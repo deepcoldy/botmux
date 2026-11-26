@@ -62,6 +62,7 @@ import {
   serializePinStreamingCardConfigChange,
 } from './pin-streaming-card-change.js';
 import { notifyFollowUpReplyChanged } from './follow-up-reply-change.js';
+import { notifyFoldBackgroundUpdatesChanged } from './fold-background-updates-change.js';
 import {
   cliModelMayKeepReasoningEffort,
   cliModelSupportsReasoningEffort,
@@ -161,7 +162,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'skills', configKey: 'skills', kind: 'json', effect: 'next-session', clearable: true, hint: 'bot 级 skill policy JSON；unset 回底层 CLI 默认行为' },
   { key: 'feedback', configKey: 'feedback', kind: 'json', effect: 'immediate', clearable: true, hint: '最终回答反馈 JSON；默认关闭，enabled=true 后按本 bot 启用；unset 关闭' },
   { key: 'feedbackPresentation', configKey: 'feedbackPresentation', kind: 'json', effect: 'immediate', clearable: true, hint: '反馈卡展示规则 JSON；按群和问题配置轮次、模板与动作；默认关闭' },
-  { key: 'groupCreation', configKey: 'groupCreation', kind: 'json', effect: 'immediate', clearable: true, hint: '/g 默认配置 JSON：agents 名称/app ID 数组、tag 个人消息分组名、avatar=logo(默认)|name|off、autoStart=true 时 /g 正文当任务、在新群自动开工（默认 false 只建群；单次可用 --start/--no-start 覆盖）；unset 恢复默认' },
+  { key: 'groupCreation', configKey: 'groupCreation', kind: 'json', effect: 'immediate', clearable: true, hint: '/g 默认配置 JSON：agents 名称/app ID 数组、tag 个人消息分组名、avatar=logo(默认)|name|off、autoStart=true 时 /g 正文当任务并在新群自动开工（单次可用 --start/--no-start 覆盖）、card=true 时裸 /g 弹出建群卡片选目录与分支（默认 false 直接建群；单次可用 --card/--no-card 覆盖）；unset 恢复默认' },
   { key: 'inviteConfig', configKey: 'inviteConfig', kind: 'json', effect: 'immediate', clearable: true, hint: '/invite all 默认成员 JSON：agents 名称/app ID 数组；与 /g 的 groupCreation 独立；unset 清空' },
   { key: 'oncallGroup', configKey: 'oncallGroup', kind: 'json', effect: 'immediate', clearable: true, hint: '拉起 Oncall 群按钮：enabled 开关及 chatIds 生效群，默认关闭' },
   { key: 'disableStreamingCard', configKey: 'disableStreamingCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '关闭实时流式卡片 on|off' },
@@ -177,6 +178,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'writableTerminalLinkInCard', configKey: 'writableTerminalLinkInCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '卡片内嵌可写终端链接 on|off' },
   { key: 'goalStatusCard', configKey: 'goalStatusCard', kind: 'boolean', effect: 'next-session', clearable: false, hint: '目标状态卡 on|off（默认 off）：Codex / TRAE 设定原生目标时，在会话里发一张状态卡并原地更新进行中、完成等状态和 CLI 累计时长；新会话或会话重启后开始读取目标，关闭后已有的卡立即停止更新' },
   { key: 'followUpReply', configKey: 'followUpReply', kind: 'boolean', effect: 'next-session', clearable: false, hint: '执行中途的即时回复 on|off（默认 off）：CLI 把执行中途收到的飞书消息并入当前一轮时（Claude Code adopt 会话、Codex 同轮转向），模型一答完就引用那条消息回复，不用等整轮结束；Codex 每轮执行中途说的进展（说完接着干活的那几句）也会回复到对应消息下；新会话或会话重启后生效，关闭立即停止发送' },
+  { key: 'foldBackgroundUpdates', configKey: 'foldBackgroundUpdates', kind: 'boolean', effect: 'immediate', clearable: false, hint: '折叠后台任务的等待进展 on|off（默认 off）：AI 帮你在后台盯着 CI、构建、日志等长任务时，等待期间的中间进展收进思考/进度折叠区，不再刷屏发新消息；开头的回复、需人工介入的提问以及任务完成/失败/超时后的最终汇报照常发送；立即生效' },
   { key: 'privateCard', configKey: 'privateCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '/card 发 owner-only 私有快照 on|off' },
   { key: 'replyCardActions', configKey: 'replyCardActions', kind: 'boolean', effect: 'immediate', clearable: false, hint: '回复卡右下角操作菜单（打开终端/切换模型/关闭会话）on|off，默认关闭' },
   { key: 'replyCardNextStep', configKey: 'replyCardNextStep', kind: 'boolean', effect: 'immediate', clearable: false, hint: '回复卡「下一步」按钮 on|off，默认关闭：把 CLI 给出的下一轮推荐输入（目前是 Claude Code 输入框里的置灰提示）放在本轮最后一张回复卡签名上方，点击即以点击人身份发给本会话；不支持的 CLI 不显示' },
@@ -201,7 +203,6 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'promptCache', configKey: 'promptCache', kind: 'json', effect: 'immediate', clearable: true, hint: 'Claude Code 提示缓存：{"ttl":"1h","keepalive":{"enabled":true,"idleMinutes":54,"maxPings":2,"activeHours":"10:00-23:00","minContextTokens":50000}}；逐字段覆盖全局 promptCache，未设的字段继承全局；ttl 下个会话生效，保活立即生效；unset 回落全局' },
   { key: 'providerRecovery', configKey: 'providerRecovery', kind: 'json', effect: 'immediate', clearable: true, hint: 'Claude Code 暂态模型服务故障后自动续跑（默认关）：{"enabled":true,"maxWaitMinutes":30}；开启后按上游给的恢复时间排期、读不到就退避，最长从最后一次成功请求算起 maxWaitMinutes 分钟（1–240，未设时 1 小时提示缓存为 55、否则 15）；关闭时失败直接发失败卡；逐字段覆盖全局 providerRecovery，unset 回落全局' },
   { key: 'promptInjection', configKey: 'promptInjection', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['default', 'none'], enumDefault: 'default', hint: '零 botmux 注入：none=仅传任务与附件，自动回传最终回复；default=恢复原有提示/技能配置。支持可自动获取最终回复的本地 CLI；新会话完整生效，已有历史不清除' },
-  { key: 'envelopeInjection', configKey: 'envelopeInjection', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['auto', 'off'], hint: '每轮上下文注入方式：auto=支持的 CLI（claude-code）把提醒/白板经 hook 注入为系统提醒，输入框只留消息本身，不支持的自动回退｜off=内联（默认）；unset 回 off' },
   { key: 'topicUnavailablePolicy', configKey: 'topicUnavailablePolicy', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['legacy', 'stop'], enumDefault: () => 'legacy', hint: '原话题不可用时：legacy=保持原有发送和兜底行为（默认）｜stop=停止发送，查询异常暂停且不改发；unset 回 legacy' },
   { key: 'replyDelivery', configKey: 'replyDelivery', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['send', 'transcript'], enumDefault: cfg => defaultReplyDeliveryFor(cfg.cliId), hint: '最终回复投递方式：send=模型自己执行 botmux send（除 doubao 外所有 CLI 的默认）｜transcript=自动转发最终回复，由 botmux 从 CLI 会话记录自动取本轮最后一段回答发回飞书（默认关闭，需显式 set transcript 开启；仅 doubao 缺省 transcript）；支持 claude-code、codex、traex、coco、hermes、mtr、pi、oh-my-pi、ebsd、grok、cursor、doubao，当前沙盒读不到会话记录时运行时回落 send（scratch 下仅 claude-code/codex/traex 可用，oncall 下 hermes 回落 send）；系统提示与转发方式在 /restart 或 CLI 重新拉起后换新值，逐轮信封立即生效；unset 回该 CLI 默认' },
   { key: 'senderTagHideEmail', configKey: 'senderTagHideEmail', kind: 'boolean', effect: 'immediate', clearable: false, hint: '隐藏 <sender> 邮箱 on|off（默认 off）：开启后只省略 email，保留姓名和 ID；不影响鉴权与 --mention-back。下一次新构造的输入生效，不清理历史或用户正文中的邮箱' },
@@ -837,6 +838,9 @@ async function applyConfigFieldInternal(
   // /config, /botconfig and the config-card boolean toggles all land here.
   // Keep workers on the same live value as the daemon's absorbed_reply gate.
   if (spec.configKey === 'followUpReply') notifyFollowUpReplyChanged(larkAppId, bot.config.followUpReply === true);
+  if (spec.configKey === 'foldBackgroundUpdates') {
+    notifyFoldBackgroundUpdatesChanged(larkAppId, bot.config.foldBackgroundUpdates === true);
+  }
   logger.info(`[config:${larkAppId}] set ${spec.key}: ${oldText} -> ${newText}`);
   return { ok: true, oldText, newText, effect: spec.effect };
 }

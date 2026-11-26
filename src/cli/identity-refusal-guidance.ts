@@ -48,6 +48,14 @@ const GUIDANCE: Record<IdentityRefusalReason, { cause: string; next: string }> =
     cause: '已证明是当前轮次，但 daemon 没有这一轮的身份材料（尚未准备、已被回收，或 daemon 刚重启）。',
     next: '重发一条消息开启新轮次后重试；连续出现再发 /login status 查看授权状态。',
   },
+  bytecloud_grant_unavailable: {
+    cause: '本轮的默认 ByteCloud 凭据已过期，平台暂未返回有效的新凭据。',
+    next: '稍后在同一轮重试。已有授权继续保留，无需反复登录。',
+  },
+  bytecloud_grant_denied: {
+    cause: '平台拒绝为这台机器续发本轮发起人的 ByteCloud 凭据。',
+    next: '请管理员检查平台授权和机器绑定。',
+  },
   invalid_invocation: {
     cause: '包装脚本的参数不完整（会话、应用、端口或工具名缺失）。',
     next: '发 /restart 重建包装脚本。',

@@ -405,7 +405,11 @@ describe('dashboard restart posts one status card and patches it on the result',
     const res = await ipc(`/api/sessions/${sessionId}/restart`);
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ revived: true });
-    expect(restartSpy).toHaveBeenCalledWith(ds, expect.objectContaining({ source: 'dashboard' }));
+    expect(restartSpy).toHaveBeenCalledWith(
+      ds,
+      expect.objectContaining({ source: 'dashboard' }),
+      { allowUnconfirmedActivationReplay: true },
+    );
 
     await observer.notify('in_progress', 'attempt-revive');
     await observer.notify('succeeded', 'attempt-revive');

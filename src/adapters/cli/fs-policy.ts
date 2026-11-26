@@ -239,15 +239,18 @@ export interface FsPolicyContext {
   larkCliLinuxStore?: string;
 }
 
-/** Normalize: require absolute, strip trailing slashes, reject `..` segments.
- *  Returns null for anything unusable (silently-dropped relative paths are a
- *  fail-open trap — callers log dropped entries). */
+/** Normalize: require absolute, collapse `//` and `/./`, strip trailing slashes,
+ *  and reject `..` segments. Returns null for anything unusable (silently-dropped
+ *  relative paths are a fail-open trap — callers log dropped entries). */
 export function normalizeFsPath(p: string): string | null {
-  if (!p || typeof p !== 'string') return null;
-  const t = p.replace(/\/+$/, '') || '/';
-  if (!t.startsWith('/')) return null;
-  if (t.split('/').includes('..')) return null;
-  return t;
+  if (!p || typeof p !== 'string' || !p.startsWith('/')) return null;
+  const out: string[] = [];
+  for (const seg of p.split('/')) {
+    if (seg === '..') return null;
+    if (seg === '' || seg === '.') continue;
+    out.push(seg);
+  }
+  return '/' + out.join('/');
 }
 
 /** Path depth for emission ordering ('/' = 0, '/a' = 1, '/a/b' = 2 …). */
@@ -707,12 +710,17 @@ export function computeNoTransportAuthorityRoots(input: {
  */
 export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   const candidates: FsRule[] = [];
-  const hostOnlyRoots = [
-    `${ctx.sessionDataDir}/link-refs`,
+  const defaultHomeNorm = ctx.defaultBotmuxHome ? normalizeFsPath(ctx.defaultBotmuxHome) : null;
+  const hostOnlyDataDirs = [...new Set([
+    normalizeFsPath(ctx.sessionDataDir),
+    ...(defaultHomeNorm ? [defaultHomeNorm === '/' ? '/data' : `${defaultHomeNorm}/data`] : []),
+  ].filter((p): p is string => p !== null))];
+  const hostOnlyRoots = [...new Set([
+    ...hostOnlyDataDirs.flatMap(dir => [`${dir}/link-refs`, `${dir}/session-turns`]),
     ...(ctx.hostOnlyDenyPaths ?? []),
   ]
     .map(normalizeFsPath)
-    .filter((p): p is string => p !== null);
+    .filter((p): p is string => p !== null))];
   const suppressedHostOnlyPaths: string[] = [];
   const insideHostOnlyRoot = (p: string): boolean => hostOnlyRoots.some(root => coversPath(root, p));
   const push = (paths: readonly string[] | undefined, access: FsAccess, source: FsRuleSource) => {
@@ -769,9 +777,10 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // dropAuthority and re-opens `master.key`/sibling appsecrets. So for
   // each root the BOT_HOME exception applies only when that root is an ancestor of
   // BOT_HOME AND p is inside BOT_HOME; a root at/under BOT_HOME keeps restricting.
+  const normalizedBotHome = normalizeFsPath(ctx.botHome);
   const insideAuthority = (p: string): boolean =>
     authorityRoots.some(root =>
-      coversPath(root, p) && !(root !== ctx.botHome && coversPath(root, ctx.botHome) && coversPath(ctx.botHome, p)));
+      coversPath(root, p) && !(normalizedBotHome !== null && root !== normalizedBotHome && coversPath(root, normalizedBotHome) && coversPath(normalizedBotHome, p)));
   // Dropped caller allow paths are RECORDED so the worker can log the suppression
   // (codex: a silently-dropped grant is a diagnosability hole).
   const suppressedAuthorityPaths: string[] = [];
@@ -1244,17 +1253,18 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     return assistantProtectedRoots.some(root => coversPath(root, p) || coversPath(p, root))
       || assistantProtectedFiles.some(file => coversPath(file, p) || coversPath(p, file));
   };
-  const finalReadOnlyPaths = [
+  const finalReadOnlyPaths = [...new Set([
     ...serviceCredentialReadOnlyPaths,
     ...(ctx.mandatoryReadOnlyPaths ?? []),
-  ].filter((path) => {
-    const normalized = normalizeFsPath(path);
-    if (!normalized || insideHostOnlyRoot(normalized) || outsideAssistantAllowedRoots(normalized)) return false;
-    // This final pass runs after ordinary rules. A service-credential exception
-    // under a withheld lark-cli store would otherwise re-open the exact key the
-    // mandatory ceiling just denied.
-    return ![...withheldLarkStores].some(root => coversPath(root, normalized));
-  });
+  ]
+    .map(normalizeFsPath)
+    .filter((normalized): normalized is string => {
+      if (!normalized || insideHostOnlyRoot(normalized) || outsideAssistantAllowedRoots(normalized)) return false;
+      // This final pass runs after ordinary rules. A service-credential exception
+      // under a withheld lark-cli store would otherwise re-open the exact key the
+      // mandatory ceiling just denied.
+      return ![...withheldLarkStores].some(root => coversPath(root, normalized));
+    }))];
 
   // No-Lark-transport HOST-AUTHORITY denies + minimal carve-out (codex escalation
   // fix). We DENY THE WHOLE authority ROOT(s) — not exact credential files, which
@@ -1342,12 +1352,14 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
       : {}),
     writeRegexes: [...(ctx.writeRegexes ?? [])],
     denyRegexes: [...(ctx.mandatoryDenyRegexes ?? [])],
-    // The final Seatbelt pass must also cover assistant session stores (all
-    // bots, including WAL/SHM) and config/dashboard secrets: an ancestor
-    // finalReadOnly grant would otherwise re-open them even when the ordinary
-    // rules and the no-transport carve-out both exclude them.
-    ...(sealLarkKeyStore ? {
-      finalDenyPaths: [
+    // The final Seatbelt pass must cover host-only roots (including shared
+    // multi-bot `session-turns/turns.sqlite` and `link-refs`) unconditionally,
+    // plus withheld lark keystores and assistant session stores/secrets when
+    // sealed: an ancestor finalReadOnly grant would otherwise re-open them even
+    // when the ordinary rules exclude them.
+    finalDenyPaths: [...new Set([
+      ...hostOnlyRoots,
+      ...(sealLarkKeyStore ? [
         ...withheldLarkStores,
         ...(ctx.assistantMode ? [
           `${ctx.sessionDataDir}/session-stores`,
@@ -1356,8 +1368,10 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
           `${ctx.botmuxHome}/.dashboard-secret`,
           `${ctx.botmuxHome}/.dashboard-token`,
         ] : []),
-      ],
-    } : {}),
+      ] : []),
+    ]
+      .map(normalizeFsPath)
+      .filter((p): p is string => p !== null))],
     finalReadOnlyPaths,
     suppressedAuthorityPaths: suppressedAuthorityPaths.length
       ? [...new Set(suppressedAuthorityPaths)].sort()

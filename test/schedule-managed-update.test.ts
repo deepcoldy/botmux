@@ -6,7 +6,7 @@ import { config } from '../src/config.js';
 import { __setScheduleStoreBeforeRenameTestHook, getTask, markRun, setScheduleScope, updateTask as updateStoredTask } from '../src/services/schedule-store.js';
 import { resolveSchedulePrecondition, schedulePreconditionPath } from '../src/services/schedule-precondition-store.js';
 import { createTaskWithOptionalPrecondition } from '../src/core/schedule-precondition-config.js';
-import { applyManagedScheduleUpdate } from '../src/core/schedule-managed-update.js';
+import { applyManagedScheduleUpdate, readManagedScheduleUpdate } from '../src/core/schedule-managed-update.js';
 import * as scheduler from '../src/core/scheduler.js';
 import { scheduleTimeZone } from '../src/utils/timezone.js';
 
@@ -252,5 +252,45 @@ describe('managed schedule frequency update', () => {
     expect(getTask(before.id, APP_ID)).toMatchObject({
       schedule: before.schedule, nextRunAt: before.nextRunAt, manualRunRequested: true,
     });
+  });
+});
+
+describe('managed schedule silent update', () => {
+  it('turns silent on and off without touching anything else', () => {
+    const before = patrolTask();
+    expect(before.silent).toBe(true);
+
+    const off = applyManagedScheduleUpdate(before.id, APP_ID, { silent: false });
+    expect(off).toMatchObject({ ok: true, task: { silent: false } });
+    const afterOff = getTask(before.id, APP_ID)!;
+    expect(afterOff.silent).toBeUndefined();
+    // Frequency, calendar, precondition and history are untouched.
+    expect(withoutFrequency(afterOff as never)).toEqual({ ...withoutFrequency(before as never), silent: undefined });
+    expect(resolveSchedulePrecondition(afterOff, APP_ID)).toEqual({
+      kind: 'configured', enabled: true, source: { kind: 'inline', script: 'printf 1' },
+    });
+    expect(afterOff.runStats).toEqual(before.runStats);
+
+    const on = applyManagedScheduleUpdate(before.id, APP_ID, { silent: true });
+    expect(on).toMatchObject({ ok: true, task: { silent: true } });
+    expect(getTask(before.id, APP_ID)!.silent).toBe(true);
+  });
+
+  it('combines a silent change with a frequency change', () => {
+    const before = patrolTask();
+    expect(applyManagedScheduleUpdate(before.id, APP_ID, { silent: false, schedule: 'every 4h' }))
+      .toMatchObject({ ok: true, task: { silent: false, schedule: 'every 4h' } });
+    expect(getTask(before.id, APP_ID)).toMatchObject({ silent: undefined, schedule: 'every 4h' });
+  });
+
+  it('rejects a non-boolean silent without touching the task', () => {
+    const before = patrolTask();
+    expect(readManagedScheduleUpdate({ silent: 'yes' })).toEqual({ ok: false, error: 'invalid_schedule_silent' });
+    expect(getTask(before.id, APP_ID)).toEqual(before);
+  });
+
+  it('rejects a body that only carries an unknown field', () => {
+    expect(readManagedScheduleUpdate({ name: 'renamed' })).toEqual({ ok: false, error: 'invalid_schedule_update' });
+    expect(readManagedScheduleUpdate({ silent: true })).toEqual({ ok: true, updates: { silent: true } });
   });
 });

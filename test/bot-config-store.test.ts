@@ -1029,6 +1029,18 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.inviteConfig).toEqual(value);
   });
 
+  it('retires envelopeInjection from CONFIG_FIELDS while tolerating legacy bots.json entries on unrelated edits', async () => {
+    const { registry, store } = await loaded({ envelopeInjection: 'off' });
+    expect(store.findConfigField('envelopeInjection')).toBeUndefined();
+    expect(registry.getBot('app_default').config).not.toHaveProperty('envelopeInjection');
+
+    const p2pSpec = store.findConfigField('p2pMode')!;
+    expect(await store.applyConfigField('app_default', p2pSpec, 'thread')).toMatchObject({ ok: true });
+    expect(readConfig()).toMatchObject({ p2pMode: 'thread', envelopeInjection: 'off' });
+    expect(registry.loadBotConfigs()[0].p2pMode).toBe('thread');
+    expect(registry.loadBotConfigs()[0]).not.toHaveProperty('envelopeInjection');
+  });
+
   it('persists Oncall button settings without changing feedback or chat overrides', async () => {
     const original = { feedback: { enabled: true, allowReselect: true }, chatFeedbackPolicies: { oc_a: { enabled: false } } };
     const { registry, store } = await loaded(original);

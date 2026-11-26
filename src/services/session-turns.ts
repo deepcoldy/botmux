@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync } from 'node:fs';
+import { accessSync, constants as fsConstants, existsSync, lstatSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { openDatabaseSyncOrThrow, type DatabaseSyncLike } from './sqlite-compat.js';
 import type { TurnSendKind } from './turn-send-ledger.js';
@@ -24,11 +24,36 @@ interface SessionTurnAnchor {
   cliEntryId?: string;
 }
 
-interface SessionTurnReply {
+export interface SessionTurnReply {
   messageId: string;
   responseKind: TurnSendKind;
   at: number;
   text?: string;
+}
+
+export interface RecordSessionTurnReplyLimits {
+  maxReplies?: number;
+  maxTextChars?: number;
+  maxPayloadBytes?: number;
+}
+
+export interface RecordSessionTurnReplyOptions {
+  retention?: SessionTurnRetention;
+  pruneNow?: number;
+  turnLimits?: RecordSessionTurnReplyLimits;
+  /** Called inside the same BEGIN IMMEDIATE transaction after exact event-key
+   *  deduplication. Returning false aborts before any insert, so a rejected
+   *  write never consumes the caller's sliding character budget. */
+  chargeNewTextChars?: (textChars: number) => boolean;
+}
+
+export interface RecordSessionTurnRepliesResult {
+  staged: boolean;
+  recorded: number;
+  duplicates: number;
+  recordedTextChars: number;
+  quotaExceeded?: boolean;
+  rateLimited?: boolean;
 }
 
 interface SessionTurn {
@@ -127,10 +152,21 @@ function inTransaction(db: DatabaseSyncLike, operation: () => void): void {
   }
 }
 
+const MAX_PUBLIC_MESSAGE_CHARS = 256 * 1024;
+
+function clampPublicMessageChars(text: string): string {
+  if (text.length <= MAX_PUBLIC_MESSAGE_CHARS) return text;
+  let cut = MAX_PUBLIC_MESSAGE_CHARS - 1;
+  const code = text.charCodeAt(cut - 1);
+  if (code >= 0xd800 && code <= 0xdbff) cut -= 1;
+  return `${text.slice(0, cut)}…`;
+}
+
 function publicMessageText(text: string): string {
-  return safeScrubAndTruncate(text, 256 * 1024).text
+  const scrubbed = safeScrubAndTruncate(text, MAX_PUBLIC_MESSAGE_CHARS).text
     .replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9+/_=.-]+/gi, '<redacted>')
     .replace(LOCAL_PATH_PATTERN, '<redacted>');
+  return clampPublicMessageChars(scrubbed);
 }
 
 function pruneSessionEvents(
@@ -401,25 +437,174 @@ export function updateSessionTurnNativeAnchor(
   }));
 }
 
-export function recordSessionTurnReply(
+function sessionTurnsDbExistsStrict(dataDir: string): boolean {
+  try {
+    lstatSync(databasePath(dataDir));
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    if (code !== 'ENOENT') throw error;
+  }
+  // On Linux uid=0 inside a mode-000 or read-only empty bind mask over
+  // `<dataDir>/session-turns`, `lstatSync(turns.sqlite)` returns ENOENT because
+  // root bypasses DAC. Inspect the parent directory so read-only / mode-000
+  // masks surface an error and trigger Daemon IPC fallback while genuinely
+  // absent or writable unsandboxed directories still return false (0 IPC calls).
+  const dir = join(dataDir, 'session-turns');
+  let dirStat: ReturnType<typeof lstatSync>;
+  try {
+    dirStat = lstatSync(dir);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    if (code === 'ENOENT') return false;
+    throw error;
+  }
+  if (!dirStat.isDirectory()) {
+    throw Object.assign(new Error(`ENOTDIR: session-turns is not a directory: ${dir}`), { code: 'ENOTDIR' });
+  }
+  if ((dirStat.mode & 0o222) === 0) {
+    throw Object.assign(new Error(`EACCES: session-turns directory is not writable: ${dir}`), { code: 'EACCES' });
+  }
+  try {
+    accessSync(dir, fsConstants.W_OK);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    if (code === 'ENOENT') return false;
+    throw error;
+  }
+  return false;
+}
+
+function resolveSafePruneNow(candidateAt: number, explicitPruneNow?: number): number {
+  if (explicitPruneNow !== undefined && Number.isFinite(explicitPruneNow)) {
+    return Math.trunc(explicitPruneNow);
+  }
+  const hostNow = Date.now();
+  return Number.isFinite(candidateAt) ? Math.min(Math.trunc(candidateAt), hostNow) : hostNow;
+}
+
+export function recordSessionTurnReplies(
   dataDir: string,
   sessionId: string,
   turnId: string,
-  reply: SessionTurnReply,
-  retention?: SessionTurnRetention,
-): void {
-  if (!existsSync(databasePath(dataDir))) return;
-  accessTurns(dataDir, true, db => inTransaction(db, () => {
-    const result = db.prepare(`
-      INSERT OR IGNORE INTO events (session_id, turn_id, at, event_key, payload)
-      SELECT ?, ?, ?, ?, ?
-      WHERE EXISTS (SELECT 1 FROM pending_inbound WHERE session_id = ? AND turn_id = ?)
-    `).run(sessionId, turnId, reply.at, `reply:${reply.responseKind}:${reply.messageId}:${reply.at}`,
-      JSON.stringify({ reply: { ...reply, text: reply.text === undefined ? undefined : publicMessageText(reply.text) } }), sessionId, turnId);
-    if (Number(result.changes) > 0) {
-      pruneSessionEvents(db, sessionId, reply.at, turnId, retention);
-    }
-  }));
+  replies: readonly SessionTurnReply[],
+  options?: RecordSessionTurnReplyOptions,
+): RecordSessionTurnRepliesResult {
+  if (replies.length === 0 || !sessionTurnsDbExistsStrict(dataDir)) {
+    return { staged: false, recorded: 0, duplicates: 0, recordedTextChars: 0 };
+  }
+  return accessTurns(dataDir, true, db => {
+    let outcome: RecordSessionTurnRepliesResult = {
+      staged: false,
+      recorded: 0,
+      duplicates: 0,
+      recordedTextChars: 0,
+    };
+    inTransaction(db, () => {
+      const stagedRow = db.prepare(`
+        SELECT 1 AS ok FROM pending_inbound
+        WHERE session_id = ? AND turn_id = ?
+          AND NOT EXISTS (SELECT 1 FROM closed_sessions WHERE session_id = ?)
+      `).get(sessionId, turnId, sessionId) as { ok: number } | undefined;
+      if (!stagedRow) return;
+
+      const prepared = replies.map(reply => {
+        const at = Number.isFinite(reply.at) ? Math.trunc(reply.at) : Date.now();
+        const scrubbedText = reply.text === undefined ? undefined : publicMessageText(reply.text);
+        const storedReply: SessionTurnReply = {
+          messageId: reply.messageId,
+          responseKind: reply.responseKind,
+          at,
+          ...(scrubbedText === undefined ? {} : { text: scrubbedText }),
+        };
+        const eventKey = `reply:${reply.responseKind}:${reply.messageId}:${at}`;
+        const payload = JSON.stringify({ reply: storedReply });
+        return {
+          at,
+          eventKey,
+          payload,
+          textChars: scrubbedText?.length ?? 0,
+          payloadBytes: Buffer.byteLength(payload, 'utf8'),
+        };
+      });
+
+      const limits = options?.turnLimits;
+      const hasDurableLimits = !!limits && (limits.maxReplies !== undefined
+        || limits.maxTextChars !== undefined || limits.maxPayloadBytes !== undefined);
+      if (hasDurableLimits || options?.chargeNewTextChars) {
+        const existingRows = db.prepare(`
+          SELECT event_key, payload FROM events
+          WHERE session_id = ? AND turn_id = ? AND event_key LIKE 'reply:%'
+        `).all(sessionId, turnId) as { event_key: string; payload: string }[];
+        const seenKeys = new Set<string>();
+        let existingTextChars = 0;
+        let existingPayloadBytes = 0;
+        for (const row of existingRows) {
+          seenKeys.add(row.event_key);
+          existingPayloadBytes += Buffer.byteLength(row.payload, 'utf8');
+          try {
+            const parsed = JSON.parse(row.payload) as { reply?: { text?: unknown } };
+            if (typeof parsed.reply?.text === 'string') existingTextChars += parsed.reply.text.length;
+          } catch { /* ignore malformed historical row */ }
+        }
+        let newCount = 0;
+        let newTextChars = 0;
+        let newPayloadBytes = 0;
+        for (const item of prepared) {
+          if (seenKeys.has(item.eventKey)) continue;
+          seenKeys.add(item.eventKey);
+          newCount += 1;
+          newTextChars += item.textChars;
+          newPayloadBytes += item.payloadBytes;
+        }
+        if (newCount === 0) {
+          outcome = { staged: true, recorded: 0, duplicates: prepared.length, recordedTextChars: 0 };
+          return;
+        }
+        if (
+          (limits?.maxReplies !== undefined && existingRows.length + newCount > limits.maxReplies)
+          || (limits?.maxTextChars !== undefined && existingTextChars + newTextChars > limits.maxTextChars)
+          || (limits?.maxPayloadBytes !== undefined && existingPayloadBytes + newPayloadBytes > limits.maxPayloadBytes)
+        ) {
+          outcome = { staged: true, recorded: 0, duplicates: 0, recordedTextChars: 0, quotaExceeded: true };
+          return;
+        }
+        if (options?.chargeNewTextChars && !options.chargeNewTextChars(newTextChars)) {
+          outcome = { staged: true, recorded: 0, duplicates: 0, recordedTextChars: 0, rateLimited: true };
+          return;
+        }
+      }
+
+      const insert = db.prepare(
+        'INSERT OR IGNORE INTO events (session_id, turn_id, at, event_key, payload) VALUES (?, ?, ?, ?, ?)',
+      );
+      let recorded = 0;
+      let duplicates = 0;
+      let recordedTextChars = 0;
+      let maxInsertedAt: number | undefined;
+      for (const item of prepared) {
+        const result = insert.run(sessionId, turnId, item.at, item.eventKey, item.payload);
+        if (Number(result.changes) > 0) {
+          recorded += 1;
+          recordedTextChars += item.textChars;
+          maxInsertedAt = maxInsertedAt === undefined ? item.at : Math.max(maxInsertedAt, item.at);
+        } else {
+          duplicates += 1;
+        }
+      }
+      if (recorded > 0) {
+        pruneSessionEvents(
+          db,
+          sessionId,
+          resolveSafePruneNow(maxInsertedAt!, options?.pruneNow),
+          turnId,
+          options?.retention,
+        );
+      }
+      outcome = { staged: true, recorded, duplicates, recordedTextChars };
+    });
+    return outcome;
+  });
 }
 
 export function cleanupSessionTurns(dataDir: string, sessionId: string): void {

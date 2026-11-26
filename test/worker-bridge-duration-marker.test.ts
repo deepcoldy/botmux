@@ -776,8 +776,13 @@ describe('marker verdict lifecycle wiring guard', () => {
     // (a fresh first turn hangs forever again). Pin the adjacency of the
     // queue ingest and the arming call.
     const workerSrc = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    // The ingest call gained extra args (the fold-background pending-wake
+    // observer). [^;]* tolerates parameter additions while still pinning the
+    // three leading args and the immediate ingest → arm adjacency. The
+    // (?=\s*,) lookahead anchors the parameter boundary so a renamed symbol
+    // sharing the prefix (e.g. observeBridgeAttributionTypo) cannot pass.
     expect(workerSrc).toMatch(
-      /bridgeQueue\.ingest\(result\.events, bridgeJsonlPath, observeBridgeAttribution\);\s*\n(?:\s*\/\/[^\n]*\n)*\s*updateProvisionalExitWatch\(\);/,
+      /bridgeQueue\.ingest\(result\.events, bridgeJsonlPath, observeBridgeAttribution(?=\s*,)[^;]*\);\s*\n(?:\s*\/\/[^\n]*\n)*\s*updateProvisionalExitWatch\(\);/,
     );
     // Fallback scope is the Claude non-adopt transcript bridge only: adopt
     // sessions and headless local turns are timed out by other paths.

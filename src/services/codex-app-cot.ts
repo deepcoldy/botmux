@@ -172,8 +172,8 @@ function readyTextBoundary(text: string): number {
 
 /**
  * Converts Codex App Server's public progress events into Botmux's cosmetic
- * thinking timeline. It intentionally consumes summary/commentary text and
- * tool activity only; raw reasoning deltas are not forwarded.
+ * thinking timeline. It consumes public summaries, commentary, async notices,
+ * and tool activity. Raw reasoning deltas and async questions stay out.
  */
 export class CodexAppCotCollector {
   private readonly streams = new Map<string, TextStreamState>();
@@ -232,7 +232,9 @@ export class CodexAppCotCollector {
     const record = item as Record<string, unknown>;
 
     if (method === 'item/started') {
-      if (record.type === 'agentMessage') this.messagePhases.set(itemId(record), record.phase);
+      if (record.type === 'agentMessage' && record.delivery !== 'async') {
+        this.messagePhases.set(itemId(record), record.phase);
+      }
       const call = toolCall(record);
       return call ? [call] : [];
     }
@@ -245,7 +247,8 @@ export class CodexAppCotCollector {
     if (record.type === 'agentMessage') {
       const id = itemId(record);
       this.messagePhases.delete(id);
-      if (record.phase === 'commentary') {
+      const publicText = record.delivery === 'async' ? record.questions == null : record.phase === 'commentary';
+      if (publicText) {
         return this.completeStream(
           `message:${id}`,
           boundedUtf8(record.text, THINKING_MAX_CHARS, THINKING_MAX_BYTES),

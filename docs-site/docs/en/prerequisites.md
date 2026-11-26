@@ -72,4 +72,4 @@ We recommend an **always-on dev machine / devbox** rather than a laptop. The dae
 | The CLI works in your terminal but botmux can't find it | botmux looks the command up through your login shell, but a CLI installed somewhere unusual can still be missed. Set `cliPathOverride` in bots.json to the CLI's absolute path, see [CLI Adapters](/en/adapters) |
 | `botmux start` says tmux is missing | Install tmux with the suggested command, or switch to another backend from the table above |
 
-**Next**: once everything is ready, go to the [5-Minute Quickstart](/en/quickstart).
+**Next**: once everything is ready, go to the [Quickstart](/en/quickstart).

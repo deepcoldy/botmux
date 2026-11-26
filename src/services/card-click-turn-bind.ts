@@ -28,6 +28,7 @@ import { extractLarkBusinessCode } from '../im/lark/lark-errors.js';
 import { beginReplyTargetTurn } from '../core/reply-target.js';
 import { activeSessionKey, sessionAnchorId, sessionKey, type DaemonSession } from '../core/types.js';
 import { sessionPromptInjection } from '../core/prompt-injection.js';
+import { plannedOpeningBackendType } from '../core/opening-backend.js';
 import { markSessionActivity } from '../core/session-activity.js';
 import { normalizeLastTurn } from '../core/session-task-status.js';
 import { buildFollowUpCliInput, buildNewTopicCliInput, rememberLastCliInput } from '../core/session-manager.js';
@@ -308,34 +309,6 @@ export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
       participants: [{ openId: senderOpenId, isBot: false }],
       inThread: ds.scope === 'thread',
     });
-    const bot = getBot(ds.larkAppId);
-    const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? bot.config.cliId;
-    const opening = !ds.hasHistory && (!ds.worker || ds.worker.killed);
-    const input = opening
-      ? buildNewTopicCliInput(
-        args.prompt, ds.session.sessionId, cliId, undefined, undefined, undefined, undefined, undefined,
-        { name: bot.botName, openId: bot.botOpenId }, localeForBot(ds.larkAppId), sender,
-        {
-          promptInjection: sessionPromptInjection(ds),
-          larkAppId: ds.larkAppId,
-          chatId: ds.chatId,
-          turnId,
-          trustedCaller,
-          sessionBackendType: ds.session.backendType,
-          selfMention: { name: bot.botName, openId: bot.botOpenId },
-        },
-      )
-      : buildFollowUpCliInput(args.prompt, ds.session.sessionId, {
-        cliId,
-        sender,
-        turnId,
-        larkAppId: ds.larkAppId,
-        chatId: ds.chatId,
-        selfMention: { name: bot.botName, openId: bot.botOpenId },
-        sessionBackendType: ds.session.backendType,
-        promptInjection: sessionPromptInjection(ds),
-        trustedCaller,
-      });
     // Identity preparation can await Lark. A newer input may take over while
     // we wait, and its routing state must never be replaced by our rollback.
     const mayRollback = () => args.responseToTurnId === undefined
@@ -367,12 +340,40 @@ export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
       if (mayRollback()) rollback();
       return { ok: false, reason: 'delivery_failed' };
     }
+    const bot = getBot(ds.larkAppId);
+    const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? bot.config.cliId;
+    const live = !!ds.worker && !ds.worker.killed;
+    const opening = !ds.hasHistory && !live;
+    const input = opening
+      ? buildNewTopicCliInput(
+        args.prompt, ds.session.sessionId, cliId, undefined, undefined, undefined, undefined, undefined,
+        { name: bot.botName, openId: bot.botOpenId }, localeForBot(ds.larkAppId), sender,
+        {
+          promptInjection: sessionPromptInjection(ds),
+          larkAppId: ds.larkAppId,
+          chatId: ds.chatId,
+          turnId,
+          trustedCaller,
+          sessionBackendType: plannedOpeningBackendType(ds, cliId, bot.config),
+          selfMention: { name: bot.botName, openId: bot.botOpenId },
+        },
+      )
+      : buildFollowUpCliInput(args.prompt, ds.session.sessionId, {
+        cliId,
+        sender,
+        turnId,
+        larkAppId: ds.larkAppId,
+        chatId: ds.chatId,
+        selfMention: { name: bot.botName, openId: bot.botOpenId },
+        sessionBackendType: ds.session.backendType,
+        promptInjection: sessionPromptInjection(ds),
+        trustedCaller,
+      });
     ds.activeInteractiveTurn = {
       turnId,
       caller: { ...trustedCaller },
       userPrompt: args.prompt,
     };
-    const live = !!ds.worker && !ds.worker.killed;
     const sent = live
       ? sendWorkerInput(ds, input, turnId, { trustedCaller })
       : forkWorker(ds, input, { resume: ds.hasHistory, turnId, trustedCaller });

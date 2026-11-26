@@ -9,6 +9,7 @@ import { controllerForSession } from '../../src/core/session-controller.js';
 import { activeSessionKey } from '../../src/core/types.js';
 import { isCodexAppCliId } from '../../src/adapters/cli/types.js';
 import { contractTerminalStatus, executionObserverSupported, sameExecution } from '../../src/services/session-contract.js';
+import { decideCodexAppSettlementActivationToken } from '../../src/services/queued-activation-reconcile.js';
 import { hasConfirmedNativeGrokEffort, noteExplicitEffortPreferenceEdit } from '../../src/core/terminal-effort-writeback.js';
 import { assertSessionLaunchModelChoiceAllowed } from '../../src/core/session-model.js';
 import { cliModelMayKeepReasoningEffort } from '../../src/services/codex-reasoning-effort.js';
@@ -67,6 +68,7 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
   if (key === 'activeSessionKey') return activeSessionKey;
   if (key === 'runtimeStartRefusal') return runtimeStartRefusal;
   if (key === 'cotMessageFinishStatus') return cotMessageFinishStatus;
+  if (key === 'hasCotMessageForTurn') return () => false;
   if (key === 'resetStartingCardHealth') return resetStartingCardHealth;
   if (key === 'isStructuredNoticeProtocolMessage') return isStructuredNoticeProtocolMessage;
   if (key === 'cancelAntigravityRotationReplay') return cancelAntigravityRotationReplay;
@@ -80,6 +82,14 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
   if (key === 'executionObserverSupported') return executionObserverSupported;
   if (key === 'contractTerminalStatus') return contractTerminalStatus;
   if (key === 'sameExecution') return sameExecution;
+  if (key === 'decideCodexAppSettlementActivationToken') return decideCodexAppSettlementActivationToken;
+  if (typeof key === 'string' && [
+    'ownsCodexAppSettlementActivation',
+    'matchCodexAppSettlementActivationToken',
+    'settleCodexAppQueuedActivationIfMatched',
+  ].includes(key)) {
+    return scope[key] ??= loadWorkerPoolClosure(key, scope);
+  }
   if (key === 'hasConfirmedNativeGrokEffort') return hasConfirmedNativeGrokEffort;
   if (key === 'noteExplicitEffortPreferenceEdit') return noteExplicitEffortPreferenceEdit;
   if (key === 'assertSessionLaunchModelChoiceAllowed') return assertSessionLaunchModelChoiceAllowed;
@@ -92,7 +102,7 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
   if (typeof key === 'string' && ['canForkRegisteredSession', 'ownsCodexAppFinalDelivery', 'completeWorkerOrdinaryImDelivery',
     'clearOrdinaryImDelivery', 'recordWorkerCommittedTurn', 'speculateStatuslineLaunchGen',
     'recordLaunchModel', 'assistantLiveInputAdmission', 'assistantTransferInputDeliveryAllowed',
-    'releaseHeldCotMessage', 'isReplayOfHeldCotTerminal', 'finalizeOrHoldCotMessage',
+    'releaseHeldCotMessage', 'isReplayOfHeldCotTerminal', 'isSynthesizedBackgroundTurnId', 'finalizeOrHoldCotMessage',
     'requiredReplyCotHoldKey', 'settleRequiredReplyBackground', 'settleRequiredReplyCotMessage',
     'failRequiredReplyCotHolds', 'clearWorkerRuntimeProvenance'].includes(key)) {
     return scope[key] ??= loadWorkerPoolFunction(key, scope);

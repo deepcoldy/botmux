@@ -30,7 +30,7 @@ botmux setup
 
 Opens an interactive UI to configure for the first time, or add, edit, or delete bots. By default it signs in with a Lark QR scan and creates the app, grants permissions, sets the redirect, and publishes a version for you. Add `--no-open-platform-auto` to skip the automatic Open Platform setup.
 
-### Scripted setup (no interactive UI)
+### Scripted setup (no interactive UI) {#scripted-setup}
 
 Good for scripts or for letting an AI do it:
 
@@ -44,6 +44,31 @@ Good for scripts or for letting an AI do it:
 | `botmux setup remove <process name\|AppID> --yes` | Delete a bot |
 
 `--allowed-users` is the bot owner. When creating a new app, use a **full email, phone number, or a union_id starting with `on_`**, not an open_id starting with `ou_`: an open_id is valid only in the Lark app that issued it, and the new app doesn't exist yet, so it can't have a valid open_id. See `botmux setup help` for every field.
+
+To use botmux only on this machine without connecting Lark, create a local bot:
+
+```bash
+botmux setup add --local --name lab --cli codex --default-working-dir ~ --json
+```
+
+You can also choose “Local only” in Dashboard → Add bot. This path needs neither a QR scan nor a Lark App ID / secret. The `local_*` id saved in `bots.json` is a stable local identity, not a Lark app id. `--name`, `--cli`, `--default-working-dir`, and `--json` are optional; see `botmux setup help` for every option.
+
+#### Add permissions beyond the built-in list {#extra-scopes}
+
+Pass `--extra-scopes-file <json>` during scripted setup (Feishu tenants only; on Lark, add the scopes manually in the developer console):
+
+```bash
+botmux setup add --create-app --allowed-users <email> --extra-scopes-file ./scopes.json
+botmux setup configure <process-name|AppID> --extra-scopes-file ./scopes.json
+```
+
+The file uses the `lark-scopes.json` shape (`{"scopes":{"tenant":[],"user":[]}}`). `{"scopes":[{"scope":"x:y"}]}` is also accepted, but every entry in that form is requested as a user scope; use `{"scopes":{"tenant":["x:y"]}}` for tenant scopes. Scopes missing from the tenant catalog (including scopes that only exist for the other identity type) are skipped and listed in the result instead of failing the run.
+
+The file path is saved on the bot, so later `configure` runs reuse it. If the saved file can't be read, setup warns and continues with the built-in list. Clear it with:
+
+```bash
+botmux setup configure <process-name|AppID> --extra-scopes-file -
+```
 
 ### Clone a bot
 
@@ -103,7 +128,7 @@ Common `botmux logs` options:
 
 `start` / `restart` also accept `--companion-secret-file <absolute path> --companion-bot <appId>`. Passing both enables a closed local API for one isolated test bot; see [Local Companion API](/en/companion-api).
 
-## Upgrade
+## Upgrade {#upgrade}
 
 ```bash
 botmux upgrade            # Upgrade to the latest stable release (alias: botmux update)
@@ -112,6 +137,8 @@ botmux upgrade 3.28.0     # Install a specific version
 ```
 
 When it finishes, run `botmux restart` as prompted to load the new version. If you run botmux from a source checkout, `upgrade` does `git pull` + rebuild + restart instead. On releases older than v3.18.0, upgrade with the curl install script instead; see [FAQ · How do I upgrade?](/en/faq#how-do-i-upgrade).
+
+For source installs, Dashboard → Settings → Version & Updates also supports a normal update and a force update that previews local changes, asks for confirmation, and creates a Git backup before overwriting them. Force updates remove local customizations from the current source tree. See the repository's [source update and recovery notes](https://github.com/deepcoldy/botmux/blob/master/docs/local-source-update.md) (Chinese) for recovery steps and safety limits.
 
 ## Manage sessions
 
@@ -198,7 +225,7 @@ botmux dashboard rotate    # Issue a new token; the old link stops working
 
 See [Dashboard](/en/dashboard) for what it can do.
 
-## Start on boot
+## Start on boot {#autostart}
 
 ```bash
 botmux autostart enable   # Register start-on-boot (no sudo needed)

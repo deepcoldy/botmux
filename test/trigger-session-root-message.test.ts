@@ -13,10 +13,14 @@ import { isExternalTriggerTurn, resolveTurnOrigin } from '../src/core/turn-origi
 const mockGetMessageChatId = vi.fn();
 const mockGetChatMode = vi.fn(async () => 'topic');
 const mockSendMessage = vi.fn(async () => 'om_new_topic');
+const mockReplyMessage = vi.fn(async () => 'om_reply');
+const mockDeleteMessage = vi.fn(async () => true);
 vi.mock('../src/im/lark/client.js', () => ({
   getMessageChatId: (...args: any[]) => mockGetMessageChatId(...args),
   getChatMode: (...args: any[]) => mockGetChatMode(...args),
   sendMessage: (...args: any[]) => mockSendMessage(...args),
+  replyMessage: (...args: any[]) => mockReplyMessage(...args),
+  deleteMessage: (...args: any[]) => mockDeleteMessage(...args),
   listChatBotMembers: vi.fn(async () => []),
 }));
 
@@ -163,7 +167,9 @@ import { buildExternalEventTopicMessage, triggerSessionTurn } from '../src/core/
 import { parseBotConfigsFromText, registerBot, __testOnly_resetBotRegistry } from '../src/bot-registry.js';
 import { sessionKey } from '../src/core/types.js';
 import { admitQueuedActivationTail, withActiveSessionKeyLock, __testOnly_sessionAgentConfig } from '../src/core/worker-pool.js';
-import { resolveSessionReplyTarget } from '../src/core/reply-target.js';
+import { frozenReplyContextForTurn, resolveSessionReplyTarget } from '../src/core/reply-target.js';
+import { hasPendingTriggerStreamingCard } from '../src/core/trigger-streaming-card.js';
+import { isTriggerFinalSuppressed } from '../src/core/trigger-final-suppression.js';
 import { authorizeReportSessionRelayRequest } from '../src/core/report-session-relay.js';
 import { createDispatchReportBinding } from '../src/core/dispatch-report-binding.js';
 import { resolveSender } from '../src/im/lark/identity-cache.js';
@@ -218,6 +224,10 @@ describe('triggerSessionTurn rootMessageId target', () => {
     __testOnly_resetBotRegistry();
     routeQuarantine.keys.clear();
     mockGetChatMode.mockReset().mockResolvedValue('topic');
+    mockSendMessage.mockReset().mockResolvedValue('om_new_topic');
+    mockReplyMessage.mockReset().mockResolvedValue('om_reply');
+    mockDeleteMessage.mockReset().mockResolvedValue(true);
+    mockUpdateSession.mockReset();
     mockBotAutoWorktreeEnabled.mockReturnValue(false);
     mockGetBot.mockReturnValue({
       config: { larkAppId: APP, cliId: 'claude-code', workingDir: '/tmp' },
@@ -987,10 +997,20 @@ describe('triggerSessionTurn rootMessageId target', () => {
       const result = await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
       expect(result.ok).toBe(true);
       if (mode === 'shared') {
-        expect(mockSendMessage).not.toHaveBeenCalled();
-        expect(activeSessions.get(sessionKey(CHAT, APP))?.scope).toBe('chat');
+        expect(mockSendMessage).toHaveBeenCalledWith(APP, CHAT, 'Explicit event');
+        const sharedDs = activeSessions.get(sessionKey(CHAT, APP))!;
+        expect(sharedDs.scope).toBe('chat');
+        expect(activeSessions.has(sessionKey('om_new_topic', APP))).toBe(false);
+        expect(frozenReplyContextForTurn(sharedDs, result.triggerId).target).toEqual({
+          mode: 'thread', rootMessageId: 'om_new_topic',
+        });
+        expect(resolveSessionReplyTarget(sharedDs, result.triggerId)).toEqual({
+          mode: 'thread', rootMessageId: 'om_new_topic',
+        });
+        expect(sharedDs.session.replyThreadAliases?.om_new_topic).toBeDefined();
+        expect(sharedDs.currentReplyTarget).toMatchObject({ rootMessageId: 'om_new_topic', turnId: result.triggerId });
         if (existing) {
-          expect(activeSessions.get(sessionKey(CHAT, APP))).toBe(incumbent);
+          expect(sharedDs).toBe(incumbent);
           expect(incumbent.worker).toBe(worker);
           expect(incumbent.workingDir).toBe('/tmp/shared-cwd');
           expect(mockCreateSession).not.toHaveBeenCalled();
@@ -1059,7 +1079,551 @@ describe('triggerSessionTurn rootMessageId target', () => {
 
     expect(result).toMatchObject({ ok: true, target: { sessionId: 'sess_existing' } });
     expect(mockCreateSession).not.toHaveBeenCalled();
-    expect(mockSendMessage).not.toHaveBeenCalled();
+    expect(mockSendMessage).toHaveBeenCalledWith(APP, CHAT, 'Shared group event');
+    expect(frozenReplyContextForTurn(incumbent, result.triggerId).target).toEqual({
+      mode: 'thread', rootMessageId: 'om_new_topic',
+    });
+    expect(incumbent.session.replyThreadAliases?.om_new_topic).toBeDefined();
+  });
+
+  describe('shared regular group explicit topicMessage anchoring', () => {
+    const setupSharedGroup = (extraConfig: Record<string, unknown> = {}) => {
+      mockGetChatMode.mockResolvedValue('group');
+      mockGetBot.mockReturnValue({
+        config: { larkAppId: APP, cliId: 'claude-code', workingDir: '/tmp', regularGroupReplyMode: 'shared', ...extraConfig },
+        botName: 'Bot',
+        botOpenId: 'ou_bot',
+      });
+    };
+
+    it('creates a chat-scope session and anchors turn replies, aliases, and structured placement to the seed topic', async () => {
+      setupSharedGroup();
+      mockSendMessage.mockResolvedValueOnce('om_shared_seed_1');
+      const activeSessions = new Map<string, DaemonSession>();
+      const req = request({ rootMessageId: undefined });
+      req.instruction = '排查 Bug';
+      req.presentation = { topicMessage: '我来看看这个问题' };
+
+      const result = await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+
+      expect(result).toMatchObject({ ok: true, action: 'queued', target: { sessionId: 'sess_new', chatId: CHAT } });
+      expect(mockSendMessage).toHaveBeenCalledWith(APP, CHAT, '我来看看这个问题');
+      expect(mockCreateSession).toHaveBeenCalledWith(CHAT, CHAT, '[External] alerts', 'group', undefined, { source: 'http' });
+      const ds = activeSessions.get(sessionKey(CHAT, APP))!;
+      expect(ds.scope).toBe('chat');
+      expect(activeSessions.has(sessionKey('om_shared_seed_1', APP))).toBe(false);
+      expect(frozenReplyContextForTurn(ds, result.triggerId).target).toEqual({
+        mode: 'thread', rootMessageId: 'om_shared_seed_1',
+      });
+      expect(resolveSessionReplyTarget(ds, result.triggerId)).toEqual({
+        mode: 'thread', rootMessageId: 'om_shared_seed_1',
+      });
+      expect(ds.session.replyThreadAliases?.om_shared_seed_1).toBeDefined();
+      expect(ds.replyThreadAliases?.om_shared_seed_1).toBeDefined();
+      expect(ds.currentReplyTarget).toMatchObject({ rootMessageId: 'om_shared_seed_1', turnId: result.triggerId });
+      expect(mockUpdateSession).toHaveBeenCalledWith(expect.objectContaining({
+        sessionId: 'sess_new',
+        currentReplyTarget: expect.objectContaining({ rootMessageId: 'om_shared_seed_1', turnId: result.triggerId }),
+        replyThreadAliases: expect.objectContaining({ om_shared_seed_1: expect.any(Object) }),
+        turnReplyContexts: expect.objectContaining({
+          [result.triggerId!]: expect.objectContaining({
+            target: { mode: 'thread', rootMessageId: 'om_shared_seed_1' },
+          }),
+        }),
+      }));
+      expect(mockForkWorker).toHaveBeenCalledWith(ds, expect.objectContaining({ content: expect.stringContaining('new:') }), result.triggerId);
+      recordSessionTurnInput({
+        dataDir: config.session.dataDir,
+        sessionId: ds.session.sessionId,
+        turnId: result.triggerId!,
+        input: 'fallback',
+        cliId: 'claude-code',
+      });
+      expect(readSessionTurns(config.session.dataDir, ds.session.sessionId, 0, 50).turns
+        .find(entry => entry.turnId === result.triggerId)?.inbound).toEqual([
+        expect.objectContaining({
+          messageId: result.triggerId,
+          via: 'trigger',
+          placement: { kind: 'thread', rootMessageId: 'om_shared_seed_1' },
+        }),
+      ]);
+    });
+
+    it('reuses a live chat-scope session and isolates the new seed topic from an earlier turn topic', async () => {
+      setupSharedGroup();
+      mockSendMessage.mockResolvedValueOnce('om_topic_b');
+      const send = vi.fn();
+      const incumbent = existingDs({
+        scope: 'chat',
+        worker: { killed: false, send } as any,
+        currentReplyTarget: { rootMessageId: 'om_topic_a', turnId: 'om_prev_human', updatedAt: '2026-06-01T00:00:00.000Z' },
+        replyThreadAliases: { om_topic_a: { createdAt: '2026-06-01T00:00:00.000Z', lastUsedAt: '2026-06-01T00:00:00.000Z' } },
+      });
+      incumbent.session.scope = 'chat';
+      incumbent.session.rootMessageId = CHAT;
+      incumbent.session.currentReplyTarget = incumbent.currentReplyTarget;
+      incumbent.session.replyThreadAliases = incumbent.replyThreadAliases;
+      incumbent.session.turnReplyContexts = {
+        om_prev_human: { target: { mode: 'thread', rootMessageId: 'om_topic_a' } },
+      };
+      incumbent.session.replyTargets = {
+        om_prev_human: { rootMessageId: 'om_topic_a', updatedAt: '2026-06-01T00:00:00.000Z' },
+      };
+      const activeSessions = new Map<string, DaemonSession>([[sessionKey(CHAT, APP), incumbent]]);
+      const req = request({ rootMessageId: undefined });
+      req.instruction = '处理第二个告警';
+      req.presentation = { topicMessage: '开始处理告警 B' };
+
+      const result = await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+
+      expect(result).toMatchObject({ ok: true, action: 'delivered', target: { sessionId: 'sess_existing', chatId: CHAT } });
+      expect(mockCreateSession).not.toHaveBeenCalled();
+      expect(mockSendMessage).toHaveBeenCalledWith(APP, CHAT, '开始处理告警 B');
+      // Previous turn stays pinned to topic A; new trigger turn is pinned to topic B.
+      expect(frozenReplyContextForTurn(incumbent, 'om_prev_human').target).toEqual({
+        mode: 'thread', rootMessageId: 'om_topic_a',
+      });
+      expect(resolveSessionReplyTarget(incumbent, 'om_prev_human')).toEqual({
+        mode: 'thread', rootMessageId: 'om_topic_a',
+      });
+      expect(frozenReplyContextForTurn(incumbent, result.triggerId).target).toEqual({
+        mode: 'thread', rootMessageId: 'om_topic_b',
+      });
+      expect(resolveSessionReplyTarget(incumbent, result.triggerId)).toEqual({
+        mode: 'thread', rootMessageId: 'om_topic_b',
+      });
+      expect(incumbent.session.replyThreadAliases?.om_topic_a).toBeDefined();
+      expect(incumbent.session.replyThreadAliases?.om_topic_b).toBeDefined();
+      expect(incumbent.currentReplyTarget).toMatchObject({ rootMessageId: 'om_topic_b', turnId: result.triggerId });
+      expect(mockUpdateSession).toHaveBeenCalledWith(expect.objectContaining({
+        sessionId: 'sess_existing',
+        currentReplyTarget: expect.objectContaining({ rootMessageId: 'om_topic_b', turnId: result.triggerId }),
+        replyThreadAliases: expect.objectContaining({ om_topic_b: expect.any(Object) }),
+        turnReplyContexts: expect.objectContaining({
+          [result.triggerId!]: expect.objectContaining({
+            target: { mode: 'thread', rootMessageId: 'om_topic_b' },
+          }),
+        }),
+      }));
+      expect(send).toHaveBeenCalledWith(expect.objectContaining({ turnId: result.triggerId }));
+      recordSessionTurnInput({
+        dataDir: config.session.dataDir,
+        sessionId: incumbent.session.sessionId,
+        turnId: result.triggerId!,
+        input: 'fallback',
+        cliId: 'claude-code',
+      });
+      expect(readSessionTurns(config.session.dataDir, incumbent.session.sessionId, 0, 50).turns
+        .find(entry => entry.turnId === result.triggerId)?.inbound).toEqual([
+        expect.objectContaining({
+          messageId: result.triggerId,
+          via: 'trigger',
+          placement: { kind: 'thread', rootMessageId: 'om_topic_b' },
+        }),
+      ]);
+    });
+
+    it('cold-resumes a suspended chat-scope session and anchors the new turn to its seed topic', async () => {
+      setupSharedGroup();
+      mockSendMessage.mockResolvedValueOnce('om_resumed_seed');
+      const suspended = existingDs({ scope: 'chat', worker: null, hasHistory: true });
+      suspended.session.scope = 'chat';
+      suspended.session.rootMessageId = CHAT;
+      suspended.session.suspendedColdResume = true;
+      const activeSessions = new Map<string, DaemonSession>([[sessionKey(CHAT, APP), suspended]]);
+      const req = request({ rootMessageId: undefined });
+      req.presentation = { topicMessage: '唤醒挂起会话排查' };
+
+      const result = await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+
+      expect(result).toMatchObject({ ok: true, action: 'queued', target: { sessionId: 'sess_existing', chatId: CHAT } });
+      expect(mockCreateSession).not.toHaveBeenCalled();
+      expect(mockSendMessage).toHaveBeenCalledWith(APP, CHAT, '唤醒挂起会话排查');
+      expect(frozenReplyContextForTurn(suspended, result.triggerId).target).toEqual({
+        mode: 'thread', rootMessageId: 'om_resumed_seed',
+      });
+      expect(suspended.session.replyThreadAliases?.om_resumed_seed).toBeDefined();
+      expect(mockForkWorker).toHaveBeenCalledWith(
+        suspended,
+        expect.anything(),
+        expect.objectContaining({ resume: true, turnId: result.triggerId }),
+      );
+    });
+
+    it.each([undefined, null])('keeps flat chat-scope reply without sending a seed when topicMessage is %s', async topicMessage => {
+      setupSharedGroup();
+      const activeSessions = new Map<string, DaemonSession>();
+      const req = request({ rootMessageId: undefined });
+      if (topicMessage !== undefined) req.presentation = { topicMessage };
+
+      const result = await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+
+      expect(result.ok).toBe(true);
+      expect(mockSendMessage).not.toHaveBeenCalled();
+      const ds = activeSessions.get(sessionKey(CHAT, APP))!;
+      expect(ds.scope).toBe('chat');
+      expect(frozenReplyContextForTurn(ds, result.triggerId).target).toEqual({ mode: 'plain', chatId: CHAT });
+    });
+
+    it('honors per-chat shared override even when bot default mode is chat', async () => {
+      mockGetChatMode.mockResolvedValue('group');
+      mockGetBot.mockReturnValue({
+        config: {
+          larkAppId: APP,
+          cliId: 'claude-code',
+          workingDir: '/tmp',
+          regularGroupReplyMode: 'chat',
+          chatReplyModes: { [CHAT]: 'shared' },
+        },
+        botName: 'Bot',
+        botOpenId: 'ou_bot',
+      });
+      mockSendMessage.mockResolvedValueOnce('om_override_seed');
+      const activeSessions = new Map<string, DaemonSession>();
+      const req = request({ rootMessageId: undefined });
+      req.presentation = { topicMessage: '按群覆盖 shared 话题' };
+
+      const result = await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+
+      expect(result.ok).toBe(true);
+      expect(mockSendMessage).toHaveBeenCalledWith(APP, CHAT, '按群覆盖 shared 话题');
+      const ds = activeSessions.get(sessionKey(CHAT, APP))!;
+      expect(ds.scope).toBe('chat');
+      expect(frozenReplyContextForTurn(ds, result.triggerId).target).toEqual({
+        mode: 'thread', rootMessageId: 'om_override_seed',
+      });
+    });
+
+    it('anchors auto-worktree notices and deferred turn into the shared seed topic', async () => {
+      setupSharedGroup();
+      mockBotAutoWorktreeEnabled.mockReturnValue(true);
+      mockSendMessage.mockResolvedValueOnce('om_wt_seed');
+      const activeSessions = new Map<string, DaemonSession>();
+      const req = request({ rootMessageId: undefined });
+      req.presentation = { topicMessage: '自动创建 worktree 处理' };
+
+      const result = await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+
+      expect(result).toMatchObject({ ok: true, action: 'queued', target: { sessionId: 'sess_new', chatId: CHAT } });
+      expect(mockSendMessage).toHaveBeenCalledWith(APP, CHAT, '自动创建 worktree 处理');
+      const ds = activeSessions.get(sessionKey(CHAT, APP))!;
+      expect(ds.scope).toBe('chat');
+      expect(ds.pendingRepo).toBe(true);
+      expect(ds.pendingTurnId).toBe(result.triggerId);
+      expect(frozenReplyContextForTurn(ds, result.triggerId).target).toEqual({
+        mode: 'thread', rootMessageId: 'om_wt_seed',
+      });
+      expect(ds.session.replyThreadAliases?.om_wt_seed).toBeDefined();
+      expect(mockUpdateSession).toHaveBeenCalledWith(expect.objectContaining({
+        sessionId: 'sess_new',
+        currentReplyTarget: expect.objectContaining({ rootMessageId: 'om_wt_seed', turnId: result.triggerId }),
+        replyThreadAliases: expect.objectContaining({ om_wt_seed: expect.any(Object) }),
+      }));
+      expect(mockRunAutoWorktreeCommit).toHaveBeenCalledTimes(1);
+      const notify = mockRunAutoWorktreeCommit.mock.calls[0][0].notify as (msg: string) => Promise<unknown>;
+      await notify('正在准备 worktree');
+      expect(mockReplyMessage).toHaveBeenCalledWith(APP, 'om_wt_seed', '正在准备 worktree', 'text', true);
+    });
+
+    it('anchors runAs trigger on an existing shared chat session to the new seed topic and registers alias', async () => {
+      setupSharedGroup();
+      mockSendMessage.mockResolvedValueOnce('om_runas_seed');
+      vi.mocked(resolveSender).mockResolvedValueOnce({ openId: 'ou_person', name: 'Alice', type: 'user' });
+      const send = vi.fn();
+      const incumbent = existingDs({
+        scope: 'chat',
+        worker: { killed: false, send } as any,
+        currentReplyTarget: { rootMessageId: 'om_old_topic', turnId: 'om_prev', updatedAt: '2026-06-01T00:00:00.000Z', quoteOnly: true },
+      });
+      incumbent.session.scope = 'chat';
+      incumbent.session.rootMessageId = CHAT;
+      incumbent.session.currentReplyTarget = incumbent.currentReplyTarget;
+      const activeSessions = new Map<string, DaemonSession>([[sessionKey(CHAT, APP), incumbent]]);
+      const req: TriggerRequest = {
+        runAs: 'ou_person',
+        source: { type: 'webhook', connectorId: 'conn_1', requestId: 'req_runas' },
+        target: { kind: 'turn', botId: APP, chatId: CHAT },
+        instruction: '按指定身份排查',
+        presentation: { topicMessage: '新话题排查' },
+        envelope: { format: 'text', sourceName: 'alerts', trusted: false },
+      };
+
+      const result = await triggerSessionTurn(req, {
+        larkAppId: APP,
+        activeSessions,
+        resolveRunAs: async () => ({ ok: true, openId: 'ou_person' }),
+      });
+
+      expect(result.ok).toBe(true);
+      expect(mockSendMessage).toHaveBeenCalledWith(APP, CHAT, '新话题排查');
+      expect(frozenReplyContextForTurn(incumbent, result.triggerId).target).toEqual({
+        mode: 'thread', rootMessageId: 'om_runas_seed',
+      });
+      expect(incumbent.session.replyThreadAliases?.om_runas_seed).toBeDefined();
+      expect(incumbent.currentReplyTarget).toMatchObject({ rootMessageId: 'om_runas_seed', turnId: result.triggerId });
+      expect(send.mock.calls[0][0].content).toContain('root_message_id="om_runas_seed"');
+    });
+
+    it('never sends a seed when dryRun is true or pre-flight fails', async () => {
+      setupSharedGroup();
+      const req = request({ rootMessageId: undefined });
+      req.presentation = { topicMessage: '不应发送' };
+      req.options = { dryRun: true };
+      const dryRes = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: new Map() });
+      expect(dryRes).toMatchObject({ ok: true, action: 'dry_run' });
+      expect(mockSendMessage).not.toHaveBeenCalled();
+
+      // Pre-flight rejection on a non-runnable incumbent must not send a seed.
+      const pendingIncumbent = existingDs({ scope: 'chat', worker: null, pendingRepo: true });
+      pendingIncumbent.session.rootMessageId = CHAT;
+      const pendingReq = request({ rootMessageId: undefined });
+      pendingReq.presentation = { topicMessage: '不应发送' };
+      const pendingRes = await triggerSessionTurn(pendingReq, {
+        larkAppId: APP,
+        activeSessions: new Map([[sessionKey(CHAT, APP), pendingIncumbent]]),
+      });
+      expect(pendingRes).toMatchObject({ ok: false, errorCode: 'session_not_runnable' });
+      expect(mockSendMessage).not.toHaveBeenCalled();
+    });
+
+    it('rolls back reply state and withdraws the seed if dispatch fails after sending', async () => {
+      setupSharedGroup();
+      mockSendMessage.mockResolvedValueOnce('om_orphan_seed');
+      const prevAnchor = { rootMessageId: 'om_prev_topic', turnId: 'om_prev_turn', updatedAt: '2026-06-01T00:00:00.000Z' };
+      const incumbent = existingDs({
+        scope: 'chat',
+        worker: null,
+        hasHistory: true,
+        currentReplyTarget: prevAnchor,
+        replyThreadAliases: { om_prev_topic: { createdAt: '2026-06-01T00:00:00.000Z', lastUsedAt: '2026-06-01T00:00:00.000Z' } },
+      });
+      incumbent.session.scope = 'chat';
+      incumbent.session.rootMessageId = CHAT;
+      incumbent.session.currentReplyTarget = prevAnchor;
+      incumbent.session.replyThreadAliases = incumbent.replyThreadAliases;
+      incumbent.session.turnReplyContexts = { om_prev_turn: { target: { mode: 'thread', rootMessageId: 'om_prev_topic' } } };
+      incumbent.session.replyTargets = { om_prev_turn: { rootMessageId: 'om_prev_topic', updatedAt: '2026-06-01T00:00:00.000Z' } };
+      mockForkWorker.mockImplementationOnce(() => { throw new Error('spawn failed'); });
+      const activeSessions = new Map<string, DaemonSession>([[sessionKey(CHAT, APP), incumbent]]);
+      const req = request({ rootMessageId: undefined });
+      req.presentation = { topicMessage: '失败应回滚' };
+
+      await expect(triggerSessionTurn(req, { larkAppId: APP, activeSessions })).rejects.toThrow('spawn failed');
+
+      expect(incumbent.currentReplyTarget).toEqual(prevAnchor);
+      expect(incumbent.session.currentReplyTarget).toEqual(prevAnchor);
+      expect(incumbent.session.replyThreadAliases?.om_orphan_seed).toBeUndefined();
+      expect(incumbent.session.replyThreadAliases?.om_prev_topic).toBeDefined();
+      expect(Object.keys(incumbent.session.turnReplyContexts ?? {})).toEqual(['om_prev_turn']);
+      await vi.waitFor(() => expect(mockDeleteMessage).toHaveBeenCalledWith(APP, 'om_orphan_seed'));
+    });
+
+    it('cleans up the new-session reservation if sending the shared seed fails', async () => {
+      setupSharedGroup();
+      mockSendMessage.mockRejectedValueOnce(new Error('lark unavailable'));
+      const activeSessions = new Map<string, DaemonSession>();
+      const req = request({ rootMessageId: undefined });
+      req.presentation = { topicMessage: '发送失败' };
+
+      await expect(triggerSessionTurn(req, { larkAppId: APP, activeSessions })).rejects.toThrow('lark unavailable');
+
+      expect(activeSessions.has(sessionKey(CHAT, APP))).toBe(false);
+      expect(mockCloseSession).toHaveBeenCalledWith('sess_new');
+      expect(mockForkWorker).not.toHaveBeenCalled();
+    });
+
+    it('withdraws the seed and refuses dispatch if the incumbent session closes while sendMessage is in flight', async () => {
+      setupSharedGroup();
+      const send = vi.fn();
+      const incumbent = existingDs({ scope: 'chat', worker: { killed: false, send } as any });
+      incumbent.session.scope = 'chat';
+      incumbent.session.rootMessageId = CHAT;
+      const activeSessions = new Map<string, DaemonSession>([[sessionKey(CHAT, APP), incumbent]]);
+      mockSendMessage.mockImplementationOnce(async () => {
+        incumbent.session.status = 'closed';
+        activeSessions.delete(sessionKey(CHAT, APP));
+        return 'om_closed_midflight';
+      });
+      const req = request({ rootMessageId: undefined });
+      req.presentation = { topicMessage: '中途关闭' };
+
+      const result = await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+
+      expect(result).toMatchObject({ ok: false, errorCode: 'session_not_found' });
+      expect(send).not.toHaveBeenCalled();
+      await vi.waitFor(() => expect(mockDeleteMessage).toHaveBeenCalledWith(APP, 'om_closed_midflight'));
+    });
+
+    it('does not open a shared group seed for p2p chats even when regularGroupReplyMode is shared', async () => {
+      mockGetChatMode.mockResolvedValue('p2p');
+      mockGetBot.mockReturnValue({
+        config: { larkAppId: APP, cliId: 'claude-code', workingDir: '/tmp', regularGroupReplyMode: 'shared' },
+        botName: 'Bot',
+        botOpenId: 'ou_bot',
+      });
+      const activeSessions = new Map<string, DaemonSession>();
+      const req = request({ rootMessageId: undefined });
+      req.presentation = { topicMessage: '私聊事件' };
+
+      const result = await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+
+      expect(result.ok).toBe(true);
+      expect(mockSendMessage).not.toHaveBeenCalled();
+      expect(activeSessions.get(sessionKey(CHAT, APP))?.scope).toBe('chat');
+    });
+
+    it('never leaks prior human quoteTarget/sender metadata into shared-topic turnReplyContexts (ordinary or runAs)', async () => {
+      setupSharedGroup();
+      const send = vi.fn();
+      const incumbent = existingDs({ scope: 'chat', worker: { killed: false, send } as any });
+      incumbent.session.scope = 'chat';
+      incumbent.session.rootMessageId = CHAT;
+      incumbent.session.quoteTargetId = 'om_bob_msg';
+      incumbent.session.quoteTargetSenderOpenId = 'ou_bob';
+      incumbent.session.quoteTargetSenderIsBot = false;
+      const activeSessions = new Map<string, DaemonSession>([[sessionKey(CHAT, APP), incumbent]]);
+
+      mockSendMessage.mockResolvedValueOnce('om_webhook_seed');
+      const webhookReq = request({ rootMessageId: undefined });
+      webhookReq.presentation = { topicMessage: 'Webhook 排查' };
+      const webhookRes = await triggerSessionTurn(webhookReq, { larkAppId: APP, activeSessions });
+      expect(webhookRes.ok).toBe(true);
+      expect(incumbent.session.turnReplyContexts?.[webhookRes.triggerId!]).toEqual({
+        target: { mode: 'thread', rootMessageId: 'om_webhook_seed' },
+      });
+      expect(incumbent.session.replyThreadAliases?.om_webhook_seed).toBeDefined();
+
+      mockSendMessage.mockResolvedValueOnce('om_runas_seed_clean');
+      vi.mocked(resolveSender).mockResolvedValueOnce({ openId: 'ou_alice', name: 'Alice', type: 'user' });
+      const runAsReq: TriggerRequest = {
+        runAs: 'ou_alice',
+        source: { type: 'webhook', connectorId: 'conn_1', requestId: 'req_runas_clean' },
+        target: { kind: 'turn', botId: APP, chatId: CHAT },
+        instruction: '按 Alice 身份执行',
+        presentation: { topicMessage: 'Alice 话题' },
+        envelope: { format: 'text', sourceName: 'alerts', trusted: false },
+      };
+      const runAsRes = await triggerSessionTurn(runAsReq, {
+        larkAppId: APP,
+        activeSessions,
+        resolveRunAs: async () => ({ ok: true, openId: 'ou_alice' }),
+      });
+      expect(runAsRes.ok).toBe(true);
+      const runAsCtx = incumbent.session.turnReplyContexts?.[runAsRes.triggerId!];
+      expect(runAsCtx?.target).toEqual({ mode: 'thread', rootMessageId: 'om_runas_seed_clean' });
+      expect(runAsCtx?.quoteTargetId).toBeUndefined();
+      expect(runAsCtx?.replyTargetSenderOpenId).toBeUndefined();
+      expect(runAsCtx?.replyTargetSenderIsBot).toBeUndefined();
+      expect(incumbent.session.replyTargets?.[runAsRes.triggerId!]?.senderOpenId).toBe('ou_alice');
+      expect(incumbent.session.replyThreadAliases?.om_runas_seed_clean).toBeDefined();
+    });
+
+    it('retires the new-session reservation and withdraws the seed when forkWorker or updateSession throws', async () => {
+      setupSharedGroup();
+      const activeSessions = new Map<string, DaemonSession>();
+
+      // 1) forkWorker throws on fresh shared session
+      mockSendMessage.mockResolvedValueOnce('om_wedged_seed');
+      mockForkWorker.mockImplementationOnce(() => { throw new Error('fork boom'); });
+      const req1 = request({ rootMessageId: undefined });
+      req1.presentation = { topicMessage: '首轮失败' };
+      await expect(triggerSessionTurn(req1, { larkAppId: APP, activeSessions })).rejects.toThrow('fork boom');
+      expect(activeSessions.has(sessionKey(CHAT, APP))).toBe(false);
+      expect(mockCloseSession).toHaveBeenCalledWith('sess_new');
+      await vi.waitFor(() => expect(mockDeleteMessage).toHaveBeenCalledWith(APP, 'om_wedged_seed'));
+
+      // Subsequent trigger on the same group must NOT be wedged by a ghost session.
+      mockSendMessage.mockResolvedValueOnce('om_recovered_seed');
+      const req2 = request({ rootMessageId: undefined });
+      req2.presentation = { topicMessage: '重试成功' };
+      const retryRes = await triggerSessionTurn(req2, { larkAppId: APP, activeSessions });
+      expect(retryRes).toMatchObject({ ok: true, action: 'queued', target: { sessionId: 'sess_new', chatId: CHAT } });
+
+      // 2) useAutoWt updateSession throws after sendMessage + beginReplyTargetTurn
+      const wtSessions = new Map<string, DaemonSession>();
+      mockBotAutoWorktreeEnabled.mockReturnValue(true);
+      mockSendMessage.mockResolvedValueOnce('om_wt_orphan');
+      let threwWtPersist = false;
+      mockUpdateSession.mockImplementation((s: any) => {
+        if (!threwWtPersist && s?.replyThreadAliases?.om_wt_orphan) {
+          threwWtPersist = true;
+          throw new Error('disk full');
+        }
+      });
+      const wtReq = request({ rootMessageId: undefined });
+      wtReq.presentation = { topicMessage: 'wt 落盘失败' };
+      await expect(triggerSessionTurn(wtReq, { larkAppId: APP, activeSessions: wtSessions })).rejects.toThrow('disk full');
+      expect(threwWtPersist).toBe(true);
+      expect(wtSessions.has(sessionKey(CHAT, APP))).toBe(false);
+      expect(mockRunAutoWorktreeCommit).not.toHaveBeenCalled();
+      await vi.waitFor(() => expect(mockDeleteMessage).toHaveBeenCalledWith(APP, 'om_wt_orphan'));
+    });
+
+    it('preserves an in-place taken-over session or admitted human follower during mid-flight sendMessage', async () => {
+      setupSharedGroup();
+
+      // 1) In-place takeover starts a live worker during sendMessage: withdraw seed, do NOT close the live session.
+      const takeoverSessions = new Map<string, DaemonSession>();
+      mockSendMessage.mockImplementationOnce(async () => {
+        const ds = takeoverSessions.get(sessionKey(CHAT, APP))!;
+        ds.initialStartPending = false;
+        ds.worker = { killed: false, send: vi.fn() } as any;
+        return 'om_takeover_seed';
+      });
+      const req1 = request({ rootMessageId: undefined });
+      req1.presentation = { topicMessage: '中途接管' };
+      const res1 = await triggerSessionTurn(req1, { larkAppId: APP, activeSessions: takeoverSessions });
+      expect(res1).toMatchObject({ ok: false, errorCode: 'trigger_failed' });
+      expect(takeoverSessions.get(sessionKey(CHAT, APP))?.session.status).toBe('active');
+      expect(mockCloseSession).not.toHaveBeenCalled();
+      await vi.waitFor(() => expect(mockDeleteMessage).toHaveBeenCalledWith(APP, 'om_takeover_seed'));
+
+      // 2) Admitted human follower arrives while sendMessage fails: do NOT destroy the queued follower's session.
+      const followerSessions = new Map<string, DaemonSession>();
+      mockSendMessage.mockImplementationOnce(async () => {
+        const ds = followerSessions.get(sessionKey(CHAT, APP))!;
+        ds.session.queuedActivationTail = [{ id: 'q1', order: 1, turnId: 'om_human', userPrompt: 'hi', cliInput: { content: 'hi' } }] as any;
+        throw new Error('lark timeout');
+      });
+      const req2 = request({ rootMessageId: undefined });
+      req2.presentation = { topicMessage: '发送超时' };
+      await expect(triggerSessionTurn(req2, { larkAppId: APP, activeSessions: followerSessions })).rejects.toThrow('lark timeout');
+      expect(followerSessions.has(sessionKey(CHAT, APP))).toBe(true);
+      expect(mockCloseSession).not.toHaveBeenCalled();
+    });
+
+    it('cleans up liveCard, hiddenThinkingTurns, suppressFinalOutput, reply state, and seed on live-worker send throw', async () => {
+      setupSharedGroup();
+      mockSendMessage.mockResolvedValueOnce('om_live_throw_seed');
+      const prevAnchor = { rootMessageId: 'om_prev', turnId: 'om_prev_t', updatedAt: '2026-06-01T00:00:00.000Z' };
+      const incumbent = existingDs({
+        scope: 'chat',
+        worker: { killed: false, send: vi.fn(() => { throw new Error('ipc broken'); }) } as any,
+        currentReplyTarget: prevAnchor,
+        replyThreadAliases: { om_prev: { createdAt: '2026-06-01T00:00:00.000Z', lastUsedAt: '2026-06-01T00:00:00.000Z' } },
+      });
+      incumbent.session.scope = 'chat';
+      incumbent.session.rootMessageId = CHAT;
+      incumbent.session.currentReplyTarget = prevAnchor;
+      incumbent.session.replyThreadAliases = incumbent.replyThreadAliases;
+      incumbent.session.hiddenThinkingTurns = ['om_prev_t'];
+      const activeSessions = new Map<string, DaemonSession>([[sessionKey(CHAT, APP), incumbent]]);
+      const req = request({ rootMessageId: undefined });
+      req.presentation = { topicMessage: '发送异常回滚', liveCard: 'on-start', thinking: 'hidden' };
+      req.options = { suppressFinalOutput: true };
+
+      await expect(triggerSessionTurn(req, { larkAppId: APP, activeSessions })).rejects.toThrow('ipc broken');
+
+      const failedTurnId = mockBuildFollowUpCliInput.mock.calls.at(-1)?.[2]?.turnId as string;
+      expect(failedTurnId).toMatch(/^trg_/);
+      expect(incumbent.currentReplyTarget).toEqual(prevAnchor);
+      expect(incumbent.session.replyThreadAliases?.om_live_throw_seed).toBeUndefined();
+      expect(incumbent.session.hiddenThinkingTurns).toEqual(['om_prev_t']);
+      expect(incumbent.suppressedTriggerFinalTurns).toBeUndefined();
+      expect(isTriggerFinalSuppressed(incumbent, failedTurnId)).toBe(false);
+      expect(hasPendingTriggerStreamingCard(incumbent, failedTurnId)).toBe(false);
+      await vi.waitFor(() => expect(mockDeleteMessage).toHaveBeenCalledWith(APP, 'om_live_throw_seed'));
+    });
   });
 
   it('anchors an explicit seed in a p2p chat to its own seed message', async () => {

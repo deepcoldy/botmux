@@ -18,6 +18,7 @@ You can also edit `~/.botmux/config.json` directly. Every item below lists its J
 |---|---|---|---|
 | Install new versions daily | System & Maintenance → Auto Maintenance → Auto update | `maintenance.autoUpdate` | Off |
 | Restart after a new version is installed | System & Maintenance → Auto Maintenance → Auto restart | `maintenance.autoRestart` | Off |
+| DM the primary bot admin about new versions | System & Maintenance → Auto Maintenance → New version DM reminders | `maintenance.notifyOnNewVersion` | Off |
 | Close long-unused sessions on a schedule | General → Scheduled tasks → Auto-clean idle sessions on a schedule | `sessionCleanup` | Off |
 | Get a DM when the host is overloaded | General → Host overload alert | `hostOverloadAlert` | Off |
 | Run scheduled tasks in a specific timezone | General → Scheduled tasks → Timezone | `scheduleTimeZone` | Follow host |
@@ -47,6 +48,12 @@ After an intentional restart (manual restart, restart after auto update, rollbac
   }
 }
 ```
+
+### New version DM reminders {#version-notifications}
+
+“New version DM reminders” are off by default. Enable them in Dashboard auto-maintenance settings or through the `/dashboard settings` card in Lark. The corresponding configuration is `"maintenance": { "notifyOnNewVersion": true }`.
+
+When enabled, botmux checks hourly for a new version and sends a DM only through the primary bot to its resolved primary admin; it doesn't notify every other bot. This is independent of auto update, auto restart, and restart reports: it only checks and reminds, never installs an update. When disabled, it neither checks nor sends reminders. See the repository's [version notification notes](https://github.com/deepcoldy/botmux/blob/master/docs/version-notifications.md) (Chinese) for delivery, deduplication, and retry details.
 
 ### Auto-upgrading Codex inside sessions
 
