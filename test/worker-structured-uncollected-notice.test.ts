@@ -5,6 +5,7 @@
  * the thread, and which are already covered by something else.
  */
 import { describe, expect, it, vi } from 'vitest';
+import { createCursorAdapter } from '../src/adapters/cli/cursor.js';
 import { CodexBridgeQueue, type CodexPendingTurn } from '../src/services/codex-bridge-queue.js';
 import { uncollectedTurnsNeedingNotice } from '../src/services/structured-uncollected-notice.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
@@ -248,6 +249,37 @@ describe('worker: expired structured heads', () => {
       const idle = harness([], undefined, { cliAdapter: adapter, captureBackendScreen: vi.fn(() => heldScreen) });
       idle.prune('structured bridge tick');
       expect(idle.scope.captureBackendScreen).not.toHaveBeenCalled();
+    });
+
+    it('holds queued Cursor follow-ups while Cursor is running or displaying its follow-ups panel, even if isPromptReady is true', () => {
+      const cursorAdapter = createCursorAdapter('/bin/cursor-agent');
+      const now = Date.now();
+      const f1: CodexPendingTurn = { turnId: 'om_f1', started: false, writeSettledAtMs: now - 60_000 };
+      const f2: CodexPendingTurn = { turnId: 'om_f2', started: false, writeSettledAtMs: now - 30_000 };
+      let screen = [
+        ' ┌─ follow-ups ────┐',
+        ' │ ○ Second follow-up │',
+        ' │ enter steer · ↑ select/edit · esc cancel │',
+        ' └──────────────────┘',
+        '  → Add a follow-up                                      ctrl+c to stop',
+      ].join('\n');
+      const h = harness([f1, f2], { isPromptReady: true }, {
+        cliAdapter: cursorAdapter,
+        captureBackendScreen: vi.fn(() => screen),
+      });
+
+      h.prune('structured bridge tick');
+      expect(h.scope.codexBridgeQueue.refreshUnstartedHeadAttributionLease)
+        .toHaveBeenCalledWith(expect.any(Number), 'held-input-cap', expect.any(Function));
+      const eligibleWhileBusy = h.scope.codexBridgeQueue.refreshUnstartedHeadAttributionLease.mock.calls[0][2] as (t: CodexPendingTurn) => boolean;
+      expect([eligibleWhileBusy(f1), eligibleWhileBusy(f2)]).toEqual([true, true]);
+
+      // Once Cursor settles to an empty idle composer, the hold ends cleanly.
+      h.scope.codexBridgeQueue.refreshUnstartedHeadAttributionLease.mockClear();
+      screen = '  → Add a follow-up\n  Gemini 4 Carbon High · 12.9%';
+      h.scope.cliHeldInputProbe.atMs -= 1_000;
+      h.prune('structured bridge tick');
+      expect(h.scope.codexBridgeQueue.refreshUnstartedHeadAttributionLease).not.toHaveBeenCalled();
     });
   });
 
