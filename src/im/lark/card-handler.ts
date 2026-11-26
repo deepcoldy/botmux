@@ -15,6 +15,8 @@ import { canSaveClaudeSessionSettings, sessionUsesClaudeCode, supportsClaudeSess
  * Extracted from daemon.ts for modularity.
  */
 import { sessionPromptInjection } from '../../core/prompt-injection.js';
+import { plannedOpeningBackendType } from '../../core/opening-backend.js';
+import { prepareHookEnvelopeForReplay } from '../../core/prompt-hook-replay.js';
 import { normalizeCardActionData } from './card-action-data.js';
 import { logCardActionDiagnostics } from './card-action-diagnostics.js';
 import { existsSync } from 'node:fs';
@@ -444,6 +446,7 @@ function captureTurnStateBeforePurgeClick(ds: DaemonSession): () => void {
     suppressRecoveryCard: ds.suppressRecoveryCard,
     lastUserPrompt: ds.lastUserPrompt,
     lastCliInput: ds.lastCliInput,
+    lastHookEnvelope: ds.lastHookEnvelope,
     lastCliInputTurnId: ds.lastCliInputTurnId,
     lastCodexAppInput: ds.lastCodexAppInput,
     currentTurnTitle: ds.currentTurnTitle,
@@ -452,6 +455,7 @@ function captureTurnStateBeforePurgeClick(ds: DaemonSession): () => void {
   const persisted = {
     lastUserPrompt: ds.session.lastUserPrompt,
     lastCliInput: ds.session.lastCliInput,
+    lastHookEnvelope: ds.session.lastHookEnvelope,
     lastCliInputTurnId: ds.session.lastCliInputTurnId,
     lastCodexAppInput: ds.session.lastCodexAppInput,
   };
@@ -910,7 +914,7 @@ export async function commitRepoSelection(
               turnId: pendingRawInput
                 ? undefined
                 : (ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId),
-              sessionBackendType: ds.session.backendType,
+              sessionBackendType: plannedOpeningBackendType(ds, effectiveCliId, botCfg),
               promptInjection: sessionPromptInjection(ds),
             },
           )
@@ -4469,19 +4473,28 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       const retryCodexAppInput = ds.lastCodexAppInput
         ? (({ clientUserMessageId: _priorMessageId, ...input }) => input)(ds.lastCodexAppInput)
         : undefined;
-      const retryInput = {
-        content: cliInput,
-        ...(retryCodexAppInput ? { codexAppInput: retryCodexAppInput } : {}),
-      };
       if ((!ds.worker || ds.worker.killed) && hasProtectedSessionMutationOwnership(ds)) {
         await sessionReply(rootId, t('card.action.retry_last_task_unavailable', undefined, locDs));
         return;
       }
       const retryTurnId = `retry-${randomUUID()}`;
+      const willUseLiveWorker = !!(ds.worker && !ds.worker.killed);
+      const replayed = prepareHookEnvelopeForReplay({
+        ds,
+        content: cliInput,
+        turnId: retryTurnId,
+        hookEnvelope: ds.lastHookEnvelope ?? ds.session.lastHookEnvelope,
+        willUseLiveWorker,
+      });
+      const retryInput = {
+        content: replayed.content,
+        ...(replayed.hookEnvelope ? { hookEnvelope: replayed.hookEnvelope } : {}),
+        ...(retryCodexAppInput ? { codexAppInput: retryCodexAppInput } : {}),
+      };
       const rollbackReplyRouting = inheritTurnReplyRouting(ds, ds.lastCliInputTurnId, retryTurnId);
       let accepted = false;
       try {
-        if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput, retryTurnId);
+        if (willUseLiveWorker) accepted = sendWorkerInput(ds, retryInput, retryTurnId);
         else {
           accepted = forkManualTurn(ds, retryInput, retryTurnId, forkWorker);
         }
@@ -4681,22 +4694,31 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       const submittedContent = continueMode
         ? buildTurnContinuePrompt()
         : failedTurn.cliInput;
-      const retryInput = editedInput ?? {
+      const retryTurnId = `retry-${randomUUID()}`;
+      const willUseLiveWorker = !!(ds.worker && !ds.worker.killed);
+      const replayed = editing ? undefined : prepareHookEnvelopeForReplay({
+        ds,
         content: submittedContent,
+        turnId: retryTurnId,
+        hookEnvelope: failedTurn.hookEnvelope,
+        willUseLiveWorker,
+      });
+      const retryInput = editedInput ?? {
+        content: replayed?.content ?? submittedContent,
+        ...(replayed?.hookEnvelope ? { hookEnvelope: replayed.hookEnvelope } : {}),
         ...(!continueMode && failedTurn.attachments ? { attachments: structuredClone(failedTurn.attachments) } : {}),
         ...(failedTurn.trustedCaller ? { trustedCaller: { ...failedTurn.trustedCaller } } : {}),
         // codexAppInput 描述的是「原样重发那条结构化输入」。续跑发的是一条新指令，
         // 带上旧 sidecar 会让 CLI 收到与正文不符的结构化载荷。
         ...(!continueMode && retryCodexAppInput ? { codexAppInput: retryCodexAppInput } : {}),
       };
-      const retryTurnId = `retry-${randomUUID()}`;
       const rollbackReplyRouting = inheritTurnReplyRouting(ds, failedTurn.turnId, retryTurnId);
       let accepted = false;
       try {
         // A turn that failed without any output is cut first and its input
         // re-sent as it was — nothing ran, so there is nothing to continue
         // from (core/failed-turn-rewind.ts). Otherwise the mode above applies.
-        if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput, retryTurnId, {
+        if (willUseLiveWorker) accepted = sendWorkerInput(ds, retryInput, retryTurnId, {
           ...(failedTurn.trustedCaller ? { trustedCaller: { ...failedTurn.trustedCaller } } : {}),
           ...(!continueMode ? { failedTurnResendOf: failedTurn.turnId } : {}),
           ...(editing ? { failedTurnEditedInput: true } : {}),

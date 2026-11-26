@@ -346,6 +346,35 @@ describe('retry_turn — happy path', () => {
     expect(res?.toast?.type).toBe('success');
   });
 
+  it('keeps the original delivery envelope for a non-direct failure continue on a live worker', async () => {
+    const envelope = '<botmux_reminder>deliver with botmux send</botmux_reminder>\n\n<sender name="Alice" />';
+    const ds = makeDs({
+      sessionOverrides: {
+        lastFailedTurn: makeFailedTurn({ hookEnvelope: envelope, directFailure: undefined }),
+      },
+    });
+    await handleCardAction(actionData(TURN, 'continue'), depsWith(ds), LARK_APP_ID);
+    const sent = sendWorkerInputMock.mock.calls[0][1];
+    expect(sent.content).toContain('[BOTMUX_CONTINUE]');
+    expect(sent.content).toContain(envelope);
+    expect(sent.hookEnvelope).toBeUndefined();
+  });
+
+  it('keeps the original delivery envelope for a direct-failure continue that reforks', async () => {
+    const envelope = '<botmux_reminder>deliver with botmux send</botmux_reminder>';
+    const ds = makeDs({
+      worker: null,
+      sessionOverrides: {
+        lastFailedTurn: makeFailedTurn({ hookEnvelope: envelope, directFailure: true }),
+      },
+    });
+    await handleCardAction(actionData(TURN, 'continue'), depsWith(ds), LARK_APP_ID);
+    const sent = forkWorkerMock.mock.calls[0][1];
+    expect(sent.content).toContain('[BOTMUX_CONTINUE]');
+    expect(sent.content).toContain(envelope);
+    expect(sent.hookEnvelope).toBeUndefined();
+  });
+
   it('treats a card with no mode as continue (fail-safe for older cards)', async () => {
     // Defaulting to resend would blindly replay a possibly-executed turn.
     const ds = makeDs();
@@ -845,6 +874,20 @@ describe('TRAE saved prompt recovery', () => {
     const [, payload, , opts] = sendWorkerInputMock.mock.calls[0];
     expect(payload.trustedCaller).toEqual(trustedCaller);
     expect(opts).toMatchObject({ trustedCaller });
+  });
+  it('uses the edited input directly without replaying a hook sidecar', async () => {
+    const trustedCaller = { requestUserOpenId: 'ou_original', requestLarkAppId: LARK_APP_ID, senderType: 'user' as const };
+    const hookEnvelope = '<botmux_reminder>original delivery</botmux_reminder>';
+    const ds = trae({ trustedCaller, hookEnvelope });
+    const data = actionData(TURN, null, 'retry_edited_prompt');
+    data.action.form_value = { failed_prompt: 'edited prompt', failed_image: 'keep' };
+    await handleCardAction(data, depsWith(ds), LARK_APP_ID);
+    const [, payload, , opts] = sendWorkerInputMock.mock.calls[0];
+    expect(payload.content).toContain('edited prompt');
+    expect(payload.content).not.toContain(hookEnvelope);
+    expect(payload.hookEnvelope).toBeUndefined();
+    expect(payload.trustedCaller).toEqual(trustedCaller);
+    expect(opts).toMatchObject({ trustedCaller, failedTurnEditedInput: true });
   });
   it('opens the editor on the same card without sending input or spending the retry cooldown', async () => {
     const { sendEphemeralCard } = await import('../src/im/lark/client.js'); vi.mocked(sendEphemeralCard).mockClear();

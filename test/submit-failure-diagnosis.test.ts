@@ -553,4 +553,49 @@ describe('shouldWaitThroughBusyTurn', () => {
     expect(shouldWaitThroughBusyTurn({ ...base, waitsSoFar: 12, maxWaits: 12 })).toBe(false);
     expect(shouldWaitThroughBusyTurn({ ...base, waitsSoFar: 99 })).toBe(false);
   });
+
+  it('recognizes expanded hook-mode opening context blocks parked in Claude composer and keeps scrolled tail match', () => {
+    const rule = '─'.repeat(50);
+    const screen = [
+      'Claude Code',
+      rule,
+      '❯ <chat_context_policy>policy</chat_context_policy>',
+      '  帮我查一下接口延迟',
+      rule,
+    ].join('\n');
+    const diagnosis = diagnoseSubmitFailure({
+      cliId: 'claude-code',
+      screenText: screen,
+      nowMs: NOW,
+    });
+    expect(diagnosis.reason).toBe('draft_parked');
+    expect(diagnosis.matched).toBe('draft_parked:claude_composer');
+
+    const fullHookOpening = `${'很长的开场消息内容'.repeat(20)}\n\n<botmux_skills mode="priority">- deploy-service-alpha</botmux_skills>`;
+    const scrolledScreen = [
+      '─── ↑ 12 more ───',
+      '  <botmux_skills mode="priority">- deploy-service-alpha</botmux_skills>',
+      rule,
+    ].join('\n');
+    expect(claudeComposerHoldsInput(scrolledScreen, fullHookOpening)).toBe(true);
+
+    // Plain single-line bare hook draft (no XML tags) + ZWJ/ZWSP sanitization match.
+    const zwsp = String.fromCharCode(0x200B);
+    const zwj = String.fromCharCode(0x200D);
+    const bareHookInput = `${zwsp}👨${zwj}👩 排查登录接口超时`;
+    const plainScreen = [
+      rule,
+      '❯ 👨👩 排查登录接口超时',
+      rule,
+    ].join('\n');
+    expect(claudeComposerHoldsInput(plainScreen, bareHookInput)).toBe(true);
+    const bareDiag = diagnoseSubmitFailure({
+      cliId: 'claude-code',
+      screenText: plainScreen,
+      submittedInput: bareHookInput,
+      nowMs: NOW,
+    });
+    expect(bareDiag.reason).toBe('draft_parked');
+    expect(bareDiag.matched).toBe('draft_parked:claude_composer_input');
+  });
 });

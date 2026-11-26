@@ -7662,7 +7662,7 @@ async function cmdProject(argv: string[]): Promise<void> {
     ipcPort,
     session.sessionId,
     'workstream' in parsed ? 'project-workstream' : 'project',
-    'workstream' in parsed ? parsed.workstream : parsed.action as unknown as Record<string, unknown>,
+    'workstream' in parsed ? parsed.workstream : { ...parsed.action, cardPublication: 'repost' },
   );
   if ('workstream' in parsed) {
     const result = await response.json().catch(() => ({})) as { ok?: boolean; error?: string; hint?: string; result?: unknown; grantId?: string };
@@ -20665,24 +20665,25 @@ async function cmdUserPromptHook(): Promise<void> {
     const larkAppId = process.env.BOTMUX_LARK_APP_ID;
     let discoveredPort: number | undefined;
     try { discoveredPort = findDaemon(larkAppId)?.ipcPort; } catch { /* masked/unreadable registry */ }
-    const ipcPort = resolveDaemonIpcPort(
-      discoveredPort,
-      process.env.BOTMUX_DAEMON_IPC_PORT,
-    );
-    if (!ipcPort) process.exit(0);
 
     let hostSecret: string | undefined;
     if (!process.env.BOTMUX_SEND_RELAY) {
       try { hostSecret = loadDaemonIpcSecret(); } catch { /* Seatbelt/read-isolated CLI */ }
     }
+    const staticIpcPort = resolveDaemonIpcPort(
+      discoveredPort,
+      process.env.BOTMUX_DAEMON_IPC_PORT,
+    );
+    if (hostSecret && !staticIpcPort) process.exit(0);
     const readOrigin = hostSecret ? undefined : () => readManagedOriginCapability(
       resolveDataDir(),
       sessionId,
       process.env.BOTMUX_SEND_RELAY,
       process.env.BOTMUX_ORIGIN_CHANNEL_ID,
     ) ?? undefined;
-    // A queued turn may advance and rotate its capability during a 404 retry.
-    // Keep a live reader; each attempt constructs a fresh authenticated body.
+    // A queued turn may advance and rotate its capability (and on reattached
+    // persistent panes, its live daemon ipcPort) during a retry. Keep a live
+    // reader; each attempt constructs a fresh authenticated body + port.
     const fingerprint = fingerprintPromptText(prompt);
     const prefix = prefixOf(prompt);
     const path = `/api/sessions/${encodeURIComponent(sessionId)}/prompt-ctx/claim`;
@@ -20690,15 +20691,21 @@ async function cmdUserPromptHook(): Promise<void> {
       fingerprint,
       prefix,
       readOrigin,
-      request: body => {
+      request: (body, claim) => {
+        const attemptPort = hostSecret
+          ? staticIpcPort
+          : resolveDaemonIpcPort(claim?.ipcPort ?? discoveredPort, process.env.BOTMUX_DAEMON_IPC_PORT);
+        if (!attemptPort) {
+          return Promise.resolve(new Response(JSON.stringify({ error: 'no_ipc_port' }), { status: 503 }));
+        }
         const init = {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify(body),
         } satisfies RequestInit;
         return hostSecret
-          ? fetchDaemonIpc(ipcPort, path, init, hostSecret)
-          : loopbackFetch(`http://127.0.0.1:${ipcPort}${path}`, init);
+          ? fetchDaemonIpc(attemptPort, path, init, hostSecret)
+          : loopbackFetch(`http://127.0.0.1:${attemptPort}${path}`, init);
       },
     });
     if (envelope) {

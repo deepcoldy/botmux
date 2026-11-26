@@ -307,6 +307,8 @@ export interface FailedTurnRecord {
   turnId: string;
   userPrompt: string;
   cliInput: string;
+  /** Per-turn hook envelope stripped from `cliInput` in hook mode, retained for lossless replay. */
+  hookEnvelope?: string;
   codexAppInput?: CodexAppTurnInput;
   /** Daemon-retained attachments paired with the exact CLI input, for replay and quota handoff. */
   attachments?: LarkAttachment[];
@@ -368,6 +370,13 @@ export interface FailedTurnRewindDirective {
   traexPromptCheckpoint?: import('./services/traex-prompt-checkpoint.js').TraexPromptCheckpoint;
   /** What the CLI gets once the turn is cut. */
   content: string;
+  /** The final content already carries every hook envelope inline. The worker
+   * must retire (not rekey) this turn's sidecar only after the rewritten input
+   * is accepted; a failed respawn keeps the original sidecar for rollback. */
+  inlineEnvelope?: true;
+  /** Envelope expected to remain in this turn's sidecar for a resend. Kept so
+   * the worker can inline it after a rekey failure or restore it on rollback. */
+  hookEnvelope?: string;
 }
 
 /** Stable human/bot identity used only for principal-lane routing.  The
@@ -1211,6 +1220,8 @@ export interface Session {
   modelFallback?: ModelFallbackState;
   lastUserPrompt?: string;
   lastCliInput?: string;
+  /** Per-turn hook envelope stripped from lastCliInput in hook mode, retained for lossless retry/replay. */
+  lastHookEnvelope?: string;
   /** Exact dispatch turn that owns lastCliInput; absent inputs cannot be replayed automatically. */
   lastCliInputTurnId?: string;
   /** Structured companion for lastCliInput so retry_last_task can preserve a
@@ -2224,6 +2235,10 @@ export interface CodexAppGenerationCommit {
 /** A legacy CLI prompt plus an optional backend-specific structured sidecar. */
 export interface CliTurnPayload {
   content: string;
+  /** Per-turn metadata moved out of `content` into a prompt-ctx sidecar under
+   *  Claude Code UserPromptSubmit hook mode; retained by daemon for lossless
+   *  failed-turn retries and replays. */
+  hookEnvelope?: string;
   /** Daemon-frozen LinkRef mode plus admission-only source material. */
   linkRefs?: LinkRefTurnEnvelope;
   codexAppInput?: CodexAppTurnInput;
@@ -3304,6 +3319,8 @@ export type WorkerToDaemonBase =
       turnId: string;
       failedTurnId: string;
       outcome: 'rewound' | 'declined';
+      /** The final rewritten input no longer uses its sidecar. */
+      inlineEnvelope?: true;
       reason: string;
     }
   | { type: 'adopt_preamble'; userText: string; assistantText: string; turnId?: string }

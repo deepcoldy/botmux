@@ -30,6 +30,15 @@ import {
 import { captureTraexPromptCheckpoint, inspectTraexFailedPrompt, withTraexFailedPrompt } from '../src/services/traex-prompt-checkpoint.js';
 import { resolveTraexImagePurgeTarget } from '../src/services/traex-tool-image-recovery.js';
 import type { FailedTurnRewindDirective } from '../src/types.js';
+import { config } from '../src/config.js';
+
+import {
+  claimPromptContext,
+  fingerprintPromptText,
+  prefixOf,
+  removePromptContextForTurn,
+  writePromptContext,
+} from '../src/services/prompt-context-store.js';
 
 const SID = '858ca892-1234-4abc-9def-0123456789ab';
 
@@ -213,6 +222,92 @@ describe('startFailedTurnRewind', () => {
     expect(reports()).toEqual([expect.objectContaining({
       type: 'failed_turn_rewind', turnId: 'trg_new', failedTurnId: 'board:app:hint-1', outcome: 'rewound',
     })]);
+  });
+
+  it('retires an inline merge sidecar only after the rewritten input is accepted', async () => {
+    const oldEnvelope = '<sender name="OLD_ENVELOPE" />';
+    const newEnvelope = '<sender name="NEW_ENVELOPE" />';
+    const d = directive({
+      content: `${oldEnvelope}\n\n${FAILED_INPUT}\n\n${newEnvelope}\n\n继续`,
+      inlineEnvelope: true,
+    });
+    const { pendingMessages, cutAfterExit, settle } = setup(failedTranscript(), {}, d);
+    const dir = join(process.env.SESSION_DATA_DIR!, 'prompt-ctx', 'sess-rewind');
+    writePromptContext('sess-rewind', 'trg_new', '继续', newEnvelope);
+    try {
+      expect(readdirSync(dir)).toHaveLength(1);
+      await cutAfterExit();
+      expect(pendingMessages).toEqual([{ content: d.content, turnId: 'trg_new' }]);
+      // Before the new generation accepts the rewrite, rollback must still be possible.
+      expect(readdirSync(dir)).toHaveLength(1);
+      settle('spawned');
+      expect(existsSync(dir) ? readdirSync(dir) : []).toHaveLength(0);
+    } finally {
+      removePromptContextForTurn('sess-rewind', 'trg_new');
+    }
+  });
+
+  it('retires an inline sidecar when a cut message hands off before normal settlement', async () => {
+    const newEnvelope = '<sender name="NEW_ENVELOPE" />';
+    const d = directive({ content: `${newEnvelope}\n\n${FAILED_INPUT}\n\n继续`, inlineEnvelope: true });
+    const { cutAfterExit, goAway, successorInputs, reports } = setup(failedTranscript(), {}, d);
+    const dir = join(process.env.SESSION_DATA_DIR!, 'prompt-ctx', 'sess-rewind');
+    writePromptContext('sess-rewind', 'trg_new', '继续', newEnvelope);
+    try {
+      await cutAfterExit();
+      goAway();
+      expect(successorInputs()).toEqual([{ content: d.content, turnId: 'trg_new' }]);
+      expect(existsSync(dir) ? readdirSync(dir) : []).toHaveLength(0);
+      expect(reports()).toEqual([expect.objectContaining({ outcome: 'rewound', inlineEnvelope: true })]);
+    } finally {
+      removePromptContextForTurn('sess-rewind', 'trg_new');
+    }
+  });
+
+  it('keeps the original sidecar when an inline merge is rolled back after a failed respawn', async () => {
+    const newEnvelope = '<sender name="NEW_ENVELOPE" />';
+    const d = directive({ content: `${newEnvelope}\n\n${FAILED_INPUT}\n\n继续`, inlineEnvelope: true });
+    const original = failedTranscript();
+    const { jsonl, cutAfterExit, settle } = setup(original, {}, d);
+    writePromptContext('sess-rewind', 'trg_new', '继续', newEnvelope);
+    try {
+      await cutAfterExit();
+      settle('failed');
+      expect(readFileSync(jsonl, 'utf8')).toBe(original);
+      expect(claimPromptContext(
+        'sess-rewind', 'trg_new', fingerprintPromptText('继续'), prefixOf('继续'),
+      )).toBe(newEnvelope);
+    } finally {
+      removePromptContextForTurn('sess-rewind', 'trg_new');
+    }
+  });
+
+  it('falls back to inline hand-off when restoring a rekeyed resend sidecar also fails', async () => {
+    const envelope = '<botmux_reminder>ROLLBACK_WRITE_FAILURE_ENVELOPE</botmux_reminder>';
+    const d = directive({
+      mode: 'resend', content: FAILED_INPUT, hookEnvelope: envelope,
+    });
+    const { cutAfterExit, settle, successorInputs } = setup(failedTranscript(), {}, d);
+    const originalDataDir = config.session.dataDir;
+    const blockedRoot = mkdtempSync(join(tmpdir(), 'botmux-pctx-blocked-'));
+    roots.push(blockedRoot);
+    const blocked = join(blockedRoot, 'not-a-directory');
+    writeFileSync(blocked, 'x');
+    writePromptContext('sess-rewind', 'trg_new', '继续', envelope);
+    try {
+      await cutAfterExit();
+      // Only the sidecar store moves onto an unwritable shape; transcript
+      // put-back and the unsent-input journal retain their original paths.
+      (config.session as any).dataDir = blocked;
+      settle('failed');
+      expect(successorInputs()).toEqual([{ content: `${envelope}\n\n继续`, turnId: 'trg_new' }]);
+      expect(claimPromptContext(
+        'sess-rewind', 'trg_new', fingerprintPromptText('继续'), prefixOf('继续'),
+      )).toBeUndefined();
+    } finally {
+      (config.session as any).dataDir = originalDataDir;
+      removePromptContextForTurn('sess-rewind', 'trg_new');
+    }
   });
 
   it('carries on the skill catalog the worker appended to the cut turn when it wrote it', async () => {

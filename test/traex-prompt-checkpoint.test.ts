@@ -87,9 +87,12 @@ describe('TRAE saved prompt boundary', () => {
     const checkpoint = setup();
     const directive = planFailedTurnRewind({ record: { turnId: 'failed', userPrompt: 'old', cliInput: input,
       failedAt: new Date().toISOString(), retryCount: 0, status: 'failed', directFailure: true,
-      retryable: false, errorCode: 'traex_tool_image_upload_failed', traexPromptCheckpoint: checkpoint },
+      retryable: false, errorCode: 'traex_tool_image_upload_failed', hookEnvelope: '<sender>original</sender>',
+      traexPromptCheckpoint: checkpoint },
       turnId: 'retry', mode: 'edit', content: 'edited prompt' });
     expect(directive).toMatchObject({ content: 'edited prompt', failedInput: input, requireRewind: true });
+    expect(directive?.inlineEnvelope).toBeUndefined();
+    expect(directive?.hookEnvelope).toBeUndefined();
   });
   it('refuses a same-size modification between descriptor inspection and cut', () => {
     setup();

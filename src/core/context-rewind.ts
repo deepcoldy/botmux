@@ -23,7 +23,7 @@ import {
   isTranscriptRateLimitEvent,
   type TranscriptEvent,
 } from '../services/claude-transcript.js';
-import { stripBotmuxDisplayBlocks } from '../utils/prompt-display-strip.js';
+import { stripBotmuxDisplayBlocks, stripBotmuxEnvelopeBlocks } from '../utils/prompt-display-strip.js';
 import { rewindBackupSuffix } from './rewind-backup-retention.js';
 
 export interface RewindCheckpoint {
@@ -68,13 +68,13 @@ export const REWIND_CHECKPOINT_LIMIT = 10;
 
 /** 从一条 `<user_message>` / `<botmux_*>` 注入口袋里剥出人真正说的话。 */
 export function summarizeUserText(text: string): string {
-  let body = text;
-  const m = /<user_message>([\s\S]*?)<\/user_message>/i.exec(body);
-  if (m) body = m[1] ?? '';
-  body = stripBotmuxDisplayBlocks(body)
-    // bare（transcript + solo）续轮没有 <user_message> 壳；上面整块剥掉追加
-    // 在用户正文后的 <botmux_formatting>（含块体），再清掉其余残留标签，
-    // 否则内部提示会混进预览文案。
+  const m = /<user_message>([\s\S]*?)<\/user_message>/i.exec(text);
+  const raw = m
+    ? stripBotmuxDisplayBlocks(m[1] ?? '')
+    // hook 注入或 bare（transcript + solo）轮没有 <user_message> 壳：整块剥掉
+    // 已知 BotMux 上下文/提示块（含块体），再清掉其余残留标签，避免内部提示混进预览。
+    : stripBotmuxEnvelopeBlocks(text, { replacement: ' ' });
+  const body = raw
     .replace(/<[^>]+>/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();

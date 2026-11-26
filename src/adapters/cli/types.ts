@@ -77,7 +77,7 @@ export type SubmitRecheckResult = boolean | {
 };
 
 /** See {@link CliAdapter.sessionRenameSurface}. */
-export type SessionRenameSurface = 'settled' | 'unsubmitted' | 'occupied' | 'unknown';
+export type SessionRenameSurface = 'settled' | 'unsubmitted' | 'occupied' | 'blocked' | 'unknown';
 
 /** What the adapter can prove about a failed runner-protocol write.
  *
@@ -97,6 +97,11 @@ export type RunnerSubmissionDisposition =
  * keep protocol ids separate from reply-routing ids. */
 export interface WriteInputContext {
   turnId?: string;
+  /** Commit worker-side turn/write state after the adapter's pre-write input
+   * checks, immediately before the actual paste. A pre-write refusal therefore
+   * leaves no durable turn, bridge mark, type-ahead or activation side effects.
+   * Returning false vetoes the paste when the worker's generation became stale. */
+  beforeSubmit?: () => boolean | void;
   onInputPrepared?: (content: string) => void;
   /** Durable replay identity. Runner adapters may forward this with turnId so
    * late output from an older attempt cannot settle its successor. */
@@ -548,6 +553,12 @@ export interface CliAdapter {
    *  assuming either way. */
   readonly resumeFindsOwnSession?: boolean;
 
+  /** This adapter performs asynchronous input-surface prechecks and invokes
+   * `context.beforeSubmit` only after they pass. The worker must therefore not
+   * also commit normal-write state through the transaction's early beforeWrite
+   * hook. Adapters without this capability retain the legacy beforeWrite path. */
+  readonly writeInputDefersPreparation?: true;
+
   /** Write user input to PTY. May fire writes asynchronously (e.g. Aiden delayed Enter).
    *  Resolves when all writes are complete.
    *
@@ -903,11 +914,12 @@ export interface CliAdapter {
 
   /** True when this CLI supports a UserPromptSubmit hook whose additionalContext
    *  is injected as an INVISIBLE system-reminder (not rendered into the visible
-   *  transcript). When true and the per-bot `envelopeInjection` setting is
-   *  `auto`, the daemon moves the per-turn reminder/whiteboard blocks out of the
-   *  user turn text and into a sidecar that `botmux user-prompt-hook` reads back.
-   *  Only set for CLIs verified end-to-end; codex renders hook context as a
-   *  visible developer message and must NOT set this. */
+   *  transcript). Enabled by default on local loopback-capable backends when
+   *  non-zero prompt injection is active and the hook is installed: the daemon
+   *  moves per-turn metadata blocks out of user turn text into a sidecar that
+   *  `botmux user-prompt-hook` claims via IPC. Only set for CLIs verified
+   *  end-to-end; codex renders hook context as a visible developer message and
+   *  must NOT set this. */
   readonly supportsInvisiblePromptHook?: boolean;
 
   /** The adapter exposes a transcript-backed end-of-turn boundary that the
@@ -1279,9 +1291,11 @@ export interface CliAdapter {
    *  it) after its Enter: `settled` — the composer is an empty native input
    *  again; `unsubmitted` — the composer still holds exactly `command` (the
    *  Enter became a newline or never arrived), so one more Enter submits it;
-   *  `occupied` — a recognised dialog, busy turn or user draft owns the input;
-   *  `unknown` — the viewport cannot be classified. Undefined keeps the
-   *  historical bounded fail-open for CLIs/backends without this capability. */
+   *  `occupied` — an ordinary busy turn owns input; `blocked` — a dialog,
+   *  confirmation, non-empty draft or paste chip owns the input focus and must
+   *  never be released by the timeout; `unknown` — the viewport cannot be
+   *  classified. Undefined keeps the historical bounded fail-open for
+   *  CLIs/backends without this capability. */
   sessionRenameSurface?(
     evidence: { viewport: string; cursor?: { x: number; y: number } },
     command: string,
@@ -1299,8 +1313,11 @@ export interface CliAdapter {
       /** Resolve at every poll: persistent reattach may prove native identity
        * only after the rename was typed. The original byte baseline is kept. */
       getCliSessionId: () => string | undefined;
-      /** Recovery after worker replacement may accept an existing receipt for
-       * this exact thread/title; normal writes arm at the current file size. */
+      /** Optional byte offset for a receipt watcher. Omitted means the current
+       * index size when armed. Recovery arms BEFORE reading the input surface
+       * and reuses that one probe across unknown retries, so a receipt in any
+       * intervening window counts; historical same-title receipts never prove
+       * that a surviving draft executed. */
       fromByte?: number;
     },
   ): () => boolean;
