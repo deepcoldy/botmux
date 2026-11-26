@@ -16,6 +16,13 @@ import {
 } from '../src/core/link-ref-turn.js';
 import type { CliTurnPayload } from '../src/types.js';
 import type { LinkRefTurnKey } from '../src/services/link-ref-types.js';
+import {
+  claimPromptContext,
+  fingerprintPromptText,
+  prefixOf,
+  removePromptContextDir,
+  writePromptContext,
+} from '../src/services/prompt-context-store.js';
 
 const key: LinkRefTurnKey = { appId: 'app', sessionId: 'session', turnId: 'turn', dispatchAttempt: 1 };
 const fullUrl = 'https://example.test/problem' + '?id=1&state=ready#timeline';
@@ -206,5 +213,36 @@ describe('LinkRef turn admission', () => {
     expect(existsSync(join(dataDir, 'link-refs'))).toBe(false);
     closeLinkRefRuntime();
     expect(getLinkRefRuntime()).toBeUndefined();
+  });
+
+  it('rekeys a short (<30 char) hook-mode prompt-context sidecar when LinkRef appends its companion block', () => {
+    const { runtime: rt } = runtime();
+    const sid = 'session-link-ref-rekey';
+    const turnId = 'turn-link-ref-rekey';
+    const shortContent = '看下这个文档';
+    const docUrl = 'https://example.test/doc/abc?tab=1';
+    try {
+      writePromptContext(sid, turnId, shortContent, '<sender name="User" />');
+      const prepared = prepareLinkRefTurnPayload({
+        runtime: rt,
+        key: { appId: 'app', sessionId: sid, turnId, dispatchAttempt: 1 },
+        mode: 'enabled',
+        payload: {
+          content: shortContent,
+          linkRefs: {
+            mode: 'enabled',
+            sources: initialLinkRefSources({ userText: `${shortContent} ${docUrl}` }),
+          },
+        },
+      });
+      expect(prepared.content).not.toBe(shortContent);
+      expect(prepared.content).toContain('<botmux_link_refs>');
+      // Old short-text key is gone; final content with appended <botmux_link_refs> claims uniquely.
+      expect(claimPromptContext(sid, turnId, fingerprintPromptText(shortContent), prefixOf(shortContent))).toBeUndefined();
+      expect(claimPromptContext(sid, turnId, fingerprintPromptText(prepared.content), prefixOf(prepared.content))).toBe('<sender name="User" />');
+    } finally {
+      removePromptContextDir(sid);
+      rt.close();
+    }
   });
 });

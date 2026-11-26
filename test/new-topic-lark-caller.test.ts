@@ -162,7 +162,7 @@ async function runCase(name: string, options: Record<string, any> = {}) {
     sessionStore: { updateSession: noop }, AutoWorktreeFailClosedError: class extends Error {},
     activeSessionKey: () => 'test-key', withBotTurnMutation: async (_app: string, fn: () => any) => fn(),
     sessionCliId: () => ds.session.cliId, getAvailableBots: async () => [], ensureSessionWhiteboard: noop,
-    buildNewTopicCliInput: () => ({ content: 'test prompt' }), sessionPromptInjection: () => undefined,
+    buildNewTopicCliInput: () => ({ content: 'test prompt' }), plannedOpeningBackendType: () => 'pty', sessionPromptInjection: () => undefined,
     rememberLastCliInput: noop, publishAttentionPatch: noop, markInitialUserTurnPending: noop,
     markRepoCardConsumed: noop, deferRepoCardWithdraw: noop,
     // commitRepoSelection 的被 @ 回执记录（#3039）：本 harness 只验证 worktree 调用者身份，

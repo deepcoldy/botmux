@@ -1050,11 +1050,15 @@ export interface DaemonSession {
     failedTurnId: string;
     mode: 'merge' | 'resend';
     content: string;
+    /** Envelope that will remain sidecar-injected in the final rewritten input;
+     * absent when the directive restored it inline. */
+    hookEnvelope?: string;
     failedUserPrompt: string;
     /** The worker process that was asked; another one never answers. */
     worker: DaemonSession['worker'];
   }>;
   lastCodexAppInput?: CodexAppTurnInput;
+  lastHookEnvelope?: string;
   replyThreadAliases?: { [rootMessageId: string]: { createdAt: string; lastUsedAt: string } };
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean };
   /** Lark turns that a still-running Claude background task was launched

@@ -1,21 +1,25 @@
 import { safeScrubAndTruncate } from './scrub.js';
 import type { TurnPromptPreview, TurnPromptSource } from './types.js';
+import { stripBotmuxEnvelopeBlocks, unwrapBotmuxTaskTags } from '../../utils/prompt-display-strip.js';
 
 const MAX_PROMPT_PREVIEW = 400;
 
 function extractBotmuxUserText(value: string): string {
   const match = value.match(/<user_message>\s*([\s\S]*?)\s*<\/user_message>/);
-  let text = match?.[1] ?? value;
+  let text = match
+    ? (match[1] ?? '')
+      .replace(/<botmux_reminder>[\s\S]*?<\/botmux_reminder>/g, '')
+      .replace(/<botmux_formatting>[\s\S]*?<\/botmux_formatting>/g, '')
+      .replace(/<mentions>[\s\S]*?<\/mentions>/g, '')
+      .replace(/<sender\b[\s\S]*?<\/sender>/g, '')
+      .replace(/<sender\b[\s\S]*?\/>/g, '')
+      .replace(/<session_id>[\s\S]*?<\/session_id>/g, '')
+    : unwrapBotmuxTaskTags(stripBotmuxEnvelopeBlocks(value, { replacement: ' ' }));
   text = text
-    .replace(/<botmux_reminder>[\s\S]*?<\/botmux_reminder>/g, '')
-    .replace(/<botmux_formatting>[\s\S]*?<\/botmux_formatting>/g, '')
-    .replace(/<mentions>[\s\S]*?<\/mentions>/g, '')
-    .replace(/<sender\b[\s\S]*?<\/sender>/g, '')
-    .replace(/<sender\b[\s\S]*?\/>/g, '')
-    .replace(/<session_id>[\s\S]*?<\/session_id>/g, '')
     .replace(/<\/?user_message>/g, '')
     .replace(/^\s*\[用户引用了消息[^\n]*\]\s*$/gm, '')
     .replace(/^\s*\[来自[^\n]*@mention[^\n]*\]\s*$/gm, '')
+    .replace(/[ \t]+\n/g, '\n')
     .trim();
   return text;
 }

@@ -1,4 +1,5 @@
 import { claudePromptSuggestion } from '../../utils/claude-prompt-suggestion.js';
+import { stripBotmuxEnvelopeBlocks, unwrapBotmuxTaskTags } from '../../utils/prompt-display-strip.js';
 import { randomBytes } from 'node:crypto';
 import {
   closeSync,
@@ -26,7 +27,7 @@ import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { claudeCompactionHookCommand, claudeStopFailureHookCommand, sessionReadyHookCommand, statuslineHookCommand, userPromptHookCommand } from '../hook-command.js';
 import type { CliAdapter, CliId, PtyHandle } from './types.js';
-import { findJsonlContainingFingerprint, jsonlContainsFingerprint, normaliseForFingerprint } from '../../services/claude-transcript.js';
+import { CLAUDE_STRIPPED_INVISIBLE_RE, findJsonlContainingFingerprint, jsonlContainsFingerprint, normaliseForFingerprint } from '../../services/claude-transcript.js';
 import { CLAUDE_REASONING_EFFORTS } from '../../services/codex-reasoning-effort.js';
 import { GOAL_ENV } from '../../workflows/v3/contract.js';
 import { buildBotmuxSystemPromptText } from './shared-hints.js';
@@ -477,111 +478,12 @@ export function sanitizeClaudeInput(content: string): string {
   return content
     .replace(/\r\n/g, '\n')
     .replace(/\r/g, '\n')
-    .replace(/[\u200B-\u200D\u2060\uFEFF\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, '');
+    .replace(CLAUDE_STRIPPED_INVISIBLE_RE, '');
 }
 
 /** Lark metadata headers prepended to user messages (e.g. quote hint and foreign bot handoff).
  *  Supports both Chinese and English i18n templates. */
 const LARK_METADATA_HEADER_RE = /^\[(?:(?:用户引用了消息|User quoted a message)[^\]\n]*|来自\s+[^\]\n]+?\s+的 @mention|@mention from\s+[^\]\n]+?)\]\s*/gm;
-
-/**
- * Known BotMux envelope tags to strip when extracting user payload in fallback
- * mode (e.g. hook injection mode or bare transcript mode where <user_message> is absent).
- * Covers both pre-userMessage blocks (summary_memory, chat_context, role, whiteboard, etc.)
- * and post-userMessage blocks (substitute, attachments, mentions, available_bots, etc.).
- */
-const BOTMUX_ENVELOPE_TAGS = new Set([
-  'botmux_routing',
-  'botmux_builtin_skills',
-  'botmux_skill_help',
-  'identity',
-  'botmux_credentials',
-  'botmux_lark_tool',
-  'session_id',
-  'role',
-  'summary_memory',
-  'botmux_reminder',
-  'botmux_formatting',
-  'whiteboard',
-  'chat_context_policy',
-  'chat_context',
-  'substitute_trigger',
-  'substitute_target',
-  'substitute_policy',
-  'attachments',
-  'mentions',
-  'available_bots',
-  'botmux_task',
-  'botmux_http_response_mode',
-]);
-
-/**
- * Strip BotMux envelope blocks using a linear cursor walk (O(N), no regex backtracking).
- */
-function stripBotmuxEnvelopeBlocks(text: string): string {
-  let i = 0;
-  let out = '';
-  // Tags that already appeared once without a matching close tag. Their next
-  // occurrences are treated as ordinary text: retrying the close-tag search for
-  // each of them would rescan the whole tail every time (quadratic on inputs
-  // like '<summary_memory>x'.repeat(N)). Malformed inputs only — every block
-  // botmux itself renders is well-formed, so this never triggers in production.
-  const deadTags = new Set<string>();
-  while (i < text.length) {
-    if (text[i] !== '<') {
-      out += text[i];
-      i++;
-      continue;
-    }
-    let nameEnd = -1;
-    for (let j = i + 1; j < text.length; j++) {
-      const ch = text[j];
-      // '<' is also a name delimiter: a legal tag name never contains '<'.
-      // Including it bounds the inner scan when a run of '<' is followed by a
-      // single delimiter (otherwise every '<' rescans the whole run — quadratic
-      // on inputs like '<'.repeat(N) + ' >').
-      if (ch === '>' || ch === ' ' || ch === '\n' || ch === '\t' || ch === '\r' || ch === '/' || ch === '<') {
-        nameEnd = j;
-        break;
-      }
-    }
-    if (nameEnd === -1) {
-      out += text.slice(i);
-      break;
-    }
-    const tagName = text.slice(i + 1, nameEnd);
-    const recognized = tagName === 'sender' || BOTMUX_ENVELOPE_TAGS.has(tagName);
-    if (recognized && !deadTags.has(tagName)) {
-      const openTagEnd = text.indexOf('>', nameEnd);
-      if (openTagEnd === -1) {
-        out += text.slice(i);
-        break;
-      }
-      if (text[openTagEnd - 1] === '/') {
-        i = openTagEnd + 1;
-        continue;
-      }
-      const closeTag = `</${tagName}>`;
-      const closeIdx = text.indexOf(closeTag, openTagEnd + 1);
-      if (closeIdx === -1) {
-        // No close tag for this open tag. Mark it dead so later same-named open
-        // tags skip the tail-rescan, then emit the leading '<' and advance by
-        // one — do NOT break: later, *other* well-formed blocks must still be
-        // stripped (e.g. '<summary_memory>x<attachments>f</attachments>' keeps
-        // stripping the attachments block).
-        deadTags.add(tagName);
-        out += text[i];
-        i++;
-        continue;
-      }
-      i = closeIdx + closeTag.length;
-      continue;
-    }
-    out += text[i];
-    i++;
-  }
-  return out;
-}
 
 /** Strip BotMux system envelopes and metadata headers from prompt content
  *  to extract the unique user payload for submit fingerprinting.
@@ -623,9 +525,9 @@ export function extractMessageContentForFingerprint(content: string): string {
   }
 
   // 2. Fallback for hook injection mode or bare transcript mode where <user_message> is omitted.
-  //    Walks all known envelope blocks (<summary_memory>, <chat_context_policy>, <chat_context>, etc.)
-  //    and strips metadata headers.
-  const stripped = stripBotmuxEnvelopeBlocks(content);
+  //    Walks all known envelope blocks (<summary_memory>, <chat_context_policy>, <chat_context>, etc.),
+  //    unwraps <botmux_task> tags (keeping the task body), and strips metadata headers.
+  const stripped = unwrapBotmuxTaskTags(stripBotmuxEnvelopeBlocks(content));
   const cleaned = stripped.replace(LARK_METADATA_HEADER_RE, '').trim();
   return cleaned.length > 0 ? cleaned : content.trim();
 }
@@ -1811,9 +1713,9 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // 避免首条 prompt 空等 45s；原生 Claude 也只从这一个来源读取 ready hook。
       sessionStartCommand: sessionReadyHookCommand(),
       preCompactCommand: variant.id === 'claude-code' ? claudeCompactionHookCommand() : undefined,
-      // UserPromptSubmit per-turn 上下文 hook（#794）：同样写全局 settings.json。
-      // 仅当 per-bot envelopeInjection=auto 时 daemon 才写 sidecar 走注入路径，
-      // 其余情况 hook 触发但读不到 sidecar，空输出 no-op。
+      // UserPromptSubmit per-turn 上下文 hook（#794，默认开启）：同样写 settings.json。
+      // 本地非零注入且通过 preflight 时 daemon 写 sidecar 经 hook 注入；其余情况
+      // hook 触发但读不到 sidecar，空输出 no-op（同时上报 prompt_submitted）。
       // 仅 claude-code 安装 UserPromptSubmit hook；seed/relay 等共享 adapter 的
       // variant 不装（supportsInvisiblePromptHook 也只对 claude-code 为 true，
       // 装了也是每轮空跑一个子进程）。

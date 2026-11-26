@@ -1,7 +1,9 @@
+import { createHash } from 'node:crypto';
 import { localeForBot } from '../i18n/index.js';
 import { logger } from '../utils/logger.js';
 import {
   buildProjectGroupCard,
+  buildProjectGroupCardDigest,
   buildProjectGroupOnboardingCard,
   buildProjectGroupStartedNoticeCard,
   type ProjectGroupCardRuntime,
@@ -23,7 +25,7 @@ import {
 } from './group-collaboration-mode-store.js';
 
 export interface ProjectCoordinatorTransport {
-  sendCard(larkAppId: string, chatId: string, cardJson: string): Promise<string>;
+  sendCard(larkAppId: string, chatId: string, cardJson: string, uuid?: string): Promise<string>;
   updateCard(larkAppId: string, messageId: string, cardJson: string): Promise<void>;
   pinMessage(larkAppId: string, messageId: string): Promise<boolean>;
   unpinMessage(larkAppId: string, messageId: string): Promise<boolean>;
@@ -58,11 +60,32 @@ export type ProjectCoordinatorAction =
       expectedAttachment?: { sourceSessionId: string; revision: number; coordinatorSessionId: string };
     };
 
+export type ProjectCardPublicationPolicy = 'patch' | 'repost' | 'deferred';
+
 export interface ProjectCoordinatorContext {
   dataDir: string;
   chatId: string;
   larkAppId: string;
   coordinatorSessionId: string;
+  cardPublication?: ProjectCardPublicationPolicy;
+}
+
+export interface ProjectCardPublication {
+  project: ProjectGroupState;
+  /** The digest of the payload sent to Lark, not a later runtime snapshot. */
+  digest: string;
+}
+
+export interface ProjectCardSyncTarget {
+  messageId: string;
+  digest: string;
+}
+
+interface PreparedProjectCard {
+  project: ProjectGroupState;
+  cardJson: string;
+  digest: string;
+  runtime?: ProjectGroupCardRuntime;
 }
 
 function stringField(record: Record<string, unknown>, key: string): string | undefined {
@@ -140,6 +163,7 @@ export function parseProjectCoordinatorAction(raw: unknown): ProjectCoordinatorA
 }
 
 const projectQueues = new Map<string, Promise<unknown>>();
+const PROJECT_CARD_PIN_RETRY_MS = 60_000;
 
 function queued<T>(key: string, operation: () => Promise<T>): Promise<T> {
   const previous = projectQueues.get(key) ?? Promise.resolve();
@@ -154,6 +178,18 @@ function queued<T>(key: string, operation: () => Promise<T>): Promise<T> {
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+/** Lark deduplicates a supplied send UUID for one hour. All replacements of
+ * the same old card share one identity, even if a retry carries newer content;
+ * sendAndPinCard reconciles that content with a PATCH before reporting success. */
+function replacementSendUuid(project: ProjectGroupState): string | undefined {
+  const replacedMessageId = project.card?.messageId;
+  if (!replacedMessageId) return undefined;
+  const digest = createHash('sha256')
+    .update(`${project.chatId}\0${project.larkAppId}\0${replacedMessageId}`)
+    .digest('hex').slice(0, 32);
+  return `project-card-${digest}`;
 }
 
 function boundedText(value: string | undefined, max: number, fallback = ''): string {
@@ -269,15 +305,78 @@ export class ProjectCoordinator {
         if (!current) throw new Error('project_not_found');
         return current;
       }
-      if (action.action === 'refresh') {
-        const current = readProjectGroup(context.dataDir, context.chatId);
-        if (!current) throw new Error('project_not_found');
-        if (current.larkAppId !== context.larkAppId) throw new Error('project_coordinator_mismatch');
-        return this.publish(context, current);
-      }
-      const changed = await this.apply(context, action, beforeApply);
-      return this.publish(context, changed);
+      const project = action.action === 'refresh'
+        ? this.readCardProject(context) : await this.apply(context, action, beforeApply);
+      if (context.cardPublication === 'deferred') return project;
+      const prepared = await this.prepareCard(context, project);
+      return (await this.publish(context, prepared, {
+        repostOnExpired: context.cardPublication === 'repost',
+      })).project;
     });
+  }
+
+  refreshCard(context: ProjectCoordinatorContext, target: ProjectCardSyncTarget): Promise<ProjectCardPublication | undefined> {
+    return queued(`${context.dataDir}:${context.chatId}`, async () => {
+      const prepared = await this.prepareSyncCard(context, target);
+      if (!prepared) return undefined;
+      return this.publish(context, prepared, {
+        repostOnExpired: false, canPublish: () => this.canSyncProjectCard(context),
+      });
+    });
+  }
+
+  /** Background recovery uses the same queue as commands. Only replace the
+   * card whose edit budget ran out, not a newer card published by a command. */
+  repostExpiredCard(context: ProjectCoordinatorContext, target: ProjectCardSyncTarget): Promise<ProjectCardPublication | undefined> {
+    return queued(`${context.dataDir}:${context.chatId}`, async () => {
+      const prepared = await this.prepareSyncCard(context, target);
+      if (!prepared) return undefined;
+      const canRepost = () => this.canSyncProjectCard(context);
+      await this.unpinExpiredCard(context, prepared.project);
+      // Dashboard mode changes are not serialized by the project queue.
+      if (!canRepost()) return undefined;
+      return this.sendAndPinCard(context, prepared, canRepost);
+    });
+  }
+
+  retryPendingCardPin(context: ProjectCoordinatorContext, messageId: string): Promise<ProjectGroupState | undefined> {
+    return queued(`${context.dataDir}:${context.chatId}`, async () => {
+      const card = this.readCardProject(context).card;
+      if (card?.messageId !== messageId || card.pinned || card.pinRetryAt === undefined
+        || card.pinRetryAt > Date.now() || !this.canSyncProjectCard(context)) return undefined;
+      // Reserve the next interval before sending so an interrupted retry
+      // cannot immediately repeat after a daemon restart.
+      const project = await mutateProjectGroup(context.dataDir, context.chatId, current => {
+        if (current?.card?.messageId === messageId && !current.card.pinned) {
+          current.card.pinRetryAt = Date.now() + PROJECT_CARD_PIN_RETRY_MS;
+        }
+        return current;
+      });
+      if (project?.card?.messageId !== messageId || !this.canSyncProjectCard(context)) return undefined;
+      return this.confirmCardPin(context, project);
+    });
+  }
+
+  private readCardProject(context: ProjectCoordinatorContext): ProjectGroupState {
+    const current = readProjectGroup(context.dataDir, context.chatId);
+    if (!current) throw new Error('project_not_found');
+    if (current.larkAppId !== context.larkAppId) throw new Error('project_coordinator_mismatch');
+    return current;
+  }
+
+  private canSyncProjectCard(context: ProjectCoordinatorContext): boolean {
+    const mode = readGroupCollaborationMode(context.dataDir, context.chatId);
+    // Legacy projects can have a durable owner and card without a mode row.
+    return !mode || (mode.mode === 'project' && mode.coordinatorAppId === context.larkAppId);
+  }
+
+  private async prepareSyncCard(context: ProjectCoordinatorContext, target: ProjectCardSyncTarget): Promise<PreparedProjectCard | undefined> {
+    const current = this.readCardProject(context);
+    if (current.card?.messageId !== target.messageId || !this.canSyncProjectCard(context)) return undefined;
+    const prepared = await this.prepareCard(context, current);
+    // A newer render must not spend another digest's PATCH or repost budget.
+    if (prepared.digest !== target.digest || !this.canSyncProjectCard(context)) return undefined;
+    return prepared;
   }
 
   private async apply(
@@ -438,13 +537,14 @@ export class ProjectCoordinator {
         if (milestone) current.milestones.push({ content: milestone, createdAt: now });
       }
       current.milestones = current.milestones.slice(-50);
+      if (context.cardPublication === 'deferred' && current.card) current.card.refreshPending = true;
       return current;
     });
     if (!next) throw new Error('project_not_found');
     return next;
   }
 
-  private async publish(context: ProjectCoordinatorContext, initial: ProjectGroupState): Promise<ProjectGroupState> {
+  private async prepareCard(context: ProjectCoordinatorContext, initial: ProjectGroupState): Promise<PreparedProjectCard> {
     let project = initial;
     const resolutions = await Promise.all(visibleProjectWorkstreams(project)
       .filter(item => !item.threadId)
@@ -464,37 +564,121 @@ export class ProjectCoordinator {
     const cardConfig = mode?.progressCard;
     const runtime = await this.transport.resolveCardRuntime?.(project, context.dataDir);
     const cardJson = JSON.stringify(buildProjectGroupCard(project, this.transport.brand(project.larkAppId), cardConfig, runtime));
+    return { project, cardJson, runtime, digest: buildProjectGroupCardDigest(project, runtime) };
+  }
+
+  private async publish(
+    context: ProjectCoordinatorContext,
+    prepared: PreparedProjectCard,
+    { repostOnExpired, canPublish }: { repostOnExpired: boolean; canPublish?: () => boolean },
+  ): Promise<ProjectCardPublication> {
+    const { project, cardJson, digest } = prepared;
     if (project.card?.messageId) {
       try {
         await this.transport.updateCard(project.larkAppId, project.card.messageId, cardJson);
-        project = (await mutateProjectGroup(context.dataDir, context.chatId, current => {
-          if (!current) throw new Error('project_not_found');
-          if (!current.card || current.card.messageId !== project.card?.messageId) return current;
-          current.card.updatedAt = current.updatedAt;
-          return current;
-        }))!;
-        // If a previous first-publish attempt persisted and pinned the active
-        // card but failed to retire the guide, retry that cleanup on refresh.
-        await this.retireOnboardingCard(context);
-        return project;
       } catch (error) {
-        if (!this.transport.isMessageWithdrawn(error)) throw error;
+        if (this.transport.isMessageWithdrawn(error)) {
+          if (canPublish?.() === false) throw new Error('project_coordinator_mismatch');
+          return this.sendAndPinCard(context, prepared, canPublish);
+        }
+        if (repostOnExpired && this.transport.isMessageUpdateExpired(error)) {
+          await this.unpinExpiredCard(context, project);
+          return this.sendAndPinCard(context, prepared);
+        }
+        throw error;
       }
+      const updated = (await mutateProjectGroup(context.dataDir, context.chatId, current => {
+        if (!current) throw new Error('project_not_found');
+        if (!current.card || current.card.messageId !== project.card?.messageId) return current;
+        current.card.updatedAt = current.updatedAt;
+        if (current.revision === project.revision) delete current.card.refreshPending;
+        return current;
+      }))!;
+      // If a previous first-publish attempt persisted and pinned the active
+      // card but failed to retire the guide, retry that cleanup on refresh.
+      const published = repostOnExpired ? await this.confirmCardPin(context, updated) : updated;
+      if (canPublish?.() !== false) await this.retireOnboardingCard(context);
+      return { project: published, digest };
     }
+    return this.sendAndPinCard(context, prepared);
+  }
+
+  private async unpinExpiredCard(context: ProjectCoordinatorContext, project: ProjectGroupState): Promise<void> {
+    const old = project.card;
+    // A failed pin call can have landed remotely. Until it is resolved, the
+    // old message ID is just as important as the ID of a confirmed pin.
+    if (!old || (!old.pinned && old.pinRetryAt === undefined)) return;
+    try {
+      if (!await this.transport.unpinMessage(project.larkAppId, old.messageId)) {
+        throw new Error('project_card_unpin_unconfirmed');
+      }
+    } catch (error) {
+      logger.warn(`[project] Could not unpin expired card ${old.messageId}: ${error}`);
+      // Dropping the old ID now would lose the only reference to its pin.
+      throw error;
+    }
+    // Keep the old ID, but record the confirmed unpin even if the POST fails.
+    // Pin metadata is not card content and must not reset the edit budget.
+    await mutateProjectGroup(context.dataDir, context.chatId, current => {
+      if (current?.card?.messageId === old.messageId) {
+        current.card.pinned = false;
+        delete current.card.pinRetryAt;
+      }
+      return current;
+    });
+  }
+
+  private async sendAndPinCard(
+    context: ProjectCoordinatorContext,
+    { project, cardJson, runtime }: PreparedProjectCard,
+    canRepost?: () => boolean,
+  ): Promise<ProjectCardPublication> {
     // Starting a project must be visible at the current point in the chat.
     // Never transform the older onboarding guide in place: publish and pin a
-    // fresh formal card first, persist it, then retire the guide. If retirement
-    // fails, its metadata remains so a later refresh can retry safely.
-    const messageId = await this.transport.sendCard(project.larkAppId, project.chatId, cardJson);
-    const pinned = await this.transport.pinMessage(project.larkAppId, messageId);
-    project = (await mutateProjectGroup(context.dataDir, context.chatId, current => {
+    // fresh formal card and retire the guide only after publication. Record the
+    // new ID before pinning so a failed store write cannot leave an orphan pin.
+    const sendUuid = replacementSendUuid(project);
+    const messageId = sendUuid
+      ? await this.transport.sendCard(project.larkAppId, project.chatId, cardJson, sendUuid)
+      : await this.transport.sendCard(project.larkAppId, project.chatId, cardJson);
+    const published = (await mutateProjectGroup(context.dataDir, context.chatId, current => {
       if (!current) throw new Error('project_not_found');
+      const refreshPending = current.revision !== project.revision && current.card?.refreshPending;
       current.revision += 1;
       current.updatedAt = nowIso();
-      current.card = { messageId, pinned, updatedAt: current.updatedAt };
+      current.card = {
+        messageId, pinned: false, updatedAt: current.updatedAt,
+        pinRetryAt: Date.now() + PROJECT_CARD_PIN_RETRY_MS,
+        ...(refreshPending ? { refreshPending: true } : {}),
+      };
       return current;
     }))!;
-    await this.retireOnboardingCard(context);
-    return project;
+    // A deduplicated send can return the message created by an earlier attempt
+    // with older content. Converge that same message before recording the digest.
+    if (sendUuid && (!canRepost || canRepost())) {
+      await this.transport.updateCard(project.larkAppId, messageId, cardJson);
+    }
+    const pinned = !canRepost || canRepost() ? await this.confirmCardPin(context, published) : published;
+    if (!canRepost || canRepost()) await this.retireOnboardingCard(context);
+    // The new card adds one revision. If another write bumped the revision
+    // during publication, its content has not been rendered yet.
+    return { project: pinned, digest: buildProjectGroupCardDigest({ ...project, revision: project.revision + 1 }, runtime) };
+  }
+
+  private async confirmCardPin(context: ProjectCoordinatorContext, project: ProjectGroupState): Promise<ProjectGroupState> {
+    const card = project.card;
+    if (!card || card.pinned) return project;
+    if (!await this.transport.pinMessage(project.larkAppId, card.messageId)) {
+      logger.warn(`[project] Could not pin card ${card.messageId}: pin not confirmed`);
+      return project;
+    }
+    return (await mutateProjectGroup(context.dataDir, context.chatId, current => {
+      if (!current) throw new Error('project_not_found');
+      if (current.card?.messageId === card.messageId) {
+        current.card.pinned = true;
+        delete current.card.pinRetryAt;
+      }
+      return current;
+    }))!;
   }
 }
