@@ -48,6 +48,15 @@ function canonicalExisting(path: string): string {
   try { return realpathSync(path); } catch { return path; }
 }
 
+/** A data/harness root that resolves to the filesystem root can never be
+ *  bind-mounted (ncaAuthPaths filters it out), so letting it launch would select
+ *  transcript delivery with no host-visible state and no `send` fallback.
+ *  realpath catches a symlink to `/`; resolve catches lexical `..` escapes. */
+function isFilesystemRoot(path: string): boolean {
+  const canonical = canonicalExisting(path);
+  return canonical === sep || resolve(canonical) === sep;
+}
+
 function ncaAuthPaths(): readonly string[] {
   const dataHome = configuredNcaDataHome();
   const userHome = canonicalExisting(dataHome ?? join(homedir(), '.nca'));
@@ -224,8 +233,14 @@ export function createNcaAdapter(pathOverride?: string): CliAdapter {
       const dataHome = configuredNcaDataHome();
       const harnessHome = configuredNcaHarnessHome();
       const explicitHome = ncaHomeArg(extraArgs);
+      if (dataHome && isFilesystemRoot(dataHome)) {
+        throw new Error('NCA_DATA_HOME must not resolve to the filesystem root');
+      }
       if (explicitHome !== undefined && !isAbsolute(explicitHome)) {
         throw new Error('NCA --home must be an absolute path');
+      }
+      if (explicitHome !== undefined && isFilesystemRoot(explicitHome)) {
+        throw new Error('NCA --home must not resolve to the filesystem root');
       }
       // The bridge and the closed-session command run outside the NCA child.
       // A child-only home would make completed turns invisible to both.

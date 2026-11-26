@@ -201,6 +201,38 @@ describe('NCA local CLI adapter', () => {
     }
   });
 
+  it('rejects a data home or --home that resolves to the filesystem root before launch', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-nca-root-guard-'));
+    const rootLink = join(root, 'to-root');
+    const normalHome = join(root, 'data');
+    symlinkSync('/', rootLink, 'dir');
+    try {
+      const adapter = createCliAdapterSync('nca');
+      vi.stubEnv('NCA_DATA_HOME', '/');
+      expect(() => adapter.buildArgs({ ...BASE, resume: false }))
+        .toThrow('filesystem root');
+      vi.unstubAllEnvs();
+
+      vi.stubEnv('CLI_EXTRA_ARGS', '--home=/');
+      expect(() => adapter.buildArgs({ ...BASE, resume: false, extraArgs: ['--home', '/'] }))
+        .toThrow('filesystem root');
+      vi.unstubAllEnvs();
+
+      vi.stubEnv('NCA_DATA_HOME', rootLink);
+      expect(() => adapter.buildArgs({ ...BASE, resume: false, env: { NCA_DATA_HOME: rootLink } }))
+        .toThrow('filesystem root');
+      vi.unstubAllEnvs();
+
+      // The guard must not widen to ordinary custom homes.
+      vi.stubEnv('NCA_DATA_HOME', normalHome);
+      expect(() => adapter.buildArgs({ ...BASE, resume: false, env: { NCA_DATA_HOME: normalHome } }))
+        .not.toThrow();
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('sends multiline input as one paste followed by one Enter', async () => {
     const adapter = createCliAdapterSync('nca');
     const write = vi.fn();
