@@ -75,10 +75,9 @@ describe('hybrid RPC ordered native steering', () => {
     const h = harness();
     await h.start();
     const steered = h.engine.steerTurn('second', { turnId: 'second' }, 'native');
-    const rejected = expect(steered).rejects.toMatchObject({ deliveryDisposition: 'not_sent' });
     h.complete();
     h.error(h.frames.at(-1)!, -32600, 'no active turn to steer');
-    await rejected;
+    await expect(steered).rejects.toMatchObject({ deliveryDisposition: 'not_sent' });
     expect(h.terminals.map(t => t.identity.turnId)).toEqual(['first']);
     expect(h.dead).not.toHaveBeenCalled();
     h.engine.stop();
@@ -88,9 +87,8 @@ describe('hybrid RPC ordered native steering', () => {
     const h = harness();
     await h.start();
     const steered = h.engine.steerTurn('second', { turnId: 'second' }, 'native');
-    const rejected = expect(steered).rejects.toMatchObject({ deliveryDisposition: 'not_sent' });
     h.error(h.frames.at(-1)!, -32601, 'method not found');
-    await rejected;
+    await expect(steered).rejects.toMatchObject({ deliveryDisposition: 'not_sent' });
     expect(h.engine.canSteer).toBe(false);
     h.complete();
     const next = h.engine.sendTurn('later', { turnId: 'later' });
@@ -108,9 +106,8 @@ describe('hybrid RPC ordered native steering', () => {
     const h = harness();
     await h.start();
     const steered = h.engine.steerTurn('second', { turnId: 'second' }, 'native');
-    const rejected = expect(steered).rejects.toMatchObject({ deliveryDisposition: 'ambiguous' });
     h.response(h.frames.at(-1)!, turnId ? { turnId } : {});
-    await rejected;
+    await expect(steered).rejects.toMatchObject({ deliveryDisposition: 'ambiguous' });
     expect(h.frames.filter(f => f.method === 'turn/steer')).toHaveLength(1);
     expect(h.engine.canSteer).toBe(false);
     expect(h.dead).toHaveBeenCalledOnce();
@@ -147,9 +144,8 @@ describe('hybrid RPC ordered native steering', () => {
     const h = harness();
     await h.start();
     const steered = h.engine.steerTurn('second', { turnId: 'second' }, 'native');
-    const rejected = expect(steered).rejects.toMatchObject({ deliveryDisposition: 'ambiguous' });
     h.error(h.frames.at(-1)!, -32000, 'internal failure after input processing');
-    await rejected;
+    await expect(steered).rejects.toMatchObject({ deliveryDisposition: 'ambiguous' });
     expect(h.engine.canSteer).toBe(false);
     expect(h.dead).toHaveBeenCalledOnce();
     expect(h.frames.filter(f => f.method === 'turn/steer')).toHaveLength(1);
@@ -192,10 +188,9 @@ describe('hybrid RPC ordered native steering', () => {
     h.response(h.frames.at(-1)!, { turnId: 'native' });
     await second;
     const third = h.engine.steerTurn('third', { turnId: 'third' }, 'native');
-    const rejected = expect(third).rejects.toMatchObject({ deliveryDisposition: 'ambiguous' });
     if (kind === 'stop') h.engine.stop();
     else h.internal.failAll(new Error('engine died'));
-    await rejected;
+    await expect(third).rejects.toMatchObject({ deliveryDisposition: 'ambiguous' });
     expect(h.terminals.map(t => t.identity.turnId)).toEqual(['first', 'second']);
     expect(h.terminals.every(t => t.status === (kind === 'stop' ? 'stopped' : 'engine-dead'))).toBe(true);
     h.engine.stop();
@@ -205,10 +200,9 @@ describe('hybrid RPC ordered native steering', () => {
     const h = harness();
     await h.start();
     const steered = h.engine.steerTurn('second', { turnId: 'second' }, 'native');
-    const rejected = expect(steered).rejects.toMatchObject({ deliveryDisposition: 'ambiguous' });
     h.complete();
     h.engine.stop();
-    await rejected;
+    await expect(steered).rejects.toMatchObject({ deliveryDisposition: 'ambiguous' });
     expect(h.terminals).toMatchObject([{ identity: { turnId: 'first' }, status: 'completed' }]);
     expect(h.terminals[0].errorCode).toBeUndefined();
   });
