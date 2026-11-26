@@ -694,9 +694,21 @@ export interface Session {
     runId?: string;
   };
   /** Host-written execution-ledger link; silent policy is frozen at admission. */
-  scheduledRun?: { taskId: string; runId: string; turnId: string; requesterSubjectId?: string; silent?: boolean; trigger?: 'scheduler' | 'dashboard' };
-  /** Retain overlapping turns in a reused schedule/chat session. */
+  scheduledRun?: {
+    taskId: string;
+    runId: string;
+    turnId: string;
+    requesterSubjectId?: string;
+    silent?: boolean;
+    /** Missing on pre-trigger-ledger rows; dispatch backfills it from the host execution log. */
+    trigger?: 'scheduler' | 'dashboard';
+    /** Host proof that this is an ordinary-recovery continuation, not another automatic tick. */
+    recoveryOfTurnId?: string;
+  };
+  /** Overlapping runs plus every still-outstanding input binding. Settled history is capped separately. */
   scheduledRuns?: Record<string, NonNullable<Session['scheduledRun']>>;
+  /** Turn ids whose exact run binding must survive the settled-history cap until terminal/rejection. */
+  scheduledRunOutstanding?: Record<string, true>;
   /** Dedicated VC meeting consumer session identity. These sessions share the
    *  listener chat as their output route, but MUST NOT share the ordinary
    *  chat-scope routing slot (or another meeting/member's CLI context). */

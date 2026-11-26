@@ -162,9 +162,18 @@ export function automaticScheduledInputTask(item: PendingCliInput): string | und
     || item.noReplay || item.taskContinuation || item.traexAutoModelRecovery
     || item.traexAutoModelContinuation || item.queuedActivationToken
     || item.vcMeetingImTurnOrigin || item.trustedCaller?.source === 'failed_turn_recovery') return undefined;
+  if (item.scheduledRun?.recoveryOfTurnId) return undefined;
   if (item.scheduledRun) return item.scheduledRun.trigger === 'scheduler'
     && item.scheduledRun.taskId === taskId && item.scheduledRun.turnId === item.turnId ? taskId : undefined;
   return item.queueAfterActiveTurn ? taskId : undefined;
+}
+
+export function scheduledRecoveryInputTask(item: PendingCliInput): string | undefined {
+  const taskId = item.turnId ? parseScheduledTurnId(item.turnId) : null;
+  const run = item.scheduledRun;
+  if (!taskId || !run?.recoveryOfTurnId || run.taskId !== taskId || run.turnId !== item.turnId
+    || parseScheduledTurnId(run.recoveryOfTurnId) !== taskId) return undefined;
+  return taskId;
 }
 
 export function coalesceAutomaticScheduledInputs(pending: PendingCliInput[]): PendingCliInput[] {
@@ -395,18 +404,17 @@ export function terminalReleasesDurableTurn(
     && current.dispatchAttempt === terminal.dispatchAttempt;
 }
 
-/** A serial schedule prefix may wait indefinitely behind an active task.
- * Let its authenticated human controller steer without changing the order of
- * other user messages or crossing a durable/group/continuation boundary. */
-export function promoteInteractiveInputPastSchedules(
+function promoteInteractiveInputPastPrefix(
   pending: PendingCliInput[],
   mayControlActiveTurn: (input: PendingCliInput) => boolean,
+  isBlockedSchedule: (item: PendingCliInput) => boolean,
+  requireSerialSchedule = true,
 ): boolean {
   let index = 0;
   while (index < pending.length) {
     const item = pending[index]!;
-    if (item.trustedCaller?.source !== 'schedule_creator'
-      || !item.queueAfterActiveTurn || item.dispatchAttempt !== undefined
+    if (!isBlockedSchedule(item)
+      || (requireSerialSchedule && !item.queueAfterActiveTurn) || item.dispatchAttempt !== undefined
       || item.durablePrimaryInbox || item.queuedActivationToken
       || item.vcMeetingImTurnOrigin || item.taskContinuation || item.noReplay) break;
     index++;
@@ -421,4 +429,25 @@ export function promoteInteractiveInputPastSchedules(
   pending.splice(index, 1);
   pending.unshift(input);
   return true;
+}
+
+/** A serial schedule prefix may wait indefinitely behind an active task.
+ * Let its authenticated human controller steer without changing the order of
+ * other user messages or crossing a durable/group/continuation boundary. */
+export function promoteInteractiveInputPastSchedules(
+  pending: PendingCliInput[],
+  mayControlActiveTurn: (input: PendingCliInput) => boolean,
+): boolean {
+  return promoteInteractiveInputPastPrefix(pending, mayControlActiveTurn,
+    item => item.trustedCaller?.source === 'schedule_creator');
+}
+
+/** A quota hold applies only to automatic ticks, not to an owner's urgent input.
+ * Promote across precisely the inputs that the quota gate would hold. */
+export function promoteInteractiveInputPastQuotaSchedules(
+  pending: PendingCliInput[],
+  mayControlActiveTurn: (input: PendingCliInput) => boolean,
+): boolean {
+  return promoteInteractiveInputPastPrefix(pending, mayControlActiveTurn,
+    item => automaticScheduledInputTask(item) !== undefined, false);
 }

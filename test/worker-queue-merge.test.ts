@@ -12,6 +12,8 @@ import {
   shouldDeferInitialPromptForArgLimit,
   shouldStopPendingBatch,
   terminalReleasesDurableTurn,
+  automaticScheduledInputTask,
+  coalesceAutomaticScheduledInputs,
 } from '../src/utils/pending-input-queue.js';
 
 const imOrigin = {
@@ -610,5 +612,16 @@ describe('automatic schedule enqueue coalescing', () => {
     for (const next of [manual, other, recovery, unknownManual, item(5)]) sendToPty(next.content, next.turnId, next);
     expect(pendingMessages.map(x => x.turnId)).toEqual(['om_human', manual.turnId, other.turnId, recovery.turnId, unknownManual.turnId, item(5).turnId]);
     expect(pendingMessages.map(x => x.content)).toEqual(['human message', manual.content, other.content, recovery.content, unknownManual.content, item(5).content]);
+  });
+
+  it('keeps host-marked ordinary recovery out of automatic tick coalescing and quota classification', () => {
+    const originalTurn = item(0).turnId;
+    const recovery = { ...item(1), content: '[BOTMUX_RECOVERY] continue from checkpoint',
+      scheduledRun: { ...item(1).scheduledRun, recoveryOfTurnId: originalTurn } };
+    const newerTick = item(2);
+    const pending = [recovery, newerTick];
+    expect(automaticScheduledInputTask(recovery)).toBeUndefined();
+    expect(coalesceAutomaticScheduledInputs(pending)).toEqual([]);
+    expect(pending).toEqual([recovery, newerTick]);
   });
 });

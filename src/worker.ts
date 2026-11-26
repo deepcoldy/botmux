@@ -282,6 +282,7 @@ import {
   mergeQueuedCliInput,
   pendingInputMayFlush,
   promoteInteractiveInputPastSchedules,
+  promoteInteractiveInputPastQuotaSchedules,
   pendingInputAllowsTypeAhead,
   resolveInitialPromptDelivery,
   shouldArmSpawnArgvInitialPromptBusy,
@@ -291,7 +292,7 @@ import {
   shouldStopPendingBatch,
   terminalReleasesDurableTurn,
   type PendingCliInput,
-  automaticScheduledInputTask, coalesceAutomaticScheduledInputs, shouldDeferScheduledInitialPrompt,
+  automaticScheduledInputTask, coalesceAutomaticScheduledInputs, scheduledRecoveryInputTask, shouldDeferScheduledInitialPrompt,
 } from './utils/pending-input-queue.js';
 import { parseScheduledTurnId } from './core/scheduled-turn-provenance.js';
 import { recordSessionTurnInput, updateSessionTurnNativeAnchor } from './services/session-turns.js';
@@ -11903,6 +11904,52 @@ function scanRestartInterruption(path: string, family: 'claude' | 'structured'):
 
 const scheduledInputReceipts = new Map<string, (decision: import('./core/scheduled-input-admission.js').ScheduledInputAdmission) => void>();
 
+let scheduledAdmissionRetry: {
+  item: PendingCliInput;
+  backend: SessionBackend;
+  generation: number;
+  attempt: number;
+  timer?: ReturnType<typeof setTimeout>;
+} | undefined;
+
+function cancelScheduledAdmissionRetry(item?: PendingCliInput): void {
+  if (!scheduledAdmissionRetry || (item && scheduledAdmissionRetry.item !== item)) return;
+  if (scheduledAdmissionRetry.timer) clearTimeout(scheduledAdmissionRetry.timer);
+  scheduledAdmissionRetry = undefined;
+}
+
+function scheduleScheduledAdmissionRetry(item: PendingCliInput): void {
+  const targetBackend = backend;
+  if (!targetBackend) return;
+  const generation = cliSpawnGeneration;
+  const prior = scheduledAdmissionRetry;
+  const attempt = prior?.item === item && prior.backend === targetBackend && prior.generation === generation
+    ? prior.attempt : 0;
+  cancelScheduledAdmissionRetry();
+  const entry: NonNullable<typeof scheduledAdmissionRetry> = {
+    item, backend: targetBackend, generation, attempt: attempt + 1,
+  };
+  scheduledAdmissionRetry = entry;
+  // Retain is fail-closed, not fail-silent. Back off a transient authority/IPC
+  // outage without letting every ready edge create an unbounded retry loop.
+  const delayMs = Math.min(30_000, 1_000 * 2 ** Math.min(attempt, 5));
+  entry.timer = setTimeout(() => {
+    entry.timer = undefined;
+    if (scheduledAdmissionRetry !== entry) return;
+    if (backend !== targetBackend || cliSpawnGeneration !== generation || cliRestartInProgress) {
+      cancelScheduledAdmissionRetry(item);
+      return;
+    }
+    if (isFlushing) { scheduleScheduledAdmissionRetry(item); return; }
+    if (pendingMessages[0] !== item && pendingAdoptMessages[0] !== item) {
+      cancelScheduledAdmissionRetry(item);
+      return;
+    }
+    void flushPending();
+  }, delayMs);
+  entry.timer.unref?.();
+}
+
 async function requestScheduledInputAdmission(item: PendingCliInput): Promise<import('./core/scheduled-input-admission.js').ScheduledInputAdmission> {
   if (!item.turnId || !parseScheduledTurnId(item.turnId)) return 'allow';
   const requestId = randomBytes(16).toString('hex');
@@ -11930,9 +11977,12 @@ async function runScheduledCliInputWrite<T>(
     const held = requireQueueOwner && owner?.item === item && owner.scheduledWriteCancelled ? 'reject'
       : !isCurrent() || (requireQueueOwner && owner?.item !== item) ? 'retain' : decision;
     if (held !== 'allow') {
+      if (held === 'retain') scheduleScheduledAdmissionRetry(item);
+      else cancelScheduledAdmissionRetry(item);
       onHold(held);
       throw new Error(`scheduled_input_${held}`);
     }
+    cancelScheduledAdmissionRetry(item);
   }
   prepare();
   return write();
@@ -13219,13 +13269,18 @@ function coalescePendingScheduledInputs(pending: PendingCliInput[] = pendingMess
 function discardScheduledBacklogForStop(): void {
   const activeTask = currentBotmuxTurnId ? parseScheduledTurnId(currentBotmuxTurnId) : null;
   const writing = cliSubmissionInFlight;
-  const writingTask = writing?.scheduledWritePending ? automaticScheduledInputTask(writing.item) : undefined;
-  if (writing && writingTask && (!activeTask || writingTask === activeTask)) writing.scheduledWriteCancelled = true;
+  const writingTask = writing?.scheduledWritePending
+    ? automaticScheduledInputTask(writing.item) ?? scheduledRecoveryInputTask(writing.item) : undefined;
+  const targetTask = activeTask ?? writingTask;
+  // STOP belongs to a human/non-scheduled turn unless a scheduled writer proves
+  // otherwise. Never turn that absence into a wildcard over every queued task.
+  if (!targetTask) return;
+  if (writing && writingTask === targetTask) writing.scheduledWriteCancelled = true;
   for (const queue of [pendingMessages, pendingAdoptMessages]) {
     for (let index = queue.length - 1; index >= 0; index--) {
       const item = queue[index]!;
-      const taskId = automaticScheduledInputTask(item);
-      if (taskId && (!activeTask || taskId === activeTask)) {
+      const taskId = automaticScheduledInputTask(item) ?? scheduledRecoveryInputTask(item);
+      if (taskId === targetTask) {
         queue.splice(index, 1);
         discardUnwrittenScheduledInput(item);
       }
@@ -13258,8 +13313,12 @@ function takeUnsentInputsFromPredecessor(cfg: Extract<DaemonToWorker, { type: 'i
     const { inputs, expired, unconfirmed } = takeUnsentInputs(path);
     predecessorUnsentInputsTaken = true;
     for (const input of inputs) {
-      input.scheduledRun ??= input.turnId ? cfg.scheduledRuns?.[input.turnId]
+      const hostRun = input.turnId ? cfg.scheduledRuns?.[input.turnId]
         ?? (cfg.scheduledRun?.turnId === input.turnId ? cfg.scheduledRun : undefined) : undefined;
+      // A journal written by the previous build may already contain a legacy
+      // scheduledRun without trigger/recovery provenance. Replace its binding
+      // with the host's newly authenticated evidence instead of keeping the stale copy.
+      if (hostRun) input.scheduledRun = { ...input.scheduledRun, ...hostRun };
       restoredUnsentInputs.add(input);
     }
     coalescePendingScheduledInputs(inputs);
@@ -22142,7 +22201,7 @@ function beginCliWriteCycle(): void {
  *  message listener does not await a prior async invocation, so without the
  *  outer AsyncSerialQueue two CoCo/Codex writes can overwrite the same composer
  *  while the first is sleeping before Enter or polling history. */
-type AdoptWriteResult = 'completed' | 'refused-before-write' | 'stale-before-write' | 'stale-after-write';
+type AdoptWriteResult = 'completed' | 'admission-rejected' | 'refused-before-write' | 'stale-before-write' | 'stale-after-write';
 
 async function writeAdoptMessage(
   content: string,
@@ -22155,6 +22214,7 @@ async function writeAdoptMessage(
   fence?: AdoptWriteFence,
   queueAfterActiveTurn?: true,
   scheduledRun?: import('./types.js').Session['scheduledRun'],
+  scheduledQueueItem?: PendingCliInput,
 ): Promise<AdoptWriteResult> {
   rememberTurnLinkRefMode(turnId, dispatchAttempt, linkRefMode);
   const executionFence = fence ?? captureAdoptWriteFence();
@@ -22163,7 +22223,9 @@ async function writeAdoptMessage(
   }
   const adoptBackend = executionFence.backend;
   const adoptInterruptGeneration = cliInterruptGeneration;
-  const scheduledItem = { content, turnId, queueAfterActiveTurn, scheduledRun };
+  // Retry/requeue identity must be the original queue object. Rebuilding it here
+  // makes the generation-fenced timer cancel itself when the head is compared by reference.
+  const scheduledItem = scheduledQueueItem ?? { content, turnId, queueAfterActiveTurn, scheduledRun };
   const isScheduledWrite = !!(turnId && parseScheduledTurnId(turnId));
   let lateScheduledHold: 'reject' | 'retain' | undefined;
   const recordScheduledHold = (decision: 'reject' | 'retain') => {
@@ -22178,12 +22240,20 @@ async function writeAdoptMessage(
   }
   if (!adoptWriteFenceIsCurrent(executionFence)) return 'stale-before-write';
   if (turnId && parseScheduledTurnId(turnId)) {
-    const item = { content, turnId, queueAfterActiveTurn, scheduledRun };
+    const item = scheduledItem;
     if (automaticScheduledInputTask(item) && usageLimitTracker.detectedThisTurn(usageLimitTracker.currentTurn())) return 'stale-before-write';
     const decision = await requestScheduledInputAdmission(item);
     if (!adoptWriteFenceIsCurrent(executionFence)) return 'stale-before-write';
-    if (decision === 'reject') { discardUnwrittenScheduledInput(item); return 'refused-before-write'; }
-    if (decision !== 'allow') return 'stale-before-write';
+    if (decision === 'reject') {
+      cancelScheduledAdmissionRetry(item);
+      discardUnwrittenScheduledInput(item);
+      return 'admission-rejected';
+    }
+    if (decision !== 'allow') {
+      scheduleScheduledAdmissionRetry(item);
+      return 'stale-before-write';
+    }
+    cancelScheduledAdmissionRetry(item);
   }
 
   let turnSeq = isScheduledWrite ? usageLimitTracker.currentTurn() : 0;
@@ -22378,7 +22448,7 @@ async function writeAdoptMessage(
       }
     } catch (err: any) {
       if (lateScheduledHold) {
-        if (lateScheduledHold === 'reject') { discardUnwrittenScheduledInput(scheduledItem); return 'refused-before-write'; }
+        if (lateScheduledHold === 'reject') { discardUnwrittenScheduledInput(scheduledItem); return 'admission-rejected'; }
         return 'stale-before-write';
       }
       recoveryFailureReason = err instanceof SubmissionWriteError
@@ -22443,7 +22513,7 @@ async function writeAdoptMessage(
       }
     } catch (err: any) {
       if (lateScheduledHold) {
-        if (lateScheduledHold === 'reject') { discardUnwrittenScheduledInput(scheduledItem); return 'refused-before-write'; }
+        if (lateScheduledHold === 'reject') { discardUnwrittenScheduledInput(scheduledItem); return 'admission-rejected'; }
         return 'stale-before-write';
       }
       recoveryFailureReason = err instanceof SubmissionWriteError
@@ -22500,6 +22570,7 @@ async function runAdoptMessageForCapturedGeneration(
       fence,
       item.queueAfterActiveTurn,
       item.scheduledRun,
+      item,
     ),
   });
   if (queued.status === 'stale-before-write') return 'stale-before-write';
@@ -29528,9 +29599,20 @@ function promotePendingHumanInterruption(): boolean {
   // swallow the owner's live interruption behind that wait. This is a queue
   // selection only: retain authority, delivery fences and the scheduled work.
   // Use the principal gate even when experimental isolation is disabled.
-  if (runtimeSupportsTypeAhead && !durableTurnInFlight && !directRpcTurnBlocksTypeAhead()
-    && !isRemoteBackendType(effectiveBackendType) && !isCodexAppCliId(lastInitConfig?.cliId)
-    && activeTurnBlocks(pendingMessages[0] ?? {})) {
+  if (durableTurnInFlight || directRpcTurnBlocksTypeAhead()) return false;
+  const queue = lastInitConfig?.adoptMode && pendingAdoptMessages.length > 0 ? pendingAdoptMessages : pendingMessages;
+  const head = queue[0] ?? {};
+  const quotaBlockedAutomaticHead = isPromptReady && automaticScheduledInputTask(head) !== undefined
+    && usageLimitTracker.detectedThisTurn(usageLimitTracker.currentTurn());
+  if (quotaBlockedAutomaticHead) {
+    // The quota-blocked CLI is idle, so this remains a serial queue selection,
+    // not type-ahead. It applies equally to adopt and idle remote backends; their
+    // busy-transport exclusions must not suppress an in-memory reorder.
+    return promoteInteractiveInputPastQuotaSchedules(queue, input =>
+      !activeTurnAuthority.blocks(turnAuthorityIdentity(input)));
+  }
+  if (runtimeSupportsTypeAhead && !isRemoteBackendType(effectiveBackendType)
+    && !isCodexAppCliId(lastInitConfig?.cliId) && activeTurnBlocks(pendingMessages[0] ?? {})) {
     return promoteInteractiveInputPastSchedules(pendingMessages, input =>
       !activeTurnAuthority.blocks(turnAuthorityIdentity(input)));
   }
@@ -29991,13 +30073,12 @@ async function flushPending(): Promise<void> {
         log(`Re-queued adopt message at queue head for the replacement CLI generation (${item.content.length} chars)`);
       });
       // Its native terminal can make the composer ready while the adapter is
-      // still awaiting history. That idle edge reached this flush under its
-      // mutex; re-drive after finally releases it, so the next queued message
-      // does not depend on another terminal redraw. Only a finished write
-      // re-drives: a pre-write refusal ('refused-before-write') wrote nothing
-      // and leaves peers to the next genuine prompt-ready edge, so this can
-      // never spin without a write.
-      if (outcome === 'completed' && isPromptReady && pendingAdoptMessages.length > 0) {
+      // still awaiting history. A finished write or a known host-admission
+      // rejection consumed the head; either can release the ready queue after
+      // finally releases the mutex. Composer refusals still wait for a genuine
+      // new prompt-ready edge, which prevents a no-write retry spin.
+      if ((outcome === 'completed' || outcome === 'admission-rejected')
+        && isPromptReady && pendingAdoptMessages.length > 0) {
         queueMicrotask(() => { void flushPending(); });
       }
       return;
@@ -30145,12 +30226,18 @@ async function flushPending(): Promise<void> {
           || webTerminalInputWireDirty()) { keepPromptReadyAfterHold(); break; }
         if (pendingMessages[0] !== scheduledHead) { keepPromptReadyAfterHold(); continue; }
         if (decision === 'reject') {
+          cancelScheduledAdmissionRetry(scheduledHead);
           pendingMessages.shift();
           discardUnwrittenScheduledInput(scheduledHead);
           keepPromptReadyAfterHold();
           continue;
         }
-        if (decision !== 'allow') { keepPromptReadyAfterHold(); break; }
+        if (decision !== 'allow') {
+          scheduleScheduledAdmissionRetry(scheduledHead);
+          keepPromptReadyAfterHold();
+          break;
+        }
+        cancelScheduledAdmissionRetry(scheduledHead);
         if (activeTurnBlocks(scheduledHead)) { keepPromptReadyAfterHold(); break; }
       }
       const item = freshnessInputQueue.takeNormal();

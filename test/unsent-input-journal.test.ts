@@ -98,6 +98,24 @@ describe('unsent input journal', () => {
   });
 });
 
+it('refreshes an existing legacy scheduledRun with host trigger and recovery evidence on restore', () => {
+  const path = join(dir, 'legacy-provenance.unsent.json');
+  const taskId = 'a1b2c3d4';
+  const turnId = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+  const originalTurn = 'schedule:a1b2c3d4:aaaaaaaa-1234-1234-1234-123456789abc';
+  saveUnsentInputs(path, [{ turnId, content: 'recovery envelope', queueAfterActiveTurn: true,
+    scheduledRun: { taskId, runId: 'run-1', turnId, trigger: 'scheduler' } }]);
+  const scope = { sessionId: 's', restoredUnsentInputs: new Set(),
+    unsentInputJournalPath: () => path, takeUnsentInputs, removeTakenUnsentInputs,
+    settleTakenUnsentInputs, log: () => {}, send: () => {}, t: (x: string) => x };
+  const restored = loadWorkerFunction<any>('takeUnsentInputsFromPredecessor', scope)({
+    cliId: 'codex', scheduledRuns: { [turnId]: { taskId, runId: 'run-1', turnId,
+      trigger: 'dashboard', recoveryOfTurnId: originalTurn } },
+  });
+  expect(restored).toHaveLength(1);
+  expect(restored[0].scheduledRun).toMatchObject({ trigger: 'dashboard', recoveryOfTurnId: originalTurn });
+});
+
 it('compacts 341 legacy scheduled inputs at worker restore and never resurrects discarded inputs after another restart', () => {
   const path = join(dir, 'restore341.unsent.json');
   const taskId = 'a1b2c3d4';

@@ -5,6 +5,8 @@ import { ActiveTurnAuthority } from '../src/core/active-turn-authority.js';
 import { pendingInputAllowsTypeAhead, pendingInputMayFlush, promoteInteractiveInputPastSchedules } from '../src/utils/pending-input-queue.js';
 import { programStatusBlockHoldsTypeAhead } from '../src/core/program-status-gate.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { AsyncSerialQueue } from '../src/utils/async-serial-queue.js';
+import { runAdoptQueuedWriteSequence } from '../src/services/adopt-input-sequence.js';
 
 function harness(cliId = 'codex') {
   const caller = { requestUserOpenId: 'owner', requestLarkAppId: 'app', senderType: 'user' as const };
@@ -394,6 +396,22 @@ describe('scheduled admission at the real worker drain', () => {
     expect(h.isPromptReady).toBe(true);
   });
 
+  it('retries a retained admission on a generation-fenced timer without an external ready edge', async () => {
+    vi.useFakeTimers();
+    try {
+      const h = ready();
+      h.requestScheduledInputAdmission = vi.fn()
+        .mockResolvedValueOnce('retain').mockResolvedValueOnce('allow');
+      await h.flushPending();
+      expect(h.requestScheduledInputAdmission).toHaveBeenCalledOnce();
+      expect(h.pendingMessages).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(h.requestScheduledInputAdmission).toHaveBeenCalledTimes(2);
+      expect(h.freshnessInputQueue.takeNormal).toHaveBeenCalledOnce();
+      expect(h.pendingMessages).toEqual([]);
+    } finally { vi.useRealTimers(); }
+  });
+
   it('does not drain an automatic backlog while a confirmed quota limit remains active', async () => {
     const h = ready(); h.usageLimitTracker = { currentTurn: () => 4, detectedThisTurn: () => true };
     h.requestScheduledInputAdmission = vi.fn(async () => 'allow');
@@ -403,6 +421,38 @@ describe('scheduled admission at the real worker drain', () => {
     expect(h.pendingMessages).toHaveLength(1);
     h.pendingMessages[0].scheduledRun.trigger = 'dashboard';
     await h.flushPending(); expect(h.freshnessInputQueue.takeNormal).toHaveBeenCalledOnce();
+  });
+
+  it.each([true, false])('lets an authorized human past the quota-held automatic head (typeAhead=%s)', async supportsTypeAhead => {
+    const h = ready();
+    const human = { turnId: 'om_human', content: 'urgent question', trustedCaller: {
+      requestUserOpenId: 'owner', requestLarkAppId: 'app', senderType: 'user' as const,
+    } };
+    h.pendingMessages.push(human);
+    h.usageLimitTracker = { currentTurn: () => 4, detectedThisTurn: () => true };
+    h.runtimePtyInputPolicy = () => ({ supportsTypeAhead, allowBackToBackWrites: true });
+    h.requestScheduledInputAdmission = vi.fn(async () => 'allow');
+    await h.flushPending();
+    expect(h.freshnessInputQueue.takeNormal).toHaveBeenCalledOnce();
+    expect(h.pendingMessages.map((x: any) => x.turnId)).toEqual([turnId]);
+    expect(h.requestScheduledInputAdmission).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['ownerless automatic input without a serial marker', 'tmux', false],
+    ['idle remote-runner', 'remote-runner', true],
+  ])('lets an authorized human past a quota-held %s', async (_name, backendType, serial) => {
+    const h = ready();
+    if (!serial) delete h.pendingMessages[0].queueAfterActiveTurn;
+    h.effectiveBackendType = backendType;
+    h.pendingMessages.push({ turnId: 'om_human', content: 'urgent question', trustedCaller: {
+      requestUserOpenId: 'owner', requestLarkAppId: 'app', senderType: 'user' as const,
+    } });
+    h.usageLimitTracker = { currentTurn: () => 4, detectedThisTurn: () => true };
+    h.runtimePtyInputPolicy = () => ({ supportsTypeAhead: false, allowBackToBackWrites: true });
+    await h.flushPending();
+    expect(h.freshnessInputQueue.takeNormal).toHaveBeenCalledOnce();
+    expect(h.pendingMessages.map((x: any) => x.turnId)).toEqual([turnId]);
   });
 
   it('STOP clears the associated automatic backlog while ordinary, manual and other-task inputs stay usable', async () => {
@@ -421,6 +471,33 @@ describe('scheduled admission at the real worker drain', () => {
     h.effectiveBackendType = 'tmux'; h.isPromptReady = true;
     await h.flushPending(); expect(h.freshnessInputQueue.takeNormal).toHaveBeenCalledOnce();
     expect(h.pendingMessages).toEqual([manual, other, unknownManual]);
+  });
+
+  it('STOP discards ordinary recovery but preserves an independent dashboard manual run', async () => {
+    const h = ready(); h.currentBotmuxTurnId = turnId;
+    const recoveryTurn = 'schedule:a1b2c3d4:aaaaaaaa-1234-1234-1234-123456789abc';
+    const recovery = { ...scheduled(), turnId: recoveryTurn,
+      scheduledRun: { ...scheduled().scheduledRun, turnId: recoveryTurn, trigger: 'dashboard' as const, recoveryOfTurnId: turnId } };
+    const manualTurn = 'schedule:a1b2c3d4:bbbbbbbb-1234-1234-1234-123456789abc';
+    const manual = { ...scheduled(), turnId: manualTurn,
+      scheduledRun: { ...scheduled().scheduledRun, turnId: manualTurn, trigger: 'dashboard' as const } };
+    h.pendingMessages.push(recovery, manual);
+    h.effectiveBackendType = 'remote-runner';
+    await loadWorkerFunction<any>('handleTermAction', h)('ctrlc');
+    expect(h.pendingMessages).toEqual([manual]);
+  });
+
+  it('STOP during a human turn preserves every scheduled task backlog', async () => {
+    const h = ready(); h.currentBotmuxTurnId = 'om_active_human';
+    const other = { ...scheduled(), turnId: 'schedule:bbbbbbbb:12345678-1234-1234-1234-123456789abc',
+      scheduledRun: { ...scheduled().scheduledRun, taskId: 'bbbbbbbb', turnId: 'schedule:bbbbbbbb:12345678-1234-1234-1234-123456789abc' } };
+    const human = { turnId: 'om_next_human', content: 'ordinary' };
+    h.pendingMessages.push(other, human);
+    const before = [...h.pendingMessages];
+    h.effectiveBackendType = 'remote-runner';
+    await loadWorkerFunction<any>('handleTermAction', h)('ctrlc');
+    expect(h.pendingMessages).toEqual(before);
+    expect(h.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'turn_input_rejected' }));
   });
 
   it('times out an authenticated IPC admission without releasing the head', async () => {
@@ -444,9 +521,81 @@ it('checks host schedule authority before an adopted pane opens or writes the tu
   };
   const result = await loadWorkerFunction<any>('writeAdoptMessage', scope)('scheduled prompt', turnId,
     undefined, undefined, undefined, undefined, undefined, undefined, true);
-  expect(result).toBe('refused-before-write');
+  expect(result).toBe('admission-rejected');
   expect(backend.write).not.toHaveBeenCalled();
   expect(scope.renderer.markNewTurn).not.toHaveBeenCalled();
+});
+
+describe('adopt admission rejection queue release', () => {
+  it.each([
+    ['admission-rejected', 2, 0],
+    ['refused-before-write', 1, 1],
+  ])('re-drives ready peers only for %s', async (outcome, expectedCalls, remaining) => {
+    const h = harness(); h.activeTurnAuthority.clear();
+    h.lastInitConfig = { cliId: 'codex', adoptMode: true };
+    const rejected = { turnId: 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc', content: 'scheduled' };
+    const human = { turnId: 'om_adopt_human', content: 'next' };
+    h.pendingMessages = []; h.pendingAdoptMessages = [rejected, human];
+    h.hasPendingInputForFlush = () => h.pendingAdoptMessages.length > 0;
+    h.runAdoptMessageForCapturedGeneration = vi.fn(async () => outcome);
+    await h.flushPending();
+    await Promise.resolve(); await Promise.resolve();
+    expect(h.runAdoptMessageForCapturedGeneration).toHaveBeenCalledTimes(expectedCalls);
+    expect(h.pendingAdoptMessages).toHaveLength(remaining);
+  });
+});
+
+describe('adopt scheduled queue recovery', () => {
+  const adoptTurn = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+  const automatic = () => ({ turnId: adoptTurn, content: 'automatic',
+    scheduledRun: { taskId: 'a1b2c3d4', runId: 'run-1', turnId: adoptTurn, trigger: 'scheduler' as const } });
+
+  it('lets an authorized human past a quota-held automatic adopt head', async () => {
+    const h = harness(); h.activeTurnAuthority.clear();
+    h.lastInitConfig = { cliId: 'codex', adoptMode: true };
+    const tick = automatic(); const human = { turnId: 'om_adopt_human', content: 'urgent', trustedCaller: {
+      requestUserOpenId: 'owner', requestLarkAppId: 'app', senderType: 'user' as const,
+    } };
+    h.pendingMessages = []; h.pendingAdoptMessages = [tick, human];
+    h.hasPendingInputForFlush = () => h.pendingAdoptMessages.length > 0;
+    h.usageLimitTracker = { currentTurn: () => 4, detectedThisTurn: () => true };
+    h.runAdoptMessageForCapturedGeneration = vi.fn(async (item: any, requeue: () => void) => {
+      if (item === human) return 'completed';
+      requeue();
+      return 'stale-before-write';
+    });
+    await h.flushPending(); await Promise.resolve(); await Promise.resolve();
+    expect(h.runAdoptMessageForCapturedGeneration.mock.calls[0][0]).toBe(human);
+    expect(h.pendingAdoptMessages).toEqual([tick]);
+  });
+
+  it('retries a retained adopt admission against the original queue item', async () => {
+    vi.useFakeTimers();
+    try {
+      const h = harness(); h.activeTurnAuthority.clear();
+      const tick = automatic();
+      h.send = vi.fn();
+      h.pendingMessages = []; h.pendingAdoptMessages = [tick];
+      h.lastInitConfig = { cliId: 'codex', adoptMode: true };
+      h.hasPendingInputForFlush = () => h.pendingAdoptMessages.length > 0;
+      h.rememberTurnLinkRefMode = () => {};
+      h.captureAdoptWriteFence = () => ({ backend: h.backend });
+      h.adoptWriteFenceIsCurrent = () => true;
+      h.runAdoptQueuedWriteSequence = runAdoptQueuedWriteSequence;
+      h.adoptWriteQueue = new AsyncSerialQueue();
+      h.writeAdoptMessage = loadWorkerFunction('writeAdoptMessage', h);
+      h.runAdoptMessageForCapturedGeneration = loadWorkerFunction('runAdoptMessageForCapturedGeneration', h);
+      h.requestScheduledInputAdmission = vi.fn()
+        .mockResolvedValueOnce('retain').mockResolvedValueOnce('reject');
+      await h.flushPending();
+      expect(h.pendingAdoptMessages).toEqual([tick]);
+      expect(h.requestScheduledInputAdmission).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(1_000);
+      await Promise.resolve(); await Promise.resolve();
+      expect(h.requestScheduledInputAdmission).toHaveBeenCalledTimes(2);
+      expect(h.pendingAdoptMessages).toEqual([]);
+    } finally { vi.useRealTimers(); }
+  });
 });
 
 describe('schedule admission after terminal write mutex', () => {
@@ -532,7 +681,7 @@ it.each(['structured', 'raw'])('leaves %s adopted authority untouched after a la
   expect(scope.currentBotmuxTurnId).toBeUndefined();
   expect(scope.renderer.markNewTurn).not.toHaveBeenCalled();
   task.enabled = false; task.disabledReason = 'manual'; release();
-  expect(await pending).toBe('refused-before-write');
+  expect(await pending).toBe('admission-rejected');
   expect(writeInput).not.toHaveBeenCalled();
   expect(backend.sendText).not.toHaveBeenCalled(); expect(backend.sendSpecialKeys).not.toHaveBeenCalled();
   expect(authority.snapshot()).toBeUndefined();

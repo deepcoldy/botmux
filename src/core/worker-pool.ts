@@ -1222,7 +1222,8 @@ import {
   trustedCallerForScheduledTask,
 } from './scheduled-turn-provenance.js';
 import { admitScheduledInput } from './scheduled-input-admission.js';
-import { scheduledSessionRun } from './scheduled-send.js';
+import { scheduledSessionRun, scheduledSessionRunWithEvidence, settleScheduledSessionRun } from './scheduled-send.js';
+import { findScheduleRunTrigger } from '../services/schedule-run-log-store.js';
 import { inheritActiveTurnFinalSuppression, isTriggerFinalSuppressed } from './trigger-final-suppression.js';
 import { writeDeferredTopicBinding } from './deferred-topic-binding.js';
 import {
@@ -18902,6 +18903,40 @@ function noteAdmittedTurnSilentScheduleState(
   }
 }
 
+function scheduledRunTriggerForWorker(ds: DaemonSession, taskId: string, runId: string): 'scheduler' | 'dashboard' | undefined {
+  return findScheduleRunTrigger(taskId, runId, ds.larkAppId, config.session.dataDir);
+}
+
+function scheduledRunForWorker(ds: DaemonSession, turnId: string | undefined): Session['scheduledRun'] {
+  try {
+    return scheduledSessionRunWithEvidence(ds.session, turnId,
+      (taskId, runId) => scheduledRunTriggerForWorker(ds, taskId, runId));
+  } catch {
+    // The admission IPC re-reads this evidence and retains on errors. Dispatching
+    // the init/message itself must not fail just because legacy history is unreadable.
+    return scheduledSessionRun(ds.session, turnId);
+  }
+}
+
+function scheduledRunsForWorker(ds: DaemonSession): Session['scheduledRuns'] {
+  const turnIds = new Set(Object.keys(ds.session.scheduledRuns ?? {}));
+  if (ds.session.scheduledRun) turnIds.add(ds.session.scheduledRun.turnId);
+  if (turnIds.size === 0) return undefined;
+  return Object.fromEntries([...turnIds].flatMap(turnId => {
+    const run = scheduledRunForWorker(ds, turnId);
+    return run ? [[turnId, run]] : [];
+  }));
+}
+
+function settleScheduledRunBinding(ds: DaemonSession, turnId: string, dispatchAttempt?: number): void {
+  const highWater = ds.turnDispatchAttemptHighWater;
+  if (dispatchAttempt !== undefined && highWater?.turnId === turnId
+    && dispatchAttempt < highWater.dispatchAttempt) return;
+  if (!settleScheduledSessionRun(ds.session, turnId)) return;
+  try { sessionStore.updateSession(ds.session); }
+  catch (error) { logger.warn(`[${tag(ds)}] Failed to persist scheduled run binding settlement: ${String(error)}`); }
+}
+
 /** Finish ordinary-turn recovery bookkeeping only after a fresh Lark turn has
  * crossed its real admission boundary (durable activation tail or worker
  * input). The user turn is already accepted at this point, so persistence
@@ -19440,7 +19475,7 @@ export function sendWorkerInput(
   // while preserving PR #597's accepted-dispatch ledger + reply-context wiring.
   const message: Extract<DaemonToWorker, { type: 'message' }> = {
     type: 'message',
-    scheduledRun: scheduledSessionRun(ds.session, effectiveTurnId),
+    scheduledRun: scheduledRunForWorker(ds, effectiveTurnId),
     content: normalized.content,
     ...(failedTurnRewind ? { failedTurnRewind } : {}),
     // A parked (crash-loop stopped) worker respawns the CLI from INSIDE the
@@ -22928,8 +22963,8 @@ function forkWorkerPrepared(
   }
   ds.protectedLoopbackProxyAttestation = protectedLoopbackProxyAttestation;
   initializeWorkerIpcBootstrap(worker);
-  initMsg.scheduledRun = scheduledSessionRun(ds.session, initMsg.turnId);
-  initMsg.scheduledRuns = ds.session.scheduledRuns;
+  initMsg.scheduledRun = scheduledRunForWorker(ds, initMsg.turnId);
+  initMsg.scheduledRuns = scheduledRunsForWorker(ds);
   rememberScheduledTurnCaller(ds, initAttributionTurnId, initTrustedCaller);
   {
     const initCallerOpenId = turnCallerOpenIdFor(ds, initMsg.turnId);
@@ -25535,6 +25570,7 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored turn_input_rejected from stale worker generation`);
           break;
         }
+        settleScheduledRunBinding(ds, msg.turnId, msg.dispatchAttempt);
         // A pre-admission rejection never ran: release the accepted-input guard
         // for the exact admission attempt it names. Without an attempt it can
         // only prove the un-attempted execution; a later re-accepted attempt
@@ -25585,7 +25621,10 @@ function setupWorkerHandlers(
         let decision: import('./scheduled-input-admission.js').ScheduledInputAdmission = 'retain';
         if (ds.worker === worker && ds.workerGeneration === workerGeneration
           && ds.session.workerGeneration === workerGeneration) {
-          try { decision = admitScheduledInput(ds.session, ds.larkAppId, msg.turnId, callbacks?.loadScheduledTaskForInput); }
+          try {
+            decision = admitScheduledInput(ds.session, ds.larkAppId, msg.turnId, callbacks?.loadScheduledTaskForInput,
+              (taskId, runId) => scheduledRunTriggerForWorker(ds, taskId, runId));
+          }
           catch (error) { logger.warn(`[${t}] Scheduled input admission unavailable: ${String(error)}`); }
         }
         worker.send({ type: 'scheduled_input_admitted', requestId: msg.requestId, decision } satisfies DaemonToWorker);
@@ -29655,6 +29694,7 @@ function setupWorkerHandlers(
         const obsoleteTerminalAttempt = msg.dispatchAttempt !== undefined
           && terminalHighWater?.turnId === msg.turnId
           && msg.dispatchAttempt < terminalHighWater.dispatchAttempt;
+        if (!obsoleteTerminalAttempt) settleScheduledRunBinding(ds, msg.turnId, msg.dispatchAttempt);
         if ((!ds.currentTurnId || ds.currentTurnId === msg.turnId)
           && (!terminalHighWater || terminalHighWater.turnId !== msg.turnId
             || msg.dispatchAttempt === undefined
@@ -34681,8 +34721,8 @@ export function forkAdoptWorker(
     const initCallerOpenId = turnCallerOpenIdFor(ds, 'turnId' in initMsg ? initMsg.turnId : undefined);
     if (initCallerOpenId) initMsg = { ...initMsg, turnCallerOpenId: initCallerOpenId };
   }
-  initMsg.scheduledRun = scheduledSessionRun(ds.session, initMsg.turnId);
-  initMsg.scheduledRuns = ds.session.scheduledRuns;
+  initMsg.scheduledRun = scheduledRunForWorker(ds, initMsg.turnId);
+  initMsg.scheduledRuns = scheduledRunsForWorker(ds);
   // IPC handlers capture the contract at registration time, before the child
   // requests its first runtime reservation (including restored adopt sessions).
   ds.initConfig = initMsg;
