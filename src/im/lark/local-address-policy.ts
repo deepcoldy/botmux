@@ -29,6 +29,7 @@ interface Context {
   hosts: Set<string>;
   hostPaths: RegExp;
   hostNames: RegExp;
+  bracketedHostNames: RegExp;
   internalFile: string;
   unavailableLink: string;
   hostIssuedLink?: (url: string) => boolean;
@@ -87,25 +88,33 @@ function contextFor(input: LocalAddressContext): Context {
   }
   const roots = (input.workspaceRoots ?? [process.cwd()]).map(root => root.replace(/\\/g, '/').replace(/\/+$/, ''));
   const hostPaths = [...roots, homedir()].filter(root => root && root !== '/').map(escaped);
+  const bracketedHosts: string[] = [];
   const hostNames = ['0.0.0.0', '::', '::1', ...hosts].filter(host => isIP(host))
     .map(host => {
+      if (host.includes(':')) bracketedHosts.push(escaped(host));
       // Bare :: is also a code operator. A bare ::1 can name loopback, but
       // starting in the middle of a colon run would turn field:::1 into an address.
-      if (host === '::') return '\\[::\\]';
+      if (host === '::') return '(?:\\[::\\]|(?<=\\[)::(?=\\s|$))';
       if (host === '::1') return '(?:\\[::1\\]|(?<!:)::1)';
       return host.includes(':') ? '(?:\\[' + escaped(host) + '\\]|' + escaped(host) + ')' : escaped(host);
     });
   const mappedLoopback = '::ffff:(?:127(?:\\.\\d{1,3}){3}|7f[0-9a-f]{2}:[0-9a-f]{1,4})';
+  bracketedHosts.push(mappedLoopback);
   hostNames.push('(?:\\[' + mappedLoopback + '\\]|' + mappedLoopback + ')');
   // Machine names are often ordinary words (ubuntu, master, devbox). In prose
   // one only names this host when it carries a port; URLs are judged by authority.
   const machineNames = [...hosts].filter(host => host && !isIP(host)).map(escaped);
   const machineAddress = machineNames.length ? '|(?:' + machineNames.join('|') + '):\\d+' : '';
+  const hostPath = '(?:/[^\\s<>"\\x27\\x60，。、；！？()[\\]]*)?';
   return {
     roots,
     hosts,
     hostPaths: new RegExp('(?<![\\w/])(?:' + hostPaths.join('|') + ')(?=/|$)[^\\s<>"\\x27\\x60，。、；！？()[\\]]*', 'gu'),
-    hostNames: new RegExp('(?<![\\w.-])(?:(?:localhost|127(?:\\.\\d{1,3}){3}|' + hostNames.join('|') + ')(?::\\d+)?' + machineAddress + ')(?![\\w.:-])(?:/[^\\s<>"\\x27\\x60，。、；！？()[\\]]*)?', 'giu'),
+    hostNames: new RegExp('(?<![\\w.-])(?:(?:localhost|127(?:\\.\\d{1,3}){3}|' + hostNames.join('|') + ')(?::\\d+)?' + machineAddress + ')(?![\\w.:-])' + hostPath, 'giu'),
+    // Brackets already delimit an IPv6 host, so a preceding word or a following
+    // colon cannot make it a domain suffix. Consume a numeric port and legal
+    // horizontal whitespace when present; otherwise still mask the bracketed IP.
+    bracketedHostNames: new RegExp('\\[(?:' + bracketedHosts.join('|') + ')\\](?::[ \\t]*\\d+(?![\\w.:-]))?' + hostPath, 'giu'),
     internalFile: input.internalFileLabel ?? '【内部文件】',
     unavailableLink: input.unavailableLinkLabel ?? '（未提供可访问链接）',
     hostIssuedLink: input.hostIssuedLink,
@@ -175,6 +184,9 @@ function localDestination(value: string, ctx: Context): boolean {
 }
 
 function localLinkLabel(label: string, target: string, ctx: Context): string {
+  // Link rewriting strips brackets; never turn a local IPv6 label back into
+  // bare prose that the narrowed colon-run matcher deliberately leaves alone.
+  if (isIP(label) === 6 && localServiceUrl(`http://[${label}]`, ctx)) label = ctx.internalFile;
   if (/(?:^|[\\/])SKILL\.md(?:[?#:]|$)/i.test(decoded(target))) return label;
   const relative = inWorkspace(target, ctx);
   if (relative) return label === relative ? relative : label + ' (' + relative + ')';
@@ -237,13 +249,15 @@ function scrubLinks(input: string, ctx: Context): string {
         // A line like "[::]:8080/health" is also a Markdown reference definition.
         // Match the whole endpoint before link rewriting strips its brackets.
         if (input[labelEnd + 1] === ':' && isIP(label) === 6) {
-          const hostAt = new RegExp(ctx.hostNames, 'iyu');
+          const hostAt = new RegExp(ctx.bracketedHostNames, 'iyu');
           hostAt.lastIndex = start;
-          if (hostAt.test(input)) {
+          if (hostAt.test(input) && hostAt.lastIndex > labelEnd + 1) {
             replacements.push({ start, end: hostAt.lastIndex, text: ctx.internalFile });
             start = hostAt.lastIndex - 1;
             continue;
           }
+          // A bracket-only match is not a numeric endpoint. Fall through to
+          // the normal local-reference label instead of manufacturing a new definition.
         }
         target = env.references![normalized]!.href;
         end = pos;
@@ -281,6 +295,7 @@ function scrubText(input: string, ctx: Context): string {
   const scrubSegment = (segment: string): string => segment
     .replace(ADDRESS_TOKEN, scrubAddress)
     .replace(ctx.hostPaths, scrubAddress)
+    .replace(ctx.bracketedHostNames, ctx.internalFile)
     .replace(ctx.hostNames, ctx.internalFile);
   // URL spans are protected as whole strings: /home in a business URL is not
   // a host filesystem path. Only the URL's authority determines locality.

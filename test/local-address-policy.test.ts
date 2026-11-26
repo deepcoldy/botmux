@@ -108,7 +108,7 @@ describe('local address presentation policy', () => {
   it.each([
     'route = rpc|example.service:staging:::|lookup|',
     'f :: Int -> Int', '1 :: xs', 'Use `::` as scope separator', 'IPv6 default route ::/0',
-    'foo:::1', 'bar::1', 'a:::b', '2001:db8::1', 'example.service::lookup',
+    'foo:::1', 'bar::1', 'a:::b', '2001:db8::1', 'example.service::lookup', 'a[::2]',
   ])('preserves non-address colon syntax in prose: %s', text => {
     expect(sanitizeLocalAddressText(text, { localHosts: ['::', '::1'] })).toBe(text);
   });
@@ -116,6 +116,10 @@ describe('local address presentation policy', () => {
   it.each([
     ['listen on [::] port 8080', 'listen on [F] port 8080'],
     ['[::]:8080/health', '[F]'],
+    ['[::]: 8080/health', '[F]'], ['[::]:\t8080/health', '[F]'],
+    ['[::]:8080/health "title"', '[F] "title"'],
+    ['[::]:', '[F]:'],
+    ['abc[::]:8080/x', 'abc[F]'], ['abc[::1]:8080/x', 'abc[F]'],
     ['address:[::]:8080/health', 'address:[F]'],
     ['http://[::]:3000/api', '[F]'], ['http://[::]/', '[F]'], ['ws://[::]:8080', '[F]'],
     ['ping ::1 now', 'ping [F] now'], ['connect to ::1:8080/api', 'connect to [F]'],
@@ -130,6 +134,36 @@ describe('local address presentation policy', () => {
     expect(sanitizeLocalAddressText(text, { internalFileLabel: '[F]', unavailableLinkLabel: ' [blocked]' }))
       .toBe('See status [blocked]\n\n[F]\nNext line');
   });
+
+  it.each(['[::]:abc', '[::]:/health', '[::]:8080foo'])(
+    'masks a local IPv6 reference label without creating a new definition: %s', text => {
+      const context = { internalFileLabel: '[F]', unavailableLinkLabel: ' [blocked]' };
+      const output = sanitizeLocalAddressText(text, context);
+      expect(output).toBe(text.replace('[::]', '[F] [blocked]'));
+      expect(sanitizeLocalAddressText(output, context)).toBe(output);
+    },
+  );
+
+  it('scrubs local IPv6 labels in shortcut references and mixed definitions', () => {
+    const text = 'See [::] and [::1]\r\n\r\n   [::]: 8080/a\r\n[::1]: 8081/b\r\n[::]:abc\r\n[::1]:def';
+    expect(sanitizeLocalAddressText(text, { internalFileLabel: '[F]', unavailableLinkLabel: ' [blocked]' }))
+      .toBe('See [F] [blocked] and [F] [blocked]\r\n\r\n   [F]\r\n[F]\r\n[F] [blocked]:abc\r\n[F] [blocked]:def');
+  });
+
+  it('scrubs local IPv6 definitions inside fenced code with CRLF preserved', () => {
+    const text = '```text\r\n   [::]: 8080/a\r\n[::1]: 8081/b\r\n[::]:abc\r\n[::1]:def\r\n```';
+    const expected = '```text\r\n   [F]\r\n[F]\r\n[F]:abc\r\n[F]:def\r\n```';
+    expect(sanitizeLocalAddressText(text, { internalFileLabel: '[F]' })).toBe(expected);
+  });
+
+  it.each(['[::', 'prefix [::', '```text\n[::\n```', '[::1'])(
+    'does not emit an unfinished local IPv6 address: %s', text => {
+      const output = sanitizeLocalAddressText(text, { internalFileLabel: '[F]' });
+      expect(output).not.toContain('::');
+      expect(output).toContain('[F]');
+      expect(sanitizeLocalAddressText(output, { internalFileLabel: '[F]' })).toBe(output);
+    },
+  );
 
   it('preserves colon-delimited fields alongside local addresses in a fenced card', () => {
     const card = (content: string) => JSON.stringify({ body: { elements: [{ tag: 'markdown', content }] } });
