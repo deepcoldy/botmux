@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { decideQueuedReadyTransition } from '../src/core/queued-ready-transition.js';
@@ -112,6 +112,23 @@ describe('a prompt-ready edge that is not the turn boundary keeps the turn autho
     const h = harness({ backgroundAgents: 1, ...queued });
     loadWorkerFunction('markPromptReady', h)();
     expect(h.releaseActiveTurnAuthority).toHaveBeenCalledWith('prompt_ready');
+  });
+
+  it('does not publish a predecessor idle frame after disk sync promotes a successor', () => {
+    const h = harness();
+    h.currentBotmuxTurnId = 'turn-a';
+    h.syncQueuedTurnsFromMarkerDisk = () => {
+      h.currentBotmuxTurnId = 'turn-b';
+      return true;
+    };
+
+    loadWorkerFunction('markPromptReady', h)();
+
+    expect(h.currentBotmuxTurnId).toBe('turn-b');
+    expect(h.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'screen_update', status: 'idle', turnId: 'turn-b',
+    }));
+    expect(h.publishScreenStatus).not.toHaveBeenCalledWith('idle');
   });
 
   it('still releases it at a real end-of-turn ready', () => {
@@ -230,6 +247,7 @@ describe('hasLiveAntigravityPendingTasks across send mode and adopt/zero-prompt 
     h.resolveFileBridgePath = () => undefined;
     h.hasAntigravityTranscriptPendingTasks = hasAntigravityTranscriptPendingTasks;
     h.join = join;
+    h.statSync = statSync;
     h.resolveLiveAntigravityTranscriptPath = loadWorkerFunction('resolveLiveAntigravityTranscriptPath', h);
     h.hasLiveAntigravityPendingTasks = loadWorkerFunction('hasLiveAntigravityPendingTasks', h);
     return { h, cid, transcriptPath };
@@ -257,6 +275,117 @@ describe('hasLiveAntigravityPendingTasks across send mode and adopt/zero-prompt 
 
     expect(h.publishScreenStatus).toHaveBeenCalledWith('idle');
     expect(h.releaseActiveTurnAuthority).toHaveBeenCalledWith('prompt_ready');
+  });
+
+  it('does not attribute a pre-existing footer task to a new turn until that turn adds work', () => {
+    const { h } = sendModeHarness({
+      screen: pendingFooter,
+      records: [
+        { step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', content: 'Unrelated old turn' },
+        { step_index: 1, source: 'MODEL', type: 'GENERIC', status: 'RUNNING', content: 'Tool is running as a background task with task id: old/task-1' },
+      ],
+    });
+
+    h.turnAuthorityIdentity = loadWorkerFunction('turnAuthorityIdentity', h);
+    loadWorkerFunction('markActiveTurnStarted', h)({ turnId: 'turn-a' });
+    expect(h.antigravityFooterTurnBaseline).toMatchObject({ turnId: 'turn-a', count: 1, sawIncrease: false });
+    expect(h.hasLiveAntigravityPendingTasks()).toBe(false);
+
+    const twoTasks = pendingFooter.replace('1 task(s)', '2 task(s)');
+    h.captureBackendScreen = () => twoTasks;
+    loadWorkerFunction('observeAntigravityFooterBackgroundTasks', h)(twoTasks);
+    expect(h.antigravityFooterTurnBaseline.sawIncrease).toBe(true);
+    expect(h.hasLiveAntigravityPendingTasks()).toBe(true);
+
+    const baseline = h.antigravityFooterTurnBaseline;
+    loadWorkerFunction('markActiveTurnStarted', h)({ turnId: 'turn-a' });
+    expect(h.antigravityFooterTurnBaseline).toBe(baseline);
+    expect(h.antigravityFooterTurnBaseline.sawIncrease).toBe(true);
+    expect(h.hasLiveAntigravityPendingTasks()).toBe(true);
+  });
+
+  it('keeps footer-only work conservative on reattach without creating a fresh-write baseline', () => {
+    const { h } = sendModeHarness({
+      screen: pendingFooter,
+      records: [
+        { step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', content: 'restored turn' },
+        { step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: 'waiting' },
+      ],
+    });
+    h.turnAuthorityIdentity = loadWorkerFunction('turnAuthorityIdentity', h);
+    h.backend = { isReattach: true };
+    loadWorkerFunction('markActiveTurnStarted', h)({ turnId: 'turn-a' });
+    expect(h.antigravityFooterTurnBaseline).toBeUndefined();
+    expect(h.hasLiveAntigravityPendingTasks()).toBe(true);
+  });
+
+  it('detects new work when the footer returns to its initial count after draining to zero', () => {
+    const { h } = sendModeHarness({
+      screen: pendingFooter,
+      records: [
+        { step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', content: 'turn with old task' },
+        { step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Done' },
+      ],
+    });
+    h.turnAuthorityIdentity = loadWorkerFunction('turnAuthorityIdentity', h);
+    loadWorkerFunction('markActiveTurnStarted', h)({ turnId: 'turn-a' });
+    expect(h.hasLiveAntigravityPendingTasks()).toBe(false);
+
+    h.captureBackendScreen = () => idleFooter;
+    loadWorkerFunction('observeAntigravityFooterBackgroundTasks', h)(idleFooter);
+    expect(h.hasLiveAntigravityPendingTasks()).toBe(false);
+
+    h.captureBackendScreen = () => pendingFooter;
+    loadWorkerFunction('observeAntigravityFooterBackgroundTasks', h)(pendingFooter);
+    expect(h.antigravityFooterTurnBaseline).toMatchObject({ lastCount: 1, sawIncrease: true });
+    expect(h.hasLiveAntigravityPendingTasks()).toBe(true);
+  });
+
+  it('keeps an already-observed current pending task through a transcript missing-file window', () => {
+    const { h, transcriptPath } = sendModeHarness({
+      screen: idleFooter,
+      records: [
+        { step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', content: 'old turn' },
+        { step_index: 1, source: 'MODEL', type: 'GENERIC', status: 'RUNNING', content: 'Tool is running as a background task with task id: old/task-1' },
+      ],
+    });
+    h.turnAuthorityIdentity = loadWorkerFunction('turnAuthorityIdentity', h);
+    loadWorkerFunction('markActiveTurnStarted', h)({ turnId: 'turn-a' });
+    appendFileSync(transcriptPath, [
+      JSON.stringify({ step_index: 2, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', content: '<USER_REQUEST>\n<message_location message_id="turn-a" />\n<user_message>\ncurrent\n</user_message>\n</USER_REQUEST>' }),
+      JSON.stringify({ step_index: 3, source: 'MODEL', type: 'GENERIC', status: 'RUNNING', content: 'Tool is running as a background task with task id: current/task-1' }),
+    ].join('\n') + '\n');
+    expect(h.hasLiveAntigravityPendingTasks()).toBe(true);
+    expect(h.antigravityFooterTurnBaseline.observedCurrentPending).toBe(true);
+
+    rmSync(transcriptPath);
+    expect(h.hasLiveAntigravityPendingTasks()).toBe(true);
+  });
+
+  it('re-anchors to the unique current-turn envelope when a transcript is replaced by a new inode', () => {
+    const { h, transcriptPath } = sendModeHarness({
+      screen: idleFooter,
+      records: [
+        { step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', content: 'old turn' },
+        { step_index: 1, source: 'MODEL', type: 'GENERIC', status: 'RUNNING', content: 'Tool is running as a background task with task id: old/task-1' },
+      ],
+    });
+    h.turnAuthorityIdentity = loadWorkerFunction('turnAuthorityIdentity', h);
+    loadWorkerFunction('markActiveTurnStarted', h)({ turnId: 'turn-a' });
+    const oldIno = statSync(transcriptPath).ino;
+    const replacement = `${transcriptPath}.next`;
+    writeFileSync(replacement, [
+      JSON.stringify({ step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', content: '<USER_REQUEST>\n<message_location message_id="turn-a" />\n<user_message>\ncurrent\n</user_message>\n</USER_REQUEST>' }),
+      JSON.stringify({ step_index: 1, source: 'MODEL', type: 'GENERIC', status: 'RUNNING', content: `Tool is running as a background task with task id: current/task-1 ${'x'.repeat(4096)}` }),
+    ].join('\n') + '\n');
+    renameSync(replacement, transcriptPath);
+    expect(statSync(transcriptPath).ino).not.toBe(oldIno);
+
+    expect(h.hasLiveAntigravityPendingTasks()).toBe(true);
+    expect(h.antigravityFooterTurnBaseline).toMatchObject({
+      transcriptOffset: 0,
+      observedCurrentPending: true,
+    });
   });
 
   it('keeps active turn authority when a background run_command is still running even though the structured bridge is inactive', () => {

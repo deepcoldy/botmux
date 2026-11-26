@@ -555,7 +555,7 @@ import {
   type AntigravityAccountStoreOptions,
   type ReconcileAntigravityTokenResult,
 } from './services/antigravity-accounts.js';
-import { hasAntigravitySideQuestionComposer, isAntigravityInterruptedScreen, isAntigravityReadyComposerScreen, parseAntigravityFooterBackgroundTasks, supportsAntigravityReadyFooterQuota } from './adapters/cli/antigravity.js';
+import { hasAntigravitySideQuestionComposer, isAntigravityIdleComposerScreen, isAntigravityInterruptedScreen, isAntigravityReadyComposerScreen, parseAntigravityFooterBackgroundTasks, supportsAntigravityReadyFooterQuota } from './adapters/cli/antigravity.js';
 import {
   antigravityTurnAnsweredInTranscript,
   antigravityTurnFailedWithoutOutput,
@@ -8536,6 +8536,7 @@ function markActiveTurnStarted(input: {
   const identity = turnAuthorityIdentity(input);
   if (!identity.turnId) return;
   const syncHold = (): void => {
+    baselineAntigravityFooterTasksForActiveTurn();
     if (typeof backgroundAuthorityHold === 'undefined' || typeof applyBackgroundAuthorityTransition !== 'function') return;
     const snap = activeTurnAuthority.snapshot();
     applyBackgroundAuthorityTransition(backgroundAuthorityHold.onForegroundTurnStarted({
@@ -9517,9 +9518,8 @@ interface AntigravityFoldedBackgroundHold {
   turnId: string;
   dispatchAttempt: number | undefined;
   webTerminalSubmitGeneration: number;
-  /** A later folded successor still needs its own sibling reconciliation. */
-  resumeTranscriptPath?: string;
-  timer?: ReturnType<typeof setTimeout>;
+  clearTimer?: ReturnType<typeof setTimeout>;
+  recheckTimer?: ReturnType<typeof setInterval>;
 }
 
 const ANTIGRAVITY_FOLDED_RECONCILE_INITIAL_DELAY_MS = 50;
@@ -9527,11 +9527,13 @@ const ANTIGRAVITY_FOLDED_RECONCILE_MAX_DELAY_MS = 1_000;
 const ANTIGRAVITY_FOLDED_RECONCILE_MAX_ATTEMPTS = 20;
 const ANTIGRAVITY_FOLDED_RECONCILE_MAX_WATCH_WAKEUPS = 50;
 const ANTIGRAVITY_FOLDED_RECONCILE_MAX_WINDOW_MS = 15_000;
+const ANTIGRAVITY_FOLDED_BACKGROUND_RECHECK_MS = 2_000;
 let antigravityFoldedReconcilePending: AntigravityFoldedReconcilePending | undefined;
 let antigravityFoldedBackgroundHold: AntigravityFoldedBackgroundHold | undefined;
 
 function cancelAntigravityFoldedReconcilePending(): void {
-  if (antigravityFoldedBackgroundHold?.timer) clearTimeout(antigravityFoldedBackgroundHold.timer);
+  if (antigravityFoldedBackgroundHold?.clearTimer) clearTimeout(antigravityFoldedBackgroundHold.clearTimer);
+  if (antigravityFoldedBackgroundHold?.recheckTimer) clearInterval(antigravityFoldedBackgroundHold.recheckTimer);
   antigravityFoldedBackgroundHold = undefined;
   const pending = antigravityFoldedReconcilePending;
   if (!pending) return;
@@ -9734,37 +9736,52 @@ function reconcileCompletedAntigravityTurnsAtPromptReady(
   };
 }
 
-function settleCompletedAntigravityFoldedTurn(promotedTurnId: string, reason: string): void {
-  markTurnRetired(promotedTurnId);
-  releaseActiveTurnAuthority(reason);
-  syncQueuedTurnsFromMarkerDisk();
-  if (queuedTypeAheadTurns.length > 0) {
-    advanceQueuedTypeAheadTurn(reason);
-    queuedTurnAdvanceConsumedForPrompt = undefined;
-  }
-  writeCliPidMarker();
-  if (renderer && pendingMessages.length === 0 && pendingAdoptMessages.length === 0
-    && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
-    const { content } = renderer.snapshot();
-    send({
-      type: 'screen_update',
-      content,
-      ...classifyUsageLimitWithNativeEvidence(content, projectedRuntimeScreenStatus()),
-      ...backgroundWaitPayload(),
-      ...modelRequestPayload(),
-      turnId: currentBotmuxTurnId,
-      dispatchAttempt: currentBotmuxDispatchAttempt,
-    });
+function hasAntigravityFoldedLiveHoldEvidence(): boolean {
+  if (typeof hasLiveAntigravityPendingTasks === 'function' && hasLiveAntigravityPendingTasks()) return true;
+  if (!backend || typeof backendScreenEvidenceIsAuthoritativeForMutation !== 'function'
+    || !backendScreenEvidenceIsAuthoritativeForMutation()) return false;
+  try {
+    const screen = captureBackendScreen(backend);
+    observeAntigravityFooterBackgroundTasks(screen);
+    // Background footers can report zero while a newer foreground turn is busy.
+    // Overlays/capture failures are inconclusive, never permission to settle.
+    return !isAntigravityIdleComposerScreen(screen);
+  } catch {
+    return true;
   }
 }
 
-function trySettleAntigravityFoldedBackgroundHold(reason: string): boolean {
+function armAntigravityFoldedBackgroundHold(
+  pending: AntigravityFoldedReconcilePending,
+  promotedTurnId: string,
+): void {
+  cancelAntigravityFoldedReconcilePending();
+  const hold: AntigravityFoldedBackgroundHold = {
+    cliSpawnGeneration: pending.cliSpawnGeneration,
+    turnId: promotedTurnId,
+    dispatchAttempt: currentBotmuxDispatchAttempt,
+    webTerminalSubmitGeneration: pending.webTerminalSubmitGeneration,
+  };
+  antigravityFoldedBackgroundHold = hold;
+  hold.recheckTimer = setInterval(() => {
+    if (antigravityFoldedBackgroundHold !== hold) return;
+    driveAntigravityFoldedBackgroundHold(true);
+  }, ANTIGRAVITY_FOLDED_BACKGROUND_RECHECK_MS);
+  hold.recheckTimer.unref();
+  revokePromptReadiness();
+  idleDetector?.reset();
+  refreshBackgroundWait();
+  publishScreenStatus('working');
+}
+
+/** True keeps or invalidates the hold without running the generic ready path.
+ *  False means fresh evidence permits settlement; callers then re-drive ready. */
+function retainAntigravityFoldedBackgroundHold(quiet = false): boolean {
   const hold = antigravityFoldedBackgroundHold;
   if (!hold) return false;
   const active = activeTurnAuthority.snapshot();
   if (
-    !isPromptReady
-    || cliSpawnGeneration !== hold.cliSpawnGeneration
+    cliSpawnGeneration !== hold.cliSpawnGeneration
     || cliRestartInProgress
     || webTerminalSubmitGeneration !== hold.webTerminalSubmitGeneration
     || currentBotmuxTurnId !== hold.turnId
@@ -9778,34 +9795,27 @@ function trySettleAntigravityFoldedBackgroundHold(reason: string): boolean {
     || isFlushing
   ) {
     cancelAntigravityFoldedReconcilePending();
-    return false;
-  }
-  if (typeof hasLiveAntigravityPendingTasks === 'function' && hasLiveAntigravityPendingTasks()) {
-    publishScreenStatus('working');
     return true;
   }
-  // The sibling proof is durable turn history. Later tool/transcript activity
-  // cannot retract it; fresh live-work/interruption evidence decides settling.
-  const resumeTranscriptPath = hold.resumeTranscriptPath;
-  cancelAntigravityFoldedReconcilePending();
-  settleCompletedAntigravityFoldedTurn(hold.turnId, `prompt_ready_reconciled:${reason}`);
-  if (resumeTranscriptPath) {
-    const active = activeTurnAuthority.snapshot();
-    const nextPromotedTurnId = currentBotmuxTurnId
-      && currentBotmuxDispatchAttempt === undefined
-      && !retiredTurnIds.has(currentBotmuxTurnId)
-      && active?.turnId === currentBotmuxTurnId
-      && active.dispatchAttempt === undefined
-      && active.started === true
-      ? currentBotmuxTurnId
-      : undefined;
-    // The retired hold's window ended with B. A remaining successor starts its
-    // own bounded sibling episode only after the background handoff completes.
-    if (nextPromotedTurnId || queuedTypeAheadTurns.some(q => q.dispatchAttempt === undefined)) {
-      armAntigravityFoldedReconcilePending(resumeTranscriptPath, nextPromotedTurnId);
+  if (hasAntigravityFoldedLiveHoldEvidence()) {
+    if (!quiet) {
+      if (isPromptReady) revokePromptReadiness();
+      idleDetector?.reset();
+      refreshBackgroundWait();
+      publishScreenStatus('working');
     }
+    return true;
   }
-  return true;
+  cancelAntigravityFoldedReconcilePending();
+  // The observer/timer may run while a duplicate ready is still latched. Force
+  // the full path so the settled predecessor cannot strand its queued successor.
+  revokePromptReadiness();
+  return false;
+}
+
+function driveAntigravityFoldedBackgroundHold(quiet = false): void {
+  if (retainAntigravityFoldedBackgroundHold(quiet)) return;
+  markPromptReady();
 }
 
 function tryReconcilePendingAntigravityFoldedTurns(reason: string): boolean {
@@ -9841,22 +9851,37 @@ function tryReconcilePendingAntigravityFoldedTurns(reason: string): boolean {
       && currentBotmuxDispatchAttempt === undefined
       && !durableTurnInFlight
     ) {
-      const stillPendingTasks = typeof hasLiveAntigravityPendingTasks === 'function'
-        && hasLiveAntigravityPendingTasks();
-      if (stillPendingTasks) {
-        cancelAntigravityFoldedReconcilePending();
-        antigravityFoldedBackgroundHold = {
-          cliSpawnGeneration: pending.cliSpawnGeneration,
-          turnId: promotedTurnId,
-          dispatchAttempt: currentBotmuxDispatchAttempt,
-          webTerminalSubmitGeneration: pending.webTerminalSubmitGeneration,
-          resumeTranscriptPath: res.pendingSibling ? res.transcriptPath : undefined,
-        };
-        publishScreenStatus('working');
+      if (hasAntigravityFoldedLiveHoldEvidence()) {
+        armAntigravityFoldedBackgroundHold(pending, promotedTurnId);
         return true;
       }
       cancelAntigravityFoldedReconcilePending();
-      settleCompletedAntigravityFoldedTurn(promotedTurnId, `prompt_ready_reconciled:${reason}`);
+      markTurnRetired(promotedTurnId);
+      releaseActiveTurnAuthority(`prompt_ready_reconciled:${reason}`);
+      const beforeSyncTurnId = currentBotmuxTurnId;
+      const beforeSyncDispatchAttempt = currentBotmuxDispatchAttempt;
+      syncQueuedTurnsFromMarkerDisk();
+      let promotedSuccessor = beforeSyncTurnId !== currentBotmuxTurnId
+        || beforeSyncDispatchAttempt !== currentBotmuxDispatchAttempt;
+      if (queuedTypeAheadTurns.length > 0) {
+        advanceQueuedTypeAheadTurn(`prompt_ready_reconciled:${reason}`);
+        queuedTurnAdvanceConsumedForPrompt = undefined;
+        promotedSuccessor = true;
+      }
+      writeCliPidMarker();
+      if (renderer && !promotedSuccessor && pendingMessages.length === 0 && pendingAdoptMessages.length === 0
+        && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
+        const { content } = renderer.snapshot();
+        send({
+          type: 'screen_update',
+          content,
+          ...classifyUsageLimitWithNativeEvidence(content, projectedRuntimeScreenStatus()),
+          ...backgroundWaitPayload(),
+          ...modelRequestPayload(),
+          turnId: currentBotmuxTurnId,
+          dispatchAttempt: currentBotmuxDispatchAttempt,
+        });
+      }
     } else {
       cancelAntigravityFoldedReconcilePending();
     }
@@ -11614,24 +11639,121 @@ let daemonCotHoldMayBeActive = false;
 let backgroundTasksTrackedForSiblings = false;
 /** Antigravity 常规模式原生页脚报告的后台任务/计时器数；与前台 activeTurnAuthority 解耦，
  *  仅经 refreshBackgroundWait 汇入 screen_update.backgroundTasks。 */
+interface AntigravityFooterTurnBaseline {
+  cliSpawnGeneration: number;
+  turnId: string;
+  dispatchAttempt: number | undefined;
+  count: number;
+  lastCount: number;
+  transcriptPath?: string;
+  transcriptOffset?: number;
+  transcriptDev?: bigint;
+  transcriptIno?: bigint;
+  observedCurrentPending: boolean;
+  sawIncrease: boolean;
+}
+let antigravityFooterTurnBaseline: AntigravityFooterTurnBaseline | undefined;
 let antigravityFooterBackgroundTasks = 0;
+
+function baselineAntigravityFooterTasksForActiveTurn(): void {
+  if (lastInitConfig?.cliId !== 'antigravity') return;
+  const active = activeTurnAuthority.snapshot();
+  if (active?.started !== true || !active.turnId) {
+    antigravityFooterTurnBaseline = undefined;
+    return;
+  }
+  const previous = antigravityFooterTurnBaseline;
+  if (previous && previous.cliSpawnGeneration === cliSpawnGeneration
+    && previous.turnId === active.turnId
+    && previous.dispatchAttempt === active.dispatchAttempt) return;
+  // Reattach/restore owns existing native work but did not start a fresh write;
+  // never baseline away the very tasks that may still need this authority.
+  if ((backend as (SessionBackend & { isReattach?: boolean }) | undefined)?.isReattach === true) {
+    antigravityFooterTurnBaseline = undefined;
+    return;
+  }
+  let count = antigravityFooterBackgroundTasks;
+  if (backend && typeof backendScreenEvidenceIsAuthoritativeForMutation === 'function'
+    && backendScreenEvidenceIsAuthoritativeForMutation()) {
+    try {
+      const parsed = parseAntigravityFooterBackgroundTasks(captureBackendScreen(backend));
+      if (parsed !== undefined) count = parsed;
+    } catch { /* Use the latest display count when a one-shot capture fails. */ }
+  }
+  let transcriptPath: string | undefined;
+  let transcriptOffset: number | undefined;
+  let transcriptDev: bigint | undefined;
+  let transcriptIno: bigint | undefined;
+  try {
+    transcriptPath = resolveLiveAntigravityTranscriptPath();
+    if (transcriptPath) {
+      const stat = statSync(transcriptPath, { throwIfNoEntry: false, bigint: true });
+      transcriptOffset = Number(stat?.size ?? 0);
+      if (!Number.isSafeInteger(transcriptOffset)) throw new Error('transcript anchor exceeds safe byte range');
+      transcriptDev = stat?.dev;
+      transcriptIno = stat?.ino;
+    }
+  } catch { /* Discovery may lag the write; absence of an anchor stays conservative. */ }
+  antigravityFooterBackgroundTasks = count;
+  antigravityFooterTurnBaseline = {
+    cliSpawnGeneration,
+    turnId: active.turnId,
+    dispatchAttempt: active.dispatchAttempt,
+    count,
+    lastCount: count,
+    transcriptPath,
+    transcriptOffset,
+    transcriptDev,
+    transcriptIno,
+    observedCurrentPending: false,
+    sawIncrease: false,
+  };
+}
+
+function noteAntigravityFooterTaskObservation(count: number): void {
+  const baseline = antigravityFooterTurnBaseline;
+  const active = activeTurnAuthority?.snapshot?.();
+  if (!baseline || active?.started !== true
+    || baseline.cliSpawnGeneration !== cliSpawnGeneration
+    || baseline.turnId !== active.turnId
+    || baseline.dispatchAttempt !== active.dispatchAttempt) return;
+  // Compare the latest valid samples, so 1→0→1 also proves new work. Once
+  // this turn added work, keep evidence until all tasks drain; without native
+  // task ids, a decrease alone must not guess which task finished.
+  if (count > baseline.lastCount) baseline.sawIncrease = true;
+  baseline.lastCount = count;
+}
+
+function antigravityFooterTaskEvidenceForActiveTurn(): boolean {
+  const baseline = antigravityFooterTurnBaseline;
+  // Restored/adopted turns have no new-write baseline; preserve conservative
+  // handling of work already belonging to their live native conversation.
+  if (!baseline) return true;
+  const active = activeTurnAuthority?.snapshot?.();
+  if (!active || active.started !== true
+    || baseline.cliSpawnGeneration !== cliSpawnGeneration
+    || baseline.turnId !== active.turnId
+    || baseline.dispatchAttempt !== active.dispatchAttempt) return true;
+  return baseline.sawIncrease;
+}
 
 function observeAntigravityFooterBackgroundTasks(screen: string | undefined): void {
   if (lastInitConfig?.cliId !== 'antigravity' || !screen) return;
   if (!backendScreenEvidenceIsAuthoritativeForMutation()) return;
   const parsed = parseAntigravityFooterBackgroundTasks(screen);
   if (parsed === undefined) return;
+  noteAntigravityFooterTaskObservation(parsed);
   antigravityFooterBackgroundTasks = parsed;
   const hold = parsed === 0 ? antigravityFoldedBackgroundHold : undefined;
-  if (!hold || hold.timer) return;
+  if (!hold || hold.clearTimer) return;
   // A footer clear need not write either transcript. Re-drive outside the
   // sampler stack; all normal generation/turn fences run when the timer fires.
-  hold.timer = setTimeout(() => {
+  hold.clearTimer = setTimeout(() => {
     if (antigravityFoldedBackgroundHold !== hold) return;
-    hold.timer = undefined;
-    trySettleAntigravityFoldedBackgroundHold('footer_clear');
+    hold.clearTimer = undefined;
+    driveAntigravityFoldedBackgroundHold();
   }, 0);
-  hold.timer.unref();
+  hold.clearTimer.unref();
 }
 
 function computeBackgroundCotHold(nowMs = Date.now()): boolean {
@@ -17244,6 +17366,40 @@ function resolveLiveAntigravityTranscriptPath(): string | undefined {
   return resolveFileBridgePath('antigravity', { sessionId: cid, pid: effectivePid });
 }
 
+/** Re-anchor only on the current turn's unique authenticated envelope in the
+ *  replacement file. A new inode or truncation must never reuse old offsets. */
+function reanchorAntigravityTurnBaseline(
+  transcriptPath: string,
+  stat: { dev: bigint; ino: bigint },
+): boolean {
+  const baseline = antigravityFooterTurnBaseline;
+  const active = activeTurnAuthority.snapshot();
+  if (!baseline || active?.started !== true || !active.turnId
+    || baseline.turnId !== active.turnId || baseline.dispatchAttempt !== active.dispatchAttempt
+    || baseline.cliSpawnGeneration !== cliSpawnGeneration) return false;
+  try {
+    const replay = drainAntigravityTranscript(transcriptPath, 0, {}, {});
+    if (replay.pendingTail.length > 0) return false;
+    const matches = replay.events.filter(event => {
+      if (event.kind !== 'user') return false;
+      const header = event.text.replace(/\r\n?/g, '\n').split('<user_message>', 1)[0] ?? event.text;
+      return header.match(/(?:^|\n)<message_location\b[^>]*\bmessage_id="([^"]+)"[^>]*\/>(?:\n|$)/)?.[1] === active.turnId;
+    });
+    if (matches.length !== 1) return false;
+    const prefix = `${transcriptPath}:`;
+    const uuid = matches[0]!.uuid;
+    if (!uuid.startsWith(prefix)) return false;
+    const offset = Number(uuid.slice(prefix.length));
+    if (!Number.isSafeInteger(offset) || offset < 0) return false;
+    baseline.transcriptOffset = offset;
+    baseline.transcriptDev = stat.dev;
+    baseline.transcriptIno = stat.ino;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Whether the live Antigravity turn still has background work. A fresh
  *  native footer can show running commands missing from the transcript.
  *  Never hold an explicitly interrupted turn or use the footer to hold a
@@ -17262,7 +17418,12 @@ function hasLiveAntigravityPendingTasks(): boolean {
       if (screen && isAntigravityInterruptedScreen(screen)) return false;
       // The cached footer count is for display and survives unparseable
       // frames. Only the current viewport may veto this ready edge.
-      if (activeTurnStarted && (parseAntigravityFooterBackgroundTasks(screen) ?? 0) > 0) return true;
+      const footerTasks = parseAntigravityFooterBackgroundTasks(screen);
+      if (footerTasks !== undefined) {
+        noteAntigravityFooterTaskObservation(footerTasks);
+        antigravityFooterBackgroundTasks = footerTasks;
+      }
+      if (activeTurnStarted && (footerTasks ?? 0) > 0 && antigravityFooterTaskEvidenceForActiveTurn()) return true;
     } catch { /* Missing viewport is not interruption evidence. */ }
   }
   if (codexBridgeFallbackActive()) {
@@ -17273,7 +17434,43 @@ function hasLiveAntigravityPendingTasks(): boolean {
     // to a direct disk scan while the bridge has not yet attached/baselined.
     if (codexBridgeRolloutPath && codexBridgeBaselineDone) return false;
   }
-  const transcriptPath = resolveLiveAntigravityTranscriptPath();
+  const resolvedTranscriptPath = resolveLiveAntigravityTranscriptPath();
+  const baseline = antigravityFooterTurnBaseline;
+  const active = activeTurnAuthority.snapshot();
+  const transcriptPath = resolvedTranscriptPath ?? baseline?.transcriptPath;
+  if (baseline && active?.started === true
+    && baseline.cliSpawnGeneration === cliSpawnGeneration
+    && baseline.turnId === active.turnId
+    && baseline.dispatchAttempt === active.dispatchAttempt
+    && baseline.transcriptPath && baseline.transcriptPath === transcriptPath
+    && baseline.transcriptOffset !== undefined) {
+    try {
+      const stat = statSync(transcriptPath!, { throwIfNoEntry: false, bigint: true });
+      if (!stat) return baseline.observedCurrentPending;
+      const size = Number(stat.size);
+      if (!Number.isSafeInteger(size)) return true;
+      if (stat.dev !== baseline.transcriptDev || stat.ino !== baseline.transcriptIno
+        || size < baseline.transcriptOffset) {
+        if (!reanchorAntigravityTurnBaseline(transcriptPath!, stat)) return true;
+      } else {
+        const replay = drainAntigravityTranscript(transcriptPath!, baseline.transcriptOffset, {}, {});
+        if (replay.pendingTail.length > 0) return true;
+        // No explicit user input after this write's byte anchor means the old
+        // RUNNING tail cannot belong to the newly started turn. Once current
+        // pending was observed, losing that user proof is instead inconclusive.
+        if (!replay.events.some(event => event.kind === 'user')) {
+          if (baseline.observedCurrentPending) return true;
+          baseline.observedCurrentPending = false;
+          return false;
+        }
+      }
+      const pending = hasAntigravityTranscriptPendingTasks(transcriptPath!);
+      baseline.observedCurrentPending = pending;
+      return pending;
+    } catch {
+      return true;
+    }
+  }
   return !!transcriptPath && hasAntigravityTranscriptPendingTasks(transcriptPath);
 }
 
@@ -22107,6 +22304,7 @@ let tuiPromptBlocking = false;
 /** One composed status projection shared by the immediate screen path,
  * periodic text updates, and screenshot uploads. */
 function projectedRuntimeScreenStatus(): RuntimeScreenStatus {
+  if (antigravityFoldedBackgroundHold) return 'working';
   return zcodeProgressStatus(codexAppLivenessStatus(projectRuntimeScreenStatus({
     promptReady: isPromptReady,
     analyzing: false,
@@ -27606,12 +27804,9 @@ function markPromptReady(): void {
     schedulePostTerminalFenceRecheck('prompt-ready deferred by fence');
     return;
   }
+  if (antigravityFoldedBackgroundHold && retainAntigravityFoldedBackgroundHold()) return;
   if (isPromptReady) {
     stopStructuredStartGraceRecheck();
-    if (antigravityFoldedBackgroundHold) {
-      trySettleAntigravityFoldedBackgroundHold('prompt_ready_reentry');
-      return;
-    }
     if (typeof antigravityFoldedReconcilePending !== 'undefined'
       && antigravityFoldedReconcilePending
       && typeof tryReconcilePendingAntigravityFoldedTurns === 'function') {
@@ -27869,8 +28064,13 @@ function markPromptReady(): void {
   judgeClaudeBridgeTurn();
   bridgeQueue.cliQueueDrained();
   settleSessionRenameOnPrompt();
+  const beforeSyncTurnId = currentBotmuxTurnId;
+  const beforeSyncDispatchAttempt = currentBotmuxDispatchAttempt;
   const syncedFromDisk = syncQueuedTurnsFromMarkerDisk();
+  let advancedQueuedTurn = beforeSyncTurnId !== currentBotmuxTurnId
+    || beforeSyncDispatchAttempt !== currentBotmuxDispatchAttempt;
   if (readyTransition(syncedFromDisk).advanceQueuedTurn) {
+    advancedQueuedTurn = true;
     advanceQueuedTypeAheadTurn('prompt_ready');
   }
   queuedTurnAdvanceConsumedForPrompt = undefined;
@@ -27975,7 +28175,7 @@ function markPromptReady(): void {
     observeAntigravityFooterBackgroundTasks(renderer?.rawSnapshot() || lastAnalyzerSnapshot);
   }
   refreshBackgroundWait();
-  if (renderer && !spawnArgvInitialPromptBusy && backgroundTaskTracker.pendingTurnAgents() === 0 && !antigravityPendingTasks && pendingMessages.length === 0 && pendingAdoptMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
+  if (renderer && !advancedQueuedTurn && !spawnArgvInitialPromptBusy && backgroundTaskTracker.pendingTurnAgents() === 0 && !antigravityPendingTasks && pendingMessages.length === 0 && pendingAdoptMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
     const { content } = renderer.snapshot();
     send({
       type: 'screen_update',
@@ -28037,7 +28237,9 @@ function markPromptReady(): void {
       log(backgroundTaskTracker.pendingTurnAgents() > 0
         ? `Idle prompt while ${backgroundTaskTracker.pendingTurnAgents()} background agent(s) pending — reporting working until their completion notification arrives`
         : 'Idle prompt while Antigravity background task(s)/subagent(s) pending — reporting working until completion notification arrives');
-    } else {
+    } else if (!advancedQueuedTurn) {
+      // A promoted folded successor owns the next working episode; never attach
+      // the predecessor's idle completion frame to its new turn identity.
       publishScreenStatus('idle');
     }
   } else if (hasPendingWork) {
@@ -28066,6 +28268,7 @@ function persistCliSessionId(cliSessionId: string): void {
   inputDeliveryObservedCliSessionId = cliSessionId;
   if (lastInitConfig?.cliId === 'antigravity' && previousCliSessionId && previousCliSessionId !== cliSessionId) {
     antigravityFooterBackgroundTasks = 0;
+  antigravityFooterTurnBaseline = undefined;
     refreshBackgroundWait();
   }
   const published = publishCliSessionIdToDaemon({
@@ -32134,6 +32337,7 @@ function stopScreenUpdates(): void {
   if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
   lastAnalyzerSnapshot = '';
   antigravityFooterBackgroundTasks = 0;
+  antigravityFooterTurnBaseline = undefined;
   cancelAntigravityFoldedReconcilePending();
 }
 
@@ -33210,6 +33414,7 @@ async function spawnCliBody(
   daemonCotHoldMayBeActive = false;
   backgroundTasksTrackedForSiblings = false;
   antigravityFooterBackgroundTasks = 0;
+  antigravityFooterTurnBaseline = undefined;
   bridgeQueue?.resetBackgroundTasks?.();
   const isolationRuntimeDataDir = process.env.SESSION_DATA_DIR
     ?? join(homedir(), '.botmux', 'data');
