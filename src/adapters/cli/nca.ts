@@ -271,6 +271,16 @@ export function createNcaAdapter(pathOverride?: string): CliAdapter {
       const dataHome = configuredNcaDataHome();
       const home = ncaHomeArg() ?? configuredNcaHarnessHome();
       if (home && !isAbsolute(home)) return null;
+      // Throw rather than return null: a null resume command makes the local
+      // opener silently fall back to a FRESH launch, which would present a new
+      // session as the restored one. A root-bound home can never be mounted, so
+      // fail the resume explicitly (the card opener catches this).
+      if (dataHome && isFilesystemRoot(dataHome)) {
+        throw new Error('NCA_DATA_HOME must not resolve to the filesystem root');
+      }
+      if (home && isFilesystemRoot(home)) {
+        throw new Error('NCA --home must not resolve to the filesystem root');
+      }
       const envPrefix = dataHome ? `NCA_DATA_HOME=${shellQuote(dataHome)} ` : '';
       return `${envPrefix}nca${home ? ` --home ${shellQuote(home)}` : ''} --resume ${cliSessionId}`;
     },

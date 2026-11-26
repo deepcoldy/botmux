@@ -233,6 +233,32 @@ describe('NCA local CLI adapter', () => {
     }
   });
 
+  it('refuses to build a resume command when the data home or --home resolves to the filesystem root', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-nca-resume-root-'));
+    const rootLink = join(root, 'to-root');
+    symlinkSync('/', rootLink, 'dir');
+    try {
+      const adapter = createCliAdapterSync('nca');
+      vi.stubEnv('NCA_DATA_HOME', '/');
+      expect(() => adapter.buildResumeCommand?.({ ...BASE, cliSessionId: NATIVE_ID }))
+        .toThrow('filesystem root');
+      vi.unstubAllEnvs();
+
+      vi.stubEnv('CLI_EXTRA_ARGS', '--home=/');
+      expect(() => adapter.buildResumeCommand?.({ ...BASE, cliSessionId: NATIVE_ID }))
+        .toThrow('filesystem root');
+      vi.unstubAllEnvs();
+
+      vi.stubEnv('NCA_DATA_HOME', rootLink);
+      expect(() => adapter.buildResumeCommand?.({ ...BASE, cliSessionId: NATIVE_ID }))
+        .toThrow('filesystem root');
+      vi.unstubAllEnvs();
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('sends multiline input as one paste followed by one Enter', async () => {
     const adapter = createCliAdapterSync('nca');
     const write = vi.fn();

@@ -118,6 +118,28 @@ describe('localCliCommandForSession', () => {
       executable: '/definitely/missing/traex',
     });
   });
+
+  it('fails structured instead of fresh-launching when the NCA resume home resolves to the filesystem root', () => {
+    vi.stubEnv('NCA_DATA_HOME', '/');
+    vi.stubEnv('CLI_EXTRA_ARGS', undefined);
+    try {
+      const result = localCliCommandForSession(session({
+        session: {
+          ...session().session,
+          cliId: 'nca',
+          cliPathOverride: '/bin/echo',
+          cliSessionId: '01a2182c-5933-72f2-8087-38b0469d1e05',
+        },
+      }));
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error).toBe('adapter_error');
+        expect(result.detail).toContain('filesystem root');
+      }
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
 });
 
 describe('terminalLaunchArgs', () => {
