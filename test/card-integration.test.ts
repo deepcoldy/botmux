@@ -618,7 +618,11 @@ describe('Card integration: full event flow', () => {
 
       await handleCardAction(makeRestartEvent(ROOT_ID), deps, APP_ID);
 
-      expect(requestSessionRestart).toHaveBeenCalledWith(ds, expect.objectContaining({ source: 'card' }));
+      expect(requestSessionRestart).toHaveBeenCalledWith(
+        ds,
+        expect.objectContaining({ source: 'card' }),
+        { allowUnconfirmedActivationReplay: true },
+      );
       // One public status card that later restart results patch in place —
       // the whole chat sees why the CLI restarted, not only the clicker.
       expect(vi.mocked(clientMod.sendEphemeralCard)).not.toHaveBeenCalled();
@@ -661,7 +665,11 @@ describe('Card integration: full event flow', () => {
 
       await handleCardAction(makeRestartEvent(ROOT_ID), deps, APP_ID);
 
-      expect(requestSessionRestart).toHaveBeenCalledWith(ds, expect.objectContaining({ source: 'card' }));
+      expect(requestSessionRestart).toHaveBeenCalledWith(
+        ds,
+        expect.objectContaining({ source: 'card' }),
+        { allowUnconfirmedActivationReplay: true },
+      );
     });
 
     it('close should remove session and deliver the closed card', async () => {
@@ -1114,7 +1122,11 @@ describe('Card integration: full event flow', () => {
 
       await handleCardAction(makeRestartEvent(ROOT_ID), deps, APP_ID);
 
-      expect(requestSessionRestart).toHaveBeenCalledWith(ds, expect.objectContaining({ source: 'card' }));
+      expect(requestSessionRestart).toHaveBeenCalledWith(
+        ds,
+        expect.objectContaining({ source: 'card' }),
+        { allowUnconfirmedActivationReplay: true },
+      );
       expect(vi.mocked(clientMod.sendEphemeralCard)).not.toHaveBeenCalled();
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID, expect.stringContaining('正在重启'), 'interactive', APP_ID,

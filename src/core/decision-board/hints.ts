@@ -8,6 +8,7 @@
  */
 import type { Locale } from '../../i18n/types.js';
 import type { BoardCloseWhen, BoardHint, BoardHintKind, BoardItem, BoardLink, BoardState } from './model.js';
+import { compactNoticeCard, escapeNoticeMarkdown, noticeItemLink } from './notice-card.js';
 
 const PR_REF = /^[\w.-]+\/[\w.-]+#\d+$/;
 
@@ -324,6 +325,20 @@ export function formatHintNotice(entries: readonly HintNoticeEntry[], locale: Lo
   const more = entries.length - shown.length;
   if (more > 0) lines.push(zh ? `另有 ${more} 项，见看板。` : `${more} more on the board.`);
   return [head, ...lines].join('\n');
+}
+
+/** 群内展示卡片：完整 prompt 与纯文本降级仍由 {@link formatHintNotice} 提供。 */
+export function formatHintNoticeCard(entries: readonly HintNoticeEntry[], locale: Locale): string | undefined {
+  const zh = locale !== 'en';
+  const shown = entries.slice(0, HINT_NOTICE_MAX_ENTRIES);
+  const lines = shown.map(e => `${noticeItemLink(e.seq, e.title, e.link)} — ${escapeNoticeMarkdown(hintEventText(e.hint, locale))}`);
+  const more = entries.length - shown.length;
+  if (more > 0) lines.push(zh ? `另有 ${more} 项，见看板。` : `${more} more on the board.`);
+  return compactNoticeCard({
+    title: zh ? `决策看板 · 提示（${entries.length} 项）` : `Decision board · hints (${entries.length})`,
+    lines,
+    footer: zh ? '仅提示，状态未改' : 'Hints only; no state was changed',
+  });
 }
 
 /** 送进管家会话的正文：通知 + 按 guide 处理的指引（零注入的管家也能照着做）。 */

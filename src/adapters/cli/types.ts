@@ -903,11 +903,12 @@ export interface CliAdapter {
 
   /** True when this CLI supports a UserPromptSubmit hook whose additionalContext
    *  is injected as an INVISIBLE system-reminder (not rendered into the visible
-   *  transcript). When true and the per-bot `envelopeInjection` setting is
-   *  `auto`, the daemon moves the per-turn reminder/whiteboard blocks out of the
-   *  user turn text and into a sidecar that `botmux user-prompt-hook` reads back.
-   *  Only set for CLIs verified end-to-end; codex renders hook context as a
-   *  visible developer message and must NOT set this. */
+   *  transcript). Enabled by default on local loopback-capable backends when
+   *  non-zero prompt injection is active and the hook is installed: the daemon
+   *  moves per-turn metadata blocks out of user turn text into a sidecar that
+   *  `botmux user-prompt-hook` claims via IPC. Only set for CLIs verified
+   *  end-to-end; codex renders hook context as a visible developer message and
+   *  must NOT set this. */
   readonly supportsInvisiblePromptHook?: boolean;
 
   /** The adapter exposes a transcript-backed end-of-turn boundary that the

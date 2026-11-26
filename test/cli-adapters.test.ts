@@ -3318,13 +3318,14 @@ describe('antigravity buildArgs', () => {
     expect(args).not.toContain('--session-id');
   });
 
-  it('injects ephemeral --settings statusLine with stack_with_default for agy >= 1.5.8 and showFeedbackSurvey:false for >= 1.5.16', () => {
+  it('sets Send Immediately and statusLine for agy >= 1.5.8, and disables the survey for >= 1.5.16', () => {
     for (const cliVersion of ['1.5.8', '1.5.12', '1.5.15']) {
       expect(supportsAntigravityFeedbackSurveySetting(cliVersion)).toBe(false);
       const args = adapter.buildArgs({ sessionId: 'sess-7', resume: false, cliVersion });
       const idx = args.indexOf('--settings');
       expect(idx, `cliVersion=${cliVersion}`).toBeGreaterThanOrEqual(0);
       expect(JSON.parse(args[idx + 1]!)).toEqual({
+        queuedMessages: 'send-immediately',
         statusLine: {
           type: 'command',
           enabled: true,
@@ -3339,6 +3340,7 @@ describe('antigravity buildArgs', () => {
       const idx = args.indexOf('--settings');
       expect(idx, `cliVersion=${cliVersion}`).toBeGreaterThanOrEqual(0);
       expect(JSON.parse(args[idx + 1]!)).toEqual({
+        queuedMessages: 'send-immediately',
         statusLine: {
           type: 'command',
           enabled: true,
@@ -3352,7 +3354,7 @@ describe('antigravity buildArgs', () => {
     // disableCliBypass keeps --settings (statusLine only, no bypass flag)
     const noBypass = adapter.buildArgs({ sessionId: 'sess-7', resume: false, disableCliBypass: true, cliVersion: '1.5.12' });
     expect(noBypass).not.toContain('--dangerously-skip-permissions');
-    expect(noBypass).toContain('--settings');
+    expect(JSON.parse(noBypass[noBypass.indexOf('--settings') + 1]!)).not.toHaveProperty('queuedMessages');
   });
 
   it.each([undefined, '', 'unknown', '1.0.8', '1.5.4', '1.5.7', '1.5.8-beta.1'])(

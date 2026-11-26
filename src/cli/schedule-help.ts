@@ -21,6 +21,7 @@ export const SCHEDULE_HELP_BODY = [
   '       --schedule <频率>               改执行频率（写法同 add），按新频率重新算下次执行，不补跑',
   '       --prompt <文本> | --prompt-file <文件>  改提示词',
   '       --calendar <名称|none> / --calendar-day-type workday|restday  改工作日历规则',
+  '       --silent / --no-silent          开启/关闭静默执行',
   '  schedule remove <id>                 删除任务',
   '  schedule pause|resume <id>           暂停/恢复',
   '  schedule run <id>                    标记立即执行',

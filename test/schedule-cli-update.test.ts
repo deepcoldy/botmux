@@ -61,6 +61,7 @@ async function managed(
   managedTurnId = 'om_live',
   observedRequests?: Array<Record<string, unknown>>,
   refuseWith?: string,
+  legacyReceipt = false,
 ) {
   seedPersistedSessionRows(f.dataDir, app, { [sid]: {
     sessionId: sid, status: 'active', larkAppId: app, chatId: 'oc_chat', rootMessageId: 'om_root',
@@ -149,6 +150,8 @@ async function managed(
           patch.parsed = { kind: 'interval', minutes: 240, display: '每 4 小时' };
           patch.nextRunAt = '2030-01-01T08:00:00.000Z';
         }
+        // Mirror the daemon's boolean normalization: off removes the key.
+        if (typeof request.silent === 'boolean') patch.silent = request.silent ? true : undefined;
         rows[taskId!] = { ...current, ...patch };
       }
       writeFileSync(f.path, JSON.stringify(rows));
@@ -156,6 +159,7 @@ async function managed(
       return res.end(JSON.stringify(request.action === 'update' && !f.preFrequencyDaemon
         ? { ok: true, task: { schedule: updated.schedule, display: updated.parsed?.display,
           nextRunAt: updated.nextRunAt ?? null, enabled: updated.enabled,
+          ...(!legacyReceipt ? { silent: updated.silent === true } : {}),
           ...(!updated.enabled && updated.disabledReason ? { disabledReason: updated.disabledReason } : {}) } }
         : { ok: true }));
     }
@@ -338,6 +342,45 @@ describe('schedule CLI prompt updates', () => {
   it('supports literal prompt values and rejects duplicate flags', () => {
     expect(readScheduleUpdate(['id', '--prompt=--literal\nbody']).prompt).toBe('--literal\nbody');
     expect(() => readScheduleUpdate(['id', '--prompt', 'a', '--prompt', 'b'])).toThrow('duplicate');
+  });
+  it('parses --silent and --no-silent as the only boolean switches', () => {
+    expect(readScheduleUpdate(['id', '--silent'])).toEqual({ silent: true });
+    expect(readScheduleUpdate(['id', '--no-silent'])).toEqual({ silent: false });
+    expect(readScheduleUpdate(['id', '--silent', '--prompt', 'p'])).toEqual({ silent: true, prompt: 'p' });
+    expect(() => readScheduleUpdate(['id', '--silent', '--no-silent'])).toThrow('只能二选一');
+    expect(() => readScheduleUpdate(['id', '--silent', '--silent'])).toThrow('duplicate');
+    expect(() => readScheduleUpdate(['id', '--silent=true'])).toThrow('不接受取值');
+    expect(() => readScheduleUpdate(['id'])).toThrow('没有要修改的字段');
+  });
+  it('sends silent on the wire and prints the receipt state', async () => {
+    const f = fixture();
+    const observed: Array<Record<string, unknown>> = [];
+    await managed(f, undefined, 'om_live', observed);
+    const on = await f.run(['update', f.task.id, '--silent']);
+    expect(on.code, on.output).toBe(0);
+    expect(observed.filter(r => r.action === 'update').at(-1)?.silent).toBe(true);
+    expect(on.output).toContain('静默执行: 已开启');
+
+    const off = await f.run(['update', f.task.id, '--no-silent']);
+    expect(off.code, off.output).toBe(0);
+    expect(observed.filter(r => r.action === 'update').at(-1)?.silent).toBe(false);
+    expect(off.output).toContain('静默执行: 已关闭');
+    expect(f.read()[f.task.id].silent).toBeUndefined();
+  });
+  it('refuses to confirm a silent change against a daemon whose receipt predates silent', async () => {
+    const f = fixture();
+    const observed: Array<Record<string, unknown>> = [];
+    await managed(f, undefined, 'om_live', observed, undefined, true);
+    const onlySilent = await f.run(['update', f.task.id, '--silent']);
+    expect(onlySilent.code, onlySilent.output).toBe(1);
+    expect(observed.filter(r => r.action === 'update').at(-1)?.silent).toBe(true);
+    expect(onlySilent.output).toContain('版本过旧');
+    expect(onlySilent.output).toContain('未修改静默设置');
+    expect(onlySilent.output).not.toContain('静默执行: 已开启');
+
+    const combined = await f.run(['update', f.task.id, '--prompt', 'new prompt', '--silent']);
+    expect(combined.code, combined.output).toBe(1);
+    expect(combined.output).toMatch(/未修改静默设置（其余字段已更新）/);
   });
   it('creates and updates from an ownerless managed session with no bots.json', async () => {
     const f = fixture(); const calls = await managed(f);

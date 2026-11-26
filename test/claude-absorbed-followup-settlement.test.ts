@@ -35,6 +35,7 @@ import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 const fixture = fileURLToPath(new URL('./fixtures/send-reply-card-capture.ts', import.meta.url));
 const replayWinnerCrashFixture = fileURLToPath(new URL('./fixtures/send-replay-winner-crash.ts', import.meta.url));
 const voiceDocFixture = fileURLToPath(new URL('./fixtures/send-voice-doc-capture.ts', import.meta.url));
+const primaryReplayRaceFixture = fileURLToPath(new URL('./fixtures/send-primary-replay-race.ts', import.meta.url));
 const repo = fileURLToPath(new URL('..', import.meta.url));
 const roots: string[] = [];
 
@@ -803,7 +804,8 @@ describe('worker <-> PID marker synchronization & lifecycle invariants', () => {
     // syncQueuedTurnsFromMarkerDisk returns false when only settled turns were pruned (no active turn change).
     expect(h.scope.syncQueuedTurnsFromMarkerDisk()).toBe(false);
 
-    // Later turn_duration emits terminals for A and B: foldedTypeAheadTurn is still recorded and disk clears settledAbsorbedTurns.
+    // Later turn_duration emits terminals for A and B: foldedTypeAheadTurn is
+    // still recorded, while settled addressing evidence survives for replay.
     h.scope.emittedTurnTerminals.claim('sid', 'om_A', undefined, 'completed');
     h.scope.emittedTurnTerminals.claim('sid', 'om_B', undefined, 'completed');
     h.scope.retireTerminatedQueuedTurn('om_B', undefined, 'completed');
@@ -812,8 +814,44 @@ describe('worker <-> PID marker synchronization & lifecycle invariants', () => {
       h.scope.foldedTypeAheadTurn,
       (tid: string, attempt?: number) => h.scope.turnTerminalEmitted(tid, attempt),
     )).toEqual({ turnId: 'om_B', dispatchAttempt: undefined });
-    expect(h.readMarker().settledAbsorbedTurns).toBeUndefined();
+    expect(h.readMarker().settledAbsorbedTurns).toEqual([{ turnId: 'om_B', hostTurnId: 'om_A' }]);
   });
+
+  it('keeps settled B addressable after B terminal for exact replay and auxiliary delivery', () => {
+    const f = setupSendFixture({
+      scope: 'chat',
+      turns: [
+        { id: 'om_A', root: 'om_topic_A', sender: 'ou_first' },
+        { id: 'om_B', root: undefined, sender: 'ou_second' },
+      ],
+      queuedTurns: [{ turnId: 'om_B', inputConsumed: true, absorbedIntoTurnId: 'om_A' }],
+    });
+    const args = ['--response-kind', 'final', '--mention-back'];
+    const first = f.run(args, 'Combined answer for A and B');
+    expect(first.status, String(first.stderr)).toBe(0);
+    expect(f.marker().settledAbsorbedTurns).toEqual([{ turnId: 'om_B', hostTurnId: 'om_A' }]);
+
+    const h = createWorkerHarness(f.data, [
+      { turnId: 'om_B', inputConsumed: true, absorbedIntoTurnId: 'om_A' },
+    ]);
+    h.scope.writeCliPidMarker();
+    h.scope.emittedTurnTerminals.claim('sid', 'om_A', undefined, 'completed');
+    h.scope.emittedTurnTerminals.claim('sid', 'om_B', undefined, 'completed');
+    h.scope.retireTerminatedQueuedTurn('om_B', undefined, 'completed');
+    expect(h.readMarker().settledAbsorbedTurns).toEqual([{ turnId: 'om_B', hostTurnId: 'om_A' }]);
+
+    const replay = f.run(args, 'Combined answer for A and B');
+    expect(replay.status, String(replay.stderr)).toBe(0);
+    expect(replay.writes).toHaveLength(0);
+    expect(f.marker().settledAbsorbedTurns).toEqual([{ turnId: 'om_B', hostTurnId: 'om_A' }]);
+
+    const aux = f.run(['--response-kind', 'auxiliary', '--mention-back'], 'Supplement');
+    expect(aux.status, String(aux.stderr)).toBe(0);
+    expect(aux.writes).toHaveLength(1);
+    expect(aux.writes[0].path).toBe('/open-apis/im/v1/messages');
+    expect(aux.writes[0].body.content).toContain('ou_second');
+    expect(aux.writes[0].body.content).not.toContain('ou_first');
+  }, 30_000);
 
   it('Scenario B reversal: worker still adopts disk promotion of B when B was absorbed AFTER A final already promoted B', () => {
     const dataDir = makeTempDir('worker-scenario-b-');
@@ -1214,6 +1252,35 @@ describe('adversarial regression matrix (crash recovery, multi-destination, priv
     expect(f.marker().settledAbsorbedTurns).toEqual([{ turnId: 'om_B', hostTurnId: 'om_A' }]);
     const retriedMarkers = readFileSync(journal, 'utf8').trim().split('\n').filter(Boolean);
     expect(retriedMarkers).toHaveLength(1);
+  }, 30_000);
+
+  it('normal primary winner and replay loser share one exact final marker', () => {
+    const f = setupSendFixture({
+      queuedTurns: [{ turnId: 'om_B', inputConsumed: true, absorbedIntoTurnId: 'om_A' }],
+    });
+    const res = f.run(['--response-kind', 'final', '--no-mention'], 'answer A and B', primaryReplayRaceFixture);
+    expect(res.status, String(res.stderr)).toBe(0);
+    expect(res.writes).toHaveLength(1);
+    expect(String(res.stdout)).toContain('REPLAY_RESULT={"winnerReplayed":false,"loserReplayed":true}');
+    const markers = readFileSync(join(f.data, 'turn-sends', 'sid.jsonl'), 'utf8')
+      .trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+    expect(markers).toHaveLength(1);
+    expect(markers[0]).toMatchObject({ turnId: 'om_A', messageId: 'om_final', responseKind: 'final' });
+  });
+
+  it('startup catch-up restores the old host final marker before advancing to unconsumed B', async () => {
+    const f = setupSendFixture({ queuedTurns: [{ turnId: 'om_B' }] });
+    const ledgerKey = { larkAppId: 'cli_test', sessionId: 'sid', turnId: 'om_A' };
+    await new TurnSendLedger(f.data).execute(ledgerKey, 'final', 'answer A only', async () => 'om_A_final');
+
+    const res = f.run(['--response-kind', 'final', '--no-mention'], 'answer A only');
+    expect(res.status, String(res.stderr)).toBe(0);
+    expect(res.writes).toHaveLength(1);
+    expect(f.marker().turnId).toBe('om_B');
+    const markers = readFileSync(join(f.data, 'turn-sends', 'sid.jsonl'), 'utf8')
+      .trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+    expect(markers.map(marker => marker.turnId)).toEqual(['om_A', 'om_B']);
+    expect(markers[0]).toMatchObject({ messageId: 'om_A_final', responseKind: 'final' });
   }, 30_000);
 
   it('explicit old-target lock retry replays A on every subsequent command instead of minting B final to A', () => {

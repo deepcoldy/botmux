@@ -1077,16 +1077,46 @@ describe('RiffBackend', () => {
     });
   });
 
-  describe('agent hardcode + reasoning effort', () => {
-    it('always sends agent=codex, even when legacy config still says aiden', async () => {
-      const be = makeBackend({ injectStatusLines: false, agent: 'aiden' });
+  describe('agent selection + reasoning effort', () => {
+    it('passes configured claude/codex agent through and falls back to codex for unset or every retired value', async () => {
+      for (const [agent, expected] of [
+        ['claude', 'claude'],
+        ['codex', 'codex'],
+        ['aiden', 'codex'],
+        ['aiden-claude', 'codex'],
+        ['opencode', 'codex'],
+        ['bogus', 'codex'],
+        [undefined, 'codex'],
+      ] as const) {
+        calls.length = 0; resolvers.length = 0;
+        const be = makeBackend({ injectStatusLines: false, agent });
+        be.spawn('', [], {} as any);
+        be.write('hi');
+        await flush();
+        resolvers.shift()!(taskResponse('task-1'));
+        await flush();
+        const exec = calls.find(c => c.url.includes('/api/task-execute'))!;
+        expect(JSON.parse(String(exec.init?.body)).config.agent).toBe(expected);
+      }
+    });
+
+    it('sends agent=claude with model and reasoningEffort together', async () => {
+      const be = makeBackend({
+        injectStatusLines: false,
+        agent: 'claude',
+        model: 'gemini-4-neon',
+        reasoningEffort: 'xhigh',
+      });
       be.spawn('', [], {} as any);
       be.write('hi');
       await flush();
       resolvers.shift()!(taskResponse('task-1'));
       await flush();
       const exec = calls.find(c => c.url.includes('/api/task-execute'))!;
-      expect(JSON.parse(String(exec.init?.body)).config.agent).toBe('codex');
+      const body = JSON.parse(String(exec.init?.body));
+      expect(body.config.agent).toBe('claude');
+      expect(body.config.model).toBe('gemini-4-neon');
+      expect(body.config.reasoningEffort).toBe('xhigh');
     });
 
     it('passes a valid reasoningEffort through and drops invalid/empty ones', async () => {

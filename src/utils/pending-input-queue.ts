@@ -254,6 +254,7 @@ export function resolveInitialPromptDelivery(opts: {
   preparedArg?: string;
   preparedDeferredContent?: string;
   defer: boolean;
+  willReattachPersistent?: boolean;
 }): {
   argvPrompt?: string;
   queuedContent?: string;
@@ -263,7 +264,9 @@ export function resolveInitialPromptDelivery(opts: {
   if (!opts.defer) {
     return { argvPrompt: opts.preparedArg ?? opts.originalPrompt };
   }
-  const queuedContent = opts.preparedDeferredContent ?? opts.originalPrompt;
+  const queuedContent = opts.willReattachPersistent
+    ? opts.originalPrompt
+    : (opts.preparedDeferredContent ?? opts.originalPrompt);
   return {
     queuedContent,
     ...(queuedContent !== opts.originalPrompt

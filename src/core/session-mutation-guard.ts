@@ -56,3 +56,24 @@ export function hasProtectedSessionMutationOwnership(
 ): boolean {
   return protectedSessionMutationReasons(value).length > 0;
 }
+
+const ACTIVATION_REPLAY_OWNERSHIP: ReadonlySet<ProtectedSessionMutationReason> = new Set([
+  'activation_head',
+  'activation_tail',
+  'initial_start',
+]);
+
+/** Activation head/tail is the one protected ownership class that an explicit
+ *  general restart may resolve by replaying, rather than abandon. Every other
+ *  durable owner keeps the ordinary restart prohibition. */
+export function hasNonActivationSessionMutationOwnership(
+  value: ProtectedRuntimeMutationState | ProtectedSessionMutationState,
+): boolean {
+  const session = 'session' in value ? value.session : value as ProtectedSessionMutationState;
+  const reasons = protectedSessionMutationReasons(value);
+  if (reasons.length === 0) return false;
+  // A bare start reservation or an unpromoted tail has no live proof observer to
+  // replay. Only a real activation head may use the operator replay exemption.
+  if (session.queuedActivationPending !== true) return true;
+  return reasons.some(reason => !ACTIVATION_REPLAY_OWNERSHIP.has(reason));
+}

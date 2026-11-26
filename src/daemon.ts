@@ -1,3 +1,4 @@
+import { createdGroupWorkingDir } from './services/created-groups-store.js';
 import { configuredCliExecutionMode, delegatedCliExecutionAllowed } from './core/cli-execution-mode.js';
 import { resolveNativeScheduledControlActor } from './core/scheduled-control-actor.js';
 import { admitDelegatedSlashTurn, queuedOpeningHasTail, sessionDelegatedSlashCommands } from './core/remote-runner-slash.js';
@@ -55,10 +56,11 @@ import {
 } from './core/report-source-reply.js';
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
 import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './core/prompt-injection.js';
+import { plannedOpeningBackendType } from './core/opening-backend.js';
 import { stripDispatchCompletionProtocol } from './core/dispatch.js';
 import { withConfiguredBotOwner } from './core/bot-owner-attribution.js';
 import { readCanonicalBotActorOwnerBindings } from './core/bot-actor-owner-binding.js';
-import { releaseExplicitAskHandoff, hasExplicitAskHandoff, invalidateExplicitAsk, setExplicitAskSessionChecker, retireExplicitAsk, explicitAskSnapshot } from './core/ask-broker.js';
+import { releaseExplicitAskHandoff, hasExplicitAskHandoff, hydrateLegacyExplicitAskCardRoot, invalidateExplicitAsk, setExplicitAskSessionChecker, retireExplicitAsk, explicitAskSnapshot } from './core/ask-broker.js';
 import { createExplicitAskContinuation, explicitAskRecoveryRequest, explicitAskOriginIsLive, explicitAskRetirementBound, explicitAskSessionBound } from './core/explicit-ask-continuation.js';
 import { createManagedAskControl, parseManagedAskControl } from './core/managed-ask-control.js';
 import { canSafelyReclaimWorkerForInstallChange, suspendWorkerAsync } from './core/worker-pool.js';
@@ -131,6 +133,7 @@ import { cotRecoveryMatches, settleCotMessageForShutdown, sweepOrphanCotMessages
 import { settleTurnReplyCards, sweepInterruptedReplyCards } from './core/turn-reply-card.js';
 import { resolveBrowserTargets, detectRunningBrowsers } from './core/browser-restart.js';
 import { countHostOverload } from './im/lark/card-handler.js';
+import { startOncallHandoffRecovery } from './im/lark/oncall-group.js';
 import { startOwnerGroupFollow } from './services/owner-group-follow-runtime.js';
 import { startMaintenance, stopMaintenance, globalInstallUpdateLockTarget } from './core/maintenance.js';
 import { createBotmuxUpdateNotifier, buildBotmuxUpdateNoticeCard } from './core/botmux-update-notify.js';
@@ -242,6 +245,7 @@ import {
 } from './services/durable-lark-session-control.js';
 import { failedTurnCaller, recordLimitedFailedTurn, clearLimitedFailedTurn, recordFailedTurnTerminal, noteFailedTurnRecoveryInput } from './core/failed-turn-recovery.js';
 import { startQuotaFallbackChainSwitch } from './core/quota-fallback-chain-switch.js';
+import { handleCodexCapacityRetry, settleCodexCapacityFallback } from './core/codex-capacity-fallback.js';
 import { isSilentScheduledTurn } from './core/silent-schedule-turns.js';
 import { isMessageListenerTaskAnchor, isSilentMessageListenerSession, messageListenerSendBlocked } from './core/message-listener-silence.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
@@ -642,7 +646,7 @@ import { initialDispatchLifecycle } from './core/dispatch-lifecycle.js';
 import { applyDispatchLaunchBinding, registerDispatchLaunchBinding } from './core/dispatch-launch-binding.js';
 import { projectCoordinator, resolveProjectGroupCardRuntime } from './services/project-coordinator-runtime.js';
 import { createProjectCardRuntimeSync } from './services/project-card-runtime-sync.js';
-import { listProjectGroups } from './services/project-group-store.js';
+import { listProjectGroups, type ProjectGroupState } from './services/project-group-store.js';
 import {
   addProjectWorkerIfNeeded,
   evaluateProjectDispatchPolicy,
@@ -1198,9 +1202,12 @@ import {
   restorePersistedAsks as restorePersistedAsksBroker,
   startHookAskReclaim,
   findPendingAskByAnchor,
+  listPendingHostChoicesByAnchor,
+  findPendingLegacyAskByCard,
   listPendingAsksByAnchor,
   askAnswerActorFor,
   submitCustomReply,
+  type AskAnswerActor,
 } from './core/ask-broker.js';
 import { createAskPersistStore } from './core/ask-persist-store.js';
 import {
@@ -6441,7 +6448,7 @@ function resolveForceTopicCurrentWorkingDir(ctx: {
   const current = validateExplicitForceTopicWorkingDir(currentSession?.workingDir, loc);
   if (current) return current;
 
-  const oncall = validateExplicitForceTopicWorkingDir(findOncallChat(ctx.larkAppId, ctx.chatId)?.workingDir, loc);
+  const oncall = validateExplicitForceTopicWorkingDir(findOncallChat(ctx.larkAppId, ctx.chatId)?.workingDir ?? createdGroupWorkingDir(ctx.chatId), loc);
   if (oncall) return oncall;
 
   const peers = ctx.scope === 'chat'
@@ -12263,6 +12270,13 @@ const explicitAskContinuation = createExplicitAskContinuation({
   invalidate: invalidateExplicitAsk,
   retire: retireExplicitAsk,
   canRetire: receipt => explicitAskRetirementBound(receipt, findActiveBySessionId(receipt.input.sessionId)),
+  resolveCardRoot: receipt => {
+    const ds = findActiveBySessionId(receipt.input.sessionId);
+    if (ds?.session.scope !== 'chat' || receipt.input.deliveryTarget || !receipt.origin?.turnId) return undefined;
+    const target = frozenReplyContextForTurn(ds, receipt.origin.turnId).target;
+    return target.mode === 'thread' ? target.rootMessageId : undefined;
+  },
+  hydrateCardRoot: hydrateLegacyExplicitAskCardRoot,
   snapshot: explicitAskSnapshot,
   shouldInvalidate: receipt => sessionsRestored
     && !explicitAskSessionBound(receipt.input, findActiveBySessionId(receipt.input.sessionId)),
@@ -12587,12 +12601,12 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
     backendSurvivesRestart:
       !!askSession && getSessionPersistentBackendType(askSession) !== undefined,
   };
-  // chat-scope 的 ask 身份仍是 root=null（文字答复按 chatId 锚点命中），独立卡片只是跟着发起
-  // turn 冻结的话题落点。嵌进回复卡的 ask 由回复卡决定位置；异步提问的提示与答复 turn
-  // 都按 root=null 发，卡片不单独搬走。
+  // chat-scope 的调用身份仍是 root=null；冻结提问话题供发卡与文字隔离使用。
+  // 内嵌 ask 也保留该位置，避免回复卡尚无 messageId 时首发到群外层或共用会话时吞掉其它话题的输入。
+  // 异步 ask 沿用自身绑定的原生话题，不覆盖其卡片落点。
   const askTurnTarget = askSession?.session.scope === 'chat' && typeof body.originTurnId === 'string'
     ? frozenReplyContextForTurn(askSession, body.originTurnId).target : undefined;
-  const cardRoot = asyncInput || askInput.replyCardTarget || askTurnTarget?.mode !== 'thread'
+  const cardRoot = asyncInput || documentDelivery || askTurnTarget?.mode !== 'thread'
     ? undefined : { cardRootMessageId: askTurnTarget.rootMessageId };
   // 点名核验查通讯录，结果随重连可能变化，所以和卡片落点一样只作展示、不进调用身份。
   // 文档 ask 私聊发给作者，确认回执不发卡，都不点名。
@@ -23589,6 +23603,15 @@ async function resolvePinnedWorkingDir(ctx: {
   }
   let oncallEntry = findOncallChat(ctx.larkAppId, ctx.chatId);
   if (!oncallEntry) {
+    const groupDir = createdGroupWorkingDir(ctx.chatId);
+    if (groupDir) {
+      return {
+        pinnedWorkingDir: groupDir,
+        oncallEntry: undefined,
+        inheritedFrom: null,
+        pinnedFromBotDefault: false,
+      };
+    }
     oncallEntry = await maybeAutoBindDefaultOncall(ctx.larkAppId, ctx.chatId, ctx.chatType);
   }
   // Resolve the bot default first so we know whether inheritance is only the
@@ -23872,10 +23895,11 @@ function buildReservedInitialInput(
       logger.warn('Failed to stage merged session input');
     }
   }
+  const openingCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId;
   const built = buildNewTopicCliInput(
     ds.pendingPrompt ?? '',
     ds.session.sessionId,
-    ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId,
+    openingCliId,
     ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? botCfg.cliPathOverride,
     ds.pendingAttachments,
     ds.pendingMentions,
@@ -23899,15 +23923,15 @@ function buildReservedInitialInput(
       // auto-start passes this via pendingChatContext).
       chatContext: ds.pendingChatContext,
       groupJoinContext: ds.pendingGroupJoinContext,
-      // #794 后续：opening 也走 hook 注入（sender/mentions 进 envelope，PTY 文本
-      // 只剩正文）。turnId 必须与 forkReservedInitialSession 传给 forkWorker 的
+      // #794 后续：opening 也走 hook 注入（sender/mentions/availableBots 进 envelope，
+      // PTY 文本只剩正文）。turnId 必须与 forkReservedInitialSession 传给 forkWorker 的
       // 权威 turnId 一致（= 最终 managedTurnOrigin.turnId），sidecar 才能被 claim。
       // raw 命令冷启动（pendingRawInput）的 buffered follow-up 走 raw_input IPC
       // 延迟发送，turnId 权威流不同，暂不启用 hook，保持 inline。
       turnId: ds.pendingRawInput
         ? undefined
         : (ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId),
-      sessionBackendType: ds.session.backendType,
+      sessionBackendType: plannedOpeningBackendType(ds, openingCliId, botCfg),
       promptInjection: sessionPromptInjection(ds),
       linkRefMode: ds.pendingLinkRefMode,
       // Reserved initial admission is the fresh launch owned by this session.
@@ -25653,6 +25677,22 @@ function removeCrossPrincipalRecord(ds: DaemonSession, id: string): void {
   persistCrossPrincipalQueue(ds);
 }
 
+function isHostChoiceOrigin(originKind: string | undefined): boolean {
+  return originKind === 'host_cross_principal_classification'
+    || originKind === 'host_cross_principal_wait'
+    || originKind === 'host_cross_principal_owner';
+}
+
+function hostChoiceTextAllowed(originKind: string | undefined, text: string): boolean {
+  return originKind === 'host_cross_principal_classification'
+    ? isCrossPrincipalChoiceOnlyText(text, 'classification')
+    : originKind === 'host_cross_principal_wait'
+      ? isCrossPrincipalChoiceOnlyText(text, 'wait')
+      : originKind === 'host_cross_principal_owner'
+        ? isCrossPrincipalChoiceOnlyText(text, 'owner')
+        : true;
+}
+
 function choiceFromAskResult(
   result: Awaited<ReturnType<typeof registerHostAsk>>,
 ): CrossPrincipalChoice | undefined {
@@ -25777,12 +25817,14 @@ async function stageCrossPrincipalInterruption(args: {
   message: CrossPrincipalInterruptionMessage;
   isCurrent?: () => boolean;
   onAdmitted?: () => void;
+  allowDirectChoice?: boolean;
 }): Promise<boolean> {
   const { ds, ownerTurnId, owner, proposer } = args;
   if (args.isCurrent && !args.isCurrent()) return false;
   if (ds.session.status !== 'active') return true;
   const { message, choice } = sanitizeCrossPrincipalMessage(args.message);
-  if (await trySettleCrossPrincipalProposerChoice(ds, proposer, args.message.text, args.message.mentions)) {
+  if (args.allowDirectChoice !== false
+    && await trySettleCrossPrincipalProposerChoice(ds, proposer, args.message.text, args.message.mentions)) {
     args.onAdmitted?.();
     return true;
   }
@@ -26797,7 +26839,9 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
       if (!result) return;
       const choice = choiceFromAskResult(result);
       const current = ds.session.crossPrincipalInterruptions?.find(item => item.id === record.id);
-      if (!current) return;
+      // A direct human/business transition may have won while this card was
+      // outstanding. Its old timeout/result must not reverse the newer phase.
+      if (!current || current.phase !== 'awaiting_classification') return;
       if (choice && await applyCrossPrincipalProposerChoice(ds, current, choice)) return;
       await settleCrossPrincipalTerminal(
         ds,
@@ -26866,7 +26910,9 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
         if (!waitResult) return;
         const waitChoice = choiceFromAskResult(waitResult);
         const current = ds.session.crossPrincipalInterruptions?.find(item => item.id === record.id);
-        if (!current) return;
+        // Each continue-wait choice starts a new round. An older card result
+        // may only settle the exact phase/round that issued it.
+        if (!current || current.phase !== 'awaiting_owner' || (current.waitDecisionRound ?? 0) !== round) return;
         if (waitChoice && await applyCrossPrincipalProposerChoice(ds, current, waitChoice)) return;
         await settleCrossPrincipalTerminal(
           ds,
@@ -31664,7 +31710,8 @@ async function handleThreadReplyAdmitted(
   // 触发的排除理由），拦截器这里只负责拿着结果去 settle。
   // 没有 hook 连着的 dormant hook ask（hook 随 CLI 退出、或重启后还没重连）不在
   // 候选里——broker 的 list/find 已过滤：此刻没有 CLI 在等答案，这条文字照常进会话。
-  const askCandidate = (ctx.effortTaskReentry || ctx.crossChatThreadFollowUp) ? null : askCustomReplyCandidate({
+  let blockCrossPrincipalBusinessFallback = false;
+  const askCandidate = (ctx.effortTaskReentry || ctx.crossChatThreadFollowUp || ctx.completionProposalContinuation) ? null : askCustomReplyCandidate({
     senderOpenId: threadSenderOpenId,
     chatId: threadChatId,
     cmdContent,
@@ -31672,52 +31719,81 @@ async function handleThreadReplyAdmitted(
     isWorkflowGrillTrigger: !!threadGrill,
   });
   if (askCandidate) {
-    const candidates = listPendingAsksByAnchor({ larkAppId, chatId: askCandidate.chatId, anchor });
-    const quoted = candidates.find(ask => !!ask.cardMessageId && parsed.parentId === ask.cardMessageId);
-    const ambiguous = candidates.length > 1 && candidates.some(ask => isNativeAsyncAskOrigin(ask.originKind));
-    const pendingAsk = quoted ?? (ambiguous ? undefined : findPendingAskByAnchor({ larkAppId, chatId: askCandidate.chatId, anchor }));
-    if (ambiguous && !quoted) {
+    // A shared/chat session can receive messages from several native topics.
+    // Match the original IM position before that routing fold, not just its session anchor.
+    // Direct-message sessions keep their existing continuous-chat routing semantics.
+    const isP2p = (ctxChatType ?? data?.message?.chat_type) === 'p2p';
+    const messageRootId = scope === 'thread'
+      ? (parsed.threadId ? (parsed.rootId || parsed.messageId) : anchor)
+      : (parsed.threadId ? (parsed.rootId || parsed.messageId) : null);
+    const askAnchor = { larkAppId, chatId: askCandidate.chatId, anchor, ...(isP2p ? {} : { messageRootId }) };
+    const hostChoiceText = askCandidate.text.trim();
+    const actor: AskAnswerActor = {
+      senderType: senderIsBotTriState(parsed.senderType, isForeignBot) === true ? 'bot'
+        : parsed.senderType === 'user' ? 'user' : undefined,
+      botSender: isBotSenderType || isForeignBot,
+      senderUnionId: threadTeamTrustUnionId,
+      senderAppId: threadTeamTrustAppId,
+      memberUnionId: threadSenderUnionId,
+    };
+    const submit = (askId: string) => submitCustomReply({ askId, by: askCandidate.senderOpenId, text: askCandidate.text, actor });
+    const hostChoices = () => listPendingHostChoicesByAnchor({
+      ...askAnchor, by: askCandidate.senderOpenId, actor,
+      sessionId: inputSession?.session.sessionId,
+    }).filter(ask => hostChoiceTextAllowed(ask.originKind, hostChoiceText));
+
+    const candidates = listPendingAsksByAnchor(askAnchor);
+    const quoted = candidates.find(ask => !!ask.cardMessageId && parsed.parentId === ask.cardMessageId)
+      ?? (parsed.parentId ? findPendingLegacyAskByCard({ larkAppId, chatId: askCandidate.chatId, anchor, cardMessageId: parsed.parentId }) : undefined);
+    const nativeAmbiguous = candidates.length > 1 && candidates.some(ask => isNativeAsyncAskOrigin(ask.originKind));
+    const ordinaryPending = findPendingAskByAnchor(askAnchor);
+    const initialHostChoices = hostChoices();
+    const pendingAsk = quoted ?? (nativeAmbiguous ? undefined
+      : ordinaryPending ?? (initialHostChoices.length === 1 ? initialHostChoices[0] : undefined));
+    let ambiguityNotified = false;
+    const notifyAmbiguous = async () => {
+      if (ambiguityNotified) return;
+      ambiguityNotified = true;
       await sessionReply(anchor, tr('card.ask.async_ambiguous', undefined, localeForBot(larkAppId)), 'text', larkAppId);
+    };
+    if ((nativeAmbiguous || (!ordinaryPending && initialHostChoices.length > 1)) && !quoted) {
+      blockCrossPrincipalBusinessFallback = true;
+      await notifyAmbiguous();
     }
     if (pendingAsk) {
-      const hostChoiceText = askCandidate.text.trim();
-      const hostChoiceAllowsText = pendingAsk.originKind === 'host_cross_principal_classification'
-        ? isCrossPrincipalChoiceOnlyText(hostChoiceText, 'classification')
-        : pendingAsk.originKind === 'host_cross_principal_wait'
-          ? isCrossPrincipalChoiceOnlyText(hostChoiceText, 'wait')
-        : pendingAsk.originKind === 'host_cross_principal_owner'
-          ? isCrossPrincipalChoiceOnlyText(hostChoiceText, 'owner')
-          : true;
+      const hostChoiceAllowsText = hostChoiceTextAllowed(pendingAsk.originKind, hostChoiceText);
       // A host-owned cross-principal card is a classification/approval gate,
-      // not a blanket "next text answers the ask" prompt.  Arbitrary business
-      // text must keep flowing to the interruption staging path; otherwise a
-      // second message from B would silently settle the card and disappear.
+      // not a blanket "next text answers the ask" prompt. Arbitrary business
+      // text must keep flowing to the interruption staging path.
       if (!hostChoiceAllowsText) {
+        if (isHostChoiceOrigin(pendingAsk.originKind)) blockCrossPrincipalBusinessFallback = true;
         logger.info(`[${anchor.substring(0, 12)}] host cross-principal ask ignored non-choice free text`);
       } else {
-      const outcome = submitCustomReply({
-        askId: pendingAsk.askId,
-        by: askCandidate.senderOpenId,
-        text: askCandidate.text,
-        // Actor context so the broker's talk check uses the same predicate as
-        // the dispatcher gate / quota recheck: a bot text-reply → evaluateBotTalk
-        // (covers team-拉群 with no union_id), a platform teamMember human →
-        // evaluateTalk's teamMember union leg. Omitting it (card clicks) degrades
-        // to the plain evaluateTalk(openId, chatType).
-        actor: {
-          senderType: senderIsBotTriState(parsed.senderType, isForeignBot) === true ? 'bot'
-            : parsed.senderType === 'user' ? 'user' : undefined,
-          botSender: isBotSenderType || isForeignBot,
-          senderUnionId: threadTeamTrustUnionId,
-          senderAppId: threadTeamTrustAppId,
-          memberUnionId: threadSenderUnionId,
-        },
-      });
-      if (outcome === 'accepted') {
-        logger.info(`[${anchor.substring(0, 12)}] ask custom reply accepted from ${askCandidate.senderOpenId.substring(0, 12)}`);
-        return;
-      }
-      logger.info(`[${anchor.substring(0, 12)}] ask custom reply not accepted (${outcome}); falling through to normal routing`);
+        let outcome = submit(pendingAsk.askId);
+        if (outcome !== 'accepted') {
+          if (quoted) {
+            // An explicit quote targets exactly one card. Never redirect its
+            // rejected answer to another host card or to business-only state.
+            blockCrossPrincipalBusinessFallback = true;
+          } else {
+            // Recompute after the ordinary attempt: expired/settled candidates
+            // disappear, and only a unique authorized host choice may be used.
+            const retry = hostChoices();
+            if (retry.length > 1) {
+              blockCrossPrincipalBusinessFallback = true;
+              await notifyAmbiguous();
+            } else if (retry.length === 1 && retry[0].askId !== pendingAsk.askId) {
+              outcome = submit(retry[0].askId);
+              if (outcome !== 'accepted') blockCrossPrincipalBusinessFallback = true;
+            }
+          }
+          if (isHostChoiceOrigin(pendingAsk.originKind)) blockCrossPrincipalBusinessFallback = true;
+        }
+        if (outcome === 'accepted') {
+          logger.info(`[${anchor.substring(0, 12)}] ask custom reply accepted from ${askCandidate.senderOpenId.substring(0, 12)}`);
+          return;
+        }
+        logger.info(`[${anchor.substring(0, 12)}] ask custom reply not accepted (${outcome}); falling through to normal routing`);
       }
     }
   }
@@ -31773,7 +31849,7 @@ async function handleThreadReplyAdmitted(
   // cmdContent (mention-stripped), matching the host-ask gate below: a raw
   // "@<bot> 另开任务" is not a choice, so the answer would fall through, the
   // record would time out, and the notice would ask for the answer just sent.
-  if (dsPre && threadTrustedCaller
+  if (dsPre && threadTrustedCaller && !blockCrossPrincipalBusinessFallback
     && await trySettleCrossPrincipalProposerChoice(dsPre, threadTrustedCaller, cmdContent, parsed.mentions)) {
     markIngressAdmitted(ctx);
     return;
@@ -32874,6 +32950,7 @@ async function handleThreadReplyAdmitted(
     if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
     await stageCrossPrincipalInterruption({
       ds,
+      allowDirectChoice: !blockCrossPrincipalBusinessFallback,
       ...(ctx.effortTaskReentry ? { isCurrent: effortSessionIsCurrent, onAdmitted: () => markIngressAdmitted(ctx) } : {}),
       ownerTurnId: activePrincipalTurn.turnId,
       owner: taskController,
@@ -32984,7 +33061,7 @@ async function handleThreadReplyAdmitted(
             // sendWorkerInput 的权威 turnId（parsed.messageId）一致，sidecar 可被 claim。
             turnId: parsed.messageId,
             linkRefSourceType: parsed.msgType === 'interactive' ? 'card' : 'user_message',
-            sessionBackendType: ds.session.backendType,
+            sessionBackendType: ds.initConfig?.backendType ?? ds.session.backendType,
             // This opening is being delivered to an already-running worker.
             // Preserve the identity mode that worker was actually launched
             // with; legacy empty-start sessions can reach this path after a
@@ -33425,10 +33502,11 @@ async function handleThreadReplyAdmitted(
     // opening 的 hook 会领到这份从没发出去的 speculative reminder → 双注入。
     let wrappedInput: CliTurnPayload;
     if (openingTurn) {
+      const openingCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? dsBotCfgForFork.cliId;
       wrappedInput = buildNewTopicCliInput(
         reforkContent,
         ds.session.sessionId,
-        ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? dsBotCfgForFork.cliId,
+        openingCliId,
         ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? dsBotCfgForFork.cliPathOverride,
         attachments,
         parsed.mentions,
@@ -33453,7 +33531,12 @@ async function handleThreadReplyAdmitted(
           // queued dashboard 场景的 turnId 是合成的，权威流不同，保持 inline。
           turnId: queuedHasDurableTail ? undefined : parsed.messageId,
           linkRefSourceType: parsed.msgType === 'interactive' ? 'card' : 'user_message',
-          sessionBackendType: ds.session.backendType,
+          sessionBackendType: plannedOpeningBackendType(
+            { initConfig: undefined, session: ds.session },
+            openingCliId,
+            dsBotCfgForFork,
+          ),
+          freshColdOpening: !openingResume,
           larkToolResume: openingResume,
           promptInjection: sessionPromptInjection(ds),
         },
@@ -36195,6 +36278,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     getActiveCount,
     prepareRawInputTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
     startQuotaFallbackChainSwitch,
+    onCodexCapacityRetry: handleCodexCapacityRetry,
+    onCodexCapacitySettle: settleCodexCapacityFallback,
     loadScheduledTaskForIdentity: (appId, taskId) =>
       readScheduledTaskFromAuthority(scheduleAuthorityStore, appId, taskId),
     onTriggerTurnStarted: (ds, title, turnId) => beginNewTurn(ds, title, turnId),
@@ -36749,12 +36834,23 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         const dispatchTrustedCaller = trustedCallerForTurn(
           cfg.larkAppId, sourceOpenId, operation.callerUnionId, true,
         );
+        const liveBot = getBot(cfg.larkAppId);
+        const liveCfg = liveBot.config;
+        const dispatchCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? liveCfg.cliId;
+        const dispatchCliPathOverride = ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? liveCfg.cliPathOverride;
         const input = buildNewTopicCliInput(
-          prompt, sessionId, cfg.cliId, cfg.cliPathOverride, undefined, undefined,
+          prompt, sessionId, dispatchCliId, dispatchCliPathOverride, undefined, undefined,
           await getAvailableBots(cfg.larkAppId, operation.chatId),
-          undefined, { name: getBot(cfg.larkAppId).botName, openId: getBot(cfg.larkAppId).botOpenId },
+          undefined, { name: liveBot.botName, openId: liveBot.botOpenId },
           localeForBot(cfg.larkAppId), sender,
-          { larkAppId: cfg.larkAppId, chatId: operation.chatId, trustedCaller: dispatchTrustedCaller },
+          {
+            larkAppId: cfg.larkAppId,
+            chatId: operation.chatId,
+            trustedCaller: dispatchTrustedCaller,
+            promptInjection: sessionPromptInjection(ds),
+            turnId: operation.sourceTurnId,
+            sessionBackendType: plannedOpeningBackendType(ds, dispatchCliId, liveCfg),
+          },
         );
         if (!forkWorker(ds, input, { turnId: operation.sourceTurnId, trustedCaller: input.trustedCaller })) {
           throw new Error('dispatch launch worker fork was rejected');
@@ -38154,23 +38250,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // dataDir 上的遗留订阅会让「无飞书连接」的 bot 每 5 秒主动打飞书。
   const ownerGroupFollower = cfg.apiOnly ? undefined : startOwnerGroupFollow(cfg.larkAppId, config.session.dataDir);
   let docCommentPollTimer: ReturnType<typeof setInterval> | undefined;
-  let oncallHandoffTimer: ReturnType<typeof setInterval> | undefined;
-  let oncallHandoffRunning = false;
-  let oncallHandoffStopped = false;
-  if (!cfg.apiOnly) {
-    const reconcileOncall = async () => {
-      // Existing group invitations remain usable after new handoffs are disabled.
-      // The reconciler checks the live policy before forwarding conversations.
-      if (oncallHandoffRunning || oncallHandoffStopped) return;
-      oncallHandoffRunning = true;
-      try { await (await import('./im/lark/oncall-group.js')).retryPendingOncallHandoffs(cfg.larkAppId, () => !oncallHandoffStopped); }
-      catch { logger.warn('[oncall-group] Handoff recovery failed; retry remains scheduled'); }
-      finally { oncallHandoffRunning = false; }
-    };
-    oncallHandoffTimer = setInterval(() => { void reconcileOncall(); }, 5_000);
-    oncallHandoffTimer.unref?.();
-    void reconcileOncall();
-  }
+  const stopOncallHandoffRecovery = cfg.apiOnly ? undefined : startOncallHandoffRecovery(cfg.larkAppId);
   if (!cfg.apiOnly) {
     // 文档订阅恢复：重启后订阅可能已失效，给仍活跃的会话重订阅；会话没恢复
     // （已关/丢失）的订阅则退订 + 清表，避免「命中订阅但无会话」的孤儿。
@@ -38776,17 +38856,21 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       try { sessionStore.updateSession(live.session); } catch { live.session.projectImportPending = true; }
     },
   });
+  const projectCardContext = (project: ProjectGroupState) => ({
+    dataDir: config.session.dataDir,
+    chatId: project.chatId,
+    larkAppId: cfg.larkAppId,
+    coordinatorSessionId: project.coordinatorSessionId,
+  });
   const projectCardRuntimeSync = createProjectCardRuntimeSync({
     larkAppId: cfg.larkAppId,
     listProjects: () => listProjectGroups(config.session.dataDir),
     readMode: chatId => readGroupCollaborationMode(config.session.dataDir, chatId),
     resolveRuntime: project => resolveProjectGroupCardRuntime(project, config.session.dataDir),
-    refresh: project => projectCoordinator.run({
-      dataDir: config.session.dataDir,
-      chatId: project.chatId,
-      larkAppId: cfg.larkAppId,
-      coordinatorSessionId: project.coordinatorSessionId,
-    }, { action: 'refresh' }),
+    refresh: (project, target) => projectCoordinator.refreshCard(projectCardContext(project), target),
+    isMessageUpdateExpired: error => error instanceof MessageUpdateExpiredError,
+    repostExpiredCard: (project, target) => projectCoordinator.repostExpiredCard(projectCardContext(project), target),
+    retryPendingCardPin: (project, messageId) => projectCoordinator.retryPendingCardPin(projectCardContext(project), messageId),
     forwardToCoordinator: (coordinatorAppId, chatId) => {
       const peer = findOnlineDaemon(coordinatorAppId, config.session.dataDir);
       if (!peer) return;
@@ -38811,8 +38895,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     void getProjectAttachmentSource(event.larkAppId, event.sessionId)
       .then(async source => {
         if (!source) return;
-        await projectWorkstreamAttachments.observe(source);
-        projectCardRuntimeSync.notify(source.chatId);
+        const projectChats = await projectWorkstreamAttachments.observe(source);
+        for (const chatId of new Set([source.chatId, ...projectChats])) projectCardRuntimeSync.notify(chatId);
       })
       .catch(() => logger.debug('[project] association projection pending; refresh can repair'));
     if (findActiveBySessionId(event.sessionId)?.session.projectImportPending) {
@@ -39355,8 +39439,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(maintenanceHeartbeat);
     ownerGroupFollower?.stop();
     clearInterval(docCommentPollTimer);
-    oncallHandoffStopped = true;
-    clearInterval(oncallHandoffTimer);
+    stopOncallHandoffRecovery?.();
     for (const session of vcMeetingSessions.values()) cleanupVcMeetingDaemonSession(session, 'daemon-shutdown');
     vcMeetingSessions.clear();
     for (const closing of vcMeetingClosingConsumerSessions.values()) {
@@ -39648,8 +39731,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     stopAllMeegoPollers();
     ownerGroupFollower?.stop();
     clearInterval(docCommentPollTimer);
-    oncallHandoffStopped = true;
-    clearInterval(oncallHandoffTimer);
+    stopOncallHandoffRecovery?.();
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     setDurableBridgeFinalOutputHandler(undefined);
     setDurableSessionSendHandler(null);

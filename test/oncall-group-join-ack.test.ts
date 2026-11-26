@@ -110,10 +110,9 @@ describe('Oncall join callback ACK ordering', () => {
     expect(result.toast.type).toBe('success');
     expect(order).toEqual(['ACK']);
     await vi.advanceTimersByTimeAsync(0);
-    await until(() => order.includes('PATCH'));
+    await until(() => groups.getRequest(source)?.cardRefreshPending === false);
     expect(order).toEqual(['ACK', 'PATCH']);
     expect(visibleCard).toContain(inviteLink);
-    expect(groups.getRequest(source)?.cardRefreshPending).toBe(false);
     expect(mocks.invite).not.toHaveBeenCalled();
   });
   it('sends the legacy invitation reply after ACK when no card snapshot exists', async () => {

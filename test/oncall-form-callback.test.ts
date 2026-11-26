@@ -453,6 +453,8 @@ describe('Botmux custom Oncall form', () => {
   });
   const fields = [input('biz_id1', '流程节点名称', true), input('biz_id2', '业务线')];
   const creates = () => fetcher.mock.calls.filter(([, init]) => init?.method === 'POST');
+  const plain = { ...category, id: 35, name: 'ordinary', workflow_id: 11 };
+  const regional = { ...category, id: 36, name: 'regional', workflow_id: 12 };
   async function open(workflow: unknown[] = fields, visibility: 'thread' | 'private' = 'thread') {
     Object.assign(mocks.bot.config.oncallGroup, {
       customFormMode: 'botmux', formDisplay: visibility === 'thread' ? 'thread_card' : 'private_card',
@@ -464,9 +466,12 @@ describe('Botmux custom Oncall form', () => {
     ] });
     fetcher.mockImplementation(async (url: string, init?: RequestInit) => {
       if (init?.method === 'POST') return response({ oncall_flow_id: '123', open_chat_id: 'oc_created' });
-      if (url.includes('/workflow/')) return response({ tenant_id: 12, type_id: 34, config: JSON.stringify(workflow) });
+      if (url.endsWith('/workflow/10')) return response({ tenant_id: 12, type_id: 34, config: JSON.stringify(workflow) });
+      if (url.endsWith('/workflow/11')) return response({ tenant_id: 12, type_id: 35, config: '[]' });
+      if (url.endsWith('/workflow/12')) return response({ tenant_id: 12, type_id: 36,
+        config: JSON.stringify([{ base: { key: 'ref', type: 'input', label: '参考编号' } }]) });
       if (url.includes('/tools/')) return response({ lark_dialog_url: `https://applink.feishu.cn/client/web_url/open?url=${encodeURIComponent('https://oncall.example.test/chat?tenant=12')}` });
-      return response({ region: { cn: [category] } });
+      return response({ region: { cn: [category, plain], global: [regional] } });
     });
     expect((await handleOncallGroupAction(event('oncall_group_create'), 'app')).toast.type).toBe('info');
     return draftForCurrentSource();
@@ -475,71 +480,288 @@ describe('Botmux custom Oncall form', () => {
     return new OncallFormStore(dir).open({ appId: 'app', ownerOpenId: 'ou_owner', source, choices: { regions: { cn: [category] } },
       region: 'cn', typeId: 34, priority: 'P2', description: 'question' });
   }
-  async function showFields(d: ReturnType<typeof draftForCurrentSource>) {
-    const confirmed = await handleOncallFormAction(event('oncall_group_form_submit', d), 'app');
-    expect(confirmed.toast.type).toBe('info');
-    expect(creates()).toHaveLength(0);
-    await confirmed.afterAck();
-    const updates = d.visibility === 'thread' ? mocks.update : mocks.ephemeral;
-    const card = JSON.parse(updates.mock.calls.at(-1)![d.visibility === 'thread' ? 2 : 3]);
-    return { draft: draftForCurrentSource(), card, form: card.elements.find((element: any) => element.tag === 'form') };
+  function readCard(d: ReturnType<typeof draftForCurrentSource>, updated = false) {
+    const publish = d.visibility === 'thread' ? (updated ? mocks.update : mocks.reply) : mocks.ephemeral;
+    const card = JSON.parse(publish.mock.calls.at(-1)![d.visibility === 'thread' ? 2 : 3]);
+    return { draft: d, card, form: card.elements.find((element: any) => element.tag === 'form') };
   }
+  async function select(d: ReturnType<typeof draftForCurrentSource>, field: string, option: string) {
+    const change = event(`oncall_group_form_${field}`, d);
+    change.action.option = option;
+    const result = await handleOncallFormAction(change, 'app');
+    expect(result.toast.type).toBe('info');
+    await result.afterAck?.();
+    return readCard(draftForCurrentSource(), true);
+  }
+  const formButtons = (form: any) => form.elements.at(-1).columns.map((column: any) => column.elements[0]);
   it('submits both configured fields once, then publishes the group link and forwards the conversation', async () => {
-    const shown = await showFields(await open());
+    const shown = readCard(await open());
     expect(mocks.reply).toHaveBeenCalledOnce();
-    expect(mocks.update.mock.calls.at(-1)![1]).toBe(shown.draft.messageId);
-    expect(shown.form.elements).toMatchObject([
+    expect(mocks.update).not.toHaveBeenCalled();
+    expect(creates()).toHaveLength(0);
+    expect(shown.card.elements.find((element: any) => element.tag === 'column_set').columns.map((column: any) => column.elements[0].initial_option))
+      .toEqual(['cn', '34', 'P2']);
+    expect(shown.form.elements.slice(0, -1)).toMatchObject([
       { tag: 'input', name: 'oncall_field_0', label: { content: '流程节点名称' }, required: true },
       { tag: 'input', name: 'oncall_field_1', label: { content: '业务线' }, required: false },
-      { tag: 'button', action_type: 'form_submit', value: { action: 'oncall_group_form_botmux_submit', version: shown.draft.version } },
+    ]);
+    expect(shown.form.elements.at(-1)).toMatchObject({ tag: 'column_set', flex_mode: 'none' });
+    const buttons = formButtons(shown.form);
+    expect(buttons).toMatchObject([
+      { action_type: 'form_submit', value: { action: 'oncall_group_form_botmux_submit', version: shown.draft.version } },
+      { action_type: 'request', value: { action: 'oncall_group_form_cancel', version: shown.draft.version } },
     ]);
     const submit = event('oncall_group_form_botmux_submit', shown.draft);
-    submit.action.value = shown.form.elements.at(-1).value;
+    submit.action.value = buttons[0].value;
     submit.action.form_value = { oncall_field_0: '结账', oncall_field_1: '核算' };
+    const respond = fetcher.getMockImplementation()!;
+    let finishCreate!: (response: Response) => void;
+    const pendingCreate = new Promise<Response>(resolve => { finishCreate = resolve; });
+    fetcher.mockImplementation((url: string, init?: RequestInit) => init?.method === 'POST' ? pendingCreate : respond(url, init));
     const submitted = await handleOncallFormAction(submit, 'app');
-    expect(submitted.toast).toMatchObject({ type: 'success' });
-    await submitted.afterAck();
+    expect(submitted.toast).toMatchObject({ type: 'info' });
+    expect(mocks.withdraw).not.toHaveBeenCalled();
+    expect(new OncallGroupStore(dir).getRequest(source)?.status).toBe('pending');
+    expect((await handleOncallFormAction(submit, 'app')).toast.type).toBe('info');
+    const finishing = submitted.afterAck();
+    try {
+      await vi.waitFor(() => expect(mocks.withdraw).toHaveBeenCalledWith('app', shown.draft.messageId, { acceptWithdrawn: true }));
+      expect(new OncallGroupStore(dir).getRequest(source)?.status).toBe('pending');
+      expect(mocks.forward).not.toHaveBeenCalled();
+    } finally {
+      finishCreate(response({ oncall_flow_id: '123', open_chat_id: 'oc_created' }));
+      await finishing;
+    }
     await handleOncallFormAction(submit, 'app');
     expect(creates()).toHaveLength(1);
+    expect(mocks.withdraw).toHaveBeenCalledOnce();
     const body = JSON.parse(creates()[0][1].body);
     expect(JSON.parse(body.workflow_config)).toEqual({
       biz_id1: { value: '结账', name: 'biz_id1', type: 'input' },
       biz_id2: { value: '核算', name: 'biz_id2', type: 'input' },
     });
-    expect(new OncallGroupStore(dir).getRequest(source)).toMatchObject({ status: 'succeeded', openChatId: 'oc_created' });
+    expect(new OncallGroupStore(dir).getRequest(source)).toMatchObject({ status: 'succeeded', openChatId: 'oc_created', formClosePending: false });
     expect(mocks.update.mock.calls.some(call => call[1] === source.messageId && call[2].includes('link_token=invite-oc_created'))).toBe(true);
     expect(mocks.forward.mock.calls.map(call => call[1])).toEqual([source.questionId, source.messageId]);
   });
-  it('rejects other users and missing required text, and allows returning to classification', async () => {
-    const shown = await showFields(await open());
+  it('allows reopening from the original reply after a confirmed create rejection', async () => {
+    const d = await open();
+    const respond = fetcher.getMockImplementation()!;
+    let finishCreate!: (response: Response) => void;
+    const pendingCreate = new Promise<Response>(resolve => { finishCreate = resolve; });
+    fetcher.mockImplementation((url: string, init?: RequestInit) => init?.method === 'POST' ? pendingCreate : respond(url, init));
+    const submit = event('oncall_group_form_botmux_submit', d);
+    submit.action.form_value = { oncall_field_0: '结账' };
+    const accepted = await handleOncallFormAction(submit, 'app');
+    const finished = expect(accepted.afterAck()).rejects.toThrow();
+    try { await vi.waitFor(() => expect(mocks.withdraw).toHaveBeenCalledOnce()); }
+    finally { finishCreate(new Response('{}', { status: 400 })); await finished; }
+    expect(mocks.withdraw).toHaveBeenCalledOnce();
+    expect(new OncallGroupStore(dir).getRequest(source)?.status).toBe('failed');
+    mocks.reply.mockResolvedValueOnce('om_new_form');
+    expect((await handleOncallGroupAction(event('oncall_group_create'), 'app')).toast.type).toBe('info');
+    expect(draftForCurrentSource().messageId).toBe('om_new_form');
+    expect(creates()).toHaveLength(1);
+  });
+  it('reopens the original reply action after the first rejection refresh fails', async () => {
+    const d = await open();
+    const respond = fetcher.getMockImplementation()!;
+    const update = mocks.update.getMockImplementation()!;
+    let finishCreate!: (response: Response) => void;
+    const pendingCreate = new Promise<Response>(resolve => { finishCreate = resolve; });
+    fetcher.mockImplementation((url: string, init?: RequestInit) => init?.method === 'POST' ? pendingCreate : respond(url, init));
+    let shown: { disabled?: boolean; behaviors?: Array<{ value?: { action?: string } }> } | undefined;
+    mocks.update.mockImplementation(async (appId, messageId, raw) => {
+      if (messageId === source.messageId) {
+        shown = JSON.parse(raw).body.elements.find((item: any) => item.element_id === 'botmux_oncall_group')
+          ?.columns.at(-1)?.elements[0];
+      }
+      return update(appId, messageId, raw);
+    });
+    const submit = event('oncall_group_form_botmux_submit', d);
+    submit.action.form_value = { oncall_field_0: '结账' };
+    const accepted = await handleOncallFormAction(submit, 'app');
+    const finished = expect(accepted.afterAck()).rejects.toThrow();
+    try {
+      await vi.waitFor(() => expect(shown?.disabled).toBe(true));
+      mocks.update.mockRejectedValueOnce(Error('PATCH unavailable'));
+    } finally {
+      finishCreate(new Response('{}', { status: 400 }));
+      await finished;
+    }
+
+    const groups = new OncallGroupStore(dir);
+    expect(groups.getRequest(source)).toMatchObject({ status: 'failed', cardRefreshPending: true, formClosePending: false });
+    expect(shown?.disabled).toBe(true);
+    const formPatches = mocks.update.mock.calls.filter(([, messageId]) => messageId === d.messageId).length;
+    await retryPendingOncallHandoffs('app');
+    expect(mocks.update.mock.calls.filter(([, messageId]) => messageId === d.messageId)).toHaveLength(formPatches);
+    expect(mocks.withdraw).toHaveBeenCalledOnce();
+    expect(shown?.disabled).not.toBe(true);
+    expect(shown?.behaviors).toContainEqual({ type: 'callback', value: { action: 'oncall_group_create' } });
+    expect(groups.getRequest(source)).toMatchObject({ status: 'failed', cardRefreshPending: false });
+    expect(creates()).toHaveLength(1);
+  });
+  it('settles a failed form after the first withdrawal fails and stores reopen', async () => {
+    const d = await open();
+    const respond = fetcher.getMockImplementation()!;
+    let finishCreate!: (response: Response) => void;
+    const pendingCreate = new Promise<Response>(resolve => { finishCreate = resolve; });
+    fetcher.mockImplementation((url: string, init?: RequestInit) => init?.method === 'POST' ? pendingCreate : respond(url, init));
+    mocks.withdraw.mockResolvedValueOnce(false);
+    const submit = event('oncall_group_form_botmux_submit', d);
+    submit.action.form_value = { oncall_field_0: '结账' };
+    const accepted = await handleOncallFormAction(submit, 'app');
+    const finishing = accepted.afterAck();
+    const rejection = expect(finishing).rejects.toThrow();
+    try { await vi.waitFor(() => expect(mocks.withdraw).toHaveBeenCalledOnce()); }
+    finally { finishCreate(new Response('{}', { status: 400 })); await rejection; }
+
+    const groups = new OncallGroupStore(dir);
+    expect(groups.getRequest(source)).toMatchObject({ status: 'failed', formClosePending: true });
+    expect(await new OncallFormStore(dir).use('app', d.id, 'ou_owner',
+      async draft => draft.closed, { allowClosed: true })).toBe(true);
+    await retryPendingOncallHandoffs('app');
+    expect(groups.getRequest(source)).toMatchObject({ status: 'failed', formClosePending: false });
+    expect(groups.pendingHandoffs('app')).toEqual([]);
+    expect(mocks.withdraw).toHaveBeenCalledOnce();
+    expect(mocks.update.mock.calls.some(([, messageId, raw]) => messageId === d.messageId
+      && JSON.parse(raw).body?.elements?.some((element: any) => element.element_id === 'botmux_oncall_form_state'))).toBe(true);
+    expect(creates()).toHaveLength(1);
+
+    const replay = await handleOncallFormAction(event('oncall_group_form_submit', d), 'app');
+    expect(replay.afterAck).toBeUndefined();
+    expect(mocks.withdraw).toHaveBeenCalledOnce();
+    expect(creates()).toHaveLength(1);
+  });
+  it.each(['MessageWithdrawnError', 'MessageUpdateExpiredError'])('settles failed-form recovery when the persisted card is unchangeable: %s', async errorName => {
+    const d = await open();
+    const respond = fetcher.getMockImplementation()!;
+    let finishCreate!: (response: Response) => void;
+    const pendingCreate = new Promise<Response>(resolve => { finishCreate = resolve; });
+    fetcher.mockImplementation((url: string, init?: RequestInit) => init?.method === 'POST' ? pendingCreate : respond(url, init));
+    mocks.withdraw.mockResolvedValueOnce(false);
+    const submit = event('oncall_group_form_botmux_submit', d);
+    submit.action.form_value = { oncall_field_0: '结账' };
+    const accepted = await handleOncallFormAction(submit, 'app');
+    const finishing = accepted.afterAck();
+    const rejection = expect(finishing).rejects.toThrow();
+    try { await vi.waitFor(() => expect(mocks.withdraw).toHaveBeenCalledOnce()); }
+    finally { finishCreate(new Response('{}', { status: 400 })); await rejection; }
+    expect(new OncallGroupStore(dir).getRequest(source)).toMatchObject({ status: 'failed', formClosePending: true });
+
+    const update = mocks.update.getMockImplementation()!;
+    mocks.update.mockImplementation(async (appId, messageId, raw) => {
+      if (messageId === d.messageId) throw Object.assign(Error('unchangeable'), { name: errorName });
+      return update(appId, messageId, raw);
+    });
+    await retryPendingOncallHandoffs('app');
+    expect(new OncallGroupStore(dir).getRequest(source)).toMatchObject({ status: 'failed', formClosePending: false });
+    expect(new OncallGroupStore(dir).pendingHandoffs('app')).toEqual([]);
+    expect(mocks.update.mock.calls.filter(([, messageId]) => messageId === d.messageId)).toHaveLength(1);
+    expect(mocks.withdraw).toHaveBeenCalledOnce();
+    expect(creates()).toHaveLength(1);
+  });
+  it.each([
+    ['succeeded', () => response({ oncall_flow_id: '123', open_chat_id: 'oc_created' })],
+    ['failed', () => new Response('{}', { status: 400 })],
+  ])('persists a %s platform result when the callback UI continuation is lost', async (status, platformResponse) => {
+    const d = await open();
+    const respond = fetcher.getMockImplementation()!;
+    fetcher.mockImplementation((url: string, init?: RequestInit) => init?.method === 'POST'
+      ? Promise.resolve(platformResponse()) : respond(url, init));
+    const submit = event('oncall_group_form_botmux_submit', d);
+    submit.action.form_value = { oncall_field_0: '结账' };
+    expect((await handleOncallFormAction(submit, 'app')).toast.type).toBe('info');
+    const groups = new OncallGroupStore(dir);
+    await vi.waitFor(() => expect(groups.getRequest(source)?.status).toBe(status));
+    expect(mocks.withdraw).not.toHaveBeenCalled();
+    if (status === 'succeeded') {
+      await retryPendingOncallHandoffs('app');
+      expect(groups.getRequest(source)?.formClosePending).toBe(false);
+      expect(mocks.withdraw).toHaveBeenCalledOnce();
+    }
+    expect(creates()).toHaveLength(1);
+  });
+  it('retries retiring the original form after creation if the early withdrawal failed', async () => {
+    const d = await open();
+    mocks.withdraw.mockResolvedValueOnce(false);
+    const submit = event('oncall_group_form_botmux_submit', d);
+    submit.action.form_value = { oncall_field_0: '结账' };
+    const accepted = await handleOncallFormAction(submit, 'app');
+    await accepted.afterAck();
+    expect(mocks.withdraw).toHaveBeenCalledTimes(2);
+    expect(creates()).toHaveLength(1);
+    expect(new OncallGroupStore(dir).getRequest(source)).toMatchObject({ status: 'succeeded', formClosePending: false });
+  });
+  it('cancels from the same button row with required fields left empty', async () => {
+    const shown = readCard(await open());
+    const cancel = event('oncall_group_form_cancel', shown.draft);
+    cancel.action.value = formButtons(shown.form)[1].value;
+    const result = await handleOncallFormAction(cancel, 'app');
+    expect(result.toast.type).toBe('info');
+    await result.afterAck();
+    expect(await new OncallFormStore(dir).use('app', shown.draft.id, 'ou_owner',
+      async draft => draft.closed, { allowClosed: true })).toBe(true);
+    expect(mocks.update.mock.calls.at(-1)?.[1]).toBe(shown.draft.messageId);
+    expect(creates()).toHaveLength(0);
+  });
+  it('rejects other users and missing required text, and replaces fields when the selection changes', async () => {
+    const shown = readCard(await open());
     const submit = event('oncall_group_form_botmux_submit', shown.draft);
     expect((await handleOncallFormAction({ ...submit, operator: { open_id: 'ou_other' } }, 'app')).toast.type).toBe('error');
     expect((await handleOncallFormAction(submit, 'app')).toast.content).toContain('请填写「流程节点名称」');
-    const back = await handleOncallFormAction(event('oncall_group_form_back', shown.draft), 'app');
-    await back.afterAck();
-    expect(draftForCurrentSource().botmuxFields).toBeUndefined();
-    await handleOncallFormAction(submit, 'app');
+    expect(mocks.withdraw).not.toHaveBeenCalled();
+    const ordinary = await select(shown.draft, 'category', '35');
+    expect(ordinary.form).toBeUndefined();
+    expect(ordinary.card.elements.at(-1).actions[0].value.action).toBe('oncall_group_form_submit');
+    submit.action.form_value = { oncall_field_0: 'stale text' };
+    const stale = await handleOncallFormAction(submit, 'app');
+    expect(stale.toast.type).toBe('info');
+    const otherRegion = await select(ordinary.draft, 'region', 'global');
+    expect(otherRegion.draft).toMatchObject({ region: 'global', typeId: 36 });
+    expect(otherRegion.form.elements.slice(0, -1)).toMatchObject([{ label: { content: '参考编号' } }]);
+    expect(mocks.update.mock.calls.every(([, messageId]) => messageId === shown.draft.messageId)).toBe(true);
+    expect(mocks.reply).toHaveBeenCalledOnce();
     expect(creates()).toHaveLength(0);
   });
   it.each(['😀', '𠀀'])('counts Unicode characters in Botmux form fields (%s)', async char => {
-    const shown = await showFields(await open());
+    const shown = readCard(await open());
     const submit = event('oncall_group_form_botmux_submit', shown.draft);
     submit.action.form_value = { oncall_field_0: char.repeat(1001) };
     expect((await handleOncallFormAction(submit, 'app')).toast.type).toBe('error');
     expect(creates()).toHaveLength(0);
     submit.action.form_value.oncall_field_0 = char.repeat(1000);
-    expect((await handleOncallFormAction(submit, 'app')).toast.type).toBe('success');
+    const accepted = await handleOncallFormAction(submit, 'app');
+    expect(accepted.toast.type).toBe('info');
+    await accepted.afterAck();
     const body = JSON.parse(creates()[0][1].body);
     expect(JSON.parse(body.workflow_config).biz_id1.value).toBe(submit.action.form_value.oncall_field_0);
   });
   it('does not accept a rendered Botmux form after switching to native', async () => {
-    const shown = await showFields(await open());
+    const shown = readCard(await open());
     mocks.bot.config.oncallGroup.customFormMode = 'native';
     const submit = event('oncall_group_form_botmux_submit', shown.draft);
     submit.action.form_value = { oncall_field_0: '结账' };
-    expect((await handleOncallFormAction(submit, 'app')).toast.content).toContain('表单配置已变更');
-    await (await handleOncallFormAction(event('oncall_group_form_back', shown.draft), 'app')).afterAck();
-    expect(draftForCurrentSource().nativeFormLink).toContain('/client/web_url/open');
+    const changed = await handleOncallFormAction(submit, 'app');
+    expect(changed.toast.content).toContain('表单配置已变更');
+    await changed.afterAck();
+    const refreshed = readCard(draftForCurrentSource(), true);
+    expect(refreshed.form).toBeUndefined();
+    expect(refreshed.card.elements.at(-1).actions[0].url).toContain('/client/web_url/open');
+    expect(creates()).toHaveLength(0);
+  });
+  it('switches the same card between linked inputs and native P0 without submitting', async () => {
+    const d = await open();
+    const native = await select(d, 'priority', 'P0');
+    expect(native.form).toBeUndefined();
+    const url = native.card.elements.at(-1).actions[0].url;
+    const page = new URL(new URL(url).searchParams.get('url')!);
+    expect(page.searchParams.get('level')).toBe('P0');
+    const botmux = await select(native.draft, 'priority', 'P2');
+    expect(botmux.form.elements.filter((element: any) => element.tag === 'input')).toHaveLength(2);
+    expect(botmux.draft.nativeFormLink).toBeUndefined();
+    expect(mocks.reply).toHaveBeenCalledOnce();
     expect(creates()).toHaveLength(0);
   });
   it('uses the native link for unsupported fields', async () => {
@@ -556,12 +778,101 @@ describe('Botmux custom Oncall form', () => {
   });
   it('replaces the private card without publishing the form to the group', async () => {
     const d = await open(fields, 'private');
+    expect(readCard(d).form.elements).toHaveLength(3);
     mocks.ephemeral.mockResolvedValueOnce('om_private_form');
-    const shown = await showFields(d);
+    const shown = await select(d, 'priority', 'P1');
     expect(shown.draft.messageId).toBe('om_private_form');
     expect(shown.form.elements).toHaveLength(3);
     expect(mocks.reply).not.toHaveBeenCalled();
     expect(mocks.remove).toHaveBeenCalledWith('app', d.messageId);
+  });
+  it('keeps a stale ACK continuation from a failed attempt out of the replacement request', async () => {
+    const d = await open();
+    const respond = fetcher.getMockImplementation()!;
+    fetcher.mockImplementation((url: string, init?: RequestInit) => init?.method === 'POST'
+      ? Promise.resolve(new Response('{}', { status: 400 })) : respond(url, init));
+    const firstSubmit = event('oncall_group_form_botmux_submit', d);
+    firstSubmit.action.form_value = { oncall_field_0: '结账' };
+    const first = await handleOncallFormAction(firstSubmit, 'app');
+    const groups = new OncallGroupStore(dir);
+    await vi.waitFor(() => expect(groups.getRequest(source)?.status).toBe('failed'));
+    const firstAttempt = groups.getRequest(source)?.attemptId;
+    fetcher.mockImplementation((url: string, init?: RequestInit) => init?.method === 'POST'
+      ? Promise.resolve(response({ oncall_flow_id: '123', open_chat_id: 'oc_created' })) : respond(url, init));
+    const secondSubmit = event('oncall_group_form_botmux_submit', d);
+    secondSubmit.action.form_value = { oncall_field_0: '结账' };
+    const second = await handleOncallFormAction(secondSubmit, 'app');
+    await vi.waitFor(() => expect(groups.getRequest(source)?.status).toBe('succeeded'));
+    expect(groups.getRequest(source)?.attemptId).not.toBe(firstAttempt);
+    // The delayed continuation of the rejected attempt must not retire the live card.
+    await first.afterAck();
+    expect(mocks.withdraw).not.toHaveBeenCalled();
+    expect(await new OncallFormStore(dir).use('app', d.id, 'ou_owner',
+      async draft => draft.closed === true, { allowClosed: true })).toBe(false);
+    // The current attempt's own continuation still owns the cleanup.
+    await second.afterAck();
+    expect(mocks.withdraw).toHaveBeenCalledOnce();
+    expect(groups.getRequest(source)).toMatchObject({ status: 'succeeded', formClosePending: false });
+  });
+  it('does not let a late withdrawal settle a replacement failed attempt', async () => {
+    const firstDraft = await open();
+    const respond = fetcher.getMockImplementation()!;
+    const creations: Array<(response: Response) => void> = [];
+    fetcher.mockImplementation((url: string, init?: RequestInit) => init?.method === 'POST'
+      ? new Promise<Response>(resolve => { creations.push(resolve); }) : respond(url, init));
+    let releaseFirstWithdrawal!: (retired: boolean) => void;
+    mocks.withdraw.mockImplementationOnce(() => new Promise<boolean>(resolve => { releaseFirstWithdrawal = resolve; }));
+    const firstSubmit = event('oncall_group_form_botmux_submit', firstDraft);
+    firstSubmit.action.form_value = { oncall_field_0: 'first' };
+    const firstAccepted = await handleOncallFormAction(firstSubmit, 'app');
+    expect(creations).toHaveLength(1);
+    const firstError = firstAccepted.afterAck().catch((error: unknown) => error);
+    await vi.waitFor(() => expect(mocks.withdraw).toHaveBeenCalledOnce());
+    creations[0](new Response('{}', { status: 400 }));
+    const groups = new OncallGroupStore(dir);
+    await vi.waitFor(() => expect(groups.getRequest(source)?.status).toBe('failed'));
+
+    mocks.reply.mockResolvedValueOnce('om_second_form');
+    await handleOncallGroupAction(event('oncall_group_create'), 'app');
+    const secondDraft = draftForCurrentSource();
+    expect(secondDraft.id).not.toBe(firstDraft.id);
+    mocks.withdraw.mockResolvedValueOnce(false);
+    const secondSubmit = event('oncall_group_form_botmux_submit', secondDraft);
+    secondSubmit.action.form_value = { oncall_field_0: 'second' };
+    const secondAccepted = await handleOncallFormAction(secondSubmit, 'app');
+    expect(creations).toHaveLength(2);
+    const secondError = secondAccepted.afterAck().catch((error: unknown) => error);
+    await vi.waitFor(() => expect(mocks.withdraw).toHaveBeenCalledTimes(2));
+    creations[1](new Response('{}', { status: 400 }));
+    expect(await secondError).toMatchObject({ status: 400 });
+    const secondAttempt = groups.getRequest(source)?.attemptId;
+    expect(groups.getRequest(source)).toMatchObject({ status: 'failed', formClosePending: true });
+
+    releaseFirstWithdrawal(true);
+    expect(await firstError).toMatchObject({ status: 400 });
+    expect(groups.getRequest(source)).toMatchObject({ attemptId: secondAttempt, status: 'failed', formClosePending: true });
+    await retryPendingOncallHandoffs('app');
+    expect(groups.getRequest(source)).toMatchObject({ attemptId: secondAttempt, status: 'failed', formClosePending: false });
+    expect(mocks.update.mock.calls.filter(([, messageId]) => messageId === firstDraft.messageId)).toHaveLength(0);
+    expect(mocks.update.mock.calls.filter(([, messageId]) => messageId === secondDraft.messageId)).toHaveLength(1);
+    expect(creates()).toHaveLength(2);
+  });
+  it('points a closed thread card at the reply-card retry after a confirmed rejection', async () => {
+    const d = await open();
+    const respond = fetcher.getMockImplementation()!;
+    fetcher.mockImplementation((url: string, init?: RequestInit) => init?.method === 'POST'
+      ? Promise.resolve(new Response('{}', { status: 400 })) : respond(url, init));
+    const submit = event('oncall_group_form_botmux_submit', d);
+    submit.action.form_value = { oncall_field_0: '结账' };
+    await handleOncallFormAction(submit, 'app');
+    await vi.waitFor(() => expect(new OncallGroupStore(dir).getRequest(source)?.status).toBe('failed'));
+    const cancel = await handleOncallFormAction(event('oncall_group_form_cancel', d), 'app');
+    await cancel.afterAck?.();
+    const again = await handleOncallFormAction(event('oncall_group_form_submit', d), 'app');
+    expect(again.toast).toMatchObject({ type: 'info' });
+    expect(again.afterAck).toBeUndefined();
+    expect(new OncallGroupStore(dir).getRequest(source)?.status).toBe('failed');
+    expect(creates()).toHaveLength(1);
   });
 });
 

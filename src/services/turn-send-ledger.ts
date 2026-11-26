@@ -36,9 +36,13 @@ export interface TurnSendLedgerRecord extends TurnSendLedgerKey {
     fingerprint: string;
     messageId: string;
     deliveredAtMs: number;
-    /** Original provider dispatch start, used to restore bridge-marker time
-     *  windows after replay. Older records fall back to deliveredAtMs. */
+    /** Exact pre-dispatch send timestamp used for structured reply event_key
+     *  deduplication and for restoring bridge-marker windows after replay. */
     sentAtMs?: number;
+    /** Present only for internally derived replay-only timestamps. Explicitly
+     *  injected values (including master-era records without this marker) stay
+     *  visible in TurnSendLedgerResult. */
+    sentAtMsDerived?: true;
     /** Absorbed mid-turn follow-up turn IDs that this final structurally
      *  settled, persisted atomically so crash recovery in the catch-up loop
      *  settles them instead of promoting them as fresh execution turns. */
@@ -49,6 +53,7 @@ export interface TurnSendLedgerRecord extends TurnSendLedgerKey {
 export interface TurnSendLedgerResult {
   messageId: string;
   replayed: boolean;
+  sentAtMs?: number;
 }
 
 export interface NonIdempotentStepEffects {
@@ -101,6 +106,12 @@ export function turnSendLedgerSessionDir(dataDir: string, sessionId: string): st
  * and attachments. Once a turn has published a final answer, no other primary
  * route or recipient can mint a second one.
  */
+function normalizeSentAtMs(value: number | undefined): number | undefined {
+  if (value === undefined || !Number.isFinite(value)) return undefined;
+  const truncated = Math.trunc(value);
+  return Number.isSafeInteger(truncated) && truncated > 0 ? truncated : undefined;
+}
+
 export class TurnSendLedger {
   readonly directory: string;
 
@@ -182,7 +193,8 @@ export class TurnSendLedger {
     }
     if (record.final && (!record.final.fingerprint || !record.final.messageId
       || !Number.isFinite(record.final.deliveredAtMs)
-      || (record.final.sentAtMs !== undefined && !Number.isFinite(record.final.sentAtMs)))) {
+      || (record.final.sentAtMs !== undefined
+        && (!Number.isSafeInteger(record.final.sentAtMs) || record.final.sentAtMs <= 0)))) {
       throw new Error('Invalid turn-send final record');
     }
     const sequence = record.nonIdempotentSequence;
@@ -195,7 +207,8 @@ export class TurnSendLedger {
       !sequence.fingerprint
       || !sequence.target
       || !Number.isSafeInteger(sequence.stepCount)
-      || (sequence.sentAtMs !== undefined && !Number.isFinite(sequence.sentAtMs))
+      || (sequence.sentAtMs !== undefined
+        && (!Number.isSafeInteger(sequence.sentAtMs) || sequence.sentAtMs <= 0))
       || sequence.stepCount <= 0
       || !Number.isSafeInteger(sequence.completedSteps)
       || sequence.completedSteps < 0
@@ -463,7 +476,11 @@ export class TurnSendLedger {
       if (final.fingerprint !== this.fingerprint(renderedContent)) {
         throw new Error('本轮 final 已投递，但本次请求的目标、提及或附件与已投递请求不同；如需补充消息，请使用 --response-kind auxiliary');
       }
-      return { messageId: final.messageId, replayed: true };
+      return {
+        messageId: final.messageId,
+        replayed: true,
+        ...(final.sentAtMs !== undefined && final.sentAtMsDerived !== true ? { sentAtMs: final.sentAtMs } : {}),
+      };
     }, { maxWaitMs: 60_000 });
   }
 
@@ -472,14 +489,7 @@ export class TurnSendLedger {
     kind: TurnSendKind,
     renderedContent: string,
     dispatch: (providerUuid?: string) => Promise<string>,
-    options: {
-      fenced?: boolean;
-      providerUuid?: string;
-      reuseExistingFinal?: boolean;
-      beforeDispatch?: () => void;
-      noSideEffect?: (error: unknown) => boolean;
-      resolveSettledAbsorbedTurnIds?: () => string[] | undefined;
-    } = {},
+    options: { fenced?: boolean; providerUuid?: string; reuseExistingFinal?: boolean; sentAtMs?: number; beforeDispatch?: () => void; noSideEffect?: (error: unknown) => boolean; resolveSettledAbsorbedTurnIds?: () => string[] | undefined } = {},
   ): Promise<TurnSendLedgerResult> {
     this.ensureSessionDirectory(key);
     return withFileLock(this.recordPath(key), async () => {
@@ -504,7 +514,11 @@ export class TurnSendLedger {
         if (!options.reuseExistingFinal && record.final.fingerprint !== this.fingerprint(renderedContent)) {
           throw new Error('本轮 final 已投递，但本次请求的目标、提及或附件与已投递请求不同；如需补充消息，请使用 --response-kind auxiliary');
         }
-        return { messageId: record.final.messageId, replayed: true };
+        return {
+          messageId: record.final.messageId,
+          replayed: true,
+          ...(record.final.sentAtMs !== undefined && record.final.sentAtMsDerived !== true ? { sentAtMs: record.final.sentAtMs } : {}),
+        };
       }
 
       const fingerprint = this.fingerprint(renderedContent);
@@ -540,13 +554,17 @@ export class TurnSendLedger {
         throw error;
       }
       if (!messageId && kind === 'final') throw new Error('Missing primary message ID');
+      const normalizedSentAtMs = normalizeSentAtMs(options.sentAtMs ?? sentAtMs);
       if (kind === 'final') {
         const settledAbsorbedTurnIds = options.resolveSettledAbsorbedTurnIds?.();
         record.final = {
           fingerprint: this.fingerprint(renderedContent),
           messageId,
           deliveredAtMs: Date.now(),
-          sentAtMs,
+          ...(normalizedSentAtMs !== undefined ? { sentAtMs: normalizedSentAtMs } : {}),
+          ...(options.sentAtMs === undefined && normalizedSentAtMs !== undefined
+            ? { sentAtMsDerived: true as const }
+            : {}),
           ...(settledAbsorbedTurnIds && settledAbsorbedTurnIds.length > 0
             ? { settledAbsorbedTurnIds }
             : {}),
@@ -554,7 +572,13 @@ export class TurnSendLedger {
         delete record.publication;
         this.write(key, record);
       }
-      return { messageId, replayed: false };
+      return {
+        messageId,
+        replayed: false,
+        ...(options.sentAtMs !== undefined && normalizedSentAtMs !== undefined
+          ? { sentAtMs: normalizedSentAtMs }
+          : {}),
+      };
     }, { maxWaitMs: 60_000 });
   }
 
@@ -579,6 +603,7 @@ export class TurnSendLedger {
     stepCount: number,
     dispatchStep: (index: number, effects: NonIdempotentStepEffects) => Promise<void>,
     messageId: string,
+    options: { sentAtMs?: number } = {},
   ): Promise<TurnSendLedgerResult> {
     if (kind !== 'final') throw new Error('分块投递只允许 final 回复；请使用 --response-kind final');
     if (!Number.isSafeInteger(stepCount) || stepCount <= 0) throw new Error('Non-idempotent delivery sequence must contain at least one step');
@@ -592,7 +617,11 @@ export class TurnSendLedger {
         if (record.final.fingerprint !== fingerprint) {
           throw new Error('本轮 final 已投递，但本次请求的目标、提及或附件与已投递请求不同；如需补充消息，请使用 --response-kind auxiliary');
         }
-        return { messageId: record.final.messageId, replayed: true };
+        return {
+          messageId: record.final.messageId,
+          replayed: true,
+          ...(record.final.sentAtMs !== undefined && record.final.sentAtMsDerived !== true ? { sentAtMs: record.final.sentAtMs } : {}),
+        };
       }
 
       const sequence = record.nonIdempotentSequence ?? {
@@ -640,9 +669,24 @@ export class TurnSendLedger {
         this.write(key, record);
       }
 
-      record.final = { fingerprint, messageId, deliveredAtMs: Date.now(), sentAtMs: sequence.sentAtMs };
+      const normalizedSentAtMs = normalizeSentAtMs(options.sentAtMs ?? sequence.sentAtMs);
+      record.final = {
+        fingerprint,
+        messageId,
+        deliveredAtMs: Date.now(),
+        ...(normalizedSentAtMs !== undefined ? { sentAtMs: normalizedSentAtMs } : {}),
+        ...(options.sentAtMs === undefined && normalizedSentAtMs !== undefined
+          ? { sentAtMsDerived: true as const }
+          : {}),
+      };
       this.write(key, record);
-      return { messageId, replayed: false };
+      return {
+        messageId,
+        replayed: false,
+        ...(options.sentAtMs !== undefined && normalizedSentAtMs !== undefined
+          ? { sentAtMs: normalizedSentAtMs }
+          : {}),
+      };
     }, { maxWaitMs: 60_000 });
   }
 }
