@@ -723,6 +723,50 @@ describe('Botmux custom Oncall form', () => {
     expect(mocks.reply).not.toHaveBeenCalled();
     expect(mocks.remove).toHaveBeenCalledWith('app', d.messageId);
   });
+  it('keeps a stale ACK continuation from a failed attempt out of the replacement request', async () => {
+    const d = await open();
+    const respond = fetcher.getMockImplementation()!;
+    fetcher.mockImplementation((url: string, init?: RequestInit) => init?.method === 'POST'
+      ? Promise.resolve(new Response('{}', { status: 400 })) : respond(url, init));
+    const firstSubmit = event('oncall_group_form_botmux_submit', d);
+    firstSubmit.action.form_value = { oncall_field_0: '结账' };
+    const first = await handleOncallFormAction(firstSubmit, 'app');
+    const groups = new OncallGroupStore(dir);
+    await vi.waitFor(() => expect(groups.getRequest(source)?.status).toBe('failed'));
+    const firstAttempt = groups.getRequest(source)?.attemptId;
+    fetcher.mockImplementation((url: string, init?: RequestInit) => init?.method === 'POST'
+      ? Promise.resolve(response({ oncall_flow_id: '123', open_chat_id: 'oc_created' })) : respond(url, init));
+    const secondSubmit = event('oncall_group_form_botmux_submit', d);
+    secondSubmit.action.form_value = { oncall_field_0: '结账' };
+    const second = await handleOncallFormAction(secondSubmit, 'app');
+    await vi.waitFor(() => expect(groups.getRequest(source)?.status).toBe('succeeded'));
+    expect(groups.getRequest(source)?.attemptId).not.toBe(firstAttempt);
+    // The delayed continuation of the rejected attempt must not retire the live card.
+    await first.afterAck();
+    expect(mocks.withdraw).not.toHaveBeenCalled();
+    expect(await new OncallFormStore(dir).use('app', d.id, 'ou_owner',
+      async draft => draft.closed === true, { allowClosed: true })).toBe(false);
+    // The current attempt's own continuation still owns the cleanup.
+    await second.afterAck();
+    expect(mocks.withdraw).toHaveBeenCalledOnce();
+    expect(groups.getRequest(source)).toMatchObject({ status: 'succeeded', formClosePending: false });
+  });
+  it('points a closed thread card at the reply-card retry after a confirmed rejection', async () => {
+    const d = await open();
+    const respond = fetcher.getMockImplementation()!;
+    fetcher.mockImplementation((url: string, init?: RequestInit) => init?.method === 'POST'
+      ? Promise.resolve(new Response('{}', { status: 400 })) : respond(url, init));
+    const submit = event('oncall_group_form_botmux_submit', d);
+    submit.action.form_value = { oncall_field_0: '结账' };
+    await handleOncallFormAction(submit, 'app');
+    await vi.waitFor(() => expect(new OncallGroupStore(dir).getRequest(source)?.status).toBe('failed'));
+    const cancel = await handleOncallFormAction(event('oncall_group_form_cancel', d), 'app');
+    await cancel.afterAck?.();
+    const again = await handleOncallFormAction(event('oncall_group_form_submit', d), 'app');
+    expect(again.toast).toMatchObject({ type: 'info' });
+    expect(again.toast.content).toContain('本次发起失败');
+    expect(creates()).toHaveLength(1);
+  });
 });
 
 describe('classified native Oncall form handoff', () => {
