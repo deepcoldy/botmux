@@ -4550,16 +4550,13 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         : failedTurn.cliInput;
       const retryTurnId = `retry-${randomUUID()}`;
       const willUseLiveWorker = !!(ds.worker && !ds.worker.killed);
-      const shouldRebindHookEnvelope = !continueMode || (willUseLiveWorker && failedTurn.directFailure === true);
-      const replayed = shouldRebindHookEnvelope
-        ? prepareHookEnvelopeForReplay({
-          ds,
-          content: submittedContent,
-          turnId: retryTurnId,
-          hookEnvelope: failedTurn.hookEnvelope,
-          willUseLiveWorker,
-        })
-        : { content: submittedContent };
+      const replayed = prepareHookEnvelopeForReplay({
+        ds,
+        content: submittedContent,
+        turnId: retryTurnId,
+        hookEnvelope: failedTurn.hookEnvelope,
+        willUseLiveWorker,
+      });
       const retryInput = {
         content: replayed.content,
         ...(replayed.hookEnvelope ? { hookEnvelope: replayed.hookEnvelope } : {}),

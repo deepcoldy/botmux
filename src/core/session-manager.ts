@@ -131,7 +131,7 @@ import { escapeXmlTagLikeTokens } from '../utils/xml.js';
 import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { initialLinkRefSources } from './link-ref-turn.js';
 import type { LinkRefMode, LinkRefSourceType } from '../services/link-ref-types.js';
-import { writePromptContext } from '../services/prompt-context-store.js';
+import { removePromptContextForTurn, writePromptContext } from '../services/prompt-context-store.js';
 import { CLAUDE_STRIPPED_INVISIBLE_RE } from '../services/claude-transcript.js';
 import { hasInstalledPromptHookCached } from '../adapters/hook-installer.js';
 import { restoreCodexCleanupArchive } from '../services/codex-cleanup-archive.js';
@@ -1928,18 +1928,29 @@ export function buildNewTopicCliInput(
       .map((b) => b.text)
       .join('\n\n');
     if (!startsWithCliComposerPrefix(ptyText) && hookEnvelope.length <= HOOK_ENVELOPE_MAX_CHARS) {
-      if (hookEnvelope) writePromptContext(sessionId, hookTurnId, ptyText, hookEnvelope);
-      return finalizeCliTurnInput(
-        {
-          content: ptyText,
-          ...(hookEnvelope ? { hookEnvelope } : {}),
-          ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
-        },
-        userMessage,
-        { ...opts, attachments, cliId },
-      );
+      const writeResult = hookEnvelope
+        ? writePromptContext(sessionId, hookTurnId, ptyText, hookEnvelope, { rejectDuplicate: true })
+        : 'written';
+      if (writeResult === 'written') {
+        // An empty-envelope rebuild must not leave an earlier sidecar for this
+        // turn to inject stale metadata into the final prompt.
+        if (!hookEnvelope) removePromptContextForTurn(sessionId, hookTurnId);
+        return finalizeCliTurnInput(
+          {
+            content: ptyText,
+            ...(hookEnvelope ? { hookEnvelope } : {}),
+            ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
+          },
+          userMessage,
+          { ...opts, attachments, cliId },
+        );
+      }
+      // A duplicate outstanding prompt or a failed sidecar write must never
+      // send stripped text: remove only this turn's stale file and fall through
+      // to the complete inline prompt below.
+      removePromptContextForTurn(sessionId, hookTurnId);
     }
-    // 首字节 `!`/`/` 或超限（>8k）→ 回退 inline，保留 `<user_message>` 外壳。
+    // 首字节 `!`/`/`、同指纹并发轮或超限（>8k）→ 回退 inline，保留 `<user_message>` 外壳。
   }
   const content = buildNewTopicPrompt(
     userMessage, sessionId, cliId, cliPathOverride, attachments, mentions,
@@ -2682,18 +2693,24 @@ export function buildFollowUpCliInput(
       .map((b) => b.text)
       .join('\n\n');
     if (!startsWithCliComposerPrefix(ptyText) && hookEnvelope.length <= HOOK_ENVELOPE_MAX_CHARS) {
-      if (hookEnvelope) writePromptContext(sessionId, hookTurnId, ptyText, hookEnvelope);
-      return finalizeCliTurnInput(
-        {
-          content: ptyText,
-          ...(hookEnvelope ? { hookEnvelope } : {}),
-          ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
-        },
-        content,
-        opts,
-      );
+      const writeResult = hookEnvelope
+        ? writePromptContext(sessionId, hookTurnId, ptyText, hookEnvelope, { rejectDuplicate: true })
+        : 'written';
+      if (writeResult === 'written') {
+        if (!hookEnvelope) removePromptContextForTurn(sessionId, hookTurnId);
+        return finalizeCliTurnInput(
+          {
+            content: ptyText,
+            ...(hookEnvelope ? { hookEnvelope } : {}),
+            ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
+          },
+          content,
+          opts,
+        );
+      }
+      removePromptContextForTurn(sessionId, hookTurnId);
     }
-    // 首字节 `!`/`/` 或超限（>8k）→ 回退 inline。
+    // 首字节 `!`/`/`、同指纹并发轮、写盘失败或超限（>8k）→ 回退完整 inline。
   }
   const legacyContent = buildFollowUpContent(content, sessionId, opts);
   if (opts?.cliId !== 'codex-app' || opts.isAdoptMode) {

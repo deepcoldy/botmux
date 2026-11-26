@@ -122,7 +122,7 @@ import { buildFollowUpCliInput, buildNewTopicCliInput, promptHookRunsInCli } fro
 import { plannedOpeningBackendType } from '../src/core/opening-backend.js';
 import { prepareHookEnvelopeForReplay } from '../src/core/prompt-hook-replay.js';
 import { DEFAULT_CLAUDE_DATA_DIR, sanitizeClaudeInput } from '../src/adapters/cli/claude-code.js';
-import { claimPromptContext, fingerprintPromptText, prefixOf } from '../src/services/prompt-context-store.js';
+import { claimPromptContext, claimPromptContextAmongTurns, fingerprintPromptText, prefixOf } from '../src/services/prompt-context-store.js';
 
 const SESSION_ID = 'hook-session-789';
 const LARK_APP_ID = 'app_test';
@@ -216,6 +216,41 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     // hook 模式用描述式文案（命令式原文只出现在 inline 路径）
     expect(envelope).toContain('本会话通过 botmux 桥接飞书');
     expect(envelope).not.toContain('至少 botmux send 回应一次');
+  });
+
+  it('相同正文的后续 type-ahead 自动保留完整 inline，首轮仍可唯一 claim', () => {
+    const first = buildFollowUpCliInput('继续', SESSION_ID, followUpOpts({ turnId: 'turn-duplicate-A' }));
+    const second = buildFollowUpCliInput('继续', SESSION_ID, followUpOpts({ turnId: 'turn-duplicate-B' }));
+    expect(first.content).toBe('继续');
+    expect(second.content).toContain('<user_message>');
+    expect(second.content).toContain('<botmux_reminder>');
+    expect(second.hookEnvelope).toBeUndefined();
+
+    const claimed = claimPromptContextAmongTurns(
+      SESSION_ID,
+      ['turn-duplicate-A', 'turn-duplicate-B'],
+      fingerprintPromptText(first.content),
+      prefixOf(first.content),
+    );
+    expect(claimed?.turnId).toBe('turn-duplicate-A');
+    expect(claimed?.envelope).toContain('<botmux_reminder>');
+    expect(claimByPrompt(SESSION_ID, 'turn-duplicate-B', second.content)).toBeUndefined();
+  });
+
+  it('sidecar 写盘失败时回退完整 inline，而不是发送去壳正文', async () => {
+    const fs = await import('node:fs');
+    fs.mkdirSync('/tmp', { recursive: true });
+    fs.rmSync('/tmp/test-sessions', { recursive: true, force: true });
+    fs.writeFileSync('/tmp/test-sessions', 'not a directory');
+    try {
+      const result = buildFollowUpCliInput('task requiring delivery', SESSION_ID, followUpOpts({ turnId: 'turn-write-failed' }));
+      expect(result.content).toContain('<user_message>');
+      expect(result.content).toContain('<botmux_reminder>');
+      expect(result.hookEnvelope).toBeUndefined();
+    } finally {
+      fs.rmSync('/tmp/test-sessions', { force: true, recursive: true });
+      fs.mkdirSync('/tmp/test-sessions', { recursive: true });
+    }
   });
 
   it('兼容忽略遗留配置字段 envelopeInjection（off/auto）并默认走 hook 模式', () => {

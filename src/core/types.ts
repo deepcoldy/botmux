@@ -1023,6 +1023,9 @@ export interface DaemonSession {
     failedTurnId: string;
     mode: 'merge' | 'resend';
     content: string;
+    /** Envelope that will remain sidecar-injected in the final rewritten input;
+     * absent when the directive restored it inline. */
+    hookEnvelope?: string;
     failedUserPrompt: string;
     /** The worker process that was asked; another one never answers. */
     worker: DaemonSession['worker'];

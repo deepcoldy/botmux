@@ -33,6 +33,7 @@ const {
   removePromptContextDir,
   removePromptContextForTurn,
   rekeyPromptContext,
+  rekeyPromptContextWithFallback,
 } = await import('../src/services/prompt-context-store.js');
 
 /** 测试辅助：模拟 hook 客户端——按 prompt 文本算指纹 + 前缀后，按 turnId claim。 */
@@ -312,6 +313,41 @@ describe('prompt-context-store', () => {
     expect(claimPromptContext('sess-chain', 'turn-chain', fingerprintPromptText(step1))).toBeUndefined();
     expect(claimPromptContext('sess-chain', 'turn-chain', fingerprintPromptText(step2))).toBeUndefined();
     expect(claimPromptContext('sess-chain', 'turn-chain', fingerprintPromptText(step3))).toBe('<sender name="U" />');
+  });
+
+  it('rekey 遇到另一轮同指纹时回退 inline，并保留另一轮 sidecar', () => {
+    const shared = '相同正文';
+    writePromptContext('sess-rekey-dup', 'turn-A', shared, 'ENV_A');
+    writePromptContext('sess-rekey-dup', 'turn-B', '旧正文', 'ENV_B');
+    const result = rekeyPromptContextWithFallback({
+      sessionId: 'sess-rekey-dup', turnId: 'turn-B',
+      previousPtyText: '旧正文', nextPtyText: shared, hookEnvelope: 'ENV_B',
+    });
+    expect(result.content).toBe('ENV_B\n\n相同正文');
+    expect(result.hookEnvelope).toBeUndefined();
+    expect(claimByPrompt('sess-rekey-dup', 'turn-A', shared)).toBe('ENV_A');
+    expect(claimByPrompt('sess-rekey-dup', 'turn-B', '旧正文')).toBeUndefined();
+  });
+
+  it('rekey 写盘失败时用 payload 信封回退完整 inline', () => {
+    const blocked = join(tmpRoot, 'not-a-directory');
+    writeFileSync(blocked, 'x');
+    process.env.SESSION_DATA_DIR = blocked;
+    const result = rekeyPromptContextWithFallback({
+      sessionId: 'sess-rekey-io', turnId: 'turn-io',
+      previousPtyText: 'before', nextPtyText: 'after', hookEnvelope: 'ENV_IO',
+    });
+    expect(result.content).toBe('ENV_IO\n\nafter');
+    expect(result.hookEnvelope).toBeUndefined();
+  });
+
+  it('rekey 正文未变但 sidecar 丢失时按最终正文重建', () => {
+    const result = rekeyPromptContextWithFallback({
+      sessionId: 'sess-rekey-missing', turnId: 'turn-missing',
+      previousPtyText: 'same', nextPtyText: 'same', hookEnvelope: 'ENV_MISSING',
+    });
+    expect(result.hookEnvelope).toBe('ENV_MISSING');
+    expect(claimByPrompt('sess-rekey-missing', 'turn-missing', 'same')).toBe('ENV_MISSING');
   });
 
   it('maintains single-sidecar-per-turn invariant when writePromptContext rebuilds the same turnId', () => {

@@ -9,7 +9,7 @@ import { refreshSessionPluginManifest, type SessionPluginManifest } from './sess
 import { refreshSessionMcpRuntimeManifest } from './mcp/session-runtime.js';
 import { resolvePluginSkillPackages } from './skills.js';
 import { assertNoGlobalBotmuxSkills } from '../../skills/zero-injection.js';
-import { rekeyPromptContext } from '../../services/prompt-context-store.js';
+import { rekeyPromptContextWithFallback } from '../../services/prompt-context-store.js';
 
 export interface CliPluginGenerationResult {
   pluginManifest: SessionPluginManifest;
@@ -113,7 +113,13 @@ export function prepareCliPluginGeneration(opts: {
     deferredSkillCatalog = catalog;
   }
   if (!delivery.fatal && opts.turnId && prompt !== opts.prompt) {
-    rekeyPromptContext(opts.sessionId, opts.turnId, opts.prompt, prompt, opts.dataDir);
+    prompt = rekeyPromptContextWithFallback({
+      sessionId: opts.sessionId,
+      turnId: opts.turnId,
+      previousPtyText: opts.prompt,
+      nextPtyText: prompt,
+      dataDir: opts.dataDir,
+    }).content;
   }
 
   return {

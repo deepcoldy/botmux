@@ -367,6 +367,13 @@ export interface FailedTurnRewindDirective {
   mode: 'resend' | 'merge';
   /** What the CLI gets once the turn is cut. */
   content: string;
+  /** The final content already carries every hook envelope inline. The worker
+   * must retire (not rekey) this turn's sidecar only after the rewritten input
+   * is accepted; a failed respawn keeps the original sidecar for rollback. */
+  inlineEnvelope?: true;
+  /** Envelope expected to remain in this turn's sidecar for a resend. Kept so
+   * the worker can inline it after a rekey failure or restore it on rollback. */
+  hookEnvelope?: string;
 }
 
 /** Stable human/bot identity used only for principal-lane routing.  The
@@ -3280,6 +3287,8 @@ export type WorkerToDaemonBase =
       turnId: string;
       failedTurnId: string;
       outcome: 'rewound' | 'declined';
+      /** The final rewritten input no longer uses its sidecar. */
+      inlineEnvelope?: true;
       reason: string;
     }
   | { type: 'adopt_preamble'; userText: string; assistantText: string; turnId?: string }

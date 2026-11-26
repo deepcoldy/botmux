@@ -110,6 +110,7 @@ import {
   isAuthoritativeSubmitSendMarker,
 } from '../../src/services/submit-confirmation.js';
 import { sanitizeClaudeInput } from '../../src/adapters/cli/claude-code.js';
+import { removePromptContextForTurn, rekeyPromptContextWithFallback, writePromptContext } from '../../src/services/prompt-context-store.js';
 
 /** Failed-turn rewind wiring that emitTurnTerminal, flushPending and
  *  handleTermAction call into (see src/worker.ts startFailedTurnRewind):
@@ -117,6 +118,7 @@ import { sanitizeClaudeInput } from '../../src/adapters/cli/claude-code.js';
  *  its old behaviour. */
 const FAILED_TURN_REWIND_FUNCTIONS = [
   'turnFailedWithoutOutput', 'failedTurnRewindWriteEdge', 'stopHeldFailedTurnRewind',
+  'retireInlineRewindSidecar',
   'waitForRetiringCliQuiescence', 'putBackFailedTurnCut', 'dropStoppedRewindMessage',
   'putBackStoppedRewindCutBeforeWrites', 'restartToPutBackCut', 'settleFailedTurnRewindOffQueue',
   'handOverFailedTurnRewind', 'failedTurnTranscriptScope',
@@ -489,6 +491,9 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
     if (key === 'isAuthoritativeSubmitSendMarker') return isAuthoritativeSubmitSendMarker;
     if (key === 'randomBytes') return randomBytes;
     if (key === 'sanitizeClaudeInput') return sanitizeClaudeInput;
+    if (key === 'rekeyPromptContextWithFallback') return rekeyPromptContextWithFallback;
+    if (key === 'removePromptContextForTurn') return removePromptContextForTurn;
+    if (key === 'writePromptContext') return writePromptContext;
     if (typeof key === 'string' && ['retireAntigravityBridgeTurn', 'rebindAntigravityBridgeTurn', 'warnPromptReadySkipped', 'cancelTurnTerminalReadyRecovery', 'recoverDeferredPromptReadyAtTurnTerminal', 'markPromptReadyFromBusyProbe', 'traexNativeStartupInputIsPending', 'isTraexTmuxViewportBackend', 'isTraexHcViewportBackend', 'isTraexNativeViewportBackend', 'currentTraexCliLifetimeNonce', 'currentTraexGridRevision', 'currentTraexControlWriteRevision', 'currentTraexInterruptGeneration', 'clearTraexStartupWebRecheck', 'currentWebResizedGridFor', 'syncHcPaneSizeFor', 'invalidateTraexNativeViewportEvidence', 'activeTraexNativeViewportEvidence', 'readTraexStartupViewportScreen', 'traexWebInputSettleStatus', 'traexNativeStartupScreenAdmitsPure', 'traexPromptReadyGateBlocks', 'probeAndPublishTraexNativeViewport', 'scheduleTraexNativeViewportRefreshIfNeeded', 'readinessTrackedInput', 'invalidatePromptReadinessEvidence', 'revokePromptReadiness', 'codexAppRuntimeTypeAheadReady', 'sessionEventMetadata', 'bindSessionObservation', 'bindSessionPhysicalObservation', 'bindSessionExecutionEvent', 'restoreCodexAppContractNativeSession', 'backgroundTranscriptChainFilePath', 'persistBackgroundTranscriptChain', 'latestClosedTranscriptOffset', 'prepareBackgroundTranscriptReplay', 'recordBackgroundTranscriptRotation', 'isClaudeFamilyCli', 'spawnCliBody', 'deferSessionReadyUntilRuntimeAssigned', 'takeDeferredSessionReady', 'replayDeferredSessionReady', 'clearDeferredSessionReady', 'setCaptureIdentity', 'cotEntryWellFormed', 'cotEntryWithoutSentinel', 'clearCodexAppInterruptTarget', 'publishAppliedReasoningSelection', 'publishNativeReasoningFooter', 'publishNativeReasoningObservation', 'notifyTraexCatalogEmpty', 'admitTraexCatalogModelBeforeInput', 'requeueUnsubmittedQueuedActivation', 'acknowledgeQueuedActivationToken', 'probeAuthoritativeQueuedActivationEvidence', 'observeAuthoritativeClaudeTurnStart', 'observeAuthoritativeStructuredTurnStart', 'claudeActivationTranscriptPathAllowed', 'prepareAntigravityAccountsCredentialMask', 'reconcileAntigravitySpawnAccount', 'confirmAntigravitySpawnAccount', 'currentAntigravityWrittenInput', 'resetAntigravityNativeQuotaLog', 'cancelAntigravityFoldedReconcilePending', 'armAntigravityFoldedReconcilePending', 'tryReconcilePendingAntigravityFoldedTurns', ...TRAEX_QUESTION_FUNCTIONS, ...FAILED_TURN_REWIND_FUNCTIONS].includes(key)) {
       if (!dependencies.has(key)) dependencies.set(key, loadWorkerFunction(key, scope));
       return dependencies.get(key);

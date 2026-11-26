@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { isCliStartupFailure } from './core/cli-startup-failure.js';
-import { fingerprintPromptText, rekeyPromptContext } from './services/prompt-context-store.js';
+import { fingerprintPromptText, removePromptContextForTurn, rekeyPromptContextWithFallback } from './services/prompt-context-store.js';
 import { readLatestNativeGoal, readNativeGoalForRollout } from './services/native-goal-state.js';
 import { WorkerSessionEventScope, type RuntimeEventBinding, type CapturedSessionOrigin } from './services/session-event-scope.js';
 import { admitSessionCommand } from './services/session-command-gateway.js';
@@ -2950,8 +2950,13 @@ function attachDeferredPluginSkillCatalog(item: PendingCliInput): void {
   } else {
     const previousContent = item.content;
     item.content = `${item.content}\n\n${deferredPluginSkillCatalog}`;
-    if (typeof rekeyPromptContext === 'function' && typeof sessionId === 'string' && sessionId && item.turnId) {
-      rekeyPromptContext(sessionId, item.turnId, previousContent, item.content);
+    if (typeof sessionId === 'string' && sessionId && item.turnId) {
+      item.content = rekeyPromptContextWithFallback({
+        sessionId,
+        turnId: item.turnId,
+        previousPtyText: previousContent,
+        nextPtyText: item.content,
+      }).content;
     }
   }
   if (item.codexAppInput) {
@@ -11788,8 +11793,13 @@ function deliverRestartInterruptionNote(): void {
       // follows.
       const previousContent = head.content;
       Object.assign(head, prefixRestartNote(head, note));
-      if (head.content !== previousContent && typeof rekeyPromptContext === 'function' && typeof sessionId === 'string' && sessionId && head.turnId) {
-        rekeyPromptContext(sessionId, head.turnId, previousContent, head.content);
+      if (head.content !== previousContent && typeof sessionId === 'string' && sessionId && head.turnId) {
+        head.content = rekeyPromptContextWithFallback({
+          sessionId,
+          turnId: head.turnId,
+          previousPtyText: previousContent,
+          nextPtyText: head.content,
+        }).content;
       }
       delivered = true;
     }
@@ -44180,6 +44190,9 @@ interface FailedTurnRewindInFlight {
    *  and a cut that landed is put back — the conversation ends as it was
    *  before the message came (see stopHeldFailedTurnRewind). */
   stopped: boolean;
+  /** The rewritten content is self-contained; retire its old sidecar only when
+   * that content actually reaches a write edge or a successor worker. */
+  inlineEnvelope: boolean;
   report: (outcome: 'rewound' | 'declined', reason: string) => void;
 }
 interface FailedTurnCut {
@@ -44230,12 +44243,16 @@ function startFailedTurnRewind(
   // the rewind settled (core/rewind-backup-retention.ts), this backup left
   // alone, without holding anything up.
   let landedBackup: string | undefined;
+  let finalEnvelopeInline = directive.inlineEnvelope === true;
   const dataDir = process.env.SESSION_DATA_DIR;
   const report = (outcome: 'rewound' | 'declined', reason: string): void => {
     if (reported) return;
     reported = true;
     log(`Failed-turn rewind ${outcome} for ${directive.failedTurnId.slice(0, 16)} → ${(turnId ?? '-').slice(0, 16)} (${directive.mode}): ${reason}`);
-    send({ type: 'failed_turn_rewind', turnId: turnId ?? '', failedTurnId: directive.failedTurnId, outcome, reason });
+    send({
+      type: 'failed_turn_rewind', turnId: turnId ?? '', failedTurnId: directive.failedTurnId,
+      outcome, reason, ...(finalEnvelopeInline ? { inlineEnvelope: true as const } : {}),
+    });
     if (landedBackup) void pruneRewindBackupsBeside(landedBackup, { dataDir, log });
   };
   const target = resolvePurgeResumeTarget(
@@ -44279,7 +44296,7 @@ function startFailedTurnRewind(
     enqueueMessage();
     return;
   }
-  const state: FailedTurnRewindInFlight = { queued: undefined, stopped: false, report };
+  const state: FailedTurnRewindInFlight = { queued: undefined, stopped: false, inlineEnvelope: finalEnvelopeInline, report };
   failedTurnRewindInFlight = state;
   void restartCliProcess('cut a turn that failed without output', {
     immediate: true,
@@ -44328,15 +44345,31 @@ function startFailedTurnRewind(
       state.cut = cut;
       const previousQueuedContent = queued.content;
       queued.content = rewoundContent(directive.content, outcome.suffix);
-      if (typeof rekeyPromptContext === 'function' && typeof sessionId === 'string' && sessionId && queued.turnId) {
-        rekeyPromptContext(sessionId, queued.turnId, previousQueuedContent, queued.content);
+      if (!finalEnvelopeInline && typeof sessionId === 'string' && sessionId && queued.turnId) {
+        const rekeyed = rekeyPromptContextWithFallback({
+          sessionId,
+          turnId: queued.turnId,
+          previousPtyText: previousQueuedContent,
+          nextPtyText: queued.content,
+          hookEnvelope: directive.hookEnvelope,
+        });
+        queued.content = rekeyed.content;
+        if (directive.hookEnvelope && !rekeyed.hookEnvelope) {
+          finalEnvelopeInline = true;
+          state.inlineEnvelope = true;
+        }
       }
     },
     onRespawnSettled: result => {
       if (result !== 'failed') {
         // Nothing was cut (declined above, or the restart ended before the
-        // cut): the message goes in unchanged.
+        // cut): the message goes in unchanged and keeps its original sidecar.
         if (!state.cut) report('declined', `restart ${result} before the cut`);
+        else if (finalEnvelopeInline) {
+          // The inline rewrite is now owned by the new CLI generation. Retire
+          // the old sidecar only here, never before a possible rollback.
+          retireInlineRewindSidecar(state);
+        }
         return;
       }
       // The worker exits right after a failed spawn. Leave the conversation
@@ -44345,14 +44378,33 @@ function startFailedTurnRewind(
       const cut = state.cut;
       if (cut && putBackFailedTurnCut(cut)) {
         state.cut = undefined;
+        let restoredInline = directive.mode === 'resend' && directive.inlineEnvelope === true;
         if (state.queued) {
-          const previousQueuedContent = state.queued.content;
+          const rewrittenContent = state.queued.content;
           state.queued.content = cut.plainContent;
-          if (typeof rekeyPromptContext === 'function' && typeof sessionId === 'string' && sessionId && state.queued.turnId) {
-            rekeyPromptContext(sessionId, state.queued.turnId, previousQueuedContent, state.queued.content);
+          if (directive.hookEnvelope && typeof sessionId === 'string' && sessionId && state.queued.turnId) {
+            // Roll back the sidecar with the same checked semantics as the cut.
+            // If restoring it also fails, hand the successor a complete inline
+            // input rather than a stripped body with an unclaimable envelope.
+            const restored = rekeyPromptContextWithFallback({
+              sessionId,
+              turnId: state.queued.turnId,
+              previousPtyText: rewrittenContent,
+              nextPtyText: cut.plainContent,
+              hookEnvelope: directive.hookEnvelope,
+            });
+            state.queued.content = restored.content;
+            restoredInline = !restored.hookEnvelope;
           }
         }
+        finalEnvelopeInline = restoredInline;
+        state.inlineEnvelope = restoredInline;
         report('declined', 'restart failed after the cut; cut restored');
+      }
+      if (finalEnvelopeInline && state.cut) {
+        // The cut could not be put back: the successor receives the inline
+        // rewrite, so its old sidecar must not inject a second copy.
+        retireInlineRewindSidecar(state);
       }
       // Without this the held message dies with the worker; the next worker
       // writes what it finds here (the old flow never restarted, so it was
@@ -44406,6 +44458,12 @@ function putBackFailedTurnCut(cut: FailedTurnCut): boolean {
   }
 }
 
+/** Retire a rewritten turn's sidecar at its irreversible delivery boundary. */
+function retireInlineRewindSidecar(held: FailedTurnRewindInFlight): void {
+  if (!held.inlineEnvelope || !held.queued?.turnId || typeof sessionId !== 'string' || !sessionId) return;
+  removePromptContextForTurn(sessionId, held.queued.turnId);
+}
+
 /** A message the user stopped while a failed-turn rewind held it, taken out
  *  of the queue: it ended without reaching the CLI. */
 function dropStoppedRewindMessage(item: PendingCliInput): void {
@@ -44423,7 +44481,10 @@ function failedTurnRewindWriteEdge(item: PendingCliInput): 'write' | 'stopped' {
   if (!held || held.queued !== item) return 'write';
   failedTurnRewindInFlight = null;
   if (!held.stopped) {
-    if (held.cut) held.report('rewound', held.cut.reason);
+    if (held.cut) {
+      retireInlineRewindSidecar(held);
+      held.report('rewound', held.cut.reason);
+    }
     return 'write';
   }
   if (held.cut) restartToPutBackCut(held, held.cut);
@@ -44516,6 +44577,7 @@ function handOverFailedTurnRewind(): void {
       ? `stopped after the cut; the worker is going away, cut NOT restored (backup ${held.cut.backupPath})`
       : 'stopped before it reached the CLI');
   } else if (held.cut) {
+    if (handedOn) retireInlineRewindSidecar(held);
     held.report(handedOn ? 'rewound' : 'declined', handedOn
       ? `${held.cut.reason}; handed to the next worker`
       : `not saved for the next worker; cut NOT restored (backup ${held.cut.backupPath})`);

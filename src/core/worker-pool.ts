@@ -4001,32 +4001,35 @@ export function ensureOrdinaryTurnRecoveryAttached(
       if (silent) armSilentScheduledTurn(ds, dispatch.turnId);
       let enqueued = false;
       try {
-        if (!ds.worker || ds.worker.killed || ds.worker.connected === false) {
-          enqueued = forkWorker(
+        const willUseLiveWorker = !!(ds.worker && !ds.worker.killed && ds.worker.connected !== false);
+        const isClaude = sessionCliId(ds, botCfg) === 'claude-code';
+        const failedTurn = ds.session.lastFailedTurn;
+        const logicalHookEnvelope = ds.session.ordinaryTurnRecovery?.retryInputs?.[dispatch.logicalTurnId]?.hookEnvelope
+          ?? (failedTurn?.turnId === dispatch.logicalTurnId ? failedTurn.hookEnvelope : undefined);
+        // Every continuation needs the original delivery envelope: hook context
+        // is not present in the resumed transcript. Only an actual replay may
+        // change the payload shape; other CLIs keep their legacy string input.
+        const replayed = isClaude && logicalHookEnvelope
+          ? prepareHookEnvelopeForReplay({
             ds,
-            trustedCaller ? { content: dispatch.prompt, trustedCaller } : dispatch.prompt,
-            { resume: true, turnId: dispatch.turnId },
-          );
+            content: dispatch.prompt,
+            turnId: dispatch.turnId,
+            hookEnvelope: logicalHookEnvelope,
+            willUseLiveWorker,
+          })
+          : undefined;
+        if (!willUseLiveWorker) {
+          const forkInput = replayed
+            ? { ...replayed, ...(trustedCaller ? { trustedCaller } : {}) }
+            : trustedCaller ? { content: dispatch.prompt, trustedCaller } : dispatch.prompt;
+          enqueued = forkWorker(ds, forkInput, { resume: true, turnId: dispatch.turnId });
         } else {
           // A turn that failed without any output is cut first and its input
           // re-sent instead of the recovery prompt: nothing ran, so there is
           // no checkpoint to continue from (core/failed-turn-rewind.ts).
-          const isClaude = sessionCliId(ds, botCfg) === 'claude-code';
-          const failedTurn = ds.session.lastFailedTurn;
-          const logicalHookEnvelope = ds.session.ordinaryTurnRecovery?.retryInputs?.[dispatch.logicalTurnId]?.hookEnvelope
-            ?? (failedTurn?.turnId === dispatch.logicalTurnId ? failedTurn.hookEnvelope : undefined);
-          const replayed = isClaude && failedTurn?.directFailure === true && logicalHookEnvelope
-            ? prepareHookEnvelopeForReplay({
-              ds,
-              content: dispatch.prompt,
-              turnId: dispatch.turnId,
-              hookEnvelope: logicalHookEnvelope,
-              willUseLiveWorker: true,
-            })
-            : { content: dispatch.prompt };
           enqueued = sendWorkerInput(
             ds,
-            replayed,
+            replayed ?? dispatch.prompt,
             dispatch.turnId,
             {
               ...(trustedCaller ? { trustedCaller } : {}),
@@ -19054,6 +19057,7 @@ function failedTurnRewindForInput(
     record: ds.session.lastFailedTurn,
     turnId,
     content: payload.content,
+    nextHookEnvelope: payload.hookEnvelope,
     mode,
   });
 }
@@ -19086,7 +19090,7 @@ function mergeKeepsFailedInputDelivered(
  *  joins the chain whose card is updated in place. */
 export function applyFailedTurnRewindResult(
   ds: DaemonSession,
-  result: { turnId: string; failedTurnId: string; outcome: 'rewound' | 'declined'; reason: string },
+  result: { turnId: string; failedTurnId: string; outcome: 'rewound' | 'declined'; inlineEnvelope?: true; reason: string },
 ): void {
   const pending = ds.pendingFailedTurnRewinds?.get(result.turnId);
   ds.pendingFailedTurnRewinds?.delete(result.turnId);
@@ -19103,9 +19107,7 @@ export function applyFailedTurnRewindResult(
   // meanwhile (it queued behind this one's restart): that one keeps it.
   // Inputs never remembered as latest (an automatic continuation) leave the
   // failed turn as the latest, which they now replace.
-  const carriedHookEnvelope = ds.session.lastFailedTurn?.turnId === result.failedTurnId
-    ? ds.session.lastFailedTurn.hookEnvelope
-    : undefined;
+  const carriedHookEnvelope = result.inlineEnvelope ? undefined : pending.hookEnvelope;
   if (ds.lastCliInputTurnId === result.turnId || ds.lastCliInputTurnId === result.failedTurnId) {
     const userPrompt = pending.mode === 'merge' && ds.lastCliInputTurnId === result.turnId && ds.lastUserPrompt
       ? mergeFailedTurnInput(pending.failedUserPrompt, ds.lastUserPrompt)
@@ -19119,12 +19121,16 @@ export function applyFailedTurnRewindResult(
     if (carriedHookEnvelope) {
       ds.lastHookEnvelope = carriedHookEnvelope;
       ds.session.lastHookEnvelope = carriedHookEnvelope;
+    } else {
+      delete ds.lastHookEnvelope;
+      delete ds.session.lastHookEnvelope;
     }
   }
   const retryInput = ds.session.ordinaryTurnRecovery?.retryInputs?.[result.turnId];
   if (retryInput) {
     retryInput.cliInput = pending.content;
     if (carriedHookEnvelope) retryInput.hookEnvelope = carriedHookEnvelope;
+    else delete retryInput.hookEnvelope;
   }
   if (ds.session.lastFailedTurn?.turnId === result.failedTurnId) delete ds.session.lastFailedTurn;
   const previous = ds.session.failedTurnRewindChain;
@@ -19271,6 +19277,7 @@ export function sendWorkerInput(
         userPrompt: normalized.content,
         cliInput: {
           content: normalized.content,
+          ...(normalized.hookEnvelope ? { hookEnvelope: normalized.hookEnvelope } : {}),
           ...(normalized.codexAppInput
             ? { codexAppInput: normalized.codexAppInput }
             : {}),
@@ -19466,6 +19473,9 @@ export function sendWorkerInput(
       failedTurnId: failedTurnRewind.failedTurnId,
       mode: failedTurnRewind.mode,
       content: failedTurnRewind.content,
+      ...(!failedTurnRewind.inlineEnvelope && normalized.hookEnvelope
+        ? { hookEnvelope: normalized.hookEnvelope }
+        : {}),
       failedUserPrompt: ds.session.lastFailedTurn?.userPrompt ?? failedTurnRewind.failedInput,
       worker: ds.worker,
     });
@@ -19888,6 +19898,7 @@ export function promoteQueuedActivationTail(
   );
   let exactInput: CliTurnPayload = {
     content: head.cliInput.content,
+    ...(head.cliInput.hookEnvelope ? { hookEnvelope: head.cliInput.hookEnvelope } : {}),
     ...(codexAppInput ? { codexAppInput } : {}),
     ...(head.cliInput.linkRefs ? { linkRefs: head.cliInput.linkRefs } : {}),
     // R5-B1-2: preserve the frozen steer authorization onto the promoted
@@ -20100,6 +20111,7 @@ export function admitQueuedActivationTail(
     ...entry,
     cliInput: {
       content: frozenInput.content,
+      ...(frozenInput.hookEnvelope ? { hookEnvelope: frozenInput.hookEnvelope } : {}),
       ...(acceptedCodexAppInput ? { codexAppInput: acceptedCodexAppInput } : {}),
       ...(frozenInput.linkRefs ? { linkRefs: frozenInput.linkRefs } : {}),
       // R5-B1-2: preserve the frozen steer authorization across the tail rebuild
@@ -20738,6 +20750,7 @@ function queueBehindPendingProtectedHttpEgressFork(
         userPrompt: payload.content,
         cliInput: {
           content: payload.content,
+          ...(payload.hookEnvelope ? { hookEnvelope: payload.hookEnvelope } : {}),
           ...(payload.codexAppInput ? { codexAppInput: payload.codexAppInput } : {}),
           ...(payload.linkRefs ? { linkRefs: payload.linkRefs } : {}),
           ...(payload.codexAppSteerable === true ? { codexAppSteerable: true as const } : {}),
@@ -21329,6 +21342,7 @@ function forkWorkerPrepared(
         userPrompt: prompt,
         cliInput: {
           content: prompt,
+          ...(promptPayload.hookEnvelope ? { hookEnvelope: promptPayload.hookEnvelope } : {}),
           ...(promptPayload.codexAppInput
             ? { codexAppInput: promptPayload.codexAppInput }
             : {}),

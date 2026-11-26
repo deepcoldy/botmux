@@ -6,7 +6,7 @@ import { botHomePath } from '../adapters/cli/read-isolation.js';
 import { resolveSandboxMode, resolveSpawnNetworkShape } from '../adapters/cli/sandbox-mode.js';
 import { hasInstalledPromptHookCached } from '../adapters/hook-installer.js';
 import { credentialSourceForcesBotHome } from '../services/cli-credential-source.js';
-import { writePromptContext } from '../services/prompt-context-store.js';
+import { inlinePromptContext, removePromptContextForTurn, writePromptContext } from '../services/prompt-context-store.js';
 import { assistantUserHome, isValidAssistantOpenId } from './assistant-mode.js';
 import { cliSupportsConfigDir } from './cli-config-dir.js';
 import type { DaemonSession } from './types.js';
@@ -105,9 +105,12 @@ export function prepareHookEnvelopeForReplay(input: {
 }): { content: string; hookEnvelope?: string } {
   const { ds, content, turnId, hookEnvelope, willUseLiveWorker } = input;
   if (!hookEnvelope) return { content };
-  if (willUseLiveWorker && canReplayViaLivePromptHook(ds)) {
-    writePromptContext(ds.session.sessionId, turnId, content, hookEnvelope);
+  if (willUseLiveWorker && canReplayViaLivePromptHook(ds)
+    && writePromptContext(ds.session.sessionId, turnId, content, hookEnvelope, { rejectDuplicate: true }) === 'written') {
     return { content, hookEnvelope };
   }
-  return { content: `${hookEnvelope}\n\n${content}` };
+  // Do not let an earlier build of this turn inject a stale envelope after the
+  // final payload has fallen back to inline. Other turns' duplicates stay put.
+  removePromptContextForTurn(ds.session.sessionId, turnId);
+  return { content: inlinePromptContext(content, hookEnvelope) };
 }
