@@ -4,7 +4,7 @@ import { basename, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
   countAntigravityUserInputMatches,
-  findCompletedAntigravityTurnIds,
+  findCompletedAntigravityTurnIdsPaired,
   hashAntigravitySubmittedText,
   resolveAntigravityCandidateMinByteOffset,
   resolveAntigravityTranscriptPath,
@@ -111,7 +111,7 @@ function workerHarness(opts: {
     atomicWriteFileSync,
     withPidMarkerLock: (_path: string, fn: () => void) => fn(),
     resolveAntigravityTranscriptPath: (cid: string) => (cid === opts.cliSessionId ? opts.transcriptPath : null),
-    findCompletedAntigravityTurnIds,
+    findCompletedAntigravityTurnIdsPaired,
     hashAntigravitySubmittedText,
     resolveAntigravityCandidateMinByteOffset,
     countAntigravityUserInputMatches,
@@ -182,12 +182,11 @@ function runPromptReadySettlement(h: Record<string, any>): void {
   h.queuedTurnAdvanceConsumedForPrompt = undefined;
 }
 
-describe('findCompletedAntigravityTurnIds', () => {
+describe('findCompletedAntigravityTurnIdsPaired', () => {
   it('proves folded message_location and schedule inputs completed before PLANNER_RESPONSE DONE', () => {
     withTempWorkspace(dir => {
-      const transcript = join(dir, 'transcript_full.jsonl');
       const scheduleText = '<session_id>sid-agy</session_id>\n\n[定时任务] 巡检 PR 状态';
-      writeFileSync(transcript, [
+      const transcript = writePairedTranscript(dir, [
         userInputRecord(1, larkEnvelope('om_A', 'first')),
         userInputRecord(2, scheduleText),
         userInputRecord(3, larkEnvelope('om_B', 'follow up')),
@@ -196,11 +195,11 @@ describe('findCompletedAntigravityTurnIds', () => {
         plannerDoneRecord(6),
       ].join('\n') + '\n');
 
-      const completed = findCompletedAntigravityTurnIds(transcript, [
+      const completed = findCompletedAntigravityTurnIdsPaired(transcript, [
         { turnId: 'om_B' },
         { turnId: 'schedule:check:1', submittedText: scheduleText },
         { turnId: 'om_unconsumed' },
-      ]);
+      ]).completed;
       expect([...completed].sort()).toEqual(['om_B', 'schedule:check:1']);
     });
   });
@@ -214,14 +213,14 @@ describe('findCompletedAntigravityTurnIds', () => {
         userInputRecord(3, larkEnvelope('om_B', 'still running')),
         plannerToolCallRecord(4),
       ].join('\n') + '\n');
-      expect([...findCompletedAntigravityTurnIds(busyTranscript, [{ turnId: 'om_A' }, { turnId: 'om_B' }])]).toEqual([]);
+      expect([...findCompletedAntigravityTurnIdsPaired(busyTranscript, [{ turnId: 'om_A' }, { turnId: 'om_B' }]).completed]).toEqual([]);
 
       const emptyPlannerTranscript = join(dir, 'empty-planner.jsonl');
       writeFileSync(emptyPlannerTranscript, [
         userInputRecord(1, larkEnvelope('om_B', 'in retry')),
         JSON.stringify({ step_index: 2, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: '' }),
       ].join('\n') + '\n');
-      expect([...findCompletedAntigravityTurnIds(emptyPlannerTranscript, [{ turnId: 'om_B' }])]).toEqual([]);
+      expect([...findCompletedAntigravityTurnIdsPaired(emptyPlannerTranscript, [{ turnId: 'om_B' }]).completed]).toEqual([]);
 
       // Waiting narration after launching a non-daemon background task is NOT turn completion.
       const bgTaskTranscript = join(dir, 'bg-task.jsonl');
@@ -231,7 +230,7 @@ describe('findCompletedAntigravityTurnIds', () => {
         JSON.stringify({ step_index: 3, type: 'GENERIC', status: 'RUNNING', content: 'Command running as a background task (task-1)' }),
         plannerDoneRecord(4, 'Waiting for background task to finish.'),
       ].join('\n') + '\n');
-      expect([...findCompletedAntigravityTurnIds(bgTaskTranscript, [{ turnId: 'om_B' }])]).toEqual([]);
+      expect([...findCompletedAntigravityTurnIdsPaired(bgTaskTranscript, [{ turnId: 'om_B' }]).completed]).toEqual([]);
     });
   });
 
@@ -243,7 +242,7 @@ describe('findCompletedAntigravityTurnIds', () => {
         userInputRecord(1, larkEnvelope('om_real', bodyWithSpoof)),
         plannerDoneRecord(2),
       ].join('\n') + '\n');
-      expect([...findCompletedAntigravityTurnIds(transcript, [{ turnId: 'om_victim' }])]).toEqual([]);
+      expect([...findCompletedAntigravityTurnIdsPaired(transcript, [{ turnId: 'om_victim' }]).completed]).toEqual([]);
     });
   });
 
@@ -260,9 +259,9 @@ describe('findCompletedAntigravityTurnIds', () => {
 
       // Second fire has not landed in transcript yet: must NOT match the earlier completed copy.
       expect([
-        ...findCompletedAntigravityTurnIds(transcript, [
+        ...findCompletedAntigravityTurnIdsPaired(transcript, [
           { turnId: 'schedule:check:2', submittedText: staticPrompt, minByteOffset: offsetBeforeSecondSubmit },
-        ]),
+        ]).completed,
       ]).toEqual([]);
 
       // Once the second fire lands at >= minByteOffset and finishes, it IS proven completed.
@@ -271,18 +270,17 @@ describe('findCompletedAntigravityTurnIds', () => {
         plannerDoneRecord(4),
       ].join('\n') + '\n');
       expect([
-        ...findCompletedAntigravityTurnIds(transcript, [
+        ...findCompletedAntigravityTurnIdsPaired(transcript, [
           { turnId: 'schedule:check:2', submittedText: staticPrompt, minByteOffset: offsetBeforeSecondSubmit },
-        ]),
+        ]).completed,
       ]).toEqual(['schedule:check:2']);
     });
   });
 
-  it('prevents a delayed flush of an earlier identical-text turn from impersonating a newer candidate (P1-A)', () => {
+  it('prevents a delayed flush of an earlier identical-text turn from impersonating a newer candidate', () => {
     withTempWorkspace(dir => {
       const marker = join(dir, 'marker.json');
-      const transcript = join(dir, 'transcript_full.jsonl');
-      writeFileSync(transcript, '');
+      const transcript = writePairedTranscript(dir, '');
       const staticPrompt = '[定时任务] 静默巡检';
 
       const h = workerHarness({ markerPath: marker, transcriptPath: transcript, cliSessionId: 'conv-p1a' });
@@ -298,44 +296,44 @@ describe('findCompletedAntigravityTurnIds', () => {
         userInputRecord(1, staticPrompt),
         plannerDoneRecord(2),
       ].join('\n') + '\n';
-      writeFileSync(transcript, firstRun);
+      writePairedTranscript(dir, firstRun);
 
       expect([
-        ...findCompletedAntigravityTurnIds(transcript, [{
+        ...findCompletedAntigravityTurnIdsPaired(transcript, [{
           turnId: 'schedule:new',
           submittedText: staticPrompt,
           sampledTranscriptPath: newHint.sampledTranscriptPath,
           minByteOffset: newHint.minByteOffset,
           skipPriorMatches: newHint.skipPriorMatches,
-        }]),
+        }]).completed,
       ]).toEqual([]);
 
       // Also verify 1-to-1 occurrence ownership: a single USER_INPUT cannot satisfy two identical candidates.
       expect([
-        ...findCompletedAntigravityTurnIds(transcript, [
+        ...findCompletedAntigravityTurnIdsPaired(transcript, [
           { turnId: 'schedule:old', submittedText: staticPrompt, minByteOffset: 0 },
           { turnId: 'schedule:new', submittedText: staticPrompt, minByteOffset: 0 },
-        ]),
+        ]).completed,
       ]).toEqual(['schedule:old']);
 
       // Once schedule:new's own independent occurrence lands and finishes, it IS completed.
-      writeFileSync(transcript, firstRun + [
+      writePairedTranscript(dir, firstRun + [
         userInputRecord(3, staticPrompt),
         plannerDoneRecord(4),
       ].join('\n') + '\n');
       expect([
-        ...findCompletedAntigravityTurnIds(transcript, [{
+        ...findCompletedAntigravityTurnIdsPaired(transcript, [{
           turnId: 'schedule:new',
           submittedText: staticPrompt,
           sampledTranscriptPath: newHint.sampledTranscriptPath,
           minByteOffset: newHint.minByteOffset,
           skipPriorMatches: newHint.skipPriorMatches,
-        }]),
+        }]).completed,
       ]).toEqual(['schedule:new']);
     });
   });
 
-  it('maps compact minByteOffset to full coordinates when transcript switches from compact to full (P1-B)', () => {
+  it('maps compact minByteOffset to full coordinates when transcript switches from compact to full', () => {
     withTempWorkspace(dir => {
       const compactPath = join(dir, 'transcript.jsonl');
       const fullPath = join(dir, 'transcript_full.jsonl');
@@ -361,38 +359,47 @@ describe('findCompletedAntigravityTurnIds', () => {
 
       // Must NOT falsely match the historical USER_INPUT in full even though its byte offset > compactOffset.
       expect([
-        ...findCompletedAntigravityTurnIds(fullPath, [{
+        ...findCompletedAntigravityTurnIdsPaired(fullPath, [{
           turnId: 'schedule:sibling',
           submittedText: staticPrompt,
           sampledTranscriptPath: compactPath,
           minByteOffset: compactOffset,
-        }]),
+        }]).completed,
       ]).toEqual([]);
 
-      // After a genuinely new occurrence lands in full, it IS proven completed.
-      writeFileSync(fullPath, fullPrior + [
+      // After a genuinely new occurrence lands in both siblings, it IS proven completed.
+      const newRun = [
         userInputRecord(3, staticPrompt),
         plannerDoneRecord(4, 'new run done'),
-      ].join('\n') + '\n');
+      ].join('\n') + '\n';
+      writeFileSync(compactPath, compactPrior + newRun);
+      writeFileSync(fullPath, fullPrior + newRun);
       expect([
-        ...findCompletedAntigravityTurnIds(fullPath, [{
+        ...findCompletedAntigravityTurnIdsPaired(fullPath, [{
           turnId: 'schedule:sibling',
           submittedText: staticPrompt,
           sampledTranscriptPath: compactPath,
           minByteOffset: compactOffset,
-        }]),
+        }]).completed,
       ]).toEqual(['schedule:sibling']);
     });
   });
 });
+
+function writePairedTranscript(dir: string, fullContent: string, compactContent = fullContent): string {
+  const fullPath = join(dir, 'transcript_full.jsonl');
+  const compactPath = join(dir, 'transcript.jsonl');
+  writeFileSync(fullPath, fullContent);
+  writeFileSync(compactPath, compactContent);
+  return fullPath;
+}
 
 describe('Antigravity prompt_ready folded-turn reconciliation', () => {
   it('clears authority after late disk marker for already-completed B so queued schedules run (XPI off & on)', () => {
     for (const xpiOn of [false, true]) {
       withTempWorkspace(dir => {
         const marker = join(dir, 'marker.json');
-        const transcript = join(dir, 'transcript_full.jsonl');
-        writeFileSync(transcript, [
+        const transcript = writePairedTranscript(dir, [
           userInputRecord(1, larkEnvelope('schedule:host:1', 'host')),
           userInputRecord(2, larkEnvelope('om_B', 'folded reply')),
           plannerDoneRecord(3),
@@ -426,8 +433,7 @@ describe('Antigravity prompt_ready folded-turn reconciliation', () => {
   it('releases already-synced B on same PTY generation when transcript proves B completed', () => {
     withTempWorkspace(dir => {
       const marker = join(dir, 'marker.json');
-      const transcript = join(dir, 'transcript_full.jsonl');
-      writeFileSync(transcript, [
+      const transcript = writePairedTranscript(dir, [
         userInputRecord(1, larkEnvelope('om_A', 'first')),
         userInputRecord(2, larkEnvelope('om_B', 'folded B')),
         userInputRecord(3, larkEnvelope('om_C', 'folded C')),
@@ -479,8 +485,7 @@ describe('Antigravity prompt_ready folded-turn reconciliation', () => {
   it('advances past completed B to still-unconsumed C', () => {
     withTempWorkspace(dir => {
       const marker = join(dir, 'marker.json');
-      const transcript = join(dir, 'transcript_full.jsonl');
-      writeFileSync(transcript, [
+      const transcript = writePairedTranscript(dir, [
         userInputRecord(1, larkEnvelope('om_A', 'first')),
         userInputRecord(2, larkEnvelope('om_B', 'folded B')),
         plannerDoneRecord(3),
@@ -536,8 +541,7 @@ describe('Antigravity prompt_ready folded-turn reconciliation', () => {
   it('reconciles folded turns after reattach without in-memory submittedText', () => {
     withTempWorkspace(dir => {
       const marker = join(dir, 'marker.json');
-      const transcript = join(dir, 'transcript_full.jsonl');
-      writeFileSync(transcript, [
+      const transcript = writePairedTranscript(dir, [
         userInputRecord(1, larkEnvelope('om_B', 'before reattach')),
         userInputRecord(2, larkEnvelope('om_C', 'folded before reattach')),
         plannerDoneRecord(3),
@@ -570,12 +574,11 @@ describe('Antigravity prompt_ready folded-turn reconciliation', () => {
   it('reconciles static scheduled turns without message_location after worker reattach via persisted marker hint (P2)', () => {
     withTempWorkspace(dir => {
       const marker = join(dir, 'marker.json');
-      const transcript = join(dir, 'transcript_full.jsonl');
       const staticSchedulePrompt = '[定时任务] 每 15 分钟检查上游 PR';
       const initialTranscript = [
         userInputRecord(1, larkEnvelope('om_host', 'initial human turn')),
       ].join('\n') + '\n';
-      writeFileSync(transcript, initialTranscript);
+      const transcript = writePairedTranscript(dir, initialTranscript);
 
       // Worker 1 submits a static scheduled turn via type-ahead and persists its reconcileHint in PID marker.
       const h1 = workerHarness({ markerPath: marker, transcriptPath: transcript, cliSessionId: 'conv-reattach-sched' });
@@ -586,7 +589,7 @@ describe('Antigravity prompt_ready folded-turn reconciliation', () => {
       h1.writeCliPidMarker();
 
       // Both turns fold and finish in transcript while worker restarts/reattaches.
-      writeFileSync(transcript, initialTranscript + [
+      writePairedTranscript(dir, initialTranscript + [
         userInputRecord(2, staticSchedulePrompt),
         plannerDoneRecord(3),
       ].join('\n') + '\n');
@@ -617,10 +620,246 @@ describe('Antigravity prompt_ready folded-turn reconciliation', () => {
       const logs = join(dir, 'conv-real', '.system_generated', 'logs');
       mkdirSync(logs, { recursive: true });
       const fullPath = join(logs, 'transcript_full.jsonl');
-      writeFileSync(fullPath, `${userInputRecord(1, larkEnvelope('om_X', 'hi'))}\n${plannerDoneRecord(2)}\n`);
+      const compactPath = join(logs, 'transcript.jsonl');
+      const done = `${userInputRecord(1, larkEnvelope('om_X', 'hi'))}\n${plannerDoneRecord(2)}\n`;
+      writeFileSync(fullPath, done);
+      writeFileSync(compactPath, done);
       const resolved = resolveAntigravityTranscriptPath('conv-real', { brainDir: dir });
       expect(resolved).toBe(fullPath);
-      expect([...findCompletedAntigravityTurnIds(resolved!, [{ turnId: 'om_X' }])]).toEqual(['om_X']);
+      expect([...findCompletedAntigravityTurnIdsPaired(resolved!, [{ turnId: 'om_X' }]).completed]).toEqual(['om_X']);
     });
+  });
+
+  it.each(['full-progress', 'compact-progress', 'missing-compact', 'partial-compact'] as const)(
+    'holds folded-turn B authority and keeps C queued on paired skew/gap (%s)',
+    mode => {
+      withTempWorkspace(dir => {
+        const marker = join(dir, 'marker.json');
+        const fullPath = join(dir, 'transcript_full.jsonl');
+        const compactPath = join(dir, 'transcript.jsonl');
+        const doneLines = [
+          userInputRecord(1, larkEnvelope('om_A', 'first')),
+          userInputRecord(2, larkEnvelope('om_B', 'folded B')),
+          plannerDoneRecord(3),
+        ].join('\n') + '\n';
+        const busyLines = [
+          userInputRecord(1, larkEnvelope('om_A', 'first')),
+          userInputRecord(2, larkEnvelope('om_B', 'folded B')),
+          plannerToolCallRecord(3),
+        ].join('\n') + '\n';
+
+        if (mode === 'full-progress') {
+          writeFileSync(fullPath, busyLines);
+          writeFileSync(compactPath, doneLines);
+        } else if (mode === 'compact-progress') {
+          writeFileSync(fullPath, doneLines);
+          writeFileSync(compactPath, busyLines);
+        } else if (mode === 'missing-compact') {
+          writeFileSync(fullPath, doneLines);
+        } else {
+          writeFileSync(fullPath, doneLines);
+          writeFileSync(compactPath, doneLines + '{"step_index":4,"type":"PLANNER_RESPONSE"');
+        }
+
+        const h = workerHarness({ markerPath: marker, transcriptPath: fullPath, cliSessionId: `conv-skew-${mode}` });
+        h.setCaptureIdentity('om_B');
+        h.markActiveTurnStarted({ turnId: 'om_B' });
+        h.queuedTypeAheadTurns.push({ turnId: 'om_C' });
+        h.rememberQueuedTurnAdvanceForPendingReady('om_A');
+        writeFileSync(marker, JSON.stringify({ sessionId: 'sid-agy', turnId: 'om_B', queuedTurns: [{ turnId: 'om_C' }] }));
+
+        runPromptReadySettlement(h);
+
+        expect(h.activeTurnAuthority.snapshot()?.turnId).toBe('om_B');
+        expect(h.currentBotmuxTurnId).toBe('om_B');
+        expect(h.queuedTypeAheadTurns.map((t: any) => t.turnId)).toEqual(['om_C']);
+      });
+    },
+  );
+
+  it('self-heals folded-turn authority when a transiently missing compact sibling arrives (via retry timer and markPromptReady re-entry) without leaking across generations', async () => {
+    vi.useFakeTimers();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        try {
+          withTempWorkspace(dir => {
+            const marker = join(dir, 'marker.json');
+            const fullPath = join(dir, 'transcript_full.jsonl');
+            const compactPath = join(dir, 'transcript.jsonl');
+            const doneLines = [
+              userInputRecord(1, larkEnvelope('om_A', 'first')),
+              userInputRecord(2, larkEnvelope('om_B', 'folded B')),
+              plannerDoneRecord(3),
+            ].join('\n') + '\n';
+
+            // Compact sibling is transiently missing on first ready.
+            writeFileSync(fullPath, doneLines);
+
+            const makeReadyScope = () => {
+              const h = workerHarness({ markerPath: marker, transcriptPath: fullPath, cliSessionId: 'conv-heal' });
+              Object.assign(h, {
+                isPromptReady: false,
+                cliSpawnGeneration: 1,
+                cliRestartInProgress: false,
+                durableTurnInFlight: false,
+                pendingMessages: [],
+                pendingAdoptMessages: [],
+                pendingRawInputs: [],
+                pendingInjections: [],
+                shouldFlushInjectionsFirst: () => false,
+                flushPendingInjections: async () => {},
+                pendingSessionRename: null,
+                isFlushing: false,
+                webTerminalInputGeneration: 0,
+                renderer: undefined,
+                idleDetector: undefined,
+                stuckDetector: undefined,
+                awaitingFirstPrompt: false,
+                consecutiveInWorkerRestarts: 0,
+                spawnArgvInitialPromptBusy: false,
+                spawnArgvNeedsWorkingSeed: false,
+                promptReadyEdges: 0,
+                reattachOpenTurnGate: false,
+                sandboxWrapperAwaitingFirstPrompt: undefined,
+                kimiActivityObserver: undefined,
+                codexAutoUpgrade: undefined,
+                codexUpgradeTimer: undefined,
+                persistCodexRunnerBuildOnReady: false,
+                currentPostTerminalInputFence: () => false,
+                traexFirstPromptViewportRejects: () => false,
+                currentInputDeliveryQuarantine: () => undefined,
+                remoteRunnerRecoveredTurnInFlight: false,
+                bareShellLaunchBlocked: false,
+                workerSessionEventScope: undefined,
+                cliAdapter: { id: 'antigravity' },
+                holdForNativeSessionFork: () => false,
+                refreshSandboxedCliLeafAttestation: undefined,
+                probeStartupBlocker: () => false,
+                stopBusyPatternIdleProbe: () => {},
+                readyGate: { shouldHold: () => false },
+                awaitingPostSessionStartPromptEvidence: false,
+                isSettlingFirstFlush: false,
+                freshnessInputQueue: { onPromptReady: () => 'continue' },
+                backgroundTaskTracker: { backgroundWait: () => 0, pendingTurnAgents: () => 0 },
+                spawnArgvTurnStartGateHolds: () => false,
+                forceReadyAfterTurnTerminal: false,
+                structuredRejectedReadyEvidenceGeneration: undefined,
+                stopStructuredStartGraceRecheck: () => {},
+                releaseInterruptedStructuredBridgeOnFirstPrompt: () => {},
+                hasStructuredLifecycleBlock: () => false,
+                isCodexAppCliId: () => false,
+                cliSubmissionInFlight: null,
+                preserveActiveTurnAuthorityForReady: false,
+                hasLiveAntigravityPendingTasks: () => false,
+                judgeClaudeBridgeTurn: () => {},
+                bridgeQueue: { cliQueueDrained: () => {} },
+                settleSessionRenameOnPrompt: () => {},
+                releaseRawInputRestartGate: () => {},
+                inflightInputs: { onTurnComplete: () => {} },
+                maybeEmitWorkflowTranscriptOutput: () => {},
+                observeAntigravityFooterBackgroundTasks: () => {},
+                refreshBackgroundWait: () => {},
+                settleRestartAttemptOnReady: () => {},
+                decideQueuedReadyTransition,
+              });
+              h.armAntigravityFoldedReconcilePending = loadWorkerFunction('armAntigravityFoldedReconcilePending', h);
+              h.tryReconcilePendingAntigravityFoldedTurns = loadWorkerFunction('tryReconcilePendingAntigravityFoldedTurns', h);
+              h.cancelAntigravityFoldedReconcilePending = loadWorkerFunction('cancelAntigravityFoldedReconcilePending', h);
+              h.markPromptReady = loadWorkerFunction('markPromptReady', h);
+              h.setCaptureIdentity('om_B');
+              h.markActiveTurnStarted({ turnId: 'om_B' });
+              h.queuedTypeAheadTurns.push({ turnId: 'om_C' });
+              h.rememberQueuedTurnAdvanceForPendingReady('om_A');
+              writeFileSync(marker, JSON.stringify({ sessionId: 'sid-agy', turnId: 'om_B', queuedTurns: [{ turnId: 'om_C' }] }));
+              return h;
+            };
+
+            // Experiment A: timer retry heals automatically once compact sibling lands.
+            const hTimer = makeReadyScope();
+            hTimer.markPromptReady();
+            expect(hTimer.isPromptReady).toBe(true);
+            expect(hTimer.currentBotmuxTurnId).toBe('om_B');
+            expect(hTimer.queuedTypeAheadTurns.map((t: any) => t.turnId)).toEqual(['om_C']);
+            expect(hTimer.antigravityFoldedReconcilePending).toBeDefined();
+
+            writeFileSync(compactPath, doneLines);
+            vi.advanceTimersByTime(60);
+            expect(hTimer.currentBotmuxTurnId).toBe('om_C');
+            expect(hTimer.activeTurnAuthority.snapshot()?.turnId).toBe('om_C');
+            expect(hTimer.queuedTypeAheadTurns).toEqual([]);
+            expect(hTimer.retiredTurnIds.has('om_B')).toBe(true);
+            expect(hTimer.antigravityFoldedReconcilePending).toBeUndefined();
+            hTimer.cancelAntigravityFoldedReconcilePending();
+
+            // Experiment B: markPromptReady() re-entry while isPromptReady===true reconciles immediately.
+            rmSync(compactPath, { force: true });
+            const hReentry = makeReadyScope();
+            hReentry.markPromptReady();
+            expect(hReentry.currentBotmuxTurnId).toBe('om_B');
+            writeFileSync(compactPath, doneLines);
+            hReentry.markPromptReady();
+            expect(hReentry.currentBotmuxTurnId).toBe('om_C');
+            expect(hReentry.queuedTypeAheadTurns).toEqual([]);
+            expect(hReentry.antigravityFoldedReconcilePending).toBeUndefined();
+            hReentry.cancelAntigravityFoldedReconcilePending();
+
+            // Negative control: cliSpawnGeneration bump cancels pending reconciliation without advancing.
+            rmSync(compactPath, { force: true });
+            const hFenced = makeReadyScope();
+            hFenced.markPromptReady();
+            expect(hFenced.antigravityFoldedReconcilePending).toBeDefined();
+            hFenced.cliSpawnGeneration = 2;
+            writeFileSync(compactPath, doneLines);
+            vi.advanceTimersByTime(100);
+            expect(hFenced.currentBotmuxTurnId).toBe('om_B');
+            expect(hFenced.antigravityFoldedReconcilePending).toBeUndefined();
+            hFenced.cancelAntigravityFoldedReconcilePending();
+
+            // Event-driven prompt_ready_reentry wakeups (>20 bursts) must NOT burn the retry cap or cancel healing.
+            rmSync(compactPath, { force: true });
+            const hBurst = makeReadyScope();
+            hBurst.markPromptReady();
+            for (let i = 0; i < 25; i++) {
+              hBurst.markPromptReady();
+            }
+            expect(hBurst.antigravityFoldedReconcilePending).toBeDefined();
+            expect(hBurst.antigravityFoldedReconcilePending.attempts).toBe(0);
+            writeFileSync(compactPath, doneLines);
+            vi.advanceTimersByTime(60);
+            expect(hBurst.currentBotmuxTurnId).toBe('om_C');
+            hBurst.cancelAntigravityFoldedReconcilePending();
+
+            // Incremental compact flush (om_B DONE first, om_C DONE second) re-arms and clears om_C too.
+            rmSync(compactPath, { force: true });
+            const bothDoneFull = [
+              userInputRecord(1, larkEnvelope('om_A', 'first')),
+              userInputRecord(2, larkEnvelope('om_B', 'folded B')),
+              plannerDoneRecord(3),
+              userInputRecord(4, larkEnvelope('om_C', 'folded C')),
+              plannerDoneRecord(5),
+            ].join('\n') + '\n';
+            writeFileSync(fullPath, bothDoneFull);
+            const hPartial = makeReadyScope();
+            hPartial.markPromptReady();
+            // Step 1: compact only flushed through om_B DONE -> advances B -> C and re-arms for C!
+            writeFileSync(compactPath, doneLines);
+            vi.advanceTimersByTime(60);
+            expect(hPartial.currentBotmuxTurnId).toBe('om_C');
+            expect(hPartial.antigravityFoldedReconcilePending).toBeDefined();
+            // Step 2: compact flushes om_C DONE -> releases authority completely!
+            writeFileSync(compactPath, bothDoneFull);
+            vi.advanceTimersByTime(60);
+            expect(hPartial.activeTurnAuthority.snapshot()).toBeUndefined();
+            expect(hPartial.antigravityFoldedReconcilePending).toBeUndefined();
+            hPartial.cancelAntigravityFoldedReconcilePending();
+          });
+          resolve();
+        } catch (err) {
+          reject(err);
+        }
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

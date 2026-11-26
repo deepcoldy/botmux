@@ -773,6 +773,79 @@ function resetRouteTestState(): void {
   bot.resolvedAllowedUsers = [OWNER];
 }
 
+describe('shared topic opening recovery routing', () => {
+  beforeEach(resetRouteTestState);
+
+  function retainedOpening(root: string, bound = false): DaemonSession {
+    const ds = seedThreadSession(root, 'shared opening');
+    ds.session.cliId = 'codex';
+    if (bound) {
+      ds.session.cliSessionId = 'native-bound-thread';
+      ds.session.existingAppServerEndpoint = 'unix:///tmp/shared-test.sock';
+      ds.session.sharedThreadOpening = {
+        endpoint: 'unix:///tmp/shared-test.sock', cwd: '/tmp', title: 'shared opening',
+        phase: 'created', threadId: 'native-bound-thread',
+      };
+    }
+    ds.session.queuedActivationPending = true;
+    ds.session.queuedActivationToken = 'retained-opening-token';
+    ds.session.queuedActivationTurnId = 'om_retained_opening';
+    ds.session.queuedActivationInput = { content: 'FIRST' };
+    return ds;
+  }
+
+  it('buffers a successor without reforking while the opening still owns the runtime gate', async () => {
+    const root = 'om_shared_opening_wait';
+    const ds = retainedOpening(root);
+    ds.initialStartPending = true;
+    ds.initialStartClaimToken = 'opening-runtime-claim';
+
+    await handleThreadReply(makeEventData('om_shared_wait_successor', 'SECOND', root),
+      makeCtx(root, 'om_shared_wait_successor'));
+
+    expect(ds.session.queuedActivationTail).toEqual([
+      expect.objectContaining({ turnId: 'om_shared_wait_successor' }),
+    ]);
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(ds.initialStartPending).toBe(true);
+  });
+
+  it('retries the retained opening before its successor after a failed attempt releases the runtime gate', async () => {
+    const root = 'om_shared_opening_retry';
+    const ds = retainedOpening(root);
+    ds.initialStartPending = false;
+
+    await handleThreadReply(makeEventData('om_shared_retry_successor', 'SECOND', root),
+      makeCtx(root, 'om_shared_retry_successor'));
+
+    expect(ds.session.queuedActivationTail).toEqual([
+      expect.objectContaining({ turnId: 'om_shared_retry_successor' }),
+    ]);
+    expect(mocks.forkWorker).toHaveBeenCalledOnce();
+    expect(mocks.forkWorker.mock.calls[0]![1]).toEqual({ content: 'FIRST' });
+    expect(mocks.forkWorker.mock.calls[0]![2]).toMatchObject({ turnId: 'om_retained_opening' });
+  });
+
+  it('replays the bound shared head from the next IM after admission releases the runtime gate', async () => {
+    const root = 'om_shared_bound_retry';
+    const ds = retainedOpening(root, true);
+    ds.initialStartPending = false;
+
+    await handleThreadReply(makeEventData('om_shared_bound_successor', 'SECOND', root),
+      makeCtx(root, 'om_shared_bound_successor'));
+
+    expect(ds.session.queuedActivationTail).toEqual([
+      expect.objectContaining({ turnId: 'om_shared_bound_successor' }),
+    ]);
+    expect(mocks.forkWorker).toHaveBeenCalledOnce();
+    expect(mocks.forkWorker.mock.calls[0]![0]).toBe(ds);
+    expect(mocks.forkWorker.mock.calls[0]![1]).toEqual({ content: 'FIRST' });
+    expect(mocks.forkWorker.mock.calls[0]![2]).toMatchObject({
+      turnId: 'om_retained_opening',
+    });
+  });
+});
+
 describe('/rename production routing — must not pre-create a session (review P1)', () => {
   beforeEach(() => {
     vi.clearAllMocks();

@@ -252,6 +252,12 @@ describe('darwin resource parsers', () => {
     expect(parseVmStat('Mach Virtual Memory Statistics: (page size of 16384 bytes)\n', 1024)).toBeNull();
   });
 
+  it('preserves a valid zero-available-memory sample', () => {
+    const raw = 'Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free: 0.\nPages speculative: 0.\nPages inactive: 0.\n';
+    expect(parseVmStat(raw, 1024)).toEqual({ memTotalBytes: 1024, memAvailableBytes: 0 });
+    expect(parseVmStat(raw.replace('Pages inactive: 0.\n', ''), 1024)).toBeNull();
+  });
+
   it('parses sysctl vm.swapusage, including the no-swap case', () => {
     expect(parseSwapusage('total = 2048.00M  used = 1024.25M  free = 1023.75M  (encrypted)')).toEqual({
       swapTotalBytes: 2048 * 1024 ** 2,

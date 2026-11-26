@@ -62,6 +62,7 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
     return scope[key] ??= WORKER_POOL_WEAK_CONTAINERS[key]();
   }
   if (key === 'randomUUID') return randomUUID;
+  if (key === 'getDaemonBootId') return scope[key] ??= () => 'worker-pool-test-boot';
   if (key === 'controllerForSession') return controllerForSession;
   if (key === 'activeSessionKey') return activeSessionKey;
   if (key === 'runtimeStartRefusal') return runtimeStartRefusal;
@@ -87,6 +88,7 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
   if (key === 'ProtectedResultStore') return ProtectedResultStore;
   if (key === 'pendingOrdinaryImDeliveries') return scope.pendingOrdinaryImDeliveries ??= new Map();
   if (key === 'workerCommittedTurnIds') return scope.workerCommittedTurnIds ??= new WeakMap();
+  if (key === 'collectSessionTurnGarbage') return () => {};
   if (typeof key === 'string' && ['canForkRegisteredSession', 'ownsCodexAppFinalDelivery', 'completeWorkerOrdinaryImDelivery',
     'clearOrdinaryImDelivery', 'recordWorkerCommittedTurn', 'speculateStatuslineLaunchGen',
     'recordLaunchModel', 'assistantLiveInputAdmission', 'assistantTransferInputDeliveryAllowed',

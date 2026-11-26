@@ -9,7 +9,11 @@ import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import { wrapBracketedPaste } from './tui-input.js';
 import { stripAnsiScreenText } from '../../utils/idle-detector.js';
-import type { CliUsageLimitState } from '../../utils/cli-usage-limit.js';
+import {
+  cliUsageLimitEpisodeKey,
+  isAntigravityNativeLimit,
+  type CliUsageLimitState,
+} from '../../utils/cli-usage-limit.js';
 import type { CliAdapter, PtyHandle, SubmitRecheckResult, StructuredBridgeSpec } from './types.js';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { discoverAntigravitySessions } from '../../services/resumable-session-discovery.js';
@@ -185,7 +189,7 @@ function isEmptyComposerRow(row: string): boolean {
 // Native agy errors end at an empty composer without the normal shortcuts
 // footer. Error ID anchors this to the CLI's error layout, rather than any
 // bare `>` in tool output, a draft or a permission menu.
-const ERROR_COMPOSER_PATTERN = new RegExp(`(?:^|\\n)[ \\t]*Error ID:[ \\t]*[a-zA-Z0-9][a-zA-Z0-9-]*[ \\t]*\\r?\\n[─━ \\t\\r\\n]*${EMPTY_COMPOSER_ROW.source}[ \\t]*(?:\\r?\\n[─━ \\t]*)*$`);
+const ERROR_COMPOSER_PATTERN = new RegExp(`(?:^|\\n)[ \\t]*Error ID:[ \\t]*([a-zA-Z0-9][a-zA-Z0-9-]*)[ \\t]*\\r?\\n[─━ \\t\\r\\n]*${EMPTY_COMPOSER_ROW.source}[ \\t]*(?:\\r?\\n[─━ \\t]*)*$`);
 
 /** An agy task footer is positive work evidence; unrelated PTY/syslog output
  * alone is not proof that a native quota refusal recovered. */
@@ -281,21 +285,21 @@ export function parseAntigravityFooterBackgroundTasks(screen: string): number | 
   return Number.isSafeInteger(count) && count >= 0 ? count : 0;
 }
 
-/** Preserve provenance only for the CLI's own quota/error/composer layout,
- * not generic quota-shaped text in model/tool output. */
-export function annotateAntigravityUsageLimit(screen: string, state: CliUsageLimitState): CliUsageLimitState {
+/** Extract `composer:<Error ID>` iff the live viewport ends in Antigravity's
+ *  own footerless quota/error/composer layout (never model/tool output). */
+export function extractAntigravityErrorComposerKey(screen: string): `composer:${string}` | undefined {
   const plain = stripAnsiScreenText(screen).replace(/\r\n/g, '\n');
   const match = ERROR_COMPOSER_PATTERN.exec(plain);
-  if (!match || /esc to cancel/i.test(plain)) return state;
+  if (!match || /esc to cancel/i.test(plain)) return undefined;
   const rows = plain.slice(0, match.index).trimEnd().split('\n');
   for (let i = rows.length - 1; i >= Math.max(0, rows.length - 8); i--) {
     const row = rows[i]!;
     if (/^⚠(?:️)?[ \t]*Individual quota reached\./.test(row)) {
-      return { ...state, source: 'antigravity-error-composer' };
+      return `composer:${match[1]!}`;
     }
-    if (/^[ \t]*(?:⚠|Error ID:|>|●)/.test(row)) return state;
+    if (/^[ \t]*(?:⚠|Error ID:|>|●)/.test(row)) return undefined;
   }
-  return state;
+  return undefined;
 }
 
 export const ANTIGRAVITY_QUOTA_HISTORY_LIMIT = 32;
@@ -305,8 +309,9 @@ export function rememberAntigravityQuota(
   history: readonly CliUsageLimitState[] | undefined,
   state: CliUsageLimitState,
 ): readonly CliUsageLimitState[] | undefined {
-  const key = state.relativeResetKey;
-  if (state.source !== 'antigravity-error-composer' || !key || history?.some(entry => entry.relativeResetKey === key)) {
+  const key = cliUsageLimitEpisodeKey(state);
+  if (!isAntigravityNativeLimit(state) || !key
+    || history?.some(entry => cliUsageLimitEpisodeKey(entry) === key)) {
     return history;
   }
   return [...(history?.slice(1 - ANTIGRAVITY_QUOTA_HISTORY_LIMIT) ?? []), state];
@@ -650,6 +655,13 @@ function supportsAntigravityBracketedPaste(version: string | undefined): boolean
  *  unknown flag or hide the `? for shortcuts` ready footer. */
 export function supportsAntigravityStatusline(version: string | undefined): boolean {
   return antigravityVersionAtLeast(version, 1, 5, 8);
+}
+
+/** Antigravity 1.5.15+ retains `? for shortcuts` beneath individual quota
+ *  banners instead of showing a footerless error composer. Older and unknown
+ *  versions keep legacy footerless detection and recovery (fail closed). */
+export function supportsAntigravityReadyFooterQuota(version: string | undefined): boolean {
+  return antigravityVersionAtLeast(version, 1, 5, 15);
 }
 
 /** Verified release baseline supporting `showFeedbackSurvey: false` inside

@@ -35,6 +35,10 @@ export function pluginCardActionTokenPath(pluginId: string): string {
   return join(pluginPrivateDir(pluginId), 'card-actions.token');
 }
 
+export function pluginWebhookTokenPath(pluginId: string): string {
+  return join(pluginPrivateDir(pluginId), 'webhooks.token');
+}
+
 export function pluginConfigPath(pluginId: string): string {
   return join(pluginHome(pluginId), 'config.json');
 }
