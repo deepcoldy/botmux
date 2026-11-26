@@ -225,6 +225,27 @@ describe('Codex deferred-precheck lifecycle ownership', () => {
     expectNoPaste(h, backend);
   });
 
+  it('restores the exact FIFO item and withholds the ACK when the durable retire ledger refuses', async () => {
+    const item: PendingCliInput = { content: 'expiring payload', turnId: 'expiring-turn', dispatchAttempt: 7 };
+    // No flush: drive the expire handler directly so the queue outcome is not
+    // racy with a concurrent precheck/beforeSubmit consuming the same item.
+    const { h, item: exact } = prewriteHarness(item);
+    expect(h.scope.pendingMessages).toEqual([exact]);
+    h.scope.retireCodexAppDispatchForDurableReplay = vi.fn(async () => false);
+
+    await loadWorkerMessageHandler('expire_durable_turn', h.scope)({
+      type: 'expire_durable_turn', turnId: 'expiring-turn', dispatchAttempt: 7,
+    });
+
+    // The ledger refused: the item must be back at its FIFO position and no
+    // removal ACK may escape (the daemon fences the unproven expiry itself).
+    expect(h.scope.pendingMessages).toEqual([exact]);
+    expect(h.scope.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'durable_expiry_ready',
+      disposition: 'queued_removed',
+    }));
+  });
+
   it.each([
     { name: 'ordinary', item: { content: 'ordinary survives', turnId: 'om_ordinary' } },
     { name: 'durable', item: { content: 'durable survives', turnId: 'durable-turn', dispatchAttempt: 3 } },
