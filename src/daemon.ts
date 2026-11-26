@@ -132,6 +132,7 @@ import { cotRecoveryMatches, settleCotMessageForShutdown, sweepOrphanCotMessages
 import { settleTurnReplyCards, sweepInterruptedReplyCards } from './core/turn-reply-card.js';
 import { resolveBrowserTargets, detectRunningBrowsers } from './core/browser-restart.js';
 import { countHostOverload } from './im/lark/card-handler.js';
+import { startOncallHandoffRecovery } from './im/lark/oncall-group.js';
 import { startOwnerGroupFollow } from './services/owner-group-follow-runtime.js';
 import { startMaintenance, stopMaintenance, globalInstallUpdateLockTarget } from './core/maintenance.js';
 import { createBotmuxUpdateNotifier, buildBotmuxUpdateNoticeCard } from './core/botmux-update-notify.js';
@@ -38227,23 +38228,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // dataDir 上的遗留订阅会让「无飞书连接」的 bot 每 5 秒主动打飞书。
   const ownerGroupFollower = cfg.apiOnly ? undefined : startOwnerGroupFollow(cfg.larkAppId, config.session.dataDir);
   let docCommentPollTimer: ReturnType<typeof setInterval> | undefined;
-  let oncallHandoffTimer: ReturnType<typeof setInterval> | undefined;
-  let oncallHandoffRunning = false;
-  let oncallHandoffStopped = false;
-  if (!cfg.apiOnly) {
-    const reconcileOncall = async () => {
-      // Existing group invitations remain usable after new handoffs are disabled.
-      // The reconciler checks the live policy before forwarding conversations.
-      if (oncallHandoffRunning || oncallHandoffStopped) return;
-      oncallHandoffRunning = true;
-      try { await (await import('./im/lark/oncall-group.js')).retryPendingOncallHandoffs(cfg.larkAppId, () => !oncallHandoffStopped); }
-      catch { logger.warn('[oncall-group] Handoff recovery failed; retry remains scheduled'); }
-      finally { oncallHandoffRunning = false; }
-    };
-    oncallHandoffTimer = setInterval(() => { void reconcileOncall(); }, 5_000);
-    oncallHandoffTimer.unref?.();
-    void reconcileOncall();
-  }
+  const stopOncallHandoffRecovery = cfg.apiOnly ? undefined : startOncallHandoffRecovery(cfg.larkAppId);
   if (!cfg.apiOnly) {
     // 文档订阅恢复：重启后订阅可能已失效，给仍活跃的会话重订阅；会话没恢复
     // （已关/丢失）的订阅则退订 + 清表，避免「命中订阅但无会话」的孤儿。
@@ -39428,8 +39413,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(maintenanceHeartbeat);
     ownerGroupFollower?.stop();
     clearInterval(docCommentPollTimer);
-    oncallHandoffStopped = true;
-    clearInterval(oncallHandoffTimer);
+    stopOncallHandoffRecovery?.();
     for (const session of vcMeetingSessions.values()) cleanupVcMeetingDaemonSession(session, 'daemon-shutdown');
     vcMeetingSessions.clear();
     for (const closing of vcMeetingClosingConsumerSessions.values()) {
@@ -39721,8 +39705,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     stopAllMeegoPollers();
     ownerGroupFollower?.stop();
     clearInterval(docCommentPollTimer);
-    oncallHandoffStopped = true;
-    clearInterval(oncallHandoffTimer);
+    stopOncallHandoffRecovery?.();
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     setDurableBridgeFinalOutputHandler(undefined);
     setDurableSessionSendHandler(null);
