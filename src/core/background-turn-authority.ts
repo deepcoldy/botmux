@@ -38,14 +38,18 @@ import {
   backgroundTaskDispatchToolUseIds,
   backgroundTaskLaunches,
   eventTimeMs,
+  extractTaskNotificationParts,
+  hasTranscriptRole,
   isClaudeApiRequestBlob,
   isClaudeTurnDurationEvent,
   isClaudeTurnTerminalEvent,
   isMeaningfulQueuedCommand,
   isMeaningfulUserEvent,
   isMidTurnAbsorbedQueuedCommand,
+  isMonitorExpiryNotificationParts,
   isScheduledTurnStartEvent,
   isSyntheticNoModelReplyEvent,
+  isTerminalTaskNotificationStatus,
   isTranscriptRateLimitEvent,
   type BackgroundTaskKind,
   type TranscriptEvent,
@@ -732,8 +736,7 @@ function extractUserTextParts(content: unknown): string[] {
 /** Self-contained Claude user-interrupt detector (no dependency on PR #3810). */
 export function isClaudeUserInterruptTranscriptEvent(ev: TranscriptEvent | null | undefined): boolean {
   if (!ev || typeof ev !== 'object' || ev.isSidechain === true || isClaudeApiRequestBlob(ev)) return false;
-  const role = ev.message?.role ?? ev.type;
-  if (role !== 'user') return false;
+  if (!hasTranscriptRole(ev, 'user')) return false;
   if (typeof (ev as { interruptedMessageId?: unknown }).interruptedMessageId === 'string') return true;
   for (const text of extractUserTextParts(ev.message?.content)) {
     if (text.trimStart().startsWith(USER_INTERRUPT_PREFIX)) return true;
@@ -746,8 +749,7 @@ const CLEAR_OR_NEW_COMMAND_RE = /<command-name>\s*\/(?:clear|new)\s*<\/command-n
 /** True for Claude Code's in-pane `/clear` or `/new` command records. */
 export function isClaudeClearOrNewCommandEvent(ev: TranscriptEvent | null | undefined): boolean {
   if (!ev || typeof ev !== 'object' || ev.isSidechain === true || isClaudeApiRequestBlob(ev)) return false;
-  const role = ev.message?.role ?? ev.type;
-  if (role !== 'user') return false;
+  if (!hasTranscriptRole(ev, 'user')) return false;
   for (const text of extractUserTextParts(ev.message?.content)) {
     if (CLEAR_OR_NEW_COMMAND_RE.test(text)) return true;
   }
@@ -757,15 +759,23 @@ export function isClaudeClearOrNewCommandEvent(ev: TranscriptEvent | null | unde
 export interface ParsedTaskNotificationMeta {
   taskIds: string[];
   status?: string;
+  hasTerminalStatus: boolean;
+  isMonitorExpiry: boolean;
 }
 
 export function extractTaskNotificationMeta(text: string): ParsedTaskNotificationMeta {
-  const taskIds = [...text.matchAll(/<task-id>([^<]+)<\/task-id>/g)]
+  const parts = extractTaskNotificationParts(text);
+  const taskIds = [...parts.metaText.matchAll(/<task-id>([^<]+)<\/task-id>/g)]
     .map(m => m[1]!.trim())
     .filter(Boolean);
-  const statusMatch = /<status>([^<]+)<\/status>/.exec(text);
-  const status = statusMatch ? statusMatch[1]!.trim().toLowerCase() : undefined;
-  return { taskIds, ...(status ? { status } : {}) };
+  const statusMatch = /<status>([^<]*)<\/status>/.exec(parts.metaText);
+  const status = statusMatch ? statusMatch[1]!.trim().toLowerCase() || undefined : undefined;
+  return {
+    taskIds,
+    ...(status ? { status } : {}),
+    hasTerminalStatus: isTerminalTaskNotificationStatus(status),
+    isMonitorExpiry: isMonitorExpiryNotificationParts(parts),
+  };
 }
 
 function userRoleTaskNotificationText(ev: TranscriptEvent): string | undefined {
@@ -849,7 +859,7 @@ export function applyClaudeTranscriptEventToAuthorityHold(
     if (!content.trimStart().startsWith('<task-notification>')) return { action: 'none' };
     const meta = extractTaskNotificationMeta(content);
     if (ev.operation === 'enqueue') {
-      if (!meta.status) return { action: 'none' };
+      if (!meta.hasTerminalStatus && !meta.isMonitorExpiry) return { action: 'none' };
       const wakes = meta.status === 'completed' || meta.status === 'failed';
       let result: BackgroundAuthorityTransition = { action: 'none' };
       for (const id of meta.taskIds) {
@@ -905,7 +915,7 @@ export function applyClaudeTranscriptEventToAuthorityHold(
     return hold.onWakeDelivered({
       taskIds: meta.taskIds,
       opensTurn: true,
-      terminalStatus: meta.status !== undefined,
+      terminalStatus: meta.hasTerminalStatus || meta.isMonitorExpiry,
       verifiedSystemWake,
       atMs,
     }, nowMs);
@@ -921,7 +931,7 @@ export function applyClaudeTranscriptEventToAuthorityHold(
     return hold.onWakeDelivered({
       taskIds: meta.taskIds,
       opensTurn: false,
-      terminalStatus: meta.status !== undefined,
+      terminalStatus: meta.hasTerminalStatus || meta.isMonitorExpiry,
       verifiedSystemWake,
       atMs,
     }, nowMs);
@@ -962,9 +972,9 @@ export function applyClaudeTranscriptEventToAuthorityHold(
   }
 
   // 10. `TaskStop` (`toolUseResult: { task_id, task_type }`) — settles immediately with wakes=false.
-  const role = ev.message?.role ?? ev.type;
+  const isUserRole = hasTranscriptRole(ev, 'user');
   const r = ev.toolUseResult as Record<string, unknown> | undefined;
-  if (role === 'user' && r && typeof r === 'object' && !Array.isArray(r)
+  if (isUserRole && r && typeof r === 'object' && !Array.isArray(r)
     && typeof r.task_id === 'string' && r.task_id && typeof r.task_type === 'string') {
     transition = pickHigherPriorityTransition(
       transition,
@@ -973,12 +983,12 @@ export function applyClaudeTranscriptEventToAuthorityHold(
   }
 
   // 11. Tool result continuation during WAKE_ACTIVE clears any provisional end timer.
-  if (role === 'user' && hold.phase() === 'WAKE_ACTIVE') {
+  if (isUserRole && hold.phase() === 'WAKE_ACTIVE') {
     hold.onWakeTurnActivity();
   }
 
   // 12. Assistant errors, rate limits, provisional terminals, and tool continuation.
-  if (role === 'assistant') {
+  if (hasTranscriptRole(ev, 'assistant')) {
     if (isTranscriptRateLimitEvent(ev)) {
       if (hold.phase() === 'WAKE_ACTIVE') {
         return pickHigherPriorityTransition(transition, hold.onWakeTurnEnded('rate_limited', nowMs));

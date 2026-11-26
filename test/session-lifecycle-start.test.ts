@@ -13007,6 +13007,18 @@ describe('folded-turn reply relay', () => {
     expect(inits.map(init => init?.followUpReply)).toEqual(Array(3).fill(followUpReply ? true : undefined));
   });
 
+  it.each([true, false])('hands foldBackgroundUpdates=%s to primary workers and omits it from adopt workers', foldBackgroundUpdates => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ foldBackgroundUpdates }));
+    initWorkerPool({ sessionReply: vi.fn(async () => 'om_reply'), getSessionWorkingDir: () => REPO, getActiveCount: () => 1, closeSession: vi.fn() });
+    const fresh = makeDs(claudeSession);
+    expect(forkWorker(fresh, 'hello', false)).toBe(true);
+    const adoptedDs = makeDs({ adoptedFrom: { tmuxTarget: 'adopt-switch:0.0', originalCliPid: 23456, sessionId: 'adopted-native', cliId: 'claude-code', cwd: REPO } });
+    forkMock.mockImplementationOnce(() => makeFakeWorker());
+    expect(forkAdoptWorker(adoptedDs)).toBe('accepted');
+    expect(fresh.initConfig?.foldBackgroundUpdates).toBe(foldBackgroundUpdates ? true : undefined);
+    expect(adoptedDs.initConfig?.foldBackgroundUpdates).toBeUndefined();
+  });
+
   it('posts nothing while followUpReply is off, checked when the reply arrives', async () => {
     const { sessionReply, worker } = forkWithReply(adopted);
     vi.mocked(getBot).mockImplementation(() => defaultBot());

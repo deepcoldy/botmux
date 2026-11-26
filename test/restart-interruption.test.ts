@@ -215,6 +215,34 @@ describe('claudeInterruptedWork — background tasks', () => {
     expect(claudeInterruptedWork(old, Date.parse(at('10:00:06')) + RESTART_TASK_MAX_AGE_MS + 1).tasks).toEqual([]);
   });
 
+  it('settles Monitors on [Monitor expired...] without <status>, keeps them live on mid-stream/running notices, and ignores api-request-blob', () => {
+    const events: TranscriptEvent[] = [
+      ...monitorLaunch(1, '10:00:00', 'm-expired', 'watch build', 1_800_000),
+      ...monitorLaunch(2, '10:00:02', 'm-still-live', 'watch deploy', 1_800_000),
+      ...endTurn('a-end', '10:00:10'),
+      {
+        type: 'user',
+        timestamp: at('10:05:00'),
+        promptSource: 'system',
+        message: { role: 'user', content: '<task-notification>\n<task-id>m-expired</task-id>\n<result>[Monitor expired after 30m]</result>\n</task-notification>' },
+      } as TranscriptEvent,
+      {
+        type: 'user',
+        timestamp: at('10:05:10'),
+        promptSource: 'system',
+        message: { role: 'user', content: '<task-notification>\n<task-id>m-still-live</task-id>\n<status>running</status>\n<result>step 2</result>\n</task-notification>' },
+      } as TranscriptEvent,
+      {
+        type: 'api-request-blob',
+        timestamp: at('10:05:20'),
+        message: { role: 'user', content: 'copied user message' },
+      } as unknown as TranscriptEvent,
+    ];
+    const result = claudeInterruptedWork(events, Date.parse(at('10:10:00')));
+    expect(result.turnOpen).toBe(false);
+    expect(result.tasks.map(t => t.taskId)).toEqual(['m-still-live']);
+  });
+
   it('reports an agent resumed with SendMessage after it stopped, also when the old stop notice is delivered late', () => {
     const resumed = (ts: string) => toolResult(`u-send-${ts}`, ts, `call-send-${ts}`, {
       success: true, message: 'Resuming agent agent-9', resumedAgentId: 'agent-9', revivedAgentId: 'agent-9',
