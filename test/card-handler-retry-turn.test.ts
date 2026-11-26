@@ -835,6 +835,17 @@ describe('TRAE saved prompt recovery', () => {
       traexPromptCheckpoint: checkpoint, attachments: [{ type: 'image', path: '/fixture/photo.png', name: 'photo.png', resourceKey: 'img_original' }], ...over,
     }) } });
   }
+  it.each(['retry_turn', 'retry_edited_prompt'])('forwards the frozen trusted caller for %s', async action => {
+    const trustedCaller = { requestUserOpenId: 'ou_original', requestLarkAppId: LARK_APP_ID, senderType: 'user' as const };
+    const ds = trae({ trustedCaller });
+    const data = actionData(TURN, 'resend', action);
+    if (action === 'retry_edited_prompt') data.action.form_value = { failed_prompt: 'edited prompt', failed_image: 'keep' };
+    await handleCardAction(data, depsWith(ds), LARK_APP_ID);
+    expect(sendWorkerInputMock).toHaveBeenCalledOnce();
+    const [, payload, , opts] = sendWorkerInputMock.mock.calls[0];
+    expect(payload.trustedCaller).toEqual(trustedCaller);
+    expect(opts).toMatchObject({ trustedCaller });
+  });
   it('opens the editor on the same card without sending input or spending the retry cooldown', async () => {
     const { sendEphemeralCard } = await import('../src/im/lark/client.js'); vi.mocked(sendEphemeralCard).mockClear();
     const ds = trae();

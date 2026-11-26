@@ -4494,7 +4494,11 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         // A turn that failed without any output is cut first and its input
         // re-sent as it was — nothing ran, so there is nothing to continue
         // from (core/failed-turn-rewind.ts). Otherwise the mode above applies.
-        if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput, retryTurnId, { ...(!continueMode ? { failedTurnResendOf: failedTurn.turnId } : {}), ...(editing ? { failedTurnEditedInput: true } : {}) });
+        if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput, retryTurnId, {
+          ...(failedTurn.trustedCaller ? { trustedCaller: { ...failedTurn.trustedCaller } } : {}),
+          ...(!continueMode ? { failedTurnResendOf: failedTurn.turnId } : {}),
+          ...(editing ? { failedTurnEditedInput: true } : {}),
+        });
         else {
           accepted = forkManualTurn(ds, retryInput, retryTurnId, forkWorker);
         }

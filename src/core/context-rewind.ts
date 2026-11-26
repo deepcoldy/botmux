@@ -179,6 +179,17 @@ export interface OpenTranscript {
 export function withOpenTranscript<T>(path: string, scope: TranscriptTreeScope, use: (transcript: OpenTranscript) => T): T {
   const fd = openTranscript(path, scope, fsConstants.O_RDWR);
   let lastRead: ReturnType<typeof fstatSync> | undefined;
+  let lastReadBytes: Buffer | undefined;
+  const readExact = (size: number): Buffer => {
+    const bytes = Buffer.alloc(size);
+    let offset = 0;
+    while (offset < size) {
+      const count = readSync(fd, bytes, offset, size - offset, offset);
+      if (!count) throw new Error('transcript changed during read');
+      offset += count;
+    }
+    return bytes;
+  };
   const verifyRead = (): void => {
     if (!lastRead) return;
     const current = fstatSync(fd);
@@ -186,6 +197,11 @@ export function withOpenTranscript<T>(path: string, scope: TranscriptTreeScope, 
       throw new Error('transcript changed after inspection');
     }
     assertSameInode(lstatSync(path), current, path);
+    // Filesystems with coarse timestamp resolution can keep every checked stat
+    // unchanged for a same-size write. Compare the inspected bytes as well.
+    if (lastReadBytes && !readExact(current.size).equals(lastReadBytes)) {
+      throw new Error('transcript changed after inspection');
+    }
   };
   try {
     return use({
@@ -193,14 +209,9 @@ export function withOpenTranscript<T>(path: string, scope: TranscriptTreeScope, 
         lastRead = fstatSync(fd);
         const size = lastRead.size;
         if (size > maxBytes) throw new Error('transcript exceeds read budget');
-        const bytes = Buffer.alloc(size);
-        let offset = 0;
-        while (offset < size) {
-          const count = readSync(fd, bytes, offset, size - offset, offset);
-          if (!count) throw new Error('transcript changed during read');
-          offset += count;
-        }
+        const bytes = readExact(size);
         verifyRead();
+        lastReadBytes = bytes;
         return bytes;
       },
       scan: (limit = 20) => scanDescriptor(fd, limit),

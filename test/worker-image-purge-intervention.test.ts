@@ -101,6 +101,26 @@ describe('worker image purge intervention', () => {
     expect(h.sent.filter(msg => msg.type === 'turn_input_rejected')).toHaveLength(1);
     expect(readFileSync(h.path, 'utf8')).toBe(original);
   });
+  it.each(['committed', 'inflight'] as const)('does not cancel a held repair for a %s duplicate', async duplicate => {
+    const h = harness(); h.start();
+    h.scope.isOrdinaryImTurnId = () => true;
+    h.scope.receiveOrdinaryImTurn = () => duplicate;
+    await h.message({ type: 'message', turnId: 'om_duplicate', content: 'retry after a lost ACK' });
+    expect(h.queued).toEqual([]);
+    h.gone(); await vi.advanceTimersByTimeAsync(600);
+    expect(h.writes).toEqual(['retry-1']);
+    expect(h.sent.filter(msg => msg.type === 'turn_input_rejected')).toEqual([]);
+  });
+  it('does not cancel a held repair for input rejected before admission', async () => {
+    const h = harness(); h.start();
+    h.scope.activeTurnAuthority = { snapshot: () => undefined };
+    h.scope.activeTurnBlocks = () => true;
+    await h.message({ type: 'message', turnId: 'om_rejected', content: 'not admitted' });
+    expect(h.sent).toContainEqual(expect.objectContaining({ type: 'turn_input_rejected', turnId: 'om_rejected' }));
+    h.gone(); await vi.advanceTimersByTimeAsync(600);
+    expect(h.writes).toEqual(['retry-1']);
+    expect(h.sent.filter(msg => msg.type === 'turn_input_rejected').map(msg => msg.turnId)).toEqual(['om_rejected']);
+  });
   it('stops the bound retry before its turn becomes the backend active turn', async () => {
     const h = harness(); h.start();
     await h.interrupt('stop-request', 'retry-1');

@@ -123,6 +123,7 @@ const FAILED_TURN_REWIND_FUNCTIONS = [
   'waitForRetiringCliQuiescence', 'putBackFailedTurnCut', 'dropStoppedRewindMessage',
   'putBackStoppedRewindCutBeforeWrites', 'restartToPutBackCut', 'settleFailedTurnRewindOffQueue',
   'handOverFailedTurnRewind', 'failedTurnTranscriptScope',
+  'settleSupersededCheckpointRewind',
 ];
 
 /** TraeX question-page wiring the hold / idle paths call into (see

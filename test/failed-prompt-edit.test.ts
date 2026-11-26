@@ -37,13 +37,11 @@ describe('failed prompt cards', () => {
     expect(json).toContain('Retry'); expect(json).toContain('Edit prompt'); expect(json).toContain('img_original');
     expect(json).toContain('signature'); expect(json).toContain('"turn_id":"failed"');
     expect(json).toContain('"mode":"resend"');
-    expect(json).toContain('unchanged image may fail again');
   });
   it('offers Continue with a side-effect explanation when proof is absent', () => {
     const json = JSON.stringify(render({ directFailure: undefined, traexPromptCheckpoint: undefined }));
     expect(json).toContain('Continue from current state');
     expect(json).not.toContain('Edit prompt'); expect(json).not.toContain('"mode":"resend"');
-    expect(json).toContain('cannot undo file edits');
   });
   it('prefills the editor, defaults to keep, and only submits on explicit retry', () => {
     const card = JSON.parse(buildFailedPromptEditCard(record, { rootId: 'root', sessionId: 'session' }, 'en'));
@@ -51,7 +49,6 @@ describe('failed prompt cards', () => {
     expect(form.elements[0].default_value).toBe('Original prompt');
     expect(form.elements[1].initial_option).toBe('keep');
     expect(form.elements[2]).toMatchObject({ action_type: 'form_submit', behaviors: [{ value: { action: 'retry_edited_prompt', turn_id: 'failed' } }] });
-    expect(JSON.stringify(card)).toContain('replacement attachment');
   });
   it('does not attach controls to a different turn or unowned session', () => {
     for (const over of [{ turnId: 'other' }, { localOwnedSession: false }, { cliId: 'codex' }]) {

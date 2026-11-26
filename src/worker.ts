@@ -44340,7 +44340,8 @@ function startFailedTurnRewind(
   }
   const state: FailedTurnRewindInFlight = { queued: undefined, stopped: false, report };
   failedTurnRewindInFlight = state;
-  void restartCliProcess('cut a turn that failed without output', {
+  let rewindRestartEpoch: number | undefined;
+  const restarting = restartCliProcess('cut a turn that failed without output', {
     immediate: true,
     preservePending: true,
     // Rescuing the context, not recovering from a crash: spending the budget
@@ -44362,6 +44363,7 @@ function startFailedTurnRewind(
         // Held behind the restart fence, so nothing can have written it yet —
         // unless it was settled meanwhile (stopped, dropped, handed on).
         messageStillQueued: () => failedTurnRewindInFlight === state && !state.stopped
+          && (!directive.requireRewind || rewindRestartEpoch === cliRestartEpoch)
           && !!state.queued && pendingMessages.includes(state.queued),
       });
       if (outcome.kind === 'declined') {
@@ -44393,7 +44395,7 @@ function startFailedTurnRewind(
     onRespawnSettled: result => {
       if (result !== 'failed') {
         if (directive.requireRewind && result === 'superseded') {
-          report('declined', 'checkpoint retry superseded by another restart');
+          settleSupersededCheckpointRewind(state);
           return;
         }
         // Nothing was cut (declined above, or the restart ended before the
@@ -44423,6 +44425,8 @@ function startFailedTurnRewind(
       report('declined', `restart failed ${cut ? 'after' : 'before'} the cut`);
     },
   });
+  rewindRestartEpoch = cliRestartEpoch;
+  void restarting;
   const before = pendingMessages.length;
   enqueueMessage();
   const last = pendingMessages[pendingMessages.length - 1];
@@ -44470,6 +44474,32 @@ function putBackFailedTurnCut(cut: FailedTurnCut): boolean {
   }
 }
 
+/** A superseded checkpoint retry is rejected, but a cut that already landed is
+ * restored only with no live/spawning CLI. If the winning restart already has
+ * a process, its own teardown must prove that process gone before restoration. */
+function settleSupersededCheckpointRewind(state: FailedTurnRewindInFlight): void {
+  const cut = state.cut;
+  if (cut && !backend && !replacementSpawnInProgress) {
+    state.cut = undefined;
+    if (state.queued) state.queued.content = cut.plainContent;
+    const restored = putBackFailedTurnCut(cut);
+    state.report('declined', restored
+      ? 'checkpoint retry superseded; cut restored before the winning restart'
+      : `checkpoint retry superseded; cut NOT restored (backup ${cut.backupPath})`);
+    if (failedTurnRewindInFlight === state) failedTurnRewindInFlight = null;
+    return;
+  }
+  if (cut && !closeRequested) {
+    if (failedTurnRewindInFlight === state) failedTurnRewindInFlight = null;
+    restartToPutBackCut(state, cut, 'superseded');
+    return;
+  }
+  state.report('declined', cut
+    ? `checkpoint retry superseded; cut NOT restored (backup ${cut.backupPath})`
+    : 'checkpoint retry superseded before the cut');
+  if (failedTurnRewindInFlight === state) failedTurnRewindInFlight = null;
+}
+
 /** A message the user stopped while a failed-turn rewind held it, taken out
  *  of the queue: it ended without reaching the CLI. */
 function dropStoppedRewindMessage(item: PendingCliInput): void {
@@ -44515,9 +44545,13 @@ function putBackStoppedRewindCutBeforeWrites(): boolean {
  *  already (the daemon no longer counts the rewind as in flight: an input
  *  arriving meanwhile goes in as it came, behind the restored turn); the
  *  daemon hears how the restore went once it ran. */
-function restartToPutBackCut(held: FailedTurnRewindInFlight, cut: FailedTurnCut): void {
-  const notRestored = (why: string) => `stopped after the cut; cut NOT restored, ${why} (backup ${cut.backupPath})`;
-  void restartCliProcess('put back a cut failed turn: its message was stopped', {
+function restartToPutBackCut(
+  held: FailedTurnRewindInFlight,
+  cut: FailedTurnCut,
+  trigger: 'stopped' | 'superseded' = 'stopped',
+): void {
+  const notRestored = (why: string) => `${trigger} after the cut; cut NOT restored, ${why} (backup ${cut.backupPath})`;
+  void restartCliProcess(`put back a cut failed turn: its retry was ${trigger}`, {
     immediate: true,
     preservePending: true,
     skipRestartBudget: true,
@@ -44530,7 +44564,7 @@ function restartToPutBackCut(held: FailedTurnRewindInFlight, cut: FailedTurnCut)
         held.report('declined', notRestored(`CLI exit unproven: ${err instanceof Error ? err.message : String(err)}`));
         return;
       }
-      held.report('declined', putBackFailedTurnCut(cut) ? 'stopped after the cut; cut restored' : notRestored('the transcript moved on'));
+      held.report('declined', putBackFailedTurnCut(cut) ? `${trigger} after the cut; cut restored` : notRestored('the transcript moved on'));
     },
     onRespawnSettled: result => {
       held.report('declined', notRestored(`restart ${result} before the restore`));
@@ -45807,8 +45841,6 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
     }
 
     case 'message': {
-      if (!msg.purgeUndersizedImages && !msg.purgeToolImages
-        && msg.turnId !== activeTranscriptImagePurge?.turnId) activeTranscriptImagePurge?.cancel();
       if (lastInitConfig?.deploymentContinuation || restoredDeploymentTurnId) discardDeploymentContinuation();
       // 每轮消息都捎带 daemon 侧当前解析出的模型，覆盖 respawn 快照——理由与
       // restart 那条通道相同，但这里管的是**崩溃 park 后由消息触发的恢复重启**：
@@ -46021,6 +46053,11 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
             ...(msg.turnCallerOpenId ? { turnCallerOpenId: msg.turnCallerOpenId } : {}),
           });
           if (inputCommitted) {
+            // Only an actually admitted successor revokes a held repair. A
+            // duplicate, backpressure/cross-principal refusal, or an input that
+            // could not be queued leaves the original continuation eligible.
+            if (!msg.purgeUndersizedImages && !msg.purgeToolImages
+              && msg.turnId !== activeTranscriptImagePurge?.turnId) activeTranscriptImagePurge?.cancel();
             if (!deferTurnInputCommitUntilSubmission(
               msg.dispatchAttempt,
               msg.durablePrimaryInbox,

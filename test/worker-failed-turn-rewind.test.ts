@@ -90,6 +90,7 @@ function setup(transcript: string, overrides: Record<string, unknown> = {}, d = 
     isRemoteBackendType: () => false,
     effectiveBackendType: 'tmux',
     cliRestartInProgress: false,
+    cliRestartEpoch: 0,
     lastResolvedSandboxMode: 'off',
     isPromptReady: true,
     isFlushing: false,
@@ -135,7 +136,10 @@ function setup(transcript: string, overrides: Record<string, unknown> = {}, d = 
   };
   // The real restart fences input synchronously: from here on a message waits
   // in the queue for the replacement CLI.
-  const restartCliProcess = vi.fn(async (_reason: string, _opts: RestartOpts) => { scope.cliRestartInProgress = true; });
+  const restartCliProcess = vi.fn(async (_reason: string, _opts: RestartOpts) => {
+    scope.cliRestartEpoch = (scope.cliRestartEpoch as number) + 1;
+    scope.cliRestartInProgress = true;
+  });
   scope.restartCliProcess ??= restartCliProcess;
   scope.saveUnsentInputsForSuccessor ??= loadWorkerFunction('saveUnsentInputsForSuccessor', scope);
   const start = loadWorkerFunction<(turnId: string | undefined, d: FailedTurnRewindDirective, enqueue: () => void) => void>(
@@ -895,9 +899,38 @@ describe('TRAE checkpoint worker transaction', () => {
     h.settle('failed');
     expect(h.pendingMessages).toEqual([]); expect(h.successorInputs()).toEqual([]);
   });
-  it('drops a checkpoint retry when a different restart supersedes its replacement', async () => {
-    const h = native(); await h.cutAfterExit(); h.settle('superseded');
-    expect(h.pendingMessages).toEqual([]); expect(h.reports()).toEqual([expect.objectContaining({ outcome: 'declined' })]);
+  it('restores the failed turn and drops the retry when a different restart supersedes its replacement', async () => {
+    const h = native(); const before = readFileSync(h.path);
+    const backupDir = rewindBackupDirForSession(process.env.SESSION_DATA_DIR!, 'sess-rewind');
+    const priorBackups = new Set(existsSync(backupDir) ? readdirSync(backupDir) : []);
+    await h.cutAfterExit(); h.scope.backend = null; h.settle('superseded');
+    expect(readFileSync(h.path)).toEqual(before);
+    expect(h.pendingMessages).toEqual([]); expect(h.successorInputs()).toEqual([]);
+    expect(h.reports()).toEqual([expect.objectContaining({ outcome: 'declined', reason: expect.stringMatching(/cut restored/) })]);
+    const backups = readdirSync(backupDir).filter(name => !priorBackups.has(name));
+    expect(backups).toHaveLength(1);
+    expect(readFileSync(join(backupDir, backups[0]!), 'utf8')).toBe(failed);
+  });
+  it('waits for a spawned winning CLI to exit before restoring a superseded cut', async () => {
+    const h = native(); const before = readFileSync(h.path); await h.cutAfterExit();
+    h.settle('superseded');
+    expect(h.restartCliProcess).toHaveBeenCalledTimes(2);
+    expect(h.restartOpts(1)).toMatchObject({ exactResumeSessionId: SID, preservePending: true });
+    expect(readFileSync(h.path, 'utf8')).toBe(prefix);
+    expect(h.pendingMessages).toHaveLength(1);
+    await h.restartOpts(1).beforeRespawn!({ pid: 4243, processScope: [4243] });
+    h.restartOpts(1).onRespawnSettled!('spawned');
+    expect(readFileSync(h.path)).toEqual(before);
+    expect(h.pendingMessages).toEqual([]); expect(h.successorInputs()).toEqual([]);
+    expect(h.reports()).toEqual([expect.objectContaining({ outcome: 'declined', reason: expect.stringMatching(/superseded after the cut; cut restored/) })]);
+  });
+  it('does not cut after its restart loses ownership during the exit wait', async () => {
+    const h = native(); const before = readFileSync(h.path);
+    h.scope.cliRestartEpoch = (h.scope.cliRestartEpoch as number) + 1;
+    await h.cutAfterExit();
+    expect(readFileSync(h.path)).toEqual(before);
+    expect(h.pendingMessages).toEqual([]);
+    expect(h.reports()).toEqual([expect.objectContaining({ outcome: 'declined' })]);
   });
   it('revokes no-work proof for another generation, external delivery, or tool activity', () => {
     const h = native();
