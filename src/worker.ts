@@ -510,6 +510,7 @@ import {
   sameExecutableObject,
   type ExecutableIdentity,
 } from './services/cli-install-identity.js';
+import { captureTraexPromptCheckpoint, inspectTraexFailedPrompt, withTraexFailedPrompt, type TraexPromptCheckpoint } from './services/traex-prompt-checkpoint.js';
 import { purgeTraexToolImages, resolveTraexImagePurgeTarget, TRAEX_TOOL_IMAGE_UPLOAD_ERROR_CODE } from './services/traex-tool-image-recovery.js';
 import { traeSessionsRoot } from './services/traex-paths.js';
 import { pinWorkerTraeHome } from './services/traex-paths.js';
@@ -29254,6 +29255,14 @@ async function flushPending(): Promise<void> {
           && (itemsWrittenInThisFlush > 0
             || queuedTypeAheadTurns.length > 0
             || (!promptReadyAtFlushStart && !currentTurnAlreadyTerminated));
+        if (lastInitConfig?.cliId === 'traex') {
+          lastTraexPromptCheckpoint = undefined;
+          if (item.turnId && promptReadyAtFlushStart && itemsWrittenInThisFlush === 0
+            && !isTypeAhead && !lastInitConfig.adoptMode && !isRemoteBackendType(effectiveBackendType)) {
+            const checkpoint = captureTraexPromptCheckpoint(codexBridgeRolloutPath, traeSessionsRoot());
+            if (checkpoint) lastTraexPromptCheckpoint = { turnId: item.turnId, generation: cliSpawnGeneration, checkpoint };
+          }
+        }
         if (cliSubmissionInFlight?.item === item) {
           cliSubmissionInFlight.composerOwned = typedIntoComposer && promptReadyAtFlushStart
             && itemsWrittenInThisFlush === 0 && !isTypeAhead;
@@ -43585,7 +43594,18 @@ function turnFailureScreen(): string | undefined {
 /** A Claude Code provider failure whose turn is the transcript's last turn,
  *  holding the input this worker wrote for it and nothing but API errors
  *  after it (core/failed-turn-rewind.ts). Best effort: any doubt is false. */
+let lastTraexPromptCheckpoint: { turnId: string; generation: number; checkpoint: TraexPromptCheckpoint } | undefined;
 function turnFailedWithoutOutput(turnId: string, errorCode: string | undefined): boolean {
+  if (lastInitConfig?.cliId === 'traex') {
+    const saved = lastTraexPromptCheckpoint;
+    if (!saved || saved.turnId !== turnId || saved.generation !== cliSpawnGeneration || !codexBridgeRolloutPath
+      || lastInitConfig.adoptMode || lastInitConfig.existingAppServerEndpoint || isRemoteBackendType(effectiveBackendType)
+      || lastWrittenCliInput?.turnId !== turnId || rawInputWriteGeneration !== lastWrittenCliInputRawGen
+      || webTerminalSubmitGeneration !== lastWrittenCliInputWebSubmitGen
+      || readSendMarkers().some(marker => marker.turnId === turnId)) return false;
+    try { return inspectTraexFailedPrompt(codexBridgeRolloutPath, traeSessionsRoot(), saved.checkpoint, lastWrittenCliInput.content).outcome === 'error_only'; }
+    catch { return false; }
+  }
   if (lastInitConfig?.cliId !== 'claude-code' || lastInitConfig.adoptMode
     || isRemoteBackendType(effectiveBackendType)) return false;
   if (!rewindableErrorCode(errorCode) || !bridgeJsonlPath) return false;
@@ -43747,6 +43767,8 @@ function emitTurnTerminal(
     ...(status !== 'completed' && Number.isFinite(providerTiming?.lastSuccessAtMs)
       ? { providerLastSuccessAtMs: providerTiming!.lastSuccessAtMs } : {}),
     ...(directFailure ? { directFailure: true as const } : {}),
+    ...(directFailure && lastInitConfig?.cliId === "traex" && lastTraexPromptCheckpoint
+      ? { traexPromptCheckpoint: { ...lastTraexPromptCheckpoint.checkpoint } } : {}),
     ...(backgroundTasks > 0 ? { backgroundTasks } : {}),
     ...(authorityHeldForBackground ? { authorityHeldForBackground: true as const } : {}),
     ...(composerRefusal && errorCode === 'safe_composer_required' ? { composerRefusal } : {}),
@@ -44217,6 +44239,8 @@ interface FailedTurnCut {
   removed: Buffer;
   /** As for the cut: the pinned projects root and the CLI-writable tree. */
   projectsRoot: ClaudeProjectsRoot | undefined;
+  traexSessionsRoot?: string;
+  traexPromptCheckpoint?: TraexPromptCheckpoint;
   scope: TranscriptTreeScope;
   sessionId: string;
   preserveScratchTree: boolean;
@@ -44251,6 +44275,7 @@ function startFailedTurnRewind(
   enqueueMessage: () => void,
 ): void {
   let reported = false;
+  let strictQueued: PendingCliInput | undefined;
   // The backup of the cut, once it landed. Its directory is pruned only after
   // the rewind settled (core/rewind-backup-retention.ts), this backup left
   // alone, without holding anything up.
@@ -44259,11 +44284,16 @@ function startFailedTurnRewind(
   const report = (outcome: 'rewound' | 'declined', reason: string): void => {
     if (reported) return;
     reported = true;
+    if (directive.requireRewind && outcome === 'declined' && turnId) {
+      if (strictQueued) { const index = pendingMessages.indexOf(strictQueued); if (index >= 0) pendingMessages.splice(index, 1); }
+      send({ type: 'turn_input_rejected', turnId, reason: 'failed_prompt_checkpoint_unverified' });
+    }
     log(`Failed-turn rewind ${outcome} for ${directive.failedTurnId.slice(0, 16)} → ${(turnId ?? '-').slice(0, 16)} (${directive.mode}): ${reason}`);
     send({ type: 'failed_turn_rewind', turnId: turnId ?? '', failedTurnId: directive.failedTurnId, outcome, reason });
     if (landedBackup) void pruneRewindBackupsBeside(landedBackup, { dataDir, log });
   };
-  const target = resolvePurgeResumeTarget(
+  const traexCheckpoint = lastInitConfig?.cliId === "traex" ? directive.traexPromptCheckpoint : undefined;
+  const target = traexCheckpoint ? resolveTraexImagePurgeTarget(codexBridgeRolloutPath) : resolvePurgeResumeTarget(
     bridgeJsonlPath,
     backend
       ? (backend as PtyBackend | TmuxBackend | TmuxPipeBackend | ZellijBackend | ZmxBackend).claudeJsonlPath
@@ -44274,7 +44304,9 @@ function startFailedTurnRewind(
   // CLI-writable tree every open is re-checked against that tree, and the
   // backup goes to a directory of the daemon's, as with /rewind.
   const projectsRoot = claudeProjectsRoot;
-  const transcriptScope = failedTurnTranscriptScope();
+  const transcriptScope = traexCheckpoint
+    ? { writableTreeRoot: traeSessionsRoot(), ...(dataDir && sessionId ? { backupDir: rewindBackupDirForSession(dataDir, sessionId) } : {}) }
+    : failedTurnTranscriptScope();
   const requested = planFailedTurnRewindRequest({
     cliId: lastInitConfig?.cliId,
     localOwnedSession: !!lastInitConfig && !lastInitConfig.adoptMode && !lastInitConfig.existingAppServerEndpoint
@@ -44292,7 +44324,9 @@ function startFailedTurnRewind(
               : durableTurnInFlight || queuedTypeAheadTurns.length > 0 || activeTurnAuthority.snapshot()?.turnId
                 ? 'a turn is running' : undefined,
     directive,
-    inspect: path => inspectLastTurnInProjectsRoot(path, projectsRoot, transcriptScope),
+    inspect: path => traexCheckpoint
+      ? inspectTraexFailedPrompt(path, traeSessionsRoot(), traexCheckpoint, directive.failedInput)
+      : inspectLastTurnInProjectsRoot(path, projectsRoot, transcriptScope),
   });
   // A transcript in a CLI-writable tree is only cut with its backup outside
   // that tree: without a backup directory, do not restart the CLI for nothing.
@@ -44301,7 +44335,7 @@ function startFailedTurnRewind(
     : requested;
   if (plan.kind === 'decline') {
     report('declined', plan.reason);
-    enqueueMessage();
+    if (!directive.requireRewind) enqueueMessage();
     return;
   }
   const state: FailedTurnRewindInFlight = { queued: undefined, stopped: false, report };
@@ -44319,7 +44353,9 @@ function startFailedTurnRewind(
         waitForQuiescence: () => waitForRetiringCliQuiescence(retiring),
         withTranscript: use => {
           if (transcriptScope.backupDir) mkdirSync(transcriptScope.backupDir, { recursive: true, mode: 0o700 });
-          return withFailedTurnTranscript(plan.target.jsonlPath, projectsRoot, transcriptScope, use);
+          return traexCheckpoint
+            ? withTraexFailedPrompt(plan.target.jsonlPath, traeSessionsRoot(), transcriptScope, traexCheckpoint, directive.failedInput, use)
+            : withFailedTurnTranscript(plan.target.jsonlPath, projectsRoot, transcriptScope, use);
         },
         planned: { offset: plan.offset, ...(plan.uuid ? { uuid: plan.uuid } : {}) },
         failedInput: directive.failedInput,
@@ -44344,6 +44380,7 @@ function startFailedTurnRewind(
         transcript: outcome.result.transcript,
         removed: outcome.result.removed ?? Buffer.alloc(0),
         projectsRoot,
+        ...(traexCheckpoint ? { traexSessionsRoot: traeSessionsRoot(), traexPromptCheckpoint: traexCheckpoint } : {}),
         scope: transcriptScope,
         sessionId: plan.target.sessionId,
         preserveScratchTree: plan.preserveScratchTree,
@@ -44355,6 +44392,10 @@ function startFailedTurnRewind(
     },
     onRespawnSettled: result => {
       if (result !== 'failed') {
+        if (directive.requireRewind && result === 'superseded') {
+          report('declined', 'checkpoint retry superseded by another restart');
+          return;
+        }
         // Nothing was cut (declined above, or the restart ended before the
         // cut): the message goes in unchanged.
         if (!state.cut) report('declined', `restart ${result} before the cut`);
@@ -44369,6 +44410,9 @@ function startFailedTurnRewind(
         if (state.queued) state.queued.content = cut.plainContent;
         report('declined', 'restart failed after the cut; cut restored');
       }
+      // A strict checkpoint retry must never enter the successor journal when
+      // its replacement failed, even if concurrent changes prevented restore.
+      if (directive.requireRewind) report('declined', `restart failed ${cut ? 'after' : 'before'} the cut`);
       // Without this the held message dies with the worker; the next worker
       // writes what it finds here (the old flow never restarted, so it was
       // always delivered). The hand-over settles the rewind: a cut that could
@@ -44383,6 +44427,7 @@ function startFailedTurnRewind(
   enqueueMessage();
   const last = pendingMessages[pendingMessages.length - 1];
   state.queued = pendingMessages.length > before && last?.turnId === turnId ? last : undefined;
+  strictQueued = state.queued;
 }
 
 /** Where a failed-turn rewind's transcript opens are checked and its backup
@@ -44413,8 +44458,12 @@ function waitForRetiringCliQuiescence(retiring: { pid?: number; processScope: nu
 /** Put a failed-turn cut back while no CLI is running on the transcript. */
 function putBackFailedTurnCut(cut: FailedTurnCut): boolean {
   try {
-    assertTranscriptInProjectsRoot(cut.path, cut.projectsRoot);
-    return restoreRewoundTranscript(cut.path, cut, cut.scope);
+    if (cut.traexSessionsRoot && cut.traexPromptCheckpoint) {
+      const current = captureTraexPromptCheckpoint(cut.path, cut.traexSessionsRoot);
+      if (!current || current.offset !== cut.offset || current.prefixHash !== cut.traexPromptCheckpoint.prefixHash) return false;
+    }
+    if (!cut.traexSessionsRoot) assertTranscriptInProjectsRoot(cut.path, cut.projectsRoot);
+    return restoreRewoundTranscript(cut.path, cut, { ...cut.scope, ...(cut.traexSessionsRoot ? { requireUnchangedTail: true } : {}) });
   } catch (err) {
     log(`Restoring the cut failed turn failed: ${err instanceof Error ? err.message : String(err)}`);
     return false;
@@ -45984,6 +46033,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
             }
           } else if (ordinaryImTurnId) rejectOrdinaryImTurn(ordinaryImTurnId, 'cli_input_unavailable');
         };
+        if (lastInitConfig?.cliId === 'traex' && !msg.failedTurnRewind) stopHeldFailedTurnRewind();
         if (msg.purgeUndersizedImages || msg.purgeToolImages) {
           startTranscriptImagePurge(msg.turnId, ordinaryImTurnId, enqueueMessage, msg.purgeToolImages === true);
           break;

@@ -332,6 +332,7 @@ export interface FailedTurnRecord {
   /** The worker saw this turn end on API errors alone (turn_terminal
    *  `directFailure`): the next input may cut it out and re-send its input. */
   directFailure?: true;
+  traexPromptCheckpoint?: import("./services/traex-prompt-checkpoint.js").TraexPromptCheckpoint;
   /** Current-turn transcript boundary backing an Antigravity limited snapshot's
    *  directFailure proof. Missing legacy boundaries fail closed for auto-replay. */
   antigravityWriteBoundary?: AntigravityTranscriptWriteBoundary;
@@ -362,7 +363,9 @@ export interface FailedTurnRewindDirective {
   failedInput: string;
   /** `resend`: the failed input again (retry button / automatic continuation).
    *  `merge`: the failed input followed by this message's input. */
-  mode: 'resend' | 'merge';
+  mode: 'resend' | 'merge' | 'edit';
+  requireRewind?: true;
+  traexPromptCheckpoint?: import('./services/traex-prompt-checkpoint.js').TraexPromptCheckpoint;
   /** What the CLI gets once the turn is cut. */
   content: string;
 }
@@ -3262,6 +3265,7 @@ export type WorkerToDaemonBase =
        *  next input may cut it out instead of stacking on top (see
        *  services/failed-turn-rewind.ts). */
       directFailure?: true;
+      traexPromptCheckpoint?: import("./services/traex-prompt-checkpoint.js").TraexPromptCheckpoint;
     }
   | {
       /** Outcome of a message's {@link FailedTurnRewindDirective}, sent before

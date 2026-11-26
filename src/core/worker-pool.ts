@@ -173,6 +173,7 @@ import {
 import { noteReplyCardTurnStarted } from './reply-card-turn-start.js';
 import type { QuotaFallbackChainTrigger } from './quota-fallback-chain-switch.js';
 import { TRAEX_QUOTA_ERROR_CODE } from '../services/traex-quota.js';
+import { appendFailedPromptActions } from '../im/lark/failed-prompt-card.js';
 import { appendTraexImageRecoveryAction } from '../im/lark/traex-image-recovery-card.js';
 import { takePurgeClickRollback } from '../services/image-purge-recovery.js';
 import { hashUrlForLog, type RiffBackendConfig } from '../adapters/backend/riff-backend.js';
@@ -3316,7 +3317,7 @@ function buildSessionTurnFailedCard(
   // 绝不 @ bot——那会触发对方新一轮）。
   const mentionOpenId = daemonCardFooterRecipientOpenId(ds, effectiveCliId)
     ?? failureNoticeFallbackMentionOpenId(ds);
-  return buildTurnFailedCard({
+  const card = buildTurnFailedCard({
     rootId: sessionAnchorId(ds),
     sessionId: ds.session.sessionId,
     cliId: effectiveCliId,
@@ -3334,6 +3335,12 @@ function buildSessionTurnFailedCard(
     ...(failedTurn ? { retryTurnId: failedTurn.turnId } : {}),
     ...(mentionOpenId ? { mentionOpenId } : {}),
     terminalUrl: readableTerminalUrlFor(ds),
+    locale: localeForBot(ds.larkAppId),
+  });
+  return appendFailedPromptActions(card, {
+    cliId: effectiveCliId, localOwnedSession: !hasProtectedSessionMutationOwnership(ds) && !isSharedAdoptSession(ds)
+      && !isRemoteBackendSession(ds) && !ds.adoptedFrom && !ds.initConfig?.adoptMode && !ds.session.headless,
+    record: failedTurn, turnId: failedTurn?.turnId ?? '', rootId: sessionAnchorId(ds), sessionId: ds.session.sessionId,
     locale: localeForBot(ds.larkAppId),
   });
 }
@@ -18887,6 +18894,7 @@ function failedTurnRewindForInput(
   cliId: string | undefined,
   opts: {
     failedTurnResendOf?: string;
+    failedTurnEditedInput?: true;
     purgeUndersizedImages?: true;
     purgeToolImages?: true;
     dispatchAttempt?: number;
@@ -18895,13 +18903,14 @@ function failedTurnRewindForInput(
     viaTransferGate: boolean;
   },
 ): FailedTurnRewindDirective | undefined {
-  if (cliId !== 'claude-code' || !turnId || opts.viaTransferGate || !ds.worker || ds.worker.killed) return undefined;
+  if (!['claude-code', 'traex'].includes(cliId ?? '') || (cliId === 'traex' && !opts.failedTurnResendOf)
+    || !turnId || opts.viaTransferGate || !ds.worker || ds.worker.killed) return undefined;
   if (opts.purgeUndersizedImages || opts.purgeToolImages || opts.dispatchAttempt !== undefined || opts.durablePrimaryInbox
     || payload.codexAppInput) return undefined;
   if (isRemoteBackendSession(ds) || isSharedAdoptSession(ds) || ds.adoptedFrom || ds.initConfig?.adoptMode) {
     return undefined;
   }
-  const mode = opts.failedTurnResendOf !== undefined ? 'resend' : 'merge';
+  const mode = opts.failedTurnEditedInput ? 'edit' : opts.failedTurnResendOf !== undefined ? 'resend' : 'merge';
   // An input already on its way to carry this failed turn on (its CLI restart
   // is running): another one would run the failed input twice.
   const record = ds.session.lastFailedTurn;
@@ -18910,7 +18919,7 @@ function failedTurnRewindForInput(
   // old card pressed after another turn failed must not cut and re-send that
   // other turn. The record qualifies when it is that turn, or the turn a
   // chain of cuts that started from it carries it on in now.
-  if (mode === 'resend' && record) {
+  if (mode !== 'merge' && record) {
     const chain = ds.session.failedTurnRewindChain;
     const same = record.turnId === opts.failedTurnResendOf
       || (chain?.turnId === record.turnId && chain.originTurnId === opts.failedTurnResendOf);
@@ -18973,7 +18982,7 @@ export function applyFailedTurnRewindResult(
   // Inputs never remembered as latest (an automatic continuation) leave the
   // failed turn as the latest, which they now replace.
   if (ds.lastCliInputTurnId === result.turnId || ds.lastCliInputTurnId === result.failedTurnId) {
-    const userPrompt = pending.mode === 'merge' && ds.lastCliInputTurnId === result.turnId && ds.lastUserPrompt
+    const userPrompt = pending.mode === 'edit' ? ds.lastUserPrompt ?? pending.failedUserPrompt : pending.mode === 'merge' && ds.lastCliInputTurnId === result.turnId && ds.lastUserPrompt
       ? mergeFailedTurnInput(pending.failedUserPrompt, ds.lastUserPrompt)
       : pending.failedUserPrompt;
     ds.lastUserPrompt = userPrompt;
@@ -19069,6 +19078,7 @@ export function sendWorkerInput(
      *  it and re-sends its input instead of this content. Any other input is
      *  sent together with such a failed input (core/failed-turn-rewind.ts). */
     failedTurnResendOf?: string;
+    failedTurnEditedInput?: true;
   } = {},
 ): boolean {
   cancelDeploymentContinuation(ds.session, previous => sessionStore.updateDeploymentContinuation(ds.session, previous));
@@ -33009,6 +33019,13 @@ function deliverFinalOutput(
           content: tr('card.turn_failed.field_error', { errorCode: `\`${msg.turnFailureCode}\`` }, localeForBot(ds.larkAppId)) });
         cardJson = JSON.stringify(failedCard);
       }
+      if (msg.turnFailed) cardJson = appendFailedPromptActions(cardJson, {
+        cliId: effectiveCliId, record: ds.session.lastFailedTurn, turnId: msg.turnId,
+        rootId: sessionAnchorId(ds), sessionId: ds.session.sessionId, locale: localeForBot(ds.larkAppId),
+        localOwnedSession: !managedReceiver && !ds.session.headless && !replyCardSandboxBlocked(ds)
+          && !hasProtectedSessionMutationOwnership(ds) && !hasQueuedActivationAdmissionGate(ds) && !isSharedAdoptSession(ds)
+          && !isRemoteBackendSession(ds) && !ds.adoptedFrom && !ds.initConfig?.adoptMode,
+      });
       const nativeLink = !managedReceiver ? await prepareNativeOncallCard(ds.larkAppId, ds.chatId, msg.replyTurnId ?? msg.turnId, ds.session.sessionId) : undefined;
       if (!managedReceiver) {
         cardJson = attachOncallGroupButton(cardJson, getBot(ds.larkAppId).config.oncallGroup, ds.chatId, ds.chatType, {

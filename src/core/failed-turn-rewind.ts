@@ -70,12 +70,12 @@ export function planFailedTurnRewind(input: {
   /** This input's own turn id. */
   turnId: string | undefined;
   content: string;
-  mode: 'merge' | 'resend';
+  mode: 'merge' | 'resend' | 'edit';
 }): FailedTurnRewindDirective | undefined {
   const record = input.record;
   if (!record || record.directFailure !== true || record.status !== 'failed') return undefined;
-  if (record.limitedSnapshot || record.recovery || record.retryable === false) return undefined;
-  if (!rewindableErrorCode(record.errorCode)) return undefined;
+  if (record.limitedSnapshot || record.recovery || (record.retryable === false && !record.traexPromptCheckpoint)) return undefined;
+  if (!record.traexPromptCheckpoint && !rewindableErrorCode(record.errorCode)) return undefined;
   if (!record.turnId || (input.turnId !== undefined && input.turnId === record.turnId)) return undefined;
   if (!record.cliInput.trim() || isCliCommandInput(record.cliInput)) return undefined;
   if (input.mode === 'merge' && isCliCommandInput(input.content)) return undefined;
@@ -83,7 +83,8 @@ export function planFailedTurnRewind(input: {
     failedTurnId: record.turnId,
     failedInput: record.cliInput,
     mode: input.mode,
-    content: input.mode === 'resend' ? record.cliInput : mergeFailedTurnInput(record.cliInput, input.content),
+    content: input.mode === 'resend' ? record.cliInput : input.mode === 'edit' ? input.content : mergeFailedTurnInput(record.cliInput, input.content),
+    ...(record.traexPromptCheckpoint ? { traexPromptCheckpoint: { ...record.traexPromptCheckpoint }, requireRewind: true as const } : {}),
   };
 }
 
@@ -247,7 +248,7 @@ export function planFailedTurnRewindRequest(input: {
   directive: FailedTurnRewindDirective;
   inspect: (jsonlPath: string) => LastTurnInspection;
 }): FailedTurnRewindPlan {
-  if (input.cliId !== 'claude-code' || !input.localOwnedSession || !input.target) {
+  if (!['claude-code', 'traex'].includes(input.cliId ?? '') || (input.cliId === 'traex' && !input.directive.traexPromptCheckpoint) || !input.localOwnedSession || !input.target) {
     return { kind: 'decline', reason: 'no worker-owned local Claude Code transcript' };
   }
   if (input.restartInProgress) return { kind: 'decline', reason: 'a CLI restart is already in progress' };

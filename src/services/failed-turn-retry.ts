@@ -30,6 +30,7 @@ export function buildFailedTurnRecord(
     retryable?: boolean;
     /** turn_terminal `directFailure`: nothing but API errors answered it. */
     directFailure?: true;
+    traexPromptCheckpoint?: FailedTurnRecord["traexPromptCheckpoint"];
   },
   sources: { userPrompt?: string; cliInput?: string; codexAppInput?: CodexAppTurnInput;
     attachments?: LarkAttachment[]; trustedCaller?: TrustedCaller; originalTurnId?: string; silent?: boolean },
@@ -47,6 +48,7 @@ export function buildFailedTurnRecord(
     status: terminal.status,
     ...(terminal.retryable !== undefined ? { retryable: terminal.retryable } : {}),
     ...(terminal.directFailure && terminal.status === 'failed' ? { directFailure: true as const } : {}),
+    ...(terminal.directFailure && terminal.traexPromptCheckpoint ? { traexPromptCheckpoint: { ...terminal.traexPromptCheckpoint } } : {}),
     retryCount: 0,
     ...(sources.silent ? { silent: true } : {}),
     ...(sources.trustedCaller ? { trustedCaller: { ...sources.trustedCaller } } : {}),

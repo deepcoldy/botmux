@@ -165,6 +165,8 @@ export function scanClaudeTranscriptCheckpoints(path: string, limit = 20, scope:
 
 /** 一个打开着的 transcript：扫描和截断都经同一个描述符，截断的一定是扫描读的那个文件。 */
 export interface OpenTranscript {
+  /** Bounded read from the same descriptor used by cut, for other native formats. */
+  read(maxBytes: number): Buffer;
   scan(limit?: number): RewindCheckpoint[];
   /** The last turn, read from the held descriptor (see {@link inspectLastClaudeTurn}). */
   lastTurn(limit?: number): LastTurnInspection;
@@ -176,15 +178,39 @@ export interface OpenTranscript {
  *  之间被换成别的文件也碰不到它，inode 号也不会在持有期间被别的文件复用。 */
 export function withOpenTranscript<T>(path: string, scope: TranscriptTreeScope, use: (transcript: OpenTranscript) => T): T {
   const fd = openTranscript(path, scope, fsConstants.O_RDWR);
+  let lastRead: ReturnType<typeof fstatSync> | undefined;
+  const verifyRead = (): void => {
+    if (!lastRead) return;
+    const current = fstatSync(fd);
+    if (current.size !== lastRead.size || current.mtimeMs !== lastRead.mtimeMs || current.ctimeMs !== lastRead.ctimeMs) {
+      throw new Error('transcript changed after inspection');
+    }
+    assertSameInode(lstatSync(path), current, path);
+  };
   try {
     return use({
+      read: maxBytes => {
+        lastRead = fstatSync(fd);
+        const size = lastRead.size;
+        if (size > maxBytes) throw new Error('transcript exceeds read budget');
+        const bytes = Buffer.alloc(size);
+        let offset = 0;
+        while (offset < size) {
+          const count = readSync(fd, bytes, offset, size - offset, offset);
+          if (!count) throw new Error('transcript changed during read');
+          offset += count;
+        }
+        verifyRead();
+        return bytes;
+      },
       scan: (limit = 20) => scanDescriptor(fd, limit),
       lastTurn: (limit = LAST_TURN_SCAN_LIMIT_BYTES) => lastTurnOfDescriptor(fd, limit),
       cut: (offset, now = Date.now(), opts = {}) => {
         // The backup is created next to the path: it must still name the
         // file held here (held open, its inode cannot have been reused).
         assertSameInode(lstatSync(path), fstatSync(fd), path);
-        return rewindOpenTranscript(fd, path, offset, now, { ...scope, ...opts });
+        verifyRead();
+        return rewindOpenTranscript(fd, path, offset, now, { ...scope, ...opts, ...(lastRead ? { beforeCut: verifyRead } : {}) });
       },
     });
   } finally {
@@ -770,7 +796,7 @@ function mayFollowRestoredTurn(line: string): boolean {
 export function restoreRewoundTranscript(
   path: string,
   cut: { offset: number; transcript: FileIdentity; removed: Buffer },
-  scope: TranscriptTreeScope = {},
+  scope: TranscriptTreeScope & { requireUnchangedTail?: boolean } = {},
 ): boolean {
   // The transcript sits in a directory the sandboxed CLI can write: opened the
   // way every transcript read here is (no link, no FIFO, inside that tree),
@@ -784,6 +810,9 @@ export function restoreRewoundTranscript(
     const st = fstatSync(fd);
     if (!sameFile(pre, st) || !sameFile(cut.transcript, st)) return false;
     const size = st.size;
+    // Native formats whose response/tool records do not look like Claude
+    // messages must never reuse Claude's permissive metadata-tail predicate.
+    if (scope.requireUnchangedTail && size !== cut.offset) return false;
     if (size < cut.offset || size - cut.offset > RESTORE_TAIL_LIMIT_BYTES) return false;
     const tail = Buffer.alloc(size - cut.offset);
     if (tail.length > 0 && readSync(fd, tail, 0, tail.length, cut.offset) !== tail.length) return false;

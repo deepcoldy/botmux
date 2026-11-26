@@ -1,3 +1,5 @@
+import { captureTraexPromptCheckpoint, inspectTraexFailedPrompt, withTraexFailedPrompt } from '../../src/services/traex-prompt-checkpoint.js';
+import { traeSessionsRoot } from '../../src/services/traex-paths.js';
 /**
  * Execute ONE real function or named callback of src/worker.ts against an injected
  * module scope, without importing the worker (its module body installs process
@@ -422,6 +424,10 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
     if (key === 'rewindableErrorCode') return rewindableErrorCode;
     if (key === 'transcriptTurnFailedWithoutOutput') return transcriptTurnFailedWithoutOutput;
     if (key === 'pruneRewindBackupsBeside') return pruneRewindBackupsBeside;
+    if (key === 'captureTraexPromptCheckpoint') return captureTraexPromptCheckpoint;
+    if (key === 'inspectTraexFailedPrompt') return inspectTraexFailedPrompt;
+    if (key === 'withTraexFailedPrompt') return withTraexFailedPrompt;
+    if (key === 'traeSessionsRoot') return traeSessionsRoot;
     if (key === 'rewindBackupDirForSession') return rewindBackupDirForSession;
     if (key === 'registerRewindBackup') return registerRewindBackup;
     if (key === 'readTraexCatalogWithRetry') return readTraexCatalogWithRetry;

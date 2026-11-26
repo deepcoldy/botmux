@@ -219,10 +219,10 @@ describe('v3 路由表', () => {
 describe('敏感动作清单', () => {
   // 逐项钉死：漏登记 = 该动作绕过 canOperate、任何人都能点。新增 / 删除必须同步改这里。
   const EXPECTED = [
-    'cleanup_session_worktree', 'close', 'compact_session', 'disconnect', 'export_text', 'get_write_link', 'open_local_cli', 'open_local_terminal',
+    'cleanup_session_worktree', 'close', 'compact_session', 'disconnect', 'edit_failed_prompt', 'export_text', 'get_write_link', 'open_local_cli', 'open_local_terminal',
     'purge_images_continue', 'quote_confirm', 'refresh_screenshot', 'reply_card_menu', 'reply_model_pick',
     'repo_manual_submit', 'repo_rebuild_worktree', 'repo_worktree_submit', 'restart', 'resume',
-    'retry_last_task', 'retry_turn', 'session_effort_apply', 'session_effort_pick', 'session_model_pick', 'session_model_unpin', 'set_reasoning_effort', 'skip_repo', 'stop_turn', 'takeover', 'term_action',
+    'retry_edited_prompt', 'retry_last_task', 'retry_turn', 'session_effort_apply', 'session_effort_pick', 'session_model_pick', 'session_model_unpin', 'set_reasoning_effort', 'skip_repo', 'stop_turn', 'takeover', 'term_action',
     'toggle_display', 'toggle_idle_compact', 'toggle_keys_panel', 'toggle_kimi_expiry_compact', 'toggle_stream', 'toggle_substitute', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_cancel', 'wf_reject',
     'worktree_toggle_mode',
   ];
@@ -237,7 +237,7 @@ describe('敏感动作清单', () => {
   });
 
   it('retry_turn / stop_turn / compact_session / quote_confirm 在册（原 test 的源码文本锁，改为查表）', () => {
-    for (const a of ['retry_turn', 'stop_turn', 'compact_session', 'quote_confirm']) {
+    for (const a of ['retry_turn', 'edit_failed_prompt', 'retry_edited_prompt', 'stop_turn', 'compact_session', 'quote_confirm']) {
       expect(sensitiveCardActionMeta(a), a).toBeDefined();
     }
   });
