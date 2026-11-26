@@ -244,6 +244,7 @@ import {
 } from './services/durable-lark-session-control.js';
 import { failedTurnCaller, recordLimitedFailedTurn, clearLimitedFailedTurn, recordFailedTurnTerminal, noteFailedTurnRecoveryInput } from './core/failed-turn-recovery.js';
 import { startQuotaFallbackChainSwitch } from './core/quota-fallback-chain-switch.js';
+import { handleCodexCapacityRetry, settleCodexCapacityFallback } from './core/codex-capacity-fallback.js';
 import { isSilentScheduledTurn } from './core/silent-schedule-turns.js';
 import { isMessageListenerTaskAnchor, isSilentMessageListenerSession, messageListenerSendBlocked } from './core/message-listener-silence.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
@@ -36269,6 +36270,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     getActiveCount,
     prepareRawInputTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
     startQuotaFallbackChainSwitch,
+    onCodexCapacityRetry: handleCodexCapacityRetry,
+    onCodexCapacitySettle: settleCodexCapacityFallback,
     loadScheduledTaskForIdentity: (appId, taskId) =>
       readScheduledTaskFromAuthority(scheduleAuthorityStore, appId, taskId),
     onTriggerTurnStarted: (ds, title, turnId) => beginNewTurn(ds, title, turnId),

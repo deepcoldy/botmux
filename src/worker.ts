@@ -489,6 +489,7 @@ import { parseCodexAsyncQuestions } from './services/codex-async-user-input.js';
 import { codexConsumedRolloutEvents, codexEventsWithStableIds } from './services/codex-rollout-replay.js';
 import { PI_CREDENTIAL_ERROR_CODE, adoptPiTranscriptIntoBotmuxDir, piSessionUsesBotmuxDir } from './services/pi-transcript.js';
 import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './services/codex-service-tier.js';
+import { CodexCapacityMonitor } from './services/codex-capacity-monitor.js';
 import { readCodexModelSettingsCursor, spawnWithCodexModelLaunch, type CodexModelLaunchObservation } from './services/codex-model-selection.js';
 import { loadCodexServiceTierCatalog, validateCodexServiceTier } from './services/codex-service-tier-catalog.js';
 import { WORKER_IPC_HANDLER_READY_EVENT } from './worker-ipc-preload.js';
@@ -12093,6 +12094,49 @@ const awaySummaryFocus = new AwaySummaryFocus({
 const codexSubagentLimitTracker = new CodexSubagentLimitTracker(
   () => codexBridgeRolloutPath ? codexSessionsRootFromRolloutPath(codexBridgeRolloutPath) : undefined,
 );
+/** Read-only observer for Codex `logs_<N>.sqlite` capacity retries so the daemon
+ *  can prompt the user to downgrade within seconds instead of waiting 25-30m. */
+const codexCapacityMonitor = new CodexCapacityMonitor();
+const codexCapacityNotifiedKeys = new Set<string>();
+function clearCodexCapacityMonitor(): void {
+  codexCapacityMonitor.clear();
+  codexCapacityNotifiedKeys.clear();
+}
+function maybePollCodexCapacityRetry(): void {
+  if (!structuredBridgeIs('codex') || !codexBridgeRolloutPath || !codexBridgeBaselineDone || cliRestartInProgress) return;
+  if (lastInitConfig?.adoptMode) return;
+  const activeTurn = codexBridgeQueue.peek().find(turn => turn.finalText === undefined);
+  if (!activeTurn?.turnId) return;
+  const threadId = codexGenerationSessionIdFromRolloutPath(codexBridgeRolloutPath);
+  if (!threadId) return;
+  const codexHomeDir = dirname(codexSessionsRootFromRolloutPath(codexBridgeRolloutPath));
+  codexCapacityMonitor.bind(codexHomeDir, threadId, {
+    ...(activeTurn.markTimeMs !== undefined ? { sinceMs: activeTurn.markTimeMs } : {}),
+  });
+  const events = codexCapacityMonitor.poll(Date.now());
+  for (const event of events) {
+    if (activeTurn.markTimeMs !== undefined && event.tsMs + 1_000 < activeTurn.markTimeMs) continue;
+    const dedupeKey = `${activeTurn.turnId}:${(event.model ?? '').toLowerCase()}`;
+    if (codexCapacityNotifiedKeys.has(dedupeKey)) continue;
+    codexCapacityNotifiedKeys.add(dedupeKey);
+    if (codexCapacityNotifiedKeys.size > 64) {
+      const oldest = codexCapacityNotifiedKeys.values().next().value;
+      if (oldest !== undefined) codexCapacityNotifiedKeys.delete(oldest);
+    }
+    log(`Codex capacity retry observed: thread=${threadId.slice(0, 8)} model=${event.model ?? '?'} attempt=${event.retryAttempt ?? '?'}/${event.maxRetries ?? '?'} delay=${event.retryDelaySec ?? '?'}s`);
+    send({
+      type: 'codex_capacity_retry',
+      turnId: activeTurn.turnId,
+      nativeSessionId: threadId,
+      ...(event.model ? { model: event.model } : {}),
+      ...(event.codexTurnId ? { codexTurnId: event.codexTurnId } : {}),
+      ...(event.retryAttempt !== undefined ? { retryAttempt: event.retryAttempt } : {}),
+      ...(event.maxRetries !== undefined ? { maxRetries: event.maxRetries } : {}),
+      ...(event.retryDelaySec !== undefined ? { retryDelaySec: event.retryDelaySec } : {}),
+      observedAtMs: event.tsMs,
+    });
+  }
+}
 /** Claude Code's automatic model switches for this bridge. The tracker owns the
  *  binding to the CURRENT Claude session id, the record-uuid dedupe and the
  *  "only report the serving model when it changed" rule; every transcript drain
@@ -17582,6 +17626,7 @@ function codexBridgeStartTimer(): void {
         // dependencies of that branch; the full worker always supplies this.
         if (typeof maybeSettleMissingStructuredFinal === 'function') maybeSettleMissingStructuredFinal();
         if (typeof flushMissingFinalNotices === 'function') flushMissingFinalNotices();
+        if (typeof maybePollCodexCapacityRetry === 'function') maybePollCodexCapacityRetry();
       } catch (err: any) {
         log(`Missing-final turn settlement error: ${err.message}`);
       }
@@ -17683,6 +17728,7 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
   codexBridgeRolloutPath = rolloutPath;
   codexBridgeUnprovenSession = undefined;
   codexSubagentLimitTracker.clear();
+  if (typeof clearCodexCapacityMonitor === 'function') clearCodexCapacityMonitor();
   if (structuredBridgeIs('codex')) codexServiceTierTracker.bind(rolloutPath);
   if (mode === 'fresh-empty') {
     // Brand-new session OR late-attach right after first submit. Either
@@ -18275,6 +18321,7 @@ function codexBridgeDetachFile(): void {
   codexBridgeRolloutPath = undefined;
   codexBridgeOffset = 0;
   codexSubagentLimitTracker.clear();
+  if (typeof clearCodexCapacityMonitor === 'function') clearCodexCapacityMonitor();
   codexBridgePendingTail = '';
   codexBridgeBaselineDone = false;
   structuredBridgeDriverState = undefined;
@@ -20490,6 +20537,7 @@ function stopCodexBridge(): void {
   codexBridgeRolloutPath = undefined;
   codexBridgeOffset = 0;
   codexSubagentLimitTracker.clear();
+  if (typeof clearCodexCapacityMonitor === 'function') clearCodexCapacityMonitor();
   codexBridgePendingTail = '';
   codexBridgeBaselineDone = false;
   structuredBridgeDriverState = undefined;

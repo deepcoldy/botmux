@@ -1517,6 +1517,14 @@ export interface WorkerPoolCallbacks {
    *  True when the limit is handled by moving this session to the next
    *  CLI/model, so the owner pause notice and backup-bot handoff are skipped. */
   startQuotaFallbackChainSwitch?: (ds: DaemonSession, trigger: QuotaFallbackChainTrigger) => boolean;
+  /** User-confirmed Codex capacity downgrade (core/codex-capacity-fallback.ts). */
+  onCodexCapacityRetry?: (
+    ds: DaemonSession,
+    trigger: import('./codex-capacity-fallback.js').CodexCapacityFallbackTrigger,
+  ) => boolean;
+  /** Invalidate any open Codex capacity-downgrade confirmation card once the
+   *  turn settles, is superseded by new input, or the worker retires. */
+  onCodexCapacitySettle?: (ds: DaemonSession, reason: string, turnId?: string) => void;
   /** A scheduled task as the host authority store holds it, for deciding who a
    *  scheduled turn runs as. Never backed by schedules.json (agent-writable
    *  inside a sandbox). Absent or undefined → the turn carries no identity. */
@@ -9703,6 +9711,7 @@ export function killWorker(
   // worker (or into nothing, if no replacement comes).
   invalidateStuckWarning(ds, 'killWorker');
   invalidateTuiPrompt(ds, 'killWorker');
+  callbacks?.onCodexCapacitySettle?.(ds, 'killWorker');
   if (!ds.worker || ds.worker.killed) {
     // No live worker to receive {type:'close'}, so its destroySession() — which
     // tears down the persistent backing session (tmux/herdr/zellij/zmx) — never
@@ -9794,6 +9803,7 @@ export function retireWorkerProcessOnly(ds: DaemonSession, reason: string): void
   if (retiredInteractiveTurnId) callbacks?.onManagedTurnOriginRevoked?.(ds, retiredInteractiveTurnId);
   invalidateStuckWarning(ds, reason);
   invalidateTuiPrompt(ds, reason);
+  callbacks?.onCodexCapacitySettle?.(ds, reason);
   const w = ds.worker;
   // This function nulls ds.worker synchronously, so the later process `exit`
   // event fails the current-worker check and cannot perform this cleanup.
@@ -9853,6 +9863,7 @@ function clearTransferWorkerState(
   if (retiredInteractiveTurnId) callbacks?.onManagedTurnOriginRevoked?.(ds, retiredInteractiveTurnId);
   invalidateStuckWarning(ds, reason);
   invalidateTuiPrompt(ds, reason);
+  callbacks?.onCodexCapacitySettle?.(ds, reason);
   if (!worker || ds.worker === worker || ds.worker === null) {
     ds.worker = null;
     ds.workerPort = null;
@@ -10331,6 +10342,7 @@ export function writeSessionModelPin(
   }
   if (!pin) ds.modelPinCleared = true;
   else delete ds.modelPinCleared;
+  callbacks?.onCodexCapacitySettle?.(ds, 'model_pin_changed');
   dashboardEventBus.publish({ type: 'session.update', body: { sessionId: ds.session.sessionId,
     patch: { modelPin: resolveSessionModelPinView(ds, cfg) ?? null } } });
   try { scheduleActiveRuntimePatch(ds); } catch (error) { logger.warn(`[${tag(ds)}] Pin card refresh failed: ${String(error)}`); }
@@ -14090,6 +14102,7 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle', stil
   const suspendedInteractiveTurnId = ds.activeInteractiveTurn?.turnId;
   ds.activeInteractiveTurn = undefined;
   if (suspendedInteractiveTurnId) callbacks?.onManagedTurnOriginRevoked?.(ds, suspendedInteractiveTurnId);
+  callbacks?.onCodexCapacitySettle?.(ds, 'suspendWorker');
   // The worker is being suspended — the CLI will be destroyed and cold-resumed
   // later. Invalidate any stuck-warning card so a late click cannot inject keys
   // after the CLI is gone (or into a different CLI on resume).
@@ -23499,6 +23512,7 @@ function setupWorkerHandlers(
   // can leave a stale card that would otherwise inject keys into the new CLI.
   invalidateStuckWarning(ds, 'new_worker_generation');
   invalidateTuiPrompt(ds, 'new_worker_generation');
+  callbacks?.onCodexCapacitySettle?.(ds, 'new_worker_generation');
   // Managed turn authority is issued by one concrete worker lifetime. A
   // replacement must advertise a fresh capability before daemon-mediated
   // exits may use it; carrying the old value across a restore/refork would
@@ -26705,6 +26719,24 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'codex_capacity_retry': {
+        if (!ownsLifecycleMutation()) break;
+        if (managedAuxUiSuppressed(msg.turnId)) break;
+        callbacks?.onCodexCapacityRetry?.(ds, {
+          turnId: msg.turnId,
+          nativeSessionId: msg.nativeSessionId,
+          ...(msg.model ? { model: msg.model } : {}),
+          ...(msg.codexTurnId ? { codexTurnId: msg.codexTurnId } : {}),
+          ...(msg.retryAttempt !== undefined ? { retryAttempt: msg.retryAttempt } : {}),
+          ...(msg.maxRetries !== undefined ? { maxRetries: msg.maxRetries } : {}),
+          ...(msg.retryDelaySec !== undefined ? { retryDelaySec: msg.retryDelaySec } : {}),
+          observedAtMs: msg.observedAtMs,
+          worker,
+          reply: text => scopedReply(text, 'text', msg.turnId),
+        });
+        break;
+      }
+
       case 'restart_result': {
         if (ds.worker !== worker) {
           logger.warn(`[${t}] Ignored restart_result from stale worker generation`);
@@ -28472,6 +28504,7 @@ function setupWorkerHandlers(
         // click could inject its keys into the replacement CLI.
         invalidateStuckWarning(ds, 'claude_exit');
         invalidateTuiPrompt(ds, 'claude_exit');
+        callbacks?.onCodexCapacitySettle?.(ds, 'claude_exit');
         logger.info(`[${t}] ${sessionCliDisplayName(ds, botCfg)} exited (code: ${msg.code}, signal: ${msg.signal})`);
         ds.hasHistory = true;
         try {
@@ -29912,6 +29945,7 @@ function setupWorkerHandlers(
           ds.session,
           readonlyTerminal,
         );
+        callbacks?.onCodexCapacitySettle?.(ds, `turn_terminal:${msg.status}`, msg.turnId);
         const ordinaryHttpTerminal = codexCapacityRecoveryCli(sessionCliId(ds, botCfg)) && (ds.pendingWaitPromises?.has(msg.turnId)
           || ds.asyncTriggerResults?.has(msg.turnId)
           || ds.settledHttpTerminalTurns?.has(msg.turnId));
@@ -31301,6 +31335,7 @@ function setupWorkerHandlers(
       }
 
       case 'final_output': {
+        if (msg.turnId) callbacks?.onCodexCapacitySettle?.(ds, 'final_output', msg.turnId);
         if (!msg.handoff) {
           if (effectiveCliId === 'codex' && msg.sessionId === ds.session.sessionId) terminateProgressDelivery(ds, msg.turnId, msg.dispatchAttempt);
           await processFinalOutput(msg);
@@ -32041,6 +32076,7 @@ function setupWorkerHandlers(
       ds.scheduledControlActors = undefined;
       ds.taskContinuationRpcProof = undefined;
       ds.activeInteractiveTurn = undefined;
+      callbacks?.onCodexCapacitySettle?.(ds, 'worker_exit');
       if (ds.remoteCloseState) {
         ds.remoteCloseState = { ...ds.remoteCloseState, phase: 'uncertain' };
         noteRiffCloseWorkerGone(ds, { exited: true });
