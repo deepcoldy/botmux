@@ -60,6 +60,8 @@ describe('policy', () => {
     [{ enabled: true, tools: ['lark-cli'], credentialSource: 'local' }, 'off'],
     [{ enabled: true, tools: ['lark-cli'] }, 'prefer-bot-app'],
     [{ enabled: true, tools: ['lark-cli'], credentialSource: 'platform' }, 'platform-only'],
+    [{ enabled: true, tools: ['lark-cli', 'bytedcli'], credentialSource: { 'lark-user': 'local', bytecloud: 'platform' } }, 'off'],
+    [{ enabled: true, tools: ['lark-cli', 'bytedcli'], credentialSource: { 'lark-user': 'platform', bytecloud: 'local' } }, 'platform-only'],
   ])('%j → %s', (tua, expected) => {
     expect(boundLarkPlatformPolicy(bot(tua))).toBe(expected);
   });
@@ -69,6 +71,18 @@ describe('resolveBoundLarkUserCredential', () => {
   it('without trigger-user auth for lark-cli the platform is never asked', async () => {
     const { result } = resolve(bot(), null);
     expect(await result).toEqual({ ok: false, reason: 'bot_app_missing' });
+    expect(grantCalls).toHaveLength(0);
+  });
+
+  it('uses only bot-app OAuth when Lark is local and ByteCloud is platform', async () => {
+    const config = bot({ enabled: true, credentialSource: { 'lark-user': 'local', bytecloud: 'platform' } });
+    const { result } = resolve(config, null);
+    expect(await result).toEqual({ ok: false, reason: 'bot_app_missing' });
+    expect(await platformAuthRequestRedirect({
+      bot: config, openId: 'ou_person', delegated: false, scopes: ['lark:read'],
+      botAppToken: async () => null,
+    })).toBeNull();
+    expect(await resolve(config, 'bot-app-token').result).toEqual({ ok: true, appId: 'cli_bot', credential: 'bot-app-token' });
     expect(grantCalls).toHaveLength(0);
   });
 

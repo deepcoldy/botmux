@@ -22,7 +22,7 @@ import {
 } from '../src/core/raw-command-writer.js';
 
 describe('raw command backend acceptance', () => {
-  it.each(['write', 'sendText', 'pasteText', 'coco'] as const)(
+  it.each(['write', 'sendText', 'pasteText', 'sendBracketedPaste', 'coco'] as const)(
     'stops later command bytes after ownership changes during %s delivery', async mode => {
       let current = true;
       const text: string[] = [], keys: string[] = [];
@@ -32,18 +32,33 @@ describe('raw command backend acceptance', () => {
           sendText: (data: string) => { text.push(data); },
           sendSpecialKeys: (key: string) => { keys.push(key); },
         } : {}),
+        ...(mode === 'sendBracketedPaste' ? {
+          sendBracketedPaste: (data: string) => { text.push(data); },
+        } : {}),
         ...(mode === 'pasteText' ? {
           supportsRawCommandPasteLine: true,
           pasteText: (data: string) => { text.push(data); },
         } : {}),
       };
-      const opts = { coco: mode === 'coco', pasteLine: mode === 'pasteText',
+      const opts = { coco: mode === 'coco', pasteLine: mode === 'pasteText', bracketedPaste: mode === 'sendBracketedPaste',
         delay: async () => { current = false; }, isCurrent: () => current };
       expect(await writeRawCommandLine(backend, '/compact', opts)).toBe(false);
       expect(text).toEqual([mode === 'coco' ? '/' : '/compact']);
       expect(keys).toEqual([]);
     },
   );
+  it('never replays a bracketed submit whose result is ambiguous', async () => {
+    const submitBracketedPaste = vi.fn(() => false);
+    const write = vi.fn();
+    const sendSpecialKeys = vi.fn();
+    expect(await writeRawCommandLine({ submitBracketedPaste, write, sendSpecialKeys }, '/rename title', {
+      bracketedPaste: true,
+    })).toBe(false);
+    expect(submitBracketedPaste).toHaveBeenCalledExactlyOnceWith('/rename title');
+    expect(write).not.toHaveBeenCalled();
+    expect(sendSpecialKeys).not.toHaveBeenCalled();
+  });
+
   it.each([typeRawCommandLine, writeRawCommandLine])('refuses a retired writer before the first byte (%s)', async writer => {
     const write = vi.fn();
     expect(await writer({ write }, '/compact', { isCurrent: () => false })).toBe(false);

@@ -26,6 +26,7 @@ Botmux 插件就是**一个 npm 包**。装上之后，它可以给 Agent 加 Sk
 | Host Service | 常驻后台进程，比如本地 HTTP 服务 | `service/index.js` |
 | 飞书斜杠指令 | 群里发 `/xxx` 直接交给插件处理 | `commands/index.json`（需要 Host Service） |
 | 卡片按钮回调 | 插件发的卡片，按钮点击交给插件处理 | `card-actions/index.json`（需要 Host Service） |
+| 外部 Webhook | 接收外部系统的 HTTP `POST` 回调并原样转发给插件服务 | `webhooks/index.json`（需要 Host Service） |
 
 没有通用的 daemon/worker 钩子。长期运行的逻辑放进 Host Service，给 Agent 的能力放进 MCP 或 Skill，给人用的运维入口放进 CLI 命令。
 
@@ -370,7 +371,15 @@ export default function PluginDashboard({ pluginId, api }) {
 | `getServiceStatus()` | 查看本插件 Service 的状态 |
 | `startService()` / `stopService()` / `restartService()` | 控制本插件 Service |
 | `getSettings()` / `saveSettings(value)` | 通过设置适配器读写配置 |
+| `serviceFetch(path, init?)` | 经 Dashboard 管理员鉴权与 CSRF 校验的同源代理请求本插件本地 HTTP Service（`/api/plugins/<plugin-id>/service/...`），远程 HTTPS 隧道下也能直接调用 |
 | `listBots()` | 列出可管理的 Bot |
+
+**通过 `serviceFetch` 调用本地 Host Service**：当用户通过远程 HTTPS 隧道打开 Dashboard 时，浏览器无法直连 `127.0.0.1:<port>`。插件前端调用 `api.serviceFetch('/status')` 或 `api.serviceFetch('/tasks', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(...) })`：
+
+- 宿主自动把相对路径归一化到 `/api/plugins/<plugin-id>/service/...`（拒绝绝对 URL、`//` 与 `..` 路径穿越），携带同源会话凭证、`redirect: 'manual'` 与 `x-botmux-csrf`；
+- Dashboard 服务端校验管理员身份（`canManageHost`）、阻断顶层文档导航、对 `POST`/`PUT`/`PATCH`/`DELETE` 强制同源 + CSRF 校验（对 `GET`/`HEAD` 同样拦截跨站/同站非同源请求），并禁止代理访问内部宿主回调路径（`/botmux/*`、`card-actions` 与 `commands` 的 `endpoint`），再经 `node:http` 直连 `127.0.0.1:<port>`（绕过环境代理），剥离浏览器 Cookie/CSRF 头并自动注入 `Authorization: Bearer <BOTMUX_PLUGIN_CARD_ACTION_TOKEN>`；
+- 支持 JSON、二进制、`FormData` 与 SSE 流式响应，且不占用 `withPluginServiceLock`；上游若使用 SSE，请每 15–25 秒发送 `: keepalive\n\n` 心跳以防反代空闲超时；
+- 响应头会自动清除 `Set-Cookie`/`Access-Control-*` 并附加 `Content-Security-Policy: default-src 'none'; sandbox`、`X-Content-Type-Options: nosniff`；上游返回 `401` 时不会触发 Dashboard 自身的重登弹窗。
 
 **设置适配器**：要用 `getSettings` / `saveSettings`，插件需要提供 `dist/server/settings.js`，同时导出两个函数：
 
@@ -419,7 +428,13 @@ export default {
 - `pm2` 这个字段名只是为了兼容老插件保留的，实际由 Botmux 内置 supervisor 解析，不需要装 PM2。支持 `script`、`args`、`cwd`、`env`、`autorestart`、`killTimeoutMs`、`watchDelayMs`。
 - 导出里的 `mode` 如果写了，必须和 manifest 一致。
 - `urls()` 拿到的 `host` 已经是能直接拼进 URL 的格式（IPv6 自带方括号）。
-- Service 进程会拿到环境变量 `BOTMUX_PLUGIN_ID`、`BOTMUX_PLUGIN_DIR`、`BOTMUX_PLUGIN_HOME`。
+- Service 进程会拿到以下宿主环境变量（由宿主强制覆盖，无法通过 `pm2.env` 伪造）：
+  - `BOTMUX_PLUGIN_ID`：插件 ID；
+  - `BOTMUX_PLUGIN_DIR`：运行时目录（`~/.botmux/plugins/<id>/dist`）；
+  - `BOTMUX_PLUGIN_HOME`：插件私有主目录（`~/.botmux/plugins/<id>`）；
+  - `BOTMUX_DATA_DIR`：当前实际生效的 Botmux 数据目录（按 `SESSION_DATA_DIR` > `~/.botmux/.data-dir` > `~/.botmux/data` 解析），无需硬编码 `~/.botmux`；
+  - `BOTMUX_BIN`：当前可直接执行的 `botmux` CLI 入口绝对路径（独立二进制版指向二进制本身，源码/开发态指向当前 wrapper），无需依赖 `PATH`；
+  - `PORT`、`BOTMUX_PLUGIN_CARD_ACTION_TOKEN` 与 `BOTMUX_PLUGIN_WEBHOOK_TOKEN`：当插件声明了 `commands`、`card-actions` 或 `webhooks` 时必须提供固定 `port`，宿主自动注入 `PORT` 与每插件独立的 43 字符回环 Bearer Token（其中 `webhooks` 使用独立的 `BOTMUX_PLUGIN_WEBHOOK_TOKEN`，与内部宿主回调/Dashboard 代理使用的 `BOTMUX_PLUGIN_CARD_ACTION_TOKEN` 隔离）；仅声明了有效 `port`（供 Dashboard `serviceFetch` 代理）的 HTTP 服务同样会自动获得 `BOTMUX_PLUGIN_CARD_ACTION_TOKEN`。
 - 用单文件版 Botmux 时，JS 脚本由它内嵌的 Bun 执行，不需要另装 Node。
 - 用 `--link` 开发时，`dist/` 有变化（存在 `dist/botmux-build/` 时只看它）Service 会自动重启。
 
@@ -513,6 +528,35 @@ export default {
 ```
 
 `toast` 是点击后的轻提示（`success` / `info` / `warning` / `error`），`card` 用来原地更新卡片，都可省略。插件仍要在每次点击时自己校验 `privileges`，不能把发卡时的权限当成点击时的授权。
+
+### 外部 Webhook
+
+插件可以声明外部 Webhook 路由，直接复用 Dashboard 现有的 HTTPS 隧道或公网入口接收第三方系统的 `POST` 回调，并由宿主转发到插件本地 HTTP 服务。
+
+**声明**：提供 `dist/webhooks/index.json`，必须同时具备 Host Service 与固定 `port`（无此声明的插件默认不暴露任何 Webhook 路由）：
+
+```json
+{
+  "schemaVersion": 1,
+  "maxBodyBytes": 1048576,
+  "routes": [
+    { "path": "/events" },
+    { "path": "/hooks", "prefix": true, "endpoint": "/internal/hooks", "maxBodyBytes": 524288 }
+  ]
+}
+```
+
+- `routes` 至少 1 条、最多 32 条，`path` 必须以 `/` 开头、不含尾部 `/`、`//`、`\`、空白或 `.`/`..` 段，且不能重复；
+- `prefix: true`（可选）表示按路径段边界匹配 `path` 及 `path/*`（精确匹配优先，其次最长前缀）；未设置时只做精确匹配；
+- `endpoint`（可选）指定转发到插件本地服务的上游路径；省略时沿用请求匹配到的相对路径（前缀匹配时自动拼接后续后缀与原始 query string）；前缀路由禁止把 `endpoint` 设为 `/`，且任何路由不得与 `/botmux/*`、`commands.endpoint` 或 `card-actions.endpoint` 重叠；
+- `maxBodyBytes`（可选）支持在顶层或单条路由配置请求体字节上限，默认 `1048576`（1 MiB），硬上限 5 MiB；超限直接返回 `413`。
+
+**入口路径与转发约定**：外部请求打到 `POST /webhook/plugin/<plugin-id><path>`（挂在 Dashboard 鉴权中间件之前）：
+
+- 仅放行 `POST`（其他方法返回 `405`）；未安装插件或未声明路由返回 `404`；本地服务未运行或回环令牌不可用返回 `503`；路径穿越或非法 framing 返回 `400`；触发入口限流返回 `429`；
+- **原始请求体逐字节保真**：宿主不做 JSON 解析/重序列化，也不解压 `Content-Encoding`，将原始字节流与外部请求头（含自定义签名头，如 HMAC 签名头）原样经 `node:http` 直连 `127.0.0.1:<port>` 转发；
+- 宿主剥离外部 `Cookie`、`x-botmux-*` 与 hop-by-hop 头，注入独立的 Webhook 回环令牌 `Authorization: Bearer <BOTMUX_PLUGIN_WEBHOOK_TOKEN>`（若外部请求带有 `Authorization`，原值放在 `x-botmux-webhook-forwarded-authorization`），并附带 `x-botmux-webhook-plugin-id`、`x-botmux-webhook-route`、`x-botmux-webhook-original-path`；
+- **安全责任边界**：Botmux 核心保持厂商中立，不内置任何具体厂商的签名算法。插件服务端必须同时验证两道防线：① 校验 `Authorization: Bearer <BOTMUX_PLUGIN_WEBHOOK_TOKEN>` 确认请求来自宿主（该令牌与内部回调/Dashboard 代理使用的 `BOTMUX_PLUGIN_CARD_ACTION_TOKEN` 独立隔离）；② 基于原始请求体字节自行完成第三方 Webhook 签名校验（例如 HMAC-SHA256 恒定时间比对）与防重放。
 
 ## 本地构建与验收
 
@@ -675,7 +719,7 @@ gh pr create \
 - [ ] `dist/` 自包含，离开源码和 `node_modules` 能运行；
 - [ ] `npm pack --dry-run` 不含敏感文件；
 - [ ] manifest、各扩展入口都通过校验；
-- [ ] Service 导出的 `mode` 和 manifest 一致；用了斜杠指令或卡片回调时写了固定 `port`；
+- [ ] Service 导出的 `mode` 和 manifest 一致；用了斜杠指令、卡片回调或外部 Webhook 时写了固定 `port`；
 - [ ] 本地目录和真实 tarball 都装过、验过；
 - [ ] npm 发布后核对版本、dist-tag 和 integrity；
 - [ ] 市场条目跑过 `npm run build && npm test`，PR 同时包含条目文件和 `index.json`。

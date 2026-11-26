@@ -75,11 +75,12 @@
  * Pure I/O. Attribution belongs in CodexBridgeQueue.
  */
 import { createHash } from 'node:crypto';
-import { closeSync, existsSync, fstatSync, openSync, readSync, statSync } from 'node:fs';
+import { closeSync, constants, existsSync, fstatSync, openSync, readSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import type { CodexBridgeEvent } from './codex-transcript.js';
-import { beginJsonlDrain, iterateJsonlLines, scanJsonlFromOffset } from './jsonl-cursor.js';
+import type { AntigravityTranscriptWriteBoundary } from '../utils/cli-usage-limit.js';
+import { beginJsonlDrain, iterateJsonlLines, scanJsonlFromFd, scanJsonlFromOffset } from './jsonl-cursor.js';
 
 const CONVERSATION_ID_RE = /^[A-Za-z0-9._-]+$/;
 const COMPACT_TRANSCRIPT_NAME = 'transcript.jsonl';
@@ -250,6 +251,100 @@ export function mapAntigravityCompactOffsetToFull(
       mapped = lineStart + Buffer.byteLength(line, 'utf8') + 1;
     },
   });
+  return aligned ? mapped : undefined;
+}
+
+/**
+ * Inverse of {@link mapAntigravityCompactOffsetToFull}: re-express a byte
+ * offset in `transcript_full.jsonl` as the equivalent byte offset in its
+ * `transcript.jsonl` compact sibling using record count + first/boundary
+ * `step_index:type` alignment on single-fd reads (fail closed on any skew).
+ */
+export function mapAntigravityFullOffsetToCompact(
+  fullPath: string,
+  fullOffset: number,
+  compactPath: string,
+): number | undefined {
+  if (!Number.isSafeInteger(fullOffset) || fullOffset < 0 || !existsSync(compactPath)) return undefined;
+  if (fullOffset === 0) return 0;
+
+  let records = 0;
+  let firstLine: string | undefined;
+  let lastLine: string | undefined;
+  let fullFd: number | undefined;
+  try {
+    fullFd = openSync(fullPath, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
+    const st = fstatSync(fullFd);
+    if (!st.isFile() || st.size < fullOffset) return undefined;
+    const scanned = scanJsonlFromFd(fullFd, 0, {
+      endOffset: fullOffset,
+      onLine: line => {
+        if (!line.trim()) return;
+        records++;
+        firstLine ??= line;
+        lastLine = line;
+      },
+    });
+    if (!scanned) return undefined;
+    if (scanned.newOffset + Buffer.byteLength(scanned.pendingTail, 'utf8') < fullOffset) return undefined;
+    if (scanned.pendingTail.trim()) {
+      records++;
+      firstLine ??= scanned.pendingTail;
+      lastLine = scanned.pendingTail;
+    }
+  } catch {
+    return undefined;
+  } finally {
+    if (fullFd !== undefined) {
+      try { closeSync(fullFd); } catch { /* ignore */ }
+    }
+  }
+  if (records === 0 || !firstLine || !lastLine) return undefined;
+  const origin = stepIdentity(firstLine);
+  const boundary = stepIdentity(lastLine);
+  if (origin === undefined || boundary === undefined) return undefined;
+
+  let seen = 0;
+  let mapped: number | undefined;
+  let aligned = true;
+  let compactFd: number | undefined;
+  try {
+    compactFd = openSync(compactPath, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
+    const st = fstatSync(compactFd);
+    if (!st.isFile()) return undefined;
+    const scanned = scanJsonlFromFd(compactFd, 0, {
+      onLine: (line, lineStart) => {
+        if (!aligned || mapped !== undefined || !line.trim()) return;
+        seen++;
+        if (seen === 1 && stepIdentity(line) !== origin) {
+          aligned = false;
+          return;
+        }
+        if (seen < records) return;
+        if (stepIdentity(line) !== boundary) {
+          aligned = false;
+          return;
+        }
+        mapped = lineStart + Buffer.byteLength(line, 'utf8') + 1;
+      },
+    });
+    if (!scanned) return undefined;
+    if (aligned && mapped === undefined && scanned.pendingTail.trim()) {
+      seen++;
+      if (seen === 1 && stepIdentity(scanned.pendingTail) !== origin) {
+        aligned = false;
+      } else if (seen === records) {
+        if (stepIdentity(scanned.pendingTail) !== boundary) aligned = false;
+        else mapped = scanned.newOffset + Buffer.byteLength(scanned.pendingTail, 'utf8');
+      }
+    }
+  } catch {
+    return undefined;
+  } finally {
+    if (compactFd !== undefined) {
+      try { closeSync(compactFd); } catch { /* ignore */ }
+    }
+  }
   return aligned ? mapped : undefined;
 }
 
@@ -1185,7 +1280,9 @@ export function resolveAntigravityCandidateMinByteOffset(
     return mapped === undefined ? null : mapped;
   }
   if (antigravityCompactSiblingPath(sampled) === transcriptPath) {
-    return candidate.minByteOffset === 0 ? 0 : null;
+    if (candidate.minByteOffset === 0) return 0;
+    const mapped = mapAntigravityFullOffsetToCompact(sampled, candidate.minByteOffset, transcriptPath);
+    return mapped === undefined ? null : mapped;
   }
   return null;
 }
@@ -1230,38 +1327,727 @@ function extractBotmuxMessageLocationId(unwrappedUserInput: string): string | un
   return match?.[1];
 }
 
-/** 从 Antigravity 原生 transcript 判定哪些候选非 durable 回合已被消费并完成。
- *  仅当 transcript 尾部不处于忙碌态，且候选回合对应的独立 USER_INPUT 之后
- *  存在非空无工具调用的 PLANNER_RESPONSE（DONE）时，才认定其已完成（fail-closed）。 */
-export function findCompletedAntigravityTurnIds(
-  transcriptPath: string,
-  candidates: readonly AntigravityCompletedTurnCandidate[],
-): Set<string> {
-  const result = new Set<string>();
-  if (candidates.length === 0 || !existsSync(transcriptPath)) return result;
-  // 最新回合仍有未完成的非 daemon 后台任务或 subagent 时，其无工具 PLANNER_RESPONSE 只是等待旁白，
-  // 绝不能提前判定该回合已结束并回收归属权。
-  if (hasAntigravityTranscriptPendingTasks(transcriptPath)) return result;
+// ─── Single Stat-Bounded Paired Transcript Snapshots ─────────────────────────
 
+export interface StatBoundedFileMeta {
+  readonly dev: bigint;
+  readonly ino: bigint;
+  readonly size: number;
+  readonly mtimeNs: bigint;
+}
+
+export type PairedSnapshotFailureReason =
+  | 'sibling-missing'
+  | 'empty-file'
+  | 'incomplete-tail'
+  | 'unstable-concurrent-write'
+  | 'not-regular-file'
+  | 'unreadable'
+  | 'offset-unmappable';
+
+export interface ParsedTranscriptRecord {
+  readonly rec: Record<string, unknown>;
+  readonly lineStart: number;
+  readonly lineEnd: number;
+}
+
+export interface ParsedTranscriptSnapshot {
+  readonly path: string;
+  readonly meta: StatBoundedFileMeta;
+  readonly windowStart: number;
+  readonly isWholeFile: boolean;
+  readonly records: readonly ParsedTranscriptRecord[];
+}
+
+export type PairedTranscriptSnapshotsResult =
+  | { readonly ok: true; readonly full: ParsedTranscriptSnapshot; readonly compact: ParsedTranscriptSnapshot }
+  | { readonly ok: false; readonly reason: PairedSnapshotFailureReason; readonly pendingSibling: boolean };
+
+export interface ReadVerifiedSnapshotOptions {
+  readonly initialTailBytes: number;
+  readonly maxTailBytes: number;
+  readonly isSufficient?: (
+    records: readonly ParsedTranscriptRecord[],
+    windowStart: number,
+    path: string,
+  ) => boolean;
+  /** Deterministic test hook fired on the opened fd right before stability check. */
+  readonly onAfterReadForTest?: (path: string) => void;
+}
+
+export interface ReadPairedSnapshotsOptions extends Omit<ReadVerifiedSnapshotOptions, 'isSufficient'> {
+  readonly isSufficient?: (
+    records: readonly ParsedTranscriptRecord[],
+    windowStart: number,
+    path: string,
+    compactSibling?: ParsedTranscriptSnapshot,
+  ) => boolean;
+  /** Deterministic test hook fired between reading compact and full siblings. */
+  readonly onAfterFirstSiblingForTest?: () => void;
+}
+
+const MAX_SNAPSHOT_ATTEMPTS = 2;
+const NO_OUTPUT_INITIAL_TAIL_BYTES = 256 * 1024;
+const NO_OUTPUT_MAX_TAIL_BYTES = 4 * 1024 * 1024;
+const PAIRED_COMPLETION_PROVENANCE_MAX_BYTES = 64 * 1024 * 1024;
+const ALLOWED_NO_OUTPUT_TRAILING_TYPES = new Set(['CHECKPOINT', 'TASK_NOTIFICATION']);
+
+function isPendingFailureReason(reason: PairedSnapshotFailureReason): boolean {
+  return reason === 'sibling-missing'
+    || reason === 'empty-file'
+    || reason === 'incomplete-tail'
+    || reason === 'unstable-concurrent-write'
+    || reason === 'offset-unmappable';
+}
+
+function sameBigIntMeta(meta: StatBoundedFileMeta, st: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint }): boolean {
+  return st.dev === meta.dev
+    && st.ino === meta.ino
+    && Number(st.size) === meta.size
+    && st.mtimeNs === meta.mtimeNs;
+}
+
+function readExactBytes(fd: number, length: number, position: number): Buffer | null {
+  const buf = Buffer.allocUnsafe(length);
+  let filled = 0;
+  while (filled < length) {
+    const n = readSync(fd, buf, filled, length - filled, position + filled);
+    if (n <= 0) return null;
+    filled += n;
+  }
+  return buf;
+}
+
+function parseStrictJsonlWindow(
+  buf: Buffer,
+  windowStart: number,
+): { ok: true; records: ParsedTranscriptRecord[] } | { ok: false; reason: 'incomplete-tail' } {
+  if (buf.length === 0 || buf[buf.length - 1] !== 0x0a) {
+    return { ok: false, reason: 'incomplete-tail' };
+  }
+  let pos = 0;
+  if (windowStart > 0) {
+    const firstNl = buf.indexOf(0x0a);
+    if (firstNl < 0) return { ok: false, reason: 'incomplete-tail' };
+    pos = firstNl + 1;
+  }
+  const records: ParsedTranscriptRecord[] = [];
+  while (pos < buf.length) {
+    const nl = buf.indexOf(0x0a, pos);
+    if (nl < 0) return { ok: false, reason: 'incomplete-tail' };
+    const lineStart = windowStart + pos;
+    const lineEnd = windowStart + nl + 1;
+    const text = buf.subarray(pos, nl).toString('utf8').trim();
+    pos = nl + 1;
+    if (!text) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      return { ok: false, reason: 'incomplete-tail' };
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { ok: false, reason: 'incomplete-tail' };
+    }
+    records.push({ rec: parsed as Record<string, unknown>, lineStart, lineEnd });
+  }
+  return { ok: true, records };
+}
+
+/**
+ * Read a transcript file tail on ONE opened fd with strict pre/post stability
+ * checks (`fstatSync` + `statSync` on `(dev, ino, size, mtimeNs)`) and strict
+ * line-by-line JSON parsing. Eliminates TOCTOU between tail validation,
+ * pending-task scanning, and completion / no-output proofs.
+ */
+export function readVerifiedTranscriptSnapshot(
+  path: string,
+  opts: ReadVerifiedSnapshotOptions,
+): { readonly ok: true; readonly snapshot: ParsedTranscriptSnapshot }
+  | { readonly ok: false; readonly reason: PairedSnapshotFailureReason } {
+  let lastReason: PairedSnapshotFailureReason = 'unreadable';
+  for (let attempt = 0; attempt < MAX_SNAPSHOT_ATTEMPTS; attempt++) {
+    let fd: number | undefined;
+    try {
+      fd = openSync(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
+    } catch (err: any) {
+      if (err?.code === 'ENOENT') return { ok: false, reason: 'sibling-missing' };
+      return { ok: false, reason: 'unreadable' };
+    }
+    try {
+      const stBefore = fstatSync(fd, { bigint: true });
+      if (!stBefore.isFile()) return { ok: false, reason: 'not-regular-file' };
+      const size = Number(stBefore.size);
+      if (!Number.isSafeInteger(size) || size <= 0) return { ok: false, reason: 'empty-file' };
+      const meta: StatBoundedFileMeta = {
+        dev: stBefore.dev,
+        ino: stBefore.ino,
+        size,
+        mtimeNs: stBefore.mtimeNs,
+      };
+
+      let span = Math.min(size, Math.max(1, opts.initialTailBytes));
+      let windowStart = size - span;
+      let buf = readExactBytes(fd, span, windowStart);
+      if (!buf) {
+        lastReason = 'unstable-concurrent-write';
+        continue;
+      }
+
+      let parsed = parseStrictJsonlWindow(buf, windowStart);
+      while (
+        windowStart > 0
+        && span < opts.maxTailBytes
+        && (!parsed.ok || (opts.isSufficient && !opts.isSufficient(parsed.records, windowStart, path)))
+      ) {
+        const nextSpan = Math.min(size, Math.min(span * 4, opts.maxTailBytes));
+        if (nextSpan <= span) break;
+        const nextWindowStart = size - nextSpan;
+        const delta = readExactBytes(fd, windowStart - nextWindowStart, nextWindowStart);
+        if (!delta) {
+          buf = null;
+          break;
+        }
+        buf = Buffer.concat([delta, buf]);
+        span = nextSpan;
+        windowStart = nextWindowStart;
+        parsed = parseStrictJsonlWindow(buf, windowStart);
+      }
+
+      if (!buf) {
+        lastReason = 'unstable-concurrent-write';
+        continue;
+      }
+
+      opts.onAfterReadForTest?.(path);
+
+      // Re-verify fd and path stability BEFORE returning any verdict.
+      let stAfter: ReturnType<typeof fstatSync> | undefined;
+      let stPath: ReturnType<typeof statSync> | undefined;
+      try {
+        stAfter = fstatSync(fd, { bigint: true });
+        stPath = statSync(path, { bigint: true });
+      } catch {
+        lastReason = 'unstable-concurrent-write';
+        continue;
+      }
+      if (!sameBigIntMeta(meta, stAfter as any) || !sameBigIntMeta(meta, stPath as any)) {
+        lastReason = 'unstable-concurrent-write';
+        continue;
+      }
+
+      if (!parsed.ok) {
+        return { ok: false, reason: parsed.reason };
+      }
+
+      return {
+        ok: true,
+        snapshot: {
+          path,
+          meta,
+          windowStart,
+          isWholeFile: windowStart === 0,
+          records: parsed.records,
+        },
+      };
+    } catch {
+      return { ok: false, reason: 'unreadable' };
+    } finally {
+      try { closeSync(fd); } catch { /* ignore */ }
+    }
+  }
+  return { ok: false, reason: lastReason };
+}
+
+/**
+ * Read BOTH `transcript.jsonl` (compact) and `transcript_full.jsonl` (full) as
+ * a single stability-verified paired snapshot. For native transcript paths, a
+ * missing sibling unconditionally fails closed (never infers legacy single-log
+ * capability). For non-native custom test file paths, reads that single file
+ * through the same stat-bounded snapshot verifier.
+ */
+export function readPairedAntigravitySnapshots(
+  transcriptPath: string,
+  opts: ReadPairedSnapshotsOptions,
+): PairedTranscriptSnapshotsResult {
+  if (!transcriptPath) {
+    return { ok: false, reason: 'sibling-missing', pendingSibling: true };
+  }
+  const base = basename(transcriptPath);
+  const isNativePair = base === COMPACT_TRANSCRIPT_NAME || base === FULL_TRANSCRIPT_NAME;
+  if (!isNativePair) {
+    const single = readVerifiedTranscriptSnapshot(transcriptPath, {
+      ...opts,
+      isSufficient: opts.isSufficient
+        ? (records, windowStart, path) => opts.isSufficient!(records, windowStart, path, undefined)
+        : undefined,
+    });
+    if (!single.ok) {
+      return { ok: false, reason: single.reason, pendingSibling: isPendingFailureReason(single.reason) };
+    }
+    return { ok: true, full: single.snapshot, compact: single.snapshot };
+  }
+
+  const compactPath = base === COMPACT_TRANSCRIPT_NAME
+    ? transcriptPath
+    : antigravityCompactSiblingPath(transcriptPath)!;
+  const fullPath = base === FULL_TRANSCRIPT_NAME
+    ? transcriptPath
+    : antigravityFullSiblingPath(transcriptPath)!;
+
+  let lastReason: PairedSnapshotFailureReason = 'unstable-concurrent-write';
+  for (let attempt = 0; attempt < MAX_SNAPSHOT_ATTEMPTS; attempt++) {
+    const compactRes = readVerifiedTranscriptSnapshot(compactPath, {
+      ...opts,
+      isSufficient: opts.isSufficient
+        ? (records, windowStart, path) => opts.isSufficient!(records, windowStart, path, undefined)
+        : undefined,
+    });
+    if (!compactRes.ok) {
+      if (compactRes.reason === 'unstable-concurrent-write') {
+        lastReason = compactRes.reason;
+        continue;
+      }
+      return {
+        ok: false,
+        reason: compactRes.reason,
+        pendingSibling: isPendingFailureReason(compactRes.reason),
+      };
+    }
+
+    opts.onAfterFirstSiblingForTest?.();
+
+    const fullRes = readVerifiedTranscriptSnapshot(fullPath, {
+      ...opts,
+      isSufficient: opts.isSufficient
+        ? (records, windowStart, path) => opts.isSufficient!(records, windowStart, path, compactRes.snapshot)
+        : undefined,
+    });
+    if (!fullRes.ok) {
+      if (fullRes.reason === 'unstable-concurrent-write') {
+        lastReason = fullRes.reason;
+        continue;
+      }
+      return {
+        ok: false,
+        reason: fullRes.reason,
+        pendingSibling: isPendingFailureReason(fullRes.reason),
+      };
+    }
+
+    // Cross-sibling stability fence: neither sibling may have changed, rotated,
+    // or disappeared while the other sibling was being read.
+    try {
+      const compactStat = statSync(compactPath, { bigint: true });
+      const fullStat = statSync(fullPath, { bigint: true });
+      if (!sameBigIntMeta(compactRes.snapshot.meta, compactStat)
+        || !sameBigIntMeta(fullRes.snapshot.meta, fullStat)) {
+        lastReason = 'unstable-concurrent-write';
+        continue;
+      }
+    } catch {
+      lastReason = 'unstable-concurrent-write';
+      continue;
+    }
+
+    return { ok: true, full: fullRes.snapshot, compact: compactRes.snapshot };
+  }
+
+  return { ok: false, reason: lastReason, pendingSibling: isPendingFailureReason(lastReason) };
+}
+
+function findLastUserInputIndex(records: readonly ParsedTranscriptRecord[]): number {
+  for (let i = records.length - 1; i >= 0; i--) {
+    if (records[i]!.rec.type === 'USER_INPUT') return i;
+  }
+  return -1;
+}
+
+function pairMatchesLastUserInput(
+  full: ParsedTranscriptSnapshot,
+  compact: ParsedTranscriptSnapshot,
+  writtenInput: string,
+): { fullIdx: number; compactIdx: number } | null {
+  const expected = writtenInput.replace(/\r\n?/g, '\n');
+  const fullIdx = findLastUserInputIndex(full.records);
+  const compactIdx = findLastUserInputIndex(compact.records);
+  if (fullIdx < 0 || compactIdx < 0) return null;
+
+  const fullRec = full.records[fullIdx]!.rec;
+  const compactRec = compact.records[compactIdx]!.rec;
+  if (!isExplicitUserInput(fullRec) || !isExplicitUserInput(compactRec)) return null;
+  if (hasTruncatedContent(fullRec) || typeof fullRec.content !== 'string') return null;
+
+  const fullUnwrapped = unwrapAntigravityUserInput(fullRec.content).replace(/\r\n?/g, '\n');
+  if (fullUnwrapped !== expected) return null;
+
+  if (Number.isInteger(fullRec.step_index) && Number.isInteger(compactRec.step_index)
+    && fullRec.step_index !== compactRec.step_index) {
+    return null;
+  }
+
+  if (hasTruncatedContent(compactRec)) {
+    // Long prompts may be truncated in compact `transcript.jsonl`; require exact
+    // step_index and source alignment with the untruncated full USER_INPUT.
+    if (!Number.isInteger(fullRec.step_index)
+      || !Number.isInteger(compactRec.step_index)
+      || fullRec.step_index !== compactRec.step_index
+      || fullRec.source !== compactRec.source) {
+      return null;
+    }
+  } else {
+    if (typeof compactRec.content !== 'string') return null;
+    const compactUnwrapped = unwrapAntigravityUserInput(compactRec.content).replace(/\r\n?/g, '\n');
+    if (compactUnwrapped !== expected) return null;
+  }
+
+  return { fullIdx, compactIdx };
+}
+
+type TranscriptProofTestHooks = Pick<
+  ReadPairedSnapshotsOptions,
+  'onAfterReadForTest' | 'onAfterFirstSiblingForTest'
+>;
+
+interface PairedCurrentUserInputProof {
+  readonly full: ParsedTranscriptSnapshot;
+  readonly compact: ParsedTranscriptSnapshot;
+  readonly matched: { fullIdx: number; compactIdx: number };
+}
+
+/** Shared fail-closed prefix for no-output and answered proofs. The last
+ * USER_INPUT must belong to THIS write, not an older identical-text turn. */
+function readPairedCurrentUserInput(
+  transcriptPath: string,
+  writtenInput: string,
+  boundary: AntigravityTranscriptWriteBoundary | undefined,
+  testHooks?: TranscriptProofTestHooks,
+): PairedCurrentUserInputProof | undefined {
+  if (!transcriptPath || !writtenInput || !boundary
+    || !Number.isSafeInteger(boundary.minByteOffset) || boundary.minByteOffset < 0) {
+    return undefined;
+  }
+  const skipPriorMatches = boundary.skipPriorMatches ?? 0;
+  if (!Number.isSafeInteger(skipPriorMatches) || skipPriorMatches < 0) return undefined;
+
+  const base = basename(transcriptPath);
+  const isNativePair = base === COMPACT_TRANSCRIPT_NAME || base === FULL_TRANSCRIPT_NAME;
+  const needsCrossSiblingWholeFile = isNativePair
+    && boundary.minByteOffset > 0
+    && boundary.sampledTranscriptPath !== undefined;
+
+  const pair = readPairedAntigravitySnapshots(transcriptPath, {
+    initialTailBytes: NO_OUTPUT_INITIAL_TAIL_BYTES,
+    maxTailBytes: needsCrossSiblingWholeFile ? PAIRED_COMPLETION_PROVENANCE_MAX_BYTES : NO_OUTPUT_MAX_TAIL_BYTES,
+    isSufficient: (records, windowStart, snapPath) => {
+      if (needsCrossSiblingWholeFile && windowStart > 0) return false;
+      if (boundary.minByteOffset > 0
+        && (!boundary.sampledTranscriptPath || boundary.sampledTranscriptPath === snapPath)
+        && windowStart > 0
+        && windowStart >= boundary.minByteOffset) {
+        return false;
+      }
+      if (skipPriorMatches > 0 && windowStart > 0) return false;
+      return findLastUserInputIndex(records) >= 0
+        && !(windowStart > 0 && records.some(r => isTaskResultRecord(r.rec)));
+    },
+    ...testHooks,
+  });
+  if (!pair.ok) return undefined;
+
+  const matched = pairMatchesLastUserInput(pair.full, pair.compact, writtenInput);
+  if (!matched) return undefined;
+  const fullMinOffset = mapMinByteOffsetInSnapshots(boundary, pair.full, pair.compact);
+  const compactMinOffset = mapMinByteOffsetInSnapshots(boundary, pair.compact, pair.full);
+  if (fullMinOffset === null || fullMinOffset === undefined
+    || compactMinOffset === null || compactMinOffset === undefined) {
+    return undefined;
+  }
+  if (pair.full.records[matched.fullIdx]!.lineStart < fullMinOffset
+    || pair.compact.records[matched.compactIdx]!.lineStart < compactMinOffset) {
+    return undefined;
+  }
+  if (skipPriorMatches > 0) {
+    if ((pair.full.windowStart > 0 && pair.full.windowStart >= fullMinOffset)
+      || (pair.compact.windowStart > 0 && pair.compact.windowStart >= compactMinOffset)) {
+      return undefined;
+    }
+    const expected = writtenInput.replace(/\r\n?/g, '\n');
+    const fullByStep = buildFullUserInputStepIndex(pair.full);
+    const fullMatches = countMatchingUserInputsFromOffset(pair.full, expected, fullMinOffset, false, undefined);
+    const compactMatches = countMatchingUserInputsFromOffset(pair.compact, expected, compactMinOffset, true, fullByStep);
+    if (fullMatches <= skipPriorMatches || compactMatches <= skipPriorMatches) return undefined;
+  }
+  return { full: pair.full, compact: pair.compact, matched };
+}
+
+export interface AntigravityNoOutputTurnOptions extends TranscriptProofTestHooks {
+  readonly writeBoundary?: AntigravityTranscriptWriteBoundary;
+}
+
+/**
+ * Paired no-progress proof for safe Antigravity quota auto-replay.
+ *
+ * Requires the current turn's pre-write boundary and returns true ONLY when the
+ * LAST `USER_INPUT` in both siblings matches `writtenInput` at/after that mapped
+ * boundary and has zero subsequent records other than CHECKPOINT/TASK_NOTIFICATION.
+ */
+export function antigravityTurnFailedWithoutOutput(
+  transcriptPath: string,
+  writtenInput: string,
+  opts?: AntigravityNoOutputTurnOptions,
+): boolean {
+  const proof = readPairedCurrentUserInput(
+    transcriptPath,
+    writtenInput,
+    opts?.writeBoundary,
+    opts,
+  );
+  if (!proof) return false;
+
+  for (let i = proof.matched.fullIdx + 1; i < proof.full.records.length; i++) {
+    const type = proof.full.records[i]!.rec.type;
+    if (typeof type !== 'string' || !ALLOWED_NO_OUTPUT_TRAILING_TYPES.has(type)) return false;
+  }
+  for (let i = proof.matched.compactIdx + 1; i < proof.compact.records.length; i++) {
+    const type = proof.compact.records[i]!.rec.type;
+    if (typeof type !== 'string' || !ALLOWED_NO_OUTPUT_TRAILING_TYPES.has(type)) return false;
+  }
+  return true;
+}
+
+function hasPendingTasksInSnapshot(snap: ParsedTranscriptSnapshot): boolean {
+  let turnStart = -1;
+  for (let i = snap.records.length - 1; i >= 0; i--) {
+    if (isExplicitUserInput(snap.records[i]!.rec)) {
+      turnStart = i;
+      break;
+    }
+  }
+  const needsEarlierProvenance = !snap.isWholeFile && snap.records.some(r => isTaskResultRecord(r.rec));
+  if (turnStart < 0 || needsEarlierProvenance) {
+    // Fail closed when the snapshot cannot prove the full turn boundary.
+    return true;
+  }
+  let state: AntigravityTranscriptState = {};
+  const events: CodexBridgeEvent[] = [];
+  for (let i = 0; i < snap.records.length; i++) {
+    state = foldRecord(snap.path, i, snap.records[i]!.rec, 0, events, state, false, false);
+  }
+  return hasAntigravityPendingTasks(state);
+}
+
+export interface AntigravityAnsweredTurnOptions extends TranscriptProofTestHooks {
+  /** Mandatory pre-write transcript boundary so repeated prompts cannot match
+   *  an earlier already-answered turn before the new turn's USER_INPUT flushes. */
+  readonly writeBoundary?: AntigravityTranscriptWriteBoundary;
+  /** Optional native-log refusal timestamp (ms); when set, requires the final
+   *  DONE PLANNER_RESPONSE `created_at` to be at or after this refusal time. */
+  readonly minAnsweredAtMs?: number;
+}
+
+function parseAnswerRecordTimeMs(rec: Record<string, unknown>): { ms: number; wholeSecond: boolean } | undefined {
+  if (typeof rec.created_at !== 'string' || !rec.created_at.trim()) return undefined;
+  const ms = Date.parse(rec.created_at);
+  if (!Number.isFinite(ms)) return undefined;
+  const wholeSecond = !/\.\d{1,9}/.test(rec.created_at);
+  return { ms, wholeSecond };
+}
+
+function resolveMatchedUserInputRawContent(
+  rec: Record<string, unknown>,
+  isCompact: boolean,
+  fullUserInputsByStep: ReadonlyMap<number, Record<string, unknown> | null> | undefined,
+): string | undefined {
+  if (hasTruncatedContent(rec)) {
+    if (!isCompact || !Number.isInteger(rec.step_index) || typeof rec.content !== 'string') return undefined;
+    const siblingRec = fullUserInputsByStep?.get(rec.step_index as number);
+    if (
+      !siblingRec
+      || hasTruncatedContent(siblingRec)
+      || siblingRec.source !== rec.source
+      || typeof siblingRec.content !== 'string'
+    ) {
+      return undefined;
+    }
+    return siblingRec.content;
+  }
+  return typeof rec.content === 'string' ? rec.content : undefined;
+}
+
+function buildFullUserInputStepIndex(
+  full: ParsedTranscriptSnapshot,
+): Map<number, Record<string, unknown> | null> {
+  const byStep = new Map<number, Record<string, unknown> | null>();
+  for (const { rec } of full.records) {
+    if (!isExplicitUserInput(rec) || !Number.isInteger(rec.step_index)) continue;
+    const step = rec.step_index as number;
+    // Fail closed on duplicate step_index in full sibling.
+    byStep.set(step, byStep.has(step) ? null : rec);
+  }
+  return byStep;
+}
+
+function countMatchingUserInputsFromOffset(
+  snap: ParsedTranscriptSnapshot,
+  expected: string,
+  minOffset: number,
+  isCompact: boolean,
+  fullUserInputsByStep: ReadonlyMap<number, Record<string, unknown> | null> | undefined,
+): number {
+  let count = 0;
+  for (const { rec, lineStart } of snap.records) {
+    if (lineStart < minOffset || !isExplicitUserInput(rec)) continue;
+    const rawContent = resolveMatchedUserInputRawContent(rec, isCompact, fullUserInputsByStep);
+    if (rawContent === undefined) continue;
+    const unwrapped = unwrapAntigravityUserInput(rawContent).replace(/\r\n?/g, '\n');
+    if (unwrapped === expected) count += 1;
+  }
+  return count;
+}
+
+/**
+ * Paired answered-turn proof on the same stat-bounded snapshot pair.
+ * Used in default `replyDelivery: 'send'` mode to detect when `agy` internally
+ * retried after a native log 429 and completed the turn with a final answer
+ * without issuing a new `HandleUserInput`.
+ *
+ * Requires an explicit `writeBoundary` (fail-closed when absent or unmappable)
+ * and, when `minAnsweredAtMs` is supplied, requires the answering `PLANNER_RESPONSE`
+ * timestamp to be at or after the refusal timestamp so pre-429 responses or
+ * older repeated prompts can never retire a genuine new refusal.
+ */
+export function antigravityTurnAnsweredInTranscript(
+  transcriptPath: string,
+  writtenInput: string,
+  opts?: AntigravityAnsweredTurnOptions,
+): boolean {
+  const proof = readPairedCurrentUserInput(
+    transcriptPath,
+    writtenInput,
+    opts?.writeBoundary,
+    opts,
+  );
+  if (!proof) return false;
+  const { full, compact, matched } = proof;
+
+  if (hasPendingTasksInSnapshot(full) || hasPendingTasksInSnapshot(compact)) return false;
+
+  const minAnsweredAtMs = opts?.minAnsweredAtMs;
+  const isAnsweredTail = (records: readonly ParsedTranscriptRecord[], userIdx: number): boolean => {
+    let busy = true;
+    let answered = false;
+    let finalAnswerTime: { ms: number; wholeSecond: boolean } | undefined;
+    for (let i = userIdx + 1; i < records.length; i++) {
+      const rec = records[i]!.rec;
+      const type = rec.type;
+      if (type === 'CHECKPOINT' || type === 'TASK_NOTIFICATION') continue;
+      if (type === 'PLANNER_RESPONSE') {
+        if (Array.isArray(rec.tool_calls) && rec.tool_calls.length > 0) {
+          busy = true;
+          answered = false;
+          finalAnswerTime = undefined;
+          continue;
+        }
+        const content = typeof rec.content === 'string' ? rec.content.trim() : '';
+        if (content.length > 0 && (rec.status === undefined || rec.status === 'DONE')) {
+          busy = false;
+          answered = true;
+          finalAnswerTime = parseAnswerRecordTimeMs(rec);
+        }
+        continue;
+      }
+      if (type === 'GENERIC') {
+        busy = true;
+        answered = false;
+        finalAnswerTime = undefined;
+        continue;
+      }
+      if (type === 'ERROR_MESSAGE' || type === 'ERROR' || type === 'SYSTEM_MESSAGE' || type === 'USER_INPUT') {
+        busy = false;
+        answered = false;
+        finalAnswerTime = undefined;
+        continue;
+      }
+    }
+    if (busy || !answered) return false;
+    if (minAnsweredAtMs !== undefined) {
+      if (!finalAnswerTime) return false;
+      const floorMs = finalAnswerTime.wholeSecond
+        ? Math.floor(minAnsweredAtMs / 1000) * 1000
+        : minAnsweredAtMs;
+      if (finalAnswerTime.ms < floorMs) return false;
+    }
+    return true;
+  };
+
+  return isAnsweredTail(full.records, matched.fullIdx)
+    && isAnsweredTail(compact.records, matched.compactIdx);
+}
+
+function recordStepId(rec: Record<string, unknown>): string | undefined {
+  return Number.isInteger(rec.step_index) && typeof rec.type === 'string'
+    ? `${rec.step_index}:${rec.type}`
+    : undefined;
+}
+
+function mapMinByteOffsetInSnapshots(
+  candidate: Pick<AntigravityCompletedTurnCandidate, 'minByteOffset' | 'sampledTranscriptPath'>,
+  target: ParsedTranscriptSnapshot,
+  sibling: ParsedTranscriptSnapshot,
+): number | undefined | null {
+  if (candidate.minByteOffset === undefined) return undefined;
+  const sampled = candidate.sampledTranscriptPath;
+  if (!sampled || sampled === target.path) {
+    if (target.windowStart > 0 && target.windowStart >= candidate.minByteOffset) return null;
+    return candidate.minByteOffset;
+  }
+  if (sampled === sibling.path) {
+    if (candidate.minByteOffset === 0) return 0;
+    // Stay strictly inside the verified stat-bounded snapshot pair (zero post-snapshot disk re-opens).
+    if (!sibling.isWholeFile || !target.isWholeFile) return null;
+    if (sibling.meta.size < candidate.minByteOffset) return null;
+    let count = 0;
+    for (const r of sibling.records) {
+      if (r.lineStart < candidate.minByteOffset) count += 1;
+      else break;
+    }
+    if (count === 0) return null;
+    if (target.records.length < count) return null;
+    const originS = recordStepId(sibling.records[0]!.rec);
+    const originT = recordStepId(target.records[0]!.rec);
+    const boundaryS = recordStepId(sibling.records[count - 1]!.rec);
+    const boundaryT = recordStepId(target.records[count - 1]!.rec);
+    if (!originS || originS !== originT || !boundaryS || boundaryS !== boundaryT) return null;
+    return target.records[count - 1]!.lineEnd;
+  }
+  return null;
+}
+
+function evaluateCompletedTurnsInSnapshot(
+  snap: ParsedTranscriptSnapshot,
+  sibling: ParsedTranscriptSnapshot,
+  candidates: readonly AntigravityCompletedTurnCandidate[],
+  isCompact: boolean,
+): { busy: boolean; completed: Set<string>; offsetUnmappable: boolean } {
   const candidateIds = new Set<string>();
   const hashToCandidates = new Map<string, Array<{
     turnId: string;
     minByteOffset?: number;
     skipPriorMatches: number;
   }>>();
-  let earliestMinOffset: number | undefined;
+  let offsetUnmappable = false;
+
   for (const candidate of candidates) {
     if (!candidate.turnId) continue;
     candidateIds.add(candidate.turnId);
     const textSha256 = candidate.submittedTextSha256
       ?? (candidate.submittedText ? hashAntigravitySubmittedText(candidate.submittedText) : undefined);
     if (textSha256) {
-      const effectiveMinOffset = resolveAntigravityCandidateMinByteOffset(candidate, transcriptPath);
-      if (effectiveMinOffset === null) continue;
-      if (effectiveMinOffset !== undefined) {
-        earliestMinOffset = earliestMinOffset === undefined
-          ? effectiveMinOffset
-          : Math.min(earliestMinOffset, effectiveMinOffset);
+      const effectiveMinOffset = mapMinByteOffsetInSnapshots(candidate, snap, sibling);
+      if (effectiveMinOffset === null) {
+        offsetUnmappable = true;
+        continue;
       }
       const entry = {
         turnId: candidate.turnId,
@@ -1276,126 +2062,237 @@ export function findCompletedAntigravityTurnIds(
       }
     }
   }
-  if (candidateIds.size === 0) return result;
 
-  try {
-    const fd = openSync(transcriptPath, 'r');
-    try {
-      const stats = fstatSync(fd);
-      if (stats.size === 0) return result;
+  const fullUserInputsByStep = isCompact ? buildFullUserInputStepIndex(sibling) : undefined;
 
-      let chunkSize = Math.min(stats.size, COMPLETED_TURN_INITIAL_TAIL_BYTES);
-      while (chunkSize <= stats.size) {
-        const windowStart = stats.size - chunkSize;
-        const buf = Buffer.alloc(chunkSize);
-        readSync(fd, buf, 0, chunkSize, windowStart);
+  let busy = false;
+  const pending = new Set<string>();
+  const completed = new Set<string>();
+  const plainTextSeenCounts = new Map<string, number>();
+  const plainTextClaimed = new Set<string>();
 
-        let busy = false;
-        const pending = new Set<string>();
-        const completed = new Set<string>();
-        const seenCandidates = new Set<string>();
-        const plainTextSeenCounts = new Map<string, number>();
-        const plainTextClaimed = new Set<string>();
-
-        let pos = 0;
-        if (windowStart > 0) {
-          const firstNl = buf.indexOf(0x0a);
-          pos = firstNl >= 0 ? firstNl + 1 : buf.length;
-        }
-        while (pos < buf.length) {
-          const nl = buf.indexOf(0x0a, pos);
-          const lineEnd = nl >= 0 ? nl : buf.length;
-          const lineFileOffset = windowStart + pos;
-          const line = buf.subarray(pos, lineEnd).toString('utf-8').trim();
-          pos = nl >= 0 ? nl + 1 : buf.length;
-          if (!line) continue;
-          let rec: any;
-          try {
-            rec = JSON.parse(line);
-          } catch {
-            continue;
+  for (const { rec, lineStart } of snap.records) {
+    const type = rec.type;
+    if (type === 'USER_INPUT') {
+      if (rec.source !== undefined && rec.source !== 'USER_EXPLICIT') continue;
+      busy = true;
+      const rawContent = resolveMatchedUserInputRawContent(rec, isCompact, fullUserInputsByStep);
+      if (rawContent === undefined) continue;
+      const unwrapped = unwrapAntigravityUserInput(rawContent).replace(/\r\n?/g, '\n');
+      const matched: string[] = [];
+      const locId = extractBotmuxMessageLocationId(unwrapped);
+      if (locId && candidateIds.has(locId)) {
+        matched.push(locId);
+      }
+      if (hashToCandidates.size > 0) {
+        const byHash = hashToCandidates.get(hashAntigravitySubmittedText(unwrapped));
+        if (byHash) {
+          let claimedThisOccurrence = false;
+          for (const entry of byHash) {
+            if (locId && locId !== entry.turnId) continue;
+            if (entry.minByteOffset !== undefined && lineStart < entry.minByteOffset) continue;
+            const seen = (plainTextSeenCounts.get(entry.turnId) ?? 0) + 1;
+            plainTextSeenCounts.set(entry.turnId, seen);
+            if (claimedThisOccurrence || plainTextClaimed.has(entry.turnId)) continue;
+            if (seen <= entry.skipPriorMatches) continue;
+            plainTextClaimed.add(entry.turnId);
+            claimedThisOccurrence = true;
+            if (!matched.includes(entry.turnId)) matched.push(entry.turnId);
           }
-          const type = rec?.type;
-          if (type === 'USER_INPUT') {
-            if (rec.source !== undefined && rec.source !== 'USER_EXPLICIT') continue;
-            busy = true;
-            const unwrapped = unwrapAntigravityUserInput(
-              typeof rec.content === 'string' ? rec.content : '',
-            ).replace(/\r\n?/g, '\n');
-            const matched: string[] = [];
-            const locId = extractBotmuxMessageLocationId(unwrapped);
-            if (locId && candidateIds.has(locId)) {
-              matched.push(locId);
-            }
-            if (hashToCandidates.size > 0) {
-              const byHash = hashToCandidates.get(hashAntigravitySubmittedText(unwrapped));
-              if (byHash) {
-                let claimedThisOccurrence = false;
-                for (const entry of byHash) {
-                  if (locId && locId !== entry.turnId) continue;
-                  if (entry.minByteOffset !== undefined && lineFileOffset < entry.minByteOffset) continue;
-                  const seen = (plainTextSeenCounts.get(entry.turnId) ?? 0) + 1;
-                  plainTextSeenCounts.set(entry.turnId, seen);
-                  if (claimedThisOccurrence || plainTextClaimed.has(entry.turnId)) continue;
-                  if (seen <= entry.skipPriorMatches) continue;
-                  plainTextClaimed.add(entry.turnId);
-                  claimedThisOccurrence = true;
-                  if (!matched.includes(entry.turnId)) matched.push(entry.turnId);
-                }
+        }
+      }
+      for (const turnId of matched) {
+        completed.delete(turnId);
+        pending.add(turnId);
+      }
+      continue;
+    }
+    if (type === 'PLANNER_RESPONSE') {
+      if (Array.isArray(rec.tool_calls) && rec.tool_calls.length > 0) {
+        busy = true;
+        continue;
+      }
+      const content = typeof rec.content === 'string' ? rec.content.trim() : '';
+      if (content.length > 0 && (rec.status === undefined || rec.status === 'DONE')) {
+        busy = false;
+        for (const turnId of pending) completed.add(turnId);
+        pending.clear();
+      }
+      continue;
+    }
+    if (type === 'GENERIC') {
+      busy = true;
+      continue;
+    }
+    if (type === 'ERROR_MESSAGE' || type === 'ERROR') {
+      busy = false;
+      continue;
+    }
+    if (type === 'SYSTEM_MESSAGE') {
+      if (/cancell?ed|interrupted|aborted/i.test(String(rec.content ?? ''))) {
+        busy = false;
+      }
+      continue;
+    }
+  }
+
+  return { busy, completed: busy ? new Set() : completed, offsetUnmappable };
+}
+
+export interface PairedCompletedTurnsResult {
+  readonly completed: Set<string>;
+  readonly pendingSibling: boolean;
+  readonly reason?: PairedSnapshotFailureReason | 'sibling-skew';
+}
+
+/**
+ * Paired folded-turn completion proof evaluated entirely in memory over ONE
+ * stat-bounded stability-verified `(full, compact)` snapshot pair.
+ *
+ * Returns `pendingSibling: true` whenever one sibling is transiently missing,
+ * incomplete, unstable, or lagging behind the other so callers can re-reconcile
+ * once the sibling flushes without prematurely transferring authority.
+ */
+export function findCompletedAntigravityTurnIdsPaired(
+  transcriptPath: string,
+  candidates: readonly AntigravityCompletedTurnCandidate[],
+  testHooks?: Pick<ReadPairedSnapshotsOptions, 'onAfterReadForTest' | 'onAfterFirstSiblingForTest'>,
+): PairedCompletedTurnsResult {
+  if (candidates.length === 0) {
+    return { completed: new Set(), pendingSibling: false };
+  }
+  if (!transcriptPath) {
+    return { completed: new Set(), pendingSibling: true, reason: 'sibling-missing' };
+  }
+
+  const base = basename(transcriptPath);
+  const isNativePair = base === COMPACT_TRANSCRIPT_NAME || base === FULL_TRANSCRIPT_NAME;
+  const compactPath = isNativePair
+    ? (base === COMPACT_TRANSCRIPT_NAME ? transcriptPath : antigravityCompactSiblingPath(transcriptPath)!)
+    : transcriptPath;
+  const fullPath = isNativePair
+    ? (base === FULL_TRANSCRIPT_NAME ? transcriptPath : antigravityFullSiblingPath(transcriptPath)!)
+    : transcriptPath;
+
+  const candidateIds = new Set<string>();
+  const candidateHashes = new Set<string>();
+  const earliestOffsetByPath = new Map<string, number>();
+  let needsCrossSiblingWholeFile = false;
+
+  const recordMinOffset = (pathKey: string, offset: number): void => {
+    const existing = earliestOffsetByPath.get(pathKey);
+    earliestOffsetByPath.set(pathKey, existing === undefined ? offset : Math.min(existing, offset));
+  };
+
+  for (const c of candidates) {
+    if (!c.turnId) continue;
+    candidateIds.add(c.turnId);
+    const hash = c.submittedTextSha256
+      ?? (c.submittedText ? hashAntigravitySubmittedText(c.submittedText) : undefined);
+    if (hash) candidateHashes.add(hash);
+    if (c.minByteOffset !== undefined) {
+      if (c.minByteOffset === 0) {
+        if (!c.sampledTranscriptPath || c.sampledTranscriptPath === compactPath || c.sampledTranscriptPath === fullPath) {
+          recordMinOffset(compactPath, 0);
+          recordMinOffset(fullPath, 0);
+        }
+      } else {
+        const targetPath = c.sampledTranscriptPath ?? transcriptPath;
+        recordMinOffset(targetPath, c.minByteOffset);
+        if (isNativePair && hash && (targetPath === compactPath || targetPath === fullPath)) {
+          needsCrossSiblingWholeFile = true;
+        }
+      }
+    }
+  }
+
+  const pair = readPairedAntigravitySnapshots(transcriptPath, {
+    initialTailBytes: COMPLETED_TURN_INITIAL_TAIL_BYTES,
+    maxTailBytes: PAIRED_COMPLETION_PROVENANCE_MAX_BYTES,
+    isSufficient: (records, windowStart, snapPath, compactSibling) => {
+      if (windowStart > 0 && records.some(r => isTaskResultRecord(r.rec))) return false;
+      if (!records.some(r => isExplicitUserInput(r.rec))) return false;
+      if (needsCrossSiblingWholeFile && windowStart > 0) return false;
+      const targetMinOffset = earliestOffsetByPath.get(snapPath);
+      if (targetMinOffset !== undefined && windowStart > 0 && windowStart >= targetMinOffset) {
+        return false;
+      }
+      // If compact sibling already observed a candidate at an earlier step_index than
+      // full's current window, keep widening full up to 64 MiB so >4 MiB full logs
+      // never split from compact with a false sibling-skew.
+      if (compactSibling && windowStart > 0 && records.length > 0) {
+        const earliestFullStep = records.find(r => Number.isInteger(r.rec.step_index))?.rec.step_index as number | undefined;
+        if (earliestFullStep !== undefined) {
+          for (const r of compactSibling.records) {
+            if (!isExplicitUserInput(r.rec) || !Number.isInteger(r.rec.step_index)) continue;
+            const step = r.rec.step_index as number;
+            if (step < earliestFullStep) {
+              const content = typeof r.rec.content === 'string' ? r.rec.content : '';
+              const unwrapped = unwrapAntigravityUserInput(content).replace(/\r\n?/g, '\n');
+              const locId = extractBotmuxMessageLocationId(unwrapped);
+              if (
+                (locId && candidateIds.has(locId))
+                || (candidateHashes.size > 0 && (hasTruncatedContent(r.rec) || candidateHashes.has(hashAntigravitySubmittedText(unwrapped))))
+              ) {
+                return false;
               }
             }
-            for (const turnId of matched) {
-              seenCandidates.add(turnId);
-              completed.delete(turnId);
-              pending.add(turnId);
-            }
-            continue;
-          }
-          if (type === 'PLANNER_RESPONSE') {
-            if (Array.isArray(rec.tool_calls) && rec.tool_calls.length > 0) {
-              busy = true;
-              continue;
-            }
-            const content = typeof rec.content === 'string' ? rec.content.trim() : '';
-            if (content.length > 0 && (rec.status === undefined || rec.status === 'DONE')) {
-              busy = false;
-              for (const turnId of pending) completed.add(turnId);
-              pending.clear();
-            }
-            continue;
-          }
-          if (type === 'GENERIC') {
-            busy = true;
-            continue;
-          }
-          if (type === 'ERROR_MESSAGE' || type === 'ERROR') {
-            busy = false;
-            continue;
-          }
-          if (type === 'SYSTEM_MESSAGE') {
-            if (/cancell?ed|interrupted|aborted/i.test(String(rec.content ?? ''))) {
-              busy = false;
-            }
-            continue;
           }
         }
-
-        // transcript 自身仍处于执行态时绝不提前回收任何候选回合。
-        if (busy) return new Set();
-
-        const coversMinOffsets = earliestMinOffset === undefined || windowStart <= earliestMinOffset;
-        if ((seenCandidates.size === candidateIds.size && coversMinOffsets)
-          || chunkSize >= stats.size
-          || chunkSize >= COMPLETED_TURN_MAX_TAIL_BYTES) {
-          return completed;
-        }
-        chunkSize = Math.min(stats.size, Math.min(chunkSize * 4, COMPLETED_TURN_MAX_TAIL_BYTES));
       }
-    } finally {
-      closeSync(fd);
-    }
-  } catch {
-    return new Set();
+      // Within the 4 MiB completion window, expand further if not all explicit message_location
+      // or plain-text hash candidates were observed yet.
+      if (windowStart > 0 && records.length > 0) {
+        const windowSize = records[records.length - 1]!.lineEnd - windowStart;
+        if (windowSize < COMPLETED_TURN_MAX_TAIL_BYTES) {
+          const seenIds = new Set<string>();
+          const seenHashes = new Set<string>();
+          for (const r of records) {
+            if (!isExplicitUserInput(r.rec) || typeof r.rec.content !== 'string') continue;
+            const unwrapped = unwrapAntigravityUserInput(r.rec.content).replace(/\r\n?/g, '\n');
+            const locId = extractBotmuxMessageLocationId(unwrapped);
+            if (locId && candidateIds.has(locId)) seenIds.add(locId);
+            if (candidateHashes.size > 0) {
+              const h = hashAntigravitySubmittedText(unwrapped);
+              if (candidateHashes.has(h)) seenHashes.add(h);
+            }
+          }
+          if (seenIds.size + seenHashes.size < candidateIds.size) return false;
+        }
+      }
+      return true;
+    },
+    ...testHooks,
+  });
+
+  if (!pair.ok) {
+    return { completed: new Set(), pendingSibling: pair.pendingSibling, reason: pair.reason };
   }
-  return result;
+
+  const pendingFull = hasPendingTasksInSnapshot(pair.full);
+  const pendingCompact = hasPendingTasksInSnapshot(pair.compact);
+  const fullRes = evaluateCompletedTurnsInSnapshot(pair.full, pair.compact, candidates, false);
+  const compactRes = evaluateCompletedTurnsInSnapshot(pair.compact, pair.full, candidates, true);
+
+  if (pendingFull || pendingCompact || fullRes.busy || compactRes.busy) {
+    const skew = pendingFull !== pendingCompact || fullRes.busy !== compactRes.busy;
+    return {
+      completed: new Set(),
+      pendingSibling: skew,
+      ...(skew ? { reason: 'sibling-skew' as const } : {}),
+    };
+  }
+
+  const completed = new Set<string>();
+  for (const turnId of fullRes.completed) {
+    if (compactRes.completed.has(turnId)) completed.add(turnId);
+  }
+  const skew = fullRes.completed.size !== completed.size
+    || compactRes.completed.size !== completed.size
+    || (fullRes.offsetUnmappable || compactRes.offsetUnmappable);
+  return {
+    completed,
+    pendingSibling: skew,
+    ...(skew ? { reason: fullRes.offsetUnmappable || compactRes.offsetUnmappable ? 'offset-unmappable' : 'sibling-skew' } : {}),
+  };
 }

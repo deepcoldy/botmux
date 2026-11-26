@@ -177,8 +177,8 @@ import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.j
 // Central no-transport predicate. Aliased because a local `const larkTransportEnabled`
 // (the role-library gate) already binds that name in one function scope.
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
-import { drainTranscript, joinAssistantText, trailingAssistantText, absorbedInputReplyText, AbsorbedReplyCollector, ABSORBED_REPLY_MAX_CHARS, type AbsorbedInputReply, isMidTurnAbsorbedQueuedCommand, isClaudeMemoryToolUse, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractAssistantTurns, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, ClaudeGoalAbortWatch, extractCotEntries, transcriptFilesSignature, ClaudeModelFallbackTracker, BackgroundTaskTracker, ClaudeModelRequestClock, backgroundTaskSettledIds, backgroundTaskStopsInSiblingTranscripts, eventTimeMs, transcriptShowsTurnDurationMarker, transcriptHoldsConversation, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
-import { BackgroundTaskPinSnapshot, BridgeTurnQueue, takeAbsorbedReplyCandidates, liveFoldedReplyUuids, noteHostFinalCarried, BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS, BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS, isHeldPendingMark, makeFingerprint, normaliseForFingerprint, PROVISIONAL_EXIT_WATCH_MS, type BridgePendingTurn } from './services/bridge-turn-queue.js';
+import { drainTranscript, joinAssistantText, trailingAssistantText, absorbedInputReplyText, AbsorbedReplyCollector, ABSORBED_REPLY_MAX_CHARS, type AbsorbedInputReply, isMidTurnAbsorbedQueuedCommand, isClaudeMemoryToolUse, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractAssistantTurns, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, ClaudeGoalAbortWatch, extractCotEntries, transcriptFilesSignature, ClaudeModelFallbackTracker, BackgroundTaskTracker, ClaudeModelRequestClock, backgroundTaskSettledIds, backgroundTaskStopsInSiblingTranscripts, eventTimeMs, isClaudeTurnDurationEvent, transcriptShowsTurnDurationMarker, transcriptHoldsConversation, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
+import { BackgroundTaskPinSnapshot, BridgeTurnQueue, takeAbsorbedReplyCandidates, liveFoldedReplyUuids, noteHostFinalCarried, BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS, BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS, isHeldPendingMark, makeFingerprint, normaliseForFingerprint, PROVISIONAL_EXIT_WATCH_MS, type BackgroundTaskAnchor, type BridgePendingTurn, type PendingWakeCotObserver } from './services/bridge-turn-queue.js';
 import { updateClaudeStateFile } from './core/claude-folder-trust.js';
 import { localTurnFailureNotice } from './services/local-turn-failure.js';
 import {
@@ -202,7 +202,9 @@ import { appendUnsentInputs, isUnsentInputReplayable, saveUnsentInputs, settleTa
 import { UniversalOutputHandoff } from './services/universal-output-handoff.js';
 import { WorkerOutputJournal } from './services/worker-output-journal.js';
 import { WorkerFinalOutputHandoff, canHandoffFinalOutput, FINAL_OUTPUT_HANDOFF_MAX_PENDING } from './services/final-output-handoff.js';
-import { stageBridgeFinalOutput, acknowledgeBridgeFinalOutput, type BridgeTurnJournalEntry } from './services/bridge-turn-journal.js';
+import { stageBridgeFinalOutput, acknowledgeBridgeFinalOutput, stageBridgeTurnNotice, acknowledgeBridgeTurnNotice, type BridgeTurnJournalEntry } from './services/bridge-turn-journal.js';
+import { RECOVERY_NOTICE_MAX_AGE_MS } from './services/ordinary-recovery-notice.js';
+import { isStructuredNoticeProtocolMessage } from './services/structured-notice-protocol.js';
 import { TurnSendLedger } from './services/turn-send-ledger.js';
 import { restartSpendsFreshBudget, exitMarksServerReplaced } from './core/restart-fresh-budget.js';
 import { createTranscriptTerminalSettle, type TranscriptTerminalSettle } from './services/transcript-terminal-settle.js';
@@ -459,6 +461,7 @@ import {
 } from './services/bridge-rotation-policy.js';
 import { CodexBridgeQueue, CodexMidTurnReplyCollector, pruneExpiredPreStartHeadsAndEmit, selectStaleRestoredJournalTurns, type CodexPendingTurn } from './services/codex-bridge-queue.js';
 import { uncollectedTurnsNeedingNotice } from './services/structured-uncollected-notice.js';
+import { StructuredMissingFinalWatchdog } from './services/structured-missing-final.js';
 import {
   BridgeBlindTurnWatch,
   blindTurnNeedsNotice,
@@ -552,8 +555,10 @@ import { baselineCursorTranscript, drainCursorTranscript, findCursorChatIdByPid,
 import { startCursorCot, stopAllCursorCot, type CursorCotEntry } from './services/cursor-cot.js';
 import { startAntigravityCot, stopAntigravityCot, stopAllAntigravityCot } from './services/antigravity-cot.js';
 import { KimiActivityObserver } from './services/kimi-cot.js';
-import { findAntigravityConversationIdByPid } from './services/antigravity-discovery.js';
+import { findAntigravityConversationIdByPid, findAttestedAntigravityConversationId } from './services/antigravity-discovery.js';
 import { AntigravitySessionLog } from './services/antigravity-session-fork.js';
+import { AntigravityNativeQuotaLog, currentAntigravityNativeQuota, type AntigravityNativeQuotaRefusal } from './services/antigravity-native-quota.js';
+import { createAntigravityQuotaStateMachine } from './services/antigravity-quota-state.js';
 import { antigravityTransport, verifyAntigravityTransport } from './services/antigravity-transport.js';
 import {
   inspectAntigravityAccounts,
@@ -562,8 +567,10 @@ import {
   type AntigravityAccountStoreOptions,
   type ReconcileAntigravityTokenResult,
 } from './services/antigravity-accounts.js';
-import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, hasAntigravitySideQuestionComposer, isAntigravityInterruptedScreen, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen, parseAntigravityFooterBackgroundTasks, rememberAntigravityQuota } from './adapters/cli/antigravity.js';
+import { hasAntigravitySideQuestionComposer, isAntigravityInterruptedScreen, isAntigravityReadyComposerScreen, parseAntigravityFooterBackgroundTasks, supportsAntigravityReadyFooterQuota } from './adapters/cli/antigravity.js';
 import {
+  antigravityTurnAnsweredInTranscript,
+  antigravityTurnFailedWithoutOutput,
   countAntigravityUserInputMatches,
   hashAntigravitySubmittedText,
   isSameAntigravityConversation,
@@ -571,7 +578,7 @@ import {
   hasAntigravityPendingTasks,
   hasAntigravityTranscriptPendingTasks,
   drainAntigravityTranscript,
-  findCompletedAntigravityTurnIds,
+  findCompletedAntigravityTurnIdsPaired,
   readAntigravitySideAnswer,
   resolveAntigravityCandidateMinByteOffset,
   resolveAntigravityTranscriptPath,
@@ -884,7 +891,19 @@ import {
   type HerdrWebScrollDirection,
 } from './utils/herdr-web-history.js';
 import { parseWorkerRequestUrl } from './utils/worker-http.js';
-import { structuredRateLimitState, structuredCodexLimitState, isStructuredRateLimitAuthoritative, reconcileUsageLimitState, type CliUsageLimitState } from './utils/cli-usage-limit.js';
+import {
+  cliUsageLimitEpisodeKey,
+  isAntigravityNativeLimit,
+  isStructuredRateLimitAuthoritative,
+  isTransientRateLimit,
+  reconcileUsageLimitState,
+  screenshotUsageLimitDedupSuffix,
+  structuredCodexLimitState,
+  structuredRateLimitState,
+  usageLimitEvidenceKey,
+  type AntigravityTranscriptWriteBoundary,
+  type CliUsageLimitState,
+} from './utils/cli-usage-limit.js';
 import { CodexSubagentLimitTracker } from './services/codex-subagent-limit-tracker.js';
 import { bridgeTurnOutcome, createUsageLimitTracker } from './utils/usage-limit-tracker.js';
 import { uploadImageBuffer } from './utils/lark-upload.js';
@@ -2605,6 +2624,13 @@ function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigi
     delete context.scope.operationId;
     delete context.bindingId;
   }
+  if (isStructuredNoticeProtocolMessage(msg)) {
+    // A durable notice belongs to its worker recovery channel, not the runtime
+    // that happened to execute the turn. Keep execution for ownership checks.
+    delete context.scope.runtime;
+    delete context.scope.operationId;
+    delete context.bindingId;
+  }
   return { ...msg, sessionContract: context };
 }
 function runtimeIdentityForContract(binding: RuntimeEventBinding): RuntimeIdentity {
@@ -3698,6 +3724,9 @@ let pendingLaunchConvergence: { attemptId?: string; requested: RestartLaunchSett
 let replacementSpawnInProgress = false;
 let structuredStartGraceRecheckTimer: ReturnType<typeof setTimeout> | null = null;
 let structuredRejectedReadyEvidenceGeneration: number | undefined;
+// Meaningful only while the generation above is set. A rejected pre-start
+// prompt has no started native user proof and must not become post-start idle.
+let structuredRejectedReadyEvidenceStartUuid: string | undefined;
 const ptyOutputGeneration = new PtyOutputGeneration();
 const adoptWriteQueue = new AsyncSerialQueue();
 /** The effectiveResume flag used by the most recent spawnCli call. Written
@@ -4476,29 +4505,63 @@ function observeAuthoritativeStructuredTurnStart(
   }
 }
 
-function notifyTerminalTurnStarted(turn: {
-  turnId: string;
-  markTimeMs?: number;
-  replyContextTurnId?: string;
-  isLocal?: boolean;
-  isScheduled?: boolean;
-  isBackgroundWake?: boolean;
-  backgroundWakeUnrouted?: boolean;
-}): void {
-  if (typeof backgroundAuthorityHold !== 'undefined' && backgroundAuthorityHold.isBackgroundHeld()
+/** Headless Monitor micro-turns whose `terminal_turn_started` IPC was skipped
+ *  while `foldBackgroundUpdates` was enabled. If the turn later becomes
+ *  deliverable (switch toggled off mid-turn, terminal notice folded in, or a
+ *  live failure notice), `sendTerminalTurnStarted` runs synchronously right
+ *  before `final_output` / `user_notify` so the daemon captures its reply context. */
+const deferredTerminalTurnStarts = new WeakSet<object>();
+/** Local turns for which `terminal_turn_started` was already sent to the daemon.
+ *  If `foldBackgroundUpdates` toggles OFF→ON mid-turn, `emitReadyTurns` fails
+ *  open for these turns so their persisted `turnReplyContexts` are never orphaned. */
+const sentTerminalTurnStarts = new WeakSet<object>();
+
+function sendTerminalTurnStarted(turn: { turnId: string; markTimeMs?: number; replyContextTurnId?: string }): void {
+  if (!zeroPromptTerminalSync()) return;
+  sentTerminalTurnStarts.add(turn);
+  send({ type: 'terminal_turn_started', turnId: turn.turnId, startedAtMs: turn.markTimeMs ?? Date.now(),
+    ...(turn.replyContextTurnId ? { replyContextTurnId: turn.replyContextTurnId } : {}) });
+}
+
+function notifyTerminalTurnStarted(
+  turn: { turnId: string; markTimeMs?: number; replyContextTurnId?: string }
+    & Partial<Pick<
+      BridgePendingTurn,
+      'wakeNonTerminalMonitor' | 'isLocal' | 'userUuid' | 'isScheduled' | 'isBackgroundWake' | 'backgroundWakeUnrouted' | 'terminalOutcome'
+    >>,
+): void {
+  const suppressedMonitorWake = isSuppressedNonTerminalMonitorWake({
+    wakeNonTerminalMonitor: turn.wakeNonTerminalMonitor,
+    isLocal: turn.isLocal,
+    userUuid: turn.userUuid,
+    isScheduled: turn.isScheduled,
+    terminalOutcome: turn.terminalOutcome,
+  });
+  // Must run BEFORE the `zeroPromptTerminalSync()` early return so default
+  // transcript-delivery mode still supersedes held background authority on
+  // genuine local/scheduled turns, while a folded Monitor micro-turn never
+  // falsely triggers `superseded_by_local_turn` (its `<task-notification>`
+  // authority policy is governed exclusively by `applyClaudeTranscriptEventToAuthorityHold`).
+  if (!suppressedMonitorWake
+    && typeof backgroundAuthorityHold !== 'undefined' && backgroundAuthorityHold.isBackgroundHeld()
     && typeof supersedeBackgroundAuthorityHold === 'function') {
     if (turn.isScheduled) {
       supersedeBackgroundAuthorityHold('superseded_by_scheduled');
     } else if (turn.isLocal && !turn.isBackgroundWake && !turn.turnId.startsWith('local-headless-')) {
       supersedeBackgroundAuthorityHold('superseded_by_local_turn');
-    } else if (turn.turnId.startsWith('local-headless-') && !turn.isBackgroundWake && !turn.backgroundWakeUnrouted) {
+    } else if (turn.turnId.startsWith('local-headless-')
+      && !turn.isBackgroundWake
+      && !turn.backgroundWakeUnrouted
+      && !turn.wakeNonTerminalMonitor) {
       supersedeBackgroundAuthorityHold('superseded_by_local_turn');
     }
   }
-  if (zeroPromptTerminalSync()) {
-    send({ type: 'terminal_turn_started', turnId: turn.turnId, startedAtMs: turn.markTimeMs ?? Date.now(),
-      ...(turn.replyContextTurnId ? { replyContextTurnId: turn.replyContextTurnId } : {}) });
+  if (!zeroPromptTerminalSync()) return;
+  if (suppressedMonitorWake) {
+    deferredTerminalTurnStarts.add(turn);
+    return;
   }
+  sendTerminalTurnStarted(turn);
 }
 let closeRequested = false;
 /** Dashboard「复现命令」：session 冷启时最终交给 backend.spawn 的真实调用
@@ -5390,6 +5453,12 @@ function noteWebTerminalInput(data: string, submits = terminalInputSubmits(data)
   if (submits) {
     lastWebTerminalSubmitAtMs = lastWebTerminalInputAtMs;
     webTerminalSubmitGeneration++;
+    // Direct Web Terminal submission begins a new user turn: clear any pinned
+    // transient 429 cooldown and refresh usageLimitTracker's answered/stale
+    // banner baseline so a genuine 429 on this direct turn is never swallowed.
+    activeTransientRateLimit = undefined;
+    lastUsageLimitCaptureTurn = undefined;
+    usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
     // Attribution only, never the input bytes: daemon-side idle maintenance
     // must distinguish a person's direct submit from local-command repaints.
     // Attribution is best-effort only: an IPC failure must never block the
@@ -5976,7 +6045,7 @@ async function sendRawCommandLine(
   const writeGeneration = cliSpawnGeneration;
   const writeLifetime = cliLifetimeNonce;
   const writeOptions = {
-    ...rawCommandWriteOptionsFor(cliAdapter ?? undefined, lastInitConfig?.cliId),
+    ...rawCommandWriteOptionsFor(cliAdapter ?? undefined, lastInitConfig?.cliId, content),
     isCurrent: () => backend === be && cliSpawnGeneration === writeGeneration
       && cliLifetimeNonce === writeLifetime && !webTerminalInputWireDirty(),
   };
@@ -7245,6 +7314,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
         // is the same point flushPending applies it for a queued message. Without
         // this, a cleared or rotated JWT did not take effect on these turns.
         applyMojoLivePatch(msg.mojoLivePatch);
+        rawInputWriteGeneration += 1;
         renderer?.markNewTurn();
         usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
         if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
@@ -8833,6 +8903,7 @@ function releaseActiveTurnAuthority(
     && backgroundAuthorityHold.holds(currentActive.turnId, currentActive.dispatchAttempt, Date.now())) {
     return false;
   }
+  cancelAntigravityFoldedReconcilePending();
   const released = exact
     ? activeTurnAuthority.releaseExact(exact)
     : activeTurnAuthority.clear();
@@ -9690,17 +9761,68 @@ function advanceQueuedTypeAheadTurn(reason: string): boolean {
   markActiveTurnStarted(next);
   writeCliPidMarker();
   publishSandboxRelayCapability();
+  cancelAntigravityFoldedReconcilePending();
   log(`Advanced active turn (${reason}): ${prevTurnId?.slice(0, 12)} -> ${currentBotmuxTurnId?.slice(0, 12)} (remaining queued: ${queuedTypeAheadTurns.length})`);
   return true;
 }
 
+interface AntigravityFoldedReconcileResult {
+  reconciled: boolean;
+  pendingSibling: boolean;
+  transcriptPath?: string;
+  completedCurrentTurn: boolean;
+  candidateIds: Set<string>;
+}
+
+interface AntigravityFoldedReconcilePending {
+  cliSpawnGeneration: number;
+  ptyOutputGeneration: number;
+  webTerminalInputGeneration: number;
+  currentTurnId: string | undefined;
+  currentDispatchAttempt: number | undefined;
+  promotedTurnId: string | undefined;
+  transcriptPath: string;
+  startedAtMs: number;
+  attempts: number;
+  watchWakeups: number;
+  delayMs: number;
+  timer?: ReturnType<typeof setTimeout>;
+  coalesceTimer?: ReturnType<typeof setTimeout>;
+  watcher?: FSWatcher;
+}
+
+const ANTIGRAVITY_FOLDED_RECONCILE_INITIAL_DELAY_MS = 50;
+const ANTIGRAVITY_FOLDED_RECONCILE_MAX_DELAY_MS = 1_000;
+const ANTIGRAVITY_FOLDED_RECONCILE_MAX_ATTEMPTS = 20;
+const ANTIGRAVITY_FOLDED_RECONCILE_MAX_WATCH_WAKEUPS = 50;
+const ANTIGRAVITY_FOLDED_RECONCILE_MAX_WINDOW_MS = 15_000;
+let antigravityFoldedReconcilePending: AntigravityFoldedReconcilePending | undefined;
+
+function cancelAntigravityFoldedReconcilePending(): void {
+  const pending = antigravityFoldedReconcilePending;
+  if (!pending) return;
+  antigravityFoldedReconcilePending = undefined;
+  if (pending.timer) clearTimeout(pending.timer);
+  if (pending.coalesceTimer) clearTimeout(pending.coalesceTimer);
+  try { pending.watcher?.close(); } catch { /* ignore */ }
+}
+
 /** Antigravity 常规模式不经 transcript bridge 逐轮发 turn_terminal；多条 type-ahead 消息会被折叠进同一次运行。
- *  在 prompt_ready 结算前，凭原生 transcript 中“已消费且后接完成态无工具 PLANNER_RESPONSE、且当前非忙碌”的精确证据，
- *  回收已结束的非 durable 候选回合，避免迟读磁盘 marker 或队列推进重新占用已空闲 CLI 的 activeTurnAuthority。 */
-function reconcileCompletedAntigravityTurnsAtPromptReady(): boolean {
-  if (lastInitConfig?.cliId !== 'antigravity' || isRemoteBackendType(effectiveBackendType)) return false;
+ *  在 prompt_ready 结算前，凭原生 full+compact 双 transcript 单次 stat-bounded 配对快照中
+ *  “已消费且后接完成态无工具 PLANNER_RESPONSE、且当前非忙碌”的精确证据，
+ *  回收已结束的非 durable 候选回合；若某侧 sibling 暂缺或尾行未写完，返回 pendingSibling=true 供后续自愈。 */
+function reconcileCompletedAntigravityTurnsAtPromptReady(
+  overridePromotedTurnId?: string,
+): AntigravityFoldedReconcileResult {
+  const empty: AntigravityFoldedReconcileResult = {
+    reconciled: false,
+    pendingSibling: false,
+    completedCurrentTurn: false,
+    candidateIds: new Set(),
+  };
+  if (lastInitConfig?.cliId !== 'antigravity' || isRemoteBackendType(effectiveBackendType)) return empty;
   const cliSessionId = inputDeliveryObservedCliSessionId ?? lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId;
-  if (!cliSessionId) return false;
+  if (!cliSessionId) return empty;
 
   const diskTurnHeads: Array<{ turnId: string; dispatchAttempt?: number }> = [];
   const diskQueuedTurns: Array<{ turnId: string; dispatchAttempt?: number }> = [];
@@ -9742,21 +9864,28 @@ function reconcileCompletedAntigravityTurnsAtPromptReady(): boolean {
   if (
     queuedTypeAheadTurns.length === 0
     && !queuedTurnAdvanceConsumedForPrompt
+    && !overridePromotedTurnId
     && !hasDiskDiff
     && diskQueuedTurns.length === 0
   ) {
-    return false;
+    return empty;
   }
 
   const transcriptPath = resolveAntigravityTranscriptPath(cliSessionId);
-  if (!transcriptPath) return false;
+  if (!transcriptPath) return empty;
 
   const candidateIds = new Set<string>();
   for (const queued of queuedTypeAheadTurns) {
     if (queued.dispatchAttempt === undefined) candidateIds.add(queued.turnId);
   }
-  const promotedCandidateId = queuedTurnAdvanceConsumedForPrompt?.promotedTurnId ?? currentBotmuxTurnId;
-  if (queuedTurnAdvanceConsumedForPrompt && promotedCandidateId && currentBotmuxDispatchAttempt === undefined) {
+  const promotedCandidateId = overridePromotedTurnId
+    ?? queuedTurnAdvanceConsumedForPrompt?.promotedTurnId
+    ?? currentBotmuxTurnId;
+  if (
+    (queuedTurnAdvanceConsumedForPrompt || overridePromotedTurnId)
+    && promotedCandidateId
+    && currentBotmuxDispatchAttempt === undefined
+  ) {
     candidateIds.add(promotedCandidateId);
   }
   for (const head of diskTurnHeads) {
@@ -9767,7 +9896,7 @@ function reconcileCompletedAntigravityTurnsAtPromptReady(): boolean {
   for (const qt of diskQueuedTurns) {
     if (qt.dispatchAttempt === undefined) candidateIds.add(qt.turnId);
   }
-  if (candidateIds.size === 0) return false;
+  if (candidateIds.size === 0) return empty;
 
   const candidates: AntigravityCompletedTurnCandidate[] = [...candidateIds].map(turnId => {
     const remembered = recentSubmittedTurnTexts.get(turnId);
@@ -9783,8 +9912,17 @@ function reconcileCompletedAntigravityTurnsAtPromptReady(): boolean {
       ...(hint?.skipPriorMatches !== undefined && hint.skipPriorMatches > 0 ? { skipPriorMatches: hint.skipPriorMatches } : {}),
     };
   });
-  const completed = findCompletedAntigravityTurnIds(transcriptPath, candidates);
-  if (completed.size === 0) return false;
+  const paired = findCompletedAntigravityTurnIdsPaired(transcriptPath, candidates);
+  const completed = paired.completed;
+  if (completed.size === 0) {
+    return {
+      reconciled: false,
+      pendingSibling: paired.pendingSibling,
+      transcriptPath,
+      completedCurrentTurn: false,
+      candidateIds,
+    };
+  }
 
   const hasLiveDurableSibling = (turnId: string): boolean => (
     (currentBotmuxTurnId === turnId && currentBotmuxDispatchAttempt !== undefined)
@@ -9812,23 +9950,245 @@ function reconcileCompletedAntigravityTurnsAtPromptReady(): boolean {
     }
   }
 
+  let completedCurrentTurn = false;
   if (
-    queuedTurnAdvanceConsumedForPrompt
-    && promotedCandidateId
+    promotedCandidateId
     && currentBotmuxTurnId === promotedCandidateId
     && currentBotmuxDispatchAttempt === undefined
+    && !hasLiveDurableSibling(promotedCandidateId)
     && completed.has(promotedCandidateId)
   ) {
+    completedCurrentTurn = true;
     queuedTurnAdvanceConsumedForPrompt = undefined;
     if (!reconciled.includes(promotedCandidateId)) reconciled.push(promotedCandidateId);
+    // Only retire the current native-log refusal when no later uncompleted turn
+    // exists AND the latest written CLI input itself is proven completed — never
+    // let reconciling an earlier folded turn om_B retire a type-ahead om_C 429.
+    const hasUncompletedQueuedTurn = queuedTypeAheadTurns.length > 0
+      || diskQueuedTurns.some(q => !completed.has(q.turnId));
+    const latestWritten = typeof lastWrittenCliInput !== 'undefined' ? lastWrittenCliInput : undefined;
+    const latestWrittenCompleted = latestWritten?.turnId !== undefined
+      ? (latestWritten.turnId === promotedCandidateId || completed.has(latestWritten.turnId))
+      : false;
+    if (
+      !hasUncompletedQueuedTurn
+      && latestWrittenCompleted
+      && typeof antigravityQuotaState !== 'undefined'
+      && typeof readAntigravityNativeQuota === 'function'
+    ) {
+      antigravityQuotaState.noteTurnAnswered(readAntigravityNativeQuota());
+    }
   }
 
   if (reconciled.length > 0) {
     log(`Reconciled completed Antigravity folded turn(s) at prompt_ready: ${reconciled.map(id => id.slice(0, 12)).join(', ')}`);
     if (needsMarkerRewrite) writeCliPidMarker();
+    return {
+      reconciled: true,
+      pendingSibling: paired.pendingSibling,
+      transcriptPath,
+      completedCurrentTurn,
+      candidateIds,
+    };
+  }
+  return {
+    reconciled: false,
+    pendingSibling: paired.pendingSibling,
+    transcriptPath,
+    completedCurrentTurn: false,
+    candidateIds,
+  };
+}
+
+function tryReconcilePendingAntigravityFoldedTurns(reason: string): boolean {
+  const pending = antigravityFoldedReconcilePending;
+  if (!pending) return false;
+  if (
+    !isPromptReady
+    || cliSpawnGeneration !== pending.cliSpawnGeneration
+    || cliRestartInProgress
+    || ptyOutputGeneration.snapshot() !== pending.ptyOutputGeneration
+    || webTerminalInputGeneration !== pending.webTerminalInputGeneration
+    || currentBotmuxTurnId !== pending.currentTurnId
+    || currentBotmuxDispatchAttempt !== pending.currentDispatchAttempt
+    || durableTurnInFlight
+    || pendingMessages.length > 0
+    || pendingRawInputs.length > 0
+    || isFlushing
+  ) {
+    cancelAntigravityFoldedReconcilePending();
+    return false;
+  }
+
+  const prevQueuedCount = queuedTypeAheadTurns.length;
+  const res = reconcileCompletedAntigravityTurnsAtPromptReady(pending.promotedTurnId);
+  if (res.reconciled) {
+    const promotedTurnId = pending.promotedTurnId;
+    cancelAntigravityFoldedReconcilePending();
+    if (
+      res.completedCurrentTurn
+      && promotedTurnId
+      && currentBotmuxTurnId === promotedTurnId
+      && currentBotmuxDispatchAttempt === undefined
+      && !durableTurnInFlight
+    ) {
+      const stillPendingTasks = typeof hasLiveAntigravityPendingTasks === 'function'
+        && hasLiveAntigravityPendingTasks();
+      if (!stillPendingTasks) {
+        markTurnRetired(promotedTurnId);
+        releaseActiveTurnAuthority(`prompt_ready_reconciled:${reason}`);
+        syncQueuedTurnsFromMarkerDisk();
+        if (queuedTypeAheadTurns.length > 0) {
+          advanceQueuedTypeAheadTurn(`prompt_ready_reconciled:${reason}`);
+          queuedTurnAdvanceConsumedForPrompt = undefined;
+        }
+        writeCliPidMarker();
+        if (renderer && pendingMessages.length === 0 && pendingAdoptMessages.length === 0
+          && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
+          const { content } = renderer.snapshot();
+          send({
+            type: 'screen_update',
+            content,
+            ...classifyUsageLimitWithNativeEvidence(content, projectedRuntimeScreenStatus()),
+            ...backgroundWaitPayload(),
+            ...modelRequestPayload(),
+            turnId: currentBotmuxTurnId,
+            dispatchAttempt: currentBotmuxDispatchAttempt,
+          });
+        }
+      }
+    }
+    // Partial reconciliation (e.g. om_B flushed to compact before om_C): re-arm
+    // within the original budget whenever sibling skew still holds on live work.
+    if (
+      res.pendingSibling
+      && res.transcriptPath
+      && isPromptReady
+      && !cliRestartInProgress
+      && !durableTurnInFlight
+      && pendingMessages.length === 0
+      && pendingRawInputs.length === 0
+      && !isFlushing
+      && pending.attempts < ANTIGRAVITY_FOLDED_RECONCILE_MAX_ATTEMPTS
+      && Date.now() - pending.startedAtMs < ANTIGRAVITY_FOLDED_RECONCILE_MAX_WINDOW_MS
+    ) {
+      const activeAuthority = activeTurnAuthority.snapshot();
+      const nextPromotedTurnId = currentBotmuxTurnId
+        && currentBotmuxDispatchAttempt === undefined
+        && !retiredTurnIds.has(currentBotmuxTurnId)
+        && activeAuthority?.turnId === currentBotmuxTurnId
+        && activeAuthority.dispatchAttempt === undefined
+        && (res.candidateIds.has(currentBotmuxTurnId) || currentBotmuxTurnId !== promotedTurnId)
+        ? currentBotmuxTurnId
+        : undefined;
+      const hasRemainingQueuedCandidate = queuedTypeAheadTurns.some(q => q.dispatchAttempt === undefined);
+      if (nextPromotedTurnId || hasRemainingQueuedCandidate) {
+        const advanced = currentBotmuxTurnId !== pending.currentTurnId
+          || queuedTypeAheadTurns.length < prevQueuedCount;
+        const nextDelayMs = advanced
+          ? ANTIGRAVITY_FOLDED_RECONCILE_INITIAL_DELAY_MS
+          : Math.min(pending.delayMs * 2, ANTIGRAVITY_FOLDED_RECONCILE_MAX_DELAY_MS);
+        armAntigravityFoldedReconcilePending(res.transcriptPath, nextPromotedTurnId, {
+          startedAtMs: pending.startedAtMs,
+          attempts: pending.attempts + 1,
+          delayMs: nextDelayMs,
+        });
+      }
+    }
     return true;
   }
+
+  if (!res.pendingSibling) {
+    // Both siblings are readable and agree the turn is still genuinely running.
+    cancelAntigravityFoldedReconcilePending();
+    return false;
+  }
+
+  if (Date.now() - pending.startedAtMs >= ANTIGRAVITY_FOLDED_RECONCILE_MAX_WINDOW_MS) {
+    cancelAntigravityFoldedReconcilePending();
+    return false;
+  }
+
+  if (reason !== 'retry') {
+    // Event-driven wakeups (`fs_watch`, `prompt_ready_reentry`) must not consume
+    // the scheduled retry budget or inflate backoff. Cap only watcher churn.
+    if (reason === 'fs_watch') {
+      pending.watchWakeups += 1;
+      if (pending.watchWakeups >= ANTIGRAVITY_FOLDED_RECONCILE_MAX_WATCH_WAKEUPS && pending.watcher) {
+        try { pending.watcher.close(); } catch { /* ignore */ }
+        pending.watcher = undefined;
+      }
+    }
+    return false;
+  }
+
+  if (pending.attempts >= ANTIGRAVITY_FOLDED_RECONCILE_MAX_ATTEMPTS) {
+    cancelAntigravityFoldedReconcilePending();
+    return false;
+  }
+
+  pending.attempts += 1;
+  pending.delayMs = Math.min(pending.delayMs * 2, ANTIGRAVITY_FOLDED_RECONCILE_MAX_DELAY_MS);
+  if (pending.timer) clearTimeout(pending.timer);
+  pending.timer = setTimeout(() => {
+    if (antigravityFoldedReconcilePending !== pending) return;
+    pending.timer = undefined;
+    tryReconcilePendingAntigravityFoldedTurns('retry');
+  }, pending.delayMs);
+  pending.timer.unref();
   return false;
+}
+
+function armAntigravityFoldedReconcilePending(
+  transcriptPath: string,
+  promotedTurnId: string | undefined,
+  budget?: { startedAtMs: number; attempts: number; delayMs: number },
+): void {
+  cancelAntigravityFoldedReconcilePending();
+  const pending: AntigravityFoldedReconcilePending = {
+    cliSpawnGeneration,
+    ptyOutputGeneration: ptyOutputGeneration.snapshot(),
+    webTerminalInputGeneration,
+    currentTurnId: currentBotmuxTurnId,
+    currentDispatchAttempt: currentBotmuxDispatchAttempt,
+    promotedTurnId,
+    transcriptPath,
+    startedAtMs: budget?.startedAtMs ?? Date.now(),
+    attempts: budget?.attempts ?? 0,
+    watchWakeups: 0,
+    delayMs: budget?.delayMs ?? ANTIGRAVITY_FOLDED_RECONCILE_INITIAL_DELAY_MS,
+  };
+  antigravityFoldedReconcilePending = pending;
+
+  try {
+    const dir = dirname(transcriptPath);
+    if (existsSync(dir)) {
+      const watcher = fsWatch(dir, (_eventType, filename) => {
+        if (antigravityFoldedReconcilePending !== pending) return;
+        const name = typeof filename === 'string' ? filename : undefined;
+        if (name && name !== 'transcript.jsonl' && name !== 'transcript_full.jsonl') return;
+        if (pending.coalesceTimer) return;
+        pending.coalesceTimer = setTimeout(() => {
+          if (antigravityFoldedReconcilePending !== pending) return;
+          pending.coalesceTimer = undefined;
+          tryReconcilePendingAntigravityFoldedTurns('fs_watch');
+        }, 10);
+        pending.coalesceTimer.unref();
+      });
+      watcher.on('error', () => { /* fall back to bounded timer */ });
+      watcher.unref();
+      pending.watcher = watcher;
+    }
+  } catch {
+    // Directory watch unavailable; bounded retry timer handles re-reconciliation.
+  }
+
+  pending.timer = setTimeout(() => {
+    if (antigravityFoldedReconcilePending !== pending) return;
+    pending.timer = undefined;
+    tryReconcilePendingAntigravityFoldedTurns('retry');
+  }, pending.delayMs);
+  pending.timer.unref();
 }
 let lastStructuredBridgeActivityAtMs = 0;
 const codexAppTurnLiveness = new CodexAppTurnLiveness();
@@ -11024,8 +11384,100 @@ const usageLimitTracker = createUsageLimitTracker<RuntimeScreenStatus>({
   isOutputActive: isOutputActivelyProgressing,
 });
 
-let antigravityQuotaHistory: readonly CliUsageLimitState[] | undefined;
-let unconfirmedAntigravityQuotas = new Map<string, CliUsageLimitState>();
+const antigravityQuotaState = createAntigravityQuotaStateMachine();
+let antigravityNativeQuotaLog: AntigravityNativeQuotaLog | undefined;
+let activeTransientRateLimit: { scope: string; state: CliUsageLimitState } | undefined;
+let lastUsageLimitCaptureTurn: { turnId: string; dispatchAttempt?: number } | undefined;
+let localAttestedCliProcess: { cliPid: number; cliProcStart: string; cliSpawnGeneration: number } | undefined;
+let rawInputWriteGeneration = 0;
+let lastWrittenCliInputWebSubmitGen = 0;
+let lastWrittenCliInputRawGen = 0;
+let lastWrittenCliInputSpawnGen = 0;
+let lastWrittenAntigravityTranscriptAnchor: AntigravityTranscriptWriteBoundary | undefined;
+
+function resetAntigravityNativeQuotaLog(): void {
+  antigravityNativeQuotaLog?.reset();
+  antigravityNativeQuotaLog = undefined;
+}
+
+/** Exact worker-written input belonging to the current Antigravity turn, or
+ *  `undefined` once direct Web Terminal input, a raw passthrough command, or a
+ *  fresh process spawn has superseded it. */
+function currentAntigravityWrittenInput(): string | undefined {
+  if (!lastWrittenCliInput) return undefined;
+  if (webTerminalSubmitGeneration > lastWrittenCliInputWebSubmitGen) return undefined;
+  if (rawInputWriteGeneration > lastWrittenCliInputRawGen) return undefined;
+  if (lastWrittenCliInputSpawnGen !== cliSpawnGeneration) return undefined;
+  return lastWrittenCliInput.content;
+}
+
+function readAntigravityNativeQuota(): AntigravityNativeQuotaRefusal | undefined {
+  if (
+    cliAdapter?.id !== 'antigravity'
+    || cliAdapter.runnerFramedInput
+    || isRemoteBackendType(effectiveBackendType)
+    || !supportsAntigravityReadyFooterQuota(lastInitConfig?.cliVersion)
+    || !sessionId
+  ) {
+    return undefined;
+  }
+  antigravityNativeQuotaLog ??= new AntigravityNativeQuotaLog(sessionId);
+  const state = antigravityNativeQuotaLog.read();
+  return currentAntigravityNativeQuota(state, currentAntigravityWrittenInput());
+}
+
+/** Resolve the live Antigravity transcript strictly through double-birth-checked
+ *  local process attestation (matching daemon settlement fail-closed semantics,
+ *  with zero fallback to `codexBridgeRolloutPath` or `storedId` on missing,
+ *  ambiguous, exited, or reused PID). */
+function resolveAntigravityProofTranscriptPath(): string | undefined {
+  if (
+    cliAdapter?.id !== 'antigravity'
+    || cliAdapter.runnerFramedInput
+    || lastInitConfig?.adoptMode
+    || isRemoteBackendType(effectiveBackendType)
+  ) {
+    return undefined;
+  }
+  const attested = localAttestedCliProcess;
+  if (!attested || attested.cliSpawnGeneration !== cliSpawnGeneration) return undefined;
+  const liveConversationId = findAttestedAntigravityConversationId(attested);
+  if (!liveConversationId) return undefined;
+  const storedId = inputDeliveryObservedCliSessionId
+    ?? lastSpawnEffectiveCliSessionId
+    ?? lastInitConfig?.cliSessionId;
+  if (storedId && storedId.toLowerCase() !== liveConversationId.toLowerCase()) return undefined;
+  return resolveAntigravityTranscriptPath(liveConversationId) ?? undefined;
+}
+
+function withAntigravityDirectFailureProof(limit: CliUsageLimitState): CliUsageLimitState {
+  if (!isAntigravityNativeLimit(limit) || limit.kind !== 'usage') return limit;
+  const written = currentAntigravityWrittenInput();
+  if (!written) return limit;
+  const transcriptPath = resolveAntigravityProofTranscriptPath();
+  if (!transcriptPath) return limit;
+  const writeBoundary = lastWrittenAntigravityTranscriptAnchor;
+  if (!writeBoundary) return limit;
+  return antigravityTurnFailedWithoutOutput(transcriptPath, written, { writeBoundary })
+    ? { ...limit, directFailure: true, antigravityWriteBoundary: { ...writeBoundary } }
+    : limit;
+}
+
+usageLimitTracker.addTurnListener(event => {
+  if (event.kind === 'beginTurn') {
+    activeTransientRateLimit = undefined;
+    lastUsageLimitCaptureTurn = undefined;
+    if (cliAdapter?.id === 'antigravity' && !cliAdapter.runnerFramedInput) {
+      antigravityQuotaState.beginTurn(event.snapshot);
+    }
+    return;
+  }
+  if (event.kind === 'answered') {
+    if (cliAdapter?.id === 'antigravity' && !cliAdapter.runnerFramedInput) {
+      antigravityQuotaState.noteTurnAnswered(readAntigravityNativeQuota());
+    }
+  }
+});
 
 function currentUsageLimitSnapshot(): string {
   if (!backendScreenEvidenceIsAuthoritativeForMutation()) return '';
@@ -11047,16 +11499,17 @@ function classifyScreenUsageLimit(
   return classifyUsageLimitWithNativeEvidence(content, status);
 }
 
-/** Preserve existing non-agy display-frame classification while requiring an
- * authoritative viewport for agy's stronger native composer evidence. */
+/** Preserve existing non-agy display-frame classification while delegating
+ *  terminal Antigravity to the single-source `antigravityQuotaState` machine. */
 function classifyUsageLimitWithNativeEvidence(
   content: string,
   status: RuntimeScreenStatus,
 ): UsageAwareScreen {
-  if (cliAdapter?.id === 'antigravity' && !backendScreenEvidenceIsAuthoritativeForMutation()) return { status };
+  const isTerminalAntigravity = cliAdapter?.id === 'antigravity' && !cliAdapter.runnerFramedInput;
+  if (isTerminalAntigravity && !backendScreenEvidenceIsAuthoritativeForMutation()) return { status };
   let evidence = content;
   let nativeViewportCaptured = false;
-  if (cliAdapter?.id === 'antigravity' && backend) {
+  if (isTerminalAntigravity && backend) {
     // Card snapshots intentionally remove input/composer rows. Native error
     // reconciliation requires the full current viewport, not that display text.
     try {
@@ -11064,50 +11517,81 @@ function classifyUsageLimitWithNativeEvidence(
       if (viewport) { evidence = viewport; nativeViewportCaptured = true; }
     } catch { /* no stronger evidence */ }
   }
-  if (cliAdapter?.id === 'antigravity') {
-    // tmux capture-pane -e preserves SGR inside phrases, countdowns and error
-    // IDs. Strip controls without filtering away native composer rows.
-    evidence = stripAnsiScreenText(evidence);
-    if (isAntigravityWorkingScreen(evidence)) return { status: 'working' };
-    // 正常输入框是当前恢复证据；保留上方历史报错，但不再用它判定本轮限额。
-    // 卡片内容会裁剪输入框，因此显式携带完整权威视口确认的恢复信号。
-    if (nativeViewportCaptured && isAntigravityReadyComposerScreen(evidence)) {
-      return { status, usageLimitRecovery: 'antigravity-ready-composer' };
-    }
-    let expiredAntigravityQuota: CliUsageLimitState | undefined;
-    const result = usageLimitTracker.classify(evidence, status, state => {
-      const observed = annotateAntigravityUsageLimit(evidence, state);
-      const key = observed.relativeResetKey;
-      if (!key) return observed;
-
-      const previous = antigravityQuotaHistory?.find(entry => entry.relativeResetKey === key)
-        ?? unconfirmedAntigravityQuotas.get(key);
-      const now = Date.now();
-      const limit = reconcileUsageLimitState(previous, observed, now);
-      // Composer 可能到期后才补齐。保留确认后的记录，但从本轮限额判定中排除。
-      if (observed.source === 'antigravity-error-composer' && previous && now >= limit.retryAtMs) {
-        expiredAntigravityQuota = limit;
-        return undefined;
+  if (isTerminalAntigravity) {
+    const nativeLogQuota = readAntigravityNativeQuota();
+    const writtenInput = currentAntigravityWrittenInput();
+    // Default `replyDelivery: 'send'` Antigravity has no transcript bridge calling
+    // `noteTurnCompleted('answered')`. If `agy` internally retried after a native
+    // log 429 and completed THIS written turn (anchored strictly at or after its
+    // pre-write transcript boundary and refusal timestamp), retire that stale log
+    // refusal before evaluating the ready composer screen.
+    if (
+      nativeLogQuota
+      && nativeViewportCaptured
+      && isAntigravityReadyComposerScreen(stripAnsiScreenText(evidence))
+      && writtenInput
+      && lastWrittenAntigravityTranscriptAnchor
+    ) {
+      const proofPath = resolveAntigravityProofTranscriptPath();
+      if (proofPath && antigravityTurnAnsweredInTranscript(proofPath, writtenInput, {
+        writeBoundary: lastWrittenAntigravityTranscriptAnchor,
+        ...(nativeLogQuota.refusalAtMs !== undefined ? { minAnsweredAtMs: nativeLogQuota.refusalAtMs } : {}),
+      })) {
+        antigravityQuotaState.noteTurnAnswered(nativeLogQuota);
       }
-      return limit;
+    }
+    const outputActive = usageLimitTracker.isOutputActive?.()
+      ?? (typeof isOutputActivelyProgressing === 'function' ? isOutputActivelyProgressing() : undefined);
+    const classified = antigravityQuotaState.classify({
+      screen: evidence,
+      nativeViewportCaptured,
+      runtimeStatus: status,
+      ...(outputActive !== undefined ? { outputActive } : {}),
+      supportsReadyFooterQuota: supportsAntigravityReadyFooterQuota(lastInitConfig?.cliVersion),
+      ...(nativeLogQuota ? { nativeLogQuota } : {}),
     });
-    // 只用已上报且带 Error ID 的部分帧固定首次截止时间。看到原生 composer 后再把它计入历史。
-    const limit = expiredAntigravityQuota ?? result.usageLimit;
-    const key = limit?.relativeResetKey;
-    if (limit && key) {
-      if (limit.source === 'antigravity-error-composer') {
-        antigravityQuotaHistory = rememberAntigravityQuota(antigravityQuotaHistory, limit);
-        unconfirmedAntigravityQuotas.delete(key);
-      } else if (limit.kind === 'usage' && !key.endsWith(':')) {
-        unconfirmedAntigravityQuotas.set(key, limit);
-        if (unconfirmedAntigravityQuotas.size > ANTIGRAVITY_QUOTA_HISTORY_LIMIT) {
-          unconfirmedAntigravityQuotas.delete(unconfirmedAntigravityQuotas.keys().next().value!);
-        }
-      }
+    if (classified.detectedThisTurn) {
+      usageLimitTracker.noteTurnDetected();
+    } else if (classified.usageLimitRecovery === 'antigravity-ready-composer') {
+      usageLimitTracker.noteScreenRecovery();
     }
-    return expiredAntigravityQuota ? { ...result, expiredAntigravityQuota } : result;
+    const usageLimit = classified.usageLimit
+      ? withAntigravityDirectFailureProof(classified.usageLimit)
+      : undefined;
+    const out: UsageAwareScreen = { status: classified.status };
+    if (usageLimit) out.usageLimit = usageLimit;
+    if (classified.expiredAntigravityQuota) out.expiredAntigravityQuota = classified.expiredAntigravityQuota;
+    if (classified.usageLimitRecovery) out.usageLimitRecovery = classified.usageLimitRecovery;
+    return out;
   }
-  return usageLimitTracker.classify(evidence, status);
+  const result = usageLimitTracker.classify(evidence, status);
+  if (currentBotmuxTurnId !== undefined) {
+    lastUsageLimitCaptureTurn = {
+      turnId: currentBotmuxTurnId,
+      dispatchAttempt: currentBotmuxDispatchAttempt,
+    };
+  }
+  if (result.usageLimit && isTransientRateLimit(result.usageLimit)) {
+    const scopeTurnId = currentBotmuxTurnId ?? lastUsageLimitCaptureTurn?.turnId ?? null;
+    const scopeAttempt = currentBotmuxTurnId !== undefined
+      ? (currentBotmuxDispatchAttempt ?? null)
+      : (lastUsageLimitCaptureTurn?.dispatchAttempt ?? null);
+    const scope = JSON.stringify([
+      scopeTurnId,
+      scopeAttempt,
+      webTerminalSubmitGeneration,
+      usageLimitTracker.currentTurn(),
+    ]);
+    if (activeTransientRateLimit?.scope === scope) {
+      const pinned = reconcileUsageLimitState(activeTransientRateLimit.state, result.usageLimit, {
+        sameTransientTurn: true,
+      });
+      activeTransientRateLimit = { scope, state: pinned };
+      return { ...result, usageLimit: pinned };
+    }
+    activeTransientRateLimit = { scope, state: result.usageLimit };
+  }
+  return result;
 }
 
 // ─── Adopt-bridge state (Claude Code only) ─────────────────────────────────
@@ -11312,6 +11796,21 @@ const backgroundTaskPins = new BackgroundTaskPinSnapshot();
  *  Rides on screen_update and changes no status decision; the daemon shows it
  *  on the card and keeps the session from being suspended while it is set. */
 let backgroundWaitTasks = 0;
+/** True when `foldBackgroundUpdates` is on and a bounded (non-persistent)
+ *  Monitor is still live while `backgroundWaitTasks === 0` (e.g. a suppressed
+ *  Monitor micro-turn temporarily opened `mainTurnOpen`). Carried on
+ *  `screen_update` as `cotHoldForBackground: true` so the daemon keeps the
+ *  launching turn's CoT bubble open without changing `ds.backgroundTaskCount`. */
+let backgroundCotHold = false;
+/** True once this worker emitted a `turn_terminal(backgroundTasks > 0)` or a
+ *  `screen_update` carrying `backgroundTasks`/`cotHoldForBackground` that may
+ *  hold `ds.cotHeldForBackground` on the daemon. Forces the next `screenUpdateTimer`
+ *  tick to publish a zero-hold working/idle frame once all holds clear — even if
+ *  the Monitor expired or the switch toggled off before the first 2s tick. */
+let daemonCotHoldMayBeActive = false;
+/** Tracks whether underlying background tasks are live for sibling-transcript
+ *  stop scanning, independent of display flags cleared by `beginCliWriteCycle`. */
+let backgroundTasksTrackedForSiblings = false;
 /** Antigravity 常规模式原生页脚报告的后台任务/计时器数；与前台 activeTurnAuthority 解耦，
  *  仅经 refreshBackgroundWait 汇入 screen_update.backgroundTasks。 */
 let antigravityFooterBackgroundTasks = 0;
@@ -11324,8 +11823,21 @@ function observeAntigravityFooterBackgroundTasks(screen: string | undefined): vo
   antigravityFooterBackgroundTasks = parsed;
 }
 
-function backgroundWaitPayload(): { backgroundTasks?: number } {
-  return backgroundWaitTasks > 0 ? { backgroundTasks: backgroundWaitTasks } : {};
+function computeBackgroundCotHold(nowMs = Date.now()): boolean {
+  if (!foldBackgroundUpdatesEnabled()) return false;
+  if (lastInitConfig?.adoptMode === true || lastInitConfig?.apiOnly === true) return false;
+  if (backgroundWaitTasks > 0) return false;
+  if (bridgeQueue?.hasActiveNonLocalTurn?.() === true) return false;
+  return backgroundTaskTracker.hasPendingNonPersistentMonitor?.(nowMs) === true
+    || bridgeQueue?.hasActiveSuppressedMonitorWake?.() === true;
+}
+
+function backgroundWaitPayload(): { backgroundTasks?: number; cotHoldForBackground?: true } {
+  if (backgroundWaitTasks > 0 || backgroundCotHold) daemonCotHoldMayBeActive = true;
+  return {
+    ...(backgroundWaitTasks > 0 ? { backgroundTasks: backgroundWaitTasks } : {}),
+    ...(backgroundCotHold ? { cotHoldForBackground: true as const } : {}),
+  };
 }
 
 /** The main conversation's latest served model request and latest non-upkeep
@@ -11464,11 +11976,13 @@ function seedBackgroundTasksFromTranscript(paths?: readonly (string | Background
       // would otherwise pin a dead task forever. Fail back to the old empty
       // tracker; the next lazy baseline retries the whole replay.
       backgroundTaskTracker.reset(bridgeLiveCliStartedAtMs);
+      bridgeQueue?.resetBackgroundTasks?.();
       refreshBackgroundWait();
       return null;
     }
     if (segment.path === currentPath) currentCursor = cursor;
   }
+  bridgeQueue?.seedBackgroundTasks?.(backgroundTaskTracker.liveTasksSnapshot?.() ?? []);
   if (typeof backgroundAuthorityHold !== 'undefined'
     && typeof backgroundTaskTracker !== 'undefined'
     && typeof backgroundTaskTracker?.liveTaskIds === 'function') {
@@ -11498,9 +12012,20 @@ function refreshBackgroundWait(): void {
   }
   const footerTasks = typeof antigravityFooterBackgroundTasks === 'number' ? antigravityFooterBackgroundTasks : 0;
   const next = Math.max(backgroundTaskTracker.backgroundWait(), footerTasks);
-  if (next > 0 && backgroundWaitTasks === 0) backgroundStopScanSinceMs = Date.now();
-  if (next === 0) backgroundStopScanOffsets.clear();
+  const prevCotHold = backgroundCotHold;
   backgroundWaitTasks = next;
+  const nextHold = next > 0 ? false : computeBackgroundCotHold();
+  // Flush any buffered anchor CoT BEFORE clearing `backgroundCotHold`, so the
+  // daemon receives trailing entries before the releasing `screen_update` closes
+  // the held CoT bubble.
+  if (prevCotHold && !nextHold && next === 0 && typeof flushThinkingUpdate === 'function') {
+    flushThinkingUpdate();
+  }
+  const hasPendingTasks = (backgroundTaskTracker.pending?.() ?? 0) > 0 || next > 0;
+  if (hasPendingTasks && !backgroundTasksTrackedForSiblings) backgroundStopScanSinceMs = Date.now();
+  if (!hasPendingTasks) backgroundStopScanOffsets.clear();
+  backgroundTasksTrackedForSiblings = hasPendingTasks;
+  backgroundCotHold = nextHold;
   syncBackgroundTaskPinsToDaemon();
 }
 
@@ -11538,7 +12063,8 @@ let backgroundStopScanSinceMs = 0;
  *  would otherwise stay up until then. Only ids this session tracks can
  *  settle. */
 function settleBackgroundTasksFromSiblings(): void {
-  if (backgroundWaitTasks === 0 || !bridgeJsonlDir || !bridgeJsonlPath) return;
+  if (((backgroundTaskTracker.pending?.() ?? 0) === 0 && backgroundWaitTasks === 0 && !backgroundCotHold)
+    || !bridgeJsonlDir || !bridgeJsonlPath) return;
   for (const taskId of backgroundTaskStopsInSiblingTranscripts(
     bridgeJsonlDir, bridgeJsonlPath, backgroundStopScanSinceMs, backgroundStopScanOffsets,
   )) {
@@ -11700,6 +12226,7 @@ function discardDeploymentContinuation(): void {
   }
   if (lastInitConfig) lastInitConfig.deploymentContinuation = undefined;
   lastWrittenCliInput = undefined;
+  lastWrittenAntigravityTranscriptAnchor = undefined;
   restoredDeploymentTurnId = undefined;
   pendingRestartInterruption = undefined;
   restartInterruptionScanBeforeMs = undefined;
@@ -12165,11 +12692,126 @@ function observeCotEntries(entries: readonly CotEntry[], turn: { turnId: string;
   scheduleThinkingEmit();
 }
 
-function observeThinkingAttribution(ev: TranscriptEvent, turn: BridgePendingTurn): void {
-  // Local-terminal turns have no Lark thread card to stream into; API-error
-  // records are execution metadata, not model thinking.
-  if (turn.isLocal) return;
+/** Opt-in per bot (foldBackgroundUpdates), as this worker process started with it.
+ *  Off, non-terminal Monitor mid-stream wakes keep their original behavior. */
+function foldBackgroundUpdatesInitEnabled(): boolean {
+  return lastInitConfig?.foldBackgroundUpdates === true;
+}
+
+/** The bot's foldBackgroundUpdates as the daemon last pushed it
+ *  (set_fold_background_updates); undefined until changed after worker start. */
+let foldBackgroundUpdatesLive: boolean | undefined;
+
+function foldBackgroundUpdatesEnabled(): boolean {
+  return (foldBackgroundUpdatesLive ?? foldBackgroundUpdatesInitEnabled()) === true;
+}
+
+function setFoldBackgroundUpdatesLive(enabled: boolean): void {
+  foldBackgroundUpdatesLive = enabled;
+  log(`foldBackgroundUpdates → ${enabled ? 'on' : 'off'}`);
+  if (!enabled) flushThinkingUpdate();
+  refreshBackgroundWait();
+}
+
+function resetFoldBackgroundUpdatesStateForInit(): void {
+  foldBackgroundUpdatesLive = undefined;
+}
+
+type MonitorWakeGateTurn = Pick<
+  BridgePendingTurn,
+  'wakeNonTerminalMonitor' | 'isLocal' | 'userUuid' | 'isScheduled' | 'terminalOutcome'
+>;
+
+/** True ONLY for a headless non-terminal Monitor mid-stream micro-turn that
+ *  should have its chat body suppressed while the bot's `foldBackgroundUpdates`
+ *  switch is enabled. Always returns false when the switch is off, in adopt or
+ *  apiOnly sessions, on non-local/human/scheduled/failed turns, or when the
+ *  wake includes any terminal/expiry/persistent/non-Monitor notice. */
+function isSuppressedNonTerminalMonitorWake(
+  turn: MonitorWakeGateTurn,
+  opts: { enabled: boolean; adoptMode: boolean; apiOnly: boolean } = {
+    enabled: foldBackgroundUpdatesEnabled(),
+    adoptMode: lastInitConfig?.adoptMode === true,
+    apiOnly: lastInitConfig?.apiOnly === true,
+  },
+): boolean {
+  if (!opts.enabled) return false;
+  if (opts.adoptMode || opts.apiOnly) return false;
+  if (turn.wakeNonTerminalMonitor !== true) return false;
+  if (turn.isLocal !== true || !!turn.userUuid || turn.isScheduled === true) return false;
+  if (turn.terminalOutcome && turn.terminalOutcome.status !== 'completed') return false;
+  return true;
+}
+
+/** Resolve the launching Lark turn anchor `(turnId, dispatchAttempt)` for
+ *  streaming a suppressed Monitor micro-turn's CoT entries into its held CoT
+ *  folding area. Refuses to clobber a newer Lark turn's cumulative CoT buffer
+ *  (`thinkingTurnKey` already moved to another turn). */
+function resolveMonitorWakeCotAnchor(
+  anchor: { turnId?: string; dispatchAttempt?: number } | undefined,
+): BackgroundTaskAnchor | undefined {
+  if (!foldBackgroundUpdatesEnabled()) return undefined;
+  if (lastInitConfig?.adoptMode === true || lastInitConfig?.apiOnly === true) return undefined;
+  if (!anchor?.turnId) return undefined;
+  const anchorKey = `${anchor.turnId}|${anchor.dispatchAttempt ?? ''}`;
+  if (thinkingTurnKey !== undefined && thinkingTurnKey !== anchorKey) return undefined;
+  return {
+    turnId: anchor.turnId,
+    ...(anchor.dispatchAttempt !== undefined ? { dispatchAttempt: anchor.dispatchAttempt } : {}),
+  };
+}
+
+function observePendingMonitorWakeCotActivity(ev: TranscriptEvent, anchor: BackgroundTaskAnchor): void {
   if ((ev as any).isApiErrorMessage === true) return;
+  const target = resolveMonitorWakeCotAnchor(anchor);
+  if (!target) return;
+  observeCotEntries(extractCotEntries(ev), target);
+}
+
+function flushPendingMonitorWakeCotOnTextlessComplete(anchor: BackgroundTaskAnchor): void {
+  if (!foldBackgroundUpdatesEnabled()) return;
+  if (lastInitConfig?.adoptMode === true || lastInitConfig?.apiOnly === true) return;
+  if (thinkingTurn?.turnId === anchor.turnId && thinkingTurn.dispatchAttempt === anchor.dispatchAttempt) {
+    flushThinkingUpdate();
+  }
+}
+
+const observePendingMonitorWakeCot: PendingWakeCotObserver = {
+  onActivity: observePendingMonitorWakeCotActivity,
+  onTextlessComplete: flushPendingMonitorWakeCotOnTextlessComplete,
+};
+
+function observeThinkingAttribution(ev: TranscriptEvent, turn: BridgePendingTurn): void {
+  // API-error records are execution metadata, not model thinking.
+  if ((ev as any).isApiErrorMessage === true) return;
+  if (turn.isLocal) {
+    // Ordinary local-terminal turns have no Lark thread card to stream into.
+    // A suppressed non-terminal Monitor mid-stream wake keeps its progress
+    // visible inside the launching main turn's held CoT folding area instead.
+    if (!isSuppressedNonTerminalMonitorWake(turn)) return;
+    const anchor = resolveMonitorWakeCotAnchor({
+      turnId: turn.replyAnchorTurnId,
+      dispatchAttempt: turn.replyAnchorDispatchAttempt,
+    });
+    if (!anchor) return;
+    observeCotEntries(extractCotEntries(ev), anchor);
+    return;
+  }
+  if (bridgeQueue?.isLateUnobservedRecovery?.(turn) === true && turn.replyAnchorTurnId) {
+    // Scenario 3A late recovery: keep CoT entries anchored on the originating
+    // Lark turn so `thinkingTurnKey` never moves to a synthetic `late-recovery-*`
+    // id (which would supersede the held bubble without a terminal and blind
+    // subsequent Monitor wakes anchored to the originating turn).
+    observeCotEntries(extractCotEntries(ev), {
+      turnId: turn.replyAnchorTurnId,
+      ...(turn.replyAnchorDispatchAttempt !== undefined
+        ? { dispatchAttempt: turn.replyAnchorDispatchAttempt }
+        : turn.dispatchAttempt !== undefined
+          ? { dispatchAttempt: turn.dispatchAttempt }
+          : {}),
+    });
+    return;
+  }
   observeCotEntries(extractCotEntries(ev), turn);
 }
 
@@ -12797,8 +13439,15 @@ function saveUnsentInputsForSuccessor(reason: string): void {
 
 /** An input reached the CLI: it becomes the turn a standalone restart note
  *  continues, and a restored predecessor input is no longer outstanding. */
-function noteCliInputWritten(item: PendingCliInput): void {
+function noteCliInputWritten(
+  item: PendingCliInput,
+  antigravityAnchor?: AntigravityTranscriptWriteBoundary,
+): void {
   lastWrittenCliInput = item;
+  lastWrittenCliInputWebSubmitGen = webTerminalSubmitGeneration;
+  lastWrittenCliInputRawGen = rawInputWriteGeneration;
+  lastWrittenCliInputSpawnGen = cliSpawnGeneration;
+  lastWrittenAntigravityTranscriptAnchor = antigravityAnchor;
   if (item.turnId) writtenInputs.noteWritten(item.turnId, item.content, item.dispatchAttempt);
   if (restoredUnsentInputs.delete(item) && restoredUnsentInputs.size === 0) {
     const unsentPath = unsentInputJournalPath();
@@ -12851,22 +13500,28 @@ function codexAdoptJournalPath(): string | undefined {
   return base && lastInitConfig?.adoptMode && structuredBridgeIs('codex') ? `${base}.codex-adopt` : undefined;
 }
 
-function checkpointCodexAdoptRecovery(): void {
+function checkpointCodexAdoptRecovery(strict = false): void {
   if (traexQuotaPending?.failedTurn) return;
   const path = codexAdoptJournalPath();
   // The first attach must consume the previous generation's journal before a
   // new pre-path input or an early empty drain can replace it.
   if (!path || !codexBridgeRolloutPath || !codexAdoptRecoveryAttempted) return;
   try { checkpointCodexAdoptTurns(path, codexBridgeRolloutPath, codexBridgeQueue, codexBridgeOffset); }
-  catch (error: unknown) { log(`Codex adopt checkpoint failed: ${error instanceof Error ? error.message : String(error)}`); }
+  catch (error: unknown) {
+    if (strict) throw error;
+    log(`Codex adopt checkpoint failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
-function checkpointStructuredBridgeRecovery(): void {
+function checkpointStructuredBridgeRecovery(strict = false): void {
   if (traexQuotaPending?.failedTurn) return;
   const path = structuredBridgeJournalPath();
   if (!path || !codexBridgeRolloutPath || !structuredBridgeRecoveryAttempted) return;
   try { checkpointCodexAdoptTurns(path, codexBridgeRolloutPath, codexBridgeQueue, codexBridgeOffset, structuredBridgeIs('doubao')); }
-  catch (error: unknown) { log(`Structured bridge checkpoint failed: ${error instanceof Error ? error.message : String(error)}`); }
+  catch (error: unknown) {
+    if (strict) throw error;
+    log(`Structured bridge checkpoint failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 /** Per-session durable file of built-in CronCreate task → topic anchors.
@@ -13745,7 +14400,7 @@ function tryRestoreInterruptedBridgeTurns(backgroundTasksCursor?: JsonlCursor): 
   bridgeOffset = drained.newOffset;
   const cutoffMs = Math.min(...restorable.map(entry => entry.markTimeMs)) - 5_000;
   const { history, live } = splitTranscriptEventsByCutoff(drained.events, cutoffMs);
-  bridgeQueue.absorb(history);
+  bridgeQueue.absorb(history, { liveSinceMs: backgroundTaskTracker.liveSinceMsValue?.() ?? 0 });
   if (live.length > 0) bridgeQueue.ingest(live, bridgeJsonlPath);
   // The old CLI's queue died with it: a replayed enqueue proves nothing now.
   bridgeQueue.forgetCliQueue();
@@ -13792,7 +14447,11 @@ function bridgeApplyFingerprintSwitch(matched: string, reason: string, cutoffMs:
   if (previousJsonlPath && bridgeBaselineDone) {
     postDrainOffset = bridgeOffset;
     try {
-      const drained = drainPathInto(previousJsonlPath, bridgeOffset);
+      // Do not feed unread trailing bytes on the pre-switch transcript into
+      // `backgroundAuthorityHold`: a post-/clear FOREGROUND turn already
+      // matched on `matched` must not be wiped by the old path's `/clear` or
+      // `turn_duration`. Any prior background-held turn is revoked below.
+      const drained = drainPathInto(previousJsonlPath, bridgeOffset, { feedAuthorityHold: false });
       postDrainOffset = drained.offset;
     } catch (err: any) {
       log(`Bridge final-drain on fingerprint switch failed (${err.message}); continuing`);
@@ -13831,7 +14490,7 @@ function bridgeApplyFingerprintSwitch(matched: string, reason: string, cutoffMs:
   // re-proves `seen` if the new file carries a marker.
   const wasHoldingWatchdog = typeof claudeOpenTurnWatchdog !== 'undefined' && claudeOpenTurnWatchdog.isActive();
   beginNewBridgeTranscriptGeneration();
-  bridgeQueue.absorb(history);
+  bridgeQueue.absorb(history, { liveSinceMs: backgroundTaskTracker.liveSinceMsValue?.() ?? 0 });
   ingestClaudeSwitchLiveAndSettleUnreadTurn(live, matched);
   if (wasHoldingWatchdog && !bridgeQueue.hasActiveOrQueuedHead?.({ ignoreCarried: true })) {
     if (typeof fireClaudeRedriveEdge === 'function') fireClaudeRedriveEdge();
@@ -13841,17 +14500,24 @@ function bridgeApplyFingerprintSwitch(matched: string, reason: string, cutoffMs:
   // previous session left behind) before folding this file's own events in.
   seedModelFallbackFromTranscript();
   observeModelFallbackEvents(matched, drained.events);
-  // Fold history into backgroundTaskTracker (and settle historical stops in
-  // backgroundAuthorityHold) BEFORE seeding preexisting live tasks, so tasks
-  // that already stopped in history do not block later SendMessage resumes.
+  // Fold history into backgroundTaskTracker (and settle historical stops /
+  // re-prove duration markers in backgroundAuthorityHold) BEFORE seeding
+  // preexisting live tasks, so tasks that already stopped in history do not
+  // block later SendMessage resumes and pre-/clear records cannot corrupt a
+  // post-/clear FOREGROUND turn.
   for (const ev of history) {
     if (typeof backgroundTaskTracker !== 'undefined' && typeof backgroundTaskTracker?.observe === 'function') {
       backgroundTaskTracker.observe(ev);
     }
-    if (typeof backgroundAuthorityHold !== 'undefined' && typeof eventTimeMs === 'function' && typeof backgroundTaskSettledIds === 'function') {
-      const atMs = eventTimeMs(ev);
-      for (const id of backgroundTaskSettledIds(ev)) {
-        backgroundAuthorityHold.recordHistoricalSettlement(id, atMs);
+    if (typeof backgroundAuthorityHold !== 'undefined') {
+      if (typeof isClaudeTurnDurationEvent === 'function' && isClaudeTurnDurationEvent(ev)) {
+        backgroundAuthorityHold.noteDurationMarkerObserved();
+      }
+      if (typeof eventTimeMs === 'function' && typeof backgroundTaskSettledIds === 'function') {
+        const atMs = eventTimeMs(ev);
+        for (const id of backgroundTaskSettledIds(ev)) {
+          backgroundAuthorityHold.recordHistoricalSettlement(id, atMs);
+        }
       }
     }
   }
@@ -14118,7 +14784,11 @@ function performRotationSwitch(newPath: string, cutoffMs: number, reason: string
   if (previousJsonlPath && bridgeBaselineDone) {
     postDrainOffset = bridgeOffset;
     try {
-      const drained = drainPathInto(previousJsonlPath, bridgeOffset);
+      // Do not feed unread trailing bytes on the pre-rotation transcript into
+      // `backgroundAuthorityHold`: mirrors `bridgeApplyFingerprintSwitch` so an
+      // unread `/clear` or pre-rotation task launch on `previousJsonlPath`
+      // cannot wipe or pollute a post-rotation FOREGROUND turn on `newPath`.
+      const drained = drainPathInto(previousJsonlPath, bridgeOffset, { feedAuthorityHold: false });
       postDrainOffset = drained.offset;
     } catch (err: any) {
       log(`Bridge final-drain on rotation (${reason}) failed (${err.message}); continuing`);
@@ -14150,7 +14820,7 @@ function performRotationSwitch(newPath: string, cutoffMs: number, reason: string
   // not carry over; absorb re-proves `seen` from the new file.
   const wasHoldingWatchdog = typeof claudeOpenTurnWatchdog !== 'undefined' && claudeOpenTurnWatchdog.isActive();
   beginNewBridgeTranscriptGeneration();
-  bridgeQueue.absorb(history);
+  bridgeQueue.absorb(history, { liveSinceMs: backgroundTaskTracker.liveSinceMsValue?.() ?? 0 });
   ingestClaudeSwitchLiveAndSettleUnreadTurn(live, newPath);
   if (wasHoldingWatchdog && !bridgeQueue.hasActiveOrQueuedHead?.({ ignoreCarried: true })) {
     if (typeof fireClaudeRedriveEdge === 'function') fireClaudeRedriveEdge();
@@ -14167,10 +14837,15 @@ function performRotationSwitch(newPath: string, cutoffMs: number, reason: string
     if (typeof backgroundTaskTracker !== 'undefined' && typeof backgroundTaskTracker?.observe === 'function') {
       backgroundTaskTracker.observe(ev);
     }
-    if (typeof backgroundAuthorityHold !== 'undefined' && typeof eventTimeMs === 'function' && typeof backgroundTaskSettledIds === 'function') {
-      const atMs = eventTimeMs(ev);
-      for (const id of backgroundTaskSettledIds(ev)) {
-        backgroundAuthorityHold.recordHistoricalSettlement(id, atMs);
+    if (typeof backgroundAuthorityHold !== 'undefined') {
+      if (typeof isClaudeTurnDurationEvent === 'function' && isClaudeTurnDurationEvent(ev)) {
+        backgroundAuthorityHold.noteDurationMarkerObserved();
+      }
+      if (typeof eventTimeMs === 'function' && typeof backgroundTaskSettledIds === 'function') {
+        const atMs = eventTimeMs(ev);
+        for (const id of backgroundTaskSettledIds(ev)) {
+          backgroundAuthorityHold.recordHistoricalSettlement(id, atMs);
+        }
       }
     }
   }
@@ -14525,9 +15200,10 @@ function ingestClaudeSwitchLiveAndSettleUnreadTurn(live: TranscriptEvent[], path
   if (live.length > 0) {
     bridgeQueue.ingest(live, path, (record, turn) => {
       if (record.type === 'assistant') attributed.push({ record, turnId: turn.turnId, isLocal: turn.isLocal === true });
+      try { observeBridgeAttribution(record, turn); } catch { /* observer channel */ }
     }, (record, turn) => {
       attributed.push({ record, turnId: turn.turnId, isLocal: turn.isLocal === true });
-    });
+    }, observePendingMonitorWakeCot);
   }
   settleUnreadClaudeTurnLookOnSwitch(attributed);
 }
@@ -15431,7 +16107,7 @@ function bridgeIngest(): void {
     // exists", which this makes true in every mode.
     cliTranscriptEverExisted = true;
   }
-  bridgeQueue.ingest(result.events, bridgeJsonlPath, observeBridgeAttribution);
+  bridgeQueue.ingest(result.events, bridgeJsonlPath, observeBridgeAttribution, undefined, observePendingMonitorWakeCot);
   // Arm (or keep) the no-idle-edge watchdog for a fresh head now waiting on
   // its closing records. No-op while an idle settle owns the wait.
   updateProvisionalExitWatch();
@@ -15962,6 +16638,11 @@ function emitReadyTurns(opts: EmitReadyTurnsOptions = {}): void {
   // user over IM, but the HTTP channel has no captured content. The terminal
   // carries `explicit_final_delivered` so wait/async callers still settle.
   const finalMarkerTurns = new Set<(typeof ready)[number]>();
+  // Suppressed non-terminal Monitor mid-stream wakes whose chat body was muted
+  // by `foldBackgroundUpdates`. Loop 2 skips `emitTurnTerminal` for these so
+  // the launching main turn's held CoT bubble stays open, flushing any buffered
+  // anchor CoT entries instead.
+  const suppressedMonitorWakes = new Set<(typeof ready)[number]>();
   // Turns that actually emitted a final_output IPC in loop 1.
   const emittedFinalOutputTurns = new Set<(typeof ready)[number]>();
   // Turns whose final_output was durably offered to V1 handoff in loop 1.
@@ -15995,6 +16676,24 @@ function emitReadyTurns(opts: EmitReadyTurnsOptions = {}): void {
     // structured terminal below owns retry/attention; never leak the raw
     // provider error through transcript fallback (regardless of send markers).
     if (turn.terminalOutcome && turn.terminalOutcome.status !== 'completed') continue;
+    // Opt-in `foldBackgroundUpdates`: mute routine non-terminal Monitor
+    // mid-stream wake replies in both zero-injection and transcript delivery
+    // modes while keeping their progress visible in the launching turn's CoT
+    // folding area. First-turn finals, terminal/expiry/persistent wakes,
+    // human turns, scheduled turns, adoptMode, apiOnly, and failures never
+    // match this predicate.
+    if (!sentTerminalTurnStarts.has(turn) && isSuppressedNonTerminalMonitorWake(turn, {
+      enabled: foldBackgroundUpdatesEnabled(),
+      adoptMode,
+      apiOnly: lastInitConfig?.apiOnly === true,
+    })) {
+      suppressedMonitorWakes.add(turn);
+      if (!turn.rateLimited && turn.assistantUuids.length > 0) {
+        usageLimitTracker.noteTurnCompleted('answered');
+      }
+      log(`Bridge final suppressed for turn ${turn.turnId.substring(0, 8)} (non-terminal Monitor mid-stream wake)`);
+      continue;
+    }
     // A turn folded into the running one (mid-turn system reminder) starts
     // inside that turn and shares its reply, so it must not cut the host's
     // send window short — the next boundary is the next turn of its own.
@@ -16253,6 +16952,13 @@ function emitReadyTurns(opts: EmitReadyTurnsOptions = {}): void {
     }
     observedOutputTurns.add(turn);
     emittedFinalOutputTurns.add(turn);
+    // JIT FIFO backstop: if `terminal_turn_started` was skipped at wake start
+    // (switch on) and the turn later became deliverable (switch turned off
+    // mid-turn or a terminal notice folded in), register its reply context
+    // immediately before `final_output` so the daemon routes it cleanly.
+    if (turn.isLocal && zeroPromptTerminalSync() && deferredTerminalTurnStarts.delete(turn)) {
+      sendTerminalTurnStarted(turn);
+    }
     send({
       type: 'final_output',
       content: deliveredText,
@@ -16304,6 +17010,21 @@ function emitReadyTurns(opts: EmitReadyTurnsOptions = {}): void {
     if (unsubmitted.has(turn.turnId) || workerFinalOutputHandoff?.hasTurn(turn.turnId)) continue;
     if (universalOutputHandoff || handoffTurnIds.has(turn.turnId)) journalBridgeTurnClear(turn.turnId, turn.dispatchAttempt);
     if (turn.rateLimited) continue;
+    if (suppressedMonitorWakes.has(turn)) {
+      // Flush any buffered CoT entries attributed to the launching turn's
+      // anchor, and skip `emitTurnTerminal` so the daemon does not release
+      // `ds.cotHeldForBackground` or overwrite `ds.lastThinkingUpdate`.
+      const cotTarget = turn.replyAnchorTurnId
+        ? { turnId: turn.replyAnchorTurnId, dispatchAttempt: turn.replyAnchorDispatchAttempt }
+        : turn.cotAnchor;
+      if (cotTarget
+        && thinkingTurn?.turnId === cotTarget.turnId
+        && thinkingTurn.dispatchAttempt === cotTarget.dispatchAttempt) {
+        flushThinkingUpdate();
+      }
+      deferredTerminalTurnStarts.delete(turn);
+      continue;
+    }
     // Scenario 3 late recovery: the originating turn already emitted its
     // turn_terminal when popped at the bounded unobserved boundary.
     if (bridgeQueue.isLateUnobservedRecovery?.(turn)) continue;
@@ -16352,6 +17073,17 @@ function emitReadyTurns(opts: EmitReadyTurnsOptions = {}): void {
           && !zeroPromptTerminalSync() && replyDeliveryMode() === 'transcript',
       });
       if (notice) {
+        const cotTarget = turn.replyAnchorTurnId
+          ? { turnId: turn.replyAnchorTurnId, dispatchAttempt: turn.replyAnchorDispatchAttempt }
+          : turn.cotAnchor;
+        if (cotTarget
+          && thinkingTurn?.turnId === cotTarget.turnId
+          && thinkingTurn.dispatchAttempt === cotTarget.dispatchAttempt) {
+          flushThinkingUpdate();
+        }
+        if (zeroPromptTerminalSync() && deferredTerminalTurnStarts.delete(turn)) {
+          sendTerminalTurnStarted(turn);
+        }
         log(`Bridge terminal for synthesised local turn ${turn.turnId.substring(0, 8)} `
           + `(${outcome.status}/${notice.errorCode}) failed live — sending a notice instead`);
         send({
@@ -16362,6 +17094,7 @@ function emitReadyTurns(opts: EmitReadyTurnsOptions = {}): void {
         lastTurnFailureSurfacedAtMs = Date.now();
         continue;
       }
+      deferredTerminalTurnStarts.delete(turn);
       log(`Bridge terminal suppressed for synthesised local turn ${turn.turnId.substring(0, 8)} `
         + `(${outcome.status}${outcome.errorCode ? `/${outcome.errorCode}` : ''}) — replayed history, no Lark turn to notify`);
       continue;
@@ -16431,6 +17164,20 @@ function emitReadyTurns(opts: EmitReadyTurnsOptions = {}): void {
           && !observedOutputTurns.has(turn)
           ? 'boundary_unobserved'
           : undefined;
+    // If a local wake turn streamed leading CoT to its launching anchor before
+    // flipping to deliverable (mid-turn toggle off, absorbed terminal notice, or
+    // unrouting), flush that anchor CoT before `emitTurnTerminal` releases the
+    // held bubble.
+    const preTerminalCotTarget = turn.isLocal
+      ? (turn.replyAnchorTurnId
+        ? { turnId: turn.replyAnchorTurnId, dispatchAttempt: turn.replyAnchorDispatchAttempt }
+        : turn.cotAnchor)
+      : undefined;
+    if (preTerminalCotTarget
+      && thinkingTurn?.turnId === preTerminalCotTarget.turnId
+      && thinkingTurn.dispatchAttempt === preTerminalCotTarget.dispatchAttempt) {
+      flushThinkingUpdate();
+    }
     try {
       emitTurnTerminal(
         turn.turnId,
@@ -16460,7 +17207,11 @@ function emitReadyTurns(opts: EmitReadyTurnsOptions = {}): void {
  *  callers can use it to flush the old path during a rotation without
  *  disturbing the watcher's normal cursor. Returns the new offset for the
  *  caller to commit (or discard, if it's about to switch paths). */
-function drainPathInto(path: string, fromOffset: number): { offset: number; tail: string } {
+function drainPathInto(
+  path: string,
+  fromOffset: number,
+  opts?: { feedAuthorityHold?: boolean },
+): { offset: number; tail: string } {
   const result = drainTranscript(path, fromOffset);
   bridgeQueue.ingest(result.events, path);
   // Drain-before-switch runs while `path` is still the primary, so these are
@@ -16469,8 +17220,33 @@ function drainPathInto(path: string, fromOffset: number): { offset: number; tail
   observeModelFallbackEvents(path, result.events);
   // Same reasoning for background-task bookkeeping: a dispatch launch-ack or a
   // `<task-notification>` can land on the trailing bytes of a rotating path and
-  // reach the tracker nowhere else.
-  observeClaudeBackgroundTasks(result.events);
+  // reach the tracker nowhere else. When `feedAuthorityHold === false` (e.g.
+  // pre-switch drain onto a post-/clear transcript), record historical
+  // settlements & preexisting live IDs without feeding old `/clear` or
+  // `turn_duration` into the new session's live `backgroundAuthorityHold`.
+  if (opts?.feedAuthorityHold === false) {
+    const now = Date.now();
+    for (const ev of result.events) {
+      if (typeof backgroundAuthorityHold !== 'undefined' && typeof eventTimeMs === 'function' && typeof backgroundTaskSettledIds === 'function') {
+        const atMs = eventTimeMs(ev);
+        for (const id of backgroundTaskSettledIds(ev)) {
+          if (typeof applyBackgroundAuthorityTransition === 'function') {
+            applyBackgroundAuthorityTransition(backgroundAuthorityHold.onTaskSettled(id, { wakes: false, atMs }, now));
+          } else {
+            backgroundAuthorityHold.recordHistoricalSettlement(id, atMs);
+          }
+        }
+      }
+    }
+    observeClaudeBackgroundTasks(result.events, { feedAuthorityHold: [] });
+    if (typeof backgroundAuthorityHold !== 'undefined'
+      && typeof backgroundTaskTracker !== 'undefined'
+      && typeof backgroundTaskTracker?.liveTaskIds === 'function') {
+      backgroundAuthorityHold.seedPreexistingLiveTasks(backgroundTaskTracker.liveTaskIds());
+    }
+  } else {
+    observeClaudeBackgroundTasks(result.events);
+  }
   return { offset: result.newOffset, tail: result.pendingTail };
 }
 
@@ -16903,19 +17679,20 @@ function codexBridgeStartTimer(): void {
             }
           }
         }
-        codexBridgeIngest();
         // Cursor's mirror can flush THIS turn's user line as late as the end
         // of the first assistant step (a tool-less reply flushes the whole
         // turn at once, at the end). While the CLI is visibly busy the queued
         // heads' bounded leases must not lapse waiting for that flush —
-        // refresh them each tick (the argv-baked confirmed first turn and
-        // type-ahead successors included); the 120s hard cap means a false
-        // "busy" screen still prunes and the queue recovers. Non-adopt only:
-        // adopt keeps its historical timing (an expired adopt mark degrades
-        // to local-turn synthesis, still visible in Lark).
+        // refresh them each tick BEFORE ingest's own prune (the argv-baked
+        // confirmed first turn and type-ahead successors included); the 120s
+        // hard cap means a false "busy" screen still prunes and the queue
+        // recovers. Non-adopt only: adopt keeps its historical timing (an
+        // expired adopt mark degrades to local-turn synthesis, still visible
+        // in Lark).
         if (!isPromptReady && !lastInitConfig?.adoptMode) {
           codexBridgeQueue.refreshUnstartedHeadAttributionLease(Date.now(), CURSOR_BUSY_REFRESH_MAX_MS);
         }
+        codexBridgeIngest();
         if (isPromptReady) emitReadyCodexTurns();
         return;
       }
@@ -17078,6 +17855,14 @@ function codexBridgeStartTimer(): void {
         pruneExpiredStructuredHeadsAndEmit('structured bridge tick');
       } catch (err: any) {
         log(`Codex bridge tick expiry error: ${err.message}`);
+      }
+      try {
+        // Worker-function harnesses for older ticker branches provide only the
+        // dependencies of that branch; the full worker always supplies this.
+        if (typeof maybeSettleMissingStructuredFinal === 'function') maybeSettleMissingStructuredFinal();
+        if (typeof flushMissingFinalNotices === 'function') flushMissingFinalNotices();
+      } catch (err: any) {
+        log(`Missing-final turn settlement error: ${err.message}`);
       }
     }
   }, 1000);
@@ -17326,7 +18111,8 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
       if (recoverySkipReason) log(`Doubao bridge recovery skipped (${recoverySkipReason})`);
       if (restored && !recoverySkipReason) {
         const journalPath = structuredBridgeJournalPath();
-        const proof = journalPath ? readBridgeTurnJournal(journalPath).find(entry => entry.turnId === restored.turnId
+        const proof = journalPath ? readBridgeTurnJournal(journalPath).find(entry => !entry.pendingNotice
+          && entry.turnId === restored.turnId
           && entry.dispatchAttempt === restored.dispatchAttempt && entry.jsonlPath === rolloutPath)?.nativeUserProof : undefined;
         const validFrontier = proof && Number.isSafeInteger(proof.trajectoryOffset)
           && proof.trajectoryOffset >= 0 && proof.trajectoryOffset <= traj.newOffset
@@ -17776,6 +18562,7 @@ function codexBridgeDetachFile(): void {
   antigravityQuietCandidateKey = undefined;
   antigravityQuietCandidateCompleteOffset = undefined;
   antigravityFullUpgradeAttemptKey = undefined;
+  structuredMissingFinalWatchdog?.observe(undefined);
 }
 
 /** Resolve the pid of the Codex process this worker observes (spawned child or
@@ -18564,11 +19351,11 @@ function codexBridgeIngest(opts: {
   flushOmpTrailingFinal?: boolean;
   flushAntigravityTrailingFinal?: boolean;
   retireAntigravityPendingTurns?: boolean;
-} = {}): void {
+} = {}): boolean {
   // An authoritative rebind is pending: freeze the possibly-misbound file.
   // This includes quiet flushes, whose waiting narration or sibling answer
   // could otherwise settle the live owner before REAL becomes readable.
-  if (structuredBridgeIs('antigravity') && antigravityPendingRebind) return;
+  if (structuredBridgeIs('antigravity') && antigravityPendingRebind) return false;
   // Follow-up RPC turns install their exact bridge mark only after the
   // turn/start ACK passes the generation fence. Ordinary ingest must not
   // advance the rollout cursor in that window. Terminal hydration for an
@@ -18577,16 +19364,16 @@ function codexBridgeIngest(opts: {
   if (rpcTranscriptIngestBlockedByAwaitingActivation(
     rpcTurnsAwaitingActivation.keys(),
     opts.hydrationOwnerKey,
-  )) return;
+  )) return false;
   if (structuredBridgeIs('hermes')) {
     hermesBridgeIngest();
-    return;
+    return true;
   }
   if (structuredBridgeIs('mtr')) {
     mtrBridgeIngest();
-    return;
+    return true;
   }
-  if (!codexBridgeRolloutPath || !codexBridgeBaselineDone) return;
+  if (!codexBridgeRolloutPath || !codexBridgeBaselineDone) return false;
   // While a newly reported Antigravity conversation is still waiting for its
   // lazily-created brain file (`codexBridgePendingSessionId`), do not let
   // fs.watch or steady-state ticks ingest new unstarted turns from the
@@ -18598,7 +19385,7 @@ function codexBridgeIngest(opts: {
     && codexBridgePendingSessionId
     && !(codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined) || codexBridgeQueue.peek().length > 1)
   ) {
-    return;
+    return false;
   }
   const result = structuredBridgeIngestPath(codexBridgeRolloutPath, codexBridgeOffset, {
     flushOmpTrailingFinal: opts.flushOmpTrailingFinal,
@@ -18692,6 +19479,7 @@ function codexBridgeIngest(opts: {
     // stays stranded). Deliver it after the caller unwinds, to the same CLI.
     deferFinalIdleSignal();
   }
+  return true;
 }
 
 /** The idle signal of a final consumed by a non-signalling drain, raised on
@@ -19219,6 +20007,275 @@ function retireRpcLifecycleFromStructuredTerminal(
   codexBridgeQueue.stopRpcActive(identity.turnId, identity.dispatchAttempt);
 }
 
+interface PendingMissingFinalNotice {
+  path: string;
+  turnId: string;
+  noticeId: string;
+  message: string;
+  silent: boolean;
+  createdAtMs: number;
+  nextAttemptAtMs: number;
+}
+const pendingMissingFinalNotices = new Map<string, PendingMissingFinalNotice>();
+
+function transmitMissingFinalNotice(record: PendingMissingFinalNotice): void {
+  if (closeRequested || lastInitConfig?.structuredNoticeAck !== true) return;
+  const now = Date.now();
+  // Stop before the daemon expires its delivered dedupe tombstone. Cleanup
+  // failure keeps the expired record for another cleanup attempt, never a send.
+  if (now - record.createdAtMs > RECOVERY_NOTICE_MAX_AGE_MS) {
+    acknowledgeMissingFinalNotice(record.turnId, record.noticeId);
+    return;
+  }
+  record.nextAttemptAtMs = now + 5_000;
+  try {
+    if (record.silent) {
+      send({
+        type: 'turn_display_retired', turnId: record.turnId,
+        message: '', silent: true, noticeId: record.noticeId,
+      });
+    } else {
+      send({
+        type: 'user_notify',
+        message: record.message,
+        kind: 'structured_turn_not_collected',
+        turnId: record.turnId,
+        noticeId: record.noticeId,
+      });
+    }
+  } catch (error) {
+    // Disk remains the owner; the structured ticker retries the exact noticeId.
+    log(`Missing-final notice IPC deferred: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function notifyMissingFinalTurn(turnId: string, silent = false): void {
+  const message = silent ? '' : t('worker.structured_final_not_collected', { cliName: cliName() });
+  const path = codexAdoptJournalPath() ?? structuredBridgeJournalPath();
+  if (!path || !sessionId || !lastInitConfig?.larkAppId) throw new Error('missing-final notice journal unavailable');
+  const noticeId = createHash('sha256').update(JSON.stringify([
+    'structured_final_not_collected', lastInitConfig.larkAppId, sessionId, turnId,
+  ])).digest('hex').slice(0, 32);
+  // This atomic write is the authoritative recovery transition for BOTH
+  // negotiated and legacy sends. A crash/checkpoint failure cannot restore the
+  // old business owner even when no daemon ACK protocol exists.
+  const createdAtMs = Date.now();
+  stageBridgeTurnNotice(path, { turnId, noticeId, message, createdAtMs, silent });
+  if (lastInitConfig?.structuredNoticeAck !== true) {
+    try {
+      // Old daemons cannot ACK and misinterpret silent display retirement.
+      if (!silent) send({ type: 'user_notify', message, kind: 'structured_turn_not_collected', turnId });
+    } finally {
+      // Normal legacy operation retains no tombstone/capacity. If cleanup fails,
+      // the notice-only record still prevents business-owner resurrection.
+      try { acknowledgeBridgeTurnNotice(path, turnId, noticeId); }
+      catch (error) { log(`Legacy missing-final tombstone cleanup deferred: ${String(error)}`); }
+    }
+    return;
+  }
+  const record = { path, turnId, noticeId, message, silent, createdAtMs, nextAttemptAtMs: 0 };
+  pendingMissingFinalNotices.set(noticeId, record);
+  transmitMissingFinalNotice(record);
+}
+
+function restoreMissingFinalNotices(): void {
+  if (lastInitConfig?.structuredNoticeAck !== true) return;
+  const paths = [...new Set([codexAdoptJournalPath(), structuredBridgeJournalPath()].filter((path): path is string => !!path))];
+  for (const path of paths) {
+    for (const entry of readBridgeTurnJournal(path)) {
+      const pending = entry.pendingNotice;
+      if (!pending) continue;
+      pendingMissingFinalNotices.set(pending.noticeId, {
+        path, turnId: entry.turnId, noticeId: pending.noticeId,
+        message: pending.message, nextAttemptAtMs: 0, silent: pending.silent === true,
+        createdAtMs: pending.createdAtMs,
+      });
+    }
+  }
+  for (const record of pendingMissingFinalNotices.values()) transmitMissingFinalNotice(record);
+}
+
+function flushMissingFinalNotices(): void {
+  if (closeRequested || lastInitConfig?.structuredNoticeAck !== true) return;
+  const now = Date.now();
+  for (const record of pendingMissingFinalNotices.values()) {
+    if (record.nextAttemptAtMs <= now) transmitMissingFinalNotice(record);
+  }
+}
+
+function acknowledgeMissingFinalNotice(turnId: string, noticeId: string): void {
+  const record = pendingMissingFinalNotices.get(noticeId);
+  if (!record || record.turnId !== turnId) return;
+  try {
+    acknowledgeBridgeTurnNotice(record.path, turnId, noticeId);
+    pendingMissingFinalNotices.delete(noticeId);
+  } catch (error) {
+    log(`Missing-final notice ACK cleanup deferred: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function missingFinalTurnDeliveredBySend(turn: CodexPendingTurn, nextBoundaryMs: number | undefined): boolean {
+  const target = bridgeGateInputForTurn(sessionId, turn, {
+    // Unlike submit confirmation, a restarted worker has no in-memory write
+    // timestamp. The queue's persisted mark is the stable lower bound; an exact
+    // turn/attempt marker remains stronger than either timestamp.
+    markTimeMs: turn.markTimeMs,
+    isLocal: turn.isLocal,
+  }, lastInitConfig?.chatId, lastInitConfig?.rootMessageId);
+  return attributableBridgeReplyMarkers(target, nextBoundaryMs, readSendMarkers())
+    .some(marker => finalBridgeSendMarkerCoversOwnThread(target, marker));
+}
+
+function structuredRpcLifecycleOwnerActive(turn?: CodexPendingTurn): boolean {
+  return turn?.rpcActive === true
+    || rpcTurnsAwaitingActivation.size > 0
+    || rpcLifecycleFailClosedOwners.size > 0
+    || rpcTerminalHydrationOwners.size > 0
+    || rpcActiveOwners.size > 0
+    || settlingRpcTerminalOwners.size > 0;
+}
+
+function structuredMissingFinalHasLifecycleSignals(): boolean {
+  return idleDetector?.programStatusActive() === true
+    || (backendScreenEvidenceIsAuthoritativeForMutation()
+      && (!!cliAdapter?.busyPattern || typeof cliAdapter?.isSessionBusy === 'function'));
+}
+
+function structuredMissingFinalBlockedByPage(): boolean {
+  // A quiet Ask/permission/review page is a LIVE wait, not a completed turn.
+  // Reuse the existing terminal/page evidence instead of inventing a second
+  // idle detector for those surfaces.
+  return tuiPromptBlocking
+    || hookReviewInputHold
+    || !!idleDetector?.programStatusBlock()
+    || !!heldStuckPage()
+    || traexQuestionHoldsHeldInput();
+}
+
+interface StructuredMissingFinalTarget {
+  key: string;
+  turn: CodexPendingTurn;
+}
+
+const structuredMissingFinalWatchdog = new StructuredMissingFinalWatchdog();
+
+/** A started turn can outlive every native terminal source. Only sustained
+ *  CLI-idle + output-quiet evidence starts the COMMON missing-final wait:
+ *  non-blocking drivers use prompt-ready; lifecycle-blocking drivers use the
+ *  idle edge they rejected while the structured owner stayed open. */
+function structuredMissingFinalTarget(): StructuredMissingFinalTarget | undefined {
+  if (replyDeliveryMode() !== 'transcript' && !zeroPromptTerminalSync()) return undefined;
+  if (!codexBridgeRolloutPath || !codexBridgeBaselineDone) return undefined;
+  const turn = codexBridgeQueue.peek()[0];
+  if (!turn?.started || turn.finalText !== undefined || turn.isLocal) return undefined;
+  if (!structuredMissingFinalHasLifecycleSignals() || structuredMissingFinalBlockedByPage()) return undefined;
+  // task_started-only claims retain their original, much longer corroboration
+  // lease. A 20s screen wait must not turn that provisional start into a drop.
+  if (turn.provisionalTaskStartedAtMs !== undefined) return undefined;
+  // A driver-held terminal or a torn trailing line is still collectible input
+  // to the existing quiet flush/read path, never evidence of a missing final.
+  if (codexBridgePendingTail) return undefined;
+  if (structuredBridgeIs('oh-my-pi') && ompBridgeState().provisionalFinal) return undefined;
+  if (structuredBridgeIs('antigravity') && antigravityBridgeState().provisionalFinal) return undefined;
+  // RPC execution can be legitimately silent for a long time, and activation
+  // hand-off deliberately freezes ingest. No RPC lifecycle owner may use this
+  // screen/quiet watchdog, including an owner behind a predecessor queue head.
+  if (structuredRpcLifecycleOwnerActive(turn)) return undefined;
+  // The authoritative replacement transcript is not bound yet. Ingest and the
+  // existing Antigravity quiet flush both bail here, so a timeout cannot prove
+  // that the final is absent from the unbound file either.
+  if (structuredBridgeIs('antigravity') && antigravityPendingRebind) return undefined;
+  if (backgroundTaskTracker.pendingTurnAgents() > 0) return undefined;
+  if (structuredBridgeIs('antigravity') && hasAntigravityPendingTasks(antigravityBridgeState())) return undefined;
+  if (idleDetector?.programStatusHeldBusy()) return undefined;
+  const rejectedGeneration = structuredRejectedReadyEvidenceGeneration;
+  const rejectedStartUuid = structuredRejectedReadyEvidenceStartUuid;
+  const idle = isPromptReady || (hasStructuredLifecycleBlock()
+    && rejectedGeneration !== undefined && ptyOutputGeneration.isCurrent(rejectedGeneration)
+    && rejectedStartUuid !== undefined && rejectedStartUuid === turn.nativeUserProof?.uuid);
+  if (!idle) return undefined;
+  const outputGeneration = ptyOutputGeneration.snapshot();
+  return {
+    turn,
+    key: JSON.stringify([
+      turn.turnId, turn.dispatchAttempt, cliSpawnGeneration,
+      codexBridgeRolloutPath,
+      turn.sourceTurnId, turn.nativeUserProof?.uuid, turn.transcriptStartTimeMs,
+      lastStructuredBridgeActivityAtMs, outputGeneration,
+    ]),
+  };
+}
+
+/** Give late transcript bytes the first chance, then retire ONLY the exact
+ *  still-idle owner whose wait expired. No CLI-specific recovery is attempted:
+ *  the user is told to read the native terminal instead of guessing a reply. */
+function maybeSettleMissingStructuredFinal(): void {
+  const target = structuredMissingFinalTarget();
+  if (!structuredMissingFinalWatchdog.observe(target?.key)) return;
+  let drainCompleted = false;
+  try { drainCompleted = codexBridgeIngest(); } catch (err: any) {
+    // A read error is not evidence that the final is absent. Keep the owner and
+    // start a fresh bounded wait; a later tick may successfully read a final
+    // that was already on disk at this deadline.
+    log(`Missing-final drain before turn retirement failed: ${err.message}`);
+    structuredMissingFinalWatchdog?.observe(undefined);
+    return;
+  }
+  if (!drainCompleted) {
+    // No transcript was actually read (detached, rebind, RPC activation, ...).
+    // Keep the owner and start a fresh wait only after a real read can run.
+    structuredMissingFinalWatchdog?.observe(undefined);
+    return;
+  }
+  const current = structuredMissingFinalTarget();
+  if (!current || current.key !== target!.key) {
+    structuredMissingFinalWatchdog.observe(current?.key);
+    return;
+  }
+  const { turn } = current;
+  // Legacy send markers have no exact turn id: bound their attribution before
+  // the drop can advance/replay the next started successor.
+  const nextBoundaryMs = codexBridgeQueue.peek().slice(1)
+    .find(candidate => candidate.started)?.markTimeMs;
+  let retireSilently = false;
+  if (turn.dispatchAttempt === undefined) {
+    const hasSubmitNotice = structuredTurnsWithSubmitNotice.has(turn.turnId);
+    retireSilently = hasSubmitNotice || missingFinalTurnDeliveredBySend(turn, nextBoundaryMs);
+    try {
+      // Stage + IPC happen before the in-memory drop for BOTH warning and silent
+      // retirement. A stage failure retains the owner; IPC failures retry on disk.
+      notifyMissingFinalTurn(turn.turnId, retireSilently);
+    } catch (error) {
+      log(`Missing-final notice staging failed; keeping the owner: ${error instanceof Error ? error.message : String(error)}`);
+      structuredMissingFinalWatchdog?.observe(undefined);
+      return;
+    }
+  }
+  const dropped = codexBridgeQueue.dropPendingTurn(turn.turnId, turn.dispatchAttempt, true);
+  structuredMissingFinalWatchdog?.observe(undefined);
+  if (!dropped) return;
+  // Universal output handoff can make emitReadyCodexTurns return before its
+  // legacy checkpoint. The ordinary warning above already has its own pinned
+  // pendingNotice; this secondary checkpoint cannot restore that business owner.
+  let checkpointError: unknown;
+  try { checkpointCodexAdoptRecovery(true); } catch (error) { checkpointError = error; }
+  try { checkpointStructuredBridgeRecovery(true); } catch (error) { checkpointError ??= error; }
+  log(`Structured transcript stayed idle without a final for turn ${turn.turnId}; ending the wait and directing the user to the Web terminal`);
+  if (turn.dispatchAttempt !== undefined) {
+    emitTurnTerminal(turn.turnId, 'ambiguous', 'structured_final_not_collected', turn.dispatchAttempt);
+  }
+  retireStructuredTurnAttribution([...(dropped.supersededTurns ?? []), dropped]);
+  if (turn.dispatchAttempt === undefined && retireSilently) {
+    structuredTurnsWithSubmitNotice.delete(turn.turnId);
+  }
+  // Dropping the dead head can replay a buffered successor user/final pair.
+  emitReadyCodexTurns();
+  redriveRejectedStructuredReady();
+  // Cleanup and successor replay must not be half-skipped. The pinned notice
+  // owns ordinary recovery; surface the strict checkpoint failure afterwards.
+  if (checkpointError) throw checkpointError;
+}
+
 /** An ordinary Lark turn whose transcript start never arrived is a reply the
  *  bridge can no longer deliver: its head is gone, so even if the CLI answers,
  *  the final has nothing to attach to. Until now that was one INFO log line and
@@ -19723,6 +20780,7 @@ function stopCodexBridge(): void {
   mtrBridgeSource = undefined;
   mtrBridgeOffset = 0;
   mtrBridgeBaselineDone = false;
+  structuredMissingFinalWatchdog?.observe(undefined);
   codexBridgeQueue.clearPending();
   codexBridgeQueue.setLocalTurns(false);
   resetThinkingChannel();
@@ -19768,7 +20826,32 @@ function drainSecondaryPaths(): void {
   for (const [path, offset] of bridgeSecondaryPaths) {
     try {
       const result = drainTranscript(path, offset);
-      if (result.events.length > 0) bridgeQueue.ingest(result.events, path);
+      if (result.events.length > 0) {
+        bridgeQueue.ingest(result.events, path);
+        // Retired secondary paths belong to a pre-rotation session: fold into
+        // `backgroundTaskTracker` and settle historical stops / mark preexisting
+        // live IDs on `backgroundAuthorityHold`, but NEVER feed old `turn_duration`,
+        // `/clear`, errors, or launches into the post-rotation live turn hold.
+        const now = Date.now();
+        for (const ev of result.events) {
+          if (typeof backgroundAuthorityHold !== 'undefined' && typeof eventTimeMs === 'function' && typeof backgroundTaskSettledIds === 'function') {
+            const atMs = eventTimeMs(ev);
+            for (const id of backgroundTaskSettledIds(ev)) {
+              if (typeof applyBackgroundAuthorityTransition === 'function') {
+                applyBackgroundAuthorityTransition(backgroundAuthorityHold.onTaskSettled(id, { wakes: false, atMs }, now));
+              } else {
+                backgroundAuthorityHold.recordHistoricalSettlement(id, atMs);
+              }
+            }
+          }
+        }
+        observeClaudeBackgroundTasks(result.events, { feedAuthorityHold: [] });
+        if (typeof backgroundAuthorityHold !== 'undefined'
+          && typeof backgroundTaskTracker !== 'undefined'
+          && typeof backgroundTaskTracker?.liveTaskIds === 'function') {
+          backgroundAuthorityHold.seedPreexistingLiveTasks(backgroundTaskTracker.liveTaskIds());
+        }
+      }
       // Retired paths belong to a Claude session we already left, so the router
       // drops them; routed anyway so the "every queue-feeding drain goes
       // through one entry" rule has no exception to reason about.
@@ -21230,6 +22313,7 @@ async function snapshotWithLatestRuntimeStatus<T>(
  *  either path may observe an assistant_final before the await returns. Reset
  *  here (never after the await) so that final remains a usable ready edge. */
 function beginCliWriteCycle(): void {
+  cancelAntigravityFoldedReconcilePending();
   // A new input supersedes an idle edge still settling: that edge belonged to
   // the previous turn, and the CLI is about to work again. Its transcript
   // terminal still settles it from the per-read drain.
@@ -21247,6 +22331,7 @@ function beginCliWriteCycle(): void {
   // its transcript record lands (a turn terminal record ends it again).
   backgroundTaskTracker.noteMainTurn(true);
   backgroundWaitTasks = 0;
+  backgroundCotHold = false;
 }
 
 /** Serialize one adopted-pane message from transcript baseline/mark through
@@ -22053,15 +23138,25 @@ async function captureAndUpload(): Promise<void> {
   const capturedTurnId = currentBotmuxTurnId;
   const capturedAttempt = currentBotmuxDispatchAttempt;
   const capturedDisplayGeneration = screenshotDisplayGeneration;
+  const capturedInputGeneration = webTerminalInputGeneration;
   const frameIsStale = (): boolean => displayMode !== 'screenshot'
     || capturedRevision !== captureRevision
     || capturedDisplayGeneration !== screenshotDisplayGeneration
     || capturedTurnId !== currentBotmuxTurnId
-    || capturedAttempt !== currentBotmuxDispatchAttempt;
-  // Dedup is bound to the full identity: the same pixels under a new capture
-  // identity or display cycle are a NEW first frame, never a duplicate.
-  const dedupKey = (pixelHash: string, recovery?: UsageAwareScreen['usageLimitRecovery']): string =>
-    `${capturedRevision}:${capturedDisplayGeneration}:${pixelHash}${recovery ? `:recovery=${recovery}` : ''}`;
+    || capturedAttempt !== currentBotmuxDispatchAttempt
+    || capturedInputGeneration !== webTerminalInputGeneration;
+  // Dedup is bound to the full identity (capture revision, display generation,
+  // direct Web Terminal input generation, and semantic usage-limit state): the
+  // same pixels under a new turn, direct input, proof/episode update, or expiry
+  // edge are a NEW frame, never a duplicate.
+  const dedupKey = (pixelHash: string, usage?: UsageAwareScreen): string => {
+    const inputSuffix = capturedInputGeneration > 0 ? `:in=${capturedInputGeneration}` : '';
+    const turnSuffix = usage && (usage.usageLimit || cliAdapter?.id === 'antigravity')
+      ? `:t=${capturedTurnId ?? ''}:${capturedAttempt ?? ''}`
+      : '';
+    const usageSuffix = usage ? screenshotUsageLimitDedupSuffix(usage) : '';
+    return `${capturedRevision}:${capturedDisplayGeneration}:${pixelHash}${inputSuffix}${turnSuffix}${usageSuffix}`;
+  };
   let recaptureAfterStaleFrame = false;
   let ownedKey: string | null = null;
   let previousShotHash = lastShotHash;
@@ -22096,7 +23191,7 @@ async function captureAndUpload(): Promise<void> {
         // zero-classification fast path for unchanged pixels.
         if (cliAdapter?.id !== 'antigravity' && dedupKey(pixelHash) === lastShotHash) return;
         usageAware = classifyScreenUsageLimit(pipeResult.content, projectedRuntimeScreenStatus());
-        const key = dedupKey(pixelHash, usageAware.usageLimitRecovery);
+        const key = cliAdapter?.id === 'antigravity' ? dedupKey(pixelHash, usageAware) : dedupKey(pixelHash);
         if (key === lastShotHash) return;
         previousShotHash = lastShotHash;
         ownedKey = key;
@@ -22113,7 +23208,7 @@ async function captureAndUpload(): Promise<void> {
         pixelHash = createHash('md5').update(snap).digest('hex');
         if (cliAdapter?.id !== 'antigravity' && dedupKey(pixelHash) === lastShotHash) return;
         usageAware = classifyScreenUsageLimit(snap, projectedRuntimeScreenStatus());
-        const key = dedupKey(pixelHash, usageAware.usageLimitRecovery);
+        const key = cliAdapter?.id === 'antigravity' ? dedupKey(pixelHash, usageAware) : dedupKey(pixelHash);
         if (key === lastShotHash) return;
         previousShotHash = lastShotHash;
         ownedKey = key;
@@ -22151,7 +23246,7 @@ async function captureAndUpload(): Promise<void> {
     // Commit the evidence actually sent, not the pre-upload classification.
     // A capture failure during upload must leave a later ready edge deliverable.
     if (lastShotHash === ownedKey) {
-      ownedKey = dedupKey(pixelHash, currentUsageAware.usageLimitRecovery);
+      ownedKey = cliAdapter?.id === 'antigravity' ? dedupKey(pixelHash, currentUsageAware) : dedupKey(pixelHash);
       lastShotHash = ownedKey;
     }
     // Success is otherwise completely silent (skips and failures log above), which
@@ -26236,6 +27331,14 @@ function redriveRejectedStructuredReady(): void {
     return;
   }
   if (hasStructuredLifecycleBlock()) {
+    // Head advance re-evaluates the same still-current idle boundary against
+    // the NEW started owner. Never carry the predecessor's proof across, and
+    // never bind an unstarted head: that would re-admit a pre-start edge.
+    if (ptyOutputGeneration.isCurrent(readyEvidenceGeneration)) {
+      const head = codexBridgeQueue.peek()[0];
+      structuredRejectedReadyEvidenceStartUuid = head?.started && head.finalText === undefined
+        ? head.nativeUserProof?.uuid : undefined;
+    }
     const nextRemainingMs = codexBridgeQueue.preStartLeaseRemainingMs();
     if (nextRemainingMs !== undefined) scheduleStructuredStartGraceRecheck(nextRemainingMs);
     return;
@@ -26744,6 +27847,11 @@ function markPromptReady(): void {
   }
   if (isPromptReady) {
     stopStructuredStartGraceRecheck();
+    if (typeof antigravityFoldedReconcilePending !== 'undefined'
+      && antigravityFoldedReconcilePending
+      && typeof tryReconcilePendingAntigravityFoldedTurns === 'function') {
+      tryReconcilePendingAntigravityFoldedTurns('prompt_ready_reentry');
+    }
     return;  // guard against duplicate calls
   }
   stopStructuredStartGraceRecheck();
@@ -26769,6 +27877,9 @@ function markPromptReady(): void {
     }
     cliSubmissionInFlight.readyDeferred = true;
     structuredRejectedReadyEvidenceGeneration = ptyOutputGeneration.snapshot();
+    const rejectedReadyOwner = codexBridgeQueue.peek()[0];
+    structuredRejectedReadyEvidenceStartUuid = rejectedReadyOwner?.started && rejectedReadyOwner.finalText === undefined
+      ? rejectedReadyOwner.nativeUserProof?.uuid : undefined;
     idleDetector?.reset();
     return;
   }
@@ -26885,6 +27996,9 @@ function markPromptReady(): void {
     // blocked until turn_completed so they cannot publish idle mid-turn.
     const remainingMs = codexBridgeQueue.preStartLeaseRemainingMs();
     structuredRejectedReadyEvidenceGeneration = ptyOutputGeneration.snapshot();
+    const rejectedReadyOwner = codexBridgeQueue.peek()[0];
+    structuredRejectedReadyEvidenceStartUuid = rejectedReadyOwner?.started && rejectedReadyOwner.finalText === undefined
+      ? rejectedReadyOwner.nativeUserProof?.uuid : undefined;
     // Keep the historical phrase (integration fixtures match it) and append
     // the machine-readable reason the skip happened.
     const skipReason = remainingMs !== undefined ? 'submit-verification-pending' : 'structured-turn-unfinished';
@@ -26912,8 +28026,9 @@ function markPromptReady(): void {
   // already-promoted authority only while the PTY generation still identifies
   // this same A edge; later B output makes the observation stale. The matching
   // observation also prevents this same A edge from advancing twice to C.
+  let preSyncAntigravityReconcile: AntigravityFoldedReconcileResult | undefined;
   if (typeof reconcileCompletedAntigravityTurnsAtPromptReady === 'function') {
-    reconcileCompletedAntigravityTurnsAtPromptReady();
+    preSyncAntigravityReconcile = reconcileCompletedAntigravityTurnsAtPromptReady();
   }
   const observedQueuedAdvanceGeneration = queuedTurnAdvanceConsumedForPrompt?.outputGeneration;
   const readyTransition = (syncedFromDisk: boolean) => decideQueuedReadyTransition({
@@ -26994,6 +28109,18 @@ function markPromptReady(): void {
     advanceQueuedTypeAheadTurn('prompt_ready');
   }
   queuedTurnAdvanceConsumedForPrompt = undefined;
+  if (
+    preSyncAntigravityReconcile?.pendingSibling
+    && preSyncAntigravityReconcile.transcriptPath
+    && typeof armAntigravityFoldedReconcilePending === 'function'
+  ) {
+    const postSyncPromotedTurnId = currentBotmuxTurnId
+      && currentBotmuxDispatchAttempt === undefined
+      && preSyncAntigravityReconcile.candidateIds.has(currentBotmuxTurnId)
+      ? currentBotmuxTurnId
+      : undefined;
+    armAntigravityFoldedReconcilePending(preSyncAntigravityReconcile.transcriptPath, postSyncPromotedTurnId);
+  }
   // An old backend can still report idle while its async teardown is running.
   // Only a prompt observed after the general restart fence drops may release
   // slash commands to the replacement generation.
@@ -29325,7 +30452,29 @@ async function flushPending(): Promise<void> {
           inflightInputs.onWrite(item);
           stuckDetector?.arm();
         }
-        noteCliInputWritten(item);
+        let antigravityWriteAnchor: AntigravityTranscriptWriteBoundary | undefined;
+        if (cliAdapter?.id === 'antigravity' && !cliAdapter.runnerFramedInput && !isRemoteBackendType(effectiveBackendType)) {
+          if (reconcileHint && reconcileHint.minByteOffset !== undefined) {
+            antigravityWriteAnchor = {
+              ...(reconcileHint.sampledTranscriptPath ? { sampledTranscriptPath: reconcileHint.sampledTranscriptPath } : {}),
+              minByteOffset: reconcileHint.minByteOffset,
+              ...(reconcileHint.skipPriorMatches ? { skipPriorMatches: reconcileHint.skipPriorMatches } : {}),
+            };
+          } else {
+            const cid = inputDeliveryObservedCliSessionId ?? lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId;
+            const path = resolveAntigravityProofTranscriptPath() ?? (cid ? resolveAntigravityTranscriptPath(cid) : undefined);
+            if (path && existsSync(path)) {
+              try {
+                antigravityWriteAnchor = { sampledTranscriptPath: path, minByteOffset: statSync(path).size };
+              } catch {
+                antigravityWriteAnchor = undefined;
+              }
+            } else {
+              antigravityWriteAnchor = { minByteOffset: 0 };
+            }
+          }
+        }
+        noteCliInputWritten(item, antigravityWriteAnchor);
         writeCliPidMarker();
         publishSandboxRelayCapability();
         if (!isTypeAhead) {
@@ -30665,8 +31814,11 @@ function startScreenUpdates(): void {
   if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
   let lastSentStatus: string | undefined;
   let lastSentExpiredQuotaKey: string | undefined;
+  let lastSentUsageLimitEvidence = '';
+  let lastSentUsageLimitTurnIdentity = '';
   let lastSentRecovery: UsageAwareScreen['usageLimitRecovery'];
   let lastSentBackgroundWait = 0;
+  let lastSentBackgroundCotHold = false;
   let lastSentModelRequestAt: number | undefined;
   let lastSentActivityRequestAt: number | undefined;
   let lastSentModelRequestSessionId: string | undefined;
@@ -30698,10 +31850,13 @@ function startScreenUpdates(): void {
     const capacityLifetime = cliLifetimeNonce;
     const sampleTurn = currentBotmuxTurnId;
     const sampleAttempt = currentBotmuxDispatchAttempt;
+    const sampleInputGeneration = webTerminalInputGeneration;
+    const sampleSubmitGeneration = webTerminalSubmitGeneration;
     const screenTurn = { turnId: sampleTurn, dispatchAttempt: sampleAttempt };
     const ownsSample = () => backend === capacityBackend && cliSpawnGeneration === capacityGeneration
       && cliLifetimeNonce === capacityLifetime
       && currentBotmuxTurnId === sampleTurn && currentBotmuxDispatchAttempt === sampleAttempt
+      && webTerminalInputGeneration === sampleInputGeneration
       && (!workerSessionEventScope || hasCurrentSessionRuntime());
     if (awaitingFirstPrompt) {
       inspectAidenCodexUpdateDialogOnScreen();
@@ -30953,18 +32108,37 @@ function startScreenUpdates(): void {
       // has been typed for it, so the projection's 'working' would be false —
       // leave the card at its starting state until the first write happens.
       if (startupInputHeld()) return;
-      const expiredQuotaKey = usageAware.expiredAntigravityQuota?.relativeResetKey;
+      const expiredQuotaKey = cliUsageLimitEpisodeKey(usageAware.expiredAntigravityQuota);
+      const usageLimitEvidence = usageLimitEvidenceKey(usageAware.usageLimit);
+      const effectiveUsageTurnId = screenTurn.turnId ?? lastUsageLimitCaptureTurn?.turnId ?? null;
+      const effectiveUsageAttempt = screenTurn.turnId !== undefined
+        ? (screenTurn.dispatchAttempt ?? null)
+        : (lastUsageLimitCaptureTurn?.dispatchAttempt ?? null);
+      const usageLimitTurnIdentity = usageAware.usageLimit
+        ? JSON.stringify([effectiveUsageTurnId, effectiveUsageAttempt, sampleSubmitGeneration])
+        : '';
       if (snapshot.changed || usageAware.status !== lastSentStatus || expiredQuotaKey !== lastSentExpiredQuotaKey
+        || usageLimitEvidence !== lastSentUsageLimitEvidence
+        || usageLimitTurnIdentity !== lastSentUsageLimitTurnIdentity
         || usageAware.usageLimitRecovery !== lastSentRecovery
         || backgroundWaitTasks !== lastSentBackgroundWait
+        || backgroundCotHold !== lastSentBackgroundCotHold
+        || (daemonCotHoldMayBeActive && backgroundWaitTasks === 0 && !backgroundCotHold)
         || modelRequestClock.lastServedAt() !== lastSentModelRequestAt
         || modelRequestClock.lastActivityAt() !== lastSentActivityRequestAt
         || modelRequestClock.boundClaudeSessionId !== lastSentModelRequestSessionId
         || awaySummaryFocus.isActive !== lastSentAwaySummaryPending) {
         lastSentStatus = usageAware.status;
         lastSentExpiredQuotaKey = expiredQuotaKey;
+        lastSentUsageLimitEvidence = usageLimitEvidence;
+        lastSentUsageLimitTurnIdentity = usageLimitTurnIdentity;
         lastSentRecovery = usageAware.usageLimitRecovery;
         lastSentBackgroundWait = backgroundWaitTasks;
+        lastSentBackgroundCotHold = backgroundCotHold;
+        if ((usageAware.status === 'working' || usageAware.status === 'idle')
+          && backgroundWaitTasks === 0 && !backgroundCotHold) {
+          daemonCotHoldMayBeActive = false;
+        }
         lastSentModelRequestAt = modelRequestClock.lastServedAt();
         lastSentActivityRequestAt = modelRequestClock.lastActivityAt();
         lastSentModelRequestSessionId = modelRequestClock.boundClaudeSessionId;
@@ -30998,6 +32172,7 @@ function stopScreenUpdates(): void {
   if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
   lastAnalyzerSnapshot = '';
   antigravityFooterBackgroundTasks = 0;
+  cancelAntigravityFoldedReconcilePending();
 }
 
 // ─── PTY Management ──────────────────────────────────────────────────────────
@@ -32034,6 +33209,12 @@ async function spawnCliBody(
   cfg: Extract<DaemonToWorker, { type: 'init' }>,
   opts: Parameters<typeof spawnCli>[1] = {},
 ): Promise<void> {
+  resetAntigravityNativeQuotaLog();
+  activeTransientRateLimit = undefined;
+  lastUsageLimitCaptureTurn = undefined;
+  localAttestedCliProcess = undefined;
+  lastWrittenAntigravityTranscriptAnchor = undefined;
+  cancelAntigravityFoldedReconcilePending();
   doubaoRestoredRuntimeIdentity = undefined;
   followBotTraeHome(cfg);
   const protectedCliError = protectedHttpEgressCliSupportError(cfg.cliId, cfg.protectedHttpEgressPolicy);
@@ -32119,7 +33300,11 @@ async function spawnCliBody(
   if (typeof legacyAgentAckPairer !== 'undefined') legacyAgentAckPairer.reset();
   if (typeof clearBackgroundHoldTimer === 'function') clearBackgroundHoldTimer();
   backgroundWaitTasks = 0;
+  backgroundCotHold = false;
+  daemonCotHoldMayBeActive = false;
+  backgroundTasksTrackedForSiblings = false;
   antigravityFooterBackgroundTasks = 0;
+  bridgeQueue?.resetBackgroundTasks?.();
   const isolationRuntimeDataDir = process.env.SESSION_DATA_DIR
     ?? join(homedir(), '.botmux', 'data');
   const sessionScratchDir = ensureSessionTempDir(isolationRuntimeDataDir, cfg.sessionId);
@@ -40013,6 +41198,12 @@ function killCli(opts: {
   preserveCliPidMarker?: boolean;
 } = {}): void {
   if (lastInitConfig?.cliId === 'minimax') minimaxFinalReceiver.reset();
+  resetAntigravityNativeQuotaLog();
+  activeTransientRateLimit = undefined;
+  lastUsageLimitCaptureTurn = undefined;
+  localAttestedCliProcess = undefined;
+  lastWrittenAntigravityTranscriptAnchor = undefined;
+  cancelAntigravityFoldedReconcilePending();
   // Invalidate an in-flight async spawn before any other teardown hook runs. The
   // remaining cleanup is synchronous today, but generation ownership must not
   // depend on that implementation detail.
@@ -44107,7 +45298,17 @@ function emitTurnTerminal(
     ? turnFailureDiagnostics({ errorDetail, screen: turnFailureScreen() })
     : {};
   const directFailure = status === 'failed' && turnFailedWithoutOutput(turnId, errorCode);
-  const backgroundTasks = status === 'completed' ? backgroundTaskTracker.backgroundWait() : 0;
+  const rawBackgroundTasks = status === 'completed' ? backgroundTaskTracker.backgroundWait() : 0;
+  const backgroundTasks = rawBackgroundTasks > 0
+    ? rawBackgroundTasks
+    : status === 'completed'
+      && foldBackgroundUpdatesEnabled()
+      && lastInitConfig?.adoptMode !== true
+      && lastInitConfig?.apiOnly !== true
+      && backgroundTaskTracker.hasPendingNonPersistentMonitor?.() === true
+      ? (backgroundTaskTracker.pending?.() ?? 0)
+      : 0;
+  if (backgroundTasks > 0) daemonCotHoldMayBeActive = true;
   const terminal: Extract<WorkerToDaemon, { type: 'turn_terminal' }> = {
     type: 'turn_terminal',
     sessionId,
@@ -44264,7 +45465,14 @@ function send(msg: WorkerToDaemon, origin?: CapturedSessionOrigin): void {
     return;
   }
   if (msg.type === 'cli_session_id') observeContractNativeSession(msg.cliSessionId);
-  const payload = sessionEventMetadata(workerIpcPayload(msg), origin);
+  const outboundMsg: WorkerToDaemon =
+    (msg.type === 'screen_update' || msg.type === 'screenshot_uploaded')
+    && cliAdapter?.id === 'antigravity'
+    && !cliAdapter.runnerFramedInput
+    && msg.antigravityQuotaCursor === undefined
+      ? { ...msg, antigravityQuotaCursor: antigravityQuotaState.exportCursor() }
+      : msg;
+  const payload = sessionEventMetadata(workerIpcPayload(outboundMsg), origin);
   if (payload.type === 'final_output' && universalOutputHandoff
     && (lastInitConfig?.finalOutputHandoff?.frozenImOnly
       ? frozenImReplyTurn(payload.turnId)
@@ -44922,6 +46130,11 @@ function publishLocalProcessAttestation(
   // This guard must stay ahead of DSH capture, identity freeze and retry
   // cancellation so a replacement never mutates any attestation state.
   if (cliPid && opts.expectedCliProcStart !== undefined && cliProcStart !== opts.expectedCliProcStart) return false;
+  if (cliPid && cliProcStart) {
+    localAttestedCliProcess = { cliPid, cliProcStart, cliSpawnGeneration };
+  } else if (!cliPid) {
+    localAttestedCliProcess = undefined;
+  }
   let dshIdentity: DshProcessIdentity | undefined;
   if (lastInitConfig?.cliId === 'dsh' && lastInitConfig.dshRuntime !== 'tui'
     && dshProcessAttestation?.generation === cliSpawnGeneration) {
@@ -45386,13 +46599,13 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       }
       lastInitConfig = msg;
       resetFollowUpReplyStateForInit();
-      antigravityQuotaHistory = msg.antigravityQuotaHistory;
-      unconfirmedAntigravityQuotas = new Map();
-      const restoredQuota = msg.antigravityActiveQuota;
-      const restoredKey = restoredQuota?.relativeResetKey;
-      if (restoredQuota?.kind === 'usage' && !restoredQuota.source && restoredKey && !restoredKey.endsWith(':')) {
-        unconfirmedAntigravityQuotas.set(restoredKey, restoredQuota);
-      }
+      resetFoldBackgroundUpdatesStateForInit();
+      antigravityQuotaState.restore({
+        history: msg.antigravityQuotaHistory,
+        activeQuota: msg.antigravityActiveQuota,
+        cursor: msg.antigravityQuotaCursor,
+      });
+      activeTransientRateLimit = undefined;
       kimiCacheExpiryAutoCompact = msg.kimiCacheExpiryAutoCompact === true;
       configureTraexAutoModel(msg);
       if (isCodexAppCliId(msg.cliId) && msg.noProgressNotify?.timeoutMs !== undefined) {
@@ -45415,6 +46628,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       activeRestartAttemptId = msg.restartAttemptId;
       seedInitTurnTerminals(msg);
       initializeFinalOutputHandoff(msg);
+      restoreMissingFinalNotices();
       applyInitFinalOutputBackpressure(msg, ordinaryImTurnId);
       // Dashboard grants stay per-boot, while the Lark-card capability is
       // revocable at the logical Session lifecycle boundary.
@@ -46129,6 +47343,11 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       break;
     }
 
+    case 'structured_turn_not_collected_ack': {
+      acknowledgeMissingFinalNotice(msg.turnId, msg.noticeId);
+      break;
+    }
+
     case 'message': {
       if (lastInitConfig?.deploymentContinuation || restoredDeploymentTurnId) discardDeploymentContinuation();
       // 每轮消息都捎带 daemon 侧当前解析出的模型，覆盖 respawn 快照——理由与
@@ -46241,7 +47460,13 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       // baseline while the message waits for normal flush scheduling.
       if (!lastInitConfig?.adoptMode && !msg.queueAfterActiveTurn) {
         renderer?.markNewTurn();
-        usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
+        // PTY/tmux CLIs call `usageLimitTracker.beginTurn()` inside `prepareNormalWrite`
+        // at the actual CLI write moment (avoiding premature wipe of Turn 1's active
+        // structured/transient limit when Turn 2 arrives queued or type-ahead).
+        // Codex App does not run `prepareNormalWrite` so it keeps the receipt baseline.
+        if (isCodexAppCliId(lastInitConfig?.cliId)) {
+          usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
+        }
       }
       if (
         msg.nativeSessionTitlePrompt
@@ -47342,6 +48567,12 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       // Any config entry point flipped the bot's mid-turn reply switch. The
       // daemon gates posting on it live, so the worker follows the same value.
       setFollowUpReplyLive(msg.enabled);
+      break;
+    }
+
+    case 'set_fold_background_updates': {
+      // Any config entry point flipped the bot's background-update fold switch.
+      setFoldBackgroundUpdatesLive(msg.enabled);
       break;
     }
 

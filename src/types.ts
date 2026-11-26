@@ -12,7 +12,7 @@ import type {
   RemoteRunnerBackendState,
   RemoteRunnerUsageReport,
 } from './adapters/backend/remote-runner-protocol.js';
-import type { CliUsageLimitState } from './utils/cli-usage-limit.js';
+import type { AntigravityTranscriptWriteBoundary, CliUsageLimitState } from './utils/cli-usage-limit.js';
 import type { VcMeetingActivityType } from './vc-agent/types.js';
 import type { CodexServiceTier, CodexServiceTierPreference, CodexServiceTierSnapshot } from './services/codex-service-tier.js';
 import type { CliId } from './adapters/cli/types.js';
@@ -332,6 +332,9 @@ export interface FailedTurnRecord {
   /** The worker saw this turn end on API errors alone (turn_terminal
    *  `directFailure`): the next input may cut it out and re-send its input. */
   directFailure?: true;
+  /** Current-turn transcript boundary backing an Antigravity limited snapshot's
+   *  directFailure proof. Missing legacy boundaries fail closed for auto-replay. */
+  antigravityWriteBoundary?: AntigravityTranscriptWriteBoundary;
   /** The terminal's `retryable`, kept for the rewind decision. */
   retryable?: boolean;
   /** Frozen at the failure: this turn's answer was meant for the chat (not an
@@ -1197,6 +1200,11 @@ export interface Session {
   usageLimit?: CliUsageLimitState;
   /** 最近的原生限额拒绝及首次截止时间，用于恢复时识别旧终端残留的提示 */
   antigravityQuotaHistory?: readonly CliUsageLimitState[];
+  /** Single-source Antigravity recovery cursor (`lastConfirmed` + `recoveredEpisodeKey`),
+   *  persisted so reader-gap retention and tombstones survive restarts deterministically. */
+  antigravityQuotaCursor?: import('./services/antigravity-quota-state.js').AntigravityQuotaRecoveryCursor;
+  /** Native Antigravity episode keys already settled by account rotation (bounded FIFO, max 32). */
+  consumedAntigravityQuotaKeys?: readonly string[];
   /** Model fallback in effect. Persisted alongside usageLimit because the
    *  worker's baseline cursors to EOF after a restart — the switch record is
    *  already history by then and would never be drained again. */
@@ -2409,6 +2417,7 @@ type DaemonToWorkerBase =
   | { type: 'execution_contract_assigned'; bindingId: string; execution: import('./services/session-contract.js').ExecutionRef }
   | import('./services/universal-output-handoff.js').OutputHandoffReceipt
   | import('./services/final-output-handoff.js').FinalOutputAccepted
+  | { type: 'structured_turn_not_collected_ack'; turnId: string; noticeId: string }
   | { type: 'deployment_continuation_cancelled'; requestId: string; ok: boolean }
   | { type: 'codex_cli_effort'; requestId: string; effort: string; deadline: number }
   | { type: 'codex_cli_effort_cancel'; requestId: string }
@@ -2421,10 +2430,14 @@ type DaemonToWorkerBase =
   | { type: 'link_ref_register_result'; requestId: string; ok: boolean; companion?: string; stats?: Partial<import('./services/link-ref-types.js').LinkRefExtractionStats>; error?: string }
   | { type: 'link_ref_resolve_result'; requestId: string; ok: boolean; payload?: import('./services/link-ref-resolver.js').ResolvedOutboundLinkRefs; error?: string }
   | { type: 'link_ref_restore_mode_result'; requestId: string; mode?: 'enabled'; error?: string }
-  | { type: 'init'; deploymentContinuation?: import('./services/deployment-continuation.js').DeploymentContinuation; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliRuntime?: import('./adapters/cli/runtime.js').CliRuntimeSnapshot; cliPathOverride?: string; cliConfigDir?: string; codexProfile?: string; codexProfileHome?: string; cliUpgrade?: import('./core/cli-version-history.js').CliUpgrade; cliVersion?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode; launchShell?: string; model?: string; modelBackendVariant?: 'standard' | 'max'; turnTimeoutMs?: number; dshProfile?: string; dshRuntime?: 'official' | 'tui'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; serviceTier?: CodexServiceTier; disableCliBypass?: boolean; noProgressNotify?: import('./services/no-progress-notify-policy.js').NoProgressNotifyPolicy; codexBrowser?: import('./core/codex-browser-config.js').CodexBrowserConfig; codexRpcInput?: boolean; codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode; credentialsSourceDir?: string; triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig; larkToolBinding?: boolean; existingAppServerEndpoint?: string; startupCommands?: string[]; initialNativeRename?: string; envPolicy?: import('./core/env-policy.js').EnvPolicy; env?: Record<string, string>; envUnset?: string[]; envFingerprint?: string; replyStyle?: import('./im/lark/reply-card-style.js').ReplyStyleConfig; sandbox?: boolean | 'off' | 'oncall' | 'scratch'; scratchStorage?: 'tmpfs' | 'disk'; scratchTmpfsSizeMb?: number; scratchDenyPaths?: string[]; sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; sandboxNetworkPolicy?: import('./core/sandbox-network-policy.js').SandboxNetworkPolicy; sandboxWithholdBotSecret?: boolean; protectedResults?: boolean; assistantTemplateDir?: string; assistantOwnerOpenId?: string; readIsolation?: boolean; readDenyExtraPaths?: string[]; autoWorktreeFallbackDir?: string; daemonBootId?: string; backendType: BackendType; hcHerdrTabTitle?: string; persistentBackendTarget?: PersistentBackendTarget; backendConfig?: RiffBackendConfig | MojoConfig | RemoteRunnerConfig | HerdrBackendConfig; remoteBackendState?: RemoteRunnerBackendState; remoteResumeMode?: 'reattach' | 'rebuild'; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; prompt: string; promptCodexAppInput?: CodexAppTurnInput; linkRefMode?: 'observe' | 'enabled'; queuedActivationToken?: string; resume?: boolean; forkSession?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; apiOnly?: boolean; replyDelivery?: 'send' | 'transcript'; replyDeliveryLegacy?: 'send' | 'transcript'; promptInjection?: 'default' | 'none'; promptCacheTtl?: import('./services/prompt-cache-policy.js').PromptCacheTtl; solo?: boolean; leadOnly?: boolean; hideLocalAddresses?: true; goalStatusCard?: true; followUpReply?: true; kimiCacheExpiryAutoCompact?: true; workflowNodeSession?: true; captureTurnFailureDiagnostics?: true; loadedBotsConfigPath?: string; loadedBotsConfigProvenance?: import('./core/config-dir.js').BotsConfigProvenance; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; durablePrimaryInbox?: true; atMostOnce?: boolean; codexAppDispatchId?: string; codexAppSteerable?: true; codexAppRecoveredDispatches?: CodexAppDispatchLedgerEntry[]; codexAppGenerationCommits?: CodexAppGenerationCommit[]; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; pluginBindings?: string[]; protectedMcpPolicy?: import('./core/protected-mcp-capabilities.js').ProtectedMcpWorkerPolicy; protectedHttpEgressPolicy?: import('./core/protected-http-egress.js').ProtectedHttpEgressWorkerPolicy; protectedLoopbackProxyAttestation?: { secret: string; workerGeneration: number }; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean; runnerBuildId?: string; persistedRunnerBuildId?: string; restartAttemptId?: string; statuslineLaunchGen?: string; turnCallerOpenId?: string }
+  | { type: 'init'; deploymentContinuation?: import('./services/deployment-continuation.js').DeploymentContinuation; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliRuntime?: import('./adapters/cli/runtime.js').CliRuntimeSnapshot; cliPathOverride?: string; cliConfigDir?: string; codexProfile?: string; codexProfileHome?: string; cliUpgrade?: import('./core/cli-version-history.js').CliUpgrade; cliVersion?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode; launchShell?: string; model?: string; modelBackendVariant?: 'standard' | 'max'; turnTimeoutMs?: number; dshProfile?: string; dshRuntime?: 'official' | 'tui'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; serviceTier?: CodexServiceTier; disableCliBypass?: boolean; noProgressNotify?: import('./services/no-progress-notify-policy.js').NoProgressNotifyPolicy; codexBrowser?: import('./core/codex-browser-config.js').CodexBrowserConfig; codexRpcInput?: boolean; codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode; credentialsSourceDir?: string; triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig; larkToolBinding?: boolean; existingAppServerEndpoint?: string; startupCommands?: string[]; initialNativeRename?: string; envPolicy?: import('./core/env-policy.js').EnvPolicy; env?: Record<string, string>; envUnset?: string[]; envFingerprint?: string; replyStyle?: import('./im/lark/reply-card-style.js').ReplyStyleConfig; sandbox?: boolean | 'off' | 'oncall' | 'scratch'; scratchStorage?: 'tmpfs' | 'disk'; scratchTmpfsSizeMb?: number; scratchDenyPaths?: string[]; sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; sandboxNetworkPolicy?: import('./core/sandbox-network-policy.js').SandboxNetworkPolicy; sandboxWithholdBotSecret?: boolean; protectedResults?: boolean; assistantTemplateDir?: string; assistantOwnerOpenId?: string; readIsolation?: boolean; readDenyExtraPaths?: string[]; autoWorktreeFallbackDir?: string; daemonBootId?: string; backendType: BackendType; hcHerdrTabTitle?: string; persistentBackendTarget?: PersistentBackendTarget; backendConfig?: RiffBackendConfig | MojoConfig | RemoteRunnerConfig | HerdrBackendConfig; remoteBackendState?: RemoteRunnerBackendState; remoteResumeMode?: 'reattach' | 'rebuild'; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; prompt: string; promptCodexAppInput?: CodexAppTurnInput; linkRefMode?: 'observe' | 'enabled'; queuedActivationToken?: string; resume?: boolean; forkSession?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; apiOnly?: boolean; replyDelivery?: 'send' | 'transcript'; replyDeliveryLegacy?: 'send' | 'transcript'; promptInjection?: 'default' | 'none'; promptCacheTtl?: import('./services/prompt-cache-policy.js').PromptCacheTtl; solo?: boolean; leadOnly?: boolean; hideLocalAddresses?: true; goalStatusCard?: true; followUpReply?: true; foldBackgroundUpdates?: true; kimiCacheExpiryAutoCompact?: true; workflowNodeSession?: true; captureTurnFailureDiagnostics?: true; loadedBotsConfigPath?: string; loadedBotsConfigProvenance?: import('./core/config-dir.js').BotsConfigProvenance; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; durablePrimaryInbox?: true; atMostOnce?: boolean; codexAppDispatchId?: string; codexAppSteerable?: true; codexAppRecoveredDispatches?: CodexAppDispatchLedgerEntry[]; codexAppGenerationCommits?: CodexAppGenerationCommit[]; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; pluginBindings?: string[]; protectedMcpPolicy?: import('./core/protected-mcp-capabilities.js').ProtectedMcpWorkerPolicy; protectedHttpEgressPolicy?: import('./core/protected-http-egress.js').ProtectedHttpEgressWorkerPolicy; protectedLoopbackProxyAttestation?: { secret: string; workerGeneration: number }; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean; runnerBuildId?: string; persistedRunnerBuildId?: string; restartAttemptId?: string; statuslineLaunchGen?: string; turnCallerOpenId?: string }
 
     & { traexAutoModel?: import('./services/traex-auto-model.js').TraexAutoModelConfig }
-    & { antigravityQuotaHistory?: readonly CliUsageLimitState[]; antigravityActiveQuota?: CliUsageLimitState }
+    & {
+      antigravityQuotaHistory?: readonly CliUsageLimitState[];
+      antigravityActiveQuota?: CliUsageLimitState;
+      antigravityQuotaCursor?: import('./services/antigravity-quota-state.js').AntigravityQuotaRecoveryCursor;
+    }
   /** `model` rides along on every turn for the SAME reason the restart IPC carries
    *  it: the crash-loop park recovery respawns the CLI from inside the worker on
    *  the next message, with no restart IPC to refresh the snapshot. Same
@@ -2532,6 +2545,8 @@ type DaemonToWorkerBase =
   | { type: 'set_locale'; locale: 'zh' | 'en' }
   /** The bot's followUpReply switch changed while this worker runs. */
   | { type: 'set_follow_up_reply'; enabled: boolean }
+  /** The bot's foldBackgroundUpdates switch changed while this worker runs. */
+  | { type: 'set_fold_background_updates'; enabled: boolean }
   /** A non-progress folded-turn reply was actually delivered by the daemon.
    *  Only this receipt lets the worker leave its text out of the host final. */
   | { type: 'absorbed_reply_delivered'; turnId: string; dispatchAttempt?: number; replyUuid: string }
@@ -2601,6 +2616,9 @@ type DaemonToWorkerTransport = DaemonToWorkerBase extends infer Message
         sessionContract?: import('./services/session-contract.js').SessionContractBootstrap;
         settledTurnTerminals?: Array<{ turnId: string; status: 'completed' }>;
         finalOutputHandoff?: { version: 1 | 2; token: string; admitNew?: boolean; frozenImOnly?: true };
+        /** Daemon persists and ACKs structured missing-final notices. Without
+         * this bit workers retain legacy single-send/no-silent-display behavior. */
+        structuredNoticeAck?: true;
       }
     : Message
   : never;
@@ -3049,7 +3067,7 @@ export type WorkerToDaemonBase =
    *  input bytes: only the attribution idle-compact needs to distinguish a
    *  person's turn from a local command's own repaint. */
   | { type: 'terminal_input'; submitted: true; at: number }
-  | { type: 'screen_update'; content: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; expiredAntigravityQuota?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number;
+  | { type: 'screen_update'; content: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; expiredAntigravityQuota?: CliUsageLimitState; antigravityQuotaCursor?: import('./services/antigravity-quota-state.js').AntigravityQuotaRecoveryCursor; turnId?: string; dispatchAttempt?: number;
       /** Worker 已从完整权威视口确认正常输入框，不能由裁剪后的卡片文本推断。 */
       usageLimitRecovery?: 'antigravity-ready-composer';
       /** Set ONLY on the working frame a Web Terminal / sandbox hook
@@ -3064,6 +3082,11 @@ export type WorkerToDaemonBase =
        *  otherwise. Never changes the reported status; the card shows it and the
        *  idle-worker sweeper will not suspend a session while it is set. */
       backgroundTasks?: number;
+      /** Set when a non-persistent Monitor is still running while a suppressed
+       *  intermediate wake temporarily dropped `backgroundTasks` to 0. Keeps
+       *  the launching turn's held CoT bubble open on working/idle frames
+       *  without altering `ds.backgroundTaskCount`. */
+      cotHoldForBackground?: true;
       /** Claude's one-shot away summary is waiting or blurred. Automatic
        *  compact must defer maintenance input rather than restore focus and
        *  cancel it. Always emitted by current workers; absent = older worker. */
@@ -3103,7 +3126,7 @@ export type WorkerToDaemonBase =
    * bridges. Cosmetic channel: it must never influence turn
    * settlement, final_output attribution, or durable receipts. */
   /** Cosmetic closure when a structured attribution lease retires without a task terminal. */
-  | { type: 'turn_display_retired'; turnId: string; dispatchAttempt?: number; message: string }
+  | { type: 'turn_display_retired'; turnId: string; dispatchAttempt?: number; message: string; silent?: boolean; noticeId?: string }
   | { type: 'thinking_update'; sessionId?: string; entries: CotEntry[]; turnId: string; dispatchAttempt?: number }
   /** A confirmed steer retired this exact timeline. Cosmetic only: this is
    * not a turn_terminal or a successful durable-delivery receipt. */
@@ -3143,7 +3166,7 @@ export type WorkerToDaemonBase =
       /** False when the post-key capture could not be taken. */
       afterObserved?: boolean }
 
-  | { type: 'screenshot_uploaded'; imageKey: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; expiredAntigravityQuota?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number;
+  | { type: 'screenshot_uploaded'; imageKey: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; expiredAntigravityQuota?: CliUsageLimitState; antigravityQuotaCursor?: import('./services/antigravity-quota-state.js').AntigravityQuotaRecoveryCursor; turnId?: string; dispatchAttempt?: number;
       usageLimitRecovery?: 'antigravity-ready-composer';
       /** capture_identity revision this frame was captured under (bound before
        *  the first await). Absent only from pre-capture-identity workers. */
@@ -3186,6 +3209,9 @@ export type WorkerToDaemonBase =
         | 'cli_startup_blocked';
       /** `kind='cli_startup_blocked'`: which dialog matched (core/cli-startup-blocker). */
       startupBlocker?: Pick<import('./core/cli-startup-blocker.js').CliStartupBlocker, 'kind' | 'rule' | 'folder'>;
+      /** Durable missing-final notice UUID. The worker retries until the daemon's
+       * persisted notice record acknowledges it; older notices omit this field. */
+      noticeId?: string
       /** Permission prompt persisted across fresh worker captures; no daemon-side grace needed. */
       permissionPromptStable?: boolean;
       /** Bounded plain-text bottom of the screen for an input_not_submitted

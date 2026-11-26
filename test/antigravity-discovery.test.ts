@@ -7,6 +7,8 @@ import {
   findAntigravityConversationId,
   findAntigravityConversationIdByPid,
   findAntigravityConversationIdByWorkspace,
+  findAttestedAntigravityConversationId,
+  inspectAntigravityConversationIdByPid,
   readAntigravityConversationTitle,
 } from '../src/services/antigravity-discovery.js';
 
@@ -245,5 +247,129 @@ describe('antigravity-discovery', () => {
     // conversation DB open: fail closed rather than picking fd-order first.
     symlinkSync(join(convDir, `${siblingId}.db`), join(procRoot, String(parentPid), 'fd', '6'));
     expect(findAntigravityConversationIdByPid(parentPid, convDir, procRoot)).toBeNull();
+  });
+
+  it('distinguishes missing, unique, and ambiguous presence locks via inspectAntigravityConversationIdByPid', () => {
+    const procRoot = join(tmpDir, 'proc-3state');
+    const convDir = join(tmpDir, 'agy-3state', 'conversations');
+    const presenceDir = join(tmpDir, 'agy-3state', 'presence');
+    const fdDir = join(procRoot, '7777', 'fd');
+    mkdirSync(convDir, { recursive: true });
+    mkdirSync(presenceDir, { recursive: true });
+    mkdirSync(fdDir, { recursive: true });
+
+    const idA = '11111111-1111-4111-8111-111111111111';
+    const idB = '22222222-2222-4222-8222-222222222222';
+    writeFileSync(join(presenceDir, `${idA}.lock`), '');
+    writeFileSync(join(presenceDir, `${idB}.lock`), '');
+
+    expect(inspectAntigravityConversationIdByPid(7777, convDir, procRoot)).toEqual({ kind: 'missing' });
+    expect(findAntigravityConversationIdByPid(7777, convDir, procRoot)).toBeNull();
+
+    symlinkSync(join(presenceDir, `${idA}.lock`), join(fdDir, '3'));
+    expect(inspectAntigravityConversationIdByPid(7777, convDir, procRoot)).toEqual({
+      kind: 'unique',
+      conversationId: idA,
+    });
+    expect(findAntigravityConversationIdByPid(7777, convDir, procRoot)).toBe(idA);
+
+    symlinkSync(join(presenceDir, `${idB}.lock`), join(fdDir, '4'));
+    expect(inspectAntigravityConversationIdByPid(7777, convDir, procRoot)).toEqual({ kind: 'ambiguous' });
+    expect(findAntigravityConversationIdByPid(7777, convDir, procRoot)).toBeNull();
+  });
+
+  it('verifies cliProcStart birth identity BOTH before and after PID discovery', () => {
+    const idA = '33333333-3333-4333-8333-333333333333';
+    // 1. Matching birth before and after -> unique conversationId.
+    let birthReads = 0;
+    let inspectCalls = 0;
+    const matched = findAttestedAntigravityConversationId(
+      { cliPid: 9999, cliProcStart: 'birth-100' },
+      {
+        readProcessStartIdentity: () => { birthReads += 1; return 'birth-100'; },
+        inspectByPid: () => { inspectCalls += 1; return { kind: 'unique', conversationId: idA }; },
+      },
+    );
+    expect(matched).toBe(idA);
+    expect(birthReads).toBe(2);
+    expect(inspectCalls).toBe(1);
+
+    // 2. Birth mismatch before discovery -> rejected before inspecting FDs.
+    inspectCalls = 0;
+    expect(findAttestedAntigravityConversationId(
+      { cliPid: 9999, cliProcStart: 'birth-old' },
+      {
+        readProcessStartIdentity: () => 'birth-reused',
+        inspectByPid: () => { inspectCalls += 1; return { kind: 'unique', conversationId: idA }; },
+      },
+    )).toBeNull();
+    expect(inspectCalls).toBe(0);
+
+    // 3. Missing cliProcStart -> rejected immediately.
+    expect(findAttestedAntigravityConversationId(
+      { cliPid: 9999, cliProcStart: undefined },
+      {
+        readProcessStartIdentity: () => 'birth-100',
+        inspectByPid: () => ({ kind: 'unique', conversationId: idA }),
+      },
+    )).toBeNull();
+
+    // 4. PID reused mid-discovery (pre-birth matches, post-birth changes) -> fail closed!
+    birthReads = 0;
+    inspectCalls = 0;
+    const midRace = findAttestedAntigravityConversationId(
+      { cliPid: 9999, cliProcStart: 'birth-100' },
+      {
+        readProcessStartIdentity: () => {
+          birthReads += 1;
+          return birthReads === 1 ? 'birth-100' : 'birth-reused-during-scan';
+        },
+        inspectByPid: () => { inspectCalls += 1; return { kind: 'unique', conversationId: idA }; },
+      },
+    );
+    expect(midRace).toBeNull();
+    expect(birthReads).toBe(2);
+    expect(inspectCalls).toBe(1);
+
+    // 5. Ambiguous discovery -> null.
+    expect(findAttestedAntigravityConversationId(
+      { cliPid: 9999, cliProcStart: 'birth-100' },
+      {
+        readProcessStartIdentity: () => 'birth-100',
+        inspectByPid: () => ({ kind: 'ambiguous' }),
+      },
+    )).toBeNull();
+  });
+
+  it('honors presence/*.lock FDs on child processes before falling back to DB files', () => {
+    const procRoot = join(tmpDir, 'proc-child-lock');
+    const convDir = join(tmpDir, 'agy-child-lock', 'conversations');
+    const presenceDir = join(tmpDir, 'agy-child-lock', 'presence');
+    const parentPid = 8100;
+    const childPid = 8101;
+    mkdirSync(convDir, { recursive: true });
+    mkdirSync(presenceDir, { recursive: true });
+    mkdirSync(join(procRoot, String(parentPid), 'fd'), { recursive: true });
+    mkdirSync(join(procRoot, String(parentPid), 'task', String(parentPid)), { recursive: true });
+    writeFileSync(join(procRoot, String(parentPid), 'task', String(parentPid), 'children'), `${childPid}\n`);
+    mkdirSync(join(procRoot, String(childPid), 'fd'), { recursive: true });
+
+    const idA = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const idB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    writeFileSync(join(presenceDir, `${idA}.lock`), '');
+    writeFileSync(join(presenceDir, `${idB}.lock`), '');
+    writeFileSync(join(convDir, `${idA}.db`), '');
+
+    // Child holds active B.lock + stale A.db -> unique B (presence lock beats DB).
+    symlinkSync(join(convDir, `${idA}.db`), join(procRoot, String(childPid), 'fd', '3'));
+    symlinkSync(join(presenceDir, `${idB}.lock`), join(procRoot, String(childPid), 'fd', '4'));
+    expect(inspectAntigravityConversationIdByPid(parentPid, convDir, procRoot)).toEqual({
+      kind: 'unique',
+      conversationId: idB,
+    });
+
+    // Child holds TWO presence locks (A.lock + B.lock) + A.db -> ambiguous!
+    symlinkSync(join(presenceDir, `${idA}.lock`), join(procRoot, String(childPid), 'fd', '5'));
+    expect(inspectAntigravityConversationIdByPid(parentPid, convDir, procRoot)).toEqual({ kind: 'ambiguous' });
   });
 });

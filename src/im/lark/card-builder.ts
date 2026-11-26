@@ -237,7 +237,7 @@ export function buildConfigCard(data: ConfigCardData, locale?: Locale): string {
     configSelect('CLI', data.cliId, data.cliOptions.map(o => ({ text: o.label, value: o.id })), { action: 'config_set', field: 'cli', ...locVal }),
   ];
   if (data.modelChoices.length > 0) {
-    runSelects.push(configSelect('model', data.model ?? CONFIG_UNSET,
+    runSelects.push(configSelect('model', data.model && data.modelChoices.includes(data.model) ? data.model : CONFIG_UNSET,
       [{ text: def, value: CONFIG_UNSET }, ...data.modelChoices.map(m => ({ text: data.modelChoiceLabels?.[m] ?? m, value: m }))],
       { action: 'config_set', field: 'model', ...locVal }));
   }
@@ -1436,22 +1436,31 @@ export function buildStreamingCard(
   }
   const effortControl = !adoptMode && usage?.reasoningControl;
   if (effortControl && effortControl.choices.length > 0) {
-    // Display executor truth; keep CAS bound to the saved session setting.
-    const displayedEffort = effortControl.choices.find(effort => effort === usage?.reasoningEffort) ?? effortControl.selected;
+    const claude = effortControl.claude;
+    // Keep the saved Claude selection visible while the usage line reports
+    // the live runtime. Codex continues to show the executor's current effort.
+    const candidate = claude ? effortControl.selected : usage?.reasoningEffort;
+    const displayedEffort = effortControl.choices.find(effort => effort === candidate)
+      ?? effortControl.choices.find(effort => effort === effortControl.selected);
     elements.push({ tag: 'action', actions: [{
       tag: 'select_static',
       placeholder: { tag: 'plain_text', content: t('card.effort.select', undefined, locale) },
       ...(displayedEffort ? { initial_option: displayedEffort } : {}),
+      ...(claude?.disabledBy ? { disabled: true } : {}),
       options: effortControl.choices.map(effort => ({
         text: { tag: 'plain_text', content: `${t('card.effort.select', undefined, locale)}: ${t(`card.effort.${effort}`, undefined, locale)}` },
         value: effort,
       })),
-      value: { action: 'set_reasoning_effort', ...actionBase, expected_effort: effortControl.selected ?? '' },
+      value: { action: 'set_reasoning_effort', ...actionBase, expected_effort: effortControl.selected ?? '',
+        ...(claude ? { expected_model: claude.model } : {}) },
     }] });
-    const effortScope = effortControl.pending && effortControl.nextTurn
-      ? t('card.effort.next_turn', { effort: effortControl.selected ?? '' }, locale)
-      : t(effortControl.pending ? 'card.effort.pending' : 'card.effort.scope', undefined, locale)
-        + (effortControl.pending && effortControl.selected ? ` (${effortControl.selected})` : '');
+    const effortScope = claude
+      ? t(claude.disabledBy ? `card.effort.claude_${claude.disabledBy}_override`
+        : effortControl.pending ? 'card.effort.claude_pending' : 'card.effort.claude_scope', undefined, locale)
+      : effortControl.pending && effortControl.nextTurn
+        ? t('card.effort.next_turn', { effort: effortControl.selected ?? '' }, locale)
+        : t(effortControl.pending ? 'card.effort.pending' : 'card.effort.scope', undefined, locale)
+          + (effortControl.pending && effortControl.selected ? ` (${effortControl.selected})` : '');
     elements.push({ tag: 'note', elements: [{ tag: 'plain_text', content: effortScope }] });
   }
 

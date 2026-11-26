@@ -78,6 +78,9 @@ export function materializePlugin(pluginId: string): PluginMaterializedFile {
   if (record.contributions?.commands) {
     materialized.commands = record.contributions.commands;
   }
+  if (record.contributions?.webhooks) {
+    materialized.webhooks = record.contributions.webhooks;
+  }
   writeMaterialized(materialized);
   return materialized;
 }

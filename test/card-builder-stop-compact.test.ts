@@ -495,6 +495,22 @@ describe('session reasoning selector', () => {
     expect(JSON.stringify(card)).toContain('待生效');
   });
 
+  it('shows the saved Claude effort and disables changing it under an environment override', () => {
+    const card = build({ cliId: 'claude-code', usage: {
+      context: null, tokens: null, reasoningEffort: 'high',
+      reasoningControl: {
+        choices: ['high', 'xhigh'], selected: 'xhigh', pending: true,
+        claude: { model: 'gateway/opus:1', disabledBy: 'env' },
+      },
+    } });
+    const select = card.elements.flatMap((e: any) => e.actions ?? []).find((a: any) => a.tag === 'select_static');
+    expect(select).toMatchObject({
+      initial_option: 'xhigh', disabled: true,
+      value: { action: 'set_reasoning_effort', expected_model: 'gateway/opus:1', expected_effort: 'xhigh' },
+    });
+    expect(JSON.stringify(card)).toContain('CLAUDE_CODE_EFFORT_LEVEL');
+  });
+
   it('does not invent a control without verified runtime support', () => {
     const card = build({ cliId: 'codex', usage: { context: null, tokens: null, reasoningEffort: 'high' } });
     expect(JSON.stringify(card)).not.toContain('set_reasoning_effort');
