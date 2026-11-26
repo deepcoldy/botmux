@@ -609,6 +609,21 @@ export interface DaemonSession {
   /** A completed turn whose CoT message is left open while background tasks
    *  run; closing it renders 「任务已完成」. See finalizeOrHoldCotMessage. */
   cotHeldForBackground?: { turnId: string; dispatchAttempt?: number };
+  /** answerRequired turns need two independent settlement facts. A map avoids
+   * a newer terminal evicting an older turn whose durable reply is still due. */
+  requiredReplyCotHolds?: Map<string, {
+    turnId: string;
+    dispatchAttempt?: number;
+    finishStatus: 'completed' | 'failed';
+    replyPending: boolean;
+    backgroundPending: boolean;
+  }>;
+  /** Per-turn in-memory continuations for required-reply-missing notices. */
+  pendingRequiredReplyMissingReceipts?: Map<string, {
+    turnId: string;
+    dispatchAttempt?: number;
+    publish: () => void;
+  }>;
   /** Last screen_update's away-summary state (waiting or blurred). Automatic
    *  compact must not restore focus and cancel Claude's one-shot recap.
    *  In-memory; absent from older workers means unknown/false. */
@@ -946,6 +961,14 @@ export interface DaemonSession {
   };
   usageLimit?: CliUsageLimitState;
   antigravityQuotaHistory?: readonly CliUsageLimitState[];
+  /** Mirrored single-source Antigravity recovery cursor from worker. */
+  antigravityQuotaCursor?: import('../services/antigravity-quota-state.js').AntigravityQuotaRecoveryCursor;
+  /** Logical turn / direct-input scope that produced `ds.usageLimit` (in-memory only). */
+  usageLimitTurnScope?: string;
+  /** Monotonic counter incremented on each direct Web Terminal `submitted=true` input. */
+  directInputEpoch?: number;
+  /** Latest timestamp of a direct Web Terminal submission (cancels pending recovery/replay). */
+  lastDirectTerminalInputAt?: number;
   /** A failed persistence must be retried even if the next frame is identical. */
   usageLimitPersistPending?: boolean;
   usageLimitRetryTimer?: NodeJS.Timeout;
@@ -955,6 +978,10 @@ export interface DaemonSession {
    *  clearUsageLimitState (limit self-heal / turn end) so the next episode can
    *  notify again. In-memory only. */
   rateLimitNotifiedKey?: string;
+  /** Independent latch for Antigravity pool-exhausted / turn-budget-exhausted
+   *  alerts so generic->native confirmation still surfaces pool exhaustion ETA
+   *  once without duplicating the generic `@owner` ping. In-memory only. */
+  antigravityExhaustedNotifiedKey?: string;
   /** Unique claim for the current handoff attempt. Guards an asynchronous
    * target lookup from posting after this episode cleared and a same-key later
    * episode started. Cross-session duplicate events use a daemon-wide TTL. */
@@ -1118,6 +1145,14 @@ export interface DaemonSession {
      * this turn authority was published. Actor callers may not traverse one of
      * these old descendants; the long-lived CLI root itself is the exception. */
     preexistingProcessIdentities?: string[];
+  };
+  /** Bounded per-worker-generation tombstone set of revoked managed-origin
+   *  capabilities. Prevents an async-delayed `managed_turn_origin` from
+   *  reinstalling a capability whose `managed_turn_origin_revoked` already
+   *  processed (for example via fail-closed backstop). */
+  revokedManagedOriginCapabilities?: {
+    workerGeneration: number;
+    tokens: Set<string>;
   };
   /** Turns the worker typed behind the running turn (type-ahead), oldest
    *  first. Prompt-context claims evaluate them together with the managed

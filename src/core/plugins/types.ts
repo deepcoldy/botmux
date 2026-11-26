@@ -88,6 +88,26 @@ export interface PluginCommandsContribution {
   commands: PluginCommandEntry[];
 }
 
+/** One external webhook route exposed at `POST /webhook/plugin/<pluginId><path>`. */
+export interface PluginWebhookRouteEntry {
+  /** Relative route path under `/webhook/plugin/<pluginId>` (starts with `/`, no trailing `/`). */
+  path: string;
+  /** When true, matches exact `path` or any sub-path under `path/*`. */
+  prefix?: true;
+  /** Optional upstream path on the plugin loopback HTTP server (defaults to the matched path). */
+  endpoint?: string;
+  /** Optional per-route request body byte limit (1..5 MiB; defaults to contribution maxBodyBytes or 1 MiB). */
+  maxBodyBytes?: number;
+}
+
+/** Public, install-time declaration of external webhook routes routed to a plugin service. */
+export interface PluginWebhooksContribution {
+  schemaVersion: 1;
+  /** Optional default request body byte limit across routes (1..5 MiB; defaults to 1 MiB). */
+  maxBodyBytes?: number;
+  routes: PluginWebhookRouteEntry[];
+}
+
 export interface PluginContributions {
   skills?: PluginSkillEntry[];
   dashboard?: PluginDashboardEntry[];
@@ -96,6 +116,7 @@ export interface PluginContributions {
   service?: PluginServiceContribution;
   cardActions?: PluginCardActionsContribution;
   commands?: PluginCommandsContribution;
+  webhooks?: PluginWebhooksContribution;
   prerequisites?: PluginRuntimeEntrypoint;
 }
 
@@ -168,6 +189,7 @@ export interface PluginServiceState {
   updatedAt: string;
   status?: string;
   pid?: number;
+  processStart?: string;
   port?: number;
   openUrl?: string;
   healthUrl?: string;
@@ -185,4 +207,5 @@ export interface PluginMaterializedFile {
   service?: Array<{ name: string }>;
   cardActions?: PluginCardActionsContribution;
   commands?: PluginCommandsContribution;
+  webhooks?: PluginWebhooksContribution;
 }

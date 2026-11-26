@@ -439,7 +439,7 @@ export class SessionController {
         // is worker-scoped and must outlive the released reservation.
         const failureReport = message.type === 'error' || message.type === 'worker_error' || (message.type === 'restart_result' && message.status !== 'succeeded');
         if (!runtime.identity && !failureReport && ['stopped', 'retiring'].includes(runtime.phase)) return { kind: 'reject', reason: 'runtime_reservation_abandoned' };
-        if (!runtime.identity && !failureReport && (waitsForBinding || !['ready', 'turn_input_received', 'turn_input_committed', 'turn_input_rejected', 'restart_result', 'session_ready_ack', 'persistent_backend_target'].includes(message.type))) {
+        if (!runtime.identity && !failureReport && (waitsForBinding || !['ready', 'turn_input_received', 'turn_input_committed', 'turn_input_rejected', 'managed_turn_origin_revoked', 'restart_result', 'session_ready_ack', 'persistent_backend_target'].includes(message.type))) {
           this.store.deferEvent(this.ref, context.bindingId, context.eventId, context.sequence, message);
           return { kind: 'defer', bindingId: context.bindingId };
         }
@@ -572,9 +572,11 @@ export class SessionController {
     }
     if (message.type === 'claude_exit' && runtime) {
       let currentPhysicalExit = false;
-      // The exit callback keeps the binding its CLI was spawned under.
+      // Exits may name the launcher's binding or the latest same-process
+      // binding. Retire both directions of the proven continuation lineage;
+      // executions stay on the runtime they originally ran under.
       const exited = new Map<string, RuntimeContract>();
-      for (const ref of [runtime, ...this.store.continuedRuntimes(this.ref, runtime, channel)]) {
+      for (const ref of this.store.runtimeExitLineage(this.ref, runtime, channel)) {
         for (const sibling of this.store.physicalRuntimes(this.ref, ref)) exited.set(sibling.ref.runtimeId, sibling);
       }
       for (const sibling of exited.values()) {

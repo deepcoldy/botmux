@@ -80,31 +80,42 @@ export function deriveKanbanColumn(s: KanbanRowLike): SessionKanbanColumn {
   return activeManualColumn(s) ?? kanbanColumnForTaskStatus(deriveSessionTaskStatus(s));
 }
 
-/** 看板上默认不放的会话：休眠（进程已退出、下条消息冷恢复）、没有仍有效的手动放置，
+/** 排队输入、后台工作和未结事项不因 CLI 休眠而消失。 */
+function hasPendingWork(s: KanbanRowLike, now: number = Date.now()): boolean {
+  // A later input invalidates the previous outcome; maintenance covered by
+  // heldThrough does not. Legacy rows alone do not prove an outstanding input.
+  const awaitingTurnOutcome = normalizeLastTurn(s.lastTurn) !== undefined && currentLastTurn(s) === undefined;
+  const task = deriveSessionTaskStatus(s, now);
+  const openTodos = s.openTodos;
+  const remaining = openTodos && typeof openTodos === 'object'
+    ? (openTodos as Record<string, unknown>).remaining : undefined;
+  // A delivered turn still owns status/column derivation, but it must not hide
+  // unfinished TODO evidence from the independent off-board decision.
+  return !!s.queued || finiteOrZero(s.backgroundTaskCount) > 0
+    || (typeof remaining === 'number' && remaining > 0) || awaitingTurnOutcome
+    || task.kind === 'unfinished' || task.kind === 'needs_you';
+}
+
+/** 看板上默认不放的会话：休眠（进程已退出、下条消息冷恢复）、没有待办或仍有效的手动放置，
  *  且最近一轮不在 24 小时内。休眠会话动辄几千个，全铺上去既看不过来、又拖垮渲染。 */
 export function isOffBoardDormant(s: KanbanRowLike, now: number = Date.now()): boolean {
-  if (s.status !== 'dormant' || activeManualColumn(s)) return false;
+  if (s.status !== 'dormant' || activeManualColumn(s) || hasPendingWork(s, now)) return false;
   const turnAt = normalizeLastTurn(s.lastTurn)?.at;
   return turnAt === undefined || now - turnAt >= RECENT_TURN_ON_BOARD_MS;
 }
 
-/** No work is implied by a resident CLI waiting at its prompt. Keep explicit
+/** No work is implied by an idle task, whether its CLI is resident or suspended. Keep explicit
  * placement, queued/background work and a newer input whose result is still
  * pending; completed replies and blockers remain on-board. */
 export function isOffBoardIdle(s: KanbanRowLike): boolean {
-  // A valid previous result invalidated by newer input proves a new round has
-  // started but has no outcome yet. Legacy rows without lastTurn do not use
-  // this exception; heldThrough still excludes maintenance activity.
-  const awaitingTurnOutcome = normalizeLastTurn(s.lastTurn) !== undefined && currentLastTurn(s) === undefined;
-  return s.status === 'idle' && !s.queued && !awaitingTurnOutcome
-    && finiteOrZero(s.backgroundTaskCount) <= 0
+  return (s.status === 'idle' || s.status === 'dormant') && !hasPendingWork(s)
     && !activeManualColumn(s) && deriveSessionTaskStatus(s).kind === 'idle';
 }
 
 /** 看板默认收起的行：长期休眠会话，以及没有待办证据的普通空闲会话。
- *  显式用「空闲」状态筛选时不收起空闲行，否则筛选结果会是一块空板。 */
+ *  显式用「空闲／休眠」状态筛选时不收起近期空闲行，否则筛选结果会是一块空板。 */
 export function isOffBoardKanbanRow(s: KanbanRowLike, statusFilter: string): boolean {
-  return isOffBoardDormant(s) || (statusFilter !== 'idle' && isOffBoardIdle(s));
+  return isOffBoardDormant(s) || (statusFilter !== 'idle' && statusFilter !== 'dormant' && isOffBoardIdle(s));
 }
 
 /** 未手动排过序的卡片的排序键基底：量级远大于任何手动位置，保证手动卡片

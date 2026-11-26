@@ -25,6 +25,7 @@ vi.mock('../src/config.js', () => ({
   },
 }));
 vi.mock('../src/bot-registry.js', () => ({
+  durableImRepliesEnabled: vi.fn(() => false),
   getBot: () => ({ botName: 'Bot', botOpenId: 'ou_bot', config: mocks.botConfig, resolvedAllowedUsers: [] }),
   getAllBots: () => [],
   getOwnerOpenId: () => 'ou_owner',

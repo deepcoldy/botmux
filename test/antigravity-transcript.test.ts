@@ -1,15 +1,22 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, writeFileSync, appendFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, appendFileSync, rmSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   ANTIGRAVITY_TRUNCATED_REPLY_NOTICE,
+  antigravityTurnAnsweredInTranscript,
+  antigravityTurnFailedWithoutOutput,
   drainAntigravityTranscript,
   antigravityTranscriptPath,
+  findCompletedAntigravityTurnIdsPaired,
   hasAntigravityTranscriptPendingTasks,
   mapAntigravityCompactOffsetToFull,
+  mapAntigravityFullOffsetToCompact,
+  readVerifiedTranscriptSnapshot,
+  resolveAntigravityCandidateMinByteOffset,
   resolveAntigravityTranscriptPath,
   unwrapAntigravityUserInput,
+  type AntigravityNoOutputTurnOptions,
   type AntigravityTranscriptState,
 } from '../src/services/antigravity-transcript.js';
 import { resolveFileBridgePath } from '../src/services/file-bridge-path.js';
@@ -1480,5 +1487,306 @@ describe('hasAntigravityTranscriptPendingTasks & multi-task/daemon tracking', ()
       line(plannerStep({ step: 3, content: '等待后台任务。' })),
     ].join(''));
     expect(hasAntigravityTranscriptPendingTasks(fullPath)).toBe(true);
+  });
+});
+
+describe('paired stat-bounded Antigravity transcript proofs', () => {
+  const userRec = (step: number, text: string) => ({
+    step_index: step,
+    source: 'USER_EXPLICIT',
+    type: 'USER_INPUT',
+    status: 'DONE',
+    content: `<USER_REQUEST>\n${text}\n</USER_REQUEST>\n<ADDITIONAL_METADATA>m</ADDITIONAL_METADATA>`,
+  });
+  const checkpointRec = (step: number) => ({
+    step_index: step,
+    source: 'SYSTEM',
+    type: 'CHECKPOINT',
+    status: 'DONE',
+    content: '',
+  });
+  const toolRec = (step: number) => ({
+    step_index: step,
+    source: 'MODEL',
+    type: 'PLANNER_RESPONSE',
+    status: 'DONE',
+    content: '',
+    tool_calls: [{ name: 'run_command', args: { CommandLine: 'echo hi' } }],
+  });
+  const answerRec = (step: number, content = 'All done.') => ({
+    step_index: step,
+    source: 'MODEL',
+    type: 'PLANNER_RESPONSE',
+    status: 'DONE',
+    content,
+  });
+  const noOutput = (
+    transcriptPath: string,
+    writtenInput: string,
+    opts: Omit<AntigravityNoOutputTurnOptions, 'writeBoundary'> = {},
+  ) => antigravityTurnFailedWithoutOutput(transcriptPath, writtenInput, {
+    ...opts,
+    writeBoundary: { sampledTranscriptPath: transcriptPath, minByteOffset: 0 },
+  });
+
+  it('proves clean direct failure on last USER_INPUT with CRLF normalization and multi-hop repeat, and rejects any post-input progress', () => {
+    const fullPath = join(dir, 'transcript_full.jsonl');
+    const compactPath = join(dir, 'transcript.jsonl');
+
+    // Older completed turn with identical prompt followed by clean repeated failure + CHECKPOINT.
+    const cleanPair = [
+      line(userRec(1, 'repeat prompt\nline 2')),
+      line(toolRec(2)),
+      line(answerRec(3, 'old answer')),
+      line(userRec(4, 'repeat prompt\nline 2')),
+      line(checkpointRec(5)),
+    ].join('');
+    writeFileSync(fullPath, cleanPair);
+    writeFileSync(compactPath, cleanPair);
+
+    expect(noOutput(fullPath, 'repeat prompt\r\nline 2')).toBe(true);
+    expect(noOutput(compactPath, 'repeat prompt\nline 2')).toBe(true);
+    expect(noOutput(fullPath, 'wrong prompt')).toBe(false);
+
+    // Long prompt truncated in compact sibling still verifies when full matches and step_index aligns.
+    const longPrompt = 'L'.repeat(5000);
+    writeFileSync(fullPath, line(userRec(10, longPrompt)));
+    writeFileSync(compactPath, line({
+      ...userRec(10, 'L...<truncated 4000 bytes>...L'),
+      truncated_fields: ['content'],
+    }));
+    expect(noOutput(fullPath, longPrompt)).toBe(true);
+
+    // Reject tool call, assistant text, GENERIC, SYSTEM_MESSAGE, ERROR_MESSAGE, or partial trailing JSON.
+    for (const trailing of [
+      line(toolRec(6)),
+      line(answerRec(6, 'partial answer')),
+      line({ step_index: 6, type: 'GENERIC', status: 'DONE', content: 'tool out' }),
+      line({ step_index: 6, type: 'SYSTEM_MESSAGE', content: 'notice' }),
+      line({ step_index: 6, type: 'ERROR_MESSAGE', content: 'err' }),
+      '{"step_index":6,"type":"PLANNER_RESPONSE"',
+    ]) {
+      writeFileSync(fullPath, line(userRec(5, 'do work')) + trailing);
+      writeFileSync(compactPath, line(userRec(5, 'do work')) + trailing);
+      expect(noOutput(fullPath, 'do work')).toBe(false);
+    }
+  });
+
+  it('requires a current write boundary and rejects an older identical clean failure before current input flushes', () => {
+    const fullPath = join(dir, 'transcript_full.jsonl');
+    const compactPath = join(dir, 'transcript.jsonl');
+    const prior = line(userRec(1, 'repeat')) + line(checkpointRec(2));
+    const current = line(userRec(3, 'repeat')) + line(checkpointRec(4));
+    writeFileSync(fullPath, prior);
+    writeFileSync(compactPath, prior);
+
+    expect(antigravityTurnFailedWithoutOutput(fullPath, 'repeat')).toBe(false);
+    const eofBoundary = { sampledTranscriptPath: fullPath, minByteOffset: Buffer.byteLength(prior) };
+    expect(antigravityTurnFailedWithoutOutput(fullPath, 'repeat', { writeBoundary: eofBoundary })).toBe(false);
+    expect(antigravityTurnFailedWithoutOutput(compactPath, 'repeat', { writeBoundary: eofBoundary })).toBe(false);
+    // A claimed prior in-flight match must actually exist after the boundary.
+    expect(antigravityTurnFailedWithoutOutput(fullPath, 'repeat', {
+      writeBoundary: { minByteOffset: 0, skipPriorMatches: 1 },
+    })).toBe(false);
+
+    writeFileSync(fullPath, prior + current);
+    writeFileSync(compactPath, prior + current);
+    expect(antigravityTurnFailedWithoutOutput(fullPath, 'repeat', { writeBoundary: eofBoundary })).toBe(true);
+    expect(antigravityTurnFailedWithoutOutput(compactPath, 'repeat', { writeBoundary: eofBoundary })).toBe(true);
+    expect(antigravityTurnFailedWithoutOutput(fullPath, 'repeat', {
+      writeBoundary: { minByteOffset: 0, skipPriorMatches: 1 },
+    })).toBe(true);
+  });
+
+  it('rejects dual-log skew, missing sibling, and transient full sibling created+tool+deleted mid-check', () => {
+    const fullPath = join(dir, 'transcript_full.jsonl');
+    const compactPath = join(dir, 'transcript.jsonl');
+
+    // compact has tool_call while full only has USER_INPUT -> MUST fail closed!
+    writeFileSync(fullPath, line(userRec(1, 'do work')));
+    writeFileSync(compactPath, line(userRec(1, 'do work')) + line(toolRec(2)));
+    expect(noOutput(fullPath, 'do work')).toBe(false);
+
+    // Reverse skew: full has tool_call while compact only has USER_INPUT -> MUST fail closed!
+    writeFileSync(fullPath, line(userRec(1, 'do work')) + line(toolRec(2)));
+    writeFileSync(compactPath, line(userRec(1, 'do work')));
+    expect(noOutput(fullPath, 'do work')).toBe(false);
+
+    // missing full sibling unconditionally fails closed (no compact-only fallback!).
+    unlinkSync(fullPath);
+    expect(noOutput(compactPath, 'do work')).toBe(false);
+
+    // transient full created with tool call and deleted mid-pair -> fails closed!
+    let createdAndDeleted = false;
+    const res = noOutput(compactPath, 'do work', {
+      onAfterFirstSiblingForTest: () => {
+        writeFileSync(fullPath, line(userRec(1, 'do work')) + line(toolRec(2)));
+        unlinkSync(fullPath);
+        createdAndDeleted = true;
+      },
+    });
+    expect(createdAndDeleted).toBe(true);
+    expect(res).toBe(false);
+  });
+
+  it('fails closed on deterministic mid-read TOCTOU append of partial tool-call JSON', () => {
+    const fullPath = join(dir, 'transcript_full.jsonl');
+    const compactPath = join(dir, 'transcript.jsonl');
+    const locPrompt = '<message_location message_id="om_B" />\n<user_message>\nrun\n</user_message>';
+    const donePair = line(userRec(1, locPrompt)) + line(answerRec(2, 'done'));
+    writeFileSync(fullPath, donePair);
+    writeFileSync(compactPath, donePair);
+
+    // Control: stable paired transcripts prove completion.
+    const control = findCompletedAntigravityTurnIdsPaired(fullPath, [{ turnId: 'om_B' }]);
+    expect([...control.completed]).toEqual(['om_B']);
+    expect(control.pendingSibling).toBe(false);
+
+    // Race: partial tool-call JSON appended right after read before stability verification!
+    let injected = 0;
+    const raced = findCompletedAntigravityTurnIdsPaired(fullPath, [{ turnId: 'om_B' }], {
+      onAfterReadForTest: readPath => {
+        if (readPath === fullPath && injected === 0) {
+          injected += 1;
+          appendFileSync(fullPath, '{"step_index":3,"type":"PLANNER_RESPONSE","tool_calls":[{"name":"run_command"');
+        }
+      },
+    });
+    expect(injected).toBe(1);
+    expect([...raced.completed]).toEqual([]);
+    expect(raced.pendingSibling).toBe(true);
+
+    // Same deterministic TOCTOU guard on antigravityTurnFailedWithoutOutput.
+    const cleanOnly = line(userRec(1, 'do work'));
+    writeFileSync(fullPath, cleanOnly);
+    writeFileSync(compactPath, cleanOnly);
+    let racedNoOutput = 0;
+    const noOutRes = noOutput(fullPath, 'do work', {
+      onAfterReadForTest: readPath => {
+        if (readPath === compactPath && racedNoOutput === 0) {
+          racedNoOutput += 1;
+          appendFileSync(compactPath, line(toolRec(2)));
+        }
+      },
+    });
+    expect(racedNoOutput).toBe(1);
+    expect(noOutRes).toBe(false);
+
+    // Direct single-file snapshot stability check: mid-read append must fail closed with unstable-concurrent-write.
+    const singlePath = join(dir, 'single-toctou.jsonl');
+    writeFileSync(singlePath, donePair);
+    const singleRaced = readVerifiedTranscriptSnapshot(singlePath, {
+      initialTailBytes: 64 * 1024,
+      maxTailBytes: 256 * 1024,
+      onAfterReadForTest: () => {
+        appendFileSync(singlePath, line(toolRec(3)));
+      },
+    });
+    expect(singleRaced.ok).toBe(false);
+    if (!singleRaced.ok) expect(singleRaced.reason).toBe('unstable-concurrent-write');
+  });
+
+  it('detects paired answered turn strictly anchored to pre-write boundary and post-refusal timestamp without confusing tool-then-quota or older repeated prompts', () => {
+    const fullPath = join(dir, 'transcript_full.jsonl');
+    const compactPath = join(dir, 'transcript.jsonl');
+
+    const t1 = Date.parse('2026-11-25T00:00:10.000Z');
+    const t2 = Date.parse('2026-11-25T00:05:10.000Z');
+    const turn1 = line(userRec(1, '继续')) + line({ ...answerRec(2, 'Turn 1 answer'), created_at: new Date(t1).toISOString() });
+    writeFileSync(fullPath, turn1);
+    writeFileSync(compactPath, turn1);
+
+    // Missing writeBoundary fails closed.
+    expect(antigravityTurnAnsweredInTranscript(fullPath, '继续')).toBe(false);
+
+    // Turn 1 with boundary at byte 0 proves answered.
+    expect(antigravityTurnAnsweredInTranscript(fullPath, '继续', {
+      writeBoundary: { sampledTranscriptPath: fullPath, minByteOffset: 0 },
+      minAnsweredAtMs: t1 - 1000,
+    })).toBe(true);
+
+    // Pre-refusal answer timestamp fails closed when refusal happened AFTER the answer.
+    expect(antigravityTurnAnsweredInTranscript(fullPath, '继续', {
+      writeBoundary: { sampledTranscriptPath: fullPath, minByteOffset: 0 },
+      minAnsweredAtMs: t1 + 1000,
+    })).toBe(false);
+
+    // Repeated Turn 2 before Turn 2 flushes to disk: writeBoundary alone (even without minAnsweredAtMs) MUST NOT match Turn 1!
+    const turn2Offset = Buffer.byteLength(turn1, 'utf8');
+    expect(antigravityTurnAnsweredInTranscript(fullPath, '继续', {
+      writeBoundary: { sampledTranscriptPath: fullPath, minByteOffset: turn2Offset },
+    })).toBe(false);
+    expect(antigravityTurnAnsweredInTranscript(fullPath, '继续', {
+      writeBoundary: { sampledTranscriptPath: fullPath, minByteOffset: turn2Offset },
+      minAnsweredAtMs: t2 - 1000,
+    })).toBe(false);
+
+    // Once Turn 2 flushes and answers AFTER refusal timestamp, it returns true.
+    const turn2 = line(userRec(3, '继续')) + line({ ...answerRec(4, 'Turn 2 recovered'), created_at: new Date(t2).toISOString() });
+    writeFileSync(fullPath, turn1 + turn2);
+    writeFileSync(compactPath, turn1 + turn2);
+    expect(antigravityTurnAnsweredInTranscript(fullPath, '继续', {
+      writeBoundary: { sampledTranscriptPath: fullPath, minByteOffset: turn2Offset },
+      minAnsweredAtMs: t2 - 1000,
+    })).toBe(true);
+
+    // Tool call followed by quota (no final answer) -> NOT answered.
+    const toolThenQuota = line(userRec(1, 'do work')) + line(toolRec(2));
+    writeFileSync(fullPath, toolThenQuota);
+    writeFileSync(compactPath, toolThenQuota);
+    expect(antigravityTurnAnsweredInTranscript(fullPath, 'do work', {
+      writeBoundary: { sampledTranscriptPath: fullPath, minByteOffset: 0 },
+    })).toBe(false);
+  });
+
+  it('reconciles compact-truncated plain-text USER_INPUT via unique full step_index alignment without sibling-skew', () => {
+    const fullPath = join(dir, 'transcript_full.jsonl');
+    const compactPath = join(dir, 'transcript.jsonl');
+    const longPrompt = 'LONG_PLAIN_PROMPT_' + 'P'.repeat(4500);
+    writeFileSync(fullPath, line(userRec(1, longPrompt)) + line(answerRec(2, 'done')));
+    writeFileSync(compactPath, line({
+      ...userRec(1, 'LONG_PLAIN_PROMPT_<truncated 4000 bytes>'),
+      truncated_fields: ['content'],
+    }) + line(answerRec(2, 'done')));
+
+    const res = findCompletedAntigravityTurnIdsPaired(fullPath, [{
+      turnId: 'schedule:long-plain',
+      submittedText: longPrompt,
+    }]);
+    expect([...res.completed]).toEqual(['schedule:long-plain']);
+    expect(res.pendingSibling).toBe(false);
+
+    // Mismatched step_index between compact and full fails closed!
+    writeFileSync(compactPath, line({
+      ...userRec(99, 'LONG_PLAIN_PROMPT_<truncated 4000 bytes>'),
+      truncated_fields: ['content'],
+    }) + line(answerRec(100, 'done')));
+    const bad = findCompletedAntigravityTurnIdsPaired(fullPath, [{
+      turnId: 'schedule:long-plain',
+      submittedText: longPrompt,
+    }]);
+    expect([...bad.completed]).toEqual([]);
+  });
+
+  it('maps full byte offsets to compact byte offsets with step_index verification', () => {
+    const fullPath = join(dir, 'transcript_full.jsonl');
+    const compactPath = join(dir, 'transcript.jsonl');
+    const full1 = line(userRec(1, 'X'.repeat(200)));
+    const full2 = line(answerRec(2, 'Y'.repeat(200)));
+    const compact1 = line({ ...userRec(1, 'X...<truncated>...X'), truncated_fields: ['content'] });
+    const compact2 = line({ ...answerRec(2, 'Y...<truncated>...Y'), truncated_fields: ['content'] });
+    writeFileSync(fullPath, full1 + full2);
+    writeFileSync(compactPath, compact1 + compact2);
+
+    const mapped = mapAntigravityFullOffsetToCompact(fullPath, Buffer.byteLength(full1, 'utf8'), compactPath);
+    expect(mapped).toBe(Buffer.byteLength(compact1, 'utf8'));
+    expect(resolveAntigravityCandidateMinByteOffset(
+      { minByteOffset: Buffer.byteLength(full1, 'utf8'), sampledTranscriptPath: fullPath },
+      compactPath,
+    )).toBe(Buffer.byteLength(compact1, 'utf8'));
+
+    // Mismatched step_index fails closed.
+    writeFileSync(compactPath, line(userRec(99, 'mismatch')) + compact2);
+    expect(mapAntigravityFullOffsetToCompact(fullPath, Buffer.byteLength(full1, 'utf8'), compactPath)).toBeUndefined();
   });
 });

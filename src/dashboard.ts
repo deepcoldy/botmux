@@ -3,6 +3,7 @@ import { createSessionContentSearch } from './dashboard/session-content-search.j
 import { TopicIndexError } from './services/topic-search/query.js';
 import { queryTopicSearchOffMainThread } from './dashboard/topic-search-client.js';
 import { proxySessionStopControl } from './dashboard/session-stop-control.js';
+import { prepareDashboardGroupCreate } from './core/group-ipc-options.js';
 // src/dashboard.ts
 import { createServer, get as httpGet, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createServer as createTcpServer } from 'node:net';
@@ -95,6 +96,7 @@ import {
   resolveSessionPreviewForProxy,
 } from './dashboard/preview-contract.js';
 import {
+  safeSessionPreviewTarget,
   sameSessionPreviewTarget,
   sessionPreviewTargetStillOwned,
   type SessionPreviewTarget,
@@ -437,7 +439,11 @@ import { materializePlugin } from './core/plugins/materializer.js';
 import { resolveEffectivePluginIds, updateBotPluginOverride } from './core/plugins/effective.js';
 import { assertPluginBindingTransition, describePluginDependencyError } from './core/plugins/dependencies.js';
 import { inspectGatewayEntry } from './core/plugins/mcp/gateway-installer.js';
+import { readPluginWebhookToken } from './core/plugins/card-actions/auth.js';
+import { resolveRunningPluginServiceTarget } from './core/plugins/webhooks/service-target.js';
 import type { InstalledPluginRecord, PluginDashboardEntry } from './core/plugins/types.js';
+import { createPluginWebhookRouteHandler, earlyGuardPluginProxyRequest } from './dashboard/plugin-webhook-routes.js';
+import { createPluginServiceProxyHandler } from './dashboard/plugin-service-proxy.js';
 import { fetchDaemonIpc } from './core/daemon-ipc-auth.js';
 import { createLazyTopicLinkBackfill } from './dashboard/lazy-topic-link-backfill.js';
 import {
@@ -3240,11 +3246,19 @@ async function handlePluginManagementApi(
     const pluginId = decodeURIComponent(match[1]);
     const action = match[2];
     if (!requireInstalledPlugin(pluginId)) return pluginJson(res, 404, { ok: false, error: 'plugin_not_found' });
+    const stopWithTeardown = async () => {
+      authSessionConnections.closeSessionStreams(`plugin:${pluginId}`);
+      try {
+        return await stopPluginServices([pluginId]);
+      } finally {
+        authSessionConnections.closeSessionStreams(`plugin:${pluginId}`);
+      }
+    };
     const reports = action === 'start'
       ? await startPluginServices([pluginId])
       : action === 'restart'
-        ? [...await stopPluginServices([pluginId]), ...await startPluginServices([pluginId])]
-        : await stopPluginServices([pluginId]);
+        ? [...await stopWithTeardown(), ...await startPluginServices([pluginId])]
+        : await stopWithTeardown();
     return pluginJson(res, 200, { ok: true, reports, ...(await listDashboardPluginsPayload()) });
   }
 
@@ -3254,6 +3268,51 @@ async function handlePluginManagementApi(
 const pluginMarket = createHostPluginMarket(id => {
   if (readGlobalConfig().plugins?.includes(id)) return true;
   return loadBotConfigs().some(bot => bot.plugins?.includes(id));
+});
+
+function pluginProxyForbiddenPorts(): Set<number> {
+  const ports = new Set<number>();
+  if (boundDashboardPort > 0) ports.add(boundDashboardPort);
+  const onlineAppIds = new Set<string>();
+  for (const daemon of registry.list()) {
+    onlineAppIds.add(daemon.larkAppId);
+    if (daemon.ipcPort > 0) ports.add(daemon.ipcPort);
+  }
+  for (const row of aggregator.getSessions()) {
+    if (!onlineAppIds.has(row.larkAppId)) continue;
+    if (typeof row.proxyPort === 'number' && Number.isInteger(row.proxyPort) && row.proxyPort > 0) {
+      ports.add(row.proxyPort);
+    }
+    if (row.status === 'closed' || row.status === 'dormant') continue;
+    if (typeof row.webPort === 'number' && Number.isInteger(row.webPort) && row.webPort > 0) {
+      ports.add(row.webPort);
+    }
+    const previewTarget = safeSessionPreviewTarget(row.previewTarget);
+    if (previewTarget) {
+      ports.add(previewTarget.port);
+    }
+  }
+  return ports;
+}
+
+const pluginWebhookRoutes = createPluginWebhookRouteHandler({
+  trustedProxyHops: dashboardH5AuthConfig.trustedProxyHops,
+  resolveTarget: pluginId => resolveRunningPluginServiceTarget(pluginId, {
+    readToken: readPluginWebhookToken,
+    forbiddenPorts: pluginProxyForbiddenPorts,
+  }),
+});
+
+const pluginServiceProxy = createPluginServiceProxyHandler({
+  csrfTokens: controlCsrfTokens,
+  isAuthSessionLive: terminalAuthSessionLive,
+  resolveTarget: pluginId => resolveRunningPluginServiceTarget(pluginId, {
+    forbiddenPorts: pluginProxyForbiddenPorts,
+  }),
+  bindStream: (authSessionId, pluginId, close) => {
+    if (!terminalAuthSessionLive(authSessionId)) return false;
+    return authSessionConnections.register(authSessionId, close, `plugin:${pluginId}`);
+  },
 });
 
 // ─── HTTP routing ────────────────────────────────────────────────────────────
@@ -4306,6 +4365,7 @@ const companionApi = (() => {
 
 const server = createServer(async (req, res) => {
   try {
+    if (earlyGuardPluginProxyRequest(req, res)) return;
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
 
     // Loopback self-identification (no auth): echoes this process's nonce so the
@@ -4427,6 +4487,10 @@ const server = createServer(async (req, res) => {
     // any other way. That is why the view-link API hands out a same-origin path
     // instead of the daemon/worker origin — this is the only door.
     if (terminalFrontProxy.handleHttp(req, res, url)) return;
+
+    if (await pluginWebhookRoutes.handle(req, res, url)) {
+      return;
+    }
 
     if (await handleWebhookRoute(req, res, url, {
       proxyToDaemon,
@@ -4681,6 +4745,10 @@ const server = createServer(async (req, res) => {
     // 所有 /api/ 路由之前，对 /api/ 下的非读方法拦截。
     if (!sessionWriteOriginAllowed(req, url.pathname)) {
       return dashboardControlJson(res, 403, { ok: false, error: 'control_origin_forbidden' });
+    }
+
+    if (await pluginServiceProxy.handle(req, res, url, { identity: requestIdentity, activeToken })) {
+      return;
     }
 
     // P2-1：飞书卡片「打开工作台」按钮的短时票据兑换，紧挨上面的 ?t= set-cookie
@@ -7603,8 +7671,15 @@ const server = createServer(async (req, res) => {
 
     let mGroupMembersDisplay: RegExpMatchArray | null;
     if (req.method === 'GET' && (mGroupMembersDisplay = url.pathname.match(/^\/api\/groups\/([^/]+)\/([^/]+)\/members-display$/))) {
-      const larkAppId = decodeURIComponent(mGroupMembersDisplay[1]);
-      const chatId = decodeURIComponent(mGroupMembersDisplay[2]);
+      let larkAppId: string;
+      let chatId: string;
+      try {
+        larkAppId = decodeURIComponent(mGroupMembersDisplay[1]);
+        chatId = decodeURIComponent(mGroupMembersDisplay[2]);
+      } catch (err) {
+        if (err instanceof URIError) return jsonRes(res, 400, { ok: false, error: 'invalid_url_encoding' });
+        throw err;
+      }
       const upstream = await proxyToDaemon(larkAppId, `/api/groups/${encodeURIComponent(chatId)}/members-display`, { method: 'GET' });
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
@@ -8275,7 +8350,7 @@ const server = createServer(async (req, res) => {
     // are app-scoped, so creator daemon and operator open_id come from the
     // SAME bot by construction. See dashboard/operator-selector.ts.
     if (req.method === 'POST' && url.pathname === '/api/groups/create') {
-      let parsed: { name?: unknown; larkAppIds?: unknown; userOpenIds?: unknown; ownerUnionIds?: unknown; bindWorkingDir?: unknown; roleProfileId?: unknown; feedGroupId?: unknown; newFeedGroupName?: unknown; feedGroupAppId?: unknown; chatMode?: unknown; botCollaboration?: unknown };
+      let parsed: unknown;
       try {
         const chunks: Buffer[] = [];
         for await (const c of req) chunks.push(c as Buffer);
@@ -8284,75 +8359,38 @@ const server = createServer(async (req, res) => {
       } catch {
         return jsonRes(res, 400, { ok: false, error: 'bad_json' });
       }
-      const selectedIds = Array.isArray(parsed.larkAppIds)
-        ? (parsed.larkAppIds as unknown[]).filter((x): x is string => typeof x === 'string')
-        : [];
-      if (selectedIds.length === 0) {
-        return jsonRes(res, 400, { ok: false, error: 'larkAppIds_required' });
-      }
-      const roleProfileId = typeof parsed.roleProfileId === 'string' && parsed.roleProfileId.trim()
-        ? parsed.roleProfileId.trim()
-        : null;
-      if (roleProfileId && !isValidRoleProfileId(roleProfileId)) {
-        return jsonRes(res, 400, { ok: false, error: 'invalid_role_profile_id' });
-      }
-      // Optional (workflow-dashboard-orchestration §8): topic group mode and
-      // the bots' collaboration grants. Not sent → forwarded body unchanged.
-      if (parsed.chatMode !== undefined && parsed.chatMode !== 'topic' && parsed.chatMode !== 'group') {
-        return jsonRes(res, 400, { ok: false, error: 'invalid_chat_mode' });
-      }
-      if (parsed.botCollaboration !== undefined && typeof parsed.botCollaboration !== 'boolean') {
-        return jsonRes(res, 400, { ok: false, error: 'invalid_bot_collaboration' });
-      }
-
-      const explicit = Array.isArray(parsed.userOpenIds)
-        ? (parsed.userOpenIds as unknown[]).filter((x): x is string => typeof x === 'string')
-        : [];
-
-      const pick = pickCreatorForGroup(selectedIds, (id) => {
+      const apiOnlyIds = new Set<string>();
+      try {
+        for (const bot of loadBotConfigs()) {
+          if (bot.apiOnly === true) apiOnlyIds.add(bot.larkAppId);
+        }
+      } catch { /* bots.json unavailable → rely on daemon descriptors */ }
+      const plan = prepareDashboardGroupCreate(parsed, (id) => {
         const d = registry.getByAppId(id);
         return d ? { larkAppId: d.larkAppId, resolvedAllowedUsers: d.resolvedAllowedUsers ?? [] } : undefined;
-      });
-      if (!pick) {
+      }, { isApiOnly: id => apiOnlyIds.has(id) });
+      if (!plan.ok) {
+        return jsonRes(res, plan.status, { ok: false, error: plan.error });
+      }
+      const creator = registry.getByAppId(plan.creatorLarkAppId);
+      if (!creator) {
         return jsonRes(res, 503, { ok: false, error: 'no_online_daemon' });
       }
-      const creator = registry.getByAppId(pick.creatorLarkAppId)!;
-      const merged = new Set<string>([...explicit, ...pick.userOpenIds]);
-      // 跨 app 邀请通道：按 union_id 加人（open_id 是 app 作用域的，union_id 稳定，
-      // 由 creator daemon 解析成本 app 的 open_id 再加）。平台「拉群」即走这条。
-      const ownerUnionIds = Array.isArray(parsed.ownerUnionIds)
-        ? (parsed.ownerUnionIds as unknown[]).filter((x): x is string => typeof x === 'string')
-        : [];
-      // Auto-invite/transfer/notify target: prefer the explicit open_id passed
-      // by the caller (rare API consumer use), else the creator bot's first
-      // resolved allowlist entry.
-      const autoInvited: string | null = explicit[0] ?? pick.userOpenIds[0] ?? null;
-
-      const forwardBody = {
-        name: typeof parsed.name === 'string' ? parsed.name : undefined,
-        larkAppIds: selectedIds,
-        userOpenIds: [...merged],
-        ownerUnionIds,
-        // Auto-transfer ownership to the auto-invited operator. Scope-safe
-        // because the open_id was sourced from the creator bot's own allowlist.
-        transferOwnerTo: autoInvited ?? undefined,
-        // Send an @-mention message into the new chat so the operator gets a
-        // Feishu push notification — being a chat member alone doesn't always
-        // surface the chat in their sidebar (esp. mobile).
-        notifyOwnerOpenId: autoInvited ?? undefined,
-        bindWorkingDir: typeof parsed.bindWorkingDir === 'string' && parsed.bindWorkingDir.trim()
-          ? parsed.bindWorkingDir.trim()
-          : undefined,
-        roleProfileId: roleProfileId ?? undefined,
-        ...(parsed.chatMode !== undefined ? { chatMode: parsed.chatMode } : {}),
-        ...(parsed.botCollaboration !== undefined ? { botCollaboration: parsed.botCollaboration } : {}),
-      };
-      const upstream = await fetchDaemonIpc(
-        creator.ipcPort,
-        '/api/groups/create',
-        { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(forwardBody) },
-      );
-      const upstreamText = await upstream.text();
+      const { autoInvited, roleProfileId, forwardBody } = plan;
+      const parsedRecord = parsed as Record<string, unknown>;
+      let upstream: Response;
+      let upstreamText: string;
+      try {
+        upstream = await fetchDaemonIpc(
+          creator.ipcPort,
+          '/api/groups/create',
+          { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(forwardBody) },
+        );
+        upstreamText = await upstream.text();
+      } catch (err) {
+        logger.warn(`[dashboard] POST /api/groups/create proxy failed for ${creator.larkAppId}: ${err instanceof Error ? err.message : String(err)}`);
+        return jsonRes(res, 502, { ok: false, error: 'group_create_proxy_failed' });
+      }
       let upstreamJson: any = null;
       try { upstreamJson = JSON.parse(upstreamText); } catch { /* leave null */ }
       if (upstreamJson && typeof upstreamJson === 'object') {
@@ -8371,9 +8409,9 @@ const server = createServer(async (req, res) => {
         } else {
           upstreamJson.autoInvitedOpenId = autoInvited;
         }
-        const existingFeedGroupId = typeof parsed.feedGroupId === 'string' ? parsed.feedGroupId.trim() : '';
-        const newFeedGroupName = typeof parsed.newFeedGroupName === 'string' ? parsed.newFeedGroupName.trim() : '';
-        const feedGroupAppId = typeof parsed.feedGroupAppId === 'string' ? parsed.feedGroupAppId.trim() : '';
+        const existingFeedGroupId = typeof parsedRecord.feedGroupId === 'string' ? parsedRecord.feedGroupId.trim() : '';
+        const newFeedGroupName = typeof parsedRecord.newFeedGroupName === 'string' ? parsedRecord.newFeedGroupName.trim() : '';
+        const feedGroupAppId = typeof parsedRecord.feedGroupAppId === 'string' ? parsedRecord.feedGroupAppId.trim() : '';
         if (upstream.ok && upstreamJson.ok && typeof upstreamJson.chatId === 'string' && (existingFeedGroupId || newFeedGroupName)) {
           try {
             const configuredFeedBot = loadBotConfigs().find(bot => bot.larkAppId === feedGroupAppId && !bot.apiOnly);

@@ -1,3 +1,4 @@
+import { durableImRepliesEnabled } from '../bot-registry.js';
 import type { DaemonSession } from './types.js';
 import type { FrozenSessionReplyContext, FrozenSessionReplyTarget, LarkMention, ReplyTargetEntry, Session, TurnParticipant } from '../types.js';
 
@@ -218,10 +219,13 @@ export function normalizeBackgroundTaskPins(turnIds: unknown): string[] | undefi
  *  task the current worker still reports as running. All three replyTargets
  *  writers prune through this set. */
 export function replyTargetPinnedTurnIds(
-  ds: Pick<DaemonSession, 'session' | 'backgroundTaskPinnedTurnIds'>,
+  ds: Pick<DaemonSession, 'session' | 'backgroundTaskPinnedTurnIds'> & {
+    managedTurnOrigin?: { turnId?: string };
+  },
 ): Set<string> {
   const pinned = cronPinnedTurnIds(ds.session.cronTaskReplyAnchors);
   for (const turnId of ds.backgroundTaskPinnedTurnIds ?? []) pinned.add(turnId);
+  if (ds.managedTurnOrigin?.turnId) pinned.add(ds.managedTurnOrigin.turnId);
   return pinned;
 }
 
@@ -484,7 +488,7 @@ export function beginReplyTargetTurn(
   delete exactContexts[turnId];
   exactContexts[turnId] = {
     target: exactTarget,
-    ...(opts?.senderOpenId && (process.env.BOTMUX_FINAL_OUTPUT_HANDOFF === '1' || ds.initConfig?.finalOutputHandoff?.admitNew)
+    ...(opts?.senderOpenId && (process.env.BOTMUX_FINAL_OUTPUT_HANDOFF === '1' || durableImRepliesEnabled(ds.larkAppId) || ds.initConfig?.finalOutputHandoff?.admitNew)
       ? { requesterOpenId: opts.senderOpenId,
           ...(opts.participants?.some(p => p.openId === opts.senderOpenId)
             ? { requesterIsBot: opts.participants.find(p => p.openId === opts.senderOpenId)!.isBot }
