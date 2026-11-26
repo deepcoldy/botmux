@@ -21,6 +21,12 @@ vi.mock('../src/core/worker-pool.js', async () => ({
   dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
   ...await vi.importActual<any>('../src/core/worker-pool.js'), forkWorker: mocks.fork,
 }));
+vi.mock('../src/services/session-group-title.js', async () => ({
+  ...await vi.importActual<any>('../src/services/session-group-title.js'),
+  // Resident/lifecycle assertions do not need a real asynchronous title CLI.
+  // Title generation has its own session-group-title/native-title suites.
+  scheduleSessionGroupTitle: vi.fn(),
+}));
 
 import { registerBot } from '../src/bot-registry.js';
 import * as store from '../src/services/session-store.js';
