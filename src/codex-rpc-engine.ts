@@ -249,13 +249,39 @@ export interface CodexRpcTurnTerminal {
 export class CodexRpcDeliveryError extends Error {
   constructor(
     message: string,
-    readonly code: 'rpc_turn_start_active' | 'rpc_turn_start_not_sent' | 'rpc_turn_start_ambiguous',
+    readonly code: 'rpc_turn_start_active' | 'rpc_turn_start_not_sent' | 'rpc_turn_start_ambiguous'
+      | 'rpc_turn_steer_not_sent' | 'rpc_turn_steer_ambiguous',
     readonly deliveryDisposition: 'not_sent' | 'ambiguous',
     readonly cause?: unknown,
   ) {
     super(message);
     this.name = 'CodexRpcDeliveryError';
   }
+}
+
+/** Preserve the wire error code: generic failures after dispatch remain
+ * ambiguous; only explicit protocol/precondition rejections prove no input. */
+class CodexRpcResponseError extends Error {
+  constructor(readonly code: number | undefined, message: string, readonly data?: unknown) {
+    super(message);
+    this.name = 'CodexRpcResponseError';
+  }
+}
+
+function definiteSteerRejection(error: unknown): boolean {
+  if (!(error instanceof CodexRpcResponseError)) return false;
+  if ([-32700, -32600, -32601, -32602].includes(error.code ?? 0)) return true;
+  let data = '';
+  try { data = JSON.stringify(error.data ?? ''); } catch { /* untrusted payload */ }
+  const detail = `${error.message} ${data}`.toLowerCase();
+  return detail.includes('no active turn to steer')
+    || detail.includes('activeturnnotsteerable')
+    || detail.includes('active turn not steerable')
+    || detail.includes('expectedturnid')
+    || detail.includes('expected turn id')
+    || detail.includes('cannot steer a review turn')
+    || detail.includes('cannot steer a compact turn')
+    || detail.includes('input must not be empty');
 }
 
 /** Server→client requests are auto-answered so codex never blocks on a human;
@@ -294,9 +320,18 @@ export class CodexRpcEngine {
     timer: ReturnType<typeof setTimeout>;
     method: string;
     turnIdentity?: CodexRpcTurnIdentity;
+    expectedSteerTurnId?: string;
     resumeTimeout: () => void;
   }>();
   private readonly turnOwners = new Map<string, CodexRpcTurnIdentity>();
+  private readonly turnOwnerGroups = new Map<string, CodexRpcTurnIdentity[]>();
+  private steerInFlight?: {
+    nativeTurnId: string;
+    terminal?: { status: CodexRpcTurnTerminalStatus; errorCode?: string };
+  };
+  private steeringUnsupported = false;
+  private terminalCallbacksPending = 0;
+  private readonly steeringClosedNativeTurns = new Set<string>();
   private readonly nativeTurnByOwner = new Map<string, string>();
   private readonly terminalNativeTurns = new Set<string>();
   private readonly deferredUnownedTerminals = new Map<string, {
@@ -320,7 +355,17 @@ export class CodexRpcEngine {
   get wsUrl(): string { return `ws://127.0.0.1:${this.port}`; }
   get activeThreadId(): string | undefined { return this.threadId; }
   get activeNativeTurnId(): string | undefined { return this.turnOwners.keys().next().value; }
+  get canSteer(): boolean { return this.canSteerTurn(this.activeNativeTurnId); }
   get appServerPid(): number | undefined { return this.child?.pid; }
+
+  canSteerTurn(expectedTurnId: string | undefined = this.activeNativeTurnId): boolean {
+    return !!expectedTurnId && !this.closed && !this.deadNotified && !this.steeringUnsupported
+      && !this.steerInFlight && this.terminalCallbacksPending === 0
+      && this.turnOwners.size === 1 && this.turnOwners.has(expectedTurnId)
+      && !this.terminalNativeTurns.has(expectedTurnId)
+      && !this.steeringClosedNativeTurns.has(expectedTurnId)
+      && ![...this.pending.values()].some(p => p.method === 'turn/start' || p.method === 'turn/steer');
+  }
 
   private ownerKey(identity: CodexRpcTurnIdentity): string {
     return `${identity.turnId}\0${identity.dispatchAttempt ?? ''}`;
@@ -350,6 +395,7 @@ export class CodexRpcEngine {
     // it as active (which would leak ownership until engine teardown).
     if (!this.terminalNativeTurns.has(nativeTurnId)) {
       this.turnOwners.set(nativeTurnId, { ...identity });
+      this.turnOwnerGroups.set(nativeTurnId, [{ ...identity }]);
     }
     this.nativeTurnByOwner.set(ownerKey, nativeTurnId);
     const deferred = this.deferredUnownedTerminals.get(nativeTurnId);
@@ -359,12 +405,30 @@ export class CodexRpcEngine {
     }
   }
 
+  private bindNativeSteer(nativeTurnId: unknown, expectedTurnId: string, identity: CodexRpcTurnIdentity): void {
+    if (this.closed || this.deadNotified || nativeTurnId !== expectedTurnId
+      || this.steerInFlight?.nativeTurnId !== expectedTurnId
+      || !this.turnOwners.has(expectedTurnId)) {
+      throw new Error('turn/steer response did not confirm the expected active native turn');
+    }
+    const owners = this.turnOwnerGroups.get(expectedTurnId) ?? [this.turnOwners.get(expectedTurnId)!];
+    this.turnOwnerGroups.set(expectedTurnId, [...owners, { ...identity }]);
+    this.turnOwners.set(expectedTurnId, { ...identity });
+    this.nativeTurnByOwner.set(this.ownerKey(identity), expectedTurnId);
+  }
+
   private emitTurnTerminal(
     nativeTurnId: string,
     status: CodexRpcTurnTerminalStatus,
     errorCode?: string,
   ): void {
     if (!nativeTurnId || this.terminalNativeTurns.has(nativeTurnId)) return;
+    // A successful steer can race with completion. Do not settle its root
+    // before the matching response determines whether the correction joined.
+    if (!this.closed && !this.deadNotified && this.steerInFlight?.nativeTurnId === nativeTurnId) {
+      this.steerInFlight.terminal ??= { status, ...(errorCode ? { errorCode } : {}) };
+      return;
+    }
     const identity = this.turnOwners.get(nativeTurnId);
     if (!identity) {
       // An attached TUI can broadcast turns not submitted by this engine. Never
@@ -390,6 +454,9 @@ export class CodexRpcEngine {
       if (oldest) this.terminalNativeTurns.delete(oldest);
     }
     this.turnOwners.delete(nativeTurnId);
+    const identities = this.turnOwnerGroups.get(nativeTurnId) ?? [identity];
+    this.turnOwnerGroups.delete(nativeTurnId);
+    this.steeringClosedNativeTurns.delete(nativeTurnId);
     // Refresh the recorded group membership at every turn boundary: tool
     // children spawned during a turn are only provable as this app-server's
     // descendants while the leader is alive. After a leader crash they are the
@@ -399,14 +466,21 @@ export class CodexRpcEngine {
     // send turn/completed in the same socket read as the turn/start response;
     // deleting here would make the awaiting sender falsely conclude that the
     // accepted response carried no native id.
+    // Retire the complete native group before callbacks: a root callback can
+    // synchronously redrive the worker but must never steer this settled turn.
+    this.terminalCallbacksPending += 1;
     try {
-      this.opts.onTurnTerminal?.({
-        identity: { ...identity },
-        nativeTurnId,
-        status,
-        ...(errorCode ? { errorCode } : {}),
-      });
-    } catch { /* worker callback is best-effort; engine transport must continue */ }
+      for (const owner of identities) {
+        try {
+          this.opts.onTurnTerminal?.({
+            identity: { ...owner }, nativeTurnId, status,
+            ...(errorCode ? { errorCode } : {}),
+          });
+        } catch { /* worker callback is best-effort; engine transport must continue */ }
+      }
+    } finally {
+      this.terminalCallbacksPending -= 1;
+    }
   }
 
   private emitAllTurnTerminals(
@@ -414,7 +488,12 @@ export class CodexRpcEngine {
     errorCode: string,
   ): void {
     for (const nativeTurnId of [...this.turnOwners.keys()]) {
-      this.emitTurnTerminal(nativeTurnId, status, errorCode);
+      // Teardown does not erase a native terminal that was already proven
+      // while a steer response was outstanding. The unacknowledged input is
+      // still excluded; accepted owners retain their actual outcome.
+      const buffered = this.steerInFlight?.nativeTurnId === nativeTurnId
+        ? this.steerInFlight.terminal : undefined;
+      this.emitTurnTerminal(nativeTurnId, buffered?.status ?? status, buffered ? buffered.errorCode : errorCode);
     }
   }
 
@@ -575,6 +654,60 @@ export class CodexRpcEngine {
     }
     this.captureGroupIdentity();
     return { nativeTurnId };
+  }
+
+  /** Append one authorized correction to an exact active native turn. A
+   * dispatched unknown result is never converted into a replacement start. */
+  async steerTurn(
+    content: string,
+    identity: CodexRpcTurnIdentity,
+    expectedTurnId: string,
+    opts?: { timeoutMs?: number; fatalOnTimeout?: boolean; onDispatch?: () => void },
+  ): Promise<{ nativeTurnId: string }> {
+    if (!this.threadId || !this.canSteerTurn(expectedTurnId)) {
+      throw new CodexRpcDeliveryError(
+        'native turn is not available for steering', 'rpc_turn_steer_not_sent', 'not_sent',
+      );
+    }
+    const owners = this.turnOwnerGroups.get(expectedTurnId) ?? [this.turnOwners.get(expectedTurnId)!];
+    if (owners.some(owner => this.ownerKey(owner) === this.ownerKey(identity))) {
+      throw new CodexRpcDeliveryError(
+        'Botmux input is already accepted in this native turn', 'rpc_turn_steer_not_sent', 'not_sent',
+      );
+    }
+    const flight: NonNullable<CodexRpcEngine['steerInFlight']> = { nativeTurnId: expectedTurnId };
+    this.steerInFlight = flight;
+    let dispatched = false;
+    const { onDispatch, ...requestOpts } = opts ?? {};
+    try {
+      await this.request('turn/steer', {
+        threadId: this.threadId,
+        input: [{ type: 'text', text: content, text_elements: [] }],
+        expectedTurnId,
+      }, requestOpts, () => { dispatched = true; onDispatch?.(); }, identity, expectedTurnId);
+      if (this.takeNativeTurnId(identity) !== expectedTurnId) {
+        throw new Error('turn/steer response did not confirm the expected active native turn');
+      }
+      this.captureGroupIdentity();
+      return { nativeTurnId: expectedTurnId };
+    } catch (error) {
+      const definite = !dispatched || definiteSteerRejection(error);
+      if (error instanceof CodexRpcResponseError && error.code === -32601) this.steeringUnsupported = true;
+      // A rejected precondition closes steering for this native turn. Retain
+      // the worker's FIFO input until its terminal instead of retrying busy.
+      if (definite) this.steeringClosedNativeTurns.add(expectedTurnId);
+      else this.failAll(error instanceof Error ? error : new Error(String(error)));
+      throw new CodexRpcDeliveryError(
+        error instanceof Error ? error.message : String(error),
+        definite ? 'rpc_turn_steer_not_sent' : 'rpc_turn_steer_ambiguous',
+        definite ? 'not_sent' : 'ambiguous', error,
+      );
+    } finally {
+      if (this.steerInFlight === flight) this.steerInFlight = undefined;
+      if (flight.terminal) {
+        this.emitTurnTerminal(expectedTurnId, flight.terminal.status, flight.terminal.errorCode);
+      }
+    }
   }
 
   /** 首条用户消息落盘后设置线程名；失败不得拖垮仍在执行的模型 turn。 */
@@ -965,9 +1098,12 @@ export class CodexRpcEngine {
     opts?: { timeoutMs?: number; fatalOnTimeout?: boolean },
     onDispatch?: () => void,
     turnIdentity?: CodexRpcTurnIdentity,
+    expectedSteerTurnId?: string,
   ): Promise<any> {
-    if (turnIdentity && [...this.pending.values()].some(p => p.method === 'turn/start')) {
-      return Promise.reject(new Error('concurrent turn/start requests are not allowed'));
+    if ((turnIdentity || method === 'turn/steer')
+      && (this.terminalCallbacksPending > 0
+        || [...this.pending.values()].some(p => p.method === 'turn/start' || p.method === 'turn/steer'))) {
+      return Promise.reject(new Error('concurrent turn/start or turn/steer requests are not allowed'));
     }
     const timeoutMs = opts?.timeoutMs ?? this.opts.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
     const fatalOnTimeout = opts?.fatalOnTimeout !== false; // default fatal
@@ -1010,6 +1146,7 @@ export class CodexRpcEngine {
           pending.timer = startTimer();
         },
         ...(turnIdentity ? { turnIdentity: { ...turnIdentity } } : {}),
+        ...(expectedSteerTurnId ? { expectedSteerTurnId } : {}),
       });
       // onDispatch fires ONLY after send() succeeds (ws was OPEN + no throw) — the
       // frame is then on the socket, so any later failure is "dispatched" and must
@@ -1134,12 +1271,20 @@ export class CodexRpcEngine {
       this.pending.delete(msg.id);
       clearTimeout(p.timer);
       if (msg.error) {
-        p.reject(new Error(typeof msg.error === 'object' ? JSON.stringify(msg.error) : String(msg.error)));
+        p.reject(new CodexRpcResponseError(
+          typeof msg.error?.code === 'number' ? msg.error.code : undefined,
+          typeof msg.error === 'object' ? JSON.stringify(msg.error) : String(msg.error),
+          msg.error?.data,
+        ));
       } else {
         try {
           if (p.turnIdentity) {
-            const nativeTurnId = String(msg.result?.turn?.id ?? '');
-            this.bindNativeTurn(nativeTurnId, p.turnIdentity);
+            if (p.expectedSteerTurnId) {
+              this.bindNativeSteer(msg.result?.turnId, p.expectedSteerTurnId, p.turnIdentity);
+            } else {
+              const nativeTurnId = String(msg.result?.turn?.id ?? '');
+              this.bindNativeTurn(nativeTurnId, p.turnIdentity);
+            }
           }
           p.resolve(msg.result);
         } catch (err) {

@@ -54,6 +54,20 @@ function covered(nativeId: string | undefined, turnId: string): number[] {
 }
 
 describe('native input consumption receipt (store)', () => {
+  it('persists confirmed steering coverage before completion and preserves generation fencing', () => {
+    const binding = prepareBound('om_correction', { nativeId: 'native_known' });
+    const steerProof = { kind: 'codex_rpc_turn_steer' as const, nativeTurnId: 'active-native' };
+    expect(confirmGroupContextNativeInput({ ...binding, workerGeneration: 2 }, steerProof, dir)).toBe(false);
+    expect(covered('native_known', 'om_correction')).toEqual([]);
+    expect(confirmGroupContextNativeInput(binding, steerProof, dir)).toBe(true);
+    const receipt = readGroupContextDeliveryReceipt(base.appId, base.chatId, 'om_correction', dir, binding.epoch);
+    expect(receipt?.proof).toEqual(steerProof);
+    expect(receipt?.confirmedAt).toBeUndefined();
+    expect(covered('native_known', 'om_followup')).toEqual([1, 2, 3]);
+    expect(confirmGroupContextNativeInput(binding, steerProof, dir)).toBe(true);
+    expect(readGroupContextDeliveryReceipt(base.appId, base.chatId, 'om_correction', dir, binding.epoch)?.nativeConsumedAt).toBe(receipt?.nativeConsumedAt);
+  });
+
   it('covers frozen sources at consumption, before any terminal, and stays idempotent', () => {
     const binding = prepareBound('om_turn', { nativeId: 'native_known' });
     expect(covered('native_known', 'om_turn')).toEqual([]);

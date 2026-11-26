@@ -53,7 +53,7 @@ import { supportsZeroPromptInjection } from './core/prompt-injection.js';
 import { SCHEDULE_PROMPT_UNDELIVERED_ERROR_CODE } from './core/deferred-schedule-settlement.js';
 import { supportsTranscriptReplyDeliveryForBot } from './core/reply-delivery.js';
 import { TurnProgressNotice, progressNoticeIntervalMinutes } from './utils/turn-progress-notice.js';
-import { traexComposerHoldsInput, traexRestoredComposerReady } from './adapters/cli/traex-footer.js';
+import { traexActiveEmptyComposerReady, traexComposerHoldsInput, traexRestoredComposerReady } from './adapters/cli/traex-footer.js';
 import { clearBotmuxPromptEnv } from './skills/zero-injection.js';
 import {
   BackgroundTurnAuthorityHold,
@@ -1183,6 +1183,9 @@ const rpcEngagementFence = new RpcEngagementFence();
 interface RpcTurnGeneration {
   engine: CodexRpcEngine;
   cliGeneration: number;
+  /** Exact native turn being steered while this owner awaits activation.
+   * Undefined for an independent turn/start, whose predecessor may still hydrate. */
+  steerNativeTurnId?: string;
 }
 
 interface PendingRpcTerminal {
@@ -1377,6 +1380,17 @@ function stopCodexRpcEngine(): void {
     }
   }
   for (const pending of [...rpcTerminalHydrationTerminals.values()]) {
+    if (pending.terminal.status === 'completed') {
+      // A same-native steer may still await activation. Give its predecessor
+      // one final owned drain BEFORE dropping pending turns: ordinary ACK-race
+      // hydration deferral must not discard an already-readable final at teardown.
+      try {
+        codexBridgeDrainAndMaybeEmit({
+          signalIdle: false,
+          hydrationOwnerKey: rpcTurnOwnerKey(pending.terminal.identity),
+        });
+      } catch { /* teardown still finalizes the exact owner below */ }
+    }
     finalizeRpcTurnTerminal(pending.terminal, pending.generation, true);
   }
   // A dispatched delivery for which the app-server never yielded a native turn
@@ -5751,6 +5765,16 @@ async function sendRawCommandLine(
     isCurrent: () => backend === be && cliSpawnGeneration === writeGeneration
       && cliLifetimeNonce === writeLifetime && !webTerminalInputWireDirty(),
   };
+  // Mojo is headless: write(content) submits a complete task, and a separate
+  // Enter is an empty task that it correctly refuses. Do not add a TUI beat or
+  // submit key; acceptance must clear readiness before native task completion
+  // re-arms the queue. Typing without submitting has no headless counterpart.
+  if (effectiveBackendType === 'mojo') {
+    if (opts.submit === false || !writeOptions.isCurrent() || be.write(content) === false) {
+      throw new Error('backend rejected command text or submit key input');
+    }
+    return;
+  }
   // `submit: false` types the line and leaves it in the composer; the caller
   // presses Enter itself. Used by the Codex effort controller, whose Enter must
   // come after a screen re-check (see typeRawCommandLine).
@@ -7167,7 +7191,35 @@ function armSessionRenameReattachRecoveryRetry(): void {
  * receipt. Unknown evidence blocks and schedules another read during the bounded
  * window; at the cap it fails open to the normal delivery gates. Only an exact
  * unsubmitted rename command remains held beyond the cap. */
-function recoverSessionRenameAfterPersistentReattach(): boolean {
+function recoverSessionRenameAfterPersistentReattach(item?: PendingCliInput): boolean {
+  // An ordinary adapter owns the composer from paste through submit receipt.
+  // Its temporary draft is not a predecessor's rename; queue arrivals behind
+  // that writer without interpreting or mutating the rename lifecycle. Real
+  // rename phases remain enforced independently by sessionRenameInFlight().
+  if (isFlushing || injectionFlushing || commandLineWritesPending > 0 || cliSubmissionInFlight) {
+    // Ordinary arrivals join the active drain. Administrative callers must
+    // remain held; false there means their raw/adopt command may write now.
+    return item === undefined;
+  }
+  // A native model can still be working in a surviving pane whose composer
+  // is already empty. Admit only this fresh human input; administrative
+  // recovery remains pending and the native turn remains busy. If the same
+  // positive busy surface cannot issue a lease (including foreign identity),
+  // do not let the ordinary settled-surface path release it by accident.
+  if (item && lastInitConfig?.cliId === 'traex') {
+    if (traexPersistentReattachSteeringFence(item)) return false;
+    const target = backend;
+    if (target) {
+      let viewport = '';
+      try { viewport = (target.captureInputState?.() ?? { viewport: captureBackendScreen(target) }).viewport; }
+      catch { /* unknown evidence is handled by the ordinary recovery below */ }
+      if (traexActiveEmptyComposerReady(viewport)) {
+        notifySessionRenameInputHeld();
+        armSessionRenameReattachRecoveryRetry();
+        return true;
+      }
+    }
+  }
   const generation = cliSpawnGeneration;
   if (sessionRenameReattachRecoveryGeneration === generation || sessionRenamePhase !== 'idle') return false;
   const adapter = cliAdapter;
@@ -7176,6 +7228,14 @@ function recoverSessionRenameAfterPersistentReattach(): boolean {
     || !adapter.sessionRenameSurface || !backendScreenEvidenceIsAuthoritativeForMutation()) {
     sessionRenameReattachRecoveryGeneration = generation;
     return false;
+  }
+  // Background/admin probes must not turn a positively empty busy composer
+  // into a fictional rename in flight. Keep their recovery pending; only an
+  // individually authorized ordinary input can use the steering lease above.
+  if (lastInitConfig?.cliId === 'traex' && traexPersistentReattachBusyComposerFence()) {
+    notifySessionRenameInputHeld();
+    armSessionRenameReattachRecoveryRetry();
+    return true;
   }
   const command = adapter.buildSessionRenameCommand(title);
   if (!sessionRenameSentAtMs) sessionRenameSentAtMs = Date.now();
@@ -13458,7 +13518,14 @@ function observeCodexMidTurnReply(ev: CodexBridgeEvent, turn: CodexPendingTurn):
     : `Turn ${turn.turnId.substring(0, 8)} progress posted live (${reply.text.length} chars)`);
 }
 codexBridgeQueue.setMidTurnReplyObserver(observeCodexMidTurnReply);
-codexBridgeQueue.setCotSupersededObserver((turn) => {
+function observeCodexCotSuperseded(turn: CodexPendingTurn): void {
+  // A confirmed same-native correction removes its predecessor from the bridge
+  // queue. Retire only that RPC lifecycle lease; the merged final still owns
+  // the predecessor's completion metadata and no terminal is synthesized here.
+  retireRpcLifecycleFromStructuredTerminal(
+    { turnId: turn.turnId, dispatchAttempt: turn.dispatchAttempt },
+    true,
+  );
   if (!sessionId || turn.isLocal) return;
   const ownsThinking = thinkingTurn?.turnId === turn.turnId
     && thinkingTurn.dispatchAttempt === turn.dispatchAttempt;
@@ -13473,7 +13540,8 @@ codexBridgeQueue.setCotSupersededObserver((turn) => {
     ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
   });
   if (ownsThinking) resetThinkingChannel();
-});
+}
+codexBridgeQueue.setCotSupersededObserver(observeCodexCotSuperseded);
 let codexBridgeWatcher: FSWatcher | null = null;
 let codexBridgeTimer: NodeJS.Timeout | null = null;
 let ompQuietCandidateKey: string | undefined;
@@ -20180,12 +20248,22 @@ function hydrateCompletedRpcTurn(
   // old generation when teardown reaches the engine.
   if (cliSpawnGeneration !== generation.cliGeneration
     || codexRpcEngine !== generation.engine) return;
-  try {
-    codexBridgeDrainAndMaybeEmit({
-      signalIdle: false,
-      hydrationOwnerKey: ownerKey,
-    });
-  } catch { /* retry */ }
+  // A successful steer ACK lets the engine emit predecessor terminals before
+  // the sender continuation activates the correction. Draining now would let a
+  // predecessor consume their shared native turn's assistant_final before the
+  // correction owns a bridge mark. Skip only an exact same-generation steer;
+  // an independent turn/start retains the predecessor-hydration exemption.
+  const awaitingSameNativeSteer = [...rpcTurnsAwaitingActivation.values()].some(awaiting =>
+    awaiting.steerNativeTurnId === terminal.nativeTurnId
+    && sameRpcGeneration(awaiting, generation));
+  if (!awaitingSameNativeSteer) {
+    try {
+      codexBridgeDrainAndMaybeEmit({
+        signalIdle: false,
+        hydrationOwnerKey: ownerKey,
+      });
+    } catch { /* retry */ }
+  }
   if (!codexBridgeQueue.hasPendingTurn(identity.turnId, identity.dispatchAttempt)) {
     // Structured ingest already emitted final_output + terminal in the canonical
     // order. The explicit native terminal below is idempotently suppressed.
@@ -20376,15 +20454,29 @@ function releaseRpcTurnTerminalDeferral(
 
 function retireRpcLifecycleFromStructuredTerminal(
   identity: CodexRpcTurnIdentity,
+  supersededSettlement = false,
 ): void {
   const ownerKey = rpcTurnOwnerKey(identity);
+  const settlingGeneration = settlingRpcTerminalOwners.get(ownerKey);
   // Native completion hydration owns its own finalization after this canonical
-  // drain returns. Do not tear down that generation's settlement underneath it.
-  if (settlingRpcTerminalOwners.has(ownerKey)) return;
-  const generation = rpcActiveOwners.get(ownerKey)
+  // drain returns. A confirmed same-native supersession is the exception: its
+  // merged successor owns the only final, so the deferred predecessor must not
+  // later publish an independent terminal.
+  if (settlingGeneration && !supersededSettlement) return;
+  const generation = settlingGeneration ?? rpcActiveOwners.get(ownerKey)
     ?? rpcLifecycleFailClosedOwners.get(ownerKey)
     ?? rpcTurnsAwaitingActivation.get(ownerKey);
   if (!generation) return;
+  if (supersededSettlement && settlingGeneration) {
+    const timer = rpcTerminalHydrationTimers.get(ownerKey);
+    if (timer) clearTimeout(timer);
+    rpcTerminalHydrationTimers.delete(ownerKey);
+    if (sameRpcGeneration(rpcTerminalHydrationOwners.get(ownerKey), generation)) {
+      rpcTerminalHydrationOwners.delete(ownerKey);
+      rpcTerminalHydrationTerminals.delete(ownerKey);
+    }
+    settlingRpcTerminalOwners.delete(ownerKey);
+  }
   clearAwaitingRpcActivation(identity, generation);
   if (sameRpcGeneration(rpcActiveOwners.get(ownerKey), generation)) {
     rpcActiveOwners.delete(ownerKey);
@@ -30185,18 +30277,91 @@ function programStatusBlockedHoldsTypeAhead(): boolean {
     && programStatusBlockHoldsTypeAhead(idleDetector?.programStatusBlock() ?? null);
 }
 
-/** The hybrid WebSocket RPC engine only has a serial turn/start contract. It
- *  does not implement Codex App's ordered turn/steer grouping, so type-ahead
- *  must stop while the exact native turn is awaiting activation, active, or
- *  still hydrating its terminal. The queued follow-up is re-driven by the
- *  normal terminal -> idle path and starts as its own turn afterwards. */
+/** A proven active native turn can accept an explicit steer. Awaiting ACKs,
+ * terminal hydration and unknown outcomes remain generation-wide barriers. */
 function directRpcTurnBlocksTypeAhead(): boolean {
   return codexRpcEngine !== undefined && (
     rpcTurnsAwaitingActivation.size > 0
-    || rpcActiveOwners.size > 0
     || settlingRpcTerminalOwners.size > 0
     || rpcTerminalHydrationOwners.size > 0
+    || rpcLifecycleFailClosedOwners.size > 0
+    || ((rpcActiveOwners.size > 0 || !!codexRpcEngine.activeNativeTurnId)
+      && codexRpcEngine.canSteerTurn?.(codexRpcEngine.activeNativeTurnId) !== true)
   );
+}
+
+/** Administrative input is never an active-turn steer, even if a stale screen
+ * says idle while the RPC turn remains live or its output is being hydrated. */
+function hybridRpcTurnBlocksAdministrativeInput(): boolean {
+  return codexRpcEngine !== undefined && (
+    !!codexRpcEngine.activeNativeTurnId || rpcActiveOwners.size > 0
+    || rpcTurnsAwaitingActivation.size > 0 || settlingRpcTerminalOwners.size > 0
+    || rpcTerminalHydrationOwners.size > 0 || rpcLifecycleFailClosedOwners.size > 0
+  );
+}
+
+/** Only a fresh authenticated human IM message may enter the active native
+ * turn. Preserve the existing XPI control policy and every explicit FIFO fence. */
+function hybridRpcInputMaySteer(item: PendingCliInput, expectedTurnId: string): boolean {
+  return !lastInitConfig?.adoptMode
+    && item.turnId?.startsWith('om_') === true
+    && item.dispatchAttempt === undefined
+    && item.queueAfterActiveTurn !== true
+    && item.noReplay !== true
+    && !item.taskContinuation && !item.vcMeetingImTurnOrigin
+    && item.trustedCaller?.senderType === 'user'
+    && item.trustedCaller.source !== 'schedule_creator'
+    && !activeTurnBlocks(item)
+    && codexRpcEngine?.canSteerTurn?.(expectedTurnId) === true;
+}
+
+/** A busy surviving TUI is initialized without publishing a new idle edge.
+ * This is a per-input write lease, never prompt readiness or rename settlement.
+ * Re-prove the PID's rollout ownership even when the identity cache is warm. */
+function traexPersistentReattachBusyComposerFence(): {
+  backend: SessionBackend; adapter: CliAdapter; generation: number; lifetime: number; webInputGeneration: number;
+  pid: number; nativeSessionId: string;
+} | undefined {
+  const target = backend;
+  const adapter = cliAdapter;
+  if (!target || !adapter || target.submitTurn || !lastSpawnPersistentReattach
+    || lastInitConfig?.cliId !== 'traex' || lastInitConfig.adoptMode
+    || lastInitConfig.existingAppServerEndpoint || codexRpcEngine
+    || !['pty', 'tmux', 'hc'].includes(effectiveBackendType)
+    || sessionRenamePhase !== 'idle' || sessionRenameInFlight()
+    || cliRestartInProgress || rawInputRestartGate || webTerminalInputWireDirty()
+    || commandLineWritesPending > 0 || injectionFlushing || hookReviewHoldsQueuedWrite()
+    || !backendScreenEvidenceIsAuthoritativeForMutation()) return undefined;
+  const generation = cliSpawnGeneration;
+  const lifetime = cliLifetimeNonce;
+  const webInputGeneration = webTerminalInputGeneration;
+  const pid = currentTraexObservedPid();
+  if (!pid) return undefined;
+  const nativeSessionId = sessionRenameNativeSessionIdNow();
+  const owned = findTraexRolloutSetByPid(pid);
+  if (!nativeSessionId || !owned
+    || !(owned.has(nativeSessionId) || owned.has(nativeSessionId.toLowerCase()))) return undefined;
+  let viewport: string;
+  try { viewport = (target.captureInputState?.() ?? { viewport: captureBackendScreen(target) }).viewport; }
+  catch { return undefined; }
+  if (!traexActiveEmptyComposerReady(viewport) || backend !== target || cliAdapter !== adapter || cliSpawnGeneration !== generation
+    || cliLifetimeNonce !== lifetime
+    || webTerminalInputGeneration !== webInputGeneration || currentTraexObservedPid() !== pid
+    || cliRestartInProgress || webTerminalInputWireDirty()) return undefined;
+  return { backend: target, adapter, generation, lifetime, webInputGeneration, pid, nativeSessionId };
+}
+
+function traexPersistentReattachSteeringFence(item?: PendingCliInput):
+  (NonNullable<ReturnType<typeof traexPersistentReattachBusyComposerFence>> & { item: PendingCliInput }) | undefined {
+  if (!item || item.turnId?.startsWith('om_') !== true || item.noReplay === true
+    || item.durablePrimaryInbox || item.taskContinuation || item.traexAutoModelRecovery || item.traexAutoModelContinuation
+    || item.codexAppInput || item.codexAppDispatchId || item.queuedActivationToken || item.restartNoteOriginalContent
+    || item.trustedCaller?.senderType !== 'user' || item.trustedCaller.source !== undefined
+    || !pendingInputAllowsTypeAhead(runtimePtyInputPolicy().supportsTypeAhead, durableTurnInFlight, item,
+      directRpcTurnBlocksTypeAhead() || programStatusBlockedHoldsTypeAhead())
+    || activeTurnBlocks(item)) return undefined;
+  const physical = traexPersistentReattachBusyComposerFence();
+  return physical ? { ...physical, item } : undefined;
 }
 
 /** Reorder only an authorized interactive steer, never settle its host turn. */
@@ -30284,7 +30449,18 @@ async function flushPending(): Promise<void> {
     if (isFlushing || backend !== target || cliRestartInProgress || webTerminalInputWireDirty()) return;
   }
   if (!hasPendingInputForFlush()) return;  // nothing to flush — keep isPromptReady
-  if (recoverSessionRenameAfterPersistentReattach()) return;
+  let reattachSteerFence = lastSpawnPersistentReattach && lastInitConfig?.cliId === 'traex'
+    ? traexPersistentReattachSteeringFence(pendingMessages[0]) : undefined;
+  const reattachSteerFenceIsCurrent = (item: PendingCliInput): boolean => {
+    const current = traexPersistentReattachSteeringFence(item);
+    return !!reattachSteerFence && !!current && current.item === reattachSteerFence.item
+      && current.backend === reattachSteerFence.backend && current.adapter === reattachSteerFence.adapter
+      && current.generation === reattachSteerFence.generation
+      && current.lifetime === reattachSteerFence.lifetime
+      && current.webInputGeneration === reattachSteerFence.webInputGeneration
+      && current.pid === reattachSteerFence.pid && current.nativeSessionId === reattachSteerFence.nativeSessionId;
+  };
+  if (recoverSessionRenameAfterPersistentReattach(pendingMessages[0])) return;
   if (resetTraexAutoModelBeforePendingTurn()) return;
   if (sessionRenameInFlight()) return;  // wait for /rename to finish before any user input
   if (commandLineWritesPending > 0) return;  // do not splice into text -> Enter
@@ -30313,6 +30489,11 @@ async function flushPending(): Promise<void> {
     log(`Holding pending input behind ${rpcLifecycleFailClosedOwners.size} unresolved Codex RPC delivery owner(s)`);
     return;
   }
+  // These transport phases own readiness even after the native id disappears.
+  // A stale screen idle (or an earlier owner's callback) cannot start a new
+  // task before every pending ACK and terminal hydration has settled.
+  if (codexRpcEngine && (rpcTurnsAwaitingActivation.size > 0
+    || settlingRpcTerminalOwners.size > 0 || rpcTerminalHydrationOwners.size > 0)) return;
   // Only after the serial/lifecycle gates above may screen evidence classify the
   // current input owner. Otherwise BotMux's own in-flight command or an active
   // durable turn is misreported as a user draft. Dedicated interaction owners
@@ -30418,9 +30599,11 @@ async function flushPending(): Promise<void> {
   const traexNativeCommandBlocked = (pendingRawInputs.length > 0 || pendingSessionRename !== null)
     && lastInitConfig?.cliId === 'traex' && lastInitConfig.adoptMode === true && !!backend
     && traexTerminalInputBlocked(adapterInputHandle(backend));
-  const sessionRenameReady = isPromptReady && pendingSessionRename !== null && !traexNativeCommandBlocked;
-  const rawInputReady = isPromptReady && pendingRawInputs.length > 0 && !traexNativeCommandBlocked;
-  const adoptInputReady = isPromptReady && lastInitConfig?.adoptMode === true && pendingAdoptMessages.length > 0;
+  const administrativeInputReady = !reattachSteerFence
+    && (!codexRpcEngine || !hybridRpcTurnBlocksAdministrativeInput());
+  const sessionRenameReady = isPromptReady && administrativeInputReady && pendingSessionRename !== null && !traexNativeCommandBlocked;
+  const rawInputReady = isPromptReady && administrativeInputReady && pendingRawInputs.length > 0 && !traexNativeCommandBlocked;
+  const adoptInputReady = isPromptReady && administrativeInputReady && lastInitConfig?.adoptMode === true && pendingAdoptMessages.length > 0;
   let supportedSessionRenameReady = sessionRenameReady;
   const renameOnRemoteBackend = effectiveBackendType === 'riff'
     || effectiveBackendType === 'mojo'
@@ -30729,6 +30912,17 @@ async function flushPending(): Promise<void> {
         }
         break;
       }
+      // The previous adapter can await while another human correction arrives.
+      // Its lease belongs to that previous item; prove a new empty composer
+      // for this head rather than carrying the first item's admission forward.
+      if (reattachSteerFence && itemsWrittenInThisFlush > 0) {
+        const nextFence = traexPersistentReattachSteeringFence(pendingMessages[0]);
+        if (!nextFence) {
+          armSessionRenameReattachRecoveryRetry();
+          break;
+        }
+        reattachSteerFence = nextFence;
+      }
       const admissionHead = pendingMessages[0]!;
       const admissionBackend = backend;
       const admissionGeneration = cliSpawnGeneration;
@@ -30817,9 +31011,23 @@ async function flushPending(): Promise<void> {
         break;
       }
       if (webTerminalInputWireDirty()) break;
+      // Settling the opening composer and question/model checks can await.
+      // Retain the exact queue head if this busy-reattach lease changed; no
+      // dequeue, rename Enter, or new prompt-ready state has occurred.
+      if (reattachSteerFence) {
+        if (!pendingMessages[0] || !reattachSteerFenceIsCurrent(pendingMessages[0])) break;
+      }
       const catalogAdmissionHead = pendingMessages[0];
       if (catalogAdmissionHead?.turnId
         && admitTraexCatalogModelBeforeInput(catalogAdmissionHead.turnId, catalogAdmissionHead.dispatchAttempt)) break;
+      // Explicit FIFO, non-interactive input and a rejected steer remain at
+      // the head until the native task closes. A stale ready screen cannot
+      // turn them into a second turn/start against the live native id.
+      if (codexRpcEngine?.activeNativeTurnId && catalogAdmissionHead
+        && !hybridRpcInputMaySteer(catalogAdmissionHead, codexRpcEngine.activeNativeTurnId)) {
+        keepPromptReadyAfterHold();
+        break;
+      }
       const item = freshnessInputQueue.takeNormal();
       if (!item) break;
       // A follow-up turn must never be written onto a degraded model while the
@@ -30927,12 +31135,19 @@ async function flushPending(): Promise<void> {
       let normalWritePrepared = false;
       let retiredBeforeSubmit = false;
       let webWireWriteRefused = false;
+      let reattachSteerWriteRefused = false;
       let submissionPreparationFailed = false;
       // Remote-runner, RPC and Codex App runner input bypass the composer.
       const typedIntoComposer = !writeBackend.submitTurn && !writeRpcEngine
         && !(item.codexAppInput && writeAdapter.writeStructuredInput);
       const prepareNormalWrite = (): void => {
         if (normalWritePrepared) return;
+        // A backend submission mutex may await after dequeue. Capture again
+        // at the literal write edge, before rotating capture or turn authority.
+        if (reattachSteerFence && !reattachSteerFenceIsCurrent(item)) {
+          reattachSteerWriteRefused = true;
+          throw new SubmissionWriteError('Persistent TRAE steering lease changed before native write', undefined, false);
+        }
         if (webTerminalInputWireDirty()) {
           webWireWriteRefused = true;
           throw new SubmissionWriteError('Web terminal wire is dirty before the native write', 'web_terminal_input_wire_dirty', false);
@@ -31293,6 +31508,7 @@ async function flushPending(): Promise<void> {
       let rpcTurnIdentity: CodexRpcTurnIdentity | undefined;
       let rpcTurnGeneration: RpcTurnGeneration | undefined;
       let rpcContext: PreparedTraexNativeContext | undefined;
+      let rpcSteering = false;
       try {
         if (item.taskContinuation && !writeRpcEngine) {
           emitTurnTerminal(
@@ -31375,13 +31591,32 @@ async function flushPending(): Promise<void> {
           // surfaces as a normal submit-failure notice.
           let rpcNativeTurnId: string | undefined;
           await runAfterAmbiguousSubmissionWrites(writeBackend, async () => {
+            // The mutex wait can outlive native completion or another ACK.
+            // Exclude this item's own activation lease, but never start/steer
+            // across another owner's unresolved transport or hydration phase.
+            const ownerKey = rpcTurnOwnerKey(rpcTurnIdentity!);
+            if ([...rpcTurnsAwaitingActivation.keys()].some(key => key !== ownerKey)
+              || settlingRpcTerminalOwners.size > 0 || rpcTerminalHydrationOwners.size > 0
+              || rpcLifecycleFailClosedOwners.size > 0) {
+              throw new CodexRpcDeliveryError(
+                'RPC lifecycle is still settling before native input', 'rpc_turn_start_not_sent', 'not_sent',
+              );
+            }
             const activeNativeTurnId = writeRpcEngine.activeNativeTurnId;
             if (activeNativeTurnId) {
-              throw new CodexRpcDeliveryError(
-                `refusing turn/start while active native turn ${activeNativeTurnId} has not reached terminal`,
-                'rpc_turn_start_active',
-                'not_sent',
-              );
+              if (!hybridRpcInputMaySteer(item, activeNativeTurnId)) {
+                throw new CodexRpcDeliveryError(
+                  `refusing turn/start while active native turn ${activeNativeTurnId} has not reached terminal`,
+                  'rpc_turn_start_active', 'not_sent',
+                );
+              }
+              rpcTurnGeneration!.steerNativeTurnId = activeNativeTurnId;
+              rpcSteering = true;
+              rpcNativeTurnId = (await writeRpcEngine.steerTurn(
+                rpcContext?.content ?? msg, rpcTurnIdentity!, activeNativeTurnId,
+                { onDispatch: prepareNormalWrite },
+              )).nativeTurnId;
+              return;
             }
             // Commit attribution/durable ownership only once the frame is on
             // the socket: a not_sent rejection (dead socket, concurrent start)
@@ -31411,7 +31646,7 @@ async function flushPending(): Promise<void> {
             item.structuredSourceTurnIds, writeRpcEngine.activeThreadId);
           // The app-server acknowledged turn/start for this exact input on
           // the engine's active thread, fenced to the current generation.
-          acknowledgeNativeInputConsumed(item.turnId, 'codex_rpc_turn_start',
+          acknowledgeNativeInputConsumed(item.turnId, rpcSteering ? 'codex_rpc_turn_steer' : 'codex_rpc_turn_start',
             writeRpcEngine.activeThreadId ?? lastInitConfig?.cliSessionId, rpcNativeTurnId,
             item.dispatchAttempt);
           publishTraexNativeContextReceipt(rpcContext, rpcTurnIdentity.turnId, 'accepted');
@@ -31457,6 +31692,20 @@ async function flushPending(): Promise<void> {
           recoveryFailureReason = transaction.recoveryFailureReason;
         } else {
           submissionBackend = writeBackend;
+          const nativeGuard = lastInitConfig?.cliId === 'traex' ? traexQuestionSubmitGuard(item) : undefined;
+          const writeSteerFence = reattachSteerFence;
+          const submitGuard = nativeGuard && writeSteerFence ? {
+            ...nativeGuard,
+            // TraeX's adapter awaits picker setup before beforeWrite. Keep
+            // authority/commit preparation at that last pre-paste boundary.
+            beforeWrite: () => { prepareNormalWrite(); nativeGuard.beforeWrite?.(); },
+            current: () => nativeGuard.current()
+              && backend === writeSteerFence.backend && cliAdapter === writeSteerFence.adapter
+              && cliSpawnGeneration === writeSteerFence.generation
+              && cliLifetimeNonce === writeSteerFence.lifetime
+              && webTerminalInputGeneration === writeSteerFence.webInputGeneration
+              && currentTraexObservedPid() === writeSteerFence.pid,
+          } : nativeGuard;
           if (writeAdapter.writeInputDefersPreparation === true && !pendingMessages.includes(item)) {
             // Keep the exact item under the ordinary pending lifecycle until its
             // asynchronous precheck reaches beforeSubmit. backend.onExit,
@@ -31506,11 +31755,12 @@ async function flushPending(): Promise<void> {
                   ? { correlateTranscript: true as const } : {}),
                 ...(item.trustedCaller ? { trustedCaller: item.trustedCaller } : {}),
                 ...(item.codexAppSteerable ? { codexAppSteerable: true } : {}),
-                ...(lastInitConfig?.cliId === 'traex' ? { submitGuard: traexQuestionSubmitGuard(item) } : {}),
+                ...(submitGuard ? { submitGuard } : {}),
               },
             ),
             settleVerifiableSubmissionForJournal,
-            writeAdapter.writeInputDefersPreparation === true ? undefined : prepareNormalWrite,
+            (writeAdapter.writeInputDefersPreparation === true || reattachSteerFence)
+              ? undefined : prepareNormalWrite,
           ).finally(() => { traexQuestionDraftWaiting = false; });
           result = transaction.result;
           recoveryFailureReason = transaction.recoveryFailureReason;
@@ -31552,6 +31802,13 @@ async function flushPending(): Promise<void> {
           scheduleBusyPatternIdleProbe(`${cliName()} post-submit`);
         }
       } catch (err: any) {
+        if (reattachSteerWriteRefused && !normalWritePrepared && writeContinuationIsCurrent()) {
+          pendingMessages.unshift(item);
+          requeueUnsubmittedQueuedActivation(item);
+          keepPromptReadyAfterHold();
+          log('Retained definitely-unwritten correction after persistent TRAE steering lease changed');
+          break;
+        }
         if ((webWireWriteRefused || (err instanceof SubmissionWriteError && !err.submissionStarted
           && webTerminalInputWireDirty())) && !tracksCodexAppLiveness && writeContinuationIsCurrent()) {
           if (writeAdapter.writeInputDefersPreparation !== true && !pendingMessages.includes(item)) {
@@ -31622,6 +31879,7 @@ async function flushPending(): Promise<void> {
           && err instanceof CodexRpcDeliveryError
           && err.deliveryDisposition === 'not_sent') {
           clearAwaitingRpcActivation(rpcTurnIdentity, rpcTurnGeneration);
+          if (rpcSteering || writeRpcEngine?.activeNativeTurnId) item.queueAfterActiveTurn = true;
           pendingMessages.unshift(item);
           log(
             `Codex RPC turn/start was not sent; retained the FIFO head `
@@ -32438,6 +32696,8 @@ function sendToPty(
     next,
     directRpcTurnBlocksTypeAhead() || programStatusBlockedHoldsTypeAhead(),
   ) && !activeTurnBlocks(next);
+  const reattachSteerReady = lastSpawnPersistentReattach && lastInitConfig?.cliId === 'traex'
+    && traexPersistentReattachSteeringFence(next) !== undefined;
   const shouldMergeQueued = !traexAutoModelRuntimeEligible()
     && opts.dispatchAttempt === undefined && !durableTurnInFlight
     && !isFlushing && !shouldWriteNow({
@@ -32445,7 +32705,7 @@ function sendToPty(
     isFlushing,
     supportsTypeAhead,
     awaitingFirstPrompt,
-    startupComplete: idleDetector?.isStartupComplete(),
+    startupComplete: reattachSteerReady || idleDetector?.isStartupComplete(),
     holdForRunnerReload: shouldHoldCodexRunnerInput(codexRunnerFreshness),
   }) && cliAdapter.mergeQueuedInput === true;
   const mergedQueued = shouldMergeQueued && mergeQueuedCliInput(pendingMessages, next);
@@ -32487,12 +32747,12 @@ function sendToPty(
   // TUI has booted. First-ready or positive initialization evidence proves
   // this; keep that evidence available to messages arriving after the startup
   // observer's one-time queue flush, even if resyncs prevent ordinary idle.
-  if (!recoverSessionRenameAfterPersistentReattach() && !sessionRenameInFlight() && commandLineWritesPending === 0 && shouldWriteNow({
+  if (!recoverSessionRenameAfterPersistentReattach(next) && !sessionRenameInFlight() && commandLineWritesPending === 0 && shouldWriteNow({
     isPromptReady,
     isFlushing,
     supportsTypeAhead,
     awaitingFirstPrompt,
-    startupComplete: idleDetector?.isStartupComplete(),
+    startupComplete: reattachSteerReady || idleDetector?.isStartupComplete(),
     holdForRunnerReload: shouldHoldCodexRunnerInput(codexRunnerFreshness),
   })) {
     if (!mergedQueued) {
@@ -48499,7 +48759,11 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       const startupInputGateHolds = !firstWriteLivenessConfirmed
         || (!openingInputBoxSettled && pendingMessages.length > 0)
         || startupCommandsInProgress || startupCommandAckHold !== null || nativeSessionForkPending();
-      if (cliRestartInProgress || rawInputRestartGate || recoverSessionRenameAfterPersistentReattach() || sessionRenameInFlight()
+      // A busy native turn can accept passthrough, but an adapter's pending
+      // paste/Enter/receipt owns the composer until its flush releases it.
+      if (isFlushing || cliSubmissionInFlight || commandLineWritesPending > 0
+        || cliRestartInProgress || rawInputRestartGate || recoverSessionRenameAfterPersistentReattach() || sessionRenameInFlight()
+        || (codexRpcEngine && hybridRpcTurnBlocksAdministrativeInput())
         || shouldHoldCodexRunnerInput(codexRunnerFreshness)
         || injectionFlushing || shouldDeferUserFlush(pendingInjections)
         || bareShellCheckInProgress || bareShellLaunchBlocked
