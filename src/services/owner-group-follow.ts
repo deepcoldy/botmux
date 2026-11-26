@@ -16,7 +16,8 @@ export interface OwnerGroupFollowDependencies {
   listChats(token: string, signal: AbortSignal): Promise<readonly (string | OwnerFollowChatItem)[]>;
   listBotChats(signal: AbortSignal): Promise<string[]>;
   invite(chatId: string, token: string, signal: AbortSignal): Promise<void>;
-  notify(ownerOpenId: string, chatId: string | undefined, issue: OwnerGroupFollowIssue | undefined, current: () => boolean): Promise<void>;
+  /** `false` means the notice was abandoned before delivery and its dedup claim must be released. */
+  notify(ownerOpenId: string, chatId: string | undefined, issue: OwnerGroupFollowIssue | undefined, current: () => boolean): Promise<boolean | void>;
   log(message: string): void;
   now?: () => number;
 }
@@ -74,18 +75,27 @@ export function createOwnerGroupFollower(deps: OwnerGroupFollowDependencies) {
       && store.read()?.epoch === epoch;
     const notice = async (chatId?: string, issue?: OwnerGroupFollowIssue) => {
       if (!current()) return;
+      let claimedAt: number | undefined;
       if (!chatId) {
         let shouldNotify = false;
         store.update(epoch, value => {
           if (value.authNoticeAt === undefined || now() - value.authNoticeAt >= 6 * 60 * 60_000) {
-            value.authNoticeAt = now(); shouldNotify = true;
+            claimedAt = now(); value.authNoticeAt = claimedAt; shouldNotify = true;
           }
         });
         if (!shouldNotify) return;
       }
       if (current()) {
-        await deps.notify(owner, chatId, issue, current)
+        const delivered = await deps.notify(owner, chatId, issue, current)
           .catch(() => deps.log('owner group follow notification failed'));
+        if (delivered === false && claimedAt !== undefined) {
+          // A superseded platform notice proves nothing about the newly selected
+          // local source. Release only this claim; a newer claim must survive.
+          store.update(epoch, value => {
+            if (value.authNoticeAt !== claimedAt) return false;
+            delete value.authNoticeAt;
+          });
+        }
       }
     };
     try {

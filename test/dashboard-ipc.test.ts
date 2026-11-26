@@ -4717,15 +4717,27 @@ describe('PUT + GET /api/bot-trigger-user-auth — 开关刷新回显', () => {
       expect(stored()).toMatchObject({ capabilities: ['bytecloud'], credentialSource: 'local' });
       expect(getBot(appId).config.triggerUserAuth?.tools).toEqual(['bytedcli']);
 
+      const credentialSource = { default: 'platform', 'lark-user': 'local' };
+      const split = await put({ enabled: true, credentialSource });
+      expect(split.status).toBe(200);
+      expect(await split.json()).toMatchObject({ triggerUserAuth: { credentialSource } });
+      expect(stored().credentialSource).toEqual(credentialSource);
+      expect(await (await fetch(`${base}/api/bot-trigger-user-auth-status`)).json()).toMatchObject({
+        policy: { credentialSource },
+        credentialSource: 'platform',
+        credentialSources: { 'lark-user': 'local', bytecloud: 'platform' },
+      });
+
       expect((await put({ enabled: true, capabilities: ['lark-user', 'meego'] })).status).toBe(200);
-      expect(stored()).toMatchObject({ capabilities: ['lark-user', 'meego'] });
+      expect(stored()).toMatchObject({ capabilities: ['lark-user', 'meego'], credentialSource });
       expect(getBot(appId).config.triggerUserAuth?.tools).toEqual(['lark-cli', 'bytedcli']);
       // `tools` is derived from `capabilities`, so it is not stored next to them.
       expect(stored()).not.toHaveProperty('tools');
 
+      expect((await put({ enabled: true, credentialSource: { meego: 'platform' } })).status).toBe(400);
       // An invalid capability is refused and leaves the stored policy alone.
       expect((await put({ enabled: true, capabilities: ['bits'] })).status).toBe(400);
-      expect(stored()).toMatchObject({ capabilities: ['lark-user', 'meego'] });
+      expect(stored()).toMatchObject({ capabilities: ['lark-user', 'meego'], credentialSource });
     } finally {
       if (handle) await handle.close();
       handle = null;

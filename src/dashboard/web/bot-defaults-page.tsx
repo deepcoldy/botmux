@@ -31,6 +31,11 @@ import { resolvePromptCachePolicy, type PromptCacheConfig } from '../../services
 import { ProviderRecoveryEditor } from './provider-recovery-editor.js';
 import type { ProviderRecoveryConfig } from '../../services/provider-recovery-policy.js';
 import {
+  credentialSourceOf,
+  type TriggerUserAuthCredentialSource,
+  type TriggerUserAuthCredentialSourceCapability,
+} from '../../services/trigger-user-auth.js';
+import {
   BOT_DEFAULTS_TABS,
   BOT_DEFAULTS_TAB_LABEL_KEYS,
   agentSelectionKey,
@@ -5061,13 +5066,26 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
  * server bypasses the wrapper entirely — an operator who is not told either of
  * those would believe the boundary is complete.
  */
-function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
   const { bot, patchBot } = props;
   const policy = bot.triggerUserAuth ?? null;
   const enabled = policy?.enabled === true;
   const capabilities = policy?.capabilities ?? ['lark-user' as const, 'bytecloud' as const, 'meego' as const];
   const credentialSource = policy?.credentialSource ?? 'auto';
+  const sourceOverrides = typeof credentialSource === 'object' ? credentialSource : undefined;
+  const defaultSource = credentialSourceOf(policy);
+  const sourceCapabilities = ['lark-user', 'bytecloud'] as const;
+  const enabledSources = sourceCapabilities
+    .filter(capability => capabilities.includes(capability))
+    .map(capability => credentialSourceOf(policy, capability));
+  const platformCapable = enabledSources.some(source => source !== 'local');
+  const platformOnly = enabledSources.includes('platform');
+  const sourceOptions = [
+    <option key="auto" value="auto">{tr('botDefaults.triggerUserAuthSourceAuto')}</option>,
+    <option key="platform" value="platform">{tr('botDefaults.triggerUserAuthSourcePlatform')}</option>,
+    <option key="local" value="local">{tr('botDefaults.triggerUserAuthSourceLocal')}</option>,
+  ];
   const delegateOnMention = policy?.delegateOnMention !== false;
   const allowSpeakerSwitch = policy?.allowSpeakerSwitch === true;
   const gitCommitIdentity = policy?.gitCommitIdentity === true;
@@ -5131,6 +5149,13 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
     saveWith({ capabilities: on ? [...new Set([...capabilities, capability])] : capabilities.filter(c => c !== capability) });
   }
 
+  function saveSourceOverride(capability: TriggerUserAuthCredentialSourceCapability, source: string): void {
+    const next = { ...sourceOverrides };
+    if (source === '') delete next[capability];
+    else next[capability] = source as TriggerUserAuthCredentialSource;
+    saveWith({ credentialSource: Object.keys(next).length ? next : { default: defaultSource } });
+  }
+
   return (
     <section className="bd-section">
       <h3 className="bd-section-title">{tr('botDefaults.sectionTriggerUserAuth')}</h3>
@@ -5163,27 +5188,64 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
             <p className="bd-section-note" data-action="trigger-user-auth-lark-user-native-note">{tr('botDefaults.triggerUserAuthLarkUserNativeNote')}</p>
           )}
           <div className="bd-row">
-            <span>{tr('botDefaults.triggerUserAuthSource')}</span>
-            <select
-              data-action="trigger-user-auth-source"
-              value={credentialSource}
-              disabled={busy}
-              onChange={event => saveWith({ credentialSource: event.currentTarget.value as 'auto' | 'platform' | 'local' })}
-            >
-              <option value="auto">{tr('botDefaults.triggerUserAuthSourceAuto')}</option>
-              <option value="platform">{tr('botDefaults.triggerUserAuthSourcePlatform')}</option>
-              <option value="local">{tr('botDefaults.triggerUserAuthSourceLocal')}</option>
-            </select>
+            <label>
+              <span>{tr('botDefaults.triggerUserAuthSource')}</span>
+              <select
+                data-action="trigger-user-auth-source"
+                value={sourceOverrides ? 'split' : defaultSource}
+                disabled={busy}
+                onChange={event => {
+                  const value = event.currentTarget.value;
+                  saveWith({ credentialSource: value === 'split' ? { default: defaultSource } : value as TriggerUserAuthCredentialSource });
+                }}
+              >
+                {sourceOptions}
+                <option value="split">{tr('botDefaults.triggerUserAuthSourceSplit')}</option>
+              </select>
+            </label>
           </div>
+          {sourceOverrides ? (
+            <>
+              <div className="bd-row">
+                <label>
+                  <span>{tr('botDefaults.triggerUserAuthSourceDefault')}</span>
+                  <select
+                    data-action="trigger-user-auth-source-default"
+                    value={defaultSource}
+                    disabled={busy}
+                    onChange={event => saveWith({ credentialSource: { ...sourceOverrides, default: event.currentTarget.value as TriggerUserAuthCredentialSource } })}
+                  >
+                    {sourceOptions}
+                  </select>
+                </label>
+              </div>
+              {sourceCapabilities.map(capability => (
+                <div key={capability} className="bd-row">
+                  <label>
+                    <span>{tr(`botDefaults.triggerUserAuthCapability.${capability}`)}</span>
+                    <select
+                      data-action={`trigger-user-auth-source-${capability}`}
+                      value={sourceOverrides[capability] ?? ''}
+                      disabled={busy}
+                      onChange={event => saveSourceOverride(capability, event.currentTarget.value)}
+                    >
+                      <option value="">{tr('botDefaults.triggerUserAuthSourceInherit')}</option>
+                      {sourceOptions}
+                    </select>
+                  </label>
+                </div>
+              ))}
+            </>
+          ) : null}
           <p className="bd-section-note">{tr('botDefaults.triggerUserAuthSourceHelp')}</p>
-          {credentialSource !== 'local' && info && info.platformBound === false ? (
+          {platformCapable && info?.platformBound === false ? (
             <p className="bd-section-note" data-trigger-user-auth-platform="unbound">
-              ⚠️ {tr(credentialSource === 'platform'
+              ⚠️ {tr(platformOnly
                 ? 'botDefaults.triggerUserAuthPlatformUnboundStrict'
                 : 'botDefaults.triggerUserAuthPlatformUnbound')}
             </p>
           ) : null}
-          {credentialSource !== 'local' && info?.platformBound && info.platformCredentialsUrl ? (
+          {platformCapable && info?.platformBound && info.platformCredentialsUrl ? (
             <p className="bd-section-note" data-trigger-user-auth-platform="bound">
               {tr('botDefaults.triggerUserAuthPlatformBound')}{' '}
               <a href={info.platformCredentialsUrl} target="_blank" rel="noreferrer">{info.platformCredentialsUrl}</a>

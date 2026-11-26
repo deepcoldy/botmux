@@ -7,6 +7,7 @@ import type { CodexReasoningEffort } from '../../services/codex-reasoning-effort
 import type { CodexServiceTier } from '../../services/codex-service-tier.js';
 import type { StreamingCardButtonId } from '../../im/lark/streaming-card-buttons.js';
 import type { TraexAutoModelConfig } from '../../services/traex-auto-model.js';
+import type { TriggerUserAuthCredentialSourceConfig } from '../../services/trigger-user-auth.js';
 import type { ScratchCapability } from '../../adapters/backend/scratch-capability.js';
 
 /** Bot 配置页的分类 tab。放在这个轻量模块里：⌘K 索引（入口包）要按它生成条目，页面本身很重。 */
@@ -163,7 +164,14 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
   { id: 'network-policy', tab: 'security', titleKey: 'botDefaults.networkPolicy', tile: 'sandbox' },
   { id: 'codex-auth', tab: 'security', titleKey: 'botDefaults.sectionCodexAuth', fieldKeys: ['botDefaults.codexAuthSyncLabel'] },
   { id: 'sandbox-paths', tab: 'security', titleKey: 'botDefaults.sectionSandboxPaths' },
-  { id: 'trigger-user-auth', tab: 'security', titleKey: 'botDefaults.sectionTriggerUserAuth', fieldKeys: ['botDefaults.triggerUserAuthToggle', 'botDefaults.triggerUserAuthDelegateOnMention', 'botDefaults.triggerUserAuthAllowSpeakerSwitch', 'botDefaults.triggerUserAuthGitCommitIdentity'] },
+  { id: 'trigger-user-auth', tab: 'security', titleKey: 'botDefaults.sectionTriggerUserAuth', fieldKeys: [
+    'botDefaults.triggerUserAuthToggle',
+    'botDefaults.triggerUserAuthSource',
+    'botDefaults.triggerUserAuthSourceDefault',
+    'botDefaults.triggerUserAuthDelegateOnMention',
+    'botDefaults.triggerUserAuthAllowSpeakerSwitch',
+    'botDefaults.triggerUserAuthGitCommitIdentity',
+  ] },
   { id: 'lark-tool-binding', tab: 'security', titleKey: 'botDefaults.sectionLarkToolBinding', fieldKeys: ['botDefaults.larkToolBindingToggle', 'botDefaults.larkUserOwnerFallbackToggle'] },
   { id: 'approval-compat', tab: 'security', titleKey: 'botDefaults.sectionApprovalCompat', fieldKeys: ['botDefaults.autoAvoidApprovalToggle'] },
   {
@@ -481,9 +489,8 @@ export type BotDefaultsRow = {
     capabilities?: Array<'lark-user' | 'bytecloud' | 'meego'>;
     /** The capabilities were derived from a legacy `tools` list, not chosen explicitly. */
     legacyCapabilities?: boolean;
-    /** Where the sender's credentials come from: central platform first
-     *  (`auto`, default), platform only, or this machine only. */
-    credentialSource?: 'auto' | 'platform' | 'local';
+    /** A shared mode or separate modes for Feishu and ByteCloud. */
+    credentialSource?: TriggerUserAuthCredentialSourceConfig;
     /** `--mention` handoffs to bots on this machine carry this turn's sender.
      *  Absent = on (the default); only `false` is stored. */
     delegateOnMention?: boolean;

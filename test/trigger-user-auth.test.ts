@@ -231,13 +231,33 @@ describe('credentialSource', () => {
   });
 
   it.each(['auto', 'platform', 'local'] as const)('accepts %s', (source) => {
-    expect(parseTriggerUserAuthConfig({ enabled: true, credentialSource: source })?.credentialSource).toBe(source);
+    const cfg = parseTriggerUserAuthConfig({ enabled: true, credentialSource: source });
+    expect(cfg?.credentialSource).toBe(source);
+    expect(credentialSourceOf(cfg, 'lark-user')).toBe(source);
+    expect(credentialSourceOf(cfg, 'bytecloud')).toBe(source);
   });
 
   it.each(['device', 'machine', 'owner', 1, true])('rejects %s', (bad) => {
     expect(() => parseTriggerUserAuthConfig({ enabled: true, credentialSource: bad }))
       .toThrow(/credentialSource must be one of auto \| platform \| local/);
   });
+
+  it('resolves capability override, configured default, and implicit auto', () => {
+    const mixed = parseTriggerUserAuthConfig({ enabled: true, credentialSource: { 'lark-user': 'local', bytecloud: 'platform' } });
+    expect(credentialSourceOf(mixed, 'lark-user')).toBe('local');
+    expect(credentialSourceOf(mixed, 'bytecloud')).toBe('platform');
+    expect(credentialSourceOf(mixed)).toBe('auto');
+    const defaulted = parseTriggerUserAuthConfig({ enabled: true, credentialSource: { default: 'platform', 'lark-user': 'auto' } });
+    expect(credentialSourceOf(defaulted, 'lark-user')).toBe('auto');
+    expect(credentialSourceOf(defaulted, 'bytecloud')).toBe('platform');
+    expect(credentialSourceOf(defaulted)).toBe('platform');
+    expect(credentialSourceOf(parseTriggerUserAuthConfig({ enabled: true, credentialSource: null }), 'bytecloud')).toBe('auto');
+  });
+
+  it.each([[{}], [[]], [{ meego: 'platform' }], [{ 'lark-cli': 'local' }], [{ bytecloud: 'owner' }], [{ default: null }]])(
+    'rejects an invalid per-capability source %j',
+    bad => expect(() => parseTriggerUserAuthConfig({ enabled: true, credentialSource: bad })).toThrow(/credentialSource/),
+  );
 });
 
 describe('delegateOnMention', () => {
