@@ -5510,6 +5510,27 @@ describe('handleCommand', () => {
       } finally { update.mockImplementation(() => {}); }
     });
 
+    it('interrupts without supervision when non-critical report metadata cannot be saved', async () => {
+      const ds = makeDaemonSession({
+        worker: { killed: false, send: vi.fn() } as any,
+        session: makeSession({ reportReplyInputId: 'om_previous' }),
+      });
+      const update = vi.mocked(sessionStore.updateSession);
+      update.mockImplementation(() => { throw new Error('injected admission write failure'); });
+      const deps = makeDeps(ds);
+      try {
+        await handleCommand('/stop', ROOT_ID, makeLarkMessage('/stop'), deps, LARK_APP_ID);
+        expect(sendWorkerSessionInput).toHaveBeenCalledWith(ds, { type: 'term_action', key: 'ctrlc' });
+        expect(deps.sessionReply).toHaveBeenCalledWith(
+          ROOT_ID,
+          expect.stringContaining(t('cmd.stop.sent')),
+          undefined,
+          LARK_APP_ID,
+          'msg_001',
+        );
+      } finally { update.mockImplementation(() => {}); }
+    });
+
     it('does not treat /stop without a session as a normal prompt', async () => {
       const deps = makeDeps();
 

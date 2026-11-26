@@ -656,7 +656,7 @@ import {
 import { loadFrozenCards, saveFrozenCards } from './services/frozen-card-store.js';
 import { resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, cancelQueuedForks, drainQueuedForks, isPendingForkTopic, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand } from './core/command-handler.js';
 import { classifySlash, isCommandDecision, parseSlashCommandInvocation, type CascadeItem, type SlashRouteDecision } from './core/command-router.js';
-import { collabGateAdmissionDecision, buildCollabRoutingEvent } from './core/collab-gate-admission.js';
+import { collabGateAdmissionDecision, buildCollabRoutingEvent, collabGroupSupervisionAllowed } from './core/collab-gate-admission.js';
 import { commandSpec } from './core/command-schema.js';
 import { groupCommandStartsTaskForRouting, isGroupCommandText, type GroupRoutingBotDefaults } from './services/group-creation-options.js';
 import { groupTaskSenderIsBot } from './core/group-task-start.js';
@@ -1178,7 +1178,7 @@ import {
   publishNativeTopicLinkPatch,
   publishSessionMessagePreviewPatch,
   publishClosedSessionPatch,
-  clearAgentAttention,
+  persistInboundAttentionBeforeCommand,
   markPassthroughActivity,
   stampHumanActivity,
 } from './core/session-activity.js';
@@ -7762,7 +7762,8 @@ function groupSupervisionSupported(ds: DaemonSession): boolean {
     && !ds.adoptedFrom && !ds.session.adoptedFrom && !isRemoteBackendSession(ds)
     && !isSessionTransferring(ds)
     && !ds.session.vcMeetingReceiver && !ds.session.workflowNode && !ds.session.principalLane
-    && !isSilentMessageListenerSession(ds.session) && !privateReplyEnabled(ds.session);
+    && !isSilentMessageListenerSession(ds.session) && !privateReplyEnabled(ds.session)
+    && collabGroupSupervisionAllowed(config.session.dataDir, ds.chatId, ds.larkAppId);
 }
 
 function groupSupervisionAuthorized(ds: DaemonSession, task: GroupSessionSupervision): boolean {
@@ -8039,6 +8040,7 @@ const commandDeps: CommandHandlerDeps = {
     }
     if (resume && existing) {
       const next = resumeGroupSessionSupervision({ ...existing, reviewer: { ...reviewer } }, turnId, Date.now());
+      if (!next) { await show('cmd.supervise.resume_needs_followup'); return; }
       replaceGroupSessionSupervision(ds.session, next, persist);
       runGroupSessionSupervision(ds);
       if (next.state === 'preparing') await show('cmd.supervise.preparing');
@@ -31786,19 +31788,7 @@ async function handleThreadReplyAdmitted(
   const clearAgentAttentionForHumanInbound = (): void => {
     if (isForeignBot || isBotSenderType || ctx.crossChatThreadFollowUp) return;
     const ds = activeSessions.get(runtimeSessionKey);
-    if (ds) {
-      if (ds.session.reportReplyInputId !== undefined && markReportReplyInput(ds.session, parsed.messageId)) {
-        try { sessionStore.updateSession(ds.session); }
-        catch (error) {
-          // Let the authorized stop handler retry the combined write and
-          // interrupt the CLI even if this earlier metadata write failed.
-          if (!ds.session.groupSessionSupervision || ctx.messageListener
-            || parseSlashCommandInvocation(cmdContent)?.cmd !== '/stop') throw error;
-          logger.warn(`[${tag(ds)}] could not save report reply input before /stop`);
-        }
-      }
-      clearAgentAttention(ds);
-    }
+    if (ds) persistInboundAttentionBeforeCommand(ds, parsed.messageId, parseSlashCommandInvocation(cmdContent)?.cmd === '/stop', !!ctx.messageListener);
   };
   // Any human-authored reply means the user has seen/touched the raised-hand
   // blocker. Do this before command, callback, workflow, and ask-custom early

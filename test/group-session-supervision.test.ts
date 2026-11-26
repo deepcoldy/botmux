@@ -4,7 +4,9 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { config } from '../src/config.js';
 import { classifySlash } from '../src/core/command-router.js';
+import { collabGroupSupervisionAllowed } from '../src/core/collab-gate-admission.js';
 import { beginFinalOutputDelivery } from '../src/core/final-output-delivery-drain.js';
+import { persistInboundAttentionBeforeCommand } from '../src/core/session-activity.js';
 import {
   chooseGroupSupervisionDecision,
   newGroupSessionSupervision,
@@ -26,6 +28,8 @@ import type { DaemonSession } from '../src/core/types.js';
 import { isForkSourceBusy } from '../src/core/worker-pool.js';
 import { invocationRequest } from '../src/services/constrained-invocation/contract.js';
 import { recordBridgeReplyMarker } from '../src/services/bridge-reply-marker.js';
+import { buildInitialCollabGate, writeCollabGate } from '../src/services/collab-gate-store.js';
+import { collabGateFilePath } from '../src/services/collab-group-config.js';
 import { recordSessionTurnReply, stageSessionTurnInbound } from '../src/services/session-turns.js';
 import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 import * as sessionStore from '../src/services/session-store.js';
@@ -307,10 +311,15 @@ describe('group session supervision', () => {
     await observeGroupSessionSupervision(saved, { ...observation, now: task.checkAt! - 1 }, io);
     expect(io.review).toHaveBeenCalledTimes(1);
     io.finalText.mockClear();
+    io.persist.mockClear();
     usePassingReview(io.review);
     await observeGroupSessionSupervision(saved, { ...observation, now: task.checkAt! }, io);
     await observeGroupSessionSupervision(saved, { ...observation, now: task.checkAt! }, io);
-    expect(io.finalText).not.toHaveBeenCalled();
+    // Re-read at observation and verdict commit without changing the cached evidence.
+    expect(io.finalText).toHaveBeenCalledTimes(4);
+    expect(saved.groupSessionSupervision).toMatchObject({
+      state: 'accepted', reviewEvidence: 'Test evidence', reviewEvidenceComplete: true,
+    });
     expect(saved.groupSessionSupervision?.state).toBe('accepted');
   });
 
@@ -327,6 +336,16 @@ describe('group session supervision', () => {
     replaceGroupSessionSupervision(session, resume, io.persist);
     expect(session.groupSessionSupervision).toMatchObject({
       state: 'watching', turnId: 'om_followup', originTurnId: task.turnId, criteria: task.criteria, reviewEpoch: 1,
+    });
+  });
+
+  it.each(['stopped', 'interrupted'] as const)('rejects same-turn resume after %s and requires a new human turn', reason => {
+    const { task } = fixture();
+    Object.assign(task, { state: 'needs_user', reason });
+    expect(resumeGroupSessionSupervision(task, task.turnId, 20)).toBeUndefined();
+    expect(task).toMatchObject({ state: 'needs_user', reason });
+    expect(resumeGroupSessionSupervision(task, 'om_followup', 20)).toMatchObject({
+      state: 'watching', turnId: 'om_followup', originTurnId: task.turnId, reviewEpoch: 1,
     });
   });
 
@@ -773,6 +792,115 @@ describe('group session supervision with the session store', () => {
     expect(io.review).not.toHaveBeenCalled();
     expect(io.dispatch).not.toHaveBeenCalled();
     expect(session.groupSessionSupervision).toMatchObject({ state: 'needs_user', reason: 'stopped' });
+  });
+
+  it('replaces corrected final evidence and restarts completion review', async () => {
+    const { task, session, io, outcome } = storedFixture();
+    const ds = { session, chatType: 'group' } as DaemonSession;
+    const first = 'Build passes';
+    const corrected = 'Build passes\nTAIL_FAILURE: deployment rolled back';
+    noteFinalReplyText(ds, task.turnId, first);
+    io.finalText.mockImplementation(() => turnSupervisionFinalReply(ds, task.turnId, dataDir));
+    const seen: { stage: string; answer: string }[] = [];
+    io.review.mockImplementation(async (_task, answer, _signal, stage) => {
+      seen.push({ stage, answer });
+      if (stage === 'completion') return { verdict: 'ready' };
+      return answer.includes('TAIL_FAILURE')
+        ? { verdict: 'needs_user', reason: 'Rollback found' }
+        : { verdict: 'accepted', evidence: ['Build passes'] };
+    });
+    await outcome();
+    expect(session.groupSessionSupervision?.state).toBe('pending_review');
+    noteFinalReplyText(ds, task.turnId, corrected);
+    await outcome(undefined, 'delivered', 11);
+    expect(session.groupSessionSupervision).toMatchObject({
+      state: 'watching', reviewEvidence: corrected, reviewEvidenceComplete: true,
+    });
+    expect(io.review).toHaveBeenCalledTimes(1);
+    await outcome(undefined, 'delivered', 12);
+    await outcome(undefined, 'delivered', 13);
+    expect(seen).toEqual([
+      { stage: 'completion', answer: first },
+      { stage: 'completion', answer: corrected },
+      { stage: 'acceptance', answer: corrected },
+    ]);
+    expect(session.groupSessionSupervision).toMatchObject({ state: 'needs_user', reason: 'needs_user' });
+    expect(sessionStore.getSessionFresh(session.sessionId)?.groupSessionSupervision?.reviewEvidence).toBe(corrected);
+  });
+
+  it('discards an acceptance verdict when the final reply changes mid-review', async () => {
+    const { task, session, io, outcome } = storedFixture();
+    const ds = { session, chatType: 'group' } as DaemonSession;
+    noteFinalReplyText(ds, task.turnId, 'Build passes');
+    io.finalText.mockImplementation(() => turnSupervisionFinalReply(ds, task.turnId, dataDir));
+    let resolveAcceptance!: (verdict: SupervisionAssessment) => void;
+    let acceptanceStarted!: () => void;
+    const started = new Promise<void>(resolve => { acceptanceStarted = resolve; });
+    io.review.mockImplementation(async (_task, _answer, _signal, stage) => {
+      if (stage === 'completion') return { verdict: 'ready' };
+      return new Promise<SupervisionAssessment>(resolve => {
+        resolveAcceptance = resolve;
+        acceptanceStarted();
+      });
+    });
+    await outcome();
+    const accepting = outcome(undefined, 'delivered', 11);
+    await started;
+    const corrected = 'Build passes\nTAIL_FAILURE: deployment rolled back';
+    noteFinalReplyText(ds, task.turnId, corrected);
+    resolveAcceptance({ verdict: 'accepted', evidence: ['Build passes'] });
+    await accepting;
+    expect(session.groupSessionSupervision).not.toMatchObject({ state: 'accepted' });
+    expect(session.groupSessionSupervision).toMatchObject({
+      state: 'watching', reviewEvidence: corrected, reviewEvidenceComplete: true,
+    });
+    expect(sessionStore.getSessionFresh(session.sessionId)?.groupSessionSupervision?.reviewEvidence).toBe(corrected);
+    expect(io.dispatch).not.toHaveBeenCalled();
+  });
+
+  it('lets only /stop continue after optional report metadata writes fail', () => {
+    const { session } = storedFixture();
+    session.reportReplyInputId = 'om_previous';
+    sessionStore.updateSession(session);
+    const plain = sessionStore.createSession('oc_plain', 'om_plain_root', 'Plain', 'group', 'thread');
+    plain.reportReplyInputId = 'om_plain_previous';
+    sessionStore.updateSession(plain);
+    sessionStore.__testOnly_setBeforeRowPersist(() => { throw new Error('injected admission SQLite outage'); });
+    try {
+      expect(() => persistInboundAttentionBeforeCommand({ session } as DaemonSession, 'om_stop', true, false)).not.toThrow();
+      expect(() => persistInboundAttentionBeforeCommand({ session: plain } as DaemonSession, 'om_plain_stop', true, false)).not.toThrow();
+      expect(() => persistInboundAttentionBeforeCommand({ session } as DaemonSession, 'om_status', false, false)).toThrow('injected admission SQLite outage');
+    } finally {
+      sessionStore.__testOnly_setBeforeRowPersist(undefined);
+    }
+  });
+
+  it('stops supervising when a collab gate makes this bot a participant', async () => {
+    const { session, io, outcome } = storedFixture();
+    const chatId = 'oc_collab';
+    const appId = 'cli_executor';
+    session.chatId = chatId;
+    session.groupSessionSupervision!.chatId = chatId;
+    io.allowed.mockImplementation(() => collabGroupSupervisionAllowed(dataDir, chatId, appId));
+    usePassingReview(io.review);
+    await outcome();
+    expect(session.groupSessionSupervision?.state).toBe('pending_review');
+    expect(collabGroupSupervisionAllowed(dataDir, 'oc_unrelated', appId)).toBe(true);
+
+    const gate = buildInitialCollabGate({
+      initId: 'i'.repeat(64), configVersion: 'cv', creatorAppId: 'cli_creator', chatId, participantAppIds: [appId],
+    });
+    gate.phase = 'done';
+    writeCollabGate(dataDir, gate);
+    expect(collabGroupSupervisionAllowed(dataDir, chatId, appId)).toBe(false);
+    expect(collabGroupSupervisionAllowed(dataDir, chatId, 'cli_other')).toBe(true);
+    await outcome(undefined, 'delivered', 11);
+    expect(io.review).toHaveBeenCalledTimes(1);
+    expect(io.dispatch).not.toHaveBeenCalled();
+    expect(session.groupSessionSupervision?.state).toBe('pending_review');
+
+    writeFileSync(collabGateFilePath(dataDir, chatId), '{not json');
+    expect(collabGroupSupervisionAllowed(dataDir, chatId, appId)).toBe(false);
   });
 
   it.each(['draining', 'committed'] as const)('preserves the watched turn if its result is %s at probe admission', async phase => {

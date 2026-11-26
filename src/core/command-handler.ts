@@ -3281,7 +3281,9 @@ export async function handleCommand(
           break;
         }
         const saveReportInput = () => {
-          if (markReportReplyInput(ds.session, message.messageId)) sessionStore.updateSession(ds.session);
+          try {
+            if (markReportReplyInput(ds.session, message.messageId)) sessionStore.updateSession(ds.session);
+          } catch { logger.warn(`[${logTag}] could not save non-critical stop report metadata`); }
         };
         if (isSessionTransferring(ds)) {
           saveReportInput();

@@ -134,7 +134,8 @@ export function stopGroupSessionSupervision(session: Session, persist: () => voi
   throw lastError;
 }
 
-export function resumeGroupSessionSupervision(task: GroupSessionSupervision, turnId: string, now: number): GroupSessionSupervision {
+export function resumeGroupSessionSupervision(task: GroupSessionSupervision, turnId: string, now: number): GroupSessionSupervision | undefined {
+  if (task.turnId === turnId && (task.reason === 'stopped' || task.reason === 'interrupted')) return undefined;
   return {
     ...task, turnId, state: task.criteria ? 'watching' : 'preparing', reason: undefined, observedAt: now, checkAt: undefined, waitBusySince: undefined,
     reviewEpoch: (task.reviewEpoch ?? 0) + 1, reviewAttempt: 0, round: 0, waitChecks: 0, notifiedKey: undefined,
@@ -167,6 +168,10 @@ export function groupSupervisionNotice(task: GroupSessionSupervision): 'accepted
   if ((task.state === 'preparing' || task.state === 'watching' || task.state === 'pending_review') && (task.reason === 'stalled'
     || (task.reason === 'review_unavailable' && (task.reviewAttempt ?? 0) >= 3))) return task.reason;
   return undefined;
+}
+
+function sameSupervisionReply(left: SupervisionFinalReply, right: SupervisionFinalReply): boolean {
+  return left.text === right.text && left.complete === right.complete;
 }
 
 /** Replay the same observation after daemon restart. Only committed rework
@@ -319,10 +324,23 @@ export async function observeGroupSessionSupervision(
 
     const cached = task.reviewEvidence !== undefined && task.reviewEvidenceComplete !== undefined
       ? { text: task.reviewEvidence, complete: task.reviewEvidenceComplete } : undefined;
-    const reply = outcome.outcome === 'delivered' ? cached ?? io.finalText(task.turnId) : undefined;
+    // A same-turn final correction must invalidate the previous verdict path.
+    const latest = outcome.outcome === 'delivered' ? io.finalText(task.turnId) : undefined;
+    const reply = latest ?? cached;
     const answer = reply?.text;
     if (!answer) {
       if (now - outcome.at >= MISSING_REPLY_GRACE_MS) await commit(() => nudgeOrPause(outcome.at + MISSING_REPLY_GRACE_MS));
+      return;
+    }
+    if (reply && cached && !sameSupervisionReply(cached, reply)) {
+      await commit(() => {
+        // Replace both atomically. Even an already pending acceptance goes back
+        // to completion; the replacement also aborts any in-flight review.
+        replaceGroupSessionSupervision(session, {
+          ...task, state: 'watching', reason: undefined, checkAt: undefined, reviewAttempt: 0,
+          reviewEvidence: reply.text, reviewEvidenceComplete: reply.complete,
+        }, io.persist);
+      });
       return;
     }
     if (reply && (task.reviewEvidence === undefined || task.reviewEvidenceComplete === undefined)) {
@@ -346,10 +364,21 @@ export async function observeGroupSessionSupervision(
       await commit(() => end('review_incomplete'));
       return;
     }
+    const reviewedEvidenceComplete = reviewedTask.reviewEvidenceComplete;
     const stage = reviewedTask.state === 'pending_review' ? 'acceptance' : 'completion';
     const result = await io.review(reviewedTask, answer, review.signal, stage).catch(() => undefined);
     if (review.signal.aborted) return;
     await commit(() => {
+      const latestAtCommit = outcome.outcome === 'delivered' ? io.finalText(task.turnId) : undefined;
+      if (latestAtCommit && (latestAtCommit.text !== answer || latestAtCommit.complete !== reviewedEvidenceComplete)) {
+        // The read→review→commit window is not atomic. Never commit a verdict
+        // against an obsolete final reply, even when it arrives mid-review.
+        replaceGroupSessionSupervision(session, {
+          ...task, state: 'watching', reason: undefined, checkAt: undefined, reviewAttempt: 0,
+          reviewEvidence: latestAtCommit.text, reviewEvidenceComplete: latestAtCommit.complete,
+        }, io.persist);
+        return;
+      }
       if (!result) {
         retryReview();
         return;
