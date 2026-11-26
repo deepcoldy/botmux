@@ -29,11 +29,16 @@ export interface TurnSendLedgerRecord extends TurnSendLedgerKey {
     stepCount: number;
     completedSteps: number;
     inFlightStep?: number;
+    /** Provider dispatch start of the first chunk, preserved across replay. */
+    sentAtMs?: number;
   };
   final?: {
     fingerprint: string;
     messageId: string;
     deliveredAtMs: number;
+    /** Original provider dispatch start, used to restore bridge-marker time
+     *  windows after replay. Older records fall back to deliveredAtMs. */
+    sentAtMs?: number;
     /** Absorbed mid-turn follow-up turn IDs that this final structurally
      *  settled, persisted atomically so crash recovery in the catch-up loop
      *  settles them instead of promoting them as fresh execution turns. */
@@ -176,7 +181,8 @@ export class TurnSendLedger {
       throw new Error('Invalid turn-send ledger record');
     }
     if (record.final && (!record.final.fingerprint || !record.final.messageId
-      || !Number.isFinite(record.final.deliveredAtMs))) {
+      || !Number.isFinite(record.final.deliveredAtMs)
+      || (record.final.sentAtMs !== undefined && !Number.isFinite(record.final.sentAtMs)))) {
       throw new Error('Invalid turn-send final record');
     }
     const sequence = record.nonIdempotentSequence;
@@ -189,6 +195,7 @@ export class TurnSendLedger {
       !sequence.fingerprint
       || !sequence.target
       || !Number.isSafeInteger(sequence.stepCount)
+      || (sequence.sentAtMs !== undefined && !Number.isFinite(sequence.sentAtMs))
       || sequence.stepCount <= 0
       || !Number.isSafeInteger(sequence.completedSteps)
       || sequence.completedSteps < 0
@@ -518,6 +525,7 @@ export class TurnSendLedger {
         record.publication ??= { fingerprint, providerUuid, startedAtMs: Date.now() };
         this.write(key, record);
       }
+      const sentAtMs = record.publication?.startedAtMs ?? Date.now();
       let messageId: string;
       try { messageId = await dispatch(providerUuid); }
       catch (error) {
@@ -538,6 +546,7 @@ export class TurnSendLedger {
           fingerprint: this.fingerprint(renderedContent),
           messageId,
           deliveredAtMs: Date.now(),
+          sentAtMs,
           ...(settledAbsorbedTurnIds && settledAbsorbedTurnIds.length > 0
             ? { settledAbsorbedTurnIds }
             : {}),
@@ -591,6 +600,7 @@ export class TurnSendLedger {
         target: messageId,
         stepCount,
         completedSteps: 0,
+        sentAtMs: Date.now(),
       };
       if (sequence.fingerprint !== fingerprint
         || sequence.target !== messageId
@@ -630,7 +640,7 @@ export class TurnSendLedger {
         this.write(key, record);
       }
 
-      record.final = { fingerprint, messageId, deliveredAtMs: Date.now() };
+      record.final = { fingerprint, messageId, deliveredAtMs: Date.now(), sentAtMs: sequence.sentAtMs };
       this.write(key, record);
       return { messageId, replayed: false };
     }, { maxWaitMs: 60_000 });

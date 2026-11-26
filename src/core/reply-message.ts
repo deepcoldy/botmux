@@ -99,6 +99,23 @@ export function buildAbsorbedTurnSettlementGate(
   };
 }
 
+/** Preserve completion guidance when a worker recovered a final-marker crash
+ *  window and conservatively promoted a snapshotted absorbed turn before the
+ *  original sender resumed. The fresh marker must prove that exact promotion;
+ *  an unrelated active turn never inherits the steer instruction. */
+export function resolvePromotedAbsorbedTurnForCompletion(
+  advance: { advanced: boolean; turnId?: string },
+  preSendAbsorbedTurnIds: ReadonlySet<string>,
+  freshMarker: Pick<AncestorSessionContext, 'turnId' | 'steerPromotedTurn'> | null | undefined,
+): string | undefined {
+  if (advance.advanced) return advance.turnId;
+  const turnId = advance.turnId;
+  if (!turnId || !preSendAbsorbedTurnIds.has(turnId)) return undefined;
+  return freshMarker?.turnId === turnId && freshMarker.steerPromotedTurn === true
+    ? turnId
+    : undefined;
+}
+
 export interface InboundMessageLocation {
   messageId?: string;
   rootMessageId?: string;

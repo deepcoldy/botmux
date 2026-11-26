@@ -168,6 +168,7 @@ import { publishCliSessionIdToDaemon } from './core/cli-session-id-publisher.js'
 import { ActiveTurnAuthority, type TurnAuthorityIdentity } from './core/active-turn-authority.js';
 import { isValidMarkerIdentityTurnId } from './core/turn-id-shape.js';
 import {
+  advanceAncestorSessionTurn,
   markerBelongsToLiveProcess,
   parseAbsorbedHostBinding,
   parseSettledAbsorbedTurns,
@@ -5891,6 +5892,10 @@ class SubmissionWriteError extends Error {
     /** The catalog changed before any byte was written; requeue and rotate
      * instead of classifying this proven pre-write refusal as ambiguous. */
     readonly traexCatalogAdmissionRequired = false,
+    /** A final-driven queue transition did not complete. The input never
+     *  reached the CLI; restore the exact head and retry after the sender's
+     *  cross-process transition has had another chance to finish. */
+    readonly retainPendingInput = false,
   ) {
     super(message);
     this.name = 'SubmissionWriteError';
@@ -7266,6 +7271,11 @@ function setCaptureIdentity(
   forceAnnouncement = false,
 ): void {
   const changed = turnId !== currentBotmuxTurnId || dispatchAttempt !== currentBotmuxDispatchAttempt;
+  if (changed) {
+    currentPromotedFromTurnId = currentBotmuxTurnId;
+    currentPromotedFromDispatchAttempt = currentBotmuxDispatchAttempt;
+    currentPromotedAbsorbedTurn = false;
+  }
   if (changed && lastInitConfig?.cliId === 'minimax') minimaxFinalReceiver.reset();
   currentBotmuxTurnId = turnId;
   currentBotmuxDispatchAttempt = dispatchAttempt;
@@ -7288,6 +7298,9 @@ function setCaptureIdentity(
 }
 let currentVcMeetingImTurnOrigin: VcMeetingImTurnOrigin | undefined;
 let currentTurnSteerPromoted = false;
+let currentPromotedAbsorbedTurn = false;
+let currentPromotedFromTurnId: string | undefined;
+let currentPromotedFromDispatchAttempt: number | undefined;
 interface AntigravityReconcileHint {
   textSha256: string;
   sampledTranscriptPath?: string;
@@ -7323,11 +7336,9 @@ function rememberSettledAbsorbedTurn(entry: SettledAbsorbedTurn): void {
   const key = settledAbsorbedKey(entry.turnId, entry.dispatchAttempt);
   settledAbsorbedTurnsByKey.delete(key);
   settledAbsorbedTurnsByKey.set(key, entry);
-  while (settledAbsorbedTurnsByKey.size > 64) {
-    const oldest = settledAbsorbedTurnsByKey.keys().next().value;
-    if (oldest === undefined) break;
-    settledAbsorbedTurnsByKey.delete(oldest);
-  }
+  // Never evict a live tombstone: the next marker write would resurrect its
+  // absorbed queue entry. emitTurnTerminal/retireTerminatedQueuedTurn remove
+  // entries when their exact turn closes, which is the safe lifecycle bound.
 }
 function syncSettledAbsorbedTurnsFromParsed(parsed: unknown): void {
   if (typeof parseSettledAbsorbedTurns !== 'function') return;
@@ -9241,6 +9252,16 @@ function writeCliPidMarker(): void {
                 mergeMarkerQueuedTurnIntoMemory(qt);
               }
             }
+            if (parsed && parsed.turnId === currentBotmuxTurnId
+              && parsed.promotedAbsorbedTurn === true
+              && typeof parsed.promotedFromTurnId === 'string'
+              && isValidMarkerIdentityTurnId(parsed.promotedFromTurnId)) {
+              currentPromotedAbsorbedTurn = true;
+              currentPromotedFromTurnId = parsed.promotedFromTurnId;
+              currentPromotedFromDispatchAttempt = typeof parsed.promotedFromDispatchAttempt === 'number'
+                ? parsed.promotedFromDispatchAttempt
+                : undefined;
+            }
           } catch {
             // best-effort
           }
@@ -9315,6 +9336,12 @@ function writeCliPidMarker(): void {
           ...(currentHostSettled.length > 0 ? { settledAbsorbedTurns: currentHostSettled } : {}),
           ...(procStart ? { procStart } : {}),
           ...(currentTurnSteerPromoted ? { steerPromotedTurn: true } : {}),
+          ...(currentTurnSteerPromoted && currentPromotedAbsorbedTurn && currentPromotedFromTurnId ? {
+            promotedAbsorbedTurn: true as const,
+            promotedFromTurnId: currentPromotedFromTurnId,
+            ...(currentPromotedFromDispatchAttempt !== undefined
+              ? { promotedFromDispatchAttempt: currentPromotedFromDispatchAttempt } : {}),
+          } : {}),
           ...(markerTurnNonResurrectable ? { backgroundHeld: true as const } : {}),
           ...(sandboxRelayCapability && sandboxRelayCapability.turnId === currentBotmuxTurnId
             && sandboxRelayCapability.dispatchAttempt === currentBotmuxDispatchAttempt
@@ -9513,8 +9540,7 @@ function advanceQueuedTypeAheadTurn(reason: string): boolean {
       && head.absorbedIntoDispatchAttempt === currentBotmuxDispatchAttempt;
     const absorbedIntoFinishedHost = absorbedIntoCurrentHost
       && !!currentBotmuxTurnId
-      && (turnTerminalEmitted(currentBotmuxTurnId, currentBotmuxDispatchAttempt)
-        || (reason === 'final_delivered' && head.dispatchAttempt === undefined));
+      && turnTerminalEmitted(currentBotmuxTurnId, currentBotmuxDispatchAttempt);
     if (alreadySettled || absorbedIntoFinishedHost) {
       if (absorbedIntoFinishedHost && typeof rememberSettledAbsorbedTurn === 'function' && currentBotmuxTurnId) {
         rememberSettledAbsorbedTurn({
@@ -9550,11 +9576,15 @@ function advanceQueuedTypeAheadTurn(reason: string): boolean {
   }
   const next = queuedTypeAheadTurns.shift()!;
   const prevTurnId = currentBotmuxTurnId;
+  const prevDispatchAttempt = currentBotmuxDispatchAttempt;
   markTurnRetired(prevTurnId);
   setCaptureIdentity(next.turnId, next.dispatchAttempt, next.turnCallerOpenId);
   currentBotmuxLinkRefMode = next.linkRefMode;
   currentVcMeetingImTurnOrigin = next.vcMeetingImTurnOrigin;
   currentTurnSteerPromoted = true;
+  currentPromotedAbsorbedTurn = next.inputConsumed === true
+    && next.absorbedIntoTurnId === prevTurnId
+    && next.absorbedIntoDispatchAttempt === prevDispatchAttempt;
   rememberQueuedTurnAdvanceForPendingReady(prevTurnId);
   markActiveTurnStarted(next);
   writeCliPidMarker();
@@ -9562,6 +9592,64 @@ function advanceQueuedTypeAheadTurn(reason: string): boolean {
   cancelAntigravityFoldedReconcilePending();
   log(`Advanced active turn (${reason}): ${prevTurnId?.slice(0, 12)} -> ${currentBotmuxTurnId?.slice(0, 12)} (remaining queued: ${queuedTypeAheadTurns.length})`);
   return true;
+}
+
+type FinalDeliverySettlementAuthorization =
+  | { kind: 'ledger'; turnIds: ReadonlySet<string> }
+  | { kind: 'legacy' }
+  | { kind: 'unknown' };
+
+/** Distinguish an immutable final decision from a legacy marker and from an
+ * actually unreadable/incomplete ledger. Unknown state authorizes neither a
+ * settlement nor a promotion: the incoming write must retain its queue head. */
+function finalDeliverySettlementAuthorization(hostTurnId: string): FinalDeliverySettlementAuthorization {
+  const dataDir = process.env.SESSION_DATA_DIR;
+  const larkAppId = lastInitConfig?.larkAppId;
+  if (!dataDir || !sessionId || !larkAppId) return { kind: 'unknown' };
+  try {
+    const record = new TurnSendLedger(dataDir).read({
+      larkAppId, sessionId, turnId: hostTurnId,
+      ...(currentBotmuxDispatchAttempt !== undefined ? { dispatchAttempt: currentBotmuxDispatchAttempt } : {}),
+    });
+    if (!record) return { kind: 'legacy' };
+    if (record.dispatchAttempt !== currentBotmuxDispatchAttempt || !record.final) return { kind: 'unknown' };
+    return { kind: 'ledger', turnIds: new Set(record.final.settledAbsorbedTurnIds ?? []) };
+  } catch (error: any) {
+    log(`Could not read absorbed-turn settlement authorization: ${error?.message ?? error}`);
+    return { kind: 'unknown' };
+  }
+}
+
+/** A bridge final marker is published inside advanceAncestorSessionTurn's PID
+ * marker lock. Seeing it here means the sender either completed that transition
+ * or died trying; both are resolved through the same core transition, with the
+ * immutable TurnSendLedger final as the only settlement authorization. */
+function advanceQueuedTypeAheadTurnAfterFinal(): void {
+  const hostTurnId = currentBotmuxTurnId;
+  const markerPath = cliPidMarker;
+  const dataDir = process.env.SESSION_DATA_DIR;
+  const markerPid = Number(basename(markerPath ?? ''));
+  if (!hostTurnId || !markerPath || !dataDir || !Number.isSafeInteger(markerPid) || markerPid <= 0) return;
+  const authorization = finalDeliverySettlementAuthorization(hostTurnId);
+  if (authorization.kind === 'unknown') return;
+  // A crashed sender may have removed the PID file after committing its ledger.
+  // Rebuild only from this worker's still-live in-memory queue, then let the
+  // normal locked transition settle or promote according to the final decision.
+  if (!existsSync(markerPath)) writeCliPidMarker();
+  if (!existsSync(markerPath)) return;
+  const authorized = authorization.kind === 'ledger' ? authorization.turnIds : new Set<string>();
+  try {
+    advanceAncestorSessionTurn(dataDir, markerPid, hostTurnId, {
+      consumedDispatchAttempt: currentBotmuxDispatchAttempt,
+      canSettleAbsorbed: turn => authorized.has(turn.turnId),
+    });
+  } catch (error: any) {
+    // Do not use the generic queue advance as a fallback: its terminal-fold
+    // cleanup is valid for other reasons, but cannot distinguish these three
+    // authorization states. prepareNormalWrite's invariant retains the input.
+    log(`Final-driven queue transition failed closed: ${error?.message ?? error}`);
+  }
+  syncQueuedTurnsFromMarkerDisk();
 }
 
 interface AntigravityFoldedReconcileResult {
@@ -30079,10 +30167,23 @@ async function flushPending(): Promise<void> {
             && readSendMarkers().some(m => m.turnId === currentBotmuxTurnId && m.responseKind === 'final')
         );
         if (currentTurnFinalDelivered && queuedTypeAheadTurns.length > 0) {
-          advanceQueuedTypeAheadTurn('final_delivered');
+          advanceQueuedTypeAheadTurnAfterFinal();
           currentTurnFinalDelivered = Boolean(
             currentBotmuxTurnId
               && readSendMarkers().some(m => m.turnId === currentBotmuxTurnId && m.responseKind === 'final')
+          );
+        }
+
+        if (currentTurnFinalDelivered && queuedTypeAheadTurns.some(q =>
+          q.inputConsumed === true
+          && q.absorbedIntoTurnId === currentBotmuxTurnId
+          && q.absorbedIntoDispatchAttempt === currentBotmuxDispatchAttempt)) {
+          // Never rotate an incoming item over an absorbed turn whose final
+          // settlement is unresolved. In particular, the markNewTurn branch
+          // below must not become an independent final-delivered bypass.
+          throw new SubmissionWriteError(
+            'Absorbed-turn final transition is still unresolved',
+            undefined, false, false, false, true,
           );
         }
 
@@ -30186,14 +30287,16 @@ async function flushPending(): Promise<void> {
           const prevActiveDispatchAttempt = currentBotmuxDispatchAttempt;
           if (prevActiveTurnId && prevActiveTurnId !== item.turnId) {
             markTurnRetired(prevActiveTurnId);
-            // Any queued entry already absorbed into the retiring host turn
-            // belongs to that host, never to the incoming turn `item.turnId`.
-            // Drop them here so they cannot hijack `selectReplyMessageId` or
-            // trigger a spurious steer-advance after `item.turnId`'s final.
+            // A final alone is NOT proof that this entry may be retired here:
+            // advanceQueuedTypeAheadTurnAfterFinal above has already applied the
+            // sender's destination-gated decision. This inline cleanup is only
+            // for terminal-fold cleanup or a settlement already synced from disk.
             const absorbedIntoPrev = queuedTypeAheadTurns.filter(q =>
               q.inputConsumed === true
               && q.absorbedIntoTurnId === prevActiveTurnId
-              && q.absorbedIntoDispatchAttempt === prevActiveDispatchAttempt);
+              && q.absorbedIntoDispatchAttempt === prevActiveDispatchAttempt
+              && (turnTerminalEmitted(prevActiveTurnId, prevActiveDispatchAttempt)
+                || settledAbsorbedTurnsByKey.has(settledAbsorbedKey(q.turnId, q.dispatchAttempt))));
             for (const absorbed of absorbedIntoPrev) {
               if (typeof rememberSettledAbsorbedTurn === 'function') {
                 rememberSettledAbsorbedTurn({
@@ -30650,6 +30753,16 @@ async function flushPending(): Promise<void> {
           requeueUnsubmittedQueuedActivation(item);
           keepPromptReadyAfterHold();
           log('Retained definitely-unwritten input behind the dirty Web terminal wire');
+          break;
+        }
+        if (err instanceof SubmissionWriteError && err.retainPendingInput && writeContinuationIsCurrent()) {
+          pendingMessages.unshift(item);
+          requeueUnsubmittedQueuedActivation(item);
+          keepPromptReadyAfterHold();
+          const retry = setTimeout(() => {
+            if (writeContinuationIsCurrent() && pendingMessages[0] === item) void flushPending();
+          }, 100);
+          retry.unref?.();
           break;
         }
         if (err instanceof SubmissionWriteError && err.traexCatalogAdmissionRequired) {

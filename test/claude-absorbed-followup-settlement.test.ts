@@ -1,10 +1,10 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, join } from 'node:path';
+import { basename, delimiter, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ActiveTurnAuthority } from '../src/core/active-turn-authority.js';
-import { buildAbsorbedTurnSettlementGate, selectReplyMessageId } from '../src/core/reply-message.js';
+import { buildAbsorbedTurnSettlementGate, resolvePromotedAbsorbedTurnForCompletion, selectReplyMessageId } from '../src/core/reply-message.js';
 import { beginReplyTargetTurn } from '../src/core/reply-target.js';
 import {
   advanceAncestorSessionTurn,
@@ -19,6 +19,8 @@ import {
 import { isValidMarkerIdentityTurnId } from '../src/core/turn-id-shape.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from '../src/services/bridge-turn-queue.js';
+import { recordBridgeReplyMarker } from '../src/services/bridge-reply-marker.js';
+import { sendCompletionHintKey } from '../src/services/send-completion-hint.js';
 import { TurnReplyCardStore } from '../src/services/turn-reply-card.js';
 import { TurnSendLedger } from '../src/services/turn-send-ledger.js';
 import { TurnTerminalDeduper } from '../src/services/turn-terminal-deduper.js';
@@ -31,6 +33,8 @@ import { spawnSyncTsScript } from './helpers/ts-runner.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
 const fixture = fileURLToPath(new URL('./fixtures/send-reply-card-capture.ts', import.meta.url));
+const replayWinnerCrashFixture = fileURLToPath(new URL('./fixtures/send-replay-winner-crash.ts', import.meta.url));
+const voiceDocFixture = fileURLToPath(new URL('./fixtures/send-voice-doc-capture.ts', import.meta.url));
 const repo = fileURLToPath(new URL('..', import.meta.url));
 const roots: string[] = [];
 
@@ -59,7 +63,7 @@ function createWorkerHarness(dataDir: string, initialQueue: Array<Record<string,
     cliPidMarker: markerPath,
     rpcEnginePidMarker: null,
     cliAdapter: { claudeDataDir: '/home/u/.claude' },
-    lastInitConfig: { cliId: 'claude-code', cliSessionId: 'native-sid-1234', adoptMode: false },
+    lastInitConfig: { cliId: 'claude-code', cliSessionId: 'native-sid-1234', adoptMode: false, larkAppId: 'cli_test' },
     currentBotmuxTurnId: 'om_A',
     currentBotmuxDispatchAttempt: undefined,
     currentBotmuxCallerOpenId: undefined,
@@ -103,6 +107,8 @@ function createWorkerHarness(dataDir: string, initialQueue: Array<Record<string,
     'restoreQueuedTurnsFromMarkerDisk',
     'syncQueuedTurnsFromMarkerDisk',
     'advanceQueuedTypeAheadTurn',
+    'bridgeMarkerPath',
+    'readSendMarkers',
     'markReplyInputConsumed',
     'scheduleConsumedQueuedTurnAdvance',
     'acknowledgeNativeInputConsumed',
@@ -119,6 +125,64 @@ function createWorkerHarness(dataDir: string, initialQueue: Array<Record<string,
   };
 }
 
+/** Execute the real closure immediately before a new Claude input is written.
+ * Unrelated PTY/execution-clock effects are inert; queue, ledger and marker I/O
+ * remain the production implementations. */
+function prepareIncomingNormalWrite(
+  h: ReturnType<typeof createWorkerHarness>,
+  dataDir: string,
+  item = { turnId: 'om_C', content: 'new message C', dispatchAttempt: undefined },
+  beforePrepare?: () => void,
+): void {
+  Object.assign(h.scope, {
+    normalWritePrepared: false,
+    webWireWriteRefused: false,
+    webTerminalInputWireDirty: () => false,
+    item,
+    claudeBridgeActive: true,
+    bridgeIngest: () => {},
+    crossPrincipalIsolationOn: () => false,
+    promptReadyAtFlushStart: false,
+    itemsWrittenInThisFlush: 0,
+    cliSubmissionInFlight: { item, composerOwned: false },
+    typedIntoComposer: true,
+    renderer: { markNewTurn: () => {} },
+    traexAutoModelRuntimeEligible: () => false,
+    rememberSubmittedTurnText: () => undefined,
+    durableWrite: false,
+    writeBackend: {},
+    writeRpcEngine: undefined,
+    writeAdapter: h.scope.cliAdapter,
+    effectiveBackendType: 'pty',
+    stuckDetector: undefined,
+    noteCliInputWritten: () => {},
+    msg: item.content,
+    logicalMsg: item.content,
+    turnSeq: 0,
+    bridgeTurnId: undefined,
+    cliGenerationTurnWrites: 0,
+    cliSpawnGeneration: 1,
+    webTerminalInputGeneration: 0,
+    cliInterruptGeneration: 0,
+    inputDeliveryEvidence: { start: () => {} },
+    codexBridgeActive: false,
+    bridgeMarkPendingTurn: () => 'bridge_C',
+    bridgeQueue: { holdForWrite: () => {} },
+    markTurnExecutionStart: () => {},
+    submissionPreparationFailed: false,
+  });
+  h.scope.inflightInputs.onWrite = () => {};
+  h.scope.adoptActiveTurnWhenIsolationOff = loadWorkerFunction('adoptActiveTurnWhenIsolationOff', h.scope);
+  h.scope.prepareNormalWrite = loadWorkerFunction('prepareNormalWrite', h.scope);
+  const priorDataDir = process.env.SESSION_DATA_DIR;
+  process.env.SESSION_DATA_DIR = dataDir;
+  beforePrepare?.();
+  try { h.scope.prepareNormalWrite(); } finally {
+    if (priorDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+    else process.env.SESSION_DATA_DIR = priorDataDir;
+  }
+}
+
 function setupSendFixture(opts: {
   cliId?: string;
   scope?: 'thread' | 'chat';
@@ -126,6 +190,7 @@ function setupSendFixture(opts: {
   extraMarkerFields?: Record<string, unknown>;
   turns?: Array<{ id: string; root?: string; sender: string; crossChat?: boolean }>;
   replyDelivery?: 'send' | 'transcript';
+  replyCardMode?: 'legacy' | 'unified';
   crossPrincipalInterruption?: boolean;
 } = {}) {
   const home = makeTempDir('claude-absorbed-send-');
@@ -153,7 +218,7 @@ function setupSendFixture(opts: {
     larkAppId: 'cli_test',
     larkAppSecret: 'test',
     cliId: opts.cliId ?? 'claude-code',
-    replyCardMode: 'legacy',
+    replyCardMode: opts.replyCardMode ?? 'legacy',
     ...(opts.crossPrincipalInterruption ? { crossPrincipalInterruption: true } : {}),
   }]));
   const ds = {
@@ -189,10 +254,10 @@ function setupSendFixture(opts: {
     data,
     markerPath,
     marker: () => JSON.parse(readFileSync(markerPath, 'utf8')),
-    run: (args: string[] = [], text = 'answer A and B') => {
+    run: (args: string[] = [], text = 'answer A and B', script = fixture) => {
       const hasMentionArg = args.some(a => a === '--mention-back' || a === '--no-mention' || a === '--mention' || a.startsWith('--mention='));
       const finalArgs = hasMentionArg ? args : ['--mention-back', ...args];
-      const result = spawnSyncTsScript(fixture, ['send', ...finalArgs, text], {
+      const result = spawnSyncTsScript(script, ['send', ...finalArgs, text], {
         cwd: repo,
         encoding: 'utf8',
         timeout: 30000,
@@ -281,6 +346,38 @@ describe('advanceAncestorSessionTurn structural settlement', () => {
     expect(onDisk.queuedTurnId).toBeUndefined();
     expect(onDisk.queuedTurns).toBeUndefined();
     expect(onDisk.settledAbsorbedTurns).toEqual([{ turnId: 'om_B', hostTurnId: 'om_A' }]);
+  });
+
+  it('publishes the final marker before the locked queue decision, even if the PID file vanished', () => {
+    const dir = makeTempDir('advance-absorbed-final-callback-');
+    const markerDir = join(dir, '.botmux-cli-pids');
+    mkdirSync(markerDir, { recursive: true });
+    const markerPath = join(markerDir, String(process.pid));
+    writeFileSync(markerPath, JSON.stringify({
+      sessionId: 'sid', turnId: 'om_A',
+      queuedTurns: [{ turnId: 'om_B', inputConsumed: true, absorbedIntoTurnId: 'om_A' }],
+    }));
+    let markerVisibleBeforeTransition = false;
+    const result = advanceAncestorSessionTurn(dir, process.pid, 'om_A', {
+      canSettleAbsorbed: allowAll,
+      beforeTransition: () => {
+        recordBridgeReplyMarker({
+          dataDir: dir, sessionId: 'sid', sentAtMs: Date.now(), messageId: 'om_final',
+          deliveryKind: 'current_session_send', content: 'done', responseKind: 'final', turnId: 'om_A',
+        });
+        markerVisibleBeforeTransition = readFileSync(join(dir, 'turn-sends', 'sid.jsonl'), 'utf8').includes('om_final');
+      },
+    });
+    expect(markerVisibleBeforeTransition).toBe(true);
+    expect(result.settledAbsorbedTurnIds).toEqual(['om_B']);
+
+    // The delivery journal is still required when the queue no longer exists.
+    unlinkSync(markerPath);
+    let orphanCallbackCalls = 0;
+    expect(advanceAncestorSessionTurn(dir, process.pid, 'om_A', {
+      beforeTransition: () => { orphanCallbackCalls++; },
+    })).toEqual({ advanced: false });
+    expect(orphanCallbackCalls).toBe(1);
   });
 
   it('settles multiple consecutive absorbed turns [B1, B2] together when no unabsorbed turn follows', () => {
@@ -651,7 +748,7 @@ describe('Claude transcript -> BridgeTurnQueue -> worker marker -> botmux send e
     expect(r2b.writes[0].body.reply_in_thread).not.toBe(true);
     expect(r2b.writes[0].body.content).toContain('ou_second');
     expect(r2b.writes[0].body.content).not.toContain('ou_first');
-  });
+  }, 30_000);
 
   it('④b Claude standalone queued turn (handleTurnStart) never sets absorbedIntoTurnId and still advances', () => {
     const dataDir = makeTempDir('claude-standalone-');
@@ -805,31 +902,107 @@ describe('worker <-> PID marker synchronization & lifecycle invariants', () => {
     expect(h.scope.send).toHaveBeenCalledWith({ type: 'type_ahead_turn_dropped', turnId: 'om_B' });
   });
 
-  it('advanceQueuedTypeAheadTurn(final_delivered) skips absorbed B instead of promoting it ahead of incoming C/D', () => {
-    const dataDir = makeTempDir('worker-final-delivered-absorbed-');
-    const h = createWorkerHarness(dataDir, [
-      { turnId: 'om_B', inputConsumed: true, absorbedIntoTurnId: 'om_A' },
-    ]);
+  it('distinguishes authorized, rejected, unknown and legacy final state across lock failures', async () => {
+    const cases: Array<{
+      mode: string;
+      authorization: string[];
+      lock: boolean;
+      terminal: boolean;
+      corrupt?: boolean;
+      legacy?: boolean;
+      expected: 'settled' | 'retained' | 'promoted';
+    }> = [
+      { mode: 'authorized-control', authorization: ['om_B'], lock: false, terminal: false, expected: 'settled' },
+      { mode: 'authorized-lock-timeout', authorization: ['om_B'], lock: true, terminal: false, expected: 'retained' },
+      { mode: 'rejected-lock-timeout-terminal', authorization: [], lock: true, terminal: true, expected: 'retained' },
+      { mode: 'unreadable-ledger', authorization: ['om_B'], corrupt: true, lock: false, terminal: false, expected: 'retained' },
+      { mode: 'legacy-no-ledger', authorization: [], legacy: true, lock: false, terminal: false, expected: 'promoted' },
+    ];
+    for (const tc of cases) {
+      const dataDir = makeTempDir(`worker-final-${tc.mode}-`);
+      const h = createWorkerHarness(dataDir, [
+        { turnId: 'om_B', inputConsumed: true, absorbedIntoTurnId: 'om_A' },
+      ]);
+      h.scope.advanceQueuedTypeAheadTurnAfterFinal = loadWorkerFunction('advanceQueuedTypeAheadTurnAfterFinal', h.scope);
+      const key = { larkAppId: 'cli_test', sessionId: 'sid', turnId: 'om_A' };
+      const ledger = new TurnSendLedger(dataDir);
+      if (!tc.legacy) {
+        await ledger.execute(key, 'final', 'Answer A', async () => 'om_A_final', {
+          resolveSettledAbsorbedTurnIds: () => [...tc.authorization],
+        });
+        if (tc.corrupt) writeFileSync(ledger.recordPath(key), '{not-json');
+      }
+      recordBridgeReplyMarker({
+        dataDir, sessionId: 'sid', sentAtMs: Date.now(), messageId: 'om_A_final',
+        deliveryKind: 'current_session_send', content: 'Answer A', responseKind: 'final', turnId: 'om_A',
+      });
+      if (tc.terminal) h.scope.emittedTurnTerminals.claim('sid', 'om_A', undefined, 'completed');
+      const previous = process.env.SESSION_DATA_DIR;
+      process.env.SESSION_DATA_DIR = dataDir;
+      try {
+        if (tc.lock) {
+          withFileLockSync(h.markerPath, () => {
+            const realNow = Date.now;
+            let ticks = 0;
+            Date.now = () => realNow() + (++ticks * 6_000);
+            try { h.scope.advanceQueuedTypeAheadTurnAfterFinal(); }
+            finally { Date.now = realNow; }
+          });
+        } else {
+          h.scope.advanceQueuedTypeAheadTurnAfterFinal();
+        }
+        h.scope.writeCliPidMarker();
+      } finally {
+        if (previous === undefined) delete process.env.SESSION_DATA_DIR;
+        else process.env.SESSION_DATA_DIR = previous;
+      }
+      if (tc.expected === 'settled') {
+        expect(h.scope.currentBotmuxTurnId, tc.mode).toBe('om_A');
+        expect(h.scope.queuedTypeAheadTurns, tc.mode).toEqual([]);
+        expect(h.readMarker().settledAbsorbedTurns, tc.mode).toEqual([{ turnId: 'om_B', hostTurnId: 'om_A' }]);
+      } else if (tc.expected === 'retained') {
+        expect(h.scope.currentBotmuxTurnId, tc.mode).toBe('om_A');
+        expect(h.scope.queuedTypeAheadTurns.map((turn: { turnId: string }) => turn.turnId), tc.mode).toEqual(['om_B']);
+        expect(h.readMarker().turnId, tc.mode).toBe('om_A');
+        expect(h.readMarker().settledAbsorbedTurns, tc.mode).toBeUndefined();
+        expect(h.readMarker().queuedTurns, tc.mode).toEqual([
+          { turnId: 'om_B', inputConsumed: true, absorbedIntoTurnId: 'om_A' },
+        ]);
+      } else {
+        expect(h.scope.currentBotmuxTurnId, tc.mode).toBe('om_B');
+        expect(h.scope.queuedTypeAheadTurns, tc.mode).toEqual([]);
+        expect(h.readMarker().turnId, tc.mode).toBe('om_B');
+        expect(h.readMarker().settledAbsorbedTurns, tc.mode).toBeUndefined();
+      }
+    }
+  });
+
+  it('keeps every live settled turn across the historical 32-entry boundary until worker synchronization', () => {
+    const dataDir = makeTempDir('worker-settled-over-32-');
+    const queue = Array.from({ length: 33 }, (_, index) => ({
+      turnId: `om_B${index + 1}`, inputConsumed: true as const, absorbedIntoTurnId: 'om_A',
+    }));
+    const h = createWorkerHarness(dataDir, queue);
     h.scope.writeCliPidMarker();
 
-    expect(h.scope.advanceQueuedTypeAheadTurn('final_delivered')).toBe(false);
-    expect(h.scope.currentBotmuxTurnId).toBe('om_A');
-    expect(h.scope.queuedTypeAheadTurns).toEqual([]);
-    expect(h.readMarker().turnId).toBe('om_A');
-    expect(h.readMarker().queuedTurns).toBeUndefined();
-    expect(h.readMarker().settledAbsorbedTurns).toEqual([{ turnId: 'om_B', hostTurnId: 'om_A' }]);
+    const adv = advanceAncestorSessionTurn(dataDir, process.pid, 'om_A', { canSettleAbsorbed: () => true });
+    expect(adv.advanced).toBe(false);
+    expect(adv.settledAbsorbedTurnIds).toHaveLength(33);
+    expect(h.readMarker().settledAbsorbedTurns).toHaveLength(33);
 
-    // Mixed [B(absorbedInto: A), C(unconsumed)]: skips B and advances directly to C.
-    const dataDir2 = makeTempDir('worker-final-delivered-mixed-');
-    const h2 = createWorkerHarness(dataDir2, [
-      { turnId: 'om_B', inputConsumed: true, absorbedIntoTurnId: 'om_A' },
-      { turnId: 'om_C' },
-    ]);
-    h2.scope.writeCliPidMarker();
-    expect(h2.scope.advanceQueuedTypeAheadTurn('final_delivered')).toBe(true);
-    expect(h2.scope.currentBotmuxTurnId).toBe('om_C');
-    expect(h2.scope.queuedTypeAheadTurns).toEqual([]);
-    expect(h2.readMarker().turnId).toBe('om_C');
+    // No entry may reappear merely because an in-memory cap or persisted-history
+    // cap was smaller than the live absorbed batch.
+    h.scope.writeCliPidMarker();
+    expect(h.scope.queuedTypeAheadTurns).toEqual([]);
+    expect(h.readMarker().queuedTurns).toBeUndefined();
+    const session = {
+      sessionId: 'sid',
+      turnReplyContexts: Object.fromEntries(queue.map(turn => [turn.turnId, {
+        target: { mode: 'thread', rootMessageId: 'om_root' },
+      }])),
+    };
+    const normalizedMarker = { ...h.readMarker(), dispatchAttempt: undefined };
+    expect(selectReplyMessageId(session, 'om_A', normalizedMarker)).toBe('om_B33');
   });
 
   it('syncSettledAbsorbedTurnsFromParsed never tombstones a live durable retry (dispatchAttempt 2) or active disk turnId', () => {
@@ -916,6 +1089,345 @@ describe('worker <-> PID marker synchronization & lifecycle invariants', () => {
 });
 
 describe('adversarial regression matrix (crash recovery, multi-destination, privateReply, unified card, malformed markers)', () => {
+  it('final-visible C write uses ledger authorization, preserves a rejected B promotion, and retains steer guidance', async () => {
+    const f = setupSendFixture({
+      scope: 'chat',
+      turns: [
+        { id: 'om_A', root: undefined, sender: 'ou_first' },
+        { id: 'om_B', root: 'om_topic_1', sender: 'ou_second' },
+      ],
+      queuedTurns: [{ turnId: 'om_B', inputConsumed: true, absorbedIntoTurnId: 'om_A' }],
+    });
+    const h = createWorkerHarness(f.data, [
+      { turnId: 'om_B', inputConsumed: true, absorbedIntoTurnId: 'om_A' },
+    ]);
+    const ledgerKey = { larkAppId: 'cli_test', sessionId: 'sid', turnId: 'om_A' };
+    // A's final is durable, but its --reply-to A / different-destination gate
+    // rejected B, so no settledAbsorbedTurnIds were authorized.
+    await new TurnSendLedger(f.data).execute(ledgerKey, 'final', 'Answer A only', async () => 'om_A_final');
+    recordBridgeReplyMarker({
+      dataDir: f.data, sessionId: 'sid', sentAtMs: Date.now(), messageId: 'om_A_final',
+      deliveryKind: 'current_session_send', content: 'Answer A only', responseKind: 'final',
+      turnId: 'om_A', targetChatId: 'oc_test', targetSessionId: 'sid',
+    });
+
+    prepareIncomingNormalWrite(h, f.data);
+    expect(h.scope.currentBotmuxTurnId).toBe('om_B');
+    expect(h.scope.queuedTypeAheadTurns.map((turn: { turnId: string }) => turn.turnId)).toEqual(['om_C']);
+    expect(f.marker().turnId).toBe('om_B');
+    expect(f.marker().steerPromotedTurn).toBe(true);
+    expect(f.marker().settledAbsorbedTurns).toBeUndefined();
+    expect(f.marker().queuedTurns).toEqual([expect.objectContaining({ turnId: 'om_C' })]);
+
+    const originalMarker: AncestorSessionContext = {
+      sessionId: 'sid', turnId: 'om_A',
+      queuedTurns: [{ turnId: 'om_B', inputConsumed: true, absorbedIntoTurnId: 'om_A' }],
+    };
+    const rejectB = buildAbsorbedTurnSettlementGate({
+      session: {
+        sessionId: 'sid', scope: 'chat',
+        turnReplyContexts: {
+          om_A: { target: { mode: 'plain', chatId: 'oc_test' } },
+          om_B: { target: { mode: 'thread', rootMessageId: 'om_topic_1' } },
+        },
+      },
+      originSessionId: 'sid', originDispatchAttempt: undefined,
+      preSendAbsorbedTurnIds: new Set(['om_B']),
+      actualDeliveredTarget: { mode: 'plain', chatId: 'oc_test' },
+      privateReply: false, replyTargetSenderOpenId: 'ou_first', explicitReplyTo: 'om_A',
+      routingOverride: false, excludedSendKind: false, crossPrincipalInterruption: false,
+    });
+    const adv = advanceAncestorSessionTurn(f.data, process.pid, 'om_A', { canSettleAbsorbed: rejectB });
+    expect(adv).toEqual({ advanced: false, turnId: 'om_B' });
+    const fresh = findAncestorSessionMarkerContext(f.data, process.pid, 'sid');
+    const completionTurn = resolvePromotedAbsorbedTurnForCompletion(adv, new Set(['om_B']), fresh);
+    expect(completionTurn).toBe('om_B');
+    expect(sendCompletionHintKey('final', false, completionTurn)).toBe('ai.send.after_success_steer_advanced');
+    // An unrelated promoted/active C can never inherit B's completion steering.
+    expect(resolvePromotedAbsorbedTurnForCompletion(
+      { advanced: false, turnId: 'om_C' }, new Set(['om_B']), fresh,
+    )).toBeUndefined();
+  });
+
+  it('an unresolved first final transition fails closed before markNewTurn can clear absorbed B', async () => {
+    const f = setupSendFixture({
+      queuedTurns: [{ turnId: 'om_B', inputConsumed: true, absorbedIntoTurnId: 'om_A' }],
+    });
+    const h = createWorkerHarness(f.data, [
+      { turnId: 'om_B', inputConsumed: true, absorbedIntoTurnId: 'om_A' },
+    ]);
+    await new TurnSendLedger(f.data).execute(
+      { larkAppId: 'cli_test', sessionId: 'sid', turnId: 'om_A' },
+      'final', 'Answer A', async () => 'om_A_final',
+    );
+    recordBridgeReplyMarker({
+      dataDir: f.data, sessionId: 'sid', sentAtMs: Date.now(), messageId: 'om_A_final',
+      deliveryKind: 'current_session_send', content: 'Answer A', responseKind: 'final', turnId: 'om_A',
+    });
+    expect(() => prepareIncomingNormalWrite(h, f.data, undefined, () => {
+      // Mutation: disable the first transition entirely. The second cleanup
+      // point must still refuse to write C rather than silently dropping B.
+      h.scope.advanceQueuedTypeAheadTurnAfterFinal = () => {};
+      h.scope.SubmissionWriteError = class SubmissionWriteError extends Error {
+        constructor(
+          message: string,
+          readonly recoveryFailureReason?: string,
+          readonly submissionStarted = true,
+          readonly runnerGenerationUnsafe = false,
+          readonly traexCatalogAdmissionRequired = false,
+          readonly retainPendingInput = false,
+        ) { super(message); }
+      };
+    })).toThrow(/final transition is still unresolved/);
+    expect(h.scope.currentBotmuxTurnId).toBe('om_A');
+    expect(h.scope.queuedTypeAheadTurns.map((turn: { turnId: string }) => turn.turnId)).toEqual(['om_B']);
+    expect(f.marker().turnId).toBe('om_A');
+    expect(f.marker().queuedTurns).toEqual([
+      { turnId: 'om_B', inputConsumed: true, absorbedIntoTurnId: 'om_A' },
+    ]);
+    expect(f.marker().settledAbsorbedTurns).toBeUndefined();
+  });
+
+  it('primary final lock timeout keeps delivery successful and exact retry converges marker and queue', () => {
+    const f = setupSendFixture({
+      queuedTurns: [{ turnId: 'om_B', inputConsumed: true, absorbedIntoTurnId: 'om_A' }],
+    });
+    const args = ['--response-kind', 'final', '--no-mention'];
+    const first = withFileLockSync(f.markerPath, () => f.run(args, 'answer A and B'));
+    expect(first.status, String(first.stderr)).toBe(0);
+    expect(first.writes).toHaveLength(1);
+    expect(String(first.stderr)).not.toContain(t('ai.send.after_success_hint', undefined, 'zh'));
+    expect(f.marker().turnId).toBe('om_A');
+    expect(f.marker().queuedTurns).toEqual([
+      { turnId: 'om_B', inputConsumed: true, absorbedIntoTurnId: 'om_A' },
+    ]);
+    const journal = join(f.data, 'turn-sends', 'sid.jsonl');
+    const firstMarkers = readFileSync(journal, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(firstMarkers).toHaveLength(1);
+    expect(firstMarkers[0]).toMatchObject({ turnId: 'om_A', messageId: 'om_separate_message', responseKind: 'final' });
+
+    const retry = f.run(args, 'answer A and B');
+    expect(retry.status, String(retry.stderr)).toBe(0);
+    expect(retry.writes).toHaveLength(0);
+    expect(f.marker().turnId).toBe('om_A');
+    expect(f.marker().queuedTurns).toBeUndefined();
+    expect(f.marker().settledAbsorbedTurns).toEqual([{ turnId: 'om_B', hostTurnId: 'om_A' }]);
+    const retriedMarkers = readFileSync(journal, 'utf8').trim().split('\n').filter(Boolean);
+    expect(retriedMarkers).toHaveLength(1);
+  }, 30_000);
+
+  it('explicit old-target lock retry replays A on every subsequent command instead of minting B final to A', () => {
+    const f = setupSendFixture({
+      scope: 'chat',
+      turns: [
+        { id: 'om_A', root: 'om_topic_A', sender: 'ou_first' },
+        { id: 'om_B', root: 'om_topic_B', sender: 'ou_second' },
+      ],
+      queuedTurns: [{ turnId: 'om_B', inputConsumed: true, absorbedIntoTurnId: 'om_A' }],
+    });
+    const args = ['--response-kind', 'final', '--reply-to', 'om_A', '--no-mention'];
+    const first = withFileLockSync(f.markerPath, () => f.run(args, 'Answer A only'));
+    expect(first.status, String(first.stderr)).toBe(0);
+    expect(first.writes).toHaveLength(1);
+    expect(first.writes[0].path).toBe('/open-apis/im/v1/messages/om_topic_A/reply');
+
+    for (const [index, result] of [f.run(args, 'Answer A only'), f.run(args, 'Answer A only')].entries()) {
+      expect(result.status, `replay ${index + 2}: ${result.stderr}`).toBe(0);
+      expect(result.writes, `replay ${index + 2} must not publish again`).toHaveLength(0);
+      expect(String(result.stdout)).toContain('"replayed":true');
+      expect(f.marker().turnId).toBe('om_B');
+      expect(f.marker().steerPromotedTurn).toBe(true);
+      expect(f.marker().promotedAbsorbedTurn).toBe(true);
+      expect(f.marker().promotedFromTurnId).toBe('om_A');
+      expect(new TurnSendLedger(f.data).read({ larkAppId: 'cli_test', sessionId: 'sid', turnId: 'om_B' })?.final)
+        .toBeUndefined();
+    }
+    const markers = readFileSync(join(f.data, 'turn-sends', 'sid.jsonl'), 'utf8')
+      .trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+    expect(markers).toHaveLength(1);
+    expect(markers[0]).toMatchObject({ turnId: 'om_A', targetRootMessageId: 'om_topic_A' });
+  }, 30_000);
+
+  it('concurrent replay after winner crash restores the missing final marker and ledger-authorized queue state', () => {
+    const f = setupSendFixture({
+      queuedTurns: [{ turnId: 'om_B', inputConsumed: true, absorbedIntoTurnId: 'om_A' }],
+    });
+    const res = f.run(['--response-kind', 'final', '--no-mention'], 'answer A and B', replayWinnerCrashFixture);
+    expect(res.status, String(res.stderr)).toBe(0);
+    expect(res.writes).toHaveLength(1);
+    expect(String(res.stdout)).toContain('REPLAY_RESULT={"winnerReplayed":false,"loserReplayed":true}');
+    expect(f.marker().turnId).toBe('om_A');
+    expect(f.marker().queuedTurns).toBeUndefined();
+    expect(f.marker().settledAbsorbedTurns).toEqual([{ turnId: 'om_B', hostTurnId: 'om_A' }]);
+    const markers = readFileSync(join(f.data, 'turn-sends', 'sid.jsonl'), 'utf8')
+      .trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+    expect(markers).toHaveLength(1);
+    expect(markers[0]).toMatchObject({ turnId: 'om_A', messageId: 'om_final', responseKind: 'final' });
+  });
+
+  it('voice and doc final lock failures preserve delivery and converge on exact replay', () => {
+    for (const kind of ['voice', 'doc'] as const) {
+      const root = makeTempDir(`final-${kind}-lock-replay-`);
+      const dataDir = join(root, 'data');
+      const binDir = join(root, 'bin');
+      mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+      mkdirSync(binDir);
+      writeFileSync(join(binDir, 'opusenc'), [
+        '#!/bin/sh', 'if [ "$1" = "--version" ]; then exit 0; fi',
+        'for last do :; done', 'printf "test-opus" > "$last"', '',
+      ].join('\n'), { mode: 0o755 });
+      writeFileSync(join(root, 'bots.json'), JSON.stringify([{
+        larkAppId: 'cli_test', larkAppSecret: 'secret', cliId: 'codex', replyCardMode: 'legacy',
+        voice: { engine: 'openai', openai: { baseUrl: 'https://tts.example.test/v1', model: 'test' } },
+      }]));
+      const markerPath = join(dataDir, '.botmux-cli-pids', String(process.pid));
+      writeFileSync(markerPath, JSON.stringify({
+        sessionId: 'sid', turnId: 'old-input', queuedTurnId: 'om_B',
+        queuedTurns: [{ turnId: 'om_B', inputConsumed: true, absorbedIntoTurnId: 'old-input' }],
+      }));
+      seedPersistedSessionRows(dataDir, 'cli_test', { sid: {
+        sessionId: 'sid', status: 'active', larkAppId: 'cli_test', cliId: 'codex',
+        scope: 'chat', chatType: 'group', workingDir: root,
+        chatId: kind === 'doc' ? 'doc:doc_test:comment_test' : 'oc_chat',
+        ...(kind === 'doc' ? { docCommentTargets: {
+          'old-input': { fileToken: 'doc_test', fileType: 'docx', commentId: 'comment_test', turnId: 'old-input' },
+          om_B: { fileToken: 'doc_test', fileType: 'docx', commentId: 'comment_test_b', turnId: 'om_B' },
+        } } : {}),
+      } });
+      const run = () => spawnSyncTsScript(voiceDocFixture, [
+        'send', '--no-mention', '--response-kind', 'final', ...(kind === 'voice' ? ['--voice'] : []), 'Final answer',
+      ], {
+        cwd: repo, encoding: 'utf8', timeout: 30_000,
+        env: {
+          ...process.env,
+          PATH: [binDir, process.env.PATH].join(delimiter), HOME: root,
+          SESSION_DATA_DIR: dataDir, BOTS_CONFIG: join(root, 'bots.json'),
+          BOTMUX_SESSION_ID: 'sid', BOTMUX_LARK_APP_ID: 'cli_test',
+        },
+      });
+      const first = withFileLockSync(markerPath, () => run());
+      expect(first.status, `${kind}: ${first.stderr}`).toBe(0);
+      expect(String(first.stdout).split('\n').filter(line => line.startsWith('PROVIDER_DELIVERY='))).toHaveLength(1);
+      expect(JSON.parse(readFileSync(markerPath, 'utf8')).turnId).toBe('old-input');
+      const journal = join(dataDir, 'turn-sends', 'sid.jsonl');
+      const firstMarkers = readFileSync(journal, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      expect(firstMarkers).toHaveLength(1);
+      expect(firstMarkers[0]).toMatchObject({ turnId: 'old-input', responseKind: 'final' });
+      if (kind === 'voice') expect(firstMarkers[0].terminalCarrier).toBe('non_patchable');
+
+      const retry = run();
+      expect(retry.status, `${kind} retry: ${retry.stderr}`).toBe(0);
+      // This gate rejected B: the retry first restores B's promotion, then B's
+      // own required final is a new turn, not a duplicate of A. A third exact
+      // command proves that new final is itself idempotent.
+      expect(String(retry.stdout).split('\n').filter(line => line.startsWith('PROVIDER_DELIVERY='))).toHaveLength(1);
+      const retriedMarker = JSON.parse(readFileSync(markerPath, 'utf8'));
+      expect(retriedMarker.turnId).toBe('om_B');
+      expect(retriedMarker.steerPromotedTurn).toBe(true);
+      expect(readFileSync(journal, 'utf8').trim().split('\n').filter(Boolean)).toHaveLength(2);
+
+      const replayB = run();
+      expect(replayB.status, `${kind} replay B: ${replayB.stderr}`).toBe(0);
+      expect(String(replayB.stdout).split('\n').filter(line => line.startsWith('PROVIDER_DELIVERY='))).toHaveLength(0);
+      const markers = readFileSync(journal, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+      expect(markers).toHaveLength(2);
+      expect(new Set(markers.map(marker => marker.turnId))).toEqual(new Set(['old-input', 'om_B']));
+    }
+  }, 60_000);
+
+  it('same-topic new B final with different content is not blocked by the old-host replay guard', () => {
+    const f = setupSendFixture({
+      scope: 'chat',
+      turns: [
+        { id: 'om_A', root: 'om_shared_topic', sender: 'ou_first' },
+        { id: 'om_B', root: 'om_shared_topic', sender: 'ou_second' },
+      ],
+      queuedTurns: [{ turnId: 'om_B', inputConsumed: true, absorbedIntoTurnId: 'om_A' }],
+    });
+    const first = f.run(['--response-kind', 'final', '--reply-to', 'om_A', '--no-mention'], 'Answer A only');
+    expect(first.status, String(first.stderr)).toBe(0);
+    expect(first.writes).toHaveLength(1);
+    expect(f.marker().turnId).toBe('om_B');
+    expect(f.marker().promotedAbsorbedTurn).toBe(true);
+    expect(f.marker().promotedFromTurnId).toBe('om_A');
+
+    const second = f.run(['--response-kind', 'final', '--no-mention'], 'New answer for B');
+    expect(second.status, String(second.stderr)).toBe(0);
+    expect(second.writes).toHaveLength(1);
+    expect(second.writes[0].path).toBe('/open-apis/im/v1/messages/om_shared_topic/reply');
+    expect(new TurnSendLedger(f.data).read({ larkAppId: 'cli_test', sessionId: 'sid', turnId: 'om_B' })?.final)
+      .toBeDefined();
+  });
+
+  it('voice explicit old-target lock retry also replays A without another TTS or B-to-A marker', () => {
+    const root = makeTempDir('voice-old-target-lock-replay-');
+    const dataDir = join(root, 'data');
+    const binDir = join(root, 'bin');
+    mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+    mkdirSync(binDir);
+    writeFileSync(join(binDir, 'opusenc'), [
+      '#!/bin/sh', 'if [ "$1" = "--version" ]; then exit 0; fi',
+      'for last do :; done', 'printf "test-opus" > "$last"', '',
+    ].join('\n'), { mode: 0o755 });
+    writeFileSync(join(root, 'bots.json'), JSON.stringify([{
+      larkAppId: 'cli_test', larkAppSecret: 'secret', cliId: 'codex', replyCardMode: 'legacy',
+      voice: { engine: 'openai', openai: { baseUrl: 'https://tts.example.test/v1', model: 'test' } },
+    }]));
+    const ds = {
+      scope: 'chat', chatId: 'oc_chat',
+      session: {
+        sessionId: 'sid', status: 'active', larkAppId: 'cli_test', cliId: 'codex',
+        scope: 'chat', chatType: 'group', workingDir: root, chatId: 'oc_chat', rootMessageId: 'oc_chat',
+      },
+    } as DaemonSession;
+    for (const turn of [
+      { id: 'om_A', root: 'om_topic_A', sender: 'ou_first' },
+      { id: 'om_B', root: 'om_topic_B', sender: 'ou_second' },
+    ]) {
+      ds.session.quoteTargetId = turn.id;
+      ds.session.quoteTargetSenderOpenId = turn.sender;
+      beginReplyTargetTurn(ds, turn.root, turn.id, new Date().toISOString(), {
+        senderOpenId: turn.sender, participants: [{ openId: turn.sender, isBot: false }], inThread: true,
+      });
+    }
+    seedPersistedSessionRows(dataDir, 'cli_test', { sid: ds.session });
+    const markerPath = join(dataDir, '.botmux-cli-pids', String(process.pid));
+    writeFileSync(markerPath, JSON.stringify({
+      sessionId: 'sid', turnId: 'om_A', queuedTurnId: 'om_B',
+      queuedTurns: [{ turnId: 'om_B', inputConsumed: true, absorbedIntoTurnId: 'om_A' }],
+    }));
+    const run = () => spawnSyncTsScript(voiceDocFixture, [
+      'send', '--voice', '--no-mention', '--response-kind', 'final', '--reply-to', 'om_A', 'Answer A only',
+    ], {
+      cwd: repo, encoding: 'utf8', timeout: 30_000,
+      env: {
+        ...process.env, PATH: [binDir, process.env.PATH].join(delimiter), HOME: root,
+        SESSION_DATA_DIR: dataDir, BOTS_CONFIG: join(root, 'bots.json'),
+        BOTMUX_SESSION_ID: 'sid', BOTMUX_LARK_APP_ID: 'cli_test', BOTMUX_TURN_ID: 'om_A',
+      },
+    });
+    const first = withFileLockSync(markerPath, () => run());
+    expect(first.status, String(first.stderr)).toBe(0);
+    expect(String(first.stdout).split('\n').filter(line => line.startsWith('PROVIDER_DELIVERY='))).toHaveLength(1);
+
+    for (const result of [run(), run()]) {
+      expect(result.status, String(result.stderr)).toBe(0);
+      expect(String(result.stdout).split('\n').filter(line => line.startsWith('PROVIDER_DELIVERY='))).toHaveLength(0);
+      expect(String(result.stdout)).toContain('"replayed":true');
+      expect(JSON.parse(readFileSync(markerPath, 'utf8'))).toMatchObject({
+        turnId: 'om_B', steerPromotedTurn: true, promotedAbsorbedTurn: true, promotedFromTurnId: 'om_A',
+      });
+      expect(new TurnSendLedger(dataDir).read({ larkAppId: 'cli_test', sessionId: 'sid', turnId: 'om_B' })?.final)
+        .toBeUndefined();
+    }
+    const markers = readFileSync(join(dataDir, 'turn-sends', 'sid.jsonl'), 'utf8')
+      .trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+    expect(markers).toHaveLength(1);
+    expect(markers[0]).toMatchObject({
+      turnId: 'om_A', targetRootMessageId: 'om_topic_A', terminalCarrier: 'non_patchable',
+    });
+  }, 45_000);
+
   it('crash recovery: TurnSendLedger records settledAbsorbedTurnIds so pre-send catch-up settles B instead of promoting it', () => {
     const f = setupSendFixture({
       queuedTurns: [{ turnId: 'om_B', inputConsumed: true, absorbedIntoTurnId: 'om_A' }],
@@ -954,7 +1466,7 @@ describe('adversarial regression matrix (crash recovery, multi-destination, priv
     expect(aux.writes).toHaveLength(1);
     expect(f.marker().turnId).toBe('om_A');
     expect(ledger.read({ larkAppId: 'cli_test', sessionId: 'sid', turnId: 'om_B' })?.final).toBeUndefined();
-  });
+  }, 30_000);
 
   it('chat-scope multi-destination absorbed turns [B1(topic_1), B2(plain)] settle B2 on send 1 and deliver B1 to topic_1 on send 2 without hijack', () => {
     const f = setupSendFixture({
@@ -998,7 +1510,7 @@ describe('adversarial regression matrix (crash recovery, multi-destination, priv
       turnId: 'om_B1',
       queuedTurns: [{ turnId: 'om_B2', inputConsumed: true, absorbedIntoTurnId: 'om_A' }],
     })).toBe('om_B1');
-  });
+  }, 30_000);
 
   it('privateReply with crossChatOrigin host mismatch (DM sent only to Alice) refuses to settle Bob absorbed turn', () => {
     const f = setupSendFixture({
@@ -1084,6 +1596,43 @@ describe('adversarial regression matrix (crash recovery, multi-destination, priv
     const markerAfter = JSON.parse(readFileSync(markerPath, 'utf8'));
     expect(markerAfter.turnId).toBe('om_A');
     expect(markerAfter.settledAbsorbedTurns).toEqual([{ turnId: 'om_B', hostTurnId: 'om_A' }]);
+  });
+
+  it('unified card already created by daemon without deliveredTarget fails closed and promotes absorbed B', async () => {
+    const f = setupSendFixture({
+      scope: 'chat',
+      replyCardMode: 'unified',
+      turns: [
+        { id: 'om_A', root: 'om_topic_1', sender: 'ou_first' },
+        { id: 'om_B', root: 'om_topic_1', sender: 'ou_second' },
+      ],
+      queuedTurns: [{ turnId: 'om_B', inputConsumed: true, absorbedIntoTurnId: 'om_A' }],
+    });
+    const key = { larkAppId: 'cli_test', sessionId: 'sid', turnId: 'om_A' };
+    const store = new TurnReplyCardStore(f.data);
+    store.prepareSync(key, { mode: 'unified', chatId: 'oc_test', rootId: 'oc_test' });
+    const daemonPublication = await store.update(key, { kind: 'progress', text: 'daemon progress' }, {
+      render: () => JSON.stringify({ config: { update_multi: true }, body: { elements: [] } }),
+      send: async () => 'om_daemon_card',
+      patch: async () => { throw new Error('unexpected initial patch'); },
+      beforeEffect: () => {},
+      isWithdrawn: () => false,
+      // The daemon transport predates deliveredTarget persistence.
+    });
+    expect(daemonPublication.record.messageId).toBe('om_daemon_card');
+    expect(daemonPublication.record.deliveredTarget).toBeUndefined();
+
+    const res = f.run(['--response-kind', 'final', '--no-mention'], 'Final only patches the main-chat card');
+    expect(res.status, String(res.stderr)).toBe(0);
+    expect(res.writes).toHaveLength(1);
+    expect(res.writes[0].method).toBe('PATCH');
+    expect(res.writes[0].path).toBe('/open-apis/im/v1/messages/om_daemon_card');
+    // The visible card is plain:oc_test, not A/B's topic_1. Unknown historical
+    // destination must preserve B for a separate answer instead of settling it.
+    expect(f.marker().turnId).toBe('om_B');
+    expect(f.marker().steerPromotedTurn).toBe(true);
+    expect(f.marker().settledAbsorbedTurns).toBeUndefined();
+    expect(String(res.stderr)).toContain(t('ai.send.after_success_steer_advanced', undefined, 'zh'));
   });
 
   it('rejects settlement fail-closed when PID marker has corrupted non-null dispatchAttempt or invalid queued turnId', () => {
