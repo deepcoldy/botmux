@@ -274,6 +274,56 @@ describe('批次消息', () => {
       header: 'batch', entries: [{ seq: 1, title: 'long', state: 'decide', text, fileCount: 0 }], locale: 'en',
     })).toBeUndefined();
   });
+
+  it.each([
+    { marker: '$&', escaped: '$&amp;' },
+    { marker: '$$', escaped: '$$' },
+    { marker: "$'", escaped: "$'" },
+    { marker: '$`', escaped: '$\\`' },
+  ])('主群名里的替换序列 $marker 按字面渲染', ({ marker, escaped }) => {
+    const chatLink = 'https://applink.feishu.cn/client/chat/open?openChatId=oc_review';
+    const content = JSON.parse(formatBatchEchoCard({
+      header: 'batch',
+      entries: [{ seq: 1, title: 'item', state: 'decide', text: '', fileCount: 0, primaryChat: { text: `Ops ${marker}`, url: chatLink } }],
+      locale: 'zh',
+    })!).body.elements[0].content as string;
+    expect(content).toContain(`\n主群：[Ops ${escaped}](${chatLink})\n选：`);
+    expect(content).not.toContain(`\n主群：Ops `);
+  });
+
+  it('主群链接只替换标题后的实际主群行，不误伤阶段里伪造的同形文本', () => {
+    const chatLink = 'https://applink.feishu.cn/client/chat/open?openChatId=oc_review';
+    const text = '评审群';
+    const content = JSON.parse(formatBatchEchoCard({
+      header: 'batch',
+      entries: [{
+        seq: 1, title: 'item', state: 'decide', stage: `在审\n主群：${text} ${chatLink}`, text: '', fileCount: 0,
+        primaryChat: { text, url: chatLink },
+      }],
+      locale: 'zh',
+    })!).body.elements[0].content as string;
+    expect(content).toContain(`\n主群：[${text}](${chatLink})\n选：`);
+    expect(content).not.toContain(`\n主群：${text} ${chatLink}\n选：`);
+  });
+
+  it('说明里的行首列表、分隔线和缩进代码语法按普通文字转义', () => {
+    const content = JSON.parse(formatBatchEchoCard({
+      header: 'batch',
+      entries: [{ seq: 1, title: 'item', state: 'decide', text: '- do not ship\n1. ship\n---\n    literal code\n\ttabbed', fileCount: 0 }],
+      locale: 'en',
+    })!).body.elements[0].content as string;
+    expect(content).toContain('\n\\- do not ship');
+    expect(content).toContain('\n1\\. ship');
+    expect(content).toContain('\n\\---');
+    expect(content).toContain('\n&#32;   literal code');
+    expect(content).toContain('\n&#32;tabbed');
+  });
+
+  it('转义密集内容按二次序列化后的实际请求体预算降级', () => {
+    expect(formatBatchEchoCard({
+      header: 'batch', entries: [{ seq: 1, title: 'quotes', state: 'decide', text: '"'.repeat(7_000), fileCount: 0 }], locale: 'en',
+    })).toBeUndefined();
+  });
 });
 
 describe('回显拆条', () => {

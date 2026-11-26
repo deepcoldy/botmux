@@ -22,6 +22,7 @@ let delivered: Array<Parameters<DecisionBoardServiceDeps['deliver']>[0]>;
 let deliverImpl: DecisionBoardServiceDeps['deliver'];
 /** 假的查群：默认每个群都查得到，群名 = 「群名-<chatId>」；用例里按需改。 */
 let lookupImpl: (chatId: string) => Promise<ChatLookupResult>;
+let bannerImpl: DecisionBoardServiceDeps['banner'];
 let lookups: string[];
 /** 每次查群收到的截止时间（一条命令里几个群共用一份）。 */
 let deadlines: number[];
@@ -36,6 +37,7 @@ beforeEach(() => {
   lookups = [];
   deadlines = [];
   lookupImpl = async chatId => ({ ok: true, chatId, appId: APP, name: `群名-${chatId}` });
+  bannerImpl = ({ batchId, count }) => `收到 ${count} 项（#${batchId}）`;
   service = new DecisionBoardService({
     dataDir: dir,
     larkAppId: () => APP,
@@ -47,7 +49,7 @@ beforeEach(() => {
     ownerName: async () => '主人',
     timeZone: () => 'UTC',
     batchAttachmentsDir: batchId => join(dir, 'attachments', `board-${batchId}`),
-    banner: ({ batchId, count }) => `收到 ${count} 项（#${batchId}）`,
+    banner: input => bannerImpl(input),
     deliver: input => deliverImpl(input),
     log: () => {},
     lookupChat: (chatId, opts) => { lookups.push(chatId); deadlines.push(opts.deadline); return lookupImpl(chatId); },
@@ -677,6 +679,21 @@ describe('提交与投递', () => {
     const whole = texts.join('');
     expect(whole).toBe(`收到 1 项（#1）\n\n#1 长说明（待拍板）\n选：B 不合\n说明：\n${longText}`);
     expect(delivered[0].prompt).toContain(`说明：\n${longText}`);
+  });
+
+  it('公告构造抛错也落 failed 并可重投，不留 dispatched 死行', async () => {
+    const a = await addDecideItem();
+    const d = service.putDraft(a.seq, 'owner', { choice: 'A', baseRev: a.rev }).draft!;
+    bannerImpl = () => { throw new Error('banner render failed'); };
+    const res = await service.submit({ author: 'owner', nonce: 'banner-error', items: [{ seq: a.seq, draftUpdatedAt: d.updatedAt }] });
+    expect(res.batch).toMatchObject({ delivery: 'failed', error: 'banner render failed' });
+    expect(service.store().getBatch(APP, res.batch.id)).toMatchObject({ delivery: 'failed', error: 'banner render failed' });
+    expect(delivered).toHaveLength(0);
+
+    bannerImpl = ({ batchId, count }) => `收到 ${count} 项（#${batchId}）`;
+    const retry = await service.redeliver(res.batch.id);
+    expect(retry.batch.delivery).toBe('delivered');
+    expect(delivered).toHaveLength(1);
   });
 
   it('管家没选群：批次落库但标为失败，补上群后重投成功', async () => {

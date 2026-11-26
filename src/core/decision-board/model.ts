@@ -896,6 +896,11 @@ function formatClock(ms: number, timeZone?: string): string {
   }
 }
 
+function formatBatchEntryTitle(e: BatchMessageEntry, locale: Locale): string {
+  const stateLabel = BOARD_STATE_LABELS[locale === 'en' ? 'en' : 'zh'][e.state];
+  return `#${e.seq} ${e.title}（${stateLabel}${e.stage ? `·${e.stage}` : ''}）`;
+}
+
 /**
  * 一批决定里逐项的那部分：编号、标题、状态、主群链接、选的选项（键 + 选项原文）、说明原文、附图数。
  * 管家会话里的批次消息和管家群里的回显共用这一份，两边对 owner 写了什么的呈现逐字一致。
@@ -909,8 +914,7 @@ export function formatBatchEntries(
 ): string {
   const zh = locale !== 'en';
   const blocks = entries.map(e => {
-    const stateLabel = BOARD_STATE_LABELS[zh ? 'zh' : 'en'][e.state];
-    const lines = [`#${e.seq} ${e.title}（${stateLabel}${e.stage ? `·${e.stage}` : ''}）`];
+    const lines = [formatBatchEntryTitle(e, locale)];
     // 主群紧跟标题：说明原文可能多行，放在它后面会像说明的一部分。群名 / 标签压成一行，不能借换行伪造下一行。
     if (e.primaryChat) lines.push(`${zh ? '主群：' : 'Main chat: '}${e.primaryChat.text.replace(/\s+/g, ' ').trim()} ${e.primaryChat.url}`);
     if (e.choice) {
@@ -987,19 +991,24 @@ export function formatBatchEcho(input: { header: string; entries: readonly Batch
 export function formatBatchEchoCard(input: { header: string; entries: readonly BatchMessageEntry[]; locale: Locale }): string | undefined {
   const zh = input.locale !== 'en';
   const blocks = input.entries.map(e => {
-    let block = escapeNoticeMarkdown(formatBatchEntries([e], input.locale, 'below'));
+    const raw = formatBatchEntries([e], input.locale, 'below');
     const plainTitle = `#${e.seq} ${e.title}`;
-    const escapedTitle = escapeNoticeMarkdown(plainTitle);
-    if (block.startsWith(escapedTitle)) {
-      block = `${noticeItemLink(e.seq, e.title, e.link)}${block.slice(escapedTitle.length)}`;
-    }
+    const header = formatBatchEntryTitle(e, input.locale);
+    if (!raw.startsWith(header) || !header.startsWith(plainTitle)) return escapeNoticeMarkdown(raw);
+    let rest = raw.slice(header.length);
+    // 标题、状态 / 阶段与后续内容分别转义；不用用户文本做 String.replace 的模式或替换串。
+    let out = `${noticeItemLink(e.seq, e.title, e.link)}${escapeNoticeMarkdown(raw.slice(plainTitle.length, header.length))}`;
     if (e.primaryChat) {
       const label = zh ? '主群：' : 'Main chat: ';
       const text = e.primaryChat.text.replace(/\s+/g, ' ').trim();
-      const plainLine = `${label}${text} ${e.primaryChat.url}`;
-      block = block.replace(escapeNoticeMarkdown(plainLine), `${label}${noticeMarkdownLink(text, e.primaryChat.url)}`);
+      const rawPrimary = `\n${label}${text} ${e.primaryChat.url}`;
+      // 主群恒在完整标题行之后；按这个位置切片，阶段 / 说明里伪造的同形文本不会被替换。
+      if (rest.startsWith(rawPrimary)) {
+        out += `\n${label}${noticeMarkdownLink(text, e.primaryChat.url)}`;
+        rest = rest.slice(rawPrimary.length);
+      }
     }
-    return block;
+    return out + escapeNoticeMarkdown(rest);
   });
   return compactNoticeCard({
     title: zh ? '决策看板 · 批次' : 'Decision board · batch',

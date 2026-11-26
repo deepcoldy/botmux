@@ -1574,16 +1574,16 @@ export class DecisionBoardService {
       locale,
       timeZone: this.deps.timeZone(),
     });
-    const echo = {
-      header: this.deps.banner({ batchId, count: decisions.length, locale }),
-      entries,
-      locale,
-    };
-    const echoTexts = splitEchoText(formatBatchEcho(echo));
-    // 长说明不截断：卡片放不下时完整沿用既有纯文本拆条。
-    const echoCard = echoTexts.length === 1 ? formatBatchEchoCard(echo) : undefined;
     let sessionId: string | undefined;
     try {
+      const echo = {
+        header: this.deps.banner({ batchId, count: decisions.length, locale }),
+        entries,
+        locale,
+      };
+      const echoTexts = splitEchoText(formatBatchEcho(echo));
+      // 长说明不截断：卡片放不下时完整沿用既有纯文本拆条。
+      const echoCard = echoTexts.length === 1 ? formatBatchEchoCard(echo) : undefined;
       const res = await this.deps.deliver({
         turnId,
         prompt,
