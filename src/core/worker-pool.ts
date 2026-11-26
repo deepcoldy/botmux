@@ -173,6 +173,7 @@ import {
 import { noteReplyCardTurnStarted } from './reply-card-turn-start.js';
 import type { QuotaFallbackChainTrigger } from './quota-fallback-chain-switch.js';
 import { TRAEX_QUOTA_ERROR_CODE } from '../services/traex-quota.js';
+import { appendTraexImageRecoveryAction } from '../im/lark/traex-image-recovery-card.js';
 import { takePurgeClickRollback } from '../services/image-purge-recovery.js';
 import { hashUrlForLog, type RiffBackendConfig } from '../adapters/backend/riff-backend.js';
 import { cancelMojoSessionById } from '../adapters/backend/mojo-backend.js';
@@ -18887,6 +18888,7 @@ function failedTurnRewindForInput(
   opts: {
     failedTurnResendOf?: string;
     purgeUndersizedImages?: true;
+    purgeToolImages?: true;
     dispatchAttempt?: number;
     durablePrimaryInbox?: true;
     trustedCaller?: TrustedCaller;
@@ -18894,7 +18896,7 @@ function failedTurnRewindForInput(
   },
 ): FailedTurnRewindDirective | undefined {
   if (cliId !== 'claude-code' || !turnId || opts.viaTransferGate || !ds.worker || ds.worker.killed) return undefined;
-  if (opts.purgeUndersizedImages || opts.dispatchAttempt !== undefined || opts.durablePrimaryInbox
+  if (opts.purgeUndersizedImages || opts.purgeToolImages || opts.dispatchAttempt !== undefined || opts.durablePrimaryInbox
     || payload.codexAppInput) return undefined;
   if (isRemoteBackendSession(ds) || isSharedAdoptSession(ds) || ds.adoptedFrom || ds.initConfig?.adoptMode) {
     return undefined;
@@ -19055,6 +19057,7 @@ export function sendWorkerInput(
      *  session transcript (drops undersized image blocks), respawns with
      *  --resume, and this turn is delivered only after the fresh CLI is ready. */
     purgeUndersizedImages?: true;
+    purgeToolImages?: true;
     trustedCaller?: TrustedCaller;
     /** Queue behind a running turn instead of folding into it (type-ahead):
      *  the input must start as a turn of its own. */
@@ -19102,7 +19105,7 @@ export function sendWorkerInput(
   if ((!ds.worker || ds.worker.killed) && !transferGate) return false;
   // The purge is a live-worker action; a staged tail would replay as a plain
   // continuation onto the unpurged transcript.
-  if (opts.purgeUndersizedImages && hasQueuedActivationAdmissionGate(ds)) return false;
+  if ((opts.purgeUndersizedImages || opts.purgeToolImages) && hasQueuedActivationAdmissionGate(ds)) return false;
   let normalized = typeof payload === 'string' ? { content: payload } : payload;
   const trustedController = trustedSessionController(ds);
   const bot = getBot(ds.larkAppId);
@@ -19261,6 +19264,7 @@ export function sendWorkerInput(
     ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
     ...(opts.atMostOnce ? { atMostOnce: true } : {}),
     ...(opts.purgeUndersizedImages ? { purgeUndersizedImages: true as const } : {}),
+    ...(opts.purgeToolImages ? { purgeToolImages: true as const } : {}),
     ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     ...(trustedController ? { trustedController } : {}),
     ...(normalized.rerouteEnvelope ? { rerouteEnvelope: normalized.rerouteEnvelope } : {}),
@@ -32986,6 +32990,13 @@ function deliverFinalOutput(
             presentation: renderSnapshot,
             ...(replyCardActionBinding ? { cardActions: replyCardActionBinding } : {}),
           });
+      if (msg.turnFailed) cardJson = appendTraexImageRecoveryAction(cardJson, {
+        cliId: effectiveCliId, errorCode: msg.turnFailureCode, turnId: msg.turnId,
+        rootId: sessionAnchorId(ds), sessionId: ds.session.sessionId, locale: localeForBot(ds.larkAppId),
+        localOwnedSession: !managedReceiver && !ds.session.headless && !replyCardSandboxBlocked(ds)
+          && !hasProtectedSessionMutationOwnership(ds) && !hasQueuedActivationAdmissionGate(ds) && !isSharedAdoptSession(ds)
+          && !isRemoteBackendSession(ds) && !ds.adoptedFrom && !ds.initConfig?.adoptMode,
+      });
       if (effectiveCliId === 'minimax' && msg.turnFailed
           && ['turn_budget_exhausted', 'execution_failed'].includes(msg.turnFailureCode ?? '')) {
         // MiniMax uses the legacy reply-card path. Keep the machine-readable

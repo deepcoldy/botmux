@@ -3,6 +3,11 @@
  * "source of truth" dictionary; `en.ts` mirrors the same keys.
  */
 export const messages: Record<string, string> = {
+  'worker.empty_final_failed_tool_image_upload': '⚠️ {cliName} 上传工具图片失败：{reason}\n会话仍然可用。历史中的工具图片可能导致后续纯文字消息也失败，普通重发或重启可能再次报错。「移除工具图片并续跑」会备份会话记录、移除全部历史工具图片块，再保留文本上下文和已完成工作续跑；用户图片与原文件保留。此恢复不能修复上游图片服务。',
+  'worker.traex_tool_images_done': '已移除 {removed} 个历史工具图片块，原会话记录已备份为同目录 .botmux-tool-images-bak-*。TRAE 已恢复同一会话，正在检查已完成工作后续跑；文本上下文与用户图片保留。',
+  'worker.traex_tool_images_unavailable': '未能完成工具图片修复并确认 CLI 恢复，已停止本次自动续跑。已完成的修复会保留原会话记录备份；会话仍可继续使用。请先查看 Web 终端确认状态。',
+  'card.btn.purge_tool_images_continue': '移除工具图片并续跑（保留文本上下文）',
+  'card.action.purge_tool_images_started': '正在移除历史工具图片并恢复同一会话…',
   'worker.startup_unavailable': '⚠️ 暂时无法启动执行环境，请稍后重试。',
   'worker.startup_owner_alert': '⚠️ {botName} 执行进程启动失败\n受影响会话：{count}\n最近报告的 CLI：{cliName}\n最近错误：{reason}\n请检查机器人的安装和运行环境。',
   'worker.install_owner_alert': '⚠️ {botName} 检测到 CLI 安装版本变化\n受影响会话：{count}\n最近报告的 CLI：{cliName}\n运行版本：{running}；安装版本：{installed}\n相关会话将在当前任务结束后休眠，下一次输入使用新版本启动。',

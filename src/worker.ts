@@ -510,6 +510,8 @@ import {
   sameExecutableObject,
   type ExecutableIdentity,
 } from './services/cli-install-identity.js';
+import { purgeTraexToolImages, resolveTraexImagePurgeTarget, TRAEX_TOOL_IMAGE_UPLOAD_ERROR_CODE } from './services/traex-tool-image-recovery.js';
+import { traeSessionsRoot } from './services/traex-paths.js';
 import { pinWorkerTraeHome } from './services/traex-paths.js';
 import { drainTraexRollout, traexResumeTargetLeftInDefaultHome, resolveTraexResumeSessionId, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, traexSessionIdFromRolloutPath, traexProcessFileSource, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
 import { bridgeCodexUserInput, postCodexAsk } from './services/codex-user-input.js';
@@ -681,7 +683,7 @@ import { migrateLegacyOmpSession } from './services/oh-my-pi-legacy-migration.js
 import { describePurgeReport, purgeUndersizedImages, resolvePurgeResumeTarget } from './services/transcript-image-purge.js';
 import { claudeProjectsRootForLaunch, type ClaudeProjectsRoot } from './services/claude-projects-root.js';
 import { claudeWritableTreeRoot } from './services/transcript-resolver.js';
-import { PURGE_IMAGES_NOT_APPLIED, planPurgeRequest, purgeOutcomeNotice, runPurgeMaintenance, type PurgeMaintenanceOutcome } from './services/image-purge-recovery.js';
+import { PURGE_IMAGES_NOT_APPLIED, PurgeContinuationLease, planPurgeRequest, purgeOutcomeNotice, runPurgeMaintenance, type PurgeMaintenanceOutcome } from './services/image-purge-recovery.js';
 import { restoreRewoundTranscript, type RewindResult, type TranscriptTreeScope } from './core/context-rewind.js';
 import {
   planFailedTurnRewindRequest,
@@ -12758,7 +12760,9 @@ function emptyCompletedBridgeFallbackContent(): string {
 
 function failedBridgeFailureText(errorCode?: string, summary?: string): string {
   const reason = summary || t('worker.failed_reason_unavailable');
-  const key = errorCode === CODEX_INVALID_REQUEST_ERROR_CODE
+  const key = errorCode === TRAEX_TOOL_IMAGE_UPLOAD_ERROR_CODE
+    ? 'worker.empty_final_failed_tool_image_upload'
+    : errorCode === CODEX_INVALID_REQUEST_ERROR_CODE
     ? 'worker.empty_final_failed_invalid_request'
     : errorCode === CODEX_AUTH_ERROR_CODE
       ? 'worker.empty_final_failed_auth'
@@ -22411,6 +22415,7 @@ function submitCursorParkedFollowUpAfterStop(target: SessionBackend, lifetime: n
 }
 
 async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
+  if (isCriticalInterruptKey(requestedKey) && activeTranscriptImagePurge?.cancel()) return;
   if (nativeSessionForkPending()) return;
   if (lastInitConfig?.deploymentContinuation && (requestedKey === 'ctrlc' || requestedKey === 'esc')) discardDeploymentContinuation();
   // 中断类键按适配器归一。卡片「⏹ 停止」与 `/stop` 都硬编码发 ctrlc，但 ZCode
@@ -22550,6 +22555,11 @@ async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
  *  active turn. This is deliberately separate from card `term_action`: a stale
  *  HTTP request must never interrupt a newer turn that reused this CLI process. */
 async function handleExactTurnInterrupt(requestId: string, turnId: string): Promise<void> {
+  if (activeTranscriptImagePurge?.turnId === turnId
+    && (!workerSessionEventScope || hasCurrentSessionRuntime()) && activeTranscriptImagePurge.cancel()) {
+    send({ type: 'turn_interrupt_result', requestId, turnId, delivered: true });
+    return;
+  }
   const expectedExecution = workerSessionEventScope?.capture()?.execution;
   const isCurrentExact = () => turnId === currentBotmuxTurnId
     && (!expectedExecution || expectedExecution.dispatchAttempt === currentBotmuxDispatchAttempt)
@@ -44083,13 +44093,21 @@ function rejectOrdinaryImTurn(
  *  停掉 CLI、确认进程退出后清洗会话记录，再以 --resume 重启。续跑指令只在清洗成功后
  *  入队（此时 cliRestartInProgress 仍为 true，它会等新 CLI 就绪才送达）；没清掉毒图就
  *  拒收它，并由 daemon 退还重试冷却。 */
+let activeTranscriptImagePurge: PurgeContinuationLease | undefined;
+
 function startTranscriptImagePurge(
   turnId: string | undefined,
   ordinaryImTurnId: string | undefined,
   enqueueContinuation: () => void,
+  toolImages = false,
 ): void {
   const notify = (key: string, params?: Record<string, string>): void => {
-    send({ type: 'user_notify', message: t(key, params), turnId });
+    const resolvedKey = toolImages
+      ? key === 'worker.purge_images_done' ? 'worker.traex_tool_images_done'
+        : key === 'worker.purge_images_busy' ? key
+        : 'worker.traex_tool_images_unavailable'
+      : key;
+    send({ type: 'user_notify', message: t(resolvedKey, params), turnId });
   };
   const rejectContinuation = (reason: string): void => {
     if (ordinaryImTurnId) rejectOrdinaryImTurn(ordinaryImTurnId, reason);
@@ -44098,7 +44116,7 @@ function startTranscriptImagePurge(
   // bridgeJsonlPath is the authoritative active transcript: it follows in-pane
   // /clear rotations and points through the scratch merged view.
   // backend.claudeJsonlPath is only the launch-time host-side guess.
-  const target = resolvePurgeResumeTarget(
+  const target = toolImages ? resolveTraexImagePurgeTarget(codexBridgeRolloutPath) : resolvePurgeResumeTarget(
     bridgeJsonlPath,
     backend
       ? (backend as PtyBackend | TmuxBackend | TmuxPipeBackend | ZellijBackend | ZmxBackend).claudeJsonlPath
@@ -44108,9 +44126,19 @@ function startTranscriptImagePurge(
   // resolved when the CLI was launched — not one derived from the path itself,
   // which a link at or above `projects` would move along. Without a pinned
   // root (null) nothing is trusted and the purge declines.
+  if (toolImages && !isPromptReady) {
+    notify('worker.purge_images_busy');
+    rejectContinuation(PURGE_IMAGES_NOT_APPLIED);
+    return;
+  }
   const purgeOptions = { trustedProjectsRoot: claudeProjectsRoot ?? null };
+  const trustedSessionsRoot = traeSessionsRoot();
+  const purge = (target: import('./services/transcript-image-purge.js').PurgeResumeTarget, dryRun = false) => toolImages
+    ? purgeTraexToolImages(target, { trustedSessionsRoot, dryRun })
+    : purgeUndersizedImages(target.jsonlPath, { ...purgeOptions, dryRun });
   const plan = planPurgeRequest({
     cliId: lastInitConfig?.cliId,
+    ...(toolImages ? { repairKind: 'traex_tool_images' as const } : {}),
     localOwnedSession: !!lastInitConfig && !lastInitConfig.adoptMode && !lastInitConfig.existingAppServerEndpoint
       && !isRemoteBackendType(effectiveBackendType),
     target,
@@ -44118,7 +44146,7 @@ function startTranscriptImagePurge(
     childPid: backend?.getChildPid?.(),
     sandboxMode: lastResolvedSandboxMode,
     platform: process.platform,
-    scan: scanTarget => purgeUndersizedImages(scanTarget.jsonlPath, { ...purgeOptions, dryRun: true }),
+    scan: scanTarget => purge(scanTarget, true),
   });
   if (plan.kind === 'decline') {
     log(`Transcript image purge declined (${plan.logReason})`);
@@ -44127,6 +44155,8 @@ function startTranscriptImagePurge(
     return;
   }
   log(`Transcript image purge accepted: ${describePurgeReport(plan.report)}`);
+  const lease = new PurgeContinuationLease(turnId ?? ordinaryImTurnId ?? '', rejectContinuation);
+  activeTranscriptImagePurge = lease;
   let outcome: PurgeMaintenanceOutcome | undefined;
   void restartCliProcess('purge undersized transcript images', {
     immediate: true,
@@ -44145,16 +44175,21 @@ function startTranscriptImagePurge(
           wait: ms => delay(ms),
           provablyGone: pid => !pidNotProvablyGone(pid),
         }, { ownedPids: retiring.processScope }),
-        purge: () => purgeUndersizedImages(plan.target.jsonlPath, purgeOptions),
+        // Stop/new input may arrive while process quiescence is awaited.
+        purge: () => {
+          if (!lease.pending) throw new Error('image repair cancelled by user input');
+          return purge(plan.target);
+        },
       });
       log(`Transcript image purge ${outcome.kind}: ${'report' in outcome ? describePurgeReport(outcome.report) : outcome.detail}`);
     },
     onRespawnSettled: respawn => {
+      if (activeTranscriptImagePurge === lease) activeTranscriptImagePurge = undefined;
+      if (!lease.pending) return;
       const notice = purgeOutcomeNotice(outcome, respawn);
       log(`Transcript image purge respawn ${respawn}; continuation ${notice.deliverContinuation ? 'delivered' : 'withheld'}`);
       if (notice.key) notify(notice.key, notice.params);
-      if (notice.deliverContinuation) enqueueContinuation();
-      else rejectContinuation(notice.rejectReason);
+      lease.settle(notice, enqueueContinuation);
     },
   });
 }
@@ -45723,6 +45758,8 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
     }
 
     case 'message': {
+      if (!msg.purgeUndersizedImages && !msg.purgeToolImages
+        && msg.turnId !== activeTranscriptImagePurge?.turnId) activeTranscriptImagePurge?.cancel();
       if (lastInitConfig?.deploymentContinuation || restoredDeploymentTurnId) discardDeploymentContinuation();
       // 每轮消息都捎带 daemon 侧当前解析出的模型，覆盖 respawn 快照——理由与
       // restart 那条通道相同，但这里管的是**崩溃 park 后由消息触发的恢复重启**：
@@ -45947,8 +45984,8 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
             }
           } else if (ordinaryImTurnId) rejectOrdinaryImTurn(ordinaryImTurnId, 'cli_input_unavailable');
         };
-        if (msg.purgeUndersizedImages) {
-          startTranscriptImagePurge(msg.turnId, ordinaryImTurnId, enqueueMessage);
+        if (msg.purgeUndersizedImages || msg.purgeToolImages) {
+          startTranscriptImagePurge(msg.turnId, ordinaryImTurnId, enqueueMessage, msg.purgeToolImages === true);
           break;
         }
         if (msg.failedTurnRewind) {

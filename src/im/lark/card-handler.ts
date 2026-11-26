@@ -4504,6 +4504,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     }
 
     if (actionType === 'purge_images_continue' && ds) {
+      const toolImages = value?.image_kind === 'traex_tool_images';
       const locDs = localeForBot(ds.larkAppId);
       // Same gates as retry_turn, plus the /restart gate set: the worker action
       // rewrites the transcript and respawns --resume, which shared-adopt and
@@ -4516,7 +4517,8 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       if (isSharedAdoptSession(ds) || isRemoteBackendSession(ds)) {
         return { toast: { type: 'warning', content: t('card.action.purge_images_unsupported', undefined, locDs) } };
       }
-      if (sessionCliId(ds) !== 'claude-code') {
+      if (sessionCliId(ds) !== (toolImages ? 'traex' : 'claude-code') || ds.session.headless
+        || ds.adoptedFrom || ds.initConfig?.adoptMode) {
         return { toast: { type: 'warning', content: t('card.action.purge_images_unsupported', undefined, locDs) } };
       }
       if (hasProtectedSessionMutationOwnership(ds)) {
@@ -4525,6 +4527,11 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       const failedTurn = ds.session.lastFailedTurn;
       if (!failedTurn) {
         return { toast: { type: 'warning', content: t('card.action.retry_turn_missing', undefined, locDs) } };
+      }
+      if (toolImages && (failedTurn.errorCode !== 'traex_tool_image_upload_failed'
+        || failedTurn.status !== 'failed'
+        || (ds.lastCliInputTurnId && ds.lastCliInputTurnId !== failedTurn.turnId))) {
+        return { toast: { type: 'warning', content: t('card.action.retry_turn_stale', undefined, locDs) } };
       }
       const clickedTurnId = value?.turn_id;
       if (!clickedTurnId || clickedTurnId !== failedTurn.turnId) {
@@ -4543,7 +4550,9 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           },
         };
       }
-      const continueInput = { content: buildTurnContinuePrompt() };
+      const continueInput = { content: buildTurnContinuePrompt() + (toolImages
+        ? '\n历史工具图片因上传失败已移除。先用文本与工作区状态检查已完成工作；图片服务恢复前不要再次调用返回图片的工具。若剩余任务必须读图，请明确说明阻碍，不要猜测图片内容或声称任务完成。'
+        : '') };
       // Same turnId handling as retry_turn: never reuse failedTurn.turnId — that
       // om_ id is a committed ordinary turn the worker would dedupe before the
       // purge branch.
@@ -4554,7 +4563,8 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         // No live worker: nothing to purge-and-respawn. Reject rather than a
         // plain fork that would replay the poisoned transcript.
         if (ds.worker && !ds.worker.killed) {
-          accepted = sendWorkerInput(ds, continueInput, retryTurnId, { purgeUndersizedImages: true });
+          accepted = sendWorkerInput(ds, continueInput, retryTurnId, toolImages
+            ? { purgeToolImages: true } : { purgeUndersizedImages: true });
         }
       } catch (err) {
         logger.warn(
@@ -4586,7 +4596,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         `[${tag(ds)}] purge_images_continue accepted for turn ${failedTurn.turnId.slice(0, 8)} `
         + `(attempt #${ds.session.lastFailedTurn?.retryCount ?? 1})`,
       );
-      return { toast: { type: 'success', content: t('card.action.purge_images_started', undefined, locDs) } };
+      return { toast: { type: 'success', content: t(toolImages ? 'card.action.purge_tool_images_started' : 'card.action.purge_images_started', undefined, locDs) } };
     }
 
     // Safe keys on the "CLI is stuck on a blocking page" card. Deliberately

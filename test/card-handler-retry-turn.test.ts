@@ -791,3 +791,37 @@ describe('/quote cold admission', () => {
     expect(published.join('\n')).not.toContain('上一轮的回顾');
   });
 });
+
+
+describe('TRAE tool image repair — behavioral dispatch', () => {
+  function data() {
+    const input = actionData(TURN, null, 'purge_images_continue');
+    input.action.value.image_kind = 'traex_tool_images';
+    return input;
+  }
+  function ds(overrides: Partial<DaemonSession> = {}) {
+    return makeDs({ ...overrides, sessionOverrides: { cliId: 'traex', lastFailedTurn: makeFailedTurn({ errorCode: 'traex_tool_image_upload_failed', status: 'failed' }) } });
+  }
+  it('continues from verified work under a new turn and keeps the conversation active', async () => {
+    const session = ds();
+    const result = await handleCardAction(data(), depsWith(session), LARK_APP_ID);
+    expect(result?.toast?.type).toBe('success');
+    expect(sendWorkerInputMock).toHaveBeenCalledWith(session, expect.objectContaining({ content: expect.stringContaining('[BOTMUX_CONTINUE]') }), expect.stringMatching(/^retry-/), { purgeToolImages: true });
+    expect(session.session.status).toBe('active');
+    expect(session.session.lastFailedTurn?.retryCount).toBe(1);
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+  });
+  it.each(['new input', 'stale card', 'unrelated failure', 'dead worker', 'wrong CLI', 'unauthorized'])('refuses %s without consuming the retry lease', async scenario => {
+    const session = ds(); const input = data();
+    if (scenario === 'new input') session.lastCliInputTurnId = 'om_new';
+    if (scenario === 'stale card') input.action.value.turn_id = 'om_old';
+    if (scenario === 'unrelated failure') session.session.lastFailedTurn!.errorCode = 'codex_connection_failed';
+    if (scenario === 'dead worker') session.worker = undefined;
+    if (scenario === 'wrong CLI') session.session.cliId = 'codex';
+    if (scenario === 'unauthorized') vi.mocked(canOperate).mockReturnValue(false);
+    await handleCardAction(input, depsWith(session), LARK_APP_ID);
+    expect(sendWorkerInputMock).not.toHaveBeenCalled();
+    expect(session.session.lastFailedTurn?.retryCount).toBe(0);
+    expect(session.session.status).toBe('active');
+  });
+});
