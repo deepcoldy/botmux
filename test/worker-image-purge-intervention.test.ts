@@ -158,6 +158,20 @@ describe('worker image purge intervention', () => {
     expect(h.writes).toEqual([]); expect(h.scope.spawnCli).not.toHaveBeenCalled();
     expect(h.sent.filter(msg => msg.type === 'turn_input_rejected')).toHaveLength(1);
   });
+  it.each([true, false])('rejects tool repair without stopping an older strict retry (restart=%s)', async restarting => {
+    const h = harness();
+    const queued = { turnId: 'retry-1', content: 'old retry' };
+    const held = { queued, stopped: false, report: vi.fn() };
+    h.scope.failedTurnRewindInFlight = held;
+    h.scope.pendingMessages = [queued];
+    h.scope.stopHeldFailedTurnRewind = loadWorkerFunction('stopHeldFailedTurnRewind', h.scope);
+    h.scope.cliRestartInProgress = restarting;
+    await h.message({ type: 'message', turnId: 'retry-2', content: 'repair', purgeToolImages: true });
+    expect(held.stopped).toBe(false);
+    expect(h.scope.pendingMessages).toEqual([queued]);
+    expect(h.sent.filter(msg => msg.type === 'turn_input_rejected').map(msg => msg.turnId)).toEqual(['retry-2']);
+    expect(h.scope.activeTranscriptImagePurge).toBeUndefined();
+  });
   it('rejects a second repair throughout the exit wait and respawn delay', async () => {
     const h = harness(); h.start();
     const second = vi.fn(); h.scope.startTranscriptImagePurge('retry-2', undefined, second, true);

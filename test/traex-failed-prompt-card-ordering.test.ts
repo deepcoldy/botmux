@@ -105,6 +105,7 @@ describe('TRAE failed-prompt final/terminal ordering', () => {
       type: 'final_output', sessionId: SID, turnId: s.turnId, lastUuid: s.turnId, content: 'tool image upload failed',
       turnFailed: true, turnFailureCode: 'traex_tool_image_upload_failed',
     });
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalled());
     const finalCard = String(sessionReply.mock.calls[0]![1]);
     expect(finalCard).toContain('"action":"purge_images_continue"');
     expect(finalCard).not.toContain('"action":"retry_turn"');

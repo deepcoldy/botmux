@@ -904,6 +904,10 @@ describe('TRAE checkpoint worker transaction', () => {
     const backupDir = rewindBackupDirForSession(process.env.SESSION_DATA_DIR!, 'sess-rewind');
     const priorBackups = new Set(existsSync(backupDir) ? readdirSync(backupDir) : []);
     await h.cutAfterExit(); h.scope.backend = null; h.settle('superseded');
+    expect(h.restartCliProcess).toHaveBeenCalledTimes(2);
+    expect(readFileSync(h.path, 'utf8')).toBe(prefix);
+    await h.restartOpts(1).beforeRespawn!({ processScope: [] });
+    h.restartOpts(1).onRespawnSettled!('spawned');
     expect(readFileSync(h.path)).toEqual(before);
     expect(h.pendingMessages).toEqual([]); expect(h.successorInputs()).toEqual([]);
     expect(h.reports()).toEqual([expect.objectContaining({ outcome: 'declined', reason: expect.stringMatching(/cut restored/) })]);
@@ -923,6 +927,20 @@ describe('TRAE checkpoint worker transaction', () => {
     expect(readFileSync(h.path)).toEqual(before);
     expect(h.pendingMessages).toEqual([]); expect(h.successorInputs()).toEqual([]);
     expect(h.reports()).toEqual([expect.objectContaining({ outcome: 'declined', reason: expect.stringMatching(/superseded after the cut; cut restored/) })]);
+  });
+  it('uses a detached winning process scope instead of treating backend=null as quiescent', async () => {
+    const wait = vi.fn().mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error('4243 is still alive'));
+    const h = native({ waitForProcessQuiescence: wait });
+    await h.cutAfterExit();
+    h.scope.backend = null;
+    h.scope.latestCliRetirement = { pid: 4243, processScope: [4243] };
+    h.scope.latestCliRetirementUncertain = false;
+    h.settle('superseded');
+    await h.restartOpts(1).beforeRespawn!({ processScope: [] });
+    expect(wait).toHaveBeenCalledTimes(2);
+    expect(wait.mock.calls[1][0]).toBe(4243);
+    expect(readFileSync(h.path, 'utf8')).toBe(prefix);
+    expect(h.reports()).toEqual([expect.objectContaining({ outcome: 'declined', reason: expect.stringMatching(/cut NOT restored/) })]);
   });
   it('does not cut after its restart loses ownership during the exit wait', async () => {
     const h = native(); const before = readFileSync(h.path);

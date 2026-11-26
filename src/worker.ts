@@ -39842,6 +39842,12 @@ function stopOwnedSessionScope(reason: string): void {
   }
 }
 
+/** Latest process scope handed to a restart's maintenance. It survives the
+ * backend=null interval so a superseded restore cannot mistake an already-live
+ * replacement for a proven exit merely because its backend was detached. */
+let latestCliRetirement: { pid: number; processScope: number[] } | undefined;
+let latestCliRetirementUncertain = false;
+
 async function restartCliProcess(
   reason: string,
   opts: {
@@ -39954,7 +39960,7 @@ async function restartCliProcess(
       const restartingBackend = backend;
       const retiringCliPid = restartingBackend?.getChildPid?.();
       const retiringProcessScope: number[] = [];
-      if (opts.beforeRespawn && retiringCliPid) {
+      if (retiringCliPid) {
         const childrenOf = snapshotChildPids();
         const pending = [retiringCliPid];
         const seen = new Set<number>();
@@ -39967,6 +39973,8 @@ async function restartCliProcess(
         }
       }
       if (restartingBackend) {
+        latestCliRetirement = retiringCliPid ? { pid: retiringCliPid, processScope: [...retiringProcessScope] } : undefined;
+        latestCliRetirementUncertain = !retiringCliPid;
         intentionalRestartBackend = restartingBackend;
         intentionallyRetiredBackends.add(restartingBackend);
       }
@@ -44153,6 +44161,13 @@ function startTranscriptImagePurge(
     rejectContinuation(PURGE_IMAGES_NOT_APPLIED);
     return;
   }
+  // A rejected repair must not cancel an older strict retry. Let that recovery
+  // settle first; the user can re-click after its restart/release boundary.
+  if (toolImages && failedTurnRewindInFlight) {
+    notify('worker.purge_images_busy');
+    rejectContinuation(PURGE_IMAGES_NOT_APPLIED);
+    return;
+  }
   const purgeOptions = { trustedProjectsRoot: claudeProjectsRoot ?? null };
   const trustedSessionsRoot = traeSessionsRoot();
   const purge = (target: import('./services/transcript-image-purge.js').PurgeResumeTarget, dryRun = false) => toolImages
@@ -44479,16 +44494,6 @@ function putBackFailedTurnCut(cut: FailedTurnCut): boolean {
  * a process, its own teardown must prove that process gone before restoration. */
 function settleSupersededCheckpointRewind(state: FailedTurnRewindInFlight): void {
   const cut = state.cut;
-  if (cut && !backend && !replacementSpawnInProgress) {
-    state.cut = undefined;
-    if (state.queued) state.queued.content = cut.plainContent;
-    const restored = putBackFailedTurnCut(cut);
-    state.report('declined', restored
-      ? 'checkpoint retry superseded; cut restored before the winning restart'
-      : `checkpoint retry superseded; cut NOT restored (backup ${cut.backupPath})`);
-    if (failedTurnRewindInFlight === state) failedTurnRewindInFlight = null;
-    return;
-  }
   if (cut && !closeRequested) {
     if (failedTurnRewindInFlight === state) failedTurnRewindInFlight = null;
     restartToPutBackCut(state, cut, 'superseded');
@@ -44550,6 +44555,7 @@ function restartToPutBackCut(
   cut: FailedTurnCut,
   trigger: 'stopped' | 'superseded' = 'stopped',
 ): void {
+  const replacementWasSpawning = replacementSpawnInProgress;
   const notRestored = (why: string) => `${trigger} after the cut; cut NOT restored, ${why} (backup ${cut.backupPath})`;
   void restartCliProcess(`put back a cut failed turn: its retry was ${trigger}`, {
     immediate: true,
@@ -44558,8 +44564,16 @@ function restartToPutBackCut(
     exactResumeSessionId: cut.sessionId,
     preserveScratchTreeForRespawn: cut.preserveScratchTree,
     beforeRespawn: async retiring => {
+      const processToProve = retiring.pid ? retiring : latestCliRetirement;
+      if (!retiring.pid && (replacementWasSpawning || latestCliRetirementUncertain)) {
+        held.report('declined', notRestored('the detached replacement has no proven exit scope'));
+        return;
+      }
       try {
-        await waitForRetiringCliQuiescence(retiring);
+        // No captured process means the cut's original exit proof is still the
+        // latest one and no uncertain replacement is in flight. Otherwise wait
+        // for the newest detached scope too; backend=null alone proves nothing.
+        if (processToProve) await waitForRetiringCliQuiescence(processToProve);
       } catch (err) {
         held.report('declined', notRestored(`CLI exit unproven: ${err instanceof Error ? err.message : String(err)}`));
         return;
@@ -46070,7 +46084,8 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
             }
           } else if (ordinaryImTurnId) rejectOrdinaryImTurn(ordinaryImTurnId, 'cli_input_unavailable');
         };
-        if (lastInitConfig?.cliId === 'traex' && !msg.failedTurnRewind) stopHeldFailedTurnRewind();
+        if (lastInitConfig?.cliId === 'traex' && !msg.failedTurnRewind
+          && !msg.purgeUndersizedImages && !msg.purgeToolImages) stopHeldFailedTurnRewind();
         if (msg.purgeUndersizedImages || msg.purgeToolImages) {
           startTranscriptImagePurge(msg.turnId, ordinaryImTurnId, enqueueMessage, msg.purgeToolImages === true);
           break;
