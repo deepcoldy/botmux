@@ -1539,6 +1539,7 @@ export class CodexBridgeQueue {
           provisional.provisionalTaskStartedAtMs = undefined;
           provisional.taskStartedRollbackAtMs = undefined;
           provisional.exactUserInputMatch = exactUserInputMatch;
+          provisional.nativeUserProof = { uuid: ev.uuid, hash: createHash('sha256').update(ev.text).digest('hex'), timestampMs: ev.timestampMs };
           if (!provisional.sourceSessionId && ev.sourceSessionId) {
             provisional.sourceSessionId = ev.sourceSessionId;
           }

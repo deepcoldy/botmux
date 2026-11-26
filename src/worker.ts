@@ -202,7 +202,9 @@ import { appendUnsentInputs, isUnsentInputReplayable, saveUnsentInputs, settleTa
 import { UniversalOutputHandoff } from './services/universal-output-handoff.js';
 import { WorkerOutputJournal } from './services/worker-output-journal.js';
 import { WorkerFinalOutputHandoff, canHandoffFinalOutput, FINAL_OUTPUT_HANDOFF_MAX_PENDING } from './services/final-output-handoff.js';
-import { stageBridgeFinalOutput, acknowledgeBridgeFinalOutput, type BridgeTurnJournalEntry } from './services/bridge-turn-journal.js';
+import { stageBridgeFinalOutput, acknowledgeBridgeFinalOutput, stageBridgeTurnNotice, acknowledgeBridgeTurnNotice, type BridgeTurnJournalEntry } from './services/bridge-turn-journal.js';
+import { RECOVERY_NOTICE_MAX_AGE_MS } from './services/ordinary-recovery-notice.js';
+import { isStructuredNoticeProtocolMessage } from './services/structured-notice-protocol.js';
 import { TurnSendLedger } from './services/turn-send-ledger.js';
 import { restartSpendsFreshBudget, exitMarksServerReplaced } from './core/restart-fresh-budget.js';
 import { createTranscriptTerminalSettle, type TranscriptTerminalSettle } from './services/transcript-terminal-settle.js';
@@ -459,6 +461,7 @@ import {
 } from './services/bridge-rotation-policy.js';
 import { CodexBridgeQueue, CodexMidTurnReplyCollector, pruneExpiredPreStartHeadsAndEmit, selectStaleRestoredJournalTurns, type CodexPendingTurn } from './services/codex-bridge-queue.js';
 import { uncollectedTurnsNeedingNotice } from './services/structured-uncollected-notice.js';
+import { StructuredMissingFinalWatchdog } from './services/structured-missing-final.js';
 import {
   BridgeBlindTurnWatch,
   blindTurnNeedsNotice,
@@ -2405,6 +2408,13 @@ function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigi
     delete context.scope.operationId;
     delete context.bindingId;
   }
+  if (isStructuredNoticeProtocolMessage(msg)) {
+    // A durable notice belongs to its worker recovery channel, not the runtime
+    // that happened to execute the turn. Keep execution for ownership checks.
+    delete context.scope.runtime;
+    delete context.scope.operationId;
+    delete context.bindingId;
+  }
   return { ...msg, sessionContract: context };
 }
 function runtimeIdentityForContract(binding: RuntimeEventBinding): RuntimeIdentity {
@@ -3486,6 +3496,9 @@ let pendingLaunchConvergence: { attemptId?: string; requested: RestartLaunchSett
 let replacementSpawnInProgress = false;
 let structuredStartGraceRecheckTimer: ReturnType<typeof setTimeout> | null = null;
 let structuredRejectedReadyEvidenceGeneration: number | undefined;
+// Meaningful only while the generation above is set. A rejected pre-start
+// prompt has no started native user proof and must not become post-start idle.
+let structuredRejectedReadyEvidenceStartUuid: string | undefined;
 const ptyOutputGeneration = new PtyOutputGeneration();
 const adoptWriteQueue = new AsyncSerialQueue();
 /** The effectiveResume flag used by the most recent spawnCli call. Written
@@ -12911,22 +12924,28 @@ function codexAdoptJournalPath(): string | undefined {
   return base && lastInitConfig?.adoptMode && structuredBridgeIs('codex') ? `${base}.codex-adopt` : undefined;
 }
 
-function checkpointCodexAdoptRecovery(): void {
+function checkpointCodexAdoptRecovery(strict = false): void {
   if (traexQuotaPending?.failedTurn) return;
   const path = codexAdoptJournalPath();
   // The first attach must consume the previous generation's journal before a
   // new pre-path input or an early empty drain can replace it.
   if (!path || !codexBridgeRolloutPath || !codexAdoptRecoveryAttempted) return;
   try { checkpointCodexAdoptTurns(path, codexBridgeRolloutPath, codexBridgeQueue, codexBridgeOffset); }
-  catch (error: unknown) { log(`Codex adopt checkpoint failed: ${error instanceof Error ? error.message : String(error)}`); }
+  catch (error: unknown) {
+    if (strict) throw error;
+    log(`Codex adopt checkpoint failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
-function checkpointStructuredBridgeRecovery(): void {
+function checkpointStructuredBridgeRecovery(strict = false): void {
   if (traexQuotaPending?.failedTurn) return;
   const path = structuredBridgeJournalPath();
   if (!path || !codexBridgeRolloutPath || !structuredBridgeRecoveryAttempted) return;
   try { checkpointCodexAdoptTurns(path, codexBridgeRolloutPath, codexBridgeQueue, codexBridgeOffset, structuredBridgeIs('doubao')); }
-  catch (error: unknown) { log(`Structured bridge checkpoint failed: ${error instanceof Error ? error.message : String(error)}`); }
+  catch (error: unknown) {
+    if (strict) throw error;
+    log(`Structured bridge checkpoint failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 /** Per-session durable file of built-in CronCreate task → topic anchors.
@@ -17139,6 +17158,14 @@ function codexBridgeStartTimer(): void {
       } catch (err: any) {
         log(`Codex bridge tick expiry error: ${err.message}`);
       }
+      try {
+        // Worker-function harnesses for older ticker branches provide only the
+        // dependencies of that branch; the full worker always supplies this.
+        if (typeof maybeSettleMissingStructuredFinal === 'function') maybeSettleMissingStructuredFinal();
+        if (typeof flushMissingFinalNotices === 'function') flushMissingFinalNotices();
+      } catch (err: any) {
+        log(`Missing-final turn settlement error: ${err.message}`);
+      }
     }
   }, 1000);
 }
@@ -17386,7 +17413,8 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
       if (recoverySkipReason) log(`Doubao bridge recovery skipped (${recoverySkipReason})`);
       if (restored && !recoverySkipReason) {
         const journalPath = structuredBridgeJournalPath();
-        const proof = journalPath ? readBridgeTurnJournal(journalPath).find(entry => entry.turnId === restored.turnId
+        const proof = journalPath ? readBridgeTurnJournal(journalPath).find(entry => !entry.pendingNotice
+          && entry.turnId === restored.turnId
           && entry.dispatchAttempt === restored.dispatchAttempt && entry.jsonlPath === rolloutPath)?.nativeUserProof : undefined;
         const validFrontier = proof && Number.isSafeInteger(proof.trajectoryOffset)
           && proof.trajectoryOffset >= 0 && proof.trajectoryOffset <= traj.newOffset
@@ -17836,6 +17864,7 @@ function codexBridgeDetachFile(): void {
   antigravityQuietCandidateKey = undefined;
   antigravityQuietCandidateCompleteOffset = undefined;
   antigravityFullUpgradeAttemptKey = undefined;
+  structuredMissingFinalWatchdog?.observe(undefined);
 }
 
 /** Resolve the pid of the Codex process this worker observes (spawned child or
@@ -18624,11 +18653,11 @@ function codexBridgeIngest(opts: {
   flushOmpTrailingFinal?: boolean;
   flushAntigravityTrailingFinal?: boolean;
   retireAntigravityPendingTurns?: boolean;
-} = {}): void {
+} = {}): boolean {
   // An authoritative rebind is pending: freeze the possibly-misbound file.
   // This includes quiet flushes, whose waiting narration or sibling answer
   // could otherwise settle the live owner before REAL becomes readable.
-  if (structuredBridgeIs('antigravity') && antigravityPendingRebind) return;
+  if (structuredBridgeIs('antigravity') && antigravityPendingRebind) return false;
   // Follow-up RPC turns install their exact bridge mark only after the
   // turn/start ACK passes the generation fence. Ordinary ingest must not
   // advance the rollout cursor in that window. Terminal hydration for an
@@ -18637,16 +18666,16 @@ function codexBridgeIngest(opts: {
   if (rpcTranscriptIngestBlockedByAwaitingActivation(
     rpcTurnsAwaitingActivation.keys(),
     opts.hydrationOwnerKey,
-  )) return;
+  )) return false;
   if (structuredBridgeIs('hermes')) {
     hermesBridgeIngest();
-    return;
+    return true;
   }
   if (structuredBridgeIs('mtr')) {
     mtrBridgeIngest();
-    return;
+    return true;
   }
-  if (!codexBridgeRolloutPath || !codexBridgeBaselineDone) return;
+  if (!codexBridgeRolloutPath || !codexBridgeBaselineDone) return false;
   // While a newly reported Antigravity conversation is still waiting for its
   // lazily-created brain file (`codexBridgePendingSessionId`), do not let
   // fs.watch or steady-state ticks ingest new unstarted turns from the
@@ -18658,7 +18687,7 @@ function codexBridgeIngest(opts: {
     && codexBridgePendingSessionId
     && !(codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined) || codexBridgeQueue.peek().length > 1)
   ) {
-    return;
+    return false;
   }
   const result = structuredBridgeIngestPath(codexBridgeRolloutPath, codexBridgeOffset, {
     flushOmpTrailingFinal: opts.flushOmpTrailingFinal,
@@ -18752,6 +18781,7 @@ function codexBridgeIngest(opts: {
     // stays stranded). Deliver it after the caller unwinds, to the same CLI.
     deferFinalIdleSignal();
   }
+  return true;
 }
 
 /** The idle signal of a final consumed by a non-signalling drain, raised on
@@ -19279,6 +19309,275 @@ function retireRpcLifecycleFromStructuredTerminal(
   codexBridgeQueue.stopRpcActive(identity.turnId, identity.dispatchAttempt);
 }
 
+interface PendingMissingFinalNotice {
+  path: string;
+  turnId: string;
+  noticeId: string;
+  message: string;
+  silent: boolean;
+  createdAtMs: number;
+  nextAttemptAtMs: number;
+}
+const pendingMissingFinalNotices = new Map<string, PendingMissingFinalNotice>();
+
+function transmitMissingFinalNotice(record: PendingMissingFinalNotice): void {
+  if (closeRequested || lastInitConfig?.structuredNoticeAck !== true) return;
+  const now = Date.now();
+  // Stop before the daemon expires its delivered dedupe tombstone. Cleanup
+  // failure keeps the expired record for another cleanup attempt, never a send.
+  if (now - record.createdAtMs > RECOVERY_NOTICE_MAX_AGE_MS) {
+    acknowledgeMissingFinalNotice(record.turnId, record.noticeId);
+    return;
+  }
+  record.nextAttemptAtMs = now + 5_000;
+  try {
+    if (record.silent) {
+      send({
+        type: 'turn_display_retired', turnId: record.turnId,
+        message: '', silent: true, noticeId: record.noticeId,
+      });
+    } else {
+      send({
+        type: 'user_notify',
+        message: record.message,
+        kind: 'structured_turn_not_collected',
+        turnId: record.turnId,
+        noticeId: record.noticeId,
+      });
+    }
+  } catch (error) {
+    // Disk remains the owner; the structured ticker retries the exact noticeId.
+    log(`Missing-final notice IPC deferred: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function notifyMissingFinalTurn(turnId: string, silent = false): void {
+  const message = silent ? '' : t('worker.structured_final_not_collected', { cliName: cliName() });
+  const path = codexAdoptJournalPath() ?? structuredBridgeJournalPath();
+  if (!path || !sessionId || !lastInitConfig?.larkAppId) throw new Error('missing-final notice journal unavailable');
+  const noticeId = createHash('sha256').update(JSON.stringify([
+    'structured_final_not_collected', lastInitConfig.larkAppId, sessionId, turnId,
+  ])).digest('hex').slice(0, 32);
+  // This atomic write is the authoritative recovery transition for BOTH
+  // negotiated and legacy sends. A crash/checkpoint failure cannot restore the
+  // old business owner even when no daemon ACK protocol exists.
+  const createdAtMs = Date.now();
+  stageBridgeTurnNotice(path, { turnId, noticeId, message, createdAtMs, silent });
+  if (lastInitConfig?.structuredNoticeAck !== true) {
+    try {
+      // Old daemons cannot ACK and misinterpret silent display retirement.
+      if (!silent) send({ type: 'user_notify', message, kind: 'structured_turn_not_collected', turnId });
+    } finally {
+      // Normal legacy operation retains no tombstone/capacity. If cleanup fails,
+      // the notice-only record still prevents business-owner resurrection.
+      try { acknowledgeBridgeTurnNotice(path, turnId, noticeId); }
+      catch (error) { log(`Legacy missing-final tombstone cleanup deferred: ${String(error)}`); }
+    }
+    return;
+  }
+  const record = { path, turnId, noticeId, message, silent, createdAtMs, nextAttemptAtMs: 0 };
+  pendingMissingFinalNotices.set(noticeId, record);
+  transmitMissingFinalNotice(record);
+}
+
+function restoreMissingFinalNotices(): void {
+  if (lastInitConfig?.structuredNoticeAck !== true) return;
+  const paths = [...new Set([codexAdoptJournalPath(), structuredBridgeJournalPath()].filter((path): path is string => !!path))];
+  for (const path of paths) {
+    for (const entry of readBridgeTurnJournal(path)) {
+      const pending = entry.pendingNotice;
+      if (!pending) continue;
+      pendingMissingFinalNotices.set(pending.noticeId, {
+        path, turnId: entry.turnId, noticeId: pending.noticeId,
+        message: pending.message, nextAttemptAtMs: 0, silent: pending.silent === true,
+        createdAtMs: pending.createdAtMs,
+      });
+    }
+  }
+  for (const record of pendingMissingFinalNotices.values()) transmitMissingFinalNotice(record);
+}
+
+function flushMissingFinalNotices(): void {
+  if (closeRequested || lastInitConfig?.structuredNoticeAck !== true) return;
+  const now = Date.now();
+  for (const record of pendingMissingFinalNotices.values()) {
+    if (record.nextAttemptAtMs <= now) transmitMissingFinalNotice(record);
+  }
+}
+
+function acknowledgeMissingFinalNotice(turnId: string, noticeId: string): void {
+  const record = pendingMissingFinalNotices.get(noticeId);
+  if (!record || record.turnId !== turnId) return;
+  try {
+    acknowledgeBridgeTurnNotice(record.path, turnId, noticeId);
+    pendingMissingFinalNotices.delete(noticeId);
+  } catch (error) {
+    log(`Missing-final notice ACK cleanup deferred: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function missingFinalTurnDeliveredBySend(turn: CodexPendingTurn, nextBoundaryMs: number | undefined): boolean {
+  const target = bridgeGateInputForTurn(sessionId, turn, {
+    // Unlike submit confirmation, a restarted worker has no in-memory write
+    // timestamp. The queue's persisted mark is the stable lower bound; an exact
+    // turn/attempt marker remains stronger than either timestamp.
+    markTimeMs: turn.markTimeMs,
+    isLocal: turn.isLocal,
+  }, lastInitConfig?.chatId, lastInitConfig?.rootMessageId);
+  return attributableBridgeReplyMarkers(target, nextBoundaryMs, readSendMarkers())
+    .some(marker => finalBridgeSendMarkerCoversOwnThread(target, marker));
+}
+
+function structuredRpcLifecycleOwnerActive(turn?: CodexPendingTurn): boolean {
+  return turn?.rpcActive === true
+    || rpcTurnsAwaitingActivation.size > 0
+    || rpcLifecycleFailClosedOwners.size > 0
+    || rpcTerminalHydrationOwners.size > 0
+    || rpcActiveOwners.size > 0
+    || settlingRpcTerminalOwners.size > 0;
+}
+
+function structuredMissingFinalHasLifecycleSignals(): boolean {
+  return idleDetector?.programStatusActive() === true
+    || (backendScreenEvidenceIsAuthoritativeForMutation()
+      && (!!cliAdapter?.busyPattern || typeof cliAdapter?.isSessionBusy === 'function'));
+}
+
+function structuredMissingFinalBlockedByPage(): boolean {
+  // A quiet Ask/permission/review page is a LIVE wait, not a completed turn.
+  // Reuse the existing terminal/page evidence instead of inventing a second
+  // idle detector for those surfaces.
+  return tuiPromptBlocking
+    || hookReviewInputHold
+    || !!idleDetector?.programStatusBlock()
+    || !!heldStuckPage()
+    || traexQuestionHoldsHeldInput();
+}
+
+interface StructuredMissingFinalTarget {
+  key: string;
+  turn: CodexPendingTurn;
+}
+
+const structuredMissingFinalWatchdog = new StructuredMissingFinalWatchdog();
+
+/** A started turn can outlive every native terminal source. Only sustained
+ *  CLI-idle + output-quiet evidence starts the COMMON missing-final wait:
+ *  non-blocking drivers use prompt-ready; lifecycle-blocking drivers use the
+ *  idle edge they rejected while the structured owner stayed open. */
+function structuredMissingFinalTarget(): StructuredMissingFinalTarget | undefined {
+  if (replyDeliveryMode() !== 'transcript' && !zeroPromptTerminalSync()) return undefined;
+  if (!codexBridgeRolloutPath || !codexBridgeBaselineDone) return undefined;
+  const turn = codexBridgeQueue.peek()[0];
+  if (!turn?.started || turn.finalText !== undefined || turn.isLocal) return undefined;
+  if (!structuredMissingFinalHasLifecycleSignals() || structuredMissingFinalBlockedByPage()) return undefined;
+  // task_started-only claims retain their original, much longer corroboration
+  // lease. A 20s screen wait must not turn that provisional start into a drop.
+  if (turn.provisionalTaskStartedAtMs !== undefined) return undefined;
+  // A driver-held terminal or a torn trailing line is still collectible input
+  // to the existing quiet flush/read path, never evidence of a missing final.
+  if (codexBridgePendingTail) return undefined;
+  if (structuredBridgeIs('oh-my-pi') && ompBridgeState().provisionalFinal) return undefined;
+  if (structuredBridgeIs('antigravity') && antigravityBridgeState().provisionalFinal) return undefined;
+  // RPC execution can be legitimately silent for a long time, and activation
+  // hand-off deliberately freezes ingest. No RPC lifecycle owner may use this
+  // screen/quiet watchdog, including an owner behind a predecessor queue head.
+  if (structuredRpcLifecycleOwnerActive(turn)) return undefined;
+  // The authoritative replacement transcript is not bound yet. Ingest and the
+  // existing Antigravity quiet flush both bail here, so a timeout cannot prove
+  // that the final is absent from the unbound file either.
+  if (structuredBridgeIs('antigravity') && antigravityPendingRebind) return undefined;
+  if (backgroundTaskTracker.pendingTurnAgents() > 0) return undefined;
+  if (structuredBridgeIs('antigravity') && hasAntigravityPendingTasks(antigravityBridgeState())) return undefined;
+  if (idleDetector?.programStatusHeldBusy()) return undefined;
+  const rejectedGeneration = structuredRejectedReadyEvidenceGeneration;
+  const rejectedStartUuid = structuredRejectedReadyEvidenceStartUuid;
+  const idle = isPromptReady || (hasStructuredLifecycleBlock()
+    && rejectedGeneration !== undefined && ptyOutputGeneration.isCurrent(rejectedGeneration)
+    && rejectedStartUuid !== undefined && rejectedStartUuid === turn.nativeUserProof?.uuid);
+  if (!idle) return undefined;
+  const outputGeneration = ptyOutputGeneration.snapshot();
+  return {
+    turn,
+    key: JSON.stringify([
+      turn.turnId, turn.dispatchAttempt, cliSpawnGeneration,
+      codexBridgeRolloutPath,
+      turn.sourceTurnId, turn.nativeUserProof?.uuid, turn.transcriptStartTimeMs,
+      lastStructuredBridgeActivityAtMs, outputGeneration,
+    ]),
+  };
+}
+
+/** Give late transcript bytes the first chance, then retire ONLY the exact
+ *  still-idle owner whose wait expired. No CLI-specific recovery is attempted:
+ *  the user is told to read the native terminal instead of guessing a reply. */
+function maybeSettleMissingStructuredFinal(): void {
+  const target = structuredMissingFinalTarget();
+  if (!structuredMissingFinalWatchdog.observe(target?.key)) return;
+  let drainCompleted = false;
+  try { drainCompleted = codexBridgeIngest(); } catch (err: any) {
+    // A read error is not evidence that the final is absent. Keep the owner and
+    // start a fresh bounded wait; a later tick may successfully read a final
+    // that was already on disk at this deadline.
+    log(`Missing-final drain before turn retirement failed: ${err.message}`);
+    structuredMissingFinalWatchdog?.observe(undefined);
+    return;
+  }
+  if (!drainCompleted) {
+    // No transcript was actually read (detached, rebind, RPC activation, ...).
+    // Keep the owner and start a fresh wait only after a real read can run.
+    structuredMissingFinalWatchdog?.observe(undefined);
+    return;
+  }
+  const current = structuredMissingFinalTarget();
+  if (!current || current.key !== target!.key) {
+    structuredMissingFinalWatchdog.observe(current?.key);
+    return;
+  }
+  const { turn } = current;
+  // Legacy send markers have no exact turn id: bound their attribution before
+  // the drop can advance/replay the next started successor.
+  const nextBoundaryMs = codexBridgeQueue.peek().slice(1)
+    .find(candidate => candidate.started)?.markTimeMs;
+  let retireSilently = false;
+  if (turn.dispatchAttempt === undefined) {
+    const hasSubmitNotice = structuredTurnsWithSubmitNotice.has(turn.turnId);
+    retireSilently = hasSubmitNotice || missingFinalTurnDeliveredBySend(turn, nextBoundaryMs);
+    try {
+      // Stage + IPC happen before the in-memory drop for BOTH warning and silent
+      // retirement. A stage failure retains the owner; IPC failures retry on disk.
+      notifyMissingFinalTurn(turn.turnId, retireSilently);
+    } catch (error) {
+      log(`Missing-final notice staging failed; keeping the owner: ${error instanceof Error ? error.message : String(error)}`);
+      structuredMissingFinalWatchdog?.observe(undefined);
+      return;
+    }
+  }
+  const dropped = codexBridgeQueue.dropPendingTurn(turn.turnId, turn.dispatchAttempt, true);
+  structuredMissingFinalWatchdog?.observe(undefined);
+  if (!dropped) return;
+  // Universal output handoff can make emitReadyCodexTurns return before its
+  // legacy checkpoint. The ordinary warning above already has its own pinned
+  // pendingNotice; this secondary checkpoint cannot restore that business owner.
+  let checkpointError: unknown;
+  try { checkpointCodexAdoptRecovery(true); } catch (error) { checkpointError = error; }
+  try { checkpointStructuredBridgeRecovery(true); } catch (error) { checkpointError ??= error; }
+  log(`Structured transcript stayed idle without a final for turn ${turn.turnId}; ending the wait and directing the user to the Web terminal`);
+  if (turn.dispatchAttempt !== undefined) {
+    emitTurnTerminal(turn.turnId, 'ambiguous', 'structured_final_not_collected', turn.dispatchAttempt);
+  }
+  retireStructuredTurnAttribution([...(dropped.supersededTurns ?? []), dropped]);
+  if (turn.dispatchAttempt === undefined && retireSilently) {
+    structuredTurnsWithSubmitNotice.delete(turn.turnId);
+  }
+  // Dropping the dead head can replay a buffered successor user/final pair.
+  emitReadyCodexTurns();
+  redriveRejectedStructuredReady();
+  // Cleanup and successor replay must not be half-skipped. The pinned notice
+  // owns ordinary recovery; surface the strict checkpoint failure afterwards.
+  if (checkpointError) throw checkpointError;
+}
+
 /** An ordinary Lark turn whose transcript start never arrived is a reply the
  *  bridge can no longer deliver: its head is gone, so even if the CLI answers,
  *  the final has nothing to attach to. Until now that was one INFO log line and
@@ -19783,6 +20082,7 @@ function stopCodexBridge(): void {
   mtrBridgeSource = undefined;
   mtrBridgeOffset = 0;
   mtrBridgeBaselineDone = false;
+  structuredMissingFinalWatchdog?.observe(undefined);
   codexBridgeQueue.clearPending();
   codexBridgeQueue.setLocalTurns(false);
   resetThinkingChannel();
@@ -26245,6 +26545,14 @@ function redriveRejectedStructuredReady(): void {
     return;
   }
   if (hasStructuredLifecycleBlock()) {
+    // Head advance re-evaluates the same still-current idle boundary against
+    // the NEW started owner. Never carry the predecessor's proof across, and
+    // never bind an unstarted head: that would re-admit a pre-start edge.
+    if (ptyOutputGeneration.isCurrent(readyEvidenceGeneration)) {
+      const head = codexBridgeQueue.peek()[0];
+      structuredRejectedReadyEvidenceStartUuid = head?.started && head.finalText === undefined
+        ? head.nativeUserProof?.uuid : undefined;
+    }
     const nextRemainingMs = codexBridgeQueue.preStartLeaseRemainingMs();
     if (nextRemainingMs !== undefined) scheduleStructuredStartGraceRecheck(nextRemainingMs);
     return;
@@ -26783,6 +27091,9 @@ function markPromptReady(): void {
     }
     cliSubmissionInFlight.readyDeferred = true;
     structuredRejectedReadyEvidenceGeneration = ptyOutputGeneration.snapshot();
+    const rejectedReadyOwner = codexBridgeQueue.peek()[0];
+    structuredRejectedReadyEvidenceStartUuid = rejectedReadyOwner?.started && rejectedReadyOwner.finalText === undefined
+      ? rejectedReadyOwner.nativeUserProof?.uuid : undefined;
     idleDetector?.reset();
     return;
   }
@@ -26899,6 +27210,9 @@ function markPromptReady(): void {
     // blocked until turn_completed so they cannot publish idle mid-turn.
     const remainingMs = codexBridgeQueue.preStartLeaseRemainingMs();
     structuredRejectedReadyEvidenceGeneration = ptyOutputGeneration.snapshot();
+    const rejectedReadyOwner = codexBridgeQueue.peek()[0];
+    structuredRejectedReadyEvidenceStartUuid = rejectedReadyOwner?.started && rejectedReadyOwner.finalText === undefined
+      ? rejectedReadyOwner.nativeUserProof?.uuid : undefined;
     // Keep the historical phrase (integration fixtures match it) and append
     // the machine-readable reason the skip happened.
     const skipReason = remainingMs !== undefined ? 'submit-verification-pending' : 'structured-turn-unfinished';
@@ -45020,6 +45334,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       activeRestartAttemptId = msg.restartAttemptId;
       seedInitTurnTerminals(msg);
       initializeFinalOutputHandoff(msg);
+      restoreMissingFinalNotices();
       applyInitFinalOutputBackpressure(msg, ordinaryImTurnId);
       // Dashboard grants stay per-boot, while the Lark-card capability is
       // revocable at the logical Session lifecycle boundary.
@@ -45719,6 +46034,11 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
     case 'final_output_accepted': {
       try { workerFinalOutputHandoff?.acknowledge(msg); }
       catch (error) { log(`Final output ACK cleanup deferred: ${String(error)}`); }
+      break;
+    }
+
+    case 'structured_turn_not_collected_ack': {
+      acknowledgeMissingFinalNotice(msg.turnId, msg.noticeId);
       break;
     }
 
