@@ -48,6 +48,8 @@ export interface CardClickTurnRuntimeDeps {
   /** `principal_lane` wins over `cross_principal` when both apply. */
   sessionBlockedShape?(session: CardClickBoundSession | undefined): 'ok' | 'principal_lane' | 'cross_principal';
   nextStepCurrent?(session: CardClickBoundSession, turnId: string): boolean;
+  /** 个人助理模式不允许多人群时：这个群现在能不能干活（恰好只有主人一个真人）。没注入 = 不限。 */
+  assistantGroupAdmitted?(larkAppId: string, chatId: string): Promise<boolean>;
   startTurn(
     session: CardClickBoundSession,
     args: { senderOpenId: string; memberUnionId?: string; prompt: string; responseToTurnId?: string },
@@ -73,7 +75,8 @@ export type CardClickTurnFailure =
   | 'delivery_failed'
   | 'app_mismatch'
   | 'principal_lane'
-  | 'cross_principal';
+  | 'cross_principal'
+  | 'assistant_group';
 
 function memberUnionId(unionId: string | undefined): string | undefined {
   return unionId?.startsWith('on_') ? unionId : undefined;
@@ -138,6 +141,12 @@ export async function acceptCardClickTurn(
   }
   const blockedShape = deps.sessionBlockedShape?.(session) ?? 'ok';
   if (blockedShape !== 'ok') return { ok: false, reason: blockedShape };
+  // 已有会话和新建会话都要过：群变成多人、或主人已不在群里时，不能再借卡片进主人的会话。
+  if (chatType === 'group' && deps.assistantGroupAdmitted) {
+    let admittedGroup = false;
+    try { admittedGroup = await deps.assistantGroupAdmitted(input.larkAppId, chatId); } catch { /* 查不到 → 拒 */ }
+    if (!admittedGroup) return { ok: false, reason: 'assistant_group' };
+  }
 
   const responseToTurnId = claims.responseToTurnId;
   let prompt = claims.prompt;

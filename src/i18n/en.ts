@@ -1801,6 +1801,7 @@ export const messages: Record<string, string> = {
   'card.click_turn.started': 'Started this turn as you',
   'card.click_turn.principal_lane': 'This button cannot run on a principal-lane session',
   'card.click_turn.cross_principal': 'This button cannot run while cross-principal interruption is on',
+  'card.click_turn.assistant_group': 'Assistant mode works only in a group whose one person is its owner; this button cannot run here now',
   'card.click_turn.rejected': 'This button is invalid or has been tampered with',
   'card.click_turn.expired': 'This button has expired',
   'card.click_turn.replayed': 'This button has already been used',

@@ -19,7 +19,7 @@ import { config } from '../../config.js';
 import { getSessionGroup } from '../../services/session-groups-store.js';
 import { getAssistantOwner, setAssistantOwner } from '../../services/assistant-owner-store.js';
 import { isValidAssistantOpenId, notifyAssistantOwnerChanged, resolveAssistantOwnerOpenId } from '../../core/assistant-mode.js';
-import { assistantMultiUserGroupsOff } from '../../core/assistant-spawn.js';
+import { assistantMultiUserGroupsOff, assistantSoloGroupAdmission } from '../../core/assistant-spawn.js';
 import { logger } from '../../utils/logger.js';
 
 export const ASSISTANT_COMMAND_RE = /^\/assistant(?:\s|$)/i;
@@ -73,24 +73,31 @@ export async function assistantGroupIsMultiUser(
 }
 
 /**
- * 单人群里发消息的真人不是登记的主人 ⇒ 主人已不在群里（多半是主动退群：那个事件不推给我们）。
- * 返回该主人的 open_id，调用方按「主人退群」处理（标记离开、停会话、提示认领），之后这个群
- * 不再用主人的目录服务别人。只在 tryHandleAssistantMultiUserGroup 放行（恰好 1 个真人）之后调用。
+ * 单人群（tryHandleAssistantMultiUserGroup 已放行）里，主人是不是还在群里。主人主动退群不推事件，
+ * 登记会停在旧主人，所以：
+ * - 真人发言且不是主人 ⇒ 主人已不在，返回 absentOwner，调用方按「主人退群」处理；
+ * - bot 发言没法拿发言人比，现拉成员列表核对：主人不在 ⇒ absentOwner；人数不对或拉不到 ⇒ drop；
+ * - 还没认领的群不管（没有主人目录可进）。
  */
-export function assistantSoloGroupAbsentOwner(
+export async function assistantSoloGroupOwnerCheck(
   larkAppId: string,
   message: any,
   senderOpenId: string | undefined,
   senderIsBot: boolean,
-): string | undefined {
+): Promise<{ drop?: true; absentOwner?: string }> {
   const chatId: string | undefined = message?.chat_id;
-  if (message?.chat_type === 'p2p' || !chatId || senderIsBot || !senderOpenId || !assistantMultiUserGroupsOff(larkAppId)) return undefined;
+  if (message?.chat_type === 'p2p' || !chatId || !assistantMultiUserGroupsOff(larkAppId)) return {};
   const owner = resolveAssistantOwnerOpenId({
     chatType: 'group',
     sessionGroupOwnerOpenId: getSessionGroup(chatId)?.ownerOpenId,
     stored: getAssistantOwner(config.session.dataDir, larkAppId, chatId),
   });
-  return owner && owner !== senderOpenId ? owner : undefined;
+  if (!owner) return {};
+  if (!senderIsBot && senderOpenId) return owner !== senderOpenId ? { absentOwner: owner } : {};
+  const admission = await assistantSoloGroupAdmission(larkAppId, chatId);
+  if (admission.ok) return {};
+  if (admission.reason === 'owner_absent') return { absentOwner: owner };
+  return { drop: true };
 }
 
 /** 测试用：清空限频记录。 */

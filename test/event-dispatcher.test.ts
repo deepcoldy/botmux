@@ -4438,6 +4438,37 @@ describe('message listener polling backfill', () => {
     handlers = makeHandlers();
   });
 
+  it('assistant mode: a card polled while the group had two people stays consumed after it drops to one', async () => {
+    (mockGetBot() as any).config.assistantMode = true;
+    try {
+      __resetChatStatsForTest();
+      const card = makeHistoryMessage({
+        senderAppId: OTHER_BOT_APP_ID,
+        senderType: 'app',
+        messageType: 'interactive',
+        messageId: 'msg-polled-assistant-multi',
+        chatId: 'chat_listener',
+        content: JSON.stringify({ title: 'Argos平台报警', elements: [[{ tag: 'text', text: 'Lego插件调用 SLA 低于 95%' }]] }),
+        createTime: String(Date.now()),
+      });
+      mockGetChatInfo.mockResolvedValue({ userCount: 2, botCount: 1 });
+      mockListChatMessagesUntil.mockResolvedValueOnce([card]);
+      await __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
+      await flushEventWork();
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+
+      __resetChatStatsForTest();
+      __resetMessageListenerPollCursorForTest();
+      mockGetChatInfo.mockResolvedValue({ userCount: 1, botCount: 1 });
+      mockListChatMessagesUntil.mockResolvedValueOnce([card]);
+      await __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
+      await flushEventWork();
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    } finally {
+      delete (mockGetBot() as any).config.assistantMode;
+    }
+  });
+
   it('routes a recent top-level Argos interactive card found in chat history', async () => {
     const card = makeHistoryMessage({
       senderAppId: OTHER_BOT_APP_ID,
@@ -18279,6 +18310,18 @@ describe('assistant mode without multi-user groups (assistantGroupChat off)', ()
       mockGetChatInfo.mockResolvedValue({ userCount: 1, botCount: 1 });
       await capturedHandlers['im.message.receive_v1'](groupMessage('msg-assistant-absent-1', 'oc_assistant_absent', other));
       await flushEventWork();
+      expect(handleChatMemberUserDeleted).toHaveBeenCalledWith('oc_assistant_absent', [owner], MY_APP_ID);
+
+      // bot 发言没法拿发言人比：现查成员，主人不在就同样按退群处理。
+      handleChatMemberUserDeleted.mockClear();
+      mockListChatMemberOpenIds.mockResolvedValue([other]);
+      await capturedHandlers['im.message.receive_v1'](makeBotMessageEvent({
+        senderOpenId: OTHER_BOT_OPEN_ID, senderAppId: OTHER_BOT_APP_ID, content: JSON.stringify({ text: '@Bot hello' }),
+        messageId: 'msg-assistant-absent-bot', chatId: 'oc_assistant_absent',
+        mentions: [{ key: '@_bot', name: 'Bot', id: { open_id: MY_OPEN_ID } }],
+      }));
+      await flushEventWork();
+      expect(mockListChatMemberOpenIds).toHaveBeenCalledWith(MY_APP_ID, 'oc_assistant_absent');
       expect(handleChatMemberUserDeleted).toHaveBeenCalledWith('oc_assistant_absent', [owner], MY_APP_ID);
 
       handleChatMemberUserDeleted.mockClear();

@@ -1799,6 +1799,7 @@ export const messages: Record<string, string> = {
   'card.click_turn.started': '已按你的身份开始这一轮',
   'card.click_turn.principal_lane': '这个会话走 principal lane，这个按钮不能用',
   'card.click_turn.cross_principal': '开启了跨本人插话时，这个按钮不能用',
+  'card.click_turn.assistant_group': '助理模式只在只有主人一个人的群里工作，这个按钮现在不能用',
   'card.click_turn.rejected': '按钮无效或已被篡改',
   'card.click_turn.expired': '按钮已过期',
   'card.click_turn.replayed': '这个按钮已经用过了',

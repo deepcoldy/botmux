@@ -72,7 +72,7 @@ import { tryHandleChatTabsCommand } from './chat-tabs-command.js';
 import { tryHandleMentionModeCommand } from './mention-mode-command.js';
 import { tryHandleSecretaryCommand } from './secretary-command.js';
 import { observeGroupSecretaryMessage } from '../../services/group-secretary-runtime.js';
-import { assistantGroupIsMultiUser, assistantSoloGroupAbsentOwner, tryHandleAssistantCommand, tryHandleAssistantMultiUserGroup } from './assistant-command.js';
+import { assistantGroupIsMultiUser, assistantSoloGroupOwnerCheck, tryHandleAssistantCommand, tryHandleAssistantMultiUserGroup } from './assistant-command.js';
 import { assistantMultiUserGroupsOff } from '../../core/assistant-spawn.js';
 import { isChatManager } from '../../services/chat-manager.js';
 import { resolveSubstituteAppMentions, substituteMentionIdentities } from './substitute-app-mentions.js';
@@ -4381,15 +4381,20 @@ async function dispatchPolledMessageListenerMatch(input: {
   chatId: string;
   messageId: string;
 }): Promise<void> {
-  // 个人助理模式不允许多人群：轮询补到的群消息同样不派发（与实时消息入口的闸一致）。
-  if (assistantMultiUserGroupsOff(input.larkAppId) && await assistantGroupIsMultiUser(input.larkAppId, input.chatId)) {
-    logger.debug(`[message-listener:${input.larkAppId}] multi-user group ${input.chatId.substring(0, 12)}; polled message ignored`);
-    return;
-  }
   if (!claimMessageOnce(input.larkAppId, input.messageId)) {
     logger.debug(`[message-listener:${input.larkAppId}] polled duplicate ignored msg=${input.messageId.substring(0, 12)}`);
     return;
   }
+  // 个人助理模式不允许多人群：轮询补到的群消息同样不派发（与实时消息入口的闸一致）。先记已处理再丢，
+  // 免得群变回单人后下一轮轮询把这条旧消息补投出去。
+  if (assistantMultiUserGroupsOff(input.larkAppId) && await assistantGroupIsMultiUser(input.larkAppId, input.chatId)) {
+    logger.debug(`[message-listener:${input.larkAppId}] multi-user group ${input.chatId.substring(0, 12)}; polled message ignored`);
+    return;
+  }
+  // 单人群：轮询补到的消息发言人身份不一定可信，统一现查成员核对主人还在（同实时入口 bot 发言的处理）。
+  const ownerCheck = await assistantSoloGroupOwnerCheck(input.larkAppId, input.data?.message, input.match.senderOpenId, true);
+  if (ownerCheck.drop) return;
+  if (ownerCheck.absentOwner) await input.handlers.handleChatMemberUserDeleted?.(input.chatId, [ownerCheck.absentOwner], input.larkAppId);
   logger.info(
     `[message-listener:${input.larkAppId}] matched polled chat=${input.chatId.substring(0, 12)} ` +
     `msg=${input.messageId.substring(0, 12)} sender=${input.match.senderOpenId?.substring(0, 12) ?? '-'}`,
@@ -6087,8 +6092,10 @@ export function createLarkEventDispatcherRuntime(
         const st = sender?.sender_type;
         const senderIsBot = st === 'app' || st === 'bot';
         if (await tryHandleAssistantMultiUserGroup(larkAppId, message, sender?.sender_id?.open_id, senderIsBot)) return;
-        // 单人群里说话的不是主人：主人已不在群里，按主人退群处理，之后这条消息按未认领的群走。
-        const absentOwner = assistantSoloGroupAbsentOwner(larkAppId, message, sender?.sender_id?.open_id, senderIsBot);
+        // 单人群里主人已不在（真人发言者不是主人，或 bot 发言时现查成员没有主人）：按主人退群处理，
+        // 之后这条消息按未认领的群走。bot 发言且核对不了 ⇒ 丢弃。
+        const { drop, absentOwner } = await assistantSoloGroupOwnerCheck(larkAppId, message, sender?.sender_id?.open_id, senderIsBot);
+        if (drop) return;
         if (absentOwner) {
           logger.info(`[assistant-mode:${larkAppId}] owner ${absentOwner.slice(0, 12)}… is not in solo group ${chatId.substring(0, 12)}; treating as left`);
           await handlers.handleChatMemberUserDeleted?.(chatId, [absentOwner], larkAppId);

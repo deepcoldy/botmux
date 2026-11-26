@@ -41,7 +41,9 @@ vi.mock('../src/im/lark/message-parser.js', () => ({
 }));
 
 const mockReplyMessage = vi.fn(async () => 'msg-id');
+const mockListChatMemberOpenIds = vi.fn(async (): Promise<string[]> => []);
 vi.mock('../src/im/lark/client.js', () => ({
+  listChatMemberOpenIds: (...a: any[]) => mockListChatMemberOpenIds(...a),
   replyMessage: (...a: any[]) => mockReplyMessage(...a),
 }));
 
@@ -65,7 +67,7 @@ vi.mock('../src/utils/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-import { assistantSoloGroupAbsentOwner, resetAssistantMultiUserNoticesForTest, tryHandleAssistantCommand, tryHandleAssistantMultiUserGroup } from '../src/im/lark/assistant-command.js';
+import { assistantSoloGroupOwnerCheck, resetAssistantMultiUserNoticesForTest, tryHandleAssistantCommand, tryHandleAssistantMultiUserGroup } from '../src/im/lark/assistant-command.js';
 import { getAssistantOwner, setAssistantOwner } from '../src/services/assistant-owner-store.js';
 
 const APP = 'cli_a1b2c3d4e5f60718';
@@ -292,28 +294,41 @@ describe('assistantGroupChat off: multi-user group gate', () => {
 });
 
 describe('assistantGroupChat off: a one-person group whose person is not the owner', () => {
-  const absent = (sender: string | undefined, opts: { bot?: boolean; chatType?: 'group' | 'p2p' } = {}) =>
-    assistantSoloGroupAbsentOwner(APP, msg('hi', { chatType: opts.chatType }), sender, opts.bot ?? false);
-  beforeEach(() => { assistantGroupChat = false; });
+  const check = (sender: string | undefined, opts: { bot?: boolean; chatType?: 'group' | 'p2p' } = {}) =>
+    assistantSoloGroupOwnerCheck(APP, msg('hi', { chatType: opts.chatType }), sender, opts.bot ?? false);
+  beforeEach(() => { assistantGroupChat = false; mockListChatMemberOpenIds.mockReset(); mockListChatMemberOpenIds.mockResolvedValue([]); });
 
-  it('names the recorded owner when someone else is the only person left', () => {
+  it('names the recorded owner when someone else is the only person left', async () => {
     setAssistantOwner(dataDir, APP, CHAT, ALICE, 'claimed');
-    expect(absent(BOB)).toBe(ALICE);
+    expect(await check(BOB)).toEqual({ absentOwner: ALICE });
+    expect(mockListChatMemberOpenIds).not.toHaveBeenCalled();
   });
 
-  it('a session group owner counts as the recorded owner', () => {
+  it('a session group owner counts as the recorded owner', async () => {
     sessionGroupOwner = ALICE;
-    expect(absent(BOB)).toBe(ALICE);
+    expect(await check(BOB)).toEqual({ absentOwner: ALICE });
   });
 
-  it('says nothing for the owner, unclaimed groups, bots, DMs or when multi-user groups are allowed', () => {
-    expect(absent(BOB)).toBeUndefined();
+  it('a bot speaking cannot vouch for the owner: the member list decides', async () => {
     setAssistantOwner(dataDir, APP, CHAT, ALICE, 'claimed');
-    expect(absent(ALICE)).toBeUndefined();
-    expect(absent(BOB, { bot: true })).toBeUndefined();
-    expect(absent(undefined)).toBeUndefined();
-    expect(absent(BOB, { chatType: 'p2p' })).toBeUndefined();
+    mockListChatMemberOpenIds.mockResolvedValue([BOB]);
+    expect(await check(BOB, { bot: true })).toEqual({ absentOwner: ALICE });
+    mockListChatMemberOpenIds.mockResolvedValue([ALICE]);
+    expect(await check(BOB, { bot: true })).toEqual({});
+    mockListChatMemberOpenIds.mockResolvedValue([ALICE, BOB]);
+    expect(await check(BOB, { bot: true })).toEqual({ drop: true });
+    mockListChatMemberOpenIds.mockRejectedValue(new Error('lark down'));
+    expect(await check(undefined, { bot: true })).toEqual({ drop: true });
+  });
+
+  it('says nothing for the owner, unclaimed groups, DMs or when multi-user groups are allowed', async () => {
+    expect(await check(BOB)).toEqual({});
+    expect(await check(BOB, { bot: true })).toEqual({});
+    setAssistantOwner(dataDir, APP, CHAT, ALICE, 'claimed');
+    expect(await check(ALICE)).toEqual({});
+    expect(await check(BOB, { chatType: 'p2p' })).toEqual({});
     assistantGroupChat = true;
-    expect(absent(BOB)).toBeUndefined();
+    expect(await check(BOB)).toEqual({});
+    expect(mockListChatMemberOpenIds).not.toHaveBeenCalled();
   });
 });

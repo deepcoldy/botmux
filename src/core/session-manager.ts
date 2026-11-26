@@ -19,7 +19,7 @@ import { recordScheduledSessionRun } from './scheduled-send.js';
 import { basename, dirname, join } from 'node:path';
 import { expandHome, validateWorkingDir } from './working-dir.js';
 import { config } from '../config.js';
-import { assistantMultiUserGroupsOff, resolveAssistantSpawn } from './assistant-spawn.js';
+import { assistantMultiUserGroupsOff, assistantSoloGroupAdmission, resolveAssistantSpawn } from './assistant-spawn.js';
 import * as sessionStore from '../services/session-store.js';
 import { groupContextEpoch, groupContextForPrompt } from '../services/group-context-prompt.js';
 import { getRuntimeTask, scheduledWorkingDirSwapReason, updateRuntimeTaskState } from './scheduler.js';
@@ -4908,23 +4908,24 @@ export async function executeScheduledTask(
   const larkClient = await import('../im/lark/client.js');
   const { getChatMode, sendMessage, replyMessage } = larkClient;
 
-  // 个人助理模式不允许多人群：投到真人 ≥2 的群、或唯一的人不是主人的群的任务，在发任何东西之前就拒掉。任务上的 chatType
-  // 是建任务时来源会话的类型：投回建任务那个私聊的任务可信，其余现查；查不到按多人群拒。
-  if (assistantMultiUserGroupsOff(larkAppId)
-    && !(task.chatType === 'p2p' && (task.creatorChatId === undefined || task.creatorChatId === task.chatId))) {
-    let multiUser = true;
+  // 个人助理模式不允许多人群：投到群的任务，群里得恰好只有主人一个真人，否则在发任何东西之前就拒掉
+  // （未认领也拒，免得先发横幅再失败）。只有投回建任务那个私聊的任务免查；任务上的 chatType 是建任务时
+  // 来源会话的类型，改过投递目标后不可信，按现查到的群类型往下走。查不到一律拒。
+  if (assistantMultiUserGroupsOff(larkAppId) && !(task.chatType === 'p2p' && task.creatorChatId === task.chatId)) {
+    let refusal: string | undefined = 'lookup_failed';
     try {
       const facts = await larkClient.getChatRoutingFacts(larkAppId, task.chatId);
-      multiUser = facts.mode !== 'p2p' && (await larkClient.getChatInfo(larkAppId, task.chatId)).userCount !== 1;
-      // 单人群里那个人得是主人：主人不在群里（主动退群不推事件）时，不能用主人的目录给别人跑。
-      if (!multiUser && facts.mode !== 'p2p') {
-        const spawn = resolveAssistantSpawn(larkAppId, task.chatId, 'group', undefined);
-        if (spawn.kind === 'owner') multiUser = !(await larkClient.listChatMemberOpenIds(larkAppId, task.chatId)).includes(spawn.openId);
+      if (facts.mode === 'p2p') {
+        refusal = undefined;
+      } else {
+        const admission = await assistantSoloGroupAdmission(larkAppId, task.chatId);
+        refusal = admission.ok ? undefined : admission.reason;
+        if (admission.ok && task.chatType === 'p2p') task = { ...task, chatType: 'group' };
       }
-    } catch { /* 查不到 → 按多人群拒 */ }
-    if (multiUser) {
-      logger.warn(`[scheduler] refusing to fire ${task.id}: assistant mode serves only a group whose one person is its owner (${task.chatId})`);
-      throw new Error(`assistant mode: multi-user groups are not allowed; scheduled run to ${task.chatId} refused`);
+    } catch { /* 查不到 → 拒 */ }
+    if (refusal) {
+      logger.warn(`[scheduler] refusing to fire ${task.id}: assistant mode serves only a group whose one person is its owner (${task.chatId}, ${refusal})`);
+      throw new Error(`assistant mode: group ${task.chatId} is not a one-person group of its owner (${refusal}); scheduled run refused`);
     }
   }
 

@@ -5,7 +5,7 @@
  * getOwnerOpenId, and it never copies the session owner or creator into the
  * caller or the reply-target sender.
  */
-import { resolveAssistantSpawn } from '../core/assistant-spawn.js';
+import { assistantMultiUserGroupsOff, assistantSoloGroupAdmission, resolveAssistantSpawn } from '../core/assistant-spawn.js';
 import { existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -384,6 +384,8 @@ export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
       return 'ok';
     },
     nextStepCurrent,
+    assistantGroupAdmitted: async (appId, chatId) =>
+      !assistantMultiUserGroupsOff(appId) || (await assistantSoloGroupAdmission(appId, chatId)).ok,
     startTurn,
   });
 

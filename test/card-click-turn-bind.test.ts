@@ -15,8 +15,14 @@ const mocks = vi.hoisted(() => ({
   isTeamBot: vi.fn(() => false),
   secretPaths: [] as string[],
   assistantSpawn: { kind: 'off' } as { kind: 'off' } | { kind: 'unclaimed' } | { kind: 'owner'; openId: string; workDir: string },
+  multiUserGroupsOff: false,
+  soloGroupAdmission: vi.fn(async (): Promise<{ ok: boolean; reason?: string }> => ({ ok: true })),
 }));
-vi.mock('../src/core/assistant-spawn.js', () => ({ resolveAssistantSpawn: () => mocks.assistantSpawn, assistantMultiUserGroupsOff: () => false }));
+vi.mock('../src/core/assistant-spawn.js', () => ({
+  resolveAssistantSpawn: () => mocks.assistantSpawn,
+  assistantMultiUserGroupsOff: () => mocks.multiUserGroupsOff,
+  assistantSoloGroupAdmission: (...a: unknown[]) => mocks.soloGroupAdmission(...a),
+}));
 
 vi.mock('../src/core/worker-pool.js', () => ({
   dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
@@ -246,6 +252,41 @@ describe('card click turn binder', () => {
     expect(refused.started.ok).toBe(false);
     expect(refused.created).toBeUndefined();
     expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('assistant mode without multi-user groups: a click runs only while the owner is the one person in the group', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'card-click-bind-'));
+    dirs.push(dataDir);
+    mocks.multiUserGroupsOff = true;
+    try {
+      const click = async (activeSessions: Map<string, DaemonSession>, nonce: string) => {
+        const binder = createCardClickTurnBinder({
+          activeSessions, dataDir: () => dataDir, noteTurnReceived: async () => undefined, beginNewTurn: () => undefined,
+          trustedCallerForInboundTurn: async (_app, openId) => ({ requestUserOpenId: openId, requestLarkAppId: 'cli_app', senderType: 'user' as const }),
+        });
+        const issued = issueCardClickTurn({ secret: 'secret', larkAppId: 'cli_app', prompt: 'p', chatId: 'oc_chat', workingDir: '/tmp', now: Date.now(), nonce });
+        if (!issued.ok) throw new Error(issued.error);
+        return binder.accept({ larkAppId: 'cli_app', operatorOpenId: 'ou_clicker', payload: issued.payload, sig: issued.sig });
+      };
+      mocks.assistantSpawn = { kind: 'owner', openId: 'ou_owner_a', workDir: '/home/u/ou_owner_a/work' };
+      mocks.soloGroupAdmission.mockResolvedValue({ ok: false, reason: 'owner_absent' });
+      const fresh = new Map<string, DaemonSession>();
+      expect(await click(fresh, 'nonce-assistant-grp1')).toEqual({ ok: false, reason: 'assistant_group' });
+      expect(fresh.size).toBe(0);
+      const ds = session();
+      const live = new Map([['oc_chat::cli_app', ds]]);
+      expect(await click(live, 'nonce-assistant-grp2')).toEqual({ ok: false, reason: 'assistant_group' });
+      expect(mocks.soloGroupAdmission).toHaveBeenCalledWith('cli_app', 'oc_chat');
+      expect(mocks.sendWorkerInput).not.toHaveBeenCalled();
+      expect(mocks.forkWorker).not.toHaveBeenCalled();
+
+      mocks.soloGroupAdmission.mockResolvedValue({ ok: true });
+      const accepted = await click(live, 'nonce-assistant-grp3');
+      expect(accepted.ok).toBe(true);
+    } finally {
+      mocks.multiUserGroupsOff = false;
+      mocks.assistantSpawn = { kind: 'off' };
+    }
   });
 
   it('does not start a turn when the clicker is a cached app', async () => {
