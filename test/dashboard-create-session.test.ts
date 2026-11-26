@@ -16,7 +16,7 @@ import type { DaemonSession } from '../src/core/types.js';
 const store = new Map<string, Session>();
 let sessionSeq = 0;
 const assistant = vi.hoisted(() => ({ spawn: { kind: 'off' } as any }));
-vi.mock('../src/core/assistant-spawn.js', () => ({ resolveAssistantSpawn: () => assistant.spawn }));
+vi.mock('../src/core/assistant-spawn.js', () => ({ resolveAssistantSpawn: () => assistant.spawn, assistantMultiUserGroupsOff: () => false }));
 // Group-level directory bindings recorded by /g --dir (created-groups.json).
 const groupDirState = vi.hoisted(() => ({ value: undefined as string | undefined }));
 vi.mock('../src/services/created-groups-store.js', () => ({

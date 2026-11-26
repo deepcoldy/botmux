@@ -71,11 +71,28 @@ const sendMessageMock = vi.fn(async () => 'om_banner_123');
 const replyMessageMock = vi.fn(async () => 'om_reply_456');
 const getChatModeMock = vi.fn(async () => 'group');
 const getMessageThreadIdMock = vi.fn(async () => 'omt_target_thread');
+const getChatRoutingFactsMock = vi.fn(async () => ({ external: false, mode: 'group' as 'group' | 'p2p' }));
+const listChatMemberOpenIdsMock = vi.fn(async (): Promise<string[]> => []);
+const resolveTargetAppOpenIdMock = vi.fn(async (): Promise<any> => ({ status: 'definitive' }));
+const resolveAssistantSpawnCalls: unknown[][] = [];
+vi.mock('../src/core/assistant-spawn.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/core/assistant-spawn.js')>();
+  return {
+    ...actual,
+    resolveAssistantSpawn: (...a: Parameters<typeof actual.resolveAssistantSpawn>) => {
+      resolveAssistantSpawnCalls.push(a);
+      return actual.resolveAssistantSpawn(...a);
+    },
+  };
+});
 vi.mock('../src/im/lark/client.js', () => ({
   sendMessage: (...a: any[]) => sendMessageMock(...a),
   replyMessage: (...a: any[]) => replyMessageMock(...a),
   getChatMode: (...a: any[]) => getChatModeMock(...a),
   getMessageThreadId: (...a: any[]) => getMessageThreadIdMock(...a),
+  getChatRoutingFacts: (...a: any[]) => getChatRoutingFactsMock(...a),
+  listChatMemberOpenIds: (...a: any[]) => listChatMemberOpenIdsMock(...a),
+  resolveTargetAppOpenId: (...a: any[]) => resolveTargetAppOpenIdMock(...a),
   downloadMessageResource: vi.fn(),
   listChatBotMembers: vi.fn(async () => []),
   listCurrentChatBotMembers: vi.fn(async () => []),
@@ -212,6 +229,7 @@ import { recordDispatchInputCommit, foldableChatSessionAppIds } from '../src/cor
 import { sessionKey } from '../src/core/types.js';
 import { writeDeferredTopicBinding, removeDeferredTopicBinding } from '../src/core/deferred-topic-binding.js';
 import { config } from '../src/config.js';
+import { assistantOwnerStorePath, setAssistantOwner } from '../src/services/assistant-owner-store.js';
 import { TopicSendError } from '../src/cli/topic-send-guard.js';
 import {
   __testOnly_activeSessions as daemonActiveSessions,
@@ -2008,5 +2026,175 @@ describe('task-position restart recovery', () => {
 
     expect(sessionStoreCloseMock).toHaveBeenCalledWith('sess-restore-unmaterialized');
     expect(daemonActiveSessions.size).toBe(0);
+  });
+});
+
+describe('assistant mode without multi-user groups (assistantGroupChat off)', () => {
+  const cfg = BOT.config as typeof BOT.config & { assistantMode?: boolean; assistantGroupChat?: boolean };
+  const OWNER = 'ou_' + 'a'.repeat(32);
+  const OTHER = 'ou_' + 'b'.repeat(32);
+  const claim = () => setAssistantOwner(config.session.dataDir, APP, CHAT, OWNER, 'claimed');
+  beforeEach(() => {
+    cfg.assistantMode = true;
+    delete cfg.assistantGroupChat;
+    getChatRoutingFactsMock.mockReset();
+    getChatRoutingFactsMock.mockResolvedValue({ external: false, mode: 'group' });
+    listChatMemberOpenIdsMock.mockReset();
+    listChatMemberOpenIdsMock.mockResolvedValue([OWNER]);
+    resolveTargetAppOpenIdMock.mockReset();
+    resolveTargetAppOpenIdMock.mockResolvedValue({ status: 'definitive' });
+    resolveAssistantSpawnCalls.length = 0;
+  });
+  afterEach(() => {
+    delete cfg.assistantMode; delete cfg.assistantGroupChat;
+    rmSync(assistantOwnerStorePath(config.session.dataDir, APP), { force: true });
+  });
+  const REFUSED = /is not a one-person group of its owner/;
+  const notRefused = (e: Error) => expect(e.message).not.toMatch(REFUSED);
+
+  it('refuses a run into a group with two people before posting anything', async () => {
+    claim();
+    listChatMemberOpenIdsMock.mockResolvedValue([OWNER, OTHER]);
+    const active = new Map<string, DaemonSession>();
+    await expect(executeScheduledTask(baseTask({}), active, refreshCliVersion)).rejects.toThrow(/multi_user/);
+    expect(listChatMemberOpenIdsMock).toHaveBeenCalledWith(APP, CHAT);
+    expect(sendMessageMock).not.toHaveBeenCalled(); expect(replyMessageMock).not.toHaveBeenCalled();
+    expect(forkWorkerMock).not.toHaveBeenCalled(); expect(store.size).toBe(0);
+  });
+
+  it('refuses when the member list is empty or cannot be read', async () => {
+    claim();
+    listChatMemberOpenIdsMock.mockResolvedValue([]);
+    await expect(executeScheduledTask(baseTask({}), new Map(), refreshCliVersion)).rejects.toThrow(REFUSED);
+    listChatMemberOpenIdsMock.mockRejectedValue(new Error('lark down'));
+    await expect(executeScheduledTask(baseTask({}), new Map(), refreshCliVersion)).rejects.toThrow(/lookup_failed/);
+    getChatRoutingFactsMock.mockRejectedValue(new Error('lark down'));
+    await expect(executeScheduledTask(baseTask({}), new Map(), refreshCliVersion)).rejects.toThrow(/lookup_failed/);
+    expect(sendMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('refuses an unclaimed one-person group before the banner', async () => {
+    listChatMemberOpenIdsMock.mockResolvedValue([OTHER]);
+    await expect(executeScheduledTask(baseTask({ silent: false }), new Map(), refreshCliVersion)).rejects.toThrow(/unclaimed/);
+    expect(sendMessageMock).not.toHaveBeenCalled(); expect(replyMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('refuses a one-person group whose person is not the owner, and runs when the owner is that person', async () => {
+    claim();
+    listChatMemberOpenIdsMock.mockResolvedValue([OTHER]);
+    await expect(executeScheduledTask(baseTask({}), new Map(), refreshCliVersion)).rejects.toThrow(/owner_absent/);
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    listChatMemberOpenIdsMock.mockResolvedValue([OWNER, OWNER]);
+    await executeScheduledTask(baseTask({ id: 'task0003' }), new Map(), refreshCliVersion).catch(notRefused);
+    expect(forkWorkerMock).toHaveBeenCalled();
+  });
+
+  it('a DM task without creatorChatId that now targets a group is checked, and spawns as a group', async () => {
+    claim();
+    listChatMemberOpenIdsMock.mockResolvedValue([OWNER, OTHER]);
+    await expect(executeScheduledTask(baseTask({ chatType: 'p2p', ownerOpenId: OTHER }), new Map(), refreshCliVersion))
+      .rejects.toThrow(/multi_user/);
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    listChatMemberOpenIdsMock.mockResolvedValue([OWNER]);
+    await executeScheduledTask(baseTask({ id: 'task0004', chatType: 'p2p', ownerOpenId: OWNER }), new Map(), refreshCliVersion)
+      .catch(notRefused);
+    expect(resolveAssistantSpawnCalls.at(-1)?.[2]).toBe('group');
+  });
+
+  it('refuses a recorded scheduled actor who is no longer the current group owner', async () => {
+    claim();
+    listChatMemberOpenIdsMock.mockResolvedValue([OWNER]);
+    await expect(executeScheduledTask(
+      baseTask({ ownerOpenId: OTHER, ownerUnionId: 'on_old', creatorLarkAppId: APP }), new Map(), refreshCliVersion,
+    )).rejects.toThrow(/scheduled actor is not the current chat owner/);
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    expect(store.size).toBe(0);
+  });
+
+  it('fails closed for union-only actors who map to another owner or cannot be resolved', async () => {
+    claim();
+    listChatMemberOpenIdsMock.mockResolvedValue([OWNER]);
+    const resolutions = [
+      { status: 'resolved', openId: OTHER },
+      { status: 'transient' },
+      { status: 'definitive' },
+    ] as const;
+    for (const [index, resolution] of resolutions.entries()) {
+      resolveTargetAppOpenIdMock.mockResolvedValueOnce(resolution);
+      await expect(executeScheduledTask(
+        baseTask({ id: `task-union-${index}`, ownerOpenId: undefined, ownerUnionId: 'on_old', creatorLarkAppId: APP }),
+        new Map(), refreshCliVersion,
+      )).rejects.toThrow(/scheduled actor is not the current chat owner/);
+    }
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    expect(store.size).toBe(0);
+  });
+
+  it('rechecks the actor after identity preparation and closes a fresh candidate on owner change', async () => {
+    setAssistantOwner(config.session.dataDir, APP, CHAT, OTHER, 'claimed');
+    listChatMemberOpenIdsMock.mockResolvedValue([OTHER]);
+    const active = new Map<string, DaemonSession>();
+    await expect(executeScheduledTask(
+      baseTask({ ownerOpenId: OTHER, ownerUnionId: 'on_old', creatorLarkAppId: APP }), active, refreshCliVersion, undefined,
+      { prepareTurnIdentity: async () => {
+        setAssistantOwner(config.session.dataDir, APP, CHAT, OWNER, 'claimed');
+        listChatMemberOpenIdsMock.mockResolvedValue([OWNER]);
+      } },
+    )).rejects.toThrow(/scheduled actor is not the current chat owner/);
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    expect(active.size).toBe(0);
+    expect(store.get('sess-1')?.status).toBe('closed');
+  });
+
+  it('rechecks schedule authority after member lookup before posting any banner', async () => {
+    claim();
+    let finishMembers!: (members: string[]) => void;
+    listChatMemberOpenIdsMock.mockImplementation(() => new Promise<string[]>(resolve => { finishMembers = resolve; }));
+    const assertExecutionCurrent = vi.fn(async () => { throw new Error('schedule paused'); });
+    const running = executeScheduledTask(baseTask({}), new Map(), refreshCliVersion, undefined, { assertExecutionCurrent });
+    await vi.waitFor(() => expect(listChatMemberOpenIdsMock).toHaveBeenCalledOnce());
+    finishMembers([OWNER]);
+    await expect(running).rejects.toThrow('schedule paused');
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    expect(replyMessageMock).not.toHaveBeenCalled();
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    expect(store.size).toBe(0);
+  });
+
+  it('rechecks authority after the final member lookup before forking', async () => {
+    claim();
+    listChatMemberOpenIdsMock.mockResolvedValue([OWNER]);
+    let checks = 0;
+    const assertExecutionCurrent = vi.fn(async () => {
+      checks++;
+      if (checks === 2) throw new Error('schedule paused during final member lookup');
+    });
+    const active = new Map<string, DaemonSession>();
+    await expect(executeScheduledTask(baseTask({}), active, refreshCliVersion, undefined, { assertExecutionCurrent }))
+      .rejects.toThrow('schedule paused during final member lookup');
+    expect(assertExecutionCurrent).toHaveBeenCalledTimes(2);
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    expect(active.size).toBe(0);
+    expect(store.get('sess-1')?.status).toBe('closed');
+  });
+
+  it('a cross-chat task labelled p2p is looked up: a real DM passes, without listing members', async () => {
+    getChatRoutingFactsMock.mockResolvedValue({ external: false, mode: 'p2p' });
+    await executeScheduledTask(baseTask({ chatType: 'p2p', creatorChatId: 'oc_elsewhere', ownerOpenId: OWNER }), new Map(), refreshCliVersion)
+      .catch(notRefused);
+    expect(getChatRoutingFactsMock).toHaveBeenCalledTimes(2);
+    expect(listChatMemberOpenIdsMock).not.toHaveBeenCalled();
+  });
+
+  it('a task in its own DM and a bot that allows multi-user groups need no lookup', async () => {
+    await executeScheduledTask(baseTask({ chatType: 'p2p', creatorChatId: CHAT }), new Map(), refreshCliVersion)
+      .catch(notRefused);
+    cfg.assistantGroupChat = true;
+    await executeScheduledTask(baseTask({ id: 'task0002' }), new Map(), refreshCliVersion)
+      .catch(notRefused);
+    expect(getChatRoutingFactsMock).not.toHaveBeenCalled();
+    expect(listChatMemberOpenIdsMock).not.toHaveBeenCalled();
   });
 });

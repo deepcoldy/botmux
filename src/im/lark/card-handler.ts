@@ -1664,6 +1664,7 @@ function cardClickTurnToastKey(reason: string): string {
     case 'delivery_failed': return 'card.click_turn.delivery_failed';
     case 'principal_lane': return 'card.click_turn.principal_lane';
     case 'cross_principal': return 'card.click_turn.cross_principal';
+    case 'assistant_group': return 'card.click_turn.assistant_group';
     default: return 'card.click_turn.rejected';
   }
 }
