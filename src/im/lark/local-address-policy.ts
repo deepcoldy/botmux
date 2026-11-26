@@ -114,7 +114,7 @@ function contextFor(input: LocalAddressContext): Context {
     // Brackets already delimit an IPv6 host, so a preceding word or a following
     // colon cannot make it a domain suffix. Consume a numeric port and legal
     // horizontal whitespace when present; otherwise still mask the bracketed IP.
-    bracketedHostNames: new RegExp('\\[(?:' + bracketedHosts.join('|') + ')\\](?::[ \\t]*\\d+(?![\\w.:-]))?' + hostPath, 'giu'),
+    bracketedHostNames: new RegExp('\\[[ \\t]*(?:' + bracketedHosts.join('|') + ')[ \\t]*\\](?::[ \\t]*\\d+(?![\\w.:-]))?' + hostPath, 'giu'),
     internalFile: input.internalFileLabel ?? '【内部文件】',
     unavailableLink: input.unavailableLinkLabel ?? '（未提供可访问链接）',
     hostIssuedLink: input.hostIssuedLink,
@@ -186,7 +186,8 @@ function localDestination(value: string, ctx: Context): boolean {
 function localLinkLabel(label: string, target: string, ctx: Context): string {
   // Link rewriting strips brackets; never turn a local IPv6 label back into
   // bare prose that the narrowed colon-run matcher deliberately leaves alone.
-  if (isIP(label) === 6 && localServiceUrl(`http://[${label}]`, ctx)) label = ctx.internalFile;
+  const ipLabel = label.trim();
+  if (isIP(ipLabel) === 6 && localServiceUrl(`http://[${ipLabel}]`, ctx)) label = ctx.internalFile;
   if (/(?:^|[\\/])SKILL\.md(?:[?#:]|$)/i.test(decoded(target))) return label;
   const relative = inWorkspace(target, ctx);
   if (relative) return label === relative ? relative : label + ' (' + relative + ')';

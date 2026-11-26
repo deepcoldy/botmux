@@ -165,6 +165,30 @@ describe('local address presentation policy', () => {
     },
   );
 
+  it.each([
+    ['[ :: ]:8080/x', '[F]（未提供可访问链接）:8080/x'],
+    ['[\t::\t]:8080/x', '[F]（未提供可访问链接）:8080/x'],
+    ['[  ::  ]', '[F]'],
+    ['a [ ::1 ] b', 'a [F] b'],
+  ])('masks a whitespace-padded local IPv6 bracket: %s', (text, expected) => {
+    const context = { internalFileLabel: '[F]' };
+    const output = sanitizeLocalAddressText(text, context);
+    expect(output).toBe(expected);
+    expect(output).not.toContain('::');
+    expect(sanitizeLocalAddressText(output, context)).toBe(output);
+  });
+
+  it('masks padded local IPv6 reference labels while keeping padded remote IPv6 readable', () => {
+    const context = { internalFileLabel: '[F]', unavailableLinkLabel: ' [blocked]' };
+    const text = 'See [x][ :: ]\r\n\r\n[ :: ]: 8080/a\r\n[ ::1 ]: 8081/b';
+    const output = sanitizeLocalAddressText(text, context);
+    expect(output).toBe('See x [blocked]\r\n\r\n[F] [blocked]: 8080/a\r\n[F] [blocked]: 8081/b');
+    expect(output).not.toContain('::');
+    expect(sanitizeLocalAddressText(output, context)).toBe(output);
+    const remote = '[ 2001:db8::1 ]';
+    expect(sanitizeLocalAddressText(remote, context)).toBe(remote);
+  });
+
   it('preserves colon-delimited fields alongside local addresses in a fenced card', () => {
     const card = (content: string) => JSON.stringify({ body: { elements: [{ tag: 'markdown', content }] } });
     const header = '```text\nroute = rpc|example.service:staging:::|lookup|\n';
