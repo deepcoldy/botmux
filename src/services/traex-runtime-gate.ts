@@ -559,8 +559,13 @@ export async function acquireTraexRuntimePeerLease(
   parent: TraexRuntimeLease,
   input: TraexRuntimePeerLeaseInput,
 ): Promise<TraexGateAcquireResult> {
-  if (parent.occupancyOnly || !parent.snapshot.comboKey) {
+  if (parent.occupancyOnly || parent.coordinate === false || !parent.snapshot.comboKey) {
     return { kind: 'error', reason: 'uncoordinated', detail: 'peer requires a proven coordinated lease' };
+  }
+  const parentRecord = readTraexRuntimeOccupants(parent.domain)
+    ?.find(occupant => occupant.occupantId === parent.occupantId);
+  if (!parentRecord || parentRecord.cliPid === undefined) {
+    return { kind: 'error', reason: 'uncoordinated', detail: 'parent lease has no attached running CLI' };
   }
   const now = input.now ?? Date.now;
   const occupantId = [input.workerPid, input.workerStart ?? 'nostart', now(), Math.random().toString(36).slice(2, 10)].join('-');

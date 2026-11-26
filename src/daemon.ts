@@ -38728,14 +38728,6 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         // same occurrence parks behind a TRAE target, their exact accepted turns
         // must join that park's ledger or the mixed run can never fully settle.
         const acceptedNonTraeTurns = new Map<string, string>();
-        const dispatchTargetCliIds = new Map<string, string | undefined>();
-        const fallbackTargetCliId = (chatId: string): string | undefined => {
-          if (dispatchTargetCliIds.has(chatId)) return dispatchTargetCliIds.get(chatId);
-          const selected = [...activeSessions.values()].find(session => session.chatId === chatId);
-          if (selected) return selected.session.cliLaunchSnapshot?.cliId ?? selected.session.cliId
-            ?? getAllBots().find(bot => bot.config.larkAppId === selected.larkAppId)?.config.cliId;
-          return getAllBots().find(bot => bot.config.larkAppId === task.larkAppId)?.config.cliId ?? cfg.cliId;
-        };
         const pending: string[] = [];
         const heldTarget = (chatId: string, turnId: string | undefined): boolean =>
           parked?.targets[chatId] === 'held'
@@ -38824,7 +38816,6 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                             ?? selectedSession.session.cliId
                             ?? selectedBotCliId)
                           : undefined;
-                        dispatchTargetCliIds.set(targetTask.chatId!, targetCliId);
                         // Only a real TRAE dispatch participates in the handoff
                         // ledger. Other CLIs' ordinary dispatch errors must never
                         // be converted into a 30-minute TRAE retry storm.
@@ -38872,7 +38863,6 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                           ?? dispatchedSession.session.cliId
                           ?? selectedBotCliId)
                         : undefined;
-                      dispatchTargetCliIds.set(targetTask.chatId!, targetCliId);
                       if (targetCliId === undefined || targetCliId === 'traex') {
                         scheduler.markDeferredTargetHeld(
                           task.id, executionContext.runId, targetTask.chatId!, targetTurnId, effectiveAppId,
@@ -38895,10 +38885,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             const failedChatIds = error instanceof ScheduleTargetExecutionError
               ? error.targetResults.filter(result => result.outcome === 'error').map(result => result.chatId)
               : pending.length === 1 ? [pending[0]!] : [];
-            // A TRAE start failure remains retryable under the same run/turn.
-            // Only a proven non-TRAE permanent target error terminates the
-            // logical run instead of leaving its chat `waiting` forever.
-            if (failedChatIds.length === 0 || failedChatIds.every(chatId => fallbackTargetCliId(chatId) === 'traex')) {
+            // Runtime handoff waits are expressed as `deferred`, never thrown
+            // errors. Any target that actually throws is a terminal dispatch
+            // failure for this logical run, including TRAE launch failures.
+            if (failedChatIds.length === 0) {
               if (error instanceof ScheduleTargetExecutionError) targetResults = error.targetResults;
               throw error;
             }

@@ -401,6 +401,9 @@ describe('deferred scheduled run lifecycle', () => {
       .filter(entry => entry.outcome === 'error');
     expect(errors).toHaveLength(1);
     expect(errors[0].errorCode).toBe('deferred_unsettled');
+    expect(errors[0].targetResults).toEqual([
+      { chatId: 'oc_a', outcome: 'deferred' }, { chatId: 'oc_b', outcome: 'deferred' },
+    ]);
     scheduler.stopScheduler();
   });
 

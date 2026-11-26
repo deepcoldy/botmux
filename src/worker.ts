@@ -1335,10 +1335,10 @@ async function settleTraexLeasesForShutdown(): Promise<void> {
 
 /** Stop owned processes BEFORE their registry leases can be settled. False
  * means death could not be proven; callers must leave the occupant for prune. */
-async function stopOwnedProcessesForTraexSettlement(): Promise<boolean> {
+async function stopOwnedProcessesForTraexSettlement(opts: { destroyBackend?: boolean } = {}): Promise<boolean> {
   closeRequested = true;
   const rpcTeardown = stopCodexRpcEngine();
-  const victim = backend;
+  const victim = opts.destroyBackend === false ? undefined : backend;
   const cliPid = victim?.getChildPid?.();
   let backendStopped = true;
   try {
@@ -1381,6 +1381,9 @@ function stopCodexRpcEngine(): Promise<boolean> {
   }
   const engine = codexRpcEngine;
   const publishedLease = traexRpcLeaseContext;
+  // teardown now exclusively owns settlement. A concurrent shutdown may only
+  // await it, never race a second release against stopAndWait/deathUnproven.
+  traexRpcLeaseContext = undefined;
   taskContinuationRpcGeneration = undefined;
   const ownedRpcTurns = new Set([
     ...rpcTurnsAwaitingActivation.keys(),
@@ -1407,6 +1410,8 @@ function stopCodexRpcEngine(): Promise<boolean> {
         }
       }
       catch (error) {
+        const lease = owned === engine ? publishedLease : pending?.engine === owned ? pending.lease : undefined;
+        if (lease && owned.appServerPid) await lease.lease.markDeathUnproven(owned.appServerPid);
         processesStopped = false;
         log(`RPC app-server teardown could not prove process death: ${String(error)}`);
       }
@@ -1989,6 +1994,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
   let enginePidMarker: string | null = null;
   let freshDeliveryOwned = false;
   const assertRpcEngagementCurrent = (): void => {
+    if (cfg.turnId && cancelledQueuedTurnIds.has(cfg.turnId)) throw new CliSpawnSupersededError();
     if (closeRequested || engagement.cancelled || !rpcEngagementFence.isCurrent(engagementLease)) {
       throw new CliSpawnSupersededError();
     }
@@ -2431,6 +2437,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
           }
         }
       } catch (error) {
+        if (rpcLeaseContext && engine?.appServerPid) await rpcLeaseContext.lease.markDeathUnproven(engine.appServerPid);
         processesStopped = false;
         log(`RPC engagement teardown could not prove process death: ${String(error)}`);
       }
@@ -3994,6 +4001,7 @@ interface TraexSpawnLeaseContext {
   readonly lease: TraexRuntimeLease;
   running: boolean;
   settled: boolean;
+  cliPid?: number;
   /** Exact detach operation shared by inner/outer exits and shutdown. */
   settlement?: Promise<void>;
   settlementRetry?: ReturnType<typeof setTimeout>;
@@ -23617,10 +23625,13 @@ function handleQueuedTurnCancel(requestId: string, turnId: string): void {
       openingMayBeArgvBaked = true;
     }
   }
+  const freshRpcOpening = lastInitConfig?.turnId === turnId
+    && codexRpcEligible(lastInitConfig, { sandboxForced: sandboxEnabled() });
   const alreadyWritten = inflightInputs.hasLiveTurn(turnId)
     || (currentBotmuxTurnId === turnId && !!backend
       && (initPromptMaterialized || openingMayBeArgvBaked))
     || openingMayBeArgvBaked
+    || freshRpcOpening
     || rpcTurnMayHaveBeenSubmitted(turnId);
   const status = alreadyWritten
     ? 'restart_required' as const
@@ -31665,9 +31676,9 @@ function sendToPty(
   };
   if (next.turnId && cancelledQueuedTurnIds.has(next.turnId)) return true;
   if (!initPromptMaterialized) {
-    if (!deferTurnInputCommitUntilSubmission(next.dispatchAttempt, next.durablePrimaryInbox)) {
-      turnInputCommitDeferredForMaterialization.add(next);
-    }
+    // codexRpcEngine is still undecided here. Always retain the exact item;
+    // only the materialization drain below may filter durable submissions.
+    turnInputCommitDeferredForMaterialization.add(next);
     pendingMessages.push(next);
     log(`Queued message behind async init materialization (${pendingMessages.length} pending)`);
     return true;
@@ -33153,7 +33164,8 @@ async function registerAdoptedTraexRuntime(
   const fixedPath = typeof cfg.cliPathOverride === 'string' && cfg.cliPathOverride.trim().length > 0;
   const configuredEntry = fixedPath ? resolveCommandEntry(cfg.cliPathOverride!.trim()) : resolveCommandEntry('traex');
   const resolvedEntry = resolveCommandReal(configuredEntry);
-  const candidatePid = adoptBackendPid ?? cfg.adoptCliPid;
+  const candidatePid = cfg.adoptCliPid && isTraexProcess(cfg.adoptCliPid)
+    ? cfg.adoptCliPid : adoptBackendPid;
   const cliPid = candidatePid && isTraexProcess(candidatePid) ? candidatePid : undefined;
   const cliStart = cliPid ? readProcessStartIdentity(cliPid) : undefined;
   const gate = await acquireTraexRuntimeOccupancy({
@@ -33178,6 +33190,7 @@ async function registerAdoptedTraexRuntime(
   }
   const context = createTraexSpawnLeaseContext(gate.lease);
   context.running = true;
+  if (cliPid) context.cliPid = cliPid;
   traexRuntimeLeaseContext = context;
   startTraexSpawnLeaseHeartbeat(context);
   if (cliPid) {
@@ -33199,7 +33212,9 @@ function settleAdoptedTraexRuntime(
   // disconnect do not prove CLI death and therefore cannot release occupancy.
   if ((effectiveBackendType === 'tmux' || effectiveBackendType === 'zellij')
     && isObserveBackend(observer) && !observer.isPaneAlive()) {
-    void settleTraexSpawnLease(context, true);
+    // A recorded PID always requires kernel death proof, even when pane_alive
+    // is false. Only a PID-less pane may use its death proof to abandon.
+    void settleTraexSpawnLease(context, context.cliPid === undefined);
     return;
   }
   log('[traex-runtime] adopted runtime death is unproven; occupancy retained');
@@ -35408,6 +35423,7 @@ async function spawnCliBody(
   const attachTraexLeaseCli = (pid: number): void => {
     const context = traexSpawnLeaseContext;
     if (!context || context.settled) return;
+    context.cliPid = pid;
     const lease = context.lease;
     const cliStart = readProcessStartIdentity(pid);
     // Prove the leaf really runs the frozen object this lease registered. A
@@ -35488,6 +35504,10 @@ async function spawnCliBody(
       if (spawnGeneration !== cliSpawnGeneration) return 'spawn-superseded';
       return undefined;
     });
+    if (closeRequested || spawnGeneration !== cliSpawnGeneration) {
+      await viewer.context.abandon();
+      throw new CliSpawnSupersededError();
+    }
     traexSpawnLeaseContext = viewer.context;
     traexRuntimeLeaseContext = viewer.context;
     setLocalTraexSpawnAbandon(viewer.context.abandon);
@@ -38882,7 +38902,7 @@ async function spawnCliBody(
     if (spawnGeneration !== cliSpawnGeneration) {
       // The reservation belongs to a superseded generation; drop it before it
       // can exec anything, then let the caller treat this as a normal abort.
-      await pendingTraexSpawnAbandon?.();
+      await localTraexSpawnAbandon?.();
       throw new CliSpawnSupersededError();
     }
     let spawnedAntigravityAccountReport: { accountId: string } | undefined;
@@ -39012,7 +39032,7 @@ async function spawnCliBody(
     // it). Never abandon a pid that may be writing the shared cache.
     const spawnedPid = backend?.getChildPid?.();
     if (spawnedPid) attachTraexLeaseCli(spawnedPid);
-    else await pendingTraexSpawnAbandon?.();
+    else await localTraexSpawnAbandon?.();
     cleanupCodexAppControlBootstrap();
     programStatusRelayPlanCleanup?.();
     if (!willReattachPersistent && sandboxTreeOutlivesPane) {
@@ -46900,6 +46920,11 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         let initialInputCommitted = false;
         let initialInputQueued = false;
         const initialTurnCancelled = !!msg.turnId && cancelledQueuedTurnIds.has(msg.turnId);
+        if (initialTurnCancelled && isCodexAppCliId(msg.cliId)) {
+          // The cancelled opening may be discarded, but unrelated accepted
+          // predecessors retain their exact turn identities and FIFO order.
+          pendingMessages.unshift(...recoveredAcceptedInputs);
+        }
         if (!initialTurnCancelled && shouldQueueInitialPrompt({
           hasPrompt: !!msg.prompt,
           rpcEngineActive: !!codexRpcEngine,
@@ -47317,7 +47342,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         const closeUnderWay = closeRequested;
         if (!closeUnderWay) retiredRuntimeBackend = backend;
         closeRequested = true;
-        const processesStopped = await stopOwnedProcessesForTraexSettlement();
+        const processesStopped = await stopOwnedProcessesForTraexSettlement({ destroyBackend: false });
         stopBridgeWatcher(); stopScreenshotLoop(); killCli();
         if (processesStopped) await settleTraexLeasesForShutdown();
         if (!closeUnderWay) armRetiredRuntimeExit(msg.bindingId);

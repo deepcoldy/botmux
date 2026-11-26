@@ -22,6 +22,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
+import { once } from 'node:events';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
@@ -810,11 +811,132 @@ describe('runtime registry lifecycle regressions', () => {
     expect(precheckTraexRuntime({ traeHome: home, releaseDir: dir }).state).toBe('compatible');
   });
 
+  it('uses the POSIX process-group probe on non-Linux platforms instead of permanent unknown', async () => {
+    const platform = vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin');
+    try {
+      const domain = testDomain(traeHome());
+      await acquireTraexRuntimeStart(domain, {
+        occupantId: 'live-group', comboKey: 'content-a', cliPid: process.pid,
+        workerPid: process.pid, daemonPid: process.pid,
+      });
+      await markTraexRuntimeDeathUnproven(domain, 'live-group', process.pid);
+      expect(occupantLiveness(readTraexRuntimeOccupants(domain)![0])).toBe('alive');
+      await acquireTraexRuntimeStart(domain, {
+        occupantId: 'dead-group', comboKey: 'content-a', cliPid: 2_000_000_000,
+        workerPid: process.pid, daemonPid: process.pid,
+      });
+      await markTraexRuntimeDeathUnproven(domain, 'dead-group', 2_000_000_000);
+      expect(occupantLiveness(readTraexRuntimeOccupants(domain)!.find(entry => entry.occupantId === 'dead-group')!)).toBe('dead');
+    } finally {
+      platform.mockRestore();
+    }
+  });
+
+  it.skipIf(process.platform !== 'linux')('treats a zombie-only process group as dead', async () => {
+    const domain = testDomain(traeHome());
+    const python = String.raw`
+import ctypes, os, time
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.prctl(36, 1, 0, 0, 0) != 0: raise OSError(ctypes.get_errno(), 'prctl')
+r, w = os.pipe()
+leader = os.fork()
+if leader == 0:
+    os.close(r)
+    os.setpgid(0, 0)
+    child_r, child_w = os.pipe()
+    zombie = os.fork()
+    if zombie == 0:
+        os.close(child_r)
+        os.write(child_w, b'x')
+        os.close(child_w)
+        os._exit(0)
+    os.close(child_w)
+    os.read(child_r, 1)
+    os.close(child_r)
+    os.write(w, (str(zombie) + '\n').encode())
+    os.close(w)
+    os._exit(0)
+os.close(w)
+with os.fdopen(r, 'r') as pipe:
+    zombie = int(pipe.readline().strip())
+time.sleep(0.2)
+print(f'{leader} {zombie}', flush=True)
+time.sleep(60)
+`;
+    const helper = spawn('python3', ['-I', '-c', python], { stdio: ['ignore', 'pipe', 'inherit'] });
+    try {
+      const [line] = await once(helper.stdout, 'data');
+      const [leader, zombie] = String(line).trim().split(/\s+/).map(Number);
+      await acquireTraexRuntimeStart(domain, {
+        occupantId: 'zombie-group', comboKey: 'content-a', cliPid: leader,
+        workerPid: process.pid, daemonPid: process.pid,
+      });
+      await markTraexRuntimeDeathUnproven(domain, 'zombie-group', leader);
+      const stat = readFileSync(`/proc/${zombie}/stat`, 'utf8');
+      expect(stat.slice(stat.lastIndexOf(')') + 2).startsWith('Z ')).toBe(true);
+      expect(occupantLiveness(readTraexRuntimeOccupants(domain)![0])).toBe('dead');
+    } finally {
+      helper.kill('SIGKILL');
+      await once(helper, 'exit').catch(() => undefined);
+    }
+  });
+
+  it.skipIf(process.platform !== 'linux')('uses zombie state for a leaf on non-Linux POSIX instead of trusting its birth timestamp', async () => {
+    const platform = vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin');
+    const python = String.raw`
+import ctypes, os, time
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.prctl(36, 1, 0, 0, 0) != 0: raise OSError(ctypes.get_errno(), 'prctl')
+r, w = os.pipe()
+leader = os.fork()
+if leader == 0:
+    os.close(r)
+    os.setpgid(0, 0)
+    child_r, child_w = os.pipe()
+    zombie = os.fork()
+    if zombie == 0:
+        os.close(child_r)
+        os.write(child_w, b'x')
+        os.close(child_w)
+        os._exit(0)
+    os.close(child_w)
+    os.read(child_r, 1)
+    os.close(child_r)
+    os.write(w, (str(zombie) + '\n').encode())
+    os.close(w)
+    os._exit(0)
+os.close(w)
+with os.fdopen(r, 'r') as pipe:
+    zombie = int(pipe.readline().strip())
+time.sleep(0.2)
+print(f'{leader} {zombie}', flush=True)
+time.sleep(60)
+`;
+    const helper = spawn('python3', ['-I', '-c', python], { stdio: ['ignore', 'pipe', 'inherit'] });
+    try {
+      const [line] = await once(helper.stdout, 'data');
+      const [leader, zombie] = String(line).trim().split(/\s+/).map(Number);
+      const domain = testDomain(traeHome());
+      await acquireTraexRuntimeStart(domain, {
+        occupantId: 'zombie-leaf', comboKey: 'content-a', cliPid: leader,
+        workerPid: process.pid, daemonPid: process.pid,
+      });
+      const stat = readFileSync(`/proc/${zombie}/stat`, 'utf8');
+      expect(stat.slice(stat.lastIndexOf(')') + 2).startsWith('Z ')).toBe(true);
+      expect(occupantLiveness(readTraexRuntimeOccupants(domain)![0])).toBe('dead');
+    } finally {
+      helper.kill('SIGKILL');
+      await once(helper, 'exit').catch(() => undefined);
+      platform.mockRestore();
+    }
+  });
+
   it.skipIf(process.platform !== 'linux')('keeps death-unproven process groups blocked until every descendant exits', async () => {
     const domain = testDomain(traeHome());
     const leader = spawn('/bin/sh', ['-c', 'sleep 60 & exit 0'], { detached: true, stdio: 'ignore' });
     const pid = leader.pid!;
     const cliStart = readProcessStartIdentity(pid);
+    let snapshotChild: ChildProcess | undefined;
     try {
       await acquireTraexRuntimeStart(domain, {
         occupantId: 'rpc-leaf', comboKey: 'content-a', cliPid: pid, ...(cliStart ? { cliStart } : {}),
@@ -827,14 +949,25 @@ describe('runtime registry lifecycle regressions', () => {
       });
       expect(blocked.decision).toBe('blocked');
       expect(readTraexRuntimeOccupants(domain)?.[0]?.deathUnproven).toBe(true);
+      const snapshotDir = realRelease('escaped-helper');
+      snapshotChild = spawn(join(snapshotDir, 'traex'), ['60'], { stdio: 'ignore' });
+      children.push(snapshotChild);
+      await markTraexRuntimeRunning(domain, 'rpc-leaf', { cliPid: pid, ...(cliStart ? { cliStart } : {}), snapshotDir });
       process.kill(-pid, 'SIGKILL');
       await new Promise(resolve => setTimeout(resolve, 50));
+      const detachedWriterBlocked = await acquireTraexRuntimeStart(domain, {
+        occupantId: 'detached-writer-blocked', comboKey: 'content-b', workerPid: process.pid, daemonPid: process.pid,
+      });
+      expect(detachedWriterBlocked.decision).toBe('blocked');
+      await exited(snapshotChild);
+      await vi.waitFor(() => expect(findProcessesRunningUnder(snapshotDir)?.length).toBe(0), { timeout: 5_000 });
       const after = await acquireTraexRuntimeStart(domain, {
         occupantId: 'after-group-exit', comboKey: 'content-b', workerPid: process.pid, daemonPid: process.pid,
       });
       expect(after.decision).toBe('start');
     } finally {
       try { process.kill(-pid, 'SIGKILL'); } catch { /* group already gone */ }
+      try { snapshotChild?.kill('SIGKILL'); } catch { /* helper already gone */ }
     }
   });
 
@@ -855,6 +988,21 @@ describe('runtime registry lifecycle regressions', () => {
     await expect(occupancy.lease.release()).rejects.toThrow('lease retained for retry');
     expect(readTraexRuntimeOccupants(occupancy.lease.domain)?.map(entry => entry.occupantId)).toEqual([occupancy.lease.occupantId]);
     await abandonTraexRuntime(occupancy.lease.domain, occupancy.lease.occupantId);
+  });
+
+  it('refuses a peer lease when the parent never attached a running CLI', async () => {
+    const app = await acquireTraexRuntimeLease({
+      traeHome: traeHome(), releaseDir: release('a'), workerPid: process.pid, daemonPid: process.pid,
+    });
+    expect(app.kind).toBe('granted');
+    if (app.kind !== 'granted') return;
+    const peer = await acquireTraexRuntimePeerLease(app.lease, {
+      workerPid: process.pid, daemonPid: process.pid,
+    });
+    expect(peer.kind).toBe('error');
+    if (peer.kind === 'error') expect(peer.reason).toBe('uncoordinated');
+    expect(readTraexRuntimeOccupants(app.lease.domain)?.map(entry => entry.occupantId)).toEqual([app.lease.occupantId]);
+    await app.lease.abandon();
   });
 
   it.each(['app-server', 'viewer'] as const)('keeps independent RPC peer occupants when the %s exits first', async firstExit => {
@@ -945,6 +1093,28 @@ describe('runtime registry lifecycle regressions', () => {
     const expected = computeTraexInstallSignature(dir, join(dir, 'traex'));
     expect(readTraexRuntimeOccupants(result.lease.domain)?.[0]?.installSignature).toBe(expected);
     expect(result.lease.snapshot.manifest?.sourceSignature).toBe(expected);
+  });
+
+  it('revalidates a release whose source changes between stat and content hashing', async () => {
+    const dir = release('a');
+    const identity = await captureTraexReleaseIdentity(dir, undefined, {
+      onBeforeHash: () => { writeFileSync(join(dir, 'traex'), 'traex-b-longer'); },
+    });
+    const expected = computeTraexInstallSignature(dir, join(dir, 'traex'));
+    expect(identity.sourceSignature).toBe(expected);
+    expect(identity.comboKey).toBe(comboKeyFromHashes(identity.hashes));
+    expect(identity.sourceSignature).not.toBeUndefined();
+  });
+
+  it.each(['traex-code-mode-host', 'trae-installation.json'])('revalidates an optional release file added during hashing: %s', async file => {
+    const dir = release('a');
+    rmSync(join(dir, file));
+    const identity = await captureTraexReleaseIdentity(dir, undefined, {
+      onBeforeHash: () => { writeFileSync(join(dir, file), 'added-during-hash'); },
+    });
+    expect(identity.sourceSignature).toBe(computeTraexInstallSignature(dir, join(dir, 'traex')));
+    if (file === 'traex-code-mode-host') expect(identity.hashes.helper).toBeDefined();
+    else expect(identity.hashes.installation).toBeDefined();
   });
 
   it('pairs a reused snapshot with the signature from the same capture after an A-to-B source race', async () => {

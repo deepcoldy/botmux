@@ -324,6 +324,7 @@ function engageHarness(opts: {
     acquireTraexRuntimeLease: vi.fn(async () => ({ kind: 'granted', lease })),
     rpcEngagementFence: { begin: () => 1, isCurrent: () => true, isLive: () => true, markDead: noop },
     closeRequested: false,
+    cancelledQueuedTurnIds: new Set(),
     pendingRpcEngagement: undefined,
     traexRpcLeaseContext: undefined,
     traexRuntimeLeaseContext: undefined,
@@ -455,7 +456,16 @@ describe('actual worker TraeX RPC engagement', () => {
     expect(h.lease.markRunning).toHaveBeenCalledWith(4242, 'start-4242');
   });
 
-  it('retains a spawned RPC lease when stopAndWait cannot prove group death', async () => {
+  it('does not construct an engine for an opening cancelled while the gate was waiting', async () => {
+    const h = engageHarness({ resume: false });
+    h.base.cancelledQueuedTurnIds.add('om_first');
+    await expect(h.engageRaw()).rejects.toBeInstanceOf(h.base.CliSpawnSupersededError);
+    expect(h.engines).toHaveLength(0);
+    expect(h.lease.abandon).toHaveBeenCalledTimes(1);
+    expect(h.lease.markRunning).not.toHaveBeenCalled();
+  });
+
+  it.each(['false', 'throw'] as const)('retains a spawned RPC lease when stopAndWait cannot prove group death (%s)', async mode => {
     let openA!: () => void;
     const gateA = new Promise<void>(resolve => { openA = resolve; });
     const h = engageHarness({ resume: true, startGates: [gateA] });
@@ -466,7 +476,8 @@ describe('actual worker TraeX RPC engagement', () => {
     };
     const resultA = h.engageRaw().then(outcome => ({ outcome }), error => ({ error }));
     for (let i = 0; i < 30 && h.engines.length === 0; i++) await Promise.resolve();
-    h.engines[0].stopAndWait.mockResolvedValue(false);
+    if (mode === 'throw') h.engines[0].stopAndWait.mockRejectedValue(new Error('unverified descendant'));
+    else h.engines[0].stopAndWait.mockResolvedValue(false);
     const resultB = h.engageRaw();
     openA();
     const a = await resultA;
@@ -475,6 +486,7 @@ describe('actual worker TraeX RPC engagement', () => {
     expect(h.engines[0].stopAndWait).toHaveBeenCalled();
     expect(h.lease.release).not.toHaveBeenCalled();
     expect(h.lease.abandon).not.toHaveBeenCalled();
+    expect(h.lease.markDeathUnproven).toHaveBeenCalledWith(4242);
   });
 
   it('abandons a stale pre-spawn lease without publishing over the replacement', async () => {

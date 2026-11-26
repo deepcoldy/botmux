@@ -544,6 +544,17 @@ describe('pre-ready input receipts', () => {
     }));
   });
 
+  it('retains a native RPC follow-up for the materialization ACK drain even before the engine exists', async () => {
+    const h = harness('codex');
+    h.scope.initPromptMaterialized = false;
+    h.scope.deferTurnInputCommitUntilSubmission = () => true;
+    await loadWorkerMessageHandler('message', h.scope)({
+      type: 'message', content: 'RPC follow-up', turnId: 'om_rpc_followup',
+    });
+    expect(h.scope.pendingMessages).toHaveLength(1);
+    expect(h.scope.turnInputCommitDeferredForMaterialization.has(h.scope.pendingMessages[0])).toBe(true);
+  });
+
   it('cancels an exact pre-ready opening without replay and preserves human queued work', async () => {
     const h = harness('traex');
     h.scope.initPromptMaterialized = false;
@@ -603,6 +614,19 @@ describe('pre-ready input receipts', () => {
     cancel('cancel-rpc', 'schedule:rpc');
     expect(h.scope.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'queued_turn_cancel_result', turnId: 'schedule:rpc', status: 'restart_required',
+    }));
+  });
+
+  it('never treats a fresh RPC-eligible opening as an ordinary queued removal', () => {
+    const h = harness('traex');
+    h.scope.initPromptMaterialized = false;
+    h.scope.lastInitConfig.turnId = 'schedule:fresh-rpc';
+    h.scope.cliAdapter = { passesInitialPromptViaArgs: false };
+    h.scope.codexRpcEligible = () => true;
+    const cancel = loadWorkerFunction('handleQueuedTurnCancel', h.scope);
+    cancel('cancel-fresh-rpc', 'schedule:fresh-rpc');
+    expect(h.scope.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'queued_turn_cancel_result', turnId: 'schedule:fresh-rpc', status: 'restart_required',
     }));
   });
 

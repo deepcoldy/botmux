@@ -106,6 +106,7 @@ import {
   suspendWorker,
   sendWorkerInput,
   promoteQueuedActivationTail,
+  reconcileQueuedActivationOnWorkerDetach,
   installReclaimPendingForCurrentGeneration,
   transferQueuedActivationOwnershipToNew,
   hasPendingOrdinaryImInput,
@@ -1247,6 +1248,30 @@ describe('activation tail claim cancellation', () => {
     expect((blocked.worker as any).send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'message', turnId: 'om_after_retry',
     }));
+  });
+
+  it('clears an all-cancelled tail without quarantining it as a failed promotion', () => {
+    const ds = makeDs();
+    ds.session.queuedActivationTail = [tailFor('om_cancelled')];
+    ds.session.cancelledActivationTurnIds = ['om_cancelled'];
+    ds.initialStartPending = true;
+    ds.quarantinedActivationTailPromotion = true;
+    expect(promoteQueuedActivationTail(ds)).toBe(false);
+    expect(ds.session.queuedActivationTail).toBeUndefined();
+    expect(ds.initialStartPending).toBe(false);
+    expect(ds.quarantinedActivationTailPromotion).toBeUndefined();
+    expect((ds.worker as any).send).not.toHaveBeenCalled();
+  });
+
+  it('does not quarantine an all-cancelled tail during worker detach reconciliation', () => {
+    const ds = makeDs();
+    ds.session.queuedActivationTail = [tailFor('om_cancelled')];
+    ds.session.cancelledActivationTurnIds = ['om_cancelled'];
+    ds.initialStartPending = true;
+    reconcileQueuedActivationOnWorkerDetach(ds);
+    expect(ds.session.queuedActivationTail).toBeUndefined();
+    expect(ds.initialStartPending).toBe(false);
+    expect(ds.quarantinedActivationTailPromotion).toBeUndefined();
   });
 });
 

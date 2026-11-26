@@ -123,19 +123,20 @@ describe('mixed non-TRAE + TRAE dispatch', () => {
         return 'dispatched';
       },
     }) as () => Promise<'dispatched' | 'deferred'>;
-    await expect(production()()).rejects.toThrow('Scheduled task failed for 1/2 target chats: oc_B');
-    expect(current().deferredRun).toMatchObject({
-      acceptedTargets: { oc_A: turnA }, targetTurnIds: { oc_A: turnA, oc_B: turnB },
-    });
-    expect(attempts.filter(attempt => attempt.chatId === 'oc_A')).toHaveLength(1);
     expect(await production()()).toBe('deferred');
-    expect(attempts.filter(attempt => attempt.chatId === 'oc_A')).toHaveLength(1);
-    expect(attempts.filter(attempt => attempt.chatId === 'oc_B').map(attempt => attempt.turnId)).toEqual([turnB, turnB]);
-    expect(scheduler.noteWorkerRuntimeAccepted(taskId, context.runId, 'oc_B', turnB, APP)).toBe(true);
-    scheduler.startScheduler();
-    await vi.advanceTimersByTimeAsync(5_000);
-    expect(current().lastStatus).toBe('ok');
+    expect(current().lastStatus).toBe('error');
     expect(current().deferredRun).toBeUndefined();
+    expect(attempts.filter(attempt => attempt.chatId === 'oc_A')).toHaveLength(1);
+    expect(attempts.filter(attempt => attempt.chatId === 'oc_B')).toHaveLength(1);
+    const logs = queryScheduleRunLogs(taskId, {}, APP).logs.filter(entry => entry.id === context.runId);
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toMatchObject({ outcome: 'error', targetResults: [
+      { chatId: 'oc_A', outcome: 'model_dispatched' }, { chatId: 'oc_B', outcome: 'error' },
+    ] });
+    scheduler.startScheduler();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(attempts.filter(attempt => attempt.chatId === 'oc_A')).toHaveLength(1);
+    expect(attempts.filter(attempt => attempt.chatId === 'oc_B')).toHaveLength(1);
   });
 
   it('terminally settles a non-TRAE target error without a parked retry storm', async () => {

@@ -946,6 +946,13 @@ export function settleParkedRunOnce(
     }
   }
   const scope = settled.larkAppId ?? appId ?? scheduleStore.getScheduleScope();
+  const targetResults = log.targetResults ?? (() => {
+    const chatIds = Object.keys(deferred.targetTurnIds ?? {});
+    if (chatIds.length === 0) return undefined;
+    return chatIds.map(chatId => deferred.acceptedTargets?.[chatId]
+      ? { chatId, outcome: 'model_dispatched' as const }
+      : { chatId, outcome: deferred.targets[chatId] === 'ambiguous' ? 'error' as const : 'deferred' as const });
+  })();
   if (scope) {
     try {
       appendScheduleRunLog({
@@ -960,7 +967,7 @@ export function settleParkedRunOnce(
         additionalPrompt: !!deferred.additionalPrompt,
         errorCode: log.errorCode ?? 'deferred_unsettled',
         error: reason,
-        ...(log.targetResults ? { targetResults: log.targetResults } : {}),
+        ...(targetResults ? { targetResults } : {}),
       }, scope);
     } catch (error) {
       logger.warn(`[scheduler] Deferred run log unavailable for ${id}: ${String(error)}`);

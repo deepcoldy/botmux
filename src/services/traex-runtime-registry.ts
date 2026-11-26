@@ -18,6 +18,7 @@
  * an unprovable record keeps occupying the domain.
  */
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withExclusiveFileLock } from '../utils/file-flock.js';
@@ -231,7 +232,9 @@ function pidLiveness(pid: number | undefined, expectedStart: string | undefined)
   const currentStart = readProcessStartIdentity(pid);
   if (currentStart !== undefined) {
     if (expectedStart !== undefined && currentStart !== expectedStart) return 'dead';
-    if (isLinuxZombie(pid)) return 'dead';
+    const zombie = zombieProcessState(pid);
+    if (zombie === true) return 'dead';
+    if (zombie === undefined && process.platform !== 'linux') return 'unknown';
     return 'alive';
   }
   // No birth token could be read. Distinguish "gone" (kill(2) -> ESRCH, which
@@ -239,6 +242,19 @@ function pidLiveness(pid: number | undefined, expectedStart: string | undefined)
   // unexpected error). Never call an unreadable-but-existing pid dead.
   if (!pidNotProvablyGone(pid)) return 'dead';
   return 'unknown';
+}
+
+function zombieProcessState(pid: number): boolean | undefined {
+  if (process.platform === 'linux') return isLinuxZombie(pid);
+  try {
+    const state = execFileSync('ps', ['-o', 'stat=', '-p', String(pid)], {
+      encoding: 'utf8', timeout: 2_000, stdio: ['ignore', 'pipe', 'ignore'],
+      env: { PATH: '/usr/bin:/bin', LANG: 'C' },
+    }).trim();
+    return state.startsWith('Z') || state.startsWith('X');
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -261,27 +277,49 @@ function processOwnershipFor(occupant: TraexRuntimeOccupant) {
 }
 
 function processGroupLiveness(pid: number | undefined): OccupantLiveness {
-  if (pid === undefined || !Number.isSafeInteger(pid) || pid <= 1 || process.platform !== 'linux') return 'unknown';
-  let entries: string[];
-  try { entries = readdirSync('/proc'); } catch { return 'unknown'; }
-  for (const entry of entries) {
-    if (!/^\d+$/.test(entry)) continue;
-    try {
-      const stat = readFileSync(`/proc/${entry}/stat`, 'utf8');
-      const fields = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/);
-      if (Number(fields[2]) === pid && fields[0] !== 'Z' && fields[0] !== 'X') return 'alive';
-    } catch (error) {
-      if (!['ENOENT', 'ESRCH'].includes((error as NodeJS.ErrnoException).code ?? '')) return 'unknown';
+  if (pid === undefined || !Number.isSafeInteger(pid) || pid <= 1) return 'unknown';
+  if (process.platform === 'win32') return 'unknown';
+  try {
+    if (process.platform === 'linux') {
+      for (const entry of readdirSync('/proc')) {
+        if (!/^\d+$/.test(entry)) continue;
+        try {
+          const stat = readFileSync(`/proc/${entry}/stat`, 'utf8');
+          const fields = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/);
+          if (Number(fields[2]) === pid && fields[0] !== 'Z' && fields[0] !== 'X') return 'alive';
+        } catch (error) {
+          if (!['ENOENT', 'ESRCH'].includes((error as NodeJS.ErrnoException).code ?? '')) return 'unknown';
+        }
+      }
+      return 'dead';
     }
+    const output = execFileSync('ps', ['-axo', 'pid=,pgid=,stat='], {
+      encoding: 'utf8', timeout: 2_000, stdio: ['ignore', 'pipe', 'ignore'],
+      env: { PATH: '/usr/bin:/bin', LANG: 'C' },
+    });
+    for (const line of output.trim().split('\n')) {
+      const [_member, group, state] = line.trim().split(/\s+/, 3);
+      if (Number(group) === pid && !state?.startsWith('Z') && !state?.startsWith('X')) return 'alive';
+    }
+    return 'dead';
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ESRCH') return 'dead';
+    if (code === 'EPERM') return 'alive';
+    return 'unknown';
   }
-  return 'dead';
 }
 
 export function occupantLiveness(occupant: TraexRuntimeOccupant, now = Date.now()): OccupantLiveness {
   void now; // liveness is pid/birth based; the lease is only a status hint
   const boot = readLinuxBootIdentity();
   if (occupant.bootId !== undefined && boot !== undefined && occupant.bootId !== boot) return 'dead';
-  if (occupant.deathUnproven === true) return processGroupLiveness(occupant.cliPid);
+  if (occupant.deathUnproven === true) {
+    const group = processGroupLiveness(occupant.cliPid);
+    if (group !== 'dead') return group;
+    // A detached helper may have escaped the original process group. Only after
+    // the group is empty do we also consult the snapshot writer scan.
+  }
   if (occupant.cliPid !== undefined) {
     const cli = traexCliLiveness(occupant);
     if (cli !== 'dead') return cli;

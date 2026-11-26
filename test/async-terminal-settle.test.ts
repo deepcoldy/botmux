@@ -99,7 +99,7 @@ vi.mock('../src/services/async-trigger-store.js', async importOriginal => {
   };
 });
 
-import { initWorkerPool, interruptExactWorkerTurn, __testOnly_setupWorkerHandlers } from '../src/core/worker-pool.js';
+import { initWorkerPool, interruptExactWorkerTurn, cancelQueuedWorkerTurn, __testOnly_setupWorkerHandlers } from '../src/core/worker-pool.js';
 import { resolveAsyncTriggerState } from '../src/services/async-trigger-state.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
@@ -155,17 +155,18 @@ describe('interruptExactWorkerTurn', () => {
     await expect(pending).resolves.toEqual({ ok: false, reason: 'stale_turn' });
   });
 
-  it('accepts only a matching exact-turn delivery acknowledgement', async () => {
+  it('cancels a pre-ready turn without binding the previous activeRuntime', async () => {
     const ds = makeDs();
-    const pending = interruptExactWorkerTurn(ds, 'turn-exact', 1_000);
+    const pending = cancelQueuedWorkerTurn(ds, 'turn-pre-ready', 1_000);
     const sent = (ds.worker as any).send.mock.calls[0][0];
+    expect(sent).toMatchObject({ type: 'cancel_queued_turn', turnId: 'turn-pre-ready',
+      sessionCommand: { version: 2 } });
+    expect(sent.sessionCommand.runtime).toBeUndefined();
     (ds.worker as any).emit('message', {
-      type: 'turn_interrupt_result', requestId: 'other', turnId: 'turn-exact', delivered: true,
+      type: 'queued_turn_cancel_result', requestId: sent.requestId,
+      turnId: 'turn-pre-ready', status: 'queued_removed',
     });
-    (ds.worker as any).emit('message', {
-      type: 'turn_interrupt_result', requestId: sent.requestId, turnId: 'turn-exact', delivered: true,
-    });
-    await expect(pending).resolves.toEqual({ ok: true, confirmation: 'interrupt_delivered' });
+    await expect(pending).resolves.toBe('queued_removed');
   });
 });
 

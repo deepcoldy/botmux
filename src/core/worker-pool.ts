@@ -17441,6 +17441,9 @@ export function cancelQueuedWorkerTurn(
     try {
       const queued = afterWorkerIpcBootstrap(worker, () => worker.send({
         type: 'cancel_queued_turn', requestId, turnId,
+        // This is a pre-runtime queue operation. Never let the controller stamp
+        // the previous generation's activeRuntime onto a pre-ready cancellation.
+        sessionCommand: { version: 2 as const },
       } satisfies DaemonToWorker));
       if (!queued) finish('no_worker');
     } catch {
@@ -19990,6 +19993,26 @@ function deliverPendingMojoLegacyPinNotice(
 }
 
 
+function pruneCancelledQueuedActivationTail(ds: DaemonSession): void {
+  const tail = ds.session.queuedActivationTail;
+  if (!tail || tail.length === 0) return;
+  const cancelledTurnIds = new Set(ds.session.cancelledActivationTurnIds ?? []);
+  const retained = tail.filter(entry => !cancelledTurnIds.has(entry.turnId));
+  if (retained.length === tail.length) return;
+  const previous = tail;
+  ds.session.queuedActivationTail = retained.length > 0 ? retained : undefined;
+  try {
+    sessionStore.updateSession(ds.session);
+    if (retained.length === 0) {
+      ds.initialStartPending = false;
+      ds.quarantinedActivationTailPromotion = undefined;
+    }
+  } catch {
+    ds.session.queuedActivationTail = previous;
+    ds.activationCancellationPending = true;
+  }
+}
+
 /** Promote the oldest durable activation successor into a fresh tokened
  * journal and (for Codex App) its single accepted-ledger owner in one store
  * update, then hand it to the current worker. The tail is never shifted merely
@@ -20011,7 +20034,10 @@ export function promoteQueuedActivationTail(
     .filter(entry => !cancelledTurnIds.has(entry.turnId))
     .sort((a, b) => a.order - b.order || a.id.localeCompare(b.id));
   const head = ordered[0];
-  if (!head) return false;
+  if (!head) {
+    pruneCancelledQueuedActivationTail(ds);
+    return false;
+  }
   // A reclaim queued for this generation means the entry was handed to the
   // replacement runtime. Never promote it onto the CLI being retired: the old
   // process would otherwise accept work that must run on the new binary.
@@ -20518,6 +20544,15 @@ export function reconcileQueuedActivationOnWorkerDetach(ds: DaemonSession): void
       );
     }
     if (!promoted) {
+      if ((ds.session.queuedActivationTail?.length ?? 0) === 0
+        && !ds.session.queuedActivationPending) {
+        // An all-cancelled tail was pruned successfully; that is an empty
+        // queue, not a promotion failure. Never manufacture a quarantine owner.
+        ds.quarantinedActivationTailPromotion = undefined;
+        ds.initialStartPending = false;
+        ds.initialStartClaimToken = undefined;
+        return;
+      }
       ds.quarantinedActivationTailPromotion = true;
       // The daemon's tail-only inbound recovery is gated by this runtime flag.
       // Keeping it (and the claim token) makes the next message stage behind the

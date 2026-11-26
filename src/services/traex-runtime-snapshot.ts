@@ -227,6 +227,7 @@ async function sha256File(file: string): Promise<string> {
 export async function captureTraexReleaseIdentity(
   releaseDir: string,
   executablePath?: string,
+  options: { attempt?: number; onBeforeHash?: () => Promise<void> | void } = {},
 ): Promise<TraexReleaseIdentity> {
   // An operator-pinned executable may not be called `traex` (renamed or
   // installed under a custom name). It is still the main executable of the
@@ -260,11 +261,18 @@ export async function captureTraexReleaseIdentity(
     }
   }
 
+  if (options.onBeforeHash && (options.attempt ?? 0) === 0) await options.onBeforeHash();
   const hashes = {
     traex: await sha256File(traex),
     ...(helper ? { helper: await sha256File(helper) } : {}),
     ...(installation ? { installation: await sha256File(installation) } : {}),
   };
+  const layoutChanged = existsSync(helperCandidate) !== !!helper
+    || existsSync(installationCandidate) !== !!installation;
+  if (layoutChanged || (signature && statSignature([traex, helper, installation]) !== signature)) {
+    if ((options.attempt ?? 0) >= 1) throw new Error('TRAE release changed repeatedly during identity capture');
+    return captureTraexReleaseIdentity(releaseDir, executablePath, { attempt: (options.attempt ?? 0) + 1 });
+  }
   const identity: TraexReleaseIdentity = {
     releaseDir,
     traex,

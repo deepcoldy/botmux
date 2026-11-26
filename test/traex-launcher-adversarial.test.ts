@@ -504,6 +504,20 @@ describe('TraeX lease lifecycle', () => {
     return { scope, context };
   }
 
+  it('does not destroy a persistent backend when retirement only detaches it', async () => {
+    const destroySession = vi.fn();
+    const kill = vi.fn();
+    const scope: Record<string, any> = {
+      backend: { destroySession, kill, getChildPid: () => null },
+      effectiveBackendType: 'tmux',
+      stopCodexRpcEngine: vi.fn(async () => true),
+    };
+    const stop = loadWorkerFunction<(opts?: { destroyBackend?: boolean }) => Promise<boolean>>('stopOwnedProcessesForTraexSettlement', scope);
+    await expect(stop({ destroyBackend: false })).resolves.toBe(true);
+    expect(destroySession).not.toHaveBeenCalled();
+    expect(kill).not.toHaveBeenCalled();
+  });
+
   it('does not let a superseded spawn catch abandon the newer generation lease', async () => {
     const oldAbandon = vi.fn(async () => {});
     const newAbandon = vi.fn(async () => {});
@@ -629,7 +643,7 @@ describe('TraeX lease lifecycle', () => {
       adoptMode: true, cliId: 'traex', cliPathOverride: '/adopted/traex', adoptCliPid: 456,
       envPolicy: undefined, envUnset: undefined, env: undefined, protectedMcpPolicy: undefined,
     };
-    const context = await register(cfg);
+    const context = await register(cfg, 999);
     expect(context.running).toBe(true);
     expect(scope.traexRuntimeLeaseContext).toBe(context);
     expect(scope.pendingTraexSpawnAbandon).toBeUndefined();
@@ -657,6 +671,19 @@ describe('TraeX lease lifecycle', () => {
     await Promise.resolve();
     expect(context.lease.abandon).toHaveBeenCalledTimes(1);
     expect(context.settled).toBe(true);
+
+    const tracked = leaseHarness({
+      release: vi.fn(async () => {}), abandon: vi.fn(async () => {}),
+    });
+    tracked.context.cliPid = 999;
+    tracked.context.running = true;
+    tracked.scope.effectiveBackendType = 'tmux';
+    tracked.scope.isObserveBackend = isObserveBackend;
+    const settleTracked = loadWorkerFunction<(context: any, backend: any) => void>('settleAdoptedTraexRuntime', tracked.scope);
+    settleTracked(tracked.context, observer);
+    await Promise.resolve();
+    expect(tracked.context.lease.release).toHaveBeenCalledTimes(1);
+    expect(tracked.context.lease.abandon).not.toHaveBeenCalled();
 
     const alive = leaseHarness({
       release: vi.fn(async () => {}), abandon: vi.fn(async () => {}),
