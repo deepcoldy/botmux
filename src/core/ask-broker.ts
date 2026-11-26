@@ -1559,6 +1559,20 @@ export function invalidateExplicitAsk(input: CreateAskInput, reason: string): vo
   }
 }
 
+/** Invalidate an active host-managed ask by its exact scoped identity (e.g., when
+ *  the turn it belongs to finishes on its own or is superseded by new input). */
+export function invalidateHostAsk(
+  target: { larkAppId: string; sessionId: string; originKind: string; requestId: string },
+  reason: string,
+): boolean {
+  if (!target.originKind.startsWith('host_')) return false;
+  const key = askKeyFor(target.larkAppId, target.sessionId, target.originKind, target.requestId);
+  const ask = findByKey(key);
+  if (!ask || ask.settled || ask.originKind !== target.originKind) return false;
+  settle(ask.askId, { kind: 'invalidated', reason, selected: null, by: null, comment: null, timedOut: false });
+  return true;
+}
+
 export function explicitAskSnapshot(input: CreateAskInput): PendingAsk | undefined {
   const key = askKeyFor(input.larkAppId, input.sessionId, 'host_explicit', input.requestId!);
   const ask = findByKey(key);

@@ -2912,6 +2912,19 @@ export type WorkerToDaemonBase =
   | { type: 'cli_runtime_version'; version: string }
   /** Fresh local Codex process, never a reattachment to an existing pane. */
   | ({ type: 'codex_model_launch' } & import('./services/codex-model-selection.js').CodexModelLaunchObservation)
+  /** Codex entered an internal responses_retry backoff on a model capacity error
+   *  observed from `<CODEX_HOME>/logs_<N>.sqlite` before any rollout terminal. */
+  | {
+      type: 'codex_capacity_retry';
+      turnId: string;
+      nativeSessionId: string;
+      model?: string;
+      codexTurnId?: string;
+      retryAttempt?: number;
+      maxRetries?: number;
+      retryDelaySec?: number;
+      observedAtMs: number;
+    }
   /** The CLI said its own install changed under the running process (Pi after
    *  a global upgrade: on-demand modules then fail with "Cannot find module").
    *  The daemon retires the worker once the current turn settles, so the next
