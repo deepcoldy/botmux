@@ -703,7 +703,7 @@ Dashboard 的「Bot 配置 → 消息卡片 → 实时卡片按钮」可以直�
 - 回复处理和每轮提醒立即生效；系统提示里的完整规则从下一个新会话起生效。
 - Dashboard「Bot 配置 → 消息卡片 → 开发机地址」里的开关改的就是这个字段。
 
-### 零注入模式（`promptInjection: "none"`）
+### 零注入模式（`promptInjection: "none"`） {#zero-prompt-injection}
 
 适合「主 bot 派活、子 bot 专心执行」的多 Agent 流水线，或者你就是不想让 botmux 往 prompt 里加任何东西。
 
