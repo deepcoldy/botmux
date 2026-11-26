@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { decideQueuedReadyTransition } from '../src/core/queued-ready-transition.js';
 import { ClaudeModelRequestClock } from '../src/services/claude-transcript.js';
 import { ActiveTurnAuthority } from '../src/core/active-turn-authority.js';
-import { isAntigravityInterruptedScreen } from '../src/adapters/cli/antigravity.js';
+import { isAntigravityInterruptedScreen, parseAntigravityFooterBackgroundTasks } from '../src/adapters/cli/antigravity.js';
 import {
   hasAntigravityPendingTasks,
   hasAntigravityTranscriptPendingTasks,
@@ -176,6 +176,8 @@ describe('a prompt-ready edge that is not the turn boundary keeps the turn autho
 });
 
 describe('hasLiveAntigravityPendingTasks in default replyDelivery=send mode (structured bridge inactive)', () => {
+  const idleFooter = '────────\n>\n────────\n? for shortcuts';
+  const pendingFooter = `${idleFooter} · gemini-4-neon · 1 task(s) · /tasks`;
   const dirs: string[] = [];
   afterEach(() => {
     for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
@@ -218,6 +220,7 @@ describe('hasLiveAntigravityPendingTasks in default replyDelivery=send mode (str
     h.backendScreenEvidenceIsAuthoritativeForMutation = () => opts.screen !== undefined;
     h.captureBackendScreen = () => opts.screen ?? '';
     h.isAntigravityInterruptedScreen = isAntigravityInterruptedScreen;
+    h.parseAntigravityFooterBackgroundTasks = parseAntigravityFooterBackgroundTasks;
     h.codexBridgeFallbackActive = () => opts.bridgeActive === true;
     h.codexBridgeRolloutPath = opts.bridgeAttached ? transcriptPath : undefined;
     h.codexBridgeBaselineDone = opts.bridgeAttached === true;
@@ -231,6 +234,30 @@ describe('hasLiveAntigravityPendingTasks in default replyDelivery=send mode (str
     h.hasLiveAntigravityPendingTasks = loadWorkerFunction('hasLiveAntigravityPendingTasks', h);
     return { h, cid, transcriptPath };
   }
+
+  it('keeps the card working when only the live footer shows a running task, then settles when it clears', () => {
+    const { h } = sendModeHarness({
+      screen: pendingFooter,
+      records: [
+        { step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', content: 'Run the tests' },
+        { step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Waiting for the tests.' },
+      ],
+    });
+    const markReady = loadWorkerFunction('markPromptReady', h);
+    markReady();
+
+    expect(h.publishScreenStatus).toHaveBeenCalledWith('working');
+    expect(h.publishScreenStatus).not.toHaveBeenCalledWith('idle');
+    expect(h.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'screen_update', status: 'idle' }));
+    expect(h.releaseActiveTurnAuthority).not.toHaveBeenCalled();
+    expect(h.activeTurnAuthority.snapshot()?.turnId).toBe('turn-a');
+
+    h.captureBackendScreen = () => idleFooter;
+    markReady();
+
+    expect(h.publishScreenStatus).toHaveBeenCalledWith('idle');
+    expect(h.releaseActiveTurnAuthority).toHaveBeenCalledWith('prompt_ready');
+  });
 
   it('keeps active turn authority when a background run_command is still running even though the structured bridge is inactive', () => {
     const cid = '22222222-2222-2222-2222-222222222222';
@@ -271,6 +298,7 @@ describe('hasLiveAntigravityPendingTasks in default replyDelivery=send mode (str
     const { h } = sendModeHarness({
       awaitingFirstPrompt: true,
       turnStarted: false,
+      screen: pendingFooter,
       records: [
         { step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', content: '<USER_REQUEST>\n旧会话任务\n</USER_REQUEST>' },
         { step_index: 1, source: 'MODEL', type: 'GENERIC', status: 'RUNNING', content: `Tool is running as a background task with task id: ${cid}/task-old\n` },
@@ -307,7 +335,7 @@ describe('hasLiveAntigravityPendingTasks in default replyDelivery=send mode (str
       '────────',
       '>',
       '────────',
-      '? for shortcuts',
+      '? for shortcuts · gemini-4-neon · 1 task(s) · /tasks',
       '',
     ].join('\n');
     const { h } = sendModeHarness({

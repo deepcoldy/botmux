@@ -17048,11 +17048,10 @@ function resolveLiveAntigravityTranscriptPath(): string | undefined {
   return resolveFileBridgePath('antigravity', { sessionId: cid, pid: effectivePid });
 }
 
-/** Whether the live Antigravity turn has pending background command task(s) or
- *  subagent(s). Works both when the structured bridge is active (zero-prompt /
- *  adopt) and in ordinary `replyDelivery: 'send'` mode where the bridge does
- *  not attach. Never holds a cold/resumed idle startup with no started turn or
- *  a viewport that explicitly shows an interrupted turn. */
+/** Whether the live Antigravity turn still has background work. A fresh
+ *  native footer can show running commands missing from the transcript.
+ *  Never hold an explicitly interrupted turn or use the footer to hold a
+ *  cold/resumed idle startup with no started turn. */
 function hasLiveAntigravityPendingTasks(): boolean {
   if (!structuredBridgeIs('antigravity') || cliAdapter?.runnerFramedInput) return false;
   const activeTurnStarted = activeTurnAuthority.snapshot()?.started === true;
@@ -17065,6 +17064,9 @@ function hasLiveAntigravityPendingTasks(): boolean {
     try {
       const screen = captureBackendScreen(backend);
       if (screen && isAntigravityInterruptedScreen(screen)) return false;
+      // The cached footer count is for display and survives unparseable
+      // frames. Only the current viewport may veto this ready edge.
+      if (activeTurnStarted && (parseAntigravityFooterBackgroundTasks(screen) ?? 0) > 0) return true;
     } catch { /* Missing viewport is not interruption evidence. */ }
   }
   if (codexBridgeFallbackActive()) {
