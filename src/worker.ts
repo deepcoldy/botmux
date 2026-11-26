@@ -278,6 +278,7 @@ import { installStdioEpipeGuard, isIgnorableStreamError } from './utils/stdio-ep
 import { resolveDarwinCodexCaBundle } from './utils/darwin-ca-bundle.js';
 import {
   handoffQueuedDurableInputsOnBackendExit,
+  dropNoReplayPendingInputsOnBackendExit,
   inputForcesSerialTurn,
   mergeQueuedCliInput,
   pendingInputMayFlush,
@@ -518,7 +519,7 @@ import { pinWorkerTraeHome } from './services/traex-paths.js';
 import { drainTraexRollout, traexResumeTargetLeftInDefaultHome, resolveTraexResumeSessionId, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, traexSessionIdFromRolloutPath, traexProcessFileSource, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
 import { bridgeCodexUserInput, postCodexAsk } from './services/codex-user-input.js';
 import { TraexQuestionBridge } from './core/traex-question-bridge.js';
-import type { AskQuestion } from './core/ask-types.js';
+import type { AskQuestion, AskResult } from './core/ask-types.js';
 import { traexQuestionFlowVisible, traexPendingAsyncQuestionCount, traexPendingAsyncQuestionVisible, parseTraexQuestionPage, traexQuestionSignature, traexQuestionState, type TraexQuestionPage } from './utils/traex-question-page.js';
 import { antigravityBlockingPageTail } from './utils/antigravity-blocking-page.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
@@ -556,7 +557,7 @@ import {
   type AntigravityAccountStoreOptions,
   type ReconcileAntigravityTokenResult,
 } from './services/antigravity-accounts.js';
-import { hasAntigravitySideQuestionComposer, isAntigravityInterruptedScreen, isAntigravityReadyComposerScreen, parseAntigravityFooterBackgroundTasks, supportsAntigravityReadyFooterQuota } from './adapters/cli/antigravity.js';
+import { hasAntigravitySideQuestionComposer, isAntigravityIdleComposerScreen, isAntigravityInterruptedScreen, isAntigravityReadyComposerScreen, parseAntigravityFooterBackgroundTasks, supportsAntigravityReadyFooterQuota } from './adapters/cli/antigravity.js';
 import {
   antigravityTurnAnsweredInTranscript,
   antigravityTurnFailedWithoutOutput,
@@ -6273,6 +6274,11 @@ function stopFirstWriteLivenessRecheck(): void {
  *  backends, and Codex App (its signed runner channel proves readiness). */
 function resetFirstWriteLiveness(skip: boolean): void {
   stopFirstWriteLivenessRecheck();
+  if (nativeInputBlockRetryTimer) {
+    clearTimeout(nativeInputBlockRetryTimer);
+    nativeInputBlockRetryTimer = null;
+  }
+  nativeInputBlockLogged = false;
   firstWriteLivenessConfirmed = skip;
   firstWriteLivenessHeld = false;
   openingInputBoxSettled = skip || !cliAdapter?.settleInputBox;
@@ -6327,7 +6333,7 @@ function adapterInputBoxReady(): boolean | undefined {
  *  was dequeued or written, so it stays at the head; the first-write gate
  *  closes again and re-drives the flush once the input box is ready. */
 function holdOpeningInput(reason: string): void {
-  log(`Holding opening input — ${reason} ${pendingMessages.length} input(s) stay queued`);
+  if (!firstWriteLivenessHeld) log(`Holding opening input — ${reason} ${pendingMessages.length} input(s) stay queued`);
   firstWriteLivenessConfirmed = false;
   firstWriteLivenessHeld = true;
   inputBoxStateAtMs = 0;
@@ -6401,8 +6407,17 @@ function armFirstWriteLivenessRecheck(): void {
   const generation = cliSpawnGeneration;
   let promptSeenAtMs = 0;
   const schedule = (ms: number): void => {
-    firstWriteLivenessTimer = setTimeout(tick, ms);
-    firstWriteLivenessTimer.unref?.();
+    // flushPending may synchronously re-enter this hold and arm another timer.
+    // Always replace the previous one instead of overwriting the variable and
+    // leaving an unreferenced live timer behind (the old 2^N failure mode).
+    if (firstWriteLivenessTimer) clearTimeout(firstWriteLivenessTimer);
+    const delayMs = ms;
+    const timer = setTimeout(() => {
+      if (firstWriteLivenessTimer === timer) firstWriteLivenessTimer = null;
+      tick();
+    }, delayMs);
+    firstWriteLivenessTimer = timer;
+    timer.unref?.();
   };
   const tick = (): void => {
     firstWriteLivenessTimer = null;
@@ -6477,11 +6492,10 @@ function startupInputHeld(): boolean {
     || startupCommandAckHold !== null;
 }
 
-/** Type the fresh-spawn `/rename` once per worker. Not part of startupCommands,
- *  so the re-arm in spawnCli cannot replay it. Once an attempt actually starts,
- *  a later restart must not apply the original title over a name the user may
- *  already have changed. A restart that is already in progress does not consume
- *  the command; the replacement flush does. */
+/** Type the fresh-spawn `/rename` once per worker, outside startupCommands so
+ * spawnCli cannot re-arm it. A restart already in progress leaves the command
+ * unconsumed for the replacement flush; once consumed, no later CLI restart
+ * reapplies the original title over a user's own rename. */
 async function runInitialNativeRename(): Promise<void> {
   const cmd = lastInitConfig?.initialNativeRename?.trim();
   if (!cmd || hasRunInitialNativeRename) return;
@@ -6617,6 +6631,11 @@ function stopNativeSessionTitleSync(): void {
  * released by prompt-ready. */
 type SessionRenamePhase = 'idle' | 'reserved' | 'writing' | 'sent';
 let sessionRenamePhase: SessionRenamePhase = 'idle';
+/** True while this rename belongs to persistent-pane reattach recovery. The
+ * provenance survives draft/dialog → settled/unknown transitions until the
+ * whole rename settles, so a later timer cannot invent readiness the previous
+ * worker never established. */
+let sessionRenamePreserveReattachReadiness = false;
 const SESSION_RENAME_IDLE_TIMEOUT_MS = 5_000;
 /** Re-read cadence while a rename the adapter can judge is not yet settled;
  *  each read is a terminal capture, so a long hold backs off. A redraw from
@@ -6624,6 +6643,10 @@ const SESSION_RENAME_IDLE_TIMEOUT_MS = 5_000;
 const SESSION_RENAME_RECHECK_MS = 2_000;
 const SESSION_RENAME_SLOW_RECHECK_MS = 10_000;
 const SESSION_RENAME_FAST_RECHECK_WINDOW_MS = 30_000;
+/** A missing durable receipt may delay delivery, never disable it indefinitely.
+ *  Leave the fast-recheck window intact, then allow one slower final grace
+ *  period before a positively writable composer fails open with a warning. */
+const SESSION_RENAME_HOLD_TIMEOUT_MS = 45_000;
 const SESSION_RENAME_RECOVERY_AFTER_MS = 60_000;
 /** Worker-lifetime latches: killCli clears the in-flight rename, not these.
  * One recovery cannot loop into another restart or spend the FRESH budget. */
@@ -6635,9 +6658,12 @@ let sessionRenameReattachRetryTimer: ReturnType<typeof setTimeout> | null = null
  *  probe armed just before it, and its one-shot recovery/notice latches. */
 let sessionRenameCommand: string | undefined;
 let sessionRenameRecorded: (() => boolean) | undefined;
+let sessionRenameHistoricalRecorded: (() => boolean) | undefined;
 let sessionRenameResubmitted = false;
 let sessionRenameHoldLogged = false;
 let sessionRenameHoldNoticeSent = false;
+let sessionRenameHoldTimeoutLogged = false;
+let sessionRenameHoldTimeoutNoticeSent = false;
 let sessionRenameSentAtMs = 0;
 
 function sessionRenameInFlight(): boolean {
@@ -6655,21 +6681,24 @@ function forceClearSessionRenameInFlight(): void {
     sessionRenameReattachRetryTimer = null;
   }
   sessionRenamePhase = 'idle';
+  sessionRenamePreserveReattachReadiness = false;
   sessionRenameCommand = undefined;
   sessionRenameRecorded = undefined;
+  sessionRenameHistoricalRecorded = undefined;
   sessionRenameResubmitted = false;
   sessionRenameHoldLogged = false;
   sessionRenameHoldNoticeSent = false;
+  sessionRenameHoldTimeoutLogged = false;
+  sessionRenameHoldTimeoutNoticeSent = false;
   sessionRenameSentAtMs = 0;
 }
 
-/** The adapter's verdict on the rename in flight, read from the backend's own
- *  viewport (and cursor where reported). Undefined — the historical fail-open —
- *  when the adapter cannot judge or this backend's screen may not drive input.
- *  Missing evidence on a judging adapter is `unknown`, never `settled`. */
-function sessionRenameSurfaceNow(): SessionRenameSurface | undefined {
+/** The adapter's verdict on an input surface, read from the backend's own
+ * viewport (and cursor where reported). Undefined — the historical fail-open —
+ * when the adapter cannot judge or this backend's screen may not drive input.
+ * Missing evidence on a judging adapter is `unknown`, never `settled`. */
+function sessionInputSurfaceNow(command: string): SessionRenameSurface | undefined {
   const adapter = cliAdapter;
-  const command = sessionRenameCommand;
   const target = backend;
   if (!adapter?.sessionRenameSurface || !command || !target
     || !backendScreenEvidenceIsAuthoritativeForMutation()) return undefined;
@@ -6681,45 +6710,161 @@ function sessionRenameSurfaceNow(): SessionRenameSurface | undefined {
   try { return adapter.sessionRenameSurface(evidence, command); } catch { return 'unknown'; }
 }
 
+function sessionRenameSurfaceNow(): SessionRenameSurface | undefined {
+  return sessionRenameCommand ? sessionInputSurfaceNow(sessionRenameCommand) : undefined;
+}
+
+/** Hard input-focus evidence shared by ordinary, adopt, raw and injection
+ * writes. Busy/unknown surfaces are NOT blocked here: their real readiness and
+ * approval gates decide. Only a dialog, draft, paste chip or visible rename
+ * command can prevent every input class from being pasted into the wrong owner. */
+function sessionInputBlocksDeliveryNow(): boolean {
+  const adapter = cliAdapter;
+  if (!adapter?.sessionRenameSurface) return false;
+  const command = adapter.buildSessionRenameCommand?.(lastInitConfig?.nativeSessionTitle ?? '') ?? '/rename ';
+  const surface = sessionInputSurfaceNow(command);
+  return surface === 'blocked' || surface === 'unsubmitted';
+}
+
+/** TRAE's native question card owns its dedicated hold/notify/bridge path.
+ * Never preempt it with the generic dialog hold, including a page whose stream
+ * arrived before the bridge had a chance to parse it. */
+function traexQuestionDeliveryOwnsInput(): boolean {
+  if (lastInitConfig?.cliId !== 'traex' || !traexQuestionBridgeActive()) return false;
+  // Bridge capability is static for every ordinary local TRAE session. It must
+  // not bypass the generic dialog/draft guard unless a question is actually
+  // reported or visible. Adopted panes have no question bridge, so their native
+  // question page remains owned by the generic hard block instead.
+  if (traexQuestionBlockReported()) return true;
+  try { return !!backend && traexQuestionFlowVisible(captureBackendScreen(backend)); } catch { return false; }
+}
+
+const NATIVE_INPUT_BLOCK_RECHECK_MS = 5_000;
+let nativeInputBlockRetryTimer: ReturnType<typeof setTimeout> | null = null;
+let nativeInputBlockLogged = false;
+
+/** One bounded-cadence retry shared by every raw/adopt/injection path. Unlike
+ * the startup-only first-write poller, this cannot re-enter itself or multiply
+ * timers. A silent dialog close still gets one later delivery attempt. */
+function armNativeInputBlockRecheck(): void {
+  if (nativeInputBlockRetryTimer) return;
+  const generation = cliSpawnGeneration;
+  nativeInputBlockRetryTimer = setTimeout(() => {
+    nativeInputBlockRetryTimer = null;
+    if (generation !== cliSpawnGeneration) return;
+    // A user may submit/clear the last queued item while the native dialog is
+    // still open. With no work left there is nothing to re-drive: stop before
+    // another capture instead of polling the same screen forever.
+    if (!hasPendingInputForFlush() && pendingInjections.length === 0) {
+      nativeInputBlockLogged = false;
+      return;
+    }
+    if (sessionInputBlocksDeliveryNow()) {
+      armNativeInputBlockRecheck();
+      return;
+    }
+    nativeInputBlockLogged = false;
+    void flushPending();
+    void flushPendingInjections();
+  }, NATIVE_INPUT_BLOCK_RECHECK_MS);
+  nativeInputBlockRetryTimer.unref?.();
+}
+
+function notifyNativeInputBlocked(): void {
+  const head = pendingMessages[0] ?? pendingAdoptMessages[0] ?? pendingRawInputs[0];
+  if (!head) return;
+  send({
+    type: 'user_notify',
+    turnId: head.turnId ?? currentBotmuxTurnId,
+    dispatchAttempt: head.dispatchAttempt ?? currentBotmuxDispatchAttempt,
+    message: t('worker.native_input_surface_held', { cliName: cliName() }),
+  });
+}
+
+function holdNativeInputForHardBlock(reason?: string): void {
+  const hasUserInput = !!(pendingMessages[0] ?? pendingAdoptMessages[0] ?? pendingRawInputs[0]);
+  if (!hasUserInput && pendingSessionRename === null && pendingInjections.length === 0) return;
+  if (!nativeInputBlockLogged) {
+    log('Native dialog or unsubmitted draft owns the CLI input; holding every input class behind a 5s recheck');
+    if (hasUserInput) {
+      if (reason) notifyHeldInput(t('worker.opening_input_held', { cliName: cliName(), reason }));
+      else notifyNativeInputBlocked();
+    }
+    // A background-only hold must not latch out a later real user's notice.
+    nativeInputBlockLogged = hasUserInput;
+  }
+  armNativeInputBlockRecheck();
+}
+
 /** Resolve native identity at every receipt poll. Persistent reattach clears
  * the init-time resume target as evidence, then proves the live conversation
  * from an explicitly bound remote thread or a rollout held by the CLI pid.
  * Never fall back to lastInitConfig.cliSessionId: configuration alone cannot
  * prove which native thread a surviving pane owns. */
 function sessionRenameNativeSessionIdNow(): string | undefined {
-  if (inputDeliveryObservedCliSessionId) return inputDeliveryObservedCliSessionId;
   const cliId = lastInitConfig?.cliId;
   if (cliId !== 'codex' && cliId !== 'traex') return undefined;
-  if (cliId === 'codex') {
-    const explicitRemote = (backend as { expectedCodexSessionId?: string } | null)?.expectedCodexSessionId;
-    const rpcThread = codexRpcEngine?.activeThreadId;
-    const bound = explicitRemote ?? rpcThread;
-    if (bound) {
-      inputDeliveryObservedCliSessionId = bound;
-      return bound;
-    }
+  const explicitRemote = (backend as { expectedCodexSessionId?: string } | null)?.expectedCodexSessionId;
+  const rpcThread = codexRpcEngine?.activeThreadId;
+  const bound = explicitRemote ?? rpcThread;
+  if (bound) {
+    inputDeliveryObservedCliSessionId = bound;
+    return bound;
   }
   const pid = cliId === 'codex' ? currentCodexObservedPid() : currentTraexObservedPid();
   if (!pid) return undefined;
   let observed: string | undefined;
   if (cliId === 'traex') {
     const owned = findTraexRolloutSetByPid(pid);
-    if (!owned) return undefined;
-    const owns = (sid: string): boolean => owned.has(sid) || owned.has(sid.toLowerCase());
     const bridgeSid = codexBridgeRolloutPath ? traexSessionIdFromRolloutPath(codexBridgeRolloutPath) : undefined;
-    if (bridgeSid && owns(bridgeSid)) observed = bridgeSid;
+    if (!owned || owned.size === 0) {
+      // TRAE shared terminals can identify the current session without a local
+      // rollout fd, but only through the exact terminal binding from #3815.
+      if (backend && bridgeSid && traexTerminalSessionIsBound(adapterInputHandle(backend), bridgeSid)) {
+        observed = bridgeSid;
+      } else if (backend && inputDeliveryObservedCliSessionId
+        && traexTerminalSessionIsBound(adapterInputHandle(backend), inputDeliveryObservedCliSessionId)) {
+        observed = inputDeliveryObservedCliSessionId;
+      }
+      if (observed) inputDeliveryObservedCliSessionId = observed;
+      return observed;
+    }
+    const owns = (sid: string): boolean => owned.has(sid) || owned.has(sid.toLowerCase());
+    // Multiple owned rollouts prove possession, not which top-level thread is
+    // current. Bridge/cache are usable only when ownership is already unique.
+    if (owned.size === 1 && bridgeSid && owns(bridgeSid)) observed = bridgeSid;
+    if (!observed && owned.size === 1 && inputDeliveryObservedCliSessionId && owns(inputDeliveryObservedCliSessionId)) {
+      observed = inputDeliveryObservedCliSessionId;
+    }
     if (!observed && owned.size === 1) {
       const rollout = findTraexRolloutByPid(pid);
       if (rollout && owns(rollout.cliSessionId)) observed = rollout.cliSessionId;
     }
   } else {
     const owned = findCodexRolloutSetByPid(pid);
-    if (!owned) return undefined;
+    const bridgeSid = codexBridgeRolloutPath ? codexGenerationSessionIdFromRolloutPath(codexBridgeRolloutPath) : undefined;
+    if (!owned || owned.size === 0) {
+      // A shared app-server owns no local rollout fd, and Linux sandboxing may
+      // hide /proc entirely. Only an exact terminal-session binding can replace
+      // that missing ownership evidence; never fall back to a bare bridge/cache.
+      if (backend && bridgeSid && codexTerminalSessionIsBound(adapterInputHandle(backend), bridgeSid)) {
+        observed = bridgeSid;
+      } else if (backend && inputDeliveryObservedCliSessionId
+        && codexTerminalSessionIsBound(adapterInputHandle(backend), inputDeliveryObservedCliSessionId)) {
+        observed = inputDeliveryObservedCliSessionId;
+      }
+      if (observed) inputDeliveryObservedCliSessionId = observed;
+      return observed;
+    }
     const owns = (sid: string): boolean => codexHistorySidIsOwned(sid, owned);
     const liveSid = readCodexLiveSessionId(pid);
     if (liveSid && owns(liveSid)) observed = liveSid;
-    const bridgeSid = codexBridgeRolloutPath ? codexGenerationSessionIdFromRolloutPath(codexBridgeRolloutPath) : undefined;
-    if (!observed && bridgeSid && owns(bridgeSid)) observed = bridgeSid;
+    // A live thread id outranks ambiguity. Without one, multiple rollouts make
+    // bridge/cache ownership-only evidence, never proof of the current thread.
+    if (!observed && owned.size === 1 && bridgeSid && owns(bridgeSid)) observed = bridgeSid;
+    if (!observed && owned.size === 1 && inputDeliveryObservedCliSessionId && owns(inputDeliveryObservedCliSessionId)) {
+      observed = inputDeliveryObservedCliSessionId;
+    }
     if (!observed && owned.size === 1) {
       const rollout = findCodexRolloutByPid(pid);
       if (rollout && owns(rollout.cliSessionId)) observed = rollout.cliSessionId;
@@ -6761,10 +6906,80 @@ function notifySessionRenameInputHeld(): void {
   });
 }
 
-function recoverUnconfirmedSessionRename(surface: SessionRenameSurface | undefined): boolean {
-  const mayRestart = !!backend && lastInitConfig?.cliId === 'traex'
+/** The hard-cap outcome is a different notice from the initial "still waiting"
+ *  message, so it is not swallowed by that earlier notification's latch. */
+function notifySessionRenameInputTimeout(outcome: 'held' | 'recovery-held' | 'released', seconds = Math.round(SESSION_RENAME_HOLD_TIMEOUT_MS / 1000)): void {
+  const head = pendingMessages[0] ?? pendingAdoptMessages[0];
+  const rawHead = pendingRawInputs[0];
+  const held = outcome !== 'released';
+  if ((held && sessionRenameHoldTimeoutNoticeSent) || (!head && !rawHead)) return;
+  if (held) sessionRenameHoldTimeoutNoticeSent = true;
+  send({
+    type: 'user_notify',
+    turnId: head?.turnId ?? rawHead?.turnId ?? currentBotmuxTurnId,
+    dispatchAttempt: head?.dispatchAttempt ?? currentBotmuxDispatchAttempt,
+    message: t(outcome === 'released'
+      ? 'worker.session_rename_release_timeout'
+      : outcome === 'recovery-held'
+        ? 'worker.session_rename_recovery_held'
+        : 'worker.session_rename_hold_timeout', {
+      cliName: cliName(), seconds,
+    }),
+  });
+}
+
+/** Restore readiness only when no authoritative native busy/permission record
+ * vetoes it. Unknown/unjudged evidence may recover after a receipt or the cap;
+ * an ordinary busy `occupied` surface still waits for a real terminal. */
+function restoreSessionRenameReadiness(surface: SessionRenameSurface | undefined, opts: { preserveReattachGate?: boolean } = {}): void {
+  if (idleDetector?.programStatusHeldBusy?.() || programStatusBlockedHoldsTypeAhead()) {
+    return;
+  }
+  if (surface === 'occupied' || surface === 'blocked' || surface === 'unsubmitted') return;
+  // Reattach recovery may preserve an already-ready prompt, but it must never
+  // manufacture readiness for an unproven open-turn gate OR a quiet unknown pane
+  // whose previous worker had not established readiness before disappearing.
+  if (opts.preserveReattachGate && (reattachOpenTurnGate || !isPromptReady)) return;
+  isPromptReady = true;
+  if (!opts.preserveReattachGate) reattachOpenTurnGate = false;
+  idleDetector?.adoptPromptReady?.();
+}
+
+/** Static properties decide whether this runtime can EVER use #3816's owned
+ * process replacement. Transient restart/write fences are deliberately absent:
+ * those may clear on a later timer and must not be mislabeled permanent. */
+function sessionRenameRecoveryRuntimeAllowed(): boolean {
+  return lastInitConfig?.cliId === 'traex'
     && !lastInitConfig.adoptMode && !lastInitConfig.existingAppServerEndpoint
     && ['pty', 'tmux', 'hc'].includes(effectiveBackendType)
+    && !sessionRenameRecoveryUsed;
+}
+
+/** Exact live process/thread proof required before replacing a TRAE CLI. */
+function sessionRenameOwnedRecoverySessionId(): string | undefined {
+  const nativeSessionId = sessionRenameNativeSessionIdNow();
+  if (!nativeSessionId) return undefined;
+  // A user may have switched native threads since the rename started. Never
+  // trust a cached receipt identity or an ambiguous multi-thread FD set.
+  const pid = currentTraexObservedPid();
+  const owned = pid ? findTraexRolloutSetByPid(pid) : undefined;
+  if (!owned || owned.size !== 1 || !(owned.has(nativeSessionId) || owned.has(nativeSessionId.toLowerCase()))) return undefined;
+  return nativeSessionId;
+}
+
+/** A statically ineligible runtime, or one whose exact live thread cannot be
+ * proven at the cap, must reach the bounded delivery fallback. Waiting another
+ * ten seconds cannot make an ambiguous/multi-rollout identity safe to restart.
+ * Only transient restart/write fences may keep an already-proven empty composer
+ * held for a later recovery opportunity. */
+function sessionRenameRecoveryPermanentlyUnavailable(): boolean {
+  if (!sessionRenameRecoveryRuntimeAllowed()) return true;
+  if (!backend || cliRestartInProgress || closeRequested) return false;
+  return !sessionRenameOwnedRecoverySessionId();
+}
+
+function recoverUnconfirmedSessionRename(surface: SessionRenameSurface | undefined): boolean {
+  const mayRestart = sessionRenameRecoveryRuntimeAllowed() && !!backend
     && !closeRequested && !cliRestartInProgress && !rawInputRestartGate && !codexAutoUpgrade
     && !pendingWebTerminalInput() && commandLineWritesPending === 0
     && !isFlushing && !injectionFlushing;
@@ -6776,16 +6991,10 @@ function recoverUnconfirmedSessionRename(surface: SessionRenameSurface | undefin
     alreadyRecovered: sessionRenameRecoveryUsed,
     mayRestart,
   })) return false;
-  // The init-time resume target alone is not evidence. Never trade a missing
-  // receipt for a fresh conversation or restart somebody else's adopted CLI.
-  const nativeSessionId = sessionRenameNativeSessionIdNow();
+  // The init-time resume target alone is not evidence. Restart only the exact
+  // live thread owned by this CLI, never a fresh conversation or adopted peer.
+  const nativeSessionId = sessionRenameOwnedRecoverySessionId();
   if (!nativeSessionId) return false;
-  // A user may have switched native threads from the terminal since the
-  // rename started. Recheck the live process rather than trusting the cached
-  // receipt identity, and refuse an ambiguous multi-thread FD set.
-  const pid = currentTraexObservedPid();
-  const owned = pid ? findTraexRolloutSetByPid(pid) : undefined;
-  if (!owned || owned.size !== 1 || !(owned.has(nativeSessionId) || owned.has(nativeSessionId.toLowerCase()))) return false;
   sessionRenameRecoveryUsed = true;
   abandonedAutomaticRenameCommand = sessionRenameCommand;
   const head = pendingMessages[0];
@@ -6812,29 +7021,59 @@ function recoverUnconfirmedSessionRename(surface: SessionRenameSurface | undefin
 function settleSessionRename(source: 'prompt' | 'timer'): void {
   if (sessionRenamePhase !== 'sent') return;
   const surface = sessionRenameSurfaceNow();
-  const recorded = surface !== undefined && surface !== 'unsubmitted' && sessionRenameRecorded?.() === true;
+  const receipt = surface === 'occupied' || surface === 'settled'
+    ? (sessionRenameHistoricalRecorded ?? sessionRenameRecorded)
+    : sessionRenameRecorded;
+  const recorded = surface !== undefined && surface !== 'unsubmitted' && receipt?.() === true;
+  const recoveryAfterMs = lastInitConfig?.cliId === 'traex' && surface === 'settled'
+    ? SESSION_RENAME_RECOVERY_AFTER_MS : SESSION_RENAME_HOLD_TIMEOUT_MS;
+  const holdExpired = Date.now() - sessionRenameSentAtMs >= recoveryAfterMs;
   const step = decideSessionRenameSettlement({
     surface,
     recorded,
     resubmitted: sessionRenameResubmitted,
     fromPrompt: source === 'prompt',
+    holdExpired,
   });
-  if (step === 'release') {
+  // A prompt edge may clear only a positively releasable rename. In particular
+  // it must never start a CLI restart and then continue markPromptReady on the
+  // dying generation; the armed timer exclusively owns recovery and timeout.
+  if (source === 'prompt' && step !== 'release') return;
+  // PR #3816 owns the TRAE settled/title-mismatch restart path at 60s. Give it
+  // priority over the generic cap; other surfaces keep the 45s safety net.
+  if (source === 'timer' && !recorded && recoverUnconfirmedSessionRename(surface)) return;
+  if (source === 'timer' && lastInitConfig?.cliId === 'traex' && surface === 'settled'
+    && holdExpired && !recorded && !sessionRenameRecoveryPermanentlyUnavailable()) {
+    // Recovery exists for this runtime and exact thread, but a transient
+    // restart/write fence currently prevents it. Keep the empty composer held
+    // with an accurate notice rather than claiming a visible draft/dialog.
+    if (!sessionRenameHoldTimeoutLogged) {
+      sessionRenameHoldTimeoutLogged = true;
+      log(`WARN Native session rename recovery remains temporarily unavailable after ${recoveryAfterMs}ms; queued input stays held`);
+    }
+    notifySessionRenameInputTimeout('recovery-held', Math.round(recoveryAfterMs / 1000));
+    armSessionRenameIdleTimeout(SESSION_RENAME_SLOW_RECHECK_MS);
+    return;
+  }
+  if (step === 'release' || step === 'release_unconfirmed') {
     const held = sessionRenameHoldLogged;
+    const timedOut = step === 'release_unconfirmed';
+    const preserveReattachGate = sessionRenamePreserveReattachReadiness;
+    if (timedOut) notifySessionRenameInputTimeout('released', Math.round(recoveryAfterMs / 1000));
     forceClearSessionRenameInFlight();
     const evidence = surface === undefined ? 'unjudged' : 'recorded by the CLI';
     if (source === 'prompt') {
       if (held) log(`Native session rename confirmed (${evidence}); releasing queued input`);
       return;
     }
-    // The timer means prompt redraw detection failed. Restore the gate
-    // explicitly; otherwise a deferred raw_input is the only queued work and
-    // flushPending would keep waiting for the very signal this timer replaces.
-    isPromptReady = true;
-    reattachOpenTurnGate = false;
-    log(surface === undefined
-      ? `Native session rename idle timeout after ${SESSION_RENAME_IDLE_TIMEOUT_MS}ms; releasing queued input`
-      : `Native session rename confirmed (${evidence}); releasing queued input`);
+    // Restore only through the native-veto-aware path: a static empty composer
+    // must not manufacture readiness over OSC-7501 approvals or held busy turns.
+    restoreSessionRenameReadiness(surface, { preserveReattachGate });
+    log(timedOut
+      ? `WARN Native session rename confirmation exceeded ${recoveryAfterMs}ms; releasing queued input without a receipt (${surface}); normal delivery gates remain in force`
+      : surface === undefined
+        ? `Native session rename idle timeout after ${SESSION_RENAME_IDLE_TIMEOUT_MS}ms; releasing queued input`
+        : `Native session rename confirmed (${evidence}); releasing queued input`);
     void flushPending();
     return;
   }
@@ -6843,18 +7082,28 @@ function settleSessionRename(source: 'prompt' | 'timer'): void {
       sessionRenameResubmitted = true;
       log(`Native session rename command is still in the ${cliName()} composer; pressed Enter once to submit it`);
     }
-    armSessionRenameIdleTimeout(SESSION_RENAME_RECHECK_MS);
+    const remainingMs = recoveryAfterMs - (Date.now() - sessionRenameSentAtMs);
+    armSessionRenameIdleTimeout(remainingMs > 0 ? Math.min(SESSION_RENAME_RECHECK_MS, remainingMs) : SESSION_RENAME_RECHECK_MS);
     return;
   }
-  if (source === 'prompt') return;  // the armed timer re-reads and owns notice/recovery
   if (!sessionRenameHoldLogged) {
     sessionRenameHoldLogged = true;
     log(`Native session rename not confirmed (${surface}${sessionRenameResubmitted ? ' after one resubmit' : ''}); holding queued input until this rename is recorded and the ${cliName()} input surface is writable`);
   }
-  notifySessionRenameInputHeld();
-  if (recoverUnconfirmedSessionRename(surface)) return;
-  armSessionRenameIdleTimeout(Date.now() - sessionRenameSentAtMs < SESSION_RENAME_FAST_RECHECK_WINDOW_MS
-    ? SESSION_RENAME_RECHECK_MS : SESSION_RENAME_SLOW_RECHECK_MS);
+  if (holdExpired) {
+    if (!sessionRenameHoldTimeoutLogged) {
+      sessionRenameHoldTimeoutLogged = true;
+      log(`WARN Native session rename confirmation exceeded ${SESSION_RENAME_HOLD_TIMEOUT_MS}ms on a ${surface} surface; queued input remains held for safety`);
+    }
+    notifySessionRenameInputTimeout('held');
+  } else {
+    notifySessionRenameInputHeld();
+  }
+  const elapsedMs = Date.now() - sessionRenameSentAtMs;
+  const cadenceMs = elapsedMs < SESSION_RENAME_FAST_RECHECK_WINDOW_MS
+    ? SESSION_RENAME_RECHECK_MS : SESSION_RENAME_SLOW_RECHECK_MS;
+  const remainingMs = recoveryAfterMs - elapsedMs;
+  armSessionRenameIdleTimeout(remainingMs > 0 ? Math.min(cadenceMs, remainingMs) : cadenceMs);
 }
 
 /** A prompt can release rename only after the command Enter was actually sent.
@@ -6863,6 +7112,7 @@ function settleSessionRename(source: 'prompt' | 'timer'): void {
  * consume the newly-ready prompt. A quiet screen still holding the command
  * is a prompt too, so an adapter that judges its composer must agree. */
 function settleSessionRenameOnPrompt(): void {
+  if (isPromptReady && !reattachOpenTurnGate) sessionRenamePreserveReattachReadiness = false;
   settleSessionRename('prompt');
 }
 
@@ -6879,7 +7129,9 @@ function settleFailedSessionRenameWrite(): void {
  * redraw output for IdleDetector to rediscover the prompt. Without an adapter
  * verdict this fails open, so one administrative command cannot wedge all
  * later Lark messages; with one, queued input waits for this thread's durable
- * rename receipt and a writable input surface. */
+ * rename receipt and a writable input surface. The hard cap returns ordinary
+ * busy/unknown evidence to the REAL readiness gates; explicit dialogs/drafts
+ * and an exact unsubmitted command stay held beyond the cap. */
 function armSessionRenameIdleTimeout(delayMs = SESSION_RENAME_IDLE_TIMEOUT_MS): void {
   if (sessionRenamePhase !== 'sent') return;
   if (sessionRenameIdleTimer) clearTimeout(sessionRenameIdleTimer);
@@ -6896,8 +7148,11 @@ function armSessionRenameReattachRecoveryRetry(): void {
   if (sessionRenameReattachRetryTimer) return;
   if (!sessionRenameSentAtMs) sessionRenameSentAtMs = Date.now();
   const generation = cliSpawnGeneration;
-  const delayMs = Date.now() - sessionRenameSentAtMs < SESSION_RENAME_FAST_RECHECK_WINDOW_MS
+  const elapsedMs = Date.now() - sessionRenameSentAtMs;
+  const cadenceMs = elapsedMs < SESSION_RENAME_FAST_RECHECK_WINDOW_MS
     ? SESSION_RENAME_RECHECK_MS : SESSION_RENAME_SLOW_RECHECK_MS;
+  const remainingMs = SESSION_RENAME_HOLD_TIMEOUT_MS - elapsedMs;
+  const delayMs = remainingMs > 0 ? Math.min(cadenceMs, remainingMs) : cadenceMs;
   sessionRenameReattachRetryTimer = setTimeout(() => {
     sessionRenameReattachRetryTimer = null;
     if (generation === cliSpawnGeneration) void flushPending();
@@ -6909,8 +7164,9 @@ function armSessionRenameReattachRecoveryRetry(): void {
  * any restored input is written, recover a visible native rename operation
  * left by the predecessor. An exact draft gets the normal one-Enter recovery;
  * an occupied surface stays held even if this thread/title already has a
- * receipt. Unknown evidence BLOCKS this flush and schedules another read; only
- * positively settled/unjudged evidence may fall through to restored input. */
+ * receipt. Unknown evidence blocks and schedules another read during the bounded
+ * window; at the cap it fails open to the normal delivery gates. Only an exact
+ * unsubmitted rename command remains held beyond the cap. */
 function recoverSessionRenameAfterPersistentReattach(): boolean {
   const generation = cliSpawnGeneration;
   if (sessionRenameReattachRecoveryGeneration === generation || sessionRenamePhase !== 'idle') return false;
@@ -6922,13 +7178,59 @@ function recoverSessionRenameAfterPersistentReattach(): boolean {
     return false;
   }
   const command = adapter.buildSessionRenameCommand(title);
+  if (!sessionRenameSentAtMs) sessionRenameSentAtMs = Date.now();
   sessionRenameCommand = command;
+  if (!sessionRenameRecorded) {
+    try {
+      // Arm BEFORE the first surface read: a receipt landing between these two
+      // observations belongs to this recovery. Keep the same probe across every
+      // unknown retry so its baseline never moves and swallows an intervening write.
+      sessionRenameRecorded = adapter.watchSessionRename?.(command, {
+        getCliSessionId: sessionRenameNativeSessionIdNow,
+        // No fromByte: 0. Historical same-title receipts cannot prove that the
+        // exact draft surviving in this pane has executed.
+      });
+    } catch { sessionRenameRecorded = undefined; }
+  }
+  if (!sessionRenameHistoricalRecorded) {
+    try {
+      // A separate, once-armed historical channel proves only that an already
+      // renamed session was busy when the worker was replaced. It never releases
+      // unknown evidence or an exact surviving draft; both use the fresh probe.
+      sessionRenameHistoricalRecorded = adapter.watchSessionRename?.(command, {
+        getCliSessionId: sessionRenameNativeSessionIdNow,
+        fromByte: 0,
+      });
+    } catch { sessionRenameHistoricalRecorded = undefined; }
+  }
+  // Preserve this provenance beyond the first surface read. A recovered draft
+  // may be cleared by a human before the ordinary rename timer releases it.
+  sessionRenamePreserveReattachReadiness = reattachOpenTurnGate || !isPromptReady;
   const surface = sessionRenameSurfaceNow();
   if (surface === 'unknown') {
     sessionRenameCommand = undefined;
+    if (sessionRenameRecorded?.() === true) {
+      if (sessionRenameReattachRetryTimer) {
+        clearTimeout(sessionRenameReattachRetryTimer);
+        sessionRenameReattachRetryTimer = null;
+      }
+      log('Native session rename confirmed by the CLI record after persistent reattach; releasing restored input');
+      forceClearSessionRenameInFlight();
+      sessionRenameReattachRecoveryGeneration = generation;
+      restoreSessionRenameReadiness(surface, { preserveReattachGate: true });
+      return false;
+    }
     if (!sessionRenameHoldLogged) {
       sessionRenameHoldLogged = true;
       log('Native session rename recovery cannot classify the surviving terminal; holding restored input and retrying');
+    }
+    if (Date.now() - sessionRenameSentAtMs >= SESSION_RENAME_HOLD_TIMEOUT_MS) {
+      notifySessionRenameInputTimeout('released');
+      forceClearSessionRenameInFlight();
+      sessionRenameReattachRecoveryGeneration = generation;
+      restoreSessionRenameReadiness(surface, { preserveReattachGate: true });
+      log(`WARN Native session rename recovery remained unknown after ${SESSION_RENAME_HOLD_TIMEOUT_MS}ms; releasing restored input to the normal delivery gates`);
+      return false;
     }
     notifySessionRenameInputHeld();
     armSessionRenameReattachRecoveryRetry();
@@ -6939,25 +7241,20 @@ function recoverSessionRenameAfterPersistentReattach(): boolean {
     sessionRenameReattachRetryTimer = null;
   }
   sessionRenameReattachRecoveryGeneration = generation;
-  sessionRenameSentAtMs = 0;
   if (surface === undefined || surface === 'settled') {
+    sessionRenamePreserveReattachReadiness = false;
     sessionRenameCommand = undefined;
     sessionRenameHoldLogged = false;
     sessionRenameHoldNoticeSent = false;
+    sessionRenameHoldTimeoutLogged = false;
+    sessionRenameHoldTimeoutNoticeSent = false;
+    sessionRenameSentAtMs = 0;
+    sessionRenameRecorded = undefined;
+    sessionRenameHistoricalRecorded = undefined;
     return false;
   }
   sessionRenamePhase = 'sent';
-  sessionRenameSentAtMs = Date.now();
   sessionRenameResubmitted = false;
-  try {
-    sessionRenameRecorded = adapter.watchSessionRename?.(command, {
-      getCliSessionId: sessionRenameNativeSessionIdNow,
-      // The predecessor may have completed the rename before it died. That
-      // existing exact receipt releases only AFTER the current surface stops
-      // being occupied/unsubmitted; it never hides the surviving draft.
-      fromByte: 0,
-    });
-  } catch { sessionRenameRecorded = undefined; }
   log(`Recovered native session rename state after persistent reattach (${surface}); restored input stays held`);
   armSessionRenameIdleTimeout();
   return true;
@@ -6967,7 +7264,14 @@ function recoverSessionRenameAfterPersistentReattach(): boolean {
  * busy (notably Codex /btw). Only the short keystroke sequence is serialized.
  * Commands received while /rename owns the TUI are deferred by the IPC handler
  * and come through this same function after the prompt returns. */
-async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' }>): Promise<void> {
+async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' }>, requeueAtHead = false): Promise<void> {
+  if (sessionInputBlocksDeliveryNow()) {
+    if (requeueAtHead) freshnessInputQueue.prependRaw(msg);
+    else freshnessInputQueue.enqueueRaw(msg);
+    holdNativeInputForHardBlock();
+    log(`Native dialog or unsubmitted draft owns the CLI input; deferred passthrough: ${msg.content}`);
+    return;
+  }
   // Daemon/card readiness can lag behind a committed ordinary input. MiniMax
   // queues native turns, so changing capture ownership while it is busy would
   // discard that ordinary turn's final. Keep ownership until the real prompt.
@@ -8549,6 +8853,7 @@ function markActiveTurnStarted(input: {
   const identity = turnAuthorityIdentity(input);
   if (!identity.turnId) return;
   const syncHold = (): void => {
+    baselineAntigravityFooterTasksForActiveTurn();
     if (typeof backgroundAuthorityHold === 'undefined' || typeof applyBackgroundAuthorityTransition !== 'function') return;
     const snap = activeTurnAuthority.snapshot();
     applyBackgroundAuthorityTransition(backgroundAuthorityHold.onForegroundTurnStarted({
@@ -9508,8 +9813,7 @@ interface AntigravityFoldedReconcileResult {
 
 interface AntigravityFoldedReconcilePending {
   cliSpawnGeneration: number;
-  ptyOutputGeneration: number;
-  webTerminalInputGeneration: number;
+  webTerminalSubmitGeneration: number;
   currentTurnId: string | undefined;
   currentDispatchAttempt: number | undefined;
   promotedTurnId: string | undefined;
@@ -9523,14 +9827,31 @@ interface AntigravityFoldedReconcilePending {
   watcher?: FSWatcher;
 }
 
+/** A sibling-proven completed turn waiting only for its live background work.
+ * PTY output is deliberately not an identity fence: background redraws advance
+ * it without changing the turn. Spawn, turn and direct-submit identities still are. */
+interface AntigravityFoldedBackgroundHold {
+  cliSpawnGeneration: number;
+  turnId: string;
+  dispatchAttempt: number | undefined;
+  webTerminalSubmitGeneration: number;
+  clearTimer?: ReturnType<typeof setTimeout>;
+  recheckTimer?: ReturnType<typeof setInterval>;
+}
+
 const ANTIGRAVITY_FOLDED_RECONCILE_INITIAL_DELAY_MS = 50;
 const ANTIGRAVITY_FOLDED_RECONCILE_MAX_DELAY_MS = 1_000;
 const ANTIGRAVITY_FOLDED_RECONCILE_MAX_ATTEMPTS = 20;
 const ANTIGRAVITY_FOLDED_RECONCILE_MAX_WATCH_WAKEUPS = 50;
 const ANTIGRAVITY_FOLDED_RECONCILE_MAX_WINDOW_MS = 15_000;
+const ANTIGRAVITY_FOLDED_BACKGROUND_RECHECK_MS = 2_000;
 let antigravityFoldedReconcilePending: AntigravityFoldedReconcilePending | undefined;
+let antigravityFoldedBackgroundHold: AntigravityFoldedBackgroundHold | undefined;
 
 function cancelAntigravityFoldedReconcilePending(): void {
+  if (antigravityFoldedBackgroundHold?.clearTimer) clearTimeout(antigravityFoldedBackgroundHold.clearTimer);
+  if (antigravityFoldedBackgroundHold?.recheckTimer) clearInterval(antigravityFoldedBackgroundHold.recheckTimer);
+  antigravityFoldedBackgroundHold = undefined;
   const pending = antigravityFoldedReconcilePending;
   if (!pending) return;
   antigravityFoldedReconcilePending = undefined;
@@ -9732,15 +10053,99 @@ function reconcileCompletedAntigravityTurnsAtPromptReady(
   };
 }
 
+function hasAntigravityFoldedLiveHoldEvidence(): boolean {
+  if (typeof hasLiveAntigravityPendingTasks === 'function' && hasLiveAntigravityPendingTasks()) return true;
+  if (!backend || typeof backendScreenEvidenceIsAuthoritativeForMutation !== 'function'
+    || !backendScreenEvidenceIsAuthoritativeForMutation()) return false;
+  try {
+    const screen = captureBackendScreen(backend);
+    observeAntigravityFooterBackgroundTasks(screen);
+    // Background footers can report zero while a newer foreground turn is busy.
+    // Overlays/capture failures are inconclusive, never permission to settle.
+    return !isAntigravityIdleComposerScreen(screen);
+  } catch {
+    return true;
+  }
+}
+
+function armAntigravityFoldedBackgroundHold(
+  pending: AntigravityFoldedReconcilePending,
+  promotedTurnId: string,
+): void {
+  cancelAntigravityFoldedReconcilePending();
+  const hold: AntigravityFoldedBackgroundHold = {
+    cliSpawnGeneration: pending.cliSpawnGeneration,
+    turnId: promotedTurnId,
+    dispatchAttempt: currentBotmuxDispatchAttempt,
+    webTerminalSubmitGeneration: pending.webTerminalSubmitGeneration,
+  };
+  antigravityFoldedBackgroundHold = hold;
+  hold.recheckTimer = setInterval(() => {
+    if (antigravityFoldedBackgroundHold !== hold) return;
+    driveAntigravityFoldedBackgroundHold(true);
+  }, ANTIGRAVITY_FOLDED_BACKGROUND_RECHECK_MS);
+  hold.recheckTimer.unref();
+  revokePromptReadiness();
+  idleDetector?.reset();
+  refreshBackgroundWait();
+  publishScreenStatus('working');
+}
+
+/** True keeps or invalidates the hold without running the generic ready path.
+ *  False means fresh evidence permits settlement; callers then re-drive ready. */
+function retainAntigravityFoldedBackgroundHold(quiet = false): boolean {
+  const hold = antigravityFoldedBackgroundHold;
+  if (!hold) return false;
+  const active = activeTurnAuthority.snapshot();
+  if (
+    cliSpawnGeneration !== hold.cliSpawnGeneration
+    || cliRestartInProgress
+    || webTerminalSubmitGeneration !== hold.webTerminalSubmitGeneration
+    || currentBotmuxTurnId !== hold.turnId
+    || currentBotmuxDispatchAttempt !== hold.dispatchAttempt
+    || active?.turnId !== hold.turnId
+    || active.dispatchAttempt !== hold.dispatchAttempt
+    || active.started !== true
+    || durableTurnInFlight
+    || pendingMessages.length > 0
+    || pendingRawInputs.length > 0
+    || isFlushing
+  ) {
+    cancelAntigravityFoldedReconcilePending();
+    return true;
+  }
+  if (hasAntigravityFoldedLiveHoldEvidence()) {
+    if (!quiet) {
+      if (isPromptReady) revokePromptReadiness();
+      idleDetector?.reset();
+      refreshBackgroundWait();
+      publishScreenStatus('working');
+    }
+    return true;
+  }
+  cancelAntigravityFoldedReconcilePending();
+  // The observer/timer may run while a duplicate ready is still latched. Force
+  // the full path so the settled predecessor cannot strand its queued successor.
+  revokePromptReadiness();
+  return false;
+}
+
+function driveAntigravityFoldedBackgroundHold(quiet = false): void {
+  if (retainAntigravityFoldedBackgroundHold(quiet)) return;
+  markPromptReady();
+}
+
 function tryReconcilePendingAntigravityFoldedTurns(reason: string): boolean {
   const pending = antigravityFoldedReconcilePending;
   if (!pending) return false;
+  // Do not fence on PTY output here: background footer redraws advance it.
+  // Spawn/turn/direct-submit identities invalidate stale work; the reconcile
+  // below always reads fresh transcript evidence for that exact identity.
   if (
     !isPromptReady
     || cliSpawnGeneration !== pending.cliSpawnGeneration
     || cliRestartInProgress
-    || ptyOutputGeneration.snapshot() !== pending.ptyOutputGeneration
-    || webTerminalInputGeneration !== pending.webTerminalInputGeneration
+    || webTerminalSubmitGeneration !== pending.webTerminalSubmitGeneration
     || currentBotmuxTurnId !== pending.currentTurnId
     || currentBotmuxDispatchAttempt !== pending.currentDispatchAttempt
     || durableTurnInFlight
@@ -9756,7 +10161,6 @@ function tryReconcilePendingAntigravityFoldedTurns(reason: string): boolean {
   const res = reconcileCompletedAntigravityTurnsAtPromptReady(pending.promotedTurnId);
   if (res.reconciled) {
     const promotedTurnId = pending.promotedTurnId;
-    cancelAntigravityFoldedReconcilePending();
     if (
       res.completedCurrentTurn
       && promotedTurnId
@@ -9764,31 +10168,39 @@ function tryReconcilePendingAntigravityFoldedTurns(reason: string): boolean {
       && currentBotmuxDispatchAttempt === undefined
       && !durableTurnInFlight
     ) {
-      const stillPendingTasks = typeof hasLiveAntigravityPendingTasks === 'function'
-        && hasLiveAntigravityPendingTasks();
-      if (!stillPendingTasks) {
-        markTurnRetired(promotedTurnId);
-        releaseActiveTurnAuthority(`prompt_ready_reconciled:${reason}`);
-        syncQueuedTurnsFromMarkerDisk();
-        if (queuedTypeAheadTurns.length > 0) {
-          advanceQueuedTypeAheadTurn(`prompt_ready_reconciled:${reason}`);
-          queuedTurnAdvanceConsumedForPrompt = undefined;
-        }
-        writeCliPidMarker();
-        if (renderer && pendingMessages.length === 0 && pendingAdoptMessages.length === 0
-          && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
-          const { content } = renderer.snapshot();
-          send({
-            type: 'screen_update',
-            content,
-            ...classifyUsageLimitWithNativeEvidence(content, projectedRuntimeScreenStatus()),
-            ...backgroundWaitPayload(),
-            ...modelRequestPayload(),
-            turnId: currentBotmuxTurnId,
-            dispatchAttempt: currentBotmuxDispatchAttempt,
-          });
-        }
+      if (hasAntigravityFoldedLiveHoldEvidence()) {
+        armAntigravityFoldedBackgroundHold(pending, promotedTurnId);
+        return true;
       }
+      cancelAntigravityFoldedReconcilePending();
+      markTurnRetired(promotedTurnId);
+      releaseActiveTurnAuthority(`prompt_ready_reconciled:${reason}`);
+      const beforeSyncTurnId = currentBotmuxTurnId;
+      const beforeSyncDispatchAttempt = currentBotmuxDispatchAttempt;
+      syncQueuedTurnsFromMarkerDisk();
+      let promotedSuccessor = beforeSyncTurnId !== currentBotmuxTurnId
+        || beforeSyncDispatchAttempt !== currentBotmuxDispatchAttempt;
+      if (queuedTypeAheadTurns.length > 0) {
+        advanceQueuedTypeAheadTurn(`prompt_ready_reconciled:${reason}`);
+        queuedTurnAdvanceConsumedForPrompt = undefined;
+        promotedSuccessor = true;
+      }
+      writeCliPidMarker();
+      if (renderer && !promotedSuccessor && pendingMessages.length === 0 && pendingAdoptMessages.length === 0
+        && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
+        const { content } = renderer.snapshot();
+        send({
+          type: 'screen_update',
+          content,
+          ...classifyUsageLimitWithNativeEvidence(content, projectedRuntimeScreenStatus()),
+          ...backgroundWaitPayload(),
+          ...modelRequestPayload(),
+          turnId: currentBotmuxTurnId,
+          dispatchAttempt: currentBotmuxDispatchAttempt,
+        });
+      }
+    } else {
+      cancelAntigravityFoldedReconcilePending();
     }
     // Partial reconciliation (e.g. om_B flushed to compact before om_C): re-arm
     // within the original budget whenever sibling skew still holds on live work.
@@ -9879,8 +10291,7 @@ function armAntigravityFoldedReconcilePending(
   cancelAntigravityFoldedReconcilePending();
   const pending: AntigravityFoldedReconcilePending = {
     cliSpawnGeneration,
-    ptyOutputGeneration: ptyOutputGeneration.snapshot(),
-    webTerminalInputGeneration,
+    webTerminalSubmitGeneration,
     currentTurnId: currentBotmuxTurnId,
     currentDispatchAttempt: currentBotmuxDispatchAttempt,
     promotedTurnId,
@@ -11545,14 +11956,121 @@ let daemonCotHoldMayBeActive = false;
 let backgroundTasksTrackedForSiblings = false;
 /** Antigravity 常规模式原生页脚报告的后台任务/计时器数；与前台 activeTurnAuthority 解耦，
  *  仅经 refreshBackgroundWait 汇入 screen_update.backgroundTasks。 */
+interface AntigravityFooterTurnBaseline {
+  cliSpawnGeneration: number;
+  turnId: string;
+  dispatchAttempt: number | undefined;
+  count: number;
+  lastCount: number;
+  transcriptPath?: string;
+  transcriptOffset?: number;
+  transcriptDev?: bigint;
+  transcriptIno?: bigint;
+  observedCurrentPending: boolean;
+  sawIncrease: boolean;
+}
+let antigravityFooterTurnBaseline: AntigravityFooterTurnBaseline | undefined;
 let antigravityFooterBackgroundTasks = 0;
+
+function baselineAntigravityFooterTasksForActiveTurn(): void {
+  if (lastInitConfig?.cliId !== 'antigravity') return;
+  const active = activeTurnAuthority.snapshot();
+  if (active?.started !== true || !active.turnId) {
+    antigravityFooterTurnBaseline = undefined;
+    return;
+  }
+  const previous = antigravityFooterTurnBaseline;
+  if (previous && previous.cliSpawnGeneration === cliSpawnGeneration
+    && previous.turnId === active.turnId
+    && previous.dispatchAttempt === active.dispatchAttempt) return;
+  // Reattach/restore owns existing native work but did not start a fresh write;
+  // never baseline away the very tasks that may still need this authority.
+  if ((backend as (SessionBackend & { isReattach?: boolean }) | undefined)?.isReattach === true) {
+    antigravityFooterTurnBaseline = undefined;
+    return;
+  }
+  let count = antigravityFooterBackgroundTasks;
+  if (backend && typeof backendScreenEvidenceIsAuthoritativeForMutation === 'function'
+    && backendScreenEvidenceIsAuthoritativeForMutation()) {
+    try {
+      const parsed = parseAntigravityFooterBackgroundTasks(captureBackendScreen(backend));
+      if (parsed !== undefined) count = parsed;
+    } catch { /* Use the latest display count when a one-shot capture fails. */ }
+  }
+  let transcriptPath: string | undefined;
+  let transcriptOffset: number | undefined;
+  let transcriptDev: bigint | undefined;
+  let transcriptIno: bigint | undefined;
+  try {
+    transcriptPath = resolveLiveAntigravityTranscriptPath();
+    if (transcriptPath) {
+      const stat = statSync(transcriptPath, { throwIfNoEntry: false, bigint: true });
+      transcriptOffset = Number(stat?.size ?? 0);
+      if (!Number.isSafeInteger(transcriptOffset)) throw new Error('transcript anchor exceeds safe byte range');
+      transcriptDev = stat?.dev;
+      transcriptIno = stat?.ino;
+    }
+  } catch { /* Discovery may lag the write; absence of an anchor stays conservative. */ }
+  antigravityFooterBackgroundTasks = count;
+  antigravityFooterTurnBaseline = {
+    cliSpawnGeneration,
+    turnId: active.turnId,
+    dispatchAttempt: active.dispatchAttempt,
+    count,
+    lastCount: count,
+    transcriptPath,
+    transcriptOffset,
+    transcriptDev,
+    transcriptIno,
+    observedCurrentPending: false,
+    sawIncrease: false,
+  };
+}
+
+function noteAntigravityFooterTaskObservation(count: number): void {
+  const baseline = antigravityFooterTurnBaseline;
+  const active = activeTurnAuthority?.snapshot?.();
+  if (!baseline || active?.started !== true
+    || baseline.cliSpawnGeneration !== cliSpawnGeneration
+    || baseline.turnId !== active.turnId
+    || baseline.dispatchAttempt !== active.dispatchAttempt) return;
+  // Compare the latest valid samples, so 1→0→1 also proves new work. Once
+  // this turn added work, keep evidence until all tasks drain; without native
+  // task ids, a decrease alone must not guess which task finished.
+  if (count > baseline.lastCount) baseline.sawIncrease = true;
+  baseline.lastCount = count;
+}
+
+function antigravityFooterTaskEvidenceForActiveTurn(): boolean {
+  const baseline = antigravityFooterTurnBaseline;
+  // Restored/adopted turns have no new-write baseline; preserve conservative
+  // handling of work already belonging to their live native conversation.
+  if (!baseline) return true;
+  const active = activeTurnAuthority?.snapshot?.();
+  if (!active || active.started !== true
+    || baseline.cliSpawnGeneration !== cliSpawnGeneration
+    || baseline.turnId !== active.turnId
+    || baseline.dispatchAttempt !== active.dispatchAttempt) return true;
+  return baseline.sawIncrease;
+}
 
 function observeAntigravityFooterBackgroundTasks(screen: string | undefined): void {
   if (lastInitConfig?.cliId !== 'antigravity' || !screen) return;
   if (!backendScreenEvidenceIsAuthoritativeForMutation()) return;
   const parsed = parseAntigravityFooterBackgroundTasks(screen);
   if (parsed === undefined) return;
+  noteAntigravityFooterTaskObservation(parsed);
   antigravityFooterBackgroundTasks = parsed;
+  const hold = parsed === 0 ? antigravityFoldedBackgroundHold : undefined;
+  if (!hold || hold.clearTimer) return;
+  // A footer clear need not write either transcript. Re-drive outside the
+  // sampler stack; all normal generation/turn fences run when the timer fires.
+  hold.clearTimer = setTimeout(() => {
+    if (antigravityFoldedBackgroundHold !== hold) return;
+    hold.clearTimer = undefined;
+    driveAntigravityFoldedBackgroundHold();
+  }, 0);
+  hold.clearTimer.unref();
 }
 
 function computeBackgroundCotHold(nowMs = Date.now()): boolean {
@@ -17217,11 +17735,44 @@ function resolveLiveAntigravityTranscriptPath(): string | undefined {
   return resolveFileBridgePath('antigravity', { sessionId: cid, pid: effectivePid });
 }
 
-/** Whether the live Antigravity turn has pending background command task(s) or
- *  subagent(s). Works both when the structured bridge is active (zero-prompt /
- *  adopt) and in ordinary `replyDelivery: 'send'` mode where the bridge does
- *  not attach. Never holds a cold/resumed idle startup with no started turn or
- *  a viewport that explicitly shows an interrupted turn. */
+/** Re-anchor only on the current turn's unique authenticated envelope in the
+ *  replacement file. A new inode or truncation must never reuse old offsets. */
+function reanchorAntigravityTurnBaseline(
+  transcriptPath: string,
+  stat: { dev: bigint; ino: bigint },
+): boolean {
+  const baseline = antigravityFooterTurnBaseline;
+  const active = activeTurnAuthority.snapshot();
+  if (!baseline || active?.started !== true || !active.turnId
+    || baseline.turnId !== active.turnId || baseline.dispatchAttempt !== active.dispatchAttempt
+    || baseline.cliSpawnGeneration !== cliSpawnGeneration) return false;
+  try {
+    const replay = drainAntigravityTranscript(transcriptPath, 0, {}, {});
+    if (replay.pendingTail.length > 0) return false;
+    const matches = replay.events.filter(event => {
+      if (event.kind !== 'user') return false;
+      const header = event.text.replace(/\r\n?/g, '\n').split('<user_message>', 1)[0] ?? event.text;
+      return header.match(/(?:^|\n)<message_location\b[^>]*\bmessage_id="([^"]+)"[^>]*\/>(?:\n|$)/)?.[1] === active.turnId;
+    });
+    if (matches.length !== 1) return false;
+    const prefix = `${transcriptPath}:`;
+    const uuid = matches[0]!.uuid;
+    if (!uuid.startsWith(prefix)) return false;
+    const offset = Number(uuid.slice(prefix.length));
+    if (!Number.isSafeInteger(offset) || offset < 0) return false;
+    baseline.transcriptOffset = offset;
+    baseline.transcriptDev = stat.dev;
+    baseline.transcriptIno = stat.ino;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Whether the live Antigravity turn still has background work. A fresh
+ *  native footer can show running commands missing from the transcript.
+ *  Never hold an explicitly interrupted turn or use the footer to hold a
+ *  cold/resumed idle startup with no started turn. */
 function hasLiveAntigravityPendingTasks(): boolean {
   if (!structuredBridgeIs('antigravity') || cliAdapter?.runnerFramedInput) return false;
   const activeTurnStarted = activeTurnAuthority.snapshot()?.started === true;
@@ -17234,6 +17785,14 @@ function hasLiveAntigravityPendingTasks(): boolean {
     try {
       const screen = captureBackendScreen(backend);
       if (screen && isAntigravityInterruptedScreen(screen)) return false;
+      // The cached footer count is for display and survives unparseable
+      // frames. Only the current viewport may veto this ready edge.
+      const footerTasks = parseAntigravityFooterBackgroundTasks(screen);
+      if (footerTasks !== undefined) {
+        noteAntigravityFooterTaskObservation(footerTasks);
+        antigravityFooterBackgroundTasks = footerTasks;
+      }
+      if (activeTurnStarted && (footerTasks ?? 0) > 0 && antigravityFooterTaskEvidenceForActiveTurn()) return true;
     } catch { /* Missing viewport is not interruption evidence. */ }
   }
   if (codexBridgeFallbackActive()) {
@@ -17244,7 +17803,43 @@ function hasLiveAntigravityPendingTasks(): boolean {
     // to a direct disk scan while the bridge has not yet attached/baselined.
     if (codexBridgeRolloutPath && codexBridgeBaselineDone) return false;
   }
-  const transcriptPath = resolveLiveAntigravityTranscriptPath();
+  const resolvedTranscriptPath = resolveLiveAntigravityTranscriptPath();
+  const baseline = antigravityFooterTurnBaseline;
+  const active = activeTurnAuthority.snapshot();
+  const transcriptPath = resolvedTranscriptPath ?? baseline?.transcriptPath;
+  if (baseline && active?.started === true
+    && baseline.cliSpawnGeneration === cliSpawnGeneration
+    && baseline.turnId === active.turnId
+    && baseline.dispatchAttempt === active.dispatchAttempt
+    && baseline.transcriptPath && baseline.transcriptPath === transcriptPath
+    && baseline.transcriptOffset !== undefined) {
+    try {
+      const stat = statSync(transcriptPath!, { throwIfNoEntry: false, bigint: true });
+      if (!stat) return baseline.observedCurrentPending;
+      const size = Number(stat.size);
+      if (!Number.isSafeInteger(size)) return true;
+      if (stat.dev !== baseline.transcriptDev || stat.ino !== baseline.transcriptIno
+        || size < baseline.transcriptOffset) {
+        if (!reanchorAntigravityTurnBaseline(transcriptPath!, stat)) return true;
+      } else {
+        const replay = drainAntigravityTranscript(transcriptPath!, baseline.transcriptOffset, {}, {});
+        if (replay.pendingTail.length > 0) return true;
+        // No explicit user input after this write's byte anchor means the old
+        // RUNNING tail cannot belong to the newly started turn. Once current
+        // pending was observed, losing that user proof is instead inconclusive.
+        if (!replay.events.some(event => event.kind === 'user')) {
+          if (baseline.observedCurrentPending) return true;
+          baseline.observedCurrentPending = false;
+          return false;
+        }
+      }
+      const pending = hasAntigravityTranscriptPendingTasks(transcriptPath!);
+      baseline.observedCurrentPending = pending;
+      return pending;
+    } catch {
+      return true;
+    }
+  }
   return !!transcriptPath && hasAntigravityTranscriptPendingTasks(transcriptPath);
 }
 
@@ -22082,6 +22677,7 @@ let tuiPromptBlocking = false;
 /** One composed status projection shared by the immediate screen path,
  * periodic text updates, and screenshot uploads. */
 function projectedRuntimeScreenStatus(): RuntimeScreenStatus {
+  if (antigravityFoldedBackgroundHold) return 'working';
   return zcodeProgressStatus(codexAppLivenessStatus(projectRuntimeScreenStatus({
     promptReady: isPromptReady,
     analyzing: false,
@@ -22473,10 +23069,13 @@ async function admitAdoptMessage(item: PendingCliInput): Promise<void> {
     && !item.queueAfterActiveTurn) {
     item = { ...item, queueAfterActiveTurn: true };
   }
-  if (cliRestartInProgress || rawInputRestartGate || !backend
+  const alreadyHeld = cliRestartInProgress || rawInputRestartGate || !backend
     || item.queueAfterActiveTurn
-    || recoverSessionRenameAfterPersistentReattach() || sessionRenameInFlight()) {
+    || recoverSessionRenameAfterPersistentReattach() || sessionRenameInFlight();
+  const adoptInputBlocked = !alreadyHeld && sessionInputBlocksDeliveryNow();
+  if (alreadyHeld || adoptInputBlocked) {
     pendingAdoptMessages.push(item);
+    if (adoptInputBlocked) holdNativeInputForHardBlock();
     log(item.queueAfterActiveTurn
       ? `Queued serial adopt message until the active turn reaches a real prompt boundary (${item.content.length} chars)`
       : `Deferred adopt message until the CLI generation/input gate settles (${item.content.length} chars)`);
@@ -23670,6 +24269,7 @@ const inFlightKeepaliveFingerprints = new Map<string, number>();
 
 /** 排队注入一行 TUI 命令：idle（isPromptReady）时经串行恢复事务敲入。 */
 async function flushPendingInjections(): Promise<void> {
+  if (pendingInjections.length === 0) return;
   if (nativeSessionForkPending() || webTerminalInputWireDirty()) return;
   if (codexModelMigrationCheckNeeded() && await codexModelMigrationAdmit('write') !== 'proceed') return;
   if (webTerminalInputWireDirty()) return;
@@ -23694,6 +24294,12 @@ async function flushPendingInjections(): Promise<void> {
     commandLineWritesPending,
     bareShellLaunchBlocked,
   })) return;
+  // Do not inspect a surface while BotMux itself is mid-command; only once all
+  // writers are idle may a native dialog/draft hold the injection queue.
+  if (sessionInputBlocksDeliveryNow()) {
+    holdNativeInputForHardBlock();
+    return;
+  }
   injectionFlushing = true;
   try {
     while (pendingInjections.length > 0 && backend && isPromptReady && !bareShellLaunchBlocked
@@ -24168,7 +24774,7 @@ function traexQuestionSubmitGuard(item: Pick<PendingCliInput, 'turnId' | 'dispat
 
 /** One answer input into the current CLI, serialized with other terminal
  *  writes; false when the backend changed or refused it. */
-async function traexQuestionWrite(write: (input: PtyHandle) => boolean | void, expected?: TraexQuestionPage): Promise<boolean> {
+async function traexQuestionWrite(write: (input: PtyHandle) => boolean | void, expected?: TraexQuestionPage, final = false): Promise<boolean> {
   const target = backend;
   const lifetime = cliLifetimeNonce;
   if (!target || cliRestartInProgress || nativeSessionForkPending()) return false;
@@ -24185,11 +24791,15 @@ async function traexQuestionWrite(write: (input: PtyHandle) => boolean | void, e
           if (!page || traexQuestionSignature(page) !== traexQuestionSignature(expected)
             || traexQuestionState(page) !== traexQuestionState(expected)) return false;
         }
+        if (final && expected?.delivery === 'async' && !prepareTraexNativeAnswer()) return false;
         invalidatePromptReadinessEvidence();
-        return write(readinessTrackedInput(adapterInputHandle(target))) !== false;
+        const written = write(readinessTrackedInput(adapterInputHandle(target))) !== false;
+        if (final && traexNativeAnswerSubmission) traexNativeAnswerSubmission.written = written;
+        return written;
       },
     );
   } catch (err: any) {
+    if (final && traexNativeAnswerSubmission) traexNativeAnswerSubmission.written = false;
     log(`TraeX question answer write failed: ${err?.message ?? err}`);
     return false;
   }
@@ -24227,6 +24837,79 @@ async function traexQuestionOpenPending(known?: TraexQuestionPage): Promise<bool
   }
 }
 
+type TraexNativeAnswerInput = Extract<DaemonToWorker, { type: 'message' }>;
+const traexNativeAnswerAdmissions = new Map<string, (input?: TraexNativeAnswerInput) => void>();
+const traexNativeAnswerInputs = new WeakMap<AskResult, TraexNativeAnswerInput>();
+let traexNativeAnswerSubmission: { input: TraexNativeAnswerInput; prepared: boolean; written?: boolean } | undefined;
+
+function prepareTraexNativeAnswer(): boolean {
+  const submission = traexNativeAnswerSubmission;
+  if (!submission || submission.prepared) return true;
+  const input = submission.input;
+  const typeAhead = !!currentBotmuxTurnId && currentBotmuxTurnId !== input.turnId
+    && !turnTerminalEmitted(currentBotmuxTurnId, currentBotmuxDispatchAttempt);
+  if ((!typeAhead && !reserveActiveTurn(input)) || (workerSessionEventScope && !workerSessionEventScope.canSubmit(input.turnId, input.dispatchAttempt))) return false;
+  workerSessionEventScope?.enterTurn(input.turnId, input.dispatchAttempt);
+  const item: PendingCliInput = { ...input, noReplay: true };
+  if (typeAhead && input.turnId) {
+    queuedTypeAheadTurns.push({ turnId: input.turnId, dispatchAttempt: input.dispatchAttempt,
+      linkRefMode: input.linkRefMode, trustedCaller: input.trustedCaller, trustedController: input.trustedController,
+      turnCallerOpenId: input.turnCallerOpenId ?? input.trustedCaller?.requestUserOpenId });
+  } else {
+    renderer?.markNewTurn();
+    usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
+    setCaptureIdentity(input.turnId, input.dispatchAttempt, input.turnCallerOpenId ?? input.trustedCaller?.requestUserOpenId);
+    currentBotmuxLinkRefMode = input.linkRefMode;
+    markActiveTurnStarted(input);
+  }
+  workerSessionEventScope?.recordSubmission(input.turnId, input.dispatchAttempt);
+  inflightInputs.onWrite(item);
+  noteCliInputWritten(item);
+  writeCliPidMarker();
+  publishSandboxRelayCapability();
+  const turnId = codexBridgeMarkPendingTurn(input.content, input.turnId, input.dispatchAttempt, Date.now(), input.linkRefMode);
+  if (turnId) codexBridgeQueue.beginSubmitVerification(turnId, undefined, input.dispatchAttempt);
+  markTurnExecutionStart(input.turnId, input.dispatchAttempt);
+  traexAutoModelTurnReplayForbidden = true;
+  submission.prepared = true;
+  return true;
+}
+
+async function runTraexNativeAnswer(
+  page: TraexQuestionPage,
+  result: AskResult | undefined,
+  write: () => Promise<boolean | undefined>,
+  admittedInput?: TraexNativeAnswerInput,
+): Promise<void> {
+  const input = admittedInput ?? (result ? traexNativeAnswerInputs.get(result) : undefined);
+  if (page.delivery !== 'async') { await write(); return; }
+  if (!input) throw new Error('Native question answer admission unavailable');
+  if (result) traexNativeAnswerInputs.delete(result);
+  const submission = { input, prepared: false, written: undefined as boolean | undefined };
+  const run = async (): Promise<void> => {
+    traexNativeAnswerSubmission = submission;
+    try {
+      await write();
+    } finally {
+      if (traexNativeAnswerSubmission === submission) traexNativeAnswerSubmission = undefined;
+      if (!submission.prepared || submission.written === false) {
+        if (input.turnId) {
+          codexBridgeQueue.dropPendingTurn(input.turnId, input.dispatchAttempt, true);
+          inflightInputs.retireTurn(input.turnId);
+          releaseActiveTurnAuthority('native_question_not_submitted', { turnId: input.turnId, dispatchAttempt: input.dispatchAttempt });
+          emitTurnTerminal(input.turnId, 'failed', 'native_question_not_submitted', input.dispatchAttempt);
+        }
+      } else if (input.turnId) {
+        codexBridgeQueue.finishSubmitVerification(input.turnId, undefined, input.dispatchAttempt);
+        codexBridgeDrainAndMaybeEmit();
+      }
+    }
+  };
+  const binding = workerSessionEventScope?.currentBinding();
+  if (binding && workerSessionEventScope) await workerSessionEventScope.run(binding, run, input.sessionCommand?.execution);
+  else await run();
+}
+
 const traexQuestionBridge = new TraexQuestionBridge({
   now: () => Date.now(),
   setTimer: (fn, ms) => {
@@ -24241,24 +24924,60 @@ const traexQuestionBridge = new TraexQuestionBridge({
   openPending: traexQuestionOpenPending,
   mayOpenPending: traexQuestionMayOpenPending,
   // The same daemon ask broker (and card) as the RPC path's native questions.
-  ask: (question, signal, page) => {
+  ask: async (question, signal, page) => {
     const cfg = lastInitConfig;
     if (!cfg) return Promise.reject(new Error('session not initialised'));
-    return postCodexAsk({
-      sessionId: cfg.sessionId,
-      larkAppId: cfg.larkAppId,
-      chatId: cfg.chatId,
-      rootMessageId: cfg.rootMessageId,
-      originTurnId: currentBotmuxTurnId,
-      originDispatchAttempt: currentBotmuxDispatchAttempt,
-      ...(page?.delivery === 'async' ? { standalone: true } : {}),
-    }, [question], signal);
+    const requestId = page?.delivery === 'async' ? randomUUID() : undefined;
+    let admittedInput: TraexNativeAnswerInput | undefined;
+    let answerHandedOff = false;
+    let resolveAdmission: ((input?: TraexNativeAnswerInput) => void) | undefined;
+    const admitted = requestId ? new Promise<TraexNativeAnswerInput | undefined>(resolve => {
+      resolveAdmission = input => { if (input) admittedInput = input; resolve(input); };
+    }) : undefined;
+    const abort = () => resolveAdmission?.();
+    if (requestId) {
+      traexNativeAnswerAdmissions.set(requestId, resolveAdmission!);
+      signal.addEventListener('abort', abort, { once: true });
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = await postCodexAsk({
+        sessionId: cfg.sessionId,
+        larkAppId: cfg.larkAppId,
+        chatId: cfg.chatId,
+        rootMessageId: cfg.rootMessageId,
+        originTurnId: currentBotmuxTurnId,
+        originDispatchAttempt: currentBotmuxDispatchAttempt,
+        ...(requestId ? { requestId } : {}),
+        ...(page?.delivery === 'async' ? { standalone: true } : {}),
+      }, [question], signal);
+      if (result.kind === 'answered' && admitted) {
+        timer = setTimeout(abort, 30_000);
+        timer.unref?.();
+        const input = await admitted;
+        if (!input) throw new Error('Native question answer admission unavailable');
+        traexNativeAnswerInputs.set(result, input);
+        answerHandedOff = true;
+      }
+      return result;
+    } finally {
+      if (timer) clearTimeout(timer);
+      signal.removeEventListener('abort', abort);
+      if (requestId) traexNativeAnswerAdmissions.delete(requestId);
+      // The daemon can commit the native answer before its HTTP response returns.
+      // If abort or transport failure prevents the bridge handoff, retire it through
+      // the same answer lifecycle without writing to a withdrawn question page.
+      if (page && admittedInput && !answerHandedOff) {
+        await runTraexNativeAnswer(page, undefined, async () => false, admittedInput);
+      }
+    }
   },
+  runAnswer: runTraexNativeAnswer,
   writeKey: (key, expected) => traexQuestionWrite(target => {
     if (target.sendSpecialKeys) return target.sendSpecialKeys(key);
     target.write(KEY_TO_ANSI[key] ?? key);
     return true;
-  }, expected),
+  }, expected, key === 'Enter'),
   paste: (text, expected) => traexQuestionWrite(target => {
     if (target.pasteText) target.pasteText(text);
     else target.write(wrapBracketedPaste(text));
@@ -27581,6 +28300,7 @@ function markPromptReady(): void {
     schedulePostTerminalFenceRecheck('prompt-ready deferred by fence');
     return;
   }
+  if (antigravityFoldedBackgroundHold && retainAntigravityFoldedBackgroundHold()) return;
   if (isPromptReady) {
     stopStructuredStartGraceRecheck();
     if (typeof antigravityFoldedReconcilePending !== 'undefined'
@@ -27840,8 +28560,13 @@ function markPromptReady(): void {
   judgeClaudeBridgeTurn();
   bridgeQueue.cliQueueDrained();
   settleSessionRenameOnPrompt();
+  const beforeSyncTurnId = currentBotmuxTurnId;
+  const beforeSyncDispatchAttempt = currentBotmuxDispatchAttempt;
   const syncedFromDisk = syncQueuedTurnsFromMarkerDisk();
+  let advancedQueuedTurn = beforeSyncTurnId !== currentBotmuxTurnId
+    || beforeSyncDispatchAttempt !== currentBotmuxDispatchAttempt;
   if (readyTransition(syncedFromDisk).advanceQueuedTurn) {
+    advancedQueuedTurn = true;
     advanceQueuedTypeAheadTurn('prompt_ready');
   }
   queuedTurnAdvanceConsumedForPrompt = undefined;
@@ -27946,7 +28671,7 @@ function markPromptReady(): void {
     observeAntigravityFooterBackgroundTasks(renderer?.rawSnapshot() || lastAnalyzerSnapshot);
   }
   refreshBackgroundWait();
-  if (renderer && !spawnArgvInitialPromptBusy && backgroundTaskTracker.pendingTurnAgents() === 0 && !antigravityPendingTasks && pendingMessages.length === 0 && pendingAdoptMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
+  if (renderer && !advancedQueuedTurn && !spawnArgvInitialPromptBusy && backgroundTaskTracker.pendingTurnAgents() === 0 && !antigravityPendingTasks && pendingMessages.length === 0 && pendingAdoptMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
     const { content } = renderer.snapshot();
     send({
       type: 'screen_update',
@@ -28008,7 +28733,9 @@ function markPromptReady(): void {
       log(backgroundTaskTracker.pendingTurnAgents() > 0
         ? `Idle prompt while ${backgroundTaskTracker.pendingTurnAgents()} background agent(s) pending — reporting working until their completion notification arrives`
         : 'Idle prompt while Antigravity background task(s)/subagent(s) pending — reporting working until completion notification arrives');
-    } else {
+    } else if (!advancedQueuedTurn) {
+      // A promoted folded successor owns the next working episode; never attach
+      // the predecessor's idle completion frame to its new turn identity.
       publishScreenStatus('idle');
     }
   } else if (hasPendingWork) {
@@ -28037,6 +28764,7 @@ function persistCliSessionId(cliSessionId: string): void {
   inputDeliveryObservedCliSessionId = cliSessionId;
   if (lastInitConfig?.cliId === 'antigravity' && previousCliSessionId && previousCliSessionId !== cliSessionId) {
     antigravityFooterBackgroundTasks = 0;
+  antigravityFooterTurnBaseline = undefined;
     refreshBackgroundWait();
   }
   const published = publishCliSessionIdToDaemon({
@@ -29570,10 +30298,6 @@ async function flushPending(): Promise<void> {
   // flushPendingInjections 消费完 barrier 后由其 finally 的 re-kick 排空。
   if (shouldDeferUserFlush(pendingInjections)) return;
   if (bareShellLaunchBlocked) return;  // launch is held at a bare shell — don't type prompts into it
-  // A Hook-review page has an active selection and consumes Enter/arrow keys.
-  // Re-check the screen right before a literal write; PTY chunks can arrive
-  // between idle detection and this queue drain.
-  if (hookReviewHoldsQueuedWrite()) return;
   // Screen-idle is not a durable receipt. A permission/AskUser prompt can look
   // idle while the logical delivery is unresolved, so no following IM or
   // meeting turn may cross this boundary until an explicit terminal releases
@@ -29589,11 +30313,21 @@ async function flushPending(): Promise<void> {
     log(`Holding pending input behind ${rpcLifecycleFailClosedOwners.size} unresolved Codex RPC delivery owner(s)`);
     return;
   }
-  // Never type into a recognized startup dialog: the text is swallowed and its
-  // Enter picks an option for the user. The ready-gate fallback settle and
-  // type-ahead adapters reach this write without a prompt-ready edge.
+  // Only after the serial/lifecycle gates above may screen evidence classify the
+  // current input owner. Otherwise BotMux's own in-flight command or an active
+  // durable turn is misreported as a user draft. Dedicated interaction owners
+  // still precede the generic dialog/draft fallback so they keep their cards.
+  if (hookReviewHoldsQueuedWrite()) return;
   if (probeStartupBlocker('Flush')) {
     log(`Holding ${pendingMessages.length} pending message(s) behind a startup dialog`);
+    return;
+  }
+  const codexDirectWriteNeedsHardGuard = lastInitConfig?.cliId === 'codex'
+    && (!backend.captureInputState || lastInitConfig.adoptMode === true
+      || pendingSessionRename !== null || pendingRawInputs.length > 0 || pendingAdoptMessages.length > 0);
+  if (!traexQuestionDeliveryOwnsInput()
+    && (lastInitConfig?.cliId !== 'codex' || codexDirectWriteNeedsHardGuard) && sessionInputBlocksDeliveryNow()) {
+    holdNativeInputForHardBlock();
     return;
   }
   // Ready-gate: hold the FIRST prompt until the SessionStart hook fires a true-
@@ -29723,7 +30457,7 @@ async function flushPending(): Promise<void> {
   // it. Inputs that cannot type ahead (durable attempts) need that readiness
   // back for the hold's re-check to reach them on a screen that stays silent.
   const keepPromptReadyAfterHold = (): void => {
-    if (promptReadyAtFlushStart && itemsWrittenInThisFlush === 0) isPromptReady = true;
+    if (promptReadyAtFlushStart && itemsWrittenInThisFlush === 0) restoreSessionRenameReadiness(undefined);
   };
   const holdFirstAdmissionAfterWebInput = (): void => {
     openingInputBoxSettled = false;
@@ -29752,6 +30486,7 @@ async function flushPending(): Promise<void> {
       publishScreenStatus('working', { force: true });
     }
     cliSubmissionInFlight = null;
+    if (submitted) firstWriteHeldNoticeSent = false;
     if (inFlight.bridgeTurnId) bridgeQueue.releaseWriteHold(inFlight.bridgeTurnId, item.dispatchAttempt);
     if (inFlight.readyDeferred) {
       // A turn this write opened makes the prompt ready again when it ends;
@@ -29836,16 +30571,21 @@ async function flushPending(): Promise<void> {
       const raw = freshnessInputQueue.takeRaw();
       if (!raw) return;
       if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
-      await deliverRawInput(raw);
+      await deliverRawInput(raw, true);
       return;
     }
     if (supportedSessionRenameReady && pendingSessionRename !== null && backend && cliAdapter) {
+      if (sessionInputBlocksDeliveryNow()) {
+        holdNativeInputForHardBlock();
+        return;
+      }
       const title = pendingSessionRename;
       const buildRename = cliAdapter.buildSessionRenameCommand!;
       const renameBackend = backend;
       const renameGeneration = cliSpawnGeneration;
       pendingSessionRename = null;
       sessionRenamePhase = 'reserved';
+      sessionRenamePreserveReattachReadiness = false;
       try {
         const writeRename = async () => {
           // Transition to busy inside the adopt queue, after the readiness
@@ -29858,6 +30598,8 @@ async function flushPending(): Promise<void> {
           sessionRenameResubmitted = false;
           sessionRenameHoldLogged = false;
           sessionRenameHoldNoticeSent = false;
+          sessionRenameHoldTimeoutLogged = false;
+          sessionRenameHoldTimeoutNoticeSent = false;
           try {
             // This is the live, observed native identity, not a possibly stale
             // init-time resume target. An adopt/reattach that has not proven its
@@ -29911,8 +30653,7 @@ async function flushPending(): Promise<void> {
         if (current && failureAction === 'retry') {
           if (pendingSessionRename === null) pendingSessionRename = title;
           forceClearSessionRenameInFlight();
-          isPromptReady = true;
-          reattachOpenTurnGate = false;
+          restoreSessionRenameReadiness(undefined);
           // The outer flush still owns isFlushing. Re-drive only after its
           // finally releases the mutex; web-dirty/backend gates may refuse the
           // retry before writing again without spinning this call stack.
@@ -30175,6 +30916,7 @@ async function flushPending(): Promise<void> {
         && cliAdapter === writeAdapter
         && codexRpcEngine === writeRpcEngine
         && !cliRestartInProgress
+        && !closeRequested
       );
       const durableWrite = item.dispatchAttempt !== undefined;
       const msg = item.content;
@@ -30183,6 +30925,7 @@ async function flushPending(): Promise<void> {
       let turnSeq = usageLimitTracker.currentTurn();
       let bridgeTurnId: string | undefined;
       let normalWritePrepared = false;
+      let retiredBeforeSubmit = false;
       let webWireWriteRefused = false;
       let submissionPreparationFailed = false;
       // Remote-runner, RPC and Codex App runner input bypass the composer.
@@ -30714,6 +31457,14 @@ async function flushPending(): Promise<void> {
           recoveryFailureReason = transaction.recoveryFailureReason;
         } else {
           submissionBackend = writeBackend;
+          if (writeAdapter.writeInputDefersPreparation === true && !pendingMessages.includes(item)) {
+            // Keep the exact item under the ordinary pending lifecycle until its
+            // asynchronous precheck reaches beforeSubmit. backend.onExit,
+            // startup-circuit stop, killCli and durable expiry can then retire or
+            // preserve it through their existing queue paths instead of losing
+            // ownership and resurrecting it later.
+            pendingMessages.unshift(item);
+          }
           const transaction = await runAmbiguousSubmissionTransaction(
             writeBackend,
             () => writeAdapter.writeInput(
@@ -30722,6 +31473,33 @@ async function flushPending(): Promise<void> {
               {
                 turnId: item.turnId,
                 dispatchAttempt: item.dispatchAttempt,
+                ...(writeAdapter.writeInputDefersPreparation === true ? { beforeSubmit: () => {
+                  // The adapter's asynchronous precheck may outlive its CLI
+                  // generation. Refuse before committing ANY global turn state
+                  // or pasting into the backend that is already being replaced.
+                  if (!writeContinuationIsCurrent()) return false;
+                  // A lifecycle path may have retired this exact pending item
+                  // during the awaited precheck (durable handoff/expiry,
+                  // noReplay drop, startup failure or a non-preserving kill).
+                  // Missing ownership is a veto, never a reason to recreate it.
+                  const pendingIndex = pendingMessages.indexOf(item);
+                  if (pendingIndex < 0) {
+                    retiredBeforeSubmit = true;
+                    return false;
+                  }
+                  // The precheck may also have waited through a prompt-ready
+                  // edge. Re-open the write cycle immediately before actual paste
+                  // so composerOwned/readiness cannot describe that stale window.
+                  beginCliWriteCycle();
+                  prepareNormalWrite();
+                  // Commit queue ownership only AFTER preparation succeeds. A
+                  // dirty Web wire (or any other preparation throw) leaves the
+                  // exact item in its original queue instead of losing it.
+                  const committedIndex = pendingMessages.indexOf(item);
+                  if (committedIndex < 0) return false;
+                  pendingMessages.splice(committedIndex, 1);
+                  return true;
+                } } : {}),
                 onInputPrepared: content => { submittedText = content; },
                 ...(lastInitConfig?.cliId === 'codex'
                   && !lastInitConfig.adoptMode && lastInitConfig.promptInjection !== 'none'
@@ -30732,13 +31510,32 @@ async function flushPending(): Promise<void> {
               },
             ),
             settleVerifiableSubmissionForJournal,
-            prepareNormalWrite,
+            writeAdapter.writeInputDefersPreparation === true ? undefined : prepareNormalWrite,
           ).finally(() => { traexQuestionDraftWaiting = false; });
           result = transaction.result;
           recoveryFailureReason = transaction.recoveryFailureReason;
         }
+        if (retiredBeforeSubmit && writeContinuationIsCurrent()) {
+          // Expiry/interrupt/continuation discard removed this exact item while
+          // the live backend was prechecking. It has no remaining write to hold;
+          // continue with the next queue head instead of warning or waiting 5s.
+          keepPromptReadyAfterHold();
+          continue;
+        }
         if (recoveryFailureReason) {
           result = { ...result, submitted: false };
+        }
+        if (!writeContinuationIsCurrent() && typedIntoComposer
+          && result?.submissionDisposition === 'untouched' && !normalWritePrepared) {
+          // The adapter vetoed before beforeSubmit, so onWrite/carryover never
+          // owned this item either. Deferred-precheck items stayed in the pending
+          // lifecycle throughout; whatever queue/handoff decision their exit path
+          // made is authoritative. Never unshift a retired item back into existence.
+          if (writeAdapter.writeInputDefersPreparation !== true && !pendingMessages.includes(item)) {
+            pendingMessages.unshift(item);
+          }
+          log(`Settled untouched pre-write input after CLI generation replacement (${item.content.length} chars)`);
+          break;
         }
         if (!writeContinuationIsCurrent()) {
           handleStaleWriteContinuation('write_generation_changed');
@@ -30757,7 +31554,9 @@ async function flushPending(): Promise<void> {
       } catch (err: any) {
         if ((webWireWriteRefused || (err instanceof SubmissionWriteError && !err.submissionStarted
           && webTerminalInputWireDirty())) && !tracksCodexAppLiveness && writeContinuationIsCurrent()) {
-          pendingMessages.unshift(item);
+          if (writeAdapter.writeInputDefersPreparation !== true && !pendingMessages.includes(item)) {
+            pendingMessages.unshift(item);
+          }
           requeueUnsubmittedQueuedActivation(item);
           keepPromptReadyAfterHold();
           log('Retained definitely-unwritten input behind the dirty Web terminal wire');
@@ -30996,7 +31795,9 @@ async function flushPending(): Promise<void> {
           // original durable attempt (and ordinary IM content) queued, but do
           // not hammer the same sticky journal or burn receiver retry budget.
           // A user /restart installs a fresh backend and releases the hold.
-          pendingMessages.unshift(item);
+          if (writeAdapter.writeInputDefersPreparation !== true && !pendingMessages.includes(item)) {
+            pendingMessages.unshift(item);
+          }
           ambiguousSubmissionRecoveryHold = {
             backend: submissionBackend,
             item,
@@ -31177,6 +31978,21 @@ async function flushPending(): Promise<void> {
         }
         const codexAppSafeNonSubmission = result.submissionDisposition === 'untouched'
           || result.submissionDisposition === 'flushed_invalid';
+        if (lastInitConfig?.cliId === 'codex' && typedIntoComposer && !recoveryFailureReason
+          && result.submissionDisposition === 'untouched') {
+          // prepareCodexTranscriptInput refused before beforeSubmit(), so this
+          // item has no durable turn, bridge mark, type-ahead or activation side
+          // effects to roll back. Restore only the FIFO head. In particular a
+          // queued activation stays queued: never ACK an unwritten activation.
+          if (writeAdapter.writeInputDefersPreparation !== true && !pendingMessages.includes(item)) {
+            pendingMessages.unshift(item);
+          }
+          openingInputBoxSettled = false;
+          keepPromptReadyAfterHold();
+          holdNativeInputForHardBlock(result.failureReason ?? 'Codex input is not ready');
+          log(`Retained untouched Codex input and its queued tail: ${result.failureReason ?? 'composer not ready'}`);
+          break;
+        }
         if (tracksCodexAppLiveness && !codexAppSafeNonSubmission) {
           // final-Enter exhaustion, cleanup failure, and thrown/unknown writes
           // can leave a complete valid frame buffered. Retain an ordinary
@@ -32106,6 +32922,7 @@ function stopScreenUpdates(): void {
   if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
   lastAnalyzerSnapshot = '';
   antigravityFooterBackgroundTasks = 0;
+  antigravityFooterTurnBaseline = undefined;
   cancelAntigravityFoldedReconcilePending();
 }
 
@@ -33182,6 +33999,7 @@ async function spawnCliBody(
   daemonCotHoldMayBeActive = false;
   backgroundTasksTrackedForSiblings = false;
   antigravityFooterBackgroundTasks = 0;
+  antigravityFooterTurnBaseline = undefined;
   bridgeQueue?.resetBackgroundTasks?.();
   const isolationRuntimeDataDir = process.env.SESSION_DATA_DIR
     ?? join(homedir(), '.botmux', 'data');
@@ -40404,15 +41222,11 @@ async function spawnCliBody(
     if (stashed > 0) {
       log(`CLI exited with ${stashed} in-flight message(s); will re-queue after restart`);
     }
-    const dropPendingOnExit = (item: PendingCliInput): boolean =>
-      item.noReplay === true && !(intentionalRestart && item.traexAutoModelRecovery);
-    const droppedPending = pendingMessages.filter(dropPendingOnExit).length;
+    const droppedPendingItems = dropNoReplayPendingInputsOnBackendExit(pendingMessages, { intentionalRestart });
+    const droppedPending = droppedPendingItems.length;
     if (droppedPending > 0) {
       // Remove ONLY the no-replay items still queued (never written); keep any
       // ordinary follow-up input for the restart's normal flush.
-      for (let i = pendingMessages.length - 1; i >= 0; i--) {
-        if (dropPendingOnExit(pendingMessages[i])) pendingMessages.splice(i, 1);
-      }
       log(`Dropped ${droppedPending} at-most-once pending message(s) on CLI exit (no replay)`);
       // The CLI is gone: a cut its rewind made can be put back right away.
       settleFailedTurnRewindOffQueue('dropped on a CLI exit', true);
@@ -47164,7 +47978,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         && msg.dispatchAttempt === undefined
         // ordinary-turn 前缀族（om_ / bmx-recovery- / board: 决策看板批次）共用一套
         // 收到/提交去重；board: 的 id 按批次稳定，重投/补投是同一个回合。
-        && isOrdinaryImTurnId(msg.turnId)
+        && (isOrdinaryImTurnId(msg.turnId) || msg.nativeQuestionAnswer !== undefined)
         ? msg.turnId
         : undefined;
       if (ordinaryImTurnId) {
@@ -47253,6 +48067,17 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
             ...(active?.caller ? { activeCaller: active.caller } : {}),
             ...(active?.controller ? { activeController: active.controller } : {}),
           });
+        }
+        break;
+      }
+      if (msg.nativeQuestionAnswer) {
+        const admit = traexNativeAnswerAdmissions.get(msg.nativeQuestionAnswer.requestId);
+        if (admit) {
+          traexNativeAnswerAdmissions.delete(msg.nativeQuestionAnswer.requestId);
+          admit(msg);
+          acknowledgeTurnInputCommitted(msg.turnId, msg.dispatchAttempt, msg.durablePrimaryInbox);
+        } else if (msg.turnId) {
+          emitTurnTerminal(msg.turnId, 'cancelled', 'native_question_no_longer_pending', msg.dispatchAttempt);
         }
         break;
       }

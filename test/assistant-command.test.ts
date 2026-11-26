@@ -11,17 +11,24 @@ import { join } from 'node:path';
 
 // ── Mocks ────────────────────────────────────────────────────────────────────
 let assistantMode = true;
+let assistantGroupChat = true;
 const BOT_OPEN_ID = 'ou_' + 'f'.repeat(32);
 vi.mock('../src/bot-registry.js', () => ({
-  getBot: () => ({ config: { assistantMode } }),
+  getBot: () => ({ config: { assistantMode, assistantGroupChat } }),
   getBotOpenId: () => BOT_OPEN_ID,
 }));
 
 const mockIsBotMentioned = vi.fn(() => true);
 const mockCanOperate = vi.fn(() => false);
+let groupUserCount = 1;
+/** 缓存里的人数（不带 requireFresh 时返回）；undefined = 与最新值相同。 */
+let cachedUserCount: number | undefined;
+const mockGetGroupStats = vi.fn(async (_app: string, _chat: string, opts?: { requireFresh?: boolean }) =>
+  ({ userCount: opts?.requireFresh || cachedUserCount === undefined ? groupUserCount : cachedUserCount, botCount: 1 }));
 vi.mock('../src/im/lark/event-dispatcher.js', () => ({
   isBotMentioned: (...a: any[]) => mockIsBotMentioned(...a),
   canOperate: (...a: any[]) => mockCanOperate(...a),
+  getGroupStats: (...a: any[]) => mockGetGroupStats(...a),
   extractMessageTextForRouting: (m: any) => {
     try { return JSON.parse(m.content ?? '{}').text ?? ''; } catch { return ''; }
   },
@@ -34,7 +41,9 @@ vi.mock('../src/im/lark/message-parser.js', () => ({
 }));
 
 const mockReplyMessage = vi.fn(async () => 'msg-id');
+const mockListChatMemberOpenIds = vi.fn(async (): Promise<string[]> => []);
 vi.mock('../src/im/lark/client.js', () => ({
+  listChatMemberOpenIds: (...a: any[]) => mockListChatMemberOpenIds(...a),
   replyMessage: (...a: any[]) => mockReplyMessage(...a),
 }));
 
@@ -58,8 +67,8 @@ vi.mock('../src/utils/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-import { tryHandleAssistantCommand } from '../src/im/lark/assistant-command.js';
-import { getAssistantOwner } from '../src/services/assistant-owner-store.js';
+import { assistantSoloGroupOwnerCheck, resetAssistantMultiUserNoticesForTest, tryHandleAssistantCommand, tryHandleAssistantMultiUserGroup } from '../src/im/lark/assistant-command.js';
+import { getAssistantOwner, setAssistantOwner } from '../src/services/assistant-owner-store.js';
 
 const APP = 'cli_a1b2c3d4e5f60718';
 const ALICE = 'ou_' + 'a'.repeat(32);
@@ -84,7 +93,12 @@ const run = (text: string, sender: string | undefined = ALICE, opts?: Parameters
 beforeEach(() => {
   dataDir = mkdtempSync(join(tmpdir(), 'assistant-cmd-'));
   assistantMode = true;
+  assistantGroupChat = true;
+  groupUserCount = 1;
+  cachedUserCount = undefined;
   sessionGroupOwner = undefined;
+  resetAssistantMultiUserNoticesForTest();
+  mockGetGroupStats.mockClear();
   mockReplyMessage.mockClear();
   mockIsBotMentioned.mockReturnValue(true);
   mockCanOperate.mockReturnValue(false);
@@ -198,5 +212,123 @@ describe('/assistant owner @x', () => {
   it('unknown subcommand → usage', async () => {
     await run('/assistant frobnicate');
     expect(lastReply()).toBe('cmd.assistant.usage');
+  });
+});
+
+describe('assistantGroupChat off: multi-user group gate', () => {
+  const T0 = 1_800_000_000_000;
+  const gate = (m: any, opts: { bot?: boolean; now?: number } = {}) =>
+    tryHandleAssistantMultiUserGroup(APP, m, opts.bot ? BOT_OPEN_ID : ALICE, opts.bot ?? false, opts.now ?? T0);
+  beforeEach(() => { assistantGroupChat = false; });
+
+  it('a group with only one person works as before, re-checking a cached solo count', async () => {
+    expect(await gate(msg('hi'))).toBe(false);
+    expect(mockGetGroupStats).toHaveBeenLastCalledWith(APP, CHAT, { requireFresh: true });
+    expect(mockReplyMessage).not.toHaveBeenCalled();
+  });
+
+  it('a stale cached solo count does not let a second person through', async () => {
+    cachedUserCount = 1;
+    groupUserCount = 2;
+    mockIsBotMentioned.mockReturnValue(false);
+    expect(await gate(msg('hi'))).toBe(true);
+  });
+
+  it('an @ re-reads a cached multi-user count, so the bot recovers as soon as the second person leaves', async () => {
+    cachedUserCount = 2;
+    groupUserCount = 1;
+    expect(await gate(msg('ping'))).toBe(false);
+    expect(mockGetGroupStats).toHaveBeenCalledWith(APP, CHAT, { requireFresh: true });
+    expect(mockReplyMessage).not.toHaveBeenCalled();
+  });
+
+  it('a cached multi-user count is trusted without another lookup', async () => {
+    groupUserCount = 3;
+    mockIsBotMentioned.mockReturnValue(false);
+    expect(await gate(msg('hi'))).toBe(true);
+    expect(mockGetGroupStats).toHaveBeenCalledTimes(1);
+  });
+
+  it('a missing member count (reported as 0) is treated as multi-user', async () => {
+    groupUserCount = 0;
+    mockIsBotMentioned.mockReturnValue(false);
+    expect(await gate(msg('hi'))).toBe(true);
+  });
+
+  it('two people: a human @ gets the notice as a reply, at most once per group per 10 minutes', async () => {
+    groupUserCount = 2;
+    expect(await gate(msg('hello'))).toBe(true);
+    expect(mockReplyMessage).toHaveBeenCalledTimes(1);
+    expect(mockReplyMessage.mock.calls[0]).toEqual([APP, 'om_1', 'cmd.assistant.multi_user_group', 'text', false]);
+    expect(await gate(msg('again'), { now: T0 + 10 * 60_000 - 1 })).toBe(true);
+    expect(mockReplyMessage).toHaveBeenCalledTimes(1);
+    expect(await gate(msg('later'), { now: T0 + 10 * 60_000 + 1 })).toBe(true);
+    expect(mockReplyMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it('two people: unmentioned and bot messages are swallowed silently, including /assistant claim', async () => {
+    groupUserCount = 2;
+    expect(await gate(msg('hi'), { bot: true })).toBe(true);
+    mockIsBotMentioned.mockReturnValue(false);
+    expect(await gate(msg('/assistant claim'))).toBe(true);
+    expect(mockReplyMessage).not.toHaveBeenCalled();
+  });
+
+  it('an unknown member count (the lookup fell back to its worst case) is treated as multi-user', async () => {
+    groupUserCount = 999;
+    mockIsBotMentioned.mockReturnValue(false);
+    expect(await gate(msg('hi'))).toBe(true);
+  });
+
+  it('DMs, switch-on and non-assistant bots pass through without a member lookup', async () => {
+    groupUserCount = 5;
+    expect(await gate(msg('hi', { chatType: 'p2p' }))).toBe(false);
+    assistantGroupChat = true;
+    expect(await gate(msg('hi'))).toBe(false);
+    assistantGroupChat = false;
+    assistantMode = false;
+    expect(await gate(msg('hi'))).toBe(false);
+    expect(mockGetGroupStats).not.toHaveBeenCalled();
+    expect(mockReplyMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe('assistantGroupChat off: a one-person group whose person is not the owner', () => {
+  const check = (sender: string | undefined, opts: { bot?: boolean; chatType?: 'group' | 'p2p' } = {}) =>
+    assistantSoloGroupOwnerCheck(APP, msg('hi', { chatType: opts.chatType }), sender, opts.bot ?? false);
+  beforeEach(() => { assistantGroupChat = false; mockListChatMemberOpenIds.mockReset(); mockListChatMemberOpenIds.mockResolvedValue([]); });
+
+  it('names the recorded owner when someone else is the only person left', async () => {
+    setAssistantOwner(dataDir, APP, CHAT, ALICE, 'claimed');
+    expect(await check(BOB)).toEqual({ absentOwner: ALICE });
+    expect(mockListChatMemberOpenIds).not.toHaveBeenCalled();
+  });
+
+  it('a session group owner counts as the recorded owner', async () => {
+    sessionGroupOwner = ALICE;
+    expect(await check(BOB)).toEqual({ absentOwner: ALICE });
+  });
+
+  it('a bot speaking cannot vouch for the owner: the member list decides', async () => {
+    setAssistantOwner(dataDir, APP, CHAT, ALICE, 'claimed');
+    mockListChatMemberOpenIds.mockResolvedValue([BOB]);
+    expect(await check(BOB, { bot: true })).toEqual({ absentOwner: ALICE });
+    mockListChatMemberOpenIds.mockResolvedValue([ALICE]);
+    expect(await check(BOB, { bot: true })).toEqual({});
+    mockListChatMemberOpenIds.mockResolvedValue([ALICE, BOB]);
+    expect(await check(BOB, { bot: true })).toEqual({ drop: true });
+    mockListChatMemberOpenIds.mockRejectedValue(new Error('lark down'));
+    expect(await check(undefined, { bot: true })).toEqual({ drop: true });
+  });
+
+  it('says nothing for the owner, unclaimed groups, DMs or when multi-user groups are allowed', async () => {
+    expect(await check(BOB)).toEqual({});
+    expect(await check(BOB, { bot: true })).toEqual({});
+    setAssistantOwner(dataDir, APP, CHAT, ALICE, 'claimed');
+    expect(await check(ALICE)).toEqual({});
+    expect(await check(BOB, { chatType: 'p2p' })).toEqual({});
+    assistantGroupChat = true;
+    expect(await check(BOB)).toEqual({});
+    expect(mockListChatMemberOpenIds).not.toHaveBeenCalled();
   });
 });

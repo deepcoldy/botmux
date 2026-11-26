@@ -98,6 +98,7 @@ export interface TraexQuestionBridgeDeps {
   /** One key / one bracketed paste into the current CLI; false = not written. */
   writeKey(key: string, expected?: TraexQuestionPage): Promise<boolean>;
   paste(text: string, expected?: TraexQuestionPage): Promise<boolean>;
+  runAnswer?(page: TraexQuestionPage, result: AskResult, write: () => Promise<boolean | undefined>): Promise<void>;
   notify(key: TraexQuestionNoticeKey, params?: Record<string, string>): void;
   log(message: string): void;
 }
@@ -341,7 +342,14 @@ export class TraexQuestionBridge {
   }
 
   private onResult(card: OpenCard, result: AskResult): void {
-    if (this.card !== card || card.controller.signal.aborted) return;
+    if (this.card !== card || card.controller.signal.aborted) {
+      if (result.kind === 'answered' && card.page.delivery === 'async' && this.deps.runAnswer) {
+        void this.deps.runAnswer(card.page, result, async () => false).catch(error => {
+          this.deps.log(`TraeX native answer cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+        });
+      }
+      return;
+    }
     if (result.kind !== 'answered') {
       this.card = undefined;
       this.settled.set(card.signature, card.lifetime);
@@ -355,14 +363,17 @@ export class TraexQuestionBridge {
       return;
     }
     const answer = traexQuestionAnswerFromAsk(card.page, result);
-    if (typeof answer === 'string') {
-      this.card = undefined;
-      this.notWritten(card, answer, 'failed');
-      this.kick();
-      return;
-    }
     card.answering = true;
-    void this.enter(card, answer).finally(() => {
+    const write = async () => {
+      if (typeof answer === 'string') {
+        this.notWritten(card, answer, 'failed');
+        return false;
+      }
+      return this.enter(card, answer);
+    };
+    void (this.deps.runAnswer ? this.deps.runAnswer(card.page, result, write) : write()).catch(error => {
+      this.notWritten(card, error instanceof Error ? error.message : String(error), 'failed');
+    }).finally(() => {
       if (this.card === card) this.card = undefined;
       this.kick();
     });
@@ -396,15 +407,16 @@ export class TraexQuestionBridge {
     return page;
   }
 
-  private async enter(card: OpenCard, answer: TraexQuestionAnswer): Promise<void> {
+  private async enter(card: OpenCard, answer: TraexQuestionAnswer): Promise<boolean | undefined> {
     // Set once this answer has opened the notes field (Tab) or typed into it:
     // an answer that stops halfway closes it again (Tab clears and closes it;
     // Esc would interrupt the turn once the notes are closed), so the page is
     // left as it was found and the next card's option still works.
     let notesOpenedHere = false;
-    const stop = async (reason: string, kind: NotWrittenKind): Promise<void> => {
+    const stop = async (reason: string, kind: NotWrittenKind): Promise<false> => {
       if (notesOpenedHere) await this.closeOwnNotes(card, answer);
       this.notWritten(card, reason, kind);
+      return false;
     };
     const maxSteps = card.page.delivery === 'async'
       ? Math.max(MIN_ANSWER_STEPS, card.page.options.length + 2)
@@ -417,7 +429,10 @@ export class TraexQuestionBridge {
       if (!traexQuestionStepAllowed(page, step)) return stop('input not allowed on this page', 'failed');
       // The capture above was the last await: nothing may have replaced the
       // CLI between it and the write.
-      if (this.card !== card || !this.deps.enabled() || this.deps.lifetime() !== card.lifetime) return this.notWritten(card, 'the CLI was replaced', 'changed');
+      if (this.card !== card || !this.deps.enabled() || this.deps.lifetime() !== card.lifetime) {
+        this.notWritten(card, 'the CLI was replaced', 'changed');
+        return false;
+      }
       const final = step.kind === 'key' && step.final;
       const written = step.kind === 'paste' ? await this.deps.paste(step.text, page) : await this.deps.writeKey(step.key, page);
       if (!written) return stop('the terminal did not take the input', 'failed');
@@ -427,7 +442,7 @@ export class TraexQuestionBridge {
       if (outcome === 'advanced') {
         this.openingPending = undefined;
         this.deps.log(`TraeX question ${page.index}/${page.total}: card answer entered`);
-        return;
+        return true;
       }
       if (outcome === 'changed') continue;
       if (final) {
@@ -438,7 +453,7 @@ export class TraexQuestionBridge {
         this.deps.notify('worker.traex_question.not_confirmed');
         return;
       }
-      if (outcome === 'left') return this.notWritten(card, 'the question left the screen mid-answer', 'changed');
+      if (outcome === 'left') return stop('the question left the screen mid-answer', 'changed');
       return stop(`input had no visible effect (${outcome})`, 'failed');
     }
     return stop('too many inputs', 'failed');
