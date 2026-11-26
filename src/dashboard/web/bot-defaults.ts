@@ -62,7 +62,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
       'botDefaults.runtimeId', 'botDefaults.runtimeExecutable', 'botDefaults.runtimePackageName',
       'botDefaults.dshProfileTitle', 'botDefaults.dshRuntimeTitle', 'botDefaults.sectionRiff',
       'botDefaults.riffModel', 'botDefaults.riffReasoningEffort',
-      'botDefaults.riffSandboxCluster', 'botDefaults.riffJwtEnv',
+      'botDefaults.riffSandboxCluster', 'botDefaults.riffAgent', 'botDefaults.riffJwtEnv',
       'botDefaults.autoModelTitle', 'botDefaults.autoModelPreflightLoadCheck',
       'botDefaults.autoModelOverloadThreshold', 'botDefaults.autoModelPreflightTimeout',
       'botDefaults.autoModelReselectPerTurn',

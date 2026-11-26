@@ -11410,7 +11410,7 @@ describe('PUT /api/bot-riff config safety (finding H)', () => {
       expect(stored).toMatchObject({
         baseUrl: 'https://riff-new.example',
         reasoningEffort: 'high',
-        // agent 已下线 UI（服务端写死 codex）——存量值按隐藏字段保留
+        // 旧 dashboard 未回写 agent 时兼容保留原值。
         agent: 'aiden',
         templateId: 'tpl-1',
         jwt: 'SECRET-JWT',
@@ -11421,6 +11421,36 @@ describe('PUT /api/bot-riff config safety (finding H)', () => {
         // UI 已不回写 injectStatusLines——存量值按隐藏字段保留。
         injectStatusLines: false,
       });
+    });
+  });
+
+  it('updates agent (codex/claude) and rejects unsupported values', async () => {
+    await withRiffBot(async (base, configPath) => {
+      const toClaude = await fetch(`${base}/api/bot-riff`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ riff: JSON.stringify({ baseUrl: 'https://riff-new.example', agent: 'claude' }) }),
+      });
+      expect(toClaude.status).toBe(200);
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].riff.agent).toBe('claude');
+
+      const toCodex = await fetch(`${base}/api/bot-riff`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ riff: JSON.stringify({ baseUrl: 'https://riff-new.example', agent: 'codex' }) }),
+      });
+      expect(toCodex.status).toBe(200);
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].riff.agent).toBe('codex');
+
+      for (const bad of ['aiden', 'bogus', '']) {
+        const invalid = await fetch(`${base}/api/bot-riff`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ riff: JSON.stringify({ baseUrl: 'https://riff-new.example', agent: bad }) }),
+        });
+        expect(invalid.status).toBe(400);
+        expect(await invalid.json()).toMatchObject({ ok: false, error: 'invalid_agent' });
+      }
     });
   });
 

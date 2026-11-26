@@ -176,7 +176,7 @@ import { parseGroupSerialInput } from './group-serial-input.js';
 import { setGroupDefaultModels } from '../services/group-default-models-store.js';
 import { parseGroupDefaultModels } from './group-default-models.js';
 import { setChatStreamingCardPin } from '../services/pin-streaming-card-mode-store.js';
-import { isValidRiffBaseUrl, isValidRiffSandboxCluster } from '../adapters/backend/riff-backend.js';
+import { isValidRiffAgent, isValidRiffBaseUrl, isValidRiffSandboxCluster } from '../adapters/backend/riff-backend.js';
 import { probeScratchCapability } from '../adapters/backend/scratch-capability.js';
 import { ensureBackendAvailable } from '../services/backend-availability.js';
 import type { BackendType } from '../adapters/backend/types.js';
@@ -14503,7 +14503,7 @@ ipcRoute('DELETE', '/api/bot-trigger-user-auth/users/:openId', requireBoundBot(a
 /** riff 配置里 dashboard 可编辑的字段——PUT /bot-riff 只覆盖这些，其余保留。 */
 // injectStatusLines 已从 dashboard UI 移除（恒默认开启）——不在此集合中意味着
 // 存量 bots.json 值按「隐藏字段」原样保留。
-const RIFF_UI_EDITABLE_KEYS = new Set(['baseUrl', 'sandboxCluster', 'model', 'reasoningEffort', 'jwtEnv', 'systemPrompt', 'setupCommands']);
+const RIFF_UI_EDITABLE_KEYS = new Set(['baseUrl', 'sandboxCluster', 'agent', 'model', 'reasoningEffort', 'jwtEnv', 'systemPrompt', 'setupCommands']);
 
 /** 发给浏览器前脱敏：明文 jwt / env（可能含各类密钥）绝不进 dashboard 响应。 */
 function redactRiffForClient(riff: unknown): Record<string, unknown> | null {
@@ -14524,12 +14524,20 @@ botConfigPutRoute<{ riff?: unknown }>('/api/bot-riff', 'riff', {
     // 一个 model 就会静默删掉认证等隐藏配置。
     const prev = (getBot(cachedLarkAppId).config.riff ?? {}) as Record<string, unknown>;
     const preserved = Object.fromEntries(Object.entries(prev).filter(([k]) => !RIFF_UI_EDITABLE_KEYS.has(k)));
-    // Older dashboard clients do not send sandboxCluster. Preserve a valid
-    // existing selection for them; a brand-new config follows Riff's BOE
-    // default. New clients always submit the explicit dropdown value.
+    // Older dashboard clients do not send sandboxCluster or agent. Preserve a valid
+    // existing selection for them (and keep legacy hidden agent values untouched);
+    // a brand-new config follows Riff's BOE / codex defaults. New clients always
+    // submit the explicit dropdown values.
     const sandboxCluster = value.sandboxCluster ?? prev.sandboxCluster ?? 'boe';
     if (!isValidRiffSandboxCluster(sandboxCluster)) return fieldInvalid('invalid_sandbox_cluster');
-    value = { ...preserved, ...value, sandboxCluster };
+    if (value.agent !== undefined && !isValidRiffAgent(value.agent)) return fieldInvalid('invalid_agent');
+    const agent = value.agent !== undefined ? value.agent : prev.agent;
+    value = {
+      ...preserved,
+      ...value,
+      sandboxCluster,
+      ...(agent !== undefined ? { agent } : {}),
+    };
     if (!isValidRiffBaseUrl(value.baseUrl)) return fieldInvalid('invalid_base_url');
     return fieldOk(value);
   },
