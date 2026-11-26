@@ -1,3 +1,4 @@
+import { DEFAULT_MODEL_VALUE_PATTERN, limitModelOptions } from '../core/model-value-pattern.js';
 import { normalizeOwnerGroupFollowConfig, notifyOwnerGroupFollowChanged } from './owner-group-follow-policy.js';
 import { botAcceptsLaunchModel } from '../core/launch-model-capability.js';
 import { parseGroupCreationDefaults } from './group-creation-options.js';
@@ -36,7 +37,7 @@ import { readAllowedUsersResolveCache, writeAllowedUsersResolveCache } from '../
 import { rmwBotEntry } from './config-store.js';
 import { resolveAllowedUsersWithMap } from '../im/lark/client.js';
 import { detectUnusableOwnerEntries } from '../setup/owner-identity.js';
-import { CLI_SELECT_OPTIONS, resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.js';
+import { CLI_SELECT_OPTIONS, isTtadkWrapper, resolveCliSelection, selectionKeyForBot, ttadkAcceptsModel } from '../setup/cli-selection.js';
 import { dropConfiguredCliRuntime } from '../adapters/cli/runtime.js';
 import { expandHomePath } from '../utils/working-dir.js';
 import { resolveTeamRoleFile } from '../core/role-resolver.js';
@@ -1427,12 +1428,19 @@ export function getConfigCardData(larkAppId: string, modelChoices: readonly stri
   const q = cfg.messageQuota?.defaultLimit;
   let selectedModel = cfg.model ?? null;
   const zcodeEnv = { ...process.env, ...cfg.env };
-  const modelChoiceLabels = cfg.cliId === 'zcode'
-    // Same model name behind two gateways must stay distinguishable in the card.
-    ? Object.fromEntries(modelChoices.map(m => [m, formatZcodeModelChoice(m, zcodeEnv, zcodeAmbiguousModelIds(zcodeEnv))])) : undefined;
   if (cfg.cliId === 'zcode' && selectedModel) {
     try { const ref = resolveZcodeModelReference(selectedModel, { ...process.env, ...cfg.env }); selectedModel = `${ref.providerId}/${ref.modelId}`; } catch { /* stale selections remain visible */ }
   }
+  const supportsConfiguredModel = botAcceptsLaunchModel(cfg)
+    && (!isTtadkWrapper(cfg.wrapperCli) || ttadkAcceptsModel(cfg.wrapperCli));
+  const configured = supportsConfiguredModel && selectedModel && !modelChoices.includes(selectedModel)
+    && DEFAULT_MODEL_VALUE_PATTERN.test(selectedModel)
+    ? [selectedModel] : [];
+  const custom = supportsConfiguredModel ? cfg.customModels ?? [] : [];
+  const options = limitModelOptions([...custom, ...configured, ...modelChoices], selectedModel ?? undefined, true);
+  const modelChoiceLabels = cfg.cliId === 'zcode'
+    // Same model name behind two gateways must stay distinguishable in the card.
+    ? Object.fromEntries(options.map(m => [m, formatZcodeModelChoice(m, zcodeEnv, zcodeAmbiguousModelIds(zcodeEnv))])) : undefined;
   return {
     larkAppId,
     botName: cfg.displayName ?? bot.botName ?? cfg.cliId,
@@ -1440,7 +1448,7 @@ export function getConfigCardData(larkAppId: string, modelChoices: readonly stri
     cliOptions: CLI_SELECT_OPTIONS.map(o => ({ id: o.key, label: o.label })),
     model: selectedModel,
     ...(modelChoiceLabels ? { modelChoiceLabels } : {}),
-    modelChoices: [...modelChoices],
+    modelChoices: options,
     ...(isConfigurableReasoningCliId(cfg.cliId)
       ? {
         reasoningEfforts: [...reasoningEffortsForCliModel(cfg.cliId, cfg.model)],
