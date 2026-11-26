@@ -59,7 +59,7 @@ Frequently used buttons sit on the card's main row. The low-frequency buttons ma
 | ⏹ Stop | Interrupt the current turn (same as ^C); the session stays. Only shown while the turn is still running |
 | ❌ Close Session | Close the session; adopted sessions show "⏏ Disconnect" here. Admins can close any session; talk-only users can close the **topics they opened themselves** (per-topic direct messages included) |
 | 🔁 Retry Last Task | Appears when the quota recovers and the status becomes "Ready to retry" |
-| Reasoning effort dropdown | Codex sessions (tmux backend, no sandbox, not using RPC input) can change reasoning effort while running; it applies from the next turn |
+| Reasoning effort dropdown | Codex sessions (tmux backend, no sandbox, not using RPC input) can change reasoning effort while running; it applies from the next turn. For managed local Claude Code sessions, saves made while idle or suspended apply after the next restart or cold resume. `CLAUDE_CODE_EFFORT_LEVEL` and startup commands that set `/effort` take precedence |
 
 You can hide buttons you don't need in the Dashboard (see "Hiding card buttons" below).
 
@@ -207,6 +207,8 @@ Values: `output` (show output, export text, refresh), `terminal`, `writeLink`, `
 | `goalStatusCard` | When a Codex / TRAE session sets a native goal (`/goal`), posts one goal status card and updates it in place with the status and the CLI-counted elapsed time. Turning it on applies to new sessions (or after a session restarts); turning it off stops updating existing cards right away | Off |
 
 All of these can be changed in the Dashboard or with `/botconfig set <setting> on|off`.
+
+For managed local Claude Code sessions, the reply card’s **Switch model** menu item and the topic command `/models` open the same model and effort picker. The picker shows the observed runtime alongside the selections for the next launch. Changes apply on the next cold resume or after an explicit `/restart` while idle. Restarting stops background terminal tasks. Custom candidates come from the bot’s `customModels` setting. Available combinations depend on the CLI and gateway.
 
 ## Pinning the current status card
 

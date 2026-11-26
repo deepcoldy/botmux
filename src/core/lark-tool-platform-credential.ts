@@ -36,7 +36,7 @@ export type BoundLarkPlatformPolicy = 'off' | 'prefer-bot-app' | 'platform-only'
 /** How the platform participates in a bound session's `--as user` for this bot. */
 export function boundLarkPlatformPolicy(bot: Pick<BotConfig, 'triggerUserAuth'>): BoundLarkPlatformPolicy {
   if (!triggerUserAuthApplies(bot.triggerUserAuth, 'lark-cli')) return 'off';
-  const source = credentialSourceOf(bot.triggerUserAuth);
+  const source = credentialSourceOf(bot.triggerUserAuth, 'lark-user');
   if (source === 'local') return 'off';
   return source === 'platform' ? 'platform-only' : 'prefer-bot-app';
 }

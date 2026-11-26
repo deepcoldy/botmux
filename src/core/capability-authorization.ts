@@ -14,7 +14,7 @@ import { beginBytedcliLogin, describeBytedcliAuth } from '../services/bytedcli-a
 import { beginLarkCliLogin, describeLarkCliAuth } from '../services/lark-cli-auth.js';
 import { onMeegoChallengeGone, onMeegoLoginCompleted, requestMeegoLogin } from '../services/meego-auth.js';
 import type { MeegoTenant } from '../services/bytedcli-home.js';
-import { capabilityOn, TRIGGER_USER_AUTH_TOOLS, type TriggerUserAuthTool } from '../services/trigger-user-auth.js';
+import { capabilityOn, credentialSourceOf, TRIGGER_USER_AUTH_TOOLS, type TriggerUserAuthTool } from '../services/trigger-user-auth.js';
 import type { ToolIdentityOutcome } from './turn-cli-identity.js';
 import { capabilityOfTool, policyFromConfig } from './identity-policy.js';
 import { platformAuthorizeUrl } from './platform-credential-source.js';
@@ -31,11 +31,16 @@ import { hasReason, NOT_AUTHORIZED_REASONS } from './refusal-reasons.js';
 type SendDirect = (openId: string, text: string) => Promise<unknown>;
 
 /** The sender of a task's authorization notices: a direct message, else a card only that person sees in the task's chat (none in a one-to-one chat). */
-export function privateNoticeSender(appId: string, chat: { chatId?: string; chatType?: string }): SendDirect {
+export function privateNoticeSender(appId: string, chat: { chatId?: string; chatType?: string }, isCurrent?: () => boolean): SendDirect {
   const { chatId } = chat;
+  function requireCurrent() {
+    if (isCurrent?.() === false) throw new Error('authorization context changed');
+  }
   return directOrEphemeral(
-    (to, text) => sendUserMessage(appId, to, text),
-    chatId && chat.chatType !== 'p2p' ? (to, card) => sendEphemeralCard(appId, chatId, to, card) : undefined,
+    async (to, text) => { requireCurrent(); return sendUserMessage(appId, to, text); },
+    chatId && chat.chatType !== 'p2p'
+      ? async (to, card) => { requireCurrent(); return sendEphemeralCard(appId, chatId, to, card); }
+      : undefined,
   );
 }
 
@@ -44,7 +49,9 @@ export type UnattendedProvider = TriggerUserAuthTool | 'meego';
 
 /** Whether the platform issues this provider's credentials on this host: the host is bound and the bot's source is not local. */
 function platformBacked(botConfig: BotConfig, provider: UnattendedProvider): boolean {
-  return provider !== 'meego' && policyFromConfig(botConfig.triggerUserAuth).credentialSource !== 'local' && !!platformAuthorizeUrl();
+  return provider !== 'meego'
+    && credentialSourceOf(botConfig.triggerUserAuth, capabilityOfTool(provider)) !== 'local'
+    && !!platformAuthorizeUrl();
 }
 
 /**
@@ -54,7 +61,7 @@ function platformBacked(botConfig: BotConfig, provider: UnattendedProvider): boo
  * platform this host is not bound to.
  */
 async function authorizationLink(tool: TriggerUserAuthTool, botConfig: BotConfig, openId: string): Promise<string | undefined> {
-  if (botConfig.triggerUserAuth?.credentialSource === 'platform') return undefined;
+  if (credentialSourceOf(botConfig.triggerUserAuth, capabilityOfTool(tool)) === 'platform') return undefined;
   return (tool === 'bytedcli' ? await beginBytedcliLogin(openId) : await beginLarkCliLogin(openId))?.authUrl;
 }
 
@@ -70,7 +77,7 @@ async function localLoginState(tool: TriggerUserAuthTool, botConfig: BotConfig, 
 
 /** Whether the person definitely has no credentials. The platform has no read-only probe, so where credentials can come from it nothing is judged. */
 async function definitelyUnauthorized(tool: TriggerUserAuthTool, botConfig: BotConfig, openId: string): Promise<boolean> {
-  const source = policyFromConfig(botConfig.triggerUserAuth).credentialSource;
+  const source = credentialSourceOf(botConfig.triggerUserAuth, capabilityOfTool(tool));
   if (source === 'platform' || (source === 'auto' && platformAuthorizeUrl())) return false;
   return await localLoginState(tool, botConfig, openId) === 'needs-login';
 }
@@ -145,12 +152,12 @@ export async function missingAuthorizationEntries(botConfig: BotConfig, openId: 
  * `none` when no card was asked for.
  */
 async function deliverPlatformEntries(args: {
-  botConfig: BotConfig; openId: string; entries: readonly AuthorizationEntry[]; scopes?: readonly string[];
+  botConfig: BotConfig; openId: string; entries: readonly AuthorizationEntry[]; scopes?: readonly string[]; isCurrent?: () => boolean;
 }): Promise<{ rest: AuthorizationEntry[]; platform: 'none' | 'sent' | 'ready' | 'failed' }> {
   const rest = args.entries.filter(e => !e.platform);
   if (rest.length === args.entries.length) return { rest, platform: 'none' };
   const result = await askPlatformToAuthorize({
-    botConfig: args.botConfig, openId: args.openId, ...(args.scopes ? { scopes: args.scopes } : {}),
+    botConfig: args.botConfig, openId: args.openId, scopes: args.scopes, isCurrent: args.isCurrent,
   });
   if (result.kind === 'legacy') {
     const url = platformAuthorizeUrl() ?? undefined;
@@ -450,9 +457,11 @@ export async function deliverUnattendedLapse(args: {
   appId: string; taskId: string; taskName: string; openId: string; locale: Locale | undefined;
   botConfig: BotConfig; scopes?: readonly string[]; tenant?: MeegoTenant;
   entries: readonly AuthorizationEntry[]; sendDirect: SendDirect;
+  isCurrent?: () => boolean;
   /** Captured by noticeUnattendedLapse before its asynchronous entry assembly. */
   noticeGeneration?: NoticeGenerationSnapshot;
 }): Promise<UnattendedNoticeOutcome> {
+  if (args.isCurrent?.() === false) return 'undelivered';
   const { appId, taskId, openId, locale, entries } = args;
   const generation = args.noticeGeneration ?? snapshotNoticeGeneration(openId);
   const now = Date.now();
@@ -484,7 +493,7 @@ export async function deliverUnattendedLapse(args: {
   let platform: 'none' | 'sent' | 'ready' | 'failed';
   try {
     ({ rest, platform } = await deliverPlatformEntries({
-      botConfig: args.botConfig, openId, entries: due, ...(args.scopes ? { scopes: args.scopes } : {}),
+      botConfig: args.botConfig, openId, entries: due, scopes: args.scopes, isCurrent: args.isCurrent,
     }));
   } catch (error) {
     for (const e of due) rollback(e);
@@ -501,6 +510,10 @@ export async function deliverUnattendedLapse(args: {
     else rollback(e);
   }
   if (!currentRest.length) return outcome;
+  if (args.isCurrent?.() === false) {
+    for (const e of currentRest) rollback(e);
+    return 'undelivered';
+  }
   const lines = currentRest.map(e => t('unattended.lapse_entry', {
     capability: capabilityOfProvider(e.provider),
     where: e.url ?? t(e.provider === 'meego' ? 'unattended.how_meego' : e.provider === 'bytedcli' ? 'unattended.how_bytecloud' : 'unattended.how_lark', undefined, locale),
@@ -552,7 +565,7 @@ export async function requestUnattendedAuthorization(args: {
     if (login.state === 'unavailable') return 'unavailable';
     if (login.state === 'ready') { clearUnattendedLapse(args.appId, args.taskId, openId, provider, args.tenant); return 'ready'; }
     url = login.authUrl;
-  } else if (policyFromConfig(botConfig.triggerUserAuth).credentialSource !== 'platform'
+  } else if (credentialSourceOf(botConfig.triggerUserAuth, capabilityOfTool(provider)) !== 'platform'
     && !platformBacked(botConfig, provider)
     && await localLoginState(provider, botConfig, openId) === 'authorized') {
     // The refusal that led here is the evidence of a lapse; a login that has appeared since ends it.
@@ -571,6 +584,7 @@ export async function requestUnattendedAuthorization(args: {
 export async function noticeUnattendedLapse(args: {
   appId: string; taskId: string; taskName: string; openId: string; locale: Locale | undefined; botConfig: BotConfig;
   provider: UnattendedProvider; url?: string | null; tenant?: MeegoTenant; scopes?: readonly string[]; sendDirect: SendDirect;
+  isCurrent?: () => boolean;
 }): Promise<UnattendedNoticeOutcome> {
   const noticeGeneration = snapshotNoticeGeneration(args.openId);
   const entries = await missingAuthorizationEntries(args.botConfig, args.openId, {
