@@ -1750,6 +1750,9 @@ export interface BotConfig {
   replyDelivery?: 'send' | 'transcript';
   /** Persist and recover final replies to this bot's ordinary human IM turns. */
   durableImReplies?: boolean;
+  /** Exact texts reserved for internal use by this bot's ordinary IM bridge.
+   * Applies to terminal-backed turns with durableImReplies enabled. */
+  imBridgeFinalExcludedTexts?: string[];
   turnResults?: { enabled: boolean };
   /** Skip Botmux prompt/skill/context injection and auto-forward final replies.
    * Existing prompt and skill customizations remain saved. */
@@ -4664,6 +4667,10 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       topicUnavailablePolicy: entry.topicUnavailablePolicy === 'stop' ? 'stop' : undefined,
       replyDelivery: entry.replyDelivery === 'transcript' || entry.replyDelivery === 'send' ? entry.replyDelivery : undefined,
       durableImReplies: entry.durableImReplies === true || undefined,
+      imBridgeFinalExcludedTexts: Array.isArray(entry.imBridgeFinalExcludedTexts)
+        ? [...new Set<string>(entry.imBridgeFinalExcludedTexts.flatMap((text: unknown) =>
+          typeof text === 'string' && text.trim() ? [text.trim()] : []))]
+        : undefined,
       promptInjection: entry.promptInjection === 'none' ? 'none' : undefined,
       // Only the non-default hook mode is persisted; absent, 'off', and invalid
       // values all retain the historical inline behavior.

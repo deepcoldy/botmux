@@ -5,14 +5,17 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { UniversalOutputHandoff, outputSnapshot, type OutputHandoffReceipt } from '../src/services/universal-output-handoff.js';
 import { WorkerOutputJournal } from '../src/services/worker-output-journal.js';
-import { OutputDeliveryJournal, type OutputDeliveryRecord } from '../src/services/output-delivery-journal.js';
-import { OutputDeliveryCoordinator } from '../src/services/output-delivery-coordinator.js';
+import { OutputDeliveryJournal, type OutputDeliveryRecord, type OutputReceipt } from '../src/services/output-delivery-journal.js';
+import { OutputDeliveryCoordinator, type OutputDeliveryControl } from '../src/services/output-delivery-coordinator.js';
 import { FinalOutputHandoffStore } from '../src/services/final-output-handoff-store.js';
 import { TurnSendLedger, FinalPublicationUnknownError } from '../src/services/turn-send-ledger.js';
 import { OutputDeliveryTerminalError } from '../src/services/output-delivery-coordinator.js';
 import { loadWorkerPoolClosure, loadWorkerPoolFunction } from './helpers/worker-pool-function-harness.js';
 import { committedCodexAppSequence, hasUnsettledCodexAppDispatch } from '../src/utils/codex-app-dispatch-ledger.js';
-import { FINAL_HANDOFF_DELIVERY_REASON, FINAL_HANDOFF_WAIT_REASON } from '../src/core/worker-pool.js';
+import {
+  FINAL_HANDOFF_DELIVERY_REASON, FINAL_HANDOFF_WAIT_REASON, INTERNAL_BRIDGE_FINAL_REJECTION,
+  REUSED_IM_FINAL_RECEIPT, isInternalBridgeFinal,
+} from '../src/core/worker-pool.js';
 import { raiseDaemonAttention } from '../src/core/session-activity.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import type { WorkerFinalOutput } from '../src/types.js';
@@ -28,6 +31,7 @@ function receipt(sent: WorkerFinalOutput): OutputHandoffReceipt { return { type:
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); for (const db of dbs.splice(0)) try { db.close(); } catch {} for (const dir of directories.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 function deliveryScope(scope: Record<string, any>) {
+  Object.assign(scope, { INTERNAL_BRIDGE_FINAL_REJECTION, REUSED_IM_FINAL_RECEIPT, isInternalBridgeFinal });
   scope.assertFrozenImDeliveryAllowed = loadWorkerPoolFunction('assertFrozenImDeliveryAllowed', scope);
   scope.classifyFinalPublicationError = loadWorkerPoolFunction('classifyFinalPublicationError', scope);
   return scope;
@@ -166,6 +170,65 @@ describe('attention lifecycle', () => {
     expect(db.read(record.id)?.state).toBe('rejected');
     expect(ctx.scope.processFinalOutput).not.toHaveBeenCalled();
     expect(ctx.scope.worker.send).not.toHaveBeenCalled();
+  });
+  it('acknowledges a replayed internal final without marking it delivered', async () => {
+    vi.useFakeTimers();
+    const dir = directory();
+    const db = database(dir);
+    const sink = { kind: 'im', answerRequired: true, chatId: 'oc', chatType: 'group',
+      context: { target: { mode: 'thread', rootMessageId: 'om_topic' } },
+      bridgeFinalExcludedTexts: ['ROUTE: generic'],
+    } as const;
+    const internal = { ...output, content: 'ROUTE: generic' };
+    const record = db.accept(outputSnapshot(app, internal), sink);
+    const attempt = vi.fn(async () => { throw new OutputDeliveryTerminalError(INTERNAL_BRIDGE_FINAL_REJECTION); });
+    const ctx = scopeFor(db, record, dir, { processFinalOutput: attempt });
+    ctx.scope.publishScopedImDeliveryStatus = vi.fn();
+    const remove = vi.fn();
+    let daemonWork: Promise<void> | undefined;
+    const transmit = vi.fn(() => { daemonWork = ctx.run(); });
+    const producer = new UniversalOutputHandoff({
+      appId: app, sessionId: output.sessionId!, token: 'tok',
+      persist: vi.fn(), remove, restore: () => [], send: transmit, error: vi.fn(), retryMs: 5_000,
+    });
+    ctx.scope.worker.send.mockImplementationOnce(() => { throw new Error('lost ACK'); });
+    ctx.scope.worker.send.mockImplementation((ack: OutputHandoffReceipt) => producer.acknowledge(ack));
+    try {
+      producer.publish(internal);
+      await daemonWork;
+      expect(db.read(record.id)).toMatchObject({ state: 'rejected', reason: INTERNAL_BRIDGE_FINAL_REJECTION });
+      expect(remove).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(5_001);
+      await daemonWork;
+      expect(remove).toHaveBeenCalledOnce();
+      expect(attempt).toHaveBeenCalledOnce();
+      expect(db.read(record.id)?.receipt).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(5_001);
+      expect(transmit).toHaveBeenCalledTimes(2);
+    } finally {
+      producer.stop();
+    }
+  });
+  it('settles an exact existing reply without projecting the internal text as its body', async () => {
+    const dir = directory();
+    const db = database(dir);
+    const sink = { kind: 'im', answerRequired: true, chatId: 'oc', chatType: 'group',
+      context: { target: { mode: 'thread', rootMessageId: 'om_topic' } },
+      bridgeFinalExcludedTexts: ['ROUTE: generic'],
+    } as const;
+    const record = db.accept(outputSnapshot(app, { ...output, content: 'ROUTE: generic' }), sink);
+    const ctx = scopeFor(db, record, dir, {
+      processFinalOutput: async () => ({
+        status: 'delivered', messageId: 'om_explicit', owner: REUSED_IM_FINAL_RECEIPT,
+      }),
+    });
+    ctx.scope.noteFinalOutputReceipt = vi.fn();
+    ctx.scope.settleRequiredReplyCotMessage = vi.fn(() => false);
+    ctx.scope.hasCompletedTurn = vi.fn(() => false);
+    await ctx.run();
+    expect(ctx.scope.noteFinalOutputReceipt).toHaveBeenCalledExactlyOnceWith(
+      ctx.ds, output.turnId, { text: undefined }, { exactAttempt: { dispatchAttempt: undefined } });
+    expect(db.read(record.id)?.receipt?.messageId).toBe('om_explicit');
   });
   it('files the expired publication window as terminal rejected instead of looping blocked', async () => {
     const dir = directory(); const db = database();
@@ -522,19 +585,91 @@ describe('worker production IPC boundary', () => {
 });
 
 describe('native and generic settlement contracts', () => {
+  it.each([
+    { text: 'ROUTE: generic', excluded: true, expected: 'rejected' },
+    { text: ' generic\n', excluded: true, expected: 'rejected' },
+    { text: 'business_qa → example-qa', excluded: true, expected: 'rejected' },
+    { text: 'ROUTE: generic\n我在。', excluded: true, expected: 'delivered' },
+    { text: 'generic', excluded: false, expected: 'delivered' },
+    { text: 'generic', excluded: true, priorAttempt: 2, expected: 'reused' },
+    { text: 'generic', excluded: true, priorAttempt: 1, expected: 'wrong_attempt' },
+  ])('checks exact bridge content and prior receipts before publishing ($expected, $text)', async scenario => {
+    const dir = directory();
+    const db = database(dir);
+    const target = { mode: 'thread', rootMessageId: 'om_original' } as const;
+    const sink = {
+      kind: 'im', answerRequired: true, context: { target }, chatId: 'oc_original', chatType: 'group',
+      ...(scenario.excluded ? {
+        bridgeFinalExcludedTexts: ['generic', 'ROUTE: generic', 'business_qa → example-qa'],
+      } : {}),
+    } as const;
+    const final = { ...output, content: scenario.text, dispatchAttempt: 2 };
+    const record = db.accept(outputSnapshot(app, final), sink);
+    const ledger = new TurnSendLedger(dir);
+    const key = { larkAppId: app, sessionId: output.sessionId!, turnId: output.turnId, dispatchAttempt: 2 };
+    ledger.enableHandoffFence(key, true);
+    if (scenario.priorAttempt !== undefined) {
+      await ledger.execute({ ...key, dispatchAttempt: scenario.priorAttempt }, 'final', 'explicit',
+        async () => 'om_explicit', { fenced: true });
+    }
+    const send = vi.fn((_ds, _msg, _tag, _attempt, done) => done(true, 'om_bridge'));
+    const run = loadWorkerPoolFunction<
+      (ds: unknown, msg: WorkerFinalOutput, tag: string, control: OutputDeliveryControl, target: unknown) => Promise<OutputReceipt | undefined>
+    >(
+      'deliverFinalOutputWithOutputControl', {
+        TurnSendLedger, OutputDeliveryTerminalError, config: { session: { dataDir: dir } },
+        isInternalBridgeFinal, INTERNAL_BRIDGE_FINAL_REJECTION, REUSED_IM_FINAL_RECEIPT,
+        deliverFinalOutput: send, bridgeFinalOutputUuid: () => 'bridge_uuid',
+        beginFinalOutputDelivery: () => () => {}, sessionPromptInjection: () => 'default',
+      });
+    const settled = vi.fn();
+    const error = vi.fn();
+    const coordinator = new OutputDeliveryCoordinator(db);
+    const dependencies = {
+      owns: () => true,
+      process: (stored: OutputDeliveryRecord, control: OutputDeliveryControl) =>
+        run({ larkAppId: app, session: { sessionId: output.sessionId } }, stored.output, 'probe', control, target),
+      settled, error,
+    };
+    await coordinator.deliver(record, dependencies);
+    await coordinator.deliver(record, dependencies);
+    if (scenario.expected === 'delivered' || scenario.expected === 'reused') {
+      expect(db.read(record.id)).toMatchObject({ state: 'settled', receipt: {
+        status: 'delivered', messageId: scenario.expected === 'reused' ? 'om_explicit' : 'om_bridge',
+        ...(scenario.expected === 'reused' ? { owner: REUSED_IM_FINAL_RECEIPT } : {}),
+      } });
+      expect(error).not.toHaveBeenCalled();
+      expect(send).toHaveBeenCalledTimes(scenario.expected === 'reused' ? 0 : 1);
+      return;
+    }
+    expect(send).not.toHaveBeenCalled();
+    expect(settled).not.toHaveBeenCalled();
+    expect(db.read(record.id)?.receipt).toBeUndefined();
+    expect(ledger.readFinalForAttempt(key)).toBeUndefined();
+    if (scenario.expected === 'rejected') {
+      expect(db.read(record.id)).toMatchObject({ state: 'rejected', reason: 'output_internal_bridge_text' });
+      expect(ledger.read(key)?.publication).toBeUndefined();
+      expect(error).toHaveBeenCalledExactlyOnceWith(expect.any(OutputDeliveryTerminalError), true);
+    } else {
+      expect(error).toHaveBeenCalledWith(expect.any(FinalPublicationUnknownError), false);
+    }
+  });
+
   it.each(['before send', 'after Feishu accepted', 'after worker-only persistence',
     'after worker-only persistence with background hold', 'without original execution proof',
-    'wrong turn', 'wrong attempt', 'originless journal', 'transient store fault'] as const)(
+    'wrong turn', 'wrong attempt', 'originless journal', 'transient store fault', 'with only a routing label'] as const)(
     'reopens a scoped final %s without rerunning the model or inventing a receipt', async crash => {
       vi.useFakeTimers();
       const dir = directory();
       let db = database(dir);
       const target = { mode: 'thread', rootMessageId: 'om_original' } as const;
-      const sink = { kind: 'im', answerRequired: true, context: { target }, chatId: 'oc_original', chatType: 'group' } as const;
+      const sink = { kind: 'im', answerRequired: true, context: { target }, chatId: 'oc_original', chatType: 'group',
+        bridgeFinalExcludedTexts: ['ROUTE: generic'] } as const;
       db.rememberSink(output.sessionId!, output.turnId, sink);
       db.rememberSink(output.sessionId!, output.turnId, { kind: 'http', mode: 'async' });
       db.rememberSink(output.sessionId!, output.turnId, { ...sink, context: { target: { mode: 'thread', rootMessageId: 'om_wrong' } } });
-      const snapshot = outputSnapshot(app, { ...output, content: '完整方案\n\n1. 检查\n2. 回读', dispatchAttempt: 2 });
+      const content = crash === 'with only a routing label' ? 'ROUTE: generic' : '完整方案\n\n1. 检查\n2. 回读';
+      const snapshot = outputSnapshot(app, { ...output, content, dispatchAttempt: 2 });
       const ref = { executionId: 'native-turn', turnId: output.turnId, dispatchAttempt: 2 };
       const origin = { scope: { execution: ref } } as NonNullable<OutputDeliveryRecord['origin']>;
       const storedRef = {
@@ -559,7 +694,8 @@ describe('native and generic settlement contracts', () => {
       });
       const helper = loadWorkerPoolFunction<(ds: any, msg: WorkerFinalOutput, t: string, control: any, target: unknown) => Promise<any>>(
         'deliverFinalOutputWithOutputControl', {
-          TurnSendLedger, config: { session: { dataDir: dir } }, deliverFinalOutput,
+          TurnSendLedger, OutputDeliveryTerminalError, config: { session: { dataDir: dir } }, deliverFinalOutput,
+          isInternalBridgeFinal, INTERNAL_BRIDGE_FINAL_REJECTION, REUSED_IM_FINAL_RECEIPT,
           bridgeFinalOutputUuid: () => 'stable_original_delivery', beginFinalOutputDelivery: () => () => {},
           sessionPromptInjection: () => 'default',
         });
@@ -614,6 +750,16 @@ describe('native and generic settlement contracts', () => {
         FinalPublicationUnknownError, OutputDeliveryTerminalError, FINAL_HANDOFF_DELIVERY_REASON,
       }));
       await recover(ds);
+      if (crash === 'with only a routing label') {
+        expect(db.read(snapshot.id)).toMatchObject({ state: 'rejected', reason: 'output_internal_bridge_text' });
+        expect(db.read(snapshot.id)?.receipt).toBeUndefined();
+        expect(ds).toMatchObject({ agentAttention: { kind: 'blocked' } });
+        expect(producer.readPending()).toHaveLength(0);
+        await recover(ds);
+        expect(deliverFinalOutput).not.toHaveBeenCalled();
+        expect(noteFinalOutputReceipt).not.toHaveBeenCalled();
+        return;
+      }
       if (storeUnavailable) {
         expect(db.read(snapshot.id)?.state).toBe('blocked');
         expect(db.read(snapshot.id)?.receipt).toBeUndefined();
@@ -691,9 +837,49 @@ describe('native and generic settlement contracts', () => {
     await ledger.execute({ larkAppId: app, sessionId: output.sessionId!, turnId: output.turnId }, 'final', 'explicit', async () => 'om_explicit', { fenced: true });
     const record = { ...outputSnapshot(app, output), sink: { kind: 'im', context: { target: { mode: 'thread', rootMessageId: 'om_root' } }, chatId: 'oc_chat', chatType: 'group' }, state: 'pending' } as OutputDeliveryRecord;
     const deliverFinalOutput = vi.fn();
-    const helper = loadWorkerPoolFunction<(ds: any, msg: WorkerFinalOutput, t: string, control: any) => Promise<any>>('deliverFinalOutputWithOutputControl', { TurnSendLedger, config: { session: { dataDir: dir } }, deliverFinalOutput, bridgeFinalOutputUuid: () => 'stable', beginFinalOutputDelivery: vi.fn() });
+    const helper = loadWorkerPoolFunction<(ds: any, msg: WorkerFinalOutput, t: string, control: any) => Promise<any>>('deliverFinalOutputWithOutputControl', { TurnSendLedger, isInternalBridgeFinal, config: { session: { dataDir: dir } }, deliverFinalOutput, bridgeFinalOutputUuid: () => 'stable', beginFinalOutputDelivery: vi.fn() });
     const receipt = await helper(ds, output, 'probe', { record, owns: () => true });
     expect(receipt.messageId).toBe('om_explicit'); expect(deliverFinalOutput).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('keeps a late recovered routing label out of its original topic (V2: %s)', async version2 => {
+    const db = database();
+    db.rememberSink(output.sessionId!, output.turnId, {
+      kind: 'im', answerRequired: true, chatId: 'oc_original', chatType: 'group',
+      context: { target: { mode: 'thread', rootMessageId: 'om_original' } },
+      bridgeFinalExcludedTexts: ['generic'],
+    });
+    const send = vi.fn();
+    const original = { ...output, content: 'generic', kind: 'bridge' as const };
+    const processOutput = loadWorkerPoolClosure<
+      (message: WorkerFinalOutput, control?: OutputDeliveryControl) => Promise<OutputReceipt | undefined>
+    >(
+      'processFinalOutput', deliveryScope({
+        ds: { session: { sessionId: output.sessionId } }, journal: db, t: 'probe',
+        shouldDropMismatchedFinalOutput: () => false, shouldDropMismatchedHermesFinalOutput: () => false,
+        finalOutputPolicyTurnId: (message: WorkerFinalOutput) => message.replyTurnId ?? message.turnId,
+        managedFinalOutputSuppressed: () => false, logger: { warn: vi.fn() },
+        deliverFinalOutputWithShutdownDrain: send,
+      }),
+    );
+    const late = { ...original, turnId: 'late-recovery-demo', replyTurnId: output.turnId };
+    if (version2) {
+      const record = db.accept(outputSnapshot(app, late), {
+        kind: 'im', chatId: 'oc_original', chatType: 'group',
+        context: { target: { mode: 'thread', rootMessageId: 'om_original' } },
+      });
+      await new OutputDeliveryCoordinator(db).deliver(record, {
+        owns: () => true, process: (stored, control) => processOutput(stored.output, control),
+        settled: vi.fn(), error: vi.fn(),
+      });
+      expect(db.read(record.id)).toMatchObject({ state: 'settled', receipt: {
+        status: 'suppressed', owner: INTERNAL_BRIDGE_FINAL_REJECTION,
+      } });
+    } else {
+      expect(await processOutput(late)).toEqual({ status: 'suppressed', owner: INTERNAL_BRIDGE_FINAL_REJECTION });
+    }
+    expect(send).not.toHaveBeenCalled();
+    expect(db.pending(output.sessionId!)).toEqual([]);
   });
 });
 
