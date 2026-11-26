@@ -266,6 +266,61 @@ describe('native rename recovery after persistent worker reattach', () => {
     expect(h.scope.idleDetector.adoptPromptReady).toHaveBeenCalled();
   });
 
+  it('clears reattach provenance on a real prompt edge before the resubmit timer (Timeline-2)', async () => {
+    vi.useFakeTimers();
+    const h = recoveryHarness('unsubmitted');
+    Object.assign(h.scope, {
+      isPromptReady: false,
+      reattachOpenTurnGate: true,
+      rawInputRestartGate: false,
+      commandLineWritesPending: 0,
+      isFlushing: false,
+      injectionFlushing: false,
+      beginRuntimeWriteCycle,
+      pendingMessages: [{ content: 'restored follow-up', turnId: 'restored-turn' }],
+      flushPending: vi.fn(),
+      sessionRenameIdleTimer: null,
+      SESSION_RENAME_IDLE_TIMEOUT_MS: 5_000,
+      SESSION_RENAME_RECHECK_MS: 2_000,
+      SESSION_RENAME_SLOW_RECHECK_MS: 10_000,
+      SESSION_RENAME_FAST_RECHECK_WINDOW_MS: 30_000,
+      SESSION_RENAME_RECOVERY_AFTER_MS: 60_000,
+      decideSessionRenameSettlement,
+      recoverUnconfirmedSessionRename: vi.fn(() => false),
+      cliName: () => 'Codex',
+    });
+    h.scope.idleDetector.reset = vi.fn();
+    h.scope.backend.write = vi.fn(() => {
+      h.probe.mockReturnValue(true);
+      h.scope.sessionRenameSurfaceNow = () => 'settled';
+    });
+    h.scope.forceClearSessionRenameInFlight = loadWorkerFunction('forceClearSessionRenameInFlight', h.scope);
+    h.scope.beginCliWriteCycle = loadWorkerFunction('beginCliWriteCycle', h.scope);
+    h.scope.resubmitSessionRename = loadWorkerFunction('resubmitSessionRename', h.scope);
+    h.scope.settleSessionRename = loadWorkerFunction('settleSessionRename', h.scope);
+    h.scope.settleSessionRenameOnPrompt = loadWorkerFunction('settleSessionRenameOnPrompt', h.scope);
+    h.scope.armSessionRenameIdleTimeout = loadWorkerFunction('armSessionRenameIdleTimeout', h.scope);
+
+    expect(h.recover()).toBe(true);
+    expect(h.scope.sessionRenamePreserveReattachReadiness).toBe(true);
+    // The real reattach idle probe proves readiness at t=3.5s. Its prompt edge
+    // must clear the provenance before resubmit revokes readiness at t=5s.
+    await vi.advanceTimersByTimeAsync(3_500);
+    h.scope.isPromptReady = true;
+    h.scope.reattachOpenTurnGate = false;
+    h.scope.settleSessionRenameOnPrompt();
+    expect(h.scope.sessionRenamePreserveReattachReadiness).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(42_500);
+
+    expect(h.scope.backend.write).toHaveBeenCalledExactlyOnceWith('\r');
+    expect(h.scope.isPromptReady).toBe(true);
+    expect(h.scope.reattachOpenTurnGate).toBe(false);
+    expect(h.scope.sessionRenamePhase).toBe('idle');
+    expect(h.scope.flushPending).toHaveBeenCalledOnce();
+    expect(h.scope.idleDetector.adoptPromptReady).toHaveBeenCalled();
+  });
+
   it('keeps one recovery clock when an unknown surface becomes an exact surviving draft', () => {
     const h = recoveryHarness('unknown');
     const startedAt = Date.now() - 1_000;

@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
+import { isCodexAppCliId } from '../src/adapters/cli/types.js';
 import { InflightInputTracker } from '../src/core/inflight-input-tracker.js';
 import { isRemoteBackendType } from '../src/core/persistent-backend.js';
 import { ActiveTurnAuthority } from '../src/core/active-turn-authority.js';
@@ -49,6 +50,7 @@ function prewriteHarness(item: PendingCliInput, onPrecheck?: (scope: Record<stri
     lastInitConfig: { cliId: 'codex', backendType: 'tmux', promptInjection: 'none' },
     effectiveBackendType: 'tmux',
     isRemoteBackendType,
+    isCodexAppCliId,
     cancelRetiredRuntimeExit: vi.fn(),
     closeRequested: false,
     beginCliWriteCycle: vi.fn(),
@@ -209,14 +211,15 @@ describe('Codex deferred-precheck lifecycle ownership', () => {
         type: 'expire_durable_turn', turnId: 'expiring-turn', dispatchAttempt: 7,
       });
     });
-    h.scope.retireCodexAppDispatchForDurableReplay = vi.fn(async () => true);
+    h.scope.retireCodexAppDispatchForDurableReplay = loadWorkerFunction('retireCodexAppDispatchForDurableReplay', h.scope);
+    h.scope.requestCodexAppDispatchTransition = vi.fn();
     h.scope.restartCliProcess = vi.fn(async () => {});
 
     await h.flush();
     await expiry;
 
     expect(h.scope.pendingMessages).toEqual([]);
-    expect(h.scope.retireCodexAppDispatchForDurableReplay).toHaveBeenCalledWith('expiring-turn', 7);
+    expect(h.scope.requestCodexAppDispatchTransition).not.toHaveBeenCalled();
     expect(h.scope.send).toHaveBeenCalledWith({
       type: 'durable_expiry_ready', sessionId: 'test-session', turnId: 'expiring-turn',
       dispatchAttempt: 7, disposition: 'queued_removed',
@@ -225,25 +228,93 @@ describe('Codex deferred-precheck lifecycle ownership', () => {
     expectNoPaste(h, backend);
   });
 
-  it('restores the exact FIFO item and withholds the ACK when the durable retire ledger refuses', async () => {
-    const item: PendingCliInput = { content: 'expiring payload', turnId: 'expiring-turn', dispatchAttempt: 7 };
+  it('keeps Codex App FIFO order and withholds the ACK when the real retire ledger refuses', async () => {
+    const ordinary: PendingCliInput = { content: 'ordinary first', turnId: 'ordinary-first' };
+    const durable: PendingCliInput = {
+      content: 'expiring payload', turnId: 'expiring-turn', dispatchAttempt: 7, codexAppDispatchId: 'dispatch-b',
+    };
     // No flush: drive the expire handler directly so the queue outcome is not
     // racy with a concurrent precheck/beforeSubmit consuming the same item.
-    const { h, item: exact } = prewriteHarness(item);
-    expect(h.scope.pendingMessages).toEqual([exact]);
-    h.scope.retireCodexAppDispatchForDurableReplay = vi.fn(async () => false);
+    const { h, item: exact } = prewriteHarness(durable);
+    h.scope.pendingMessages.unshift(ordinary);
+    h.scope.lastInitConfig.cliId = 'codex-app';
+    h.scope.codexAppTurnDispatchQueue = { findExact: () => undefined, cancelExact: vi.fn() };
+    h.scope.codexAppRecoveredDispatches = [];
+    h.scope.requestCodexAppDispatchTransition = vi.fn(async () => false);
+    h.scope.retireCodexAppDispatchForDurableReplay = loadWorkerFunction('retireCodexAppDispatchForDurableReplay', h.scope);
 
     await loadWorkerMessageHandler('expire_durable_turn', h.scope)({
       type: 'expire_durable_turn', turnId: 'expiring-turn', dispatchAttempt: 7,
     });
 
-    // The ledger refused: the item must be back at its FIFO position and no
-    // removal ACK may escape (the daemon fences the unproven expiry itself).
-    expect(h.scope.pendingMessages).toEqual([exact]);
+    expect(h.scope.pendingMessages).toEqual([ordinary, exact]);
+    expect(h.scope.requestCodexAppDispatchTransition).toHaveBeenCalledWith('cancel', [{
+      dispatchId: 'dispatch-b', turnId: 'expiring-turn', dispatchAttempt: 7,
+    }]);
     expect(h.scope.send).not.toHaveBeenCalledWith(expect.objectContaining({
       type: 'durable_expiry_ready',
       disposition: 'queued_removed',
     }));
+  });
+
+  it('lets the real Codex App retire path expire a queued durable item without disturbing its predecessor', async () => {
+    const ordinary: PendingCliInput = { content: 'ordinary first', turnId: 'ordinary-first' };
+    const durable: PendingCliInput = {
+      content: 'expiring payload', turnId: 'expiring-turn', dispatchAttempt: 7, codexAppDispatchId: 'dispatch-b',
+    };
+    const { h } = prewriteHarness(durable);
+    h.scope.pendingMessages.unshift(ordinary);
+    h.scope.lastInitConfig.cliId = 'codex-app';
+    h.scope.codexAppTurnDispatchQueue = { findExact: () => undefined, cancelExact: vi.fn() };
+    h.scope.codexAppRecoveredDispatches = [];
+    h.scope.requestCodexAppDispatchTransition = vi.fn(async () => true);
+    h.scope.retireCodexAppDispatchForDurableReplay = loadWorkerFunction('retireCodexAppDispatchForDurableReplay', h.scope);
+
+    await loadWorkerMessageHandler('expire_durable_turn', h.scope)({
+      type: 'expire_durable_turn', turnId: 'expiring-turn', dispatchAttempt: 7,
+    });
+
+    expect(h.scope.pendingMessages).toEqual([ordinary]);
+    expect(h.scope.requestCodexAppDispatchTransition).toHaveBeenCalledWith('cancel', [{
+      dispatchId: 'dispatch-b', turnId: 'expiring-turn', dispatchAttempt: 7,
+    }]);
+    expect(h.scope.send).toHaveBeenCalledWith({
+      type: 'durable_expiry_ready', sessionId: 'test-session', turnId: 'expiring-turn',
+      dispatchAttempt: 7, disposition: 'queued_removed',
+    });
+  });
+
+  it('continues with the next queued input after a live-generation prewrite item expires', async () => {
+    const expired: PendingCliInput = { content: 'expired payload', turnId: 'expired-turn', dispatchAttempt: 1 };
+    const next: PendingCliInput = { content: 'next payload', turnId: 'next-turn' };
+    let expiry!: Promise<void>;
+    const { h, backend } = prewriteHarness(expired, scope => {
+      if (!expiry) expiry = loadWorkerMessageHandler('expire_durable_turn', scope)({
+        type: 'expire_durable_turn', turnId: 'expired-turn', dispatchAttempt: 1,
+      });
+    });
+    h.scope.pendingMessages.push(next);
+    h.scope.retireCodexAppDispatchForDurableReplay = loadWorkerFunction('retireCodexAppDispatchForDurableReplay', h.scope);
+    h.scope.holdNativeInputForHardBlock = vi.fn();
+    h.scope.markTurnRetired = vi.fn();
+    h.scope.codexBridgeNotifyCliSessionId = vi.fn();
+    backend.submitBracketedPaste = vi.fn((text: string) => {
+      appendFileSync(join(process.env.CODEX_HOME!, 'history.jsonl'), `${JSON.stringify({ session_id: SID, text })}\n`);
+    });
+
+    await h.flush();
+    await expiry;
+
+    expect(backend.submitBracketedPaste, JSON.stringify({
+      pending: h.scope.pendingMessages, ready: h.scope.isPromptReady,
+      durable: h.scope.durableTurnInFlight,
+      logs: h.scope.log.mock.calls.map(([line]: [string]) => line),
+    })).toHaveBeenCalledExactlyOnceWith('next payload');
+    expect(h.scope.pendingMessages).toEqual([]);
+    expect(h.scope.openingInputBoxSettled).toBe(true);
+    expect(h.scope.holdNativeInputForHardBlock).not.toHaveBeenCalled();
+    expect(h.scope.send.mock.calls.map(([event]: [any]) => event.message))
+      .not.toContain('worker.opening_input_held');
   });
 
   it.each([

@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
+import { createKimiAdapter } from '../src/adapters/cli/kimi.js';
+import { canStartInjectionFlush } from '../src/core/inject-queue-policy.js';
 import type { DaemonToWorker } from '../src/types.js';
 import { codexEmptyComposerFooter, codexNativeComposerState, codexNativeFooterRows } from '../src/services/codex-terminal-session.js';
 import { detectCodexChoiceModal } from '../src/utils/codex-choice-modal.js';
@@ -40,9 +42,9 @@ function codexCursor(viewport: string): { x: number; y: number } {
   return { x: 2, y: 0 };
 }
 
-function inputHarness(cliId: 'codex' | 'traex', viewport: string, persistentReattach = false) {
+function inputHarness(cliId: 'codex' | 'traex' | 'kimi', viewport: string, persistentReattach = false) {
   const h = workerSubmitHarness();
-  const adapter = cliId === 'codex' ? createCodexAdapter() : createTraexAdapter();
+  const adapter = cliId === 'codex' ? createCodexAdapter() : cliId === 'traex' ? createTraexAdapter() : createKimiAdapter();
   const backend = {
     write: vi.fn(),
     captureInputState: () => ({ viewport, cursor: cliId === 'codex' ? codexCursor(viewport) : undefined }),
@@ -387,6 +389,69 @@ describe('native hard input-focus blocks across real delivery paths', () => {
     expect(h.scope.armNativeInputBlockRecheck).not.toHaveBeenCalled();
     expect(h.scope.pendingMessages).toHaveLength(1);
   });
+  it.each(['command-line', 'injection', 'deferred-cwd', 'bare-shell', 'durable', 'rpc'] as const)(
+    'does not inspect or warn about a surface before the %s lifecycle gate', async gate => {
+      const viewport = fixture('traex-0.216.0-rename-dialog.txt');
+      const h = inputHarness('traex', viewport);
+      wireInteraction(h, viewport);
+      const hook = vi.fn(h.scope.hookReviewHoldsQueuedWrite);
+      const startup = vi.fn(h.scope.probeStartupBlocker);
+      const surface = vi.fn(h.scope.sessionInputBlocksDeliveryNow);
+      Object.assign(h.scope, {
+        hookReviewHoldsQueuedWrite: hook,
+        probeStartupBlocker: startup,
+        sessionInputBlocksDeliveryNow: surface,
+      });
+      if (gate === 'command-line') h.scope.commandLineWritesPending = 1;
+      if (gate === 'injection') h.scope.injectionFlushing = true;
+      if (gate === 'deferred-cwd') h.scope.shouldDeferUserFlush = () => true;
+      if (gate === 'bare-shell') h.scope.bareShellLaunchBlocked = true;
+      if (gate === 'durable') h.scope.pendingInputMayFlush = () => false;
+      if (gate === 'rpc') h.scope.rpcLifecycleFailClosedOwners = new Map([['owner', {}]]);
+
+      await h.flush();
+
+      expect(hook).not.toHaveBeenCalled();
+      expect(startup).not.toHaveBeenCalled();
+      expect(surface).not.toHaveBeenCalled();
+      expect(h.scope.notifyNativeInputBlocked).not.toHaveBeenCalled();
+      expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+      expect(h.scope.pendingMessages).toHaveLength(1);
+    },
+  );
+
+  it('does not consume Kimi resume-opening settlement while the bare-shell gate holds', async () => {
+    const h = inputHarness('kimi', '› Ask Kimi');
+    wireInteraction(h, '› Ask Kimi');
+    h.scope.bareShellLaunchBlocked = true;
+    h.scope.kimiResumeOpeningSettle = { generation: h.scope.cliSpawnGeneration };
+    h.scope.kimiResumeOpeningSettleHolds = loadWorkerFunction('kimiResumeOpeningSettleHolds', h.scope);
+    const settle = h.scope.kimiResumeOpeningSettle;
+
+    await h.flush();
+
+    expect(h.scope.kimiResumeOpeningSettle).toBe(settle);
+    expect(settle.firstCheckAtMs).toBeUndefined();
+    expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+  });
+
+  it('checks the injection writer mutex before inspecting a native input surface', async () => {
+    const h = inputHarness('traex', fixture('traex-0.216.0-rename-dialog.txt'));
+    h.scope.pendingInjections = [{ command: '/compact', kind: 'keepalive' }];
+    h.scope.commandLineWritesPending = 1;
+    h.scope.canStartInjectionFlush = canStartInjectionFlush;
+    const surface = vi.fn(h.scope.sessionInputBlocksDeliveryNow);
+    const hold = vi.fn(h.scope.holdNativeInputForHardBlock);
+    h.scope.sessionInputBlocksDeliveryNow = surface;
+    h.scope.holdNativeInputForHardBlock = hold;
+
+    await loadWorkerFunction<() => Promise<void>>('flushPendingInjections', h.scope)();
+
+    expect(surface).not.toHaveBeenCalled();
+    expect(hold).not.toHaveBeenCalled();
+    expect(h.scope.pendingInjections).toHaveLength(1);
+  });
+
   it.each([
     { name: 'TRAE L0', cliId: 'traex' as const, file: 'traex-0.213.1-hooks-startup-menu.txt', adopt: false },
     { name: 'TRAE L1', cliId: 'traex' as const, file: 'traex-0.213.1-hooks-browser-l1.txt', adopt: false },

@@ -23817,10 +23817,6 @@ async function flushPendingInjections(): Promise<void> {
   //   （commandLineWritesPending）：raw-write 围栏，注入同为 raw 命令行写入方。
   // 被挡下的注入不丢：队列留存，竞争写入方结束后的下一次 markPromptReady 再踢。
   if (recoverSessionRenameAfterPersistentReattach()) return;
-  if (sessionInputBlocksDeliveryNow()) {
-    holdNativeInputForHardBlock();
-    return;
-  }
   if (!canStartInjectionFlush({
     injectionFlushing,
     userFlushing: isFlushing,
@@ -23828,6 +23824,12 @@ async function flushPendingInjections(): Promise<void> {
     commandLineWritesPending,
     bareShellLaunchBlocked,
   })) return;
+  // Do not inspect a surface while BotMux itself is mid-command; only once all
+  // writers are idle may a native dialog/draft hold the injection queue.
+  if (sessionInputBlocksDeliveryNow()) {
+    holdNativeInputForHardBlock();
+    return;
+  }
   injectionFlushing = true;
   try {
     while (pendingInjections.length > 0 && backend && isPromptReady && !bareShellLaunchBlocked
@@ -29570,23 +29572,6 @@ async function flushPending(): Promise<void> {
   if (recoverSessionRenameAfterPersistentReattach()) return;
   if (resetTraexAutoModelBeforePendingTurn()) return;
   if (sessionRenameInFlight()) return;  // wait for /rename to finish before any user input
-  // Dedicated interaction owners run BEFORE the generic dialog/draft fallback:
-  // Hook-review must retain its actionable stuck card, and a startup trust page
-  // must retain its structured cli_startup_blocked event. The generic text hold
-  // is only for surfaces those richer paths did not claim.
-  if (hookReviewHoldsQueuedWrite()) return;
-  if (probeStartupBlocker('Flush')) {
-    log(`Holding ${pendingMessages.length} pending message(s) behind a startup dialog`);
-    return;
-  }
-  const codexDirectWriteNeedsHardGuard = lastInitConfig?.cliId === 'codex'
-    && (!backend.captureInputState || lastInitConfig.adoptMode === true
-      || pendingSessionRename !== null || pendingRawInputs.length > 0 || pendingAdoptMessages.length > 0);
-  if (!traexQuestionDeliveryOwnsInput()
-    && (lastInitConfig?.cliId !== 'codex' || codexDirectWriteNeedsHardGuard) && sessionInputBlocksDeliveryNow()) {
-    holdNativeInputForHardBlock();
-    return;
-  }
   if (commandLineWritesPending > 0) return;  // do not splice into text -> Enter
   // 注入进行中不得并发写 PTY（用户消息留在 pendingMessages，注入完成后的下一次
   // markPromptReady 自然排空）——防止 type-ahead 插进注入的 text→Enter 窗口。
@@ -29611,6 +29596,23 @@ async function flushPending(): Promise<void> {
   // teardown retires the owner.
   if (rpcLifecycleFailClosedOwners.size > 0) {
     log(`Holding pending input behind ${rpcLifecycleFailClosedOwners.size} unresolved Codex RPC delivery owner(s)`);
+    return;
+  }
+  // Only after the serial/lifecycle gates above may screen evidence classify the
+  // current input owner. Otherwise BotMux's own in-flight command or an active
+  // durable turn is misreported as a user draft. Dedicated interaction owners
+  // still precede the generic dialog/draft fallback so they keep their cards.
+  if (hookReviewHoldsQueuedWrite()) return;
+  if (probeStartupBlocker('Flush')) {
+    log(`Holding ${pendingMessages.length} pending message(s) behind a startup dialog`);
+    return;
+  }
+  const codexDirectWriteNeedsHardGuard = lastInitConfig?.cliId === 'codex'
+    && (!backend.captureInputState || lastInitConfig.adoptMode === true
+      || pendingSessionRename !== null || pendingRawInputs.length > 0 || pendingAdoptMessages.length > 0);
+  if (!traexQuestionDeliveryOwnsInput()
+    && (lastInitConfig?.cliId !== 'codex' || codexDirectWriteNeedsHardGuard) && sessionInputBlocksDeliveryNow()) {
+    holdNativeInputForHardBlock();
     return;
   }
   // Ready-gate: hold the FIRST prompt until the SessionStart hook fires a true-
@@ -30167,6 +30169,7 @@ async function flushPending(): Promise<void> {
       let turnSeq = usageLimitTracker.currentTurn();
       let bridgeTurnId: string | undefined;
       let normalWritePrepared = false;
+      let retiredBeforeSubmit = false;
       let webWireWriteRefused = false;
       let submissionPreparationFailed = false;
       // Remote-runner, RPC and Codex App runner input bypass the composer.
@@ -30724,7 +30727,10 @@ async function flushPending(): Promise<void> {
                   // noReplay drop, startup failure or a non-preserving kill).
                   // Missing ownership is a veto, never a reason to recreate it.
                   const pendingIndex = pendingMessages.indexOf(item);
-                  if (pendingIndex < 0) return false;
+                  if (pendingIndex < 0) {
+                    retiredBeforeSubmit = true;
+                    return false;
+                  }
                   // The precheck may also have waited through a prompt-ready
                   // edge. Re-open the write cycle immediately before actual paste
                   // so composerOwned/readiness cannot describe that stale window.
@@ -30752,6 +30758,13 @@ async function flushPending(): Promise<void> {
           ).finally(() => { traexQuestionDraftWaiting = false; });
           result = transaction.result;
           recoveryFailureReason = transaction.recoveryFailureReason;
+        }
+        if (retiredBeforeSubmit && writeContinuationIsCurrent()) {
+          // Expiry/interrupt/continuation discard removed this exact item while
+          // the live backend was prechecking. It has no remaining write to hold;
+          // continue with the next queue head instead of warning or waiting 5s.
+          keepPromptReadyAfterHold();
+          continue;
         }
         if (recoveryFailureReason) {
           result = { ...result, submitted: false };
@@ -47536,28 +47549,10 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         acknowledge('cli_fenced');
         break;
       }
-      // Remove exact queued items BEFORE awaiting the dispatch-ledger retire.
-      // A deferred Codex precheck may finish on that await: its beforeSubmit
-      // must see the item as retired, never as still writable. If the ledger
-      // refuses or throws, restore the same FIFO order and withhold the ACK.
-      const expiredPending: PendingCliInput[] = [];
-      for (let i = pendingMessages.length - 1; i >= 0; i--) {
-        const item = pendingMessages[i]!;
-        if (item.turnId === msg.turnId && item.dispatchAttempt === msg.dispatchAttempt) {
-          expiredPending.unshift(item);
-          pendingMessages.splice(i, 1);
-        }
-      }
-      let retiredPending = false;
-      try {
-        retiredPending = expiredPending.length > 0
-          && await retireCodexAppDispatchForDurableReplay(msg.turnId, msg.dispatchAttempt);
-      } finally {
-        if (!retiredPending && expiredPending.length > 0) pendingMessages.unshift(...expiredPending);
-      }
-      if (retiredPending) {
+      if (removedPending > 0
+          && await retireCodexAppDispatchForDurableReplay(msg.turnId, msg.dispatchAttempt)) {
         log(
-          `Expired ${expiredPending.length} queued durable input(s) turn=${msg.turnId.slice(0, 12)} `
+          `Expired ${removedPending} queued durable input(s) turn=${msg.turnId.slice(0, 12)} `
           + `attempt=${msg.dispatchAttempt}`,
         );
         acknowledge('queued_removed');
