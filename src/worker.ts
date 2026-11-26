@@ -758,6 +758,7 @@ import { buildReproduceCommand, selectReproduceLaunch } from './adapters/backend
 import {
   deriveRiffReposFromDirs,
   deriveRiffRepoFromWorkingDir,
+  isRetiredRiffAgent,
   isValidRiffAgent,
   isValidRiffBaseUrl,
   isValidRiffHostToolsUrl,
@@ -33499,7 +33500,7 @@ async function spawnCliBody(
     if (riffCfg.sandboxCluster !== undefined && !isValidRiffSandboxCluster(riffCfg.sandboxCluster)) {
       throw new Error(`riff sandboxCluster 非法（仅支持 boe/cn，当前: ${JSON.stringify(riffCfg.sandboxCluster)}）——请在 dashboard 的 Riff 配置中重新选择`);
     }
-    if (riffCfg.agent !== undefined && riffCfg.agent !== 'aiden' && !isValidRiffAgent(riffCfg.agent)) {
+    if (riffCfg.agent !== undefined && !isValidRiffAgent(riffCfg.agent) && !isRetiredRiffAgent(riffCfg.agent)) {
       throw new Error(`riff agent 非法（仅支持 codex/claude，当前: ${JSON.stringify(riffCfg.agent)}）——请在 dashboard 的 Riff 配置中重新选择`);
     }
     if (riffCfg.jwtHome !== undefined && !isValidRiffJwtHome(riffCfg.jwtHome)) {

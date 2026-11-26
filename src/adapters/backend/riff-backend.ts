@@ -65,6 +65,12 @@ export type RiffSandboxCluster = typeof RIFF_SANDBOX_CLUSTERS[number];
 /** riff task-execute 支持的 harness / agent（与服务端 modelValidation 对齐；codex 默认，claude 支持 Claude Code 与 Gemini 4 强度）。 */
 export const RIFF_AGENTS = ['codex', 'claude'] as const;
 export type RiffAgent = typeof RIFF_AGENTS[number];
+/** 已下线的历史 riff agent（2026-07 服务端收敛前 bots.json 的可选值）：spawn 门禁放行、
+ *  派发时由 resolveRiffAgent 统一回落 codex，保证存量配置升级后仍可建会话。 */
+export const RIFF_RETIRED_AGENTS = ['aiden', 'aiden-claude', 'opencode'] as const;
+export function isRetiredRiffAgent(v: unknown): boolean {
+  return typeof v === 'string' && (RIFF_RETIRED_AGENTS as readonly string[]).includes(v);
+}
 
 const MANDATORY_SETUP_COMMANDS = [
   // Unconditional install/upgrade: a `which botmux` guard would skip the
@@ -85,7 +91,7 @@ export interface RiffBackendConfig {
   /** Worker-only dispatch factory. Never supplied by the Riff API or sandbox. */
   hostToolsBinding?: () => import('../../services/riff-host-tools.js').RiffHostBinding | undefined;
   templateId?: string;
-  /** riff task-execute 的执行引擎（`codex` 默认 / `claude`）。存量 bots.json 里的已下线值（如 `aiden`）会在运行时回落为 `codex`。 */
+  /** riff task-execute 的执行引擎（`codex` 默认 / `claude`）。存量 bots.json 里的已下线值（`aiden` / `aiden-claude` / `opencode`，见 RIFF_RETIRED_AGENTS）会在运行时回落为 `codex`。 */
   agent?: string;
   model?: string;
   /** 思考等级（low/medium/high/xhigh）：codex 写入沙箱 config.toml 的 model_reasoning_effort，claude 写入受控 flag settings 的 CLAUDE_CODE_EFFORT_LEVEL；留空走 riff 默认 medium。非法值静默丢弃。 */
@@ -247,7 +253,7 @@ export function isValidRiffAgent(v: unknown): v is RiffAgent {
 
 /** Resolve the effective Riff `config.agent` for `/api/task-execute`.
  *  Configured `codex` / `claude` pass through; unset or legacy retired values
- *  (e.g. `aiden` in older `bots.json`) fall back to `codex`. */
+ *  (see RIFF_RETIRED_AGENTS, e.g. `aiden` in older `bots.json`) fall back to `codex`. */
 export function resolveRiffAgent(v: unknown): RiffAgent {
   return isValidRiffAgent(v) ? v : 'codex';
 }

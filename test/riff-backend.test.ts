@@ -1078,11 +1078,14 @@ describe('RiffBackend', () => {
   });
 
   describe('agent selection + reasoning effort', () => {
-    it('passes configured claude/codex agent through and falls back to codex for unset or legacy aiden', async () => {
+    it('passes configured claude/codex agent through and falls back to codex for unset or every retired value', async () => {
       for (const [agent, expected] of [
         ['claude', 'claude'],
         ['codex', 'codex'],
         ['aiden', 'codex'],
+        ['aiden-claude', 'codex'],
+        ['opencode', 'codex'],
+        ['bogus', 'codex'],
         [undefined, 'codex'],
       ] as const) {
         calls.length = 0; resolvers.length = 0;
