@@ -72,6 +72,20 @@ function inlinePurposeCarrier(root: any[], marker: string): boolean {
   return false;
 }
 
+/** A turn status card has only runtime Markdown rows, so no authored block can
+ * carry the marker. Reuse the card's own notation row (usage first, otherwise
+ * the last progress/thinking/tools row) instead of appending a marker-only
+ * footer, which Lark renders as a blank line. The status row is excluded: its
+ * exact text is matched by the legacy projection. */
+function inlineRuntimePurposeCarrier(root: any[], marker: string): boolean {
+  const carriers = root.filter(node => node?.tag === 'markdown' && typeof node.content === 'string'
+    && /^botmux_turn_(?:usage|progress_\d+|thinking|tools)$/.test(node.element_id ?? ''));
+  const node = carriers.find(node => node.element_id === 'botmux_turn_usage') ?? carriers[carriers.length - 1];
+  if (!node) return false;
+  node.content = `${stripTrailingGroupContextCardPurposeMarker(node.content)}${marker}`;
+  return true;
+}
+
 /** Reuse an existing media/table text field instead of allocating a blank row. */
 function inlineMediaPurposeCarrier(value: any, marker: string, kind: 'table' | 'img'): boolean {
   if (!value || typeof value !== 'object') return false;
@@ -140,7 +154,8 @@ export function markGroupContextCardPurpose(card: string | Record<string, any>, 
   } else if (!inlinePurposeCarrier(root, marker)
     && !inlineMediaPurposeCarrier(root, mediaMarker, 'table')
     && !chartPurposeCarrier(root, purpose)
-    && !inlineMediaPurposeCarrier(root, mediaMarker, 'img')) {
+    && !inlineMediaPurposeCarrier(root, mediaMarker, 'img')
+    && !inlineRuntimePurposeCarrier(root, marker)) {
     // Unsupported custom shapes retain the compatibility carrier.
     root.push({ tag: 'markdown', element_id: REPLY_CARD_FOOTER_ELEMENT_ID, text_size: 'notation',
       content: `<font color='grey'>${marker}</font>` });

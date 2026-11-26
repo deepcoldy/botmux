@@ -54,6 +54,44 @@ describe('group-context card projection', () => {
     },
   );
 
+  it.each(['working', 'completed', 'failed'] as const)(
+    'stamps a %s turn status card on its usage row instead of appending a marker-only footer', phase => {
+      const raw = buildTurnReplyCard(record({ phase }), presentation);
+      const card = JSON.parse(raw);
+      const ids = card.body.elements.map((e: any) => e.element_id);
+      expect(ids).toContain('botmux_turn_usage');
+      const marker = '\u2063'.repeat(12);
+      // No element may carry only the invisible marker.
+      const bare = (JSON.stringify(card).match(/"content":"(?:<font[^>]*>)?\u2063+(?:<\/font>)?"/g) ?? []);
+      expect(bare).toEqual([]);
+      const usage = card.body.elements.find((e: any) => e.element_id === 'botmux_turn_usage');
+      expect(usage.content.endsWith(marker)).toBe(true);
+      expect(usage.content.slice(0, -marker.length)).not.toBe('');
+      expect(projectGroupContextCard(raw)).toEqual({ kind: 'runtime' });
+      expect(projectGroupContextCard(simplified(raw))).toEqual({ kind: 'runtime' });
+    });
+
+  it('falls back to the last runtime row when a turn card has no usage row, and still avoids a bare footer', () => {
+    const raw = JSON.stringify({ schema: '2.0', body: { elements: [
+      { tag: 'markdown', element_id: 'botmux_turn_status', content: '✅ **已完成**' },
+      { tag: 'markdown', element_id: 'botmux_turn_progress_0', content: 'PROGRESS_ROW' },
+    ] } });
+    const stamped = markGroupContextCardPurpose(raw, 'runtime');
+    const elements = JSON.parse(stamped).body.elements;
+    expect(elements).toHaveLength(2);
+    expect(elements[0].content).toBe('✅ **已完成**');
+    expect(elements[1].content).toBe(`PROGRESS_ROW${'\u2063'.repeat(12)}`);
+    expect(markGroupContextCardPurpose(stamped, 'runtime')).toBe(stamped);
+    expect(projectGroupContextCard(stamped)).toEqual({ kind: 'runtime' });
+  });
+
+  it('keeps the marker-only footer for cards with no usable carrier at all', () => {
+    const stamped = JSON.parse(markGroupContextCardPurpose(JSON.stringify({ schema: '2.0', body: { elements: [
+      { tag: 'markdown', element_id: 'botmux_turn_status', content: '✅ **已完成**' },
+    ] } }), 'runtime'));
+    expect(stamped.body.elements.at(-1).element_id).toBe('botmux_reply_footer');
+  });
+
   it('shares a final published while working and retains custom body IDs, layout, and images', () => {
     const final = JSON.parse(buildCanonicalFinalReplyCard({ markdown: 'FINAL_PUBLIC' }));
     final.header = { title: { tag: 'plain_text', content: 'Custom title' }, template: 'green' };
