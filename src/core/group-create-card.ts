@@ -39,6 +39,9 @@ export interface GroupCreateForm {
   appIdToName: Record<string, string>;
   /** Where `/g` was sent; the result card replies here (the form card itself is withdrawn). */
   rootId: string;
+  /** Chat where `/g` was sent; the submit callback re-runs the live `/g` permission check against it. */
+  sourceChatId: string;
+  sourceChatType: 'p2p' | 'group';
   selectedDir?: string;
   expiresAt: number;
 }
@@ -92,6 +95,25 @@ export function selectGroupCreateDir(form: GroupCreateForm, dir: string): void {
 /** Single use: a submitted form cannot create a second group. */
 export function consumeGroupCreateForm(form: GroupCreateForm): void {
   forms.delete(form.id);
+}
+
+/**
+ * Atomically claim a form BEFORE any async validation. Two concurrent submits
+ * carry different event ids, so the event-dispatcher in-flight dedupe cannot
+ * catch them; both can otherwise pass {@link getGroupCreateForm} while waiting
+ * on the branch-validation await and each reach `createSlashGroup`. `Map.delete`
+ * is synchronous, so exactly one caller gets `true` and owns the single group
+ * creation. A claimant whose validation fails must call
+ * {@link releaseGroupCreateForm} so the user can correct and resubmit.
+ */
+export function claimGroupCreateForm(form: GroupCreateForm): boolean {
+  return forms.delete(form.id);
+}
+
+/** Restore a claimed form after a failed pre-create validation; never clobber a re-opened one. */
+export function releaseGroupCreateForm(form: GroupCreateForm, now = Date.now()): void {
+  if (form.expiresAt <= now) return;
+  if (!forms.has(form.id)) forms.set(form.id, form);
 }
 
 /** Test-only cleanup to isolate in-memory form state across cases. */

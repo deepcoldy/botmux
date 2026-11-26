@@ -136,8 +136,9 @@ import {
   GROUP_CREATE_DIR_ACTION,
   GROUP_CREATE_SUBMIT_ACTION,
   buildGroupCreatedCard,
-  consumeGroupCreateForm,
+  claimGroupCreateForm,
   getGroupCreateForm,
+  releaseGroupCreateForm,
   selectGroupCreateDir,
 } from '../../core/group-create-card.js';
 import {
@@ -2657,6 +2658,19 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       return { toast: { type: 'error', content: t(`card.group_create.${opened.reason}`, undefined, loc) } };
     }
     const { form } = opened;
+    // Re-run the live `/g` permission gate on every interaction. The owner id
+    // stored when the card opened is historical: within the 30-min TTL the user
+    // may have lost allowedUsers / entered blockedUsers, and a forwarded card
+    // must not let them create groups, invite bots or worktrees anyway.
+    // Same predicate as the `/g` command entry (canOperate ∪ talk-level /g);
+    // card callbacks carry no union_id, so that leg stays fail-closed.
+    if (!canRunDaemonCommand(
+      larkAppId, form.sourceChatId, operatorOpenId,
+      undefined, '/group', undefined, form.sourceChatType,
+    )) {
+      logger.info(`[group-create-card] blocked card action for unauthorized operator: ${operatorOpenId}`);
+      return { toast: { type: 'error', content: t('card.group_create.need_auth', undefined, loc) } };
+    }
     if (value.action === GROUP_CREATE_DIR_ACTION) {
       const raw = typeof action?.option === 'string' ? action.option.trim() : '';
       const dir = validateWorkingDir(raw, loc);
@@ -2674,13 +2688,30 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       workingDir = dir.resolvedPath;
     }
     const branch = String(fv.group_branch ?? '').trim();
+    // Synchronous pre-checks happen before claiming so a rejected submit keeps
+    // the form open for correction.
     if (branch && !workingDir) {
       return { toast: { type: 'error', content: t('card.group_create.repo_required', undefined, loc) } };
     }
-    if (branch && !(await isValidBranchName(branch))) {
-      return { toast: { type: 'error', content: t('daemon.topic_header_branch_invalid', { arg: branch }, loc) } };
+    // Atomic claim BEFORE the async branch validation: concurrent submits have
+    // distinct event ids and both reach this point; only the claimant that
+    // actually removes the form may build an afterAck (single createSlashGroup).
+    if (!claimGroupCreateForm(form)) {
+      return { toast: { type: 'error', content: t('card.group_create.expired', undefined, loc) } };
     }
-    consumeGroupCreateForm(form);
+    if (branch) {
+      let branchOk = true;
+      try {
+        branchOk = await isValidBranchName(branch);
+      } catch (err) {
+        releaseGroupCreateForm(form);
+        throw err;
+      }
+      if (!branchOk) {
+        releaseGroupCreateForm(form);
+        return { toast: { type: 'error', content: t('daemon.topic_header_branch_invalid', { arg: branch }, loc) } };
+      }
+    }
     return {
       toast: { type: 'info', content: t('card.group_create.creating', undefined, loc) },
       afterAck: async () => {

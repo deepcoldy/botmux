@@ -10570,6 +10570,24 @@ describe('handleCommand', () => {
       expect(conflictCard.elements[0].text.content).toContain('--card');
     });
 
+    it('P2-1: in primary coordination mode --card is refused with a downgrade card and creates no group', async () => {
+      // Form state lives in one process's Map while primary delivers a card
+      // callback to a random replica; fail closed instead of random "expired".
+      vi.stubEnv('BOTMUX_COORDINATION_MODE', 'primary');
+      try {
+        const deps = makeDeps();
+        await handleCommand('/g', ROOT_ID, makeLarkMessage('/g --card 预填群名'), deps, LARK_APP_ID);
+        expect(mockedCreate).not.toHaveBeenCalled();
+        const reply = vi.mocked(deps.sessionReply).mock.calls[0]!;
+        expect(reply[2]).toBe('interactive');
+        const card = JSON.parse(reply[1] as string);
+        expect(card.header.template).toBe('red');
+        expect(card.elements[0].text.content).toContain('primary');
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    });
+
     it('binds --dir and creates a worktree for --branch, recording the created group directory', async () => {
       vi.mocked(existsSync).mockImplementation((p: any) => String(p) === '/home/testuser/my-repo' || String(p).includes('bots-info.json'));
       vi.mocked(statSync).mockImplementation((() => ({ isDirectory: () => true })) as any);
@@ -10612,6 +10630,44 @@ describe('handleCommand', () => {
       await handleCommand('/g', ROOT_ID, makeLarkMessage('/g 项目群 --branch feat/y'), missingDirDeps, LARK_APP_ID);
       expect(mockedCreate).toHaveBeenCalledTimes(1);
       expect(JSON.parse(vi.mocked(missingDirDeps.sessionReply).mock.calls[0][1] as string).header.template).toBe('red');
+    });
+
+    it('P2-5 plain /g --dir: a created-groups.json write failure keeps the green success card, chat link and binding hint', async () => {
+      vi.mocked(existsSync).mockImplementation((p: any) => String(p) === '/home/testuser/bind-repo' || String(p).includes('bots-info.json'));
+      vi.mocked(statSync).mockImplementation((() => ({ isDirectory: () => true })) as any);
+      mockedCreate.mockImplementationOnce(async (opts: any) => {
+        await opts.onChatCreated?.('oc_bind_fail');
+        return {
+          ok: true, chatId: 'oc_bind_fail', creator: opts.creatorLarkAppId,
+          invalidBotIds: [], invalidUserIds: [], ownerTransferredTo: opts.transferOwnerTo ?? null,
+          shareLink: 'https://applink.feishu.cn/oc_bind_fail',
+        } as any;
+      });
+      vi.mocked(recordCreatedGroup).mockImplementationOnce(() => { throw new Error('review_disk_full'); });
+      const deps = makeDeps();
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g 绑定群 --dir /home/testuser/bind-repo'), deps, LARK_APP_ID);
+
+      expect(mockedCreate).toHaveBeenCalledTimes(1);
+      const card = JSON.parse(vi.mocked(deps.sessionReply).mock.calls[0][1] as string);
+      const text = JSON.stringify(card);
+      expect(card.header.template).toBe('green');
+      expect(text).toContain('oc_bind_fail');
+      expect(text).toContain('review_disk_full');
+    });
+
+    it('P2-5 /g --start --dir: a binding write failure does not abort the task reservation and still returns a green card', async () => {
+      vi.mocked(existsSync).mockImplementation((p: any) => String(p) === '/home/testuser/bind-repo' || String(p).includes('bots-info.json'));
+      vi.mocked(statSync).mockImplementation((() => ({ isDirectory: () => true })) as any);
+      vi.mocked(recordCreatedGroup).mockImplementationOnce(() => { throw new Error('review_disk_full_task'); });
+      const deps = makeDeps();
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g --start 任务 --dir /home/testuser/bind-repo'), deps, LARK_APP_ID);
+
+      // The task reservation still ran despite the binding failure.
+      expect(spawnDashboardSession).toHaveBeenCalledTimes(1);
+      const card = JSON.parse(vi.mocked(deps.sessionReply).mock.calls[0][1] as string);
+      const text = JSON.stringify(card);
+      expect(card.header.template).toBe('green');
+      expect(text).toContain('review_disk_full_task');
     });
 
     it('passes /group --role-profile through and strips it from the group name', async () => {

@@ -7,6 +7,9 @@ const mockedCreateSlashGroup = vi.fn();
 const mockedReplyMessage = vi.fn(async () => 'om_fallback');
 const mockedDeleteMessage = vi.fn(async () => true);
 const mockedIsValidBranchName = vi.fn(async (name: string) => !name.includes('..') && !name.includes(' '));
+// Live permission gate re-checked on every card interaction; default allow,
+// individual cases flip it to false to model revocation after the card opened.
+const mockedCanRunDaemonCommand = vi.fn(() => true);
 
 vi.mock('../src/core/command-handler.js', () => ({
   configWriteFailureText: vi.fn((e: unknown) => String(e)),
@@ -41,6 +44,12 @@ vi.mock('../src/bot-registry.js', () => ({
   getAllBots: vi.fn(() => []),
   getOwnerOpenId: vi.fn(() => 'ou_owner'),
   effectiveDefaultWorkingDir: vi.fn(() => undefined),
+}));
+
+vi.mock('../src/im/lark/event-dispatcher.js', () => ({
+  canOperate: (...args: any[]) => mockedCanRunDaemonCommand(...args),
+  canTalk: (...args: any[]) => mockedCanRunDaemonCommand(...args),
+  canRunDaemonCommand: (...args: any[]) => mockedCanRunDaemonCommand(...args),
 }));
 
 import {
@@ -81,6 +90,8 @@ beforeEach(() => {
   mockedReplyMessage.mockClear();
   mockedDeleteMessage.mockClear();
   mockedIsValidBranchName.mockClear();
+  mockedCanRunDaemonCommand.mockClear();
+  mockedCanRunDaemonCommand.mockReturnValue(true);
 });
 
 afterEach(() => {
@@ -98,6 +109,8 @@ describe('group-create-card form lifecycle & rendering', () => {
       groupArgs: { name: '', body: '' },
       appIdToName: {},
       rootId: 'om_root',
+      sourceChatId: 'oc_source',
+      sourceChatType: 'group',
     }, t0);
 
     expect(getGroupCreateForm(form.id, 'ou_other', t0)).toEqual({ ok: false, reason: 'not_owner' });
@@ -116,6 +129,8 @@ describe('group-create-card form lifecycle & rendering', () => {
       groupArgs: { name: '', body: '' },
       appIdToName: {},
       rootId: 'om_root',
+      sourceChatId: 'oc_source',
+      sourceChatType: 'group',
     }, t0);
     consumeGroupCreateForm(form2);
     expect(getGroupCreateForm(form2.id, 'ou_owner', t0)).toEqual({ ok: false, reason: 'expired' });
@@ -157,6 +172,8 @@ describe('group-create-card form lifecycle & rendering', () => {
       groupArgs: { name: '发布群', body: '发布群', workingDir: '/work/a', branch: 'feat/rel' },
       appIdToName: {},
       rootId: 'om_root',
+      sourceChatId: 'oc_source',
+      sourceChatType: 'group',
       selectedDir: '/work/a',
     });
 
@@ -200,6 +217,8 @@ describe('card-handler group_create callbacks', () => {
       groupArgs: { name: '', body: '', avatar: 'name' },
       appIdToName: { 'app-1': 'Claude', 'app-2': 'Codex' },
       rootId: 'om_root',
+      sourceChatId: 'oc_source',
+      sourceChatType: 'group',
     });
     const deps = makeDeps();
 
@@ -260,6 +279,8 @@ describe('card-handler group_create callbacks', () => {
       groupArgs: { name: '', body: '' },
       appIdToName: {},
       rootId: 'om_root',
+      sourceChatId: 'oc_source',
+      sourceChatType: 'group',
     });
     const deps = makeDeps();
 
@@ -294,6 +315,8 @@ describe('card-handler group_create callbacks', () => {
       groupArgs: { name: '', body: '' },
       appIdToName: {},
       rootId: 'om_root',
+      sourceChatId: 'oc_source',
+      sourceChatType: 'group',
     });
     const deps = makeDeps();
     vi.mocked(deps.sessionReply).mockRejectedValueOnce(new Error('card_failed'));
@@ -315,5 +338,129 @@ describe('card-handler group_create callbacks', () => {
     await submitted.afterAck!();
 
     expect(mockedReplyMessage).toHaveBeenCalledWith('app-1', 'om_form_card', 'TEXT_OK:Fallback Group:https://feishu.cn/oc_fb', 'text', false);
+  });
+});
+
+describe('card-handler group_create live permission gate and atomic single claim', () => {
+  it('P2-4: after permission is revoked, submit and dir selection are refused with no afterAck and no group created', async () => {
+    const repoDir = makeDir('revoked-repo');
+    const form = openGroupCreateForm({
+      creatorAppId: 'app-1',
+      senderOpenId: 'ou_owner',
+      larkAppIdsForGroup: ['app-1'],
+      groupArgs: { name: '', body: '' },
+      appIdToName: {},
+      rootId: 'om_root',
+      sourceChatId: 'oc_source',
+      sourceChatType: 'group',
+      selectedDir: repoDir,
+    });
+    const deps = makeDeps();
+    // Operator was removed from allowedUsers / added to blockedUsers after the card opened.
+    mockedCanRunDaemonCommand.mockReturnValue(false);
+
+    const submit = await handleCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: {
+        value: { action: GROUP_CREATE_SUBMIT_ACTION, form: form.id },
+        form_value: { group_name: '撤权后提交' },
+      },
+      context: { open_message_id: 'om_form_card' },
+    }, deps, 'app-1');
+    expect(submit.toast.type).toBe('error');
+    expect(submit.afterAck).toBeUndefined();
+    expect(mockedCreateSlashGroup).not.toHaveBeenCalled();
+    // The form is not consumed by a refused submit, so re-authorization allows resubmit.
+    expect(getGroupCreateForm(form.id, 'ou_owner').ok).toBe(true);
+
+    const pick = await handleCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: { value: { action: GROUP_CREATE_DIR_ACTION, form: form.id }, option: repoDir },
+      context: { open_message_id: 'om_form_card' },
+    }, deps, 'app-1');
+    expect(pick.toast.type).toBe('error');
+    expect(pick.afterAck).toBeUndefined();
+  });
+
+  it('P2-3: two concurrent branch submits (distinct events) produce one afterAck and one createSlashGroup', async () => {
+    const repoDir = makeDir('race-repo');
+    const form = openGroupCreateForm({
+      creatorAppId: 'app-1',
+      senderOpenId: 'ou_owner',
+      larkAppIdsForGroup: ['app-1'],
+      groupArgs: { name: '', body: '' },
+      appIdToName: {},
+      rootId: 'om_root',
+      sourceChatId: 'oc_source',
+      sourceChatType: 'group',
+      selectedDir: repoDir,
+    });
+    const deps = makeDeps();
+    const releases: Array<() => void> = [];
+    // Only the winner reaches validation (the loser is refused at form lookup),
+    // so a single scoped Once is enough and leaves no residual implementation.
+    mockedIsValidBranchName.mockImplementationOnce(
+      () => new Promise<boolean>(resolve => { releases.push(() => resolve(true)); }),
+    );
+    mockedCreateSlashGroup.mockResolvedValue({ ok: true, name: 'g', link: 'https://x/oc', hints: [] });
+
+    const p1 = handleCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: { value: { action: GROUP_CREATE_SUBMIT_ACTION, form: form.id }, form_value: { group_branch: 'feat/a' } },
+      context: { open_message_id: 'om_form_card' },
+    }, deps, 'app-1');
+    const p2 = handleCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: { value: { action: GROUP_CREATE_SUBMIT_ACTION, form: form.id, event: 2 }, form_value: { group_branch: 'feat/b' } },
+      context: { open_message_id: 'om_form_card' },
+    }, deps, 'app-1');
+    await Promise.resolve();
+    await Promise.resolve();
+    // The claim is synchronous and precedes the branch await: only the winner
+    // ever enters validation, so the loser is refused at the form lookup.
+    expect(releases.length).toBe(1);
+    releases.forEach(r => r());
+
+    const [r1, r2] = await Promise.all([p1, p2]);
+    const acks = [r1, r2].filter(r => typeof r?.afterAck === 'function');
+    expect(acks.length).toBe(1);
+    await Promise.all([r1, r2].map(r => (r as any)?.afterAck?.()));
+    expect(mockedCreateSlashGroup).toHaveBeenCalledTimes(1);
+  });
+
+  it('a failed branch validation releases the claim so the same form can be corrected and resubmitted', async () => {
+    const repoDir = makeDir('retry-repo');
+    const form = openGroupCreateForm({
+      creatorAppId: 'app-1',
+      senderOpenId: 'ou_owner',
+      larkAppIdsForGroup: ['app-1'],
+      groupArgs: { name: '', body: '' },
+      appIdToName: {},
+      rootId: 'om_root',
+      sourceChatId: 'oc_source',
+      sourceChatType: 'group',
+      selectedDir: repoDir,
+    });
+    const deps = makeDeps();
+    mockedCreateSlashGroup.mockResolvedValue({ ok: true, name: 'g', link: 'https://x/oc', hints: [] });
+
+    const bad = await handleCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: { value: { action: GROUP_CREATE_SUBMIT_ACTION, form: form.id }, form_value: { group_branch: 'bad..name' } },
+      context: { open_message_id: 'om_form_card' },
+    }, deps, 'app-1');
+    expect(bad.toast.type).toBe('error');
+    expect(bad.afterAck).toBeUndefined();
+    expect(getGroupCreateForm(form.id, 'ou_owner').ok).toBe(true);
+    expect(mockedCreateSlashGroup).not.toHaveBeenCalled();
+
+    const ok = await handleCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: { value: { action: GROUP_CREATE_SUBMIT_ACTION, form: form.id }, form_value: { group_branch: 'feat/ok' } },
+      context: { open_message_id: 'om_form_card' },
+    }, deps, 'app-1');
+    expect(typeof ok.afterAck).toBe('function');
+    await ok.afterAck!();
+    expect(mockedCreateSlashGroup).toHaveBeenCalledTimes(1);
   });
 });

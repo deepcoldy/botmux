@@ -2232,6 +2232,7 @@ export async function createSlashGroup(opts: {
 
   let dirSetup: PreparedGroupWorkingDir = {};
   let createdChatId: string | undefined;
+  let bindingError: string | undefined;
   try {
     dirSetup = await prepareGroupWorkingDir({
       workingDir: groupArgs.workingDir,
@@ -2262,14 +2263,21 @@ export async function createSlashGroup(opts: {
         onChatCreated: (chatId: string) => {
           createdChatId = chatId;
           if (dirSetup.workingDir) {
-            recordCreatedGroup({
-              chatId,
-              creatorAppId,
-              ownerOpenId: senderOpenId,
-              workingDir: dirSetup.workingDir,
-              repository: dirSetup.repository,
-              branch: dirSetup.branch,
-            });
+            // Auxiliary local state: a lock timeout / disk error must not abort
+            // the chat that already exists or drop its link. Degrade to a hint.
+            try {
+              recordCreatedGroup({
+                chatId,
+                creatorAppId,
+                ownerOpenId: senderOpenId,
+                workingDir: dirSetup.workingDir,
+                repository: dirSetup.repository,
+                branch: dirSetup.branch,
+              });
+            } catch (e: any) {
+              bindingError = e?.message ?? String(e);
+              logger.warn(`[${logTag}] /group created-groups bind failed for ${chatId}: ${bindingError}`);
+            }
           }
           if (autoTitle) registerGroupAutoTitle(creatorAppId, chatId, {
             placeholderName: groupName,
@@ -2287,6 +2295,7 @@ export async function createSlashGroup(opts: {
     // hints so the user knows whether to expect to be auto-invited.
     const hints: string[] = [];
     if (autoTitle) hints.push(t('cmd.group.auto_title_pending', undefined, loc));
+    if (bindingError) hints.push(t('card.group_create.binding_failed', { error: bindingError }, loc));
     if (result.customization?.avatarError) hints.push(t('cmd.group.avatar_failed', { reason: result.customization.avatarError }, loc));
     if (result.customization?.tagError) hints.push(t('cmd.group.tag_failed', { reason: result.customization.tagError }, loc));
     if (result.invalidUserIds.includes(senderOpenId)) {
@@ -6473,6 +6482,15 @@ export async function handleCommand(
           break;
         }
         if (cardDecision === 'card') {
+          // The form lives in this process's memory and card callbacks are
+          // delivered to a random primary replica; opening it there would make
+          // every callback that lands on another replica fail as "expired".
+          // Fail closed with a command-line downgrade until form state is shared
+          // (mirrors the /close and /dismiss primary guards).
+          if (coordinationModeIsPrimary()) {
+            await replyError(t('cmd.group.card_primary_unsupported', undefined, loc));
+            break;
+          }
           const prefillCheck = await validateGroupDirAndBranch(groupArgs, { requireDirForBranch: false, loc });
           if (!prefillCheck.ok) {
             await replyError(prefillCheck.error);
@@ -6482,6 +6500,8 @@ export async function handleCommand(
             creatorAppId,
             senderOpenId,
             rootId,
+            sourceChatId: message.chatId ?? '',
+            sourceChatType: message.chatType === 'p2p' ? 'p2p' : 'group',
             larkAppIdsForGroup,
             groupArgs: { ...groupArgs, workingDir: prefillCheck.workingDir },
             appIdToName: Object.fromEntries(appIdToName),
@@ -6606,6 +6626,7 @@ export async function handleCommand(
         ];
 
         let dirSetup: PreparedGroupWorkingDir = {};
+        let taskBindingError: string | undefined;
         try {
           dirSetup = await prepareGroupWorkingDir({
             workingDir: dirBranchCheck.workingDir,
@@ -6647,14 +6668,21 @@ export async function handleCommand(
             onChatCreated: async (chatId: string) => {
               createdChatId = chatId;
               if (dirSetup.workingDir) {
-                recordCreatedGroup({
-                  chatId,
-                  creatorAppId,
-                  ownerOpenId: senderOpenId,
-                  workingDir: dirSetup.workingDir,
-                  repository: dirSetup.repository,
-                  branch: dirSetup.branch,
-                });
+                // Auxiliary local state must not abort the created chat or the
+                // task reservation below; degrade to a receipt hint.
+                try {
+                  recordCreatedGroup({
+                    chatId,
+                    creatorAppId,
+                    ownerOpenId: senderOpenId,
+                    workingDir: dirSetup.workingDir,
+                    repository: dirSetup.repository,
+                    branch: dirSetup.branch,
+                  });
+                } catch (e: any) {
+                  taskBindingError = e?.message ?? String(e);
+                  logger.warn(`[${logTag}] /group task created-groups bind failed for ${chatId}: ${taskBindingError}`);
+                }
               }
               if (autoTitle) registerGroupAutoTitle(creatorAppId, chatId, {
                 placeholderName: groupName,
@@ -6686,6 +6714,7 @@ export async function handleCommand(
           logger.info(`[${logTag}] /group task chat=${result.chatId} forwardFailed=${taskStart.forwardFailed.length} startError=${taskStart.startError ?? '-'}`);
           const hints: string[] = [];
           if (autoTitle) hints.push(t('cmd.group.auto_title_task', undefined, loc));
+          if (taskBindingError) hints.push(t('card.group_create.binding_failed', { error: taskBindingError }, loc));
           hints.push(...taskStartHints(taskStart));
           if (result.collaborationError) hints.push(t('cmd.group.collaboration_failed', { reason: result.collaborationError }, loc));
           if (result.customization?.avatarError) hints.push(t('cmd.group.avatar_failed', { reason: result.customization.avatarError }, loc));
