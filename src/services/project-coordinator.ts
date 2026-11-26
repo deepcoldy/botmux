@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { localeForBot } from '../i18n/index.js';
 import { logger } from '../utils/logger.js';
 import {
@@ -24,7 +25,7 @@ import {
 } from './group-collaboration-mode-store.js';
 
 export interface ProjectCoordinatorTransport {
-  sendCard(larkAppId: string, chatId: string, cardJson: string): Promise<string>;
+  sendCard(larkAppId: string, chatId: string, cardJson: string, uuid?: string): Promise<string>;
   updateCard(larkAppId: string, messageId: string, cardJson: string): Promise<void>;
   pinMessage(larkAppId: string, messageId: string): Promise<boolean>;
   unpinMessage(larkAppId: string, messageId: string): Promise<boolean>;
@@ -177,6 +178,18 @@ function queued<T>(key: string, operation: () => Promise<T>): Promise<T> {
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+/** Lark deduplicates a supplied send UUID for one hour. All replacements of
+ * the same old card share one identity, even if a retry carries newer content;
+ * sendAndPinCard reconciles that content with a PATCH before reporting success. */
+function replacementSendUuid(project: ProjectGroupState): string | undefined {
+  const replacedMessageId = project.card?.messageId;
+  if (!replacedMessageId) return undefined;
+  const digest = createHash('sha256')
+    .update(`${project.chatId}\0${project.larkAppId}\0${replacedMessageId}`)
+    .digest('hex').slice(0, 32);
+  return `project-card-${digest}`;
 }
 
 function boundedText(value: string | undefined, max: number, fallback = ''): string {
@@ -624,7 +637,10 @@ export class ProjectCoordinator {
     // Never transform the older onboarding guide in place: publish and pin a
     // fresh formal card and retire the guide only after publication. Record the
     // new ID before pinning so a failed store write cannot leave an orphan pin.
-    const messageId = await this.transport.sendCard(project.larkAppId, project.chatId, cardJson);
+    const sendUuid = replacementSendUuid(project);
+    const messageId = sendUuid
+      ? await this.transport.sendCard(project.larkAppId, project.chatId, cardJson, sendUuid)
+      : await this.transport.sendCard(project.larkAppId, project.chatId, cardJson);
     const published = (await mutateProjectGroup(context.dataDir, context.chatId, current => {
       if (!current) throw new Error('project_not_found');
       const refreshPending = current.revision !== project.revision && current.card?.refreshPending;
@@ -637,6 +653,11 @@ export class ProjectCoordinator {
       };
       return current;
     }))!;
+    // A deduplicated send can return the message created by an earlier attempt
+    // with older content. Converge that same message before recording the digest.
+    if (sendUuid && (!canRepost || canRepost())) {
+      await this.transport.updateCard(project.larkAppId, messageId, cardJson);
+    }
     const pinned = !canRepost || canRepost() ? await this.confirmCardPin(context, published) : published;
     if (!canRepost || canRepost()) await this.retireOnboardingCard(context);
     // The new card adds one revision. If another write bumped the revision

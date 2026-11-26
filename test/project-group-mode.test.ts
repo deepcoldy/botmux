@@ -419,7 +419,9 @@ describe('project group mode', () => {
       return `om_card_${sends}`;
     });
     await f.coordinator.run(f.context, { action: 'init', title: '项目', goal: '完成目标' });
-    f.transport.updateCard = vi.fn(async () => { throw new Error('withdrawn'); });
+    f.transport.updateCard = vi.fn(async (_appId, messageId) => {
+      if (messageId === 'om_card_1') throw new Error('withdrawn');
+    });
     const updated = await f.coordinator.run(f.context, { action: 'update', focus: '恢复卡片' });
     expect(updated.card).toMatchObject({ messageId: 'om_card_2', pinned: true });
     expect(updated.focus).toBe('恢复卡片');
@@ -434,7 +436,8 @@ describe('project group mode', () => {
       return `om_card_${sends}`;
     });
     await f.coordinator.run(f.context, { action: 'init', title: '项目', goal: '完成目标' });
-    f.transport.updateCard = vi.fn(async () => {
+    f.transport.updateCard = vi.fn(async (_appId, messageId) => {
+      if (messageId !== 'om_card_1') return;
       const error = new Error('past edit window');
       error.name = 'MessageUpdateExpiredError';
       throw error;
@@ -474,9 +477,11 @@ describe('project group mode', () => {
     const f = fixture();
     const manual = { ...f.context, cardPublication: 'repost' } as const;
     await f.coordinator.run(f.context, { action: 'init', title: '项目', goal: '完成目标' });
-    vi.mocked(f.transport.updateCard).mockRejectedValue(
-      Object.assign(new Error('past edit window'), { name: 'MessageUpdateExpiredError' }),
-    );
+    vi.mocked(f.transport.updateCard).mockImplementation(async (_appId, messageId) => {
+      if (messageId === 'om_card_1') {
+        throw Object.assign(new Error('past edit window'), { name: 'MessageUpdateExpiredError' });
+      }
+    });
     vi.mocked(f.transport.sendCard).mockRejectedValueOnce(new Error('send failed'));
     await expect(f.coordinator.run(manual, { action: 'refresh' })).rejects.toThrow('send failed');
     expect(readProjectGroup(f.dataDir, f.context.chatId)?.card).toMatchObject({ messageId: 'om_card_1', pinned: false });
@@ -495,7 +500,9 @@ describe('project group mode', () => {
     const f = fixture();
     await f.coordinator.run(f.context, { action: 'init', title: '项目', goal: '完成目标' });
     const expired = Object.assign(new Error('past edit window'), { name: 'MessageUpdateExpiredError' });
-    vi.mocked(f.transport.updateCard).mockRejectedValue(expired);
+    vi.mocked(f.transport.updateCard).mockImplementation(async (_appId, messageId) => {
+      if (messageId === 'om_card_1') throw expired;
+    });
 
     await expect(f.coordinator.run(f.context, action)).rejects.toBe(expired);
     expect(f.transport.sendCard).toHaveBeenCalledTimes(1);

@@ -1,6 +1,6 @@
 // 用真实 ProjectCoordinator 与项目存储覆盖刷新预算、过期重发、按群防抖与主控转发。
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { ProjectCoordinator, type ProjectCoordinatorTransport } from '../src/services/project-coordinator.js';
 import { listProjectGroups, mutateProjectGroup, readProjectGroup } from '../src/services/project-group-store.js';
@@ -118,7 +118,7 @@ describe('project card runtime sync', () => {
     expect(f.deps.repostExpiredCard).not.toHaveBeenCalled();
     await f.sync.sync();
     for (let i = PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST; i < 20; i += 1) await f.sync.sync();
-    expect(f.updates()).toBe(PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST);
+    expect(f.updates()).toBe(PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST + 1);
     expect(f.deps.onDeferred).toHaveBeenCalledTimes(PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST);
     expect(f.deps.repostExpiredCard).toHaveBeenCalledTimes(1);
     expect(f.transport.sendCard).toHaveBeenCalledTimes(2);
@@ -128,16 +128,18 @@ describe('project card runtime sync', () => {
 
     f.setRuntime({ ownerDisplayNames: { cli_worker: 'BotBeta' } });
     await f.sync.sync();
-    expect(f.updates()).toBe(PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST + 1);
+    expect(f.updates()).toBe(PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST + 2);
     expect(f.transport.updateCard).toHaveBeenLastCalledWith('cli_main', 'om_card_2', expect.stringContaining('BotBeta'));
     expect(f.transport.sendCard).toHaveBeenCalledTimes(2);
   });
 
   it('新摘要获得完整的独立失败预算，不继承旧摘要的失败计数', async () => {
     const f = await fixture();
-    vi.mocked(f.transport.updateCard).mockImplementation(async () => { throw expiredError(); });
+    vi.mocked(f.transport.updateCard).mockImplementation(async (_appId, messageId) => {
+      if (messageId === 'om_card') throw expiredError();
+    });
     for (let i = 0; i < 20; i += 1) await f.sync.sync();
-    expect(f.updates()).toBe(PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST);
+    expect(f.updates()).toBe(PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST + 1);
 
     // 新摘要：前两次瞬时失败，第三次成功——新预算必须容忍这两次失败。
     f.setRuntime({ ownerDisplayNames: { cli_worker: 'BotBeta' } });
@@ -148,10 +150,10 @@ describe('project card runtime sync', () => {
     await f.sync.sync();
     await f.sync.sync();
     await f.sync.sync();
-    expect(f.updates()).toBe(PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST + 3);
+    expect(f.updates()).toBe(PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST + 4);
     // 成功后同摘要不再打接口。
     await f.sync.sync();
-    expect(f.updates()).toBe(PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST + 3);
+    expect(f.updates()).toBe(PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST + 4);
     expect(f.deps.repostExpiredCard).toHaveBeenCalledTimes(1);
   });
 
@@ -171,10 +173,12 @@ describe('project card runtime sync', () => {
     expect(readProjectGroup(f.dataDir, f.context.chatId)?.card).toMatchObject({ messageId: 'om_card_2', pinned: true });
   });
 
-  it('解除置顶未确认时后台不换卡，也不继续尝试同一摘要', async () => {
+  it('解除置顶未确认时后台不换卡，冷却后重试同一摘要', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     const f = await fixture();
-    vi.mocked(f.transport.updateCard).mockRejectedValue(expiredError());
+    vi.mocked(f.transport.updateCard).mockImplementation(async (_appId, messageId) => {
+      if (messageId === 'om_card') throw expiredError();
+    });
     vi.mocked(f.transport.unpinMessage).mockResolvedValueOnce(false);
     for (let i = 0; i < PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST; i += 1) await f.sync.sync();
     expect(f.transport.unpinMessage).toHaveBeenCalledExactlyOnceWith('cli_main', 'om_card');
@@ -184,7 +188,7 @@ describe('project card runtime sync', () => {
 
     vi.setSystemTime(Date.now() + 11 * 60_000);
     await f.sync.sync();
-    expect(f.transport.unpinMessage).toHaveBeenCalledTimes(1);
+    expect(f.transport.unpinMessage).toHaveBeenCalledTimes(2);
     f.setRuntime({ ownerDisplayNames: { cli_worker: 'BotBeta' } });
     for (let i = 0; i < PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST; i += 1) await f.sync.sync();
     expect(f.transport.sendCard).toHaveBeenCalledTimes(2);
@@ -206,7 +210,7 @@ describe('project card runtime sync', () => {
     vi.setSystemTime(firstDue - 1);
     await f.sync.sync();
     expect(f.transport.pinMessage).toHaveBeenCalledTimes(2);
-    expect(f.updates()).toBe(PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST);
+    expect(f.updates()).toBe(PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST + 1);
 
     // A fresh coordinator and sync must honor the stored retry window.
     const coordinator = new ProjectCoordinator(f.transport);
@@ -286,7 +290,7 @@ describe('project card runtime sync', () => {
     expect(readProjectGroup(f.dataDir, f.context.chatId)?.card?.refreshPending).toBeUndefined();
   });
 
-  it('20 个持续过期的 tick 即使摘要变化也只重发一次，冷却结束不额外 PATCH', async () => {
+  it('20 个持续过期的 tick 即使摘要变化也只重发一次，冷却结束只对齐新卡内容', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     const start = Date.now();
     const f = await fixture();
@@ -311,7 +315,7 @@ describe('project card runtime sync', () => {
     expect(f.deps.repostExpiredCard).toHaveBeenCalledTimes(1);
     vi.setSystemTime(start + 690_000);
     await f.sync.sync();
-    expect(f.updates()).toBe(updates);
+    expect(f.updates()).toBe(updates + 1);
     expect(f.deps.repostExpiredCard).toHaveBeenCalledTimes(2);
     expect(f.transport.unpinMessage).toHaveBeenLastCalledWith('cli_main', 'om_card_2');
     expect(readProjectGroup(f.dataDir, f.context.chatId)?.card?.messageId).toBe('om_card_3');
@@ -329,32 +333,90 @@ describe('project card runtime sync', () => {
     expect(f.transport.unpinMessage).toHaveBeenCalledWith('cli_main', 'om_card_2');
   });
 
-  it('重发失败计入失败次数，同一摘要即使切换回来也只尝试重发一次', async () => {
+  it.each(['unpin', 'send'] as const)('%s 瞬败后保留同一摘要，冷却结束自动重试并恢复', async stage => {
     vi.useFakeTimers({ toFake: ['Date'] });
     const f = await fixture();
-    vi.mocked(f.transport.updateCard).mockRejectedValue(expiredError());
-    const sendError = new Error('send failed');
-    vi.mocked(f.transport.sendCard).mockRejectedValueOnce(sendError);
+    vi.mocked(f.transport.updateCard).mockImplementation(async (_appId, messageId) => {
+      if (messageId === 'om_card') throw expiredError();
+    });
+    if (stage === 'unpin') vi.mocked(f.transport.unpinMessage).mockResolvedValueOnce(false);
+    else vi.mocked(f.transport.sendCard).mockRejectedValueOnce(new Error('send failed'));
     for (let i = 0; i < PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST; i += 1) await f.sync.sync();
-    expect(f.updates()).toBe(PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST);
-    expect(f.deps.onDeferred).toHaveBeenCalledTimes(PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST + 1);
-    expect(f.deps.onDeferred).toHaveBeenLastCalledWith(f.context.chatId, sendError);
     expect(f.deps.repostExpiredCard).toHaveBeenCalledTimes(1);
+    expect(readProjectGroup(f.dataDir, f.context.chatId)?.card).toMatchObject({
+      messageId: 'om_card', pinned: stage === 'unpin',
+    });
+
+    const callsBeforeRetry = vi.mocked(f.transport.sendCard).mock.calls.length;
+    vi.setSystemTime(Date.now() + 9 * 60_000);
+    await f.sync.sync();
+    expect(f.deps.repostExpiredCard).toHaveBeenCalledTimes(1);
+    vi.setSystemTime(Date.now() + 60_000);
+    await f.sync.sync();
+    expect(f.deps.repostExpiredCard).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(f.transport.sendCard).mock.calls.length).toBeGreaterThan(callsBeforeRetry);
+    expect(readProjectGroup(f.dataDir, f.context.chatId)?.card).toMatchObject({ messageId: 'om_card_2', pinned: true });
+
+    for (let i = 0; i < 5; i += 1) await f.sync.sync();
+    expect(f.deps.repostExpiredCard).toHaveBeenCalledTimes(2);
+    expect(f.transport.sendCard).toHaveBeenCalledTimes(stage === 'unpin' ? 2 : 3);
+  });
+
+  it.each([
+    { restart: false, changed: false },
+    { restart: true, changed: false },
+    { restart: false, changed: true },
+  ])('send 成功但新 ID 写库失败后同一旧卡去重并收敛内容（重建=$restart，内容变化=$changed）', async ({ restart, changed }) => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const f = await fixture();
+    vi.mocked(f.transport.updateCard).mockImplementation(async (_appId, messageId) => {
+      if (messageId === 'om_card') throw expiredError();
+    });
+    const storePath = join(f.dataDir, 'project-groups.json');
+    const remoteIds = new Map<string, string>();
+    const sendUuids: Array<string | undefined> = [];
+    let replacements = 0;
+    let restoreStore: (() => void) | undefined;
+    vi.mocked(f.transport.sendCard).mockClear();
+    vi.mocked(f.transport.sendCard).mockImplementation(async (_appId, _chatId, _cardJson, uuid) => {
+      sendUuids.push(uuid);
+      if (uuid && remoteIds.has(uuid)) return remoteIds.get(uuid)!;
+      const messageId = `om_replacement_${++replacements}`;
+      if (uuid) remoteIds.set(uuid, messageId);
+      if (!restoreStore) {
+        const saved = readFileSync(storePath, 'utf8');
+        rmSync(storePath, { force: true });
+        mkdirSync(storePath);
+        restoreStore = () => {
+          rmSync(storePath, { recursive: true, force: true });
+          writeFileSync(storePath, saved, { mode: 0o600 });
+        };
+      }
+      return messageId;
+    });
+    for (let i = 0; i < PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST; i += 1) await f.sync.sync();
+    expect(restoreStore).toBeDefined();
+    restoreStore!();
     expect(readProjectGroup(f.dataDir, f.context.chatId)?.card).toMatchObject({ messageId: 'om_card', pinned: false });
 
+    if (changed) f.setRuntime({ ownerDisplayNames: { cli_worker: 'BotBeta' } });
+    const sync = restart ? createProjectCardRuntimeSync(f.deps) : f.sync;
     vi.setSystemTime(Date.now() + 11 * 60_000);
-    for (let i = 0; i < 5; i += 1) await f.sync.sync();
-    expect(f.updates()).toBe(PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST);
+    const attempts = restart || changed ? PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST : 1;
+    for (let i = 0; i < attempts; i += 1) await sync.sync();
+    expect(replacements).toBe(1);
+    expect(sendUuids).toHaveLength(2);
+    expect(sendUuids[0]).toBe(sendUuids[1]);
+    expect(sendUuids[0]?.length).toBeLessThanOrEqual(50);
     expect(f.transport.sendCard).toHaveBeenCalledTimes(2);
-
-    f.setRuntime({ ownerDisplayNames: { cli_worker: 'BotBeta' } });
-    vi.mocked(f.transport.updateCard).mockResolvedValueOnce(undefined);
-    await f.sync.sync();
-    f.setRuntime({ ownerDisplayNames: { cli_worker: 'BotAlpha' } });
-    for (let i = 0; i < 5; i += 1) await f.sync.sync();
-    expect(f.updates()).toBe(2 * PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST + 1);
-    expect(f.transport.sendCard).toHaveBeenCalledTimes(2);
-    expect(f.deps.repostExpiredCard).toHaveBeenCalledTimes(1);
+    if (changed) {
+      const latestUpdate = vi.mocked(f.transport.updateCard).mock.calls.at(-1);
+      expect(latestUpdate?.[1]).toBe('om_replacement_1');
+      expect(latestUpdate?.[2]).toContain('BotBeta');
+    }
+    expect(readProjectGroup(f.dataDir, f.context.chatId)?.card).toMatchObject({
+      messageId: 'om_replacement_1', pinned: true,
+    });
   });
 
   it('非过期错误耗尽预算后停手，不重发', async () => {
@@ -388,7 +450,7 @@ describe('project card runtime sync', () => {
     for (let i = 0; i < PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST - 1; i += 1) await f.sync.sync();
     expect(f.transport.sendCard).toHaveBeenCalledTimes(1);
     await f.sync.sync();
-    expect(f.transport.sendCard).toHaveBeenLastCalledWith('cli_main', 'oc_group', expect.stringContaining('BotBeta'));
+    expect(f.transport.sendCard).toHaveBeenLastCalledWith('cli_main', 'oc_group', expect.stringContaining('BotBeta'), expect.any(String));
     f.setRuntime(alpha);
     await f.sync.sync();
     expect(f.transport.updateCard).toHaveBeenLastCalledWith('cli_main', 'om_card_2', expect.stringContaining('BotAlpha'));
@@ -476,7 +538,9 @@ describe('project card runtime sync', () => {
 
   it('命令在后台预算耗尽时已换卡，排队的重发不替换新卡', async () => {
     const f = await fixture();
-    vi.mocked(f.transport.updateCard).mockRejectedValue(expiredError());
+    vi.mocked(f.transport.updateCard).mockImplementation(async (_appId, messageId) => {
+      if (messageId === 'om_card') throw expiredError();
+    });
     for (let i = 0; i < PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST - 1; i += 1) await f.sync.sync();
 
     const updating = gate();

@@ -8,7 +8,7 @@ const APP_ID_OWNER_RE = /^cli_[A-Za-z0-9_-]{1,128}$/u;
 
 /**
  * 同一份卡片摘要最多连续刷新 3 次，约覆盖 1.5 分钟的瞬时故障。预算耗尽后停止 PATCH。
- * 窗口内出现过飞书编辑过期（230031）才允许后台重发，每个摘要一次、每群间隔至少 10 分钟。
+ * 窗口内出现过飞书编辑过期（230031）才允许后台重发；成功重发每摘要一次，失败按每群 10 分钟冷却重试。
  */
 export const PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST = 3;
 const PROJECT_CARD_REPOST_COOLDOWN_MS = 10 * 60_000;
@@ -68,26 +68,29 @@ export function createProjectCardRuntimeSync(deps: ProjectCardRuntimeSyncDeps): 
     const { digest } = target;
     const previous = reposts.get(chatId);
     if (previous && Date.now() < previous.cooldownUntil) return;
-    // The digest includes the monotonically increasing project revision. Keep
-    // attempts across runtime changes at this revision, not old revisions.
+    // Successful reposts are deduplicated by digest. Failures share only the
+    // per-chat cooldown so the same stable-UUID send can be retried later.
     const digests = previous?.revision === project.revision ? previous.digests : new Set<string>();
     if (digests.has(digest)) return;
     function rememberAttempt(): void {
-      digests.add(digest);
       reposts.set(chatId, {
         revision: project.revision, cooldownUntil: Date.now() + PROJECT_CARD_REPOST_COOLDOWN_MS, digests,
       });
     }
+    function rememberSuccess(): void {
+      digests.add(digest);
+      rememberAttempt();
+    }
     try {
       const updated = await deps.repostExpiredCard(project, target);
       if (updated) {
-        rememberAttempt();
+        rememberSuccess();
         rememberPublication(updated);
       }
     } catch (error) {
       rememberAttempt();
       states.set(chatId, {
-        ...target, status: 'failed', failures: PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST + 1, sawExpired: true,
+        ...target, status: 'failed', failures: PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST, sawExpired: true,
       });
       deps.onDeferred?.(chatId, error);
     }
