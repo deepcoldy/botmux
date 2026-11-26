@@ -231,9 +231,9 @@ export function traexRestoredComposerReady(
   while (composer >= 0 && !PROMPT_ROW.test(rows[composer]!)) composer--;
   if (composer < 0 || !TRAEX_EMPTY_COMPOSER_HINTS.has(rows[composer]!.slice(1).trim())) return false;
   const footer = rows.slice(composer + 1).filter(row => row.trim());
-  // TraeX 0.209–0.211: optional bottom rule, initialized model/context row,
-  // then the access/shortcut row. Extra rows can be a draft, picker or dialog.
-  const hasBottomRule = /^[ \t]*─+[ \t]*$/.test(footer[0] ?? '');
+  // The optional bottom rule can be a line or a solid row of upper half-blocks.
+  // The solid rule starts at column zero; wrapped draft rows are indented.
+  const hasBottomRule = /^(?:[ \t]*─+|▀{3,})[ \t]*$/.test(footer[0] ?? '');
   if (hasBottomRule) footer.shift();
   if (footer.length < 1 || footer.length > 2) return false;
   // An owned native idle/done proves initialization even when a newer CLI
