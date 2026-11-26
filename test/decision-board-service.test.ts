@@ -7,7 +7,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DecisionBoardService, boardErrorStatus, type DecisionBoardServiceDeps } from '../src/core/decision-board/service.js';
-import type { StewardConfig } from '../src/core/decision-board/model.js';
+import {
+  formatBatchEcho,
+  formatBatchEchoCard,
+  splitEchoText,
+  type BatchMessageEntry,
+  type StewardConfig,
+} from '../src/core/decision-board/model.js';
 import type { ChatLookupResult } from '../src/core/decision-board/chat-lookup.js';
 import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 import { decisionBoardDbPath } from '../src/services/decision-board-store.js';
@@ -22,6 +28,8 @@ let delivered: Array<Parameters<DecisionBoardServiceDeps['deliver']>[0]>;
 let deliverImpl: DecisionBoardServiceDeps['deliver'];
 /** 假的查群：默认每个群都查得到，群名 = 「群名-<chatId>」；用例里按需改。 */
 let lookupImpl: (chatId: string) => Promise<ChatLookupResult>;
+let bannerImpl: DecisionBoardServiceDeps['banner'];
+let dashboardOrigin: string | undefined;
 let lookups: string[];
 /** 每次查群收到的截止时间（一条命令里几个群共用一份）。 */
 let deadlines: number[];
@@ -36,18 +44,20 @@ beforeEach(() => {
   lookups = [];
   deadlines = [];
   lookupImpl = async chatId => ({ ok: true, chatId, appId: APP, name: `群名-${chatId}` });
+  bannerImpl = ({ batchId, count }) => `收到 ${count} 项（#${batchId}）`;
+  dashboardOrigin = 'https://dash.example';
   service = new DecisionBoardService({
     dataDir: dir,
     larkAppId: () => APP,
     steward: () => steward,
     locale: () => locale,
     brand: () => 'feishu',
-    dashboardOrigin: () => 'https://dash.example',
+    dashboardOrigin: () => dashboardOrigin,
     ownerOpenId: () => 'ou_owner',
     ownerName: async () => '主人',
     timeZone: () => 'UTC',
     batchAttachmentsDir: batchId => join(dir, 'attachments', `board-${batchId}`),
-    banner: ({ batchId, count }) => `收到 ${count} 项（#${batchId}）`,
+    banner: input => bannerImpl(input),
     deliver: input => deliverImpl(input),
     log: () => {},
     lookupChat: (chatId, opts) => { lookups.push(chatId); deadlines.push(opts.deadline); return lookupImpl(chatId); },
@@ -649,6 +659,13 @@ describe('提交与投递', () => {
       '收到 2 项（#1）\n\n#1 a（待拍板）\n选：A 合\n说明：\n合吧\n附图：1 张（见下方图片）\n\n#2 b（待拍板）\n选：未选\n说明：\n先别动',
     ]);
     expect(msg.announcement.texts.join('')).not.toContain('botmux board');
+    const card = JSON.parse(msg.announcement.card!);
+    const cardText = card.body.elements[0].content as string;
+    expect(card.schema).toBe('2.0');
+    expect(cardText).toContain('[#1 a](https://applink.feishu.cn/');
+    expect(cardText).toContain('[#2 b](https://applink.feishu.cn/');
+    expect(cardText).not.toMatch(/ https:\/\/applink\.feishu\.cn\//);
+    // 卡片只改群内展示；上面的原 prompt 逐项断言保持不动。
     expect(msg.announcement.images.map(i => i.path)).toEqual(msg.attachments.map(i => i.path));
     expect(msg.attachments).toHaveLength(1);
     expect(readFileSync(msg.attachments[0].path).toString('base64')).toBe(PNG_B64);
@@ -664,11 +681,52 @@ describe('提交与投递', () => {
     const d = service.putDraft(a.seq, 'owner', { choice: 'B', text: longText, baseRev: a.rev }).draft!;
     await service.submit({ author: 'owner', nonce: 'long', items: [{ seq: a.seq, draftUpdatedAt: d.updatedAt }] });
     const { texts } = delivered[0].announcement;
+    expect(delivered[0].announcement.card).toBeUndefined();
     expect(texts.length).toBeGreaterThan(1);
     for (const t of texts) expect(Buffer.byteLength(t, 'utf8')).toBeLessThanOrEqual(30 * 1024);
     const whole = texts.join('');
     expect(whole).toBe(`收到 1 项（#1）\n\n#1 长说明（待拍板）\n选：B 不合\n说明：\n${longText}`);
     expect(delivered[0].prompt).toContain(`说明：\n${longText}`);
+  });
+
+  it('纯文本已拆条时即使完整卡片能放下也不出卡，避免与后续段落重复', async () => {
+    // 卡片会把标题内部空白压成一行，纯文本则保留：两边测量的不是同一份字节数。
+    // 没有 Dashboard origin 时事项不带链接，正是这个反例需要的合法生产形状。
+    dashboardOrigin = undefined;
+    const title = `x${' '.repeat(198)}y`;
+    const entries: BatchMessageEntry[] = [];
+    const submitted: Array<{ seq: number; draftUpdatedAt: string }> = [];
+    for (let i = 0; i < 160; i++) {
+      const item = await addDecideItem(title);
+      const draft = service.putDraft(item.seq, 'owner', { choice: 'A', text: '', baseRev: item.rev }).draft!;
+      entries.push({ seq: item.seq, title, state: 'decide', choice: 'A', choiceLabel: '合', text: '', fileCount: 0 });
+      submitted.push({ seq: item.seq, draftUpdatedAt: draft.updatedAt });
+    }
+    const echo = { header: '收到 160 项（#1）', entries, locale: 'zh' as const };
+    const expectedTexts = splitEchoText(formatBatchEcho(echo));
+    expect(expectedTexts.length).toBeGreaterThan(1);
+    expect(formatBatchEchoCard(echo)).toBeDefined();
+
+    await service.submit({ author: 'owner', nonce: 'split-card-gate', items: submitted });
+
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]!.announcement.texts).toEqual(expectedTexts);
+    expect(delivered[0]!.announcement.card).toBeUndefined();
+  });
+
+  it('公告构造抛错也落 failed 并可重投，不留 dispatched 死行', async () => {
+    const a = await addDecideItem();
+    const d = service.putDraft(a.seq, 'owner', { choice: 'A', baseRev: a.rev }).draft!;
+    bannerImpl = () => { throw new Error('banner render failed'); };
+    const res = await service.submit({ author: 'owner', nonce: 'banner-error', items: [{ seq: a.seq, draftUpdatedAt: d.updatedAt }] });
+    expect(res.batch).toMatchObject({ delivery: 'failed', error: 'banner render failed' });
+    expect(service.store().getBatch(APP, res.batch.id)).toMatchObject({ delivery: 'failed', error: 'banner render failed' });
+    expect(delivered).toHaveLength(0);
+
+    bannerImpl = ({ batchId, count }) => `收到 ${count} 项（#${batchId}）`;
+    const retry = await service.redeliver(res.batch.id);
+    expect(retry.batch.delivery).toBe('delivered');
+    expect(delivered).toHaveLength(1);
   });
 
   it('管家没选群：批次落库但标为失败，补上群后重投成功', async () => {

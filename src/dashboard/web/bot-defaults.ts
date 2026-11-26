@@ -62,7 +62,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
       'botDefaults.runtimeId', 'botDefaults.runtimeExecutable', 'botDefaults.runtimePackageName',
       'botDefaults.dshProfileTitle', 'botDefaults.dshRuntimeTitle', 'botDefaults.sectionRiff',
       'botDefaults.riffModel', 'botDefaults.riffReasoningEffort',
-      'botDefaults.riffSandboxCluster', 'botDefaults.riffJwtEnv',
+      'botDefaults.riffSandboxCluster', 'botDefaults.riffAgent', 'botDefaults.riffJwtEnv',
       'botDefaults.autoModelTitle', 'botDefaults.autoModelPreflightLoadCheck',
       'botDefaults.autoModelOverloadThreshold', 'botDefaults.autoModelPreflightTimeout',
       'botDefaults.autoModelReselectPerTurn',
@@ -250,7 +250,6 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     tile: 'codex-app-display',
     fieldKeys: ['botDefaults.cliProgressNotify'],
   },
-  { id: 'envelope-injection', tab: 'advanced', titleKey: 'botDefaults.envelopeInjection', fieldKeys: ['botDefaults.envelopeInjectionAuto'] },
   { id: 'prompt-injection', tab: 'advanced', titleKey: 'botDefaults.promptInjection', fieldKeys: ['botDefaults.promptInjectionToggle'] },
   { id: 'reply-delivery', tab: 'advanced', titleKey: 'botDefaults.replyDelivery', tile: 'prompt-injection', fieldKeys: ['botDefaults.replyDeliveryTranscript'] },
   { id: 'sender-tag', tab: 'advanced', titleKey: 'botDefaults.senderTag', fieldKeys: ['botDefaults.senderTagInject', 'botDefaults.senderTagHideEmail'] },
@@ -597,8 +596,6 @@ export type BotDefaultsRow = {
   summaryMemory?: boolean;
   summaryMemoryPath?: string;
   p2pMode?: string;
-  /** #794: per-turn 上下文注入方式。'auto' = 支持的 CLI 走 hook 注入；缺省/'off' = 内联。 */
-  envelopeInjection?: 'auto' | 'off' | null;
   /** 最终回复投递方式的**生效值**（显式配置，否则按 CLI 缺省）。'transcript' = daemon
    *  从 CLI 转写自动取最终回复，模型不再被要求 botmux send；'send' = 模型自己 botmux send。 */
   topicUnavailablePolicy?: 'legacy' | 'stop';

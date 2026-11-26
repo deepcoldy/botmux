@@ -8,6 +8,21 @@ import { flushFakeTimers } from './helpers/flush-fake-timers.js';
 
 const SID = '019dd80d-d922-7a11-8339-0208d8c5b4ee';
 const MESSAGE = 'Inspect the pending change\nand run its tests.';
+// Native composer hints embedded in codex-cli 0.146.1. They are display-only
+// ghost text, not user drafts, and are external terminal protocol fixtures.
+const CODEX_0146_PLACEHOLDERS = [
+  'Explain this codebase',
+  'Summarize recent commits',
+  'Implement {feature}',
+  'Find and fix a bug in @filename',
+  'Write tests for @filename',
+  'Improve documentation in @filename',
+  'Run /review on my current changes',
+  'Use /skills to list available skills',
+  'Check recently modified functions for compatibility',
+  'How many files have been modified?',
+  'Will this algorithm scale well?',
+] as const;
 const OVERLAY = '/ T R A N S C R I P T / / / / / / / / / /\nPrevious conversation\n──────────────────── 100% ─\n↑/↓ to scroll   PgUp/PgDn to page   Home/End to jump\nq to quit   esc to edit prev\n';
 const PREVIEW = OVERLAY.replace('esc to edit prev', 'esc/← to edit prev   → to edit next   enter to edit message');
 const OVERLAY_MODERN = OVERLAY.replace('q to quit   esc to edit prev', 'q close · f3 find · esc browse prompts');
@@ -31,7 +46,7 @@ afterEach(() => {
 function terminal(initial = OVERLAY, options: {
   closeDelay?: number; receiptDelay?: number; hiddenDraft?: string; close?: boolean;
   closeResult?: 'false' | 'throw'; enterResult?: 'false' | 'throw';
-  redrawFrames?: number; startupFrames?: number;
+  redrawFrames?: number; startupFrames?: number; placeholder?: string;
 } = {}) {
   let overlay: string | undefined = initial || undefined;
   let draft = options.hiddenDraft ?? '';
@@ -79,7 +94,7 @@ function terminal(initial = OVERLAY, options: {
         return { viewport: 'Previous conversation\n› mid-redraw residual glyphs\n\n  model · /tmp · Ready\n', cursor: { x: 27, y: 1 } };
       }
       const lines = draft.split('\n');
-      return { viewport: `Previous conversation\n› ${(draft || 'Ask Codex to do anything').replace(/\n/g, '\n  ')}\n  model · /tmp · Ready\n  ? for shortcuts\n`, cursor: { x: 2 + lines.at(-1)!.length, y: lines.length } };
+      return { viewport: `Previous conversation\n› ${(draft || options.placeholder || 'Ask Codex to do anything').replace(/\n/g, '\n  ')}\n  model · /tmp · Ready\n  ? for shortcuts\n`, cursor: { x: 2 + lines.at(-1)!.length, y: lines.length } };
     }),
   };
   return { target, executed, rewinds: () => rewinds, receipt,
@@ -164,6 +179,13 @@ describe('Codex transcript submission boundary', () => {
     expect(t.target.write).toHaveBeenCalledExactlyOnceWith('q');
     expect(t.target.submitBracketedPaste).not.toHaveBeenCalled();
     expect(t.target.sendSpecialKeys).not.toHaveBeenCalled();
+  });
+
+  it.each(CODEX_0146_PLACEHOLDERS)('delivers through the native 0.146.1 composer hint: %s', async placeholder => {
+    const t = terminal('', { placeholder });
+    expect(await submit(t.target)).toMatchObject({ submitted: true, cliSessionId: SID, ownershipProven: true });
+    expect(t.executed).toEqual([MESSAGE]);
+    expect(t.target.submitBracketedPaste).toHaveBeenCalledExactlyOnceWith(MESSAGE);
   });
 
   it('rejects an ordinary draft immediately without waiting for it to clear', async () => {

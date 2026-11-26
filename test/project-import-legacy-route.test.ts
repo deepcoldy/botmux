@@ -167,11 +167,14 @@ describe('legacy /project cannot bypass imported workstream authority', () => {
   });
 
   it('accepts an exact host-signed imported report through the actual coordinator mutation', async () => {
+    const cardWrites = transport.updateCard.mock.calls.length;
     expect(await post({
       action: 'report', dispatchRoot: ROOT, status: 'completed', content: '已验证结果',
       expectedAttachment: expectedAttachment(),
-    }, true)).toMatchObject({ status: 200, body: { ok: true } });
+      cardPublication: 'repost',
+    }, true)).toMatchObject({ status: 200, body: { ok: true, project: { card: { refreshPending: true } } } });
     expect(run).toHaveBeenCalledTimes(1);
+    expect(transport.updateCard).toHaveBeenCalledTimes(cardWrites);
     expect(item()).toMatchObject({ title: '原始迁入任务', status: 'completed', lastReport: '已验证结果' });
   });
 

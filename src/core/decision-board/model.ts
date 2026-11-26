@@ -9,6 +9,7 @@
  */
 import type { Locale } from '../../i18n/types.js';
 import { chatAppLink, larkHosts, type Brand } from '../../im/lark/lark-hosts.js';
+import { compactNoticeCard, escapeNoticeMarkdown, noticeItemLink, noticeMarkdownLink } from './notice-card.js';
 
 export const BOARD_STATES = ['decide', 'accept', 'active', 'waiting', 'done', 'closed'] as const;
 export type BoardState = typeof BOARD_STATES[number];
@@ -856,6 +857,8 @@ export interface BatchMessageEntry {
   fileCount: number;
   /** 这一项的主群：管家群里的回显和批次消息都带上，点了直接进群。 */
   primaryChat?: { text: string; url: string };
+  /** 看板详情地址：只用于群内卡片的事项标题链接，不进管家 prompt。 */
+  link?: string;
   /** 在管家群的拍板卡片上点的、或本机外部客户端提交的（缺省 = 网页看板）。 */
   source?: BatchSource;
   /** 提交之后管家改过问题或选项：选项键可能已经换了意思，不附现在的选项原文。 */
@@ -893,6 +896,11 @@ function formatClock(ms: number, timeZone?: string): string {
   }
 }
 
+function formatBatchEntryTitle(e: BatchMessageEntry, locale: Locale): string {
+  const stateLabel = BOARD_STATE_LABELS[locale === 'en' ? 'en' : 'zh'][e.state];
+  return `#${e.seq} ${e.title}（${stateLabel}${e.stage ? `·${e.stage}` : ''}）`;
+}
+
 /**
  * 一批决定里逐项的那部分：编号、标题、状态、主群链接、选的选项（键 + 选项原文）、说明原文、附图数。
  * 管家会话里的批次消息和管家群里的回显共用这一份，两边对 owner 写了什么的呈现逐字一致。
@@ -906,8 +914,7 @@ export function formatBatchEntries(
 ): string {
   const zh = locale !== 'en';
   const blocks = entries.map(e => {
-    const stateLabel = BOARD_STATE_LABELS[zh ? 'zh' : 'en'][e.state];
-    const lines = [`#${e.seq} ${e.title}（${stateLabel}${e.stage ? `·${e.stage}` : ''}）`];
+    const lines = [formatBatchEntryTitle(e, locale)];
     // 主群紧跟标题：说明原文可能多行，放在它后面会像说明的一部分。群名 / 标签压成一行，不能借换行伪造下一行。
     if (e.primaryChat) lines.push(`${zh ? '主群：' : 'Main chat: '}${e.primaryChat.text.replace(/\s+/g, ' ').trim()} ${e.primaryChat.url}`);
     if (e.choice) {
@@ -975,6 +982,38 @@ export function formatBatchMessage(input: BatchMessageInput): string {
  */
 export function formatBatchEcho(input: { header: string; entries: readonly BatchMessageEntry[]; locale: Locale }): string {
   return `${input.header}\n\n${formatBatchEntries(input.entries, input.locale, 'below')}`;
+}
+
+/**
+ * 群内卡片版回显。逐项内容仍由 {@link formatBatchEntries} 生成，只在转义后把标题 / 主群改成
+ * 可点击文案；因此选择、覆盖关系、说明原文与附图说明不会和纯文本降级分叉。
+ */
+export function formatBatchEchoCard(input: { header: string; entries: readonly BatchMessageEntry[]; locale: Locale }): string | undefined {
+  const zh = input.locale !== 'en';
+  const blocks = input.entries.map(e => {
+    const raw = formatBatchEntries([e], input.locale, 'below');
+    const plainTitle = `#${e.seq} ${e.title}`;
+    const header = formatBatchEntryTitle(e, input.locale);
+    if (!raw.startsWith(header) || !header.startsWith(plainTitle)) return escapeNoticeMarkdown(raw);
+    let rest = raw.slice(header.length);
+    // 标题、状态 / 阶段与后续内容分别转义；不用用户文本做 String.replace 的模式或替换串。
+    let out = `${noticeItemLink(e.seq, e.title, e.link)}${escapeNoticeMarkdown(raw.slice(plainTitle.length, header.length))}`;
+    if (e.primaryChat) {
+      const label = zh ? '主群：' : 'Main chat: ';
+      const text = e.primaryChat.text.replace(/\s+/g, ' ').trim();
+      const rawPrimary = `\n${label}${text} ${e.primaryChat.url}`;
+      // 主群恒在完整标题行之后；按这个位置切片，阶段 / 说明里伪造的同形文本不会被替换。
+      if (rest.startsWith(rawPrimary)) {
+        out += `\n${label}${noticeMarkdownLink(text, e.primaryChat.url)}`;
+        rest = rest.slice(rawPrimary.length);
+      }
+    }
+    return out + escapeNoticeMarkdown(rest);
+  });
+  return compactNoticeCard({
+    title: zh ? '决策看板 · 批次' : 'Decision board · batch',
+    lines: [`**${escapeNoticeMarkdown(input.header)}**\n\n${blocks.join('\n\n')}`],
+  });
 }
 
 /**

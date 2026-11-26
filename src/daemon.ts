@@ -1,3 +1,4 @@
+import { createdGroupWorkingDir } from './services/created-groups-store.js';
 import { configuredCliExecutionMode, delegatedCliExecutionAllowed } from './core/cli-execution-mode.js';
 import { resolveNativeScheduledControlActor } from './core/scheduled-control-actor.js';
 import { admitDelegatedSlashTurn, queuedOpeningHasTail, sessionDelegatedSlashCommands } from './core/remote-runner-slash.js';
@@ -55,6 +56,7 @@ import {
 } from './core/report-source-reply.js';
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
 import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './core/prompt-injection.js';
+import { plannedOpeningBackendType } from './core/opening-backend.js';
 import { stripDispatchCompletionProtocol } from './core/dispatch.js';
 import { withConfiguredBotOwner } from './core/bot-owner-attribution.js';
 import { readCanonicalBotActorOwnerBindings } from './core/bot-actor-owner-binding.js';
@@ -131,6 +133,7 @@ import { cotRecoveryMatches, settleCotMessageForShutdown, sweepOrphanCotMessages
 import { settleTurnReplyCards, sweepInterruptedReplyCards } from './core/turn-reply-card.js';
 import { resolveBrowserTargets, detectRunningBrowsers } from './core/browser-restart.js';
 import { countHostOverload } from './im/lark/card-handler.js';
+import { startOncallHandoffRecovery } from './im/lark/oncall-group.js';
 import { startOwnerGroupFollow } from './services/owner-group-follow-runtime.js';
 import { startMaintenance, stopMaintenance, globalInstallUpdateLockTarget } from './core/maintenance.js';
 import { createBotmuxUpdateNotifier, buildBotmuxUpdateNoticeCard } from './core/botmux-update-notify.js';
@@ -242,6 +245,7 @@ import {
 } from './services/durable-lark-session-control.js';
 import { failedTurnCaller, recordLimitedFailedTurn, clearLimitedFailedTurn, recordFailedTurnTerminal, noteFailedTurnRecoveryInput } from './core/failed-turn-recovery.js';
 import { startQuotaFallbackChainSwitch } from './core/quota-fallback-chain-switch.js';
+import { handleCodexCapacityRetry, settleCodexCapacityFallback } from './core/codex-capacity-fallback.js';
 import { isSilentScheduledTurn } from './core/silent-schedule-turns.js';
 import { isMessageListenerTaskAnchor, isSilentMessageListenerSession, messageListenerSendBlocked } from './core/message-listener-silence.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
@@ -642,7 +646,7 @@ import { initialDispatchLifecycle } from './core/dispatch-lifecycle.js';
 import { applyDispatchLaunchBinding, registerDispatchLaunchBinding } from './core/dispatch-launch-binding.js';
 import { projectCoordinator, resolveProjectGroupCardRuntime } from './services/project-coordinator-runtime.js';
 import { createProjectCardRuntimeSync } from './services/project-card-runtime-sync.js';
-import { listProjectGroups } from './services/project-group-store.js';
+import { listProjectGroups, type ProjectGroupState } from './services/project-group-store.js';
 import {
   addProjectWorkerIfNeeded,
   evaluateProjectDispatchPolicy,
@@ -6444,7 +6448,7 @@ function resolveForceTopicCurrentWorkingDir(ctx: {
   const current = validateExplicitForceTopicWorkingDir(currentSession?.workingDir, loc);
   if (current) return current;
 
-  const oncall = validateExplicitForceTopicWorkingDir(findOncallChat(ctx.larkAppId, ctx.chatId)?.workingDir, loc);
+  const oncall = validateExplicitForceTopicWorkingDir(findOncallChat(ctx.larkAppId, ctx.chatId)?.workingDir ?? createdGroupWorkingDir(ctx.chatId), loc);
   if (oncall) return oncall;
 
   const peers = ctx.scope === 'chat'
@@ -23599,6 +23603,15 @@ async function resolvePinnedWorkingDir(ctx: {
   }
   let oncallEntry = findOncallChat(ctx.larkAppId, ctx.chatId);
   if (!oncallEntry) {
+    const groupDir = createdGroupWorkingDir(ctx.chatId);
+    if (groupDir) {
+      return {
+        pinnedWorkingDir: groupDir,
+        oncallEntry: undefined,
+        inheritedFrom: null,
+        pinnedFromBotDefault: false,
+      };
+    }
     oncallEntry = await maybeAutoBindDefaultOncall(ctx.larkAppId, ctx.chatId, ctx.chatType);
   }
   // Resolve the bot default first so we know whether inheritance is only the
@@ -23882,10 +23895,11 @@ function buildReservedInitialInput(
       logger.warn('Failed to stage merged session input');
     }
   }
+  const openingCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId;
   const built = buildNewTopicCliInput(
     ds.pendingPrompt ?? '',
     ds.session.sessionId,
-    ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId,
+    openingCliId,
     ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? botCfg.cliPathOverride,
     ds.pendingAttachments,
     ds.pendingMentions,
@@ -23909,15 +23923,15 @@ function buildReservedInitialInput(
       // auto-start passes this via pendingChatContext).
       chatContext: ds.pendingChatContext,
       groupJoinContext: ds.pendingGroupJoinContext,
-      // #794 后续：opening 也走 hook 注入（sender/mentions 进 envelope，PTY 文本
-      // 只剩正文）。turnId 必须与 forkReservedInitialSession 传给 forkWorker 的
+      // #794 后续：opening 也走 hook 注入（sender/mentions/availableBots 进 envelope，
+      // PTY 文本只剩正文）。turnId 必须与 forkReservedInitialSession 传给 forkWorker 的
       // 权威 turnId 一致（= 最终 managedTurnOrigin.turnId），sidecar 才能被 claim。
       // raw 命令冷启动（pendingRawInput）的 buffered follow-up 走 raw_input IPC
       // 延迟发送，turnId 权威流不同，暂不启用 hook，保持 inline。
       turnId: ds.pendingRawInput
         ? undefined
         : (ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId),
-      sessionBackendType: ds.session.backendType,
+      sessionBackendType: plannedOpeningBackendType(ds, openingCliId, botCfg),
       promptInjection: sessionPromptInjection(ds),
       linkRefMode: ds.pendingLinkRefMode,
       // Reserved initial admission is the fresh launch owned by this session.
@@ -33047,7 +33061,7 @@ async function handleThreadReplyAdmitted(
             // sendWorkerInput 的权威 turnId（parsed.messageId）一致，sidecar 可被 claim。
             turnId: parsed.messageId,
             linkRefSourceType: parsed.msgType === 'interactive' ? 'card' : 'user_message',
-            sessionBackendType: ds.session.backendType,
+            sessionBackendType: ds.initConfig?.backendType ?? ds.session.backendType,
             // This opening is being delivered to an already-running worker.
             // Preserve the identity mode that worker was actually launched
             // with; legacy empty-start sessions can reach this path after a
@@ -33488,10 +33502,11 @@ async function handleThreadReplyAdmitted(
     // opening 的 hook 会领到这份从没发出去的 speculative reminder → 双注入。
     let wrappedInput: CliTurnPayload;
     if (openingTurn) {
+      const openingCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? dsBotCfgForFork.cliId;
       wrappedInput = buildNewTopicCliInput(
         reforkContent,
         ds.session.sessionId,
-        ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? dsBotCfgForFork.cliId,
+        openingCliId,
         ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? dsBotCfgForFork.cliPathOverride,
         attachments,
         parsed.mentions,
@@ -33516,7 +33531,12 @@ async function handleThreadReplyAdmitted(
           // queued dashboard 场景的 turnId 是合成的，权威流不同，保持 inline。
           turnId: queuedHasDurableTail ? undefined : parsed.messageId,
           linkRefSourceType: parsed.msgType === 'interactive' ? 'card' : 'user_message',
-          sessionBackendType: ds.session.backendType,
+          sessionBackendType: plannedOpeningBackendType(
+            { initConfig: undefined, session: ds.session },
+            openingCliId,
+            dsBotCfgForFork,
+          ),
+          freshColdOpening: !openingResume,
           larkToolResume: openingResume,
           promptInjection: sessionPromptInjection(ds),
         },
@@ -36258,6 +36278,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     getActiveCount,
     prepareRawInputTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
     startQuotaFallbackChainSwitch,
+    onCodexCapacityRetry: handleCodexCapacityRetry,
+    onCodexCapacitySettle: settleCodexCapacityFallback,
     loadScheduledTaskForIdentity: (appId, taskId) =>
       readScheduledTaskFromAuthority(scheduleAuthorityStore, appId, taskId),
     loadScheduledTaskForInput: (appId, taskId) => {
@@ -36817,12 +36839,23 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         const dispatchTrustedCaller = trustedCallerForTurn(
           cfg.larkAppId, sourceOpenId, operation.callerUnionId, true,
         );
+        const liveBot = getBot(cfg.larkAppId);
+        const liveCfg = liveBot.config;
+        const dispatchCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? liveCfg.cliId;
+        const dispatchCliPathOverride = ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? liveCfg.cliPathOverride;
         const input = buildNewTopicCliInput(
-          prompt, sessionId, cfg.cliId, cfg.cliPathOverride, undefined, undefined,
+          prompt, sessionId, dispatchCliId, dispatchCliPathOverride, undefined, undefined,
           await getAvailableBots(cfg.larkAppId, operation.chatId),
-          undefined, { name: getBot(cfg.larkAppId).botName, openId: getBot(cfg.larkAppId).botOpenId },
+          undefined, { name: liveBot.botName, openId: liveBot.botOpenId },
           localeForBot(cfg.larkAppId), sender,
-          { larkAppId: cfg.larkAppId, chatId: operation.chatId, trustedCaller: dispatchTrustedCaller },
+          {
+            larkAppId: cfg.larkAppId,
+            chatId: operation.chatId,
+            trustedCaller: dispatchTrustedCaller,
+            promptInjection: sessionPromptInjection(ds),
+            turnId: operation.sourceTurnId,
+            sessionBackendType: plannedOpeningBackendType(ds, dispatchCliId, liveCfg),
+          },
         );
         if (!forkWorker(ds, input, { turnId: operation.sourceTurnId, trustedCaller: input.trustedCaller })) {
           throw new Error('dispatch launch worker fork was rejected');
@@ -38222,23 +38255,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // dataDir 上的遗留订阅会让「无飞书连接」的 bot 每 5 秒主动打飞书。
   const ownerGroupFollower = cfg.apiOnly ? undefined : startOwnerGroupFollow(cfg.larkAppId, config.session.dataDir);
   let docCommentPollTimer: ReturnType<typeof setInterval> | undefined;
-  let oncallHandoffTimer: ReturnType<typeof setInterval> | undefined;
-  let oncallHandoffRunning = false;
-  let oncallHandoffStopped = false;
-  if (!cfg.apiOnly) {
-    const reconcileOncall = async () => {
-      // Existing group invitations remain usable after new handoffs are disabled.
-      // The reconciler checks the live policy before forwarding conversations.
-      if (oncallHandoffRunning || oncallHandoffStopped) return;
-      oncallHandoffRunning = true;
-      try { await (await import('./im/lark/oncall-group.js')).retryPendingOncallHandoffs(cfg.larkAppId, () => !oncallHandoffStopped); }
-      catch { logger.warn('[oncall-group] Handoff recovery failed; retry remains scheduled'); }
-      finally { oncallHandoffRunning = false; }
-    };
-    oncallHandoffTimer = setInterval(() => { void reconcileOncall(); }, 5_000);
-    oncallHandoffTimer.unref?.();
-    void reconcileOncall();
-  }
+  const stopOncallHandoffRecovery = cfg.apiOnly ? undefined : startOncallHandoffRecovery(cfg.larkAppId);
   if (!cfg.apiOnly) {
     // 文档订阅恢复：重启后订阅可能已失效，给仍活跃的会话重订阅；会话没恢复
     // （已关/丢失）的订阅则退订 + 清表，避免「命中订阅但无会话」的孤儿。
@@ -38650,6 +38667,18 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             iso => new Date(iso).toLocaleString('zh-CN', { timeZone: scheduleTimeZone() }),
           );
           const runPrompt = [additionalPrompt, untilDonePrompt].filter(Boolean).join('\n\n') || undefined;
+          const assertExecutionCurrent = async (targetTask: typeof task, turnId: string) => {
+            // Re-read after preconditions/admission waits. A human can
+            // pause, revoke or edit while those awaits are outstanding.
+            const current = scheduleAuthorityStore?.getRecord(effectiveAppId, targetTask.id);
+            if (!current || (current.state !== 'active'
+              && !(current.state === 'paused'
+                && scheduler.admitManualRunTurn(targetTask.id, executionContext.runId, turnId, effectiveAppId)))) {
+              throw new Error('schedule authority changed before turn admission');
+            }
+            assertScheduledAuthorityCurrent(authority, current, { runId: executionContext.runId });
+            return current;
+          };
           try {
             const results = await executeScheduledTaskForTargets(
               task,
@@ -38662,16 +38691,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                   refreshCliVersion,
                   runPrompt,
                   {
+                    assertExecutionCurrent: async (targetTask, turnId) => { await assertExecutionCurrent(targetTask, turnId); },
                     prepareTurnIdentity: async (session, turnId) => {
-                      // Re-read after preconditions/admission waits. A human can
-                      // pause, revoke or edit while those awaits are outstanding.
-                      const current = scheduleAuthorityStore?.getRecord(effectiveAppId, task.id);
-                      if (!current || (current.state !== 'active'
-                        && !(current.state === 'paused'
-                          && scheduler.admitManualRunTurn(task.id, executionContext.runId, turnId, effectiveAppId)))) {
-                        throw new Error('schedule authority changed before turn admission');
-                      }
-                      assertScheduledAuthorityCurrent(authority, current, { runId: executionContext.runId });
+                      const current = await assertExecutionCurrent(task, turnId);
                       await prepareTurnCliIdentity(session, turnId);
                       const prepared = scheduleAuthorityStore?.getRecord(effectiveAppId, task.id);
                       assertScheduledAuthorityCurrent(current, prepared, { runId: executionContext.runId, turnId });
@@ -38845,17 +38867,21 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       try { sessionStore.updateSession(live.session); } catch { live.session.projectImportPending = true; }
     },
   });
+  const projectCardContext = (project: ProjectGroupState) => ({
+    dataDir: config.session.dataDir,
+    chatId: project.chatId,
+    larkAppId: cfg.larkAppId,
+    coordinatorSessionId: project.coordinatorSessionId,
+  });
   const projectCardRuntimeSync = createProjectCardRuntimeSync({
     larkAppId: cfg.larkAppId,
     listProjects: () => listProjectGroups(config.session.dataDir),
     readMode: chatId => readGroupCollaborationMode(config.session.dataDir, chatId),
     resolveRuntime: project => resolveProjectGroupCardRuntime(project, config.session.dataDir),
-    refresh: project => projectCoordinator.run({
-      dataDir: config.session.dataDir,
-      chatId: project.chatId,
-      larkAppId: cfg.larkAppId,
-      coordinatorSessionId: project.coordinatorSessionId,
-    }, { action: 'refresh' }),
+    refresh: (project, target) => projectCoordinator.refreshCard(projectCardContext(project), target),
+    isMessageUpdateExpired: error => error instanceof MessageUpdateExpiredError,
+    repostExpiredCard: (project, target) => projectCoordinator.repostExpiredCard(projectCardContext(project), target),
+    retryPendingCardPin: (project, messageId) => projectCoordinator.retryPendingCardPin(projectCardContext(project), messageId),
     forwardToCoordinator: (coordinatorAppId, chatId) => {
       const peer = findOnlineDaemon(coordinatorAppId, config.session.dataDir);
       if (!peer) return;
@@ -38880,8 +38906,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     void getProjectAttachmentSource(event.larkAppId, event.sessionId)
       .then(async source => {
         if (!source) return;
-        await projectWorkstreamAttachments.observe(source);
-        projectCardRuntimeSync.notify(source.chatId);
+        const projectChats = await projectWorkstreamAttachments.observe(source);
+        for (const chatId of new Set([source.chatId, ...projectChats])) projectCardRuntimeSync.notify(chatId);
       })
       .catch(() => logger.debug('[project] association projection pending; refresh can repair'));
     if (findActiveBySessionId(event.sessionId)?.session.projectImportPending) {
@@ -39424,8 +39450,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(maintenanceHeartbeat);
     ownerGroupFollower?.stop();
     clearInterval(docCommentPollTimer);
-    oncallHandoffStopped = true;
-    clearInterval(oncallHandoffTimer);
+    stopOncallHandoffRecovery?.();
     for (const session of vcMeetingSessions.values()) cleanupVcMeetingDaemonSession(session, 'daemon-shutdown');
     vcMeetingSessions.clear();
     for (const closing of vcMeetingClosingConsumerSessions.values()) {
@@ -39717,8 +39742,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     stopAllMeegoPollers();
     ownerGroupFollower?.stop();
     clearInterval(docCommentPollTimer);
-    oncallHandoffStopped = true;
-    clearInterval(oncallHandoffTimer);
+    stopOncallHandoffRecovery?.();
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     setDurableBridgeFinalOutputHandler(undefined);
     setDurableSessionSendHandler(null);

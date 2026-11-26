@@ -52,7 +52,10 @@ export function nativeSessionIndexNamedSince(
     if (!line.trim()) continue;
     try {
       const record = JSON.parse(line) as { id?: unknown; thread_name?: unknown };
-      if (record.id === sessionId && typeof record.thread_name === 'string' && record.thread_name.trim() === wanted) return true;
+      // Codex/TRAE thread ids are UUIDs; persisted configuration may carry a
+      // different case from the index writer without denoting another thread.
+      if (typeof record.id === 'string' && record.id.toLowerCase() === sessionId.toLowerCase()
+        && typeof record.thread_name === 'string' && record.thread_name.trim() === wanted) return true;
     } catch { /* partial or foreign line */ }
   }
   return false;

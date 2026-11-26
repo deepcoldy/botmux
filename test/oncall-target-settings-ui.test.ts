@@ -420,8 +420,12 @@ describe('Oncall unified save', () => {
     expect(writes().map(([url]) => url)).toEqual(['/api/bots/app/oncall-group']);
     expect(JSON.parse(writes()[0][1].body).oncallGroup.customFormMode).toBe('botmux');
     expect(field().props.value).toBe('botmux');
-    act(() => renderer.root.findByProps({ dataInput: 'oncallFormDisplay' }).props.onChange('native'));
+    const entry = () => renderer.root.findByProps({ dataInput: 'oncallFormDisplay' });
+    act(() => entry().props.onChange('native'));
     expect(renderer.root.findAllByProps({ dataInput: 'oncallCustomFormMode' })).toHaveLength(0);
+    act(() => entry().props.onChange('private_card'));
+    expect(field().props.value).toBe('botmux');
+    expect(writes()).toHaveLength(1);
   });
 
   it('clears preset routing when the business line changes', async () => {

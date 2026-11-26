@@ -161,6 +161,42 @@ describe('CodexAppCotCollector', () => {
       item: { id: 'm2', type: 'agentMessage', phase: 'final_answer', text: '最终回答' },
     })).toEqual([]);
   });
+
+  it('keeps async questions out of the thinking timeline regardless of phase', () => {
+    const collector = new CodexAppCotCollector();
+    const question: Record<string, unknown> = {
+      id: 'q1',
+      type: 'agentMessage',
+      delivery: 'async',
+      phase: 'commentary',
+      text: 'Which environment?\nPPE (Recommended) / Production',
+      questions: [{ title: 'Which environment?', options: ['PPE (Recommended)', 'Production'] }],
+    };
+    expect(collector.observe('item/started', { item: question })).toEqual([]);
+    expect(collector.observe('item/agentMessage/delta', { itemId: 'q1', delta: 'Which environment?\n' })).toEqual([]);
+    expect(collector.observe('item/agentMessage/delta', { itemId: 'q1', delta: 'PPE (Recommended) / Production' })).toEqual([]);
+    expect(collector.observe('item/completed', { item: question })).toEqual([]);
+  });
+
+  it.each([
+    ['missing questions', 'absent'],
+    ['null questions', 'null'],
+  ] as const)('publishes a plain async notice as thinking when questions is %s', (_label, shape) => {
+    const collector = new CodexAppCotCollector();
+    const notice: Record<string, unknown> = {
+      id: 'n1',
+      type: 'agentMessage',
+      delivery: 'async',
+      phase: 'final_answer',
+      text: 'Complete sign-in in your private terminal.',
+    };
+    if (shape === 'null') notice.questions = null;
+    expect(collector.observe('item/started', { item: notice })).toEqual([]);
+    expect(collector.observe('item/agentMessage/delta', { itemId: 'n1', delta: notice.text })).toEqual([]);
+    expect(collector.observe('item/completed', { item: notice })).toEqual([
+      { kind: 'thinking', text: notice.text },
+    ]);
+  });
 });
 
 describe('normalizeCodexAppCotMarker', () => {

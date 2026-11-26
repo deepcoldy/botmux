@@ -176,7 +176,7 @@ import { parseGroupSerialInput } from './group-serial-input.js';
 import { setGroupDefaultModels } from '../services/group-default-models-store.js';
 import { parseGroupDefaultModels } from './group-default-models.js';
 import { setChatStreamingCardPin } from '../services/pin-streaming-card-mode-store.js';
-import { isValidRiffBaseUrl, isValidRiffSandboxCluster } from '../adapters/backend/riff-backend.js';
+import { isValidRiffAgent, isValidRiffBaseUrl, isValidRiffSandboxCluster } from '../adapters/backend/riff-backend.js';
 import { probeScratchCapability } from '../adapters/backend/scratch-capability.js';
 import { ensureBackendAvailable } from '../services/backend-availability.js';
 import type { BackendType } from '../adapters/backend/types.js';
@@ -4306,6 +4306,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/project-workstream', async (req, res,
     }
     const actor = { sessionId: ds.session.sessionId, larkAppId: ds.larkAppId, chatId: ds.chatId,
       scope: 'chat' as const, ownerKey, authorizedSourceOwnerKey, sourceAuthorizationStillValid, turnId: turn,
+      repostOnExpired: directHuman,
       authorizationStillValid: () => findActiveBySessionId(params.sessionId) === ds
         && ds.managedTurnOrigin === admittedOrigin && ds.managedTurnOrigin?.capability === admittedCapability
         && ds.managedTurnOrigin?.turnId === turn
@@ -6277,12 +6278,17 @@ ipcRoute('POST', '/api/sessions/:sessionId/project', async (req, res, params) =>
   if (action.action === 'report' && action.expectedAttachment && !isTrustedHostIpcRequest(req)) {
     return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
   }
+  // Report relay traffic always leaves publication to sync. Only a caller
+  // that opts into immediate recovery on the control path can repost inline.
+  const cardPublication = action.action === 'report'
+    ? 'deferred' : body?.cardPublication === 'repost' ? 'repost' : 'patch';
   try {
     const project = await projectCoordinator.run({
       dataDir: config.session.dataDir,
       chatId: ds.chatId,
       larkAppId: ds.larkAppId,
       coordinatorSessionId: ds.session.sessionId,
+      cardPublication,
     }, action, action.action === 'report' && action.expectedAttachment ? () => {
       const record = readProjectAttachmentRecord(config.session.dataDir, ds.chatId, action.dispatchRoot);
       const source = record && sessionStore.getSession(record.source.sessionId);
@@ -6298,6 +6304,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/project', async (req, res, params) =>
         || mode?.mode !== 'project' || mode.coordinatorAppId !== ds.larkAppId
         || !mode.workerAppIds?.includes(record.source.larkAppId)) throw new Error('project_attachment_revision_conflict');
     } : undefined);
+    if (cardPublication === 'deferred') projectCardRuntimeObserver?.(ds.chatId);
     if (action.action === 'init') {
       await refreshProjectImportCardsForChat({
         coordinatorAppId: ds.larkAppId,
@@ -7150,6 +7157,7 @@ ipcRoute('POST', '/api/project-groups/:chatId/refresh-card', async (_req, res, p
       chatId,
       larkAppId: cachedLarkAppId,
       coordinatorSessionId: project.coordinatorSessionId,
+      cardPublication: 'repost',
     }, { action: 'refresh' });
     return jsonRes(res, 200, { ok: true, project: refreshed });
   } catch (error) {
@@ -11844,8 +11852,6 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     const configured = getBot(cachedLarkAppId).config.p2pMode;
     if (configured === 'thread' || configured === 'group') p2pMode = configured;
   } catch { /* default chat */ }
-  let envelopeInjection: 'auto' | 'off' = 'off';
-  try { if (getBot(cachedLarkAppId).config.envelopeInjection === 'auto') envelopeInjection = 'auto'; } catch { /* default off */ }
   // 最终回复投递方式：给 dashboard 的是**生效值**（显式配置 → 否则按 CLI 缺省，
   // doubao 缺省 transcript、其余 send）
   // + 该 CLI 的缺省值 + 当前 CLI 是否支持 transcript（dashboard 据此禁用开关并说明）。
@@ -12245,7 +12251,8 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     messageQuotaDefaultLimit: grantPrefs.messageQuotaDefaultLimit,
     grantDefaultDurationMs: grantPrefs.grantDefaultDurationMs,
     p2pMode,
-    envelopeInjection,
+    // Read-only compatibility field for stale Dashboard chunks: hook injection is now default-on.
+    envelopeInjection: 'auto',
     triggerUserAuth,
     larkToolBinding: getBot(cachedLarkAppId).config.larkToolBinding !== false,
     larkUserOwnerFallback: getBot(cachedLarkAppId).config.larkUserOwnerFallback !== false,
@@ -13582,6 +13589,15 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
     } else if (bot.config.backendType && isRemoteBackendType(bot.config.backendType)) {
       bot.config.backendType = undefined;
     }
+    if (selected.cliId === 'claude-code') {
+      try {
+        (await import('./worker-pool.js')).ensureCliEnv?.(
+          'claude-code',
+          bot.config.cliPathOverride,
+          { configDir: bot.config.cliConfigDir },
+        );
+      } catch { /* best-effort */ }
+    }
 
     // 热切后立刻清掉本 bot 名下失配的存量会话——否则它们冻结的旧 CLI 会被下一条
     // 消息 lazy resume 复活，要等下次 daemon 重启才被 restore 守卫清理。
@@ -13811,15 +13827,13 @@ botConfigPutRoute<{ p2pMode?: unknown }>('/api/bot-p2p-mode', 'p2pMode', {
   respond: value => ({ ok: true, p2pMode: value ?? 'chat' }),
 });
 
-// Per-bot 每轮上下文注入方式 envelopeInjection（#794）。Body `{ envelopeInjection: 'auto'|'off'|'' }`:
-//   • 'auto' → 支持的 CLI（claude-code）把 reminder/whiteboard 经 UserPromptSubmit
-//     hook 注入为 system-reminder，user turn 只留消息本身；不支持的自动回退内联
-//   • 'off'/其它 → 内联 envelope（历史行为，默认）
-// 走 applyConfigField（与 /botconfig 同一写盘 + 热更新路径），下一个 follow-up turn 生效。
-botConfigPutRoute<{ envelopeInjection?: unknown }>('/api/bot-envelope-injection', 'envelopeInjection', {
-  normalize: body => fieldOk(body.envelopeInjection === 'auto' ? 'auto' : null),
-  respond: value => ({ ok: true, envelopeInjection: value ?? 'off' }),
-});
+// 只读兼容路由：Claude Code hook 注入已默认开启并移除实验开关，保留此路由避免
+// 升级前已打开的 Dashboard 缓存分包或旧 API 客户端收到 404/500；不改写 bots.json。
+ipcRoute('PUT', '/api/bot-envelope-injection', requireBoundBot(async (req, res) => {
+  const body = await readJsonBodyOrBadJson(req, res);
+  if (body === BAD_JSON) return;
+  jsonRes(res, 200, { ok: true, envelopeInjection: 'auto' });
+}));
 
 botConfigPutRoute('/api/bot-topic-unavailable-policy', 'topicUnavailablePolicy', {
   normalize: body => {
@@ -14503,7 +14517,7 @@ ipcRoute('DELETE', '/api/bot-trigger-user-auth/users/:openId', requireBoundBot(a
 /** riff 配置里 dashboard 可编辑的字段——PUT /bot-riff 只覆盖这些，其余保留。 */
 // injectStatusLines 已从 dashboard UI 移除（恒默认开启）——不在此集合中意味着
 // 存量 bots.json 值按「隐藏字段」原样保留。
-const RIFF_UI_EDITABLE_KEYS = new Set(['baseUrl', 'sandboxCluster', 'model', 'reasoningEffort', 'jwtEnv', 'systemPrompt', 'setupCommands']);
+const RIFF_UI_EDITABLE_KEYS = new Set(['baseUrl', 'sandboxCluster', 'agent', 'model', 'reasoningEffort', 'jwtEnv', 'systemPrompt', 'setupCommands']);
 
 /** 发给浏览器前脱敏：明文 jwt / env（可能含各类密钥）绝不进 dashboard 响应。 */
 function redactRiffForClient(riff: unknown): Record<string, unknown> | null {
@@ -14524,12 +14538,20 @@ botConfigPutRoute<{ riff?: unknown }>('/api/bot-riff', 'riff', {
     // 一个 model 就会静默删掉认证等隐藏配置。
     const prev = (getBot(cachedLarkAppId).config.riff ?? {}) as Record<string, unknown>;
     const preserved = Object.fromEntries(Object.entries(prev).filter(([k]) => !RIFF_UI_EDITABLE_KEYS.has(k)));
-    // Older dashboard clients do not send sandboxCluster. Preserve a valid
-    // existing selection for them; a brand-new config follows Riff's BOE
-    // default. New clients always submit the explicit dropdown value.
+    // Older dashboard clients do not send sandboxCluster or agent. Preserve a valid
+    // existing selection for them (and keep legacy hidden agent values untouched);
+    // a brand-new config follows Riff's BOE / codex defaults. New clients always
+    // submit the explicit dropdown values.
     const sandboxCluster = value.sandboxCluster ?? prev.sandboxCluster ?? 'boe';
     if (!isValidRiffSandboxCluster(sandboxCluster)) return fieldInvalid('invalid_sandbox_cluster');
-    value = { ...preserved, ...value, sandboxCluster };
+    if (value.agent !== undefined && !isValidRiffAgent(value.agent)) return fieldInvalid('invalid_agent');
+    const agent = value.agent !== undefined ? value.agent : prev.agent;
+    value = {
+      ...preserved,
+      ...value,
+      sandboxCluster,
+      ...(agent !== undefined ? { agent } : {}),
+    };
     if (!isValidRiffBaseUrl(value.baseUrl)) return fieldInvalid('invalid_base_url');
     return fieldOk(value);
   },

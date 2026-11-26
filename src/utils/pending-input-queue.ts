@@ -129,6 +129,24 @@ export function handoffQueuedDurableInputsOnBackendExit(
   return handedOff;
 }
 
+/** Remove only at-most-once inputs whose backend generation ended. Ordinary
+ * inputs and an intentional TraeX recovery restart keep their existing queue
+ * ownership. Returning the exact removed items lets probes prove that a
+ * deferred precheck cannot recreate them after the daemon terminalizes them. */
+export function dropNoReplayPendingInputsOnBackendExit(
+  pending: PendingCliInput[],
+  opts: { intentionalRestart: boolean },
+): PendingCliInput[] {
+  const dropped: PendingCliInput[] = [];
+  for (let index = pending.length - 1; index >= 0; index -= 1) {
+    const item = pending[index]!;
+    if (item.noReplay !== true || (opts.intentionalRestart && item.traexAutoModelRecovery)) continue;
+    dropped.unshift(item);
+    pending.splice(index, 1);
+  }
+  return dropped;
+}
+
 /** Whether an input must wait for the active turn's real prompt boundary.
  *  The explicit flag marks collaborative/durable serial inputs; a cross-chat
  *  task continuation is serial on its own even when the flag was not carried

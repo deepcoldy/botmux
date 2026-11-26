@@ -114,6 +114,7 @@ import {
   isAuthoritativeSubmitSendMarker,
 } from '../../src/services/submit-confirmation.js';
 import { sanitizeClaudeInput } from '../../src/adapters/cli/claude-code.js';
+import { removePromptContextForTurn, rekeyPromptContextWithFallback, writePromptContext } from '../../src/services/prompt-context-store.js';
 
 /** Failed-turn rewind wiring that emitTurnTerminal, flushPending and
  *  handleTermAction call into (see src/worker.ts startFailedTurnRewind):
@@ -121,6 +122,7 @@ import { sanitizeClaudeInput } from '../../src/adapters/cli/claude-code.js';
  *  its old behaviour. */
 const FAILED_TURN_REWIND_FUNCTIONS = [
   'turnFailedWithoutOutput', 'failedTurnRewindWriteEdge', 'stopHeldFailedTurnRewind',
+  'retireInlineRewindSidecar',
   'waitForRetiringCliQuiescence', 'putBackFailedTurnCut', 'dropStoppedRewindMessage',
   'putBackStoppedRewindCutBeforeWrites', 'restartToPutBackCut', 'settleFailedTurnRewindOffQueue',
   'handOverFailedTurnRewind', 'failedTurnTranscriptScope',
@@ -414,6 +416,15 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
     // keep the new reattach reconciliation inert unless a test loads it as
     // the function under test with its own explicit backend/generation scope.
     if (key === 'recoverSessionRenameAfterPersistentReattach') return () => false;
+    if (key === 'recoverUnconfirmedSessionRename') return () => false;
+    if (key === 'traexQuestionDeliveryOwnsInput') return () => false;
+    // Unrelated submission fixtures do not model the shared native-input hold;
+    // focused hard-block suites load the real function with explicit queues.
+    if (key === 'holdNativeInputForHardBlock') return () => {};
+    if (key === 'restoreSessionRenameReadiness') return loadWorkerFunction(key, scope);
+    // Input-focus guard is inert unless a fixture explicitly models a dialog or
+    // draft. This keeps unrelated worker-function tests on their original path.
+    if (key === 'sessionInputBlocksDeliveryNow') return () => false;
     if (key === 'recordStructuredInput') return () => {};
     if (key === 'updateSessionTurnNativeAnchor') return () => {};
     if (key === 'claudeEffortObserver') {
@@ -522,6 +533,9 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
     if (key === 'isAuthoritativeSubmitSendMarker') return isAuthoritativeSubmitSendMarker;
     if (key === 'randomBytes') return randomBytes;
     if (key === 'sanitizeClaudeInput') return sanitizeClaudeInput;
+    if (key === 'rekeyPromptContextWithFallback') return rekeyPromptContextWithFallback;
+    if (key === 'removePromptContextForTurn') return removePromptContextForTurn;
+    if (key === 'writePromptContext') return writePromptContext;
     if (typeof key === 'string' && ['retireAntigravityBridgeTurn', 'rebindAntigravityBridgeTurn', 'warnPromptReadySkipped', 'cancelTurnTerminalReadyRecovery', 'recoverDeferredPromptReadyAtTurnTerminal', 'markPromptReadyFromBusyProbe', 'traexNativeStartupInputIsPending', 'isTraexTmuxViewportBackend', 'isTraexHcViewportBackend', 'isTraexNativeViewportBackend', 'currentTraexCliLifetimeNonce', 'currentTraexGridRevision', 'currentTraexControlWriteRevision', 'currentTraexInterruptGeneration', 'clearTraexStartupWebRecheck', 'currentWebResizedGridFor', 'syncHcPaneSizeFor', 'invalidateTraexNativeViewportEvidence', 'activeTraexNativeViewportEvidence', 'readTraexStartupViewportScreen', 'traexWebInputSettleStatus', 'traexNativeStartupScreenAdmitsPure', 'traexPromptReadyGateBlocks', 'probeAndPublishTraexNativeViewport', 'scheduleTraexNativeViewportRefreshIfNeeded', 'readinessTrackedInput', 'invalidatePromptReadinessEvidence', 'revokePromptReadiness', 'codexAppRuntimeTypeAheadReady', 'sessionEventMetadata', 'bindSessionObservation', 'bindSessionPhysicalObservation', 'bindSessionExecutionEvent', 'restoreCodexAppContractNativeSession', 'backgroundTranscriptChainFilePath', 'persistBackgroundTranscriptChain', 'latestClosedTranscriptOffset', 'prepareBackgroundTranscriptReplay', 'recordBackgroundTranscriptRotation', 'isClaudeFamilyCli', 'spawnCliBody', 'deferSessionReadyUntilRuntimeAssigned', 'takeDeferredSessionReady', 'replayDeferredSessionReady', 'clearDeferredSessionReady', 'setCaptureIdentity', 'cotEntryWellFormed', 'cotEntryWithoutSentinel', 'clearCodexAppInterruptTarget', 'publishAppliedReasoningSelection', 'publishNativeReasoningFooter', 'publishNativeReasoningObservation', 'notifyTraexCatalogEmpty', 'admitTraexCatalogModelBeforeInput', 'requeueUnsubmittedQueuedActivation', 'acknowledgeQueuedActivationToken', 'authorizeUnconfirmedQueuedActivationReplay', 'restoreMissingFinalNotices', 'durableArgvActivationRecheck', 'observeQueuedActivationReceipt', 'observeUnconfirmedQueuedActivation', 'scheduleSubmitFailureNotify', 'flushPending', 'deferTurnInputCommitUntilSubmission', 'probeAuthoritativeQueuedActivationEvidence', 'observeAuthoritativeClaudeTurnStart', 'observeAuthoritativeStructuredTurnStart', 'claudeActivationTranscriptPathAllowed', 'prepareAntigravityAccountsCredentialMask', 'reconcileAntigravitySpawnAccount', 'confirmAntigravitySpawnAccount', 'currentAntigravityWrittenInput', 'resetAntigravityNativeQuotaLog', 'cancelAntigravityFoldedReconcilePending', 'armAntigravityFoldedReconcilePending', 'tryReconcilePendingAntigravityFoldedTurns', 'foldBackgroundUpdatesInitEnabled', 'foldBackgroundUpdatesEnabled', 'setFoldBackgroundUpdatesLive', 'resetFoldBackgroundUpdatesStateForInit', 'isSuppressedNonTerminalMonitorWake', 'sendTerminalTurnStarted', 'resolveMonitorWakeCotAnchor', 'computeBackgroundCotHold', 'observePendingMonitorWakeCotActivity', 'flushPendingMonitorWakeCotOnTextlessComplete', ...TRAEX_QUESTION_FUNCTIONS, ...FAILED_TURN_REWIND_FUNCTIONS].includes(key)) {
       if (!dependencies.has(key)) dependencies.set(key, loadWorkerFunction(key, scope));
       return dependencies.get(key);
@@ -567,6 +581,8 @@ export function loadWorkerMessageHandler(name: string, scope: Record<string, unk
       if (scopedDefault !== undefined) return scopedDefault;
       if (key === 'recordStructuredInput') return () => {};
       if (key === 'recoverSessionRenameAfterPersistentReattach') return () => false;
+    if (key === 'recoverUnconfirmedSessionRename') return () => false;
+    if (key === 'traexQuestionDeliveryOwnsInput') return () => false;
       if (key === 'updateSessionTurnNativeAnchor') return () => {};
       if (key === 'revokePromptReadiness') return loadWorkerFunction('revokePromptReadiness', scope);
       if (key === 'replayDeferredSessionReady') return loadWorkerFunction('replayDeferredSessionReady', scope);

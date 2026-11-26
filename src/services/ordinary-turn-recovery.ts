@@ -20,6 +20,8 @@ export const RECOVERY_OUTCOME_UNVERIFIED = 'recovery_outcome_unverified';
  *  overwrites both before the earlier turn's failure is known. */
 export interface OrdinaryTurnRetryInput {
   cliInput: string;
+  /** Hook-stripped per-turn envelope paired with `cliInput`, for lossless recovery re-delivery. */
+  hookEnvelope?: string;
   /** Daemon-authenticated caller of the original turn, when admission had one. */
   trustedCaller?: TrustedCaller;
 }

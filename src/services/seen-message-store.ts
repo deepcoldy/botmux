@@ -98,6 +98,13 @@ function pruneAndCap(map: Map<string, number>, now: number): void {
   }
 }
 
+/** 只读检查是否已经结算，供需要「先查准入、再决定是否终态丢弃」的入口避免重复外部查询。 */
+export function hasClaimedMessage(larkAppId: string, messageId: string, now = Date.now()): boolean {
+  if (!messageId) return false;
+  const exp = load(larkAppId).map.get(messageId);
+  return !!exp && exp > now;
+}
+
 /**
  * 首次见到此 `messageId` → 记录 + 落盘，返回 `true`（调用方应处理这条消息）。
  * 8h 内重复命中（飞书重推 / at-least-once 重复）→ 返回 `false`（重投，应丢弃）。

@@ -4,11 +4,13 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { decideSessionRenameSettlement, sessionRenameWriteFailureAction } from '../src/core/session-rename-settlement.js';
 import { traexSessionRenameSurface } from '../src/adapters/cli/traex-footer.js';
-import { codexSessionRenameSurface } from '../src/services/codex-terminal-session.js';
+import { codexNativeComposerState, codexSessionRenameSurface, codexNativeFooterRows } from '../src/services/codex-terminal-session.js';
+import { detectCodexChoiceModal } from '../src/utils/codex-choice-modal.js';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { watchNativeSessionIndex } from '../src/services/native-session-index.js';
 import { composerTextKey } from '../src/utils/composer-text-key.js';
+import { TerminalRenderer } from '../src/utils/terminal-renderer.js';
 
 // Real viewports captured from traecli 0.216.0 and codex-cli 0.167.0 in a
 // private tmux pane (paths and the binary location sanitized).
@@ -21,6 +23,35 @@ const cursorOf = (name: string): { x: number; y: number } => {
 const TITLE = '[BotMux·Lark] 修复登录页报错';
 const COMMAND = `/rename ${TITLE}`;
 const NATIVE_ID = '01a2';
+
+type RecordedTerminalItem = [number, 'out' | 'write' | 'key', string];
+interface RecordedTerminalSession {
+  cli: string;
+  version: string;
+  scenario: string;
+  items: RecordedTerminalItem[];
+}
+
+async function renderTraexApproval(): Promise<string> {
+  const { recordings } = JSON.parse(readFileSync(
+    new URL('./fixtures/program-status/codex-traex-osc7501.json', import.meta.url), 'utf8',
+  )) as { recordings: RecordedTerminalSession[] };
+  const recording = recordings.find(item => item.cli === 'traex'
+    && item.version === '0.214.1' && item.scenario === 'approval-15s');
+  if (!recording) throw new Error('missing traex 0.214.1 approval-15s recording');
+  const approvalKey = recording.items.find(([, kind, data]) => kind === 'key' && data === 'Enter (approve)');
+  if (!approvalKey) throw new Error('missing approval key in recording');
+  const renderer = new TerminalRenderer(160, 50);
+  try {
+    for (const [time, kind, data] of recording.items) {
+      if (time >= approvalKey[0]) break;
+      if (kind === 'out') await renderer.writeAndFlush(data);
+    }
+    return renderer.rawSnapshot();
+  } finally {
+    renderer.dispose();
+  }
+}
 
 describe('decideSessionRenameSettlement', () => {
   const decide = (over: Partial<Parameters<typeof decideSessionRenameSettlement>[0]>) =>
@@ -55,6 +86,26 @@ describe('decideSessionRenameSettlement', () => {
     expect(decide({ surface: 'unsubmitted', recorded: true })).toBe('resubmit');
     expect(decide({ surface: 'unsubmitted', recorded: true, resubmitted: true })).toBe('hold');
   });
+
+  it('fails open after the hold cap on every surface except a visible rename command', () => {
+    expect(decide({ surface: 'settled', holdExpired: true })).toBe('release_unconfirmed');
+    expect(decide({ surface: 'settled', recorded: true, holdExpired: true })).toBe('release');
+    expect(decide({ surface: 'occupied', recorded: true, holdExpired: true })).toBe('release');
+    expect(decide({ surface: 'unknown', holdExpired: true })).toBe('release_unconfirmed');
+    expect(decide({ surface: 'occupied', holdExpired: true })).toBe('release_unconfirmed');
+  });
+
+  it('never releases an explicit dialog, draft or paste chip, even at the cap with a receipt', () => {
+    expect(decide({ surface: 'blocked' })).toBe('hold');
+    expect(decide({ surface: 'blocked', recorded: true })).toBe('hold');
+    expect(decide({ surface: 'blocked', recorded: true, holdExpired: true })).toBe('hold');
+  });
+
+  it('never turns the hold cap into a late automatic Enter or release of a visible rename command', () => {
+    expect(decide({ surface: 'unsubmitted', holdExpired: true })).toBe('hold');
+    expect(decide({ surface: 'unsubmitted', recorded: true, holdExpired: true })).toBe('hold');
+    expect(decide({ surface: 'unsubmitted', resubmitted: true, holdExpired: true })).toBe('hold');
+  });
 });
 
 describe('sessionRenameWriteFailureAction', () => {
@@ -76,14 +127,14 @@ describe('TRAE native rename surface (0.216.0)', () => {
   it('recognises only its own command left in the composer as unsubmitted', () => {
     const screen = fixture('traex-0.216.0-rename-left-in-composer.txt');
     expect(traexSessionRenameSurface(screen, COMMAND)).toBe('unsubmitted');
-    expect(traexSessionRenameSurface(screen, '/rename another title')).toBe('occupied');
+    expect(traexSessionRenameSurface(screen, '/rename another title')).toBe('blocked');
   });
 
   it('matches its command when tmux draws the recorded warning emoji as blank cells', () => {
     const screen = fixture('traex-0.216.0-rename-left-in-composer-emoji.txt');
     const command = createTraexAdapter().buildSessionRenameCommand!('[BotMux·Lark] ⚠️ 线上告警 👨‍💻 处理');
     expect(traexSessionRenameSurface(screen, command)).toBe('unsubmitted');
-    expect(traexSessionRenameSurface(screen, '/rename [BotMux·Lark] ⚠️ 线上故障 👨‍💻 处理')).toBe('occupied');
+    expect(traexSessionRenameSurface(screen, '/rename [BotMux·Lark] ⚠️ 线上故障 👨‍💻 处理')).toBe('blocked');
   });
 
   it('does not equate visibly different emoji-only edits', () => {
@@ -92,20 +143,47 @@ describe('TRAE native rename surface (0.216.0)', () => {
     expect(composerTextKey('/rename 👨‍💻')).not.toBe(composerTextKey('/rename 👨💻'));
     const edited = fixture('traex-0.216.0-rename-left-in-composer.txt')
       .replace(`❯ ${COMMAND}`, '❯ /rename 😎');
-    expect(traexSessionRenameSurface(edited, '/rename 😀')).toBe('occupied');
+    expect(traexSessionRenameSurface(edited, '/rename 😀')).toBe('blocked');
   });
 
   it('does not claim an unrelated collapsed paste from its character count', () => {
     const chip = `[Pasted Content ${Array.from(COMMAND).length} chars]`;
     const foreignDraft = fixture('traex-0.216.0-rename-left-in-composer.txt')
       .replace(`❯ ${COMMAND}`, `❯ ${chip}`);
-    expect(traexSessionRenameSurface(foreignDraft, COMMAND)).toBe('occupied');
+    expect(traexSessionRenameSurface(foreignDraft, COMMAND)).toBe('blocked');
+  });
+
+  it('lets drafts and exact commands outrank busy chrome', () => {
+    const busyDraft = fixture('traex-0.216.0-renamed-while-busy.txt')
+      .replace('❯ Run /review on my current changes', `❯ ${COMMAND}`);
+    expect(traexSessionRenameSurface(busyDraft, COMMAND)).toBe('unsubmitted');
+    expect(traexSessionRenameSurface(busyDraft, '/rename another title')).toBe('blocked');
+  });
+
+  it('treats model pickers, question pages and real TRAE selection surfaces as hard input owners', async () => {
+    const picker = ['─'.repeat(80), '', '  Select Model and Effort', '',
+      '❯  7. GPT-5.6-Sol / Standard', '  2. Other option', '', '  enter confirm  |  esc go back'].join('\n');
+    expect(traexSessionRenameSurface(picker, COMMAND)).toBe('blocked');
+    const question = readFileSync(new URL('./fixtures/traex-question/traex-0.214.1-submit-confirm-160x50.txt', import.meta.url), 'utf8');
+    expect(traexSessionRenameSurface(question, COMMAND)).toBe('blocked');
+
+    const approval = await renderTraexApproval();
+    expect(approval).toContain('❯ 1. Yes, proceed');
+    expect(detectCodexChoiceModal(approval)).toMatchObject({ kind: 'choice-list' });
+    expect(traexSessionRenameSurface(approval, COMMAND)).toBe('blocked');
+
+    const folderTrust = readFileSync(
+      new URL('./fixtures/stuck-pages/traex-0.213.1-folder-trust.txt', import.meta.url), 'utf8',
+    );
+    expect(folderTrust).toContain('❯ 1. Yes, continue');
+    expect(detectCodexChoiceModal(folderTrust)).toMatchObject({ kind: 'choice-list' });
+    expect(traexSessionRenameSurface(folderTrust, COMMAND)).toBe('blocked');
   });
 
   it('keeps the rename dialog and a busy turn occupied even with a receipt', () => {
     const dialog = traexSessionRenameSurface(fixture('traex-0.216.0-rename-dialog.txt'), COMMAND);
     const busy = traexSessionRenameSurface(fixture('traex-0.216.0-renamed-while-busy.txt'), '/rename 修复登录页报错');
-    expect(dialog).toBe('occupied');
+    expect(dialog).toBe('blocked');
     expect(busy).toBe('occupied');
     expect(decideSessionRenameSettlement({ surface: dialog, recorded: true, resubmitted: false, fromPrompt: false })).toBe('hold');
     expect(decideSessionRenameSettlement({ surface: busy, recorded: true, resubmitted: false, fromPrompt: false })).toBe('hold');
@@ -142,14 +220,82 @@ describe('Codex native rename surface (0.167.0)', () => {
   it('falls back to the live prompt row without a cursor', () => {
     expect(codexSessionRenameSurface({ viewport: left }, COMMAND)).toBe('unsubmitted');
     expect(codexSessionRenameSurface({ viewport: done }, COMMAND)).toBe('settled');
-    expect(codexSessionRenameSurface({ viewport: left }, '/rename another title')).toBe('occupied');
+    expect(codexSessionRenameSurface({ viewport: left }, '/rename another title')).toBe('blocked');
   });
 
-  it('keeps busy and native rename-dialog surfaces occupied', () => {
+  it('keeps busy and native rename-dialog surfaces distinct', () => {
     const busy = done.replace('› Ask Codex to do anything', '  Working… (2s • esc to interrupt)\n\n› Ask Codex to do anything');
     const dialog = ['>_ OpenAI Codex', '', '  Rename thread', '', '› title', '', 'enter submit  |  esc back'].join('\n');
     expect(codexSessionRenameSurface({ viewport: busy }, COMMAND)).toBe('occupied');
-    expect(codexSessionRenameSurface({ viewport: dialog }, COMMAND)).toBe('occupied');
+    expect(codexSessionRenameSurface({ viewport: dialog }, COMMAND)).toBe('blocked');
+  });
+
+  it('accepts a native 0.146.1 hint for the first input box', () => {
+    const state = {
+      viewport: 'Previous conversation\n› Implement {feature}\n\n  gpt-5.6-sol default · ~/data',
+      cursor: { x: 2, y: 1 },
+    };
+    expect(createCodexAdapter().inputBoxReady!(state)).toBe(true);
+  });
+
+  it('settles a recorded rename on a native 0.146.1 hint', () => {
+    const state = {
+      viewport: 'Previous conversation\n› Implement {feature}\n\n  gpt-5.6-sol default · ~/data',
+      cursor: { x: 2, y: 1 },
+    };
+    expect(codexNativeComposerState(state)).toBe('unknown');
+    expect(codexNativeComposerState(state, { allowCodex0146Hints: true })).toBe('empty');
+    expect(codexSessionRenameSurface(state, COMMAND)).toBe('settled');
+  });
+
+  it('lets exact commands and drafts outrank busy chrome', () => {
+    const exact = done.replace('› Ask Codex to do anything', '  Working… (2s • esc to interrupt)\n\n› /rename [BotMux·Lark] 修复登录页报错');
+    expect(codexSessionRenameSurface({ viewport: exact }, COMMAND)).toBe('unsubmitted');
+    const other = done.replace('› Ask Codex to do anything', '  Working… (2s • esc to interrupt)\n\n› a human draft');
+    expect(codexSessionRenameSurface({ viewport: other }, COMMAND)).toBe('blocked');
+  });
+
+  it('keeps a pasted TRAE draft blocked even on the provisional resume footer', () => {
+    const pasted = readFileSync(new URL('./fixtures/traex-cold-resume/0.216.0-resume-provisional-pasted.txt', import.meta.url), 'utf8');
+    expect(traexSessionRenameSurface(pasted, COMMAND)).toBe('blocked');
+  });
+
+  it('lets Codex hints and unfamiliar chrome degrade to unknown instead of permanent blocked', () => {
+    for (const viewport of [
+      '› Implement {feature}\nQueued for capacity\nmodel · /tmp',
+      '› Implement\n {feature}\nmodel · /tmp',
+      '›\nunknown\nother · weird',
+    ]) {
+      expect(codexSessionRenameSurface({ viewport, cursor: { x: 2, y: 0 } }, COMMAND), JSON.stringify(viewport)).toBe('unknown');
+    }
+  });
+
+  it('classifies a footerless non-empty draft as blocked rather than occupied', () => {
+    expect(codexSessionRenameSurface({ viewport: '› a human draft', cursor: { x: 13, y: 0 } }, COMMAND)).toBe('blocked');
+  });
+
+  it('accepts a bare native prompt with a valid footer and keeps an unfamiliar footer unknown', () => {
+    expect(codexSessionRenameSurface({ viewport: '›\nmodel · /tmp', cursor: { x: 2, y: 0 } }, COMMAND)).toBe('settled');
+    expect(codexSessionRenameSurface({ viewport: '›\nunknown footer', cursor: { x: 2, y: 0 } }, COMMAND)).toBe('unknown');
+    expect(codexNativeFooterRows(['enter to submit / esc to cancel'])).toBeUndefined();
+    for (const valid of ['  100% context left', '01a20bdb-47c4-7702-8188-21c3628071d2', '⚠️ 3']) {
+      expect(codexNativeFooterRows([valid])).toBe(valid.trim());
+    }
+  });
+
+  it('rejects a manually typed 0.146.1 hint when the cursor is past Home', () => {
+    const state = {
+      viewport: 'Previous conversation\n› Implement {feature}\n\n  gpt-5.6-sol default · ~/data',
+      cursor: { x: 20, y: 1 },
+    };
+    expect(createCodexAdapter().inputBoxReady!(state)).toBe(false);
+    expect(codexSessionRenameSurface(state, COMMAND)).not.toBe('settled');
+  });
+
+  it('detects a choice modal in a tall viewport with hint-only backdrop rows', () => {
+    const modal = readFileSync(new URL('./fixtures/codex-choice-modal/tmux-pane-tool-approval-160x30.txt', import.meta.url), 'utf8');
+    const tall = `${'context\n'.repeat(40)}${modal}\n? for shortcuts`;
+    expect(detectCodexChoiceModal(tall)).toBeDefined();
   });
 
   it('is the judge the Codex adapter declares', () => {
@@ -203,6 +349,14 @@ describe('watchNativeSessionIndex', () => {
     appendFileSync(path, record(TITLE));
     expect(recorded()).toBe(false);
     nativeId = NATIVE_ID;
+    expect(recorded()).toBe(true);
+  });
+
+  it('matches UUID thread ids case-insensitively', () => {
+    const path = index();
+    const lower = '01a20bdb-47c4-7702-8188-21c3628071d2';
+    const recorded = watchNativeSessionIndex(path, TITLE, () => lower.toUpperCase());
+    appendFileSync(path, record(TITLE, lower));
     expect(recorded()).toBe(true);
   });
 
