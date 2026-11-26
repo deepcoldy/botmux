@@ -449,12 +449,12 @@ export async function settleTurnReplyCardTerminal(
 
 /** UI retirement never asserts native task failure or changes task settlement. */
 export async function retireReplyCardDisplay(
-  ds: DaemonSession, msg: { turnId: string; dispatchAttempt?: number; message?: string; silent?: boolean },
+  ds: DaemonSession, msg: { turnId: string; dispatchAttempt?: number; message?: string; silent?: boolean; preserveCot?: boolean },
   send: ReplyCardSender, owns: () => boolean,
 ): Promise<boolean> {
   if (!owns()) return false;
   if (replyCardModeFor(ds, msg.turnId) === 'legacy') {
-    finalizeCotMessage(ds, msg.turnId, msg.silent ? 'completed' : 'ambiguous', msg.dispatchAttempt);
+    if (!msg.preserveCot) finalizeCotMessage(ds, msg.turnId, msg.silent ? 'completed' : 'ambiguous', msg.dispatchAttempt);
     return false;
   }
   try {
@@ -478,7 +478,7 @@ export async function retireReplyCardDisplay(
     if (retired && owns() && ds.replyCardRunningTurnId === msg.turnId) ds.replyCardRunningTurnId = undefined;
     return retired !== undefined;
   } finally {
-    if (owns()) {
+    if (owns() && !msg.preserveCot) {
       const record = new TurnReplyCardStore(config.session.dataDir).read(replyCardKey(ds, msg.turnId, msg.dispatchAttempt));
       // Silent retirement is a DISPLAY-only close after delivery/an earlier
       // notice; it must not turn that evidence into a native failure assertion.

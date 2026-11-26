@@ -18,7 +18,7 @@ import {
 } from '../src/core/worker-pool.js';
 import { raiseDaemonAttention } from '../src/core/session-activity.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
-import type { WorkerFinalOutput } from '../src/types.js';
+import type { WorkerFinalOutput, WorkerToDaemon } from '../src/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 const app = 'cli_universal';
@@ -184,6 +184,14 @@ describe('attention lifecycle', () => {
     const attempt = vi.fn(async () => { throw new OutputDeliveryTerminalError(INTERNAL_BRIDGE_FINAL_REJECTION); });
     const ctx = scopeFor(db, record, dir, { processFinalOutput: attempt });
     ctx.scope.publishScopedImDeliveryStatus = vi.fn();
+    const holdKey = (turnId: string, dispatchAttempt?: number) => `${turnId}:${dispatchAttempt}`;
+    const unrelated = { turnId: 'om_other', finishStatus: 'completed', replyPending: true, backgroundPending: false };
+    ctx.ds.requiredReplyCotHolds = new Map([
+      [holdKey(internal.turnId), { turnId: internal.turnId, finishStatus: 'completed', replyPending: true, backgroundPending: false }],
+      [holdKey(unrelated.turnId), unrelated],
+    ]);
+    Object.assign(ctx.scope, { TurnSendLedger, requiredReplyCotHoldKey: holdKey, finalizeCotMessage: vi.fn() });
+    ctx.scope.settleRequiredReplyCotMessage = loadWorkerPoolFunction('settleRequiredReplyCotMessage', ctx.scope);
     const remove = vi.fn();
     let daemonWork: Promise<void> | undefined;
     const transmit = vi.fn(() => { daemonWork = ctx.run(); });
@@ -197,6 +205,8 @@ describe('attention lifecycle', () => {
       producer.publish(internal);
       await daemonWork;
       expect(db.read(record.id)).toMatchObject({ state: 'rejected', reason: INTERNAL_BRIDGE_FINAL_REJECTION });
+      expect(ctx.scope.finalizeCotMessage).toHaveBeenCalledExactlyOnceWith(ctx.ds, internal.turnId, 'failed', undefined);
+      expect([...ctx.ds.requiredReplyCotHolds.values()]).toEqual([unrelated]);
       expect(remove).not.toHaveBeenCalled();
       await vi.advanceTimersByTimeAsync(5_001);
       await daemonWork;
@@ -585,6 +595,96 @@ describe('worker production IPC boundary', () => {
 });
 
 describe('native and generic settlement contracts', () => {
+  it.each([
+    { state: 'pending', card: 'held' },
+    { state: 'wrong attempt', card: 'held' },
+    { state: 'empty', card: 'failed' },
+    { state: 'rejected', card: 'failed' },
+    { state: 'wrong rejection', card: 'held' },
+    { state: 'delivered', card: 'completed' },
+    { state: 'legacy', card: 'completed' },
+    { state: 'lost authority', card: 'unchanged' },
+  ])('settles the historical display from the exact IM receipt ($state)', async ({ state, card }) => {
+    const dir = directory();
+    const db = database(dir);
+    const sink = { kind: 'im', answerRequired: true, chatId: 'oc', chatType: 'group',
+      context: { target: { mode: 'thread', rootMessageId: 'om_topic' } },
+    } as const;
+    const key = { larkAppId: app, sessionId: output.sessionId!, turnId: output.turnId, dispatchAttempt: 2 };
+    if (state !== 'legacy') db.rememberSink(key.sessionId, key.turnId, sink);
+    if (state === 'delivered' || state === 'wrong attempt') {
+      await new TurnSendLedger(dir).execute({ ...key, dispatchAttempt: state === 'delivered' ? 2 : 1 },
+        'final', 'explicit', async () => 'om_final', { fenced: true });
+    }
+    if (state === 'rejected' || state === 'wrong rejection') {
+      const rejected = db.accept(outputSnapshot(app, { ...output, dispatchAttempt: state === 'rejected' ? 2 : 1 }), sink);
+      expect(db.claim(rejected.id, 'owner')).toBe(true);
+      expect(db.rejectTerminal(rejected.id, 'owner', INTERNAL_BRIDGE_FINAL_REJECTION)).toBe(true);
+    }
+    const earlierHold = { turnId: 'om_other', dispatchAttempt: 1 };
+    const ds = { larkAppId: app, cotHeldForBackground: earlierHold } as DaemonSession;
+    const finalizeCotMessage = vi.fn();
+    const retireReplyCardDisplay = vi.fn();
+    const settleTurnReplyCardTerminal = vi.fn();
+    const scope = {
+      TurnSendLedger, config: { session: { dataDir: dir } },
+      finalizeCotMessage, retireReplyCardDisplay, settleTurnReplyCardTerminal,
+      tr: () => 'pending', localeForBot: () => 'en',
+      requiredReplyCotHoldKey: (turnId: string, attempt?: number) => `${turnId}:${attempt}`,
+      isReplayOfHeldCotTerminal: () => false, releaseHeldCotMessage: vi.fn(),
+      cotMessageFinishStatus: () => undefined,
+    };
+    Object.assign(scope, {
+      finalizeOrHoldCotMessage: loadWorkerPoolFunction('finalizeOrHoldCotMessage', scope),
+      settleRequiredReplyCotMessage: loadWorkerPoolFunction('settleRequiredReplyCotMessage', scope),
+    });
+    const settleDisplay = loadWorkerPoolFunction<(ds: DaemonSession, msg: WorkerToDaemon,
+      journal: OutputDeliveryJournal, send: unknown, owns: () => boolean, suppress: boolean) => Promise<void>>(
+      'settleHistoricalTurnDisplay', scope);
+    await settleDisplay(ds, { type: 'turn_terminal', sessionId: key.sessionId,
+      turnId: key.turnId, dispatchAttempt: key.dispatchAttempt, status: 'completed',
+      ...(state === 'empty' ? { outputDisposition: 'empty_answer' as const } : {}),
+    }, db, vi.fn(), () => state !== 'lost authority', false);
+    expect(ds.cotHeldForBackground).toBe(earlierHold);
+    expect(scope.releaseHeldCotMessage).not.toHaveBeenCalled();
+    if (card === 'held') {
+      expect(retireReplyCardDisplay).toHaveBeenCalledOnce();
+      expect(retireReplyCardDisplay).toHaveBeenCalledWith(ds,
+        expect.objectContaining({ preserveCot: true }), expect.any(Function), expect.any(Function));
+      expect(ds.requiredReplyCotHolds?.get(`${key.turnId}:2`)?.replyPending).toBe(true);
+      expect(finalizeCotMessage).not.toHaveBeenCalled();
+      expect(settleTurnReplyCardTerminal).not.toHaveBeenCalled();
+    } else if (card === 'unchanged') {
+      expect(finalizeCotMessage).not.toHaveBeenCalled();
+      expect(retireReplyCardDisplay).not.toHaveBeenCalled();
+      expect(settleTurnReplyCardTerminal).not.toHaveBeenCalled();
+    } else {
+      expect(finalizeCotMessage).toHaveBeenCalledExactlyOnceWith(ds, key.turnId, card, 2);
+      expect(settleTurnReplyCardTerminal).toHaveBeenCalledWith(ds, expect.objectContaining({ status: card }), expect.any(Function), expect.any(Function));
+    }
+  });
+
+  it('preserves the deferred missing-reply notice on a historical failure with live background work', () => {
+    const publish = vi.fn();
+    const finalizeCotMessage = vi.fn();
+    const reply = { turnId: 'om_turn', dispatchAttempt: 2, finishStatus: 'completed', replyPending: true, backgroundPending: true };
+    const ds = {
+      requiredReplyCotHolds: new Map([['exact', reply]]),
+      pendingRequiredReplyMissingReceipts: new Map([['exact', { publish }]]),
+    } as unknown as DaemonSession;
+    const scope = { requiredReplyCotHoldKey: () => 'exact', finalizeCotMessage };
+    const settleReply = loadWorkerPoolFunction<(session: DaemonSession, turnId: string, attempt: number, status: 'failed') => boolean>(
+      'settleRequiredReplyCotMessage', scope);
+    const settleBackground = loadWorkerPoolFunction<(session: DaemonSession) => void>('settleRequiredReplyBackground', scope);
+    expect(settleReply(ds, reply.turnId, reply.dispatchAttempt, 'failed')).toBe(true);
+    expect(publish).not.toHaveBeenCalled();
+    expect(finalizeCotMessage).not.toHaveBeenCalled();
+    expect(ds.pendingRequiredReplyMissingReceipts?.size).toBe(1);
+    settleBackground(ds);
+    expect(finalizeCotMessage).toHaveBeenCalledExactlyOnceWith(ds, reply.turnId, 'failed', reply.dispatchAttempt);
+    expect(publish).toHaveBeenCalledOnce();
+  });
+
   it.each([
     { text: 'ROUTE: generic', excluded: true, expected: 'rejected' },
     { text: ' generic\n', excluded: true, expected: 'rejected' },
