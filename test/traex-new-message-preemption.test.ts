@@ -11,9 +11,14 @@ import { shouldAllowTypeAheadOnReattach } from '../src/services/queued-activatio
 import { decideQueuedReadyTransition } from '../src/core/queued-ready-transition.js';
 import { isStructuredBridgeLifecycleBlockingCli } from '../src/services/structured-bridge-clis.js';
 import { TurnExecutionClock } from '../src/services/turn-execution-clock.js';
+import { detectCliStartupBlocker } from '../src/core/cli-startup-blocker.js';
 
 const busy = readFileSync(new URL('./fixtures/session-rename/traex-0.216.0-renamed-while-busy.txt', import.meta.url), 'utf8');
 const caller = { senderType: 'user' as const, requestUserOpenId: 'owner', requestLarkAppId: 'app' };
+const trustDialog = [
+  'Folder access', '/fixture', 'Do you trust the contents of this directory?',
+  '❯ 1. Yes, continue', '  2. No, quit', '  enter continue  |  esc quit',
+].join('\n');
 function harness() {
   const authority = new ActiveTurnAuthority();
   authority.reserve({ turnId: 'om_old', caller }); authority.markStarted({ turnId: 'om_old', caller });
@@ -60,7 +65,111 @@ function harness() {
   const preempt = loadWorkerFunction('preemptActiveTurnForNewMessage', scope);
   return { scope, target, preempt };
 }
+
+function trustHandler(h: ReturnType<typeof harness>) {
+  Object.assign(h.scope, {
+    trustHandled: false, TRUST_DIALOG_PATTERN: /Yes, I trust this folder|Yes, continue|Trust and continue/,
+    dismissAidenCodexUpdateDialog: () => false, noticeCodexModelMigrationDialog: vi.fn(),
+    detectCliStartupBlocker, stripAnsiScreenText: (text: string) => text,
+    promptReadinessRevision: 0, closeRequested: false,
+    pendingWebTerminalInput: () => false, webTerminalInputWireDirty: () => false,
+    nativeSessionForkPending: () => false,
+  });
+  return loadWorkerFunction('handleVisibleStartupInteraction', h.scope);
+}
+
 describe('ordinary TraeX new-message preemption', () => {
+  it('does not accept historical trust text while the native viewport is already working', async () => {
+    vi.useFakeTimers();
+    try {
+      const h = harness();
+      expect(trustHandler(h)(trustDialog + '\n' + busy)).toBe(false);
+      await vi.advanceTimersByTimeAsync(500);
+      expect(h.target.sendSpecialKeys).not.toHaveBeenCalled();
+      expect(h.scope.trustHandled).toBe(false);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('accepts a still-current native trust dialog once after the startup delay', async () => {
+    vi.useFakeTimers();
+    try {
+      const h = harness();
+      h.target.captureInputState = () => ({ viewport: trustDialog });
+      const handle = trustHandler(h);
+      expect(handle(trustDialog)).toBe(true);
+      expect(handle(trustDialog)).toBe(false);
+      await vi.advanceTimersByTimeAsync(399);
+      expect(h.target.sendSpecialKeys).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(h.target.sendSpecialKeys).toHaveBeenCalledExactlyOnceWith('Enter');
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('expires a trust Enter when exact preemption restores the old request as a draft', async () => {
+    vi.useFakeTimers();
+    try {
+      const h = harness();
+      h.target.captureInputState = () => ({ viewport: trustDialog });
+      expect(trustHandler(h)(trustDialog)).toBe(true);
+      h.target.captureInputState = () => ({ viewport: busy });
+      h.preempt(h.scope.pendingMessages[0], h.target);
+      await Promise.resolve(); await Promise.resolve();
+      expect(h.target.sendSpecialKeys).toHaveBeenCalledExactlyOnceWith('Escape');
+      h.scope.observeTraexPreemptionTerminal([{ kind: 'assistant_final', text: '',
+        terminalStatus: 'ambiguous', terminalErrorCode: 'traex_turn_aborted:interrupted',
+        sourceSessionId: 'native-sid', sourceTurnId: 'native-old' }]);
+      h.target.captureInputState = () => ({ viewport: busy.replace(/^◆ Working[^\n]*\n/m, '')
+        .replace('Run /review on my current changes', 'original task') });
+      await vi.advanceTimersByTimeAsync(400);
+      expect(h.target.sendSpecialKeys).toHaveBeenCalledExactlyOnceWith('Escape');
+      expect(h.scope.pendingMessages).toHaveLength(1);
+      expect(h.scope.emitTurnTerminal).toHaveBeenCalledExactlyOnceWith(
+        'om_old', 'cancelled', 'preempted_by_user_message', undefined,
+      );
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each(['viewport draft', 'unreadable viewport', 'selected quit', 'backend', 'lifetime', 'generation',
+    'interrupt', 'readiness', 'Web input', 'normal writer', 'injection writer', 'command writer', 'pending preemption'])
+    ('never sends a stale trust Enter after %s takes the input surface', async state => {
+      vi.useFakeTimers();
+      try {
+        const h = harness();
+        h.target.captureInputState = () => ({ viewport: trustDialog });
+        expect(trustHandler(h)(trustDialog)).toBe(true);
+        if (state === 'viewport draft') h.target.captureInputState = () => ({ viewport: busy });
+        if (state === 'unreadable viewport') h.target.captureInputState = () => { throw new Error('capture unavailable'); };
+        if (state === 'selected quit') h.target.captureInputState = () => ({ viewport: trustDialog
+          .replace('❯ 1. Yes, continue', '  1. Yes, continue').replace('  2. No, quit', '❯ 2. No, quit') });
+        if (state === 'backend') h.scope.backend = {};
+        if (state === 'lifetime') h.scope.cliLifetimeNonce++;
+        if (state === 'generation') h.scope.cliSpawnGeneration++;
+        if (state === 'interrupt') h.scope.cliInterruptGeneration++;
+        if (state === 'readiness') h.scope.promptReadinessRevision++;
+        if (state === 'Web input') h.scope.webTerminalInputGeneration++;
+        if (state === 'normal writer') h.scope.cliSubmissionInFlight = { composerOwned: true };
+        if (state === 'injection writer') h.scope.injectionFlushing = true;
+        if (state === 'command writer') h.scope.commandLineWritesPending = 1;
+        if (state === 'pending preemption') h.scope.traexPreemption = {};
+        await vi.advanceTimersByTimeAsync(400);
+        expect(h.target.sendSpecialKeys).not.toHaveBeenCalled();
+        expect(h.scope.invalidatePromptReadinessEvidence).not.toHaveBeenCalled();
+      } finally { vi.useRealTimers(); }
+    });
+
+  it('does not schedule a trust key while a pending preemption already owns the composer', async () => {
+    vi.useFakeTimers();
+    try {
+      const h = harness();
+      h.target.captureInputState = () => ({ viewport: trustDialog });
+      h.scope.traexPreemption = {};
+      expect(trustHandler(h)(trustDialog)).toBe(false);
+      await vi.advanceTimersByTimeAsync(400);
+      expect(h.target.sendSpecialKeys).not.toHaveBeenCalled();
+      expect(h.scope.trustHandled).toBe(false);
+    } finally { vi.useRealTimers(); }
+  });
+
   it('interrupts before paste and keeps the old turn pending until native settlement', async () => {
     const h = harness();
     expect(h.preempt(h.scope.pendingMessages[0], h.target)).toBe(true);
