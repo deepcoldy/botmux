@@ -1006,6 +1006,8 @@ export function submitCustomReply(args: {
  *   - 提供原始消息位置时：仅匹配提问的冻结话题；群外层仅匹配群外层
  *   - 旧调用只提供 anchor：话题匹配 rootMessageId，群外层匹配 chatId
  *   - 升级前遗留的无位置标记旧 v2 chat-scope 记录回退旧的群内通配语义，兼容在途提问
+ *   - rootless 交叉身份选择卡保留旧版群内候选路径；daemon 只接受严格选择词，
+ *     且这些兼容候选始终排在精确话题候选之后
  *
  * 命中多个时返回最先注册的（实践中同一 anchor 同时最多一个 pending ask，因为发起
  * ask 的 CLI 此刻正阻塞等待结果）。返回 snapshot，改它不影响 broker 状态。
@@ -1045,22 +1047,44 @@ export function findPendingAskByAnchor(args: AskMessageAnchor): PendingAsk | und
   return undefined;
 }
 
+/** List rootless cross-principal choice cards this exact sender may answer.
+ * Expiry is adjudicated BEFORE candidates are returned, so an expired older
+ * card cannot consume the only retry. Session scoping prevents a restored card
+ * from another CLI session winning merely because it was registered first. */
+export function listPendingHostChoicesByAnchor(args: AskMessageAnchor & {
+  by: string;
+  actor?: AskAnswerActor;
+  sessionId?: string;
+}): PendingAsk[] {
+  const matches: PendingAsk[] = [];
+  for (const ask of pending.values()) {
+    expireAskAtDeadline(ask);
+    if (!hostChoiceFallbackMatches(ask, args) || isUnclaimedHookAsk(ask)) continue;
+    if (args.sessionId !== undefined && ask.sessionId !== args.sessionId) continue;
+    if (!isAuthorizedToAnswer(ask, args.by, args.actor)) continue;
+    matches.push(snapshot(ask));
+  }
+  return matches;
+}
+
 /** Snapshot all live candidates, without changing the legacy first-match API.
  *  Exact-location asks take precedence over restored legacy unscoped records so
  *  a pre-upgrade ask never shadows or induces false ambiguity for a newer ask. */
 export function listPendingAsksByAnchor(args: AskMessageAnchor): PendingAsk[] {
   const exact: PendingAsk[] = [];
-  const legacy: PendingAsk[] = [];
+  const fallback: PendingAsk[] = [];
   for (const ask of pending.values()) {
     if (isUnclaimedHookAsk(ask)) continue;
     if (exactAnchorMatches(ask, args)) exact.push(snapshot(ask));
-    else if (legacyFallbackMatches(ask, args)) legacy.push(snapshot(ask));
+    else if (legacyFallbackMatches(ask, args)) fallback.push(snapshot(ask));
   }
-  return exact.length > 0 ? exact : legacy;
+  return exact.length > 0 ? exact : fallback;
 }
 
-/** Locate a live restored legacy ask explicitly quoted by its delivered card
- *  message ID, even when a newer exact-location ask coexists in the chat. */
+/** Locate a restored legacy or rootless host-choice ask explicitly quoted by
+ *  its delivered card message ID. The globally unique card ID is the precise
+ *  locator here: unlike an unquoted legacy fallback, an explicit card quote is
+ *  valid even when routing gave the reply an independent thread anchor. */
 export function findPendingLegacyAskByCard(args: {
   larkAppId: string;
   chatId: string;
@@ -1069,15 +1093,16 @@ export function findPendingLegacyAskByCard(args: {
 }): PendingAsk | undefined {
   for (const ask of pending.values()) {
     if (isUnclaimedHookAsk(ask)) continue;
-    if (legacyFallbackMatches(ask, args) && ask.cardMessageId === args.cardMessageId) {
-      return snapshot(ask);
-    }
+    if (ask.settled || ask.larkAppId !== args.larkAppId || ask.chatId !== args.chatId
+      || ask.cardMessageId !== args.cardMessageId) continue;
+    if (ask.legacyUnscopedChatText === true || isRootlessHostChoiceAsk(ask)) return snapshot(ask);
   }
   return undefined;
 }
 
 function exactAnchorMatches(ask: InternalPending, args: AskMessageAnchor): boolean {
-  if (ask.settled || ask.legacyUnscopedChatText || ask.larkAppId !== args.larkAppId || ask.chatId !== args.chatId) {
+  if (ask.settled || ask.legacyUnscopedChatText || isRootlessHostChoiceAsk(ask)
+    || ask.larkAppId !== args.larkAppId || ask.chatId !== args.chatId) {
     return false;
   }
   if (args.messageRootId !== undefined) {
@@ -1097,6 +1122,34 @@ function exactAnchorMatches(ask: InternalPending, args: AskMessageAnchor): boole
 function legacyFallbackMatches(ask: InternalPending, args: AskMessageAnchor): boolean {
   return !ask.settled
     && ask.legacyUnscopedChatText === true
+    && ask.larkAppId === args.larkAppId
+    && ask.chatId === args.chatId
+    && args.anchor === args.chatId;
+}
+
+const CHAT_SCOPE_HOST_CHOICE_ORIGINS = new Set([
+  'host_cross_principal_classification',
+  'host_cross_principal_wait',
+  'host_cross_principal_owner',
+]);
+
+/** Rootless cross-principal cards have no frozen reply root to match. Keep
+ * their old candidate path only while routing stays folded into the chat-scope
+ * session: daemon.ts admits only strict choice vocabulary and lets ordinary
+ * work text continue through normal routing. Independent threads need an
+ * explicit card quote; a supplied frozen root restores exact topic isolation. */
+function isRootlessHostChoiceAsk(ask: InternalPending): boolean {
+  return ask.chatType !== 'p2p'
+    && ask.rootMessageId === null
+    && normalizeCardRoot(ask.cardRootMessageId, ask.chatId) === undefined
+    && CHAT_SCOPE_HOST_CHOICE_ORIGINS.has(ask.originKind);
+}
+
+/** Compatibility candidates stay BELOW exact-location asks so they cannot
+ * shadow a newer topic-isolated Ask in the same chat. */
+function hostChoiceFallbackMatches(ask: InternalPending, args: AskMessageAnchor): boolean {
+  return !ask.settled
+    && isRootlessHostChoiceAsk(ask)
     && ask.larkAppId === args.larkAppId
     && ask.chatId === args.chatId
     && args.anchor === args.chatId;

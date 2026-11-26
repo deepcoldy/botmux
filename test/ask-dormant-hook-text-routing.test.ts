@@ -75,16 +75,18 @@ import {
 } from '../src/daemon.js';
 import {
   _resetForTest,
+  _getPending,
   _setHookReclaimGraceForTest,
   findPendingAskByAnchor,
   registerAsk,
+  registerHostAsk,
   restorePersistedAsks,
   setAskPersistStore,
   setCanTalkChecker,
   setCardDispatcher,
   startHookAskReclaim,
 } from '../src/core/ask-broker.js';
-import { createAskPersistStore, type PersistedAsk } from '../src/core/ask-persist-store.js';
+import { createAskPersistStore, askKeyFor, type PersistedAsk } from '../src/core/ask-persist-store.js';
 import type { AskResult, CreateAskInput, PendingAsk } from '../src/core/ask-types.js';
 
 const APP = 'ask_dormant_route_app';
@@ -353,6 +355,70 @@ describe('群级 ask 与同群话题隔离（真实消息路由）', () => {
     await handleThreadReply(inThread, { ...makeCtx('om_reply_on_card'), replyRootId: cardMsgId });
     expect(await waiting).toMatchObject({ kind: 'answered', comment: '直接开话题答复外层卡' });
     expect(workerStrings(send)).not.toContain('直接开话题答复外层卡');
+  });
+
+  it.each([
+    { route: 'folded', scope: 'chat' as const },
+    { route: 'independent-thread', scope: 'thread' as const },
+  ])('升级前外层卡的显式引用在 $route 路由都可结算，且未引用旧卡仍不跨独立话题通配', async ({ scope }) => {
+    const cardMessageId = 'om_legacy_direct_card';
+    const now = Date.now();
+    createAskPersistStore(join(storeRoot, 'asks')).put({
+      v: 2,
+      askKey: askKeyFor(APP, SESSION_ID, 'host_explicit', 'legacy-direct-card'),
+      requestId: 'legacy-direct-card', originKind: 'host_explicit',
+      askId: 'ask-legacy-direct-card', nonce: 'n_legacy_direct',
+      larkAppId: APP, chatId: CHAT, rootMessageId: null, sessionId: SESSION_ID, chatType: 'group',
+      questions: [{ prompt: '旧外层提问？', multiSelect: false,
+        options: [{ key: 'yes', label: '继续' }, { key: 'no', label: '停止' }] }],
+      createdAt: now - 1000, deadlineAt: now + 60_000, timeoutMs: 60_000,
+      timeoutStartsAfterDelivery: true, timeoutStartedAt: now - 900,
+      cardMessageId, selections: [[]],
+    });
+    _resetForTest();
+    wireBroker();
+    expect(restorePersistedAsks(now, APP)).toBe(1);
+    const { send } = scope === 'thread' ? seedTopic(cardMessageId) : seedChatSession();
+
+    // Merely entering an unrelated independent thread must not consume the legacy card.
+    expect(findPendingAskByAnchor({ larkAppId: APP, chatId: CHAT,
+      anchor: 'om_unrelated_legacy_thread', messageRootId: 'om_unrelated_legacy_thread' })).toBeUndefined();
+
+    const answer = topicEvent(`om_legacy_answer_${scope}`, '旧卡精确引用答复', cardMessageId);
+    answer.message.parent_id = cardMessageId;
+    await handleThreadReply(answer, {
+      ...makeCtx(`om_legacy_answer_${scope}`), scope,
+      anchor: scope === 'thread' ? cardMessageId : CHAT,
+      replyRootId: cardMessageId,
+    });
+
+    expect(persisted().find(ask => ask.askId === 'ask-legacy-direct-card')?.answeredResult)
+      .toMatchObject({ kind: 'answered', comment: '旧卡精确引用答复' });
+    expect(workerStrings(send)).not.toContain('旧卡精确引用答复');
+  });
+
+  it('独立 thread 的普通选择词不结算 rootless owner 卡，显式引用才可结算', async () => {
+    const root = 'om_unrelated_owner_topic';
+    const { send } = seedTopic(root);
+    const waiting = registerHostAsk({ ...hookAsk(), originKind: 'host_cross_principal_owner',
+      rootMessageId: null, requestId: 'owner-unrelated-thread', answererOpenId: USER });
+    await vi.waitFor(() => expect(cards).toHaveLength(1));
+    const askId = cards[0]!.askId;
+    const cardMessageId = _getPending(askId)?.cardMessageId ?? 'om_card_1';
+
+    await handleThreadReply(topicEvent('om_plain_owner_ok', 'ok', root), {
+      ...makeCtx('om_plain_owner_ok'), scope: 'thread', anchor: root, replyRootId: root,
+    });
+    expect(workerStrings(send)).toContain('ok');
+    expect(_getPending(askId)?.settled).toBe(false);
+
+    const quoted = topicEvent('om_quoted_owner_answer', '采纳并重新执行', root);
+    quoted.message.parent_id = cardMessageId;
+    await handleThreadReply(quoted, {
+      ...makeCtx('om_quoted_owner_answer'), scope: 'thread', anchor: root, replyRootId: root,
+    });
+    await expect(waiting).resolves.toMatchObject({ kind: 'answered', comment: '采纳并重新执行' });
+    expect(workerStrings(send)).not.toContain('采纳并重新执行');
   });
 
   it('chat-scope 收到带 thread_id 且 root_id 为空的原生话题首条消息时，不结算群外层 ask', async () => {
