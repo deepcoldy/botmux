@@ -80,6 +80,7 @@ if (stubbedLargeUpload) {
 
 const topicLookups = new Map<string, number>();
 let providerMessageSequence = 0;
+let providerFileUploadSequence = 0;
 
 (defaultHttpInstance as any).defaults.adapter = async (config: any) => {
   const url = new URL(config.url, 'https://open.feishu.cn');
@@ -97,7 +98,10 @@ let providerMessageSequence = 0;
   if (url.pathname.includes('/auth/')) {
     data = { code: 0, tenant_access_token: 'test-token', expire: 7200 };
   } else if (url.pathname.includes('/im/v1/files')) {
+    providerFileUploadSequence += 1;
+    const failedSequence = Number(process.env.BOTMUX_TEST_FAIL_FILE_UPLOAD_SEQUENCE);
     data = process.env.BOTMUX_TEST_FAIL_FILE_UPLOAD === '1'
+      || (Number.isSafeInteger(failedSequence) && failedSequence > 0 && providerFileUploadSequence === failedSequence)
       ? { code: 99991400, msg: 'upload rejected by test' }
       : { code: 0, data: { file_key: 'file_test_upload' } };
   } else if (url.pathname.includes('/im/v1/images') && process.env.BOTMUX_TEST_ALLOW_IMAGE_UPLOAD === '1') {

@@ -29,8 +29,8 @@
  * otherwise be readable inside a running session. A mask is a mount on the path
  * itself, so whatever later appears beneath it on the host stays hidden.
  */
-import { existsSync, lstatSync, readdirSync } from 'node:fs';
-import { join, dirname, basename } from 'node:path';
+import { existsSync, lstatSync, readdirSync, readlinkSync, realpathSync, statSync } from 'node:fs';
+import { join, dirname, basename, resolve } from 'node:path';
 import { homedir as osHomedir } from 'node:os';
 import { resolveLarkCliLinuxStoreDir } from '../cli/fs-policy.js';
 import { BACKGROUND_JOBS_HOME_ROOT, MEEGO_HOME_ROOT } from '../../services/bytedcli-home.js';
@@ -70,16 +70,25 @@ export interface ScratchSecrets {
 //      files in place, and a directory bind resolves names live so a persistent
 //      tmux pane reads the refreshed identity each turn.
 const CLI_IDENTITY_DIR = 'cli-identity';
-const PER_PERSON_SECRET_DIRS = ['vc-meeting-daemon-auth', 'bytedcli-home', 'oauth-pending'];
+const PER_PERSON_SECRET_DIRS = ['vc-meeting-daemon-auth', 'bytedcli-home', 'oauth-pending', 'session-turns'];
 function sessionIdentityDirName(sessionId: string): string {
   return `${sessionId}.bin`;
 }
 
+function isMissing(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT';
+}
 function isFileOrLink(p: string): boolean {
-  try { return !lstatSync(p).isDirectory(); } catch { return false; }
+  try { return !lstatSync(p).isDirectory(); } catch (error) {
+    if (isMissing(error)) return false;
+    throw error;
+  }
 }
 function isDir(p: string): boolean {
-  try { return lstatSync(p).isDirectory(); } catch { return false; }
+  try { return lstatSync(p).isDirectory(); } catch (error) {
+    if (isMissing(error)) return false;
+    throw error;
+  }
 }
 
 export function enumerateScratchSecretPaths(input: ScratchSecretInput): ScratchSecrets {
@@ -95,10 +104,50 @@ export function enumerateScratchSecretPaths(input: ScratchSecretInput): ScratchS
   const addFile = (p: string | undefined): void => {
     if (p && isFileOrLink(p)) out.add(p);
   };
+  const addDirectoryMask = (p: string): boolean => {
+    let lst: ReturnType<typeof lstatSync>;
+    try {
+      lst = lstatSync(p);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') {
+        out.add(p);
+        return true;
+      }
+      // Secret enumeration must fail closed: an ESTALE/EIO/EACCES that later
+      // clears must not leave a long-lived scratch pane without this mask.
+      throw error;
+    }
+    if (lst.isDirectory()) {
+      out.add(p);
+      return true;
+    }
+    if (lst.isSymbolicLink()) {
+      try {
+        if (statSync(p).isDirectory()) {
+          out.add(p);
+          out.add(realpathSync(p));
+          return true;
+        }
+        return false; // symlink to a regular file: never turn into a directory mask
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') {
+          // Dangling symlink: mask the resolved target directory instead of the
+          // dangling link path itself (bwrap rejects bind-mounting dangling links).
+          out.add(resolve(dirname(p), readlinkSync(p)));
+          return true;
+        }
+        throw error;
+      }
+    }
+    return false;
+  };
 
   for (const home of input.botmuxHomes) {
     let entries: string[];
-    try { entries = readdirSync(home); } catch { continue; }
+    try { entries = readdirSync(home); } catch (error) {
+      if (isMissing(error)) continue;
+      throw error;
+    }
     for (const name of entries) {
       const p = join(home, name);
       // Top-level FILES are daemon-level authority (bots.json + every
@@ -110,7 +159,10 @@ export function enumerateScratchSecretPaths(input: ScratchSecretInput): ScratchS
         out.add(p);
       } else if (name === 'bots' && isDir(p)) {
         let appDirs: string[];
-        try { appDirs = readdirSync(p); } catch { continue; }
+        try { appDirs = readdirSync(p); } catch (error) {
+          if (isMissing(error)) continue;
+          throw error;
+        }
         for (const app of appDirs) {
           addFile(join(p, app, 'send-cred.json'));
         }
@@ -129,7 +181,9 @@ export function enumerateScratchSecretPaths(input: ScratchSecretInput): ScratchS
       for (const name of readdirSync(dir)) {
         if (name !== stem && name.startsWith(stem)) addFile(join(dir, name));
       }
-    } catch { /* */ }
+    } catch (error) {
+      if (!isMissing(error)) throw error;
+    }
   }
 
   for (const dataDir of input.dataDirs) {
@@ -156,7 +210,9 @@ export function enumerateScratchSecretPaths(input: ScratchSecretInput): ScratchS
             addFile(join(dataDir, name));
           }
         }
-      } catch { /* */ }
+      } catch (error) {
+        if (!isMissing(error)) throw error;
+      }
     }
 
     // Per-person secret subdirectories (whole dirs, present or not — see the
@@ -164,8 +220,7 @@ export function enumerateScratchSecretPaths(input: ScratchSecretInput): ScratchS
     // pending OAuth logins. The CLI never needs these inside a scratch turn
     // (they are daemon-side / per-owner).
     for (const secretDir of PER_PERSON_SECRET_DIRS) {
-      const p = join(dataDir, secretDir);
-      if (!isFileOrLink(p)) out.add(p);
+      addDirectoryMask(join(dataDir, secretDir));
     }
 
     // Trigger-user CLI identity dir: holds EVERY concurrent session's
@@ -175,8 +230,7 @@ export function enumerateScratchSecretPaths(input: ScratchSecretInput): ScratchS
     // / `botmux send` wrapper sources at runtime. Mirrors fs-policy's
     // per-session grants; never grant the parent.
     const cliIdentityDir = join(dataDir, CLI_IDENTITY_DIR);
-    if (!isFileOrLink(cliIdentityDir)) {
-      out.add(cliIdentityDir);
+    if (addDirectoryMask(cliIdentityDir)) {
       if (input.sessionId) {
         const ownDir = join(cliIdentityDir, sessionIdentityDirName(input.sessionId));
         if (existsSync(ownDir)) readOnlyCarve.add(ownDir);
@@ -195,7 +249,12 @@ export function enumerateScratchSecretPaths(input: ScratchSecretInput): ScratchS
     resolveLarkCliLinuxStoreDir(process.env.LARKSUITE_CLI_DATA_DIR, homeDir),
   ]);
   for (const p of larkStoreCandidates) {
-    if (existsSync(p)) out.add(p);
+    try {
+      lstatSync(p);
+      out.add(p);
+    } catch (error) {
+      if (!isMissing(error)) throw error;
+    }
   }
 
   return { denyPaths: [...out], readOnlyCarvePaths: [...readOnlyCarve] };
