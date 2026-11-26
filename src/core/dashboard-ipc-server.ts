@@ -203,8 +203,8 @@ import {
   CURRENT_EXECUTION_IDENTITY_ROUTE,
   CURRENT_EXECUTION_IDENTITY_SCHEMA,
 } from '../cli/current-execution.js';
-import { isBytedcliOverseasRegion } from '../platform/bytedcli-grant-regions.js';
-import { GRANT_WAIT_CAP_MS } from '../platform/credential-grant-budget.js';
+import { isBytedcliIdentityRegion } from '../platform/bytedcli-grant-regions.js';
+import { GRANT_WAIT_CAP_MS, PROVIDER_AUTH_REQUEST_ROUTE_BUDGET_MS } from '../platform/credential-grant-budget.js';
 import { resolveDaemonCurrentExecution } from './current-execution.js';
 import { configuredCliExecutionMode, sessionCliExecutionInfo } from './cli-execution-mode.js';
 import { getDashboardAdminOpenIds } from '../bot-registry.js';
@@ -651,7 +651,8 @@ import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { getIdentity, resolveVerifiedUserIdentity } from '../im/lark/identity-cache.js';
 import { isValidLarkScopeSyntax } from '../utils/lark-scope-catalog.js';
 import { unknownLarkUserScopes } from './lark-user-scope-validation.js';
-import { recallProvenIdentityContent, refreshSessionIdentity, sessionIdentityMaterialPresent } from './cli-identity.js';
+import { recallProvenIdentityContent, recallProvenIdentitySnapshot, refreshSessionIdentity, renderIdentityEnv, sessionIdentityMaterialPresent } from './cli-identity.js';
+import { readCliAuthEpoch } from '../services/cli-auth-epoch.js';
 import { allowsPersonalIdentityForTurn, isRunAsTurnId, isUnattendedIdentityTurnId } from './workflow-event-turn.js';
 import {
   decideOwnerFallback,
@@ -686,11 +687,11 @@ import { chooseTurnSpeaker, governedSpeakers } from './turn-speakers.js';
 import { resolveUserToken } from '../utils/user-token.js';
 import { currentLarkToolDelegation, getLarkToolDelegation } from './lark-tool-delegation.js';
 import { capabilityOfTool } from './identity-policy.js';
-import { reasonTag, platformAuthorizeUrl } from './platform-credential-source.js';
+import { activePlatformCredentialBindingKey, reasonTag, platformAuthorizeUrl } from './platform-credential-source.js';
 import { askPlatformToAuthorize, type PlatformAuthorizationRequestResult } from './platform-authorization-request.js';
 import { hasReason, PLATFORM_WILL_NOT_ISSUE_REASONS } from './refusal-reasons.js';
 import { requestUnattendedAuthorization, noticeUnattendedLapse, clearUnattendedLapse, definitelyNotAuthorized, missingAuthorizationEntries, privateNoticeSender, unattendedTask, unattendedRefusalText, type UnattendedNoticeOutcome, type UnattendedProvider } from './capability-authorization.js';
-import { publishDelegationRefusal, adoptLocalBytedcliAuthorization, retryMissingRegionalGrant, retryTransientTurnIdentity, awaitTurnIdentityPublication } from './turn-cli-identity.js';
+import { publishDelegationRefusal, adoptLocalBytedcliAuthorization, refreshExpiredPlatformBytedcliDefault, retryMissingRegionalGrant, retryTransientTurnIdentity, awaitTurnIdentityPublication } from './turn-cli-identity.js';
 import { boundLarkPlatformPolicy, platformAuthRequestRedirect, resolveBoundLarkUserCredential } from './lark-tool-platform-credential.js';
 import type { ReplyStyleConfig } from '../im/lark/reply-card-style.js';
 import {
@@ -1826,7 +1827,7 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
     ? toolValue as IdentityRouteTool : '';
   const region = record?.region;
   if (!sessionId || !tool || (record?.as !== undefined && typeof record.as !== 'string')
-    || (region !== undefined && (tool !== 'bytedcli' || !isBytedcliOverseasRegion(region)))) {
+    || (region !== undefined && (tool !== 'bytedcli' || !isBytedcliIdentityRegion(region)))) {
     return jsonRes(res, 400, blocked('invalid_request'));
   }
   const requestedAs = record?.as as string | undefined;
@@ -1931,12 +1932,26 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
       env = recallProvenIdentityContent(config.session.dataDir, sessionId, speakerTurnId, tool);
     }
     if (env && region && !delegation) {
-      await retryMissingRegionalGrant({
-        sessionDataDir: dataDir, sessionId, turnId: speakerTurnId, region, speakerOpenId: choice.speaker?.openId,
+      const refresh = {
+        sessionDataDir: dataDir, sessionId, turnId: speakerTurnId, speakerOpenId: choice.speaker?.openId,
         currentPolicy, executionStillCurrent, waitMs: grantDeadline - Date.now(),
-      });
-      if (!executionStillCurrent()) return jsonRes(res, 403, blocked('lineage_unproven'));
+      };
+      const renewed = region === 'default' || region === 'cn'
+        ? await refreshExpiredPlatformBytedcliDefault({ ...refresh, region })
+        : await retryMissingRegionalGrant({ ...refresh, region });
+      if (!executionStillCurrent() || renewed === 'superseded') return jsonRes(res, 403, blocked('lineage_unproven'));
+      if (renewed === 'unavailable') return jsonRes(res, 503, blocked('bytecloud_grant_unavailable'));
+      if (renewed === 'denied') return jsonRes(res, 403, blocked('bytecloud_grant_denied'));
       env = recallProvenIdentityContent(dataDir, sessionId, speakerTurnId, tool);
+      if (renewed === 'not_authorized' || renewed === 'consent_missing') {
+        // Refuse this command without overwriting the turn's other credentials.
+        // The existing wrapper flow can ask the platform for authorization.
+        const consent = renewed === 'consent_missing';
+        const hint = t(consent ? 'trigger_user_auth.denied_platform_consent' : 'trigger_user_auth.denied_platform_login',
+          { tool, provider: 'ByteCloud' }, localeForBot(liveAppId));
+        env = renderIdentityEnv({ tool: 'bytedcli', mode: 'denied', turnId: speakerTurnId,
+          openId: choice.speaker?.openId, message: `${hint}\n${reasonTag(consent ? 'platform_consent_missing' : 'platform_not_authorized')}` });
+      }
     }
     if (env) {
       return jsonRes(res, 200, {
@@ -5148,10 +5163,69 @@ async function handleProviderAuthRequest(
     return refuse('platform_credentials', 'ByteCloud identity comes from the platform and this host is not bound to it');
   }
   if (bound) {
+    const worker = ds.worker;
+    const generation = ds.workerGeneration;
+    const { turnId: executionTurnId, capability, dispatchAttempt } = origin;
+    const dataDir = config.session.dataDir;
+    const currentPolicy = () => getBot(ds.larkAppId).config.triggerUserAuth;
+    const executionStillCurrent = () => {
+      const live = ds.managedTurnOrigin;
+      if (findActiveBySessionId(sessionId) !== ds || ds.session.status !== 'active' || ds.worker !== worker
+        || !worker || worker.killed || worker.connected === false || ds.workerGeneration !== generation
+        || !live || live.turnId !== executionTurnId || (live.identityTurnId ?? live.turnId) !== turnId
+        || live.capability !== capability || live.dispatchAttempt !== dispatchAttempt || live.callerOpenId !== callerOpenId
+        || identityStorageModelForDaemonSession(ds) !== 'proven') return false;
+      if (as === undefined) return true;
+      try {
+        return governedSpeakers({ policy: currentPolicy(), tool: 'bytedcli',
+          sessionDataDir: dataDir, sessionId, origin: live })
+          ?.some(speaker => speaker.openId === openId && speaker.turnId === publishedTurnId) ?? false;
+      } catch { return false; }
+    };
+    const routeDeadline = Date.now() + PROVIDER_AUTH_REQUEST_ROUTE_BUDGET_MS;
+    const grantDeadline = Math.min(routeDeadline, Date.now() + GRANT_WAIT_CAP_MS);
+    const refreshBytedcli = ({ afterPlatformReady = false } = {}) => {
+      // A ready answer authorizes one immediate re-ask, past the previous
+      // refusal's cooldown. It gets its own grant window, bounded by this
+      // request's overall route budget so the CLI can still receive an answer.
+      const deadline = afterPlatformReady ? Math.min(routeDeadline, Date.now() + GRANT_WAIT_CAP_MS) : grantDeadline;
+      return refreshExpiredPlatformBytedcliDefault({
+        sessionDataDir: dataDir, sessionId, turnId: publishedTurnId, speakerOpenId: openId,
+        currentPolicy, executionStillCurrent, waitMs: deadline - Date.now(), force: afterPlatformReady,
+      });
+    };
+    const renewalUnavailable = (superseded: boolean) => jsonRes(res, 200, { ok: true, provider, status: 'unavailable',
+      message: t(superseded ? 'provider_auth.ready_bytedcli_superseded' : 'provider_auth.ready_bytedcli_unavailable', undefined, loc) });
+    const renewalDenied = () => jsonRes(res, 409, { ok: false, status: 'refused', error: 'platform_denied',
+      message: t('provider_auth.platform_team_required', undefined, loc) });
+    const bindingKey = provider === 'bytedcli' && published ? activePlatformCredentialBindingKey() : undefined;
+    const authEpoch = provider === 'bytedcli' && published ? readCliAuthEpoch(openId) : undefined;
+    const publishedBytedcliSnapshot = () => recallProvenIdentitySnapshot(dataDir, sessionId, publishedTurnId, 'bytedcli');
+    const originalSnapshot = provider === 'bytedcli' && published ? publishedBytedcliSnapshot() : undefined;
+    const canRequestRenewalAuthorization = () => {
+      try {
+        if (!executionStillCurrent() || activePlatformCredentialBindingKey() !== bindingKey
+          || readCliAuthEpoch(openId) !== authEpoch || publishedBytedcliSnapshot() !== originalSnapshot) return false;
+        const policy = currentPolicy();
+        return capabilityOn(policy, 'bytecloud') && credentialSourceOf(policy, 'bytecloud') !== 'local'
+          && !getLarkToolDelegation(dataDir, sessionId, turnId);
+      } catch { return false; }
+    };
+    let needsRenewalAuthorization = false;
     if (provider === 'bytedcli' && published?.('bytedcli')?.includes("BOTMUX_IDENTITY_MODE='user'")) {
-      return jsonRes(res, 200, { ok: true, provider, status: 'ready', message: t('provider_auth.ready_bytedcli_already', undefined, loc) });
+      const renewed = await refreshBytedcli();
+      if (!executionStillCurrent()) return renewalUnavailable(true);
+      if (renewed === 'ready' || renewed === 'untracked') {
+        return jsonRes(res, 200, { ok: true, provider, status: 'ready', message: t('provider_auth.ready_bytedcli_already', undefined, loc) });
+      }
+      if (renewed === 'denied') return renewalDenied();
+      if (renewed !== 'not_authorized' && renewed !== 'consent_missing') return renewalUnavailable(renewed === 'superseded');
+      needsRenewalAuthorization = true;
     }
-    const asked = await askPlatformToAuthorize({ botConfig: cfg, openId });
+    const asked = await askPlatformToAuthorize({ botConfig: cfg, openId,
+      ...(needsRenewalAuthorization ? { stillAllowed: canRequestRenewalAuthorization } : {}),
+    });
+    if (needsRenewalAuthorization && !canRequestRenewalAuthorization()) return renewalUnavailable(true);
     if (asked.kind === 'legacy') {
       const delivered = await deliverPlatformAuthorization(ds, cfg, openId, platformUrl, provider as AuthProvider | 'lark-cli', published);
       return jsonRes(res, 200, { ok: true, provider, ...delivered });
@@ -5162,6 +5236,14 @@ async function handleProviderAuthRequest(
         sessionDataDir: config.session.dataDir, sessionId, turnId: publishedTurnId, tool: provider as TriggerUserAuthTool,
         force: true, currentPolicy: () => getBot(ds.larkAppId).config.triggerUserAuth,
       });
+      // The card endpoint reports authorization, while readiness also requires
+      // a usable JWT in this turn, including if the recovery just published it.
+      if (provider === 'bytedcli' && published?.('bytedcli')?.includes("BOTMUX_IDENTITY_MODE='user'")) {
+        const renewed = await refreshBytedcli({ afterPlatformReady: true });
+        if (!executionStillCurrent()) return renewalUnavailable(true);
+        if (renewed === 'denied') return renewalDenied();
+        if (renewed !== 'ready' && renewed !== 'untracked') return renewalUnavailable(renewed === 'superseded');
+      }
       const effective = recallProvenIdentityContent(config.session.dataDir, sessionId, publishedTurnId, provider as TriggerUserAuthTool)
         ?.includes("BOTMUX_IDENTITY_MODE='user'");
       return jsonRes(res, 200, { ok: true, provider, status: 'ready',
@@ -11824,6 +11906,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     writableTerminalLinkInCard: cardPrefs.writableTerminalLinkInCard,
     goalStatusCard: cardPrefs.goalStatusCard,
     followUpReply: cardPrefs.followUpReply,
+    foldBackgroundUpdates: cardPrefs.foldBackgroundUpdates,
     privateCard: cardPrefs.privateCard,
     replyCardActions: cardPrefs.replyCardActions,
     replyCardNextStep: cardPrefs.replyCardNextStep,
@@ -12042,7 +12125,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     usageDisplay?: unknown;
     showUsageQuota?: unknown;
     replyCardMode?: unknown;
-    disableStreamingCard?: unknown; streamingCardFoldedLayout?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; codexBrowser?: unknown; codexBrowserAutoApproveOrigins?: unknown; writableTerminalLinkInCard?: unknown; goalStatusCard?: unknown; followUpReply?: unknown; privateCard?: unknown; replyCardActions?: unknown; replyCardNextStep?: unknown; replyCardRecap?: unknown; cotEnabled?: unknown; thinkingCard?: unknown;
+    disableStreamingCard?: unknown; streamingCardFoldedLayout?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; codexBrowser?: unknown; codexBrowserAutoApproveOrigins?: unknown; writableTerminalLinkInCard?: unknown; goalStatusCard?: unknown; followUpReply?: unknown; foldBackgroundUpdates?: unknown; privateCard?: unknown; replyCardActions?: unknown; replyCardNextStep?: unknown; replyCardRecap?: unknown; cotEnabled?: unknown; thinkingCard?: unknown;
     botToBotSameDir?: unknown;
     autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnGroupJoinSeed?: unknown; autoStartOnGroupJoinSeedDefault?: unknown; autoStartOnNewTopic?: unknown; autoStartExcludedChats?: unknown; autoInviteOwnerOnGroupAdd?: unknown;
     groupJoinCommandEnabled?: unknown; groupJoinCommand?: unknown;
@@ -12065,7 +12148,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     usageDisplay?: UsageDisplayMode;
     showUsageQuota?: boolean;
     replyCardMode?: import('../services/turn-reply-card.js').ReplyCardMode;
-    disableStreamingCard?: boolean; streamingCardFoldedLayout?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; codexBrowser?: boolean; codexBrowserAutoApproveOrigins?: boolean; writableTerminalLinkInCard?: boolean; goalStatusCard?: boolean; followUpReply?: boolean; privateCard?: boolean; replyCardActions?: boolean; replyCardNextStep?: boolean; replyCardRecap?: boolean; cotEnabled?: boolean;
+    disableStreamingCard?: boolean; streamingCardFoldedLayout?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; codexBrowser?: boolean; codexBrowserAutoApproveOrigins?: boolean; writableTerminalLinkInCard?: boolean; goalStatusCard?: boolean; followUpReply?: boolean; foldBackgroundUpdates?: boolean; privateCard?: boolean; replyCardActions?: boolean; replyCardNextStep?: boolean; replyCardRecap?: boolean; cotEnabled?: boolean;
     botToBotSameDir?: boolean;
     autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnGroupJoinSeed?: string; autoStartOnNewTopic?: boolean; autoStartExcludedChats?: string[]; autoInviteOwnerOnGroupAdd?: boolean;
     groupJoinCommandEnabled?: boolean; groupJoinCommand?: string;
@@ -12144,6 +12227,12 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
   if (typeof body.writableTerminalLinkInCard === 'boolean') patch.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
   if (typeof body.goalStatusCard === 'boolean') patch.goalStatusCard = body.goalStatusCard;
   if (typeof body.followUpReply === 'boolean') patch.followUpReply = body.followUpReply;
+  if (body.foldBackgroundUpdates !== undefined) {
+    if (typeof body.foldBackgroundUpdates !== 'boolean') {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_fold_background_updates' });
+    }
+    patch.foldBackgroundUpdates = body.foldBackgroundUpdates;
+  }
   if (typeof body.privateCard === 'boolean') patch.privateCard = body.privateCard;
   if (typeof body.replyCardActions === 'boolean') patch.replyCardActions = body.replyCardActions;
   if (typeof body.replyCardNextStep === 'boolean') patch.replyCardNextStep = body.replyCardNextStep;

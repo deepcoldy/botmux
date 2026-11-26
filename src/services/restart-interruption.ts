@@ -20,6 +20,7 @@ import {
   backgroundTaskDispatchToolUseIds,
   backgroundTaskLaunches,
   backgroundTaskSettledIds,
+  hasTranscriptRole,
   isClaudeApiRequestBlob,
   isClaudeTurnTerminalEvent,
   isClaudeUserInterruptEvent,
@@ -246,18 +247,19 @@ export function claudeInterruptedWork(
       continue;
     }
 
-    const role = ev.message?.role ?? ev.type;
+    const isUser = hasTranscriptRole(ev, 'user');
+    const isAssistant = hasTranscriptRole(ev, 'assistant');
     if (isClaudeUserInterruptEvent(ev)) {
       turnOpen = false;
     } else if (isMeaningfulUserEvent(ev) || isMeaningfulQueuedCommand(ev) || isScheduledTurnStartEvent(ev)) {
       turnOpen = true;
     } else if (isClaudeTurnTerminalEvent(ev)) {
       turnOpen = false;
-    } else if (role === 'assistant') {
+    } else if (isAssistant) {
       turnOpen = true;
     }
 
-    if (role === 'assistant' && Array.isArray(ev.message?.content)) {
+    if (isAssistant && Array.isArray(ev.message?.content)) {
       for (const block of ev.message!.content as any[]) {
         if (block && block.type === 'tool_use' && typeof block.id === 'string') {
           toolUses.set(block.id, toolUseDescription(block.input));
@@ -267,7 +269,7 @@ export function claudeInterruptedWork(
         legacyAwaitingAck.set(toolUseId, toolUses.get(toolUseId));
       }
     }
-    if (role === 'user') {
+    if (isUser) {
       const resultToolUseIds = toolResultToolUseIds(ev);
       const launchDescription = resultToolUseIds.length === 1 ? toolUses.get(resultToolUseIds[0]) : undefined;
       for (const l of backgroundTaskLaunches(ev)) {

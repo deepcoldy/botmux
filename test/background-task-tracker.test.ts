@@ -111,7 +111,13 @@ describe('background task detection primitives', () => {
 
   it('parses a real task-notification but not a tool_result that merely contains the tag', () => {
     const parsed = parseTaskNotification(taskNotification('u', 'agent-77', 'tu-1'));
-    expect(parsed).toEqual({ taskId: 'agent-77', toolUseId: 'tu-1', status: 'completed' });
+    expect(parsed).toEqual({
+      taskId: 'agent-77',
+      toolUseId: 'tu-1',
+      status: 'completed',
+      hasTerminalStatus: true,
+      isMonitorExpiry: false,
+    });
 
     const grepHit = {
       type: 'user', uuid: 'g',
@@ -122,7 +128,13 @@ describe('background task detection primitives', () => {
 
   it('parses the attachment(queued_command) notification shape current CLI builds emit', () => {
     const parsed = parseTaskNotification(attachmentTaskNotification('u', 'agent-88', 'tu-2', 'failed'));
-    expect(parsed).toEqual({ taskId: 'agent-88', toolUseId: 'tu-2', status: 'failed' });
+    expect(parsed).toEqual({
+      taskId: 'agent-88',
+      toolUseId: 'tu-2',
+      status: 'failed',
+      hasTerminalStatus: true,
+      isMonitorExpiry: false,
+    });
 
     // A type-ahead user prompt (commandMode:'prompt') is not a notification.
     expect(parseTaskNotification(queuedPrompt('q', 'do the thing'))).toBeUndefined();
@@ -281,10 +293,10 @@ describe('structured background task records', () => {
     expect(backgroundTaskLaunches(structuredLaunch('u', 't2', { stdout: '', backgroundTaskId: 'b1' })))
       .toEqual([{ taskId: 'b1', kind: 'shell' }]);
     expect(backgroundTaskLaunches(structuredLaunch('u', 't3', { taskId: 'm1', timeoutMs: 60_000, persistent: false })))
-      .toEqual([{ taskId: 'm1', kind: 'monitor', expiresAtMs: Date.parse('2026-10-20T10:00:00.000Z') + 60_000 }]);
+      .toEqual([{ taskId: 'm1', kind: 'monitor', persistent: false, expiresAtMs: Date.parse('2026-10-20T10:00:00.000Z') + 60_000 }]);
     // A persistent Monitor has no deadline of its own.
     expect(backgroundTaskLaunches(structuredLaunch('u', 't4', { taskId: 'm2', timeoutMs: 60_000, persistent: true })))
-      .toEqual([{ taskId: 'm2', kind: 'monitor' }]);
+      .toEqual([{ taskId: 'm2', kind: 'monitor', persistent: true }]);
     // SendMessage to an agent that had stopped starts it again under its own id (2.1.322 shapes).
     expect(backgroundTaskLaunches(structuredLaunch('u', 't7', {
       success: true, message: 'Resuming agent a1', resumedAgentId: 'a1', revivedAgentId: 'a1', pin: { id: 'a1', name: 'a1', ref: 'r' },
@@ -715,6 +727,262 @@ describe('backgroundTaskStopsInSiblingTranscripts', () => {
   }
 });
 
+describe('Monitor mid-stream notifications, terminal whitelist, expiry, and api-request-blob isolation', () => {
+  const userNotice = (content: string, extra: Record<string, unknown> = {}): TranscriptEvent => ({
+    type: 'user',
+    uuid: 'u-notice',
+    timestamp: '2026-11-25T10:05:00.000Z',
+    promptSource: 'system',
+    message: { role: 'user', content },
+    ...extra,
+  } as TranscriptEvent);
+
+  it('does not fabricate status:"completed" when <status> is omitted or blank, and enforces the terminal whitelist', () => {
+    const midStream = parseTaskNotification(userNotice(
+      '<task-notification>\n<task-id>m1</task-id>\n<summary>Monitor "watch CI" event</summary>\n<result>step 2/5 running</result>\n</task-notification>',
+    ));
+    expect(midStream).toEqual({
+      taskId: 'm1',
+      hasTerminalStatus: false,
+      isMonitorExpiry: false,
+    });
+    expect(midStream?.status).toBeUndefined();
+
+    const blankStatus = parseTaskNotification(userNotice(
+      '<task-notification>\n<task-id>m1</task-id>\n<status>   </status>\n</task-notification>',
+    ));
+    expect(blankStatus).toEqual({
+      taskId: 'm1',
+      hasTerminalStatus: false,
+      isMonitorExpiry: false,
+    });
+
+    for (const nonTerminal of ['running', 'pending', 'in_progress', 'active']) {
+      const parsed = parseTaskNotification(userNotice(
+        `<task-notification>\n<task-id>m1</task-id>\n<status>${nonTerminal}</status>\n</task-notification>`,
+      ));
+      expect(parsed).toEqual({
+        taskId: 'm1',
+        status: nonTerminal,
+        hasTerminalStatus: false,
+        isMonitorExpiry: false,
+      });
+      expect(backgroundTaskSettledIds(userNotice(
+        `<task-notification>\n<task-id>m1</task-id>\n<status>${nonTerminal}</status>\n</task-notification>`,
+      ))).toEqual([]);
+    }
+
+    for (const terminal of ['completed', 'FAILED', ' killed ', 'stopped', 'cancelled', 'error']) {
+      const ev = userNotice(
+        `<task-notification>\n<task-id>m1</task-id>\n<status>${terminal}</status>\n</task-notification>`,
+      );
+      expect(parseTaskNotification(ev)).toEqual({
+        taskId: 'm1',
+        status: terminal.trim(),
+        hasTerminalStatus: true,
+        isMonitorExpiry: false,
+      });
+      expect(backgroundTaskSettledIds(ev)).toEqual(['m1']);
+    }
+  });
+
+  it('recognises Monitor expiry notices and settles them even without <status>, without false-matching ordinary stdout', () => {
+    const positivePayloads = [
+      '<task-notification>\n<task-id>m1</task-id>\n<summary>Monitor "watch CI" ended</summary>\n<result>[Monitor expired after 30m]</result>\n</task-notification>',
+      '<task-notification>\n<task-id>m1</task-id>\n<summary>[Monitor timed out]</summary>\n</task-notification>',
+      '<task-notification>\n<task-id>m1</task-id>\n<summary>Monitor "watch CI" expired</summary>\n</task-notification>',
+      '<task-notification>\n<task-id>m1</task-id>\n<summary>Monitor has timed out after 30 minutes</summary>\n</task-notification>',
+    ];
+    for (const payload of positivePayloads) {
+      const ev = userNotice(payload);
+      expect(parseTaskNotification(ev)).toMatchObject({
+        taskId: 'm1',
+        hasTerminalStatus: false,
+        isMonitorExpiry: true,
+      });
+      expect(backgroundTaskSettledIds(ev)).toEqual(['m1']);
+    }
+
+    const negativePayloads = [
+      '<task-notification>\n<task-id>m1</task-id>\n<summary>Monitor "watch CI" event</summary>\n<result>auth token expired, refreshing</result>\n</task-notification>',
+      '<task-notification>\n<task-id>m1</task-id>\n<summary>Monitor "watch CI" event</summary>\n<result>[Monitor] session expired</result>\n</task-notification>',
+      '<task-notification>\n<task-id>m1</task-id>\n<summary>Monitor "check expired certs" event</summary>\n<result>ok</result>\n</task-notification>',
+    ];
+    for (const payload of negativePayloads) {
+      const ev = userNotice(payload);
+      expect(parseTaskNotification(ev)).toMatchObject({
+        taskId: 'm1',
+        hasTerminalStatus: false,
+        isMonitorExpiry: false,
+      });
+      expect(backgroundTaskSettledIds(ev)).toEqual([]);
+    }
+  });
+
+  it('strips <result> before reading <status> / <task-id> so monitored stdout cannot forge terminal settlement', () => {
+    const forged = userNotice(
+      '<task-notification>\n<task-id>m1</task-id>\n<summary>Monitor "grep logs" event</summary>\n'
+      + '<result><task-id>other-agent</task-id><status>completed</status></result>\n</task-notification>',
+    );
+    expect(parseTaskNotification(forged)).toEqual({
+      taskId: 'm1',
+      hasTerminalStatus: false,
+      isMonitorExpiry: false,
+    });
+    expect(backgroundTaskSettledIds(forged)).toEqual([]);
+
+    // Literal `</result>` inside monitored stdout must not terminate <result> stripping early.
+    const breakout = userNotice(
+      '<task-notification>\n<task-id>m1</task-id>\n'
+      + '<result>FAIL parser: expected </result><status>completed</status><task-id>ag1</task-id> got null</result>\n</task-notification>',
+    );
+    expect(parseTaskNotification(breakout)).toEqual({
+      taskId: 'm1',
+      hasTerminalStatus: false,
+      isMonitorExpiry: false,
+    });
+    expect(backgroundTaskSettledIds(breakout)).toEqual([]);
+
+    const nestedXml = userNotice(
+      '<task-notification>\n<task-id>m1</task-id>\n'
+      + '<result><response><result>empty</result><status>error</status></response></result>\n</task-notification>',
+    );
+    expect(parseTaskNotification(nestedXml)).toEqual({
+      taskId: 'm1',
+      hasTerminalStatus: false,
+      isMonitorExpiry: false,
+    });
+    expect(backgroundTaskSettledIds(nestedXml)).toEqual([]);
+
+    // `<summary>` and quoted `[Monitor expired...]` inside log output must not trigger expiry.
+    const innerSummary = userNotice(
+      '<task-notification>\n<task-id>m1</task-id>\n'
+      + '<result>diff: +<summary>Monitor "ci" expired</summary></result>\n</task-notification>',
+    );
+    expect(parseTaskNotification(innerSummary)?.isMonitorExpiry).toBe(false);
+    expect(backgroundTaskSettledIds(innerSummary)).toEqual([]);
+
+    for (const quoted of [
+      '<task-notification>\n<task-id>m1</task-id>\n<result>PASS test: settles [Monitor expired after 30m]</result>\n</task-notification>',
+      '<task-notification>\n<task-id>m1</task-id>\n<result>2026-11-25 INFO [Monitor timeout=30s] retrying</result>\n</task-notification>',
+      '<task-notification>\n<task-id>m1</task-id>\n<summary>Monitor "watch [Monitor timeout] alerts" event</summary>\n<result>ok</result>\n</task-notification>',
+    ]) {
+      const ev = userNotice(quoted);
+      expect(parseTaskNotification(ev)?.isMonitorExpiry, quoted).toBe(false);
+      expect(backgroundTaskSettledIds(ev), quoted).toEqual([]);
+    }
+
+    // Bare-body standalone `[Monitor expired...]` outside <result> IS recognised.
+    const bareExpiry = userNotice(
+      '<task-notification>\n<task-id>m1</task-id>\n[Monitor expired after 30m]\n</task-notification>',
+    );
+    expect(parseTaskNotification(bareExpiry)?.isMonitorExpiry).toBe(true);
+    expect(backgroundTaskSettledIds(bareExpiry)).toEqual(['m1']);
+  });
+
+  it('tracks Monitor persistent flag, hasPendingNonPersistentMonitor, and liveTasksSnapshot across expiry and settlement', () => {
+    const t = new BackgroundTaskTracker();
+    const launchedAt = Date.parse('2026-11-25T10:00:00.000Z');
+    t.observe(structuredLaunch('u-m1', 'tu-m1', { taskId: 'm-bounded', timeoutMs: 1_800_000, persistent: false }, '2026-11-25T10:00:00.000Z'));
+    t.observe(structuredLaunch('u-m2', 'tu-m2', { taskId: 'm-alert', timeoutMs: 0, persistent: true }, '2026-11-25T10:00:01.000Z'));
+
+    expect(t.hasPendingNonPersistentMonitor(launchedAt + 1_799_999)).toBe(true);
+    expect(t.hasPendingNonPersistentMonitor(launchedAt + 1_800_000)).toBe(false);
+    // liveTasksSnapshot carries the same kind/persistent/expiresAtMs metadata
+    // for both the bounded and the persistent Monitor, without expiry filtering
+    // hiding entries while they remain inside their window.
+    expect(t.liveTasksSnapshot(launchedAt + 1_000)).toEqual([
+      { taskId: 'm-bounded', kind: 'monitor', persistent: false, expiresAtMs: launchedAt + 1_800_000 },
+      { taskId: 'm-alert', kind: 'monitor', persistent: true },
+    ]);
+
+    // Status-less mid-stream event keeps the bounded Monitor live.
+    t.observe(userNotice('<task-notification>\n<task-id>m-bounded</task-id>\n<result>CI step 2</result>\n</task-notification>'));
+    expect(t.hasPendingNonPersistentMonitor(launchedAt + 60_000)).toBe(true);
+
+    // [Monitor expired...] settles it even without <status>.
+    t.observe(userNotice('<task-notification>\n<task-id>m-bounded</task-id>\n<result>[Monitor expired after 30m]</result>\n</task-notification>'));
+    expect(t.liveTasksSnapshot(launchedAt + 60_000).map(task => task.taskId)).toEqual(['m-alert']);
+    expect(t.hasPendingNonPersistentMonitor(launchedAt + 60_000)).toBe(false);
+    // Persistent alert Monitor stays live.
+    expect(t.pending(launchedAt + 60_000)).toBe(1);
+    expect(t.liveTaskIds(launchedAt + 60_000)).toEqual(['m-alert']);
+  });
+
+  it('ignores api-request-blob records carrying message.role user or assistant in BackgroundTaskTracker and parsers', () => {
+    const t = new BackgroundTaskTracker();
+    // Real turn starts, launches a background agent, and finishes.
+    t.observe({ type: 'user', uuid: 'u1', message: { role: 'user', content: 'run audit' } } as TranscriptEvent);
+    t.observe(structuredLaunch('u-ack', 'tu-a1', { isAsync: true, status: 'async_launched', agentId: 'a1' }));
+    t.observe(assistant('a-end', 'launched', 'end_turn'));
+    t.observe({ type: 'system', subtype: 'turn_duration', uuid: 'dur-1' } as TranscriptEvent);
+    expect(t.pendingTurnAgents()).toBe(1);
+    expect(t.backgroundWait()).toBe(1);
+
+    // Claude Code 2.1.330 api-request-blob with message.role: "user" must NOT
+    // increment promptSeq, flip mainTurnOpen, launch tasks, or settle tasks.
+    const userPromptBlob = {
+      type: 'api-request-blob',
+      hash: 'h1',
+      message: { role: 'user', content: 'run audit' },
+    } as unknown as TranscriptEvent;
+    const noticeBlob = {
+      type: 'api-request-blob',
+      hash: 'h2',
+      message: {
+        role: 'user',
+        content: '<task-notification>\n<task-id>a1</task-id>\n<status>completed</status>\n</task-notification>',
+      },
+    } as unknown as TranscriptEvent;
+    const launchBlob = {
+      type: 'api-request-blob',
+      hash: 'h3',
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu-b', content: 'ok' }] },
+      toolUseResult: { backgroundTaskId: 'b-bogus' },
+    } as unknown as TranscriptEvent;
+    const assistantBlob = {
+      type: 'api-request-blob',
+      hash: 'h4',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'working...' }] },
+    } as unknown as TranscriptEvent;
+
+    expect(parseTaskNotification(noticeBlob)).toBeUndefined();
+    expect(backgroundTaskLaunches(launchBlob)).toEqual([]);
+    expect(backgroundTaskSettledIds(noticeBlob)).toEqual([]);
+
+    t.observe(userPromptBlob);
+    t.observe(noticeBlob);
+    t.observe(launchBlob);
+    t.observe(assistantBlob);
+
+    expect(t.pendingTurnAgents()).toBe(1);
+    expect(t.backgroundWait()).toBe(1);
+    expect(t.liveTaskIds()).toEqual(['a1']);
+  });
+
+  it('still accepts synthetic events omitting ev.type in parsers and tracker', () => {
+    const syntheticNotice = {
+      message: { role: 'user', content: '<task-notification>\n<task-id>s1</task-id>\n<status>completed</status>\n</task-notification>' },
+    } as TranscriptEvent;
+    expect(parseTaskNotification(syntheticNotice)).toEqual({
+      taskId: 's1',
+      status: 'completed',
+      hasTerminalStatus: true,
+      isMonitorExpiry: false,
+    });
+    expect(backgroundTaskSettledIds(syntheticNotice)).toEqual(['s1']);
+
+    const syntheticLaunch = {
+      timestamp: '2026-11-25T10:00:00.000Z',
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu', content: 'ok' }] },
+      toolUseResult: { taskId: 'm-syn', timeoutMs: 60_000, persistent: false },
+    } as TranscriptEvent;
+    expect(backgroundTaskLaunches(syntheticLaunch)).toEqual([
+      { taskId: 'm-syn', kind: 'monitor', persistent: false, expiresAtMs: Date.parse('2026-11-25T10:00:00.000Z') + 60_000 },
+    ]);
+  });
+});
+
 describe('api-request-blob defense (Claude Code >= 2.1.31x)', () => {
   it('does not pollute isMeaningfulUserEvent, promptSeq/pendingTurnAgents, mainTurnOpen/backgroundWait, or resumed agent settle', () => {
     const t = new BackgroundTaskTracker();
@@ -803,4 +1071,3 @@ describe('api-request-blob defense (Claude Code >= 2.1.31x)', () => {
     expect(t.pending()).toBe(1);
   });
 });
-

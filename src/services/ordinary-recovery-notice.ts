@@ -421,19 +421,37 @@ export interface TurnNoticeRecord {
   msgType: 'interactive' | 'text';
   content: string;
   createdAt: number;
+  /** Structured worker/ACK notices retain pending ownership and delivered
+   * dedupe tombstones for the recovery lifetime; ordinary notices keep the old
+   * pending-only compaction behavior. */
+  retention?: 'structured';
+  carrier?: 'card' | 'text' | 'silent';
   delivery: OrdinaryRecoveryNoticeRecord['delivery'];
 }
 
 export const MAX_TURN_NOTICES = 10;
+const MAX_STRUCTURED_TURN_NOTICES = 32;
+// Workers stop retrying at RECOVERY_NOTICE_MAX_AGE_MS. Keep daemon tombstones
+// slightly longer so no late worker replay can repeat a settled UI effect.
+const STRUCTURED_NOTICE_TOMBSTONE_MAX_AGE_MS = RECOVERY_NOTICE_MAX_AGE_MS + 5 * 60_000;
 
-/** Add a notice to the session's list, keeping only the newest pending ones. */
+/** Add a notice to the session's list. Ordinary notices retain the newest
+ * pending rows; ACKed structured notices never silently lose a pending owner or
+ * a fresh delivered dedupe tombstone. Structured capacity overflow is explicit
+ * backpressure, so the worker keeps its pendingNotice and retries later. */
 export function addTurnNotice(
   list: readonly TurnNoticeRecord[] | undefined,
   record: TurnNoticeRecord,
 ): TurnNoticeRecord[] {
-  const pending = (list ?? []).filter(entry => entry.delivery.state === 'pending');
-  pending.push(record);
-  return pending.slice(-MAX_TURN_NOTICES);
+  const retained = (list ?? []).filter(entry => entry.retention === 'structured'
+    ? record.createdAt - entry.createdAt <= STRUCTURED_NOTICE_TOMBSTONE_MAX_AGE_MS
+    : entry.delivery.state === 'pending');
+  const pending = [...retained, record];
+  const structured = pending.filter(entry => entry.retention === 'structured');
+  if (structured.length > MAX_STRUCTURED_TURN_NOTICES) throw new Error('structured_notice_backpressure');
+  const ordinary = pending.filter(entry => entry.retention !== 'structured' && entry.delivery.state === 'pending');
+  const selected = new Set([...structured, ...ordinary.slice(-MAX_TURN_NOTICES)]);
+  return pending.filter(entry => selected.has(entry));
 }
 
 // ─── Outbox ──────────────────────────────────────────────────────────────────
@@ -442,6 +460,9 @@ export function addTurnNotice(
 export interface OutboxNoticeRecord {
   logicalTurnId?: string;
   createdAt: number;
+  /** Structured records keep their exact carrier across restart/replay. Only
+   * text-owned or legacy undefined records may enter the generic text outbox. */
+  carrier?: 'card' | 'text' | 'silent';
   delivery: OrdinaryRecoveryNoticeRecord['delivery'];
 }
 
@@ -504,7 +525,7 @@ export class RecoveryNoticeOutbox<TTimer = unknown, TRecord extends OutboxNotice
    *  to deliver and stop). */
   resume(host: RecoveryNoticeHost<TRecord>): void {
     for (const record of host.list()) {
-      if (record.delivery.state !== 'pending') continue;
+      if (record.delivery.state !== 'pending' || record.carrier === 'card' || record.carrier === 'silent') continue;
       const recordKey = outboxNoticeKey(record);
       const key = this.keyOf(host.key, recordKey);
       if (this.inFlight.has(key)) continue;
@@ -559,7 +580,7 @@ export class RecoveryNoticeOutbox<TTimer = unknown, TRecord extends OutboxNotice
     const key = this.keyOf(host.key, logicalTurnId);
     if (this.inFlight.has(key)) return;
     const record = host.list().find(entry => outboxNoticeKey(entry) === logicalTurnId);
-    if (!record || record.delivery.state !== 'pending') return;
+    if (!record || record.delivery.state !== 'pending' || record.carrier === 'card' || record.carrier === 'silent') return;
     const now = this.now();
     if (recoveryNoticeExpired(record, now)) {
       this.safeUpdate(host, logicalTurnId, entry => {

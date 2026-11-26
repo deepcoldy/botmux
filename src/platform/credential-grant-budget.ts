@@ -41,3 +41,9 @@ export const GRANT_WAIT_CAP_MS = TOTAL_BUDGET_MS + UNION_ID_LOOKUP_ROOM_MS;
 /** Client side: timeout of a request to a daemon route that may wait up to
  *  {@link GRANT_WAIT_CAP_MS} (or run a grant itself). */
 export const GRANT_ROUTE_CLIENT_TIMEOUT_MS = GRANT_WAIT_CAP_MS + ROUTE_OVERHEAD_ROOM_MS;
+
+/** A provider authorization request may include a grant, a platform card
+ * request and one post-authorization grant. Keep the daemon's own deadline one
+ * overhead allowance inside the CLI timeout so its last answer can get back. */
+export const PROVIDER_AUTH_REQUEST_CLIENT_TIMEOUT_MS = 60_000;
+export const PROVIDER_AUTH_REQUEST_ROUTE_BUDGET_MS = PROVIDER_AUTH_REQUEST_CLIENT_TIMEOUT_MS - ROUTE_OVERHEAD_ROOM_MS;

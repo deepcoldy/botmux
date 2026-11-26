@@ -62,6 +62,7 @@ import {
   serializePinStreamingCardConfigChange,
 } from './pin-streaming-card-change.js';
 import { notifyFollowUpReplyChanged } from './follow-up-reply-change.js';
+import { notifyFoldBackgroundUpdatesChanged } from './fold-background-updates-change.js';
 import {
   cliModelMayKeepReasoningEffort,
   cliModelSupportsReasoningEffort,
@@ -177,6 +178,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'writableTerminalLinkInCard', configKey: 'writableTerminalLinkInCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '卡片内嵌可写终端链接 on|off' },
   { key: 'goalStatusCard', configKey: 'goalStatusCard', kind: 'boolean', effect: 'next-session', clearable: false, hint: '目标状态卡 on|off（默认 off）：Codex / TRAE 设定原生目标时，在会话里发一张状态卡并原地更新进行中、完成等状态和 CLI 累计时长；新会话或会话重启后开始读取目标，关闭后已有的卡立即停止更新' },
   { key: 'followUpReply', configKey: 'followUpReply', kind: 'boolean', effect: 'next-session', clearable: false, hint: '执行中途的即时回复 on|off（默认 off）：CLI 把执行中途收到的飞书消息并入当前一轮时（Claude Code adopt 会话、Codex 同轮转向），模型一答完就引用那条消息回复，不用等整轮结束；Codex 每轮执行中途说的进展（说完接着干活的那几句）也会回复到对应消息下；新会话或会话重启后生效，关闭立即停止发送' },
+  { key: 'foldBackgroundUpdates', configKey: 'foldBackgroundUpdates', kind: 'boolean', effect: 'immediate', clearable: false, hint: '折叠后台任务的等待进展 on|off（默认 off）：AI 帮你在后台盯着 CI、构建、日志等长任务时，等待期间的中间进展收进思考/进度折叠区，不再刷屏发新消息；开头的回复、需人工介入的提问以及任务完成/失败/超时后的最终汇报照常发送；立即生效' },
   { key: 'privateCard', configKey: 'privateCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '/card 发 owner-only 私有快照 on|off' },
   { key: 'replyCardActions', configKey: 'replyCardActions', kind: 'boolean', effect: 'immediate', clearable: false, hint: '回复卡右下角操作菜单（打开终端/切换模型/关闭会话）on|off，默认关闭' },
   { key: 'replyCardNextStep', configKey: 'replyCardNextStep', kind: 'boolean', effect: 'immediate', clearable: false, hint: '回复卡「下一步」按钮 on|off，默认关闭：把 CLI 给出的下一轮推荐输入（目前是 Claude Code 输入框里的置灰提示）放在本轮最后一张回复卡签名上方，点击即以点击人身份发给本会话；不支持的 CLI 不显示' },
@@ -835,6 +837,9 @@ async function applyConfigFieldInternal(
   // /config, /botconfig and the config-card boolean toggles all land here.
   // Keep workers on the same live value as the daemon's absorbed_reply gate.
   if (spec.configKey === 'followUpReply') notifyFollowUpReplyChanged(larkAppId, bot.config.followUpReply === true);
+  if (spec.configKey === 'foldBackgroundUpdates') {
+    notifyFoldBackgroundUpdatesChanged(larkAppId, bot.config.foldBackgroundUpdates === true);
+  }
   logger.info(`[config:${larkAppId}] set ${spec.key}: ${oldText} -> ${newText}`);
   return { ok: true, oldText, newText, effect: spec.effect };
 }

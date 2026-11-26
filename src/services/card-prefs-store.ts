@@ -58,6 +58,7 @@ import {
   serializePinStreamingCardConfigChange,
 } from './pin-streaming-card-change.js';
 import { notifyFollowUpReplyChanged } from './follow-up-reply-change.js';
+import { notifyFoldBackgroundUpdatesChanged } from './fold-background-updates-change.js';
 import {
   normalizeHiddenStreamingCardButtons,
   resolveStreamingCardFoldedLayout,
@@ -97,6 +98,8 @@ export interface BotCardPrefs extends ReplyFooterPreferences {
   goalStatusCard: boolean;
   /** Mid-turn replies (see BotConfig.followUpReply). Default false; only true persists. */
   followUpReply: boolean;
+  /** Fold intermediate waiting updates while watching background tasks. Default false; only true persists. */
+  foldBackgroundUpdates: boolean;
   privateCard: boolean;
   /** Compact overflow menu (terminal/model/close) on ordinary reply cards.
    *  Default false; only an explicit true enables it. */
@@ -195,6 +198,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       writableTerminalLinkInCard: c.writableTerminalLinkInCard === true,
       goalStatusCard: c.goalStatusCard === true,
       followUpReply: c.followUpReply === true,
+      foldBackgroundUpdates: c.foldBackgroundUpdates === true,
       privateCard: c.privateCard === true,
       replyCardActions: c.replyCardActions === true,
       replyCardNextStep: c.replyCardNextStep === true,
@@ -244,6 +248,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       writableTerminalLinkInCard: false,
       goalStatusCard: false,
       followUpReply: false,
+      foldBackgroundUpdates: false,
       privateCard: false,
       replyCardActions: false,
       replyCardNextStep: false,
@@ -390,6 +395,7 @@ async function updateBotCardPrefsInternal(
     apply(entry, 'writableTerminalLinkInCard', patch.writableTerminalLinkInCard);
     apply(entry, 'goalStatusCard', patch.goalStatusCard);
     apply(entry, 'followUpReply', patch.followUpReply);
+    apply(entry, 'foldBackgroundUpdates', patch.foldBackgroundUpdates);
     apply(entry, 'privateCard', patch.privateCard);
     apply(entry, 'replyCardActions', patch.replyCardActions);
     apply(entry, 'replyCardNextStep', patch.replyCardNextStep);
@@ -444,6 +450,7 @@ async function updateBotCardPrefsInternal(
         writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true,
         goalStatusCard: entry.goalStatusCard === true,
         followUpReply: entry.followUpReply === true,
+        foldBackgroundUpdates: entry.foldBackgroundUpdates === true,
         privateCard: entry.privateCard === true,
         replyCardActions: entry.replyCardActions === true,
         replyCardNextStep: entry.replyCardNextStep === true,
@@ -529,6 +536,9 @@ async function updateBotCardPrefsInternal(
   }
   if (patch.followUpReply !== undefined) {
     bot.config.followUpReply = patch.followUpReply || undefined;
+  }
+  if (patch.foldBackgroundUpdates !== undefined) {
+    bot.config.foldBackgroundUpdates = patch.foldBackgroundUpdates || undefined;
   }
   if (patch.privateCard !== undefined) {
     bot.config.privateCard = patch.privateCard || undefined;
@@ -634,6 +644,9 @@ async function updateBotCardPrefsInternal(
     notifyPinStreamingCardChanged(larkAppId, nextPinStreamingCard);
   }
   if (patch.followUpReply !== undefined) notifyFollowUpReplyChanged(larkAppId, r.result.followUpReply);
+  if (patch.foldBackgroundUpdates !== undefined) {
+    notifyFoldBackgroundUpdatesChanged(larkAppId, r.result.foldBackgroundUpdates);
+  }
   logger.info(
     `[card-prefs:${larkAppId}] usageDisplay=${r.result.usageDisplay} ` +
     `showUsageQuota=${r.result.showUsageQuota} ` +
@@ -643,7 +656,7 @@ async function updateBotCardPrefsInternal(
     `silentTurnReactions=${r.result.silentTurnReactions} ` +
     `codexAppCleanInput=${r.result.codexAppCleanInput} ` +
     `codexBrowser=${r.result.codexBrowser} ` +
-    `writableTerminalLinkInCard=${r.result.writableTerminalLinkInCard} goalStatusCard=${r.result.goalStatusCard} followUpReply=${r.result.followUpReply} privateCard=${r.result.privateCard} ` +
+    `writableTerminalLinkInCard=${r.result.writableTerminalLinkInCard} goalStatusCard=${r.result.goalStatusCard} followUpReply=${r.result.followUpReply} foldBackgroundUpdates=${r.result.foldBackgroundUpdates} privateCard=${r.result.privateCard} ` +
     `cotEnabled=${r.result.cotEnabled} ` +
     `thinkingCardToolResult=${r.result.thinkingCardToolResult} ` +
     `senderTag=${r.result.senderTag} ` +

@@ -341,6 +341,17 @@ describe('buildBotFromAddFlags', () => {
     expect(buildBotFromAddFlags({ ...REQUIRED, showInTeam: 'true' }).showInTeam).toBeUndefined();
   });
 
+  it('parses --fold-background-updates, stores only explicit true, and keeps default false unstored', () => {
+    expect(parseSetupCommand(['add', '--app-id', 'cli_1', '--app-secret', 'sec', '--allowed-users', 'a@b.com', '--fold-background-updates', 'true']))
+      .toMatchObject({ action: 'add', flags: { foldBackgroundUpdates: 'true' } });
+    expect(parseSetupCommand(['edit', 'cli_1', '--fold-background-updates', 'false']))
+      .toMatchObject({ action: 'edit', flags: { foldBackgroundUpdates: 'false' } });
+    expect(buildBotFromAddFlags({ ...REQUIRED, foldBackgroundUpdates: 'true' }).foldBackgroundUpdates).toBe(true);
+    expect(buildBotFromAddFlags({ ...REQUIRED, foldBackgroundUpdates: 'false' }).foldBackgroundUpdates).toBeUndefined();
+    expect(editInputFromFlags({ foldBackgroundUpdates: 'true' })).toEqual({ foldBackgroundUpdates: 'true' });
+    expect(SETUP_CLI_USAGE).toContain('--fold-background-updates');
+  });
+
   it('stores lang when specified', () => {
     expect(buildBotFromAddFlags({ ...REQUIRED, lang: 'en' }).lang).toBe('en');
     expect(buildBotFromAddFlags({ ...REQUIRED, lang: 'zh' }).lang).toBe('zh');

@@ -15,6 +15,7 @@ import { cliModelMayKeepReasoningEffort } from '../../src/services/codex-reasoni
 import { runtimeStartRefusal } from '../../src/services/runtime-reservation.js';
 import { cotMessageFinishStatus } from '../../src/im/lark/cot-message.js';
 import { resetStartingCardHealth } from '../../src/core/starting-card-health.js';
+import { isStructuredNoticeProtocolMessage } from '../../src/services/structured-notice-protocol.js';
 import { ProtectedResultStore } from '../../src/services/protected-result-store.js';
 
 /** deliverFinalOutput's protected final gate reads `config.session.dataDir` and
@@ -66,7 +67,9 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
   if (key === 'activeSessionKey') return activeSessionKey;
   if (key === 'runtimeStartRefusal') return runtimeStartRefusal;
   if (key === 'cotMessageFinishStatus') return cotMessageFinishStatus;
+  if (key === 'hasCotMessageForTurn') return () => false;
   if (key === 'resetStartingCardHealth') return resetStartingCardHealth;
+  if (key === 'isStructuredNoticeProtocolMessage') return isStructuredNoticeProtocolMessage;
   if (key === 'cancelAntigravityRotationReplay') return cancelAntigravityRotationReplay;
   if (key === 'clearInFlightAntigravityRotation') return clearInFlightAntigravityRotation;
   if (key === 'formatAntigravityCooldown') return formatAntigravityCooldown;
@@ -90,7 +93,7 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
   if (typeof key === 'string' && ['canForkRegisteredSession', 'ownsCodexAppFinalDelivery', 'completeWorkerOrdinaryImDelivery',
     'clearOrdinaryImDelivery', 'recordWorkerCommittedTurn', 'speculateStatuslineLaunchGen',
     'recordLaunchModel', 'assistantLiveInputAdmission', 'assistantTransferInputDeliveryAllowed',
-    'releaseHeldCotMessage', 'isReplayOfHeldCotTerminal', 'finalizeOrHoldCotMessage',
+    'releaseHeldCotMessage', 'isReplayOfHeldCotTerminal', 'isSynthesizedBackgroundTurnId', 'finalizeOrHoldCotMessage',
     'requiredReplyCotHoldKey', 'settleRequiredReplyBackground', 'settleRequiredReplyCotMessage',
     'failRequiredReplyCotHolds', 'clearWorkerRuntimeProvenance'].includes(key)) {
     return scope[key] ??= loadWorkerPoolFunction(key, scope);
