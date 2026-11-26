@@ -437,7 +437,6 @@ import {
   buildRelayedTurnReplyPortCandidates,
   postRelayedTurnReplies,
   recordStructuredTurnRepliesWithFallback,
-  RELAYED_TURN_REPLY_HEADERS,
   RELAYED_TURN_REPLY_ROUTE,
   type RelayedTurnReplyClientClaim,
 } from './core/relayed-turn-reply.js';
@@ -6883,7 +6882,7 @@ async function postSessionCliIpc(
   route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'chat-manager' | 'rename' | 'project' | 'project-workstream' | 'decision-board' | 'continuation' | 'durable-send' | 'turn-delivery' | typeof RELAYED_TURN_REPLY_ROUTE | 'reply-card-ready' | 'feedback-bind' | typeof DEFERRED_TOPIC_CLAIM_ROUTE | typeof FEEDBACK_SEND_LEASE_ROUTE | 'link-refs/register' | 'link-refs/resolve',
   payload: Record<string, unknown>,
   signal?: AbortSignal,
-  opts?: { originClaim?: RelayedTurnReplyClientClaim | null },
+  opts?: { originClaim?: RelayedTurnReplyClientClaim | null; relayHeaders?: Record<string, string> },
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };
   const headers: Record<string, string> = { 'content-type': 'application/json' };
@@ -6891,7 +6890,12 @@ async function postSessionCliIpc(
   if (!process.env.BOTMUX_SEND_RELAY) {
     try { hostSecret = loadDaemonIpcSecret(); } catch { /* sandboxed/read-isolated: capability fallback below */ }
   }
-  if (!hostSecret || route === 'chat-manager' || route === 'project-workstream' || route === RELAYED_TURN_REPLY_ROUTE) {
+  if (route === RELAYED_TURN_REPLY_ROUTE) {
+    // This route accepts only sealed payloads. Never attach the raw bearer
+    // capability: the request/response HMACs use it strictly as local key material.
+    if (!opts?.relayHeaders) throw new Error('Missing protected turn-reply envelope');
+    Object.assign(headers, opts.relayHeaders);
+  } else if (!hostSecret || route === 'chat-manager' || route === 'project-workstream') {
     const resolvedClaim = opts && 'originClaim' in opts
       ? opts.originClaim ?? null
       : (() => {
@@ -6902,7 +6906,7 @@ async function postSessionCliIpc(
             process.env.BOTMUX_ORIGIN_CHANNEL_ID,
           );
           if (claim) return claim;
-          if ((route === 'chat-manager' || route === 'project-workstream' || route === RELAYED_TURN_REPLY_ROUTE)
+          if ((route === 'chat-manager' || route === 'project-workstream')
             && !process.env.BOTMUX_SEND_RELAY && !process.env.BOTMUX_ORIGIN_CHANNEL_ID) {
             try {
               const marker = findAuthenticatedAncestorSessionContext(resolveDataDir());
@@ -6918,20 +6922,9 @@ async function postSessionCliIpc(
           return null;
         })();
     if (resolvedClaim) {
-      if (route === RELAYED_TURN_REPLY_ROUTE) {
-        // Always attach capability headers when available: if $HOME holds a
-        // mismatched `.dashboard-secret`, the daemon's outer gate falls through
-        // to `sessionCliIpcAuth` and authenticates via these headers instead.
-        headers[RELAYED_TURN_REPLY_HEADERS.capability] = resolvedClaim.capability;
-        if (resolvedClaim.turnId) headers[RELAYED_TURN_REPLY_HEADERS.turnId] = resolvedClaim.turnId;
-        if (resolvedClaim.dispatchAttempt !== undefined) {
-          headers[RELAYED_TURN_REPLY_HEADERS.dispatchAttempt] = String(resolvedClaim.dispatchAttempt);
-        }
-      } else {
-        requestBody.originCapability = resolvedClaim.capability;
-        if (resolvedClaim.turnId) requestBody.originTurnId = resolvedClaim.turnId;
-        if (resolvedClaim.dispatchAttempt !== undefined) requestBody.originDispatchAttempt = resolvedClaim.dispatchAttempt;
-      }
+      requestBody.originCapability = resolvedClaim.capability;
+      if (resolvedClaim.turnId) requestBody.originTurnId = resolvedClaim.turnId;
+      if (resolvedClaim.dispatchAttempt !== undefined) requestBody.originDispatchAttempt = resolvedClaim.dispatchAttempt;
     }
   }
   const path = `/api/sessions/${encodeURIComponent(sessionId)}/${route}`;
@@ -14052,9 +14045,15 @@ async function cmdSend(
           expectedTurnId: markerTurnId,
           replies: batch,
           readClaim: readClaimForSession,
+          readHostSecret: () => {
+            if (relayDir) return undefined;
+            try { return loadDaemonIpcSecret(); } catch { return undefined; }
+          },
+          preferCapability: mustProxyStructuredReply,
           resolvePorts: resolvePortsForSession,
-          postBatch: ({ ipcPort, sessionId: targetSid, payload, claim, signal }) =>
-            postSessionCliIpc(ipcPort, targetSid, RELAYED_TURN_REPLY_ROUTE, payload, signal, { originClaim: claim }),
+          postBatch: ({ ipcPort, sessionId: targetSid, payload, headers, signal }) =>
+            postSessionCliIpc(ipcPort, targetSid, RELAYED_TURN_REPLY_ROUTE,
+              payload as unknown as Record<string, unknown>, signal, { relayHeaders: headers }),
           allowTurnUnboundRetry: !isolatedAttestationContext,
         }),
       });
@@ -15734,6 +15733,7 @@ async function cmdSend(
       // and updates primaryQuotedId). Otherwise a bare `--videos … --no-mention`
       // reply in a 普通群 lands as a standalone message that doesn't quote the
       // trigger — unlike file-only/image-only sends whose primary card quotes.
+      const sentVideoIndices: number[] = [];
       const videoResult = await sendVideoAttachments(
         {
           uploadFile,
@@ -15741,6 +15741,9 @@ async function cmdSend(
           dispatch: dispatchAfterOriginGate,
           primaryDispatch: (body, type) => dispatchPrimary(body, type, true),
           beforeEffect: fenceIsolatedOriginBeforeEffect,
+          onResult: (index, outcome) => {
+            if ('messageId' in outcome) sentVideoIndices.push(index);
+          },
           ...(vcMeetingManagedSendOrigin ? { maxMessages: 1 } : {}),
         },
         appId,
@@ -15757,19 +15760,25 @@ async function cmdSend(
         try {
           const { ReplyDeliveryStore } = await import('./services/reply-delivery-store.js');
           const deliveryStore = new ReplyDeliveryStore(resolveDataDir());
-          const secondaryIds = videoMessageIds.filter(id => id !== messageId);
-          if (secondaryIds.length > 0) {
+          const secondary = videoMessageIds.slice(1).map((candidateId, position) => ({
+            messageId: candidateId,
+            sourceIndex: sentVideoIndices[position + 1]!,
+          }));
+          if (secondary.length > 0) {
             const videoDeliveryId = deliveryStore.begin(
               appId,
               messageId,
               targetChatId,
-              secondaryIds.map((_, idx) => ({
-                path: videoAttachments[idx + 1]?.videoPath ?? `video-${idx + 1}.mp4`,
+              // `sent` is compressed after failures. Use the original indices
+              // reported by onResult rather than treating position+1 as the
+              // source attachment, or C's id can be recorded under B's name.
+              secondary.map(({ sourceIndex }) => ({
+                path: videoAttachments[sourceIndex]?.videoPath ?? `video-${sourceIndex + 1}.mp4`,
                 type: 'media' as const,
               })),
             );
-            for (let idx = 0; idx < secondaryIds.length; idx++) {
-              deliveryStore.record(appId, messageId, targetChatId, videoDeliveryId, idx, { messageId: secondaryIds[idx]! });
+            for (let idx = 0; idx < secondary.length; idx++) {
+              deliveryStore.record(appId, messageId, targetChatId, videoDeliveryId, idx, { messageId: secondary[idx]!.messageId });
             }
           }
         } catch { /* best-effort delivery index for replay healing */ }

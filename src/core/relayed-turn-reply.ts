@@ -3,6 +3,16 @@ import { performance } from 'node:perf_hooks';
 import type { DaemonSession } from './types.js';
 import type { TurnSendKind } from '../services/turn-send-ledger.js';
 import {
+  RELAYED_TURN_REPLY_HEADERS,
+  RELAYED_TURN_REPLY_RESPONSE_MAX_BYTES,
+  sealRelayedTurnReplyRequest,
+  verifyRelayedTurnReplyResponse,
+  type RelayedTurnReplyKey,
+  type RelayedTurnReplyKeyKind,
+  type RelayedTurnReplyRequestAuth,
+  type RelayedTurnReplyWireBody,
+} from './relayed-turn-reply-crypto.js';
+import {
   recordSessionTurnReplies,
   type RecordSessionTurnRepliesResult,
   type RecordSessionTurnReplyLimits,
@@ -20,10 +30,11 @@ import {
  * the host and is strictly host-only — never allowlisted into any sandbox.
  *
  * Trust boundary:
- * - Pre-body auth & rate admission: the HTTP handler runs `sessionCliIpcAuth(...,
- *   { allowReceiver: true })` using outer trusted-host HMAC or
- *   `RELAYED_TURN_REPLY_HEADERS` and enforces sliding-window request rate +
+ * - Pre-body auth & rate admission: the HTTP handler verifies an HMAC bound to
+ *   the exact sealed body (using either the host IPC secret or the live turn
+ *   capability as local key material) and enforces sliding-window request rate +
  *   per-session/global in-flight limits BEFORE reading any request body bytes.
+ *   Neither key nor plaintext reply text crosses the loopback wire.
  * - Zero TOCTOU: after bounded body read, the handler synchronously re-verifies
  *   `ds`, `ds.managedTurnOrigin.turnId`, and (for capability callers) live
  *   capability before committing in a single SQLite transaction.
@@ -36,16 +47,24 @@ import {
  *   caps are enforced atomically post-deduplication inside SQLite.
  */
 export const RELAYED_TURN_REPLY_ROUTE = 'turn-reply';
+export { RELAYED_TURN_REPLY_HEADERS };
+export type {
+  RelayedTurnReplyKey,
+  RelayedTurnReplyKeyKind,
+  RelayedTurnReplyRequestAuth,
+  RelayedTurnReplyWireBody,
+};
+export {
+  openRelayedTurnReplyRequest,
+  sealRelayedTurnReplyRequest,
+  signRelayedTurnReplyResponse,
+  verifyRelayedTurnReplyRequestProof,
+  verifyRelayedTurnReplyResponse,
+} from './relayed-turn-reply-crypto.js';
 
-export const RELAYED_TURN_REPLY_HEADERS = {
-  capability: 'x-botmux-origin-capability',
-  turnId: 'x-botmux-origin-turn-id',
-  dispatchAttempt: 'x-botmux-origin-dispatch-attempt',
-} as const;
-
-/** 2 MiB: holds a 256 KiB UTF-16 CJK reply (~768 KiB UTF-8) + worst-case JSON
- *  escaping + batch envelope metadata without false 413 rejections. */
-export const RELAYED_TURN_REPLY_MAX_BYTES = 2 * 1024 * 1024;
+/** 3 MiB: holds the AES-GCM/base64url envelope for a 256 KiB UTF-16 CJK reply
+ *  (~768 KiB UTF-8) plus worst-case JSON escaping and request metadata. */
+export const RELAYED_TURN_REPLY_MAX_BYTES = 3 * 1024 * 1024;
 export const RELAYED_TURN_REPLY_BODY_TIMEOUT_MS = 2_000;
 export const RELAYED_TURN_REPLY_MAX_IN_FLIGHT = 16;
 export const RELAYED_TURN_REPLY_MAX_IN_FLIGHT_PER_SESSION = 3;
@@ -71,35 +90,33 @@ const MESSAGE_ID_RE = /^(?:om_[A-Za-z0-9_-]{1,128}|doc:[A-Za-z0-9_.-]{1,128})$/;
 const VALID_RESPONSE_KINDS = new Set<TurnSendKind>(['progress', 'final', 'auxiliary']);
 const EXPECTED_TURN_ID_MAX_CHARS = 256;
 
-export interface RelayedTurnReplyAuthClaim {
-  originCapability?: string;
-  originTurnId?: string;
-  originDispatchAttempt?: number;
-}
+export type RelayedTurnReplyAuthClaim = Partial<RelayedTurnReplyRequestAuth>;
 
 function singleHeaderString(headers: IncomingHttpHeaders, name: string): string | undefined {
   const value = headers[name];
   return typeof value === 'string' ? value : undefined;
 }
 
-/** Parse capability auth headers strictly from single-valued HTTP headers. */
+/** Parse encrypted-relay auth headers strictly from single-valued HTTP headers. */
 export function parseRelayedTurnReplyAuthHeaders(headers: IncomingHttpHeaders): RelayedTurnReplyAuthClaim {
   const claim: RelayedTurnReplyAuthClaim = {};
-  const capability = singleHeaderString(headers, RELAYED_TURN_REPLY_HEADERS.capability);
-  if (capability && capability.length <= 256) {
-    claim.originCapability = capability;
-  }
+  const keyKind = singleHeaderString(headers, RELAYED_TURN_REPLY_HEADERS.keyKind);
+  if (keyKind === 'capability' || keyKind === 'host') claim.keyKind = keyKind;
   const turnId = singleHeaderString(headers, RELAYED_TURN_REPLY_HEADERS.turnId);
   if (turnId && turnId.length <= EXPECTED_TURN_ID_MAX_CHARS && !turnId.includes('\0')) {
-    claim.originTurnId = turnId;
+    claim.turnId = turnId;
   }
   const attemptRaw = singleHeaderString(headers, RELAYED_TURN_REPLY_HEADERS.dispatchAttempt);
   if (attemptRaw && /^\d+$/.test(attemptRaw)) {
     const attempt = Number(attemptRaw);
-    if (Number.isSafeInteger(attempt) && attempt > 0) {
-      claim.originDispatchAttempt = attempt;
-    }
+    if (Number.isSafeInteger(attempt) && attempt > 0) claim.dispatchAttempt = attempt;
   }
+  const requestNonce = singleHeaderString(headers, RELAYED_TURN_REPLY_HEADERS.requestNonce);
+  if (requestNonce && /^[a-f0-9]{64}$/.test(requestNonce)) claim.requestNonce = requestNonce;
+  const payloadSha256 = singleHeaderString(headers, RELAYED_TURN_REPLY_HEADERS.payloadSha256);
+  if (payloadSha256 && /^[a-f0-9]{64}$/.test(payloadSha256)) claim.payloadSha256 = payloadSha256;
+  const requestProof = singleHeaderString(headers, RELAYED_TURN_REPLY_HEADERS.requestProof);
+  if (requestProof && /^[a-f0-9]{64}$/.test(requestProof)) claim.requestProof = requestProof;
   return claim;
 }
 
@@ -313,19 +330,7 @@ export function recordRelayedTurnReply(input: {
     });
   }
 
-  if (input.quota) {
-    const windowClock = input.rateWindowNow ?? (input.now !== undefined ? serverNow : undefined);
-    const quotaDecision = input.quota.checkAndRecordChars(
-      ds.session.sessionId,
-      turnId,
-      totalTextChars,
-      input.quotaSlot,
-      windowClock,
-    );
-    if (!quotaDecision.ok) {
-      return { ok: false, status: 429, error: quotaDecision.error };
-    }
-  }
+  const rateWindowNow = input.rateWindowNow ?? (input.now !== undefined ? serverNow : undefined);
 
   const turnLimits: RecordSessionTurnReplyLimits = input.quota?.turnLimits ?? {
     maxReplies: RELAYED_TURN_REPLY_TURN_MAX_REPLIES,
@@ -339,11 +344,23 @@ export function recordRelayedTurnReply(input: {
       pruneNow: serverNow,
       retention: input.retention,
       turnLimits,
+      chargeNewTextChars: input.quota
+        ? newTextChars => input.quota!.checkAndRecordChars(
+            ds.session.sessionId,
+            turnId,
+            newTextChars,
+            input.quotaSlot,
+            rateWindowNow,
+          ).ok
+        : undefined,
     });
   } catch {
     return { ok: false, status: 500, error: 'turn_reply_store_error' };
   }
 
+  if (result.rateLimited) {
+    return { ok: false, status: 429, error: 'turn_reply_rate_limited' };
+  }
   if (result.quotaExceeded) {
     return { ok: false, status: 429, error: 'turn_reply_quota_exceeded' };
   }
@@ -424,11 +441,19 @@ export interface PostRelayedTurnRepliesOptions {
   expectedTurnId: string;
   replies: readonly SessionTurnReply[];
   readClaim: () => RelayedTurnReplyClientClaim | null;
+  /** Host secret is read lazily per attempt. A wrong secret may fail over to a
+   *  live capability (and vice versa) without ever exposing either key. */
+  readHostSecret?: () => string | undefined;
+  /** Isolated callers prefer capability encryption; host-first callers prefer
+   *  the host-secret envelope. Unauthenticated responses may switch once. */
+  preferCapability?: boolean;
   resolvePorts: (claim: RelayedTurnReplyClientClaim | null) => number[];
   postBatch: (input: {
     ipcPort: number;
     sessionId: string;
-    payload: { expectedTurnId: string; replies: SessionTurnReply[] };
+    payload: RelayedTurnReplyWireBody;
+    headers: Record<string, string>;
+    keyKind: RelayedTurnReplyKeyKind;
     claim: RelayedTurnReplyClientClaim | null;
     signal?: AbortSignal;
   }) => Promise<Response>;
@@ -443,13 +468,71 @@ export interface PostRelayedTurnRepliesOptions {
   sleep?: (ms: number) => Promise<void>;
 }
 
-async function parseErrorCode(res: Response): Promise<string | undefined> {
-  try {
-    const parsed = await res.json() as { error?: unknown } | undefined;
-    return typeof parsed?.error === 'string' ? parsed.error : undefined;
-  } catch {
-    return undefined;
+async function readBoundedRelayResponse(res: Response): Promise<string> {
+  const contentLength = res.headers.get('content-length');
+  if (contentLength !== null && (!/^\d+$/.test(contentLength)
+    || Number(contentLength) > RELAYED_TURN_REPLY_RESPONSE_MAX_BYTES)) {
+    void res.body?.cancel().catch(() => {});
+    throw new Error('unauthenticated_ipc_response');
   }
+  if (!res.body) return '';
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > RELAYED_TURN_REPLY_RESPONSE_MAX_BYTES) {
+        void reader.cancel().catch(() => {});
+        throw new Error('unauthenticated_ipc_response');
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {
+    throw new Error('unauthenticated_ipc_response');
+  }
+}
+
+async function readVerifiedRelayResponse(input: {
+  res: Response;
+  key: RelayedTurnReplyKey;
+  sessionId: string;
+  auth: RelayedTurnReplyRequestAuth;
+}): Promise<Record<string, unknown> | undefined> {
+  const { res } = input;
+  const raw = await readBoundedRelayResponse(res);
+  if (!verifyRelayedTurnReplyResponse({
+    key: input.key,
+    sessionId: input.sessionId,
+    turnId: input.auth.turnId,
+    dispatchAttempt: input.auth.dispatchAttempt,
+    requestNonce: input.auth.requestNonce,
+    status: res.status,
+    raw,
+    signature: res.headers.get(RELAYED_TURN_REPLY_HEADERS.responseProof),
+  })) throw new Error('unauthenticated_ipc_response');
+  let parsed: unknown;
+  if (raw) {
+    try { parsed = JSON.parse(raw); } catch { parsed = undefined; }
+  }
+  if (res.ok) {
+    const value = parsed as { ok?: unknown; recorded?: unknown; duplicates?: unknown; staged?: unknown } | undefined;
+    if (!value || value.ok !== true || typeof value.recorded !== 'number'
+      || typeof value.duplicates !== 'number' || typeof value.staged !== 'boolean') {
+      throw new Error('invalid_turn_reply_response');
+    }
+  }
+  return parsed as Record<string, unknown> | undefined;
 }
 
 function defaultSleep(ms: number): Promise<void> {
@@ -493,13 +576,14 @@ export async function postRelayedTurnReplies(
     let immediateRotations = 0;
     let sameTurn403Retries = 0;
     let turnUnboundRetries = 0;
+    let fallbackKeyKind: RelayedTurnReplyKeyKind | undefined;
+    let fallbackActivated = false;
 
     while (attemptIndex < backoffSchedule.length) {
       const waitMs = skipNextWait ? 0 : (backoffSchedule[attemptIndex] ?? 0);
       skipNextWait = false;
       if (waitMs > 0) {
         const remaining = deadlineAt - now();
-        // Do not sleep into an expired deadline that leaves no usable attempt budget.
         if (remaining <= waitMs || remaining - waitMs < minAttemptBudgetMs) {
           lastError = lastError || 'deadline_exceeded';
           break;
@@ -519,17 +603,53 @@ export async function postRelayedTurnReplies(
         attemptIndex += 1;
         continue;
       }
+      let hostSecret: string | undefined;
+      try { hostSecret = opts.readHostSecret?.(); } catch { hostSecret = undefined; }
+      const capability = claim?.capability || undefined;
+      const primaryKeyKind: RelayedTurnReplyKeyKind | undefined = opts.preferCapability && capability
+        ? 'capability'
+        : hostSecret
+          ? 'host'
+          : capability
+            ? 'capability'
+            : hostSecret
+              ? 'host'
+              : undefined;
+      const fallbackAvailable = fallbackKeyKind === 'capability' ? !!capability : fallbackKeyKind === 'host' ? !!hostSecret : false;
+      const keyKind = fallbackAvailable ? fallbackKeyKind! : primaryKeyKind;
+      const key: RelayedTurnReplyKey | undefined = keyKind === 'capability' && capability
+        ? { kind: keyKind, material: capability }
+        : keyKind === 'host' && hostSecret
+          ? { kind: keyKind, material: hostSecret }
+          : undefined;
+      if (!key || !keyKind) {
+        // A warm worker may publish a claim during the next backoff. Never send
+        // an unencrypted/plaintext fallback while no local key is available.
+        lastError = 'origin_unproven';
+        hasDispatchedAny = true;
+        attemptIndex += 1;
+        continue;
+      }
+      const sealed = sealRelayedTurnReplyRequest({
+        key,
+        sessionId: opts.sessionId,
+        payload: { expectedTurnId: opts.expectedTurnId, replies: batch },
+        dispatchAttempt: claim?.dispatchAttempt,
+      });
 
       let outcome: 'committed' | 'retry_backoff' | 'retry_immediate' | 'terminal' = 'terminal';
       let sawRetryableTransportOrServer = false;
       let sawRetryableTurnUnbound = false;
       let saw403OriginUnproven = false;
+      let sawUnauthenticatedResponse = false;
+      let sawAuthenticatedResponse = false;
       let retryableError: string | undefined;
 
       for (const ipcPort of ports) {
         const remaining = deadlineAt - now();
         if (hasDispatchedAny && remaining < minAttemptBudgetMs) {
-          if (!sawRetryableTransportOrServer && !sawRetryableTurnUnbound && !saw403OriginUnproven) {
+          if (!sawRetryableTransportOrServer && !sawRetryableTurnUnbound
+            && !saw403OriginUnproven && !sawUnauthenticatedResponse) {
             outcome = 'terminal';
           }
           break;
@@ -547,7 +667,9 @@ export async function postRelayedTurnReplies(
           res = await opts.postBatch({
             ipcPort,
             sessionId: opts.sessionId,
-            payload: { expectedTurnId: opts.expectedTurnId, replies: batch },
+            payload: sealed.body,
+            headers: sealed.headers,
+            keyKind,
             claim,
             signal,
           });
@@ -559,22 +681,35 @@ export async function postRelayedTurnReplies(
           continue;
         }
 
+        let parsed: Record<string, unknown> | undefined;
+        try {
+          parsed = await readVerifiedRelayResponse({ res, key, sessionId: opts.sessionId, auth: sealed.auth });
+          sawAuthenticatedResponse = true;
+        } catch (error) {
+          // The listener could not prove possession of the request key. Ignore
+          // every status/body it supplied and continue to the next candidate.
+          const msg = error instanceof Error ? error.message : 'unauthenticated_ipc_response';
+          lastError = msg;
+          sawUnauthenticatedResponse = true;
+          retryableError ??= msg;
+          continue;
+        }
+
         if (res.ok) {
           outcome = 'committed';
           break;
         }
 
-        const errorCode = await parseErrorCode(res);
+        const errorCode = typeof parsed?.error === 'string' ? parsed.error : undefined;
         const errLabel = errorCode ?? `HTTP ${res.status}`;
         lastError = errLabel;
 
-        // Definitive owner-originated terminal errors stop immediately without
-        // sweeping stale fallback ports.
         if (isDefinitiveOwnerTerminal(res.status, errorCode)) {
           outcome = 'terminal';
           sawRetryableTransportOrServer = false;
           sawRetryableTurnUnbound = false;
           saw403OriginUnproven = false;
+          sawUnauthenticatedResponse = false;
           break;
         }
 
@@ -592,23 +727,15 @@ export async function postRelayedTurnReplies(
         }
 
         if (res.status === 403) {
-          // A sibling bot daemon reusing a stale IPC port returns 403
-          // `origin_unproven` with no session-existence oracle — sweep any
-          // remaining candidate ports before concluding this attempt failed.
           saw403OriginUnproven = true;
           retryableError ??= errLabel;
           continue;
         }
 
-        // Port-local misses (404 session_not_active/not_found on a reused port,
-        // 401/405 on an unrelated listener) still allow remaining candidate ports
-        // in `ports` to answer before failing terminally.
         if (res.status === 404 || res.status === 401 || res.status === 405) {
           continue;
         }
 
-        // 400, 413, other 4xx from a speaking server: stop sweep unless an
-        // earlier port already reported a retryable error.
         break;
       }
 
@@ -617,32 +744,49 @@ export async function postRelayedTurnReplies(
         break;
       }
 
-      if (sawRetryableTransportOrServer) {
-        if (retryableError) lastError = retryableError;
-        outcome = 'retry_backoff';
-      } else if (sawRetryableTurnUnbound) {
-        if (retryableError) lastError = retryableError;
-        if (turnUnboundRetries < MAX_TURN_UNBOUND_409_RETRIES) {
-          turnUnboundRetries += 1;
-          outcome = 'retry_backoff';
-        } else {
-          outcome = 'terminal';
-        }
-      } else if (saw403OriginUnproven) {
-        if (retryableError) lastError = retryableError;
-        const nextClaim = opts.readClaim();
-        if (!nextClaim || (nextClaim.turnId && nextClaim.turnId !== opts.expectedTurnId)) {
-          // Capability was unlinked/absent or rotated to Turn N+1: stop immediately.
-          outcome = 'terminal';
-        } else if (nextClaim.capability !== claim?.capability && immediateRotations < MAX_IMMEDIATE_CAPABILITY_ROTATIONS) {
-          immediateRotations += 1;
+      if (sawUnauthenticatedResponse && !sawAuthenticatedResponse && !fallbackActivated) {
+        const alternate = keyKind === 'capability'
+          ? (hostSecret ? 'host' as const : undefined)
+          : (capability ? 'capability' as const : undefined);
+        if (alternate) {
+          fallbackKeyKind = alternate;
+          fallbackActivated = true;
           outcome = 'retry_immediate';
-        } else if ((!nextClaim.turnId || nextClaim.turnId === opts.expectedTurnId)
-          && sameTurn403Retries < MAX_SAME_TURN_403_RETRIES) {
-          sameTurn403Retries += 1;
+          if (retryableError) lastError = retryableError;
+        }
+      }
+
+      if (outcome !== 'retry_immediate') {
+        if (sawUnauthenticatedResponse) {
+          if (keyKind === 'capability') saw403OriginUnproven = true;
+          else sawRetryableTransportOrServer = true;
+        }
+        if (sawRetryableTransportOrServer) {
+          if (retryableError) lastError = retryableError;
           outcome = 'retry_backoff';
-        } else {
-          outcome = 'terminal';
+        } else if (sawRetryableTurnUnbound) {
+          if (retryableError) lastError = retryableError;
+          if (turnUnboundRetries < MAX_TURN_UNBOUND_409_RETRIES) {
+            turnUnboundRetries += 1;
+            outcome = 'retry_backoff';
+          } else {
+            outcome = 'terminal';
+          }
+        } else if (saw403OriginUnproven) {
+          if (retryableError) lastError = retryableError;
+          const nextClaim = opts.readClaim();
+          if (!nextClaim || (nextClaim.turnId && nextClaim.turnId !== opts.expectedTurnId)) {
+            outcome = 'terminal';
+          } else if (nextClaim.capability !== claim?.capability && immediateRotations < MAX_IMMEDIATE_CAPABILITY_ROTATIONS) {
+            immediateRotations += 1;
+            outcome = 'retry_immediate';
+          } else if ((!nextClaim.turnId || nextClaim.turnId === opts.expectedTurnId)
+            && sameTurn403Retries < MAX_SAME_TURN_403_RETRIES) {
+            sameTurn403Retries += 1;
+            outcome = 'retry_backoff';
+          } else {
+            outcome = 'terminal';
+          }
         }
       }
 

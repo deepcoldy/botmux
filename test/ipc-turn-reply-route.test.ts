@@ -22,12 +22,14 @@ import { fetchDaemonIpc } from '../src/core/daemon-ipc-auth.js';
 import { loopbackFetch } from '../src/core/loopback-fetch.js';
 import {
   createTurnReplyQuotaTracker,
+  postRelayedTurnReplies,
   recordRelayedTurnReply,
   RELAYED_TURN_REPLY_HEADERS,
   RELAYED_TURN_REPLY_MAX_BYTES,
   RELAYED_TURN_REPLY_MAX_IN_FLIGHT_PER_SESSION,
   RELAYED_TURN_REPLY_MAX_ITEMS,
   RELAYED_TURN_REPLY_ROUTE,
+  sealRelayedTurnReplyRequest,
   SESSION_TURN_REPLY_RAW_TEXT_CAP,
 } from '../src/core/relayed-turn-reply.js';
 import {
@@ -36,6 +38,7 @@ import {
   readSessionTurns,
   recordSessionTurnInput,
   stageSessionTurnInbound,
+  type SessionTurnReply,
 } from '../src/services/session-turns.js';
 
 const SECRET = 'turn-reply-narrow-secret';
@@ -113,27 +116,61 @@ async function setup(sessions: Record<string, any>): Promise<void> {
   handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
 }
 
+function capabilityRequest(
+  sessionId: string,
+  body: unknown,
+  opts: { capability: string; turnId?: string; dispatchAttempt?: number },
+): { raw: string; headers: Record<string, string> } {
+  if (typeof body === 'string') {
+    // Oversized-body coverage only needs valid pre-body auth; the daemon rejects
+    // Content-Length before inspecting this deliberately non-envelope payload.
+    const expectedTurnId = (JSON.parse(body) as { expectedTurnId: string }).expectedTurnId;
+    const sealed = sealRelayedTurnReplyRequest({
+      key: { kind: 'capability', material: opts.capability },
+      sessionId,
+      payload: { expectedTurnId, replies: [] },
+      dispatchAttempt: opts.dispatchAttempt,
+    });
+    return { raw: body, headers: { 'content-type': 'application/json', ...sealed.headers } };
+  }
+  const sealed = sealRelayedTurnReplyRequest({
+    key: { kind: 'capability', material: opts.capability },
+    sessionId,
+    payload: body as { expectedTurnId: string; replies: [] },
+    dispatchAttempt: opts.dispatchAttempt,
+  });
+  return { raw: JSON.stringify(sealed.body), headers: { 'content-type': 'application/json', ...sealed.headers } };
+}
+
 function postCapability(
   sessionId: string,
   body: unknown,
-  opts: { capability?: string; turnId?: string; dispatchAttempt?: number } = {},
+  opts: { capability: string; turnId?: string; dispatchAttempt?: number },
 ): Promise<Response> {
-  const headers: Record<string, string> = { 'content-type': 'application/json' };
-  if (opts.capability !== undefined) headers[RELAYED_TURN_REPLY_HEADERS.capability] = opts.capability;
-  if (opts.turnId !== undefined) headers[RELAYED_TURN_REPLY_HEADERS.turnId] = opts.turnId;
-  if (opts.dispatchAttempt !== undefined) headers[RELAYED_TURN_REPLY_HEADERS.dispatchAttempt] = String(opts.dispatchAttempt);
+  const request = capabilityRequest(sessionId, body, opts);
   return loopbackFetch(`http://127.0.0.1:${handle!.port}/api/sessions/${encodeURIComponent(sessionId)}/${RELAYED_TURN_REPLY_ROUTE}`, {
     method: 'POST',
-    headers,
-    body: typeof body === 'string' ? body : JSON.stringify(body),
+    headers: request.headers,
+    body: request.raw,
+  });
+}
+
+function hostRequest(sessionId: string, body: { expectedTurnId: string; replies: SessionTurnReply[] }) {
+  return sealRelayedTurnReplyRequest({
+    key: { kind: 'host', material: SECRET },
+    sessionId,
+    payload: body,
+    dispatchAttempt: 1,
   });
 }
 
 function openStreamingRequest(input: {
   sessionId: string;
   headers?: Record<string, string>;
+  body?: string;
 }): {
   req: http.ClientRequest;
+  body: string;
   response: Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }>;
 } {
   let resolveResponse!: (value: { status: number; headers: http.IncomingHttpHeaders; body: string }) => void;
@@ -166,7 +203,22 @@ function openStreamingRequest(input: {
     // An early 403/413/429 closes the socket before the client finishes streaming.
     void err;
   });
-  return { req, response };
+  return { req, body: input.body ?? '', response };
+}
+
+function openSealedStream(
+  sessionId: string,
+  body: { expectedTurnId: string; replies: SessionTurnReply[] },
+  opts: { capability: string; dispatchAttempt?: number },
+) {
+  const request = capabilityRequest(sessionId, body, opts);
+  const stream = openStreamingRequest({ sessionId, headers: request.headers, body: request.raw });
+  const splitAt = Math.max(1, Math.floor(request.raw.length / 2));
+  return {
+    stream,
+    writePrefix: () => stream.req.write(request.raw.slice(0, splitAt)),
+    end: () => stream.req.end(request.raw.slice(splitAt)),
+  };
 }
 
 describe('POST /api/sessions/:sessionId/turn-reply', () => {
@@ -186,11 +238,15 @@ describe('POST /api/sessions/:sessionId/turn-reply', () => {
       ['sess-a', CAP_B],
       ['sess-missing', CAP_A],
     ] as const) {
+      const request = cap
+        ? capabilityRequest(targetSession, { expectedTurnId: 'turn-a', replies: [] }, { capability: cap })
+        : { raw: '', headers: {} as Record<string, string> };
       const stream = openStreamingRequest({
         sessionId: targetSession,
-        headers: cap ? { [RELAYED_TURN_REPLY_HEADERS.capability]: cap } : {},
+        headers: request.headers,
+        body: request.raw,
       });
-      stream.req.write('{"expectedTurnId":"turn-a",'); // intentionally incomplete, never ended
+      stream.req.write(request.raw.slice(0, Math.max(1, Math.floor(request.raw.length / 2)))); // intentionally incomplete, never ended
       const res = await stream.response;
       stream.req.destroy();
       expect(res.status).toBe(403);
@@ -198,6 +254,283 @@ describe('POST /api/sessions/:sessionId/turn-reply', () => {
       expect(JSON.parse(res.body)).toEqual({ ok: false, error: 'origin_unproven' });
     }
     expect(readSessionTurns(dataDir!, 'sess-a', 0, 50).turns[0]?.replies).toEqual([]);
+  });
+
+  it('keeps capability and reply text confidential from a stale listener and rejects tampered replay', async () => {
+    await setup({ 'sess-a': liveSession('sess-a', CAP_A, 'turn-a') });
+    stageTurn('sess-a', 'turn-a');
+    let captured: { headers: http.IncomingHttpHeaders; raw: string } | undefined;
+    const rogue = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on('data', chunk => chunks.push(Buffer.from(chunk)));
+      req.on('end', () => {
+        captured = { headers: req.headers, raw: Buffer.concat(chunks).toString('utf8') };
+        res.writeHead(403, { 'content-type': 'application/json', connection: 'close' });
+        res.end(JSON.stringify({ ok: false, error: 'origin_unproven' }));
+      });
+    });
+    await new Promise<void>(resolve => rogue.listen(0, '127.0.0.1', resolve));
+    const address = rogue.address();
+    if (!address || typeof address === 'string') throw new Error('rogue listener has no port');
+    try {
+      const outcome = await postRelayedTurnReplies({
+        sessionId: 'sess-a',
+        expectedTurnId: 'turn-a',
+        replies: [{ messageId: 'om_real', responseKind: 'final', at: Date.now(), text: 'private reply body' }],
+        readClaim: () => ({ capability: CAP_A, turnId: 'turn-a', dispatchAttempt: 1, ipcPort: address.port }),
+        readHostSecret: () => undefined,
+        preferCapability: true,
+        resolvePorts: claim => [claim?.ipcPort ?? address.port, handle!.port],
+        backoffMs: [0],
+        postBatch: async ({ ipcPort, sessionId, payload, headers }) => loopbackFetch(
+          `http://127.0.0.1:${ipcPort}/api/sessions/${sessionId}/${RELAYED_TURN_REPLY_ROUTE}`,
+          { method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(payload) },
+        ),
+      });
+      expect(outcome).toEqual({ ok: true });
+      expect(captured).toBeDefined();
+      const stolen = captured!;
+      expect(stolen.raw).not.toContain(CAP_A);
+      expect(stolen.raw).not.toContain('private reply body');
+      for (const value of Object.values(stolen.headers)) {
+        expect(String(value)).not.toContain(CAP_A);
+      }
+
+      // The sealed request may only be replayed verbatim. The result cache
+      // returns the first committed response; no second SQLite row is written.
+      const replay = await loopbackFetch(`http://127.0.0.1:${handle!.port}/api/sessions/sess-a/${RELAYED_TURN_REPLY_ROUTE}`, {
+        method: 'POST', headers: stolen.headers as Record<string, string>, body: stolen.raw,
+      });
+      expect(replay.status).toBe(200);
+      expect(await replay.json()).toMatchObject({ recorded: 1, duplicates: 0, staged: true });
+
+      // Reusing a valid proof with modified ciphertext cannot mint a new reply.
+      // Use a fresh nonce so this exercises hash/decrypt rejection rather than
+      // the exact-replay cache's idempotent acknowledgement of an earlier commit.
+      const tamperRequest = capabilityRequest('sess-a', {
+        expectedTurnId: 'turn-a',
+        replies: [{ messageId: 'om_tampered', responseKind: 'final', at: Date.now(), text: 'tampered' }],
+      }, { capability: CAP_A });
+      const tamperedBody = JSON.parse(tamperRequest.raw) as { sealed: string };
+      tamperedBody.sealed = `${tamperedBody.sealed.slice(0, -1)}${tamperedBody.sealed.endsWith('A') ? 'B' : 'A'}`;
+      const tampered = await loopbackFetch(`http://127.0.0.1:${handle!.port}/api/sessions/sess-a/${RELAYED_TURN_REPLY_ROUTE}`, {
+        method: 'POST', headers: tamperRequest.headers, body: JSON.stringify(tamperedBody),
+      });
+      expect(tampered.status).toBe(400);
+      expect(readSessionTurns(dataDir!, 'sess-a', 0, 50).turns[0]?.replies.map(reply => reply.messageId))
+        .toEqual(['om_real']);
+    } finally {
+      await new Promise<void>(resolve => rogue.close(() => resolve()));
+    }
+  });
+
+  it('fails over between wrong host secret and stale capability in both directions without exposing either key', async () => {
+    await setup({ 'sess-a': liveSession('sess-a', CAP_A, 'turn-a') });
+    stageTurn('sess-a', 'turn-a');
+    const now = Date.now();
+
+    for (const scenario of [
+      {
+        name: 'host-to-capability', messageId: 'om_host_to_cap', capability: CAP_A,
+        hostSecret: 'wrong-secret-for-current-daemon', preferCapability: false,
+        expectedKinds: ['host', 'capability'],
+      },
+      {
+        name: 'capability-to-host', messageId: 'om_cap_to_host', capability: CAP_B,
+        hostSecret: SECRET, preferCapability: true,
+        expectedKinds: ['capability', 'host'],
+      },
+    ] as const) {
+      const keyKinds: string[] = [];
+      const outcome = await postRelayedTurnReplies({
+        sessionId: 'sess-a',
+        expectedTurnId: 'turn-a',
+        replies: [{ messageId: scenario.messageId, responseKind: 'final', at: now, text: `private ${scenario.name}` }],
+        readClaim: () => ({ capability: scenario.capability, turnId: 'turn-a', dispatchAttempt: 1, ipcPort: handle!.port }),
+        readHostSecret: () => scenario.hostSecret,
+        preferCapability: scenario.preferCapability,
+        resolvePorts: () => [handle!.port],
+        backoffMs: [0],
+        postBatch: async ({ ipcPort, sessionId, payload, headers, keyKind }) => {
+          keyKinds.push(keyKind);
+          return fetchDaemonIpc(ipcPort, `/api/sessions/${sessionId}/${RELAYED_TURN_REPLY_ROUTE}`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', ...headers },
+            body: JSON.stringify(payload),
+          }, scenario.hostSecret);
+        },
+      });
+      expect(outcome, scenario.name).toEqual({ ok: true });
+      expect(keyKinds, scenario.name).toEqual(scenario.expectedKinds);
+    }
+    expect(readSessionTurns(dataDir!, 'sess-a', 0, 50).turns[0]?.replies.map(reply => reply.messageId))
+      .toEqual(['om_host_to_cap', 'om_cap_to_host']);
+  });
+
+  it('serves exact replay floods from the bounded result cache without charging pre-body quota again', async () => {
+    await setup({ 'sess-a': liveSession('sess-a', CAP_A, 'turn-a') });
+    stageTurn('sess-a', 'turn-a');
+    const request = capabilityRequest('sess-a', {
+      expectedTurnId: 'turn-a',
+      replies: [{ messageId: 'om_replayed', responseKind: 'final', at: Date.now(), text: 'one real reply' }],
+    }, { capability: CAP_A, dispatchAttempt: 1 });
+    const postExact = () => loopbackFetch(`http://127.0.0.1:${handle!.port}/api/sessions/sess-a/${RELAYED_TURN_REPLY_ROUTE}`, {
+      method: 'POST', headers: request.headers, body: request.raw,
+    });
+    const statuses: number[] = [];
+    for (let index = 0; index < 30; index++) {
+      const response = await postExact();
+      statuses.push(response.status);
+      await response.arrayBuffer();
+    }
+    expect(statuses).toEqual(Array(30).fill(200));
+
+    const fresh = await postCapability('sess-a', {
+      expectedTurnId: 'turn-a',
+      replies: [{ messageId: 'om_after_replay_flood', responseKind: 'auxiliary', at: Date.now(), text: 'still writable' }],
+    }, { capability: CAP_A });
+    expect(fresh.status).toBe(200);
+    expect(readSessionTurns(dataDir!, 'sess-a', 0, 50).turns[0]?.replies.map(reply => reply.messageId))
+      .toEqual(['om_replayed', 'om_after_replay_flood']);
+  });
+
+  it('uses retryable failure tombstones to stop tampered replay floods without poisoning fresh recovery', async () => {
+    await setup({ 'sess-a': liveSession('sess-a', CAP_A, 'turn-a') });
+    stageTurn('sess-a', 'turn-a');
+    const originalPayload = {
+      expectedTurnId: 'turn-a',
+      replies: [{ messageId: 'om_after_failure', responseKind: 'final' as const, at: Date.now(), text: 'valid after failures' }],
+    };
+    const request = capabilityRequest('sess-a', originalPayload, { capability: CAP_A });
+    const tampered = JSON.parse(request.raw) as { sealed: string };
+    tampered.sealed = `${tampered.sealed.slice(0, -1)}${tampered.sealed.endsWith('A') ? 'B' : 'A'}`;
+    const tamperedRaw = JSON.stringify(tampered);
+    const postRaw = (raw: string) => loopbackFetch(`http://127.0.0.1:${handle!.port}/api/sessions/sess-a/${RELAYED_TURN_REPLY_ROUTE}`, {
+      method: 'POST', headers: request.headers, body: raw,
+    });
+
+    const statuses: number[] = [];
+    for (let index = 0; index < 30; index++) {
+      const response = await postRaw(tamperedRaw);
+      statuses.push(response.status);
+      await response.arrayBuffer();
+    }
+    expect(statuses).toEqual([400, ...Array(29).fill(503)]);
+
+    // The original nonce gets a retryable tombstone, never a poisoned cached
+    // 400. The production client reseals with a fresh nonce and commits at once.
+    const originalExact = await postRaw(request.raw);
+    expect(originalExact.status).toBe(503);
+    await originalExact.arrayBuffer();
+    const recovered = await postRelayedTurnReplies({
+      sessionId: 'sess-a', expectedTurnId: 'turn-a', replies: originalPayload.replies,
+      readClaim: () => ({ capability: CAP_A, turnId: 'turn-a', dispatchAttempt: 1, ipcPort: handle!.port }),
+      readHostSecret: () => undefined,
+      preferCapability: true,
+      resolvePorts: () => [handle!.port],
+      backoffMs: [0],
+      postBatch: async ({ ipcPort, sessionId, payload, headers }) => loopbackFetch(
+        `http://127.0.0.1:${ipcPort}/api/sessions/${sessionId}/${RELAYED_TURN_REPLY_ROUTE}`,
+        { method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(payload) },
+      ),
+    });
+    expect(recovered).toEqual({ ok: true });
+    expect(readSessionTurns(dataDir!, 'sess-a', 0, 50).turns[0]?.replies.map(reply => reply.messageId))
+      .toEqual(['om_after_failure']);
+  });
+
+  it('coalesces an exact duplicate while the original body is pending, then serves the committed result', async () => {
+    await setup({ 'sess-a': liveSession('sess-a', CAP_A, 'turn-a') });
+    stageTurn('sess-a', 'turn-a');
+    const request = capabilityRequest('sess-a', {
+      expectedTurnId: 'turn-a',
+      replies: [{ messageId: 'om_pending', responseKind: 'final', at: Date.now(), text: 'pending coalesce' }],
+    }, { capability: CAP_A });
+    const stream = openStreamingRequest({ sessionId: 'sess-a', headers: request.headers, body: request.raw });
+    const splitAt = Math.floor(request.raw.length / 2);
+    stream.req.write(request.raw.slice(0, splitAt));
+    await new Promise(resolve => setTimeout(resolve, 40));
+
+    const duplicate = await loopbackFetch(`http://127.0.0.1:${handle!.port}/api/sessions/sess-a/${RELAYED_TURN_REPLY_ROUTE}`, {
+      method: 'POST', headers: request.headers, body: request.raw,
+    });
+    expect(duplicate.status).toBe(503);
+    expect(await duplicate.json()).toEqual({ ok: false, error: 'turn_reply_in_progress' });
+
+    stream.req.end(request.raw.slice(splitAt));
+    const original = await stream.response;
+    expect(original.status).toBe(200);
+    const afterDone = await loopbackFetch(`http://127.0.0.1:${handle!.port}/api/sessions/sess-a/${RELAYED_TURN_REPLY_ROUTE}`, {
+      method: 'POST', headers: request.headers, body: request.raw,
+    });
+    expect(afterDone.status).toBe(200);
+    expect(await afterDone.json()).toEqual(JSON.parse(original.body));
+    expect(readSessionTurns(dataDir!, 'sess-a', 0, 50).turns[0]?.replies.map(reply => reply.messageId))
+      .toEqual(['om_pending']);
+  });
+
+  it('charges lost-response retries only for post-dedup new text and continues later batches', async () => {
+    await setup({ 'sess-a': liveSession('sess-a', CAP_A, 'turn-a') });
+    stageTurn('sess-a', 'turn-a');
+    const now = Date.now();
+    const largeText = 'a'.repeat(SESSION_TURN_REPLY_RAW_TEXT_CAP);
+    const postReal = async (
+      replies: SessionTurnReply[],
+      stripFirstProof: boolean,
+      expectedAttempts?: number,
+    ) => {
+      let attempts = 0;
+      let stripRemaining = stripFirstProof ? 1 : 0;
+      const outcome = await postRelayedTurnReplies({
+        sessionId: 'sess-a', expectedTurnId: 'turn-a', replies,
+        readClaim: () => ({ capability: CAP_A, turnId: 'turn-a', dispatchAttempt: 1, ipcPort: handle!.port }),
+        readHostSecret: () => undefined,
+        preferCapability: true,
+        resolvePorts: () => [handle!.port],
+        backoffMs: [0, 0],
+        postBatch: async ({ ipcPort, sessionId, payload, headers }) => {
+          attempts += 1;
+          const response = await loopbackFetch(`http://127.0.0.1:${ipcPort}/api/sessions/${sessionId}/${RELAYED_TURN_REPLY_ROUTE}`, {
+            method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(payload),
+          });
+          if (stripRemaining > 0) {
+            stripRemaining -= 1;
+            const raw = await response.text();
+            const unauthenticatedHeaders = new Headers(response.headers);
+            unauthenticatedHeaders.delete(RELAYED_TURN_REPLY_HEADERS.responseProof);
+            return new Response(raw, { status: response.status, headers: unauthenticatedHeaders });
+          }
+          return response;
+        },
+      });
+      expect(outcome).toEqual({ ok: true });
+      if (expectedAttempts !== undefined) expect(attempts).toBe(expectedAttempts);
+    };
+
+    const firstBatch: SessionTurnReply[] = [
+      { messageId: 'om_large_first', responseKind: 'final', at: now, text: largeText },
+      ...Array.from({ length: 63 }, (_, index) => ({
+        messageId: `om_first_${index}`, responseKind: 'final' as const, at: now,
+      })),
+    ];
+    await postReal([
+      ...firstBatch,
+      { messageId: 'om_second_batch', responseKind: 'final', at: now },
+    ], true, 3);
+    expect(readSessionTurns(dataDir!, 'sess-a', 0, 50).turns[0]?.replies).toHaveLength(65);
+
+    // The first committed batch plus three later batches fit the character
+    // window exactly after scrub/truncation. A duplicate retry charging raw
+    // text again would make the last legitimate batch hit 429 instead.
+    for (let index = 0; index < 3; index++) {
+      await postReal([{
+        messageId: `om_large_new_${index}`,
+        responseKind: 'final',
+        at: now,
+        text: largeText,
+      }], false, 1);
+    }
+    expect(readSessionTurns(dataDir!, 'sess-a', 0, 50).turns[0]?.replies).toHaveLength(68);
   });
 
   it('records multi-reply batches atomically, scrubs text, preserves text:undefined, and deduplicates retries', async () => {
@@ -252,15 +585,21 @@ describe('POST /api/sessions/:sessionId/turn-reply', () => {
     expect(crossTurn.status).toBe(409);
     expect(await crossTurn.json()).toEqual({ ok: false, error: 'turn_mismatch' });
 
-    // Start streaming a valid request for turn-new, then revoke/rotate mid-stream before body ends.
+    // Start streaming a valid sealed request for turn-new, then revoke/rotate mid-stream before body ends.
+    const raceRequest = capabilityRequest('sess-a', {
+      expectedTurnId: 'turn-new',
+      replies: [{ messageId: 'om_race', responseKind: 'final', at: now, text: 'too late' }],
+    }, { capability: CAP_A });
     const stream = openStreamingRequest({
       sessionId: 'sess-a',
-      headers: { [RELAYED_TURN_REPLY_HEADERS.capability]: CAP_A },
+      headers: raceRequest.headers,
+      body: raceRequest.raw,
     });
-    stream.req.write(`{"expectedTurnId":"turn-new","replies":[{"messageId":"om_race","responseKind":"final","at":${now},`);
+    const splitAt = Math.floor(raceRequest.raw.length / 2);
+    stream.req.write(raceRequest.raw.slice(0, splitAt));
     await new Promise(resolve => setTimeout(resolve, 40));
     session.managedTurnOrigin = { capability: CAP_B, turnId: 'turn-next', dispatchAttempt: 2 };
-    stream.req.end('"text":"too late"}]}');
+    stream.req.end(raceRequest.raw.slice(splitAt));
     const raceRes = await stream.response;
     expect(raceRes.status).toBe(409);
     expect(JSON.parse(raceRes.body)).toEqual({ ok: false, error: 'turn_mismatch' });
@@ -283,26 +622,28 @@ describe('POST /api/sessions/:sessionId/turn-reply', () => {
     }, { capability: CAP_A });
     expect(capRes.status).toBe(200);
 
+    const hmacRequest = hostRequest('sess-rx', {
+      expectedTurnId: 'turn-rx',
+      replies: [{ messageId: 'om_rx_2', responseKind: 'final', at: now + 1, text: 'done' }],
+    });
     const hmacRes = await fetchDaemonIpc(handle!.port, `/api/sessions/sess-rx/${RELAYED_TURN_REPLY_ROUTE}`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        expectedTurnId: 'turn-rx',
-        replies: [{ messageId: 'om_rx_2', responseKind: 'final', at: now + 1, text: 'done' }],
-      }),
+      headers: { 'content-type': 'application/json', ...hmacRequest.headers },
+      body: JSON.stringify(hmacRequest.body),
     }, SECRET);
     expect(hmacRes.status).toBe(200);
     expect(readSessionTurns(dataDir!, 'sess-rx', 0, 50).turns[0]?.replies.map(r => r.messageId))
       .toEqual(['om_rx_1', 'om_rx_2']);
 
     // Trusted host targeting an absent or closed session receives 404 session_not_active.
+    const missingRequest = hostRequest('sess-gone', {
+      expectedTurnId: 'turn-rx',
+      replies: [{ messageId: 'om_gone', responseKind: 'final', at: now }],
+    });
     const missingRes = await fetchDaemonIpc(handle!.port, `/api/sessions/sess-gone/${RELAYED_TURN_REPLY_ROUTE}`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        expectedTurnId: 'turn-rx',
-        replies: [{ messageId: 'om_gone', responseKind: 'final', at: now }],
-      }),
+      headers: { 'content-type': 'application/json', ...missingRequest.headers },
+      body: JSON.stringify(missingRequest.body),
     }, SECRET);
     expect(missingRes.status).toBe(404);
     expect(await missingRes.json()).toEqual({ ok: false, error: 'session_not_active' });
@@ -353,7 +694,7 @@ describe('POST /api/sessions/:sessionId/turn-reply', () => {
     ]);
   });
 
-  it('enforces timestamp bounds, 262K CJK UTF-8 payload acceptance, 2 MiB body cap, cumulative text cap, and 64-item cap', async () => {
+  it('enforces timestamp bounds, 262K CJK UTF-8 payload acceptance, 3 MiB body cap, cumulative text cap, and 64-item cap', async () => {
     await setup({ 'sess-a': liveSession('sess-a', CAP_A, 'turn-a') });
     stageTurn('sess-a', 'turn-a');
     const now = Date.now();
@@ -398,7 +739,7 @@ describe('POST /api/sessions/:sessionId/turn-reply', () => {
     const itemsRes = await postCapability('sess-a', { expectedTurnId: 'turn-a', replies: tooManyItems }, { capability: CAP_A });
     expect(itemsRes.status).toBe(400);
 
-    // Body > 2 MiB rejected with 413 body_too_large.
+    // Body > 3 MiB rejected with 413 body_too_large.
     const oversized = JSON.stringify({
       expectedTurnId: 'turn-a',
       replies: [{ messageId: 'om_huge', responseKind: 'progress', at: now, text: 'x'.repeat(RELAYED_TURN_REPLY_MAX_BYTES + 1024) }],
@@ -416,40 +757,40 @@ describe('POST /api/sessions/:sessionId/turn-reply', () => {
     const now = Date.now();
 
     // 1. Mid-stream policyCapability-only revoke (same live capability & turnId) MUST still commit 200.
-    const s1 = openStreamingRequest({
-      sessionId: 'sess-a',
-      headers: { [RELAYED_TURN_REPLY_HEADERS.capability]: CAP_A },
-    });
-    s1.req.write(`{"expectedTurnId":"turn-a","replies":[{"messageId":"om_pol_ok","responseKind":"progress","at":${now},`);
+    const s1 = openSealedStream('sess-a', {
+      expectedTurnId: 'turn-a',
+      replies: [{ messageId: 'om_pol_ok', responseKind: 'progress', at: now, text: 'policy revoke ok' }],
+    }, { capability: CAP_A });
+    s1.writePrefix();
     await new Promise(resolve => setTimeout(resolve, 40));
     session.managedTurnOrigin = { capability: CAP_A, turnId: 'turn-a', dispatchAttempt: 1 };
-    s1.req.end('"text":"policy revoke ok"}]}');
-    const r1 = await s1.response;
+    s1.end();
+    const r1 = await s1.stream.response;
     expect(r1.status).toBe(200);
 
     // 2. Mid-stream same-turn capability rotation (CAP_A -> CAP_B, same turn-a) MUST return retryable 403 origin_unproven (NOT terminal 409).
-    const s2 = openStreamingRequest({
-      sessionId: 'sess-a',
-      headers: { [RELAYED_TURN_REPLY_HEADERS.capability]: CAP_A },
-    });
-    s2.req.write(`{"expectedTurnId":"turn-a","replies":[{"messageId":"om_rot","responseKind":"progress","at":${now + 1},`);
+    const s2 = openSealedStream('sess-a', {
+      expectedTurnId: 'turn-a',
+      replies: [{ messageId: 'om_rot', responseKind: 'progress', at: now + 1, text: 'rotated' }],
+    }, { capability: CAP_A });
+    s2.writePrefix();
     await new Promise(resolve => setTimeout(resolve, 40));
     session.managedTurnOrigin = { capability: CAP_B, turnId: 'turn-a', dispatchAttempt: 1 };
-    s2.req.end('"text":"rotated"}]}');
-    const r2 = await s2.response;
+    s2.end();
+    const r2 = await s2.stream.response;
     expect(r2.status).toBe(403);
     expect(JSON.parse(r2.body)).toEqual({ ok: false, error: 'origin_unproven' });
 
     // 3. Mid-stream full revocation (!turnId) rejects capability callers with 403 origin_unproven and writes nothing.
-    const s3 = openStreamingRequest({
-      sessionId: 'sess-a',
-      headers: { [RELAYED_TURN_REPLY_HEADERS.capability]: CAP_B },
-    });
-    s3.req.write(`{"expectedTurnId":"turn-a","replies":[{"messageId":"om_revoked","responseKind":"final","at":${now + 2},`);
+    const s3 = openSealedStream('sess-a', {
+      expectedTurnId: 'turn-a',
+      replies: [{ messageId: 'om_revoked', responseKind: 'final', at: now + 2, text: 'revoked' }],
+    }, { capability: CAP_B });
+    s3.writePrefix();
     await new Promise(resolve => setTimeout(resolve, 40));
     session.managedTurnOrigin = { capability: 'unpublished-random' };
-    s3.req.end('"text":"revoked"}]}');
-    const r3 = await s3.response;
+    s3.end();
+    const r3 = await s3.stream.response;
     expect(r3.status).toBe(403);
     expect(JSON.parse(r3.body)).toEqual({ ok: false, error: 'origin_unproven' });
 
@@ -466,12 +807,12 @@ describe('POST /api/sessions/:sessionId/turn-reply', () => {
     stageTurn('sess-b', 'turn-b');
 
     const held = Array.from({ length: RELAYED_TURN_REPLY_MAX_IN_FLIGHT_PER_SESSION }, () => {
-      const s = openStreamingRequest({
-        sessionId: 'sess-a',
-        headers: { [RELAYED_TURN_REPLY_HEADERS.capability]: CAP_A },
-      });
-      s.req.write('{"expectedTurnId":"turn-a",');
-      return s;
+      const sealed = openSealedStream('sess-a', {
+        expectedTurnId: 'turn-a',
+        replies: [{ messageId: 'om_stalled', responseKind: 'progress', at: Date.now() }],
+      }, { capability: CAP_A });
+      sealed.writePrefix();
+      return sealed.stream;
     });
     await new Promise(resolve => setTimeout(resolve, 60));
 

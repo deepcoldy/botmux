@@ -258,13 +258,19 @@ import { prepareReplyCardNativeThinking, replyCardDispatchAttempt } from './turn
 import { recordRelayedTurnDelivery, RELAYED_TURN_DELIVERY_MAX_BYTES, RELAYED_TURN_DELIVERY_ROUTE } from './relayed-turn-delivery.js';
 import {
   createTurnReplyQuotaTracker,
+  openRelayedTurnReplyRequest,
   parseRelayedTurnReplyAuthHeaders,
   recordRelayedTurnReply,
   RELAYED_TURN_REPLY_BODY_TIMEOUT_MS,
+  RELAYED_TURN_REPLY_HEADERS,
   RELAYED_TURN_REPLY_MAX_BYTES,
   RELAYED_TURN_REPLY_MAX_IN_FLIGHT,
   RELAYED_TURN_REPLY_MAX_IN_FLIGHT_PER_SESSION,
   RELAYED_TURN_REPLY_ROUTE,
+  signRelayedTurnReplyResponse,
+  verifyRelayedTurnReplyRequestProof,
+  type RelayedTurnReplyKey,
+  type RelayedTurnReplyRequestAuth,
 } from './relayed-turn-reply.js';
 import { FEEDBACK_SEND_LEASE_ROUTE, handleFeedbackSendLeaseRelay } from '../services/feedback-send-lease-relay.js';
 import { resolveNamespaceLocalPid } from './pid-namespace-peer.js';
@@ -1504,6 +1510,7 @@ export function __testOnly_resetManagedOriginRuntimeAuthState(): void {
   relayedTurnReplyInFlight = 0;
   relayedTurnReplySessionInFlight.clear();
   relayedTurnReplyQuota.clear();
+  relayedTurnReplyResultCache.clear();
 }
 /** @internal test-only: override runtime nonce-store behavior for capacity tests. */
 export function __testOnly_setNativeSubagentRuntimeNonceStore(
@@ -2657,6 +2664,27 @@ let relayedTurnReplyInFlight = 0;
 const relayedTurnReplySessionInFlight = new Map<string, number>();
 const relayedTurnReplyQuota = createTurnReplyQuotaTracker();
 
+interface RelayedTurnReplyCacheEntry {
+  state: 'pending' | 'done' | 'failed';
+  expiresAt: number;
+  raw?: string;
+}
+const RELAYED_TURN_REPLY_RESULT_CACHE_TTL_MS = 10 * 60_000;
+const RELAYED_TURN_REPLY_FAILURE_TTL_MS = 30_000;
+const RELAYED_TURN_REPLY_RESULT_CACHE_MAX_KEYS = 1024;
+const relayedTurnReplyResultCache = new Map<string, RelayedTurnReplyCacheEntry>();
+
+function pruneRelayedTurnReplyResultCache(now = Date.now()): void {
+  for (const [key, entry] of relayedTurnReplyResultCache) {
+    if (entry.expiresAt <= now) relayedTurnReplyResultCache.delete(key);
+  }
+  while (relayedTurnReplyResultCache.size > RELAYED_TURN_REPLY_RESULT_CACHE_MAX_KEYS) {
+    const oldest = relayedTurnReplyResultCache.keys().next().value;
+    if (oldest === undefined) break;
+    relayedTurnReplyResultCache.delete(oldest);
+  }
+}
+
 /** Host-side structured turn-reply writer for an isolated CLI that cannot open
  *  the shared `<DATA_DIR>/session-turns/turns.sqlite` store directly.
  *  Authenticates and applies pre-body rate & per-session/global in-flight
@@ -2667,30 +2695,99 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_REPLY_ROUTE}`, async (
   const trustedHost = isTrustedHostIpcRequest(req);
   const headerClaim = parseRelayedTurnReplyAuthHeaders(req.headers);
   const ds = findActiveBySessionId(params.sessionId);
-  const auth = sessionCliIpcAuth(req, ds, params.sessionId, headerClaim as Record<string, unknown>, { allowReceiver: true });
-  if (!auth.ok) {
+  const candidateKey: RelayedTurnReplyKey | undefined = headerClaim.keyKind === 'capability'
+    && ds?.managedTurnOrigin?.capability
+    ? { kind: 'capability', material: ds.managedTurnOrigin.capability }
+    : headerClaim.keyKind === 'host' && trustedHost && trustedHostRequestSecrets.get(req)
+      ? { kind: 'host', material: trustedHostRequestSecrets.get(req)! }
+      : undefined;
+  const authenticated = candidateKey && verifyRelayedTurnReplyRequestProof({
+    key: candidateKey,
+    sessionId: params.sessionId,
+    auth: headerClaim,
+  });
+  const signer = authenticated && headerClaim.turnId && headerClaim.requestNonce
+    ? { key: candidateKey!, auth: headerClaim as RelayedTurnReplyRequestAuth }
+    : undefined;
+  const replyRaw = (status: number, raw: string): void => {
+    if (signer) {
+      res.setHeader(
+        RELAYED_TURN_REPLY_HEADERS.responseProof,
+        signRelayedTurnReplyResponse({
+          key: signer.key,
+          sessionId: params.sessionId,
+          turnId: signer.auth.turnId,
+          dispatchAttempt: signer.auth.dispatchAttempt,
+          requestNonce: signer.auth.requestNonce,
+          status,
+          raw,
+        }),
+      );
+    }
+    res.writeHead(status, { 'content-type': 'application/json' });
+    res.end(raw);
+  };
+  const reply = (status: number, body: Record<string, unknown>): void => {
+    replyRaw(status, JSON.stringify(body));
+  };
+  if (!authenticated || !signer) {
     closeUntrustedRequestAfterResponse(req, res);
-    return jsonRes(res, 403, { ok: false, error: auth.error });
+    return reply(403, { ok: false, error: 'origin_unproven' });
   }
   if (!ds || ds.session.status === 'closed') {
     if (trustedHost) {
       drainRequest(req);
-      return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+      return reply(404, { ok: false, error: 'session_not_active' });
     }
     closeUntrustedRequestAfterResponse(req, res);
-    return jsonRes(res, 403, { ok: false, error: 'origin_unproven' });
+    return reply(403, { ok: false, error: 'origin_unproven' });
   }
   const initialTurnId = ds.managedTurnOrigin?.turnId;
   if (!initialTurnId) {
     if (trustedHost) drainRequest(req);
     else closeUntrustedRequestAfterResponse(req, res);
-    return jsonRes(res, 409, { ok: false, error: 'turn_unbound' });
+    return reply(409, { ok: false, error: 'turn_unbound' });
+  }
+  if (signer.auth.turnId !== initialTurnId) {
+    if (trustedHost) drainRequest(req);
+    else closeUntrustedRequestAfterResponse(req, res);
+    return reply(409, { ok: false, error: 'turn_mismatch' });
+  }
+
+  // Exact replay gets the already-authenticated result without reading the body
+  // or consuming another pre-body request slot. The cached 200 acknowledges the
+  // ORIGINAL authenticated payload hash; changed bytes have no committed effect.
+  // Pending duplicates coalesce to a retryable 503 instead of becoming another
+  // slow body / in-flight occupant.
+  pruneRelayedTurnReplyResultCache();
+  const resultCacheKey = JSON.stringify([
+    params.sessionId,
+    signer.key.kind,
+    signer.auth.turnId,
+    signer.auth.requestNonce,
+    signer.auth.payloadSha256,
+  ]);
+  const cached = relayedTurnReplyResultCache.get(resultCacheKey);
+  if (cached?.state === 'done' && cached.raw !== undefined) {
+    relayedTurnReplyResultCache.delete(resultCacheKey);
+    relayedTurnReplyResultCache.set(resultCacheKey, cached);
+    if (trustedHost) drainRequest(req);
+    else closeUntrustedRequestAfterResponse(req, res);
+    return replyRaw(200, cached.raw);
+  }
+  if (cached) {
+    if (trustedHost) drainRequest(req);
+    else closeUntrustedRequestAfterResponse(req, res);
+    return reply(503, {
+      ok: false,
+      error: cached.state === 'pending' ? 'turn_reply_in_progress' : 'turn_reply_retry_required',
+    });
   }
   const preQuota = relayedTurnReplyQuota.admitPreBodyRequest(params.sessionId, initialTurnId);
   if (!preQuota.ok) {
     if (trustedHost) drainRequest(req);
     else closeUntrustedRequestAfterResponse(req, res);
-    return jsonRes(res, 429, { ok: false, error: preQuota.error });
+    return reply(429, { ok: false, error: preQuota.error });
   }
   const sessionInFlight = relayedTurnReplySessionInFlight.get(params.sessionId) ?? 0;
   if (!trustedHost && (
@@ -2698,13 +2795,19 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_REPLY_ROUTE}`, async (
     || sessionInFlight >= RELAYED_TURN_REPLY_MAX_IN_FLIGHT_PER_SESSION
   )) {
     closeUntrustedRequestAfterResponse(req, res);
-    return jsonRes(res, 429, { ok: false, error: 'too_many_turn_reply_requests' });
+    return reply(429, { ok: false, error: 'too_many_turn_reply_requests' });
   }
 
   if (!trustedHost) {
     relayedTurnReplyInFlight += 1;
     relayedTurnReplySessionInFlight.set(params.sessionId, sessionInFlight + 1);
   }
+  const pendingCacheEntry: RelayedTurnReplyCacheEntry = {
+    state: 'pending',
+    expiresAt: Date.now() + RELAYED_TURN_REPLY_RESULT_CACHE_TTL_MS,
+  };
+  relayedTurnReplyResultCache.set(resultCacheKey, pendingCacheEntry);
+  pruneRelayedTurnReplyResultCache();
   let body: unknown;
   try {
     body = await readBoundedJsonBody<unknown>(
@@ -2716,14 +2819,23 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_REPLY_ROUTE}`, async (
     if (req.aborted || req.destroyed || res.destroyed) return;
     if (error instanceof IpcBodyTooLargeError) {
       closeUntrustedRequestAfterResponse(req, res);
-      return jsonRes(res, 413, { ok: false, error: 'body_too_large' });
+      return reply(413, { ok: false, error: 'body_too_large' });
     }
     if (error instanceof IpcBodyTimeoutError) {
       closeUntrustedRequestAfterResponse(req, res);
-      return jsonRes(res, 408, { ok: false, error: 'body_timeout' });
+      return reply(408, { ok: false, error: 'body_timeout' });
     }
-    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+    return reply(400, { ok: false, error: 'bad_json' });
   } finally {
+    if (relayedTurnReplyResultCache.get(resultCacheKey) === pendingCacheEntry) {
+      // A failed/aborted request leaves a short retry tombstone, not a terminal
+      // 400 cache: exact replays stop consuming pre-body quota, while the real
+      // client can immediately reseal the same replies under a fresh nonce.
+      relayedTurnReplyResultCache.set(resultCacheKey, {
+        state: 'failed',
+        expiresAt: Date.now() + RELAYED_TURN_REPLY_FAILURE_TTL_MS,
+      });
+    }
     if (!trustedHost) {
       relayedTurnReplyInFlight = Math.max(0, relayedTurnReplyInFlight - 1);
       const remaining = (relayedTurnReplySessionInFlight.get(params.sessionId) ?? 1) - 1;
@@ -2733,52 +2845,65 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_REPLY_ROUTE}`, async (
   }
 
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
-    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+    return reply(400, { ok: false, error: 'bad_json' });
   }
 
   // Zero-TOCTOU post-read re-verification: synchronous from here to SQLite commit.
   const currentDs = findActiveBySessionId(params.sessionId);
   if (!currentDs || currentDs !== ds || currentDs.session.status === 'closed') {
-    return jsonRes(
-      res,
+    return reply(
       trustedHost ? 404 : 403,
       { ok: false, error: trustedHost ? 'session_not_active' : 'origin_unproven' },
     );
   }
   const currentOrigin = currentDs.managedTurnOrigin;
   if (!currentOrigin?.turnId) {
-    return jsonRes(
-      res,
+    return reply(
       trustedHost ? 409 : 403,
       { ok: false, error: trustedHost ? 'turn_mismatch' : 'origin_unproven' },
     );
   }
   if (currentOrigin.turnId !== initialTurnId) {
-    return jsonRes(res, 409, { ok: false, error: 'turn_mismatch' });
+    return reply(409, { ok: false, error: 'turn_mismatch' });
   }
-  if (!trustedHost) {
-    const postAuth = sessionCliIpcAuth(
-      req,
-      currentDs,
-      params.sessionId,
-      headerClaim as Record<string, unknown>,
-      { allowReceiver: true },
-    );
-    if (!postAuth.ok) {
-      return jsonRes(res, 403, { ok: false, error: postAuth.error });
+  if (signer.key.kind === 'capability') {
+    const postAuth = verifyRelayedTurnReplyRequestProof({
+      key: { kind: 'capability', material: currentOrigin.capability },
+      sessionId: params.sessionId,
+      auth: headerClaim,
+    });
+    if (!postAuth) {
+      return reply(403, { ok: false, error: 'origin_unproven' });
     }
   }
 
+  const plaintext = openRelayedTurnReplyRequest({
+    key: signer.key,
+    sessionId: params.sessionId,
+    auth: signer.auth,
+    body,
+  });
+  if (!plaintext) {
+    return reply(400, { ok: false, error: 'invalid_turn_reply' });
+  }
   const result = recordRelayedTurnReply({
     ds: currentDs,
-    body: body as Record<string, unknown>,
+    body: plaintext as unknown as Record<string, unknown>,
     dataDir: config.session.dataDir,
     quota: relayedTurnReplyQuota,
     quotaSlot: preQuota.slot,
   });
-  return result.ok
-    ? jsonRes(res, 200, result)
-    : jsonRes(res, result.status, { ok: false, error: result.error });
+  if (result.ok) {
+    const raw = JSON.stringify(result);
+    relayedTurnReplyResultCache.set(resultCacheKey, {
+      state: 'done',
+      expiresAt: Date.now() + RELAYED_TURN_REPLY_RESULT_CACHE_TTL_MS,
+      raw,
+    });
+    pruneRelayedTurnReplyResultCache();
+    return replyRaw(200, raw);
+  }
+  return reply(result.status, { ok: false, error: result.error });
 });
 
 /** Feedback send lease for an isolated CLI that cannot take it in-process
@@ -15154,6 +15279,7 @@ export function startIpcServer(opts: {
       relayedTurnReplyInFlight = 0;
       relayedTurnReplySessionInFlight.clear();
       relayedTurnReplyQuota.clear();
+  relayedTurnReplyResultCache.clear();
     });
     return {
     port,

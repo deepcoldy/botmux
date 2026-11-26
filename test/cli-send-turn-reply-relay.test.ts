@@ -22,13 +22,17 @@ import { config } from '../src/config.js';
 import {
   buildRelayedTurnReplyPortCandidates,
   chunkRelayedTurnReplies,
-  postRelayedTurnReplies,
+  postRelayedTurnReplies as postRelayedTurnRepliesBase,
   recordStructuredTurnRepliesWithFallback,
+  signRelayedTurnReplyResponse,
+  RELAYED_TURN_REPLY_HEADERS,
   RELAYED_TURN_REPLY_MAX_ITEMS,
   SESSION_TURN_REPLY_RAW_TEXT_CAP,
+  type PostRelayedTurnRepliesOptions,
   type RelayedTurnReplyClientClaim,
 } from '../src/core/relayed-turn-reply.js';
 import { readProcessStartIdentity } from '../src/core/session-marker.js';
+import { ReplyDeliveryStore } from '../src/services/reply-delivery-store.js';
 import {
   projectLarkTurnInbound,
   readSessionTurns,
@@ -76,6 +80,38 @@ function jsonResponse(status: number, body: Record<string, unknown>): Response {
   return new Response(JSON.stringify(body), {
     status,
     headers: { 'content-type': 'application/json' },
+  });
+}
+
+async function postRelayedForTest(
+  opts: PostRelayedTurnRepliesOptions,
+  signResponses: boolean | ((input: Parameters<PostRelayedTurnRepliesOptions['postBatch']>[0]) => boolean) = true,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  return postRelayedTurnRepliesBase({
+    readHostSecret: () => SECRET,
+    preferCapability: true,
+    ...opts,
+    postBatch: async input => {
+      const res = await opts.postBatch(input);
+      const shouldSign = typeof signResponses === 'function' ? signResponses(input) : signResponses;
+      if (!shouldSign) return res;
+      const raw = await res.clone().text();
+      const material = input.keyKind === 'capability' ? input.claim?.capability : SECRET;
+      if (!material) return res;
+      const headers = new Headers(res.headers);
+      headers.set(RELAYED_TURN_REPLY_HEADERS.responseProof, signRelayedTurnReplyResponse({
+        key: { kind: input.keyKind, material },
+        sessionId: input.sessionId,
+        turnId: input.headers[RELAYED_TURN_REPLY_HEADERS.turnId]!,
+        ...(input.headers[RELAYED_TURN_REPLY_HEADERS.dispatchAttempt]
+          ? { dispatchAttempt: Number(input.headers[RELAYED_TURN_REPLY_HEADERS.dispatchAttempt]) }
+          : {}),
+        requestNonce: input.payload.requestNonce,
+        status: res.status,
+        raw,
+      }));
+      return new Response(raw, { status: res.status, headers });
+    },
   });
 }
 
@@ -166,7 +202,7 @@ describe('relayed turn-reply client helpers (deterministic fake clock)', () => {
     let currentClaim: RelayedTurnReplyClientClaim | null = { capability: CAP_1, turnId: 'turn-1', ipcPort: 9101 };
     const calls: Array<{ port: number; cap?: string }> = [];
 
-    const outcome = await postRelayedTurnReplies({
+    const outcome = await postRelayedForTest({
       sessionId: 'sess-a',
       expectedTurnId: 'turn-1',
       replies: [{ messageId: 'om_1', responseKind: 'final', at: 10_000, text: 'ok' }],
@@ -198,7 +234,7 @@ describe('relayed turn-reply client helpers (deterministic fake clock)', () => {
 
     // Case 1: capability already rotated for SAME turn when 403 arrives -> 0ms immediate retry.
     let readCount = 0;
-    const immediate = await postRelayedTurnReplies({
+    const immediate = await postRelayedForTest({
       sessionId: 'sess-a',
       expectedTurnId: 'turn-1',
       replies: [{ messageId: 'om_1', responseKind: 'final', at: 50_000 }],
@@ -217,7 +253,7 @@ describe('relayed turn-reply client helpers (deterministic fake clock)', () => {
 
     // Case 2: capability unlinked on revocation -> immediate terminal stop with 0 sleeps.
     let unlinkedRead = 0;
-    const revoked = await postRelayedTurnReplies({
+    const revoked = await postRelayedForTest({
       sessionId: 'sess-a',
       expectedTurnId: 'turn-1',
       replies: [{ messageId: 'om_2', responseKind: 'final', at: 50_000 }],
@@ -232,7 +268,7 @@ describe('relayed turn-reply client helpers (deterministic fake clock)', () => {
 
     // Case 3: capability rotated to Turn N+1 -> immediate terminal stop with 0 sleeps.
     let rotatedNextRead = 0;
-    const nextTurn = await postRelayedTurnReplies({
+    const nextTurn = await postRelayedForTest({
       sessionId: 'sess-a',
       expectedTurnId: 'turn-1',
       replies: [{ messageId: 'om_3', responseKind: 'final', at: 50_000 }],
@@ -254,7 +290,7 @@ describe('relayed turn-reply client helpers (deterministic fake clock)', () => {
     const sleep = async (ms: number) => { sleeps.push(ms); fakeNow += ms; };
 
     let attempt = 0;
-    const okAfterUnbound = await postRelayedTurnReplies({
+    const okAfterUnbound = await postRelayedForTest({
       sessionId: 'sess-a',
       expectedTurnId: 'turn-1',
       replies: [{ messageId: 'om_1', responseKind: 'final', at: 80_000 }],
@@ -274,7 +310,7 @@ describe('relayed turn-reply client helpers (deterministic fake clock)', () => {
     expect(sleeps).toEqual([250, 500]);
 
     sleeps.length = 0;
-    const mismatch = await postRelayedTurnReplies({
+    const mismatch = await postRelayedForTest({
       sessionId: 'sess-a',
       expectedTurnId: 'turn-1',
       replies: [{ messageId: 'om_2', responseKind: 'final', at: 80_000 }],
@@ -288,7 +324,7 @@ describe('relayed turn-reply client helpers (deterministic fake clock)', () => {
     expect(mismatch).toEqual({ ok: false, error: 'turn_mismatch' });
     expect(sleeps).toEqual([]);
 
-    const quota = await postRelayedTurnReplies({
+    const quota = await postRelayedForTest({
       sessionId: 'sess-a',
       expectedTurnId: 'turn-1',
       replies: [{ messageId: 'om_3', responseKind: 'final', at: 80_000 }],
@@ -309,7 +345,7 @@ describe('relayed turn-reply client helpers (deterministic fake clock)', () => {
 
     for (const staleStatus of [403, 404, 401, 503] as const) {
       const visited: number[] = [];
-      const res = await postRelayedTurnReplies({
+      const res = await postRelayedForTest({
         sessionId: 'sess-a',
         expectedTurnId: 'turn-1',
         replies: [{ messageId: 'om_failover', responseKind: 'final', at: 90_000 }],
@@ -332,7 +368,7 @@ describe('relayed turn-reply client helpers (deterministic fake clock)', () => {
 
     // Trailing stale port returning 404 MUST NOT mask an earlier live port's retryable 503.
     let liveAttempts = 0;
-    const preserved = await postRelayedTurnReplies({
+    const preserved = await postRelayedForTest({
       sessionId: 'sess-a',
       expectedTurnId: 'turn-1',
       replies: [{ messageId: 'om_preserve', responseKind: 'final', at: 90_000 }],
@@ -361,7 +397,7 @@ describe('relayed turn-reply client helpers (deterministic fake clock)', () => {
 
     // Deadline = 200ms, first backoff = 250ms -> must abort without sleeping into expired deadline.
     let calls = 0;
-    const expired = await postRelayedTurnReplies({
+    const expired = await postRelayedForTest({
       sessionId: 'sess-a',
       expectedTurnId: 'turn-1',
       replies: [{ messageId: 'om_deadline', responseKind: 'final', at: 100_000 }],
@@ -383,7 +419,7 @@ describe('relayed turn-reply client helpers (deterministic fake clock)', () => {
     // Capability without turnId (pre-turn-binding) getting transient 403 still backs off and succeeds.
     let claimState: RelayedTurnReplyClientClaim = { capability: CAP_1, ipcPort: 9501 };
     const noTurnSleeps: number[] = [];
-    const ok = await postRelayedTurnReplies({
+    const ok = await postRelayedForTest({
       sessionId: 'sess-a',
       expectedTurnId: 'turn-1',
       replies: [{ messageId: 'om_noturn', responseKind: 'final', at: 100_000 }],
@@ -401,6 +437,43 @@ describe('relayed turn-reply client helpers (deterministic fake clock)', () => {
     });
     expect(ok).toEqual({ ok: true });
     expect(noTurnSleeps).toEqual([250]);
+  });
+  it('never exposes bearer capability or plaintext to candidate listeners and rejects an unsigned forged 200', async () => {
+    const seen: Array<{ headers: Record<string, string>; body: string }> = [];
+    const outcome = await postRelayedForTest({
+      sessionId: 'sess-a',
+      expectedTurnId: 'turn-1',
+      replies: [{ messageId: 'om_secret', responseKind: 'final', at: 100_000, text: 'private reply body' }],
+      readClaim: () => ({ capability: CAP_1, turnId: 'turn-1', dispatchAttempt: 1, ipcPort: 9401 }),
+      resolvePorts: () => [9401, 9402],
+      postBatch: async ({ ipcPort, headers, payload }) => {
+        seen.push({ headers, body: JSON.stringify(payload) });
+        return ipcPort === 9401
+          ? jsonResponse(403, { ok: false, error: 'origin_unproven' })
+          : jsonResponse(200, { ok: true, recorded: 1, duplicates: 0, staged: true });
+      },
+    }, input => input.ipcPort === 9402);
+
+    expect(outcome).toEqual({ ok: true });
+    expect(seen).toHaveLength(2);
+    for (const request of seen) {
+      expect(request.body).not.toContain('private reply body');
+      expect(request.body).not.toContain(CAP_1);
+      for (const value of Object.values(request.headers)) expect(value).not.toContain(CAP_1);
+      expect(request.headers['x-botmux-origin-capability']).toBeUndefined();
+      expect(request.headers[RELAYED_TURN_REPLY_HEADERS.requestProof]).toMatch(/^[a-f0-9]{64}$/);
+    }
+
+    const forged = await postRelayedForTest({
+      sessionId: 'sess-a',
+      expectedTurnId: 'turn-1',
+      replies: [{ messageId: 'om_forged_ack', responseKind: 'final', at: 100_000, text: 'still private' }],
+      readClaim: () => ({ capability: CAP_1, turnId: 'turn-1', ipcPort: 9401 }),
+      resolvePorts: () => [9401],
+      backoffMs: [0],
+      postBatch: async () => jsonResponse(200, { ok: true, recorded: 1, duplicates: 0, staged: true }),
+    }, false);
+    expect(forged).toEqual({ ok: false, error: 'unauthenticated_ipc_response' });
   });
 });
 
@@ -707,4 +780,37 @@ describe('real botmux send -> host Daemon IPC / local SQLite end-to-end', () => 
     expect(replies[1]).toMatchObject({ messageId: 'om_sent_2', responseKind: 'final' });
     expect(replies[2]).toMatchObject({ messageId: 'om_sent_3', responseKind: 'final' });
   }, 45_000);
+
+  it('keeps the original attachment index when a middle pure-video upload fails', async () => {
+    const h = await createHarness({
+      sessionId: 'sess_video_partial',
+      turnId: 'om_turn_video_partial',
+      squatSessionTurns: false,
+      startServer: false,
+    });
+    const args = ['send', '--no-mention', '--response-kind', 'final'];
+    for (const name of ['A', 'B', 'C']) {
+      const video = join(h.root, `${name}.mp4`);
+      const cover = join(h.root, `${name}-cover.png`);
+      writeFileSync(video, `video-${name}`);
+      writeFileSync(cover, `cover-${name}`);
+      args.push('--videos', video, '--video-covers', cover);
+    }
+
+    const res = await runFixtureAsync(args, {
+      ...h.env(),
+      BOTMUX_TEST_ALLOW_IMAGE_UPLOAD: '1',
+      BOTMUX_TEST_FAIL_FILE_UPLOAD_SEQUENCE: '2',
+    });
+    expect(res.code, res.stderr).toBe(0);
+    expect(res.stderr).toContain('B.mp4');
+
+    const delivery = new ReplyDeliveryStore(h.hostDataDir).read('cli_test_relay', 'om_sent_1', 'oc_test');
+    expect(delivery?.attachments).toHaveLength(1);
+    expect(delivery?.attachments[0]).toMatchObject({
+      name: 'C.mp4',
+      status: 'sent',
+      messageId: 'om_sent_2',
+    });
+  }, 35_000);
 });

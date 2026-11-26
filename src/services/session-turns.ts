@@ -41,6 +41,10 @@ export interface RecordSessionTurnReplyOptions {
   retention?: SessionTurnRetention;
   pruneNow?: number;
   turnLimits?: RecordSessionTurnReplyLimits;
+  /** Called inside the same BEGIN IMMEDIATE transaction after exact event-key
+   *  deduplication. Returning false aborts before any insert, so a rejected
+   *  write never consumes the caller's sliding character budget. */
+  chargeNewTextChars?: (textChars: number) => boolean;
 }
 
 export interface RecordSessionTurnRepliesResult {
@@ -49,6 +53,7 @@ export interface RecordSessionTurnRepliesResult {
   duplicates: number;
   recordedTextChars: number;
   quotaExceeded?: boolean;
+  rateLimited?: boolean;
 }
 
 interface SessionTurn {
@@ -524,7 +529,9 @@ export function recordSessionTurnReplies(
       });
 
       const limits = options?.turnLimits;
-      if (limits && (limits.maxReplies !== undefined || limits.maxTextChars !== undefined || limits.maxPayloadBytes !== undefined)) {
+      const hasDurableLimits = !!limits && (limits.maxReplies !== undefined
+        || limits.maxTextChars !== undefined || limits.maxPayloadBytes !== undefined);
+      if (hasDurableLimits || options?.chargeNewTextChars) {
         const existingRows = db.prepare(`
           SELECT event_key, payload FROM events
           WHERE session_id = ? AND turn_id = ? AND event_key LIKE 'reply:%'
@@ -555,11 +562,15 @@ export function recordSessionTurnReplies(
           return;
         }
         if (
-          (limits.maxReplies !== undefined && existingRows.length + newCount > limits.maxReplies)
-          || (limits.maxTextChars !== undefined && existingTextChars + newTextChars > limits.maxTextChars)
-          || (limits.maxPayloadBytes !== undefined && existingPayloadBytes + newPayloadBytes > limits.maxPayloadBytes)
+          (limits?.maxReplies !== undefined && existingRows.length + newCount > limits.maxReplies)
+          || (limits?.maxTextChars !== undefined && existingTextChars + newTextChars > limits.maxTextChars)
+          || (limits?.maxPayloadBytes !== undefined && existingPayloadBytes + newPayloadBytes > limits.maxPayloadBytes)
         ) {
           outcome = { staged: true, recorded: 0, duplicates: 0, recordedTextChars: 0, quotaExceeded: true };
+          return;
+        }
+        if (options?.chargeNewTextChars && !options.chargeNewTextChars(newTextChars)) {
+          outcome = { staged: true, recorded: 0, duplicates: 0, recordedTextChars: 0, rateLimited: true };
           return;
         }
       }
@@ -593,20 +604,6 @@ export function recordSessionTurnReplies(
       outcome = { staged: true, recorded, duplicates, recordedTextChars };
     });
     return outcome;
-  });
-}
-
-export function recordSessionTurnReply(
-  dataDir: string,
-  sessionId: string,
-  turnId: string,
-  reply: SessionTurnReply,
-  retention?: SessionTurnRetention,
-  opts?: { pruneNow?: number },
-): void {
-  recordSessionTurnReplies(dataDir, sessionId, turnId, [reply], {
-    retention,
-    pruneNow: opts?.pruneNow,
   });
 }
 

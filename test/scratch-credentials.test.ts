@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, realpathSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 import { enumerateScratchSecretPaths } from '../src/adapters/backend/scratch-credentials.js';
@@ -100,6 +100,32 @@ describe('enumerateScratchSecretPaths', () => {
     }
   });
 
+  it('fails closed on unexpected directory and symlink inspection errors', () => {
+    mkdirSync(data(), { recursive: true });
+    // Following a symlink loop in the PARENT makes lstatSync itself fail ELOOP.
+    const loopingDataDir = join(data(), 'loop');
+    symlinkSync('loop', loopingDataDir);
+    expect(() => enumerateScratchSecretPaths({ botmuxHomes: [], dataDirs: [loopingDataDir] }))
+      .toThrow(expect.objectContaining({ code: 'ELOOP' }));
+
+    // A loop in the final secret leaf passes lstat but fails statSync (the
+    // directory-symlink branch), covering the second former fail-open return.
+    const linked = join(data(), 'session-turns');
+    symlinkSync('session-turns', linked);
+    expect(() => enumerateScratchSecretPaths({ botmuxHomes: [], dataDirs: [data()] }))
+      .toThrow(expect.objectContaining({ code: 'ELOOP' }));
+
+    // File-shaped authority and top-level/sidecar enumeration must follow the
+    // same fail-closed rule, not silently return a partial mask.
+    const configLoop = join(root, 'config-loop');
+    symlinkSync('config-loop', configLoop);
+    expect(() => enumerateScratchSecretPaths({
+      botmuxHomes: [], dataDirs: [], botsConfigPath: join(configLoop, 'bots.json'),
+    })).toThrow(expect.objectContaining({ code: 'ELOOP' }));
+    expect(() => enumerateScratchSecretPaths({ botmuxHomes: [configLoop], dataDirs: [] }))
+      .toThrow(expect.objectContaining({ code: 'ELOOP' }));
+  });
+
   it('never turns a same-named FILE into a directory mask, but DOES mask a symlink to a directory and its target', () => {
     mkdirSync(data(), { recursive: true });
     writeFileSync(join(data(), 'oauth-pending'), 'x');
@@ -112,7 +138,7 @@ describe('enumerateScratchSecretPaths', () => {
     const got = enumerateScratchSecretPaths({ botmuxHomes: [], dataDirs: [data()] }).denyPaths;
     expect(got).not.toContain(join(data(), 'oauth-pending'));
     expect(got).toContain(join(data(), 'session-turns'));
-    expect(got).toContain(realTurnsTarget);
+    expect(got).toContain(realpathSync(realTurnsTarget));
     expect(got).not.toContain(join(data(), 'vc-meeting-daemon-auth'));
     expect(got).toContain(danglingTarget);
   });
