@@ -103,6 +103,11 @@ describe('explicit plugin host shutdown failures', () => {
     state({ supervisorPid: 2_147_483_647, procs: [{ name: 'botmux-plugin-lost', appId: '', pid: 0, status: 'launching' }] });
     await expect(stopAll()).rejects.toThrow('plugin_supervisor_shutdown_incomplete');
   });
+  it('rejects a dead host whose durable process-state file vanished', async () => {
+    result({ pid: 2_147_483_647, processStart: 'old-birth' });
+    await expect(stopAll()).rejects.toThrow('plugin_supervisor_shutdown_incomplete');
+    expect(runtime.signal).not.toHaveBeenCalled();
+  });
   it('rejects a still live member after the host exited', async () => {
     result({ pid: 2_147_483_647, processStart: 'old-birth' });
     state({ supervisorPid: 0, procs: [{ name: 'botmux-plugin-lost', appId: '', pid: process.pid, status: 'online' }] });
