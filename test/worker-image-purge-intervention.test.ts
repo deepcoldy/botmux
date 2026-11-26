@@ -61,6 +61,7 @@ function harness() {
     // Real worker message admission, injected queue/backend write boundary.
     applyWorkerLaunchModel: vi.fn(), applyRespawnConfigPatch: vi.fn(), respawnConfigPatchFromMessage: () => ({}),
     isOrdinaryImTurnId: () => false, activeTurnBlocks: () => false, isCodexAppCliId: () => false,
+    activeTurnAuthority: { snapshot: () => undefined },
     tmuxScrolledHalfPages: 0, crashDiagnosticStopped: false, renderer: undefined,
     sendToPty: (content: string, turn: string) => { queued.push(turn); return true; },
     deferTurnInputCommitUntilSubmission: () => false, acknowledgeTurnInputCommitted: vi.fn(),
