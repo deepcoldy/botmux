@@ -110,13 +110,13 @@ function allNodes(value: unknown): any[] {
   return value && typeof value === 'object' ? [value, ...Object.values(value).flatMap(allNodes)] : [];
 }
 
-/** Each question as its heading shows it (number prefix and bold markers removed) plus any continuation lines. */
+/** Each question as its heading shows it (literal number prefix removed) plus any continuation lines. */
 function questionTexts(card: unknown): string[] {
   return allNodes(card).filter(n => n.tag === 'column' && n.elements?.some((e: any) => e.text_size === 'heading')).map(column => {
     const at = column.elements.findIndex((e: any) => e.text_size === 'heading');
     const next = column.elements[at + 1];
     const more = next?.tag === 'markdown' && next.text_size === 'normal' ? `\n${next.content}` : '';
-    return column.elements[at].content.replace(/^\*\*(?:\d+\. )?/, '').replace(/\*\*$/, '') + more;
+    return column.elements[at].content.replace(/^\d+\\\. /, '') + more;
   });
 }
 
@@ -298,7 +298,7 @@ describe('buildAskCard', () => {
     // 每个选项一行，整行回调旧的单选即答动作；没有 form、没有提交按钮
     const rows = allNodes(card).filter(n => n.tag === 'interactive_container');
     expect(rows.map(callbackOf)).toEqual(['deploy', 'rollback', 'abort'].map(key => ({ action: ASK_SELECT_ACTION, ask_id: 'ask-1', nonce: 'nonce-1', key })));
-    expect(optionTexts(card).map(content => content.split('\n')[0])).toEqual(['**继续发布**', '**回滚**', '**中止**']);
+    expect(optionTexts(card).map(content => content.split('\n')[0])).toEqual(['继续发布', '回滚', '中止']);
     expect(text).not.toContain('"tag":"form"');
     expect(text).not.toContain('"tag":"button"');
   });
@@ -391,7 +391,7 @@ describe('buildAskCard', () => {
     // 终态仍保留原问题，让审批人能回看自己批准的内容。
     expect(questionTexts(json)).toEqual(['审批内容：补充回归测试']);
     // 选中的答案以 ✓ 行列在问题下
-    expect(allNodes(json).some(n => n.tag === 'markdown' && n.content === '✓ **是**')).toBe(true);
+    expect(allNodes(json).some(n => n.tag === 'markdown' && n.content === '✓ 是')).toBe(true);
     expect(text).not.toContain('否');
     // 无可交互组件
     expect(allNodes(json).filter(n => n.behaviors || ['button', 'checker', 'input', 'form'].includes(n.tag))).toEqual([]);
