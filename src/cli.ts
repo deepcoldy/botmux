@@ -10246,6 +10246,15 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
         console.error(`⚠️ 当前 Bot daemon 版本过旧，未修改执行频率${updates.prompt !== undefined || updates.calendar !== undefined || updates.calendarDayType !== undefined ? '（其余字段已更新）' : ''}；请先重启/升级 daemon 再改频率。`);
         process.exit(1);
       }
+      if (updates.silent !== undefined && (!task || !('silent' in task))) {
+        // A daemon from before silent edits ignores the field and its receipt
+        // carries no silent value; never confirm a quiet-mode change that did
+        // not commit (the stored task may still be silent).
+        const otherFieldsChanged = updates.schedule !== undefined || updates.prompt !== undefined
+          || updates.calendar !== undefined || updates.calendarDayType !== undefined;
+        console.error(`⚠️ 当前 Bot daemon 版本过旧，未修改静默设置${otherFieldsChanged ? '（其余字段已更新）' : ''}；请先重启/升级 daemon 再切换静默执行。`);
+        process.exit(1);
+      }
       console.log(`✅ 已更新任务 ${id} 的配置；后续执行生效，未触发补跑。`);
       if (task) {
         const fmt = (iso: string) => new Date(iso).toLocaleString('zh-CN', { timeZone: scheduleTimeZone() });
