@@ -2075,6 +2075,18 @@ async function collaborativeSession() {
 }
 
 describe('configured serial group input', () => {
+  it('keeps ordinary TraeX RPC corrections steerable unless the group explicitly serializes input', async () => {
+    const { ds, owner } = await collaborativeSession();
+    ds.session.cliId = 'traex';
+    ds.initConfig = { ...ds.initConfig, cliId: 'traex', codexRpcInput: true } as typeof ds.initConfig;
+    const cfg = modules.registry.getBot(ds.larkAppId).config;
+    cfg.groupSerialInput = undefined;
+    expect(modules.policy.shouldQueueAfterActiveTurn(ds, { turnId: 'om_correction', caller: owner })).toBe(false);
+    cfg.groupSerialInput = { [ds.chatId]: true };
+    expect(modules.policy.shouldQueueAfterActiveTurn(ds, { turnId: 'om_correction', caller: owner })).toBe(true);
+    expect(modules.policy.shouldQueueAfterActiveTurn(ds, { turnId: 'om_correction', caller: owner, dispatchAttempt: 1 })).toBe(false);
+  });
+
   it.each(['false', 'true'])('admits another member in order without an owner question with XPI=%s', async (xpiEnabled) => {
     vi.stubEnv('BOTMUX_XPI_ENABLED', xpiEnabled);
     const { ds, other } = await collaborativeSession();

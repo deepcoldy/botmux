@@ -12580,7 +12580,11 @@ function observeCodexMidTurnReply(ev: CodexBridgeEvent, turn: CodexPendingTurn):
     : `Turn ${turn.turnId.substring(0, 8)} progress posted live (${reply.text.length} chars)`);
 }
 codexBridgeQueue.setMidTurnReplyObserver(observeCodexMidTurnReply);
-codexBridgeQueue.setCotSupersededObserver((turn) => {
+function observeCodexCotSuperseded(turn: CodexPendingTurn): void {
+  // A confirmed same-native correction removes its predecessor from the bridge
+  // queue. Retire only that RPC lifecycle lease; the merged final still owns
+  // the predecessor's completion metadata and no terminal is synthesized here.
+  retireRpcLifecycleFromStructuredTerminal({ turnId: turn.turnId, dispatchAttempt: turn.dispatchAttempt });
   if (!sessionId || turn.isLocal) return;
   const ownsThinking = thinkingTurn?.turnId === turn.turnId
     && thinkingTurn.dispatchAttempt === turn.dispatchAttempt;
@@ -12595,7 +12599,8 @@ codexBridgeQueue.setCotSupersededObserver((turn) => {
     ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
   });
   if (ownsThinking) resetThinkingChannel();
-});
+}
+codexBridgeQueue.setCotSupersededObserver(observeCodexCotSuperseded);
 let codexBridgeWatcher: FSWatcher | null = null;
 let codexBridgeTimer: NodeJS.Timeout | null = null;
 let ompQuietCandidateKey: string | undefined;
@@ -28818,18 +28823,42 @@ function programStatusBlockedHoldsTypeAhead(): boolean {
     && programStatusBlockHoldsTypeAhead(idleDetector?.programStatusBlock() ?? null);
 }
 
-/** The hybrid WebSocket RPC engine only has a serial turn/start contract. It
- *  does not implement Codex App's ordered turn/steer grouping, so type-ahead
- *  must stop while the exact native turn is awaiting activation, active, or
- *  still hydrating its terminal. The queued follow-up is re-driven by the
- *  normal terminal -> idle path and starts as its own turn afterwards. */
+/** A proven active native turn can accept an explicit steer. Awaiting ACKs,
+ * terminal hydration and unknown outcomes remain generation-wide barriers. */
 function directRpcTurnBlocksTypeAhead(): boolean {
   return codexRpcEngine !== undefined && (
     rpcTurnsAwaitingActivation.size > 0
-    || rpcActiveOwners.size > 0
     || settlingRpcTerminalOwners.size > 0
     || rpcTerminalHydrationOwners.size > 0
+    || rpcLifecycleFailClosedOwners.size > 0
+    || ((rpcActiveOwners.size > 0 || !!codexRpcEngine.activeNativeTurnId)
+      && codexRpcEngine.canSteerTurn?.(codexRpcEngine.activeNativeTurnId) !== true)
   );
+}
+
+/** Administrative input is never an active-turn steer, even if a stale screen
+ * says idle while the RPC turn remains live or its output is being hydrated. */
+function hybridRpcTurnBlocksAdministrativeInput(): boolean {
+  return codexRpcEngine !== undefined && (
+    !!codexRpcEngine.activeNativeTurnId || rpcActiveOwners.size > 0
+    || rpcTurnsAwaitingActivation.size > 0 || settlingRpcTerminalOwners.size > 0
+    || rpcTerminalHydrationOwners.size > 0 || rpcLifecycleFailClosedOwners.size > 0
+  );
+}
+
+/** Only a fresh authenticated human IM message may enter the active native
+ * turn. Preserve the existing XPI control policy and every explicit FIFO fence. */
+function hybridRpcInputMaySteer(item: PendingCliInput, expectedTurnId: string): boolean {
+  return !lastInitConfig?.adoptMode
+    && item.turnId?.startsWith('om_') === true
+    && item.dispatchAttempt === undefined
+    && item.queueAfterActiveTurn !== true
+    && item.noReplay !== true
+    && !item.taskContinuation && !item.vcMeetingImTurnOrigin
+    && item.trustedCaller?.senderType === 'user'
+    && item.trustedCaller.source !== 'schedule_creator'
+    && !activeTurnBlocks(item)
+    && codexRpcEngine?.canSteerTurn?.(expectedTurnId) === true;
 }
 
 /** Reorder only an authorized interactive steer, never settle its host turn. */
@@ -28950,6 +28979,11 @@ async function flushPending(): Promise<void> {
     log(`Holding pending input behind ${rpcLifecycleFailClosedOwners.size} unresolved Codex RPC delivery owner(s)`);
     return;
   }
+  // These transport phases own readiness even after the native id disappears.
+  // A stale screen idle (or an earlier owner's callback) cannot start a new
+  // task before every pending ACK and terminal hydration has settled.
+  if (codexRpcEngine && (rpcTurnsAwaitingActivation.size > 0
+    || settlingRpcTerminalOwners.size > 0 || rpcTerminalHydrationOwners.size > 0)) return;
   // Never type into a recognized startup dialog: the text is swallowed and its
   // Enter picks an option for the user. The ready-gate fallback settle and
   // type-ahead adapters reach this write without a prompt-ready edge.
@@ -29039,9 +29073,10 @@ async function flushPending(): Promise<void> {
   const traexNativeCommandBlocked = (pendingRawInputs.length > 0 || pendingSessionRename !== null)
     && lastInitConfig?.cliId === 'traex' && lastInitConfig.adoptMode === true && !!backend
     && traexTerminalInputBlocked(adapterInputHandle(backend));
-  const sessionRenameReady = isPromptReady && pendingSessionRename !== null && !traexNativeCommandBlocked;
-  const rawInputReady = isPromptReady && pendingRawInputs.length > 0 && !traexNativeCommandBlocked;
-  const adoptInputReady = isPromptReady && lastInitConfig?.adoptMode === true && pendingAdoptMessages.length > 0;
+  const administrativeInputReady = !codexRpcEngine || !hybridRpcTurnBlocksAdministrativeInput();
+  const sessionRenameReady = isPromptReady && administrativeInputReady && pendingSessionRename !== null && !traexNativeCommandBlocked;
+  const rawInputReady = isPromptReady && administrativeInputReady && pendingRawInputs.length > 0 && !traexNativeCommandBlocked;
+  const adoptInputReady = isPromptReady && administrativeInputReady && lastInitConfig?.adoptMode === true && pendingAdoptMessages.length > 0;
   let supportedSessionRenameReady = sessionRenameReady;
   const renameOnRemoteBackend = effectiveBackendType === 'riff'
     || effectiveBackendType === 'mojo'
@@ -29434,6 +29469,14 @@ async function flushPending(): Promise<void> {
       const catalogAdmissionHead = pendingMessages[0];
       if (catalogAdmissionHead?.turnId
         && admitTraexCatalogModelBeforeInput(catalogAdmissionHead.turnId, catalogAdmissionHead.dispatchAttempt)) break;
+      // Explicit FIFO, non-interactive input and a rejected steer remain at
+      // the head until the native task closes. A stale ready screen cannot
+      // turn them into a second turn/start against the live native id.
+      if (codexRpcEngine?.activeNativeTurnId && catalogAdmissionHead
+        && !hybridRpcInputMaySteer(catalogAdmissionHead, codexRpcEngine.activeNativeTurnId)) {
+        keepPromptReadyAfterHold();
+        break;
+      }
       const item = freshnessInputQueue.takeNormal();
       if (!item) break;
       // A follow-up turn must never be written onto a degraded model while the
@@ -29870,6 +29913,7 @@ async function flushPending(): Promise<void> {
       let rpcTurnIdentity: CodexRpcTurnIdentity | undefined;
       let rpcTurnGeneration: RpcTurnGeneration | undefined;
       let rpcContext: PreparedTraexNativeContext | undefined;
+      let rpcSteering = false;
       try {
         if (item.taskContinuation && !writeRpcEngine) {
           emitTurnTerminal(
@@ -29952,13 +29996,31 @@ async function flushPending(): Promise<void> {
           // surfaces as a normal submit-failure notice.
           let rpcNativeTurnId: string | undefined;
           await runAfterAmbiguousSubmissionWrites(writeBackend, async () => {
+            // The mutex wait can outlive native completion or another ACK.
+            // Exclude this item's own activation lease, but never start/steer
+            // across another owner's unresolved transport or hydration phase.
+            const ownerKey = rpcTurnOwnerKey(rpcTurnIdentity!);
+            if ([...rpcTurnsAwaitingActivation.keys()].some(key => key !== ownerKey)
+              || settlingRpcTerminalOwners.size > 0 || rpcTerminalHydrationOwners.size > 0
+              || rpcLifecycleFailClosedOwners.size > 0) {
+              throw new CodexRpcDeliveryError(
+                'RPC lifecycle is still settling before native input', 'rpc_turn_start_not_sent', 'not_sent',
+              );
+            }
             const activeNativeTurnId = writeRpcEngine.activeNativeTurnId;
             if (activeNativeTurnId) {
-              throw new CodexRpcDeliveryError(
-                `refusing turn/start while active native turn ${activeNativeTurnId} has not reached terminal`,
-                'rpc_turn_start_active',
-                'not_sent',
-              );
+              if (!hybridRpcInputMaySteer(item, activeNativeTurnId)) {
+                throw new CodexRpcDeliveryError(
+                  `refusing turn/start while active native turn ${activeNativeTurnId} has not reached terminal`,
+                  'rpc_turn_start_active', 'not_sent',
+                );
+              }
+              rpcSteering = true;
+              rpcNativeTurnId = (await writeRpcEngine.steerTurn(
+                rpcContext?.content ?? msg, rpcTurnIdentity!, activeNativeTurnId,
+                { onDispatch: prepareNormalWrite },
+              )).nativeTurnId;
+              return;
             }
             // Commit attribution/durable ownership only once the frame is on
             // the socket: a not_sent rejection (dead socket, concurrent start)
@@ -29988,7 +30050,7 @@ async function flushPending(): Promise<void> {
             item.structuredSourceTurnIds, writeRpcEngine.activeThreadId);
           // The app-server acknowledged turn/start for this exact input on
           // the engine's active thread, fenced to the current generation.
-          acknowledgeNativeInputConsumed(item.turnId, 'codex_rpc_turn_start',
+          acknowledgeNativeInputConsumed(item.turnId, rpcSteering ? 'codex_rpc_turn_steer' : 'codex_rpc_turn_start',
             writeRpcEngine.activeThreadId ?? lastInitConfig?.cliSessionId, rpcNativeTurnId,
             item.dispatchAttempt);
           publishTraexNativeContextReceipt(rpcContext, rpcTurnIdentity.turnId, 'accepted');
@@ -30143,6 +30205,7 @@ async function flushPending(): Promise<void> {
           && err instanceof CodexRpcDeliveryError
           && err.deliveryDisposition === 'not_sent') {
           clearAwaitingRpcActivation(rpcTurnIdentity, rpcTurnGeneration);
+          if (rpcSteering || writeRpcEngine?.activeNativeTurnId) item.queueAfterActiveTurn = true;
           pendingMessages.unshift(item);
           log(
             `Codex RPC turn/start was not sent; retained the FIFO head `
@@ -46505,6 +46568,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         || (!openingInputBoxSettled && pendingMessages.length > 0)
         || startupCommandsInProgress || startupCommandAckHold !== null || nativeSessionForkPending();
       if (cliRestartInProgress || rawInputRestartGate || recoverSessionRenameAfterPersistentReattach() || sessionRenameInFlight()
+        || (codexRpcEngine && hybridRpcTurnBlocksAdministrativeInput())
         || shouldHoldCodexRunnerInput(codexRunnerFreshness)
         || injectionFlushing || shouldDeferUserFlush(pendingInjections)
         || bareShellCheckInProgress || bareShellLaunchBlocked
