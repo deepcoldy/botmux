@@ -429,7 +429,7 @@ describe('BotOnboardingManager manual App ID / App Secret onboarding', () => {
     const job = mgr.start({
       registrationMode: 'local',
       appName: 'local-exact-record',
-      cliId: 'claude-code',
+      cliId: 'riff',
       workingDir: tmpDir,
       dirMode: 'fixed',
       model: 'original-model',
