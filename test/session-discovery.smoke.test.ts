@@ -9,18 +9,20 @@
  *   等历史回归，纯 mock 测不到）
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { mkdtempSync, rmSync, realpathSync } from 'node:fs';
-import { join } from 'node:path';
+import { copyFileSync, mkdtempSync, rmSync, realpathSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { basename, join } from 'node:path';
 import {
   __testOnly_readComm,
   __testOnly_readCwd,
   __testOnly_getChildPids,
+  cliIdFromCommArgv,
 } from '../src/core/session-discovery.js';
 
 let child: ChildProcessWithoutNullStreams;
 let childCwd: string;
+let nativeDir: string;
 
 beforeAll(async () => {
   // macOS 的 tmpdir 通常是 /var/folders/.. 的软链，真实路径在 /private/var/...
@@ -43,11 +45,71 @@ beforeAll(async () => {
     });
     child.once('error', reject);
   });
+
+  // A real native image whose process title differs from its loaded binary.
+  // No installed CLI, credentials, daemon or network connection is used.
+  nativeDir = realpathSync(mkdtempSync(join(tmpdir(), 'bmx-sd-native-')));
+  const source = join(nativeDir, 'title.c');
+  writeFileSync(source, `
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
+int main(void) {
+#ifdef __linux__
+  if (prctl(PR_SET_NAME, "traecli", 0, 0, 0) != 0) return 2;
+#else
+  setprogname("traecli");
+#endif
+  puts("ready"); fflush(stdout); sleep(60); return 0;
+}
+`);
+  execFileSync('cc', [source, '-o', join(nativeDir, 'traex')], { timeout: 15_000 });
+  copyFileSync(join(nativeDir, 'traex'), join(nativeDir, 'coco'));
 });
 
 afterAll(() => {
   if (child && !child.killed) child.kill('SIGKILL');
   if (childCwd) rmSync(childCwd, { recursive: true, force: true });
+  if (nativeDir) rmSync(nativeDir, { recursive: true, force: true });
+});
+
+async function withNativeAlias(binary: string, check: (pid: number) => void): Promise<void> {
+  const process = spawn(binary, [], { argv0: 'traecli', stdio: ['ignore', 'pipe', 'pipe'] });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('native fixture not ready in 5s')), 5_000);
+      process.stdout.once('data', () => { clearTimeout(timer); resolve(); });
+      process.once('error', error => { clearTimeout(timer); reject(error); });
+      process.once('exit', code => { clearTimeout(timer); reject(new Error(`native fixture exited: ${code}`)); });
+    });
+    check(process.pid!);
+  } finally { process.kill('SIGKILL'); }
+}
+
+describe('native traecli alias', () => {
+  it.each(['traex', 'coco'] as const)('recognizes the loaded %s image despite its traecli title', async cli => {
+    await withNativeAlias(join(nativeDir, cli), pid => {
+      const rawComm = execFileSync('ps', ['-o', 'comm=', '-p', String(pid)], { encoding: 'utf8' }).trim();
+      expect(basename(rawComm)).toBe('traecli');
+      const comm = __testOnly_readComm(pid);
+      expect(comm).toBe(cli);
+      expect(cliIdFromCommArgv(comm, ['traecli'], cli)).toBe(cli);
+      expect(cliIdFromCommArgv(comm, ['traecli'], cli === 'traex' ? 'coco' : 'traex')).toBeUndefined();
+    });
+  });
+
+  it('does not relabel a running CoCo after its launch symlink is retargeted to TRAE', async () => {
+    const alias = join(nativeDir, 'traecli');
+    symlinkSync(join(nativeDir, 'coco'), alias);
+    await withNativeAlias(alias, pid => {
+      unlinkSync(alias);
+      symlinkSync(join(nativeDir, 'traex'), alias);
+      expect(__testOnly_readComm(pid)).toBe('coco');
+    });
+  });
 });
 
 describe('readComm', () => {
