@@ -4,6 +4,7 @@
     "larkAppSecret": "your_secret_1",
     "cliId": "claude-code",
     "model": "sonnet",
+    "customModels": ["gateway/model-v2:1"],
     "groupDefaultModels": {
       "oc_xxx_team": { "claude-code": { "model": "opus", "reasoningEffort": "high" } }
     },

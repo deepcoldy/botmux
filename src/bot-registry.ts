@@ -1,3 +1,4 @@
+import { normalizeCustomModels } from './core/model-value-pattern.js';
 import { normalizeOwnerGroupFollowConfig, type OwnerGroupFollowConfig } from './services/owner-group-follow-policy.js';
 import { validateSessionGroupCollaborationConfig, type SessionGroupCollaborationConfig } from './services/collab-group-config.js';
 import { normalizeCodexProfile, assertCodexProfileConfig } from './services/codex-profiles.js';
@@ -1628,6 +1629,8 @@ export interface BotConfig {
    * `modelChoices` for the curated candidates surfaced in `botmux setup`.
    */
   model?: string;
+  /** Up to 50 extra model IDs for this bot’s configured CLI or gateway. */
+  customModels?: string[];
   /** Experimental TraeX-only ordered model allowlist used when model=`auto`.
    * The first entry is the core model; later entries are capacity fallbacks.
    * Missing keeps the feature off. */
@@ -4625,6 +4628,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.launchShell.trim()
         : undefined,
       model,
+      customModels: normalizeCustomModels(entry.customModels),
       traexAutoModel,
       groupDefaultModels: normalizeGroupDefaultModels(entry.groupDefaultModels),
       groupSerialInput: normalizeGroupSerialInput(entry.groupSerialInput),
