@@ -626,6 +626,7 @@ describe('native and generic settlement contracts', () => {
     { state: 'empty', card: 'failed' },
     { state: 'rejected', card: 'failed' },
     { state: 'rejected with in-flight output', card: 'held' },
+    { state: 'non-internal rejection', card: 'held' },
     { state: 'wrong rejection', card: 'held' },
     { state: 'delivered', card: 'completed' },
     { state: 'legacy', card: 'completed' },
@@ -642,10 +643,12 @@ describe('native and generic settlement contracts', () => {
       await new TurnSendLedger(dir).execute({ ...key, dispatchAttempt: state === 'delivered' ? 2 : 1 },
         'final', 'explicit', async () => 'om_final', { fenced: true });
     }
-    if (state === 'rejected' || state === 'wrong rejection' || state === 'rejected with in-flight output') {
+    if (state === 'rejected' || state === 'wrong rejection' || state === 'rejected with in-flight output'
+      || state === 'non-internal rejection') {
       const rejected = db.accept(outputSnapshot(app, { ...output, dispatchAttempt: state === 'wrong rejection' ? 1 : 2 }), sink);
       expect(db.claim(rejected.id, 'owner')).toBe(true);
-      expect(db.rejectTerminal(rejected.id, 'owner', INTERNAL_BRIDGE_FINAL_REJECTION)).toBe(true);
+      const reason = state === 'non-internal rejection' ? 'output_original_channel_changed' : INTERNAL_BRIDGE_FINAL_REJECTION;
+      expect(db.rejectTerminal(rejected.id, 'owner', reason)).toBe(true);
       if (state === 'rejected with in-flight output') {
         db.accept(outputSnapshot(app, { ...output, lastUuid: 'real_pending', content: 'real answer', dispatchAttempt: 2 }), sink);
       }
@@ -691,6 +694,12 @@ describe('native and generic settlement contracts', () => {
     } else {
       expect(finalizeCotMessage).toHaveBeenCalledExactlyOnceWith(ds, key.turnId, card, 2);
       expect(settleTurnReplyCardTerminal).toHaveBeenCalledWith(ds, expect.objectContaining({ status: card }), expect.any(Function), expect.any(Function));
+    }
+    if (state === 'non-internal rejection') {
+      // Display stays pending, while the durable terminal rejection keeps the
+      // session's blocked-attention evidence available for human inspection.
+      expect(db.hasTerminalRejection(key.sessionId)).toBe(true);
+      expect(db.hasUnsettled(key.sessionId)).toBe(false);
     }
   });
 
