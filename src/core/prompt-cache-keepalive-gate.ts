@@ -114,7 +114,7 @@ export function promptCacheKeepaliveRefusal(probe: PromptCacheKeepaliveWriteProb
   if (probe.inputPending) return 'input_pending';
   if (probe.cliId === 'codex') {
     if (!probe.codexInputState) return 'no_screen_evidence';
-    const state = codexNativeComposerState(probe.codexInputState);
+    const state = codexNativeComposerState(probe.codexInputState, { allowCodex0146Hints: true });
     if (state === 'draft') return 'composer_not_empty';
     return state === 'empty' ? undefined : 'prompt_not_framed';
   }
