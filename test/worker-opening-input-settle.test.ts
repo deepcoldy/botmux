@@ -33,8 +33,11 @@ it('replaces the first-write recheck on synchronous flush re-entry instead of mu
   expect(scope.flushPending.mock.calls.length).toBeGreaterThan(1);
 });
 
-it.each([false, true])('a passthrough queues behind an opening whose input box has not settled (settled: %s)', async settled => {
-  const queued = !settled;
+it.each([
+  { settled: false, flushing: false, queued: true },
+  { settled: true, flushing: false, queued: false },
+  { settled: true, flushing: true, queued: true },
+])('a passthrough preserves opening-settle and active-writer gates (settled: $settled, flushing: $flushing)', async ({ settled, flushing, queued }) => {
   const enqueueRaw = vi.fn();
   const deliverRawInput = vi.fn(async () => {});
   const scope: Record<string, unknown> = {
@@ -46,7 +49,7 @@ it.each([false, true])('a passthrough queues behind an opening whose input box h
     cliRestartInProgress: false, rawInputRestartGate: null, sessionRenameInFlight: () => false,
     shouldHoldCodexRunnerInput: () => false, codexRunnerFreshness: undefined, injectionFlushing: false,
     shouldDeferUserFlush: () => false, pendingInjections: [], bareShellCheckInProgress: false,
-    bareShellLaunchBlocked: false, lastInitConfig: { cliId: 'codex' }, isFlushing: true,
+    bareShellLaunchBlocked: false, lastInitConfig: { cliId: 'codex' }, isFlushing: flushing,
     codexModelMigrationHoldsRawInput: () => false, currentBotmuxTurnId: undefined,
     freshnessInputQueue: { enqueueRaw }, deliverRawInput, flushPending: vi.fn(async () => {}),
   };

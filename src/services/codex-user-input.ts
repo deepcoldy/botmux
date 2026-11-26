@@ -19,6 +19,7 @@ export interface CodexUserInputContext {
   originDispatchAttempt?: number;
   /** 异步原生问题的卡片应独立于回复正文，不能在正文终局时被收走。 */
   standalone?: boolean;
+  requestId?: string;
   env?: NodeJS.ProcessEnv;
 }
 
@@ -149,7 +150,7 @@ export async function postCodexAsk(
       questions, timeoutMs,
       // A server request belongs to this process/turn. Do not reattach a card
       // from an older runner merely because its JSON-RPC id was reused.
-      requestId: asyncUserInput?.itemId ?? randomUUID(),
+      requestId: asyncUserInput?.itemId ?? context.requestId ?? randomUUID(),
       originKind: asyncUserInput
         ? (asyncRestore ? CODEX_ASYNC_RESTORE_ASK_ORIGIN : CODEX_ASYNC_ASK_ORIGIN)
         : context.standalone ? NATIVE_STANDALONE_ASK_ORIGIN : 'native-user-input',

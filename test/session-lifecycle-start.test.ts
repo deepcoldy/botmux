@@ -8218,7 +8218,7 @@ describe('Codex App clean-input feature gate', () => {
   });
 });
 
-describe('TraeX RPC ordinary follow-up FIFO policy', () => {
+describe('TraeX RPC ordinary follow-up steer policy', () => {
   const caller = {
     requestUserOpenId: 'ou_owner',
     requestUserUnionId: 'on_owner',
@@ -8246,7 +8246,7 @@ describe('TraeX RPC ordinary follow-up FIFO policy', () => {
     return { ds, worker };
   }
 
-  it('queues an ordinary interactive follow-up without requiring groupSerialInput', () => {
+  it('admits an ordinary interactive follow-up to the worker steering gate', () => {
     const { ds, worker } = traexRpcSession();
 
     expect(sendWorkerInput(ds, 'follow-up', 'om_followup', { trustedCaller: caller })).toBe(true);
@@ -8254,11 +8254,11 @@ describe('TraeX RPC ordinary follow-up FIFO policy', () => {
     expect(worker.send).toHaveBeenLastCalledWith(expect.objectContaining({
       type: 'message',
       turnId: 'om_followup',
-      queueAfterActiveTurn: true,
     }));
+    expect(worker.send.mock.calls.at(-1)?.[0]).not.toHaveProperty('queueAfterActiveTurn');
   });
 
-  it('queues an ordinary human follow-up even when the legacy Codex-App flag is true', () => {
+  it('admits an ordinary human follow-up independently of the legacy Codex-App flag', () => {
     const { ds, worker } = traexRpcSession();
 
     expect(sendWorkerInput(ds, 'human follow-up', 'om_human_followup', {
@@ -8270,8 +8270,8 @@ describe('TraeX RPC ordinary follow-up FIFO policy', () => {
       type: 'message',
       turnId: 'om_human_followup',
       codexAppSteerable: true,
-      queueAfterActiveTurn: true,
     }));
+    expect(worker.send.mock.calls.at(-1)?.[0]).not.toHaveProperty('queueAfterActiveTurn');
   });
 
   it.each([

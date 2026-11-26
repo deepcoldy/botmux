@@ -87,6 +87,8 @@ const STATUS_ROW = new RegExp(
  *  continuations and composer-draft continuations are indented two columns,
  *  so a quoted "❯ …" never reaches column 0. */
 const PROMPT_ROW = /^[›❯](?:[ \t]|$)/;
+/** Native status cells can be cut off by a cwd wider than the pane. */
+const TRUNCATED_STATUS_ROW = /^[ \t]*(?![^\r\n]*│)\S[^\r\n]* · [^\r\n]*…[ \t]*$/;
 
 /** Native /model overlays replace the composer. Match only the live tail
  * below the final rule, never an old menu quoted in the transcript. Return
@@ -116,6 +118,28 @@ export function traexViewportFooterBusy(screen: string): boolean {
   const composer = rows.findIndex(row => PROMPT_ROW.test(row));
   if (composer < 2) return false;
   return STATUS_ROW.test(rows[composer - 2]!);
+}
+
+/** A model turn may keep the initialized, empty type-ahead composer visible.
+ * This is input evidence only, never an idle or rename-completion signal. */
+export function traexActiveEmptyComposerReady(screen: string): boolean {
+  const rows = stripAnsiScreenText(screen).trimEnd().split(/\r?\n/);
+  let composer = rows.length - 1;
+  while (composer >= 0 && !PROMPT_ROW.test(rows[composer]!)) composer--;
+  if (composer < 2 || !TRAEX_EMPTY_COMPOSER_HINTS.has(rows[composer]!.slice(1).trim())) return false;
+  const activity = rows[composer - 2]!;
+  if (!STATUS_ROW.test(activity) || !TRAEX_PROGRESS_PATTERN.test(activity)
+    || /Reviewing approval request|Queued for/i.test(activity)) return false;
+  // Do not accept the provisional shortcut-only surface. Model/context cells
+  // below this exact empty composer are independent initialization evidence.
+  const footer = rows.slice(composer + 1).filter(row => row.trim());
+  if (/^[ \t]*─+[ \t]*$/.test(footer[0] ?? '')) footer.shift();
+  if (!/^[ \t]*\S[^│\r\n]* · (?:[^│\r\n]* · )?Context (?:\d+% (?:left|used)|—)(?: · [^\r\n]*)?[ \t]*$/.test(footer[0] ?? '')
+    && !TRUNCATED_STATUS_ROW.test(footer[0] ?? '')) return false;
+  // Remove only the positively recognized model status row; all other draft,
+  // dialog, login, loading and footer checks remain in the existing predicate.
+  rows[composer - 2] = '';
+  return traexRestoredComposerReady(rows.join('\n'), { requireThreadReady: true });
 }
 
 interface TraexComposerDraft {
@@ -318,10 +342,9 @@ export function traexRestoredComposerReady(
   // pane only emits native status cells (toasts render above the composer),
   // so this arm deliberately trusts the footer-region geometry; revisit it if
   // a future build moves notification content below the composer.
-  const truncatedStatusRow = /^[ \t]*(?![^\r\n]*│)\S[^\r\n]* · [^\r\n]*…[ \t]*$/;
   if (!reportedIdleFooter && !repositoryNotice && !shortcutOnlyFooter
     && !/^[ \t]*\S[^│\r\n]* · (?:[^│\r\n]* · )?Context (?:\d+% (?:left|used)|—)(?: · [^\r\n]*)?[ \t]*$/.test(footer[0]!)
-    && !truncatedStatusRow.test(footer[0]!)) return false;
+    && !TRUNCATED_STATUS_ROW.test(footer[0]!)) return false;
   // Only the model cell is initialization evidence; a cwd named "loading"
   // in a later footer cell must not strand an otherwise initialized prompt.
   if (!repositoryNotice && /\bloading\b/i.test(footer[0]!.split(' · ', 1)[0]!)) return false;
