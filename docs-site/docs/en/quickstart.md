@@ -32,7 +32,7 @@ Use the arrow keys and Enter to complete these choices:
 2. **Choose a CLI**: pick the AI CLI this bot will use. You can type to search.
 3. **Choose a working directory**: for your first bot, choose the pinned default directory and enter an existing project directory such as `~/projects/my-app`. New topics will start there directly.
 
-If you already have a Lark app, you can select it or enter its credentials manually. If automatic configuration doesn't finish, follow the wizard's instructions and see [FAQ · Finish Open Platform setup manually](/en/faq#manual-open-platform-setup).
+If you already have an app, enter its App ID and secret manually. Selecting an existing app to fetch its credentials automatically is available for Feishu tenants only; on Lark international, enter the App ID and secret manually instead. If automatic configuration doesn't finish, follow the wizard's instructions and see [FAQ · Finish Open Platform setup manually](/en/faq#manual-open-platform-setup).
 
 > Press `Esc` to cancel setup without writing any configuration. Your scan login is remembered on this machine, so adding another bot usually only requires confirming the account.
 
