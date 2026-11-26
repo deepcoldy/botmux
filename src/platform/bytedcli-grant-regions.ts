@@ -7,6 +7,13 @@ export function isBytedcliOverseasRegion(value: unknown): value is BytedcliOvers
   return (BYTEDCLI_OVERSEAS_REGIONS as readonly unknown[]).includes(value);
 }
 
+/** Default ByteCloud demand or a specific partition for one CLI invocation. */
+export type BytedcliIdentityRegion = 'default' | BytedcliGrantRegion;
+
+export function isBytedcliIdentityRegion(value: unknown): value is BytedcliIdentityRegion {
+  return value === 'default' || value === 'cn' || isBytedcliOverseasRegion(value);
+}
+
 export const BYTEDCLI_REGION_STATES = ['minted', 'pending', 'not_authorized', 'reauth_required', 'failed'] as const;
 export type BytedcliRegionState = typeof BYTEDCLI_REGION_STATES[number];
 export type BytedcliRegionStates = Partial<Record<BytedcliGrantRegion, BytedcliRegionState>>;
