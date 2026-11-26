@@ -2178,7 +2178,7 @@ export function persistActiveRemoteLineagesExactBatch(
  *  the serialized row identical skips the write — the daemon fires several
  *  updateSession() calls per inbound message (activity bump, pid, stream-card
  *  state, …) and many of them change nothing. */
-function persistRow(session: Session, modelPinWrite = false): void {
+function persistRow(session: Session, modelPinWrite = false, sharedThreadOpeningWrite = false): void {
   if (loadFailure) throw new SessionStoreUnavailableError(loadFailure);
   if (!ownStore) {
     throw new SessionStoreUnavailableError(
@@ -2191,6 +2191,15 @@ function persistRow(session: Session, modelPinWrite = false): void {
   const existing = ownStore.selectRow.get(session.sessionId) as { row: string } | undefined;
   if (existing) {
     const durable = JSON.parse(existing.row) as Session;
+    // Late metadata must not rewind creation or erase a received identity.
+    const opening = durable.sharedThreadOpening;
+    if (opening?.phase && !sharedThreadOpeningWrite) {
+      session = { ...session, sharedThreadOpening: opening };
+    }
+    if (opening?.threadId && durable.existingAppServerEndpoint && !session.existingAppServerEndpoint) {
+      session = { ...session, cliSessionId: durable.cliSessionId,
+        existingAppServerEndpoint: durable.existingAppServerEndpoint };
+    }
     // Only explicit pin writers may change intent. Late metadata copies cannot
     // resurrect a cleared pin or erase a newer choice.
     if (!modelPinWrite) session = { ...session, modelPin: durable.modelPin };
@@ -2291,6 +2300,11 @@ function buildNewSession(
       : source === 'external' ? 'default' : bot?.promptInjection ?? 'default',
     ...initial,
   };
+  if (!intent.inherit && source === 'ordinary-feishu' && bot?.cliId === 'codex'
+    && bot.existingAppServer?.newTopics === 'create') {
+    session.cliId = 'codex';
+    session.sharedThreadOpening = { endpoint: bot.existingAppServer.endpoint };
+  }
   if (source !== 'external' && isCodexServiceTierCliId(bot?.cliId)) {
     session.serviceTier = bot?.serviceTier ?? 'inherit';
   } else {
@@ -2987,6 +3001,8 @@ export function reactivateClosedSession(
   next.queuedActivationPending = undefined;
   next.queuedActivationToken = undefined;
   next.queuedActivationInput = undefined;
+  next.queuedActivationRawInput = undefined;
+  next.queuedActivationRawTurnId = undefined;
   next.queuedActivationTurnId = undefined;
   next.queuedActivationDispatchAttempt = undefined;
   next.queuedActivationResume = undefined;
@@ -3113,6 +3129,8 @@ export function mutateOwnedSessionsAtomically<T>(
     nonblocking?: boolean;
     /** Explicit pin writer, never ordinary metadata. */
     modelPinWrite?: true;
+    /** Creation checkpoints are changed only from fresh transactional rows. */
+    sharedThreadOpeningWrite?: true;
   } = {},
 ): { result: T; rows: Map<string, Session> } {
   loadForWrite();
@@ -3133,7 +3151,7 @@ export function mutateOwnedSessionsAtomically<T>(
       fresh.set(sessionId, structuredClone(JSON.parse(hit.row) as Session));
     }
     result = mutate(fresh);
-    for (const row of fresh.values()) persistRow(row, options.modelPinWrite);
+    for (const row of fresh.values()) persistRow(row, options.modelPinWrite, options.sharedThreadOpeningWrite);
   });
   for (const [sessionId, row] of fresh) {
     const cached = sessions.get(sessionId);
@@ -4046,7 +4064,7 @@ const PRINCIPAL_LANE_RUNTIME_KEYS = [
   'codexProfile', 'codexProfileHome', 'cliConfigDir', 'wrapperCli', 'agentFrozen', 'model', 'modelPin', 'reasoningEffort', 'modelBackendVariant',
   'backendType', 'mojoIdentity', 'mojoIdentityHostDefault',
   'sandbox', 'sandboxPaths', 'sandboxHidePaths',
-  'sandboxReadonlyPaths', 'sandboxNetwork', 'sandboxNetworkPolicy', 'sandboxWithholdBotSecret',
+  'sandboxReadonlyPaths', 'sandboxNetwork', 'sandboxNetworkPolicy', 'sandboxWithholdBotSecret', 'protectedResults',
   'protectedHttpEgressPolicy',
 ] as const satisfies readonly (keyof Session)[];
 

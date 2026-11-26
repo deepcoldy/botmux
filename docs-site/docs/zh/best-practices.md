@@ -33,7 +33,7 @@
 
 ![关闭卡片上的「清理 worktree」按钮](/img/worktree-cleanup-close-card.png)
 
-**权限怎么分：** 绑定 oncall 后，群里所有人都能跟机器人**对话**；而 `/cd`、`/restart`、`/close`、点卡片按钮这类**改动会话**的操作，仍然只有 owner 和管理员（`allowedUsers`）能做。详见 [权限与授权](/permissions)。
+**权限怎么分：** 绑定 oncall 后，群里所有人都能跟机器人**对话**；而 `/cd`、`/restart`、`/close`、点卡片按钮这类**改动会话**的操作，仍然只有 owner 和管理员（`allowedUsers`）能做，唯一例外是话题发起人可以点卡片上的「❌ 关闭会话」关掉自己发起的话题（`/close` 命令仍需操作权）。详见 [权限与授权](/permissions)。
 
 **多个项目怎么办：** 建多个机器人，每个 `/oncall bind` 到不同的项目目录，各管一摊。
 

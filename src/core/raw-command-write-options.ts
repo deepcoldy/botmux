@@ -12,6 +12,7 @@ export interface WorkerRawCommandWriteOptions extends RawCommandWriteOptions {
 export function rawCommandWriteOptionsFor(
   adapter: Pick<CliAdapter, 'id' | 'rawCommandInputMode' | 'rawCommandSettleMs'> | undefined,
   cliId: CliId | string | undefined,
+  command?: string,
 ): WorkerRawCommandWriteOptions {
   const options: WorkerRawCommandWriteOptions = {
     coco: cliId === 'coco',
@@ -19,6 +20,11 @@ export function rawCommandWriteOptionsFor(
     submitBeatMs: RAW_COMMAND_SUBMIT_BEAT_MS,
   };
   if (options.coco) return options;
+  // TraeX can read typed text and Enter in one batch after a stall, treating
+  // Enter as a pasted newline. Only frame the single-line native rename.
+  if (adapter?.id === 'traex' && command && /^\/rename [^\x00-\x1f\x7f-\x9f]+$/u.test(command)) {
+    return { ...options, bracketedPaste: true };
+  }
   if (
     adapter?.rawCommandInputMode === 'paste-line' &&
     adapter.rawCommandSettleMs !== undefined &&

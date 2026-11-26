@@ -10,6 +10,7 @@ import {
   backgroundTaskLaunches,
   backgroundTaskSettledIds,
   isClaudeMainTurnStart,
+  isMeaningfulUserEvent,
   parseTaskNotification,
   type TranscriptEvent,
 } from '../src/services/claude-transcript.js';
@@ -298,6 +299,20 @@ describe('structured background task records', () => {
     // A foreground Bash result, and a sidechain launch (a sub-agent's own task), are not main-thread launches.
     expect(backgroundTaskLaunches(structuredLaunch('u', 't5', { stdout: 'ok', stderr: '', interrupted: false }))).toEqual([]);
     expect(backgroundTaskLaunches({ ...structuredLaunch('u', 't6', { backgroundTaskId: 'b2' }), isSidechain: true } as TranscriptEvent)).toEqual([]);
+  });
+
+  it('reads a Workflow launch as background work that its completion notification ends', () => {
+    const launch = structuredLaunch('u1', 't1', {
+      status: 'async_launched', taskId: 'w1', taskType: 'local_workflow', runId: 'wf_1',
+    });
+    expect(backgroundTaskLaunches(launch)).toEqual([{ taskId: 'w1', kind: 'agent' }]);
+    const t = new BackgroundTaskTracker();
+    t.observe(launch);
+    t.observe(assistant('a1', 'started', 'end_turn'));
+    expect(t.pending()).toBe(1);
+    expect(t.backgroundWait()).toBe(1);
+    t.observe(queueOperation('enqueue', notificationText(['w1'], 'completed')));
+    expect(t.pending()).toBe(0);
   });
 
   it('settles on a terminal notification in any shape, every listed id, and a TaskStop result', () => {
@@ -699,3 +714,93 @@ describe('backgroundTaskStopsInSiblingTranscripts', () => {
     }) + '\n';
   }
 });
+
+describe('api-request-blob defense (Claude Code >= 2.1.31x)', () => {
+  it('does not pollute isMeaningfulUserEvent, promptSeq/pendingTurnAgents, mainTurnOpen/backgroundWait, or resumed agent settle', () => {
+    const t = new BackgroundTaskTracker();
+    const base = Date.parse('2026-11-25T10:00:00.000Z');
+    t.reset(base);
+
+    const promptEv: TranscriptEvent = {
+      type: 'user',
+      uuid: 'u-1',
+      timestamp: new Date(base + 1000).toISOString(),
+      message: { role: 'user', content: 'run agent in background' },
+    };
+    const launchEv: TranscriptEvent = {
+      type: 'user',
+      uuid: 'u-launch',
+      timestamp: new Date(base + 2000).toISOString(),
+      toolUseResult: { isAsync: true, status: 'async_launched', agentId: 'ag-blob-1' },
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu1', content: 'launched' }] },
+    };
+    // Claude Code >= 2.1.31x writes untimestamped/uuid-less api-request-blob records carrying copied messages
+    const userBlobMidTurn: TranscriptEvent = {
+      type: 'api-request-blob',
+      message: {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'tu1', content: 'launched' },
+          { type: 'text', text: '<system-reminder>tool context</system-reminder>' },
+        ],
+      },
+    };
+    const assistantBlobMidTurn: TranscriptEvent = {
+      type: 'api-request-blob',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'copied' }] },
+    };
+
+    expect(isMeaningfulUserEvent(userBlobMidTurn)).toBe(false);
+
+    t.observe(promptEv);
+    t.observe(launchEv);
+    expect(t.pendingTurnAgents()).toBe(1);
+
+    // Mid-turn user api-request-blob MUST NOT bump promptSeq and zero pendingTurnAgents()
+    t.observe(userBlobMidTurn);
+    expect(t.pendingTurnAgents()).toBe(1);
+
+    // Main turn ends -> backgroundWait() === 1
+    t.observe({
+      type: 'system',
+      subtype: 'turn_duration',
+      uuid: 'dur-1',
+      timestamp: new Date(base + 3000).toISOString(),
+    });
+    expect(t.backgroundWait()).toBe(1);
+
+    // Post-turn user/assistant api-request-blob MUST NOT flip mainTurnOpen=true and drop backgroundWait() to 0
+    t.observe(userBlobMidTurn);
+    t.observe(assistantBlobMidTurn);
+    expect(t.backgroundWait()).toBe(1);
+
+    // Agent stops then is resumed via SendMessage; a subsequent api-request-blob copying the earlier
+    // <task-notification> (with no timestamp) MUST NOT settle the newly resumed agent!
+    t.observe({
+      type: 'user',
+      uuid: 'u-stop',
+      timestamp: new Date(base + 5000).toISOString(),
+      promptSource: 'system',
+      message: { role: 'user', content: '<task-notification>\n<task-id>ag-blob-1</task-id>\n<status>completed</status>\n</task-notification>' },
+    });
+    t.observe({
+      type: 'user',
+      uuid: 'u-resume',
+      timestamp: new Date(base + 6000).toISOString(),
+      toolUseResult: { success: true, resumedAgentId: 'ag-blob-1' },
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu2', content: 'resumed' }] },
+    });
+    expect(t.pending()).toBe(1);
+
+    const copiedStopBlob: TranscriptEvent = {
+      type: 'api-request-blob',
+      message: {
+        role: 'user',
+        content: '<task-notification>\n<task-id>ag-blob-1</task-id>\n<status>completed</status>\n</task-notification>',
+      },
+    };
+    t.observe(copiedStopBlob);
+    expect(t.pending()).toBe(1);
+  });
+});
+

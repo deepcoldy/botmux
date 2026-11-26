@@ -15,8 +15,8 @@ import { SessionContractStore } from '../../services/session-contract-store.js';
 import { sessionContractsEnabled } from '../../services/session-contract.js';
 import type { DaemonSession } from '../../core/types.js';
 import { resolveSessionEnv, type SessionEnvBotInput } from '../../core/session-env-resolve.js';
-import { getBot, loadBotConfigsCached, type BotConfig } from '../../bot-registry.js';
-import { statSync } from 'node:fs';
+import { effectiveDefaultWorkingDir, getBot, loadBotConfigsCached, type BotConfig } from '../../bot-registry.js';
+import { realpathSync, statSync } from 'node:fs';
 import { appendFile, mkdir } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -24,6 +24,9 @@ import { fileURLToPath } from 'node:url';
 import type { WorkerToDaemon } from '../../types.js';
 import type { BackendType } from '../../adapters/backend/types.js';
 import { config } from '../../config.js';
+import { createCliAdapterSync } from '../../adapters/cli/registry.js';
+import { resolveSandboxMode } from '../../adapters/cli/sandbox-mode.js';
+import { prepareWorkflowClaudeTrust } from '../../core/claude-folder-trust.js';
 import { spawnWorker } from '../../core/self-spawn.js';
 import {
   expandWorkflowWorkingDir,
@@ -89,6 +92,28 @@ export interface EphemeralPoolDeps {
 function liveBotConfig(larkAppId: string): BotConfig | undefined {
   try { return getBot(larkAppId).config; } catch { /* not hosted by this daemon */ }
   try { return loadBotConfigsCached().find(b => b.larkAppId === larkAppId); } catch { return undefined; }
+}
+
+/** A run may override its cwd or replay an old profile. Only seed the live
+ * bot's configured project and profile. A sandbox or credential-isolated
+ * worker provisions its own state and must leave its source profile alone. */
+async function prepareNodeFolderTrust(
+  snapshot: RunNodeRequest['botSnapshot'], cwd: string, sandboxEnv: string | undefined, signal?: AbortSignal,
+): Promise<void> {
+  if (snapshot.credentialsSourceDir || resolveSandboxMode({ configSandbox: snapshot.sandbox, envValue: sandboxEnv }) !== 'off') return;
+  const bot = liveBotConfig(snapshot.larkAppId);
+  if (!bot || bot.cliId !== snapshot.cliId || bot.cliConfigDir !== snapshot.cliConfigDir) return;
+  const adapter = createCliAdapterSync(snapshot.cliId, snapshot.cliPathOverride, { configDir: snapshot.cliConfigDir });
+  if (!adapter.claudeStateJsonPath) return;
+
+  const canonical = realpathSync(cwd);
+  const directories = [effectiveDefaultWorkingDir(bot), bot.workingDir, ...(bot.workingDirs ?? [])];
+  const configured = directories.some(directory => {
+    const path = expandWorkflowWorkingDir(directory);
+    if (!path) return false;
+    try { return realpathSync(path) === canonical; } catch { return false; }
+  });
+  if (configured) await prepareWorkflowClaudeTrust(canonical, adapter.claudeStateJsonPath, signal);
 }
 
 /** Throws when the live bot runs personal-assistant mode (see runNodeImpl). */
@@ -181,7 +206,7 @@ async function runNodeImpl(
   }
   if (!secret) {
     closeV3ArmedFenceWithoutSpawn(req.attemptDir, armedFence, 'secret_missing');
-    return { status: 'fail', manifestPath };
+    return { status: 'fail', manifestPath, failureDetail: `no Lark app secret available for ${req.botSnapshot.larkAppId}` };
   }
 
   try {
@@ -216,6 +241,17 @@ async function runNodeImpl(
     BOTMUX_WORKFLOW_NODE_ID: req.node.id,
   };
   for (const key of protectedEnvKeys) delete workerEnv[key];
+  try {
+    await prepareNodeFolderTrust(req.botSnapshot, cwd, workerEnv.BOTMUX_SANDBOX, cancelSignal);
+  } catch (error) {
+    // Trust is optional. A missing cwd or profile must still take the normal
+    // worker startup path and surface the actual launch error or dialog.
+    await appendLine(stderrPath(req), `[v3] folder trust preparation skipped: ${error}`);
+  }
+  if (cancelSignal?.aborted) {
+    closeV3ArmedFenceWithoutSpawn(req.attemptDir, armedFence, 'pre_aborted');
+    return { status: 'cancelled', manifestPath, cancelReason: cancelSignal.reason };
+  }
   // Where the worker writes this attempt's skill manifest + snapshot (its own
   // SESSION_DATA_DIR, i.e. config.session.dataDir unless req.env overrides it).
   const workerDataDir = workerEnv.SESSION_DATA_DIR || config.session.dataDir;
@@ -324,9 +360,11 @@ async function runNodeImpl(
     cliRuntime: req.botSnapshot.cliRuntime,
     cliPathOverride: req.botSnapshot.cliPathOverride,
     credentialsSourceDir: req.botSnapshot.credentialsSourceDir,
+    cliConfigDir: req.botSnapshot.cliConfigDir,
     wrapperCli: req.botSnapshot.wrapperCli,
     model: req.botSnapshot.model,
     reasoningEffort: req.botSnapshot.reasoningEffort,
+    modelBackendVariant: req.botSnapshot.modelBackendVariant,
     envPolicy: req.botSnapshot.envPolicy,
     ...workerSessionEnv,
     // Workflow nodes receive no write capability or secret channel, but must
@@ -374,7 +412,7 @@ async function runNodeImpl(
 
   return new Promise<RunNodeResult>((resolve) => {
     let settled = false;
-    let pendingResult: { status: 'ok' | 'fail'; reason: string } | undefined;
+    let pendingResult: { status: 'ok' | 'fail'; reason: string; detail?: string; error?: RunNodeResult['error'] } | undefined;
     let quiesceTimer: NodeJS.Timeout | undefined;
     let sigtermTimer: NodeJS.Timeout | undefined;
     let sigkillTimer: NodeJS.Timeout | undefined;
@@ -386,6 +424,8 @@ async function runNodeImpl(
     let cancelRequested = false;
     let initSent = false;
     let goalSent = false;
+    /** The CLI cleared its goal after the manifest appeared (see 'error'). */
+    let goalAbortedAfterManifest: string | undefined;
     let sessionReadyNotified = false;
     let cancelReason: unknown;
     let observedRuntime: Extract<WorkerEvent, { type: 'active_runtime' }> | undefined;
@@ -426,7 +466,7 @@ async function runNodeImpl(
     }
 
     const hardDeadline = setTimeout(() => {
-      finish('fail', 'timeout');
+      finish('fail', 'timeout', { detail: `node timed out after ${Math.round(req.timeoutMs / 1000)}s` });
     }, req.timeoutMs);
 
     function sessionInfo(): WorkerSessionInfo {
@@ -473,10 +513,20 @@ async function runNodeImpl(
       worker.send({ type: 'close', ...(controller ? { sessionCommand: { version: 2, runtime: controller.currentRuntime(), operationId: operation?.operationId } } : {}) });
     }
 
-    function finish(status: RunNodeResult['status'], reason: string): void {
+    /** `detail` is the human-readable root cause kept for a failure that
+     *  leaves no manifest; `error` is a precise pool error (wins over both). */
+    function finish(
+      status: RunNodeResult['status'],
+      reason: string,
+      outcome: { detail?: string; error?: RunNodeResult['error'] } = {},
+    ): void {
       if (settled || cancelRequested || pendingResult) return;
       if (status === 'cancelled') return;
-      pendingResult = { status, reason };
+      pendingResult = {
+        status, reason,
+        ...(outcome.detail ? { detail: outcome.detail } : {}),
+        ...(outcome.error ? { error: outcome.error } : {}),
+      };
       void appendLine(stderrPath(req), `[v3] worker outcome claimed status=${status} reason=${reason}; waiting for worker exit`);
       requestWorkerExit();
     }
@@ -542,6 +592,11 @@ async function runNodeImpl(
       const poll = () => {
         manifestTimer = undefined;
         if (settled || cancelRequested) return;
+        if (goalAbortedAfterManifest && !isRegularFile(manifestPath)) {
+          // The manifest we deferred to is gone and nothing will write it again.
+          finish('fail', 'worker-error', { detail: goalAbortedAfterManifest });
+          return;
+        }
         const stable = manifestIsStable(manifestPath, manifestCandidate, deps.manifestSettleMs);
         manifestCandidate = stable.candidate;
         if (stable.done) {
@@ -613,13 +668,42 @@ async function runNodeImpl(
         case 'active_runtime':
           observedRuntime = event;
           break;
+        case 'user_notify':
+          // Only the worker's authoritative startup-dialog detection is fatal,
+          // and only before the goal went out; every other notice (permission
+          // prompts during a running goal, …) stays informational. Nobody can
+          // answer the dialog from a workflow, so waiting would only burn the
+          // node deadline and end in a bare "manifest missing".
+          if (event.kind === 'cli_startup_blocked' && event.startupBlocker && !goalSent) {
+            const { kind, rule, folder } = event.startupBlocker;
+            const profile = req.botSnapshot.cliConfigDir ? ` (${req.botSnapshot.cliConfigDir})` : '';
+            const error = {
+              code: `CLI_STARTUP_${kind.toUpperCase()}`,
+              message: `${req.botSnapshot.cliId} startup is blocked on ${kind} (${rule})${folder ? ` for ${folder}` : ''} `
+                + `before the goal was sent; complete that step with this bot's CLI profile${profile}, then retry the node`,
+              retryable: true,
+            };
+            void appendLine(stderrPath(req), `[v3] ${error.code}: ${event.message}`);
+            finish('fail', 'startup-blocked', { error });
+          }
+          break;
         case 'error':
           void appendLine(stderrPath(req), `[worker] ${event.message}`);
-          finish('fail', 'worker-error');
+          if (event.goalAborted && goalSent && isRegularFile(manifestPath)) {
+            // Claude gave up on a call AFTER the goal wrote its manifest (e.g.
+            // the context ran out on the closing turn). The work may be on
+            // disk: let the manifest watch settle it and the runtime judge it,
+            // keeping the cause in case that manifest is not valid.
+            goalAbortedAfterManifest = event.message;
+            void appendLine(stderrPath(req), '[v3] goal cleared after the manifest was written; settling on the manifest');
+            break;
+          }
+          finish('fail', 'worker-error', { detail: event.message });
           break;
         case 'claude_exit':
           void appendLine(stderrPath(req), `[worker] cli exit code=${event.code ?? 'null'} signal=${event.signal ?? 'null'}`);
-          finish(event.code === 0 ? 'ok' : 'fail', 'cli-exit');
+          finish(event.code === 0 ? 'ok' : 'fail', 'cli-exit',
+            { detail: `CLI exited code=${event.code ?? 'null'} signal=${event.signal ?? 'null'}` });
           break;
       }
     };
@@ -627,7 +711,7 @@ async function runNodeImpl(
 
     forwardWorkerError = (err) => {
       if (cancelRequested) return;
-      finish('fail', 'worker-process-error');
+      finish('fail', 'worker-process-error', { detail: `worker process error: ${err.message}` });
     };
     if (deferredWorkerError) {
       const err = deferredWorkerError;
@@ -671,12 +755,23 @@ async function runNodeImpl(
         void appendLine(stderrPath(req), `[v3] ${runtimeError.code}: ${runtimeError.message}`);
       }
       void appendLine(stderrPath(req), `[v3] worker closed status=${status} reason=${reason} code=${code ?? 'null'}`);
+      const processDetail = workerStatus !== 'fail' ? undefined
+        : pendingResult
+          // The pool itself closed the worker (send failure, …): its exit code says nothing.
+          ? pendingResult.detail ?? `node ended by the pool (${pendingResult.reason})`
+          : `worker exited code=${code ?? 'null'}`;
+      // A goal the CLI cleared after its manifest appeared is the root cause of
+      // whatever ended the node next (deadline, CLI exit, a vanished manifest).
+      const failureDetail = goalAbortedAfterManifest && !processDetail?.startsWith(goalAbortedAfterManifest)
+        ? (processDetail ? `${goalAbortedAfterManifest}; ${processDetail}` : goalAbortedAfterManifest)
+        : processDetail;
       resolve({
         status,
         manifestPath,
         sessionInfo: sessionInfo(),
+        ...(failureDetail ? { failureDetail } : {}),
         ...(runtime ? { runtime } : {}),
-        ...(runtimeError ? { error: runtimeError } : {}),
+        ...((runtimeError ?? pendingResult?.error) ? { error: runtimeError ?? pendingResult?.error } : {}),
       });
     });
 
@@ -797,6 +892,10 @@ function stdoutPath(req: RunNodeRequest): string {
 
 function stderrPath(req: RunNodeRequest): string {
   return req.stderrPath ?? join(req.attemptDir, 'stderr.log');
+}
+
+function isRegularFile(path: string): boolean {
+  try { return statSync(path).isFile(); } catch { return false; }
 }
 
 function manifestIsStable(

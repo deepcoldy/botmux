@@ -489,8 +489,13 @@ describe('Web startup protocol activity and recovery', () => {
     for (let i = 0; i < 20; i++) recheck(target, {});
     expect(vi.getTimerCount()).toBe(1);
     await vi.advanceTimersByTimeAsync(100_000);
-    expect(vi.getTimerCount()).toBe(0);
+    // Past the 90s warning deadline the single observation poller slows down
+    // rather than stopping permanently, and drops to zero once retired.
+    expect(vi.getTimerCount()).toBe(1);
     expect(h.admissions()).toBe(0);
+    h.scope.closeRequested = true;
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(vi.getTimerCount()).toBe(0);
   });
 });
 

@@ -19,6 +19,10 @@ vi.mock('../src/utils/user-token.js', () => ({
   lookupAuthorizedUserName: vi.fn(() => undefined),
   isUsableOpenId: (openId: unknown) => typeof openId === 'string' && /^[A-Za-z0-9_-]{1,120}$/.test(openId),
 }));
+const localTrackRenewal = vi.fn();
+vi.mock('../src/core/bytedcli-identity-renewal.js', () => ({
+  trackBytedcliIdentityRenewal: (...args: unknown[]) => localTrackRenewal(...args),
+}));
 vi.mock('../src/services/bytedcli-auth.js', () => ({
   renewBytedcliJwts: vi.fn(async () => null),
   mintBytedcliJwts: vi.fn(async () => null),
@@ -459,10 +463,13 @@ describe('transient platform refusal within a turn: concurrency and policy', () 
   const platformPolicy = () => parseTriggerUserAuthConfig({ enabled: true, tools: ['bytedcli'], credentialSource: 'platform' });
   const toolOffPolicy = () => parseTriggerUserAuthConfig({ enabled: true, tools: ['lark-cli'], credentialSource: 'platform' });
 
-  it('does not write a grant acquired while the bot was switched to local credentials', async () => {
+  it.each([
+    localPolicy,
+    () => parseTriggerUserAuthConfig({ enabled: true, credentialSource: { default: 'platform', bytecloud: 'local' } }),
+  ])('does not write a grant acquired while ByteCloud was switched to local credentials', async toLocal => {
     let policy = platformPolicy();
     const { release, pending } = await startHeldRetry({ currentPolicy: () => policy });
-    policy = localPolicy();     // operator switches the bot mid-flight
+    policy = toLocal();        // operator switches ByteCloud mid-flight
     const before = current();
     release(GRANTED);
     await pending;
@@ -659,5 +666,208 @@ describe('person turns: the publication fence also guards the retry write', () =
     await publishWithFence(() => true);
     await retryPerson();
     expect(body()).toContain("BYTEDCLI_USER_CLOUD_JWT='cloud-jwt'");
+  });
+});
+
+describe('transient local bytedcli refusal within a turn', () => {
+  const localConfig = {
+    larkAppId: 'cli_bot', larkAppSecret: 'secret', brand: 'feishu' as const,
+    triggerUserAuth: parseTriggerUserAuthConfig({ enabled: true, tools: ['bytedcli'], credentialSource: 'local' }) ?? undefined,
+  } as any;
+  const autoConfig = {
+    larkAppId: 'cli_bot', larkAppSecret: 'secret', brand: 'feishu' as const,
+    triggerUserAuth: parseTriggerUserAuthConfig({ enabled: true, tools: ['bytedcli'], credentialSource: 'auto' }) ?? undefined,
+  } as any;
+
+  let mintBytedcliJwts: ReturnType<typeof vi.fn>;
+
+  beforeEach(async () => {
+    const provider = await import('../src/services/bytedcli-auth.js');
+    mintBytedcliJwts = vi.mocked(provider.mintBytedcliJwts);
+    mintBytedcliJwts.mockReset();
+    localTrackRenewal.mockClear();
+    __setPlatformCredentialDepsForTest({ readBinding: () => null });
+  });
+
+  const prepareLocal = (overrides: Record<string, unknown> = {}) => publishTurnCliIdentity({
+    botConfig: localConfig, sessionDataDir: dir, sessionId: SESSION, senderOpenId: ALICE,
+    turnId: TURN, storageModel: 'proven', ...overrides,
+  } as any);
+
+  it('recovers a local provider_unavailable turn after cooldown and registers renewal', async () => {
+    mintBytedcliJwts
+      .mockRejectedValueOnce(new Error('bytedcli authorization service unavailable (status)'))
+      .mockResolvedValueOnce({ cloudJwt: 'local-recovered-jwt', codeJwt: 'local-code-jwt' });
+
+    const validateBeforeWrite = vi.fn(() => true);
+    const outcomes = await prepareLocal({ validateBeforeWrite });
+    expect(outcomes.find(o => o.tool === 'bytedcli')?.state).toBe('unavailable');
+    expect(current()).toContain("BOTMUX_IDENTITY_MODE='denied'");
+    expect(current()).toContain('[reason=provider_unavailable]');
+    expect(mintBytedcliJwts).toHaveBeenCalledTimes(1);
+
+    // Cooldown prevents hammering a local CLI immediately after a 30s timeout.
+    await retry(localConfig);
+    later(TRANSIENT_REFUSAL_RETRY_INTERVAL_MS - 1);
+    await retry(localConfig);
+    expect(mintBytedcliJwts).toHaveBeenCalledTimes(1);
+
+    // Once cooldown elapses, the next call in the same turn recovers transparently.
+    later(1);
+    await retry(localConfig);
+    expect(mintBytedcliJwts).toHaveBeenCalledTimes(2);
+    expect(current()).toContain("BOTMUX_IDENTITY_MODE='user'");
+    expect(current()).toContain("BYTEDCLI_USER_CLOUD_JWT='local-recovered-jwt'");
+    expect(current('codebase')).not.toContain("BOTMUX_IDENTITY_MODE='denied'");
+    expect(localTrackRenewal).toHaveBeenCalledTimes(1);
+    expect(localTrackRenewal).toHaveBeenCalledWith(expect.objectContaining({ validateBeforeWrite }));
+
+    // Recovered: no further mints on later calls.
+    later();
+    await retry(localConfig);
+    expect(mintBytedcliJwts).toHaveBeenCalledTimes(2);
+  });
+
+  it('passes the publication fence to renewal after an initial local mint', async () => {
+    mintBytedcliJwts.mockResolvedValueOnce({ cloudJwt: 'initial-local-jwt' });
+    const validateBeforeWrite = vi.fn(() => true);
+    await prepareLocal({ validateBeforeWrite });
+    expect(current()).toContain("BYTEDCLI_USER_CLOUD_JWT='initial-local-jwt'");
+    expect(localTrackRenewal).toHaveBeenCalledWith(expect.objectContaining({ validateBeforeWrite }));
+  });
+
+  it('stops retrying after TRANSIENT_REFUSAL_MAX_RETRIES while the local provider stays unavailable', async () => {
+    mintBytedcliJwts.mockRejectedValue(new Error('bytedcli authorization service unavailable (status)'));
+    await prepareLocal();
+    for (let i = 0; i < TRANSIENT_REFUSAL_MAX_RETRIES + 3; i++) {
+      later();
+      await retry(localConfig);
+    }
+    expect(mintBytedcliJwts).toHaveBeenCalledTimes(1 + TRANSIENT_REFUSAL_MAX_RETRIES);
+    expect(current()).toContain('[reason=provider_unavailable]');
+  });
+
+  it('paces the next local retry from when a slow failing mint finishes, not when it started', async () => {
+    mintBytedcliJwts.mockRejectedValueOnce(new Error('initial timeout'));
+    await prepareLocal();
+    later();
+    mintBytedcliJwts.mockImplementationOnce(async () => {
+      later(TOTAL_BUDGET_MS);
+      throw new Error('second 30s timeout');
+    });
+    await retry(localConfig);
+    expect(mintBytedcliJwts).toHaveBeenCalledTimes(2);
+
+    // Immediately after the 30s failure finishes, cooldown still holds.
+    mintBytedcliJwts.mockResolvedValueOnce({ cloudJwt: 'recovered-after-cooldown' });
+    later(TRANSIENT_REFUSAL_RETRY_INTERVAL_MS - 1);
+    await retry(localConfig);
+    expect(mintBytedcliJwts).toHaveBeenCalledTimes(2);
+
+    later(1);
+    await retry(localConfig);
+    expect(mintBytedcliJwts).toHaveBeenCalledTimes(3);
+    expect(current()).toContain("BYTEDCLI_USER_CLOUD_JWT='recovered-after-cooldown'");
+  });
+
+  it('replaces provider_unavailable with not_authorized (or unattended) and stops when the recovered provider reports no login', async () => {
+    mintBytedcliJwts
+      .mockRejectedValueOnce(new Error('bytedcli authorization service unavailable (status)'))
+      .mockResolvedValueOnce(null);
+    await prepareLocal();
+    later();
+    await retry(localConfig);
+    expect(mintBytedcliJwts).toHaveBeenCalledTimes(2);
+    expect(current()).toContain('[reason=not_authorized]');
+    later();
+    await retry(localConfig);
+    expect(mintBytedcliJwts).toHaveBeenCalledTimes(2);
+
+    // Unattended turn transitions to [reason=unattended] and stops.
+    const scheduled = 'schedule:job2:22222222-2222-2222-2222-222222222222';
+    mintBytedcliJwts
+      .mockRejectedValueOnce(new Error('bytedcli authorization service unavailable (status)'))
+      .mockResolvedValueOnce(null);
+    await prepareLocal({ turnId: scheduled });
+    later();
+    await retryTransientTurnIdentity({
+      sessionDataDir: dir, sessionId: SESSION, turnId: scheduled, tool: 'bytedcli', botConfig: localConfig,
+    });
+    expect(recallProvenIdentityContent(dir, SESSION, scheduled, 'bytedcli')).toContain('[reason=unattended]');
+    later();
+    await retryTransientTurnIdentity({
+      sessionDataDir: dir, sessionId: SESSION, turnId: scheduled, tool: 'bytedcli', botConfig: localConfig,
+    });
+    expect(mintBytedcliJwts).toHaveBeenCalledTimes(4);
+  });
+
+  it('drops the retry entry when authEpoch changes, validateBeforeWrite fails, or policy switches away from local', async () => {
+    // 1. authEpoch bump (logout / revoke) ends retries.
+    mintBytedcliJwts
+      .mockRejectedValueOnce(new Error('unavailable'))
+      .mockResolvedValue({ cloudJwt: 'should-not-write' });
+    await prepareLocal();
+    authEpoch = 1;
+    later();
+    await retry(localConfig);
+    expect(mintBytedcliJwts).toHaveBeenCalledTimes(1);
+    expect(current()).toContain('[reason=provider_unavailable]');
+
+    // 2. Policy switched to platform mid-turn drops retries.
+    authEpoch = 0;
+    mintBytedcliJwts.mockReset();
+    mintBytedcliJwts
+      .mockRejectedValueOnce(new Error('unavailable'))
+      .mockResolvedValue({ cloudJwt: 'should-not-write' });
+    await prepareLocal();
+    const platformOnly = parseTriggerUserAuthConfig({ enabled: true, tools: ['bytedcli'], credentialSource: 'platform' });
+    later();
+    await retry(localConfig, () => platformOnly);
+    expect(mintBytedcliJwts).toHaveBeenCalledTimes(1);
+
+    // 3. Auto host bound to platform mid-turn drops local retries.
+    mintBytedcliJwts.mockReset();
+    mintBytedcliJwts
+      .mockRejectedValueOnce(new Error('unavailable'))
+      .mockResolvedValue({ cloudJwt: 'should-not-write' });
+    await prepareLocal({ botConfig: autoConfig });
+    __setPlatformCredentialDepsForTest({ readBinding: () => BINDING });
+    later();
+    await retry(autoConfig);
+    expect(mintBytedcliJwts).toHaveBeenCalledTimes(1);
+
+    // 4. validateBeforeWrite turning false prevents writing the recovered credential.
+    __setPlatformCredentialDepsForTest({ readBinding: () => null });
+    mintBytedcliJwts.mockReset();
+    mintBytedcliJwts
+      .mockRejectedValueOnce(new Error('unavailable'))
+      .mockResolvedValueOnce({ cloudJwt: 'fenced-jwt' });
+    let admitted = true;
+    await prepareLocal({ validateBeforeWrite: () => admitted });
+    admitted = false;
+    later();
+    await retry(localConfig);
+    expect(current()).toContain('[reason=provider_unavailable]');
+    expect(current()).not.toContain('fenced-jwt');
+  });
+
+  it('does not register local retries for single-file storage or delegated turns', async () => {
+    mintBytedcliJwts.mockRejectedValueOnce(new Error('unavailable')).mockResolvedValue({ cloudJwt: 'x' });
+    await prepareLocal({ storageModel: 'single' });
+    later();
+    await retry(localConfig);
+    expect(mintBytedcliJwts).toHaveBeenCalledTimes(1);
+
+    mintBytedcliJwts.mockReset();
+    mintBytedcliJwts.mockRejectedValueOnce(new Error('unavailable')).mockResolvedValue({ cloudJwt: 'x' });
+    await prepareLocal({
+      delegatedIdentity: {
+        credentialOpenId: ALICE, targetOpenId: 'ou_bob', unionId: 'on_alice',
+        tools: ['bytedcli'], dispatchRoot: 'om_root',
+      },
+    });
+    later();
+    await retry(localConfig);
+    expect(mintBytedcliJwts).toHaveBeenCalledTimes(1);
   });
 });

@@ -41,6 +41,7 @@ const ROUTES: ReadonlyArray<readonly [string, object]> = [
   ['/api/bot-bare-rename-passthrough', LEGACY],
   ['/api/bot-riff', LEGACY],
   ['/api/bot-herdr', LEGACY],
+  ['/api/bot-hc-herdr-tabs', LEGACY],
   ['/api/bot-skills', LEGACY],
   ['/api/bot-sandbox-network-policy', LEGACY],
   ['/api/bot-lark-tool-binding', LEGACY],
@@ -50,8 +51,13 @@ const ROUTES: ReadonlyArray<readonly [string, object]> = [
 
 /** [path, 请求体, 期望 status, 期望 body（toMatchObject）, 期望落盘的 config 字段（undefined = 不应出现）] */
 type Case = readonly [string, string, number, unknown, Record<string, unknown>?];
+const followInclude = { field: 'description', op: 'contains', pattern: 'alarm group' };
+const followExclude = { field: 'name', op: 'contains', pattern: '[已关单]' };
+const followConfig = { enabled: true, includeRules: [followInclude], excludeRules: [followExclude] };
 const CASES: readonly Case[] = [
   ['/api/bot-owner-group-follow', '{"ownerGroupFollow":{"enabled":true,"excludeChatIds":["oc_skip"]}}', 200, { ok: true, ownerGroupFollow: { enabled: true, excludeChatIds: ['oc_skip'] } }, { ownerGroupFollow: { enabled: true, excludeChatIds: ['oc_skip'] } }],
+  ['/api/bot-owner-group-follow', JSON.stringify({ ownerGroupFollow: { ...followConfig, includeRules: [followInclude, { ...followInclude, caseSensitive: false }] } }), 200, { ok: true, ownerGroupFollow: followConfig }, { ownerGroupFollow: followConfig }],
+  ['/api/bot-owner-group-follow', JSON.stringify({ ownerGroupFollow: { excludeRules: [{ field: 'any', op: 'regex', pattern: '(a|aa)+' }] } }), 400, { ok: false, error: 'invalid_json' }],
   ['/api/bot-owner-group-follow', '{"ownerGroupFollow":{"enabled":false}}', 200, { ok: true, ownerGroupFollow: null }, { ownerGroupFollow: undefined }],
   ['/api/bot-owner-group-follow', '{"ownerGroupFollow":{"enabled":"true"}}', 400, { ok: false, error: 'invalid_json' }],
   ['/api/bot-owner-group-follow', '{"ownerGroupFollow":{"excludeChatIds":["ou_other"]}}', 400, { ok: false, error: 'invalid_json' }],
@@ -149,6 +155,10 @@ const CASES: readonly Case[] = [
   ['/api/bot-herdr', '{"herdr":"{\\"sessionName\\":\\"default\\",\\"chatTypes\\":[\\"group\\",\\"group\\"]}"}', 200, { ok: true }, { herdr: { sessionName: 'default', chatTypes: ['group'] } }],
   // 非字符串 body 不能静默当清除（破坏性字段类型门）。
   ['/api/bot-herdr', '{"herdr":{"tab":"3"}}', 400, { ok: false, error: expect.stringContaining('invalid_herdr_config') }],
+  ['/api/bot-hc-herdr-tabs', '{"enabled":true}', 200, { ok: true, hcHerdrTabs: true }, { hcHerdrTabs: true }],
+  ['/api/bot-hc-herdr-tabs', '{"enabled":false}', 200, { ok: true, hcHerdrTabs: false }, { hcHerdrTabs: undefined }],
+  ['/api/bot-hc-herdr-tabs', '{"enabled":"true"}', 400, { ok: false, error: 'invalid_boolean' }],
+  ['/api/bot-hc-herdr-tabs', 'null', 400, { ok: false, error: 'invalid_boolean' }],
   ['/api/bot-skills', '{"action":"set","policy":null}', 200, { ok: true, skills: null }],
   ['/api/bot-skills', '{"action":"x"}', 400, { ok: false, error: 'invalid_action' }],
   ['/api/bot-skills', '{"action":"attach"}', 400, { ok: false, error: 'name_required' }],

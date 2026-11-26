@@ -14,6 +14,7 @@ import type { AuthLinkDelivery } from './auth-link-delivery.js';
 import type { MeegoTenant } from '../services/bytedcli-home.js';
 import type { MeegoLoginRequest } from '../services/meego-auth.js';
 import type { BytedcliLoginStart } from '../services/bytedcli-auth.js';
+import type { AdoptResult } from './turn-cli-identity.js';
 
 export type AuthProvider = 'meego' | 'bytedcli';
 
@@ -42,11 +43,13 @@ export interface ProviderAuthDeps {
   /** A link to send; or `authorized` when bytedcli already holds a confirmed
    *  login; or `failed` with a redacted reason. */
   startBytedcliLogin: (openId: string) => Promise<BytedcliLoginStart>;
-  /** Hands a finished ByteCloud login to the running turn; true when the turn
-   *  can use it now. */
-  adoptBytedcliForTurn: (openId: string) => Promise<'adopted' | 'already' | 'none'>;
+  /** Hands a finished ByteCloud login to the running turn; `'unavailable'` when
+   *  minting fails transiently, `'superseded'` when a safety fence changed. */
+  adoptBytedcliForTurn: (openId: string) => Promise<AdoptResult>;
   /** {@link deliverAuthLink} bound to this conversation and person. */
   deliver: (text: string, privateCommand: string) => Promise<AuthLinkDelivery>;
+  /** The originating credential route is still valid. */
+  isCurrent?: () => boolean;
   now?: () => number;
 }
 
@@ -79,13 +82,26 @@ export async function requestProviderAuth(
       command: meegoLoginCommand(tenant),
     };
   } else {
+    const superseded = (): ProviderAuthResult => ({ status: 'unavailable', message: t('provider_auth.ready_bytedcli_superseded', undefined, locale) });
     // Starting a login can itself find one: bytedcli 0.186+ answers `--begin`
     // with a login it already holds (or just finished) instead of a link.
-    const started = await deps.bytedcliAuthorized(openId) === true
-      ? { state: 'authorized' as const }
-      : await deps.startBytedcliLogin(openId);
+    const authorized = await deps.bytedcliAuthorized(openId) === true;
+    if (deps.isCurrent?.() === false) return superseded();
+    const started = authorized ? { state: 'authorized' as const } : await deps.startBytedcliLogin(openId);
+    if (deps.isCurrent?.() === false) return superseded();
     if (started.state === 'authorized') {
-      const adopted = await deps.adoptBytedcliForTurn(openId);
+      let adopted: AdoptResult;
+      try {
+        adopted = await deps.adoptBytedcliForTurn(openId);
+      } catch {
+        adopted = 'unavailable';
+      }
+      if (adopted === 'unavailable') {
+        return { status: 'unavailable', message: t('provider_auth.ready_bytedcli_unavailable', undefined, locale) };
+      }
+      if (adopted === 'superseded') {
+        return superseded();
+      }
       const key = { adopted: 'provider_auth.ready_bytedcli_now', already: 'provider_auth.ready_bytedcli_already', none: 'provider_auth.ready_bytedcli' }[adopted];
       return { status: 'ready', message: t(key, undefined, locale) };
     }
@@ -136,14 +152,23 @@ export async function deliverProviderLink(
   const at = now();
   for (const [k, v] of recent) if (at - v.at >= LINK_RESEND_MS) recent.delete(k);
   // Claimed before sending, so refusals that arrive while it goes out wait for it.
-  recent.set(key, { at, reached: true });
+  const claimed = { at, reached: true };
+  recent.set(key, claimed);
   const delivery = await deps.deliver(link.text, link.command);
-  recent.set(key, { at, reached: delivery !== 'dm_failed' });
+  if (delivery === 'cancelled_before_write') {
+    if (recent.get(key) === claimed) recent.delete(key);
+  } else if (recent.get(key) === claimed) {
+    // A delivery that outlived its claim must not overwrite a newer attempt.
+    // dm_failed is also used for unknown post-write outcomes, so it never
+    // proves that releasing the claim would be safe.
+    recent.set(key, { at, reached: delivery !== 'dm_failed' });
+  }
   switch (delivery) {
     case 'inline': return { status: 'delivered', delivery, message: t('provider_auth.delivered_inline', vars, locale) };
     case 'dm': return { status: 'delivered', delivery, message: t('provider_auth.delivered_dm', vars, locale) };
     case 'ephemeral': return { status: 'delivered', delivery, message: t('provider_auth.delivered_ephemeral', vars, locale) };
-    case 'dm_failed': return { status: 'undeliverable', delivery, message: t('provider_auth.undeliverable', vars, locale) };
+    case 'cancelled_before_write':
+    case 'dm_failed': return { status: 'undeliverable', delivery: 'dm_failed', message: t('provider_auth.undeliverable', vars, locale) };
   }
 }
 

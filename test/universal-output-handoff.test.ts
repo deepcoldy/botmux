@@ -1,3 +1,4 @@
+import { sameExecution } from '../src/services/session-contract.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -15,6 +16,7 @@ import { FINAL_HANDOFF_DELIVERY_REASON, FINAL_HANDOFF_WAIT_REASON } from '../src
 import { raiseDaemonAttention } from '../src/core/session-activity.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import type { WorkerFinalOutput } from '../src/types.js';
+import type { DaemonSession } from '../src/core/types.js';
 
 const app = 'cli_universal';
 const output: WorkerFinalOutput = { type: 'final_output', sessionId: 'session_one', turnId: 'om_turn', lastUuid: 'native_final', content: 'answer' };
@@ -24,6 +26,12 @@ function directory() { const value = mkdtempSync(join(tmpdir(), 'universal-outpu
 function database(dir = directory()) { const journal = new OutputDeliveryJournal(dir, app); dbs.push(journal); return journal; }
 function receipt(sent: WorkerFinalOutput): OutputHandoffReceipt { return { type: 'final_output_settled', ...sent.handoff! }; }
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); for (const db of dbs.splice(0)) try { db.close(); } catch {} for (const dir of directories.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+
+function deliveryScope(scope: Record<string, any>) {
+  scope.assertFrozenImDeliveryAllowed = loadWorkerPoolFunction('assertFrozenImDeliveryAllowed', scope);
+  scope.classifyFinalPublicationError = loadWorkerPoolFunction('classifyFinalPublicationError', scope);
+  return scope;
+}
 
 describe('journal app identity', () => {
   it('accepts any safe-basename app id but rejects path-shaped ids', () => {
@@ -54,7 +62,7 @@ it('preserves the first reply model without changing the final output identity',
 
 describe('attention lifecycle', () => {
   const loadRunOutput = (scope: Record<string, any>) =>
-    loadWorkerPoolClosure<(record: OutputDeliveryRecord) => Promise<void>>('runOutput', scope);
+    loadWorkerPoolClosure<(record: OutputDeliveryRecord) => Promise<void>>('runOutput', deliveryScope(scope));
   const scopeFor = (
     db: OutputDeliveryJournal,
     record: OutputDeliveryRecord,
@@ -212,6 +220,93 @@ describe('attention lifecycle', () => {
     // The startup blip must NOT latch the attention after a later success.
     expect(ctx.ds.agentAttention).toBeUndefined();
     vi.useRealTimers();
+  });
+  it('settles an existing required hold and reaction before terminal outcome registration', async () => {
+    const dir = directory(); const db = database();
+    const record = db.accept(outputSnapshot(app, output),
+      { kind: 'im', answerRequired: true, context: { target: { mode: 'plain', chatId: 'oc' } }, chatId: 'oc', chatType: 'group' });
+    const ctx = scopeFor(db, record, dir, {
+      processFinalOutput: vi.fn(async () => ({ status: 'delivered' as const, messageId: 'om_ok' })),
+    });
+    ctx.ds.requiredReplyCotHolds = new Map([[`${output.turnId}\0${output.dispatchAttempt ?? ''}`, {
+      turnId: output.turnId, dispatchAttempt: output.dispatchAttempt,
+      finishStatus: 'completed' as const, replyPending: true, backgroundPending: false,
+    }]]);
+    ctx.scope.hasCompletedTurn = () => false;
+    ctx.scope.noteFinalOutputReceipt = vi.fn();
+    ctx.scope.finishTurnReactions = vi.fn();
+    ctx.scope.finalizeCotMessage = vi.fn();
+
+    await ctx.run();
+
+    expect(db.read(record.id)?.state).toBe('settled');
+    expect(ctx.ds.requiredReplyCotHolds).toBeUndefined();
+    expect(ctx.scope.finalizeCotMessage).toHaveBeenCalledExactlyOnceWith(
+      ctx.ds, output.turnId, 'completed', output.dispatchAttempt,
+    );
+    expect(ctx.scope.finishTurnReactions).toHaveBeenCalledOnce();
+  });
+  it('settles a delivered CoT before a flush can interleave with CLI loss', async () => {
+    const dir = directory(); const db = database();
+    const record = db.accept(outputSnapshot(app, output),
+      { kind: 'im', answerRequired: true, context: { target: { mode: 'plain', chatId: 'oc' } }, chatId: 'oc', chatType: 'group' });
+    const ctx = scopeFor(db, record, dir, {
+      processFinalOutput: vi.fn(async () => ({ status: 'delivered' as const, messageId: 'om_ok' })),
+    });
+    ctx.ds.requiredReplyCotHolds = new Map([[`${output.turnId}\0${output.dispatchAttempt ?? ''}`, {
+      turnId: output.turnId, dispatchAttempt: output.dispatchAttempt,
+      finishStatus: 'completed' as const, replyPending: true, backgroundPending: false,
+    }]]);
+    let cliAlive = true;
+    let releaseFlush!: () => void;
+    const flush = new Promise<void>(resolve => { releaseFlush = resolve; });
+    ctx.scope.ownsWorkerSession = () => cliAlive;
+    ctx.scope.sessionController = {
+      ref: { appId: app, sessionId: output.sessionId },
+      store: { apply: vi.fn(), read: () => ({ lifecycle: 'active' }) },
+      flushPrimary: vi.fn(() => flush),
+    };
+    ctx.scope.finalizeCotMessage = vi.fn();
+    const settleLoss = loadWorkerPoolFunction<(session: DaemonSession) => boolean>(
+      'settleBackgroundStateOnCliLoss', ctx.scope,
+    );
+
+    const running = ctx.run();
+    try {
+      await vi.waitFor(() => expect(ctx.scope.sessionController.flushPrimary).toHaveBeenCalledOnce());
+      cliAlive = false;
+      settleLoss(ctx.ds);
+    } finally {
+      releaseFlush();
+    }
+    await running;
+
+    expect(db.read(record.id)?.state).toBe('settled');
+    expect(ctx.scope.finalizeCotMessage).toHaveBeenCalledExactlyOnceWith(
+      ctx.ds, output.turnId, 'completed', output.dispatchAttempt,
+    );
+    expect(ctx.scope.finalizeCotMessage).not.toHaveBeenCalledWith(
+      ctx.ds, output.turnId, 'failed', output.dispatchAttempt,
+    );
+    expect(ctx.ds.requiredReplyCotHolds).toBeUndefined();
+  });
+  it('withholds reaction for a pre-terminal final without an exact hold', async () => {
+    const dir = directory(); const db = database();
+    const record = db.accept(outputSnapshot(app, output),
+      { kind: 'im', answerRequired: true, context: { target: { mode: 'plain', chatId: 'oc' } }, chatId: 'oc', chatType: 'group' });
+    const ctx = scopeFor(db, record, dir, {
+      processFinalOutput: vi.fn(async () => ({ status: 'delivered' as const, messageId: 'om_ok' })),
+    });
+    ctx.scope.hasCompletedTurn = () => false;
+    ctx.scope.noteFinalOutputReceipt = vi.fn();
+    ctx.scope.finishTurnReactions = vi.fn();
+    ctx.scope.finalizeCotMessage = vi.fn();
+
+    await ctx.run();
+
+    expect(db.read(record.id)?.state).toBe('settled');
+    expect(ctx.scope.finishTurnReactions).not.toHaveBeenCalled();
+    expect(ctx.scope.finalizeCotMessage).not.toHaveBeenCalled();
   });
   it('files a deterministic non-native drop (binding mismatch, undefined receipt) as terminal rejected', async () => {
     const dir = directory(); const db = database();
@@ -427,18 +522,163 @@ describe('worker production IPC boundary', () => {
 });
 
 describe('native and generic settlement contracts', () => {
+  it.each(['before send', 'after Feishu accepted', 'after worker-only persistence',
+    'after worker-only persistence with background hold', 'without original execution proof',
+    'wrong turn', 'wrong attempt', 'originless journal', 'transient store fault'] as const)(
+    'reopens a scoped final %s without rerunning the model or inventing a receipt', async crash => {
+      vi.useFakeTimers();
+      const dir = directory();
+      let db = database(dir);
+      const target = { mode: 'thread', rootMessageId: 'om_original' } as const;
+      const sink = { kind: 'im', answerRequired: true, context: { target }, chatId: 'oc_original', chatType: 'group' } as const;
+      db.rememberSink(output.sessionId!, output.turnId, sink);
+      db.rememberSink(output.sessionId!, output.turnId, { kind: 'http', mode: 'async' });
+      db.rememberSink(output.sessionId!, output.turnId, { ...sink, context: { target: { mode: 'thread', rootMessageId: 'om_wrong' } } });
+      const snapshot = outputSnapshot(app, { ...output, content: '完整方案\n\n1. 检查\n2. 回读', dispatchAttempt: 2 });
+      const ref = { executionId: 'native-turn', turnId: output.turnId, dispatchAttempt: 2 };
+      const origin = { scope: { execution: ref } } as NonNullable<OutputDeliveryRecord['origin']>;
+      const storedRef = {
+        ...ref,
+        turnId: crash === 'wrong turn' ? 'om_different_turn' : ref.turnId,
+        dispatchAttempt: crash === 'wrong attempt' ? 1 : ref.dispatchAttempt,
+      };
+      let storeUnavailable = crash === 'transient store fault';
+      const producer = new WorkerOutputJournal(dir, app, output.sessionId!);
+      producer.save({ ...snapshot, origin } as Parameters<typeof producer.save>[0]);
+      const hasProof = crash !== 'without original execution proof';
+      if (crash === 'before send' || crash === 'after Feishu accepted' || storeUnavailable) {
+        db.accept({ ...snapshot, origin }, sink);
+      }
+      if (crash === 'originless journal') db.accept(snapshot, sink);
+      const received = new Map<string, { content: string; target: unknown }>();
+      let loseResponse = crash === 'after Feishu accepted';
+      const deliverFinalOutput = vi.fn((_ds, msg, _tag, _attempt, done, _owns, route, _unused, _initiator, _legacy, _effect, control) => {
+        received.set(control.publicationUuid, { content: msg.content, target: route });
+        if (loseResponse) { loseResponse = false; done(false); return; }
+        done(true, 'om_original_answer');
+      });
+      const helper = loadWorkerPoolFunction<(ds: any, msg: WorkerFinalOutput, t: string, control: any, target: unknown) => Promise<any>>(
+        'deliverFinalOutputWithOutputControl', {
+          TurnSendLedger, config: { session: { dataDir: dir } }, deliverFinalOutput,
+          bridgeFinalOutputUuid: () => 'stable_original_delivery', beginFinalOutputDelivery: () => () => {},
+          sessionPromptInjection: () => 'default',
+        });
+      const ds: any = { larkAppId: app, chatId: sink.chatId, chatType: sink.chatType, worker: null,
+        session: { sessionId: output.sessionId, status: 'active' } };
+      if (crash === 'after worker-only persistence' || crash === 'after worker-only persistence with background hold') {
+        ds.requiredReplyCotHolds = new Map([[`${snapshot.output.turnId}\0${snapshot.output.dispatchAttempt}`, {
+          turnId: snapshot.output.turnId, dispatchAttempt: snapshot.output.dispatchAttempt,
+          finishStatus: 'completed', replyPending: true,
+          backgroundPending: crash === 'after worker-only persistence with background hold',
+        }]]);
+      }
+      const attempt = (journal: OutputDeliveryJournal, pending: OutputDeliveryRecord) =>
+        new OutputDeliveryCoordinator(journal).deliver(pending, {
+          owns: () => true,
+          process: (stored, control) => helper(ds, stored.output, 'trial', control,
+            stored.sink.kind === 'im' ? stored.sink.context.target : undefined),
+          settled: vi.fn(), error: vi.fn(),
+        });
+
+      if (crash === 'after Feishu accepted') {
+        await attempt(db, db.read(snapshot.id)!);
+        expect(db.read(snapshot.id)?.receipt).toBeUndefined();
+        expect(received.size).toBe(1);
+        await vi.advanceTimersByTimeAsync(5_001);
+      }
+      db.close();
+      db = database(dir);
+      expect(db.sink(output.sessionId!, output.turnId)).toEqual(sink);
+      const noteFinalOutputReceipt = vi.fn();
+      const settleRequiredReplyCotMessage = vi.fn(() => false);
+      const settleRequiredReplyBackground = vi.fn();
+      const finalizeCotMessage = vi.fn();
+      const recover = loadWorkerPoolFunction<(ds: unknown) => Promise<void>>('recoverColdImReplies', deliveryScope({
+        config: { session: { dataDir: dir } }, WorkerOutputJournal, OutputDeliveryCoordinator,
+        outputDeliveryJournal: () => db, isSessionTransferring: () => false,
+        controllerForSession: () => ({ outputOrigin: () => hasProof ? origin : undefined,
+          store: { execution: () => {
+            if (storeUnavailable) throw new Error('temporary store read failure');
+            return { phase: 'succeeded', ref: storedRef,
+              terminal: { status: 'succeeded', evidence: 'native_terminal' } };
+          }, executions: () => [] } }),
+        sameExecution,
+        raiseDaemonAttention, publishAttentionPatch: vi.fn(), publishScopedImDeliveryStatus: vi.fn(), logger: { warn: vi.fn() },
+        tag: () => 'trial', shouldDropMismatchedFinalOutput: () => false, shouldDropMismatchedHermesFinalOutput: () => false,
+        deliverFinalOutputWithOutputControl: helper, privateReplyEnabled: () => false,
+        noteFinalOutputReceipt,
+        ...(crash === 'after worker-only persistence' || crash === 'after worker-only persistence with background hold'
+          ? { settleRequiredReplyBackground }
+          : { settleRequiredReplyCotMessage }),
+        finalizeCotMessage,
+        FinalPublicationUnknownError, OutputDeliveryTerminalError, FINAL_HANDOFF_DELIVERY_REASON,
+      }));
+      await recover(ds);
+      if (storeUnavailable) {
+        expect(db.read(snapshot.id)?.state).toBe('blocked');
+        expect(db.read(snapshot.id)?.receipt).toBeUndefined();
+        expect(deliverFinalOutput).not.toHaveBeenCalled();
+        storeUnavailable = false;
+        await vi.advanceTimersByTimeAsync(5_001);
+        await recover(ds);
+      }
+      if (crash === 'originless journal') {
+        expect(db.read(snapshot.id)).toMatchObject({
+          state: 'rejected', reason: 'execution_scope_unproven', output: { content: snapshot.output.content },
+        });
+        expect(db.read(snapshot.id)?.receipt).toBeUndefined();
+        expect(db.hasTerminalRejection(output.sessionId!)).toBe(true);
+        expect(db.hasUnsettled(output.sessionId!)).toBe(false);
+        expect(ds).toMatchObject({ agentAttention: { kind: 'blocked' } });
+        await recover(ds);
+        expect(deliverFinalOutput).not.toHaveBeenCalled();
+        expect(producer.readPending()[0].output.content).toBe(snapshot.output.content);
+        return;
+      }
+      if (!hasProof || crash === 'wrong turn' || crash === 'wrong attempt') {
+        expect(db.read(snapshot.id)).toBeUndefined();
+        expect(deliverFinalOutput).not.toHaveBeenCalled();
+        expect(producer.readPending()[0].output.content).toBe(snapshot.output.content);
+        expect(ds).toMatchObject({ agentAttention: { kind: 'blocked' } });
+        return;
+      }
+      expect(db.read(snapshot.id)?.receipt).toMatchObject({ status: 'delivered', messageId: 'om_original_answer' });
+      expect([...received.values()]).toEqual([{ content: snapshot.output.content, target }]);
+      expect(deliverFinalOutput).toHaveBeenCalledTimes(crash === 'after Feishu accepted' ? 2 : 1);
+      expect(noteFinalOutputReceipt).toHaveBeenCalledWith(ds, output.turnId,
+        { text: snapshot.output.content }, { exactAttempt: { dispatchAttempt: 2 } });
+      if (crash === 'after worker-only persistence with background hold') {
+        expect(finalizeCotMessage).not.toHaveBeenCalled();
+        expect([...ds.requiredReplyCotHolds!.values()]).toEqual([expect.objectContaining({
+          turnId: output.turnId, dispatchAttempt: 2, replyPending: false, backgroundPending: true,
+        })]);
+        expect(settleRequiredReplyBackground).not.toHaveBeenCalled();
+      } else if (crash === 'after worker-only persistence') {
+        expect(finalizeCotMessage).toHaveBeenCalledExactlyOnceWith(ds, output.turnId, 'completed', 2);
+        expect(ds.requiredReplyCotHolds).toBeUndefined();
+        expect(settleRequiredReplyBackground).not.toHaveBeenCalled();
+      } else {
+        // A restarted daemon has no CoT/hold to reconstruct. The visible final
+        // reply is already persisted; do not invent background-zero completion.
+        expect(finalizeCotMessage).not.toHaveBeenCalled();
+      }
+      expect(producer.readPending()).toEqual([]);
+      expect(db.pending(output.sessionId!)).toEqual([]);
+    },
+  );
+
   it.each(['recovery receipt write', 'signed sequence rejection', 'unauthorized steer'])('retains both owners after %s failure', async (failure) => {
     const db = database(); const worker = { send: vi.fn() };
     const native: WorkerFinalOutput = { ...output, codexAppSettlement: { requestId: 'current', generation: 'native-1', seq: 1, dispatchId: 'dispatch' }, ...(failure === 'unauthorized steer' ? { disposition: 'steer_superseded' as const } : {}) };
     const record = db.accept(outputSnapshot(app, native), { kind: 'managed' });
     const ds: any = { worker, larkAppId: app, initConfig: { finalOutputHandoff: { token: 'token' } }, session: { sessionId: output.sessionId, status: 'active', codexAppDispatchLedger: [], codexAppGenerationCommits: failure === 'recovery receipt write' ? [{ generation: 'native-1', committedThrough: 1 }] : [] } };
-    const scope: any = { ds, worker, t: 'probe', workerGeneration: 1, cb: {}, journal: db, coordinator: new OutputDeliveryCoordinator(db),
+    const scope: any = deliveryScope({ ds, worker, t: 'probe', workerGeneration: 1, cb: {}, journal: db, coordinator: new OutputDeliveryCoordinator(db),
       ownsLifecycleMutation: () => true, ownsWorkerSession: () => true, isSessionTransferring: () => false, sessionController: undefined, logger: { warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
       committedCodexAppSequence, hasUnsettledCodexAppDispatch,
       reconcileOrdinaryTurnRecoveryTerminalReceipt: () => { throw new Error('EIO'); },
       settleCodexAppDispatch: () => failure === 'unauthorized steer' ? { ok: true, ledger: [], settledEntry: { codexAppSteerable: false, deliverySink: 'suppressed' } } : { ok: false, error: 'signed_sequence_rejected' },
-      FINAL_HANDOFF_DELIVERY_REASON: 'pending',
-    };
+      FinalPublicationUnknownError, OutputDeliveryTerminalError, FINAL_HANDOFF_DELIVERY_REASON: 'pending',
+    });
     scope.processFinalOutput = loadWorkerPoolClosure('processFinalOutput', scope);
     const run = loadWorkerPoolClosure<(record: OutputDeliveryRecord) => Promise<void>>('runOutput', scope);
     await run(record);

@@ -53,6 +53,7 @@ import {
   readDashboardWorkbenchShell,
 } from './client-shell.js';
 import { dashboardLoginHref } from './auth-login.js';
+import { classifyFetchUnauthorized } from './fetch-auth-guard.js';
 import { ToastStack } from './toast.js';
 import { createHashChangeHandler } from './leave-guard.js';
 import { ConfirmModalRoot } from './confirm-modal.js';
@@ -63,6 +64,7 @@ import {
 import { isMacLike, isPaletteHotkey, paletteShortcutLabel } from './command-palette-model.js';
 import { NAV_GROUPS, NAV_ITEMS, NAV_SUBPAGES, type NavItem } from './nav-items.js';
 import { DECISION_BOARD_CHANGED_EVENT, boardsFromResponse } from './decision-board-model.js';
+import { TASK_ROUTING_CHANGED_EVENT } from './task-routing-model.js';
 import { parseWorkflowSidebarHash } from '../../core/workflow-sidebar-link.js';
 import { deriveSessionTaskStatus } from '../../core/session-task-status.js';
 import type { PalettePageEntry, PaletteShellContext } from './command-palette-sources.js';
@@ -106,6 +108,7 @@ type PluginDashboardNavEntry = {
 };
 
 const MANAGE_ROUTES = [
+  'assign',
   'roles',
   'role-profiles',
   'bot-defaults',
@@ -126,6 +129,8 @@ const MANAGE_ROUTES = [
 let pinnedPluginNavItems: NavItem[] = [];
 /** 至少有一个 Bot 设为管家时，侧边栏才显示「决策看板」（见 loadDecisionBoardNav）。 */
 let decisionBoardNavVisible = false;
+/** 全局设置开启「Bot 任务分配」时，侧边栏才显示「任务分配」（默认关闭）。 */
+let taskRoutingNavVisible = false;
 /** 全部插件 Dashboard 页面（含没置顶的）；⌘K 收录全部，侧边栏只放置顶的。 */
 let pluginPageNavItems: NavItem[] = [];
 
@@ -189,6 +194,7 @@ function sidebarNavItems(): NavItem[] {
     // 网页终端在 Desktop/Mobile 客户端壳里归原生会话面管（见 dashboardShellAllowsWebTerminal）。
     if (item.id === 'terminal') return !clientShell && ui.hostTerminal;
     if (item.id === 'decision-board') return decisionBoardNavVisible;
+    if (item.id === 'task-routing') return taskRoutingNavVisible;
     return true;
   });
   if (pinnedPluginNavItems.length === 0) return builtInItems;
@@ -1673,15 +1679,15 @@ window.fetch = async function patchedFetch(
 ): ReturnType<typeof fetch> {
   const res = await origFetch(...args);
   if (res.status === 401) {
-    // Management reads are intentionally outside an H5/platform Workbench
-    // identity's capability map. The server marks that expected narrow denial;
-    // an unmarked 401 still means the identity expired and opens the login UI.
-    if (res.headers.get('x-botmux-auth-scope') === 'workbench') return res;
-    const loginUrl = res.headers.get('x-botmux-login-url') ?? undefined;
-    const method = (args[1]?.method ?? 'GET').toUpperCase();
-    const isRead = method === 'GET' || method === 'HEAD';
-    if (loginUrl || (isRead && !publicReadOnly)) showAuthExpiredOverlay(loginUrl);
-    else showReadOnlyToast();
+    const action = classifyFetchUnauthorized({
+      input: args[0],
+      init: args[1],
+      response: res,
+      locationHref: window.location.href,
+      publicReadOnly,
+    });
+    if (action.kind === 'auth-expired') showAuthExpiredOverlay(action.loginUrl);
+    else if (action.kind === 'readonly-toast') showReadOnlyToast();
   }
   return res;
 };
@@ -1718,6 +1724,7 @@ async function loadAuthState(): Promise<void> {
       ui.authed = isAuthed;
       ui.workbenchAuthed = isAuthed;
       ui.hostTerminal = isAuthed && j.hostTerminal === true;
+      taskRoutingNavVisible = isAuthed && j.settings?.taskRouting?.enabled === true;
       publicReadOnly = !!(j.settings && j.settings.publicReadOnly);
       ui.publicReadOnly = publicReadOnly;
       authStateKnown = true;
@@ -1730,6 +1737,7 @@ async function loadAuthState(): Promise<void> {
       ui.authed = false;
       ui.workbenchAuthed = true;
       ui.hostTerminal = false;
+      taskRoutingNavVisible = false;
       publicReadOnly = false;
       ui.publicReadOnly = false;
       authStateKnown = true;
@@ -1738,6 +1746,7 @@ async function loadAuthState(): Promise<void> {
       ui.authed = false;
       ui.workbenchAuthed = false;
       ui.hostTerminal = false;
+      taskRoutingNavVisible = false;
       authStateKnown = true;
       const loginUrl = r.headers.get('x-botmux-login-url') ?? undefined;
       showAuthExpiredOverlay(loginUrl);
@@ -1966,6 +1975,28 @@ void (async () => {
   window.addEventListener(PLUGIN_PINS_CHANGED_EVENT, () => { void loadPinnedPluginNavItems(); });
   // Bot 配置里开关管家后会发这个事件，侧边栏随之出现 / 消失。
   window.addEventListener(DECISION_BOARD_CHANGED_EVENT, () => { void loadDecisionBoardNav(); });
+  // 全局设置里开关任务分配后会发这个事件，侧边栏随之出现 / 消失。
+  window.addEventListener(TASK_ROUTING_CHANGED_EVENT, event => {
+    const detail = (event as CustomEvent<{ enabled?: boolean }>).detail;
+    if (typeof detail?.enabled === 'boolean') {
+      const next = isAuthed && detail.enabled;
+      if (next !== taskRoutingNavVisible) {
+        taskRoutingNavVisible = next;
+        renderShell();
+      }
+      return;
+    }
+    void origFetch('/api/settings', { cache: 'no-store' })
+      .then(r => (r.ok ? r.json() : null))
+      .then(body => {
+        const next = isAuthed && body?.settings?.taskRouting?.enabled === true;
+        if (next !== taskRoutingNavVisible) {
+          taskRoutingNavVisible = next;
+          renderShell();
+        }
+      })
+      .catch(() => { /* ignore */ });
+  });
   window.setInterval(() => {
     if (document.hidden) return;
     void checkUpdateBadge();

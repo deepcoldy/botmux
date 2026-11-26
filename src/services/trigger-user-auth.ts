@@ -40,11 +40,9 @@ export type IdentityRouteTool = typeof IDENTITY_ROUTE_TOOLS[number];
 /**
  * Where a person's credentials come from.
  *
- * - `auto` (default): ask the central platform first when this machine is
- *   bound to one; otherwise, or when the platform knows nothing about the
- *   person, fall back to the per-person HOME on this machine. A bound machine
- *   never STARTS a local device login on its own — the person is pointed at
- *   the platform, so one authorization serves every machine.
+ * - `auto` (default): use the central platform when this machine is bound.
+ *   Managed lark-cli first prefers an existing grant to the bot's own app.
+ *   An unbound machine uses the per-person local credentials.
  * - `platform`: platform only. An unbound machine, or an unreachable platform,
  *   refuses the call. For deployments that require central audit.
  * - `local`: today's behaviour — per-person HOME on this machine only, the
@@ -56,6 +54,10 @@ export type IdentityRouteTool = typeof IDENTITY_ROUTE_TOOLS[number];
  */
 export const TRIGGER_USER_AUTH_CREDENTIAL_SOURCES = ['auto', 'platform', 'local'] as const;
 export type TriggerUserAuthCredentialSource = typeof TRIGGER_USER_AUTH_CREDENTIAL_SOURCES[number];
+export type TriggerUserAuthCredentialSourceCapability = 'lark-user' | 'bytecloud';
+export type TriggerUserAuthCredentialSourceConfig =
+  | TriggerUserAuthCredentialSource
+  | Partial<Record<'default' | TriggerUserAuthCredentialSourceCapability, TriggerUserAuthCredentialSource>>;
 
 /**
  * Per-bot capability switches. Each is either native (off: the CLI runs with
@@ -80,7 +82,7 @@ export interface TriggerUserAuthConfig {
   /** See {@link TRIGGER_USER_AUTH_CREDENTIAL_SOURCES}. The parser always fills
    *  it; it is optional on the type only so hand-built configs (tests, legacy
    *  callers) keep compiling — read it through {@link credentialSourceOf}. */
-  credentialSource?: TriggerUserAuthCredentialSource;
+  credentialSource?: TriggerUserAuthCredentialSourceConfig;
   /** The legacy `fallback` value as stored. Never acted on; it only keeps the
    *  background-job policy key of an unedited config what it was. */
   legacyFallback?: 'bot-identity' | 'none';
@@ -119,6 +121,7 @@ export interface TriggerUserAuthConfig {
    * of source.
    */
   gitHost?: string;
+  gitCommitIdentity?: boolean;
   /**
    * Optional second source for a Codebase JWT, used only when `bytedcli` cannot
    * produce one (missing, broken, mid-upgrade). Same reason as `gitHost` for
@@ -252,16 +255,7 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
     throw new TriggerUserAuthConfigError('triggerUserAuth.tools must be an array');
   }
 
-  let credentialSource: TriggerUserAuthCredentialSource = 'auto';
-  if (rec.credentialSource !== undefined && rec.credentialSource !== null) {
-    if (!(TRIGGER_USER_AUTH_CREDENTIAL_SOURCES as readonly unknown[]).includes(rec.credentialSource)) {
-      throw new TriggerUserAuthConfigError(
-        `triggerUserAuth.credentialSource must be one of ${TRIGGER_USER_AUTH_CREDENTIAL_SOURCES.join(' | ')}`
-        + ` (got ${JSON.stringify(rec.credentialSource)})`,
-      );
-    }
-    credentialSource = rec.credentialSource as TriggerUserAuthCredentialSource;
-  }
+  const credentialSource = parseCredentialSource(rec.credentialSource);
 
   if (rec.delegateOnMention !== undefined && rec.delegateOnMention !== null
     && typeof rec.delegateOnMention !== 'boolean') {
@@ -276,6 +270,9 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
     throw new TriggerUserAuthConfigError('triggerUserAuth.allowOwnerActor must be a boolean');
   }
 
+  if (rec.gitCommitIdentity !== undefined && typeof rec.gitCommitIdentity !== 'boolean') {
+    throw new TriggerUserAuthConfigError('triggerUserAuth.gitCommitIdentity must be a boolean');
+  }
   const gitHost = optionalHost(rec.gitHost, 'triggerUserAuth.gitHost');
   const gitTokenExchangeUrl = optionalHttpsUrl(
     rec.gitTokenExchangeUrl,
@@ -324,6 +321,7 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
     ...(rec.allowSpeakerSwitch === true ? { allowSpeakerSwitch: true } : {}),
     ...(rec.allowOwnerActor === true ? { allowOwnerActor: true } : {}),
     ...(dispatchOnly ? { dispatchOnly } : {}),
+    ...(rec.gitCommitIdentity === true ? { gitCommitIdentity: true } : {}),
     ...(gitHost ? { gitHost } : {}),
     ...(gitTokenExchangeUrl ? { gitTokenExchangeUrl } : {}),
   };
@@ -414,11 +412,41 @@ export function larkUserNative(config: Pick<TriggerUserAuthConfig, 'enabled' | '
   return config?.enabled === true && config.capabilities !== undefined && !capabilityOn(config, 'lark-user');
 }
 
-/** The effective credential source; absent means `auto`. */
+function isCredentialSource(value: unknown): value is TriggerUserAuthCredentialSource {
+  return (TRIGGER_USER_AUTH_CREDENTIAL_SOURCES as readonly unknown[]).includes(value);
+}
+
+function parseCredentialSource(raw: unknown): TriggerUserAuthCredentialSourceConfig {
+  if (raw == null) return 'auto';
+  if (isCredentialSource(raw)) return raw;
+  const field = 'triggerUserAuth.credentialSource';
+  const modes = TRIGGER_USER_AUTH_CREDENTIAL_SOURCES.join(' | ');
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new TriggerUserAuthConfigError(`${field} must be one of ${modes}, or a per-capability object`);
+  }
+  const keys = ['default', 'lark-user', 'bytecloud'] as const;
+  const entries = Object.keys(raw);
+  if (!entries.length) throw new TriggerUserAuthConfigError(`${field} must not be empty`);
+  const unknown = entries.find(key => !(keys as readonly string[]).includes(key));
+  if (unknown !== undefined) throw new TriggerUserAuthConfigError(`${field} has unknown key: ${unknown}`);
+  const result: Exclude<TriggerUserAuthCredentialSourceConfig, string> = {};
+  for (const key of keys) {
+    if (!Object.hasOwn(raw, key)) continue;
+    const value = (raw as Record<string, unknown>)[key];
+    if (!isCredentialSource(value)) throw new TriggerUserAuthConfigError(`${field}.${key} must be one of ${modes}`);
+    result[key] = value;
+  }
+  return result;
+}
+
+/** Without a capability, return the configured default for legacy callers. */
 export function credentialSourceOf(
   config: Pick<TriggerUserAuthConfig, 'credentialSource'> | null | undefined,
+  capability?: TriggerUserAuthCredentialSourceCapability,
 ): TriggerUserAuthCredentialSource {
-  return config?.credentialSource ?? 'auto';
+  const source = config?.credentialSource;
+  if (!source || typeof source === 'string') return source ?? 'auto';
+  return (capability ? source[capability] : undefined) ?? source.default ?? 'auto';
 }
 
 /** Whether this policy governs `tool` right now. */

@@ -2,6 +2,7 @@ import { existsSync, readdirSync, readFileSync, readlinkSync, realpathSync } fro
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { listProcessOpenFiles } from '../utils/process-open-files.js';
+import { readProcessStartIdentity } from '../utils/process-identity.js';
 import { openDatabaseSyncNow } from './sqlite-compat.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -80,6 +81,99 @@ function matchingPrefix(link: string, prefixes: readonly string[]): string | und
   return prefixes.find(prefix => link.startsWith(prefix));
 }
 
+export type AntigravityConversationIdInspection =
+  | { readonly kind: 'unique'; readonly conversationId: string }
+  | { readonly kind: 'ambiguous' }
+  | { readonly kind: 'missing' };
+
+/**
+ * Three-state live PID conversation inspection (`unique` | `ambiguous` | `missing`).
+ * Callers that gate side-effect-sensitive decisions (such as quota auto-replay)
+ * must distinguish `ambiguous` (multiple active locks/DBs -> fail closed, never
+ * fall back to a stored conversation ID) from `missing`.
+ */
+export function inspectAntigravityConversationIdByPid(
+  pid: number,
+  conversationsDir?: string,
+  procRoot = '/proc',
+): AntigravityConversationIdInspection {
+  if (!Number.isFinite(pid) || pid <= 0) return { kind: 'missing' };
+  const useProcfs = process.platform === 'linux' || procRoot !== '/proc';
+  const links = useProcfs
+    ? getProcessFds(pid, procRoot)
+    : listProcessOpenFiles(pid) ?? [];
+  const databases = conversationsDir ?? join(homedir(), '.gemini', 'antigravity-cli', 'conversations');
+  const presencePrefixes = directoryPrefixVariants(join(dirname(databases), 'presence'));
+  const collectPresenceLocks = (fdLinks: readonly string[]): Set<string> => {
+    const active = new Set<string>();
+    for (const link of fdLinks) {
+      const presencePrefix = matchingPrefix(link, presencePrefixes);
+      if (!presencePrefix || !link.endsWith('.lock')) continue;
+      const id = link.slice(presencePrefix.length, -'.lock'.length);
+      if (UUID_RE.test(id)) active.add(id.toLowerCase());
+    }
+    return active;
+  };
+  const ownActive = collectPresenceLocks(links);
+  if (ownActive.size === 1) return { kind: 'unique', conversationId: [...ownActive][0]! };
+  if (ownActive.size > 1) return { kind: 'ambiguous' };
+
+  if (useProcfs) {
+    const childLinks: string[] = [];
+    for (const child of getProcessChildPids(pid, procRoot)) {
+      childLinks.push(...getProcessFds(child, procRoot));
+    }
+    const childActive = collectPresenceLocks(childLinks);
+    if (childActive.size === 1) return { kind: 'unique', conversationId: [...childActive][0]! };
+    if (childActive.size > 1) return { kind: 'ambiguous' };
+    links.push(...childLinks);
+  }
+  const databasePrefixes = directoryPrefixVariants(databases);
+  const brainPrefixes = directoryPrefixVariants(join(dirname(databases), 'brain'));
+  let found: string | null = null;
+  for (const link of links) {
+    let id: string | undefined;
+    const brainPrefix = matchingPrefix(link, brainPrefixes);
+    if (brainPrefix) {
+      id = link.slice(brainPrefix.length).split('/')[0];
+    } else {
+      const databasePrefix = matchingPrefix(link, databasePrefixes);
+      if (databasePrefix) {
+        id = CONVERSATION_DB_RE.exec(link.slice(databasePrefix.length))?.[1];
+      }
+    }
+    if (!id || !UUID_RE.test(id)) continue;
+    if (found && found.toLowerCase() !== id.toLowerCase()) return { kind: 'ambiguous' };
+    found ??= id;
+  }
+  return found ? { kind: 'unique', conversationId: found } : { kind: 'missing' };
+}
+
+/**
+ * Resolve the active conversation ID of a locally attested CLI process,
+ * verifying process birth identity (`cliProcStart`) BOTH before and after
+ * file-descriptor inspection so PID reuse or missing birth identity fails
+ * closed with zero fallback to stored session IDs.
+ */
+export function findAttestedAntigravityConversationId(
+  attestation: { readonly cliPid?: number; readonly cliProcStart?: string } | undefined,
+  deps?: {
+    readProcessStartIdentity?: (pid: number) => string | undefined;
+    inspectByPid?: (pid: number) => AntigravityConversationIdInspection;
+  },
+): string | null {
+  const pid = attestation?.cliPid;
+  const expectedBirth = attestation?.cliProcStart;
+  if (!pid || !Number.isFinite(pid) || pid <= 0 || !expectedBirth) return null;
+  const readBirth = deps?.readProcessStartIdentity ?? readProcessStartIdentity;
+  const inspect = deps?.inspectByPid ?? ((p: number) => inspectAntigravityConversationIdByPid(p));
+  if (readBirth(pid) !== expectedBirth) return null;
+  const inspected = inspect(pid);
+  if (inspected.kind !== 'unique') return null;
+  if (readBirth(pid) !== expectedBirth) return null;
+  return inspected.conversationId;
+}
+
 /**
  * Agy holds a presence lock on the active conversation in the TUI process.
  * Prefer that descriptor because old brain directories and databases can
@@ -97,44 +191,8 @@ export function findAntigravityConversationIdByPid(
   conversationsDir?: string,
   procRoot = '/proc',
 ): string | null {
-  if (!Number.isFinite(pid) || pid <= 0) return null;
-  const useProcfs = process.platform === 'linux' || procRoot !== '/proc';
-  const links = useProcfs
-    ? getProcessFds(pid, procRoot)
-    : listProcessOpenFiles(pid) ?? [];
-  const databases = conversationsDir ?? join(homedir(), '.gemini', 'antigravity-cli', 'conversations');
-  const presencePrefixes = directoryPrefixVariants(join(dirname(databases), 'presence'));
-  const active = new Set<string>();
-  for (const link of links) {
-    const presencePrefix = matchingPrefix(link, presencePrefixes);
-    if (!presencePrefix || !link.endsWith('.lock')) continue;
-    const id = link.slice(presencePrefix.length, -'.lock'.length);
-    if (UUID_RE.test(id)) active.add(id.toLowerCase());
-  }
-  if (active.size > 0) return active.size === 1 ? [...active][0] : null;
-
-  if (useProcfs) {
-    for (const child of getProcessChildPids(pid, procRoot)) links.push(...getProcessFds(child, procRoot));
-  }
-  const databasePrefixes = directoryPrefixVariants(databases);
-  const brainPrefixes = directoryPrefixVariants(join(dirname(databases), 'brain'));
-  let found: string | null = null;
-  for (const link of links) {
-    let id: string | undefined;
-    const brainPrefix = matchingPrefix(link, brainPrefixes);
-    if (brainPrefix) {
-      id = link.slice(brainPrefix.length).split('/')[0];
-    } else {
-      const databasePrefix = matchingPrefix(link, databasePrefixes);
-      if (databasePrefix) {
-        id = CONVERSATION_DB_RE.exec(link.slice(databasePrefix.length))?.[1];
-      }
-    }
-    if (!id || !UUID_RE.test(id)) continue;
-    if (found && found.toLowerCase() !== id.toLowerCase()) return null;
-    found ??= id;
-  }
-  return found;
+  const inspected = inspectAntigravityConversationIdByPid(pid, conversationsDir, procRoot);
+  return inspected.kind === 'unique' ? inspected.conversationId : null;
 }
 
 function uriToPath(uri: string): string {

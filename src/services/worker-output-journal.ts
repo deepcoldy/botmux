@@ -7,6 +7,10 @@ import { mergeOutputReplay, validateOutputSnapshot, isOutputJournalAppId, type O
 /** Independent of transcript format, local/remote backend and native queue.
  * No eviction: a failed write must retain the producer's original owner. */
 export class WorkerOutputJournal {
+  static exists(dataDir: string, appId: string, sessionId: string): boolean {
+    return isOutputJournalAppId(appId) && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(sessionId)
+      && existsSync(join(dataDir, 'worker-final-outputs', appId, sessionId));
+  }
   readonly directory: string;
   constructor(dataDir: string, readonly appId: string, readonly sessionId: string) {
     if (!isOutputJournalAppId(appId) || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(sessionId)) throw new Error('invalid_output_journal_identity');

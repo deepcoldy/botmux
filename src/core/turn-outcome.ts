@@ -38,6 +38,7 @@ export function isMaintenanceTurnId(turnId: string): boolean {
 
 export interface TurnOutcomeTerminal {
   turnId: string;
+  dispatchAttempt?: number;
   status: 'completed' | 'failed' | 'cancelled' | 'ambiguous';
   errorCode?: string;
 }
@@ -73,7 +74,12 @@ const finalSupervisionReplies = new WeakMap<DaemonSession, Map<string, Supervisi
 const SUPERVISION_FINAL_REPLY_MAX_CHARS = 256_000;
 const SUPERVISION_FINAL_TEXT_MEMORY = 2;
 const finalKinds = new WeakMap<DaemonSession, Map<string, 'answer' | 'diagnostic'>>();
-const terminalStatuses = new WeakMap<DaemonSession, Map<string, TurnOutcomeTerminal['status']>>();
+const terminalStatuses = new WeakMap<DaemonSession, Map<string, TurnOutcomeTerminal>>();
+
+export function hasCompletedTurn(ds: DaemonSession, turnId: string, dispatchAttempt?: number): boolean {
+  const terminal = terminalStatuses.get(ds)?.get(turnId);
+  return terminal?.status === 'completed' && terminal.dispatchAttempt === dispatchAttempt;
+}
 const turnStarts = new WeakMap<DaemonSession, Map<string, number>>();
 const excludedActivityAt = new WeakMap<DaemonSession, Map<string, number>>();
 const outcomeSeq = new WeakMap<DaemonSession, number>();
@@ -168,7 +174,7 @@ export function noteFinalOutputReceipt(
   ds: DaemonSession,
   turnId: string,
   receipt: { turnFailed?: boolean; emptyCompletedNotice?: boolean; text: unknown },
-  opts: { now?: () => number; dataDir?: string } = {},
+  opts: { now?: () => number; dataDir?: string; exactAttempt?: { dispatchAttempt?: number } } = {},
 ): void {
   if (receipt.turnFailed) return;
   if (receipt.emptyCompletedNotice) {
@@ -315,7 +321,7 @@ export async function recordTurnOutcome(
   const now = opts.now ?? Date.now;
   const seq = (outcomeSeq.get(ds) ?? 0) + 1;
   outcomeSeq.set(ds, seq);
-  remember(terminalStatuses, ds, terminal.turnId, terminal.status);
+  remember(terminalStatuses, ds, terminal.turnId, terminal);
   if (terminal.status === 'completed') {
     const draining = drainingOutcomes.get(ds) ?? new Map<string, number>();
     drainingOutcomes.set(ds, draining);
@@ -372,10 +378,12 @@ export async function recordTurnOutcome(
 export function noteLateFinalReply(
   ds: DaemonSession,
   turnId: string,
-  opts: { now?: () => number; dataDir?: string } = {},
+  opts: { now?: () => number; dataDir?: string; exactAttempt?: { dispatchAttempt?: number } } = {},
 ): SessionLastTurn | undefined {
   noteAnswered(ds, turnId);
-  if (terminalStatuses.get(ds)?.get(turnId) !== 'completed') return undefined;
+  const terminal = terminalStatuses.get(ds)?.get(turnId);
+  if (terminal?.status !== 'completed'
+    || (opts.exactAttempt && terminal.dispatchAttempt !== opts.exactAttempt.dispatchAttempt)) return undefined;
   const current = ds.session.lastTurn;
   const heldBack = heldBackNoOutput.get(ds);
   // 之后又来了新消息：这一轮已经不是「本轮」，补登会把它重新顶成当前结果。

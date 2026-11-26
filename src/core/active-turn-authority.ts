@@ -38,7 +38,12 @@ function mayControlActiveTurn(
 }
 
 function frozenCaller(caller: TrustedCaller | undefined): TrustedCaller | undefined {
-  return caller ? Object.freeze({ ...caller }) : undefined;
+  return caller ? Object.freeze({
+    ...caller,
+    ...(caller.taskContinuation
+      ? { taskContinuation: Object.freeze({ ...caller.taskContinuation }) }
+      : {}),
+  }) : undefined;
 }
 
 function compatibleAuthorityPrincipal(
@@ -60,6 +65,20 @@ export function sameTrustedPrincipal(
   if (!left || !right) return false;
   if (left.requestLarkAppId !== right.requestLarkAppId) return false;
   if (left.senderType !== right.senderType) return false;
+  const leftContinuation = left.taskContinuation;
+  const rightContinuation = right.taskContinuation;
+  // A followed cross-chat reply keeps the peer bot as the immediate actor, but
+  // its bounded source turn is an independent execution principal. Two replies
+  // from the same bot must not gain same-principal authority merely because the
+  // immediate actor matches: that would let one human/source turn steer or
+  // merge into another while retaining the first continuation's credentials.
+  if (leftContinuation || rightContinuation) {
+    if (!leftContinuation || !rightContinuation) return false;
+    if (leftContinuation.appId !== rightContinuation.appId
+      || leftContinuation.openId !== rightContinuation.openId
+      || leftContinuation.sourceSessionId !== rightContinuation.sourceSessionId
+      || leftContinuation.sourceTurnId !== rightContinuation.sourceTurnId) return false;
+  }
   const leftSource = left.source ?? 'interactive';
   const rightSource = right.source ?? 'interactive';
   if (leftSource !== rightSource) return false;

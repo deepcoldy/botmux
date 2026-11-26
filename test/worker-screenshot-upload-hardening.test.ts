@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import ts from 'typescript';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { isCodexAppCliId } from '../src/adapters/cli/types.js';
+import { screenshotUsageLimitDedupSuffix } from '../src/utils/cli-usage-limit.js';
 
 const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
 
@@ -24,6 +25,8 @@ type CaptureHarness = {
   revision(): number;
   /** Simulate applyDisplayMode(): mode change + generation bump + hash reset. */
   applyDisplayMode(mode: 'hidden' | 'screenshot'): void;
+  /** Simulate direct Web Terminal input submission. */
+  bumpInputGeneration(): number;
 };
 
 function executeProductionCapture(deps: Record<string, unknown>): CaptureHarness {
@@ -34,7 +37,7 @@ function executeProductionCapture(deps: Record<string, unknown>): CaptureHarness
     functionSlice('captureAndUpload', 'applyDisplayMode'),
     { compilerOptions: { module: ts.ModuleKind.None, target: ts.ScriptTarget.ES2022 } },
   ).outputText;
-  const factory = new Function('deps', `
+  const factory = new Function('deps', 'screenshotUsageLimitDedupSuffix', `
     const {
       logScreenshotSkip, backend, renderCols, renderRows,
       renderer, createHash, clamp, captureToPng, uploadImageBuffer, logError,
@@ -53,6 +56,7 @@ function executeProductionCapture(deps: Record<string, unknown>): CaptureHarness
     let currentBotmuxDispatchAttempt = deps.currentBotmuxDispatchAttempt;
     let screenshotDisplayGeneration = 0;
     let captureRevision = 0;
+    let webTerminalInputGeneration = typeof deps.webTerminalInputGeneration === 'number' ? deps.webTerminalInputGeneration : 0;
     let displayMode = 'screenshot';
     let awaitingFirstPrompt = false;
     let apiOnlyForUpload = false;
@@ -82,9 +86,13 @@ function executeProductionCapture(deps: Record<string, unknown>): CaptureHarness
         screenshotDisplayGeneration += 1;
         lastShotHash = '';
       },
+      bumpInputGeneration: () => {
+        webTerminalInputGeneration += 1;
+        return webTerminalInputGeneration;
+      },
     };
   `);
-  return factory(deps) as CaptureHarness;
+  return factory(deps, screenshotUsageLimitDedupSuffix) as CaptureHarness;
 }
 
 afterEach(() => vi.useRealTimers());
@@ -559,13 +567,17 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
       const turnTerminalEmitted = () => false, dropQueuedTurnRecord = () => false;
       const readSendMarkers = () => [];
       const markActiveTurnStarted = record => started.push(record);
-      const writeCliPidMarker = () => {}, publishSandboxRelayCapability = () => {}, log = () => {};
+      const writeCliPidMarker = () => {}, publishSandboxRelayCapability = () => {}, cancelAntigravityFoldedReconcilePending = () => {}, log = () => {};
       // Restart bookkeeping (restored-input settle) is short-circuited here; it is
       // covered by unsent-input-journal.test.ts and the restart integration tests.
       const noteCliInputWritten = () => {};
       const ordinaryImTurnDedupe = { commit: () => {} };
       let normalWritePrepared = false, item, durableWrite = false, durableTurnInFlight = false;
       let promptReadyAtFlushStart = false, itemsWrittenInThisFlush = 0, turnSeq = 0, bridgeTurnId;
+      let cliGenerationTurnWrites = 0;
+      let webTerminalInputGeneration = 0, cliInterruptGeneration = 0;
+      const cliSpawnGeneration = 1;
+      const inputDeliveryEvidence = { start: () => {} };
       const renderer = { markNewTurn: () => {} }, writeRpcEngine = undefined;
       const inflightInputs = { onWrite: () => {} }, stuckDetector = undefined;
       const usageLimitTracker = { beginTurn: () => 1 }, currentUsageLimitSnapshot = () => undefined;
@@ -602,6 +614,7 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
       retired: [], started: [],
     });
     expect(send.mock.calls.map(call => call[0])).toEqual([
+      { type: 'type_ahead_queued', turnId: 'om_queued' },
       { type: 'turn_input_committed', turnId: 'om_queued' },
     ]);
 
@@ -614,7 +627,7 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
       type: 'capture_identity', revision: 1, turnId: 'om_queued', dispatchAttempt: 7,
     });
     expect(harness.advance()).toBe(false);
-    expect(send).toHaveBeenCalledTimes(2);
+    expect(send).toHaveBeenCalledTimes(3);
   });
 });
 
@@ -812,5 +825,132 @@ describe('R2 turn-only capture acceptance', () => {
     await harness.captureAndUpload();
     expect(uploadImageBuffer).toHaveBeenCalledTimes(2);
     expect(harness.lastHash()).toBe('0:0:213x58:same-pixels');
+  });
+
+  it('delivers unchanged-pixel native proof, episode, and expiry edges and dedups repeats', async () => {
+    const send = vi.fn();
+    const uploadImageBuffer = vi.fn(async () => `img_${uploadImageBuffer.mock.calls.length}`);
+    let currentClassification: any = {
+      status: 'limited',
+      usageLimit: {
+        limited: true, kind: 'usage', retryAtMs: 100_000, retryLabel: '1m', retryReady: false,
+        source: 'antigravity-native-log', nativeEpisodeKey: 'log:ep-1',
+      },
+    };
+    const harness = executeProductionCapture({
+      logScreenshotSkip: vi.fn(),
+      snapshotToPng: vi.fn(async () => ({ ansi: 'static-banner', png: Buffer.from('png'), content: 'static-banner' })),
+      backend: {},
+      renderCols: 80,
+      renderRows: 24,
+      cliAdapter: { id: 'antigravity' },
+      renderer: null,
+      createHash: vi.fn(),
+      clamp: vi.fn(),
+      captureToPng: vi.fn(),
+      uploadImageBuffer,
+      logError: vi.fn(),
+      log: vi.fn(),
+      projectedRuntimeScreenStatus: () => 'idle',
+      send,
+      classifyScreenUsageLimit: () => currentClassification,
+      currentBotmuxTurnId: 'turn_1',
+    });
+
+    await harness.captureAndUpload();
+    await harness.captureAndUpload();
+    expect(send).toHaveBeenCalledTimes(1);
+
+    // Late directFailure proof arrives on identical pixels -> emits once, then dedups.
+    currentClassification = {
+      status: 'limited',
+      usageLimit: { ...currentClassification.usageLimit, directFailure: true },
+    };
+    await harness.captureAndUpload();
+    await harness.captureAndUpload();
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(send.mock.calls[1][0].usageLimit.directFailure).toBe(true);
+
+    // Native quota expires on identical pixels -> emits once, then dedups!
+    currentClassification = {
+      status: 'idle',
+      expiredAntigravityQuota: { ...currentClassification.usageLimit, retryReady: true },
+    };
+    await harness.captureAndUpload();
+    await harness.captureAndUpload();
+    expect(send).toHaveBeenCalledTimes(3);
+    expect(send.mock.calls[2][0].expiredAntigravityQuota.nativeEpisodeKey).toBe('log:ep-1');
+  });
+
+  it('reopens unchanged Error-ID-less quota screenshots on new turn or direct Web Terminal input, and drops stale mid-await input generation', async () => {
+    const send = vi.fn();
+    let resolveSnapshot: ((val: any) => void) | undefined;
+    let resolveUpload: ((val: string) => void) | undefined;
+    const uploadImageBuffer = vi.fn(() => new Promise<string>(resolve => { resolveUpload = resolve; }));
+    const snapshotToPng = vi.fn(() => new Promise(resolve => { resolveSnapshot = resolve; }));
+
+    const harness = executeProductionCapture({
+      logScreenshotSkip: vi.fn(),
+      snapshotToPng,
+      backend: {},
+      renderCols: 80,
+      renderRows: 24,
+      cliAdapter: { id: 'antigravity' },
+      renderer: null,
+      createHash: vi.fn(),
+      clamp: vi.fn(),
+      captureToPng: vi.fn(),
+      uploadImageBuffer,
+      logError: vi.fn(),
+      log: vi.fn(),
+      projectedRuntimeScreenStatus: () => 'idle',
+      send,
+      classifyScreenUsageLimit: () => ({
+        status: 'limited',
+        usageLimit: { limited: true, kind: 'usage', retryAtMs: 60_000, retryLabel: '1m', retryReady: false, relativeResetKey: 'usage:60000:' },
+      }),
+      currentBotmuxTurnId: 'turn_1',
+    });
+
+    // direct Web Terminal input during snapshot await cancels stale frame before upload!
+    const p1 = harness.captureAndUpload();
+    harness.bumpInputGeneration();
+    resolveSnapshot!({ ansi: 'quota-1m', png: Buffer.from('png'), content: 'quota-1m' });
+    await p1;
+    expect(uploadImageBuffer).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+
+    // direct Web Terminal input during upload await drops stale frame and does not send!
+    const p2 = harness.captureAndUpload();
+    resolveSnapshot!({ ansi: 'quota-1m', png: Buffer.from('png'), content: 'quota-1m' });
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.bumpInputGeneration();
+    resolveUpload!('img_stale');
+    await p2;
+    expect(send).not.toHaveBeenCalled();
+
+    // steady upload sends once, dedups repeat, then reopens on new input generation!
+    const p3 = harness.captureAndUpload();
+    resolveSnapshot!({ ansi: 'quota-1m', png: Buffer.from('png'), content: 'quota-1m' });
+    await Promise.resolve();
+    await Promise.resolve();
+    resolveUpload!('img_ok_1');
+    await p3;
+    expect(send).toHaveBeenCalledTimes(1);
+
+    const p4 = harness.captureAndUpload();
+    resolveSnapshot!({ ansi: 'quota-1m', png: Buffer.from('png'), content: 'quota-1m' });
+    await p4;
+    expect(send).toHaveBeenCalledTimes(1);
+
+    harness.bumpInputGeneration();
+    const p5 = harness.captureAndUpload();
+    resolveSnapshot!({ ansi: 'quota-1m', png: Buffer.from('png'), content: 'quota-1m' });
+    await Promise.resolve();
+    await Promise.resolve();
+    resolveUpload!('img_ok_2');
+    await p5;
+    expect(send).toHaveBeenCalledTimes(2);
   });
 });

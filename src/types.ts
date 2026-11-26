@@ -12,7 +12,7 @@ import type {
   RemoteRunnerBackendState,
   RemoteRunnerUsageReport,
 } from './adapters/backend/remote-runner-protocol.js';
-import type { CliUsageLimitState } from './utils/cli-usage-limit.js';
+import type { AntigravityTranscriptWriteBoundary, CliUsageLimitState } from './utils/cli-usage-limit.js';
 import type { VcMeetingActivityType } from './vc-agent/types.js';
 import type { CodexServiceTier, CodexServiceTierPreference, CodexServiceTierSnapshot } from './services/codex-service-tier.js';
 import type { CliId } from './adapters/cli/types.js';
@@ -122,6 +122,16 @@ export interface TrustedCaller {
     unionId: string;
     email: string;
     source: 'bot_config';
+  };
+  /** Human principal of the exact source turn for a followed cross-chat bot
+   * reply. The immediate caller remains the bot above; credential consumers
+   * must opt in to this bounded continuation instead of rewriting senderType. */
+  taskContinuation?: {
+    appId: string;
+    openId: string;
+    unionId?: string;
+    sourceSessionId: string;
+    sourceTurnId: string;
   };
 }
 
@@ -298,6 +308,8 @@ export interface FailedTurnRecord {
   userPrompt: string;
   cliInput: string;
   codexAppInput?: CodexAppTurnInput;
+  /** Daemon-retained attachments paired with the exact CLI input, for replay and quota handoff. */
+  attachments?: LarkAttachment[];
   failedAt: string;        // ISO
   errorCode?: string;
   status: 'failed' | 'ambiguous';
@@ -320,6 +332,9 @@ export interface FailedTurnRecord {
   /** The worker saw this turn end on API errors alone (turn_terminal
    *  `directFailure`): the next input may cut it out and re-send its input. */
   directFailure?: true;
+  /** Current-turn transcript boundary backing an Antigravity limited snapshot's
+   *  directFailure proof. Missing legacy boundaries fail closed for auto-replay. */
+  antigravityWriteBoundary?: AntigravityTranscriptWriteBoundary;
   /** The terminal's `retryable`, kept for the rewind decision. */
   retryable?: boolean;
   /** Frozen at the failure: this turn's answer was meant for the chat (not an
@@ -429,16 +444,17 @@ export interface PrincipalLaneBinding {
 }
 
 /**
- * One exact human turn admitted behind an already-running turn in the same
- * principal lane.  The final CLI payload is persisted so daemon-side FIFO does
- * not depend on re-parsing a Lark event after the transport has acknowledged
- * it.  `attempting` is a commit-unknown fence: a restart must never replay a
- * turn that may already have crossed the worker IPC boundary.
+ * One exact turn admitted behind an already-running turn in the same principal
+ * lane. The final CLI payload is persisted so daemon-side FIFO does not depend
+ * on re-parsing a Lark event after the transport has acknowledged it.
+ * `attempting` is a commit-unknown fence: a restart must never replay a turn
+ * that may already have crossed the worker IPC boundary. A legacy cross-chat
+ * callerless turn keeps `caller` absent; no owner/session identity is invented.
  */
 export interface PrincipalLaneQueuedTurn {
   version: 1;
   turnId: string;
-  caller: TrustedCaller;
+  caller?: TrustedCaller;
   userPrompt: string;
   title: string;
   cliInput: CliTurnPayload;
@@ -456,7 +472,7 @@ export interface PrincipalLaneDispatchUnknownNotice {
   version: 1;
   id: string;
   turnId: string;
-  caller: TrustedCaller;
+  caller?: TrustedCaller;
   detectedAt: string;
   noticePending: true;
 }
@@ -845,6 +861,11 @@ export interface Session {
   /** Exact final worker input retained for retry. This may include a triggering
    * group reply in addition to the original dashboard backlog prompt. */
   queuedActivationInput?: CliTurnPayload;
+  /** Literal raw opening retained while its activation has no submission ACK.
+   * Unlike pendingRawInput, this survives daemon restart and immediate raw starts
+   * that never had a pendingRepoSetup. Cleared with the activation journal. */
+  queuedActivationRawInput?: string;
+  queuedActivationRawTurnId?: string;
   queuedActivationTurnId?: string;
   queuedActivationDispatchAttempt?: number;
   /** Frozen resume mode for the exact journal head. Backlog activations are
@@ -1178,6 +1199,11 @@ export interface Session {
   usageLimit?: CliUsageLimitState;
   /** 最近的原生限额拒绝及首次截止时间，用于恢复时识别旧终端残留的提示 */
   antigravityQuotaHistory?: readonly CliUsageLimitState[];
+  /** Single-source Antigravity recovery cursor (`lastConfirmed` + `recoveredEpisodeKey`),
+   *  persisted so reader-gap retention and tombstones survive restarts deterministically. */
+  antigravityQuotaCursor?: import('./services/antigravity-quota-state.js').AntigravityQuotaRecoveryCursor;
+  /** Native Antigravity episode keys already settled by account rotation (bounded FIFO, max 32). */
+  consumedAntigravityQuotaKeys?: readonly string[];
   /** Model fallback in effect. Persisted alongside usageLimit because the
    *  worker's baseline cursors to EOF after a restart — the switch record is
    *  already history by then and would never be drained again. */
@@ -1189,6 +1215,8 @@ export interface Session {
   /** Structured companion for lastCliInput so retry_last_task can preserve a
    * clean Codex App turn. The legacy string remains authoritative fallback. */
   lastCodexAppInput?: CodexAppTurnInput;
+  /** Attachments paired with lastCliInputTurnId; retained for exact failure recovery and quota handoff. */
+  lastAttachments?: LarkAttachment[];
   /** 最近一个失败或被中断的 turn 的记录，供 /retry 命令重注入。
    *  在 onTurnTerminal 回调中记录（failed/ambiguous），不随新 turn 注入清除——
    *  只被更新的失败 turn 覆盖。 */
@@ -1241,6 +1269,15 @@ export interface Session {
    * to this external server.
    */
   existingAppServerEndpoint?: string;
+  /** Frozen at ordinary-topic creation; input stays in the activation journal. */
+  sharedThreadOpening?: {
+    endpoint: string;
+    cwd?: string;
+    title?: string;
+    projectRouteRevision?: number;
+    phase?: 'creating' | 'created';
+    threadId?: string;
+  };
   /** Provenance: the botmux sessionId this session was forked from (`/fork`).
    *  Purely informational — surfaced in UI/pickers so a fork is distinguishable
    *  from its parent. Does not affect routing or lifecycle. */
@@ -1327,6 +1364,9 @@ export interface Session {
   modelPin?: import('./core/model-pin.js').ModelPin;
   /** Retained Auto-model selection for the exact native conversation. */
   traexAutoModelRuntime?: import('./services/traex-auto-model.js').TraexAutoModelRuntimeState;
+  /** Step of the bot's quota fallback chain this session moved to. Its model
+   * outranks every other launch-model source while its CLI is the session's. */
+  quotaFallback?: import('./services/quota-fallback-chain.js').QuotaFallbackSessionState;
   /** Group defaults at topic creation; absent on legacy sessions. */
   groupDefaultModels?: import('./core/group-default-models.js').GroupDefaultModels;
   /** Optional reasoning effort frozen at creation (per-turn API override).
@@ -1467,6 +1507,7 @@ export interface Session {
   sandboxNetwork?: boolean;
   /** `sandboxWithholdBotSecret` recorded alongside `sandbox` at session creation. */
   sandboxWithholdBotSecret?: boolean;
+  protectedResults?: boolean;
   sandboxNetworkPolicy?: import('./core/sandbox-network-policy.js').SandboxNetworkPolicy;
   /**
    * Protected plugin HTTP egress decision frozen for this session before its
@@ -2185,6 +2226,8 @@ export interface CliTurnPayload {
   /** Daemon-frozen LinkRef mode plus admission-only source material. */
   linkRefs?: LinkRefTurnEnvelope;
   codexAppInput?: CodexAppTurnInput;
+  /** Daemon-side replay metadata paired with this exact input. Workers do not consume it directly. */
+  attachments?: LarkAttachment[];
   nativeSessionTitle?: string;
   nativeSessionTitlePrompt?: string;
   trustedCaller?: TrustedCaller;
@@ -2281,10 +2324,14 @@ type DaemonToWorkerBase =
   | { type: 'link_ref_register_result'; requestId: string; ok: boolean; companion?: string; stats?: Partial<import('./services/link-ref-types.js').LinkRefExtractionStats>; error?: string }
   | { type: 'link_ref_resolve_result'; requestId: string; ok: boolean; payload?: import('./services/link-ref-resolver.js').ResolvedOutboundLinkRefs; error?: string }
   | { type: 'link_ref_restore_mode_result'; requestId: string; mode?: 'enabled'; error?: string }
-  | { type: 'init'; deploymentContinuation?: import('./services/deployment-continuation.js').DeploymentContinuation; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliRuntime?: import('./adapters/cli/runtime.js').CliRuntimeSnapshot; cliPathOverride?: string; cliConfigDir?: string; codexProfile?: string; codexProfileHome?: string; cliUpgrade?: import('./core/cli-version-history.js').CliUpgrade; cliVersion?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode; launchShell?: string; model?: string; modelBackendVariant?: 'standard' | 'max'; turnTimeoutMs?: number; dshProfile?: string; dshRuntime?: 'official' | 'tui'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; serviceTier?: CodexServiceTier; disableCliBypass?: boolean; noProgressNotify?: import('./services/no-progress-notify-policy.js').NoProgressNotifyPolicy; codexBrowser?: import('./core/codex-browser-config.js').CodexBrowserConfig; codexRpcInput?: boolean; codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode; credentialsSourceDir?: string; triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig; larkToolBinding?: boolean; existingAppServerEndpoint?: string; startupCommands?: string[]; initialNativeRename?: string; envPolicy?: import('./core/env-policy.js').EnvPolicy; env?: Record<string, string>; envUnset?: string[]; envFingerprint?: string; replyStyle?: import('./im/lark/reply-card-style.js').ReplyStyleConfig; sandbox?: boolean | 'off' | 'oncall' | 'scratch'; scratchStorage?: 'tmpfs' | 'disk'; scratchTmpfsSizeMb?: number; scratchDenyPaths?: string[]; sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; sandboxNetworkPolicy?: import('./core/sandbox-network-policy.js').SandboxNetworkPolicy; sandboxWithholdBotSecret?: boolean; assistantTemplateDir?: string; assistantOwnerOpenId?: string; readIsolation?: boolean; readDenyExtraPaths?: string[]; autoWorktreeFallbackDir?: string; daemonBootId?: string; backendType: BackendType; persistentBackendTarget?: PersistentBackendTarget; backendConfig?: RiffBackendConfig | MojoConfig | RemoteRunnerConfig | HerdrBackendConfig; remoteBackendState?: RemoteRunnerBackendState; remoteResumeMode?: 'reattach' | 'rebuild'; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; prompt: string; promptCodexAppInput?: CodexAppTurnInput; linkRefMode?: 'observe' | 'enabled'; queuedActivationToken?: string; resume?: boolean; forkSession?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; apiOnly?: boolean; replyDelivery?: 'send' | 'transcript'; replyDeliveryLegacy?: 'send' | 'transcript'; promptInjection?: 'default' | 'none'; promptCacheTtl?: import('./services/prompt-cache-policy.js').PromptCacheTtl; solo?: boolean; leadOnly?: boolean; hideLocalAddresses?: true; goalStatusCard?: true; followUpReply?: true; kimiCacheExpiryAutoCompact?: true; workflowNodeSession?: true; captureTurnFailureDiagnostics?: true; loadedBotsConfigPath?: string; loadedBotsConfigProvenance?: import('./core/config-dir.js').BotsConfigProvenance; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; durablePrimaryInbox?: true; atMostOnce?: boolean; codexAppDispatchId?: string; codexAppSteerable?: true; codexAppRecoveredDispatches?: CodexAppDispatchLedgerEntry[]; codexAppGenerationCommits?: CodexAppGenerationCommit[]; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; pluginBindings?: string[]; protectedMcpPolicy?: import('./core/protected-mcp-capabilities.js').ProtectedMcpWorkerPolicy; protectedHttpEgressPolicy?: import('./core/protected-http-egress.js').ProtectedHttpEgressWorkerPolicy; protectedLoopbackProxyAttestation?: { secret: string; workerGeneration: number }; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean; runnerBuildId?: string; persistedRunnerBuildId?: string; restartAttemptId?: string; statuslineLaunchGen?: string; turnCallerOpenId?: string }
+  | { type: 'init'; deploymentContinuation?: import('./services/deployment-continuation.js').DeploymentContinuation; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliRuntime?: import('./adapters/cli/runtime.js').CliRuntimeSnapshot; cliPathOverride?: string; cliConfigDir?: string; codexProfile?: string; codexProfileHome?: string; cliUpgrade?: import('./core/cli-version-history.js').CliUpgrade; cliVersion?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode; launchShell?: string; model?: string; modelBackendVariant?: 'standard' | 'max'; turnTimeoutMs?: number; dshProfile?: string; dshRuntime?: 'official' | 'tui'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; serviceTier?: CodexServiceTier; disableCliBypass?: boolean; noProgressNotify?: import('./services/no-progress-notify-policy.js').NoProgressNotifyPolicy; codexBrowser?: import('./core/codex-browser-config.js').CodexBrowserConfig; codexRpcInput?: boolean; codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode; credentialsSourceDir?: string; triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig; larkToolBinding?: boolean; existingAppServerEndpoint?: string; startupCommands?: string[]; initialNativeRename?: string; envPolicy?: import('./core/env-policy.js').EnvPolicy; env?: Record<string, string>; envUnset?: string[]; envFingerprint?: string; replyStyle?: import('./im/lark/reply-card-style.js').ReplyStyleConfig; sandbox?: boolean | 'off' | 'oncall' | 'scratch'; scratchStorage?: 'tmpfs' | 'disk'; scratchTmpfsSizeMb?: number; scratchDenyPaths?: string[]; sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; sandboxNetworkPolicy?: import('./core/sandbox-network-policy.js').SandboxNetworkPolicy; sandboxWithholdBotSecret?: boolean; protectedResults?: boolean; assistantTemplateDir?: string; assistantOwnerOpenId?: string; readIsolation?: boolean; readDenyExtraPaths?: string[]; autoWorktreeFallbackDir?: string; daemonBootId?: string; backendType: BackendType; hcHerdrTabTitle?: string; persistentBackendTarget?: PersistentBackendTarget; backendConfig?: RiffBackendConfig | MojoConfig | RemoteRunnerConfig | HerdrBackendConfig; remoteBackendState?: RemoteRunnerBackendState; remoteResumeMode?: 'reattach' | 'rebuild'; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; prompt: string; promptCodexAppInput?: CodexAppTurnInput; linkRefMode?: 'observe' | 'enabled'; queuedActivationToken?: string; resume?: boolean; forkSession?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; apiOnly?: boolean; replyDelivery?: 'send' | 'transcript'; replyDeliveryLegacy?: 'send' | 'transcript'; promptInjection?: 'default' | 'none'; promptCacheTtl?: import('./services/prompt-cache-policy.js').PromptCacheTtl; solo?: boolean; leadOnly?: boolean; hideLocalAddresses?: true; goalStatusCard?: true; followUpReply?: true; kimiCacheExpiryAutoCompact?: true; workflowNodeSession?: true; captureTurnFailureDiagnostics?: true; loadedBotsConfigPath?: string; loadedBotsConfigProvenance?: import('./core/config-dir.js').BotsConfigProvenance; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; durablePrimaryInbox?: true; atMostOnce?: boolean; codexAppDispatchId?: string; codexAppSteerable?: true; codexAppRecoveredDispatches?: CodexAppDispatchLedgerEntry[]; codexAppGenerationCommits?: CodexAppGenerationCommit[]; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; pluginBindings?: string[]; protectedMcpPolicy?: import('./core/protected-mcp-capabilities.js').ProtectedMcpWorkerPolicy; protectedHttpEgressPolicy?: import('./core/protected-http-egress.js').ProtectedHttpEgressWorkerPolicy; protectedLoopbackProxyAttestation?: { secret: string; workerGeneration: number }; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean; runnerBuildId?: string; persistedRunnerBuildId?: string; restartAttemptId?: string; statuslineLaunchGen?: string; turnCallerOpenId?: string }
 
     & { traexAutoModel?: import('./services/traex-auto-model.js').TraexAutoModelConfig }
-    & { antigravityQuotaHistory?: readonly CliUsageLimitState[]; antigravityActiveQuota?: CliUsageLimitState }
+    & {
+      antigravityQuotaHistory?: readonly CliUsageLimitState[];
+      antigravityActiveQuota?: CliUsageLimitState;
+      antigravityQuotaCursor?: import('./services/antigravity-quota-state.js').AntigravityQuotaRecoveryCursor;
+    }
   /** `model` rides along on every turn for the SAME reason the restart IPC carries
    *  it: the crash-loop park recovery respawns the CLI from inside the worker on
    *  the next message, with no restart IPC to refresh the snapshot. Same
@@ -2355,7 +2402,7 @@ type DaemonToWorkerBase =
   // onExit so transient auto-restarted exits don't park-then-tear-down.
   // `terminal: false` (backend-outage give-up): only stop and wait for the next
   // message; do not create the bmx-diag shell on a tmux server that just failed.
-  | { type: 'park_diagnostic'; terminal?: boolean }
+  | { type: 'park_diagnostic'; terminal?: boolean; failPending?: boolean }
   | {
       type: 'tui_keys';
       keys: string[];
@@ -2390,6 +2437,11 @@ type DaemonToWorkerBase =
   | { type: 'coco_drive_picker'; navKeys: string[]; needsReviewSubmit: boolean; comment?: string | null }
   | { type: 'set_display_mode'; mode: DisplayMode }
   | { type: 'set_locale'; locale: 'zh' | 'en' }
+  /** The bot's followUpReply switch changed while this worker runs. */
+  | { type: 'set_follow_up_reply'; enabled: boolean }
+  /** A non-progress folded-turn reply was actually delivered by the daemon.
+   *  Only this receipt lets the worker leave its text out of the host final. */
+  | { type: 'absorbed_reply_delivered'; turnId: string; dispatchAttempt?: number; replyUuid: string }
   | { type: 'term_action'; key: TermActionKey }
   /** Exact turn-level interruption. The worker verifies `turnId` against its
    * own active turn before injecting Ctrl+C and acknowledges the result. */
@@ -2452,7 +2504,7 @@ type DaemonToWorkerTransport = DaemonToWorkerBase extends infer Message
         /** Explicit, off-by-default ordinary bridge handoff negotiation. */
         sessionContract?: import('./services/session-contract.js').SessionContractBootstrap;
         settledTurnTerminals?: Array<{ turnId: string; status: 'completed' }>;
-        finalOutputHandoff?: { version: 1 | 2; token: string; admitNew?: boolean };
+        finalOutputHandoff?: { version: 1 | 2; token: string; admitNew?: boolean; frozenImOnly?: true };
       }
     : Message
   : never;
@@ -2648,6 +2700,7 @@ export type WorkerToDaemonBase =
       expiresAt: string;
       fileCount: number;
       responseKind: 'final' | 'auxiliary';
+      readPolicy?: 'receipt-only';
     }
   | {
       type: 'ready';
@@ -2692,6 +2745,16 @@ export type WorkerToDaemonBase =
    * with, the text this worker wrote for this turn. Read before the model
    * starts on it; no stand-in for `native_input_consumed`. */
   | { type: 'prompt_submitted_input'; turnId: string; dispatchAttempt?: number }
+  /** The worker is about to type this turn into the CLI behind the running
+   * turn (type-ahead). Its UserPromptSubmit hook fires while the running turn
+   * is still the managed origin, so the daemon accepts this turn's prompt
+   * context sidecar at claim time as well. */
+  | { type: 'type_ahead_queued'; turnId: string }
+  /** A queued turn was dropped, folded or terminated before its hook claimed. */
+  | { type: 'type_ahead_turn_dropped'; turnId: string }
+  /** Complete live queue after binding a local CLI PID marker; includes records
+   * restored by a replacement worker and reconciles daemon-side stale entries. */
+  | { type: 'type_ahead_queue_snapshot'; turnIds: string[] }
   /** Provenance-only signal for a Web Terminal / sandbox hook direct-submit.
    *  Sent unconditionally when the submit hook fires, even when the worker has
    *  no prompt_ready (the exact stuck-after-terminal case this card fix
@@ -2812,6 +2875,8 @@ export type WorkerToDaemonBase =
     canParkDiagnostic?: boolean;
     /** Presentation-only evidence that this TraeX generation never reached a prompt. */
     traexStartupFailure?: boolean;
+    /** Fresh local CLI exited before readiness / opening argv turn evidence. */
+    startupFailure?: boolean;
     /** A Codex App thread is still owned by another app-server writer. */
     codexAppActiveWriter?: boolean;
     /** Linux bwrap sandbox could not create this namespace on this host. */
@@ -2865,7 +2930,7 @@ export type WorkerToDaemonBase =
    *  input bytes: only the attribution idle-compact needs to distinguish a
    *  person's turn from a local command's own repaint. */
   | { type: 'terminal_input'; submitted: true; at: number }
-  | { type: 'screen_update'; content: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; expiredAntigravityQuota?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number;
+  | { type: 'screen_update'; content: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; expiredAntigravityQuota?: CliUsageLimitState; antigravityQuotaCursor?: import('./services/antigravity-quota-state.js').AntigravityQuotaRecoveryCursor; turnId?: string; dispatchAttempt?: number;
       /** Worker 已从完整权威视口确认正常输入框，不能由裁剪后的卡片文本推断。 */
       usageLimitRecovery?: 'antigravity-ready-composer';
       /** Set ONLY on the working frame a Web Terminal / sandbox hook
@@ -2927,7 +2992,7 @@ export type WorkerToDaemonBase =
   /** Executor-observed Codex tier, bound to this worker + rollout generation.
    * `null` explicitly clears any previous generation's snapshot. */
   | { type: 'codex_service_tier'; snapshot: CodexServiceTierSnapshot | null }
-  | { type: 'error'; message: string; turnId?: string; dispatchAttempt?: number; sandboxNamespace?: 'pid' | 'user' }
+  | { type: 'error'; message: string; turnId?: string; dispatchAttempt?: number; sandboxNamespace?: 'pid' | 'user'; /** Workflow worker only: Claude cleared the node's `/goal` (claude-transcript ClaudeGoalAbortWatch). */ goalAborted?: true }
   | { type: 'bridge_source_session'; bridge: 'hermes'; sourceSessionId: string }
   /** Worker observed a successful explicit `botmux send` for this turn, so
    * the daemon should treat listener-preview runs as visibly replied even
@@ -2959,7 +3024,7 @@ export type WorkerToDaemonBase =
       /** False when the post-key capture could not be taken. */
       afterObserved?: boolean }
 
-  | { type: 'screenshot_uploaded'; imageKey: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; expiredAntigravityQuota?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number;
+  | { type: 'screenshot_uploaded'; imageKey: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; expiredAntigravityQuota?: CliUsageLimitState; antigravityQuotaCursor?: import('./services/antigravity-quota-state.js').AntigravityQuotaRecoveryCursor; turnId?: string; dispatchAttempt?: number;
       usageLimitRecovery?: 'antigravity-ready-composer';
       /** capture_identity revision this frame was captured under (bound before
        *  the first await). Absent only from pre-capture-identity workers. */
@@ -2995,7 +3060,13 @@ export type WorkerToDaemonBase =
         /** A resumed CLI reported what the previous process left unfinished
          *  (restart-interruption.ts). During a backend outage the daemon folds
          *  it into the topic's single outage status card. */
-        | 'restart_interruption';
+        | 'restart_interruption'
+        /** A known startup dialog (folder trust, login, …) holds a CLI that was
+         *  never input-ready. Chat sessions deliver it as plain text like an
+         *  unkinded notice; the v3 workflow pool fails the node on it. */
+        | 'cli_startup_blocked';
+      /** `kind='cli_startup_blocked'`: which dialog matched (core/cli-startup-blocker). */
+      startupBlocker?: Pick<import('./core/cli-startup-blocker.js').CliStartupBlocker, 'kind' | 'rule' | 'folder'>;
       /** Permission prompt persisted across fresh worker captures; no daemon-side grace needed. */
       permissionPromptStable?: boolean;
       /** Bounded plain-text bottom of the screen for an input_not_submitted
@@ -3105,6 +3176,16 @@ export type WorkerToDaemonBase =
        *  reached a final assistant turn; it does not imply any Lark fallback
        *  message was posted (silent/suppressed turns also complete). */
       status: 'completed' | 'failed' | 'cancelled' | 'ambiguous';
+      /** Background tasks (agents, workflows, shells, monitors) still running
+       *  when a `completed` turn ended. Absent means none. */
+      backgroundTasks?: number;
+      /** Worker intentionally retains this turn's managed-origin authority past
+       *  foreground terminal while owned finite background task(s) or their wake-up
+       *  micro-turn remain active. Daemon skips its defense-in-depth wipe of
+       *  `ds.managedTurnOrigin` (and retains `ds.activeInteractiveTurn` under XPI=ON);
+       *  a later `managed_turn_origin_revoked` (or new origin / CLI exit / worker exit)
+       *  clears it. Older workers omit this field (fail closed). */
+      authorityHeldForBackground?: true;
       errorCode?: string;
       /** With `errorCode: 'safe_composer_required'` only: why the worker
        *  refused the unattended maintenance write. Absent from older workers;
@@ -3135,6 +3216,8 @@ export type WorkerToDaemonBase =
        *    must settle this fail-closed — no output was ever observed; the
        *    claude bridge guarantees `final_output` precedes this terminal, so
        *    no answer can still arrive.
+       *  - 'empty_answer': a structured, observed terminal had no answer on a
+       *    turn admitted with a required IM reply. It is neither delivery nor silence.
        *  - 'explicit_final_delivered': the claude transcript bridge popped a
        *    real (non-local) turn without transcript terminal evidence, but an
        *    explicit final `botmux send` marker proves the answer was delivered
@@ -3147,7 +3230,7 @@ export type WorkerToDaemonBase =
        *  RPC-hydration timeout path, which emits `completed` with no
        *  final_output after fs-lag and must NOT be read as silence or as a dead
        *  turn (that would mask a real, still-arriving answer). */
-      outputDisposition?: 'nothing_to_send' | 'boundary_unobserved' | 'explicit_final_delivered';
+      outputDisposition?: 'nothing_to_send' | 'empty_answer' | 'boundary_unobserved' | 'explicit_final_delivered';
       /** Wall-clock epoch ms at which the CLI turn actually reached its native
        *  terminal. Absent when the emitter cannot vouch for a real instant, in
        *  which case the recorder falls back to its own write time (which is NOT

@@ -20,7 +20,7 @@ import { resolveLarkCliHomeForTurn, beginLarkCliLogin } from '../services/lark-c
 import { readCliAuthEpoch } from '../services/cli-auth-epoch.js';
 import type { BotConfig } from '../bot-registry.js';
 import { isLarkToolBound } from './lark-tool-binding.js';
-import { rememberLarkToolDelegation } from './lark-tool-delegation.js';
+import { rememberLarkToolDelegation, getLarkToolDelegation } from './lark-tool-delegation.js';
 import { registerActiveIdentityTurn, releaseActiveIdentityTurn } from './active-identity-turns.js';
 import {
   TRIGGER_USER_AUTH_TOOLS,
@@ -32,6 +32,7 @@ import type { IdentityStorageModel } from './lark-tool-binding.js';
 import {
   resolvePlatformIdentity,
   platformRefusalReason,
+  platformAuthorizeUrl,
   reasonTag,
   type PlatformIdentityResolution,
 } from './platform-credential-source.js';
@@ -41,12 +42,16 @@ import {
   meegoStoreShape,
   clearSessionIdentity,
   recallProvenIdentityContent,
+  recallProvenIdentitySnapshot,
+  type ProvenIdentitySnapshot,
+  publishedIdentityShape,
   type BytedCliIdentity,
   type CliIdentity,
 } from './cli-identity.js';
 import { allowsPersonalIdentityForTurn, isUnattendedIdentityTurnId } from './workflow-event-turn.js';
 import { trackBytedcliIdentityRenewal } from './bytedcli-identity-renewal.js';
 import { GRANT_WAIT_CAP_MS } from '../platform/credential-grant-budget.js';
+import { BYTEDCLI_OVERSEAS_REGIONS, type BytedcliOverseasRegion } from '../platform/bytedcli-grant-regions.js';
 
 /** What was published for one tool this turn — drives the user-visible notice. */
 export interface ToolIdentityOutcome {
@@ -236,7 +241,10 @@ async function publishTurnCliIdentityNow(
   // Only an initially eligible personal publication is revoked here. A turn
   // that started with owner credentials disabled keeps its ordinary denial.
   if (personalIdentityAllowedAtStart && args.validateBeforeWrite && !publicationValid(args.validateBeforeWrite)) {
-    for (const tool of TRIGGER_USER_AUTH_TOOLS) clearSessionIdentity(sessionDataDir, sessionId, tool, turnId, args.storageModel);
+    for (const tool of TRIGGER_USER_AUTH_TOOLS) {
+      clearSessionIdentity(sessionDataDir, sessionId, tool, turnId, args.storageModel);
+      if (turnId) transientRefusals.delete(transientKey(sessionDataDir, sessionId, turnId, tool));
+    }
     if (turnId) releaseActiveIdentityTurn(sessionDataDir, sessionId, turnId);
     return TRIGGER_USER_AUTH_TOOLS.map(tool => ({ tool, state: 'off' as const }));
   }
@@ -286,11 +294,19 @@ async function publishToolIdentity(
       try {
         writeSessionIdentity(sessionDataDir, sessionId, {
           tool, mode: 'denied', ...(turnId ? { turnId } : {}),
+          ...(!delegated && senderOpenId ? { openId: senderOpenId } : {}),
           message: locale === 'en'
             ? `botmux: bytedcli authorization service is unavailable. Stop automatic retries and repeated login requests; retry after the service recovers. Existing authorization is retained.\n${reasonTag('provider_unavailable')}`
             : `botmux: bytedcli 授权服务暂时不可用。请停止自动重试和重复要求用户登录；服务恢复后再重试，已有授权会保留。\n${reasonTag('provider_unavailable')}`,
         }, storageModel);
       } catch { clearSessionIdentity(sessionDataDir, sessionId, tool, turnId, storageModel); }
+      if (!delegated && senderOpenId && turnId && storageModel === 'proven'
+        && policy.capabilities.has('bytecloud') && localCredentialSourceAllowed(policy, tool)) {
+        rememberTransientRefusal({
+          source: 'local', botConfig, tool, sessionDataDir, sessionId, senderOpenId, locale, turnId,
+          validateBeforeWrite: args.validateBeforeWrite, kind: 'unavailable',
+        });
+      }
       return { tool, state: 'unavailable' };
     }
     return args.delegatedIdentity
@@ -332,7 +348,7 @@ async function publishDelegated(tool: TriggerUserAuthTool, args: PublishTurnIden
   // contact lookup that need not be reachable. On a bound host a non-grant is
   // final and local stores are never read; an unbound `auto` host still
   // honours an already-provisioned local HOME below.
-  const source = policy.credentialSource;
+  const source = policy.credentialSources[capabilityOfTool(tool)];
   if (source !== 'local') {
     const platform = await resolvePlatformIdentity({
       botConfig: args.botConfig, tool, unionId: user.unionId,
@@ -429,13 +445,19 @@ async function publishOne(
   const withheld = async () =>
     withholdIdentity(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, storageModel, privateChat);
 
-  const publish = (identity: CliIdentity, localMint = false): ToolIdentityOutcome => {
+  const publish = (identity: CliIdentity, localMint = false, platformUnionId?: string): ToolIdentityOutcome => {
     if (!publicationValid(validateBeforeWrite)) return { tool, state: 'off' };
     const stamped = withMeegoStore({ ...identity, ...(turnId ? { turnId } : {}), openId: senderOpenId }, policy);
-    writeSessionIdentity(sessionDataDir, sessionId, stamped, storageModel);
+    if (platformUnionId && turnId && storageModel === 'proven') {
+      writeProvenPlatformIdentity({
+        sessionDataDir, sessionId, botConfig, turnId, senderOpenId, validateBeforeWrite,
+      }, stamped, platformUnionId);
+    } else {
+      writeSessionIdentity(sessionDataDir, sessionId, stamped, storageModel);
+    }
     if (localMint && turnId && storageModel === 'proven' && stamped.tool === 'bytedcli' && !('mode' in stamped)) {
       trackBytedcliIdentityRenewal({
-        sessionDataDir, sessionId, credentialOpenId: senderOpenId, identity: { ...stamped, turnId },
+        sessionDataDir, sessionId, credentialOpenId: senderOpenId, identity: { ...stamped, turnId }, validateBeforeWrite,
       });
     }
     return { tool, state: 'user' };
@@ -450,9 +472,9 @@ async function publishOne(
   //   platform         → platform grant or refusal; local is never consulted.
   const { platform, local, decision } = await gatherCredentials(tool, botConfig, policy, senderOpenId, sessionId, turnId);
   if (decision.kind === 'person') {
-    return decision.source === 'platform'
-      ? publish((platform as Extract<PlatformIdentityResolution, { state: 'granted' }>).identity)
-      : publish(local!, true);
+    if (decision.source !== 'platform') return publish(local!, true);
+    const grant = platform as Extract<PlatformIdentityResolution, { state: 'granted' }>;
+    return publish(grant.identity, false, grant.unionId);
   }
   if (decision.entry === 'private-link') return await withheld();
 
@@ -466,6 +488,7 @@ async function publishOne(
   const outcome = refuseViaPlatform(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, storageModel, refusal, retryable);
   if (retryable) {
     rememberTransientRefusal({
+      source: 'platform',
       botConfig, tool, sessionDataDir, sessionId, senderOpenId, locale, turnId: turnId!, validateBeforeWrite,
       ...refusalKindOf(refusal as Extract<PlatformIdentityResolution, { state: 'unavailable' | 'not_authorized' }>),
     });
@@ -482,7 +505,7 @@ async function gatherCredentials(
   sessionId: string,
   turnId?: string,
 ) {
-  const source = policy.credentialSource;
+  const source = policy.credentialSources[capabilityOfTool(tool)];
   const platform = source !== 'local'
     ? await resolvePlatformIdentity({ botConfig, tool, openId, sessionId, ...(turnId ? { turnId } : {}) })
     : undefined;
@@ -496,6 +519,162 @@ async function gatherCredentials(
     localLogin: !!local,
   });
   return { platform, local, decision };
+}
+
+interface RegionalGrantContext {
+  sessionDataDir: string;
+  sessionId: string;
+  turnId: string;
+  botConfig: BotConfig;
+  senderOpenId: string;
+  validateBeforeWrite?: () => boolean;
+}
+
+interface RegionalGrantAttempt {
+  count: number;
+  retryAfter: number;
+  inFlight?: Promise<void>;
+}
+
+interface RegionalGrantPublication extends RegionalGrantContext {
+  identity: BytedCliIdentity;
+  snapshot: ProvenIdentitySnapshot;
+  unionId: string;
+  authEpoch: number;
+  attempts: Map<BytedcliOverseasRegion, RegionalGrantAttempt>;
+}
+
+// Once a publication is superseded, revoked or collected, its retry state
+// follows it out of the proven store. Never retain a second cache of a turn's JWTs.
+const regionalGrantPublications = new WeakMap<ProvenIdentitySnapshot, RegionalGrantPublication>();
+const REGIONAL_GRANT_RETRY_INTERVAL_MS = 10_000;
+const REGIONAL_GRANT_MAX_ATTEMPTS = 2;
+
+function writeProvenPlatformIdentity(
+  context: RegionalGrantContext,
+  identity: CliIdentity,
+  unionId: string,
+): void {
+  const { sessionDataDir, sessionId, turnId, senderOpenId } = context;
+  if (identity.tool !== 'bytedcli' || 'mode' in identity
+    || identity.regionalCloudJwtSource !== 'platform'
+    || isUnattendedIdentityTurnId(turnId)
+    || BYTEDCLI_OVERSEAS_REGIONS.every(region => identity.regionalCloudJwts?.[region])) {
+    writeSessionIdentity(sessionDataDir, sessionId, identity, 'proven');
+    return;
+  }
+  const shaped = publishedIdentityShape(sessionDataDir, sessionId, {
+    ...identity, retryRegionalCloudJwts: true,
+  });
+  writeSessionIdentity(sessionDataDir, sessionId, shaped, 'proven');
+  const snapshot = recallProvenIdentitySnapshot(sessionDataDir, sessionId, turnId, 'bytedcli')!;
+  regionalGrantPublications.set(snapshot, {
+    ...context, snapshot, identity: shaped, unionId,
+    authEpoch: readCliAuthEpoch(senderOpenId), attempts: new Map(),
+  });
+}
+
+/** Refresh one missing partition for the already-proven speaker. Concurrent
+ * calls for a partition share a grant. Distinct partitions merge into the
+ * same publication without replacing any of the original credentials. */
+export async function retryMissingRegionalGrant(args: {
+  sessionDataDir: string;
+  sessionId: string;
+  turnId: string;
+  region: BytedcliOverseasRegion;
+  speakerOpenId?: string;
+  currentPolicy: () => TriggerUserAuthConfig | undefined;
+  executionStillCurrent: () => boolean;
+  waitMs: number;
+}): Promise<void> {
+  const { sessionDataDir, sessionId, turnId, region } = args;
+  const current = () => recallProvenIdentitySnapshot(sessionDataDir, sessionId, turnId, 'bytedcli');
+  const snapshot = current();
+  const entry = snapshot && regionalGrantPublications.get(snapshot);
+  if (!entry || entry.identity.regionalCloudJwts?.[region]
+    || (args.speakerOpenId !== undefined && args.speakerOpenId !== entry.senderOpenId)) return;
+  const state = entry.identity.regionalCloudJwtStates?.[region];
+  if (state === 'not_authorized' || state === 'reauth_required' || state === 'retry_exhausted') return;
+
+  const stillAllowed = () => {
+    if (current() !== entry.snapshot || readCliAuthEpoch(entry.senderOpenId) !== entry.authEpoch
+      || getLarkToolDelegation(sessionDataDir, sessionId, turnId)
+      || !publicationValid(entry.validateBeforeWrite) || !args.executionStillCurrent()) return false;
+    const policy = args.currentPolicy();
+    const effective = policyFromConfig(policy);
+    return effective.capabilities.has('bytecloud') && effective.credentialSources.bytecloud !== 'local'
+      && allowsPersonalIdentityForTurn(turnId, policy);
+  };
+  if (!publicationValid(stillAllowed)) return;
+  let attempt = entry.attempts.get(region);
+  if (!attempt) {
+    attempt = { count: 0, retryAfter: 0 };
+    entry.attempts.set(region, attempt);
+  }
+  const active = attempt;
+  const commit = (identity: BytedCliIdentity) => {
+    writeSessionIdentity(sessionDataDir, sessionId, identity, 'proven');
+    const replacement = current()!;
+    regionalGrantPublications.delete(entry.snapshot);
+    entry.snapshot = replacement;
+    entry.identity = identity;
+    regionalGrantPublications.set(replacement, entry);
+  };
+  const commitExhausted = () => {
+    if (active.count < REGIONAL_GRANT_MAX_ATTEMPTS || entry.identity.regionalCloudJwts?.[region]) return;
+    const state = entry.identity.regionalCloudJwtStates?.[region];
+    if (state === 'retry_exhausted' || state === 'not_authorized' || state === 'reauth_required') return;
+    if (!publicationValid(stillAllowed)) return;
+    // The retry flag is shared by all regions. Keep it for their remaining
+    // attempts and mark only this exhausted region terminal. This local cleanup
+    // is retryable: a policy change may have suppressed the request's finally.
+    try {
+      commit({
+        ...entry.identity,
+        regionalCloudJwtStates: { ...entry.identity.regionalCloudJwtStates, [region]: 'retry_exhausted' },
+      });
+    } catch { /* keep the old identity; a later capped call can retry this cleanup */ }
+  };
+  if (!active.inFlight) {
+    if (active.count >= REGIONAL_GRANT_MAX_ATTEMPTS) {
+      commitExhausted();
+      return;
+    }
+    if (Date.now() < active.retryAfter) return;
+    active.count++;
+    active.inFlight = (async () => {
+      const grant = await resolvePlatformIdentity({
+        botConfig: entry.botConfig, tool: 'bytedcli', unionId: entry.unionId,
+        sessionId, turnId, cloudJwtRegions: [region],
+      });
+      if (grant.state !== 'granted' || grant.identity.tool !== 'bytedcli' || !stillAllowed()) return;
+      const jwt = grant.identity.regionalCloudJwts?.[region];
+      const reportedState = grant.identity.regionalCloudJwtStates?.[region];
+      const nextState = jwt ? 'minted'
+        : reportedState === 'not_authorized' || reportedState === 'reauth_required' ? reportedState
+          : active.count >= REGIONAL_GRANT_MAX_ATTEMPTS ? 'retry_exhausted'
+            : reportedState === 'minted' ? 'failed' : reportedState;
+      if (!jwt && !nextState) return;
+      // Read the latest identity at commit: another partition may have
+      // finished while this request was in flight.
+      const merged: BytedCliIdentity = {
+        ...entry.identity,
+        ...(jwt ? { regionalCloudJwts: { ...entry.identity.regionalCloudJwts, [region]: jwt } } : {}),
+        regionalCloudJwtStates: { ...entry.identity.regionalCloudJwtStates, [region]: nextState },
+      };
+      commit(merged);
+    })().catch(() => {
+      logger.warn(`[trigger-user-auth] bytedcli regional grant retry failed for partition ${region}`);
+    }).finally(() => {
+      commitExhausted();
+      active.retryAfter = Date.now() + REGIONAL_GRANT_RETRY_INTERVAL_MS;
+      active.inFlight = undefined;
+    });
+  }
+  if (args.waitMs <= 0) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([active.inFlight, new Promise<void>(resolve => { timer = setTimeout(resolve, args.waitMs); })]);
+  clearTimeout(timer);
 }
 
 /** Gives a bytedcli identity the person's Meego store, only while Meego is a
@@ -552,9 +731,33 @@ export const NOT_AUTHORIZED_MAX_RETRIES = 20;
 const TRANSIENT_REFUSAL_TTL_MS = 2 * 60 * 60 * 1000;
 const TRANSIENT_REFUSAL_MAX_ENTRIES = 1000;
 
+type RetryableRefusalSource = 'platform' | 'local';
 type RetryableRefusalKind = 'unavailable' | 'not_authorized';
 
+/** Refusal reasons that {@link adoptLocalBytedcliAuthorization} may replace
+ *  with the turn sender's freshly minted local ByteCloud identity. Policy,
+ *  membership, unattended, and delegation denials are deliberately excluded. */
+const LOCAL_ADOPTABLE_BYTEDCLI_REASONS = ['not_authorized', 'provider_unavailable'] as const;
+
+function localCredentialSourceAllowed(policy: IdentityPolicy, tool: TriggerUserAuthTool): boolean {
+  const source = policy.credentialSources[capabilityOfTool(tool)];
+  return source === 'local' || (source === 'auto' && !platformAuthorizeUrl());
+}
+
+function stampedOpenIdOf(body: string | undefined): string | undefined {
+  if (!body) return undefined;
+  const prefix = 'BOTMUX_IDENTITY_OPEN_ID=';
+  for (const line of body.split('\n')) {
+    if (!line.startsWith(prefix)) continue;
+    const quoted = line.slice(prefix.length);
+    if (quoted.length < 2 || !quoted.startsWith("'") || !quoted.endsWith("'")) return undefined;
+    return quoted.slice(1, -1).replaceAll("'\\''", "'");
+  }
+  return undefined;
+}
+
 interface TransientRefusal {
+  source: RetryableRefusalSource;
   botConfig: BotConfig;
   tool: TriggerUserAuthTool;
   /** Which refusal was published; decides the pace and what a re-ask may keep. */
@@ -606,9 +809,12 @@ function rememberTransientRefusal(entry: Omit<TransientRefusal, 'body' | 'authEp
   transientRefusals.delete(key);
   transientRefusals.set(key, {
     ...entry, body, authEpoch: readCliAuthEpoch(entry.senderOpenId),
-    // An outage is re-asked on the turn's first call; "not authorized yet" was
-    // itself just asked, so its spacing starts now.
-    createdAt: now, lastAttemptAt: entry.kind === 'not_authorized' ? now : Number.NEGATIVE_INFINITY, retries: 0,
+    // A platform outage is re-asked on the turn's first call; "not authorized yet"
+    // and a local bytedcli outage start their cooldown from the refusal itself so
+    // a fresh 30s local CLI timeout is not repeated immediately on the next second.
+    createdAt: now,
+    lastAttemptAt: (entry.kind === 'not_authorized' || entry.source === 'local') ? now : Number.NEGATIVE_INFINITY,
+    retries: 0,
   });
   while (transientRefusals.size > TRANSIENT_REFUSAL_MAX_ENTRIES) {
     const oldest = transientRefusals.keys().next().value;
@@ -619,18 +825,21 @@ function rememberTransientRefusal(entry: Omit<TransientRefusal, 'body' | 'authEp
 
 /**
  * Called by the proven identity route before it serves a turn's identity. When
- * what is in force is a transient platform refusal this module published, ask
- * the platform again and publish the answer if the refusal is still the one in
- * force. Each refusal keeps its own pace: an `unavailable` refusal is re-asked
- * right away and then at most once per {@link TRANSIENT_REFUSAL_RETRY_INTERVAL_MS},
- * while a `not_authorized` refusal waits {@link NOT_AUTHORIZED_RETRY_INTERVAL_MS}
- * from the refusal itself, including before its first re-ask. Concurrent callers
- * share one attempt; no caller waits longer than
+ * what is in force is a transient refusal this module published (platform outage,
+ * platform "not authorized yet", or local `bytedcli` provider outage), ask the
+ * credential source again and publish the answer if the refusal is still the
+ * one in force. Each refusal keeps its own pace: a platform `unavailable`
+ * refusal is re-asked right away and then at most once per
+ * {@link TRANSIENT_REFUSAL_RETRY_INTERVAL_MS}; a local `bytedcli` `unavailable`
+ * refusal waits {@link TRANSIENT_REFUSAL_RETRY_INTERVAL_MS} from the refusal
+ * itself; a `not_authorized` refusal waits
+ * {@link NOT_AUTHORIZED_RETRY_INTERVAL_MS} from the refusal itself. Concurrent
+ * callers share one attempt; no caller waits longer than
  * {@link TRANSIENT_REFUSAL_WAIT_CAP_MS}. Never throws.
  *
  * `currentPolicy` — not `botConfig` — is what decides whether a re-ask may run
  * and whether its answer may be written: a bot policy changed mid-turn (tool no
- * longer governed, source switched to local) ends the re-asks instead of
+ * longer governed, source switched away) ends the re-asks instead of
  * publishing under the policy the turn started with. `botConfig` is only the
  * fallback for a caller with no registry reader.
  */
@@ -682,7 +891,7 @@ function stillInForce(entry: TransientRefusal): boolean {
 }
 
 /** Does the bot's policy — read NOW, not when the refusal was published — still
- *  take this tool's credentials from the platform?
+ *  take this tool's credentials from the entry's source?
  *
  *  Dashboard writes replace the whole bot config object
  *  (`bots.set(appId, { config: cfg, … })`), so a snapshot taken at publication
@@ -703,7 +912,77 @@ function policyStillWants(
     policy = (fallbackConfig ?? entry.botConfig).triggerUserAuth;
   }
   const current = policyFromConfig(policy);
-  return current.capabilities.has(capabilityOfTool(entry.tool)) && current.credentialSource !== 'local' ? current : undefined;
+  const capability = capabilityOfTool(entry.tool);
+  if (!current.capabilities.has(capability)) return undefined;
+  return entry.source === 'local'
+    ? (localCredentialSourceAllowed(current, entry.tool) ? current : undefined)
+    : (current.credentialSources[capability] !== 'local' ? current : undefined);
+}
+
+function localBytedcliPolicy(
+  live: (() => TriggerUserAuthConfig | undefined) | undefined,
+  fallbackConfig: BotConfig,
+): IdentityPolicy | undefined {
+  let policy: TriggerUserAuthConfig | undefined;
+  if (live) {
+    try { policy = live(); } catch { return undefined; }
+  } else {
+    policy = fallbackConfig.triggerUserAuth;
+  }
+  const current = policyFromConfig(policy);
+  return current.capabilities.has('bytecloud') && localCredentialSourceAllowed(current, 'bytedcli') ? current : undefined;
+}
+
+async function runLocalTransientRetry(
+  key: string,
+  entry: TransientRefusal,
+  live: (() => TriggerUserAuthConfig | undefined) | undefined,
+  fallbackConfig: BotConfig | undefined,
+  drop: () => void,
+): Promise<void> {
+  try {
+    const identity = await resolveIdentityFor(entry.tool, entry.botConfig, entry.senderOpenId);
+    // Compare-and-set: synchronous from here to the write.
+    const wanted = policyStillWants(live, entry, fallbackConfig);
+    if (transientRefusals.get(key) !== entry || !stillInForce(entry) || !wanted || !publicationValid(entry.validateBeforeWrite)) {
+      drop();
+      return;
+    }
+    if (identity) {
+      const stamped = withMeegoStore(
+        { ...identity, turnId: entry.turnId, openId: entry.senderOpenId },
+        wanted,
+      );
+      writeSessionIdentity(entry.sessionDataDir, entry.sessionId, stamped, 'proven');
+      if (stamped.tool === 'bytedcli' && !('mode' in stamped)) {
+        trackBytedcliIdentityRenewal({
+          sessionDataDir: entry.sessionDataDir, sessionId: entry.sessionId,
+          credentialOpenId: entry.senderOpenId, identity: { ...stamped, turnId: entry.turnId },
+          validateBeforeWrite: entry.validateBeforeWrite,
+        });
+      }
+      drop();
+      logger.info(`[trigger-user-auth] local ${entry.tool} identity recovered for session ${entry.sessionId} on retry`);
+      return;
+    }
+    // The local provider is reachable again and definitively reports that this
+    // person has no active authorization: replace the outage refusal with the
+    // ordinary refusal so the wrapper/user sees the right next step.
+    if (isUnattendedIdentityTurnId(entry.turnId)) {
+      denyUnattended(entry.tool, entry.botConfig, entry.sessionDataDir, entry.sessionId,
+        entry.senderOpenId, entry.locale, entry.turnId, 'proven');
+    } else {
+      writeDenial(entry.sessionDataDir, entry.sessionId, entry.tool, entry.senderOpenId,
+        entry.botConfig, entry.locale, entry.turnId, 'proven', undefined, undefined, 'not_authorized');
+    }
+    drop();
+  } catch (e) {
+    // Anchor the next cooldown to when the failed CLI call finished, so a 30s
+    // timeout cannot immediately trigger another 30s timeout on the next call.
+    entry.lastAttemptAt = Date.now();
+    logger.warn(`[trigger-user-auth] local retry of ${entry.tool} identity failed for session ${entry.sessionId}: `
+      + `${e instanceof Error ? e.message : String(e)}`);
+  }
 }
 
 async function runTransientRetry(
@@ -715,6 +994,10 @@ async function runTransientRetry(
   // Only ever drop THIS entry: a republication of the same turn registers a
   // fresh one under the same key, which an older attempt must not erase.
   const drop = () => { if (transientRefusals.get(key) === entry) transientRefusals.delete(key); };
+  if (entry.source === 'local') {
+    await runLocalTransientRetry(key, entry, live, fallbackConfig, drop);
+    return;
+  }
   try {
     const platform = await resolvePlatformIdentity({
       botConfig: entry.botConfig, tool: entry.tool, openId: entry.senderOpenId,
@@ -736,9 +1019,9 @@ async function runTransientRetry(
         drop();
         return;
       }
-      writeSessionIdentity(entry.sessionDataDir, entry.sessionId, withMeegoStore(
+      writeProvenPlatformIdentity(entry, withMeegoStore(
         { ...platform.identity, turnId: entry.turnId, openId: entry.senderOpenId },
-        wanted), 'proven');
+        wanted), platform.unionId);
       drop();
       logger.info(`[trigger-user-auth] platform ${entry.tool} grant recovered for session ${entry.sessionId} on retry`);
       return;
@@ -762,7 +1045,10 @@ async function runTransientRetry(
     drop();
     if (platform.state === 'not_authorized' && !isUnattendedIdentityTurnId(entry.turnId)) {
       const { botConfig, tool, sessionDataDir, sessionId, senderOpenId, locale, turnId, validateBeforeWrite } = entry;
-      rememberTransientRefusal({ botConfig, tool, sessionDataDir, sessionId, senderOpenId, locale, turnId, validateBeforeWrite, ...refusalKindOf(platform) });
+      rememberTransientRefusal({
+        source: 'platform',
+        botConfig, tool, sessionDataDir, sessionId, senderOpenId, locale, turnId, validateBeforeWrite, ...refusalKindOf(platform),
+      });
     }
   } catch (e) {
     logger.warn(`[trigger-user-auth] retry of ${entry.tool} identity failed for session ${entry.sessionId}: `
@@ -771,10 +1057,17 @@ async function runTransientRetry(
 }
 
 /**
- * The person finished a local ByteCloud login while this turn runs: replace the
- * turn's "not authorized" refusal with their identity so the retry of the
- * refused command succeeds in this turn. Returns false (leaving the turn as
- * is) when the turn does not hold that refusal or the login yields no identity.
+ * The person finished a local ByteCloud login (or the local bytedcli provider
+ * recovered from a transient outage) while this turn runs: replace the turn's
+ * adoptable refusal (`not_authorized` or `provider_unavailable`) with their
+ * identity so the retry of the refused command succeeds in this turn.
+ *
+ * Returns `'none'` (leaving the turn as is) when the turn does not hold an
+ * adoptable refusal, belongs to another principal/delegation/unattended run,
+ * or the person definitely has no local login; returns `'superseded'` when a
+ * live policy, delegation, credential epoch, or published snapshot changed
+ * around the mint; returns `'unavailable'` when minting fails transiently so
+ * the caller does not report ready or throw HTTP 500.
  */
 export async function adoptLocalBytedcliAuthorization(args: {
   sessionDataDir: string;
@@ -782,24 +1075,63 @@ export async function adoptLocalBytedcliAuthorization(args: {
   turnId: string;
   botConfig: BotConfig;
   senderOpenId: string;
+  currentPolicy?: () => TriggerUserAuthConfig | undefined;
 }): Promise<AdoptResult> {
-  const { sessionDataDir, sessionId, turnId, botConfig, senderOpenId } = args;
-  const policy = policyFromConfig(botConfig.triggerUserAuth);
+  const { sessionDataDir, sessionId, turnId, botConfig, senderOpenId, currentPolicy } = args;
+  if (isUnattendedIdentityTurnId(turnId) || getLarkToolDelegation(sessionDataDir, sessionId, turnId)) {
+    return 'none';
+  }
+  const initialPolicy = localBytedcliPolicy(currentPolicy, botConfig);
+  // With no live reader this is simply a caller whose static policy is not
+  // locally adoptable. A live reader, however, means the request's config was
+  // already superseded (or can no longer be read): never promise next-turn use.
+  if (!initialPolicy) return currentPolicy ? 'superseded' : 'none';
   const before = recallProvenIdentityContent(sessionDataDir, sessionId, turnId, 'bytedcli');
+  const stampedOwner = stampedOpenIdOf(before);
+  if (stampedOwner && stampedOwner !== senderOpenId) return 'none';
   if (before?.includes("BOTMUX_IDENTITY_MODE='user'")) return 'already';
-  if (!hasReason(before, ['not_authorized'])) return 'none';
-  const identity = await resolveIdentityFor('bytedcli', botConfig, senderOpenId);
-  if (!identity || recallProvenIdentityContent(sessionDataDir, sessionId, turnId, 'bytedcli') !== before) return 'none';
-  const stamped = withMeegoStore({ ...identity, turnId, openId: senderOpenId }, policy);
+  if (!hasReason(before, LOCAL_ADOPTABLE_BYTEDCLI_REASONS)) return 'none';
+  const epochBefore = readCliAuthEpoch(senderOpenId);
+  let identity: CliIdentity | null;
+  try {
+    identity = await resolveIdentityFor('bytedcli', botConfig, senderOpenId);
+  } catch (e) {
+    logger.warn(
+      `[trigger-user-auth] could not adopt local bytedcli identity for session ${sessionId}: `
+      + `${e instanceof Error ? e.message : String(e)}`,
+    );
+    return 'unavailable';
+  }
+  const after = recallProvenIdentityContent(sessionDataDir, sessionId, turnId, 'bytedcli');
+  const livePolicy = localBytedcliPolicy(currentPolicy, botConfig);
+  if (!livePolicy || getLarkToolDelegation(sessionDataDir, sessionId, turnId)) return 'superseded';
+  if (readCliAuthEpoch(senderOpenId) !== epochBefore) return 'superseded';
+  if (after !== before) {
+    // Another concurrent adoption or local transient retry already installed
+    // this same person's identity for this turn.
+    if (after?.includes("BOTMUX_IDENTITY_MODE='user'") && stampedOpenIdOf(after) === senderOpenId) {
+      return 'already';
+    }
+    return 'superseded';
+  }
+  if (!identity) return 'none';
+  const stamped = withMeegoStore({ ...identity, turnId, openId: senderOpenId }, livePolicy);
   writeSessionIdentity(sessionDataDir, sessionId, stamped, 'proven');
+  transientRefusals.delete(transientKey(sessionDataDir, sessionId, turnId, 'bytedcli'));
   if (stamped.tool === 'bytedcli' && !('mode' in stamped)) {
     trackBytedcliIdentityRenewal({ sessionDataDir, sessionId, credentialOpenId: senderOpenId, identity: stamped });
   }
   return 'adopted';
 }
 
-/** `already`: the turn already holds the person's identity, so there is nothing to take up. */
-export type AdoptResult = 'adopted' | 'already' | 'none';
+/**
+ * - `adopted`: the turn's refusal was replaced with the person's identity.
+ * - `already`: the turn already holds the person's identity, so there is nothing to take up.
+ * - `unavailable`: minting the turn's personal JWT failed transiently; do not report ready.
+ * - `superseded`: policy, delegation, credential epoch, or the published snapshot changed around the mint.
+ * - `none`: the turn does not hold an adoptable refusal, or the person definitely has no local login.
+ */
+export type AdoptResult = 'adopted' | 'already' | 'none' | 'unavailable' | 'superseded';
 
 /** @internal test-only */
 export function __resetTransientRefusalsForTest(): void {

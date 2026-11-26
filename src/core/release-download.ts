@@ -18,9 +18,17 @@
  */
 import { request as httpsRequest } from 'node:https';
 import { request as httpRequest, type IncomingMessage } from 'node:http';
+import { isIP } from 'node:net';
 import { connect as tlsConnect } from 'node:tls';
 import { Buffer } from 'node:buffer';
 import { readGlobalConfig } from '../global-config.js';
+
+/** Strip WHATWG URL brackets around IPv6 literals (`[::1]` → `::1`).
+ * `node:http` passes `options.host` straight to `net.connect` / `dns.lookup`,
+ * where literal brackets fail with `ENOTFOUND` on both Node and Bun. */
+export function stripHostBrackets(hostname: string): string {
+  return hostname.startsWith('[') && hostname.endsWith(']') ? hostname.slice(1, -1) : hostname;
+}
 
 /** Resolve an outbound proxy: GitHub downloads prefer explicit config, then
  * standard env vars. Registry requests opt out of the GitHub-only config. */
@@ -94,6 +102,8 @@ export function getReleaseStream(
     if (hopProxy) {
       try { p = new URL(hopProxy); } catch { reject(new Error(`代理地址非法: ${hopProxy}`)); return; }
     }
+    const proxyHost = p ? stripHostBrackets(p.hostname) : undefined;
+    const proxyPort = p ? Number(p.port || 80) : undefined;
     const proxyAuth = (): Record<string, string> => p?.username
       ? { 'proxy-authorization': `Basic ${Buffer.from(`${decodeURIComponent(p.username)}:${decodeURIComponent(p.password)}`).toString('base64')}` }
       : {};
@@ -102,7 +112,7 @@ export function getReleaseStream(
       // HTTPS via HTTP proxy: open a CONNECT tunnel, then TLS over the socket.
       const port = target.port || '443';
       const creq = httpRequest({
-        host: p.hostname, port: Number(p.port || 80), method: 'CONNECT', agent: false,
+        host: proxyHost, port: proxyPort, method: 'CONNECT', agent: false,
         signal: options.signal,
         path: `${target.hostname}:${port}`,
         headers: { host: `${target.hostname}:${port}`, ...proxyAuth() },
@@ -110,7 +120,10 @@ export function getReleaseStream(
       creq.on('connect', (cres, socket) => {
         if (cres.statusCode !== 200) { socket.destroy(); reject(new Error(`代理 CONNECT 失败: HTTP ${cres.statusCode}`)); return; }
         if (options.signal?.aborted) { socket.destroy(); reject(options.signal.reason); return; }
-        const tls = tlsConnect({ socket, servername: target.hostname }, () => {
+        const targetHost = stripHostBrackets(target.hostname);
+        // `host` sets the certificate identity even with an existing socket.
+        // Without it Node verifies IP targets as localhost when SNI is omitted.
+        const tls = tlsConnect({ socket, host: targetHost, ...(isIP(targetHost) ? {} : { servername: targetHost }) }, () => {
           const greq = httpsRequest({
             method: 'GET', path: `${target.pathname}${target.search}`,
             headers: { ...options.headers, host: target.host, 'user-agent': userAgent },
@@ -135,7 +148,7 @@ export function getReleaseStream(
     if (p) {
       // Plain HTTP via proxy: send the absolute-form request line to the proxy.
       const greq = httpRequest({
-        host: p.hostname, port: Number(p.port || 80), method: 'GET', path: rawUrl,
+        host: proxyHost, port: proxyPort, method: 'GET', path: rawUrl,
         headers: { ...options.headers, host: target.host, 'user-agent': userAgent, ...proxyAuth() },
         signal: options.signal,
       }, handle);

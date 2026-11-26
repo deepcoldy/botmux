@@ -1,0 +1,697 @@
+import { EventEmitter } from 'node:events';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+const { finalizeCotMessageMock, cotFinishStatuses, botState } = vi.hoisted(() => {
+  const statuses = new Map<string, 'done' | 'interrupted'>();
+  return {
+    cotFinishStatuses: statuses,
+    finalizeCotMessageMock: vi.fn((_ds: unknown, turnId: string, status: string, dispatchAttempt?: number) => {
+      const key = `${turnId}|${dispatchAttempt ?? ''}`;
+      if (!statuses.has(key)) statuses.set(key, status === 'completed' ? 'done' : 'interrupted');
+    }),
+    botState: {
+      cliId: 'antigravity' as string,
+      env: undefined as Record<string, string> | undefined,
+      dshRuntime: undefined as 'official' | 'tui' | undefined,
+    },
+  };
+});
+
+vi.mock('../src/im/lark/cot-message.js', () => ({
+  handleCotThinkingUpdate: vi.fn(),
+  handleCotThinkingSuperseded: vi.fn(),
+  finalizeCotMessage: (...args: unknown[]) => finalizeCotMessageMock(...args),
+  cotMessageFinishStatus: (_ds: unknown, binding: { turnId: string; dispatchAttempt?: number }) =>
+    cotFinishStatuses.get(`${binding.turnId}|${binding.dispatchAttempt ?? ''}`),
+  abortCotMessage: vi.fn(),
+  resumeCotMessage: vi.fn(),
+  cotMessageCarriesTurn: vi.fn(() => false),
+  hasCotMessageForTurn: vi.fn(() => false),
+  prepareCotMessageBeforeReply: vi.fn(),
+}));
+
+vi.mock('../src/im/lark/client.js', () => ({
+  updateMessage: vi.fn(async () => {}),
+  deleteMessage: vi.fn(async () => {}),
+  MessageWithdrawnError: class extends Error {},
+}));
+
+vi.mock('../src/im/lark/card-builder.js', () => ({
+  buildStreamingCard: vi.fn(() => '{"type":"streaming"}'),
+  buildSessionCard: vi.fn(() => '{"type":"session"}'),
+  buildTuiPromptCard: vi.fn(() => '{"type":"tui"}'),
+  buildTuiPromptResolvedCard: vi.fn(() => '{"type":"tui-resolved"}'),
+  getCliDisplayName: vi.fn(() => 'Antigravity'),
+}));
+
+vi.mock('../src/bot-registry.js', () => ({
+  getBot: vi.fn(() => ({
+    config: {
+      larkAppId: 'app_test', larkAppSecret: 'secret', cliId: botState.cliId,
+      ...(botState.env ? { env: botState.env } : {}),
+      ...(botState.dshRuntime ? { dshRuntime: botState.dshRuntime } : {}),
+    },
+    resolvedAllowedUsers: [],
+    botOpenId: 'ou_bot',
+    botName: 'Castor',
+  })),
+  getAllBots: vi.fn(() => []),
+}));
+
+vi.mock('../src/config.js', () => ({
+  config: {
+    web: { externalHost: 'localhost' },
+    session: { dataDir: '/tmp/test-sessions' },
+    daemon: { backendType: 'tmux', cliId: 'antigravity' },
+  },
+}));
+
+vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
+  closeSession: vi.fn(),
+  updateSession: vi.fn(),
+  updateSessionPid: vi.fn(),
+}));
+
+vi.mock('../src/services/frozen-card-store.js', () => ({
+  loadFrozenCards: vi.fn(() => new Map()),
+  saveFrozenCards: vi.fn(),
+}));
+
+vi.mock('../src/core/session-manager.js', () => ({
+  ensureSessionWhiteboard: vi.fn(),
+  persistStreamCardState: vi.fn(),
+}));
+
+vi.mock('../src/core/dashboard-events.js', () => ({
+  dashboardEventBus: { publish: vi.fn() },
+}));
+
+vi.mock('../src/core/dashboard-rows.js', () => ({
+  composeRowFromActive: vi.fn(() => ({ tokenUsage: null })),
+}));
+
+vi.mock('../src/skills/installer.js', () => ({
+  ensureSkills: vi.fn(),
+}));
+
+vi.mock('../src/adapters/backend/tmux-backend.js', () => ({
+  TmuxBackend: class {},
+}));
+
+vi.mock('../src/utils/logger.js', () => ({
+  logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
+}));
+
+vi.mock('@larksuiteoapi/node-sdk', () => ({
+  Client: class {},
+  WSClient: class { start() {} },
+  EventDispatcher: class { register() {} },
+  LoggerLevel: { info: 2 },
+}));
+
+import { __testOnly_setSuspendBackingVerifier, __testOnly_setupWorkerHandlers, initWorkerPool, killWorker, suspendWorker } from '../src/core/worker-pool.js';
+import { dashboardEventBus } from '../src/core/dashboard-events.js';
+import type { DaemonSession } from '../src/core/types.js';
+import { loadWorkerPoolFunction } from './helpers/worker-pool-function-harness.js';
+
+interface SetupOptions {
+  cliId?: string;
+  promptInjection?: 'default' | 'none';
+  adopted?: boolean;
+  agyTransport?: 'terminal' | 'acp';
+  dshRuntime?: 'official' | 'tui';
+  backendType?: 'tmux' | 'remote-runner';
+  scratch?: boolean;
+}
+
+function setup(opts: SetupOptions = {}) {
+  const cliId = opts.cliId ?? 'antigravity';
+  botState.cliId = cliId;
+  botState.env = opts.agyTransport ? { AGY_BOTMUX_TRANSPORT: opts.agyTransport } : undefined;
+  botState.dshRuntime = opts.dshRuntime;
+  const worker = Object.assign(new EventEmitter(), {
+    killed: false, send: vi.fn(), kill: vi.fn(), pid: 4242,
+    stdout: new EventEmitter(), stderr: new EventEmitter(),
+  });
+  const ds = {
+    session: {
+      sessionId: 'sid-cot-held',
+      rootMessageId: 'om_root',
+      chatId: 'oc_chat',
+      status: 'active',
+      createdAt: new Date().toISOString(),
+      chatType: 'p2p',
+      cliId,
+      workingDir: '/repo',
+      backendType: opts.backendType ?? 'tmux',
+      ...(opts.scratch ? { sandbox: 'scratch' } : {}),
+      ...(opts.promptInjection ? { promptInjection: opts.promptInjection } : {}),
+      ...(opts.adopted ? { adoptedFrom: { source: 'tmux', paneId: '%1' } } : {}),
+    },
+    worker,
+    workerPort: 9999,
+    workerToken: 'tok',
+    larkAppId: 'app_test',
+    chatId: 'oc_chat',
+    chatType: 'p2p',
+    scope: 'chat',
+    spawnedAt: 1,
+    lastMessageAt: 2,
+    hasHistory: false,
+    workingDir: '/repo',
+    displayMode: 'hidden',
+    lastScreenContent: 'working',
+    lastScreenStatus: 'working',
+    activeTurnId: 'om_turn',
+    activeDispatchAttempt: 1,
+    ...(opts.adopted ? { adoptedFrom: { source: 'tmux', paneId: '%1' } } : {}),
+  } as unknown as DaemonSession;
+  initWorkerPool({
+    sessionReply: vi.fn(async () => 'om_reply'),
+    getSessionWorkingDir: () => '/repo',
+    getActiveCount: () => 1,
+    closeSession: vi.fn(),
+  } as any);
+  __testOnly_setupWorkerHandlers(ds, worker as any);
+  return { ds, worker };
+}
+
+function terminal(worker: EventEmitter, extra: Record<string, unknown> = {}): void {
+  worker.emit('message', {
+    type: 'turn_terminal', sessionId: 'sid-cot-held', turnId: 'om_turn', dispatchAttempt: 1, status: 'completed', ...extra,
+  });
+}
+
+function screen(worker: EventEmitter, backgroundTasks?: number): void {
+  worker.emit('message', {
+    type: 'screen_update', content: 'ready', status: 'idle', turnId: 'om_turn', dispatchAttempt: 1,
+    ...(backgroundTasks ? { backgroundTasks } : {}),
+  });
+}
+
+async function startupCircuit(worker: EventEmitter): Promise<void> {
+  for (let i = 0; i < 2; i++) {
+    await Promise.all(worker.listeners('message').map(listener => listener.call(worker, {
+      type: 'claude_exit', code: 1, startupFailure: true, turnId: 'om_turn', dispatchAttempt: 1,
+    })));
+  }
+}
+
+describe('CoT message of a turn that ended with background tasks running', () => {
+  beforeEach(() => {
+    cotFinishStatuses.clear();
+    vi.clearAllMocks();
+  });
+
+  it('closes the CoT message at the terminal when no background task runs', () => {
+    const { ds, worker } = setup({ cliId: 'claude-code' });
+    terminal(worker);
+    expect(finalizeCotMessageMock).toHaveBeenCalledWith(ds, 'om_turn', 'completed', 1);
+  });
+
+  it('keeps the CoT message open until the background task count reaches 0', () => {
+    const { ds, worker } = setup({ cliId: 'claude-code' });
+    terminal(worker, { backgroundTasks: 1 });
+    screen(worker, 1);
+    expect(finalizeCotMessageMock).not.toHaveBeenCalled();
+    screen(worker);
+    expect(finalizeCotMessageMock).toHaveBeenCalledTimes(1);
+    expect(finalizeCotMessageMock).toHaveBeenCalledWith(ds, 'om_turn', 'completed', 1);
+    screen(worker);
+    expect(finalizeCotMessageMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['reply_first', 'background_first'] as const)(
+    'requires both the exact durable reply and background zero before closing CoT (%s)', order => {
+      const scope = { finalizeCotMessage: finalizeCotMessageMock } as Record<string, unknown>;
+      const hold = loadWorkerPoolFunction<(
+        ds: DaemonSession,
+        msg: { turnId: string; status: 'completed'; dispatchAttempt: number; backgroundTasks: number },
+        opts: { replyPending: boolean },
+      ) => void>('finalizeOrHoldCotMessage', scope);
+      const settleReply = loadWorkerPoolFunction<(
+        ds: DaemonSession,
+        turnId: string,
+        dispatchAttempt: number,
+      ) => boolean>('settleRequiredReplyCotMessage', scope);
+      const settleBackground = loadWorkerPoolFunction<(
+        ds: DaemonSession,
+      ) => void>('settleRequiredReplyBackground', scope);
+      const ds = {} as DaemonSession;
+
+      hold(ds, { turnId: 'om_required', status: 'completed', dispatchAttempt: 2, backgroundTasks: 1 },
+        { replyPending: true });
+      expect([...ds.requiredReplyCotHolds!.values()]).toEqual([{
+        turnId: 'om_required', dispatchAttempt: 2, finishStatus: 'completed',
+        replyPending: true, backgroundPending: true,
+      }]);
+
+      if (order === 'reply_first') {
+        expect(settleReply(ds, 'om_required', 2)).toBe(true);
+        expect(finalizeCotMessageMock).not.toHaveBeenCalled();
+        settleBackground(ds);
+      } else {
+        settleBackground(ds);
+        expect([...ds.requiredReplyCotHolds!.values()]).toEqual([{
+          turnId: 'om_required', dispatchAttempt: 2, finishStatus: 'completed',
+          replyPending: true, backgroundPending: false,
+        }]);
+        expect(finalizeCotMessageMock).not.toHaveBeenCalled();
+        expect(settleReply(ds, 'om_required', 2)).toBe(true);
+      }
+
+      expect(finalizeCotMessageMock).toHaveBeenCalledExactlyOnceWith(
+        ds, 'om_required', 'completed', 2,
+      );
+      expect(ds.requiredReplyCotHolds).toBeUndefined();
+    },
+  );
+
+  it('tracks a reply-only required turn so CLI loss can close it', () => {
+    const scope = { finalizeCotMessage: finalizeCotMessageMock } as Record<string, unknown>;
+    const hold = loadWorkerPoolFunction<(
+      ds: DaemonSession,
+      msg: { turnId: string; status: 'completed'; dispatchAttempt: number; backgroundTasks?: number },
+      opts: { replyPending: true },
+    ) => void>('finalizeOrHoldCotMessage', scope);
+    const loseCli = loadWorkerPoolFunction<(ds: DaemonSession) => boolean>(
+      'settleBackgroundStateOnCliLoss', scope,
+    );
+    const ds = {} as DaemonSession;
+
+    hold(ds, { turnId: 'om_reply_only', status: 'completed', dispatchAttempt: 4 },
+      { replyPending: true });
+
+    expect([...ds.requiredReplyCotHolds!.values()]).toEqual([{
+      turnId: 'om_reply_only', dispatchAttempt: 4, finishStatus: 'completed',
+      replyPending: true, backgroundPending: false,
+    }]);
+    loseCli(ds);
+    expect(finalizeCotMessageMock).toHaveBeenCalledExactlyOnceWith(
+      ds, 'om_reply_only', 'failed', 4,
+    );
+    expect(ds.requiredReplyCotHolds).toBeUndefined();
+  });
+
+  it('keeps a delivered required turn completed when graceful CLI retirement clears its background hold', () => {
+    const scope = { finalizeCotMessage: finalizeCotMessageMock } as Record<string, unknown>;
+    const loseCli = loadWorkerPoolFunction<(ds: DaemonSession) => boolean>(
+      'settleBackgroundStateOnCliLoss', scope,
+    );
+    const ds = {
+      backgroundTaskCount: 1,
+      requiredReplyCotHolds: new Map([['om_delivered\0' + 2, {
+        turnId: 'om_delivered', dispatchAttempt: 2, finishStatus: 'completed' as const,
+        replyPending: false, backgroundPending: true,
+      }]]),
+    } as unknown as DaemonSession;
+
+    expect(loseCli(ds)).toBe(true);
+    expect(finalizeCotMessageMock).toHaveBeenCalledExactlyOnceWith(
+      ds, 'om_delivered', 'completed', 2,
+    );
+    expect(ds.requiredReplyCotHolds).toBeUndefined();
+  });
+
+  it('holds the synthetic required-reply failure until background zero', () => {
+    const scope = { finalizeCotMessage: finalizeCotMessageMock } as Record<string, unknown>;
+    const hold = loadWorkerPoolFunction<(
+      ds: DaemonSession,
+      msg: { turnId: string; status: 'completed'; dispatchAttempt: number; backgroundTasks: number },
+      opts: { finishStatus: 'failed' },
+    ) => void>('finalizeOrHoldCotMessage', scope);
+    const settleBackground = loadWorkerPoolFunction<(
+      ds: DaemonSession,
+    ) => void>('settleRequiredReplyBackground', scope);
+    const ds = {} as DaemonSession;
+
+    hold(ds, { turnId: 'om_empty', status: 'completed', dispatchAttempt: 3, backgroundTasks: 1 },
+      { finishStatus: 'failed' });
+    expect(finalizeCotMessageMock).not.toHaveBeenCalled();
+    settleBackground(ds);
+    expect(finalizeCotMessageMock).toHaveBeenCalledExactlyOnceWith(ds, 'om_empty', 'failed', 3);
+  });
+
+  it('cancels the delayed missing-reply closure when a durable final arrives', () => {
+    const publishMissing = vi.fn();
+    const scope = { finalizeCotMessage: finalizeCotMessageMock } as Record<string, unknown>;
+    const hold = loadWorkerPoolFunction<(
+      ds: DaemonSession,
+      msg: { turnId: string; status: 'completed'; dispatchAttempt: number; backgroundTasks: number },
+      opts: { finishStatus: 'failed' },
+    ) => void>('finalizeOrHoldCotMessage', scope);
+    const settleReply = loadWorkerPoolFunction<(
+      ds: DaemonSession,
+      turnId: string,
+      dispatchAttempt: number,
+    ) => boolean>('settleRequiredReplyCotMessage', scope);
+    const settleBackground = loadWorkerPoolFunction<(
+      ds: DaemonSession,
+    ) => void>('settleRequiredReplyBackground', scope);
+    const key = 'om_empty\0' + 3;
+    const ds = {
+      pendingRequiredReplyMissingReceipts: new Map([[key, {
+        turnId: 'om_empty', dispatchAttempt: 3, publish: publishMissing,
+      }]]),
+    } as unknown as DaemonSession;
+
+    hold(ds, { turnId: 'om_empty', status: 'completed', dispatchAttempt: 3, backgroundTasks: 1 },
+      { finishStatus: 'failed' });
+    expect(settleReply(ds, 'om_empty', 3)).toBe(true);
+    settleBackground(ds);
+
+    expect(publishMissing).not.toHaveBeenCalled();
+    expect(ds.pendingRequiredReplyMissingReceipts).toBeUndefined();
+    expect(finalizeCotMessageMock).toHaveBeenCalledExactlyOnceWith(ds, 'om_empty', 'completed', 3);
+  });
+
+  it('does not let a later terminal evict an older required-reply hold', () => {
+    const scope = { finalizeCotMessage: finalizeCotMessageMock } as Record<string, unknown>;
+    const hold = loadWorkerPoolFunction<(
+      ds: DaemonSession,
+      msg: { turnId: string; status: 'completed'; dispatchAttempt: number; backgroundTasks?: number },
+      opts?: { replyPending?: boolean },
+    ) => void>('finalizeOrHoldCotMessage', scope);
+    const ds = {} as DaemonSession;
+
+    hold(ds, { turnId: 'om_required', status: 'completed', dispatchAttempt: 2, backgroundTasks: 1 },
+      { replyPending: true });
+    hold(ds, { turnId: 'om_newer', status: 'completed', dispatchAttempt: 1 });
+
+    expect(finalizeCotMessageMock).toHaveBeenCalledExactlyOnceWith(ds, 'om_newer', 'completed', 1);
+    expect([...ds.requiredReplyCotHolds!.values()]).toEqual([expect.objectContaining({
+      turnId: 'om_required', dispatchAttempt: 2, replyPending: true,
+    })]);
+  });
+
+  it.each(['reply_first', 'background_first'] as const)(
+    'settles an older required hold when aggregate zero is attributed to a newer turn (%s)', order => {
+      const { ds, worker } = setup({ cliId: 'claude-code' });
+      const scope = { finalizeCotMessage: finalizeCotMessageMock } as Record<string, unknown>;
+      const settleReply = loadWorkerPoolFunction<(
+        ds: DaemonSession,
+        turnId: string,
+        dispatchAttempt: number,
+      ) => boolean>('settleRequiredReplyCotMessage', scope);
+      ds.requiredReplyCotHolds = new Map([['om_older\0' + 2, {
+        turnId: 'om_older',
+        dispatchAttempt: 2,
+        finishStatus: 'completed',
+        replyPending: order === 'background_first',
+        backgroundPending: true,
+      }]]);
+
+      // The later terminal and zero frame both carry om_turn, but the
+      // worker-level tracker draining also settles the older om_older hold.
+      terminal(worker);
+      screen(worker);
+
+      if (order === 'background_first') {
+        expect(ds.requiredReplyCotHolds?.get('om_older\0' + 2)).toEqual(expect.objectContaining({
+          replyPending: true,
+          backgroundPending: false,
+        }));
+        expect(settleReply(ds, 'om_older', 2)).toBe(true);
+      }
+      expect(finalizeCotMessageMock).toHaveBeenCalledWith(ds, 'om_older', 'completed', 2);
+      expect(ds.requiredReplyCotHolds).toBeUndefined();
+    },
+  );
+
+  it('settles every required hold when the worker-level background count reaches zero', () => {
+    const { ds, worker } = setup({ cliId: 'claude-code' });
+    ds.requiredReplyCotHolds = new Map([
+      ['om_a\0' + 1, {
+        turnId: 'om_a', dispatchAttempt: 1, finishStatus: 'completed',
+        replyPending: false, backgroundPending: true,
+      }],
+      ['om_b\0' + 3, {
+        turnId: 'om_b', dispatchAttempt: 3, finishStatus: 'completed',
+        replyPending: false, backgroundPending: true,
+      }],
+    ]);
+
+    screen(worker);
+
+    expect(finalizeCotMessageMock).toHaveBeenCalledWith(ds, 'om_a', 'completed', 1);
+    expect(finalizeCotMessageMock).toHaveBeenCalledWith(ds, 'om_b', 'completed', 3);
+    expect(ds.requiredReplyCotHolds).toBeUndefined();
+  });
+
+  it('keeps a delayed missing receipt cancellable across a later terminal', () => {
+    const publishMissing = vi.fn();
+    const scope = { finalizeCotMessage: finalizeCotMessageMock } as Record<string, unknown>;
+    const hold = loadWorkerPoolFunction<(
+      ds: DaemonSession,
+      msg: { turnId: string; status: 'completed'; dispatchAttempt: number; backgroundTasks?: number },
+      opts?: { finishStatus?: 'failed' },
+    ) => void>('finalizeOrHoldCotMessage', scope);
+    const settleReply = loadWorkerPoolFunction<(
+      ds: DaemonSession,
+      turnId: string,
+      dispatchAttempt: number,
+    ) => boolean>('settleRequiredReplyCotMessage', scope);
+    const settleBackground = loadWorkerPoolFunction<(
+      ds: DaemonSession,
+    ) => void>('settleRequiredReplyBackground', scope);
+    const key = 'om_empty\0' + 3;
+    const ds = {} as DaemonSession;
+
+    hold(ds, { turnId: 'om_empty', status: 'completed', dispatchAttempt: 3, backgroundTasks: 1 },
+      { finishStatus: 'failed' });
+    ds.pendingRequiredReplyMissingReceipts = new Map([[key, {
+      turnId: 'om_empty', dispatchAttempt: 3, publish: publishMissing,
+    }]]);
+    hold(ds, { turnId: 'om_newer', status: 'completed', dispatchAttempt: 1 });
+
+    expect(publishMissing).not.toHaveBeenCalled();
+    expect(ds.pendingRequiredReplyMissingReceipts?.has(key)).toBe(true);
+    expect(settleReply(ds, 'om_empty', 3)).toBe(true);
+    settleBackground(ds);
+    expect(publishMissing).not.toHaveBeenCalled();
+    expect(finalizeCotMessageMock).toHaveBeenCalledWith(ds, 'om_empty', 'completed', 3);
+  });
+
+  it('keeps the held CoT message open when the same terminal is replayed', () => {
+    const { ds, worker } = setup({ cliId: 'claude-code' });
+    terminal(worker, { backgroundTasks: 1 });
+    terminal(worker, { backgroundTasks: 1 });
+    expect(finalizeCotMessageMock).not.toHaveBeenCalled();
+    expect(ds.cotHeldForBackground).toEqual({ turnId: 'om_turn', dispatchAttempt: 1 });
+    screen(worker);
+    expect(finalizeCotMessageMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['stalled', 'limited'] as const)('does not treat a positive count on a %s frame as zero', status => {
+    const { worker } = setup({ cliId: 'claude-code' });
+    terminal(worker, { backgroundTasks: 1 });
+    worker.emit('message', {
+      type: 'screen_update', content: 'still waiting', status, turnId: 'om_turn', dispatchAttempt: 1,
+      backgroundTasks: 1,
+    });
+    expect(finalizeCotMessageMock).not.toHaveBeenCalled();
+    screen(worker);
+    expect(finalizeCotMessageMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('releases on a raw idle zero frame even when a sticky limit projects limited', () => {
+    const { ds, worker } = setup({ cliId: 'claude-code' });
+    ds.usageLimit = {
+      limited: true, kind: 'rate', retryAtMs: Date.now() + 60_000,
+      retryLabel: '1 min', retryReady: false,
+    };
+    terminal(worker, { backgroundTasks: 1 });
+    screen(worker);
+    expect(ds.lastScreenStatus).toBe('limited');
+    expect(finalizeCotMessageMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('clears and publishes the background count when the startup circuit stops the CLI', async () => {
+    const { ds, worker } = setup({ cliId: 'claude-code' });
+    screen(worker, 1);
+    expect(ds.backgroundTaskCount).toBe(1);
+    await startupCircuit(worker);
+    expect(ds.cliStartupFailureReason).toBeTruthy();
+    expect(ds.backgroundTaskCount).toBeUndefined();
+    expect(dashboardEventBus.publish).toHaveBeenCalledWith({
+      type: 'session.update',
+      body: { sessionId: ds.session.sessionId, patch: { status: 'interrupted', backgroundTaskCount: null } },
+    });
+  });
+
+  it('settles the held CoT as interrupted when the startup circuit stops the CLI', async () => {
+    const { ds, worker } = setup({ cliId: 'claude-code' });
+    terminal(worker, { backgroundTasks: 1 });
+    await startupCircuit(worker);
+    expect(ds.cliStartupFailureReason).toBeTruthy();
+    expect(finalizeCotMessageMock).toHaveBeenCalledWith(ds, 'om_turn', 'failed', 1);
+    expect(ds.cotHeldForBackground).toBeUndefined();
+  });
+
+  it('settles the held CoT once on an ordinary CLI restart, not again on a later zero frame', async () => {
+    const { ds, worker } = setup({ cliId: 'claude-code' });
+    terminal(worker, { backgroundTasks: 1 });
+    await Promise.all(worker.listeners('message').map(listener => listener.call(worker, {
+      type: 'claude_exit', code: 1, startupFailure: false, turnId: 'om_turn', dispatchAttempt: 1,
+    })));
+    expect(finalizeCotMessageMock).toHaveBeenCalledWith(ds, 'om_turn', 'failed', 1);
+    screen(worker);
+    expect(finalizeCotMessageMock).toHaveBeenCalledTimes(1);
+    expect(ds.cotHeldForBackground).toBeUndefined();
+  });
+
+  it('does not recreate a hold when a completed terminal replays after the circuit', async () => {
+    const { ds, worker } = setup({ cliId: 'claude-code' });
+    terminal(worker, { backgroundTasks: 1 });
+    await startupCircuit(worker);
+    expect(finalizeCotMessageMock).toHaveBeenCalledTimes(1);
+    terminal(worker, { backgroundTasks: 1 });
+    expect(ds.cotHeldForBackground).toBeUndefined();
+    expect(finalizeCotMessageMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('clears and interrupts background state on shared worker retirement', () => {
+    const { ds } = setup({ cliId: 'claude-code' });
+    ds.backgroundTaskCount = 1;
+    ds.cotHeldForBackground = { turnId: 'om_turn', dispatchAttempt: 1 };
+    killWorker(ds);
+    expect(ds.worker).toBeNull();
+    expect(ds.backgroundTaskCount).toBeUndefined();
+    expect(ds.cotHeldForBackground).toBeUndefined();
+    expect(finalizeCotMessageMock).toHaveBeenCalledWith(ds, 'om_turn', 'failed', 1);
+    expect(dashboardEventBus.publish).toHaveBeenCalledWith({
+      type: 'session.update',
+      body: { sessionId: ds.session.sessionId, patch: { backgroundTaskCount: null } },
+    });
+  });
+
+  it('keeps background state when remote worker retirement is refused', () => {
+    const { ds, worker } = setup({ cliId: 'claude-code', backendType: 'remote-runner' });
+    ds.backgroundTaskCount = 1;
+    ds.cotHeldForBackground = { turnId: 'om_turn', dispatchAttempt: 1 };
+    killWorker(ds);
+    expect(ds.worker).toBe(worker);
+    expect(ds.backgroundTaskCount).toBe(1);
+    expect(ds.cotHeldForBackground).toEqual({ turnId: 'om_turn', dispatchAttempt: 1 });
+    expect(finalizeCotMessageMock).not.toHaveBeenCalled();
+    expect(dashboardEventBus.publish).not.toHaveBeenCalled();
+  });
+
+  it('does not infer CLI loss from worker-less best-effort orphan cleanup', () => {
+    const { ds } = setup({ cliId: 'claude-code', adopted: true });
+    ds.worker = null;
+    ds.backgroundTaskCount = 1;
+    ds.cotHeldForBackground = { turnId: 'om_turn', dispatchAttempt: 1 };
+    killWorker(ds);
+    expect(ds.backgroundTaskCount).toBe(1);
+    expect(ds.cotHeldForBackground).toEqual({ turnId: 'om_turn', dispatchAttempt: 1 });
+    expect(finalizeCotMessageMock).not.toHaveBeenCalled();
+    expect(dashboardEventBus.publish).not.toHaveBeenCalled();
+  });
+
+  it('closes the held CoT message when a later terminal arrives', () => {
+    const { ds, worker } = setup({ cliId: 'claude-code' });
+    terminal(worker, { backgroundTasks: 1 });
+    expect(finalizeCotMessageMock).not.toHaveBeenCalled();
+    terminal(worker, { turnId: 'om_turn2', dispatchAttempt: 2 });
+    expect(finalizeCotMessageMock).toHaveBeenCalledWith(ds, 'om_turn', 'completed', 1);
+  });
+
+  it('closes the held CoT message as completed when the worker is suspended', () => {
+    const { ds, worker } = setup({ cliId: 'claude-code' });
+    terminal(worker, { backgroundTasks: 1 });
+    expect(finalizeCotMessageMock).not.toHaveBeenCalled();
+    ds.initConfig = { backendType: 'tmux' } as DaemonSession['initConfig'];
+    __testOnly_setSuspendBackingVerifier(() => true);
+    try {
+      expect(suspendWorker(ds)).toBe(true);
+    } finally {
+      __testOnly_setSuspendBackingVerifier();
+    }
+    expect(finalizeCotMessageMock).toHaveBeenCalledWith(ds, 'om_turn', 'completed', 1);
+  });
+
+  it('retains ds.managedTurnOrigin on completed turn_terminal ONLY when authorityHeldForBackground is true', () => {
+    const { ds, worker } = setup({ cliId: 'claude-code' });
+    ds.managedTurnOrigin = {
+      capability: 'cap_keep_1',
+      policyCapability: 'pol_1',
+      turnId: 'om_turn',
+      callerOpenId: 'ou_user_a',
+      preexistingProcessIdentities: ['100:1'],
+    };
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_turn',
+      status: 'completed',
+      backgroundTasks: 1,
+      authorityHeldForBackground: true,
+    });
+    expect(ds.managedTurnOrigin?.turnId).toBe('om_turn');
+    expect(ds.managedTurnOrigin?.capability).toBe('cap_keep_1');
+    expect(ds.managedTurnOrigin?.callerOpenId).toBe('ou_user_a');
+
+    // Without authorityHeldForBackground (e.g. Turn 2 ending while Turn 1 bg task runs),
+    // daemon MUST wipe ds.managedTurnOrigin even when backgroundTasks === 1!
+    ds.managedTurnOrigin = {
+      capability: 'cap_wipe_2',
+      policyCapability: 'pol_1',
+      turnId: 'om_turn2',
+      callerOpenId: 'ou_user_b',
+    };
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_turn2',
+      status: 'completed',
+      backgroundTasks: 1,
+    });
+    expect(ds.managedTurnOrigin?.turnId).toBeUndefined();
+    expect(ds.managedTurnOrigin?.callerOpenId).toBeUndefined();
+
+    // Failed terminal MUST NEVER retain ds.managedTurnOrigin even if authorityHeldForBackground were forged!
+    ds.managedTurnOrigin = {
+      capability: 'cap_wipe_3',
+      policyCapability: 'pol_1',
+      turnId: 'om_turn3',
+      callerOpenId: 'ou_user_a',
+    };
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_turn3',
+      status: 'failed',
+      authorityHeldForBackground: true,
+    });
+    expect(ds.managedTurnOrigin?.turnId).toBeUndefined();
+  });
+
+  it('clears ds.activeInteractiveTurn synchronously on suspendWorker and killWorker', () => {
+    const { ds } = setup({ cliId: 'claude-code' });
+    ds.activeInteractiveTurn = {
+      turnId: 'om_turn',
+      caller: { requestLarkAppId: 'app_test', requestUserOpenId: 'ou_user_a', senderType: 'user' },
+    };
+    ds.initConfig = { backendType: 'tmux' } as DaemonSession['initConfig'];
+    __testOnly_setSuspendBackingVerifier(() => true);
+    try {
+      expect(suspendWorker(ds)).toBe(true);
+    } finally {
+      __testOnly_setSuspendBackingVerifier();
+    }
+    expect(ds.activeInteractiveTurn).toBeUndefined();
+
+    const s2 = setup({ cliId: 'claude-code', adopted: true });
+    s2.ds.worker = null;
+    s2.ds.activeInteractiveTurn = {
+      turnId: 'om_turn',
+      caller: { requestLarkAppId: 'app_test', requestUserOpenId: 'ou_user_a', senderType: 'user' },
+    };
+    killWorker(s2.ds);
+    expect(s2.ds.activeInteractiveTurn).toBeUndefined();
+  });
+});

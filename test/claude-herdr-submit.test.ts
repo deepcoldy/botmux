@@ -1,15 +1,17 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';
 import type { PtyHandle } from '../src/adapters/cli/types.js';
 
 const roots: string[] = [];
-afterEach(() => { vi.useRealTimers(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 function handle(): PtyHandle {
   const root = mkdtempSync(join(tmpdir(), 'claude-submit-')); roots.push(root);
-  const file = join(root, 'session.jsonl'); writeFileSync(file, '');
+  const project = join(root, 'projects', 'project');
+  mkdirSync(project, { recursive: true });
+  const file = join(project, 'session.jsonl'); writeFileSync(file, '');
   return { write: vi.fn(), sendText: vi.fn(), sendSpecialKeys: vi.fn(), claudeJsonlPath: file };
 }
 async function submit(pty: PtyHandle, content = '<user_message>\n中文第一行\nsecond line\n</user_message>') {
@@ -50,5 +52,45 @@ describe('Claude submission transport acceptance', () => {
     appendFileSync(pty.claudeJsonlPath!, JSON.stringify({ type: 'queue-operation', operation: 'enqueue', content, timestamp: new Date().toISOString() }) + '\n');
     expect(result?.recheck?.()).toBe(true);
     expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not recheck-confirm a partial 30-char prefix before the whole payload arrives', async () => {
+    const pty = handle();
+    const fullPayload = 'abcdefghijklmnopqrstuvwxyz0123456789--TAIL-MUST-NOT-BE-DROPPED';
+    const content = `<user_message>\n${fullPayload}\n</user_message>`;
+    pty.sendBracketedPaste = vi.fn(() => true);
+    pty.sendSpecialKeys = vi.fn(() => false);
+    const result = await submit(pty, content);
+
+    appendFileSync(pty.claudeJsonlPath!, JSON.stringify({
+      type: 'user', timestamp: new Date().toISOString(),
+      message: { role: 'user', content: fullPayload.slice(0, 30) },
+    }) + '\n');
+    expect(result?.recheck?.()).toBe(false);
+
+    appendFileSync(pty.claudeJsonlPath!, JSON.stringify({
+      type: 'user', timestamp: new Date().toISOString(),
+      message: { role: 'user', content: fullPayload },
+    }) + '\n');
+    expect(result?.recheck?.()).toBe(true);
+  });
+
+  it('does not mistake a short payload for a substring of an unrelated longer user record', async () => {
+    const pty = handle();
+    pty.sendBracketedPaste = vi.fn(() => true);
+    pty.sendSpecialKeys = vi.fn(() => false);
+    const result = await submit(pty, 'ok');
+
+    appendFileSync(pty.claudeJsonlPath!, JSON.stringify({
+      type: 'user', timestamp: new Date().toISOString(),
+      message: { role: 'user', content: 'do not click ok yet; abort the deployment first' },
+    }) + '\n');
+    expect(result?.recheck?.()).toBe(false);
+
+    appendFileSync(pty.claudeJsonlPath!, JSON.stringify({
+      type: 'user', timestamp: new Date().toISOString(),
+      message: { role: 'user', content: 'ok' },
+    }) + '\n');
+    expect(result?.recheck?.()).toBe(true);
   });
 });

@@ -18,12 +18,33 @@
  */
 import { awaySummaryFocusRefusal } from '../../src/services/away-summary-focus.js';
 import { paneReplyDeliveryFromProcessTree } from '../../src/services/pane-reply-delivery.js';
+import { createUsageLimitTracker } from '../../src/utils/usage-limit-tracker.js';
 import { REPLY_DELIVERY_ENV } from '../../src/services/send-completion-hint.js';
-import { randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { randomBytes, randomUUID } from 'node:crypto';
+import { readFileSync, watch as fsWatch } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import ts from 'typescript';
+import {
+  cliUsageLimitEpisodeKey,
+  isAntigravityNativeLimit,
+  isTransientRateLimit,
+  reconcileUsageLimitState,
+  screenshotUsageLimitDedupSuffix,
+  usageLimitEvidenceKey,
+} from '../../src/utils/cli-usage-limit.js';
+import { supportsAntigravityReadyFooterQuota } from '../../src/adapters/cli/antigravity.js';
+import { isCodexAppCliId } from '../../src/adapters/cli/types.js';
+import { findAttestedAntigravityConversationId, inspectAntigravityConversationIdByPid } from '../../src/services/antigravity-discovery.js';
+import { readProcessStartIdentity } from '../../src/utils/process-identity.js';
+import { AntigravityNativeQuotaLog, currentAntigravityNativeQuota } from '../../src/services/antigravity-native-quota.js';
+import { createAntigravityQuotaStateMachine } from '../../src/services/antigravity-quota-state.js';
+import {
+  antigravityTurnAnsweredInTranscript,
+  antigravityTurnFailedWithoutOutput,
+  drainAntigravityTranscript,
+  findCompletedAntigravityTurnIdsPaired,
+} from '../../src/services/antigravity-transcript.js';
 import { minimaxCompactQueueSuppressesPromptReady } from '../../src/core/inject-queue-policy.js';
 import { clearStatuslineSnapshot } from '../../src/services/statusline-snapshot.js';
 import { contractTerminalStatus, executionObserverSupported } from '../../src/services/session-contract.js';
@@ -36,13 +57,34 @@ import { readNativeReasoningFooter } from '../../src/utils/native-reasoning-foot
 import { readGrokRuntimeObservation } from '../../src/services/grok-runtime-observer.js';
 import { ClaudeEffortObserver } from '../../src/services/claude-effort-observer.js';
 import { TerminalEffortChoiceTracker } from '../../src/services/terminal-effort-choice.js';
-import { finalBridgeSendMarkerCoversOwnThread, isFinalBridgeSendMarker, stripTrailingBridgeSentinelLine } from '../../src/services/bridge-fallback-gate.js';
+import { finalBridgeSendMarkerCoversOwnThread, isBridgeNothingToSendFinal, isFinalBridgeSendMarker, stripTrailingBridgeSentinelLine } from '../../src/services/bridge-fallback-gate.js';
+import { TurnSendLedger } from '../../src/services/turn-send-ledger.js';
 import { rewindableErrorCode, transcriptTurnFailedWithoutOutput } from '../../src/core/failed-turn-rewind.js';
 import { pruneRewindBackupsBeside, registerRewindBackup, rewindBackupDirForSession } from '../../src/core/rewind-backup-retention.js';
 import { readTraexCatalogWithRetry } from '../../src/services/traex-model-catalog-retry.js';
 import { traexAutoModelPolicyKey } from '../../src/services/traex-auto-model.js';
 import { traexStartupInputReady } from '../../src/core/traex-startup-input.js';
+import { traexTerminalInputBlocked } from '../../src/services/traex-terminal-session.js';
+import {
+  TRAEX_FIRST_PROMPT_SLOW_POLL_MS,
+  TraexFirstPromptReadinessPoller,
+  TraexNativeViewportEvidenceStore,
+  TraexNativeViewportRefreshController,
+  isTraexWebInputSettled,
+  isValidPaneDimensions,
+  nextTraexFirstPromptPollDelayMs,
+  paneDimensionsEqual,
+  stageNativeViewportInTempRendererSync,
+} from '../../src/core/traex-first-prompt-readiness.js';
+import { DEFAULT_RENDER_COLS, DEFAULT_RENDER_ROWS } from '../../src/utils/render-dimensions.js';
 import { WebTerminalInputController, WebTerminalInputWireState } from '../../src/core/web-terminal-input-controller.js';
+import {
+  BackgroundTurnAuthorityHold,
+  LegacyAgentAckPairer,
+  applyClaudeTranscriptEventToAuthorityHold,
+  isDeferrableAuthorityReleaseReason,
+} from '../../src/core/background-turn-authority.js';
+import { backgroundTaskSettledIds, eventTimeMs } from '../../src/services/claude-transcript.js';
 import { BusyReadyDeferralTracker, BusyReadyLogThrottle } from '../../src/utils/busy-ready-deferral.js';
 import { ClaudePermissionNoticeTracker } from '../../src/services/claude-action-prompt.js';
 import {
@@ -50,7 +92,24 @@ import {
   reconcileActiveAntigravityToken,
   resolveAntigravitySpawnStoreOptions,
 } from '../../src/services/antigravity-accounts.js';
-import { drainAntigravityTranscript } from '../../src/services/antigravity-transcript.js';
+import {
+  normalizeBackgroundTranscriptPath,
+  normalizeBackgroundTranscriptSegments,
+  readBackgroundTranscriptChain,
+  writeBackgroundTranscriptChain,
+} from '../../src/services/background-transcript-chain.js';
+import {
+  claudeNativeSessionIdFromJsonlPath,
+  matchesQueuedActivationTurn,
+  proofFromSubmitRecheckResult,
+  recheckResultFromProof,
+} from '../../src/services/queued-activation-receipts.js';
+import {
+  isAuthoritativeClaudeTranscriptTurn,
+  isAuthoritativeStructuredTranscriptTurn,
+  isAuthoritativeSubmitSendMarker,
+} from '../../src/services/submit-confirmation.js';
+import { sanitizeClaudeInput } from '../../src/adapters/cli/claude-code.js';
 
 /** Failed-turn rewind wiring that emitTurnTerminal, flushPending and
  *  handleTermAction call into (see src/worker.ts startFailedTurnRewind):
@@ -75,6 +134,51 @@ const TRAEX_QUESTION_FUNCTIONS = [
 /** Inert stand-in for the worker's TraexQuestionBridge instance (a const, not
  *  a function); a caller that observes it passes its own in `scope`. */
 const INERT_TRAEX_QUESTION_BRIDGE = { kick() {}, reset() {}, hasOpenCard: () => false, dispose() {} };
+const INERT_BACKGROUND_TASK_TRACKER = {
+  backgroundWait: () => 0,
+  pending: () => 0,
+  pendingTurnAgents: () => 0,
+  liveTaskIds: () => [] as string[],
+  noteMainTurn() {},
+  observe() {},
+  launch() {},
+  settle() {},
+  reset() {},
+};
+const INERT_BACKGROUND_AUTHORITY_HOLD = {
+  phase: () => 'IDLE' as const,
+  owner: () => undefined,
+  liveFloorMs: () => 0,
+  holds: () => false,
+  isBackgroundHeld: () => false,
+  isIdleWaiting: () => false,
+  isWakeActive: () => false,
+  hasOwnedWork: () => false,
+  nextDeadlineMs: () => undefined,
+  noteDurationMarkerObserved() {},
+  resetDurationMarkerObserved() {},
+  isDurationMarkerObserved: () => false,
+  isForegroundProvisionalEndObserved: () => false,
+  seedPreexistingLiveTasks() {},
+  recordHistoricalSettlement() {},
+  onForegroundTurnStarted: () => ({ action: 'none' as const }),
+  onTaskLaunched: () => ({ action: 'none' as const }),
+  onTaskSettled: () => ({ action: 'none' as const }),
+  onPendingWakeRemoved: () => ({ action: 'none' as const }),
+  onWakeDelivered: () => ({ action: 'none' as const }),
+  onForegroundProvisionalEnd() {},
+  onForegroundTurnEnded: () => ({ action: 'none' as const }),
+  onForegroundTurnTerminal: () => false,
+  onWakeTurnProvisionalEnd: () => ({ action: 'none' as const }),
+  onWakeTurnActivity() {},
+  onWakeTurnEnded: () => ({ action: 'none' as const }),
+  onSuperseded: () => ({ action: 'none' as const }),
+  onPromptReady: () => ({ action: 'none' as const }),
+  onTick: () => ({ action: 'none' as const }),
+  clearIfOwner() {},
+  reset() {},
+};
+const INERT_LEGACY_AGENT_ACK_PAIRER = { observe: () => [] as Array<{ taskId: string; kind: 'agent' }>, reset() {} };
 /** The worker's away-summary focus controller, doing nothing unless a test supplies its own. */
 const INERT_AWAY_SUMMARY_FOCUS = { request() {}, noteSuggestion() {}, beforeDaemonMessage() {}, noteRecap() {}, noteCliTurnStarted() {}, restore() {}, reset() {}, isBlurred: false, isActive: false };
 
@@ -148,7 +252,99 @@ function defaultScopedWorkerState(scope: Record<string, unknown>, key: string | 
   if (key === 'publishedActiveRuntimeSeeded') {
     return (scope.publishedActiveRuntimeSeeded ??= false);
   }
+  if (key === 'cliRestartEpoch') return (scope.cliRestartEpoch ??= 0);
   if (key === 'deferredSessionReady') return (scope.deferredSessionReady ??= []);
+  if (key === 'pendingAbsorbedReplyDeliveries') return (scope.pendingAbsorbedReplyDeliveries ??= new Map());
+  if (key === 'deferredAbsorbedReplyFinals') return (scope.deferredAbsorbedReplyFinals ??= new Map());
+  if (key === 'traexFirstPromptReadinessPoller') {
+    return (scope.traexFirstPromptReadinessPoller ??= new TraexFirstPromptReadinessPoller());
+  }
+  if (key === 'traexNativeViewportEvidence') {
+    return (scope.traexNativeViewportEvidence ??= new TraexNativeViewportEvidenceStore());
+  }
+  if (key === 'traexNativeViewportRefresh') {
+    return (scope.traexNativeViewportRefresh ??= new TraexNativeViewportRefreshController());
+  }
+  if (key === 'observedPaneGridRevision') return (scope.observedPaneGridRevision ??= 0);
+  if (key === 'traexControlWriteRevision') return (scope.traexControlWriteRevision ??= 0);
+  if (key === 'webTerminalInputGeneration') return (scope.webTerminalInputGeneration ??= 0);
+  if (key === 'webTerminalSubmitGeneration') return (scope.webTerminalSubmitGeneration ??= 0);
+  if (key === 'rawInputWriteGeneration') return (scope.rawInputWriteGeneration ??= 0);
+  if (key === 'lastWrittenCliInputWebSubmitGen') return (scope.lastWrittenCliInputWebSubmitGen ??= 0);
+  if (key === 'lastWrittenCliInputRawGen') return (scope.lastWrittenCliInputRawGen ??= 0);
+  if (key === 'lastWrittenCliInputSpawnGen') {
+    return (scope.lastWrittenCliInputSpawnGen ??= (typeof scope.cliSpawnGeneration === 'number' ? scope.cliSpawnGeneration : 0));
+  }
+  if (key === 'lastWrittenAntigravityTranscriptAnchor') return scope.lastWrittenAntigravityTranscriptAnchor;
+  if (key === 'localAttestedCliProcess') return scope.localAttestedCliProcess;
+  if (key === 'lastUsageLimitCaptureTurn') return scope.lastUsageLimitCaptureTurn;
+  if (key === 'activeTransientRateLimit') return scope.activeTransientRateLimit;
+  // noteWebTerminalInput / flushPending begin a fresh usage-limit turn on every
+  // submitted input; scopes that do not model limit detection still need a real
+  // tracker so the extracted functions never dereference undefined. Explicit
+  // scope-supplied trackers (e.g. the Antigravity screen producer) win.
+  if (key === 'usageLimitTracker') {
+    return (scope.usageLimitTracker ??= createUsageLimitTracker({
+      isRateKindSuppressed: () => false,
+      isOutputActive: () => false,
+    }));
+  }
+  // Mirrors the worker's non-authoritative-backend branch: empty snapshot string.
+  if (key === 'currentUsageLimitSnapshot') return () => '';
+  // Real CLI-family predicate for extracted IPC cases; explicit scope stubs win.
+  if (key === 'isCodexAppCliId') return (scope.isCodexAppCliId as ((id: string | null | undefined) => boolean) | undefined) ?? isCodexAppCliId;
+  if (key === 'antigravityNativeQuotaLog') return scope.antigravityNativeQuotaLog;
+  if (key === 'antigravityFoldedReconcilePending') return scope.antigravityFoldedReconcilePending;
+  if (key === 'ANTIGRAVITY_FOLDED_RECONCILE_INITIAL_DELAY_MS') return 50;
+  if (key === 'ANTIGRAVITY_FOLDED_RECONCILE_MAX_DELAY_MS') return 1_000;
+  if (key === 'ANTIGRAVITY_FOLDED_RECONCILE_MAX_ATTEMPTS') return 20;
+  if (key === 'ANTIGRAVITY_FOLDED_RECONCILE_MAX_WATCH_WAKEUPS') return 50;
+  if (key === 'ANTIGRAVITY_FOLDED_RECONCILE_MAX_WINDOW_MS') return 15_000;
+  if (key === 'antigravityQuotaState') {
+    if (!scope.antigravityQuotaState) {
+      const state = createAntigravityQuotaStateMachine();
+      if (scope.antigravityQuotaHistory !== undefined
+        || scope.antigravityActiveQuota !== undefined
+        || scope.antigravityQuotaCursor !== undefined) {
+        state.restore({
+          history: scope.antigravityQuotaHistory as any,
+          activeQuota: scope.antigravityActiveQuota as any,
+          cursor: scope.antigravityQuotaCursor as any,
+        });
+      }
+      const tracker = scope.usageLimitTracker as { addTurnListener?: (fn: (ev: any) => void) => () => void } | undefined;
+      tracker?.addTurnListener?.(ev => {
+        if (ev.kind === 'beginTurn') {
+          scope.activeTransientRateLimit = undefined;
+          const adapter = scope.cliAdapter as { id?: string; runnerFramedInput?: boolean } | undefined;
+          if (!adapter || (adapter.id === 'antigravity' && !adapter.runnerFramedInput)) {
+            state.beginTurn(ev.snapshot);
+          }
+        } else if (ev.kind === 'answered') {
+          const adapter = scope.cliAdapter as { id?: string; runnerFramedInput?: boolean } | undefined;
+          if (!adapter || (adapter.id === 'antigravity' && !adapter.runnerFramedInput)) {
+            const readQuota = scope.readAntigravityNativeQuota as (() => any) | undefined;
+            state.noteTurnAnswered(readQuota?.());
+          }
+        }
+      });
+      scope.antigravityQuotaState = state;
+    }
+    return scope.antigravityQuotaState;
+  }
+  if (key === 'backgroundAuthorityHold') return INERT_BACKGROUND_AUTHORITY_HOLD;
+  if (key === 'legacyAgentAckPairer') return INERT_LEGACY_AGENT_ACK_PAIRER;
+  if (key === 'backgroundHoldTimer') return (scope.backgroundHoldTimer ??= null);
+  if (key === 'isDeferrableAuthorityReleaseReason') return isDeferrableAuthorityReleaseReason;
+  if (key === 'applyClaudeTranscriptEventToAuthorityHold') return applyClaudeTranscriptEventToAuthorityHold;
+  if (key === 'BackgroundTurnAuthorityHold') return BackgroundTurnAuthorityHold;
+  if (key === 'LegacyAgentAckPairer') return LegacyAgentAckPairer;
+  if (key === 'backgroundTaskSettledIds') return backgroundTaskSettledIds;
+  if (key === 'eventTimeMs') return eventTimeMs;
+  if (key === 'applyBackgroundAuthorityTransition') return () => {};
+  if (key === 'supersedeBackgroundAuthorityHold') return () => {};
+  if (key === 'scheduleBackgroundHoldTimer') return () => {};
+  if (key === 'clearBackgroundHoldTimer') return () => {};
   return undefined;
 }
 
@@ -179,6 +375,11 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
       return dependencies.get(key);
     }
     if (key === 'randomUUID') return randomUUID;
+    if (key === 'join') return join;
+    if (key === 'readBackgroundTranscriptChain') return readBackgroundTranscriptChain;
+    if (key === 'writeBackgroundTranscriptChain') return writeBackgroundTranscriptChain;
+    if (key === 'normalizeBackgroundTranscriptPath') return normalizeBackgroundTranscriptPath;
+    if (key === 'normalizeBackgroundTranscriptSegments') return normalizeBackgroundTranscriptSegments;
     if (key === 'clearStatuslineSnapshot') return clearStatuslineSnapshot;
     if (key === 'confirmedTerminalEffortChoice') return () => undefined;
     if (key === 'noteTerminalEffortInput') return () => {};
@@ -236,14 +437,59 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
     if (key === 'traexQuestionFlowVisible') return traexQuestionFlowVisible;
     if (key === 'antigravityBlockingPageTail') return antigravityBlockingPageTail;
     if (key === 'traexStartupInputReady') return traexStartupInputReady;
+    if (key === 'traexTerminalInputBlocked') return traexTerminalInputBlocked;
+    if (key === 'TRAEX_FIRST_PROMPT_SLOW_POLL_MS') return TRAEX_FIRST_PROMPT_SLOW_POLL_MS;
+    if (key === 'isTraexWebInputSettled') return isTraexWebInputSettled;
+    if (key === 'isValidPaneDimensions') return isValidPaneDimensions;
+    if (key === 'nextTraexFirstPromptPollDelayMs') return nextTraexFirstPromptPollDelayMs;
+    if (key === 'paneDimensionsEqual') return paneDimensionsEqual;
+    if (key === 'stageNativeViewportInTempRendererSync') return stageNativeViewportInTempRendererSync;
+    if (key === 'DEFAULT_RENDER_COLS') return DEFAULT_RENDER_COLS;
+    if (key === 'DEFAULT_RENDER_ROWS') return DEFAULT_RENDER_ROWS;
     if (key === 'reconcileActiveAntigravityToken') return reconcileActiveAntigravityToken;
     if (key === 'inspectAntigravityAccounts') return inspectAntigravityAccounts;
     if (key === 'resolveAntigravitySpawnStoreOptions') return resolveAntigravitySpawnStoreOptions;
     if (key === 'drainAntigravityTranscript') return drainAntigravityTranscript;
+    if (key === 'findCompletedAntigravityTurnIdsPaired') return findCompletedAntigravityTurnIdsPaired;
+    if (key === 'antigravityTurnFailedWithoutOutput') return antigravityTurnFailedWithoutOutput;
+    if (key === 'antigravityTurnAnsweredInTranscript') return antigravityTurnAnsweredInTranscript;
+    if (key === 'inspectAntigravityConversationIdByPid') return inspectAntigravityConversationIdByPid;
+    if (key === 'findAttestedAntigravityConversationId') return findAttestedAntigravityConversationId;
+    if (key === 'readProcessStartIdentity') return readProcessStartIdentity;
+    if (key === 'AntigravityNativeQuotaLog') return AntigravityNativeQuotaLog;
+    if (key === 'currentAntigravityNativeQuota') return currentAntigravityNativeQuota;
+    if (key === 'supportsAntigravityReadyFooterQuota') return supportsAntigravityReadyFooterQuota;
+    if (key === 'isAntigravityNativeLimit') return isAntigravityNativeLimit;
+    if (key === 'isTransientRateLimit') return isTransientRateLimit;
+    if (key === 'reconcileUsageLimitState') return reconcileUsageLimitState;
+    if (key === 'cliUsageLimitEpisodeKey') return cliUsageLimitEpisodeKey;
+    if (key === 'usageLimitEvidenceKey') return usageLimitEvidenceKey;
+    if (key === 'screenshotUsageLimitDedupSuffix') return screenshotUsageLimitDedupSuffix;
+    if (key === 'fsWatch') return fsWatch;
+    if (key === 'dirname') return dirname;
+    if (key === 'readAntigravityNativeQuota') return () => undefined;
+    if (key === 'resolveAntigravityProofTranscriptPath') return () => undefined;
+    if (key === 'withAntigravityDirectFailureProof') return (limit: unknown) => limit;
     if (key === 'traexQuestionBridge') return INERT_TRAEX_QUESTION_BRIDGE;
     if (key === 'awaySummaryFocus') return INERT_AWAY_SUMMARY_FOCUS;
+    if (key === 'backgroundTaskTracker') return INERT_BACKGROUND_TASK_TRACKER;
     if (key === 'awaySummaryFocusRefusal') return awaySummaryFocusRefusal;
-    if (typeof key === 'string' && ['retireAntigravityBridgeTurn', 'rebindAntigravityBridgeTurn', 'warnPromptReadySkipped', 'cancelTurnTerminalReadyRecovery', 'recoverDeferredPromptReadyAtTurnTerminal', 'markPromptReadyFromBusyProbe', 'traexNativeStartupInputIsPending', 'readinessTrackedInput', 'invalidatePromptReadinessEvidence', 'revokePromptReadiness', 'codexAppRuntimeTypeAheadReady', 'sessionEventMetadata', 'bindSessionObservation', 'bindSessionPhysicalObservation', 'bindSessionExecutionEvent', 'restoreCodexAppContractNativeSession', 'spawnCliBody', 'deferSessionReadyUntilRuntimeAssigned', 'takeDeferredSessionReady', 'replayDeferredSessionReady', 'clearDeferredSessionReady', 'setCaptureIdentity', 'cotEntryWithoutSentinel', 'clearCodexAppInterruptTarget', 'publishAppliedReasoningSelection', 'publishNativeReasoningFooter', 'publishNativeReasoningObservation', 'notifyTraexCatalogEmpty', 'admitTraexCatalogModelBeforeInput', 'requeueUnsubmittedQueuedActivation', 'prepareAntigravityAccountsCredentialMask', 'reconcileAntigravitySpawnAccount', 'confirmAntigravitySpawnAccount', ...TRAEX_QUESTION_FUNCTIONS, ...FAILED_TURN_REWIND_FUNCTIONS].includes(key)) {
+    if (key === 'isBridgeNothingToSendFinal') return isBridgeNothingToSendFinal;
+    if (key === 'TurnSendLedger') return TurnSendLedger;
+    if (key === 'frozenImReplyTurn') {
+      if (!dependencies.has(key)) dependencies.set(key, loadWorkerFunction(key, scope));
+      return dependencies.get(key);
+    }
+    if (key === 'proofFromSubmitRecheckResult') return proofFromSubmitRecheckResult;
+    if (key === 'recheckResultFromProof') return recheckResultFromProof;
+    if (key === 'matchesQueuedActivationTurn') return matchesQueuedActivationTurn;
+    if (key === 'claudeNativeSessionIdFromJsonlPath') return claudeNativeSessionIdFromJsonlPath;
+    if (key === 'isAuthoritativeClaudeTranscriptTurn') return isAuthoritativeClaudeTranscriptTurn;
+    if (key === 'isAuthoritativeStructuredTranscriptTurn') return isAuthoritativeStructuredTranscriptTurn;
+    if (key === 'isAuthoritativeSubmitSendMarker') return isAuthoritativeSubmitSendMarker;
+    if (key === 'randomBytes') return randomBytes;
+    if (key === 'sanitizeClaudeInput') return sanitizeClaudeInput;
+    if (typeof key === 'string' && ['retireAntigravityBridgeTurn', 'rebindAntigravityBridgeTurn', 'warnPromptReadySkipped', 'cancelTurnTerminalReadyRecovery', 'recoverDeferredPromptReadyAtTurnTerminal', 'markPromptReadyFromBusyProbe', 'traexNativeStartupInputIsPending', 'isTraexTmuxViewportBackend', 'isTraexHcViewportBackend', 'isTraexNativeViewportBackend', 'currentTraexCliLifetimeNonce', 'currentTraexGridRevision', 'currentTraexControlWriteRevision', 'currentTraexInterruptGeneration', 'clearTraexStartupWebRecheck', 'currentWebResizedGridFor', 'syncHcPaneSizeFor', 'invalidateTraexNativeViewportEvidence', 'activeTraexNativeViewportEvidence', 'readTraexStartupViewportScreen', 'traexWebInputSettleStatus', 'traexNativeStartupScreenAdmitsPure', 'traexPromptReadyGateBlocks', 'probeAndPublishTraexNativeViewport', 'scheduleTraexNativeViewportRefreshIfNeeded', 'readinessTrackedInput', 'invalidatePromptReadinessEvidence', 'revokePromptReadiness', 'codexAppRuntimeTypeAheadReady', 'sessionEventMetadata', 'bindSessionObservation', 'bindSessionPhysicalObservation', 'bindSessionExecutionEvent', 'restoreCodexAppContractNativeSession', 'backgroundTranscriptChainFilePath', 'persistBackgroundTranscriptChain', 'latestClosedTranscriptOffset', 'prepareBackgroundTranscriptReplay', 'recordBackgroundTranscriptRotation', 'isClaudeFamilyCli', 'spawnCliBody', 'deferSessionReadyUntilRuntimeAssigned', 'takeDeferredSessionReady', 'replayDeferredSessionReady', 'clearDeferredSessionReady', 'setCaptureIdentity', 'cotEntryWellFormed', 'cotEntryWithoutSentinel', 'clearCodexAppInterruptTarget', 'publishAppliedReasoningSelection', 'publishNativeReasoningFooter', 'publishNativeReasoningObservation', 'notifyTraexCatalogEmpty', 'admitTraexCatalogModelBeforeInput', 'requeueUnsubmittedQueuedActivation', 'acknowledgeQueuedActivationToken', 'probeAuthoritativeQueuedActivationEvidence', 'observeAuthoritativeClaudeTurnStart', 'observeAuthoritativeStructuredTurnStart', 'claudeActivationTranscriptPathAllowed', 'prepareAntigravityAccountsCredentialMask', 'reconcileAntigravitySpawnAccount', 'confirmAntigravitySpawnAccount', 'currentAntigravityWrittenInput', 'resetAntigravityNativeQuotaLog', 'cancelAntigravityFoldedReconcilePending', 'armAntigravityFoldedReconcilePending', 'tryReconcilePendingAntigravityFoldedTurns', ...TRAEX_QUESTION_FUNCTIONS, ...FAILED_TURN_REWIND_FUNCTIONS].includes(key)) {
       if (!dependencies.has(key)) dependencies.set(key, loadWorkerFunction(key, scope));
       return dependencies.get(key);
     }

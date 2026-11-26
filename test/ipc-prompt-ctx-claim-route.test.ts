@@ -24,7 +24,8 @@ let handle: IpcServerHandle | null = null;
 // claim 路由依赖的 store 函数：mock 掉，只验证路由鉴权与参数传递。
 const claimMock = vi.fn();
 vi.mock('../src/services/prompt-context-store.js', () => ({
-  claimPromptContext: (...args: unknown[]) => claimMock(...args),
+  claimPromptContextAmongTurns: (...args: unknown[]) => claimMock(...args),
+  removePromptContextForTurn: vi.fn(),
 }));
 
 afterEach(async () => {
@@ -84,14 +85,14 @@ const VALID_BODY = {
 describe('POST /api/sessions/:sessionId/prompt-ctx/claim', () => {
   it('accepts the exact live session capability and returns the envelope (authRequired: true)', async () => {
     mockSession('s-claim');
-    claimMock.mockReturnValue('<botmux_reminder>提醒</botmux_reminder>');
+    claimMock.mockReturnValue({ turnId: 'turn-1', envelope: '<botmux_reminder>提醒</botmux_reminder>' });
 
     const res = await postClaim('s-claim', VALID_BODY, { authRequired: true } as any);
 
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true, envelope: '<botmux_reminder>提醒</botmux_reminder>' });
     // 按权威 turnId claim（不是 FIFO）
-    expect(claimMock).toHaveBeenCalledWith('s-claim', 'turn-1', 'a'.repeat(64), 'some-prefix');
+    expect(claimMock).toHaveBeenCalledWith('s-claim', ['turn-1'], 'a'.repeat(64), 'some-prefix');
   });
 
   it('rejects a wrong capability with 403 (authRequired: true)', async () => {
@@ -135,7 +136,7 @@ describe('POST /api/sessions/:sessionId/prompt-ctx/claim', () => {
 
   it('accepts trusted-host HMAC without a capability', async () => {
     mockSession('s-claim');
-    claimMock.mockReturnValue('<botmux_reminder>提醒</botmux_reminder>');
+    claimMock.mockReturnValue({ turnId: 'turn-1', envelope: '<botmux_reminder>提醒</botmux_reminder>' });
 
     const res = await postClaim('s-claim', VALID_BODY, { auth: 'signed' });
 
@@ -185,13 +186,13 @@ describe('POST /api/sessions/:sessionId/prompt-ctx/claim', () => {
       managedTurnOrigin: { capability: CAP, turnId: 'turn-1' },
       larkAppId: 'app-1',
     } as any);
-    claimMock.mockReturnValue('<botmux_reminder>提醒</botmux_reminder>');
+    claimMock.mockReturnValue({ turnId: 'turn-1', envelope: '<botmux_reminder>提醒</botmux_reminder>' });
 
     const res = await postClaim('s-receiver', VALID_BODY);
 
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true, envelope: '<botmux_reminder>提醒</botmux_reminder>' });
-    expect(claimMock).toHaveBeenCalledWith('s-receiver', 'turn-1', 'a'.repeat(64), 'some-prefix');
+    expect(claimMock).toHaveBeenCalledWith('s-receiver', ['turn-1'], 'a'.repeat(64), 'some-prefix');
   });
 
   it('notifies worker with prompt_submitted and suppressing callback even when no active turn (web terminal prompt)', async () => {
@@ -210,7 +211,7 @@ describe('POST /api/sessions/:sessionId/prompt-ctx/claim', () => {
   it('notifies worker with prompt_submitted on active turn', async () => {
     const workerSend = vi.fn();
     mockSession('s-active-turn', { worker: { send: workerSend, killed: false, connected: true }, turnId: 'turn-1' });
-    claimMock.mockReturnValue('envelope-content');
+    claimMock.mockReturnValue({ turnId: 'turn-1', envelope: 'envelope-content' });
 
     const res = await postClaim('s-active-turn', VALID_BODY, { auth: 'signed' });
 

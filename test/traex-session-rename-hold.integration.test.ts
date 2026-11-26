@@ -60,6 +60,8 @@ interface Harness {
   renames: () => string[];
   recordNativeRename: (id: string, title: string) => void;
   userPressesEnter: () => void;
+  resumeReading: () => void;
+  renameAttempts: () => number;
   /** The TUI stops reading its input for `ms` (host load); bytes written
    *  meanwhile reach it in one read afterwards. Resolves once it stopped. */
   stallReading: (ms: number) => Promise<void>;
@@ -70,17 +72,22 @@ interface Harness {
 
 /** @param swallowedRenameEnters how many Enters the fake takes as a newline
  *  while `/rename …` sits in its composer (1 = the rename's own Enter).
- *  @param unknownFooterAfterRename once renamed, draw a footer no screen
- *  predicate knows (a future TRAE layout).
- *  @param outputWhileStalled emit cursor-only frames while stdin is paused:
- *  terminal output that neither consumes input nor changes the viewport. */
+ *  The automatic case pauses stdin after the opening task until resumeReading(). */
 async function startWorker(
   swallowedRenameEnters: number,
-  unknownFooterAfterRename = false,
-  outputWhileStalled = false,
-  forceTmux = false,
-  unknownFooterWhileUnsubmitted = false,
+  options: {
+    unknownFooterAfterRename?: boolean;
+    outputWhileStalled?: boolean;
+    forceTmux?: boolean;
+    unknownFooterWhileUnsubmitted?: boolean;
+    mismatchedRenameReceipt?: boolean;
+    automaticRename?: 'fresh' | 'resume';
+  } = {},
 ): Promise<Harness> {
+  const {
+    unknownFooterAfterRename, outputWhileStalled, forceTmux,
+    unknownFooterWhileUnsubmitted, mismatchedRenameReceipt, automaticRename,
+  } = options;
   const sessionId = randomUUID();
   const root = mkdtempSync(join(tmpdir(), 'botmux-traex-rename-hold-'));
   tempDirs.add(root);
@@ -94,6 +101,7 @@ async function startWorker(
   const submissionsPath = join(root, 'submissions.jsonl');
   const renamesPath = join(root, 'renames.jsonl');
   const userEnterPath = join(root, 'user-enter');
+  const resumeReadPath = join(root, 'resume-reading');
   const stallPath = join(root, 'stall');
   const stalledPath = join(root, 'stalled');
   mkdirSync(dataDir, { recursive: true });
@@ -121,6 +129,8 @@ let draft = '';
 let last = '◆ ready';
 let pending = '';
 let pasting = false;
+let pastedCommand = false;
+let renameEnters = 0;
 const line = value => JSON.stringify(value) + '\\n';
 function render() {
   const rows = [last, '─'.repeat(40)];
@@ -131,16 +141,22 @@ function render() {
 }
 function enter(fromUser) {
   if (draft.startsWith('/rename ')) {
-    if (swallow > 0 && !fromUser) {
+    renameEnters++;
+    // In the delayed automatic-rename case, 0.209.1 treats only unframed
+    // text plus Enter as a paste burst. The older fault cases independently
+    // inject dropped Enters even when the transport uses an explicit frame.
+    if (swallow > 0 && !fromUser && !(${!!automaticRename} && pastedCommand)) {
       swallow--;
       draft += '\\n';
       if (${unknownFooterWhileUnsubmitted}) footer = '  GPT-6-Astra xhigh · an unreadable status cell';
       render();
       return;
     }
-    const name = draft.slice(8).trim();
+    const requestedName = draft.slice(8).trim();
+    const name = ${mismatchedRenameReceipt} ? requestedName + ' (normalised)' : requestedName;
     draft = '';
-    fs.appendFileSync(${JSON.stringify(renamesPath)}, line({ name }));
+    fs.appendFileSync(${JSON.stringify(renamesPath)}, line({ name, enters: renameEnters }));
+    renameEnters = 0;
     fs.appendFileSync(indexPath, line({ id: sessionId, thread_name: name, updated_at: new Date().toISOString() }));
     last = '◆ Thread renamed to ' + name;
     if (${unknownFooterAfterRename}) footer = '  GPT-6-Astra xhigh · a status cell from a newer release';
@@ -156,6 +172,7 @@ function enter(fromUser) {
   const turnId = 'native-' + Date.now();
   fs.writeSync(rolloutFd, line({ timestamp: new Date().toISOString(), type: 'event_msg', payload: { type: 'user_message', message: text, images: [], local_images: [], text_elements: [], turn_id: turnId } }));
   fs.writeSync(rolloutFd, line({ timestamp: new Date().toISOString(), type: 'event_msg', payload: { type: 'task_complete', turn_id: turnId, last_agent_message: 'ok', completed_at: Math.floor(Date.now() / 1000), duration_ms: 10 } }));
+  if (${!!automaticRename} && text.split('\\n')[0] === 'first question') process.stdin.pause();
   last = '◆ ok';
   render();
 }
@@ -169,7 +186,9 @@ process.stdin.on('data', chunk => {
     if (pasting) {
       const end = pending.indexOf('\\x1b[201~');
       if (end < 0) return;
-      draft += pending.slice(0, end);
+      pastedCommand = pending.slice(0, end).startsWith('/rename ');
+      // tmux paste-buffer maps pasted LF to CR before the TUI receives it.
+      draft += pending.slice(0, end).replace(/\\r\\n?/g, '\\n');
       pending = pending.slice(end + 6);
       pasting = false;
       continue;
@@ -191,6 +210,10 @@ process.stdin.on('data', chunk => {
 // The user finishing the rename in the Web terminal.
 setInterval(() => {
   if (fs.existsSync(${JSON.stringify(userEnterPath)})) { fs.rmSync(${JSON.stringify(userEnterPath)}); enter(true); }
+  if (fs.existsSync(${JSON.stringify(resumeReadPath)})) {
+    fs.rmSync(${JSON.stringify(resumeReadPath)});
+    process.stdin.resume();
+  }
   if (fs.existsSync(${JSON.stringify(stallPath)})) {
     const ms = Number(fs.readFileSync(${JSON.stringify(stallPath)}, 'utf8'));
     fs.rmSync(${JSON.stringify(stallPath)});
@@ -213,7 +236,7 @@ setInterval(() => {
   const workerBinary = process.env.BOTMUX_TEST_WORKER_BINARY;
   const backendType = workerBinary || forceTmux ? 'tmux' : 'pty';
   if (backendType === 'tmux') tmuxSessions.add(`bmx-${sessionId.slice(0, 8)}`);
-  const options: SpawnOptions = {
+  const spawnOptions: SpawnOptions = {
     cwd: resolve('.'),
     env: {
       ...process.env,
@@ -230,8 +253,8 @@ setInterval(() => {
   let child!: ChildProcess;
   const launchWorker = () => {
     child = workerBinary
-      ? spawn(workerBinary, ['__worker'], options)
-      : spawnNodeTsScript(resolve('src/worker.ts'), [], options);
+      ? spawn(workerBinary, ['__worker'], spawnOptions)
+      : spawnNodeTsScript(resolve('src/worker.ts'), [], spawnOptions);
     children.add(child);
     child.on('message', raw => messages.push(raw as WorkerToDaemon));
     child.stdout?.on('data', chunk => logs.push(chunk.toString()));
@@ -244,17 +267,17 @@ setInterval(() => {
       workingDir: dataDir,
       cliId: 'traex',
       cliPathOverride: fakeTraex,
-      cliSessionId: nativeSessionId,
+      ...(automaticRename === 'fresh' ? {} : { resume: true, cliSessionId: nativeSessionId }),
       nativeSessionTitle: TITLE,
-      resume: true,
       backendType,
-      prompt: '',
+      prompt: automaticRename ? 'first question' : '',
+      ...(automaticRename ? { turnId: 'om_first' } : {}),
       larkAppId: 'app_test',
       larkAppSecret: 'secret',
     } satisfies DaemonToWorker);
   };
   launchWorker();
-  await waitFor(child, () => messages.some(m => m.type === 'prompt_ready'), logs, 'resumed TRAE prompt', 30_000);
+  await waitFor(child, () => messages.some(m => m.type === 'prompt_ready'), logs, 'TRAE prompt', 30_000);
   return {
     get child() { return child; },
     messages,
@@ -263,6 +286,8 @@ setInterval(() => {
     // catalog) below the user's text; the user's text is the first line.
     submissions: () => readJsonLines<{ text: string }>(submissionsPath).map(s => s.text.split('\n')[0]!),
     renames: () => readJsonLines<{ name: string }>(renamesPath).map(r => r.name),
+    resumeReading: () => writeFileSync(resumeReadPath, ''),
+    renameAttempts: () => readJsonLines<{ enters: number }>(renamesPath)[0]?.enters ?? 0,
     recordNativeRename: (id, title) => appendFileSync(indexPath, `${JSON.stringify({ id, thread_name: title })}\n`),
     userPressesEnter: () => writeFileSync(userEnterPath, ''),
     stallReading: async (ms: number) => {
@@ -286,6 +311,40 @@ function send(child: ChildProcess, message: DaemonToWorker): Promise<void> {
 }
 
 describe('TRAE native rename left in the composer', () => {
+  it.each(['fresh', 'resume'] as const)('delivers one follow-up after a slow automatic rename on %s startup', async automaticRename => {
+    const h = await startWorker(1, { automaticRename, forceTmux: automaticRename === 'resume' });
+    await waitFor(h.child, () => h.submissions().includes('first question'), h.logs, 'initial task');
+    // The fake stopped reading as it completed the initial task. The rename
+    // and its Enter will reach the CLI together when we release it.
+    await waitFor(h.child, () => h.logs.some(line => line.includes('Native session rename command sent')), h.logs, 'automatic rename write');
+    await send(h.child, { type: 'message', content: FOLLOW_UP, turnId: 'om_follow' });
+    await waitFor(h.child, () => h.messages.some(m => m.type === 'user_notify' && m.turnId === 'om_follow'), h.logs, 'rename hold after the bounded wait', 30_000);
+    expect(h.renames()).toEqual([]);
+    expect(h.submissions()).toEqual(['first question']);
+    h.resumeReading();
+    await waitFor(h.child, () => h.submissions().includes(FOLLOW_UP), h.logs, 'follow-up task', 30_000);
+    expect(h.renames()).toEqual([TITLE]);
+    expect(h.submissions()).toEqual(['first question', FOLLOW_UP]);
+    expect(h.renameAttempts()).toBe(1);
+  }, 90_000);
+
+  it('restarts an idle CLI with a different saved title and delivers every held follow-up once', async () => {
+    const h = await startWorker(0, { mismatchedRenameReceipt: true });
+    await send(h.child, { type: 'rename_session', title: TITLE });
+    await send(h.child, { type: 'message', content: FOLLOW_UP, turnId: 'om_follow' });
+    await waitFor(h.child, () => h.logs.some(line => line.includes('Native session rename not confirmed (settled)')),
+      h.logs, 'missing exact-title receipt', 30_000);
+    expect(h.submissions()).toEqual([]);
+    await waitFor(h.child, () => h.logs.some(line => line.includes('Restart requested (native session rename receipt timeout)')),
+      h.logs, 'bounded rename recovery', 80_000);
+    // Input arriving during teardown belongs to the replacement too.
+    await send(h.child, { type: 'message', content: 'another follow-up', turnId: 'om_second' });
+    await waitFor(h.child, () => h.submissions().includes('another follow-up'), h.logs, 'held inputs after recovery', 40_000);
+    expect(h.submissions()).toEqual([FOLLOW_UP, 'another follow-up']);
+    expect(h.renames()).toEqual([TITLE + ' (normalised)']);
+    expect(h.logs.filter(line => line.includes('Restart requested (native session rename receipt timeout)'))).toHaveLength(1);
+  }, 150_000);
+
   it('holds a follow-up arriving after the rename wait, completes the rename once, then delivers it as its own turn', async () => {
     const h = await startWorker(1);
     await send(h.child, { type: 'message', content: 'first question', turnId: 'om_first' });
@@ -309,7 +368,7 @@ describe('TRAE native rename left in the composer', () => {
   }, 90_000);
 
   it('accepts this thread\'s valid rename receipt after a persistent worker replacement', async () => {
-    const h = await startWorker(0, false, false, true);
+    const h = await startWorker(0, { forceTmux: true });
     await h.restartWorker();
     await send(h.child, { type: 'rename_session', title: TITLE });
     await send(h.child, { type: 'message', content: FOLLOW_UP, turnId: 'om_follow' });
@@ -319,7 +378,7 @@ describe('TRAE native rename left in the composer', () => {
   }, 90_000);
 
   it('completes a surviving unsubmitted rename before restored input after worker replacement', async () => {
-    const h = await startWorker(2, false, false, true);
+    const h = await startWorker(2, { forceTmux: true });
     await send(h.child, { type: 'rename_session', title: TITLE });
     await waitFor(h.child, () => h.logs.some(line => line.includes('pressed Enter once')), h.logs, 'recovery Enter before replacement');
     expect(h.renames()).toEqual([]);
@@ -331,7 +390,7 @@ describe('TRAE native rename left in the composer', () => {
   }, 90_000);
 
   it('holds restored input on unknown surviving evidence and recovers after the user completes the rename', async () => {
-    const h = await startWorker(1, false, false, true, true);
+    const h = await startWorker(1, { forceTmux: true, unknownFooterWhileUnsubmitted: true });
     await send(h.child, { type: 'rename_session', title: TITLE });
     await waitFor(h.child, () => h.logs.some(line => line.includes('Native session rename not confirmed (unknown)')), h.logs, 'unknown surviving surface');
     await h.restartWorker();
@@ -349,7 +408,7 @@ describe('TRAE native rename left in the composer', () => {
   }, 90_000);
 
   it('ignores unrelated output and another thread\'s same-title receipt while the TUI has not read the rename', async () => {
-    const h = await startWorker(1, false, true);
+    const h = await startWorker(1, { outputWhileStalled: true });
     // The screen stays at the pre-rename empty composer while cursor-only
     // frames keep advancing the worker's global PTY output generation.
     await h.stallReading(6_500);
@@ -363,7 +422,7 @@ describe('TRAE native rename left in the composer', () => {
   }, 90_000);
 
   it('releases on the CLI\'s own record of the rename when its screen layout is not recognised', async () => {
-    const h = await startWorker(0, true);
+    const h = await startWorker(0, { unknownFooterAfterRename: true });
     await send(h.child, { type: 'rename_session', title: TITLE });
     await send(h.child, { type: 'message', content: FOLLOW_UP, turnId: 'om_follow' });
     await waitFor(h.child, () => h.submissions().includes(FOLLOW_UP), h.logs, 'follow-up turn', 30_000);

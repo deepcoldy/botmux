@@ -179,6 +179,52 @@ describe('claudeTranscriptLatestTurnState (re-attach: is the turn still running?
     expect(claudeTranscriptLatestTurnState(join(dir, 'missing.jsonl'))).toBeUndefined();
     expect(claudeTranscriptLatestTurnState(write('empty.jsonl', []))).toBeUndefined();
   });
+
+  it('treats user interrupts (with or without interruptedMessageId), API errors, and synthetic no-model-reply as closed', () => {
+    const p1 = write('int-tool.jsonl', [
+      userLine('u1'),
+      toolUse('a1'),
+      { type: 'user', uuid: 'int1', message: { role: 'user', content: [{ type: 'text', text: '[Request interrupted by user for tool use]' }] } },
+    ]);
+    expect(claudeTranscriptLatestTurnState(p1)).toBe('closed');
+
+    const p2 = write('int-id.jsonl', [
+      userLine('u1'),
+      { type: 'user', uuid: 'int2', interruptedMessageId: 'msg_1', message: { role: 'user', content: [{ type: 'text', text: '[Request interrupted by user]' }] } },
+    ]);
+    expect(claudeTranscriptLatestTurnState(p2)).toBe('closed');
+
+    const p3 = write('api-err.jsonl', [
+      userLine('u1'),
+      { type: 'assistant', uuid: 'e1', isApiErrorMessage: true, error: 'server_error', message: { role: 'assistant', model: '<synthetic>', stop_reason: null, content: [{ type: 'text', text: 'API Error: 500' }] } },
+    ]);
+    expect(claudeTranscriptLatestTurnState(p3)).toBe('closed');
+
+    const p4 = write('synth.jsonl', [
+      userLine('u1'),
+      { type: 'assistant', uuid: 's1', isApiErrorMessage: false, message: { role: 'assistant', model: '<synthetic>', stop_reason: null, content: [{ type: 'text', text: 'No response requested.' }] } },
+    ]);
+    expect(claudeTranscriptLatestTurnState(p4)).toBe('closed');
+  });
+
+  it('ignores api-request-blob and local slash-command wrappers when scanning for open turns', () => {
+    const p1 = write('blob.jsonl', [
+      userLine('u1'),
+      finalAnswer('a1'),
+      turnDuration('d1'),
+      { type: 'api-request-blob', hash: 'h1', message: { role: 'user', content: [{ type: 'text', text: 'blob copy' }] } },
+    ]);
+    expect(claudeTranscriptLatestTurnState(p1)).toBe('closed');
+
+    const p2 = write('slash.jsonl', [
+      userLine('u1'),
+      finalAnswer('a1'),
+      turnDuration('d1'),
+      { type: 'user', uuid: 'c1', message: { role: 'user', content: '<command-name>/model</command-name>' } },
+      { type: 'user', uuid: 'c2', message: { role: 'user', content: '<local-command-stdout>ok</local-command-stdout>' } },
+    ]);
+    expect(claudeTranscriptLatestTurnState(p2)).toBe('closed');
+  });
 });
 
 describe('staleProgramStatusVerdict', () => {
@@ -211,4 +257,35 @@ describe('staleProgramStatusVerdict', () => {
     expect(staleProgramStatusVerdict(evidence({ heldWorking: false, backgroundTasksRunning: 2 }))).toBe('stop');
     expect(staleProgramStatusVerdict(evidence({ transcriptEndedForMs: undefined }))).toBe('stop');
   });
+
+  it('ignores api-request-blob records in ClaudeTranscriptTurnEnd and claudeTranscriptLatestTurnState', () => {
+    const tracker = new ClaudeTranscriptTurnEnd();
+    const base = 1_762_344_000_000;
+    tracker.observe([
+      { type: 'system', subtype: 'turn_duration', timestamp: new Date(base).toISOString() },
+    ], base);
+    expect(tracker.endedForMs(base + 5000)).toBe(5000);
+
+    // Trailing user/assistant api-request-blob must NOT reopen the closed turn
+    tracker.observe([
+      { type: 'api-request-blob', message: { role: 'user', content: 'copied prompt' } },
+      { type: 'api-request-blob', message: { role: 'assistant', content: [{ type: 'text', text: 'copied' }] } },
+    ], base + 6000);
+    expect(tracker.endedForMs(base + 10_000)).toBe(10_000);
+
+    // Same for file-tail inspection
+    const dir = mkdtempSync(join(tmpdir(), 'stale-blob-'));
+    try {
+      const file = join(dir, 'session.jsonl');
+      writeFileSync(file, [
+        JSON.stringify({ type: 'assistant', message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: 'done' }] } }),
+        JSON.stringify({ type: 'system', subtype: 'turn_duration' }),
+        JSON.stringify({ type: 'api-request-blob', message: { role: 'user', content: 'copied' } }),
+      ].join('\n') + '\n');
+      expect(claudeTranscriptLatestTurnState(file)).toBe('closed');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
+

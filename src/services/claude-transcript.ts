@@ -57,6 +57,12 @@ export interface TranscriptEvent {
   type?: string;
   subtype?: string;
   uuid?: string;
+  /** Parent record UUID in Claude Code's conversation tree (`null` on a root record). */
+  parentUuid?: string | null;
+  /** Request identifier present on `type:"api-request"` records. */
+  id?: string;
+  /** Present on user interrupt records when Claude Code cancels an active message. */
+  interruptedMessageId?: string;
   sessionId?: string;
   timestamp?: string;
   message?: {
@@ -135,6 +141,8 @@ export interface TranscriptEvent {
    *  records — both excluded from meaningful turn attribution. */
   isSidechain?: boolean;
   isCompactSummary?: boolean;
+  /** Present on `type:"system", subtype:"compact_boundary"` lines (`manual` vs `auto`). */
+  compactMetadata?: { trigger?: string };
   /** Claude Code ≥2.1.259 stamps this on a `model_refusal_fallback` copied into
    *  a FORKED session: the record is history the fork inherited, and the switch
    *  it describes does NOT apply to this conversation. Treated as positive
@@ -178,6 +186,43 @@ export function apiErrorMessageText(ev: TranscriptEvent): string {
       .join(' ');
   }
   return '';
+}
+
+/** Claude Code's `/goal` clears itself after an API failure it will not retry
+ *  (its own backoff for transient errors runs before this) and records it as
+ *  `{type:"system", subtype:"informational", content:"Goal cleared after an
+ *  unrecoverable error (<label>): …"}`. Returns that notice, else undefined. */
+export function claudeGoalAbortNotice(ev: TranscriptEvent | null | undefined): string | undefined {
+  if (!ev || typeof ev !== 'object' || ev.type !== 'system' || ev.subtype !== 'informational' || ev.isSidechain === true) return undefined;
+  const content = (ev as { content?: unknown }).content;
+  if (typeof content !== 'string') return undefined;
+  return /^Goal cleared after an unrecoverable error\b/.test(content) ? content : undefined;
+}
+
+/** Follows one main transcript for a goal abort. Remembers the latest API-error
+ *  text (the record Claude writes right before clearing the goal, e.g.
+ *  "Please run /login · API Error: 403") and yields a single failure message
+ *  naming both once the goal is cleared; nothing after that. */
+export class ClaudeGoalAbortWatch {
+  private lastApiError: string | undefined;
+  private reported = false;
+
+  observe(events: readonly TranscriptEvent[]): string | undefined {
+    if (this.reported) return undefined;
+    for (const ev of events) {
+      if (!ev || typeof ev !== 'object' || ev.isSidechain === true) continue;
+      if (ev.type === 'assistant') {
+        // A real reply after an error means that error was recovered from.
+        this.lastApiError = ev.isApiErrorMessage === true ? apiErrorMessageText(ev).trim() : undefined;
+        continue;
+      }
+      const notice = claudeGoalAbortNotice(ev);
+      if (!notice) continue;
+      this.reported = true;
+      return this.lastApiError ? `${notice} Cause: ${this.lastApiError}` : notice;
+    }
+    return undefined;
+  }
 }
 
 /** Kind of automatic model switch Claude Code recorded, mapped from the raw
@@ -282,7 +327,7 @@ export function parseClaudeModelFallbackEvent(
  *  placeholders and Claude's `<synthetic>` sentinel are not the main session's
  *  model, so they yield undefined rather than a false "model changed". */
 export function servingModelFromAssistantEvent(ev: TranscriptEvent): string | undefined {
-  if (!ev || typeof ev !== 'object') return undefined;
+  if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev)) return undefined;
   if ((ev as any).isSidechain === true) return undefined;
   if (ev.isApiErrorMessage === true || isTranscriptRateLimitEvent(ev)) return undefined;
   if ((ev.message?.role ?? ev.type) !== 'assistant') return undefined;
@@ -563,6 +608,7 @@ export type ClaudeTerminalOutcome =
     retryAtMs?: number;
   }
   | { status: 'ambiguous'; errorCode: string; retryable: false }
+  | { status: 'cancelled'; errorCode: 'user_interrupted'; retryable: false }
   | { status: 'rate_limited'; errorCode: 'provider_rate_limited'; retryable: false };
 
 function normalizedApiErrorCode(ev: TranscriptEvent): string {
@@ -590,7 +636,7 @@ export const SYNTHETIC_MODEL_PLACEHOLDER = '<synthetic>';
  *  its content shape. Provider-success accounting must exclude all of these;
  *  turn-terminal classification narrows this further for local tool calls. */
 export function isSyntheticAssistantRecord(ev: TranscriptEvent | null | undefined): boolean {
-  if (!ev || typeof ev !== 'object' || ev.isApiErrorMessage === true) return false;
+  if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev) || ev.isApiErrorMessage === true) return false;
   const role = ev.message?.role ?? ev.type;
   return role === 'assistant' && ev.message?.model === SYNTHETIC_MODEL_PLACEHOLDER;
 }
@@ -624,7 +670,7 @@ export function isSyntheticNoModelReplyEvent(ev: TranscriptEvent | null | undefi
 export function classifyClaudeTerminalEvent(
   ev: TranscriptEvent,
 ): ClaudeTerminalOutcome | undefined {
-  if (!ev || typeof ev !== 'object' || (ev as any).isSidechain === true) return undefined;
+  if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev) || (ev as any).isSidechain === true) return undefined;
   if (isTranscriptRateLimitEvent(ev)) {
     return {
       status: 'rate_limited',
@@ -698,7 +744,7 @@ export function classifyClaudeTerminalEvent(
  * of them.
  */
 export function isClaudeTurnTerminalEvent(ev: TranscriptEvent): boolean {
-  if (!ev || typeof ev !== 'object' || (ev as any).isSidechain === true) return false;
+  if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev) || (ev as any).isSidechain === true) return false;
   if (isClaudeTurnDurationEvent(ev)) return true;
   const role = ev.message?.role ?? ev.type;
   if (role !== 'assistant') return false;
@@ -788,7 +834,7 @@ const BACKGROUND_LAUNCH_AGENT_ID_RE = /\bagentId:\s*(\S+)/;
  *  none. The launch-ack lives in the FOLLOWING user event's tool_result, so the
  *  caller pairs this with {@link backgroundTaskDispatchAcks}. */
 export function backgroundTaskDispatchToolUseIds(ev: TranscriptEvent): string[] {
-  if (!ev || (ev as any).isSidechain === true) return [];
+  if (!ev || isClaudeApiRequestBlob(ev) || (ev as any).isSidechain === true) return [];
   const role = ev.message?.role ?? ev.type;
   if (role !== 'assistant') return [];
   const content = ev.message?.content;
@@ -809,7 +855,7 @@ export function backgroundTaskDispatchToolUseIds(ev: TranscriptEvent): string[] 
  *  tool_results whose text carries BOTH the launch phrasing and an `agentId:`
  *  line qualify, so a synchronous tool result is never counted. */
 export function backgroundTaskDispatchAcks(ev: TranscriptEvent): Array<{ toolUseId: string; agentId: string }> {
-  if (!ev || (ev as any).isSidechain === true) return [];
+  if (!ev || isClaudeApiRequestBlob(ev) || (ev as any).isSidechain === true) return [];
   const role = ev.message?.role ?? ev.type;
   if (role !== 'user') return [];
   const content = ev.message?.content;
@@ -834,6 +880,7 @@ export function backgroundTaskDispatchAcks(ev: TranscriptEvent): Array<{ toolUse
  *  START WITH the tag — a tool_result that merely contains the literal string
  *  (e.g. grep over this source) is not one. */
 function deliveredTaskNotificationText(ev: TranscriptEvent): string | undefined {
+  if (isClaudeApiRequestBlob(ev)) return undefined;
   let text: string;
   if (ev.type === 'attachment' && ev.attachment?.type === 'queued_command') {
     const prompt = ev.attachment.prompt;
@@ -902,6 +949,8 @@ export function eventTimeMs(ev: TranscriptEvent): number | undefined {
  *  Code's structured `toolUseResult` (the launch-ack text is for the model and
  *  is not parsed here):
  *  - Agent `run_in_background` → `{ isAsync:true, status:'async_launched', agentId }`;
+ *  - Workflow → `{ status:'async_launched', taskType:'local_workflow', taskId }`,
+ *    tracked like an agent: it wakes the model when it finishes;
  *  - Bash `run_in_background` (or a command the user backgrounded) →
  *    `{ backgroundTaskId }`;
  *  - Monitor → `{ taskId, timeoutMs, persistent }`. A non-persistent Monitor
@@ -914,13 +963,16 @@ export function eventTimeMs(ev: TranscriptEvent): number | undefined {
  *    running (`Message queued for delivery …`) changes nothing.
  *  The id is the one the task's `<task-notification>` later reports as `<task-id>`. */
 export function backgroundTaskLaunches(ev: TranscriptEvent): BackgroundTaskLaunch[] {
-  if (!ev || ev.isSidechain === true) return [];
+  if (!ev || isClaudeApiRequestBlob(ev) || ev.isSidechain === true) return [];
   const role = ev.message?.role ?? ev.type;
   if (role !== 'user') return [];
   const r = ev.toolUseResult as Record<string, unknown> | undefined;
   if (!r || typeof r !== 'object' || Array.isArray(r)) return [];
   if ((r.isAsync === true || r.status === 'async_launched') && typeof r.agentId === 'string' && r.agentId) {
     return [{ taskId: r.agentId, kind: 'agent' }];
+  }
+  if (r.status === 'async_launched' && r.taskType === 'local_workflow' && typeof r.taskId === 'string' && r.taskId) {
+    return [{ taskId: r.taskId, kind: 'agent' }];
   }
   if (typeof r.backgroundTaskId === 'string' && r.backgroundTaskId) {
     return [{ taskId: r.backgroundTaskId, kind: 'shell' }];
@@ -946,7 +998,7 @@ export function backgroundTaskLaunches(ev: TranscriptEvent): BackgroundTaskLaunc
  *  - a successful TaskStop result (`toolUseResult.task_id` + `task_type`).
  *    Stopping a shell this way usually writes no notification at all. */
 export function backgroundTaskSettledIds(ev: TranscriptEvent): string[] {
-  if (!ev || ev.isSidechain === true) return [];
+  if (!ev || isClaudeApiRequestBlob(ev) || ev.isSidechain === true) return [];
   const text = anyTaskNotificationText(ev);
   if (text !== undefined) {
     if (!/<status>[^<]+<\/status>/.test(text)) return [];
@@ -1000,11 +1052,18 @@ export function backgroundTaskStopsInSiblingTranscripts(
   return ids;
 }
 
+/** Claude Code >= 2.1.31x logs copied request messages as `type:"api-request-blob"`
+ *  with no `uuid` or `timestamp`, carrying `message.role: "user" | "assistant"`.
+ *  These are wire-level debug blobs, never conversation turn events. */
+export function isClaudeApiRequestBlob(ev: TranscriptEvent | null | undefined): boolean {
+  return !!ev && typeof ev === 'object' && ev.type === 'api-request-blob';
+}
+
 /** True when the main agent is (re)starting work: a real prompt (typed, or
  *  dequeued type-ahead), a scheduler fire, a delivered task notification, or a
  *  `queue-operation dequeue` (Claude Code took a queued item to run). */
 export function isClaudeMainTurnStart(ev: TranscriptEvent | null | undefined): boolean {
-  if (!ev || typeof ev !== 'object' || ev.isSidechain === true) return false;
+  if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev) || ev.isSidechain === true) return false;
   if (ev.type === 'queue-operation') return ev.operation === 'dequeue';
   return isMeaningfulUserEvent(ev)
     || isMeaningfulQueuedCommand(ev)
@@ -1061,7 +1120,11 @@ export class BackgroundTaskTracker {
   private mainTurnOpen = false;
 
   observe(ev: TranscriptEvent): void {
-    if (!ev || ev.isSidechain === true) return;
+    if (!ev || isClaudeApiRequestBlob(ev) || ev.isSidechain === true) return;
+    if (isClaudeUserInterruptEvent(ev)) {
+      this.mainTurnOpen = false;
+      return;
+    }
     if (isClaudeMainTurnStart(ev)) this.mainTurnOpen = true;
     else if (isClaudeTurnTerminalEvent(ev)) this.mainTurnOpen = false;
     else if ((ev.message?.role ?? ev.type) === 'assistant') this.mainTurnOpen = true;
@@ -1241,7 +1304,7 @@ export class ClaudeModelRequestClock {
   }
 
   observe(ev: TranscriptEvent): void {
-    if (!ev || typeof ev !== 'object' || ev.isSidechain === true) return;
+    if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev) || ev.isSidechain === true) return;
     if (ev.type !== 'queue-operation' && isClaudeMainTurnStart(ev)) {
       const upkeep = isIdleUpkeepTurnStart(ev);
       // Upkeep folded into a running turn does not take that turn over.
@@ -1270,7 +1333,7 @@ export class ClaudeModelRequestClock {
         this.activityAtMs = served.completedAt;
       }
     }
-    if (isClaudeTurnTerminalEvent(ev)) {
+    if (isClaudeTurnTerminalEvent(ev) || isClaudeUserInterruptEvent(ev)) {
       // Whatever the next turn is, nothing here says it is upkeep: a slash
       // command typed in the terminal writes no record that starts a turn.
       this.turnOpen = false;
@@ -1399,7 +1462,7 @@ export function drainTranscript(
  */
 export function pickAssistantTextEvents(events: TranscriptEvent[]): TranscriptEvent[] {
   return events.filter(e => {
-    if (!e || typeof e !== 'object') return false;
+    if (!e || typeof e !== 'object' || isClaudeApiRequestBlob(e)) return false;
     if ((e as any).isSidechain === true) return false;
     // API-error lines are execution metadata rather than assistant answers.
     // The bridge emits a structured terminal outcome (or the existing limited
@@ -1577,10 +1640,10 @@ export function trailingAssistantText(
   // closed mid-tooling — there is no final answer to fall back with.
   for (let i = end + 1; i < events.length; i++) {
     const ev = events[i];
-    if (!ev || typeof ev !== 'object') continue;
+    if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev)) continue;
     const role = ev.message?.role ?? ev.type;
     if (role === 'assistant' && hasToolUseBlock(ev)) return '';
-    if (role === 'user' && isMeaningfulUserEvent(ev)) break;
+    if (role === 'user' && (isMeaningfulUserEvent(ev) || isClaudeUserInterruptEvent(ev))) break;
   }
   const { run, boundary } = collectTrailingTextRun(events, end, uuids);
   const trailing = joinAssistantText(run);
@@ -1630,13 +1693,13 @@ export class AbsorbedReplyCollector {
    *  in — and keeps returning true; records fed after that are ignored. */
   feed(ev: TranscriptEvent): boolean {
     if (this.complete) return true;
-    if (!ev || typeof ev !== 'object' || (ev as any).isSidechain === true) return false;
+    if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev) || (ev as any).isSidechain === true) return false;
     // Claude Code ≥ 2.1.31x writes an `api-request-blob` (a copy of the
     // request's user content: role "user", no uuid) between a folded input and
     // the model's answer to it. Read only uuid records, as the bridge queue
     // does, or that copy passes for the next user prompt.
     if (!ev.uuid) return false;
-    if (isClaudeTurnDurationEvent(ev) || isMeaningfulUserEvent(ev) || isMidTurnAbsorbedQueuedCommand(ev)) {
+    if (isClaudeTurnDurationEvent(ev) || isMeaningfulUserEvent(ev) || isClaudeUserInterruptEvent(ev) || isMidTurnAbsorbedQueuedCommand(ev)) {
       return (this.complete = true);
     }
     const role = ev.message?.role ?? ev.type;
@@ -1668,6 +1731,7 @@ export class AbsorbedReplyCollector {
     return {
       text: picked.map(part => part.text).join('\n\n'),
       lastUuid: picked[picked.length - 1].uuid,
+      uuids: [...new Set(picked.map(part => part.uuid))],
       source: texts.length > 0 ? 'text' : 'thinking',
     };
   }
@@ -1675,12 +1739,19 @@ export class AbsorbedReplyCollector {
 
 /** The reply to a folded input. `source: 'thinking'` means the model said it
  *  only in a thinking summary — possibly a plan rather than an answer, and
- *  content a bot with its thinking display off does not show. */
+ *  content a bot with its thinking display off does not show. `uuids` are
+ *  the records it was read from, in transcript order. */
 export interface AbsorbedInputReply {
   text: string;
   lastUuid: string;
+  uuids: string[];
   source: 'text' | 'thinking';
 }
+
+/** Longest folded-turn reply the daemon posts whole; a longer one is cut in
+ *  its card. The worker leaves only a reply posted whole out of the host
+ *  turn's final. */
+export const ABSORBED_REPLY_MAX_CHARS = 6_000;
 
 /** {@link AbsorbedReplyCollector} over a whole transcript: the reply to the
  *  input folded in at the record `absorbedAtUuid`, read up to the end of the
@@ -1708,7 +1779,7 @@ function collectTrailingTextRun(
   const run: TranscriptEvent[] = [];
   for (let i = end; i >= 0; i--) {
     const ev = events[i];
-    if (!ev || typeof ev !== 'object') continue;
+    if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev)) continue;
     const role = ev.message?.role ?? ev.type;
     if (role === 'assistant') {
       if (hasToolUseBlock(ev)) return { run, boundary: i };
@@ -1739,7 +1810,7 @@ function textBeforeHousekeeping(
   let i = boundary;
   for (; i >= 0; i--) {
     const ev = events[i];
-    if (!ev || typeof ev !== 'object') continue;
+    if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev)) continue;
     const role = ev.message?.role ?? ev.type;
     const content = Array.isArray(ev.message?.content) ? ev.message.content as any[] : [];
     if (role === 'assistant') {
@@ -1812,14 +1883,118 @@ const SYNTHETIC_USER_PREFIXES = [
   '<task-notification>',
 ];
 
+const CLAUDE_USER_INTERRUPT_TEXT_RE = /^\[Request interrupted by user(?: for tool use)?\]$/;
+
+/** True when a main-thread `role:'user'` record is Claude Code's synthetic
+ *  user-interrupt marker (Esc / Ctrl-C): either stamped with
+ *  `interruptedMessageId` or matching the exact standalone bracketed marker
+ *  `[Request interrupted by user]` / `[Request interrupted by user for tool use]`.
+ *  Human prose merely quoting that string will not match the anchored pattern. */
+export function isClaudeUserInterruptEvent(ev: TranscriptEvent | null | undefined): boolean {
+  if (!ev || typeof ev !== 'object') return false;
+  if (ev.type === 'api-request-blob') return false;
+  if ((ev as any).isSidechain === true) return false;
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'user') return false;
+  if (typeof ev.interruptedMessageId === 'string' && ev.interruptedMessageId.length > 0) return true;
+  if ((ev as any).isMeta === true || (ev as any).isCompactSummary === true) return false;
+  const content = ev.message?.content;
+  if (isPureToolResultUserEvent(content)) return false;
+  const trimmed = stringifyUserContent(content).trim();
+  if (CLAUDE_USER_INTERRUPT_TEXT_RE.test(trimmed)) return true;
+  // Combined `[tool_result, text: "[Request interrupted by user for tool use]"]`:
+  // Claude Code can pair a tool_result with the standalone interrupt notice in
+  // one user record. Require at least one text block and EVERY non-tool_result
+  // block to be a text block matching the exact anchored interrupt marker.
+  if (Array.isArray(content) && content.length > 0) {
+    let sawInterruptText = false;
+    for (const block of content as any[]) {
+      if (!block || typeof block !== 'object') return false;
+      if (block.type === 'tool_result') continue;
+      if (block.type !== 'text' || typeof block.text !== 'string') return false;
+      if (!CLAUDE_USER_INTERRUPT_TEXT_RE.test(block.text.trim())) return false;
+      sawInterruptText = true;
+    }
+    return sawInterruptText;
+  }
+  return false;
+}
+
+/** True when a user-role event carries a Claude synthetic/command prefix
+ *  (`<command-name>`, `<local-command-*>`, `<task-notification>`, …). */
+export function isSyntheticUserPrefixEvent(ev: TranscriptEvent | null | undefined): boolean {
+  if (!ev || typeof ev !== 'object') return false;
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'user') return false;
+  const text = normaliseForFingerprint(stringifyUserContent(ev.message?.content));
+  return text.length > 0 && SYNTHETIC_USER_PREFIXES.some(p => text.startsWith(p));
+}
+
+/** Tool-use block ids requested by a non-sidechain, non-API-error assistant record.
+ *  Includes `<synthetic>` local tool calls (which keep the logical turn open). */
+export function assistantToolUseIds(ev: TranscriptEvent | null | undefined): string[] {
+  if (!ev || typeof ev !== 'object' || (ev as any).isSidechain === true) return [];
+  if (ev.type === 'api-request-blob' || ev.isApiErrorMessage === true) return [];
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'assistant') return [];
+  const content = ev.message?.content;
+  if (!Array.isArray(content)) return [];
+  const ids: string[] = [];
+  for (const block of content as any[]) {
+    if (block && block.type === 'tool_use' && typeof block.id === 'string' && block.id.length > 0) {
+      ids.push(block.id);
+    }
+  }
+  return ids;
+}
+
+/** Tool-result `tool_use_id` values returned in a non-sidechain `role:'user'` record. */
+export function userToolResultIds(ev: TranscriptEvent | null | undefined): string[] {
+  if (!ev || typeof ev !== 'object' || (ev as any).isSidechain === true) return [];
+  if (ev.type === 'api-request-blob') return [];
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'user') return [];
+  const content = ev.message?.content;
+  if (!Array.isArray(content)) return [];
+  const ids: string[] = [];
+  for (const block of content as any[]) {
+    if (block && block.type === 'tool_result' && typeof block.tool_use_id === 'string' && block.tool_use_id.length > 0) {
+      ids.push(block.tool_use_id);
+    }
+  }
+  return ids;
+}
+
+/** True when a record is Claude Code's main-thread outgoing API request marker
+ *  (`type:"api-request"`, `querySource:"repl_main_thread"`). Note: has no `uuid`. */
+export function isMainThreadApiRequestEvent(ev: TranscriptEvent | null | undefined): boolean {
+  return !!ev && typeof ev === 'object'
+    && ev.type === 'api-request'
+    && ev.querySource === MAIN_THREAD_QUERY_SOURCE;
+}
+
+/** True when a non-sidechain `type:"attachment"` record is intra-turn machinery
+ *  (e.g. inactivity reminders, `hook_additional_context`, `edited_text_file`,
+ *  mid-turn absorbed `queued_command`, or absorbed `task-notification`) rather
+ *  than a standalone new-turn `queued_command`. */
+export function isIntraTurnAttachmentEvent(ev: TranscriptEvent | null | undefined): boolean {
+  if (!ev || typeof ev !== 'object' || (ev as any).isSidechain === true) return false;
+  if (ev.type !== 'attachment') return false;
+  if (ev.attachment?.type === 'queued_command' && !isMidTurnAbsorbedQueuedCommand(ev) && isMeaningfulQueuedCommand(ev)) {
+    return false;
+  }
+  return true;
+}
+
 /** True when a `type:'user'` (or `message.role:'user'`) event represents a
  *  *real* prompt the human typed — not Claude Code's internal machinery
  *  (tool_result, slash-command wrappers, isMeta/isCompactSummary markers,
- *  sidechain spawn events). The bridge attribution queue and the adopt
- *  preamble extractor share this predicate to ensure they're seeing the
- *  same notion of "user input". */
+ *  sidechain spawn events, user-interrupt markers). The bridge attribution queue
+ *  and the adopt preamble extractor share this predicate to ensure they're seeing
+ *  the same notion of "user input". */
 export function isMeaningfulUserEvent(ev: TranscriptEvent | null | undefined): boolean {
   if (!ev || typeof ev !== 'object') return false;
+  if (ev.type === 'api-request-blob') return false;
   const role = ev.message?.role ?? ev.type;
   if (role !== 'user') return false;
   const flags = ev as any;
@@ -1828,6 +2003,7 @@ export function isMeaningfulUserEvent(ev: TranscriptEvent | null | undefined): b
   if (flags.isSidechain === true) return false;
   const content = ev.message?.content;
   if (isPureToolResultUserEvent(content)) return false;
+  if (isClaudeUserInterruptEvent(ev)) return false;
   const text = normaliseForFingerprint(stringifyUserContent(content));
   if (text.length === 0) return false;
   if (SYNTHETIC_USER_PREFIXES.some(p => text.startsWith(p))) return false;
@@ -1844,7 +2020,7 @@ export const CLAUDE_CRON_CREATE_TOOL = 'CronCreate';
  *  the caller pairs this with {@link cronCreateAcks} — same dispatch/ack split
  *  as background Task dispatches. */
 export function cronCreateToolUseIds(ev: TranscriptEvent | null | undefined): string[] {
-  if (!ev || (ev as any).isSidechain === true) return [];
+  if (!ev || isClaudeApiRequestBlob(ev) || (ev as any).isSidechain === true) return [];
   const role = ev.message?.role ?? ev.type;
   if (role !== 'assistant') return [];
   const content = ev.message?.content;
@@ -1874,7 +2050,7 @@ const CRON_CREATE_ACK_TASK_ID_RE =
 
 export function cronCreateAcks(ev: TranscriptEvent | null | undefined):
   Array<{ toolUseId: string; taskId: string }> {
-  if (!ev || (ev as any).isSidechain === true) return [];
+  if (!ev || isClaudeApiRequestBlob(ev) || (ev as any).isSidechain === true) return [];
   const role = ev.message?.role ?? ev.type;
   if (role !== 'user') return [];
   const content = ev.message?.content;
@@ -1914,7 +2090,7 @@ export function cronCreateAcks(ev: TranscriptEvent | null | undefined):
  *  (`botmux schedule add`), whose turns carry daemon-assigned
  *  `schedule:<taskId>:<uuid>` ids and never touch this path. */
 export function isScheduledTurnStartEvent(ev: TranscriptEvent | null | undefined): boolean {
-  if (!ev || typeof ev !== 'object') return false;
+  if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev)) return false;
   const role = ev.message?.role ?? ev.type;
   if (role !== 'user') return false;
   // Hard guard: only internal meta records. Must stay ahead of the
@@ -2007,7 +2183,7 @@ function collectAssistantTurns(
   };
 
   for (const ev of events) {
-    if (!ev || typeof ev !== 'object') continue;
+    if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev)) continue;
     if (isMeaningfulUserEvent(ev)) {
       // New turn boundary — reset the assistant accumulator.
       flush();
@@ -2185,6 +2361,10 @@ export interface JsonlFingerprintSearchOptions {
   minEventTimestampMs?: number;
   /** Also match Claude Code type-ahead enqueue events, whose content is not role:user. */
   includeQueueOperations?: boolean;
+  /** Called on each normalized transcript candidate. When supplied, this
+   *  replaces the legacy substring predicate so callers can require stronger
+   *  exact-payload proof without changing other fingerprint consumers. */
+  candidateMatcher?: (candidate: string) => boolean;
   /** Called on each candidate that already passed the fingerprint match.
    *  Returning `false` skips the candidate and continues searching older
    *  files in the directory (mtime-descending walk). Used by the bridge
@@ -2237,7 +2417,11 @@ function eventAtOrAfter(ev: { timestamp?: unknown }, floorMs: number): boolean {
 export function jsonlContainsFingerprint(
   path: string,
   fingerprint: string,
-  opts?: { includeQueueOperations?: boolean; minEventTimestampMs?: number },
+  opts?: {
+    includeQueueOperations?: boolean;
+    minEventTimestampMs?: number;
+    candidateMatcher?: (candidate: string) => boolean;
+  },
 ): boolean {
   if (fingerprint.length === 0 || !existsSync(path)) return false;
   let size: number;
@@ -2292,8 +2476,10 @@ export function jsonlContainsFingerprint(
     } else {
       continue;
     }
-    if (normaliseTranscriptFingerprintCandidates(lineText)
-      .some(candidate => candidate.length > 0 && candidate.includes(fingerprint))) return true;
+    const candidates = normaliseTranscriptFingerprintCandidates(lineText);
+    if (opts?.candidateMatcher
+      ? candidates.some(opts.candidateMatcher)
+      : candidates.some(candidate => candidate.length > 0 && candidate.includes(fingerprint))) return true;
   }
   return false;
 }
@@ -2389,8 +2575,10 @@ function jsonlTailMatchFingerprint(
         } else {
           continue;
         }
-        if (normaliseTranscriptFingerprintCandidates(text)
-          .some(candidate => candidate.length > 0 && candidate.includes(fingerprint))) {
+        const candidates = normaliseTranscriptFingerprintCandidates(text);
+        if (opts.candidateMatcher
+          ? candidates.some(opts.candidateMatcher)
+          : candidates.some(candidate => candidate.length > 0 && candidate.includes(fingerprint))) {
           hit = true;
           break;
         }

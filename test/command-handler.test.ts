@@ -163,6 +163,7 @@ vi.mock('../src/services/lark-cli-auth.js', () => ({
 
 vi.mock('../src/bot-registry.js', () => ({
   loadBotConfigs: vi.fn(() => [{ larkAppId: 'app-1' }, { larkAppId: 'app-2' }]),
+  loadBotConfigsCached: vi.fn(() => []),
   normalizeUsageDisplay: (cfg: { usageDisplay?: string }) => cfg.usageDisplay ?? 'streaming',
   getBot: vi.fn((id: string = 'app-1') => ({
     botName: id === 'app-2' ? 'Codex' : 'Claude',
@@ -752,6 +753,7 @@ vi.mock('../src/im/lark/cot-message.js', () => ({
   handleCotThinkingUpdate: vi.fn(() => true),
   prepareCotMessageBeforeReply: vi.fn(async () => {}),
   hasCotMessageForTurn: vi.fn(() => true),
+  cotMessageFinishStatus: vi.fn(() => undefined),
 }));
 
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
@@ -8181,6 +8183,87 @@ describe('handleCommand', () => {
       expect(beginLarkCliLogin).toHaveBeenCalledWith('ou_sender');
     });
 
+    it('starts only the explicit provider and handles both sides of a bare mixed login', async () => {
+      const deps = withPolicy({
+        enabled: true, capabilities: ['lark-user', 'bytecloud'],
+        credentialSource: { 'lark-user': 'local', bytecloud: 'platform' },
+      }, true);
+      (deps as any).activeSessions.get(sessionKey(ROOT_ID, LARK_APP_ID)).worker = null;
+      await handleCommand('/login', ROOT_ID, makeLarkMessage('/login lark'), deps, LARK_APP_ID);
+      expect(generateAuthUrl).toHaveBeenCalledTimes(1);
+      expect(askPlatformToAuthorize).not.toHaveBeenCalled();
+      await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli'), deps, LARK_APP_ID);
+      expect(generateAuthUrl).toHaveBeenCalledTimes(1);
+      expect(askPlatformToAuthorize).toHaveBeenCalledTimes(1);
+      await handleCommand('/login', ROOT_ID, makeLarkMessage('/login'), deps, LARK_APP_ID);
+      expect(generateAuthUrl).toHaveBeenCalledTimes(2);
+      expect(askPlatformToAuthorize).toHaveBeenCalledTimes(2);
+      expect(startBytedcliLogin).not.toHaveBeenCalled();
+      vi.mocked(deps.sessionReply).mockClear();
+      await handleCommand('/login', ROOT_ID, makeLarkMessage('/login status'), deps, LARK_APP_ID);
+      expect(reply(deps)).toContain(t('cmd.login.platform_status', { tool: 'bytedcli', url: PAGE }, 'zh'));
+      expect(getTokenStatus).toHaveBeenCalled();
+    });
+
+    it.each([true, false])('starts the local ByteCloud side independently of platform Lark (bound=%s)', async bound => {
+      const deps = withPolicy({
+        enabled: true, capabilities: ['lark-user', 'bytecloud'],
+        credentialSource: { 'lark-user': 'platform', bytecloud: 'local' },
+      }, bound);
+      (deps as any).activeSessions.get(sessionKey(ROOT_ID, LARK_APP_ID)).worker = null;
+      await handleCommand('/login', ROOT_ID, makeLarkMessage('/login'), deps, LARK_APP_ID);
+      expect(askPlatformToAuthorize).toHaveBeenCalledTimes(bound ? 1 : 0);
+      expect(startBytedcliLogin).toHaveBeenCalledExactlyOnceWith('ou_sender');
+      expect(generateAuthUrl).not.toHaveBeenCalled();
+      expect(beginLarkCliLogin).not.toHaveBeenCalled();
+      expect(vi.mocked(deps.sessionReply).mock.calls.map(call => call[1]).join('\n')).toContain('https://cloud.example.com/auth');
+    });
+
+    it.each(['/login done', '/login bytedcli done'])('%s does not complete an old local challenge for platform-only ByteCloud', async text => {
+      const deps = withPolicy({
+        enabled: true, capabilities: ['lark-user', 'bytecloud'],
+        credentialSource: { 'lark-user': 'local', bytecloud: 'platform' },
+      }, true);
+      vi.mocked(pendingBytedcliChallenge).mockReturnValueOnce('stale-challenge');
+      try {
+        await handleCommand('/login', ROOT_ID, makeLarkMessage(text), deps, LARK_APP_ID);
+        expect(pendingBytedcliChallenge).not.toHaveBeenCalled();
+        expect(completeBytedcliLogin).not.toHaveBeenCalled();
+      } finally {
+        vi.mocked(pendingBytedcliChallenge).mockReset().mockReturnValue(null);
+      }
+    });
+
+    it.each(['/login lark extra', '/login bytedcli i18n-tt', '/login unknown'])('%s does not start an unrelated authorization', async text => {
+      const deps = withPolicy({ enabled: true, credentialSource: 'platform' }, true);
+      await handleCommand('/login', ROOT_ID, makeLarkMessage(text), deps, LARK_APP_ID);
+      expect(askPlatformToAuthorize).not.toHaveBeenCalled();
+      expect(generateAuthUrl).not.toHaveBeenCalled();
+      expect(beginLarkCliLogin).not.toHaveBeenCalled();
+      expect(startBytedcliLogin).not.toHaveBeenCalled();
+    });
+
+    it('does not start ByteCloud device login after its source changes during a local status check', async () => {
+      const deps = withPolicy({
+        enabled: true, capabilities: ['lark-user', 'bytecloud'],
+        credentialSource: { 'lark-user': 'platform', bytecloud: 'local' },
+      }, true, 'group');
+      const bot = getBot(LARK_APP_ID);
+      vi.mocked(describeBytedcliAuth).mockImplementationOnce(async () => {
+        vi.mocked(getBot).mockReturnValue({
+          ...bot,
+          config: { ...bot.config, triggerUserAuth: parseTriggerUserAuthConfig({
+            enabled: true, capabilities: ['lark-user', 'bytecloud'],
+            credentialSource: 'platform',
+          }) ?? undefined },
+        });
+        return { state: 'needs-login' };
+      });
+      await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli'), deps, LARK_APP_ID);
+      expect(startBytedcliLogin).not.toHaveBeenCalled();
+      expect(reply(deps)).toBe(t('cmd.login.policy_changed', undefined, 'zh'));
+    });
+
     it('platform + bound: explicit /login lark asks the platform', async () => {
       const deps = withPolicy({ enabled: true, tools: ['lark-cli'], credentialSource: 'platform' }, true);
       await handleCommand('/login', ROOT_ID, makeLarkMessage('/login lark'), deps, LARK_APP_ID);
@@ -8278,6 +8361,20 @@ describe('handleCommand', () => {
         (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls.map(c => c[1] as string);
       beforeEach(() => { vi.mocked(sendUserMessage).mockClear(); });
 
+      it('mixed sources keep both links private when the platform uses its legacy page', async () => {
+        const deps = withPolicy({
+          enabled: true, capabilities: ['lark-user', 'bytecloud'],
+          credentialSource: { 'lark-user': 'local', bytecloud: 'platform' },
+        }, true, 'group');
+        vi.mocked(askPlatformToAuthorize).mockResolvedValue({ kind: 'legacy' });
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login'), deps, LARK_APP_ID);
+        const messages = vi.mocked(sendUserMessage).mock.calls.map(([, recipient, text]) => ({ recipient, text }));
+        expect(messages.map(message => message.recipient)).toEqual(['ou_sender', 'ou_sender']);
+        expect(messages.map(message => message.text).join('\n')).toContain(PAGE);
+        expect(messages.map(message => message.text).join('\n')).toContain('https://lark.example.com/device');
+        expect(groupReplies(deps).join('\n')).not.toContain('https://');
+      });
+
       it('the platform sends the card: the group hears one link-free line and botmux DMs nothing', async () => {
         const deps = withPolicy({ enabled: true, tools: ['lark-cli'] }, true, 'group');
         await handleCommand('/login', ROOT_ID, makeLarkMessage('/login'), deps, LARK_APP_ID);
@@ -8353,11 +8450,23 @@ describe('handleCommand', () => {
       try {
         await handleCommand('/logout', ROOT_ID, makeLarkMessage('/logout'), deps, LARK_APP_ID);
         const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
-        expect(replyContent).toContain(t('cmd.logout.platform_note', { url: page }, 'zh'));
+        expect(replyContent).toContain(t('cmd.logout.platform_note', { tool: 'lark-cli', url: page }, 'zh'));
       } finally {
         vi.mocked(platformCredentialsUrl).mockReturnValue(null);
         if (previousGetBot) vi.mocked(getBot).mockImplementation(previousGetBot);
       }
+    });
+
+    it('warns that platform grants survive logout when the host is unbound', async () => {
+      governBot({
+        enabled: true, capabilities: ['lark-user', 'bytecloud'],
+        credentialSource: { 'lark-user': 'local', bytecloud: 'platform' },
+      });
+      vi.mocked(platformCredentialsUrl).mockReturnValue(null);
+      const deps = makeDeps();
+      await handleCommand('/logout', ROOT_ID, makeLarkMessage('/logout'), deps, LARK_APP_ID);
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain(t('cmd.logout.platform_unbound', undefined, 'zh'));
     });
   });
 
@@ -8604,6 +8713,28 @@ describe('handleCommand', () => {
     // exactly what was refused" needs no guessing — and no giant default set
     // that makes every person approve permissions they will never use.
     describe('/login --scope', () => {
+      it('accepts a user scope declared for this bot', async () => {
+        const dir = mkdtempSync(join(tmpdir(), 'botmux-login-extra-scopes-'));
+        const previous = vi.mocked(getBot).getMockImplementation()!;
+        try {
+          const file = join(dir, 'scopes.json');
+          const scope = 'custom:feature:read';
+          writeFileSync(file, JSON.stringify([scope]));
+          vi.mocked(getBot).mockImplementation((id => {
+            const bot = previous(id);
+            return { ...bot, config: { ...bot.config, extraScopesFile: file } };
+          }) as typeof getBot);
+          const deps = makeDeps(makeDaemonSession({ chatType: 'p2p' }));
+
+          await handleCommand('/login', ROOT_ID, makeLarkMessage(`/login --scope ${scope}`), deps, LARK_APP_ID);
+
+          expect(generateAuthUrl).toHaveBeenCalledWith('app-1', 'secret-1', 'feishu', [scope], 'ou_sender');
+        } finally {
+          vi.mocked(getBot).mockImplementation(previous);
+          rmSync(dir, { recursive: true, force: true });
+        }
+      });
+
       it('passes an explicit document scope and the requesting user to OAuth', async () => {
         const deps = makeDeps(makeDaemonSession({ chatType: 'p2p' }));
         await handleCommand('/login', ROOT_ID, makeLarkMessage('/login --scope docx:document:readonly'), deps, LARK_APP_ID);

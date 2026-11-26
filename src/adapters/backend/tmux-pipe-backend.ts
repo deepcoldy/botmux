@@ -24,6 +24,7 @@
  * grouped — fully zero-touch from tmux's perspective beyond the pipe-pane
  * subscription, which is automatically detached when we kill the backend.
  */
+import { CliStartupExitError } from '../../core/startup-failure-reason.js';
 import * as fs from 'node:fs';
 import { execSync, execFile, execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -568,7 +569,9 @@ export function buildPipePaneStartupError(rawErr: unknown, evidence: PipePaneDea
   ];
   if (evidence.lastScreen) lines.push(`最后一屏摘要：\n${evidence.lastScreen}`);
   if (rawFirstLine) lines.push(`原始 pipe-pane 错误：${rawFirstLine}`);
-  return new Error(lines.join('\n'));
+  const code = typeof evidence.paneDeadStatus === 'string' && /^\d+$/.test(evidence.paneDeadStatus)
+    ? Number(evidence.paneDeadStatus) : null;
+  return new CliStartupExitError(lines.join('\n'), code);
 }
 
 /** Best-effort post-mortem after a terminal pipe-pane failure. Runs one
@@ -3044,6 +3047,40 @@ export class TmuxPipeBackend implements SessionBackend {
     } catch {
       return null;
     }
+  }
+
+  /** Non-blocking tmux pane dimensions query for async native viewport
+   *  staging. Mirrors captureViewportAsync's bounded execFile contract so
+   *  periodic readiness sampling never blocks the Worker event loop. */
+  getPaneSizeAsync(): Promise<{ cols: number; rows: number } | null> {
+    if (this.exited || !Array.isArray(this.tmuxArgs) || !this.paneTarget) {
+      return Promise.resolve(null);
+    }
+    return new Promise((resolve, reject) => {
+      execFile('tmux', [...this.tmuxArgs, 'display-message', '-p', '-t', this.paneTarget, '#{pane_width} #{pane_height}'], {
+        encoding: 'utf8',
+        timeout: 1_000,
+        killSignal: 'SIGKILL',
+        maxBuffer: 16 * 1024,
+        env: tmuxEnv(),
+      }, (error, stdout) => {
+        if (error) {
+          this.noteCaptureError(error);
+          reject(error);
+          return;
+        }
+        if (this.exited) {
+          resolve(null);
+          return;
+        }
+        const [cols, rows] = stdout.trim().split(/\s+/).map(s => Number(s));
+        if (Number.isInteger(cols) && Number.isInteger(rows) && cols > 0 && rows > 0) {
+          resolve({ cols, rows });
+        } else {
+          resolve(null);
+        }
+      });
+    });
   }
 
   /** Cheap probe: is the adopted pane currently in the alternate screen

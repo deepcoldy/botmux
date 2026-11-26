@@ -1,4 +1,24 @@
 export type CliUsageLimitKind = 'usage' | 'rate';
+export type CliUsageLimitSource = 'antigravity-error-composer' | 'antigravity-native-log';
+
+/** Serializable transcript position sampled immediately before an Antigravity
+ * input was written. A no-output/answered proof may only use USER_INPUT records
+ * at or after this boundary, including when the full/compact view changes. */
+export interface AntigravityTranscriptWriteBoundary {
+  readonly sampledTranscriptPath?: string;
+  readonly minByteOffset: number;
+  readonly skipPriorMatches?: number;
+}
+
+export function sameAntigravityTranscriptWriteBoundary(
+  a: AntigravityTranscriptWriteBoundary | undefined,
+  b: AntigravityTranscriptWriteBoundary | undefined,
+): boolean {
+  return a === b || Boolean(a && b
+    && a.sampledTranscriptPath === b.sampledTranscriptPath
+    && a.minByteOffset === b.minByteOffset
+    && (a.skipPriorMatches ?? 0) === (b.skipPriorMatches ?? 0));
+}
 
 export interface CliUsageLimitState {
   limited: true;
@@ -9,8 +29,22 @@ export interface CliUsageLimitState {
   /** Stable identity of one relative-countdown refusal, persisted so a
    * reattached worker cannot move its already-observed reset deadline. */
   relativeResetKey?: string;
-  /** A confirmed native quota composer must survive unrelated PTY output. */
-  source?: 'antigravity-error-composer';
+  /** A confirmed native quota source must survive unrelated PTY output. */
+  source?: CliUsageLimitSource;
+  /** Canonical primary native episode key: `log:<glog-ts>` when log-backed,
+   *  else `composer:<errorId>`. Independent of countdown wording. */
+  nativeEpisodeKey?: string;
+  /** Companion native key when one episode was observed simultaneously on both
+   *  a footerless composer and a native executor log (`composer:<errorId>`).
+   *  Never populated for replacement logs on an already-known composer. */
+  linkedNativeEpisodeKey?: string;
+  /** Paired native transcript proof that the turn produced zero output or side
+   *  effects after USER_INPUT and may be safely auto-replayed after rotation. */
+  directFailure?: true;
+  /** Current-turn pre-write boundary backing directFailure. It is persisted
+   *  alongside the provisional failed turn so daemon settlement re-proves the
+   *  same input window instead of accepting an older identical prompt. */
+  antigravityWriteBoundary?: AntigravityTranscriptWriteBoundary;
 }
 
 export interface CliUsageLimitNotDetected {
@@ -118,6 +152,14 @@ function parseRelativeReset(text: string, now: Date): {
 }
 
 /** Stable fixed cooldown pinned to wall-clock buckets for hard 429 fallbacks. */
+const HARD_RATE_LIMIT_FALLBACK_LABEL = '5-10 min';
+
+/** A rate limit that carried no provider reset time, so botmux applied its own
+ * cooldown: usually transient, unlike a quota with a stated reset clock. */
+export function isTransientRateLimit(state: CliUsageLimitState): boolean {
+  return state.kind === 'rate' && state.retryLabel === HARD_RATE_LIMIT_FALLBACK_LABEL;
+}
+
 function hardRateLimitFallbackTime(now: Date): { retryAtMs: number; retryLabel: string } {
   const nowMs = now.getTime();
   const bucketStart = Math.floor(nowMs / HARD_RATE_LIMIT_COOLDOWN_MS) * HARD_RATE_LIMIT_COOLDOWN_MS;
@@ -128,7 +170,7 @@ function hardRateLimitFallbackTime(now: Date): { retryAtMs: number; retryLabel: 
     retryAtMs,
     // Label reflects the real (5min, 10min] window, not an optimistic "~5 min":
     // the card's countdown text must not undersell how long the wait can be.
-    retryLabel: '5-10 min',
+    retryLabel: HARD_RATE_LIMIT_FALLBACK_LABEL,
   };
 }
 
@@ -304,9 +346,201 @@ export function detectCliUsageLimit(
   return { limited: false };
 }
 
+export function isAntigravityNativeLimit(state: CliUsageLimitState | undefined): boolean {
+  return state?.source === 'antigravity-error-composer' || state?.source === 'antigravity-native-log';
+}
+
+export function isExpiredNativeAntigravityQuota(
+  limit: CliUsageLimitState | undefined,
+  nowMs = Date.now(),
+): boolean {
+  return isAntigravityNativeLimit(limit) && Boolean(limit?.relativeResetKey) && limit!.retryAtMs <= nowMs;
+}
+
+function legacyComposerKeyFromRelativeReset(state: CliUsageLimitState | undefined): string | undefined {
+  if (state?.source !== 'antigravity-error-composer' || !state.relativeResetKey) return undefined;
+  const first = state.relativeResetKey.indexOf(':');
+  const second = first >= 0 ? state.relativeResetKey.indexOf(':', first + 1) : -1;
+  const errorId = second >= 0 ? state.relativeResetKey.slice(second + 1) : '';
+  return errorId ? `composer:${errorId}` : undefined;
+}
+
+/** All native episode keys carried by a confirmed Antigravity limit state.
+ *  Falls back to deriving `composer:<errorId>` from legacy `relativeResetKey`
+ *  so persisted pre-refactor rows match new rows with zero migration. */
+export function cliUsageLimitNativeKeys(state: CliUsageLimitState | undefined): string[] {
+  if (!state) return [];
+  const keys: string[] = [];
+  if (state.nativeEpisodeKey) keys.push(state.nativeEpisodeKey);
+  if (state.linkedNativeEpisodeKey && !keys.includes(state.linkedNativeEpisodeKey)) {
+    keys.push(state.linkedNativeEpisodeKey);
+  }
+  if (keys.length === 0) {
+    const legacy = legacyComposerKeyFromRelativeReset(state);
+    if (legacy) keys.push(legacy);
+  }
+  return keys;
+}
+
+/** Canonical primary episode key across worker, daemon, history, tombstones,
+ *  and notifications. Always prefers `log:*` over `composer:*`, then falls back
+ *  to `relativeResetKey` for generic/legacy states. */
+export function cliUsageLimitEpisodeKey(state: CliUsageLimitState | undefined): string | undefined {
+  if (!state) return undefined;
+  if (state.nativeEpisodeKey?.startsWith('log:')) return state.nativeEpisodeKey;
+  if (state.linkedNativeEpisodeKey?.startsWith('log:')) return state.linkedNativeEpisodeKey;
+  return state.nativeEpisodeKey
+    ?? state.linkedNativeEpisodeKey
+    ?? legacyComposerKeyFromRelativeReset(state)
+    ?? state.relativeResetKey;
+}
+
+/** Whether two usage-limit states represent the same underlying episode.
+ *  Conflicting `log:*` keys never match even if they share a composer Error ID;
+ *  linked `log:* <-> composer:*` pairs match bidirectionally. */
+export function isSameUsageLimitEpisode(
+  a: CliUsageLimitState | undefined,
+  b: CliUsageLimitState | undefined,
+): boolean {
+  if (!a || !b || a.kind !== b.kind) return false;
+  const aKeys = cliUsageLimitNativeKeys(a);
+  const bKeys = cliUsageLimitNativeKeys(b);
+  if (aKeys.length > 0 && bKeys.length > 0) {
+    const aLog = aKeys.find(k => k.startsWith('log:'));
+    const bLog = bKeys.find(k => k.startsWith('log:'));
+    if (aLog && bLog) return aLog === bLog;
+    return aKeys.some(k => bKeys.includes(k));
+  }
+  if (aKeys.length > 0 || bKeys.length > 0) return false;
+  if (a.relativeResetKey || b.relativeResetKey) {
+    return a.relativeResetKey === b.relativeResetKey;
+  }
+  return a.source === b.source && a.retryLabel === b.retryLabel && a.retryAtMs === b.retryAtMs;
+}
+
+/** Exact structural equality for persistence diffing and skip-write guards. */
+export function sameUsageLimit(
+  a: CliUsageLimitState | undefined,
+  b: CliUsageLimitState | undefined,
+): boolean {
+  if (!a || !b) return a === b;
+  return a.kind === b.kind
+    && a.retryAtMs === b.retryAtMs
+    && a.retryLabel === b.retryLabel
+    && a.retryReady === b.retryReady
+    && a.relativeResetKey === b.relativeResetKey
+    && a.source === b.source
+    && a.nativeEpisodeKey === b.nativeEpisodeKey
+    && a.linkedNativeEpisodeKey === b.linkedNativeEpisodeKey
+    && a.directFailure === b.directFailure
+    && sameAntigravityTranscriptWriteBoundary(a.antigravityWriteBoundary, b.antigravityWriteBoundary);
+}
+
+/** Whether any native key of `state` is present in the durable consumed set. */
+export function isAntigravityEpisodeConsumed(
+  consumedKeys: readonly string[] | undefined,
+  state: CliUsageLimitState | undefined,
+): boolean {
+  if (!consumedKeys?.length || !state) return false;
+  const keys = cliUsageLimitNativeKeys(state);
+  if (keys.length === 0) return false;
+  return keys.some(key => consumedKeys.includes(key));
+}
+
+/** Append all native keys of one or more settled episodes into a bounded FIFO
+ *  consumed list (default cap 32), avoiding duplicates. */
+export function appendConsumedAntigravityQuotaKeys(
+  existing: readonly string[] | undefined,
+  episodes: readonly (CliUsageLimitState | undefined)[],
+  limit = 32,
+): readonly string[] | undefined {
+  const next = existing ? [...existing] : [];
+  let changed = false;
+  for (const episode of episodes) {
+    for (const key of cliUsageLimitNativeKeys(episode)) {
+      if (!next.includes(key)) {
+        next.push(key);
+        changed = true;
+      }
+    }
+  }
+  if (!changed) return existing;
+  return next.length > limit ? next.slice(next.length - limit) : next;
+}
+
 export function usageLimitStateKey(state: CliUsageLimitState): string {
   const key = `${state.kind}:${state.retryAtMs}:${state.retryLabel}`;
-  return state.relativeResetKey ? `${key}:${state.relativeResetKey}` : key;
+  const episode = cliUsageLimitEpisodeKey(state);
+  return episode ? `${key}:${episode}` : key;
+}
+
+/** Stable worker-side evidence fingerprint for frame deduplication. Omits
+ *  per-tick recomputed `retryAtMs` when an explicit episode key exists or the
+ *  state is a synthetic bare-429 cooldown, preventing per-tick IPC spam while
+ *  still firing on proof, source, episode, or `retryReady` transitions. */
+export function usageLimitEvidenceKey(state: CliUsageLimitState | undefined): string {
+  if (!state) return '';
+  const episode = cliUsageLimitEpisodeKey(state);
+  const includeRetryAt = !episode && !isTransientRateLimit(state);
+  return JSON.stringify([
+    state.kind,
+    includeRetryAt ? state.retryAtMs : null,
+    state.retryLabel,
+    state.retryReady,
+    state.source ?? null,
+    state.nativeEpisodeKey ?? null,
+    state.linkedNativeEpisodeKey ?? null,
+    state.relativeResetKey ?? null,
+    state.directFailure === true,
+    state.antigravityWriteBoundary
+      ? [
+        state.antigravityWriteBoundary.sampledTranscriptPath ?? null,
+        state.antigravityWriteBoundary.minByteOffset,
+        state.antigravityWriteBoundary.skipPriorMatches ?? 0,
+      ]
+      : null,
+  ]);
+}
+
+/** Semantic dedup suffix folded into screenshot pixel keys so static-pixel
+ *  frames still emit on proof, episode, expiry, or recovery transitions. */
+export function screenshotUsageLimitDedupSuffix(frame: {
+  status: string;
+  usageLimit?: CliUsageLimitState;
+  expiredAntigravityQuota?: CliUsageLimitState;
+  usageLimitRecovery?: string;
+}): string {
+  const parts: string[] = [];
+  if (frame.status === 'limited' || frame.usageLimit) {
+    parts.push(`status=${frame.status}`);
+    parts.push(`limit=${usageLimitEvidenceKey(frame.usageLimit)}`);
+  }
+  if (frame.expiredAntigravityQuota) {
+    parts.push(`expired=${cliUsageLimitEpisodeKey(frame.expiredAntigravityQuota) ?? usageLimitStateKey(frame.expiredAntigravityQuota)}`);
+  }
+  if (frame.usageLimitRecovery) {
+    parts.push(`recovery=${frame.usageLimitRecovery}`);
+  }
+  return parts.length > 0 ? `:${parts.join(':')}` : '';
+}
+
+/** Stable scope identifying the logical turn / direct-input generation that
+ *  produced a usage-limit observation. Used to pin synthetic bare-429 cooldowns
+ *  within a single turn without leaking expired cooldowns across turns. */
+export function computeUsageLimitTurnScope(
+  turnId: string | undefined,
+  dispatchAttempt: number | undefined,
+  directInputEpoch: number | undefined,
+): string {
+  return JSON.stringify([turnId ?? null, dispatchAttempt ?? null, directInputEpoch ?? 0]);
+}
+
+export interface ReconcileUsageLimitOptions {
+  nowMs?: number;
+  /** Explicitly opt into pinning synthetic `5-10 min` hard-429 cooldowns across
+   *  5-minute bucket rollovers ONLY within the same turn/input generation.
+   *  Defaults fail-closed to `false` so new turns never inherit expired cooldowns. */
+  sameTransientTurn?: boolean;
 }
 
 /** Repeated screenshots contain the same relative duration, not a new reset.
@@ -315,16 +549,141 @@ export function usageLimitStateKey(state: CliUsageLimitState): string {
 export function reconcileUsageLimitState(
   previous: CliUsageLimitState | undefined,
   incoming: CliUsageLimitState,
-  nowMs = Date.now(),
+  nowMsOrOpts: number | ReconcileUsageLimitOptions = Date.now(),
 ): CliUsageLimitState {
-  if (!incoming.relativeResetKey || previous?.relativeResetKey !== incoming.relativeResetKey
-    || previous.kind !== incoming.kind || !Number.isFinite(previous.retryAtMs)) return incoming;
-  return {
-    ...incoming,
-    retryAtMs: previous.retryAtMs,
-    retryReady: previous.retryReady || nowMs >= previous.retryAtMs,
-    ...(previous.source ? { source: previous.source } : {}),
-  };
+  if (!previous || !Number.isFinite(previous.retryAtMs)) return incoming;
+  const nowMs = typeof nowMsOrOpts === 'number' ? nowMsOrOpts : (nowMsOrOpts.nowMs ?? Date.now());
+  const sameTransientTurn = typeof nowMsOrOpts === 'number' ? false : nowMsOrOpts.sameTransientTurn === true;
+
+  if (sameTransientTurn && isTransientRateLimit(previous) && isTransientRateLimit(incoming)) {
+    return {
+      ...incoming,
+      retryAtMs: previous.retryAtMs,
+      retryReady: previous.retryReady || nowMs >= previous.retryAtMs,
+    };
+  }
+
+  const prevKeys = cliUsageLimitNativeKeys(previous);
+  const nextKeys = cliUsageLimitNativeKeys(incoming);
+
+  // 1. Same native or linked episode, or same generic relativeResetKey.
+  if (isSameUsageLimitEpisode(previous, incoming)) {
+    const mergedKeys = [...new Set([...nextKeys, ...prevKeys])];
+    const logKey = mergedKeys.find(k => k.startsWith('log:'));
+    const composerKey = mergedKeys.find(k => k.startsWith('composer:'));
+    const primaryKey = logKey ?? composerKey;
+    const linkedKey = logKey && composerKey ? composerKey : undefined;
+    const source = incoming.source ?? previous.source;
+    const next: CliUsageLimitState = {
+      ...incoming,
+      retryAtMs: previous.retryAtMs,
+      retryReady: previous.retryReady || nowMs >= previous.retryAtMs,
+      ...(source ? { source } : {}),
+    };
+    if (primaryKey) next.nativeEpisodeKey = primaryKey;
+    else delete next.nativeEpisodeKey;
+    if (linkedKey) next.linkedNativeEpisodeKey = linkedKey;
+    else delete next.linkedNativeEpisodeKey;
+    return next;
+  }
+
+  // 2. Generic partial frame upgraded to a confirmed native episode on the same relativeResetKey.
+  if (
+    prevKeys.length === 0
+    && nextKeys.length > 0
+    && previous.kind === incoming.kind
+    && Boolean(previous.relativeResetKey && previous.relativeResetKey === incoming.relativeResetKey)
+  ) {
+    return {
+      ...incoming,
+      retryAtMs: previous.retryAtMs,
+      retryReady: previous.retryReady || nowMs >= previous.retryAtMs,
+    };
+  }
+
+  // 3. Active (unexpired) native episode followed by a partial generic frame on the same relativeResetKey:
+  //    keep first deadline and native provenance so a truncated capture cannot strip native identity.
+  if (
+    prevKeys.length > 0
+    && nextKeys.length === 0
+    && previous.kind === incoming.kind
+    && Boolean(previous.relativeResetKey && previous.relativeResetKey === incoming.relativeResetKey)
+    && !isExpiredNativeAntigravityQuota(previous, nowMs)
+  ) {
+    return {
+      ...incoming,
+      retryAtMs: previous.retryAtMs,
+      retryReady: previous.retryReady || nowMs >= previous.retryAtMs,
+      ...(previous.source ? { source: previous.source } : {}),
+      ...(previous.nativeEpisodeKey ? { nativeEpisodeKey: previous.nativeEpisodeKey } : {}),
+      ...(previous.linkedNativeEpisodeKey ? { linkedNativeEpisodeKey: previous.linkedNativeEpisodeKey } : {}),
+    };
+  }
+
+  return incoming;
+}
+
+export type UsageLimitTriggerEdge =
+  | { readonly kind: 'entered'; readonly notificationKey: string }
+  | { readonly kind: 'replaced_expired'; readonly notificationKey: string }
+  | { readonly kind: 'native_confirmation'; readonly notificationKey: string }
+  | { readonly kind: 'replaced_native'; readonly notificationKey: string }
+  | { readonly kind: 'replaced_transient_turn'; readonly notificationKey: string };
+
+/** Single canonical daemon trigger-edge classifier shared by `screen_update`
+ *  and `screenshot_uploaded`. Returns an edge iff rotation / fallback / owner
+ *  notification should be evaluated for this state transition. */
+export function classifyUsageLimitTriggerEdge(input: {
+  prevStatus?: string;
+  prevLimit?: CliUsageLimitState;
+  prevTurnScope?: string;
+  nextLimit: CliUsageLimitState;
+  nextTurnScope?: string;
+  nowMs?: number;
+}): UsageLimitTriggerEdge | undefined {
+  const { prevStatus, prevLimit, prevTurnScope, nextLimit, nextTurnScope } = input;
+  const nowMs = input.nowMs ?? Date.now();
+  const nextKey = usageLimitStateKey(nextLimit);
+
+  if (prevStatus !== 'limited' || !prevLimit) {
+    return { kind: 'entered', notificationKey: nextKey };
+  }
+  if (isExpiredNativeAntigravityQuota(prevLimit, nowMs) && !isSameUsageLimitEpisode(prevLimit, nextLimit)) {
+    return { kind: 'replaced_expired', notificationKey: nextKey };
+  }
+  if (!isAntigravityNativeLimit(prevLimit) && isAntigravityNativeLimit(nextLimit)) {
+    const sameBanner = prevLimit.kind === nextLimit.kind
+      && prevLimit.retryLabel === nextLimit.retryLabel
+      && prevLimit.relativeResetKey === nextLimit.relativeResetKey;
+    return {
+      kind: 'native_confirmation',
+      notificationKey: sameBanner ? usageLimitStateKey(prevLimit) : nextKey,
+    };
+  }
+  if (isAntigravityNativeLimit(nextLimit) && !isSameUsageLimitEpisode(prevLimit, nextLimit)) {
+    return { kind: 'replaced_native', notificationKey: nextKey };
+  }
+  if (
+    isTransientRateLimit(prevLimit)
+    && isTransientRateLimit(nextLimit)
+    && prevTurnScope !== undefined
+    && nextTurnScope !== undefined
+    && prevTurnScope !== nextTurnScope
+  ) {
+    return { kind: 'replaced_transient_turn', notificationKey: `${nextKey}@${nextTurnScope}` };
+  }
+  if (
+    isTransientRateLimit(prevLimit)
+    && isTransientRateLimit(nextLimit)
+    && prevLimit.retryReady
+    && !nextLimit.retryReady
+  ) {
+    return {
+      kind: 'replaced_transient_turn',
+      notificationKey: nextTurnScope ? `${nextKey}@${nextTurnScope}` : nextKey,
+    };
+  }
+  return undefined;
 }
 
 /**

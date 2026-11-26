@@ -34,6 +34,8 @@
  * `POST /question/{id}/reply`、body `{ answers }`）。
  */
 
+import { answerWithNote, noteEntry } from '../ask-notes.js';
+import type { Locale } from '../../i18n/types.js';
 import type { AskQuestion } from '../ask-types.js';
 import type { HookAskAdapter, ParsedAsk } from './types.js';
 
@@ -97,7 +99,17 @@ const openCodeAdapter: HookAskAdapter = {
     parsed: ParsedAsk,
     comment?: string | null,
     customAnswers?: ReadonlyArray<string | null>,
+    notes?: ReadonlyArray<string | null>,
+    locale?: Locale,
   ): string {
+    // A note written next to the options: on a single-choice question it rides on the one answer
+    // string (as for Claude Code); on a multi-choice one it is one more entry after the labels.
+    const withNote = (values: string[], i: number) => {
+      const note = notes?.[i];
+      if (!note) return values;
+      return parsed.questions[i]?.multiSelect || values.length !== 1
+        ? [...values, noteEntry(note, locale)] : [answerWithNote(values[0]!, note, locale)];
+    };
     const p = parsed.raw as Record<string, unknown> | undefined;
     const toolInput = (p?.tool_input as { questions?: unknown[] } | undefined);
     const hasStructured = Array.isArray(toolInput?.questions) && (toolInput!.questions!.length > 0);
@@ -113,17 +125,17 @@ const openCodeAdapter: HookAskAdapter = {
           return customText ? [customText] : [''];
         }
         // OpenCode options 以 label 为 key，直接用 key（= label）
-        return selectedKeys.map((k) => {
+        return withNote(selectedKeys.map((k) => {
           const opt = q.options.find((o) => o.key === k);
           return opt ? opt.label : k;
-        });
+        }), i);
       });
       return JSON.stringify({ type: 'answer', answers });
     }
 
     // 旧版：拍平所有答案为 free-text；纯自定义回复时直接用自定义文字
     const flat = answersByQuestion
-      .map((keys, i) => customAnswers?.[i] ? [customAnswers[i]!] : keys)
+      .map((keys, i) => customAnswers?.[i] ? [customAnswers[i]!] : keys.length ? withNote([...keys], i) : keys)
       .flat()
       .filter((s) => s.length > 0)
       .join(', ');

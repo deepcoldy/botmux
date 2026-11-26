@@ -15,6 +15,12 @@ import {
  * Generic over the runtime status union so the worker can plug in its
  * RuntimeScreenStatus while tests drive it with plain strings.
  */
+export type UsageLimitTurnEvent =
+  | { readonly kind: 'beginTurn'; readonly snapshot: string; readonly turnSeq: number }
+  | { readonly kind: 'answered'; readonly turnSeq: number };
+
+export type UsageLimitTurnListener = (event: UsageLimitTurnEvent) => void;
+
 export interface UsageLimitTracker<S extends string = string> {
   currentTurn(): number;
   beginTurn(snapshot: string): number;
@@ -24,6 +30,17 @@ export interface UsageLimitTracker<S extends string = string> {
     refineDetection?: (state: CliUsageLimitState) => CliUsageLimitState | undefined,
   ): { status: S | 'limited'; usageLimit?: CliUsageLimitState };
   detectedThisTurn(seq: number): boolean;
+  /** Expose the configured output-activity probe so external CLI evaluators
+   *  share the exact same quiescence gate. */
+  isOutputActive(): boolean | undefined;
+  /** Record that the current turn hit a limit (used by external CLI-specific
+   *  evaluators so submit-confirmation suppression stays coherent). */
+  noteTurnDetected(): void;
+  /** Clear screen-detected limit marker after positive composer recovery without
+   *  disturbing an authoritative structured transcript limit. */
+  noteScreenRecovery(): void;
+  /** Subscribe to generic turn-start and answered-turn lifecycle transitions. */
+  addTurnListener(listener: UsageLimitTurnListener): () => void;
   noteStructuredLimit(state: CliUsageLimitState): void;
   /**
    * A turn reached its terminal.
@@ -152,6 +169,13 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
   // blocked turn. Screen-scan detections stay one-shot: the daemon self-heal is
   // the correct remedy for THEIR false positives (idle-flicker mis-hits).
   let activeStructured: { seq: number; state: CliUsageLimitState } | undefined;
+  const turnListeners = new Set<UsageLimitTurnListener>();
+
+  const emitTurnEvent = (event: UsageLimitTurnEvent): void => {
+    for (const listener of turnListeners) {
+      listener(event);
+    }
+  };
 
   return {
     currentTurn(): number {
@@ -169,6 +193,7 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
         ? usageLimitStateKey(current)
         : undefined;
       turnProducedAnswer = false;
+      emitTurnEvent({ kind: 'beginTurn', snapshot, turnSeq });
       return turnSeq;
     },
     // Map a runtime status to a usage-limit-aware status, recording whether this
@@ -222,6 +247,21 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
     detectedThisTurn(seq: number): boolean {
       return detectedTurn === seq;
     },
+    isOutputActive(): boolean | undefined {
+      return opts.isOutputActive?.();
+    },
+    noteTurnDetected(): void {
+      detectedTurn = turnSeq;
+    },
+    noteScreenRecovery(): void {
+      if (activeStructured?.seq !== turnSeq) {
+        detectedTurn = undefined;
+      }
+    },
+    addTurnListener(listener: UsageLimitTurnListener): () => void {
+      turnListeners.add(listener);
+      return () => { turnListeners.delete(listener); };
+    },
     // Record a limit that came from a STRUCTURED signal (transcript error
     // record) rather than screen text. Mirrors classify()'s state writes so
     // the tracker stays coherent: mark this turn as having hit a limit (read
@@ -265,6 +305,7 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
       // harvested answer. Any limit banner that was already on screen when
       // the turn opened is therefore leftover text from an earlier episode.
       turnProducedAnswer = true;
+      emitTurnEvent({ kind: 'answered', turnSeq });
     },
   };
 }

@@ -1,5 +1,7 @@
+import { normalizeCustomModels } from './core/model-value-pattern.js';
 import { normalizeOwnerGroupFollowConfig, type OwnerGroupFollowConfig } from './services/owner-group-follow-policy.js';
 import { groupSessionSupervisorConfig } from './core/group-session-supervisor-config.js';
+import { validateSessionGroupCollaborationConfig, type SessionGroupCollaborationConfig } from './services/collab-group-config.js';
 import { normalizeCodexProfile, assertCodexProfileConfig } from './services/codex-profiles.js';
 import { normalizeMessageListenerReplyMode } from './services/message-listener-reply-policy.js';
 import { normalizeLongTaskReminderConfig, type LongTaskReminderConfig } from './services/long-task-reminder-policy.js';
@@ -109,7 +111,6 @@ import {
 } from './im/lark/reply-card-style.js';
 import {
   normalizeAskOptionLayout,
-  setAskOptionLayoutLookup,
   type AskOptionLayout,
 } from './im/lark/ask-option-layout.js';
 import { cliModelMayKeepReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId, isCodexReasoningEffort } from './services/codex-reasoning-effort.js';
@@ -131,6 +132,10 @@ import {
   normalizeQuotaFallbackBotConfig,
   type QuotaFallbackBotConfig,
 } from './services/quota-fallback.js';
+import {
+  normalizeQuotaFallbackChainConfig,
+  type QuotaFallbackChainConfig,
+} from './services/quota-fallback-chain.js';
 import {
   normalizeTraexAutoModelConfig,
   TRAEX_AUTO_MODEL_ID,
@@ -1399,6 +1404,19 @@ export interface VcMeetingRealtimeVoiceConfig {
  * Everything is optional; effective defaults in parentheses.
  */
 export interface SessionGroupConfig {
+  /**
+   * 私聊专属群可视化协作配置（design 2026-11-20-dm-collab-group-design §4）。
+   * 缺省、不存在或非 `{enabled:true}` 都完全关闭（走 legacy 建群）。
+   * parse 时经 `validateSessionGroupCollaborationConfig` 结构校验，仅 `{enabled:true}`
+   * 且结构合法才保留，否则丢弃（安全默认关闭，不被类型断言绕过）。
+   */
+  collaboration?: SessionGroupCollaborationConfig;
+  /**
+   * 解析期标记：显式 `{enabled:true}` 但结构非法的协作配置被保留原样时写入该原因，
+   * 供 preflight 认出「应 fail-closed 而非走 legacy」的坏配置（§3 铁律 1）。
+   * 运行时不落盘、不参与任何序列化。仅显式 enabled 且非法时非空。
+   */
+  collaborationDisabledReason?: string;
   /** Group-name generation. */
   naming?: {
     /**
@@ -1525,8 +1543,7 @@ export interface BotConfig {
   brand?: Brand;
   /**
    * `botmux setup add|configure --extra-scopes-file` 记下的追加权限清单绝对路径，之后不带参的
-   * `setup configure` 沿用它。只有 setup 脚本化命令直接读写 bots.json 里的这个字段；
-   * {@link parseBotConfigsFromText} 不携带它，daemon 运行时也不用。
+   * `setup configure` 沿用它。daemon 用清单的 user 桶校验显式请求的 scope 名称。
    */
   extraScopesFile?: string;
   /**
@@ -1612,6 +1629,8 @@ export interface BotConfig {
    * `modelChoices` for the curated candidates surfaced in `botmux setup`.
    */
   model?: string;
+  /** Up to 50 extra model IDs for this bot’s configured CLI or gateway. */
+  customModels?: string[];
   /** Experimental TraeX-only ordered model allowlist used when model=`auto`.
    * The first entry is the core model; later entries are capacity fallbacks.
    * Missing keeps the feature off. */
@@ -1730,6 +1749,8 @@ export interface BotConfig {
    * 逐轮信封立即生效。
    */
   replyDelivery?: 'send' | 'transcript';
+  /** Persist and recover final replies to this bot's ordinary human IM turns. */
+  durableImReplies?: boolean;
   turnResults?: { enabled: boolean };
   /** Skip Botmux prompt/skill/context injection and auto-forward final replies.
    * Existing prompt and skill customizations remain saved. */
@@ -1903,6 +1924,8 @@ export interface BotConfig {
    * agent mint the tenant token itself.
    */
   sandboxWithholdBotSecret?: boolean;
+  /** Opt-in opaque plugin results. Requires a sandbox and withholds all CLI Lark credentials. */
+  protectedResults?: boolean;
   /**
    * LEGACY read-isolation flag (pre fs-policy). The unified sandbox is
    * deny-by-default, so cross-bot read isolation is inherent — this flag is
@@ -1913,6 +1936,8 @@ export interface BotConfig {
   /** LEGACY: extra read-deny paths — auto-migrated into sandboxPaths.deny. */
   readDenyExtraPaths?: string[];
   backendType?: BackendType;
+  /** Register this bot's hc sessions as tabs on the private core's Herdr layout. */
+  hcHerdrTabs?: boolean;
   /**
    * Configuration for the riff backend (agent-services platform). Required
    * when `backendType` is `'riff'`. Contains base URL, template ID, agent/model
@@ -1983,6 +2008,12 @@ export interface BotConfig {
    * Missing/invalid/disabled means no automatic handoff.
    */
   quotaFallbackBot?: QuotaFallbackBotConfig;
+  /**
+   * Optional same-bot CLI/model chain used before `quotaFallbackBot`: on a
+   * usage or rate limit the session restarts in place on the next step.
+   * Missing/invalid/disabled means sessions stay on the bot's own CLI.
+   */
+  quotaFallbackChain?: QuotaFallbackChainConfig;
   /**
    * When true, THIS bot's daemon watches host load/memory and DMs the bot owner
    * when the machine crosses into (and back out of) an overloaded state — a
@@ -2308,9 +2339,8 @@ export interface BotConfig {
    */
   replyStyle?: ReplyStyleConfig;
   /**
-   * `botmux ask` 选项按钮布局：'compact'（默认，按行自动换行）或 'vertical'
-   * （每行 1 个，长标签更易读）。手改的非法值在读取时 fail-soft 回退 compact，
-   * 不影响发卡；卡片在 daemon 进程内渲染，改动即时生效，无需重启 worker。
+   * 旧的 `botmux ask` 选项按钮布局（'compact' / 'vertical'）。提问卡改成每个选项一行勾选框后
+   * 已不再影响排版；为不破坏现有配置，仍照常读取、校验（非法值 fail-soft 丢弃）和保存。
    */
   askOptionLayout?: AskOptionLayout;
   /**
@@ -2324,6 +2354,15 @@ export interface BotConfig {
    * `usageDisplay` set is read as `'off'` (see {@link resolveUsageDisplay}).
    */
   usageDisplay?: UsageDisplayMode;
+  /**
+   * Whether to show 5h / 7d rolling account quota percentages in the card usage
+   * line (streaming card body & reply-card footer). Default ON (absent = true);
+   * only an explicit `false` hides the 5h / 7d segments while keeping context
+   * usage (`ctx`), token counts, cache hit rate, custom extensions and model
+   * identity visible. Display only — statusline persistence and quota fallback
+   * are unaffected.
+   */
+  showUsageQuota?: boolean;
   replyFooterEnabled?: boolean;
   replyFooterBrand?: boolean;
   replyFooterModel?: boolean;
@@ -2781,16 +2820,13 @@ export function __testOnly_resetBotRegistry(): void {
   brandLabelCache = null;
   cachedLarkUploadHttpPool = undefined;
   usageDisplayCache = null;
+  showUsageQuotaCache = null;
   replyStyleCache = null;
 }
 
 // Wire the i18n lookup so `localeForBot()` can resolve per-bot locale without
 // a hard import cycle between `i18n` and `bot-registry`.
 setBotLookup((id) => bots.get(id));
-
-// 同理给 ask 卡片选项布局注册 lookup：ask-card.ts 经 turn-reply-ask.ts 间接依赖
-// 本模块，不能反向 import，只能由这里把 bots 表推进去。
-setAskOptionLayoutLookup((id) => bots.get(id));
 setHideLocalAddressesResolver(resolveHideLocalAddresses);
 
 /** Path of the bot config file we loaded (so `/oncall` can persist bindings back). */
@@ -3141,6 +3177,10 @@ export function getStrictOwnerOpenId(larkAppId: string): string | undefined {
  *  由 core/reply-delivery.ts 的 effectiveReplyDelivery 按 CLI 补缺省（doubao 缺省
  *  transcript，其余缺省 send）。只读内存
  *  registry：worker 通过 init IPC 拿冻结值，不需要磁盘 mtime 缓存。 */
+export function durableImRepliesEnabled(larkAppId: string): boolean {
+  return bots.get(larkAppId)?.config.durableImReplies === true;
+}
+
 export function resolveReplyDelivery(larkAppId: string): 'send' | 'transcript' | undefined {
   const v = bots.get(larkAppId)?.config.replyDelivery;
   return v === 'transcript' || v === 'send' ? v : undefined;
@@ -3322,7 +3362,13 @@ export function findOncallChatForAnyBot(chatId: string): OncallChat | undefined 
 // the configured value (undefined when the bot has no brandLabel key).
 let brandLabelCache: { mtimeMs: number; map: Map<string, string | undefined> } | null = null;
 let usageDisplayCache: { mtimeMs: number; map: Map<string, UsageDisplayMode> } | null = null;
+let showUsageQuotaCache: { mtimeMs: number; map: Map<string, boolean> } | null = null;
 let replyStyleCache: { mtimeMs: number; map: Map<string, ReplyStyleConfig | undefined> } | null = null;
+
+/** Default ON: only an explicit `false` hides the 5h / 7d quota segments. */
+export function normalizeShowUsageQuota(entry?: { showUsageQuota?: unknown }): boolean {
+  return entry?.showUsageQuota !== false;
+}
 
 /** Normalize a raw bots.json entry's usage-display intent to the enum, applying
  *  backward compat: an explicit `usageDisplay` wins; otherwise a legacy
@@ -3483,6 +3529,42 @@ export function resolveUsageDisplay(larkAppId: string): UsageDisplayMode {
   } catch {
     return DEFAULT_USAGE_DISPLAY;
   }
+}
+
+/**
+ * Whether to show 5h / 7d rolling account quota percentages in card usage
+ * lines (default ON). Live registry first, disk bots.json second (so host
+ * `botmux send` sees hot `/botconfig` updates), own-bot spawn env fallback for
+ * sandboxed / remote sessions where bots.json is unreadable.
+ */
+export function resolveShowUsageQuota(larkAppId: string): boolean {
+  const inMem = bots.get(larkAppId);
+  if (inMem) return normalizeShowUsageQuota(inMem.config);
+  const path = loadedConfigPath ?? botsConfigDiskPath();
+  if (path) {
+    try {
+      const stat = statSync(path);
+      if (!showUsageQuotaCache || showUsageQuotaCache.mtimeMs !== stat.mtimeMs) {
+        const raw = JSON.parse(readFileSync(path, 'utf-8'));
+        const map = new Map<string, boolean>();
+        if (Array.isArray(raw)) {
+          for (const entry of raw) {
+            if (entry && typeof entry.larkAppId === 'string') {
+              map.set(entry.larkAppId, normalizeShowUsageQuota(entry));
+            }
+          }
+        }
+        showUsageQuotaCache = { mtimeMs: stat.mtimeMs, map };
+      }
+      const configured = showUsageQuotaCache.map.get(larkAppId);
+      if (configured !== undefined) return configured;
+    } catch { /* isolated send: disk is intentionally unreadable */ }
+  }
+  if (process.env.BOTMUX_LARK_APP_ID === larkAppId
+    && process.env.BOTMUX_SHOW_USAGE_QUOTA === 'false') {
+    return false;
+  }
+  return true;
 }
 
 /**
@@ -4031,6 +4113,13 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     if (entry.sandboxWithholdBotSecret != null && typeof entry.sandboxWithholdBotSecret !== 'boolean') {
       throw new Error(`Bot config [${i}]: sandboxWithholdBotSecret must be true or false, got ${JSON.stringify(entry.sandboxWithholdBotSecret)}`);
     }
+    if (entry.protectedResults != null && typeof entry.protectedResults !== 'boolean') {
+      throw new Error(`Bot config [${i}]: protectedResults must be true or false`);
+    }
+    if (entry.protectedResults === true && (!(entry.sandbox === true || entry.sandbox === 'oncall')
+      || entry.larkToolBinding === false)) {
+      throw new Error(`Bot config [${i}]: protectedResults requires an explicit oncall sandbox and managed lark-tool binding`);
+    }
     validateCliLaunchModeConfig({
       cliId: entryCliId,
       cliLaunchMode,
@@ -4382,6 +4471,18 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       ? (traexAutoModel ? TRAEX_AUTO_MODEL_ID : undefined)
       : requestedModel;
 
+    const normalizedQuotaFallbackChain = normalizeQuotaFallbackChainConfig(entry.quotaFallbackChain, {
+      cliId: entryCliId,
+      model,
+      backendType: typeof entry.backendType === 'string' ? entry.backendType : undefined,
+      codexRpcInput: entry.codexRpcInput === true,
+    });
+    if (normalizedQuotaFallbackChain.error) {
+      logger.warn(
+        `[bot-registry:${entry.larkAppId}] quotaFallbackChain ignored: ${normalizedQuotaFallbackChain.error}`,
+      );
+    }
+
     // Shared effort applies only where a model has no independent entry.
     const sharedEffortModels = traexAutoModel
       ? traexAutoModel.models.filter(id => !Object.prototype.hasOwnProperty.call(traexAutoModel.modelSettings ?? {}, id))
@@ -4502,6 +4603,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // brand：只认精确的 'lark'，其余 → undefined（下游 normalizeBrand 当
       // feishu）。feishu 故意存成 undefined，保持旧 bots.json 干净、不写死字段。
       brand: entry.brand === 'lark' ? 'lark' : undefined,
+      extraScopesFile: typeof entry.extraScopesFile === 'string' ? entry.extraScopesFile.trim() || undefined : undefined,
       approvalDeferredScopes: normalizeApprovalDeferredScopes(entry.approvalDeferredScopes),
       cardActionAckTimeoutMs: normalizeCardActionAckTimeoutMs(entry.cardActionAckTimeoutMs),
       name: typeof entry.name === 'string' && entry.name.trim() ? entry.name.trim() : undefined,
@@ -4520,6 +4622,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.launchShell.trim()
         : undefined,
       model,
+      customModels: normalizeCustomModels(entry.customModels),
       traexAutoModel,
       groupDefaultModels: normalizeGroupDefaultModels(entry.groupDefaultModels),
       groupSerialInput: normalizeGroupSerialInput(entry.groupSerialInput),
@@ -4554,6 +4657,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // 显式 send / transcript 都保留；缺省按 defaultReplyDeliveryFor 解析。
       topicUnavailablePolicy: entry.topicUnavailablePolicy === 'stop' ? 'stop' : undefined,
       replyDelivery: entry.replyDelivery === 'transcript' || entry.replyDelivery === 'send' ? entry.replyDelivery : undefined,
+      durableImReplies: entry.durableImReplies === true || undefined,
       promptInjection: entry.promptInjection === 'none' ? 'none' : undefined,
       // Only the non-default hook mode is persisted; absent, 'off', and invalid
       // values all retain the historical inline behavior.
@@ -4589,11 +4693,13 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       sandboxReadonlyPaths: normalizeStringList(entry.sandboxReadonlyPaths),
       sandboxNetwork: typeof entry.sandboxNetwork === 'boolean' ? entry.sandboxNetwork : undefined,
       // assistantMode implies it (see sandboxWithholdsBotSecret)
-      ...(entry.sandboxWithholdBotSecret === true || entry.assistantMode === true ? { sandboxWithholdBotSecret: true } : {}),
+      ...(entry.sandboxWithholdBotSecret === true || entry.assistantMode === true || entry.protectedResults === true ? { sandboxWithholdBotSecret: true } : {}),
+      ...(entry.protectedResults === true ? { protectedResults: true } : {}),
       ...(entry.sandboxNetworkPolicy !== undefined ? { sandboxNetworkPolicy: parseSandboxNetworkPolicy(entry.sandboxNetworkPolicy) } : {}),
       readIsolation: entry.readIsolation === true,
       readDenyExtraPaths: normalizeStringList(entry.readDenyExtraPaths),
       backendType: entry.backendType,
+      hcHerdrTabs: entry.hcHerdrTabs === true ? true : undefined,
       riff: entry.riff && typeof entry.riff === 'object' ? entry.riff : undefined,
       herdr: normalizeHerdrBackendConfig(entry.herdr),
       mojo: entry.mojo && typeof entry.mojo === 'object' ? entry.mojo : undefined,
@@ -4619,6 +4725,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       sessionOwnerReminder: normalizeSessionOwnerReminderConfig(entry.sessionOwnerReminder),
       longTaskReminder: normalizeLongTaskReminderConfig(entry.longTaskReminder),
       quotaFallbackBot: normalizedQuotaFallback.config,
+      quotaFallbackChain: normalizedQuotaFallbackChain.config,
       // Only explicit true persisted (undefined = off), same as restrictGrantCommands.
       overloadAlert: entry.overloadAlert === true || undefined,
       vcMeetingAgent,
@@ -4713,6 +4820,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       usageDisplay: normalizeUsageDisplay(entry) === DEFAULT_USAGE_DISPLAY
         ? undefined
         : normalizeUsageDisplay(entry),
+      // Default ON: only an explicit false hides 5h / 7d quota segments.
+      showUsageQuota: entry.showUsageQuota === false ? false : undefined,
       ...normalizeReplyFooter(entry),
       showReplyTiming: entry.showReplyTiming === true || undefined,
       // Retired final-only preference must not opt into an extra terminal card.
@@ -4752,9 +4861,45 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // 'group' are meaningful and persist; 'chat' (and anything else)
       // normalizes to undefined so bots.json stays clean.
       p2pMode: entry.p2pMode === 'thread' ? 'thread' : entry.p2pMode === 'group' ? 'group' : undefined,
-      sessionGroup: entry.sessionGroup && typeof entry.sessionGroup === 'object'
-        ? entry.sessionGroup as SessionGroupConfig
-        : undefined,
+      sessionGroup: (() => {
+        const sg = entry.sessionGroup;
+        if (!sg || typeof sg !== 'object' || Array.isArray(sg)) return undefined;
+        const parsed = { ...(sg as Record<string, unknown>) };
+        // 丢弃输入携带的旧标记：collaborationDisabledReason 是解析期派生的，绝不能从
+        // 输入继承（否则「改 enabled:false / 删除 collaboration / 修合法」都会被旧标记
+        // 误判为坏配置）。只在「当前显式 enabled:true 且当前结构非法」时重新生成。
+        delete (parsed as Record<string, unknown>).collaborationDisabledReason;
+        // 协作配置显式校验，绝不只靠 `as` 透传（§3 铁律 1）：
+        //  - 非 {enabled:true}（缺省/`enabled:false`/非对象）→ 归一化关闭，走 legacy；
+        //  - {enabled:true} 且结构合法 → 保留归一化后的 config；
+        //  - {enabled:true} 但结构非法 → **不得擦除**：保留原始 collaboration 并写入
+        //    collaborationDisabledReason，让 preflight 认出来返回 failed（不扣费、不走
+        //    legacy）。擦除会让运行时把「坏配置」当「未启用」，绕过 fail-closed。
+        if (parsed.collaboration !== undefined) {
+          const collabRaw = parsed.collaboration;
+          const collabObj = (typeof collabRaw === 'object' && collabRaw !== null && !Array.isArray(collabRaw))
+            ? (collabRaw as Record<string, unknown>)
+            : undefined;
+          const explicitlyEnabled = collabObj?.enabled === true;
+          const v = validateSessionGroupCollaborationConfig(parsed.collaboration);
+          if (v.ok) {
+            parsed.collaboration = v.config;
+          } else if (explicitlyEnabled) {
+            // 保留原始 collaboration，仅标记解析期禁用原因；preflight 据此 fail-closed。
+            // non-enumerable：解析期派生标记，不参与 JSON.stringify / 任何序列化。
+            Object.defineProperty(parsed, 'collaborationDisabledReason', {
+              value: v.errors.join('；'),
+              enumerable: false,
+              configurable: true,
+              writable: true,
+            });
+          } else {
+            // 非 enabled:true → 归一化关闭（安全默认）。
+            delete parsed.collaboration;
+          }
+        }
+        return parsed as SessionGroupConfig;
+      })(),
       noCardChats: Array.isArray(entry.noCardChats)
         ? entry.noCardChats.filter((x: any): x is string => typeof x === 'string' && x.trim().length > 0).map((x: string) => x.trim())
         : undefined,

@@ -435,7 +435,7 @@ describe('sweepIdleWorkers (per-bot count cap)', () => {
     expect(activeSessions.get('d').worker).not.toBe(null);
   });
 
-  it('suspends the oldest (by lastMessageAt) sessions down to the cap', () => {
+  it('falls back to last activity without an idle edge and suspends down to the cap', () => {
     const activeSessions = new Map<string, any>([
       ['a', ds('a', 'tmux', now - 90 * 60_000)],
       ['b', ds('b', 'herdr', now - 80 * 60_000)],
@@ -453,6 +453,19 @@ describe('sweepIdleWorkers (per-bot count cap)', () => {
     expect(activeSessions.get('b').worker).toBe(null);
     expect(activeSessions.get('c').worker).not.toBe(null);
     expect(activeSessions.get('f').worker).not.toBe(null);
+  });
+
+  it('prefers an already-idle worker over a long turn that just returned to the prompt', async () => {
+    const justFinished = ds('just-finished', 'tmux', now - 20 * 60_000);
+    justFinished.idleSinceAt = now - 4_000;
+    const alreadyIdle = ds('already-idle', 'tmux', now - 10 * 60_000);
+    alreadyIdle.idleSinceAt = now - 8 * 60_000;
+    const activeSessions = new Map([['just-finished', justFinished], ['already-idle', alreadyIdle]]);
+
+    expect(await sweepIdleWorkersAsync(activeSessions, { maxLiveWorkers: 1, now })).toEqual([
+      { sessionId: 'already-idle', reason: 'live_worker_cap' },
+    ]);
+    expect(justFinished.worker).not.toBe(null);
   });
 
   it('skips an idle session with durable Codex App dispatch ownership and suspends the next candidate', () => {
@@ -780,7 +793,7 @@ describe('sweepIdleWorkers (per-bot idle TTL)', () => {
       ['old1', { ...ds('old1', 'tmux', now - 100 * 60_000), idleSinceAt: now - 5 * 60_000 }],
       ['old2', { ...ds('old2', 'herdr', now - 90 * 60_000), idleSinceAt: now - 5 * 60_000 }],
       ['mid', { ...ds('mid', 'zellij', now - 80 * 60_000), idleSinceAt: now - 5 * 60_000 }],
-      ['ttlNew', { ...ds('ttlNew', 'tmux', now - 10 * 60_000), idleSinceAt: now - 45 * 60_000 }],
+      ['ttlNew', { ...ds('ttlNew', 'tmux', now - 4 * 60_000), idleSinceAt: now - 45 * 60_000 }],
       ['new', { ...ds('new', 'zmx', now - 5 * 60_000), idleSinceAt: now - 2 * 60_000 }],
     ]);
 

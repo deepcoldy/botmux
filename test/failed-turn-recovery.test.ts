@@ -396,6 +396,35 @@ describe('controlled failed-turn recovery', () => {
     expect(isSilentScheduledTurn(ds, result.turnId)).toBe(true);
     expect(pool.sendWorkerInput).toHaveBeenCalledWith(ds, expect.anything(), expect.anything(), expect.objectContaining({ trustedCaller: { ...caller, source: 'schedule_creator', taskId: 'abcdef12' } }));
   });
+  it('uses the exact persisted caller after scheduled live state is released', () => {
+    const scheduled = { ...caller, source: 'schedule_creator' as const, taskId: 'abcdef12' };
+    ds.session.lastFailedTurn.trustedCaller = scheduled;
+    ds.session.replyTargets = {};
+    ds.activeInteractiveTurn = undefined;
+    ds.scheduledTurnCallers = undefined;
+    expect(failedTurnCaller(ds, request.turnId, { includeRecordedCaller: true })).toEqual(scheduled);
+    expect(failedTurnCaller(ds, 'om_other', { includeRecordedCaller: true })).toBeUndefined();
+  });
+  it('does not revive a persisted caller for a cross-chat failure', () => {
+    ds.session.replyTargets = {};
+    ds.session.turnReplyContexts = {};
+    ds.activeInteractiveTurn = undefined;
+    ds.session.lastFailedTurn.crossChatOrigin = {
+      sourceChatId: 'oc_origin', followedChatId: 'oc_followed', followedRootMessageId: 'om_followed',
+    };
+    expect(failedTurnCaller(ds, request.turnId, { includeRecordedCaller: true })).toBeUndefined();
+  });
+  it.each(['retry', 'fresh'] as const)('preserves exact-input attachments through %s recovery', async mode => {
+    const attachments = [{ type: 'image' as const, name: 'evidence.png', path: '/tmp/evidence.png' }];
+    ds.session.lastFailedTurn.attachments = attachments;
+    const result = await recoverFailedTurn('old', { ...request, mode });
+    expect(result).toMatchObject({ ok: true, state: 'accepted' });
+    if (mode === 'retry') {
+      expect(pool.sendWorkerInput).toHaveBeenCalledWith(ds, expect.objectContaining({ attachments }), expect.anything(), expect.anything());
+    } else {
+      expect(manager.buildFollowUpCliInput).toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.objectContaining({ attachments }));
+    }
+  });
   it('preserves clean Codex App task text and local image references on fresh recovery', async () => {
     ds.session.lastFailedTurn.codexAppInput = { text: 'original image task', clientUserMessageId: 'old-client-id', localImages: [{ path: '/tmp/image.png' }] };
     await recoverFailedTurn('old', { ...request, mode: 'fresh' });
@@ -522,6 +551,179 @@ describe('controlled failed-turn recovery', () => {
     expect(parseFailedTurnRecoveryRequest(request)).toEqual(request);
     for (const extra of [{ caller }, { instruction: 'other task' }, { larkAppId: 'other' }, { trustedCaller: caller }]) {
       expect(parseFailedTurnRecoveryRequest({ ...request, ...extra })).toBeUndefined();
+    }
+  });
+
+  it('tracks directFailure updates/revocations on unclaimed provisional snapshots without mutating real terminals or claimed recoveries', () => {
+    // 1. Real terminal record (!limitedSnapshot) MUST stay immutable to provisional limit proof changes.
+    ds.usageLimit = {
+      limited: true, kind: 'usage', retryAtMs: Date.now() + 60_000,
+      retryLabel: '1m', retryReady: false, source: 'antigravity-native-log', directFailure: true,
+    };
+    recordLimitedFailedTurn(ds, request.turnId);
+    expect(ds.session.lastFailedTurn.directFailure).toBeUndefined();
+
+    // 2. Provisional limitedSnapshot accepts directFailure addition and revocation, rolling back on SQLite error.
+    ds.session.lastFailedTurn = undefined;
+    ds.lastUserPrompt = 'do work';
+    ds.lastCliInput = 'do work';
+    ds.usageLimit.directFailure = undefined;
+    recordLimitedFailedTurn(ds, request.turnId);
+    expect(ds.session.lastFailedTurn?.limitedSnapshot).toBe(true);
+    expect(ds.session.lastFailedTurn?.directFailure).toBeUndefined();
+
+    const boundary = { sampledTranscriptPath: '/tmp/current.jsonl', minByteOffset: 42 };
+    ds.usageLimit = { ...ds.usageLimit, directFailure: true, antigravityWriteBoundary: boundary };
+    recordLimitedFailedTurn(ds, request.turnId);
+    expect(ds.session.lastFailedTurn?.directFailure).toBe(true);
+    expect(ds.session.lastFailedTurn?.antigravityWriteBoundary).toEqual(boundary);
+
+    // Revocation failure rolls back in-memory lastFailedTurn cleanly.
+    vi.spyOn(store, 'updateSession').mockImplementationOnce(() => { throw new Error('sqlite busy'); });
+    ds.usageLimit = { ...ds.usageLimit, directFailure: undefined };
+    expect(() => recordLimitedFailedTurn(ds, request.turnId)).toThrow('sqlite busy');
+    expect(ds.session.lastFailedTurn?.directFailure).toBe(true);
+    expect(ds.session.lastFailedTurn?.antigravityWriteBoundary).toEqual(boundary);
+
+    // Successful revocation clears directFailure and its boundary together.
+    recordLimitedFailedTurn(ds, request.turnId);
+    expect(ds.session.lastFailedTurn?.directFailure).toBeUndefined();
+    expect(ds.session.lastFailedTurn?.antigravityWriteBoundary).toBeUndefined();
+
+    // Claimed recovery freezes provisional snapshot.
+    ds.session.lastFailedTurn.recovery = { requestId: 'r1', mode: 'retry', turnId: 'bmx-r1', sessionId: 'old', state: 'attempting' };
+    ds.usageLimit = { ...ds.usageLimit, directFailure: true };
+    recordLimitedFailedTurn(ds, request.turnId);
+    expect(ds.session.lastFailedTurn?.directFailure).toBeUndefined();
+
+    // Completed turn in terminalIdentityTurnIds cannot recreate a provisional snapshot.
+    ds.session.lastFailedTurn = undefined;
+    ds.terminalIdentityTurnIds = new Set([request.turnId]);
+    recordLimitedFailedTurn(ds, request.turnId);
+    expect(ds.session.lastFailedTurn).toBeUndefined();
+  });
+
+  it.each([
+    'clone',
+    'new-turn',
+    'new-failed-at',
+    'recovery-claim',
+    'ownership-lost',
+    'generation-change',
+    'current-turn',
+    'new-limit',
+    'unrelated-completed',
+  ] as const)('enforces six-way fences on clearLimitedFailedTurn retry (%s)', mode => {
+    vi.useFakeTimers();
+    try {
+      ds.workerGeneration = 1;
+      ds.session.workerGeneration = 1;
+      ds.usageLimit = undefined;
+      ds.session.lastFailedTurn = {
+        turnId: 'om_A',
+        failedAt: '2026-10-16T00:00:00.000Z',
+        status: 'failed',
+        userPrompt: 'task A',
+        cliInput: 'task A',
+        retryCount: 0,
+        trustedCaller: caller,
+        limitedSnapshot: true,
+        directFailure: true,
+      };
+      ds.lastCliInputTurnId = 'om_A';
+
+      vi.spyOn(store, 'updateSession').mockImplementationOnce(() => { throw new Error('disk locked'); });
+      clearLimitedFailedTurn(ds, 'om_A');
+      expect(ds.session.lastFailedTurn?.turnId).toBe('om_A');
+
+      if (mode === 'clone') {
+        ds.session.lastFailedTurn = structuredClone(ds.session.lastFailedTurn);
+      } else if (mode === 'new-turn') {
+        ds.session.lastFailedTurn = { ...ds.session.lastFailedTurn, turnId: 'om_B' };
+      } else if (mode === 'new-failed-at') {
+        ds.session.lastFailedTurn = { ...ds.session.lastFailedTurn, failedAt: '2026-10-16T00:05:00.000Z' };
+      } else if (mode === 'recovery-claim') {
+        ds.session.lastFailedTurn.recovery = { requestId: 'r1', mode: 'retry', turnId: 'bmx-r1', sessionId: 'old', state: 'attempting' };
+      } else if (mode === 'ownership-lost') {
+        registry.clear();
+      } else if (mode === 'generation-change') {
+        ds.workerGeneration = 2;
+      } else if (mode === 'current-turn') {
+        ds.lastCliInputTurnId = 'om_newer';
+      } else if (mode === 'new-limit') {
+        ds.usageLimit = {
+          limited: true, kind: 'usage', retryAtMs: Date.now() + 60_000,
+          retryLabel: '1m', retryReady: false, source: 'antigravity-native-log',
+          nativeEpisodeKey: 'log:new-episode', directFailure: true,
+        };
+      } else if (mode === 'unrelated-completed') {
+        // unrelated turn B completing MUST NOT cancel turn A's sole cleanup retry!
+        recordFailedTurnTerminal(ds, { turnId: 'om_B', status: 'completed' }, {
+          workerGeneration: 1, caller, silent: false,
+        });
+      }
+
+      vi.advanceTimersByTime(600);
+
+      if (mode === 'clone' || mode === 'unrelated-completed') {
+        expect(ds.session.lastFailedTurn).toBeUndefined();
+      } else {
+        expect(ds.session.lastFailedTurn).toBeDefined();
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(['retry', 'fresh'] as const)('cancels pending %s recovery when Web Terminal submits direct input during async waits', async mode => {
+    vi.spyOn(pool, 'prepareFailedTurnRecoveryIdentity').mockImplementationOnce(async () => {
+      // Simulate direct Web Terminal input arriving mid-await even without an IM cancel callback.
+      ds.lastDirectTerminalInputAt = Date.parse(request.failedAt) + 500;
+      noteFailedTurnRecoveryInput(ds.larkAppId, ds.session.rootMessageId, `web-terminal:${ds.lastDirectTerminalInputAt}`);
+    });
+    const result = await recoverFailedTurn(ds.session.sessionId, { ...request, mode });
+    expect(result).toMatchObject({ ok: true, state: 'cancelled' });
+    expect(pool.sendWorkerInput).not.toHaveBeenCalled();
+    expect(pool.forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('blocks recovery after async await even without noteFailedTurnRecoveryInput when newerInput detects lastDirectTerminalInputAt', async () => {
+    vi.spyOn(pool, 'prepareFailedTurnRecoveryIdentity').mockImplementationOnce(async () => {
+      ds.lastDirectTerminalInputAt = Date.parse(request.failedAt) + 1000;
+    });
+    const result = await recoverFailedTurn(ds.session.sessionId, { ...request, mode: 'retry' });
+    expect(result).toMatchObject({ ok: true, state: 'cancelled' });
+    expect(pool.sendWorkerInput).not.toHaveBeenCalled();
+  });
+
+  it('preserves currentGenerationCompleted authorization when an un-authorized clearLimitedFailedTurn runs during the same SQLite outage', () => {
+    vi.useFakeTimers();
+    try {
+      ds.workerGeneration = 1;
+      ds.session.workerGeneration = 1;
+      ds.lastCliInputTurnId = 'om_A';
+      ds.usageLimit = {
+        limited: true, kind: 'usage', retryAtMs: Date.now() + 60_000,
+        retryLabel: '1m', retryReady: false, source: 'antigravity-native-log',
+      };
+      ds.session.lastFailedTurn = {
+        turnId: 'om_A', failedAt: '2026-10-16T00:00:00.000Z', status: 'failed',
+        userPrompt: 'task A', cliInput: 'task A', retryCount: 0, trustedCaller: caller,
+        limitedSnapshot: true,
+      };
+      vi.spyOn(store, 'updateSession')
+        .mockImplementationOnce(() => { throw new Error('sqlite busy 1'); })
+        .mockImplementationOnce(() => { throw new Error('sqlite busy 2'); });
+      // Authorized current-generation completion fails first, then un-authorized clear runs during the same outage.
+      recordFailedTurnTerminal(ds, { turnId: 'om_A', status: 'completed' }, {
+        workerGeneration: 1, caller, silent: false,
+      });
+      clearLimitedFailedTurn(ds);
+      // After SQLite recovers, preserved currentGenerationCompleted authorization still clears past sticky usageLimit.
+      vi.advanceTimersByTime(600);
+      expect(ds.session.lastFailedTurn).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
     }
   });
 });

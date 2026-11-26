@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1320" height="660" viewBox="0 0 1320 660" role="img" aria-label="TraeX 原生异步问题桥接到独立飞书提问卡的交互示意">
+<rect width="1320" height="660" fill="#f4f6f9"/>
+<g font-family="Noto Sans CJK SC, sans-serif">
+<text x="44" y="61" font-size="32" fill="#202a3b">TraeX 异步 Question · 交互示意</text>
+<text x="44" y="101" font-size="20" fill="#596579">使用回归夹具中的示例题干；不含业务会话内容</text>
+<rect x="40" y="126" width="582" height="460" rx="18" fill="#202633"/>
+<g fill="white" font-size="23"><text x="66" y="183" font-size="25">TraeX 原生终端</text><text x="66" y="343">Pick probe label</text><text x="66" y="390">› 1. Alpha</text><text x="66" y="427">　2. Beta</text><text x="66" y="464">　3. Other</text></g>
+<g fill="#abb8ce" font-size="20"><text x="66" y="230">? 1 question · alt/⌥+↑ to answer</text><text x="66" y="296">展开后读取当前问题</text><text x="66" y="553">Enter 回传当前题的答案</text></g>
+<line x1="66" x2="594" y1="245" y2="245" stroke="#526076"/>
+<rect x="698" y="126" width="582" height="460" rx="18" fill="white" stroke="#d9e0ea" stroke-width="2"/>
+<g fill="#202a3b"><text x="724" y="183" font-size="25">飞书中的独立提问卡</text><text x="724" y="247" font-size="26">Pick probe label</text><text x="766" y="309" font-size="23">Alpha</text><text x="766" y="363" font-size="23">Beta</text></g>
+<circle cx="738" cy="299" r="12" fill="white" stroke="#3370ff" stroke-width="2"/><circle cx="738" cy="299" r="6" fill="#3370ff"/><circle cx="738" cy="353" r="12" fill="white" stroke="#98a4b6" stroke-width="2"/>
+<text x="724" y="428" font-size="20" fill="#596579">自定义回答</text><rect x="724" y="445" width="528" height="52" rx="7" fill="white" stroke="#cbd4e2" stroke-width="2"/>
+<text x="742" y="479" font-size="18" fill="#98a4b6">填写自己的答案</text><rect x="1116" y="524" width="136" height="40" rx="6" fill="#3370ff"/><text x="1162" y="552" font-size="21" fill="white">提交</text>
+<text x="637" y="374" font-size="42" fill="#3370ff">→</text><text x="44" y="638" font-size="20" fill="#596579">正文完成后卡片仍可回答；恢复时重新核验原生问题，再回传答案</text>
+</g></svg>

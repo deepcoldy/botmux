@@ -26,6 +26,7 @@ import { SERVER_OUTAGE_ESCALATE_MS, writeManagedPaneLaunch } from './tmux-pipe-b
 import { HcClient, isHcError, type HcChannelClose, type HcChunkInfo, type HcStream, type HcSubscription } from './hc/client.js';
 import { hcOwnerLabels, isHcTerminalOwnedBy, killHcTerminal, type HcKillOutcome, type HcTarget } from './hc/cli-ops.js';
 import { ensureHcCore, hcPaneXdgRestore } from './hc/core.js';
+import { publishHcHerdrTab } from './hc/herdr-layout.js';
 import { bracketedPasteFrame, encodeTmuxKey, encodeTmuxKeys, pasteBufferBytes, type KeyEncodingModes } from './hc/keys.js';
 import { HC_MIRROR_SCROLLBACK_LINES, ScreenMirror } from './hc/screen-mirror.js';
 import {
@@ -98,6 +99,8 @@ export interface HcBackendOptions {
   sessionId: string;
   /** Attach to the live terminal named target.sessionName instead of creating one. */
   isReattach?: boolean;
+  /** Display title for the private core's native Herdr tab. Undefined opts out. */
+  herdrTabTitle?: string;
   /** The worker's own env (never a CLI child env): hc's control env is derived from it. */
   env?: NodeJS.ProcessEnv;
 }
@@ -259,6 +262,8 @@ export class HcBackend implements SessionBackend {
   private readonly sessionId: string;
   private readonly env: NodeJS.ProcessEnv;
   private readonly _isReattach: boolean;
+  private readonly herdrTabTitle?: string;
+  private herdrTabRegistered = false;
   private cols = 0;
   private rows = 0;
   private address: string | null = null;
@@ -332,6 +337,7 @@ export class HcBackend implements SessionBackend {
     this.sessionId = opts.sessionId;
     this.env = opts.env ?? process.env;
     this._isReattach = opts.isReattach ?? false;
+    this.herdrTabTitle = opts.herdrTabTitle;
   }
 
   get isReattach(): boolean {
@@ -558,6 +564,10 @@ export class HcBackend implements SessionBackend {
     return this.mirror.size();
   }
 
+  getPaneSizeAsync(): Promise<{ cols: number; rows: number } | null> {
+    return Promise.resolve(this.getPaneSize());
+  }
+
   // ─── spawn ─────────────────────────────────────────────────────────────────────────
 
   private createTerminal(core: HcSyncCore, bin: string, args: string[], opts: SpawnOpts): HcTerminalRecord {
@@ -690,6 +700,16 @@ export class HcBackend implements SessionBackend {
         return;
       }
       this.adopt(client, sub, stream, size);
+      if (this.herdrTabTitle !== undefined && !this.herdrTabRegistered && listed.cwd) {
+        const current = (): boolean => !stale() && this.client === client;
+        void publishHcHerdrTab(client, this.sessionId, listed, this.herdrTabTitle, current)
+          .then(() => {
+            // A verified attach with this worker already registered the tab.
+            // A reconnect must leave a pane the user later parked alone.
+            if (current()) this.herdrTabRegistered = true;
+          })
+          .catch(error => process.stderr.write(`[hc-backend] ${this.target.sessionName}: Herdr 布局更新失败：${describeError(error)}\n`));
+      }
     } catch (err) {
       if (stale()) {
         client?.close();

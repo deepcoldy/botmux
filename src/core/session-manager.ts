@@ -98,7 +98,7 @@ import {
   larkTransportEnabled,
 } from './types.js';
 import type { DaemonSession, GroupJoinContext } from './types.js';
-import { stagePendingRepoSetup, persistPendingRepoCardMessageId, restorePendingRepoRuntime } from './pending-repo-journal.js';
+import { stagePendingRepoSetup, persistPendingRepoCardMessageId, restorePendingRepoRuntime, restoreQueuedActivationRawInput } from './pending-repo-journal.js';
 import { announceSessionRow, clearAgentAttention, markSessionActivity, stampHumanActivity, announcePendingRepoSession } from './session-activity.js';
 import { noteTurnStarted } from './turn-outcome.js';
 import { applyFollowActive, followActiveOpenedFreshTopic, recordFollowActiveFreshTopic } from './schedule-follow-active.js';
@@ -106,7 +106,7 @@ import { resolveScheduleModelOverride } from './schedule-model-override.js';
 import { scanMultipleProjects } from '../services/project-scanner.js';
 import { buildRepoSelectCard } from '../im/lark/card-builder.js';
 import { repoPickerScanOptions } from '../global-config.js';
-import { usageLimitStateKey } from '../utils/cli-usage-limit.js';
+import { sameUsageLimit } from '../utils/cli-usage-limit.js';
 import { t, localeForBot, getDefaultLocale, type Locale } from '../i18n/index.js';
 import { parseWorkingDirList } from '../utils/working-dir.js';
 import { resolveRoleInjection } from './role-resolver.js';
@@ -364,10 +364,19 @@ function quarantineUnregisteredRestoreSession(session: Session, reason: string):
   }
 }
 
-function sameUsageLimit(a: DaemonSession['usageLimit'], b: DaemonSession['usageLimit']): boolean {
-  if (!a && !b) return true;
-  if (!a || !b) return false;
-  return usageLimitStateKey(a) === usageLimitStateKey(b) && a.retryReady === b.retryReady && a.source === b.source;
+function hydrateSessionUsageLimitFields(session: Session): Pick<
+  DaemonSession,
+  'usageLimit' | 'antigravityQuotaHistory' | 'antigravityQuotaCursor'
+> {
+  return {
+    usageLimit: session.usageLimit,
+    ...(session.antigravityQuotaHistory !== undefined
+      ? { antigravityQuotaHistory: session.antigravityQuotaHistory }
+      : {}),
+    ...(session.antigravityQuotaCursor !== undefined
+      ? { antigravityQuotaCursor: session.antigravityQuotaCursor }
+      : {}),
+  };
 }
 
 function sessionBotCliMismatch(ds: DaemonSession): { sessionCli: string; botCli: string } | null {
@@ -1718,6 +1727,11 @@ function buildNewTopicBlocks(
     if (routingBlock) blocks.push({ key: 'routing', text: routingBlock });
     if (skillBlock) blocks.push({ key: 'skill', text: skillBlock });
     if (identityBlock) blocks.push({ key: 'identity', text: identityBlock });
+  }
+  // Keep the bot/chat role in the reusable prefix, ahead of session-specific
+  // credentials and ids. All permission boundaries still precede user content.
+  if (roleBlock) blocks.push({ key: 'role', text: roleBlock });
+  if (!adapter.injectsSessionContext) {
     // Trigger-user auth: the same credential boundary the claude-family adapters
     // get via --append-system-prompt. Without it the inline-prompt CLIs
     // (codex/opencode/…) would run with NO constraint at all — and since that is
@@ -1744,7 +1758,6 @@ function buildNewTopicBlocks(
     if (credentialBoundary) blocks.push({ key: 'credentials', text: credentialBoundary });
     blocks.push({ key: 'sessionId', text: `<session_id>${xmlEscape(sessionId)}</session_id>` });
   }
-  if (roleBlock) blocks.push({ key: 'role', text: roleBlock });
   if (summaryMemoryBlock) blocks.push({ key: 'summaryMemory', text: summaryMemoryBlock });
   if (whiteboardBlock) blocks.push({ key: 'whiteboard', text: whiteboardBlock });
   if (groupJoinContextBlock) blocks.push({ key: 'groupJoin', text: groupJoinContextBlock });
@@ -2058,12 +2071,12 @@ function buildFollowUpBlocks(
     : false);
 
   // Put stable context before the user's turn. Follow the new-topic order for
-  // shared blocks: session id first, then role. The whiteboard block is
+  // shared blocks: stable role first, then session id. The whiteboard block is
   // per-turn available context, so place it right after <botmux_reminder> and
   // before <user_message> — consistent with new-topic/refork — not after the
   // user's text. Per-turn attribution (sender/attachments/mentions) stays after.
-  if (!skipSessionId) blocks.push({ key: 'sessionId', text: `<session_id>${xmlEscape(sessionId)}</session_id>` });
   if (roleBlock) blocks.push({ key: 'role', text: roleBlock });
+  if (!skipSessionId) blocks.push({ key: 'sessionId', text: `<session_id>${xmlEscape(sessionId)}</session_id>` });
   {
     const session = sessionStore.getSession(sessionId);
     const resume = !!session?.cliId || !!session?.lastCliInput || !!session?.backendType;
@@ -2379,6 +2392,12 @@ function finalizeCliTurnInput(
       ...(opts.acceptedInput.trustedCaller ? { trustedCaller: opts.acceptedInput.trustedCaller } : {}) };
     userText = opts.acceptedInput.content;
   }
+  // Keep the structured attachments beside the exact input for daemon-side
+  // failure recovery. The legacy/structured model input was already built above;
+  // this metadata is not sent as a new worker control field.
+  if (opts?.attachments?.length) {
+    payload = { ...payload, attachments: opts.attachments.map(attachment => ({ ...attachment })) };
+  }
   // Builders only describe explicitly model-visible sources. They do not read
   // mutable rollout configuration: the real fork/send boundary freezes that
   // decision after every await/defer. Keep callers without a daemon app scope
@@ -2676,12 +2695,16 @@ export function buildReforkCliInput(
  * Lets the existing card be PATCHed on next screen_update after a daemon restart,
  * instead of a fresh card being POSTed.
  */
-export function persistStreamCardState(ds: DaemonSession): void {
+export function persistStreamCardState(ds: DaemonSession, opts?: { forceWrite?: boolean }): void {
   const cardId = ds.streamCardId === STREAM_CARD_SENTINEL ? undefined : ds.streamCardId;
   const s = ds.session;
   const quotaHistory = ds.antigravityQuotaHistory ?? s.antigravityQuotaHistory;
+  const quotaCursor = ds.antigravityQuotaCursor !== undefined
+    ? ds.antigravityQuotaCursor
+    : s.antigravityQuotaCursor;
   // Skip write if nothing actually changed — avoids disk churn on every screen_update.
   if (
+    !opts?.forceWrite &&
     s.streamCardId === cardId &&
     s.streamCardNonce === ds.streamCardNonce &&
     s.streamCardReplyTargetKey === ds.streamCardReplyTargetKey &&
@@ -2691,6 +2714,7 @@ export function persistStreamCardState(ds: DaemonSession): void {
     s.currentTurnTitle === ds.currentTurnTitle &&
     sameUsageLimit(s.usageLimit, ds.usageLimit) &&
     isDeepStrictEqual(s.antigravityQuotaHistory, quotaHistory) &&
+    isDeepStrictEqual(s.antigravityQuotaCursor, quotaCursor) &&
     s.modelFallback?.uuid === ds.modelFallback?.uuid &&
     s.modelFallback?.claudeSessionId === ds.modelFallback?.claudeSessionId &&
     s.lastUserPrompt === ds.lastUserPrompt &&
@@ -2709,6 +2733,7 @@ export function persistStreamCardState(ds: DaemonSession): void {
   s.currentTurnTitle = ds.currentTurnTitle;
   s.usageLimit = ds.usageLimit;
   s.antigravityQuotaHistory = quotaHistory;
+  if (quotaCursor !== undefined) s.antigravityQuotaCursor = quotaCursor;
   s.modelFallback = ds.modelFallback;
   s.lastUserPrompt = ds.lastUserPrompt;
   s.lastCliInput = ds.lastCliInput;
@@ -2759,6 +2784,8 @@ export function rememberLastCliInput(
   ds.session.lastCliInputTurnId = inputTurnId;
   if (replayCodexAppInput) ds.session.lastCodexAppInput = replayCodexAppInput;
   else delete ds.session.lastCodexAppInput;
+  if (normalized.attachments?.length) ds.session.lastAttachments = structuredClone(normalized.attachments);
+  else delete ds.session.lastAttachments;
   ds.session.replyThreadAliases = ds.replyThreadAliases;
   ds.session.currentReplyTarget = ds.currentReplyTarget;
   sessionStore.updateSession(ds.session);
@@ -3341,7 +3368,7 @@ export async function restoreActiveSessions(
             : (session.streamExpanded ? 'screenshot' : 'hidden'),
           currentImageKey: session.currentImageKey,
           currentTurnTitle: session.currentTurnTitle,
-          usageLimit: session.usageLimit,
+          ...hydrateSessionUsageLimitFields(session),
           modelFallback: session.modelFallback,
           lastUserPrompt: session.lastUserPrompt,
           lastCliInput: session.lastCliInput,
@@ -3412,6 +3439,8 @@ export async function restoreActiveSessions(
             queuedActivationPending: session.queuedActivationPending,
             queuedActivationToken: session.queuedActivationToken,
             queuedActivationInput: session.queuedActivationInput,
+            queuedActivationRawInput: session.queuedActivationRawInput,
+            queuedActivationRawTurnId: session.queuedActivationRawTurnId,
             queuedActivationTurnId: session.queuedActivationTurnId,
             queuedActivationDispatchAttempt: session.queuedActivationDispatchAttempt,
             queuedActivationResume: session.queuedActivationResume,
@@ -3423,6 +3452,8 @@ export async function restoreActiveSessions(
           session.queuedActivationPending = undefined;
           session.queuedActivationToken = undefined;
           session.queuedActivationInput = undefined;
+          session.queuedActivationRawInput = undefined;
+          session.queuedActivationRawTurnId = undefined;
           session.queuedActivationTurnId = undefined;
           session.queuedActivationDispatchAttempt = undefined;
           session.queuedActivationResume = undefined;
@@ -3470,6 +3501,7 @@ export async function restoreActiveSessions(
         pendingAttachments: session.queuedAttachments,
         currentTurnTitle: session.currentTurnTitle ?? session.title,
       };
+      restoreQueuedActivationRawInput(ds);
       const restoredPendingRepo = restorePendingRepoRuntime(ds);
       const anchor = sessionAnchorId(ds);
       messageQueue.ensureQueue(anchor);
@@ -3553,7 +3585,7 @@ export async function restoreActiveSessions(
       displayMode: session.displayMode ?? (session.streamExpanded ? 'screenshot' : 'hidden'),
       currentImageKey: session.currentImageKey,
       currentTurnTitle: session.currentTurnTitle,
-      usageLimit: session.usageLimit,
+      ...hydrateSessionUsageLimitFields(session),
       modelFallback: session.modelFallback,
       lastUserPrompt: session.lastUserPrompt,
       lastCliInput: session.lastCliInput,
@@ -3623,8 +3655,10 @@ export async function restoreActiveSessions(
     // Literal pending-repo passthroughs have an empty init prompt and therefore
     // no Codex ledger entry. Their setup journal is the exact replay owner; the
     // recovered worker sends it at prompt_ready with the retained token.
-    if (session.queuedActivationPending && session.pendingRepoSetup?.rawInput) {
+    restoreQueuedActivationRawInput(ds);
+    if (ds.pendingRawInput === undefined && session.queuedActivationPending && session.pendingRepoSetup?.rawInput) {
       ds.pendingRawInput = session.pendingRepoSetup.rawInput;
+      ds.pendingRawTurnId = session.pendingRepoSetup.turnId ?? session.queuedActivationTurnId;
     }
     try {
       const mismatchClose = await closeActiveSessionIfCliMismatch(ds);
@@ -4265,7 +4299,7 @@ export async function takeOverDurableActiveRemoteSession(
       displayMode: persisted.displayMode ?? (persisted.streamExpanded ? 'screenshot' : 'hidden'),
       currentImageKey: persisted.currentImageKey,
       currentTurnTitle: persisted.currentTurnTitle,
-      usageLimit: persisted.usageLimit,
+      ...hydrateSessionUsageLimitFields(persisted),
       modelFallback: persisted.modelFallback,
       lastUserPrompt: persisted.lastUserPrompt,
       lastCliInput: persisted.lastCliInput,
@@ -4554,7 +4588,7 @@ export async function resumeSession(
     displayMode: session.displayMode ?? (session.streamExpanded ? 'screenshot' : 'hidden'),
     currentImageKey: session.currentImageKey,
     currentTurnTitle: session.currentTurnTitle,
-    usageLimit: session.usageLimit,
+    ...hydrateSessionUsageLimitFields(session),
     modelFallback: session.modelFallback,
     lastUserPrompt: session.lastUserPrompt,
     lastCliInput: session.lastCliInput,
@@ -4672,7 +4706,15 @@ export async function resumeSession(
   // also publish.
   dashboardEventBus.publish({
     type: 'session.update',
-    body: { sessionId, patch: { status: 'active', closedAt: null } },
+    body: {
+      sessionId,
+      patch: {
+        status: 'active',
+        closedAt: null,
+        queuedActivationPending: null,
+        queuedActivationTailCount: null,
+      },
+    },
   });
   return {
     ok: true,
@@ -6482,11 +6524,24 @@ export async function activateQueuedSession(ds: DaemonSession): Promise<{ ok: bo
     ds.session.queuedActivationPending = undefined;
     ds.session.queuedActivationToken = undefined;
     ds.session.queuedActivationInput = undefined;
+    ds.session.queuedActivationRawInput = undefined;
+    ds.session.queuedActivationRawTurnId = undefined;
     ds.session.queuedActivationTurnId = undefined;
     ds.session.queuedActivationDispatchAttempt = undefined;
     ds.session.queuedActivationResume = undefined;
     ds.session.pendingRepoSetup = undefined;
     sessionStore.updateSession(ds.session);
+    dashboardEventBus.publish({
+      type: 'session.update',
+      body: {
+        sessionId: ds.session.sessionId,
+        patch: {
+          queued: false,
+          queuedActivationPending: null,
+          queuedActivationTailCount: null,
+        },
+      },
+    });
     return { ok: true };
   }
   // Repo selection / auto-worktree or another ingress already owns this
@@ -6509,6 +6564,7 @@ export async function activateQueuedSession(ds: DaemonSession): Promise<{ ok: bo
     try {
       const exactRetry = ds.session.queuedActivationInput;
       if (exactRetry) {
+        restoreQueuedActivationRawInput(ds);
         forkWorker(ds, exactRetry, {
           resume: ds.session.queuedActivationResume ?? ds.hasHistory,
           turnId: ds.session.queuedActivationTurnId,

@@ -321,6 +321,7 @@ import { _resetCacheForTest as _resetSeenMessagesForTest } from '../src/services
 import { _resetReverifyForTest, reverifyPendingCount } from '../src/im/lark/mention-reverify.js';
 import { logger } from '../src/utils/logger.js';
 import { config } from '../src/config.js';
+import { ProtectedResultStore, PROTECTED_RESULT_PLACEHOLDER } from '../src/services/protected-result-store.js';
 import { isSubstituteEnabledForChat, setSubstituteEnabledForChat } from '../src/services/substitute-chat-toggle-store.js';
 import { __resetPeerCrossRefCacheForTest } from '../src/services/peer-cross-ref-store.js';
 import { CLONE_EXCLUDED_KEYS, cloneBotConfig, cloneOwnerEntries } from '../src/setup/bot-config-editor.js';
@@ -1204,6 +1205,17 @@ function makeHistoryMessage(opts: {
   };
 }
 
+/** Use a real index under the fs mock's existing real-filesystem carve-out. */
+function seedProtectedResultMessage(dataDir: string, chatId: string, messageId: string, resource?: string): void {
+  const store = new ProtectedResultStore(dataDir);
+  const context = { appId: 'cli_writer', pluginId: 'synthetic', sessionId: 'session_one',
+    turnId: 'om_turn', ownerUnionId: 'on_owner', chatId };
+  store.begin(context, 'delivery_listener', 'a'.repeat(64));
+  if (resource) store.update(context, 'delivery_listener', { resource });
+  store.update(context, 'delivery_listener', { message: { messageId, kind: 'primary' } });
+  store.update(context, 'delivery_listener', { status: 'delivered' });
+}
+
 describe('startLarkEventDispatcher — connection wiring', () => {
   it.each(['feishu', 'lark'] as const)('starts %s with the registered dispatcher and exposes its live status', (brand) => {
     const client = startLarkEventDispatcher(MY_APP_ID, 'secret', makeHandlers(), brand);
@@ -1535,6 +1547,46 @@ describe('Lark event dispatcher — durable primary processor', () => {
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
     runtime.close();
+  });
+
+  it('redacts protected rich text before durable primary capture', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), SUBST_TEST_TMP_PREFIX));
+    const previousDataDir = config.session.dataDir;
+    const secret = 'SYNTHETIC_DURABLE_CAPTURE_SECRET_9381';
+    const runtimeHandlers = makeHandlers();
+    const captureHumanInput = vi.fn(() => true);
+    runtimeHandlers.captureHumanInput = captureHumanInput;
+    let runtime: ReturnType<typeof createLarkEventDispatcherRuntime> | undefined;
+    try {
+      setupBotState({ allowedUsers: [USER_OPEN_ID] });
+      vi.stubEnv('SESSION_DATA_DIR', dataDir);
+      config.session.dataDir = dataDir;
+      seedProtectedResultMessage(dataDir, 'oc_primary_capture', 'om_primary_capture_protected', 'file_sensitive');
+      runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', runtimeHandlers);
+      const content = JSON.stringify({ zh_cn: { title: secret, content: [[
+        { tag: 'text', text: secret }, { tag: 'media', file_key: 'file_sensitive' },
+      ]] } });
+      const data = makeUserMessageEvent({ senderOpenId: USER_OPEN_ID, content,
+        messageId: 'om_primary_capture_protected', rootId: 'om_primary_question', threadId: 'omt_primary_question',
+        chatId: 'oc_primary_capture', chatType: 'group', messageType: 'post' });
+      Object.assign(data.message, { body: { content }, card_json: { business: secret } });
+
+      await expect(processPrimary(runtime, data, 'om_primary_capture_protected')).resolves.toEqual({
+        kind: 'ignored', reason: 'durable primary captured human input',
+      });
+      expect(captureHumanInput).toHaveBeenCalledOnce();
+      const captured = captureHumanInput.mock.calls[0][0] as any;
+      expect(JSON.stringify(captured)).not.toContain(secret);
+      expect(JSON.stringify(captured)).not.toContain('file_sensitive');
+      expect(captured.message.body).toBeUndefined();
+      expect(captured.message.card_json).toBeUndefined();
+      expect(captured.message.content).toContain(PROTECTED_RESULT_PLACEHOLDER);
+    } finally {
+      runtime?.close();
+      config.session.dataDir = previousDataDir;
+      vi.unstubAllEnvs();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
   });
 
   it('retries the durable claim when captured-input persistence fails', async () => {
@@ -4223,6 +4275,42 @@ describe('im.message.receive_v1 — pre-ACK input capture', () => {
     await flushEventWork();
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+  it('redacts protected rich text before synchronous pre-ACK capture', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), SUBST_TEST_TMP_PREFIX));
+    const previousDataDir = config.session.dataDir;
+    const secret = 'SYNTHETIC_PRE_ACK_SECRET_9381';
+    try {
+      capturedHandlers = {}; __resetAnchorQueues(); __resetEventClaimsForTest(); setupBotState();
+      vi.stubEnv('SESSION_DATA_DIR', dataDir);
+      config.session.dataDir = dataDir;
+      seedProtectedResultMessage(dataDir, 'oc_capture_pre_ack', 'om_capture_pre_ack', 'file_sensitive');
+      const handlers = makeHandlers();
+      const captureHumanInput = vi.fn(() => true);
+      startLarkEventDispatcher(MY_APP_ID, 'secret', { ...handlers, captureHumanInput });
+      const content = JSON.stringify({ zh_cn: { title: secret, content: [[
+        { tag: 'text', text: secret }, { tag: 'media', file_key: 'file_sensitive' },
+      ]] } });
+      const event = makeUserMessageEvent({ senderOpenId: USER_OPEN_ID, content,
+        messageId: 'om_capture_pre_ack', rootId: 'om_capture_root', chatId: 'oc_capture_pre_ack', messageType: 'post' });
+      Object.assign(event.message, { body: { content }, card_json: { business: secret } });
+
+      expect(capturedHandlers['im.message.receive_v1'](event)).toBeUndefined();
+      expect(captureHumanInput).toHaveBeenCalledOnce();
+      const captured = captureHumanInput.mock.calls[0][0] as any;
+      expect(JSON.stringify(captured)).not.toContain(secret);
+      expect(JSON.stringify(captured)).not.toContain('file_sensitive');
+      expect(captured.message.body).toBeUndefined();
+      expect(captured.message.card_json).toBeUndefined();
+      expect(captured.message.content).toContain(PROTECTED_RESULT_PLACEHOLDER);
+      await flushEventWork();
+      expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    } finally {
+      config.session.dataDir = previousDataDir;
+      vi.unstubAllEnvs();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -10598,6 +10686,197 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic)
     await capturedHandlers['im.message.receive_v1'](event);
     await flushEventWork();
     expect(handlers.handleNewTopic).toHaveBeenCalledTimes(1);
+  });
+
+  describe('forward + comment into an auto-start topic (#3784)', () => {
+    beforeEach(() => {
+      setupAutoTopicBot(true);
+      mockGetBot().resolvedAllowedUsers = [USER_OPEN_ID];
+      mockGetBot().config.allowedUsers = [USER_OPEN_ID];
+      mockGetBot().config.chatMentionModes = { 'chat-fwd-auto': 'topic' };
+      mockGetBot().config.soloGroupMentionBypass = false;  // 多人话题群（同发改委），不走 1人1bot 放行
+      mockGetChatInfo.mockResolvedValue({ userCount: 3, botCount: 1 });
+      mockGetChatMode.mockResolvedValue('topic');
+      config.daemon.forwardFollowupWaitMs = 25;
+      // The hold buffer takes its wait at dispatcher start: restart with the wait on.
+      capturedHandlers = {};
+      startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+      markForwardFollowupsSessionsReady(MY_APP_ID);
+    });
+    afterEach(() => { config.daemon.forwardFollowupWaitMs = 0; });
+
+    const seed = () => makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '转发的聊天记录' }),
+      messageId: 'msg-auto-fwd-seed',
+      chatId: 'chat-fwd-auto',
+      chatType: 'group',
+    });
+
+    it('pairs the un-@ comment with the held auto-start seed instead of dropping it', async () => {
+      const s = seed();
+      const comment = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '调研学习一下' }),
+        rootId: 'msg-auto-fwd-seed',
+        messageId: 'msg-auto-fwd-comment',
+        chatId: 'chat-fwd-auto',
+        chatType: 'group',
+      });
+      await capturedHandlers['im.message.receive_v1'](s);
+      await flushEventWork();
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+
+      await capturedHandlers['im.message.receive_v1'](comment);
+      await flushEventWork();
+      expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+      expect(handlers.handleNewTopic).toHaveBeenCalledWith(comment, expect.objectContaining({
+        scope: 'thread',
+        anchor: 'msg-auto-fwd-comment',
+        forwardSeedData: s,
+      }));
+      await new Promise(resolve => setTimeout(resolve, 40));
+      expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+    });
+
+    it('still auto-starts an unpaired seed after the wait', async () => {
+      const s = seed();
+      await capturedHandlers['im.message.receive_v1'](s);
+      await flushEventWork();
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+      await new Promise(resolve => setTimeout(resolve, 40));
+      await flushEventWork();
+      expect(handlers.handleNewTopic).toHaveBeenCalledWith(s, expect.objectContaining({
+        scope: 'thread',
+        anchor: 'msg-auto-fwd-seed',
+      }));
+    });
+
+    it('also pairs under the default always mode', async () => {
+      mockGetBot().config.chatMentionModes = {};
+      const s = seed();
+      const comment = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '借鉴一下' }),
+        rootId: 'msg-auto-fwd-seed',
+        messageId: 'msg-auto-fwd-comment-always',
+        chatId: 'chat-fwd-auto',
+        chatType: 'group',
+      });
+      await capturedHandlers['im.message.receive_v1'](s);
+      await capturedHandlers['im.message.receive_v1'](comment);
+      await flushEventWork();
+      expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+      expect(handlers.handleNewTopic).toHaveBeenCalledWith(comment, expect.objectContaining({ forwardSeedData: s }));
+    });
+
+    it('an excluded chat neither holds nor auto-starts the seed', async () => {
+      mockGetBot().config.autoStartExcludedChats = ['chat-fwd-auto'];
+      await capturedHandlers['im.message.receive_v1'](seed());
+      await flushEventWork();
+      await new Promise(resolve => setTimeout(resolve, 40));
+      await flushEventWork();
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    });
+
+    it('a comment from someone else does not pair', async () => {
+      mockGetBot().resolvedAllowedUsers = [USER_OPEN_ID, 'ou_bystander'];  // 允许的另一个人：挡住它的是发件人比对，不是权限
+      mockGetBot().config.allowedUsers = [USER_OPEN_ID, 'ou_bystander'];
+      const s = seed();
+      const other = makeUserMessageEvent({
+        senderOpenId: 'ou_bystander',
+        content: JSON.stringify({ text: '路过' }),
+        rootId: 'msg-auto-fwd-seed',
+        messageId: 'msg-auto-fwd-other',
+        chatId: 'chat-fwd-auto',
+        chatType: 'group',
+      });
+      await capturedHandlers['im.message.receive_v1'](s);
+      await capturedHandlers['im.message.receive_v1'](other);
+      await flushEventWork();
+      await new Promise(resolve => setTimeout(resolve, 40));
+      await flushEventWork();
+      expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+      expect(handlers.handleNewTopic).toHaveBeenCalledWith(s, expect.objectContaining({ anchor: 'msg-auto-fwd-seed' }));
+    });
+
+    it('re-holds a persisted auto-start seed after restart and pairs its post-restart comment (#3784)', async () => {
+      const persistedSeed = seed();
+      const persistedPayload = {
+        data: persistedSeed,
+        ctx: {
+          chatId: 'chat-fwd-auto',
+          messageId: 'msg-auto-fwd-seed',
+          chatType: 'group',
+          scope: 'thread',
+          anchor: 'msg-auto-fwd-seed',
+          larkAppId: MY_APP_ID,
+        },
+        ownsSession: false,
+        autoTopicSeed: true,
+      };
+      mockReadFileSync.mockImplementation(path => String(path).includes('forward-followups-')
+        ? JSON.stringify([{ messageId: 'msg-auto-fwd-seed', dueAt: Date.now() + 10_000, payload: persistedPayload }])
+        : '[]');
+      handlers.handleNewTopic.mockClear();
+      capturedHandlers = {};
+      startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+      markForwardFollowupsSessionsReady(MY_APP_ID);
+      await flushEventWork();
+      // Re-held under topic mode: not flushed immediately.
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+
+      const comment = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '重启后留言' }),
+        rootId: 'msg-auto-fwd-seed',
+        messageId: 'msg-auto-fwd-post-restart-comment',
+        chatId: 'chat-fwd-auto',
+        chatType: 'group',
+      });
+      await capturedHandlers['im.message.receive_v1'](comment);
+      await flushEventWork();
+      expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+      expect(handlers.handleNewTopic).toHaveBeenCalledWith(comment, expect.objectContaining({
+        anchor: 'msg-auto-fwd-post-restart-comment',
+        forwardSeedData: persistedSeed,
+      }));
+    });
+
+    it('pairs when the comment arrives while the seed routing is still resolving (#3784)', async () => {
+      let releaseMode!: (mode: 'topic') => void;
+      const delayedMode = new Promise<'topic'>(resolve => { releaseMode = resolve; });
+      mockGetChatMode.mockReset()
+        .mockImplementationOnce(async () => delayedMode)
+        .mockResolvedValue('topic');
+      capturedHandlers = {};
+      __resetAnchorQueues();
+      __resetEventClaimsForTest();
+      startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+      markForwardFollowupsSessionsReady(MY_APP_ID);
+
+      const s = seed();
+      const comment = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '路由未决时的留言' }),
+        rootId: 'msg-auto-fwd-seed',
+        messageId: 'msg-auto-fwd-gate-comment',
+        chatId: 'chat-fwd-auto',
+        chatType: 'group',
+      });
+      capturedHandlers['im.message.receive_v1'](s);
+      capturedHandlers['im.message.receive_v1'](comment);
+      await flushEventWork();
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+      releaseMode('topic');
+      await flushEventWork();
+      await flushEventWork();
+      expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+      expect(handlers.handleNewTopic).toHaveBeenCalledWith(comment, expect.objectContaining({
+        anchor: 'msg-auto-fwd-gate-comment',
+        forwardSeedData: s,
+      }));
+    });
   });
 
   it('话题群新话题（未 @）开关开 → 自动开工 (FR-6)', async () => {

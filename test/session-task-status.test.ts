@@ -101,6 +101,20 @@ describe('deriveSessionTaskStatus', () => {
     expect(deriveSessionTaskStatus({ status: 'dormant', lastTurn: delivered(T0) })).toEqual({ kind: 'delivered', at: T0 });
   });
 
+  it('keeps a delivered result after a nonzero idle CLI exit, until new input invalidates it', () => {
+    const facts = { status: 'interrupted', lastMessageAt: T0 - 10, lastTurn: delivered(T0, 'done') };
+    expect(deriveSessionTaskStatus(facts)).toEqual({ kind: 'delivered', at: T0, summary: 'done' });
+    expect(deriveSessionTaskStatus({ ...facts, lastMessageAt: T0 + 1 }))
+      .toEqual({ kind: 'needs_you', reason: 'interrupted' });
+  });
+
+  it.each([undefined, 'agent'])('keeps blocking attention above a delivered result after CLI exit: %s', source => {
+    expect(deriveSessionTaskStatus({ status: 'interrupted', lastTurn: delivered(T0),
+      agentAttention: { reason: 'needs decision', at: T0, source },
+    })).toEqual({ kind: 'needs_you', reason: source === 'agent' ? 'attention' : 'interrupted',
+      detail: 'needs decision', at: T0 });
+  });
+
   it('never reports delivered when the result cannot be read', () => {
     const unreadable: unknown[] = [
       undefined,
@@ -319,13 +333,51 @@ describe('idle sessions do not imply pending work', () => {
       { lastTurn: { turnId: 'failed', outcome: 'interrupted', at: T0 } },
       { agentAttention: { source: 'agent', reason: 'decision', at: T0 } },
     ]) expect(isOffBoardIdle({ status: 'idle', ...facts })).toBe(false);
-    for (const status of ['working', 'starting', 'limited', 'stalled', 'closed', 'dormant']) {
+    for (const status of ['working', 'starting', 'limited', 'stalled', 'closed']) {
       expect(isOffBoardIdle({ status })).toBe(false);
     }
   });
 });
 
 describe('kanban off-board composition follows the active status filter', () => {
+  it('keeps old dormant TODOs visible even when the latest reply was delivered', () => {
+    const at = Date.now() - 2 * RECENT_TURN_ON_BOARD_MS;
+    const row = { status: 'dormant', lastTurn: delivered(at), lastMessageAt: at };
+    for (const remaining of [1, 3]) {
+      const pending = { ...row, openTodos: { remaining } };
+      expect(deriveSessionTaskStatus(pending).kind).toBe('delivered');
+      expect(isOffBoardKanbanRow(pending, '')).toBe(false);
+    }
+    for (const remaining of [0, -1, undefined, '1']) {
+      expect(isOffBoardKanbanRow({ ...row, openTodos: { remaining } }, '')).toBe(true);
+    }
+    expect(isOffBoardKanbanRow(row, '')).toBe(true);
+    expect(isOffBoardKanbanRow({
+      ...row,
+      lastTurn: { turnId: 'silent', outcome: 'no_output', at },
+      openTodos: { remaining: 1 },
+    }, '')).toBe(false);
+  });
+  it('does not reintroduce a silent idle round as a todo when its worker is suspended', () => {
+    const lastTurn = { turnId: 'silent', outcome: 'no_output', at: Date.now() - 60_000 };
+    for (const status of ['idle', 'dormant']) {
+      const row = { status, lastTurn, lastMessageAt: lastTurn.at - 1, openTodos: { remaining: 0 } };
+      expect(deriveSessionTaskStatus(row).kind).toBe('idle');
+      expect(isOffBoardKanbanRow(row, '')).toBe(true);
+      expect(isOffBoardKanbanRow(row, 'idle')).toBe(false);
+    }
+    expect(isOffBoardKanbanRow({ status: 'dormant', lastTurn }, 'dormant')).toBe(false);
+  });
+  it('does not age out actionable dormant work or a newer input awaiting its outcome', () => {
+    const at = Date.now() - 2 * RECENT_TURN_ON_BOARD_MS;
+    const dormant = { status: 'dormant', lastTurn: { turnId: 'silent', outcome: 'no_output', at } };
+    for (const facts of [
+      { openTodos: { remaining: 1 } }, { queued: true }, { backgroundTaskCount: 1 },
+      { lastMessageAt: at + 1 }, { pendingRepo: true }, { tuiPromptActive: true },
+      { agentAttention: { source: 'agent', reason: 'decision', at } },
+      { kanbanColumn: 'todo', kanbanColumnAt: at + 1 },
+    ]) expect(isOffBoardKanbanRow({ ...dormant, ...facts }, '')).toBe(false);
+  });
   const staleDormant = {
     status: 'dormant',
     lastTurn: { turnId: 'old', outcome: 'no_output', at: Date.now() - RECENT_TURN_ON_BOARD_MS - 1 },

@@ -26,6 +26,7 @@ A plugin delivers its capabilities through **fixed directories**. Botmux scans t
 | Host Service | A long-running background process, e.g. a local HTTP service | `service/index.js` |
 | Feishu slash commands | `/xxx` in a chat goes straight to the plugin | `commands/index.json` (needs a Host Service) |
 | Card button callbacks | Button clicks on the plugin's cards go to the plugin | `card-actions/index.json` (needs a Host Service) |
+| External Webhooks | Receive external HTTP `POST` callbacks and forward raw payloads to the plugin service | `webhooks/index.json` (needs a Host Service) |
 
 There is no general daemon/worker hook. Put long-running logic in a Host Service, Agent capabilities in MCP or a Skill, and human-facing ops entry points in CLI commands.
 
@@ -370,7 +371,15 @@ The route is fixed at `#/plugins/<plugin-id>`. `api` provides:
 | `getServiceStatus()` | Read this plugin's Service status |
 | `startService()` / `stopService()` / `restartService()` | Control this plugin's Service |
 | `getSettings()` / `saveSettings(value)` | Read/write config through the settings adapter |
+| `serviceFetch(path, init?)` | Call this plugin's local HTTP Service through the Dashboard admin-auth & CSRF-protected same-origin proxy (`/api/plugins/<plugin-id>/service/...`), including over remote HTTPS tunnels |
 | `listBots()` | List manageable Bots |
+
+**Calling your Host Service with `serviceFetch`**: when the Dashboard is opened through a remote HTTPS tunnel, the browser cannot connect directly to `127.0.0.1:<port>`. Call `api.serviceFetch('/status')` or `api.serviceFetch('/tasks', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(...) })`:
+
+- The host normalizes the relative path onto `/api/plugins/<plugin-id>/service/...` (rejecting absolute URLs, `//`, and `..` traversal), attaches same-origin credentials, forces `redirect: 'manual'`, and injects `x-botmux-csrf`;
+- The Dashboard server enforces administrator authentication (`canManageHost`), rejects top-level document navigations, enforces same-origin + CSRF validation on `POST`/`PUT`/`PATCH`/`DELETE` (and blocks cross-site/same-site non-same-origin `GET`/`HEAD`), blocks proxying to reserved internal host-callback paths (`/botmux/*`, `card-actions` and `commands` endpoints), strips browser cookies/CSRF headers, injects `Authorization: Bearer <BOTMUX_PLUGIN_CARD_ACTION_TOKEN>`, and dials `127.0.0.1:<port>` directly via `node:http` (bypassing proxy env vars);
+- Supports JSON, binary, `FormData`, and SSE streaming responses without holding `withPluginServiceLock`; for SSE endpoints, emit `: keepalive\n\n` every 15–25 seconds to prevent reverse-proxy idle timeouts;
+- Responses strip `Set-Cookie`/`Access-Control-*` and enforce `Content-Security-Policy: default-src 'none'; sandbox` and `X-Content-Type-Options: nosniff`; upstream `401` responses do not trigger the Dashboard's own session-expired overlay.
 
 **Settings adapter**: to use `getSettings` / `saveSettings`, ship `dist/server/settings.js` exporting both functions:
 
@@ -419,7 +428,13 @@ export default {
 - The `pm2` field name is kept only for compatibility with older plugins. Botmux's built-in supervisor interprets it; PM2 is not needed. Supported keys: `script`, `args`, `cwd`, `env`, `autorestart`, `killTimeoutMs`, `watchDelayMs`.
 - If the export sets `mode`, it must match the manifest.
 - The `host` passed to `urls()` is already URL-ready (IPv6 literals come bracketed).
-- The Service process receives `BOTMUX_PLUGIN_ID`, `BOTMUX_PLUGIN_DIR`, and `BOTMUX_PLUGIN_HOME`.
+- The Service process receives the following host-injected environment variables (overwriting any colliding entries in `pm2.env`):
+  - `BOTMUX_PLUGIN_ID`: the plugin ID;
+  - `BOTMUX_PLUGIN_DIR`: the runtime directory (`~/.botmux/plugins/<id>/dist`);
+  - `BOTMUX_PLUGIN_HOME`: the plugin's private home directory (`~/.botmux/plugins/<id>`);
+  - `BOTMUX_DATA_DIR`: the active Botmux data directory (`SESSION_DATA_DIR` > `~/.botmux/.data-dir` > `~/.botmux/data`), removing the need to hardcode `~/.botmux`;
+  - `BOTMUX_BIN`: the absolute path to the currently runnable `botmux` CLI entry (the executable itself in standalone binary installs, or the managed wrapper in source/dev installs), removing the need to depend on `PATH`;
+  - `PORT`, `BOTMUX_PLUGIN_CARD_ACTION_TOKEN`, and `BOTMUX_PLUGIN_WEBHOOK_TOKEN`: plugins declaring `commands`, `card-actions`, or `webhooks` must declare a fixed `port` and receive `PORT` plus per-plugin 43-char loopback Bearer tokens (`webhooks` uses a dedicated `BOTMUX_PLUGIN_WEBHOOK_TOKEN`, isolated from the `BOTMUX_PLUGIN_CARD_ACTION_TOKEN` used by internal callbacks and the Dashboard proxy); HTTP services declaring a valid `port` (for Dashboard `serviceFetch` proxying) also receive `BOTMUX_PLUGIN_CARD_ACTION_TOKEN` automatically.
 - With the single-file Botmux binary, JS scripts run on its embedded Bun, so no separate Node install is needed.
 - While developing with `--link`, the Service restarts automatically when `dist/` changes (only `dist/botmux-build/` is watched if it exists).
 
@@ -513,6 +528,35 @@ On click, Botmux `POST`s the operator, card context, button value, and form valu
 ```
 
 `toast` is a short notice after the click (`success` / `info` / `warning` / `error`); `card` updates the card in place. Both are optional. The plugin must still check `privileges` on every click; permission at send time is not authorization at click time.
+
+### Webhooks
+
+A plugin can declare external webhook routes to receive HTTP `POST` callbacks directly through the Dashboard's existing HTTPS tunnel or public endpoint and have them forwarded to its local Host Service.
+
+**Declare**: ship `dist/webhooks/index.json`; the plugin must have a Host Service with a fixed `port` (plugins without this file expose no webhook routes by default):
+
+```json
+{
+  "schemaVersion": 1,
+  "maxBodyBytes": 1048576,
+  "routes": [
+    { "path": "/events" },
+    { "path": "/hooks", "prefix": true, "endpoint": "/internal/hooks", "maxBodyBytes": 524288 }
+  ]
+}
+```
+
+- `routes` accepts 1–32 entries; each `path` must start with `/`, contain no trailing `/`, `//`, `\`, whitespace, or `.`/`..` segments, and be unique;
+- `prefix: true` (optional) matches exact `path` or any segment-bounded `path/*` subpath (exact matches take precedence, followed by longest prefix); omit for exact match only;
+- `endpoint` (optional) maps the upstream path on the plugin's loopback server; when omitted, the matched request path is preserved (prefix routes append the matched suffix and raw query string); prefix routes cannot map `endpoint` to `/`, and no webhook route may overlap `/botmux/*`, `commands.endpoint`, or `card-actions.endpoint`;
+- `maxBodyBytes` (optional) sets the payload byte limit at contribution or per-route level; defaults to `1048576` (1 MiB) with a hard ceiling of 5 MiB; oversized payloads return `413`.
+
+**Endpoint and forwarding contract**: external senders `POST` to `/webhook/plugin/<plugin-id><path>` (mounted before Dashboard authentication):
+
+- Only `POST` is allowed (other methods return `405`); uninstalled plugins or undeclared routes return `404`; stopped services or missing loopback tokens fail closed with `503`; path traversal or invalid framing returns `400`; rate-limited bursts return `429`;
+- **Byte-exact raw body fidelity**: the host never JSON-parses/re-serializes the payload and never decompresses `Content-Encoding`, forwarding the exact raw request bytes and external headers (including signature headers) directly to `127.0.0.1:<port>` over `node:http`;
+- The host strips external `Cookie`, `x-botmux-*`, and hop-by-hop headers, injects the dedicated webhook loopback token `Authorization: Bearer <BOTMUX_PLUGIN_WEBHOOK_TOKEN>` (preserving any incoming `Authorization` header in `x-botmux-webhook-forwarded-authorization`), and adds `x-botmux-webhook-plugin-id`, `x-botmux-webhook-route`, and `x-botmux-webhook-original-path`;
+- **Security boundary**: Botmux core stays vendor-neutral and does not implement third-party signature schemes. The plugin service must verify both: (1) `Authorization: Bearer <BOTMUX_PLUGIN_WEBHOOK_TOKEN>` to confirm host origin (isolated from `BOTMUX_PLUGIN_CARD_ACTION_TOKEN` used by internal callbacks and the Dashboard proxy), and (2) the external webhook signature (e.g. constant-time HMAC-SHA256 over the raw body bytes) and replay protection.
 
 ## Local build and acceptance
 
@@ -675,7 +719,7 @@ Before publishing, confirm:
 - [ ] `dist/` is self-contained and runs without the source tree or `node_modules`;
 - [ ] `npm pack --dry-run` contains no sensitive files;
 - [ ] the manifest and every contribution entry pass validation;
-- [ ] the Service export's `mode` matches the manifest; a fixed `port` is set if you use slash commands or card callbacks;
+- [ ] the Service export's `mode` matches the manifest; a fixed `port` is set if you use slash commands, card callbacks, or webhooks;
 - [ ] both the local directory and the real tarball were installed and checked;
 - [ ] after publishing, version, dist-tag, and integrity were verified;
 - [ ] the Market entry passed `npm run build && npm test`, and the PR includes both the entry file and `index.json`.
