@@ -31,6 +31,7 @@
 import {
   normaliseForFingerprint,
   normaliseTranscriptFingerprintCandidates,
+  isClaudeApiRequestBlob,
   isMeaningfulUserEvent,
   isMeaningfulQueuedCommand,
   isMidTurnAbsorbedQueuedCommand,
@@ -41,17 +42,30 @@ import {
   extractTurnStartText,
   isClaudeTurnTerminalEvent,
   isClaudeTurnDurationEvent,
+  isClaudeUserInterruptEvent,
+  isSyntheticUserPrefixEvent,
+  assistantToolUseIds,
+  userToolResultIds,
+  isMainThreadApiRequestEvent,
+  isIntraTurnAttachmentEvent,
   eventTimeMs,
+  hasTranscriptRole,
   backgroundTaskLaunches,
+  backgroundTaskSettledIds,
   parseTaskNotification,
   isTranscriptRateLimitEvent,
+  isSyntheticAssistantRecord,
   isSyntheticNoModelReplyEvent,
   classifyClaudeTerminalEvent,
   apiErrorMessageText,
   AbsorbedReplyCollector,
+  type BackgroundTaskKind,
+  type BackgroundTaskLaunch,
+  type ParsedTaskNotification,
   type ClaudeTerminalOutcome,
   type TranscriptEvent,
 } from './claude-transcript.js';
+import type { ClaudeOpenTurnQueueEvidence } from './claude-open-turn-watchdog.js';
 
 // Re-export so existing callers (worker.ts, tests) don't need to change
 // their import path now that these helpers live in claude-transcript.ts.
@@ -75,10 +89,22 @@ export interface BridgePendingTurn {
   dispatchAttempt?: number;
   linkRefMode?: 'observe' | 'enabled';
   started: boolean;
+  /** True only when the transcript user/queued_command record's untouched
+   *  legacy-normalised text contained the entire normalised marked content
+   *  (never prefix-only, residue-only, truncation, or unfingerprinted binds). */
+  fullContentMatch?: boolean;
+  /** Strict whole-string equality against the normalised marked content (or its
+   *  sanitized/submitted exact variants). Unlike fullContentMatch (substring),
+   *  prevents short prompts like "ok" from matching unrelated longer inputs. */
+  exactContentMatch?: boolean;
+  /** Additional normalised exact-match targets (e.g. sanitized Claude input or
+   *  catalog-appended submitted text) checked with strict whole-string equality. */
+  extraExactContents?: readonly string[];
   assistantUuids: string[];
   /** An authoritative transcript boundary closed this turn. Durable turns may
    * never settle from screen-idle alone; worker terminal emission requires
-   * this bit (or an explicit failure/exit path outside the queue). */
+   * this bit (or an explicit failure/exit/ambiguous outcome outside the
+   * transcript's completion evidence). */
   terminalObserved?: boolean;
   /** The latest terminal evidence is an assistant record's stop_reason that no
    * `system/turn_duration` has confirmed yet. Claude Code stamps EVERY content
@@ -142,6 +168,23 @@ export interface BridgePendingTurn {
    *  Unused in thread scope, where the session root is the anchor. For a
    *  background wake: the Lark turn that launched the task. */
   replyAnchorTurnId?: string;
+  /** Durable dispatch attempt of {@link replyAnchorTurnId} when the launching
+   *  Lark turn carried one. Keeps CoT forwarding on the exact `turnId|attempt`
+   *  key of the launching turn instead of superseding its live CoT bubble. */
+  replyAnchorDispatchAttempt?: number;
+  /** Set ONLY on a headless local turn opened by `<task-notification>` when
+   *  EVERY notice opening or folded into the turn (pre-synthesis and mid-turn)
+   *  is a system-origin non-terminal, non-expiry, non-expired event from a
+   *  known non-persistent (`persistent === false`) Monitor, with no mid-turn
+   *  human prompt folded in. Fail-open (unset) for all other turns. */
+  wakeNonTerminalMonitor?: true;
+  /** Sticky CoT anchor that actually received leading `thinking_update`
+   *  entries before this wake turn was synthesised or unrouted. Lets Loop 2
+   *  flush buffered anchor CoT even if `replyAnchorTurnId` was later cleared. */
+  cotAnchor?: BackgroundTaskAnchor;
+  /** Monitor task ids that opened this headless wake (used to disarm
+   *  `wakeNonTerminalMonitor` if any of them is killed mid-wake). */
+  monitorWakeTaskIds?: Set<string>;
   /** Transcript uuid of the user event that started this turn. Stored for
    *  local turns so emit can fetch the user-typed content from the source
    *  jsonl alongside the assistant uuids. Lark turns don't need it because
@@ -234,10 +277,25 @@ export interface BridgePendingTurn {
   /** Multiple inputs share one uninterrupted output segment, so the next
    *  output cannot be attributed to this later input without guessing. */
   absorbedReplyAmbiguous?: boolean;
-  /** The worker already sent this folded turn's reply live, while its host
-   *  turn was still running: the end of the host turn must not post it again,
-   *  and a failure the host meets afterwards is not this turn's. */
+  /** The worker handed this folded turn's reply to the daemon. The host still
+   *  carries its text unless actual delivery is confirmed, and a failure the
+   *  host meets afterwards is not this turn's. */
   absorbedReplySent?: boolean;
+  /** The daemon confirmed the live card's actual POST. Distinct from IPC
+   *  handoff: a failed host may settle on a confirmed reply, but an unconfirmed
+   *  one still needs its own final fallback. */
+  absorbedReplyDelivered?: boolean;
+  /** Records whose text is known to have gone out whole as this folded turn's
+   *  live reply (empty for a thinking summary, a reply too long for one card,
+   *  or a delivery not confirmed by the daemon). They are the host turn's
+   *  records too, so the host's own final leaves them out — see
+   *  liveFoldedReplyUuids. */
+  absorbedReplyTextUuids?: string[];
+  /** Records the host turn's final carried whole into the chat this folded
+   *  message came from (noteHostFinalCarried). An answer among them is not
+   *  posted to this turn again. Kept on the turn, so an emit retried after a
+   *  throw still knows. */
+  absorbedHostFinalUuids?: ReadonlySet<string>;
   /** The live check for this folded turn's reply has run (see
    *  takeAbsorbedReplyCandidates); whatever it found, it does not run again. */
   absorbedLiveChecked?: boolean;
@@ -257,6 +315,44 @@ export const CLI_QUEUE_HOLD_MAX_MS = 30 * 60_000;
 const CLI_QUEUE_MARK_SKEW_MS = 5_000;
 /** Background-task launch anchors kept per queue (oldest evicted first). */
 const BACKGROUND_TASK_ANCHORS_MAX = 256;
+/** Background-task launch metadata entries kept per queue (oldest evicted first). */
+const BACKGROUND_TASK_META_MAX = 512;
+
+export interface BackgroundTaskAnchor {
+  turnId: string;
+  dispatchAttempt?: number;
+}
+
+export interface BackgroundTaskLaunchMeta {
+  kind: BackgroundTaskKind;
+  persistent?: boolean;
+  expiresAtMs?: number;
+}
+
+/** Read-only side-channel observer for leading thinking/tool records during an
+ *  armed non-terminal Monitor wake BEFORE the first visible text block (and for
+ *  text-less Monitor wakes that close at `turn_duration` with no visible text). */
+export interface PendingWakeCotObserver {
+  onActivity?: (ev: TranscriptEvent, anchor: BackgroundTaskAnchor) => void;
+  onTextlessComplete?: (anchor: BackgroundTaskAnchor) => void;
+}
+
+interface PendingBackgroundWake {
+  anchor: BackgroundTaskAnchor | null;
+  nonTerminalMonitor: boolean;
+  hasAssistantActivity: boolean;
+  /** Sticky anchor that already received at least one `onActivity` CoT event. */
+  emittedAnchorCot?: BackgroundTaskAnchor;
+  /** Non-terminal Monitor task ids observed in this armed wake. */
+  monitorTaskIds: Set<string>;
+}
+
+function sameBackgroundTaskAnchor(
+  a: BackgroundTaskAnchor | undefined | null,
+  b: BackgroundTaskAnchor | undefined | null,
+): boolean {
+  return !!a && !!b && a.turnId === b.turnId && a.dispatchAttempt === b.dispatchAttempt;
+}
 
 /** Change detector for the worker's `background_task_pins_sync` snapshots
  *  (see BridgeTurnQueue.backgroundTaskAnchorTurnIds). It starts as "never
@@ -326,6 +422,39 @@ export function takeAbsorbedReplyCandidates(
   return due;
 }
 
+/** Records the host turn's own final leaves out: their text already went out,
+ *  live, as the reply to an input folded into it (absorbedReplyTextUuids).
+ *  Claude Code writes that reply inside the host turn, so a final joined from
+ *  all of the host's text would post it a second time — word for word when it
+ *  is all the host said before an idle edge cut it. A reply still unsent when
+ *  the host ends is not left out: the host's final carries it instead. */
+export function liveFoldedReplyUuids(host: BridgePendingTurn): Set<string> {
+  const uuids = new Set<string>();
+  for (const folded of host.absorbedTurns ?? []) {
+    if (!folded.absorbedReplySent) continue;
+    for (const uuid of folded.absorbedReplyTextUuids ?? []) uuids.add(uuid);
+  }
+  return uuids;
+}
+
+/** The host turn's final went out carrying `records`, `whole` or cut short.
+ *  Each input folded into it may then settle on that final instead of posting
+ *  its answer again (absorbedHostFinalUuids) — but only when the final went
+ *  out whole into the chat the folded message came from: a Lark message turn
+ *  (`om_…`) or a terminal-typed turn mirrored there. A trigger's or a
+ *  schedule's final may go elsewhere (an HTTP caller, a doc, nowhere). */
+export function noteHostFinalCarried(
+  host: BridgePendingTurn,
+  records: readonly TranscriptEvent[],
+  whole: boolean,
+): void {
+  if (!whole || !host.absorbedTurns?.length) return;
+  if (!host.turnId.startsWith('om_') && !(host.isLocal && !host.isScheduled)) return;
+  const uuids = new Set<string>();
+  for (const ev of records) if (ev.uuid) uuids.add(ev.uuid);
+  for (const folded of host.absorbedTurns) folded.absorbedHostFinalUuids = uuids;
+}
+
 /** Claude's own transcript proves this input is waiting in its queue. There is
  *  nothing to search other transcripts for, and no reason to expire the mark:
  *  the record that binds it arrives when Claude takes the input. */
@@ -391,6 +520,9 @@ interface TranscriptMarkMatch {
   truncationMatch: boolean;
   /** Only the untouched legacy candidate can prove native consumption. */
   legacyFullContentMatch: boolean;
+  /** Strict whole-string equality on the untouched legacy candidate against the
+   *  normalised mark (or its exact submitted/sanitized variants). */
+  legacyExactContentMatch: boolean;
   /** A bind that exists only because the residue candidate was considered. */
   residueOnlyMatch: boolean;
   /** A strong bind that exists only because the residue candidate was considered. */
@@ -406,6 +538,7 @@ function matchTranscriptAgainstMark(
   candidates: readonly string[],
   contentFingerprint?: string,
   contentNormalized?: string,
+  extraExactContents?: readonly string[],
 ): TranscriptMarkMatch {
   const legacy = candidates.slice(0, 1);
   const residue = candidates.slice(1);
@@ -413,9 +546,13 @@ function matchTranscriptAgainstMark(
     && texts.some(text => text.includes(contentFingerprint));
   const full = (texts: readonly string[]) => !!contentNormalized
     && texts.some(text => text.includes(contentNormalized));
+  const exact = (texts: readonly string[]) => (!!contentNormalized || (extraExactContents?.length ?? 0) > 0)
+    && texts.some(text => (!!contentNormalized && text === contentNormalized)
+      || (extraExactContents?.includes(text) ?? false));
   const truncated = (texts: readonly string[]) => texts.some(text => isTruncatedMatch(text, contentNormalized));
   const legacyFingerprintMatch = fingerprint(legacy);
   const legacyFull = full(legacy);
+  const legacyExact = exact(legacy);
   const legacyTruncationMatch = truncated(legacy);
   const residueFingerprintMatch = fingerprint(residue);
   const residueFull = full(residue);
@@ -427,6 +564,7 @@ function matchTranscriptAgainstMark(
     anyFullContentMatch: legacyFull || residueFull,
     truncationMatch: legacyTruncationMatch || residueTruncationMatch,
     legacyFullContentMatch: legacyFull,
+    legacyExactContentMatch: legacyExact,
     residueOnlyMatch: !legacyMatch && (residueFingerprintMatch || residueTruncationMatch),
     residueOnlyStrongMatch: !legacyStrongMatch && (residueFull || residueTruncationMatch),
   };
@@ -448,7 +586,12 @@ function evaluateMarksAgainstTranscript(
 ): MarkMatchEvaluation[] {
   return turns.map(turn => ({
     turn,
-    match: matchTranscriptAgainstMark(candidates, turn.contentFingerprint, turn.contentNormalized),
+    match: matchTranscriptAgainstMark(
+      candidates,
+      turn.contentFingerprint,
+      turn.contentNormalized,
+      turn.extraExactContents,
+    ),
   }));
 }
 
@@ -476,7 +619,87 @@ function residueAttributionConflictTurns(
  *  attribution heuristics, not consumption proof. */
 export interface BridgeTurnStartEvidence {
   fullContentMatch: boolean;
+  exactContentMatch?: boolean;
   sourceJsonlPath?: string;
+}
+
+const MAX_TRACKED_CHAIN_UUIDS = 512;
+const MAX_TRACKED_PROGRESS_UUIDS = 128;
+const MAX_SEEN_API_REQUEST_KEYS = 512;
+
+function addBoundedKey(set: Set<string>, key: string, maxSize: number): void {
+  if (set.has(key)) return;
+  if (set.size >= maxSize) {
+    const oldest = set.values().next().value;
+    if (oldest !== undefined) set.delete(oldest);
+  }
+  set.add(key);
+}
+
+/** Per-turn intra-turn execution evidence stored outside `BridgePendingTurn`
+ *  so the queue can prove active work and conversation-tree lineage without
+ *  altering the persisted/public turn record shape. */
+interface ClaudeTurnLiveState {
+  startUuid?: string;
+  chainUuids: Set<string>;
+  /** Separate bounded set for `type:"progress"` UUIDs so long tool-call progress
+   *  bursts (>512 events) never evict conversation-backbone UUIDs (`u1`, `tool_use`). */
+  progressChainUuids: Set<string>;
+  sawParentUuid: boolean;
+  pendingToolUseIds: Set<string>;
+  apiRequestInFlight: boolean;
+  awaitingPostToolAssistant: boolean;
+  /** True between a manual `compact_boundary` (`trigger:"manual"`) and its
+   *  paired `isCompactSummary` record so manual `/compact` does not upgrade
+   *  the watchdog to `in_flight_model`. */
+  manualCompactPending?: boolean;
+  /** Epoch ms when this turn was re-opened via Scenario 3 recovery (bounds mid-tool hold). */
+  reattachedAtMs?: number;
+  /** Mirrors `trailingAssistantText`: true iff the latest assistant block with
+   *  text/tool_use carried visible text without a `tool_use` block. Determines
+   *  default Sub-case 3A vs 3B when `emitReadyTurns` does not report ground truth. */
+  hasTrailingVisibleText: boolean;
+  /** Monotonic intra-turn transcript progress counter (separate from
+   *  `attributedActivitySeq` so provisional-exit semantics stay untouched). */
+  activitySeq: number;
+}
+
+/** Snapshot of an IM turn popped at an unobserved boundary (`!terminalObserved`).
+ *  Lets late records proving the same conversation-tree lineage re-attach to
+ *  the originating IM turn instead of synthesising a suppressed `local-headless-*`. */
+interface RecentUnobservedTurn {
+  turnId: string;
+  dispatchAttempt?: number;
+  linkRefMode?: 'observe' | 'enabled';
+  markTimeMs?: number;
+  sourceJsonlPath?: string;
+  startUuid?: string;
+  chainUuids: Set<string>;
+  progressChainUuids: Set<string>;
+  sawParentUuid: boolean;
+  pendingToolUseIds: Set<string>;
+  apiRequestInFlight: boolean;
+  awaitingPostToolAssistant: boolean;
+  hadTrailingVisibleText: boolean;
+  closedAtMs: number;
+}
+
+function matchesRecentUnobservedLineage(
+  ev: TranscriptEvent,
+  sourceJsonlPath: string | undefined,
+  anchor: RecentUnobservedTurn,
+  nowMs: number,
+): boolean {
+  if (nowMs - anchor.closedAtMs > CLI_QUEUE_HOLD_MAX_MS) return false;
+  if (anchor.sourceJsonlPath && sourceJsonlPath && anchor.sourceJsonlPath !== sourceJsonlPath) return false;
+  if (ev.parentUuid !== undefined) {
+    return typeof ev.parentUuid === 'string' && ev.parentUuid.length > 0
+      && (anchor.chainUuids.has(ev.parentUuid) || anchor.progressChainUuids.has(ev.parentUuid));
+  }
+  if (anchor.sawParentUuid || !anchor.startUuid) return false;
+  const atMs = eventTimeMs(ev);
+  if (atMs !== undefined && anchor.markTimeMs !== undefined && atMs < anchor.markTimeMs) return false;
+  return true;
 }
 
 export class BridgeTurnQueue {
@@ -527,18 +750,25 @@ export class BridgeTurnQueue {
    *  would route cross-topic after a restart. Restored by the worker from the
    *  durable anchor store on startup. */
   private scheduledTaskAnchors = new Map<string, string | undefined>();
-  /** Background task id → Lark turn whose tool_result acked its launch
-   *  (inherited through a scheduled / background-wake turn's own anchor).
-   *  Tasks launched from terminal-typed turns, or before this queue existed,
-   *  have no entry: their wake stays an ordinary local turn. */
-  private backgroundTaskAnchors = new Map<string, string>();
+  /** Background task id → launch metadata (kind, Monitor persistence, timeout
+   *  deadline). Recorded for ALL main-thread launches (including local/zero-
+   *  injection turns and re-attached seeded tasks), independent of whether a
+   *  Lark topic anchor exists. */
+  private backgroundTaskMeta = new Map<string, BackgroundTaskLaunchMeta>();
+  /** Background task id → Lark turn (`turnId` + optional `dispatchAttempt`)
+   *  whose tool_result acked its launch (inherited through a scheduled /
+   *  background-wake turn's own anchor). Tasks launched from terminal-typed
+   *  turns, or before this queue existed, have no entry: their wake stays an
+   *  ordinary local turn. */
+  private backgroundTaskAnchors = new Map<string, BackgroundTaskAnchor>();
   /** Background wake armed by the `<task-notification>`s that opened the next
    *  turn and have not yet produced the visible text that synthesises its
    *  headless turn. Claude may answer several notices in one turn, so this
    *  accumulates: the shared anchor while every notice resolves to the same
-   *  launching Lark turn, `null` (ambiguous — fail closed, stay local) once
-   *  two differ or any one has no anchor, `undefined` when nothing pending. */
-  private pendingBackgroundWake: string | null | undefined;
+   *  launching Lark turn (`null` once two differ or any one has no anchor),
+   *  plus whether every notice so far is a qualifying non-terminal Monitor
+   *  mid-stream event (`nonTerminalMonitor`). `undefined` when nothing pending. */
+  private pendingBackgroundWake: PendingBackgroundWake | undefined;
   /** Records written before this queue existed were written while no worker
    *  of this process was watching: replaying them (journal restore, rotation)
    *  must never open a background-wake delivery. */
@@ -560,10 +790,139 @@ export class BridgeTurnQueue {
    *  Survives clearPending for the same reason as durationMarkerSeen. */
   private durationMarkerWaitExpired = false;
   /** Transcript time of the newest real model reply read (any main-thread
-   *  assistant record that is not an API error or a no-model placeholder,
-   *  tool_use blocks included). Survives clearPending like the markers above:
+   *  assistant record that is neither an API error nor a synthetic local record,
+   *  real-model tool_use blocks included). Survives clearPending like the markers above:
    *  it describes the provider session, not one generation's turns. */
   private lastProviderReplyAtMs: number | undefined;
+  private readonly liveStates = new WeakMap<BridgePendingTurn, ClaudeTurnLiveState>();
+  private readonly seenApiRequestKeys = new Set<string>();
+  private apiRequestObservedInGeneration = false;
+  private recentUnobservedTurn: RecentUnobservedTurn | null = null;
+  private readonly reattachedFromUnobserved = new WeakSet<BridgePendingTurn>();
+
+  private liveStateFor(turn: BridgePendingTurn): ClaudeTurnLiveState {
+    let state = this.liveStates.get(turn);
+    if (!state) {
+      state = {
+        chainUuids: new Set(),
+        progressChainUuids: new Set(),
+        sawParentUuid: false,
+        pendingToolUseIds: new Set(),
+        apiRequestInFlight: false,
+        awaitingPostToolAssistant: false,
+        hasTrailingVisibleText: false,
+        activitySeq: 0,
+      };
+      this.liveStates.set(turn, state);
+    }
+    return state;
+  }
+
+  private recordChainUuid(turn: BridgePendingTurn, uuid: string, ev: TranscriptEvent, isProgress = false): ClaudeTurnLiveState {
+    const state = this.liveStateFor(turn);
+    if (isProgress) {
+      addBoundedKey(state.progressChainUuids, uuid, MAX_TRACKED_PROGRESS_UUIDS);
+    } else {
+      addBoundedKey(state.chainUuids, uuid, MAX_TRACKED_CHAIN_UUIDS);
+    }
+    if (ev.parentUuid !== undefined) state.sawParentUuid = true;
+    return state;
+  }
+
+  private extendRecentUnobservedChain(uuid: string, ev: TranscriptEvent, isProgress = false): void {
+    const anchor = this.recentUnobservedTurn;
+    if (!anchor) return;
+    if (isProgress) {
+      addBoundedKey(anchor.progressChainUuids, uuid, MAX_TRACKED_PROGRESS_UUIDS);
+    } else {
+      addBoundedKey(anchor.chainUuids, uuid, MAX_TRACKED_CHAIN_UUIDS);
+    }
+    if (ev.parentUuid !== undefined) anchor.sawParentUuid = true;
+  }
+
+  /** Clear the late-recovery lineage anchor (generation boundary, CLI exit, teardown). */
+  clearRecentUnobservedTurn(): void {
+    this.recentUnobservedTurn = null;
+  }
+
+  /** True when `turn` was re-opened from a recent unobserved-boundary IM close
+   *  (Scenario 3). Such turns get a fresh bounded open-turn episode, but must
+   *  not enter V1 handoff admission or emit a duplicate `turn_terminal`. */
+  isLateUnobservedRecovery(turn: BridgePendingTurn): boolean {
+    return this.reattachedFromUnobserved.has(turn);
+  }
+
+  /** Reconcile Scenario 3A vs 3B against whether `emitReadyTurns` actually
+   *  emitted or offered a `final_output` when this unobserved turn was popped. */
+  noteUnobservedTurnEmittedFinalOutput(
+    turnId: string,
+    dispatchAttempt: number | undefined,
+    emitted: boolean,
+  ): void {
+    if (this.recentUnobservedTurn
+      && this.recentUnobservedTurn.turnId === turnId
+      && this.recentUnobservedTurn.dispatchAttempt === dispatchAttempt) {
+      this.recentUnobservedTurn.hadTrailingVisibleText = emitted;
+    }
+  }
+
+  /** Record that an unobserved-popped IM turn was already covered by an explicit
+   *  final `botmux send` marker (not by emitting bridge `final_output`). Keeping
+   *  `hadTrailingVisibleText = false` guarantees a late trailing summary re-opens
+   *  under the original `turnId` so `shouldSuppressBridgeEmit` deduplicates it. */
+  noteUnobservedTurnDeliveredBySend(turnId: string, dispatchAttempt?: number): void {
+    this.noteUnobservedTurnEmittedFinalOutput(turnId, dispatchAttempt, false);
+  }
+
+  /** True when the queue head is actively running, awaiting a duration marker,
+   *  or held in Claude's input queue — including local, scheduled, and
+   *  background-wake turns. Used to guard post-settlement redrive so we never
+   *  fire a premature idle boundary on top of a live successor turn. */
+  hasActiveOrQueuedHead(opts: { ignoreCarried?: boolean } = {}): boolean {
+    const head = this.queue[0];
+    if (!head) return false;
+    if (opts.ignoreCarried && head.carriedAcrossGeneration) return false;
+    if (head.started && !head.terminalObserved && !head.closedByDurationMarker && !head.rateLimited) return true;
+    if (this.isAwaitingDurationMarker(head)) return true;
+    if (isHeldInCliQueue(head)) return true;
+    return false;
+  }
+
+  /** Record an explicit worker-side ambiguity for the exact durable head.
+   *  Unlike `terminalObserved`, this does not claim any transcript terminal:
+   *  the model may have run, but its precise completion contract is unknown.
+   *  The bounded worker release drains this outcome without normal final_output. */
+  markDurableTurnAmbiguous(turn: BridgePendingTurn, errorCode: string): boolean {
+    if (this.queue[0] !== turn || turn.dispatchAttempt === undefined
+      || turn.closedByDurationMarker || turn.rateLimited) return false;
+    turn.terminalOutcome = { status: 'ambiguous', errorCode, retryable: false };
+    turn.terminalOutcomeAtMs = Date.now();
+    turn.awaitingDurationMarker = false;
+    return true;
+  }
+
+  /** Head live non-local turn that has started collecting in the current
+   *  transcript generation and has not yet observed any terminal record. */
+  openLiveNonLocalTurn(): BridgePendingTurn | undefined {
+    const head = this.queue[0];
+    if (!head || head.isLocal || !head.started || head !== this.collecting) return undefined;
+    if (head.terminalObserved || head.closedByDurationMarker || head.rateLimited) return undefined;
+    if (head.restoredFromJournal || head.carriedAcrossGeneration) return undefined;
+    return head;
+  }
+
+  /** Snapshot of deterministic intra-turn transcript evidence for `turn`. */
+  getOpenTurnEvidence(turn: BridgePendingTurn): ClaudeOpenTurnQueueEvidence {
+    const live = this.liveStates.get(turn);
+    return {
+      activitySeq: live?.activitySeq ?? 0,
+      unmatchedToolUseCount: live?.pendingToolUseIds.size ?? 0,
+      apiRequestInFlight: live?.apiRequestInFlight ?? false,
+      awaitingPostToolAssistant: live?.awaitingPostToolAssistant ?? false,
+      hasVisibleAssistantText: turn.assistantUuids.length > 0,
+      apiRequestObservedInGeneration: this.apiRequestObservedInGeneration,
+    };
+  }
 
   private stampProviderLastSuccess(turn: BridgePendingTurn): void {
     if (this.lastProviderReplyAtMs !== undefined) turn.terminalProviderLastSuccessAtMs = this.lastProviderReplyAtMs;
@@ -590,6 +949,9 @@ export class BridgeTurnQueue {
   resetDurationMarkerVerdicts(): void {
     this.durationMarkerSeen = false;
     this.durationMarkerWaitExpired = false;
+    this.recentUnobservedTurn = null;
+    this.seenApiRequestKeys.clear();
+    this.apiRequestObservedInGeneration = false;
   }
 
   /** Claude's queue is not observable from another transcript or CLI process:
@@ -616,6 +978,7 @@ export class BridgeTurnQueue {
    *  keep its normal marker hold (including after a proven marker-present
    *  history), not inherit the old writer's terminal-boundary exception. */
   markPendingTurnsCarriedAcrossGeneration(): void {
+    this.recentUnobservedTurn = null;
     for (const turn of this.queue) {
       if (turn.started) turn.carriedAcrossGeneration = true;
     }
@@ -669,12 +1032,68 @@ export class BridgeTurnQueue {
   }
 
   /** Register events as historical — their uuids are now considered seen
-   *  but no attribution happens. Used at attach time to baseline. */
-  absorb(events: TranscriptEvent[]): void {
+   *  but no attribution happens. Used at attach time to baseline. Also retains
+   *  background-task launch metadata (not Lark anchors) so Monitor mid-stream
+   *  events after attach still know whether the Monitor is persistent/bounded.
+   *  When `opts.liveSinceMs` is passed, launches stamped earlier than that CLI
+   *  lifetime floor are ignored (preventing dead-CLI Monitors from leaking on
+   *  `/resume`). */
+  absorb(events: TranscriptEvent[], opts?: { liveSinceMs?: number }): void {
+    const liveSinceMs = opts?.liveSinceMs;
     for (const ev of events) {
       if (ev.uuid) this.seen.add(ev.uuid);
       if (isClaudeTurnDurationEvent(ev)) this.durationMarkerSeen = true;
+      if (isMainThreadApiRequestEvent(ev)) this.apiRequestObservedInGeneration = true;
+      const atMs = liveSinceMs !== undefined ? eventTimeMs(ev) : undefined;
+      if (liveSinceMs === undefined || (atMs !== undefined && atMs >= liveSinceMs)) {
+        this.recordBackgroundTaskMetadata(backgroundTaskLaunches(ev));
+      }
+      for (const id of backgroundTaskSettledIds(ev)) this.backgroundTaskMeta.delete(id);
     }
+  }
+
+  /** Seed background-task launch metadata from a re-attach transcript scan
+   *  (metadata only: never writes `seen`, Lark anchors, or turn state). */
+  seedBackgroundTasks(tasks: readonly BackgroundTaskLaunch[]): void {
+    this.recordBackgroundTaskMetadata(tasks);
+  }
+
+  /** Seed background-task launch metadata from a historical event batch,
+   *  ignoring launches older than (or missing timestamps under) `liveSinceMs`. */
+  seedBackgroundTasksFromHistory(events: readonly TranscriptEvent[], liveSinceMs: number): void {
+    for (const ev of events) {
+      const atMs = eventTimeMs(ev);
+      if (atMs === undefined || atMs < liveSinceMs) continue;
+      this.recordBackgroundTaskMetadata(backgroundTaskLaunches(ev));
+      for (const id of backgroundTaskSettledIds(ev)) this.backgroundTaskMeta.delete(id);
+    }
+  }
+
+  /** Forget all tracked background-task metadata, anchors, and any armed wake
+   *  when the backing CLI process is replaced (its background tasks died). */
+  resetBackgroundTasks(): void {
+    this.backgroundTaskMeta.clear();
+    this.backgroundTaskAnchors.clear();
+    this.pendingBackgroundWake = undefined;
+  }
+
+  /** True while a non-terminal Monitor mid-stream wake is armed (pre-text) or
+   *  actively collecting (before `turn_duration`). Keeps the launching turn's
+   *  held CoT bubble open if the Monitor crosses `expiresAtMs` mid-micro-turn. */
+  hasActiveSuppressedMonitorWake(): boolean {
+    if (this.pendingBackgroundWake?.nonTerminalMonitor === true) return true;
+    const running = this.collecting?.closedByDurationMarker ? null : this.collecting;
+    return running?.wakeNonTerminalMonitor === true;
+  }
+
+  /** True while a non-local (IM/API) turn is actively collecting. Prevents
+   *  `computeBackgroundCotHold()` from holding an earlier turn's CoT during a
+   *  brand-new human turn, while excluding Scenario 3 late-recovery continuations
+   *  of an already-terminated launching turn. */
+  hasActiveNonLocalTurn(): boolean {
+    const running = this.collecting?.closedByDurationMarker ? null : this.collecting;
+    return !!running && !running.isLocal && !running.terminalObserved
+      && !this.reattachedFromUnobserved.has(running);
   }
 
   /** Push a new pending turn for the next Lark message. `contentFingerprint`
@@ -691,7 +1110,11 @@ export class BridgeTurnQueue {
     markTimeMs: number = Date.now(),
     contentNormalized?: string,
     dispatchAttempt?: number,
-    opts?: { restoredFromJournal?: boolean; linkRefMode?: 'observe' | 'enabled' },
+    opts?: {
+      restoredFromJournal?: boolean;
+      linkRefMode?: 'observe' | 'enabled';
+      extraExactContents?: readonly string[];
+    },
   ): string {
     this.queue.push({
       turnId,
@@ -701,6 +1124,7 @@ export class BridgeTurnQueue {
       assistantUuids: [],
       contentFingerprint,
       contentNormalized,
+      ...(opts?.extraExactContents?.length ? { extraExactContents: opts.extraExactContents } : {}),
       markTimeMs,
       ...(opts?.restoredFromJournal ? { restoredFromJournal: true } : {}),
     });
@@ -760,6 +1184,7 @@ export class BridgeTurnQueue {
   clearPending(): BridgePendingTurn[] {
     this.lastLocalTurnId = undefined;
     this.pendingBackgroundWake = undefined;
+    this.recentUnobservedTurn = null;
     this.cliQueue = [];
     this.residueConflictGroups = [];
     const dropped = this.queue.splice(0);
@@ -878,24 +1303,64 @@ export class BridgeTurnQueue {
      *  turn identity, so a replayed previous turn's marker cannot settle the
      *  current unread run. Must not mutate the queue or influence attribution. */
     onTurnDurationAttributed?: (ev: TranscriptEvent, turn: BridgePendingTurn) => void,
+    /** Read-only observer for leading thinking/tool records during an armed
+     *  non-terminal Monitor wake before the first visible text block (and for
+     *  text-less Monitor wakes closed by `system/turn_duration`). */
+    pendingWakeObserver?: PendingWakeCotObserver,
   ): void {
     if (sourceJsonlPath && events.length > 0) this.onEventsRead?.(events, sourceJsonlPath);
+    let batchMadeUuidProgress = false;
     for (const ev of events) {
       if (ev.type === 'queue-operation') {
         this.observeCliQueueOperation(ev);
+        this.settleBackgroundTasksFromEvent(ev, true);
+        continue;
+      }
+      if (isClaudeApiRequestBlob(ev)) continue;
+      if (isMainThreadApiRequestEvent(ev)) {
+        const hasStableId = typeof ev.id === 'string' && ev.id.length > 0;
+        const apiKey = hasStableId
+          ? `id:${ev.id}`
+          : typeof ev.timestamp === 'string' && ev.timestamp.length > 0
+            ? `ts:${ev.timestamp}:${sourceJsonlPath ?? ''}`
+            : undefined;
+        // An id-less request is distinguishable from a same-timestamp successor
+        // only when this batch also contains NEW uuid progress. Without such
+        // progress, treat timestamp+path as a replay key: using the mutable
+        // last-seen batch cursor made the same request gain a fresh key whenever a
+        // replay batch started at the request after later records had landed.
+        const seen = !!apiKey && this.seenApiRequestKeys.has(apiKey);
+        if (!apiKey || (seen && (hasStableId || !batchMadeUuidProgress))) continue;
+        if (!seen) addBoundedKey(this.seenApiRequestKeys, apiKey, MAX_SEEN_API_REQUEST_KEYS);
+        this.apiRequestObservedInGeneration = true;
+        if (this.collecting && !this.collecting.terminalObserved && !this.collecting.closedByDurationMarker) {
+          const live = this.liveStateFor(this.collecting);
+          live.apiRequestInFlight = true;
+          live.awaitingPostToolAssistant = false;
+          live.manualCompactPending = false;
+          live.activitySeq++;
+        }
         continue;
       }
       const uuid = ev.uuid;
       if (!uuid || this.seen.has(uuid)) continue;
       this.seen.add(uuid);
-      const role = ev.message?.role ?? ev.type;
-      if (role === 'user') {
+      batchMadeUuidProgress = true;
+      if ((ev as any).isSidechain === true) {
+        if (this.collecting && !this.collecting.terminalObserved && !this.collecting.closedByDurationMarker) {
+          const live = this.liveStates.get(this.collecting);
+          if (live && live.pendingToolUseIds.size > 0) live.activitySeq++;
+        }
+        continue;
+      }
+      if (hasTranscriptRole(ev, 'user')) {
         // Built-in CronCreate fire: isMeta + turnOrigin:"scheduled". It is
         // NOT a meaningful human event (fingerprint matching must never bind a
         // pending Lark mark to the scheduler's prompt), but it DOES open a
         // real model turn whose final belongs in the originating Lark thread.
         // Handle it before the isMeaningfulUserEvent filter below.
         if (isScheduledTurnStartEvent(ev)) {
+          this.clearPendingBackgroundWake(pendingWakeObserver);
           this.handleScheduledTurnStart(uuid, ev, sourceJsonlPath);
           continue;
         }
@@ -919,20 +1384,90 @@ export class BridgeTurnQueue {
         this.handleCronCreateAcks(ev);
         this.recordBackgroundTaskLaunches(ev);
         this.notePendingBackgroundWake(ev);
-        if (!isMeaningfulUserEvent(ev)) {
-          // Pure tool_result events are intra-turn tool output — never a
-          // turn boundary, but the CoT observer wants them for the tool
-          // timeline of the currently-collecting turn.
-          if (this.collecting && onAssistantAttributed
-            && (ev as any).isSidechain !== true
-            && isPureToolResultUserEvent(ev.message?.content)) {
-            try { onAssistantAttributed(ev, this.collecting); } catch { /* observer channel — never break attribution */ }
+        this.settleBackgroundTasksFromEvent(ev, isPureToolResultUserEvent(ev.message?.content));
+        if (isClaudeUserInterruptEvent(ev)) {
+          this.clearPendingBackgroundWake(pendingWakeObserver);
+          this.recentUnobservedTurn = null;
+          if (this.collecting && !this.collecting.closedByDurationMarker) {
+            const live = this.recordChainUuid(this.collecting, uuid, ev);
+            live.pendingToolUseIds.clear();
+            live.apiRequestInFlight = false;
+            live.awaitingPostToolAssistant = false;
+            live.activitySeq++;
+            this.collecting.terminalObserved = true;
+            this.collecting.awaitingDurationMarker = false;
+            this.collecting.closedByDurationMarker = true;
+            this.collecting.terminalOutcome ??= {
+              status: 'cancelled',
+              errorCode: 'user_interrupted',
+              retryable: false,
+            };
+            this.collecting.terminalOutcomeAtMs = eventTimeMs(ev);
+            this.collecting = null;
           }
           continue;
         }
+        if (!isMeaningfulUserEvent(ev)) {
+          // Pure tool_result events are intra-turn tool output — never a
+          // turn boundary, but the CoT observer wants them for the tool
+          // timeline of the currently-collecting turn (or an armed pre-text
+          // non-terminal Monitor wake that has already emitted assistant work).
+          if (isPureToolResultUserEvent(ev.message?.content)) {
+            if (this.collecting && onAssistantAttributed) {
+              try { onAssistantAttributed(ev, this.collecting); } catch { /* observer channel — never break attribution */ }
+            } else if (!this.collecting
+              && pendingWakeObserver?.onActivity
+              && this.pendingBackgroundWake?.nonTerminalMonitor === true
+              && this.pendingBackgroundWake.hasAssistantActivity
+              && this.pendingBackgroundWake.anchor !== null) {
+              this.pendingBackgroundWake.emittedAnchorCot ??= { ...this.pendingBackgroundWake.anchor };
+              try { pendingWakeObserver.onActivity(ev, { ...this.pendingBackgroundWake.anchor }); } catch { /* observer channel */ }
+            }
+            if (this.collecting && !this.collecting.terminalObserved && !this.collecting.closedByDurationMarker) {
+              const live = this.recordChainUuid(this.collecting, uuid, ev);
+              for (const toolUseId of userToolResultIds(ev)) live.pendingToolUseIds.delete(toolUseId);
+              live.awaitingPostToolAssistant = true;
+              live.manualCompactPending = false;
+              live.activitySeq++;
+            } else if (!this.collecting && this.recentUnobservedTurn) {
+              if (matchesRecentUnobservedLineage(ev, sourceJsonlPath, this.recentUnobservedTurn, Date.now())) {
+                for (const toolUseId of userToolResultIds(ev)) {
+                  this.recentUnobservedTurn.pendingToolUseIds.delete(toolUseId);
+                }
+                this.recentUnobservedTurn.awaitingPostToolAssistant = true;
+                this.extendRecentUnobservedChain(uuid, ev);
+              } else {
+                this.recentUnobservedTurn = null;
+              }
+            }
+          } else {
+            if (this.collecting && !this.collecting.terminalObserved && !this.collecting.closedByDurationMarker) {
+              if ((ev as any).isCompactSummary === true) {
+                const live = this.recordChainUuid(this.collecting, uuid, ev);
+                if (!live.manualCompactPending) {
+                  live.awaitingPostToolAssistant = true;
+                  live.activitySeq++;
+                }
+                live.manualCompactPending = false;
+              } else if ((ev as any).isMeta === true && !isSyntheticUserPrefixEvent(ev)) {
+                // Mid-turn non-synthetic meta records (e.g. expanded Skill
+                // instructions) participate in the conversation parentUuid chain
+                // without opening a new turn or extending awaitingPostToolAssistant.
+                this.recordChainUuid(this.collecting, uuid, ev);
+              }
+            }
+            // Wall 1: any non-tool_result user record (local slash command,
+            // `<task-notification>`, `isMeta`, `isCompactSummary`) invalidates
+            // the late-recovery anchor so subsequent replies never cross-attach.
+            this.recentUnobservedTurn = null;
+          }
+          continue;
+        }
+        this.clearPendingBackgroundWake(pendingWakeObserver);
         this.handleTurnStart(uuid, ev, sourceJsonlPath);
       } else if (ev.type === 'attachment' && ev.attachment?.type === 'queued_command') {
         this.noteAbsorbedBackgroundNotice(ev);
+        this.settleBackgroundTasksFromEvent(ev, false);
         // Type-ahead path: Claude writes `attachment(queued_command)` the
         // moment it dequeues a queued submit, immediately before the
         // assistant text for that turn starts streaming. Equivalent to
@@ -943,20 +1478,74 @@ export class BridgeTurnQueue {
         // assistant text would either be dropped or attributed to a
         // sibling turn.
         if (isMidTurnAbsorbedQueuedCommand(ev)) {
-          this.handleAbsorbedInput(ev, sourceJsonlPath);
+          // A human prompt folded into a Monitor wake turn means the model's
+          // reply now answers the human too. Try binding a pending Lark mark
+          // first (which promotes that Lark turn to `collecting` instead of
+          // burying it inside a headless background wake); if the prompt did
+          // not promote a new collecting turn (e.g. local-typed mid-turn input),
+          // fail open by disarming the Monitor wake so its answer is delivered.
+          const beforeHost = this.collecting;
+          if (this.pendingBackgroundWake) this.pendingBackgroundWake.nonTerminalMonitor = false;
+          const matched = this.handleAbsorbedInput(ev, sourceJsonlPath, pendingWakeObserver);
+          if (this.collecting === beforeHost) {
+            this.disarmCollectingMonitorWake();
+          }
+          if (!matched) {
+            if (this.collecting && !this.collecting.terminalObserved && !this.collecting.closedByDurationMarker) {
+              const live = this.recordChainUuid(this.collecting, uuid, ev);
+              live.awaitingPostToolAssistant = true;
+              live.activitySeq++;
+            } else {
+              this.recentUnobservedTurn = null;
+            }
+          }
           continue;
         }
-        if (!isMeaningfulQueuedCommand(ev)) continue;
+        if (!isMeaningfulQueuedCommand(ev)) {
+          if (this.collecting && !this.collecting.terminalObserved && !this.collecting.closedByDurationMarker) {
+            const live = this.recordChainUuid(this.collecting, uuid, ev);
+            live.awaitingPostToolAssistant = true;
+            live.activitySeq++;
+          } else {
+            this.recentUnobservedTurn = null;
+          }
+          continue;
+        }
+        this.clearPendingBackgroundWake(pendingWakeObserver);
         this.handleTurnStart(uuid, ev, sourceJsonlPath);
-      } else if (role === 'assistant') {
-        if ((ev as any).isSidechain === true) continue;
-        // An assistant record after the collecting turn's duration marker opens
-        // the next turn, one that began without a meaningful user line (a
-        // `<task-notification>` wake-up). A live drain has emitted the closed
-        // turn by then; a batch spanning several turns — a rotation switch
-        // replaying what the bridge did not read — must not fold the next
-        // turn's reply into it.
-        if (this.collecting?.closedByDurationMarker) this.collecting = null;
+      } else if (isIntraTurnAttachmentEvent(ev)) {
+        if (this.collecting && !this.collecting.terminalObserved && !this.collecting.closedByDurationMarker) {
+          const live = this.recordChainUuid(this.collecting, uuid, ev);
+          live.awaitingPostToolAssistant = true;
+          live.manualCompactPending = false;
+          live.activitySeq++;
+        } else if (!this.collecting && this.recentUnobservedTurn) {
+          if (matchesRecentUnobservedLineage(ev, sourceJsonlPath, this.recentUnobservedTurn, Date.now())) {
+            this.recentUnobservedTurn.awaitingPostToolAssistant = true;
+            this.extendRecentUnobservedChain(uuid, ev);
+          } else {
+            this.recentUnobservedTurn = null;
+          }
+        }
+      } else if (ev.type === 'progress') {
+        if (this.collecting && !this.collecting.terminalObserved && !this.collecting.closedByDurationMarker) {
+          const live = this.recordChainUuid(this.collecting, uuid, ev, true);
+          live.activitySeq++;
+        } else if (!this.collecting && this.recentUnobservedTurn
+          && matchesRecentUnobservedLineage(ev, sourceJsonlPath, this.recentUnobservedTurn, Date.now())) {
+          this.extendRecentUnobservedChain(uuid, ev, true);
+        }
+      } else if (hasTranscriptRole(ev, 'assistant')) {
+        // An assistant record after the collecting turn's duration marker (or
+        // after a markerless turn's `end_turn` once a `<task-notification>`
+        // armed a new background wake) opens the next turn. A live drain has
+        // emitted the closed turn by then; a batch spanning several turns must
+        // not fold the next turn's reply into it.
+        if (this.collecting?.closedByDurationMarker
+          || (this.collecting?.terminalObserved && !this.isAwaitingDurationMarker(this.collecting)
+            && this.pendingBackgroundWake !== undefined)) {
+          this.collecting = null;
+        }
         // Capture CronCreate calls with the topic anchor of the turn that is
         // running them: when the ack returns the task id, fires of that task
         // route back to THIS topic even if other topics receive messages
@@ -967,7 +1556,9 @@ export class BridgeTurnQueue {
           // anchor (a task (re)created during a scheduled run belongs in that
           // same topic); otherwise the latest started Lark turn; else none.
           const anchor = this.collecting && !this.collecting.isLocal
-            ? this.collecting.turnId
+            ? (this.reattachedFromUnobserved.has(this.collecting) && this.collecting.replyAnchorTurnId
+              ? this.collecting.replyAnchorTurnId
+              : this.collecting.turnId)
             : this.collecting?.isScheduled
               ? this.collecting.replyAnchorTurnId
               : this.lastLarkTurnId;
@@ -986,9 +1577,18 @@ export class BridgeTurnQueue {
         // and bounded retry are owned by the worker/daemon, respectively.
         if (isTranscriptRateLimitEvent(ev)) {
           // Ends a wake cut before any visible text, like the API-error
-          // records below.
-          this.pendingBackgroundWake = undefined;
-          if (this.collecting) this.collecting.rateLimited = true;
+          // records below; flush any leading anchor CoT first.
+          this.clearPendingBackgroundWake(pendingWakeObserver);
+          this.recentUnobservedTurn = null;
+          if (this.collecting) {
+            this.collecting.rateLimited = true;
+            const live = this.liveStates.get(this.collecting);
+            if (live) {
+              live.pendingToolUseIds.clear();
+              live.apiRequestInFlight = false;
+              live.awaitingPostToolAssistant = false;
+            }
+          }
           continue;
         }
         const terminalOutcome = classifyClaudeTerminalEvent(ev);
@@ -1005,7 +1605,16 @@ export class BridgeTurnQueue {
           // a duration marker follows: left armed it would claim whatever
           // headless text comes next — a continuation of the failed turn or
           // an unrelated turn — for the launching topic.
-          this.pendingBackgroundWake = undefined;
+          this.clearPendingBackgroundWake(pendingWakeObserver);
+          this.recentUnobservedTurn = null;
+          if (this.collecting) {
+            const live = this.liveStates.get(this.collecting);
+            if (live) {
+              live.pendingToolUseIds.clear();
+              live.apiRequestInFlight = false;
+              live.awaitingPostToolAssistant = false;
+            }
+          }
           if (this.collecting && terminalOutcome?.status !== 'rate_limited') {
             // The two signals that share this exit are NOT of equal authority,
             // so they do not share an assignment operator (maintainer ruling on
@@ -1045,11 +1654,66 @@ export class BridgeTurnQueue {
         }
         // A real model reply: the provider answered this request.
         const replyAtMs = eventTimeMs(ev);
-        if (replyAtMs !== undefined
+        // Synthetic local tool calls still follow ordinary attribution below,
+        // but no provider answered, so they must not move recovery's clock.
+        if (!isSyntheticAssistantRecord(ev) && replyAtMs !== undefined
           && (this.lastProviderReplyAtMs === undefined || replyAtMs > this.lastProviderReplyAtMs)) {
           this.lastProviderReplyAtMs = replyAtMs;
         }
         const hasVisibleText = assistantHasVisibleText(ev.message?.content);
+        // Scenario 3: an IM turn was popped at a bounded unobserved boundary
+        // before its real assistant records arrived. If the arriving record
+        // proves conversation-tree lineage back to that exact turn (with zero
+        // intervening prompts/commands/wakes), re-attach instead of minting a
+        // suppressed `local-headless-*` turn.
+        if (!this.collecting && this.recentUnobservedTurn && this.pendingBackgroundWake === undefined) {
+          const anchor = this.recentUnobservedTurn;
+          if (!matchesRecentUnobservedLineage(ev, sourceJsonlPath, anchor, Date.now())) {
+            this.recentUnobservedTurn = null;
+          } else if (!hasVisibleText) {
+            this.extendRecentUnobservedChain(uuid, ev);
+          } else if (!anchor.hadTrailingVisibleText || anchor.turnId.startsWith('om_')) {
+            const recovered: BridgePendingTurn = anchor.hadTrailingVisibleText
+              ? {
+                  turnId: `late-recovery-${uuid}`,
+                  replyAnchorTurnId: anchor.turnId,
+                  ...(anchor.dispatchAttempt !== undefined ? { replyAnchorDispatchAttempt: anchor.dispatchAttempt } : {}),
+                  ...(anchor.linkRefMode ? { linkRefMode: anchor.linkRefMode } : {}),
+                  started: true,
+                  isLocal: false,
+                  assistantUuids: [],
+                  sourceJsonlPath: sourceJsonlPath ?? anchor.sourceJsonlPath,
+                  markTimeMs: anchor.markTimeMs,
+                }
+              : {
+                  turnId: anchor.turnId,
+                  dispatchAttempt: anchor.dispatchAttempt,
+                  ...(anchor.linkRefMode ? { linkRefMode: anchor.linkRefMode } : {}),
+                  started: true,
+                  isLocal: false,
+                  assistantUuids: [],
+                  sourceJsonlPath: sourceJsonlPath ?? anchor.sourceJsonlPath,
+                  markTimeMs: anchor.markTimeMs,
+                };
+            this.reattachedFromUnobserved.add(recovered);
+            const live = this.liveStateFor(recovered);
+            live.startUuid = anchor.startUuid;
+            live.sawParentUuid = anchor.sawParentUuid;
+            live.pendingToolUseIds = new Set(anchor.pendingToolUseIds);
+            live.apiRequestInFlight = anchor.apiRequestInFlight;
+            live.awaitingPostToolAssistant = anchor.awaitingPostToolAssistant;
+            live.reattachedAtMs = Date.now();
+            for (const id of anchor.chainUuids) addBoundedKey(live.chainUuids, id, MAX_TRACKED_CHAIN_UUIDS);
+            for (const id of anchor.progressChainUuids) addBoundedKey(live.progressChainUuids, id, MAX_TRACKED_PROGRESS_UUIDS);
+            const insertAt = this.queue.findIndex(t => !t.started);
+            if (insertAt === -1) this.queue.push(recovered);
+            else this.queue.splice(insertAt, 0, recovered);
+            this.collecting = recovered;
+            this.recentUnobservedTurn = null;
+          } else {
+            this.recentUnobservedTurn = null;
+          }
+        }
         if (hasVisibleText && !this.collecting) {
           // Headless local turn: an assistant boundary arrived without any
           // collecting context. Typical trigger: daemon restart cut off
@@ -1060,14 +1724,21 @@ export class BridgeTurnQueue {
           // Headless turns have no userUuid; emit-side formatting omits
           // the user block. Inserted at the head of the unstarted region
           // so a subsequent normal turn doesn't get reordered ahead of it.
-          const wakeAnchor = this.pendingBackgroundWake;
+          const wake = this.pendingBackgroundWake;
           this.pendingBackgroundWake = undefined;
           const headless: BridgePendingTurn = {
             turnId: `local-headless-${uuid}`,
             started: true,
             isLocal: true,
-            ...(typeof wakeAnchor === 'string' ? { isBackgroundWake: true, replyAnchorTurnId: wakeAnchor } : {}),
-            ...(wakeAnchor === null ? { backgroundWakeUnrouted: true } : {}),
+            ...(wake?.anchor ? {
+              isBackgroundWake: true,
+              replyAnchorTurnId: wake.anchor.turnId,
+              ...(wake.anchor.dispatchAttempt !== undefined ? { replyAnchorDispatchAttempt: wake.anchor.dispatchAttempt } : {}),
+            } : {}),
+            ...(wake && wake.anchor === null ? { backgroundWakeUnrouted: true } : {}),
+            ...(wake?.nonTerminalMonitor ? { wakeNonTerminalMonitor: true as const } : {}),
+            ...(wake?.emittedAnchorCot ? { cotAnchor: { ...wake.emittedAnchorCot } } : {}),
+            ...(wake?.monitorTaskIds.size ? { monitorWakeTaskIds: new Set(wake.monitorTaskIds) } : {}),
             userUuid: undefined,
             replyContextTurnId: this.lastLocalTurnId,
             precedingLarkTurnId: this.lastLarkTurnId,
@@ -1085,6 +1756,38 @@ export class BridgeTurnQueue {
           this.collecting.hasAssistantActivity = true;
           this.collecting.attributedActivitySeq
             = (this.collecting.attributedActivitySeq ?? 0) + 1;
+          const live = this.recordChainUuid(this.collecting, uuid, ev);
+          const toolIds = assistantToolUseIds(ev);
+          // Preserve `apiRequestInFlight` across intermediate streaming blocks
+          // (`stop_reason: null`) so a thinking-only or narration block before a
+          // large `Write`/`Edit` `tool_use` does not collapse the watchdog tier
+          // from `in_flight_model` (120s) down to `unmarked_partial` (4s).
+          const isStreamingNullBlock = ev.message?.stop_reason == null;
+          if (!(isStreamingNullBlock
+            && ((!hasVisibleText && toolIds.length === 0) || (this.durationMarkerSeen && toolIds.length === 0)))) {
+            live.apiRequestInFlight = false;
+          }
+          live.awaitingPostToolAssistant = false;
+          live.manualCompactPending = false;
+          live.activitySeq++;
+          for (const toolId of toolIds) live.pendingToolUseIds.add(toolId);
+          // Match `trailingAssistantText`: a record carrying `tool_use` (even
+          // paired with a `text` block) does NOT leave trailing visible text.
+          if (toolIds.length > 0) live.hasTrailingVisibleText = false;
+          else if (hasVisibleText) live.hasTrailingVisibleText = true;
+          if (ev.message?.stop_reason === 'pause_turn') live.awaitingPostToolAssistant = true;
+        } else if (this.pendingBackgroundWake) {
+          // Text-less leading assistant record (thinking / tool_use) during an
+          // armed background wake: do not synthesise early, but expose CoT
+          // entries to the anchor observer while the wake stays a pure
+          // non-terminal Monitor mid-stream event.
+          this.pendingBackgroundWake.hasAssistantActivity = true;
+          if (pendingWakeObserver?.onActivity
+            && this.pendingBackgroundWake.nonTerminalMonitor
+            && this.pendingBackgroundWake.anchor !== null) {
+            this.pendingBackgroundWake.emittedAnchorCot ??= { ...this.pendingBackgroundWake.anchor };
+            try { pendingWakeObserver.onActivity(ev, { ...this.pendingBackgroundWake.anchor }); } catch { /* observer channel */ }
+          }
         }
         if (hasVisibleText) this.collecting?.assistantUuids.push(uuid);
         if (this.collecting && onAssistantAttributed) {
@@ -1096,6 +1799,8 @@ export class BridgeTurnQueue {
           // last one. Records that follow stay attributed here because the turn
           // keeps `collecting`; drainEmittable holds it for the duration marker.
           this.collecting.awaitingDurationMarker = true;
+          const live = this.liveStates.get(this.collecting);
+          if (live) live.pendingToolUseIds.clear();
           if (terminalOutcome?.status !== 'rate_limited') {
             this.collecting.terminalOutcome ??= terminalOutcome;
           }
@@ -1109,10 +1814,16 @@ export class BridgeTurnQueue {
         // as the next-turn-start compatibility boundary below.
         if (isClaudeTurnDurationEvent(ev)) {
           this.durationMarkerSeen = true;
-          // A wake turn that ended without visible text has nothing to forward.
-          this.pendingBackgroundWake = undefined;
+          // Flush any anchor CoT buffered during a text-less pre-text wake
+          // (even if the wake was later disarmed mid-turn) before clearing it.
+          this.clearPendingBackgroundWake(pendingWakeObserver);
         }
         if (this.collecting) {
+          const live = this.recordChainUuid(this.collecting, uuid, ev);
+          live.pendingToolUseIds.clear();
+          live.apiRequestInFlight = false;
+          live.awaitingPostToolAssistant = false;
+          live.activitySeq++;
           this.collecting.terminalObserved = true;
           this.collecting.awaitingDurationMarker = false;
           if (isClaudeTurnDurationEvent(ev)) {
@@ -1121,6 +1832,32 @@ export class BridgeTurnQueue {
           }
           if (!this.collecting.rateLimited) {
             this.collecting.terminalOutcome ??= { status: 'completed' };
+          }
+        } else if (isClaudeTurnDurationEvent(ev)) {
+          this.recentUnobservedTurn = null;
+        }
+      } else if (ev.type === 'system') {
+        if (ev.subtype === 'compact_boundary') {
+          if (this.collecting && !this.collecting.terminalObserved && !this.collecting.closedByDurationMarker) {
+            const live = this.recordChainUuid(this.collecting, uuid, ev);
+            if (ev.compactMetadata?.trigger === 'manual') {
+              live.manualCompactPending = true;
+            } else {
+              live.manualCompactPending = false;
+              live.awaitingPostToolAssistant = true;
+              live.activitySeq++;
+            }
+          } else {
+            this.recentUnobservedTurn = null;
+          }
+        } else if (ev.subtype === 'local_command') {
+          this.recentUnobservedTurn = null;
+        } else if (ev.subtype !== 'away_summary') {
+          if (this.collecting && !this.collecting.terminalObserved && !this.collecting.closedByDurationMarker) {
+            this.recordChainUuid(this.collecting, uuid, ev);
+          } else if (!this.collecting && this.recentUnobservedTurn
+            && matchesRecentUnobservedLineage(ev, sourceJsonlPath, this.recentUnobservedTurn, Date.now())) {
+            this.extendRecentUnobservedChain(uuid, ev);
           }
         }
       }
@@ -1146,87 +1883,248 @@ export class BridgeTurnQueue {
     }
   }
 
-  /** File the Lark anchor of the running turn under each background task a
-   *  main-thread tool_result just acked as launched. A wake turn that has not
-   *  said anything yet has no headless turn collecting; the wake it armed is
-   *  what is running, so its launches inherit that anchor (never an ambiguous
-   *  one). */
+  private recordBackgroundTaskMetadata(launches: Iterable<BackgroundTaskLaunch>): void {
+    for (const launch of launches) {
+      this.backgroundTaskMeta.delete(launch.taskId);
+      this.backgroundTaskMeta.set(launch.taskId, {
+        kind: launch.kind,
+        ...(launch.persistent !== undefined ? { persistent: launch.persistent } : {}),
+        ...(launch.expiresAtMs !== undefined ? { expiresAtMs: launch.expiresAtMs } : {}),
+      });
+    }
+    while (this.backgroundTaskMeta.size > BACKGROUND_TASK_META_MAX) {
+      this.backgroundTaskMeta.delete(this.backgroundTaskMeta.keys().next().value!);
+    }
+  }
+
+  /** File the launch metadata (always) and Lark anchor (when known) of the
+   *  running turn under each background task a main-thread tool_result just
+   *  acked as launched. A wake turn that has not said anything yet has no
+   *  headless turn collecting; the wake it armed is what is running, so its
+   *  launches inherit that anchor (never an ambiguous one). */
   private recordBackgroundTaskLaunches(ev: TranscriptEvent): void {
     const launches = backgroundTaskLaunches(ev);
     if (launches.length === 0) return;
-    const running = this.collecting;
-    const anchor = running && !running.isLocal
-      ? running.turnId
-      : running?.isScheduled || running?.isBackgroundWake ? running.replyAnchorTurnId
-      : !running && typeof this.pendingBackgroundWake === 'string' ? this.pendingBackgroundWake
-      : undefined;
-    if (anchor === undefined) return;
+    this.recordBackgroundTaskMetadata(launches);
+    const running = this.collecting?.closedByDurationMarker ? null : this.collecting;
+    const isLateRecovery = !!running && this.reattachedFromUnobserved.has(running) && !!running.replyAnchorTurnId;
+    const anchor: BackgroundTaskAnchor | undefined = running && !running.isLocal
+      ? {
+        turnId: isLateRecovery ? running.replyAnchorTurnId! : running.turnId,
+        ...((isLateRecovery ? running.replyAnchorDispatchAttempt : running.dispatchAttempt) !== undefined
+          ? { dispatchAttempt: isLateRecovery ? running.replyAnchorDispatchAttempt : running.dispatchAttempt }
+          : {}),
+      }
+      : (running?.isScheduled || running?.isBackgroundWake) && running.replyAnchorTurnId
+        ? {
+          turnId: running.replyAnchorTurnId,
+          ...(running.replyAnchorDispatchAttempt !== undefined ? { dispatchAttempt: running.replyAnchorDispatchAttempt } : {}),
+        }
+        : !running && this.pendingBackgroundWake?.anchor
+          ? this.pendingBackgroundWake.anchor
+          : undefined;
+    if (!anchor) return;
     for (const launch of launches) {
       this.backgroundTaskAnchors.delete(launch.taskId);
-      this.backgroundTaskAnchors.set(launch.taskId, anchor);
+      this.backgroundTaskAnchors.set(launch.taskId, { ...anchor });
     }
     while (this.backgroundTaskAnchors.size > BACKGROUND_TASK_ANCHORS_MAX) {
       this.backgroundTaskAnchors.delete(this.backgroundTaskAnchors.keys().next().value!);
     }
   }
 
-  /** A delivered main-thread `role:user` `<task-notification>` that OPENS a
-   *  turn (nothing collecting, or the last turn closed by its duration marker)
-   *  for a task with a known launch anchor arms a background wake for the
-   *  headless turn its reply synthesises. A notice folded into a running turn,
-   *  a sidechain one, one written before this queue existed, one not written
-   *  by Claude Code itself (`promptSource` other than `system`: a typed
-   *  message that merely starts with the tag), or one for a task without an
-   *  anchor arms nothing — and, since Claude may answer every notice that piled
-   *  up in one turn, also disarms any wake already pending: a mixed or
-   *  cross-topic answer has no single safe destination.
-   *
-   *  The `attachment(queued_command, commandMode:'task-notification')` form
-   *  never arms (see {@link noteAbsorbedBackgroundNotice}): current Claude Code
-   *  writes it only for a notice absorbed into a turn already running. */
-  private notePendingBackgroundWake(ev: TranscriptEvent): void {
-    if (ev.isSidechain === true || ev.type !== 'user') return;
-    const notice = parseTaskNotification(ev);
-    if (!notice) return;
-    const opensTurn = !this.collecting || this.collecting.closedByDurationMarker === true;
-    if (!opensTurn) this.unrouteCollectingWake(this.backgroundTaskAnchors.get(notice.taskId));
+  /** Strict predicate for whether a delivered `<task-notification>` is a pure
+   *  non-terminal mid-stream event from a known non-persistent (`persistent:
+   *  false`) Monitor that has not reached its expiry boundary. Fails open
+   *  (`false`) on any uncertainty (including missing event timestamp when the
+   *  Monitor carries an `expiresAtMs` deadline) so terminal/persistent/expired
+   *  notices are never suppressed. */
+  private isNonTerminalMonitorNotice(ev: TranscriptEvent, notice: ParsedTaskNotification): boolean {
+    if (ev.type !== 'attachment' && ev.promptSource !== 'system') return false;
+    if (notice.hasTerminalStatus || notice.isMonitorExpiry) return false;
+    const meta = this.backgroundTaskMeta.get(notice.taskId);
+    if (!meta || meta.kind !== 'monitor' || meta.persistent !== false) return false;
     const atMs = eventTimeMs(ev);
-    const anchor = opensTurn && ev.promptSource === 'system' && atMs !== undefined && atMs >= this.liveSinceMs
-      ? this.backgroundTaskAnchors.get(notice.taskId)
-      : undefined;
-    const pending = this.pendingBackgroundWake;
-    this.pendingBackgroundWake = anchor !== undefined && (pending === undefined || pending === anchor)
-      ? anchor
-      : null;
+    if (meta.expiresAtMs !== undefined && (atMs === undefined || atMs >= meta.expiresAtMs)) return false;
+    return true;
   }
 
-  /** A `<task-notification>` Claude Code folded into a turn already under way
-   *  (`attachment(queued_command)`, commandMode `task-notification`): the
-   *  turn's answer now covers that task too. It only ever DISARMS — a wake
-   *  armed or collecting for another topic, or for a task this notice cannot
-   *  vouch for (no anchor), has no single safe destination any more and stays
-   *  an ordinary local turn. A notice of a task from the same launching turn
-   *  changes nothing. */
-  private noteAbsorbedBackgroundNotice(ev: TranscriptEvent): void {
-    if (ev.isSidechain === true || ev.attachment?.commandMode !== 'task-notification') return;
+  /** Clear `pendingBackgroundWake` and flush any anchor CoT that already
+   *  streamed pre-text records to `pendingWakeObserver`. */
+  private clearPendingBackgroundWake(pendingWakeObserver?: PendingWakeCotObserver): void {
+    const cotAnchor = this.pendingBackgroundWake?.emittedAnchorCot
+      ? { ...this.pendingBackgroundWake.emittedAnchorCot }
+      : undefined;
+    this.pendingBackgroundWake = undefined;
+    if (cotAnchor && pendingWakeObserver?.onTextlessComplete) {
+      try { pendingWakeObserver.onTextlessComplete(cotAnchor); } catch { /* observer channel */ }
+    }
+  }
+
+  /** Retire settled background tasks from `backgroundTaskMeta` so late notices
+   *  fail open, and disarm any active/armed Monitor wake when Claude explicitly
+   *  stops a task (`TaskStop`) or the TUI kills the wake's own Monitor. */
+  private settleBackgroundTasksFromEvent(ev: TranscriptEvent, disarmActiveWake: boolean): void {
+    const settled = backgroundTaskSettledIds(ev);
+    if (settled.length === 0) return;
+    for (const id of settled) this.backgroundTaskMeta.delete(id);
+    if (!disarmActiveWake) return;
+    const isTaskStop = hasTranscriptRole(ev, 'user') && isPureToolResultUserEvent(ev.message?.content);
+    const running = this.collecting?.closedByDurationMarker ? null : this.collecting;
+    if (isTaskStop) {
+      if (this.pendingBackgroundWake) this.pendingBackgroundWake.nonTerminalMonitor = false;
+      this.disarmCollectingMonitorWake();
+      return;
+    }
+    // `queue-operation: enqueue` (e.g. TUI kill): disarm only if one of the
+    // settled task ids belongs to the currently armed/collecting Monitor wake.
+    if (this.pendingBackgroundWake?.nonTerminalMonitor
+      && settled.some(id => this.pendingBackgroundWake!.monitorTaskIds.has(id))) {
+      this.pendingBackgroundWake.nonTerminalMonitor = false;
+    }
+    if (running?.wakeNonTerminalMonitor
+      && settled.some(id => running.monitorWakeTaskIds?.has(id) === true)) {
+      delete running.wakeNonTerminalMonitor;
+    }
+  }
+
+  /** True when `this.collecting` is no longer open for a new `<task-notification>`
+   *  to fold into (nothing collecting, closed by `system/turn_duration`, or a
+   *  markerless turn that already observed `end_turn`). */
+  private isCollectingClosedForWake(): boolean {
+    return !this.collecting
+      || this.collecting.closedByDurationMarker === true
+      || (this.collecting.terminalObserved === true && !this.isAwaitingDurationMarker(this.collecting));
+  }
+
+  /** A delivered main-thread `role:user` `<task-notification>` that OPENS a
+   *  turn (nothing collecting, or the last turn already terminated) for a task
+   *  with a known launch anchor arms a background wake for the headless turn
+   *  its reply synthesises. Independently of Lark anchoring, it tracks whether
+   *  EVERY notice opening this turn is a qualifying non-terminal Monitor
+   *  mid-stream event (`nonTerminalMonitor`). A notice folded into a running
+   *  turn, a sidechain one, one written before this queue existed, one not
+   *  written by Claude Code itself (`promptSource` other than `system`), or
+   *  one for a task without an anchor arms no Lark route — and any mixed or
+   *  id-less batch fails open regardless of arrival order. */
+  private notePendingBackgroundWake(ev: TranscriptEvent): void {
+    if (ev.isSidechain === true || !hasTranscriptRole(ev, 'user')) return;
+    const opensTurn = this.isCollectingClosedForWake();
     const notice = parseTaskNotification(ev);
-    if (!notice) return;
-    const anchor = this.backgroundTaskAnchors.get(notice.taskId);
-    if (typeof this.pendingBackgroundWake === 'string' && this.pendingBackgroundWake !== anchor) {
-      this.pendingBackgroundWake = null;
+    if (!notice) {
+      // Defensive fail-open: an id-less `<task-notification>` still poisons a
+      // wake batch regardless of whether it arrived before or after a Monitor
+      // notice, without retroactively mutating an already-closed turn.
+      if (!isPureToolResultUserEvent(ev.message?.content)
+        && extractTurnStartText(ev).trimStart().startsWith('<task-notification>')) {
+        if (opensTurn) {
+          this.pendingBackgroundWake = {
+            anchor: null,
+            nonTerminalMonitor: false,
+            hasAssistantActivity: this.pendingBackgroundWake?.hasAssistantActivity ?? false,
+            ...(this.pendingBackgroundWake?.emittedAnchorCot ? { emittedAnchorCot: this.pendingBackgroundWake.emittedAnchorCot } : {}),
+            monitorTaskIds: this.pendingBackgroundWake?.monitorTaskIds ?? new Set(),
+          };
+        } else {
+          this.unrouteCollectingWake(undefined);
+          this.disarmCollectingMonitorWake();
+        }
+      }
+      return;
+    }
+    const isNonTerminalMon = this.isNonTerminalMonitorNotice(ev, notice);
+    if (!opensTurn) {
+      this.unrouteCollectingWake(this.backgroundTaskAnchors.get(notice.taskId));
+      if (!isNonTerminalMon) this.disarmCollectingMonitorWake();
+      return;
+    }
+    const atMs = eventTimeMs(ev);
+    const liveAnchor = ev.promptSource === 'system' && atMs !== undefined && atMs >= this.liveSinceMs
+      ? this.backgroundTaskAnchors.get(notice.taskId)
+      : undefined;
+    const prev = this.pendingBackgroundWake;
+    if (!prev) {
+      this.pendingBackgroundWake = {
+        anchor: liveAnchor ? { ...liveAnchor } : null,
+        nonTerminalMonitor: isNonTerminalMon,
+        hasAssistantActivity: false,
+        monitorTaskIds: new Set(isNonTerminalMon ? [notice.taskId] : []),
+      };
+    } else {
+      const monitorTaskIds = prev.monitorTaskIds;
+      if (isNonTerminalMon) monitorTaskIds.add(notice.taskId);
+      this.pendingBackgroundWake = {
+        anchor: sameBackgroundTaskAnchor(prev.anchor, liveAnchor) ? prev.anchor : null,
+        nonTerminalMonitor: prev.nonTerminalMonitor && isNonTerminalMon,
+        hasAssistantActivity: prev.hasAssistantActivity,
+        ...(prev.emittedAnchorCot ? { emittedAnchorCot: prev.emittedAnchorCot } : {}),
+        monitorTaskIds,
+      };
+    }
+  }
+
+  /** A `<task-notification>` Claude Code folded into a turn via
+   *  `attachment(queued_command)` (with `commandMode: 'task-notification'` OR
+   *  whose prompt starts with `<task-notification>`): the turn's answer now
+   *  covers that task too. It only ever DISARMS — never arms an anchor or
+   *  suppression — and poisons `pendingBackgroundWake` even if it arrives
+   *  before a `role:user` Monitor notice while idle, without mutating a turn
+   *  already closed by `turn_duration`. */
+  private noteAbsorbedBackgroundNotice(ev: TranscriptEvent): void {
+    if (ev.isSidechain === true) return;
+    const isTaskNoticeAttachment = ev.attachment?.commandMode === 'task-notification'
+      || extractTurnStartText(ev).trimStart().startsWith('<task-notification>');
+    if (!isTaskNoticeAttachment) return;
+    const opensTurn = this.isCollectingClosedForWake();
+    const notice = parseTaskNotification(ev);
+    const anchor = notice ? this.backgroundTaskAnchors.get(notice.taskId) : undefined;
+    const isNonTerminalMon = notice !== undefined && this.isNonTerminalMonitorNotice(ev, notice);
+    if (opensTurn) {
+      if (this.pendingBackgroundWake) {
+        if (this.pendingBackgroundWake.anchor !== null
+          && !sameBackgroundTaskAnchor(this.pendingBackgroundWake.anchor, anchor)) {
+          this.pendingBackgroundWake.anchor = null;
+        }
+        if (!isNonTerminalMon) this.pendingBackgroundWake.nonTerminalMonitor = false;
+        else if (notice) this.pendingBackgroundWake.monitorTaskIds.add(notice.taskId);
+      } else {
+        // Poison when idle so a subsequent role:user Monitor notice in the same
+        // batch cannot arm suppression or single-topic routing over this notice.
+        this.pendingBackgroundWake = {
+          anchor: null,
+          nonTerminalMonitor: false,
+          hasAssistantActivity: false,
+          monitorTaskIds: new Set(),
+        };
+      }
+      return;
     }
     this.unrouteCollectingWake(anchor);
+    if (!isNonTerminalMon) this.disarmCollectingMonitorWake();
   }
 
   /** A notice folded into the collecting wake turn whose launch anchor differs
    *  (or is unknown): the merged answer no longer belongs to one topic, so the
    *  turn falls back to an ordinary local turn (logged as unrouted). */
-  private unrouteCollectingWake(noticeAnchor: string | undefined): void {
-    const running = this.collecting;
-    if (!running?.isBackgroundWake || running.replyAnchorTurnId === noticeAnchor) return;
+  private unrouteCollectingWake(noticeAnchor: BackgroundTaskAnchor | undefined): void {
+    const running = this.collecting?.closedByDurationMarker ? null : this.collecting;
+    if (!running?.isBackgroundWake) return;
+    const current: BackgroundTaskAnchor | undefined = running.replyAnchorTurnId
+      ? {
+        turnId: running.replyAnchorTurnId,
+        ...(running.replyAnchorDispatchAttempt !== undefined ? { dispatchAttempt: running.replyAnchorDispatchAttempt } : {}),
+      }
+      : undefined;
+    if (sameBackgroundTaskAnchor(current, noticeAnchor)) return;
     delete running.isBackgroundWake;
     delete running.replyAnchorTurnId;
+    delete running.replyAnchorDispatchAttempt;
     running.backgroundWakeUnrouted = true;
+  }
+
+  private disarmCollectingMonitorWake(): void {
+    const running = this.collecting?.closedByDurationMarker ? null : this.collecting;
+    if (running?.wakeNonTerminalMonitor) delete running.wakeNonTerminalMonitor;
   }
 
   /** Distinct Lark turns that the given (still running) background tasks
@@ -1239,7 +2137,7 @@ export class BridgeTurnQueue {
     const live = new Set(liveTaskIds);
     const out = new Set<string>();
     for (const [taskId, anchor] of this.backgroundTaskAnchors) {
-      if (live.has(taskId)) out.add(anchor);
+      if (live.has(taskId)) out.add(anchor.turnId);
     }
     return [...out];
   }
@@ -1276,6 +2174,7 @@ export class BridgeTurnQueue {
    *  unstarted — the scheduler's prompt must never fingerprint-bind them. */
   private handleScheduledTurnStart(uuid: string, ev: TranscriptEvent, sourceJsonlPath?: string): void {
     this.pendingBackgroundWake = undefined;
+    this.recentUnobservedTurn = null;
     // Same transcript-order closeout as a real turn start.
     if (this.collecting && !this.collecting.terminalObserved) {
       if (this.collecting.dispatchAttempt !== undefined || this.collecting.hasAssistantActivity) {
@@ -1403,9 +2302,13 @@ export class BridgeTurnQueue {
    *  real turn start — and end it together with the turn that absorbed it;
    *  otherwise the mark expires unmatched and its turn never gets a terminal.
    *  A non-matching or unfingerprinted mark is left alone. */
-  private handleAbsorbedInput(ev: TranscriptEvent, sourceJsonlPath?: string): void {
+  private handleAbsorbedInput(
+    ev: TranscriptEvent,
+    sourceJsonlPath?: string,
+    pendingWakeObserver?: PendingWakeCotObserver,
+  ): boolean {
     const next = this.queue.find(t => !t.started);
-    if (!next?.contentFingerprint) return;
+    if (!next?.contentFingerprint) return false;
     const evaluations = evaluateMarksAgainstTranscript(
       this.attributionMatchTurns(this.queue.filter(turn => !turn.started)),
       normaliseTranscriptFingerprintCandidates(extractTurnStartText(ev)),
@@ -1416,14 +2319,38 @@ export class BridgeTurnQueue {
     const conflict = residueAttributionConflictTurns(evaluations, evaluation);
     if (conflict.length > 0) this.noteResidueConflict(conflict, eventTimeMs);
     if ((!evaluation.match.fingerprintMatch && !evaluation.match.truncationMatch)
-      || conflict.length > 0) return;
+      || conflict.length > 0) return false;
     const fullContentMatch = evaluation.match.legacyFullContentMatch;
+    const exactContentMatch = evaluation.match.legacyExactContentMatch;
     next.started = true;
+    next.fullContentMatch = fullContentMatch;
+    next.exactContentMatch = exactContentMatch;
     this.resolveResidueConflictFor(next);
     if (!next.sourceJsonlPath) next.sourceJsonlPath = sourceJsonlPath;
     next.markTimeMs = eventTimeMs;
     const host = this.collecting;
-    if (host && !host.terminalObserved) {
+    if (host && !host.terminalObserved
+      && host.isLocal && !host.userUuid && (host.wakeNonTerminalMonitor || host.isBackgroundWake)) {
+      // A real Lark turn folded mid-turn into a headless background-wake turn:
+      // promote the Lark turn to own subsequent output instead of burying it
+      // inside `host.absorbedTurns` (which would swallow it in send mode or
+      // misroute it to the Monitor's launching topic in transcript mode).
+      host.terminalObserved = true;
+      const hostLive = this.liveStates.get(host);
+      if (hostLive) {
+        hostLive.pendingToolUseIds.clear();
+        hostLive.apiRequestInFlight = false;
+        hostLive.awaitingPostToolAssistant = false;
+      }
+      this.clearPendingBackgroundWake(pendingWakeObserver);
+      this.recentUnobservedTurn = null;
+      this.collecting = next;
+      if (typeof ev.uuid === 'string' && ev.uuid) {
+        const live = this.recordChainUuid(next, ev.uuid, ev);
+        live.startUuid = ev.uuid;
+        live.awaitingPostToolAssistant = true;
+      }
+    } else if (host && !host.terminalObserved) {
       next.absorbedIntoTurnId = host.turnId;
       if (typeof ev.uuid === 'string' && ev.uuid) next.absorbedAtUuid = ev.uuid;
       const activitySeq = host.attributedActivitySeq ?? 0;
@@ -1431,14 +2358,30 @@ export class BridgeTurnQueue {
       if (previous?.absorbedActivitySeqAtFold === activitySeq) next.absorbedReplyAmbiguous = true;
       next.absorbedActivitySeqAtFold = activitySeq;
       (host.absorbedTurns ??= []).push(next);
+      if (typeof ev.uuid === 'string' && ev.uuid) {
+        const hostLive = this.recordChainUuid(host, ev.uuid, ev);
+        hostLive.awaitingPostToolAssistant = true;
+        hostLive.activitySeq++;
+      }
     } else {
       // Nothing is collecting (e.g. the worker restarted mid-turn and lost the
       // running turn): what the model does from here on answers this input.
+      this.clearPendingBackgroundWake(pendingWakeObserver);
+      this.recentUnobservedTurn = null;
       this.collecting = next;
+      if (typeof ev.uuid === 'string' && ev.uuid) {
+        const live = this.recordChainUuid(next, ev.uuid, ev);
+        live.startUuid = ev.uuid;
+      }
     }
     this.lastLarkTurnId = next.turnId;
     this.lastLocalTurnId = undefined;
-    this.onLarkTurnStarted?.(next, { fullContentMatch, ...(sourceJsonlPath ? { sourceJsonlPath } : {}) });
+    this.onLarkTurnStarted?.(next, {
+      fullContentMatch,
+      exactContentMatch,
+      ...(sourceJsonlPath ? { sourceJsonlPath } : {}),
+    });
+    return true;
   }
 
   /** A head-of-line dropped turn takes the input it absorbed with it: left
@@ -1472,6 +2415,7 @@ export class BridgeTurnQueue {
    *       in commit b2d9791 was protecting against). */
   private handleTurnStart(uuid: string, ev: TranscriptEvent, sourceJsonlPath?: string): void {
     this.pendingBackgroundWake = undefined;
+    this.recentUnobservedTurn = null;
     // A following real user/queued-command event is itself a transcript-order
     // proof that the previous durable turn ended. This covers older Claude
     // JSONL variants that omitted the explicit final marker, without trusting
@@ -1510,6 +2454,7 @@ export class BridgeTurnQueue {
     const next = this.queue.find(t => !t.started);
     let consumedNext = false;
     let fullContentMatch = false;
+    let exactContentMatch = false;
     if (next) {
       if (next.contentFingerprint) {
         // The mark keeps its legacy identity. Transcript text additionally
@@ -1525,6 +2470,7 @@ export class BridgeTurnQueue {
         if (conflict.length > 0) this.noteResidueConflict(conflict, eventTimeMs);
         const ambiguous = conflict.length > 0;
         fullContentMatch = match.legacyFullContentMatch;
+        exactContentMatch = match.legacyExactContentMatch;
         if (!ambiguous && match.fingerprintMatch) {
           next.started = true;
           if (!next.sourceJsonlPath) next.sourceJsonlPath = sourceJsonlPath;
@@ -1561,8 +2507,16 @@ export class BridgeTurnQueue {
       }
     }
     if (consumedNext && next) {
+      next.fullContentMatch = fullContentMatch;
+      next.exactContentMatch = exactContentMatch;
+      const live = this.recordChainUuid(next, uuid, ev);
+      live.startUuid = uuid;
       this.resolveResidueConflictFor(next);
-      this.onLarkTurnStarted?.(next, { fullContentMatch, ...(sourceJsonlPath ? { sourceJsonlPath } : {}) });
+      this.onLarkTurnStarted?.(next, {
+        fullContentMatch,
+        exactContentMatch,
+        ...(sourceJsonlPath ? { sourceJsonlPath } : {}),
+      });
     }
     if (!consumedNext) {
       // The user event neither fingerprint-matched nor proved a truncation of a
@@ -1611,7 +2565,7 @@ export class BridgeTurnQueue {
     /** Pop only turns carrying an authoritative transcript boundary. */
     explicitTerminalOnly?: boolean;
     /** Screen idle may release ordinary fallback turns, but never a durable
-     * receiver turn whose receipt depends on an exact terminal contract. */
+     * receiver turn without an exact terminal or an explicit ambiguous outcome. */
     requireExplicitTerminalForDurable?: boolean;
     /** The CLI generation is ending (exit, kill, teardown): a duration marker
      *  still due will never be written, so a turn held for it is final now. */
@@ -1621,6 +2575,11 @@ export class BridgeTurnQueue {
      *  settle a type-ahead turn that merely follows the bound one (a global
      *  terminal-boundary drain would pop that follower even mid-tool). */
     onlyTurn?: { turnId: string; dispatchAttempt?: number };
+    /** Adopt sessions keep their existing headless-continuation / folded-turn
+     *  attribution. They never arm the open-turn watchdog, so an idle drain must
+     *  not mint a Scenario 3 unobserved-recovery anchor that would re-attach what
+     *  is deliberately a suppressed `local-headless-*` continuation. */
+    adoptMode?: boolean;
   } = {}): BridgePendingTurn[] {
     const out: BridgePendingTurn[] = [];
     while (this.queue.length > 0) {
@@ -1634,7 +2593,8 @@ export class BridgeTurnQueue {
       if (opts.explicitTerminalOnly && !head.terminalObserved) break;
       if (opts.requireExplicitTerminalForDurable
         && head.dispatchAttempt !== undefined
-        && !head.terminalObserved) break;
+        && !head.terminalObserved
+        && !(opts.releaseHeldTerminals && head.terminalOutcome?.status === 'ambiguous')) break;
       // Neither the per-read drain nor the idle edge may settle a turn on a
       // block-level stop_reason when its duration marker is due: the reader can
       // stop between two records of one message (the idle edge, too, can beat
@@ -1650,6 +2610,20 @@ export class BridgeTurnQueue {
         // verdict, which belongs to a live CLI only.
         && !(opts.terminalBoundary && (head.restoredFromJournal || head.carriedAcrossGeneration))) break;
       if (!opts.terminalBoundary && !head.terminalObserved && head.assistantUuids.length === 0) break;
+      // Finding 8: a Scenario 3 re-attached turn can emit interim narration and
+      // then start a tool call. Do not pop it mid-tool on a subsequent screen
+      // idle while strong in-flight proof remains (bounded by CLI_QUEUE_HOLD_MAX_MS).
+      if (this.reattachedFromUnobserved.has(head)
+        && !head.terminalObserved
+        && !opts.releaseHeldTerminals) {
+        const live = this.liveStates.get(head);
+        const withinCap = live?.reattachedAtMs === undefined
+          || (Date.now() - live.reattachedAtMs) < CLI_QUEUE_HOLD_MAX_MS;
+        if (withinCap && live
+          && (live.pendingToolUseIds.size > 0 || live.apiRequestInFlight || live.awaitingPostToolAssistant)) {
+          break;
+        }
+      }
       this.queue.shift();
       if (this.collecting === head) this.collecting = null;
       out.push(head);
@@ -1677,6 +2651,40 @@ export class BridgeTurnQueue {
         if (head.rateLimited) absorbed.rateLimited = true;
         out.push(absorbed);
       }
+      // Scenario 3 anchor: remember a live non-local turn popped without an
+      // explicit transcript terminal (and with no later started turn behind it)
+      // so late assistant records proving the same conversation-tree lineage
+      // re-attach rather than becoming a suppressed `local-headless-*` turn.
+      if (!head.isLocal
+        && head.dispatchAttempt === undefined
+        && !head.terminalObserved
+        && !head.rateLimited
+        && !head.restoredFromJournal
+        && !head.carriedAcrossGeneration
+        && !this.reattachedFromUnobserved.has(head)
+        && !opts.releaseHeldTerminals
+        && !opts.adoptMode
+        && this.queue.every(t => !t.started)) {
+        const live = this.liveStates.get(head);
+        this.recentUnobservedTurn = {
+          turnId: head.turnId,
+          dispatchAttempt: head.dispatchAttempt,
+          linkRefMode: head.linkRefMode,
+          markTimeMs: head.markTimeMs,
+          sourceJsonlPath: head.sourceJsonlPath,
+          startUuid: live?.startUuid,
+          chainUuids: new Set(live?.chainUuids ?? []),
+          progressChainUuids: new Set(live?.progressChainUuids ?? []),
+          sawParentUuid: live?.sawParentUuid ?? false,
+          pendingToolUseIds: new Set(live?.pendingToolUseIds ?? []),
+          apiRequestInFlight: live?.apiRequestInFlight ?? false,
+          awaitingPostToolAssistant: live?.awaitingPostToolAssistant ?? false,
+          hadTrailingVisibleText: live?.hasTrailingVisibleText ?? false,
+          closedAtMs: Date.now(),
+        };
+      } else {
+        this.recentUnobservedTurn = null;
+      }
     }
     return out;
   }
@@ -1685,7 +2693,23 @@ export class BridgeTurnQueue {
    * already submitted siblings stay with their output owner. */
   restoreDrained(turns: readonly BridgePendingTurn[]): void {
     const existing = new Set(this.queue.map(turn => `${turn.turnId}:${turn.dispatchAttempt ?? ''}`));
-    this.queue.unshift(...turns.filter(turn => !existing.has(`${turn.turnId}:${turn.dispatchAttempt ?? ''}`)));
+    const restored = turns.filter(turn => !existing.has(`${turn.turnId}:${turn.dispatchAttempt ?? ''}`));
+    if (restored.length === 0) return;
+    this.queue.unshift(...restored);
+    this.recentUnobservedTurn = null;
+    if (!this.collecting) {
+      for (let i = restored.length - 1; i >= 0; i--) {
+        const candidate = restored[i]!;
+        if (candidate.started
+          && !candidate.absorbedIntoTurnId
+          && !candidate.closedByDurationMarker
+          && !candidate.rateLimited
+          && (!candidate.terminalObserved || candidate.awaitingDurationMarker)) {
+          this.collecting = candidate;
+          break;
+        }
+      }
+    }
   }
 
   /** Number of queued (not-yet-emitted) Lark turns. */

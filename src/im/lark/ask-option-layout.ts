@@ -1,14 +1,10 @@
 /**
- * `botmux ask` 选项按钮的 per-bot 布局：
+ * Per-bot `askOptionLayout` setting (`compact` / `vertical`).
  *
- *   compact  — 按行自动换行排列（独立卡为 `action` 行，实时卡内嵌为 `flow` 行）
- *   vertical — 每行 1 个按钮，各自包在单列 `column_set` 里单列排布，
- *              长选项标签不被挤压换行
- *
- * 本模块是**叶子模块**（零 import）：ask-card.ts 在 daemon 进程内渲染卡片，
- * 但不能 import bot-registry 取配置——ask-card → turn-reply-ask → bot-registry
- * 的既有依赖链会因此成环。所以镜像 i18n 的 setBotLookup：bot-registry 在模块
- * 加载时把 lookup 推进来，渲染侧经它按 larkAppId 读配置。
+ * It no longer changes how Ask cards look: every option is now its own row with
+ * a checker (see ask-card-look.ts), so there is no row of buttons left to lay out.
+ * The key is still accepted, validated and saved (bots.json, Dashboard) so existing
+ * configurations keep loading; it simply has no visible effect.
  */
 
 export const ASK_OPTION_LAYOUTS = ['compact', 'vertical'] as const;
@@ -38,26 +34,4 @@ export function normalizeAskOptionLayout(
   return {
     warnings: [`askOptionLayout 不支持“${String(raw)}”，已回退 ${DEFAULT_ASK_OPTION_LAYOUT}`],
   };
-}
-
-type BotLookup = (larkAppId: string) => { config: { askOptionLayout?: unknown } } | undefined;
-
-let botLookup: BotLookup | undefined;
-
-export function setAskOptionLayoutLookup(lookup: BotLookup): void {
-  botLookup = lookup;
-}
-
-/**
- * 解析某 bot 当前生效的布局。lookup 未注册 / bot 未知 / 值非法 / lookup 抛错，
- * 一律回退 compact——与 localeForBot 同款防御。
- */
-export function askOptionLayoutForBot(larkAppId: string | undefined): AskOptionLayout {
-  if (!larkAppId || !botLookup) return DEFAULT_ASK_OPTION_LAYOUT;
-  try {
-    const raw = botLookup(larkAppId)?.config?.askOptionLayout;
-    return isAskOptionLayout(raw) ? raw : DEFAULT_ASK_OPTION_LAYOUT;
-  } catch {
-    return DEFAULT_ASK_OPTION_LAYOUT;
-  }
 }

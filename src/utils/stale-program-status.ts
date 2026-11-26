@@ -10,7 +10,16 @@
  * itself has been silent, and the screen shows the idle prompt with no busy
  * marker. The screen is only the last check.
  */
-import { isClaudeTurnTerminalEvent, type TranscriptEvent } from '../services/claude-transcript.js';
+import {
+  isClaudeApiRequestBlob,
+  isClaudeTurnTerminalEvent,
+  isClaudeUserInterruptEvent,
+  isPureToolResultUserEvent,
+  isScheduledTurnStartEvent,
+  isSyntheticNoModelReplyEvent,
+  isSyntheticUserPrefixEvent,
+  type TranscriptEvent,
+} from '../services/claude-transcript.js';
 import { baselineJsonlCursor, scanJsonlBackward } from '../services/jsonl-cursor.js';
 
 /** How long the transcript must have been closed AND OSC silent. Claude writes
@@ -19,12 +28,32 @@ export const STALE_PROGRAM_STATUS_QUIET_MS = 60_000;
 /** Re-check cadence while a closed turn's OSC hold persists. */
 export const STALE_PROGRAM_STATUS_CHECK_MS = 15_000;
 
+/** Records that definitively close a Claude main-thread turn (normal terminal,
+ *  user interrupt, API error, or `<synthetic>` no-model-reply placeholder). */
+function isMainThreadTurnClose(ev: TranscriptEvent): boolean {
+  if (!ev || typeof ev !== 'object' || (ev as { isSidechain?: unknown }).isSidechain === true) return false;
+  if (ev.type === 'api-request-blob') return false;
+  return isClaudeTurnTerminalEvent(ev)
+    || isClaudeUserInterruptEvent(ev)
+    || ev.isApiErrorMessage === true
+    || isSyntheticNoModelReplyEvent(ev);
+}
+
 /** Main-thread conversation records — anything else (metadata, snapshots,
- *  queue bookkeeping, sidechains) neither opens nor closes the turn. */
+ *  queue bookkeeping, sidechains, `api-request-blob`, slash-command wrappers,
+ *  non-scheduled meta lines) neither opens nor closes the turn. */
 function isMainThreadActivity(ev: TranscriptEvent): boolean {
-  if (!ev || (ev as { isSidechain?: unknown }).isSidechain === true) return false;
+  if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev) || (ev as { isSidechain?: unknown }).isSidechain === true) return false;
   const role = ev.message?.role ?? ev.type;
-  if (role === 'user' || role === 'assistant') return true;
+  if (role === 'assistant') return true;
+  if (role === 'user') {
+    if (isPureToolResultUserEvent(ev.message?.content)) return true;
+    if (isScheduledTurnStartEvent(ev)) return true;
+    if ((ev as { isMeta?: unknown }).isMeta === true) return false;
+    if ((ev as { isCompactSummary?: unknown }).isCompactSummary === true) return false;
+    if (isSyntheticUserPrefixEvent(ev)) return false;
+    return true;
+  }
   return ev.type === 'attachment' && ev.attachment?.type === 'queued_command';
 }
 
@@ -54,7 +83,7 @@ export function claudeTranscriptLatestTurnState(path: string): 'open' | 'closed'
       onLine: (line) => {
         let ev: TranscriptEvent;
         try { ev = JSON.parse(line.toString('utf8')) as TranscriptEvent; } catch { return false; }
-        if (isClaudeTurnTerminalEvent(ev)) { state = 'closed'; return true; }
+        if (isMainThreadTurnClose(ev)) { state = 'closed'; return true; }
         if (isMainThreadActivity(ev)) { state = 'open'; return true; }
         return false;
       },
@@ -72,7 +101,7 @@ export class ClaudeTranscriptTurnEnd {
   /** Fold newly drained records, in transcript order. */
   observe(events: readonly TranscriptEvent[], now: number = Date.now()): void {
     for (const ev of events) {
-      if (isClaudeTurnTerminalEvent(ev)) {
+      if (isMainThreadTurnClose(ev)) {
         this.endedAtMs ??= now;
       } else if (isMainThreadActivity(ev)) {
         this.endedAtMs = undefined;

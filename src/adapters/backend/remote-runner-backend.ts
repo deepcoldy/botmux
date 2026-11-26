@@ -32,6 +32,7 @@ import {
   type RemoteRunnerSessionToolOperation,
   type RemoteRunnerSessionToolResult,
   type RemoteRunnerUsageReport,
+  type RemoteRunnerTrustedCaller,
 } from './remote-runner-protocol.js';
 import type { RemoteRunnerConfig } from './remote-runner-config.js';
 import { sessionChildEnvWithInject } from '../../core/session-env.js';
@@ -272,6 +273,20 @@ export class RemoteRunnerBackend implements SessionBackend {
         failureReason: `remote runner turn ${this.activeTurnId} is still active`,
       };
     }
+    let trustedCaller: RemoteRunnerTrustedCaller | undefined;
+    try {
+      trustedCaller = input.trustedCaller
+        ? projectRemoteRunnerTrustedCaller(input.trustedCaller as typeof input.trustedCaller & Record<string, unknown>)
+        : undefined;
+    } catch (error) {
+      // Projection is pre-dispatch validation, not an ambiguous pipe write.
+      // Keep this provider generation available for a corrected successor.
+      return {
+        submitted: false,
+        submissionDisposition: 'untouched',
+        failureReason: error instanceof Error ? error.message : String(error),
+      };
+    }
     this.activeTurnId = input.turnId;
     this.activeTurnHostContext = { ...(input.linkRefMode ? { linkRefMode: input.linkRefMode } : {}),
       ...(input.sessionOrigin ? { sessionOrigin: structuredClone(input.sessionOrigin) } : {}) };
@@ -291,9 +306,7 @@ export class RemoteRunnerBackend implements SessionBackend {
         turnId: input.turnId,
         content: input.content,
         ...(input.dispatchAttempt !== undefined ? { dispatchAttempt: input.dispatchAttempt } : {}),
-        ...(input.trustedCaller
-          ? { trustedCaller: projectRemoteRunnerTrustedCaller(input.trustedCaller as typeof input.trustedCaller & Record<string, unknown>) }
-          : {}),
+        ...(trustedCaller ? { trustedCaller } : {}),
       }), event => event.type === 'status' && event.status === 'busy', this.operationTimeoutMs);
       if (acknowledgement.type === 'failure') {
         const failure: BackendTurnFailure = {

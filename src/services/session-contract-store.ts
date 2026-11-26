@@ -617,6 +617,41 @@ export class SessionContractStore {
   deferredEvents<T>(ref: ContractSessionRef, bindingId: string): T[] {
     return (this.db.prepare('SELECT value FROM deferred_events WHERE session_key=? AND binding_id=? ORDER BY sequence,event_id').all(sessionKey(ref), bindingId) as Array<{ value: string }>).map(row => JSON.parse(row.value));
   }
+  /** Physical exits retained while a replacement decides whether their legacy
+   * lifecycle notification may run. Other deferred event types stay scoped to
+   * their own binding and never join this replay path. */
+  deferredPhysicalExits<T>(ref: ContractSessionRef): T[] {
+    return (this.db.prepare("SELECT value FROM deferred_events WHERE session_key=? AND json_extract(value,'$.type')='claude_exit' ORDER BY sequence,event_id").all(sessionKey(ref)) as Array<{ value: string }>).map(row => JSON.parse(row.value));
+  }
+  /** Claim the legacy notification separately from contract event dedup. The
+   * same daemon owner cannot notify twice concurrently; a new owner may only
+   * reclaim an unfinished notification after a process restart. */
+  claimPhysicalExitNotification(ref: ContractSessionRef, eventId: string, owner: string): 'claimed' | 'already_notifying' | 'settled' {
+    return this.transaction(() => {
+      const current = this.entity<{ state: string; owner: string }>(ref, 'physical_exit_notification', eventId);
+      if (current?.state === 'settled') return 'settled';
+      if (current?.state === 'notifying' && current.owner === owner) return 'already_notifying';
+      if (current && !['pending', 'notifying'].includes(current.state)) return 'already_notifying';
+      this.saveEntity(ref, 'physical_exit_notification', eventId, 'notifying', { state: 'notifying', owner });
+      return 'claimed';
+    });
+  }
+  settlePhysicalExitNotification(ref: ContractSessionRef, eventId: string, owner: string): void {
+    this.transaction(() => {
+      const current = this.entity<{ state: string; owner: string }>(ref, 'physical_exit_notification', eventId);
+      if (current?.state === 'settled') return;
+      // A stale owner must not settle a newer owner's in-flight claim.
+      if (current?.state === 'notifying' && current.owner !== owner) return;
+      this.saveEntity(ref, 'physical_exit_notification', eventId, 'settled', { state: 'settled', owner });
+    });
+  }
+  releasePhysicalExitNotification(ref: ContractSessionRef, eventId: string, owner: string): void {
+    this.transaction(() => {
+      const current = this.entity<{ state: string; owner: string }>(ref, 'physical_exit_notification', eventId);
+      if (current?.state !== 'notifying' || current.owner !== owner) return;
+      this.saveEntity(ref, 'physical_exit_notification', eventId, 'pending', { state: 'pending', owner });
+    });
+  }
   discardDeferred(ref: ContractSessionRef, bindingId: string): void {
     this.db.prepare('DELETE FROM deferred_events WHERE session_key=? AND binding_id=?').run(sessionKey(ref), bindingId);
   }
@@ -682,6 +717,31 @@ export class SessionContractStore {
       chain.push(link.to); current = link.to;
     }
     return chain;
+  }
+  /** A physical exit stops the whole in-process lineage, even when reported
+   * under its newest binding. This is NOT execution/observation authority. */
+  runtimeExitLineage(ref: ContractSessionRef, origin: RuntimeRef, worker: WorkerRef): RuntimeRef[] {
+    const neighbors = new Map<string, RuntimeRef[]>();
+    const key = (runtime: RuntimeRef): string => JSON.stringify([runtime.runtimeId, runtime.epoch]);
+    const link = (from: RuntimeRef, to: RuntimeRef): void => {
+      const adjacent = neighbors.get(key(from)) ?? [];
+      adjacent.push(to); neighbors.set(key(from), adjacent);
+    };
+    const rows = this.db.prepare("SELECT value FROM entities WHERE session_key=? AND kind='runtime_continuation'")
+      .all(sessionKey(ref)) as Array<{ value: string }>;
+    for (const row of rows) {
+      const edge = JSON.parse(row.value) as { from: RuntimeRef; to: RuntimeRef; worker: WorkerRef };
+      if (!sameWorker(edge.worker, worker)) continue;
+      link(edge.from, edge.to); link(edge.to, edge.from);
+    }
+    const lineage = [origin]; const visited = new Set([key(origin)]);
+    for (const runtime of lineage) {
+      for (const adjacent of neighbors.get(key(runtime)) ?? []) {
+        if (visited.has(key(adjacent))) continue;
+        visited.add(key(adjacent)); lineage.push(adjacent);
+      }
+    }
+    return lineage;
   }
   /** `from` is `to`, or became it through `worker`'s in-process continuations. */
   runtimeContinues(ref: ContractSessionRef, from: RuntimeRef, to: RuntimeRef, worker: WorkerRef): boolean {

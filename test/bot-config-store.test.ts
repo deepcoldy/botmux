@@ -9,6 +9,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { limitModelOptions } from '../src/core/model-value-pattern.js';
 import { validateCodexServiceTier } from '../src/services/codex-service-tier-catalog.js';
 import { resolveEffectiveFeedbackPolicy, type FeedbackPolicyLayer } from '../src/services/feedback-policy-resolver.js';
 
@@ -57,6 +58,39 @@ async function freshModules() {
   const awaySummaryFocusRevocation = await import('../src/services/away-summary-focus-revocation.js');
   return { registry, store, pinStreamingCardChange, sessionGroups, awaySummaryFocusRevocation };
 }
+
+it('loads safe gateway model IDs and preserves the configured order', async () => {
+  const { registry } = await freshModules();
+  const additional = Array.from({ length: 50 }, (_, i) => `gateway/model-${i}`);
+  const [config] = registry.parseBotConfigsFromText(JSON.stringify([{
+    larkAppId: 'app_custom_models', larkAppSecret: 'secret', cliId: 'claude-code',
+    customModels: [' gateway/model_v2:1.0 ', 'gateway/model_v2:1.0', 'Gateway/model_v2:1.0', 'two-2', '', 'two words',
+      'newline\n', 'command;separator', '../relative', 'x'.repeat(65), 1, ...additional],
+  }]));
+  expect(config.customModels).toEqual(['gateway/model_v2:1.0', 'Gateway/model_v2:1.0', 'two-2', ...additional.slice(0, 47)]);
+});
+
+it('keeps the configured model inside the /botconfig dropdown cap', async () => {
+  const { registry, store } = await freshModules();
+  const { buildConfigCard } = await import('../src/im/lark/card-builder.js');
+  const models = Array.from({ length: 75 }, (_, i) => `gateway/model-${i}`);
+  const current = `gateway/${'x'.repeat(120)}`;
+  const appId = 'app_custom_model_dropdown';
+  registry.registerBot({ larkAppId: appId, larkAppSecret: 'secret', cliId: 'claude-code',
+    model: current, customModels: models });
+  const data = store.getConfigCardData(appId, ['sonnet']);
+  const card = JSON.parse(buildConfigCard(data!));
+  const select = card.elements.flatMap((e: any) => e.actions ?? [])
+    .find((action: any) => action.value?.field === 'model');
+  expect(select.initial_option).toBe(current);
+  expect(select.options.map((option: any) => option.value)).toEqual(['__unset__', ...models.slice(0, 48), current]);
+});
+
+it('keeps a pending selection and the active model inside a full session dropdown', () => {
+  const models = Array.from({ length: 50 }, (_, i) => `gateway/model-${i}`);
+  expect(limitModelOptions([...models, 'gateway/active', 'gateway/pinned'], 'gateway/pinned', false, 'gateway/active'))
+    .toEqual([...models.slice(0, 48), 'gateway/active', 'gateway/pinned']);
+});
 
 describe('bot-config store', () => {
   let configPath: string;
@@ -482,6 +516,22 @@ describe('bot-config store', () => {
     expect((await store.applyConfigField('app_default', backend, coerced.ok ? coerced.value : undefined)).ok).toBe(true);
     expect(readConfig().backendType).toBe('hc');
     expect(registry.getBot('app_default').config.backendType).toBe('hc');
+  });
+
+  it('defaults hc Herdr tabs off and round-trips the opt-in through live config and reload', async () => {
+    const { registry, store } = await loaded({ backendType: 'hc' });
+    const tabs = store.findConfigField('hcHerdrTabs')!;
+    expect(registry.getBot('app_default').config.hcHerdrTabs).toBeUndefined();
+
+    expect(await store.applyConfigField('app_default', tabs, true)).toMatchObject({ ok: true });
+    expect(readConfig().hcHerdrTabs).toBe(true);
+    expect(registry.getBot('app_default').config.hcHerdrTabs).toBe(true);
+    expect(registry.loadBotConfigs()[0]?.hcHerdrTabs).toBe(true);
+
+    expect(await store.applyConfigField('app_default', tabs, false)).toMatchObject({ ok: true });
+    expect(readConfig()).not.toHaveProperty('hcHerdrTabs');
+    expect(registry.getBot('app_default').config.hcHerdrTabs).toBeUndefined();
+    expect(registry.loadBotConfigs()[0]?.hcHerdrTabs).toBeUndefined();
   });
 
   it('pairs a remote daemon default back to pty for a local CLI, as spawning does', async () => {

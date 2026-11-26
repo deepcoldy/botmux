@@ -161,15 +161,26 @@ const render = () => {
 let startupTicker = cfg.startupTicker
   ? setInterval(() => process.stdout.write('\x1b7\x1b[1;40H' + new Date().toISOString().slice(11, 19) + '\x1b8'), 500)
   : undefined;
-const runTurn = (prompt, reply) => {
+const runTurn = (prompt, reply, opts) => {
   if (startupTicker) { clearInterval(startupTicker); startupTicker = undefined; }
   busy = true;
   programStatus('working');
-  record({ type: 'user', message: { role: 'user', content: prompt } });
+  record({
+    type: 'user',
+    ...(opts && opts.promptSource ? { promptSource: opts.promptSource, turnOrigin: 'task_notification' } : {}),
+    message: { role: 'user', content: prompt },
+  });
   render();
   const spinner = setInterval(render, 300);
   setTimeout(() => {
     clearInterval(spinner);
+    if (opts && opts.monitorTaskId) {
+      record({ type: 'assistant', message: { role: 'assistant', model: 'claude-fake', content: [{ type: 'tool_use', id: 'toolu_mon', name: 'Monitor', input: { command: 'watch', description: 'watch CI', persistent: opts.persistent === true, timeout_ms: 1800000 } }], stop_reason: 'tool_use' } });
+      record({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_mon', content: 'Monitor started' }] }, toolUseResult: { taskId: opts.monitorTaskId, timeoutMs: 1800000, persistent: opts.persistent === true } });
+    }
+    if (opts && opts.thinking) {
+      record({ type: 'assistant', message: { role: 'assistant', model: 'claude-fake', content: [{ type: 'thinking', thinking: opts.thinking }] } });
+    }
     record({ type: 'assistant', message: { role: 'assistant', model: 'claude-fake', content: [{ type: 'text', text: reply }], stop_reason: 'end_turn' } });
     record({ type: 'system', subtype: 'turn_duration', durationMs: cfg.turnMs });
     busy = false;
@@ -264,8 +275,13 @@ const submit = () => {
   else if (text.startsWith('LONGTOOL')) { toolTurn(text, Number(text.split(/\\s+/)[1]) || 20000, 'done'); return; }
   else if (text.startsWith('HANG')) { toolTurn(text, 0, 'hang'); return; }
   else if (text.startsWith('INTERRUPTED')) { toolTurn(text, 500, 'interrupted'); return; }
-  else if (text.startsWith('FAIL_AFTER_QUIET')) { failTurn(text, 4000); return; }
+  else if (text.startsWith('FAIL_AFTER_QUIET')) { failTurn(text, Number(text.split(/\\s+/)[1]) || 4000); return; }
   else if (text.startsWith('FAIL')) { failTurn(text, 0); return; }
+  else if (text.startsWith('MONITOR:')) {
+    const taskId = text.slice('MONITOR:'.length).trim() || 'mon-1';
+    runTurn(text, 'reply: ' + text, { monitorTaskId: taskId, persistent: false });
+    return;
+  }
   else { runTurn(text, 'reply: ' + text); return; }
   ev({ kind: 'command', text });
   render();
@@ -289,9 +305,17 @@ setInterval(() => {
   if (busy) return;
   for (const name of fs.readdirSync(cfg.notifyDir).sort()) {
     const file = path.join(cfg.notifyDir, name);
-    const reply = fs.readFileSync(file, 'utf8');
+    const raw = fs.readFileSync(file, 'utf8');
     fs.unlinkSync(file);
-    runTurn('<task-notification>\\n<task-id>' + name + '</task-id>\\n<status>completed</status>\\n</task-notification>', reply);
+    if (raw.startsWith('{')) {
+      const payload = JSON.parse(raw);
+      runTurn(payload.notice, payload.reply, {
+        promptSource: payload.promptSource || 'system',
+        thinking: payload.thinking,
+      });
+    } else {
+      runTurn('<task-notification>\\n<task-id>' + name + '</task-id>\\n<status>completed</status>\\n</task-notification>', raw);
+    }
     return;
   }
 }, 100);
@@ -312,6 +336,7 @@ export interface Harness {
   stallPidStateRewrite: () => void;
   landPidStateRewrite: () => void;
   notify: (reply: string) => void;
+  notifyEvent: (payload: { notice: string; reply: string; thinking?: string; promptSource?: string }) => void;
   commands: () => string[];
   /** Every CLI launch: the session it opened and its argv. */
   launches: () => Array<{ sid: string; args: string[] }>;
@@ -464,6 +489,8 @@ export function setupFakeClaude(opts: {
    *  without the directories that hold another `claude`; setup fails if a
    *  shell lookup the way the worker does it still finds one. */
   onPath?: boolean;
+  /** Optional extra environment variables passed to spawned workers. */
+  workerEnv?: Record<string, string>;
 }): Harness {
   mkdirSync(join(homedir(), '.botmux'), { recursive: true, mode: 0o700 });
   const root = mkdtempSync(join(tmpdir(), 'bmx-clear-restore-'));
@@ -585,6 +612,12 @@ child.on('exit', code => process.exit(code ?? 1));
       writeFileSync(staged, reply);
       renameSync(staged, join(notifyDir, name));
     },
+    notifyEvent: payload => {
+      const name = String(++notified).padStart(4, '0');
+      const staged = join(root, `notify-${name}.tmp`);
+      writeFileSync(staged, JSON.stringify(payload));
+      renameSync(staged, join(notifyDir, name));
+    },
     commands: () => readEvents().filter(e => e.kind === 'command').map(e => e.text as string),
     launches: () => readEvents().filter(e => e.kind === 'start').map(e => ({ sid: e.sid as string, args: e.args as string[] })),
     doneAt: (kind, text) => readEvents().find(e => e.kind === kind && (kind === 'command' ? e.text === text : e.reply === text))?.t,
@@ -605,6 +638,7 @@ child.on('exit', code => process.exit(code ?? 1));
           SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sessionId,
           LARK_APP_ID: 'app_test', LARK_APP_SECRET: 'secret',
           ...pathEnv,
+          ...opts.workerEnv,
         }),
         stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
       };

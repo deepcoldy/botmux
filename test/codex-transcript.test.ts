@@ -71,6 +71,28 @@ beforeEach(() => {
   path = join(dir, 'rollout.jsonl');
 });
 
+it.each([
+  ['plan follow-up', 325, 122],
+  ['plan revision', 1945, 49],
+  ['full plan', 3401, 58],
+  ['diagnostic report', 2381, 46],
+  ['status request', 531, 22],
+])('replays the redacted %s transcript shape without treating pre-terminal prose as final',
+  (_name, bodyLength, hookLength) => {
+    const body = '完整正文。'.padEnd(bodyLength, '内');
+    const hookReply = '已交付。'.padEnd(hookLength, '略');
+    const preTerminal = ev(userResponseItem('请给出完整答复'))
+      + ev(assistantMessageResponseItem(body, undefined, '2026-04-29T07:00:01Z'));
+
+    writeFileSync(path, preTerminal + ev(assistantFinalResponseItem(hookReply, '2026-04-29T07:00:03Z')));
+    expect(drainCodexRollout(path, 0).events.filter(event => event.kind === 'assistant_final').map(event => event.text))
+      .toEqual([hookReply]);
+
+    writeFileSync(path, preTerminal + ev(assistantFinalResponseItem(body, '2026-04-29T07:00:03Z')));
+    expect(drainCodexRollout(path, 0).events.filter(event => event.kind === 'assistant_final').map(event => event.text))
+      .toEqual([body]);
+  });
+
 describe('post-delivery provider failure notification', () => {
   it.each([false, true])('keeps the delivered final after an empty 527 terminal (incremental=%s)', incremental => {
     const start = Date.parse('2026-04-29T07:00:00.000Z');
@@ -786,6 +808,38 @@ describe('drainCodexRollout', () => {
         sourceTurnId: 'turn-2026-04-29T07:02:00.000Z',
       }),
     ]);
+  });
+
+  it('persists native user proof through task_started corroboration for first and successor turns', () => {
+    const start = Date.parse('2026-04-29T07:00:00.000Z');
+    const queue = new CodexBridgeQueue(() => start);
+    queue.mark('first', 'first prompt', start);
+    writeFileSync(path,
+      ev({ timestamp: '2026-04-29T07:00:00.000Z', type: 'event_msg', payload: { type: 'task_started', turn_id: 'native-1' } })
+      + ev(userResponseItem('first prompt', '2026-04-29T07:00:01.000Z')));
+    let drained = drainCodexRollout(path, 0);
+    queue.ingest(drained.events);
+    expect(queue.peek()[0]).toMatchObject({
+      turnId: 'first', provisionalTaskStartedAtMs: undefined,
+      nativeUserProof: { timestampMs: Date.parse('2026-04-29T07:00:01.000Z') },
+    });
+
+    appendFileSync(path, ev({ timestamp: '2026-04-29T07:00:02.000Z', type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: 'native-1', last_agent_message: 'done' } }));
+    drained = drainCodexRollout(path, drained.newOffset, drained.state);
+    queue.ingest(drained.events);
+    expect(queue.drainEmittable()).toMatchObject([{ turnId: 'first', finalText: 'done' }]);
+
+    queue.mark('second', 'second prompt', start + 3_000);
+    appendFileSync(path,
+      ev({ timestamp: '2026-04-29T07:00:03.000Z', type: 'event_msg', payload: { type: 'task_started', turn_id: 'native-2' } })
+      + ev(userResponseItem('second prompt', '2026-04-29T07:00:04.000Z')));
+    drained = drainCodexRollout(path, drained.newOffset, drained.state);
+    queue.ingest(drained.events);
+    expect(queue.peek()[0]).toMatchObject({
+      turnId: 'second', provisionalTaskStartedAtMs: undefined,
+      nativeUserProof: { timestampMs: Date.parse('2026-04-29T07:00:04.000Z') },
+    });
   });
 
   it('renders native CommandExecution and hides its outer JavaScript exec wrapper', () => {

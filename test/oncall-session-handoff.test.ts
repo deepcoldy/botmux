@@ -147,7 +147,8 @@ describe('Oncall configuration and platform adapters', () => {
     expect(normalizeOncallGroupPolicy({})).toEqual({ enabled: false, chatIds: [] });
     for (const forwardMode of ['none', 'individual', 'merge']) expect(normalizeOncallGroupPolicy({ forwardMode })).toMatchObject({ forwardMode });
     for (const formDisplay of ['native', 'private_card', 'thread_card']) expect(normalizeOncallGroupPolicy({ flowMode: 'classify', formDisplay, button: { timing: 'first', minTurns: 3 } })).toMatchObject({ flowMode: 'classify', formDisplay });
-    for (const bad of [{ forwardMode: 'invalid' }, { formDisplay: 'public' }, { button: { minTurns: 0 } }, { button: { minTurns: 1.5 } }, { button: { minTurns: 101 } }, { button: { text: 'other' } }, { defaultCategory: 5 }]) expect(() => normalizeOncallGroupPolicy(bad)).toThrow();
+    for (const customFormMode of ['native', 'botmux']) expect(normalizeOncallGroupPolicy({ customFormMode })).toMatchObject({ customFormMode });
+    for (const bad of [{ forwardMode: 'invalid' }, { formDisplay: 'public' }, { customFormMode: 'invalid' }, { button: { minTurns: 0 } }, { button: { minTurns: 1.5 } }, { button: { minTurns: 101 } }, { button: { text: 'other' } }, { defaultCategory: 5 }]) expect(() => normalizeOncallGroupPolicy(bad)).toThrow();
   });
   it('saves one target source without overwriting another bot or requiring legacy fixed values for native forms', () => {
     const dir = temp();

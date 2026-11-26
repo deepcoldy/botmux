@@ -1,8 +1,12 @@
 import {
   chmodSync,
+  closeSync,
+  constants,
   existsSync,
   lstatSync,
+  fstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
   readdirSync,
   rmSync,
@@ -25,6 +29,7 @@ const MAX_TTL_MS = 30 * 24 * 60 * 60_000;
 
 export interface PluginResultArtifactManifest {
   schemaVersion: 1;
+  readPolicy?: 'receipt-only';
   artifactId: string;
   viewId: string;
   deliveryId: string;
@@ -172,6 +177,7 @@ export class PluginResultArtifactStore {
         });
         const manifest: PluginResultArtifactManifest = {
           schemaVersion: 1,
+          ...(input.delivery.readPolicy ? { readPolicy: input.delivery.readPolicy } : {}),
           artifactId,
           viewId,
           deliveryId: input.delivery.deliveryId,
@@ -255,6 +261,25 @@ export class PluginResultArtifactStore {
     };
   }
 
+  readFile(manifest: PluginResultArtifactManifest, index: number): { data: Buffer; name: string; size: number } {
+    const file = manifest.files[index];
+    if (!file) throw new Error('plugin_result_file_not_found');
+    const path = join(this.root, 'artifacts', manifest.artifactId, 'files', file.storedName);
+    if (lstatSync(path).isSymbolicLink()) throw new Error('plugin_result_file_integrity_failed');
+    const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const stat = fstatSync(fd);
+      if (!stat.isFile() || stat.size !== file.size || stat.size > 8 * 1024 * 1024) {
+        throw new Error('plugin_result_file_integrity_failed');
+      }
+      const data = readFileSync(fd);
+      if (data.byteLength !== file.size || createHash('sha256').update(data).digest('hex') !== file.sha256) {
+        throw new Error('plugin_result_file_integrity_failed');
+      }
+      return { data, name: file.name, size: file.size };
+    } finally { closeSync(fd); }
+  }
+
   revoke(artifactId: string): void {
     const manifest = this.readManifest(artifactId);
     if (manifest.revokedAt) return;
@@ -289,6 +314,7 @@ export class PluginResultArtifactStore {
     if (
       !manifest
       || manifest.schemaVersion !== 1
+      || manifest.readPolicy !== undefined && manifest.readPolicy !== 'receipt-only'
       || manifest.artifactId !== artifactId
       || !validOpaque(manifest.viewId)
       || !/^[a-f0-9]{64}$/.test(manifest.tokenDigest)

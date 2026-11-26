@@ -7,7 +7,6 @@ import { buildTurnReplyCard } from '../src/im/lark/turn-reply-card.js';
 import { buildCanonicalFinalReplyCard, buildImageCardElements } from '../src/im/lark/md-card.js';
 import { extractCardContent, extractResources } from '../src/im/lark/message-parser.js';
 import { stampBotmuxCallbackMarkers } from '../src/im/lark/callback-button-marker.js';
-import { buildTurnReplyAskElements } from '../src/im/lark/turn-reply-ask-elements.js';
 import type { TurnReplyCardRecord } from '../src/services/turn-reply-card.js';
 
 const presentation = { showProcess: true, showToolResults: true, canStop: true, showLiveUsage: true };
@@ -305,17 +304,22 @@ describe('group-context card projection', () => {
   });
 
   it('retains a verified legacy question prefix and options while excluding deadline and tool output', () => {
-    const ask = { ask: {
-      askId: 'legacy_ask', nonce: 'NONCE', larkAppId: 'app_test', chatId: 'chat', rootMessageId: 'root', sessionId: 'session',
-      createdAt: 1, deadlineAt: 100000, settled: false,
-      questions: [
-        { prompt: 'LEGACY_QUESTION_ONE?', multiSelect: false, options: [{ key: 'a', label: 'ONE_A' }, { key: 'b', label: 'ONE_B' }] },
-        { prompt: 'LEGACY_QUESTION_TWO?', multiSelect: true, options: [{ key: 'a', label: 'TWO_A' }, { key: 'b', label: 'TWO_B' }] },
-      ],
-    } };
+    // Frozen copy of what the embedded Ask looked like before role IDs (cards already in chat history).
+    const button = (label: string, value: Record<string, string>, type = 'default') => ({ tag: 'column', width: 'auto', elements: [{
+      tag: 'button', text: { tag: 'plain_text', content: label }, type,
+      behaviors: [{ type: 'callback', value: { ...value, ask_id: 'legacy_ask', nonce: 'NONCE' } }],
+    }] });
+    const options = (i: number, labels: string[]) => ({ tag: 'column_set', flex_mode: 'flow', columns: labels.map((label, j) =>
+      button(label, { action: 'ask_toggle', key: 'ab'[j]!, question_index: String(i) })) });
+    const legacyAsk = [
+      { tag: 'markdown', content: 'LEGACY_QUESTION_ONE?' }, options(0, ['ONE_A', 'ONE_B']),
+      { tag: 'markdown', content: 'LEGACY_QUESTION_TWO?' }, options(1, ['TWO_A', 'TWO_B']),
+      { tag: 'column_set', flex_mode: 'flow', columns: [button('提交', { action: 'ask_submit' }, 'primary')] },
+      { tag: 'markdown', text_size: 'notation', content: '💬 选项都不合适？直接在话题里回复你的答案即可。\n截止: 1969/12/31 16:01:40\n本群可对话成员' },
+    ];
     const raw = JSON.stringify({ schema: '2.0', body: { elements: [
       { tag: 'markdown', element_id: 'botmux_turn_status', content: '🙋 **等待你确认**' },
-      ...buildTurnReplyAskElements(ask),
+      ...legacyAsk,
       { tag: 'collapsible_panel', header: { title: { tag: 'plain_text', content: '📋 执行过程' } },
         elements: [{ tag: 'markdown', content: 'TOOL_PRIVATE' }] },
     ] } });
@@ -432,11 +436,14 @@ describe('group-context card projection', () => {
       createdAt: 1, deadlineAt: 100000, settled: false,
       questions: [{ prompt: 'PUBLIC_QUESTION?', multiSelect: false, options: [{ key: 'yes', label: 'PUBLIC_YES' }, { key: 'no', label: 'PUBLIC_NO' }] }],
     } }] }), presentation));
-    for (const element of card.body.elements) {
-      if (!element.element_id?.startsWith('botmux_turn_options_')) continue;
-      for (const column of element.columns) for (const button of column.elements) {
-        button.text = { tag: 'plain_text', property: { content: button.text.content } };
-        delete button.behaviors;
+    const all = (node: any): any[] => node && typeof node === 'object' ? [node, ...Object.values(node).flatMap(all)] : [];
+    const regions = all(card).filter(node => node.element_id?.startsWith?.('botmux_turn_options_'));
+    expect(regions).toHaveLength(2);
+    for (const region of regions) {
+      delete region.behaviors;
+      for (const node of all(region)) {
+        if (node.tag === 'markdown') { node.property = { content: node.content }; delete node.content; }
+        if (node.tag === 'checker') node.text = { tag: 'plain_text', property: { content: node.text.content } };
       }
     }
     const projected = conversation(JSON.stringify(card));

@@ -1,7 +1,21 @@
 import type { SubmitFailureChainKey } from './submit-failure-chain.js';
 import { submitFailureChainKeyOf } from './submit-failure-chain.js';
 
-type Evidence = { writeStartedAtMs?: number; externalInputGeneration?: number; interruptGeneration?: number; structuredTerminal: boolean };
+export interface AuthoritativeInputReceipt {
+  evidence: 'structured-transcript' | 'botmux-send';
+  cliSessionId?: string;
+  /** Claude transcript provenance, used to reject already-retired secondary
+   *  files when retained evidence is probed after a rotation. */
+  sourceJsonlPath?: string;
+}
+
+type Evidence = {
+  writeStartedAtMs?: number;
+  externalInputGeneration?: number;
+  interruptGeneration?: number;
+  structuredTerminal: boolean;
+  authoritativeReceipt?: AuthoritativeInputReceipt;
+};
 
 /** A persistent reattach does not execute the configured resume target, so that
  * target is not proof of the pane's live native conversation. Wait for an owned
@@ -31,7 +45,44 @@ export class InputDeliveryEvidenceTracker {
   start(key: SubmitFailureChainKey, atMs: number = Date.now(), externalInputGeneration?: number, interruptGeneration?: number): void {
     if (!key.turnId || !Number.isFinite(atMs)) return;
     // A new literal write is a new evidence window, even for a reused id.
-    this.remember(key, { writeStartedAtMs: atMs, externalInputGeneration, interruptGeneration, structuredTerminal: false });
+    this.remember(key, {
+      writeStartedAtMs: atMs,
+      externalInputGeneration,
+      interruptGeneration,
+      structuredTerminal: false,
+      authoritativeReceipt: undefined,
+    });
+  }
+
+  observeAuthoritativeReceipt(
+    key: SubmitFailureChainKey,
+    receipt: AuthoritativeInputReceipt,
+  ): void {
+    if (!key.turnId) return;
+    const prev = this.evidence.get(submitFailureChainKeyOf(key));
+    const prevReceipt = prev?.authoritativeReceipt;
+    const evidence: AuthoritativeInputReceipt['evidence'] =
+      prevReceipt?.evidence === 'structured-transcript' || receipt.evidence === 'structured-transcript'
+        ? 'structured-transcript'
+        : receipt.evidence;
+    // An authoritative transcript rebind may correct an early sibling bind while
+    // the adapter write is still pending. Prefer the newest receipt's owned id;
+    // only retain the old one when the newer proof carries no id at all.
+    const cliSessionId = receipt.cliSessionId ?? prevReceipt?.cliSessionId;
+    const sourceJsonlPath = receipt.sourceJsonlPath ?? prevReceipt?.sourceJsonlPath;
+    this.remember(key, {
+      structuredTerminal: false,
+      ...prev,
+      authoritativeReceipt: {
+        evidence,
+        ...(cliSessionId ? { cliSessionId } : {}),
+        ...(sourceJsonlPath ? { sourceJsonlPath } : {}),
+      },
+    });
+  }
+
+  authoritativeReceipt(key: SubmitFailureChainKey): AuthoritativeInputReceipt | undefined {
+    return key.turnId ? this.evidence.get(submitFailureChainKeyOf(key))?.authoritativeReceipt : undefined;
   }
 
   observeStructuredTerminal(key: SubmitFailureChainKey): void {

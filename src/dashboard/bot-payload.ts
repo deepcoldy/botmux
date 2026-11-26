@@ -227,10 +227,12 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
       : [],
     readIsolationSupported: j?.readIsolationSupported === true,
     backendType: typeof j?.backendType === 'string' ? j.backendType : null,
+    hcHerdrTabs: j?.hcHerdrTabs === true,
     defaultBackendType: typeof j?.defaultBackendType === 'string' && j.defaultBackendType ? j.defaultBackendType : null,
     ...normalizeReplyFooter(j),
     showReplyTiming: j?.showReplyTiming === true,
     usageDisplay: normalizeUsageDisplay(j ?? {}),
+    showUsageQuota: j?.showUsageQuota !== false,
     usageSupported: j?.usageSupported === true,
     disableStreamingCard: j?.disableStreamingCard === true || j?.replyCardMode === 'final-only',
     replyCardMode: j?.replyCardMode === 'unified' || j?.replyCardMode === 'final-only' ? 'unified' : 'legacy',
@@ -245,6 +247,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     writableTerminalLinkInCard: j?.writableTerminalLinkInCard === true,
     goalStatusCard: j?.goalStatusCard === true,
     followUpReply: j?.followUpReply === true,
+    foldBackgroundUpdates: j?.foldBackgroundUpdates === true,
     privateCard: j?.privateCard === true,
     replyCardActions: j?.replyCardActions === true,
     replyCardNextStep: j?.replyCardNextStep === true,
@@ -258,6 +261,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     overloadAlert: j?.overloadAlert === true,
     botToBotSameDir: j?.botToBotSameDir !== false,
     quotaFallbackBot: normalizeQuotaFallbackBotConfig(j?.quotaFallbackBot, bot.larkAppId).config ?? null,
+    quotaFallbackChain: j?.quotaFallbackChain ?? null,
     autoInviteOwnerOnGroupAdd: j?.autoInviteOwnerOnGroupAdd !== false,
     autoStartOnGroupJoin: j?.autoStartOnGroupJoin === true,
     autoStartOnGroupJoinPrompt: typeof j?.autoStartOnGroupJoinPrompt === 'string' ? j.autoStartOnGroupJoinPrompt : '',
@@ -328,6 +332,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     triggerUserAuth: normalizeTriggerUserAuthForClient(j?.triggerUserAuth),
     larkToolBinding: j?.larkToolBinding !== false,
     larkUserOwnerFallback: j?.larkUserOwnerFallback !== false,
+    autoAvoidApproval: j?.autoAvoidApproval !== false,
     skillInjection: (j?.skillInjection === 'global' || j?.skillInjection === 'prompt' || j?.skillInjection === 'off') ? j.skillInjection : null,
     skillInjectionDefault: (j?.skillInjectionDefault === 'global' || j?.skillInjectionDefault === 'off') ? j.skillInjectionDefault : 'prompt',
     skillInjectionSupport: (j?.skillInjectionSupport === 'dynamic' || j?.skillInjectionSupport === 'global') ? j.skillInjectionSupport : 'none',
@@ -377,11 +382,14 @@ export function sparseOverridesFromRawBotConfig(rawEntry: any): {
   apiOnly: boolean;
   larkToolBinding: boolean | undefined;
   larkUserOwnerFallback: boolean | undefined;
+  autoAvoidApproval: boolean | undefined;
   streamingCardFoldedLayout: boolean | undefined;
+  foldBackgroundUpdates: boolean | undefined;
   askOptionLayout: any;
   trustSameOwnerBots: boolean | undefined;
   grantDelegateBots: string[] | undefined;
   archiveCodex: boolean | undefined;
+  taskRouting: unknown;
 } {
   return {
     quotaFallbackBot: rawEntry?.quotaFallbackBot,
@@ -390,8 +398,11 @@ export function sparseOverridesFromRawBotConfig(rawEntry: any): {
     larkToolBinding: typeof rawEntry?.larkToolBinding === 'boolean' ? rawEntry.larkToolBinding : undefined,
     // 默认开：显式 false 必须从这里带回，否则离线行会把已关闭的主人回退显示成开启。
     larkUserOwnerFallback: typeof rawEntry?.larkUserOwnerFallback === 'boolean' ? rawEntry.larkUserOwnerFallback : undefined,
+    autoAvoidApproval: typeof rawEntry?.autoAvoidApproval === 'boolean' ? rawEntry.autoAvoidApproval : undefined,
     streamingCardFoldedLayout: typeof rawEntry?.streamingCardFoldedLayout === 'boolean'
       ? rawEntry.streamingCardFoldedLayout : undefined,
+    foldBackgroundUpdates: typeof rawEntry?.foldBackgroundUpdates === 'boolean'
+      ? rawEntry.foldBackgroundUpdates : undefined,
     askOptionLayout: rawEntry?.askOptionLayout,
     // 默认开：显式 false 必须从这里带回，否则离线行会把已关闭的同机信任显示成开启。
     trustSameOwnerBots: typeof rawEntry?.trustSameOwnerBots === 'boolean' ? rawEntry.trustSameOwnerBots : undefined,
@@ -401,6 +412,8 @@ export function sparseOverridesFromRawBotConfig(rawEntry: any): {
       : undefined,
     // 显式开/关原样带回（否则 daemon 离线时会显示成「跟随全局」）；缺省或非法值不带，按跟随全局显示。
     archiveCodex: typeof rawEntry?.archiveCodex === 'boolean' ? rawEntry.archiveCodex : undefined,
+    // 离线 bot 也带回已保存的任务分配画像，避免 daemon 离线时 Bot 配置页把画像显示为空。
+    taskRouting: rawEntry?.taskRouting,
   };
 }
 

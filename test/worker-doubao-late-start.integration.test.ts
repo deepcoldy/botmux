@@ -318,11 +318,13 @@ describe.skipIf(process.platform === 'win32' || !tmuxAvailable)('Doubao input ac
     await s.waitUntil(() => s.messages.some(msg => msg.type === 'turn_terminal'
       && msg.turnId === 'om_turn_1'), 'bounded terminal', 90_000);
     expect(s.finals('om_turn_1')).toEqual([]);
-    expect(s.messages.filter(msg => msg.type === 'turn_display_retired' && msg.turnId === 'om_turn_1')).toHaveLength(1);
+    const failureNotices = () => s.messages.filter(msg => (msg.type === 'turn_display_retired'
+      || msg.type === 'user_notify' && msg.kind === 'structured_turn_not_collected') && msg.turnId === 'om_turn_1');
+    expect(failureNotices()).toHaveLength(1);
     expect(s.messages.find(msg => msg.type === 'turn_terminal' && msg.turnId === 'om_turn_1'))
       .toMatchObject({ status: 'ambiguous', errorCode: 'doubao_reply_not_collected' });
     await pause(2_000);
-    expect(s.messages.filter(msg => msg.type === 'turn_display_retired' && msg.turnId === 'om_turn_1')).toHaveLength(1);
+    expect(failureNotices()).toHaveLength(1);
   }, 130_000);
 
   it('export recovery never publishes a stopped turn and still recovers its successor', async () => {
@@ -335,6 +337,10 @@ describe.skipIf(process.platform === 'win32' || !tmuxAvailable)('Doubao input ac
       .toMatchObject({ delivered: true });
     s.sendMessage('om_turn_2', 'successor after stop');
     await s.waitUntil(() => s.assignmentText().includes('successor after stop'), 'successor proof', 30_000);
+    appendFileSync(s.trajectory, JSON.stringify({ role: 'user', content: 'successor after stop' }) + '\n'
+      + JSON.stringify({ role: 'assistant', content: 'LATE_STOPPED_FINAL' }) + '\n');
+    await pause(1500);
+    expect(s.finals('om_turn_2')).toEqual([]);
     s.control('finish-2', 'AFTER_STOP');
     await s.waitUntil(() => s.finals('om_turn_2').length > 0, 'successor reply', 30_000);
     expect(s.finals('om_turn_1')).toEqual([]);

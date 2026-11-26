@@ -1,12 +1,12 @@
 import { type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { spawnNodeTsScript, tsRunnerPrefix } from './helpers/ts-runner.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
-import { annotateAntigravityUsageLimit } from '../src/adapters/cli/antigravity.js';
+import { extractAntigravityErrorComposerKey } from '../src/adapters/cli/antigravity.js';
 import { detectCliUsageLimit } from '../src/utils/cli-usage-limit.js';
 
 const children = new Set<ChildProcess>();
@@ -70,7 +70,7 @@ async function waitFor(check: () => boolean, logs: string[], timeout = 10_000): 
   throw new Error(`Worker condition timed out\n${logs.join('')}`);
 }
 
-function startWorker(mode: 'delayed' | 'interrupted' | 'manual' | 'native-error' | 'quota' | 'expired-quota' | 'running', cliId: 'antigravity' | 'traex' = 'antigravity') {
+function startWorker(mode: 'delayed' | 'interrupted' | 'manual' | 'native-error' | 'quota' | 'quota-with-footer' | 'expired-quota' | 'running' | 'foreground-tool', cliId: 'antigravity' | 'traex' = 'antigravity') {
   // Closing a worker also stops its OS session scope. A fixed session ID would
   // let parallel runtime/test invocations terminate each other's fake CLI.
   const sessionId = `agy-delivery-${randomUUID()}`;
@@ -82,6 +82,7 @@ function startWorker(mode: 'delayed' | 'interrupted' | 'manual' | 'native-error'
   const transcriptDir = join(cliHome, 'brain', nativeId, '.system_generated', 'logs');
   mkdirSync(dataDir, { recursive: true });
   mkdirSync(transcriptDir, { recursive: true });
+  const transcript = join(transcriptDir, 'transcript.jsonl');
   const inputLog = join(root, 'input.log');
   const cliPidFile = join(root, 'fake-cli.pid');
   cliPidFiles.add(cliPidFile);
@@ -89,25 +90,42 @@ function startWorker(mode: 'delayed' | 'interrupted' | 'manual' | 'native-error'
     ? join(cliHome, 'history.jsonl') : join(root, '.trae', 'cli', 'history.jsonl');
   mkdirSync(join(history, '..'), { recursive: true });
   const isQuota = mode === 'quota' || mode === 'expired-quota';
-  const passive = isQuota || ['interrupted', 'native-error', 'running'].includes(mode);
+  const isQuotaWithFooter = mode === 'quota-with-footer';
+  const passive = isQuota || isQuotaWithFooter || ['interrupted', 'native-error', 'running', 'foreground-tool'].includes(mode);
   if (passive) {
-    writeFileSync(join(transcriptDir, 'transcript.jsonl'), JSON.stringify({
-      type: 'GENERIC', status: mode === 'running' ? 'RUNNING' : 'DONE', content: 'tool result',
+    writeFileSync(transcript, JSON.stringify({
+      type: mode === 'foreground-tool' ? 'PLANNER_RESPONSE' : 'GENERIC', status: mode === 'running' ? 'RUNNING' : 'DONE', content: 'tool result',
     }) + '\n');
+  }
+  if (isQuotaWithFooter) {
+    const botmuxLogDir = join(cliHome, 'botmux');
+    mkdirSync(botmuxLogDir, { recursive: true });
+    const nativeLogPath = join(botmuxLogDir, `${encodeURIComponent(sessionId)}.log`);
+    writeFileSync(nativeLogPath, [
+      'I1125 00:00:01.000000 100 input_loop.go:104] HandleUserInput called with text: "do work"',
+      'E1125 00:00:02.123456 200 errorreport.go:282] agent executor error: generating and executing: transport error (ResourceExhausted, HTTP 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 2h39m35s.: RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 2h39m35s.',
+    ].join('\n') + '\n');
   }
   const ready = cliId === 'antigravity' ? '? for shortcuts' : '›';
   const screen = mode === 'interrupted'
     ? '  ⎿  Interrupted · What should Antigravity CLI do instead?\n────────\n>\n────────\n? for shortcuts\n'
+    : isQuotaWithFooter
+      ? '⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 2h39m35s.\nError ID: agy-1515-footer-fixture\n────────\n>\n────────\n? for shortcuts  accept-edits · Gemini 4 Neon\n'
     : mode === 'native-error' || isQuota
       ? `⚠ ${isQuota ? 'Individual quota reached. Resets in 124h24m15s.' : 'Request failed. Please retry.'}\nError ID: native-error-fixture\n────────\n>\n────────\n`
     : mode === 'running'
       ? '● Bash(sleep 30)\n⣻ Running command...\n────────\n>\n────────\nesc to cancel · 1 task(s)\n'
+    : mode === 'foreground-tool'
+      ? '────────\n>\n────────\n? for shortcuts\n'
     : ready + '\n';
   const antigravityQuotaHistory = mode === 'expired-quota' ? [screen, screen.replace('native-error-fixture', 'newer-quota-fixture')]
     .map((banner, index) => {
       const state = detectCliUsageLimit(banner, index === 0 ? new Date(0) : new Date());
       if (!state.limited) throw new Error('Expected relative quota');
-      return annotateAntigravityUsageLimit(banner, state);
+      const composerKey = extractAntigravityErrorComposerKey(banner);
+      return composerKey
+        ? { ...state, source: 'antigravity-error-composer' as const, nativeEpisodeKey: composerKey }
+        : state;
     }) : undefined;
   const fakeCli = join(root, 'fake-cli');
   const initialScreenGate = passive ? join(root, 'worker-ready') : '';
@@ -121,6 +139,7 @@ const ready = ${JSON.stringify(ready)};
 const screen = ${JSON.stringify(screen)};
 const delayed = ${mode === 'delayed'};
 const manual = ${mode === 'manual'};
+const foregroundTool = ${mode === 'foreground-tool'};
 const initialScreenGate = ${JSON.stringify(initialScreenGate)};
 process.stdin.setRawMode?.(true);
 const drawInitialScreen = () => process.stdout.write('\\x1b[2J\\x1b[H' + screen);
@@ -141,12 +160,21 @@ process.stdin.on('data', chunk => {
   fs.appendFileSync(inputLog, text);
   for (const marker of ['ACTIVATION_UNIQUE_MARKER', 'FOLLOWUP_UNIQUE_MARKER']) {
     if (!text.includes(marker)) continue;
+    if (foregroundTool) {
+      const steps = [
+        { type: 'USER_INPUT', source: 'USER_EXPLICIT', content: marker },
+        { type: 'PLANNER_RESPONSE', tool_calls: [{ name: 'run_command' }] },
+      ];
+      fs.appendFileSync(${JSON.stringify(transcript)}, steps.map(step => JSON.stringify(step)).join('\\n') + '\\n');
+      drawInitialScreen();
+    }
     if (!manual) setTimeout(() => {
       const row = ${JSON.stringify(cliId)} === 'antigravity'
         ? { display: marker, workspace: ${JSON.stringify(dataDir)}, timestamp: Date.now() }
         : { text: marker, session_id: ${JSON.stringify(nativeId)}, ts: Date.now() };
       fs.appendFileSync(history, JSON.stringify(row) + '\\n');
     }, delayed ? 9_000 : 0);
+    if (foregroundTool) continue; // Keep the same composer on screen while the tool runs.
     // Force several idle edges before the delayed receipt appears. Re-enqueueing
     // the activation on a false submit result used to paste the whole input again.
     for (const ms of [1_000, 4_000, 7_000]) {
@@ -185,13 +213,14 @@ setInterval(() => {}, 1_000);
     type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_root',
     workingDir: dataDir, cliId, cliPathOverride: fakeCli, backendType: 'pty',
     cliSessionId: nativeId,
+    ...(isQuotaWithFooter ? { cliVersion: '1.5.15' } : {}),
     antigravityQuotaHistory,
     prompt: passive ? '' : 'ACTIVATION_UNIQUE_MARKER',
     ...(!passive ? { queuedActivationToken: 'activation-token', turnId: 'om_initial' } : {}),
     larkAppId: 'app_test', larkAppSecret: 'secret',
   } satisfies DaemonToWorker);
   return {
-    child, messages, logs, root, cliPidFile, sessionId,
+    child, messages, logs, root, cliPidFile, sessionId, transcript,
     recordReceipt: () => writeFileSync(history, JSON.stringify({
       display: 'ACTIVATION_UNIQUE_MARKER', workspace: dataDir, timestamp: Date.now(),
     }) + '\n'),
@@ -232,6 +261,23 @@ describe('worker delayed activation and interrupted Antigravity delivery', () =>
     expect(worker.messages.some(m => m.type === 'prompt_ready')).toBe(false);
     expect(worker.input()).toBe('');
   }, 60_000);
+
+  it('holds a submitted tool call across the post-submit idle probe until the transcript final', async () => {
+    const worker = startWorker('foreground-tool');
+    await waitFor(() => worker.messages.some(m => m.type === 'screen_update'
+      && m.status === 'idle' && m.content.includes('? for shortcuts')), worker.logs, 30_000);
+    const start = worker.messages.length;
+    worker.child.send({ type: 'message', content: 'FOLLOWUP_UNIQUE_MARKER', turnId: 'om_tool' } satisfies DaemonToWorker);
+    const frames = () => worker.messages.slice(start);
+    await waitFor(() => frames().some(m => m.type === 'turn_input_committed' && m.turnId === 'om_tool'), worker.logs, 15_000);
+    // Hold the fake CLI at the type-ahead composer through two 3.5s probe intervals.
+    await new Promise(resolve => setTimeout(resolve, 7_500));
+    expect(frames().some(m => m.type === 'prompt_ready')).toBe(false);
+
+    appendFileSync(worker.transcript, JSON.stringify({ type: 'PLANNER_RESPONSE', content: 'Finished.' }) + '\n');
+    await waitFor(() => frames().some(m => m.type === 'prompt_ready'), worker.logs, 15_000);
+  }, 60_000);
+
   it.each(['antigravity', 'traex'] as const)('%s writes a slow activation once and acknowledges its deferred receipt', async cliId => {
     const worker = startWorker('delayed', cliId);
     await waitFor(() => worker.input().includes('ACTIVATION_UNIQUE_MARKER'), worker.logs, 30_000);
@@ -292,4 +338,35 @@ describe('worker delayed activation and interrupted Antigravity delivery', () =>
     expect(originalInput.match(/ACTIVATION_UNIQUE_MARKER/g)).toHaveLength(1);
     expect(worker.input()).toBe(originalInput);
   }, 100_000);
+
+  it('promotes agy 1.5.15+ shortcuts-footer quota screen to antigravity-native-log with recovery cursor over real worker/PTY IPC', async () => {
+    const worker = startWorker('quota-with-footer');
+    await waitFor(() => worker.messages.some(m => m.type === 'ready'), worker.logs, 30_000);
+    await waitFor(
+      () => worker.messages.some(
+        m => m.type === 'screen_update'
+          && m.status === 'limited'
+          && m.usageLimit?.source === 'antigravity-native-log',
+      ),
+      worker.logs,
+      25_000,
+    );
+    const limited = worker.messages.find(
+      m => m.type === 'screen_update' && m.usageLimit?.source === 'antigravity-native-log',
+    );
+    expect(limited && limited.type === 'screen_update' ? limited.usageLimit : undefined).toMatchObject({
+      limited: true,
+      kind: 'usage',
+      source: 'antigravity-native-log',
+      nativeEpisodeKey: 'log:E1125 00:00:02.123456',
+      retryLabel: '2h39m35s',
+    });
+    expect(limited && limited.type === 'screen_update' ? limited.antigravityQuotaCursor : undefined).toMatchObject({
+      lastConfirmed: {
+        source: 'antigravity-native-log',
+        nativeEpisodeKey: 'log:E1125 00:00:02.123456',
+      },
+      recoveredEpisodeKey: null,
+    });
+  }, 60_000);
 });

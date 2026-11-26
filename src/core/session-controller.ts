@@ -16,6 +16,7 @@ import { SessionEventGateway, type SessionEventAdmission } from './session-event
 import { isOutputJournalAppId } from '../services/universal-output-handoff.js';
 import { commitPrimarySessionContract, sessionContractPrimary } from './session-contract-primary.js';
 import { isCodexFamilyCliId } from '../adapters/cli/types.js';
+import { isStructuredNoticeProtocolMessage } from '../services/structured-notice-protocol.js';
 
 export type SessionContractBootstrap = import('../services/session-contract.js').SessionContractBootstrap;
 export interface WorkerContractContext extends SessionEventContext { bindingId?: string }
@@ -439,7 +440,7 @@ export class SessionController {
         // is worker-scoped and must outlive the released reservation.
         const failureReport = message.type === 'error' || message.type === 'worker_error' || (message.type === 'restart_result' && message.status !== 'succeeded');
         if (!runtime.identity && !failureReport && ['stopped', 'retiring'].includes(runtime.phase)) return { kind: 'reject', reason: 'runtime_reservation_abandoned' };
-        if (!runtime.identity && !failureReport && (waitsForBinding || !['ready', 'turn_input_received', 'turn_input_committed', 'turn_input_rejected', 'restart_result', 'session_ready_ack', 'persistent_backend_target'].includes(message.type))) {
+        if (!runtime.identity && !failureReport && (waitsForBinding || !['ready', 'turn_input_received', 'turn_input_committed', 'turn_input_rejected', 'managed_turn_origin_revoked', 'restart_result', 'session_ready_ack', 'persistent_backend_target'].includes(message.type))) {
           this.store.deferEvent(this.ref, context.bindingId, context.eventId, context.sequence, message);
           return { kind: 'defer', bindingId: context.bindingId };
         }
@@ -470,7 +471,15 @@ export class SessionController {
     // input is still queued. Do not reconstruct execution authority from the
     // notification's display-only turnId (or create an input admission for it).
     if (message.type !== 'cli_session_id' && !context.scope.execution && typeof message.turnId === 'string' && context.scope.runtime && this.store.authorizedProducer(this.ref, context.scope.runtime, channel)) {
-      const existing = this.store.executions(this.ref, message.turnId, message.dispatchAttempt);
+      // Scenario 3B late-recovery final_output carries a synthetic `late-recovery-*`
+      // turnId anchored to `replyTurnId`. Attach `execution_output` to the
+      // originating execution instead of minting an unclosed synthetic contract.
+      const lookupTurnId = message.type === 'final_output'
+        && message.turnId.startsWith('late-recovery-')
+        && typeof message.replyTurnId === 'string'
+        ? message.replyTurnId
+        : message.turnId;
+      const existing = this.store.executions(this.ref, lookupTurnId, message.dispatchAttempt);
       const current = this.currentRuntime();
       // A turn the CLI starts itself is reported under the binding it was
       // spawned with; an in-process continuation moved that CLI to `current`.
@@ -481,11 +490,11 @@ export class SessionController {
       // (the relay resolving the real CLI, a new native session id), and a
       // zero-prompt session would lose where that turn replies.
       if (continuedInto && message.type === 'terminal_turn_started') context.scope.runtime = continuedInto;
-      const preliminary = this.gateway.admit(message.type, context, channel);
+      const preliminary = this.gateway.admit(message.type, context, channel, undefined, isStructuredNoticeProtocolMessage(message));
       if (preliminary.kind === 'reject' || preliminary.kind === 'defer') return preliminary;
       if (continuedInto) context.scope.runtime = continuedInto;
       if (existing.length === 1) context.scope.execution = existing[0].ref;
-      else if (!existing.length && message.type !== 'screen_update' && sameRuntime(current, context.scope.runtime)) context.scope.execution = this.admitInput(message.turnId, message.dispatchAttempt);
+      else if (!existing.length && message.type !== 'screen_update' && sameRuntime(current, context.scope.runtime)) context.scope.execution = this.admitInput(lookupTurnId, message.dispatchAttempt);
     }
     // Physical screen status is a runtime observation, not an execution claim.
     // A turn that was already running when its physical CLI continued into a
@@ -512,7 +521,7 @@ export class SessionController {
     }
     const uncertainTerminal = message.type === 'turn_terminal' && contractTerminalStatus(message.status, message.errorCode) === 'reconciling';
     if (['turn_terminal', 'final_output', 'turn_execution_started', 'native_input_consumed'].includes(message.type) && !context.scope.execution) return { kind: 'reject', reason: 'execution_scope_missing' };
-    const admission = this.gateway.admit(message.type, context, channel, recoveredOrigin);
+    const admission = this.gateway.admit(message.type, context, channel, recoveredOrigin, isStructuredNoticeProtocolMessage(message));
     if (admission.kind === 'reject' || admission.kind === 'defer') return admission;
     const runtime = context.scope.runtime; const execution = context.scope.execution;
     if (execution && runtime && !recoveredOrigin && !uncertainTerminal && ['turn_execution_started', 'native_input_consumed', 'turn_terminal', 'final_output'].includes(message.type)) {
@@ -564,9 +573,11 @@ export class SessionController {
     }
     if (message.type === 'claude_exit' && runtime) {
       let currentPhysicalExit = false;
-      // The exit callback keeps the binding its CLI was spawned under.
+      // Exits may name the launcher's binding or the latest same-process
+      // binding. Retire both directions of the proven continuation lineage;
+      // executions stay on the runtime they originally ran under.
       const exited = new Map<string, RuntimeContract>();
-      for (const ref of [runtime, ...this.store.continuedRuntimes(this.ref, runtime, channel)]) {
+      for (const ref of this.store.runtimeExitLineage(this.ref, runtime, channel)) {
         for (const sibling of this.store.physicalRuntimes(this.ref, ref)) exited.set(sibling.ref.runtimeId, sibling);
       }
       for (const sibling of exited.values()) {

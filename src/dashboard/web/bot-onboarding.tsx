@@ -1,7 +1,7 @@
 import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { DropdownMenu } from './dashboard-components.js';
-import { fetchDetectedModels, mergeModelCandidates, modelSuggestionsForOption } from './bot-defaults.js';
+import { cliSearchTerms, fetchDetectedModels, mergeModelCandidates, modelSuggestionsForOption } from './bot-defaults.js';
 import { ModelPickerField } from './field-controls.js';
 import { confirm } from './confirm-modal.js';
 import { t } from './ui.js';
@@ -31,6 +31,14 @@ type OnboardingStatus =
   | 'completed'
   | 'failed';
 
+type DeferredApprovalScopeView = {
+  bucket: 'tenant' | 'user';
+  name: string;
+  desc?: string;
+  isolation: 'exact' | 'group' | 'all_level4';
+  group: string;
+};
+
 type OnboardingPermission = {
   ok: boolean;
   scopeCount?: number;
@@ -46,6 +54,10 @@ type OnboardingPermission = {
   versionPendingReview?: boolean;
   pendingReviewAppVersion?: string;
   approvalHumanApprovers?: string[];
+  approvalDeferredScopes?: DeferredApprovalScopeView[];
+  approvalDisabledRefreshToken?: boolean;
+  approvalInitialApprovers?: string[];
+  approvalConsoleUrl?: string;
   reason?: string;
   message?: string;
 };
@@ -83,6 +95,8 @@ type CliOption = {
   available?: boolean;
   availabilityStatus?: import('../../setup/cli-availability.js').CliAvailabilityStatus;
   command?: string;
+  /** Launch commands and short aliases from the CLI registry, used only for search. */
+  searchTerms?: readonly string[];
   availabilityReason?: string;
   cliLaunchMode?: 'forge-traex';
   /** 静态模型候选（与 bot-defaults.ts 的 CliOption 对齐）。 */
@@ -117,6 +131,7 @@ type OnboardingFormState = {
   dirMode: 'fixed' | 'card';
   workingDir: string;
   model: string;
+  autoAvoidApproval: boolean;
 };
 
 type ViewState =
@@ -144,6 +159,7 @@ function defaultFormState(): OnboardingFormState {
     dirMode: 'fixed',
     workingDir: '~',
     model: '',
+    autoAvoidApproval: true,
   };
 }
 
@@ -249,6 +265,10 @@ async function fetchCliOptions(): Promise<CliOptionsState> {
       return {
         options: (body.options as any[]).map((o: any) => ({
           ...o,
+          // 容错：缺失/非数组 → []；空数组由 cliSearchTerms 回退到 command。
+          searchTerms: Array.isArray(o?.searchTerms)
+            ? o.searchTerms.filter((term: unknown): term is string => typeof term === 'string')
+            : [],
           // 容错：缺失/非数组 → []，与 bot-defaults.ts 的 fetchCliOptions 对齐。
           modelChoices: Array.isArray(o?.modelChoices)
             ? o.modelChoices.filter((m: unknown): m is string => typeof m === 'string')
@@ -392,6 +412,56 @@ function reviewPendingText(permission: OnboardingPermission): string {
     : t('botOnboarding.permissionReviewPendingNoVersion', { approvers, stuckHint });
 }
 
+function ApprovalDeferredNotice(props: { permission: OnboardingPermission }): React.JSX.Element | null {
+  const { permission } = props;
+  const deferred = permission.approvalDeferredScopes ?? [];
+  const disabledRefresh = permission.approvalDisabledRefreshToken === true;
+  if (deferred.length === 0 && !disabledRefresh) return null;
+  const approvers = permission.approvalInitialApprovers?.length
+    ? t('botOnboarding.approvalDeferredApprovers', { approvers: permission.approvalInitialApprovers.join('、') })
+    : '';
+  const inlineLimit = 8;
+  const previewItems = deferred.slice(0, inlineLimit);
+  const hasMore = deferred.length > inlineLimit;
+  const renderItem = (scope: DeferredApprovalScopeView) => (
+    <li key={`${scope.bucket}:${scope.name}`}>
+      <code>{scope.name}</code>
+      {' '}
+      <small>({scope.bucket === 'tenant' ? t('botOnboarding.scopeBucketTenant') : t('botOnboarding.scopeBucketUser')})</small>
+      {scope.desc ? <> — {scope.desc}</> : null}
+    </li>
+  );
+  return (
+    <div className="onboarding-approval-deferred" data-onboarding-approval-deferred="">
+      {deferred.length > 0 ? (
+        <p className="hint-warn">
+          {t('botOnboarding.approvalDeferredSummary', { count: deferred.length, approvers })}
+        </p>
+      ) : null}
+      {disabledRefresh ? (
+        <p className="hint-warn">{t('botOnboarding.approvalDisabledRefreshToken')}</p>
+      ) : null}
+      {deferred.length > 0 ? (
+        hasMore ? (
+          <details className="onboarding-technical">
+            <summary>{t('botOnboarding.approvalDeferredExpand', { count: deferred.length })}</summary>
+            <ul className="onboarding-steps">{deferred.map(renderItem)}</ul>
+          </details>
+        ) : (
+          <ul className="onboarding-steps">{previewItems.map(renderItem)}</ul>
+        )
+      ) : null}
+      {permission.approvalConsoleUrl ? (
+        <p className="hint-warn">
+          <a href={permission.approvalConsoleUrl} target="_blank" rel="noopener">
+            {t('botOnboarding.approvalDeferredOpenConsole')}
+          </a>
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
 export function PermissionSummary(props: { job: OnboardingJob }): React.JSX.Element | null {
   const { job } = props;
   if ((job.status !== 'completed' && job.status !== 'needs_owner') || !job.permission) return null;
@@ -415,6 +485,7 @@ export function PermissionSummary(props: { job: OnboardingJob }): React.JSX.Elem
           <p className="hint-warn" data-onboarding-version-warning="">{permission.versionWarning}</p>
         ) : null}
         {permission.scopeWarning ? <p className="hint-warn">{permission.scopeWarning}</p> : null}
+        <ApprovalDeferredNotice permission={permission} />
         <RedirectWarning permission={permission} />
       </>
     );
@@ -642,6 +713,7 @@ function OnboardingForm(props: {
     .sort((a, b) => a.label.localeCompare(b.label, 'en', { sensitivity: 'base' }))
     .map(option => ({
       value: option.id,
+      searchTerms: cliSearchTerms(option),
       label: (option.id === props.form.cliId ? availabilityStatus : cliAvailabilityStatus(option)) === 'unavailable'
         ? t('botOnboarding.cliMissingOption', { label: option.label, command: option.command ?? option.id })
         : option.label,
@@ -793,6 +865,20 @@ function OnboardingForm(props: {
           />
         </div>
       ) : null}
+      {!local ? (
+        <label className="onboarding-field onboarding-checkbox">
+          <span className="onboarding-checkbox-row">
+            <input
+              id="ob-auto-avoid-approval"
+              type="checkbox"
+              checked={props.form.autoAvoidApproval}
+              onChange={event => props.onFormChange({ ...props.form, autoAvoidApproval: event.currentTarget.checked })}
+            />
+            <span>{t('botOnboarding.autoAvoidApprovalLabel')}</span>
+          </span>
+          <small className="onboarding-field-hint">{t('botOnboarding.autoAvoidApprovalHint')}</small>
+        </label>
+      ) : null}
       {props.error ? <p className="form-error">{props.error}</p> : null}
       <div className="actions onboarding-actions">
         <button type="button" id="ob-cancel" disabled={props.submitting} onClick={props.onClose}>{t('botOnboarding.cancel')}</button>
@@ -942,7 +1028,7 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
           workingDir: form.workingDir.trim(),
           dirMode: form.dirMode,
           model: form.model.trim() || undefined,
-          ...(registrationMode === 'local' ? {} : { cloneSourceAppId }),
+          ...(registrationMode === 'local' ? {} : { cloneSourceAppId, autoAvoidApproval: form.autoAvoidApproval }),
         }),
       });
       const body = await res.json();

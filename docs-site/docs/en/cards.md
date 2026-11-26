@@ -57,9 +57,9 @@ Frequently used buttons sit on the card's main row. The low-frequency buttons ma
 | 🗜️ Compact | Send `/compact` to the CLI to compress context (shown only when the CLI supports it) |
 | ⏲️ Idle auto-compact: on/off | More Actions. Compact automatically after the session sits idle, same as [`/idlecompact`](/en/slash-commands) |
 | ⏹ Stop | Interrupt the current turn (same as ^C); the session stays. Only shown while the turn is still running |
-| ❌ Close Session | Close the session; adopted sessions show "⏏ Disconnect" here |
+| ❌ Close Session | Close the session; adopted sessions show "⏏ Disconnect" here. Admins can close any session; talk-only users can close the **topics they opened themselves** (per-topic direct messages included) |
 | 🔁 Retry Last Task | Appears when the quota recovers and the status becomes "Ready to retry" |
-| Reasoning effort dropdown | Codex sessions (tmux backend, no sandbox, not using RPC input) can change reasoning effort while running; it applies from the next turn |
+| Reasoning effort dropdown | Codex sessions (tmux backend, no sandbox, not using RPC input) can change reasoning effort while running; it applies from the next turn. For managed local Claude Code sessions, saves made while idle or suspended apply after the next restart or cold resume. `CLAUDE_CODE_EFFORT_LEVEL` and startup commands that set `/effort` take precedence |
 
 You can hide buttons you don't need in the Dashboard (see "Hiding card buttons" below).
 
@@ -92,22 +92,24 @@ To open a new worktree from a repo, use the "🌿 Open a repo as a new worktree"
 
 ### AI question cards
 
-When the agent asks with `botmux ask`, or Claude Code / Codex asks a question on its own, a question card appears in the chat. Its "Can answer" field tells you who can answer.
+When the agent asks with `botmux ask`, or Claude Code / Codex asks a question on its own, a question card appears in the chat, titled "N questions need your answer". Each question has its own grey block with a small label for its kind ("Single choice · pick one" / "Multiple choice · pick any"), one row with a checkbox per option, and each option's description in grey under its label. The last small line shows the deadline and who can answer.
 
 | What you see | What to do |
 |--------------|------------|
-| Single / multiple choice | Press an option; for multi-select pick as many as you like, then press "Submit". Submitting with nothing selected needs a second "Confirm empty submit" |
-| Several questions on one card | Each is labeled "Question 1", "Question 2", ...; answer them all, then "Submit" once |
+| Single / multiple choice | Tick options (ticking stays in your client until you submit), then press "Submit" at the bottom once for the whole card. A single-choice question takes one tick; submitting a multi-choice card with nothing ticked needs a second "Confirm empty submit" |
+| A pop-up after "Submit" | Your ticks and text are still on the card: fix the question it names (more than one tick on a single choice, or a required question left empty), then press "Submit" again |
+| "Single choice · tap to submit" | With one single-choice question, no own-answer box and no preselection, tapping a row submits that option right away; there is no "Submit" button |
+| Green "Recommended" tag | The asker's recommended option (a trailing "(Recommended)" / 「（推荐）」 in its label becomes this tag); it is only a hint |
+| Options already ticked | These are the asker's defaults, only a draft. Nothing counts as an answer until you press "Submit", and you can change them |
+| "Add a note, or write your own answer if none fits" | Most questions have this box under their options (unless the asker turned it off, or the card has text / number fields). With options ticked, what you write is a note on that question and goes to the asker with them; with nothing ticked, it is that question's answer. Up to 1000 characters per question, 2000 per card |
 | Text / number fields | Fill them in; required fields can't be blank, and numbers must stay within any given range |
-| Options already selected | These are the asker's recommended defaults, only a draft. Nothing counts as an answer until you press "Submit", and you can change them |
-| "Other / custom answer" | Most questions have their own input box (unless the asker turned it off, or the card has text / number fields). Write your own answer when no option fits; it replaces only that question. Up to 1000 characters per question, 2000 per card |
-| "Can answer" @-mentions one person | The asker named an answerer with `--answerer`, and only that person can submit (questions routed in from another app show "designated member only" instead). It only limits who can answer; it is not a business approval |
+| The small line @-mentions one person | The asker named an answerer with `--answerer`, and only that person can submit (questions routed in from another app show "only the designated member may answer" instead). It only limits who can answer; it is not a business approval |
 
-Without a designated answerer, anyone in the chat who can talk to the bot can answer. If no option fits, you can also just reply in the topic with text. See [CLI commands](/en/cli-commands) for the flags.
+After you submit, the card turns green ("Submitted") and lists what you chose or wrote under each question with ✓ (a note on its own "Note: …" line) and who submitted it; a timed-out or invalidated card turns grey and still shows the questions. Without a designated answerer, anyone in the chat who can talk to the bot can answer. If no option fits, you can also just reply in the topic with text. When an ask has so many questions and options that checkboxes no longer fit on one card, the card only lists them; reply with your answer in the chat. See [CLI commands](/en/cli-commands) for the flags.
 
 ### Terminal permission card (Claude Code)
 
-Some Claude Code actions pop a confirmation dialog in the terminal, for example a risky `rm` caught by a built-in safety check, which appears even when permission prompts are skipped. Lark can't see that dialog, so the session would hang. Botmux turns it into a question card showing the tool name and the command or file path, with buttons labeled 「允许执行」 (allow) and 「拒绝」 (deny). The card text and buttons are currently Chinese only.
+Some Claude Code actions pop a confirmation dialog in the terminal, for example a risky `rm` caught by a built-in safety check, which appears even when permission prompts are skipped. Lark can't see that dialog, so the session would hang. Botmux turns it into a question card showing the tool name and the command or file path, with two options, 「允许执行」 (allow) and 「拒绝」 (deny); tapping a row submits it. The option labels are currently Chinese only.
 
 - Allow lets Claude run it; deny tells Claude no, and it continues another way.
 - It **waits 10 minutes by default**. If no one presses anything, it counts as denied and Claude is told it timed out.
@@ -149,9 +151,9 @@ Want only one card? Choose dynamic single card and turn off "**Show a separate s
 
 ### Questions (Ask) live in the card too
 
-`botmux ask` in the same turn, and Claude Code / Codex questions, open right inside the reply card with a "Waiting for your response" title. Once answered, timed out or expired, they fold into the process; multiple questions show one after another without overwriting each other. Multi-select, text answers and answering from the Dashboard all work as usual.
+`botmux ask` in the same turn, and Claude Code / Codex questions, open right inside the reply card with a "Waiting for your response" title when one click answers them (a single single-choice question with no default pick and no box for your own answer, such as a permission confirmation) or when they are answered by a chat reply. Once answered, timed out or expired, they fold into the process; multiple questions show one after another without overwriting each other.
 
-Large forms with more than 16 options or question content over 3000 bytes are still sent as separate cards. Approval / authorization cards are also sent separately.
+Questions you tick or fill in and then Submit (multi-select, default picks, a note or your own answer, several questions at once, input forms) are sent as separate cards: the reply card is redrawn as the turn runs, and inside it your unsubmitted ticks and notes would be wiped. Large forms with more than 16 options or question content over 3000 bytes are also sent as separate cards. Approval / authorization cards are also sent separately.
 
 ### Working with `botmux send`
 
@@ -206,6 +208,8 @@ Values: `output` (show output, export text, refresh), `terminal`, `writeLink`, `
 
 All of these can be changed in the Dashboard or with `/botconfig set <setting> on|off`.
 
+For managed local Claude Code sessions, the reply card’s **Switch model** menu item and the topic command `/models` open the same model and effort picker. The picker shows the observed runtime alongside the selections for the next launch. Changes apply on the next cold resume or after an explicit `/restart` while idle. Restarting stops background terminal tasks. Custom candidates come from the bot’s `customModels` setting. Available combinations depend on the CLI and gateway.
+
 ## Pinning the current status card
 
 With `pinStreamingCard` on, Botmux pins the **current public status card** to the top of the chat so the terminal and close buttons are always within reach.
@@ -245,6 +249,8 @@ The usage line looks like `ctx 23% · 5h 18% · 7d 5% · This turn ↑12k ↓3k 
 | `off` | Not shown |
 
 This only affects display, not usage accounting.
+
+To hide only the `5h` / `7d` rolling account quota segments while keeping context and token usage visible, turn off **Show account quota (5h / 7d)** under **Bot Config → Message cards → Card content**, or run `/botconfig set showUsageQuota off` (`"showUsageQuota": false` in `bots.json`, takes effect immediately).
 
 ### Showing timing
 

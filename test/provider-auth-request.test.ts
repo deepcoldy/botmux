@@ -5,8 +5,9 @@
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AuthLinkDelivery } from '../src/core/auth-link-delivery.js';
+import { deliverAuthLink } from '../src/core/auth-link-delivery.js';
 import {
-  __providerAuthTrackedForTest, __resetProviderAuthForTest, LINK_RESEND_MS, requestProviderAuth, type ProviderAuthDeps,
+  __providerAuthTrackedForTest, __resetProviderAuthForTest, deliverProviderLink, LINK_RESEND_MS, requestProviderAuth, type ProviderAuthDeps,
 } from '../src/core/provider-auth-request.js';
 import type { MeegoLoginRequest } from '../src/services/meego-auth.js';
 import type { BytedcliLoginStart } from '../src/services/bytedcli-auth.js';
@@ -27,7 +28,7 @@ beforeEach(() => {
   deps = {
     requestMeegoLogin: vi.fn(async () => meego),
     bytedcliAuthorized: vi.fn(async () => false as boolean | 'unknown'),
-    adoptBytedcliForTurn: vi.fn(async () => 'none' as 'adopted' | 'already' | 'none'),
+    adoptBytedcliForTurn: vi.fn(async () => 'none' as 'adopted' | 'already' | 'none' | 'unavailable'),
     startBytedcliLogin: vi.fn(async () => ({ state: 'challenge', challenge: { authUrl: BYTED_URL, completeToken: 'tok-b' } }) as BytedcliLoginStart),
     deliver: vi.fn(async () => delivery),
     now: () => clock,
@@ -161,6 +162,19 @@ describe('requestProviderAuth — ByteCloud', () => {
     expect(r.message).not.toContain(BYTED_URL);
   });
 
+  it('can deliver the same link after a policy change cancelled its previous delivery', async () => {
+    let current = true;
+    deps.isCurrent = () => current;
+    deps.deliver.mockImplementationOnce(async () => {
+      current = false;
+      return 'cancelled_before_write';
+    });
+    expect((await ask('bytedcli')).status).toBe('undeliverable');
+    current = true;
+    expect((await ask('bytedcli')).status).toBe('delivered');
+    expect(deps.deliver).toHaveBeenCalledTimes(2);
+  });
+
   it('a login that cannot be started is unavailable, and the agent hears bytedcli\'s reason', async () => {
     deps.startBytedcliLogin = vi.fn(async () => ({ state: 'failed', detail: 'AUTH_REQUIRED: Not authenticated' }) as BytedcliLoginStart);
     const r = await ask('bytedcli');
@@ -203,7 +217,9 @@ describe('requestProviderAuth — ByteCloud already authorized mid-turn', () => 
   it('keeps the next-turn wording when the turn cannot adopt it', async () => {
     deps.bytedcliAuthorized = vi.fn(async () => true as boolean | 'unknown');
     deps.adoptBytedcliForTurn = vi.fn(async () => 'none' as const);
-    expect((await ask('bytedcli')).message).toContain('下一轮');
+    const r = await ask('bytedcli');
+    expect(r.status).toBe('ready');
+    expect(r.message).toContain('下一轮');
   });
 
   it('says no login is needed when the turn already holds the person\'s identity', async () => {
@@ -212,5 +228,89 @@ describe('requestProviderAuth — ByteCloud already authorized mid-turn', () => 
     const r = await ask('bytedcli');
     expect(r.status).toBe('ready');
     expect(r.message).toContain('不需要再登录');
+  });
+
+  it('returns unavailable instead of ready when adopting the login fails transiently', async () => {
+    deps.bytedcliAuthorized = vi.fn(async () => true as boolean | 'unknown');
+    deps.adoptBytedcliForTurn = vi.fn(async () => 'unavailable' as const);
+    const r = await ask('bytedcli');
+    expect(r.status).toBe('unavailable');
+    expect(deps.deliver).not.toHaveBeenCalled();
+  });
+
+  it('catches unexpected errors thrown by adoptBytedcliForTurn and returns unavailable', async () => {
+    deps.bytedcliAuthorized = vi.fn(async () => true as boolean | 'unknown');
+    deps.adoptBytedcliForTurn = vi.fn(async () => { throw new Error('bytedcli authorization service unavailable'); });
+    const r = await ask('bytedcli');
+    expect(r.status).toBe('unavailable');
+    expect(deps.deliver).not.toHaveBeenCalled();
+  });
+
+  it('returns unavailable when adoption is superseded by a live policy or generation change', async () => {
+    deps.bytedcliAuthorized = vi.fn(async () => true as boolean | 'unknown');
+    deps.adoptBytedcliForTurn = vi.fn(async () => 'superseded' as const);
+    const r = await ask('bytedcli');
+    expect(r.status).toBe('unavailable');
+    expect(deps.deliver).not.toHaveBeenCalled();
+  });
+});
+
+describe('deliverProviderLink — cancellation and claim ownership', () => {
+  const link = { authUrl: MEEGO_URL, text: MEEGO_URL, command: '/login meego' };
+  const input = { provider: 'meego' as const, openId: 'ou_alice', chatId: 'oc_topic', locale: 'zh' as const };
+  const deliverWith = (
+    sendDirect: (openId: string, text: string) => Promise<unknown>,
+    isCurrent: () => boolean,
+  ) => (text: string, privateCommand: string) => deliverAuthLink({
+    privateChat: false,
+    openId: input.openId,
+    text,
+    privateCommand,
+    replyInPlace: vi.fn(async () => undefined),
+    sendDirect,
+    isCurrent,
+  });
+
+  it('retries only after a cancellation proven to precede every provider write', async () => {
+    let current = false;
+    const accepted = vi.fn(async () => 'om_dm');
+    const deliver = deliverWith(accepted, () => current);
+    expect((await deliverProviderLink(input, link, { deliver, now: () => clock })).status).toBe('undeliverable');
+    expect(accepted).not.toHaveBeenCalled();
+
+    current = true;
+    expect((await deliverProviderLink(input, link, { deliver, now: () => clock })).status).toBe('delivered');
+    expect(accepted).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the claim when the provider accepted a write whose response was lost', async () => {
+    let current = true;
+    const accepted = vi.fn(async () => {
+      current = false;
+      throw new Error('response lost after provider acceptance');
+    });
+    const deliver = deliverWith(accepted, () => current);
+    expect((await deliverProviderLink(input, link, { deliver, now: () => clock })).status).toBe('undeliverable');
+    expect(accepted).toHaveBeenCalledTimes(1);
+
+    current = true;
+    expect((await deliverProviderLink(input, link, { deliver, now: () => clock })).status).toBe('undeliverable');
+    expect(accepted).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not let a late completion overwrite a newer claim', async () => {
+    let finish!: (result: AuthLinkDelivery) => void;
+    deps.deliver.mockImplementationOnce(() => new Promise<AuthLinkDelivery>(resolve => { finish = resolve; }));
+    const old = ask('meego');
+    await vi.waitFor(() => expect(deps.deliver).toHaveBeenCalledTimes(1));
+
+    clock += LINK_RESEND_MS;
+    deps.deliver.mockResolvedValueOnce('dm');
+    expect((await ask('meego')).status).toBe('delivered');
+    finish('dm_failed');
+    expect((await old).status).toBe('undeliverable');
+
+    expect((await ask('meego')).status).toBe('pending');
+    expect(deps.deliver).toHaveBeenCalledTimes(2);
   });
 });

@@ -41,6 +41,8 @@ export interface SetupBotFlags {
   allowedUsers?: string;
   allowedChatGroups?: string;
   showInTeam?: string;
+  /** AI 在后台盯长任务时将等待期间的中间进展收进折叠区（默认 false）。 */
+  foldBackgroundUpdates?: string;
   /** 仅 add：feishu | lark。 */
   brand?: string;
   /** UI 语言：zh | en。 */
@@ -89,6 +91,7 @@ const BOT_FIELD_FLAGS: Record<string, keyof SetupBotFlags> = {
   '--allowed-users': 'allowedUsers',
   '--allowed-chat-groups': 'allowedChatGroups',
   '--show-in-team': 'showInTeam',
+  '--fold-background-updates': 'foldBackgroundUpdates',
   '--brand': 'brand',
   '--lang': 'lang',
   '--welcome-message': 'welcomeMessage',
@@ -152,7 +155,7 @@ export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
   --wrapper-cli <prefix>     通用启动前缀（如 "aiden x claude"），覆盖 --cli 推导值
   --model <m>                CLI 模型名
   --backend <b>              会话后端 pty | tmux | herdr | zellij | zmx | hc
-                             hc 需显式选用，且本机要有 herdr-core >= 0.1.19（仅 Linux）
+                             hc 需显式选用，且本机要有 herdr-core >= 0.1.19（Linux / macOS）
                              traex + herdr 插件安装需在 Dashboard Settings 中显式开启并填写可信 source/ref
   --working-dir <dirs>       仓库选择卡片的扫描根目录（逗号分隔多个）
   --default-working-dir <d>  固定默认目录：新话题直接在此目录启动、不弹仓库
@@ -161,6 +164,8 @@ export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
                              ou_xxx 仅限已有目标应用自身，勿跨 Bot 复制）
   --allowed-chat-groups <g>  可对话群 chat_id（oc_xxx，逗号分隔）
   --show-in-team <bool>      平台团队页是否展示（默认 true）
+  --fold-background-updates <bool>
+                             AI 在后台盯长任务时等待进展收进折叠区，不刷屏发新消息（默认 false）
   --brand <feishu|lark>      租户类型（仅 add）
   --lang <zh|en>             Bot 语言（zh | en；edit 传 - 清空以继承全局语言）
   --welcome-message <text>   机器人首次成功上线后私聊 owner 的欢迎语，只发一次；
@@ -435,6 +440,7 @@ export function buildBotFromAddFlags(flags: SetupBotFlags): Record<string, any> 
     allowedUsers: flags.allowedUsers,
     allowedChatGroups: flags.allowedChatGroups,
     showInTeam: flags.showInTeam,
+    foldBackgroundUpdates: flags.foldBackgroundUpdates,
     // 显式 --wrapper-cli 覆盖 --cli 推导出的前缀（undefined 时不动 base 里的值）。
     wrapperCli: flags.wrapperCli,
     lang: flags.lang,
@@ -491,6 +497,7 @@ export function editInputFromFlags(flags: SetupBotFlags): BotConfigEditInput {
   if (flags.allowedUsers !== undefined) input.allowedUsers = flags.allowedUsers;
   if (flags.allowedChatGroups !== undefined) input.allowedChatGroups = flags.allowedChatGroups;
   if (flags.showInTeam !== undefined) input.showInTeam = flags.showInTeam;
+  if (flags.foldBackgroundUpdates !== undefined) input.foldBackgroundUpdates = flags.foldBackgroundUpdates;
   if (flags.lang !== undefined) input.lang = flags.lang;
   if (flags.welcomeMessage !== undefined) input.welcomeMessage = flags.welcomeMessage;
   return input;

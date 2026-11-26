@@ -4,6 +4,8 @@ import ts from 'typescript';
 // Execute the pool's actual IPC branches without starting a daemon/fleet.
 export function loadWorkerPoolMessageHandlers(names: string[], scope: Record<string, unknown>, asynchronous = false) {
   if (!('config' in scope)) scope.config = { terminalEffortWriteback: false };
+  if (!('collectSessionTurnGarbage' in scope)) scope.collectSessionTurnGarbage = () => {};
+  if (!('cb' in scope)) scope.cb = {};
   const pool = ts.createSourceFile('worker-pool.ts', readFileSync(new URL('../../src/core/worker-pool.ts', import.meta.url), 'utf8'), ts.ScriptTarget.Latest, true);
   const clauses: string[] = [];
   function visit(node: ts.Node) {

@@ -38,7 +38,7 @@ describe('deferred startup catalog retry lifetime', () => {
     const cfg = { traexAutoModel: pool, turnId: 'cold', prompt: 'synthetic' };
     const read = vi.fn(async () => null);
     const scope: Record<string, any> = {
-      traexAutoModelController: controller, cliSpawnGeneration: 1, lastInitConfig: cfg,
+      traexAutoModelController: controller, cliSpawnGeneration: 1, lastInitConfig: cfg, pendingMessages: [],
       traexAutoModelRuntimeEligible: () => true, cliAdapter: {}, backend: undefined,
       currentTraexLoadSnapshot: read, TRAEX_AUTO_MODEL_DEFAULT_PREFLIGHT_TIMEOUT_MS: 8_000,
       send: vi.fn(), t: (key: string) => key, log: vi.fn(),

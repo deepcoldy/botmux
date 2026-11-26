@@ -57,6 +57,12 @@ export interface TranscriptEvent {
   type?: string;
   subtype?: string;
   uuid?: string;
+  /** Parent record UUID in Claude Code's conversation tree (`null` on a root record). */
+  parentUuid?: string | null;
+  /** Request identifier present on `type:"api-request"` records. */
+  id?: string;
+  /** Present on user interrupt records when Claude Code cancels an active message. */
+  interruptedMessageId?: string;
   sessionId?: string;
   timestamp?: string;
   message?: {
@@ -67,8 +73,8 @@ export interface TranscriptEvent {
     stop_reason?: string | null;
     /** Model that actually served this reply (e.g. `claude-opus-4-8`). Claude
      *  Code writes the placeholder `<synthetic>` on records no model produced:
-     *  API-error records (`isApiErrorMessage:true`) and the bridge-resume
-     *  placeholder (`isApiErrorMessage:false`, text "No response requested.",
+     *  API-error records (`isApiErrorMessage:true`), local tool calls, and the
+     *  bridge-resume placeholder (`isApiErrorMessage:false`, text "No response requested.",
      *  usage all zero, no `requestId`) — see {@link isSyntheticNoModelReplyEvent}. */
     model?: string;
     /** API usage of the request this assistant record answers. */
@@ -135,6 +141,8 @@ export interface TranscriptEvent {
    *  records — both excluded from meaningful turn attribution. */
   isSidechain?: boolean;
   isCompactSummary?: boolean;
+  /** Present on `type:"system", subtype:"compact_boundary"` lines (`manual` vs `auto`). */
+  compactMetadata?: { trigger?: string };
   /** Claude Code ≥2.1.259 stamps this on a `model_refusal_fallback` copied into
    *  a FORKED session: the record is history the fork inherited, and the switch
    *  it describes does NOT apply to this conversation. Treated as positive
@@ -178,6 +186,43 @@ export function apiErrorMessageText(ev: TranscriptEvent): string {
       .join(' ');
   }
   return '';
+}
+
+/** Claude Code's `/goal` clears itself after an API failure it will not retry
+ *  (its own backoff for transient errors runs before this) and records it as
+ *  `{type:"system", subtype:"informational", content:"Goal cleared after an
+ *  unrecoverable error (<label>): …"}`. Returns that notice, else undefined. */
+export function claudeGoalAbortNotice(ev: TranscriptEvent | null | undefined): string | undefined {
+  if (!ev || typeof ev !== 'object' || ev.type !== 'system' || ev.subtype !== 'informational' || ev.isSidechain === true) return undefined;
+  const content = (ev as { content?: unknown }).content;
+  if (typeof content !== 'string') return undefined;
+  return /^Goal cleared after an unrecoverable error\b/.test(content) ? content : undefined;
+}
+
+/** Follows one main transcript for a goal abort. Remembers the latest API-error
+ *  text (the record Claude writes right before clearing the goal, e.g.
+ *  "Please run /login · API Error: 403") and yields a single failure message
+ *  naming both once the goal is cleared; nothing after that. */
+export class ClaudeGoalAbortWatch {
+  private lastApiError: string | undefined;
+  private reported = false;
+
+  observe(events: readonly TranscriptEvent[]): string | undefined {
+    if (this.reported) return undefined;
+    for (const ev of events) {
+      if (!ev || typeof ev !== 'object' || ev.isSidechain === true) continue;
+      if (ev.type === 'assistant') {
+        // A real reply after an error means that error was recovered from.
+        this.lastApiError = ev.isApiErrorMessage === true ? apiErrorMessageText(ev).trim() : undefined;
+        continue;
+      }
+      const notice = claudeGoalAbortNotice(ev);
+      if (!notice) continue;
+      this.reported = true;
+      return this.lastApiError ? `${notice} Cause: ${this.lastApiError}` : notice;
+    }
+    return undefined;
+  }
 }
 
 /** Kind of automatic model switch Claude Code recorded, mapped from the raw
@@ -278,14 +323,28 @@ export function parseClaudeModelFallbackEvent(
   };
 }
 
+/** True when `ev` is an actual conversation record of the given role (`user` or
+ *  `assistant`). Rejects non-conversation records that embed a nested
+ *  `message.role` (e.g. Claude Code 2.1.330 `type: "api-request-blob"` carrying
+ *  `message.role: "user"` or `"assistant"`), while still accepting synthetic
+ *  records that omit `ev.type`. */
+export function hasTranscriptRole(
+  ev: TranscriptEvent | null | undefined,
+  role: 'user' | 'assistant',
+): boolean {
+  if (!ev || typeof ev !== 'object') return false;
+  if (ev.type !== undefined && ev.type !== role) return false;
+  return (ev.message?.role ?? ev.type) === role;
+}
+
 /** Model that actually served an assistant record. Sub-agent output, API-error
  *  placeholders and Claude's `<synthetic>` sentinel are not the main session's
  *  model, so they yield undefined rather than a false "model changed". */
 export function servingModelFromAssistantEvent(ev: TranscriptEvent): string | undefined {
-  if (!ev || typeof ev !== 'object') return undefined;
+  if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev)) return undefined;
   if ((ev as any).isSidechain === true) return undefined;
   if (ev.isApiErrorMessage === true || isTranscriptRateLimitEvent(ev)) return undefined;
-  if ((ev.message?.role ?? ev.type) !== 'assistant') return undefined;
+  if (!hasTranscriptRole(ev, 'assistant')) return undefined;
   const model = ev.message?.model?.trim();
   if (!model || model === '<synthetic>') return undefined;
   return model;
@@ -563,6 +622,7 @@ export type ClaudeTerminalOutcome =
     retryAtMs?: number;
   }
   | { status: 'ambiguous'; errorCode: string; retryable: false }
+  | { status: 'cancelled'; errorCode: 'user_interrupted'; retryable: false }
   | { status: 'rate_limited'; errorCode: 'provider_rate_limited'; retryable: false };
 
 function normalizedApiErrorCode(ev: TranscriptEvent): string {
@@ -586,6 +646,14 @@ function withProviderRetryHint(
 /** Model placeholder Claude Code writes on assistant records no model produced. */
 export const SYNTHETIC_MODEL_PLACEHOLDER = '<synthetic>';
 
+/** Any non-API-error assistant record Claude Code wrote locally, regardless of
+ *  its content shape. Provider-success accounting must exclude all of these;
+ *  turn-terminal classification narrows this further for local tool calls. */
+export function isSyntheticAssistantRecord(ev: TranscriptEvent | null | undefined): boolean {
+  if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev) || ev.isApiErrorMessage === true) return false;
+  return hasTranscriptRole(ev, 'assistant') && ev.message?.model === SYNTHETIC_MODEL_PLACEHOLDER;
+}
+
 /**
  * A `type:"assistant"` record that Claude Code wrote WITHOUT calling the model
  * and WITHOUT flagging it as an API error. Observed shape (Claude Code 2.1.263,
@@ -604,20 +672,18 @@ export const SYNTHETIC_MODEL_PLACEHOLDER = '<synthetic>';
  * the user's message was never answered. Treating it as `completed` closes the
  * Lark turn silently (measured: 53 such records across 26 local sessions, 39 of
  * them directly after a Lark-delivered user message, none surfaced anywhere).
- * Only `message.model` distinguishes it from a real reply.
+ * Claude also uses `<synthetic>` for local tool calls. Their `tool_use` blocks
+ * keep the logical turn open even when stamped with `stop_sequence`.
  */
 export function isSyntheticNoModelReplyEvent(ev: TranscriptEvent | null | undefined): boolean {
-  if (!ev || typeof ev !== 'object') return false;
-  if (ev.isApiErrorMessage === true) return false;
-  const role = ev.message?.role ?? ev.type;
-  if (role !== 'assistant') return false;
-  return ev.message?.model === SYNTHETIC_MODEL_PLACEHOLDER;
+  if (!ev || !isSyntheticAssistantRecord(ev)) return false;
+  return !hasToolUseBlock(ev);
 }
 
 export function classifyClaudeTerminalEvent(
   ev: TranscriptEvent,
 ): ClaudeTerminalOutcome | undefined {
-  if (!ev || typeof ev !== 'object' || (ev as any).isSidechain === true) return undefined;
+  if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev) || (ev as any).isSidechain === true) return undefined;
   if (isTranscriptRateLimitEvent(ev)) {
     return {
       status: 'rate_limited',
@@ -670,12 +736,7 @@ export function classifyClaudeTerminalEvent(
   if (isSyntheticNoModelReplyEvent(ev)) {
     return { status: 'failed', errorCode: 'provider_no_model_reply', retryable: true };
   }
-  const role = ev.message?.role ?? ev.type;
-  if (role !== 'assistant') return undefined;
-  const reason = ev.message?.stop_reason;
-  if (typeof reason !== 'string' || reason.length === 0
-    || reason === 'tool_use' || reason === 'pause_turn') return undefined;
-  return { status: 'completed' };
+  return isClaudeTurnTerminalEvent(ev) ? { status: 'completed' } : undefined;
 }
 
 /**
@@ -696,10 +757,11 @@ export function classifyClaudeTerminalEvent(
  * of them.
  */
 export function isClaudeTurnTerminalEvent(ev: TranscriptEvent): boolean {
-  if (!ev || typeof ev !== 'object' || (ev as any).isSidechain === true) return false;
+  if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev) || (ev as any).isSidechain === true) return false;
   if (isClaudeTurnDurationEvent(ev)) return true;
-  const role = ev.message?.role ?? ev.type;
-  if (role !== 'assistant') return false;
+  if (!hasTranscriptRole(ev, 'assistant')) return false;
+  if (ev.isApiErrorMessage !== true && ev.message?.model === SYNTHETIC_MODEL_PLACEHOLDER
+    && hasToolUseBlock(ev)) return false;
   const reason = ev.message?.stop_reason;
   return typeof reason === 'string'
     && reason.length > 0
@@ -784,9 +846,8 @@ const BACKGROUND_LAUNCH_AGENT_ID_RE = /\bagentId:\s*(\S+)/;
  *  none. The launch-ack lives in the FOLLOWING user event's tool_result, so the
  *  caller pairs this with {@link backgroundTaskDispatchAcks}. */
 export function backgroundTaskDispatchToolUseIds(ev: TranscriptEvent): string[] {
-  if (!ev || (ev as any).isSidechain === true) return [];
-  const role = ev.message?.role ?? ev.type;
-  if (role !== 'assistant') return [];
+  if (!ev || isClaudeApiRequestBlob(ev) || (ev as any).isSidechain === true) return [];
+  if (!hasTranscriptRole(ev, 'assistant')) return [];
   const content = ev.message?.content;
   if (!Array.isArray(content)) return [];
   const ids: string[] = [];
@@ -805,9 +866,8 @@ export function backgroundTaskDispatchToolUseIds(ev: TranscriptEvent): string[] 
  *  tool_results whose text carries BOTH the launch phrasing and an `agentId:`
  *  line qualify, so a synchronous tool result is never counted. */
 export function backgroundTaskDispatchAcks(ev: TranscriptEvent): Array<{ toolUseId: string; agentId: string }> {
-  if (!ev || (ev as any).isSidechain === true) return [];
-  const role = ev.message?.role ?? ev.type;
-  if (role !== 'user') return [];
+  if (!ev || isClaudeApiRequestBlob(ev) || (ev as any).isSidechain === true) return [];
+  if (!hasTranscriptRole(ev, 'user')) return [];
   const content = ev.message?.content;
   if (!Array.isArray(content)) return [];
   const acks: Array<{ toolUseId: string; agentId: string }> = [];
@@ -830,13 +890,13 @@ export function backgroundTaskDispatchAcks(ev: TranscriptEvent): Array<{ toolUse
  *  START WITH the tag — a tool_result that merely contains the literal string
  *  (e.g. grep over this source) is not one. */
 function deliveredTaskNotificationText(ev: TranscriptEvent): string | undefined {
+  if (isClaudeApiRequestBlob(ev)) return undefined;
   let text: string;
   if (ev.type === 'attachment' && ev.attachment?.type === 'queued_command') {
     const prompt = ev.attachment.prompt;
     text = typeof prompt === 'string' ? prompt : stringifyUserContent(prompt);
   } else {
-    const role = ev.message?.role ?? ev.type;
-    if (role !== 'user') return undefined;
+    if (!hasTranscriptRole(ev, 'user')) return undefined;
     const raw = ev.message?.content;
     text = typeof raw === 'string'
       ? raw
@@ -862,20 +922,98 @@ function anyTaskNotificationText(ev: TranscriptEvent): string | undefined {
   return deliveredTaskNotificationText(ev);
 }
 
+/** Whitelist of `<status>` values that prove a background task has ended. */
+const TERMINAL_TASK_NOTIFICATION_STATUSES = new Set([
+  'completed',
+  'failed',
+  'killed',
+  'stopped',
+  'cancelled',
+  'error',
+]);
+
+/** Recognises Claude Code's Monitor timeout/expiry markers (e.g.
+ *  `[Monitor expired after 30m]` as a standalone result/summary/body tag, or
+ *  `<summary>Monitor "watch CI" expired</summary>`) without matching ordinary
+ *  log lines that merely quote `[Monitor expired]` or mention "expired". */
+const MONITOR_EXPIRY_BRACKET_LINE_RE = /^\[\s*Monitor\s+(?:expired|timed\s+out|timeout)(?:\s+[^\]]*)?\]$/i;
+const MONITOR_EXPIRY_SUMMARY_RE = /^Monitor(?:\s+(?:"[^"]*"|'[^']*'))?(?:\s*:)?\s+(?:has\s+)?(?:expired|timed\s+out)\b/i;
+
+export function isTerminalTaskNotificationStatus(status: string | undefined): boolean {
+  return status !== undefined && TERMINAL_TASK_NOTIFICATION_STATUSES.has(status.trim().toLowerCase());
+}
+
+/** Split a `<task-notification>` payload into outer envelope metadata and inner
+ *  `<result>` body by matching from the FIRST `<result>` to the LAST `</result>`
+ *  (or EOF if unclosed). Prevents monitored stdout containing literal `</result>`
+ *  followed by `<status>` or `<task-id>` XML from breaking out into metadata. */
+export function extractTaskNotificationParts(text: string): { metaText: string; resultText: string } {
+  const openTag = '<result>';
+  const closeTag = '</result>';
+  const openIdx = text.indexOf(openTag);
+  if (openIdx === -1) return { metaText: text, resultText: '' };
+  const closeIdx = text.lastIndexOf(closeTag);
+  if (closeIdx < openIdx) {
+    return {
+      metaText: text.slice(0, openIdx),
+      resultText: text.slice(openIdx + openTag.length).trim(),
+    };
+  }
+  return {
+    metaText: text.slice(0, openIdx) + text.slice(closeIdx + closeTag.length),
+    resultText: text.slice(openIdx + openTag.length, closeIdx).trim(),
+  };
+}
+
+export function isMonitorExpiryNotificationParts(parts: { metaText: string; resultText: string }): boolean {
+  if (parts.resultText && MONITOR_EXPIRY_BRACKET_LINE_RE.test(parts.resultText)) return true;
+  const summary = /<summary>([\s\S]*?)<\/summary>/i.exec(parts.metaText)?.[1]?.trim();
+  if (summary && (MONITOR_EXPIRY_SUMMARY_RE.test(summary) || MONITOR_EXPIRY_BRACKET_LINE_RE.test(summary))) {
+    return true;
+  }
+  const bareBody = parts.metaText
+    .replace(/<\/?task-notification>/gi, '')
+    .replace(/<([a-z0-9_-]+)>[\s\S]*?<\/\1>/gi, '');
+  for (const line of bareBody.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed && MONITOR_EXPIRY_BRACKET_LINE_RE.test(trimmed)) return true;
+  }
+  return false;
+}
+
+export interface ParsedTaskNotification {
+  taskId: string;
+  toolUseId?: string;
+  /** Raw trimmed `<status>` tag when present and non-empty; omitted (never
+   *  fabricated as `'completed'`) when `<status>` is absent or blank. */
+  status?: string;
+  /** True iff `<status>` matches the terminal whitelist
+   *  (`completed | failed | killed | stopped | cancelled | error`). */
+  hasTerminalStatus: boolean;
+  /** True when the notification reports Monitor timeout/expiry
+   *  (e.g. `[Monitor expired...]`), even without a `<status>` tag. */
+  isMonitorExpiry: boolean;
+}
+
 /** A delivered `<task-notification>` (see {@link deliveredTaskNotificationText}).
- *  `status` is the task's terminal state; the same task-id may notify more
- *  than once (a resumed agent stops again), so a completed/failed notice only
- *  ever RETIRES a tracked id, it never adds one. */
-export function parseTaskNotification(ev: TranscriptEvent):
-  { taskId: string; toolUseId?: string; status: string } | undefined {
+ *  Status-less Monitor per-event notifications yield `status: undefined`,
+ *  `hasTerminalStatus: false`, keeping them distinct from terminal notices. */
+export function parseTaskNotification(ev: TranscriptEvent): ParsedTaskNotification | undefined {
   if (!ev) return undefined;
   const text = deliveredTaskNotificationText(ev);
   if (text === undefined) return undefined;
-  const taskId = /<task-id>([^<]+)<\/task-id>/.exec(text)?.[1]?.trim();
+  const parts = extractTaskNotificationParts(text);
+  const taskId = /<task-id>([^<]+)<\/task-id>/.exec(parts.metaText)?.[1]?.trim();
   if (!taskId) return undefined;
-  const toolUseId = /<tool-use-id>([^<]+)<\/tool-use-id>/.exec(text)?.[1]?.trim();
-  const status = /<status>([^<]+)<\/status>/.exec(text)?.[1]?.trim() ?? 'completed';
-  return { taskId, ...(toolUseId ? { toolUseId } : {}), status };
+  const toolUseId = /<tool-use-id>([^<]+)<\/tool-use-id>/.exec(parts.metaText)?.[1]?.trim();
+  const status = /<status>([^<]*)<\/status>/.exec(parts.metaText)?.[1]?.trim() || undefined;
+  return {
+    taskId,
+    ...(toolUseId ? { toolUseId } : {}),
+    ...(status !== undefined ? { status } : {}),
+    hasTerminalStatus: isTerminalTaskNotificationStatus(status),
+    isMonitorExpiry: isMonitorExpiryNotificationParts(parts),
+  };
 }
 
 export type BackgroundTaskKind = 'agent' | 'shell' | 'monitor';
@@ -885,6 +1023,9 @@ export interface BackgroundTaskLaunch {
   kind: BackgroundTaskKind;
   /** Hard end Claude Code itself enforces (non-persistent Monitor timeout). */
   expiresAtMs?: number;
+  /** For Monitor launches, whether the Monitor is persistent (`true`) or
+   *  bounded by `timeoutMs` (`false`). Persistent Monitors must never be muted. */
+  persistent?: boolean;
   /** A stopped agent started again (SendMessage), under its original id. */
   resumed?: true;
 }
@@ -898,6 +1039,8 @@ export function eventTimeMs(ev: TranscriptEvent): number | undefined {
  *  Code's structured `toolUseResult` (the launch-ack text is for the model and
  *  is not parsed here):
  *  - Agent `run_in_background` → `{ isAsync:true, status:'async_launched', agentId }`;
+ *  - Workflow → `{ status:'async_launched', taskType:'local_workflow', taskId }`,
+ *    tracked like an agent: it wakes the model when it finishes;
  *  - Bash `run_in_background` (or a command the user backgrounded) →
  *    `{ backgroundTaskId }`;
  *  - Monitor → `{ taskId, timeoutMs, persistent }`. A non-persistent Monitor
@@ -910,13 +1053,15 @@ export function eventTimeMs(ev: TranscriptEvent): number | undefined {
  *    running (`Message queued for delivery …`) changes nothing.
  *  The id is the one the task's `<task-notification>` later reports as `<task-id>`. */
 export function backgroundTaskLaunches(ev: TranscriptEvent): BackgroundTaskLaunch[] {
-  if (!ev || ev.isSidechain === true) return [];
-  const role = ev.message?.role ?? ev.type;
-  if (role !== 'user') return [];
+  if (!ev || isClaudeApiRequestBlob(ev) || ev.isSidechain === true) return [];
+  if (!hasTranscriptRole(ev, 'user')) return [];
   const r = ev.toolUseResult as Record<string, unknown> | undefined;
   if (!r || typeof r !== 'object' || Array.isArray(r)) return [];
   if ((r.isAsync === true || r.status === 'async_launched') && typeof r.agentId === 'string' && r.agentId) {
     return [{ taskId: r.agentId, kind: 'agent' }];
+  }
+  if (r.status === 'async_launched' && r.taskType === 'local_workflow' && typeof r.taskId === 'string' && r.taskId) {
+    return [{ taskId: r.taskId, kind: 'agent' }];
   }
   if (typeof r.backgroundTaskId === 'string' && r.backgroundTaskId) {
     return [{ taskId: r.backgroundTaskId, kind: 'shell' }];
@@ -924,7 +1069,12 @@ export function backgroundTaskLaunches(ev: TranscriptEvent): BackgroundTaskLaunc
   if (typeof r.taskId === 'string' && r.taskId && typeof r.timeoutMs === 'number' && typeof r.persistent === 'boolean') {
     const at = eventTimeMs(ev);
     const expiresAtMs = !r.persistent && r.timeoutMs > 0 && at !== undefined ? at + r.timeoutMs : undefined;
-    return [{ taskId: r.taskId, kind: 'monitor', ...(expiresAtMs !== undefined ? { expiresAtMs } : {}) }];
+    return [{
+      taskId: r.taskId,
+      kind: 'monitor',
+      persistent: r.persistent,
+      ...(expiresAtMs !== undefined ? { expiresAtMs } : {}),
+    }];
   }
   const resumedAgentId = typeof r.resumedAgentId === 'string' && r.resumedAgentId ? r.resumedAgentId
     : typeof r.revivedAgentId === 'string' && r.revivedAgentId ? r.revivedAgentId : undefined;
@@ -935,22 +1085,25 @@ export function backgroundTaskLaunches(ev: TranscriptEvent): BackgroundTaskLaunc
 }
 
 /** Background task ids an event proves have stopped:
- *  - a `<task-notification>` that carries a `<status>` (completed / failed /
- *    killed / stopped), in any of its three shapes. A resume-time orphan
- *    summary lists several `<task-id>` tags, so every one is taken. A Monitor's
- *    per-event notice has no `<status>` and the Monitor keeps running;
+ *  - a `<task-notification>` carrying a whitelisted terminal `<status>`
+ *    (completed / failed / killed / stopped / cancelled / error) OR a Monitor
+ *    expiry marker (`[Monitor expired...]`), in any of its three shapes. A
+ *    resume-time orphan summary lists several `<task-id>` tags, so every one is
+ *    taken. A Monitor's per-event notice has no terminal `<status>` and the
+ *    Monitor keeps running;
  *  - a successful TaskStop result (`toolUseResult.task_id` + `task_type`).
  *    Stopping a shell this way usually writes no notification at all. */
 export function backgroundTaskSettledIds(ev: TranscriptEvent): string[] {
-  if (!ev || ev.isSidechain === true) return [];
+  if (!ev || isClaudeApiRequestBlob(ev) || ev.isSidechain === true) return [];
   const text = anyTaskNotificationText(ev);
   if (text !== undefined) {
-    if (!/<status>[^<]+<\/status>/.test(text)) return [];
-    return [...text.matchAll(/<task-id>([^<]+)<\/task-id>/g)].map(m => m[1].trim()).filter(Boolean);
+    const parts = extractTaskNotificationParts(text);
+    const status = /<status>([^<]*)<\/status>/.exec(parts.metaText)?.[1]?.trim() || undefined;
+    if (!isTerminalTaskNotificationStatus(status) && !isMonitorExpiryNotificationParts(parts)) return [];
+    return [...parts.metaText.matchAll(/<task-id>([^<]+)<\/task-id>/g)].map(m => m[1].trim()).filter(Boolean);
   }
-  const role = ev.message?.role ?? ev.type;
   const r = ev.toolUseResult as Record<string, unknown> | undefined;
-  if (role === 'user' && r && typeof r === 'object' && !Array.isArray(r)
+  if (hasTranscriptRole(ev, 'user') && r && typeof r === 'object' && !Array.isArray(r)
     && typeof r.task_id === 'string' && r.task_id && typeof r.task_type === 'string') {
     return [r.task_id];
   }
@@ -996,11 +1149,18 @@ export function backgroundTaskStopsInSiblingTranscripts(
   return ids;
 }
 
+/** Claude Code >= 2.1.31x logs copied request messages as `type:"api-request-blob"`
+ *  with no `uuid` or `timestamp`, carrying `message.role: "user" | "assistant"`.
+ *  These are wire-level debug blobs, never conversation turn events. */
+export function isClaudeApiRequestBlob(ev: TranscriptEvent | null | undefined): boolean {
+  return !!ev && typeof ev === 'object' && ev.type === 'api-request-blob';
+}
+
 /** True when the main agent is (re)starting work: a real prompt (typed, or
  *  dequeued type-ahead), a scheduler fire, a delivered task notification, or a
  *  `queue-operation dequeue` (Claude Code took a queued item to run). */
 export function isClaudeMainTurnStart(ev: TranscriptEvent | null | undefined): boolean {
-  if (!ev || typeof ev !== 'object' || ev.isSidechain === true) return false;
+  if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev) || ev.isSidechain === true) return false;
   if (ev.type === 'queue-operation') return ev.operation === 'dequeue';
   return isMeaningfulUserEvent(ev)
     || isMeaningfulQueuedCommand(ev)
@@ -1008,9 +1168,17 @@ export function isClaudeMainTurnStart(ev: TranscriptEvent | null | undefined): b
     || deliveredTaskNotificationText(ev) !== undefined;
 }
 
-interface TrackedBackgroundTask {
+export interface BackgroundTaskInfo {
   kind: BackgroundTaskKind;
+  persistent?: boolean;
   expiresAtMs?: number;
+}
+
+export interface LiveBackgroundTaskSnapshot extends BackgroundTaskInfo {
+  taskId: string;
+}
+
+interface TrackedBackgroundTask extends BackgroundTaskInfo {
   /** Value of `promptSeq` when launched — see {@link BackgroundTaskTracker.pendingTurnAgents}. */
   promptSeq: number;
   /** When this run started (its launch or resume was written). A stop written
@@ -1057,17 +1225,26 @@ export class BackgroundTaskTracker {
   private mainTurnOpen = false;
 
   observe(ev: TranscriptEvent): void {
-    if (!ev || ev.isSidechain === true) return;
+    if (!ev || isClaudeApiRequestBlob(ev) || ev.isSidechain === true) return;
+    if (isClaudeUserInterruptEvent(ev)) {
+      this.mainTurnOpen = false;
+      return;
+    }
     if (isClaudeMainTurnStart(ev)) this.mainTurnOpen = true;
     else if (isClaudeTurnTerminalEvent(ev)) this.mainTurnOpen = false;
-    else if ((ev.message?.role ?? ev.type) === 'assistant') this.mainTurnOpen = true;
+    else if (hasTranscriptRole(ev, 'assistant')) this.mainTurnOpen = true;
     if (isMeaningfulUserEvent(ev) || isMeaningfulQueuedCommand(ev)) {
       this.promptSeq++;
       return;
     }
     const atMs = eventTimeMs(ev);
     for (const launch of backgroundTaskLaunches(ev)) {
-      this.launch(launch.taskId, launch.kind, { atMs, expiresAtMs: launch.expiresAtMs, resumed: launch.resumed });
+      this.launch(launch.taskId, launch.kind, {
+        atMs,
+        expiresAtMs: launch.expiresAtMs,
+        persistent: launch.persistent,
+        resumed: launch.resumed,
+      });
     }
     // Builds that predate the structured `toolUseResult` are still recognised
     // from the dispatch tool_use + launch-ack text pair.
@@ -1087,7 +1264,7 @@ export class BackgroundTaskTracker {
    *  than the current CLI process (see {@link reset}) is ignored. A `resumed`
    *  agent runs again after it stopped: it revives a settled id, but only when
    *  written after that stop (a re-drained resume is older than the next stop). */
-  launch(taskId: string, kind: BackgroundTaskKind, opts: { atMs?: number; expiresAtMs?: number; resumed?: boolean } = {}): void {
+  launch(taskId: string, kind: BackgroundTaskKind, opts: { atMs?: number; expiresAtMs?: number; persistent?: boolean; resumed?: boolean } = {}): void {
     if (opts.atMs !== undefined && opts.atMs < this.liveSinceMs) return;
     const running = this.live.get(taskId);
     if (running) {
@@ -1105,6 +1282,7 @@ export class BackgroundTaskTracker {
     this.live.set(taskId, {
       kind,
       promptSeq: this.promptSeq,
+      ...(opts.persistent !== undefined ? { persistent: opts.persistent } : {}),
       ...(opts.expiresAtMs !== undefined ? { expiresAtMs: opts.expiresAtMs } : {}),
       ...(opts.atMs !== undefined ? { sinceMs: opts.atMs } : {}),
     });
@@ -1134,6 +1312,41 @@ export class BackgroundTaskTracker {
       if (task.expiresAtMs === undefined || task.expiresAtMs > nowMs) ids.push(taskId);
     }
     return ids;
+  }
+
+  /** True when at least one non-persistent (`persistent === false`) Monitor is
+   *  still live at `nowMs`. Used to keep the launching turn's held CoT bubble
+   *  open while a suppressed Monitor micro-turn temporarily sets `mainTurnOpen`. */
+  hasPendingNonPersistentMonitor(nowMs = Date.now()): boolean {
+    for (const task of this.live.values()) {
+      if (task.kind === 'monitor' && task.persistent === false
+        && (task.expiresAtMs === undefined || task.expiresAtMs > nowMs)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** Snapshot of all background tasks still live at `nowMs`, for seeding
+   *  `BridgeTurnQueue` after a worker re-attach scan. */
+  liveTasksSnapshot(nowMs = Date.now()): LiveBackgroundTaskSnapshot[] {
+    const out: LiveBackgroundTaskSnapshot[] = [];
+    for (const [taskId, task] of this.live) {
+      if (task.expiresAtMs === undefined || task.expiresAtMs > nowMs) {
+        out.push({
+          taskId,
+          kind: task.kind,
+          ...(task.persistent !== undefined ? { persistent: task.persistent } : {}),
+          ...(task.expiresAtMs !== undefined ? { expiresAtMs: task.expiresAtMs } : {}),
+        });
+      }
+    }
+    return out;
+  }
+
+  /** The CLI lifetime floor last passed to {@link reset}. */
+  liveSinceMsValue(): number {
+    return this.liveSinceMs;
   }
 
   /** Mark the main turn open or ended from a source other than a Claude
@@ -1237,7 +1450,7 @@ export class ClaudeModelRequestClock {
   }
 
   observe(ev: TranscriptEvent): void {
-    if (!ev || typeof ev !== 'object' || ev.isSidechain === true) return;
+    if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev) || ev.isSidechain === true) return;
     if (ev.type !== 'queue-operation' && isClaudeMainTurnStart(ev)) {
       const upkeep = isIdleUpkeepTurnStart(ev);
       // Upkeep folded into a running turn does not take that turn over.
@@ -1266,7 +1479,7 @@ export class ClaudeModelRequestClock {
         this.activityAtMs = served.completedAt;
       }
     }
-    if (isClaudeTurnTerminalEvent(ev)) {
+    if (isClaudeTurnTerminalEvent(ev) || isClaudeUserInterruptEvent(ev)) {
       // Whatever the next turn is, nothing here says it is upkeep: a slash
       // command typed in the terminal writes no record that starts a turn.
       this.turnOpen = false;
@@ -1277,7 +1490,7 @@ export class ClaudeModelRequestClock {
   /** Start and completion of a main-thread assistant record that proves a
    *  served request; undefined for any other record. */
   private servedRequest(ev: TranscriptEvent): { startedAt: number; completedAt: number } | undefined {
-    if (ev.type !== 'assistant' || ev.isApiErrorMessage === true || isSyntheticNoModelReplyEvent(ev)) return undefined;
+    if (ev.type !== 'assistant' || ev.isApiErrorMessage === true || isSyntheticAssistantRecord(ev)) return undefined;
     const usage = ev.message?.usage;
     const tokens = (usage?.input_tokens ?? 0) + (usage?.cache_read_input_tokens ?? 0) + (usage?.cache_creation_input_tokens ?? 0);
     if (!(tokens > 0)) return undefined;
@@ -1395,14 +1608,13 @@ export function drainTranscript(
  */
 export function pickAssistantTextEvents(events: TranscriptEvent[]): TranscriptEvent[] {
   return events.filter(e => {
-    if (!e || typeof e !== 'object') return false;
+    if (!e || typeof e !== 'object' || isClaudeApiRequestBlob(e)) return false;
     if ((e as any).isSidechain === true) return false;
     // API-error lines are execution metadata rather than assistant answers.
     // The bridge emits a structured terminal outcome (or the existing limited
     // state) and daemon-owned recovery/attention provides user visibility.
     if (e.isApiErrorMessage === true || isTranscriptRateLimitEvent(e)) return false;
-    const role = e.message?.role ?? e.type;
-    if (role !== 'assistant') return false;
+    if (!hasTranscriptRole(e, 'assistant')) return false;
     if (!e.uuid) return false;
     const content = e.message?.content;
     if (!content) return false;
@@ -1573,10 +1785,9 @@ export function trailingAssistantText(
   // closed mid-tooling — there is no final answer to fall back with.
   for (let i = end + 1; i < events.length; i++) {
     const ev = events[i];
-    if (!ev || typeof ev !== 'object') continue;
-    const role = ev.message?.role ?? ev.type;
-    if (role === 'assistant' && hasToolUseBlock(ev)) return '';
-    if (role === 'user' && isMeaningfulUserEvent(ev)) break;
+    if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev)) continue;
+    if (hasTranscriptRole(ev, 'assistant') && hasToolUseBlock(ev)) return '';
+    if (hasTranscriptRole(ev, 'user') && (isMeaningfulUserEvent(ev) || isClaudeUserInterruptEvent(ev))) break;
   }
   const { run, boundary } = collectTrailingTextRun(events, end, uuids);
   const trailing = joinAssistantText(run);
@@ -1626,17 +1837,16 @@ export class AbsorbedReplyCollector {
    *  in — and keeps returning true; records fed after that are ignored. */
   feed(ev: TranscriptEvent): boolean {
     if (this.complete) return true;
-    if (!ev || typeof ev !== 'object' || (ev as any).isSidechain === true) return false;
+    if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev) || (ev as any).isSidechain === true) return false;
     // Claude Code ≥ 2.1.31x writes an `api-request-blob` (a copy of the
     // request's user content: role "user", no uuid) between a folded input and
     // the model's answer to it. Read only uuid records, as the bridge queue
     // does, or that copy passes for the next user prompt.
     if (!ev.uuid) return false;
-    if (isClaudeTurnDurationEvent(ev) || isMeaningfulUserEvent(ev) || isMidTurnAbsorbedQueuedCommand(ev)) {
+    if (isClaudeTurnDurationEvent(ev) || isMeaningfulUserEvent(ev) || isClaudeUserInterruptEvent(ev) || isMidTurnAbsorbedQueuedCommand(ev)) {
       return (this.complete = true);
     }
-    const role = ev.message?.role ?? ev.type;
-    if (role !== 'assistant' || !ev.uuid) return false;
+    if (!hasTranscriptRole(ev, 'assistant') || !ev.uuid) return false;
     if (ev.isApiErrorMessage === true || isSyntheticNoModelReplyEvent(ev)) return false;
     const content = ev.message?.content;
     if (!Array.isArray(content)) return false;
@@ -1664,6 +1874,7 @@ export class AbsorbedReplyCollector {
     return {
       text: picked.map(part => part.text).join('\n\n'),
       lastUuid: picked[picked.length - 1].uuid,
+      uuids: [...new Set(picked.map(part => part.uuid))],
       source: texts.length > 0 ? 'text' : 'thinking',
     };
   }
@@ -1671,12 +1882,19 @@ export class AbsorbedReplyCollector {
 
 /** The reply to a folded input. `source: 'thinking'` means the model said it
  *  only in a thinking summary — possibly a plan rather than an answer, and
- *  content a bot with its thinking display off does not show. */
+ *  content a bot with its thinking display off does not show. `uuids` are
+ *  the records it was read from, in transcript order. */
 export interface AbsorbedInputReply {
   text: string;
   lastUuid: string;
+  uuids: string[];
   source: 'text' | 'thinking';
 }
+
+/** Longest folded-turn reply the daemon posts whole; a longer one is cut in
+ *  its card. The worker leaves only a reply posted whole out of the host
+ *  turn's final. */
+export const ABSORBED_REPLY_MAX_CHARS = 6_000;
 
 /** {@link AbsorbedReplyCollector} over a whole transcript: the reply to the
  *  input folded in at the record `absorbedAtUuid`, read up to the end of the
@@ -1704,9 +1922,8 @@ function collectTrailingTextRun(
   const run: TranscriptEvent[] = [];
   for (let i = end; i >= 0; i--) {
     const ev = events[i];
-    if (!ev || typeof ev !== 'object') continue;
-    const role = ev.message?.role ?? ev.type;
-    if (role === 'assistant') {
+    if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev)) continue;
+    if (hasTranscriptRole(ev, 'assistant')) {
       if (hasToolUseBlock(ev)) return { run, boundary: i };
       if (ev.uuid && uuids.has(ev.uuid)) { run.unshift(ev); continue; }
       // Thinking-only / non-turn assistant lines: cross unless they belong to
@@ -1714,7 +1931,7 @@ function collectTrailingTextRun(
       if (pickAssistantTextEvents([ev]).length > 0) return { run, boundary: i };
       continue;
     }
-    if (role === 'user') return { run, boundary: i };
+    if (hasTranscriptRole(ev, 'user')) return { run, boundary: i };
     // system / attachment / meta lines (last-prompt, ai-title, …): cross.
   }
   return { run, boundary: -1 };
@@ -1735,10 +1952,9 @@ function textBeforeHousekeeping(
   let i = boundary;
   for (; i >= 0; i--) {
     const ev = events[i];
-    if (!ev || typeof ev !== 'object') continue;
-    const role = ev.message?.role ?? ev.type;
+    if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev)) continue;
     const content = Array.isArray(ev.message?.content) ? ev.message.content as any[] : [];
-    if (role === 'assistant') {
+    if (hasTranscriptRole(ev, 'assistant')) {
       const hasText = pickAssistantTextEvents([ev]).length > 0;
       const uses = content.filter(b => b?.type === 'tool_use');
       if (uses.length === 0) {
@@ -1749,7 +1965,7 @@ function textBeforeHousekeeping(
       for (const use of uses) if (typeof use.id === 'string') toolUseIds.add(use.id);
       continue;
     }
-    if (role === 'user') {
+    if (hasTranscriptRole(ev, 'user')) {
       if (!isPureToolResultUserEvent(ev.message?.content)) return '';
       for (const block of content) toolResultIds.push(block.tool_use_id);
       continue;
@@ -1808,22 +2024,114 @@ const SYNTHETIC_USER_PREFIXES = [
   '<task-notification>',
 ];
 
+const CLAUDE_USER_INTERRUPT_TEXT_RE = /^\[Request interrupted by user(?: for tool use)?\]$/;
+
+/** True when a main-thread `role:'user'` record is Claude Code's synthetic
+ *  user-interrupt marker (Esc / Ctrl-C): either stamped with
+ *  `interruptedMessageId` or matching the exact standalone bracketed marker
+ *  `[Request interrupted by user]` / `[Request interrupted by user for tool use]`.
+ *  Human prose merely quoting that string will not match the anchored pattern. */
+export function isClaudeUserInterruptEvent(ev: TranscriptEvent | null | undefined): boolean {
+  if (!hasTranscriptRole(ev, 'user')) return false;
+  if ((ev as any).isSidechain === true) return false;
+  if (typeof ev!.interruptedMessageId === 'string' && ev!.interruptedMessageId.length > 0) return true;
+  if ((ev as any).isMeta === true || (ev as any).isCompactSummary === true) return false;
+  const content = ev!.message?.content;
+  if (isPureToolResultUserEvent(content)) return false;
+  const trimmed = stringifyUserContent(content).trim();
+  if (CLAUDE_USER_INTERRUPT_TEXT_RE.test(trimmed)) return true;
+  // Combined `[tool_result, text: "[Request interrupted by user for tool use]"]`:
+  // Claude Code can pair a tool_result with the standalone interrupt notice in
+  // one user record. Require at least one text block and EVERY non-tool_result
+  // block to be a text block matching the exact anchored interrupt marker.
+  if (Array.isArray(content) && content.length > 0) {
+    let sawInterruptText = false;
+    for (const block of content as any[]) {
+      if (!block || typeof block !== 'object') return false;
+      if (block.type === 'tool_result') continue;
+      if (block.type !== 'text' || typeof block.text !== 'string') return false;
+      if (!CLAUDE_USER_INTERRUPT_TEXT_RE.test(block.text.trim())) return false;
+      sawInterruptText = true;
+    }
+    return sawInterruptText;
+  }
+  return false;
+}
+
+/** True when a user-role event carries a Claude synthetic/command prefix
+ *  (`<command-name>`, `<local-command-*>`, `<task-notification>`, …). */
+export function isSyntheticUserPrefixEvent(ev: TranscriptEvent | null | undefined): boolean {
+  if (!hasTranscriptRole(ev, 'user')) return false;
+  const text = normaliseForFingerprint(stringifyUserContent(ev!.message?.content));
+  return text.length > 0 && SYNTHETIC_USER_PREFIXES.some(p => text.startsWith(p));
+}
+
+/** Tool-use block ids requested by a non-sidechain, non-API-error assistant record.
+ *  Includes `<synthetic>` local tool calls (which keep the logical turn open). */
+export function assistantToolUseIds(ev: TranscriptEvent | null | undefined): string[] {
+  if (!hasTranscriptRole(ev, 'assistant') || (ev as any).isSidechain === true) return [];
+  if (ev!.isApiErrorMessage === true) return [];
+  const content = ev!.message?.content;
+  if (!Array.isArray(content)) return [];
+  const ids: string[] = [];
+  for (const block of content as any[]) {
+    if (block && block.type === 'tool_use' && typeof block.id === 'string' && block.id.length > 0) {
+      ids.push(block.id);
+    }
+  }
+  return ids;
+}
+
+/** Tool-result `tool_use_id` values returned in a non-sidechain `role:'user'` record. */
+export function userToolResultIds(ev: TranscriptEvent | null | undefined): string[] {
+  if (!hasTranscriptRole(ev, 'user') || (ev as any).isSidechain === true) return [];
+  const content = ev!.message?.content;
+  if (!Array.isArray(content)) return [];
+  const ids: string[] = [];
+  for (const block of content as any[]) {
+    if (block && block.type === 'tool_result' && typeof block.tool_use_id === 'string' && block.tool_use_id.length > 0) {
+      ids.push(block.tool_use_id);
+    }
+  }
+  return ids;
+}
+
+/** True when a record is Claude Code's main-thread outgoing API request marker
+ *  (`type:"api-request"`, `querySource:"repl_main_thread"`). Note: has no `uuid`. */
+export function isMainThreadApiRequestEvent(ev: TranscriptEvent | null | undefined): boolean {
+  return !!ev && typeof ev === 'object'
+    && ev.type === 'api-request'
+    && ev.querySource === MAIN_THREAD_QUERY_SOURCE;
+}
+
+/** True when a non-sidechain `type:"attachment"` record is intra-turn machinery
+ *  (e.g. inactivity reminders, `hook_additional_context`, `edited_text_file`,
+ *  mid-turn absorbed `queued_command`, or absorbed `task-notification`) rather
+ *  than a standalone new-turn `queued_command`. */
+export function isIntraTurnAttachmentEvent(ev: TranscriptEvent | null | undefined): boolean {
+  if (!ev || typeof ev !== 'object' || (ev as any).isSidechain === true) return false;
+  if (ev.type !== 'attachment') return false;
+  if (ev.attachment?.type === 'queued_command' && !isMidTurnAbsorbedQueuedCommand(ev) && isMeaningfulQueuedCommand(ev)) {
+    return false;
+  }
+  return true;
+}
+
 /** True when a `type:'user'` (or `message.role:'user'`) event represents a
  *  *real* prompt the human typed — not Claude Code's internal machinery
  *  (tool_result, slash-command wrappers, isMeta/isCompactSummary markers,
- *  sidechain spawn events). The bridge attribution queue and the adopt
- *  preamble extractor share this predicate to ensure they're seeing the
- *  same notion of "user input". */
+ *  sidechain spawn events, user-interrupt markers). The bridge attribution queue
+ *  and the adopt preamble extractor share this predicate to ensure they're seeing
+ *  the same notion of "user input". */
 export function isMeaningfulUserEvent(ev: TranscriptEvent | null | undefined): boolean {
-  if (!ev || typeof ev !== 'object') return false;
-  const role = ev.message?.role ?? ev.type;
-  if (role !== 'user') return false;
+  if (!hasTranscriptRole(ev, 'user')) return false;
   const flags = ev as any;
   if (flags.isMeta === true) return false;
   if (flags.isCompactSummary === true) return false;
   if (flags.isSidechain === true) return false;
-  const content = ev.message?.content;
+  const content = ev!.message?.content;
   if (isPureToolResultUserEvent(content)) return false;
+  if (isClaudeUserInterruptEvent(ev)) return false;
   const text = normaliseForFingerprint(stringifyUserContent(content));
   if (text.length === 0) return false;
   if (SYNTHETIC_USER_PREFIXES.some(p => text.startsWith(p))) return false;
@@ -1840,9 +2148,8 @@ export const CLAUDE_CRON_CREATE_TOOL = 'CronCreate';
  *  the caller pairs this with {@link cronCreateAcks} — same dispatch/ack split
  *  as background Task dispatches. */
 export function cronCreateToolUseIds(ev: TranscriptEvent | null | undefined): string[] {
-  if (!ev || (ev as any).isSidechain === true) return [];
-  const role = ev.message?.role ?? ev.type;
-  if (role !== 'assistant') return [];
+  if (!ev || isClaudeApiRequestBlob(ev) || (ev as any).isSidechain === true) return [];
+  if (!hasTranscriptRole(ev, 'assistant')) return [];
   const content = ev.message?.content;
   if (!Array.isArray(content)) return [];
   const ids: string[] = [];
@@ -1870,9 +2177,8 @@ const CRON_CREATE_ACK_TASK_ID_RE =
 
 export function cronCreateAcks(ev: TranscriptEvent | null | undefined):
   Array<{ toolUseId: string; taskId: string }> {
-  if (!ev || (ev as any).isSidechain === true) return [];
-  const role = ev.message?.role ?? ev.type;
-  if (role !== 'user') return [];
+  if (!ev || isClaudeApiRequestBlob(ev) || (ev as any).isSidechain === true) return [];
+  if (!hasTranscriptRole(ev, 'user')) return [];
   const content = ev.message?.content;
   if (!Array.isArray(content)) return [];
   const acks: Array<{ toolUseId: string; taskId: string }> = [];
@@ -1910,25 +2216,23 @@ export function cronCreateAcks(ev: TranscriptEvent | null | undefined):
  *  (`botmux schedule add`), whose turns carry daemon-assigned
  *  `schedule:<taskId>:<uuid>` ids and never touch this path. */
 export function isScheduledTurnStartEvent(ev: TranscriptEvent | null | undefined): boolean {
-  if (!ev || typeof ev !== 'object') return false;
-  const role = ev.message?.role ?? ev.type;
-  if (role !== 'user') return false;
+  if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev) || !hasTranscriptRole(ev, 'user')) return false;
   // Hard guard: only internal meta records. Must stay ahead of the
   // promptSource fallback below.
-  if (ev.isMeta !== true) return false;
-  if (ev.turnOrigin !== undefined) {
+  if (ev!.isMeta !== true) return false;
+  if (ev!.turnOrigin !== undefined) {
     // Newer builds stamp the discriminator explicitly.
-    if (ev.turnOrigin !== 'scheduled') return false;
+    if (ev!.turnOrigin !== 'scheduled') return false;
   } else {
     // Older builds (≤2.1.280) omit turnOrigin; recognise the fire via
     // promptSource. isMeta already passed; scheduledFireId still required.
-    if (ev.promptSource !== 'system') return false;
+    if (ev!.promptSource !== 'system') return false;
   }
   // Require the fire identity: every real CronCreate fire carries it, and it
   // rules out isMeta + promptSource:'system' lookalikes (cross-session
   // messages) that happen to lack it.
-  if (typeof ev.scheduledFireId !== 'string' || ev.scheduledFireId.length === 0) return false;
-  if (ev.isSidechain === true || ev.isCompactSummary === true) return false;
+  if (typeof ev!.scheduledFireId !== 'string' || ev!.scheduledFireId.length === 0) return false;
+  if (ev!.isSidechain === true || ev!.isCompactSummary === true) return false;
   return true;
 }
 
@@ -2003,7 +2307,7 @@ function collectAssistantTurns(
   };
 
   for (const ev of events) {
-    if (!ev || typeof ev !== 'object') continue;
+    if (!ev || typeof ev !== 'object' || isClaudeApiRequestBlob(ev)) continue;
     if (isMeaningfulUserEvent(ev)) {
       // New turn boundary — reset the assistant accumulator.
       flush();
@@ -2011,8 +2315,7 @@ function collectAssistantTurns(
       assistantTexts = [];
       continue;
     }
-    const role = ev.message?.role ?? ev.type;
-    if (role !== 'assistant') continue;
+    if (!hasTranscriptRole(ev, 'assistant')) continue;
     if ((ev as any).isSidechain === true) continue;
     const text = extractAssistantText(ev);
     if (text.length === 0) continue;
@@ -2181,6 +2484,10 @@ export interface JsonlFingerprintSearchOptions {
   minEventTimestampMs?: number;
   /** Also match Claude Code type-ahead enqueue events, whose content is not role:user. */
   includeQueueOperations?: boolean;
+  /** Called on each normalized transcript candidate. When supplied, this
+   *  replaces the legacy substring predicate so callers can require stronger
+   *  exact-payload proof without changing other fingerprint consumers. */
+  candidateMatcher?: (candidate: string) => boolean;
   /** Called on each candidate that already passed the fingerprint match.
    *  Returning `false` skips the candidate and continues searching older
    *  files in the directory (mtime-descending walk). Used by the bridge
@@ -2233,7 +2540,11 @@ function eventAtOrAfter(ev: { timestamp?: unknown }, floorMs: number): boolean {
 export function jsonlContainsFingerprint(
   path: string,
   fingerprint: string,
-  opts?: { includeQueueOperations?: boolean; minEventTimestampMs?: number },
+  opts?: {
+    includeQueueOperations?: boolean;
+    minEventTimestampMs?: number;
+    candidateMatcher?: (candidate: string) => boolean;
+  },
 ): boolean {
   if (fingerprint.length === 0 || !existsSync(path)) return false;
   let size: number;
@@ -2288,8 +2599,10 @@ export function jsonlContainsFingerprint(
     } else {
       continue;
     }
-    if (normaliseTranscriptFingerprintCandidates(lineText)
-      .some(candidate => candidate.length > 0 && candidate.includes(fingerprint))) return true;
+    const candidates = normaliseTranscriptFingerprintCandidates(lineText);
+    if (opts?.candidateMatcher
+      ? candidates.some(opts.candidateMatcher)
+      : candidates.some(candidate => candidate.length > 0 && candidate.includes(fingerprint))) return true;
   }
   return false;
 }
@@ -2385,8 +2698,10 @@ function jsonlTailMatchFingerprint(
         } else {
           continue;
         }
-        if (normaliseTranscriptFingerprintCandidates(text)
-          .some(candidate => candidate.length > 0 && candidate.includes(fingerprint))) {
+        const candidates = normaliseTranscriptFingerprintCandidates(text);
+        if (opts.candidateMatcher
+          ? candidates.some(opts.candidateMatcher)
+          : candidates.some(candidate => candidate.length > 0 && candidate.includes(fingerprint))) {
           hit = true;
           break;
         }

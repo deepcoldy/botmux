@@ -156,4 +156,15 @@ describe('worker emitReadyTurns: failed turns', () => {
       undefined, 'API Error: Connection lost mid-response.', undefined, undefined]]);
     expect(h.sent).toEqual([]);
   });
+
+  it('stays silent for a user-interrupted local turn (cancelled is not a provider failure)', () => {
+    expect(localTurnFailureNotice({
+      turnId: 'local-u1',
+      terminalOutcome: { status: 'cancelled', errorCode: 'user_interrupted', retryable: false },
+      terminalOutcomeAtMs: LIVE_AT,
+    }, {
+      liveSinceMs: LIVE_AT - 1_000,
+      zeroPromptTerminalSync: false,
+    })).toBeUndefined();
+  });
 });

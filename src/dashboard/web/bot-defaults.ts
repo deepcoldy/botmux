@@ -7,6 +7,7 @@ import type { CodexReasoningEffort } from '../../services/codex-reasoning-effort
 import type { CodexServiceTier } from '../../services/codex-service-tier.js';
 import type { StreamingCardButtonId } from '../../im/lark/streaming-card-buttons.js';
 import type { TraexAutoModelConfig } from '../../services/traex-auto-model.js';
+import type { TriggerUserAuthCredentialSourceConfig } from '../../services/trigger-user-auth.js';
 import type { ScratchCapability } from '../../adapters/backend/scratch-capability.js';
 
 /** Bot 配置页的分类 tab。放在这个轻量模块里：⌘K 索引（入口包）要按它生成条目，页面本身很重。 */
@@ -80,6 +81,17 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
       'botDefaults.groupWorkingDir', 'botDefaults.autoWorktree', 'botDefaults.autoStartJoin',
       'botDefaults.autoStartJoinSeed', 'botDefaults.autoStartTopic', 'botDefaults.autoInviteOwnerOnGroupAdd',
       'botDefaults.ownerGroupFollow', 'botDefaults.ownerGroupFollowEnabled', 'botDefaults.ownerGroupFollowExcluded',
+      'botDefaults.ownerGroupFollowScope', 'botDefaults.ownerGroupFollowAll', 'botDefaults.ownerGroupFollowFiltered',
+      'botDefaults.ownerGroupFollowPresetDefect', 'botDefaults.ownerGroupFollowPresetAlertDesc',
+      'botDefaults.ownerGroupFollowPresetAlert', 'botDefaults.ownerGroupFollowPresetClosed',
+      'botDefaults.ownerGroupFollowInclude', 'botDefaults.ownerGroupFollowExclude',
+      'botDefaults.ownerGroupFollowAddInclude', 'botDefaults.ownerGroupFollowAddExclude',
+      'botDefaults.ownerGroupFollowField', 'botDefaults.ownerGroupFollowOp', 'botDefaults.ownerGroupFollowPattern',
+      'botDefaults.ownerGroupFollowName', 'botDefaults.ownerGroupFollowDescription', 'botDefaults.ownerGroupFollowAny',
+      'botDefaults.ownerGroupFollowContains', 'botDefaults.ownerGroupFollowStartsWith',
+      'botDefaults.ownerGroupFollowEndsWith', 'botDefaults.ownerGroupFollowRegex',
+      'botDefaults.ownerGroupFollowCase', 'botDefaults.ownerGroupFollowRemoveRule',
+      'botDefaults.ownerGroupFollowTester', 'botDefaults.ownerGroupFollowTestName', 'botDefaults.ownerGroupFollowTestDescription',
       'botDefaults.groupJoinCommand', 'botDefaults.groupJoinCommandField',
       'botDefaults.workingDirField', 'botDefaults.autoStartJoinPrompt',
     ],
@@ -106,7 +118,12 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     id: 'task-routing',
     tab: 'sessions',
     titleKey: 'botDefaults.sectionTaskRouting',
-    fieldKeys: ['botDefaults.taskRoutingEnabled'],
+    fieldKeys: [
+      'botDefaults.taskRoutingEnabled',
+      'botDefaults.taskRoutingCostTier',
+      'botDefaults.taskRoutingStrengths',
+      'botDefaults.taskRoutingLimitations',
+    ],
   },
   {
     id: 'substitute',
@@ -147,8 +164,16 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
   { id: 'network-policy', tab: 'security', titleKey: 'botDefaults.networkPolicy', tile: 'sandbox' },
   { id: 'codex-auth', tab: 'security', titleKey: 'botDefaults.sectionCodexAuth', fieldKeys: ['botDefaults.codexAuthSyncLabel'] },
   { id: 'sandbox-paths', tab: 'security', titleKey: 'botDefaults.sectionSandboxPaths' },
-  { id: 'trigger-user-auth', tab: 'security', titleKey: 'botDefaults.sectionTriggerUserAuth', fieldKeys: ['botDefaults.triggerUserAuthToggle', 'botDefaults.triggerUserAuthDelegateOnMention', 'botDefaults.triggerUserAuthAllowSpeakerSwitch'] },
+  { id: 'trigger-user-auth', tab: 'security', titleKey: 'botDefaults.sectionTriggerUserAuth', fieldKeys: [
+    'botDefaults.triggerUserAuthToggle',
+    'botDefaults.triggerUserAuthSource',
+    'botDefaults.triggerUserAuthSourceDefault',
+    'botDefaults.triggerUserAuthDelegateOnMention',
+    'botDefaults.triggerUserAuthAllowSpeakerSwitch',
+    'botDefaults.triggerUserAuthGitCommitIdentity',
+  ] },
   { id: 'lark-tool-binding', tab: 'security', titleKey: 'botDefaults.sectionLarkToolBinding', fieldKeys: ['botDefaults.larkToolBindingToggle', 'botDefaults.larkUserOwnerFallbackToggle'] },
+  { id: 'approval-compat', tab: 'security', titleKey: 'botDefaults.sectionApprovalCompat', fieldKeys: ['botDefaults.autoAvoidApprovalToggle'] },
   {
     id: 'grant',
     tab: 'security',
@@ -171,9 +196,9 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     tab: 'cards',
     titleKey: 'botDefaults.sectionCard',
     fieldKeys: [
-      'botDefaults.replyCardMode', 'botDefaults.autoStreaming', 'botDefaults.goalStatusCard', 'botDefaults.followUpReply', 'botDefaults.pinStreamingCard',
+      'botDefaults.replyCardMode', 'botDefaults.autoStreaming', 'botDefaults.goalStatusCard', 'botDefaults.followUpReply', 'botDefaults.foldBackgroundUpdates', 'botDefaults.pinStreamingCard',
       'botDefaults.privateCard', 'botDefaults.writableLink', 'botDefaults.footerTiming',
-      'botDefaults.usageDisplay', 'botDefaults.silentTurnReactions', 'botDefaults.replyCardActions', 'botDefaults.replyCardNextStep',
+      'botDefaults.usageDisplay', 'botDefaults.showUsageQuota', 'botDefaults.silentTurnReactions', 'botDefaults.replyCardActions', 'botDefaults.replyCardNextStep',
       'botDefaults.replyCardRecap',
       'botDefaults.cotEnabled', 'botDefaults.replyCardTools', 'botDefaults.replyCardShowTools',
       'botDefaults.replyFooterEnabled', 'botDefaults.replyFooterBrand', 'botDefaults.replyFooterModel',
@@ -201,7 +226,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
   { id: 'ask-option-layout', tab: 'cards', titleKey: 'botDefaults.sectionAskOptionLayout' },
   { id: 'brand', tab: 'cards', titleKey: 'botDefaults.sectionBrand', fieldKeys: ['botDefaults.brandLabel'] },
   { id: 'oncall', tab: 'cards', titleKey: 'botDefaults.sectionOncall' },
-  { id: 'backend', tab: 'advanced', titleKey: 'botDefaults.sectionBackend', fieldKeys: ['botDefaults.backendLabel'] },
+  { id: 'backend', tab: 'advanced', titleKey: 'botDefaults.sectionBackend', fieldKeys: ['botDefaults.backendLabel', 'botDefaults.hcHerdrTabs'] },
   {
     id: 'herdr',
     tab: 'advanced',
@@ -236,6 +261,15 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     fieldKeys: [
       'botDefaults.quotaFallbackEnabled', 'botDefaults.quotaFallbackTarget', 'botDefaults.quotaFallbackMessage',
       'botDefaults.quotaFallbackKindUsage', 'botDefaults.quotaFallbackKindRate',
+    ],
+  },
+  {
+    id: 'quota-fallback-chain',
+    tab: 'advanced',
+    titleKey: 'botDefaults.quotaFallbackChainTitle',
+    tile: 'quota-fallback',
+    fieldKeys: [
+      'botDefaults.quotaFallbackChainEnabled', 'botDefaults.quotaFallbackChainSteps',
     ],
   },
   {
@@ -298,6 +332,8 @@ export type CliOption = {
   available?: boolean;
   availabilityStatus?: import('../../setup/cli-availability.js').CliAvailabilityStatus;
   command?: string;
+  /** Launch commands and short aliases from the CLI registry, used only for search. */
+  searchTerms?: readonly string[];
   availabilityReason?: string;
   cliLaunchMode?: 'forge-traex';
   /** 静态模型候选（后端精选列表；不支持模型的 CLI 为 []）。live 探测结果走 /api/cli-options/models。 */
@@ -309,6 +345,12 @@ export type CliOptionsState = {
   ttadkModelDefault: string;
   ttadkModelSuggestions: string[];
 };
+
+/** Empty alias lists still fall back to the launch command exposed by older servers. */
+export function cliSearchTerms(option: Pick<CliOption, 'command' | 'searchTerms'>): readonly string[] {
+  if (option.searchTerms?.length) return option.searchTerms;
+  return option.command ? [option.command] : [];
+}
 
 export type ModelCapabilities = {
   slug: string;
@@ -447,21 +489,23 @@ export type BotDefaultsRow = {
     capabilities?: Array<'lark-user' | 'bytecloud' | 'meego'>;
     /** The capabilities were derived from a legacy `tools` list, not chosen explicitly. */
     legacyCapabilities?: boolean;
-    /** Where the sender's credentials come from: central platform first
-     *  (`auto`, default), platform only, or this machine only. */
-    credentialSource?: 'auto' | 'platform' | 'local';
+    /** A shared mode or separate modes for Feishu and ByteCloud. */
+    credentialSource?: TriggerUserAuthCredentialSourceConfig;
     /** `--mention` handoffs to bots on this machine carry this turn's sender.
      *  Absent = on (the default); only `false` is stored. */
     delegateOnMention?: boolean;
     /** One command can run as another speaker of a multi-person turn. Absent = off. */
     allowSpeakerSwitch?: boolean;
     gitHost?: string;
+    gitCommitIdentity?: boolean;
     gitTokenExchangeUrl?: string;
   } | null;
   /** lark-cli 应用绑定开关（默认开启）。默认开启以当前 Bot 应用凭证调用并支持 --profile 透传；设为 false 显式关闭。 */
   larkToolBinding?: boolean;
   /** 没有发起人时 lark-cli --as user 用主人的飞书身份（默认开启）；false 回到只认发起人的严格行为。 */
   larkUserOwnerFallback?: boolean;
+  /** 飞书开放平台预判卡审批时草稿态自动二分跳过需审权限（默认开启；设为 false 关闭）。 */
+  autoAvoidApproval?: boolean;
   /** Opt-in policy, configured for future sessions; absence retains legacy behavior. */
   sandboxNetworkPolicy?: import('../../core/sandbox-network-policy.js').SandboxNetworkPolicy | null;
   sandboxNetworkPolicyPlatform?: string | null;
@@ -482,9 +526,11 @@ export type BotDefaultsRow = {
   readIsolation?: boolean;
   readIsolationSupported?: boolean;
   backendType?: string | null;
+  hcHerdrTabs?: boolean;
   /** daemon 的默认后端：`backendType` 没有覆盖时会话实际用它（见 effectiveBackendType）。 */
   defaultBackendType?: string | null;
   usageDisplay?: 'streaming' | 'footer' | 'off';
+  showUsageQuota?: boolean;
   replyFooterEnabled?: boolean;
   replyFooterBrand?: boolean;
   replyFooterModel?: boolean;
@@ -506,6 +552,7 @@ export type BotDefaultsRow = {
   writableTerminalLinkInCard?: boolean;
   goalStatusCard?: boolean;
   followUpReply?: boolean;
+  foldBackgroundUpdates?: boolean;
   privateCard?: boolean;
   replyCardActions?: boolean;
   replyCardNextStep?: boolean;
@@ -530,6 +577,11 @@ export type BotDefaultsRow = {
     targetAppId: string;
     kinds: Array<'usage' | 'rate'>;
     message: string;
+  } | null;
+  quotaFallbackChain?: {
+    enabled: true;
+    kinds: Array<'usage' | 'rate'>;
+    steps: Array<{ cliId: string; model?: string }>;
   } | null;
   online?: boolean;
   startupBlocked?: {
@@ -981,6 +1033,10 @@ export async function fetchCliOptions(): Promise<CliOptionsState> {
       .filter((o: any) => o && typeof o.id === 'string' && typeof o.label === 'string')
       .map((o: any) => ({
         ...o,
+        // 容错：缺失/非数组 → []；空数组由 cliSearchTerms 回退到 command。
+        searchTerms: Array.isArray(o.searchTerms)
+          ? o.searchTerms.filter((term: unknown): term is string => typeof term === 'string')
+          : [],
         // 容错：缺失/非数组 → []，候选合并走 mergeModelCandidates。
         modelChoices: Array.isArray(o.modelChoices)
           ? o.modelChoices.filter((m: unknown): m is string => typeof m === 'string')

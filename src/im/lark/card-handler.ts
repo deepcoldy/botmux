@@ -7,7 +7,8 @@ import { forkManualTurn } from '../../core/manual-turn-dispatch.js';
 import { isCodexReasoningEffort } from '../../services/codex-reasoning-effort.js';
 import { botAcceptsLaunchModel } from '../../core/launch-model-capability.js';
 import { randomUUID } from 'node:crypto';
-import { DEFAULT_MODEL_VALUE_PATTERN, MODEL_SLUG_PATTERN, sessionModelChoices, sessionModelPickerData, buildSessionModelPickerCard, buildDefaultModelPickerCard, defaultModelPickerData, defaultModelSelectionKey } from './session-model-picker.js';
+import { DEFAULT_MODEL_VALUE_PATTERN, MODEL_SLUG_PATTERN, sessionModelChoices, sessionModelPickerData, buildSessionModelPickerCard, buildDefaultModelPickerCard, claudeSettingsPickerVersion, deliverSessionModelPicker, defaultModelPickerData, defaultModelSelectionKey } from './session-model-picker.js';
+import { canSaveClaudeSessionSettings, sessionUsesClaudeCode, supportsClaudeSessionSettings } from '../../core/worker-pool.js';
 /**
  * Lark card action handler — processes button clicks and dropdown selections
  * from Feishu interactive cards.
@@ -33,7 +34,7 @@ import { validateModelPin } from '../../core/model-pin.js';
 import { canOperate, canTalk, canRunDaemonCommand } from './event-dispatcher.js';
 import { isBotAdmin } from './grant-owner.js';
 import { handleTmuxUpgradeCardAction, isTmuxUpgradeAction } from '../../core/tmux-upgrade.js';
-import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, getChatModeStrict, getCachedChatModeStrict, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
+import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, deleteEphemeralCard, getMessageDetail, getChatModeStrict, getCachedChatModeStrict, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
 import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildGrantResultCard, buildGrantRequesterNoticeCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigQuotaCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard, frozenIdleLabel, STREAMING_CARD_PATCH_VERSION } from './card-builder.js';
 import type { GrantCardDelivery } from './card-builder.js';
 import { codexServiceTierBadge } from '../../services/codex-service-tier.js';
@@ -3033,8 +3034,9 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     return await v3Route.run({ value, operatorOpenId, larkAppId, cardMessageId, formValue: action?.form_value, deps });
   }
 
-  // 过 canOperate 门的动作清单与两处例外（拒绝 toast / pendingRepo 发起人放行）
-  // 登记在 card-action-routes.ts 的 SENSITIVE_CARD_ACTIONS；漏登记 = 任何人都能点。
+  // 过 canOperate 门的动作清单与三处例外（拒绝 toast / pendingRepo 发起人放行 /
+  // 话题会话发起人关闭自己的会话）登记在 card-action-routes.ts 的 SENSITIVE_CARD_ACTIONS；
+  // 漏登记 = 任何人都能点。
   const sensitiveMeta = sensitiveCardActionMeta(value?.action);
   if (sensitiveMeta) {
     const rootId = value?.root_id;
@@ -3066,8 +3068,20 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     const pendingRepoOwnerException =
       sensitiveMeta.pendingRepoOwnerException === true && !!ds?.pendingRepo &&
       !!operatorOpenId && operatorOpenId === ds.session.ownerOpenId;
+    // 按话题划分的会话（含私聊）的发起人（含 chat-granted 用户）可以关闭自己发起的会话。
+    // 开启 sessionOwnerReminder 后，botmux 会定期 @ 发起人跟进，却没给 ta 收尾的入口，点
+    // 「关闭会话」被这道门静默丢弃，最后只能找管理员代关。open_id 是 app-scoped：ds 按收到
+    // 回调的 larkAppId 解析，两侧是同一个 bot 视角下的身份，不能拿别的应用下的 open_id 来比。
+    const sessionOwnerException = sensitiveMeta.sessionOwnerException === true
+      && !!ds && !!operatorOpenId
+      && operatorOpenId === ds.session.ownerOpenId
+      && (ds.scope ?? ds.session.scope) === 'thread'
+      && !isSharedAdoptSession(ds);
     if (effectiveAppId) {
-      if (!pendingRepoOwnerException && !canOperate(effectiveAppId, chatId, operatorOpenId)) {
+      if (sessionOwnerException && !canOperate(effectiveAppId, chatId, operatorOpenId)) {
+        logger.info(`Card action "${value?.action}" allowed for session owner without operate permission: ${operatorOpenId} (chat=${chatId})`);
+      }
+      if (!pendingRepoOwnerException && !sessionOwnerException && !canOperate(effectiveAppId, chatId, operatorOpenId)) {
         logger.info(`Card action "${value?.action}" blocked for non-operator user: ${operatorOpenId} (chat=${chatId})`);
         // get_write_link 显式破例：其余敏感动作沿用「静默 block（仅日志）」的既有设计
         // （test/card-handler-repo-select.test.ts 把这点 pin 住了），但「获取操作链接」是
@@ -3744,6 +3758,82 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       };
     }
 
+    if (ds && (actionType === 'session_effort_pick' || actionType === 'session_model_pick'
+      || actionType === 'reply_model_pick' || actionType === 'session_model_unpin')
+      && (value.claude_settings_version !== undefined || sessionUsesClaudeCode(ds))) {
+      const loc = localeForBot(ds.larkAppId);
+      const warning = (key: string) => ({ toast: { type: 'warning', content: t(key, undefined, loc) } });
+      const pickerAction = value.picker_action;
+      const privateRecipient = value.private_recipient;
+      if (!sessionUsesClaudeCode(ds) || !operatorOpenId || (pickerAction !== 'reply_model_pick' && pickerAction !== 'session_model_pick')
+        || (privateRecipient !== undefined && (privateRecipient !== operatorOpenId || ds.scope !== 'chat' || ds.chatType === 'p2p'))
+        || !cardMessageId || value.claude_settings_version !== claudeSettingsPickerVersion(ds)) {
+        return warning('card.session_settings.stale');
+      }
+      const changingModel = actionType === 'session_model_pick' || actionType === 'reply_model_pick';
+      if (changingModel && actionType !== pickerAction) return warning('card.session_settings.stale');
+      const selected = typeof action?.option === 'string' ? action.option : '';
+      const configured = JSON.stringify(getBot(ds.larkAppId).config.customModels);
+      const models = await sessionModelChoices(ds);
+      const mutation = await tryWithBotTurnMutation(ds.larkAppId, 1000, () => {
+        const current = getSessionByActionValue(activeSessions, rootId, ds.larkAppId, value.session_id, actionType);
+        if (current !== ds || value.session_id !== ds.session.sessionId
+          || !sessionUsesClaudeCode(ds)
+          || value.lark_app_id !== ds.larkAppId || value.chat_id !== ds.chatId || rootId !== sessionAnchorId(ds)
+          || !canOperate(ds.larkAppId, ds.chatId, operatorOpenId, data?.operator?.union_id)
+          || !validatePrincipalLaneCardActionAuthority(ds, cardMessageId, activeSessions)
+          || (pickerAction === 'reply_model_pick' && getBot(ds.larkAppId).config.replyCardActions !== true)
+          || (changingModel && configured !== JSON.stringify(getBot(ds.larkAppId).config.customModels))
+          || value.claude_settings_version !== claudeSettingsPickerVersion(ds)) return 'card.session_settings.stale';
+        if (!supportsClaudeSessionSettings(ds)) return 'card.session_settings.unsupported';
+        if (!canSaveClaudeSessionSettings(ds)) return 'card.session_settings.busy';
+        try {
+          if (actionType === 'session_effort_pick') {
+            const control = sessionReasoningControl(ds);
+            if (control?.claude?.disabledBy) return `card.effort.claude_${control.claude.disabledBy}_override`;
+            const result = setSessionReasoningEffort(ds, selected, { source: 'card', setBy: operatorOpenId });
+            return result === 'saved' ? undefined : `card.effort.${result}`;
+          }
+          if (changingModel && (!models.includes(selected) || !MODEL_SLUG_PATTERN.test(selected)
+            || validateModelPin({ model: selected }, { cliId: 'claude-code', backendType: ds.initConfig?.backendType ?? ds.session.backendType }))) {
+            return 'card.reply_actions.model_unsupported';
+          }
+          const pin = ds.session.modelPin;
+          if (!changingModel && (!pin || value.expected_pin_set_at !== pin.setAt)) return 'card.session_settings.stale';
+          // Claude's interactive commands can persist user-wide defaults. Use
+          // the managed launch path for both model and effort preferences.
+          writeSessionModelPin(ds, changingModel
+            ? { model: selected, source: 'card', setBy: operatorOpenId, setAt: new Date().toISOString() }
+            : undefined, { compareAndSet: true });
+        } catch (error) {
+          logger.warn(`[${tag(ds)}] Claude session settings save failed: ${String(error)}`);
+          return 'card.session_settings.save_failed';
+        }
+      });
+      if (!mutation.acquired) return warning('card.session_settings.busy');
+      if (mutation.value === 'card.session_settings.stale') return warning(mutation.value);
+      if (!mutation.value && actionType === 'session_effort_pick') {
+        scheduleCardPatch(ds, buildStreamingCardJson(ds, ds.session.suspendedColdResume ? 'idle' : undefined), undefined, { userInitiated: true });
+      }
+      const pinView = changingModel ? resolveSessionModelPinView(ds, getBot(ds.larkAppId).config) : undefined;
+      const feedback = mutation.value ? warning(mutation.value) : pinView?.shadowedBy ? warning('card.session_settings.shadowed') : {
+        toast: { type: 'success', content: t('card.session_settings.saved', undefined, loc) },
+      };
+      const card = buildSessionModelPickerCard(ds, rootId, models, ds.activeModel ?? ds.session.model, loc, pickerAction,
+        undefined, privateRecipient);
+      if (!privateRecipient) return { ...feedback, card: { type: 'raw' as const, data: JSON.parse(card) } };
+      const refreshVersion = claudeSettingsPickerVersion(ds);
+      return { ...feedback, afterAck: async () => {
+        if (!canOperate(ds.larkAppId, ds.chatId, operatorOpenId, data?.operator?.union_id)
+          || getSessionByActionValue(activeSessions, rootId, ds.larkAppId, value.session_id, actionType) !== ds
+          || claudeSettingsPickerVersion(ds) !== refreshVersion) return;
+        // The ephemeral delivery API only supports send and delete. Keep
+        // the old picker visible if the replacement could not be delivered.
+        await sendEphemeralCard(ds.larkAppId, ds.chatId, operatorOpenId, card);
+        await deleteEphemeralCard(ds.larkAppId, cardMessageId, { acceptWithdrawn: true });
+      } };
+    }
+
     if (actionType === 'session_effort_pick' || actionType === 'session_effort_apply') {
       const loc = localeForBot(ds?.larkAppId ?? larkAppId);
       const warning = (key: string) => ({ toast: { type: 'warning', content: t(key, undefined, loc) } });
@@ -3807,12 +3897,25 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         const current = getSessionByActionValue(activeSessions, rootId, ds.larkAppId, value.session_id, actionType);
         if (current !== ds || value.session_id !== ds.session.sessionId
           || !cardMessageId || cardMessageId !== ds.streamCardId
-          || value.card_nonce !== ds.streamCardNonce
-          || value.expected_effort !== (ds.session.reasoningEffort ?? '')) return 'stale' as const;
+          || value.card_nonce !== ds.streamCardNonce) return 'stale' as const;
         const control = sessionReasoningControl(ds);
         if (!control) return 'unsupported' as const;
+        if (control.claude && (!canOperate(ds.larkAppId, ds.chatId, operatorOpenId)
+          || !validatePrincipalLaneCardActionAuthority(ds, cardMessageId, activeSessions))) return 'unavailable' as const;
+        if (control.claude?.disabledBy) return `claude_${control.claude.disabledBy}_override` as const;
+        if (value.expected_effort !== (control.claude ? control.selected ?? '' : ds.session.reasoningEffort ?? '')
+          || (control.claude && value.expected_model !== control.claude.model)) return 'stale' as const;
         const effort = control.choices.find(choice => choice === data.action?.option);
         if (!effort) return 'invalid' as const;
+        if (control.claude) {
+          try {
+            const result = setSessionReasoningEffort(ds, effort, { source: 'card', setBy: operatorOpenId });
+            return result === 'saved' ? 'claude_saved' as const : result;
+          } catch (error) {
+            logger.warn(`[${tag(ds)}] Claude session effort save failed: ${String(error)}`);
+            return 'claude_save_failed' as const;
+          }
+        }
         // Keep the verified cold-start path for suspended sessions and wrappers.
         // A live Codex uses the same native, receipt-confirmed menu as /effort.
         const worker = ds.worker;
@@ -3846,9 +3949,9 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       if (mutation.value === 'updating') return {
         toast: { type: 'info', content: t('card.effort.updating', undefined, loc) },
       };
-      if (mutation.value !== 'saved') return warning(`card.effort.${mutation.value}`);
+      if (mutation.value !== 'saved' && mutation.value !== 'claude_saved') return warning(`card.effort.${mutation.value}`);
       return {
-        toast: { type: 'success', content: t('card.effort.saved', undefined, loc) },
+        toast: { type: 'success', content: t(`card.effort.${mutation.value}`, undefined, loc) },
         card: { type: 'raw' as const, data: JSON.parse(buildStreamingCardJson(ds, ds.session.suspendedColdResume ? 'idle' : undefined)) },
       };
     }
@@ -5480,8 +5583,10 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         // Same pre-check the submission does: CLIs without a raw passthrough
         // surface cannot switch via /model — say so instead of showing a picker
         // whose only outcome is a refusal.
-        if (cliHasNoRawPassthroughSurface(sessionCliId(ds), { dshRuntime: getBot(ds.larkAppId).config.dshRuntime })) {
-          const cardJson = menuNoticeCard(t('card.reply_actions.model_unsupported', undefined, loc));
+        const claude = sessionUsesClaudeCode(ds);
+        if ((claude && (!supportsClaudeSessionSettings(ds) || ds.session.principalLane))
+          || cliHasNoRawPassthroughSurface(sessionCliId(ds), { dshRuntime: getBot(ds.larkAppId).config.dshRuntime })) {
+          const cardJson = menuNoticeCard(t(claude ? 'card.session_settings.unsupported' : 'card.reply_actions.model_unsupported', undefined, loc));
           await deliverEphemeralOrReply(ds, operatorOpenId, cardJson, 'interactive',
             () => sessionReply(rootId, cardJson, 'interactive'));
           return {};
@@ -5493,10 +5598,11 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           toast: { type: 'info', content: t('card.reply_actions.model_loading', undefined, loc) },
           afterAck: async () => {
             const { models, load } = await sessionModelPickerData(pickerDs);
-            if (!canOperate(pickerDs.larkAppId, pickerDs.chatId, operatorOpenId)
+            if (!canOperate(pickerDs.larkAppId, pickerDs.chatId, operatorOpenId, data?.operator?.union_id)
               || pickerDs.worker !== pickerWorker || pickerDs.workerGeneration !== pickerGeneration
-              || pickerDs.worker?.killed || isSessionTransferring(pickerDs)) return;
-            const cardJson = models.length > 0
+              || (pickerDs.worker?.killed && !(claude && pickerDs.session.suspendedColdResume))
+              || (claude && !supportsClaudeSessionSettings(pickerDs)) || isSessionTransferring(pickerDs)) return;
+            const render = (recipient?: string) => models.length > 0
               ? buildSessionModelPickerCard(
                 pickerDs,
                 rootId,
@@ -5505,10 +5611,11 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
                 loc,
                 'reply_model_pick',
                 load,
+                recipient,
               )
               : menuNoticeCard(t('card.reply_actions.model_empty', undefined, loc));
-            await deliverEphemeralOrReply(pickerDs, operatorOpenId, cardJson, 'interactive',
-              () => sessionReply(rootId, cardJson, 'interactive'));
+            await deliverSessionModelPicker(pickerDs, operatorOpenId, render,
+              card => sessionReply(rootId, card, 'interactive'));
           },
         };
       }

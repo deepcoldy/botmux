@@ -48,6 +48,8 @@ export interface CreateGroupCompletionStatus {
   success: boolean;
   chatCreated: true;
   chatId: string;
+  shareLink: string | null;
+  shareLinkError: string | null;
   collaborationReady: boolean;
   kickoffAccepted: boolean;
   kickoffRequested: boolean;
@@ -59,9 +61,12 @@ export interface CreateGroupCompletionStatus {
  * an explicitly requested kickoff (if any) was sent. `collaborationReady` reports
  * whether the best-effort bot-to-bot grants were written: a miss there is a
  * warning, and must not make callers that retry on failure create a second
- * group. */
+ * group. `shareLink` / `shareLinkError` are best-effort metadata and likewise
+ * do not flip `success` to false. */
 export function createGroupCompletionStatus(input: {
   chatId: string;
+  shareLink?: string | null;
+  shareLinkError?: string | null;
   collaborationReady: boolean;
   kickoffRequested: boolean;
   kickoffMessageId: string | null;
@@ -73,6 +78,8 @@ export function createGroupCompletionStatus(input: {
     success: kickoffAccepted,
     chatCreated: true,
     chatId: input.chatId,
+    shareLink: input.shareLink ?? null,
+    shareLinkError: input.shareLinkError ?? null,
     collaborationReady: input.collaborationReady,
     kickoffAccepted,
     kickoffRequested: input.kickoffRequested,
@@ -191,6 +198,180 @@ export function resolveChatMode(raw: string | undefined): ResolvedChatMode {
   return { ok: false, error: `--chat-mode 只支持 group 或 topic，收到: "${raw}"。` };
 }
 
+export type ParsedCreateGroupCliArgs =
+  | { kind: 'help' }
+  | { kind: 'deprecated-chat' }
+  | { kind: 'team' }
+  | { kind: 'error'; error: string }
+  | {
+    kind: 'ok';
+    botRefs: string[];
+    name?: string;
+    chatMode?: string;
+    workingDir?: string;
+    kickoffBot?: string;
+    kickoffPrompt?: string;
+    jsonStatus: boolean;
+  };
+
+const CREATE_GROUP_KNOWN_FLAGS = new Set([
+  '--help', '-h', '--json-status',
+  '--bot', '--name', '--chat-mode', '--working-dir', '--cwd', '--dir',
+  '--kickoff-bot', '--kickoff-prompt', '--chat', '--team', '--agent',
+]);
+
+const CREATE_GROUP_VALUE_FLAG_PREFIXES = [
+  '--bot=', '--name=', '--chat-mode=', '--working-dir=', '--cwd=', '--dir=',
+  '--kickoff-bot=', '--kickoff-prompt=', '--chat=', '--team=', '--agent=',
+];
+
+function looksLikeKnownCreateGroupFlag(token: string): boolean {
+  if (CREATE_GROUP_KNOWN_FLAGS.has(token)) return true;
+  if (/\s/.test(token)) return false;
+  return CREATE_GROUP_VALUE_FLAG_PREFIXES.some(prefix => token.startsWith(prefix));
+}
+
+/**
+ * Single-pass left-to-right argv parser for `botmux create-group`.
+ *
+ * Walking once and advancing past consumed flag values prevents value tokens
+ * (such as prose inside `--kickoff-prompt` or `--name`) from being re-read as
+ * `--help`, `--chat`, `--team`, `--kickoff-bot`, or `--json-status`, while
+ * still catching missing values, blank `--kickoff-bot` / `--kickoff-prompt`,
+ * and trailing bare duplicate flags.
+ */
+export function parseCreateGroupCliArgs(rest: readonly string[]): ParsedCreateGroupCliArgs {
+  const botRefs: string[] = [];
+  let name: string | undefined;
+  let chatMode: string | undefined;
+  let workingDir: string | undefined;
+  let kickoffBot: string | undefined;
+  let kickoffPrompt: string | undefined;
+  let jsonStatus = false;
+  let hasChat = false;
+  let hasTeamOrAgent = false;
+  let seenKickoffBot = false;
+  let seenKickoffPrompt = false;
+  let pendingError: string | undefined;
+
+  const takeValue = (
+    i: number,
+    flag: string,
+  ): { nextIndex: number; value: string | undefined; fromEq: boolean } => {
+    const token = rest[i]!;
+    if (token.startsWith(`${flag}=`)) {
+      return { nextIndex: i, value: token.slice(flag.length + 1), fromEq: true };
+    }
+    if (i + 1 < rest.length) {
+      return { nextIndex: i + 1, value: rest[i + 1], fromEq: false };
+    }
+    return { nextIndex: i, value: undefined, fromEq: false };
+  };
+
+  for (let i = 0; i < rest.length; i++) {
+    const token = rest[i]!;
+    if (token === '--help' || token === '-h') return { kind: 'help' };
+    if (token === '--json-status') {
+      jsonStatus = true;
+      continue;
+    }
+    if (token === '--chat' || token.startsWith('--chat=')) {
+      hasChat = true;
+      if (token === '--chat' && i + 1 < rest.length && !rest[i + 1]!.startsWith('-')) i++;
+      continue;
+    }
+    if (token === '--team' || token.startsWith('--team=') || token === '--agent' || token.startsWith('--agent=')) {
+      hasTeamOrAgent = true;
+      if ((token === '--team' || token === '--agent') && i + 1 < rest.length && !rest[i + 1]!.startsWith('-')) i++;
+      continue;
+    }
+    if (token === '--bot' || token.startsWith('--bot=')) {
+      const { nextIndex, value } = takeValue(i, '--bot');
+      i = nextIndex;
+      if (value !== undefined) botRefs.push(value);
+      continue;
+    }
+    if (token === '--name' || token.startsWith('--name=')) {
+      const { nextIndex, value } = takeValue(i, '--name');
+      i = nextIndex;
+      if (name === undefined && value !== undefined) name = value;
+      continue;
+    }
+    if (token === '--chat-mode' || token.startsWith('--chat-mode=')) {
+      const { nextIndex, value } = takeValue(i, '--chat-mode');
+      i = nextIndex;
+      if (chatMode === undefined && value !== undefined) chatMode = value;
+      continue;
+    }
+    if (
+      token === '--working-dir' || token.startsWith('--working-dir=')
+      || token === '--cwd' || token.startsWith('--cwd=')
+      || token === '--dir' || token.startsWith('--dir=')
+    ) {
+      const flag = token.startsWith('--working-dir') ? '--working-dir'
+        : token.startsWith('--cwd') ? '--cwd' : '--dir';
+      const { nextIndex, value } = takeValue(i, flag);
+      i = nextIndex;
+      if (workingDir === undefined && value !== undefined) workingDir = value;
+      continue;
+    }
+    if (token === '--kickoff-bot' || token.startsWith('--kickoff-bot=')) {
+      if (seenKickoffBot) {
+        pendingError ??= '--kickoff-bot 不能重复指定。';
+        if (token === '--kickoff-bot' && i + 1 < rest.length && !rest[i + 1]!.startsWith('-')) i++;
+        continue;
+      }
+      seenKickoffBot = true;
+      const { nextIndex, value, fromEq } = takeValue(i, '--kickoff-bot');
+      if (value === undefined || (!fromEq && value.startsWith('-'))) {
+        pendingError ??= '--kickoff-bot 缺少值。';
+        continue;
+      }
+      i = nextIndex;
+      if (!value.trim()) {
+        pendingError ??= '--kickoff-bot 不能为空。';
+        continue;
+      }
+      kickoffBot = value;
+      continue;
+    }
+    if (token === '--kickoff-prompt' || token.startsWith('--kickoff-prompt=')) {
+      if (seenKickoffPrompt) {
+        pendingError ??= '--kickoff-prompt 不能重复指定。';
+        if (token === '--kickoff-prompt' && i + 1 < rest.length && !looksLikeKnownCreateGroupFlag(rest[i + 1]!)) i++;
+        continue;
+      }
+      seenKickoffPrompt = true;
+      const { nextIndex, value, fromEq } = takeValue(i, '--kickoff-prompt');
+      if (value === undefined || (!fromEq && looksLikeKnownCreateGroupFlag(value))) {
+        pendingError ??= '--kickoff-prompt 缺少值。';
+        continue;
+      }
+      i = nextIndex;
+      if (!value.trim()) {
+        pendingError ??= '--kickoff-prompt 不能为空。';
+        continue;
+      }
+      kickoffPrompt = value;
+      continue;
+    }
+  }
+
+  if (hasChat) return { kind: 'deprecated-chat' };
+  if (hasTeamOrAgent) return { kind: 'team' };
+  if (pendingError) return { kind: 'error', error: pendingError };
+  return {
+    kind: 'ok',
+    botRefs,
+    name,
+    chatMode,
+    workingDir,
+    kickoffBot,
+    kickoffPrompt,
+    jsonStatus,
+  };
+}
+
 export function resolveBotRefs(
   refs: string[],
   botConfigs: BotConfigForResolve[],
@@ -259,38 +440,75 @@ export function resolveBotRefs(
   return { larkAppIds: out, invalid, ambiguousWarnings };
 }
 
+const KICKOFF_LARK_APP_ID_RE = /^cli_[A-Za-z0-9_-]{1,128}$/;
+const KICKOFF_BOT_OPEN_ID_RE = /^ou_[A-Za-z0-9_-]{1,160}$/;
+
 /**
- * Validate the optional kickoff pair and resolve the user-facing bot open_id
- * back to a selected larkAppId. The service later obtains the target bot's
- * observer-scoped open_id from the creator app before sending the @mention;
- * a bot's self-reported open_id is not valid across Lark apps.
+ * Validate the optional kickoff pair and resolve the target bot reference
+ * (`botOpenId` `ou_...` or `larkAppId` `cli_...`) to a selected `larkAppId`.
+ *
+ * The two identifier namespaces (`ou_` vs `cli_`) are strictly disjoint so
+ * resolution is unambiguous:
+ * - `cli_...` resolves directly against `selectedLarkAppIds` (and optional
+ *   `knownLarkAppIds`), working even when `bots-info.json` is absent or stale.
+ * - `ou_...` resolves via `botInfo` (`bots-info.json`) to a unique `larkAppId`.
+ * - Any other value (display name, cliId, `local_*`, flag token, etc.) fails
+ *   closed so kickoff never guesses an ambiguous target.
+ *
+ * The service later obtains the target bot's observer-scoped `open_id` from the
+ * creator app before sending the `@mention`; a bot's self-reported `open_id` is
+ * never used across Lark apps.
  */
 export function resolveKickoff(
-  botOpenIdRaw: string | undefined,
+  botRefRaw: string | undefined,
   promptRaw: string | undefined,
   selectedLarkAppIds: string[],
   botInfo: BotInfoForKickoff[],
+  knownLarkAppIds?: readonly string[],
 ): ResolvedKickoff {
-  const botOpenId = botOpenIdRaw?.trim() || undefined;
+  const botRef = botRefRaw?.trim() || undefined;
   const prompt = promptRaw?.trim() || undefined;
 
-  if (!botOpenId && !prompt) return { ok: true };
-  if (!botOpenId || !prompt) {
+  if (!botRef && !prompt) return { ok: true };
+  if (!botRef || !prompt) {
     return { ok: false, error: '--kickoff-bot 与 --kickoff-prompt 必须同时提供且不能为空。' };
   }
 
-  const matches = botInfo.filter(info => info.botOpenId?.trim() === botOpenId);
-  if (matches.length === 0) {
-    return { ok: false, error: `--kickoff-bot 未匹配到本机 bot: ${botOpenId}` };
-  }
-  if (matches.length > 1) {
-    return { ok: false, error: `--kickoff-bot 匹配到多个本机 bot，请检查 bots-info.json: ${botOpenId}` };
+  let targetLarkAppId: string;
+  if (KICKOFF_LARK_APP_ID_RE.test(botRef)) {
+    if (selectedLarkAppIds.includes(botRef)) {
+      targetLarkAppId = botRef;
+    } else {
+      const known = new Set<string>([
+        ...(knownLarkAppIds ?? []),
+        ...botInfo.map(info => info.larkAppId),
+      ]);
+      if (known.has(botRef)) {
+        return { ok: false, error: '--kickoff-bot 必须属于本次 --bot 列表。' };
+      }
+      return { ok: false, error: `--kickoff-bot 未匹配到本机 bot: ${botRef}` };
+    }
+  } else if (KICKOFF_BOT_OPEN_ID_RE.test(botRef)) {
+    const matches = botInfo.filter(
+      info => typeof info.botOpenId === 'string' && info.botOpenId.trim() === botRef,
+    );
+    if (matches.length === 0) {
+      return { ok: false, error: `--kickoff-bot 未匹配到本机 bot: ${botRef}` };
+    }
+    if (matches.length > 1) {
+      return { ok: false, error: `--kickoff-bot 匹配到多个本机 bot，请检查 bots-info.json: ${botRef}` };
+    }
+    targetLarkAppId = matches[0].larkAppId;
+    if (!selectedLarkAppIds.includes(targetLarkAppId)) {
+      return { ok: false, error: '--kickoff-bot 必须属于本次 --bot 列表。' };
+    }
+  } else {
+    return {
+      ok: false,
+      error: `--kickoff-bot 格式无效（仅支持 botOpenId (ou_...) 或 larkAppId (cli_...)）: ${botRef}`,
+    };
   }
 
-  const targetLarkAppId = matches[0].larkAppId;
-  if (!selectedLarkAppIds.includes(targetLarkAppId)) {
-    return { ok: false, error: '--kickoff-bot 必须属于本次 --bot 列表。' };
-  }
   if (targetLarkAppId === selectedLarkAppIds[0]) {
     return { ok: false, error: '--kickoff-bot 不能是 creator（第一个 --bot）。' };
   }

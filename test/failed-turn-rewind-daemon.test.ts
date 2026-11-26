@@ -349,6 +349,33 @@ describe('a turn that failed without output, then more input (daemon side)', () 
     expect(s.input('trg_1', '继续').failedTurnRewind).toMatchObject({ mode: 'merge' });
   });
 
+  it('never folds one source task into another when both arrive through the same reply bot continuation', async () => {
+    // The immediate actor is the same peer bot for both; only the bounded
+    // taskContinuation tuple distinguishes the two human tasks.
+    const continuation = (openId: string, sourceTurnId: string) => ({
+      requestUserOpenId: 'ou_reply_bot',
+      requestUserUnionId: 'on_reply_bot',
+      requestLarkAppId: 'app_test',
+      senderType: 'bot' as const,
+      taskContinuation: {
+        appId: 'app_test', openId, sourceSessionId: 'sess-source', sourceTurnId,
+      },
+    });
+    const taskA = continuation('ou_human_a', 'om_source_a');
+    const taskB = continuation('ou_human_b', 'om_source_b');
+    const s = session();
+    rememberLastCliInput(s.ds, 'task A result', 'task A result', 'om_reply_a');
+    await s.failed('om_reply_a', { directFailure: true });
+    s.ds.session.lastFailedTurn!.trustedCaller = taskA;
+    // An appId+openId-only rule would treat the same reply bot as one principal
+    // and let task B's turn carry task A's failed input under B's credentials.
+    expect(s.input('om_reply_b', 'task B result', { trustedCaller: taskB }).failedTurnRewind).toBeUndefined();
+    // A retry carrying the exact same continuation tuple still folds as one task.
+    expect(s.input('om_reply_a2', 'task A retry', {
+      trustedCaller: continuation('ou_human_a', 'om_source_a'),
+    }).failedTurnRewind).toMatchObject({ mode: 'merge' });
+  });
+
   it('never folds an input nobody vouched for (a webhook\'s) into a person\'s turn', async () => {
     const alice = { requestUserOpenId: 'ou_alice', requestLarkAppId: 'app_test', senderType: 'user' as const };
     const s = session();

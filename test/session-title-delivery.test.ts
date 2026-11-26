@@ -102,6 +102,11 @@ function activationAck(ds: any, worker: any) {
   const scope: Record<string, any> = {
     ds, worker, t: 'title-delivery', logger, sessionStore: store,
     startupState: { ready: false, failureNotified: false },
+    ownsLifecycleMutation: () => ds.worker === worker
+      && ds.workerGeneration === ds.session.workerGeneration
+      && ds.session.status === 'active',
+    handleQueuedActivationSubmittedAck: pool.handleQueuedActivationSubmittedAck,
+    publishQueuedActivationStatePatch: vi.fn(),
     // Title delivery fixtures never arm Mojo notices; the cosmetic dependency
     // stays observable while the real activation journal and SQLite store run.
     deliverMojoNoticesForAcceptedInput: vi.fn(),

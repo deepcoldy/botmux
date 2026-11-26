@@ -42,6 +42,7 @@ import { join } from 'node:path';
  *   - `export-only`     answers are exported but no trajectory rows are written;
  *   - `export-error`    the read-only export command exits nonzero;
  *   - `export-delay`    delays returning an export snapshot, in milliseconds.
+ *   - `no-trajectory`   suppress every trajectory.jsonl row, including the final
  * Every stdin chunk is appended to `inputLog` as one JSON line.
  */
 export function writeFakeDoubaoTui(dir: string, opts: {
@@ -63,7 +64,7 @@ const TRAJECTORY = path.join(SYSTEM_DIR, 'trajectory.jsonl');
 const ctl = name => path.join(CTL, name);
 const has = name => fs.existsSync(ctl(name));
 const read = name => { try { return fs.readFileSync(ctl(name), 'utf8').trim(); } catch { return ''; } };
-const appendJson = row => fs.appendFileSync(TRAJECTORY, JSON.stringify(row) + '\\n');
+const appendJson = row => { if (!has('no-trajectory')) fs.appendFileSync(TRAJECTORY, JSON.stringify(row) + '\\n'); };
 const EXPORT = ctl('export.json');
 if (process.argv.includes('--hold-export-pipes')) { setInterval(() => {}, 100); return; }
 if (process.argv.includes('--export')) {

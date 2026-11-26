@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
+import { buildPipePaneStartupError } from '../src/adapters/backend/tmux-pipe-backend.js';
 import { chatSafeFatalErrorMessage } from '../src/core/startup-failure-reason.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
@@ -27,6 +28,18 @@ describe('chatSafeFatalErrorMessage', () => {
   it('keeps only the stderr tail', () => {
     const err = execFailure(['-c', 'for i in 1 2 3 4 5 6 7 8; do echo "line $i" >&2; done; exit 1']);
     expect(chatSafeFatalErrorMessage(err).split('\n').slice(1)).toEqual(['line 4', 'line 5', 'line 6', 'line 7', 'line 8']);
+  });
+
+  it('publishes only the numeric status of a pre-observer startup exit, retaining the full local diagnosis', () => {
+    const error = buildPipePaneStartupError(new Error('pane is dead: SECOND_SECRET'), {
+      paneDead: true, paneDeadStatus: '1', lastScreen: 'unstructured provider credential FIRST_SECRET',
+    });
+    expect(error.message).toContain('FIRST_SECRET');
+    expect(error.message).toContain('SECOND_SECRET');
+    const safe = chatSafeFatalErrorMessage(error);
+    expect(safe).toContain('1');
+    expect(safe).not.toContain('FIRST_SECRET');
+    expect(safe).not.toContain('SECOND_SECRET');
   });
 
   it('passes other errors through unchanged', () => {

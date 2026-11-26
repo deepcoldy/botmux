@@ -230,6 +230,33 @@ export async function createChat(
   creatorLarkAppId: string,
   opts: { name?: string; botIds: string[]; userIds?: string[]; chatMode?: ChatMode },
 ): Promise<{ chatId: string; invalidBotIds: string[]; invalidUserIds: string[] }> {
+  return createChatInternal(creatorLarkAppId, opts, undefined);
+}
+
+/**
+ * Create a chat with a caller-supplied `uuid` for idempotent creation.
+ *
+ * Feishu `im.v1.chat.create` accepts a `uuid` in **params** (not data) and
+ * dedupes by it for ~10h — same uuid re-sent within the window returns the
+ * original chatId instead of creating a second chat (design
+ * 2026-11-20-dm-collab-group §5.1 / §10.3; issue #3405). The uuid travels as
+ * `params.uuid`, verified against the SDK payload type.
+ *
+ * Everything else (creator filtering, empty-list omission, chat_mode explicit
+ * only) is identical to `createChat`.
+ */
+export async function createChatWithUuid(
+  creatorLarkAppId: string,
+  opts: { name?: string; botIds: string[]; userIds?: string[]; chatMode?: ChatMode; uuid: string },
+): Promise<{ chatId: string; invalidBotIds: string[]; invalidUserIds: string[] }> {
+  return createChatInternal(creatorLarkAppId, opts, opts.uuid);
+}
+
+async function createChatInternal(
+  creatorLarkAppId: string,
+  opts: { name?: string; botIds: string[]; userIds?: string[]; chatMode?: ChatMode },
+  uuid: string | undefined,
+): Promise<{ chatId: string; invalidBotIds: string[]; invalidUserIds: string[] }> {
   const client = getBotClient(creatorLarkAppId);
   // Filter out the creator from bot_id_list — Lark errors if the inviter
   // appears in their own invite list.
@@ -245,6 +272,8 @@ export async function createChat(
   if (opts.chatMode) data.chat_mode = opts.chatMode;
   const params: Record<string, unknown> = {};
   if (userIds.length > 0) params.user_id_type = 'open_id';
+  // uuid is a params-level idempotency key (not data), per the SDK payload type.
+  if (uuid !== undefined) params.uuid = uuid;
   const res: any = await (client as any).im.v1.chat.create({ data, params });
   if (res.code !== 0 && res.code !== undefined) {
     throw new Error(`Failed to create chat: ${res.msg ?? 'unknown'} (code: ${res.code})`);
@@ -713,12 +742,27 @@ export interface ChatMemberDisplay {
   openId: string;
   name: string;
   memberType: 'user' | 'bot' | 'unknown';
+  /** Configured Feishu app ID when this bot maps to a local botmux bot. */
+  larkAppId?: string;
+}
+
+function pickNonEmptyDisplayName(candidates: readonly unknown[], fallback: string): string {
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string') {
+      const trimmed = candidate.trim();
+      if (trimmed) return trimmed;
+    }
+  }
+  return fallback;
 }
 
 export async function listChatMemberDisplays(larkAppId: string, chatId: string): Promise<ChatMemberDisplay[]> {
   const client = getBotClient(larkAppId);
   const out: ChatMemberDisplay[] = [];
   const seen = new Map<string, number>();
+  // Once two different configured apps claim the same observer-scoped openId,
+  // keep that row ambiguous even if later duplicate rows repeat one claimant.
+  const ambiguousBotOpenIds = new Set<string>();
   let pageToken: string | undefined;
   for (let page = 0; page < 20; page++) {
     const params: Record<string, string> = {
@@ -734,13 +778,26 @@ export async function listChatMemberDisplays(larkAppId: string, chatId: string):
     for (const item of res.data?.items ?? []) {
       const openId = String(item?.member_id ?? '').trim();
       if (!openId) continue;
-      const name = String(item?.name ?? item?.member_name ?? item?.display_name ?? openId).trim() || openId;
+      const name = pickNonEmptyDisplayName([item?.name, item?.member_name, item?.display_name], openId);
       const typeRaw = String(item?.member_type ?? item?.type ?? '').trim();
       const memberType: ChatMemberDisplay['memberType'] = typeRaw === 'bot' || typeRaw === 'app'
         ? 'bot'
         : typeRaw === 'user' ? 'user' : 'unknown';
-      seen.set(openId, out.length);
-      out.push({ openId, name, memberType });
+      const existing = seen.get(openId);
+      if (existing === undefined) {
+        seen.set(openId, out.length);
+        out.push({ openId, name, memberType });
+      } else {
+        const prev = out[existing]!;
+        const resolvedName = name === openId && prev.name !== openId ? prev.name : name;
+        const resolvedType = memberType === 'unknown' && prev.memberType !== 'unknown' ? prev.memberType : memberType;
+        out[existing] = {
+          openId,
+          name: resolvedName,
+          memberType: resolvedType,
+          ...(prev.larkAppId ? { larkAppId: prev.larkAppId } : {}),
+        };
+      }
     }
     if (!res.data?.has_more || !res.data?.page_token) break;
     pageToken = res.data.page_token;
@@ -750,13 +807,34 @@ export async function listChatMemberDisplays(larkAppId: string, chatId: string):
     for (const bot of bots) {
       const openId = String(bot.openId ?? '').trim();
       if (!openId) continue;
-      const name = String(bot.displayName ?? bot.name ?? openId).trim() || openId;
+      const name = pickNonEmptyDisplayName([bot.displayName, bot.name], openId);
+      const botLarkAppId = typeof bot.larkAppId === 'string' ? bot.larkAppId.trim() : '';
       const existing = seen.get(openId);
       if (existing === undefined) {
         seen.set(openId, out.length);
-        out.push({ openId, name, memberType: 'bot' });
+        out.push({
+          openId,
+          name,
+          memberType: 'bot',
+          ...(botLarkAppId ? { larkAppId: botLarkAppId } : {}),
+        });
       } else {
-        out[existing] = { openId, name, memberType: 'bot' };
+        const prev = out[existing]!;
+        const resolvedName = name === openId && prev.name !== openId ? prev.name : name;
+        if (botLarkAppId && prev.larkAppId && botLarkAppId !== prev.larkAppId) {
+          ambiguousBotOpenIds.add(openId);
+        }
+        // An observed external row (empty appId) does not erase a configured
+        // identity, but conflicting configured identities fail closed.
+        const resolvedAppId = ambiguousBotOpenIds.has(openId)
+          ? undefined
+          : botLarkAppId || prev.larkAppId;
+        out[existing] = {
+          openId,
+          name: resolvedName,
+          memberType: 'bot',
+          ...(resolvedAppId ? { larkAppId: resolvedAppId } : {}),
+        };
       }
     }
   } catch (err) {

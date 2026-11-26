@@ -21,8 +21,10 @@ import * as sessions from '../src/services/session-store.js';
 import * as scheduler from '../src/core/scheduler.js';
 import * as platformCredentials from '../src/core/platform-credential-source.js';
 import * as publication from '../src/core/turn-cli-identity.js';
+const realPublishTurnCliIdentity = publication.publishTurnCliIdentity;
 const h = { root: '', ds: undefined as any, session: undefined as any,
-  store: undefined as any, jobs: undefined as any, storageModel: 'proven', allowed: true, delay: 0, publishes: 0, bot: undefined as any };
+  store: undefined as any, jobs: undefined as any, storageModel: 'proven', allowed: true, delay: 0, publishes: 0, bot: undefined as any,
+  realPublish: false };
 function mockDependencies() {
   vi.spyOn(registry, 'getBot').mockImplementation(() => ({ config: h.bot }) as any);
   vi.spyOn(i18n, 'localeForBot').mockReturnValue('en');
@@ -36,6 +38,7 @@ function mockDependencies() {
   vi.spyOn(scheduler, 'revokeBackgroundExecution').mockImplementation(id => h.store.revokeBackgroundExecution(id));
   vi.spyOn(platformCredentials, 'noteSenderUnionId').mockImplementation(() => {});
   vi.spyOn(publication, 'publishTurnCliIdentity').mockImplementation(async args => {
+    if (h.realPublish) return realPublishTurnCliIdentity(args);
     h.publishes++;
     if (h.delay) await new Promise(resolve => setTimeout(resolve, h.delay));
     const env = `BOTMUX_IDENTITY_MODE='local'\nBOTMUX_IDENTITY_OPEN_ID='${args.senderOpenId}'\n`;
@@ -65,7 +68,7 @@ beforeEach(async () => {
     localProcessAttestation: { workerGeneration: 1, cliPid: process.pid, cliProcStart: readProcessStartIdentity(process.pid) },
     managedTurnOrigin: { turnId: turn, callerOpenId: 'ou_bg', dispatchAttempt: 1,
       capability: 'a'.repeat(64), preexistingProcessIdentities: [`${process.pid}:${readProcessStartIdentity(process.pid)}`] } };
-  h.allowed = true; h.jobs = undefined; h.storageModel = 'proven'; h.delay = h.publishes = 0;
+  h.allowed = true; h.jobs = undefined; h.storageModel = 'proven'; h.delay = h.publishes = 0; h.realPublish = false;
   h.bot = { larkAppId: app, apiOnly: false };
   rootProcess = spawnTsEval('setInterval(() => {}, 1000)', { stdio: 'ignore' });
   await once(rootProcess, 'spawn');
@@ -233,6 +236,41 @@ describe.skipIf(process.platform !== 'linux')('registered scheduled identity', (
     expect(await first).toEqual(await next); expect(h.publishes).toBe(1);
     expect(recallProvenIdentityContent(h.root, 's-bg', turn, 'bytedcli')).toBeUndefined();
     expect(recallProvenIdentityContent(h.root, 's-bg', `background:${job.id}`, 'bytedcli')).toBeDefined();
+  });
+  it('does not advertise regional retries that the detached background route cannot perform', async () => {
+    const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
+    h.bot = { ...h.bot, larkToolBinding: true, triggerUserAuth: parseTriggerUserAuthConfig({
+      enabled: true, tools: ['bytedcli'], credentialSource: 'platform',
+    }) };
+    const job = registerScheduledBackgroundExecution(input())!;
+    h.ds.managedTurnOrigin = undefined;
+    h.realPublish = true;
+    let grants = 0;
+    platformCredentials.__setPlatformCredentialDepsForTest({
+      readBinding: () => ({ platformUrl: 'https://platform.example.test', machineToken: 'mt', machineId: 'm-1' }),
+      resolveUnionId: async () => 'on_bg',
+      requestGrant: async () => {
+        grants++;
+        return { ok: true, value: {
+          tool: 'bytedcli', unionId: 'on_bg', expiresAt: Date.now() + 3_600_000,
+          cloudJwtRegions: ['i18n'], cloudJwtRegionStates: { i18n: 'failed' },
+          variables: { BYTEDCLI_USER_CLOUD_JWT: jwt(7200) },
+        } };
+      },
+    });
+    try {
+      const first = await resolveDetachedScheduledExecutionIdentity(input());
+      expect(first?.env).toContain(`BOTMUX_IDENTITY_TURN='background:${job.id}'`);
+      expect(first?.env).toContain("BOTMUX_IDENTITY_UNATTENDED='1'");
+      expect(first?.env).toContain("BOTMUX_IDENTITY_REGIONAL_STATE_I18N='failed'");
+      expect(first?.env).not.toContain('BOTMUX_IDENTITY_REGIONAL_RETRY');
+      expect(grants).toBe(1);
+      const second = await resolveDetachedScheduledExecutionIdentity(input());
+      expect(second?.env).toBe(first?.env);
+      expect(grants).toBe(1);
+    } finally {
+      platformCredentials.__setPlatformCredentialDepsForTest(null);
+    }
   });
   it.each(['BYTEDCLI_USER_CLOUD_JWT', 'BYTEDCLI_USER_CODE_JWT', 'BOTMUX_IDENTITY_CLOUD_JWT_I18N',
     'BOTMUX_IDENTITY_CLOUD_JWT_I18NBD', 'BOTMUX_IDENTITY_CLOUD_JWT_TX'])('refreshes an expired %s independently', async field => {

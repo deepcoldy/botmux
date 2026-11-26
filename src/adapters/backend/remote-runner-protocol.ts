@@ -1,4 +1,5 @@
 import { Buffer } from 'node:buffer';
+import { normalizeHistoryReadFilters, type HistoryReadFilterOptions } from '../../core/history-read-options.js';
 
 export const REMOTE_RUNNER_PROTOCOL = 'botmux.remote-runner';
 export const REMOTE_RUNNER_PROTOCOL_VERSION = 1;
@@ -115,6 +116,13 @@ export interface RemoteRunnerUsageReport {
 }
 
 export interface RemoteRunnerTrustedCaller {
+  taskContinuation?: {
+    appId: string;
+    openId: string;
+    unionId?: string;
+    sourceSessionId: string;
+    sourceTurnId: string;
+  };
   requestUserOpenId?: string;
   requestUserUnionId?: string;
   requestLarkAppId?: string;
@@ -132,6 +140,26 @@ export interface RemoteRunnerTrustedCaller {
 export function projectRemoteRunnerTrustedCaller(
   caller: RemoteRunnerTrustedCaller & Record<string, unknown>,
 ): RemoteRunnerTrustedCaller {
+  let taskContinuation: RemoteRunnerTrustedCaller['taskContinuation'];
+  if (caller.taskContinuation !== undefined) {
+    const raw = record(caller.taskContinuation);
+    const appId = nonEmptyString(raw?.appId, 256);
+    const openId = nonEmptyString(raw?.openId, 256);
+    const unionId = raw?.unionId === undefined ? undefined : nonEmptyString(raw.unionId, 256);
+    const sourceSessionId = nonEmptyString(raw?.sourceSessionId, 256);
+    const sourceTurnId = nonEmptyString(raw?.sourceTurnId, 256);
+    if (!raw || caller.senderType !== 'bot' || appId !== caller.requestLarkAppId
+      || !appId?.startsWith('cli_') || !ID_RE.test(appId)
+      || !openId?.startsWith('ou_') || !ID_RE.test(openId)
+      || (raw.unionId !== undefined && (!unionId?.startsWith('on_') || !ID_RE.test(unionId)))
+      || !sourceSessionId || !ID_RE.test(sourceSessionId)
+      || !sourceTurnId?.startsWith('om_') || !ID_RE.test(sourceTurnId)) {
+      throw new Error('Invalid host task continuation for remote runner');
+    }
+    // Host-attested outbound context only. Never copy protected email or
+    // arbitrary persisted fields; recovered provider events cannot mint it.
+    taskContinuation = { appId, openId, ...(unionId ? { unionId } : {}), sourceSessionId, sourceTurnId };
+  }
   return {
     ...(caller.requestUserOpenId ? { requestUserOpenId: caller.requestUserOpenId } : {}),
     ...(caller.requestUserUnionId ? { requestUserUnionId: caller.requestUserUnionId } : {}),
@@ -140,6 +168,7 @@ export function projectRemoteRunnerTrustedCaller(
     ...(caller.taskId ? { taskId: caller.taskId } : {}),
     ...(caller.senderType ? { senderType: caller.senderType } : {}),
     ...(caller.botOwner ? { botOwner: { ...caller.botOwner } } : {}),
+    ...(taskContinuation ? { taskContinuation } : {}),
   };
 }
 
@@ -191,12 +220,12 @@ export type RemoteRunnerSessionToolRequest =
       tool: 'history';
       limit?: number;
       scope?: 'session' | 'thread' | 'chat' | 'ambient';
-      withCardJson?: boolean;
-    }
+    } & HistoryReadFilterOptions
   | {
       tool: 'quoted';
       messageId: string;
       raw?: boolean;
+      download?: boolean;
     }
   | { tool: 'bots.list' }
   | { tool: 'skill.list' }
@@ -787,7 +816,7 @@ export function normalizeRemoteRunnerSessionToolRequest(
   if (!raw || typeof raw.tool !== 'string') return undefined;
 
   if (raw.tool === 'history') {
-    const allowed = new Set(['tool', 'limit', 'scope', 'withCardJson']);
+    const allowed = new Set(['tool', 'limit', 'scope', 'withCardJson', 'view', 'query', 'types', 'since', 'until']);
     if (Object.keys(raw).some(key => !allowed.has(key))) return undefined;
     const limit = raw.limit === undefined ? undefined : nonNegativeInteger(raw.limit);
     if (raw.limit !== undefined && (limit === undefined || limit < 1 || limit > 100)) {
@@ -797,27 +826,28 @@ export function normalizeRemoteRunnerSessionToolRequest(
     if (scope !== undefined && !['session', 'thread', 'chat', 'ambient'].includes(scope)) {
       return undefined;
     }
-    if (raw.withCardJson !== undefined && typeof raw.withCardJson !== 'boolean') {
-      return undefined;
-    }
+    const filters = normalizeHistoryReadFilters(raw);
+    if (!filters) return undefined;
     return {
       tool: 'history',
       ...(limit !== undefined ? { limit } : {}),
       ...(scope !== undefined ? { scope: scope as 'session' | 'thread' | 'chat' | 'ambient' } : {}),
-      ...(raw.withCardJson !== undefined ? { withCardJson: raw.withCardJson } : {}),
+      ...filters,
     };
   }
 
   if (raw.tool === 'quoted') {
-    const allowed = new Set(['tool', 'messageId', 'raw']);
+    const allowed = new Set(['tool', 'messageId', 'raw', 'download']);
     if (Object.keys(raw).some(key => !allowed.has(key))) return undefined;
     const messageId = nonEmptyString(raw.messageId, 256);
     if (!messageId || !/^om_[A-Za-z0-9_-]+$/.test(messageId)) return undefined;
     if (raw.raw !== undefined && typeof raw.raw !== 'boolean') return undefined;
+    if (raw.download !== undefined && typeof raw.download !== 'boolean') return undefined;
     return {
       tool: 'quoted',
       messageId,
       ...(raw.raw !== undefined ? { raw: raw.raw } : {}),
+      ...(raw.download !== undefined ? { download: raw.download } : {}),
     };
   }
 

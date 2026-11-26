@@ -9,6 +9,14 @@ import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vites
 import { applyQueuedCodexAppLegacyFallback } from '../src/core/session-create.js';
 import { WorkerOwnerDiagnostics } from '../src/core/worker-owner-diagnostic.js';
 import { acceptSessionGroupTitle } from '../src/services/session-group-title.js';
+const sharedOpenMock = vi.hoisted(() => vi.fn());
+vi.mock('../src/core/shared-thread-opening.js', () => ({
+  SharedThreadClient: class {
+    async initialize() {}
+    close() {}
+  },
+  openSharedThread: (...args: unknown[]) => sharedOpenMock(...args),
+}));
 
 vi.mock('../src/services/session-group-title.js', () => ({
   acceptSessionGroupTitle: vi.fn(),
@@ -117,6 +125,7 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
 }));
 
 vi.mock('../src/bot-registry.js', () => ({
+  durableImRepliesEnabled: vi.fn(() => false),
   getBot: vi.fn(() => ({
     config: {
       larkAppId: 'app_test',
@@ -179,6 +188,7 @@ vi.mock('../src/services/session-store.js', () => {
   cleanupSessionBridgeSendMarkersNow: vi.fn(),
   closeSession: vi.fn(),
   getSessionFresh: vi.fn(),
+  getOwnedSession: vi.fn(),
   updateSession,
   updateSessionPid: vi.fn(),
 }; });
@@ -344,6 +354,7 @@ import { retireCodexAppDispatchAfterBackingMissing } from '../src/utils/codex-ap
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
+import { cliSelectionSnapshot } from '../src/core/cli-selection-snapshot.js';
 
 // 上面那些钩子和配置都按 homedir() 落盘：HOME 不在本文件的测试围栏内就拒绝加载，一个文件都不写。
 if (!isInsideDir(homedir(), process.env.__TEST_DATA_DIR_FENCE)) {
@@ -414,10 +425,387 @@ function defaultBot(overrides: Record<string, unknown> = {}) {
   } as any;
 }
 
+describe('new topics on the existing shared server', () => {
+  function setup() {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ wrapperCli: undefined }));
+    const ds = makeDs();
+    ds.session.cliId = 'codex';
+    ds.session.sharedThreadOpening = { endpoint: 'unix:///tmp/shared-test.sock' };
+    vi.mocked(sessionStore.getOwnedSession).mockImplementation(() => ds.session);
+    setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+    vi.mocked(sessionStore.mutateOwnedSessionsAtomically).mockImplementation((ids, mutate) => {
+      const rows = new Map([[ds.session.sessionId, ds.session]]);
+      return { result: mutate(rows), rows };
+    });
+    return ds;
+  }
+
+  function replacementAfterClose(oldDs: DaemonSession): DaemonSession {
+    const replacement = {
+      ...oldDs,
+      session: structuredClone(oldDs.session),
+      worker: null,
+      hasHistory: true,
+      initialStartPending: false,
+      initialStartClaimToken: undefined,
+    } as DaemonSession;
+    // reactivateClosedSession intentionally abandons the closed lifecycle FIFO;
+    // the next inbound becomes the new durable head.
+    replacement.session.queuedActivationPending = undefined;
+    replacement.session.queuedActivationToken = undefined;
+    replacement.session.queuedActivationInput = undefined;
+    replacement.session.queuedActivationRawInput = undefined;
+    replacement.session.queuedActivationRawTurnId = undefined;
+    replacement.session.queuedActivationTurnId = undefined;
+    replacement.session.queuedActivationDispatchAttempt = undefined;
+    replacement.session.queuedActivationResume = undefined;
+    replacement.session.queuedActivationTail = undefined;
+    replacement.session.queuedActivationTailNextOrder = undefined;
+    vi.mocked(sessionStore.getOwnedSession).mockImplementation(() => replacement.session);
+    setActiveSessionsRegistry(new Map([[activeSessionKey(replacement), replacement]]));
+    return replacement;
+  }
+
+  it('journals the first input before creation and retains a successor in the existing FIFO', async () => {
+    const ds = setup();
+    let release!: () => void;
+    sharedOpenMock.mockImplementation(async () => {
+      expect(ds.session.queuedActivationInput?.content).toBe('first');
+      expect(forkMock).not.toHaveBeenCalled();
+      await new Promise<void>(resolve => { release = resolve; });
+      ds.session.cliSessionId = 'native-test';
+      ds.session.existingAppServerEndpoint = 'unix:///tmp/shared-test.sock';
+      return 'native-test';
+    });
+    forkWorker(ds, 'first', 'first-turn');
+    forkWorker(ds, 'first', 'first-turn');
+    forkWorker(ds, 'second', 'second-turn');
+    await vi.waitFor(() => expect(sharedOpenMock).toHaveBeenCalledOnce());
+    expect(ds.session.queuedActivationInput?.content).toBe('first');
+    expect(ds.session.queuedActivationTail).toHaveLength(1);
+    expect(ds.session.queuedActivationTail?.[0].cliInput.content).toBe('second');
+    release();
+    await vi.waitFor(() => expect(forkMock).toHaveBeenCalledOnce());
+    expect(ds.initConfig).toMatchObject({ cliSessionId: 'native-test',
+      existingAppServerEndpoint: 'unix:///tmp/shared-test.sock', resume: true, prompt: 'first' });
+  });
+
+  it('preserves the opening input when remote creation fails', async () => {
+    const ds = setup();
+    sharedOpenMock.mockRejectedValue(new Error('connection lost'));
+    forkWorker(ds, 'first', 'first-turn');
+    await vi.waitFor(() => expect(loggerErrorMock).toHaveBeenCalled());
+    expect(ds.session.queuedActivationInput?.content).toBe('first');
+    expect(ds.session.queuedActivationPending).toBe(true);
+    expect(ds.initialStartPending).toBe(false);
+    expect(forkMock).not.toHaveBeenCalled();
+    sharedOpenMock.mockImplementation(async () => {
+      ds.session.cliSessionId = 'retried-native';
+      ds.session.existingAppServerEndpoint = 'unix:///tmp/shared-test.sock';
+      return 'retried-native';
+    });
+    forkWorker(ds, '', { resume: true, turnId: 'first-turn' });
+    await vi.waitFor(() => expect(forkMock).toHaveBeenCalledOnce());
+    expect(ds.initConfig?.prompt).toBe('first');
+  });
+
+  it('restores a queued opening even when hasHistory was set during daemon recovery', async () => {
+    const ds = setup();
+    ds.hasHistory = true;
+    sharedOpenMock.mockImplementation(async () => {
+      ds.session.cliSessionId = 'restored-native';
+      ds.session.existingAppServerEndpoint = 'unix:///tmp/shared-test.sock';
+      return 'restored-native';
+    });
+    forkWorker(ds, 'first', 'first-turn');
+    await vi.waitFor(() => expect(forkMock).toHaveBeenCalledOnce());
+    expect(ds.initConfig?.cliSessionId).toBe('restored-native');
+  });
+
+  it('does not create remotely if journaling fails', () => {
+    const ds = setup();
+    sharedOpenMock.mockReset();
+    vi.mocked(sessionStore.updateSession).mockImplementation(() => { throw new Error('disk full'); });
+    expect(() => forkWorker(ds, 'first', 'first-turn')).toThrow('disk full');
+    expect(sharedOpenMock).not.toHaveBeenCalled();
+    expect(forkMock).not.toHaveBeenCalled();
+  });
+
+  it('does not launch a new activation from a stale creation callback', async () => {
+    const ds = setup();
+    sharedOpenMock.mockImplementation(async () => {
+      ds.session.cliSessionId = 'native-test';
+      ds.session.existingAppServerEndpoint = 'unix:///tmp/shared-test.sock';
+      ds.session.backgroundExecutionEpoch = 1;
+      ds.session.queuedActivationToken = 'replacement-activation';
+      return 'native-test';
+    });
+    forkWorker(ds, 'first', 'first-turn');
+    await vi.waitFor(() => expect(sharedOpenMock).toHaveBeenCalledOnce());
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(forkMock).not.toHaveBeenCalled();
+  });
+
+  it('releases the opening gate after a final post-binding admission rejection', async () => {
+    const ds = setup();
+    sharedOpenMock.mockImplementation(async () => {
+      ds.session.cliSessionId = 'native-test';
+      ds.session.existingAppServerEndpoint = 'unix:///tmp/shared-test.sock';
+      return 'native-test';
+    });
+    const allowed = { allowed: true, reasons: [], pressure: { warnings: [] }, policy: {} } as any;
+    const blocked = { allowed: false, reasons: ['host memory exhausted'], pressure: { warnings: [] }, policy: {} } as any;
+    checkWorkerAdmissionMock.mockReturnValueOnce(allowed).mockReturnValueOnce(blocked).mockReturnValue(allowed);
+    const admissions: string[] = [];
+    forkWorker(ds, 'first', 'first-turn', { onAdmission: value => admissions.push(value) });
+
+    await vi.waitFor(() => expect(admissions).toEqual(['deferred', 'rejected']));
+    expect(ds.session.queuedActivationPending).toBe(true);
+    expect(ds.session.queuedActivationInput?.content).toBe('first');
+    expect(ds.worker).toBeNull();
+    expect(ds.initialStartPending).toBe(false);
+    expect(ds.initialStartClaimToken).toBeUndefined();
+    expect(forkMock).not.toHaveBeenCalled();
+
+    // With the route gate released, the next recovery fork attaches the bound
+    // thread and replays the retained head instead of creating another one.
+    forkWorker(ds, ds.session.queuedActivationInput!, { resume: true, turnId: 'first-turn' });
+    await vi.waitFor(() => expect(forkMock).toHaveBeenCalledOnce());
+    expect(sharedOpenMock).toHaveBeenCalledOnce();
+    expect(ds.initConfig).toMatchObject({
+      cliSessionId: 'native-test', existingAppServerEndpoint: 'unix:///tmp/shared-test.sock',
+      prompt: 'first', resume: true,
+    });
+  });
+
+  it('releases the opening gate on a synchronous tail-only refusal without hiding its quarantine', async () => {
+    const ds = setup();
+    sharedOpenMock.mockImplementation(async () => {
+      ds.session.cliSessionId = 'native-test';
+      ds.session.existingAppServerEndpoint = 'unix:///tmp/shared-test.sock';
+      ds.quarantinedActivationTailPromotion = true;
+      return 'native-test';
+    });
+    const admissions: string[] = [];
+    forkWorker(ds, 'first', 'first-turn', { onAdmission: value => admissions.push(value) });
+
+    await vi.waitFor(() => expect(admissions).toEqual(['deferred', 'rejected']), { timeout: 5000 });
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(ds.worker).toBeNull();
+    expect(ds.quarantinedActivationTailPromotion).toBe(true);
+    expect(ds.session.queuedActivationPending).toBe(true);
+    expect(ds.session.queuedActivationInput?.content).toBe('first');
+    expect(ds.initialStartPending).toBe(false);
+    expect(ds.initialStartClaimToken).toBeUndefined();
+  });
+
+  it('releases the opening gate when the bound worker spawn fails after generation reservation', async () => {
+    const ds = setup();
+    ds.initialStartClaimToken = 'opening-claim';
+    const generationBefore = ds.session.workerGeneration;
+    sharedOpenMock.mockImplementation(async () => {
+      ds.session.cliSessionId = 'native-test';
+      ds.session.existingAppServerEndpoint = 'unix:///tmp/shared-test.sock';
+      return 'native-test';
+    });
+    forkMock.mockImplementationOnce(() => { throw new Error('spawn failed'); });
+    forkWorker(ds, 'first', 'first-turn');
+
+    await vi.waitFor(() => expect(forkMock).toHaveBeenCalledOnce(), { timeout: 5000 });
+    expect(ds.session.workerGeneration).not.toBe(generationBefore);
+    expect(ds.worker).toBeNull();
+    expect(ds.session.queuedActivationPending).toBe(true);
+    expect(ds.session.queuedActivationInput?.content).toBe('first');
+    expect(ds.initialStartPending).toBe(false);
+    expect(ds.initialStartClaimToken).toBeUndefined();
+
+    forkMock.mockImplementation(() => makeFakeWorker());
+    forkWorker(ds, ds.session.queuedActivationInput!, { resume: true, turnId: 'first-turn' });
+    await vi.waitFor(() => expect(forkMock).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    expect(sharedOpenMock).toHaveBeenCalledOnce();
+    expect(ds.initConfig).toMatchObject({
+      cliSessionId: 'native-test', existingAppServerEndpoint: 'unix:///tmp/shared-test.sock',
+      prompt: 'first', resume: true,
+    });
+  });
+
+  it('keeps the claim and caller out-flag through deferred marginal admission', async () => {
+    vi.useFakeTimers();
+    const ds = setup();
+    sharedOpenMock.mockImplementation(async () => {
+      ds.session.cliSessionId = 'native-test';
+      ds.session.existingAppServerEndpoint = 'unix:///tmp/shared-test.sock';
+      return 'native-test';
+    });
+    const allowed = { allowed: true, reasons: [], pressure: { warnings: [] }, policy: {} } as any;
+    const marginal = {
+      allowed: false,
+      reasons: ['available memory 7.5 GiB is below the reserved 8.0 GiB'],
+      pressure: {
+        totalMemoryBytes: 32 * 1024 ** 3,
+        availableMemoryBytes: 7.5 * 1024 ** 3,
+        memoryFullAvg10: 0,
+        warnings: [],
+      },
+      policy: {
+        memoryAdmissionEnabled: true,
+        minAvailableMemoryBytes: 8 * 1024 ** 3,
+        maxMemoryFullAvg10: 20,
+        minAvailableMemorySource: 'default',
+        maxMemoryFullAvg10Source: 'default',
+      },
+    } as any;
+    checkWorkerAdmissionMock.mockReturnValueOnce(allowed).mockReturnValueOnce(marginal).mockReturnValue(allowed);
+    const admissions: string[] = [];
+    const opts = { onAdmission: (value: string) => admissions.push(value), marginalReclaimScheduled: false };
+    forkWorker(ds, 'first', 'first-turn', opts);
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(admissions).toEqual(['deferred', 'deferred']);
+    expect(opts.marginalReclaimScheduled).toBe(true);
+    expect(ds.initialStartPending).toBe(true);
+    expect(ds.worker).toBeNull();
+    expect(forkMock).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(admissions).toEqual(['deferred', 'deferred', 'accepted']);
+    expect(forkMock).toHaveBeenCalledOnce();
+    expect(ds.initConfig).toMatchObject({
+      cliSessionId: 'native-test', existingAppServerEndpoint: 'unix:///tmp/shared-test.sock',
+      prompt: 'first', resume: true,
+    });
+  });
+
+  it('releases the opening gate when deferred marginal admission ends in rejection', async () => {
+    vi.useFakeTimers();
+    const ds = setup();
+    sharedOpenMock.mockImplementation(async () => {
+      ds.session.cliSessionId = 'native-test';
+      ds.session.existingAppServerEndpoint = 'unix:///tmp/shared-test.sock';
+      return 'native-test';
+    });
+    const allowed = { allowed: true, reasons: [], pressure: { warnings: [] }, policy: {} } as any;
+    const marginal = {
+      allowed: false,
+      reasons: ['available memory 7.5 GiB is below the reserved 8.0 GiB'],
+      pressure: {
+        totalMemoryBytes: 32 * 1024 ** 3,
+        availableMemoryBytes: 7.5 * 1024 ** 3,
+        memoryFullAvg10: 0,
+        warnings: [],
+      },
+      policy: {
+        memoryAdmissionEnabled: true,
+        minAvailableMemoryBytes: 8 * 1024 ** 3,
+        maxMemoryFullAvg10: 20,
+        minAvailableMemorySource: 'default',
+        maxMemoryFullAvg10Source: 'default',
+      },
+    } as any;
+    const exhausted = {
+      ...marginal,
+      reasons: ['host memory exhausted'],
+      pressure: { ...marginal.pressure, availableMemoryBytes: 0.1 * 1024 ** 3 },
+    };
+    checkWorkerAdmissionMock.mockReturnValueOnce(allowed).mockReturnValueOnce(marginal).mockReturnValue(exhausted);
+    const admissions: string[] = [];
+    const opts = { onAdmission: (value: string) => admissions.push(value), marginalReclaimScheduled: false };
+    forkWorker(ds, 'first', 'first-turn', opts);
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(admissions).toEqual(['deferred', 'deferred']);
+    expect(ds.initialStartPending).toBe(true);
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(admissions).toEqual(['deferred', 'deferred', 'rejected']);
+    expect(opts.marginalReclaimScheduled).toBe(true);
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(ds.worker).toBeNull();
+    expect(ds.session.queuedActivationPending).toBe(true);
+    expect(ds.session.queuedActivationInput?.content).toBe('first');
+    expect(ds.initialStartPending).toBe(false);
+    expect(ds.initialStartClaimToken).toBeUndefined();
+  });
+
+  it('hands the retained activation to a replacement runtime when the stale opener settles', async () => {
+    const oldDs = setup();
+    let release!: () => void;
+    let current: DaemonSession | undefined;
+    sharedOpenMock.mockImplementation(async () => {
+      await new Promise<void>(resolve => { release = resolve; });
+      // The durable transaction updates the reactivated row even though the old
+      // runtime is no longer allowed to launch it.
+      if (!current) throw new Error('replacement runtime missing');
+      current.session.cliSessionId = 'native-replacement';
+      current.session.existingAppServerEndpoint = 'unix:///tmp/shared-test.sock';
+      return 'native-replacement';
+    });
+    forkWorker(oldDs, 'first', 'first-turn');
+    await vi.waitFor(() => expect(sharedOpenMock).toHaveBeenCalledOnce());
+
+    const replacement = replacementAfterClose(oldDs);
+    current = replacement;
+
+    forkWorker(replacement, 'second', 'second-turn');
+    expect(sharedOpenMock).toHaveBeenCalledOnce();
+    expect(replacement.session.queuedActivationInput?.content).toBe('second');
+    expect(replacement.initialStartPending).toBe(true);
+
+    release();
+    await vi.waitFor(() => expect(forkMock).toHaveBeenCalledOnce());
+    expect(sharedOpenMock).toHaveBeenCalledOnce();
+    expect(replacement.worker).not.toBeNull();
+    expect(replacement.initConfig).toMatchObject({
+      cliSessionId: 'native-replacement', existingAppServerEndpoint: 'unix:///tmp/shared-test.sock',
+      prompt: 'second', resume: true,
+    });
+  });
+
+  it.each(['activation token', 'claim token'] as const)('does not run a registered handoff after its %s changes', async changed => {
+    const oldDs = setup();
+    let release!: () => void;
+    sharedOpenMock.mockImplementation(async () => {
+      await new Promise<void>(resolve => { release = resolve; });
+      return 'native-stale';
+    });
+    forkWorker(oldDs, 'first', 'first-turn');
+    await vi.waitFor(() => expect(sharedOpenMock).toHaveBeenCalledOnce());
+
+    const replacement = replacementAfterClose(oldDs);
+    forkWorker(replacement, 'second', 'second-turn');
+    expect(replacement.initialStartPending).toBe(true);
+    if (changed === 'activation token') {
+      replacement.session.queuedActivationToken = 'newer-activation-token';
+      replacement.session.queuedActivationTurnId = 'third-turn';
+      replacement.session.queuedActivationInput = { content: 'third' };
+    } else {
+      replacement.initialStartClaimToken = 'newer-claim';
+    }
+
+    release();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(sharedOpenMock).toHaveBeenCalledOnce();
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(replacement.initialStartPending).toBe(true);
+    expect(replacement.initialStartClaimToken).toBe(changed === 'claim token' ? 'newer-claim' : undefined);
+  });
+});
+
 beforeEach(() => {
   __testOnly_setSuspendBackingVerifier(() => true);
   vi.useRealTimers();
   vi.clearAllMocks();
+  vi.mocked(sessionStore.getOwnedSession).mockReset();
+  vi.mocked(sessionStore.mutateOwnedSessionsAtomically).mockImplementation((ids, mutate) => {
+    const rows = new Map<string, any>();
+    for (const id of ids) {
+      const row = [...vi.mocked(sessionStore.updateSession).mock.calls].reverse()
+        .find(call => call[0]?.sessionId === id)?.[0];
+      if (!row) throw new Error('fixture session not persisted');
+      rows.set(id, structuredClone(row));
+    }
+    return { result: mutate(rows), rows };
+  });
   delete process.env.BOTMUX_TASK_CONTINUATION_ENABLED;
   delete process.env.BOTMUX_READONLY_CONTINUATION_ENABLED;
   vi.mocked(sessionStore.getSessionFresh).mockReturnValue(undefined);
@@ -579,6 +967,7 @@ describe('worker start operation', () => {
       else forkWorker(ds, '');
       const init = send.mock.calls[0][0];
       expect(init.type).toBe('init');
+      expect(init.structuredNoticeAck).toBe(true);
       expect(controller.operation()).toMatchObject({ kind: 'restart', operationId: init.restartAttemptId });
       expect(controller.operation(stop.operationId)).toMatchObject({ phase: 'uncertain', error: 'superseded_by_restart' });
     } finally {
@@ -7953,6 +8342,36 @@ describe('TraeX RPC ordinary follow-up FIFO policy', () => {
       queueAfterActiveTurn: true,
     }));
   });
+
+  it('always gives a followed cross-chat continuation its own serial turn', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex', codexRpcInput: true }));
+    const worker = makeFakeWorker();
+    const base = makeDs();
+    const ds = makeDs({
+      worker,
+      session: { ...base.session, cliId: 'codex' },
+      initConfig: { type: 'init', cliId: 'codex', codexRpcInput: true } as any,
+    });
+    const replyBot = {
+      requestUserOpenId: 'ou_reply_bot', requestUserUnionId: 'on_reply_bot',
+      requestLarkAppId: 'app_test', senderType: 'bot' as const,
+      taskContinuation: {
+        appId: 'app_test', openId: 'ou_source_human', sourceSessionId: 'source-session',
+        sourceTurnId: 'om_source_turn',
+      },
+    };
+
+    expect(sendWorkerInput(ds, 'cross-chat result', 'om_reply', {
+      trustedCaller: replyBot,
+    })).toBe(true);
+
+    expect(worker.send).toHaveBeenLastCalledWith(expect.objectContaining({
+      type: 'message',
+      turnId: 'om_reply',
+      trustedCaller: replyBot,
+      queueAfterActiveTurn: true,
+    }));
+  });
 });
 
 describe('adopt worker re-fork forwards the incoming turn (PR#293 issue #3)', () => {
@@ -7987,6 +8406,7 @@ describe('adopt worker re-fork forwards the incoming turn (PR#293 issue #3)', ()
       adoptMode: true,
       adoptSource: 'tmux',
       adoptTmuxTarget: 'work:0.0',
+      structuredNoticeAck: true,
       cliId: 'claude-code',
       prompt: '<bridge>hello from Lark</bridge>',
       turnId: 'om_refork_turn',
@@ -12587,6 +13007,18 @@ describe('folded-turn reply relay', () => {
     expect(inits.map(init => init?.followUpReply)).toEqual(Array(3).fill(followUpReply ? true : undefined));
   });
 
+  it.each([true, false])('hands foldBackgroundUpdates=%s to primary workers and omits it from adopt workers', foldBackgroundUpdates => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ foldBackgroundUpdates }));
+    initWorkerPool({ sessionReply: vi.fn(async () => 'om_reply'), getSessionWorkingDir: () => REPO, getActiveCount: () => 1, closeSession: vi.fn() });
+    const fresh = makeDs(claudeSession);
+    expect(forkWorker(fresh, 'hello', false)).toBe(true);
+    const adoptedDs = makeDs({ adoptedFrom: { tmuxTarget: 'adopt-switch:0.0', originalCliPid: 23456, sessionId: 'adopted-native', cliId: 'claude-code', cwd: REPO } });
+    forkMock.mockImplementationOnce(() => makeFakeWorker());
+    expect(forkAdoptWorker(adoptedDs)).toBe('accepted');
+    expect(fresh.initConfig?.foldBackgroundUpdates).toBe(foldBackgroundUpdates ? true : undefined);
+    expect(adoptedDs.initConfig?.foldBackgroundUpdates).toBeUndefined();
+  });
+
   it('posts nothing while followUpReply is off, checked when the reply arrives', async () => {
     const { sessionReply, worker } = forkWithReply(adopted);
     vi.mocked(getBot).mockImplementation(() => defaultBot());
@@ -12840,5 +13272,54 @@ describe('a suspend queued while a re-forked worker takes its opening input', ()
     expect(next.send.mock.calls.filter(([message]: [any]) => message?.type === 'message' && message.turnId === 'om_more')).toHaveLength(2);
     expect(ds.worker).toBe(next);
     expect(ds.pendingSuspendReason).toBe('manual_suspend');
+  });
+});
+
+describe('quota fallback chain step launch', () => {
+  const relayBot = () => defaultBot({
+    cliId: 'claude-code',
+    wrapperCli: undefined,
+    model: 'claude-opus-5-5',
+    env: { ANTHROPIC_BASE_URL: 'https://relay.example' },
+  });
+
+  function stepDs(onChain: boolean): DaemonSession {
+    const ds = makeDs();
+    ds.session.cliId = 'claude-code';
+    ds.session.agentFrozen = true;
+    ds.session.cliLaunchSnapshot = { ...cliSelectionSnapshot('traex'), model: 'GPT-6.1-Sol' };
+    if (onChain) ds.session.quotaFallback = { step: 1, cliId: 'traex', model: 'GPT-6.1-Sol' };
+    return ds;
+  }
+
+  async function initMessage(): Promise<any> {
+    for (let i = 0; i < 10; i++) await new Promise(resolve => setTimeout(resolve, 0));
+    const worker = forkMock.mock.results.at(-1)?.value;
+    return worker && vi.mocked(worker.send).mock.calls.map((call: any[]) => call[0]).find((m: any) => m?.type === 'init');
+  }
+
+  it('launches the step CLI and model as a fresh conversation without the bot env', async () => {
+    vi.mocked(getBot).mockImplementation(relayBot);
+    const ds = stepDs(true);
+
+    expect(forkWorker(ds, { content: 'handoff' }, { resume: false, turnId: 'bmx-quota-fallback-1' })).toBe(true);
+    const init = await initMessage();
+
+    expect(init).toMatchObject({ cliId: 'traex', model: 'GPT-6.1-Sol', resume: false, turnId: 'bmx-quota-fallback-1' });
+    expect(JSON.stringify(init.env ?? {})).not.toContain('relay.example');
+    expect(ds.session.cliId).toBe('traex');
+    expect(ds.session.cliLaunchSnapshot?.state).toBe('resolved');
+  });
+
+  it('keeps refusing a /cli selection on a bot with env', async () => {
+    vi.mocked(getBot).mockImplementation(relayBot);
+    const ds = stepDs(false);
+
+    let refused: unknown;
+    try { forkWorker(ds, { content: 'x' }, { resume: false, turnId: 'om_cli' }); } catch (error) { refused = error; }
+    const init = await initMessage();
+
+    expect(String(refused ?? '')).toMatch(/bot env/);
+    expect(init).toBeUndefined();
   });
 });

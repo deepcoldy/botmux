@@ -1,8 +1,18 @@
 import type { AskQuestion, AskResult } from '../core/ask-types.js';
+import { NATIVE_ASYNC_ASK_ORIGIN, NATIVE_ASYNC_RESTORE_ASK_ORIGIN } from '../core/ask-types.js';
 import { codexUserInputAnswer } from './codex-user-input.js';
 import type { CodexAppTurnInput } from '../types.js';
 
-export const CODEX_ASYNC_ASK_ORIGIN = 'native-user-input-async';
+export const CODEX_ASYNC_ASK_ORIGIN = NATIVE_ASYNC_ASK_ORIGIN;
+/** A card restored after a worker restart is a NEW broker identity. The dead
+ *  worker's ask may still be retained as an invalidated terminal under the
+ *  original key; re-registering that key would return the stale result and
+ *  never post a card. */
+export const CODEX_ASYNC_RESTORE_ASK_ORIGIN = NATIVE_ASYNC_RESTORE_ASK_ORIGIN;
+
+export function isCodexAsyncAskOrigin(originKind: string | undefined): boolean {
+  return originKind === CODEX_ASYNC_ASK_ORIGIN || originKind === CODEX_ASYNC_RESTORE_ASK_ORIGIN;
+}
 export interface CodexAsyncUserInput { threadId: string; itemId: string; nativeTurnId?: string }
 
 export function parseCodexAsyncUserInput(value: unknown): CodexAsyncUserInput | undefined {
@@ -33,6 +43,25 @@ export function codexAsyncAnswerSteerable(facts: CodexAsyncAnswerSteerFacts): bo
 /** In-turn answer delivery additionally requires its original native target. */
 export function codexAsyncAnswerSteerTarget(input: CodexAsyncUserInput, facts: CodexAsyncAnswerSteerFacts): string | undefined {
   return codexAsyncAnswerSteerable(facts) ? input.nativeTurnId : undefined;
+}
+
+/** A TUI Codex launch has no app-server input channel: the native question
+ *  reply envelope must reach its composer verbatim. Botmux's role and
+ *  formatting blocks would wrap it and break the correlation. codex-app and
+ *  the hybrid RPC mode keep the structured input. */
+export function codexAsyncAnswerNeedsRawInput(
+  cliId: string | null | undefined, codexRpcInput: boolean | undefined,
+): boolean {
+  return cliId === 'codex' && codexRpcInput !== true;
+}
+
+/** Which Codex launches may register an async question card. codex-app and a
+ *  TUI codex launch both have a reply path; the hybrid RPC mode is excluded
+ *  because its app-server handler owns the same item. */
+export function codexAsyncAskOriginEligible(
+  cliId: string | null | undefined, codexRpcInput: boolean | undefined,
+): boolean {
+  return cliId === 'codex-app' || codexAsyncAnswerNeedsRawInput(cliId, codexRpcInput);
 }
 
 /** This only narrows an existing daemon steer grant. A synthetic async answer
@@ -80,7 +109,7 @@ export function codexAsyncAnswerText(
     questionItemId: JSON.stringify(['request_user_input_async', input.itemId, index]),
     question: [...entry.question.prompt.replace(/[\r\n]/g, ' ')].slice(0, 512).join(''),
     answer: (result.kind === 'answered' && result.answers?.[index]?.length
-      ? answers[entry.id].answers.map(key => entry.question.options.find(o => o.key === key)!.label)
+      ? answers[entry.id].answers.map(value => entry.question.options.find(o => o.key === value)?.label ?? value)
       : answers[entry.id].answers).join('\n'),
   }));
   const json = JSON.stringify(replies).replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/&/g, '\\u0026');

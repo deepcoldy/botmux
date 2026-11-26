@@ -60,6 +60,18 @@ describe('session-observe normalizer', () => {
     expect(observe.raw).toBeUndefined();
   });
 
+  it.each([undefined, { kind: 'blocked', reason: 'CLI startup failed (exit code 1)', at: OBSERVED_AT }])(
+    'does not call a dead CLI working while its diagnostic worker remains alive: %j', attention => {
+      const observe = normalizeSessionRow(makeRow({ status: 'interrupted', agentAttention: attention }), {
+        observedAt: OBSERVED_AT, includeTask: true,
+      });
+      expect(observe.schemaVersion).toBe(1);
+      expect(observe.turn).toBe('interrupted');
+      expect(observe.task).toMatchObject({ kind: 'needs_you', reason: 'interrupted' });
+      if (attention) expect(observe.task?.detail).toBe(attention.reason);
+    },
+  );
+
   it('maps an idle row to alive/idle', () => {
     const observe = normalizeSessionRow(
       makeRow({ status: 'idle', queued: false }),
@@ -384,6 +396,16 @@ describe('session-observe task block', () => {
     })).toEqual({ kind: 'idle' });
   });
 
+  it('keeps delivered after a physical CLI exit, but reports interrupted for a new undelivered input', () => {
+    const row: Partial<RawSessionRow> = { status: 'interrupted', lastMessageAt: OBSERVED_AT - 60_000,
+      lastTurn: { turnId: 't1', outcome: 'delivered', at: OBSERVED_AT - 30_000 } };
+    expect(task(row)).toEqual({ kind: 'delivered', at: OBSERVED_AT - 30_000 });
+    expect(task({ ...row, lastMessageAt: OBSERVED_AT - 10_000 }))
+      .toEqual({ kind: 'needs_you', reason: 'interrupted' });
+    expect(task({ ...row, agentAttention: { kind: 'blocked', reason: 'delivery needs intervention', at: OBSERVED_AT } }))
+      .toMatchObject({ kind: 'needs_you', reason: 'interrupted', detail: 'delivery needs intervention' });
+  });
+
   it('never infers delivered for a session without a recorded turn', () => {
     expect(task({ status: 'idle' })).toEqual({ kind: 'idle' });
     expect(task({ status: 'dormant', workerPid: undefined })).toEqual({ kind: 'idle' });
@@ -423,5 +445,76 @@ describe('session-observe task block', () => {
       includeTask: true,
       probe: { status: 'unreachable', source: 'daemon-ipc' },
     }).task).toBeUndefined();
+  });
+});
+
+describe('normalizeSessionRow queued activation visibility (#3748)', () => {
+  it('surfaces queuedActivationPending and queuedActivationTailCount on live idle and dormant rows without changing queued semantics', () => {
+    const idleBlocked = normalizeSessionRow(
+      makeRow({
+        status: 'idle',
+        queued: false,
+        queuedActivationPending: true,
+        queuedActivationTailCount: 3,
+      }),
+      { observedAt: OBSERVED_AT },
+    );
+    expect(idleBlocked.liveness).toBe('alive');
+    expect(idleBlocked.turn).toBe('idle');
+    expect(idleBlocked.queued).toBe(false);
+    expect(idleBlocked.queuedActivationPending).toBe(true);
+    expect(idleBlocked.queuedActivationTailCount).toBe(3);
+
+    const dormantBlocked = normalizeSessionRow(
+      makeRow({
+        status: 'dormant',
+        queued: false,
+        queuedActivationPending: true,
+        queuedActivationTailCount: 2,
+      }),
+      { observedAt: OBSERVED_AT },
+    );
+    expect(dormantBlocked.liveness).toBe('not_running');
+    expect(dormantBlocked.queuedActivationPending).toBe(true);
+    expect(dormantBlocked.queuedActivationTailCount).toBe(2);
+  });
+
+  it('omits queuedActivationPending and queuedActivationTailCount when settled, zero, closed, or probe failed', () => {
+    const settled = normalizeSessionRow(
+      makeRow({
+        status: 'idle',
+        queued: false,
+        queuedActivationPending: false,
+        queuedActivationTailCount: 0,
+      }),
+      { observedAt: OBSERVED_AT },
+    );
+    expect('queuedActivationPending' in settled).toBe(false);
+    expect('queuedActivationTailCount' in settled).toBe(false);
+
+    const closed = normalizeSessionRow(
+      makeRow({
+        status: 'closed',
+        queuedActivationPending: true,
+        queuedActivationTailCount: 3,
+      }),
+      { observedAt: OBSERVED_AT },
+    );
+    expect('queuedActivationPending' in closed).toBe(false);
+    expect('queuedActivationTailCount' in closed).toBe(false);
+
+    const failedProbe = normalizeSessionRow(
+      makeRow({
+        status: 'idle',
+        queuedActivationPending: true,
+        queuedActivationTailCount: 3,
+      }),
+      {
+        observedAt: OBSERVED_AT,
+        probe: { status: 'unreachable', source: 'daemon-ipc' },
+      },
+    );
+    expect('queuedActivationPending' in failedProbe).toBe(false);
+    expect('queuedActivationTailCount' in failedProbe).toBe(false);
   });
 });

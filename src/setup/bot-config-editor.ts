@@ -244,6 +244,10 @@ export interface BotConfigEditInput {
    *   - '' / '-' → 清空（回到默认 ON）
    */
   showInTeam?: string;
+  /** 飞书开放平台预判卡审批时草稿态自动二分避开需审权限（默认 ON；仅 false 落盘）。 */
+  autoAvoidApproval?: string;
+  /** AI 在后台盯长任务时将等待进展收进折叠区（默认 OFF；仅 true 落盘）。 */
+  foldBackgroundUpdates?: string;
   /** UI 语言：zh 或 en；'-' 或 null 清空。 */
   lang?: string | null;
 }
@@ -477,6 +481,7 @@ export const CLONE_EXCLUDED_KEYS = [
   'activationStarting',
   'activationCommitted',
   'extraScopesFile',
+  'approvalDeferredScopes',
 ] as const;
 
 /**
@@ -566,7 +571,13 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
   const out: Record<string, any> = { ...bot };
 
   const appId = trimmed(input.larkAppId);
-  if (appId) out.larkAppId = appId;
+  if (appId) {
+    if (appId !== bot.larkAppId) {
+      // approvalDeferredScopes 是原飞书应用的权限审批记录，换绑新应用后不得继承。
+      delete out.approvalDeferredScopes;
+    }
+    out.larkAppId = appId;
+  }
 
   const name = normalizeBotProcessName(input.name);
   if (input.name !== undefined) {
@@ -724,6 +735,10 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
 
   // 平台团队展示默认 ON → 只把显式 false 落盘。
   applyOptionalBoolean(out, 'showInTeam', input.showInTeam, true);
+  // 开放平台卡审批自动避开默认 ON → 只把显式 false 落盘。
+  applyOptionalBoolean(out, 'autoAvoidApproval', input.autoAvoidApproval, true);
+  // 折叠后台等待进展默认 OFF → 只把显式 true 落盘。
+  applyOptionalBoolean(out, 'foldBackgroundUpdates', input.foldBackgroundUpdates, false);
 
   if (input.lang !== undefined) {
     if (input.lang === null || input.lang.trim() === '-') {

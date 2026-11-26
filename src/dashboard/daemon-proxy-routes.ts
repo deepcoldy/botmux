@@ -102,7 +102,8 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   putBotConfig('steward', { kind: 'json', maxBytes: 64 * 1024 }),
   // task-routing：`{ taskRouting: {...} | null }`（参与开关及画像配置）。
   putBotConfig('task-routing', { kind: 'json', maxBytes: 64 * 1024 }),
-  putBotConfig('owner-group-follow', { kind: 'json', maxBytes: 64 * 1024 }),
+  // Both rule lists can contain 50 patterns of 200 characters plus per-rule JSON and excluded IDs.
+  putBotConfig('owner-group-follow', { kind: 'json', maxBytes: 256 * 1024 }),
   // actor-owner-bindings：完整替换 target Bot 的 source Bot 双 ID → Owner 策略。
   putBotConfig('actor-owner-bindings'),
   putBotConfig('feedback'),
@@ -133,6 +134,7 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   putBotConfig('lark-tool-binding'),
   // lark-user-owner-fallback：`{ enabled: boolean }`（没有发起人时 --as user 用主人的飞书身份）。
   putBotConfig('lark-user-owner-fallback'),
+  putBotConfig('auto-avoid-approval'),
   {
     method: 'GET',
     path: botPath('trigger-user-auth-status'),
@@ -158,8 +160,11 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   putBotConfig('read-isolation'),
   // backend-type：`{ backendType: 'pty'|'tmux'|'herdr'|'zellij'|'zmx'|'hc'|'' }`（''/'auto' 清除覆盖）。
   putBotConfig('backend-type'),
+  putBotConfig('hc-herdr-tabs'),
   // card-prefs：任意子集的 per-bot 行为布尔 / prompt 字符串。
   putBotConfig('card-prefs'),
+  // quota-fallback-chain：`{ enabled, kinds, steps: [{ cliId, model? }] }`，同 Bot 额度耗尽切换 CLI / 模型。
+  putBotConfig('quota-fallback-chain', { kind: 'json', maxBytes: 16 * 1024 }),
   // substitute-mode：`{ enabled, targets, disclosure }`。
   putBotConfig('substitute-mode'),
   // substitute-targets/resolve：只预览解析单个 target、不落盘，供 dashboard 自动补全。

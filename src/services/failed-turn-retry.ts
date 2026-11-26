@@ -9,7 +9,11 @@
  * Pure functions only — persistence and IPC stay with the daemon/command-handler
  * callers, mirroring the ordinary-turn-recovery split.
  */
-import type { CodexAppTurnInput, FailedTurnRecord, TrustedCaller } from '../types.js';
+import type { CodexAppTurnInput, FailedTurnRecord, LarkAttachment, TrustedCaller } from '../types.js';
+import {
+  sameAntigravityTranscriptWriteBoundary,
+  type CliUsageLimitState,
+} from '../utils/cli-usage-limit.js';
 
 /** Cooldown between two `/retry` attempts on the same session. */
 export const RETRY_COOLDOWN_MS = 10_000;
@@ -28,7 +32,7 @@ export function buildFailedTurnRecord(
     directFailure?: true;
   },
   sources: { userPrompt?: string; cliInput?: string; codexAppInput?: CodexAppTurnInput;
-    trustedCaller?: TrustedCaller; originalTurnId?: string; silent?: boolean },
+    attachments?: LarkAttachment[]; trustedCaller?: TrustedCaller; originalTurnId?: string; silent?: boolean },
   now: Date = new Date(),
 ): FailedTurnRecord | undefined {
   if (!sources.cliInput) return undefined;
@@ -37,6 +41,7 @@ export function buildFailedTurnRecord(
     userPrompt: sources.userPrompt ?? sources.cliInput,
     cliInput: sources.cliInput,
     ...(sources.codexAppInput ? { codexAppInput: sources.codexAppInput } : {}),
+    ...(sources.attachments?.length ? { attachments: structuredClone(sources.attachments) } : {}),
     failedAt: now.toISOString(),
     ...(terminal.errorCode ? { errorCode: terminal.errorCode } : {}),
     status: terminal.status,
@@ -47,6 +52,40 @@ export function buildFailedTurnRecord(
     ...(sources.trustedCaller ? { trustedCaller: { ...sources.trustedCaller } } : {}),
     ...(sources.originalTurnId ? { originalTurnId: sources.originalTurnId } : {}),
   };
+}
+
+/** Whether the persisted provisional proof and its current-turn transcript
+ * boundary both match the latest worker evidence. Boundary-only upgrades must
+ * be persisted too; directFailure without a boundary remains manual-only. */
+export function failedTurnDirectFailureProofMatches(
+  record: FailedTurnRecord,
+  limit: Pick<CliUsageLimitState, 'directFailure' | 'antigravityWriteBoundary'>,
+): boolean {
+  const directFailure = limit.directFailure === true ? true : undefined;
+  const boundary = directFailure ? limit.antigravityWriteBoundary : undefined;
+  return record.directFailure === directFailure
+    && sameAntigravityTranscriptWriteBoundary(record.antigravityWriteBoundary, boundary);
+}
+
+/** Atomically project directFailure and its boundary into a failed-turn record.
+ * Revoking the proof always revokes the boundary as well. */
+export function syncFailedTurnDirectFailureProof(
+  record: FailedTurnRecord,
+  limit: Pick<CliUsageLimitState, 'directFailure' | 'antigravityWriteBoundary'>,
+): FailedTurnRecord {
+  const next: FailedTurnRecord = { ...record };
+  if (limit.directFailure === true) {
+    next.directFailure = true;
+    if (limit.antigravityWriteBoundary) {
+      next.antigravityWriteBoundary = { ...limit.antigravityWriteBoundary };
+    } else {
+      delete next.antigravityWriteBoundary;
+    }
+  } else {
+    delete next.directFailure;
+    delete next.antigravityWriteBoundary;
+  }
+  return next;
 }
 
 /** Remaining cooldown in ms before `/retry` may fire again (0 = ready). */

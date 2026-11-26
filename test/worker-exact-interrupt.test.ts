@@ -1,7 +1,11 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createContext, runInContext } from 'node:vm';
 import { transpileModule, ModuleKind, ScriptTarget } from 'typescript';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
+import { commitDoubaoExportMode, doubaoExportOwnsTerminals } from '../src/services/doubao-export-recovery.js';
 import { InflightInputTracker } from '../src/core/inflight-input-tracker.js';
 import { isCodexAppCliId } from '../src/adapters/cli/types.js';
 import { TraexAutoModelController } from '../src/services/traex-auto-model.js';
@@ -18,6 +22,8 @@ if (start < 0 || end < start) throw new Error('Exact interrupt handler not found
 const handler = transpileModule(source.slice(start, end), {
   compilerOptions: { target: ScriptTarget.ES2022, module: ModuleKind.None },
 }).outputText;
+const directories: string[] = [];
+afterEach(() => { for (const dir of directories.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 function harness(delivered = true, interruptKey?: 'ctrlc' | 'esc', cliId = 'codex') {
   const inflightInputs = new InflightInputTracker();
@@ -42,9 +48,11 @@ function harness(delivered = true, interruptKey?: 'ctrlc' | 'esc', cliId = 'code
     sendCriticalControlKey: controlKey,
     sendTermActionOnce: control,
     retireDoubaoBridgeTurnOnInterrupt,
+    prepareDoubaoStopBarrier: vi.fn(),
     submitCursorParkedFollowUpAfterStop,
   });
   context.nativeSessionForkPending = loadWorkerFunction('nativeSessionForkPending', context);
+  context.waitForDoubaoSubmissionBeforeStop = loadWorkerFunction('waitForDoubaoSubmissionBeforeStop', context);
   context.holdTraexRecoveryForStop = loadWorkerFunction('holdTraexRecoveryForStop', context);
   context.settleStoppedTraexRecovery = loadWorkerFunction('settleStoppedTraexRecovery', context);
   runInContext(handler, context);
@@ -54,6 +62,85 @@ function harness(delivered = true, interruptKey?: 'ctrlc' | 'esc', cliId = 'code
 }
 
 describe('worker exact interrupt acknowledgement and crash replay', () => {
+  function doubaoHarness(delivered = true) {
+    const h = harness(delivered, 'esc', 'doubao');
+    const directory = mkdtempSync(join(tmpdir(), 'doubao-stop-barrier-'));
+    directories.push(directory);
+    const queue = new CodexBridgeQueue(() => 0);
+    queue.mark('stop', 'cancelled task', 0);
+    queue.ingest([{ kind: 'user', uuid: 'native-stop', timestampMs: 0, text: 'cancelled task' }]);
+    Object.assign(h.context, { config: { session: { dataDir: directory } }, codexBridgeQueue: queue,
+      codexBridgeRolloutPath: 'trajectory', inputDeliveryObservedCliSessionId: '38451111111111111',
+      lastResolvedSandboxMode: undefined, structuredBridgeIs: (id: string) => id === 'doubao',
+      commitDoubaoExportMode, doubaoExportOwnsTerminals, codexBridgeIngest: vi.fn(), isPromptReady: true });
+    h.context.prepareDoubaoStopBarrier = loadWorkerFunction('prepareDoubaoStopBarrier', h.context);
+    h.context.retireDoubaoBridgeTurnOnInterrupt = loadWorkerFunction('retireDoubaoBridgeTurnOnInterrupt', h.context);
+    return { ...h, directory, queue };
+  }
+
+  it('commits the Doubao source barrier before delivering the stop key and retiring its owner', async () => {
+    const h = doubaoHarness();
+    h.control.mockImplementation(async () => {
+      expect(doubaoExportOwnsTerminals(h.directory, 'trajectory')).toBe(true);
+      expect(h.queue.peek()).toHaveLength(1);
+      return true;
+    });
+    await h.interrupt();
+    expect(h.queue.peek()).toEqual([]);
+    expect(h.send).toHaveBeenCalledWith(expect.objectContaining({ delivered: true }));
+  });
+
+  it('protects an accepted Doubao input even before the transcript poll establishes its native start', async () => {
+    const h = doubaoHarness();
+    h.queue.clearPending();
+    h.queue.mark('stop', 'cancelled task', 0);
+    await h.interrupt();
+    expect(doubaoExportOwnsTerminals(h.directory, 'trajectory')).toBe(true);
+    expect(h.queue.peek()).toEqual([]);
+    expect(h.send).toHaveBeenCalledWith(expect.objectContaining({ delivered: true }));
+  });
+
+  it('waits for input receipt bookkeeping before choosing the Doubao terminal source', async () => {
+    const h = doubaoHarness();
+    h.context.inputDeliveryObservedCliSessionId = undefined;
+    h.context.cliSubmissionInFlight = { item: { turnId: 'stop' }, generation: 1 };
+    h.context.cliSpawnGeneration = 1;
+    const stopping = h.interrupt();
+    await new Promise(resolve => setImmediate(resolve));
+    expect(h.control).not.toHaveBeenCalled();
+    h.context.inputDeliveryObservedCliSessionId = '38451111111111111';
+    h.context.cliSubmissionInFlight = null;
+    await stopping;
+    expect(doubaoExportOwnsTerminals(h.directory, 'trajectory')).toBe(true);
+    expect(h.send).toHaveBeenCalledWith(expect.objectContaining({ delivered: true }));
+  });
+
+  it('does not claim or dispatch an unsafe managed stop when its source checkpoint fails, and retries after repair', async () => {
+    const h = doubaoHarness();
+    const barrier = join(h.directory, 'doubao-export');
+    writeFileSync(barrier, 'not a directory');
+    await h.interrupt();
+    expect(h.control).not.toHaveBeenCalled();
+    expect(h.queue.peek()).toHaveLength(1);
+    expect(h.send).toHaveBeenCalledWith(expect.objectContaining({ delivered: false, reason: 'delivery_failed' }));
+    rmSync(barrier);
+    await h.interrupt();
+    expect(h.control).toHaveBeenCalledOnce();
+    expect(h.queue.peek()).toEqual([]);
+    expect(doubaoExportOwnsTerminals(h.directory, 'trajectory')).toBe(true);
+  });
+
+  it('keeps a committed source barrier when the stop key is not delivered and safely reuses it on retry', async () => {
+    const h = doubaoHarness(false);
+    await h.interrupt();
+    expect(doubaoExportOwnsTerminals(h.directory, 'trajectory')).toBe(true);
+    expect(h.queue.peek()).toHaveLength(1);
+    h.control.mockResolvedValue(true);
+    await h.interrupt();
+    expect(h.queue.peek()).toEqual([]);
+    expect(h.send).toHaveBeenLastCalledWith(expect.objectContaining({ delivered: true }));
+  });
+
   it('does not interrupt a later dispatch attempt that reused the same logical turn id', async () => {
     const h = harness(); const scope = new WorkerSessionEventScope({ appId: 'cli_exact', sessionId: 'sid' }, { workerId: 'worker', generation: 1 });
     const binding = scope.beginRuntime(); scope.assign(binding.bindingId, { runtimeId: 'runtime', epoch: 1 });

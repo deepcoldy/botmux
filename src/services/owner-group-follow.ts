@@ -1,5 +1,6 @@
 import type { OwnerGroupFollowConfig } from './owner-group-follow-policy.js';
-import { registerOwnerGroupFollowChangeHandler } from './owner-group-follow-policy.js';
+import { evaluateOwnerGroupFollowFilter, registerOwnerGroupFollowChangeHandler } from './owner-group-follow-policy.js';
+import type { OwnerFollowChatItem } from './owner-group-follow-runtime.js';
 import { OwnerGroupFollowStore } from './owner-group-follow-store.js';
 
 export interface OwnerGroupFollowContext {
@@ -12,10 +13,11 @@ export interface OwnerGroupFollowDependencies {
   dataDir: string;
   context(): OwnerGroupFollowContext;
   token(ownerOpenId: string, signal: AbortSignal): Promise<string | null>;
-  listChats(token: string, signal: AbortSignal): Promise<string[]>;
+  listChats(token: string, signal: AbortSignal): Promise<readonly (string | OwnerFollowChatItem)[]>;
   listBotChats(signal: AbortSignal): Promise<string[]>;
   invite(chatId: string, token: string, signal: AbortSignal): Promise<void>;
-  notify(ownerOpenId: string, chatId: string | undefined, issue: OwnerGroupFollowIssue | undefined, current: () => boolean): Promise<void>;
+  /** `false` means the notice was abandoned before delivery and its dedup claim must be released. */
+  notify(ownerOpenId: string, chatId: string | undefined, issue: OwnerGroupFollowIssue | undefined, current: () => boolean): Promise<boolean | void>;
   log(message: string): void;
   now?: () => number;
 }
@@ -73,18 +75,27 @@ export function createOwnerGroupFollower(deps: OwnerGroupFollowDependencies) {
       && store.read()?.epoch === epoch;
     const notice = async (chatId?: string, issue?: OwnerGroupFollowIssue) => {
       if (!current()) return;
+      let claimedAt: number | undefined;
       if (!chatId) {
         let shouldNotify = false;
         store.update(epoch, value => {
           if (value.authNoticeAt === undefined || now() - value.authNoticeAt >= 6 * 60 * 60_000) {
-            value.authNoticeAt = now(); shouldNotify = true;
+            claimedAt = now(); value.authNoticeAt = claimedAt; shouldNotify = true;
           }
         });
         if (!shouldNotify) return;
       }
       if (current()) {
-        await deps.notify(owner, chatId, issue, current)
+        const delivered = await deps.notify(owner, chatId, issue, current)
           .catch(() => deps.log('owner group follow notification failed'));
+        if (delivered === false && claimedAt !== undefined) {
+          // A superseded platform notice proves nothing about the newly selected
+          // local source. Release only this claim; a newer claim must survive.
+          store.update(epoch, value => {
+            if (value.authNoticeAt !== claimedAt) return false;
+            delete value.authNoticeAt;
+          });
+        }
       }
     };
     try {
@@ -97,21 +108,31 @@ export function createOwnerGroupFollower(deps: OwnerGroupFollowDependencies) {
       if (!current()) return;
       const botChats = new Set(await deps.listBotChats(signal));
       if (!current()) return;
-      const excluded = new Set(deps.context().config?.excludeChatIds ?? []);
-      const observedRevision = store.observe(epoch, chats, botChats, excluded, snapshotRevision);
+      const chatById = new Map<string, OwnerFollowChatItem>();
+      for (const item of chats) {
+        const chat = typeof item === 'string' ? { chatId: item } : item;
+        if (!chatById.has(chat.chatId)) chatById.set(chat.chatId, chat);
+      }
+      const chatIds = [...chatById.keys()];
+      const config = deps.context().config;
+      const ineligible = new Set<string>();
+      for (const chat of chatById.values()) {
+        if (!evaluateOwnerGroupFollowFilter(config, chat).matched) ineligible.add(chat.chatId);
+      }
+      const observedRevision = store.observe(epoch, chatIds, botChats, ineligible, snapshotRevision);
       if (observedRevision === undefined) return;
       let roundRevision = observedRevision;
-      const joinedByOwner = new Set(chats);
       const entries = store.read()?.entries ?? {};
       for (const [chatId, entry] of Object.entries(entries)) {
         if (!current()) return;
-        if (!joinedByOwner.has(chatId) || botChats.has(chatId) || excluded.has(chatId)
+        const chat = chatById.get(chatId);
+        if (!chat || botChats.has(chatId) || ineligible.has(chatId)
             || !['pending', 'inviting'].includes(entry.status)) continue;
         // Resolve again before writing: local logout/revocation must stop the scan.
         const freshToken = await deps.token(owner, signal);
         if (!current()) return;
         if (!freshToken) { await notice(); return; }
-        if (deps.context().config?.excludeChatIds?.includes(chatId)) continue;
+        if (!evaluateOwnerGroupFollowFilter(deps.context().config, chat).matched) continue;
         if (entry.status === 'inviting' && entry.attempts >= 3 && now() - (entry.startedAt ?? now()) >= 120_000) {
           if (entry.attemptId) {
             const settledRevision = store.finish(epoch, chatId, entry.attemptId, 'failed', now());

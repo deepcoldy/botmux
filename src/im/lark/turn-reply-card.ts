@@ -5,6 +5,7 @@ import {
   replyCardIsTerminal, type ReplyCardTool, type TurnReplyCardRecord, type ReplyCardActivity,
 } from '../../services/turn-reply-card.js';
 import { buildTurnReplyAskElements, turnReplyAskSummary } from './turn-reply-ask-elements.js';
+import { ASK_CARD_COLORS, ASK_CARD_ELEMENT_LIMIT, countCardElements } from './ask-card-look.js';
 import { buildCardBodyElements, cardUsageFooterSegment, cardUsageRuntimeSegment, createReplyCard, prepareCardMarkdown, stripCardMarkdownImages } from './md-card.js';
 import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from './turn-reply-card-size.js';
 import { markGroupContextCardPurpose } from './group-context-card.js';
@@ -204,15 +205,7 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
   }
 
   if (pendingAsks.length) {
-    const askElements = buildTurnReplyAskElements(pendingAsks[0], presentation.locale);
-    const isOptions = (element: Record<string, any> | undefined) => element?.columns?.some((column: any) =>
-      column.elements?.some((button: any) => button.behaviors?.some((behavior: any) =>
-        ['ask_select', 'ask_toggle'].includes(behavior.value?.action))));
-    card.body.elements.unshift(...askElements.map((element, index) => ({ ...element,
-      element_id: isOptions(element) ? `botmux_turn_options_${index}`
-        : element.tag === 'markdown' && isOptions(askElements[index + 1]) ? `botmux_turn_question_${index}`
-          : `botmux_turn_control_ask_${index}`,
-    })));
+    // The Ask itself goes in last (below), once the rest of the card is known.
     if (pendingAsks.length > 1) card.body.elements.push({ tag: 'markdown', element_id: 'botmux_turn_control', text_size: 'notation', content: en
       ? `${pendingAsks.length - 1} more requests will appear after this one is answered.`
       : `还有 ${pendingAsks.length - 1} 个待回答请求，完成当前问题后依次显示。` });
@@ -229,10 +222,14 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
     // can turn escaped fences into real ones and thereby hand back image syntax
     // that was inert when we scanned. Run the same normalization first so the
     // strip sees exactly the text the renderer will parse.
-    const content = latest
-      ? stripCardMarkdownImages(prepareCardMarkdown(bounded(latest, 6000), presentation.workingDir, 'disabled'))
-      : terminal ? (en ? 'No final answer was provided. See the turn record below.' : '本轮没有提供最终答复，可查看下方过程记录。')
-        : (en ? 'Working on your request…' : '正在处理你的请求…');
+    const content = record.displayRetired && record.progress.length === 0
+      // Silent display retirement after external delivery/an earlier notice has
+      // no warning body to add. Do not synthesise the generic "no final" prose.
+      ? ''
+      : latest
+        ? stripCardMarkdownImages(prepareCardMarkdown(bounded(latest, 6000), presentation.workingDir, 'disabled'))
+        : terminal ? (en ? 'No final answer was provided. See the turn record below.' : '本轮没有提供最终答复，可查看下方过程记录。')
+          : (en ? 'Working on your request…' : '正在处理你的请求…');
     card.body.elements.push(...buildCardBodyElements(content, presentation.workingDir, 'disabled')
       .map((element, index) => ({ ...element, element_id: element.element_id ?? `botmux_turn_progress_${index}` })));
   }
@@ -341,6 +338,15 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
           text_size: 'notation', content: `<font color='grey'>${en ? 'Working…' : '正在处理…'}</font>` }] },
         ...(controls?.columns ?? []),
       ] } as any);
+  }
+  if (pendingAsks.length) {
+    // Built last so it gets what the rest of the card leaves of Feishu's element limit
+    // (two spare for the purpose marker carrier). It sits right under the status line.
+    const askElements = buildTurnReplyAskElements(pendingAsks[0], presentation.locale,
+      ASK_CARD_ELEMENT_LIMIT - 2 - countCardElements(card));
+    card.body.elements.splice(card.body.elements[0]?.element_id === 'botmux_turn_status' ? 1 : 0, 0, ...askElements);
+    const config = card.config as Record<string, any>;
+    card.config = { ...config, style: { ...config.style, color: { ...config.style?.color, ...ASK_CARD_COLORS } } } as unknown as typeof card.config;
   }
   // Feedback becomes clickable after runtime settlement, avoiding a feedback
   // callback racing with the last status PATCH.

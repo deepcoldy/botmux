@@ -12,6 +12,12 @@ const fixture = fileURLToPath(new URL('./fixtures/send-reply-card-capture.ts', i
 // copy: `botmux send` there takes hideLocalAddresses from the snapshot the
 // worker froze into the session env when it was forked.
 describe('botmux send in an env-only (remote) session', () => {
+  const loginCommand = '/login --scope --allow-unknown minutes:minutes.basic:read drive:file:download drive:file:upload offline_access';
+  const message = [
+    '日志在 /opt/app/logs/error.log，服务 http://localhost:3000/health，报告:file:///tmp/local-report.md',
+    '', '```sh', loginCommand, '```',
+  ].join('\n');
+
   function sendInRemoteSession(snapshot: '1' | '0' | undefined, staleBotsJsonValue?: boolean) {
     const root = mkdtempSync(join(tmpdir(), 'botmux-remote-local-address-'));
     try {
@@ -20,8 +26,7 @@ describe('botmux send in an env-only (remote) session', () => {
       writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({ sessionId: 'riff-sid', turnId: 'om_turn' }));
       writeFileSync(join(root, 'bots.json'), JSON.stringify([{ larkAppId: 'cli_riff', larkAppSecret: 'secret', cliId: 'riff',
         replyCardMode: 'legacy', ...(staleBotsJsonValue === undefined ? {} : { hideLocalAddresses: staleBotsJsonValue }) }]));
-      const result = spawnSyncTsScript(fixture, ['send', '--no-mention', '--response-kind', 'progress',
-        '日志在 /opt/app/logs/error.log，服务 http://localhost:3000/health'], {
+      const result = spawnSyncTsScript(fixture, ['send', '--no-mention', '--response-kind', 'progress', message], {
         cwd: process.cwd(), encoding: 'utf8', timeout: 30_000,
         env: { ...process.env, HOME: root, SESSION_DATA_DIR: dataDir, BOTS_CONFIG: join(root, 'bots.json'),
           BOTMUX_LARK_APP_ID: 'cli_riff', BOTMUX_LARK_APP_SECRET: 'secret',
@@ -37,12 +42,14 @@ describe('botmux send in an env-only (remote) session', () => {
     }
   }
 
-  it('replaces host addresses when the snapshot says the bot turned it on', () => {
+  it('replaces host addresses and preserves OAuth scopes when the snapshot turns the policy on', () => {
     const { result, sent } = sendInRemoteSession('1', false);
     expect(result.status, result.stderr).toBe(0);
     expect(sent).toContain('日志在');
     expect(sent).not.toContain('/opt/app/logs');
     expect(sent).not.toContain('localhost:3000');
+    expect(sent).not.toContain('local-report.md');
+    expect(sent).toContain(loginCommand);
   });
 
   it.each([['0', true], [undefined, undefined]] as const)('sends host addresses as written with snapshot %s', (snapshot, stale) => {
