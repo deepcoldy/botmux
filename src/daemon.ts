@@ -58,7 +58,7 @@ import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection
 import { stripDispatchCompletionProtocol } from './core/dispatch.js';
 import { withConfiguredBotOwner } from './core/bot-owner-attribution.js';
 import { readCanonicalBotActorOwnerBindings } from './core/bot-actor-owner-binding.js';
-import { releaseExplicitAskHandoff, hasExplicitAskHandoff, invalidateExplicitAsk, setExplicitAskSessionChecker, retireExplicitAsk, explicitAskSnapshot } from './core/ask-broker.js';
+import { releaseExplicitAskHandoff, hasExplicitAskHandoff, hydrateLegacyExplicitAskCardRoot, invalidateExplicitAsk, setExplicitAskSessionChecker, retireExplicitAsk, explicitAskSnapshot } from './core/ask-broker.js';
 import { createExplicitAskContinuation, explicitAskRecoveryRequest, explicitAskOriginIsLive, explicitAskRetirementBound, explicitAskSessionBound } from './core/explicit-ask-continuation.js';
 import { createManagedAskControl, parseManagedAskControl } from './core/managed-ask-control.js';
 import { canSafelyReclaimWorkerForInstallChange, suspendWorkerAsync } from './core/worker-pool.js';
@@ -1196,6 +1196,7 @@ import {
   restorePersistedAsks as restorePersistedAsksBroker,
   startHookAskReclaim,
   findPendingAskByAnchor,
+  findPendingLegacyAskByCard,
   listPendingAsksByAnchor,
   askAnswerActorFor,
   submitCustomReply,
@@ -12261,6 +12262,13 @@ const explicitAskContinuation = createExplicitAskContinuation({
   invalidate: invalidateExplicitAsk,
   retire: retireExplicitAsk,
   canRetire: receipt => explicitAskRetirementBound(receipt, findActiveBySessionId(receipt.input.sessionId)),
+  resolveCardRoot: receipt => {
+    const ds = findActiveBySessionId(receipt.input.sessionId);
+    if (ds?.session.scope !== 'chat' || receipt.input.deliveryTarget || !receipt.origin?.turnId) return undefined;
+    const target = frozenReplyContextForTurn(ds, receipt.origin.turnId).target;
+    return target.mode === 'thread' ? target.rootMessageId : undefined;
+  },
+  hydrateCardRoot: hydrateLegacyExplicitAskCardRoot,
   snapshot: explicitAskSnapshot,
   shouldInvalidate: receipt => sessionsRestored
     && !explicitAskSessionBound(receipt.input, findActiveBySessionId(receipt.input.sessionId)),
@@ -12585,12 +12593,12 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
     backendSurvivesRestart:
       !!askSession && getSessionPersistentBackendType(askSession) !== undefined,
   };
-  // chat-scope 的 ask 身份仍是 root=null（文字答复按 chatId 锚点命中），独立卡片只是跟着发起
-  // turn 冻结的话题落点。嵌进回复卡的 ask 由回复卡决定位置；异步提问的提示与答复 turn
-  // 都按 root=null 发，卡片不单独搬走。
+  // chat-scope 的调用身份仍是 root=null；冻结提问话题供发卡与文字隔离使用。
+  // 内嵌 ask 也保留该位置，避免回复卡尚无 messageId 时首发到群外层或共用会话时吞掉其它话题的输入。
+  // 异步 ask 沿用自身绑定的原生话题，不覆盖其卡片落点。
   const askTurnTarget = askSession?.session.scope === 'chat' && typeof body.originTurnId === 'string'
     ? frozenReplyContextForTurn(askSession, body.originTurnId).target : undefined;
-  const cardRoot = asyncInput || askInput.replyCardTarget || askTurnTarget?.mode !== 'thread'
+  const cardRoot = asyncInput || documentDelivery || askTurnTarget?.mode !== 'thread'
     ? undefined : { cardRootMessageId: askTurnTarget.rootMessageId };
   // 点名核验查通讯录，结果随重连可能变化，所以和卡片落点一样只作展示、不进调用身份。
   // 文档 ask 私聊发给作者，确认回执不发卡，都不点名。
@@ -31662,7 +31670,7 @@ async function handleThreadReplyAdmitted(
   // 触发的排除理由），拦截器这里只负责拿着结果去 settle。
   // 没有 hook 连着的 dormant hook ask（hook 随 CLI 退出、或重启后还没重连）不在
   // 候选里——broker 的 list/find 已过滤：此刻没有 CLI 在等答案，这条文字照常进会话。
-  const askCandidate = (ctx.effortTaskReentry || ctx.crossChatThreadFollowUp) ? null : askCustomReplyCandidate({
+  const askCandidate = (ctx.effortTaskReentry || ctx.crossChatThreadFollowUp || ctx.completionProposalContinuation) ? null : askCustomReplyCandidate({
     senderOpenId: threadSenderOpenId,
     chatId: threadChatId,
     cmdContent,
@@ -31670,10 +31678,19 @@ async function handleThreadReplyAdmitted(
     isWorkflowGrillTrigger: !!threadGrill,
   });
   if (askCandidate) {
-    const candidates = listPendingAsksByAnchor({ larkAppId, chatId: askCandidate.chatId, anchor });
-    const quoted = candidates.find(ask => !!ask.cardMessageId && parsed.parentId === ask.cardMessageId);
+    // A shared/chat session can receive messages from several native topics.
+    // Match the original IM position before that routing fold, not just its session anchor.
+    // Direct-message sessions keep their existing continuous-chat routing semantics.
+    const isP2p = (ctxChatType ?? data?.message?.chat_type) === 'p2p';
+    const messageRootId = scope === 'thread'
+      ? (parsed.threadId ? (parsed.rootId || parsed.messageId) : anchor)
+      : (parsed.threadId ? (parsed.rootId || parsed.messageId) : null);
+    const askAnchor = { larkAppId, chatId: askCandidate.chatId, anchor, ...(isP2p ? {} : { messageRootId }) };
+    const candidates = listPendingAsksByAnchor(askAnchor);
+    const quoted = candidates.find(ask => !!ask.cardMessageId && parsed.parentId === ask.cardMessageId)
+      ?? (parsed.parentId ? findPendingLegacyAskByCard({ larkAppId, chatId: askCandidate.chatId, anchor, cardMessageId: parsed.parentId }) : undefined);
     const ambiguous = candidates.length > 1 && candidates.some(ask => isNativeAsyncAskOrigin(ask.originKind));
-    const pendingAsk = quoted ?? (ambiguous ? undefined : findPendingAskByAnchor({ larkAppId, chatId: askCandidate.chatId, anchor }));
+    const pendingAsk = quoted ?? (ambiguous ? undefined : findPendingAskByAnchor(askAnchor));
     if (ambiguous && !quoted) {
       await sessionReply(anchor, tr('card.ask.async_ambiguous', undefined, localeForBot(larkAppId)), 'text', larkAppId);
     }

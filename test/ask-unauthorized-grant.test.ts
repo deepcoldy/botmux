@@ -218,6 +218,37 @@ describe('ask 卡片点击：unauthorized → 授权卡', () => {
     );
   });
 
+  it('chat-scope 话题内 ask 被非授权人点击时，授权卡保留冻结话题 cardRootMessageId', async () => {
+    let captured: { askId: string; nonce: string } | undefined;
+    setCardDispatcher({
+      async send(ask) {
+        captured = { askId: ask.askId, nonce: ask.nonce };
+        return { messageId: 'om_topic_card' };
+      },
+    });
+    void registerAsk({
+      larkAppId: 'cli_ask',
+      chatId: 'oc_chat',
+      rootMessageId: null,
+      cardRootMessageId: 'om_frozen_topic',
+      sessionId: 'sess-chat-topic',
+      questions: [{
+        prompt: '要发布吗？',
+        options: [{ key: 'deploy', label: '发布' }, { key: 'rollback', label: '回滚' }],
+        multiSelect: false,
+      }],
+      timeoutMs: 10_000,
+    });
+    await vi.waitFor(() => expect(captured).toBeDefined());
+    const requestGrant = vi.fn(() => 'sent' as const);
+    const res: any = await click(captured!.askId, captured!.nonce, 'ou_pm', { requestGrant });
+    expect(res.toast.content).toContain('再点一次');
+    expect(requestGrant).toHaveBeenCalledWith(
+      expect.objectContaining({ larkAppId: 'cli_ask', chatId: 'oc_chat', rootMessageId: 'om_frozen_topic', cardMessageId: 'om_topic_card' }),
+      'ou_pm',
+    );
+  });
+
   it('重复点击（已在申请中）→ toast 说等 owner 处理，不重复发卡', async () => {
     const { askId, nonce } = await seedAsk();
     const res: any = await click(askId, nonce, 'ou_pm', { requestGrant: () => 'pending' as const });

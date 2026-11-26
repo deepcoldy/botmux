@@ -99,6 +99,13 @@ interface InternalPending extends Omit<PendingAsk, 'selections'> {
    * 按问题序号（questionIndex）累积的勾选 key 集合。
    */
   selections: Map<number, Set<string>>;
+  /**
+   * True only for legacy pre-isolation v2 chat-scope records restored without
+   * `topicIsolated: true` or `cardRootMessageId`: their original card topic was
+   * never persisted, so text matching falls back to the pre-change chat-wide
+   * predicate until reattach supplies a topic root or the ask settles.
+   */
+  legacyUnscopedChatText?: boolean;
 }
 
 const pending = new Map<string, InternalPending>();
@@ -316,6 +323,7 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean, signal
       // active (still awaiting a click): add another waiter → both callers get the
       // one result; no second ask, no second card.
       if (!existing.settled && !existing.dormant) {
+        hydrateLegacyCardRoot(existing, input.cardRootMessageId);
         logger.info?.(`ask-broker: active replay joined ask ${existing.askId} (key=${askKey})`);
         return new Promise<AskResult>((resolve) => { attachWaiter(existing, resolve, signal); });
       }
@@ -326,7 +334,7 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean, signal
       }
       // dormant (restored after restart): re-attach (handoff or fresh waiter).
       if (existing.dormant) {
-        return reattachByRequest(existing, signal);
+        return reattachByRequest(existing, signal, input.cardRootMessageId);
       }
     } else {
       // Same key, DIFFERENT immutable identity (crafted / stale-but-mutated
@@ -363,7 +371,7 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean, signal
       larkAppId: input.larkAppId,
       chatId: input.chatId,
       rootMessageId: input.rootMessageId,
-      cardRootMessageId: input.cardRootMessageId,
+      cardRootMessageId: normalizeCardRoot(input.cardRootMessageId, input.chatId),
       sessionId: input.sessionId,
       chatType: input.chatType,
       answererOpenId: input.answererOpenId,
@@ -378,6 +386,7 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean, signal
       timeoutMs: input.timeoutMs,
       timeoutStartsAfterDelivery: hostManaged,
       selections,
+      legacyUnscopedChatText: false,
     };
     if (!hostManaged) armAskTimeout(ask, input.timeoutMs, createdAt);
     pending.set(askId, ask);
@@ -578,7 +587,29 @@ function findByKey(askKey: string): InternalPending | undefined {
  *  - still awaiting a click: install a waiter + timeout re-armed to the ORIGINAL
  *    absolute deadline; re-send the card if it was never confirmed sent.
  */
-function reattachByRequest(ask: InternalPending, signal?: AbortSignal): Promise<AskResult> {
+function normalizeCardRoot(value: string | undefined, chatId: string): string | undefined {
+  return typeof value === 'string' && value.length > 0 && value !== chatId ? value : undefined;
+}
+
+function hydrateLegacyCardRoot(ask: InternalPending, cardRootMessageId?: string): void {
+  const normalized = normalizeCardRoot(cardRootMessageId, ask.chatId);
+  if (!ask.legacyUnscopedChatText || !normalized) return;
+  ask.cardRootMessageId = normalized;
+  ask.legacyUnscopedChatText = false;
+  persistFromInternal(ask);
+}
+
+/** Hydrate a restored pre-upgrade host_explicit ask when a joining caller supplies
+ *  the turn's frozen topic root without issuing a duplicate register call. */
+export function hydrateLegacyExplicitAskCardRoot(input: CreateAskInput, cardRootMessageId: string): void {
+  if (!input.requestId) return;
+  const key = askKeyFor(input.larkAppId, input.sessionId, 'host_explicit', input.requestId);
+  const ask = findByKey(key);
+  if (!ask || ask.settled || ask.originKind !== 'host_explicit' || !sameIdentity(ask, input)) return;
+  hydrateLegacyCardRoot(ask, cardRootMessageId);
+}
+
+function reattachByRequest(ask: InternalPending, signal?: AbortSignal, cardRootMessageId?: string): Promise<AskResult> {
   clearTimeout(ask.reclaimHandle); // the hook is back — the CLI is still waiting
   ask.reclaimHandle = undefined;
   if (ask.answeredResult) {
@@ -598,6 +629,7 @@ function reattachByRequest(ask: InternalPending, signal?: AbortSignal): Promise<
   return new Promise<AskResult>((resolve) => {
     ask.dormant = false;
     attachWaiter(ask, resolve, signal);
+    hydrateLegacyCardRoot(ask, cardRootMessageId);
     clearTimeout(ask.timeoutHandle);
     const awaitsDelivery = ask.timeoutStartsAfterDelivery && !ask.cardMessageId;
     const remaining = ask.timeoutMs === 0 ? 0 : awaitsDelivery ? ask.timeoutMs : Math.max(0, ask.deadlineAt - Date.now());
@@ -627,6 +659,8 @@ function persistFromInternal(ask: InternalPending, strict = false): void {
     larkAppId: ask.larkAppId,
     chatId: ask.chatId,
     rootMessageId: ask.rootMessageId,
+    cardRootMessageId: ask.cardRootMessageId,
+    ...(ask.legacyUnscopedChatText ? {} : { topicIsolated: true as const }),
     sessionId: ask.sessionId,
     chatType: ask.chatType,
     answererOpenId: ask.answererOpenId,
@@ -969,8 +1003,9 @@ export function submitCustomReply(args: {
  * 是不是在回答某个 ask」。匹配条件：
  *   - larkAppId 相同（不跨 bot 命中）
  *   - chatId 相同
- *   - thread-scope：ask.rootMessageId === anchor（话题根 message_id）
- *   - chat-scope：ask.rootMessageId === null（anchor 实为 chatId，已由 chatId 命中）
+ *   - 提供原始消息位置时：仅匹配提问的冻结话题；群外层仅匹配群外层
+ *   - 旧调用只提供 anchor：话题匹配 rootMessageId，群外层匹配 chatId
+ *   - 升级前遗留的无位置标记旧 v2 chat-scope 记录回退旧的群内通配语义，兼容在途提问
  *
  * 命中多个时返回最先注册的（实践中同一 anchor 同时最多一个 pending ask，因为发起
  * ask 的 CLI 此刻正阻塞等待结果）。返回 snapshot，改它不影响 broker 状态。
@@ -978,13 +1013,27 @@ export function submitCustomReply(args: {
  * 跳过没有 hook 连着的 dormant hook ask（见 submitCustomReply）：这条文字应按普通
  * 消息进会话，而不是被当成一张没人在等的问题卡的答案。
  */
-export function findPendingAskByAnchor(args: {
+export interface AskMessageAnchor {
   larkAppId: string;
   chatId: string;
   anchor: string;
-}): PendingAsk | undefined {
+  /** Original IM location, before chat/shared routing folds a topic into the chat. */
+  messageRootId?: string | null;
+}
+
+export function findPendingAskByAnchor(args: AskMessageAnchor): PendingAsk | undefined {
   for (const ask of pending.values()) {
-    if (!anchorMatches(ask, args)) continue;
+    if (!exactAnchorMatches(ask, args)) continue;
+    if (isUnclaimedHookAsk(ask)) {
+      logger.info?.(
+        `ask-broker: ask ${ask.askId} has no hook attached (dormant) — text is not taken as its answer`,
+      );
+      continue;
+    }
+    return snapshot(ask);
+  }
+  for (const ask of pending.values()) {
+    if (!legacyFallbackMatches(ask, args)) continue;
     if (isUnclaimedHookAsk(ask)) {
       logger.info?.(
         `ask-broker: ask ${ask.askId} has no hook attached (dormant) — text is not taken as its answer`,
@@ -996,16 +1045,61 @@ export function findPendingAskByAnchor(args: {
   return undefined;
 }
 
-/** Snapshot all live candidates, without changing the legacy first-match API. */
-export function listPendingAsksByAnchor(args: { larkAppId: string; chatId: string; anchor: string }): PendingAsk[] {
-  return [...pending.values()]
-    .filter(ask => anchorMatches(ask, args) && !isUnclaimedHookAsk(ask))
-    .map(snapshot);
+/** Snapshot all live candidates, without changing the legacy first-match API.
+ *  Exact-location asks take precedence over restored legacy unscoped records so
+ *  a pre-upgrade ask never shadows or induces false ambiguity for a newer ask. */
+export function listPendingAsksByAnchor(args: AskMessageAnchor): PendingAsk[] {
+  const exact: PendingAsk[] = [];
+  const legacy: PendingAsk[] = [];
+  for (const ask of pending.values()) {
+    if (isUnclaimedHookAsk(ask)) continue;
+    if (exactAnchorMatches(ask, args)) exact.push(snapshot(ask));
+    else if (legacyFallbackMatches(ask, args)) legacy.push(snapshot(ask));
+  }
+  return exact.length > 0 ? exact : legacy;
 }
 
-function anchorMatches(ask: InternalPending, args: { larkAppId: string; chatId: string; anchor: string }): boolean {
-  return !ask.settled && ask.larkAppId === args.larkAppId && ask.chatId === args.chatId
-    && (ask.rootMessageId === null || ask.rootMessageId === args.anchor);
+/** Locate a live restored legacy ask explicitly quoted by its delivered card
+ *  message ID, even when a newer exact-location ask coexists in the chat. */
+export function findPendingLegacyAskByCard(args: {
+  larkAppId: string;
+  chatId: string;
+  anchor: string;
+  cardMessageId: string;
+}): PendingAsk | undefined {
+  for (const ask of pending.values()) {
+    if (isUnclaimedHookAsk(ask)) continue;
+    if (legacyFallbackMatches(ask, args) && ask.cardMessageId === args.cardMessageId) {
+      return snapshot(ask);
+    }
+  }
+  return undefined;
+}
+
+function exactAnchorMatches(ask: InternalPending, args: AskMessageAnchor): boolean {
+  if (ask.settled || ask.legacyUnscopedChatText || ask.larkAppId !== args.larkAppId || ask.chatId !== args.chatId) {
+    return false;
+  }
+  if (args.messageRootId !== undefined) {
+    const cardRoot = normalizeCardRoot(ask.cardRootMessageId, ask.chatId);
+    const askRoot = cardRoot ?? (ask.rootMessageId === ask.chatId ? null : ask.rootMessageId);
+    if (askRoot === args.messageRootId) return true;
+    // "Reply in thread" directly on an outer-chat Ask card creates a thread rooted on cardMessageId.
+    return askRoot === null
+      && typeof ask.cardMessageId === 'string'
+      && ask.cardMessageId.length > 0
+      && ask.cardMessageId !== ask.chatId
+      && args.messageRootId === ask.cardMessageId;
+  }
+  return ask.rootMessageId === null ? args.anchor === args.chatId : ask.rootMessageId === args.anchor;
+}
+
+function legacyFallbackMatches(ask: InternalPending, args: AskMessageAnchor): boolean {
+  return !ask.settled
+    && ask.legacyUnscopedChatText === true
+    && ask.larkAppId === args.larkAppId
+    && ask.chatId === args.chatId
+    && args.anchor === args.chatId;
 }
 
 /** A hook ask whose hook connection is gone: no CLI is blocked on it right now.
@@ -1143,6 +1237,10 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
         }, remaining);
     timeoutHandle?.unref?.();
 
+    const cardRootMessageId = normalizeCardRoot(p.cardRootMessageId, p.chatId);
+    const isChatScopedRoot = p.rootMessageId === null || p.rootMessageId === p.chatId;
+    const legacyUnscopedChatText = p.chatType !== 'p2p' && isChatScopedRoot && p.topicIsolated !== true && !cardRootMessageId;
+
     const ask: InternalPending = {
       askId: p.askId,
       askKey: p.askKey,
@@ -1153,6 +1251,7 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
       larkAppId: p.larkAppId,
       chatId: p.chatId,
       rootMessageId: p.rootMessageId,
+      cardRootMessageId,
       sessionId: p.sessionId,
       chatType: p.chatType,
       answererOpenId: p.answererOpenId,
@@ -1181,6 +1280,7 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
       ...(p.answeredResult ? { answeredResult: p.answeredResult, terminalResult: p.answeredResult } : {}),
       timeoutHandle,
       selections,
+      legacyUnscopedChatText,
     };
     pending.set(p.askId, ask);
     // Re-arm the absolute handoff-expiry reaper for a restored stash (codex
@@ -1460,6 +1560,7 @@ function snapshot(ask: InternalPending): PendingAsk {
     timeoutMs: _tm, timeoutStartsAfterDelivery: _td, timeoutStartedAt: _ts,
     askKey: _ak, requestId: _rid, resumable: _rs,
     dormant: _dm, answeredResult: _ar, terminalResult: _tr,
+    legacyUnscopedChatText: _lu,
     ...rest
   } = ask;
   return {
