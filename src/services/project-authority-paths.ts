@@ -14,5 +14,6 @@ export function hostAuthorityPaths(dataDir: string): string[] {
     join(dataDir, '.dashboard-secret.project-imports'),
     dispatchTaskDecisionDirectory(dataDir),
     crossChatFollowThreadDir(dataDir),
+    join(dataDir, 'session-turns'),
   ];
 }

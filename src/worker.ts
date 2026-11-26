@@ -35282,11 +35282,15 @@ async function spawnCliBody(
       sandboxHome,
     );
     const mandatoryDenyPaths: string[] = [];
-    const hostOnlyDenyPaths: string[] = [
-      join(canonical(dataDir), 'schedule-preconditions'),
-      join(canonical(dataDir), 'link-refs'),
-      ...hostAuthorityPaths(canonical(dataDir)),
-    ];
+    const hostOnlyDataDirs = [...new Set([
+      canonical(dataDir),
+      canonical(join(canonical(defaultBotmuxHome), 'data')),
+    ])];
+    const hostOnlyDenyPaths: string[] = [...new Set(hostOnlyDataDirs.flatMap(dir => [
+      join(dir, 'schedule-preconditions'),
+      join(dir, 'link-refs'),
+      ...hostAuthorityPaths(dir),
+    ]))];
     const mandatoryDenyRegexes: string[] = [];
     const mandatoryReadOnlyPaths: string[] = [];
     // Linux: the per-session sandbox tree (`sandboxes/<sid>`) holds the deny-mask
@@ -35912,8 +35916,12 @@ async function spawnCliBody(
       homeDir: scratchHome,
       sessionId: cfg.sessionId,
     });
+    const scratchHostAuthorityDataDirs = [...new Set([
+      scratchCanonical(scratchDataDir),
+      scratchCanonical(join(scratchCanonical(defaultBotmuxHome), 'data')),
+    ])];
     const scratchDeny = [...new Set<string>([
-      ...hostAuthorityPaths(scratchCanonical(scratchDataDir)),
+      ...scratchHostAuthorityDataDirs.flatMap(hostAuthorityPaths),
       ...credentialRules.denyPaths.map(path =>
         scratchProtectedPathSet.has(path) ? path : scratchCanonical(path)),
       ...existingProtectedPathVariants(scratchProtectedPaths),
@@ -36392,10 +36400,18 @@ async function spawnCliBody(
       botmuxHome: canonical(configuredBotmuxHome),
       defaultBotmuxHome: canonical(defaultBotmuxHome),
     }, seatbeltProtectedPaths);
-    // Imported-task authority is nested under dataDir, not among the legacy
-    // root-level dashboard files enumerated by credential-only profiles.
-    rules.denyPaths.push(...hostAuthorityPaths(canonical(isolationRuntimeDataDir)));
-    rules.denyWritePaths.push(...hostAuthorityPaths(canonical(isolationRuntimeDataDir)));
+    // Imported-task and host-only turn authority is nested under dataDir (both
+    // the configured runtime data dir and default ~/.botmux/data when custom
+    // SESSION_DATA_DIR is used), not among the legacy root-level dashboard files.
+    const seatbeltHostAuthorityDataDirs = [...new Set([
+      canonical(isolationRuntimeDataDir),
+      canonical(join(seatbeltHome, '.botmux', 'data')),
+      canonical(join(canonical(defaultBotmuxHome), 'data')),
+    ])];
+    for (const authorityDataDir of seatbeltHostAuthorityDataDirs) {
+      rules.denyPaths.push(...hostAuthorityPaths(authorityDataDir));
+      rules.denyWritePaths.push(...hostAuthorityPaths(authorityDataDir));
+    }
     const profileDir = join(isolationRuntimeDataDir, 'read-isolation');
     mkdirSync(profileDir, { recursive: true });
     const originDirectory = managedOriginCapabilityDirectory(
@@ -36517,15 +36533,29 @@ async function spawnCliBody(
       }
     };
     const credentialOnlyProtectedPaths = protectedPathsForHome(hostHomeDir);
-    for (const path of hostAuthorityPaths(isolationRuntimeDataDir)) {
-      try { mkdirSync(path, { recursive: true, mode: 0o700 }); } catch {
-        throw new Error('project authority mask directory unavailable');
+    const credentialOnlyAuthorityDataDirs = [...new Set([
+      isolationRuntimeDataDir,
+      ...[...processedRoots].map(root => join(root, 'data')),
+    ])];
+    for (const authorityDataDir of credentialOnlyAuthorityDataDirs) {
+      try {
+        const dirShape = lstatSync(authorityDataDir);
+        if (!dirShape.isDirectory() || dirShape.isSymbolicLink()) {
+          throw new Error('project authority mask directory is not safe');
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException | undefined)?.code !== 'ENOENT') throw error;
       }
-      const shape = lstatSync(path);
-      if (!shape.isDirectory() || shape.isSymbolicLink()) {
-        throw new Error('project authority mask directory is not safe');
+      for (const path of hostAuthorityPaths(authorityDataDir)) {
+        try { mkdirSync(path, { recursive: true, mode: 0o700 }); } catch {
+          throw new Error('project authority mask directory unavailable');
+        }
+        const shape = lstatSync(path);
+        if (!shape.isDirectory() || shape.isSymbolicLink()) {
+          throw new Error('project authority mask directory is not safe');
+        }
+        hideDirectories.add(realpathSync(path));
       }
-      hideDirectories.add(realpathSync(path));
     }
     for (const path of [
       ...credentialOnlyProtectedPaths,

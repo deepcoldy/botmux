@@ -29,8 +29,8 @@
  * otherwise be readable inside a running session. A mask is a mount on the path
  * itself, so whatever later appears beneath it on the host stays hidden.
  */
-import { existsSync, lstatSync, readdirSync } from 'node:fs';
-import { join, dirname, basename } from 'node:path';
+import { existsSync, lstatSync, readdirSync, readlinkSync, realpathSync, statSync } from 'node:fs';
+import { join, dirname, basename, resolve } from 'node:path';
 import { homedir as osHomedir } from 'node:os';
 import { resolveLarkCliLinuxStoreDir } from '../cli/fs-policy.js';
 import { BACKGROUND_JOBS_HOME_ROOT, MEEGO_HOME_ROOT } from '../../services/bytedcli-home.js';
@@ -70,7 +70,7 @@ export interface ScratchSecrets {
 //      files in place, and a directory bind resolves names live so a persistent
 //      tmux pane reads the refreshed identity each turn.
 const CLI_IDENTITY_DIR = 'cli-identity';
-const PER_PERSON_SECRET_DIRS = ['vc-meeting-daemon-auth', 'bytedcli-home', 'oauth-pending'];
+const PER_PERSON_SECRET_DIRS = ['vc-meeting-daemon-auth', 'bytedcli-home', 'oauth-pending', 'session-turns'];
 function sessionIdentityDirName(sessionId: string): string {
   return `${sessionId}.bin`;
 }
@@ -94,6 +94,43 @@ export function enumerateScratchSecretPaths(input: ScratchSecretInput): ScratchS
   const homeDir = input.homeDir || osHomedir();
   const addFile = (p: string | undefined): void => {
     if (p && isFileOrLink(p)) out.add(p);
+  };
+  const addDirectoryMask = (p: string): boolean => {
+    let lst: ReturnType<typeof lstatSync>;
+    try {
+      lst = lstatSync(p);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') {
+        out.add(p);
+        return true;
+      }
+      return false;
+    }
+    if (lst.isDirectory()) {
+      out.add(p);
+      return true;
+    }
+    if (lst.isSymbolicLink()) {
+      try {
+        if (statSync(p).isDirectory()) {
+          out.add(p);
+          try { out.add(realpathSync(p)); } catch { /* best-effort canonical target */ }
+          return true;
+        }
+        return false; // symlink to a regular file: never turn into a directory mask
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') {
+          // Dangling symlink: mask the resolved target directory instead of the
+          // dangling link path itself (bwrap rejects bind-mounting dangling links).
+          try {
+            out.add(resolve(dirname(p), readlinkSync(p)));
+            return true;
+          } catch { return false; }
+        }
+        return false;
+      }
+    }
+    return false;
   };
 
   for (const home of input.botmuxHomes) {
@@ -164,8 +201,7 @@ export function enumerateScratchSecretPaths(input: ScratchSecretInput): ScratchS
     // pending OAuth logins. The CLI never needs these inside a scratch turn
     // (they are daemon-side / per-owner).
     for (const secretDir of PER_PERSON_SECRET_DIRS) {
-      const p = join(dataDir, secretDir);
-      if (!isFileOrLink(p)) out.add(p);
+      addDirectoryMask(join(dataDir, secretDir));
     }
 
     // Trigger-user CLI identity dir: holds EVERY concurrent session's
@@ -175,8 +211,7 @@ export function enumerateScratchSecretPaths(input: ScratchSecretInput): ScratchS
     // / `botmux send` wrapper sources at runtime. Mirrors fs-policy's
     // per-session grants; never grant the parent.
     const cliIdentityDir = join(dataDir, CLI_IDENTITY_DIR);
-    if (!isFileOrLink(cliIdentityDir)) {
-      out.add(cliIdentityDir);
+    if (addDirectoryMask(cliIdentityDir)) {
       if (input.sessionId) {
         const ownDir = join(cliIdentityDir, sessionIdentityDirName(input.sessionId));
         if (existsSync(ownDir)) readOnlyCarve.add(ownDir);

@@ -256,6 +256,16 @@ import { defaultReplyDeliveryFor, effectiveReplyDelivery, supportsTranscriptRepl
 import { resolveFeedbackTeamId, traceFeedbackPolicyForDelivery } from '../services/feedback-policy-resolver.js';
 import { prepareReplyCardNativeThinking, replyCardDispatchAttempt } from './turn-reply-card.js';
 import { recordRelayedTurnDelivery, RELAYED_TURN_DELIVERY_MAX_BYTES, RELAYED_TURN_DELIVERY_ROUTE } from './relayed-turn-delivery.js';
+import {
+  createTurnReplyQuotaTracker,
+  parseRelayedTurnReplyAuthHeaders,
+  recordRelayedTurnReply,
+  RELAYED_TURN_REPLY_BODY_TIMEOUT_MS,
+  RELAYED_TURN_REPLY_MAX_BYTES,
+  RELAYED_TURN_REPLY_MAX_IN_FLIGHT,
+  RELAYED_TURN_REPLY_MAX_IN_FLIGHT_PER_SESSION,
+  RELAYED_TURN_REPLY_ROUTE,
+} from './relayed-turn-reply.js';
 import { FEEDBACK_SEND_LEASE_ROUTE, handleFeedbackSendLeaseRelay } from '../services/feedback-send-lease-relay.js';
 import { resolveNamespaceLocalPid } from './pid-namespace-peer.js';
 import {
@@ -1161,6 +1171,10 @@ async function readBoundedJsonBodyWithRaw<T = unknown>(
     }
   }
   return await new Promise<{ body: T; raw: Buffer }>((resolve, reject) => {
+    if (req.aborted || req.destroyed) {
+      reject(new Error('request aborted'));
+      return;
+    }
     const chunks: Buffer[] = [];
     let total = 0;
     let settled = false;
@@ -1170,6 +1184,7 @@ async function readBoundedJsonBodyWithRaw<T = unknown>(
       req.off('end', onEnd);
       req.off('error', onError);
       req.off('aborted', onAborted);
+      req.off('close', onClose);
     };
     const fail = (err: Error) => {
       if (settled) return;
@@ -1203,6 +1218,9 @@ async function readBoundedJsonBodyWithRaw<T = unknown>(
     };
     const onError = (err: Error) => fail(err);
     const onAborted = () => fail(new Error('request aborted'));
+    const onClose = () => {
+      if (!req.readableEnded) fail(new Error('request aborted'));
+    };
     const timer = setTimeout(
       () => fail(new IpcBodyTimeoutError('request body timed out')),
       timeoutMs,
@@ -1212,6 +1230,7 @@ async function readBoundedJsonBodyWithRaw<T = unknown>(
     req.once('end', onEnd);
     req.once('error', onError);
     req.once('aborted', onAborted);
+    req.once('close', onClose);
   });
 }
 
@@ -1379,7 +1398,7 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
   // 该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
-  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|chat-manager|rename|project|project-workstream|dispatch-tree|decision-board|decision-board\/upload|task-routing|project-dispatch-policy|continuation|durable-send|turn-delivery|feedback-send-lease|reply-card-ready|feedback-bind|deferred-topic|link-refs\/register|link-refs\/resolve|auth-request|auth-status)$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|chat-manager|rename|project|project-workstream|dispatch-tree|decision-board|decision-board\/upload|task-routing|project-dispatch-policy|continuation|durable-send|turn-delivery|turn-reply|feedback-send-lease|reply-card-ready|feedback-bind|deferred-topic|link-refs\/register|link-refs\/resolve|auth-request|auth-status)$/.test(pathname)) return true;
   // UserPromptSubmit hook 的 envelope claim：沙箱内 hook 读不到 host secret，
   // 走 body 里的 per-turn capability；handler 内 sessionCliIpcAuth 绑定到 URL 的
   // sessionId + 按 managedTurnOrigin.turnId 权威取（同 /close 姿势）。
@@ -1482,6 +1501,9 @@ export function __testOnly_resetManagedOriginRuntimeAuthState(): void {
   managedOriginPreauthInFlight = 0;
   nativeSubagentRuntimePreauthInFlight = 0;
   nativeSubagentRuntimeNonceStore = createNativeSubagentRuntimeNonceStore();
+  relayedTurnReplyInFlight = 0;
+  relayedTurnReplySessionInFlight.clear();
+  relayedTurnReplyQuota.clear();
 }
 /** @internal test-only: override runtime nonce-store behavior for capacity tests. */
 export function __testOnly_setNativeSubagentRuntimeNonceStore(
@@ -2629,6 +2651,134 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
   } catch (error) {
     return jsonRes(res, 409, { ok: false, error: error instanceof Error ? error.message : String(error) });
   }
+});
+
+let relayedTurnReplyInFlight = 0;
+const relayedTurnReplySessionInFlight = new Map<string, number>();
+const relayedTurnReplyQuota = createTurnReplyQuotaTracker();
+
+/** Host-side structured turn-reply writer for an isolated CLI that cannot open
+ *  the shared `<DATA_DIR>/session-turns/turns.sqlite` store directly.
+ *  Authenticates and applies pre-body rate & per-session/global in-flight
+ *  bounds BEFORE buffering any body bytes, then synchronously re-verifies the
+ *  live origin after reading the bounded JSON body (zero TOCTOU). */
+ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_REPLY_ROUTE}`, async (req, res, params) => {
+  if (req.aborted || req.destroyed || res.destroyed) return;
+  const trustedHost = isTrustedHostIpcRequest(req);
+  const headerClaim = parseRelayedTurnReplyAuthHeaders(req.headers);
+  const ds = findActiveBySessionId(params.sessionId);
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, headerClaim as Record<string, unknown>, { allowReceiver: true });
+  if (!auth.ok) {
+    closeUntrustedRequestAfterResponse(req, res);
+    return jsonRes(res, 403, { ok: false, error: auth.error });
+  }
+  if (!ds || ds.session.status === 'closed') {
+    if (trustedHost) {
+      drainRequest(req);
+      return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+    }
+    closeUntrustedRequestAfterResponse(req, res);
+    return jsonRes(res, 403, { ok: false, error: 'origin_unproven' });
+  }
+  const initialTurnId = ds.managedTurnOrigin?.turnId;
+  if (!initialTurnId) {
+    if (trustedHost) drainRequest(req);
+    else closeUntrustedRequestAfterResponse(req, res);
+    return jsonRes(res, 409, { ok: false, error: 'turn_unbound' });
+  }
+  const preQuota = relayedTurnReplyQuota.admitPreBodyRequest(params.sessionId, initialTurnId);
+  if (!preQuota.ok) {
+    if (trustedHost) drainRequest(req);
+    else closeUntrustedRequestAfterResponse(req, res);
+    return jsonRes(res, 429, { ok: false, error: preQuota.error });
+  }
+  const sessionInFlight = relayedTurnReplySessionInFlight.get(params.sessionId) ?? 0;
+  if (!trustedHost && (
+    relayedTurnReplyInFlight >= RELAYED_TURN_REPLY_MAX_IN_FLIGHT
+    || sessionInFlight >= RELAYED_TURN_REPLY_MAX_IN_FLIGHT_PER_SESSION
+  )) {
+    closeUntrustedRequestAfterResponse(req, res);
+    return jsonRes(res, 429, { ok: false, error: 'too_many_turn_reply_requests' });
+  }
+
+  if (!trustedHost) {
+    relayedTurnReplyInFlight += 1;
+    relayedTurnReplySessionInFlight.set(params.sessionId, sessionInFlight + 1);
+  }
+  let body: unknown;
+  try {
+    body = await readBoundedJsonBody<unknown>(
+      req,
+      RELAYED_TURN_REPLY_MAX_BYTES,
+      RELAYED_TURN_REPLY_BODY_TIMEOUT_MS,
+    );
+  } catch (error) {
+    if (req.aborted || req.destroyed || res.destroyed) return;
+    if (error instanceof IpcBodyTooLargeError) {
+      closeUntrustedRequestAfterResponse(req, res);
+      return jsonRes(res, 413, { ok: false, error: 'body_too_large' });
+    }
+    if (error instanceof IpcBodyTimeoutError) {
+      closeUntrustedRequestAfterResponse(req, res);
+      return jsonRes(res, 408, { ok: false, error: 'body_timeout' });
+    }
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  } finally {
+    if (!trustedHost) {
+      relayedTurnReplyInFlight = Math.max(0, relayedTurnReplyInFlight - 1);
+      const remaining = (relayedTurnReplySessionInFlight.get(params.sessionId) ?? 1) - 1;
+      if (remaining > 0) relayedTurnReplySessionInFlight.set(params.sessionId, remaining);
+      else relayedTurnReplySessionInFlight.delete(params.sessionId);
+    }
+  }
+
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+
+  // Zero-TOCTOU post-read re-verification: synchronous from here to SQLite commit.
+  const currentDs = findActiveBySessionId(params.sessionId);
+  if (!currentDs || currentDs !== ds || currentDs.session.status === 'closed') {
+    return jsonRes(
+      res,
+      trustedHost ? 404 : 403,
+      { ok: false, error: trustedHost ? 'session_not_active' : 'origin_unproven' },
+    );
+  }
+  const currentOrigin = currentDs.managedTurnOrigin;
+  if (!currentOrigin?.turnId) {
+    return jsonRes(
+      res,
+      trustedHost ? 409 : 403,
+      { ok: false, error: trustedHost ? 'turn_mismatch' : 'origin_unproven' },
+    );
+  }
+  if (currentOrigin.turnId !== initialTurnId) {
+    return jsonRes(res, 409, { ok: false, error: 'turn_mismatch' });
+  }
+  if (!trustedHost) {
+    const postAuth = sessionCliIpcAuth(
+      req,
+      currentDs,
+      params.sessionId,
+      headerClaim as Record<string, unknown>,
+      { allowReceiver: true },
+    );
+    if (!postAuth.ok) {
+      return jsonRes(res, 403, { ok: false, error: postAuth.error });
+    }
+  }
+
+  const result = recordRelayedTurnReply({
+    ds: currentDs,
+    body: body as Record<string, unknown>,
+    dataDir: config.session.dataDir,
+    quota: relayedTurnReplyQuota,
+    quotaSlot: preQuota.slot,
+  });
+  return result.ok
+    ? jsonRes(res, 200, result)
+    : jsonRes(res, result.status, { ok: false, error: result.error });
 });
 
 /** Feedback send lease for an isolated CLI that cannot take it in-process
@@ -14952,7 +15102,10 @@ export function startIpcServer(opts: {
           return jsonRes(res, 401, { ok: false, error: 'unauthorized', reason: auth.reason });
         }
       }
-      if (!publicRoute && opts.ready) await opts.ready;
+      if (!publicRoute && opts.ready) {
+        await opts.ready;
+        if (req.aborted || req.destroyed || res.destroyed) return;
+      }
       for (const r of routes) {
         if (r.method !== req.method) continue;
         const m = r.pattern.exec(url.pathname);
@@ -14998,6 +15151,9 @@ export function startIpcServer(opts: {
     server.once('close', () => {
       workspaceRecycleRuntime.stop();
       sessionAuthRequests.disposeAndClear();
+      relayedTurnReplyInFlight = 0;
+      relayedTurnReplySessionInFlight.clear();
+      relayedTurnReplyQuota.clear();
     });
     return {
     port,
