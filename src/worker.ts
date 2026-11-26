@@ -23334,6 +23334,8 @@ type TraexPreemptionLease = {
   backend: SessionBackend; generation: number; lifetime: number; pid?: number; nativeSessionId?: string;
   nativeTurnId?: string; turnId: string; dispatchAttempt?: number; webGeneration: number;
   originalInput?: string; restoredDraftCleared?: true;
+  restoredDraftProbe?: Promise<void>;
+  restoredDraftGeometryUnknown?: true;
   incomingTurnId?: string; incomingCaller?: TrustedCaller;
   interruptGeneration: number; requestedAt: number; delivered?: true; settled?: true; unknownNotified?: true; nativeCompleted?: true;
 };
@@ -23464,9 +23466,84 @@ function observeTraexPreemptionTerminal(events: readonly CodexBridgeEvent[]): vo
   armTraexPreemptionPoll();
 }
 
+/** Read the whole draft at a bounded native size. A suffix or length-only
+ * chip never establishes ownership; restore the original grid on every exit. */
+async function clearTraexOwnedRestoredDraft(pending: TraexPreemptionLease): Promise<void> {
+  const target = pending.backend;
+  const original = pending.originalInput;
+  const current = (): boolean => traexPreemption === pending && traexPreemptionLeaseCurrent(pending)
+    && !isFlushing && !injectionFlushing && commandLineWritesPending === 0 && !cliSubmissionInFlight
+    && !hookReviewHoldsQueuedWrite() && !programStatusBlockedHoldsTypeAhead();
+  const capture = (): string => {
+    try { return target.captureInputState?.()?.viewport ?? ''; } catch { return ''; }
+  };
+  const matches = (screen: string): boolean => !!original && !/\[Pasted Content \d+ chars?\]/i.test(screen)
+    && traexComposerHoldsInput(screen, original, { glyphTolerant: true });
+  if (!original || !current()) return;
+  let restoreSize: { cols: number; rows: number } | undefined;
+  let evidenceSize: { cols: number; rows: number } | undefined;
+  try {
+    let viewport = capture();
+    if (/\[Pasted Content \d+ chars?\]/i.test(viewport)) return;
+    if (!matches(viewport)) {
+      if (effectiveBackendType !== 'tmux' || lastInitConfig?.adoptMode || !target.getPaneSize) return;
+      const size = target.getPaneSize();
+      if (!size || size.cols < 80 || size.cols > 320 || size.rows < 24 || size.rows > 2048) return;
+      const contentCols = Math.max(1, size.cols - 4);
+      const requiredRows = original.split(/\r?\n/).reduce((sum, line) =>
+        sum + Math.max(1, Math.ceil(Array.from(line).length * 2 / contentCols)), 0) + 24;
+      const rows = Math.max(size.rows, requiredRows);
+      if (rows > 2048) return;
+      restoreSize = size;
+      pending.restoredDraftGeometryUnknown = true;
+      evidenceSize = { cols: size.cols, rows };
+      target.resize(evidenceSize.cols, evidenceSize.rows);
+      const deadline = Math.min(Date.now() + 1500, pending.requestedAt + 10_000);
+      while (Date.now() < deadline && current()) {
+        const actual = target.getPaneSize();
+        if (!actual || actual.cols !== evidenceSize.cols || actual.rows !== evidenceSize.rows) return;
+        viewport = capture();
+        if (matches(viewport)) break;
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+    }
+    if (!current() || !matches(viewport)) return;
+    await new Promise(resolve => setTimeout(resolve, 100));
+    if (!current() || !matches(capture())) return;
+    if (evidenceSize) {
+      const actual = target.getPaneSize?.();
+      if (!actual || actual.cols !== evidenceSize.cols || actual.rows !== evidenceSize.rows) return;
+    }
+    pending.restoredDraftCleared = true; // A second Ctrl+C could quit the native CLI.
+    invalidatePromptReadinessEvidence();
+    const accepted = 'sendSpecialKeys' in target
+      ? (target as SessionBackend & { sendSpecialKeys(...keys: string[]): unknown }).sendSpecialKeys('C-c')
+      : target.write('\x03');
+    if (accepted === false) log('TraeX owned restored draft clear unconfirmed; waiting for a fresh empty composer');
+    await new Promise(resolve => setTimeout(resolve, 100));
+    // The normal poll must reject the temporary "ctrl+c again to quit" footer.
+    capture();
+  } catch (error) {
+    log('TraeX owned restored draft verification failed: ' + String(error));
+  } finally {
+    if (restoreSize && evidenceSize && backend === target && cliSpawnGeneration === pending.generation
+      && cliLifetimeNonce === pending.lifetime && webTerminalInputGeneration === pending.webGeneration) {
+      try {
+        const actual = target.getPaneSize?.();
+        if (actual?.cols === evidenceSize.cols && actual.rows === evidenceSize.rows) {
+          target.resize(restoreSize.cols, restoreSize.rows);
+          const restored = target.getPaneSize?.();
+          if (restored?.cols === restoreSize.cols && restored.rows === restoreSize.rows) pending.restoredDraftGeometryUnknown = undefined;
+        }
+      } catch { log('TraeX temporary draft viewport size restore failed; input remains held'); }
+    }
+  }
+}
+
 async function resolveTraexPreemption(): Promise<void> {
   const pending = traexPreemption;
   if (!pending) return;
+  if (pending.restoredDraftProbe) return;
   if (backend !== pending.backend || cliSpawnGeneration !== pending.generation || cliLifetimeNonce !== pending.lifetime) {
     traexPreemption = undefined; return;
   }
@@ -23488,25 +23565,16 @@ async function resolveTraexPreemption(): Promise<void> {
   try { viewport = (pending.backend.captureInputState?.() ?? { viewport: captureBackendScreen(pending.backend) }).viewport; }
   catch { viewport = ''; }
   if (pending.settled && !pending.nativeCompleted && !pending.restoredDraftCleared && pending.originalInput
-    && traexPreemptionLeaseCurrent(pending) && !/\[Pasted Content \d+ chars?\]/i.test(viewport)
-    && traexComposerHoldsInput(viewport, pending.originalInput, { glyphTolerant: true })
-    && !hookReviewHoldsQueuedWrite() && !programStatusBlockedHoldsTypeAhead()) {
-    // Escape can restore the exact previously submitted prompt as a draft.
-    // Only this cancelled input belongs to us; never erase a different user
-    // draft, a collapsed length-only chip, or text after a Web input change.
-    const fresh = pending.backend.captureInputState?.()?.viewport;
-    if (fresh && !/\[Pasted Content \d+ chars?\]/i.test(fresh) && traexPreemptionLeaseCurrent(pending)
-      && traexComposerHoldsInput(fresh, pending.originalInput, { glyphTolerant: true })) {
-      pending.restoredDraftCleared = true;
-      invalidatePromptReadinessEvidence();
-      try {
-        const accepted = 'sendSpecialKeys' in pending.backend
-          ? (pending.backend as SessionBackend & { sendSpecialKeys(...keys: string[]): unknown }).sendSpecialKeys('C-u')
-          : pending.backend.write('\x15');
-        if (accepted === false) log('TraeX owned restored draft clear unconfirmed; holding input until fresh empty composer');
-      } catch { log('TraeX owned restored draft clear failed; holding input until fresh empty composer'); }
-      armTraexPreemptionPoll(); return;
+    && !traexRestoredComposerReady(viewport, { requireThreadReady: true })) {
+    if (Date.now() - pending.requestedAt > 10_000) {
+      if (!pending.unknownNotified) { pending.unknownNotified = true; send({ type: 'user_notify',
+        turnId: pendingMessages[0]?.turnId, message: 'TraeX 恢复草稿未取得全文或安全清理证明；新消息已保留，需显式恢复。' }); }
+      return;
     }
+    pending.restoredDraftProbe = clearTraexOwnedRestoredDraft(pending);
+    await pending.restoredDraftProbe;
+    pending.restoredDraftProbe = undefined;
+    armTraexPreemptionPoll(); return;
   }
   if (!pending.delivered) {
     if (traexRestoredComposerReady(viewport, { requireThreadReady: true })) {
@@ -23540,7 +23608,7 @@ async function resolveTraexPreemption(): Promise<void> {
         if (accepted === false) log('TraeX preemption Escape unconfirmed; awaiting native settlement');
       } catch (error) { log('TraeX preemption Escape failed: ' + String(error)); }
     });
-  } else if (pending.settled && traexRestoredComposerReady(viewport, { requireThreadReady: true })
+  } else if (pending.settled && !pending.restoredDraftGeometryUnknown && traexPreemptionEmptyComposerReady(viewport)
     && !hookReviewHoldsQueuedWrite() && !programStatusBlockedHoldsTypeAhead()) {
     const next = pendingMessages[0];
     if (!pending.nativeCompleted && pending.originalInput && next && next.turnId === pending.incomingTurnId
@@ -23574,6 +23642,14 @@ async function resolveTraexPreemption(): Promise<void> {
     return;
   }
   armTraexPreemptionPoll();
+}
+
+function traexPreemptionEmptyComposerReady(viewport: string): boolean {
+  const rows = viewport.trimEnd().split(/\r?\n/);
+  let composer = rows.length - 1;
+  while (composer >= 0 && !/^[›❯](?:[ \t]|$)/.test(rows[composer]!)) composer--;
+  return composer >= 0 && !/ctrl\+c again to quit/i.test(rows.slice(composer + 1).join('\n'))
+    && traexRestoredComposerReady(viewport, { requireThreadReady: true });
 }
 
 function traexPreemptionHoldsWrites(): boolean { return !!traexPreemption; }

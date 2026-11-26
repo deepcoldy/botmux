@@ -51,6 +51,8 @@ function harness() {
   scope.preemptTraexForNewMessage = loadWorkerFunction('preemptTraexForNewMessage', scope);
   scope.resolveTraexPreemption = loadWorkerFunction('resolveTraexPreemption', scope);
   scope.observeTraexPreemptionTerminal = loadWorkerFunction('observeTraexPreemptionTerminal', scope);
+  scope.clearTraexOwnedRestoredDraft = loadWorkerFunction('clearTraexOwnedRestoredDraft', scope);
+  scope.traexPreemptionEmptyComposerReady = loadWorkerFunction('traexPreemptionEmptyComposerReady', scope);
   const preempt = loadWorkerFunction('preemptActiveTurnForNewMessage', scope);
   return { scope, target, preempt };
 }
@@ -230,7 +232,7 @@ describe('ordinary TraeX new-message preemption', () => {
     const idle = busy.replace(/^◆ Working[^\n]*\n/m, '');
     h.target.captureInputState = () => ({ viewport: idle.replace('Run /review on my current changes', 'original task') });
     await h.scope.resolveTraexPreemption();
-    expect(h.target.sendSpecialKeys).toHaveBeenLastCalledWith('C-u');
+    expect(h.target.sendSpecialKeys).toHaveBeenLastCalledWith('C-c');
     expect(h.scope.flushPending).not.toHaveBeenCalled();
     h.target.captureInputState = () => ({ viewport: idle });
     await h.scope.resolveTraexPreemption();
@@ -249,6 +251,76 @@ describe('ordinary TraeX new-message preemption', () => {
     h.target.captureInputState = () => ({ viewport: busy.replace(/^◆ Working[^\n]*\n/m, '').replace('Run /review on my current changes', draft) });
     await h.scope.resolveTraexPreemption();
     expect(h.target.sendSpecialKeys).toHaveBeenCalledOnce();
+    expect(h.scope.flushPending).not.toHaveBeenCalled();
+  });
+
+  it('verifies a long restored draft at a larger native grid, clears once, restores the grid and waits out quit confirmation', async () => {
+    const h = harness();
+    const old = 'original task line\n'.repeat(172);
+    h.scope.lastWrittenCliInput.content = old;
+    h.preempt(h.scope.pendingMessages[0], h.target);
+    await vi.waitFor(() => expect(h.target.sendSpecialKeys).toHaveBeenCalledOnce());
+    h.scope.traexPreemption.settled = true;
+    let size = { cols: 160, rows: 50 };
+    let cleared = false;
+    const idle = busy.replace(/^◆ Working[^\n]*\n/m, '');
+    Object.assign(h.target, {
+      getPaneSize: () => size, resize: vi.fn((cols: number, rows: number) => { size = { cols, rows }; }),
+      captureInputState: () => ({ viewport: cleared ? idle.replace('← for agents', '← for agents · ctrl+c again to quit')
+        : idle.replace('Run /review on my current changes', size.rows > 100 ? old : 'original task line') }),
+    });
+    h.target.sendSpecialKeys.mockImplementation((key: string) => { if (key === 'C-c') cleared = true; return true; });
+    const verifying = h.scope.resolveTraexPreemption();
+    await h.scope.resolveTraexPreemption(); // no second concurrent resize/clear
+    await verifying;
+    expect(h.target.resize.mock.calls).toHaveLength(2);
+    expect(h.target.resize.mock.calls[0][1]).toBeGreaterThan(100);
+    expect(size).toEqual({ cols: 160, rows: 50 });
+    expect(h.target.sendSpecialKeys.mock.calls.filter(([key]) => key === 'C-c')).toHaveLength(1);
+    await h.scope.resolveTraexPreemption();
+    expect(h.scope.flushPending).not.toHaveBeenCalled();
+    expect(h.target.sendSpecialKeys.mock.calls.filter(([key]) => key === 'C-c')).toHaveLength(1);
+    h.target.captureInputState = () => ({ viewport: idle });
+    await h.scope.resolveTraexPreemption();
+    expect(h.scope.flushPending).toHaveBeenCalledOnce();
+  });
+
+  it('keeps a changed Web input draft and current geometry while full-draft verification awaits', async () => {
+    const h = harness();
+    h.scope.lastWrittenCliInput.content = 'long old input\n'.repeat(72);
+    h.preempt(h.scope.pendingMessages[0], h.target);
+    await vi.waitFor(() => expect(h.target.sendSpecialKeys).toHaveBeenCalledOnce());
+    h.scope.traexPreemption.settled = true;
+    let size = { cols: 160, rows: 50 };
+    Object.assign(h.target, {
+      getPaneSize: () => size,
+      resize: vi.fn((cols: number, rows: number) => { size = { cols, rows }; }),
+      captureInputState: () => ({ viewport: busy.replace(/^◆ Working[^\n]*\n/m, '').replace('Run /review on my current changes', 'foreign user draft') }),
+    });
+    const verifying = h.scope.resolveTraexPreemption();
+    h.scope.webTerminalInputGeneration++;
+    size = { cols: 120, rows: 80 };
+    await verifying;
+    expect(h.target.sendSpecialKeys).toHaveBeenCalledOnce();
+    expect(size).toEqual({ cols: 120, rows: 80 });
+    expect(h.target.resize.mock.calls).toHaveLength(1);
+  });
+
+  it('holds an oversized or unresolved long draft with one bounded notice and no clear', async () => {
+    const h = harness();
+    h.scope.lastWrittenCliInput.content = 'old line\n'.repeat(3000);
+    h.preempt(h.scope.pendingMessages[0], h.target);
+    await vi.waitFor(() => expect(h.target.sendSpecialKeys).toHaveBeenCalledOnce());
+    h.scope.traexPreemption.settled = true;
+    const resize = vi.fn();
+    Object.assign(h.target, { getPaneSize: () => ({ cols: 160, rows: 50 }), resize,
+      captureInputState: () => ({ viewport: busy.replace(/^◆ Working[^\n]*\n/m, '').replace('Run /review on my current changes', 'old line') }) });
+    await h.scope.resolveTraexPreemption();
+    expect(resize).not.toHaveBeenCalled();
+    expect(h.target.sendSpecialKeys).toHaveBeenCalledOnce();
+    h.scope.traexPreemption.requestedAt = Date.now() - 11_000;
+    await h.scope.resolveTraexPreemption(); await h.scope.resolveTraexPreemption();
+    expect(h.scope.send).toHaveBeenCalledOnce();
     expect(h.scope.flushPending).not.toHaveBeenCalled();
   });
 });

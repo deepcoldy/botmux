@@ -449,7 +449,8 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
     if (key === 'traexQuestionFlowVisible') return traexQuestionFlowVisible;
     if (typeof key === 'string' && ['traexPreemptionHoldsWrites', 'armTraexPreemptionPoll',
       'traexPreemptionEligible', 'traexPreemptionLeaseNow', 'traexPreemptionLeaseCurrent',
-      'preemptTraexForNewMessage', 'resolveTraexPreemption', 'observeTraexPreemptionTerminal', 'traexActiveNativeTurnId'].includes(key)) {
+      'preemptTraexForNewMessage', 'resolveTraexPreemption', 'observeTraexPreemptionTerminal',
+      'traexActiveNativeInput', 'clearTraexOwnedRestoredDraft', 'traexPreemptionEmptyComposerReady'].includes(key)) {
       if (!dependencies.has(key)) dependencies.set(key, loadWorkerFunction(key, scope));
       return dependencies.get(key);
     }
