@@ -2166,6 +2166,45 @@ describe('cursor buildArgs', () => {
     expect(adapter.readyPattern?.test('Plan, search, build anything')).toBe(false);
   });
 
+  it('detects active composer busy state and follow-ups queue without matching scrollback prose', () => {
+    const busyAnsi = [
+      '  I inspected /ctrl+c to stop/i in cursor.ts',
+      '\u001b[0m\u001b[39m\u001b[49m \u001b[33m┌─ follow-ups ────┐',
+      '\u001b[39m \u001b[33m│ \u001b[2m\u001b[39m○ Next follow-up    \u001b[0m\u001b[33m\u001b[49m │',
+      '\u001b[39m \u001b[33m│ \u001b[2m\u001b[39menter steer · ↑ select/edit · esc cancel    \u001b[0m\u001b[33m\u001b[49m │',
+      '\u001b[39m \u001b[33m└────┘',
+      '\u001b[49m \u001b[48;5;233m \u001b[2m→ \u001b[0;7m\u001b[39m\u001b[48;5;233mA\u001b[0;2m\u001b[39m\u001b[48;5;233mdd a follow-up\u001b[0m\u001b[39m\u001b[48;5;233m    \u001b[2mctrl+c to stop\u001b[0m',
+    ].join('\n');
+    const parkedOnly = [
+      ' ┌─ follow-ups ────┐',
+      ' │ ○ Parked follow-up │',
+      ' └──────────────────┘',
+      '  → Add a follow-up',
+    ].join('\n');
+    const idleWithProse = [
+      '  Note: press ctrl+c to stop a running command.',
+      '  → Add a follow-up',
+      '  Gemini 4 Carbon High · 12.9%',
+    ].join('\n');
+    const draftWithQuotedPlaceholder = [
+      '  Quoted: → Add a follow-up',
+      '  → half-typed draft',
+    ].join('\n');
+
+    expect(adapter.busyPattern?.test('  → Add a follow-up    ctrl+c to stop')).toBe(true);
+    expect(adapter.busyPattern?.test(idleWithProse)).toBe(false);
+
+    expect(adapter.screenHoldsSubmittedInput?.(busyAnsi)).toBe(true);
+    expect(adapter.screenHoldsSubmittedInput?.(parkedOnly)).toBe(true);
+    expect(adapter.screenHoldsSubmittedInput?.(idleWithProse)).toBe(false);
+
+    expect(adapter.screenShowsNoPendingInput?.(idleWithProse)).toBe(true);
+    expect(adapter.screenShowsNoPendingInput?.(busyAnsi)).toBe(false);
+    expect(adapter.screenShowsNoPendingInput?.(parkedOnly)).toBe(false);
+    expect(adapter.screenShowsNoPendingInput?.(draftWithQuotedPlaceholder)).toBe(false);
+    expect(adapter.screenShowsNoPendingInput?.('  Loading workspace...')).toBe(false);
+  });
+
   it('injects built-in plugin-dir by default and supports session-scoped skillPluginDir', () => {
     const args = adapter.buildArgs({
       sessionId: 'sess-cursor',
