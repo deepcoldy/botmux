@@ -9,6 +9,7 @@
 import { realpathSync } from 'node:fs';
 import { delimiter, isAbsolute, join } from 'node:path';
 import { homedir } from 'node:os';
+import { isStandaloneBinary } from './self-spawn.js';
 
 const BOTMUX_WRAPPER_BASENAME = 'botmux';
 const NATIVE_SUBAGENT_RUNTIME_HOOK_WRAPPER_BASENAME = 'botmux-native-subagent-runtime-hook';
@@ -65,6 +66,49 @@ export function resolveNativeSubagentRuntimeHookWrapperPath(
   let canonicalDir = lexicalDir;
   try { canonicalDir = realpathSync(lexicalDir); } catch { /* wrapper dir not materialized yet */ }
   return join(canonicalDir, wrapperFilename(NATIVE_SUBAGENT_RUNTIME_HOOK_WRAPPER_BASENAME, platform));
+}
+
+export interface ResolveBotmuxBinOptions {
+  env?: NodeJS.ProcessEnv;
+  platform?: NodeJS.Platform;
+  execPath?: string;
+  standalone?: boolean;
+}
+
+/**
+ * Resolve a single directly-executable `botmux` CLI path (`BOTMUX_BIN`) safe
+ * across source checkouts, standalone Bun single-file binaries, candidate
+ * `BOTMUX_WRAPPER_BIN` builds, and `BOTMUX_CORE_ONLY` instances.
+ *
+ * Priority:
+ *  1. Explicit absolute `BOTMUX_WRAPPER_BIN` → `<dir>/botmux[.cmd]`
+ *  2. Standalone compiled binary → canonical `process.execPath` (guarded
+ *     against `/$bunfs/` virtual paths and unlinked ` (deleted)` paths)
+ *  3. Wrapper path under `resolveBotmuxWrapperBinDir(env)` (`~/.botmux/bin/botmux`
+ *     or `<SESSION_DATA_DIR>/bin/botmux` in core-only mode)
+ */
+export function resolveBotmuxBin(options: ResolveBotmuxBinOptions = {}): string {
+  const env = options.env ?? process.env;
+  const platform = options.platform ?? process.platform;
+  const name = wrapperFilename(BOTMUX_WRAPPER_BASENAME, platform);
+  const explicitWrapperDir = env.BOTMUX_WRAPPER_BIN?.trim();
+  if (explicitWrapperDir && isAbsolute(explicitWrapperDir)) {
+    return join(resolveBotmuxWrapperBinDir(env), name);
+  }
+  const standalone = options.standalone ?? isStandaloneBinary();
+  if (standalone) {
+    const rawExec = options.execPath ?? process.execPath;
+    let resolved = rawExec;
+    try { resolved = realpathSync(rawExec); } catch { /* fall back to rawExec */ }
+    if (
+      isAbsolute(resolved)
+      && !resolved.startsWith('/$bunfs/')
+      && !resolved.endsWith(' (deleted)')
+    ) {
+      return resolved;
+    }
+  }
+  return join(resolveBotmuxWrapperBinDir(env), name);
 }
 
 /**

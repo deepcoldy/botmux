@@ -527,4 +527,69 @@ describe('antigravity quota auto-rotation state machine', () => {
     expect(tryAntigravityQuotaAutoRotate(h.deps)).toEqual({ outcome: 'identity_unknown' });
     expect(h.events.some(e => e.type === 'restart_requested')).toBe(false);
   });
+
+  it('accepts antigravity-native-log as an eligible auto-rotation source', () => {
+    expect(isAntigravityQuotaAutoRotateEligible({
+      effectiveCliId: 'antigravity',
+      usageLimit: nativeAgyLimit({
+        source: 'antigravity-native-log',
+        nativeEpisodeKey: 'log:E1125 00:00:01.000000',
+      }),
+    })).toBe(true);
+  });
+
+  it('reconciles switching notice vs settlement-time replay payload and passes settlement sourceTurnId on replay failure', () => {
+    // 1. Late proof arrives (false -> true): initial notice announces manual, settlement emits notifyAutoReplayStarted before replayTurn!
+    let dynamicPayload: AntigravityQuotaAutoRotateDeps['replayPayload'] = undefined;
+    const noticeOrder: string[] = [];
+    const h1 = makeHarness({
+      replayPayload: undefined,
+      getReplayPayload: () => dynamicPayload,
+      notifySwitching: info => { noticeOrder.push(`switching:${info.willAutoReplay}`); },
+      notifyAutoReplayStarted: info => { noticeOrder.push(`replay_started:${info.toId}`); },
+      replayTurn: payload => {
+        noticeOrder.push(`replay_turn:${payload.sourceTurnId}`);
+        return { accepted: true, retryTurnId: 'agy-rotate-late-1' };
+      },
+    });
+    expect(tryAntigravityQuotaAutoRotate(h1.deps).outcome).toBe('started');
+    expect(noticeOrder).toEqual(['switching:false']);
+
+    dynamicPayload = { sourceTurnId: 'turn-late', cliInput: 'late task', userPrompt: 'late task' };
+    h1.triggerRestartSettled('succeeded');
+    expect(noticeOrder).toEqual(['switching:false', 'replay_started:acc2', 'replay_turn:turn-late']);
+
+    // 2. Late proof arrives, then replay fails: notifyReplayFailed receives settlement-time sourceTurnId (NOT stale undefined initial payload)!
+    let failedSourceTurnId: string | undefined;
+    let payload2: AntigravityQuotaAutoRotateDeps['replayPayload'] = undefined;
+    const h2 = makeHarness({
+      replayPayload: undefined,
+      getReplayPayload: () => payload2,
+      replayTurn: () => ({ accepted: false }),
+      notifyReplayFailed: info => { failedSourceTurnId = info.sourceTurnId; },
+    });
+    expect(tryAntigravityQuotaAutoRotate(h2.deps).outcome).toBe('started');
+    payload2 = { sourceTurnId: 'turn-settled-fail', cliInput: 'retry me', userPrompt: 'retry me' };
+    h2.triggerRestartSettled('succeeded');
+    expect(failedSourceTurnId).toBe('turn-settled-fail');
+
+    // 3. Proof revoked mid-restart (true -> false): settlement calls notifyManualReplayNeeded and does NOT replay!
+    let payload3: AntigravityQuotaAutoRotateDeps['replayPayload'] = {
+      sourceTurnId: 'turn-revoked',
+      cliInput: 'do work',
+      userPrompt: 'do work',
+    };
+    const events3: string[] = [];
+    const h3 = makeHarness({
+      replayPayload: undefined,
+      getReplayPayload: () => payload3,
+      notifySwitching: info => { events3.push(`switching:${info.willAutoReplay}`); },
+      notifyManualReplayNeeded: info => { events3.push(`manual:${info.toId}`); },
+      replayTurn: () => { events3.push('replayed'); return { accepted: true, retryTurnId: 'bad' }; },
+    });
+    expect(tryAntigravityQuotaAutoRotate(h3.deps).outcome).toBe('started');
+    payload3 = undefined;
+    h3.triggerRestartSettled('succeeded');
+    expect(events3).toEqual(['switching:true', 'manual:acc2']);
+  });
 });

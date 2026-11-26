@@ -1,8 +1,13 @@
 import { createHash } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync } from 'node:fs';
-import { dirname, extname, isAbsolute, resolve } from 'node:path';
+import { dirname, extname, isAbsolute, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { config } from '../../config.js';
 import { formatUrlHost } from '../dashboard-url.js';
+import { resolveBotmuxDataDir } from '../data-dir.js';
+import { botmuxWrapperFiles, resolveBotmuxBin, resolveBotmuxWrapperBinDir } from '../botmux-wrapper.js';
+import { writeBotmuxWrapperFiles } from '../botmux-wrapper-writer.js';
+import { globalInstallUpdateLockTargetIn } from '../global-install-lock.js';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { withFileLock, withFileLockSync } from '../../utils/file-lock.js';
 import { readPluginRegistry } from '../../services/plugin-registry-store.js';
@@ -12,12 +17,16 @@ import {
   pluginServiceStatePath,
   pluginsHome,
 } from './paths.js';
-import { getOrCreatePluginCardActionToken } from './card-actions/auth.js';
+import {
+  getOrCreatePluginCardActionToken,
+  getOrCreatePluginWebhookToken,
+} from './card-actions/auth.js';
 import {
   PLUGIN_CARD_ACTION_ENDPOINT_ENV,
   PLUGIN_CARD_ACTION_TOKEN_ENV,
 } from './card-actions/protocol.js';
 import { PLUGIN_COMMANDS_ENDPOINT_ENV } from './commands/protocol.js';
+import { PLUGIN_WEBHOOK_TOKEN_ENV } from './webhooks/protocol.js';
 import { loadPluginServiceDefinition, type PluginServiceDefinition } from './runtime.js';
 import { changePluginService, readPluginProcesses, type PluginProcessInfo } from './supervisor-client.js';
 import { ensurePluginServicePreload, pluginServiceName, type PluginServiceSpec } from './supervisor-store.js';
@@ -84,50 +93,88 @@ export function withPluginServiceLock<T>(fn: () => Promise<T> | T): Promise<T> {
   return withFileLock(serviceLockTarget(), async () => fn(), { maxWaitMs: 30_000 });
 }
 
-/** Card actions and Lark slash commands are both host → plugin loopback calls:
- * they share the fixed port and the per-plugin bearer token. */
-const hostCallbackContributions = (record: InstalledPluginRecord): boolean =>
-  !!record.contributions?.cardActions || !!record.contributions?.commands;
+const STRICT_TCP_PORT_RE = /^[1-9]\d{0,4}$/;
 
-const assertCardActionServicePort = (
+export function parseValidTcpPort(value: unknown): number | undefined {
+  if (typeof value === 'number') {
+    return Number.isInteger(value) && value >= 1 && value <= 65_535 ? value : undefined;
+  }
+  if (typeof value === 'string' && STRICT_TCP_PORT_RE.test(value)) {
+    const parsed = Number(value);
+    return parsed >= 1 && parsed <= 65_535 ? parsed : undefined;
+  }
+  return undefined;
+}
+
+export function resolveDeclaredServicePort(definition: PluginServiceDefinition): number | undefined {
+  return parseValidTcpPort(definition.port) ?? parseValidTcpPort(definition.pm2.env?.PORT);
+}
+
+/** Card actions, Lark slash commands, and webhooks are host → plugin loopback
+ * calls: they require a fixed port and receive the per-plugin bearer token. */
+const hostCallbackContributions = (record: InstalledPluginRecord): boolean =>
+  !!record.contributions?.cardActions
+  || !!record.contributions?.commands
+  || !!record.contributions?.webhooks;
+
+const assertHostCallbackServicePort = (
   record: InstalledPluginRecord,
   definition: PluginServiceDefinition,
 ): number | undefined => {
-  if (!hostCallbackContributions(record)) return undefined;
-  if (!Number.isInteger(definition.port) || definition.port! < 1 || definition.port! > 65_535) {
+  const fixedPort = parseValidTcpPort(definition.port);
+  if (!hostCallbackContributions(record)) return fixedPort;
+  if (fixedPort === undefined) {
     throw new Error(record.contributions?.cardActions
       ? `plugin_card_actions_fixed_port_required:${record.id}`
-      : `plugin_commands_fixed_port_required:${record.id}`);
+      : record.contributions?.commands
+        ? `plugin_commands_fixed_port_required:${record.id}`
+        : `plugin_webhooks_fixed_port_required:${record.id}`);
   }
-  return definition.port;
+  return fixedPort;
 };
 
 const publicDefinitionEnv = (record: InstalledPluginRecord, definition: PluginServiceDefinition): Record<string, string> => {
-  const cardActionPort = assertCardActionServicePort(record, definition);
+  const fixedPort = assertHostCallbackServicePort(record, definition);
+  const dataDir = resolveBotmuxDataDir();
   const env: Record<string, string> = {
     ...(definition.pm2.env ?? {}),
     BOTMUX_PLUGIN_ID: record.id,
     BOTMUX_PLUGIN_DIR: pluginRuntimeDir(record.id),
     BOTMUX_PLUGIN_HOME: pluginHome(record.id),
+    BOTMUX_DATA_DIR: dataDir,
+    BOTMUX_BIN: resolveBotmuxBin(),
   };
+  // Never let a plugin manifest forge host-managed loopback bearer tokens
+  // into public env / urls() or survive on non-HTTP services.
+  delete env[PLUGIN_CARD_ACTION_TOKEN_ENV];
+  delete env[PLUGIN_WEBHOOK_TOKEN_ENV];
+  if (process.env.SESSION_DATA_DIR?.trim()) {
+    env.SESSION_DATA_DIR = dataDir;
+  }
   if (record.contributions?.cardActions) {
     env[PLUGIN_CARD_ACTION_ENDPOINT_ENV] = record.contributions.cardActions.endpoint;
   }
   if (record.contributions?.commands) {
     env[PLUGIN_COMMANDS_ENDPOINT_ENV] = record.contributions.commands.endpoint;
   }
-  if (cardActionPort !== undefined) env.PORT = String(cardActionPort);
+  if (fixedPort !== undefined) env.PORT = String(fixedPort);
   return env;
 };
 
 const definitionEnv = (record: InstalledPluginRecord, definition: PluginServiceDefinition): Record<string, string> => {
   const env = publicDefinitionEnv(record, definition);
-  return hostCallbackContributions(record)
+  const needsLoopbackToken = hostCallbackContributions(record)
+    || resolveDeclaredServicePort(definition) !== undefined;
+  const out: Record<string, string> = needsLoopbackToken
     ? {
         ...env,
         [PLUGIN_CARD_ACTION_TOKEN_ENV]: getOrCreatePluginCardActionToken(record.id),
       }
-    : env;
+    : { ...env };
+  if (record.contributions?.webhooks) {
+    out[PLUGIN_WEBHOOK_TOKEN_ENV] = getOrCreatePluginWebhookToken(record.id);
+  }
+  return out;
 };
 
 function definitionCwd(record: InstalledPluginRecord, definition: PluginServiceDefinition): string {
@@ -174,12 +221,13 @@ function serviceConfigHash(
   record: InstalledPluginRecord,
   definition: PluginServiceDefinition,
   linked: boolean,
+  baseEnv: Record<string, string>,
 ): string {
   return createHash('sha256').update(stableJson({
     script: definitionScript(record, definition),
     cwd: definitionCwd(record, definition),
     args: definition.pm2.args ?? [],
-    env: definitionEnv(record, definition),
+    env: baseEnv,
     autorestart: definition.pm2.autorestart !== false,
     killTimeoutMs: definition.pm2.killTimeoutMs ?? null,
     watch: linked ? linkedWatchPath(record) : false,
@@ -194,8 +242,9 @@ export function resolvePluginServiceSpec(
   const linked = isLinkedPlugin(record);
   const script = definitionScript(record, definition);
   const javascript = ['.js', '.cjs', '.mjs', '.ts', '.tsx', '.jsx'].includes(extname(script));
+  const baseEnv = definitionEnv(record, definition);
   const env: Record<string, string> = {
-    ...definitionEnv(record, definition),
+    ...baseEnv,
     BOTMUX_PLUGIN_LINKED: linked ? '1' : '0',
   };
   // A standalone botmux executable contains the Bun runtime. BUN_BE_BUN runs
@@ -222,7 +271,7 @@ export function resolvePluginServiceSpec(
       cwd: definitionCwd(record, definition), env,
       autorestart: definition.pm2.autorestart !== false,
       ...(killTimeoutMs !== undefined ? { killTimeoutMs } : {}),
-      configHash: serviceConfigHash(record, definition, linked),
+      configHash: serviceConfigHash(record, definition, linked, baseEnv),
     },
     ...(linked ? { watch: { path: linkedWatchPath(record), delayMs: watchDelayMs } } : {}),
   };
@@ -233,6 +282,10 @@ function findService(name: string): PluginProcessInfo | undefined {
 }
 
 function isStoppedService(app: PluginProcessInfo): boolean {
+  // Requires BOTH no live pid and a terminal status. An 'unknown' row keeps its
+  // live pid (birth identity unreadable/unmatched), so it never counts as
+  // stopped: uninstall/update must fail closed rather than touch a process that
+  // is still running but cannot be verified.
   return app.pid === undefined && (app.status === 'stopped' || app.status === 'errored');
 }
 
@@ -263,12 +316,12 @@ export function rewriteLoopbackServiceUrl(rawUrl: string | undefined): string | 
 
 export function serviceUrls(record: InstalledPluginRecord, definition: PluginServiceDefinition): Pick<PluginServiceState, 'port' | 'openUrl' | 'healthUrl'> {
   const env = publicDefinitionEnv(record, definition);
-  const port = definition.port ?? (env.PORT ? Number(env.PORT) : undefined);
+  const port = resolveDeclaredServicePort(definition);
   const host = formatUrlHost(config.dashboard.externalHost);
-  const urls = definition.urls?.({ host, env, ...(Number.isFinite(port) ? { port } : {}) }) ?? {};
+  const urls = definition.urls?.({ host, env, ...(port !== undefined ? { port } : {}) }) ?? {};
   return {
-    ...(Number.isFinite(port) ? { port } : {}),
-    ...(urls.openUrl ? { openUrl: rewriteLoopbackServiceUrl(urls.openUrl) } : Number.isFinite(port) ? { openUrl: `http://${host}:${port}/` } : {}),
+    ...(port !== undefined ? { port } : {}),
+    ...(urls.openUrl ? { openUrl: rewriteLoopbackServiceUrl(urls.openUrl) } : port !== undefined ? { openUrl: `http://${host}:${port}/` } : {}),
     ...(urls.healthUrl ? { healthUrl: rewriteLoopbackServiceUrl(urls.healthUrl) } : {}),
   };
 }
@@ -297,6 +350,7 @@ function writeServiceState(record: InstalledPluginRecord, definition: PluginServ
     updatedAt: new Date().toISOString(),
     status: app?.status ?? 'stopped',
     ...(typeof app?.pid === 'number' ? { pid: app.pid } : {}),
+    ...(typeof app?.processStart === 'string' && app.processStart ? { processStart: app.processStart } : {}),
     ...serviceUrls(record, definition),
     processName: pluginServiceName(record.id),
     supervisor: 'builtin',
@@ -375,13 +429,62 @@ async function startService(record: InstalledPluginRecord, definition: PluginSer
   return 'started';
 }
 
+function ensureBotmuxBinWrapperIfAbsent(): void {
+  if (process.env.BOTMUX_NO_CLAIM === '1') return;
+  const binPath = resolveBotmuxBin();
+  if (existsSync(binPath)) return;
+  const binDir = dirname(binPath);
+  if (resolve(binDir) !== resolve(resolveBotmuxWrapperBinDir())) return;
+  try {
+    const standalone = isStandaloneBinary();
+    let files;
+    if (standalone) {
+      let binaryPath = process.execPath;
+      try { binaryPath = realpathSync(binaryPath); } catch { /* fall back to process.execPath */ }
+      if (
+        !isAbsolute(binaryPath)
+        || binaryPath.startsWith('/$bunfs/')
+        || binaryPath.endsWith(' (deleted)')
+        || !existsSync(binaryPath)
+      ) {
+        return;
+      }
+      files = botmuxWrapperFiles('', binaryPath, process.platform, true);
+    } else {
+      const root = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
+      const cliCandidates = [
+        join(root, 'cli.js'),
+        join(dirname(root), 'dist', 'cli.js'),
+      ];
+      const cliScript = cliCandidates.find(candidate => existsSync(candidate));
+      if (!cliScript) return;
+      files = botmuxWrapperFiles(cliScript, process.execPath, process.platform, false);
+    }
+    const missingFiles = files.filter(file => !existsSync(join(binDir, file.name)));
+    if (missingFiles.length === 0) return;
+    const dataDir = resolveBotmuxDataDir();
+    mkdirSync(dataDir, { recursive: true });
+    writeBotmuxWrapperFiles({
+      binDir,
+      files: missingFiles,
+      runningExecutable: process.execPath,
+      lockTarget: globalInstallUpdateLockTargetIn(dataDir),
+    });
+  } catch {
+    // Best-effort only: never block plugin service start on wrapper lock contention
+    // or read-only filesystems.
+  }
+}
+
 export async function startPluginServices(
   pluginIds?: readonly string[],
   options: { autoOnly?: boolean } = {},
 ): Promise<PluginServiceReport[]> {
   return withPluginServiceLock(async () => {
+    const records = selectedRecords(pluginIds, options.autoOnly === true);
+    if (records.length > 0) ensureBotmuxBinWrapperIfAbsent();
     const reports: PluginServiceReport[] = [];
-    for (const record of selectedRecords(pluginIds, options.autoOnly === true)) {
+    for (const record of records) {
       try {
         const definition = await loadPluginServiceDefinition(record);
         if (!definition) continue;

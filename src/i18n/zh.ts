@@ -197,6 +197,7 @@ export const messages: Record<string, string> = {
   'worker.rate_limit_notify.usage': '⚠️ {cliName} 已达使用限额，本轮任务已暂停。额度刷新后（{retryLabel}）请重发上一条任务，或直接发送新消息继续。',
   'worker.agy_rotate.switching': '🔄 Antigravity 账号 {fromAccount} 已达限额，已自动轮换至 {toAccount}，正在重启会话并重试本轮消息…',
   'worker.agy_rotate.switching_no_replay': '🔄 Antigravity 账号 {fromAccount} 已达限额，已自动轮换至 {toAccount}，正在重启会话…',
+  'worker.agy_rotate.replay_started': '🔄 已切换至 Antigravity 账号 {toAccount} 并重启会话，确认本轮无副作用后正在自动重试本轮消息…',
   'worker.agy_rotate.exhausted': '⚠️ 托管池中所有 Antigravity 账号均已达到限额（共 {count} 个启用账号），最早预计恢复时间：{recovery}。',
   'worker.agy_rotate.exhausted_no_eta': '⚠️ 托管池中所有 Antigravity 账号均已达到限额（共 {count} 个启用账号），暂停自动轮换。',
   'worker.agy_rotate.turn_budget_exhausted': '⚠️ 本轮已达到 Antigravity 账号自动轮换次数上限，已停止继续轮换。',

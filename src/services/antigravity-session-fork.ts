@@ -8,6 +8,14 @@ const STREAM = new RegExp(`\\bStreaming conversation (${UUID})\\s*$`, 'i');
 const FORK = new RegExp(`\\bForked conversation (${UUID}) -> (${UUID})\\s*$`, 'i');
 const SIDE_QUESTION = new RegExp(`(?:^|\\] )btw side question (${UUID}) ended after [^:]+: (.+?)\\s*$`, 'i');
 
+/** Per-session native `--log-file` path shared by fork/stream and quota readers. */
+export function antigravitySessionLogPath(
+  sessionId: string,
+  root = join(homedir(), '.gemini', 'antigravity-cli'),
+): string {
+  return join(root, 'botmux', `${encodeURIComponent(sessionId)}.log`);
+}
+
 /** Each managed agy gets its own native log. A global cli.log mixes sibling
  * processes, and agy keeps BOTH parent and child DBs open after /fork. */
 export class AntigravitySessionLog {
@@ -22,7 +30,7 @@ export class AntigravitySessionLog {
   } = {};
 
   constructor(sessionId: string, root = join(homedir(), '.gemini', 'antigravity-cli')) {
-    this.path = join(root, 'botmux', `${encodeURIComponent(sessionId)}.log`);
+    this.path = antigravitySessionLogPath(sessionId, root);
     mkdirSync(dirname(this.path), { recursive: true });
   }
 

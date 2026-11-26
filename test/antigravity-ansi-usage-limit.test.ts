@@ -3,7 +3,7 @@ import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { createUsageLimitTracker } from '../src/utils/usage-limit-tracker.js';
 import { reconcileUsageLimitState, type CliUsageLimitState } from '../src/utils/cli-usage-limit.js';
 import { stripAnsiScreenText } from '../src/utils/idle-detector.js';
-import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen, rememberAntigravityQuota } from '../src/adapters/cli/antigravity.js';
+import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen, rememberAntigravityQuota } from '../src/adapters/cli/antigravity.js';
 
 function classifier(raw: () => string, cliId = 'antigravity', authoritative = true) {
   const capture = vi.fn(raw);
@@ -11,7 +11,7 @@ function classifier(raw: () => string, cliId = 'antigravity', authoritative = tr
   const classify = loadWorkerFunction<(content: string, status: string) => any>('classifyUsageLimitWithNativeEvidence', {
     cliAdapter: { id: cliId }, backend: {}, captureBackendScreen: capture,
     backendScreenEvidenceIsAuthoritativeForMutation: () => authoritative,
-    stripAnsiScreenText, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen, annotateAntigravityUsageLimit,
+    stripAnsiScreenText, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen,
     usageLimitTracker, reconcileUsageLimitState, rememberAntigravityQuota, antigravityQuotaHistory: undefined,
     unconfirmedAntigravityQuotas: new Map(), ANTIGRAVITY_QUOTA_HISTORY_LIMIT,
   });

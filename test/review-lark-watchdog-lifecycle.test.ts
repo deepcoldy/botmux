@@ -183,6 +183,9 @@ describe('independent watchdog lifecycle with the real SDK transport', () => {
 
   it('a real inbound frame after throttling restores burst recovery and closes the connected socket', async () => {
     vi.stubEnv('BOTMUX_LARK_WS_MAX_REBUILDS', '1');
+    // The transport chooses its proxy for the discovery host before discovery
+    // returns our loopback socket. An inherited proxy must not handle that dial.
+    vi.stubEnv('npm_config_no_proxy', 'open.feishu.cn,127.0.0.1');
     const server = new WebSocketServer({ port: 0, host: '127.0.0.1' });
     servers.push(server);
     await new Promise<void>(resolve => server.once('listening', resolve));

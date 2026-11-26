@@ -15,7 +15,7 @@ import {
   replaceManagedOriginCapabilityFile,
 } from '../src/core/managed-origin-capability.js';
 import {
-  findCompletedAntigravityTurnIds,
+  findCompletedAntigravityTurnIdsPaired,
   hashAntigravitySubmittedText,
 } from '../src/services/antigravity-transcript.js';
 
@@ -363,16 +363,19 @@ describe('resolveSessionContext()', () => {
     expect(advanced.antigravityReconcileHint).toBeUndefined();
     const hint = advanced.antigravityReconcileHint;
     const transcript = join(dir, 'transcript_full.jsonl');
-    writeFileSync(transcript, [
+    const compactTranscript = join(dir, 'transcript.jsonl');
+    const content = [
       JSON.stringify({ step_index: 1, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', content: `<USER_REQUEST>\n${prompt}\n</USER_REQUEST>` }),
       JSON.stringify({ step_index: 2, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: 'done' }),
-    ].join('\n') + '\n');
+    ].join('\n') + '\n';
+    writeFileSync(transcript, content);
+    writeFileSync(compactTranscript, content);
     // The transcript contains only an older completed occurrence. A weakened
     // parser would retain the hash, drop the bad offset and falsely complete it.
-    expect([...findCompletedAntigravityTurnIds(transcript, [{
+    expect([...findCompletedAntigravityTurnIdsPaired(transcript, [{
       turnId: 'schedule:new',
       ...(hint ? { submittedTextSha256: hint.textSha256 } : {}),
-    }])]).toEqual([]);
+    }]).completed]).toEqual([]);
   });
 
   it('handles single legacy queuedTurnId when advancing turn', () => {
