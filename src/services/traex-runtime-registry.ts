@@ -21,6 +21,7 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { PROCESS_TABLE_MAX_BUFFER } from '../utils/exec-limits.js';
 import { withExclusiveFileLock } from '../utils/file-flock.js';
 import { pidNotProvablyGone } from '../utils/process-alive.js';
 import {
@@ -295,6 +296,7 @@ function processGroupLiveness(pid: number | undefined): OccupantLiveness {
     }
     const output = execFileSync('ps', ['-axo', 'pid=,pgid=,stat='], {
       encoding: 'utf8', timeout: 2_000, stdio: ['ignore', 'pipe', 'ignore'],
+      maxBuffer: PROCESS_TABLE_MAX_BUFFER,
       env: { PATH: '/usr/bin:/bin', LANG: 'C' },
     });
     for (const line of output.trim().split('\n')) {
