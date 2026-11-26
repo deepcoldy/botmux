@@ -4,10 +4,13 @@
 // 已交付只认两样确定事实同时成立：轮次正常结束 + 本轮有最终回复的送达回执；
 // 其余一律不标已交付。
 import { closeSync, existsSync, fstatSync, openSync, readSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { config } from '../config.js';
 import { SUPPORTED_LOCALES, t } from '../i18n/index.js';
 import * as sessionStore from '../services/session-store.js';
+import { normaliseForFingerprint } from '../services/bridge-turn-queue.js';
+import { readSessionTurnFinalReply } from '../services/session-turns.js';
 import { shouldNotifyTurnFailure } from '../services/turn-failure-notice.js';
 import { logger } from '../utils/logger.js';
 import { dashboardEventBus } from './dashboard-events.js';
@@ -58,6 +61,22 @@ const finalTexts = new WeakMap<DaemonSession, Map<string, string>>();
 // bound as the summary cache and cap each body; do not add another disk copy.
 const finalFullTexts = new WeakMap<DaemonSession, Map<string, string>>();
 const FINAL_REPLY_CONTEXT_MAX_CHARS = 2_000;
+export interface SupervisionFinalReply {
+  text: string;
+  /** False when any source boundary omitted part of the delivered reply. */
+  complete: boolean;
+  /** Delivery time used to order independent final corrections. */
+  at?: number;
+  /** True only when a source is proven to be a truncated prefix of a fuller reply. */
+  prefixProven?: boolean;
+}
+
+// Supervision needs the evidence and any failure qualifiers beyond the short
+// next-step prefix. Two recent group replies cover both `/supervise on` after
+// delivery and an automatic continuation without retaining large text fleet-wide.
+const finalSupervisionReplies = new WeakMap<DaemonSession, Map<string, SupervisionFinalReply>>();
+const SUPERVISION_FINAL_REPLY_MAX_CHARS = 256_000;
+const SUPERVISION_FINAL_TEXT_MEMORY = 2;
 const finalKinds = new WeakMap<DaemonSession, Map<string, 'answer' | 'diagnostic'>>();
 const terminalStatuses = new WeakMap<DaemonSession, Map<string, TurnOutcomeTerminal>>();
 
@@ -68,15 +87,16 @@ export function hasCompletedTurn(ds: DaemonSession, turnId: string, dispatchAtte
 const turnStarts = new WeakMap<DaemonSession, Map<string, number>>();
 const excludedActivityAt = new WeakMap<DaemonSession, Map<string, number>>();
 const outcomeSeq = new WeakMap<DaemonSession, number>();
+const drainingOutcomes = new WeakMap<DaemonSession, Map<string, number>>();
 /** 没写盘的「无最终输出」：它的最终回复晚到时仍可补登成已交付。 */
 const heldBackNoOutput = new WeakMap<DaemonSession, { turnId: string; at: number }>();
 
-function remember<V>(store: WeakMap<DaemonSession, Map<string, V>>, ds: DaemonSession, turnId: string, value: V): void {
+function remember<V>(store: WeakMap<DaemonSession, Map<string, V>>, ds: DaemonSession, turnId: string, value: V, limit = FINAL_TEXT_MEMORY): void {
   const map = store.get(ds) ?? new Map<string, V>();
   store.set(ds, map);
   map.delete(turnId);
   map.set(turnId, value);
-  while (map.size > FINAL_TEXT_MEMORY) map.delete(map.keys().next().value!);
+  while (map.size > limit) map.delete(map.keys().next().value!);
 }
 
 function noteAnswered(ds: DaemonSession, turnId: string): void {
@@ -104,17 +124,37 @@ function stripRestoredNotice(raw: unknown): unknown {
   return notice ? text.slice(notice.length) : raw;
 }
 
-function boundedFinalText(raw: unknown): string | undefined {
+function boundedReplyText(raw: unknown, maxChars: number): string | undefined {
   if (typeof raw !== 'string') return undefined;
   const text = raw.trim();
   if (!text) return undefined;
-  return text.length > FINAL_REPLY_CONTEXT_MAX_CHARS
-    ? `${text.slice(0, FINAL_REPLY_CONTEXT_MAX_CHARS - 1)}…`
-    : text;
+  return text.length > maxChars ? `${text.slice(0, maxChars - 1)}…` : text;
+}
+
+function boundedFinalText(raw: unknown): string | undefined {
+  return boundedReplyText(raw, FINAL_REPLY_CONTEXT_MAX_CHARS);
+}
+
+function boundedSupervisionFinalText(raw: unknown): string | undefined {
+  // Prompt fitting is checked separately after JSON escaping; this is only the
+  // capture bound. A reply that crosses either boundary is never auto-accepted.
+  return boundedReplyText(raw, SUPERVISION_FINAL_REPLY_MAX_CHARS);
+}
+
+function supervisionFinalReply(raw: unknown, complete = true, at?: number, prefixProven = false): SupervisionFinalReply | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const text = boundedSupervisionFinalText(raw);
+  if (!text) return undefined;
+  return {
+    text,
+    complete: complete && text === raw.trim(),
+    ...(at !== undefined ? { at } : {}),
+    ...(prefixProven || text !== raw.trim() ? { prefixProven: true } : {}),
+  };
 }
 
 /** daemon 投递最终回复时记下首行摘要和有界正文，供卡片与下一步建议使用。 */
-export function noteFinalReplyText(ds: DaemonSession, turnId: string, raw: unknown): void {
+export function noteFinalReplyText(ds: DaemonSession, turnId: string, raw: unknown, at = Date.now()): void {
   if (!turnId) return;
   noteAnswered(ds, turnId);
   const text = stripRestoredNotice(raw);
@@ -123,6 +163,10 @@ export function noteFinalReplyText(ds: DaemonSession, turnId: string, raw: unkno
   remember(finalTexts, ds, turnId, line);
   const fullText = boundedFinalText(text);
   if (fullText) remember(finalFullTexts, ds, turnId, fullText);
+  if (ds.chatType === 'group' || ds.session.chatType === 'group') {
+    const supervisionReply = supervisionFinalReply(text, true, at);
+    if (supervisionReply) remember(finalSupervisionReplies, ds, turnId, supervisionReply, SUPERVISION_FINAL_TEXT_MEMORY);
+  }
 }
 
 /** 投递出去的是「没匹配到最终文本」诊断，不是模型的答复：不算本轮的最终回复。 */
@@ -146,7 +190,7 @@ export function noteFinalOutputReceipt(
     noteDiagnosticFinal(ds, turnId);
     return;
   }
-  noteFinalReplyText(ds, turnId, receipt.text);
+  noteFinalReplyText(ds, turnId, receipt.text, opts.now?.());
   noteLateFinalReply(ds, turnId, opts);
 }
 
@@ -165,7 +209,7 @@ function resultStillCurrent(ds: DaemonSession, turn: SessionLastTurn | undefined
 }
 
 /** `botmux send --response-kind final` 的正文预览在 turn-sends 里，按 turnId 从尾部反查。 */
-function readFinalSendText(dataDir: string, sessionId: string, turnId: string): string | undefined {
+function readFinalSendRecord(dataDir: string, sessionId: string, turnId: string): SupervisionFinalReply | undefined {
   const path = join(dataDir, 'turn-sends', `${sessionId}.jsonl`);
   if (!existsSync(path)) return undefined;
   let fd: number | undefined;
@@ -183,7 +227,16 @@ function readFinalSendText(dataDir: string, sessionId: string, turnId: string): 
       try {
         const row = JSON.parse(lines[i]!);
         if (row?.turnId === turnId && row.responseKind === 'final' && typeof row.previewText === 'string') {
-          return row.previewText;
+          const normalized = normaliseForFingerprint(row.previewText);
+          // A complete preview reproduces the full normalized body. Hash covers
+          // a natural trailing ellipsis; length supports older structured rows.
+          const complete = typeof row.contentHash === 'string'
+            ? createHash('sha256').update(normalized).digest('hex') === row.contentHash
+            : typeof row.contentLength === 'number'
+              ? normalized.length === row.contentLength
+              : !row.previewText.endsWith('…');
+          const prefixProven = (typeof row.contentHash === 'string' || typeof row.contentLength === 'number') && !complete;
+          return { text: row.previewText, complete, ...(prefixProven ? { prefixProven: true } : {}), ...(typeof row.sentAtMs === 'number' && Number.isFinite(row.sentAtMs) ? { at: row.sentAtMs } : {}) };
         }
       } catch { /* 并发写入的半行 */ }
     }
@@ -197,6 +250,10 @@ function readFinalSendText(dataDir: string, sessionId: string, turnId: string): 
   }
 }
 
+function readFinalSendText(dataDir: string, sessionId: string, turnId: string): string | undefined {
+  return readFinalSendRecord(dataDir, sessionId, turnId)?.text;
+}
+
 export function readFinalSendPreview(dataDir: string, sessionId: string, turnId: string): string | undefined {
   return replySummaryLine(readFinalSendText(dataDir, sessionId, turnId));
 }
@@ -204,6 +261,36 @@ export function readFinalSendPreview(dataDir: string, sessionId: string, turnId:
 /** Bounded multiline reply used only as generation context, not as the dashboard summary. */
 export function turnFinalText(ds: DaemonSession, turnId: string, dataDir: string): string | undefined {
   return finalFullTexts.get(ds)?.get(turnId) ?? boundedFinalText(readFinalSendText(dataDir, ds.session.sessionId, turnId));
+}
+
+/** Larger, supervision-only view of the delivered reply. Independent final
+ * corrections are ordered by delivery time; an unorderable conflict is never complete. */
+export function turnSupervisionFinalReply(ds: DaemonSession, turnId: string, dataDir: string): SupervisionFinalReply | undefined {
+  const candidates = [
+    finalSupervisionReplies.get(ds)?.get(turnId),
+    (() => {
+      const structured = readSessionTurnFinalReply(dataDir, ds.session.sessionId, turnId);
+      return structured ? supervisionFinalReply(structured.text, structured.complete, structured.at, structured.prefixProven) : undefined;
+    })(),
+    (() => {
+      const preview = readFinalSendRecord(dataDir, ds.session.sessionId, turnId);
+      return preview ? supervisionFinalReply(preview.text, preview.complete, preview.at, preview.prefixProven) : undefined;
+    })(),
+  ].filter((candidate): candidate is SupervisionFinalReply => !!candidate);
+  if (!candidates.length) return undefined;
+  const coveredBy = (candidate: SupervisionFinalReply, complete: SupervisionFinalReply): boolean => {
+    if (candidate.prefixProven !== true || !complete.complete) return false;
+    const prefix = candidate.text.endsWith('…') ? candidate.text.slice(0, -1) : candidate.text;
+    return complete.text.length > prefix.length && complete.text.startsWith(prefix);
+  };
+  const timed = candidates.filter(candidate => typeof candidate.at === 'number' && Number.isFinite(candidate.at));
+  const newestAt = timed.length ? Math.max(...timed.map(candidate => candidate.at!)) : undefined;
+  const newest = newestAt === undefined ? candidates : timed.filter(candidate => candidate.at === newestAt);
+  const chosen = newest.find(candidate => newest.every(other => other === candidate || coveredBy(other, candidate))) ?? newest[0]!;
+  const tiedConflict = newest.length > 1 && newest.some(candidate => candidate.text !== chosen.text && !coveredBy(candidate, chosen));
+  const unknownConflict = timed.length < candidates.length
+    && candidates.some(candidate => candidate.text !== chosen.text && !coveredBy(candidate, chosen));
+  return { ...chosen, complete: chosen.complete && !tiedConflict && !unknownConflict };
 }
 
 export function turnFinalSummary(ds: DaemonSession, turnId: string, dataDir: string): string | undefined {
@@ -231,6 +318,15 @@ function commitLastTurn(ds: DaemonSession, lastTurn: SessionLastTurn): boolean {
   return true;
 }
 
+/** Recheck under turn admission before treating an observed turn as lacking output. */
+export function turnOutcomePendingOrChanged(
+  ds: DaemonSession, turnId: string, observed: SessionLastTurn | undefined,
+): boolean {
+  if (drainingOutcomes.get(ds)?.has(turnId)) return true;
+  const latest = ds.session.lastTurn;
+  return latest?.turnId === turnId && (latest.at !== observed?.at || latest.outcome !== observed?.outcome);
+}
+
 /**
  * 轮次终态时调用。completed 先等本轮 daemon 兜底最终回复投递落地（它的送达回执在
  * 飞书往返之后才记，可能晚于终态），再看有没有最终回复。只有最后一个终态能写，
@@ -255,11 +351,19 @@ export async function recordTurnOutcome(
   outcomeSeq.set(ds, seq);
   remember(terminalStatuses, ds, terminal.turnId, terminal);
   if (terminal.status === 'completed') {
-    await waitAllWithin(
-      [waitForTurnFinalOutputDeliveryDrain(ds, terminal.turnId)],
-      now() + (opts.drainTimeoutMs ?? TURN_OUTCOME_DRAIN_TIMEOUT_MS),
-      now,
-    );
+    const draining = drainingOutcomes.get(ds) ?? new Map<string, number>();
+    drainingOutcomes.set(ds, draining);
+    draining.set(terminal.turnId, seq);
+    try {
+      await waitAllWithin(
+        [waitForTurnFinalOutputDeliveryDrain(ds, terminal.turnId)],
+        now() + (opts.drainTimeoutMs ?? TURN_OUTCOME_DRAIN_TIMEOUT_MS),
+        now,
+      );
+    } finally {
+      if (draining.get(terminal.turnId) === seq) draining.delete(terminal.turnId);
+      if (draining.size === 0) drainingOutcomes.delete(ds);
+    }
   }
   const outcome = classifyTurnOutcome(terminal, {
     recoveryHandled: opts.recoveryHandled,

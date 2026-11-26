@@ -912,6 +912,8 @@ export interface Session {
   /** 最近一轮的结果（已交付 / 中断 / 无最终输出），由 daemon 在轮次终态处写入。
    *  只供会话任务状态推导使用（core/session-task-status.ts）。 */
   lastTurn?: import('./core/session-task-status.js').SessionLastTurn;
+  /** A human opted this exact group task into end-of-turn review. */
+  groupSessionSupervision?: import('./core/group-session-supervision.js').GroupSessionSupervision;
   closedAt?: string;
   /** Set when a HUMAN closed this session explicitly (`/close`, the card's close
    *  button). Such a session is not resumed automatically when the topic gets a

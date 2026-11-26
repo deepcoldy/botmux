@@ -87,11 +87,7 @@ export function buildReportReplyContext(references: readonly ReportReplyReferenc
     + '\n</delivered_project_results>\n';
 }
 
-export function markReportReplyInput(session: { reportReplyInputId?: string }, inputId: string): boolean {
-  if (session.reportReplyInputId === inputId) return false;
-  session.reportReplyInputId = inputId;
-  return true;
-}
+export { markReportReplyInput } from './session-activity.js';
 
 /** 直投引用随会话持久并注入后续每一轮提示；长会话需要有界，避免持久数据与提示无限增长。 */
 export const MAX_REPORT_REPLY_REFERENCES = 20;

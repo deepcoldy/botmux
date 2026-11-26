@@ -37,6 +37,8 @@ import { pluginCommandGateway, renderPluginCommandHelp } from './plugins/command
 import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from './close-residual.js';
 import * as sessionStore from '../services/session-store.js';
 import { markReportReplyInput } from './report-source-reply.js';
+import { stopGroupSessionSupervision } from './group-session-supervision.js';
+import { buildGroupSupervisionCard } from '../im/lark/group-supervision-card.js';
 import { findEffortTaskConfirmation, recordEffortTaskConfirmation } from '../services/codex-effort-task-state.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
@@ -662,6 +664,7 @@ export interface CommandHandlerDeps {
    * Missing policy wiring fails closed rather than reviving a revoked fork. */
   canRunQueuedFork?: (source: DaemonSession, message: LarkMessage) => boolean;
   prepareTurn?: (ds: DaemonSession, turnId: string) => Promise<void> | undefined;
+  superviseSession?: (ds: DaemonSession, message: LarkMessage) => string;
   submitQueuedMessage?: (ds: DaemonSession, message: LarkMessage, text: string, replyTarget?: FrozenSessionReplyTarget) => Promise<boolean>;
   /** Task text attached to a successful native effort change uses normal input delivery. */
   submitEffortTask?: (ds: DaemonSession, message: LarkMessage, text: string, replyTarget?: FrozenSessionReplyTarget) => Promise<boolean>;
@@ -3278,41 +3281,63 @@ export async function handleCommand(
           await replyNoSession(replyHere, loc);
           break;
         }
-        if (markReportReplyInput(ds.session, message.messageId)) sessionStore.updateSession(ds.session);
+        const saveReportInput = () => {
+          try {
+            if (markReportReplyInput(ds.session, message.messageId)) sessionStore.updateSession(ds.session);
+          } catch { logger.warn(`[${logTag}] could not save non-critical stop report metadata`); }
+        };
         if (isSessionTransferring(ds)) {
+          saveReportInput();
           await replyTransferInProgress(replyHere, loc);
           break;
         }
+        let supervisionStopSaveFailed = false;
+        let supervisionStopped = false;
+        try {
+          supervisionStopped = stopGroupSessionSupervision(ds.session, () => {
+            // An unsuccessful update restores the durable row. Include the
+            // stop input in each attempt so a separate write cannot block it.
+            markReportReplyInput(ds.session, message.messageId);
+            sessionStore.updateSession(ds.session);
+          });
+        } catch {
+          supervisionStopSaveFailed = true;
+          logger.warn(`[${logTag}] could not save stopped supervision`);
+        }
+        if (!supervisionStopped && !supervisionStopSaveFailed) saveReportInput();
+        const withStopWarning = (content: string) => supervisionStopSaveFailed
+          ? `${content}\n${t('cmd.supervise.stop_save_failed', undefined, loc)}`
+          : content;
         const effectiveCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
         if (ds.session.pendingForkSession && effectiveCliId === 'antigravity') {
-          await sessionReply(rootId, t('cmd.stop.fork_pending', undefined, loc));
+          await sessionReply(rootId, withStopWarning(t('cmd.stop.fork_pending', undefined, loc)));
           break;
         }
         if (effectiveCliId === 'codex-app' && !isRemoteBackendSession(ds)) {
           const status = await interruptCodexAppTurn(ds);
-          await sessionReply(rootId, t(`cmd.stop.app_${status}`, undefined, loc));
+          await sessionReply(rootId, withStopWarning(t(`cmd.stop.app_${status}`, undefined, loc)));
           break;
         }
         if (ds.initConfig?.codexRpcInput === true || isRemoteCliId(effectiveCliId) || isRemoteBackendSession(ds)) {
-          await sessionReply(rootId, t('cmd.stop.unsupported', undefined, loc));
+          await sessionReply(rootId, withStopWarning(t('cmd.stop.unsupported', undefined, loc)));
           break;
         }
         const cancelledAgyReplay = cancelAntigravityRotationReplay(ds.antigravityRotation);
         if (!ds.worker || ds.worker.killed) {
           if (cancelledAgyReplay) {
-            await sessionReply(rootId, t('worker.agy_rotate.stop_cancelled', undefined, loc));
+            await sessionReply(rootId, withStopWarning(t('worker.agy_rotate.stop_cancelled', undefined, loc)));
             break;
           }
-          await sessionReply(rootId, t('cmd.stop.no_worker', undefined, loc));
+          await sessionReply(rootId, withStopWarning(t('cmd.stop.no_worker', undefined, loc)));
           break;
         }
         sendWorkerSessionInput(ds, { type: 'term_action', key: 'ctrlc' });
         logger.info(`[${logTag}] /stop: ^C sent (session kept alive${cancelledAgyReplay ? ', cancelled in-flight agy rotation replay' : ''})`);
         await sessionReply(
           rootId,
-          cancelledAgyReplay
+          withStopWarning(cancelledAgyReplay
             ? `${t('cmd.stop.sent', { cliName: sessionCliDisplayName(ds) }, loc)}\n${t('worker.agy_rotate.stop_cancelled', undefined, loc)}`
-            : t('cmd.stop.sent', { cliName: sessionCliDisplayName(ds) }, loc),
+            : t('cmd.stop.sent', { cliName: sessionCliDisplayName(ds) }, loc)),
         );
         break;
       }
@@ -4178,6 +4203,16 @@ export async function handleCommand(
         sessionStore.updateSession(ds.session);
         logger.info(`[${logTag}] /retry re-injected turn ${failedTurn.turnId.slice(0, 8)} (attempt #${ds.session.lastFailedTurn?.retryCount ?? 1})`);
         await sessionReply(rootId, t('cmd.retry.success', { errorCode: failedTurn.errorCode ?? 'unknown' }, loc));
+        break;
+      }
+
+      case '/supervise': {
+        const card = (status: string) => JSON.stringify(buildGroupSupervisionCard({ locale: loc, status }));
+        const body = !ds ? card('card.supervise.no_session')
+          : message.senderType !== 'user' || !canOperateForCommandMessage(ds.larkAppId, ds.chatId, message)
+            ? card('cmd.supervise.owner_only')
+            : deps.superviseSession?.(ds, message) ?? card('cmd.supervise.unavailable');
+        await sessionReply(rootId, body, 'interactive');
         break;
       }
 
@@ -7631,6 +7666,7 @@ export async function handleCommand(
           t('help.retry', undefined, loc),
           t('help.rewind', undefined, loc),
           t('help.idlecompact', undefined, loc),
+          t('help.supervise', undefined, loc),
           t('help.queue', undefined, loc),
           t('help.card', undefined, loc),
           t('help.cot', undefined, loc),

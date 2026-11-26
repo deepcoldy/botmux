@@ -1,5 +1,6 @@
 import { DEFAULT_MODEL_VALUE_PATTERN, limitModelOptions } from '../core/model-value-pattern.js';
 import { normalizeOwnerGroupFollowConfig, notifyOwnerGroupFollowChanged } from './owner-group-follow-policy.js';
+import { groupSessionSupervisorConfig } from '../core/group-session-supervisor-config.js';
 import { botAcceptsLaunchModel } from '../core/launch-model-capability.js';
 import { parseGroupCreationDefaults } from './group-creation-options.js';
 import { parseInviteConfig } from './invite-config.js';
@@ -177,6 +178,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'silentTurnReactions', configKey: 'silentTurnReactions', kind: 'boolean', effect: 'immediate', clearable: false, hint: '关闭无卡片模式下的 GoGoGo/DONE reaction 和 Codex App 追加指令确认回执 on|off' },
   { key: 'writableTerminalLinkInCard', configKey: 'writableTerminalLinkInCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '卡片内嵌可写终端链接 on|off' },
   { key: 'goalStatusCard', configKey: 'goalStatusCard', kind: 'boolean', effect: 'next-session', clearable: false, hint: '目标状态卡 on|off（默认 off）：Codex / TRAE 设定原生目标时，在会话里发一张状态卡并原地更新进行中、完成等状态和 CLI 累计时长；新会话或会话重启后开始读取目标，关闭后已有的卡立即停止更新' },
+  { key: 'groupSessionSupervisor', configKey: 'groupSessionSupervisor', kind: 'json', effect: 'immediate', clearable: true, hint: '群会话督办，填写 {"provider":"magpie","model":"..."} 或 {"botAppId":"local_reviewer","model":"..."}；unset 关闭' },
   { key: 'followUpReply', configKey: 'followUpReply', kind: 'boolean', effect: 'next-session', clearable: false, hint: '执行中途的即时回复 on|off（默认 off）：CLI 把执行中途收到的飞书消息并入当前一轮时（Claude Code adopt 会话、Codex 同轮转向），模型一答完就引用那条消息回复，不用等整轮结束；Codex 每轮执行中途说的进展（说完接着干活的那几句）也会回复到对应消息下；新会话或会话重启后生效，关闭立即停止发送' },
   { key: 'foldBackgroundUpdates', configKey: 'foldBackgroundUpdates', kind: 'boolean', effect: 'immediate', clearable: false, hint: '折叠后台任务的等待进展 on|off（默认 off）：AI 帮你在后台盯着 CI、构建、日志等长任务时，等待期间的中间进展收进思考/进度折叠区，不再刷屏发新消息；开头的回复、需人工介入的提问以及任务完成/失败/超时后的最终汇报照常发送；立即生效' },
   { key: 'privateCard', configKey: 'privateCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '/card 发 owner-only 私有快照 on|off' },
@@ -1271,6 +1273,10 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
       try {
         const parsed = JSON.parse(s);
         if (spec.configKey === 'sandboxNetworkPolicy') return { ok: true, value: parseSandboxNetworkPolicy(parsed) };
+        if (spec.configKey === 'groupSessionSupervisor') {
+          const reviewer = groupSessionSupervisorConfig.safeParse(parsed);
+          return reviewer.success ? { ok: true, value: reviewer.data } : { ok: false, reason: 'invalid_json' };
+        }
         if (spec.configKey === 'groupCreation') return { ok: true, value: parseGroupCreationDefaults(parsed) };
         if (spec.configKey === 'inviteConfig') return { ok: true, value: parseInviteConfig(parsed) };
         if (spec.configKey === 'oncallGroup') return { ok: true, value: normalizeOncallGroupPolicy(parsed) };

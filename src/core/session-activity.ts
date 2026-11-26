@@ -4,6 +4,7 @@
 // DaemonSession fields are process-local and get rebuilt after a daemon
 // restart, so user-visible activity time must also be persisted on Session.
 import * as sessionStore from '../services/session-store.js';
+import { logger } from '../utils/logger.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { composeRowFromActive, composeRowFromClosed, composeRowFromPersistedActive } from './dashboard-rows.js';
 import { buildSessionMessagePreview } from './session-message-preview.js';
@@ -51,6 +52,27 @@ export function markSessionActivity(
       },
     },
   });
+}
+
+export function markReportReplyInput(session: { reportReplyInputId?: string }, inputId: string): boolean {
+  if (session.reportReplyInputId === inputId) return false;
+  session.reportReplyInputId = inputId;
+  return true;
+}
+
+/** Persist optional reply metadata before a daemon command. Only an explicit
+ * `/stop` may proceed past a failed optional write; every other command keeps
+ * the original fail-fast behavior. */
+export function persistInboundAttentionBeforeCommand(
+  ds: DaemonSession, messageId: string, stopCommand: boolean, messageListener: boolean,
+): void {
+  if (ds.session.reportReplyInputId !== undefined && markReportReplyInput(ds.session, messageId)) {
+    try { sessionStore.updateSession(ds.session); } catch (error) {
+      if (messageListener || !stopCommand) throw error;
+      logger.warn(`[${ds.session.sessionId.slice(0, 8)}] could not save report reply input before /stop`);
+    }
+  }
+  clearAgentAttention(ds);
 }
 
 /**

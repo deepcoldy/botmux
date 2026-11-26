@@ -405,6 +405,22 @@ Disabled by default. Both windows default to 10 minutes and accept integers from
 - Codex App has it on without any config; Codex CLI needs `{"cliEnabled": true}`. Other CLIs are unaffected.
 - `timeoutMs` applies from the next worker process. While the session waits on a person (ask card, terminal choice, agent attention request), the Codex CLI timer pauses.
 
+### Group session supervision {#group-session-supervisor}
+
+`groupSessionSupervisor` is off by default. Set `provider: "magpie"` to reach Magpie at `127.0.0.1:3425` and use a model ID from its `/v1/models` catalog. Store the existing gateway key in `magpie-reviewer.key` in the Botmux data directory with mode `0600`. A `botAppId` in the same fleet can also act as the reviewer. Use `botmux session invoke capabilities --bot <ID>` to check for model-only support.
+
+```text
+/botconfig set groupSessionSupervisor {"provider":"magpie","model":"<Magpie model ID>"}
+/botconfig set groupSessionSupervisor {"botAppId":"local_reviewer","model":"<model>"}
+/botconfig unset groupSessionSupervisor
+```
+
+In an existing local Feishu group session, send a task, use `/supervise` to open the card, and click **Start supervision**. Botmux derives acceptance criteria from the original request. Click **Refresh** to see them. To supply criteria explicitly, use `/supervise on <acceptance criteria>`, with one criterion per line. Botmux checks every 30 seconds and restores tracked tasks after a restart. If the execution stops without a result, it can make one attempt to move the original session forward. A result judged complete enters pending review. A separate model call then checks the reported evidence against each criterion. Botmux sends up to two rework turns, each listing the unmet criteria.
+
+Botmux records the reason and evidence for observable waits such as CI, then rechecks in the original session, backing off from five minutes to an hour. It sends a card to the original session when execution stalls, needs human input, exhausts its rework budget, or passes review.
+
+The card shows status, criteria, evidence, and options that require a human decision. The authorized requester can choose an option on the card. If further instructions are needed, send them in the original session, refresh the card, and click **Resume**. Click **End supervision** to stop tracking the task. If the card expires, send `/supervise` to open a new one. `/stop` pauses execution and supervision. `/supervise resume`, `/supervise off`, and `/supervise decide` are also available.
+
 ## Permissions and authorization
 
 For the full permission model see [Permissions](/en/permissions).

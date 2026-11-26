@@ -1473,6 +1473,7 @@ export interface WorkerSessionReplyOptions {
 }
 
 export interface WorkerPoolCallbacks {
+  onGroupSupervisionOutcome?: (ds: DaemonSession, outcome: import('./session-task-status.js').SessionLastTurn) => void;
   /** Bot-owner diagnostics, separate from any task's conversation output. */
   onOwnerDiagnostic?: (ds: DaemonSession, diagnostic: WorkerOwnerDiagnostic) => void;
   /** Exact store-owning app, including boot with no live sessions. */
@@ -29984,7 +29985,10 @@ function setupWorkerHandlers(
             recoveryHandled,
             onClassified: outcome => { delivered = outcome === 'delivered'; },
             isFinalDelivered: answered,
-          }).then(async () => {
+          }).then(async (outcome) => {
+            if (outcome && ds.session.groupSessionSupervision && ownsLifecycleMutation()) {
+              callbacks?.onGroupSupervisionOutcome?.(ds, outcome);
+            }
             if (!usesOutcomeBasedTurnReactions(ds)) return;
             // The persistent delivery owner may still be reconciling a provider
             // effect. Keep the original ack until it can report an actual result.

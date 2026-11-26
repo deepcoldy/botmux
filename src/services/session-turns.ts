@@ -29,6 +29,7 @@ interface SessionTurnReply {
   responseKind: TurnSendKind;
   at: number;
   text?: string;
+  textTruncated?: boolean;
 }
 
 interface SessionTurn {
@@ -127,10 +128,18 @@ function inTransaction(db: DatabaseSyncLike, operation: () => void): void {
   }
 }
 
+function publicMessageWithTruncation(text: string): { text: string; truncated: boolean } {
+  const scrubbed = safeScrubAndTruncate(text, 256 * 1024);
+  return {
+    text: scrubbed.text
+      .replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9+/_=.-]+/gi, '<redacted>')
+      .replace(LOCAL_PATH_PATTERN, '<redacted>'),
+    truncated: scrubbed.truncated,
+  };
+}
+
 function publicMessageText(text: string): string {
-  return safeScrubAndTruncate(text, 256 * 1024).text
-    .replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9+/_=.-]+/gi, '<redacted>')
-    .replace(LOCAL_PATH_PATTERN, '<redacted>');
+  return publicMessageWithTruncation(text).text;
 }
 
 function pruneSessionEvents(
@@ -409,17 +418,54 @@ export function recordSessionTurnReply(
   retention?: SessionTurnRetention,
 ): void {
   if (!existsSync(databasePath(dataDir))) return;
+  const publicReply = reply.text === undefined ? undefined : publicMessageWithTruncation(reply.text);
+  const storedReply: SessionTurnReply = {
+    ...reply,
+    ...(publicReply ? {
+      text: publicReply.text,
+      textTruncated: publicReply.truncated,
+    } : {}),
+  };
   accessTurns(dataDir, true, db => inTransaction(db, () => {
     const result = db.prepare(`
       INSERT OR IGNORE INTO events (session_id, turn_id, at, event_key, payload)
       SELECT ?, ?, ?, ?, ?
       WHERE EXISTS (SELECT 1 FROM pending_inbound WHERE session_id = ? AND turn_id = ?)
     `).run(sessionId, turnId, reply.at, `reply:${reply.responseKind}:${reply.messageId}:${reply.at}`,
-      JSON.stringify({ reply: { ...reply, text: reply.text === undefined ? undefined : publicMessageText(reply.text) } }), sessionId, turnId);
+      JSON.stringify({ reply: storedReply }), sessionId, turnId);
     if (Number(result.changes) > 0) {
       pruneSessionEvents(db, sessionId, reply.at, turnId, retention);
     }
   }));
+}
+
+/** Exact final reply text for supervision, without the dashboard's 4k preview
+ * boundary. The persisted flag distinguishes full text from a scrubbed prefix. */
+export function readSessionTurnFinalReply(
+  dataDir: string, sessionId: string, turnId: string,
+): { text: string; complete: boolean; at: number; prefixProven?: boolean } | undefined {
+  if (!existsSync(databasePath(dataDir))) return undefined;
+  return accessTurns(dataDir, false, db => {
+    const rows = db.prepare(`
+      SELECT payload FROM events
+      WHERE session_id = ? AND turn_id = ? AND event_key LIKE 'reply:final:%'
+      ORDER BY seq DESC
+    `).all(sessionId, turnId) as { payload: string }[];
+    for (const row of rows) {
+      const event = JSON.parse(row.payload) as TurnEvent;
+      // Attachment-only carriers do not erase an earlier full text response.
+      if (!('reply' in event) || typeof event.reply.text !== 'string') continue;
+      // Only an explicit false proves completeness. Legacy rows have no marker,
+      // and post-truncation redaction can hide both length and trailing ellipsis.
+      return {
+        text: event.reply.text,
+        complete: event.reply.textTruncated === false,
+        at: event.reply.at,
+        prefixProven: event.reply.textTruncated === true ? true : undefined,
+      };
+    }
+    return undefined;
+  });
 }
 
 export function cleanupSessionTurns(dataDir: string, sessionId: string): void {
@@ -499,7 +545,12 @@ export function readSessionTurns(dataDir: string, sessionId: string, since: numb
         if (!turn.inbound.length) turn.at = row.at;
         turn.inbound.push(event.inbound);
       }
-      else if ('reply' in event) turn.replies.push(event.reply);
+      else if ('reply' in event) {
+        // The explicit false bit is internal evidence for supervision. Keep the
+        // established page API shape for ordinary complete replies.
+        const { textTruncated, ...publicReply } = event.reply;
+        turn.replies.push(textTruncated === false ? publicReply : event.reply);
+      }
       else turn.anchor = event.anchor;
     }
   });

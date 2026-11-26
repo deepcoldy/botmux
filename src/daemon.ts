@@ -538,6 +538,7 @@ import {
   closeSession as closeSessionHelper,
   closeSessionForBackgroundCleanup,
   hasPendingOrdinaryImInput,
+  isForkSourceBusy,
   setActiveSessionIfActive,
   rollbackRejectedSessionAndGetWinner,
   ensureCliEnv,
@@ -656,8 +657,8 @@ import {
 } from './services/subtopic-mentionless-handoff.js';
 import { loadFrozenCards, saveFrozenCards } from './services/frozen-card-store.js';
 import { resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, cancelQueuedForks, drainQueuedForks, isPendingForkTopic, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand } from './core/command-handler.js';
-import { classifySlash, isCommandDecision, type CascadeItem, type SlashRouteDecision } from './core/command-router.js';
-import { collabGateAdmissionDecision, buildCollabRoutingEvent } from './core/collab-gate-admission.js';
+import { classifySlash, isCommandDecision, parseSlashCommandInvocation, type CascadeItem, type SlashRouteDecision } from './core/command-router.js';
+import { collabGateAdmissionDecision, buildCollabRoutingEvent, collabGroupSupervisionAllowed } from './core/collab-gate-admission.js';
 import { commandSpec } from './core/command-schema.js';
 import { groupCommandStartsTaskForRouting, isGroupCommandText, type GroupRoutingBotDefaults } from './services/group-creation-options.js';
 import { groupTaskSenderIsBot } from './core/group-task-start.js';
@@ -899,6 +900,10 @@ import {
 } from './core/persistent-backend.js';
 import type { PersistentBackendTarget } from './adapters/backend/types.js';
 import { handleCardAction, resolveCardOperatorUnionId, runAutoWorktreeCommit } from './im/lark/card-handler.js';
+import {
+  buildGroupSupervisionCard, GROUP_SUPERVISION_CARD_ACTION, groupSupervisionCardRevision,
+  invalidateGroupSupervisionStartCards, readGroupSupervisionCardAction,
+} from './im/lark/group-supervision-card.js';
 import { createPluginCardActionGateway } from './core/plugins/card-actions/gateway.js';
 import { createInputCaptureStore } from './core/plugins/input-capture/store.js';
 import { createInputCaptureRuntime, setInputCaptureRuntime, stopInputCaptureRuntimes } from './core/plugins/input-capture/runtime.js';
@@ -1179,11 +1184,20 @@ import {
   publishNativeTopicLinkPatch,
   publishSessionMessagePreviewPatch,
   publishClosedSessionPatch,
-  clearAgentAttention,
+  persistInboundAttentionBeforeCommand,
   markPassthroughActivity,
   stampHumanActivity,
 } from './core/session-activity.js';
-import { noteTurnStarted } from './core/turn-outcome.js';
+import { noteTurnStarted, turnOutcomePendingOrChanged, turnSupervisionFinalReply } from './core/turn-outcome.js';
+import { inheritTurnReplyRouting } from './core/reply-target.js';
+import {
+  chooseGroupSupervisionDecision, groupSupervisionNotice, groupSupervisionTracking, MAX_SUPERVISION_CRITERIA_CHARS, newGroupSessionSupervision,
+  observeGroupSessionSupervision, replaceGroupSessionSupervision, resumeGroupSessionSupervision,
+  SUPERVISION_POLL_MS, type GroupSessionSupervision,
+} from './core/group-session-supervision.js';
+import { deriveGroupSupervisionCriteria, reviewGroupSessionTask } from './core/group-session-supervision-review.js';
+import { sameGroupSessionSupervisor } from './core/group-session-supervisor-config.js';
+import type { SessionLastTurn } from './core/session-task-status.js';
 import { emitSessionLifecycleHook } from './services/session-lifecycle-hooks.js';
 import { botAutoWorktreeEnabled } from './services/default-worktree.js';
 import { createRepoWorktree, isGitWorkTree } from './services/git-worktree.js';
@@ -7745,6 +7759,309 @@ async function submitQueuedMessage(
   return true;
 }
 
+let groupSupervisionLocalSessions = false;
+
+export function __testOnly_setGroupSupervisionLocalSessions(enabled: boolean): void {
+  groupSupervisionLocalSessions = enabled;
+}
+
+function groupSupervisionSupported(ds: DaemonSession): boolean {
+  return groupSupervisionLocalSessions && ds.chatType === 'group'
+    && ds.chatId.startsWith('oc_') && ds.session.status === 'active'
+    && !ds.adoptedFrom && !ds.session.adoptedFrom && !isRemoteBackendSession(ds)
+    && !isSessionTransferring(ds)
+    && !ds.session.vcMeetingReceiver && !ds.session.workflowNode && !ds.session.principalLane
+    && !isSilentMessageListenerSession(ds.session) && !privateReplyEnabled(ds.session)
+    && collabGroupSupervisionAllowed(config.session.dataDir, ds.chatId, ds.larkAppId);
+}
+
+function groupSupervisionAuthorized(ds: DaemonSession, task: GroupSessionSupervision): boolean {
+  const current = getBot(ds.larkAppId).config.groupSessionSupervisor;
+  return sameGroupSessionSupervisor(current, task.reviewer)
+    && ds.chatId === task.chatId && sessionAnchorId(ds) === task.anchor
+    && groupSupervisionSupported(ds) && findActiveBySessionId(ds.session.sessionId) === ds
+    && humanCanRunDaemonCommand(ds.larkAppId, ds.chatId, task.requester, task.requesterUnionId, '/supervise', 'group')
+    && canOperate(ds.larkAppId, ds.chatId, task.requester, task.requesterUnionId);
+}
+
+const groupSupervisionNotices = new WeakSet<DaemonSession>();
+const groupSupervisionWakeAt = new WeakMap<DaemonSession, number>();
+
+function groupSupervisionInput(ds: DaemonSession, requester: string) {
+  const turnId = ds.lastCliInputTurnId ?? ds.session.lastCliInputTurnId;
+  const prompt = ds.lastUserPrompt ?? ds.session.lastUserPrompt;
+  const target = turnId ? ds.session.replyTargets?.[turnId] : undefined;
+  const turnAvailable = !!turnId && (!ds.currentTurnId || ds.currentTurnId === turnId);
+  const ownedHumanTurn = turnId?.startsWith('om_') && turnAvailable && !!prompt?.trim()
+    && target?.senderOpenId === requester && !target.crossChatOrigin && !isSubstituteTurn(ds, turnId)
+    && target.participants?.some(participant => participant.openId === requester && participant.isBot === false);
+  return { turnId, prompt, turnAvailable, ownedHumanTurn };
+}
+
+function groupSupervisionStatusCard(ds: DaemonSession, requester: string, feedback?: string, noticeStatus?: string) {
+  const locale = localeForBot(ds.larkAppId);
+  const bot = getBot(ds.larkAppId).config;
+  const reviewer = bot.groupSessionSupervisor;
+  if (!groupSupervisionSupported(ds)) return buildGroupSupervisionCard({ locale, status: 'cmd.supervise.unavailable', feedback });
+  if (!reviewer) return buildGroupSupervisionCard({ locale, status: 'cmd.supervise.unconfigured', feedback });
+  const task = ds.session.groupSessionSupervision;
+  const { turnId, ownedHumanTurn, turnAvailable } = groupSupervisionInput(ds, requester);
+  const ownsTask = task?.requester === requester;
+  const configMatches = !!task && sameGroupSessionSupervisor(reviewer, task.reviewer);
+  const changed = !!task && (!configMatches || task.turnId !== turnId || !turnAvailable);
+  const commands: ('on' | 'resume' | 'off' | 'status')[] = [];
+  if ((!task || task.state === 'accepted' && turnId !== task.turnId) && ownedHumanTurn) commands.push('on');
+  if (task && ownsTask && task.state !== 'accepted') {
+    const needsNewTurn = task.reason === 'stopped' || task.reason === 'interrupted';
+    const canResume = turnAvailable && (turnId !== task.turnId ? ownedHumanTurn : !needsNewTurn);
+    if (canResume && (task.state === 'needs_user' || changed) && (!task.decision || changed)) commands.push('resume');
+  }
+  commands.push('status');
+  if (task) commands.push('off');
+
+  let status = noticeStatus ?? 'cmd.supervise.off';
+  if (task && !noticeStatus) {
+    if (task.state === 'accepted') status = 'cmd.supervise.accepted';
+    else if (task.state === 'needs_user') status = `cmd.supervise.${groupSupervisionNotice(task) ?? task.reason ?? 'needs_user'}`;
+    else if (changed) status = 'cmd.supervise.session_changed';
+    else if (task.ownerDecision && task.state === 'waiting') status = 'cmd.supervise.decide_saved';
+    else status = `cmd.supervise.${task.reason === 'stalled' || task.reason === 'review_unavailable' ? task.reason : task.state}`;
+  }
+  return buildGroupSupervisionCard({
+    locale, status, feedback: feedback ?? (!task && !ownedHumanTurn ? 'cmd.supervise.no_task' : undefined), task,
+    control: bot.larkAppSecret ? {
+      appId: ds.larkAppId, chatId: ds.chatId, sessionId: ds.session.sessionId, requester,
+      secret: bot.larkAppSecret, revision: groupSupervisionCardRevision(ds.session, turnId, ds.currentTurnId), commands,
+      canDecide: ownsTask && !changed && !!task && groupSupervisionAuthorized(ds, task),
+    } : undefined,
+  });
+}
+
+async function sendGroupSupervisionNotice(ds: DaemonSession): Promise<void> {
+  const task = ds.session.groupSessionSupervision;
+  if (!task || groupSupervisionNotices.has(ds) || !groupSupervisionAuthorized(ds, task)) return;
+  const reason = groupSupervisionNotice(task);
+  if (!reason) return;
+  // A same-turn resume or corrected reply starts a new review. Its notice
+  // must not reuse the Feishu UUID of a previous question or verdict.
+  const epoch = task.reviewEpoch ?? 0;
+  const key = `${task.id}:${task.turnId}:${reason}${epoch ? `:${epoch}` : ''}`;
+  if (task.notifiedKey === key) return;
+  const turnId = task.originTurnId ?? task.turnId;
+  const assertCurrent = () => {
+    if (ds.session.groupSessionSupervision !== task || !groupSupervisionAuthorized(ds, task)) {
+      throw new Error('stale group supervision notice');
+    }
+  };
+  groupSupervisionNotices.add(ds);
+  try {
+    const card = groupSupervisionStatusCard(ds, task.requester, undefined, `cmd.supervise.${reason}`);
+    const messageId = await sessionReply(
+      task.anchor, JSON.stringify(card), 'interactive', ds.larkAppId, turnId,
+      {
+        sourceSessionId: ds.session.sessionId, replyTarget: frozenReplyContextForTurn(ds, turnId).target,
+        suppressHook: true, beforeWrite: assertCurrent,
+        uuid: createHash('sha256').update(`group-supervision:${key}`).digest('hex').slice(0, 40),
+      },
+    );
+    if (messageId && ds.session.groupSessionSupervision === task) {
+      const previous = task.notifiedKey;
+      task.notifiedKey = key;
+      try { sessionStore.updateSession(ds.session); } catch (error) { task.notifiedKey = previous; throw error; }
+    }
+  } finally {
+    groupSupervisionNotices.delete(ds);
+  }
+}
+
+function runGroupSessionSupervision(ds: DaemonSession, terminal?: SessionLastTurn): void {
+  const task = ds.session.groupSessionSupervision;
+  if (!task || !groupSupervisionAuthorized(ds, task)) return;
+  const session = ds.session;
+  const worker = ds.worker;
+  const generation = ds.workerGeneration;
+  const lastMessageAt = ds.lastMessageAt;
+  const now = Date.now();
+  const lastInputId = () => ds.lastCliInputTurnId ?? ds.session.lastCliInputTurnId;
+  const currentTurn = (turnId: string) => lastInputId() === turnId && (!ds.currentTurnId || ds.currentTurnId === turnId)
+    && ds.lastMessageAt === lastMessageAt;
+  const persist = () => sessionStore.updateSession(ds.session);
+  const blocked = () => ds.lastScreenStatus === 'limited' || !!ds.agentAttention || !!ds.tuiPromptCardId
+    || listPendingAsksByAnchor({ larkAppId: ds.larkAppId, chatId: ds.chatId, anchor: sessionAnchorId(ds) }).length > 0;
+  const isRunning = () => !!ds.worker?.connected && !ds.worker.killed && isForkSourceBusy(ds);
+  const running = isRunning();
+  const canDispatch = () => !!worker?.connected && !worker.killed && ds.worker === worker
+    && ds.workerGeneration === generation && ds.workerReady && workerHasInitialized(ds)
+    && !blocked() && !isForkSourceBusy(ds);
+  const latest = session.lastTurn?.turnId === task.turnId ? session.lastTurn : undefined;
+  const turnKey = `[${JSON.stringify(task.turnId)},`;
+  let progressAt = 0;
+  for (const [key, progress] of ds.replyExecutionStarts ?? []) {
+    if (key.startsWith(turnKey) && progress.workerGeneration === generation && !progress.completed) {
+      progressAt = Math.max(progressAt, progress.lastProgressAtMs ?? progress.startedAtMs);
+    }
+  }
+  const terminalAt = ds.lastTurnTerminalTurnId === task.turnId ? ds.lastTurnTerminalAt ?? 0 : 0;
+  const stalled = ds.lastScreenStatus === 'stalled'
+    || (running && progressAt > 0 && now - progressAt >= 20 * 60_000);
+  void observeGroupSessionSupervision(session, {
+    now, lastActivityAt: Math.max(lastMessageAt, progressAt, terminalAt), running, stalled, blocked: blocked(),
+    outcome: terminal ?? (task.state === 'waiting' ? undefined : latest),
+  }, {
+    allowed: task => ds.session === session && groupSupervisionAuthorized(ds, task),
+    current: currentTurn,
+    finalText: turnId => turnSupervisionFinalReply(ds, turnId, config.session.dataDir),
+    deriveCriteria: async (task, signal) => {
+      const sourceId = task.originTurnId ?? task.turnId;
+      // Use the authored message, before the executor prompt gained routing
+      // hints, tool instructions, or background context.
+      let message = messageQueue.findQueuedMessage(task.anchor, sourceId, task.requester);
+      if (!message) {
+        const detail = await getMessageDetail(ds.larkAppId, sourceId, {
+          userCardContent: false, userIdType: 'open_id', timeoutMs: 8_000, signal,
+        });
+        const item = detail?.items?.[0];
+        if (item?.message_id !== sourceId || item.chat_id !== task.chatId || item.deleted
+          || item.sender?.sender_type !== 'user' || item.sender.id !== task.requester) return undefined;
+        message = parseApiMessage(item, undefined, { resolveMentions: true });
+      }
+      const original = message.content.trim();
+      if (!original || signal.aborted || ds.session !== session
+        || !currentTurn(task.turnId) || !groupSupervisionAuthorized(ds, task)) return undefined;
+      const criteria = await deriveGroupSupervisionCriteria({ ...task, task: original }, signal);
+      return criteria ? { criteria, task: original } : undefined;
+    },
+    review: (task, answer, signal, stage) => reviewGroupSessionTask(task.reviewer, task, answer, signal, stage),
+    // Let pending Feishu input finish admission before a verdict can continue the session.
+    serializeAdmission: action => withActiveSessionKeyLock(
+      activeSessions,
+      threadDeliveryKey(ds.larkAppId, ds.scope, ds.runtimeRoutingAnchor ?? sessionAnchorId(ds)),
+      () => runDetachedBotTurnAdmission(ds.larkAppId, action),
+    ),
+    persist,
+    canDispatch: () => canDispatch() === true,
+    stillMissingOutput: (turnId, observed) => !isRunning()
+      && !turnOutcomePendingOrChanged(ds, turnId, observed)
+      && (observed?.outcome !== 'delivered' || !turnSupervisionFinalReply(ds, turnId, config.session.dataDir)),
+    wake: () => {
+      if ((ds.worker && !ds.worker.killed) || !ds.hasHistory || !ds.session.cliSessionId
+        || ds.pendingRepo || ds.session.queued || blocked()
+        || now - (groupSupervisionWakeAt.get(ds) ?? 0) < 2 * 60_000) return;
+      groupSupervisionWakeAt.set(ds, now);
+      // Reattach only. The next check still needs current authority to send a prompt.
+      forkWorker(ds, '', { resume: true }, { deferDuringDeviceIsolation: false, memoryNoticeAudience: 'owner-only' });
+    },
+    dispatch: (turnId, sourceTurnId, prompt) => {
+      const rollbackRouting = inheritTurnReplyRouting(ds, sourceTurnId, turnId);
+      if (!sendWorkerInput(ds, prompt, turnId, { atMostOnce: true, queueAfterActiveTurn: true, notifyRejection: false })) {
+        rollbackRouting();
+        return false;
+      }
+      // The worker accepted the input. A presentation failure cannot cause a replay.
+      try {
+        beginNewTurn(ds, 'Botmux task supervision', turnId, { unattended: true });
+        rememberLastCliInput(ds, prompt, prompt, turnId);
+      } catch {
+        logger.warn(`[${tag(ds)}] supervised turn accepted; presentation update failed`);
+      }
+      return true;
+    },
+  }).then(() => sendGroupSupervisionNotice(ds))
+    .catch(() => logger.warn(`[${tag(ds)}] group task supervision observation or notice failed`));
+}
+
+export const __testOnly_runGroupSessionSupervision = runGroupSessionSupervision;
+
+function controlGroupSupervision(ds: DaemonSession, requester: string, requesterUnionId: string | undefined, args: string, feedback?: string) {
+  const locale = localeForBot(ds.larkAppId);
+  const show = (status: string) => buildGroupSupervisionCard({ locale, status, feedback });
+  const status = (note = feedback) => groupSupervisionStatusCard(ds, requester, note);
+  const existing = ds.session.groupSessionSupervision;
+  const owner = ds.ownerOpenId ?? ds.session.ownerOpenId;
+  if (isKnownPeerBot(config.session.dataDir, ds.larkAppId, requester)
+    || (owner && owner !== requester) || (existing && existing.state !== 'accepted' && existing.requester !== requester)) {
+    return show('cmd.supervise.owner_only');
+  }
+  const persist = () => sessionStore.updateSession(ds.session);
+  if (args === 'off') {
+    if (existing) replaceGroupSessionSupervision(ds.session, undefined, persist);
+    return status('cmd.supervise.off');
+  }
+  if (!groupSupervisionSupported(ds)) return show('cmd.supervise.unavailable');
+  const reviewer = getBot(ds.larkAppId).config.groupSessionSupervisor;
+  if (!reviewer) return show('cmd.supervise.unconfigured');
+  if (!args || args === 'status') return status();
+
+  const { turnId, prompt, turnAvailable, ownedHumanTurn } = groupSupervisionInput(ds, requester);
+  const decision = /^decide\s+(\S+)\s+([1-4])$/i.exec(args);
+  if (decision) {
+    const next = existing && existing.requester === requester && turnAvailable && turnId === existing.turnId
+      && groupSupervisionAuthorized(ds, existing)
+      ? chooseGroupSupervisionDecision(existing, decision[1], Number(decision[2]), Date.now()) : undefined;
+    if (!next) return status('cmd.supervise.decide_stale');
+    replaceGroupSessionSupervision(ds.session, next, persist);
+    runGroupSessionSupervision(ds);
+    return status('cmd.supervise.decide_saved');
+  }
+  const resume = args === 'resume';
+  if (resume && (!existing || existing.requester !== requester
+    || existing.chatId !== ds.chatId || existing.anchor !== sessionAnchorId(ds))) return show('cmd.supervise.off');
+  if (resume && existing?.state === 'accepted') return status();
+  const start = /^on(?:\s+([\s\S]+))?$/i.exec(args);
+  const criteria = start?.[1]?.trim() ?? '';
+  if (!resume && (!start || criteria.length > MAX_SUPERVISION_CRITERIA_CHARS)) return status('help.supervise');
+  const originalWatchedTurn = resume && existing?.turnId === turnId;
+  if (!turnId || !turnAvailable || (!originalWatchedTurn && !ownedHumanTurn)) return status('cmd.supervise.no_task');
+  if (resume && existing) {
+    const next = resumeGroupSessionSupervision({ ...existing, reviewer: { ...reviewer } }, turnId, Date.now());
+    if (!next) return status('cmd.supervise.resume_needs_followup');
+    replaceGroupSessionSupervision(ds.session, next, persist);
+  } else if (!(groupSupervisionTracking(existing) && existing.turnId === turnId && (!criteria || existing.criteria === criteria)
+    && sameGroupSessionSupervisor(reviewer, existing.reviewer))) {
+    replaceGroupSessionSupervision(ds.session, newGroupSessionSupervision({
+      turnId, task: criteria ? prompt!.slice(0, 8_000) : '', criteria, requester,
+      requesterUnionId, reviewer: { ...reviewer }, chatId: ds.chatId, anchor: sessionAnchorId(ds),
+    }), persist);
+    invalidateGroupSupervisionStartCards(ds.session);
+  }
+  runGroupSessionSupervision(ds);
+  return status();
+}
+
+async function handleGroupSupervisionCardAction(data: CardActionData, appId: string) {
+  const locale = localeForBot(appId);
+  const warn = (key: string) => ({ toast: { type: 'warning', content: tr(key, undefined, locale) } });
+  const action = readGroupSupervisionCardAction(data, appId, getBot(appId).config.larkAppSecret);
+  if (!action) return warn('card.supervise.invalid');
+  const { sessionId, requester, chatId, command, revision } = action;
+  const ds = findActiveBySessionId(sessionId);
+  if (!ds || ds.larkAppId !== appId || ds.chatId !== chatId) return warn('card.supervise.invalid');
+  const permitted = (unionId?: string) => humanCanRunDaemonCommand(appId, chatId, requester, unionId, '/supervise', 'group')
+    && canOperate(appId, chatId, requester, unionId);
+  const identity = data.operator?.union_id;
+  if (typeof identity === 'string' && !identity.startsWith('on_')) return warn('card.supervise.invalid');
+  const task = ds.session.groupSessionSupervision;
+  let unionId = identity?.startsWith('on_') ? identity : task?.requester === requester ? task.requesterUnionId : undefined;
+  if (!unionId && !permitted()) unionId = (await resolveCardOperatorUnionId(data, appId)).unionId;
+  return withActiveSessionKeyLock(activeSessions,
+    threadDeliveryKey(appId, ds.scope, ds.runtimeRoutingAnchor ?? sessionAnchorId(ds)),
+    () => withBotTurnAdmission(appId, () => {
+      if (findActiveBySessionId(sessionId) !== ds || ds.chatId !== chatId || !permitted(unionId)) return warn('card.supervise.invalid');
+      const patchCard = (data: ReturnType<typeof buildGroupSupervisionCard>) => ({ card: { type: 'raw' as const, data } });
+      const recover = (key: string) => ({ ...warn(key), ...patchCard(controlGroupSupervision(ds, requester, unionId, 'status', key)) });
+      const turnId = ds.lastCliInputTurnId ?? ds.session.lastCliInputTurnId;
+      if (command !== 'status' && groupSupervisionCardRevision(ds.session, turnId, ds.currentTurnId) !== revision) {
+        return recover('card.supervise.stale');
+      }
+      try {
+        return patchCard(controlGroupSupervision(ds, requester, unionId, command));
+      } catch {
+        logger.warn(`[${tag(ds)}] could not save group supervision card action`);
+        return recover('card.supervise.save_failed');
+      }
+    }));
+}
+
 // Dependencies passed to command-handler
 const commandDeps: CommandHandlerDeps = {
   activeSessions,
@@ -7767,6 +8084,14 @@ const commandDeps: CommandHandlerDeps = {
     );
   },
   prepareTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
+  superviseSession: (ds, message) => {
+    const args = message.content.trim().replace(/^\/supervise\b/i, '').trim();
+    try { return JSON.stringify(controlGroupSupervision(ds, message.senderId, message.senderUnionId, args)); }
+    catch {
+      logger.warn(`[${tag(ds)}] could not save group supervision command`);
+      return JSON.stringify(buildGroupSupervisionCard({ locale: localeForBot(ds.larkAppId), status: 'card.supervise.save_failed' }));
+    }
+  },
   prewarmDocCommentSession,
   submitQueuedMessage,
   // `/g <task>` hands its text to a new CLI session: same talk check,
@@ -9081,6 +9406,16 @@ const cardActionPluginGateway = createPluginCardActionGateway({
   // callback context's chat; card values never feed this decision.
   resolvePrivileges: resolvePluginCardPrivileges,
 });
+
+function handleDaemonCardAction(data: CardActionData, appId: string) {
+  // Supervision controls share the thread ingress FIFO. Acquire it before
+  // the bot-wide gate, in the same order as messages and polling.
+  return data.action?.value?.action === GROUP_SUPERVISION_CARD_ACTION
+    ? handleGroupSupervisionCardAction(data, appId)
+    : withBotTurnAdmission(appId, () => cardActionPluginGateway.dispatch(data, appId));
+}
+
+export const __testOnly_handleDaemonCardAction = handleDaemonCardAction;
 
 const LEGACY_WORKFLOW_API_RETIRED = {
   ok: false,
@@ -31489,12 +31824,7 @@ async function handleThreadReplyAdmitted(
   const clearAgentAttentionForHumanInbound = (): void => {
     if (isForeignBot || isBotSenderType || ctx.crossChatThreadFollowUp) return;
     const ds = activeSessions.get(runtimeSessionKey);
-    if (ds) {
-      if (ds.session.reportReplyInputId !== undefined && markReportReplyInput(ds.session, parsed.messageId)) {
-        sessionStore.updateSession(ds.session);
-      }
-      clearAgentAttention(ds);
-    }
+    if (ds) persistInboundAttentionBeforeCommand(ds, parsed.messageId, parseSlashCommandInvocation(cmdContent)?.cmd === '/stop', !!ctx.messageListener);
   };
   // Any human-authored reply means the user has seen/touched the raised-hand
   // blocker. Do this before command, callback, workflow, and ask-custom early
@@ -36168,7 +36498,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   };
   const memoryAdmissionOwnerAlerts = new WorkerAdmissionOwnerAlerts(ownerAlertDependencies);
   const workerOwnerDiagnostics = new WorkerOwnerDiagnostics(ownerAlertDependencies);
+  groupSupervisionLocalSessions = durableCoordinationRuntime?.mode !== 'primary';
   initWorkerPool({
+    onGroupSupervisionOutcome: runGroupSessionSupervision,
     onOwnerDiagnostic: (ds, diagnostic) =>
       workerOwnerDiagnostics.report(ds.larkAppId, ds.session.sessionId, diagnostic),
     larkAppId: cfg.larkAppId,
@@ -37420,10 +37752,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           const p2pMode = getBot(cfg.larkAppId).config.p2pMode;
           return p2pMode !== 'thread' && p2pMode !== 'group' && !isP2pForceTopicRoot(cfg.larkAppId, rootId, chatId);
         }),
-      handleCardAction: (data, appId) => withBotTurnAdmission(
-        appId,
-        () => cardActionPluginGateway.dispatch(data, appId),
-      ),
+      handleCardAction: handleDaemonCardAction,
       handleNewTopic: (data, ctx) => handleNewTopic(data, ctx),
       handleThreadReply: (data, ctx) => handleThreadReply(data, ctx),
       validateTopicHeader: async (header, appId) => (await resolveTopicSpec(header, {
@@ -38369,6 +38698,18 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     void longTaskReminder.scan().catch(error => logger.warn(`[long-task-reminder] scan failed: ${String(error)}`));
   }, 30_000);
   longTaskReminderTimer.unref?.();
+
+  const scanGroupSupervision = () => {
+    if (!getBot(cfg.larkAppId).config.groupSessionSupervisor) return;
+    for (const ds of activeSessions.values()) {
+      if (!ds.session.groupSessionSupervision) continue;
+      try { runGroupSessionSupervision(ds); }
+      catch { logger.warn(`[${tag(ds)}] group task supervision scan failed`); }
+    }
+  };
+  const groupSupervisionTimer = setInterval(scanGroupSupervision, SUPERVISION_POLL_MS);
+  groupSupervisionTimer.unref?.();
+  scanGroupSupervision();
 
   // Periodic sandbox reconciler: the daemon's SIGKILL straggler-reaper (and any
   // worker SIGKILL) bypasses worker-side killCli(), so the pre-created deny-mask
@@ -39370,6 +39711,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearTimeout(orphanSessionSweepKickoff);
     clearInterval(sessionOwnerReminderTimer);
     clearInterval(longTaskReminderTimer);
+    clearInterval(groupSupervisionTimer);
     clearInterval(grantExpirySweepTimer);
     clearInterval(bytedcliRenewalTimer);
     stopAllMeegoPollers();
@@ -39643,6 +39985,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearTimeout(orphanSessionSweepKickoff);
     clearInterval(sessionOwnerReminderTimer);
     clearInterval(longTaskReminderTimer);
+    clearInterval(groupSupervisionTimer);
     clearInterval(grantExpirySweepTimer);
     clearInterval(bytedcliRenewalTimer);
     stopAllMeegoPollers();

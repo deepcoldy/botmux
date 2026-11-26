@@ -12940,6 +12940,27 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     await first;
   });
 
+  it('lets distinct supervision controls through without an event ID and dedupes the same control in flight', async () => {
+    let release!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    handlers.handleCardAction.mockImplementationOnce(async () => { await pending; return {}; });
+    const event = (command: string) => ({
+      action: { value: { action: 'group_supervision_control', session_id: 'group-session', command } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_supervision_card' },
+    });
+
+    const first = capturedHandlers['card.action.trigger'](event('status'));
+    try {
+      expect(await capturedHandlers['card.action.trigger'](event('status'))).toHaveProperty('toast.type', 'info');
+      await capturedHandlers['card.action.trigger'](event('off'));
+      expect(handlers.handleCardAction).toHaveBeenCalledTimes(2);
+    } finally {
+      release();
+      await first;
+    }
+  });
+
   // Dashboard groups detail actions share the same action id across many
   // cells. `chat_id` + `app_id` must both be in the in-flight dedupe key so
   // managing bot A in chat X doesn't swallow bot B in chat Y.

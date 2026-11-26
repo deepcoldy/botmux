@@ -416,6 +416,22 @@ botmux 用 app-server 协议运行 Codex 时，拿不到 Codex App 内置的 Chr
 - Codex App 不用配就默认开启；Codex CLI 要写 `{"cliEnabled": true}`。其它 CLI 不受影响。
 - `timeoutMs` 从下一个 worker 进程起生效。会话在等人回复（问答卡、终端选项、agent 请求处理）时，Codex CLI 的提醒会暂停计时。
 
+### 群会话督办 {#group-session-supervisor}
+
+`groupSessionSupervisor` 默认关闭。`provider: "magpie"` 使用同机 `127.0.0.1:3425` 的 Magpie，模型 ID 从该网关的 `/v1/models` 获取。把现有网关 key 存入本机 Botmux 数据目录的 `magpie-reviewer.key`，权限设为 `0600`。也可用同一 fleet 中支持纯模型调用的 `botAppId`，用 `botmux session invoke capabilities --bot <ID>` 检查 `supported`。
+
+```text
+/botconfig set groupSessionSupervisor {"provider":"magpie","model":"<Magpie 模型 ID>"}
+/botconfig set groupSessionSupervisor {"botAppId":"local_reviewer","model":"<模型名>"}
+/botconfig unset groupSessionSupervisor
+```
+
+在已有的本机飞书群会话中，任务发起人发送任务后，用 `/supervise` 打开飞书卡片，点击「开启督办」。Botmux 从原任务提炼验收条件，点击「刷新状态」可查看。也可以用 `/supervise on <验收条件>` 显式提供条件，每行一条。Botmux 每 30 秒巡检一次，在重启后沿用已保存的任务和验收条件。执行停下但没有结果时，会在空闲的原会话尝试推进一次。判断结果可以验收后，任务进入待验收状态，由另一次模型调用逐项复核执行方提供的证据。可自行处理的缺项最多自动返工两轮，返工指令会列出相应条款。
+
+遇到 CI 等外部依赖时，Botmux 保存等待原因和证据，在原会话从 5 分钟起退避复查，最长间隔一小时。执行停滞、需要人工决定、返工预算用完或验收通过时，会在原会话发卡片。
+
+卡片展示督办状态、验收条件、验收证据和需要人工决定的选项。只有有操作权限的发起人可以点击决策按钮。需要补充指令时，先在原会话发送新指令，再刷新卡片并点击「恢复督办」。点「结束督办」可停止跟踪。旧卡片过期时，可发送 `/supervise` 打开新卡。`/stop` 暂停执行和督办，`/supervise resume`、`/supervise off` 和 `/supervise decide` 也可继续使用。
+
 ## 权限与授权
 
 完整的权限模型见[权限与授权](/permissions)。

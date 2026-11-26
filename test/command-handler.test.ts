@@ -5487,6 +5487,50 @@ describe('handleCommand', () => {
       );
     });
 
+    it('interrupts and warns when storage rejects every write made by /stop', async () => {
+      const ds = makeDaemonSession({ worker: { killed: false, send: vi.fn() } as any });
+      ds.session.groupSessionSupervision = {
+        id: 'supervision-stop-save', requester: 'ou_requester', reviewer: { botAppId: 'local_reviewer', model: 'm' },
+        chatId: CHAT_ID, anchor: ROOT_ID, task: 'Build', criteria: 'Tests pass', turnId: 'om_task', round: 0, state: 'watching',
+      };
+      const update = vi.mocked(sessionStore.updateSession);
+      update.mockImplementation(() => { throw new Error('injected stop write failure'); });
+      const deps = makeDeps(ds);
+      try {
+        await handleCommand('/stop', ROOT_ID, makeLarkMessage('/stop'), deps, LARK_APP_ID);
+        expect(ds.session.groupSessionSupervision).toMatchObject({ state: 'needs_user', reason: 'stopped' });
+        expect(sendWorkerSessionInput).toHaveBeenCalledWith(ds, { type: 'term_action', key: 'ctrlc' });
+        expect(deps.sessionReply).toHaveBeenCalledWith(
+          ROOT_ID,
+          expect.stringContaining(t('cmd.supervise.stop_save_failed')),
+          undefined,
+          LARK_APP_ID,
+          'msg_001',
+        );
+      } finally { update.mockImplementation(() => {}); }
+    });
+
+    it('interrupts without supervision when non-critical report metadata cannot be saved', async () => {
+      const ds = makeDaemonSession({
+        worker: { killed: false, send: vi.fn() } as any,
+        session: makeSession({ reportReplyInputId: 'om_previous' }),
+      });
+      const update = vi.mocked(sessionStore.updateSession);
+      update.mockImplementation(() => { throw new Error('injected admission write failure'); });
+      const deps = makeDeps(ds);
+      try {
+        await handleCommand('/stop', ROOT_ID, makeLarkMessage('/stop'), deps, LARK_APP_ID);
+        expect(sendWorkerSessionInput).toHaveBeenCalledWith(ds, { type: 'term_action', key: 'ctrlc' });
+        expect(deps.sessionReply).toHaveBeenCalledWith(
+          ROOT_ID,
+          expect.stringContaining(t('cmd.stop.sent')),
+          undefined,
+          LARK_APP_ID,
+          'msg_001',
+        );
+      } finally { update.mockImplementation(() => {}); }
+    });
+
     it('does not treat /stop without a session as a normal prompt', async () => {
       const deps = makeDeps();
 

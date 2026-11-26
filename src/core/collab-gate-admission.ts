@@ -120,6 +120,16 @@ export function collabCommandExempt(decision: SlashRouteDecision | undefined): b
   return false;
 }
 
+/** /supervise is currently scoped to ordinary local groups. A gate participant
+ * is a collaboration session even when the gate is still active, so never let
+ * supervision start or continue in that separate orchestration lifecycle. */
+export function collabGroupSupervisionAllowed(dataDir: string, chatId: string, botAppId: string): boolean {
+  const read = readCollabGateStrict(dataDir, chatId);
+  if (read.kind === 'missing') return true;
+  if (read.kind === 'corrupted') return false;
+  return read.gate.participants[botAppId] === undefined;
+}
+
 export interface CollabGateAdmissionOpts {
   dataDir: string;
   chatId: string;
