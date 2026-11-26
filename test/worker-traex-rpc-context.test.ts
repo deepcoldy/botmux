@@ -7,6 +7,7 @@ import { TurnExecutionClock } from '../src/services/turn-execution-clock.js';
 import { pendingInputMayFlush } from '../src/utils/pending-input-queue.js';
 import { workerSubmitHarness } from './helpers/worker-submit-harness.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { parseScheduledTurnId } from '../src/core/scheduled-turn-provenance.js';
 
 const prompt = (role: string, text: string) =>
   `<role>${role}</role>\n\n<user_message>${text}</user_message>`;
@@ -280,6 +281,7 @@ function engageHarness(opts: {
   const noop = () => undefined;
   const base: Record<string, any> = {
     ...context,
+    parseScheduledTurnId,
     CodexRpcEngine: FakeEngine,
     CliSpawnSupersededError: class extends Error {},
     CodexRpcEngineDiedDuringEngagementError: class extends Error {},
