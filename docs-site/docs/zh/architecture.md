@@ -8,6 +8,23 @@ botmux 做的事情一句话就能说清：**把飞书里的消息，变成 AI �
 
 ![botmux 进程结构：supervisor 拉起每个 bot 的 daemon、Dashboard 和插件服务；daemon 为每个话题起一个 worker，worker 通过 tmux 等会话后端连接 CLI 进程](/img/arch-overview-zh.png)
 
+## 设计取舍：桥接完整 CLI {#cli-bridge-design}
+
+botmux **不重新实现** Agent 能力。记忆、上下文管理、工具调用、权限、plan mode、`/` 命令、MCP 这些交给 CLI 自己做。多数 CLI 原生能力无需 botmux 重造，CLI 升级通常直接受益；接口、参数、输出格式或 resume 语义有变时，对应适配器仍可能要跟进。
+
+用户照常发自然语言。daemon 在后台把消息和系统指令用结构化格式（XML 标签）分开包好，再交给 CLI，用户不需要自己写任何格式。
+
+和「基于 Agent SDK 重新搭建」的方案相比，下表只对比**可核验的集成边界**，不对其它方案下「必然缺失」的结论：
+
+| 集成边界 | botmux | 基于 Agent SDK 的方案 |
+|---|---|---|
+| 桥接对象 | 完整 CLI 进程（含 hooks / memory / plan mode / MCP / `/` 命令等 CLI 自带运行时） | SDK 暴露的接口面 |
+| CLI 升级 | 多数直接受益；接口 / resume 有变时适配器跟进 | 取决于 SDK 版本与集成实现 |
+| 记忆 / 上下文 | 直接复用 CLI 内建 | 取决于 SDK / 自建 |
+| 多 CLI / Agent | 30+ 适配器，在配置里切换 | 取决于 SDK 覆盖面 |
+| 多机器人 | 同群多 bot，按 @ 分派 | 取决于实现 |
+| 终端直连 | 用 tmux 后端时，可 `tmux attach` 进真实 CLI 进程 | 取决于实现 |
+
 ## 各进程分别做什么
 
 | 进程 | 有几个 | 做什么 |

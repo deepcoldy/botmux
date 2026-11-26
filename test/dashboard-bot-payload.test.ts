@@ -79,7 +79,7 @@ describe('dashboard bot payload helpers', () => {
       'sandbox', 'sandboxPaths', 'readIsolationSupported', 'backendType', 'defaultBackendType',
       'usageDisplay', 'showUsageQuota', 'usageSupported',
       'disableStreamingCard', 'hiddenStreamingCardButtons', 'pinStreamingCard', 'silentTurnReactions',
-      'codexAppCleanInput', 'codexBrowser', 'codexBrowserAutoApproveOrigins', 'writableTerminalLinkInCard', 'goalStatusCard', 'followUpReply', 'privateCard',
+      'codexAppCleanInput', 'codexBrowser', 'codexBrowserAutoApproveOrigins', 'writableTerminalLinkInCard', 'goalStatusCard', 'followUpReply', 'foldBackgroundUpdates', 'privateCard',
       'cotEnabled', 'replyCardShowTools', 'senderTag', 'senderTagHideEmail', 'overloadAlert', 'botToBotSameDir', 'autoInviteOwnerOnGroupAdd', 'quotaFallbackBot',
       'autoStartOnGroupJoin', 'autoStartOnGroupJoinPrompt', 'autoStartOnGroupJoinSeed', 'autoStartOnGroupJoinSeedDefault',
       'groupJoinCommandEnabled', 'groupJoinCommand',
@@ -106,6 +106,15 @@ describe('dashboard bot payload helpers', () => {
     // 旧 daemon 不回 oncallChatCount：不能补成 0（会被读成「已全部解绑」），也不能拿累计数顶上。
     expect(botDefaultsPayload({ larkAppId: 'app' }, { autoboundChatCount: 1052 }))
       .toMatchObject({ autoboundChatCount: 1052, oncallChatCount: null });
+  });
+
+  it('defaults foldBackgroundUpdates to false, passes true through, rejects non-booleans, and preserves it for offline bots', () => {
+    expect(botDefaultsPayload({ larkAppId: 'app' }, {}).foldBackgroundUpdates).toBe(false);
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { foldBackgroundUpdates: true }).foldBackgroundUpdates).toBe(true);
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { foldBackgroundUpdates: 'true' }).foldBackgroundUpdates).toBe(false);
+    expect(sparseOverridesFromRawBotConfig({ foldBackgroundUpdates: true }).foldBackgroundUpdates).toBe(true);
+    expect(sparseOverridesFromRawBotConfig({ foldBackgroundUpdates: false }).foldBackgroundUpdates).toBe(false);
+    expect(sparseOverridesFromRawBotConfig({}).foldBackgroundUpdates).toBeUndefined();
   });
 
   it('passes the shared-bot sandbox advice inputs through, degrading missing/malformed values to null', () => {

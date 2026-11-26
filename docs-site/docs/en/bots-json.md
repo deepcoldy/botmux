@@ -103,6 +103,7 @@ The optional `brand` says which platform the app belongs to: `feishu` (default, 
 | `displayName` | Nickname shown in the Dashboard. Display only; it does not rename the app in Feishu |
 | `cliId` | Which CLI to run. Defaults to `claude-code`. See [Multi-CLI adapters](/en/adapters) for the options. `gemini` has been removed: a bot still set to `"gemini"` refuses to start and tells you to switch to `"antigravity"` |
 | `model` | Model passed to the CLI at launch (e.g. `claude --model opus`); empty means the CLI's own default. Several bots on the same CLI can run different models. It is read every time a session starts or resumes, so after a change, existing sessions without a per-group model pick up the new model on their next resume |
+| `customModels` | Up to 50 extra model IDs for the Feishu pickers in `/models`, `/models default`, `/botconfig`, and the reply-card model menu. For example, `["gateway/model-v2:1"]`. IDs are case-sensitive, start with an ASCII letter or digit, support `.`, `_`, `:`, `/`, and `-`, and are limited to 64 characters. List models your CLI or gateway accepts |
 | `reasoningEffort` | Default reasoning effort for new sessions: `low` / `medium` / `high` / `xhigh` / `max` / `ultra`. Supported CLIs: Claude Code, Codex, Codex App, TraeX, Grok, Kimi, ZCode, Doubao, `remote-runner`. Checked against the CLI and model; unsupported combinations are ignored. For example, Kimi only applies with model `kimi-code/k3` or `kimi-code/k3-256k`, and only has `low` / `high` / `max`; Claude's Haiku models take no reasoning effort |
 | `groupDefaultModels` | Per-group default model for new topics; Codex and Claude Code for now. See [Per-group default model](#group-default-models) below |
 | `serviceTier` | Codex only: speed tier for new sessions, `default` / `priority` / `ultrafast`. Empty keeps Codex's own setting |
@@ -691,7 +692,7 @@ When off (the default), replies and cards are sent as written and no related rul
 - Reply processing and the per-turn reminder apply immediately; the full rule in the system prompt applies from the next new session.
 - The Dashboard switch "Bot Config → Message Cards → Development host addresses" writes this field.
 
-### Zero prompt injection (`promptInjection: "none"`)
+### Zero prompt injection (`promptInjection: "none"`) {#zero-prompt-injection}
 
 For multi-agent pipelines where a lead bot hands out work and sub-bots just execute, or whenever you don't want botmux adding anything to the prompt.
 

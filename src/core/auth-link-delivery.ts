@@ -17,7 +17,7 @@
  */
 import { t, type Locale } from '../i18n/index.js';
 
-export type AuthLinkDelivery = 'inline' | 'dm' | 'ephemeral' | 'dm_failed';
+export type AuthLinkDelivery = 'inline' | 'dm' | 'ephemeral' | 'dm_failed' | 'cancelled_before_write';
 
 export interface AuthLinkDeliveryInput {
   /** True only for a one-to-one chat between the initiator and the bot. */
@@ -35,27 +35,45 @@ export interface AuthLinkDeliveryInput {
   locale?: Locale;
   /** The command the person should send in a private chat if the DM fails. */
   privateCommand?: string;
+  /** Checked immediately before each provider write. No check is made after a
+   * write starts: an error after provider acceptance has an unknown outcome. */
+  isCurrent?: () => boolean;
 }
 
 export async function deliverAuthLink(input: AuthLinkDeliveryInput): Promise<AuthLinkDelivery> {
   if (input.privateChat) {
+    if (input.isCurrent?.() === false) return 'cancelled_before_write';
     await input.replyInPlace(input.text);
     return 'inline';
   }
+  // A failed write has an unknown outcome. Only cancellation before the first
+  // attempted provider write is safe for callers to retry without dedup state.
+  let providerAttempted = false;
+  const attempt = async (send: () => Promise<unknown>): Promise<'sent' | 'failed' | 'cancelled'> => {
+    if (input.isCurrent?.() === false) return 'cancelled';
+    providerAttempted = true;
+    try { await send(); return 'sent'; }
+    catch { return 'failed'; }
+  };
   if (input.openId) {
     const openId = input.openId;
     // The link reached the person; failing to say so in the group must not
     // turn into "I could not message you".
-    if (await attempt(() => input.sendDirect(openId, input.text))) {
+    const direct = await attempt(() => input.sendDirect(openId, input.text));
+    if (direct === 'sent') {
       await input.replyInPlace(t('auth_link.sent_privately', undefined, input.locale)).catch(() => undefined);
       return 'dm';
     }
-    if (input.sendEphemeral
-      && await attempt(() => input.sendEphemeral!(openId, authLinkCard(input.text)))) {
-      await input.replyInPlace(t('auth_link.sent_ephemeral', undefined, input.locale)).catch(() => undefined);
-      return 'ephemeral';
+    if (direct === 'cancelled') return 'cancelled_before_write';
+    if (input.sendEphemeral) {
+      const ephemeral = await attempt(() => input.sendEphemeral!(openId, authLinkCard(input.text)));
+      if (ephemeral === 'sent') {
+        await input.replyInPlace(t('auth_link.sent_ephemeral', undefined, input.locale)).catch(() => undefined);
+        return 'ephemeral';
+      }
     }
   }
+  if (input.isCurrent?.() === false) return providerAttempted ? 'dm_failed' : 'cancelled_before_write';
   await input.replyInPlace(t('auth_link.dm_failed', { command: input.privateCommand ?? '/login' }, input.locale));
   return 'dm_failed';
 }
@@ -78,15 +96,6 @@ export function directOrEphemeral(
       return sendEphemeral(openId, authLinkCard(text));
     }
   };
-}
-
-async function attempt(send: () => Promise<unknown>): Promise<boolean> {
-  try {
-    await send();
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 /** The ephemeral API takes cards only (msg_type=text → 10003). */

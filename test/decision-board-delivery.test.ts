@@ -63,6 +63,7 @@ vi.mock('../src/bot-registry.js', () => {
 
 const lark = vi.hoisted(() => ({
   chatMode: 'group' as 'group' | 'topic' | 'p2p',
+  regularMode: 'chat' as 'chat' | 'chat-topic' | 'new-topic' | 'shared',
   sendMessage: vi.fn(async (..._args: unknown[]) => 'om_banner'),
   replyMessage: vi.fn(async (..._args: unknown[]) => 'om_reply'),
   uploadImage: vi.fn(async (_app: string, path: string) => `img_${path.split('/').pop()}`),
@@ -75,6 +76,11 @@ vi.mock('../src/im/lark/client.js', () => ({
   uploadImage: lark.uploadImage,
   downloadMessageResource: vi.fn(),
   listChatBotMembers: vi.fn(),
+}));
+
+vi.mock('../src/services/chat-reply-mode-store.js', async importOriginal => ({
+  ...(await importOriginal<typeof import('../src/services/chat-reply-mode-store.js')>()),
+  resolveRegularGroupMode: () => lark.regularMode,
 }));
 
 vi.mock('../src/services/message-queue.js', () => ({ ensureQueue: vi.fn() }));
@@ -113,6 +119,7 @@ beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), 'decision-board-delivery-'));
   sessionStore.init('app_s');
   lark.chatMode = 'group';
+  lark.regularMode = 'chat';
   wp.forkWorker.mockClear();
   wp.sendWorkerInput.mockClear();
   lark.sendMessage.mockClear();
@@ -266,6 +273,79 @@ describe('管家群里的回显', () => {
     expect(lark.sendMessage.mock.calls.filter(c => c[3] === 'image').map(c => c[2]))
       .toEqual([JSON.stringify({ image_key: 'img_001-2-b.png' })]);
     expect(wp.sendWorkerInput).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('卡片公告投递', () => {
+  const CARD = JSON.stringify({
+    schema: '2.0', header: { title: { tag: 'plain_text', content: '决策看板 · 提示（1 项）' }, template: 'blue' },
+    body: { elements: [{ tag: 'markdown', content: '[#1 事项](https://applink.feishu.cn/client/web_url/open)' }] },
+  });
+  const CARD_ECHO = {
+    ...INPUT,
+    announcement: {
+      texts: ['📥 收到 2 项', '#2 b（待拍板）\n说明：\n第二段'],
+      images: [
+        { type: 'image' as const, path: '/tmp/b1/001-1-a.png', name: '001-1-a.png' },
+        { type: 'image' as const, path: '/tmp/b1/001-2-b.png', name: '001-2-b.png' },
+      ],
+      card: CARD,
+    },
+  };
+  const modes = [
+    { name: 'topic', chatMode: 'topic' as const, regularMode: 'chat' as const, threaded: true, independent: true },
+    { name: 'new-topic', chatMode: 'group' as const, regularMode: 'new-topic' as const, threaded: true, independent: true },
+    { name: 'shared', chatMode: 'group' as const, regularMode: 'shared' as const, threaded: true, independent: false },
+    { name: 'chat', chatMode: 'group' as const, regularMode: 'chat' as const, threaded: false, independent: false },
+  ];
+
+  it.each(modes)('$name：interactive 首条作为 bannerId，后续拆分与附图保持原顺序', async mode => {
+    lark.chatMode = mode.chatMode;
+    lark.regularMode = mode.regularMode;
+    const map = new Map<string, any>();
+    await deliverOwnerBatchTurn(CARD_ECHO, map, () => false);
+    expect(lark.sendMessage.mock.calls[0]!.slice(0, 5)).toEqual(['app_s', 'oc_steward', CARD, 'interactive', expect.any(String)]);
+    if (mode.threaded) {
+      expect(lark.sendMessage).toHaveBeenCalledTimes(1);
+      expect(lark.replyMessage.mock.calls.map(c => [c[1], c[2], c[3], c[4]])).toEqual([
+        ['om_banner', CARD_ECHO.announcement.texts[1], 'text', true],
+        ['om_banner', JSON.stringify({ image_key: 'img_001-1-a.png' }), 'image', true],
+        ['om_banner', JSON.stringify({ image_key: 'img_001-2-b.png' }), 'image', true],
+      ]);
+    } else {
+      expect(lark.replyMessage).not.toHaveBeenCalled();
+      expect(lark.sendMessage.mock.calls.slice(1).map(c => [c[2], c[3]])).toEqual([
+        [CARD_ECHO.announcement.texts[1], 'text'],
+        [JSON.stringify({ image_key: 'img_001-1-a.png' }), 'image'],
+        [JSON.stringify({ image_key: 'img_001-2-b.png' }), 'image'],
+      ]);
+    }
+    const ds = map.get(sessionKey(mode.independent ? 'om_banner' : 'oc_steward', 'app_s'));
+    expect(ds.scope).toBe(mode.independent ? 'thread' : 'chat');
+    if (mode.regularMode === 'shared') {
+      expect(ds.session.turnReplyContexts[CARD_ECHO.turnId].target).toEqual({ mode: 'thread', rootMessageId: 'om_banner' });
+    }
+    expect(wp.forkWorker).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(modes)('$name：卡片发送失败时用同一去重键回退纯文本，不阻塞批次', async mode => {
+    lark.chatMode = mode.chatMode;
+    lark.regularMode = mode.regularMode;
+    lark.sendMessage.mockImplementationOnce(async () => { throw new Error('card rejected'); });
+    const input = { ...INPUT, announcement: { texts: ['原纯文本横幅', '后续段落'], images: [], card: CARD } };
+    const map = new Map<string, any>();
+    await deliverOwnerBatchTurn(input, map, () => false);
+    const [cardCall, textCall] = lark.sendMessage.mock.calls;
+    expect(cardCall.slice(0, 5)).toEqual(['app_s', 'oc_steward', CARD, 'interactive', expect.any(String)]);
+    expect(textCall.slice(0, 5)).toEqual(['app_s', 'oc_steward', '原纯文本横幅', 'text', cardCall[4]]);
+    if (mode.threaded) {
+      expect(lark.replyMessage.mock.calls[0].slice(1, 5)).toEqual(['om_banner', '后续段落', 'text', true]);
+    } else {
+      expect(lark.sendMessage.mock.calls[2].slice(2, 4)).toEqual(['后续段落', 'text']);
+      expect(lark.replyMessage).not.toHaveBeenCalled();
+    }
+    expect(map.has(sessionKey(mode.independent ? 'om_banner' : 'oc_steward', 'app_s'))).toBe(true);
+    expect(wp.forkWorker).toHaveBeenCalledTimes(1);
   });
 });
 

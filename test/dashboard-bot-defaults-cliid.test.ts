@@ -10,6 +10,7 @@ import {
   patchCardPrefsFromBody,
   CodexAppDisplaySection,
   OwnerGroupFollowControls,
+  TriggerUserAuthSection,
   type BotDefaultsTab,
 } from '../src/dashboard/web/bot-defaults-page.js';
 import { isOnboardingSubmitDisabled, onboardingRetryMode } from '../src/dashboard/web/bot-onboarding.js';
@@ -84,6 +85,50 @@ describe('bot defaults task tabs', () => {
     expect(onChange).toHaveBeenLastCalledWith('common');
     act(() => tabs[2]!.props.onKeyDown(event('End')));
     expect(onChange).toHaveBeenLastCalledWith('advanced');
+  });
+});
+
+describe('trigger-user credential sources', () => {
+  it('edits each override and keeps the policy when another setting changes', async () => {
+    const appId = 'cli_split_auth';
+    const request = vi.fn(async (_url: string, init?: RequestInit) => ({
+      ok: true,
+      json: async () => init?.method === 'PUT' ? { ok: true } : { ok: true, platformBound: true },
+    } as Response));
+    vi.stubGlobal('fetch', request);
+    function Harness() {
+      const [bot, setBot] = React.useState<BotDefaultsRow>({
+        larkAppId: appId,
+        triggerUserAuth: { enabled: true, credentialSource: 'platform' },
+      });
+      return React.createElement(TriggerUserAuthSection, {
+        bot, patchBot: (_appId, patch) => setBot(previous => typeof patch === 'function' ? patch(previous) : { ...previous, ...patch }),
+      });
+    }
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => { renderer = TestRenderer.create(React.createElement(Harness)); });
+    const control = (name: string) => renderer.root.findByProps({ 'data-action': name });
+    const change = async (name: string, value: string) => act(async () => {
+      control(name).props.onChange({ currentTarget: { value } });
+    });
+    const savedSource = () => JSON.parse(String(request.mock.lastCall?.[1]?.body)).triggerUserAuth.credentialSource;
+
+    expect(control('trigger-user-auth-source').props.value).toBe('platform');
+    await change('trigger-user-auth-source', 'split');
+    expect(savedSource()).toEqual({ default: 'platform' });
+    expect(control('trigger-user-auth-source-bytecloud').props.value).toBe('');
+    await change('trigger-user-auth-source-lark-user', 'local');
+    expect(savedSource()).toEqual({ default: 'platform', 'lark-user': 'local' });
+    await act(async () => {
+      control('trigger-user-auth-capability-meego').props.onChange({ currentTarget: { checked: false } });
+    });
+    expect(savedSource()).toEqual({ default: 'platform', 'lark-user': 'local' });
+    await change('trigger-user-auth-source-default', 'local');
+    await change('trigger-user-auth-source-lark-user', '');
+    expect(savedSource()).toEqual({ default: 'local' });
+    await change('trigger-user-auth-source', 'auto');
+    expect(savedSource()).toBe('auto');
+    await act(async () => { renderer.unmount(); });
   });
 });
 
@@ -2197,10 +2242,14 @@ describe('riff CLI switch persistence (PR #467 P1)', () => {
     // （DropdownField 是自定义组件：按组件 prop dataInput 定位并调用其 onChange）
     act(() => { root.findByProps({ dataInput: 'agentCliId' }).props.onChange('riff'); });
     expect(root.findAllByProps({ 'data-action': 'save-agent' })).toHaveLength(0);
-    // Agent 配置已下线：面板不得再渲染 riff-agent 输入框
-    expect(root.findAllByProps({ 'data-input': 'riff-agent' })).toHaveLength(0);
+    // Riff Agent 下拉默认 codex，支持切换到 claude；切到 claude 后模型建议列表同步切换。
+    expect(root.findByProps({ dataInput: 'riff-agent' }).props.value).toBe('codex');
+    act(() => { root.findByProps({ dataInput: 'riff-agent' }).props.onChange('claude'); });
+    const datalistOptions = root.findByType('datalist').findAllByType('option').map(o => o.props.value);
+    expect(datalistOptions).toContain('gemini-4-neon');
+    expect(datalistOptions).toContain('glm-5.3');
     // 运行环境选择 CN、思考等级选择 xhigh → 保存的 PUT /riff 必须一起携带
-    // sandboxCluster / reasoningEffort。
+    // sandboxCluster / agent / reasoningEffort。
     act(() => { root.findByProps({ dataInput: 'riff-sandbox-cluster' }).props.onChange('cn'); });
     act(() => { root.findByProps({ dataInput: 'riff-reasoning-effort' }).props.onChange('xhigh'); });
     const baseUrlInput = root.findByProps({ 'data-input': 'riff-base-url' });
@@ -2211,7 +2260,58 @@ describe('riff CLI switch persistence (PR #467 P1)', () => {
     const puts = requests.filter(r => r.method === 'PUT');
     expect(puts.map(r => r.url.split('/').pop())).toEqual(['riff', 'agent']);
     expect(puts[1]!.body).toEqual({ cliId: 'riff', model: '' });
-    expect(JSON.parse(puts[0]!.body.riff)).toMatchObject({ sandboxCluster: 'cn', reasoningEffort: 'xhigh' });
+    expect(JSON.parse(puts[0]!.body.riff)).toMatchObject({ sandboxCluster: 'cn', agent: 'claude', reasoningEffort: 'xhigh' });
+  });
+
+  it('clears an explicitly configured model on either Riff agent transition before saving', async () => {
+    const requests: Array<{ method: string; url: string; body: any }> = [];
+    (globalThis as any).fetch = async (url: string, init?: any) => {
+      requests.push({ method: init?.method ?? 'GET', url: String(url), body: init?.body ? JSON.parse(init.body) : undefined });
+      const body = String(url).endsWith('/agent')
+        ? { ok: true, cliId: 'riff', wrapperCli: null, model: '', selectionKey: 'riff' }
+        : { ok: true, riff: init?.body ? JSON.parse(init.body).riff : JSON.stringify({}) };
+      return { ok: true, status: 200, json: async () => body } as any;
+    };
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(BotAgentSection, {
+        bot: {
+          larkAppId: 'cli_riff_agent_model', cliId: 'riff', model: '',
+          riff: {
+            baseUrl: 'https://riff.example', sandboxCluster: 'cn', agent: 'codex',
+            model: 'gpt-5.5', reasoningEffort: 'high',
+          },
+        },
+        sessionFallback: 'riff',
+        cliState: {
+          options: [{ id: 'codex', label: 'Codex' }, { id: 'riff', label: 'Riff' }],
+          ttadkModelDefault: 'glm-5.1',
+          ttadkModelSuggestions: [],
+        },
+        patchBot: () => undefined,
+      }));
+    });
+    const root = renderer.root;
+    expect(root.findByProps({ dataInput: 'riff-agent' }).props.value).toBe('codex');
+    expect(root.findByProps({ 'data-input': 'riff-model' }).props.value).toBe('gpt-5.5');
+
+    act(() => { root.findByProps({ dataInput: 'riff-agent' }).props.onChange('claude'); });
+    expect(root.findByProps({ 'data-input': 'riff-model' }).props.value).toBe('');
+    expect(root.findByProps({ dataInput: 'riff-reasoning-effort' }).props.value).toBe('high');
+
+    // The reset is deliberately unconditional, not based on either suggestion list.
+    act(() => { root.findByProps({ 'data-input': 'riff-model' }).props.onChange({ currentTarget: { value: 'glm-5.3' } }); });
+    act(() => { root.findByProps({ dataInput: 'riff-agent' }).props.onChange('codex'); });
+    expect(root.findByProps({ 'data-input': 'riff-model' }).props.value).toBe('');
+    act(() => { root.findByProps({ dataInput: 'riff-agent' }).props.onChange('claude'); });
+
+    await act(async () => { await root.findByProps({ 'data-action': 'save-riff' }).props.onClick(); });
+    const put = requests.find(r => r.method === 'PUT' && r.url.endsWith('/riff'))!;
+    const saved = JSON.parse(put.body.riff);
+    expect(saved).toMatchObject({
+      baseUrl: 'https://riff.example', sandboxCluster: 'cn', agent: 'claude', reasoningEffort: 'high',
+    });
+    expect(saved).not.toHaveProperty('model');
   });
 
   it('resets the native-subagent editor from the authoritative Trae-to-Riff response', async () => {

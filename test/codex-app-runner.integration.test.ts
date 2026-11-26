@@ -805,8 +805,8 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     }
   });
 
-  it.each(['selected', 'text', 'duplicate', 'early', 'malformed', 'foreign', 'interrupted', 'exit', 'workflow', 'timedOut', 'refused', 'no-start', 'limit', 'corrected', 'overlap', 'live-steer'] as const)(
-    'bridges async questions without blocking the turn, through the real broker: %s', async outcome => {
+  it.each(['selected', 'text', 'duplicate', 'early', 'malformed', 'foreign', 'interrupted', 'exit', 'workflow', 'timedOut', 'refused', 'no-start', 'limit', 'corrected', 'overlap', 'live-steer', 'plain', 'plain-null'] as const)(
+    'routes async messages without blocking the turn, through the real runner: %s', async outcome => {
       resetAskBroker();
       setCanTalkChecker(() => true);
       const dir = mkdtempSync(join(tmpdir(), 'botmux-async-user-input-'));
@@ -865,7 +865,21 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       try {
         await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
         harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('Ask and continue', outcome === 'live-steer' ? { text: 'Ask and continue', clientUserMessageId: 'om_async_input' } : undefined, 'om_async_input', outcome === 'live-steer')}\r`);
-        if (outcome === 'limit') {
+        if (outcome === 'plain' || outcome === 'plain-null') {
+          const text = 'Complete sign-in in your private terminal.';
+          await waitFor(harness, () => control.finals.length > 0 && harness.stdout.includes('Independent work completed'));
+          expect(posts).toEqual([]);
+          expect(cards).toEqual([]);
+          expect(harness.stdout.split(text)).toHaveLength(2);
+          // The notice owns its line boundary: it must not fuse with the
+          // following final-answer output in the terminal.
+          expect(harness.stdout).not.toContain(`${text}Independent work completed`);
+          expect(harness.stdout).toContain(`${text}\nIndependent work completed`);
+          expect(control.markers.filter(m => m.kind === 'thinking').map(m => m.payload)).toEqual([
+            { turnId: 'om_async_input', entries: [{ kind: 'thinking', text }] },
+          ]);
+          expect(control.finals[0].content).toBe('Independent work completed');
+        } else if (outcome === 'limit') {
           await waitFor(harness, () => posts.some(p => p.asyncFailure === 'limit') && control.finals.length > 0);
           expect(cards).toHaveLength(32);
           expect(posts.filter(p => p.asyncFailure === 'limit')).toHaveLength(1);
@@ -910,6 +924,14 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
             } else {
               expect(control.finals[0].content).toBe('Independent work completed');
               expect(harness.stdout).not.toContain('PPE (Recommended) / Production');
+              const progress = control.markers.filter(m => m.kind === 'thinking').flatMap(m => m.payload.entries);
+              // The question text must never surface as progress: a streamed
+              // delta leaks its first line, completion leaks the whole item.
+              for (const leaked of ['Which environment?', 'PPE (Recommended) / Production']) {
+                expect(progress).not.toEqual(expect.arrayContaining([
+                  expect.objectContaining({ text: expect.stringContaining(leaked) }),
+                ]));
+              }
             }
             expect(deliveries).toHaveLength(0);
             const ask = cards[0];

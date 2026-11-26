@@ -163,6 +163,7 @@ vi.mock('../src/services/lark-cli-auth.js', () => ({
 
 vi.mock('../src/bot-registry.js', () => ({
   loadBotConfigs: vi.fn(() => [{ larkAppId: 'app-1' }, { larkAppId: 'app-2' }]),
+  loadBotConfigsCached: vi.fn(() => []),
   normalizeUsageDisplay: (cfg: { usageDisplay?: string }) => cfg.usageDisplay ?? 'streaming',
   getBot: vi.fn((id: string = 'app-1') => ({
     botName: id === 'app-2' ? 'Codex' : 'Claude',
@@ -278,6 +279,7 @@ vi.mock('../src/services/project-scanner.js', () => ({
 
 vi.mock('../src/services/git-worktree.js', () => ({
   createRepoWorktree: vi.fn(),
+  isValidBranchName: vi.fn(async (name: string) => !name.includes('..') && !name.includes(' ')),
   pushWorktreeBranch: vi.fn(async () => {}),
   isLinkedWorktree: vi.fn(async () => false),
   mainWorktreeFor: vi.fn(async () => '/home/testuser/project'),
@@ -406,6 +408,12 @@ vi.mock('../src/im/lark/client.js', () => ({
 vi.mock('../src/services/group-auto-title.js', () => ({
   registerGroupAutoTitle: vi.fn(),
   scheduleGroupAutoTitle: vi.fn(),
+}));
+
+vi.mock('../src/services/created-groups-store.js', () => ({
+  recordCreatedGroup: vi.fn(),
+  getCreatedGroup: vi.fn(),
+  createdGroupWorkingDir: vi.fn(),
 }));
 
 vi.mock('../src/services/group-creator.js', () => ({
@@ -796,6 +804,7 @@ import { recordP2pForceTopicRoot, removeP2pForceTopicRoot } from '../src/service
 import { buildAdoptSelectCard, buildRepoSelectCard, buildSlashListCard, buildSessionClosedCard } from '../src/im/lark/card-builder.js';
 import { createGroupWithBots } from '../src/services/group-creator.js';
 import { registerGroupAutoTitle, scheduleGroupAutoTitle } from '../src/services/group-auto-title.js';
+import { recordCreatedGroup } from '../src/services/created-groups-store.js';
 import { getAllBots, getBot, loadBotConfigs, findOncallChat, effectiveDefaultWorkingDir, type ChatReplyMode } from '../src/bot-registry.js';
 import { getChatReplyModeState, resolveRegularGroupMode } from '../src/services/chat-reply-mode-store.js';
 import { t } from '../src/i18n/index.js';
@@ -5334,7 +5343,11 @@ describe('handleCommand', () => {
 
       await handleCommand('/restart', ROOT_ID, makeLarkMessage('/restart'), deps, LARK_APP_ID);
 
-      expect(requestSessionRestart).toHaveBeenCalledWith(ds, expect.objectContaining({ source: 'slash' }));
+      expect(requestSessionRestart).toHaveBeenCalledWith(
+        ds,
+        expect.objectContaining({ source: 'slash' }),
+        { allowUnconfirmedActivationReplay: true },
+      );
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
         expect.stringContaining('正在重启'),
@@ -5402,7 +5415,11 @@ describe('handleCommand', () => {
 
       await handleCommand('/restart', ROOT_ID, makeLarkMessage('/restart'), deps, LARK_APP_ID);
 
-      expect(requestSessionRestart).toHaveBeenCalledWith(ds, expect.objectContaining({ source: 'slash' }));
+      expect(requestSessionRestart).toHaveBeenCalledWith(
+        ds,
+        expect.objectContaining({ source: 'slash' }),
+        { allowUnconfirmedActivationReplay: true },
+      );
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
         expect.stringContaining('正在重启'),
@@ -5418,7 +5435,11 @@ describe('handleCommand', () => {
 
       await handleCommand('/restart', ROOT_ID, makeLarkMessage('/restart'), deps, LARK_APP_ID);
 
-      expect(requestSessionRestart).toHaveBeenCalledWith(ds, expect.objectContaining({ source: 'slash' }));
+      expect(requestSessionRestart).toHaveBeenCalledWith(
+        ds,
+        expect.objectContaining({ source: 'slash' }),
+        { allowUnconfirmedActivationReplay: true },
+      );
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
         expect.stringContaining('正在重启'),
@@ -8159,6 +8180,87 @@ describe('handleCommand', () => {
       expect(beginLarkCliLogin).toHaveBeenCalledWith('ou_sender');
     });
 
+    it('starts only the explicit provider and handles both sides of a bare mixed login', async () => {
+      const deps = withPolicy({
+        enabled: true, capabilities: ['lark-user', 'bytecloud'],
+        credentialSource: { 'lark-user': 'local', bytecloud: 'platform' },
+      }, true);
+      (deps as any).activeSessions.get(sessionKey(ROOT_ID, LARK_APP_ID)).worker = null;
+      await handleCommand('/login', ROOT_ID, makeLarkMessage('/login lark'), deps, LARK_APP_ID);
+      expect(generateAuthUrl).toHaveBeenCalledTimes(1);
+      expect(askPlatformToAuthorize).not.toHaveBeenCalled();
+      await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli'), deps, LARK_APP_ID);
+      expect(generateAuthUrl).toHaveBeenCalledTimes(1);
+      expect(askPlatformToAuthorize).toHaveBeenCalledTimes(1);
+      await handleCommand('/login', ROOT_ID, makeLarkMessage('/login'), deps, LARK_APP_ID);
+      expect(generateAuthUrl).toHaveBeenCalledTimes(2);
+      expect(askPlatformToAuthorize).toHaveBeenCalledTimes(2);
+      expect(startBytedcliLogin).not.toHaveBeenCalled();
+      vi.mocked(deps.sessionReply).mockClear();
+      await handleCommand('/login', ROOT_ID, makeLarkMessage('/login status'), deps, LARK_APP_ID);
+      expect(reply(deps)).toContain(t('cmd.login.platform_status', { tool: 'bytedcli', url: PAGE }, 'zh'));
+      expect(getTokenStatus).toHaveBeenCalled();
+    });
+
+    it.each([true, false])('starts the local ByteCloud side independently of platform Lark (bound=%s)', async bound => {
+      const deps = withPolicy({
+        enabled: true, capabilities: ['lark-user', 'bytecloud'],
+        credentialSource: { 'lark-user': 'platform', bytecloud: 'local' },
+      }, bound);
+      (deps as any).activeSessions.get(sessionKey(ROOT_ID, LARK_APP_ID)).worker = null;
+      await handleCommand('/login', ROOT_ID, makeLarkMessage('/login'), deps, LARK_APP_ID);
+      expect(askPlatformToAuthorize).toHaveBeenCalledTimes(bound ? 1 : 0);
+      expect(startBytedcliLogin).toHaveBeenCalledExactlyOnceWith('ou_sender');
+      expect(generateAuthUrl).not.toHaveBeenCalled();
+      expect(beginLarkCliLogin).not.toHaveBeenCalled();
+      expect(vi.mocked(deps.sessionReply).mock.calls.map(call => call[1]).join('\n')).toContain('https://cloud.example.com/auth');
+    });
+
+    it.each(['/login done', '/login bytedcli done'])('%s does not complete an old local challenge for platform-only ByteCloud', async text => {
+      const deps = withPolicy({
+        enabled: true, capabilities: ['lark-user', 'bytecloud'],
+        credentialSource: { 'lark-user': 'local', bytecloud: 'platform' },
+      }, true);
+      vi.mocked(pendingBytedcliChallenge).mockReturnValueOnce('stale-challenge');
+      try {
+        await handleCommand('/login', ROOT_ID, makeLarkMessage(text), deps, LARK_APP_ID);
+        expect(pendingBytedcliChallenge).not.toHaveBeenCalled();
+        expect(completeBytedcliLogin).not.toHaveBeenCalled();
+      } finally {
+        vi.mocked(pendingBytedcliChallenge).mockReset().mockReturnValue(null);
+      }
+    });
+
+    it.each(['/login lark extra', '/login bytedcli i18n-tt', '/login unknown'])('%s does not start an unrelated authorization', async text => {
+      const deps = withPolicy({ enabled: true, credentialSource: 'platform' }, true);
+      await handleCommand('/login', ROOT_ID, makeLarkMessage(text), deps, LARK_APP_ID);
+      expect(askPlatformToAuthorize).not.toHaveBeenCalled();
+      expect(generateAuthUrl).not.toHaveBeenCalled();
+      expect(beginLarkCliLogin).not.toHaveBeenCalled();
+      expect(startBytedcliLogin).not.toHaveBeenCalled();
+    });
+
+    it('does not start ByteCloud device login after its source changes during a local status check', async () => {
+      const deps = withPolicy({
+        enabled: true, capabilities: ['lark-user', 'bytecloud'],
+        credentialSource: { 'lark-user': 'platform', bytecloud: 'local' },
+      }, true, 'group');
+      const bot = getBot(LARK_APP_ID);
+      vi.mocked(describeBytedcliAuth).mockImplementationOnce(async () => {
+        vi.mocked(getBot).mockReturnValue({
+          ...bot,
+          config: { ...bot.config, triggerUserAuth: parseTriggerUserAuthConfig({
+            enabled: true, capabilities: ['lark-user', 'bytecloud'],
+            credentialSource: 'platform',
+          }) ?? undefined },
+        });
+        return { state: 'needs-login' };
+      });
+      await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli'), deps, LARK_APP_ID);
+      expect(startBytedcliLogin).not.toHaveBeenCalled();
+      expect(reply(deps)).toBe(t('cmd.login.policy_changed', undefined, 'zh'));
+    });
+
     it('platform + bound: explicit /login lark asks the platform', async () => {
       const deps = withPolicy({ enabled: true, tools: ['lark-cli'], credentialSource: 'platform' }, true);
       await handleCommand('/login', ROOT_ID, makeLarkMessage('/login lark'), deps, LARK_APP_ID);
@@ -8256,6 +8358,20 @@ describe('handleCommand', () => {
         (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls.map(c => c[1] as string);
       beforeEach(() => { vi.mocked(sendUserMessage).mockClear(); });
 
+      it('mixed sources keep both links private when the platform uses its legacy page', async () => {
+        const deps = withPolicy({
+          enabled: true, capabilities: ['lark-user', 'bytecloud'],
+          credentialSource: { 'lark-user': 'local', bytecloud: 'platform' },
+        }, true, 'group');
+        vi.mocked(askPlatformToAuthorize).mockResolvedValue({ kind: 'legacy' });
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login'), deps, LARK_APP_ID);
+        const messages = vi.mocked(sendUserMessage).mock.calls.map(([, recipient, text]) => ({ recipient, text }));
+        expect(messages.map(message => message.recipient)).toEqual(['ou_sender', 'ou_sender']);
+        expect(messages.map(message => message.text).join('\n')).toContain(PAGE);
+        expect(messages.map(message => message.text).join('\n')).toContain('https://lark.example.com/device');
+        expect(groupReplies(deps).join('\n')).not.toContain('https://');
+      });
+
       it('the platform sends the card: the group hears one link-free line and botmux DMs nothing', async () => {
         const deps = withPolicy({ enabled: true, tools: ['lark-cli'] }, true, 'group');
         await handleCommand('/login', ROOT_ID, makeLarkMessage('/login'), deps, LARK_APP_ID);
@@ -8331,11 +8447,23 @@ describe('handleCommand', () => {
       try {
         await handleCommand('/logout', ROOT_ID, makeLarkMessage('/logout'), deps, LARK_APP_ID);
         const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
-        expect(replyContent).toContain(t('cmd.logout.platform_note', { url: page }, 'zh'));
+        expect(replyContent).toContain(t('cmd.logout.platform_note', { tool: 'lark-cli', url: page }, 'zh'));
       } finally {
         vi.mocked(platformCredentialsUrl).mockReturnValue(null);
         if (previousGetBot) vi.mocked(getBot).mockImplementation(previousGetBot);
       }
+    });
+
+    it('warns that platform grants survive logout when the host is unbound', async () => {
+      governBot({
+        enabled: true, capabilities: ['lark-user', 'bytecloud'],
+        credentialSource: { 'lark-user': 'local', bytecloud: 'platform' },
+      });
+      vi.mocked(platformCredentialsUrl).mockReturnValue(null);
+      const deps = makeDeps();
+      await handleCommand('/logout', ROOT_ID, makeLarkMessage('/logout'), deps, LARK_APP_ID);
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain(t('cmd.logout.platform_unbound', undefined, 'zh'));
     });
   });
 
@@ -8582,6 +8710,28 @@ describe('handleCommand', () => {
     // exactly what was refused" needs no guessing — and no giant default set
     // that makes every person approve permissions they will never use.
     describe('/login --scope', () => {
+      it('accepts a user scope declared for this bot', async () => {
+        const dir = mkdtempSync(join(tmpdir(), 'botmux-login-extra-scopes-'));
+        const previous = vi.mocked(getBot).getMockImplementation()!;
+        try {
+          const file = join(dir, 'scopes.json');
+          const scope = 'custom:feature:read';
+          writeFileSync(file, JSON.stringify([scope]));
+          vi.mocked(getBot).mockImplementation((id => {
+            const bot = previous(id);
+            return { ...bot, config: { ...bot.config, extraScopesFile: file } };
+          }) as typeof getBot);
+          const deps = makeDeps(makeDaemonSession({ chatType: 'p2p' }));
+
+          await handleCommand('/login', ROOT_ID, makeLarkMessage(`/login --scope ${scope}`), deps, LARK_APP_ID);
+
+          expect(generateAuthUrl).toHaveBeenCalledWith('app-1', 'secret-1', 'feishu', [scope], 'ou_sender');
+        } finally {
+          vi.mocked(getBot).mockImplementation(previous);
+          rmSync(dir, { recursive: true, force: true });
+        }
+      });
+
       it('passes an explicit document scope and the requesting user to OAuth', async () => {
         const deps = makeDeps(makeDaemonSession({ chatType: 'p2p' }));
         await handleCommand('/login', ROOT_ID, makeLarkMessage('/login --scope docx:document:readonly'), deps, LARK_APP_ID);
@@ -10399,12 +10549,13 @@ describe('handleCommand', () => {
 
       it('does not repeat forwarding or activation when the source receipt fails after startup', async () => {
         const deps = makeDeps();
-        vi.mocked(deps.sessionReply).mockRejectedValueOnce(new Error('source_reply_failed'));
+        vi.mocked(deps.sessionReply).mockRejectedValue(new Error('source_reply_failed'));
         await handleCommand('/g', ROOT_ID, makeLarkMessage('/g --start 原任务', { msgType: 'image' }), deps, LARK_APP_ID);
 
         expect(vi.mocked(forwardMessage)).toHaveBeenCalledTimes(1);
         expect(activate()).toHaveBeenCalledTimes(1);
-        expect(vi.mocked(deps.sessionReply)).toHaveBeenCalledTimes(1);
+        // Interactive card attempt + plain-text fallback attempt; neither re-runs startup.
+        expect(vi.mocked(deps.sessionReply)).toHaveBeenCalledTimes(2);
       });
 
       it('activates the same reserved session and reports setup failure after the chat exists', async () => {
@@ -10500,6 +10651,165 @@ describe('handleCommand', () => {
     it('/g --avatar off keeps Feishu\'s default avatar', async () => {
       await handleCommand('/g', ROOT_ID, makeLarkMessage('/g Project --avatar off'), makeDeps(), LARK_APP_ID);
       expect(mockedCreate.mock.calls[0][0].customization).toBeUndefined();
+    });
+
+    it('sends unified interactive result and error cards on /g, falling back to text if card send fails', async () => {
+      const okDeps = makeDeps();
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g 统一卡片'), okDeps, LARK_APP_ID);
+      expect(vi.mocked(okDeps.sessionReply).mock.calls[0][2]).toBe('interactive');
+      const okCard = JSON.parse(vi.mocked(okDeps.sessionReply).mock.calls[0][1] as string);
+      expect(okCard.header.template).toBe('green');
+      expect(okCard.header.title.content).toContain('统一卡片');
+
+      const errDeps = makeDeps();
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g --avatar bad 项目'), errDeps, LARK_APP_ID);
+      expect(vi.mocked(errDeps.sessionReply).mock.calls[0][2]).toBe('interactive');
+      const errCard = JSON.parse(vi.mocked(errDeps.sessionReply).mock.calls[0][1] as string);
+      expect(errCard.header.template).toBe('red');
+
+      const fbDeps = makeDeps();
+      vi.mocked(fbDeps.sessionReply).mockRejectedValueOnce(new Error('card_send_failed'));
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g 降级回执'), fbDeps, LARK_APP_ID);
+      expect(vi.mocked(fbDeps.sessionReply)).toHaveBeenCalledTimes(2);
+      expect(vi.mocked(fbDeps.sessionReply).mock.calls[1][2]).toBeUndefined();
+      expect(vi.mocked(fbDeps.sessionReply).mock.calls[1][1]).toContain('降级回执');
+    });
+
+    it('opens the interactive form card on --card or opt-in groupCreation.card: true, without breaking default bare /g', async () => {
+      // Explicit --card opens the form card and prefills name.
+      const explicitDeps = makeDeps();
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g --card 预填群名'), explicitDeps, LARK_APP_ID);
+      expect(mockedCreate).not.toHaveBeenCalled();
+      expect(vi.mocked(explicitDeps.sessionReply).mock.calls[0][2]).toBe('interactive');
+      const formCard = JSON.parse(vi.mocked(explicitDeps.sessionReply).mock.calls[0][1] as string);
+      expect(formCard.header.template).toBe('blue');
+      expect(JSON.stringify(formCard)).toContain('预填群名');
+
+      // Opt-in groupCreation.card: true makes bare /g open the form card; --no-card or explicit name stays direct.
+      vi.mocked(getBot).mockImplementation(((id: string) => {
+        const bot = defaultGetBot(id);
+        return { ...bot, config: { ...bot.config, groupCreation: { card: true } } };
+      }) as any);
+      const bareOptInDeps = makeDeps();
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g'), bareOptInDeps, LARK_APP_ID);
+      expect(mockedCreate).not.toHaveBeenCalled();
+      expect(JSON.parse(vi.mocked(bareOptInDeps.sessionReply).mock.calls[0][1] as string).header.template).toBe('blue');
+
+      const skipCardDeps = makeDeps();
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g --no-card'), skipCardDeps, LARK_APP_ID);
+      expect(mockedCreate).toHaveBeenCalledTimes(1);
+
+      const namedDeps = makeDeps();
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g 直接建群'), namedDeps, LARK_APP_ID);
+      expect(mockedCreate).toHaveBeenCalledTimes(2);
+
+      // Explicit --card combined with an auto-starting task is rejected cleanly.
+      const conflictDeps = makeDeps();
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g --card --start 冲突任务'), conflictDeps, LARK_APP_ID);
+      expect(mockedCreate).toHaveBeenCalledTimes(2);
+      const conflictCard = JSON.parse(vi.mocked(conflictDeps.sessionReply).mock.calls[0][1] as string);
+      expect(conflictCard.header.template).toBe('red');
+      expect(conflictCard.elements[0].text.content).toContain('--card');
+    });
+
+    it('P2-1: in primary coordination mode --card is refused with a downgrade card and creates no group', async () => {
+      // Form state lives in one process's Map while primary delivers a card
+      // callback to a random replica; fail closed instead of random "expired".
+      vi.stubEnv('BOTMUX_COORDINATION_MODE', 'primary');
+      try {
+        const deps = makeDeps();
+        await handleCommand('/g', ROOT_ID, makeLarkMessage('/g --card 预填群名'), deps, LARK_APP_ID);
+        expect(mockedCreate).not.toHaveBeenCalled();
+        const reply = vi.mocked(deps.sessionReply).mock.calls[0]!;
+        expect(reply[2]).toBe('interactive');
+        const card = JSON.parse(reply[1] as string);
+        expect(card.header.template).toBe('red');
+        expect(card.elements[0].text.content).toContain('primary');
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    });
+
+    it('binds --dir and creates a worktree for --branch, recording the created group directory', async () => {
+      vi.mocked(existsSync).mockImplementation((p: any) => String(p) === '/home/testuser/my-repo' || String(p).includes('bots-info.json'));
+      vi.mocked(statSync).mockImplementation((() => ({ isDirectory: () => true })) as any);
+      vi.mocked(createRepoWorktree).mockResolvedValueOnce({
+        path: '/home/testuser/my-repo-feat-x',
+        branch: 'feat/x',
+        baseRef: 'origin/master',
+      });
+      mockedCreate.mockImplementationOnce(async (opts: any) => {
+        await opts.onChatCreated?.('oc_dir_group');
+        return {
+          ok: true,
+          chatId: 'oc_dir_group',
+          creator: opts.creatorLarkAppId,
+          invalidBotIds: [],
+          invalidUserIds: [],
+          ownerTransferredTo: opts.transferOwnerTo ?? null,
+          shareLink: 'https://applink.feishu.cn/oc_dir_group',
+        } as any;
+      });
+      const deps = makeDeps();
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g 项目群 --dir /home/testuser/my-repo --branch feat/x'), deps, LARK_APP_ID);
+
+      expect(createRepoWorktree).toHaveBeenCalledWith('/home/testuser/my-repo', { branch: 'feat/x' });
+      expect(recordCreatedGroup).toHaveBeenCalledWith(expect.objectContaining({
+        chatId: 'oc_dir_group',
+        creatorAppId: LARK_APP_ID,
+        ownerOpenId: 'ou_sender',
+        workingDir: '/home/testuser/my-repo-feat-x',
+        repository: '/home/testuser/my-repo',
+        branch: 'feat/x',
+      }));
+      const card = JSON.parse(vi.mocked(deps.sessionReply).mock.calls[0][1] as string);
+      expect(card.header.template).toBe('green');
+      expect(card.elements[0].text.content).toContain('/home/testuser/my-repo-feat-x');
+      expect(card.elements[0].text.content).toContain('feat/x');
+
+      // --branch without --dir fails before group creation.
+      const missingDirDeps = makeDeps();
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g 项目群 --branch feat/y'), missingDirDeps, LARK_APP_ID);
+      expect(mockedCreate).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(vi.mocked(missingDirDeps.sessionReply).mock.calls[0][1] as string).header.template).toBe('red');
+    });
+
+    it('P2-5 plain /g --dir: a created-groups.json write failure keeps the green success card, chat link and binding hint', async () => {
+      vi.mocked(existsSync).mockImplementation((p: any) => String(p) === '/home/testuser/bind-repo' || String(p).includes('bots-info.json'));
+      vi.mocked(statSync).mockImplementation((() => ({ isDirectory: () => true })) as any);
+      mockedCreate.mockImplementationOnce(async (opts: any) => {
+        await opts.onChatCreated?.('oc_bind_fail');
+        return {
+          ok: true, chatId: 'oc_bind_fail', creator: opts.creatorLarkAppId,
+          invalidBotIds: [], invalidUserIds: [], ownerTransferredTo: opts.transferOwnerTo ?? null,
+          shareLink: 'https://applink.feishu.cn/oc_bind_fail',
+        } as any;
+      });
+      vi.mocked(recordCreatedGroup).mockImplementationOnce(() => { throw new Error('review_disk_full'); });
+      const deps = makeDeps();
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g 绑定群 --dir /home/testuser/bind-repo'), deps, LARK_APP_ID);
+
+      expect(mockedCreate).toHaveBeenCalledTimes(1);
+      const card = JSON.parse(vi.mocked(deps.sessionReply).mock.calls[0][1] as string);
+      const text = JSON.stringify(card);
+      expect(card.header.template).toBe('green');
+      expect(text).toContain('oc_bind_fail');
+      expect(text).toContain('review_disk_full');
+    });
+
+    it('P2-5 /g --start --dir: a binding write failure does not abort the task reservation and still returns a green card', async () => {
+      vi.mocked(existsSync).mockImplementation((p: any) => String(p) === '/home/testuser/bind-repo' || String(p).includes('bots-info.json'));
+      vi.mocked(statSync).mockImplementation((() => ({ isDirectory: () => true })) as any);
+      vi.mocked(recordCreatedGroup).mockImplementationOnce(() => { throw new Error('review_disk_full_task'); });
+      const deps = makeDeps();
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g --start 任务 --dir /home/testuser/bind-repo'), deps, LARK_APP_ID);
+
+      // The task reservation still ran despite the binding failure.
+      expect(spawnDashboardSession).toHaveBeenCalledTimes(1);
+      const card = JSON.parse(vi.mocked(deps.sessionReply).mock.calls[0][1] as string);
+      const text = JSON.stringify(card);
+      expect(card.header.template).toBe('green');
+      expect(text).toContain('review_disk_full_task');
     });
 
     it('passes /group --role-profile through and strips it from the group name', async () => {

@@ -18,6 +18,7 @@ vi.mock('../src/im/lark/client.js', () => ({
   sendMessage: vi.fn(),
   sendUserMessage: vi.fn(),
   sendEphemeralCard: vi.fn(async () => 'om_eph'),
+  deleteEphemeralCard: vi.fn(async () => true),
   getMessageDetail: vi.fn(),
   isHumanOpenId: vi.fn(() => true),
   MessageWithdrawnError: class MessageWithdrawnError extends Error {},
@@ -69,6 +70,8 @@ const readableTerminalUrlMock = vi.fn(() => 'https://example.com/term');
 const liveReadableTerminalUrlMock = vi.fn(() => 'https://example.com/term');
 const topicReasoningControlMock = vi.fn((..._a: any[]) => undefined as any);
 const setTopicReasoningEffortMock = vi.fn((..._a: any[]) => 'saved');
+const sessionReasoningControlMock = vi.fn<(ds: DaemonSession) => any>(() => undefined);
+const setSessionReasoningEffortMock = vi.fn((..._a: any[]) => 'saved');
 const isSessionRestartInFlightMock = vi.fn((..._a: any[]) => false);
 const requestSessionRestartMock = vi.fn((..._a: any[]) => ({ attemptId: 'topic-restart', joined: false }));
 const isSessionTransferringMock = vi.fn(() => false);
@@ -82,8 +85,13 @@ vi.mock('../src/core/worker-pool.js', () => ({
   writeSessionModelPin: (ds: any, pin: any) => writeSessionModelPinMock(ds, pin),
   topicReasoningControl: (...a: any[]) => topicReasoningControlMock(...a),
   setTopicReasoningEffort: (...a: any[]) => setTopicReasoningEffortMock(...a),
+  sessionUsesClaudeCode: (ds: DaemonSession) => ds.session.cliId === 'claude-code',
+  supportsClaudeSessionSettings: (ds: DaemonSession) => ds.session.cliId === 'claude-code' && !ds.session.wrapperCli,
+  canSaveClaudeSessionSettings: (ds: DaemonSession) => (ds.session.suspendedColdResume || !!ds.worker && !ds.worker.killed)
+    && !isSessionTransferringMock() && sessionAcceptsDirectCommandMock(),
+  sessionReasoningControl: (ds: DaemonSession) => sessionReasoningControlMock(ds),
   isSessionRestartInFlight: (...a: any[]) => isSessionRestartInFlightMock(...a),
-  setSessionReasoningEffort: vi.fn(),
+  setSessionReasoningEffort: (...a: any[]) => setSessionReasoningEffortMock(...a),
   forkWorker: vi.fn(),
   sendWorkerInput: vi.fn(),
   sendWorkerSessionInput: vi.fn(),
@@ -173,9 +181,10 @@ vi.mock('../src/services/model-catalog.js', () => ({
   runtimeExecutableForBotSelection: () => undefined,
 }));
 
-import { buildDefaultModelPickerCard, showSessionModelPicker } from '../src/im/lark/session-model-picker.js';
+import { buildDefaultModelPickerCard, buildSessionModelPickerCard, claudeSettingsPickerVersion, showSessionModelPicker } from '../src/im/lark/session-model-picker.js';
 import { handleCommand } from '../src/core/command-handler.js';
 import { handleCardAction } from '../src/im/lark/card-handler.js';
+import { deleteEphemeralCard, sendEphemeralCard } from '../src/im/lark/client.js';
 import { setTerminalProxyPort, resetTerminalProxy } from '../src/core/terminal-url.js';
 import { canOperate } from '../src/im/lark/event-dispatcher.js';
 import { getBot } from '../src/bot-registry.js';
@@ -238,11 +247,14 @@ function menuData(option: string, extraValue: Record<string, unknown> = {}): any
   };
 }
 
-function pickData(slug: string): any {
+function pickData(
+  slug: string, ds?: DaemonSession, origin: 'reply_model_pick' | 'session_model_pick' = 'reply_model_pick',
+): any {
   return {
     operator: { open_id: OWNER },
     action: {
-      value: { action: 'reply_model_pick', root_id: ROOT, session_id: SID, lark_app_id: LARK_APP_ID, chat_id: 'oc_chat' },
+      value: { action: origin, root_id: ROOT, session_id: SID, lark_app_id: LARK_APP_ID, chat_id: 'oc_chat',
+        ...(ds ? { claude_settings_version: claudeSettingsPickerVersion(ds), picker_action: origin } : {}) },
       option: slug,
     },
     context: { open_message_id: 'om_picker_card' },
@@ -273,6 +285,8 @@ beforeEach(() => {
   writeSessionModelPinMock.mockReset().mockImplementation((ds: any, pin: any) => { ds.session.modelPin = pin; return true; });
   topicReasoningControlMock.mockReset().mockReturnValue(undefined);
   setTopicReasoningEffortMock.mockReset().mockReturnValue('saved');
+  sessionReasoningControlMock.mockReset().mockReturnValue(undefined);
+  setSessionReasoningEffortMock.mockReset().mockReturnValue('saved');
   isSessionRestartInFlightMock.mockReset().mockReturnValue(false);
   requestSessionRestartMock.mockClear();
 
@@ -406,7 +420,8 @@ describe('reply_card_menu model option', () => {
     expect(select.tag).toBe('select_static');
     expect(select.value.action).toBe('reply_model_pick');
     expect(select.value.session_id).toBe(SID);
-    expect(select.initial_option).toBe('sonnet');
+    expect(select.initial_option).toBeUndefined();
+    expect(select.options).toContainEqual(expect.objectContaining({ value: 'sonnet' }));
     const values = select.options.map((o: any) => o.value);
     expect(values).toEqual(['fable', 'opus', 'sonnet', 'haiku']);
     expect(select.options.find((o: any) => o.value === 'sonnet').text.content).toContain('当前');
@@ -436,9 +451,42 @@ describe('reply_card_menu model option', () => {
 });
 
 describe('reply_model_pick action', () => {
-  it('injects /model <slug> through the passthrough dep and toasts the sent command', async () => {
-    enableMenu();
-    const ds = makeDs();
+  it.each(['session_model_pick', 'reply_model_pick'] as const)(
+    '%s shows model and effort together and saves the next-launch effort',
+    async origin => {
+      enableMenu();
+      const ds = makeDs({ activeModel: 'opus', activeReasoningEffort: 'high',
+        sessionOverrides: { suspendedColdResume: true, reasoningEffort: 'high' }, worker: null });
+      sessionReasoningControlMock.mockImplementation(current => ({
+        choices: ['low', 'medium', 'high'], selected: current.session.reasoningEffort,
+        claude: { model: 'opus' },
+      }));
+      setSessionReasoningEffortMock.mockImplementation((current: DaemonSession, effort) => {
+        current.session.reasoningEffort = effort;
+        return 'saved';
+      });
+      const parseControls = (card: any) => card.elements.flatMap((element: any) => element.actions ?? []);
+      const card = JSON.parse(buildSessionModelPickerCard(ds, ROOT, ['opus', 'sonnet'], 'opus', 'en', origin));
+      const controls = parseControls(card);
+      expect(controls.map((control: any) => control.value.action)).toEqual([origin, 'session_effort_pick']);
+      const callback = { ...pickData('medium'), action: { value: controls[1].value, option: 'medium' } };
+      const deliver = vi.fn();
+      const deps = depsWith(ds, deliver);
+      const result = await handleCardAction(callback, deps, LARK_APP_ID);
+      expect(result.toast.type).toBe('success');
+      expect(parseControls(result.card.data)[1].initial_option).toBe('medium');
+      expect(ds.activeReasoningEffort).toBe('high');
+      expect(deliver).not.toHaveBeenCalled();
+      expect(requestSessionRestartMock).not.toHaveBeenCalled();
+      const replay = await handleCardAction(callback, deps, LARK_APP_ID);
+      expect(replay.toast.type).toBe('warning');
+      expect(setSessionReasoningEffortMock).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('keeps the legacy passthrough and restart path for Codex CLI', async () => {
+    enableMenu('codex');
+    const ds = makeDs({ sessionOverrides: { cliId: 'codex' } });
     const deliver = vi.fn();
     const result = await handleCardAction(pickData('sonnet'), depsWith(ds, deliver), LARK_APP_ID);
     expect(deliver).toHaveBeenCalledTimes(1);
@@ -449,11 +497,94 @@ describe('reply_model_pick action', () => {
     expect(requestSessionRestartMock).toHaveBeenCalledWith(ds, expect.objectContaining({ source: 'card' }));
   });
 
+  it('rejects a Claude picker callback after a session switches runtimes', async () => {
+    const ds = makeDs();
+    const callback = pickData('sonnet', ds, 'session_model_pick');
+    ds.session.cliId = 'codex';
+    enableMenu('codex');
+    const deliver = vi.fn();
+    const result = await handleCardAction(callback, depsWith(ds, deliver), LARK_APP_ID);
+    expect(result.toast.type).toBe('warning');
+    expect(writeSessionModelPinMock).not.toHaveBeenCalled();
+    expect(deliver).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])('refreshes a flat-group private picker with delivery success=%s', async canSend => {
+    enableMenu();
+    const ds = makeDs({ scope: 'chat', sessionOverrides: { scope: 'chat' } });
+    const render = () => JSON.parse(buildSessionModelPickerCard(ds, ds.chatId, ['sonnet', 'opus'], undefined,
+      'en', 'reply_model_pick', undefined, OWNER));
+    const model = render().elements.find((element: any) => element.tag === 'action').actions[0];
+    const data = { ...pickData('sonnet'), action: { value: model.value, option: 'sonnet' } };
+    vi.mocked(sendEphemeralCard).mockClear();
+    vi.mocked(deleteEphemeralCard).mockClear();
+    if (!canSend) vi.mocked(sendEphemeralCard).mockRejectedValueOnce(new Error('Feishu unavailable'));
+    const saved = await handleCardAction(data, depsWith(ds), LARK_APP_ID);
+    expect(saved.toast.type).toBe('success');
+    expect(saved.card).toBeUndefined();
+    expect(ds.session.modelPin?.model).toBe('sonnet');
+    expect(sendEphemeralCard).not.toHaveBeenCalled();
+    if (!canSend) {
+      await expect(saved.afterAck()).rejects.toThrow('Feishu unavailable');
+      expect(deleteEphemeralCard).not.toHaveBeenCalled();
+    } else {
+      await saved.afterAck();
+      expect(sendEphemeralCard).toHaveBeenCalledWith(LARK_APP_ID, ds.chatId, OWNER, expect.any(String));
+      expect(deleteEphemeralCard).toHaveBeenCalledWith(LARK_APP_ID, 'om_picker_card', { acceptWithdrawn: true });
+      expect(vi.mocked(sendEphemeralCard).mock.invocationCallOrder[0])
+        .toBeLessThan(vi.mocked(deleteEphemeralCard).mock.invocationCallOrder[0]);
+    }
+  });
+
+  it('renders a configured gateway model once and accepts that same model on callback', async () => {
+    enableMenu();
+    const bot = getBot(LARK_APP_ID);
+    const gateway = 'gateway/custom_model-v2:1.0';
+    bot.config.customModels = [gateway, 'opus'];
+    bot.config.model = 'gateway/default-model';
+    detectModelsMock.mockResolvedValue(['opus', gateway, 'other-model']);
+    const ds = makeDs({ activeModel: 'gateway/current-model' });
+    const deliver = vi.fn();
+    const opened = await handleCardAction(menuData('model'), depsWith(ds), LARK_APP_ID);
+    await opened.afterAck();
+    const select = JSON.parse(deliverEphemeralOrReplyMock.mock.calls[0][2])
+      .elements.find((e: any) => e.tag === 'action').actions[0];
+    expect(select.options.map((option: any) => option.value)).toEqual([
+      gateway, 'opus', 'gateway/default-model', 'gateway/current-model', 'other-model',
+    ]);
+    expect(select.initial_option).toBe('gateway/default-model');
+    const saved = await handleCardAction({
+      ...pickData(gateway), action: { value: select.value, option: gateway },
+    }, depsWith(ds, deliver), LARK_APP_ID);
+    expect(saved.toast.type).toBe('success');
+    expect(ds.session.modelPin?.model).toBe(gateway);
+    expect(deliver).not.toHaveBeenCalled();
+    expect(requestSessionRestartMock).not.toHaveBeenCalled();
+    const updated = saved.card.data.elements.find((e: any) => e.tag === 'action').actions[0];
+    expect(updated.initial_option).toBe(gateway);
+    expect(updated.value.claude_settings_version).not.toBe(select.value.claude_settings_version);
+  });
+
+  it('rejects a custom model removed before discovery finishes', async () => {
+    enableMenu();
+    const bot = getBot(LARK_APP_ID);
+    bot.config.customModels = ['gateway/removed-model'];
+    detectModelsMock.mockImplementationOnce(async () => {
+      delete bot.config.customModels;
+      return null;
+    });
+    const deliver = vi.fn();
+    const ds = makeDs();
+    const result = await handleCardAction(pickData('gateway/removed-model', ds), depsWith(ds, deliver), LARK_APP_ID);
+    expect(result.toast.type).toBe('warning');
+    expect(deliver).not.toHaveBeenCalled();
+  });
+
   it('refuses a slug missing from the catalogue even if character-legal', async () => {
     enableMenu();
     const ds = makeDs();
     const deliver = vi.fn();
-    const result = await handleCardAction(pickData('not-a-real-model'), depsWith(ds, deliver), LARK_APP_ID);
+    const result = await handleCardAction(pickData('not-a-real-model', ds), depsWith(ds, deliver), LARK_APP_ID);
     expect(deliver).not.toHaveBeenCalled();
     expect(result.toast.type).toBe('warning');
   });
@@ -462,7 +593,7 @@ describe('reply_model_pick action', () => {
     enableMenu();
     const ds = makeDs();
     const deliver = vi.fn();
-    const result = await handleCardAction(pickData('sonnet\nrm -rf /'), depsWith(ds, deliver), LARK_APP_ID);
+    const result = await handleCardAction(pickData('sonnet\nrm -rf /', ds), depsWith(ds, deliver), LARK_APP_ID);
     expect(result.toast.type).toBe('warning');
     expect(deliver).not.toHaveBeenCalled();
   });
@@ -473,7 +604,7 @@ describe('reply_model_pick action', () => {
     const deliver = vi.fn();
     // Even when the catalogue advertises it, the injected command stays strict.
     detectModelsMock.mockResolvedValue(['sonnet', 'sonnet#thinking']);
-    const result = await handleCardAction(pickData('sonnet#thinking'), depsWith(ds, deliver), LARK_APP_ID);
+    const result = await handleCardAction(pickData('sonnet#thinking', ds), depsWith(ds, deliver), LARK_APP_ID);
     expect(result.toast.type).toBe('warning');
     expect(deliver).not.toHaveBeenCalled();
   });
@@ -483,9 +614,9 @@ describe('reply_model_pick action', () => {
     sessionAcceptsDirectCommandMock.mockReturnValue(false);
     const ds = makeDs();
     const deliver = vi.fn();
-    const result = await handleCardAction(pickData('sonnet'), depsWith(ds, deliver), LARK_APP_ID);
+    const result = await handleCardAction(pickData('sonnet', ds), depsWith(ds, deliver), LARK_APP_ID);
     expect(deliver).not.toHaveBeenCalled();
-    expect(result.toast.content).toContain('执行任务');
+    expect(result.toast.type).toBe('warning');
   });
 
   it('refuses for CLIs without a raw passthrough surface', async () => {
@@ -500,7 +631,7 @@ describe('reply_model_pick action', () => {
   it('refuses when the worker is dead', async () => {
     enableMenu();
     const ds = makeDs({ worker: { killed: true } as any });
-    const result = await handleCardAction(pickData('sonnet'), depsWith(ds, vi.fn()), LARK_APP_ID);
+    const result = await handleCardAction(pickData('sonnet', ds), depsWith(ds, vi.fn()), LARK_APP_ID);
     expect(result.toast.type).toBe('warning');
   });
 
@@ -622,7 +753,8 @@ describe('/models shortcut', () => {
     const card = JSON.parse(deliverEphemeralOrReplyMock.mock.calls[0][2]);
     const select = card.elements.find((e: any) => e.tag === 'action').actions[0];
     expect(select.value).toMatchObject({ action: 'session_model_pick', session_id: SID, lark_app_id: LARK_APP_ID, root_id: ROOT, chat_id: 'oc_chat' });
-    expect(select.initial_option).toBe('sonnet');
+    expect(select.initial_option).toBeUndefined();
+    expect(select.options).toContainEqual(expect.objectContaining({ value: 'sonnet' }));
     expect(select.options.map((o: any) => o.value)).toContain('sonnet');
     expect(ds.activeModel).toBe('sonnet');
   });
@@ -667,16 +799,22 @@ describe('/models shortcut', () => {
     expect(card.elements.some((e: any) => e.tag === 'action')).toBe(false);
   });
 
-  function shortcutPick(slug: string) {
-    const data = pickData(slug);
-    data.action.value.action = 'session_model_pick';
-    return data;
+  function shortcutPick(slug: string, ds?: DaemonSession) {
+    return pickData(slug, ds, 'session_model_pick');
   }
 
-  it('selecting the shortcut sends the chosen model while reply menus are disabled', async () => {
+  function codexDirectModelSession() {
+    enableMenu('codex');
+    return makeDs({ sessionOverrides: { cliId: 'codex' } });
+  }
+
+  it('saves a Claude model from /models when reply menus are disabled', async () => {
+    const ds = makeDs();
     const deliver = vi.fn();
-    const result = await handleCardAction(shortcutPick('sonnet'), depsWith(makeDs(), deliver), LARK_APP_ID);
-    expect(deliver).toHaveBeenCalledWith(expect.anything(), '/model sonnet', expect.objectContaining({ senderOpenId: OWNER, senderIsBot: false }));
+    const result = await handleCardAction(shortcutPick('sonnet', ds), depsWith(ds, deliver), LARK_APP_ID);
+    expect(ds.session.modelPin?.model).toBe('sonnet');
+    expect(deliver).not.toHaveBeenCalled();
+    expect(requestSessionRestartMock).not.toHaveBeenCalled();
     expect(result.toast.type).toBe('success');
   });
 
@@ -686,7 +824,7 @@ describe('/models shortcut', () => {
     const ds = makeDs();
     const deliver = vi.fn();
     const deps = depsWith(ds, deliver);
-    const pending = handleCardAction(shortcutPick('sonnet'), deps, LARK_APP_ID);
+    const pending = handleCardAction(shortcutPick('sonnet', ds), deps, LARK_APP_ID);
     // Detection is reached synchronously before the handler's first await.
     if (reason === 'permission') vi.mocked(canOperate).mockReturnValue(false);
     if (reason === 'busy') sessionAcceptsDirectCommandMock.mockReturnValue(false);
@@ -700,23 +838,24 @@ describe('/models shortcut', () => {
     expect(result.toast.type).toBe('warning');
   });
 
-  it('refuses a second concurrent model choice once the first starts a turn', async () => {
+  it('refuses a second concurrent Claude model choice from the superseded card', async () => {
     let resolve!: (models: string[] | null) => void;
     const probe = new Promise<string[] | null>(r => { resolve = r; });
     detectModelsMock.mockImplementation(() => probe);
     const ds = makeDs();
-    const deliver = vi.fn(() => { sessionAcceptsDirectCommandMock.mockReturnValue(false); return true; });
+    const deliver = vi.fn();
     const deps = depsWith(ds, deliver);
-    const first = handleCardAction(shortcutPick('sonnet'), deps, LARK_APP_ID);
-    const second = handleCardAction(shortcutPick('opus'), deps, LARK_APP_ID);
+    const first = handleCardAction(shortcutPick('sonnet', ds), deps, LARK_APP_ID);
+    const second = handleCardAction(shortcutPick('opus', ds), deps, LARK_APP_ID);
     resolve(null);
     const results = await Promise.all([first, second]);
-    expect(deliver).toHaveBeenCalledTimes(1);
-    expect(results.map(r => r.toast.type)).toEqual(['success', 'warning']);
+    expect(deliver).not.toHaveBeenCalled();
+    expect(results.map(r => r.toast.type).sort()).toEqual(['success', 'warning']);
+    expect(writeSessionModelPinMock).toHaveBeenCalledTimes(1);
   });
 
   it('gives later selections from the same card distinct turn identifiers', async () => {
-    const ds = makeDs();
+    const ds = codexDirectModelSession();
     const deliver = vi.fn(() => true);
     const deps = depsWith(ds, deliver);
     await handleCardAction(shortcutPick('sonnet'), deps, LARK_APP_ID);
@@ -727,18 +866,19 @@ describe('/models shortcut', () => {
   });
 
   it('reports a rejected worker enqueue as a warning', async () => {
-    const result = await handleCardAction(shortcutPick('sonnet'), depsWith(makeDs(), vi.fn(() => false)), LARK_APP_ID);
+    const result = await handleCardAction(shortcutPick('sonnet'), depsWith(codexDirectModelSession(), vi.fn(() => false)), LARK_APP_ID);
     expect(result.toast.type).toBe('warning');
   });
 
   it('does not invite a retry when bookkeeping throws after the worker accepted the command', async () => {
     const deliver = vi.fn((_ds: any, _cmd: string, opts: any) => { opts.onDelivered(); throw new Error('bookkeeping failed'); });
-    const result = await handleCardAction(shortcutPick('sonnet'), depsWith(makeDs(), deliver), LARK_APP_ID);
+    const result = await handleCardAction(shortcutPick('sonnet'), depsWith(codexDirectModelSession(), deliver), LARK_APP_ID);
     expect(result.toast.type).toBe('success');
   });
 
   it('does not pass a chat id as the reply message when switching in a flat group session', async () => {
-    const ds = makeDs({ scope: 'chat', sessionOverrides: { scope: 'chat' } });
+    enableMenu('codex');
+    const ds = makeDs({ scope: 'chat', sessionOverrides: { scope: 'chat', cliId: 'codex' } });
     const deliver = vi.fn();
     const data = shortcutPick('sonnet');
     data.action.value.root_id = 'oc_chat';
@@ -755,7 +895,7 @@ describe('/models shortcut', () => {
     if (reason === 'dead') ds.worker = { killed: true } as any;
     if (reason === 'transfer') isSessionTransferringMock.mockReturnValue(true);
     const deliver = vi.fn();
-    await handleCardAction(shortcutPick(reason === 'invalid' ? 'sonnet\n/clear' : 'sonnet'), depsWith(ds, deliver), LARK_APP_ID);
+    await handleCardAction(shortcutPick(reason === 'invalid' ? 'sonnet\n/clear' : 'sonnet', ds), depsWith(ds, deliver), LARK_APP_ID);
     expect(deliver).not.toHaveBeenCalled();
   });
 });
@@ -1139,6 +1279,19 @@ describe('model option precheck', () => {
 });
 
 describe('model picker option sanitisation', () => {
+  it('keeps the active session option when configured models fill the dropdown', async () => {
+    enableMenu();
+    const models = Array.from({ length: 75 }, (_, i) => `gateway/model-${i}`);
+    getBot(LARK_APP_ID).config.customModels = models;
+    const ds = makeDs({ activeModel: 'gateway/active' });
+    const result = await handleCardAction(menuData('model'), depsWith(ds), LARK_APP_ID);
+    await result.afterAck();
+    const select = JSON.parse(deliverEphemeralOrReplyMock.mock.calls[0][2])
+      .elements.find((e: any) => e.tag === 'action').actions[0];
+    expect(select.options.map((o: any) => o.value)).toEqual([...models.slice(0, 49), 'gateway/active']);
+    expect(select.options[49].text.content).toContain('（当前）');
+  });
+
   it('drops live-detected slugs that fail the inject pattern', async () => {
     enableMenu();
     detectModelsMock.mockResolvedValue(['good-model', 'has space', '../evil', 'x'.repeat(130)]);
@@ -1158,6 +1311,41 @@ describe('model picker option sanitisation', () => {
 // ─── P2-b: model catalogue key must carry wrapper/launch mode ─────────────
 
 describe('model catalogue selection key', () => {
+  it('keeps the saved pin and active model when the session has a different Claude profile', async () => {
+    enableMenu();
+    const bot = getBot(LARK_APP_ID);
+    bot.config.cliConfigDir = '/profiles/new';
+    bot.config.customModels = ['new-profile/custom'];
+    bot.config.model = 'new-profile/default';
+    const ds = makeDs({ activeModel: 'old-profile/active', sessionOverrides: {
+      agentFrozen: true,
+      cliConfigDir: '/profiles/old',
+      modelPin: { model: 'old-profile/saved', source: 'command', setBy: OWNER, setAt: '2026-11-24T00:00:00Z' },
+    } });
+    const { sessionModelChoices } = await import('../src/im/lark/session-model-picker.js');
+
+    expect(await sessionModelChoices(ds)).toEqual(['old-profile/active', 'old-profile/saved', 'fable', 'opus', 'sonnet', 'haiku']);
+    expect(detectModelsMock).not.toHaveBeenCalled();
+  });
+
+  it('does not expose current bot choices to a session frozen on a different gateway wrapper', async () => {
+    enableMenu();
+    const bot = getBot(LARK_APP_ID);
+    bot.config.wrapperCli = 'new-gateway claude';
+    bot.config.customModels = ['new-gateway/custom'];
+    bot.config.model = 'new-gateway/default';
+    const ds = makeDs({ activeModel: 'old-gateway/active', sessionOverrides: { wrapperCli: 'old-gateway claude' } });
+    const { sessionModelChoices } = await import('../src/im/lark/session-model-picker.js');
+    const choices = await sessionModelChoices(ds);
+    expect(choices).toContain('old-gateway/active');
+    const deliver = vi.fn();
+    for (const model of ['new-gateway/custom', 'new-gateway/default']) {
+      expect(choices).not.toContain(model);
+      expect(await handleCardAction(pickData(model), depsWith(ds, deliver), LARK_APP_ID)).toMatchObject({ toast: { type: 'warning' } });
+    }
+    expect(deliver).not.toHaveBeenCalled();
+  });
+
   it('probes with the wrapper-composed key, not the bare frozen cliId', async () => {
     enableMenu();
     const seenKeys: string[] = [];
@@ -1297,7 +1485,8 @@ describe('pin clear card freshness', () => {
   });
   it('the current owner-bound pin card clears the matching selection', async () => {
     const ds = makeDs(); ds.session.modelPin = { model: 'sonnet', source: 'command', setBy: OWNER, setAt: 'current' };
-    const data = pickData('sonnet'); data.action.value.action = 'session_model_unpin'; data.action.value.expected_pin_set_at = 'current';
+    const data = pickData('sonnet', ds, 'session_model_pick');
+    data.action.value.action = 'session_model_unpin'; data.action.value.expected_pin_set_at = 'current';
     expect((await handleCardAction(data, depsWith(ds), LARK_APP_ID)).toast.type).toBe('success');
     expect(ds.session.modelPin).toBeUndefined();
   });
@@ -1325,8 +1514,10 @@ describe('model pin explicit entry semantics', () => {
     const deliver = vi.fn(); const deps = depsWith(ds, deliver);
     if (kind === 'command') await handleCommand('/modelpin', ROOT, { senderId: OWNER, content: '/modelpin sonnet high' } as any, deps, LARK_APP_ID);
     else {
-      const data = pickData('sonnet'); const result = await handleCardAction(data, deps, LARK_APP_ID);
-      expect(result.toast.content).toContain('spawn-override'); expect(deliver).not.toHaveBeenCalled();
+      const data = pickData('sonnet', ds); const result = await handleCardAction(data, deps, LARK_APP_ID);
+      expect(result.toast.type).toBe('warning');
+      expect(result.card.data.elements.some((element: any) => element.text?.content?.includes('opus'))).toBe(true);
+      expect(deliver).not.toHaveBeenCalled();
     }
     expect(ds.session.modelPin?.model).toBe('sonnet'); expect(ds.spawnModelOverride).toBe('opus');
     expect(requestSessionRestartMock).not.toHaveBeenCalled();
@@ -1337,10 +1528,10 @@ describe('model pin explicit entry semantics', () => {
     ds.session.modelPin = { model: 'sonnet', effort: 'high', source: 'topic-header', setBy: OWNER, setAt: 'old' };
     const deps = depsWith(ds, vi.fn(() => true));
     if (kind === 'command') await handleCommand('/modelpin', ROOT, { senderId: OWNER, content: '/modelpin sonnet' } as any, deps, LARK_APP_ID);
-    else await handleCardAction(pickData('sonnet'), deps, LARK_APP_ID);
+    else await handleCardAction(pickData('sonnet', ds), deps, LARK_APP_ID);
     expect(ds.session.modelPin.effort).toBe('high');
     if (kind === 'command') await handleCommand('/modelpin', ROOT, { senderId: OWNER, content: '/modelpin opus' } as any, deps, LARK_APP_ID);
-    else { const res = await handleCardAction(pickData('opus'), deps, LARK_APP_ID); expect(res.toast.type, res.toast.content).toBe('success'); }
+    else { const res = await handleCardAction(pickData('opus', ds), deps, LARK_APP_ID); expect(res.toast.type, res.toast.content).toBe('success'); }
     expect(ds.session.modelPin.model).toBe('opus'); expect(ds.session.modelPin.effort).toBeUndefined();
   });
   it('sends the supported Codex reasoning flag with the retained pin effort before requesting restart', async () => {

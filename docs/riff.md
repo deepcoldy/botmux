@@ -1,6 +1,6 @@
 # Riff 机器人接入指南
 
-> Riff 后端：消息发给飞书机器人 → riff 云端沙箱运行 codex agent → 结果自动回到飞书。agent 跑在远端沙箱里，本机无需安装任何 CLI；botmux 自动把仓库、环境变量、回投凭证带进沙箱。要求 botmux ≥ 2.109.0。
+> Riff 后端：消息发给飞书机器人 → riff 云端沙箱运行编码 agent（codex，或可选的 Claude Code）→ 结果自动回到飞书。agent 跑在远端沙箱里，本机无需安装任何 CLI；botmux 自动把仓库、环境变量、回投凭证带进沙箱。要求 botmux ≥ 2.109.0。
 
 ## 快速接入（约 5 分钟）
 
@@ -12,8 +12,9 @@
    |------|--------|
    | Base URL | **必填**。填你所在环境的 riff 服务地址（线上 / BOE 测试环境各一个域名，向 riff 团队或内部文档获取；形如 `https://riff.example.internal`） |
    | 运行环境 | 新任务使用的沙箱资源池：`BOE`（配置值 `boe`）或 `CN`（配置值 `cn`）；不配置时 Riff 默认 `boe`。该选择与 Base URL 所指向的 Riff 服务环境相互独立 |
-   | 模型 | **留空**（默认 `gpt-5.5`）；推荐可选：`gpt-5.5` / `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` / `gpt-5.4` / `gpt-5.4-pro`（输入框有下拉建议） |
-   | 思考等级 | codex 推理强度（low / medium / high / xhigh），留空跟随默认 medium |
+   | Riff Agent | 任务执行引擎：`codex`（默认）或 `claude`（Claude Code，支持 Gemini 4 思考等级等）。不配置或存量已下线值（`aiden` / `aiden-claude` / `opencode`）一律回落 `codex`，下个新会话生效 |
+   | 模型 | **留空**（使用所选 Agent 的 riff 默认模型：codex 默认 `gpt-5.5`，claude 默认 `glm-5.3`）；推荐值随 Riff Agent 切换（输入框有下拉建议），仅接受 riff 支持清单内的值，非法名字会创建失败并回显完整清单 |
+   | 思考等级 | low / medium / high / xhigh，留空跟随默认 medium。codex 写入沙箱 `model_reasoning_effort`，claude 写入 `CLAUDE_CODE_EFFORT_LEVEL`；模型不支持显式档位时服务端返回 400 |
    | JWT 环境变量 | 一般**留空**，见「认证（JWT）」 |
    | System Prompt / 额外初始化命令 | 可选。自定义 System Prompt 是**追加**在内置路由规则之后，不会替换它 |
 

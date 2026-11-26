@@ -136,7 +136,12 @@ const CASES: readonly Case[] = [
     ok: true,
     riff: '{\n  "baseUrl": "https://riff.example.com",\n  "model": "m",\n  "sandboxCluster": "boe"\n}',
   }, { riff: { baseUrl: 'https://riff.example.com', model: 'm', sandboxCluster: 'boe' } }],
+  ['/api/bot-riff', '{"riff":"{\\"baseUrl\\":\\"https://riff.example.com\\",\\"agent\\":\\"claude\\",\\"model\\":\\"gemini-4-neon\\"}"}', 200, {
+    ok: true,
+    riff: '{\n  "baseUrl": "https://riff.example.com",\n  "agent": "claude",\n  "model": "gemini-4-neon",\n  "sandboxCluster": "boe"\n}',
+  }, { riff: { baseUrl: 'https://riff.example.com', agent: 'claude', model: 'gemini-4-neon', sandboxCluster: 'boe' } }],
   ['/api/bot-riff', '{"riff":"   "}', 200, { ok: true, riff: '' }, { riff: undefined }],
+  ['/api/bot-riff', '{"riff":"{\\"baseUrl\\":\\"https://riff.example.com\\",\\"agent\\":\\"bogus\\"}"}', 400, { ok: false, error: 'invalid_agent' }],
   ['/api/bot-riff', '{"riff":"{\\"baseUrl\\":\\"https://riff.example.com\\",\\"sandboxCluster\\":\\"nope\\"}"}', 400, { ok: false, error: 'invalid_sandbox_cluster' }],
   ['/api/bot-riff', '{"riff":"{\\"baseUrl\\":\\"ftp://x\\"}"}', 400, { ok: false, error: 'invalid_base_url' }],
   // herdr：合法值经 normalizeHerdrBackendConfig 归一落盘；非法字段显式拒绝；空串 / 空对象清除。

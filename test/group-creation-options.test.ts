@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { formatSlashGroupName, groupCommandStartsTask, groupCommandStartsTaskForRouting, parseGroupCreationArgs, parseGroupCreationDefaults, resolveGroupCreationAgents, resolveGroupDecorations } from '../src/services/group-creation-options.js';
+import { formatSlashGroupName, groupCommandStartsTask, groupCommandStartsTaskForRouting, parseGroupCreationArgs, parseGroupCreationDefaults, resolveGroupCreationAgents, resolveGroupDecorations, shouldOpenGroupCreateCard } from '../src/services/group-creation-options.js';
 
 describe('/g customization', () => {
   it('preserves punctuation, spaces and the first non-empty name line', () => {
@@ -203,5 +203,59 @@ describe('/g multiline routing uses the shared first-mentioned creator, never re
   it('does not reinterpret non-/g text', () => {
     expect(route({ autoStart: true }, [], [A, B], '/gx --start 任务\n细节')).toBe(false);
     expect(route({ autoStart: true }, [], [A, B], '普通文本')).toBe(false);
+  });
+});
+
+describe('/g directory, branch, and opt-in form card (--dir, --branch, --card, --no-card, groupCreation.card)', () => {
+  it('parses --dir and --branch alongside the group name', () => {
+    expect(parseGroupCreationArgs('项目讨论 --dir /work/app --branch feat/demo')).toMatchObject({
+      name: '项目讨论',
+      workingDir: '/work/app',
+      branch: 'feat/demo',
+    });
+    expect(parseGroupCreationArgs('--dir="/work/my app" --branch=fix/a')).toMatchObject({
+      name: '',
+      workingDir: '/work/my app',
+      branch: 'fix/a',
+    });
+  });
+
+  it('validates card in defaults and parses --card / --no-card switches', () => {
+    expect(parseGroupCreationDefaults({ card: true })).toEqual({ card: true });
+    expect(parseGroupCreationDefaults({ card: false })).toEqual({ card: false });
+    expect(() => parseGroupCreationDefaults({ card: 'yes' })).toThrow(/card/);
+
+    expect(parseGroupCreationArgs('--card')).toMatchObject({ card: true, cardExplicit: true, name: '' });
+    expect(parseGroupCreationArgs('--card 项目名 --dir /repo')).toMatchObject({
+      card: true,
+      cardExplicit: true,
+      name: '项目名',
+      workingDir: '/repo',
+    });
+    expect(parseGroupCreationArgs('--no-card', { card: true })).toMatchObject({ card: false, name: '' });
+    expect(parseGroupCreationArgs('--no-card', { card: true }).cardExplicit).toBeUndefined();
+    expect(() => parseGroupCreationArgs('--card=yes')).toThrow(/takes no value/);
+    expect(() => parseGroupCreationArgs('--no-card=no')).toThrow(/takes no value/);
+    expect(() => parseGroupCreationArgs('--card --no-card')).toThrow(/Duplicate option/);
+  });
+
+  it('shouldOpenGroupCreateCard keeps bare /g backward-compatible by default and honors opt-in + explicit overrides', () => {
+    // Default (card unset/false): bare /g stays direct, --card opens the form card.
+    expect(shouldOpenGroupCreateCard(parseGroupCreationArgs(''), { autoStart: false })).toBe('direct');
+    expect(shouldOpenGroupCreateCard(parseGroupCreationArgs('项目名'), { autoStart: false })).toBe('direct');
+    expect(shouldOpenGroupCreateCard(parseGroupCreationArgs('--card'), { autoStart: false })).toBe('card');
+    expect(shouldOpenGroupCreateCard(parseGroupCreationArgs('--card 项目名'), { autoStart: false })).toBe('card');
+    expect(shouldOpenGroupCreateCard(parseGroupCreationArgs('--card --start 修复 bug'), { autoStart: true })).toBe('conflict_with_start');
+    // --card with autoStart default but NO task text/quote has autoStart=false → opens form card cleanly.
+    expect(shouldOpenGroupCreateCard(parseGroupCreationArgs('--card', { autoStart: true }), { autoStart: false })).toBe('card');
+
+    // Opt-in groupCreation.card: true: bare /g opens card; explicit name/dir/branch/task or --no-card stays direct.
+    expect(shouldOpenGroupCreateCard(parseGroupCreationArgs('', { card: true }), { autoStart: false })).toBe('card');
+    expect(shouldOpenGroupCreateCard(parseGroupCreationArgs('--avatar name', { card: true }), { autoStart: false })).toBe('card');
+    expect(shouldOpenGroupCreateCard(parseGroupCreationArgs('--no-card', { card: true }), { autoStart: false })).toBe('direct');
+    expect(shouldOpenGroupCreateCard(parseGroupCreationArgs('项目名', { card: true }), { autoStart: false })).toBe('direct');
+    expect(shouldOpenGroupCreateCard(parseGroupCreationArgs('--dir /repo', { card: true }), { autoStart: false })).toBe('direct');
+    expect(shouldOpenGroupCreateCard(parseGroupCreationArgs('--start 修 bug', { card: true }), { autoStart: true })).toBe('direct');
+    expect(shouldOpenGroupCreateCard(parseGroupCreationArgs('--card 项目名', { card: true }), { autoStart: false })).toBe('card');
   });
 });

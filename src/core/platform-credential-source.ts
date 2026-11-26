@@ -31,7 +31,7 @@ import type { TriggerUserAuthTool } from '../services/trigger-user-auth.js';
 import type { LarkCliIdentity, BytedCliIdentity, BytedcliRegion } from './cli-identity.js';
 
 export type PlatformIdentityResolution =
-  | { state: 'granted'; identity: LarkCliIdentity | BytedCliIdentity; expiresAt: number; unionId: string }
+  | { state: 'granted'; identity: LarkCliIdentity | BytedCliIdentity; expiresAt: number; unionId: string; bindingKey: string }
   /** This machine is not bound to a platform; nothing was asked. */
   | { state: 'unbound' }
   /** The platform knows the person but has no usable credential for this tool
@@ -62,6 +62,15 @@ interface Deps {
   resolveUnionId: (larkAppId: string, openId: string) => Promise<string | null>;
   requestGrant: (req: CredentialGrantRequest, opts: { binding: { platformUrl: string; machineToken: string; machineId: string } }) => Promise<CredentialGrantResult>;
   now: () => number;
+}
+
+function platformBindingKey(binding: NonNullable<ReturnType<Deps['readBinding']>>): string {
+  return JSON.stringify([binding.platformUrl.replace(/\/+$/, ''), binding.machineId]);
+}
+
+export function activePlatformCredentialBindingKey(): string | undefined {
+  const binding = deps.readBinding();
+  return binding ? platformBindingKey(binding) : undefined;
 }
 
 const realDeps: Deps = {
@@ -275,7 +284,7 @@ export async function resolvePlatformIdentity(args: ResolvePlatformIdentityArgs)
       logger.warn(`[trigger-user-auth] platform ${args.tool} grant malformed: required variable missing`);
       return { state: 'unavailable', detail: 'malformed grant' };
     }
-    return { state: 'granted', identity, expiresAt: result.value.expiresAt, unionId };
+    return { state: 'granted', identity, expiresAt: result.value.expiresAt, unionId, bindingKey: platformBindingKey(binding) };
   }
   const detail = describeCredentialGrantFailure(result);
   const pageUrl = platformCredentialsUrl({ binding }) ?? undefined;

@@ -8,7 +8,16 @@ import { supportsCodexModelSelection } from '../services/codex-model-selection.j
 import { inspectAntigravityAccounts } from '../services/antigravity-accounts.js';
 import { cancelAntigravityRotationReplay, formatAntigravityStatusLine } from './antigravity-rotation.js';
 import { resetSessionCodexModelSelection, dshRuntimeForSession } from './worker-pool.js';
-import { formatSlashGroupName, parseGroupCreationArgs, resolveGroupCreationAgents, resolveGroupDecorations, knownGroupBotMentions, knownGroupBotNames, type GroupCreationArgs } from '../services/group-creation-options.js';
+import { formatSlashGroupName, parseGroupCreationArgs, resolveGroupCreationAgents, resolveGroupDecorations, knownGroupBotMentions, knownGroupBotNames, shouldOpenGroupCreateCard, type GroupCreationArgs } from '../services/group-creation-options.js';
+import { recordCreatedGroup } from '../services/created-groups-store.js';
+import {
+  buildGroupCreateCard,
+  buildGroupCreatedCard,
+  buildGroupErrorCard,
+  groupCreateDirOptions,
+  openGroupCreateForm,
+  type GroupCreateCardResult,
+} from './group-create-card.js';
 import { groupTaskForwardIds, groupTaskPlaceholder, groupTaskPrompt, groupTaskPromptAttachments, groupTaskQuoteId, groupTaskSenderIsBot, startGroupTask, type GroupTaskPromptAttachment, type GroupTaskStartResult } from './group-task-start.js';
 /**
  * Command handler — processes /slash commands from users.
@@ -21,7 +30,7 @@ import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir, loadBotConfigs, type BotConfig } from '../bot-registry.js';
-import { triggerUserAuthApplies, credentialSourceOf, capabilityOn } from '../services/trigger-user-auth.js';
+import { triggerUserAuthApplies, credentialSourceOf, capabilityOn, type TriggerUserAuthCredentialSourceCapability } from '../services/trigger-user-auth.js';
 import { platformCredentialsUrl } from '../platform/credential-grant-client.js';
 import { startBytedcliLogin, completeBytedcliLogin, describeBytedcliAuth, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
 import { requestMeegoLogin } from '../services/meego-auth.js';
@@ -31,7 +40,7 @@ import { beginLarkCliLogin, completeLarkCliLogin, pendingLarkCliChallenge, hasLa
 import { sessionLarkToolBound } from './lark-tool-binding.js';
 import { deliverAuthLink } from './auth-link-delivery.js';
 import { askPlatformToAuthorize } from './platform-authorization-request.js';
-import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
+import { unknownLarkUserScopes } from './lark-user-scope-validation.js';
 import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from '../global-config.js';
 import { pluginCommandGateway, renderPluginCommandHelp } from './plugins/commands/runtime.js';
 import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from './close-residual.js';
@@ -42,7 +51,7 @@ import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
 import { scheduledTaskRunAs } from './schedule-run-as.js';
 import { scanMultipleProjects } from '../services/project-scanner.js';
-import { createRepoWorktree, pushWorktreeBranch, isLinkedWorktree, mainWorktreeFor, removeRepoWorktree, withWorktreeTargetLock, worktreeRootFor, worktreeSafetyStatus } from '../services/git-worktree.js';
+import { createRepoWorktree, isValidBranchName, pushWorktreeBranch, isLinkedWorktree, mainWorktreeFor, removeRepoWorktree, withWorktreeTargetLock, worktreeRootFor, worktreeSafetyStatus } from '../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
 import { getSessionPersistentBackendType, isRemoteBackendSession, killPersistentBackendTarget, persistentBackendTargetForSession, probePersistentBackendTargetAfterKill, resolvePairedSpawnBackendType } from './persistent-backend.js';
 import { isRemoteCliId } from './remote-cli-ids.js';
@@ -161,7 +170,7 @@ import { messageMentionsBot, parseApiMessage, extractResources } from '../im/lar
 import { updateSessionTitle } from './session-title.js';
 import { markProjectImportPending, noteProjectAssociationChanged } from './project-session-association-events.js';
 import { requestAgentSessionRename, resolveAgentSessionAutoRename } from './session-rename.js';
-import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
+import { hasNonActivationSessionMutationOwnership, hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import { withBotTurnMutation, runDetachedBotTurnAdmission, withBotTurnAdmission } from './bot-turn-mutation-gate.js';
 import { REWIND_CHECKPOINT_LIMIT, findCheckpoint, scanClaudeTranscriptCheckpoints, waitForTranscriptQuiet, withOpenTranscript, type RewindCheckpoint, type RewindResult } from './context-rewind.js';
 import { REWIND_BACKUP_RETENTION, pruneRewindBackupsBeside, registerRewindBackup, rewindBackupDirForSession } from './rewind-backup-retention.js';
@@ -2104,6 +2113,226 @@ export async function drainQueuedForks(
   }
 }
 
+export type SlashGroupCreationResult = GroupCreateCardResult;
+
+export function slashGroupReceiptText(result: SlashGroupCreationResult, loc?: Locale): string {
+  if (!result.ok) return t('cmd.group.failed', { error: result.error }, loc);
+  if (result.reservationFailedReason) {
+    return t('cmd.group.reservation_failed', {
+      name: result.name,
+      reason: result.reservationFailedReason,
+      link: result.link,
+    }, loc);
+  }
+  const extraLines = [
+    ...(result.workingDir ? [t('card.group_create.done_dir', { dir: result.workingDir }, loc)] : []),
+    ...(result.branch ? [t('card.group_create.done_branch', { branch: result.branch }, loc)] : []),
+    ...result.hints,
+  ];
+  const hints = extraLines.length > 0 ? '\n' + extraLines.join('\n') : '';
+  return t(result.started ? 'cmd.group.started' : 'cmd.group.created', {
+    name: result.name,
+    link: result.link,
+    hints,
+  }, loc);
+}
+
+async function replyGroupCardOrText(
+  sessionReply: CommandHandlerDeps['sessionReply'],
+  rootId: string,
+  cardJson: string,
+  fallbackText: string,
+  logTag: string,
+): Promise<void> {
+  try {
+    await sessionReply(rootId, cardJson, 'interactive');
+  } catch (err) {
+    logger.warn(`[${logTag}] /group card reply failed, falling back to text: ${err instanceof Error ? err.message : String(err)}`);
+    await sessionReply(rootId, fallbackText);
+  }
+}
+
+interface PreparedGroupWorkingDir {
+  workingDir?: string;
+  repository?: string;
+  branch?: string;
+  createdWorktree?: { path: string; reused?: true };
+}
+
+async function validateGroupDirAndBranch(
+  groupArgs: Pick<GroupCreationArgs, 'workingDir' | 'branch'>,
+  opts: { requireDirForBranch: boolean; loc?: Locale },
+): Promise<{ ok: true; workingDir?: string } | { ok: false; error: string }> {
+  let resolvedDir: string | undefined;
+  if (groupArgs.workingDir) {
+    const validated = validateWorkingDir(groupArgs.workingDir, opts.loc);
+    if (!validated.ok) return { ok: false, error: validated.error };
+    resolvedDir = validated.resolvedPath;
+  }
+  if (groupArgs.branch) {
+    if (opts.requireDirForBranch && !resolvedDir) {
+      return { ok: false, error: t('card.group_create.repo_required', undefined, opts.loc) };
+    }
+    if (!(await isValidBranchName(groupArgs.branch))) {
+      return { ok: false, error: t('daemon.topic_header_branch_invalid', { arg: groupArgs.branch }, opts.loc) };
+    }
+  }
+  return { ok: true, workingDir: resolvedDir };
+}
+
+async function prepareGroupWorkingDir(opts: {
+  workingDir?: string;
+  branch?: string;
+  creatorAppId: string;
+  loc?: Locale;
+}): Promise<PreparedGroupWorkingDir> {
+  const checked = await validateGroupDirAndBranch(opts, { requireDirForBranch: true, loc: opts.loc });
+  if (!checked.ok) throw new Error(checked.error);
+  const resolvedDir = checked.workingDir;
+  if (!opts.branch) return { workingDir: resolvedDir };
+  const creation = await createRepoWorktree(resolvedDir!, { branch: opts.branch });
+  await recordCreatedWorktree(opts.creatorAppId, creation);
+  return {
+    workingDir: creation.path,
+    repository: resolvedDir,
+    branch: creation.branch,
+    createdWorktree: { path: creation.path, reused: creation.reused },
+  };
+}
+
+export async function createSlashGroup(opts: {
+  creatorAppId: string;
+  senderOpenId: string;
+  groupArgs: GroupCreationArgs;
+  larkAppIdsForGroup: string[];
+  appIdToName: ReadonlyMap<string, string>;
+  loc?: Locale;
+  logTag: string;
+}): Promise<SlashGroupCreationResult> {
+  const { creatorAppId, senderOpenId, groupArgs, larkAppIdsForGroup, appIdToName, loc, logTag } = opts;
+  const { roleProfileId } = groupArgs;
+  const firstLine = groupArgs.name;
+  let baseGroupName: string;
+  if (firstLine) {
+    baseGroupName = firstLine;
+  } else {
+    const now = new Date();
+    const ts = `${String(now.getMonth() + 1).padStart(2, '0')}/${String(now.getDate()).padStart(2, '0')} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+    baseGroupName = t('cmd.group.empty_fallback', { ts }, loc);
+  }
+  const namePrefix = readGlobalConfig().groupNamePrefix;
+  const groupName = formatSlashGroupName(baseGroupName, namePrefix);
+  // Unnamed groups are AI-titled from their first message, as session
+  // groups are. The title needs a one-shot print mode of this bot's CLI
+  // and an unsandboxed bot (the call runs on the host); otherwise the
+  // placeholder simply stays (same silent degrade).
+  const decorations = resolveGroupDecorations(groupArgs);
+  const { oneShotTitleAllowed } = await import('../services/session-group-title.js');
+  const autoTitle = decorations.autoTitle && oneShotTitleAllowed(getBot(creatorAppId).config);
+
+  let dirSetup: PreparedGroupWorkingDir = {};
+  let createdChatId: string | undefined;
+  let bindingError: string | undefined;
+  try {
+    dirSetup = await prepareGroupWorkingDir({
+      workingDir: groupArgs.workingDir,
+      branch: groupArgs.branch,
+      creatorAppId,
+      loc,
+    });
+    const { createGroupWithBots } = await import('../services/group-creator.js');
+    const { registerGroupAutoTitle } = await import('../services/group-auto-title.js');
+    // Settles when createGroupWithBots returns or throws, i.e. after its
+    // initial avatar; a fast AI title waits on it before re-rendering.
+    let settleDecorations!: () => void;
+    const decorationsSettled = new Promise<void>(resolve => { settleDecorations = resolve; });
+    const result = await createGroupWithBots({
+      creatorLarkAppId: creatorAppId,
+      larkAppIds: larkAppIdsForGroup,
+      name: groupName,
+      userOpenIds: [senderOpenId],
+      transferOwnerTo: senderOpenId,
+      notifyOwnerOpenId: senderOpenId,
+      roleProfileId,
+      ...((groupArgs.tag || decorations.avatar) ? {
+        customization: { tag: groupArgs.tag, avatar: decorations.avatar, userOpenId: senderOpenId },
+      } : {}),
+      // Register as soon as the chat exists: the invited sender can type
+      // in it while invites / owner transfer are still running.
+      ...((dirSetup.workingDir || autoTitle) ? {
+        onChatCreated: (chatId: string) => {
+          createdChatId = chatId;
+          if (dirSetup.workingDir) {
+            // Auxiliary local state: a lock timeout / disk error must not abort
+            // the chat that already exists or drop its link. Degrade to a hint.
+            try {
+              recordCreatedGroup({
+                chatId,
+                creatorAppId,
+                ownerOpenId: senderOpenId,
+                workingDir: dirSetup.workingDir,
+                repository: dirSetup.repository,
+                branch: dirSetup.branch,
+              });
+            } catch (e: any) {
+              bindingError = e?.message ?? String(e);
+              logger.warn(`[${logTag}] /group created-groups bind failed for ${chatId}: ${bindingError}`);
+            }
+          }
+          if (autoTitle) registerGroupAutoTitle(creatorAppId, chatId, {
+            placeholderName: groupName,
+            namePrefix: namePrefix || undefined,
+            nameAvatar: decorations.avatar === 'name' || undefined,
+          }, decorationsSettled);
+        },
+      } : {}),
+    }).finally(settleDecorations);
+    // Prefer the shareable join link (others can click to *join*); fall
+    // back to the member-only applink URL when Lark's link API failed.
+    const applink = chatAppLink(result.chatId, normalizeBrand(getBot(creatorAppId).config.brand));
+    const link = result.shareLink ?? applink;
+    // Partial failures are non-fatal — the chat exists; surface them as
+    // hints so the user knows whether to expect to be auto-invited.
+    const hints: string[] = [];
+    if (autoTitle) hints.push(t('cmd.group.auto_title_pending', undefined, loc));
+    if (bindingError) hints.push(t('card.group_create.binding_failed', { error: bindingError }, loc));
+    if (result.customization?.avatarError) hints.push(t('cmd.group.avatar_failed', { reason: result.customization.avatarError }, loc));
+    if (result.customization?.tagError) hints.push(t('cmd.group.tag_failed', { reason: result.customization.tagError }, loc));
+    if (result.invalidUserIds.includes(senderOpenId)) {
+      hints.push(t('cmd.group.warn_invite_rejected', undefined, loc));
+    } else if (result.transferError) {
+      hints.push(t('cmd.group.warn_transfer_failed', { reason: result.transferError }, loc));
+    }
+    if (!result.shareLink && result.shareLinkError) {
+      logger.warn(`[${logTag}] /group share-link unavailable, using applink: ${result.shareLinkError}`);
+      hints.push(t('cmd.group.warn_share_link_failed', undefined, loc));
+    }
+    const nameOf = (id: string) => appIdToName.get(id) ?? botDisplayName(id);
+    const groupBotIds = larkAppIdsForGroup.filter(id => !result.invalidBotIds.includes(id));
+    if (groupBotIds.length > 1) {
+      hints.push(t('cmd.group.bots_invited', { bots: groupBotIds.map(nameOf).join('、') }, loc));
+    }
+    if (result.invalidBotIds.length > 0) {
+      hints.push(t('cmd.group.warn_bots_rejected', { bots: result.invalidBotIds.map(nameOf).join('、') }, loc));
+    }
+    if (roleProfileId) {
+      if (result.roleProfileBootstrapError) {
+        hints.push(t('cmd.group.role_profile_bootstrap_failed', { profile: roleProfileId, reason: result.roleProfileBootstrapError ?? 'unknown' }, loc));
+      } else {
+        hints.push(t('cmd.group.role_profile_bootstrap_sent', { profile: roleProfileId }, loc));
+      }
+    }
+    logger.info(`[${logTag}] /group created chat=${result.chatId} name="${groupName}" bots=[${larkAppIdsForGroup.join(',')}] invitee=${senderOpenId} autoTitle=${autoTitle} avatar=${decorations.avatar ?? '-'} dir=${dirSetup.workingDir ?? '-'}`);
+    return { ok: true, name: groupName, link, workingDir: dirSetup.workingDir, branch: dirSetup.branch, hints };
+  } catch (err: any) {
+    if (!createdChatId && dirSetup.createdWorktree && !dirSetup.createdWorktree.reused && dirSetup.repository) {
+      removeRepoWorktree(dirSetup.repository, dirSetup.createdWorktree.path).catch(() => {});
+    }
+    logger.error(`[${logTag}] /group failed: ${err?.message ?? err}`);
+    return { ok: false, error: err?.message ?? String(err) };
+  }
+}
+
 export async function handleCommand(
   cmd: string,
   rootId: string,
@@ -3245,7 +3474,7 @@ export async function handleCommand(
           // route. requestSessionRestart does not itself gate on dispatch
           // ownership, so reject here before the coordinator tears the worker
           // down (mirrors the card-handler restart path).
-          if (hasProtectedSessionMutationOwnership(ds)) {
+          if (hasNonActivationSessionMutationOwnership(ds)) {
             await sessionReply(
               rootId,
               '当前 Codex App 仍有未结算消息，暂不能重启；请等待本轮完成或关闭会话。',
@@ -3265,7 +3494,7 @@ export async function handleCommand(
               render: status => buildRestartStatusCard({ status, cliName, source: 'slash', locale: loc }),
               post: card => sessionReply(rootId, card, 'interactive'),
             }),
-          });
+          }, { allowUnconfirmedActivationReplay: true });
           logger.info(`[${logTag}] Restart by /restart command`);
         } else {
           await replyNoSession(replyHere, loc);
@@ -4805,14 +5034,15 @@ export async function handleCommand(
         // fetched again next turn; this process cannot revoke it. Say so when
         // this bot actually takes credentials from the platform, the same way
         // /login points at that page.
-        const credSource = credentialSourceOf(botCfg.triggerUserAuth);
-        const platformUrl = botCfg.triggerUserAuth?.enabled && credSource !== 'local'
-          ? platformCredentialsUrl()
-          : null;
-        const platformNote = !botCfg.triggerUserAuth?.enabled || credSource === 'local'
-          ? ''
+        const policy = botCfg.triggerUserAuth;
+        const platformTools = [
+          triggerUserAuthApplies(policy, 'lark-cli') && credentialSourceOf(policy, 'lark-user') !== 'local' ? 'lark-cli' : '',
+          capabilityOn(policy, 'bytecloud') && credentialSourceOf(policy, 'bytecloud') !== 'local' ? 'bytedcli' : '',
+        ].filter(Boolean).join(' / ');
+        const platformUrl = platformTools ? platformCredentialsUrl() : null;
+        const platformNote = !platformTools ? ''
           : platformUrl
-            ? `\n${t('cmd.logout.platform_note', { url: platformUrl }, loc)}`
+            ? `\n${t('cmd.logout.platform_note', { tool: platformTools, url: platformUrl }, loc)}`
             : `\n${t('cmd.logout.platform_unbound', undefined, loc)}`;
         await sessionReply(rootId, t('cmd.logout.ok', undefined, loc) + platformNote);
         break;
@@ -4864,20 +5094,35 @@ export async function handleCommand(
           },
           workflow: process.env.BOTMUX_WORKFLOW === '1',
         });
-        // credentialSource = platform: a bound session's `lark-cli --as user` takes
-        // the sender's token from the platform only, so a bot-app authorization
-        // would be useless there. The platform branch below already answers the
-        // bare and explicit forms; status/done must not report one either.
-        const larkPlatformOnly = credentialSourceOf(botCfg2.triggerUserAuth) === 'platform'
-          && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli');
-        // 中心化平台来源：本机已绑定且本 bot 的凭据来源不是 local 时，裸 /login 与显式的
-        // /login lark|bytedcli 都请平台给本人发授权卡片，平台没有该端点时回退到平台凭据页。
-        const credSource = credentialSourceOf(botCfg2.triggerUserAuth);
-        const larkGoverned = triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli');
-        const bytedcliGoverned = capabilityOn(botCfg2.triggerUserAuth, 'bytecloud');
-        const platformCredsUrl = credSource !== 'local' && (larkGoverned || bytedcliGoverned)
+        const policy = botCfg2.triggerUserAuth;
+        const larkSource = credentialSourceOf(policy, 'lark-user');
+        const bytedcliSource = credentialSourceOf(policy, 'bytecloud');
+        const larkGoverned = triggerUserAuthApplies(policy, 'lark-cli');
+        const bytedcliGoverned = capabilityOn(policy, 'bytecloud');
+        const larkPlatformOnly = larkGoverned && larkSource === 'platform';
+        const bytedcliPlatformOnly = bytedcliGoverned && bytedcliSource === 'platform';
+        const platformCredsUrl = (larkGoverned && larkSource !== 'local') || (bytedcliGoverned && bytedcliSource !== 'local')
           ? platformCredentialsUrl() : null;
-        const explicitGoverned = (subCmd === 'lark' && larkGoverned) || (subCmd === 'bytedcli' && bytedcliGoverned);
+        const platformLark = larkPlatformOnly || (larkGoverned && larkSource === 'auto' && !!platformCredsUrl);
+        const platformBytedcli = bytedcliPlatformOnly || (bytedcliGoverned && bytedcliSource === 'auto' && !!platformCredsUrl);
+        const loginProvider = subCmd.split(/\s+/, 1)[0];
+        const wantsLark = loginProvider === 'lark';
+        const wantsBytedcli = loginProvider === 'bytedcli';
+        const bytedcliDone = /^bytedcli\s+(done|完成)$/.test(subCmd);
+        const includePlatformLark = platformLark && (subCmd === '' || wantsLark);
+        const includePlatformBytedcli = platformBytedcli && (subCmd === '' || (wantsBytedcli && !bytedcliDone));
+        // Keep the existing bare local flow when both providers use the same
+        // source. With split sources, also handle the local provider.
+        const localLarkAlongsidePlatform = subCmd === '' && includePlatformBytedcli && larkGoverned && !platformLark;
+        const localBytedcliAlongsidePlatform = subCmd === '' && includePlatformLark && bytedcliGoverned && !platformBytedcli;
+        const loginSourceStillCurrent = (capability: TriggerUserAuthCredentialSourceCapability) => {
+          try {
+            const live = getBot(botCfg2.larkAppId).config.triggerUserAuth;
+            return capabilityOn(live, capability) === (capability === 'lark-user' ? larkGoverned : bytedcliGoverned)
+              && credentialSourceOf(live, capability) === (capability === 'lark-user' ? larkSource : bytedcliSource);
+          } catch { return false; }
+        };
+        const replyPolicyChanged = () => sessionReply(rootId, t('cmd.login.policy_changed', undefined, loc));
         // `/login meego [dcar]` — the person's Meego login, kept once per person
         // for every session of this bot. Independent of where ByteCloud
         // credentials come from: the platform does not issue Meego logins.
@@ -4911,53 +5156,64 @@ export async function handleCommand(
           }
           break;
         }
+        if ((wantsLark && subCmd !== 'lark') || (wantsBytedcli && subCmd !== 'bytedcli' && !bytedcliDone)) {
+          await sessionReply(rootId, t('cmd.login.provider_usage', undefined, loc));
+          break;
+        }
         // A capability that is off is native: this bot never runs it as the
         // person, so there is nothing to authorize and no link is minted.
-        const nativeLogin = (subCmd === 'bytedcli' || subCmd.startsWith('bytedcli ') && !/^bytedcli\s+(done|完成)$/.test(subCmd)) && !bytedcliGoverned ? 'ByteCloud'
-          : (subCmd === 'lark' || subCmd.startsWith('lark ')) && !larkGoverned && !larkBound ? t('trigger_user_auth.provider_lark', undefined, loc)
+        const nativeLogin = wantsBytedcli && !bytedcliDone && !bytedcliGoverned ? 'ByteCloud'
+          : wantsLark && !larkGoverned && !larkBound ? t('trigger_user_auth.provider_lark', undefined, loc)
             : undefined;
         if (nativeLogin) {
           await sessionReply(rootId, t('cmd.login.native', { provider: nativeLogin }, loc));
           break;
         }
-        // platform 模式 + 本机未绑定：按矩阵一律拒绝，绝不落到本机扫码——否则扫完也不会被采信。
-        if (credSource === 'platform' && !platformCredsUrl && (larkGoverned || bytedcliGoverned)
-          && (subCmd === '' || explicitGoverned)) {
-          await sessionReply(rootId, t('cmd.login.platform_unbound', undefined, loc));
+        if (bytedcliDone && bytedcliPlatformOnly) {
+          await sessionReply(rootId, platformCredsUrl
+            ? t('cmd.login.platform_status', { tool: 'bytedcli', url: platformCredsUrl }, loc)
+            : t('cmd.login.platform_unbound', undefined, loc));
           break;
         }
-        if (platformCredsUrl && (subCmd === '' || explicitGoverned)) {
-          const asked = await askPlatformToAuthorize({
-            botConfig: botCfg2,
-            ...(isUsableOpenId(loginOpenId) ? { openId: loginOpenId } : {}),
-            ...(message.senderUnionId ? { unionId: message.senderUnionId } : {}),
-          });
-          if (asked.kind !== 'legacy') {
-            await sessionReply(rootId, asked.kind === 'sent' ? t('cmd.login.platform_sent', undefined, loc)
-              : asked.kind === 'ready' ? t('cmd.login.platform_ready', undefined, loc)
-                : asked.kind === 'undeliverable' ? t('cmd.login.platform_undeliverable', { url: platformCredsUrl }, loc)
-                  : asked.kind === 'request_cap' ? t('cmd.login.platform_request_cap', { url: platformCredsUrl }, loc)
-                    : t('cmd.login.platform_unavailable', undefined, loc));
-            break;
+        if (includePlatformLark || includePlatformBytedcli) {
+          if (!platformCredsUrl) {
+            await sessionReply(rootId, t('cmd.login.platform_unbound', undefined, loc));
+          } else {
+            const platformLoginCurrent = () =>
+              (!includePlatformLark || loginSourceStillCurrent('lark-user'))
+              && (!includePlatformBytedcli || loginSourceStillCurrent('bytecloud'));
+            const asked = await askPlatformToAuthorize({
+              botConfig: botCfg2,
+              ...(isUsableOpenId(loginOpenId) ? { openId: loginOpenId } : {}),
+              ...(message.senderUnionId ? { unionId: message.senderUnionId } : {}),
+              isCurrent: platformLoginCurrent,
+            });
+            if (!platformLoginCurrent()) {
+              await replyPolicyChanged();
+            } else if (asked.kind !== 'legacy') {
+              await sessionReply(rootId, asked.kind === 'sent' ? t('cmd.login.platform_sent', undefined, loc)
+                : asked.kind === 'ready' ? t('cmd.login.platform_ready', undefined, loc)
+                  : asked.kind === 'undeliverable' ? t('cmd.login.platform_undeliverable', { url: platformCredsUrl }, loc)
+                    : asked.kind === 'request_cap' ? t('cmd.login.platform_request_cap', { url: platformCredsUrl }, loc)
+                      : t('cmd.login.platform_unavailable', undefined, loc));
+            } else {
+              const which = [includePlatformLark ? 'lark-cli' : '', includePlatformBytedcli ? 'bytedcli' : ''].filter(Boolean).join(' / ');
+              const provider = [includePlatformLark ? t('trigger_user_auth.provider_lark', undefined, loc) : '',
+                includePlatformBytedcli ? 'ByteCloud' : ''].filter(Boolean).join(' / ');
+              await authLinkReply([
+                t('cmd.login.platform_title', undefined, loc), '',
+                t('cmd.login.platform_step1', { provider }, loc),
+                platformCredsUrl, '',
+                t('cmd.login.platform_step2', undefined, loc), '',
+                t('cmd.login.platform_note', { tool: which }, loc),
+              ].join('\n'), wantsBytedcli ? '/login bytedcli' : '/login');
+            }
           }
-          const which = subCmd === 'bytedcli' ? 'bytedcli' : subCmd === 'lark' ? 'lark-cli'
-            : [larkGoverned ? 'lark-cli' : '', bytedcliGoverned ? 'bytedcli' : ''].filter(Boolean).join(' / ');
-          const provider = subCmd === 'bytedcli' ? 'ByteCloud' : subCmd === 'lark'
-            ? t('trigger_user_auth.provider_lark', undefined, loc)
-            : [larkGoverned ? t('trigger_user_auth.provider_lark', undefined, loc) : '', bytedcliGoverned ? 'ByteCloud' : ''].filter(Boolean).join(' / ');
-          await authLinkReply([
-            t('cmd.login.platform_title', undefined, loc), '',
-            t('cmd.login.platform_step1', { provider }, loc),
-            platformCredsUrl, '',
-            t('cmd.login.platform_step2', undefined, loc), '',
-            t('cmd.login.platform_note', { tool: which }, loc),
-          ].join('\n'), subCmd === 'bytedcli' ? '/login bytedcli' : '/login');
-          break;
+          if (!localLarkAlongsidePlatform && !localBytedcliAlongsidePlatform) break;
         }
 
-        // After the platform branch: on a platform-bound machine the bare /login
-        // always points at the platform page, whatever state the session is in.
-        if (larkBound && (subCmd === '' || subCmd === 'lark')) {
+        if (larkBound && ((subCmd === '' && !localBytedcliAlongsidePlatform) || subCmd === 'lark')) {
+          if (!loginSourceStillCurrent('lark-user')) { await replyPolicyChanged(); break; }
           const { authUrl } = generateAuthUrl(botCfg2.larkAppId, botCfg2.larkAppSecret,
             normalizeBrand(botCfg2.brand), [], loginOpenId);
           await authLinkReply(loginPromptLines(authUrl, loc).join('\n'));
@@ -4969,22 +5225,20 @@ export async function handleCommand(
           const lines: string[] = [];
           if (platformCredsUrl) {
             lines.push(t('cmd.login.platform_status', {
-              tool: [larkGoverned ? 'lark-cli' : '', bytedcliGoverned ? 'bytedcli' : ''].filter(Boolean).join(' / '),
+              tool: [platformLark ? 'lark-cli' : '', platformBytedcli ? 'bytedcli' : ''].filter(Boolean).join(' / '),
               url: platformCredsUrl,
             }, loc));
           }
-          if (larkPlatformOnly) {
-            // The platform is the only source of this person's lark-cli identity:
-            // the platform line above is the answer. Neither the bot-app token nor
-            // a machine-local device login would ever be used here.
-            if (!platformCredsUrl) lines.push(t('cmd.login.platform_unbound', undefined, loc));
-          } else if (larkBound) {
+          if (!platformCredsUrl && (larkPlatformOnly || bytedcliPlatformOnly)) {
+            lines.push(t('cmd.login.platform_unbound', undefined, loc));
+          }
+          if (larkBound && !larkPlatformOnly) {
             lines.push(getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand), loginOpenId));
-          } else if (!platformCredsUrl && loginOpenId && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli')) {
+          } else if (!platformLark && loginOpenId && larkGoverned) {
             lines.push(t(hasLarkCliHome(loginOpenId) ? 'cmd.login.lark_status_yes' : 'cmd.login.lark_status_no', undefined, loc));
           }
           // ByteCloud 是另一个身份提供方，飞书授权了不代表这边也授权了。
-          if (!platformCredsUrl && loginOpenId && bytedcliGoverned) {
+          if (!platformBytedcli && loginOpenId && bytedcliGoverned) {
             const status = await bytedcliLoginStatus(loginOpenId);
             lines.push(t(
               status === 'unavailable' ? 'cmd.login.bytedcli_unavailable'
@@ -5028,7 +5282,7 @@ export async function handleCommand(
           } else if (hasLarkCliHome(loginOpenId)) {
             doneLines.push(t('cmd.login.lark_status_yes', undefined, loc));
           }
-          const bytedPending = pendingBytedcliChallenge(loginOpenId);
+          const bytedPending = bytedcliPlatformOnly ? null : pendingBytedcliChallenge(loginOpenId);
           if (bytedPending) {
             const { state, detail } = await completeBytedcliLogin(loginOpenId, bytedPending);
             doneLines.push(state === 'authorized'
@@ -5038,7 +5292,7 @@ export async function handleCommand(
                 : state === 'unavailable'
                   ? t('cmd.login.bytedcli_unavailable', undefined, loc)
                   : t('cmd.login.bytedcli_failed', { detail: detail ?? 'unknown' }, loc));
-          } else {
+          } else if (!bytedcliPlatformOnly) {
             const status = await bytedcliLoginStatus(loginOpenId);
             if (status === 'authorized') doneLines.push(t('cmd.login.bytedcli_status_yes', undefined, loc));
             else if (status === 'unavailable') doneLines.push(t('cmd.login.bytedcli_unavailable', undefined, loc));
@@ -5050,9 +5304,11 @@ export async function handleCommand(
 
         // `/login lark` — lark-cli device-code (QR) authorization against the
         // provisioned per-person issuer app. Non-blocking: returns a verify URL.
-        if (subCmd === 'lark' || subCmd.startsWith('lark ')) {
+        if (wantsLark || (larkGoverned && subCmd === '' && !localBytedcliAlongsidePlatform)) {
           if (loginOpenId) {
+            if (!loginSourceStillCurrent('lark-user')) { await replyPolicyChanged(); break; }
             const started = await beginLarkCliLogin(loginOpenId);
+            if (!loginSourceStillCurrent('lark-user')) { await replyPolicyChanged(); break; }
             if (!started) {
               await sessionReply(rootId, t('cmd.login.lark_begin_failed', { detail: 'lark-cli has no provisioned issuer app on the server' }, loc));
               break;
@@ -5073,36 +5329,14 @@ export async function handleCommand(
           break;
         }
 
-        // When trigger-user auth governs lark-cli, the bare `/login` goes through
-        // the device-code flow (per-person HOME), not the per-bot web OAuth.
-        const larkDeviceOn = triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli');
-        if (larkDeviceOn && subCmd === '') {
-          if (loginOpenId) {
-            const started = await beginLarkCliLogin(loginOpenId);
-            if (!started) {
-              await sessionReply(rootId, t('cmd.login.lark_begin_failed', { detail: 'no provisioned issuer app' }, loc));
-              break;
-            }
-            await authLinkReply([
-              t('cmd.login.lark_title', undefined, loc), '',
-              t('cmd.login.lark_step1', undefined, loc),
-              started.authUrl, '',
-              t('cmd.login.lark_step2', undefined, loc), '',
-              t('cmd.login.lark_note', undefined, loc),
-            ].join('\n'));
-          } else {
-            await sessionReply(rootId, t('cmd.login.no_credentials', undefined, loc));
-          }
-          break;
-        }
-
-        // `/login --scope a b c` —— 在默认 scope 之外追加申请。
+        // `/login --scope a b c` —— 给使用本机器人应用的 BotMux 功能追加授权。
+        // 受管 CLI 通过 `botmux auth request` 按其配置的凭据来源申请。
         //
         // 飞书被拒时会返回结构化的 missing_scopes（99991679），所以「缺什么补什么」
         // 不需要猜：把它报的名字原样传进来即可。默认集只覆盖消息/资源和续期，
         // 文档、通讯录和写操作等权限走这条路显式申请——让人在授权页上看见自己批准的到底是什么。
         //
-        // 名字对着 lark-scopes.json 校验：拼错不会降级，会让整个授权链接 20043 失败，
+        // 名字对着内置清单和当前 bot 的追加用户态权限校验，避免拼错使整个授权链接 20043 失败。
         const loginTokens = subCmd.split(/[\s,]+/).filter(Boolean);
         const hasScopeFlag = loginTokens.some(t => t === '--scope' || t === 'scope');
         const hasForce = loginTokens.some(t => t === '--force' || t === '--allow-unknown');
@@ -5113,7 +5347,10 @@ export async function handleCommand(
             await sessionReply(rootId, t('cmd.login.scope_usage', undefined, loc));
             break;
           }
-          const unknown = requested.filter(x => !isKnownLarkUserScope(x, { allowUnknown: hasForce }));
+          const unknown = await unknownLarkUserScopes(requested, {
+            bot: botCfg2,
+            allowUnknown: hasForce,
+          });
           if (unknown.length) {
             await sessionReply(rootId, t('cmd.login.scope_unknown', { scopes: unknown.join(' ') }, loc));
             break;
@@ -5138,10 +5375,9 @@ export async function handleCommand(
         //
         // 分两步而不是一步等：设备码流程要人去点链接，阻塞等待会把会话卡住，所以
         // `--begin` 拿链接先回，人点完再发 `done` 收尾。
-        if (subCmd === 'bytedcli' || subCmd.startsWith('bytedcli ')) {
+        if (wantsBytedcli || localBytedcliAlongsidePlatform) {
           if (!loginOpenId) { await sessionReply(rootId, t('cmd.login.no_credentials', undefined, loc)); break; }
-          const done = subCmd.slice('bytedcli'.length).trim();
-          if (done === 'done' || done === '完成') {
+          if (bytedcliDone) {
             const challenge = pendingBytedcliChallenge(loginOpenId);
             if (!challenge) {
               await sessionReply(rootId, t('cmd.login.bytedcli_no_challenge', undefined, loc));
@@ -5164,9 +5400,11 @@ export async function handleCommand(
           const alreadyAuthorized = (pendingChallenge
             && (await completeBytedcliLogin(loginOpenId, pendingChallenge)).state === 'authorized')
             || (await describeBytedcliAuth(loginOpenId)).state === 'authorized';
+          if (!loginSourceStillCurrent('bytecloud')) { await replyPolicyChanged(); break; }
           // Newer bytedcli also answers `--begin` with the login it already
           // holds instead of a link: that is success, not a failure to start.
           const started = alreadyAuthorized ? { state: 'authorized' as const } : await startBytedcliLogin(loginOpenId);
+          if (!loginSourceStillCurrent('bytecloud')) { await replyPolicyChanged(); break; }
           if (started.state === 'authorized') {
             await sessionReply(rootId, bytedcliLoginSuccessReply(botCfg2, loc, 'cmd.login.bytedcli_already'));
             break;
@@ -5203,6 +5441,10 @@ export async function handleCommand(
             '',
             t('cmd.login.tags_footer', undefined, loc),
           ].join('\n'));
+          break;
+        }
+        if (larkPlatformOnly) {
+          await sessionReply(rootId, t('cmd.login.provider_usage', undefined, loc));
           break;
         }
         const { authUrl } = generateAuthUrl(
@@ -6096,15 +6338,17 @@ export async function handleCommand(
 
       case '/group':
       case '/g': {
+        const replyError = (msg: string) =>
+          replyGroupCardOrText(sessionReply, rootId, buildGroupErrorCard(msg, loc), msg, logTag);
         const creatorAppId = larkAppId ?? ds?.larkAppId;
         if (!creatorAppId) {
-          await sessionReply(rootId, t('cmd.group.no_bot', undefined, loc));
+          await replyError(t('cmd.group.no_bot', undefined, loc));
           break;
         }
 
         const senderOpenId = message.senderId;
         if (!senderOpenId) {
-          await sessionReply(rootId, t('cmd.group.no_sender', undefined, loc));
+          await replyError(t('cmd.group.no_sender', undefined, loc));
           break;
         }
 
@@ -6137,7 +6381,7 @@ export async function handleCommand(
         // which would let every @-mentioned bot create its own group.
         if (knownBotNames.size === 0 && mentions.some(m => !!m.name)) {
           logger.warn(`[${logTag}] /group: global bot registry empty (bots-info.json missing/corrupt); cannot elect a creator`);
-          await sessionReply(rootId, t('cmd.group.resolve_failed', undefined, loc));
+          await replyError(t('cmd.group.resolve_failed', undefined, loc));
           break;
         }
 
@@ -6168,7 +6412,7 @@ export async function handleCommand(
           // group (which would let every mentioned bot create one).
           if (!sourceChatId) {
             logger.warn(`[${logTag}] /group: missing source chatId, cannot resolve @-mentioned bots`);
-            await sessionReply(rootId, t('cmd.group.resolve_failed', undefined, loc));
+            await replyError(t('cmd.group.resolve_failed', undefined, loc));
             break;
           }
           let members: Awaited<ReturnType<typeof listChatBotMembers>> = [];
@@ -6194,7 +6438,7 @@ export async function handleCommand(
           }
           if (unresolved) {
             logger.warn(`[${logTag}] /group: could not resolve @-mentioned bot "${unresolved}" to an app id; aborting`);
-            await sessionReply(rootId, t('cmd.group.resolve_failed', undefined, loc));
+            await replyError(t('cmd.group.resolve_failed', undefined, loc));
             break;
           }
         }
@@ -6225,24 +6469,89 @@ export async function handleCommand(
             configuredAgentIds = resolveGroupCreationAgents(groupArgs.agents, configs, bots);
           }
         } catch (err: any) {
-          await sessionReply(rootId, t('cmd.group.invalid_options', { reason: err?.message ?? String(err) }, loc));
+          await replyError(t('cmd.group.invalid_options', { reason: err?.message ?? String(err) }, loc));
           break;
         }
         const { roleProfileId } = groupArgs;
         if (roleProfileId && !isValidRoleProfileId(roleProfileId)) {
-          await sessionReply(rootId, t('role.profile.invalid', undefined, loc));
+          await replyError(t('role.profile.invalid', undefined, loc));
           break;
         }
         // Task mode is opt-in (`--start`, or groupCreation.autoStart: true
         // without `--no-start`): the chat is named from the text and this bot
         // starts a fresh session there; a quoted message may carry the whole
         // task. Otherwise `/g <text>` keeps its released meaning — a plain
-        // group named <text> — and a bare `/g` is titled from its first message.
+        // group named <text> — and a bare `/g` is titled from its first message
+        // (unless `groupCreation.card: true` or `--card` asks for the form card).
         const taskMode = groupArgs.autoStart === true;
         const taskText = taskMode ? groupArgs.body : '';
         const quoteId = taskMode ? groupTaskQuoteId(message) : undefined;
         const autoStart = !!taskText || !!quoteId;
-        const commandAttachments = taskMode ? groupTaskPromptAttachments(message) : [];
+        const larkAppIdsForGroup = [...new Set([creatorAppId, ...mentionedBotAppIds, ...configuredAgentIds])];
+
+        const cardDecision = shouldOpenGroupCreateCard(groupArgs, { autoStart });
+        if (cardDecision === 'conflict_with_start') {
+          await replyError(t('cmd.group.card_start_conflict', undefined, loc));
+          break;
+        }
+        if (cardDecision === 'card') {
+          // The form lives in this process's memory and card callbacks are
+          // delivered to a random primary replica; opening it there would make
+          // every callback that lands on another replica fail as "expired".
+          // Fail closed with a command-line downgrade until form state is shared
+          // (mirrors the /close and /dismiss primary guards).
+          if (coordinationModeIsPrimary()) {
+            await replyError(t('cmd.group.card_primary_unsupported', undefined, loc));
+            break;
+          }
+          const prefillCheck = await validateGroupDirAndBranch(groupArgs, { requireDirForBranch: false, loc });
+          if (!prefillCheck.ok) {
+            await replyError(prefillCheck.error);
+            break;
+          }
+          const form = openGroupCreateForm({
+            creatorAppId,
+            senderOpenId,
+            rootId,
+            sourceChatId: message.chatId ?? '',
+            sourceChatType: message.chatType === 'p2p' ? 'p2p' : 'group',
+            sourceCommand: cmd,
+            larkAppIdsForGroup,
+            groupArgs: { ...groupArgs, workingDir: prefillCheck.workingDir },
+            appIdToName: Object.fromEntries(appIdToName),
+            selectedDir: prefillCheck.workingDir,
+          });
+          await sessionReply(rootId, buildGroupCreateCard(form, groupCreateDirOptions(creatorAppId), loc), 'interactive');
+          break;
+        }
+
+        const dirBranchCheck = await validateGroupDirAndBranch(groupArgs, { requireDirForBranch: true, loc });
+        if (!dirBranchCheck.ok) {
+          await replyError(dirBranchCheck.error);
+          break;
+        }
+
+        if (!autoStart) {
+          const created = await createSlashGroup({
+            creatorAppId,
+            senderOpenId,
+            groupArgs: { ...groupArgs, workingDir: dirBranchCheck.workingDir },
+            larkAppIdsForGroup,
+            appIdToName,
+            loc,
+            logTag,
+          });
+          await replyGroupCardOrText(
+            sessionReply,
+            rootId,
+            buildGroupCreatedCard(created, loc),
+            slashGroupReceiptText(created, loc),
+            logTag,
+          );
+          break;
+        }
+
+        const commandAttachments = groupTaskPromptAttachments(message);
         let quotedTask: { text: string; attachments: GroupTaskPromptAttachment[] } | undefined;
         let quotedTaskPromise: Promise<{ text: string; attachments: GroupTaskPromptAttachment[] }> | undefined;
         const loadQuotedTask = () => quotedTaskPromise ??= quotedMessageTask(creatorAppId, quoteId!);
@@ -6259,24 +6568,22 @@ export async function handleCommand(
         // prompt behind that boundary, run prompt.submit and charge quota before
         // any external side effect. A false refusal is already reported (or
         // deliberately silent) by the gate.
-        if (autoStart) {
-          try {
-            if (deps.admitTaskPrompt && !await deps.admitTaskPrompt({
-              larkAppId: creatorAppId, message, anchor: rootId, content: taskText, resolvePrompt,
-            })) break;
-            // Direct handler callers without an admission hook still need the
-            // title seed; production resolves and caches it inside the gate.
-            if (quoteId && !quotedTask) quotedTask = await loadQuotedTask();
-          } catch (err: any) {
-            logger.warn(`[${logTag}] /group task admission failed before chat creation: ${err?.message ?? err}`);
-            await sessionReply(rootId, quoteId
-              ? t('cmd.group.quote_read_failed', undefined, loc)
-              : t('cmd.group.failed', { error: err?.message ?? String(err) }, loc));
-            break;
-          }
+        try {
+          if (deps.admitTaskPrompt && !await deps.admitTaskPrompt({
+            larkAppId: creatorAppId, message, anchor: rootId, content: taskText, resolvePrompt,
+          })) break;
+          // Direct handler callers without an admission hook still need the
+          // title seed; production resolves and caches it inside the gate.
+          if (quoteId && !quotedTask) quotedTask = await loadQuotedTask();
+        } catch (err: any) {
+          logger.warn(`[${logTag}] /group task admission failed before chat creation: ${err?.message ?? err}`);
+          await replyError(quoteId
+            ? t('cmd.group.quote_read_failed', undefined, loc)
+            : t('cmd.group.failed', { error: err?.message ?? String(err) }, loc));
+          break;
         }
-        const titleSeed = autoStart ? taskText || quotedTask?.text || '' : '';
-        const firstLine = autoStart ? groupTaskPlaceholder(titleSeed) : groupArgs.name;
+        const titleSeed = taskText || quotedTask?.text || '';
+        const firstLine = groupTaskPlaceholder(titleSeed);
         let baseGroupName: string;
         if (firstLine) {
           baseGroupName = firstLine;
@@ -6287,25 +6594,17 @@ export async function handleCommand(
         }
         const namePrefix = readGlobalConfig().groupNamePrefix;
         const groupName = formatSlashGroupName(baseGroupName, namePrefix);
-        // Unnamed groups are AI-titled from their first message, as session
-        // groups are. The title needs a one-shot print mode of this bot's CLI
-        // and an unsandboxed bot (the call runs on the host); otherwise the
-        // placeholder simply stays (same silent degrade).
+        // Task groups are AI-titled from the task text when supported.
         const decorations = resolveGroupDecorations(groupArgs);
         const { oneShotTitleAllowed } = await import('../services/session-group-title.js');
-        const autoTitle = (autoStart ? !!titleSeed : decorations.autoTitle)
-          && oneShotTitleAllowed(getBot(creatorAppId).config);
-
-        // Bots to invite: every @-mentioned bot (creator filtered out internally
-        // by the service). Empty mentions → solo group (creator only).
-        const larkAppIdsForGroup = [...new Set([creatorAppId, ...mentionedBotAppIds, ...configuredAgentIds])];
+        const autoTitle = !!titleSeed && oneShotTitleAllowed(getBot(creatorAppId).config);
 
         let createdChatId: string | undefined;
         let reservedSessionId: string | undefined;
         let sourceReplyStarted = false;
         let taskPrompt = '';
         let taskSessionManager: typeof import('./session-manager.js') | undefined;
-        const taskSenderIsBot = autoStart && groupTaskSenderIsBot(
+        const taskSenderIsBot = groupTaskSenderIsBot(
           message,
           getBot(creatorAppId).botOpenId,
           isKnownPeerBot(config.session.dataDir, creatorAppId, senderOpenId),
@@ -6340,19 +6639,25 @@ export async function handleCommand(
           ...(taskStart.forwardFailed.length ? [t('cmd.group.forward_failed', undefined, loc)] : []),
         ];
 
+        let dirSetup: PreparedGroupWorkingDir = {};
+        let taskBindingError: string | undefined;
         try {
+          dirSetup = await prepareGroupWorkingDir({
+            workingDir: dirBranchCheck.workingDir,
+            branch: groupArgs.branch,
+            creatorAppId,
+            loc,
+          });
           const { createGroupWithBots } = await import('../services/group-creator.js');
           const { registerGroupAutoTitle, scheduleGroupAutoTitle } = await import('../services/group-auto-title.js');
-          if (autoStart) {
-            taskSessionManager = await import('./session-manager.js');
-            const chatName = message.chatType === 'p2p' || !sourceChatId
-              ? undefined
-              : (await getChatName(creatorAppId, sourceChatId)) ?? undefined;
-            taskPrompt = groupTaskPrompt({
-              chatId: sourceChatId ?? '', chatType: message.chatType, chatName, messageId: message.messageId,
-              threadId: message.threadId, rootId: message.rootId, parentId: quoteId, task: taskText,
-            }, loc);
-          }
+          taskSessionManager = await import('./session-manager.js');
+          const chatName = message.chatType === 'p2p' || !sourceChatId
+            ? undefined
+            : (await getChatName(creatorAppId, sourceChatId)) ?? undefined;
+          taskPrompt = groupTaskPrompt({
+            chatId: sourceChatId ?? '', chatType: message.chatType, chatName, messageId: message.messageId,
+            threadId: message.threadId, rootId: message.rootId, parentId: quoteId, task: taskText,
+          }, loc);
           // Settles when createGroupWithBots returns or throws, i.e. after its
           // initial avatar; a fast AI title waits on it before re-rendering.
           let settleDecorations!: () => void;
@@ -6367,58 +6672,64 @@ export async function handleCommand(
             roleProfileId,
             // A task group is worked on by its bots together; let them @ each
             // other without approval, as `botmux create-group` does.
-            ...(autoStart ? {
-              ensureBotCollaboration: ensureLocalGroupBotCollaboration,
-              deferUserInvites: true as const,
-            } : {}),
+            ensureBotCollaboration: ensureLocalGroupBotCollaboration,
+            deferUserInvites: true as const,
             ...((groupArgs.tag || decorations.avatar) ? {
               customization: { tag: groupArgs.tag, avatar: decorations.avatar, userOpenId: senderOpenId },
             } : {}),
-            // Reserve the original task at the durable chat boundary, BEFORE
-            // deferred user invites. A fast first message then joins this queued
-            // opening instead of winning session_exists and losing the task.
-            ...((autoTitle || autoStart) ? {
-              onChatCreated: async (chatId: string) => {
-                createdChatId = chatId;
-                if (autoTitle) registerGroupAutoTitle(creatorAppId, chatId, {
-                  placeholderName: groupName,
-                  namePrefix: namePrefix || undefined,
-                  nameAvatar: decorations.avatar === 'name' || undefined,
-                }, decorationsSettled);
-                if (autoStart) {
-                  const reserved = await withBotTurnAdmission(creatorAppId,
-                    () => taskSessionManager!.spawnDashboardSession(activeSessions, undefined, {
-                      larkAppId: creatorAppId, chatId, content: taskPrompt, column: 'backlog', role: 'solo', title: groupName,
-                      postBanner: false,
-                      ownerOpenId: taskSenderIsBot ? null : senderOpenId,
-                      ownerUnionId: taskSenderIsBot ? undefined : message.senderUnionId,
-                      creatorOpenId: senderOpenId,
-                    }));
-                  if (!reserved.ok) throw new Error(reserved.error);
-                  reservedSessionId = reserved.sessionId;
+            // Record any bound directory and reserve the original task at the
+            // durable chat boundary, BEFORE deferred user invites.
+            onChatCreated: async (chatId: string) => {
+              createdChatId = chatId;
+              if (dirSetup.workingDir) {
+                // Auxiliary local state must not abort the created chat or the
+                // task reservation below; degrade to a receipt hint.
+                try {
+                  recordCreatedGroup({
+                    chatId,
+                    creatorAppId,
+                    ownerOpenId: senderOpenId,
+                    workingDir: dirSetup.workingDir,
+                    repository: dirSetup.repository,
+                    branch: dirSetup.branch,
+                  });
+                } catch (e: any) {
+                  taskBindingError = e?.message ?? String(e);
+                  logger.warn(`[${logTag}] /group task created-groups bind failed for ${chatId}: ${taskBindingError}`);
                 }
-              },
-            } : {}),
+              }
+              if (autoTitle) registerGroupAutoTitle(creatorAppId, chatId, {
+                placeholderName: groupName,
+                namePrefix: namePrefix || undefined,
+                nameAvatar: decorations.avatar === 'name' || undefined,
+              }, decorationsSettled);
+              const reserved = await withBotTurnAdmission(creatorAppId,
+                () => taskSessionManager!.spawnDashboardSession(activeSessions, undefined, {
+                  larkAppId: creatorAppId, chatId, content: taskPrompt, column: 'backlog', role: 'solo', title: groupName,
+                  postBanner: false,
+                  ownerOpenId: taskSenderIsBot ? null : senderOpenId,
+                  ownerUnionId: taskSenderIsBot ? undefined : message.senderUnionId,
+                  creatorOpenId: senderOpenId,
+                }));
+              if (!reserved.ok) throw new Error(reserved.error);
+              reservedSessionId = reserved.sessionId;
+            },
           }).finally(settleDecorations);
           // Prefer the shareable join link (others can click to *join*); fall
           // back to the member-only applink URL when Lark's link API failed.
           const applink = chatAppLink(result.chatId, normalizeBrand(getBot(creatorAppId).config.brand));
           const link = result.shareLink ?? applink;
-          // Partial failures are non-fatal — the chat exists; surface them as
-          // hints so the user knows whether to expect to be auto-invited.
-          let taskStart: GroupTaskStartResult | undefined;
-          if (autoStart) {
-            if (autoTitle) scheduleGroupAutoTitle({ larkAppId: creatorAppId, chatId: result.chatId, userText: titleSeed });
-            taskStart = await runReservedTask(result.chatId);
-            const pendingSetup = activeSessions.get(sessionKey(result.chatId, creatorAppId))?.session.pendingRepoSetup;
-            if (!taskStart.startError && activeSessions.get(sessionKey(result.chatId, creatorAppId))?.pendingRepo) {
-              taskStart.pendingRepo = pendingSetup?.mode ?? 'picker';
-            }
-            logger.info(`[${logTag}] /group task chat=${result.chatId} forwardFailed=${taskStart.forwardFailed.length} startError=${taskStart.startError ?? '-'}`);
+          if (autoTitle) scheduleGroupAutoTitle({ larkAppId: creatorAppId, chatId: result.chatId, userText: titleSeed });
+          const taskStart = await runReservedTask(result.chatId);
+          const pendingSetup = activeSessions.get(sessionKey(result.chatId, creatorAppId))?.session.pendingRepoSetup;
+          if (!taskStart.startError && activeSessions.get(sessionKey(result.chatId, creatorAppId))?.pendingRepo) {
+            taskStart.pendingRepo = pendingSetup?.mode ?? 'picker';
           }
+          logger.info(`[${logTag}] /group task chat=${result.chatId} forwardFailed=${taskStart.forwardFailed.length} startError=${taskStart.startError ?? '-'}`);
           const hints: string[] = [];
-          if (autoTitle) hints.push(t(autoStart ? 'cmd.group.auto_title_task' : 'cmd.group.auto_title_pending', undefined, loc));
-          if (taskStart) hints.push(...taskStartHints(taskStart));
+          if (autoTitle) hints.push(t('cmd.group.auto_title_task', undefined, loc));
+          if (taskBindingError) hints.push(t('card.group_create.binding_failed', { error: taskBindingError }, loc));
+          hints.push(...taskStartHints(taskStart));
           if (result.collaborationError) hints.push(t('cmd.group.collaboration_failed', { reason: result.collaborationError }, loc));
           if (result.customization?.avatarError) hints.push(t('cmd.group.avatar_failed', { reason: result.customization.avatarError }, loc));
           if (result.customization?.tagError) hints.push(t('cmd.group.tag_failed', { reason: result.customization.tagError }, loc));
@@ -6427,16 +6738,10 @@ export async function handleCommand(
           } else if (result.transferError) {
             hints.push(t('cmd.group.warn_transfer_failed', { reason: result.transferError }, loc));
           }
-          // Share-link fetch failed → the displayed link is the member-only
-          // applink; warn the user so they don't expect non-members to join via it.
           if (!result.shareLink && result.shareLinkError) {
             logger.warn(`[${logTag}] /group share-link unavailable, using applink: ${result.shareLinkError}`);
             hints.push(t('cmd.group.warn_share_link_failed', undefined, loc));
           }
-          // List every bot in the new group (creator included), and warn about
-          // any Feishu rejected. Names come from the chat roster (members) since
-          // getBot() only knows this process's own bot in the one-daemon-per-bot
-          // model; fall back to the registry/raw id for anything not in the map.
           const nameOf = (id: string) => appIdToName.get(id) ?? botDisplayName(id);
           const groupBotIds = larkAppIdsForGroup.filter(id => !result.invalidBotIds.includes(id));
           if (groupBotIds.length > 1) {
@@ -6452,20 +6757,33 @@ export async function handleCommand(
               hints.push(t('cmd.group.role_profile_bootstrap_sent', { profile: roleProfileId }, loc));
             }
           }
-          const hintsText = hints.length > 0 ? '\n' + hints.join('\n') : '';
+          const taskReceipt: SlashGroupCreationResult = {
+            ok: true,
+            name: groupName,
+            link,
+            workingDir: dirSetup.workingDir,
+            branch: dirSetup.branch,
+            started: true,
+            hints,
+          };
           sourceReplyStarted = true;
-          await sessionReply(rootId, t(autoStart ? 'cmd.group.started' : 'cmd.group.created', { name: groupName, link, hints: hintsText }, loc));
-          logger.info(`[${logTag}] /group created chat=${result.chatId} name="${groupName}" bots=[${larkAppIdsForGroup.join(',')}] invitee=${senderOpenId} autoTitle=${autoTitle} avatar=${decorations.avatar ?? '-'}`);
-          // Outside task mode there is intentionally NO auto-bootstrap
-          // (repo-select card / chat-scope session): a group name rarely
-          // carries enough context to seed a useful prompt. The user starts a
-          // real conversation in the new group, which spawns the session.
+          await replyGroupCardOrText(
+            sessionReply,
+            rootId,
+            buildGroupCreatedCard(taskReceipt, loc),
+            slashGroupReceiptText(taskReceipt, loc),
+            logTag,
+          );
+          logger.info(`[${logTag}] /group created chat=${result.chatId} name="${groupName}" bots=[${larkAppIdsForGroup.join(',')}] invitee=${senderOpenId} autoTitle=${autoTitle} avatar=${decorations.avatar ?? '-'} dir=${dirSetup.workingDir ?? '-'}`);
         } catch (err: any) {
           logger.error(`[${logTag}] /group failed: ${err?.message ?? err}`);
           // A source-reply failure is not a setup failure. Do not re-run
           // forwarding/activation or send a second, contradictory receipt.
           if (sourceReplyStarted) throw err;
-          if (autoStart && createdChatId) {
+          if (!createdChatId && dirSetup.createdWorktree && !dirSetup.createdWorktree.reused && dirSetup.repository) {
+            removeRepoWorktree(dirSetup.repository, dirSetup.createdWorktree.path).catch(() => {});
+          }
+          if (createdChatId) {
             const chatId = createdChatId;
             const link = chatAppLink(chatId, normalizeBrand(getBot(creatorAppId).config.brand));
             if (reservedSessionId) {
@@ -6476,16 +6794,49 @@ export async function handleCommand(
                 t('cmd.group.setup_failed', { reason: err?.message ?? String(err) }, loc),
                 ...taskStartHints(taskStart),
               ];
-              await sessionReply(rootId, t('cmd.group.started', {
-                name: groupName, link, hints: `\n${hints.join('\n')}`,
-              }, loc));
+              const recoveryReceipt: SlashGroupCreationResult = {
+                ok: true,
+                name: groupName,
+                link,
+                workingDir: dirSetup.workingDir,
+                branch: dirSetup.branch,
+                started: true,
+                hints,
+              };
+              await replyGroupCardOrText(
+                sessionReply,
+                rootId,
+                buildGroupCreatedCard(recoveryReceipt, loc),
+                slashGroupReceiptText(recoveryReceipt, loc),
+                logTag,
+              );
             } else {
-              await sessionReply(rootId, t('cmd.group.reservation_failed', {
-                name: groupName, reason: err?.message ?? String(err), link,
-              }, loc));
+              const reservationReceipt: SlashGroupCreationResult = {
+                ok: true,
+                name: groupName,
+                link,
+                workingDir: dirSetup.workingDir,
+                branch: dirSetup.branch,
+                reservationFailedReason: err?.message ?? String(err),
+                hints: [],
+              };
+              await replyGroupCardOrText(
+                sessionReply,
+                rootId,
+                buildGroupCreatedCard(reservationReceipt, loc),
+                slashGroupReceiptText(reservationReceipt, loc),
+                logTag,
+              );
             }
           } else {
-            await sessionReply(rootId, t('cmd.group.failed', { error: err?.message ?? String(err) }, loc));
+            const failedReceipt: SlashGroupCreationResult = { ok: false, error: err?.message ?? String(err) };
+            await replyGroupCardOrText(
+              sessionReply,
+              rootId,
+              buildGroupCreatedCard(failedReceipt, loc),
+              slashGroupReceiptText(failedReceipt, loc),
+              logTag,
+            );
           }
         }
         break;

@@ -649,6 +649,11 @@ describe('drainTraexRollout', () => {
     appendFileSync(path, line(canonicalCompletion(input.payload.item, input.timestamp))
       + line({ ...taskComplete('alerts are clear'), timestamp: '2000-01-01T00:05:00.000Z' }));
     queue.ingest(drainTraexRollout(path, started.newOffset).events);
+    expect(queue.peek()[0]).toMatchObject({
+      provisionalTaskStartedAtMs: undefined,
+      nativeUserProof: { timestampMs: Date.parse(input.timestamp) },
+    });
+    expect(queue.peek()[0]?.nativeUserProof?.uuid).toEqual(expect.any(String));
     expect(queue.drainEmittable()).toEqual([
       expect.objectContaining({ turnId: 'remote-turn', finalText: 'alerts are clear' }),
     ]);

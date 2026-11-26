@@ -86,6 +86,8 @@ export function createExplicitAskContinuation(deps: {
   invalidate?: (input: CreateAskInput, reason: string) => void;
   retire?: (input: CreateAskInput, reason: string) => AskResult | undefined;
   canRetire?: (receipt: ExplicitAskReceipt) => boolean;
+  resolveCardRoot?: (receipt: ExplicitAskReceipt) => string | undefined;
+  hydrateCardRoot?: (input: CreateAskInput, cardRootMessageId: string) => void;
   snapshot?: (input: CreateAskInput) => {
     askId: string;
     cardMessageId?: string;
@@ -189,7 +191,12 @@ export function createExplicitAskContinuation(deps: {
     }
     if (original?.result) return Promise.resolve(original.result);
     const joined = running.get(key);
-    if (joined) return joined;
+    if (joined) {
+      if (original && presentation?.cardRootMessageId) {
+        deps.hydrateCardRoot?.(original.input, presentation.cardRootMessageId);
+      }
+      return joined;
+    }
     if (original && deps.hasHandoff && !deps.hasHandoff(input)) {
       const result = handoffMissing();
       write(key, { ...original, result, settledAt: now() });
@@ -197,7 +204,10 @@ export function createExplicitAskContinuation(deps: {
     }
     if (!original) write(key, { version: 1, input, ...(origin ? { origin } : {}) });
     const frozenInput = original?.input ?? input;
-    const promise = deps.register(original ? frozenInput : { ...frozenInput, ...presentation }).then(result => {
+    const registerInput = original
+      ? (presentation?.cardRootMessageId ? { ...frozenInput, cardRootMessageId: presentation.cardRootMessageId } : frozenInput)
+      : { ...frozenInput, ...presentation };
+    const promise = deps.register(registerInput).then(result => {
       const receipt = read(key)!;
       write(key, withCard({ ...receipt, result: receipt.result ?? result, settledAt: receipt.settledAt ?? now() }));
       deps.releaseHandoff?.(frozenInput);
@@ -272,7 +282,8 @@ export function createExplicitAskContinuation(deps: {
             // Restore only existing, still-bound sessions. Never create a session
             // or revive a closed business task to recover an interaction.
             if (deps.canResume(receipt) && !running.has(key)) {
-              void wait(receipt.input).catch(deps.onError);
+              const cardRoot = deps.resolveCardRoot?.(receipt);
+              void wait(receipt.input, undefined, cardRoot ? { cardRootMessageId: cardRoot } : undefined).catch(deps.onError);
             }
             continue;
           }

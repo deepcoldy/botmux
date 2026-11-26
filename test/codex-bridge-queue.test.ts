@@ -1159,6 +1159,60 @@ describe('CodexBridgeQueue', () => {
     expect(q.pruneExpiredPreStartHeads().map(turn => turn.turnId)).toEqual(['queued-bare']);
   });
 
+  it('re-anchors busy-refresh caps and multi-follow-up leases when a >120s predecessor finishes', () => {
+    let now = 0;
+    const q = new CodexBridgeQueue(() => now);
+
+    // Predecessor turn 1 starts at t=0 and runs for 180s (exceeding the 120s cap).
+    q.mark('turn-1', 'long predecessor task', 0);
+    q.ingest([userEv('long predecessor task', 'u-turn-1', 10)]);
+
+    // Two type-ahead follow-ups arrive at t=10s and t=40s while turn 1 is busy.
+    now = 10_000;
+    q.mark('followup-1', 'first queued follow-up', now);
+    q.beginSubmitVerification('followup-1', now);
+    q.finishSubmitVerification('followup-1', now + 500);
+
+    now = 40_000;
+    q.mark('followup-2', 'second queued follow-up', now);
+    q.beginSubmitVerification('followup-2', now);
+    q.finishSubmitVerification('followup-2', now + 500);
+
+    // Turn 1 completes at t=180s. Both follow-ups waited >120s behind turn 1,
+    // so hand-off must refresh BOTH leases and re-anchor maxSinceMarkMs to 180s.
+    now = 180_000;
+    q.ingest([asstEv('turn 1 answer', 'a-turn-1', now)]);
+    expect(q.drainEmittable().map(t => t.turnId)).toEqual(['turn-1']);
+
+    // Cursor auto-dequeues followup-1, thinking 45s before flushing its user line.
+    for (now = 181_000; now <= 225_000; now += 1_000) {
+      expect(q.refreshUnstartedHeadAttributionLease(now, 120_000)).toBe(2);
+      expect(q.pruneExpiredPreStartHeads(now)).toEqual([]);
+    }
+
+    // followup-1 user line flushes at 225.5s and completes at 310s.
+    now = 225_500;
+    q.ingest([userEv('first queued follow-up', 'u-f1', now)]);
+    now = 310_000;
+    q.ingest([asstEv('followup 1 answer', 'a-f1', now)]);
+    expect(q.drainEmittable().map(t => t.turnId)).toEqual(['followup-1']);
+
+    // followup-2 now gets its own fresh 120s window anchored at 310s.
+    for (now = 311_000; now <= 345_000; now += 1_000) {
+      expect(q.refreshUnstartedHeadAttributionLease(now, 120_000)).toBe(1);
+      expect(q.pruneExpiredPreStartHeads(now)).toEqual([]);
+    }
+
+    // Hard cap still holds from the hand-off edge if a head never starts.
+    expect(q.refreshUnstartedHeadAttributionLease(310_000 + 120_001, 120_000)).toBe(0);
+
+    now = 345_500;
+    q.ingest([userEv('second queued follow-up', 'u-f2', now)]);
+    now = 360_000;
+    q.ingest([asstEv('followup 2 answer', 'a-f2', now)]);
+    expect(q.drainEmittable().map(t => t.turnId)).toEqual(['followup-2']);
+  });
+
   it('keeps status queries pure when pruning would replay a complete buffered successor', () => {
     let now = 19_000;
     const q = new CodexBridgeQueue(() => now);

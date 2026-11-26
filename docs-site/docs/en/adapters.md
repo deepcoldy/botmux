@@ -152,6 +152,10 @@ In the Dashboard, switch "Codex Runtime" to "Custom Compatible" and fill in the 
 
 For all fields and update sources see [the Codex-compatible distributions section of `bots.json`](/en/bots-json#codex-runtime). The older `cliPathOverride` setup keeps working, but it does not turn on Codex RPC features that require an explicit compatibility declaration.
 
+### Codex multi-account instance pools {#codex-instances}
+
+One bot can use `codexInstancePool` to configure multiple Codex login homes and assign them to ordinary new sessions with static weights. Follow-up messages, retries, and cold restores keep the saved instance instead of drawing again. See [Session-level Codex instances](https://github.com/deepcoldy/botmux/blob/master/docs/codex-instances.md) (Chinese) for configuration limits, initialization and login commands, and recovery semantics.
+
 ## API / remote adapters {#remote-agents}
 
 The agents behind these four adapters don't run in a local terminal. `riff`, `mojo` and `remote-runner` are paired with the session backend of the same name automatically, so you don't need to set `backendType`.

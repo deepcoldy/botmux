@@ -433,6 +433,8 @@ export interface CardUsageSnapshot {
     choices: readonly import('../../services/codex-reasoning-effort.js').CodexReasoningEffort[];
     selected?: string;
     pending: boolean;
+    /** Claude's session-only setting is applied by the next CLI launch. */
+    claude?: { model: string; disabledBy?: 'env' | 'startup' };
   };
   /** Frozen TraeX backend variant selected for this session. */
   modelBackendVariant?: string;

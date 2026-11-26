@@ -1,6 +1,6 @@
-import { resolveSessionModelPinView } from '../../core/session-model.js';
+import { resolveSessionLaunchModel, resolveSessionModelPinView } from '../../core/session-model.js';
 import { modelPinText } from '../../core/model-pin.js';
-import { isConfigurableReasoningCliId, reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
+import { isCodexReasoningEffort, isConfigurableReasoningCliId, reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
 /** Model catalogue and picker shared by /models and the optional reply menu. */
 import type { DaemonSession } from '../../core/types.js';
 import { getBot, type BotConfig } from '../../bot-registry.js';
@@ -9,14 +9,15 @@ import { botAcceptsLaunchModel } from '../../core/launch-model-capability.js';
 import { createCliAdapterSync } from '../../adapters/cli/registry.js';
 import { staticModelChoices, detectModels, mergeModelChoices } from '../../services/model-catalog.js';
 import { modelCatalogProbeContext } from '../../dashboard/model-catalog-request.js';
-import { selectionKeyForBot } from '../../setup/cli-selection.js';
+import { isTtadkWrapper, lookupCliSelectionForBotShape, selectionKeyForBot, ttadkAcceptsModel } from '../../setup/cli-selection.js';
 import { t, type Locale } from '../../i18n/index.js';
 import { cliHasNoRawPassthroughSurface } from '../../core/passthrough-commands.js';
 import { canOperate } from './event-dispatcher.js';
-import { deliverEphemeralOrReply, isSessionTransferring, topicReasoningControl } from '../../core/worker-pool.js';
+import { deliverEphemeralOrReply, isSessionTransferring, sessionReasoningControl, sessionUsesClaudeCode, supportsClaudeSessionSettings, topicReasoningControl } from '../../core/worker-pool.js';
 import { readTraexModelLoads } from '../../services/traex-model-load.js';
 import { isRemoteBackendId } from '../../core/remote-cli-ids.js';
-import { DEFAULT_MODEL_VALUE_PATTERN } from '../../core/model-value-pattern.js';
+import { runtimePathOverride } from '../../adapters/cli/runtime.js';
+import { DEFAULT_MODEL_VALUE_PATTERN, MODEL_SLUG_PATTERN, isSessionModelPickerValue, limitModelOptions } from '../../core/model-value-pattern.js';
 
 export interface ModelPickerLoad {
   /** Missing entries and an unavailable query both mean unknown, never idle. */
@@ -28,17 +29,14 @@ async function pickerLoad(key: string, cfg: BotConfig, session?: DaemonSession):
   const unavailable = { loads: null, checkedAt: null };
   // Only a native local TraeX catalogue advertises load metadata. Do not
   // substitute a host account for a wrapper/remote/session-selected runtime.
-  const snapshot = session?.session.cliLaunchSnapshot;
   if (key !== 'traex' || cfg.wrapperCli || cfg.cliLaunchMode
-    || session?.session.wrapperCli || session?.session.cliLaunchMode || snapshot?.wrapperCli || snapshot?.cliLaunchMode
+    || (session && !sessionModelCatalogueContext(session, cfg).matchesBot)
     || isRemoteBackendId(session?.session.backendType ?? cfg.backendType ?? 'pty')) return unavailable;
   try {
     const probe = modelCatalogProbeContext(key, cfg, process.env);
     if (!probe.runtimeContext) return unavailable;
-    const executable = snapshot?.cliRuntime?.executable ?? snapshot?.cliPathOverride
-      ?? session?.session.cliPathOverride ?? probe.runtimeExecutable;
     const loads = await readTraexModelLoads({
-      cliBin: createCliAdapterSync('traex', executable ?? undefined).resolvedBin,
+      cliBin: createCliAdapterSync('traex', probe.runtimeExecutable).resolvedBin,
       env: probe.probeEnv,
       cwd: session?.session.workingDir,
       timeoutMs: 2_500,
@@ -68,9 +66,32 @@ function sessionCliId(ds: DaemonSession) {
   return ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
 }
 
-export const MODEL_SLUG_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
+function sessionModelCatalogueContext(ds: DaemonSession, bot: BotConfig) {
+  const session = ds.session;
+  const snapshot = session.cliLaunchSnapshot;
+  const launch = snapshot ?? session;
+  const cliId = launch.cliId ?? bot.cliId;
+  const inheritsLaunchShape = !snapshot && !session.agentFrozen && cliId === bot.cliId;
+  const wrapper = launch.wrapperCli ?? (inheritsLaunchShape ? bot.wrapperCli : undefined);
+  const launchMode = launch.cliLaunchMode ?? (inheritsLaunchShape ? bot.cliLaunchMode : undefined);
+  const botExecutable = bot.cliRuntime?.executable ?? bot.cliPathOverride;
+  const executable = launch.cliRuntime ? runtimePathOverride(launch.cliRuntime)
+    : launch.cliPathOverride ?? (inheritsLaunchShape ? botExecutable : undefined);
+  const configDir = session.cliConfigDir ?? (inheritsLaunchShape ? bot.cliConfigDir : undefined);
+  const key = selectionKeyForBot(cliId, wrapper, launchMode);
+  const matchesBot = !snapshot && !session.cliInstanceBinding && !session.existingAppServerEndpoint && cliId === bot.cliId
+    && (wrapper?.trim() || '') === (bot.wrapperCli?.trim() || '') && launchMode === bot.cliLaunchMode
+    && (!!wrapper || executable === botExecutable) && configDir === bot.cliConfigDir
+    && (session.codexProfile ?? undefined) === bot.codexProfile;
+  // A one-shot probe cannot target a per-session account/profile. Unknown
+  // launchers must not substitute the host's native CLI catalogue either.
+  const canProbe = !session.cliInstanceBinding && !session.existingAppServerEndpoint
+    && !session.codexProfile && !configDir && !!lookupCliSelectionForBotShape(cliId, wrapper, launchMode)
+    && (matchesBot || !executable);
+  return { key, matchesBot, canProbe };
+}
 
-export { DEFAULT_MODEL_VALUE_PATTERN };
+export { DEFAULT_MODEL_VALUE_PATTERN, MODEL_SLUG_PATTERN };
 
 /**
  * Resolve the model-catalogue selection for THIS session's frozen CLI shape.
@@ -81,16 +102,10 @@ export { DEFAULT_MODEL_VALUE_PATTERN };
  * derived through the same helper as the dashboard endpoint so the menu sees
  * exactly the runtime the session is running.
  */
-function resolveModelCatalogue(key: string, botConfig: BotConfig): {
-  key: string;
-  staticChoices: readonly string[];
-  detect: () => Promise<readonly string[] | null>;
-} {
-  const probe = modelCatalogProbeContext(key, botConfig, process.env);
-  return {
-    key,
-    staticChoices: staticModelChoices(key),
-    detect: () => detectModels(key, {
+async function detectPickerModels(key: string, botConfig: BotConfig | undefined): Promise<readonly string[] | null> {
+  try {
+    const probe = modelCatalogProbeContext(key, botConfig, process.env);
+    return await detectModels(key, {
       runtimeContext: probe.runtimeContext,
       probeEnv: probe.probeEnv,
       runtimeExecutable: probe.runtimeExecutable,
@@ -98,28 +113,59 @@ function resolveModelCatalogue(key: string, botConfig: BotConfig): {
         requestedCliId,
         requestedCliId === probe.cliId ? probe.runtimeExecutable : undefined,
       ),
-    }),
+    });
+  } catch { return null; }
+}
+
+async function resolvedPickerModels(
+  appId: string, session?: DaemonSession,
+): Promise<readonly string[]> {
+  const context = (config: BotConfig) => session ? sessionModelCatalogueContext(session, config) : {
+    key: selectionKeyForBot(config.cliId, config.wrapperCli, config.cliLaunchMode),
+    matchesBot: true,
+    canProbe: !config.codexProfile && !config.cliConfigDir
+      && !!lookupCliSelectionForBotShape(config.cliId, config.wrapperCli, config.cliLaunchMode),
   };
+  const before = getBot(appId).config;
+  const launch = context(before);
+  const live = launch.canProbe ? await detectPickerModels(launch.key, launch.matchesBot ? before : undefined) : null;
+  const config = getBot(appId).config;
+  const current = context(config);
+  const compatible = launch.key === current.key && launch.matchesBot === current.matchesBot && current.canProbe;
+  const models = mergeModelChoices(staticModelChoices(current.key), compatible ? live : null).models;
+  const useConfigured = current.matchesBot && botAcceptsLaunchModel(config)
+    && (!isTtadkWrapper(config.wrapperCli) || ttadkAcceptsModel(config.wrapperCli));
+  const custom = useConfigured ? config.customModels ?? [] : [];
+  const activeModel = session?.activeModel?.trim() || session?.session.model?.trim();
+  const fallback = [useConfigured ? config.model : undefined, activeModel, session?.session.modelPin?.model]
+    .filter((model): model is string => !!model && !models.includes(model));
+  const accepts = session ? isSessionModelPickerValue : (model: string) => DEFAULT_MODEL_VALUE_PATTERN.test(model);
+  return [...new Set([...custom, ...fallback, ...models].filter(accepts))];
 }
 
-/** One accept rule shared by the picker render and the submission whitelist:
- * live non-empty wins, otherwise the curated static list. Building both from
- * this keeps the offered options and the inject whitelist on identical terms. */
-export async function sessionModelChoices(ds: DaemonSession): Promise<readonly string[]> {
-  const key = selectionKeyForBot(sessionCliId(ds), ds.session.wrapperCli, ds.session.cliLaunchMode);
-  const catalogue = resolveModelCatalogue(key, getBot(ds.larkAppId).config);
-  const live = await catalogue.detect().catch(() => null);
-  return mergeModelChoices(catalogue.staticChoices, live).models;
+/** The picker and callback resolve the same session-specific catalogue. */
+export function sessionModelChoices(ds: DaemonSession): Promise<readonly string[]> {
+  return resolvedPickerModels(ds.larkAppId, ds);
 }
 
-/** Display metadata is separate from the command whitelist: a failed load
- * query must never make a selectable model disappear or change its slug. */
+/** Display metadata must never change which slugs are selectable. */
 export async function sessionModelPickerData(ds: DaemonSession) {
-  const key = selectionKeyForBot(sessionCliId(ds), ds.session.wrapperCli, ds.session.cliLaunchMode);
+  const config = getBot(ds.larkAppId).config;
+  const { key } = sessionModelCatalogueContext(ds, config);
   const [models, load] = await Promise.all([
-    sessionModelChoices(ds).catch(() => staticModelChoices(key)), pickerLoad(key, getBot(ds.larkAppId).config, ds),
+    sessionModelChoices(ds), pickerLoad(key, config, ds),
   ]);
   return { models, load };
+}
+
+type ModelPickerAction = 'reply_model_pick' | 'session_model_pick';
+
+export function claudeSettingsPickerVersion(ds: DaemonSession): string {
+  const effort = sessionReasoningControl(ds);
+  return JSON.stringify([
+    ds.workerGeneration, ds.cliReadyGeneration, ds.session.modelPin?.setAt, ds.session.modelPin?.model,
+    ds.activeModel, ds.session.model, resolveSessionLaunchModel(ds, getBot(ds.larkAppId).config), effort?.selected,
+  ]);
 }
 
 export function buildSessionModelPickerCard(
@@ -128,15 +174,32 @@ export function buildSessionModelPickerCard(
   models: readonly string[],
   currentModel: string | undefined,
   loc: Locale,
-  action: 'reply_model_pick' | 'session_model_pick' = 'reply_model_pick',
+  action: ModelPickerAction = 'reply_model_pick',
   load?: ModelPickerLoad,
+  privateRecipient?: string,
 ): string {
   // Only render slugs the inject path would accept: a live-detected catalogue
   // entry with exotic characters must not render into a dead option.
-  const safeModels = models.filter(model => MODEL_SLUG_PATTERN.test(model));
-  const effort = action === 'session_model_pick' ? topicReasoningControl(ds) : undefined;
-  const effortBinding = {
+  const claude = sessionUsesClaudeCode(ds);
+  const claudeEffort = claude ? sessionReasoningControl(ds) : undefined;
+  const botConfig = claude || ds.session.modelPin ? getBot(ds.larkAppId).config : undefined;
+  const pin = ds.session.modelPin;
+  const pinView = pin ? resolveSessionModelPinView(ds, botConfig) : undefined;
+  const selection = claude ? pin?.model ?? resolveSessionLaunchModel(ds, botConfig) : currentModel;
+  const observedModel = claude ? ds.activeModel : currentModel;
+  const observationIsCurrent = !claude || (!ds.session.suspendedColdResume && !ds.statuslineActiveModelStale && !ds.activeModelFromSeed);
+  const observedEffort = ds.activeModelFromSeed ? undefined : ds.activeReasoningEffort;
+  const startupModelOverride = claude && (ds.session.cliLaunchSnapshot?.startupCommands ?? botConfig?.startupCommands)
+    ?.some(command => /^\/model\s+\S/i.test(command.trim()));
+  const safeModels = limitModelOptions(models.filter(model => MODEL_SLUG_PATTERN.test(model)), selection, false, observedModel);
+  const effort = !claude && action === 'session_model_pick' ? topicReasoningControl(ds) : undefined;
+  const binding = {
     session_id: ds.session.sessionId, root_id: rootId, lark_app_id: ds.larkAppId, chat_id: ds.chatId,
+    ...(claude ? { claude_settings_version: claudeSettingsPickerVersion(ds), picker_action: action,
+      ...(privateRecipient ? { private_recipient: privateRecipient } : {}) } : {}),
+  };
+  const effortBinding = {
+    ...binding,
     expected_model: currentModel ?? '',
     expected_effort: ds.session.topicReasoningEffort?.effort ?? '',
     expected_effort_model: ds.session.topicReasoningEffort?.model ?? '',
@@ -162,36 +225,69 @@ export function buildSessionModelPickerCard(
   return JSON.stringify({
     config: { wide_screen_mode: true },
     elements: [
-      { tag: 'markdown', content: `**${t('card.reply_actions.model_title', undefined, loc)}**` },
-      { tag: 'div', text: { tag: 'plain_text', content: loc === 'en'
+      { tag: 'markdown', content: `**${t(claude ? 'card.session_settings.title' : 'card.reply_actions.model_title', undefined, loc)}**` },
+      ...(claude ? [
+        { tag: 'div', text: { tag: 'plain_text', content: t('card.session_settings.active', {
+          model: !ds.activeModelFromSeed ? ds.activeModel ?? '—' : '—',
+          effort: observedEffort && isCodexReasoningEffort(observedEffort)
+            ? t(`card.effort.${observedEffort}`, undefined, loc) : observedEffort ?? '—',
+        }, loc) } },
+        { tag: 'div', text: { tag: 'plain_text', content: t('card.session_settings.scope', undefined, loc) } },
+        { tag: 'div', text: { tag: 'plain_text', content: t('card.session_settings.model', undefined, loc) } },
+      ] : [{ tag: 'div', text: { tag: 'plain_text', content: loc === 'en'
         ? 'Choosing a model saves a topic pin. Higher-priority launch overrides remain in effect; otherwise the CLI restarts with conversation history and background terminal tasks stop.'
-        : '选择模型会保存话题固定；存在更高优先级覆盖时保留覆盖，否则重启 CLI 并保留对话上下文，后台终端任务会停止。' } },
+        : '选择模型会保存话题固定；存在更高优先级覆盖时保留覆盖，否则重启 CLI 并保留对话上下文，后台终端任务会停止。' } }]),
       {
         tag: 'action',
         actions: [{
           tag: 'select_static',
-          placeholder: { tag: 'plain_text', content: currentModel || t('card.reply_actions.model', undefined, loc) },
-          ...(currentModel && safeModels.includes(currentModel) ? { initial_option: currentModel } : {}),
-          options: safeModels.slice(0, 50).map(model => ({
+          placeholder: { tag: 'plain_text', content: selection || t(claude ? 'card.models.cli_default' : 'card.reply_actions.model', undefined, loc) },
+          ...(selection && safeModels.includes(selection) ? { initial_option: selection } : {}),
+          options: safeModels.map(model => ({
             text: {
               tag: 'plain_text',
               content: modelOptionLabel(model, load, loc)
-                + (model === currentModel ? ` ${t('card.reply_actions.model_current', undefined, loc)}` : ''),
+                + (observationIsCurrent && model === observedModel ? ` ${t('card.reply_actions.model_current', undefined, loc)}` : ''),
             },
             value: model,
           })),
-          value: { action, session_id: ds.session.sessionId, root_id: rootId, lark_app_id: ds.larkAppId, chat_id: ds.chatId },
+          value: { action, ...binding },
         }],
       },
-      ...(ds.session.modelPin ? [
-        { tag: 'div', text: { tag: 'plain_text', content: modelPinText(resolveSessionModelPinView(ds, getBot(ds.larkAppId).config)) } },
-        { tag: 'action', actions: [{ tag: 'button', text: { tag: 'plain_text', content: '解除话题固定' },
-          value: { action: 'session_model_unpin', expected_pin_set_at: ds.session.modelPin.setAt, session_id: ds.session.sessionId, root_id: rootId, lark_app_id: ds.larkAppId, chat_id: ds.chatId } }] },
+      ...(startupModelOverride ? [{ tag: 'div', text: { tag: 'plain_text',
+        content: t('card.session_settings.startup_model_override', undefined, loc) } }] : []),
+      ...(pin ? [
+        ...(!claude ? [{ tag: 'div', text: { tag: 'plain_text', content: modelPinText(pinView) } }]
+          : pinView?.shadowedBy ? [{ tag: 'div', text: { tag: 'plain_text',
+            content: t('card.session_settings.launch_override', { model: pinView.launchModel ?? '—' }, loc) } }] : []),
+        { tag: 'action', actions: [{ tag: 'button', text: { tag: 'plain_text', content: t('card.session_settings.unpin', undefined, loc) },
+          value: { action: 'session_model_unpin', expected_pin_set_at: pin.setAt, ...binding } }] },
       ] : []),
-      ...modelLoadNote(load, loc),
+      ...(claudeEffort?.choices.length ? [
+        { tag: 'div', text: { tag: 'plain_text', content: t('card.session_settings.effort', undefined, loc) } },
+        { tag: 'action', actions: [{ tag: 'select_static',
+          placeholder: { tag: 'plain_text', content: t('card.effort.select', undefined, loc) },
+          ...(claudeEffort.selected ? { initial_option: claudeEffort.selected } : {}),
+          ...(claudeEffort.claude?.disabledBy ? { disabled: true } : {}),
+          options: claudeEffort.choices.map(level => ({ text: { tag: 'plain_text', content: t(`card.effort.${level}`, undefined, loc) }, value: level })),
+          value: { action: 'session_effort_pick', ...binding },
+        }] },
+        ...(claudeEffort.claude?.disabledBy ? [{ tag: 'div', text: { tag: 'plain_text',
+          content: t(`card.effort.claude_${claudeEffort.claude.disabledBy}_override`, undefined, loc) } }] : []),
+      ] : []),
+      ...modelLoadNote(claude ? undefined : load, loc),
       ...effortElements,
     ],
   });
+}
+
+export async function deliverSessionModelPicker(
+  ds: DaemonSession, operator: string, render: (privateRecipient?: string) => string,
+  reply: (card: string) => Promise<unknown>,
+): Promise<void> {
+  const privateRecipient = sessionUsesClaudeCode(ds) && ds.scope === 'chat' && ds.chatType !== 'p2p'
+    ? operator : undefined;
+  await deliverEphemeralOrReply(ds, operator, render(privateRecipient), 'interactive', () => reply(render()));
 }
 
 /** Read-only shortcut: a short-lived catalogue helper creates no conversation
@@ -209,7 +305,9 @@ export async function showSessionModelPicker(
     notice = t('daemon.cmd_allowed_users_only', { cmd: '/models' }, loc);
   } else if (isSessionTransferring(ds)) {
     notice = t('cmd.session.transfer_in_progress', undefined, loc);
-  } else if (!ds.worker || ds.worker.killed) {
+  } else if (sessionUsesClaudeCode(ds) && (!supportsClaudeSessionSettings(ds) || ds.session.principalLane)) {
+    notice = t('card.session_settings.unsupported', undefined, loc);
+  } else if ((!ds.worker || ds.worker.killed) && !(supportsClaudeSessionSettings(ds) && ds.session.suspendedColdResume)) {
     notice = t('daemon.cmd_needs_active_cli', { cmd: '/models' }, loc);
   } else if (cliHasNoRawPassthroughSurface(sessionCliId(ds), { dshRuntime: getBot(ds.larkAppId).config.dshRuntime })) {
     notice = t('card.reply_actions.model_unsupported', undefined, loc);
@@ -219,18 +317,19 @@ export async function showSessionModelPicker(
   const generation = ds.workerGeneration;
   const data = await sessionModelPickerData(ds);
   if (!canOperate(ds.larkAppId, ds.chatId, operatorOpenId, operatorUnionId)
-    || ds.worker !== worker || ds.workerGeneration !== generation || ds.worker?.killed || isSessionTransferring(ds)) {
+    || ds.worker !== worker || ds.workerGeneration !== generation || isSessionTransferring(ds)
+    || (ds.worker?.killed && !(supportsClaudeSessionSettings(ds) && ds.session.suspendedColdResume))) {
     await reply(rootId, t('card.models.changed', undefined, loc));
     return;
   }
   const models = data.models.filter(model => MODEL_SLUG_PATTERN.test(model));
-  const card = models.length > 0
+  const render = (recipient?: string) => models.length > 0
     ? buildSessionModelPickerCard(ds, rootId, models,
-      ds.activeModel?.trim() || ds.session.model?.trim() || undefined, loc, 'session_model_pick', data.load)
+      ds.activeModel?.trim() || ds.session.model?.trim() || undefined, loc, 'session_model_pick', data.load, recipient)
     : JSON.stringify({ config: { wide_screen_mode: true }, elements: [
       { tag: 'markdown', content: t('card.reply_actions.model_empty', undefined, loc) },
     ] });
-  await deliverEphemeralOrReply(ds, operatorOpenId, card, 'interactive', () => reply(rootId, card, 'interactive'));
+  await deliverSessionModelPicker(ds, operatorOpenId, render, card => reply(rootId, card, 'interactive'));
 }
 
 export function defaultModelSelectionKey(appId: string): string {
@@ -238,19 +337,15 @@ export function defaultModelSelectionKey(appId: string): string {
   return selectionKeyForBot(cfg.cliId, cfg.wrapperCli, cfg.cliLaunchMode);
 }
 
-export async function defaultModelChoices(appId: string): Promise<readonly string[]> {
-  const cfg = getBot(appId).config;
-  const key = selectionKeyForBot(cfg.cliId, cfg.wrapperCli, cfg.cliLaunchMode);
-  const catalogue = resolveModelCatalogue(key, cfg);
-  const live = await catalogue.detect().catch(() => null);
-  return mergeModelChoices(catalogue.staticChoices, live).models;
+export function defaultModelChoices(appId: string): Promise<readonly string[]> {
+  return resolvedPickerModels(appId);
 }
 
 export async function defaultModelPickerData(appId: string) {
   const cfg = getBot(appId).config;
   const key = defaultModelSelectionKey(appId);
   const [models, load] = await Promise.all([
-    defaultModelChoices(appId).catch(() => staticModelChoices(key)), pickerLoad(key, cfg),
+    defaultModelChoices(appId), pickerLoad(key, cfg),
   ]);
   return { models, load };
 }
@@ -264,14 +359,10 @@ export function buildDefaultModelPickerCard(
   reasoning?: { cliId: string; effort?: string },
   load?: ModelPickerLoad,
 ): string {
-  const safe = [...new Set(models)].filter(model => DEFAULT_MODEL_VALUE_PATTERN.test(model));
-  if (currentModel && DEFAULT_MODEL_VALUE_PATTERN.test(currentModel)) {
-    const existing = safe.indexOf(currentModel);
-    if (existing >= 0) safe.splice(existing, 1);
-    safe.unshift(currentModel);
-  }
+  const safe = [...models].filter(model => DEFAULT_MODEL_VALUE_PATTERN.test(model));
+  if (currentModel && DEFAULT_MODEL_VALUE_PATTERN.test(currentModel) && !safe.includes(currentModel)) safe.unshift(currentModel);
   const choices = [{ text: t('card.models.cli_default', undefined, loc), value: CONFIG_UNSET },
-    ...safe.slice(0, 49).map(model => ({ text: modelOptionLabel(model, load, loc), value: model }))];
+    ...limitModelOptions(safe, currentModel, true).map(model => ({ text: modelOptionLabel(model, load, loc), value: model }))];
   const initial = currentModel && choices.some(c => c.value === currentModel) ? currentModel : CONFIG_UNSET;
   const efforts = reasoning ? reasoningEffortsForCliModel(reasoning.cliId, currentModel) : [];
   const effortControls = reasoning && isConfigurableReasoningCliId(reasoning.cliId) ? [

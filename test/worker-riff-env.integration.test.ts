@@ -367,4 +367,96 @@ describe('Riff worker session environment', () => {
       rmTree(root);
     }
   }, 25_000);
+
+  it('rejects unsupported riff.agent at the worker spawn gate before dispatch', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-riff-agent-'));
+    let outbound = 0;
+    const server = createServer((req, res) => {
+      if (req.method === 'POST' && (req.url === '/api/task-execute' || req.url === '/api/task-follow-up')) outbound++;
+      res.writeHead(404); res.end();
+    });
+    let child: ChildProcess | undefined;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const port = await listen(server);
+      const appId = 'cli_riff_bad_agent', botsPath = join(root, 'bots.json');
+      writeFileSync(botsPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'test-secret',
+        cliId: 'riff', backendType: 'riff', riff: { baseUrl: `http://127.0.0.1:${port}`, agent: 'bogus' } }]));
+      child = spawnTsScript(resolve('src/worker.ts'), [], { cwd: resolve('.'),
+        env: { ...process.env, HOME: root, SESSION_DATA_DIR: root, BOTS_CONFIG: botsPath,
+          BOTMUX_SESSION_ID: 'sid-riff-bad-agent', LARK_APP_ID: appId, LARK_APP_SECRET: 'test-secret' },
+        stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
+      const logs: string[] = [];
+      child.stdout!.on('data', chunk => logs.push(String(chunk)));
+      child.stderr!.on('data', chunk => logs.push(String(chunk)));
+      const error = new Promise<string>((resolvePromise, reject) => {
+        child!.on('message', (raw: WorkerToDaemon) => { if (raw.type === 'error') resolvePromise(raw.message); });
+        child!.once('error', reject);
+        child!.once('exit', () => reject(new Error(`worker exited before reporting config failure: ${logs.join('')}`)));
+        timeout = setTimeout(() => reject(new Error(`worker error timeout: ${logs.join('')}`)), 15_000);
+      });
+      child.send({ type: 'init', sessionId: 'sid-riff-bad-agent', chatId: 'oc_test', rootMessageId: 'om_root',
+        workingDir: root, cliId: 'riff', backendType: 'riff', larkAppId: appId, larkAppSecret: 'test-secret',
+        prompt: 'must not be dispatched', turnId: 'turn-bad-agent',
+        backendConfig: { baseUrl: `http://127.0.0.1:${port}`, jwt: 'test-jwt', agent: 'bogus' },
+      } satisfies DaemonToWorker);
+      expect(await error).toContain('riff agent 非法');
+      expect(outbound).toBe(0);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      await new Promise<void>(resolvePromise => server.close(() => resolvePromise()));
+      rmTree(root);
+    }
+  }, 25_000);
+
+  // 2026-07 服务端收敛前的历史 agent 值：spawn 门禁必须放行（不能让升级后的存量
+  // bots.json 建不了会话），派发体里的 config.agent 统一回落 codex。
+  it.each(['aiden', 'aiden-claude', 'opencode'])('admits retired riff.agent %s through the spawn gate and dispatches codex', async retiredAgent => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-riff-retired-agent-'));
+    let settleDispatch!: (body: Record<string, any>) => void;
+    let rejectGate!: (error: Error) => void;
+    const dispatched = new Promise<Record<string, any>>((resolvePromise, rejectPromise) => {
+      settleDispatch = resolvePromise;
+      rejectGate = rejectPromise;
+    });
+    const server = createServer(async (req, res) => {
+      if (req.method === 'POST' && req.url === '/api/task-execute') {
+        settleDispatch(JSON.parse(await readRequestBody(req)));
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ success: true, data: { id: 'task-retired-1', status: 'running' } }));
+        return;
+      }
+      res.writeHead(404); res.end();
+    });
+    let child: ChildProcess | undefined;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const port = await listen(server);
+      const appId = `cli_riff_retired_${retiredAgent.replace(/-/g, '_')}`, botsPath = join(root, 'bots.json');
+      writeFileSync(botsPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'test-secret',
+        cliId: 'riff', backendType: 'riff', riff: { baseUrl: `http://127.0.0.1:${port}`, agent: retiredAgent } }]));
+      child = spawnTsScript(resolve('src/worker.ts'), [], { cwd: resolve('.'),
+        env: { ...process.env, HOME: root, SESSION_DATA_DIR: root, BOTS_CONFIG: botsPath,
+          BOTMUX_SESSION_ID: `sid-riff-retired-${retiredAgent}`, LARK_APP_ID: appId, LARK_APP_SECRET: 'test-secret' },
+        stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
+      child.on('message', (raw: WorkerToDaemon) => {
+        if (raw.type === 'error') rejectGate(new Error(`spawn gate refused retired agent: ${raw.message}`));
+      });
+      timeout = setTimeout(() => rejectGate(new Error('task-execute dispatch timeout')), 15_000);
+      child.send({ type: 'init', sessionId: `sid-riff-retired-${retiredAgent}`, chatId: 'oc_test', rootMessageId: 'om_root',
+        workingDir: root, cliId: 'riff', backendType: 'riff', larkAppId: appId, larkAppSecret: 'test-secret',
+        prompt: 'legacy config must still dispatch', turnId: `turn-retired-${retiredAgent}`,
+        backendConfig: { baseUrl: `http://127.0.0.1:${port}`, jwt: 'test-jwt', agent: retiredAgent },
+      } satisfies DaemonToWorker);
+      const body = await dispatched;
+      clearTimeout(timeout);
+      expect(body.config.agent).toBe('codex');
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      await new Promise<void>(resolvePromise => server.close(() => resolvePromise()));
+      rmTree(root);
+    }
+  }, 25_000);
 });

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -10,14 +10,30 @@ import {
   readSessionTurns,
   reconcileClosedSessionTurns,
   recordSessionTurnInput,
-  recordSessionTurnReply,
+  recordSessionTurnReplies,
   resumeSessionTurns,
   stageSessionTurnInbound,
   updateSessionTurnNativeAnchor,
+  type SessionTurnReply,
+  type SessionTurnRetention,
 } from '../src/services/session-turns.js';
 import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 import { resolveDashboardRequestGate } from '../src/dashboard/request-identity.js';
 import { mergeQueuedCliInput, type PendingCliInput } from '../src/utils/pending-input-queue.js';
+
+function recordReply(
+  dataDir: string,
+  sessionId: string,
+  turnId: string,
+  reply: SessionTurnReply,
+  retention?: SessionTurnRetention,
+  opts?: { pruneNow?: number },
+): void {
+  recordSessionTurnReplies(dataDir, sessionId, turnId, [reply], {
+    retention,
+    pruneNow: opts?.pruneNow,
+  });
+}
 
 describe('structured session turns', () => {
   let dataDir: string;
@@ -95,8 +111,8 @@ describe('structured session turns', () => {
     stage('message-third');
     recordSessionTurnInput({ dataDir, sessionId, turnId: 'message-third', input: 'Third', cliId: 'codex' });
     const reply = { messageId: 'reply-final', responseKind: 'final' as const, at: 42, text: 'Reply text' };
-    recordSessionTurnReply(dataDir, sessionId, 'message-second', reply);
-    recordSessionTurnReply(dataDir, sessionId, 'message-second', reply);
+    recordReply(dataDir, sessionId, 'message-second', reply);
+    recordReply(dataDir, sessionId, 'message-second', reply);
     const middle = readSessionTurns(dataDir, sessionId, Number(initial.next), 1);
     expect(middle.turns.map(turn => turn.turnId)).toEqual(['message-third']);
     const late = readSessionTurns(dataDir, sessionId, Number(middle.next), 1);
@@ -105,7 +121,7 @@ describe('structured session turns', () => {
     cleanupSessionTurns(dataDir, sessionId);
     stage('message-first');
     recordSessionTurnInput(write);
-    recordSessionTurnReply(dataDir, sessionId, 'message-second', reply);
+    recordReply(dataDir, sessionId, 'message-second', reply);
     expect(readSessionTurns(dataDir, sessionId, 0, 50).turns).toEqual([]);
     resumeSessionTurns(dataDir, sessionId);
     stage('message-reopened');
@@ -154,7 +170,7 @@ describe('structured session turns', () => {
     recordSessionTurnInput(write);
     expect(readSessionTurns(dataDir, sessionId, 0, 50).turns).toHaveLength(1);
     reconcileClosedSessionTurns(dataDir, new Set([sessionId]));
-    recordSessionTurnReply(dataDir, sessionId, 'message-closed', { messageId: 'reply-late', responseKind: 'final', at: 50 });
+    recordReply(dataDir, sessionId, 'message-closed', { messageId: 'reply-late', responseKind: 'final', at: 50 });
     expect(readSessionTurns(dataDir, sessionId, 0, 50).turns).toEqual([]);
   });
 
@@ -162,7 +178,7 @@ describe('structured session turns', () => {
     stage('message-first');
     const write = { dataDir, sessionId, turnId: 'message-first', input: 'First', cliId: 'codex' };
     updateSessionTurnNativeAnchor(dataDir, sessionId, write.turnId, 'native-session', 'native-entry');
-    recordSessionTurnReply(dataDir, sessionId, write.turnId, { messageId: 'reply-early', responseKind: 'final', at: 1 });
+    recordReply(dataDir, sessionId, write.turnId, { messageId: 'reply-early', responseKind: 'final', at: 1 });
     recordSessionTurnInput(write);
     const first = readSessionTurns(dataDir, sessionId, 0, 50);
     expect(first.turns[0]?.anchor?.cliEntryId).toBe('native-entry');
@@ -181,19 +197,19 @@ describe('structured session turns', () => {
 
     stage('turn-1');
     recordSessionTurnInput({ dataDir, sessionId, turnId: 'turn-1', input: 'one', cliId: 'codex', at: t0, retention });
-    recordSessionTurnReply(dataDir, sessionId, 'turn-1', { messageId: 'r-1', responseKind: 'final', at: t0 + 10 }, retention);
+    recordReply(dataDir, sessionId, 'turn-1', { messageId: 'r-1', responseKind: 'final', at: t0 + 10 }, retention);
     const afterT1 = readSessionTurns(dataDir, sessionId, 0, 50);
     expect(afterT1.turns.map(t => t.turnId)).toEqual(['turn-1']);
 
     // turn-2 仅收到 progress 回执，尚未收到 final，属于活跃/未完成轮次
     stage('turn-2');
     recordSessionTurnInput({ dataDir, sessionId, turnId: 'turn-2', input: 'two', cliId: 'codex', at: t0 + 20, retention });
-    recordSessionTurnReply(dataDir, sessionId, 'turn-2', { messageId: 'r-2p', responseKind: 'progress', at: t0 + 30 }, retention);
+    recordReply(dataDir, sessionId, 'turn-2', { messageId: 'r-2p', responseKind: 'progress', at: t0 + 30 }, retention);
 
     // turn-3 完成后总事件数达到 9 > 8，应淘汰最旧的已完成轮次 turn-1，保留活跃轮次 turn-2 与最新轮次 turn-3
     stage('turn-3');
     recordSessionTurnInput({ dataDir, sessionId, turnId: 'turn-3', input: 'three', cliId: 'codex', at: t0 + 40, retention });
-    recordSessionTurnReply(dataDir, sessionId, 'turn-3', { messageId: 'r-3', responseKind: 'final', at: t0 + 50 }, retention);
+    recordReply(dataDir, sessionId, 'turn-3', { messageId: 'r-3', responseKind: 'final', at: t0 + 50 }, retention);
 
     const afterT3 = readSessionTurns(dataDir, sessionId, 0, 50);
     expect(afterT3.turns.map(t => t.turnId)).toEqual(['turn-2', 'turn-3']);
@@ -205,7 +221,7 @@ describe('structured session turns', () => {
     // turn-4 完成后再次超上限，应优先淘汰已完成的 turn-3，仍保留活跃轮次 turn-2 与最新轮次 turn-4
     stage('turn-4');
     recordSessionTurnInput({ dataDir, sessionId, turnId: 'turn-4', input: 'four', cliId: 'codex', at: t0 + 60, retention });
-    recordSessionTurnReply(dataDir, sessionId, 'turn-4', { messageId: 'r-4', responseKind: 'final', at: t0 + 70 }, retention);
+    recordReply(dataDir, sessionId, 'turn-4', { messageId: 'r-4', responseKind: 'final', at: t0 + 70 }, retention);
 
     const afterT4 = readSessionTurns(dataDir, sessionId, 0, 50);
     expect(afterT4.turns.map(t => t.turnId)).toEqual(['turn-2', 'turn-4']);
@@ -214,11 +230,11 @@ describe('structured session turns', () => {
     expect(Number(deltaAfterT3.next)).toBeGreaterThan(Number(afterT3.next));
 
     // 已裁剪轮次的迟到回执被忽略，不产生孤立事件
-    recordSessionTurnReply(dataDir, sessionId, 'turn-1', { messageId: 'r-1-late', responseKind: 'auxiliary', at: t0 + 80 }, retention);
+    recordReply(dataDir, sessionId, 'turn-1', { messageId: 'r-1-late', responseKind: 'auxiliary', at: t0 + 80 }, retention);
     expect(readSessionTurns(dataDir, sessionId, Number(afterT4.next), 50)).toMatchObject({ turns: [], next: afterT4.next });
 
     // 活跃轮次 turn-2 最终完成时仍可正常追加回执并推进游标
-    recordSessionTurnReply(dataDir, sessionId, 'turn-2', { messageId: 'r-2f', responseKind: 'final', at: t0 + 90 }, retention);
+    recordReply(dataDir, sessionId, 'turn-2', { messageId: 'r-2f', responseKind: 'final', at: t0 + 90 }, retention);
     const completedActive = readSessionTurns(dataDir, sessionId, Number(afterT4.next), 50);
     expect(completedActive.turns.map(t => [t.turnId, t.replies.map(r => r.responseKind)])).toEqual([
       ['turn-2', ['progress', 'final']],
@@ -231,7 +247,7 @@ describe('structured session turns', () => {
     stage('solo-turn');
     recordSessionTurnInput({ dataDir, sessionId, turnId: 'solo-turn', input: 'one', cliId: 'codex', at: 1000, retention });
     for (const i of [1, 2, 3, 4, 5, 6]) {
-      recordSessionTurnReply(dataDir, sessionId, 'solo-turn',
+      recordReply(dataDir, sessionId, 'solo-turn',
         { messageId: `p-${i}`, responseKind: 'progress', at: 1000 + i }, retention);
     }
     // A later native anchor supersedes the first one; only the newest survives.
@@ -252,7 +268,7 @@ describe('structured session turns', () => {
 
     stage('old-done');
     recordSessionTurnInput({ dataDir, sessionId, turnId: 'old-done', input: 'a', cliId: 'codex', at: 1_000, retention });
-    recordSessionTurnReply(dataDir, sessionId, 'old-done', { messageId: 'r-old', responseKind: 'final', at: 1_500 }, retention);
+    recordReply(dataDir, sessionId, 'old-done', { messageId: 'r-old', responseKind: 'final', at: 1_500 }, retention);
 
     stage('old-stale-incomplete');
     recordSessionTurnInput({ dataDir, sessionId, turnId: 'old-stale-incomplete', input: 'b', cliId: 'codex', at: 2_000, retention });
@@ -315,7 +331,7 @@ describe('structured session turns', () => {
 
     stage('redact-turn', undefined, inboundText);
     recordSessionTurnInput({ dataDir, sessionId, turnId: 'redact-turn', input: inboundText, cliId: 'codex' });
-    recordSessionTurnReply(dataDir, sessionId, 'redact-turn', {
+    recordReply(dataDir, sessionId, 'redact-turn', {
       messageId: 'reply-redact',
       responseKind: 'final',
       at: 100,
@@ -342,5 +358,120 @@ describe('structured session turns', () => {
       's3://bucket/data00/file.parquet',
     ].join('\n'));
     expect(storedReply).toBe('结果：<redacted>，详情见 https://example.com/home/docs');
+  });
+
+  it('prevents a forged future reply.at from TTL-evicting earlier turns and supports explicit pruneNow', () => {
+    const retention = { maxEventsPerSession: 50, eventTtlMs: 60_000 };
+    const now = Date.now();
+    const t0 = now - 5_000;
+
+    stage('turn-a');
+    recordSessionTurnInput({ dataDir, sessionId, turnId: 'turn-a', input: 'a', cliId: 'codex', at: t0, retention });
+    recordReply(dataDir, sessionId, 'turn-a', { messageId: 'om_a', responseKind: 'final', at: t0 + 10 }, retention);
+
+    stage('turn-b');
+    recordSessionTurnInput({ dataDir, sessionId, turnId: 'turn-b', input: 'b', cliId: 'codex', at: t0 + 20, retention });
+
+    // A future reply.at 30 days ahead must NOT advance the TTL cutoff beyond host wall clock.
+    const farFuture = now + 30 * 24 * 60 * 60 * 1000;
+    recordReply(dataDir, sessionId, 'turn-b', { messageId: 'om_b', responseKind: 'final', at: farFuture }, retention);
+    expect(readSessionTurns(dataDir, sessionId, 0, 50).turns.map(t => t.turnId)).toEqual(['turn-a', 'turn-b']);
+
+    // Passing an explicit host pruneNow past TTL does evict the expired completed turn.
+    recordReply(
+      dataDir,
+      sessionId,
+      'turn-b',
+      { messageId: 'om_b_aux', responseKind: 'auxiliary', at: t0 + 30 },
+      retention,
+      { pruneNow: t0 + 120_000 },
+    );
+    expect(readSessionTurns(dataDir, sessionId, 0, 50).turns.map(t => t.turnId)).toEqual(['turn-b']);
+  });
+
+  it('propagates non-ENOENT stat errors while returning clean no-op when turns.sqlite is absent', () => {
+    expect(recordSessionTurnReplies(dataDir, sessionId, 'turn-absent', [
+      { messageId: 'om_1', responseKind: 'final', at: 100 },
+    ])).toEqual({ staged: false, recorded: 0, duplicates: 0, recordedTextChars: 0 });
+
+    // Squat `session-turns` as a regular file -> lstatSync(session-turns/turns.sqlite) fails with ENOTDIR.
+    writeFileSync(join(dataDir, 'session-turns'), 'not-a-directory');
+    expect(() => recordSessionTurnReplies(dataDir, sessionId, 'turn-squatted', [
+      { messageId: 'om_1', responseKind: 'final', at: 100 },
+    ])).toThrow();
+
+    // Mode-000 empty directory (simulates Linux bwrap mask even under uid=0) must also throw instead of silent no-op.
+    rmSync(join(dataDir, 'session-turns'), { force: true });
+    mkdirSync(join(dataDir, 'session-turns'), { mode: 0o000 });
+    try {
+      chmodSync(join(dataDir, 'session-turns'), 0o000);
+      expect(() => recordSessionTurnReplies(dataDir, sessionId, 'turn-masked', [
+        { messageId: 'om_1', responseKind: 'final', at: 100 },
+      ])).toThrow();
+    } finally {
+      chmodSync(join(dataDir, 'session-turns'), 0o700);
+    }
+  });
+
+  it('clamps post-redaction reply text to 256 KiB even when <redacted> replacements expand length', () => {
+    stage('turn-expand');
+    recordSessionTurnInput({ dataDir, sessionId, turnId: 'turn-expand', input: 'x', cliId: 'claude-code', at: 1000 });
+    // Repeating 4-char path `~/a ` expands to 11-char `<redacted> ` (2.75x amplification).
+    const amplified = '~/a '.repeat(70_000);
+    recordReply(dataDir, sessionId, 'turn-expand', {
+      messageId: 'om_amp',
+      responseKind: 'final',
+      at: 2000,
+      text: amplified,
+    });
+    const stored = readSessionTurns(dataDir, sessionId, 0, 50).turns[0]?.replies[0]?.text ?? '';
+    expect(stored.length).toBeLessThanOrEqual(256 * 1024);
+    expect(stored.endsWith('…')).toBe(true);
+  });
+
+  it('batches multi-attachment replies atomically, preserves text:undefined, deduplicates, and honors closed_sessions fence', () => {
+    stage('turn-multi');
+    recordSessionTurnInput({ dataDir, sessionId, turnId: 'turn-multi', input: 'send files', cliId: 'claude-code', at: 1000 });
+
+    const first = recordSessionTurnReplies(dataDir, sessionId, 'turn-multi', [
+      { messageId: 'om_primary', responseKind: 'final', at: 2000, text: 'Attached /Users/alice/secret.txt' },
+      { messageId: 'om_file_1', responseKind: 'final', at: 2000 },
+      { messageId: 'om_file_2', responseKind: 'final', at: 2000 },
+      { messageId: 'om_nan', responseKind: 'auxiliary', at: Number.NaN },
+    ]);
+    expect(first.staged).toBe(true);
+    expect(first.recorded).toBe(4);
+    expect(first.duplicates).toBe(0);
+    expect(first.recordedTextChars).toBe('Attached <redacted>'.length);
+
+    // Replaying exact timestamps deduplicates without adding rows or text chars.
+    const replay = recordSessionTurnReplies(dataDir, sessionId, 'turn-multi', [
+      { messageId: 'om_primary', responseKind: 'final', at: 2000, text: 'Attached /Users/alice/secret.txt' },
+      { messageId: 'om_file_1', responseKind: 'final', at: 2000 },
+      { messageId: 'om_video_1', responseKind: 'final', at: 2000 },
+    ]);
+    expect(replay).toEqual({ staged: true, recorded: 1, duplicates: 2, recordedTextChars: 0 });
+
+    const turn = readSessionTurns(dataDir, sessionId, 0, 50).turns[0]!;
+    expect(turn.replies.slice(0, 3)).toEqual([
+      { messageId: 'om_primary', responseKind: 'final', at: 2000, text: 'Attached <redacted>' },
+      { messageId: 'om_file_1', responseKind: 'final', at: 2000 },
+      { messageId: 'om_file_2', responseKind: 'final', at: 2000 },
+    ]);
+    expect('text' in turn.replies[1]!).toBe(false);
+    expect(Number.isSafeInteger(turn.replies[3]!.at)).toBe(true);
+    expect(turn.replies[4]).toEqual({ messageId: 'om_video_1', responseKind: 'final', at: 2000 });
+
+    // Belt-and-suspenders close fence: even if pending_inbound had a stale row alongside closed_sessions, refuse writes.
+    const db = openDatabaseSyncOrThrow(join(dataDir, 'session-turns', 'turns.sqlite'), { readOnly: false });
+    try {
+      db.prepare('INSERT OR IGNORE INTO closed_sessions VALUES (?)').run(sessionId);
+    } finally {
+      db.close();
+    }
+    const fenced = recordSessionTurnReplies(dataDir, sessionId, 'turn-multi', [
+      { messageId: 'om_after_close', responseKind: 'auxiliary', at: 2001, text: 'late' },
+    ]);
+    expect(fenced).toEqual({ staged: false, recorded: 0, duplicates: 0, recordedTextChars: 0 });
   });
 });
