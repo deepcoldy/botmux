@@ -183,6 +183,12 @@ export interface CodexPendingTurn {
    *  lease anchors it is never refreshed, so it can be compared with later
    *  screen observations of whether the CLI still holds the input. */
   writeSettledAtMs?: number;
+  /** Local observation time when an earlier started turn reached its terminal
+   *  edge while this mark was waiting unstarted behind it. Busy-tick lease
+   *  refresh caps (`maxSinceMarkMs`) measure from the later of `markTimeMs` and
+   *  this hand-off edge so a type-ahead follow-up that waited > 120s behind a
+   *  long predecessor still gets its own bounded window to flush its `user` row. */
+  predecessorTerminalAtMs?: number;
   /** The worker still owns an ambiguous draft in this CLI generation. Keep
    * its exact fingerprint for a later manual submit, without claiming success. */
   inputDeliveryQuarantined?: true;
@@ -983,9 +989,13 @@ export class CodexBridgeQueue {
         && nowMs - head.submitVerificationStartedAtMs <= STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS) {
         continue;
       }
+      const capAnchorMs = head.predecessorTerminalAtMs !== undefined
+        && (head.markTimeMs === undefined || head.predecessorTerminalAtMs > head.markTimeMs)
+        ? head.predecessorTerminalAtMs
+        : head.markTimeMs;
       if (maxSinceMarkMs !== undefined
-        && head.markTimeMs !== undefined
-        && nowMs - head.markTimeMs > maxSinceMarkMs) {
+        && capAnchorMs !== undefined
+        && nowMs - capAnchorMs > maxSinceMarkMs) {
         continue;
       }
       if (head.submitConfirmedAtMs !== undefined) {
@@ -1304,21 +1314,24 @@ export class CodexBridgeQueue {
     }
   }
 
-  /** Refresh the next queued submit from the locally-observed terminal edge.
+  /** Refresh queued unstarted submits from the locally-observed terminal edge.
    *  External transcript clocks may be skewed, so lease boundedness must use
-   *  this process's clock for both successful and aborted predecessors. */
+   *  this process's clock for both successful and aborted predecessors. Every
+   *  unstarted successor that waited behind the completed turn gets its lease
+   *  and busy-refresh cap re-anchored to this hand-off time. */
   private refreshNextPreStartLease(): void {
-    const nextPending = this.queue.find(turn => !turn.started
-      && turn.finalText === undefined && !turn.passedBySuccessor);
-    if (!nextPending) return;
-    // RPC turns keep their own rpcActive flag for lifecycle gating; do not
-    // overwrite it with a bounded confirmation/attribution lease.
-    if (nextPending.rpcActive) return;
     const observedAtMs = this.now();
-    if (nextPending.submitConfirmedAtMs !== undefined) {
-      nextPending.submitConfirmedAtMs = observedAtMs;
-    } else {
-      nextPending.unconfirmedAttributionStartedAtMs = observedAtMs;
+    for (const nextPending of this.queue) {
+      if (nextPending.started || nextPending.finalText !== undefined || nextPending.passedBySuccessor) continue;
+      // RPC turns keep their own rpcActive flag for lifecycle gating; do not
+      // overwrite it with a bounded confirmation/attribution lease.
+      if (nextPending.rpcActive) continue;
+      nextPending.predecessorTerminalAtMs = observedAtMs;
+      if (nextPending.submitConfirmedAtMs !== undefined) {
+        nextPending.submitConfirmedAtMs = observedAtMs;
+      } else {
+        nextPending.unconfirmedAttributionStartedAtMs = observedAtMs;
+      }
     }
   }
 

@@ -1250,6 +1250,33 @@ describe('IdleDetector: quiescence detection', () => {
     expect(cb, 'turn-2 idle must fire on the post-turn "Add a follow-up" placeholder').toHaveBeenCalledTimes(2);
     detector.dispose();
   });
+
+  it('cursor: auto-dequeued follow-up flips external idle back to busy via idleToBusyPattern', () => {
+    const detector = new IdleDetector(createCursorAdapter('/bin/cursor-agent'));
+    const onIdle = vi.fn();
+    const onBusy = vi.fn();
+    detector.onIdle(onIdle);
+    detector.onBusy(onBusy);
+
+    // Predecessor turn ends via transcript assistant_final -> fireIdle().
+    detector.fireIdle();
+    expect(onIdle).toHaveBeenCalledTimes(1);
+    expect(onBusy).toHaveBeenCalledTimes(0);
+
+    // Prose mentioning ctrl+c to stop without the composer prompt does not trip busy.
+    detector.feed('  Tip: press ctrl+c to stop a shell tool\n');
+    expect(onBusy).toHaveBeenCalledTimes(0);
+
+    // Cursor auto-dequeues a follow-up from its queue and renders ctrl+c to stop on the composer row.
+    detector.feed('  → Add a follow-up                                      ctrl+c to stop\n');
+    expect(onBusy).toHaveBeenCalledTimes(1);
+
+    // Once that follow-up finishes and the idle composer redraws, idle fires again.
+    detector.feed('  → Add a follow-up\n');
+    vi.advanceTimersByTime(3500);
+    expect(onIdle).toHaveBeenCalledTimes(2);
+    detector.dispose();
+  });
 });
 
 // ─── ANSI stripping ──────────────────────────────────────────────────────
