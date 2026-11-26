@@ -176,7 +176,7 @@ import { parseGroupSerialInput } from './group-serial-input.js';
 import { setGroupDefaultModels } from '../services/group-default-models-store.js';
 import { parseGroupDefaultModels } from './group-default-models.js';
 import { setChatStreamingCardPin } from '../services/pin-streaming-card-mode-store.js';
-import { isValidRiffBaseUrl, isValidRiffSandboxCluster } from '../adapters/backend/riff-backend.js';
+import { isValidRiffAgent, isValidRiffBaseUrl, isValidRiffSandboxCluster } from '../adapters/backend/riff-backend.js';
 import { probeScratchCapability } from '../adapters/backend/scratch-capability.js';
 import { ensureBackendAvailable } from '../services/backend-availability.js';
 import type { BackendType } from '../adapters/backend/types.js';
@@ -256,6 +256,22 @@ import { defaultReplyDeliveryFor, effectiveReplyDelivery, supportsTranscriptRepl
 import { resolveFeedbackTeamId, traceFeedbackPolicyForDelivery } from '../services/feedback-policy-resolver.js';
 import { prepareReplyCardNativeThinking, replyCardDispatchAttempt } from './turn-reply-card.js';
 import { recordRelayedTurnDelivery, RELAYED_TURN_DELIVERY_MAX_BYTES, RELAYED_TURN_DELIVERY_ROUTE } from './relayed-turn-delivery.js';
+import {
+  createTurnReplyQuotaTracker,
+  openRelayedTurnReplyRequest,
+  parseRelayedTurnReplyAuthHeaders,
+  recordRelayedTurnReply,
+  RELAYED_TURN_REPLY_BODY_TIMEOUT_MS,
+  RELAYED_TURN_REPLY_HEADERS,
+  RELAYED_TURN_REPLY_MAX_BYTES,
+  RELAYED_TURN_REPLY_MAX_IN_FLIGHT,
+  RELAYED_TURN_REPLY_MAX_IN_FLIGHT_PER_SESSION,
+  RELAYED_TURN_REPLY_ROUTE,
+  signRelayedTurnReplyResponse,
+  verifyRelayedTurnReplyRequestProof,
+  type RelayedTurnReplyKey,
+  type RelayedTurnReplyRequestAuth,
+} from './relayed-turn-reply.js';
 import { FEEDBACK_SEND_LEASE_ROUTE, handleFeedbackSendLeaseRelay } from '../services/feedback-send-lease-relay.js';
 import { resolveNamespaceLocalPid } from './pid-namespace-peer.js';
 import {
@@ -480,6 +496,7 @@ import {
   sessionWakeAcquireTimeoutMs,
 } from './session-wake-deadline.js';
 import {
+  hasNonActivationSessionMutationOwnership,
   hasProtectedSessionMutationOwnership,
   protectedSessionMutationReasons,
 } from './session-mutation-guard.js';
@@ -922,6 +939,7 @@ function ipcErrorText(err: unknown): string {
 function rejectProtectedSessionMutation(
   res: ServerResponse,
   values: readonly (DaemonSession | Session)[],
+  opts: { allowActivationReplay?: boolean } = {},
 ): boolean {
   const bySessionId = new Map<string, {
     sessionId: string;
@@ -931,6 +949,7 @@ function rejectProtectedSessionMutation(
     reasons: ReturnType<typeof protectedSessionMutationReasons>;
   }>();
   for (const value of values) {
+    if (opts.allowActivationReplay && !hasNonActivationSessionMutationOwnership(value)) continue;
     const session = 'session' in value ? value.session : value;
     const reasons = protectedSessionMutationReasons(value);
     if (reasons.length === 0) continue;
@@ -1163,6 +1182,10 @@ async function readBoundedJsonBodyWithRaw<T = unknown>(
     }
   }
   return await new Promise<{ body: T; raw: Buffer }>((resolve, reject) => {
+    if (req.aborted || req.destroyed) {
+      reject(new Error('request aborted'));
+      return;
+    }
     const chunks: Buffer[] = [];
     let total = 0;
     let settled = false;
@@ -1172,6 +1195,7 @@ async function readBoundedJsonBodyWithRaw<T = unknown>(
       req.off('end', onEnd);
       req.off('error', onError);
       req.off('aborted', onAborted);
+      req.off('close', onClose);
     };
     const fail = (err: Error) => {
       if (settled) return;
@@ -1205,6 +1229,9 @@ async function readBoundedJsonBodyWithRaw<T = unknown>(
     };
     const onError = (err: Error) => fail(err);
     const onAborted = () => fail(new Error('request aborted'));
+    const onClose = () => {
+      if (!req.readableEnded) fail(new Error('request aborted'));
+    };
     const timer = setTimeout(
       () => fail(new IpcBodyTimeoutError('request body timed out')),
       timeoutMs,
@@ -1214,6 +1241,7 @@ async function readBoundedJsonBodyWithRaw<T = unknown>(
     req.once('end', onEnd);
     req.once('error', onError);
     req.once('aborted', onAborted);
+    req.once('close', onClose);
   });
 }
 
@@ -1381,7 +1409,7 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
   // 该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
-  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|chat-manager|rename|project|project-workstream|dispatch-tree|decision-board|decision-board\/upload|task-routing|project-dispatch-policy|continuation|durable-send|turn-delivery|feedback-send-lease|reply-card-ready|feedback-bind|deferred-topic|link-refs\/register|link-refs\/resolve|auth-request|auth-status)$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|chat-manager|rename|project|project-workstream|dispatch-tree|decision-board|decision-board\/upload|task-routing|project-dispatch-policy|continuation|durable-send|turn-delivery|turn-reply|feedback-send-lease|reply-card-ready|feedback-bind|deferred-topic|link-refs\/register|link-refs\/resolve|auth-request|auth-status)$/.test(pathname)) return true;
   // UserPromptSubmit hook 的 envelope claim：沙箱内 hook 读不到 host secret，
   // 走 body 里的 per-turn capability；handler 内 sessionCliIpcAuth 绑定到 URL 的
   // sessionId + 按 managedTurnOrigin.turnId 权威取（同 /close 姿势）。
@@ -1484,6 +1512,10 @@ export function __testOnly_resetManagedOriginRuntimeAuthState(): void {
   managedOriginPreauthInFlight = 0;
   nativeSubagentRuntimePreauthInFlight = 0;
   nativeSubagentRuntimeNonceStore = createNativeSubagentRuntimeNonceStore();
+  relayedTurnReplyInFlight = 0;
+  relayedTurnReplySessionInFlight.clear();
+  relayedTurnReplyQuota.clear();
+  relayedTurnReplyResultCache.clear();
 }
 /** @internal test-only: override runtime nonce-store behavior for capacity tests. */
 export function __testOnly_setNativeSubagentRuntimeNonceStore(
@@ -2647,6 +2679,252 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
   }
 });
 
+let relayedTurnReplyInFlight = 0;
+const relayedTurnReplySessionInFlight = new Map<string, number>();
+const relayedTurnReplyQuota = createTurnReplyQuotaTracker();
+
+interface RelayedTurnReplyCacheEntry {
+  state: 'pending' | 'done' | 'failed';
+  expiresAt: number;
+  raw?: string;
+}
+const RELAYED_TURN_REPLY_RESULT_CACHE_TTL_MS = 10 * 60_000;
+const RELAYED_TURN_REPLY_FAILURE_TTL_MS = 30_000;
+const RELAYED_TURN_REPLY_RESULT_CACHE_MAX_KEYS = 1024;
+const relayedTurnReplyResultCache = new Map<string, RelayedTurnReplyCacheEntry>();
+
+function pruneRelayedTurnReplyResultCache(now = Date.now()): void {
+  for (const [key, entry] of relayedTurnReplyResultCache) {
+    if (entry.expiresAt <= now) relayedTurnReplyResultCache.delete(key);
+  }
+  while (relayedTurnReplyResultCache.size > RELAYED_TURN_REPLY_RESULT_CACHE_MAX_KEYS) {
+    const oldest = relayedTurnReplyResultCache.keys().next().value;
+    if (oldest === undefined) break;
+    relayedTurnReplyResultCache.delete(oldest);
+  }
+}
+
+/** Host-side structured turn-reply writer for an isolated CLI that cannot open
+ *  the shared `<DATA_DIR>/session-turns/turns.sqlite` store directly.
+ *  Authenticates and applies pre-body rate & per-session/global in-flight
+ *  bounds BEFORE buffering any body bytes, then synchronously re-verifies the
+ *  live origin after reading the bounded JSON body (zero TOCTOU). */
+ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_REPLY_ROUTE}`, async (req, res, params) => {
+  if (req.aborted || req.destroyed || res.destroyed) return;
+  const trustedHost = isTrustedHostIpcRequest(req);
+  const headerClaim = parseRelayedTurnReplyAuthHeaders(req.headers);
+  const ds = findActiveBySessionId(params.sessionId);
+  const candidateKey: RelayedTurnReplyKey | undefined = headerClaim.keyKind === 'capability'
+    && ds?.managedTurnOrigin?.capability
+    ? { kind: 'capability', material: ds.managedTurnOrigin.capability }
+    : headerClaim.keyKind === 'host' && trustedHost && trustedHostRequestSecrets.get(req)
+      ? { kind: 'host', material: trustedHostRequestSecrets.get(req)! }
+      : undefined;
+  const authenticated = candidateKey && verifyRelayedTurnReplyRequestProof({
+    key: candidateKey,
+    sessionId: params.sessionId,
+    auth: headerClaim,
+  });
+  const signer = authenticated && headerClaim.turnId && headerClaim.requestNonce
+    ? { key: candidateKey!, auth: headerClaim as RelayedTurnReplyRequestAuth }
+    : undefined;
+  const replyRaw = (status: number, raw: string): void => {
+    if (signer) {
+      res.setHeader(
+        RELAYED_TURN_REPLY_HEADERS.responseProof,
+        signRelayedTurnReplyResponse({
+          key: signer.key,
+          sessionId: params.sessionId,
+          turnId: signer.auth.turnId,
+          dispatchAttempt: signer.auth.dispatchAttempt,
+          requestNonce: signer.auth.requestNonce,
+          status,
+          raw,
+        }),
+      );
+    }
+    res.writeHead(status, { 'content-type': 'application/json' });
+    res.end(raw);
+  };
+  const reply = (status: number, body: Record<string, unknown>): void => {
+    replyRaw(status, JSON.stringify(body));
+  };
+  if (!authenticated || !signer) {
+    closeUntrustedRequestAfterResponse(req, res);
+    return reply(403, { ok: false, error: 'origin_unproven' });
+  }
+  if (!ds || ds.session.status === 'closed') {
+    if (trustedHost) {
+      drainRequest(req);
+      return reply(404, { ok: false, error: 'session_not_active' });
+    }
+    closeUntrustedRequestAfterResponse(req, res);
+    return reply(403, { ok: false, error: 'origin_unproven' });
+  }
+  const initialTurnId = ds.managedTurnOrigin?.turnId;
+  if (!initialTurnId) {
+    if (trustedHost) drainRequest(req);
+    else closeUntrustedRequestAfterResponse(req, res);
+    return reply(409, { ok: false, error: 'turn_unbound' });
+  }
+  if (signer.auth.turnId !== initialTurnId) {
+    if (trustedHost) drainRequest(req);
+    else closeUntrustedRequestAfterResponse(req, res);
+    return reply(409, { ok: false, error: 'turn_mismatch' });
+  }
+
+  // Exact replay gets the already-authenticated result without reading the body
+  // or consuming another pre-body request slot. The cached 200 acknowledges the
+  // ORIGINAL authenticated payload hash; changed bytes have no committed effect.
+  // Pending duplicates coalesce to a retryable 503 instead of becoming another
+  // slow body / in-flight occupant.
+  pruneRelayedTurnReplyResultCache();
+  const resultCacheKey = JSON.stringify([
+    params.sessionId,
+    signer.key.kind,
+    signer.auth.turnId,
+    signer.auth.requestNonce,
+    signer.auth.payloadSha256,
+  ]);
+  const cached = relayedTurnReplyResultCache.get(resultCacheKey);
+  if (cached?.state === 'done' && cached.raw !== undefined) {
+    relayedTurnReplyResultCache.delete(resultCacheKey);
+    relayedTurnReplyResultCache.set(resultCacheKey, cached);
+    if (trustedHost) drainRequest(req);
+    else closeUntrustedRequestAfterResponse(req, res);
+    return replyRaw(200, cached.raw);
+  }
+  if (cached) {
+    if (trustedHost) drainRequest(req);
+    else closeUntrustedRequestAfterResponse(req, res);
+    return reply(503, {
+      ok: false,
+      error: cached.state === 'pending' ? 'turn_reply_in_progress' : 'turn_reply_retry_required',
+    });
+  }
+  const preQuota = relayedTurnReplyQuota.admitPreBodyRequest(params.sessionId, initialTurnId);
+  if (!preQuota.ok) {
+    if (trustedHost) drainRequest(req);
+    else closeUntrustedRequestAfterResponse(req, res);
+    return reply(429, { ok: false, error: preQuota.error });
+  }
+  const sessionInFlight = relayedTurnReplySessionInFlight.get(params.sessionId) ?? 0;
+  if (!trustedHost && (
+    relayedTurnReplyInFlight >= RELAYED_TURN_REPLY_MAX_IN_FLIGHT
+    || sessionInFlight >= RELAYED_TURN_REPLY_MAX_IN_FLIGHT_PER_SESSION
+  )) {
+    closeUntrustedRequestAfterResponse(req, res);
+    return reply(429, { ok: false, error: 'too_many_turn_reply_requests' });
+  }
+
+  if (!trustedHost) {
+    relayedTurnReplyInFlight += 1;
+    relayedTurnReplySessionInFlight.set(params.sessionId, sessionInFlight + 1);
+  }
+  const pendingCacheEntry: RelayedTurnReplyCacheEntry = {
+    state: 'pending',
+    expiresAt: Date.now() + RELAYED_TURN_REPLY_RESULT_CACHE_TTL_MS,
+  };
+  relayedTurnReplyResultCache.set(resultCacheKey, pendingCacheEntry);
+  pruneRelayedTurnReplyResultCache();
+  let body: unknown;
+  try {
+    body = await readBoundedJsonBody<unknown>(
+      req,
+      RELAYED_TURN_REPLY_MAX_BYTES,
+      RELAYED_TURN_REPLY_BODY_TIMEOUT_MS,
+    );
+  } catch (error) {
+    if (req.aborted || req.destroyed || res.destroyed) return;
+    if (error instanceof IpcBodyTooLargeError) {
+      closeUntrustedRequestAfterResponse(req, res);
+      return reply(413, { ok: false, error: 'body_too_large' });
+    }
+    if (error instanceof IpcBodyTimeoutError) {
+      closeUntrustedRequestAfterResponse(req, res);
+      return reply(408, { ok: false, error: 'body_timeout' });
+    }
+    return reply(400, { ok: false, error: 'bad_json' });
+  } finally {
+    if (relayedTurnReplyResultCache.get(resultCacheKey) === pendingCacheEntry) {
+      // A failed/aborted request leaves a short retry tombstone, not a terminal
+      // 400 cache: exact replays stop consuming pre-body quota, while the real
+      // client can immediately reseal the same replies under a fresh nonce.
+      relayedTurnReplyResultCache.set(resultCacheKey, {
+        state: 'failed',
+        expiresAt: Date.now() + RELAYED_TURN_REPLY_FAILURE_TTL_MS,
+      });
+    }
+    if (!trustedHost) {
+      relayedTurnReplyInFlight = Math.max(0, relayedTurnReplyInFlight - 1);
+      const remaining = (relayedTurnReplySessionInFlight.get(params.sessionId) ?? 1) - 1;
+      if (remaining > 0) relayedTurnReplySessionInFlight.set(params.sessionId, remaining);
+      else relayedTurnReplySessionInFlight.delete(params.sessionId);
+    }
+  }
+
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return reply(400, { ok: false, error: 'bad_json' });
+  }
+
+  // Zero-TOCTOU post-read re-verification: synchronous from here to SQLite commit.
+  const currentDs = findActiveBySessionId(params.sessionId);
+  if (!currentDs || currentDs !== ds || currentDs.session.status === 'closed') {
+    return reply(
+      trustedHost ? 404 : 403,
+      { ok: false, error: trustedHost ? 'session_not_active' : 'origin_unproven' },
+    );
+  }
+  const currentOrigin = currentDs.managedTurnOrigin;
+  if (!currentOrigin?.turnId) {
+    return reply(
+      trustedHost ? 409 : 403,
+      { ok: false, error: trustedHost ? 'turn_mismatch' : 'origin_unproven' },
+    );
+  }
+  if (currentOrigin.turnId !== initialTurnId) {
+    return reply(409, { ok: false, error: 'turn_mismatch' });
+  }
+  if (signer.key.kind === 'capability') {
+    const postAuth = verifyRelayedTurnReplyRequestProof({
+      key: { kind: 'capability', material: currentOrigin.capability },
+      sessionId: params.sessionId,
+      auth: headerClaim,
+    });
+    if (!postAuth) {
+      return reply(403, { ok: false, error: 'origin_unproven' });
+    }
+  }
+
+  const plaintext = openRelayedTurnReplyRequest({
+    key: signer.key,
+    sessionId: params.sessionId,
+    auth: signer.auth,
+    body,
+  });
+  if (!plaintext) {
+    return reply(400, { ok: false, error: 'invalid_turn_reply' });
+  }
+  const result = recordRelayedTurnReply({
+    ds: currentDs,
+    body: plaintext as unknown as Record<string, unknown>,
+    dataDir: config.session.dataDir,
+    quota: relayedTurnReplyQuota,
+    quotaSlot: preQuota.slot,
+  });
+  if (result.ok) {
+    const raw = JSON.stringify(result);
+    relayedTurnReplyResultCache.set(resultCacheKey, {
+      state: 'done',
+      expiresAt: Date.now() + RELAYED_TURN_REPLY_RESULT_CACHE_TTL_MS,
+      raw,
+    });
+    pruneRelayedTurnReplyResultCache();
+    return replyRaw(200, raw);
+  }
+  return reply(result.status, { ok: false, error: result.error });
+});
+
 /** Feedback send lease for an isolated CLI that cannot take it in-process
  * (see acquireFeedbackSendLeaseFor); bound to the authenticated session. */
 ipcRoute('POST', `/api/sessions/:sessionId/${FEEDBACK_SEND_LEASE_ROUTE}`, async (req, res, params) => {
@@ -3374,7 +3652,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/restart', async (_req, res, params) =
       message: t('cmd.restart.remote_unsupported', undefined, localeForBot(ds.larkAppId)),
     });
   }
-  if (rejectProtectedSessionMutation(res, [ds])) return;
+  if (rejectProtectedSessionMutation(res, [ds], { allowActivationReplay: true })) return;
   // A correlated restart (IM /restart, card, crash auto-restart, an earlier
   // click) is still in flight. Joining it would silently drop what this click
   // is for — the operator usually just saved env / model / tool binding, and
@@ -3403,7 +3681,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/restart', async (_req, res, params) =
   // still-alive pane, so the revive is a real relaunch rather than a reattach
   // to the wedged CLI — and its result can update the status card.
   const revived = !ds.worker || ds.worker.killed;
-  const restart = requestSessionRestart(ds, dashboardRestartObserver(ds));
+  const restart = requestSessionRestart(ds, dashboardRestartObserver(ds), { allowUnconfirmedActivationReplay: true });
   if (!restart) return jsonRes(res, 409, { ok: false, error: 'session_transferring' });
   if (restart.startFailure) {
     return jsonRes(res, 502, { ok: false, error: ipcErrorText(restart.startFailure.error) });
@@ -14225,7 +14503,7 @@ ipcRoute('DELETE', '/api/bot-trigger-user-auth/users/:openId', requireBoundBot(a
 /** riff 配置里 dashboard 可编辑的字段——PUT /bot-riff 只覆盖这些，其余保留。 */
 // injectStatusLines 已从 dashboard UI 移除（恒默认开启）——不在此集合中意味着
 // 存量 bots.json 值按「隐藏字段」原样保留。
-const RIFF_UI_EDITABLE_KEYS = new Set(['baseUrl', 'sandboxCluster', 'model', 'reasoningEffort', 'jwtEnv', 'systemPrompt', 'setupCommands']);
+const RIFF_UI_EDITABLE_KEYS = new Set(['baseUrl', 'sandboxCluster', 'agent', 'model', 'reasoningEffort', 'jwtEnv', 'systemPrompt', 'setupCommands']);
 
 /** 发给浏览器前脱敏：明文 jwt / env（可能含各类密钥）绝不进 dashboard 响应。 */
 function redactRiffForClient(riff: unknown): Record<string, unknown> | null {
@@ -14246,12 +14524,20 @@ botConfigPutRoute<{ riff?: unknown }>('/api/bot-riff', 'riff', {
     // 一个 model 就会静默删掉认证等隐藏配置。
     const prev = (getBot(cachedLarkAppId).config.riff ?? {}) as Record<string, unknown>;
     const preserved = Object.fromEntries(Object.entries(prev).filter(([k]) => !RIFF_UI_EDITABLE_KEYS.has(k)));
-    // Older dashboard clients do not send sandboxCluster. Preserve a valid
-    // existing selection for them; a brand-new config follows Riff's BOE
-    // default. New clients always submit the explicit dropdown value.
+    // Older dashboard clients do not send sandboxCluster or agent. Preserve a valid
+    // existing selection for them (and keep legacy hidden agent values untouched);
+    // a brand-new config follows Riff's BOE / codex defaults. New clients always
+    // submit the explicit dropdown values.
     const sandboxCluster = value.sandboxCluster ?? prev.sandboxCluster ?? 'boe';
     if (!isValidRiffSandboxCluster(sandboxCluster)) return fieldInvalid('invalid_sandbox_cluster');
-    value = { ...preserved, ...value, sandboxCluster };
+    if (value.agent !== undefined && !isValidRiffAgent(value.agent)) return fieldInvalid('invalid_agent');
+    const agent = value.agent !== undefined ? value.agent : prev.agent;
+    value = {
+      ...preserved,
+      ...value,
+      sandboxCluster,
+      ...(agent !== undefined ? { agent } : {}),
+    };
     if (!isValidRiffBaseUrl(value.baseUrl)) return fieldInvalid('invalid_base_url');
     return fieldOk(value);
   },
@@ -15099,7 +15385,10 @@ export function startIpcServer(opts: {
           return jsonRes(res, 401, { ok: false, error: 'unauthorized', reason: auth.reason });
         }
       }
-      if (!publicRoute && opts.ready) await opts.ready;
+      if (!publicRoute && opts.ready) {
+        await opts.ready;
+        if (req.aborted || req.destroyed || res.destroyed) return;
+      }
       for (const r of routes) {
         if (r.method !== req.method) continue;
         const m = r.pattern.exec(url.pathname);
@@ -15145,6 +15434,10 @@ export function startIpcServer(opts: {
     server.once('close', () => {
       workspaceRecycleRuntime.stop();
       sessionAuthRequests.disposeAndClear();
+      relayedTurnReplyInFlight = 0;
+      relayedTurnReplySessionInFlight.clear();
+      relayedTurnReplyQuota.clear();
+  relayedTurnReplyResultCache.clear();
     });
     return {
     port,

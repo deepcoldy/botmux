@@ -65,6 +65,13 @@ export interface PersistedAsk {
   larkAppId: string;
   chatId: string;
   rootMessageId: string | null;
+  /** Original question topic for chat-scope asks, retained so text replies stay isolated after restart. */
+  cardRootMessageId?: string;
+  /** Explicit persistence marker distinguishing records written with topic-isolated
+   *  text routing from pre-upgrade v2 records whose card topic was never persisted.
+   *  Rootless cross-principal choice cards retain an origin-scoped compatibility
+   *  fallback even with this marker; ordinary asks remain strictly isolated. */
+  topicIsolated?: true;
   sessionId: string;
   chatType?: 'group' | 'p2p';
   /** Optional app-scoped responder lock for host-owned approval asks. */

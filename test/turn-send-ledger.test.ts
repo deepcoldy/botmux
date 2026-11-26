@@ -583,4 +583,54 @@ describe('TurnSendLedger per-session layout', () => {
       expect(() => ledger.inspect()).toThrow('filed under another session');
     });
   });
+
+  it('persists exact pre-dispatch sentAtMs on final completion and returns it on replay while staying legacy-compatible', async () => {
+    await withLedger(async ledger => {
+      const sentAtMs = 1_700_000_000_123;
+      const first = await ledger.execute(key, 'final', 'answer', async () => 'om_exact', { sentAtMs });
+      expect(first).toEqual({ messageId: 'om_exact', replayed: false, sentAtMs });
+      expect(ledger.read(key)?.final?.sentAtMs).toBe(sentAtMs);
+
+      const preflight = await ledger.replayOrThrow(key, 'final', 'answer');
+      expect(preflight).toEqual({ messageId: 'om_exact', replayed: true, sentAtMs });
+
+      const retry = await ledger.execute(key, 'final', 'answer', async () => 'om_never', { sentAtMs: sentAtMs + 9999 });
+      expect(retry).toEqual({ messageId: 'om_exact', replayed: true, sentAtMs });
+
+      const seqKey = { ...key, turnId: 'turn_doc_seq' };
+      const seqFirst = await ledger.executeNonIdempotentSequence(
+        seqKey, 'final', 'doc reply', 1, async () => {}, 'doc:comment_1', { sentAtMs: sentAtMs + 50 },
+      );
+      expect(seqFirst).toEqual({ messageId: 'doc:comment_1', replayed: false, sentAtMs: sentAtMs + 50 });
+      const seqReplay = await ledger.executeNonIdempotentSequence(
+        seqKey, 'final', 'doc reply', 1, async () => { throw new Error('must not run'); }, 'doc:comment_1', { sentAtMs: sentAtMs + 999 },
+      );
+      expect(seqReplay).toEqual({ messageId: 'doc:comment_1', replayed: true, sentAtMs: sentAtMs + 50 });
+
+      // Legacy records without sentAtMs still replay cleanly with sentAtMs omitted.
+      const legacyKey = { ...key, turnId: 'turn_legacy_no_sent_at' };
+      await ledger.execute(legacyKey, 'final', 'legacy', async () => 'om_legacy');
+      expect(await ledger.replayOrThrow(legacyKey, 'final', 'legacy')).toEqual({ messageId: 'om_legacy', replayed: true });
+
+      // Sub-1 floats and unsafe integers passed into execute are omitted rather than self-corrupting the record.
+      const subOneKey = { ...key, turnId: 'turn_sub_one' };
+      expect(await ledger.execute(subOneKey, 'final', 'sub', async () => 'om_sub', { sentAtMs: 0.5 }))
+        .toEqual({ messageId: 'om_sub', replayed: false });
+      expect(ledger.read(subOneKey)?.final?.sentAtMs).toBeUndefined();
+
+      const unsafeKey = { ...key, turnId: 'turn_unsafe_int' };
+      expect(await ledger.executeNonIdempotentSequence(
+        unsafeKey, 'final', 'unsafe', 1, async () => {}, 'doc:cmt', { sentAtMs: 1e25 },
+      )).toEqual({ messageId: 'doc:cmt', replayed: false });
+      expect(ledger.read(unsafeKey)?.final?.sentAtMs).toBeUndefined();
+
+      // Corrupted on-disk sentAtMs values (float, unsafe integer, <= 0, string, null) fail closed on read.
+      for (const bad of [123.45, 1e25, 0, -5, '1000', null]) {
+        const parsed = JSON.parse(readFileSync(ledger.recordPath(key), 'utf8'));
+        parsed.final.sentAtMs = bad;
+        writeFileSync(ledger.recordPath(key), JSON.stringify(parsed));
+        expect(() => ledger.read(key)).toThrow('Invalid turn-send final record');
+      }
+    });
+  });
 });

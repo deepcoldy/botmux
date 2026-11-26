@@ -4,9 +4,14 @@
 
 ```text
 /g 项目讨论 --agents Review,Build,Check --tag 项目群 --avatar name
-/g Project work --agents cli_review_app --tag "Project work"
+/g Project work --agents cli_review_app --tag "Project work" --dir ~/code/my-app --branch feat/demo
+/g --card
 /g --avatar off
 ```
+
+`--dir <目录>` 为新群绑定默认工作目录（存入本机共享的 `created-groups.json`），新群内任意本机机器人开会话时优先使用该目录（优先级低于显式 `/oncall bind`，高于默认 Oncall、Bot 默认目录与同群继承）。配合 `--branch <分支>` 会先为该仓库创建独立 git worktree 并绑定到新群。
+
+`--card` 弹出交互式建群卡片（下拉选择或手填工作目录、可选分支、可选群名，群名留空时沿用占位名与首条消息 AI 自动起名）。所有 `/g` 路径的成功、失败与前置校验错误均统一通过交互卡片回执（发送卡片失败时自动降级纯文本）。
 
 `--agents` 接受逗号分隔的机器人显示名或 app ID；名称不区分大小写。机器人可以不在来源群内，但必须存在于本机当前 `bots.json` 配置中且启用飞书连接；`bots-info.json` 只辅助解析显示名，历史条目不参与成员选择。未知名称或重名会在建群前报错，重名时请使用 app ID。创建机器人始终保留。
 
@@ -17,10 +22,13 @@
   "groupCreation": {
     "agents": ["cli_review_app", "cli_build_app", "cli_check_app"],
     "tag": "项目群",
-    "avatar": "name"
+    "avatar": "name",
+    "card": true
   }
 }
 ```
+
+`"card": true` 开启后，不带群名/目录/分支/任务的裸 `/g` 会弹出建群卡片（默认 `false`，保持直接建群 + AI 自动起名的既有行为）；单次可用 `--no-card` 跳过卡片直接建群，或未开启时用 `--card` 单次弹出卡片。`--card` 不能与自动开工的任务（`--start`）同时使用。
 
 显式参数覆盖相应默认值。命令有 `@机器人` 时继续由第一个被 @ 的机器人创建群，并补齐默认名单，按 app ID 去重。例如默认配置三个机器人时，只 @ 其中一个执行 `/g`，也会邀请整个组合。显式 `--agents` 替换默认名单，`--no-agents` 忽略默认名单，`--no-tag` 忽略默认分组，`--avatar off` 忽略默认头像。这些选项不会删除明确 @ 的机器人。
 

@@ -57,7 +57,7 @@ describe('推荐标记：卡片上换成「推荐」标签，答案仍是原始�
   ])('%s → 标签去掉标记并带推荐标签', async label => {
     const { card } = await open([single({ options: [{ key: label, label }, { key: 'b', label: '带老人' }] })]);
     const [first, second] = checkers(card);
-    expect(first.text.content.split('\n')[0]).toBe(`**带小孩** <text_tag color='green'>${t('card.ask.recommended')}</text_tag>`);
+    expect(first.text.content.split('\n')[0]).toBe(`带小孩 <text_tag color='green'>${t('card.ask.recommended')}</text_tag>`);
     expect(second.text.content).not.toContain('text_tag');
   });
 
@@ -69,7 +69,7 @@ describe('推荐标记：卡片上换成「推荐」标签，答案仍是原始�
     const rows = checkers(card);
     expect(rows.map(row => row.text.content.includes('text_tag'))).toEqual([true, true, true, false]);
     expect(rows.map(row => row.checked)).toEqual([false, true, false, false]);
-    expect(labelLines(card).map(line => line.replace(/ <text_tag.*$/, ''))).toEqual(['**徒步**', '**乐园**', '**美食**', '**泡温泉**']);
+    expect(labelLines(card).map(line => line.replace(/ <text_tag.*$/, ''))).toEqual(['徒步', '乐园', '美食', '泡温泉']);
   });
 
   it('只有标记本身的标签不会被删成空白', async () => {
@@ -269,16 +269,16 @@ describe('题目形态', () => {
     expect(inputs.map(n => [n.name, n.placeholder.content])).toEqual([
       ['custom_0', t('card.ask.text_placeholder')], ['custom_1', t('card.ask.custom_placeholder')]]);
     const headings = all(card).filter(n => n.text_size === 'heading').map(n => n.content);
-    expect(headings).toEqual(['**1. 补充说明**', '**2. 去几天？**']);
+    expect(headings).toEqual(['1\\. 补充说明', '2\\. 去几天？']);
     const one = (await open([single()])).card;
-    expect(all(one).filter(n => n.text_size === 'heading').map(n => n.content)).toEqual(['**去几天？**']);
+    expect(all(one).filter(n => n.text_size === 'heading').map(n => n.content)).toEqual(['去几天？']);
   });
 
   it('多行问题：第一行是大字标题，其余行正常大小紧随其后', async () => {
     const { card } = await open([single({ prompt: '要发布吗？\n改动：修复登录\n影响：全部用户' })]);
     const column = all(card).find(n => n.tag === 'column' && n.elements.some((e: any) => e.text_size === 'heading'));
     const at = column.elements.findIndex((e: any) => e.text_size === 'heading');
-    expect(column.elements[at].content).toBe('**要发布吗？**');
+    expect(column.elements[at].content).toBe('要发布吗？');
     expect(column.elements[at + 1]).toMatchObject({ tag: 'markdown', text_size: 'normal', content: '改动：修复登录\n影响：全部用户' });
   });
 
@@ -301,12 +301,12 @@ describe('已结束的卡', () => {
     const answered: AskResult = { kind: 'answered', answers: [['one'], []], by: 'ou_owner', comment: null, timedOut: false };
     const card = JSON.parse(buildAskCard(ask(), answered));
     expect(card.header).toMatchObject({ template: 'green', title: { content: t('card.ask.header.answered') } });
-    expect(all(card).filter(n => n.text_size === 'heading').map(n => n.content)).toEqual(['**1. 去几天？**', '**2. 玩什么？**']);
+    expect(all(card).filter(n => n.text_size === 'heading').map(n => n.content)).toEqual(['1\\. 去几天？', '2\\. 玩什么？']);
     const lines = answerLines(card);
-    expect(lines[0]).toMatch(/^✓ \*\*当天\*\* <text_tag[^>]*>.*<\/text_tag>\n<font color='grey'>不用订住宿<\/font>$/);
+    expect(lines[0]).toMatch(/^✓ 当天 <text_tag[^>]*>.*<\/text_tag>\n<font color='grey'>不用订住宿<\/font>$/);
     expect(lines[1]).toContain(t('card.ask.answer.none'));
     const custom = JSON.parse(buildAskCard(ask(), { ...answered, answers: [[], ['hike']], customAnswers: ['<b>周末</b>', null] }));
-    expect(answerLines(custom)).toEqual(['✓ &lt;b&gt;周末&lt;/b&gt;', '✓ **徒步**']);
+    expect(answerLines(custom)).toEqual(['✓ &lt;b&gt;周末&lt;/b&gt;', '✓ 徒步']);
     expect(all(card).filter(n => n.behaviors || ['button', 'checker', 'input', 'form'].includes(n.tag))).toEqual([]);
   });
 
@@ -314,8 +314,8 @@ describe('已结束的卡', () => {
     const withNotes: AskResult = { kind: 'answered', answers: [['two'], ['hike', 'food']], notes: ['带一只*狗*', null],
       by: 'ou_owner', comment: null, timedOut: false };
     const lines = answerLines(JSON.parse(buildAskCard(ask(), withNotes)));
-    expect(lines[0]).toBe(`✓ **两天**\n${t('card.ask.note_line', { note: '带一只\\*狗\\*' })}`);
-    expect(lines[1]).toBe('✓ **徒步**\n✓ **美食**');
+    expect(lines[0]).toBe(`✓ 两天\n${t('card.ask.note_line', { note: '带一只\\*狗\\*' })}`);
+    expect(lines[1]).toBe('✓ 徒步\n✓ 美食');
   });
 
   it('提交人显示成飞书里的名字（只展示、不 @ 人），不是一串 open_id；非飞书用户 id 照原文', () => {
@@ -422,7 +422,7 @@ describe('元素上限（Card 2.0 每卡 200）与字节预算', () => {
       expect(card.body.elements.at(-1).content).toContain(t('card.ask.list_reply_hint'));
       const text = all(card).filter(n => n.tag === 'markdown').map(n => n.content).join('\n');
       expect(text).toContain(`选项 ${options}`);
-      expect(text).toContain(`${questions}. 问题 ${questions}`);
+      expect(text).toContain(`${questions}\\. 问题 ${questions}`);
       // The settled card of such an Ask stays within the limit too.
       const settled = renderAskCard(pending(qs), { kind: 'timedOut', selected: null, by: null, comment: null, timedOut: true });
       expect(tagged(JSON.parse(settled.json))).toBeLessThanOrEqual(FEISHU_CARD_ELEMENT_LIMIT);

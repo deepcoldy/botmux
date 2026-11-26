@@ -59,7 +59,7 @@ export function buildAskListBody(ask: PendingAsk, options: { locale: Locale; pro
       return `• ${text.content.replace(/\n/g, '\n   ')}`;
     });
     const [first = '', ...rest] = options.prompt(q.prompt).trim().split('\n');
-    return [`**${ask.questions.length > 1 ? `${i + 1}. ` : ''}${first.trim()}**`, ...rest, ...lines].join('\n');
+    return [`${ask.questions.length > 1 ? `${i + 1}\\. ` : ''}${first.trim()}`, ...rest, ...lines].join('\n');
   });
   return { descriptionsTruncated, elements: [{ tag: 'markdown', content: blocks.join('\n\n') }] };
 }
@@ -104,16 +104,16 @@ export function isRecommended(q: AskQuestion, option: AskOption): boolean {
   return recommendedLabel(option.label || option.key).recommended || !!q.defaultSelectedKeys?.includes(option.key);
 }
 
-/** `**label** [推荐]` plus the description in grey; `descriptionCap` limits the description. */
+/** Regular-weight `label [推荐]` plus the description in grey; `descriptionCap` limits the description. */
 export function optionContent(q: AskQuestion, option: AskOption, locale: Locale, descriptionCap = Infinity,
   options: { withDescription?: boolean } = {}): { content: string; truncated: boolean } {
   const label = escapeOptionText(recommendedLabel(option.label || option.key).label.trim() || option.key);
   const tag = isRecommended(q, option) ? ` <text_tag color='green'>${t('card.ask.recommended', undefined, locale)}</text_tag>` : '';
   const description = option.description ?? '';
-  if (!description || options.withDescription === false) return { content: `**${label}**${tag}`, truncated: false };
+  if (!description || options.withDescription === false) return { content: `${label}${tag}`, truncated: false };
   const truncated = description.length > descriptionCap;
   const shown = truncated ? (descriptionCap > 0 ? `${capChars(description, descriptionCap)}…` : '') : description;
-  return { content: `**${label}**${tag}${shown ? `\n${greyLines(escapeOptionText(shown))}` : ''}`, truncated };
+  return { content: `${label}${tag}${shown ? `\n${greyLines(escapeOptionText(shown))}` : ''}`, truncated };
 }
 
 function kindOf(q: AskQuestion): { kind: string; color: 'blue' | 'orange' } {
@@ -130,11 +130,12 @@ export function askEyebrow(q: AskQuestion, locale: Locale, how?: string): El {
     content: `<font color='${color}'>**${how ? `${text} · ${t(how, undefined, locale)}` : text}**</font>` };
 }
 
-/** The question in heading size, numbered when the Ask has several; lines after the first stay normal size. */
+/** The question in heading size without bold, numbered when the Ask has several; lines after the first stay normal size. */
 export function questionHeading(prompt: string, index: number, total: number): El[] {
   const [first = '', ...rest] = prompt.trim().split('\n');
+  // Keep the visible number literal now that it is no longer inside a bold span.
   const heading: El = { tag: 'markdown', text_size: 'heading', margin: '0px 0px -2px 0px',
-    content: `**${total > 1 ? `${index + 1}. ` : ''}${first.trim()}**` };
+    content: `${total > 1 ? `${index + 1}\\. ` : ''}${first.trim()}` };
   const more = rest.join('\n').trim();
   return more ? [heading, { tag: 'markdown', text_size: 'normal', content: more }] : [heading];
 }

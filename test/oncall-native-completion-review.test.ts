@@ -11,7 +11,8 @@ vi.mock('../src/im/lark/client.js', () => ({ updateMessage: mocks.update, delete
   forwardMessage: vi.fn(), mergeForwardMessages: mocks.merge, isBotInChat: mocks.membership, listThreadMessagesWithContext: mocks.thread }));
 import { OncallFormStore } from '../src/services/oncall-form-store.js';
 import { OncallGroupStore, type OncallGroupSource } from '../src/services/oncall-group-store.js';
-import { reconcileNativeOncallSubmissions, retryPendingOncallHandoffs } from '../src/im/lark/oncall-group.js';
+import { reconcileNativeOncallSubmissions, retryPendingOncallHandoffs, startOncallHandoffRecovery } from '../src/im/lark/oncall-group.js';
+import { logger } from '../src/utils/logger.js';
 import { readNativeOncallResultCandidates } from '../src/services/oncall-platform.js';
 import { loadOncallGroupTarget } from '../src/services/oncall-group-client.js';
 let dir: string, now: number, fetcher: ReturnType<typeof vi.fn>, rows: any[];
@@ -34,20 +35,48 @@ beforeEach(() => {
   fetcher = vi.fn(async (url: string) => json(url.includes('oncall_flow/list') ? rows : 'oc_destination')); vi.stubGlobal('fetch', fetcher);
 });
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.unstubAllEnvs(); vi.useRealTimers(); rmSync(dir, { recursive: true, force: true }); });
-function draft() {
-  const d = new OncallFormStore(dir).open({ appId: 'app', ownerOpenId: 'ou_actor', source, messageId: 'om_form', visibility: 'thread',
+function draft(hosted = false, draftSource = source, username = 'actor') {
+  const d = new OncallFormStore(dir).open({ appId: 'app', ownerOpenId: 'ou_actor', source: draftSource, messageId: 'om_form', visibility: 'thread',
     description: 'synthetic question', choices: { regions: { cn: [] } }, region: 'cn', typeId: 34, priority: 'P2',
     targetFingerprint: JSON.stringify(loadOncallGroupTarget(dir, 'app')), nativeFormLink: 'https://oncall.example.test/chat',
-    nativeSubmission: { attempts: [{ sourceLocation: rows[0].source_location, username: 'actor', preparedAtMs: now,
+    nativeSubmission: { attempts: [{ sourceLocation: rows[0].source_location, username, preparedAtMs: now,
+      ...(hosted ? { hostedSourceLocation: rows[0].source_location } : {}),
       policyFingerprint: JSON.stringify(mocks.bot.config.oncallGroup), forwardMode: 'merge', typeId: 34, region: 'cn' }] } });
   vi.setSystemTime(now + 5000); return d;
 }
 const current = (d: any) => new OncallFormStore(dir).use('app', d.id, 'ou_actor', async value => ({ ...value }), { allowClosed: true });
 function changeTarget() { const target = loadOncallGroupTarget(dir, 'app'); writeFileSync(join(dir, 'oncall-group-targets.json'), JSON.stringify({ app: { ...target, tenantId: 99 } })); }
 
+async function reconcileAndDeliver() {
+  await reconcileNativeOncallSubmissions('app');
+  await retryPendingOncallHandoffs('app');
+}
+
 describe('native completion independent review', () => {
-  it('skips an overlapping query and applies failure backoff from the end of the request', async () => {
-    draft();
+  it.each([
+    { hosted: true, age: 5_000, nextQueryAfter: 5_000 },
+    { hosted: true, age: 120_000, nextQueryAfter: 15_800 },
+    { hosted: false, age: 5_000, nextQueryAfter: 15_800 },
+  ])('uses the expected polling cadence for a draft aged $age ms (hosted=$hosted)', async ({ hosted, age, nextQueryAfter }) => {
+    draft(hosted);
+    vi.setSystemTime(now + age);
+    fetcher.mockImplementation(async () => json([]));
+    fetcher.mockImplementationOnce(async () => {
+      vi.setSystemTime(now + age + 800);
+      return json([]);
+    });
+    await reconcileNativeOncallSubmissions('app');
+    const queries = fetcher.mock.calls.length;
+    expect(queries).toBeGreaterThan(0);
+    vi.setSystemTime(now + age + nextQueryAfter - 1);
+    await reconcileNativeOncallSubmissions('app');
+    expect(fetcher).toHaveBeenCalledTimes(queries);
+    vi.setSystemTime(now + age + nextQueryAfter);
+    await reconcileNativeOncallSubmissions('app');
+    expect(fetcher).toHaveBeenCalledTimes(queries * 2);
+  });
+  it.each([true, false])('skips overlapping queries and backs off from the end of a failure (hosted=%s)', async hosted => {
+    draft(hosted);
     let fail!: (error: Error) => void;
     fetcher.mockImplementationOnce(() => new Promise<Response>((_resolve, reject) => { fail = reject; }));
     const first = reconcileNativeOncallSubmissions('app');
@@ -61,7 +90,88 @@ describe('native completion independent review', () => {
     expect(fetcher).toHaveBeenCalledOnce();
     vi.setSystemTime(now + 85_000);
     await reconcileNativeOncallSubmissions('app');
+    if (hosted) {
+      // Master rechecks a hosted exact match from the beginning before adoption.
+      expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
+      vi.setSystemTime(now + 90_000);
+      await reconcileNativeOncallSubmissions('app');
+    }
     expect(new OncallGroupStore(dir).getRequest(source)?.status).toBe('succeeded');
+  });
+  it('refreshes and forwards an already confirmed handoff during a slow native lookup', async () => {
+    draft(true);
+    vi.useRealTimers();
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    vi.setSystemTime(now + 5_000);
+    const ready = { ...source, sessionId: 'ready', questionId: 'om_q2', messageId: 'om_a2',
+      cardJson: JSON.stringify({ schema: '2.0', body: { elements: [] } }) };
+    const groups = new OncallGroupStore(dir);
+    groups.recordSource(ready);
+    groups.adoptNativeGroup(ready, 'ou_actor', { flowId: '5678', openChatId: 'oc_ready' },
+      { messageIds: [ready.questionId, ready.messageId], cutoffMs: Date.now(), forwardMode: 'merge' });
+    let finishLookup!: () => void;
+    fetcher.mockImplementationOnce(() => new Promise<Response>(resolve => { finishLookup = () => resolve(json(rows)); }));
+    let finishForward!: () => void;
+    mocks.merge.mockImplementationOnce(() => new Promise(resolve => {
+      finishForward = () => resolve({ messageId: 'om_receipt', invalidMessageIds: [] });
+    }));
+    const warnings = vi.spyOn(logger, 'warn');
+    const stop = startOncallHandoffRecovery('app');
+    try {
+      await vi.waitFor(() => expect(mocks.merge).toHaveBeenCalledOnce());
+      expect(fetcher).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(mocks.merge).toHaveBeenCalledOnce();
+      expect(fetcher).toHaveBeenCalledOnce();
+      finishForward();
+      await vi.waitFor(() => expect(groups.getRequest(ready)?.cardRefreshPending).toBe(false));
+      expect(groups.getRequest(ready)?.forwardedMessageIds?.[ready.questionId]).toBe('om_receipt');
+      const raw = mocks.update.mock.calls.find(([, message]) => message === ready.messageId)?.[2];
+      const button = JSON.parse(raw).body.elements.at(-1).columns.at(-1).elements[0];
+      expect(button.behaviors[0]).toMatchObject({ type: 'open_url', default_url: expect.stringContaining('add_by_link') });
+      stop();
+      finishLookup();
+      await vi.waitFor(() => expect(warnings).toHaveBeenCalledWith(expect.stringContaining('Native submission reconciliation will retry')));
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(groups.getRequest(source)).toBeUndefined();
+      expect(fetcher.mock.calls.filter(([url]) => String(url).includes('oncall_flow/list'))).toHaveLength(1);
+      expect(mocks.merge).toHaveBeenCalledOnce();
+    } finally {
+      stop();
+      finishLookup?.();
+      finishForward?.();
+    }
+  });
+  it('keeps checking recent hosted forms while a legacy page lookup is stalled', async () => {
+    draft(false);
+    draft(true, { ...source, sessionId: 'recent', questionId: 'om_recent' }, 'recent_actor');
+    vi.useRealTimers();
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    vi.setSystemTime(now + 5_000);
+    let releaseLegacy!: () => void;
+    const pendingLegacy = new Promise<void>(resolve => { releaseLegacy = resolve; });
+    const queried: string[] = [];
+    fetcher.mockImplementation(async (_url: string, options: RequestInit) => {
+      const filters = JSON.parse(String(options.body)).filter_fields as Array<{ field: string; value: unknown }>;
+      if (filters.some(filter => filter.field === 'originator_user' && filter.value === 'actor')) {
+        queried.push('legacy');
+        await pendingLegacy;
+      } else if (filters.some(filter => filter.field === 'source_location')) {
+        queried.push('hosted');
+      }
+      return json([]);
+    });
+    const stop = startOncallHandoffRecovery('app');
+    try {
+      await vi.waitFor(() => expect(queried.sort()).toEqual(['hosted', 'legacy']));
+      await vi.waitFor(() => expect(vi.getTimerCount()).toBe(2)); // hosted and handoff only
+      await vi.advanceTimersByTimeAsync(5_000);
+      await vi.waitFor(() => expect(queried.filter(query => query === 'hosted')).toHaveLength(2));
+      expect(queried.filter(query => query === 'legacy')).toHaveLength(1);
+    } finally {
+      stop();
+      releaseLegacy();
+    }
   });
   it.each(['disabled', 'target', 'ownership'])('does not adopt after %s changes during the platform lookup', async intervention => {
     draft(); let release!: () => void; let owns = true;
@@ -85,14 +195,14 @@ describe('native completion independent review', () => {
     vi.spyOn(OncallGroupStore.prototype, 'adoptNativeGroup').mockImplementationOnce(function (...args) { original.apply(this, args); throw new Error('caller interrupted after write'); });
     await reconcileNativeOncallSubmissions('app'); const first = new OncallGroupStore(dir).getRequest(source)!;
     expect(first).toMatchObject({ status: 'succeeded', openChatId: 'oc_destination' }); expect((await current(d)).closed).not.toBe(true);
-    const queries = fetcher.mock.calls.length; vi.setSystemTime(now + 70000); await retryPendingOncallHandoffs('app');
+    const queries = fetcher.mock.calls.length; vi.setSystemTime(now + 70000); await reconcileAndDeliver();
     expect(fetcher).toHaveBeenCalledTimes(queries); expect(new OncallGroupStore(dir).getRequest(source)?.attemptId).toBe(first.attemptId);
     expect(mocks.merge).toHaveBeenCalledOnce(); expect((await current(d)).nativeSubmission?.completed).toBe(true);
   });
   it('retries a failed form withdrawal after forwarding completes, without repeating the forwarded messages', async () => {
     const d = draft(); mocks.withdraw.mockResolvedValueOnce(false);
-    await retryPendingOncallHandoffs('app'); expect(mocks.merge).toHaveBeenCalledOnce(); expect((await current(d)).nativeSubmission?.completed).not.toBe(true);
-    vi.setSystemTime(now + 70000); await retryPendingOncallHandoffs('app');
+    await reconcileAndDeliver(); expect(mocks.merge).toHaveBeenCalledOnce(); expect((await current(d)).nativeSubmission?.completed).not.toBe(true);
+    vi.setSystemTime(now + 70000); await reconcileAndDeliver();
     expect(mocks.withdraw).toHaveBeenCalledTimes(2); expect(mocks.merge).toHaveBeenCalledOnce(); expect((await current(d)).nativeSubmission?.completed).toBe(true);
   });
   it.each(['refresh', 'withdraw'] as const)('keeps native cleanup recoverable after losing ownership during %s', async stage => {
@@ -112,7 +222,7 @@ describe('native completion independent review', () => {
     expect((await current(d)).nativeSubmission?.completed).not.toBe(true);
     const attempt = new OncallGroupStore(dir).getRequest(source)!.attemptId;
     vi.setSystemTime(now + 70_000);
-    await retryPendingOncallHandoffs('app');
+    await reconcileAndDeliver();
     expect((await current(d)).nativeSubmission?.completed).toBe(true);
     expect(new OncallGroupStore(dir).getRequest(source)?.attemptId).toBe(attempt);
     expect(fetcher.mock.calls.filter(([url]) => String(url).includes('oncall_flow/list'))).toHaveLength(1);
@@ -125,7 +235,7 @@ describe('native completion independent review', () => {
       { message_id: 'om_q1', create_time: String(now - 1000) }, { message_id: 'om_a1', create_time: String(now) },
       { message_id: 'om_q2', create_time: String(now + 200) }, { message_id: 'om_a2', create_time: String(now + 400) },
     ] });
-    await retryPendingOncallHandoffs('app');
+    await reconcileAndDeliver();
     expect(groups.getRequest(source)).toMatchObject({ status: 'succeeded', messageIdsSnapshot: ['om_q1', 'om_a1'] });
     expect(groups.getRequest(fresh)).toBeUndefined(); expect(mocks.merge.mock.calls[0][1]).toEqual(['om_q1', 'om_a1']);
   });

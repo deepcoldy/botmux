@@ -206,7 +206,14 @@ function completeTurn(request) {
         { title: 'Which environment?', options: ['PPE (Recommended)', 'Production'] },
         { title: 'Which voice?', options: null },
       ] };
+    if (behavior === 'async-user-input-plain' || behavior === 'async-user-input-plain-null') {
+      item.id = 'call_async_notice';
+      item.text = 'Complete sign-in in your private terminal.';
+      if (behavior === 'async-user-input-plain-null') item.questions = null;
+      else delete item.questions;
+    }
     if (behavior === 'async-user-input-malformed') item.questions[0].options = [];
+    if (behavior === 'async-user-input-duplicate') item.phase = 'commentary';
     if (behavior === 'async-user-input-selected') item.questions[1].options = ['Elia', 'Other'];
     const notificationThread = behavior === 'async-user-input-foreign' ? 'foreign-thread' : threadId;
     if (behavior === 'async-user-input-corrected') notify('item/completed', { threadId, turnId,
@@ -219,7 +226,9 @@ function completeTurn(request) {
     if (behavior !== 'async-user-input-no-start') notify('item/started', { threadId: notificationThread, turnId, item });
     notify('item/agentMessage/delta', { threadId: notificationThread, turnId, itemId: item.id, delta: item.text });
     notify('item/completed', { threadId: notificationThread, turnId, item });
-    if (behavior === 'async-user-input-duplicate') notify('item/completed', { threadId, turnId, item });
+    if (behavior === 'async-user-input-duplicate' || behavior === 'async-user-input-plain') {
+      notify('item/completed', { threadId, turnId, item });
+    }
     if (behavior === 'async-user-input-limit') {
       for (let n = 1; n <= 32; n++) notify('item/completed', { threadId, turnId, item: { ...item, id: `call_limit_${n}` } });
     }

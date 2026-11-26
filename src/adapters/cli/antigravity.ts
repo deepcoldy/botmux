@@ -803,6 +803,10 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
             command: statuslineHookCommand(),
             stack_with_default: true,
           },
+          // The worker already delivers follow-ups to the busy composer when
+          // approval bypass is enabled. Let agy consume them after its current
+          // step, while keeping the approval-gated session's queue policy.
+          ...(!disableCliBypass ? { queuedMessages: 'send-immediately' } : {}),
           ...(supportsAntigravityFeedbackSurveySetting(cliVersion)
             ? { showFeedbackSurvey: false }
             : {}),

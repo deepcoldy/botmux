@@ -1606,6 +1606,7 @@ export function OncallGroupSettings(props: { bot: BotDefaultsRow; patchBot: Patc
   const policyChanged = JSON.stringify(policy) !== JSON.stringify(savedPolicy);
   const dirty = identityChanged || connectionChanged || oncallTargetDirty(basic) || oncallSecretDirty(basic) || policyChanged;
   const options = [...props.chats, ...policy.chatIds.filter(id => !props.chats.some(chat => chat.chatId === id)).map(chatId => ({ chatId }))];
+  const formDisplay = policy.formDisplay ?? 'native';
   return <section className="bd-section bd-oncall-section">
     <h3 className="bd-section-title"><FieldTitle help="同一会话的回答卡片共用一个人工群。建群后统一显示进群入口，并按对话交接设置同步提交前的会话记录。">{tr('botDefaults.sectionOncall')}</FieldTitle></h3>
     {!savedPolicy.enabled && <p className="bd-section-note" role="note">使用前，请由应用管理员选择身份查询方式：为当前机器人申请全员通讯录邮箱读取范围，或在下方高级设置中配置统一查询应用。两种方式均不改变 AI 使用授权；权限需审核发布后生效。</p>}
@@ -1638,20 +1639,28 @@ export function OncallGroupSettings(props: { bot: BotDefaultsRow; patchBot: Patc
         onChange={forwardMode => updateDraft({ ...policy, forwardMode })} />
     </div>
     {policy.flowMode === 'classify' && <div className="bd-oncall-field">
-      <FieldTitle help="决定用户在哪里填写问题区域和分类。群内卡片在原群聊或话题中展示，所有成员可见，仅发起人操作。仅本人可见卡片支持普通群。分类选定后，如需补充自定义字段，按下方的附加表单方式填写。">分类填写方式</FieldTitle>
-      <DropdownField dataInput="oncallFormDisplay" ariaLabel="分类填写方式" disabled={busy} value={policy.formDisplay ?? 'native'}
-        options={[{ value: 'thread_card', label: '群内卡片（推荐）', hint: '在原群聊或话题内填写；所有成员可见，仅发起人操作' }, { value: 'native', label: '飞书侧栏（有限支持）', hint: '在 Oncall 平台表单中填写；暂不自动关联人工群或转交对话' }, { value: 'private_card', label: '仅本人可见卡片', hint: '仅点击者可见；只支持普通群，不支持话题群和私聊' }]}
+      <FieldTitle help="决定用户点击转人工后，先在哪选择问题区域和分类。">提单入口</FieldTitle>
+      <DropdownField dataInput="oncallFormDisplay" ariaLabel="提单入口" disabled={busy} value={formDisplay}
+        options={[
+          { value: 'thread_card', label: '群内分类卡（推荐）', hint: '在原群聊或话题中选分类，群成员可见，仅发起人可操作' },
+          { value: 'private_card', label: '仅本人可见的分类卡', hint: '仅发起人可见和操作，适用于普通群' },
+          { value: 'native', label: '直接打开 Oncall 侧栏', hint: '从选择分类开始就在侧栏操作' },
+        ]}
         onChange={formDisplay => updateDraft({ ...policy, formDisplay })} />
-      <small className={`bd-section-note${(policy.formDisplay ?? 'native') === 'native' ? ' bd-warn' : ''}`}>{(policy.formDisplay ?? 'native') === 'native' ? '此方式暂不自动关联人工群，也不会自动转交当前对话。'
-        : policy.formDisplay === 'private_card' ? '仅支持普通群；话题群请使用群内卡片。'
-        : policy.forwardMode === 'none' ? '普通群和话题群均可使用，提交成功后显示人工群入口，不自动转交对话。'
-        : '普通群和话题群均可使用，提交成功后自动转交当前对话。'}</small>
-    </div>}
-    {policy.flowMode === 'classify' && (policy.formDisplay === 'thread_card' || policy.formDisplay === 'private_card') && <div className="bd-oncall-field">
-      <FieldTitle help="仅在分类要求补充信息时生效。Botmux 表单支持普通文本字段，可在当前分类卡填写并提交。遇到复杂字段或 P0 自定义表单时会打开 Oncall 原生侧栏。">附加表单填写方式</FieldTitle>
-      <DropdownField dataInput="oncallCustomFormMode" ariaLabel="附加表单填写方式" disabled={busy} value={policy.customFormMode ?? 'native'}
-        options={[{ value: 'native', label: 'Oncall 原生表单', hint: '在飞书侧栏填写' }, { value: 'botmux', label: 'Botmux 表单', hint: '在当前分类卡补充文本并提交' }]}
-        onChange={customFormMode => updateDraft({ ...policy, customFormMode })} />
+      {formDisplay === 'native'
+        ? <small className="bd-section-note bd-warn">从侧栏直接提单暂不自动关联人工群或转交对话。</small>
+        : <>
+          {formDisplay === 'private_card' && <small className="bd-section-note">仅支持普通群。话题群请选择群内分类卡。</small>}
+          <div className="bd-oncall-field bd-oncall-form-followup">
+            <FieldTitle help="只有所选分类要求补充自定义字段时才生效。复杂字段和 P0 自定义表单会使用 Oncall 侧栏。">自定义字段在哪填</FieldTitle>
+            <DropdownField dataInput="oncallCustomFormMode" ariaLabel="自定义字段在哪填" disabled={busy} value={policy.customFormMode ?? 'native'}
+              options={[
+                { value: 'native', label: '打开侧栏补填', hint: '先在分类卡选分类，再到 Oncall 侧栏补充信息' },
+                { value: 'botmux', label: '留在分类卡填写', hint: '普通文本字段直接显示在分类卡里，可在卡内提交' },
+              ]}
+              onChange={customFormMode => updateDraft({ ...policy, customFormMode })} />
+          </div>
+        </>}
     </div>}
     </div>
     <details className="bd-oncall-details"><summary>按钮显示<span className="bd-oncall-summary-meta">{policy.button?.timing === 'first' ? '开始处理时' : '回答完成后'} · 第 {policy.button?.minTurns ?? 1} 轮起</span></summary>
@@ -10624,18 +10633,31 @@ function LaunchShellSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) 
 
 
 
-/** riff UI 建议主动选择的模型（服务端另有隐藏降级备胎，不在此列）。 */
-const RIFF_MODEL_SUGGESTIONS = ['gpt-5.5', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.4', 'gpt-5.4-pro'];
-/** codex 思考等级档位（与 riff 服务端对齐）；'' = 跟随 riff 默认（medium）。 */
+/** riff UI 按执行引擎给出的建议模型（服务端另有隐藏降级备胎，不在此列）。 */
+const RIFF_MODEL_SUGGESTIONS_BY_AGENT: Record<'codex' | 'claude', readonly string[]> = {
+  codex: [
+    'gpt-6.2-sol', 'GPT-6.1-Sol', 'gpt-6-astra', 'gpt-5.5',
+    'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.4', 'gpt-5.4-pro',
+    'gemini-4-neon', 'gemini-4-carbon', 'gemini-4-hydrogen', 'gemini-4-argon',
+  ],
+  claude: [
+    'glm-5.3', 'glm-5.3-flash', 'deepseek-v4.1-flash',
+    'gemini-4-neon', 'gemini-4-carbon', 'gemini-4-hydrogen', 'gemini-4-argon',
+  ],
+};
+/** riff 思考等级档位（与 riff 服务端对齐）；'' = 跟随 riff 默认（medium）。 */
 const RIFF_REASONING_EFFORT_OPTIONS = ['', 'low', 'medium', 'high', 'xhigh'];
 /** riff task-execute 的 sandboxCluster；缺省行为与服务端一致，回落 BOE。 */
 const RIFF_SANDBOX_CLUSTER_OPTIONS = ['boe', 'cn'] as const;
+/** riff task-execute 的 agent（harness）；缺省行为与服务端一致，回落 codex。 */
+const RIFF_AGENT_OPTIONS = ['codex', 'claude'] as const;
 
 function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; persistCliSelection?: () => Promise<CliPersistOutcome> }) {
   const tr = useT();
   const riff = props.bot.riff && typeof props.bot.riff === 'object' ? props.bot.riff : {};
   const [baseUrl, setBaseUrl] = useState(typeof riff.baseUrl === 'string' ? riff.baseUrl : '');
   const [sandboxCluster, setSandboxCluster] = useState(riff.sandboxCluster === 'cn' ? 'cn' : 'boe');
+  const [agent, setAgent] = useState<'codex' | 'claude'>(riff.agent === 'claude' ? 'claude' : 'codex');
   const [model, setModel] = useState(typeof riff.model === 'string' ? riff.model : '');
   const [reasoningEffort, setReasoningEffort] = useState(typeof riff.reasoningEffort === 'string' ? riff.reasoningEffort : '');
   const [jwtEnv, setJwtEnv] = useState(typeof riff.jwtEnv === 'string' ? riff.jwtEnv : '');
@@ -10650,6 +10672,7 @@ function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; persistCl
     const r = props.bot.riff && typeof props.bot.riff === 'object' ? props.bot.riff : {};
     setBaseUrl(typeof r.baseUrl === 'string' ? r.baseUrl : '');
     setSandboxCluster(r.sandboxCluster === 'cn' ? 'cn' : 'boe');
+    setAgent(r.agent === 'claude' ? 'claude' : 'codex');
     setModel(typeof r.model === 'string' ? r.model : '');
     setReasoningEffort(typeof r.reasoningEffort === 'string' ? r.reasoningEffort : '');
     setJwtEnv(typeof r.jwtEnv === 'string' ? r.jwtEnv : '');
@@ -10664,6 +10687,7 @@ function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; persistCl
       const config: Record<string, unknown> = {};
       if (baseUrl.trim()) config.baseUrl = baseUrl.trim();
       config.sandboxCluster = sandboxCluster;
+      config.agent = agent;
       if (model.trim()) config.model = model.trim();
       if (reasoningEffort) config.reasoningEffort = reasoningEffort;
       if (jwtEnv.trim()) config.jwtEnv = jwtEnv.trim();
@@ -10704,6 +10728,8 @@ function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; persistCl
     }
   }
 
+  const modelSuggestions = RIFF_MODEL_SUGGESTIONS_BY_AGENT[agent];
+
   return (
     <div className="bd-subsection">
       <h4 className="bd-subsection-title"><FieldTitle help={tr('botDefaults.riffHelp')}>{tr('botDefaults.sectionRiff')}</FieldTitle></h4>
@@ -10727,11 +10753,29 @@ function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; persistCl
         </div>
       </div>
       <div className="bd-row">
+        <div className="bd-field">
+          <span><FieldTitle help={tr('botDefaults.riffAgentHelp')}>{tr('botDefaults.riffAgent')}</FieldTitle></span>
+          <DropdownField
+            dataInput="riff-agent"
+            ariaLabel={tr('botDefaults.riffAgent')}
+            value={agent}
+            disabled={busy}
+            options={RIFF_AGENT_OPTIONS.map(value => ({ value, label: value === 'claude' ? 'Claude Code (claude)' : 'Codex (codex)' }))}
+            onChange={next => {
+              setAgent(next === 'claude' ? 'claude' : 'codex');
+              // 显式模型可能仅适用于旧引擎；切换时回到新引擎默认模型，避免保存坏组合。
+              // 建议清单不是权威目录，不能按成员关系条件清空；reasoningEffort 两引擎通用，保留。
+              setModel('');
+            }}
+          />
+        </div>
+      </div>
+      <div className="bd-row">
         <label>
           <span><FieldTitle help={tr('botDefaults.riffModelHelp')}>{tr('botDefaults.riffModel')}</FieldTitle></span>
           <input type="text" data-input="riff-model" list={`riff-model-suggestions-${props.bot.larkAppId}`} placeholder={tr('botDefaults.riffModelPlaceholder')} value={model} disabled={busy} onChange={e => setModel(e.currentTarget.value)} />
           <datalist id={`riff-model-suggestions-${props.bot.larkAppId}`}>
-            {RIFF_MODEL_SUGGESTIONS.map(item => <option value={item} key={item} />)}
+            {modelSuggestions.map(item => <option value={item} key={item} />)}
           </datalist>
         </label>
       </div>
