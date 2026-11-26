@@ -526,12 +526,15 @@ async function runDowngrade(
           overloadedModels: [...plan.overloadedModels],
         };
       }
+      // Rotate the streaming-card turn BEFORE the fallible bookkeeping below:
+      // a capacity hop starts a fresh turn, so bump the generation and clear
+      // prior-turn slots first (a commit-unknown uuid from the overloaded turn
+      // must never be reused). Retain the existing pendingTurnId so the
+      // starting-card health watchdog, whose arm gate keys off currentTurnId,
+      // keeps matching while currentTurnId still holds the pre-hop turn.
+      advancePendingStreamingCardTurn(ds, ds.streamCardPendingTurnId);
       rememberInput(ds, plan.userPrompt, input, turnId);
       noteStarted(ds, turnId);
-      // A capacity hop starts a fresh turn: rotate the streaming-card generation
-      // and clear prior-turn slots so a commit-unknown uuid from the overloaded
-      // turn can never be reused on the downgraded worker's card.
-      advancePendingStreamingCardTurn(ds);
       persistCard(ds);
       updateSession(ds.session);
       if (plan.mode === 'pin') {

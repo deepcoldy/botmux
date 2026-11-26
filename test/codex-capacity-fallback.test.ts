@@ -358,7 +358,14 @@ describe('handleCodexCapacityRetry', () => {
   });
 
   it('rotates streaming-card generation and slots across a capacity hop so the new card never reuses the prior commit-unknown uuid', async () => {
-    const ds = makeDs({ streamCardTurnGeneration: 7, streamCardPending: true });
+    // Pre-hop turn is pending: currentTurnId and pendingTurnId both hold the
+    // overloaded turn, the state the starting-card health watchdog arms against.
+    const ds = makeDs({
+      currentTurnId: TURN,
+      streamCardTurnGeneration: 7,
+      streamCardPending: true,
+      streamCardPendingTurnId: TURN,
+    });
     // Simulate an overloaded-turn card that landed but returned 500: its
     // commit-unknown slot would otherwise be sticky for same-generation retries.
     const seeded = acquireTurnStreamingCardPostSlot(ds, {
@@ -385,6 +392,11 @@ describe('handleCodexCapacityRetry', () => {
     // The hop starts a fresh turn: generation bumped and a new pending turn armed.
     expect(ds.streamCardTurnGeneration).toBe(8);
     expect(ds.streamCardPending).toBe(true);
+    // The pre-hop health turn id is retained so armPublishedStartingCardHealth's
+    // currentTurnId === turnId gate still matches (currentTurnId is not moved by
+    // the capacity hop itself).
+    expect(ds.streamCardPendingTurnId).toBe(TURN);
+    expect(ds.streamCardPendingTurnId).toBe(ds.currentTurnId);
 
     // The downgraded worker's card must allocate a fresh slot instead of
     // deduplicating onto the overloaded turn's possibly-landed message.
@@ -395,6 +407,52 @@ describe('handleCodexCapacityRetry', () => {
       replyTargetKey: 'thread:om_root',
       turnGeneration: 8,
       canonicalTurnId: ds.lastCliInputTurnId,
+    });
+    expect(after.reused).toBe(false);
+    expect(after.slot.uuid).not.toBe(seeded.slot.uuid);
+  });
+
+  it('still rotates the streaming-card turn when post-switch bookkeeping throws, since the hop runs first', async () => {
+    const ds = makeDs({
+      currentTurnId: TURN,
+      streamCardTurnGeneration: 7,
+      streamCardPending: true,
+      streamCardPendingTurnId: TURN,
+    });
+    const seeded = acquireTurnStreamingCardPostSlot(ds, {
+      sessionId: ds.session.sessionId,
+      larkAppId: APP,
+      anchorId: 'om_root',
+      replyTargetKey: 'thread:om_root',
+      turnGeneration: 7,
+      canonicalTurnId: TURN,
+    });
+    recordStreamingCardPostFailure(
+      ds,
+      seeded.slot,
+      classifyStreamingCardPostError({ isAxiosError: true, response: { status: 500, data: { code: 2200 } } }),
+      hashStreamingCardBody('overloaded-turn-2'),
+      'working',
+    );
+
+    // rememberLastCliInput failing must not skip the turn rotation: the switch
+    // still reports 'switched', but the generation/slot change happens first.
+    const harness = makeDeps(ds, {
+      rememberLastInput: () => { throw new Error('bookkeeping boom'); },
+    });
+    const { trigger } = makeTrigger(ds);
+    expect(handleCodexCapacityRetry(ds, trigger, harness.deps)).toBe(true);
+    await flushMicrotasks();
+
+    expect(ds.streamCardTurnGeneration).toBe(8);
+    expect(ds.streamCardPendingTurnId).toBe(TURN);
+    const after = acquireTurnStreamingCardPostSlot(ds, {
+      sessionId: ds.session.sessionId,
+      larkAppId: APP,
+      anchorId: 'om_root',
+      replyTargetKey: 'thread:om_root',
+      turnGeneration: 8,
+      canonicalTurnId: TURN,
     });
     expect(after.reused).toBe(false);
     expect(after.slot.uuid).not.toBe(seeded.slot.uuid);
