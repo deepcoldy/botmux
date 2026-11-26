@@ -10752,7 +10752,12 @@ function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; persistCl
             value={agent}
             disabled={busy}
             options={RIFF_AGENT_OPTIONS.map(value => ({ value, label: value === 'claude' ? 'Claude Code (claude)' : 'Codex (codex)' }))}
-            onChange={next => setAgent(next === 'claude' ? 'claude' : 'codex')}
+            onChange={next => {
+              setAgent(next === 'claude' ? 'claude' : 'codex');
+              // 显式模型可能仅适用于旧引擎；切换时回到新引擎默认模型，避免保存坏组合。
+              // 建议清单不是权威目录，不能按成员关系条件清空；reasoningEffort 两引擎通用，保留。
+              setModel('');
+            }}
           />
         </div>
       </div>
