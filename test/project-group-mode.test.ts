@@ -423,6 +423,34 @@ describe('project group mode', () => {
     expect(updated.focus).toBe('恢复卡片');
   });
 
+  it('recreates and re-pins a projection whose card is past the edit window', async () => {
+    const f = fixture();
+    let sends = 0;
+    f.transport.sendCard = vi.fn(async (_appId, _chatId, cardJson) => {
+      f.cards.push(cardJson);
+      sends += 1;
+      return `om_card_${sends}`;
+    });
+    await f.coordinator.run(f.context, { action: 'init', title: '项目', goal: '完成目标' });
+    f.transport.updateCard = vi.fn(async () => {
+      const error = new Error('past edit window');
+      error.name = 'MessageUpdateExpiredError';
+      throw error;
+    });
+    const updated = await f.coordinator.run(f.context, { action: 'update', focus: '过期重发' });
+    expect(updated.card).toMatchObject({ messageId: 'om_card_2', pinned: true });
+    expect(updated.focus).toBe('过期重发');
+    expect(f.transport.unpinMessage).toHaveBeenCalledWith('cli_coordinator', 'om_card_1');
+  });
+
+  it('does not repost on unrelated card update failures', async () => {
+    const f = fixture();
+    await f.coordinator.run(f.context, { action: 'init', title: '项目', goal: '完成目标' });
+    f.transport.updateCard = vi.fn(async () => { throw new Error('boom'); });
+    await expect(f.coordinator.run(f.context, { action: 'update', focus: '失败' })).rejects.toThrow('boom');
+    expect(f.transport.sendCard).toHaveBeenCalledTimes(1);
+  });
+
   it('refreshes the same card through a group-level template and section configuration', async () => {
     const f = fixture();
     await f.coordinator.run(f.context, { action: 'init', title: '项目', goal: '完成目标' });

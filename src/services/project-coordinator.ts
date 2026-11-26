@@ -478,7 +478,18 @@ export class ProjectCoordinator {
         await this.retireOnboardingCard(context);
         return project;
       } catch (error) {
-        if (!this.transport.isMessageWithdrawn(error)) throw error;
+        const expired = this.transport.isMessageUpdateExpired(error);
+        if (!this.transport.isMessageWithdrawn(error) && !expired) throw error;
+        // 14 天编辑窗口过期（230031）不会自己恢复：取消旧卡置顶，下面发一张新卡并置顶。
+        if (expired && project.card?.pinned) {
+          try {
+            await this.transport.unpinMessage(project.larkAppId, project.card.messageId);
+          } catch (unpinError) {
+            if (!this.transport.isMessageWithdrawn(unpinError)) {
+              logger.warn(`[project] Could not unpin expired card ${project.card.messageId}: ${unpinError}`);
+            }
+          }
+        }
       }
     }
     // Starting a project must be visible at the current point in the chat.
