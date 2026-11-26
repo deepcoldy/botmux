@@ -112,7 +112,7 @@ export async function resolveProjectGroupCardRuntime(
 /** One process-wide coordinator keeps projection updates serialized while the
  * durable ProjectStore remains the cross-restart source of truth. */
 export const projectCoordinator = new ProjectCoordinator({
-  sendCard: (larkAppId, chatId, cardJson) => sendMessage(larkAppId, chatId, cardJson, 'interactive'),
+  sendCard: (larkAppId, chatId, cardJson, uuid) => sendMessage(larkAppId, chatId, cardJson, 'interactive', uuid),
   updateCard: (larkAppId, messageId, cardJson) => updateMessage(larkAppId, messageId, cardJson),
   pinMessage: async (larkAppId, messageId) => !!(await pinMessage(larkAppId, messageId)),
   unpinMessage: async (larkAppId, messageId) => !!(await unpinMessage(larkAppId, messageId)),

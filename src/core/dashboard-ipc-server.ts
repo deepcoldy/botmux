@@ -4306,6 +4306,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/project-workstream', async (req, res,
     }
     const actor = { sessionId: ds.session.sessionId, larkAppId: ds.larkAppId, chatId: ds.chatId,
       scope: 'chat' as const, ownerKey, authorizedSourceOwnerKey, sourceAuthorizationStillValid, turnId: turn,
+      repostOnExpired: directHuman,
       authorizationStillValid: () => findActiveBySessionId(params.sessionId) === ds
         && ds.managedTurnOrigin === admittedOrigin && ds.managedTurnOrigin?.capability === admittedCapability
         && ds.managedTurnOrigin?.turnId === turn
@@ -6277,12 +6278,17 @@ ipcRoute('POST', '/api/sessions/:sessionId/project', async (req, res, params) =>
   if (action.action === 'report' && action.expectedAttachment && !isTrustedHostIpcRequest(req)) {
     return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
   }
+  // Report relay traffic always leaves publication to sync. Only a caller
+  // that opts into immediate recovery on the control path can repost inline.
+  const cardPublication = action.action === 'report'
+    ? 'deferred' : body?.cardPublication === 'repost' ? 'repost' : 'patch';
   try {
     const project = await projectCoordinator.run({
       dataDir: config.session.dataDir,
       chatId: ds.chatId,
       larkAppId: ds.larkAppId,
       coordinatorSessionId: ds.session.sessionId,
+      cardPublication,
     }, action, action.action === 'report' && action.expectedAttachment ? () => {
       const record = readProjectAttachmentRecord(config.session.dataDir, ds.chatId, action.dispatchRoot);
       const source = record && sessionStore.getSession(record.source.sessionId);
@@ -6298,6 +6304,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/project', async (req, res, params) =>
         || mode?.mode !== 'project' || mode.coordinatorAppId !== ds.larkAppId
         || !mode.workerAppIds?.includes(record.source.larkAppId)) throw new Error('project_attachment_revision_conflict');
     } : undefined);
+    if (cardPublication === 'deferred') projectCardRuntimeObserver?.(ds.chatId);
     if (action.action === 'init') {
       await refreshProjectImportCardsForChat({
         coordinatorAppId: ds.larkAppId,
@@ -7150,6 +7157,7 @@ ipcRoute('POST', '/api/project-groups/:chatId/refresh-card', async (_req, res, p
       chatId,
       larkAppId: cachedLarkAppId,
       coordinatorSessionId: project.coordinatorSessionId,
+      cardPublication: 'repost',
     }, { action: 'refresh' });
     return jsonRes(res, 200, { ok: true, project: refreshed });
   } catch (error) {

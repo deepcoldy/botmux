@@ -645,7 +645,7 @@ import { initialDispatchLifecycle } from './core/dispatch-lifecycle.js';
 import { applyDispatchLaunchBinding, registerDispatchLaunchBinding } from './core/dispatch-launch-binding.js';
 import { projectCoordinator, resolveProjectGroupCardRuntime } from './services/project-coordinator-runtime.js';
 import { createProjectCardRuntimeSync } from './services/project-card-runtime-sync.js';
-import { listProjectGroups } from './services/project-group-store.js';
+import { listProjectGroups, type ProjectGroupState } from './services/project-group-store.js';
 import {
   addProjectWorkerIfNeeded,
   evaluateProjectDispatchPolicy,
@@ -38837,17 +38837,21 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       try { sessionStore.updateSession(live.session); } catch { live.session.projectImportPending = true; }
     },
   });
+  const projectCardContext = (project: ProjectGroupState) => ({
+    dataDir: config.session.dataDir,
+    chatId: project.chatId,
+    larkAppId: cfg.larkAppId,
+    coordinatorSessionId: project.coordinatorSessionId,
+  });
   const projectCardRuntimeSync = createProjectCardRuntimeSync({
     larkAppId: cfg.larkAppId,
     listProjects: () => listProjectGroups(config.session.dataDir),
     readMode: chatId => readGroupCollaborationMode(config.session.dataDir, chatId),
     resolveRuntime: project => resolveProjectGroupCardRuntime(project, config.session.dataDir),
-    refresh: project => projectCoordinator.run({
-      dataDir: config.session.dataDir,
-      chatId: project.chatId,
-      larkAppId: cfg.larkAppId,
-      coordinatorSessionId: project.coordinatorSessionId,
-    }, { action: 'refresh' }),
+    refresh: (project, target) => projectCoordinator.refreshCard(projectCardContext(project), target),
+    isMessageUpdateExpired: error => error instanceof MessageUpdateExpiredError,
+    repostExpiredCard: (project, target) => projectCoordinator.repostExpiredCard(projectCardContext(project), target),
+    retryPendingCardPin: (project, messageId) => projectCoordinator.retryPendingCardPin(projectCardContext(project), messageId),
     forwardToCoordinator: (coordinatorAppId, chatId) => {
       const peer = findOnlineDaemon(coordinatorAppId, config.session.dataDir);
       if (!peer) return;
@@ -38872,8 +38876,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     void getProjectAttachmentSource(event.larkAppId, event.sessionId)
       .then(async source => {
         if (!source) return;
-        await projectWorkstreamAttachments.observe(source);
-        projectCardRuntimeSync.notify(source.chatId);
+        const projectChats = await projectWorkstreamAttachments.observe(source);
+        for (const chatId of new Set([source.chatId, ...projectChats])) projectCardRuntimeSync.notify(chatId);
       })
       .catch(() => logger.debug('[project] association projection pending; refresh can repair'));
     if (findActiveBySessionId(event.sessionId)?.session.projectImportPending) {

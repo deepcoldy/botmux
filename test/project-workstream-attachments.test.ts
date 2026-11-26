@@ -8,7 +8,8 @@ import {
 import {
   ProjectCoordinator, type ProjectCoordinatorAction, type ProjectCoordinatorContext, type ProjectCoordinatorTransport,
 } from '../src/services/project-coordinator.js';
-import { mutateProjectGroup, readProjectGroup } from '../src/services/project-group-store.js';
+import { listProjectGroups, mutateProjectGroup, readProjectGroup } from '../src/services/project-group-store.js';
+import { createProjectCardRuntimeSync, PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST } from '../src/services/project-card-runtime-sync.js';
 import {
   readGroupCollaborationMode, writeGroupCollaborationMode,
 } from '../src/services/group-collaboration-mode-store.js';
@@ -22,7 +23,10 @@ import { issueProjectSourceGrant, verifyProjectSourceGrant } from '../src/servic
 import { withFileLock } from '../src/utils/file-lock.js';
 
 const roots: string[] = [];
-afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+afterEach(() => {
+  vi.useRealTimers();
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
 const SECRET = 'synthetic-attachment-test-secret';
 
 async function fixture() {
@@ -30,6 +34,7 @@ async function fixture() {
   roots.push(dataDir);
   const actor: ProjectAttachmentActor = {
     sessionId: 'main-one', larkAppId: 'cli_main', chatId: 'oc_group', scope: 'chat', ownerKey: 'union:on_owner',
+    repostOnExpired: true,
   };
   let source: ProjectAttachmentSource | undefined = {
     sessionId: 'source-one', larkAppId: 'cli_worker', chatId: 'oc_group', rootMessageId: 'om_topic',
@@ -42,7 +47,9 @@ async function fixture() {
     pinMessage: vi.fn(async () => true),
     unpinMessage: vi.fn(async () => true),
     resolveThreadId: vi.fn(async () => null),
-    isMessageWithdrawn: () => false, isMessageUpdateExpired: () => false, brand: () => 'feishu',
+    isMessageWithdrawn: () => false,
+    isMessageUpdateExpired: error => error instanceof Error && error.name === 'MessageUpdateExpiredError',
+    brand: () => 'feishu',
   };
   const coordinator = new ProjectCoordinator(transport);
   const context = { dataDir, chatId: actor.chatId, larkAppId: actor.larkAppId, coordinatorSessionId: actor.sessionId };
@@ -306,7 +313,9 @@ describe('project workstream attachments', () => {
     expect(readProjectAttachmentRecord(f.dataDir, 'om_topic')?.state).toBe('active');
     f.source().rootMessageId = 'om_other';
     f.source().routeRevision = 2;
-    await f.service.observe(structuredClone(f.source()));
+    f.projectRun.mockClear();
+    expect(await f.service.observe(structuredClone(f.source()))).toEqual(['oc_group']);
+    expect(f.projectRun).not.toHaveBeenCalled();
     expect(readProjectAttachmentRecord(f.dataDir, 'om_topic')?.state).toBe('moved');
     expect(f.registry().om_topic.lastReport.status).toBe('completed');
     expect(readProjectGroup(f.dataDir, 'oc_group')?.workstreams[0]?.status).toBe('completed');
@@ -845,6 +854,54 @@ describe('project workstream attachments', () => {
       registry[rootMessageId] = entry;
     });
   }
+
+  it.each(['attached', 'ordinary'] as const)('shares the sync budget for 20 automatic %s reports', async kind => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const f = await fixture();
+    const root = f.request.rootMessageId;
+    if (kind === 'attached') await f.service.attach(f.actor, f.request);
+    else {
+      await seedOrdinaryDispatch(f, root, entry => {
+        entry.reportBinding = createDispatchReportBinding(SECRET, {
+          dispatchRoot: root, targetLarkAppId: f.actor.larkAppId, targetSessionId: f.actor.sessionId,
+          targetChatId: f.actor.chatId, targetScope: 'chat', sourceName: '普通派单任务',
+          issuedAt: new Date().toISOString(),
+        });
+      });
+    }
+    vi.mocked(f.transport.sendCard).mockResolvedValue('om_replacement');
+    vi.mocked(f.transport.updateCard).mockClear().mockRejectedValue(
+      Object.assign(new Error('past edit window'), { name: 'MessageUpdateExpiredError' }),
+    );
+    const sync = createProjectCardRuntimeSync({
+      larkAppId: f.context.larkAppId,
+      listProjects: () => listProjectGroups(f.dataDir),
+      readMode: f.deps.getMode,
+      resolveRuntime: async () => undefined,
+      refresh: (_project, target) => f.coordinator.refreshCard(f.context, target),
+      isMessageUpdateExpired: f.transport.isMessageUpdateExpired,
+      repostExpiredCard: (_project, target) => f.coordinator.repostExpiredCard(f.context, target),
+      retryPendingCardPin: (_project, id) => f.coordinator.retryPendingCardPin(f.context, id),
+      forwardToCoordinator: () => {},
+    });
+    const automatic = { ...f.actor, repostOnExpired: false };
+    const start = Date.now();
+    for (let report = 1; report <= 20; report += 1) {
+      vi.setSystemTime(start + report * 30_000);
+      const patches = vi.mocked(f.transport.updateCard).mock.calls.length;
+      expect(await f.service.update(automatic, {
+        rootMessageId: root, status: 'in_progress', progress: report, content: `进展 ${report}`,
+      })).toMatchObject({ registered: true, cardSynced: false });
+      expect(f.transport.updateCard).toHaveBeenCalledTimes(patches);
+      if (report % 4 === 0) {
+        for (let tick = 0; tick < PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST; tick += 1) await sync.sync();
+      }
+    }
+    expect(f.transport.sendCard).toHaveBeenCalledTimes(2);
+    expect(f.transport.pinMessage).toHaveBeenCalledTimes(2);
+    expect(f.transport.unpinMessage).toHaveBeenCalledExactlyOnceWith(f.actor.larkAppId, 'om_card');
+    expect(readProjectGroup(f.dataDir, f.actor.chatId)?.workstreams[0]).toMatchObject({ progress: 20, lastReport: '进展 20' });
+  });
 
   it('refuses manual update on an ordinary dispatch whose signed binding targets another coordinator', async () => {
     const f = await fixture();
