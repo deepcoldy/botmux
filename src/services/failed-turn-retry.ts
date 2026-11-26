@@ -31,7 +31,7 @@ export function buildFailedTurnRecord(
     /** turn_terminal `directFailure`: nothing but API errors answered it. */
     directFailure?: true;
   },
-  sources: { userPrompt?: string; cliInput?: string; codexAppInput?: CodexAppTurnInput;
+  sources: { userPrompt?: string; cliInput?: string; hookEnvelope?: string; codexAppInput?: CodexAppTurnInput;
     attachments?: LarkAttachment[]; trustedCaller?: TrustedCaller; originalTurnId?: string; silent?: boolean },
   now: Date = new Date(),
 ): FailedTurnRecord | undefined {
@@ -40,6 +40,7 @@ export function buildFailedTurnRecord(
     turnId: terminal.turnId,
     userPrompt: sources.userPrompt ?? sources.cliInput,
     cliInput: sources.cliInput,
+    ...(sources.hookEnvelope ? { hookEnvelope: sources.hookEnvelope } : {}),
     ...(sources.codexAppInput ? { codexAppInput: sources.codexAppInput } : {}),
     ...(sources.attachments?.length ? { attachments: structuredClone(sources.attachments) } : {}),
     failedAt: now.toISOString(),

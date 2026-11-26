@@ -29,7 +29,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, unl
 import { join } from 'node:path';
 import { config } from '../config.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
-import { normaliseForFingerprint } from './claude-transcript.js';
+import { CLAUDE_STRIPPED_INVISIBLE_RE, normaliseForFingerprint } from './claude-transcript.js';
 
 /** sidecar 保留上限：超出按 mtime 淘汰最旧的。 */
 const SIDECAR_MAX_FILES = 100;
@@ -38,18 +38,22 @@ const SIDECAR_TTL_MS = 24 * 60 * 60 * 1000;
 /** 前缀兜底匹配长度：与 makeSubmitFingerprint 一致，足以覆盖 paste 污染前的完好区。 */
 const PREFIX_FALLBACK_LEN = 30;
 
-function sessionDir(sessionId: string): string {
-  return join(config.session.dataDir, 'prompt-ctx', sessionId);
+function normalisePromptKeyText(text: string): string {
+  return normaliseForFingerprint(text.replace(CLAUDE_STRIPPED_INVISIBLE_RE, ''));
 }
 
-/** 全量指纹：normalise 后 sha256（hex）。主键，无前缀碰撞。 */
+function sessionDir(sessionId: string, dataDir = config.session.dataDir): string {
+  return join(dataDir, 'prompt-ctx', sessionId);
+}
+
+/** 全量指纹：去除 Claude PTY 会剥离的不可见字符并 normalise 后 sha256（hex）。主键，无前缀碰撞。 */
 export function fingerprintPromptText(text: string): string {
-  return createHash('sha256').update(normaliseForFingerprint(text), 'utf8').digest('hex');
+  return createHash('sha256').update(normalisePromptKeyText(text), 'utf8').digest('hex');
 }
 
-/** 前缀指纹：normalise 后取前 N 字符。仅用于 paste 污染时的兜底匹配。 */
+/** 前缀指纹：与全量指纹同口径归一化后取前 N 字符。仅用于 paste 污染时的兜底匹配。 */
 export function prefixOf(text: string): string {
-  return normaliseForFingerprint(text).slice(0, PREFIX_FALLBACK_LEN);
+  return normalisePromptKeyText(text).slice(0, PREFIX_FALLBACK_LEN);
 }
 
 /** turnId 文件名键：全量 sha256(turnId) hex。
@@ -70,7 +74,9 @@ export function writePromptContext(sessionId: string, turnId: string, ptyText: s
   try {
     const dir = sessionDir(sessionId);
     mkdirSync(dir, { recursive: true, mode: 0o700 });
-    const file = join(dir, `${fingerprintPromptText(ptyText)}.${turnIdKey(turnId)}.json`);
+    const key = turnIdKey(turnId);
+    const suffix = `.${key}.json`;
+    const file = join(dir, `${fingerprintPromptText(ptyText)}${suffix}`);
     const payload = JSON.stringify({
       version: 3,
       envelope,
@@ -80,6 +86,15 @@ export function writePromptContext(sessionId: string, turnId: string, ptyText: s
       createdAt: Date.now(),
     }) + '\n';
     atomicWriteFileSync(file, payload, { mode: 0o600, followTargetSymlink: false });
+    // Maintain the single-sidecar-per-turn invariant: remove any earlier file
+    // for the same turnId (e.g. rebuild/retry with different text) after the
+    // new sidecar has landed atomically.
+    for (const existing of readdirSync(dir)) {
+      if (!existing.endsWith(suffix)) continue;
+      const existingFull = join(dir, existing);
+      if (existingFull === file) continue;
+      try { unlinkSync(existingFull); } catch { /* best-effort */ }
+    }
     pruneSidecars(dir, file);
   } catch { /* best-effort */ }
 }
@@ -90,10 +105,16 @@ export function writePromptContext(sessionId: string, turnId: string, ptyText: s
  * claim 为空，reminder/sender 随之丢失。精确命中旧指纹就改它；没有旧指纹时按
  * turnId 定域找到该轮唯一一条也改它。best-effort，不影响主路径。
  */
-export function rekeyPromptContext(sessionId: string, turnId: string, previousPtyText: string, nextPtyText: string): boolean {
+export function rekeyPromptContext(
+  sessionId: string,
+  turnId: string,
+  previousPtyText: string,
+  nextPtyText: string,
+  dataDir?: string,
+): boolean {
   try {
     if (previousPtyText === nextPtyText) return false;
-    const dir = sessionDir(sessionId);
+    const dir = sessionDir(sessionId, dataDir);
     if (!existsSync(dir)) return false;
     const key = turnIdKey(turnId);
     const exact = join(dir, `${fingerprintPromptText(previousPtyText)}.${key}.json`);

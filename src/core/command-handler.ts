@@ -15,6 +15,8 @@ import { groupTaskForwardIds, groupTaskPlaceholder, groupTaskPrompt, groupTaskPr
  * Extracted from daemon.ts for modularity.
  */
 import { sessionPromptInjection, supportsZeroPromptInjectionForBot, type PromptInjection } from './prompt-injection.js';
+import { plannedOpeningBackendType } from './opening-backend.js';
+import { prepareHookEnvelopeForReplay } from './prompt-hook-replay.js';
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { join, resolve, basename } from 'node:path';
@@ -2379,6 +2381,9 @@ export async function handleCommand(
           return 'selected' as const;
         });
         if (result === 'selected') {
+          if (selectedCliId === 'claude-code') {
+            try { (await import('./worker-pool.js')).ensureCliEnv?.('claude-code'); } catch { /* best-effort */ }
+          }
           await sessionReply(rootId, `CLI selected: ${selectedCliId}`);
         } else if (result === 'no_active_session') {
           await replyNoSession(replyHere, loc);
@@ -3582,6 +3587,11 @@ export async function handleCommand(
                   // Pending repo selection still owns the original fresh
                   // launch; the paired forkWorker call does not resume.
                   larkToolResume: false,
+                  turnId: pendingRawInput
+                    ? undefined
+                    : (current.pendingTurnId ?? current.session.pendingRepoSetup?.turnId),
+                  sessionBackendType: plannedOpeningBackendType(current, effectiveCliId, botCfg),
+                  promptInjection: sessionPromptInjection(current),
                 },
               );
             }
@@ -4145,15 +4155,24 @@ export async function handleCommand(
         const retryCodexAppInput = failedTurn.codexAppInput
           ? (({ clientUserMessageId: _prior, ...input }) => input)(failedTurn.codexAppInput)
           : undefined;
-        const retryInput: CliTurnPayload = {
+        const retryTurnId = `retry-${randomUUID()}`;
+        const willUseLiveWorker = !!(ds.worker && !ds.worker.killed);
+        const replayed = prepareHookEnvelopeForReplay({
+          ds,
           content: failedTurn.cliInput,
+          turnId: retryTurnId,
+          hookEnvelope: failedTurn.hookEnvelope,
+          willUseLiveWorker,
+        });
+        const retryInput: CliTurnPayload = {
+          content: replayed.content,
+          ...(replayed.hookEnvelope ? { hookEnvelope: replayed.hookEnvelope } : {}),
           ...(retryCodexAppInput ? { codexAppInput: retryCodexAppInput } : {}),
         };
-        const retryTurnId = `retry-${randomUUID()}`;
         const rollbackReplyRouting = inheritTurnReplyRouting(ds, failedTurn.turnId, retryTurnId);
         let accepted = false;
         try {
-          if (ds.worker && !ds.worker.killed) {
+          if (willUseLiveWorker) {
             // A turn that failed without any output is cut first, so the
             // retry replaces it instead of stacking on top.
             accepted = sendWorkerInput(ds, retryInput, retryTurnId, { failedTurnResendOf: failedTurn.turnId });
@@ -8459,6 +8478,13 @@ export async function startForkSubtopicSession(
             // /fork creates a new child session and never resumes an existing
             // worker generation for this opening.
             larkToolResume: false,
+            turnId: message.messageId,
+            sessionBackendType: plannedOpeningBackendType(
+              { initConfig: undefined, session: { backendType: parentSession.backendType } },
+              childCliId,
+              botCfg,
+            ),
+            promptInjection: sessionPromptInjection(parentDs),
           },
         ),
       },

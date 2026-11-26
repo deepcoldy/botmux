@@ -279,4 +279,51 @@ describe('prompt-context-store', () => {
     expect(rekeyPromptContext('sess-1', 'turn-4', 'something else', dispatched)).toBe(true);
     expect(claimByPrompt('sess-1', 'turn-4', dispatched)).toBe('E4');
   });
+
+  it('aligns fingerprinting with sanitizeClaudeInput when text starts with ZWJ emoji or ZWSP', () => {
+    // Claude PTY write strips ZWJ/ZWSP/BOM before typing; without <user_message>
+    // leading user text starts at index 0, so both sides must produce identical keys.
+    const rawFromFeishu = '\u200B👨\u200D👩\u200D👧\u200D👦 帮我看下这个报错\uFEFF';
+    const sanitizedInClaude = rawFromFeishu.replace(/[\u200B-\u200D\u2060\uFEFF]/g, '');
+    expect(fingerprintPromptText(rawFromFeishu)).toBe(fingerprintPromptText(sanitizedInClaude));
+    expect(prefixOf(rawFromFeishu)).toBe(prefixOf(sanitizedInClaude));
+
+    writePromptContext('sess-zwj', 'turn-zwj', rawFromFeishu, '<sender name="User" />');
+    expect(claimPromptContext(
+      'sess-zwj',
+      'turn-zwj',
+      fingerprintPromptText(sanitizedInClaude),
+      prefixOf(sanitizedInClaude),
+    )).toBe('<sender name="User" />');
+  });
+
+  it('supports chained rekeys across group-context, LinkRef, and worker <botmux_skills> appends', () => {
+    const step0 = '<shared_group_context>bg</shared_group_context>\n\n帮我查报错';
+    const step1 = '帮我查报错';
+    const step2 = '帮我查报错\n\n<botmux_link_refs>L1=https://example.test</botmux_link_refs>';
+    const step3 = `${step2}\n\n<botmux_skills mode="priority">- deploy</botmux_skills>`;
+
+    writePromptContext('sess-chain', 'turn-chain', step0, '<sender name="U" />');
+    expect(rekeyPromptContext('sess-chain', 'turn-chain', step0, step1)).toBe(true);
+    expect(rekeyPromptContext('sess-chain', 'turn-chain', step1, step2)).toBe(true);
+    expect(rekeyPromptContext('sess-chain', 'turn-chain', step2, step3)).toBe(true);
+
+    expect(claimPromptContext('sess-chain', 'turn-chain', fingerprintPromptText(step0))).toBeUndefined();
+    expect(claimPromptContext('sess-chain', 'turn-chain', fingerprintPromptText(step1))).toBeUndefined();
+    expect(claimPromptContext('sess-chain', 'turn-chain', fingerprintPromptText(step2))).toBeUndefined();
+    expect(claimPromptContext('sess-chain', 'turn-chain', fingerprintPromptText(step3))).toBe('<sender name="U" />');
+  });
+
+  it('maintains single-sidecar-per-turn invariant when writePromptContext rebuilds the same turnId', () => {
+    const prefix = '这是一个超过三十个字符的相同前缀用于验证重建替换逻辑';
+    const first = `${prefix} 版本一`;
+    const second = `${prefix} 版本二`;
+    writePromptContext('sess-rebuild', 'turn-same', first, 'OLD_ENV');
+    writePromptContext('sess-rebuild', 'turn-same', second, 'NEW_ENV');
+
+    // Old file was unlinked on rebuild; prefix fallback and rekey see exactly 1 file.
+    expect(claimPromptContext('sess-rebuild', 'turn-same', fingerprintPromptText(first))).toBeUndefined();
+    expect(rekeyPromptContext('sess-rebuild', 'turn-same', second, `${second} tail`)).toBe(true);
+    expect(claimByPrompt('sess-rebuild', 'turn-same', `${second} tail`)).toBe('NEW_ENV');
+  });
 });

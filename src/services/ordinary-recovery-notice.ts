@@ -26,7 +26,7 @@
 import { randomUUID } from 'node:crypto';
 import type { TrustedCaller } from '../types.js';
 import { extractLarkBusinessCode } from '../im/lark/lark-errors.js';
-import { stripBotmuxDisplayBlocks } from '../utils/prompt-display-strip.js';
+import { stripBotmuxEnvelopeBlocks } from '../utils/prompt-display-strip.js';
 import {
   ordinaryTurnRecoveryCauseCode,
   type OrdinaryTurnRecoveryState,
@@ -114,7 +114,7 @@ export interface OrdinaryRecoveryNoticeRecord {
   /** Short excerpt of the original message, for "which message was this". */
   task?: string;
   /** Re-delivery material. Absent ⇒ the card offers no retry button. */
-  retry?: { cliInput: string; trustedCaller: TrustedCaller };
+  retry?: { cliInput: string; hookEnvelope?: string; trustedCaller: TrustedCaller };
   delivery: {
     state: RecoveryNoticeDeliveryState;
     attempts: number;
@@ -193,7 +193,13 @@ export function createOrdinaryRecoveryNotice(
     ...(context.initiatorOpenId ? { initiatorOpenId: context.initiatorOpenId } : {}),
     ...(task ? { task } : {}),
     ...(context.retrySupported && input && context.retryCaller
-      ? { retry: { cliInput: input.cliInput, trustedCaller: { ...context.retryCaller } } }
+      ? {
+          retry: {
+            cliInput: input.cliInput,
+            ...(input.hookEnvelope ? { hookEnvelope: input.hookEnvelope } : {}),
+            trustedCaller: { ...context.retryCaller },
+          },
+        }
       : {}),
     delivery: {
       state: stale ? 'skipped' : 'pending',
@@ -297,9 +303,9 @@ export function userMessageExcerpt(cliInput: string, maxChars = 80): string | un
   const blocks = [...cliInput.matchAll(/<user_message\b[^>]*>([\s\S]*?)<\/user_message>/gi)];
   const raw = blocks.length > 0
     ? blocks.map(match => match[1]).join(' ')
-    // bare（transcript + solo）续轮没有 <user_message> 壳：先整块剥掉追加在
-    // 正文后的 <botmux_formatting>（含块体），再退化为去标签文本。
-    : stripBotmuxDisplayBlocks(stripRetryPrefix(cliInput)).replace(/<[^>]+>/g, ' ');
+    // hook 注入或 bare（transcript + solo）轮没有 <user_message> 壳：先整块剥掉
+    // 已知 BotMux 上下文/提示块（含块体），再退化为去标签文本。
+    : stripBotmuxEnvelopeBlocks(stripRetryPrefix(cliInput), { replacement: ' ' }).replace(/<[^>]+>/g, ' ');
   const text = decodeXmlEntities(raw).replace(/\s+/g, ' ').trim();
   if (!text) return undefined;
   return text.length > maxChars ? `${text.slice(0, maxChars)}…` : text;

@@ -223,6 +223,7 @@ import { logger } from '../utils/logger.js';
 import { createCliAdapterSync, type CliAdapterOptions } from '../adapters/cli/registry.js';
 import { antigravityTransport } from '../services/antigravity-transport.js';
 import { cliSupportsConfigDir } from './cli-config-dir.js';
+import { prepareHookEnvelopeForReplay } from './prompt-hook-replay.js';
 import {
   resolveCliRuntime,
   runtimeInstallationKey,
@@ -4010,15 +4011,28 @@ export function ensureOrdinaryTurnRecoveryAttached(
           // A turn that failed without any output is cut first and its input
           // re-sent instead of the recovery prompt: nothing ran, so there is
           // no checkpoint to continue from (core/failed-turn-rewind.ts).
+          const isClaude = sessionCliId(ds, botCfg) === 'claude-code';
+          const failedTurn = ds.session.lastFailedTurn;
+          const logicalHookEnvelope = ds.session.ordinaryTurnRecovery?.retryInputs?.[dispatch.logicalTurnId]?.hookEnvelope
+            ?? (failedTurn?.turnId === dispatch.logicalTurnId ? failedTurn.hookEnvelope : undefined);
+          const replayed = isClaude && failedTurn?.directFailure === true && logicalHookEnvelope
+            ? prepareHookEnvelopeForReplay({
+              ds,
+              content: dispatch.prompt,
+              turnId: dispatch.turnId,
+              hookEnvelope: logicalHookEnvelope,
+              willUseLiveWorker: true,
+            })
+            : { content: dispatch.prompt };
           enqueued = sendWorkerInput(
             ds,
-            dispatch.prompt,
+            replayed,
             dispatch.turnId,
             {
               ...(trustedCaller ? { trustedCaller } : {}),
               // Only Claude Code transcripts can be cut; other CLIs keep their
               // continuation exactly as it was.
-              ...(sessionCliId(ds, botCfg) === 'claude-code' ? { failedTurnResendOf: dispatch.logicalTurnId } : {}),
+              ...(isClaude ? { failedTurnResendOf: dispatch.logicalTurnId } : {}),
             },
           );
         }
@@ -19089,6 +19103,9 @@ export function applyFailedTurnRewindResult(
   // meanwhile (it queued behind this one's restart): that one keeps it.
   // Inputs never remembered as latest (an automatic continuation) leave the
   // failed turn as the latest, which they now replace.
+  const carriedHookEnvelope = ds.session.lastFailedTurn?.turnId === result.failedTurnId
+    ? ds.session.lastFailedTurn.hookEnvelope
+    : undefined;
   if (ds.lastCliInputTurnId === result.turnId || ds.lastCliInputTurnId === result.failedTurnId) {
     const userPrompt = pending.mode === 'merge' && ds.lastCliInputTurnId === result.turnId && ds.lastUserPrompt
       ? mergeFailedTurnInput(pending.failedUserPrompt, ds.lastUserPrompt)
@@ -19099,9 +19116,16 @@ export function applyFailedTurnRewindResult(
     ds.session.lastUserPrompt = userPrompt;
     ds.session.lastCliInput = pending.content;
     ds.session.lastCliInputTurnId = result.turnId;
+    if (carriedHookEnvelope) {
+      ds.lastHookEnvelope = carriedHookEnvelope;
+      ds.session.lastHookEnvelope = carriedHookEnvelope;
+    }
   }
   const retryInput = ds.session.ordinaryTurnRecovery?.retryInputs?.[result.turnId];
-  if (retryInput) retryInput.cliInput = pending.content;
+  if (retryInput) {
+    retryInput.cliInput = pending.content;
+    if (carriedHookEnvelope) retryInput.hookEnvelope = carriedHookEnvelope;
+  }
   if (ds.session.lastFailedTurn?.turnId === result.failedTurnId) delete ds.session.lastFailedTurn;
   const previous = ds.session.failedTurnRewindChain;
   const continues = previous?.turnId === result.failedTurnId;
@@ -19455,6 +19479,7 @@ export function sendWorkerInput(
       ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
       input: {
         cliInput: normalized.content,
+        ...(normalized.hookEnvelope ? { hookEnvelope: normalized.hookEnvelope } : {}),
         ...(opts.trustedCaller ? { trustedCaller: { ...opts.trustedCaller } } : {}),
       },
     });
@@ -20001,6 +20026,7 @@ export function promoteQueuedActivationTail(
         : {}),
       input: {
         cliInput: exactInput.content,
+        ...(exactInput.hookEnvelope ? { hookEnvelope: exactInput.hookEnvelope } : {}),
         ...(exactInput.trustedCaller ? { trustedCaller: { ...exactInput.trustedCaller } } : {}),
       },
     });
@@ -22665,6 +22691,7 @@ function forkWorkerPrepared(
         : {}),
       input: {
         cliInput: prompt,
+        ...(promptPayload.hookEnvelope ? { hookEnvelope: promptPayload.hookEnvelope } : {}),
         ...(initTrustedCaller ? { trustedCaller: { ...initTrustedCaller } } : {}),
       },
     });

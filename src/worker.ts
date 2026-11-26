@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { isCliStartupFailure } from './core/cli-startup-failure.js';
-import { fingerprintPromptText } from './services/prompt-context-store.js';
+import { fingerprintPromptText, rekeyPromptContext } from './services/prompt-context-store.js';
 import { readLatestNativeGoal, readNativeGoalForRollout } from './services/native-goal-state.js';
 import { WorkerSessionEventScope, type RuntimeEventBinding, type CapturedSessionOrigin } from './services/session-event-scope.js';
 import { admitSessionCommand } from './services/session-command-gateway.js';
@@ -2948,7 +2948,11 @@ function attachDeferredPluginSkillCatalog(item: PendingCliInput): void {
     item.traexSkillCatalog = deferredPluginSkillCatalog;
     item.traexSkillCatalogDigest = deferredPluginSkillCatalogDigest;
   } else {
+    const previousContent = item.content;
     item.content = `${item.content}\n\n${deferredPluginSkillCatalog}`;
+    if (typeof rekeyPromptContext === 'function' && typeof sessionId === 'string' && sessionId && item.turnId) {
+      rekeyPromptContext(sessionId, item.turnId, previousContent, item.content);
+    }
   }
   if (item.codexAppInput) {
     item.codexAppInput = withCodexAppContext(item.codexAppInput,
@@ -3025,6 +3029,7 @@ function refreshCliPluginGeneration(
     adapter,
     workingDir: cfg.workingDir,
     prompt: cfg.prompt,
+    turnId: cfg.turnId,
     replacesPriorGeneration: cfg.resume === true,
     promptInjection: cfg.promptInjection,
     compactCatalog: cfg.cliId === 'traex'
@@ -11781,7 +11786,11 @@ function deliverRestartInterruptionNote(): void {
     if (restartNoteMayPrefix(head)) {
       // In place: the queue item's identity is what replay / hold tracking
       // follows.
+      const previousContent = head.content;
       Object.assign(head, prefixRestartNote(head, note));
+      if (head.content !== previousContent && typeof rekeyPromptContext === 'function' && typeof sessionId === 'string' && sessionId && head.turnId) {
+        rekeyPromptContext(sessionId, head.turnId, previousContent, head.content);
+      }
       delivered = true;
     }
   } else if (!spawnArgvNeedsWorkingSeed && !spawnArgvInitialPromptBusy && lastWrittenCliInput) {
@@ -27819,6 +27828,7 @@ function scheduleSubmitFailureNotify(
       backendType: effectiveBackendType,
       capturedScreenText: submitDiagnosisScreen,
       cliId: lastInitConfig?.cliId,
+      submittedInput: msg,
       lastActivityAtMs: lastPtyActivityAtMs,
     });
     // A retained (quarantined) draft can stop being submittable without any
@@ -44316,7 +44326,11 @@ function startFailedTurnRewind(
         reason: `cut ${outcome.result.removedBytes} bytes, backup ${outcome.result.backupPath}`,
       };
       state.cut = cut;
+      const previousQueuedContent = queued.content;
       queued.content = rewoundContent(directive.content, outcome.suffix);
+      if (typeof rekeyPromptContext === 'function' && typeof sessionId === 'string' && sessionId && queued.turnId) {
+        rekeyPromptContext(sessionId, queued.turnId, previousQueuedContent, queued.content);
+      }
     },
     onRespawnSettled: result => {
       if (result !== 'failed') {
@@ -44331,7 +44345,13 @@ function startFailedTurnRewind(
       const cut = state.cut;
       if (cut && putBackFailedTurnCut(cut)) {
         state.cut = undefined;
-        if (state.queued) state.queued.content = cut.plainContent;
+        if (state.queued) {
+          const previousQueuedContent = state.queued.content;
+          state.queued.content = cut.plainContent;
+          if (typeof rekeyPromptContext === 'function' && typeof sessionId === 'string' && sessionId && state.queued.turnId) {
+            rekeyPromptContext(sessionId, state.queued.turnId, previousQueuedContent, state.queued.content);
+          }
+        }
         report('declined', 'restart failed after the cut; cut restored');
       }
       // Without this the held message dies with the worker; the next worker

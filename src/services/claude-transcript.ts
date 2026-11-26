@@ -2259,6 +2259,14 @@ export function stringifyUserContent(content: unknown): string {
  * collide and would make pre-upgrade journal entries impossible to migrate
  * (their line breaks have already been collapsed to spaces).
  */
+/**
+ * Invisible control/joiner/BiDi characters stripped by `sanitizeClaudeInput`
+ * before writing prompts to Claude Code's PTY. Shared by prompt fingerprinting,
+ * hook composer-prefix safety checks, and submit-failure composer matching so
+ * every side normalises the exact same character class.
+ */
+export const CLAUDE_STRIPPED_INVISIBLE_RE = /[\u200B-\u200D\u2060\uFEFF\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
+
 export function normaliseForFingerprint(s: string): string {
   return s.replace(/\s+/g, ' ').trim();
 }

@@ -5,6 +5,7 @@ import { armTriggerStreamingCard } from './trigger-streaming-card.js';
 import { messageListenerTaskAnchor } from './message-listener-silence.js';
 import { rememberExternalTriggerTurn, rememberTriggerTurn } from './turn-origin.js';
 import { zeroPromptInjectionForBot, sessionPromptInjection } from './prompt-injection.js';
+import { plannedOpeningBackendType } from './opening-backend.js';
 import { withLarkTurnIdempotency } from './lark-turn-idempotency.js';
 import * as sessionStore from '../services/session-store.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
@@ -2202,9 +2203,10 @@ async function triggerSessionTurnAdmitted(
   }
   const newTurnRoot = scope === 'thread' ? anchor : undefined;
   stageTriggerReadModel(newDs, req, triggerId, runAsPerson, newTurnRoot);
+  const triggerOpeningCliId = session.cliLaunchSnapshot?.cliId ?? session.cliId ?? bot.config.cliId;
   const promptInput = buildNewTopicCliInput(prompt,
     session.sessionId,
-    session.cliLaunchSnapshot?.cliId ?? session.cliId ?? bot.config.cliId,
+    triggerOpeningCliId,
     session.cliLaunchSnapshot?.cliPathOverride ?? session.cliPathOverride ?? bot.config.cliPathOverride,
     undefined,
     undefined,
@@ -2217,6 +2219,9 @@ async function triggerSessionTurnAdmitted(
       larkAppId,
       chatId,
       whiteboardId: newDs.session.whiteboardId,
+      promptInjection: sessionPromptInjection(newDs),
+      turnId: triggerId,
+      sessionBackendType: plannedOpeningBackendType(newDs, triggerOpeningCliId, bot.config),
       codexAppText,
       codexAppApplicationContext,
       codexAppMessageContext,

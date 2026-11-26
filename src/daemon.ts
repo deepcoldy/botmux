@@ -55,6 +55,7 @@ import {
 } from './core/report-source-reply.js';
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
 import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './core/prompt-injection.js';
+import { plannedOpeningBackendType } from './core/opening-backend.js';
 import { stripDispatchCompletionProtocol } from './core/dispatch.js';
 import { withConfiguredBotOwner } from './core/bot-owner-attribution.js';
 import { readCanonicalBotActorOwnerBindings } from './core/bot-actor-owner-binding.js';
@@ -23870,10 +23871,11 @@ function buildReservedInitialInput(
       logger.warn('Failed to stage merged session input');
     }
   }
+  const openingCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId;
   const built = buildNewTopicCliInput(
     ds.pendingPrompt ?? '',
     ds.session.sessionId,
-    ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId,
+    openingCliId,
     ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? botCfg.cliPathOverride,
     ds.pendingAttachments,
     ds.pendingMentions,
@@ -23897,15 +23899,15 @@ function buildReservedInitialInput(
       // auto-start passes this via pendingChatContext).
       chatContext: ds.pendingChatContext,
       groupJoinContext: ds.pendingGroupJoinContext,
-      // #794 后续：opening 也走 hook 注入（sender/mentions 进 envelope，PTY 文本
-      // 只剩正文）。turnId 必须与 forkReservedInitialSession 传给 forkWorker 的
+      // #794 后续：opening 也走 hook 注入（sender/mentions/availableBots 进 envelope，
+      // PTY 文本只剩正文）。turnId 必须与 forkReservedInitialSession 传给 forkWorker 的
       // 权威 turnId 一致（= 最终 managedTurnOrigin.turnId），sidecar 才能被 claim。
       // raw 命令冷启动（pendingRawInput）的 buffered follow-up 走 raw_input IPC
       // 延迟发送，turnId 权威流不同，暂不启用 hook，保持 inline。
       turnId: ds.pendingRawInput
         ? undefined
         : (ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId),
-      sessionBackendType: ds.session.backendType,
+      sessionBackendType: plannedOpeningBackendType(ds, openingCliId, botCfg),
       promptInjection: sessionPromptInjection(ds),
       linkRefMode: ds.pendingLinkRefMode,
       // Reserved initial admission is the fresh launch owned by this session.
@@ -32982,7 +32984,7 @@ async function handleThreadReplyAdmitted(
             // sendWorkerInput 的权威 turnId（parsed.messageId）一致，sidecar 可被 claim。
             turnId: parsed.messageId,
             linkRefSourceType: parsed.msgType === 'interactive' ? 'card' : 'user_message',
-            sessionBackendType: ds.session.backendType,
+            sessionBackendType: ds.initConfig?.backendType ?? ds.session.backendType,
             // This opening is being delivered to an already-running worker.
             // Preserve the identity mode that worker was actually launched
             // with; legacy empty-start sessions can reach this path after a
@@ -33423,10 +33425,11 @@ async function handleThreadReplyAdmitted(
     // opening 的 hook 会领到这份从没发出去的 speculative reminder → 双注入。
     let wrappedInput: CliTurnPayload;
     if (openingTurn) {
+      const openingCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? dsBotCfgForFork.cliId;
       wrappedInput = buildNewTopicCliInput(
         reforkContent,
         ds.session.sessionId,
-        ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? dsBotCfgForFork.cliId,
+        openingCliId,
         ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? dsBotCfgForFork.cliPathOverride,
         attachments,
         parsed.mentions,
@@ -33451,7 +33454,12 @@ async function handleThreadReplyAdmitted(
           // queued dashboard 场景的 turnId 是合成的，权威流不同，保持 inline。
           turnId: queuedHasDurableTail ? undefined : parsed.messageId,
           linkRefSourceType: parsed.msgType === 'interactive' ? 'card' : 'user_message',
-          sessionBackendType: ds.session.backendType,
+          sessionBackendType: plannedOpeningBackendType(
+            { initConfig: undefined, session: ds.session },
+            openingCliId,
+            dsBotCfgForFork,
+          ),
+          freshColdOpening: !openingResume,
           larkToolResume: openingResume,
           promptInjection: sessionPromptInjection(ds),
         },
@@ -36739,12 +36747,23 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         const dispatchTrustedCaller = trustedCallerForTurn(
           cfg.larkAppId, sourceOpenId, operation.callerUnionId, true,
         );
+        const liveBot = getBot(cfg.larkAppId);
+        const liveCfg = liveBot.config;
+        const dispatchCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? liveCfg.cliId;
+        const dispatchCliPathOverride = ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? liveCfg.cliPathOverride;
         const input = buildNewTopicCliInput(
-          prompt, sessionId, cfg.cliId, cfg.cliPathOverride, undefined, undefined,
+          prompt, sessionId, dispatchCliId, dispatchCliPathOverride, undefined, undefined,
           await getAvailableBots(cfg.larkAppId, operation.chatId),
-          undefined, { name: getBot(cfg.larkAppId).botName, openId: getBot(cfg.larkAppId).botOpenId },
+          undefined, { name: liveBot.botName, openId: liveBot.botOpenId },
           localeForBot(cfg.larkAppId), sender,
-          { larkAppId: cfg.larkAppId, chatId: operation.chatId, trustedCaller: dispatchTrustedCaller },
+          {
+            larkAppId: cfg.larkAppId,
+            chatId: operation.chatId,
+            trustedCaller: dispatchTrustedCaller,
+            promptInjection: sessionPromptInjection(ds),
+            turnId: operation.sourceTurnId,
+            sessionBackendType: plannedOpeningBackendType(ds, dispatchCliId, liveCfg),
+          },
         );
         if (!forkWorker(ds, input, { turnId: operation.sourceTurnId, trustedCaller: input.trustedCaller })) {
           throw new Error('dispatch launch worker fork was rejected');

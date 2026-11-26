@@ -1028,6 +1028,7 @@ export interface DaemonSession {
     worker: DaemonSession['worker'];
   }>;
   lastCodexAppInput?: CodexAppTurnInput;
+  lastHookEnvelope?: string;
   replyThreadAliases?: { [rootMessageId: string]: { createdAt: string; lastUsedAt: string } };
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean };
   /** Lark turns that a still-running Claude background task was launched

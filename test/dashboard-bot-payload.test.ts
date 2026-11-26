@@ -436,13 +436,15 @@ describe('dashboard bot payload helpers', () => {
       .toMatchObject({ pinStreamingCard: false });
   });
 
-  it('projects hook envelope injection so the dashboard preserves it after refresh', () => {
+  it('projects read-only hook envelope compatibility field as auto across all daemon payloads', () => {
     const daemon = { larkAppId: 'app_claude', botName: 'Claude', cliId: 'claude-code' };
-    expect(botDefaultsPayload(daemon, {})).toMatchObject({ envelopeInjection: 'off' });
+    expect(botDefaultsPayload(daemon, {})).toMatchObject({ envelopeInjection: 'auto' });
     expect(botDefaultsPayload(daemon, { envelopeInjection: 'auto' }))
       .toMatchObject({ envelopeInjection: 'auto' });
+    expect(botDefaultsPayload(daemon, { envelopeInjection: 'off' }))
+      .toMatchObject({ envelopeInjection: 'auto' });
     expect(botDefaultsPayload(daemon, { envelopeInjection: 'invalid' }))
-      .toMatchObject({ envelopeInjection: 'off' });
+      .toMatchObject({ envelopeInjection: 'auto' });
   });
 
   it('projects reply delivery effective value + CLI default + CLI support so the dashboard toggle survives refresh', () => {

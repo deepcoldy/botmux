@@ -1531,14 +1531,14 @@ describe('parseBotConfigsFromText — replyStyle', () => {
   });
 });
 
-describe('parseBotConfigsFromText — envelopeInjection cold read', () => {
+describe('parseBotConfigsFromText — legacy envelopeInjection compatibility', () => {
   let mod: Awaited<ReturnType<typeof freshImport>>;
 
   beforeEach(async () => {
     mod = await freshImport();
   });
 
-  it('preserves auto and treats unset, off, and invalid values as the default', () => {
+  it('compatibly ignores legacy auto, off, and invalid values without error', () => {
     const [auto, unset, off, invalid] = mod.parseBotConfigsFromText(JSON.stringify([
       { larkAppId: 'auto', larkAppSecret: 's', envelopeInjection: 'auto' },
       { larkAppId: 'unset', larkAppSecret: 's' },
@@ -1546,10 +1546,13 @@ describe('parseBotConfigsFromText — envelopeInjection cold read', () => {
       { larkAppId: 'invalid', larkAppSecret: 's', envelopeInjection: 'sideways' },
     ]));
 
-    expect(auto.envelopeInjection).toBe('auto');
-    expect(unset.envelopeInjection).toBeUndefined();
-    expect(off.envelopeInjection).toBeUndefined();
-    expect(invalid.envelopeInjection).toBeUndefined();
+    expect(auto.larkAppId).toBe('auto');
+    expect(unset.larkAppId).toBe('unset');
+    expect(off.larkAppId).toBe('off');
+    expect(invalid.larkAppId).toBe('invalid');
+    for (const cfg of [auto, unset, off, invalid]) {
+      expect(cfg).not.toHaveProperty('envelopeInjection');
+    }
   });
 });
 
@@ -2268,16 +2271,20 @@ describe('loadBotConfigs', () => {
     expect(configs[0].cliId).toBe('claude-code'); // default
   });
 
-  it('cold-reads envelopeInjection for the indexed daemon slot', () => {
+  it('compatibly ignores legacy envelopeInjection for the indexed daemon slot', () => {
     process.env.BOTS_CONFIG = '/tmp/bots.json';
     fsMock.existsSync.mockReturnValue(true);
-    fsMock.readFileSync.mockReturnValue(JSON.stringify([{
-      larkAppId: 'daemon_app',
-      larkAppSecret: 'secret',
-      envelopeInjection: 'auto',
-    }]));
+    fsMock.readFileSync.mockReturnValue(JSON.stringify([
+      { larkAppId: 'daemon_auto', larkAppSecret: 'secret', envelopeInjection: 'auto' },
+      { larkAppId: 'daemon_off', larkAppSecret: 'secret', envelopeInjection: 'off' },
+    ]));
 
-    expect(mod.loadBotConfigAtIndex(0).envelopeInjection).toBe('auto');
+    const first = mod.loadBotConfigAtIndex(0);
+    const second = mod.loadBotConfigAtIndex(1);
+    expect(first.larkAppId).toBe('daemon_auto');
+    expect(second.larkAppId).toBe('daemon_off');
+    expect(first).not.toHaveProperty('envelopeInjection');
+    expect(second).not.toHaveProperty('envelopeInjection');
   });
 
   it('cold-reads dshProfile for the indexed daemon slot', () => {

@@ -1253,18 +1253,13 @@ function BotDefaultsCard(props: {
             {bot.cliId === 'codex-app' || bot.cliId === 'codex' ? (
               <section className="bd-tile" id={botDefaultsSectionDomId('codex-app-display')}><CodexAppDisplaySection bot={bot} putCardPref={putCardPref} patchBot={patchBot} /></section>
             ) : null}
-            {/* #794 hook 注入目前只验证了 claude-code，其它 CLI 隐藏避免误开。 */}
-            {bot.cliId === 'claude-code' ? (
-              <section className="bd-tile" id={botDefaultsSectionDomId('envelope-injection')}><EnvelopeInjectionSection bot={bot} patchBot={patchBot} /></section>
-            ) : null}
             {/* 自动转发最终回复开关对所有 CLI 都显示：不支持的 CLI 禁用开关并说明原因，
                 避免用户在别的 tab 找不到这个开关却在 /botconfig 里能设。 */}
             <section className="bd-tile" id={botDefaultsSectionDomId('prompt-injection')}>
               <PromptInjectionSection bot={bot} patchBot={patchBot} lock={props.linkedAgent} />
               <ReplyDeliverySection bot={bot} patchBot={patchBot} />
             </section>
-            {/* <sender> 注入对所有 CLI 都生效（每种 CLI 的 prompt 都会带这个块），
-                所以不按 cliId 收窄——不像上面的 hook 注入只验证过 claude-code。 */}
+            {/* <sender> 注入对所有 CLI 都生效（每种 CLI 的 prompt 都会带这个块），不按 cliId 收窄。 */}
             <section className="bd-tile" id={botDefaultsSectionDomId('sender-tag')}><SenderTagSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('quota-fallback')}>
               <QuotaFallbackChainSection bot={bot} cliState={cliState} startCli={cli} patchBot={patchBot} />
@@ -7284,50 +7279,6 @@ export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref
       <small className="bd-section-note">{tr(isCodexApp ? 'botDefaults.noProgressNotifyTimeoutHelp' : 'botDefaults.cliProgressNotifyTimeoutHelp')}</small>
       <div className="actions">
         <StatusSpan status={status} attr={{ 'data-codex-app-clean-input-status': '' }} />
-      </div>
-    </section>
-  );
-}
-
-export function EnvelopeInjectionSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
-  const tr = useT();
-  const [auto, setAuto] = useState(props.bot.envelopeInjection === 'auto');
-  const [status, setStatus] = useState<StatusMessage>(null);
-  const [busy, setBusy] = useState(false);
-
-  useEffect(() => setAuto(props.bot.envelopeInjection === 'auto'), [props.bot.envelopeInjection]);
-
-  async function save(next: boolean): Promise<void> {
-    const previous = auto;
-    setAuto(next);
-    await saveBotField({
-      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/envelope-injection`, { envelopeInjection: next ? 'auto' : 'off' }),
-      setStatus,
-      setBusy,
-      saved: tr('botDefaults.cardPrefSaved'),
-      onSaved: body => {
-        const saved = body.envelopeInjection === 'auto';
-        setAuto(saved);
-        props.patchBot(props.bot.larkAppId, { envelopeInjection: saved ? 'auto' : 'off' });
-      },
-      rollback: () => setAuto(previous),
-    });
-  }
-
-  return (
-    <section className="bd-section" data-envelope-injection>
-      <h3 className="bd-section-title">{tr('botDefaults.envelopeInjection')}</h3>
-      <ToggleRow
-        checked={auto}
-        disabled={busy}
-        dataAction="toggle-envelope-injection"
-        title={tr('botDefaults.envelopeInjectionAuto')}
-        help={tr('botDefaults.envelopeInjectionHelp')}
-        onChange={checked => void save(checked)}
-      />
-      <small className="bd-section-note">{tr('botDefaults.envelopeInjectionNote')}</small>
-      <div className="actions">
-        <StatusSpan status={status} attr={{ 'data-envelope-injection-status': '' }} />
       </div>
     </section>
   );

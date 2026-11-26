@@ -11484,8 +11484,6 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     const configured = getBot(cachedLarkAppId).config.p2pMode;
     if (configured === 'thread' || configured === 'group') p2pMode = configured;
   } catch { /* default chat */ }
-  let envelopeInjection: 'auto' | 'off' = 'off';
-  try { if (getBot(cachedLarkAppId).config.envelopeInjection === 'auto') envelopeInjection = 'auto'; } catch { /* default off */ }
   // 最终回复投递方式：给 dashboard 的是**生效值**（显式配置 → 否则按 CLI 缺省，
   // doubao 缺省 transcript、其余 send）
   // + 该 CLI 的缺省值 + 当前 CLI 是否支持 transcript（dashboard 据此禁用开关并说明）。
@@ -11884,7 +11882,8 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     messageQuotaDefaultLimit: grantPrefs.messageQuotaDefaultLimit,
     grantDefaultDurationMs: grantPrefs.grantDefaultDurationMs,
     p2pMode,
-    envelopeInjection,
+    // Read-only compatibility field for stale Dashboard chunks: hook injection is now default-on.
+    envelopeInjection: 'auto',
     triggerUserAuth,
     larkToolBinding: getBot(cachedLarkAppId).config.larkToolBinding !== false,
     larkUserOwnerFallback: getBot(cachedLarkAppId).config.larkUserOwnerFallback !== false,
@@ -13215,6 +13214,15 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
     } else if (bot.config.backendType && isRemoteBackendType(bot.config.backendType)) {
       bot.config.backendType = undefined;
     }
+    if (selected.cliId === 'claude-code') {
+      try {
+        (await import('./worker-pool.js')).ensureCliEnv?.(
+          'claude-code',
+          bot.config.cliPathOverride,
+          { configDir: bot.config.cliConfigDir },
+        );
+      } catch { /* best-effort */ }
+    }
 
     // 热切后立刻清掉本 bot 名下失配的存量会话——否则它们冻结的旧 CLI 会被下一条
     // 消息 lazy resume 复活，要等下次 daemon 重启才被 restore 守卫清理。
@@ -13444,15 +13452,13 @@ botConfigPutRoute<{ p2pMode?: unknown }>('/api/bot-p2p-mode', 'p2pMode', {
   respond: value => ({ ok: true, p2pMode: value ?? 'chat' }),
 });
 
-// Per-bot 每轮上下文注入方式 envelopeInjection（#794）。Body `{ envelopeInjection: 'auto'|'off'|'' }`:
-//   • 'auto' → 支持的 CLI（claude-code）把 reminder/whiteboard 经 UserPromptSubmit
-//     hook 注入为 system-reminder，user turn 只留消息本身；不支持的自动回退内联
-//   • 'off'/其它 → 内联 envelope（历史行为，默认）
-// 走 applyConfigField（与 /botconfig 同一写盘 + 热更新路径），下一个 follow-up turn 生效。
-botConfigPutRoute<{ envelopeInjection?: unknown }>('/api/bot-envelope-injection', 'envelopeInjection', {
-  normalize: body => fieldOk(body.envelopeInjection === 'auto' ? 'auto' : null),
-  respond: value => ({ ok: true, envelopeInjection: value ?? 'off' }),
-});
+// 只读兼容路由：Claude Code hook 注入已默认开启并移除实验开关，保留此路由避免
+// 升级前已打开的 Dashboard 缓存分包或旧 API 客户端收到 404/500；不改写 bots.json。
+ipcRoute('PUT', '/api/bot-envelope-injection', requireBoundBot(async (req, res) => {
+  const body = await readJsonBodyOrBadJson(req, res);
+  if (body === BAD_JSON) return;
+  jsonRes(res, 200, { ok: true, envelopeInjection: 'auto' });
+}));
 
 botConfigPutRoute('/api/bot-topic-unavailable-policy', 'topicUnavailablePolicy', {
   normalize: body => {

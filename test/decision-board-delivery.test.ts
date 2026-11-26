@@ -42,6 +42,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   }),
   isRelayableRealSession: (ds: any) => !!ds?.worker || !!ds?.session?.cliId || !!ds?.session?.lastCliInput,
   isDisposableCommandScratch: () => false,
+  getActiveSessionsRegistry: vi.fn(() => undefined),
   closeSession: vi.fn(async () => ({ ok: true })),
 }));
 
