@@ -16,7 +16,7 @@ import { botmuxHome } from './paths.js';
 import {
   pluginServiceName, pluginSupervisorDir, readPluginSupervisorState,
   pluginSupervisorDesiredPath, readPluginSupervisorDesired, readPluginSupervisorResult,
-  type PluginServiceSpec,
+  type PluginServiceSpec, type PluginSupervisorResult,
 } from './supervisor-store.js';
 
 export interface PluginProcessInfo {
@@ -108,6 +108,23 @@ function supervisorAlive(): boolean {
     && readDurableProcessIdentity(result.pid) === result.processStart;
 }
 
+function assertSupervisorIdentity(result: PluginSupervisorResult) {
+  if (!result.processStart) throw new Error(`plugin_supervisor_identity_unknown:${result.pid}`);
+  const identity = readDurableProcessIdentity(result.pid);
+  if (!identity) throw new Error(`plugin_supervisor_identity_unknown:${result.pid}`);
+  if (identity !== result.processStart) throw new Error(`plugin_supervisor_identity_mismatch:${result.pid}`);
+  return result.processStart;
+}
+
+function assertSupervisorOwner(result: PluginSupervisorResult) {
+  const identity = assertSupervisorIdentity(result);
+  const state = readPluginSupervisorState();
+  if (state?.supervisorPid !== result.pid) throw new Error(`plugin_supervisor_identity_mismatch:${result.pid}`);
+  if (!state.supervisorProcessStart) throw new Error(`plugin_supervisor_identity_unknown:${result.pid}`);
+  if (state.supervisorProcessStart !== identity) throw new Error(`plugin_supervisor_identity_mismatch:${result.pid}`);
+  return identity;
+}
+
 /** Caller holds the service-manager lock. Explicit --all also covers desired
  * members absent from the installed registry, including failed-start retries.
  * Reuse the host's signal/finally path; a delivered signal is not completion. */
@@ -116,12 +133,6 @@ export async function shutdownPluginSupervisor(): Promise<void> {
   readPluginSupervisorDesired(); // validate uncertainty even without a host result
   const initial = readPluginSupervisorResult();
   const ownerLock = join(pluginSupervisorDir(), 'owner.lock');
-  const assertIdentity = (result: NonNullable<typeof initial>) => {
-    if (!result.processStart) throw new Error(`plugin_supervisor_identity_unknown:${result.pid}`);
-    const identity = readDurableProcessIdentity(result.pid);
-    if (!identity) throw new Error(`plugin_supervisor_identity_unknown:${result.pid}`);
-    if (identity !== result.processStart) throw new Error(`plugin_supervisor_identity_mismatch:${result.pid}`);
-  };
   const assertComplete = () => {
     const state = readPluginSupervisorState();
     if (Object.values(readPluginSupervisorDesired().services).some(item => item.running)
@@ -139,9 +150,9 @@ export async function shutdownPluginSupervisor(): Promise<void> {
     assertComplete();
     return;
   }
-  assertIdentity(initial);
+  assertSupervisorOwner(initial);
   for (const [id, item] of Object.entries(readPluginSupervisorDesired().services)) {
-    if (item.running) await changePluginService(id, 'stop');
+    if (item.running) await changePluginService(id, 'stop', undefined, { existingSupervisorOnly: true });
   }
   const desired = readPluginSupervisorDesired();
   const result = readPluginSupervisorResult();
@@ -154,10 +165,10 @@ export async function shutdownPluginSupervisor(): Promise<void> {
     assertComplete();
     return;
   }
-  assertIdentity(result);
-  if (!signalAttestedFleetProcess({ pid: result.pid, processStart: result.processStart! }, 'SIGTERM')) {
+  const processStart = assertSupervisorOwner(result);
+  if (!signalAttestedFleetProcess({ pid: result.pid, processStart }, 'SIGTERM')) {
     if (pidNotProvablyGone(result.pid)) {
-      assertIdentity(result);
+      assertSupervisorIdentity(result);
       throw new Error(`plugin_supervisor_signal_failed:${result.pid}`);
     }
     assertComplete();
@@ -170,7 +181,7 @@ export async function shutdownPluginSupervisor(): Promise<void> {
       assertComplete();
       return;
     }
-    assertIdentity(result);
+    assertSupervisorIdentity(result);
     await new Promise(resolve => setTimeout(resolve, 50));
   }
   throw new Error(`plugin_supervisor_shutdown_timeout:${result.pid}`);
@@ -206,8 +217,14 @@ export async function changePluginService(
   pluginId: string,
   operation: 'start' | 'stop' | 'remove',
   spec?: PluginServiceSpec,
+  options: { existingSupervisorOnly?: boolean } = {},
 ): Promise<void> {
   assertNoLegacyPluginPm2();
+  const current = options.existingSupervisorOnly ? readPluginSupervisorResult() : undefined;
+  if (options.existingSupervisorOnly) {
+    if (!current || !pidNotProvablyGone(current.pid)) throw new Error('plugin_supervisor_shutdown_incomplete');
+    assertSupervisorOwner(current);
+  }
   const desired = readPluginSupervisorDesired();
   const killTimeoutMs = spec?.external.killTimeoutMs ?? desired.services[pluginId]?.spec.external.killTimeoutMs ?? 8_000;
   const name = pluginServiceName(pluginId);
@@ -225,12 +242,15 @@ export async function changePluginService(
   desired.target = pluginId;
   mkdirSync(pluginSupervisorDir(), { recursive: true, mode: 0o700 });
   atomicWriteFileSync(pluginSupervisorDesiredPath(), JSON.stringify(desired), { mode: 0o600, durable: true, followTargetSymlink: false });
-  if (!supervisorAlive()) launchSupervisor();
+  if (!current && !supervisorAlive()) launchSupervisor();
   const timeoutMs = Math.max(30_000, killTimeoutMs + 10_000);
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const result = readPluginSupervisorResult();
     if (result?.revision === desired.revision) {
+      if (current && (result.pid !== current.pid || result.processStart !== current.processStart)) {
+        throw new Error('plugin_supervisor_identity_mismatch');
+      }
       if (result.error) throw new Error(result.error);
       return;
     }

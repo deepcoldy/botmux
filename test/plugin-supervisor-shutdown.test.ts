@@ -68,9 +68,30 @@ describe('explicit plugin host shutdown failures', () => {
     writeFileSync(join(pluginSupervisorDir(), 'owner.lock'), 'unknown');
     await expect(stopAll()).rejects.toThrow('plugin_supervisor_identity_unknown');
   });
-  it('reports a host exit timeout instead of accepting signal delivery as completion', async () => {
+  it('rejects conflicting durable host records before attempting a signal', async () => {
+    result({ processStart: 'known-birth' });
+    state({ supervisorPid: 2_147_483_647, procs: [] });
+    runtime.signal.mockReturnValue(false);
+    await expect(stopAll()).rejects.toThrow('plugin_supervisor_identity_mismatch');
+    expect(runtime.signal).not.toHaveBeenCalled();
+  });
+  it('rejects a reused host PID when its state birth identity disagrees', async () => {
+    result({ processStart: 'known-birth' });
+    state({ supervisorPid: process.pid, supervisorProcessStart: 'old-birth', procs: [] });
+    runtime.signal.mockReturnValue(false);
+    await expect(stopAll()).rejects.toThrow('plugin_supervisor_identity_mismatch');
+    expect(runtime.signal).not.toHaveBeenCalled();
+  });
+  it('rejects a host state without a recorded birth identity', async () => {
     result({ processStart: 'known-birth' });
     state({ supervisorPid: process.pid, procs: [] });
+    runtime.signal.mockReturnValue(false);
+    await expect(stopAll()).rejects.toThrow('plugin_supervisor_identity_unknown');
+    expect(runtime.signal).not.toHaveBeenCalled();
+  });
+  it('reports a host exit timeout instead of accepting signal delivery as completion', async () => {
+    result({ processStart: 'known-birth' });
+    state({ supervisorPid: process.pid, supervisorProcessStart: 'known-birth', procs: [] });
     vi.useFakeTimers();
     const assertion = expect(stopAll()).rejects.toThrow('plugin_supervisor_shutdown_timeout');
     await vi.waitFor(() => expect(runtime.signal).toHaveBeenCalled());

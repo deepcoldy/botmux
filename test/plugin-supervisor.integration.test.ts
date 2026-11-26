@@ -148,7 +148,9 @@ describe('plugin services on the built-in supervisor', () => {
     expect(proc('idle')!.pid).toBeUndefined();
     await stopCli('--all');
     expect(pidAlive(owner)).toBe(false);
-    await stopCli('--all'); // repeated stop must not create a new host
+    const closedResult = readFileSync(pluginSupervisorResultPath(), 'utf8');
+    await stopCli('--all');
+    expect(readFileSync(pluginSupervisorResultPath(), 'utf8')).toBe(closedResult);
     expect(existsSync(join(pluginSupervisorDir(), 'owner.lock'))).toBe(false);
   }, 60_000);
 

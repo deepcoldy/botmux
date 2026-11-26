@@ -517,7 +517,9 @@ export async function stopPluginServices(
           reports.push(reportFromState(record, 'not-running', state));
           continue;
         }
-        await changePluginService(record.id, 'stop');
+        if (!options.shutdownSupervisor || !isStoppedService(before)) {
+          await changePluginService(record.id, 'stop', undefined, { existingSupervisorOnly: options.shutdownSupervisor });
+        }
         const app = findService(name);
         const state = writeServiceState(record, definition, app);
         reports.push(reportFromState(record, isStoppedService(before) ? 'not-running' : 'stopped', state));
