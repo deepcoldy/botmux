@@ -14,6 +14,10 @@ import {
 } from '../src/desktop/main/zero-bot-lifecycle.js';
 import { readFleetState } from '../src/core/fleet-state-store.js';
 import { pidAlive } from '../src/core/fleet-supervisor.js';
+import {
+  createDesktopHostLeaseRegistry,
+  parseStopIfEmptyCliOutcome,
+} from '../src/core/desktop-host-leases.js';
 
 const REPO_ROOT = resolve(import.meta.dirname, '..');
 const CLI_DIST = join(REPO_ROOT, 'dist', 'cli.js');
@@ -326,5 +330,60 @@ describe('0-bot CLI + Desktop end-to-end onboarding lifecycle', () => {
     const dashLog = readFileSync(join(botmuxHome, 'logs', 'dashboard-out.log'), 'utf-8');
     expect(dashLog).toContain(`listening on 127.0.0.1:${port}`);
     expect(dashLog).not.toContain('listening on 0.0.0.0:');
+  }, 45_000);
+
+  it('fences stop --if-empty against another attested Desktop host lease and enforces 0->1 start-bot dependency preflight with clean JSON output', async () => {
+    const home = makeTempHome();
+    const port = await reserveFreePort();
+    const botmuxHome = join(home, '.botmux');
+    const env = cliEnv(home, port);
+
+    expect(runCli(['start', '--allow-empty'], env).code).toBe(0);
+    const sup = readLiveSupervisorSnapshot(botmuxHome)!;
+    expect(sup).not.toBeNull();
+
+    // Standalone `--host-pid` without `--if-empty` must fail closed (exit 2).
+    const bareHostPidStop = runCli(['stop', '--host-pid', String(process.pid)], env);
+    expect(bareHostPidStop.code).toBe(2);
+    expect(pidAlive(sup.supervisorPid)).toBe(true);
+
+    // Register an attested Desktop host lease for the current process, then run
+    // `stop --if-empty --host-pid <otherPid>`: CLI must see our live lease under
+    // the fleet lock, emit skipped:other-host, and leave the supervisor alive.
+    const lease = createDesktopHostLeaseRegistry(botmuxHome, { selfPid: process.pid });
+    expect(await lease.ensureRegistered()).toBe(true);
+    try {
+      const fencedStop = runCli(
+        ['stop', '--if-empty', '--supervisor-pid', String(sup.supervisorPid), '--host-pid', String(process.pid + 12345)],
+        env,
+      );
+      expect(fencedStop.code).toBe(0);
+      expect(parseStopIfEmptyCliOutcome(fencedStop.stdout)).toBe('skipped:other-host');
+      expect(pidAlive(sup.supervisorPid)).toBe(true);
+    } finally {
+      lease.unregister();
+    }
+
+    // 0->1 start-bot dependency preflight: an hc bot with a missing hc binary must
+    // return clean structured JSON `{ ok: false, reason: 'dependency_missing' }`
+    // with zero stdout pollution and must not spawn the daemon.
+    writeFileSync(join(botmuxHome, 'bots.json'), JSON.stringify([
+      {
+        larkAppId: 'local_hc_missing',
+        apiOnly: true,
+        localIdentity: true,
+        cliId: 'claude-code',
+        backendType: 'hc',
+        defaultWorkingDir: home,
+      },
+    ], null, 2));
+    const missingDepStart = runCli(
+      ['start-bot', 'local_hc_missing', '--json'],
+      cliEnv(home, port, { BOTMUX_HC_BIN: join(home, 'nonexistent-hc') }),
+    );
+    expect(missingDepStart.code).toBe(1);
+    const parsedMissing = JSON.parse(missingDepStart.stdout.trim());
+    expect(parsedMissing).toMatchObject({ ok: false, reason: 'dependency_missing' });
+    expect(parsedMissing.message).toContain('herdr-core');
   }, 45_000);
 });

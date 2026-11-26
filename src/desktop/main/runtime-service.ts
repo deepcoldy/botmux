@@ -252,8 +252,10 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
   }
 
   function zeroBotLoopbackExtraEnv(): NodeJS.ProcessEnv {
+    // 0-bot onboarding has no persisted operator host preference yet; always pin
+    // strictly to loopback even if the parent shell inherited 0.0.0.0.
     return {
-      BOTMUX_DASHBOARD_HOST: deps.env.BOTMUX_DASHBOARD_HOST?.trim() || '127.0.0.1',
+      BOTMUX_DASHBOARD_HOST: '127.0.0.1',
     };
   }
 
@@ -547,12 +549,15 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
     async stop(options?: { timeoutMs?: number }): Promise<RunResult> {
       return runCliAction(['stop'], { timeoutMs: options?.timeoutMs });
     },
-    async stopIfEmpty(options?: { supervisorPid?: number; timeoutMs?: number }): Promise<RunResult> {
+    async stopIfEmpty(options?: { supervisorPid?: number; hostPid?: number; timeoutMs?: number }): Promise<RunResult> {
       const runtime = deps.bundledRuntime ?? activeRuntime();
       if (!runtime) return rejectedCliRequired();
       const args = ['stop', '--if-empty'];
       if (typeof options?.supervisorPid === 'number' && Number.isSafeInteger(options.supervisorPid) && options.supervisorPid > 0) {
         args.push('--supervisor-pid', String(options.supervisorPid));
+      }
+      if (typeof options?.hostPid === 'number' && Number.isSafeInteger(options.hostPid) && options.hostPid > 0) {
+        args.push('--host-pid', String(options.hostPid));
       }
       return invokeRun(command(runtime, args), { timeoutMs: options?.timeoutMs });
     },

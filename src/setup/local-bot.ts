@@ -135,21 +135,27 @@ export async function findInvalidFleetCredentials(
       invalid.push({ appId: '(无效条目)', reason: 'bots.json 条目必须是对象' });
       continue;
     }
-    const appId = typeof bot.larkAppId === 'string' ? bot.larkAppId.trim() : '';
-    const appSecret = typeof bot.larkAppSecret === 'string' ? bot.larkAppSecret.trim() : '';
-    if (appId && opts.blockedBotIds?.has(appId)) continue;
+    const rawAppId = typeof bot.larkAppId === 'string' ? bot.larkAppId : '';
+    const rawAppSecret = typeof bot.larkAppSecret === 'string' ? bot.larkAppSecret : '';
+    if (rawAppId && opts.blockedBotIds?.has(rawAppId)) continue;
     if (botSkipsFeishuCredentialCheck(bot)) continue;
-    if (!appId || !appSecret) {
-      invalid.push({ appId: appId || '(空 appId)', reason: 'larkAppId/larkAppSecret 缺失' });
+    if (!rawAppId.trim() || !rawAppSecret.trim()) {
+      invalid.push({ appId: rawAppId.trim() || '(空 appId)', reason: 'larkAppId/larkAppSecret 缺失' });
       continue;
     }
-    const verdict = await opts.validate(appId, appSecret, opts.brandOf(bot));
+    if (rawAppId !== rawAppId.trim() || rawAppSecret !== rawAppSecret.trim()) {
+      // bot-registry passes raw strings to the daemon; reject leading/trailing
+      // whitespace instead of validating trimmed values that differ at runtime.
+      invalid.push({ appId: rawAppId.trim(), reason: 'larkAppId/larkAppSecret 包含首尾空白字符' });
+      continue;
+    }
+    const verdict = await opts.validate(rawAppId, rawAppSecret, opts.brandOf(bot));
     if (verdict.ok) continue;
     if (verdict.error === 'invalid_credentials') {
-      invalid.push({ appId, reason: verdict.message });
+      invalid.push({ appId: rawAppId, reason: verdict.message });
       continue;
     }
-    opts.warn?.(`⚠️  [${appId}] 启动前凭证验证未成功（${verdict.error}）: ${verdict.message}`);
+    opts.warn?.(`⚠️  [${rawAppId}] 启动前凭证验证未成功（${verdict.error}）: ${verdict.message}`);
     opts.warn?.('   daemon 仍会启动；启动后 dispatcher 会自行重试。');
   }
   return invalid;

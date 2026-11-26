@@ -608,7 +608,10 @@ describe('runtime service', () => {
       paths,
       appVersion: '1.0.0',
       execPath: '/Electron',
-      env: { BOTMUX_SESSION_ID: 'inherited-session-id' },
+      env: {
+        BOTMUX_SESSION_ID: 'inherited-session-id',
+        BOTMUX_DASHBOARD_HOST: '0.0.0.0',
+      },
       fs: { existsSync: () => false, readFileSync: () => '' },
       bundledRuntime: bundledRuntime(),
       run,

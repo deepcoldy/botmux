@@ -2,6 +2,7 @@ import { existsSync, readFileSync, rmSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { readBotsJsonOrEmpty, writeBotsJsonAtomic, mutateBotsJsonAtomic } from '../setup/bots-store.js';
 import { validateBotConfigEntries } from '../setup/bots-config-validation.js';
+import { parseBotConfigsFromText } from '../bot-registry.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { logger } from '../utils/logger.js';
 import {
@@ -87,7 +88,72 @@ export class InvalidBotsJsonError extends Error {
   }
 }
 
-/** Fail closed if `bots.json` exists on disk and is malformed, non-array, unreadable, or has invalid entries. */
+class OnboardingCancelledError extends Error {
+  readonly code = 'ONBOARDING_CANCELLED' as const;
+  constructor() {
+    super('已取消本次添加');
+    this.name = 'OnboardingCancelledError';
+  }
+}
+
+export type CancelBotOnboardingResult =
+  | { ok: true; job: BotOnboardingSnapshot }
+  | {
+      ok: false;
+      error: 'unknown_onboarding_job' | 'already_completed' | 'not_cancellable';
+      job?: BotOnboardingSnapshot;
+      message?: string;
+    };
+
+/** Validate a candidate bots.json array against BOTH the pure validator AND the real daemon loader (`parseBotConfigsFromText`). */
+function assertBotsArrayValidForDaemon(entries: unknown): void {
+  const validation = validateBotConfigEntries(entries);
+  if (!validation.ok) {
+    throw new InvalidBotsJsonError(validation.message);
+  }
+  try {
+    parseBotConfigsFromText(JSON.stringify(entries));
+  } catch (err) {
+    throw new InvalidBotsJsonError(err instanceof Error ? err.message : String(err));
+  }
+}
+
+/** Strict exact-record equality for uncertain-commit reconciliation in manual onboarding. */
+function sameManualBotRecord(candidate: unknown, expected: Record<string, any>): boolean {
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return false;
+  const record = candidate as Record<string, any>;
+  if (
+    record.larkAppId !== expected.larkAppId
+    || record.larkAppSecret !== expected.larkAppSecret
+    || record.localIdentity !== expected.localIdentity
+    || record.brand !== expected.brand
+    || record.cliId !== expected.cliId
+    || record.wrapperCli !== expected.wrapperCli
+    || record.cliLaunchMode !== expected.cliLaunchMode
+    || record.defaultWorkingDir !== expected.defaultWorkingDir
+    || record.workingDir !== expected.workingDir
+    || record.model !== expected.model
+    || record.displayName !== expected.displayName
+    || record.name !== expected.name
+  ) {
+    return false;
+  }
+  const candidateOwners = Array.isArray(record.allowedUsers) ? record.allowedUsers : undefined;
+  const expectedOwners = Array.isArray(expected.allowedUsers) ? expected.allowedUsers : undefined;
+  if (!candidateOwners || !expectedOwners) return candidateOwners === expectedOwners;
+  if (
+    candidateOwners.length !== expectedOwners.length
+    || !candidateOwners.every((entry, idx) => entry === expectedOwners[idx])
+  ) {
+    return false;
+  }
+  const expectedKeys = Object.keys(expected).filter(key => expected[key] !== undefined);
+  const candidateKeys = Object.keys(record).filter(key => record[key] !== undefined);
+  return candidateKeys.length === expectedKeys.length
+    && candidateKeys.every(key => expected[key] !== undefined);
+}
+
+/** Fail closed if `bots.json` exists on disk and is malformed, non-array, unreadable, or rejected by the daemon loader. */
 export function assertBotsJsonValidOrAbsent(botsJsonPath: string): void {
   if (!existsSync(botsJsonPath)) return;
   let parsed: unknown;
@@ -96,10 +162,7 @@ export function assertBotsJsonValidOrAbsent(botsJsonPath: string): void {
   } catch (err) {
     throw new InvalidBotsJsonError(err instanceof Error ? err.message : String(err));
   }
-  const validation = validateBotConfigEntries(parsed);
-  if (!validation.ok) {
-    throw new InvalidBotsJsonError(validation.message);
-  }
+  assertBotsArrayValidForDaemon(parsed);
 }
 
 export function isValidManualAppSecret(value: unknown): value is string {
@@ -523,6 +586,9 @@ export function renderQrSvgDataUrl(value: string): string {
 
 export class BotOnboardingManager {
   private readonly jobs = new Map<string, BotOnboardingSnapshot>();
+  private readonly cancelledJobs = new Set<string>();
+  private readonly committedJobs = new Set<string>();
+  private readonly jobAbortControllers = new Map<string, AbortController>();
   // needs_owner 状态下「待落盘」的 bot 配置（含 secret）——故意不写进 bots.json,
   // 避免在 owner 确认前就有一个空 allowlist 的可启动 bot 留在磁盘上（重启即 fail-open）。
   // 也不放进 jobs 快照（那个会序列化给前端、会泄漏 secret）。owner 校验通过后才 append。
@@ -1425,6 +1491,53 @@ export class BotOnboardingManager {
     this.patch(id, { activationPending: true, activationDeactivating: false });
   }
 
+  private isCancelled(id: string): boolean {
+    return this.cancelledJobs.has(id);
+  }
+
+  /**
+   * Cooperatively cancel an in-flight onboarding job so switching from QR scan to
+   * manual entry (or closing the modal) can never leave an abandoned background
+   * job creating an app, persisting `bots.json`, or starting an unexpected bot.
+   */
+  cancel(id: string): CancelBotOnboardingResult {
+    const current = this.jobs.get(id);
+    if (!current) {
+      return { ok: false, error: 'unknown_onboarding_job', message: '找不到对应的添加任务。' };
+    }
+    if (current.recoveryOfJobId) {
+      return { ok: false, error: 'not_cancellable', job: { ...current }, message: '权限恢复任务不支持取消。' };
+    }
+    if (current.status === 'failed') {
+      return { ok: true, job: { ...current } };
+    }
+    if (current.status === 'completed' || this.committedJobs.has(id)) {
+      return { ok: false, error: 'already_completed', job: { ...current }, message: '该机器人已写入配置，无法取消。' };
+    }
+
+    this.cancelledJobs.add(id);
+    const hadPending = this.pendingBots.delete(id);
+    const next: BotOnboardingSnapshot = {
+      ...current,
+      status: 'failed',
+      error: 'cancelled',
+      message: '已取消本次添加',
+      qrUrl: undefined,
+      qrDataUrl: undefined,
+      platformQrDataUrl: undefined,
+      updatedAt: this.now(),
+    };
+    this.jobs.set(id, next);
+    if (hadPending) {
+      this.savePendingJobs();
+    }
+    const controller = this.jobAbortControllers.get(id);
+    if (controller && !controller.signal.aborted) {
+      controller.abort(new OnboardingCancelledError());
+    }
+    return { ok: true, job: { ...next } };
+  }
+
   start(input: BotOnboardingInput = {}): BotOnboardingJob {
     const id = `bot_${Math.random().toString(36).slice(2)}_${this.now().toString(36)}`;
     const createdAt = this.now();
@@ -1434,20 +1547,27 @@ export class BotOnboardingManager {
     const sanitizeErrorMessage = (raw: string): string => (
       secretToRedact ? raw.split(secretToRedact).join('[REDACTED]') : raw
     );
+    const abortController = new AbortController();
+    this.jobAbortControllers.set(id, abortController);
     this.jobs.set(id, { id, status: 'starting', createdAt, updatedAt: createdAt });
-    const done = this.run(id, input).catch(err => {
-      const error = err instanceof InvalidBotsJsonError
-        ? 'invalid_bots_json'
-        : err instanceof DuplicateAppIdError
-          ? 'duplicate_app'
-          : 'unexpected_error';
-      const rawMessage = err instanceof Error ? err.message : String(err);
-      this.patch(id, {
-        status: 'failed',
-        error,
-        message: sanitizeErrorMessage(rawMessage),
+    const done = this.run(id, input, abortController.signal)
+      .catch(err => {
+        if (err instanceof OnboardingCancelledError || this.isCancelled(id)) return;
+        const error = err instanceof InvalidBotsJsonError
+          ? 'invalid_bots_json'
+          : err instanceof DuplicateAppIdError
+            ? 'duplicate_app'
+            : 'unexpected_error';
+        const rawMessage = err instanceof Error ? err.message : String(err);
+        this.patch(id, {
+          status: 'failed',
+          error,
+          message: sanitizeErrorMessage(rawMessage),
+        });
+      })
+      .finally(() => {
+        this.jobAbortControllers.delete(id);
       });
-    });
     return { id, done };
   }
 
@@ -1741,6 +1861,7 @@ export class BotOnboardingManager {
   }
 
   private patch(id: string, patch: Partial<BotOnboardingSnapshot>): void {
+    if (this.cancelledJobs.has(id)) return;
     const current = this.jobs.get(id);
     if (!current) return;
     const next = { ...current, ...patch, updatedAt: this.now() };
@@ -1756,6 +1877,7 @@ export class BotOnboardingManager {
   }
 
   private confirmPlatformQrScan(id: string, confirmedAt: number): void {
+    if (this.cancelledJobs.has(id)) return;
     const current = this.jobs.get(id);
     if (!current || current.platformQrScanConfirmedAt !== undefined) return;
     if (!Number.isInteger(confirmedAt) || confirmedAt <= 0) {
@@ -1829,7 +1951,9 @@ export class BotOnboardingManager {
       });
       return;
     }
-    const persisted = await this.persistNewLocalBot(record);
+    if (this.isCancelled(id)) return;
+    const persisted = await this.persistNewLocalBot(id, record);
+    if (this.isCancelled(id)) return;
     await this.runLiveStart(id, String(persisted.bot.larkAppId));
     this.patch(id, {
       status: 'completed',
@@ -1949,7 +2073,9 @@ export class BotOnboardingManager {
       ...(appName ? { appName } : {}),
     });
 
+    if (this.isCancelled(id)) return;
     const cred = await this.validateCredentials(appId, appSecret, brand);
+    if (this.isCancelled(id)) return;
     if (!cred.ok) {
       const reason = 'message' in cred && typeof cred.message === 'string' && cred.message.trim()
         ? cred.message.split(appSecret).join('[REDACTED]')
@@ -1963,6 +2089,7 @@ export class BotOnboardingManager {
     }
 
     const unusable = await this.detectUnusableOwners(appId, appSecret, brand, entries);
+    if (this.isCancelled(id)) return;
     if (unusable.length > 0) {
       this.patch(id, {
         status: 'failed',
@@ -1988,7 +2115,8 @@ export class BotOnboardingManager {
       allowedUsers: entries,
     };
 
-    const addedBotIndex = await this.persistNewManualBot(bot);
+    const addedBotIndex = await this.persistNewManualBot(id, bot);
+    if (this.isCancelled(id)) return;
     await this.runLiveStart(id, appId);
     this.patch(id, {
       status: 'completed',
@@ -2002,7 +2130,8 @@ export class BotOnboardingManager {
     });
   }
 
-  private async run(id: string, input: BotOnboardingInput = {}): Promise<void> {
+  private async run(id: string, input: BotOnboardingInput = {}, signal?: AbortSignal): Promise<void> {
+    if (this.isCancelled(id)) return;
     if (input.registrationMode === 'local') {
       await this.runLocal(id, input);
       return;
@@ -2049,6 +2178,8 @@ export class BotOnboardingManager {
       ...(input.registrationMode === 'compat' ? {} : { appName }),
     });
 
+    if (this.isCancelled(id)) return;
+
     let result: RegisterAppResult;
     // 网页创建使用已验证的会话邮箱作为 owner 候选。
     let sessionEmail: string | undefined;
@@ -2058,7 +2189,7 @@ export class BotOnboardingManager {
     const autoAvoidApproval = input.autoAvoidApproval !== false;
     const registration = registrationMode === 'sdk' ? createRegistrationOptions(appName) : undefined;
     if (registrationMode !== 'web') {
-      result = await this.registerWithSdk(id, registration);
+      result = await this.registerWithSdk(id, registration, signal);
     } else {
       const created = await this.createApp({
         name: appName,
@@ -2067,7 +2198,9 @@ export class BotOnboardingManager {
           : { forceQrLogin: true }),
         disableBytedcliFallback: true,
         autoAvoidApproval,
+        ...(signal ? { signal } : {}),
         onQrCode: info => {
+          if (this.isCancelled(id)) return;
           this.patch(id, {
             status: 'waiting_for_scan',
             qrUrl: undefined,
@@ -2076,9 +2209,11 @@ export class BotOnboardingManager {
           });
         },
         onStatus: message => {
+          if (this.isCancelled(id)) return;
           this.patch(id, { message });
         },
       });
+      if (this.isCancelled(id)) return;
       if (created.ok) {
         result = created;
         sessionEmail = created.sessionIdentity?.email?.trim() || undefined;
@@ -2122,6 +2257,8 @@ export class BotOnboardingManager {
       }
     }
 
+    if (this.isCancelled(id)) return;
+
     if (!result.ok) {
       this.patch(id, { status: 'failed', error: result.error, message: result.message, qrUrl: undefined, qrDataUrl: undefined });
       return;
@@ -2130,6 +2267,7 @@ export class BotOnboardingManager {
     // 全程从 BotConfig.brand 派生域名，feishu / lark 都能直接跑。
     this.patch(id, { status: 'verifying', appId: result.appId, brand: result.brand, message: undefined, qrUrl: undefined, qrDataUrl: undefined });
     const validation = await this.validateCredentials(result.appId, result.appSecret, result.brand);
+    if (this.isCancelled(id)) return;
     if (!validation.ok) {
       this.patch(id, {
         status: 'failed',
@@ -2200,6 +2338,7 @@ export class BotOnboardingManager {
     // 只有「能确认 owner」时才落盘——见下方两条路径。
 
     // 跑 setup 同款开放平台自动配置 (导入权限 / 配 redirect / 建并发版)。
+    if (this.isCancelled(id)) return;
     const rawAuto = await this.runPermissionAutomation(id, result.appId, result.brand, {
       cliId,
       workingDir,
@@ -2208,7 +2347,9 @@ export class BotOnboardingManager {
       requireVerifiedEvents: input.requireCriticalScopesBeforeActivation === true,
       excludeScopes: deferredScopesToBuckets(initialApprovalDeferredScopes),
       autoAvoidApproval: effectiveAutoAvoidApproval,
+      signal,
     });
+    if (this.isCancelled(id)) return;
     const mergedDeferredScopes = mergeDeferredApprovalScopes(
       initialApprovalDeferredScopes,
       rawAuto.approvalDeferredScopes,
@@ -2265,10 +2406,12 @@ export class BotOnboardingManager {
     // only when the scanner path verifies it belongs to THIS app (below).
     let ownerOpenId: string | undefined;
     if (result.userOpenId) {
+      if (this.isCancelled(id)) return;
       // registerApp 返回的 open_id 来自扫码链路; 用新 app 自身凭证验证, 失败不
       // fallback 写入该 (常为跨 app 的) ou_——避免把其他 app 视角的 open_id 固化
       // 成 owner, 导致 /grant 和授权卡片一直判 non-owner。
       ownerEntry = await resolveScannerAllowedUser(result.appId, result.appSecret, result.userOpenId, result.brand);
+      if (this.isCancelled(id)) return;
       // Verified against this app (ownerEntry set) → the native open_id is a
       // trustworthy owner anchor; store it raw so a boot-time contact-API blip
       // can't strip our only DM recipient. (Skip on the email path below: no
@@ -2276,15 +2419,19 @@ export class BotOnboardingManager {
       if (ownerEntry) ownerOpenId = result.userOpenId;
     }
     if (!ownerEntry && sessionEmail) {
+      if (this.isCancelled(id)) return;
       // Web 主路径：创建应用的登录账号邮箱就是 owner（表单第一步已展示并确认），
       // 不再让用户手填一遍。能解析成 union_id 就落 on_；无法证伪（scope 未生效 /
       // 网络错误）直接落邮箱，运行时 resolveAllowedUsers 会再解析成本 app open_id；
       // 只有确凿不在本企业时才回落 needs_owner。
       ownerEntry = await resolveSessionEmailAllowedUser(result.appId, result.appSecret, sessionEmail, result.brand);
+      if (this.isCancelled(id)) return;
     }
 
+    if (this.isCancelled(id)) return;
     if (ownerEntry) {
-      const addedBotIndex = await this.persistBot({ ...bot, allowedUsers: [ownerEntry], ...(ownerOpenId ? { ownerOpenId } : {}) });
+      const addedBotIndex = await this.persistBot(id, { ...bot, allowedUsers: [ownerEntry], ...(ownerOpenId ? { ownerOpenId } : {}) });
+      if (this.isCancelled(id)) return;
       if (!activationPending) {
         await this.runLiveStart(id, result.appId);
       }
@@ -2298,10 +2445,12 @@ export class BotOnboardingManager {
     }
   }
 
-  private async registerWithSdk(id: string, options?: RegisterAppOptions): Promise<RegisterAppResult> {
+  private async registerWithSdk(id: string, options?: RegisterAppOptions, signal?: AbortSignal): Promise<RegisterAppResult> {
     return this.registerApp({
       ...options,
+      ...(signal ? { signal } : {}),
       onQRCodeReady: info => {
+        if (this.isCancelled(id)) return;
         this.patch(id, {
           status: 'waiting_for_scan',
           qrUrl: info.url,
@@ -2310,6 +2459,7 @@ export class BotOnboardingManager {
         });
       },
       onStatusChange: info => {
+        if (this.isCancelled(id)) return;
         if (info.status === 'slow_down') this.patch(id, { message: 'slow_down' });
         if (info.status === 'domain_switched') this.patch(id, { message: 'domain_switched' });
       },
@@ -2317,9 +2467,10 @@ export class BotOnboardingManager {
   }
 
   /**
-   * Locked read-modify-write that re-validates the on-disk `bots.json` entries
-   * INSIDE the file lock, closing TOCTOU gaps where `bots.json` was corrupted
-   * while remote validation or QR login was in flight.
+   * Locked read-modify-write that re-validates BOTH `previous` AND `next`
+   * against the full daemon loader (`parseBotConfigsFromText` + pure checks)
+   * INSIDE the file lock, closing TOCTOU gaps and preventing corrupt/drifted
+   * generations from ever being written to `bots.json`.
    */
   private mutateBotsJsonValidated<T>(
     mutation: (previous: any[]) => { bots: any[]; result: T },
@@ -2328,11 +2479,10 @@ export class BotOnboardingManager {
     try {
       return mutateBotsJsonAtomic(this.opts.botsJsonPath, previous => {
         callbackEntered = true;
-        const validation = validateBotConfigEntries(previous);
-        if (!validation.ok) {
-          throw new InvalidBotsJsonError(validation.message);
-        }
-        return mutation(previous);
+        assertBotsArrayValidForDaemon(previous);
+        const outcome = mutation(previous);
+        assertBotsArrayValidForDaemon(outcome.bots);
+        return outcome;
       });
     } catch (err) {
       if (
@@ -2353,15 +2503,18 @@ export class BotOnboardingManager {
     larkAppId?: string;
     displayName?: string;
     name?: string;
-  }>(record: T): Promise<{ bot: T & { larkAppId: string }; index: number }> {
+  }>(id: string, record: T): Promise<{ bot: T & { larkAppId: string }; index: number }> {
+    if (this.isCancelled(id)) throw new OnboardingCancelledError();
     let allocated: (T & { larkAppId: string }) | undefined;
     try {
       return await this.runBotsMutation(() => this.mutateBotsJsonValidated(bots => {
+        if (this.isCancelled(id)) throw new OnboardingCancelledError();
         allocated = normalizeBotConfig(reallocateLocalBotId(
           record,
           bots.map((bot: any) => String(bot?.larkAppId ?? '')).filter(Boolean),
         ));
         const index = bots.length;
+        this.committedJobs.add(id);
         return {
           bots: [...bots, allocated],
           result: { bot: allocated, index },
@@ -2371,7 +2524,13 @@ export class BotOnboardingManager {
       // The file rename may already have succeeded when a coordinator's
       // post-write commit fails. Reconcile that exact record instead of letting
       // a no-appId failure trigger a second create/append on local retry.
-      if (!allocated) throw error;
+      if (
+        !allocated
+        || error instanceof OnboardingCancelledError
+        || error instanceof InvalidBotsJsonError
+      ) {
+        throw error;
+      }
       const expected = allocated as Record<string, any>;
       const bots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
       const index = bots.findIndex((bot: any) => (
@@ -2381,33 +2540,65 @@ export class BotOnboardingManager {
         && bot?.displayName === expected.displayName
         && bot?.name === expected.name
       ));
-      if (index < 0) throw error;
+      if (index < 0) {
+        this.committedJobs.delete(id);
+        throw error;
+      }
       return { bot: bots[index], index };
     }
   }
 
-  /** Create-only atomic append for manual onboarding: rejects duplicate larkAppId & colliding process names under lock. */
-  private async persistNewManualBot(bot: Record<string, any>): Promise<number> {
+  /** Create-only atomic append for manual onboarding: rejects duplicate larkAppId & colliding process names under lock, and reconciles uncertain post-rename commits. */
+  private async persistNewManualBot(id: string, bot: Record<string, any>): Promise<number> {
+    if (this.isCancelled(id)) throw new OnboardingCancelledError();
     const normalized = normalizeBotConfig(bot);
-    return this.runBotsMutation(() => this.mutateBotsJsonValidated(previous => {
-      if (previous.some((entry: any) => entry?.larkAppId === normalized.larkAppId)) {
-        throw new DuplicateAppIdError(String(normalized.larkAppId));
+    let writeAttempted = false;
+    try {
+      return await this.runBotsMutation(() => this.mutateBotsJsonValidated(previous => {
+        if (this.isCancelled(id)) throw new OnboardingCancelledError();
+        if (previous.some((entry: any) => entry?.larkAppId === normalized.larkAppId)) {
+          throw new DuplicateAppIdError(String(normalized.larkAppId));
+        }
+        const index = previous.length;
+        const next = [...previous, normalized];
+        assertUniqueBotProcessNames(next);
+        writeAttempted = true;
+        this.committedJobs.add(id);
+        return {
+          bots: next,
+          result: index,
+        };
+      }));
+    } catch (error) {
+      if (
+        !writeAttempted
+        || error instanceof OnboardingCancelledError
+        || error instanceof DuplicateAppIdError
+        || error instanceof InvalidBotsJsonError
+      ) {
+        throw error;
       }
-      const index = previous.length;
-      const next = [...previous, normalized];
-      assertUniqueBotProcessNames(next);
-      return {
-        bots: next,
-        result: index,
-      };
-    }));
+      // If `renameSync` already committed the file before a coordinator post-write
+      // error threw, reconcile our exact record and continue to live-start instead
+      // of stranding the user with `duplicate_app` on retry.
+      const bots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
+      const index = bots.findIndex(entry => sameManualBotRecord(entry, normalized));
+      if (index < 0) {
+        this.committedJobs.delete(id);
+        throw error;
+      }
+      return index;
+    }
   }
 
   /** 把 bot append/更新进 bots.json（按 larkAppId upsert, 幂等），返回它的行号。 */
-  private async persistBot(bot: Record<string, any>): Promise<number> {
+  private async persistBot(id: string, bot: Record<string, any>): Promise<number> {
+    if (this.isCancelled(id)) throw new OnboardingCancelledError();
     const normalized = normalizeBotConfig(bot);
     return this.runBotsMutation(() => this.mutateBotsJsonValidated(previous => {
+      if (this.isCancelled(id)) throw new OnboardingCancelledError();
       const existing = previous.findIndex((b: any) => b?.larkAppId === bot.larkAppId);
+      this.committedJobs.add(id);
       if (existing >= 0) {
         const next = [...previous];
         next[existing] = normalized;
@@ -2425,6 +2616,7 @@ export class BotOnboardingManager {
    * 用户永久卡在 needs_owner。校验通过才落盘 allowedUsers 并进入 completed。
    */
   async submitOwner(id: string, rawEntries: string[]): Promise<{ ok: boolean; error?: string; message?: string }> {
+    if (this.isCancelled(id)) return { ok: false, error: 'onboarding_cancelled', message: '该添加任务已取消。' };
     const job = this.jobs.get(id);
     if (!job) return { ok: false, error: 'unknown_onboarding_job' };
     if (job.status !== 'needs_owner') return { ok: false, error: 'not_awaiting_owner' };
@@ -2455,6 +2647,7 @@ export class BotOnboardingManager {
     }
 
     const unusable = await this.detectUnusableOwners(appId, appSecret, brand, entries);
+    if (this.isCancelled(id)) return { ok: false, error: 'onboarding_cancelled', message: '该添加任务已取消。' };
     if (unusable.length > 0) {
       return {
         ok: false,
@@ -2466,8 +2659,11 @@ export class BotOnboardingManager {
     // 校验通过才落盘：此刻 bot 第一次进入 bots.json, 且带着非空 allowedUsers。
     let addedBotIndex: number;
     try {
-      addedBotIndex = await this.persistBot({ ...pending, allowedUsers: entries });
+      addedBotIndex = await this.persistBot(id, { ...pending, allowedUsers: entries });
     } catch (err) {
+      if (err instanceof OnboardingCancelledError) {
+        return { ok: false, error: 'onboarding_cancelled', message: '该添加任务已取消。' };
+      }
       if (err instanceof InvalidBotsJsonError) {
         return { ok: false, error: 'invalid_bots_json', message: err.message };
       }
@@ -2476,7 +2672,7 @@ export class BotOnboardingManager {
     this.pendingBots.delete(id);
     if (pending.activationPending === true) {
       this.patch(id, { activationPending: true });
-    } else {
+    } else if (!this.isCancelled(id)) {
       await this.runLiveStart(id, appId);
     }
     this.patch(id, { status: 'completed', addedBotIndex });
@@ -2502,8 +2698,12 @@ export class BotOnboardingManager {
       requireVerifiedEvents: boolean;
       excludeScopes?: ApprovalDeferredScopeBuckets;
       autoAvoidApproval?: boolean;
+      signal?: AbortSignal;
     },
   ): Promise<OpenPlatformAutomationResult> {
+    if (this.isCancelled(id)) {
+      return { ok: false, reason: 'aborted', message: '用户已取消操作' };
+    }
     this.patch(id, {
       status: 'configuring_permissions',
       appId,
@@ -2513,15 +2713,18 @@ export class BotOnboardingManager {
 
     const callbacks = {
       onQrCode: (info: { qrText: string; qrPayload: string }) => {
+        if (this.isCancelled(id)) return;
         this.patch(id, {
           status: 'waiting_for_platform_scan',
           platformQrDataUrl: this.renderQrDataUrl(info.qrPayload),
         });
       },
       onQrScanConfirmed: (info: { confirmedAt: number }) => {
+        if (this.isCancelled(id)) return;
         this.confirmPlatformQrScan(id, info.confirmedAt);
       },
       onStatus: (msg: string) => {
+        if (this.isCancelled(id)) return;
         // onStatus follows onQrCode while polling; keep the QR visible.
         this.patch(id, { permissionStatusMsg: msg });
       },
@@ -2537,6 +2740,7 @@ export class BotOnboardingManager {
             disableBytedcliFallback: true,
             ...(meta.excludeScopes ? { excludeScopes: meta.excludeScopes } : {}),
             ...(meta.autoAvoidApproval !== undefined ? { autoAvoidApproval: meta.autoAvoidApproval } : {}),
+            ...(meta.signal ? { signal: meta.signal } : {}),
           });
         } finally {
           rmSync(sessionFilePath, { force: true });
@@ -2558,6 +2762,7 @@ export class BotOnboardingManager {
           true,
           meta.registrationMode === 'sdk' ? false : undefined,
           meta.autoAvoidApproval,
+          meta.signal,
         );
       }
       const first = await this.automateOpenPlatform({
@@ -2573,6 +2778,7 @@ export class BotOnboardingManager {
         appJustCreated: true,
         ...(meta.excludeScopes ? { excludeScopes: meta.excludeScopes } : {}),
         ...(meta.autoAvoidApproval !== undefined ? { autoAvoidApproval: meta.autoAvoidApproval } : {}),
+        ...(meta.signal ? { signal: meta.signal } : {}),
         ...callbacks,
       });
       return first;
@@ -2723,6 +2929,7 @@ export class BotOnboardingManager {
     appJustCreated = false,
     allowBlindRedirectWrite?: false,
     autoAvoidApproval?: boolean,
+    signal?: AbortSignal,
   ): Promise<OpenPlatformAutomationResult> {
     try {
       return await this.automateOpenPlatform({
@@ -2736,6 +2943,7 @@ export class BotOnboardingManager {
         appJustCreated,
         ...(allowBlindRedirectWrite === false ? { allowBlindRedirectWrite } : {}),
         ...(autoAvoidApproval !== undefined ? { autoAvoidApproval } : {}),
+        ...(signal ? { signal } : {}),
         ...callbacks,
       });
     } finally {
@@ -2756,6 +2964,7 @@ export class BotOnboardingManager {
     status: 'completed' | 'needs_owner' | 'failed',
     error?: string,
   ): void {
+    if (this.cancelledJobs.has(id)) return;
     const permission: BotOnboardingPermission = auto.ok
       ? {
           ok: true,

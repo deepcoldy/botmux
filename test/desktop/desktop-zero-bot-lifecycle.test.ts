@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -11,6 +11,12 @@ import {
   type LiveSupervisorSnapshot,
   type ZeroBotLifecycleRuntime,
 } from '../../src/desktop/main/zero-bot-lifecycle.js';
+import {
+  DESKTOP_HOST_LEASES_DIRNAME,
+  formatStopIfEmptyCliOutcome,
+  hasOtherActiveDesktopHostLease,
+  parseDesktopHostLeaseRecord,
+} from '../../src/core/desktop-host-leases.js';
 
 function okResult(stdout = ''): RunResult {
   return { code: 0, stdout, stderr: '', signal: null };
@@ -253,15 +259,19 @@ describe('zero-bot lifecycle quit cleanup', () => {
 
   it('is idempotent when cleanupOnQuit is invoked concurrently', async () => {
     let releaseStop!: (result: RunResult) => void;
+    let markStopEntered!: () => void;
+    const stopEntered = new Promise<void>(resolve => { markStopEntered = resolve; });
     const h = makeHarness({
       stopIfEmptyImpl: () => new Promise<RunResult>(resolve => {
         releaseStop = resolve;
+        markStopEntered();
       }),
     });
     await h.lifecycle.runtime.start();
 
     const first = h.lifecycle.cleanupOnQuit();
     const second = h.lifecycle.cleanupOnQuit();
+    await stopEntered;
     releaseStop(okResult());
 
     expect(await Promise.all([first, second])).toEqual(['stopped', 'stopped']);
@@ -421,7 +431,9 @@ describe('zero-bot lifecycle quit cleanup', () => {
       });
 
       expect(lc1.adoptRunningZeroBot()).toBe(true);
-      expect(store1.read()?.supervisorPid).toBe(8080);
+      const saved1 = store1.read();
+      expect(saved1?.state).toBe('active');
+      if (saved1?.state === 'active') expect(saved1.supervisorPid).toBe(8080);
 
       // Re-hydration in same session succeeds; different session ignores the marker.
       const storeOther = createFileZeroBotOwnershipStore(dir, 'app-session-2');
@@ -469,6 +481,205 @@ describe('zero-bot lifecycle quit cleanup', () => {
       expect(await lc2.cleanupOnQuit()).toBe('stopped');
       expect(stopIfEmpty2).toHaveBeenCalledWith(expect.objectContaining({ supervisorPid: 8080 }));
       expect(store2.read()).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('mid-flight stop() waits for aborted start and catches a late-writing detached supervisor', async () => {
+    let setLiveRef!: (next: LiveSupervisorSnapshot | null) => void;
+    let liveAtStopCall: LiveSupervisorSnapshot | null = null;
+    let currentLive: LiveSupervisorSnapshot | null = null;
+
+    const h = makeHarness({
+      startImpl: opts => new Promise<RunResult>(resolve => {
+        opts?.signal?.addEventListener('abort', () => {
+          setTimeout(() => {
+            const spawned: LiveSupervisorSnapshot = {
+              supervisorPid: 2222,
+              supervisorStartedAt: '2026-11-26T00:05:00.000Z',
+              supervisorEntry: '/Applications/Botmux.app/Contents/Resources/runtime/dist/index-supervisor.js',
+            };
+            currentLive = spawned;
+            setLiveRef(spawned);
+          }, 50);
+          resolve({ code: 1, stdout: '', stderr: 'Command aborted', signal: null });
+        }, { once: true });
+      }),
+      stopImpl: async () => {
+        liveAtStopCall = currentLive;
+        currentLive = null;
+        setLiveRef(null);
+        return okResult();
+      },
+    });
+    setLiveRef = h.setLive;
+
+    const startPromise = h.lifecycle.runtime.start();
+    const stopResult = await h.lifecycle.runtime.stop({ timeoutMs: 2_000, abortGraceMs: 400, postAbortPollMs: 15 });
+    await startPromise;
+
+    expect(stopResult.code).toBe(0);
+    expect(liveAtStopCall).toMatchObject({ supervisorPid: 2222 });
+    expect(h.lifecycle.needsQuitCleanup()).toBe(false);
+  });
+
+  it('persists pending launch before invoker runs and recovers ownership after abnormal SIGKILL', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-pending-recover-'));
+    try {
+      const store1 = createFileZeroBotOwnershipStore(dir, 'sigkill-session');
+      let resolveStart!: (r: RunResult) => void;
+      const lc1 = createZeroBotLifecycle({
+        runtime: {
+          readBotConfigStatus: () => ({ status: 'not_configured', count: 0 }),
+          getState: async () => runtimeState(),
+          start: () => new Promise<RunResult>(resolve => { resolveStart = resolve; }),
+          stop: async () => okResult(),
+          stopIfEmpty: vi.fn(async () => okResult()),
+          restart: async () => okResult(),
+          restartBundled: async () => okResult(),
+          takeover: async () => okResult(),
+        },
+        readLiveSupervisor: () => null,
+        isOwnedByApp: () => true,
+        ownershipStore: store1,
+      });
+
+      const pStart = lc1.runtime.start();
+      expect(store1.read()?.state).toBe('pending');
+
+      // Simulate host1 SIGKILL before start() finishes; detached supervisor booted shortly after.
+      const bootedLive: LiveSupervisorSnapshot = {
+        supervisorPid: 3333,
+        supervisorStartedAt: new Date(Date.now() + 200).toISOString(),
+        supervisorEntry: '/Applications/Botmux.app/Contents/Resources/runtime/dist/index-supervisor.js',
+      };
+      const store2 = createFileZeroBotOwnershipStore(dir, 'sigkill-session');
+      const stopIfEmpty2 = vi.fn(async () => okResult(formatStopIfEmptyCliOutcome('stopped')));
+      const lc2 = createZeroBotLifecycle({
+        runtime: {
+          readBotConfigStatus: () => ({ status: 'not_configured', count: 0 }),
+          getState: async () => runtimeState(),
+          start: async () => okResult(),
+          stop: async () => okResult(),
+          stopIfEmpty: stopIfEmpty2,
+          restart: async () => okResult(),
+          restartBundled: async () => okResult(),
+          takeover: async () => okResult(),
+        },
+        readLiveSupervisor: () => bootedLive,
+        isOwnedByApp: () => true,
+        ownershipStore: store2,
+        hostPid: 7777,
+      });
+
+      expect(lc2.needsQuitCleanup()).toBe(true);
+      expect(lc2.getOwnedSupervisor()?.supervisorPid).toBe(3333);
+      expect(store2.read()?.state).toBe('active');
+
+      expect(await lc2.cleanupOnQuit()).toBe('stopped');
+      expect(stopIfEmpty2).toHaveBeenCalledWith(expect.objectContaining({ supervisorPid: 3333, hostPid: 7777 }));
+
+      resolveStart(okResult());
+      await pStart;
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('distinguishes protective CLI skip outcomes from stopped and preserves ownership marker on skipped:other-host', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-stop-outcome-'));
+    try {
+      const store = createFileZeroBotOwnershipStore(dir, 'outcome-session');
+      const live: LiveSupervisorSnapshot = {
+        supervisorPid: 5555,
+        supervisorStartedAt: '2026-11-26T00:06:00.000Z',
+        supervisorEntry: '/Applications/Botmux.app/Contents/Resources/runtime/dist/index-supervisor.js',
+      };
+
+      const lcPidMismatch = createZeroBotLifecycle({
+        runtime: {
+          readBotConfigStatus: () => ({ status: 'not_configured', count: 0 }),
+          getState: async () => runtimeState(),
+          start: async () => okResult(),
+          stop: async () => okResult(),
+          stopIfEmpty: async () => okResult(`${formatStopIfEmptyCliOutcome('skipped:pid-mismatch')}\n`),
+          restart: async () => okResult(),
+          restartBundled: async () => okResult(),
+          takeover: async () => okResult(),
+        },
+        readLiveSupervisor: () => live,
+        isOwnedByApp: () => true,
+      });
+      expect(lcPidMismatch.adoptRunningZeroBot()).toBe(true);
+      expect(await lcPidMismatch.cleanupOnQuit()).toBe('skipped-unowned');
+
+      const lcOtherHost = createZeroBotLifecycle({
+        runtime: {
+          readBotConfigStatus: () => ({ status: 'not_configured', count: 0 }),
+          getState: async () => runtimeState(),
+          start: async () => okResult(),
+          stop: async () => okResult(),
+          stopIfEmpty: async () => okResult(`${formatStopIfEmptyCliOutcome('skipped:other-host')}\n`),
+          restart: async () => okResult(),
+          restartBundled: async () => okResult(),
+          takeover: async () => okResult(),
+        },
+        readLiveSupervisor: () => live,
+        isOwnedByApp: () => true,
+        ownershipStore: store,
+      });
+      expect(lcOtherHost.adoptRunningZeroBot()).toBe(true);
+      expect(await lcOtherHost.cleanupOnQuit()).toBe('skipped-other-host');
+      // Marker preserved so the active host retains ownership.
+      expect(store.read()?.state).toBe('active');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('attested desktop host lease verification (PID-reuse resistant)', () => {
+  it('rejects legacy bare-PID leases and pruned reused PIDs while honoring attested live leases', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-lease-attest-'));
+    try {
+      const leaseDir = join(dir, DESKTOP_HOST_LEASES_DIRNAME);
+      mkdirSync(leaseDir, { recursive: true });
+
+      // Legacy bare-PID record without processStart must be rejected.
+      expect(parseDesktopHostLeaseRecord(JSON.stringify({ pid: 4001, startedAt: '2026-11-26T00:00:00Z' }), 4001)).toBeNull();
+      writeFileSync(join(leaseDir, 'host-4001.json'), JSON.stringify({ pid: 4001, startedAt: '2026-11-26T00:00:00Z' }));
+
+      // Reused PID (processStart differs) must be treated as stale and pruned.
+      writeFileSync(join(leaseDir, 'host-4002.json'), JSON.stringify({
+        pid: 4002,
+        processStart: 'old-start-ticks',
+        commandLine: 'botmux __desktop-host',
+        startedAt: '2026-11-26T00:00:00Z',
+      }));
+
+      const fakeRuntime = {
+        pidAlive: (pid: number) => pid === 4001 || pid === 4002 || pid === 4003,
+        readIdentity: (pid: number) => (pid === 4002 ? 'new-unrelated-process-ticks' : pid === 4003 ? 'live-host-ticks' : null),
+        readPidNamespace: () => 'pid:[1]',
+        readCommandLine: (pid: number) => (pid === 4003 ? 'botmux __desktop-host' : 'sleep 999'),
+        signalProcess: () => true,
+      };
+
+      expect(hasOtherActiveDesktopHostLease(dir, { excludePid: 9999, runtime: fakeRuntime, pruneStale: true })).toBe(false);
+      expect(existsSync(join(leaseDir, 'host-4001.json'))).toBe(false);
+      expect(existsSync(join(leaseDir, 'host-4002.json'))).toBe(false);
+
+      // Matching attested live lease protects the supervisor.
+      writeFileSync(join(leaseDir, 'host-4003.json'), JSON.stringify({
+        pid: 4003,
+        processStart: 'live-host-ticks',
+        pidNamespace: 'pid:[1]',
+        commandLine: 'botmux __desktop-host',
+        startedAt: '2026-11-26T00:00:00Z',
+      }));
+      expect(hasOtherActiveDesktopHostLease(dir, { excludePid: 9999, runtime: fakeRuntime, pruneStale: true })).toBe(true);
+      expect(hasOtherActiveDesktopHostLease(dir, { excludePid: 4003, runtime: fakeRuntime, pruneStale: true })).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

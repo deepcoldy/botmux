@@ -232,8 +232,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
 
         menu.addItem(item("显示控制台", #selector(showConsole)))
-        let start = item("启动", #selector(startRuntime))
-        start.isEnabled = !running && status != "not_configured"
+        let managed = (state["runtimeManaged"] as? Bool) == true
+        let start = item(status == "not_configured" ? "开始配置 / 添加机器人" : "启动", #selector(startRuntime))
+        start.isEnabled = (status == "stopped" || status == "not_configured") && managed
         menu.addItem(start)
         let stop = item("停止", #selector(stopRuntime))
         stop.isEnabled = running

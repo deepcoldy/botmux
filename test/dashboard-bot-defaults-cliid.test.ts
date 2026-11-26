@@ -19,6 +19,7 @@ import {
   selectDefaultOnboardingCliId,
 } from '../src/dashboard/web/bot-onboarding.js';
 import { shouldShowZeroBotOnboardingBanner } from '../src/dashboard/web/overview-page.js';
+import { ui } from '../src/dashboard/web/ui.js';
 import { DropdownMenu } from '../src/dashboard/web/dashboard-components.js';
 import { filterDropdownOptions } from '../src/dashboard/web/dropdown-shared.js';
 import { CLI_ALIASES, rawCliExecutable } from '../src/adapters/cli/registry.js';
@@ -2085,6 +2086,41 @@ describe('bot onboarding Agent availability warning', () => {
       cardCount: 0,
       configuredBotCount: 0,
     })).toBe(false);
+  });
+
+  it('queues a follow-up refreshConfiguredBotCount fetch when invalidated mid-flight so stale 0 cannot overwrite 1', async () => {
+    ui.authed = true;
+    ui.setConfiguredBotCount(0);
+    let resolveFirst!: (res: Response) => void;
+    let markFirstEntered!: () => void;
+    const firstEntered = new Promise<void>(resolve => { markFirstEntered = resolve; });
+    let calls = 0;
+    const mockFetch = vi.fn((_url: string | URL | Request) => {
+      calls += 1;
+      if (calls === 1) {
+        return new Promise<Response>(resolve => {
+          resolveFirst = resolve;
+          markFirstEntered();
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        json: async () => ({ authed: true, configuredBotCount: 1 }),
+      } as Response);
+    }) as unknown as typeof fetch;
+
+    const first = ui.refreshConfiguredBotCount(mockFetch);
+    await firstEntered;
+    // Onboarding completes while first /api/settings fetch is still pending.
+    const second = ui.refreshConfiguredBotCount(mockFetch);
+    resolveFirst({
+      ok: true,
+      json: async () => ({ authed: true, configuredBotCount: 0 }),
+    } as Response);
+    await Promise.all([first, second]);
+
+    expect(calls).toBe(2);
+    expect(ui.configuredBotCount).toBe(1);
   });
 });
 

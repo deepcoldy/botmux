@@ -13,6 +13,10 @@ import { createRuntimeService } from './main/runtime-service.js';
 import { createDesktopTray } from './main/tray.js';
 import { createMainWindow } from './main/window.js';
 import {
+  createDesktopHostLeaseRegistry,
+  type DesktopHostLeaseRegistry,
+} from '../core/desktop-host-leases.js';
+import {
   createZeroBotLifecycle,
   isSupervisorOwnedByBundledRuntime,
   readLiveSupervisorSnapshot,
@@ -25,12 +29,14 @@ let quitCleanupState: 'idle' | 'cleaning' | 'ready' = 'idle';
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let activeMonitor: RuntimeStateMonitor | null = null;
+let activeHostLease: DesktopHostLeaseRegistry | null = null;
 let activeZeroBotLifecycle: ReturnType<typeof createZeroBotLifecycle> | null = null;
 
 configureDesktopCommandLine();
 
 app.on('before-quit', event => {
   quitting = true;
+  activeHostLease?.unregister();
   activeZeroBotLifecycle?.markClosing();
   if (quitCleanupState === 'ready') return;
   if (quitCleanupState === 'cleaning') {
@@ -51,6 +57,10 @@ app.on('before-quit', event => {
       quitCleanupState = 'ready';
       app.quit();
     });
+});
+
+app.on('will-quit', () => {
+  activeHostLease?.unregister();
 });
 
 app.on('activate', () => {
@@ -111,12 +121,22 @@ async function bootstrap(): Promise<void> {
     shellPathEnv: () => probeShellPathEnv(),
     fleetApps: () => listFleetApps(paths),
   });
+  const hostLease = createDesktopHostLeaseRegistry(paths.botmuxHome);
+  activeHostLease = hostLease;
+  await hostLease.ensureRegistered();
+  if (quitting) return;
+
   const zeroBotLifecycle = createZeroBotLifecycle({
     runtime: rawRuntime,
     readLiveSupervisor: () => readLiveSupervisorSnapshot(paths.botmuxHome),
     isOwnedByApp: live => isSupervisorOwnedByBundledRuntime(live, bundledRuntime),
+    hasOtherActiveHost: () => hostLease.hasOtherActiveHost(),
+    hostPid: process.pid,
     warn: message => console.warn(`[desktop] ${message}`),
   });
+  // If a prior Electron session crashed abnormally while leaving an app-owned
+  // 0-bot onboarding supervisor alive, adopt it now so normal Quit reaps it.
+  zeroBotLifecycle.adoptRunningZeroBot();
   activeZeroBotLifecycle = zeroBotLifecycle;
   const runtime = zeroBotLifecycle.runtime;
 
@@ -128,6 +148,7 @@ async function bootstrap(): Promise<void> {
     watchDir: paths.botmuxHome,
     sendState: state => {
       if (quitting) return;
+      void hostLease.ensureRegistered();
       zeroBotLifecycle.observeState(state);
       if (!win.isDestroyed()) win.webContents.send('desktop:state-changed', state);
       // A user may invoke an older/global `botmux restart` after Desktop has
@@ -147,9 +168,17 @@ async function bootstrap(): Promise<void> {
     runtime,
     monitor,
     warn: message => console.warn(`[desktop] ${message}`),
-  }).finally(() => {
-    if (!quitting) monitor.start();
-  });
+  })
+    .then(async outcome => {
+      if (quitting) return;
+      await hostLease.ensureRegistered();
+      if (!quitting && outcome === 'skipped') {
+        zeroBotLifecycle.adoptRunningZeroBot();
+      }
+    })
+    .finally(() => {
+      if (!quitting) monitor.start();
+    });
   win.on('close', event => {
     // Closing the window should not stop the supervised daemon; explicit Quit
     // exits the shell, explicit Stop controls the runtime.

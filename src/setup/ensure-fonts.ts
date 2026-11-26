@@ -207,7 +207,7 @@ function downloadFile(url: string, destPath: string, timeoutMs = 60_000): Promis
   });
 }
 
-async function downloadCategory(spec: FontSpec): Promise<void> {
+async function downloadCategory(spec: FontSpec, opts?: { quiet?: boolean; downloadTimeoutMs?: number }): Promise<void> {
   if (!existsSync(FONT_DIR)) mkdirSync(FONT_DIR, { recursive: true });
   for (const f of spec.files) {
     const dest = join(FONT_DIR, f.name);
@@ -215,8 +215,8 @@ async function downloadCategory(spec: FontSpec): Promise<void> {
     try {
       if (existsSync(dest) && statSync(dest).size >= f.minBytes) continue;
     } catch { /* fall through to redownload */ }
-    console.log(`   下载 ${spec.category}: ${f.name} ...`);
-    await downloadFile(f.url, dest);
+    if (!opts?.quiet) console.log(`   下载 ${spec.category}: ${f.name} ...`);
+    await downloadFile(f.url, dest, opts?.downloadTimeoutMs);
     const sz = statSync(dest).size;
     if (sz < f.minBytes) {
       try { unlinkSync(dest); } catch { /* ignore */ }
@@ -225,7 +225,10 @@ async function downloadCategory(spec: FontSpec): Promise<void> {
   }
 }
 
-export async function ensureFonts(info?: PlatformInfo): Promise<FontResult> {
+export async function ensureFonts(
+  info?: PlatformInfo,
+  opts?: { quiet?: boolean; downloadTimeoutMs?: number },
+): Promise<FontResult> {
   const platform = info ?? detectPlatform();
   const result: FontResult = { fontDir: FONT_DIR, ready: [], failed: [] };
 
@@ -241,10 +244,10 @@ export async function ensureFonts(info?: PlatformInfo): Promise<FontResult> {
       continue;
     }
     try {
-      await downloadCategory(spec);
+      await downloadCategory(spec, opts);
       result.ready.push(spec.category);
     } catch (err: any) {
-      console.warn(`⚠️  字体下载失败 [${spec.category}]: ${err?.message ?? err}`);
+      if (!opts?.quiet) console.warn(`⚠️  字体下载失败 [${spec.category}]: ${err?.message ?? err}`);
       result.failed.push(spec.category);
     }
   }

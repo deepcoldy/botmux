@@ -142,7 +142,7 @@ type OnboardingFormState = {
 
 type ViewState =
   | { kind: 'form'; error?: string }
-  | { kind: 'job'; job: OnboardingJob; ownerError?: string };
+  | { kind: 'job'; job: OnboardingJob; ownerError?: string; cancelError?: string };
 
 const DEFAULT_CLI_OPTION: CliOption = { id: 'claude-code', label: 'Claude' };
 const DEFAULT_TTADK_MODEL = 'glm-5.1';
@@ -607,6 +607,7 @@ export function onboardingRetryMode(job: {
 function OnboardingJobView(props: {
   view: Extract<ViewState, { kind: 'job' }>;
   allowManual: boolean;
+  cancelling: boolean;
   ownerInput: string;
   ownerIdInput: string;
   onOwnerInputChange(value: string): void;
@@ -616,7 +617,7 @@ function OnboardingJobView(props: {
   onBackToManualForm(prefill?: { appId?: string; brand?: 'feishu' | 'lark' }): void;
   onClose(): void;
 }): React.JSX.Element {
-  const { job, ownerError } = props.view;
+  const { job, ownerError, cancelError } = props.view;
   const manualSteps = job.status === 'completed' && job.registrationMode === 'manual'
     ? (job.remainingSteps ?? [])
     : [];
@@ -626,11 +627,17 @@ function OnboardingJobView(props: {
       {job.status === 'waiting_for_scan' && job.qrDataUrl ? (
         <QrCard dataUrl={job.qrDataUrl} alt={t('botOnboarding.qrAlt')} link={job.qrUrl} />
       ) : null}
-      {job.status === 'waiting_for_scan' && props.allowManual ? (
+      {cancelError ? <p className="form-error">{cancelError}</p> : null}
+      {job.status === 'waiting_for_scan' ? (
         <div className="actions onboarding-actions">
-          <button type="button" onClick={() => props.onBackToManualForm()}>
-            {t('botOnboarding.switchToManual')}
+          <button type="button" disabled={props.cancelling} onClick={props.onClose}>
+            {t('botOnboarding.cancel')}
           </button>
+          {props.allowManual ? (
+            <button type="button" disabled={props.cancelling} onClick={() => props.onBackToManualForm()}>
+              {t('botOnboarding.switchToManual')}
+            </button>
+          ) : null}
         </div>
       ) : null}
       {job.status === 'waiting_for_platform_scan' && job.platformQrDataUrl ? (
@@ -691,9 +698,18 @@ function OnboardingJobView(props: {
         </form>
       ) : null}
       {job.status === 'completed' ? (
-        <p className="hint-ok">{job.registrationMode === 'local'
-          ? (job.liveStarted ? t('botOnboarding.liveOkLocal') : t('botOnboarding.restartHintLocal'))
-          : (job.liveStarted ? t('botOnboarding.liveOk') : t('botOnboarding.restartHint'))}</p>
+        job.liveStarted === false ? (
+          <>
+            <p className="hint-warn">
+              {job.registrationMode === 'local' ? t('botOnboarding.restartHintLocal') : t('botOnboarding.restartHint')}
+            </p>
+            {job.liveStartMessage ? <p className="hint-warn">{job.liveStartMessage}</p> : null}
+          </>
+        ) : (
+          <p className="hint-ok">{job.registrationMode === 'local'
+            ? (job.liveStarted ? t('botOnboarding.liveOkLocal') : t('botOnboarding.restartHintLocal'))
+            : (job.liveStarted ? t('botOnboarding.liveOk') : t('botOnboarding.restartHint'))}</p>
+        )
       ) : null}
       {job.status === 'failed' ? (
         <>
@@ -1097,14 +1113,19 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
   const pollSeqRef = useRef(0);
   const pollAbortRef = useRef<AbortController | null>(null);
   const loadSeqRef = useRef(0);
+  const startSeqRef = useRef(0);
   const cliTouchedRef = useRef(false);
   const completedNotifiedJobIdRef = useRef<string | null>(null);
+  const cancellingRef = useRef(false);
   const [cliState, setCliState] = useState<CliOptionsState>(() => defaultCliOptionsState());
   const [form, setForm] = useState<OnboardingFormState>(() => defaultFormState());
   const [cliRecheckSeq, setCliRecheckSeq] = useState(0);
   const [sessionMode, setSessionMode] = useState<'checking' | 'reuse' | 'qr'>('checking');
   const [view, setView] = useState<ViewState>({ kind: 'form' });
+  const viewRef = useRef<ViewState>(view);
+  viewRef.current = view;
   const [submitting, setSubmitting] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
   const [ownerInput, setOwnerInput] = useState('');
   const [ownerIdInput, setOwnerIdInput] = useState('');
 
@@ -1118,7 +1139,8 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
     }
   }, []);
 
-  const close = useCallback(() => {
+  const finishClose = useCallback(() => {
+    startSeqRef.current += 1;
     stopPolling();
     cloneSourceAppId = undefined;
     cloneSourceDefaults = undefined;
@@ -1229,6 +1251,7 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
     sessionModeOverride?: 'reuse' | 'qr',
   ) => {
     stopPolling();
+    const startSeq = ++startSeqRef.current;
     setSubmitting(true);
     setView({ kind: 'job', job: { id: '', status: 'starting', registrationMode } });
     try {
@@ -1264,6 +1287,12 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
         }),
       });
       const body = await res.json();
+      if (startSeqRef.current !== startSeq) {
+        if (res.ok && body?.job?.id) {
+          void fetch(`/api/bot-onboarding/${encodeURIComponent(String(body.job.id))}/cancel`, { method: 'POST' }).catch(() => {});
+        }
+        return;
+      }
       if (res.status === 400 || res.status === 409) {
         setView({ kind: 'form', error: body?.message ?? body?.error ?? 'invalid_input' });
         return;
@@ -1273,11 +1302,64 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
       applyJob(job);
       if (!shouldStopPolling(job)) startPolling(job.id, job.registrationMode);
     } catch (error) {
+      if (startSeqRef.current !== startSeq) return;
       setView({ kind: 'job', job: { id: '', status: 'failed', message: caughtErrorText(error), registrationMode } });
     } finally {
-      setSubmitting(false);
+      if (startSeqRef.current === startSeq) setSubmitting(false);
     }
   }, [applyJob, cliState.webSession, form, sessionMode, startPolling, stopPolling]);
+
+  const ensureActiveJobCancelled = useCallback(async (): Promise<boolean> => {
+    if (cancellingRef.current) return false;
+    const currentView = viewRef.current;
+    if (currentView.kind !== 'job' || !currentView.job.id || shouldStopPolling(currentView.job)) {
+      stopPolling();
+      return true;
+    }
+    const activeJob = currentView.job;
+    cancellingRef.current = true;
+    setCancelling(true);
+    stopPolling();
+    try {
+      const res = await fetch(`/api/bot-onboarding/${encodeURIComponent(activeJob.id)}/cancel`, {
+        method: 'POST',
+      });
+      const body = await res.json().catch(() => ({}));
+      if (res.ok || res.status === 404) {
+        return true;
+      }
+      if (res.status === 409 && body?.job) {
+        const latestJob = body.job as OnboardingJob;
+        applyJob(latestJob);
+        if (!shouldStopPolling(latestJob)) startPolling(latestJob.id, latestJob.registrationMode);
+        return false;
+      }
+      setView({
+        kind: 'job',
+        job: activeJob,
+        cancelError: body?.message ?? body?.error ?? `http_${res.status}`,
+      });
+      startPolling(activeJob.id, activeJob.registrationMode);
+      return false;
+    } catch (error) {
+      setView({
+        kind: 'job',
+        job: activeJob,
+        cancelError: caughtErrorText(error),
+      });
+      startPolling(activeJob.id, activeJob.registrationMode);
+      return false;
+    } finally {
+      cancellingRef.current = false;
+      setCancelling(false);
+    }
+  }, [applyJob, startPolling, stopPolling]);
+
+  const close = useCallback(() => {
+    void ensureActiveJobCancelled().then(cancelled => {
+      if (cancelled) finishClose();
+    });
+  }, [ensureActiveJobCancelled, finishClose]);
 
   const submitForm = useCallback((event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -1291,15 +1373,18 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
   }, [form.connection, startOnboarding]);
 
   const switchToManualForm = useCallback((prefill?: { appId?: string; brand?: 'feishu' | 'lark' }) => {
-    stopPolling();
-    setForm(current => ({
-      ...current,
-      connection: 'manual',
-      ...(prefill?.appId ? { appId: prefill.appId } : {}),
-      ...(prefill?.brand ? { brand: prefill.brand } : {}),
-    }));
-    setView({ kind: 'form' });
-  }, [stopPolling]);
+    void ensureActiveJobCancelled().then(cancelled => {
+      if (!cancelled) return;
+      startSeqRef.current += 1;
+      setForm(current => ({
+        ...current,
+        connection: 'manual',
+        ...(prefill?.appId ? { appId: prefill.appId } : {}),
+        ...(prefill?.brand ? { brand: prefill.brand } : {}),
+      }));
+      setView({ kind: 'form' });
+    });
+  }, [ensureActiveJobCancelled]);
 
   const retry = useCallback(async (registrationMode: 'web' | 'compat' | 'local') => {
     if (registrationMode === 'compat') {
@@ -1376,6 +1461,7 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
       <OnboardingJobView
         view={view}
         allowManual={cloneSourceAppId === undefined}
+        cancelling={cancelling}
         ownerInput={ownerInput}
         ownerIdInput={ownerIdInput}
         onOwnerInputChange={setOwnerInput}
@@ -1386,18 +1472,21 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
         onClose={close}
       />
     );
-  }, [cliRecheckSeq, cliState, close, form, handleCliChange, handleRecheckCli, ownerIdInput, ownerInput, props.open, retry, sessionMode, submitForm, submitOwner, submitting, switchToManualForm, view]);
+  }, [cancelling, cliRecheckSeq, cliState, close, form, handleCliChange, handleRecheckCli, ownerIdInput, ownerInput, props.open, retry, sessionMode, submitForm, submitOwner, submitting, switchToManualForm, view]);
 
-  const canClose = view.kind === 'form' || (view.kind === 'job' && (view.job.status === 'completed' || view.job.status === 'failed' || view.job.status === 'waiting_for_scan'));
+  const canClose = !cancelling && (view.kind === 'form' || (view.kind === 'job' && (view.job.status === 'completed' || view.job.status === 'failed' || view.job.status === 'waiting_for_scan')));
 
   return (
     <dialog
       className="onboarding-dialog"
       ref={dialogRef}
       onCancel={event => {
-        if (!canClose) event.preventDefault();
+        // Always prevent synchronous native dialog dismissal so Escape awaits
+        // POST /api/bot-onboarding/:id/cancel before closing.
+        event.preventDefault();
+        if (canClose) close();
       }}
-      onClose={() => { if (canClose) close(); }}
+      onClose={() => { if (props.open && canClose) close(); }}
       onClick={event => { if (canClose && event.target === event.currentTarget) close(); }}
     >
       <article className="onboarding-card">

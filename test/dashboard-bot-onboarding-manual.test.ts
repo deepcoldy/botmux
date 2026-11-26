@@ -92,7 +92,7 @@ describe('BotOnboardingManager manual App ID / App Secret onboarding', () => {
     const snap = mgr.get(job.id)!;
     expect(snap.status).toBe('completed');
     expect(snap.brand).toBe('lark');
-    expect(snap.remainingSteps?.every(step => step.url.includes('open.larksuite.com'))).toBe(true);
+    expect(snap.remainingSteps?.every(step => new URL(step.url).hostname === 'open.larksuite.com')).toBe(true);
 
     const persisted = JSON.parse(readFileSync(botsJsonPath, 'utf-8'));
     expect(persisted[0].brand).toBe('lark');
@@ -348,5 +348,125 @@ describe('BotOnboardingManager manual App ID / App Secret onboarding', () => {
       expect(mgr.get(job.id)?.error).toBe('invalid_bots_json');
       expect(readFileSync(botsJsonPath, 'utf-8')).toBe(corruptPayload);
     }
+  });
+
+  it('rejects loader-invalid bots.json entries (sandboxNetwork, mojo.localDaemon, cliLaunchMode) without overwriting', async () => {
+    const loaderInvalidPayloads = [
+      JSON.stringify([{ larkAppId: 'cli_a', larkAppSecret: 's', sandboxNetwork: 'false' }]),
+      JSON.stringify([{ larkAppId: 'cli_a', larkAppSecret: 's', mojo: { localDaemon: 'false' } }]),
+      JSON.stringify([{ larkAppId: 'cli_a', larkAppSecret: 's', cliLaunchMode: 'not-a-mode' }]),
+    ];
+    for (const raw of loaderInvalidPayloads) {
+      writeFileSync(botsJsonPath, raw);
+      const mgr = new BotOnboardingManager({
+        botsJsonPath,
+        validateCredentials: vi.fn(async () => ({ ok: true as const })),
+        detectUnusableOwners: vi.fn(async () => []),
+      });
+      const job = mgr.start({
+        registrationMode: 'manual',
+        appId: 'cli_newvalid1',
+        appSecret: 'sec',
+        allowedUsers: ['owner@example.com'],
+        workingDir: tmpDir,
+      });
+      await job.done;
+      expect(mgr.get(job.id)?.status).toBe('failed');
+      expect(mgr.get(job.id)?.error).toBe('invalid_bots_json');
+      expect(readFileSync(botsJsonPath, 'utf-8')).toBe(raw);
+    }
+  });
+
+  it('reconciles uncertain post-rename coordinator failures in manual onboarding without stranding on duplicate_app', async () => {
+    const startBotLive = vi.fn(async () => ({ ok: true, message: 'botmux-0 已上线' }));
+    const mgr = new BotOnboardingManager({
+      botsJsonPath,
+      validateCredentials: async () => ({ ok: true }),
+      detectUnusableOwners: async () => [],
+      startBotLive,
+      runBotsMutation: async mutation => {
+        // File write + rename succeeds, then coordinator post-commit throws.
+        await mutation();
+        throw new Error('coordinator commit ack lost');
+      },
+    });
+
+    const job = mgr.start({
+      registrationMode: 'manual',
+      appId: 'cli_reconcile1',
+      appSecret: 'sec-reconcile',
+      allowedUsers: ['owner@example.com'],
+      cliId: 'claude-code',
+      workingDir: tmpDir,
+      dirMode: 'fixed',
+    });
+    await job.done;
+
+    const snap = mgr.get(job.id)!;
+    expect(snap.status).toBe('completed');
+    expect(snap.addedBotIndex).toBe(0);
+    expect(startBotLive).toHaveBeenCalledWith('cli_reconcile1');
+    const persisted = JSON.parse(readFileSync(botsJsonPath, 'utf-8'));
+    expect(persisted).toHaveLength(1);
+    expect(persisted[0].larkAppId).toBe('cli_reconcile1');
+  });
+
+  it('cancels an in-flight QR onboarding job cooperatively so late QR resolution never writes bots.json or starts a bot', async () => {
+    let releaseCreateApp!: () => void;
+    let receivedSignal: AbortSignal | undefined;
+    const validateCredentials = vi.fn(async () => ({ ok: true as const }));
+    const startBotLive = vi.fn(async () => ({ ok: true }));
+    let qrReady!: () => void;
+    const waitForQr = new Promise<void>(resolve => { qrReady = resolve; });
+
+    const mgr = new BotOnboardingManager({
+      botsJsonPath,
+      validateCredentials,
+      startBotLive,
+      createApp: async opts => {
+        receivedSignal = opts.signal;
+        await opts.onQrCode?.({ qrText: 'QR', qrPayload: 'https://feishu.cn/qr/test' });
+        qrReady();
+        await new Promise<void>(resolve => { releaseCreateApp = resolve; });
+        return {
+          ok: true,
+          appId: 'cli_late_qr1',
+          appSecret: 'sec-late',
+          brand: 'feishu',
+          sessionFile: join(tmpDir, 'feishu-session.json'),
+          sessionSource: 'qr_login',
+          sessionIdentity: {
+            userId: 'u1',
+            userName: 'Alice',
+            email: 'alice@example.com',
+            tenantId: 't1',
+            tenantName: 'Corp',
+          },
+        };
+      },
+    });
+
+    const job = mgr.start({
+      registrationMode: 'web',
+      cliId: 'claude-code',
+      workingDir: tmpDir,
+    });
+    await waitForQr;
+    expect(mgr.get(job.id)?.status).toBe('waiting_for_scan');
+
+    const cancelled = mgr.cancel(job.id);
+    expect(cancelled.ok).toBe(true);
+    expect(receivedSignal?.aborted).toBe(true);
+    expect(mgr.get(job.id)?.status).toBe('failed');
+    expect(mgr.get(job.id)?.error).toBe('cancelled');
+    expect(mgr.get(job.id)?.qrDataUrl).toBeUndefined();
+
+    // Even if the remote QR poll later resolves with valid credentials, nothing is persisted or started.
+    releaseCreateApp();
+    await job.done;
+    expect(validateCredentials).not.toHaveBeenCalled();
+    expect(startBotLive).not.toHaveBeenCalled();
+    expect(existsSync(botsJsonPath)).toBe(false);
+    expect(mgr.get(job.id)?.error).toBe('cancelled');
   });
 });

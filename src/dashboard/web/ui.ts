@@ -117,6 +117,8 @@ class DashboardUiState {
 
   private configuredBotCountSeq = 0;
   private configuredBotCountInFlight: Promise<void> | null = null;
+  private configuredBotCountDirty = false;
+  private configuredBotCountPendingFetcher: typeof fetch | null = null;
 
   setConfiguredBotCount(count: number | null): void {
     if (this.configuredBotCount === count) return;
@@ -126,7 +128,24 @@ class DashboardUiState {
 
   refreshConfiguredBotCount(fetcher: typeof fetch = fetch): Promise<void> {
     if (!this.authed) return Promise.resolve();
-    if (this.configuredBotCountInFlight) return this.configuredBotCountInFlight;
+    if (this.configuredBotCountInFlight) {
+      // A newer mutation event arrived while a stale GET /api/settings is still
+      // in flight: invalidate the stale response and queue a follow-up fetch so
+      // a late 0 response cannot overwrite a just-completed 0->1 onboarding.
+      this.configuredBotCountSeq += 1;
+      this.configuredBotCountDirty = true;
+      this.configuredBotCountPendingFetcher = fetcher;
+      return this.configuredBotCountInFlight.then(() => {
+        if (this.configuredBotCountInFlight) return this.configuredBotCountInFlight;
+        if (this.configuredBotCountDirty && this.authed) {
+          const nextFetcher = this.configuredBotCountPendingFetcher ?? fetcher;
+          this.configuredBotCountDirty = false;
+          this.configuredBotCountPendingFetcher = null;
+          return this.refreshConfiguredBotCount(nextFetcher);
+        }
+        return undefined;
+      });
+    }
     const seq = ++this.configuredBotCountSeq;
     const req = Promise.resolve()
       .then(() => fetcher('/api/settings', { cache: 'no-store' }))
@@ -137,7 +156,15 @@ class DashboardUiState {
       })
       .catch(() => { /* keep previous count on transient fetch error */ })
       .finally(() => {
-        if (this.configuredBotCountInFlight === req) this.configuredBotCountInFlight = null;
+        if (this.configuredBotCountInFlight === req) {
+          this.configuredBotCountInFlight = null;
+          if (this.configuredBotCountDirty && this.authed) {
+            const nextFetcher = this.configuredBotCountPendingFetcher ?? fetcher;
+            this.configuredBotCountDirty = false;
+            this.configuredBotCountPendingFetcher = null;
+            void this.refreshConfiguredBotCount(nextFetcher);
+          }
+        }
       });
     this.configuredBotCountInFlight = req;
     return req;

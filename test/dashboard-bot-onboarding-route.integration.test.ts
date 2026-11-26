@@ -305,4 +305,95 @@ describe('Dashboard bot onboarding HTTP route', () => {
       rmSync(home, { recursive: true, force: true });
     }
   });
+
+  it('supports POST /api/bot-onboarding/:id/cancel and respects custom BOTS_CONFIG in GET /api/settings', () => {
+    const home = mkdtempSync(join(tmpdir(), 'botmux-onboarding-cancel-route-'));
+    const botmuxDir = join(home, '.botmux');
+    const dataDir = join(botmuxDir, 'data');
+    const customBotsPath = join(home, 'custom-fleet.json');
+    try {
+      mkdirSync(dataDir, { recursive: true });
+      writeFileSync(customBotsPath, JSON.stringify([
+        { larkAppId: 'local_custom_1', apiOnly: true, localIdentity: true, cliId: 'claude-code' },
+      ]));
+      writeFileSync(join(botmuxDir, '.data-dir'), dataDir, { mode: 0o600 });
+
+      const child = spawnSyncTsEvalWithRepoImports(`
+        import { readFileSync } from 'node:fs';
+        import { homedir } from 'node:os';
+        import { join } from 'node:path';
+        import { loopbackFetch } from './src/core/loopback-fetch.js';
+        import { loadOrCreatePersistedToken } from './src/dashboard/auth.js';
+        import { BotOnboardingManager } from './src/dashboard/bot-onboarding.js';
+
+        BotOnboardingManager.prototype.cancel = function (id) {
+          if (id === 'active-job') return { ok: true, job: { id, status: 'failed', error: 'cancelled' } };
+          if (id === 'done-job') return { ok: false, error: 'already_completed', job: { id, status: 'completed' } };
+          return { ok: false, error: 'unknown_onboarding_job' };
+        };
+
+        const botmuxDir = join(homedir(), '.botmux');
+        const token = loadOrCreatePersistedToken(join(botmuxDir, '.dashboard-token'));
+        await import('./src/index-dashboard.js');
+
+        let port;
+        const deadline = Date.now() + 10_000;
+        while (!port && Date.now() < deadline) {
+          try { port = Number(readFileSync(join(botmuxDir, '.dashboard-port'), 'utf8')); }
+          catch { await new Promise(resolve => setTimeout(resolve, 20)); }
+        }
+        if (!port) throw new Error('dashboard did not publish its port');
+
+        const origin = 'http://127.0.0.1:' + port;
+        const headers = { cookie: 'botmux_dashboard_token=' + token, origin };
+        const settingsRes = await loopbackFetch(origin + '/api/settings', { headers, signal: AbortSignal.timeout(3_000) });
+        const settingsBody = await settingsRes.json();
+
+        const cancelCall = async (id) => {
+          const r = await loopbackFetch(origin + '/api/bot-onboarding/' + id + '/cancel', {
+            method: 'POST',
+            headers,
+            signal: AbortSignal.timeout(3_000),
+          });
+          return { status: r.status, body: await r.json() };
+        };
+
+        console.log('CANCEL_AND_SETTINGS=' + JSON.stringify({
+          configuredBotCount: settingsBody.configuredBotCount,
+          cancelActive: await cancelCall('active-job'),
+          cancelDone: await cancelCall('done-job'),
+          cancelMissing: await cancelCall('missing-job'),
+        }));
+        process.exit(0);
+      `, {
+        cwd: process.cwd(),
+        encoding: 'utf8',
+        timeout: 25_000,
+        killSignal: 'SIGKILL',
+        env: {
+          ...process.env,
+          HOME: home,
+          USERPROFILE: home,
+          SESSION_DATA_DIR: dataDir,
+          BOTS_CONFIG: customBotsPath,
+          BOTMUX_DASHBOARD_PORT: String(randomInt(20_000, 40_000)),
+          BOTMUX_DASHBOARD_HOST: '127.0.0.1',
+          BOTMUX_DASHBOARD_PUBLIC_READONLY: 'false',
+        },
+      });
+      expect(child.error).toBeUndefined();
+      expect(child.status, String(child.stderr)).toBe(0);
+      const prefix = 'CANCEL_AND_SETTINGS=';
+      const line = String(child.stdout).split('\n').find(l => l.startsWith(prefix));
+      expect(line, String(child.stdout)).toBeDefined();
+      const parsed = JSON.parse(line!.slice(prefix.length));
+      // Default ~/.botmux/bots.json does not exist, yet custom BOTS_CONFIG has 1 bot -> must return 1.
+      expect(parsed.configuredBotCount).toBe(1);
+      expect(parsed.cancelActive).toMatchObject({ status: 200, body: { ok: true, job: { id: 'active-job', error: 'cancelled' } } });
+      expect(parsed.cancelDone).toMatchObject({ status: 409, body: { ok: false, error: 'already_completed' } });
+      expect(parsed.cancelMissing).toMatchObject({ status: 404, body: { ok: false, error: 'unknown_onboarding_job' } });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
 });

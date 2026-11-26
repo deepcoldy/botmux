@@ -758,11 +758,24 @@ export function buildTmuxUpgradeArgv(
  *  (which is pure) — it runs once just before the apt install attempt.
  *  Failure here is non-fatal; the actual install will fail loudly if it
  *  can't find the package. */
-export function aptUpdateBeforeInstall(info: PlatformInfo): void {
+export interface EnsureTmuxOptions {
+  /** Suppress stdout logs and child installer stdio inheritance (required for `--json` CLI callers). */
+  quiet?: boolean;
+  installTimeoutMs?: number;
+  aptUpdateTimeoutMs?: number;
+}
+
+export function aptUpdateBeforeInstall(
+  info: PlatformInfo,
+  opts?: { quiet?: boolean; timeoutMs?: number },
+): void {
   const argv = sudoPrefix(['apt-get', 'update'], info);
   if (!argv) return;
   try {
-    spawnSync(argv[0]!, argv.slice(1), { stdio: 'inherit', timeout: 120_000 });
+    spawnSync(argv[0]!, argv.slice(1), {
+      stdio: opts?.quiet ? 'ignore' : 'inherit',
+      timeout: opts?.timeoutMs ?? 120_000,
+    });
   } catch { /* best-effort */ }
 }
 
@@ -781,18 +794,21 @@ export function suggestManualCommand(pm: PackageManager, pkg: string): string {
   }
 }
 
-export function runInstall(argv: string[]): boolean {
+export function runInstall(
+  argv: string[],
+  opts?: { quiet?: boolean; timeoutMs?: number; env?: NodeJS.ProcessEnv },
+): boolean {
   const result = spawnSync(argv[0]!, argv.slice(1), {
-    stdio: 'inherit',
-    timeout: 10 * 60_000, // 10 min — apt-get on slow networks
+    stdio: opts?.quiet ? 'ignore' : 'inherit',
+    timeout: opts?.timeoutMs ?? 10 * 60_000, // 10 min — apt-get on slow networks
+    ...(opts?.env ? { env: opts.env } : {}),
   });
   return result.status === 0;
 }
 
-export async function ensureTmux(info?: PlatformInfo): Promise<TmuxResult> {
-  const platform = info ?? detectPlatform();
-
+export async function ensureTmux(info?: PlatformInfo, opts?: EnsureTmuxOptions): Promise<TmuxResult> {
   // Step 1: already installed AND functional?
+  // Run BEFORE detectPlatform() so healthy hosts skip command-v / sudo -n probing.
   // `tmux -V` alone is not enough — see probeTmuxFunctional jsdoc for the
   // failure modes (broken /tmp perms / bad ~/.tmux.conf / mismatched libs)
   // that pass -V but fail every actual tmux command.
@@ -817,7 +833,9 @@ export async function ensureTmux(info?: PlatformInfo): Promise<TmuxResult> {
     };
   }
 
-  console.log('⚠️  tmux 未检测到，正在安装...');
+  const platform = info ?? detectPlatform();
+  const quiet = opts?.quiet === true;
+  if (!quiet) console.log('⚠️  tmux 未检测到，正在安装...');
 
   // Step 2..4: walk the package-manager preference list.
   const tried: string[] = [];
@@ -828,12 +846,17 @@ export async function ensureTmux(info?: PlatformInfo): Promise<TmuxResult> {
       tried.push(`${pm}（跳过：当前用户无 sudo 且无 TTY）`);
       continue;
     }
-    if (pm === 'apt') aptUpdateBeforeInstall(platform);
-    console.log(`   尝试 ${pm}: ${argv.join(' ')}`);
-    if (runInstall(argv)) {
+    if (pm === 'apt') {
+      aptUpdateBeforeInstall(platform, { quiet, timeoutMs: opts?.aptUpdateTimeoutMs });
+    }
+    if (!quiet) console.log(`   尝试 ${pm}: ${argv.join(' ')}`);
+    const installEnv = pm === 'brew'
+      ? { ...process.env, HOMEBREW_NO_AUTO_UPDATE: '1', HOMEBREW_NO_INSTALL_CLEANUP: '1' }
+      : undefined;
+    if (runInstall(argv, { quiet, timeoutMs: opts?.installTimeoutMs, env: installEnv })) {
       const postInstall = probeTmuxFunctional();
       if (postInstall.ok) {
-        console.log(`✅ tmux ${postInstall.version} 安装完成 (via ${pm})`);
+        if (!quiet) console.log(`✅ tmux ${postInstall.version} 安装完成 (via ${pm})`);
         return { installed: true, version: postInstall.version, freshInstall: true, strategy: pm, binaryPresent: true };
       }
       tried.push(`${pm}（装上了但 server 起不来：${postInstall.reason}）`);

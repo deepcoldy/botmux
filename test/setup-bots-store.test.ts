@@ -200,5 +200,18 @@ describe('readConfiguredBotCount', () => {
 
     writeFileSync(botsPath, JSON.stringify([{ larkAppId: 'cli_missing_secret' }]));
     expect(readConfiguredBotCount(botsPath)).toBeNull();
+
+    // Full loader parity: reject malformed daemon-loader fields and still count activationPending / retired rows.
+    writeFileSync(botsPath, JSON.stringify([{ larkAppId: 'cli_a', larkAppSecret: 's', sandboxNetwork: 'false' }]));
+    expect(readConfiguredBotCount(botsPath)).toBeNull();
+
+    writeFileSync(botsPath, JSON.stringify([{ larkAppId: 'cli_a', larkAppSecret: 's', mojo: { localDaemon: 'false' } }]));
+    expect(readConfiguredBotCount(botsPath)).toBeNull();
+
+    writeFileSync(botsPath, JSON.stringify([{ larkAppId: 'cli_pending', larkAppSecret: 's', activationPending: true }]));
+    expect(readConfiguredBotCount(botsPath)).toBe(1);
+
+    writeFileSync(botsPath, JSON.stringify([{ larkAppId: 'cli_retired', larkAppSecret: 's', cliId: 'gemini' }]));
+    expect(readConfiguredBotCount(botsPath)).toBe(1);
   });
 });

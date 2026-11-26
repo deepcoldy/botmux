@@ -15,11 +15,13 @@
  * but never stops the fleet — the daemon outlives the app by design.
  */
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { replaceStandaloneBinary } from '../../core/binary-self-update.js';
+import { createDesktopHostLeaseRegistry } from '../../core/desktop-host-leases.js';
+import { captureFleetProcessIdentity } from '../../core/fleet-process-identity.js';
 import { globalInstallUpdateLockTarget } from '../../core/maintenance.js';
 import { withFileLock } from '../../utils/file-lock.js';
 import { readFleetState } from '../../core/fleet-state-store.js';
@@ -155,7 +157,7 @@ export function bundledRuntimeForHost(input: {
   };
 }
 
-export type LaunchOutcome = 'started' | 'restarted' | 'restart-failed' | 'aligned' | 'none';
+export type LaunchOutcome = 'started' | 'start-failed' | 'restarted' | 'restart-failed' | 'aligned' | 'none';
 
 /**
  * Only the runtime properly seeded at `~/.botmux/app-runtime/botmux` may be
@@ -208,45 +210,13 @@ export interface DesktopOverview {
   state: DesktopRuntimeState;
   alignment: FleetAlignment;
   update: DesktopUpdateStatus;
+  launchError?: string;
 }
 
 const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60_000;
 
-function createDesktopHostLeaseRegistry(botmuxHome: string, selfPid = process.pid) {
-  const leaseDir = join(botmuxHome, '.desktop-host-leases');
-  const selfFile = join(leaseDir, `host-${selfPid}.json`);
-  let registered = false;
-
-  const ensureRegistered = () => {
-    if (registered || !existsSync(botmuxHome)) return;
-    try {
-      if (!existsSync(leaseDir)) mkdirSync(leaseDir, { recursive: true, mode: 0o700 });
-      writeFileSync(selfFile, `${JSON.stringify({ pid: selfPid, startedAt: new Date().toISOString() })}\n`, { mode: 0o600 });
-      registered = true;
-    } catch { /* best-effort */ }
-  };
-
-  const unregister = () => {
-    registered = false;
-    try { rmSync(selfFile, { force: true }); } catch { /* ignore */ }
-  };
-
-  const hasOtherActiveHost = (): boolean => {
-    if (!existsSync(leaseDir)) return false;
-    try {
-      for (const name of readdirSync(leaseDir)) {
-        const match = /^host-(\d+)\.json$/.exec(name);
-        if (!match) continue;
-        const pid = Number(match[1]);
-        if (!Number.isSafeInteger(pid) || pid <= 0 || pid === selfPid) continue;
-        if (pidAlive(pid)) return true;
-        try { rmSync(join(leaseDir, name), { force: true }); } catch { /* ignore */ }
-      }
-    } catch { /* ignore */ }
-    return false;
-  };
-
-  return { ensureRegistered, unregister, hasOtherActiveHost };
+export function formatLaunchFailure(result: { code: number; stdout: string; stderr: string }): string {
+  return result.stderr.trim() || result.stdout.trim() || `exit code ${result.code}`;
 }
 
 export async function runDesktopHost(): Promise<void> {
@@ -266,7 +236,6 @@ export async function runDesktopHost(): Promise<void> {
     logsDir: join(botmuxHome, 'logs'),
   };
   const hostLease = createDesktopHostLeaseRegistry(botmuxHome);
-  hostLease.ensureRegistered();
   // The host runs from the binary bundled with the app (its protocol matches the
   // shell); the FLEET runs from the self-updatable runtime the app passes in
   // (~/.botmux/app-runtime/botmux). A runtime updated to a release that predates
@@ -323,14 +292,16 @@ export async function runDesktopHost(): Promise<void> {
     fleetApps: () => listFleetApps(paths),
     fleetOwner,
   });
+  const parentIdentity = process.ppid > 1 ? captureFleetProcessIdentity(process.ppid) : null;
   const appSessionId = process.env.BOTMUX_DESKTOP_APP_SESSION?.trim()
-    || (process.ppid > 1 ? `ppid:${process.ppid}` : null);
+    || (process.ppid > 1 ? `ppid:${process.ppid}${parentIdentity?.processStart ? `:${parentIdentity.processStart}` : ''}` : null);
   const zeroBotLifecycle = createZeroBotLifecycle({
     runtime: rawRuntime,
     readLiveSupervisor: () => readLiveSupervisorSnapshot(botmuxHome),
     isOwnedByApp: live => ownedByApp() || isSupervisorOwnedByBundledRuntime(live, bundled),
     ownershipStore: appSessionId ? createFileZeroBotOwnershipStore(botmuxHome, appSessionId) : undefined,
     hasOtherActiveHost: () => hostLease.hasOtherActiveHost(),
+    hostPid: process.pid,
     warn: message => log(message),
   });
   const runtime = zeroBotLifecycle.runtime;
@@ -351,6 +322,7 @@ export async function runDesktopHost(): Promise<void> {
   };
   const startedMtime = runtimeMtime();
   let lastState: DesktopRuntimeState | null = null;
+  let lastLaunchError: string | null = null;
   const overview = (state: DesktopRuntimeState): DesktopOverview => {
     const owner = fleetOwner();
     const fleetRunning = state.status === 'running' || state.status === 'degraded';
@@ -369,6 +341,7 @@ export async function runDesktopHost(): Promise<void> {
         fleetRunning: state.status === 'running' || state.status === 'degraded',
       }),
       update: { ...update },
+      ...(lastLaunchError && state.status !== 'running' ? { launchError: lastLaunchError } : {}),
     };
   };
   const publish = () => { if (lastState) emit('overview', overview(lastState)); };
@@ -377,8 +350,9 @@ export async function runDesktopHost(): Promise<void> {
     watchDir: botmuxHome,
     sendState: state => {
       if (closing) return;
-      hostLease.ensureRegistered();
+      void hostLease.ensureRegistered();
       zeroBotLifecycle.observeState(state);
+      if (state.status === 'running') lastLaunchError = null;
       lastState = state;
       emit('state', state);
       publish();
@@ -388,6 +362,7 @@ export async function runDesktopHost(): Promise<void> {
       const now = runtimeMtime();
       if (bundled.selfDispatching && startedMtime !== null && now !== null && now !== startedMtime && !update.inProgress) {
         log('runtime binary was replaced; relaunching host');
+        hostLease.unregister();
         setTimeout(() => process.exit(0), 100);
       }
     },
@@ -474,6 +449,7 @@ export async function runDesktopHost(): Promise<void> {
         if (restarted.code !== 0) log(`restart after update failed: ${(restarted.stderr || restarted.stdout).trim()}`);
       }
       // Exit so the app relaunches the host from the new binary.
+      hostLease.unregister();
       setTimeout(() => process.exit(0), 200);
       return { ok: true, message: output };
     } finally {
@@ -482,14 +458,22 @@ export async function runDesktopHost(): Promise<void> {
     }
   }
 
+  const runManualAction = (action: () => ReturnType<typeof runtime.start>) => {
+    if (lastLaunchError !== null) {
+      lastLaunchError = null;
+      publish();
+    }
+    return runRuntimeAction(action, monitor);
+  };
+
   const handlers: Record<string, HostHandler> = {
     getState: () => runtime.getState(),
     getOverview: async () => overview(await runtime.getState()),
     getDeviceStatus: () => runtime.getDeviceStatus(),
-    start: () => runRuntimeAction(runtime.start, monitor),
+    start: () => runManualAction(runtime.start),
     stop: () => runRuntimeAction(runtime.stop, monitor),
-    restart: () => runRuntimeAction(runtime.restart, monitor),
-    takeover: () => runRuntimeAction(runtime.takeover.bind(runtime), monitor),
+    restart: () => runManualAction(runtime.restart),
+    takeover: () => runManualAction(runtime.takeover.bind(runtime)),
     locateDashboard: () => locateDashboard(runtime),
     getDashboardUrl: async () => {
       const result = await runtime.dashboard();
@@ -553,15 +537,21 @@ export async function runDesktopHost(): Promise<void> {
   try {
     const launchTask = (async () => {
       try {
-        const initialState = await runtime.getState();
+        await hostLease.ensureRegistered();
+        if (closing) return;
+        let initialState = await runtime.getState();
         if (closing) return;
         const appLaunch = process.env.BOTMUX_DESKTOP_APP_LAUNCH === '1';
         if (appLaunch && initialState.status === 'running' && initialState.botCount === 0 && ownedByApp()) {
           // A reopened app adopting a still-live app-owned 0-bot supervisor takes
-          // over cleanup ownership and records its lease so an exiting prior host
-          // will not kill it underneath us.
-          hostLease.ensureRegistered();
-          zeroBotLifecycle.adoptRunningZeroBot();
+          // over cleanup ownership and records its fenced lease under the fleet lock
+          // so an exiting prior host cannot stop it underneath us.
+          await hostLease.ensureRegistered();
+          if (closing) return;
+          if (!zeroBotLifecycle.adoptRunningZeroBot()) {
+            initialState = await runtime.getState();
+            if (closing) return;
+          }
         }
         const outcome = await launchPolicy({
           runtime,
@@ -574,14 +564,17 @@ export async function runDesktopHost(): Promise<void> {
           appLaunch,
           ownedByApp,
           log,
+          onLaunchError: message => { lastLaunchError = message; },
         });
-        hostLease.ensureRegistered();
+        if (!closing) await hostLease.ensureRegistered();
         // A stopped fleet + marker + background relaunch returns 'none' here: there
         // is no old-build fleet to restart, so removing the marker is the correct
         // outcome (settleRestartMarker), not a conflict with restart-failed keeping it.
         if (!closing && settleRestartMarker(outcome) === 'remove') rmSync(restartMarker, { force: true });
       } catch (error) {
-        log(`launch policy failed: ${error instanceof Error ? error.message : String(error)}`);
+        const message = error instanceof Error ? error.message : String(error);
+        lastLaunchError = message;
+        log(`launch policy failed: ${message}`);
       }
     })();
 
@@ -638,17 +631,22 @@ export async function launchPolicy(input: {
   appLaunch: boolean;
   ownedByApp: () => boolean;
   log: (message: string) => void;
+  onLaunchError?: (message: string) => void;
 }): Promise<LaunchOutcome> {
   const report = (label: string, result: { code: number; stdout: string; stderr: string }) => {
-    if (result.code !== 0) input.log(`${label} failed: ${(result.stderr || result.stdout).trim()}`);
-    return result.code === 0;
+    if (result.code !== 0) {
+      const detail = formatLaunchFailure(result);
+      input.log(`${label} failed: ${detail}`);
+      return { ok: false as const, detail };
+    }
+    return { ok: true as const, detail: '' };
   };
   const running = input.state.status === 'running' || input.state.status === 'degraded';
   // Before the app-launch gate on purpose: restarting an app-owned fleet onto a
   // runtime the app just reseeded must also happen when the host merely
   // relaunched (that is exactly when a self-update/reseed lands).
   if (running && input.ownedByApp() && input.runtimeReplaced) {
-    return report('restart onto the new app runtime', await input.runtime.restartBundled()) ? 'restarted' : 'restart-failed';
+    return report('restart onto the new app runtime', await input.runtime.restartBundled()).ok ? 'restarted' : 'restart-failed';
   }
   // Everything else is an app-launch decision. A background host relaunch never
   // starts or takes over anything — the fleet outlives the app by design, and a
@@ -662,8 +660,19 @@ export async function launchPolicy(input: {
       (shouldAutoStartCliRuntime(input.state) && input.state.runtimeSource === 'bundled')
       || shouldAutoStartEmptyOnboardingRuntime(input.state)
     ) {
-      report('auto-start', await input.runtime.start());
-      return 'started';
+      try {
+        const outcome = report('auto-start', await input.runtime.start());
+        if (!outcome.ok) {
+          input.onLaunchError?.(outcome.detail);
+          return 'start-failed';
+        }
+        return 'started';
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        input.log(`auto-start failed: ${detail}`);
+        input.onLaunchError?.(detail);
+        return 'start-failed';
+      }
     }
     return 'none';
   }

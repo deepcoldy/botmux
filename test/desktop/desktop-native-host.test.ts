@@ -545,6 +545,25 @@ describe('native host launchPolicy supports 0-bot onboarding on app launch only'
     })).toBe('none');
     expect(startRelaunch).not.toHaveBeenCalled();
 
+    // Auto-start failure returns 'start-failed' and reports detail to onLaunchError.
+    const launchErrors: string[] = [];
+    expect(await launchPolicy({
+      runtime: {
+        start: vi.fn(async () => ({ code: 1, stdout: '', stderr: 'port 7891 busy' })),
+        takeover: vi.fn(),
+        restartBundled: vi.fn(),
+      },
+      state: zeroBotState,
+      alignment: async () => ({ kind: 'aligned' as const }),
+      runtimeReplaced: false,
+      appLaunch: true,
+      ownedByApp: () => false,
+      log: () => {},
+      onLaunchError: msg => launchErrors.push(msg),
+    })).toBe('start-failed');
+    expect(launchErrors).toEqual(['port 7891 busy']);
+    expect(settleRestartMarker('start-failed')).toBe('remove');
+
     // Older packaged external 0-bot supervisor must NOT be auto-hijacked by launchPolicy.
     const takeoverZeroBot = vi.fn(async () => ({ code: 0, stdout: '', stderr: '' }));
     expect(await launchPolicy({

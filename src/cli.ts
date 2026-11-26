@@ -107,6 +107,10 @@ import {
   writeBotsJsonAtomic as writeBotsAtomic,
 } from './setup/bots-store.js';
 import { validateBotConfigEntries } from './setup/bots-config-validation.js';
+import {
+  formatStopIfEmptyCliOutcome,
+  hasOtherActiveDesktopHostLease,
+} from './core/desktop-host-leases.js';
 import { findQuotaFallbackCycles } from './services/quota-fallback.js';
 import { findRetiredCliBots, retiredCliNotice } from './adapters/cli/retired-cli.js';
 import {
@@ -3659,23 +3663,23 @@ function cleanupLegacyPm2(_op?: 'stop' | 'restart'): boolean {
 }
 
 
-function parseOptionalSupervisorPidFlag(argv: string[]): number | undefined {
+function parseOptionalPositivePidFlag(argv: string[], flag: string): number | undefined {
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     let raw: string | undefined;
-    if (arg === '--supervisor-pid') {
+    if (arg === flag) {
       raw = argv[i + 1];
-    } else if (arg.startsWith('--supervisor-pid=')) {
-      raw = arg.slice('--supervisor-pid='.length);
+    } else if (arg.startsWith(`${flag}=`)) {
+      raw = arg.slice(flag.length + 1);
     } else {
       continue;
     }
     if (!raw || !/^\d+$/.test(raw)) {
-      throw new Error('--supervisor-pid 需要正整数 PID');
+      throw new Error(`${flag} 需要正整数 PID`);
     }
     const parsed = Number(raw);
     if (!Number.isSafeInteger(parsed) || parsed <= 0) {
-      throw new Error('--supervisor-pid 需要正整数 PID');
+      throw new Error(`${flag} 需要正整数 PID`);
     }
     return parsed;
   }
@@ -3686,18 +3690,20 @@ async function cmdStop(): Promise<void> {
   const stopArgs = process.argv.slice(3);
   const includePluginServices = stopArgs.includes('--with-plugin');
   const ifEmpty = stopArgs.includes('--if-empty');
-  const expectedSupervisorPid = parseOptionalSupervisorPidFlag(stopArgs);
-  if (expectedSupervisorPid !== undefined && !ifEmpty) {
-    console.error('--supervisor-pid 必须与 --if-empty 一起使用。');
+  const expectedSupervisorPid = parseOptionalPositivePidFlag(stopArgs, '--supervisor-pid');
+  const callerHostPid = parseOptionalPositivePidFlag(stopArgs, '--host-pid');
+  if ((expectedSupervisorPid !== undefined || callerHostPid !== undefined) && !ifEmpty) {
+    console.error('--supervisor-pid / --host-pid 必须与 --if-empty 一起使用。');
     process.exit(2);
   }
 
   if (ifEmpty) {
     // Desktop 0-bot quit cleanup: never create ~/.botmux on an untouched host,
-    // never leave a watchdog-stopped marker, and re-verify 0 configured bots
-    // under the exact same lock order as cmdStart (fleet lock -> bots.json lock)
-    // so a concurrent first-bot save can never be torn down.
+    // never leave a watchdog-stopped marker, re-verify 0 configured bots AND
+    // check attested Desktop host leases atomically under the exact same lock
+    // order as cmdStart (fleet lock -> bots.json lock).
     if (!existsSync(CONFIG_DIR)) {
+      console.log(formatStopIfEmptyCliOutcome('skipped:not-running'));
       console.log('daemon 未在运行。');
       return;
     }
@@ -3708,28 +3714,43 @@ async function cmdStop(): Promise<void> {
           try {
             parsed = JSON.parse(readFileSync(BOTS_JSON_FILE, 'utf-8'));
           } catch {
+            console.log(formatStopIfEmptyCliOutcome('skipped:invalid-config'));
             console.log('bots.json 存在且不可解析，跳过 --if-empty 停止。');
             return;
           }
           const validation = validateBotConfigEntries(parsed);
-          if (!validation.ok || validation.count > 0) {
+          if (!validation.ok) {
+            console.log(formatStopIfEmptyCliOutcome('skipped:invalid-config'));
+            console.log('bots.json 存在且结构无效，跳过 --if-empty 停止。');
+            return;
+          }
+          if (validation.count > 0) {
+            console.log(formatStopIfEmptyCliOutcome('skipped:configured'));
             console.log('已存在配置机器人，跳过 --if-empty 停止。');
             return;
           }
         }
+        if (hasOtherActiveDesktopHostLease(CONFIG_DIR, { excludePid: callerHostPid, pruneStale: true })) {
+          console.log(formatStopIfEmptyCliOutcome('skipped:other-host'));
+          console.log('检测到其他活跃的 Botmux Desktop 实例，跳过 --if-empty 停止。');
+          return;
+        }
         const { liveSupervisorTarget, stopFleet } = await import('./core/fleet-runtime.js');
         const target = liveSupervisorTarget();
         if (!target) {
+          console.log(formatStopIfEmptyCliOutcome('skipped:not-running'));
           console.log('daemon 未在运行。');
           return;
         }
         if (expectedSupervisorPid !== undefined && target.pid !== expectedSupervisorPid) {
+          console.log(formatStopIfEmptyCliOutcome('skipped:pid-mismatch'));
           console.log(`supervisor pid (${target.pid}) 与目标 (${expectedSupervisorPid}) 不一致，跳过 --if-empty 停止。`);
           return;
         }
         const result = stopFleet(FLEET_DAEMON_EXIT_WAIT_MS);
         if (result.action === 'not-running') {
           cleanupStaleDaemonDescriptors();
+          console.log(formatStopIfEmptyCliOutcome('skipped:not-running'));
           console.log('daemon 未在运行。');
           return;
         }
@@ -3740,6 +3761,7 @@ async function cmdStop(): Promise<void> {
           );
         }
         cleanupStaleDaemonDescriptors();
+        console.log(formatStopIfEmptyCliOutcome('stopped'));
         console.log(`✅ 0-bot 引导服务已停止 (supervisor pid ${result.supervisorPid})`);
       }, { maxWaitMs: 5_000 });
     }, { maxWaitMs: 5_000 });
@@ -3941,7 +3963,7 @@ async function cmdRestart(): Promise<void> {
 
 export type StartBotLiveResult =
   | { ok: true; state: 'started' | 'already-online'; processName: string }
-  | { ok: false; reason: 'not_found' | 'not_ready' | 'fleet_down' | 'timeout' | 'supervisor_error' | 'config_dir_not_writable'; message: string };
+  | { ok: false; reason: 'not_found' | 'not_ready' | 'fleet_down' | 'timeout' | 'supervisor_error' | 'config_dir_not_writable' | 'dependency_missing'; message: string };
 
 export type StopBotLiveResult =
   | { ok: true; state: 'stopped' | 'already-stopped'; processName: string }
@@ -4013,48 +4035,113 @@ async function ensureBotDaemonStopped(
  * The activation-readiness gate (activationPending/starting/committed/
  * deactivating) is orthogonal to how the daemon is launched and is preserved.
  */
+function validateBotActivationGate(appId: string, bot: any): StartBotLiveResult | null {
+  if (bot?.activationPending === true) {
+    return { ok: false, reason: 'not_ready', message: `appId ${appId} is still activation pending` };
+  }
+  const activationStarting = bot?.activationStarting;
+  const activationCommitted = bot?.activationCommitted;
+  const activationDeactivating = bot?.activationDeactivating;
+  if (activationDeactivating !== undefined) {
+    return { ok: false, reason: 'not_ready', message: `appId ${appId} is still deactivating` };
+  }
+  if (activationStarting !== undefined && activationCommitted !== undefined) {
+    return { ok: false, reason: 'not_ready', message: `appId ${appId} has conflicting activation markers` };
+  }
+  const activationMarker = activationStarting ?? activationCommitted;
+  const activationJobId = (
+    activationMarker
+    && typeof activationMarker === 'object'
+    && !Array.isArray(activationMarker)
+    && activationMarker.appId === appId
+    && typeof activationMarker.jobId === 'string'
+    && activationMarker.jobId
+  )
+    ? String(activationMarker.jobId)
+    : undefined;
+  if (activationMarker !== undefined && !activationJobId) {
+    return { ok: false, reason: 'not_ready', message: `appId ${appId} has an invalid activation marker` };
+  }
+  return null;
+}
+
 async function ensureBotDaemonStarted(
   appId: string,
   opts: { quiet?: boolean } = {},
 ): Promise<StartBotLiveResult> {
   ensureConfigDir();
   try {
-    return await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
+    // Phase 1 (under fleet lock): verify writability, target bot readiness, and
+    // live supervisor status before releasing the lock for any dependency install.
+    type Phase1Result =
+      | { done: true; result: StartBotLiveResult }
+      | {
+          done: false;
+          effectiveBackend: string;
+          cliId?: import('./adapters/cli/types.js').CliId;
+          isApiOnly: boolean;
+          isFirstBotTransition: boolean;
+        };
+
+    const phase1: Phase1Result = await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
       cleanupLegacyPm2(); // reap a pre-migration pm2 God if one is still around
+      const bots = loadBotsJson();
+      const index = bots.findIndex(b => b?.larkAppId === appId);
+      if (index < 0) {
+        return { done: true, result: { ok: false, reason: 'not_found', message: `appId ${appId} 不在 bots.json 中` } };
+      }
+      const bot = bots[index];
+      const gateFailure = validateBotActivationGate(appId, bot);
+      if (gateFailure) return { done: true, result: gateFailure };
+
+      const { liveSupervisorTarget, readFleetStatus } = await import('./core/fleet-runtime.js');
+      if (!liveSupervisorTarget()) {
+        return { done: true, result: { ok: false, reason: 'fleet_down', message: 'daemon 未在运行，请先 botmux start' } };
+      }
+      const fleetStatus = readFleetStatus();
+      const existingRow = fleetStatus?.rows.find(row => row.appId === appId && row.status === 'online' && row.alive);
+      if (existingRow) {
+        return { done: true, result: { ok: true, state: 'already-online', processName: existingRow.name } };
+      }
+      const hasOnlineBotDaemon = Boolean(fleetStatus?.rows.some(row => Boolean(row.appId) && row.status === 'online' && row.alive));
+      return {
+        done: false,
+        effectiveBackend: bot?.backendType ?? config.daemon.backendType,
+        cliId: bot?.cliId,
+        isApiOnly: bot?.apiOnly === true,
+        isFirstBotTransition: !hasOnlineBotDaemon,
+      };
+    }, { maxWaitMs: 5_000 });
+
+    if (phase1.done) return phase1.result;
+
+    // Phase 2 (outside fleet lock): run single-bot dependency preflight so a
+    // 0->1 transition after `start --allow-empty` provisions tmux/herdr/fonts
+    // (or fails cleanly with dependency_missing) before spawning the daemon.
+    const { ensureBotStartDependencies } = await import('./setup/index.js');
+    const depCheck = await ensureBotStartDependencies({
+      effectiveBackend: phase1.effectiveBackend,
+      cliId: phase1.cliId,
+      isApiOnly: phase1.isApiOnly,
+      isFirstBotTransition: phase1.isFirstBotTransition,
+      ptyOptIn: (process.env.BACKEND_TYPE ?? '').toLowerCase() === 'pty',
+      quiet: opts.quiet,
+      installTimeoutMs: 90_000,
+      skipFontsDownload: process.env.BOTMUX_FENCED_RUN === '1',
+    });
+    if (!depCheck.ok) {
+      return depCheck;
+    }
+
+    // Phase 3 (re-acquire fleet lock): re-validate bot & spawn via supervisor.
+    return await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
       const bots = loadBotsJson();
       const index = bots.findIndex(b => b?.larkAppId === appId);
       if (index < 0) {
         return { ok: false, reason: 'not_found', message: `appId ${appId} 不在 bots.json 中` };
       }
-      const bot = bots[index];
-      // Activation-readiness gate (managed onboarding) — unchanged by the pm2→
-      // supervisor migration; a not-yet-ready bot must not be launched.
-      if (bot?.activationPending === true) {
-        return { ok: false, reason: 'not_ready', message: `appId ${appId} is still activation pending` };
-      }
-      const activationStarting = bot?.activationStarting;
-      const activationCommitted = bot?.activationCommitted;
-      const activationDeactivating = bot?.activationDeactivating;
-      if (activationDeactivating !== undefined) {
-        return { ok: false, reason: 'not_ready', message: `appId ${appId} is still deactivating` };
-      }
-      if (activationStarting !== undefined && activationCommitted !== undefined) {
-        return { ok: false, reason: 'not_ready', message: `appId ${appId} has conflicting activation markers` };
-      }
-      const activationMarker = activationStarting ?? activationCommitted;
-      const activationJobId = (
-        activationMarker
-        && typeof activationMarker === 'object'
-        && !Array.isArray(activationMarker)
-        && activationMarker.appId === appId
-        && typeof activationMarker.jobId === 'string'
-        && activationMarker.jobId
-      )
-        ? String(activationMarker.jobId)
-        : undefined;
-      if (activationMarker !== undefined && !activationJobId) {
-        return { ok: false, reason: 'not_ready', message: `appId ${appId} has an invalid activation marker` };
-      }
+      const gateFailure = validateBotActivationGate(appId, bots[index]);
+      if (gateFailure) return gateFailure;
 
       const { startBotViaSupervisor } = await import('./core/fleet-runtime.js');
       const r = startBotViaSupervisor(
@@ -4111,7 +4198,7 @@ async function cmdStartBot(argv: string[]): Promise<void> {
   }
   if (r.reason === 'fleet_down') {
     console.error('ℹ️  daemon 未在运行。请用 `botmux start` 启动整个进程组。');
-  } else if (r.reason === 'config_dir_not_writable') {
+  } else if (r.reason === 'config_dir_not_writable' || r.reason === 'dependency_missing') {
     console.error(`❌ ${r.message}`);
   } else {
     console.error(`❌ 拉起失败 (${r.reason}): ${r.message}`);
@@ -21662,12 +21749,12 @@ const ROOT_FLEET_MUTATION_COMMANDS = new Set(['start', 'stop', 'restart', 'upgra
 // and start has no tear-down phase.
 const FLEET_KNOWN_FLAGS: Record<string, readonly string[]> = {
   start: ['--allow-empty', '--companion-secret-file', '--companion-bot'],
-  stop: ['--with-plugin', '--if-empty', '--supervisor-pid'],
+  stop: ['--with-plugin', '--if-empty', '--supervisor-pid', '--host-pid'],
   restart: ['--with-plugin', '--allow-empty', '--companion-secret-file', '--companion-bot'],
   upgrade: ['--canary', '--beta', '--rc', '--next', '--latest'],
   update: ['--canary', '--beta', '--rc', '--next', '--latest'],
 };
-const FLEET_VALUE_FLAGS = new Set(['--companion-secret-file', '--companion-bot', '--supervisor-pid']);
+const FLEET_VALUE_FLAGS = new Set(['--companion-secret-file', '--companion-bot', '--supervisor-pid', '--host-pid']);
 if (ROOT_FLEET_MUTATION_COMMANDS.has(command ?? '')) {
   const fleetArgs = process.argv.slice(3);
   if (fleetArgs.some(arg => arg === '--help' || arg === '-h')) {
@@ -21697,10 +21784,15 @@ if (ROOT_FLEET_MUTATION_COMMANDS.has(command ?? '')) {
   }
   if (
     command === 'stop'
-    && fleetArgs.some(arg => arg === '--supervisor-pid' || arg.startsWith('--supervisor-pid='))
+    && fleetArgs.some(arg => (
+      arg === '--supervisor-pid'
+      || arg.startsWith('--supervisor-pid=')
+      || arg === '--host-pid'
+      || arg.startsWith('--host-pid=')
+    ))
     && !fleetArgs.includes('--if-empty')
   ) {
-    console.error('--supervisor-pid 必须与 --if-empty 一起使用。');
+    console.error('--supervisor-pid / --host-pid 必须与 --if-empty 一起使用。');
     process.exit(2);
   }
   if ((command === 'upgrade' || command === 'update') && fleetArgs.filter(a => a !== '--help' && a !== '-h').length > 1) {

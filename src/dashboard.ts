@@ -39,6 +39,7 @@ import {
   writeTeamRoleInjectMode,
 } from './core/role-resolver.js';
 import { readBotsJsonOrEmpty, readConfiguredBotCount } from './setup/bots-store.js';
+import { resolveBotsConfigFile } from './core/config-dir.js';
 import { findInvalidAllowedUserEntries, hasOwnerEntry, isMobileEntry } from './setup/bot-config-editor.js';
 import { listenWithProbe, LISTEN_RELEASE_WEDGED_CODE, type VerifyBoundResult } from './utils/listen-with-probe.js';
 import {
@@ -5313,7 +5314,7 @@ const server = createServer(async (req, res) => {
         // 那里进来的机器主人和协管者都解析成 legacy 身份，能看到。
         hostTerminal: legacyAuthed,
         bound: readPlatformBinding() !== null,
-        ...(authed ? { configuredBotCount: readConfiguredBotCount(BOTS_JSON_PATH) } : {}),
+        ...(authed ? { configuredBotCount: readConfiguredBotCount(getLoadedConfigPath() ?? resolveBotsConfigFile()) } : {}),
       });
     }
     if (req.method === 'PUT' && url.pathname === '/api/settings') {
@@ -6928,10 +6929,29 @@ const server = createServer(async (req, res) => {
           : [];
       const r = await botOnboarding.submitOwner(onboardingId, entries);
       if (!r.ok) {
-        const status = r.error === 'unknown_onboarding_job' ? 404 : 400;
+        const status = r.error === 'unknown_onboarding_job'
+          ? 404
+          : r.error === 'onboarding_cancelled'
+            ? 409
+            : 400;
         return jsonRes(res, status, r);
       }
       return jsonRes(res, 200, { job: botOnboarding.get(onboardingId) });
+    }
+    let mCancel: RegExpMatchArray | null;
+    if (req.method === 'POST' && (mCancel = url.pathname.match(/^\/api\/bot-onboarding\/([^/]+)\/cancel$/))) {
+      let onboardingId: string;
+      try {
+        onboardingId = decodeURIComponent(mCancel[1]);
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_request' });
+      }
+      const r = botOnboarding.cancel(onboardingId);
+      if (!r.ok) {
+        const status = r.error === 'unknown_onboarding_job' ? 404 : 409;
+        return jsonRes(res, status, r);
+      }
+      return jsonRes(res, 200, { ok: true, job: r.job });
     }
     let mOnboard: RegExpMatchArray | null;
     if (req.method === 'GET' && (mOnboard = url.pathname.match(/^\/api\/bot-onboarding\/([^/]+)$/))) {
