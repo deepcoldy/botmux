@@ -967,6 +967,7 @@ describe('worker start operation', () => {
       else forkWorker(ds, '');
       const init = send.mock.calls[0][0];
       expect(init.type).toBe('init');
+      expect(init.structuredNoticeAck).toBe(true);
       expect(controller.operation()).toMatchObject({ kind: 'restart', operationId: init.restartAttemptId });
       expect(controller.operation(stop.operationId)).toMatchObject({ phase: 'uncertain', error: 'superseded_by_restart' });
     } finally {
@@ -8405,6 +8406,7 @@ describe('adopt worker re-fork forwards the incoming turn (PR#293 issue #3)', ()
       adoptMode: true,
       adoptSource: 'tmux',
       adoptTmuxTarget: 'work:0.0',
+      structuredNoticeAck: true,
       cliId: 'claude-code',
       prompt: '<bridge>hello from Lark</bridge>',
       turnId: 'om_refork_turn',

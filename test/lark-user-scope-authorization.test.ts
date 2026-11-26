@@ -1,10 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { startIpcServer, setIpcAuthSecret, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import * as workerPool from '../src/core/worker-pool.js';
 import * as botRegistry from '../src/bot-registry.js';
 import * as identities from '../src/im/lark/identity-cache.js';
 import * as tokens from '../src/utils/user-token.js';
 import { isKnownLarkUserScope, ON_DEMAND_USER_SCOPES } from '../src/utils/lark-scope-catalog.js';
+import { readDefaultScopeManifest } from '../src/setup/open-platform-automation.js';
 
 // Regressions for valid user scopes being rejected with `unknown_scopes` before
 // any authorize URL could be minted because the names were absent from
@@ -135,6 +139,79 @@ describe('Scopes removed from the default user manifest remain legal', () => {
 });
 
 describe('auth-request handler — user scope authorization', () => {
+  const minutesAndMeetingScopes = [
+    'minutes:minutes.artifacts:read',
+    'minutes:minutes.basic:read',
+    'minutes:minutes.media:export',
+    'minutes:minutes.search:read',
+    'minutes:minutes.transcript:export',
+    'minutes:minutes:readonly',
+    'vc:meeting.search:read',
+    'vc:note:read',
+    'vc:record:readonly',
+  ];
+
+  it('accepts Minutes and meeting scopes explicitly without requesting them during app setup', async () => {
+    const setupUserScopes = readDefaultScopeManifest().scopes?.user ?? [];
+    expect(minutesAndMeetingScopes.filter(scope => setupUserScopes.includes(scope))).toEqual([]);
+
+    const res = await post({ scopes: minutesAndMeetingScopes });
+    expect(res.status).toBe(200);
+    expect(vi.mocked(tokens.requestUserAuthorization).mock.calls[0]?.[3]).toEqual(minutesAndMeetingScopes);
+  });
+
+  it('uses only the active bot’s user scopes and follows live declaration changes', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-user-scopes-'));
+    try {
+      const file = join(dir, 'extra.json');
+      const extra = 'custom:older:read';
+      const next = 'custom:newer:read';
+      const tenant = 'custom:tenant:read';
+      writeFileSync(file, JSON.stringify({ scopes: { user: [extra], tenant: [tenant] } }));
+      const bot = botRegistry.getBot(session.larkAppId);
+      const [cfg] = botRegistry.parseBotConfigsFromText(JSON.stringify([{ ...bot.config, extraScopesFile: file }]));
+      vi.mocked(botRegistry.getBot).mockReturnValue({ ...bot, config: cfg });
+
+      expect((await post({ scopes: [extra] })).status).toBe(200);
+      expect(vi.mocked(tokens.requestUserAuthorization).mock.calls[0]?.[3]).toEqual([extra]);
+
+      const rejected = await post({ scopes: [tenant] });
+      expect(rejected.status).toBe(400);
+      expect(await rejected.json()).toMatchObject({ error: 'unknown_scopes', scopes: [tenant] });
+
+      const replacement = join(dir, 'extra-new.json');
+      writeFileSync(replacement, JSON.stringify({ scopes: [{ scope: next }] }));
+      renameSync(replacement, file);
+      expect((await post({ scopes: [extra] })).status).toBe(400);
+      expect((await post({ scopes: [next] })).status).toBe(200);
+
+      const botsFile = join(dir, 'bots.json');
+      const newPath = join(dir, 'new-path.json');
+      writeFileSync(newPath, JSON.stringify([extra]));
+      const writeBotConfigs = (extraScopesFile?: string) => {
+        writeFileSync(botsFile, JSON.stringify([
+          { ...bot.config, extraScopesFile },
+          { ...bot.config, larkAppId: 'cli_other', extraScopesFile: newPath },
+        ]));
+      };
+      writeBotConfigs(newPath);
+      vi.stubEnv('BOTS_CONFIG', botsFile);
+      expect((await post({ scopes: [extra] })).status).toBe(200);
+      expect((await post({ scopes: [next] })).status).toBe(400);
+
+      writeBotConfigs();
+      expect((await post({ scopes: [extra] })).status).toBe(400);
+
+      writeBotConfigs(newPath);
+      writeFileSync(newPath, '{');
+      expect((await post({ scopes: [extra] })).status).toBe(400);
+      expect((await post()).status).toBe(200);
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('mints an authorize URL for legal Base v3 scopes, bound to the verified caller', async () => {
     const scopes = ['base:app:read', 'base:table:read', 'base:field:read', 'base:record:read'];
     const res = await post({ scopes });

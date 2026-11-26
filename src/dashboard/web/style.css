@@ -6758,6 +6758,9 @@ dialog.onboarding-dialog::backdrop {
 .bot-defaults-page .bd-body .bd-row .bd-inline-check {
   display: inline-flex;
 }
+.bot-defaults-page select[data-action^="trigger-user-auth-source"] {
+  appearance: auto;
+}
 .bd-section-note[data-trigger-user-auth-token-advisory],
 .bd-section-note[data-trigger-user-auth-mcp-advisory] {
   margin-top: 8px;

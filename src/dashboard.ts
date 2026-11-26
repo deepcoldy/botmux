@@ -96,6 +96,7 @@ import {
   resolveSessionPreviewForProxy,
 } from './dashboard/preview-contract.js';
 import {
+  safeSessionPreviewTarget,
   sameSessionPreviewTarget,
   sessionPreviewTargetStillOwned,
   type SessionPreviewTarget,
@@ -438,7 +439,11 @@ import { materializePlugin } from './core/plugins/materializer.js';
 import { resolveEffectivePluginIds, updateBotPluginOverride } from './core/plugins/effective.js';
 import { assertPluginBindingTransition, describePluginDependencyError } from './core/plugins/dependencies.js';
 import { inspectGatewayEntry } from './core/plugins/mcp/gateway-installer.js';
+import { readPluginWebhookToken } from './core/plugins/card-actions/auth.js';
+import { resolveRunningPluginServiceTarget } from './core/plugins/webhooks/service-target.js';
 import type { InstalledPluginRecord, PluginDashboardEntry } from './core/plugins/types.js';
+import { createPluginWebhookRouteHandler, earlyGuardPluginProxyRequest } from './dashboard/plugin-webhook-routes.js';
+import { createPluginServiceProxyHandler } from './dashboard/plugin-service-proxy.js';
 import { fetchDaemonIpc } from './core/daemon-ipc-auth.js';
 import { createLazyTopicLinkBackfill } from './dashboard/lazy-topic-link-backfill.js';
 import {
@@ -3241,11 +3246,19 @@ async function handlePluginManagementApi(
     const pluginId = decodeURIComponent(match[1]);
     const action = match[2];
     if (!requireInstalledPlugin(pluginId)) return pluginJson(res, 404, { ok: false, error: 'plugin_not_found' });
+    const stopWithTeardown = async () => {
+      authSessionConnections.closeSessionStreams(`plugin:${pluginId}`);
+      try {
+        return await stopPluginServices([pluginId]);
+      } finally {
+        authSessionConnections.closeSessionStreams(`plugin:${pluginId}`);
+      }
+    };
     const reports = action === 'start'
       ? await startPluginServices([pluginId])
       : action === 'restart'
-        ? [...await stopPluginServices([pluginId]), ...await startPluginServices([pluginId])]
-        : await stopPluginServices([pluginId]);
+        ? [...await stopWithTeardown(), ...await startPluginServices([pluginId])]
+        : await stopWithTeardown();
     return pluginJson(res, 200, { ok: true, reports, ...(await listDashboardPluginsPayload()) });
   }
 
@@ -3255,6 +3268,51 @@ async function handlePluginManagementApi(
 const pluginMarket = createHostPluginMarket(id => {
   if (readGlobalConfig().plugins?.includes(id)) return true;
   return loadBotConfigs().some(bot => bot.plugins?.includes(id));
+});
+
+function pluginProxyForbiddenPorts(): Set<number> {
+  const ports = new Set<number>();
+  if (boundDashboardPort > 0) ports.add(boundDashboardPort);
+  const onlineAppIds = new Set<string>();
+  for (const daemon of registry.list()) {
+    onlineAppIds.add(daemon.larkAppId);
+    if (daemon.ipcPort > 0) ports.add(daemon.ipcPort);
+  }
+  for (const row of aggregator.getSessions()) {
+    if (!onlineAppIds.has(row.larkAppId)) continue;
+    if (typeof row.proxyPort === 'number' && Number.isInteger(row.proxyPort) && row.proxyPort > 0) {
+      ports.add(row.proxyPort);
+    }
+    if (row.status === 'closed' || row.status === 'dormant') continue;
+    if (typeof row.webPort === 'number' && Number.isInteger(row.webPort) && row.webPort > 0) {
+      ports.add(row.webPort);
+    }
+    const previewTarget = safeSessionPreviewTarget(row.previewTarget);
+    if (previewTarget) {
+      ports.add(previewTarget.port);
+    }
+  }
+  return ports;
+}
+
+const pluginWebhookRoutes = createPluginWebhookRouteHandler({
+  trustedProxyHops: dashboardH5AuthConfig.trustedProxyHops,
+  resolveTarget: pluginId => resolveRunningPluginServiceTarget(pluginId, {
+    readToken: readPluginWebhookToken,
+    forbiddenPorts: pluginProxyForbiddenPorts,
+  }),
+});
+
+const pluginServiceProxy = createPluginServiceProxyHandler({
+  csrfTokens: controlCsrfTokens,
+  isAuthSessionLive: terminalAuthSessionLive,
+  resolveTarget: pluginId => resolveRunningPluginServiceTarget(pluginId, {
+    forbiddenPorts: pluginProxyForbiddenPorts,
+  }),
+  bindStream: (authSessionId, pluginId, close) => {
+    if (!terminalAuthSessionLive(authSessionId)) return false;
+    return authSessionConnections.register(authSessionId, close, `plugin:${pluginId}`);
+  },
 });
 
 // ─── HTTP routing ────────────────────────────────────────────────────────────
@@ -4307,6 +4365,7 @@ const companionApi = (() => {
 
 const server = createServer(async (req, res) => {
   try {
+    if (earlyGuardPluginProxyRequest(req, res)) return;
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
 
     // Loopback self-identification (no auth): echoes this process's nonce so the
@@ -4428,6 +4487,10 @@ const server = createServer(async (req, res) => {
     // any other way. That is why the view-link API hands out a same-origin path
     // instead of the daemon/worker origin — this is the only door.
     if (terminalFrontProxy.handleHttp(req, res, url)) return;
+
+    if (await pluginWebhookRoutes.handle(req, res, url)) {
+      return;
+    }
 
     if (await handleWebhookRoute(req, res, url, {
       proxyToDaemon,
@@ -4682,6 +4745,10 @@ const server = createServer(async (req, res) => {
     // 所有 /api/ 路由之前，对 /api/ 下的非读方法拦截。
     if (!sessionWriteOriginAllowed(req, url.pathname)) {
       return dashboardControlJson(res, 403, { ok: false, error: 'control_origin_forbidden' });
+    }
+
+    if (await pluginServiceProxy.handle(req, res, url, { identity: requestIdentity, activeToken })) {
+      return;
     }
 
     // P2-1：飞书卡片「打开工作台」按钮的短时票据兑换，紧挨上面的 ?t= set-cookie

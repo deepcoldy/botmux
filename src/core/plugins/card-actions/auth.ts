@@ -18,12 +18,18 @@ import {
   pluginCardActionTokenPath,
   pluginHome,
   pluginPrivateDir,
+  pluginWebhookTokenPath,
 } from '../paths.js';
 
 const TOKEN_BYTES = 32;
 const TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
 
-const assertPrivateStorageLayout = (pluginId: string, create: boolean): void => {
+const assertPrivateStorageLayout = (
+  pluginId: string,
+  tokenPath: string,
+  tokenErrorKey: string,
+  create: boolean,
+): void => {
   const home = pluginHome(pluginId);
   if (existsSync(home)) {
     const stat = lstatSync(home);
@@ -46,19 +52,22 @@ const assertPrivateStorageLayout = (pluginId: string, create: boolean): void => 
     chmodSync(privateDir, 0o700);
   }
 
-  const tokenPath = pluginCardActionTokenPath(pluginId);
   if (existsSync(tokenPath)) {
     const stat = lstatSync(tokenPath);
     if (!stat.isFile() || stat.isSymbolicLink()) {
-      throw new Error(`unsafe_plugin_card_action_token:${pluginId}`);
+      throw new Error(`unsafe_${tokenErrorKey}:${pluginId}`);
     }
   }
 };
 
-export const readPluginCardActionToken = (pluginId: string): string => {
+const readPrivatePluginToken = (
+  pluginId: string,
+  tokenPathFor: (id: string) => string,
+  tokenErrorKey: string,
+): string => {
   const id = assertValidPluginId(pluginId);
-  assertPrivateStorageLayout(id, false);
-  const tokenPath = pluginCardActionTokenPath(id);
+  const tokenPath = tokenPathFor(id);
+  assertPrivateStorageLayout(id, tokenPath, tokenErrorKey, false);
   let fd: number | undefined;
   try {
     fd = openSync(
@@ -66,16 +75,16 @@ export const readPluginCardActionToken = (pluginId: string): string => {
       constants.O_RDONLY | (process.platform === 'win32' ? 0 : constants.O_NOFOLLOW),
     );
     const stat = fstatSync(fd);
-    if (!stat.isFile()) throw new Error(`invalid_plugin_card_action_token:${id}`);
+    if (!stat.isFile()) throw new Error(`invalid_${tokenErrorKey}:${id}`);
     if (process.platform !== 'win32' && (stat.mode & 0o777) !== 0o600) {
       fchmodSync(fd, 0o600);
     }
     const token = readFileSync(fd, 'utf8').trim();
-    if (!TOKEN_RE.test(token)) throw new Error(`invalid_plugin_card_action_token:${id}`);
+    if (!TOKEN_RE.test(token)) throw new Error(`invalid_${tokenErrorKey}:${id}`);
     return token;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-      throw new Error(`plugin_card_action_token_missing:${id}`);
+      throw new Error(`${tokenErrorKey}_missing:${id}`);
     }
     throw error;
   } finally {
@@ -83,19 +92,35 @@ export const readPluginCardActionToken = (pluginId: string): string => {
   }
 };
 
-export const getOrCreatePluginCardActionToken = (pluginId: string): string => {
+const getOrCreatePrivatePluginToken = (
+  pluginId: string,
+  tokenPathFor: (id: string) => string,
+  tokenErrorKey: string,
+): string => {
   const id = assertValidPluginId(pluginId);
-  assertPrivateStorageLayout(id, true);
-  const tokenPath = pluginCardActionTokenPath(id);
+  const tokenPath = tokenPathFor(id);
+  assertPrivateStorageLayout(id, tokenPath, tokenErrorKey, true);
   return withFileLockSync(tokenPath, () => {
-    assertPrivateStorageLayout(id, true);
-    if (existsSync(tokenPath)) return readPluginCardActionToken(id);
+    assertPrivateStorageLayout(id, tokenPath, tokenErrorKey, true);
+    if (existsSync(tokenPath)) return readPrivatePluginToken(id, tokenPathFor, tokenErrorKey);
     const token = randomBytes(TOKEN_BYTES).toString('base64url');
     atomicWriteFileSync(tokenPath, token, {
       mode: 0o600,
       durable: true,
       followTargetSymlink: false,
     });
-    return readPluginCardActionToken(id);
+    return readPrivatePluginToken(id, tokenPathFor, tokenErrorKey);
   }, { maxWaitMs: 30_000 });
 };
+
+export const readPluginCardActionToken = (pluginId: string): string =>
+  readPrivatePluginToken(pluginId, pluginCardActionTokenPath, 'plugin_card_action_token');
+
+export const getOrCreatePluginCardActionToken = (pluginId: string): string =>
+  getOrCreatePrivatePluginToken(pluginId, pluginCardActionTokenPath, 'plugin_card_action_token');
+
+export const readPluginWebhookToken = (pluginId: string): string =>
+  readPrivatePluginToken(pluginId, pluginWebhookTokenPath, 'plugin_webhook_token');
+
+export const getOrCreatePluginWebhookToken = (pluginId: string): string =>
+  getOrCreatePrivatePluginToken(pluginId, pluginWebhookTokenPath, 'plugin_webhook_token');

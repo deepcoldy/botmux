@@ -3,10 +3,16 @@ import { loadWorkerFunction } from './worker-function-harness.js';
 import { PromptSuggestionPublisher } from '../../src/utils/prompt-suggestion-publisher.js';
 import { ClaudeModelRequestClock } from '../../src/services/claude-transcript.js';
 import { createUsageLimitTracker } from '../../src/utils/usage-limit-tracker.js';
-import { reconcileUsageLimitState } from '../../src/utils/cli-usage-limit.js';
+import {
+  cliUsageLimitEpisodeKey,
+  isTransientRateLimit,
+  reconcileUsageLimitState,
+  screenshotUsageLimitDedupSuffix,
+  usageLimitEvidenceKey,
+} from '../../src/utils/cli-usage-limit.js';
 import { stripAnsiScreenText } from '../../src/utils/idle-detector.js';
-import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, isAntigravityWorkingScreen,
-  isAntigravityReadyComposerScreen, rememberAntigravityQuota } from '../../src/adapters/cli/antigravity.js';
+import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, isAntigravityWorkingScreen,
+  isAntigravityReadyComposerScreen, rememberAntigravityQuota, supportsAntigravityReadyFooterQuota } from '../../src/adapters/cli/antigravity.js';
 import type { WorkerToDaemon } from '../../src/types.js';
 
 /** Real timer, classifier and capture/upload function; only terminal/network
@@ -34,9 +40,11 @@ export function antigravityScreenProducer(send: (frame: WorkerToDaemon) => void)
     turnTerminalEmitted: false, promptSuggestionReportTurn: () => undefined,
     SCREEN_UPDATE_INTERVAL_MS: 100, backendScreenEvidenceIsAuthoritativeForMutation: () => true,
     captureBackendScreen: capture, stripAnsiScreenText, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen,
-    annotateAntigravityUsageLimit, usageLimitTracker: createUsageLimitTracker({ isRateKindSuppressed: () => false, isOutputActive: () => false }),
-    reconcileUsageLimitState, rememberAntigravityQuota, antigravityQuotaHistory: undefined,
-    unconfirmedAntigravityQuotas: new Map(), ANTIGRAVITY_QUOTA_HISTORY_LIMIT,
+    supportsAntigravityReadyFooterQuota,
+    usageLimitTracker: createUsageLimitTracker({ isRateKindSuppressed: () => false, isOutputActive: () => false }),
+    reconcileUsageLimitState, rememberAntigravityQuota, cliUsageLimitEpisodeKey, usageLimitEvidenceKey,
+    screenshotUsageLimitDedupSuffix, isTransientRateLimit, webTerminalInputGeneration: 0,
+    antigravityQuotaHistory: undefined, unconfirmedAntigravityQuotas: new Map(), ANTIGRAVITY_QUOTA_HISTORY_LIMIT,
     displayMode: 'screenshot', captureRevision: 0, screenshotDisplayGeneration: 0,
     apiOnlyForUpload: false, larkAppIdForUpload: 'app', larkAppSecretForUpload: 'secret',
     screenshotCaptureInFlight: false, lastShotHash: '', lastUploadLogAtMs: 0,

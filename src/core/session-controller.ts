@@ -16,6 +16,7 @@ import { SessionEventGateway, type SessionEventAdmission } from './session-event
 import { isOutputJournalAppId } from '../services/universal-output-handoff.js';
 import { commitPrimarySessionContract, sessionContractPrimary } from './session-contract-primary.js';
 import { isCodexFamilyCliId } from '../adapters/cli/types.js';
+import { isStructuredNoticeProtocolMessage } from '../services/structured-notice-protocol.js';
 
 export type SessionContractBootstrap = import('../services/session-contract.js').SessionContractBootstrap;
 export interface WorkerContractContext extends SessionEventContext { bindingId?: string }
@@ -489,7 +490,7 @@ export class SessionController {
       // (the relay resolving the real CLI, a new native session id), and a
       // zero-prompt session would lose where that turn replies.
       if (continuedInto && message.type === 'terminal_turn_started') context.scope.runtime = continuedInto;
-      const preliminary = this.gateway.admit(message.type, context, channel);
+      const preliminary = this.gateway.admit(message.type, context, channel, undefined, isStructuredNoticeProtocolMessage(message));
       if (preliminary.kind === 'reject' || preliminary.kind === 'defer') return preliminary;
       if (continuedInto) context.scope.runtime = continuedInto;
       if (existing.length === 1) context.scope.execution = existing[0].ref;
@@ -520,7 +521,7 @@ export class SessionController {
     }
     const uncertainTerminal = message.type === 'turn_terminal' && contractTerminalStatus(message.status, message.errorCode) === 'reconciling';
     if (['turn_terminal', 'final_output', 'turn_execution_started', 'native_input_consumed'].includes(message.type) && !context.scope.execution) return { kind: 'reject', reason: 'execution_scope_missing' };
-    const admission = this.gateway.admit(message.type, context, channel, recoveredOrigin);
+    const admission = this.gateway.admit(message.type, context, channel, recoveredOrigin, isStructuredNoticeProtocolMessage(message));
     if (admission.kind === 'reject' || admission.kind === 'defer') return admission;
     const runtime = context.scope.runtime; const execution = context.scope.execution;
     if (execution && runtime && !recoveredOrigin && !uncertainTerminal && ['turn_execution_started', 'native_input_consumed', 'turn_terminal', 'final_output'].includes(message.type)) {
@@ -572,9 +573,11 @@ export class SessionController {
     }
     if (message.type === 'claude_exit' && runtime) {
       let currentPhysicalExit = false;
-      // The exit callback keeps the binding its CLI was spawned under.
+      // Exits may name the launcher's binding or the latest same-process
+      // binding. Retire both directions of the proven continuation lineage;
+      // executions stay on the runtime they originally ran under.
       const exited = new Map<string, RuntimeContract>();
-      for (const ref of [runtime, ...this.store.continuedRuntimes(this.ref, runtime, channel)]) {
+      for (const ref of this.store.runtimeExitLineage(this.ref, runtime, channel)) {
         for (const sibling of this.store.physicalRuntimes(this.ref, ref)) exited.set(sibling.ref.runtimeId, sibling);
       }
       for (const sibling of exited.values()) {

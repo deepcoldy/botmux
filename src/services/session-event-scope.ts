@@ -382,6 +382,27 @@ export class WorkerSessionEventScope {
     if (captured && captured.physicalId !== current.physicalId) return undefined;
     return this.snapshot(current);
   }
+  /** A physical exit must survive a pending rebind being refused. Its
+   * unassigned reservation can be abandoned (and deferred events discarded),
+   * while the last assigned binding still proves this very CLI. Prefer the
+   * newest non-aborted assigned binding on the same-process predecessor chain.
+   * Restart receipts deliberately keep the pending binding and its readiness
+   * gate; this separate entry point cannot alter their deferred semantics. */
+  physicalExitOrigin(): CapturedSessionOrigin | undefined {
+    const current = this.current;
+    if (!current) return undefined;
+    const captured = this.storage.getStore()?.binding;
+    if (captured && captured.physicalId !== current.physicalId) return undefined;
+    let binding: RuntimeEventBinding | undefined = current;
+    while (binding?.physicalId === current.physicalId) {
+      if (binding.runtime && !this.aborted.has(binding.bindingId)) return this.snapshot(binding);
+      binding = this.predecessors.get(binding.bindingId);
+    }
+    // A first process can exit before any binding is assigned. Keep that exit
+    // on the current reservation for the host's normal defer/replay path rather
+    // than borrowing an identity across a physical-process boundary.
+    return this.snapshot(current);
+  }
   /** Screen observations describe the live process, not the historical
    * execution a timer inherited. Only an in-process rebind may advance it;
    * callbacks from a replaced process retain their stale runtime fence. */

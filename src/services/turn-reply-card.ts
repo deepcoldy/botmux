@@ -101,7 +101,7 @@ export type TurnReplyCardEvent =
   | { kind: 'final'; text: string; card: string; source: 'explicit' | 'bridge'; feedback?: TurnReplyCardRecord['feedback'] }
   | { kind: 'phase'; phase: 'working' | 'waiting' | 'stopping' }
   | { kind: 'terminal'; phase: 'completed' | 'failed' | 'cancelled' | 'ambiguous' | 'superseded'; notice?: string; durationMs?: number; completedAtMs?: number; disconnected?: boolean; orphanAskIds?: string[] }
-  | { kind: 'display_retired'; notice: string }
+  | { kind: 'display_retired'; notice?: string; silent?: boolean }
   | { kind: 'refresh' }
   /** Set or clear the next-step row; valid after the terminal edge too. */
   | { kind: 'next_step'; nextStep?: import('../im/lark/next-step-card.js').NextStepButton }
@@ -252,11 +252,26 @@ export class TurnReplyCardStore {
           ? { kind: 'refresh' }
           : { kind: 'terminal', phase: 'ambiguous', disconnected: true, orphanAskIds: event.orphanAskIds };
       }
+      if (event.kind === 'display_retired' && event.silent) {
+        // A genuinely unshown display needs no provider write. This fast path
+        // deliberately shares update()'s lock and beforeEffect/owns barrier:
+        // an uncertain first POST, any final payload or an existing terminal
+        // outcome must instead use the full publication/recovery protocol below.
+        if ((!replyCardIsTerminal(record) || (record.displayRetired && record.phase === 'completed'))
+          && !record.messageId && !record.pendingCreate && !record.finalCard) {
+          record.displayRetired = true;
+          record.phase = 'completed';
+          delete record.pendingPatch;
+          delete record.publishPending;
+          this.write(key, record);
+          return { delivered: false, record };
+        }
+      }
       const displayRetirement = event.kind === 'display_retired';
       if (event.kind === 'display_retired') {
         if (!replyCardIsTerminal(record) || record.displayRetired) record.displayRetired = true;
-        event = { kind: 'terminal', phase: record.finalDelivered ? 'completed' : 'ambiguous',
-          ...(record.finalDelivered ? {} : { notice: event.notice }) };
+        event = { kind: 'terminal', phase: record.finalDelivered || event.silent ? 'completed' : 'ambiguous',
+          ...(record.finalDelivered || event.silent ? {} : { notice: event.notice }) };
       }
       const terminal = replyCardIsTerminal(record) && !record.disconnected;
       record.updatedAtMs = Date.now();
