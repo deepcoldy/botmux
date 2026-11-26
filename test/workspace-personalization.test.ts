@@ -4,8 +4,9 @@ import { NAV_GROUPS, NAV_ITEMS } from '../src/dashboard/web/nav-items.js';
 import {
   CAPABILITY_CATALOG, CORE_NAV_IDS, DEFAULT_WORKSPACE_MODE, WORKSPACE_PERSONALIZATION_STORAGE_KEY,
   WORKSPACE_PRESETS, applyWorkspacePreset, createWorkspacePersonalizationStore, detectActivePreset, filterCatalogCapabilities,
-  filterSidebarItemsForWorkspace, loadWorkspacePersonalization, pinCapability, resolveEffectivePinnedIds,
-  saveWorkspacePersonalization, unpinCapability, type WorkspacePersonalizationState,
+  filterSidebarItemsForWorkspace, isCapabilityExplicitlyPinned, loadWorkspacePersonalization, pinCapability, resolveEffectivePinnedIds,
+  saveWorkspacePersonalization, subscribeWorkspacePersonalizationStore, unpinCapability, unpinExplicitCapability,
+  type WorkspacePersonalizationState,
 } from '../src/dashboard/web/workspace-personalization.js';
 
 const zh = createDashboardTranslator('zh');
@@ -23,6 +24,12 @@ function memoryStorage(raw?: string) {
     getItem: (key: string) => values.get(key) ?? null,
     setItem: (key: string, value: string) => { values.set(key, value); },
   };
+}
+
+type Store = ReturnType<typeof createWorkspacePersonalizationStore>;
+
+function updatePin(store: Store, id: string) {
+  return store.update(current => pinCapability(current, id), { replay: 'pin', capabilityId: id });
 }
 
 describe('workspace personalization', () => {
@@ -82,8 +89,8 @@ describe('workspace personalization', () => {
     const storage = memoryStorage();
     const first = createWorkspacePersonalizationStore(storage);
     const second = createWorkspacePersonalizationStore(storage);
-    expect(first.update(current => pinCapability(current, 'skills')).pinnedIds).toEqual(['skills']);
-    expect(second.update(current => pinCapability(current, 'monitoring')).pinnedIds).toEqual(['skills', 'monitoring']);
+    expect(updatePin(first, 'skills').pinnedIds).toEqual(['skills']);
+    expect(updatePin(second, 'monitoring').pinnedIds).toEqual(['skills', 'monitoring']);
     expect(first.read().pinnedIds).toEqual(['skills', 'monitoring']);
     expect(loadWorkspacePersonalization(storage).pinnedIds).toEqual(['skills', 'monitoring']);
   });
@@ -94,8 +101,8 @@ describe('workspace personalization', () => {
     const first = createWorkspacePersonalizationStore({ ...storage, setItem: write });
     const second = createWorkspacePersonalizationStore(storage);
 
-    expect(first.update(current => pinCapability(current, 'skills')).pinnedIds).toEqual(['skills']);
-    expect(second.update(current => pinCapability(current, 'monitoring')).pinnedIds).toEqual(['monitoring']);
+    expect(updatePin(first, 'skills').pinnedIds).toEqual(['skills']);
+    expect(updatePin(second, 'monitoring').pinnedIds).toEqual(['monitoring']);
     expect(first.read().pinnedIds).toEqual(['monitoring', 'skills']);
     first.update(current => ({ ...current, mode: 'all' }));
     expect(loadWorkspacePersonalization(storage)).toEqual(state({ mode: 'all', pinnedIds: ['monitoring', 'skills'] }));
@@ -111,12 +118,250 @@ describe('workspace personalization', () => {
     const first = createWorkspacePersonalizationStore({ getItem: read, setItem: write });
     const second = createWorkspacePersonalizationStore(storage);
 
-    second.update(current => pinCapability(current, 'monitoring'));
+    updatePin(second, 'monitoring');
     read.mockImplementationOnce(() => { throw new Error('unavailable'); });
-    expect(first.update(current => pinCapability(current, 'skills')).pinnedIds).toEqual(['skills']);
+    expect(updatePin(first, 'skills').pinnedIds).toEqual(['skills']);
     expect(write).not.toHaveBeenCalled();
     first.update(current => ({ ...current, mode: 'all' }));
     expect(loadWorkspacePersonalization(storage)).toEqual(state({ mode: 'all', pinnedIds: ['monitoring', 'skills'] }));
+  });
+
+  it('replays a failed preset over the same snapshot and flushes it after storage recovers', () => {
+    const storage = memoryStorage();
+    const write = vi.fn().mockImplementationOnce(() => { throw new Error('quota'); }).mockImplementation(storage.setItem);
+    const store = createWorkspacePersonalizationStore({ ...storage, setItem: write });
+
+    store.update(current => applyWorkspacePreset(current, 'builder'), { replay: 'same-snapshot' });
+    expect(store.read().pinnedIds).toEqual(['skills', 'customization', 'plugins', 'connectors', 'terminal']);
+    updatePin(store, 'monitoring');
+    expect(loadWorkspacePersonalization(storage)).toEqual(state({
+      mode: 'focused', pinnedIds: ['skills', 'customization', 'plugins', 'connectors', 'terminal', 'monitoring'],
+    }));
+  });
+
+  it('drops an outdated pending preset instead of overwriting another tab’s newer preset', () => {
+    const storage = memoryStorage();
+    let unavailable = true;
+    const first = createWorkspacePersonalizationStore({
+      getItem: storage.getItem,
+      setItem: (key, value) => {
+        if (unavailable) throw new Error('unavailable');
+        storage.setItem(key, value);
+      },
+    });
+    const second = createWorkspacePersonalizationStore(storage);
+
+    first.update(current => applyWorkspacePreset(current, 'builder'), { replay: 'same-snapshot' });
+    second.update(current => applyWorkspacePreset(current, 'minimal'), { replay: 'same-snapshot' });
+    expect(first.read()).toEqual(state({ mode: 'focused' }));
+
+    unavailable = false;
+    updatePin(first, 'skills');
+    expect(loadWorkspacePersonalization(storage)).toEqual(state({ mode: 'focused', pinnedIds: ['skills'] }));
+  });
+
+  it('still merges an additive pending pin into another tab’s newer preset', () => {
+    const storage = memoryStorage();
+    const write = vi.fn().mockImplementationOnce(() => { throw new Error('quota'); }).mockImplementation(storage.setItem);
+    const first = createWorkspacePersonalizationStore({ ...storage, setItem: write });
+    const second = createWorkspacePersonalizationStore(storage);
+
+    updatePin(first, 'monitoring');
+    second.update(current => applyWorkspacePreset(current, 'minimal'), { replay: 'same-snapshot' });
+    expect(first.read()).toEqual(state({ mode: 'focused', pinnedIds: ['monitoring'] }));
+    first.update(current => ({ ...current, dismissedGuideIds: ['skills'] }));
+    expect(loadWorkspacePersonalization(storage)).toEqual(state({
+      mode: 'focused', pinnedIds: ['monitoring'], dismissedGuideIds: ['skills'],
+    }));
+  });
+
+  it('lets a newer remote pin win over an older failed automatic hide', () => {
+    const storage = memoryStorage();
+    let unavailable = true;
+    const first = createWorkspacePersonalizationStore({
+      getItem: storage.getItem,
+      setItem: (key, value) => {
+        if (unavailable) throw new Error('unavailable');
+        storage.setItem(key, value);
+      },
+    });
+    const second = createWorkspacePersonalizationStore(storage);
+
+    first.update(current => unpinCapability(current, 'schedules'));
+    updatePin(second, 'schedules');
+    expect(first.read()).toEqual(state({ mode: 'focused', pinnedIds: ['schedules'] }));
+
+    unavailable = false;
+    updatePin(first, 'monitoring');
+    expect(loadWorkspacePersonalization(storage)).toEqual(state({
+      mode: 'focused', pinnedIds: ['schedules', 'monitoring'],
+    }));
+  });
+
+  it('lets a newer remote automatic hide win over an older failed pin', () => {
+    const storage = memoryStorage();
+    let unavailable = true;
+    const first = createWorkspacePersonalizationStore({
+      getItem: storage.getItem,
+      setItem: (key, value) => {
+        if (unavailable) throw new Error('unavailable');
+        storage.setItem(key, value);
+      },
+    });
+    const second = createWorkspacePersonalizationStore(storage);
+
+    updatePin(first, 'schedules');
+    second.update(current => unpinCapability(current, 'schedules'));
+    expect(first.read()).toEqual(state({ dismissedAutoIds: ['schedules'] }));
+
+    unavailable = false;
+    updatePin(first, 'monitoring');
+    expect(loadWorkspacePersonalization(storage)).toEqual(state({
+      mode: 'focused', pinnedIds: ['monitoring'], dismissedAutoIds: ['schedules'],
+    }));
+  });
+
+  it('does not replay an old explicit unpin over a newer preset', () => {
+    const storage = memoryStorage(JSON.stringify(state({ mode: 'focused', pinnedIds: ['skills'] })));
+    let unavailable = true;
+    const first = createWorkspacePersonalizationStore({
+      getItem: storage.getItem,
+      setItem: (key, value) => {
+        if (unavailable) throw new Error('unavailable');
+        storage.setItem(key, value);
+      },
+    });
+    const second = createWorkspacePersonalizationStore(storage);
+
+    first.update(current => unpinExplicitCapability(current, 'skills'));
+    second.update(current => applyWorkspacePreset(current, 'builder'));
+    expect(first.read().pinnedIds).toEqual(['skills', 'customization', 'plugins', 'connectors', 'terminal']);
+
+    unavailable = false;
+    updatePin(first, 'monitoring');
+    expect(loadWorkspacePersonalization(storage).pinnedIds).toEqual([
+      'skills', 'customization', 'plugins', 'connectors', 'terminal', 'monitoring',
+    ]);
+  });
+
+  it('merges a pending pin without overwriting a newer remote mode', () => {
+    const storage = memoryStorage(JSON.stringify(state({ mode: 'focused', pinnedIds: ['feedback'] })));
+    const write = vi.fn().mockImplementationOnce(() => { throw new Error('quota'); }).mockImplementation(storage.setItem);
+    const first = createWorkspacePersonalizationStore({ ...storage, setItem: write });
+    const second = createWorkspacePersonalizationStore(storage);
+
+    updatePin(first, 'skills');
+    second.update(current => ({ ...current, mode: 'all' }));
+    expect(first.read()).toEqual(state({ mode: 'all', pinnedIds: ['feedback', 'skills'] }));
+    expect(first.read()).toEqual(state({ mode: 'all', pinnedIds: ['feedback', 'skills'] }));
+
+    first.update(current => ({ ...current, dismissedGuideIds: ['skills'] }), { replay: 'always' });
+    expect(loadWorkspacePersonalization(storage)).toEqual(state({
+      mode: 'all', pinnedIds: ['feedback', 'skills'], dismissedGuideIds: ['skills'],
+    }));
+  });
+
+  it('does not replay a preset without a known baseline over a newer saved preset', () => {
+    const storage = memoryStorage();
+    let readable = false;
+    const write = vi.fn(storage.setItem);
+    const first = createWorkspacePersonalizationStore({
+      getItem: key => {
+        if (!readable) throw new Error('unavailable');
+        return storage.getItem(key);
+      },
+      setItem: write,
+    });
+    const second = createWorkspacePersonalizationStore(storage);
+
+    first.update(current => applyWorkspacePreset(current, 'builder'));
+    expect(write).not.toHaveBeenCalled();
+    second.update(current => applyWorkspacePreset(current, 'minimal'));
+    readable = true;
+    expect(first.read()).toEqual(state({ mode: 'focused' }));
+
+    updatePin(first, 'skills');
+    expect(loadWorkspacePersonalization(storage)).toEqual(state({ mode: 'focused', pinnedIds: ['skills'] }));
+    expect(write).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps independent pins queued before a later destructive conflict', () => {
+    const storage = memoryStorage();
+    let unavailable = true;
+    const first = createWorkspacePersonalizationStore({
+      getItem: storage.getItem,
+      setItem: (key, value) => {
+        if (unavailable) throw new Error('unavailable');
+        storage.setItem(key, value);
+      },
+    });
+    const second = createWorkspacePersonalizationStore(storage);
+
+    updatePin(first, 'monitoring');
+    first.update(current => unpinCapability(current, 'schedules'));
+    first.update(current => ({ ...current, dismissedGuideIds: [...current.dismissedGuideIds, 'skills'] }), { replay: 'always' });
+    second.update(current => ({ ...current, dismissedGuideIds: ['feedback'] }), { replay: 'always' });
+
+    expect(first.read()).toEqual(state({
+      pinnedIds: ['monitoring'], dismissedGuideIds: ['feedback', 'skills'],
+    }));
+    unavailable = false;
+    first.update(current => ({ ...current, dismissedGuideIds: [...current.dismissedGuideIds, 'workflows'] }), { replay: 'always' });
+    expect(loadWorkspacePersonalization(storage)).toEqual(state({
+      pinnedIds: ['monitoring'], dismissedGuideIds: ['feedback', 'skills', 'workflows'],
+    }));
+  });
+
+  it('re-reads on subscription to catch writes before the listener was installed', () => {
+    const storage = memoryStorage();
+    const local = createWorkspacePersonalizationStore(storage);
+    const remote = createWorkspacePersonalizationStore(storage);
+    expect(local.read()).toEqual(state());
+    remote.update(current => ({ ...current, mode: 'focused', pinnedIds: ['skills'] }));
+
+    const listeners = new Set<(event: StorageEvent) => void>();
+    const target = {
+      addEventListener: (_type: 'storage', listener: (event: StorageEvent) => void) => { listeners.add(listener); },
+      removeEventListener: (_type: 'storage', listener: (event: StorageEvent) => void) => { listeners.delete(listener); },
+    };
+    const onChange = vi.fn();
+    const unsubscribe = subscribeWorkspacePersonalizationStore(local, target, () => storage, onChange);
+    expect(onChange).toHaveBeenCalledTimes(1);
+    expect(onChange).toHaveBeenLastCalledWith(state({ mode: 'focused', pinnedIds: ['skills'] }));
+
+    const dispatch = (key: string | null, storageArea = storage as Storage) => {
+      for (const listener of listeners) listener({ key, storageArea } as StorageEvent);
+    };
+    dispatch('unrelated');
+    expect(onChange).toHaveBeenCalledTimes(1);
+    updatePin(remote, 'monitoring');
+    dispatch(WORKSPACE_PERSONALIZATION_STORAGE_KEY);
+    expect(onChange).toHaveBeenCalledTimes(2);
+    expect(onChange).toHaveBeenLastCalledWith(state({ mode: 'focused', pinnedIds: ['skills', 'monitoring'] }));
+    dispatch(null);
+    expect(onChange).toHaveBeenCalledTimes(3);
+    dispatch(WORKSPACE_PERSONALIZATION_STORAGE_KEY, {} as Storage);
+    expect(onChange).toHaveBeenCalledTimes(3);
+    unsubscribe();
+    dispatch(null);
+    expect(onChange).toHaveBeenCalledTimes(3);
+    expect(listeners).toHaveLength(0);
+
+    const denied = createWorkspacePersonalizationStore({
+      getItem: () => { throw new Error('denied'); },
+      setItem: () => { throw new Error('denied'); },
+    });
+    const deniedOnChange = vi.fn();
+    const unsubscribeDenied = subscribeWorkspacePersonalizationStore(
+      denied,
+      target,
+      () => { throw new Error('denied'); },
+      deniedOnChange,
+    );
+    expect(deniedOnChange).toHaveBeenCalledTimes(1);
+    expect(() => dispatch(WORKSPACE_PERSONALIZATION_STORAGE_KEY)).not.toThrow();
+    expect(deniedOnChange).toHaveBeenCalledTimes(1);
+    unsubscribeDenied();
   });
 
   it('keeps core, explicit, automatic and pinned plugin entries in input order', () => {
@@ -136,6 +381,23 @@ describe('workspace personalization', () => {
       expect(unpinCapability(original, id)).toBe(original);
       expect(pinCapability(original, id)).toBe(original);
     }
+  });
+
+  it('separates explicit pins from automatic visibility and keeps live auto items after explicit unpin', () => {
+    const automatic = state({ mode: 'focused' });
+    expect(isCapabilityExplicitlyPinned(automatic, 'schedules')).toBe(false);
+    expect(resolveEffectivePinnedIds(automatic, ['schedules']).has('schedules')).toBe(true);
+
+    const pinned = pinCapability(automatic, 'schedules');
+    expect(isCapabilityExplicitlyPinned(pinned, 'schedules')).toBe(true);
+    const unpinned = unpinExplicitCapability(pinned, 'schedules');
+    expect(isCapabilityExplicitlyPinned(unpinned, 'schedules')).toBe(false);
+    expect(unpinned.dismissedAutoIds).toEqual([]);
+    expect(resolveEffectivePinnedIds(unpinned, ['schedules']).has('schedules')).toBe(true);
+
+    const hidden = unpinCapability(unpinned, 'schedules');
+    expect(hidden.dismissedAutoIds).toEqual(['schedules']);
+    expect(resolveEffectivePinnedIds(hidden, ['schedules']).has('schedules')).toBe(false);
   });
 
   it('keeps an automatic entry removed across signal changes, then restores it on pin', () => {

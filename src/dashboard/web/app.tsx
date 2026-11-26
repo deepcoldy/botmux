@@ -70,19 +70,23 @@ import {
   isManageNavAllowed,
   type NavItem,
 } from './nav-items.js';
-import { FeatureCatalogModal, WorkspaceGuideBanner } from './workspace-catalog.js';
+import {
+  FeatureCatalogModal,
+  WorkspaceGuideBanner,
+  createWorkspaceCatalogActions,
+  createWorkspaceGuideActions,
+} from './workspace-catalog.js';
 import {
   CORE_NAV_IDS,
-  WORKSPACE_PERSONALIZATION_STORAGE_KEY,
   WORKSPACE_PRESETS,
-  applyWorkspacePreset,
   detectActivePreset,
   filterSidebarItemsForWorkspace,
   createWorkspacePersonalizationStore,
-  pinCapability,
+  subscribeWorkspacePersonalizationStore,
   unpinCapability,
   type WorkspaceMode,
   type WorkspacePersonalizationState,
+  type WorkspacePersonalizationUpdateOptions,
 } from './workspace-personalization.js';
 import { DECISION_BOARD_CHANGED_EVENT, boardsFromResponse } from './decision-board-model.js';
 import { TASK_ROUTING_CHANGED_EVENT } from './task-routing-model.js';
@@ -1420,19 +1424,18 @@ function DashboardShell(): React.JSX.Element {
   const paletteEnabledRef = useRef(true);
   paletteOpenRef.current = palette.open;
 
-  useEffect(() => {
-    const syncWorkspace = (event: StorageEvent) => {
-      if ((event.key === WORKSPACE_PERSONALIZATION_STORAGE_KEY || event.key === null) &&
-          event.storageArea === window.localStorage) {
-        setWorkspace(workspaceStore.read());
-      }
-    };
-    window.addEventListener('storage', syncWorkspace);
-    return () => window.removeEventListener('storage', syncWorkspace);
-  }, [workspaceStore]);
+  useEffect(() => subscribeWorkspacePersonalizationStore(
+    workspaceStore,
+    window,
+    () => window.localStorage,
+    setWorkspace,
+  ), [workspaceStore]);
 
-  const updateWorkspace = (edit: (state: WorkspacePersonalizationState) => WorkspacePersonalizationState) => {
-    setWorkspace(workspaceStore.update(edit));
+  const updateWorkspace = (
+    edit: (state: WorkspacePersonalizationState) => WorkspacePersonalizationState,
+    options?: WorkspacePersonalizationUpdateOptions,
+  ) => {
+    setWorkspace(workspaceStore.update(edit, options));
   };
   const setWorkspaceMode = (mode: WorkspaceMode) => updateWorkspace(state => ({ ...state, mode }));
 
@@ -1560,6 +1563,8 @@ function DashboardShell(): React.JSX.Element {
   if (store.schedules.size > 0) autoActiveMap.set('schedules', { active: true, count: store.schedules.size });
   if (decisionBoardNavVisible) autoActiveMap.set('decision-board', { active: true });
   if (taskRoutingNavVisible) autoActiveMap.set('task-routing', { active: true });
+  const catalogActions = createWorkspaceCatalogActions(workspace, autoActiveMap, updateWorkspace);
+  const guideActions = createWorkspaceGuideActions(updateWorkspace);
   const visibleItems = filterSidebarItemsForWorkspace(permittedItems, workspace, autoActiveMap.keys());
   const visibleById = new Map(visibleItems.map(item => [item.id, item]));
   const pinnedPlugins = visibleItems.filter(item => item.plugin);
@@ -1727,10 +1732,8 @@ function DashboardShell(): React.JSX.Element {
             <WorkspaceGuideBanner
               item={currentNavItem}
               state={workspace}
-              isPinned={currentNavItem !== undefined && visibleById.has(currentNavItem.id)}
               tr={t}
-              onPin={id => updateWorkspace(state => pinCapability(state, id))}
-              onDismiss={id => updateWorkspace(state => ({ ...state, dismissedGuideIds: [...state.dismissedGuideIds, id] }))}
+              {...guideActions}
             />
             <main id="root" ref={setRouteRoot} />
           </div>
@@ -1751,10 +1754,7 @@ function DashboardShell(): React.JSX.Element {
           tr={t}
           onClose={() => setCatalogOpen(false)}
           onMode={setWorkspaceMode}
-          onPreset={preset => updateWorkspace(state => applyWorkspacePreset(state, preset, autoActiveMap.keys()))}
-          onTogglePin={id => updateWorkspace(state => focused && visibleById.has(id)
-            ? unpinCapability(state, id)
-            : pinCapability(state, id))}
+          {...catalogActions}
           onNavigate={href => { location.hash = href; }}
         />
       )}

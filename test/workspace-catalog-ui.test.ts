@@ -3,10 +3,16 @@ import TestRenderer, { act, type ReactTestInstance, type ReactTestRenderer } fro
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createDashboardTranslator } from '../src/dashboard/web/i18n.js';
 import { NAV_ITEMS } from '../src/dashboard/web/nav-items.js';
-import { FeatureCatalogModal, WorkspaceGuideBanner, type AutoActiveInfo } from '../src/dashboard/web/workspace-catalog.js';
 import {
-  CORE_NAV_IDS, WORKSPACE_PRESETS, applyWorkspacePreset, filterSidebarItemsForWorkspace, loadWorkspacePersonalization,
-  pinCapability, resolveEffectivePinnedIds, unpinCapability, type WorkspaceMode,
+  FeatureCatalogModal,
+  WorkspaceGuideBanner,
+  createWorkspaceCatalogActions,
+  createWorkspaceGuideActions,
+  type AutoActiveInfo,
+} from '../src/dashboard/web/workspace-catalog.js';
+import {
+  CORE_NAV_IDS, WORKSPACE_PRESETS, createWorkspacePersonalizationStore, filterSidebarItemsForWorkspace,
+  loadWorkspacePersonalization, type WorkspaceMode, type WorkspacePersonalizationState,
 } from '../src/dashboard/web/workspace-personalization.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
@@ -31,19 +37,41 @@ function click(node: ReactTestInstance) {
   act(() => node.props.onClick());
 }
 
-function CatalogFixture({ authed = true, onNavigate }: { authed?: boolean; onNavigate?: (href: string) => void }) {
-  const [state, setState] = useState(defaults);
+function fixtureStore(mode: WorkspaceMode) {
+  let raw = JSON.stringify({ ...defaults(), mode });
+  return createWorkspacePersonalizationStore({
+    getItem: () => raw,
+    setItem: (_key, value) => { raw = value; },
+  });
+}
+
+function CatalogFixture({
+  authed = true,
+  onNavigate,
+  initialMode = 'all',
+  activeInfo = autoActiveInfo,
+}: {
+  authed?: boolean;
+  onNavigate?: (href: string) => void;
+  initialMode?: WorkspaceMode;
+  activeInfo?: AutoActiveInfo;
+}) {
+  const [store] = useState(() => fixtureStore(initialMode));
+  const [state, setState] = useState(store.read);
   const [open, setOpen] = useState(true);
+  const update = (
+    edit: (current: WorkspacePersonalizationState) => WorkspacePersonalizationState,
+    options?: Parameters<typeof store.update>[1],
+  ) => setState(store.update(edit, options));
+  const actions = createWorkspaceCatalogActions(state, activeInfo, update);
   const permittedItems = NAV_ITEMS.filter(item => authed || !item.manage);
-  const visible = filterSidebarItemsForWorkspace(permittedItems, state, autoActiveInfo.keys());
+  const visible = filterSidebarItemsForWorkspace(permittedItems, state, activeInfo.keys());
   if (!open) return null;
   return createElement(FeatureCatalogModal, {
-    state, permittedItems, autoActiveInfo, visibleCount: visible.length, shortcut: '⌘K', tr,
+    state, permittedItems, autoActiveInfo: activeInfo, visibleCount: visible.length, shortcut: '⌘K', tr,
     onClose: () => setOpen(false),
-    onMode: mode => setState({ ...state, mode }),
-    onPreset: preset => setState(applyWorkspacePreset(state, preset, autoActiveInfo.keys())),
-    onTogglePin: id => setState(state.mode === 'focused' && visible.some(item => item.id === id)
-      ? unpinCapability(state, id) : pinCapability(state, id)),
+    onMode: mode => update(current => ({ ...current, mode })),
+    ...actions,
     onNavigate: href => onNavigate?.(href),
   });
 }
@@ -101,6 +129,50 @@ describe('workspace capability catalog', () => {
     expect(action(card(root, 'skills'), 'toggle-pin-capability').props['aria-pressed']).toBe(true);
   });
 
+  it('offers permanent pinning and a separate hide action for an automatic entry', () => {
+    const root = mount(createElement(CatalogFixture, { initialMode: 'focused' }));
+    const schedules = card(root, 'schedules');
+    const pin = action(schedules, 'toggle-pin-capability');
+    const visibleCount = () => root.findByType(FeatureCatalogModal).props.visibleCount;
+    const initialCount = visibleCount();
+
+    expect(pin.props['aria-pressed']).toBe(false);
+    expect(schedules.findByProps({ className: 'wc-badge is-active' }).children).toEqual(['In use · 3']);
+    click(action(schedules, 'hide-auto-capability'));
+    expect(visibleCount()).toBe(initialCount - 1);
+    expect(pin.props['aria-pressed']).toBe(false);
+    expect(schedules.findAllByProps({ 'data-action': 'hide-auto-capability' })).toHaveLength(0);
+
+    click(pin);
+    expect(pin.props['aria-pressed']).toBe(true);
+    expect(visibleCount()).toBe(initialCount);
+  });
+
+  it('keeps an explicitly pinned automatic entry after its live signal disappears', () => {
+    const root = mount(createElement(CatalogFixture, { initialMode: 'focused' }));
+    const pin = action(card(root, 'schedules'), 'toggle-pin-capability');
+    expect(pin.props['aria-pressed']).toBe(false);
+    click(pin);
+    const visibleCount = () => root.findByType(FeatureCatalogModal).props.visibleCount;
+    const pinnedCount = visibleCount();
+
+    act(() => {
+      renderer!.update(createElement(CatalogFixture, { initialMode: 'focused', activeInfo: new Map() }));
+    });
+    expect(root.findByType(FeatureCatalogModal).props.autoActiveInfo.size).toBe(0);
+    expect(pin.props['aria-pressed']).toBe(true);
+    expect(visibleCount()).toBe(pinnedCount);
+    expect(card(root, 'schedules').findByProps({ className: 'wc-badge is-pinned' }).children).toEqual(['Pinned']);
+  });
+
+  it('does not mark an unpinned entry as pinned after its automatic signal has ended', () => {
+    const root = mount(createElement(CatalogFixture, { initialMode: 'focused', activeInfo: new Map() }));
+    const schedules = card(root, 'schedules');
+    expect(action(schedules, 'toggle-pin-capability').props['aria-pressed']).toBe(false);
+    expect(schedules.findAllByProps({ 'data-action': 'hide-auto-capability' })).toHaveLength(0);
+    expect(root.findByType(FeatureCatalogModal).props.visibleCount).toBe(CORE_NAV_IDS.length);
+  });
+
   it('omits management capabilities even when searched by name', () => {
     const root = mount(createElement(CatalogFixture, { authed: false }));
     expect(card(root, 'monitoring')).toBeDefined();
@@ -124,16 +196,73 @@ describe('workspace capability catalog', () => {
   });
 });
 
+describe('workspace production actions', () => {
+  it('replays a failed preset only over the same saved snapshot', () => {
+    let raw: string | null = null;
+    let unavailable = true;
+    const backing = {
+      getItem: () => raw,
+      setItem: (_key: string, value: string) => { raw = value; },
+    };
+    const first = createWorkspacePersonalizationStore({
+      getItem: backing.getItem,
+      setItem: (key: string, value: string) => {
+        if (unavailable) throw new Error('unavailable');
+        backing.setItem(key, value);
+      },
+    });
+    const second = createWorkspacePersonalizationStore(backing);
+    const updateFirst = (
+      edit: Parameters<typeof first.update>[0],
+      options?: Parameters<typeof first.update>[1],
+    ) => { first.update(edit, options); };
+    const updateSecond = (
+      edit: Parameters<typeof second.update>[0],
+      options?: Parameters<typeof second.update>[1],
+    ) => { second.update(edit, options); };
+
+    createWorkspaceCatalogActions(first.read(), autoActiveInfo, updateFirst).onPreset('builder');
+    createWorkspaceCatalogActions(second.read(), autoActiveInfo, updateSecond).onPreset('minimal');
+    expect(first.read().pinnedIds).toEqual([]);
+
+    unavailable = false;
+    createWorkspaceCatalogActions(first.read(), autoActiveInfo, updateFirst).onTogglePin('skills');
+    expect(JSON.parse(raw!)).toMatchObject({ mode: 'focused', pinnedIds: ['skills'] });
+  });
+});
+
+function useGuideFixture(mode: WorkspaceMode) {
+  const [store] = useState(() => fixtureStore(mode));
+  const [state, setState] = useState(store.read);
+  const update = (
+    edit: (current: WorkspacePersonalizationState) => WorkspacePersonalizationState,
+    options?: Parameters<typeof store.update>[1],
+  ) => setState(store.update(edit, options));
+  return { state, actions: createWorkspaceGuideActions(update) };
+}
+
 function GuideFixture({ id, mode = 'focused' }: { id: string; mode?: WorkspaceMode }) {
-  const [state, setState] = useState(() => ({ ...defaults(), mode }));
+  const { state, actions } = useGuideFixture(mode);
   return createElement(WorkspaceGuideBanner, {
     item: NAV_ITEMS.find(item => item.id === id),
     state,
-    isPinned: resolveEffectivePinnedIds(state, []).has(id),
     tr,
-    onPin: capId => setState(pinCapability(state, capId)),
-    onDismiss: capId => setState({ ...state, dismissedGuideIds: [capId] }),
+    ...actions,
   });
+}
+
+function AutomaticGuideFixture({ active }: { active: boolean }) {
+  const { state, actions } = useGuideFixture('focused');
+  const visible = filterSidebarItemsForWorkspace(NAV_ITEMS, state, active ? ['schedules'] : []);
+  return createElement('div', {},
+    createElement('span', { 'data-schedules-visible': visible.some(item => item.id === 'schedules') }),
+    createElement(WorkspaceGuideBanner, {
+      item: NAV_ITEMS.find(item => item.id === 'schedules'),
+      state,
+      tr,
+      ...actions,
+    }),
+  );
 }
 
 describe('workspace guide', () => {
@@ -145,6 +274,18 @@ describe('workspace guide', () => {
     expect(root.findByProps({ 'data-guide-id': 'monitoring' })).toBeDefined();
     click(root.findByProps({ 'aria-label': tr('workspace.guide.dismiss') }));
     expect(renderer!.toJSON()).toBeNull();
+  });
+
+  it('offers permanent pinning on an automatically visible page and survives signal removal', () => {
+    const root = mount(createElement(AutomaticGuideFixture, { active: true }));
+    expect(root.findByProps({ 'data-schedules-visible': true })).toBeDefined();
+    expect(action(root, 'pin-guide-capability')).toBeDefined();
+    click(action(root, 'pin-guide-capability'));
+    expect(root.findAllByProps({ 'data-action': 'pin-guide-capability' })).toHaveLength(0);
+
+    act(() => renderer!.update(createElement(AutomaticGuideFixture, { active: false })));
+    expect(root.findByProps({ 'data-schedules-visible': true })).toBeDefined();
+    expect(root.findAllByProps({ 'data-action': 'pin-guide-capability' })).toHaveLength(0);
   });
 
   it('allows dismissing the guide while the page is still unpinned', () => {

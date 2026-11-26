@@ -5,17 +5,57 @@ import type { NavItem } from './nav-items.js';
 import {
   CAPABILITY_CATALOG,
   WORKSPACE_PRESETS,
+  applyWorkspacePreset,
   detectActivePreset,
   filterCatalogCapabilities,
+  isCapabilityExplicitlyPinned,
   resolveEffectivePinnedIds,
+  pinCapability,
+  unpinCapability,
+  unpinExplicitCapability,
   type CapabilityCategoryId,
   type WorkspaceMode,
   type WorkspacePersonalizationState,
+  type WorkspacePersonalizationUpdater,
   type WorkspacePresetId,
 } from './workspace-personalization.js';
 
 type Translate = (key: string, params?: Record<string, string | number>) => string;
 export type AutoActiveInfo = ReadonlyMap<string, { active: true; count?: number }>;
+
+export function createWorkspaceCatalogActions(
+  state: WorkspacePersonalizationState,
+  autoActiveInfo: AutoActiveInfo,
+  update: WorkspacePersonalizationUpdater,
+) {
+  return {
+    onPreset(preset: WorkspacePresetId) {
+      update(current => applyWorkspacePreset(current, preset, autoActiveInfo.keys()), { replay: 'same-snapshot' });
+    },
+    onTogglePin(id: string) {
+      if (isCapabilityExplicitlyPinned(state, id)) {
+        update(current => unpinExplicitCapability(current, id), { replay: 'same-snapshot' });
+      } else {
+        update(current => pinCapability(current, id), { replay: 'pin', capabilityId: id });
+      }
+    },
+    onHideAuto(id: string) {
+      update(current => unpinCapability(current, id), { replay: 'same-snapshot' });
+    },
+  };
+}
+
+export function createWorkspaceGuideActions(update: WorkspacePersonalizationUpdater) {
+  return {
+    onPin(id: string) {
+      update(current => pinCapability(current, id), { replay: 'pin', capabilityId: id });
+    },
+    onDismiss(id: string) {
+      update(current => ({ ...current, dismissedGuideIds: [...current.dismissedGuideIds, id] }), { replay: 'always' });
+    },
+  };
+}
+
 
 const categories: readonly CapabilityCategoryId[] = ['automation', 'collaboration', 'extensions', 'observability'];
 
@@ -38,12 +78,13 @@ interface FeatureCatalogModalProps {
   onMode(mode: WorkspaceMode): void;
   onPreset(preset: WorkspacePresetId): void;
   onTogglePin(id: string): void;
+  onHideAuto(id: string): void;
   onNavigate(href: string): void;
 }
 
 export function FeatureCatalogModal({
   state, permittedItems, autoActiveInfo, visibleCount, shortcut, tr,
-  onClose, onMode, onPreset, onTogglePin, onNavigate,
+  onClose, onMode, onPreset, onTogglePin, onHideAuto, onNavigate,
 }: FeatureCatalogModalProps): React.JSX.Element {
   const [query, setQuery] = useState('');
   const titleId = useId();
@@ -127,7 +168,8 @@ export function FeatureCatalogModal({
                     {cards.map(cap => {
                       const item = byId.get(cap.id)!;
                       const active = autoActiveInfo.get(cap.id);
-                      const pinned = state.mode === 'focused' && effectivePins.has(cap.id);
+                      const pinned = isCapabilityExplicitlyPinned(state, cap.id);
+                      const automaticVisible = state.mode === 'focused' && active !== undefined && !pinned && effectivePins.has(cap.id);
                       return (
                         <div key={cap.id} className="wc-card" data-capability-id={cap.id}>
                           <div className="wc-card-heading">
@@ -152,11 +194,21 @@ export function FeatureCatalogModal({
                               className="wc-pin"
                               data-action="toggle-pin-capability"
                               aria-pressed={pinned}
-                              title={state.mode === 'all' ? tr('workspace.action.pinFromAll') : undefined}
+                              title={state.mode === 'all' && !pinned ? tr('workspace.action.pinFromAll') : undefined}
                               onClick={() => onTogglePin(cap.id)}
                             >
                               {tr(pinned ? 'workspace.action.pinned' : 'workspace.action.pin')}
                             </button>
+                            {automaticVisible && (
+                              <button
+                                type="button"
+                                className="wc-open wc-hide-auto"
+                                data-action="hide-auto-capability"
+                                onClick={() => onHideAuto(cap.id)}
+                              >
+                                {tr('workspace.action.hideAuto')}
+                              </button>
+                            )}
                             <button
                               type="button"
                               className="wc-open"
@@ -194,18 +246,18 @@ export function FeatureCatalogModal({
 interface WorkspaceGuideBannerProps {
   item: NavItem | undefined;
   state: WorkspacePersonalizationState;
-  isPinned: boolean;
   tr: Translate;
   onPin(id: string): void;
   onDismiss(id: string): void;
 }
 
 export function WorkspaceGuideBanner({
-  item, state, isPinned, tr, onPin, onDismiss,
+  item, state, tr, onPin, onDismiss,
 }: WorkspaceGuideBannerProps): React.JSX.Element | null {
   if (state.mode !== 'focused' || !item || item.plugin || state.dismissedGuideIds.includes(item.id)) return null;
   const cap = CAPABILITY_CATALOG.find(entry => entry.id === item.id);
   if (!cap) return null;
+  const isPinned = isCapabilityExplicitlyPinned(state, item.id);
 
   return (
     <div className="workspace-guide-banner" data-guide-id={cap.id}>

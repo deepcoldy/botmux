@@ -104,7 +104,12 @@ function defaultWorkspacePersonalization(): WorkspacePersonalizationState {
   return { mode: DEFAULT_WORKSPACE_MODE, pinnedIds: [], dismissedAutoIds: [], dismissedGuideIds: [] };
 }
 
-function readWorkspacePersonalization(storage?: WorkspaceStorage): WorkspacePersonalizationState | undefined {
+interface WorkspacePersonalizationSnapshot {
+  state: WorkspacePersonalizationState;
+  raw: string | null;
+}
+
+function readWorkspacePersonalizationSnapshot(storage?: WorkspaceStorage): WorkspacePersonalizationSnapshot | undefined {
   let raw: string | null;
   try {
     const source = storage ?? globalThis.localStorage;
@@ -120,47 +125,157 @@ function readWorkspacePersonalization(storage?: WorkspaceStorage): WorkspacePers
       (state?.mode === 'focused' || state?.mode === 'all') &&
       Array.isArray(state.pinnedIds) && Array.isArray(state.dismissedAutoIds) &&
       Array.isArray(state.dismissedGuideIds)
-    ) return normalizeState(state);
+    ) return { state: normalizeState(state), raw };
   } catch { /* Invalid JSON starts with the default preferences. */ }
-  return defaultWorkspacePersonalization();
+  return { state: defaultWorkspacePersonalization(), raw };
 }
 
 export function loadWorkspacePersonalization(storage?: WorkspaceStorage): WorkspacePersonalizationState {
-  return readWorkspacePersonalization(storage) ?? defaultWorkspacePersonalization();
+  return readWorkspacePersonalizationSnapshot(storage)?.state ?? defaultWorkspacePersonalization();
+}
+
+function serializeWorkspacePersonalization(state: WorkspacePersonalizationState): string {
+  return JSON.stringify(normalizeState(state));
 }
 
 export function saveWorkspacePersonalization(state: WorkspacePersonalizationState, storage?: WorkspaceStorage): boolean {
   try {
     const target = storage ?? globalThis.localStorage;
     if (!target) return false;
-    target.setItem(WORKSPACE_PERSONALIZATION_STORAGE_KEY, JSON.stringify(normalizeState(state)));
+    target.setItem(WORKSPACE_PERSONALIZATION_STORAGE_KEY, serializeWorkspacePersonalization(state));
     return true;
   } catch {
     return false;
   }
 }
 
+export type WorkspacePersonalizationUpdateOptions =
+  | {
+    /**
+     * `same-snapshot` (default): destructive edit; a newer saved snapshot wins.
+     * `always`: independent set-union edit, such as dismissing a guide.
+     */
+    replay?: 'always' | 'same-snapshot';
+    capabilityId?: never;
+  }
+  | {
+    /** Merge only if the other tab did not change this capability's pin/dismissal. */
+    replay: 'pin';
+    capabilityId: string;
+  };
+
+export type WorkspacePersonalizationUpdater = (
+  edit: (state: WorkspacePersonalizationState) => WorkspacePersonalizationState,
+  options?: WorkspacePersonalizationUpdateOptions,
+) => void;
+
 export function createWorkspacePersonalizationStore(storage?: WorkspaceStorage) {
   type Edit = (state: WorkspacePersonalizationState) => WorkspacePersonalizationState;
-  let current = loadWorkspacePersonalization(storage);
-  const pending: Edit[] = [];
+  type PendingEdit = {
+    edit: Edit;
+    baseRaw: string | null | undefined;
+    baseState: WorkspacePersonalizationState;
+    replay: NonNullable<WorkspacePersonalizationUpdateOptions['replay']>;
+    capabilityId?: string;
+    preserveModeOnReplay: boolean;
+  };
+  const initial = readWorkspacePersonalizationSnapshot(storage);
+  let current = initial?.state ?? defaultWorkspacePersonalization();
+  let observedRaw = initial?.raw;
+  const pending: PendingEdit[] = [];
+
+  function rebasePending(saved: WorkspacePersonalizationSnapshot): void {
+    // Edits before the first conflicting destructive operation cannot depend on its intermediate
+    // state, so keep them. Drop that operation and later state edits, but retain independent guides.
+    const firstConflict = pending.findIndex(queued =>
+      queued.replay === 'same-snapshot' && queued.baseRaw !== saved.raw
+    );
+    const replayable = pending.filter((queued, index) =>
+      queued.replay === 'always' || firstConflict === -1 || index < firstConflict
+    );
+
+    const retained: PendingEdit[] = [];
+    current = saved.state;
+    for (const queued of replayable) {
+      if (queued.replay === 'same-snapshot') {
+        current = queued.edit(current);
+      } else if (queued.replay === 'pin') {
+        const id = queued.capabilityId!;
+        if (queued.baseRaw !== saved.raw) {
+          const basePinned = queued.baseState.pinnedIds.includes(id);
+          const savedPinned = saved.state.pinnedIds.includes(id);
+          const baseDismissed = queued.baseState.dismissedAutoIds.includes(id);
+          const savedDismissed = saved.state.dismissedAutoIds.includes(id);
+          // A newer pin/unpin/hide of the same capability wins over this older pending pin.
+          if (basePinned !== savedPinned || baseDismissed !== savedDismissed) continue;
+          queued.preserveModeOnReplay = true;
+        }
+        const rebasedMode = current.mode;
+        current = queued.edit(current);
+        if (queued.preserveModeOnReplay) current = { ...current, mode: rebasedMode };
+      } else {
+        current = queued.edit(current);
+      }
+      retained.push({ ...queued, baseRaw: saved.raw, baseState: saved.state });
+    }
+    pending.splice(0, pending.length, ...retained);
+    observedRaw = saved.raw;
+  }
 
   return {
     read(): WorkspacePersonalizationState {
-      const saved = readWorkspacePersonalization(storage);
-      if (saved) current = pending.reduce((state, edit) => edit(state), saved);
+      const saved = readWorkspacePersonalizationSnapshot(storage);
+      if (saved) rebasePending(saved);
       return current;
     },
-    update(edit: Edit): WorkspacePersonalizationState {
+    update(edit: Edit, options: WorkspacePersonalizationUpdateOptions = {}): WorkspacePersonalizationState {
       // A different tab may have written newer preferences before its storage event arrives.
-      const saved = readWorkspacePersonalization(storage);
-      const base = saved ? pending.reduce((state, queuedEdit) => queuedEdit(state), saved) : current;
-      current = edit(base);
-      if (saved && saveWorkspacePersonalization(current, storage)) pending.length = 0;
-      else pending.push(edit);
+      const saved = readWorkspacePersonalizationSnapshot(storage);
+      if (saved) rebasePending(saved);
+      const baseState = current;
+      current = edit(current);
+      if (saved && saveWorkspacePersonalization(current, storage)) {
+        pending.length = 0;
+        observedRaw = serializeWorkspacePersonalization(current);
+      } else {
+        pending.push({
+          edit,
+          baseRaw: saved ? saved.raw : observedRaw,
+          baseState,
+          replay: options.replay ?? 'same-snapshot',
+          capabilityId: options.capabilityId,
+          preserveModeOnReplay: false,
+        });
+      }
       return current;
     },
   };
+}
+
+interface WorkspaceStorageEventTarget {
+  addEventListener(type: 'storage', listener: (event: StorageEvent) => void): void;
+  removeEventListener(type: 'storage', listener: (event: StorageEvent) => void): void;
+}
+
+export function subscribeWorkspacePersonalizationStore(
+  store: ReturnType<typeof createWorkspacePersonalizationStore>,
+  target: WorkspaceStorageEventTarget,
+  getStorageArea: () => WorkspaceStorage,
+  onChange: (state: WorkspacePersonalizationState) => void,
+): () => void {
+  const sync = (event: StorageEvent) => {
+    if (event.key !== WORKSPACE_PERSONALIZATION_STORAGE_KEY && event.key !== null) return;
+    try {
+      if (event.storageArea !== getStorageArea()) return;
+    } catch {
+      return;
+    }
+    onChange(store.read());
+  };
+  target.addEventListener('storage', sync);
+  // Close the initial-render → passive-subscription gap: a write in that window has no listener.
+  onChange(store.read());
+  return () => target.removeEventListener('storage', sync);
 }
 
 export function resolveEffectivePinnedIds(
@@ -178,6 +293,10 @@ export function filterSidebarItemsForWorkspace<T extends { id: string; plugin?: 
   return items.filter(item => item.plugin === true || CORE_NAV_IDS.includes(item.id) || effectivePins.has(item.id));
 }
 
+export function isCapabilityExplicitlyPinned(state: WorkspacePersonalizationState, id: string): boolean {
+  return state.pinnedIds.includes(id);
+}
+
 export function pinCapability(state: WorkspacePersonalizationState, id: string): WorkspacePersonalizationState {
   if (!capabilityIds.has(id)) return state;
   return {
@@ -188,15 +307,17 @@ export function pinCapability(state: WorkspacePersonalizationState, id: string):
   };
 }
 
-export function unpinCapability(state: WorkspacePersonalizationState, id: string): WorkspacePersonalizationState {
+/** Toggle only the permanent preference; an active automatic entry remains visible after unpinning. */
+export function unpinExplicitCapability(state: WorkspacePersonalizationState, id: string): WorkspacePersonalizationState {
   if (!capabilityIds.has(id)) return state;
-  return {
-    ...state,
-    pinnedIds: state.pinnedIds.filter(entry => entry !== id),
-    dismissedAutoIds: autoCapabilityIds.has(id)
-      ? [...new Set([...state.dismissedAutoIds, id])]
-      : state.dismissedAutoIds,
-  };
+  return { ...state, pinnedIds: state.pinnedIds.filter(entry => entry !== id) };
+}
+
+/** Remove a capability from the focused sidebar, including its future automatic visibility. */
+export function unpinCapability(state: WorkspacePersonalizationState, id: string): WorkspacePersonalizationState {
+  const next = unpinExplicitCapability(state, id);
+  if (next === state || !autoCapabilityIds.has(id)) return next;
+  return { ...next, dismissedAutoIds: [...new Set([...state.dismissedAutoIds, id])] };
 }
 
 export function applyWorkspacePreset(
