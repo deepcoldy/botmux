@@ -497,9 +497,11 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       return discoverRolloutSessions(codexSessionsRoot(), limit, exclude);
     },
 
+    writeInputDefersPreparation: true,
+
     async writeInput(pty: PtyHandle, content: string, context?: WriteInputContext) {
       const blocked = await prepareCodexTranscriptInput(pty);
-      if (blocked) return { submitted: false, failureReason: blocked };
+      if (blocked) return { submitted: false, submissionDisposition: 'untouched', failureReason: blocked };
       const terminalSession = await refreshCodexTerminalSession(pty);
       // Paste frame and Enter go out back to back: no timer window in which a
       // human can submit/replace the draft or open backtrack before a delayed
@@ -533,6 +535,13 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
         && !expectedRemoteSid && (!initialOwned || initialOwned.size === 0);
       if (correlated) content += `\n\n<botmux_routing>\nbotmux_input_id: ${randomBytes(16).toString('hex')}\n</botmux_routing>`;
       context?.onInputPrepared?.(content);
+      if (context?.beforeSubmit?.() === false) {
+        return {
+          submitted: false,
+          submissionDisposition: 'untouched',
+          failureReason: 'Codex CLI generation changed before submission',
+        };
+      }
       const acceptSid: HistorySidFilter | undefined = expectedRemoteSid
         ? (sid) => !!sid && sid.toLowerCase() === expectedRemoteSid.toLowerCase()
         : cliPid
@@ -602,7 +611,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     // 0.166+ first paints a provisional `›` with no footer and only later the
     // initialized composer; writeInput refuses anything but the latter, or a
     // transcript pager it closes first.
-    inputBoxReady: state => codexNativeComposerState(state) === 'empty'
+    inputBoxReady: state => codexNativeComposerState(state, { allowCodex0146Hints: true }) === 'empty'
       || codexTranscriptCloseable(state.viewport),
     settleInputBox: settleCodexInputBox,
     startupResume: {
