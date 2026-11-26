@@ -423,7 +423,7 @@ export function createProjectWorkstreamAttachments(deps: ProjectWorkstreamAttach
       authorizeActor(actor);
       const project = authorizeActor(actor);
       return { cardSynced: true, project: await deps.projectRun(
-        context(actor, deps.dataDir), { action: 'refresh' }, actorCommitGuard(actor, project.createdAt),
+        context(actor, deps.dataDir), { action: 'refresh', repostOnExpired: true }, actorCommitGuard(actor, project.createdAt),
       ) };
     } catch (error) {
       return { cardSynced: false, error: error instanceof Error ? error.message : String(error) };
@@ -848,16 +848,17 @@ export function createProjectWorkstreamAttachments(deps: ProjectWorkstreamAttach
     /** A source daemon observed an existing source leave/close/change lifetime.
      * This method may only DOWNGRADE an existing association. It cannot claim a
      * new source, revive a moved attachment or change coordinator authority. */
-    async observe(source: ProjectAttachmentSource): Promise<void> {
-      if (!id(source.sessionId) || !id(source.larkAppId, 'cli_')) return;
+    async observe(source: ProjectAttachmentSource): Promise<string[]> {
+      if (!id(source.sessionId) || !id(source.larkAppId, 'cli_')) return [];
       let files: string[];
       try {
         if (lstatSync(journalDir(deps.dataDir)).isSymbolicLink()) fail('unsafe_attachment_directory');
         files = readdirSync(journalDir(deps.dataDir)).filter(file => /^[a-f0-9]{64}\.json$/u.test(file)).slice(0, 512);
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
         throw error;
       }
+      const projectChats = new Set<string>();
       for (const file of files) {
         const candidate = readRecord(join(journalDir(deps.dataDir), file));
         if (!candidate
@@ -891,15 +892,13 @@ export function createProjectWorkstreamAttachments(deps: ProjectWorkstreamAttach
           }
           const mode = deps.getMode(record.chatId);
           if (mode?.mode === 'project' && mode.coordinatorAppId === record.coordinatorLarkAppId) {
-            try {
-              await deps.projectRun({
-                dataDir: deps.dataDir, chatId: record.chatId,
-                larkAppId: record.coordinatorLarkAppId, coordinatorSessionId: record.coordinatorSessionId,
-              }, { action: 'refresh' });
-            } catch { /* Only the view failed; status/reconcile can repair it. */ }
+            projectChats.add(record.chatId);
           }
         });
       }
+      // The daemon feeds these groups into runtime sync so association events
+      // share the same PATCH budget as task events and periodic ticks.
+      return [...projectChats];
     },
   };
 }

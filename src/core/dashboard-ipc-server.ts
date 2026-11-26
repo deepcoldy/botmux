@@ -6689,7 +6689,7 @@ ipcRoute('POST', '/api/project-groups/:chatId/refresh-card', async (_req, res, p
       chatId,
       larkAppId: cachedLarkAppId,
       coordinatorSessionId: project.coordinatorSessionId,
-    }, { action: 'refresh' });
+    }, { action: 'refresh', repostOnExpired: true });
     return jsonRes(res, 200, { ok: true, project: refreshed });
   } catch (error) {
     return jsonRes(res, 502, {

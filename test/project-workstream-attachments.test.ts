@@ -306,7 +306,9 @@ describe('project workstream attachments', () => {
     expect(readProjectAttachmentRecord(f.dataDir, 'om_topic')?.state).toBe('active');
     f.source().rootMessageId = 'om_other';
     f.source().routeRevision = 2;
-    await f.service.observe(structuredClone(f.source()));
+    f.projectRun.mockClear();
+    expect(await f.service.observe(structuredClone(f.source()))).toEqual(['oc_group']);
+    expect(f.projectRun).not.toHaveBeenCalled();
     expect(readProjectAttachmentRecord(f.dataDir, 'om_topic')?.state).toBe('moved');
     expect(f.registry().om_topic.lastReport.status).toBe('completed');
     expect(readProjectGroup(f.dataDir, 'oc_group')?.workstreams[0]?.status).toBe('completed');

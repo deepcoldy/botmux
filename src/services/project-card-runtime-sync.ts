@@ -1,16 +1,17 @@
 import { buildProjectGroupCardDigest, type ProjectGroupCardRuntime } from '../im/lark/project-group-card.js';
 import type { GroupCollaborationModeConfig } from './group-collaboration-mode-store.js';
+import type { ProjectCardPublication, ProjectCardSyncTarget } from './project-coordinator.js';
 import type { ProjectGroupState } from './project-group-store.js';
 
 const CHAT_ID_RE = /^oc_[A-Za-z0-9_-]{1,128}$/;
 const APP_ID_OWNER_RE = /^cli_[A-Za-z0-9_-]{1,128}$/u;
 
 /**
- * 同一份卡片摘要连续刷新失败到这个次数就停手，等摘要变化（会话状态变了、项目有新写入）再试。
- * 飞书卡片过了 14 天编辑窗口（230031）、主控 Bot 被移出群这类失败不会自己恢复；不设上限时，
- * 每个 30 秒 tick 都会对同一张卡重打一遍飞书接口，永远停不下来。3 次约覆盖 1.5 分钟的瞬时故障。
+ * 同一份卡片摘要最多连续刷新 3 次，约覆盖 1.5 分钟的瞬时故障。预算耗尽后停止 PATCH。
+ * 如果最后一次是飞书编辑窗口过期（230031），后台可尝试重发，每个摘要一次、每群间隔至少 10 分钟。
  */
 export const PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST = 3;
+const PROJECT_CARD_REPOST_COOLDOWN_MS = 10 * 60_000;
 
 export interface ProjectCardRuntimeSyncDeps {
   /** 本 daemon 的 Bot；只刷新它当主控的项目卡。 */
@@ -18,7 +19,10 @@ export interface ProjectCardRuntimeSyncDeps {
   listProjects(): ProjectGroupState[];
   readMode(chatId: string): GroupCollaborationModeConfig | undefined;
   resolveRuntime(project: ProjectGroupState): Promise<ProjectGroupCardRuntime | undefined>;
-  refresh(project: ProjectGroupState): Promise<ProjectGroupState>;
+  /** Undefined if the queued publication no longer matches the target. */
+  refresh(project: ProjectGroupState, target: ProjectCardSyncTarget): Promise<ProjectCardPublication | undefined>;
+  isMessageUpdateExpired(error: unknown): boolean;
+  repostExpiredCard(project: ProjectGroupState, target: ProjectCardSyncTarget): Promise<ProjectCardPublication | undefined>;
   /** 主控在本机别的 daemon 上：只把群 ID 转过去，由主控自己重读状态。 */
   forwardToCoordinator(coordinatorAppId: string, chatId: string): void;
   onDeferred?(chatId: string, error: unknown): void;
@@ -37,11 +41,77 @@ function hasDynamicWorkstreams(project: ProjectGroupState): boolean {
 
 /**
  * 主控置顶卡的运行态刷新：会话状态变化事件、迁入关联变化与 30 秒兜底 tick 都走这里。
- * 只在卡片摘要变化时调飞书；同一摘要失败有上限（见 PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST）。
+ * 同群刷新串行。摘要变化时重新计数，过期重发与 PATCH 分开限频。
  */
 export function createProjectCardRuntimeSync(deps: ProjectCardRuntimeSyncDeps): ProjectCardRuntimeSync {
-  const published = new Map<string, { digest: string; failures: number }>();
+  const published = new Map<string, {
+    digest: string; messageId?: string; failures: number; awaitingRepost?: boolean;
+  }>();
+  const reposts = new Map<string, { revision: number; cooldownUntil: number; digests: Set<string> }>();
+  const syncing = new Set<string>();
   const pending = new Map<string, ReturnType<typeof setTimeout>>();
+
+  async function syncProject(project: ProjectGroupState, messageId: string): Promise<void> {
+    const { chatId } = project;
+    const mode = deps.readMode(chatId);
+    if (mode?.mode !== 'project' || mode.coordinatorAppId !== deps.larkAppId) return;
+    if (!hasDynamicWorkstreams(project)) return;
+    const runtime = await deps.resolveRuntime(project);
+    const digest = buildProjectGroupCardDigest(project, runtime);
+    const target = { messageId, digest };
+    const cached = published.get(chatId);
+    const last = cached?.digest === digest && cached.messageId === messageId ? cached : undefined;
+    if (last?.failures === 0) return;
+
+    function rememberPublished(result: ProjectCardPublication): void {
+      published.set(chatId, {
+        digest: result.digest,
+        messageId: result.project.card?.messageId,
+        failures: 0,
+      });
+    }
+
+    let failures = last?.failures ?? 0;
+    if (failures < PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST) {
+      try {
+        const updated = await deps.refresh(project, target);
+        if (updated) rememberPublished(updated);
+        return;
+      } catch (error) {
+        failures += 1;
+        const awaitingRepost = failures === PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST && deps.isMessageUpdateExpired(error);
+        published.set(chatId, { digest, messageId, failures, awaitingRepost });
+        deps.onDeferred?.(chatId, error);
+        if (!awaitingRepost) return;
+      }
+    } else if (!last?.awaitingRepost) {
+      return;
+    }
+
+    const previous = reposts.get(chatId);
+    if (previous && Date.now() < previous.cooldownUntil) return;
+    // The digest includes the monotonically increasing project revision. Keep
+    // attempts across runtime changes at this revision, not old revisions.
+    const digests = previous?.revision === project.revision ? previous.digests : new Set<string>();
+    if (digests.has(digest)) return;
+    function rememberAttempt(): void {
+      digests.add(digest);
+      reposts.set(chatId, {
+        revision: project.revision, cooldownUntil: Date.now() + PROJECT_CARD_REPOST_COOLDOWN_MS, digests,
+      });
+    }
+    try {
+      const updated = await deps.repostExpiredCard(project, target);
+      if (updated) {
+        rememberAttempt();
+        rememberPublished(updated);
+      }
+    } catch (error) {
+      rememberAttempt();
+      published.set(chatId, { digest, messageId, failures: failures + 1 });
+      deps.onDeferred?.(chatId, error);
+    }
+  }
 
   async function sync(filterChatId?: string): Promise<void> {
     let projects: ProjectGroupState[];
@@ -51,31 +121,17 @@ export function createProjectCardRuntimeSync(deps: ProjectCardRuntimeSyncDeps): 
       return;
     }
     for (const project of projects) {
-      if (project.larkAppId !== deps.larkAppId || !project.card?.messageId) continue;
-      if (filterChatId && project.chatId !== filterChatId) continue;
+      const { chatId } = project;
+      const messageId = project.card?.messageId;
+      if (project.larkAppId !== deps.larkAppId || !messageId) continue;
+      if ((filterChatId && chatId !== filterChatId) || syncing.has(chatId)) continue;
+      syncing.add(chatId);
       try {
-        const mode = deps.readMode(project.chatId);
-        if (mode?.mode !== 'project' || mode.coordinatorAppId !== deps.larkAppId) continue;
-        if (!hasDynamicWorkstreams(project)) continue;
-        const digest = buildProjectGroupCardDigest(project, await deps.resolveRuntime(project));
-        const last = published.get(project.chatId);
-        const failures = last?.digest === digest ? last.failures : 0;
-        if (last?.digest === digest
-          && (failures === 0 || failures >= PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST)) continue;
-        // 先占位：同一摘要的并发同步看到它就跳过。
-        published.set(project.chatId, { digest, failures: 0 });
-        try {
-          const refreshed = await deps.refresh(project);
-          published.set(project.chatId, {
-            digest: buildProjectGroupCardDigest(refreshed, await deps.resolveRuntime(refreshed)),
-            failures: 0,
-          });
-        } catch (error) {
-          published.set(project.chatId, { digest, failures: failures + 1 });
-          deps.onDeferred?.(project.chatId, error);
-        }
+        await syncProject(project, messageId);
       } catch (error) {
-        deps.onDeferred?.(project.chatId, error);
+        deps.onDeferred?.(chatId, error);
+      } finally {
+        syncing.delete(chatId);
       }
     }
   }
