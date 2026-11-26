@@ -194,6 +194,7 @@ export const messages: Record<string, string> = {
   'worker.rate_limit_notify.usage': '⚠️ {cliName} hit its usage limit — this turn is paused. Once the quota resets ({retryLabel}), resend the last task or send a new message to continue.',
   'worker.agy_rotate.switching': '🔄 Antigravity account {fromAccount} hit its quota limit. Rotated to {toAccount}; restarting the session and retrying this turn…',
   'worker.agy_rotate.switching_no_replay': '🔄 Antigravity account {fromAccount} hit its quota limit. Rotated to {toAccount}; restarting the session…',
+  'worker.agy_rotate.replay_started': '🔄 Switched to Antigravity account {toAccount} and restarted the session. Verified no side effects occurred; automatically retrying this turn…',
   'worker.agy_rotate.exhausted': '⚠️ All hosted Antigravity accounts are currently in quota cooldown ({count} enabled). Earliest estimated recovery: {recovery}.',
   'worker.agy_rotate.exhausted_no_eta': '⚠️ All hosted Antigravity accounts are currently in quota cooldown ({count} enabled); automatic rotation paused.',
   'worker.agy_rotate.turn_budget_exhausted': '⚠️ Reached the per-turn Antigravity automatic account rotation limit; stopping further retries.',

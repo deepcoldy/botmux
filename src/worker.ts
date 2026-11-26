@@ -540,8 +540,10 @@ import { baselineCursorTranscript, drainCursorTranscript, findCursorChatIdByPid,
 import { startCursorCot, stopAllCursorCot, type CursorCotEntry } from './services/cursor-cot.js';
 import { startAntigravityCot, stopAntigravityCot, stopAllAntigravityCot } from './services/antigravity-cot.js';
 import { KimiActivityObserver } from './services/kimi-cot.js';
-import { findAntigravityConversationIdByPid } from './services/antigravity-discovery.js';
+import { findAntigravityConversationIdByPid, findAttestedAntigravityConversationId } from './services/antigravity-discovery.js';
 import { AntigravitySessionLog } from './services/antigravity-session-fork.js';
+import { AntigravityNativeQuotaLog, currentAntigravityNativeQuota, type AntigravityNativeQuotaRefusal } from './services/antigravity-native-quota.js';
+import { createAntigravityQuotaStateMachine } from './services/antigravity-quota-state.js';
 import { antigravityTransport, verifyAntigravityTransport } from './services/antigravity-transport.js';
 import {
   inspectAntigravityAccounts,
@@ -550,8 +552,10 @@ import {
   type AntigravityAccountStoreOptions,
   type ReconcileAntigravityTokenResult,
 } from './services/antigravity-accounts.js';
-import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, hasAntigravitySideQuestionComposer, isAntigravityInterruptedScreen, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen, parseAntigravityFooterBackgroundTasks, rememberAntigravityQuota } from './adapters/cli/antigravity.js';
+import { hasAntigravitySideQuestionComposer, isAntigravityInterruptedScreen, isAntigravityReadyComposerScreen, parseAntigravityFooterBackgroundTasks, supportsAntigravityReadyFooterQuota } from './adapters/cli/antigravity.js';
 import {
+  antigravityTurnAnsweredInTranscript,
+  antigravityTurnFailedWithoutOutput,
   countAntigravityUserInputMatches,
   hashAntigravitySubmittedText,
   isSameAntigravityConversation,
@@ -559,7 +563,7 @@ import {
   hasAntigravityPendingTasks,
   hasAntigravityTranscriptPendingTasks,
   drainAntigravityTranscript,
-  findCompletedAntigravityTurnIds,
+  findCompletedAntigravityTurnIdsPaired,
   readAntigravitySideAnswer,
   resolveAntigravityCandidateMinByteOffset,
   resolveAntigravityTranscriptPath,
@@ -872,7 +876,19 @@ import {
   type HerdrWebScrollDirection,
 } from './utils/herdr-web-history.js';
 import { parseWorkerRequestUrl } from './utils/worker-http.js';
-import { structuredRateLimitState, structuredCodexLimitState, isStructuredRateLimitAuthoritative, reconcileUsageLimitState, type CliUsageLimitState } from './utils/cli-usage-limit.js';
+import {
+  cliUsageLimitEpisodeKey,
+  isAntigravityNativeLimit,
+  isStructuredRateLimitAuthoritative,
+  isTransientRateLimit,
+  reconcileUsageLimitState,
+  screenshotUsageLimitDedupSuffix,
+  structuredCodexLimitState,
+  structuredRateLimitState,
+  usageLimitEvidenceKey,
+  type AntigravityTranscriptWriteBoundary,
+  type CliUsageLimitState,
+} from './utils/cli-usage-limit.js';
 import { CodexSubagentLimitTracker } from './services/codex-subagent-limit-tracker.js';
 import { bridgeTurnOutcome, createUsageLimitTracker } from './utils/usage-limit-tracker.js';
 import { uploadImageBuffer } from './utils/lark-upload.js';
@@ -5078,6 +5094,12 @@ function noteWebTerminalInput(data: string, submits = terminalInputSubmits(data)
   if (submits) {
     lastWebTerminalSubmitAtMs = lastWebTerminalInputAtMs;
     webTerminalSubmitGeneration++;
+    // Direct Web Terminal submission begins a new user turn: clear any pinned
+    // transient 429 cooldown and refresh usageLimitTracker's answered/stale
+    // banner baseline so a genuine 429 on this direct turn is never swallowed.
+    activeTransientRateLimit = undefined;
+    lastUsageLimitCaptureTurn = undefined;
+    usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
     // Attribution only, never the input bytes: daemon-side idle maintenance
     // must distinguish a person's direct submit from local-command repaints.
     // Attribution is best-effort only: an IPC failure must never block the
@@ -6917,6 +6939,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
         // is the same point flushPending applies it for a queued message. Without
         // this, a cleared or rotated JWT did not take effect on these turns.
         applyMojoLivePatch(msg.mojoLivePatch);
+        rawInputWriteGeneration += 1;
         renderer?.markNewTurn();
         usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
         if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
@@ -8506,6 +8529,7 @@ function releaseActiveTurnAuthority(
     && backgroundAuthorityHold.holds(currentActive.turnId, currentActive.dispatchAttempt, Date.now())) {
     return false;
   }
+  cancelAntigravityFoldedReconcilePending();
   const released = exact
     ? activeTurnAuthority.releaseExact(exact)
     : activeTurnAuthority.clear();
@@ -9409,17 +9433,68 @@ function advanceQueuedTypeAheadTurn(reason: string): boolean {
   markActiveTurnStarted(next);
   writeCliPidMarker();
   publishSandboxRelayCapability();
+  cancelAntigravityFoldedReconcilePending();
   log(`Advanced active turn (${reason}): ${prevTurnId?.slice(0, 12)} -> ${currentBotmuxTurnId?.slice(0, 12)} (remaining queued: ${queuedTypeAheadTurns.length})`);
   return true;
 }
 
+interface AntigravityFoldedReconcileResult {
+  reconciled: boolean;
+  pendingSibling: boolean;
+  transcriptPath?: string;
+  completedCurrentTurn: boolean;
+  candidateIds: Set<string>;
+}
+
+interface AntigravityFoldedReconcilePending {
+  cliSpawnGeneration: number;
+  ptyOutputGeneration: number;
+  webTerminalInputGeneration: number;
+  currentTurnId: string | undefined;
+  currentDispatchAttempt: number | undefined;
+  promotedTurnId: string | undefined;
+  transcriptPath: string;
+  startedAtMs: number;
+  attempts: number;
+  watchWakeups: number;
+  delayMs: number;
+  timer?: ReturnType<typeof setTimeout>;
+  coalesceTimer?: ReturnType<typeof setTimeout>;
+  watcher?: FSWatcher;
+}
+
+const ANTIGRAVITY_FOLDED_RECONCILE_INITIAL_DELAY_MS = 50;
+const ANTIGRAVITY_FOLDED_RECONCILE_MAX_DELAY_MS = 1_000;
+const ANTIGRAVITY_FOLDED_RECONCILE_MAX_ATTEMPTS = 20;
+const ANTIGRAVITY_FOLDED_RECONCILE_MAX_WATCH_WAKEUPS = 50;
+const ANTIGRAVITY_FOLDED_RECONCILE_MAX_WINDOW_MS = 15_000;
+let antigravityFoldedReconcilePending: AntigravityFoldedReconcilePending | undefined;
+
+function cancelAntigravityFoldedReconcilePending(): void {
+  const pending = antigravityFoldedReconcilePending;
+  if (!pending) return;
+  antigravityFoldedReconcilePending = undefined;
+  if (pending.timer) clearTimeout(pending.timer);
+  if (pending.coalesceTimer) clearTimeout(pending.coalesceTimer);
+  try { pending.watcher?.close(); } catch { /* ignore */ }
+}
+
 /** Antigravity 常规模式不经 transcript bridge 逐轮发 turn_terminal；多条 type-ahead 消息会被折叠进同一次运行。
- *  在 prompt_ready 结算前，凭原生 transcript 中“已消费且后接完成态无工具 PLANNER_RESPONSE、且当前非忙碌”的精确证据，
- *  回收已结束的非 durable 候选回合，避免迟读磁盘 marker 或队列推进重新占用已空闲 CLI 的 activeTurnAuthority。 */
-function reconcileCompletedAntigravityTurnsAtPromptReady(): boolean {
-  if (lastInitConfig?.cliId !== 'antigravity' || isRemoteBackendType(effectiveBackendType)) return false;
+ *  在 prompt_ready 结算前，凭原生 full+compact 双 transcript 单次 stat-bounded 配对快照中
+ *  “已消费且后接完成态无工具 PLANNER_RESPONSE、且当前非忙碌”的精确证据，
+ *  回收已结束的非 durable 候选回合；若某侧 sibling 暂缺或尾行未写完，返回 pendingSibling=true 供后续自愈。 */
+function reconcileCompletedAntigravityTurnsAtPromptReady(
+  overridePromotedTurnId?: string,
+): AntigravityFoldedReconcileResult {
+  const empty: AntigravityFoldedReconcileResult = {
+    reconciled: false,
+    pendingSibling: false,
+    completedCurrentTurn: false,
+    candidateIds: new Set(),
+  };
+  if (lastInitConfig?.cliId !== 'antigravity' || isRemoteBackendType(effectiveBackendType)) return empty;
   const cliSessionId = inputDeliveryObservedCliSessionId ?? lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId;
-  if (!cliSessionId) return false;
+  if (!cliSessionId) return empty;
 
   const diskTurnHeads: Array<{ turnId: string; dispatchAttempt?: number }> = [];
   const diskQueuedTurns: Array<{ turnId: string; dispatchAttempt?: number }> = [];
@@ -9461,21 +9536,28 @@ function reconcileCompletedAntigravityTurnsAtPromptReady(): boolean {
   if (
     queuedTypeAheadTurns.length === 0
     && !queuedTurnAdvanceConsumedForPrompt
+    && !overridePromotedTurnId
     && !hasDiskDiff
     && diskQueuedTurns.length === 0
   ) {
-    return false;
+    return empty;
   }
 
   const transcriptPath = resolveAntigravityTranscriptPath(cliSessionId);
-  if (!transcriptPath) return false;
+  if (!transcriptPath) return empty;
 
   const candidateIds = new Set<string>();
   for (const queued of queuedTypeAheadTurns) {
     if (queued.dispatchAttempt === undefined) candidateIds.add(queued.turnId);
   }
-  const promotedCandidateId = queuedTurnAdvanceConsumedForPrompt?.promotedTurnId ?? currentBotmuxTurnId;
-  if (queuedTurnAdvanceConsumedForPrompt && promotedCandidateId && currentBotmuxDispatchAttempt === undefined) {
+  const promotedCandidateId = overridePromotedTurnId
+    ?? queuedTurnAdvanceConsumedForPrompt?.promotedTurnId
+    ?? currentBotmuxTurnId;
+  if (
+    (queuedTurnAdvanceConsumedForPrompt || overridePromotedTurnId)
+    && promotedCandidateId
+    && currentBotmuxDispatchAttempt === undefined
+  ) {
     candidateIds.add(promotedCandidateId);
   }
   for (const head of diskTurnHeads) {
@@ -9486,7 +9568,7 @@ function reconcileCompletedAntigravityTurnsAtPromptReady(): boolean {
   for (const qt of diskQueuedTurns) {
     if (qt.dispatchAttempt === undefined) candidateIds.add(qt.turnId);
   }
-  if (candidateIds.size === 0) return false;
+  if (candidateIds.size === 0) return empty;
 
   const candidates: AntigravityCompletedTurnCandidate[] = [...candidateIds].map(turnId => {
     const remembered = recentSubmittedTurnTexts.get(turnId);
@@ -9502,8 +9584,17 @@ function reconcileCompletedAntigravityTurnsAtPromptReady(): boolean {
       ...(hint?.skipPriorMatches !== undefined && hint.skipPriorMatches > 0 ? { skipPriorMatches: hint.skipPriorMatches } : {}),
     };
   });
-  const completed = findCompletedAntigravityTurnIds(transcriptPath, candidates);
-  if (completed.size === 0) return false;
+  const paired = findCompletedAntigravityTurnIdsPaired(transcriptPath, candidates);
+  const completed = paired.completed;
+  if (completed.size === 0) {
+    return {
+      reconciled: false,
+      pendingSibling: paired.pendingSibling,
+      transcriptPath,
+      completedCurrentTurn: false,
+      candidateIds,
+    };
+  }
 
   const hasLiveDurableSibling = (turnId: string): boolean => (
     (currentBotmuxTurnId === turnId && currentBotmuxDispatchAttempt !== undefined)
@@ -9531,23 +9622,245 @@ function reconcileCompletedAntigravityTurnsAtPromptReady(): boolean {
     }
   }
 
+  let completedCurrentTurn = false;
   if (
-    queuedTurnAdvanceConsumedForPrompt
-    && promotedCandidateId
+    promotedCandidateId
     && currentBotmuxTurnId === promotedCandidateId
     && currentBotmuxDispatchAttempt === undefined
+    && !hasLiveDurableSibling(promotedCandidateId)
     && completed.has(promotedCandidateId)
   ) {
+    completedCurrentTurn = true;
     queuedTurnAdvanceConsumedForPrompt = undefined;
     if (!reconciled.includes(promotedCandidateId)) reconciled.push(promotedCandidateId);
+    // Only retire the current native-log refusal when no later uncompleted turn
+    // exists AND the latest written CLI input itself is proven completed — never
+    // let reconciling an earlier folded turn om_B retire a type-ahead om_C 429.
+    const hasUncompletedQueuedTurn = queuedTypeAheadTurns.length > 0
+      || diskQueuedTurns.some(q => !completed.has(q.turnId));
+    const latestWritten = typeof lastWrittenCliInput !== 'undefined' ? lastWrittenCliInput : undefined;
+    const latestWrittenCompleted = latestWritten?.turnId !== undefined
+      ? (latestWritten.turnId === promotedCandidateId || completed.has(latestWritten.turnId))
+      : false;
+    if (
+      !hasUncompletedQueuedTurn
+      && latestWrittenCompleted
+      && typeof antigravityQuotaState !== 'undefined'
+      && typeof readAntigravityNativeQuota === 'function'
+    ) {
+      antigravityQuotaState.noteTurnAnswered(readAntigravityNativeQuota());
+    }
   }
 
   if (reconciled.length > 0) {
     log(`Reconciled completed Antigravity folded turn(s) at prompt_ready: ${reconciled.map(id => id.slice(0, 12)).join(', ')}`);
     if (needsMarkerRewrite) writeCliPidMarker();
+    return {
+      reconciled: true,
+      pendingSibling: paired.pendingSibling,
+      transcriptPath,
+      completedCurrentTurn,
+      candidateIds,
+    };
+  }
+  return {
+    reconciled: false,
+    pendingSibling: paired.pendingSibling,
+    transcriptPath,
+    completedCurrentTurn: false,
+    candidateIds,
+  };
+}
+
+function tryReconcilePendingAntigravityFoldedTurns(reason: string): boolean {
+  const pending = antigravityFoldedReconcilePending;
+  if (!pending) return false;
+  if (
+    !isPromptReady
+    || cliSpawnGeneration !== pending.cliSpawnGeneration
+    || cliRestartInProgress
+    || ptyOutputGeneration.snapshot() !== pending.ptyOutputGeneration
+    || webTerminalInputGeneration !== pending.webTerminalInputGeneration
+    || currentBotmuxTurnId !== pending.currentTurnId
+    || currentBotmuxDispatchAttempt !== pending.currentDispatchAttempt
+    || durableTurnInFlight
+    || pendingMessages.length > 0
+    || pendingRawInputs.length > 0
+    || isFlushing
+  ) {
+    cancelAntigravityFoldedReconcilePending();
+    return false;
+  }
+
+  const prevQueuedCount = queuedTypeAheadTurns.length;
+  const res = reconcileCompletedAntigravityTurnsAtPromptReady(pending.promotedTurnId);
+  if (res.reconciled) {
+    const promotedTurnId = pending.promotedTurnId;
+    cancelAntigravityFoldedReconcilePending();
+    if (
+      res.completedCurrentTurn
+      && promotedTurnId
+      && currentBotmuxTurnId === promotedTurnId
+      && currentBotmuxDispatchAttempt === undefined
+      && !durableTurnInFlight
+    ) {
+      const stillPendingTasks = typeof hasLiveAntigravityPendingTasks === 'function'
+        && hasLiveAntigravityPendingTasks();
+      if (!stillPendingTasks) {
+        markTurnRetired(promotedTurnId);
+        releaseActiveTurnAuthority(`prompt_ready_reconciled:${reason}`);
+        syncQueuedTurnsFromMarkerDisk();
+        if (queuedTypeAheadTurns.length > 0) {
+          advanceQueuedTypeAheadTurn(`prompt_ready_reconciled:${reason}`);
+          queuedTurnAdvanceConsumedForPrompt = undefined;
+        }
+        writeCliPidMarker();
+        if (renderer && pendingMessages.length === 0 && pendingAdoptMessages.length === 0
+          && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
+          const { content } = renderer.snapshot();
+          send({
+            type: 'screen_update',
+            content,
+            ...classifyUsageLimitWithNativeEvidence(content, projectedRuntimeScreenStatus()),
+            ...backgroundWaitPayload(),
+            ...modelRequestPayload(),
+            turnId: currentBotmuxTurnId,
+            dispatchAttempt: currentBotmuxDispatchAttempt,
+          });
+        }
+      }
+    }
+    // Partial reconciliation (e.g. om_B flushed to compact before om_C): re-arm
+    // within the original budget whenever sibling skew still holds on live work.
+    if (
+      res.pendingSibling
+      && res.transcriptPath
+      && isPromptReady
+      && !cliRestartInProgress
+      && !durableTurnInFlight
+      && pendingMessages.length === 0
+      && pendingRawInputs.length === 0
+      && !isFlushing
+      && pending.attempts < ANTIGRAVITY_FOLDED_RECONCILE_MAX_ATTEMPTS
+      && Date.now() - pending.startedAtMs < ANTIGRAVITY_FOLDED_RECONCILE_MAX_WINDOW_MS
+    ) {
+      const activeAuthority = activeTurnAuthority.snapshot();
+      const nextPromotedTurnId = currentBotmuxTurnId
+        && currentBotmuxDispatchAttempt === undefined
+        && !retiredTurnIds.has(currentBotmuxTurnId)
+        && activeAuthority?.turnId === currentBotmuxTurnId
+        && activeAuthority.dispatchAttempt === undefined
+        && (res.candidateIds.has(currentBotmuxTurnId) || currentBotmuxTurnId !== promotedTurnId)
+        ? currentBotmuxTurnId
+        : undefined;
+      const hasRemainingQueuedCandidate = queuedTypeAheadTurns.some(q => q.dispatchAttempt === undefined);
+      if (nextPromotedTurnId || hasRemainingQueuedCandidate) {
+        const advanced = currentBotmuxTurnId !== pending.currentTurnId
+          || queuedTypeAheadTurns.length < prevQueuedCount;
+        const nextDelayMs = advanced
+          ? ANTIGRAVITY_FOLDED_RECONCILE_INITIAL_DELAY_MS
+          : Math.min(pending.delayMs * 2, ANTIGRAVITY_FOLDED_RECONCILE_MAX_DELAY_MS);
+        armAntigravityFoldedReconcilePending(res.transcriptPath, nextPromotedTurnId, {
+          startedAtMs: pending.startedAtMs,
+          attempts: pending.attempts + 1,
+          delayMs: nextDelayMs,
+        });
+      }
+    }
     return true;
   }
+
+  if (!res.pendingSibling) {
+    // Both siblings are readable and agree the turn is still genuinely running.
+    cancelAntigravityFoldedReconcilePending();
+    return false;
+  }
+
+  if (Date.now() - pending.startedAtMs >= ANTIGRAVITY_FOLDED_RECONCILE_MAX_WINDOW_MS) {
+    cancelAntigravityFoldedReconcilePending();
+    return false;
+  }
+
+  if (reason !== 'retry') {
+    // Event-driven wakeups (`fs_watch`, `prompt_ready_reentry`) must not consume
+    // the scheduled retry budget or inflate backoff. Cap only watcher churn.
+    if (reason === 'fs_watch') {
+      pending.watchWakeups += 1;
+      if (pending.watchWakeups >= ANTIGRAVITY_FOLDED_RECONCILE_MAX_WATCH_WAKEUPS && pending.watcher) {
+        try { pending.watcher.close(); } catch { /* ignore */ }
+        pending.watcher = undefined;
+      }
+    }
+    return false;
+  }
+
+  if (pending.attempts >= ANTIGRAVITY_FOLDED_RECONCILE_MAX_ATTEMPTS) {
+    cancelAntigravityFoldedReconcilePending();
+    return false;
+  }
+
+  pending.attempts += 1;
+  pending.delayMs = Math.min(pending.delayMs * 2, ANTIGRAVITY_FOLDED_RECONCILE_MAX_DELAY_MS);
+  if (pending.timer) clearTimeout(pending.timer);
+  pending.timer = setTimeout(() => {
+    if (antigravityFoldedReconcilePending !== pending) return;
+    pending.timer = undefined;
+    tryReconcilePendingAntigravityFoldedTurns('retry');
+  }, pending.delayMs);
+  pending.timer.unref();
   return false;
+}
+
+function armAntigravityFoldedReconcilePending(
+  transcriptPath: string,
+  promotedTurnId: string | undefined,
+  budget?: { startedAtMs: number; attempts: number; delayMs: number },
+): void {
+  cancelAntigravityFoldedReconcilePending();
+  const pending: AntigravityFoldedReconcilePending = {
+    cliSpawnGeneration,
+    ptyOutputGeneration: ptyOutputGeneration.snapshot(),
+    webTerminalInputGeneration,
+    currentTurnId: currentBotmuxTurnId,
+    currentDispatchAttempt: currentBotmuxDispatchAttempt,
+    promotedTurnId,
+    transcriptPath,
+    startedAtMs: budget?.startedAtMs ?? Date.now(),
+    attempts: budget?.attempts ?? 0,
+    watchWakeups: 0,
+    delayMs: budget?.delayMs ?? ANTIGRAVITY_FOLDED_RECONCILE_INITIAL_DELAY_MS,
+  };
+  antigravityFoldedReconcilePending = pending;
+
+  try {
+    const dir = dirname(transcriptPath);
+    if (existsSync(dir)) {
+      const watcher = fsWatch(dir, (_eventType, filename) => {
+        if (antigravityFoldedReconcilePending !== pending) return;
+        const name = typeof filename === 'string' ? filename : undefined;
+        if (name && name !== 'transcript.jsonl' && name !== 'transcript_full.jsonl') return;
+        if (pending.coalesceTimer) return;
+        pending.coalesceTimer = setTimeout(() => {
+          if (antigravityFoldedReconcilePending !== pending) return;
+          pending.coalesceTimer = undefined;
+          tryReconcilePendingAntigravityFoldedTurns('fs_watch');
+        }, 10);
+        pending.coalesceTimer.unref();
+      });
+      watcher.on('error', () => { /* fall back to bounded timer */ });
+      watcher.unref();
+      pending.watcher = watcher;
+    }
+  } catch {
+    // Directory watch unavailable; bounded retry timer handles re-reconciliation.
+  }
+
+  pending.timer = setTimeout(() => {
+    if (antigravityFoldedReconcilePending !== pending) return;
+    pending.timer = undefined;
+    tryReconcilePendingAntigravityFoldedTurns('retry');
+  }, pending.delayMs);
+  pending.timer.unref();
 }
 let lastStructuredBridgeActivityAtMs = 0;
 const codexAppTurnLiveness = new CodexAppTurnLiveness();
@@ -10743,8 +11056,100 @@ const usageLimitTracker = createUsageLimitTracker<RuntimeScreenStatus>({
   isOutputActive: isOutputActivelyProgressing,
 });
 
-let antigravityQuotaHistory: readonly CliUsageLimitState[] | undefined;
-let unconfirmedAntigravityQuotas = new Map<string, CliUsageLimitState>();
+const antigravityQuotaState = createAntigravityQuotaStateMachine();
+let antigravityNativeQuotaLog: AntigravityNativeQuotaLog | undefined;
+let activeTransientRateLimit: { scope: string; state: CliUsageLimitState } | undefined;
+let lastUsageLimitCaptureTurn: { turnId: string; dispatchAttempt?: number } | undefined;
+let localAttestedCliProcess: { cliPid: number; cliProcStart: string; cliSpawnGeneration: number } | undefined;
+let rawInputWriteGeneration = 0;
+let lastWrittenCliInputWebSubmitGen = 0;
+let lastWrittenCliInputRawGen = 0;
+let lastWrittenCliInputSpawnGen = 0;
+let lastWrittenAntigravityTranscriptAnchor: AntigravityTranscriptWriteBoundary | undefined;
+
+function resetAntigravityNativeQuotaLog(): void {
+  antigravityNativeQuotaLog?.reset();
+  antigravityNativeQuotaLog = undefined;
+}
+
+/** Exact worker-written input belonging to the current Antigravity turn, or
+ *  `undefined` once direct Web Terminal input, a raw passthrough command, or a
+ *  fresh process spawn has superseded it. */
+function currentAntigravityWrittenInput(): string | undefined {
+  if (!lastWrittenCliInput) return undefined;
+  if (webTerminalSubmitGeneration > lastWrittenCliInputWebSubmitGen) return undefined;
+  if (rawInputWriteGeneration > lastWrittenCliInputRawGen) return undefined;
+  if (lastWrittenCliInputSpawnGen !== cliSpawnGeneration) return undefined;
+  return lastWrittenCliInput.content;
+}
+
+function readAntigravityNativeQuota(): AntigravityNativeQuotaRefusal | undefined {
+  if (
+    cliAdapter?.id !== 'antigravity'
+    || cliAdapter.runnerFramedInput
+    || isRemoteBackendType(effectiveBackendType)
+    || !supportsAntigravityReadyFooterQuota(lastInitConfig?.cliVersion)
+    || !sessionId
+  ) {
+    return undefined;
+  }
+  antigravityNativeQuotaLog ??= new AntigravityNativeQuotaLog(sessionId);
+  const state = antigravityNativeQuotaLog.read();
+  return currentAntigravityNativeQuota(state, currentAntigravityWrittenInput());
+}
+
+/** Resolve the live Antigravity transcript strictly through double-birth-checked
+ *  local process attestation (matching daemon settlement fail-closed semantics,
+ *  with zero fallback to `codexBridgeRolloutPath` or `storedId` on missing,
+ *  ambiguous, exited, or reused PID). */
+function resolveAntigravityProofTranscriptPath(): string | undefined {
+  if (
+    cliAdapter?.id !== 'antigravity'
+    || cliAdapter.runnerFramedInput
+    || lastInitConfig?.adoptMode
+    || isRemoteBackendType(effectiveBackendType)
+  ) {
+    return undefined;
+  }
+  const attested = localAttestedCliProcess;
+  if (!attested || attested.cliSpawnGeneration !== cliSpawnGeneration) return undefined;
+  const liveConversationId = findAttestedAntigravityConversationId(attested);
+  if (!liveConversationId) return undefined;
+  const storedId = inputDeliveryObservedCliSessionId
+    ?? lastSpawnEffectiveCliSessionId
+    ?? lastInitConfig?.cliSessionId;
+  if (storedId && storedId.toLowerCase() !== liveConversationId.toLowerCase()) return undefined;
+  return resolveAntigravityTranscriptPath(liveConversationId) ?? undefined;
+}
+
+function withAntigravityDirectFailureProof(limit: CliUsageLimitState): CliUsageLimitState {
+  if (!isAntigravityNativeLimit(limit) || limit.kind !== 'usage') return limit;
+  const written = currentAntigravityWrittenInput();
+  if (!written) return limit;
+  const transcriptPath = resolveAntigravityProofTranscriptPath();
+  if (!transcriptPath) return limit;
+  const writeBoundary = lastWrittenAntigravityTranscriptAnchor;
+  if (!writeBoundary) return limit;
+  return antigravityTurnFailedWithoutOutput(transcriptPath, written, { writeBoundary })
+    ? { ...limit, directFailure: true, antigravityWriteBoundary: { ...writeBoundary } }
+    : limit;
+}
+
+usageLimitTracker.addTurnListener(event => {
+  if (event.kind === 'beginTurn') {
+    activeTransientRateLimit = undefined;
+    lastUsageLimitCaptureTurn = undefined;
+    if (cliAdapter?.id === 'antigravity' && !cliAdapter.runnerFramedInput) {
+      antigravityQuotaState.beginTurn(event.snapshot);
+    }
+    return;
+  }
+  if (event.kind === 'answered') {
+    if (cliAdapter?.id === 'antigravity' && !cliAdapter.runnerFramedInput) {
+      antigravityQuotaState.noteTurnAnswered(readAntigravityNativeQuota());
+    }
+  }
+});
 
 function currentUsageLimitSnapshot(): string {
   if (!backendScreenEvidenceIsAuthoritativeForMutation()) return '';
@@ -10766,16 +11171,17 @@ function classifyScreenUsageLimit(
   return classifyUsageLimitWithNativeEvidence(content, status);
 }
 
-/** Preserve existing non-agy display-frame classification while requiring an
- * authoritative viewport for agy's stronger native composer evidence. */
+/** Preserve existing non-agy display-frame classification while delegating
+ *  terminal Antigravity to the single-source `antigravityQuotaState` machine. */
 function classifyUsageLimitWithNativeEvidence(
   content: string,
   status: RuntimeScreenStatus,
 ): UsageAwareScreen {
-  if (cliAdapter?.id === 'antigravity' && !backendScreenEvidenceIsAuthoritativeForMutation()) return { status };
+  const isTerminalAntigravity = cliAdapter?.id === 'antigravity' && !cliAdapter.runnerFramedInput;
+  if (isTerminalAntigravity && !backendScreenEvidenceIsAuthoritativeForMutation()) return { status };
   let evidence = content;
   let nativeViewportCaptured = false;
-  if (cliAdapter?.id === 'antigravity' && backend) {
+  if (isTerminalAntigravity && backend) {
     // Card snapshots intentionally remove input/composer rows. Native error
     // reconciliation requires the full current viewport, not that display text.
     try {
@@ -10783,50 +11189,81 @@ function classifyUsageLimitWithNativeEvidence(
       if (viewport) { evidence = viewport; nativeViewportCaptured = true; }
     } catch { /* no stronger evidence */ }
   }
-  if (cliAdapter?.id === 'antigravity') {
-    // tmux capture-pane -e preserves SGR inside phrases, countdowns and error
-    // IDs. Strip controls without filtering away native composer rows.
-    evidence = stripAnsiScreenText(evidence);
-    if (isAntigravityWorkingScreen(evidence)) return { status: 'working' };
-    // 正常输入框是当前恢复证据；保留上方历史报错，但不再用它判定本轮限额。
-    // 卡片内容会裁剪输入框，因此显式携带完整权威视口确认的恢复信号。
-    if (nativeViewportCaptured && isAntigravityReadyComposerScreen(evidence)) {
-      return { status, usageLimitRecovery: 'antigravity-ready-composer' };
-    }
-    let expiredAntigravityQuota: CliUsageLimitState | undefined;
-    const result = usageLimitTracker.classify(evidence, status, state => {
-      const observed = annotateAntigravityUsageLimit(evidence, state);
-      const key = observed.relativeResetKey;
-      if (!key) return observed;
-
-      const previous = antigravityQuotaHistory?.find(entry => entry.relativeResetKey === key)
-        ?? unconfirmedAntigravityQuotas.get(key);
-      const now = Date.now();
-      const limit = reconcileUsageLimitState(previous, observed, now);
-      // Composer 可能到期后才补齐。保留确认后的记录，但从本轮限额判定中排除。
-      if (observed.source === 'antigravity-error-composer' && previous && now >= limit.retryAtMs) {
-        expiredAntigravityQuota = limit;
-        return undefined;
+  if (isTerminalAntigravity) {
+    const nativeLogQuota = readAntigravityNativeQuota();
+    const writtenInput = currentAntigravityWrittenInput();
+    // Default `replyDelivery: 'send'` Antigravity has no transcript bridge calling
+    // `noteTurnCompleted('answered')`. If `agy` internally retried after a native
+    // log 429 and completed THIS written turn (anchored strictly at or after its
+    // pre-write transcript boundary and refusal timestamp), retire that stale log
+    // refusal before evaluating the ready composer screen.
+    if (
+      nativeLogQuota
+      && nativeViewportCaptured
+      && isAntigravityReadyComposerScreen(stripAnsiScreenText(evidence))
+      && writtenInput
+      && lastWrittenAntigravityTranscriptAnchor
+    ) {
+      const proofPath = resolveAntigravityProofTranscriptPath();
+      if (proofPath && antigravityTurnAnsweredInTranscript(proofPath, writtenInput, {
+        writeBoundary: lastWrittenAntigravityTranscriptAnchor,
+        ...(nativeLogQuota.refusalAtMs !== undefined ? { minAnsweredAtMs: nativeLogQuota.refusalAtMs } : {}),
+      })) {
+        antigravityQuotaState.noteTurnAnswered(nativeLogQuota);
       }
-      return limit;
+    }
+    const outputActive = usageLimitTracker.isOutputActive?.()
+      ?? (typeof isOutputActivelyProgressing === 'function' ? isOutputActivelyProgressing() : undefined);
+    const classified = antigravityQuotaState.classify({
+      screen: evidence,
+      nativeViewportCaptured,
+      runtimeStatus: status,
+      ...(outputActive !== undefined ? { outputActive } : {}),
+      supportsReadyFooterQuota: supportsAntigravityReadyFooterQuota(lastInitConfig?.cliVersion),
+      ...(nativeLogQuota ? { nativeLogQuota } : {}),
     });
-    // 只用已上报且带 Error ID 的部分帧固定首次截止时间。看到原生 composer 后再把它计入历史。
-    const limit = expiredAntigravityQuota ?? result.usageLimit;
-    const key = limit?.relativeResetKey;
-    if (limit && key) {
-      if (limit.source === 'antigravity-error-composer') {
-        antigravityQuotaHistory = rememberAntigravityQuota(antigravityQuotaHistory, limit);
-        unconfirmedAntigravityQuotas.delete(key);
-      } else if (limit.kind === 'usage' && !key.endsWith(':')) {
-        unconfirmedAntigravityQuotas.set(key, limit);
-        if (unconfirmedAntigravityQuotas.size > ANTIGRAVITY_QUOTA_HISTORY_LIMIT) {
-          unconfirmedAntigravityQuotas.delete(unconfirmedAntigravityQuotas.keys().next().value!);
-        }
-      }
+    if (classified.detectedThisTurn) {
+      usageLimitTracker.noteTurnDetected();
+    } else if (classified.usageLimitRecovery === 'antigravity-ready-composer') {
+      usageLimitTracker.noteScreenRecovery();
     }
-    return expiredAntigravityQuota ? { ...result, expiredAntigravityQuota } : result;
+    const usageLimit = classified.usageLimit
+      ? withAntigravityDirectFailureProof(classified.usageLimit)
+      : undefined;
+    const out: UsageAwareScreen = { status: classified.status };
+    if (usageLimit) out.usageLimit = usageLimit;
+    if (classified.expiredAntigravityQuota) out.expiredAntigravityQuota = classified.expiredAntigravityQuota;
+    if (classified.usageLimitRecovery) out.usageLimitRecovery = classified.usageLimitRecovery;
+    return out;
   }
-  return usageLimitTracker.classify(evidence, status);
+  const result = usageLimitTracker.classify(evidence, status);
+  if (currentBotmuxTurnId !== undefined) {
+    lastUsageLimitCaptureTurn = {
+      turnId: currentBotmuxTurnId,
+      dispatchAttempt: currentBotmuxDispatchAttempt,
+    };
+  }
+  if (result.usageLimit && isTransientRateLimit(result.usageLimit)) {
+    const scopeTurnId = currentBotmuxTurnId ?? lastUsageLimitCaptureTurn?.turnId ?? null;
+    const scopeAttempt = currentBotmuxTurnId !== undefined
+      ? (currentBotmuxDispatchAttempt ?? null)
+      : (lastUsageLimitCaptureTurn?.dispatchAttempt ?? null);
+    const scope = JSON.stringify([
+      scopeTurnId,
+      scopeAttempt,
+      webTerminalSubmitGeneration,
+      usageLimitTracker.currentTurn(),
+    ]);
+    if (activeTransientRateLimit?.scope === scope) {
+      const pinned = reconcileUsageLimitState(activeTransientRateLimit.state, result.usageLimit, {
+        sameTransientTurn: true,
+      });
+      activeTransientRateLimit = { scope, state: pinned };
+      return { ...result, usageLimit: pinned };
+    }
+    activeTransientRateLimit = { scope, state: result.usageLimit };
+  }
+  return result;
 }
 
 // ─── Adopt-bridge state (Claude Code only) ─────────────────────────────────
@@ -11419,6 +11856,7 @@ function discardDeploymentContinuation(): void {
   }
   if (lastInitConfig) lastInitConfig.deploymentContinuation = undefined;
   lastWrittenCliInput = undefined;
+  lastWrittenAntigravityTranscriptAnchor = undefined;
   restoredDeploymentTurnId = undefined;
   pendingRestartInterruption = undefined;
   restartInterruptionScanBeforeMs = undefined;
@@ -12516,8 +12954,15 @@ function saveUnsentInputsForSuccessor(reason: string): void {
 
 /** An input reached the CLI: it becomes the turn a standalone restart note
  *  continues, and a restored predecessor input is no longer outstanding. */
-function noteCliInputWritten(item: PendingCliInput): void {
+function noteCliInputWritten(
+  item: PendingCliInput,
+  antigravityAnchor?: AntigravityTranscriptWriteBoundary,
+): void {
   lastWrittenCliInput = item;
+  lastWrittenCliInputWebSubmitGen = webTerminalSubmitGeneration;
+  lastWrittenCliInputRawGen = rawInputWriteGeneration;
+  lastWrittenCliInputSpawnGen = cliSpawnGeneration;
+  lastWrittenAntigravityTranscriptAnchor = antigravityAnchor;
   if (item.turnId) writtenInputs.noteWritten(item.turnId, item.content, item.dispatchAttempt);
   if (restoredUnsentInputs.delete(item) && restoredUnsentInputs.size === 0) {
     const unsentPath = unsentInputJournalPath();
@@ -20953,6 +21398,7 @@ async function snapshotWithLatestRuntimeStatus<T>(
  *  either path may observe an assistant_final before the await returns. Reset
  *  here (never after the await) so that final remains a usable ready edge. */
 function beginCliWriteCycle(): void {
+  cancelAntigravityFoldedReconcilePending();
   // A new input supersedes an idle edge still settling: that edge belonged to
   // the previous turn, and the CLI is about to work again. Its transcript
   // terminal still settles it from the per-read drain.
@@ -21776,15 +22222,25 @@ async function captureAndUpload(): Promise<void> {
   const capturedTurnId = currentBotmuxTurnId;
   const capturedAttempt = currentBotmuxDispatchAttempt;
   const capturedDisplayGeneration = screenshotDisplayGeneration;
+  const capturedInputGeneration = webTerminalInputGeneration;
   const frameIsStale = (): boolean => displayMode !== 'screenshot'
     || capturedRevision !== captureRevision
     || capturedDisplayGeneration !== screenshotDisplayGeneration
     || capturedTurnId !== currentBotmuxTurnId
-    || capturedAttempt !== currentBotmuxDispatchAttempt;
-  // Dedup is bound to the full identity: the same pixels under a new capture
-  // identity or display cycle are a NEW first frame, never a duplicate.
-  const dedupKey = (pixelHash: string, recovery?: UsageAwareScreen['usageLimitRecovery']): string =>
-    `${capturedRevision}:${capturedDisplayGeneration}:${pixelHash}${recovery ? `:recovery=${recovery}` : ''}`;
+    || capturedAttempt !== currentBotmuxDispatchAttempt
+    || capturedInputGeneration !== webTerminalInputGeneration;
+  // Dedup is bound to the full identity (capture revision, display generation,
+  // direct Web Terminal input generation, and semantic usage-limit state): the
+  // same pixels under a new turn, direct input, proof/episode update, or expiry
+  // edge are a NEW frame, never a duplicate.
+  const dedupKey = (pixelHash: string, usage?: UsageAwareScreen): string => {
+    const inputSuffix = capturedInputGeneration > 0 ? `:in=${capturedInputGeneration}` : '';
+    const turnSuffix = usage && (usage.usageLimit || cliAdapter?.id === 'antigravity')
+      ? `:t=${capturedTurnId ?? ''}:${capturedAttempt ?? ''}`
+      : '';
+    const usageSuffix = usage ? screenshotUsageLimitDedupSuffix(usage) : '';
+    return `${capturedRevision}:${capturedDisplayGeneration}:${pixelHash}${inputSuffix}${turnSuffix}${usageSuffix}`;
+  };
   let recaptureAfterStaleFrame = false;
   let ownedKey: string | null = null;
   let previousShotHash = lastShotHash;
@@ -21819,7 +22275,7 @@ async function captureAndUpload(): Promise<void> {
         // zero-classification fast path for unchanged pixels.
         if (cliAdapter?.id !== 'antigravity' && dedupKey(pixelHash) === lastShotHash) return;
         usageAware = classifyScreenUsageLimit(pipeResult.content, projectedRuntimeScreenStatus());
-        const key = dedupKey(pixelHash, usageAware.usageLimitRecovery);
+        const key = cliAdapter?.id === 'antigravity' ? dedupKey(pixelHash, usageAware) : dedupKey(pixelHash);
         if (key === lastShotHash) return;
         previousShotHash = lastShotHash;
         ownedKey = key;
@@ -21836,7 +22292,7 @@ async function captureAndUpload(): Promise<void> {
         pixelHash = createHash('md5').update(snap).digest('hex');
         if (cliAdapter?.id !== 'antigravity' && dedupKey(pixelHash) === lastShotHash) return;
         usageAware = classifyScreenUsageLimit(snap, projectedRuntimeScreenStatus());
-        const key = dedupKey(pixelHash, usageAware.usageLimitRecovery);
+        const key = cliAdapter?.id === 'antigravity' ? dedupKey(pixelHash, usageAware) : dedupKey(pixelHash);
         if (key === lastShotHash) return;
         previousShotHash = lastShotHash;
         ownedKey = key;
@@ -21874,7 +22330,7 @@ async function captureAndUpload(): Promise<void> {
     // Commit the evidence actually sent, not the pre-upload classification.
     // A capture failure during upload must leave a later ready edge deliverable.
     if (lastShotHash === ownedKey) {
-      ownedKey = dedupKey(pixelHash, currentUsageAware.usageLimitRecovery);
+      ownedKey = cliAdapter?.id === 'antigravity' ? dedupKey(pixelHash, currentUsageAware) : dedupKey(pixelHash);
       lastShotHash = ownedKey;
     }
     // Success is otherwise completely silent (skips and failures log above), which
@@ -26411,6 +26867,11 @@ function markPromptReady(): void {
   }
   if (isPromptReady) {
     stopStructuredStartGraceRecheck();
+    if (typeof antigravityFoldedReconcilePending !== 'undefined'
+      && antigravityFoldedReconcilePending
+      && typeof tryReconcilePendingAntigravityFoldedTurns === 'function') {
+      tryReconcilePendingAntigravityFoldedTurns('prompt_ready_reentry');
+    }
     return;  // guard against duplicate calls
   }
   stopStructuredStartGraceRecheck();
@@ -26579,8 +27040,9 @@ function markPromptReady(): void {
   // already-promoted authority only while the PTY generation still identifies
   // this same A edge; later B output makes the observation stale. The matching
   // observation also prevents this same A edge from advancing twice to C.
+  let preSyncAntigravityReconcile: AntigravityFoldedReconcileResult | undefined;
   if (typeof reconcileCompletedAntigravityTurnsAtPromptReady === 'function') {
-    reconcileCompletedAntigravityTurnsAtPromptReady();
+    preSyncAntigravityReconcile = reconcileCompletedAntigravityTurnsAtPromptReady();
   }
   const observedQueuedAdvanceGeneration = queuedTurnAdvanceConsumedForPrompt?.outputGeneration;
   const readyTransition = (syncedFromDisk: boolean) => decideQueuedReadyTransition({
@@ -26661,6 +27123,18 @@ function markPromptReady(): void {
     advanceQueuedTypeAheadTurn('prompt_ready');
   }
   queuedTurnAdvanceConsumedForPrompt = undefined;
+  if (
+    preSyncAntigravityReconcile?.pendingSibling
+    && preSyncAntigravityReconcile.transcriptPath
+    && typeof armAntigravityFoldedReconcilePending === 'function'
+  ) {
+    const postSyncPromotedTurnId = currentBotmuxTurnId
+      && currentBotmuxDispatchAttempt === undefined
+      && preSyncAntigravityReconcile.candidateIds.has(currentBotmuxTurnId)
+      ? currentBotmuxTurnId
+      : undefined;
+    armAntigravityFoldedReconcilePending(preSyncAntigravityReconcile.transcriptPath, postSyncPromotedTurnId);
+  }
   // An old backend can still report idle while its async teardown is running.
   // Only a prompt observed after the general restart fence drops may release
   // slash commands to the replacement generation.
@@ -29149,7 +29623,29 @@ async function flushPending(): Promise<void> {
           inflightInputs.onWrite(item);
           stuckDetector?.arm();
         }
-        noteCliInputWritten(item);
+        let antigravityWriteAnchor: AntigravityTranscriptWriteBoundary | undefined;
+        if (cliAdapter?.id === 'antigravity' && !cliAdapter.runnerFramedInput && !isRemoteBackendType(effectiveBackendType)) {
+          if (reconcileHint && reconcileHint.minByteOffset !== undefined) {
+            antigravityWriteAnchor = {
+              ...(reconcileHint.sampledTranscriptPath ? { sampledTranscriptPath: reconcileHint.sampledTranscriptPath } : {}),
+              minByteOffset: reconcileHint.minByteOffset,
+              ...(reconcileHint.skipPriorMatches ? { skipPriorMatches: reconcileHint.skipPriorMatches } : {}),
+            };
+          } else {
+            const cid = inputDeliveryObservedCliSessionId ?? lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId;
+            const path = resolveAntigravityProofTranscriptPath() ?? (cid ? resolveAntigravityTranscriptPath(cid) : undefined);
+            if (path && existsSync(path)) {
+              try {
+                antigravityWriteAnchor = { sampledTranscriptPath: path, minByteOffset: statSync(path).size };
+              } catch {
+                antigravityWriteAnchor = undefined;
+              }
+            } else {
+              antigravityWriteAnchor = { minByteOffset: 0 };
+            }
+          }
+        }
+        noteCliInputWritten(item, antigravityWriteAnchor);
         writeCliPidMarker();
         publishSandboxRelayCapability();
         if (!isTypeAhead) {
@@ -30529,6 +31025,8 @@ function startScreenUpdates(): void {
   if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
   let lastSentStatus: string | undefined;
   let lastSentExpiredQuotaKey: string | undefined;
+  let lastSentUsageLimitEvidence = '';
+  let lastSentUsageLimitTurnIdentity = '';
   let lastSentRecovery: UsageAwareScreen['usageLimitRecovery'];
   let lastSentBackgroundWait = 0;
   let lastSentModelRequestAt: number | undefined;
@@ -30562,10 +31060,13 @@ function startScreenUpdates(): void {
     const capacityLifetime = cliLifetimeNonce;
     const sampleTurn = currentBotmuxTurnId;
     const sampleAttempt = currentBotmuxDispatchAttempt;
+    const sampleInputGeneration = webTerminalInputGeneration;
+    const sampleSubmitGeneration = webTerminalSubmitGeneration;
     const screenTurn = { turnId: sampleTurn, dispatchAttempt: sampleAttempt };
     const ownsSample = () => backend === capacityBackend && cliSpawnGeneration === capacityGeneration
       && cliLifetimeNonce === capacityLifetime
       && currentBotmuxTurnId === sampleTurn && currentBotmuxDispatchAttempt === sampleAttempt
+      && webTerminalInputGeneration === sampleInputGeneration
       && (!workerSessionEventScope || hasCurrentSessionRuntime());
     if (awaitingFirstPrompt) {
       inspectAidenCodexUpdateDialogOnScreen();
@@ -30817,8 +31318,18 @@ function startScreenUpdates(): void {
       // has been typed for it, so the projection's 'working' would be false —
       // leave the card at its starting state until the first write happens.
       if (startupInputHeld()) return;
-      const expiredQuotaKey = usageAware.expiredAntigravityQuota?.relativeResetKey;
+      const expiredQuotaKey = cliUsageLimitEpisodeKey(usageAware.expiredAntigravityQuota);
+      const usageLimitEvidence = usageLimitEvidenceKey(usageAware.usageLimit);
+      const effectiveUsageTurnId = screenTurn.turnId ?? lastUsageLimitCaptureTurn?.turnId ?? null;
+      const effectiveUsageAttempt = screenTurn.turnId !== undefined
+        ? (screenTurn.dispatchAttempt ?? null)
+        : (lastUsageLimitCaptureTurn?.dispatchAttempt ?? null);
+      const usageLimitTurnIdentity = usageAware.usageLimit
+        ? JSON.stringify([effectiveUsageTurnId, effectiveUsageAttempt, sampleSubmitGeneration])
+        : '';
       if (snapshot.changed || usageAware.status !== lastSentStatus || expiredQuotaKey !== lastSentExpiredQuotaKey
+        || usageLimitEvidence !== lastSentUsageLimitEvidence
+        || usageLimitTurnIdentity !== lastSentUsageLimitTurnIdentity
         || usageAware.usageLimitRecovery !== lastSentRecovery
         || backgroundWaitTasks !== lastSentBackgroundWait
         || modelRequestClock.lastServedAt() !== lastSentModelRequestAt
@@ -30827,6 +31338,8 @@ function startScreenUpdates(): void {
         || awaySummaryFocus.isActive !== lastSentAwaySummaryPending) {
         lastSentStatus = usageAware.status;
         lastSentExpiredQuotaKey = expiredQuotaKey;
+        lastSentUsageLimitEvidence = usageLimitEvidence;
+        lastSentUsageLimitTurnIdentity = usageLimitTurnIdentity;
         lastSentRecovery = usageAware.usageLimitRecovery;
         lastSentBackgroundWait = backgroundWaitTasks;
         lastSentModelRequestAt = modelRequestClock.lastServedAt();
@@ -30862,6 +31375,7 @@ function stopScreenUpdates(): void {
   if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
   lastAnalyzerSnapshot = '';
   antigravityFooterBackgroundTasks = 0;
+  cancelAntigravityFoldedReconcilePending();
 }
 
 // ─── PTY Management ──────────────────────────────────────────────────────────
@@ -31840,6 +32354,12 @@ async function spawnCliBody(
   cfg: Extract<DaemonToWorker, { type: 'init' }>,
   opts: Parameters<typeof spawnCli>[1] = {},
 ): Promise<void> {
+  resetAntigravityNativeQuotaLog();
+  activeTransientRateLimit = undefined;
+  lastUsageLimitCaptureTurn = undefined;
+  localAttestedCliProcess = undefined;
+  lastWrittenAntigravityTranscriptAnchor = undefined;
+  cancelAntigravityFoldedReconcilePending();
   doubaoRestoredRuntimeIdentity = undefined;
   followBotTraeHome(cfg);
   const protectedCliError = protectedHttpEgressCliSupportError(cfg.cliId, cfg.protectedHttpEgressPolicy);
@@ -39509,6 +40029,12 @@ function killCli(opts: {
   preserveCliPidMarker?: boolean;
 } = {}): void {
   if (lastInitConfig?.cliId === 'minimax') minimaxFinalReceiver.reset();
+  resetAntigravityNativeQuotaLog();
+  activeTransientRateLimit = undefined;
+  lastUsageLimitCaptureTurn = undefined;
+  localAttestedCliProcess = undefined;
+  lastWrittenAntigravityTranscriptAnchor = undefined;
+  cancelAntigravityFoldedReconcilePending();
   // Invalidate an in-flight async spawn before any other teardown hook runs. The
   // remaining cleanup is synchronous today, but generation ownership must not
   // depend on that implementation detail.
@@ -43756,7 +44282,14 @@ function send(msg: WorkerToDaemon, origin?: CapturedSessionOrigin): void {
     return;
   }
   if (msg.type === 'cli_session_id') observeContractNativeSession(msg.cliSessionId);
-  const payload = sessionEventMetadata(workerIpcPayload(msg), origin);
+  const outboundMsg: WorkerToDaemon =
+    (msg.type === 'screen_update' || msg.type === 'screenshot_uploaded')
+    && cliAdapter?.id === 'antigravity'
+    && !cliAdapter.runnerFramedInput
+    && msg.antigravityQuotaCursor === undefined
+      ? { ...msg, antigravityQuotaCursor: antigravityQuotaState.exportCursor() }
+      : msg;
+  const payload = sessionEventMetadata(workerIpcPayload(outboundMsg), origin);
   if (payload.type === 'final_output' && universalOutputHandoff
     && (lastInitConfig?.finalOutputHandoff?.frozenImOnly
       ? frozenImReplyTurn(payload.turnId)
@@ -44414,6 +44947,11 @@ function publishLocalProcessAttestation(
   // This guard must stay ahead of DSH capture, identity freeze and retry
   // cancellation so a replacement never mutates any attestation state.
   if (cliPid && opts.expectedCliProcStart !== undefined && cliProcStart !== opts.expectedCliProcStart) return false;
+  if (cliPid && cliProcStart) {
+    localAttestedCliProcess = { cliPid, cliProcStart, cliSpawnGeneration };
+  } else if (!cliPid) {
+    localAttestedCliProcess = undefined;
+  }
   let dshIdentity: DshProcessIdentity | undefined;
   if (lastInitConfig?.cliId === 'dsh' && lastInitConfig.dshRuntime !== 'tui'
     && dshProcessAttestation?.generation === cliSpawnGeneration) {
@@ -44861,13 +45399,12 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       }
       lastInitConfig = msg;
       resetFollowUpReplyStateForInit();
-      antigravityQuotaHistory = msg.antigravityQuotaHistory;
-      unconfirmedAntigravityQuotas = new Map();
-      const restoredQuota = msg.antigravityActiveQuota;
-      const restoredKey = restoredQuota?.relativeResetKey;
-      if (restoredQuota?.kind === 'usage' && !restoredQuota.source && restoredKey && !restoredKey.endsWith(':')) {
-        unconfirmedAntigravityQuotas.set(restoredKey, restoredQuota);
-      }
+      antigravityQuotaState.restore({
+        history: msg.antigravityQuotaHistory,
+        activeQuota: msg.antigravityActiveQuota,
+        cursor: msg.antigravityQuotaCursor,
+      });
+      activeTransientRateLimit = undefined;
       kimiCacheExpiryAutoCompact = msg.kimiCacheExpiryAutoCompact === true;
       configureTraexAutoModel(msg);
       if (isCodexAppCliId(msg.cliId) && msg.noProgressNotify?.timeoutMs !== undefined) {
@@ -45880,7 +46417,13 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       // baseline while the message waits for normal flush scheduling.
       if (!lastInitConfig?.adoptMode && !effectiveQueueAfterActiveTurn) {
         renderer?.markNewTurn();
-        usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
+        // PTY/tmux CLIs call `usageLimitTracker.beginTurn()` inside `prepareNormalWrite`
+        // at the actual CLI write moment (avoiding premature wipe of Turn 1's active
+        // structured/transient limit when Turn 2 arrives queued or type-ahead).
+        // Codex App does not run `prepareNormalWrite` so it keeps the receipt baseline.
+        if (isCodexAppCliId(lastInitConfig?.cliId)) {
+          usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
+        }
       }
       if (
         msg.nativeSessionTitlePrompt
