@@ -96,6 +96,7 @@ export const CLI_MODEL_CHOICES: Readonly<Record<CliId, readonly string[] | undef
     'minimax/MiniMax-M2.7-highspeed',
   ],
   'remote-runner': undefined,
+  nca: undefined,
   'codem': undefined,
   // Personal providers are discovered on demand; never perform I/O here.
   zcode: undefined,

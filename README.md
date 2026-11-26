@@ -75,7 +75,7 @@ botmux start
 
 - **完整新手路径**：[文档首页](https://deepcoldy.github.io/botmux/) · [快速上手](https://deepcoldy.github.io/botmux/quickstart) · [常见问题](https://deepcoldy.github.io/botmux/faq)
 - **更多协作方式**：[多话题并行](https://deepcoldy.github.io/botmux/multi-topic) · [角色与团队](https://deepcoldy.github.io/botmux/roles) · [多人独立会话](https://deepcoldy.github.io/botmux/global-settings#xpi) · [语音总结](https://deepcoldy.github.io/botmux/voice)
-- **支持的 AI 工具**：已适配 30+ CLI / Agent，[查看完整列表与配置](https://deepcoldy.github.io/botmux/adapters)。
+- **支持的 AI 工具**：已适配包括本地 NCA 在内的 30+ CLI / Agent。[查看完整列表与配置](https://deepcoldy.github.io/botmux/adapters)。
 - **按需进阶**：[命令参考](https://deepcoldy.github.io/botmux/cli-commands) · [bots.json 配置](https://deepcoldy.github.io/botmux/bots-json) · [零注入](https://deepcoldy.github.io/botmux/bots-json#zero-prompt-injection) · [最佳实践](https://deepcoldy.github.io/botmux/best-practices) · [架构原理](https://deepcoldy.github.io/botmux/architecture)
 - **多机器与团队协作**：可自托管开源的[中心化平台](https://deepcoldy.github.io/botmux/platform)，单机使用不需要它。
 - **升级与维护**：[升级指南](https://deepcoldy.github.io/botmux/cli-commands#upgrade) · [全局设置](https://deepcoldy.github.io/botmux/global-settings) · [常见踩坑](https://deepcoldy.github.io/botmux/pitfalls)
