@@ -29,6 +29,7 @@ import {
   normalizeScheduleNotify,
   normalizeUntilDone,
   recordRunOutcome,
+  releaseUntilDoneFinalRun,
   SCHEDULE_FAILING_THRESHOLD,
   settleUntilDoneRun,
   settleUntilDoneSkip,
@@ -1128,8 +1129,6 @@ export function claimDeferredRun(
     Object.assign(task, {
       lastStatus: 'running' as const,
       lastRunId: runId,
-      lastError: undefined,
-      lastDeliveryError: undefined,
     });
     // Re-enter the exact accepted run: frozen inputs win over edits made while
     // the run was parked.
@@ -1175,7 +1174,7 @@ export function markSkipped(id: string, nextRunAt?: string, runId?: string, opti
     delete task.deferredRun;
     task.runStats = recordRunOutcome(task.runStats, 'skipped');
     if (task.parsed.kind === 'once') task.nextRunAt = nextRunAt;
-    working.set(id, options.operatorCancel ? task : settleUntilDoneSkip(task, runId, Date.now()));
+    working.set(id, options.operatorCancel ? releaseUntilDoneFinalRun(task, runId) : settleUntilDoneSkip(task, runId, Date.now()));
     return { result: undefined, changed: true };
   });
 }

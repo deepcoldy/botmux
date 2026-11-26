@@ -38,6 +38,7 @@ import {
   acquireTraexRuntimeStart,
   describeTraexRuntimeBlockers,
   heartbeatTraexRuntime,
+  markTraexRuntimeDeathUnproven,
   markTraexRuntimeRunning,
   markTraexRuntimeUnknown,
   occupantLiveness,
@@ -123,6 +124,8 @@ export interface TraexRuntimeLease {
   occupantId: string;
   domain: TraexRuntimeDomain;
   snapshot: TraexRuntimeContent;
+  /** Capture-time source identity registered with this exact occupant. */
+  installSignature?: string;
   /** This lease only reserves the domain for a runtime this worker did not
    *  exec (adopt/reattach). Its content identity is unknown until backfilled,
    *  so it blocks incompatible starts and must never authorize one. */
@@ -139,6 +142,9 @@ export interface TraexRuntimeLease {
    *  Downgrade the occupant to unknown so it blocks instead of authorizing a
    *  parallel start with an unproven identity. */
   markUnknown(cliPid?: number, cliStart?: string): Promise<void>;
+  /** Persist that the leaf was reported dead but its process group was not
+   *  proven gone. Pruning must keep blocking until the group is empty. */
+  markDeathUnproven(cliPid: number): Promise<void>;
   /** False for a session-private scratch runtime. Such processes receive a
    *  distinct private ownership marker so coordinated domains can exclude them
    *  without treating every sanitized descendant as unrelated. */
@@ -270,6 +276,9 @@ function leaseFor(
         ...(snapshot.dir ? { snapshotDir: snapshot.dir } : {}),
       });
     },
+    async markDeathUnproven(cliPid: number): Promise<void> {
+      await markTraexRuntimeDeathUnproven(domain, occupantId, cliPid);
+    },
     async heartbeat(): Promise<void> {
       await heartbeatTraexRuntime(domain, occupantId);
     },
@@ -286,6 +295,7 @@ function leaseFor(
         }
         await sleep(100 * (attempt + 1));
       }
+      throw new Error(`TRAE runtime ${occupantId} could not prove process exit; lease retained for retry`);
     },
     async abandon(): Promise<void> {
       if (abandonCalled) return;
@@ -391,6 +401,7 @@ export async function acquireTraexRuntimeLease(
           occupancyOnly: false,
           async markRunning() { /* private cache: nothing to record */ },
           async markUnknown() { /* private cache: nothing to record */ },
+    async markDeathUnproven() { /* private cache: nothing to record */ },
           async heartbeat() { /* private cache: nothing to record */ },
           async release() { /* private cache: nothing to record */ },
           async abandon() { /* private cache: nothing to record */ },
@@ -431,10 +442,8 @@ export async function acquireTraexRuntimeLease(
               __testOnly_onCaptured: input.__testOnly_onCaptured,
             })
           : await captureTraexExecutableIdentity(target.executablePath!);
-        snapshotSignature = currentSignature;
-        installSignature = snapshot.reused
-          ? currentSignature
-          : snapshot.manifest?.sourceSignature ?? currentSignature;
+        snapshotSignature = snapshot.sourceSignature ?? currentSignature;
+        installSignature = snapshot.sourceSignature ?? currentSignature;
       } catch (err) {
         return { kind: 'error', reason: 'snapshot-failed', detail: errorText(err) };
       }
@@ -453,7 +462,9 @@ export async function acquireTraexRuntimeLease(
       now: now(),
     });
     if (decision.decision === 'start') {
-      return { kind: 'granted', lease: leaseFor(domain, snapshot, occupantId, false, input.coordinate !== false) };
+      const lease = leaseFor(domain, snapshot, occupantId, false, input.coordinate !== false);
+      lease.installSignature = installSignature;
+      return { kind: 'granted', lease };
     }
     if (decision.decision === 'blocked') {
       const signature = decision.blockers
@@ -523,10 +534,75 @@ function privateOccupancyLease(releaseDir: string): TraexRuntimeLease {
     occupancyOnly: true,
     async markRunning() { /* private cache: nothing to record */ },
     async markUnknown() { /* private cache: nothing to record */ },
+    async markDeathUnproven() { /* private cache: nothing to record */ },
     async heartbeat() { /* private cache: nothing to record */ },
     async release() { /* private cache: nothing to record */ },
     async abandon() { /* private cache: nothing to record */ },
   };
+}
+
+export interface TraexRuntimePeerLeaseInput {
+  workerPid: number;
+  workerStart?: string;
+  daemonPid: number;
+  daemonStart?: string;
+  waitMs?: number;
+  pollMs?: number;
+  now?: () => number;
+  onBlocked?: (blockers: TraexRuntimeBlocker[], detail: string) => void;
+  abort?: () => string | undefined;
+}
+
+/** Register a second real process against an already-frozen compatible runtime.
+ * The peer shares content/snapshot facts, never the parent's scalar cliPid. */
+export async function acquireTraexRuntimePeerLease(
+  parent: TraexRuntimeLease,
+  input: TraexRuntimePeerLeaseInput,
+): Promise<TraexGateAcquireResult> {
+  if (parent.occupancyOnly || !parent.snapshot.comboKey) {
+    return { kind: 'error', reason: 'uncoordinated', detail: 'peer requires a proven coordinated lease' };
+  }
+  const now = input.now ?? Date.now;
+  const occupantId = [input.workerPid, input.workerStart ?? 'nostart', now(), Math.random().toString(36).slice(2, 10)].join('-');
+  const installSignature = parent.installSignature ?? parent.snapshot.sourceSignature ?? parent.snapshot.manifest?.sourceSignature;
+  const deadline = now() + Math.max(0, input.waitMs ?? 0);
+  const pollMs = Math.max(50, input.pollMs ?? 500);
+  let reportedSignature: string | undefined;
+  for (;;) {
+    const aborted = input.abort?.();
+    if (aborted) return { kind: 'aborted', reason: aborted };
+    const decision = await acquireTraexRuntimeStart(parent.domain, {
+      occupantId,
+      comboKey: parent.snapshot.comboKey,
+      ownershipDomainKey: parent.domain.domainKey,
+      ...(installSignature ? { installSignature } : {}),
+      ...(parent.snapshot.snapshot ? { snapshotDir: parent.snapshot.dir } : {}),
+      workerPid: input.workerPid,
+      ...(input.workerStart ? { workerStart: input.workerStart } : {}),
+      daemonPid: input.daemonPid,
+      ...(input.daemonStart ? { daemonStart: input.daemonStart } : {}),
+      ...(parent.snapshot.snapshot === false ? { fixedPath: true } : {}),
+      now: now(),
+    });
+    if (decision.decision === 'start') {
+      const lease = leaseFor(parent.domain, parent.snapshot, occupantId);
+      lease.installSignature = installSignature;
+      return { kind: 'granted', lease };
+    }
+    if (decision.decision === 'blocked') {
+      const signature = decision.blockers.map(blocker => `${blocker.occupantId}:${blocker.comboKey}:${blocker.phase}`).sort().join('|');
+      if (signature !== reportedSignature) {
+        reportedSignature = signature;
+        input.onBlocked?.(decision.blockers, describeTraexRuntimeBlockers(decision.blockers));
+      }
+      if (now() >= deadline) {
+        return { kind: 'blocked', blockers: decision.blockers, detail: describeTraexRuntimeBlockers(decision.blockers) };
+      }
+      await sleep(Math.min(pollMs, Math.max(0, deadline - now())));
+      continue;
+    }
+    return { kind: 'error', reason: decision.reason, detail: decision.detail };
+  }
 }
 
 /**

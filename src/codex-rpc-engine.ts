@@ -424,14 +424,17 @@ export class CodexRpcEngine {
   /** Spawn the app-server, connect, and complete the initialize handshake. */
   async start(): Promise<void> {
     await this.reapStaleAppServer();
+    if (this.closed) throw new Error('codex app-server start cancelled');
     const tierCheck = await (this.dependencies.validateServiceTier ?? validateCodexServiceTier)({
       cliBin: this.opts.cliBin,
       env: this.opts.env,
       model: this.opts.model,
       serviceTier: this.opts.serviceTier,
     });
+    if (this.closed) throw new Error('codex app-server start cancelled');
     if (!tierCheck.ok) throw new Error(`Codex service tier rejected: ${tierCheck.error}`);
     this.port = await findFreePort();
+    if (this.closed) throw new Error('codex app-server start cancelled');
     const featureArgs = (this.opts.appServerFeatures ?? []).flatMap(feature => ['--enable', feature]);
     const configArgs = [...(this.opts.appServerConfig ?? [])]
       .flatMap(value => ['-c', value]);

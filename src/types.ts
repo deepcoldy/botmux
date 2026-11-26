@@ -2539,6 +2539,9 @@ type DaemonToWorkerBase =
   /** Exact turn-level interruption. The worker verifies `turnId` against its
    * own active turn before injecting Ctrl+C and acknowledges the result. */
   | { type: 'interrupt_turn'; requestId: string; turnId: string }
+  /** Cancel an exact unsubmitted turn while init/backend startup is still
+   *  pre-ready. Distinct from interrupt_turn: no active runtime is required. */
+  | { type: 'cancel_queued_turn'; requestId: string; turnId: string }
   | { type: 'refresh_screen' }
   // Claude-family SessionStart 信号：CLI hook 经 `botmux session-ready` 调到
   // daemon。requestId 让 daemon 等到 worker 已清掉启动选择器留下的旧 prompt
@@ -3026,6 +3029,7 @@ export type WorkerToDaemonBase =
        *  that was already accounted as dispatched but whose worker is waiting
        *  in the start gate (no input was accepted yet). */
       turnId?: string;
+      dispatchAttempt?: number;
     }
   | { type: 'antigravity_account'; accountId: string | null; attemptId?: string }
   | { type: 'runner_build_ready'; runnerBuildId: string }
@@ -3196,6 +3200,7 @@ export type WorkerToDaemonBase =
        *  (claude-family first-turn launch recovery with no transcript ever). */
       resumeLost?: boolean }
   | { type: 'turn_interrupt_result'; requestId: string; turnId: string; delivered: boolean; reason?: 'stale_turn' | 'unsupported' | 'delivery_failed' | 'fork_pending' }
+  | { type: 'queued_turn_cancel_result'; requestId: string; turnId: string; status: 'queued_removed' | 'restart_required' | 'not_found' }
   /** A normal success acknowledgement for one app-server accepted steer.
    * `appTurnId` is diagnostic/protocol identity; `turnId` is the immutable
    * botmux/Lark reply route. This must never enter the attention path. */

@@ -1126,6 +1126,7 @@ import {
   type TurnTerminalCarrier,
 } from './types.js';
 import { hasProtectedSessionMutationOwnership, protectedSessionMutationReasons } from './session-mutation-guard.js';
+import { retryCancelledActivationPersistence } from './deferred-schedule-settlement.js';
 import { retainQueuedActivationRawInput } from './pending-repo-journal.js';
 import { failedTurnRewindInFlight, mergeFailedTurnInput, planFailedTurnRewind, turnAnswersInChat } from './failed-turn-rewind.js';
 import { decideAutoRestart, type RestartCounter } from './restart-policy.js';
@@ -16994,6 +16995,51 @@ export function interruptExactWorkerTurn(
   });
 }
 
+export type QueuedWorkerTurnCancelStatus = Extract<WorkerToDaemon, {
+  type: 'queued_turn_cancel_result';
+}>['status'] | 'no_worker' | 'timeout' | 'delivery_failed';
+
+/** Cancel an exact pre-ready/unsubmitted turn without borrowing the active
+ * execution fence required by interruptExactWorkerTurn. */
+export function cancelQueuedWorkerTurn(
+  ds: DaemonSession,
+  turnId: string,
+  timeoutMs = 10_000,
+): Promise<QueuedWorkerTurnCancelStatus> {
+  const worker = ds.worker;
+  if (!worker || worker.killed) return Promise.resolve('no_worker');
+  const requestId = randomUUID();
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = (status: QueuedWorkerTurnCancelStatus): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      worker.off('message', onMessage);
+      worker.off('exit', onExit);
+      resolve(status);
+    };
+    const onMessage = (msg: WorkerToDaemon): void => {
+      if (msg.type !== 'queued_turn_cancel_result' || msg.requestId !== requestId || msg.turnId !== turnId) return;
+      if (ds.worker !== worker) return finish('no_worker');
+      finish(msg.status);
+    };
+    const onExit = (): void => finish('no_worker');
+    const timer = setTimeout(() => finish('timeout'), timeoutMs);
+    timer.unref?.();
+    worker.on('message', onMessage);
+    worker.once('exit', onExit);
+    try {
+      const queued = afterWorkerIpcBootstrap(worker, () => worker.send({
+        type: 'cancel_queued_turn', requestId, turnId,
+      } satisfies DaemonToWorker));
+      if (!queued) finish('no_worker');
+    } catch {
+      finish('delivery_failed');
+    }
+  });
+}
+
 function settleTransferInputGate(
   ds: DaemonSession,
   gate: TransferInputGate,
@@ -19545,7 +19591,7 @@ export function promoteQueuedActivationTail(
   opts: { send?: boolean } = {},
 ): boolean {
   if (ds.session.status !== 'active') return false;
-  if (ds.activationCancellationPending) return false;
+  if (!retryCancelledActivationPersistence(ds)) return false;
   const cancelledTurnIds = new Set(ds.session.cancelledActivationTurnIds ?? []);
   if (ds.session.queuedActivationPending) {
     return !cancelledTurnIds.has(ds.session.queuedActivationTurnId ?? '');
@@ -25613,7 +25659,7 @@ function setupWorkerHandlers(
           }
         }
         const noticeKey = `${ds.workerGeneration}:${msg.detail}`;
-        if (managedAuxUiSuppressed(msg.turnId) || ds.session.principalLane) {
+        if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt) || ds.session.principalLane) {
           traexRuntimeDeferredNotice.delete(ds.session.sessionId);
           break;
         }
@@ -30815,7 +30861,10 @@ function setupWorkerHandlers(
         ds.antigravityRotation = clearInFlightAntigravityRotation(ds.antigravityRotation);
       }
       clearPendingSuspendClaim(ds, 'worker exited');
-      if (!restoreQueuedActivationOwnershipToCurrent(ds)) {
+      // A held predecessor journal still owns the head. Keep successor tail
+      // entries tagged for the replacement until that journal is released;
+      // stripping ownerRuntime here would strand them after exact cancellation.
+      if (!ds.session.queuedActivationPending && !restoreQueuedActivationOwnershipToCurrent(ds)) {
         logger.warn(`[${tag(ds)}] Activation ownership restore failed before detach reconciliation`);
       }
       // #3814 owns the sole offline promotion/claim state machine. The turn ids

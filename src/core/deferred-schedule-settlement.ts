@@ -82,8 +82,13 @@ export function settleHeldScheduleRunsOnWorkerExit(
 export interface ScheduledWorkerCancellationOptions {
   /** Exact accepted turns must survive cancellation of the other targets. */
   acceptedTurnIds?: ReadonlySet<string>;
-  /** Interrupt only the exact scheduled turn on a shared pre-ready worker. */
-  cancelTurn?: (ds: DaemonSession, turnId: string) => void | Promise<void>;
+  /** Cancel an exact unsubmitted turn; no active runtime is required. */
+  cancelTurn?: (ds: DaemonSession, turnId: string) => unknown | Promise<unknown>;
+  /** Last-resort retirement when the worker cannot prove queue removal. The
+   *  session row and retained human conversation stay active. */
+  retireWorker?: (ds: DaemonSession) => unknown | Promise<unknown>;
+  /** Release/promote retained work after a cancelled head or tail is removed. */
+  release?: (ds: DaemonSession) => unknown | Promise<unknown>;
   /** Test seam for an isolated session-store instance. */
   updateSession?: (session: DaemonSession['session']) => void;
 }
@@ -99,43 +104,9 @@ function hasOtherQueuedWork(ds: DaemonSession, cancelledTurnIds: ReadonlySet<str
   return false;
 }
 
-function persistCancelledTurnTombstones(
-  ds: DaemonSession,
-  turnIds: ReadonlySet<string>,
-  update: (session: DaemonSession['session']) => void,
-): boolean {
-  const previous = ds.session.cancelledActivationTurnIds;
-  ds.session.cancelledActivationTurnIds = [...new Set([...(previous ?? []), ...turnIds])];
-  try {
-    update(ds.session);
-    ds.activationCancellationPending = undefined;
-    return true;
-  } catch {
-    ds.session.cancelledActivationTurnIds = previous;
-    ds.activationCancellationPending = true;
-    return false;
-  }
-}
-
-function clearCancelledActivationJournal(
-  ds: DaemonSession,
-  turnIds: ReadonlySet<string>,
-  update: (session: DaemonSession['session']) => void,
-): void {
+function clearCancelledActivationJournal(ds: DaemonSession, turnIds: ReadonlySet<string>): boolean {
   const turnId = ds.session.queuedActivationTurnId;
-  if (!ds.session.queuedActivationPending || !turnId || !turnIds.has(turnId)) return;
-  const previous = {
-    pending: ds.session.queuedActivationPending,
-    token: ds.session.queuedActivationToken,
-    input: ds.session.queuedActivationInput,
-    turnId: ds.session.queuedActivationTurnId,
-    dispatchAttempt: ds.session.queuedActivationDispatchAttempt,
-    resume: ds.session.queuedActivationResume,
-    rawInput: ds.session.queuedActivationRawInput,
-    rawTurnId: ds.session.queuedActivationRawTurnId,
-    initialStartPending: ds.initialStartPending,
-    pendingPrompt: ds.pendingPrompt,
-  };
+  if (!ds.session.queuedActivationPending || !turnId || !turnIds.has(turnId)) return false;
   ds.session.queuedActivationPending = undefined;
   ds.session.queuedActivationToken = undefined;
   ds.session.queuedActivationInput = undefined;
@@ -146,29 +117,29 @@ function clearCancelledActivationJournal(
   ds.session.queuedActivationRawTurnId = undefined;
   ds.initialStartPending = false;
   ds.pendingPrompt = undefined;
+  return true;
+}
+
+/** Retry the exact in-memory tombstone/tail/journal state before any later
+ * promotion. A transient write failure must not become a permanent quarantine. */
+export function retryCancelledActivationPersistence(
+  ds: DaemonSession,
+  update: (session: DaemonSession['session']) => void = sessionStore.updateSession,
+): boolean {
+  if (!ds.activationCancellationPending) return true;
   try {
     update(ds.session);
-  } catch (error) {
-    Object.assign(ds.session, {
-      queuedActivationPending: previous.pending,
-      queuedActivationToken: previous.token,
-      queuedActivationInput: previous.input,
-      queuedActivationTurnId: previous.turnId,
-      queuedActivationDispatchAttempt: previous.dispatchAttempt,
-      queuedActivationResume: previous.resume,
-      queuedActivationRawInput: previous.rawInput,
-      queuedActivationRawTurnId: previous.rawTurnId,
-    });
-    ds.initialStartPending = previous.initialStartPending;
-    ds.pendingPrompt = previous.pendingPrompt;
-    throw error;
+    ds.activationCancellationPending = undefined;
+    return true;
+  } catch {
+    return false;
   }
 }
 
 /** Stop pre-ready work whose scheduled turn can no longer be allowed to execute.
- * Ready turns are never killed by this path. Tail entries are removed by exact
- * turn identity BEFORE any session-level close, so a ready old worker cannot
- * later promote a cancelled scheduled turn into its replacement. */
+ * A durable tombstone is written ahead of tail/journal cleanup. If either write
+ * fails, in-memory tombstones remain fail-closed and a later promotion retries
+ * the complete current state instead of losing the cancelled turn ids. */
 export function cancelPreReadyScheduledWorkers(
   sessions: Iterable<DaemonSession>,
   runId: string,
@@ -184,50 +155,120 @@ export function cancelPreReadyScheduledWorkers(
     const turnIds = new Set(runs.filter(run => run.runId === runId).map(run => run.turnId)
       .filter(turnId => !options.acceptedTurnIds?.has(turnId)));
     if (turnIds.size === 0) continue;
-    if (!persistCancelledTurnTombstones(ds, turnIds, options.updateSession ?? sessionStore.updateSession)) {
-      logger.warn(`[scheduler] Failed to persist cancellation tombstone for run ${runId}; promotion remains blocked`);
-      continue;
-    }
+    const update = options.updateSession ?? sessionStore.updateSession;
     const tail = ds.session.queuedActivationTail;
-    if (tail?.some(entry => turnIds.has(entry.turnId))) {
-      const retained = tail.filter(entry => !turnIds.has(entry.turnId));
-      const previous = tail;
+    const tailCancelled = !!tail?.some(entry => turnIds.has(entry.turnId));
+    const journalCancelled = !!ds.session.queuedActivationTurnId
+      && turnIds.has(ds.session.queuedActivationTurnId);
+    const stagedPlaceholder = ds.initialStartPending === true && !ds.worker;
+    const retainedHumanConversation = ds.hasHistory === true || !!ds.session.cliSessionId
+      || (!!ds.session.creationSource && ds.session.creationSource !== 'schedule');
+
+    ds.session.cancelledActivationTurnIds = [...new Set([
+      ...(ds.session.cancelledActivationTurnIds ?? []), ...turnIds,
+    ])];
+    // Write-ahead cancellation: the tombstone becomes durable BEFORE any tail
+    // or journal entry is removed. If the cleanup write later fails and the
+    // daemon restarts, recovery still filters this exact turn from the old tail.
+    try {
+      update(ds.session);
+      ds.activationCancellationPending = undefined;
+    } catch (error) {
+      ds.activationCancellationPending = true;
+      logger.warn(`[scheduler] Cancellation tombstone write-ahead for run ${runId} failed; worker execution is still blocked: ${String(error)}`);
+    }
+    if (tailCancelled) {
+      const retained = tail!.filter(entry => !turnIds.has(entry.turnId));
       ds.session.queuedActivationTail = retained.length > 0 ? retained : undefined;
-      try {
-        (options.updateSession ?? sessionStore.updateSession)(ds.session);
-      } catch (error) {
-        ds.session.queuedActivationTail = previous;
-        logger.warn(`[scheduler] Failed to remove cancelled activation turn(s) for run ${runId}: ${String(error)}`);
-        // The tombstone is already durable, so this turn cannot execute later.
-        // Do not close/interrupt based on the restored tail as if it were new work.
-        continue;
-      }
+    }
+    clearCancelledActivationJournal(ds, turnIds);
+    if (stagedPlaceholder && !retainedHumanConversation) {
+      // This prompt belongs to the cancelled scheduled opening itself, not to
+      // unrelated queued work that would justify keeping a placeholder alive.
+      ds.pendingPrompt = undefined;
+      ds.scheduledStagedInput = undefined;
     }
     try {
-      clearCancelledActivationJournal(ds, turnIds, options.updateSession ?? sessionStore.updateSession);
+      update(ds.session);
+      ds.activationCancellationPending = undefined;
     } catch (error) {
-      logger.warn(`[scheduler] Failed to clear cancelled activation journal for run ${runId}: ${String(error)}`);
+      ds.activationCancellationPending = true;
+      logger.warn(`[scheduler] Cancellation cleanup write for run ${runId} failed; retained in-memory tombstones and pruned state for retry: ${String(error)}`);
+    }
+
+    const waitingWorker = !!ds.worker && !ds.worker.killed && ds.workerReady !== true;
+    const otherWork = hasOtherQueuedWork(ds, turnIds);
+    const disposable = !retainedHumanConversation && !otherWork;
+    if (!stagedPlaceholder && !waitingWorker) {
+      if ((tailCancelled || journalCancelled) && options.release) {
+        void Promise.resolve(options.release(ds)).catch(error => {
+          logger.warn(`[scheduler] Failed to release retained activation work for run ${runId}: ${String(error)}`);
+        });
+      }
       continue;
     }
-    const stagedPlaceholder = ds.initialStartPending === true && !ds.worker;
-    const waitingWorker = !!ds.worker && !ds.worker.killed && ds.workerReady !== true;
-    if (!stagedPlaceholder && !waitingWorker) continue;
     cancelled += 1;
-    try {
-      if (hasOtherQueuedWork(ds, turnIds)) {
-        for (const turnId of turnIds) void Promise.resolve(options.cancelTurn?.(ds, turnId)).catch(error => {
-          logger.warn(`[scheduler] Failed to interrupt scheduled turn ${turnId} for run ${runId}: ${String(error)}`);
-        });
-      } else {
-        void Promise.resolve(close(ds)).catch(error => {
-          logger.warn(`[scheduler] Failed to close pre-ready worker for run ${runId}: ${String(error)}`);
-        });
+    void (async () => {
+      if (disposable) {
+        await close(ds);
+        return;
       }
-    } catch (error) {
-      logger.warn(`[scheduler] Failed to close pre-ready worker for run ${runId}: ${String(error)}`);
-    }
+      if (waitingWorker) {
+        // A tail-only item has already been removed from durable FIFO and needs
+        // no active-turn interrupt. Opening or worker-queued turns need the
+        // worker's exact unsubmitted-queue cancellation.
+        const needsWorkerCancel = journalCancelled || !tailCancelled;
+        let mustRetire = false;
+        if (needsWorkerCancel) {
+          for (const turnId of turnIds) {
+            const status = await options.cancelTurn?.(ds, turnId);
+            if (status !== undefined && status !== 'queued_removed') mustRetire = true;
+          }
+        }
+        let releaseAllowed = true;
+        if (mustRetire) {
+          if (!options.retireWorker) releaseAllowed = false;
+          else releaseAllowed = (await options.retireWorker(ds)) !== false;
+        }
+        if (!releaseAllowed) {
+          logger.warn(`[scheduler] Worker retirement for run ${runId} was not proven; retained successor stays queued`);
+          return;
+        }
+      }
+      if (options.release) await options.release(ds);
+    })().catch(error => {
+      logger.warn(`[scheduler] Failed to cancel pre-ready work for run ${runId}: ${String(error)}`);
+    });
   }
   return cancelled;
+}
+
+/** A durable activation head is recoverable only when its exact turn is not
+ *  tombstoned. Restore paths must check this again at the final fork boundary. */
+export function hasRecoverableActivationHead(
+  session: Pick<DaemonSession['session'], 'queuedActivationPending' | 'queuedActivationTurnId' | 'cancelledActivationTurnIds'>,
+): boolean {
+  return session.queuedActivationPending === true && !!session.queuedActivationTurnId
+    && !(session.cancelledActivationTurnIds ?? []).includes(session.queuedActivationTurnId);
+}
+
+/** After a proven retirement, an already-promoted human journal must not wait
+ * for an unrelated inbound merely because the eager retry claim was cleared. */
+export async function releaseCancelledActivationWork(
+  ds: DaemonSession,
+  deps: {
+    release: () => Promise<boolean>;
+    startJournal: () => void;
+    scheduleRetry: () => void;
+  },
+): Promise<void> {
+  if (await deps.release()) return;
+  if ((!ds.worker || ds.worker.killed)
+    && ds.session.queuedActivationPending && ds.session.queuedActivationInput) {
+    deps.startJournal();
+    return;
+  }
+  deps.scheduleRetry();
 }
 
 /** Execute the exact-turn lifecycle decision after a hidden schedule run

@@ -24,8 +24,9 @@ import * as scheduler from '../src/core/scheduler.js';
 import { ScheduleAuthorityStore } from '../src/services/schedule-authority-store.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
 import { queryScheduleRunLogs } from '../src/services/schedule-run-log-store.js';
-import { settleHeldScheduleRunsOnWorkerExit, cancelPreReadyScheduledWorkers } from '../src/core/deferred-schedule-settlement.js';
+import { settleHeldScheduleRunsOnWorkerExit, cancelPreReadyScheduledWorkers, retryCancelledActivationPersistence, releaseCancelledActivationWork } from '../src/core/deferred-schedule-settlement.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
+import { untilDoneDeadlineDue } from '../src/services/schedule-until-done.js';
 
 const APP = 'cli_deferred_test';
 
@@ -690,7 +691,9 @@ describe('deferred scheduled run lifecycle', () => {
     await flush();
     const parked = scheduler.getRuntimeTask(task.id, APP)!.deferredRun!;
     if (action === 'completeTask' || action === 'disableTask' || action === 'setEnabled') {
-      store.updateTask(APP, task.id, current => ({ ...current, untilDone: { status: 'open', attempts: 0, finalRunId: parked.runId } }));
+      store.updateTask(APP, task.id, current => ({ ...current, untilDone: {
+        status: 'open', attempts: 0, deadline: '2020-01-01T00:00:00.000Z', finalRunId: parked.runId,
+      } }));
     }
     const turnId = Object.values(parked.targetTurnIds!)[0]!;
     const ds = {
@@ -726,7 +729,11 @@ describe('deferred scheduled run lifecycle', () => {
     expect(scheduler.noteWorkerRuntimeAccepted(task.id, parked.runId, 'oc_a', turnId, APP)).toBe(false);
     expect(queryScheduleRunLogs(task.id, {}, APP).logs.filter(entry => entry.outcome === 'error')).toHaveLength(0);
     if (action === 'completeTask') expect(settled.untilDone?.status).toBe('done');
-    else expect(settled.untilDone?.status).toBe('open');
+    else {
+      expect(settled.untilDone?.status).toBe('open');
+      expect(settled.untilDone?.finalRunId).toBeUndefined();
+      expect(untilDoneDeadlineDue(settled, Date.now())).toBe(true);
+    }
   });
 
   it('writes exactly one successful run log when the tick settles an accepted parked run', async () => {
@@ -800,6 +807,45 @@ describe('deferred scheduled run lifecycle', () => {
     expect(scheduler.getRuntimeTask(task.id, APP)?.deferredRun?.runId).toBe(runId);
   });
 
+  it('preserves delivery error facts when the same deferred run is reclaimed', async () => {
+    const task = addTwoTargetTask();
+    const { callback } = makeDaemonCallback({ action: () => 'defer' });
+    scheduler.setExecuteCallback(callback);
+    scheduler.runNow(task.id);
+    await flush();
+    const runId = scheduler.getRuntimeTask(task.id, APP)!.deferredRun!.runId;
+    scheduler.recordDeliveryFailure(task.id, runId, 'parked send rejected', APP, 'schedule_send_rejected', 'oc_a');
+    const claimed = scheduler.claimDeferredRunForDispatch(task.id, runId, APP);
+    expect(claimed.ok).toBe(true);
+    if (!claimed.ok) return;
+    expect(claimed.task.lastDeliveryError).toBe('parked send rejected');
+    expect(claimed.task.lastError).toBe('parked send rejected');
+    expect(scheduler.getRuntimeTask(task.id, APP)?.lastDeliveryError).toBe('parked send rejected');
+  });
+
+  it('writes one terminal deferred delivery-failure log with per-target facts', async () => {
+    const task = addTwoTargetTask();
+    const { callback } = makeDaemonCallback({ action: () => 'defer' });
+    scheduler.setExecuteCallback(callback);
+    scheduler.runNow(task.id);
+    await flush();
+    const parked = scheduler.getRuntimeTask(task.id, APP)!.deferredRun!;
+    scheduler.recordDeliveryFailure(task.id, parked.runId, 'oc_a rejected', APP, 'schedule_send_rejected', 'oc_a');
+    for (const [chatId, turnId] of Object.entries(parked.targetTurnIds!)) {
+      expect(scheduler.noteWorkerRuntimeAccepted(task.id, parked.runId, chatId, turnId, APP)).toBe(true);
+    }
+    vi.useFakeTimers({ now: new Date(Date.parse(parked.since) + 30_000) });
+    scheduler.startScheduler();
+    await vi.advanceTimersByTimeAsync(5_000);
+    const logs = queryScheduleRunLogs(task.id, {}, APP).logs.filter(entry => entry.id === parked.runId);
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toMatchObject({
+      outcome: 'error', errorCode: 'schedule_send_rejected',
+      targetResults: [{ chatId: 'oc_a', outcome: 'error' }, { chatId: 'oc_b', outcome: 'model_dispatched' }],
+      deliveryFailureBaseline: { outcome: 'model_dispatched' },
+    });
+  });
+
   it('rejects schedule-expression edits while a run is parked', async () => {
     const task = addTwoTargetTask();
     const { callback } = makeDaemonCallback({ action: () => 'defer' });
@@ -864,7 +910,7 @@ describe('deferred scheduled run lifecycle', () => {
     const base = {
       worker: { killed: false }, workerReady: false, workerPort: null, workerToken: null,
       larkAppId: APP, chatId: 'oc_a', chatType: 'group', scope: 'thread',
-      spawnedAt: 0, lastMessageAt: 0, hasHistory: true, workingDir: '/tmp',
+      spawnedAt: 0, lastMessageAt: 0, hasHistory: false, workingDir: '/tmp',
     };
     const pre = {
       ...base,
@@ -956,15 +1002,25 @@ describe('deferred scheduled run lifecycle', () => {
         queuedActivationTail: [{ turnId: targetTurn, ownerRuntime: 'new' }] as any },
     };
     cancelTurn.mockClear();
+    const durableStates: any[] = [];
     const updateSession = vi.fn()
-      .mockImplementationOnce(() => {})
-      .mockImplementationOnce(() => { throw new Error('controlled tail write failure'); });
+      .mockImplementationOnce(session => { durableStates.push(structuredClone(session)); })
+      .mockImplementationOnce(() => { throw new Error('controlled cleanup write failure'); });
     expect(cancelPreReadyScheduledWorkers([failedWrite], runId, close, { updateSession })).toBe(0);
+    expect(updateSession).toHaveBeenCalledTimes(2);
+    // The first write is a write-ahead tombstone with the old tail intact. A
+    // restart after the second-write failure can still filter the cancelled turn.
+    expect(durableStates[0].queuedActivationTail.map((entry: any) => entry.turnId)).toContain(targetTurn);
+    expect(durableStates[0].cancelledActivationTurnIds).toContain(targetTurn);
     expect(failedWrite.session.cancelledActivationTurnIds).toContain(targetTurn);
-    expect(failedWrite.activationCancellationPending).toBeUndefined();
+    expect(failedWrite.activationCancellationPending).toBe(true);
     expect(close).not.toHaveBeenCalled();
     expect(cancelTurn).not.toHaveBeenCalled();
-    expect(failedWrite.session.queuedActivationTail).toHaveLength(1);
+    // Cleanup failure keeps the pruned state and tombstone in memory, then the
+    // same state is retried before promotion rather than restoring the turn.
+    expect(failedWrite.session.queuedActivationTail).toBeUndefined();
+    expect(retryCancelledActivationPersistence(failedWrite, vi.fn())).toBe(true);
+    expect(failedWrite.activationCancellationPending).toBeUndefined();
 
     const tombstoneFailure = {
       ...ready,
@@ -976,6 +1032,133 @@ describe('deferred scheduled run lifecycle', () => {
     })).toBe(0);
     expect(tombstoneFailure.activationCancellationPending).toBe(true);
     expect(close).not.toHaveBeenCalled();
+  });
+
+  it('cancels a shared pre-ready opening and releases the retained human successor', async () => {
+    const runId = 'run-shared-opening';
+    const ds = {
+      worker: { killed: false }, workerReady: false, hasHistory: true,
+      session: {
+        status: 'active', creationSource: 'schedule', cliSessionId: 'traex-human',
+      },
+    } as any;
+    ds.session.scheduledRuns = { 'schedule:target': { taskId: 'defer001', runId, turnId: 'schedule:target' } };
+    Object.assign(ds.session, {
+      queuedActivationPending: true, queuedActivationTurnId: 'schedule:target',
+      queuedActivationToken: 'token-target',
+      queuedActivationTail: [{ turnId: 'om_human', ownerRuntime: 'new' }],
+    });
+    const close = vi.fn();
+    const cancelTurn = vi.fn(async () => 'queued_removed');
+    const release = vi.fn(async () => {});
+    expect(cancelPreReadyScheduledWorkers([ds], runId, close, {
+      cancelTurn, release, updateSession: vi.fn(),
+    })).toBe(1);
+    await flush();
+    expect(cancelTurn).toHaveBeenCalledWith(ds, 'schedule:target');
+    expect(release).toHaveBeenCalledWith(ds);
+    expect(close).not.toHaveBeenCalled();
+    expect(ds.session.status).toBe('active');
+    expect(ds.session.queuedActivationTail.map((entry: any) => entry.turnId)).toEqual(['om_human']);
+  });
+
+  it('retires only the worker when exact queue cancellation is unproven', async () => {
+    const ds = {
+      worker: { killed: false }, workerReady: false, hasHistory: true,
+      session: {
+        status: 'active', cliSessionId: 'traex-human',
+        scheduledRuns: { 'schedule:argv': { taskId: 'defer001', runId: 'run-argv', turnId: 'schedule:argv' } },
+        queuedActivationTail: [{ turnId: 'om_human', ownerRuntime: 'new' }],
+      },
+    } as any;
+    const close = vi.fn();
+    const retireWorker = vi.fn(async () => {});
+    const release = vi.fn(async () => {});
+    expect(cancelPreReadyScheduledWorkers([ds], 'run-argv', close, {
+      cancelTurn: async () => 'restart_required', retireWorker, release, updateSession: vi.fn(),
+    })).toBe(1);
+    await flush();
+    expect(retireWorker).toHaveBeenCalledWith(ds);
+    expect(release).toHaveBeenCalledWith(ds);
+    expect(close).not.toHaveBeenCalled();
+    expect(ds.session.status).toBe('active');
+  });
+
+  it('does not release a successor when worker retirement is refused', async () => {
+    const ds = {
+      worker: { killed: false }, workerReady: false, hasHistory: true,
+      session: {
+        status: 'active', cliSessionId: 'remote-human',
+        scheduledRuns: { 'schedule:remote': { taskId: 'defer001', runId: 'run-remote', turnId: 'schedule:remote' } },
+        queuedActivationTail: [{ turnId: 'om_remote_human', ownerRuntime: 'new' }],
+      },
+    } as any;
+    const release = vi.fn(async () => {});
+    expect(cancelPreReadyScheduledWorkers([ds], 'run-remote', vi.fn(), {
+      cancelTurn: async () => 'restart_required', retireWorker: async () => false,
+      release, updateSession: vi.fn(),
+    })).toBe(1);
+    await flush();
+    expect(release).not.toHaveBeenCalled();
+    expect(ds.session.queuedActivationTail.map((entry: any) => entry.turnId)).toEqual(['om_remote_human']);
+    expect(ds.worker.killed).toBe(false);
+  });
+
+  it('cold-starts a retained human journal after a proven worker retirement', async () => {
+    const ds = {
+      worker: null,
+      session: { queuedActivationPending: true, queuedActivationInput: { content: 'human' } },
+    } as any;
+    const startJournal = vi.fn();
+    const scheduleRetry = vi.fn();
+    await releaseCancelledActivationWork(ds, {
+      release: async () => false, startJournal, scheduleRetry,
+    });
+    expect(startJournal).toHaveBeenCalledOnce();
+    expect(scheduleRetry).not.toHaveBeenCalled();
+    await releaseCancelledActivationWork(ds, {
+      release: async () => true, startJournal, scheduleRetry,
+    });
+    expect(startJournal).toHaveBeenCalledOnce();
+    expect(scheduleRetry).not.toHaveBeenCalled();
+  });
+
+  it('closes a staged scheduled placeholder whose own pendingPrompt is cancelled', async () => {
+    const ds = {
+      worker: null, workerReady: false, initialStartPending: true,
+      hasHistory: false, pendingPrompt: 'scheduled opening', scheduledStagedInput: {},
+      session: {
+        status: 'active', creationSource: 'schedule',
+        scheduledRuns: { 'schedule:staged': { taskId: 'defer001', runId: 'run-staged', turnId: 'schedule:staged' } },
+      },
+    } as any;
+    const close = vi.fn(async () => {});
+    expect(cancelPreReadyScheduledWorkers([ds], 'run-staged', close, { updateSession: vi.fn() })).toBe(1);
+    await flush();
+    expect(close).toHaveBeenCalledWith(ds);
+    expect(ds.pendingPrompt).toBeUndefined();
+    expect(ds.scheduledStagedInput).toBeUndefined();
+  });
+
+  it('still cancels a retained pre-ready worker when the atomic tombstone write fails', async () => {
+    const ds = {
+      worker: { killed: false }, workerReady: false, hasHistory: true,
+      session: {
+        status: 'active', cliSessionId: 'traex-human',
+        scheduledRuns: { 'schedule:busy': { taskId: 'defer001', runId: 'run-busy', turnId: 'schedule:busy' } },
+      },
+    } as any;
+    const close = vi.fn();
+    const cancelTurn = vi.fn(async () => 'queued_removed');
+    expect(cancelPreReadyScheduledWorkers([ds], 'run-busy', close, {
+      cancelTurn, updateSession: () => { throw new Error('SQLITE_BUSY'); },
+    })).toBe(1);
+    await flush();
+    expect(cancelTurn).toHaveBeenCalledWith(ds, 'schedule:busy');
+    expect(ds.activationCancellationPending).toBe(true);
+    expect(ds.session.cancelledActivationTurnIds).toContain('schedule:busy');
+    expect(close).not.toHaveBeenCalled();
+    expect(ds.session.status).toBe('active');
   });
 
   it('ignores a superseded in-flight callback after a newer run has settled', async () => {

@@ -28,6 +28,7 @@ import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } fr
 import { logger } from '../utils/logger.js';
 import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, findQuarantinedRoutingConflict, isDisposableCommandScratch, isRelayableRealSession, closeSession, closeSessionForBackgroundCleanup, findActiveBySessionId, identityStorageModelForDaemonSession, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart, recordTurnExplicitMention, resumeTurnNotices } from './worker-pool.js';
 import { createCliAdapterSync, resolveCommandReal } from '../adapters/cli/registry.js';
+import { hasRecoverableActivationHead } from './deferred-schedule-settlement.js';
 import { precheckTraexRuntime, traexLaunchUsesSharedRuntimeGate } from '../services/traex-runtime-gate.js';
 import { releaseDirForExecutable } from '../services/traex-runtime-snapshot.js';
 import { resolveTraexChildHome } from '../services/traex-paths.js';
@@ -3587,6 +3588,32 @@ export async function restoreActiveSessions(
       // patch a streaming card. Cleared on the first real CLI input.
       suppressRecoveryCard: true,
     };
+    const cancelledHeadTurnId = session.queuedActivationTurnId;
+    if (session.queuedActivationPending && cancelledHeadTurnId
+      && (session.cancelledActivationTurnIds ?? []).includes(cancelledHeadTurnId)) {
+      // Apply cancellation tombstones BEFORE any recovery callback can select
+      // this head. Then promote the next eligible tail through the normal owner.
+      session.queuedActivationPending = undefined;
+      session.queuedActivationToken = undefined;
+      session.queuedActivationInput = undefined;
+      session.queuedActivationRawInput = undefined;
+      session.queuedActivationRawTurnId = undefined;
+      session.queuedActivationTurnId = undefined;
+      session.queuedActivationDispatchAttempt = undefined;
+      session.queuedActivationResume = undefined;
+      session.queuedPrompt = undefined;
+      session.queuedCodexAppText = undefined;
+      session.queuedCodexAppMessageContext = undefined;
+      if (session.pendingRepoSetup?.turnId === cancelledHeadTurnId) session.pendingRepoSetup = undefined;
+      if (!ds.pendingRawTurnId || ds.pendingRawTurnId === cancelledHeadTurnId) {
+        ds.pendingRawInput = undefined;
+        ds.pendingRawTurnId = undefined;
+      }
+      ds.pendingPrompt = undefined;
+      ds.initialStartPending = false;
+      sessionStore.updateSession(session);
+      if ((session.queuedActivationTail?.length ?? 0) > 0) promoteQueuedActivationTail(ds, { send: false });
+    }
     if (session.deferredScheduleRun) {
       const binding = readDeferredTopicBinding(config.session.dataDir, session.sessionId);
       if (!binding) {
@@ -3979,7 +4006,7 @@ export async function restoreActiveSessions(
       // is pending), which a quarantined owner is not (its promotion failed, so
       // queuedActivationPending stayed false) — the guard rewrites the fork args
       // in that case instead.
-      const recoverExactNonCodex = ds.session.queuedActivationPending
+      const recoverExactNonCodex = hasRecoverableActivationHead(ds.session)
         && ds.session.cliId !== 'codex-app'
         && ds.session.queuedActivationInput;
       const prompt = recoverExactNonCodex || '';
@@ -5490,7 +5517,10 @@ export async function executeScheduledTask(
             // creates the session, every later fire injects into it), so the
             // failure shape would be "worked once, silently identity-less after".
             // A refused durable admission must stop before the IPC send.
-            if (!(await persistDispatch(existing))) return 'deferred';
+            if (!(await persistDispatch(existing))) {
+              if (silent) disarmSilentScheduledTurn(existing, scheduledTurnId);
+              return 'deferred';
+            }
             if (sendWorkerInput(
               existing,
               input,
@@ -5509,7 +5539,10 @@ export async function executeScheduledTask(
           throw new Error(`scheduled continuation lost active session ${existing.session.sessionId}`);
         }
         try {
-          if (!(await persistDispatch(existing))) return 'deferred';
+          if (!(await persistDispatch(existing))) {
+            if (silent) disarmSilentScheduledTurn(existing, scheduledTurnId);
+            return 'deferred';
+          }
           forkWorker(existing, input, { resume: existing.hasHistory, turnId: scheduledTurnId });
         } catch (err) {
           if (silent) disarmSilentScheduledTurn(existing, scheduledTurnId);

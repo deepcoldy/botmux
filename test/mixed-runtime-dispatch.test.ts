@@ -9,6 +9,7 @@ import * as scheduler from '../src/core/scheduler.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
 import type { ScheduleExecutionContext } from '../src/core/scheduler.js';
 import { executeScheduledTaskForTargets, ScheduleTargetExecutionError } from '../src/services/schedule-target-executor.js';
+import { queryScheduleRunLogs } from '../src/services/schedule-run-log-store.js';
 
 const APP = 'cli_mixed_dispatch';
 let root: string;
@@ -76,6 +77,9 @@ describe('mixed non-TRAE + TRAE dispatch', () => {
       scheduleTimeZone: () => 'Asia/Shanghai', executeScheduledTaskForTargets,
       ScheduleTargetExecutionError, activeSessions: active, refreshCliVersion: async () => {},
       precondition: { precondition: 'passed' }, targetResults: undefined,
+      resolveScheduleRunLogErrorDetails: (_precondition: unknown, error: unknown) => ({
+        error: error instanceof Error ? error.message : String(error),
+      }),
       withBotTurnAdmission: (_app: string, action: () => unknown) => action(),
       getAllBots: () => [{ config: { larkAppId: APP, cliId: 'traex' } }],
       executeScheduledTask: async (target: any, sessions: typeof active, _refresh: any, _prompt: any, runtime: any) => {
@@ -105,6 +109,9 @@ describe('mixed non-TRAE + TRAE dispatch', () => {
       scheduleTimeZone: () => 'Asia/Shanghai', executeScheduledTaskForTargets,
       ScheduleTargetExecutionError, activeSessions: active, refreshCliVersion: async () => {},
       precondition: { precondition: 'passed' }, targetResults: undefined,
+      resolveScheduleRunLogErrorDetails: (_precondition: unknown, error: unknown) => ({
+        error: error instanceof Error ? error.message : String(error),
+      }),
       withBotTurnAdmission: (_app: string, action: () => unknown) => action(),
       getAllBots: () => [{ config: { larkAppId: APP, cliId: 'traex' } }],
       executeScheduledTask: async (target: any, sessions: typeof active, _refresh: any, _prompt: any, runtime: any) => {
@@ -129,5 +136,44 @@ describe('mixed non-TRAE + TRAE dispatch', () => {
     await vi.advanceTimersByTimeAsync(5_000);
     expect(current().lastStatus).toBe('ok');
     expect(current().deferredRun).toBeUndefined();
+  });
+
+  it('terminally settles a non-TRAE target error without a parked retry storm', async () => {
+    const active = sessions();
+    expect(scheduler.parkDeferredRun(taskId, context, {
+      runId: context.runId, detail: 'TRAE held', targets: { oc_A: 'waiting', oc_B: 'held' },
+      heldTargets: { oc_B: turnB }, targetTurnIds: { oc_A: turnA, oc_B: turnB },
+    })).toBe(true);
+    const attempts: string[] = [];
+    const run = productionRunTargets()({ task: current(), executionContext: context, parked: current().deferredRun,
+      scheduler, scheduleStore, effectiveAppId: APP, cfg: { cliId: 'traex' },
+      randomUUID: () => 'unused', buildUntilDoneRunPrompt: () => undefined,
+      scheduleTimeZone: () => 'Asia/Shanghai', executeScheduledTaskForTargets,
+      ScheduleTargetExecutionError, activeSessions: active, refreshCliVersion: async () => {},
+      precondition: { precondition: 'passed' }, targetResults: undefined,
+      resolveScheduleRunLogErrorDetails: (_precondition: unknown, error: unknown) => ({
+        error: error instanceof Error ? error.message : String(error), errorCode: 'schedule_target_failed',
+      }),
+      withBotTurnAdmission: (_app: string, action: () => unknown) => action(),
+      getAllBots: () => [{ config: { larkAppId: APP, cliId: 'claude-code' } }],
+      executeScheduledTask: async (target: any) => {
+        attempts.push(target.chatId);
+        throw new Error('permanent target refusal');
+      },
+    }) as () => Promise<'dispatched' | 'deferred'>;
+
+    expect(await run()).toBe('deferred');
+    expect(current().lastStatus).toBe('error');
+    expect(current().deferredRun).toBeUndefined();
+    expect(current().runStats?.failed).toBe(1);
+    const logs = queryScheduleRunLogs(taskId, {}, APP).logs.filter(entry => entry.id === context.runId);
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toMatchObject({ outcome: 'error', errorCode: 'schedule_target_failed', targetResults: [
+      { chatId: 'oc_A', outcome: 'error' }, { chatId: 'oc_B', outcome: 'deferred' },
+    ] });
+    scheduler.startScheduler();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(attempts).toEqual(['oc_A']);
+    expect(queryScheduleRunLogs(taskId, {}, APP).logs.filter(entry => entry.id === context.runId)).toHaveLength(1);
   });
 });

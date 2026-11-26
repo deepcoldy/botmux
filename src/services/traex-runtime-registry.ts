@@ -17,7 +17,7 @@
  * provable process-birth source, the lease + `kill(pid, 0)` policy is used and
  * an unprovable record keeps occupying the domain.
  */
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withExclusiveFileLock } from '../utils/file-flock.js';
@@ -78,6 +78,9 @@ export interface TraexRuntimeOccupant {
    *  (adopt/reattach/endpoint). It is never superseded by a later new exec from
    *  the same worker pid: it describes a different process. */
   occupancyOnly?: boolean;
+  /** Leaf death was reported, but teardown could not prove that its process
+   *  group (including ordinary tool descendants) is gone. */
+  deathUnproven?: true;
   createdAt: number;
   heartbeatAt: number;
   leaseUntil: number;
@@ -199,6 +202,7 @@ function normalizeOccupant(value: unknown): TraexRuntimeOccupant | undefined {
     ...(typeof v.bootId === 'string' ? { bootId: v.bootId } : {}),
     ...(v.fixedPath === true ? { fixedPath: true } : {}),
     ...(v.occupancyOnly === true ? { occupancyOnly: true } : {}),
+    ...(v.deathUnproven === true ? { deathUnproven: true } : {}),
     createdAt: typeof v.createdAt === 'number' ? v.createdAt : 0,
     heartbeatAt: typeof v.heartbeatAt === 'number' ? v.heartbeatAt : 0,
     leaseUntil: typeof v.leaseUntil === 'number' ? v.leaseUntil : 0,
@@ -256,10 +260,28 @@ function processOwnershipFor(occupant: TraexRuntimeOccupant) {
     : undefined;
 }
 
+function processGroupLiveness(pid: number | undefined): OccupantLiveness {
+  if (pid === undefined || !Number.isSafeInteger(pid) || pid <= 1 || process.platform !== 'linux') return 'unknown';
+  let entries: string[];
+  try { entries = readdirSync('/proc'); } catch { return 'unknown'; }
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    try {
+      const stat = readFileSync(`/proc/${entry}/stat`, 'utf8');
+      const fields = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/);
+      if (Number(fields[2]) === pid && fields[0] !== 'Z' && fields[0] !== 'X') return 'alive';
+    } catch (error) {
+      if (!['ENOENT', 'ESRCH'].includes((error as NodeJS.ErrnoException).code ?? '')) return 'unknown';
+    }
+  }
+  return 'dead';
+}
+
 export function occupantLiveness(occupant: TraexRuntimeOccupant, now = Date.now()): OccupantLiveness {
   void now; // liveness is pid/birth based; the lease is only a status hint
   const boot = readLinuxBootIdentity();
   if (occupant.bootId !== undefined && boot !== undefined && occupant.bootId !== boot) return 'dead';
+  if (occupant.deathUnproven === true) return processGroupLiveness(occupant.cliPid);
   if (occupant.cliPid !== undefined) {
     const cli = traexCliLiveness(occupant);
     if (cli !== 'dead') return cli;
@@ -371,7 +393,7 @@ function supersedableSameOwner(
 ): boolean {
   if (occupant.occupancyOnly === true) return false;
   if (occupant.workerPid !== request.workerPid) return false;
-  if ((occupant.workerStart ?? undefined) !== (request.workerStart ?? undefined)) return false;
+  if (!occupant.workerStart || !request.workerStart || occupant.workerStart !== request.workerStart) return false;
   if (occupant.phase !== 'starting') return false;
   // pruneDead already includes helper/writer scans. Never let same-owner
   // supersession bypass a live snapshot helper after the leaf CLI exits.
@@ -594,6 +616,22 @@ export async function markTraexRuntimeUnknown(
   }, detail.now ?? Date.now());
 }
 
+export async function markTraexRuntimeDeathUnproven(
+  domain: TraexRuntimeDomain,
+  occupantId: string,
+  cliPid: number,
+  now = Date.now(),
+): Promise<boolean> {
+  return mutateOccupant(domain, occupantId, occupant => ({
+    ...occupant,
+    cliPid,
+    phase: 'draining',
+    deathUnproven: true,
+    heartbeatAt: now,
+    leaseUntil: now + TRAEX_RUNTIME_LEASE_MS,
+  }), now);
+}
+
 export async function heartbeatTraexRuntime(
   domain: TraexRuntimeDomain,
   occupantId: string,
@@ -637,6 +675,7 @@ export async function releaseTraexRuntime(
       // Keep `starting` for bounded orphan recovery; never turn it into a
       // permanent `draining` record that reconcileStartingOrphans would skip.
       if (target.cliPid === undefined) return false;
+      if (target.cliPid !== undefined) {
       // A recorded CLI that cannot be proven dead keeps the domain. Mark it
       // `draining` so status messages explain why a newer content waits, and
       // let a later prune/release finish once the kernel proves it gone.
@@ -649,7 +688,7 @@ export async function releaseTraexRuntime(
       // for any process still running from the recorded snapshot. `undefined`
       // means the platform cannot answer (macOS); fall back to the CLI verdict
       // rather than blocking forever, matching `occupantLiveness`.
-      const cli = traexCliLiveness(target);
+      const cli = target.deathUnproven === true ? occupantLiveness(target) : traexCliLiveness(target);
       const writers = target.snapshotDir
         ? findProcessesRunningUnder(target.snapshotDir, processOwnershipFor(target))
         : undefined;
@@ -665,6 +704,7 @@ export async function releaseTraexRuntime(
           });
         }
         return false;
+      }
       }
     }
     const next = read.registry.occupants.filter((occupant) => occupant.occupantId !== occupantId);

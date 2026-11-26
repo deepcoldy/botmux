@@ -103,6 +103,9 @@ export interface TraexRuntimeContent {
    *  atomically consistent: an entry switch after the lease cannot relabel
    *  which install this runtime was admitted from. */
   sourceInstallIdentity?: ExecutableIdentity;
+  /** Source stat signature captured atomically with comboKey. For reused
+   *  snapshots this is the CURRENT capture, not the historical manifest. */
+  sourceSignature?: string;
 }
 
 export interface TraexSnapshot extends TraexRuntimeContent {
@@ -296,6 +299,7 @@ export async function captureTraexExecutableIdentity(executablePath: string): Pr
   const installationCandidate = join(dir, 'trae-installation.json');
   const helper = existsSync(helperCandidate) ? helperCandidate : undefined;
   const installation = existsSync(installationCandidate) ? installationCandidate : undefined;
+  const sourceSignature = statSignature([executablePath, helper, installation]);
   const hashes = {
     traex: await sha256File(executablePath),
     ...(helper ? { helper: await sha256File(helper) } : {}),
@@ -306,6 +310,7 @@ export async function captureTraexExecutableIdentity(executablePath: string): Pr
     comboKey: comboKeyFromHashes(hashes),
     dir,
     traexPath: executablePath,
+    ...(sourceSignature ? { sourceSignature } : {}),
     ...(sourceInstallIdentity ? { sourceInstallIdentity } : {}),
     ...(helper ? { helperPath: helper } : {}),
     ...(installation ? { installationPath: installation } : {}),
@@ -348,6 +353,7 @@ function snapshotFromDir(
   manifest: TraexSnapshotManifest,
   reused: boolean,
   sourceInstallIdentity?: ExecutableIdentity,
+  sourceSignature?: string,
 ): TraexSnapshot {
   const paths = snapshotPaths(dir);
   return {
@@ -360,6 +366,7 @@ function snapshotFromDir(
     reused,
     snapshot: true,
     ...(sourceInstallIdentity ? { sourceInstallIdentity } : {}),
+    ...(sourceSignature ? { sourceSignature } : {}),
   };
 }
 
@@ -379,7 +386,7 @@ function reusableSnapshot(dir: string, identity: TraexReleaseIdentity): TraexSna
   } catch {
     return undefined;
   }
-  return snapshotFromDir(dir, manifest, true, identity.sourceInstallIdentity);
+  return snapshotFromDir(dir, manifest, true, identity.sourceInstallIdentity, identity.sourceSignature);
 }
 
 function fileStat(path: string): ReleaseFileStat {
@@ -572,7 +579,7 @@ export async function materializeTraexSnapshot(input: {
             }
             throw err;
           }
-          return { kind: 'snapshot', snapshot: snapshotFromDir(finalDir, manifest, false, identity.sourceInstallIdentity) };
+          return { kind: 'snapshot', snapshot: snapshotFromDir(finalDir, manifest, false, identity.sourceInstallIdentity, identity.sourceSignature) };
         } catch (err) {
           try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best effort */ }
           throw err;

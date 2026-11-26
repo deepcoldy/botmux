@@ -30,11 +30,13 @@ import {
   TRAEX_RUNTIME_REGISTRY_NAME,
 } from '../src/services/traex-runtime-domain.js';
 import {
+  abandonTraexRuntime,
   acquireTraexRuntimeStart,
   contentCompatible,
   occupantLiveness,
   readTraexRuntimeOccupants,
   releaseTraexRuntime,
+  markTraexRuntimeDeathUnproven,
   markTraexRuntimeRunning,
   markTraexRuntimeUnknown,
   type TraexRuntimeOccupant,
@@ -50,6 +52,7 @@ import {
 } from '../src/services/traex-runtime-snapshot.js';
 import {
   acquireTraexRuntimeLease,
+  acquireTraexRuntimePeerLease,
   acquireTraexRuntimeOccupancy,
   applyTraexRuntimeOwnershipEnv,
   captureTraexRunningContentIdentity,
@@ -603,7 +606,7 @@ describe('acquireTraexRuntimeLease', () => {
     expect(live.kind).toBe('granted');
     if (live.kind !== 'granted') return;
     await live.lease.markRunning(process.pid);
-    await live.lease.release();
+    await expect(live.lease.release()).rejects.toThrow('lease retained for retry');
     const domain = resolveTraexRuntimeDomain(home);
     if (domain.kind !== 'ready') throw new Error('domain not ready');
     const kept = readTraexRuntimeOccupants(domain.domain) ?? [];
@@ -714,7 +717,7 @@ describe('acquireTraexRuntimeLease', () => {
     expect(precheckTraexRuntime({ traeHome: home, releaseDir: dir }).state).toBe('compatible');
     // A different release signature => defer, never assume compatibility.
     expect(precheckTraexRuntime({ traeHome: home, releaseDir: release('b') }).state).toBe('blocked');
-    await lease.lease.release();
+    await lease.lease.abandon();
   });
 
   it('computes a stable install signature and leaves absent files as holes', () => {
@@ -807,6 +810,103 @@ describe('runtime registry lifecycle regressions', () => {
     expect(precheckTraexRuntime({ traeHome: home, releaseDir: dir }).state).toBe('compatible');
   });
 
+  it.skipIf(process.platform !== 'linux')('keeps death-unproven process groups blocked until every descendant exits', async () => {
+    const domain = testDomain(traeHome());
+    const leader = spawn('/bin/sh', ['-c', 'sleep 60 & exit 0'], { detached: true, stdio: 'ignore' });
+    const pid = leader.pid!;
+    const cliStart = readProcessStartIdentity(pid);
+    try {
+      await acquireTraexRuntimeStart(domain, {
+        occupantId: 'rpc-leaf', comboKey: 'content-a', cliPid: pid, ...(cliStart ? { cliStart } : {}),
+        workerPid: process.pid, daemonPid: process.pid,
+      });
+      if (leader.exitCode === null) await new Promise<void>(resolve => leader.once('exit', () => resolve()));
+      await markTraexRuntimeDeathUnproven(domain, 'rpc-leaf', pid);
+      const blocked = await acquireTraexRuntimeStart(domain, {
+        occupantId: 'incompatible', comboKey: 'content-b', workerPid: process.pid, daemonPid: process.pid,
+      });
+      expect(blocked.decision).toBe('blocked');
+      expect(readTraexRuntimeOccupants(domain)?.[0]?.deathUnproven).toBe(true);
+      process.kill(-pid, 'SIGKILL');
+      await new Promise(resolve => setTimeout(resolve, 50));
+      const after = await acquireTraexRuntimeStart(domain, {
+        occupantId: 'after-group-exit', comboKey: 'content-b', workerPid: process.pid, daemonPid: process.pid,
+      });
+      expect(after.decision).toBe('start');
+    } finally {
+      try { process.kill(-pid, 'SIGKILL'); } catch { /* group already gone */ }
+    }
+  });
+
+  it.skipIf(process.platform !== 'linux')('keeps PID-less adopted occupancy closed when actual process identity is unproven', async () => {
+    const dir = realRelease('adopt-no-pid');
+    const occupancy = await acquireTraexRuntimeOccupancy({
+      traeHome: traeHome(), releaseDir: dir, workerPid: process.pid, daemonPid: process.pid,
+      existingRuntime: true,
+    });
+    expect(occupancy.kind).toBe('granted');
+    if (occupancy.kind !== 'granted') return;
+    const child = spawn(join(dir, 'traex'), ['60'], { stdio: 'ignore' });
+    children.push(child);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    await expect(occupancy.lease.release()).rejects.toThrow('lease retained for retry');
+    expect(readTraexRuntimeOccupants(occupancy.lease.domain)?.map(entry => entry.occupantId)).toEqual([occupancy.lease.occupantId]);
+    await exited(child);
+    await expect(occupancy.lease.release()).rejects.toThrow('lease retained for retry');
+    expect(readTraexRuntimeOccupants(occupancy.lease.domain)?.map(entry => entry.occupantId)).toEqual([occupancy.lease.occupantId]);
+    await abandonTraexRuntime(occupancy.lease.domain, occupancy.lease.occupantId);
+  });
+
+  it.each(['app-server', 'viewer'] as const)('keeps independent RPC peer occupants when the %s exits first', async firstExit => {
+    const app = await acquireTraexRuntimeLease({
+      traeHome: traeHome(), releaseDir: release('a'), workerPid: process.pid, daemonPid: process.pid,
+    });
+    expect(app.kind).toBe('granted');
+    if (app.kind !== 'granted') return;
+    await app.lease.markRunning(process.pid);
+    const viewer = await acquireTraexRuntimePeerLease(app.lease, {
+      workerPid: process.pid, daemonPid: process.pid,
+    });
+    expect(viewer.kind).toBe('granted');
+    if (viewer.kind !== 'granted') return;
+    await viewer.lease.markRunning(process.ppid);
+    expect(viewer.lease.occupantId).not.toBe(app.lease.occupantId);
+    expect(viewer.lease.snapshot.comboKey).toBe(app.lease.snapshot.comboKey);
+    expect(viewer.lease.installSignature).toBe(app.lease.installSignature);
+    const occupants = readTraexRuntimeOccupants(app.lease.domain) ?? [];
+    expect(occupants.find(entry => entry.occupantId === app.lease.occupantId)?.cliPid).toBe(process.pid);
+    expect(occupants.find(entry => entry.occupantId === viewer.lease.occupantId)?.cliPid).toBe(process.ppid);
+
+    const first = firstExit === 'app-server' ? app.lease : viewer.lease;
+    const survivor = firstExit === 'app-server' ? viewer.lease : app.lease;
+    await abandonTraexRuntime(app.lease.domain, first.occupantId);
+    const blocked = await acquireTraexRuntimeStart(app.lease.domain, {
+      occupantId: 'incompatible-after-peer-exit', comboKey: 'content-b',
+      workerPid: process.pid, daemonPid: process.pid,
+    });
+    expect(blocked.decision).toBe('blocked');
+    expect(readTraexRuntimeOccupants(app.lease.domain)?.map(entry => entry.occupantId)).toEqual([survivor.occupantId]);
+    await abandonTraexRuntime(app.lease.domain, survivor.occupantId);
+  });
+
+  it.each([
+    [undefined, undefined, 'blocked'],
+    ['worker-birth', undefined, 'blocked'],
+    [undefined, 'worker-birth', 'blocked'],
+    ['worker-birth', 'worker-birth', 'start'],
+  ] as const)('requires paired worker birth tokens for same-owner supersession (%s, %s)', async (oldBirth, newBirth, expected) => {
+    const domain = testDomain(traeHome());
+    await acquireTraexRuntimeStart(domain, {
+      occupantId: 'old-start', comboKey: 'content-old', workerPid: process.pid, daemonPid: process.pid,
+      ...(oldBirth ? { workerStart: oldBirth } : {}),
+    });
+    const replacement = await acquireTraexRuntimeStart(domain, {
+      occupantId: 'new-start', comboKey: 'content-new', workerPid: process.pid, daemonPid: process.pid,
+      ...(newBirth ? { workerStart: newBirth } : {}),
+    });
+    expect(replacement.decision).toBe(expected);
+  });
+
   it('does not supersede a running unknown occupant or inherit identity without birth proof', async () => {
     const domain = testDomain(traeHome());
     await acquireTraexRuntimeStart(domain, {
@@ -845,6 +945,32 @@ describe('runtime registry lifecycle regressions', () => {
     const expected = computeTraexInstallSignature(dir, join(dir, 'traex'));
     expect(readTraexRuntimeOccupants(result.lease.domain)?.[0]?.installSignature).toBe(expected);
     expect(result.lease.snapshot.manifest?.sourceSignature).toBe(expected);
+  });
+
+  it('pairs a reused snapshot with the signature from the same capture after an A-to-B source race', async () => {
+    const dir = release('a');
+    const home = traeHome();
+    const snapshotsRoot = tempDir('botmux-traex-snapshots-');
+    writeFileSync(join(dir, 'traex'), 'traex-b-longer');
+    await materializeTraexSnapshot({ releaseDir: dir, snapshotsRoot });
+
+    writeFileSync(join(dir, 'traex'), 'a');
+    const stale = computeTraexInstallSignature(dir, join(dir, 'traex'));
+    const result = await acquireTraexRuntimeLease({
+      traeHome: home, releaseDir: dir, workerPid: process.pid, daemonPid: process.pid,
+      snapshotsRoot,
+      __testOnly_onCaptured: (_identity, attempt) => {
+        if (attempt === 1) writeFileSync(join(dir, 'traex'), 'traex-b-longer');
+      },
+    });
+    expect(result.kind).toBe('granted');
+    if (result.kind !== 'granted') return;
+    const expected = computeTraexInstallSignature(dir, join(dir, 'traex'));
+    expect(result.lease.snapshot.reused).toBe(true);
+    expect(result.lease.snapshot.sourceSignature).toBe(expected);
+    const registered = readTraexRuntimeOccupants(result.lease.domain)?.[0]?.installSignature;
+    expect(registered).toBe(expected);
+    expect(registered).not.toBe(stale);
   });
 
   it('clears a stale cliStart whenever a new attach lacks a birth token, even for the same PID', async () => {

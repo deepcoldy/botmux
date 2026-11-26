@@ -6,6 +6,7 @@ import type { ScheduleOwner, ScheduleReasoningEffort } from '../services/schedul
 import { removeSchedulePrecondition } from '../services/schedule-precondition-store.js';
 import { checkTaskCalendar, manualCalendarCheck, normalizeCalendarBinding, normalizeCalendarDayType } from '../services/work-calendar.js';
 import { appendScheduleRunLog, queryScheduleRunLogs, removeScheduleRunLogs } from '../services/schedule-run-log-store.js';
+import type { ScheduleRunTargetResult } from '../services/schedule-run-log-store.js';
 import type { ScheduledTaskPreconditionOutcome } from '../services/schedule-precondition-gate.js';
 import { scheduleTimeZone, zonedTomorrowAt } from '../utils/timezone.js';
 import { emitHookEvent } from '../services/hook-runner.js';
@@ -28,6 +29,7 @@ import {
   markUntilDoneFinalRun,
   recordMissed,
   recordRunOutcome,
+  releaseUntilDoneFinalRun,
   resolveUntilDoneConfig,
   scheduleNotificationsFor,
   settleUntilDoneRun,
@@ -408,7 +410,7 @@ function markRuntimeSkipped(
         deferredRun: undefined,
         runStats: recordRunOutcome(task.runStats, 'skipped'),
         ...(task.parsed.kind === 'once' ? { nextRunAt } : {}) };
-      return operatorCancel ? skipped : settleUntilDoneSkip(skipped, runId, Date.now());
+      return operatorCancel ? releaseUntilDoneFinalRun(skipped, runId) : settleUntilDoneSkip(skipped, runId, Date.now());
     }, appId);
   }
   notifyAfterSettle(before, id);
@@ -593,22 +595,37 @@ function appendAcceptedRunLogOnce(
       .some(entry => entry.id === context.runId);
     if (alreadyLogged) return;
     const acceptedChatIds = Object.keys(deferred?.acceptedTargets ?? {});
-    const targetResults = acceptedChatIds.length > 1
-      ? acceptedChatIds.map(chatId => ({ chatId, outcome: 'model_dispatched' as const }))
+    const deliveryFailure = task.lastRunId === context.runId
+      && task.deliveryFailureRunId === context.runId
+      && task.deliveryFailureState?.runId === context.runId
+      ? task.deliveryFailureState : undefined;
+    const failedTargets = deliveryFailure?.targets ?? {};
+    const targetChatIds = [...new Set([...acceptedChatIds, ...Object.keys(failedTargets).filter(id => id !== '__single')])];
+    const dispatchedTargets = targetChatIds.length > 1 || Object.keys(failedTargets).some(id => id !== '__single')
+      ? targetChatIds.map(chatId => ({ chatId, outcome: 'model_dispatched' as const }))
       : undefined;
+    const targetResults = dispatchedTargets?.map(target => failedTargets[target.chatId]
+      ? { chatId: target.chatId, outcome: 'error' as const, error: failedTargets[target.chatId] }
+      : target);
+    const outcome = deliveryFailure ? 'error' as const : 'model_dispatched' as const;
     const startedAt = deferred?.since ?? context.startedAt;
     const finishedAt = new Date().toISOString();
     appendScheduleRunLog({
       id: context.runId,
       taskId: task.id,
       trigger: context.trigger,
-      outcome: 'model_dispatched',
+      outcome,
       precondition: deferred?.precondition ?? 'not_checked',
       startedAt,
       finishedAt,
       durationMs: Math.max(0, Date.parse(finishedAt) - Date.parse(startedAt)),
       additionalPrompt: !!deferred?.additionalPrompt,
       calendarCheck: task.lastCalendarCheck,
+      ...(deliveryFailure ? {
+        errorCode: task.lastDeliveryErrorCode ?? 'schedule_send_rejected',
+        error: task.lastDeliveryError,
+        deliveryFailureBaseline: { outcome: 'model_dispatched' as const, ...(dispatchedTargets ? { targetResults: dispatchedTargets } : {}) },
+      } : {}),
       ...(targetResults ? { targetResults } : {}),
     }, scope);
   } catch (error) {
@@ -634,8 +651,9 @@ function recordDispatchOutcome(
   if (outcome === 'deferred') return;
   if (current?.lastRunId === context.runId && current.deliveryFailureRunId === context.runId
     && !runHasTerminalOutcome(current, context.runId)) {
-    // A very short model turn can fail its send before dispatch returns.
-    // Keep that failure; only account for the dispatch that just completed.
+    // A deferred run has no earlier daemon execution row: materialize the
+    // terminal delivery-failure row before clearing its parked state.
+    if (current.deferredRun) appendAcceptedRunLogOnce(current, context, current.deferredRun);
     mutateRuntimeTask(task.id, value => {
       if (value.lastRunId !== context.runId) return;
       const repeat = value.repeat ? { ...value.repeat, completed: (value.repeat.completed ?? 0) + 1 } : undefined;
@@ -657,6 +675,7 @@ function recordDispatchOutcome(
     });
     dashboardEventBus.publish({ type: 'schedule.fired', body: {
       id: task.id, runAt: Date.now(), status: 'error', error: current.lastDeliveryError } });
+    emitScheduleFiredHook(task, 'error', current.lastDeliveryError);
     return;
   }
   if (runHasTerminalOutcome(current, context.runId)) return;
@@ -681,7 +700,9 @@ function recordDispatchOutcome(
     markRuntimeSkipped(task.id, nextRunAt, context.runId);
   } else {
     markRuntimeRun(task.id, true, undefined, undefined, context.runId);
-    appendAcceptedRunLogOnce(task, context, current?.deferredRun);
+    // Ordinary daemon callbacks own their execution row. Only an accepted
+    // parked run needs the tick fast path to materialize that row here.
+    if (current?.deferredRun) appendAcceptedRunLogOnce(task, context, current.deferredRun);
     cleanupIfTaskWasAutoRemoved(task);
   }
   dashboardEventBus.publish({
@@ -770,14 +791,14 @@ function deferredRunFullyAccepted(deferred: NonNullable<ScheduledTask['deferredR
 }
 
 function skipDeferredRunForOperator(task: ScheduledTask): ScheduledTask {
-  return {
+  return releaseUntilDoneFinalRun({
     ...task,
     lastStatus: 'skipped',
     lastError: undefined,
     lastDeliveryError: undefined,
     deferredRun: undefined,
     runStats: recordRunOutcome(task.runStats, 'skipped'),
-  };
+  }, task.lastRunId);
 }
 
 /** Park the claimed run behind a runtime handoff. Reuses `since` when the same
@@ -891,6 +912,11 @@ export function settleParkedRunOnce(
   runId: string,
   reason: string,
   appId?: string,
+  log: {
+    trigger?: ScheduleExecutionContext['trigger'];
+    errorCode?: string;
+    targetResults?: ScheduleRunTargetResult[];
+  } = {},
 ): boolean {
   const before = runtimeTask(id, appId);
   const deferred = before?.deferredRun;
@@ -925,15 +951,16 @@ export function settleParkedRunOnce(
       appendScheduleRunLog({
         id: runId,
         taskId: id,
-        trigger: 'scheduler',
+        trigger: log.trigger ?? 'scheduler',
         outcome: 'error',
         precondition: deferred.precondition ?? 'not_checked',
         startedAt: deferred.since,
         finishedAt: new Date().toISOString(),
         durationMs: Math.max(0, Date.now() - Date.parse(deferred.since)),
         additionalPrompt: !!deferred.additionalPrompt,
-        errorCode: 'deferred_unsettled',
+        errorCode: log.errorCode ?? 'deferred_unsettled',
         error: reason,
+        ...(log.targetResults ? { targetResults: log.targetResults } : {}),
       }, scope);
     } catch (error) {
       logger.warn(`[scheduler] Deferred run log unavailable for ${id}: ${String(error)}`);
@@ -1281,8 +1308,7 @@ export function claimDeferredRunForDispatch(
       return;
     }
     const manualRunRequested = task.manualRunRequested;
-    const claimed: ScheduledTask = { ...task, lastStatus: 'running', lastRunId: runId,
-      lastError: undefined, lastDeliveryError: undefined };
+    const claimed: ScheduledTask = { ...task, lastStatus: 'running', lastRunId: runId };
     delete claimed.manualRunRequested;
     // Re-enter the exact accepted run: overlay the frozen inputs so edits made
     // while parked cannot change this retry's prompt, identity or routing.

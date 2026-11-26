@@ -544,6 +544,68 @@ describe('pre-ready input receipts', () => {
     }));
   });
 
+  it('cancels an exact pre-ready opening without replay and preserves human queued work', async () => {
+    const h = harness('traex');
+    h.scope.initPromptMaterialized = false;
+    h.scope.lastInitConfig.turnId = 'schedule:cancelled';
+    h.scope.cliAdapter = { passesInitialPromptViaArgs: false };
+    h.scope.currentBotmuxTurnId = 'schedule:cancelled';
+    h.scope.backend = null;
+    h.scope.pendingMessages.push(item('schedule:cancelled'), item('om_human'));
+    const cancel = loadWorkerFunction('handleQueuedTurnCancel', h.scope);
+    cancel('cancel-request', 'schedule:cancelled');
+
+    expect(h.scope.pendingMessages.map((entry: InflightItem) => entry.turnId)).toEqual(['om_human']);
+    expect(h.scope.send).toHaveBeenCalledWith({
+      type: 'queued_turn_cancel_result', requestId: 'cancel-request',
+      turnId: 'schedule:cancelled', status: 'queued_removed',
+    });
+    const before = h.scope.pendingMessages.length;
+    expect(h.scope.sendToPty('must not reinsert', 'schedule:cancelled')).toBe(true);
+    expect(h.scope.pendingMessages).toHaveLength(before);
+    expect(h.scope.pendingMessages[0].turnId).toBe('om_human');
+  });
+
+  it('reports restart_required instead of claiming a written turn was only queued', () => {
+    const h = harness('traex');
+    h.scope.initPromptMaterialized = true;
+    h.scope.currentBotmuxTurnId = 'schedule:written';
+    h.scope.backend = {};
+    h.scope.inflightInputs.onWrite(item('schedule:written'));
+    const cancel = loadWorkerFunction('handleQueuedTurnCancel', h.scope);
+    cancel('cancel-written', 'schedule:written');
+    expect(h.scope.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'queued_turn_cancel_result', turnId: 'schedule:written', status: 'restart_required',
+    }));
+  });
+
+  it('never claims an argv-baked opening was removed from a pre-ready queue', () => {
+    const h = harness('pi');
+    h.scope.initPromptMaterialized = false;
+    h.scope.lastInitConfig.turnId = 'schedule:argv';
+    h.scope.cliAdapter = { passesInitialPromptViaArgs: true };
+    h.scope.backend = null;
+    const cancel = loadWorkerFunction('handleQueuedTurnCancel', h.scope);
+    cancel('cancel-argv', 'schedule:argv');
+    expect(h.scope.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'queued_turn_cancel_result', turnId: 'schedule:argv', status: 'restart_required',
+    }));
+  });
+
+  it('never reports an RPC turn with submission ownership as queued_removed', () => {
+    const h = harness('traex');
+    h.scope.initPromptMaterialized = false;
+    h.scope.lastInitConfig.turnId = 'schedule:rpc';
+    h.scope.backend = null;
+    h.scope.cliAdapter = { passesInitialPromptViaArgs: false };
+    h.scope.rpcTurnsAwaitingActivation = new Map([['schedule:rpc\0', {}]]);
+    const cancel = loadWorkerFunction('handleQueuedTurnCancel', h.scope);
+    cancel('cancel-rpc', 'schedule:rpc');
+    expect(h.scope.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'queued_turn_cancel_result', turnId: 'schedule:rpc', status: 'restart_required',
+    }));
+  });
+
   it.each([false, true])('settles only the exiting backend lease when a replacement is current (running=%s)', running => {
     const h = exitHarness('traex');
     const oldLease = { release: vi.fn(async () => {}), abandon: vi.fn(async () => {}) };

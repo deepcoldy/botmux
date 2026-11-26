@@ -80,12 +80,14 @@ describe('PR2 independent runtime adversarial review', () => {
   it('does not register old content and exec changed bytes for fixed or hash-only launches', async () => {
     const source = release();
     const oldKey = actualKey(source);
-    await acquireTraexRuntimeStart(domain(), { occupantId: 'old-A', comboKey: oldKey, workerPid: process.pid, daemonPid: process.pid });
+    await acquireTraexRuntimeStart(domain(), {
+      occupantId: 'old-A', comboKey: oldKey, workerPid: process.pid, workerStart: 'worker-birth', daemonPid: process.pid,
+    });
     let changed = false;
     const result = await acquireTraexRuntimeLease({
       traeHome: join(root, 'home'), releaseDir: source, executablePath: join(source, 'traex'),
       fixedPath: true, fixedExecutablePath: join(source, 'traex'),
-      workerPid: process.pid, daemonPid: process.pid,
+      workerPid: process.pid, workerStart: 'worker-birth', daemonPid: process.pid,
       abort: () => { if (!changed) { changed = true; rewrite(source, 'B'); } return undefined; },
     });
     expect(result.kind).toBe('granted');

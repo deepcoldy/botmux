@@ -61,7 +61,7 @@ import { readCanonicalBotActorOwnerBindings } from './core/bot-actor-owner-bindi
 import { releaseExplicitAskHandoff, hasExplicitAskHandoff, invalidateExplicitAsk, setExplicitAskSessionChecker, retireExplicitAsk, explicitAskSnapshot } from './core/ask-broker.js';
 import { createExplicitAskContinuation, explicitAskRecoveryRequest, explicitAskOriginIsLive, explicitAskRetirementBound, explicitAskSessionBound } from './core/explicit-ask-continuation.js';
 import { createManagedAskControl, parseManagedAskControl } from './core/managed-ask-control.js';
-import { canSafelyReclaimWorkerForInstallChange, suspendWorkerAsync, interruptExactWorkerTurn } from './core/worker-pool.js';
+import { canSafelyReclaimWorkerForInstallChange, suspendWorkerAsync, cancelQueuedWorkerTurn } from './core/worker-pool.js';
 import { execFileSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, readdirSync, existsSync, mkdirSync, unlinkSync, realpathSync } from 'node:fs';
@@ -851,6 +851,7 @@ import {
   settleDeferredScheduleRun,
   settleHeldScheduleRunsOnWorkerExit,
   cancelPreReadyScheduledWorkers,
+  releaseCancelledActivationWork,
 } from './core/deferred-schedule-settlement.js';
 import {
   renderMessageListenerPrompt,
@@ -36357,7 +36358,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // hand over the parked FIFO head; otherwise stay dormant for the next
     // inbound/scheduler trigger.
     onInstallChangeReclaimed(ds) {
-      startReplacementRuntimeAfterReclaim(ds);
+      // PTY detach may already have promoted the sole replacement tail into
+      // its durable journal before this callback runs. Accept that journal as
+      // well as a still-parked tail; neither shape needs another inbound.
+      startReplacementRuntimeAfterReclaim(ds, true);
     },
     // 决策看板批次回合的投递终态失败（收据超时 / worker 拒绝入队）：不往管家群贴失败
     // 卡片，只把批次退回 failed，owner 在 Dashboard 批次行看到原因并重投（同一 turnId）。
@@ -38704,6 +38708,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         // same occurrence parks behind a TRAE target, their exact accepted turns
         // must join that park's ledger or the mixed run can never fully settle.
         const acceptedNonTraeTurns = new Map<string, string>();
+        const dispatchTargetCliIds = new Map<string, string | undefined>();
+        const fallbackTargetCliId = (chatId: string): string | undefined => {
+          if (dispatchTargetCliIds.has(chatId)) return dispatchTargetCliIds.get(chatId);
+          const selected = [...activeSessions.values()].find(session => session.chatId === chatId);
+          if (selected) return selected.session.cliLaunchSnapshot?.cliId ?? selected.session.cliId
+            ?? getAllBots().find(bot => bot.config.larkAppId === selected.larkAppId)?.config.cliId;
+          return getAllBots().find(bot => bot.config.larkAppId === task.larkAppId)?.config.cliId ?? cfg.cliId;
+        };
         const pending: string[] = [];
         const heldTarget = (chatId: string, turnId: string | undefined): boolean =>
           parked?.targets[chatId] === 'held'
@@ -38738,6 +38750,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             chatId,
             outcome: heldTarget(chatId, turnIds.get(chatId)) ? 'deferred' as const : 'model_dispatched' as const,
           }));
+        let targetExecutionError: unknown;
         if (pending.length > 0) {
           try {
             results = results.concat(await executeScheduledTaskForTargets(
@@ -38791,6 +38804,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                             ?? selectedSession.session.cliId
                             ?? selectedBotCliId)
                           : undefined;
+                        dispatchTargetCliIds.set(targetTask.chatId!, targetCliId);
                         // Only a real TRAE dispatch participates in the handoff
                         // ledger. Other CLIs' ordinary dispatch errors must never
                         // be converted into a 30-minute TRAE retry storm.
@@ -38838,6 +38852,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                           ?? dispatchedSession.session.cliId
                           ?? selectedBotCliId)
                         : undefined;
+                      dispatchTargetCliIds.set(targetTask.chatId!, targetCliId);
                       if (targetCliId === undefined || targetCliId === 'traex') {
                         scheduler.markDeferredTargetHeld(
                           task.id, executionContext.runId, targetTask.chatId!, targetTurnId, effectiveAppId,
@@ -38856,10 +38871,33 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             ));
             if (targetChatIds.length > 1) targetResults = results;
           } catch (error) {
-            if (error instanceof ScheduleTargetExecutionError) {
-              targetResults = error.targetResults;
+            targetExecutionError = error;
+            const failedChatIds = error instanceof ScheduleTargetExecutionError
+              ? error.targetResults.filter(result => result.outcome === 'error').map(result => result.chatId)
+              : pending.length === 1 ? [pending[0]!] : [];
+            // A TRAE start failure remains retryable under the same run/turn.
+            // Only a proven non-TRAE permanent target error terminates the
+            // logical run instead of leaving its chat `waiting` forever.
+            if (failedChatIds.length === 0 || failedChatIds.every(chatId => fallbackTargetCliId(chatId) === 'traex')) {
+              if (error instanceof ScheduleTargetExecutionError) targetResults = error.targetResults;
+              throw error;
             }
-            throw error;
+            const merged = new Map(results.map(result => [result.chatId, result]));
+            if (error instanceof ScheduleTargetExecutionError) {
+              for (const result of error.targetResults) merged.set(result.chatId, result);
+            } else if (pending.length === 1) {
+              merged.set(pending[0]!, {
+                chatId: pending[0]!, outcome: 'error',
+                error: error instanceof Error ? error.message : String(error),
+              });
+            }
+            // Targets not reached before the failure never executed; retain
+            // them as deferred facts in the single terminal run-log row.
+            for (const chatId of targetChatIds) {
+              if (!merged.has(chatId)) merged.set(chatId, { chatId, outcome: 'deferred' });
+            }
+            results = targetChatIds.map(chatId => merged.get(chatId)!);
+            if (targetChatIds.length > 1) targetResults = results;
           }
         }
         // The `parked` snapshot above was captured before the awaits. Re-read
@@ -38879,6 +38917,26 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         results = results.map(result => acceptedNow(result.chatId)
           ? { ...result, outcome: 'model_dispatched' as const }
           : result);
+        if (targetExecutionError !== undefined) {
+          const details = resolveScheduleRunLogErrorDetails(precondition.precondition, targetExecutionError);
+          const reason = details.error
+            ?? (targetExecutionError instanceof Error ? targetExecutionError.message : String(targetExecutionError));
+          if (currentDeferred?.runId === executionContext.runId) {
+            const settled = scheduler.settleParkedRunOnce(
+              task.id,
+              executionContext.runId,
+              reason,
+              effectiveAppId,
+              {
+                trigger: executionContext.trigger,
+                errorCode: details.errorCode ?? 'schedule_target_failed',
+                targetResults: results,
+              },
+            );
+            if (settled) return 'deferred';
+          }
+          throw targetExecutionError;
+        }
         const deferredResults = results.filter(result => result.outcome === 'deferred');
         if (deferredResults.length === 0) return 'dispatched';
         // Keep the claimed run parked. Targets already dispatched stay recorded
@@ -38957,8 +39015,35 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       await closeSessionForBackgroundCleanup(ds.session.sessionId, 'scheduled run cancelled');
     }, {
       acceptedTurnIds: new Set(Object.values(task.deferredRun?.acceptedTargets ?? {})),
-      cancelTurn: async (ds, turnId) => {
-        await interruptExactWorkerTurn(ds, turnId);
+      cancelTurn: async (ds, turnId) => cancelQueuedWorkerTurn(ds, turnId),
+      retireWorker: async ds => {
+        const worker = ds.worker;
+        if (!worker) return;
+        killWorker(ds);
+        const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
+        if (backendType && isRemoteBackendType(backendType)
+          && ds.worker === worker && worker.exitCode === null && worker.signalCode === null) {
+          return false;
+        }
+        if (worker.exitCode !== null || worker.signalCode !== null) return true;
+        await new Promise<void>(resolve => {
+          const timer = setTimeout(done, 5_000);
+          timer.unref?.();
+          function done(): void {
+            clearTimeout(timer);
+            worker!.off('exit', done);
+            resolve();
+          }
+          worker.once('exit', done);
+        });
+        return worker.exitCode !== null || worker.signalCode !== null;
+      },
+      release: async ds => {
+        await releaseCancelledActivationWork(ds, {
+          release: () => releaseQueuedActivationReservation(ds),
+          startJournal: () => startReplacementRuntimeAfterReclaim(ds, true),
+          scheduleRetry: () => scheduleQueuedActivationTailReleaseRetry(ds),
+        });
       },
     });
   });

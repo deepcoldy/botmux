@@ -143,6 +143,20 @@ describe('legacy schedule-store deferred run', () => {
     expect(mod.getTask(task.id)!.deferredRun).toBeUndefined();
   });
 
+  it('releases an operator-cancelled closing run without expiring the legacy task', async () => {
+    const mod = await freshImport();
+    const task = mod.createTask(TASK_PARAMS);
+    mod.updateTask(task.id, {
+      deferredRun: deferred('run-closing'), lastRunId: 'run-closing', lastStatus: 'deferred',
+      enabled: false, disabledReason: 'manual',
+      untilDone: { status: 'open', attempts: 0, deadline: '2020-01-01T00:00:00.000Z', finalRunId: 'run-closing' },
+    });
+    mod.markSkipped(task.id, undefined, 'run-closing', { operatorCancel: true });
+    expect(mod.getTask(task.id)).toMatchObject({ enabled: false, disabledReason: 'manual' });
+    expect(mod.getTask(task.id)?.untilDone?.status).toBe('open');
+    expect(mod.getTask(task.id)?.untilDone?.finalRunId).toBeUndefined();
+  });
+
   it('uses settleParked to write a terminal failure instead of re-parking the legacy run', async () => {
     const mod = await freshImport();
     const task = mod.createTask(TASK_PARAMS);

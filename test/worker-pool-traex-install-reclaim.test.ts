@@ -338,6 +338,17 @@ describe('canSafelyReclaimWorkerForInstallChange', () => {
     worker.emit('message', { type: 'traex_runtime_deferred', turnId: 'om_silent', detail: 'blocked B', blockers: [] });
     await new Promise(resolve => setTimeout(resolve, 0));
     expect(replies).toHaveLength(1);
+
+    ds.session.vcMeetingReceiver = {} as any;
+    worker.emit('message', { type: 'traex_runtime_deferred', turnId: 'om_vc', dispatchAttempt: 2,
+      detail: 'blocked durable VC', blockers: [] });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(replies).toHaveLength(1);
+    // A plain human turn on the same receiver remains visible without an
+    // attempt/meeting origin; only the durable attempted turn is suppressed.
+    worker.emit('message', { type: 'traex_runtime_deferred', turnId: 'om_plain', detail: 'blocked plain VC', blockers: [] });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(replies).toHaveLength(2);
   });
 });
 
@@ -1223,9 +1234,19 @@ describe('activation tail claim cancellation', () => {
 
     const blocked = makeDs();
     blocked.session.queuedActivationTail = [tailFor('om_still_cancelled')];
+    blocked.session.cancelledActivationTurnIds = ['om_still_cancelled'];
     blocked.activationCancellationPending = true;
+    vi.mocked(sessionStore.updateSession).mockImplementationOnce(() => { throw new Error('controlled retry failure'); });
     expect(promoteQueuedActivationTail(blocked)).toBe(false);
+    expect(blocked.activationCancellationPending).toBe(true);
     expect((blocked.worker as any).send).not.toHaveBeenCalled();
+
+    blocked.session.queuedActivationTail = [tailFor('om_still_cancelled'), tailFor('om_after_retry')];
+    expect(promoteQueuedActivationTail(blocked)).toBe(true);
+    expect(blocked.activationCancellationPending).toBeUndefined();
+    expect((blocked.worker as any).send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'message', turnId: 'om_after_retry',
+    }));
   });
 });
 

@@ -736,6 +736,7 @@ describe('target daemon consumes signed message authority', () => {
           compilerOptions: { target: ts.ScriptTarget.ES2022 },
         }).outputText;
         new Function('scope', 'with (scope) { ' + code + ' }')({
+          getAllBots: () => [],
           ...scopeValues, prepareTurnCliIdentity: handlers.prepareTurnCliIdentity, ...scope,
         });
       },

@@ -269,6 +269,7 @@ function engageHarness(opts: {
     wsUrl = 'ws://127.0.0.1:1';
     activeThreadId: string | undefined;
     stop = vi.fn();
+    stopAndWait = vi.fn(async () => true);
     sendFirstTurn = vi.fn(async () => ({
       outcome: opts.firstOutcome ?? 'accepted',
       ...(opts.firstOutcome === 'accepted' || !opts.firstOutcome ? { nativeTurnId: 'native-1' } : {}),
@@ -296,6 +297,7 @@ function engageHarness(opts: {
     },
     markRunning: vi.fn(async () => {}),
     markUnknown: vi.fn(async () => {}),
+    markDeathUnproven: vi.fn(async () => {}),
     release: vi.fn(async () => {}),
     abandon: vi.fn(async () => {}),
   };
@@ -321,6 +323,9 @@ function engageHarness(opts: {
     },
     acquireTraexRuntimeLease: vi.fn(async () => ({ kind: 'granted', lease })),
     rpcEngagementFence: { begin: () => 1, isCurrent: () => true, isLive: () => true, markDead: noop },
+    closeRequested: false,
+    pendingRpcEngagement: undefined,
+    traexRpcLeaseContext: undefined,
     traexRuntimeLeaseContext: undefined,
     traexSpawnLeaseContext: undefined,
     traexLeaseSettlements: new Set(),
@@ -450,6 +455,62 @@ describe('actual worker TraeX RPC engagement', () => {
     expect(h.lease.markRunning).toHaveBeenCalledWith(4242, 'start-4242');
   });
 
+  it('retains a spawned RPC lease when stopAndWait cannot prove group death', async () => {
+    let openA!: () => void;
+    const gateA = new Promise<void>(resolve => { openA = resolve; });
+    const h = engageHarness({ resume: true, startGates: [gateA] });
+    let generation = 0;
+    h.base.rpcEngagementFence = {
+      begin: () => ++generation, isCurrent: (token: number) => token === generation,
+      isLive: () => true, markDead: () => undefined,
+    };
+    const resultA = h.engageRaw().then(outcome => ({ outcome }), error => ({ error }));
+    for (let i = 0; i < 30 && h.engines.length === 0; i++) await Promise.resolve();
+    h.engines[0].stopAndWait.mockResolvedValue(false);
+    const resultB = h.engageRaw();
+    openA();
+    const a = await resultA;
+    expect((a as any).error).toBeInstanceOf(h.base.CliSpawnSupersededError);
+    await expect(resultB).resolves.toBe('resumed');
+    expect(h.engines[0].stopAndWait).toHaveBeenCalled();
+    expect(h.lease.release).not.toHaveBeenCalled();
+    expect(h.lease.abandon).not.toHaveBeenCalled();
+  });
+
+  it('abandons a stale pre-spawn lease without publishing over the replacement', async () => {
+    const h = engageHarness({ resume: true });
+    let grantA!: (value: { kind: 'granted'; lease: any }) => void;
+    const gateA = new Promise<{ kind: 'granted'; lease: any }>(resolve => { grantA = resolve; });
+    const leaseB = {
+      ...h.lease, occupantId: 'occupant-b',
+      markRunning: vi.fn(async () => {}), release: vi.fn(async () => {}), abandon: vi.fn(async () => {}),
+    };
+    h.base.acquireTraexRuntimeLease = vi.fn()
+      .mockImplementationOnce(() => gateA)
+      .mockResolvedValueOnce({ kind: 'granted', lease: leaseB });
+    let generation = 0;
+    h.base.rpcEngagementFence = {
+      begin: () => ++generation,
+      isCurrent: (token: number) => token === generation,
+      isLive: () => true,
+      markDead: () => undefined,
+    };
+    const resultA = h.engageRaw().then(
+      outcome => ({ outcome }), error => ({ error }),
+    );
+    for (let i = 0; i < 30 && h.base.acquireTraexRuntimeLease.mock.calls.length === 0; i++) await Promise.resolve();
+    const resultB = h.engageRaw();
+    grantA({ kind: 'granted', lease: h.lease });
+    const a = await resultA;
+    expect((a as any).error).toBeInstanceOf(h.base.CliSpawnSupersededError);
+    await expect(resultB).resolves.toBe('resumed');
+    expect(h.lease.abandon).toHaveBeenCalledTimes(1);
+    expect(h.lease.release).not.toHaveBeenCalled();
+    expect(h.lease.markRunning).not.toHaveBeenCalled();
+    expect(h.engines).toHaveLength(1);
+    expect(h.base.traexRpcLeaseContext?.lease).toBe(leaseB);
+  });
+
   it('keeps overlapping engagements on their own lease contexts', async () => {
     let openA!: () => void;
     let openB!: () => void;
@@ -493,11 +554,16 @@ describe('actual worker TraeX RPC engagement', () => {
     const a = await resultA;
     expect((a as any).error).toBeInstanceOf(h.base.CliSpawnSupersededError);
     expect(h.lease.markRunning).toHaveBeenCalledWith(4242, 'start-4242');
+    expect(h.engines[0].stopAndWait).toHaveBeenCalled();
+    expect(h.engines[0].stopAndWait.mock.invocationCallOrder[0]).toBeLessThan(h.lease.release.mock.invocationCallOrder[0]);
     expect(h.lease.release).toHaveBeenCalledTimes(1);
     expect(leaseB.markRunning).not.toHaveBeenCalled();
     expect(leaseB.release).not.toHaveBeenCalled();
     expect(leaseB.abandon).not.toHaveBeenCalled();
-    expect(h.base.traexRpcLeaseContext?.lease).toBe(leaseB);
+    // B is still inside start(): its granted lease stays local and cannot be
+    // overwritten by A's late cleanup or published as the active generation.
+    expect(h.base.traexRpcLeaseContext).toBeUndefined();
+    expect(h.base.pendingRpcEngagement?.lease?.lease).toBe(leaseB);
 
     openB();
     await expect(resultB).resolves.toBe('resumed');

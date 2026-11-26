@@ -237,6 +237,24 @@ function defaultScopedWorkerState(scope: Record<string, unknown>, key: string | 
   if (key === 'deferredSessionReady') return (scope.deferredSessionReady ??= []);
   if (key === 'pendingAbsorbedReplyDeliveries') return (scope.pendingAbsorbedReplyDeliveries ??= new Map());
   if (key === 'deferredAbsorbedReplyFinals') return (scope.deferredAbsorbedReplyFinals ??= new Map());
+  if (key === 'turnInputCommitDeferredForMaterialization') {
+    return (scope.turnInputCommitDeferredForMaterialization ??= new WeakSet());
+  }
+  if (key === 'cancelledQueuedTurnIds') return (scope.cancelledQueuedTurnIds ??= new Set());
+  if (typeof key === 'string' && [
+    'rpcTurnsAwaitingActivation', 'rpcActiveOwners', 'rpcLifecycleFailClosedOwners',
+    'rpcTerminalHydrationOwners', 'settlingRpcTerminalOwners', 'pendingRpcTurnTerminals',
+  ].includes(key)) return (scope[key] ??= new Map());
+  if (key === 'deferTurnInputCommitUntilSubmission') {
+    return (scope.deferTurnInputCommitUntilSubmission ??= () => false);
+  }
+  if (key === 'traexLeaseSettlements') return (scope.traexLeaseSettlements ??= new Set());
+  if (key === 'settleTraexLeasesForShutdown') {
+    return (scope.settleTraexLeasesForShutdown ??= async () => {});
+  }
+  if (key === 'stopOwnedProcessesForTraexSettlement') {
+    return (scope.stopOwnedProcessesForTraexSettlement ??= async () => true);
+  }
   if (key === 'traexFirstPromptReadinessPoller') {
     return (scope.traexFirstPromptReadinessPoller ??= new TraexFirstPromptReadinessPoller());
   }
@@ -386,7 +404,7 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
     if (key === 'isAuthoritativeSubmitSendMarker') return isAuthoritativeSubmitSendMarker;
     if (key === 'randomBytes') return randomBytes;
     if (key === 'sanitizeClaudeInput') return sanitizeClaudeInput;
-    if (typeof key === 'string' && ['retireAntigravityBridgeTurn', 'rebindAntigravityBridgeTurn', 'warnPromptReadySkipped', 'cancelTurnTerminalReadyRecovery', 'recoverDeferredPromptReadyAtTurnTerminal', 'markPromptReadyFromBusyProbe', 'traexNativeStartupInputIsPending', 'isTraexTmuxViewportBackend', 'isTraexHcViewportBackend', 'isTraexNativeViewportBackend', 'currentTraexCliLifetimeNonce', 'currentTraexGridRevision', 'currentTraexControlWriteRevision', 'currentTraexInterruptGeneration', 'clearTraexStartupWebRecheck', 'currentWebResizedGridFor', 'syncHcPaneSizeFor', 'invalidateTraexNativeViewportEvidence', 'activeTraexNativeViewportEvidence', 'readTraexStartupViewportScreen', 'traexWebInputSettleStatus', 'traexNativeStartupScreenAdmitsPure', 'traexPromptReadyGateBlocks', 'probeAndPublishTraexNativeViewport', 'scheduleTraexNativeViewportRefreshIfNeeded', 'readinessTrackedInput', 'invalidatePromptReadinessEvidence', 'revokePromptReadiness', 'codexAppRuntimeTypeAheadReady', 'sessionEventMetadata', 'bindSessionObservation', 'bindSessionPhysicalObservation', 'bindSessionExecutionEvent', 'restoreCodexAppContractNativeSession', 'backgroundTranscriptChainFilePath', 'persistBackgroundTranscriptChain', 'latestClosedTranscriptOffset', 'prepareBackgroundTranscriptReplay', 'recordBackgroundTranscriptRotation', 'isClaudeFamilyCli', 'spawnCliBody', 'deferSessionReadyUntilRuntimeAssigned', 'takeDeferredSessionReady', 'replayDeferredSessionReady', 'clearDeferredSessionReady', 'setCaptureIdentity', 'cotEntryWellFormed', 'cotEntryWithoutSentinel', 'clearCodexAppInterruptTarget', 'publishAppliedReasoningSelection', 'publishNativeReasoningFooter', 'publishNativeReasoningObservation', 'notifyTraexCatalogEmpty', 'admitTraexCatalogModelBeforeInput', 'requeueUnsubmittedQueuedActivation', 'acknowledgeQueuedActivationToken', 'probeAuthoritativeQueuedActivationEvidence', 'observeAuthoritativeClaudeTurnStart', 'observeAuthoritativeStructuredTurnStart', 'claudeActivationTranscriptPathAllowed', 'prepareAntigravityAccountsCredentialMask', 'reconcileAntigravitySpawnAccount', 'confirmAntigravitySpawnAccount', ...TRAEX_QUESTION_FUNCTIONS, ...FAILED_TURN_REWIND_FUNCTIONS].includes(key)) {
+    if (typeof key === 'string' && ['rpcTurnMayHaveBeenSubmitted', 'noteCancelledQueuedTurn', 'retireAntigravityBridgeTurn', 'rebindAntigravityBridgeTurn', 'warnPromptReadySkipped', 'cancelTurnTerminalReadyRecovery', 'recoverDeferredPromptReadyAtTurnTerminal', 'markPromptReadyFromBusyProbe', 'traexNativeStartupInputIsPending', 'isTraexTmuxViewportBackend', 'isTraexHcViewportBackend', 'isTraexNativeViewportBackend', 'currentTraexCliLifetimeNonce', 'currentTraexGridRevision', 'currentTraexControlWriteRevision', 'currentTraexInterruptGeneration', 'clearTraexStartupWebRecheck', 'currentWebResizedGridFor', 'syncHcPaneSizeFor', 'invalidateTraexNativeViewportEvidence', 'activeTraexNativeViewportEvidence', 'readTraexStartupViewportScreen', 'traexWebInputSettleStatus', 'traexNativeStartupScreenAdmitsPure', 'traexPromptReadyGateBlocks', 'probeAndPublishTraexNativeViewport', 'scheduleTraexNativeViewportRefreshIfNeeded', 'readinessTrackedInput', 'invalidatePromptReadinessEvidence', 'revokePromptReadiness', 'codexAppRuntimeTypeAheadReady', 'sessionEventMetadata', 'bindSessionObservation', 'bindSessionPhysicalObservation', 'bindSessionExecutionEvent', 'restoreCodexAppContractNativeSession', 'backgroundTranscriptChainFilePath', 'persistBackgroundTranscriptChain', 'latestClosedTranscriptOffset', 'prepareBackgroundTranscriptReplay', 'recordBackgroundTranscriptRotation', 'isClaudeFamilyCli', 'spawnCliBody', 'deferSessionReadyUntilRuntimeAssigned', 'takeDeferredSessionReady', 'replayDeferredSessionReady', 'clearDeferredSessionReady', 'setCaptureIdentity', 'cotEntryWellFormed', 'cotEntryWithoutSentinel', 'clearCodexAppInterruptTarget', 'publishAppliedReasoningSelection', 'publishNativeReasoningFooter', 'publishNativeReasoningObservation', 'notifyTraexCatalogEmpty', 'admitTraexCatalogModelBeforeInput', 'requeueUnsubmittedQueuedActivation', 'acknowledgeQueuedActivationToken', 'probeAuthoritativeQueuedActivationEvidence', 'observeAuthoritativeClaudeTurnStart', 'observeAuthoritativeStructuredTurnStart', 'claudeActivationTranscriptPathAllowed', 'prepareAntigravityAccountsCredentialMask', 'reconcileAntigravitySpawnAccount', 'confirmAntigravitySpawnAccount', ...TRAEX_QUESTION_FUNCTIONS, ...FAILED_TURN_REWIND_FUNCTIONS].includes(key)) {
       if (!dependencies.has(key)) dependencies.set(key, loadWorkerFunction(key, scope));
       return dependencies.get(key);
     }

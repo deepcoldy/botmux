@@ -31,6 +31,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ScheduleAuthorityStore } from '../src/services/schedule-authority-store.js';
 import { setScheduleAuthorityStore } from '../src/core/scheduler.js';
+import { isSilentScheduledTurn } from '../src/core/silent-schedule-turns.js';
 
 // ── in-memory session store ──────────────────────────────────────────────
 const store = new Map<string, Session>();
@@ -2283,6 +2284,24 @@ describe('retained TRAE scheduling uses the actual session launch', () => {
       hasHistory: true, workingDir: '/tmp',
     };
   }
+
+  it.each([true, false])('disarms a silent continuation when durable admission is refused (live=%s)', async live => {
+    const existing = retainedSession('/bin/true', live);
+    existing.session.cliId = 'claude-code';
+    existing.session.cliLaunchSnapshot!.cliId = 'claude-code';
+    const active = new Map<string, DaemonSession>([[sessionKey(ROOT, APP), existing]]);
+    const runtime = {
+      runId: `run-silent-refused-${live}`, turnId: `schedule:task0001:refused-${live}`,
+      onBeforeDispatch: vi.fn(() => false),
+    };
+    expect(await executeScheduledTask(
+      baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }), active, refreshCliVersion, undefined, runtime,
+    )).toBe('deferred');
+    expect(runtime.onBeforeDispatch).toHaveBeenCalled();
+    expect(isSilentScheduledTurn(existing, runtime.turnId)).toBe(false);
+    expect(sendWorkerInputMock).not.toHaveBeenCalled();
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+  });
 
   it('cold-resume prechecks the session-frozen release A when the Bot now points at B', async () => {
     const isolated = mkdtempSync(join(tmpdir(), 'pr2-session-release-'));
