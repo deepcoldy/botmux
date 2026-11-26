@@ -47,6 +47,7 @@ function harness() {
   h.scope.turnAuthorityIdentity = loadWorkerFunction('turnAuthorityIdentity', h.scope);
   h.scope.rpcTurnOwnerKey = loadWorkerFunction('rpcTurnOwnerKey', h.scope);
   h.scope.directRpcTurnBlocksTypeAhead = loadWorkerFunction('directRpcTurnBlocksTypeAhead', h.scope);
+  h.scope.traexPreemptionHoldsWrites = loadWorkerFunction('traexPreemptionHoldsWrites', h.scope);
   // Lazily resolve the worker's actual authorization at the write edge.
   h.scope.hybridRpcInputMaySteer = (...args: any[]) =>
     loadWorkerFunction('hybridRpcInputMaySteer', h.scope)(...args);

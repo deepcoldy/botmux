@@ -54,6 +54,7 @@ import { SCHEDULE_PROMPT_UNDELIVERED_ERROR_CODE } from './core/deferred-schedule
 import { supportsTranscriptReplyDeliveryForBot } from './core/reply-delivery.js';
 import { TurnProgressNotice, progressNoticeIntervalMinutes } from './utils/turn-progress-notice.js';
 import { traexActiveEmptyComposerReady, traexComposerHoldsInput, traexRestoredComposerReady } from './adapters/cli/traex-footer.js';
+import { traexPreemptionComposerReady } from './adapters/cli/traex.js';
 import { clearBotmuxPromptEnv } from './skills/zero-injection.js';
 import {
   BackgroundTurnAuthorityHold,
@@ -76,7 +77,7 @@ import {
  *   7. On 'restart', kills CLI and re-spawns with --resume
  */
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
+import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, openSync, closeSync, fstatSync, readSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative, extname, isAbsolute, resolve } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
@@ -165,7 +166,7 @@ import {
 import { rawCommandWriteOptionsFor } from './core/raw-command-write-options.js';
 import { classifyRawDispatchFailure, rewrapSubmissionFailure } from './core/raw-dispatch-failure.js';
 import { publishCliSessionIdToDaemon } from './core/cli-session-id-publisher.js';
-import { ActiveTurnAuthority, type TurnAuthorityIdentity } from './core/active-turn-authority.js';
+import { ActiveTurnAuthority, sameTrustedPrincipal, type TurnAuthorityIdentity } from './core/active-turn-authority.js';
 import { isValidMarkerIdentityTurnId } from './core/turn-id-shape.js';
 import { markerBelongsToLiveProcess, readProcessStartIdentity } from './core/session-marker.js';
 import { hostAuthorityPaths } from './services/project-authority-paths.js';
@@ -19072,6 +19073,7 @@ function codexBridgeIngest(opts: {
     backend.appendWebHistory(renderOrcaTranscriptHistory(result.events));
   }
   codexBridgeQueue.ingest(result.events);
+  if (structuredBridgeIs('traex') && traexPreemption) observeTraexPreemptionTerminal(result.events);
   if (structuredBridgeIs('codex')) {
     observeCodexTuiAsyncQuestions(result.events);
     maybeRestoreCodexTuiAsyncQuestion();
@@ -23327,6 +23329,270 @@ let preemptedTurnId: string | undefined;
 const PREEMPT_COOLDOWN_MS = 2_000;
 let preemptCooldownUntil = 0;
 
+type TraexPreemptionLease = {
+  backend: SessionBackend; generation: number; lifetime: number; pid?: number; nativeSessionId?: string;
+  nativeTurnId?: string; turnId: string; dispatchAttempt?: number; webGeneration: number;
+  originalInput?: string; restoredDraftCleared?: true;
+  incomingTurnId?: string; incomingCaller?: TrustedCaller;
+  interruptGeneration: number; requestedAt: number; delivered?: true; settled?: true; unknownNotified?: true; nativeCompleted?: true;
+};
+let traexPreemption: TraexPreemptionLease | undefined;
+let traexPreemptionTimer: ReturnType<typeof setTimeout> | undefined;
+
+function traexPreemptionEligible(incoming: PendingCliInput): boolean {
+  const active = activeTurnAuthority.snapshot();
+  return lastInitConfig?.cliId === 'traex' && !lastInitConfig.adoptMode && !codexRpcEngine
+    && !traexAutoModelRuntimeEligible() && !isWorkflowWorker()
+    && !lastInitConfig.existingAppServerEndpoint && ['pty', 'tmux', 'hc'].includes(effectiveBackendType)
+    && incoming.turnId?.startsWith('om_') === true && incoming.dispatchAttempt === undefined
+    && !incoming.durablePrimaryInbox && !incoming.noReplay && !incoming.queueAfterActiveTurn
+    && !incoming.taskContinuation && !incoming.traexAutoModelRecovery && !incoming.traexAutoModelContinuation
+    && !incoming.restartNoteOriginalContent && !incoming.queuedActivationToken && !incoming.codexAppInput
+    && !incoming.codexAppDispatchId && !incoming.vcMeetingImTurnOrigin && !durableTurnInFlight
+    && incoming.trustedCaller?.senderType === 'user' && incoming.trustedCaller.source === undefined
+    && !incoming.trustedCaller.taskContinuation && active?.caller?.senderType === 'user'
+    && active.caller.source === undefined && !active.caller.taskContinuation && active.dispatchAttempt === undefined
+    && sameTrustedPrincipal(active.caller, incoming.trustedCaller);
+}
+
+function traexPreemptionLeaseCurrent(lease: TraexPreemptionLease): boolean {
+  return backend === lease.backend && cliSpawnGeneration === lease.generation && cliLifetimeNonce === lease.lifetime
+    && webTerminalInputGeneration === lease.webGeneration && cliInterruptGeneration === lease.interruptGeneration
+    && !cliRestartInProgress && !rawInputRestartGate && !fatalWorkerErrorPending
+    && !webTerminalInputWireDirty() && (!lease.pid || currentTraexObservedPid() === lease.pid)
+    && (!lease.nativeSessionId || sessionRenameNativeSessionIdNow() === lease.nativeSessionId)
+    && (lease.settled || (currentBotmuxTurnId === lease.turnId && currentBotmuxDispatchAttempt === lease.dispatchAttempt));
+}
+
+function traexPreemptionLeaseNow(): TraexPreemptionLease | undefined {
+  const target = backend;
+  const turnId = currentBotmuxTurnId;
+  const generation = cliSpawnGeneration;
+  const lifetime = cliLifetimeNonce;
+  const webGeneration = webTerminalInputGeneration;
+  const interruptGeneration = cliInterruptGeneration;
+  if (!target || !turnId || currentBotmuxDispatchAttempt !== undefined || cliRestartInProgress
+    || rawInputRestartGate || fatalWorkerErrorPending || webTerminalInputWireDirty()
+    || sessionRenameInFlight() || hookReviewHoldsQueuedWrite() || programStatusBlockedHoldsTypeAhead()
+    || currentInputDeliveryQuarantine() || !backendScreenEvidenceIsAuthoritativeForMutation()) return;
+  const pid = currentTraexObservedPid();
+  const nativeSessionId = sessionRenameNativeSessionIdNow();
+  const owned = pid ? findTraexRolloutSetByPid(pid) : undefined;
+  if (!pid || !nativeSessionId || !owned || !owned.has(nativeSessionId)) return;
+  const nativeTurn = codexBridgeQueue.peek().find(turn => turn.turnId === turnId
+    && turn.dispatchAttempt === currentBotmuxDispatchAttempt && turn.started && turn.finalText === undefined
+    && turn.sourceSessionId === nativeSessionId && turn.sourceTurnId);
+  const nativeInput = traexActiveNativeInput(pid, nativeSessionId);
+  const nativeTurnId = nativeTurn?.sourceTurnId ?? nativeInput?.turnId;
+  if (!nativeTurnId) return;
+  let viewport: string;
+  try { viewport = (target.captureInputState?.() ?? { viewport: captureBackendScreen(target) }).viewport; } catch { return; }
+  if (!traexPreemptionComposerReady(viewport)) return;
+  const lease: TraexPreemptionLease = { backend: target, generation, lifetime,
+    pid, nativeSessionId, nativeTurnId, turnId, dispatchAttempt: currentBotmuxDispatchAttempt,
+    webGeneration, interruptGeneration, requestedAt: Date.now(),
+    originalInput: lastWrittenCliInput?.turnId === turnId && lastWrittenCliInput.dispatchAttempt === currentBotmuxDispatchAttempt
+      ? lastWrittenCliInput.content : recentSubmittedTurnTexts.get(turnId)?.text
+        ?? (nativeInput?.turnId === nativeTurnId ? nativeInput.input : undefined) };
+  // Native interruption discards the old request from the next model input.
+  // Without its exact text we cannot preserve context, even when a cached
+  // bridge record still proves the native turn. Keep the new input queued.
+  return lease.originalInput?.trim() && traexPreemptionLeaseCurrent(lease) ? lease : undefined;
+}
+
+/** Reattach can baseline after task_started; read only the tail of the
+ * PID-owned rollout to prove the last open native task. */
+function traexActiveNativeInput(pid: number, nativeSessionId: string): { turnId: string; input?: string } | undefined {
+  const rollout = findTraexRolloutByPid(pid, nativeSessionId);
+  if (!rollout || rollout.cliSessionId !== nativeSessionId) return;
+  let fd: number | undefined;
+  try {
+    fd = openSync(rollout.path, 'r');
+    const size = fstatSync(fd).size;
+    const start = Math.max(0, size - 262_144);
+    const bytes = Buffer.alloc(size - start);
+    const read = readSync(fd, bytes, 0, bytes.length, start);
+    let turnId: string | undefined;
+    let input: string | undefined;
+    const lines = bytes.subarray(0, read).toString('utf8').split('\n');
+    if (start) lines.shift();
+    for (const line of lines) {
+      let row; try { row = JSON.parse(line); } catch { continue; }
+      if (row.type !== 'event_msg') continue;
+      if (row.payload?.type === 'task_started') { turnId = row.payload.turn_id; input = undefined; }
+      if (row.payload?.turn_id === turnId && row.payload?.type === 'item_completed'
+        && row.payload.item?.type === 'UserMessage' && Array.isArray(row.payload.item.content)) {
+        const text = row.payload.item.content.filter((item: { type?: string; text?: unknown }) => (item.type === 'input_text' || item.type === 'text') && typeof item.text === 'string')
+          .map((item: { text: string }) => item.text).join('\n');
+        if (text) input = text;
+      }
+      if (row.payload?.turn_id === turnId && row.payload?.type === 'user_message' && typeof row.payload.message === 'string') input = row.payload.message;
+      if (['task_complete', 'turn_aborted'].includes(row.payload?.type) && row.payload.turn_id === turnId) { turnId = undefined; input = undefined; }
+    }
+    return typeof turnId === 'string' && turnId ? { turnId, input } : undefined;
+  } catch { return; } finally { if (fd !== undefined) closeSync(fd); }
+}
+
+function armTraexPreemptionPoll(): void {
+  if (traexPreemptionTimer || !traexPreemption) return;
+  traexPreemptionTimer = setTimeout(() => {
+    traexPreemptionTimer = undefined;
+    void resolveTraexPreemption();
+  }, 100);
+  traexPreemptionTimer.unref?.();
+}
+
+function observeTraexPreemptionTerminal(events: readonly CodexBridgeEvent[]): void {
+  const lease = traexPreemption;
+  if (!lease?.delivered || lease.settled || backend !== lease.backend || cliSpawnGeneration !== lease.generation
+    || cliLifetimeNonce !== lease.lifetime || currentTraexObservedPid() !== lease.pid
+    || sessionRenameNativeSessionIdNow() !== lease.nativeSessionId) return;
+  const terminal = events.find(event => event.kind === 'assistant_final'
+    && event.sourceSessionId === lease.nativeSessionId && event.sourceTurnId === lease.nativeTurnId);
+  if (!terminal) return;
+  const attributed = codexBridgeQueue.peek().find(turn => turn.turnId === lease.turnId
+    && turn.dispatchAttempt === lease.dispatchAttempt && turn.sourceTurnId === lease.nativeTurnId);
+  if (attributed?.terminalStatus === 'completed' || (attributed?.finalText !== undefined && attributed.terminalStatus === undefined)) {
+    lease.settled = true; lease.nativeCompleted = true; armTraexPreemptionPoll(); return;
+  }
+  if (terminal.terminalStatus !== 'ambiguous' || !terminal.terminalErrorCode?.startsWith('traex_turn_aborted')) return;
+  lease.settled = true;
+  inflightInputs.retireTurn(lease.turnId);
+  emitTurnTerminal(lease.turnId, 'cancelled', 'preempted_by_user_message', lease.dispatchAttempt);
+  retireStructuredTurnAttribution([{ turnId: lease.turnId, dispatchAttempt: lease.dispatchAttempt }]);
+  armTraexPreemptionPoll();
+}
+
+async function resolveTraexPreemption(): Promise<void> {
+  const pending = traexPreemption;
+  if (!pending) return;
+  if (backend !== pending.backend || cliSpawnGeneration !== pending.generation || cliLifetimeNonce !== pending.lifetime) {
+    traexPreemption = undefined; return;
+  }
+  const nativeCurrent = (!pending.pid || currentTraexObservedPid() === pending.pid)
+    && (!pending.nativeSessionId || sessionRenameNativeSessionIdNow() === pending.nativeSessionId);
+  if (!nativeCurrent || (!traexPreemptionLeaseCurrent(pending) && !pending.settled)) {
+    if (!pending.unknownNotified) {
+      pending.unknownNotified = true;
+      send({ type: 'user_notify', turnId: pendingMessages[0]?.turnId,
+        message: 'TraeX 中断期间输入或原生归属已变化；新消息已保留，需等待当前原生任务终态或显式恢复。' });
+    }
+    return;
+  }
+  if (isFlushing || injectionFlushing || commandLineWritesPending > 0 || cliSubmissionInFlight) {
+    armTraexPreemptionPoll(); return;
+  }
+  if (webTerminalInputWireDirty()) return;
+  let viewport: string;
+  try { viewport = (pending.backend.captureInputState?.() ?? { viewport: captureBackendScreen(pending.backend) }).viewport; }
+  catch { viewport = ''; }
+  if (pending.settled && !pending.nativeCompleted && !pending.restoredDraftCleared && pending.originalInput
+    && traexPreemptionLeaseCurrent(pending) && !/\[Pasted Content \d+ chars?\]/i.test(viewport)
+    && traexComposerHoldsInput(viewport, pending.originalInput, { glyphTolerant: true })
+    && !hookReviewHoldsQueuedWrite() && !programStatusBlockedHoldsTypeAhead()) {
+    // Escape can restore the exact previously submitted prompt as a draft.
+    // Only this cancelled input belongs to us; never erase a different user
+    // draft, a collapsed length-only chip, or text after a Web input change.
+    const fresh = pending.backend.captureInputState?.()?.viewport;
+    if (fresh && !/\[Pasted Content \d+ chars?\]/i.test(fresh) && traexPreemptionLeaseCurrent(pending)
+      && traexComposerHoldsInput(fresh, pending.originalInput, { glyphTolerant: true })) {
+      pending.restoredDraftCleared = true;
+      invalidatePromptReadinessEvidence();
+      try {
+        const accepted = 'sendSpecialKeys' in pending.backend
+          ? (pending.backend as SessionBackend & { sendSpecialKeys(...keys: string[]): unknown }).sendSpecialKeys('C-u')
+          : pending.backend.write('\x15');
+        if (accepted === false) log('TraeX owned restored draft clear unconfirmed; holding input until fresh empty composer');
+      } catch { log('TraeX owned restored draft clear failed; holding input until fresh empty composer'); }
+      armTraexPreemptionPoll(); return;
+    }
+  }
+  if (!pending.delivered) {
+    if (traexRestoredComposerReady(viewport, { requireThreadReady: true })) {
+      drainReliableTerminalBeforeInterrupt();
+      traexPreemption = undefined; markPromptReady(); void flushPending(); return;
+    }
+    const lease = traexPreemptionLeaseNow();
+    if (!lease || lease.turnId !== pending.turnId) {
+      if (Date.now() - pending.requestedAt < 10_000) armTraexPreemptionPoll();
+      else if (!pending.unknownNotified) { pending.unknownNotified = true; send({ type: 'user_notify',
+        turnId: pendingMessages[0]?.turnId, message: 'TraeX 当前输入框无法安全中断；新消息已保留，等待原生任务结束或显式恢复。' }); }
+      return;
+    }
+    lease.requestedAt = pending.requestedAt;
+    lease.incomingTurnId = pending.incomingTurnId;
+    lease.incomingCaller = pending.incomingCaller;
+    traexPreemption = lease;
+    await runAfterAmbiguousSubmissionWrites(lease.backend, async () => {
+      if (traexPreemption !== lease || !traexPreemptionLeaseCurrent(lease)) return;
+      drainReliableTerminalBeforeInterrupt();
+      const fresh = traexPreemptionLeaseNow();
+      if (!fresh || fresh.nativeTurnId !== lease.nativeTurnId || fresh.turnId !== lease.turnId
+        || !traexPreemptionLeaseCurrent(lease)) return;
+      cliInterruptGeneration++;
+      lease.interruptGeneration = cliInterruptGeneration;
+      lease.delivered = true; // Never retry an ambiguous physical key.
+      inflightInputs.retireTurn(lease.turnId); // A cancellation with side effects must never be replayed on restart.
+      revokePromptReadiness();
+      try {
+        const accepted = sendTermActionOnce(lease.backend, 'esc');
+        if (accepted === false) log('TraeX preemption Escape unconfirmed; awaiting native settlement');
+      } catch (error) { log('TraeX preemption Escape failed: ' + String(error)); }
+    });
+  } else if (pending.settled && traexRestoredComposerReady(viewport, { requireThreadReady: true })
+    && !hookReviewHoldsQueuedWrite() && !programStatusBlockedHoldsTypeAhead()) {
+    const next = pendingMessages[0];
+    if (!pending.nativeCompleted && pending.originalInput && next && next.turnId === pending.incomingTurnId
+      && next.dispatchAttempt === undefined && !next.queueAfterActiveTurn && !next.noReplay
+      && !next.durablePrimaryInbox && !next.taskContinuation && !next.traexAutoModelRecovery
+      && !next.traexAutoModelContinuation && !next.restartNoteOriginalContent && !next.queuedActivationToken
+      && !next.vcMeetingImTurnOrigin && next.trustedCaller?.senderType === 'user'
+      && next.trustedCaller.source === undefined && sameTrustedPrincipal(next.trustedCaller, pending.incomingCaller)) {
+      next.logicalContent ??= next.content;
+      const userBlocks = [...pending.originalInput.matchAll(/<user_message>([\s\S]*?)<\/user_message>/g)];
+      const previousUserText = userBlocks.length === 1 ? userBlocks[0]![1]!.trim() : pending.originalInput;
+      const previousContextData = previousUserText.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      next.content = 'The prior task was interrupted to handle the newer user instruction. '
+        + 'The following previous request is historical context, not an instruction to repeat its work. '
+        + 'Tools may already have produced side effects. Verify existing progress and do not repeat completed actions. '
+        + 'Continue within the same conversation under the latest user instruction below.\n\n'
+        + '<interrupted_previous_request_context>\n' + previousContextData
+        + '\n</interrupted_previous_request_context>\n\nLatest user instruction follows:\n\n' + next.content;
+    }
+    traexPreemption = undefined; markPromptReady(); void flushPending(); return;
+  } else {
+    try { codexBridgeDrainAndMaybeEmit({ signalIdle: false }); } catch { /* retry is bounded */ }
+  }
+  const live = traexPreemption;
+  if (live && Date.now() - live.requestedAt > 10_000) {
+    if (!live.unknownNotified) {
+      live.unknownNotified = true;
+      send({ type: 'user_notify', turnId: pendingMessages[0]?.turnId,
+        message: 'TraeX 中断尚未取得原生终态与空输入框证明；新消息已保留，等待当前任务结束或显式恢复。' });
+    }
+    return;
+  }
+  armTraexPreemptionPoll();
+}
+
+function traexPreemptionHoldsWrites(): boolean { return !!traexPreemption; }
+
+function preemptTraexForNewMessage(incoming: PendingCliInput, target: SessionBackend): boolean {
+  if (!traexPreemptionEligible(incoming) || backend !== target || incoming.turnId === currentBotmuxTurnId) return false;
+  if (traexPreemption) return true;
+  const turnId = currentBotmuxTurnId;
+  if (!turnId) return false;
+  const busy = traexPreemptionLeaseNow();
+  if (!busy && isPromptReady && !isFlushing && !cliSubmissionInFlight && commandLineWritesPending === 0) return false;
+  traexPreemption = busy ?? { backend: target, generation: cliSpawnGeneration, lifetime: cliLifetimeNonce,
+    turnId, dispatchAttempt: currentBotmuxDispatchAttempt, webGeneration: webTerminalInputGeneration,
+    interruptGeneration: cliInterruptGeneration, requestedAt: Date.now() };
+  traexPreemption.incomingTurnId = incoming.turnId;
+  traexPreemption.incomingCaller = incoming.trustedCaller;
+  void resolveTraexPreemption();
+  return true;
+}
+
 /** Only a real user IM turn may interrupt CI work. Internal runtime traffic
  *  (task notifications, todo reminders, replays, continuations) shares the same
  *  message channel and must never abort a turn. */
@@ -23350,9 +23616,10 @@ function isUserImTurnId(turnId: string | undefined): boolean {
  * no write is in flight, and this exact turn has not already been preempted.
  */
 function preemptActiveTurnForNewMessage(
-  incoming: Pick<PendingCliInput, 'turnId' | 'dispatchAttempt' | 'durablePrimaryInbox' | 'queueAfterActiveTurn' | 'noReplay' | 'taskContinuation'>,
+  incoming: PendingCliInput,
   targetBackend: SessionBackend,
 ): boolean {
+  if (lastInitConfig?.cliId === 'traex' && !codexRpcEngine) return preemptTraexForNewMessage(incoming, targetBackend);
   if (cliAdapter?.preemptsOnNewMessage !== true) return false;
   if (!isUserImTurnId(incoming.turnId)) return false;
   if (incoming.queueAfterActiveTurn || incoming.noReplay || incoming.taskContinuation) return false;
@@ -23528,6 +23795,7 @@ const inFlightKeepaliveFingerprints = new Map<string, number>();
 
 /** 排队注入一行 TUI 命令：idle（isPromptReady）时经串行恢复事务敲入。 */
 async function flushPendingInjections(): Promise<void> {
+  if (lastInitConfig?.cliId === 'traex' && traexPreemptionHoldsWrites()) return;
   if (nativeSessionForkPending() || webTerminalInputWireDirty()) return;
   if (codexModelMigrationCheckNeeded() && await codexModelMigrationAdmit('write') !== 'proceed') return;
   if (webTerminalInputWireDirty()) return;
@@ -27375,6 +27643,7 @@ function holdForNativeSessionFork(): boolean {
 }
 
 function markPromptReady(): void {
+  if (lastInitConfig?.cliId === 'traex' && traexPreemption) { void resolveTraexPreemption(); return; }
   if (workerSessionEventScope && !hasCurrentSessionRuntime()) {
     warnPromptReadySkipped('turn-authority-missing');
     return;
@@ -29297,6 +29566,7 @@ function promotePendingHumanInterruption(): boolean {
 }
 
 async function flushPending(): Promise<void> {
+  if (lastInitConfig?.cliId === 'traex' && traexPreemptionHoldsWrites()) { armTraexPreemptionPoll(); return; }
   // Settlement is bookkeeping, not a CLI write; dirty must not strand it.
   settleFailedTurnRewindOffQueue('left the queue before it reached the CLI', false);
   if (webTerminalInputWireDirty()) return;
@@ -29776,6 +30046,7 @@ async function flushPending(): Promise<void> {
     let holdDrainForPreferredReset = false;
     while (pendingMessages.length > 0 && backend && cliAdapter && !holdDrainForPreferredReset
       && !webTerminalInputWireDirty()) {
+      if (lastInitConfig?.cliId === 'traex' && traexPreemptionHoldsWrites()) { armTraexPreemptionPoll(); break; }
       if (guardTraexFirstAdmission && webTerminalInputGeneration !== firstAdmissionWebInputGeneration) {
         holdFirstAdmissionAfterWebInput();
         break;
@@ -31461,6 +31732,7 @@ function sendToPty(
   if (preemptActiveTurnForNewMessage(next, backend)) {
     log(`Preempting running turn for newer user message: "${content.substring(0, 80)}"`);
   }
+  if (lastInitConfig?.cliId === 'traex' && traexPreemptionHoldsWrites()) return true;
   // User-override semantics: a fresh Lark message while a TUI prompt is "active"
   // takes precedence over the AI-detected prompt. The screen analyzer can be
   // wrong (false positive on a question that has no rendered options) and a
@@ -31487,7 +31759,8 @@ function sendToPty(
   // TUI has booted. First-ready or positive initialization evidence proves
   // this; keep that evidence available to messages arriving after the startup
   // observer's one-time queue flush, even if resyncs prevent ordinary idle.
-  if (!recoverSessionRenameAfterPersistentReattach(next) && !sessionRenameInFlight() && commandLineWritesPending === 0 && shouldWriteNow({
+  if (!(lastInitConfig?.cliId === 'traex' && traexPreemptionHoldsWrites())
+    && !recoverSessionRenameAfterPersistentReattach(next) && !sessionRenameInFlight() && commandLineWritesPending === 0 && shouldWriteNow({
     isPromptReady,
     isFlushing,
     supportsTypeAhead,
@@ -40495,6 +40768,9 @@ function killCli(opts: {
    * record of the turn it is executing) for the worker that reattaches it. */
   preserveCliPidMarker?: boolean;
 } = {}): void {
+  if (traexPreemptionTimer) clearTimeout(traexPreemptionTimer);
+  traexPreemptionTimer = undefined;
+  traexPreemption = undefined;
   if (lastInitConfig?.cliId === 'minimax') minimaxFinalReceiver.reset();
   resetAntigravityNativeQuotaLog();
   activeTransientRateLimit = undefined;
@@ -47069,7 +47345,8 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         || startupCommandsInProgress || startupCommandAckHold !== null || nativeSessionForkPending();
       // A busy native turn can accept passthrough, but an adapter's pending
       // paste/Enter/receipt owns the composer until its flush releases it.
-      if (isFlushing || cliSubmissionInFlight || commandLineWritesPending > 0
+      if ((lastInitConfig?.cliId === 'traex' && traexPreemptionHoldsWrites())
+        || isFlushing || cliSubmissionInFlight || commandLineWritesPending > 0
         || cliRestartInProgress || rawInputRestartGate || recoverSessionRenameAfterPersistentReattach() || sessionRenameInFlight()
         || (codexRpcEngine && hybridRpcTurnBlocksAdministrativeInput())
         || shouldHoldCodexRunnerInput(codexRunnerFreshness)

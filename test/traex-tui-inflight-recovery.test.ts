@@ -36,6 +36,7 @@ function reattachHarness() {
     traexActiveEmptyComposerReady, pendingInputAllowsTypeAhead, pendingInputMayFlush, shouldWriteNow, inputForcesSerialTurn,
     durableTurnInFlight: false, initPromptMaterialized: true,
     commandLineWritesPending: 0, cliLifetimeNonce: 2,
+    structuredTurnsWithSubmitNotice: new Set<string>(),
     traexNativeStartupInputPending: false, traexFirstInputAdmissionPending: false,
     firstWriteLivenessConfirmed: false, firstWriteSpawnedAtMs: Date.now(),
     firstWriteLivenessHeld: false, firstWriteCaptureAtMs: 0, firstWriteCapturedViewport: undefined,
@@ -58,6 +59,7 @@ function reattachHarness() {
     writeInput: vi.fn(async (_target, _content, context) => { context?.submitGuard?.beforeWrite?.(); return { submitted: true }; }),
   });
   h.scope.sessionRenameNativeSessionIdNow = loadWorkerFunction('sessionRenameNativeSessionIdNow', h.scope);
+  h.scope.traexPreemptionHoldsWrites = loadWorkerFunction('traexPreemptionHoldsWrites', h.scope);
   h.scope.inputBoxJudgeable = loadWorkerFunction('inputBoxJudgeable', h.scope);
   h.scope.adapterInputBoxReady = loadWorkerFunction('adapterInputBoxReady', h.scope);
   h.scope.firstWriteScreen = loadWorkerFunction('firstWriteScreen', h.scope);

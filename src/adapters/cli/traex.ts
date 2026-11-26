@@ -30,8 +30,10 @@ import {
 } from '../../services/traex-transcript.js';
 import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay } from '../../utils/timing.js';
+import { stripAnsiScreenText } from '../../utils/idle-detector.js';
 import {
   traexModelPickerPage,
+  traexActiveEmptyComposerReady,
   traexRestoredComposerReady,
   traexSessionRenameSurface,
   traexViewportFooterBusy,
@@ -40,6 +42,16 @@ import {
   TRAEX_SPINNER_LABELS,
 } from './traex-footer.js';
 export { TRAEX_SPINNER_LABELS } from './traex-footer.js';
+
+/** A foreground shell adds a suffix and optional native tip below its status
+ * row. Remove only those recorded cells before the existing empty-composer
+ * admission check; a queue, permission page, draft or picker stays rejected. */
+export function traexPreemptionComposerReady(screen: string): boolean {
+  const rows = stripAnsiScreenText(screen).trimEnd().split(/\r?\n/);
+  const normalized = rows.filter(row => !/^  └ Tip: Use \/raw to toggle copy-friendly raw scrollback\.$/.test(row))
+    .map(row => row.replace(/ · \d+ shells? running… · \/ps to manage$/, ''));
+  return traexActiveEmptyComposerReady(normalized.join('\n'));
+}
 import { probeTraexHookTrustSupport, TRAEX_HOOK_TRUST_FLAG, TRAEX_HOOK_TRUST_MIN_VERSION, TRAEX_PROGRAM_STATUS_MIN_VERSION } from './traex-version.js';
 
 /**

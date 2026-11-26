@@ -86,6 +86,8 @@ function harness(opts: Opts = {}) {
   const backend = { sendSpecialKeys: sendSpecial };
   const context = createContext({
     cliAdapter: adapter,
+    lastInitConfig: { cliId: 'zcode' },
+    codexRpcEngine: undefined,
     backend,
     cliRestartInProgress: opts.cliRestartInProgress ?? false,
     awaitingFirstPrompt: opts.awaitingFirstPrompt ?? false,
