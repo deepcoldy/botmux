@@ -63,13 +63,55 @@ export type AntigravityCotEntry =
   }
   | { kind: 'tool_result'; id: string; result: string };
 
+type PendingAntigravityTools = Array<{ id: string; name: string }>;
+
+interface IdAllocation {
+  used: Set<string>;
+  nextSuffix: Map<string, number>;
+}
+
+/** Ids already used by calls in this native turn. Keeping this state separately
+ * from the FIFO is necessary: a completed call leaves pendingTools, but its id
+ * remains on the reply card and must not be reused by a later record.
+ *
+ * Non-conflicting ids retain their legacy form across an in-place upgrade. On a
+ * collision, deterministic suffixes disambiguate both mixed raw types (42 vs
+ * "42") and repeated fallback step/index pairs. restorePendingTools replays the
+ * same records in order and therefore reproduces the same allocation; no JSONL
+ * byte offsets or compact/full layout leak into the pairing key. */
+const idAllocations = new WeakMap<PendingAntigravityTools, IdAllocation>();
+
+function toolCallId(rawId: unknown, stepIndex: unknown, index: number, pendingTools: PendingAntigravityTools): string {
+  let allocation = idAllocations.get(pendingTools);
+  if (!allocation) {
+    allocation = { used: new Set(), nextSuffix: new Map() };
+    idAllocations.set(pendingTools, allocation);
+  }
+  const base = (typeof rawId === 'string' || typeof rawId === 'number') && rawId !== ''
+    ? String(rawId)
+    : `call_${stepIndex ?? 'step'}_${index}`;
+  if (!allocation.used.has(base)) {
+    allocation.used.add(base);
+    return base;
+  }
+  let suffix = allocation.nextSuffix.get(base) ?? 0;
+  let id: string;
+  do {
+    suffix += 1;
+    id = `${base}__botmux_${suffix}`;
+  } while (allocation.used.has(id));
+  allocation.nextSuffix.set(base, suffix);
+  allocation.used.add(id);
+  return id;
+}
+
 function truncateForCot(s: string, max: number): string {
   return s.length > max ? `${s.slice(0, max)}…` : s;
 }
 
 export function extractAntigravityCotEntriesFromRecord(
   d: any,
-  pendingTools: Array<{ id: string; name: string }>,
+  pendingTools: PendingAntigravityTools,
 ): AntigravityCotEntry[] {
   if (!d || typeof d !== 'object') return [];
   const entries: AntigravityCotEntry[] = [];
@@ -77,6 +119,7 @@ export function extractAntigravityCotEntriesFromRecord(
   // User input lines never enter the thinking process; reset any pending tools
   if (d.type === 'USER_INPUT' || d.source === 'USER_EXPLICIT') {
     pendingTools.length = 0;
+    idAllocations.delete(pendingTools);
     return entries;
   }
 
@@ -102,7 +145,7 @@ export function extractAntigravityCotEntriesFromRecord(
       d.tool_calls.forEach((tc: any, idx: number) => {
         if (!tc || typeof tc !== 'object') return;
         const toolName = typeof tc.name === 'string' && tc.name ? tc.name : 'tool';
-        const id = tc.id || `call_${d.step_index ?? 'step'}_${idx}`;
+        const id = toolCallId(tc.id, d.step_index, idx, pendingTools);
         pendingTools.push({ id, name: toolName });
         let argsStr = '';
         if (typeof tc.args === 'string') {
@@ -158,7 +201,7 @@ interface ReaderState {
   upgradeAttemptKey?: string;
   timer: NodeJS.Timeout;
   watcher: FSWatcher | null;
-  pendingTools: Array<{ id: string; name: string }>;
+  pendingTools: PendingAntigravityTools;
   /** Boundary of the native user turn the currently scanned records belong
    *  to. Undefined only for lines predating the first USER_INPUT the reader
    *  has observed. */
@@ -308,7 +351,7 @@ export interface StartAntigravityCotOptions {
 /** Pending tools reset at USER_INPUT. Locate that boundary backwards, then
  * replay only the latest turn's correlation state, not the whole conversation.
  * Use one regular-file fd for both passes and retain an incomplete EOF line. */
-function restorePendingTools(path: string, endOffset: number, pendingTools: Array<{ id: string; name: string }>): number {
+function restorePendingTools(path: string, endOffset: number, pendingTools: PendingAntigravityTools): number {
   let fd: number | undefined;
   try {
     fd = openSync(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
@@ -369,7 +412,7 @@ export function startAntigravityCot(
 
   // Restore correlation for a tool that started before this reader attached,
   // without replaying any old thinking or tool-call display entries.
-  const pendingTools: Array<{ id: string; name: string }> = [];
+  const pendingTools: PendingAntigravityTools = [];
   if (initialOffset > 0 && transcriptPath) {
     initialOffset = restorePendingTools(transcriptPath, initialOffset, pendingTools);
   }
