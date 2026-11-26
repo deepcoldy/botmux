@@ -83,7 +83,7 @@ The bot updates its card as it works and posts the result when finished. You can
 ## Community and contributing
 
 - 🎬 **Video introduction**: [Watch the demo](https://deepcoldy.github.io/botmux/img/video-promo-en.mp4)
-- 💬 **Public community**: the [About & Resources](https://deepcoldy.github.io/botmux/en/about) page has a QR code for the external community group.
+- 💬 **Community groups**: the [About & Resources](https://deepcoldy.github.io/botmux/en/about) page has QR codes for internal and external groups; internal users can join an internal group first.
 - 🤝 **Contribute**: [Issues](https://github.com/deepcoldy/botmux/issues) and PRs are welcome. To add an adapter, see [CLI Adapters](https://deepcoldy.github.io/botmux/en/adapters).
 - 📄 **License**: [MIT](LICENSE)
 

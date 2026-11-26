@@ -83,7 +83,7 @@ botmux start
 ## 社区 · 贡献
 
 - 🎬 **视频介绍**：[观看演示](https://deepcoldy.github.io/botmux/img/video-promo.mp4)
-- 💬 **公开交流群**：[关于 & 资源](https://deepcoldy.github.io/botmux/about)页提供外部社区扫码入口。
+- 💬 **交流群**：[关于 & 资源](https://deepcoldy.github.io/botmux/about)页提供内部与外部群扫码入口，内部用户可优先加入内部群。
 - 🤝 **参与贡献**：欢迎提交 [Issue](https://github.com/deepcoldy/botmux/issues) / PR；新增适配器见[多 CLI 适配器](https://deepcoldy.github.io/botmux/adapters)。
 - 📄 **License**：[MIT](LICENSE)
 
