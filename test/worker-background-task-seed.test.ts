@@ -448,4 +448,120 @@ describe('turn_terminal background task count', () => {
     expect(terminalFor('completed', 0)).not.toHaveProperty('backgroundTasks');
     expect(terminalFor('failed', 2)).not.toHaveProperty('backgroundTasks');
   });
+
+  it('preserves backgroundTasks on a same-batch completed turn when foldBackgroundUpdates is on and a bounded Monitor is live', () => {
+    const tracker = new BackgroundTaskTracker();
+    // Anchor relative to the real clock so the bounded Monitor stays inside its
+    // 30m window on every runner: a fixed historical timestamp would make the
+    // default-now hasPendingNonPersistentMonitor()/emitTurnTerminal checks read
+    // it as expired on the Bun leg (no global fake timer), unlike vitest.
+    const t0 = Date.now() - 60_000;
+    tracker.observe({
+      type: 'user', uuid: 'm-ack', timestamp: new Date(t0).toISOString(), isSidechain: false,
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu1', content: 'started' }] },
+      toolUseResult: { taskId: 'm1', timeoutMs: 1_800_000, persistent: false },
+    } as TranscriptEvent);
+    // Same-batch race: main turn ended, then Monitor mid-stream notice reopened mainTurnOpen.
+    tracker.observe({
+      type: 'system', subtype: 'turn_duration', uuid: 'd1', timestamp: new Date(t0 + 100).toISOString(),
+    } as TranscriptEvent);
+    tracker.observe({
+      type: 'user', uuid: 'n1', timestamp: new Date(t0 + 200).toISOString(), promptSource: 'system',
+      message: { role: 'user', content: '<task-notification>\n<task-id>m1</task-id>\n<result>tick</result>\n</task-notification>' },
+    } as TranscriptEvent);
+    expect(tracker.backgroundWait()).toBe(0);
+    expect(tracker.hasPendingNonPersistentMonitor()).toBe(true);
+
+    const runEmit = (foldBackgroundUpdates: boolean) => {
+      const scope: Record<string, any> = {
+        lastInitConfig: { cliId: 'claude-code', ...(foldBackgroundUpdates ? { foldBackgroundUpdates: true } : {}) },
+        sessionId: 'sid-same-batch',
+        emittedTurnTerminals: new TurnTerminalDeduper(),
+        activeTurnAuthority: new ActiveTurnAuthority(),
+        retiredTurnIds: new Set<string>(),
+        pendingQueue: [],
+        queuedTypeAheadTurns: [],
+        currentTurnDispatchAttempt: 1,
+        submitFailureChains: new Map(),
+        cliSpawnGeneration: 1,
+        cancelSubmitFailureChainForTerminal: vi.fn(),
+        turnExecutionClock: { settle: () => ({ completedAtMs: 1000, durationMs: 5 }), forget: vi.fn() },
+        codexBridgeQueue: { dropPendingTurn: () => false },
+        terminalReleasesDurableTurn: () => false,
+        remoteRunnerRecoveredTurnInFlight: false,
+        flushPending: vi.fn(),
+        queueMicrotask: (fn: () => void) => fn(),
+        syncQueuedTurnsFromMarkerDisk: () => false,
+        crossPrincipalIsolationOn: () => false,
+        backgroundTaskTracker: tracker,
+        send: vi.fn(),
+        log: vi.fn(),
+      };
+      scope.markTurnRetired = (turnId?: string) => { if (turnId) scope.retiredTurnIds.add(turnId); };
+      for (const name of [
+        'turnAuthorityIdentity', 'adoptActiveTurnWhenIsolationOff', 'activeTurnBlocks', 'markActiveTurnStarted',
+        'releaseActiveTurnAuthority', 'releaseTerminatedActiveTurnAuthority', 'retireTerminatedQueuedTurn',
+        'advanceQueuedTypeAheadTurn', 'emitTurnTerminal', 'dropQueuedTurnRecord', 'turnTerminalEmitted',
+        'retireTerminatedMarkerTurn',
+      ]) scope[name] = loadWorkerFunction(name, scope);
+      scope.emitTurnTerminal('om_t', 'completed', undefined, 1);
+      return scope.send.mock.calls.map((call: any[]) => call[0]).find((m: any) => m.type === 'turn_terminal');
+    };
+
+    expect(runEmit(false)).not.toHaveProperty('backgroundTasks');
+    expect(runEmit(true)).toMatchObject({ status: 'completed', backgroundTasks: 1 });
+  });
+});
+
+describe('seedBackgroundTasksFromTranscript seeds BridgeTurnQueue for re-attached Monitors', () => {
+  it('seeds live bounded Monitors into bridgeQueue and rolls back on partial scan failure', () => {
+    const t0 = Date.now() - 10_000;
+    const monitorLaunch: TranscriptEvent = {
+      type: 'user',
+      uuid: 'u-mon',
+      timestamp: new Date(t0 + 1_000).toISOString(),
+      isSidechain: false,
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu-m', content: 'Monitor started' }] },
+      toolUseResult: { taskId: 'm-reattach', timeoutMs: 1_800_000, persistent: false },
+    } as TranscriptEvent;
+    const events: TranscriptEvent[] = [
+      prompt(100),
+      monitorLaunch,
+      finalAnswer(2_000),
+      turnDuration(2_100),
+    ];
+    const seedCalls: unknown[] = [];
+    const resetCalls: number[] = [];
+    const path = join(dir, `reattach-mon-${Math.random().toString(36).slice(2)}.jsonl`);
+    writeFileSync(path, events.map(ev => JSON.stringify(ev)).join('\n') + '\n');
+
+    const tracker = new BackgroundTaskTracker();
+    const scope: Record<string, any> = {
+      lastInitConfig: { cliId: 'claude-code' },
+      bridgeLiveCliStartedAtMs: t0,
+      bridgeJsonlPath: path,
+      existsSyncSafe: () => true,
+      scanJsonlFromOffset,
+      backgroundTaskTracker: tracker,
+      bridgeQueue: {
+        seedBackgroundTasks: (tasks: unknown) => { seedCalls.push(tasks); },
+        resetBackgroundTasks: () => { resetCalls.push(1); },
+      },
+      normalizeBackgroundTranscriptPath,
+      normalizeBackgroundTranscriptSegments,
+      refreshBackgroundWait: () => {},
+      log: vi.fn(),
+    };
+    const seedFn = loadWorkerFunction<() => JsonlCursor | null | undefined>('seedBackgroundTasksFromTranscript', scope);
+    expect(seedFn()).not.toBeNull();
+    expect(seedCalls).toEqual([[
+      { taskId: 'm-reattach', kind: 'monitor', persistent: false, expiresAtMs: t0 + 1_000 + 1_800_000 },
+    ]]);
+    expect(resetCalls).toHaveLength(0);
+
+    // Partial scan failure (!cursor) rolls back bridgeQueue background metadata too.
+    scope.scanJsonlFromOffset = () => null;
+    expect(seedFn()).toBeNull();
+    expect(resetCalls).toHaveLength(1);
+  });
 });
