@@ -362,7 +362,9 @@ export interface ResolvedSender {
 export async function resolveVerifiedUserIdentity(
   larkAppId: string,
   openId: string,
+  requestOwned?:RequestOwnedIdentityQueryOptions,
 ): Promise<{ openId: string; type: 'user'; name?: string; email?: string } | undefined> {
+  if(requestOwned)return fetchRequestOwnedVerifiedIdentity(larkAppId,openId,'open_id',requestOwned);
   if (!openId) return undefined;
   try {
     const c = getBotClient(larkAppId);
@@ -398,6 +400,48 @@ interface VerifiedUnionIdentity {
   type: 'user';
   name?: string;
   email?: string;
+}
+
+/** Request-owned branch only. The existing two-argument helpers retain their
+ * shared token/cache/timeout contract. This branch never joins owner inflight
+ * waiters and returns only after the actual SDK token+contact promise settles. */
+export interface RequestOwnedIdentityQueryOptions {
+  readonly signal:AbortSignal;
+  /** Lower-only host/testing budget; expiry aborts transport, never just waiter. */
+  readonly timeoutMs?:number;
+}
+async function fetchRequestOwnedVerifiedIdentity(
+  larkAppId:string,id:string,idType:'open_id'|'union_id',options:RequestOwnedIdentityQueryOptions,
+):Promise<{openId:string;type:'user';name?:string;email?:string;unionId?:string}|undefined>{
+  if(options.signal.aborted || !(idType==='union_id'?id.startsWith('on_'):id.startsWith('ou_')))return undefined;
+  const controller=new AbortController();const abort=()=>controller.abort();
+  options.signal.addEventListener('abort',abort,{once:true});
+  if(options.signal.aborted)abort();
+  const budget=Math.min(3_000,Math.max(1,options.timeoutMs??3_000));
+  const timer=setTimeout(abort,budget);
+  try{
+    if(controller.signal.aborted)return undefined;
+    const c=getBotClient(larkAppId);
+    // The SDK's tenant-token await may ignore this signal. Keeping this actual
+    // promise (not withTimeout) lets the broker join it on retire/close.
+    const res=await larkGet(c,`/open-apis/contact/v3/users/${encodeURIComponent(id)}`,
+      {user_id_type:idType},{timeoutMs:budget,signal:controller.signal});
+    if(controller.signal.aborted||res?.code!==0)return undefined;
+    const user=res?.data?.user;
+    const openId=idType==='open_id'?id:typeof user?.open_id==='string'?user.open_id.trim():'';
+    const returnedOpenId=typeof user?.open_id==='string'?user.open_id.trim():openId;
+    const unionId=idType==='union_id'?(typeof user?.union_id==='string'?user.union_id.trim():id):undefined;
+    const rawEmail=user?.enterprise_email??user?.email;
+    const email=typeof rawEmail==='string'&&rawEmail.trim()?rawEmail.trim():undefined;
+    const name=typeof user?.name==='string'&&user.name.trim()?user.name.trim():undefined;
+    if(!openId.startsWith('ou_')||returnedOpenId!==openId||(idType==='union_id'&&(unionId!==id||!email?.includes('@'))))return undefined;
+    // No awaits between the cancellation fence and publication. Failed/cancelled
+    // owned queries never modify negative caches or the shared scope breaker.
+    if(controller.signal.aborted)return undefined;
+    recordIdentity(larkAppId,{openId,type:'user',name,email,contactResolvedAt:Date.now(),source:'contact_api'});
+    return {openId,type:'user',name,email,...(unionId?{unionId}:{})};
+  }catch{return undefined;}
+  finally{clearTimeout(timer);options.signal.removeEventListener('abort',abort);}
 }
 
 /**
@@ -484,7 +528,9 @@ function tripOwnerScopeBreaker(larkAppId: string, negativeKey: string, attemptTo
 export async function resolveVerifiedUserIdentityByUnionId(
   larkAppId: string,
   unionId: string,
+  requestOwned?:RequestOwnedIdentityQueryOptions,
 ): Promise<VerifiedUnionIdentity | undefined> {
+  if(requestOwned)return fetchRequestOwnedVerifiedIdentity(larkAppId,unionId,'union_id',requestOwned) as Promise<VerifiedUnionIdentity|undefined>;
   if (!unionId.startsWith('on_')) return undefined;
   if (scopeUnavailable.has(larkAppId)) return undefined;
   const key = `${larkAppId}:${unionId}`;

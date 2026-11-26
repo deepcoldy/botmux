@@ -36231,7 +36231,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   };
   const memoryAdmissionOwnerAlerts = new WorkerAdmissionOwnerAlerts(ownerAlertDependencies);
   const workerOwnerDiagnostics = new WorkerOwnerDiagnostics(ownerAlertDependencies);
-  let bytedcliRetireSession: ((sessionId: string) => Promise<void>) | undefined;
+  let bytedcliRetireSession: ((sessionId: string, workerGeneration?: number) => Promise<void>) | undefined;
   initWorkerPool({
     onOwnerDiagnostic: (ds, diagnostic) =>
       workerOwnerDiagnostics.report(ds.larkAppId, ds.session.sessionId, diagnostic),
@@ -36648,7 +36648,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     },
     async onSessionClosed(session, context) {
       autoCompactCoordinator.cancel(session.sessionId);
-      await bytedcliRetireSession?.(session.sessionId);
+      await bytedcliRetireSession?.(session.sessionId, context.workerGeneration);
       await finalizeClosedXpiSharedCwdMember(session, context);
     },
     onReceiverResetReady(_ds, context) {

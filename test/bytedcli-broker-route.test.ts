@@ -101,3 +101,45 @@ it('keeps a known pre-dispatch executor rejection rejected after authority withd
  const response=await post({...body,argv:['codebase','mr','close','42','--repo','ns/repo']});
  expect(await response.json()).toMatchObject({outcome:'rejected',errorCode:'policy_changed'});
 });
+
+it.each(['completed','rejected'] as const)('preserves write safety when post-result recheck throws after %s',async outcome=>{
+ let finished=false,writes=0;const authority:any={daemonBootId:'boot',botAppId:'app',sessionId:'s-broker',turnId:'t',workerGeneration:1,dispatchAttempt:0,policyFingerprint:'p',actor:{verifiedEmail:'a@example.com',credentialOpenId:'ou_A',source:'local'},recheck:async()=>{if(finished)throw new Error('provider failure');}};
+ const broker=new BytedcliBroker({authority:async()=>({ok:true,authority}),executor:{execute:async r=>{finished=true;if(outcome==='completed')writes++;return {schema:BYTEDCLI_EXEC_SCHEMA,requestId:r.requestId,operationId:r.operation.id,effectiveIdentity:{kind:outcome==='completed'?'actor':'none'},outcome,stdoutBase64:'',stderrBase64:'',exitCode:outcome==='completed'?0:77,...(outcome==='rejected'?{errorCode:'actor_auth_required' as const}:{})};},retireSession:async()=>{},close:async()=>{}}});
+ ipc=await startIpcServer({port:0,host:'127.0.0.1',authRequired:true,bytedcliBroker:broker});
+ const response=await post({...body,argv:['codebase','mr','close','42','--repo','ns/repo']});
+ expect(writes).toBe(outcome==='completed'?1:0);
+ expect(await response.json()).toMatchObject(outcome==='completed'?{outcome:'write_outcome_unknown',effectiveIdentity:{kind:'actor'},errorCode:'write_outcome_unknown'}:{outcome:'rejected'});
+});
+it('admits a successor generation after retiring the same session',async()=>{
+ let generation=1;
+ const broker=new BytedcliBroker({currentWorkerGeneration:()=>generation,
+  authority:async()=>({ok:true,authority:{daemonBootId:'boot',botAppId:'app',sessionId:'s-broker',turnId:'t',workerGeneration:generation,dispatchAttempt:0,policyFingerprint:'p',recheck:async()=>undefined}}),
+  executor:{execute:async (r:any)=>({schema:BYTEDCLI_EXEC_SCHEMA,requestId:r.requestId,operationId:r.operation.id,effectiveIdentity:{kind:'machine'},outcome:'completed',stdoutBase64:'',stderrBase64:'',exitCode:0}),retireSession:async()=>{},close:async()=>{}}} as any);
+ ipc=await startIpcServer({port:0,host:'127.0.0.1',authRequired:true,bytedcliBroker:broker});
+ expect((await (await post(body)).json()).outcome).toBe('completed');
+ await ipc.retireBytedcliSession('s-broker',1);generation=2;
+ expect((await (await post({...body,requestId:'generation-2'})).json()).outcome).toBe('completed');
+});
+it('does not let an old close callback cancel a successor generation request',async()=>{
+ let generation=2,started!:()=>void,release!:()=>void;const entered=new Promise<void>(r=>started=r),gate=new Promise<void>(r=>release=r);let aborted=false;
+ const authority:any={daemonBootId:'boot',botAppId:'app',sessionId:'s-broker',turnId:'t',workerGeneration:2,dispatchAttempt:0,policyFingerprint:'p',recheck:async()=>undefined};
+ const broker=new BytedcliBroker({currentWorkerGeneration:()=>generation,authority:async()=>({ok:true,authority}),executor:{execute:async r=>{r.signal!.addEventListener('abort',()=>aborted=true,{once:true});started();await gate;return {schema:BYTEDCLI_EXEC_SCHEMA,requestId:r.requestId,operationId:r.operation.id,effectiveIdentity:{kind:'machine'},outcome:'completed',stdoutBase64:'',stderrBase64:'',exitCode:0};},retireSession:async()=>{},close:async()=>{}}} as any);
+ ipc=await startIpcServer({port:0,host:'127.0.0.1',authRequired:true,bytedcliBroker:broker});
+ const pending=post(body);await entered;const retired=ipc.retireBytedcliSession('s-broker',1);
+ await new Promise(r=>setTimeout(r,20));const cancelledSuccessor=aborted;release();await retired;
+ const result=await (await pending).json();expect(cancelledSuccessor).toBe(false);expect(result.outcome).toBe('completed');
+});
+it.each(['retire','close'] as const)('joins pending authority even when executor %s cleanup rejects',async method=>{
+ let started!:()=>void,release!:()=>void;const entered=new Promise<void>(r=>started=r),gate=new Promise<void>(r=>release=r);
+ const cleanupError=new Error('cleanup failed');let cleanupCalls=0;
+ const cleanup=async()=>{if(cleanupCalls++===0)throw cleanupError;};
+ const broker=new BytedcliBroker({currentWorkerGeneration:()=>1,authority:async(_sid,_peer,_operation,context)=>{
+  context!.freezeGeneration!(1);started();await gate;return {ok:false,errorCode:'cancelled'};
+ },executor:{execute:async()=>{throw new Error('must not execute');},retireSession:cleanup,close:cleanup}});
+ ipc=await startIpcServer({port:0,host:'127.0.0.1',authRequired:true,bytedcliBroker:broker});
+ const pending=post(body);await entered;let settled=false;
+ const stop=(method==='retire'?broker.retireSession('s-broker',1):broker.close()).then(()=>{settled=true;return undefined;},error=>{settled=true;return error;});
+ await new Promise(r=>setTimeout(r,15));const premature=settled;release();
+ const result=await stop;await pending;
+ expect(premature).toBe(false);expect(result).toBe(cleanupError);
+});

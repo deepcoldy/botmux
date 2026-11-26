@@ -16,6 +16,10 @@ import type { BytedcliFrozenAuthority } from './bytedcli-executor.js';
 import type { BytedcliOperation } from './bytedcli-operation-policy.js';
 import type { BytedcliExecErrorCode } from '../cli/bytedcli-exec-protocol.js';
 import type { DaemonSession } from './types.js';
+import {effectiveScheduleChatIds} from '../services/schedule-store.js';
+import {isAutoCompletedSchedule} from '../services/schedule-until-done.js';
+import {isManualScheduledTurn} from './scheduled-turn-provenance.js';
+import type { RequestOwnedIdentityQueryOptions } from '../im/lark/identity-cache.js';
 import type { TrustedCaller } from '../types.js';
 export interface BytedcliAuthorityDependencies {
   readonly daemonBootId: string; readonly dataDir: string;
@@ -23,11 +27,16 @@ export interface BytedcliAuthorityDependencies {
   readonly policy: (ds: DaemonSession) => TriggerUserAuthConfig | undefined;
   readonly contains: (ds: DaemonSession) => boolean;
   readonly canTalk: (ds: DaemonSession, openId?: string, memberUnionId?: string) => boolean;
-  readonly identity: (app: string, openId: string) => Promise<{openId:string;type:'user';email?:string} | undefined>;
-  readonly unionIdentity: (app: string, unionId: string) => Promise<{openId:string;email?:string} | undefined>;
+  readonly identity: (app: string, openId: string,options?:RequestOwnedIdentityQueryOptions) => Promise<{openId:string;type:'user';email?:string} | undefined>;
+  readonly unionIdentity: (app: string, unionId: string,options?:RequestOwnedIdentityQueryOptions) => Promise<{openId:string;email?:string} | undefined>;
   readonly schedule: (app: string, taskId: string) => ScheduleAuthorityRecord | undefined;
   readonly procRoot?: string;
   readonly authEpoch?: typeof readCliAuthEpoch; readonly bindingKey?: typeof activePlatformCredentialBindingKey;
+}
+export interface BytedcliAuthorityRequestContext {
+  readonly signal:AbortSignal;
+  /** Host proof publishes its frozen generation before any provider wait. */
+  readonly freezeGeneration?:(workerGeneration:number)=>boolean;
 }
 export type BytedcliAuthorityResult = {ok:true; authority:BytedcliFrozenAuthority} | {ok:false;errorCode:BytedcliExecErrorCode};
 const fail = (errorCode:BytedcliExecErrorCode):BytedcliAuthorityResult => ({ok:false,errorCode});
@@ -46,11 +55,13 @@ const stable = (value:unknown):string => JSON.stringify(value);
 /** Snapshot before the first async contact/task lookup; recheck never captures
  * a request-owned signal, so an authorized replay has independent cancellation. */
 export async function resolveBytedcliAuthority(deps:BytedcliAuthorityDependencies,
-  sessionId:string, peer:ProcessIdentity, operation:BytedcliOperation):Promise<BytedcliAuthorityResult> {
+  sessionId:string, peer:ProcessIdentity, operation:BytedcliOperation,context?:BytedcliAuthorityRequestContext):Promise<BytedcliAuthorityResult> {
   const input = {sessionId,peer,findSession:deps.findSession,procRoot:deps.procRoot};
   const proof = attestCurrentExecutionLoopbackPeer(input);
   const execution = resolveDaemonCurrentExecution(input);
   if (!proof || !execution) return fail('execution_unverified');
+  if(context?.signal.aborted)return fail('cancelled');
+  if(context?.freezeGeneration && !context.freezeGeneration(execution.workerGeneration))return fail('execution_stale');
   const ds = proof.ds, worker = ds.worker;
   const identityTurn = execution.identityTurnId ?? execution.turnId;
   const policy = deps.policy(ds), fingerprint = stable(policy);
@@ -68,6 +79,13 @@ export async function resolveBytedcliAuthority(deps:BytedcliAuthorityDependencie
     const current = deps.schedule(ds.larkAppId,taskId);
     try { assertScheduledAuthorityCurrent(schedule,current,{turnId:identityTurn,allowCompleted:true}); }
     catch { return false; }
+    if(operation.effect==='read'){
+      if(!current || current.task.id!==taskId || (current.task.larkAppId && current.task.larkAppId!==ds.larkAppId))return false;
+      try{if(!effectiveScheduleChatIds(current.task).includes(ds.chatId))return false;}catch{return false;}
+      if(current.task.enabled===false && !((current.state==='completed'&&isAutoCompletedSchedule(current.task))
+        ||(current.state==='paused'&&isManualScheduledTurn(current.task,identityTurn))))return false;
+      return true;
+    }
     const admission = authorizeScheduledTurn({turnId:identityTurn, sessionLarkAppId:ds.larkAppId,sessionChatId:ds.chatId,
       loadTask:()=>current?.task,isOwnerAllowed:(_app,id)=>deps.canTalk(ds,id),
       isScheduledTurnLive:()=>currentTurnPeerAttestationStable(proof,input)});
@@ -105,6 +123,7 @@ export async function resolveBytedcliAuthority(deps:BytedcliAuthorityDependencie
     return synchronousCheck();
   };
   const initial = await recheck(); if (initial) return fail(initial);
+  if(context?.signal.aborted)return fail('cancelled');
   let actor:BytedcliFrozenAuthority['actor'];
   if (operation.effect === 'write') {
     if (isOwnerActorTurnId(identityTurn) || (!delegated && (scheduledCaller ?? caller)?.senderType !== 'user')
@@ -112,8 +131,9 @@ export async function resolveBytedcliAuthority(deps:BytedcliAuthorityDependencie
     const unionId = delegated?.unionId ?? scheduledCaller?.requestUserUnionId ?? caller?.requestUserUnionId;
     if (!credentialOpenId) return fail('actor_required');
     const identity = delegated && unionId
-      ? await deps.unionIdentity(ds.larkAppId,unionId)
-      : await deps.identity(ds.larkAppId,credentialOpenId);
+      ? await deps.unionIdentity(ds.larkAppId,unionId,context?{signal:context.signal}:undefined)
+      : await deps.identity(ds.larkAppId,credentialOpenId,context?{signal:context.signal}:undefined);
+    if(context?.signal.aborted)return fail('cancelled');
     const after = await recheck(); if (after) return fail(after);
     if (!identity || identity.openId !== (delegated?.targetOpenId ?? credentialOpenId)) return fail('actor_identity_unverified');
     let verifiedEmail:string;

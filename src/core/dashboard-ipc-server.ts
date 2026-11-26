@@ -795,7 +795,7 @@ type HeadlessReasoningEffort = NonNullable<HeadlessSessionRecord['reasoningEffor
 export interface IpcServerHandle {
   port: number;
   close: () => Promise<void>;
-  retireBytedcliSession: (sessionId: string) => Promise<void>;
+  retireBytedcliSession: (sessionId: string, workerGeneration?: number) => Promise<void>;
 }
 
 export type Handler = (
@@ -15489,7 +15489,7 @@ export function startIpcServer(opts: {
     // handlers run on — teardown callers already have to cope with that, since
     // the daemon can exit mid-request. listen-with-probe's release path tears
     // sockets down for the same reason.
-    retireBytedcliSession: sessionId => bytedcliBroker.retireSession(sessionId),
+    retireBytedcliSession: (sessionId, generation) => bytedcliBroker.retireSession(sessionId, generation),
     close: async () => {
       server.closeAllConnections?.();
       const stopped = new Promise<void>(resolve => server.close(() => resolve()));

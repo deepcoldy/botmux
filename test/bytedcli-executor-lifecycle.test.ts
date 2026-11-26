@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -106,4 +106,44 @@ describe('replay lifecycle registration', () => {
     const response = await Promise.race([replay, drain().then(() => ({ errorCode: 'hung' }))]); gate.release(); await blocker; await replay; await stop;
     expect(response.errorCode).toBe('write_outcome_unknown'); expect(revalidations).toBe(0);
   });
+});
+
+describe('generation-scoped retirement',()=>{
+ it.each(['close','retireSession'] as const)('finishes replay ownership after listener cleanup throws during %s',async method=>{
+  const gate=deferred(),entered=deferred();const parent=new AbortController();
+  const lease={jwt:'fake-only',kind:'machine',region:'cn',expiresAt:Date.now()+60_000,accountFingerprint:'sha256:machine',source:'machine',stillCurrent:async(signal?:AbortSignal)=>{if(signal){entered.release();await gate.promise;}}};
+  const s=setup({machine:async()=>lease,actor:async()=>{throw new Error('unexpected actor');}});
+  expect((await s.executor.execute(s.request())).outcome).toBe('completed');
+  const execution=s.executor.execute(s.request(read(),'request',{signal:parent.signal}));await entered.promise;
+  const detach=vi.spyOn(parent.signal,'removeEventListener').mockImplementationOnce(()=>{throw new Error('listener detach failed');});
+  let settled=false;const stop=(method==='close'?s.executor.close():s.executor.retireSession('session',1)).then(()=>{settled=true;return 'stopped';},()=>{settled=true;return 'failed';});
+  await drain();const premature=settled;gate.release();await execution;detach.mockRestore();
+  const result=await Promise.race([stop,new Promise<string>(resolve=>setTimeout(()=>resolve('hung'),100))]);
+  expect(premature).toBe(false);expect(result).toBe('stopped');
+ });
+ it.each(['close','retireSession'] as const)('joins underlying work after response finalization throws during %s',async method=>{
+  const gate=deferred(),entered=deferred();const parent=new AbortController();
+  const lease={jwt:'fake-only',kind:'machine',region:'cn',expiresAt:Date.now()+60_000,accountFingerprint:'sha256:machine',source:'machine',stillCurrent:async()=>undefined};
+  const s=setup({machine:async()=>lease,actor:async()=>{throw new Error('unexpected actor');}},async()=>{entered.release();await gate.promise;return empty;});
+  const execution=s.executor.execute(s.request(read(),'faulty',{signal:parent.signal}));await entered.promise;
+  const cleanupError=new Error('listener detach failed');
+  const detach=vi.spyOn(parent.signal,'removeEventListener').mockImplementationOnce(()=>{throw cleanupError;});
+  let settled=false;const stop=(method==='close'?s.executor.close():s.executor.retireSession('session',1)).then(()=>{settled=true;return undefined;},error=>{settled=true;return error;});
+  await drain();const premature=settled;gate.release();const failure=await stop;await execution;detach.mockRestore();
+  expect(premature).toBe(false);expect(failure).toBe(cleanupError);
+ });
+ it('retires old owned work without cancelling successor execution or future admissions',async()=>{
+  const oldGate=deferred(),newGate=deferred();const invocations:any[]=[];
+  const lease={jwt:'fake-only',kind:'machine',region:'cn',expiresAt:Date.now()+60_000,accountFingerprint:'sha256:machine',source:'machine',stillCurrent:async()=>undefined};
+  const s=setup({machine:async()=>lease,actor:async()=>{throw new Error('unexpected actor');}},async (invocation:any)=>{
+   const index=invocations.push(invocation)-1;if(index===0)await oldGate.promise;if(index===1)await newGate.promise;return empty;
+  });
+  const old=s.executor.execute(s.request(read(),'old',{authority:{...s.authority,workerGeneration:1}}));await drain();
+  const next=s.executor.execute(s.request(read(),'next',{authority:{...s.authority,workerGeneration:2}}));await drain();
+  let stopped=false;const retiring=s.executor.retireSession('session',1).then(()=>stopped=true);await drain();
+  const oldAborted=invocations[0]?.signal.aborted,newAborted=invocations[1]?.signal.aborted,premature=stopped;
+  newGate.release();const fresh=await next;oldGate.release();await old;await retiring;
+  const later=await s.executor.execute(s.request(read(),'later',{authority:{...s.authority,workerGeneration:3}}));await s.executor.close();
+  expect(oldAborted).toBe(true);expect(newAborted).toBe(false);expect(premature).toBe(false);expect(fresh.outcome).toBe('completed');expect(later.outcome).toBe('completed');
+ });
 });

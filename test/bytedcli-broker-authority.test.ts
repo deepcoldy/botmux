@@ -82,3 +82,13 @@ it('does not promote an explicit callerless origin through old human registry da
   f.ds.session.replyTargets={ 'executing-A':{senderOpenId:'ou_old',participants:[{openId:'ou_old',isBot:false}],senderType:'user'} };
   expect(await resolve(f,write)).toMatchObject({errorCode:'actor_required'});expect(f.identities()).toBe(0);
 });
+
+it('allows host-authorized ownerless scheduled shared reads while fencing task lifetime and chat',async()=>{
+ const f=setup();const turn='schedule:ab12:12345678-1234-1234-1234-123456789abc';f.ds.managedTurnOrigin.turnId=turn;f.ds.managedTurnOrigin.identityTurnId=turn;f.ds.managedTurnOrigin.trustedCaller=null;
+ let record:any={kind:'direct',state:'active',selfManage:false,runScopes:[],task:{id:'ab12',enabled:true,larkAppId:'cli_authority',chatId:'oc_authority',prompt:'shared read'}};
+ const deps={...f.deps,schedule:()=>record};const result=await resolveBytedcliAuthority(deps,'s-authority',{pid:process.pid,procStart:readProcessStartIdentity(process.pid)!},read);
+ expect(result.ok).toBe(true);expect(f.identities()).toBe(0);if(!result.ok)return;
+ record={...record,state:'revoked'};expect(await result.authority.recheck()).toBe('delegation_revoked');
+ record={...record,state:'active',task:{...record.task,chatId:'oc_foreign'}};
+ expect(await resolveBytedcliAuthority(deps,'s-authority',{pid:process.pid,procStart:readProcessStartIdentity(process.pid)!},read)).toMatchObject({errorCode:'permission_denied'});
+});

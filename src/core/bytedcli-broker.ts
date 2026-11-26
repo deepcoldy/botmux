@@ -6,7 +6,7 @@ import { BYTEDCLI_EXEC_LIMITS, BYTEDCLI_EXEC_SCHEMA, BYTEDCLI_EXEC_ERROR_CODES, 
   type BytedcliExecErrorCode, type BytedcliExecResponse } from '../cli/bytedcli-exec-protocol.js';
 import { parseBytedcliOperation, BytedcliOperationPolicyError } from './bytedcli-operation-policy.js';
 import { resolveLoopbackPeerProcesses } from './current-actor-attestation.js';
-import type { BytedcliAuthorityResult } from './bytedcli-broker-authority.js';
+import type { BytedcliAuthorityResult, BytedcliAuthorityRequestContext } from './bytedcli-broker-authority.js';
 import { resolveBytedcliAuthority } from './bytedcli-broker-authority.js';
 import { BytedcliExecutor, type BytedcliExecutionRequest } from './bytedcli-executor.js';
 import { createBytedcliHostCredentialResolver, parseBytedcliMachineProfile } from './bytedcli-broker-credentials.js';
@@ -17,9 +17,10 @@ import { bytecloudBrokerEnabled } from './identity-policy.js';
 import type { BytedcliOperation } from './bytedcli-operation-policy.js';
 import type { ProcessIdentity } from './current-actor-attestation.js';
 export interface BytedcliBrokerDependencies {
-  readonly authority: (sessionId:string,peer:ProcessIdentity,operation:BytedcliOperation) => Promise<BytedcliAuthorityResult>;
+  readonly authority: (sessionId:string,peer:ProcessIdentity,operation:BytedcliOperation,context?:BytedcliAuthorityRequestContext) => Promise<BytedcliAuthorityResult>;
+  readonly currentWorkerGeneration?: (sessionId:string)=>number|undefined;
   readonly executor: {execute:(request:BytedcliExecutionRequest)=>Promise<BytedcliExecResponse>;
-    retireSession:(sessionId:string)=>Promise<void>; close:()=>Promise<void>};
+    retireSession:(sessionId:string,workerGeneration?:number)=>Promise<void>; close:()=>Promise<void>};
   /** Lower-only timeout seam for hosts/tests; the public body cannot choose it. */
   readonly deadlineMs?: number; readonly bodyTimeoutMs?:number; readonly maxPreauth?:number;
 }
@@ -46,80 +47,106 @@ function readBody(req:IncomingMessage,signal:AbortSignal,timeoutMs:number):Promi
 }
 /** Each instance owns one daemon executor and pre-auth budget. Socket process
  * resolution is mandatory even when the outer HTTP HMAC gate exempts this route. */
+interface BytedcliRequestOwner {
+  readonly controller:AbortController;
+  sessionId?:string; workerGeneration?:number; work:Promise<void>;
+}
+const retirementKey=(sessionId:string,generation:number)=>JSON.stringify([sessionId,generation]);
+/** A failing cleanup must not release ownership of another pending provider. */
+async function joinOwnedWork(work:readonly Promise<unknown>[]):Promise<void>{
+  const settled=await Promise.allSettled(work);
+  const failed=settled.find((result):result is PromiseRejectedResult=>result.status==='rejected');
+  if(failed)throw failed.reason;
+}
 export class BytedcliBroker {
-  private readonly controllers=new Set<AbortController>();private preauth=0;private closed=false;
-  private readonly handlers=new Set<Promise<void>>();
-  private readonly sessions=new Map<AbortController,string>();
-  private readonly retiring=new Set<string>();
-  private readonly retiredHandlers=new Map<string,Set<Promise<void>>>();
+  private preauth=0;private closed=false;
+  private readonly owners=new Set<BytedcliRequestOwner>();
+  private readonly retiring=new Map<string,Promise<void>>();
   constructor(private readonly deps:BytedcliBrokerDependencies){}
   handle(req:IncomingMessage,res:ServerResponse):Promise<void>{
-    let work:Promise<void>;
-    const bindSession=(id:string)=>{
-      let group=this.retiredHandlers.get(id);if(!group){group=new Set();this.retiredHandlers.set(id,group);}
-      group.add(work);
-      void work.then(()=>{group!.delete(work);if(!group!.size)this.retiredHandlers.delete(id);},()=>{group!.delete(work);if(!group!.size)this.retiredHandlers.delete(id);});
-    };
-    work=this.handleRequest(req,res,bindSession);this.handlers.add(work);
-    void work.then(()=>this.handlers.delete(work),()=>this.handlers.delete(work));return work;
+    const owner:BytedcliRequestOwner={controller:new AbortController(),work:Promise.resolve()};
+    this.owners.add(owner);
+    owner.work=this.handleRequest(req,res,owner);
+    void owner.work.then(()=>this.owners.delete(owner),()=>this.owners.delete(owner));
+    return owner.work;
   }
-  private async handleRequest(req:IncomingMessage,res:ServerResponse,bindSession:(id:string)=>void):Promise<void>{
+  private freezeGeneration(owner:BytedcliRequestOwner,generation:number):boolean{
+    if(owner.controller.signal.aborted || (owner.workerGeneration!==undefined && owner.workerGeneration!==generation))return false;
+    owner.workerGeneration=generation;
+    if(owner.sessionId && this.retiring.has(retirementKey(owner.sessionId,generation))){owner.controller.abort();return false;}
+    return true;
+  }
+  private async handleRequest(req:IncomingMessage,res:ServerResponse,owner:BytedcliRequestOwner):Promise<void>{
     if(this.closed)return answer(res,503,refusal('broker_disabled'));
     if(this.preauth>=Math.min(64,this.deps.maxPreauth??64)){res.setHeader('connection','close');return answer(res,503,refusal('busy'));}
     this.preauth++;let preauthHeld=true;
-    const controller=new AbortController();this.controllers.add(controller);
+    const controller=owner.controller;
     let deadline=false,submitted=false,write=false;
+    let executorOutcome:BytedcliExecResponse['outcome']|undefined;
     let requestId='unparsed',operationId='unparsed';
+    const unsafeWrite=()=>submitted&&write&&executorOutcome!=='rejected';
+    const failed=(code:BytedcliExecErrorCode):BytedcliExecResponse=>{
+      const rejected=refusal(code,requestId,operationId);
+      return unsafeWrite()?{...rejected,effectiveIdentity:{kind:'actor'},outcome:'write_outcome_unknown',errorCode:'write_outcome_unknown'}:rejected;
+    };
     const abort=()=>controller.abort();
     const responseClosed=()=>{if(!res.writableFinished)abort();};
     req.once('aborted',abort);res.once('close',responseClosed);
-    const timer=setTimeout(()=>{
-      deadline=true;abort();
-      const result=refusal('timeout',requestId,operationId);
-      answer(res,408,submitted&&write?{...result,effectiveIdentity:{kind:'actor'},outcome:'write_outcome_unknown',errorCode:'write_outcome_unknown'}:result);
-    },Math.min(180_000,this.deps.deadlineMs??180_000));
+    const timer=setTimeout(()=>{deadline=true;abort();answer(res,408,failed('timeout'));},Math.min(180_000,this.deps.deadlineMs??180_000));
     try {
       const request=parseBytedcliExecRequest(await readBody(req,controller.signal,Math.min(1000,this.deps.bodyTimeoutMs??1000)));
-      requestId=request.requestId;this.sessions.set(controller,request.sessionId);bindSession(request.sessionId);
-      if(this.retiring.has(request.sessionId))return answer(res,403,refusal('execution_stale',requestId));
+      requestId=request.requestId;owner.sessionId=request.sessionId;
+      owner.workerGeneration=this.deps.currentWorkerGeneration?.(request.sessionId);
+      if(owner.workerGeneration!==undefined&&!this.freezeGeneration(owner,owner.workerGeneration))return answer(res,403,failed('execution_stale'));
       const operation=parseBytedcliOperation(request.argv,request.inputs);operationId=operation.id;write=operation.effect==='write';
       const peer=await resolveLoopbackPeerProcesses({remoteAddress:req.socket.remoteAddress,remotePort:req.socket.remotePort,localPort:req.socket.localPort});
-      if(controller.signal.aborted)return answer(res,408,refusal(deadline?'timeout':'cancelled',requestId,operationId));
-      if(!peer.ok)return answer(res,403,refusal('execution_unverified',requestId,operationId));
-      const result=await this.deps.authority(request.sessionId,peer.peer,operation);
-      if(!result.ok)return answer(res,403,refusal(result.errorCode,requestId,operationId));
-      // Admission remains owned through all provider waits. The executor also
-      // checks before its quota wait, lease, audit intent, dispatch and return.
+      if(controller.signal.aborted)return answer(res,408,failed(deadline?'timeout':'cancelled'));
+      if(!peer.ok)return answer(res,403,failed('execution_unverified'));
+      // freezeGeneration runs synchronously from host proof, before identity
+      // queries, so retirement owns these provider waits as well as execution.
+      const result=await this.deps.authority(request.sessionId,peer.peer,operation,{signal:controller.signal,
+        freezeGeneration:generation=>this.freezeGeneration(owner,generation)});
+      if(!result.ok)return answer(res,403,failed(result.errorCode));
+      if(!this.freezeGeneration(owner,result.authority.workerGeneration))return answer(res,403,failed('execution_stale'));
       const current=await result.authority.recheck();
-      if(current)return answer(res,403,refusal(current,requestId,operationId));
-      if(controller.signal.aborted)return answer(res,408,refusal(deadline?'timeout':'cancelled',requestId,operationId));
+      if(current)return answer(res,403,failed(current));
+      if(controller.signal.aborted)return answer(res,408,failed(deadline?'timeout':'cancelled'));
       this.preauth--;preauthHeld=false;
       submitted=true;
       const response=await this.deps.executor.execute({requestId,operation,authority:result.authority,signal:controller.signal});
+      executorOutcome=response.outcome;
       const after=await result.authority.recheck();
-      if(after||controller.signal.aborted){
-        const code=after??(deadline?'timeout':'cancelled');
-        const rejected=refusal(code,requestId,operationId);
-        return answer(res,403,write&&response.outcome!=='rejected'?{...rejected,effectiveIdentity:{kind:'actor'},outcome:'write_outcome_unknown',errorCode:'write_outcome_unknown'}:rejected);
-      }
+      if(after||controller.signal.aborted)return answer(res,403,failed(after??(deadline?'timeout':'cancelled')));
       answer(res,200,response);
     }catch(error){
       const code:BytedcliExecErrorCode=error instanceof BytedcliOperationPolicyError?error.code
         :controller.signal.aborted?(deadline?'timeout':'cancelled')
         :(BYTEDCLI_EXEC_ERROR_CODES as readonly unknown[]).includes((error as {code?:unknown})?.code)?(error as {code:BytedcliExecErrorCode}).code
         :(error as Error)?.message==='input_limit'?'input_limit':(error as Error)?.message==='timeout'?'timeout':'invalid_request';
-      if(code==='input_limit'||code==='timeout'){res.setHeader('connection','close');res.once('finish',()=>req.destroy());}
-      answer(res,code==='input_limit'?413:code==='timeout'?408:400,refusal(code,requestId,operationId));
-    }finally{clearTimeout(timer);req.off('aborted',abort);res.off('close',responseClosed);this.controllers.delete(controller);this.sessions.delete(controller);if(preauthHeld)this.preauth--;}
+      if((code==='input_limit'||code==='timeout')&&!res.writableEnded){res.setHeader('connection','close');res.once('finish',()=>req.destroy());}
+      answer(res,code==='input_limit'?413:code==='timeout'?408:400,failed(code));
+    }finally{clearTimeout(timer);req.off('aborted',abort);res.off('close',responseClosed);if(preauthHeld)this.preauth--;}
   }
-  async retireSession(sessionId:string):Promise<void>{
-    this.retiring.add(sessionId);
-    if(this.retiring.size>4096)this.retiring.delete(this.retiring.values().next().value!);
-    for(const [controller,id] of this.sessions)if(id===sessionId)controller.abort();
-    await this.deps.executor.retireSession(sessionId);
-    await Promise.allSettled([...(this.retiredHandlers.get(sessionId)??[])]);
+  /** The daemon supplies the closed worker generation. Legacy embedders without
+   * one retire only the request generations present in this call's snapshot. */
+  async retireSession(sessionId:string,workerGeneration?:number):Promise<void>{
+    const generation=workerGeneration??this.deps.currentWorkerGeneration?.(sessionId);
+    const snapshot=[...this.owners].filter(owner=>owner.sessionId===sessionId
+      &&(generation===undefined||owner.workerGeneration===generation));
+    const generations=generation===undefined?[...new Set(snapshot.flatMap(owner=>owner.workerGeneration===undefined?[]:[owner.workerGeneration]))]:[generation];
+    const keys=generations.map(value=>retirementKey(sessionId,value));
+    if(keys.length===1&&this.retiring.has(keys[0]!))return this.retiring.get(keys[0]!)!;
+    const retiring=Promise.resolve().then(async()=>{
+      for(const owner of snapshot)owner.controller.abort();
+      await joinOwnedWork([Promise.resolve().then(()=>this.deps.executor.retireSession(sessionId,generation)),...snapshot.map(owner=>owner.work)]);
+    });
+    for(const key of keys)this.retiring.set(key,retiring);
+    try{await retiring;}finally{for(const key of keys)if(this.retiring.get(key)===retiring)this.retiring.delete(key);}
   }
-  async close():Promise<void>{this.closed=true;for(const controller of this.controllers)controller.abort();await this.deps.executor.close();await Promise.allSettled([...this.handlers]);}
+  async close():Promise<void>{
+    this.closed=true;const snapshot=[...this.owners];for(const owner of snapshot)owner.controller.abort();
+    await joinOwnedWork([Promise.resolve().then(()=>this.deps.executor.close()),...snapshot.map(owner=>owner.work)]);
+  }
 }
 /** Frozen once at host assembly. PATH is daemon startup configuration, never
  * Bot/Agent env, and discover validates canonical install/runtime ownership. */
@@ -173,11 +200,11 @@ export function createProductionBytedcliBroker(host:Omit<import('./bytedcli-brok
     executor=new BytedcliExecutor({privateRoot:layout.privateRoot,trustedCli,leases,audit:new BytedcliBrokerAudit(layout.auditRoot),networkEnv:layout.networkEnv});
     if(closed)await executor.close();return executor;
   })();
-  return new BytedcliBroker({authority:(sessionId,peer,operation)=>resolveBytedcliAuthority({...host,contains:ds=>{
+  return new BytedcliBroker({currentWorkerGeneration:id=>host.findSession(id)?.workerGeneration,authority:(sessionId,peer,operation,context)=>resolveBytedcliAuthority({...host,contains:ds=>{
     if(bytecloudBrokerEnabled(host.policy(ds)))markBytedcliStrictSession(ds);
     return bytedcliContainmentAvailable(ds,layout.protectedRoots);
-  }},sessionId,peer,operation),executor:{execute:async request=>{
+  }},sessionId,peer,operation,context),executor:{execute:async request=>{
     if(closed)return refusal('broker_disabled',request.requestId,request.operation.id);
     return (await getExecutor()).execute(request);
-  },retireSession:async id=>{await executor?.retireSession(id);},close:async()=>{closed=true;if(pending){const instance=await pending.catch(()=>undefined);await instance?.close();}}}});
+  },retireSession:async (id,generation)=>{await executor?.retireSession(id,generation);},close:async()=>{closed=true;if(pending){const instance=await pending.catch(()=>undefined);await instance?.close();}}}});
 }
