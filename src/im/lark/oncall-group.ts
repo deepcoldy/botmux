@@ -440,10 +440,11 @@ function classifiedCardPolicy(policy: OncallGroupPolicy | undefined, draft: Onca
     && policy.formDisplay === (draft.visibility === 'thread' ? 'thread_card' : 'private_card');
 }
 
-async function closeOncallForm(draft: OncallFormDraft, created: boolean, owns: () => boolean = () => true): Promise<void> {
+async function closeOncallForm(draft: OncallFormDraft, outcome: 'created' | 'failed' | 'cancelled', owns: () => boolean = () => true): Promise<void> {
   const messageId = draft.messageId;
   if (!messageId) return;
   const client = await import('./client.js');
+  const created = outcome === 'created';
   if (!owns()) return;
   if (draft.visibility !== 'thread') {
     if (!created) await client.deleteEphemeralCard(draft.appId, messageId);
@@ -485,7 +486,19 @@ async function closeOncallForm(draft: OncallFormDraft, created: boolean, owns: (
     if (!retired) throw new Error('分类表单收起失败，请重试');
     return;
   }
-  await replaceWithStatus(draft.nativeEntry || draft.nativeFormLink ? '已收起本次表单入口；平台已提交的工单不受影响' : '已取消本次转人工');
+  try {
+    await replaceWithStatus(outcome === 'failed' ? '本次发起失败，请从原回答卡重新发起'
+      : draft.nativeEntry || draft.nativeFormLink ? '已收起本次表单入口；平台已提交的工单不受影响' : '已取消本次转人工');
+  } catch (error) {
+    // A concurrently retired or immutable form needs no further cleanup. In
+    // particular, do not keep PATCHing a form whose early withdrawal succeeded.
+    const unchangeable = oncallCardUnchangeable(error);
+    if (unchangeable) {
+      logger.warn(`[oncall-group] Classification form ${messageId} is ${unchangeable}; settling ${outcome} cleanup`);
+      return;
+    }
+    throw error;
+  }
 }
 
 function assertOncallFormCurrent(latest: OncallFormDraft): void {
@@ -505,11 +518,13 @@ async function writeOncallFormDraft(latest: OncallFormDraft, persist: () => void
   const store = new OncallGroupStore(config.session.dataDir);
   const request = store.getRequest(latest.source);
   if (latest.closed) {
-    const submittedForm = request?.status === 'succeeded' && request.creation?.formId === latest.id;
-    if (submittedForm && request.formClosePending === false) return;
-    await closeOncallForm(latest, request?.status === 'succeeded', owns);
-    if (submittedForm && request.formClosePending && owns()) {
-      store.finish(latest.source, { status: 'succeeded', formClosePending: false }, request.attemptId);
+    const formRequest = request?.creation?.formId === latest.id ? request : undefined;
+    const submittedForm = formRequest?.status === 'succeeded' || formRequest?.status === 'failed' ? formRequest : undefined;
+    if (submittedForm && submittedForm.formClosePending === false) return;
+    const outcome = formRequest?.status === 'failed' ? 'failed' : request?.status === 'succeeded' ? 'created' : 'cancelled';
+    await closeOncallForm(latest, outcome, owns);
+    if (submittedForm?.formClosePending && owns()) {
+      store.finish(latest.source, { status: submittedForm.status, formClosePending: false }, submittedForm.attemptId);
     }
     return;
   }
@@ -563,7 +578,7 @@ export async function handleOncallFormAction(data: CardActionData, appId: string
         draft.closed = true;
         delete draft.nativeSubmission;
         persist();
-        if (draft.visibility !== 'thread') await closeOncallForm(draft, false);
+        if (draft.visibility !== 'thread') await closeOncallForm(draft, 'cancelled');
         return { toast: { type: 'info', content: draft.nativeEntry || draft.nativeFormLink ? '已收起本次入口，平台工单不受影响' : '已取消，尚未提交工单' },
           ...(draft.visibility === 'thread' ? { afterAck: () => refreshOncallFormCard(appId, draft.id, owner) } : {}) };
       }
@@ -678,7 +693,7 @@ export async function handleOncallFormAction(data: CardActionData, appId: string
             logOncallCreationFailure(error, request?.submittedAtMs);
             if (request?.status !== 'succeeded') store.finish(source, {
               status: error instanceof OncallGroupApiError && !error.uncertain ? 'failed' : 'unknown',
-              ...(botmuxSubmit ? { cardRefreshPending: true } : {}),
+              ...(botmuxSubmit ? { cardRefreshPending: true, formClosePending: true } : {}),
             }, attemptId);
             throw error;
           });
@@ -704,7 +719,12 @@ export async function handleOncallFormAction(data: CardActionData, appId: string
             await refreshOncallSessionCard(source).catch(() => {});
             throw error;
           } finally {
-            await withdrawal;
+            if (await withdrawal) {
+              const settled = store.getRequest(source);
+              if (settled && settled.attemptId === attemptId && settled.status === 'failed' && settled.formClosePending) {
+                store.finish(source, { status: 'failed', formClosePending: false }, attemptId);
+              }
+            }
           }
         };
         if (!botmuxSubmit) return await finishSubmission(draft, persist);
@@ -1037,7 +1057,8 @@ async function closeRecoveredOncallForm(source: OncallGroupSource, owns: () => b
   // Interaction expiry must not discard cleanup owed by an already submitted request.
   await new OncallFormStore(config.session.dataDir).use(source.appId, request.creation.formId, request.operatorOpenId, async (draft, persist) => {
     const current = store.getRequest(source);
-    if (!owns() || !current || current.attemptId !== request.attemptId || current.status !== 'succeeded' || !current.formClosePending) return;
+    if (!owns() || !current || current.attemptId !== request.attemptId
+      || (current.status !== 'succeeded' && current.status !== 'failed') || !current.formClosePending) return;
     if (draft.source.chatId !== source.chatId || draft.source.sessionId !== source.sessionId
       || draft.source.questionId !== current.questionId || draft.source.messageId !== current.sourceMessageId) throw new Error('恢复请求与分类表单不匹配');
     draft.closed = true;
@@ -1099,7 +1120,8 @@ export async function reconcileNativeOncallSubmissions(appId: string, owns: () =
         const request = groups.getRequest(draft.source);
         let completionAttempt = eligibleAttempts.at(-1)!;
         if (!request || request.status === 'failed') {
-          if (draft.closed) return;
+          // Cancellation atomically removes nativeSubmission. A closed candidate
+          // was retired automatically and may still own an unresolved native ticket.
           const lookupStartedAt = Date.now();
           const lookupStarted = performance.now();
           if (isRecentHostedSubmission(eligibleAttempts, lookupStartedAt)) {
@@ -1192,6 +1214,11 @@ export async function retryPendingOncallHandoffs(appId: string, owns: () => bool
         catch { failed = true; logger.warn('[oncall-group] Create result reconciliation will retry; no new group is created'); }
       }
       if (store.getRequest(source)?.status !== 'succeeded') {
+        const current = store.getRequest(source);
+        if (current?.status === 'failed' && current.formClosePending && owns()) {
+          try { await closeRecoveredOncallForm(source, owns); }
+          catch { failed = true; logger.warn('[oncall-group] Failed form cleanup will retry'); }
+        }
         retries.set(key, { failures: 0, state: JSON.stringify(store.getRequest(source)), nextAtMs: Date.now() + (failed ? 60_000 : 15_000) });
         continue;
       }

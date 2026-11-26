@@ -148,6 +148,56 @@ describe('native submission completion', () => {
     await reconcileAndDeliver();
     expect(mocks.merge).toHaveBeenCalledOnce();
   });
+  it('adopts an earlier native submission after a replacement Botmux attempt fails', async () => {
+    mocks.bot.config.oncallGroup.customFormMode = 'botmux';
+    const initialFetch = fetcher.getMockImplementation()!;
+    fetcher.mockImplementation((url: string, init?: RequestInit) => url.includes('/workflow/')
+      ? json({ tenant_id: 12, type_id: 34, config: JSON.stringify([{ base: { key: 'field', label: '字段', type: 'input' } }]) })
+      : initialFetch(url, init));
+    const opened = await handleOncallGroupAction({ operator: { open_id: 'ou_actor' }, context: { open_chat_id: source.chatId, open_message_id: source.messageId },
+      action: { value: { action: 'oncall_group_create' } } } as any, appId);
+    expect(opened.toast.type).toBe('info');
+    const active = () => new OncallFormStore(dir).open({ appId, ownerOpenId: 'ou_actor', source,
+      choices: { regions: { cn: [category] } }, region: 'cn', typeId: 34, priority: 'P2', description: 'question' });
+    const callback = (action: string, draft: any, option?: string): any => ({ operator: { open_id: 'ou_actor' },
+      context: { open_chat_id: source.chatId, open_message_id: draft.messageId },
+      action: { value: { action, draftId: draft.id, version: draft.version }, ...(option ? { option } : {}) } });
+    let d = active();
+    for (const priority of ['P0', 'P2']) {
+      const changed = await handleOncallFormAction(callback('oncall_group_form_priority', d, priority), appId);
+      expect(changed.toast.type).toBe('info');
+      await changed.afterAck?.();
+      d = active();
+      if (priority === 'P0') submitted(d);
+    }
+    expect(d.botmuxFields).toHaveLength(1);
+    expect(d.nativeSubmission.attempts).toHaveLength(1);
+
+    const respond = fetcher.getMockImplementation()!;
+    let finishCreate!: (value: Response) => void;
+    const pendingCreate = new Promise<Response>(resolve => { finishCreate = resolve; });
+    fetcher.mockImplementation((url: string, init?: RequestInit) => url.endsWith('/api/inf/v1/chat/') && init?.method === 'POST'
+      ? pendingCreate : respond(url, init));
+    const submission = callback('oncall_group_form_botmux_submit', d);
+    submission.action.form_value = { oncall_field_0: 'value' };
+    const accepted = await handleOncallFormAction(submission, appId);
+    expect(accepted.toast.type).toBe('info');
+    const settled = accepted.afterAck().catch((error: unknown) => error);
+    await vi.waitFor(() => { expect(mocks.withdraw).toHaveBeenCalledOnce(); });
+    finishCreate(new Response('{}', { status: 400 }));
+    await settled;
+    expect(new OncallGroupStore(dir).getRequest(source)?.status).toBe('failed');
+    expect((await current(d)).closed).toBe(true);
+
+    await reconcileAndDeliver();
+    expect(new OncallGroupStore(dir).getRequest(source)).toMatchObject({
+      status: 'succeeded', flowId: '1234', openChatId: 'oc_destination',
+    });
+    expect((await current(d)).nativeSubmission?.completed).toBe(true);
+    expect(fetcher.mock.calls.filter(([url, init]) => String(url).endsWith('/api/inf/v1/chat/') && init?.method === 'POST')).toHaveLength(1);
+    expect(fetcher.mock.calls.filter(([url]) => String(url).includes('/oncall_flow/list')).length).toBeGreaterThan(0);
+    expect(mocks.merge).toHaveBeenCalledOnce();
+  });
   it('still adopts a submitted native form if the default changes to Botmux before reconciliation', async () => {
     const d = await open();
     submitted(d);

@@ -178,7 +178,7 @@ export class OncallGroupStore {
       const request = read<OncallGroupRequest>(key)
         ?? ([...legacyFiles.get(key) ?? []].some(file => requests.has(file)) ? this.legacyRequest(source) : undefined);
       if (request?.creation && request.attemptId && (request.status === 'pending' || request.status === 'unknown'
-        || (request.status === 'failed' && request.cardRefreshPending))) {
+        || (request.status === 'failed' && (request.cardRefreshPending || request.formClosePending)))) {
         return Date.now() - (request.submittedAtMs ?? 0) < 24 * 60 * 60_000;
       }
       return request?.status === 'succeeded'
