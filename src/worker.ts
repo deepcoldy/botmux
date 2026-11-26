@@ -23787,12 +23787,16 @@ function handleQueuedTurnCancel(requestId: string, turnId: string): void {
     && codexRpcEligible(lastInitConfig, { sandboxForced: sandboxEnabled() });
   const recoveredOpening = lastInitConfig?.reconcileQueuedActivation?.turnId === turnId
     || remoteRunnerRecoveredTurnIdentity?.turnId === turnId;
+  const remoteRecoveryOpening = !initPromptMaterialized
+    && lastInitConfig?.turnId === turnId
+    && (lastInitConfig.backendType === 'remote-runner' || effectiveBackendType === 'remote-runner');
   const alreadyWritten = inflightInputs.hasLiveTurn(turnId)
     || (currentBotmuxTurnId === turnId && !!backend
       && (initPromptMaterialized || openingMayBeArgvBaked))
     || openingMayBeArgvBaked
     || freshRpcOpening
     || recoveredOpening
+    || remoteRecoveryOpening
     || rpcTurnMayHaveBeenSubmitted(turnId);
   const status = alreadyWritten
     ? 'restart_required' as const
@@ -40908,6 +40912,10 @@ async function spawnCliBody(
   }, args => ({ turnId: args[0].turnId, origin: args[1]?.sessionOrigin })));
   backend.onTurnRecovered?.(bindSessionExecutionEvent(async (turn) => {
     if (fatalWorkerErrorPending || backend !== observedBackend) return;
+    if (cancelledQueuedTurnIds.has(turn.turnId)) {
+      log(`Ignored tombstoned recovered remote turn ${turn.turnId.substring(0, 12)}`);
+      return;
+    }
     try {
       if (currentBotmuxTurnId && currentBotmuxTurnId !== turn.turnId) {
         const canAdoptOverUnstartedInit = typeof shouldAdoptPidMarkerWithoutRetiringCurrent === 'function'

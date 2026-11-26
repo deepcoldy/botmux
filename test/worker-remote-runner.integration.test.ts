@@ -277,6 +277,131 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
     expect(messages.some(message => message.type === 'error')).toBe(false);
   });
 
+  it.each(['final', 'failure'] as const)('suppresses a late recovered %s after the opening was tombstoned', async outcome => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-remote-cancel-recovery-'));
+    tempDirs.push(root);
+    const turnId = 'schedule:remote-cancel-recovery';
+    const commandsPath = join(root, 'commands.jsonl');
+    const releaseReadyPath = join(root, 'release-ready');
+    const releaseTerminalPath = join(root, 'release-terminal');
+    const terminalEmittedPath = join(root, 'terminal-emitted');
+    const provider = join(root, 'provider.mjs');
+    writeFileSync(provider, `#!/usr/bin/env node
+import fs from 'node:fs';
+import readline from 'node:readline';
+const protocol = 'botmux.remote-runner';
+const version = 1;
+const emit = event => process.stdout.write(JSON.stringify({ protocol, version, ...event }) + '\\n');
+const readyTimer = setInterval(() => {
+  if (!globalThis.resumeRequestId || !fs.existsSync(${JSON.stringify(releaseReadyPath)})) return;
+  clearInterval(readyTimer);
+  const state = { version: 1, provider: 'cancel-recovery-provider', generation: 7, remoteSessionId: 'remote-7', agentThreadId: 'thread-7' };
+  emit({ type: 'ready', requestId: globalThis.resumeRequestId, state, recoveredTurn: { turnId: ${JSON.stringify(turnId)}, generation: 7, dispatchAttempt: 3, startedAtMs: 1000 } });
+  const terminalTimer = setInterval(() => {
+    if (!fs.existsSync(${JSON.stringify(releaseTerminalPath)})) return;
+    clearInterval(terminalTimer);
+    if (${JSON.stringify(outcome)} === 'final') {
+      emit({ type: 'final', turnId: ${JSON.stringify(turnId)}, content: 'RECOVERED_AFTER_CANCEL', state });
+    } else {
+      emit({ type: 'failure', turnId: ${JSON.stringify(turnId)}, status: 'failed', code: 'cancel_probe_failure', message: 'late failure after cancellation', retryable: false });
+    }
+    fs.writeFileSync(${JSON.stringify(terminalEmittedPath)}, 'emitted\\n');
+  }, 10);
+  terminalTimer.unref();
+}, 10);
+readyTimer.unref();
+readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line', line => {
+  const command = JSON.parse(line);
+  fs.appendFileSync(${JSON.stringify(commandsPath)}, JSON.stringify(command) + '\\n');
+  if (command.type === 'hello') {
+    emit({ type: 'hello', requestId: command.requestId, provider: 'cancel-recovery-provider', capabilities: ['start','resume','turn','cancel','detach','reattach','status','turn_recovery'] });
+  } else if (command.type === 'resume') {
+    globalThis.resumeRequestId = command.requestId;
+  } else if (command.type === 'cancel') {
+    emit({ type: 'status', requestId: command.requestId, status: 'closed' });
+  }
+});
+const keepAlive = setInterval(() => {}, 1000);
+process.stdin.on('end', () => { clearInterval(keepAlive); process.exit(0); });
+`);
+    chmodSync(provider, 0o755);
+    writeFileSync(commandsPath, '');
+    const dataDir = join(root, 'data');
+    const botsPath = join(root, 'bots.json');
+    writeFileSync(botsPath, JSON.stringify([{
+      larkAppId: 'app_remote_cancel_recovery', larkAppSecret: 'secret',
+      cliId: 'remote-runner', backendType: 'remote-runner', cliPathOverride: provider,
+      remoteRunner: {
+        expectedProvider: 'cancel-recovery-provider',
+        requiredCapabilities: ['start','resume','turn','cancel','detach','reattach','status','turn_recovery'],
+      },
+    }]));
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTS_CONFIG: botsPath,
+        BOTMUX_SESSION_ID: 'sid-remote-cancel-recovery',
+        LARK_APP_ID: 'app_remote_cancel_recovery',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.push(child);
+    child.stdout?.on('data', chunk => logs.push(String(chunk)));
+    child.stderr?.on('data', chunk => logs.push(String(chunk)));
+    child.on('message', raw => {
+      const message = raw as WorkerToDaemon;
+      messages.push(message);
+      if (message.type === 'link_ref_restore_mode') {
+        child.send({ type: 'link_ref_restore_mode_result', requestId: message.requestId, mode: 'enabled' } satisfies DaemonToWorker);
+      }
+    });
+    child.send({
+      type: 'init', sessionId: 'sid-remote-cancel-recovery', chatId: 'oc_remote_cancel_recovery',
+      rootMessageId: 'om_remote_cancel_recovery', workingDir: root,
+      cliId: 'remote-runner', cliPathOverride: provider, backendType: 'remote-runner',
+      backendConfig: {
+        expectedProvider: 'cancel-recovery-provider',
+        requiredCapabilities: ['start','resume','turn','cancel','detach','reattach','status','turn_recovery'],
+      },
+      remoteBackendState: { version: 1, provider: 'cancel-recovery-provider', generation: 7, remoteSessionId: 'remote-7', agentThreadId: 'thread-7' },
+      prompt: 'opening whose submission evidence was lost', turnId, dispatchAttempt: 3,
+      queuedActivationToken: 'tok-remote-cancel-recovery', larkAppId: 'app_remote_cancel_recovery', larkAppSecret: 'secret',
+    } satisfies DaemonToWorker);
+    child.send({ type: 'cancel_queued_turn', requestId: 'cancel-before-recovery', turnId, sessionCommand: { version: 2 } } satisfies DaemonToWorker);
+
+    await waitFor(
+      () => messages.some(message => message.type === 'queued_turn_cancel_result' && message.requestId === 'cancel-before-recovery'),
+      () => `remote cancellation did not settle\n${logs.join('')}\n${JSON.stringify(messages)}`,
+    );
+    expect(messages).toContainEqual(expect.objectContaining({
+      type: 'queued_turn_cancel_result', requestId: 'cancel-before-recovery', turnId, status: 'restart_required',
+    }));
+    writeFileSync(releaseReadyPath, 'ready\n');
+    await waitFor(
+      () => messages.some(message => message.type === 'ready'),
+      () => `remote worker did not become ready\n${logs.join('')}\n${JSON.stringify(messages)}`,
+    );
+    writeFileSync(releaseTerminalPath, 'terminal\n');
+    await waitFor(
+      () => existsSync(terminalEmittedPath),
+      () => `provider did not emit its recovered ${outcome}\n${logs.join('')}`,
+    );
+    await new Promise<void>(resolveDelay => setTimeout(resolveDelay, 250));
+
+    expect(messages.filter(message => message.type === 'turn_input_committed' && message.turnId === turnId), JSON.stringify(messages)).toEqual([]);
+    expect(messages.filter(message => message.type === 'queued_activation_submitted'), JSON.stringify(messages)).toEqual([]);
+    expect(messages.filter(message => message.type === 'final_output' && message.turnId === turnId), JSON.stringify(messages)).toEqual([]);
+    expect(messages.filter(message => message.type === 'turn_terminal' && message.turnId === turnId), `${JSON.stringify(messages)}\n${logs.join('')}`).toEqual([]);
+    const commands = readFileSync(commandsPath, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+    expect(commands.filter(command => command.type === 'turn')).toEqual([]);
+  });
+
   it('passes persisted provider state and defers a durable refork ACK until provider submission', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-remote-runner-resume-'));
     tempDirs.push(root);
