@@ -6286,7 +6286,11 @@ describe('POST /api/sessions/:sessionId/restart', () => {
     // A correlated attempt (pane teardown + fork with a restartAttemptId, resume
     // from ds.hasHistory) — not a bare forkWorker whose result nobody hears.
     expect(restartSpy).toHaveBeenCalledTimes(1);
-    expect(restartSpy).toHaveBeenCalledWith(ds, expect.objectContaining({ source: 'dashboard' }));
+    expect(restartSpy).toHaveBeenCalledWith(
+      ds,
+      expect.objectContaining({ source: 'dashboard' }),
+      { allowUnconfirmedActivationReplay: true },
+    );
     expect(forkSpy).not.toHaveBeenCalled();
     findSpy.mockRestore();
     restartSpy.mockRestore();

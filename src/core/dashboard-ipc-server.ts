@@ -496,6 +496,7 @@ import {
   sessionWakeAcquireTimeoutMs,
 } from './session-wake-deadline.js';
 import {
+  hasNonActivationSessionMutationOwnership,
   hasProtectedSessionMutationOwnership,
   protectedSessionMutationReasons,
 } from './session-mutation-guard.js';
@@ -938,6 +939,7 @@ function ipcErrorText(err: unknown): string {
 function rejectProtectedSessionMutation(
   res: ServerResponse,
   values: readonly (DaemonSession | Session)[],
+  opts: { allowActivationReplay?: boolean } = {},
 ): boolean {
   const bySessionId = new Map<string, {
     sessionId: string;
@@ -947,6 +949,7 @@ function rejectProtectedSessionMutation(
     reasons: ReturnType<typeof protectedSessionMutationReasons>;
   }>();
   for (const value of values) {
+    if (opts.allowActivationReplay && !hasNonActivationSessionMutationOwnership(value)) continue;
     const session = 'session' in value ? value.session : value;
     const reasons = protectedSessionMutationReasons(value);
     if (reasons.length === 0) continue;
@@ -3649,7 +3652,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/restart', async (_req, res, params) =
       message: t('cmd.restart.remote_unsupported', undefined, localeForBot(ds.larkAppId)),
     });
   }
-  if (rejectProtectedSessionMutation(res, [ds])) return;
+  if (rejectProtectedSessionMutation(res, [ds], { allowActivationReplay: true })) return;
   // A correlated restart (IM /restart, card, crash auto-restart, an earlier
   // click) is still in flight. Joining it would silently drop what this click
   // is for — the operator usually just saved env / model / tool binding, and
@@ -3678,7 +3681,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/restart', async (_req, res, params) =
   // still-alive pane, so the revive is a real relaunch rather than a reattach
   // to the wedged CLI — and its result can update the status card.
   const revived = !ds.worker || ds.worker.killed;
-  const restart = requestSessionRestart(ds, dashboardRestartObserver(ds));
+  const restart = requestSessionRestart(ds, dashboardRestartObserver(ds), { allowUnconfirmedActivationReplay: true });
   if (!restart) return jsonRes(res, 409, { ok: false, error: 'session_transferring' });
   if (restart.startFailure) {
     return jsonRes(res, 502, { ok: false, error: ipcErrorText(restart.startFailure.error) });

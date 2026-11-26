@@ -917,6 +917,16 @@ import {
   createQueuedActivationReceiptObserver,
   type QueuedActivationProof,
 } from './services/queued-activation-receipts.js';
+import {
+  decideDurableArgvReattachSubmission,
+  decideFlushSubmissionRejectionSettlement,
+  decidePromotedActivationMessageHandling,
+  decideRawInputSubmissionReconciliation,
+  reconcileRemoteRecoveredTurnQueue,
+  shouldAdoptPidMarkerWithoutRetiringCurrent,
+  shouldAllowTypeAheadOnReattach,
+  shouldPrepareInitialPromptArg,
+} from './services/queued-activation-reconcile.js';
 import { claudeComposerHoldsInput, decideSessionStartGatedSubmitWarning, diagnoseBackendSubmitFailure, diagnoseSubmitFailure, shouldWaitThroughBusyTurn, SUBMIT_POST_SESSION_START_GRACE_MS, type SubmitFailureDiagnosisReason } from './services/submit-failure-diagnosis.js';
 import {
   runAdoptQueuedWriteSequence,
@@ -1242,9 +1252,20 @@ function awaitingRpcActivationReplayAnchorMs(
   return rpcTurnsAwaitingActivationReplayAnchors.get(ownerKey);
 }
 
+const ambiguousRpcActivationTokens = new Map<string, { generation: RpcTurnGeneration; token: string }>();
+let pendingAmbiguousFreshRpcActivation: {
+  identity: CodexRpcTurnIdentity;
+  generation: RpcTurnGeneration;
+  prompt: string;
+  token: string;
+  sessionId: string;
+  startedAtMs: number;
+} | undefined;
+
 function clearRpcLifecycleFailClosedOwner(
   identity: CodexRpcTurnIdentity,
   generation: RpcTurnGeneration,
+  opts?: { acknowledgeActivation?: boolean },
 ): boolean {
   const ownerKey = rpcTurnOwnerKey(identity);
   if (!sameRpcGeneration(rpcLifecycleFailClosedOwners.get(ownerKey), generation)) {
@@ -1252,6 +1273,13 @@ function clearRpcLifecycleFailClosedOwner(
   }
   rpcLifecycleFailClosedOwners.delete(ownerKey);
   rpcLifecycleFailClosedIdentities.delete(ownerKey);
+  const ambiguousActivation = ambiguousRpcActivationTokens.get(ownerKey);
+  if (ambiguousActivation && sameRpcGeneration(ambiguousActivation.generation, generation)) {
+    ambiguousRpcActivationTokens.delete(ownerKey);
+    if (opts?.acknowledgeActivation === true) {
+      acknowledgeQueuedActivationToken(ambiguousActivation.token);
+    }
+  }
   return true;
 }
 
@@ -1301,6 +1329,11 @@ function stopCodexRpcEngine(): void {
     ...rpcActiveOwners.keys(),
     ...settlingRpcTerminalOwners.keys(),
   ]);
+  // Never ACK ambiguous activation tokens during bare engine teardown: clear
+  // the tracking map BEFORE engine?.stop() can emit synchronous 'stopped'
+  // terminals through settleRpcTurnTerminal.
+  ambiguousRpcActivationTokens.clear();
+  pendingAmbiguousFreshRpcActivation = undefined;
   // stop() emits exact 'stopped' terminals for every engine-owned native turn.
   // Keep the engine identity installed until those synchronous callbacks have
   // retired their matching rpcActive entries.
@@ -1381,6 +1414,8 @@ function stopCodexRpcEngine(): void {
   rpcTurnsAwaitingActivationReplayAnchors.clear();
   rpcLifecycleFailClosedOwners.clear();
   rpcLifecycleFailClosedIdentities.clear();
+  ambiguousRpcActivationTokens.clear();
+  pendingAmbiguousFreshRpcActivation = undefined;
   rpcActiveOwners.clear();
   for (const timer of rpcTerminalHydrationTimers.values()) clearTimeout(timer);
   rpcTerminalHydrationTimers.clear();
@@ -2157,6 +2192,18 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
           awaitingRpcActivationReplayAnchorMs(firstIdentity, firstGeneration),
         );
         installRpcLifecycleFailClosedOwner(firstIdentity, firstGeneration);
+        if (cfg.queuedActivationToken) {
+          // Stash until after spawnCli(msg) finishes: spawnCliBody calls
+          // queuedActivationReceipts.clear(), which would wipe any watch armed here.
+          pendingAmbiguousFreshRpcActivation = {
+            identity: firstIdentity,
+            generation: firstGeneration,
+            prompt: firstTurnPrompt,
+            token: cfg.queuedActivationToken,
+            sessionId: cfg.sessionId,
+            startedAtMs: Date.now(),
+          };
+        }
         deferredFreshRpcTurn = {
           identity: firstIdentity,
           generation: firstGeneration,
@@ -2402,8 +2449,17 @@ function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigi
   // too: they may name a queued execution, but never assert that it has started.
   if (msg.type === 'cli_input_backlog' || msg.type === 'failed_turn_rewind'
     || msg.type === 'type_ahead_queued' || msg.type === 'type_ahead_turn_dropped'
-    || msg.type === 'type_ahead_queue_snapshot') {
+    || msg.type === 'type_ahead_queue_snapshot' || msg.type === 'queued_activation_submitted') {
     delete context.scope.execution;
+    delete context.scope.runtime;
+    delete context.scope.operationId;
+    delete context.bindingId;
+  }
+  // turn_input_rejected is a worker-scoped event (workerEvents) that may reject
+  // a predecessor execution (execution_reconciliation_required) from inside a
+  // replacement runtime binding; omit runtime/bindingId so SessionEventGateway
+  // validates scope.execution without rejecting cross-runtime scope mismatch.
+  if (msg.type === 'turn_input_rejected') {
     delete context.scope.runtime;
     delete context.scope.operationId;
     delete context.bindingId;
@@ -3521,6 +3577,7 @@ let lastSpawnEffectiveCliSessionId: string | undefined;
 let inputDeliveryObservedCliSessionId: string | undefined;
 let lastSpawnEffectiveAdapterSessionId: string | undefined;
 let lastSpawnDeferInitialPrompt = false;
+let spawnCliReconciledActivationToken: string | undefined;
 let lastSpawnArgvDurableInitialPrompt = false;
 let lastSpawnArgvDurableInitialPromptSubmission: { baseline: number | null; content: string } | undefined;
 let argvDurableInitialPromptCompletionTimer: ReturnType<typeof setInterval> | null = null;
@@ -7421,6 +7478,7 @@ let durableTurnInFlight = false;
  * distinct from currentBotmuxTurnId: a fresh initial prompt reserves that id
  * before submitTurn awaits the provider ready handshake. */
 let remoteRunnerRecoveredTurnInFlight = false;
+let remoteRunnerRecoveredTurnIdentity: { turnId: string; dispatchAttempt?: number } | undefined;
 const activeTurnAuthority = new ActiveTurnAuthority((previousTurnId, turnId) => {
   // Ordered IPC reaches the daemon before any output attributed to the steer.
   send({ type: 'active_turn_envelope_changed', previousTurnId, turnId });
@@ -9042,7 +9100,15 @@ function writeCliPidMarker(): void {
             const raw = readFileSync(markerPath, 'utf-8');
             const parsed = JSON.parse(raw);
             if (parsed && typeof parsed.turnId === 'string' && parsed.turnId && (parsed.turnId !== currentBotmuxTurnId || ((typeof backend === 'undefined' || !backend || ('isReattach' in backend && backend.isReattach === true)) && (activeTurnAuthority.snapshot() ? !activeAuthorityMatchesMarker(parsed) : !activeTurnAuthority.matchesLastRelease(parsed))))) {
-              if (parsed.backgroundHeld === true || retiredTurnIds.has(parsed.turnId) || retireTerminatedMarkerTurn(parsed)) {
+              const markerSettled = typeof workerSessionEventScope?.isExecutionSettled === 'function'
+                && workerSessionEventScope.isExecutionSettled(
+                  parsed.turnId,
+                  typeof parsed.dispatchAttempt === 'number' ? parsed.dispatchAttempt : undefined,
+                );
+              if (markerSettled && typeof markTurnRetired === 'function') {
+                markTurnRetired(parsed.turnId);
+              }
+              if (parsed.backgroundHeld === true || retiredTurnIds.has(parsed.turnId) || retireTerminatedMarkerTurn(parsed) || markerSettled) {
                 // Disk holds an older turn that worker memory has already retired/advanced past.
                 // Do not adopt it back; allow write to overwrite disk with currentBotmuxTurnId.
               } else {
@@ -9063,7 +9129,18 @@ function writeCliPidMarker(): void {
                   publishSandboxRelayCapability();
                   rememberQueuedTurnAdvanceForPendingReady(prevTurnId);
                   log(`Adopted active turn advance from PID marker before write: ${prevTurnId?.slice(0, 12)} -> ${currentBotmuxTurnId?.slice(0, 12)}`);
-                } else if (!currentBotmuxTurnId || parsed.turnId === currentBotmuxTurnId) {
+                } else if (
+                  !currentBotmuxTurnId
+                  || parsed.turnId === currentBotmuxTurnId
+                  || (typeof shouldAdoptPidMarkerWithoutRetiringCurrent === 'function'
+                    && shouldAdoptPidMarkerWithoutRetiringCurrent({
+                      initialInputOwnershipPending: typeof initialInputOwnershipPending === 'boolean' && initialInputOwnershipPending,
+                      pendingCurrentTurnQueued: Array.isArray(pendingMessages) && pendingMessages.some(m => m.turnId === currentBotmuxTurnId),
+                      activeTurnStarted: activeTurnAuthority.snapshot()?.started,
+                      currentTurnId: currentBotmuxTurnId,
+                      diskTurnId: parsed.turnId,
+                    }))
+                ) {
                   adoptInitialActiveTurn(parsed, true);
                   rememberQueuedTurnAdvanceForPendingReady();
                 } else {
@@ -9185,9 +9262,28 @@ function restoreQueuedTurnsFromMarkerDisk(markerPath: string): void {
       const raw = readFileSync(markerPath, 'utf-8');
       const parsed = JSON.parse(raw);
       if (parsed && typeof parsed.turnId === 'string' && parsed.turnId && (parsed.turnId !== currentBotmuxTurnId || ((typeof backend === 'undefined' || !backend || ('isReattach' in backend && backend.isReattach === true)) && (activeTurnAuthority.snapshot() ? !activeAuthorityMatchesMarker(parsed) : !activeTurnAuthority.matchesLastRelease(parsed))))) {
-        if (parsed.backgroundHeld === true || retiredTurnIds.has(parsed.turnId) || retireTerminatedMarkerTurn(parsed)) {
+        const markerSettled = typeof workerSessionEventScope?.isExecutionSettled === 'function'
+          && workerSessionEventScope.isExecutionSettled(
+            parsed.turnId,
+            typeof parsed.dispatchAttempt === 'number' ? parsed.dispatchAttempt : undefined,
+          );
+        if (markerSettled && typeof markTurnRetired === 'function') {
+          markTurnRetired(parsed.turnId);
+        }
+        if (parsed.backgroundHeld === true || retiredTurnIds.has(parsed.turnId) || retireTerminatedMarkerTurn(parsed) || markerSettled) {
           // Disk holds an older turn that has already terminated; do not re-adopt it.
-        } else if (!currentBotmuxTurnId || parsed.turnId === currentBotmuxTurnId) {
+        } else if (
+          !currentBotmuxTurnId
+          || parsed.turnId === currentBotmuxTurnId
+          || (typeof shouldAdoptPidMarkerWithoutRetiringCurrent === 'function'
+            && shouldAdoptPidMarkerWithoutRetiringCurrent({
+              initialInputOwnershipPending: typeof initialInputOwnershipPending === 'boolean' && initialInputOwnershipPending,
+              pendingCurrentTurnQueued: Array.isArray(pendingMessages) && pendingMessages.some(m => m.turnId === currentBotmuxTurnId),
+              activeTurnStarted: activeTurnAuthority.snapshot()?.started,
+              currentTurnId: currentBotmuxTurnId,
+              diskTurnId: parsed.turnId,
+            }))
+        ) {
           adoptInitialActiveTurn(parsed, true);
         } else {
           adoptDisplacedActiveTurn(parsed);
@@ -9291,7 +9387,15 @@ function syncQueuedTurnsFromMarkerDisk(): boolean {
         const raw = readFileSync(markerPath, 'utf-8');
         const parsed = JSON.parse(raw);
         if (parsed && typeof parsed.turnId === 'string' && parsed.turnId && (parsed.turnId !== currentBotmuxTurnId || ((typeof backend === 'undefined' || !backend || ('isReattach' in backend && backend.isReattach === true)) && (activeTurnAuthority.snapshot() ? !activeAuthorityMatchesMarker(parsed) : !activeTurnAuthority.matchesLastRelease(parsed))))) {
-          if (parsed.backgroundHeld === true || retiredTurnIds.has(parsed.turnId) || retireTerminatedMarkerTurn(parsed)) {
+          const markerSettled = typeof workerSessionEventScope?.isExecutionSettled === 'function'
+            && workerSessionEventScope.isExecutionSettled(
+              parsed.turnId,
+              typeof parsed.dispatchAttempt === 'number' ? parsed.dispatchAttempt : undefined,
+            );
+          if (markerSettled && typeof markTurnRetired === 'function') {
+            markTurnRetired(parsed.turnId);
+          }
+          if (parsed.backgroundHeld === true || retiredTurnIds.has(parsed.turnId) || retireTerminatedMarkerTurn(parsed) || markerSettled) {
             // Disk holds an older turn that worker memory has already retired/advanced past.
           } else {
             const idx = queuedTypeAheadTurns.findIndex(t => t.turnId === parsed.turnId);
@@ -19356,7 +19460,9 @@ function finalizeRpcTurnTerminal(
   }
   settlingRpcTerminalOwners.delete(ownerKey);
   clearAwaitingRpcActivation(identity, generation);
-  clearRpcLifecycleFailClosedOwner(identity, generation);
+  clearRpcLifecycleFailClosedOwner(identity, generation, {
+    acknowledgeActivation: terminal.status === 'completed' || terminal.status === 'failed' || terminal.status === 'aborted',
+  });
   if (sameRpcGeneration(rpcActiveOwners.get(ownerKey), generation)) {
     rpcActiveOwners.delete(ownerKey);
   }
@@ -19454,7 +19560,9 @@ function settleRpcTurnTerminal(
   }
   settlingRpcTerminalOwners.set(ownerKey, generation);
   clearAwaitingRpcActivation(terminal.identity, generation);
-  clearRpcLifecycleFailClosedOwner(terminal.identity, generation);
+  clearRpcLifecycleFailClosedOwner(terminal.identity, generation, {
+    acknowledgeActivation: terminal.status === 'completed' || terminal.status === 'failed' || terminal.status === 'aborted',
+  });
   if (sameRpcGeneration(rpcActiveOwners.get(ownerKey), generation)) {
     rpcActiveOwners.delete(ownerKey);
   }
@@ -19618,7 +19726,7 @@ function retireRpcLifecycleFromStructuredTerminal(
   if (sameRpcGeneration(rpcActiveOwners.get(ownerKey), generation)) {
     rpcActiveOwners.delete(ownerKey);
   }
-  clearRpcLifecycleFailClosedOwner(identity, generation);
+  clearRpcLifecycleFailClosedOwner(identity, generation, { acknowledgeActivation: true });
   codexBridgeQueue.stopRpcActive(identity.turnId, identity.dispatchAttempt);
 }
 
@@ -25762,9 +25870,15 @@ async function handleTrustedCodexAppMarker(
           ),
         },
       ];
+      const settledRecoveredEntry = codexAppRecoveredDispatches.find(
+        entry => entry.dispatchId === codexAppDispatchId,
+      );
       codexAppRecoveredDispatches = codexAppRecoveredDispatches.filter(
         entry => entry.dispatchId !== codexAppDispatchId,
       );
+      if (settledRecoveredEntry?.queuedActivationToken) {
+        acknowledgeQueuedActivationToken(settledRecoveredEntry.queuedActivationToken);
+      }
     } else {
       if (isCodexAppCliId(lastInitConfig?.cliId)
           && codexAppDispatchHandle !== undefined
@@ -28977,6 +29091,122 @@ function observeQueuedActivationReceipt(
   return false;
 }
 
+const unconfirmedQueuedActivations = new Map<string, { item: PendingCliInput; generation: number }>();
+/** Explicit operator-authorized replay tokens, valid for exactly one CLI generation. */
+const authorizedQueuedActivationReplays = new Map<string, number>();
+
+/** Called only after an explicitly authorized restart enters its new CLI generation. */
+function authorizeUnconfirmedQueuedActivationReplay(): number {
+  const items: PendingCliInput[] = [];
+  for (const [token, entry] of [...unconfirmedQueuedActivations]) {
+    unconfirmedQueuedActivations.delete(token);
+    // Stale/cancelled observers and already-settled tokens never gain replay authority.
+    if (!queuedActivationReceipts.has(token) || queuedActivationReceipts.isSettled(token)) continue;
+    queuedActivationReceipts.cancel(token);
+    authorizedQueuedActivationReplays.set(token, cliSpawnGeneration);
+    items.push(entry.item);
+  }
+  if (items.length > 0) {
+    pendingMessages.unshift(...items);
+    log(`Operator authorized replay of ${items.length} unconfirmed queued activation(s) for CLI generation ${cliSpawnGeneration}`);
+  }
+  return items.length;
+}
+
+function durableArgvActivationRecheck(
+  item: PendingCliInput,
+): (() => SubmitRecheckResult | Promise<SubmitRecheckResult>) | undefined {
+  const adapter = cliAdapter;
+  if (!adapter?.durableInitialPromptViaArgs || !adapter.findInitialPromptArgSubmission || !item.content
+    || lastInitConfig?.resume) return undefined;
+  return () => {
+    const probeResult = adapter.findInitialPromptArgSubmission!(0, item.content);
+    const resumeCmd = adapter.buildResumeCommand?.({ sessionId, cliSessionId: undefined });
+    const ownedCliSessionId = resumeCmd?.match(/(?:^|\s)-s\s+(\S+)/)?.[1];
+    const decision = decideDurableArgvReattachSubmission({
+      probeResult,
+      expectedCliSessionId: lastInitConfig?.cliSessionId,
+      ownedCliSessionId,
+      promptContainsSessionId: Boolean(sessionId && item.content.includes(sessionId)),
+    });
+    return decision.action === 'already_submitted'
+      ? { submitted: true as const, ...(decision.cliSessionId ? { cliSessionId: decision.cliSessionId } : {}) }
+      : false;
+  };
+}
+
+/** A persisted `submitting`/`reconciling` phase proves only intent-to-write.
+ *  Keep the exact activation read-only until an authoritative receipt arrives;
+ *  never ACK from that phase alone and never replay the retained bytes blindly. */
+function observeUnconfirmedQueuedActivation(
+  item: PendingCliInput,
+  opts?: {
+    recheck?: () => SubmitRecheckResult | Promise<SubmitRecheckResult>;
+    durableTerminalStatus?: 'failed' | 'ambiguous';
+    deferRedrive?: boolean;
+    onSettledExtra?: (proof: QueuedActivationProof, redrive: () => void) => void;
+  },
+): boolean {
+  const evidenceTurnId = item.turnId;
+  const generation = cliSpawnGeneration;
+  const activationToken = item.queuedActivationToken;
+  if (activationToken) unconfirmedQueuedActivations.set(activationToken, { item, generation });
+  const writeStartedAtMs = evidenceTurnId && typeof inputDeliveryEvidence?.writeStartedAtMs === 'function'
+    ? inputDeliveryEvidence.writeStartedAtMs({
+      turnId: evidenceTurnId,
+      dispatchAttempt: item.dispatchAttempt,
+      cliGeneration: generation,
+    })
+    : undefined;
+  let failureChain: SubmitFailureChainKey | undefined;
+  const receiptBackend = backend;
+  const redrive = (): void => {
+    if (cliSpawnGeneration !== generation || backend !== receiptBackend || cliRestartInProgress) return;
+    try { redriveRejectedStructuredReady(); } finally { void flushPending(); }
+  };
+  const settled = observeQueuedActivationReceipt(
+    item,
+    opts?.recheck,
+    item.content,
+    {
+      generation,
+      ...(evidenceTurnId ? { turnId: evidenceTurnId } : {}),
+      ...(evidenceTurnId ? {
+        probeEvidence: () => probeAuthoritativeQueuedActivationEvidence(
+          {
+            turnId: evidenceTurnId,
+            sendMarkerTurnId: item.turnId,
+            dispatchAttempt: item.dispatchAttempt,
+            generation,
+            allowStandaloneSendMarker: cliGenerationTurnWrites <= 1,
+          },
+          writeStartedAtMs,
+        ),
+      } : {}),
+      onSettledExtra: proof => {
+        if (activationToken) unconfirmedQueuedActivations.delete(activationToken);
+        if (failureChain) submitFailureChains.cancel(failureChain);
+        opts?.onSettledExtra?.(proof, redrive);
+        if (!opts?.deferRedrive) queueMicrotask(redrive);
+      },
+    },
+  );
+  if (!settled) {
+    failureChain = scheduleSubmitFailureNotify(
+      item.logicalContent ?? item.content,
+      opts?.recheck,
+      t('worker.transcriptLabel'),
+      undefined,
+      undefined,
+      usageLimitTracker.currentTurn(),
+      item,
+      opts?.durableTerminalStatus ?? 'ambiguous',
+      codexBridgeFallbackActive(),
+    );
+  }
+  return settled;
+}
+
 function codexAppRuntimeTypeAheadReady(): boolean {
   return isCodexAppCliId(lastInitConfig?.cliId)
     && codexAppControlProven
@@ -29366,8 +29596,14 @@ async function flushPending(): Promise<void> {
       supersedeBackgroundAuthorityHold('superseded_by_message');
     }
   }
+  const effectiveSupportsTypeAhead = typeof shouldAllowTypeAheadOnReattach === 'function'
+    ? shouldAllowTypeAheadOnReattach(
+        typeof reattachOpenTurnGate === 'boolean' && reattachOpenTurnGate && !isCodexAppCliId(lastInitConfig?.cliId),
+        runtimeSupportsTypeAhead,
+      )
+    : runtimeSupportsTypeAhead;
   const typeAheadAllowed = pendingInputAllowsTypeAhead(
-    runtimeSupportsTypeAhead,
+    effectiveSupportsTypeAhead,
     durableTurnInFlight,
     pendingMessages[0],
     directRpcTurnBlocksTypeAhead() || programStatusBlockedHoldsTypeAhead(),
@@ -29799,10 +30035,45 @@ async function flushPending(): Promise<void> {
         break;
       }
       const continuedExecution = item.traexAutoModelRecovery ? item.traexAutoModelContinuation?.execution : undefined;
-      if (workerSessionEventScope && !(continuedExecution && item.turnId
+      const replayAuthorized = !continuedExecution && !!item.queuedActivationToken
+        && authorizedQueuedActivationReplays.get(item.queuedActivationToken) === cliSpawnGeneration;
+      if (replayAuthorized) {
+        authorizedQueuedActivationReplays.delete(item.queuedActivationToken!);
+        log(`Writing operator-authorized unconfirmed activation replay (turn=${item.turnId?.substring(0, 16) ?? '-'})`);
+      }
+      if (workerSessionEventScope && !replayAuthorized && !(continuedExecution && item.turnId
         ? workerSessionEventScope.canSubmitContinuation(item.turnId, continuedExecution)
         : workerSessionEventScope.canSubmit(item.turnId, item.dispatchAttempt))) {
+        const submissionGate = !continuedExecution
+          ? workerSessionEventScope.inspectSubmissionGate?.(item.turnId, item.dispatchAttempt)
+          : undefined;
+        const rejectionSettlement = typeof decideFlushSubmissionRejectionSettlement === 'function'
+          ? decideFlushSubmissionRejectionSettlement({
+            isCodexApp: isCodexAppCliId(lastInitConfig?.cliId),
+            hasToken: !!item.queuedActivationToken,
+            gate: submissionGate,
+          })
+          : 'retain';
+        let holdForUnconfirmedActivation = false;
+        if (rejectionSettlement === 'settle_already_submitted') {
+          log(
+            `Settled already-submitted queued activation ${item.queuedActivationToken!.substring(0, 8)} `
+            + `without re-submitting (phase=${submissionGate?.phase ?? '-'})`,
+          );
+          acknowledgeQueuedActivation(item);
+        } else if (rejectionSettlement === 'observe_only') {
+          log(
+            `Queued activation requires authoritative submission evidence before ACK `
+            + `(turn=${item.turnId?.substring(0, 16) ?? '-'}, phase=${submissionGate?.phase ?? '-'})`,
+          );
+          holdForUnconfirmedActivation = !observeUnconfirmedQueuedActivation(item, {
+            recheck: durableArgvActivationRecheck(item),
+          });
+        }
         if (item.turnId) send({ type: 'turn_input_rejected', turnId: item.turnId, ...(item.dispatchAttempt !== undefined ? { dispatchAttempt: item.dispatchAttempt } : {}), reason: 'execution_reconciliation_required' });
+        // An unproven activation remains the FIFO owner. Its receipt observer
+        // holds the exact head; do not let later queued inputs overtake it.
+        if (holdForUnconfirmedActivation) break;
         continue;
       }
       if (continuedExecution && item.turnId) workerSessionEventScope?.enterContinuation(item.turnId, continuedExecution);
@@ -30520,6 +30791,44 @@ async function flushPending(): Promise<void> {
             replayAnchorMs,
           );
           installRpcLifecycleFailClosedOwner(rpcTurnIdentity, rpcTurnGeneration);
+          if (item.queuedActivationToken) {
+            const ambiguousRpcIdentity = rpcTurnIdentity;
+            const ambiguousRpcGeneration = rpcTurnGeneration;
+            const ownerKey = rpcTurnOwnerKey(ambiguousRpcIdentity);
+            ambiguousRpcActivationTokens.set(ownerKey, {
+              generation: ambiguousRpcGeneration,
+              token: item.queuedActivationToken,
+            });
+            const rpcEvidenceBaselineMs = typeof inputDeliveryEvidence?.writeStartedAtMs === 'function'
+              ? (inputDeliveryEvidence.writeStartedAtMs({
+                  turnId: ambiguousRpcIdentity.turnId,
+                  dispatchAttempt: ambiguousRpcIdentity.dispatchAttempt,
+                  cliGeneration: writeGeneration,
+                }) ?? Date.now())
+              : Date.now();
+            observeQueuedActivationReceipt(
+              item,
+              undefined,
+              rpcContext?.content ?? msg,
+              {
+                generation: writeGeneration,
+                turnId: ambiguousRpcIdentity.turnId,
+                probeEvidence: () => probeAuthoritativeQueuedActivationEvidence(
+                  {
+                    turnId: ambiguousRpcIdentity.turnId,
+                    sendMarkerTurnId: item.turnId,
+                    dispatchAttempt: item.dispatchAttempt,
+                    generation: writeGeneration,
+                    allowStandaloneSendMarker: cliGenerationTurnWrites <= 1,
+                  },
+                  rpcEvidenceBaselineMs,
+                ),
+                onSettledExtra: () => {
+                  ambiguousRpcActivationTokens.delete(ownerKey);
+                },
+              },
+            );
+          }
           log(
             `Codex RPC turn/start became ambiguous; held exact owner and blocked successors `
             + `turn=${rpcTurnIdentity.turnId} attempt=${rpcTurnIdentity.dispatchAttempt ?? '-'} `
@@ -31231,8 +31540,14 @@ function sendToPty(
     return true;
   }
   if (!cliAdapter) return false;
+  const sendSupportsTypeAhead = typeof shouldAllowTypeAheadOnReattach === 'function'
+    ? shouldAllowTypeAheadOnReattach(
+        typeof reattachOpenTurnGate === 'boolean' && reattachOpenTurnGate && !isCodexAppCliId(lastInitConfig?.cliId),
+        runtimePtyInputPolicy().supportsTypeAhead,
+      )
+    : runtimePtyInputPolicy().supportsTypeAhead;
   const supportsTypeAhead = pendingInputAllowsTypeAhead(
-    runtimePtyInputPolicy().supportsTypeAhead,
+    sendSupportsTypeAhead,
     durableTurnInFlight,
     next,
     directRpcTurnBlocksTypeAhead() || programStatusBlockedHoldsTypeAhead(),
@@ -32609,8 +32924,31 @@ async function spawnCli(
   if (!workerSessionEventScope) return spawnCliBody(cfg, opts);
   const firstBinding = !workerSessionEventScope.currentBinding();
   if (cfg.prompt && !workerSessionEventScope.canSubmit(cfg.turnId, cfg.dispatchAttempt, cfg.sessionCommand?.execution)) {
-    if (cfg.turnId) send({ type: 'turn_input_rejected', turnId: cfg.turnId, ...(cfg.dispatchAttempt !== undefined ? { dispatchAttempt: cfg.dispatchAttempt } : {}), reason: 'execution_reconciliation_required' });
-    cfg.prompt = ''; initialInputOwnershipPending = false;
+    const submissionGate = workerSessionEventScope.inspectSubmissionGate?.(
+      cfg.turnId,
+      cfg.dispatchAttempt,
+      cfg.sessionCommand?.execution,
+    );
+    const rejectionSettlement = typeof decideFlushSubmissionRejectionSettlement === 'function'
+      ? decideFlushSubmissionRejectionSettlement({
+        isCodexApp: typeof isCodexAppCliId === 'function' && isCodexAppCliId(cfg.cliId),
+        hasToken: !!cfg.queuedActivationToken,
+        gate: submissionGate,
+      })
+      : 'retain';
+    if (rejectionSettlement === 'settle_already_submitted') {
+      spawnCliReconciledActivationToken = cfg.queuedActivationToken;
+    }
+    if (cfg.turnId && rejectionSettlement !== 'observe_only') {
+      send({ type: 'turn_input_rejected', turnId: cfg.turnId, ...(cfg.dispatchAttempt !== undefined ? { dispatchAttempt: cfg.dispatchAttempt } : {}), reason: 'execution_reconciliation_required' });
+    }
+    // An unconfirmed persisted phase must not authorize either a blind replay or
+    // a direct ACK. Keep the exact init payload through spawn so the adapter's
+    // authoritative reattach probe and the post-spawn receipt observer can decide.
+    if (rejectionSettlement !== 'observe_only') {
+      cfg.prompt = '';
+      initialInputOwnershipPending = false;
+    }
   }
   const execution = firstBinding || cfg.prompt ? cfg.sessionCommand?.execution : undefined;
   const previousBinding = workerSessionEventScope.currentBinding();
@@ -32700,6 +33038,8 @@ async function spawnCliBody(
     : cfg.sandboxNetworkPolicy;
   if (!codexRpcEngine) codexCleanupLaunchTarget = undefined;
   remoteRunnerRecoveredTurnInFlight = false;
+  remoteRunnerRecoveredTurnIdentity = undefined;
+  lastSpawnPersistentReattach = false;
   // Probed once at the early gate and reused at the final child-env gate so a
   // launch runs --version/--help only once; profile FILES are re-read at both
   // gates (the late scan still catches a deletion mid-setup).
@@ -35187,7 +35527,11 @@ async function spawnCliBody(
     additionalArgs?: string[];
     env?: Record<string, string>;
   } | undefined;
-  if (cfg.prompt) {
+  if (shouldPrepareInitialPromptArg({
+    hasPrompt: !!cfg.prompt,
+    willReattachPersistent,
+    adoptMode: cfg.adoptMode === true,
+  })) {
     const prepared = cliAdapter.prepareInitialPromptArg?.({
       initialPrompt: cfg.prompt,
       sessionId: effectiveAdapterSessionId,
@@ -35245,6 +35589,7 @@ async function spawnCliBody(
     preparedArg: preparedInitialPrompt,
     preparedDeferredContent: preparedDeferredInput?.content,
     defer: deferInitialPrompt,
+    willReattachPersistent,
   });
   preparedInitialPrompt = initialPromptDelivery.argvPrompt;
   lastSpawnStructuredArgvPrompt = preparedInitialPrompt;
@@ -35264,7 +35609,6 @@ async function spawnCliBody(
     ...argvBakedOpts,
     reliableTurnTerminal: cliAdapter.reliableTurnTerminal === true,
   });
-  armPendingArgvTurnExecutionStart(cfg.turnId, cfg.dispatchAttempt, spawnArgvNeedsWorkingSeed);
   // Fresh evidence window for the argv first-turn start gate (Pi): the new
   // generation must not inherit a previous spawn's latch or fail-open timer.
   stopSpawnArgvTurnStartFailOpen();
@@ -35286,6 +35630,15 @@ async function spawnCliBody(
     && !!cliAdapter.confirmInitialPromptArgSubmission
     && durableInitialPromptArgBaseline !== null
     && hasDurableInitialPrompt;
+  // Durable-argv adapters (OpenCode/MiMoCode) confirm `--prompt` ingestion via
+  // their SQLite store (finalizeArgvSubmission); delaying turn_execution_started
+  // until that confirmation keeps SessionContract in 'queued' if the process
+  // dies before ingesting `--prompt`.
+  armPendingArgvTurnExecutionStart(
+    cfg.turnId,
+    cfg.dispatchAttempt,
+    spawnArgvNeedsWorkingSeed && !lastSpawnArgvDurableInitialPrompt,
+  );
   lastSpawnArgvDurableInitialPromptSubmission = lastSpawnArgvDurableInitialPrompt
     ? { baseline: durableInitialPromptArgBaseline!, content: preparedInitialPrompt! }
     : undefined;
@@ -38184,6 +38537,7 @@ async function spawnCliBody(
   cliOutlivesWorker = cliSurvivesWorkerExit({ backendType: effectiveBackendType, persistentSessionName });
   const actuallyReattachedPersistent = 'isReattach' in backend
     && backend.isReattach === true;
+  lastSpawnPersistentReattach = actuallyReattachedPersistent;
   prepareDeploymentContinuationForSpawn(cfg, actuallyReattachedPersistent);
   // A NEW process resuming the same conversation — not a re-attach, whose CLI
   // never stopped: the transcript bridge's baseline reads what the previous
@@ -39588,9 +39942,20 @@ async function spawnCliBody(
     if (fatalWorkerErrorPending || backend !== observedBackend) return;
     try {
       if (currentBotmuxTurnId && currentBotmuxTurnId !== turn.turnId) {
-        throw new Error(
-          `turn ${currentBotmuxTurnId.substring(0, 12)} already owns this worker`,
-        );
+        const canAdoptOverUnstartedInit = typeof shouldAdoptPidMarkerWithoutRetiringCurrent === 'function'
+          && shouldAdoptPidMarkerWithoutRetiringCurrent({
+            initialInputOwnershipPending: typeof initialInputOwnershipPending === 'boolean' && initialInputOwnershipPending,
+            pendingCurrentTurnQueued: Array.isArray(pendingMessages) && pendingMessages.some(m => m.turnId === currentBotmuxTurnId),
+            activeTurnStarted: activeTurnAuthority.snapshot()?.started,
+            currentTurnId: currentBotmuxTurnId,
+            diskTurnId: turn.turnId,
+          });
+        if (!canAdoptOverUnstartedInit) {
+          throw new Error(
+            `turn ${currentBotmuxTurnId.substring(0, 12)} already owns this worker`,
+          );
+        }
+        activeTurnAuthority.clear();
       }
       // Fence startup synchronously before awaiting the daemon. The backend
       // resolves its ready handshake immediately after this callback returns;
@@ -39632,6 +39997,30 @@ async function spawnCliBody(
           ? true
           : undefined,
       );
+      remoteRunnerRecoveredTurnIdentity = {
+        turnId: turn.turnId,
+        ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
+      };
+      workerSessionEventScope?.recordSubmission(turn.turnId, turn.dispatchAttempt);
+      const recoveredQueue = reconcileRemoteRecoveredTurnQueue(
+        pendingMessages,
+        remoteRunnerRecoveredTurnIdentity,
+        lastInitConfig,
+      );
+      if (recoveredQueue.remaining.length !== pendingMessages.length) {
+        pendingMessages.splice(0, pendingMessages.length, ...recoveredQueue.remaining);
+      }
+      for (const token of recoveredQueue.matchedTokens) {
+        // When matching the in-progress init turn before init finishes ready +
+        // publishRuntimeContract, let case 'init' emit the ACK post-ready so
+        // tail promotion never races the runtime binding.
+        if (recoveredQueue.matchedInitTurn
+          && !initPromptMaterialized
+          && token === lastInitConfig?.queuedActivationToken) {
+          continue;
+        }
+        acknowledgeQueuedActivationToken(token, sessionId);
+      }
       publishSandboxRelayCapability();
       log(
         `Recovered provider-owned remote turn ${turn.turnId.substring(0, 12)} `
@@ -40218,7 +40607,17 @@ async function spawnCliBody(
     // release keeps its settle: that is the pre-existing behavior for legacy
     // adapters, whose own cap is far away.
     if (forced) cancelFirstFlushSettle();
-    if (decideHardTimeoutAction(runtimePtyInputPolicy().supportsTypeAhead) === 'flush') {
+    // Keep soft-timeout and durable/cross-principal type-ahead behavior intact.
+    // Only at the hard cap (forced === true), after deferPromptReadyWhileBusy
+    // has already proved the reattached pane is neither busy nor mid-turn, let
+    // a stuck reattachOpenTurnGate (scrolled-off readyPattern) fall through to
+    // markPromptReady() so Case C / promoted tails cannot deadlock forever.
+    const hardCapQuietReattachRelease = forced
+      && typeof reattachOpenTurnGate === 'boolean'
+      && reattachOpenTurnGate
+      && !isCodexAppCliId(lastInitConfig?.cliId)
+      && !activeTurnBlocks(pendingMessages[0] ?? {});
+    if (!hardCapQuietReattachRelease && decideHardTimeoutAction(runtimePtyInputPolicy().supportsTypeAhead) === 'flush') {
       const armPromptSeed = shouldArmFirstPromptTimeoutPromptSeed({
         wasAwaitingPostHookPrompt,
         hasPendingInput: hasPendingInputForFlush(),
@@ -40523,6 +40922,8 @@ async function restartCliProcess(
   opts: {
     immediate?: boolean;
     preservePending?: boolean;
+    /** Explicit user restart may retry unconfirmed activations once in the new generation. */
+    allowUnconfirmedActivationReplay?: boolean;
     skipRestartBudget?: boolean;
     exactResumeSessionId?: string;
     restartCause?: CliRestartCause;
@@ -40566,6 +40967,7 @@ async function restartCliProcess(
   }
   if (typeof queuedActivationReceipts?.size === 'function'
     && queuedActivationReceipts.size() > 0
+    && !opts.allowUnconfirmedActivationReplay
     && !closeRequested) {
     queuedActivationReceipts.clear();
     log(`In-worker CLI restart (${reason}) has an unsettled queued activation receipt; retiring worker for daemon journal recovery`);
@@ -40581,6 +40983,10 @@ async function restartCliProcess(
   // until killCli/spawnCli would leave a window where an old timer can mutate
   // the next durable attempt while destroySession is still awaiting.
   cliSpawnGeneration += 1;
+  // Authorization is always generation-scoped: an unrelated later restart drops it.
+  authorizedQueuedActivationReplays.clear();
+  if (opts.allowUnconfirmedActivationReplay) authorizeUnconfirmedQueuedActivationReplay();
+  unconfirmedQueuedActivations.clear();
   // Old-generation deferred submit rechecks are stale by definition: cancel
   // them now so no lingering timer warns or mutates the replacement attempt.
   submitFailureChains.clear();
@@ -44486,6 +44892,7 @@ function emitTurnTerminal(
     // fence. Exact turn identity is sufficient: a later/stale terminal cannot
     // match after capture attribution advances.
     remoteRunnerRecoveredTurnInFlight = false;
+    remoteRunnerRecoveredTurnIdentity = undefined;
     wakePending = true;
   }
   if (wakePending) {
@@ -45909,10 +46316,65 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
           // init so the daemon retries a clean incarnation instead of freezing.
           throw new Error('codex RPC resume: could not replace stale --remote pane; aborting init');
         }
+        spawnCliReconciledActivationToken = undefined;
         await spawnCli(msg, { pluginGenerationPrepared: rpcPluginGenerationPrepared, retryPaneAgentStart: !msg.restartAttemptId });
         if (traexAutoModelRuntimeEligible()) publishActiveRuntime({ model: msg.model, reasoningEffort: msg.reasoningEffort });
         await prepareCodexNativeTitleGeneration(msg, codexRpcEngine);
         if (codexRpcEngine) armRpcStartupDialogDismiss(); // boundary #4: keep the --remote pane from freezing on a startup dialog
+        const freshAmbiguousRpc = pendingAmbiguousFreshRpcActivation;
+        pendingAmbiguousFreshRpcActivation = undefined;
+        if (freshAmbiguousRpc && codexRpcEngine === freshAmbiguousRpc.generation.engine) {
+          const scopeBinding = workerSessionEventScope?.currentBinding();
+          if (scopeBinding && workerSessionEventScope) {
+            const rpcExec = msg.sessionCommand?.execution
+              ?? workerSessionEventScope.executionForTurn(
+                freshAmbiguousRpc.identity.turnId,
+                freshAmbiguousRpc.identity.dispatchAttempt,
+              );
+            workerSessionEventScope.run(scopeBinding, () => {
+              markTurnExecutionStart(
+                freshAmbiguousRpc.identity.turnId,
+                freshAmbiguousRpc.identity.dispatchAttempt,
+                { evidenceAlreadyStarted: true },
+              );
+            }, rpcExec);
+          }
+          const ownerKey = rpcTurnOwnerKey(freshAmbiguousRpc.identity);
+          ambiguousRpcActivationTokens.set(ownerKey, {
+            generation: freshAmbiguousRpc.generation,
+            token: freshAmbiguousRpc.token,
+          });
+          const ambiguousGeneration = cliSpawnGeneration;
+          const ambiguousBackend = backend;
+          const watched = queuedActivationReceipts.watch(freshAmbiguousRpc.token, {
+            probeEvidence: () => probeAuthoritativeQueuedActivationEvidence(
+              {
+                turnId: freshAmbiguousRpc.identity.turnId,
+                sendMarkerTurnId: freshAmbiguousRpc.identity.turnId,
+                dispatchAttempt: freshAmbiguousRpc.identity.dispatchAttempt,
+                generation: ambiguousGeneration,
+                allowStandaloneSendMarker: true,
+              },
+              freshAmbiguousRpc.startedAtMs,
+            ),
+            sessionId: freshAmbiguousRpc.sessionId,
+            generation: ambiguousGeneration,
+            turnId: freshAmbiguousRpc.identity.turnId,
+            ...(freshAmbiguousRpc.identity.dispatchAttempt !== undefined
+              ? { dispatchAttempt: freshAmbiguousRpc.identity.dispatchAttempt }
+              : {}),
+            isCurrent: () => cliSpawnGeneration === ambiguousGeneration
+              && backend === ambiguousBackend
+              && codexRpcEngine === freshAmbiguousRpc.generation.engine
+              && !cliRestartInProgress,
+            onSettled: proof => {
+              ambiguousRpcActivationTokens.delete(ownerKey);
+              if (proof.cliSessionId) persistCliSessionId(proof.cliSessionId);
+              acknowledgeQueuedActivationToken(freshAmbiguousRpc.token, freshAmbiguousRpc.sessionId);
+            },
+          });
+          if (watched) queuedActivationReceipts.probeToken(freshAmbiguousRpc.token);
+        }
         if (deferredFreshRpcTurn) {
           const deferred = deferredFreshRpcTurn;
           deferredFreshRpcTurn = undefined;
@@ -45993,10 +46455,86 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         const initialNativeSessionTitle = msg.nativeSessionTitle;
         const initialNativeSessionTitlePrompt = msg.nativeSessionTitlePrompt;
         // Received before this init's own prompt, so they go ahead of it.
-        const predecessorUnsentInputs = takeUnsentInputsFromPredecessor(msg);
+        const predecessorUnsentInputs = takeUnsentInputsFromPredecessor(msg).filter(entry => !(
+          msg.reconcileQueuedActivation
+          && entry.turnId === msg.reconcileQueuedActivation.turnId
+          && entry.dispatchAttempt === msg.reconcileQueuedActivation.dispatchAttempt
+        ));
         let initialInputCommitted = false;
         let initialInputQueued = false;
-        if (shouldQueueInitialPrompt({
+        let reconciledInitActivationToken: string | undefined;
+        const remoteRunnerRecoveredInitTurn = Boolean(
+          remoteRunnerRecoveredTurnIdentity
+          && msg.turnId
+          && remoteRunnerRecoveredTurnIdentity.turnId === msg.turnId
+          && remoteRunnerRecoveredTurnIdentity.dispatchAttempt === msg.dispatchAttempt,
+        );
+        let durableArgvReattachSettled = false;
+        if (remoteRunnerRecoveredInitTurn) {
+          initialInputCommitted = true;
+          reconciledInitActivationToken = msg.queuedActivationToken;
+        } else if (
+          lastSpawnPersistentReattach
+          && !msg.resume
+          && msg.prompt
+          && !codexRpcEngine
+          && cliAdapter?.durableInitialPromptViaArgs === true
+          && cliAdapter.findInitialPromptArgSubmission
+        ) {
+          const probeResult = cliAdapter.findInitialPromptArgSubmission(0, msg.prompt);
+          const resumeCmd = cliAdapter.buildResumeCommand?.({ sessionId, cliSessionId: undefined });
+          const ownedCliSessionId = resumeCmd?.match(/(?:^|\s)-s\s+(\S+)/)?.[1];
+          const reattachDecision = decideDurableArgvReattachSubmission({
+            probeResult,
+            expectedCliSessionId: msg.cliSessionId,
+            ownedCliSessionId,
+            promptContainsSessionId: Boolean(sessionId && msg.prompt.includes(sessionId)),
+          });
+          if (reattachDecision.action === 'already_submitted') {
+            durableArgvReattachSettled = true;
+            initialInputCommitted = true;
+            reconciledInitActivationToken = msg.queuedActivationToken;
+            if (reattachDecision.cliSessionId) persistCliSessionId(reattachDecision.cliSessionId);
+            if (msg.turnId && workerSessionEventScope) {
+              const scopeBinding = workerSessionEventScope.currentBinding();
+              if (scopeBinding) {
+                const exec = msg.sessionCommand?.execution
+                  ?? workerSessionEventScope.executionForTurn(msg.turnId, msg.dispatchAttempt);
+                workerSessionEventScope.run(scopeBinding, () => {
+                  markTurnExecutionStart(msg.turnId, msg.dispatchAttempt, { evidenceAlreadyStarted: true });
+                }, exec);
+              }
+            }
+            if (msg.dispatchAttempt !== undefined
+              && reattachDecision.cliSessionId
+              && msg.turnId
+              && cliAdapter.isInitialPromptComplete
+              && backend) {
+              durableTurnInFlight = true;
+              const completion = {
+                baseline: 0,
+                content: msg.prompt,
+                cliSessionId: reattachDecision.cliSessionId,
+                turnId: msg.turnId,
+                dispatchAttempt: msg.dispatchAttempt,
+                adapter: cliAdapter,
+              };
+              argvDurableInitialPromptCompletion = completion;
+              watchArgvDurableInitialPromptCompletion({
+                ...completion,
+                backend,
+                generation: cliSpawnGeneration,
+              });
+            }
+            log(`Reconciled already-submitted durable argv initial prompt on persistent reattach (turn=${msg.turnId?.substring(0, 16) ?? '-'})`);
+          }
+        }
+        const reattachQueueAfterActiveTurn = lastSpawnPersistentReattach && (
+          reattachOpenTurnGate
+          || (activeTurnAuthority.snapshot()?.started === true
+            && activeTurnAuthority.snapshot()?.turnId !== msg.turnId)
+        );
+        if (!remoteRunnerRecoveredInitTurn && !durableArgvReattachSettled && shouldQueueInitialPrompt({
           hasPrompt: !!msg.prompt,
           rpcEngineActive: !!codexRpcEngine,
           queuePrompt: rpcDecision.queuePrompt,
@@ -46015,6 +46553,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
             ...(lastSpawnQueuedInitialPromptLogicalContent
               ? { logicalContent: lastSpawnQueuedInitialPromptLogicalContent }
               : {}),
+            ...(reattachQueueAfterActiveTurn ? { queueAfterActiveTurn: true as const } : {}),
             turnId: msg.turnId,
             replyTurnId: msg.replyTurnId,
             dispatchAttempt: msg.dispatchAttempt,
@@ -46045,9 +46584,11 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
           initialInputQueued = true;
         } else if (isCodexAppCliId(msg.cliId)) {
           pendingMessages.unshift(...recoveredAcceptedInputs);
-        } else if (msg.prompt) {
+        } else if (!remoteRunnerRecoveredInitTurn && !durableArgvReattachSettled && msg.prompt) {
           // A successful spawn with a non-queued prompt means the adapter baked
-          // it into argv or the RPC engine already accepted it.
+          // it into argv or the RPC engine already accepted it. Cold-start argv
+          // execution start is published via pendingTurnExecutionStart once the
+          // daemon assigns the live runtime (runtime_contract_assigned).
           initialInputCommitted = true;
           if (!codexRpcEngine) recordStructuredInput(msg.turnId, lastSpawnStructuredArgvPrompt ?? msg.prompt);
           // An argv-baked prompt is input the CLI has not consumed until its
@@ -46120,6 +46661,16 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
             const finalizeArgvSubmission = (cliSessionId?: string) => {
               if (!argvIsCurrent()) return;
               if (cliSessionId) persistCliSessionId(cliSessionId);
+              if (msg.turnId && workerSessionEventScope?.canSubmit(msg.turnId, msg.dispatchAttempt, msg.sessionCommand?.execution)) {
+                const scopeBinding = workerSessionEventScope.currentBinding();
+                if (scopeBinding) {
+                  const exec = msg.sessionCommand?.execution
+                    ?? workerSessionEventScope.executionForTurn(msg.turnId, msg.dispatchAttempt);
+                  workerSessionEventScope.run(scopeBinding, () => {
+                    markTurnExecutionStart(msg.turnId, msg.dispatchAttempt, { evidenceAlreadyStarted: true });
+                  }, exec);
+                }
+              }
               if (msg.queuedActivationToken) {
                 acknowledgeQueuedActivationToken(msg.queuedActivationToken);
               }
@@ -46262,6 +46813,24 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
           turnId: currentBotmuxTurnId,
           dispatchAttempt: currentBotmuxDispatchAttempt,
         });
+        const postInitReconcileToken = msg.reconcileQueuedActivation
+          ? msg.queuedActivationToken
+          : (reconciledInitActivationToken ?? (typeof spawnCliReconciledActivationToken === 'string' ? spawnCliReconciledActivationToken : undefined));
+        spawnCliReconciledActivationToken = undefined;
+        if (msg.reconcileQueuedActivation?.evidenceRequired && msg.queuedActivationToken) {
+          const item: PendingCliInput = {
+            content: msg.reconcileQueuedActivation.submittedText ?? '',
+            turnId: msg.reconcileQueuedActivation.turnId,
+            ...(msg.reconcileQueuedActivation.dispatchAttempt !== undefined
+              ? { dispatchAttempt: msg.reconcileQueuedActivation.dispatchAttempt }
+              : {}),
+            queuedActivationToken: msg.queuedActivationToken,
+            ...(msg.nativeSessionTitle ? { nativeSessionTitle: msg.nativeSessionTitle } : {}),
+          };
+          observeUnconfirmedQueuedActivation(item);
+        } else if (postInitReconcileToken) {
+          acknowledgeQueuedActivationToken(postInitReconcileToken, msg.sessionId);
+        }
       } catch (err: any) {
         if (err instanceof CliSpawnSupersededError) return;
         initialInputOwnershipPending = false;
@@ -46512,12 +47081,26 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       // Cross-principal turns are rejected at this worker boundary. The daemon
       // normally isolates them before worker IPC; this closes races/restarts so
       // another human can never steer the active turn directly.
-      if (!msg.queueAfterActiveTurn && activeTurnBlocks({
+      const messageActiveTurnBlocked = activeTurnBlocks({
         turnId: msg.turnId,
         dispatchAttempt: msg.dispatchAttempt,
         trustedCaller: msg.trustedCaller,
         trustedController: msg.trustedController,
-      })) {
+      });
+      const activeTurnSnapshotForMessage = activeTurnAuthority.snapshot();
+      const promotedActivationDecision = typeof decidePromotedActivationMessageHandling === 'function'
+        ? decidePromotedActivationMessageHandling({
+            hasQueuedActivationToken: !!msg.queuedActivationToken,
+            explicitQueueAfterActiveTurn: msg.queueAfterActiveTurn === true,
+            reattachOpenTurnGate: typeof reattachOpenTurnGate === 'boolean' && reattachOpenTurnGate,
+            remoteRunnerRecoveredTurnInFlight: typeof remoteRunnerRecoveredTurnInFlight === 'boolean' && remoteRunnerRecoveredTurnInFlight,
+            activeTurnBlocks: messageActiveTurnBlocked,
+            activeTurnStartedOnDifferentTurn: activeTurnSnapshotForMessage?.started === true
+              && activeTurnSnapshotForMessage.turnId !== msg.turnId,
+          })
+        : { queueAfterActiveTurn: msg.queueAfterActiveTurn === true, reason: 'none' as const };
+      const effectiveQueueAfterActiveTurn = promotedActivationDecision.queueAfterActiveTurn;
+      if (!effectiveQueueAfterActiveTurn && messageActiveTurnBlocked) {
         if (ordinaryImTurnId) {
           rejectOrdinaryImTurn(
             ordinaryImTurnId,
@@ -46544,7 +47127,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       // Adopt handlers are async and serialized below, so their renderer/usage
       // turn begins inside writeAdoptMessage. Non-adopt keeps the immediate
       // baseline while the message waits for normal flush scheduling.
-      if (!lastInitConfig?.adoptMode && !msg.queueAfterActiveTurn) {
+      if (!lastInitConfig?.adoptMode && !effectiveQueueAfterActiveTurn) {
         renderer?.markNewTurn();
         // PTY/tmux CLIs call `usageLimitTracker.beginTurn()` inside `prepareNormalWrite`
         // at the actual CLI write moment (avoiding premature wipe of Turn 1's active
@@ -46626,7 +47209,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
           // turn whose `botmux send` could sneak its sentAtMs past this
           // turn's markTimeMs and falsely suppress its fallback.
           const inputCommitted = sendToPty(content, msg.turnId, {
-            ...(msg.queueAfterActiveTurn ? { queueAfterActiveTurn: true } : {}),
+            ...(effectiveQueueAfterActiveTurn ? { queueAfterActiveTurn: true } : {}),
             codexAppInput,
             dispatchAttempt: msg.dispatchAttempt,
             durablePrimaryInbox: msg.durablePrimaryInbox,
@@ -46844,6 +47427,66 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
     }
 
     case 'raw_input': {
+      const rawSubmissionGate = workerSessionEventScope?.inspectSubmissionGate?.(
+        msg.turnId,
+        undefined,
+        msg.sessionCommand?.execution,
+      );
+      const rawReconcileAction = typeof decideRawInputSubmissionReconciliation === 'function'
+        ? decideRawInputSubmissionReconciliation({
+            isCodexApp: isCodexAppCliId(lastInitConfig?.cliId),
+            hasToken: !!msg.queuedActivationToken,
+            gate: rawSubmissionGate,
+          })
+        : 'deliver';
+      if (rawReconcileAction === 'observe_only') {
+        log(
+          `Raw input requires authoritative submission evidence before ACK `
+          + `(turn=${msg.turnId?.substring(0, 16) ?? '-'}, phase=${rawSubmissionGate?.phase ?? '-'})`,
+        );
+        const deliverBundledFollowUp = () => {
+          if (msg.followUpContent) {
+            sendToPty(msg.followUpContent, msg.followUpTurnId, {
+              codexAppInput: msg.followUpCodexAppInput,
+              trustedController: msg.trustedController,
+              ...(msg.mojoLivePatch ? { mojoLivePatch: msg.mojoLivePatch } : {}),
+            });
+          }
+        };
+        const item: PendingCliInput = {
+          content: msg.content,
+          ...(msg.turnId ? { turnId: msg.turnId } : {}),
+          ...(msg.queuedActivationToken ? { queuedActivationToken: msg.queuedActivationToken } : {}),
+        };
+        observeUnconfirmedQueuedActivation(item, {
+          deferRedrive: true,
+          onSettledExtra: (_proof, redrive) => {
+            // observeQueuedActivationReceipt ACKs in its finally block. Preserve
+            // the established ACK -> bundled followUp -> successor redrive order.
+            queueMicrotask(() => {
+              try { deliverBundledFollowUp(); } finally { redrive(); }
+            });
+          },
+        });
+        break;
+      }
+      if (rawReconcileAction !== 'deliver') {
+        log(
+          `Skipped already-submitted raw input (${msg.content.substring(0, 40)}) `
+          + `turn=${msg.turnId?.substring(0, 16) ?? '-'} phase=${rawSubmissionGate?.phase ?? '-'}`,
+        );
+        if (rawReconcileAction === 'skip_and_ack' && msg.queuedActivationToken) {
+          acknowledgeQueuedActivationToken(msg.queuedActivationToken);
+        }
+        if (msg.followUpContent) {
+          sendToPty(msg.followUpContent, msg.followUpTurnId, {
+            codexAppInput: msg.followUpCodexAppInput,
+            trustedController: msg.trustedController,
+            ...(msg.mojoLivePatch ? { mojoLivePatch: msg.mojoLivePatch } : {}),
+          });
+        }
+        break;
+      }
       const unattendedRefusal = unattendedRawInputRefusal(msg);
       if (unattendedRefusal) {
         log(`Refused unattended raw input without safe composer evidence: ${unattendedRefusal.refusal} `
@@ -47104,6 +47747,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         // auto-restart 那条裸 restart 的计数兜底。
         {
           preservePending: true,
+          allowUnconfirmedActivationReplay: msg.allowUnconfirmedActivationReplay === true && !!msg.attemptId,
           immediate: msg.reason === 'account_rotation',
           skipRestartBudget: !!msg.updateWorkingDir || !!msg.topicEffort || msg.reason === 'account_rotation',
           ...(msg.topicEffort ? { exactResumeSessionId: msg.topicEffort.nativeSessionId } : {}),
