@@ -24,7 +24,7 @@ vi.mock('../src/im/lark/identity-cache.js', () => ({ resolveSender: mocks.sender
 vi.mock('../src/im/lark/client.js', () => ({ replyMessage: mocks.reply, updateMessage: mocks.update, deleteMessage: mocks.withdraw,
   getMessageDetail: mocks.detail, getChatModeStrict: mocks.mode, getChatInviteLink: mocks.invite,
   listThreadMessagesWithContext: mocks.thread, mergeForwardMessages: mocks.merge, forwardMessage: vi.fn(), isBotInChat: mocks.membership }));
-import { handleOncallGroupAction, handleOncallFormAction, retryPendingOncallHandoffs } from '../src/im/lark/oncall-group.js';
+import { handleOncallGroupAction, handleOncallFormAction, reconcileNativeOncallSubmissions, retryPendingOncallHandoffs } from '../src/im/lark/oncall-group.js';
 import { OncallFormStore } from '../src/services/oncall-form-store.js';
 import { OncallGroupStore, type OncallGroupSource } from '../src/services/oncall-group-store.js';
 import { createNativeOncallLink, readNativeOncallResultCandidates } from '../src/services/oncall-platform.js';
@@ -100,6 +100,11 @@ function queriedRows(init?: RequestInit) {
 }
 const current = (d: any) => new OncallFormStore(dir).use(appId, d.id, 'ou_actor', async value => ({ ...value }), { allowClosed: true });
 
+async function reconcileAndDeliver() {
+  await reconcileNativeOncallSubmissions(appId);
+  await retryPendingOncallHandoffs(appId);
+}
+
 describe('native submission completion', () => {
   it('adopts a group from an earlier platform draft and forwards the conversation through launch time once', async () => {
     const d = await open(); submitted(d);
@@ -107,7 +112,7 @@ describe('native submission completion', () => {
     expect([...page.searchParams.keys()][0]).toBe('bm_form');
     expect(page.searchParams.get('bm_form')).toBe(new URL(d.nativeSubmission.attempts[0]!.sourceLocation).searchParams.get('bm_form'));
     expect(d.nativeSubmission.attempts[0]!.sourceLocation).toContain(d.id);
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     const request = new OncallGroupStore(dir).getRequest(source)!;
     expect(request).toMatchObject({ status: 'succeeded', flowId: '1234', openChatId: 'oc_destination', forwardMode: 'merge', submittedAtMs: started + 2000,
       messageIdsSnapshot: ['om_q1', 'om_a1', 'om_q2', 'om_a2', 'om_file'], forwarded: ['om_q1', 'om_a1', 'om_q2', 'om_a2', 'om_file'] });
@@ -118,11 +123,11 @@ describe('native submission completion', () => {
       expect(button.behaviors[0]).toMatchObject({ type: 'open_url', default_url: expect.stringContaining('add_by_link') });
     }
     expect((await current(d)).nativeSubmission?.completed).toBe(true);
-    await retryPendingOncallHandoffs(appId); expect(mocks.merge).toHaveBeenCalledOnce();
+    await reconcileAndDeliver(); expect(mocks.merge).toHaveBeenCalledOnce();
     expect(fetcher.mock.calls.filter(([url]) => new URL(url).pathname.endsWith('/chat/'))).toHaveLength(0);
   });
   it('waits for submission and never treats an open sidebar as a created group', async () => {
-    await open(); await retryPendingOncallHandoffs(appId);
+    await open(); await reconcileAndDeliver();
     expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined(); expect(mocks.merge).not.toHaveBeenCalled(); expect(mocks.withdraw).not.toHaveBeenCalled();
   });
   it.each([false, true])('uses the group creation cutoff even with delayed duty start (recorded: %s)', async dutyStarted => {
@@ -130,7 +135,7 @@ describe('native submission completion', () => {
     submitted(d);
     rows[0].create_chat_time = '2026-01-01T08:00:02';
     rows[0].oncall_start_time = dutyStarted ? '2026-01-01T08:00:04' : null;
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     const request = new OncallGroupStore(dir).getRequest(source);
     expect(request).toMatchObject({ status: 'succeeded', openChatId: 'oc_destination', submittedAtMs: started + 2000,
       messageIdsSnapshot: ['om_q1', 'om_a1', 'om_q2', 'om_a2', 'om_file'] });
@@ -140,58 +145,58 @@ describe('native submission completion', () => {
     expect((await current(d)).nativeSubmission?.completed).toBe(true);
     rows[0].oncall_start_time = '2026-01-01T08:00:04';
     vi.setSystemTime(started + 20_000);
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     expect(mocks.merge).toHaveBeenCalledOnce();
   });
   it('still adopts a submitted native form if the default changes to Botmux before reconciliation', async () => {
     const d = await open();
     submitted(d);
     mocks.bot.config.oncallGroup.customFormMode = 'botmux';
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     expect(new OncallGroupStore(dir).getRequest(source)).toMatchObject({ status: 'succeeded', openChatId: 'oc_destination' });
     expect((await current(d)).nativeSubmission?.completed).toBe(true);
   });
   it.each(['originator_user', 'tenant_id', 'source_location', 'region'])('rejects a mismatched %s without adoption or forwarding', async key => {
     const d = await open(); submitted(d); rows[0][key] = typeof rows[0][key] === 'number' ? 99 : 'different';
-    await retryPendingOncallHandoffs(appId); expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined(); expect(mocks.merge).not.toHaveBeenCalled();
+    await reconcileAndDeliver(); expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined(); expect(mocks.merge).not.toHaveBeenCalled();
   });
   it('updates the original answer and forwards once after Oncall changes the category', async () => {
     const d = await open(); submitted(d);
     rows[0].oncall_question_type_id = 99;
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     expect(new OncallGroupStore(dir).getRequest(source)).toMatchObject({ status: 'succeeded', flowId: '1234', openChatId: 'oc_destination' });
     expect(mocks.update.mock.calls.some(([, message]) => message === source.messageId)).toBe(true);
     expect(mocks.merge).toHaveBeenCalledOnce();
   });
   it('does not guess between two orders submitted from the same form', async () => {
     const d = await open(); submitted(d); rows.push({ ...rows[0], id: 5678 });
-    await retryPendingOncallHandoffs(appId); expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined(); expect(mocks.merge).not.toHaveBeenCalled();
+    await reconcileAndDeliver(); expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined(); expect(mocks.merge).not.toHaveBeenCalled();
   });
   it('recovers adoption after a failed card update, using the same group and forwarding receipt', async () => {
     const d = await open(); submitted(d); mocks.update.mockRejectedValueOnce(new Error('patch failed'));
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     const attempt = new OncallGroupStore(dir).getRequest(source)!.attemptId;
     const checks = fetcher.mock.calls.filter(([url]) => url.includes('/oncall_flow/list')).length;
-    vi.setSystemTime(started + 70000); await retryPendingOncallHandoffs(appId);
+    vi.setSystemTime(started + 70000); await reconcileAndDeliver();
     expect(new OncallGroupStore(dir).getRequest(source)!.attemptId).toBe(attempt); expect(mocks.merge).toHaveBeenCalledOnce();
     expect(fetcher.mock.calls.filter(([url]) => url.includes('/oncall_flow/list'))).toHaveLength(checks);
     expect((await current(d)).nativeSubmission?.completed).toBe(true);
   });
   it('preserves existing session ownership and never rebinds a pending ordinary request', async () => {
     const d = await open(); submitted(d); const groups = new OncallGroupStore(dir); groups.claim(source, 'ou_other');
-    await retryPendingOncallHandoffs(appId); expect(groups.getRequest(source)).toMatchObject({ status: 'pending', operatorOpenId: 'ou_other' });
+    await reconcileAndDeliver(); expect(groups.getRequest(source)).toMatchObject({ status: 'pending', operatorOpenId: 'ou_other' });
     expect(mocks.merge).not.toHaveBeenCalled();
   });
   it('honors the no-forward setting while still producing the group invitation', async () => {
     mocks.bot.config.oncallGroup.forwardMode = 'none'; const d = await open(); submitted(d);
-    await retryPendingOncallHandoffs(appId); expect(mocks.thread).not.toHaveBeenCalled(); expect(mocks.merge).not.toHaveBeenCalled();
+    await reconcileAndDeliver(); expect(mocks.thread).not.toHaveBeenCalled(); expect(mocks.merge).not.toHaveBeenCalled();
     expect(new OncallGroupStore(dir).getRequest(source)).toMatchObject({ status: 'succeeded', forwardMode: 'none', messageIdsSnapshot: [] });
   });
   it('does not attach an order after the initiator cancels the original form', async () => {
     const d = await open(); submitted(d);
     await handleOncallFormAction({ operator: { open_id: 'ou_actor' }, context: { open_chat_id: source.chatId, open_message_id: d.messageId },
       action: { value: { action: 'oncall_group_form_cancel', draftId: d.id, version: d.version } } } as any, appId);
-    await retryPendingOncallHandoffs(appId); expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined(); expect(mocks.merge).not.toHaveBeenCalled();
+    await reconcileAndDeliver(); expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined(); expect(mocks.merge).not.toHaveBeenCalled();
   });
   it.each(['stale', 'future', 'missing'])('does not adopt a platform ticket with a %s launch time', async kind => {
     const d = await open(); submitted(d);
@@ -199,7 +204,7 @@ describe('native submission completion', () => {
       : new Date(kind === 'stale' ? started - 60_000 : started + 500_000).toISOString();
     // Exercise local validation even if the platform returns a row outside the filter.
     fetcher.mockImplementation(async (url: string) => json(url.includes('/oncall_flow/list') ? rows : 'oc_destination'));
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined(); expect(mocks.merge).not.toHaveBeenCalled();
   });
 });
@@ -217,7 +222,7 @@ describe('platform completion protocol', () => {
     rows[0].source_location = original.href.slice(0, 200);
     const other = new URL(rows[0].source_location); other.searchParams.set('bm_form', 'different-form');
     rows.push({ ...rows[0], id: 5678, source_location: other.href });
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     expect(new OncallGroupStore(dir).getRequest(source)).toMatchObject({ flowId: '1234', openChatId: 'oc_destination' });
     expect(mocks.merge).toHaveBeenCalledOnce();
   });
@@ -234,10 +239,10 @@ describe('platform completion protocol', () => {
     const expected = d.nativeSubmission.attempts[0]!.hostedSourceLocation;
     expect(new URL(expected).searchParams.size).toBe(1);
     rows[0].source_location = expected;
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
     vi.setSystemTime(started + 21_000);
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     const lists = fetcher.mock.calls.filter(([url]) => url.includes('/oncall_flow/list'));
     expect(lists).toHaveLength(2);
     expect(JSON.parse(lists[0]![1].body).filter_fields).toContainEqual({ field: 'source_location', value: [expected], operator: 'in' });
@@ -259,11 +264,11 @@ describe('platform completion protocol', () => {
       if (filters.some((filter: any) => filter.field === 'source_location')) return json(rows);
       return respond(url, init);
     });
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
     expect((await current(d)).nativeSubmission?.scan).toMatchObject({ afterId: 0, verifyFlowId: 1234 });
     vi.setSystemTime(started + 21_000);
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     expect(new OncallGroupStore(dir).getRequest(source)?.flowId).toBe('1234');
     expect(mocks.merge).toHaveBeenCalledOnce();
   });
@@ -276,10 +281,10 @@ describe('platform completion protocol', () => {
     const exact = { ...rows[0], id: 5678, source_location: expected };
     rows[0].source_location = `${expected}&bizFrom=lark`;
     if (duplicate) rows.push(exact);
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
     vi.setSystemTime(started + 21_000);
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     expect(new OncallGroupStore(dir).getRequest(source)?.flowId).toBe(duplicate ? undefined : '1234');
     expect(mocks.merge).toHaveBeenCalledTimes(duplicate ? 0 : 1);
   });
@@ -289,12 +294,12 @@ describe('platform completion protocol', () => {
     vi.stubEnv('BOTMUX_PUBLIC_URL', 'https://dashboard.example.test');
     const d = await open(); submitted(d);
     rows[0].source_location = d.nativeSubmission.attempts[0]!.hostedSourceLocation!;
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     expect((await current(d)).nativeSubmission?.scan).toMatchObject({ afterId: 0, verifyFlowId: 1234 });
     rows.push({ ...rows[0], id: 5678,
       create_time: new Date(started + 10_000).toISOString(), update_time: new Date(started + 10_000).toISOString() });
     vi.setSystemTime(started + 21_000);
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
     expect((await current(d)).nativeSubmission?.scan).toBeUndefined();
     expect(mocks.merge).not.toHaveBeenCalled();
@@ -307,12 +312,12 @@ describe('platform completion protocol', () => {
     const targetRow = { ...rows[0], id: 101, source_location: d.nativeSubmission.attempts[0]!.hostedSourceLocation! };
     rows = [...Array.from({ length: 100 }, (_, i) => ({ ...rows[0], id: i + 1,
       source_location: 'https://oncall.example.test/chat?bm_form=other' })), targetRow];
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     let passes = 0;
     while ((await current(d)).nativeSubmission?.scan && passes < 5) {
       passes++;
       vi.setSystemTime(started + 6_000 + passes * 15_000);
-      await retryPendingOncallHandoffs(appId);
+      await reconcileAndDeliver();
       expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
       if (passes === 1) expect((await current(d)).nativeSubmission?.scan).toMatchObject({ afterId: 0, verifyFlowId: 101, verifyRounds: 1 });
     }
@@ -337,13 +342,13 @@ describe('platform completion protocol', () => {
       source_location: 'https://oncall.example.test/chat?bm_form=other' }));
     if (duplicate) rows[0] = { ...wanted, id: 1 };
     rows.push(wanted);
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
     expect((await current(d)).nativeSubmission?.scan).toMatchObject({ afterId: 1000 });
     expect(mocks.merge).not.toHaveBeenCalled();
     wanted.update_time = new Date(started + 20_000).toISOString();
     vi.setSystemTime(started + 21_000);
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     const lists = fetcher.mock.calls.filter(([url]) => url.includes('/oncall_flow/list'));
     expect(lists).toHaveLength(11);
     expect(JSON.parse(lists[10]![1].body).filter_fields).toContainEqual({ field: 'id', value: '1001', operator: 'greater_or_equals' });
@@ -353,7 +358,7 @@ describe('platform completion protocol', () => {
     expect((await current(d)).nativeSubmission?.scan).toMatchObject({ afterId: 0, verifyFlowId: 1234 });
     rows = [wanted];
     vi.setSystemTime(started + 36_000);
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     expect(fetcher.mock.calls.filter(([url]) => url.includes('/oncall_flow/list'))).toHaveLength(12);
     expect(new OncallGroupStore(dir).getRequest(source)?.flowId).toBe('1234');
     expect(mocks.merge).toHaveBeenCalledOnce();
@@ -365,19 +370,19 @@ describe('platform completion protocol', () => {
     const duplicate = { ...rows[0], id: 1, update_time: new Date(started - 60_000).toISOString() };
     rows = [duplicate, ...Array.from({ length: 999 }, (_, i) => ({ ...rows[0], id: i + 2,
       source_location: 'https://oncall.example.test/chat?bm_form=other' })), targetRow];
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     expect((await current(d)).nativeSubmission?.scan).toMatchObject({ afterId: 1001, flowId: 1001 });
     duplicate.update_time = new Date(started + 6000).toISOString();
     vi.setSystemTime(started + 21_000);
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     expect((await current(d)).nativeSubmission?.scan).toMatchObject({ afterId: 0, verifyFlowId: 1001 });
     expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
     vi.setSystemTime(started + 36_000);
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     expect((await current(d)).nativeSubmission?.scan).toMatchObject({ afterId: 1000, flowId: 1, verifyFlowId: 1001 });
     expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
     vi.setSystemTime(started + 51_000);
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
     expect((await current(d)).nativeSubmission?.scan).toBeUndefined();
     expect(mocks.merge).not.toHaveBeenCalled();
@@ -399,11 +404,11 @@ describe('platform completion protocol', () => {
       }
       return result;
     });
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     expect((await current(d)).nativeSubmission?.scan).toMatchObject({ afterId: 0, verifyFlowId: 102 });
     expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
     vi.setSystemTime(started + 21_000);
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
     expect((await current(d)).nativeSubmission?.scan).toBeUndefined();
     expect(mocks.merge).not.toHaveBeenCalled();
@@ -417,7 +422,7 @@ describe('platform completion protocol', () => {
     const duplicate = { ...rows[0], id: 1, update_time: new Date(started - 60_000).toISOString() };
     rows = [duplicate, ...Array.from({ length: 100 }, (_, i) => ({ ...rows[0], id: i + 2,
       source_location: 'https://oncall.example.test/chat?bm_form=other' })), targetRow];
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     const respond = fetcher.getMockImplementation()!;
     let firstVerificationPage = true;
     fetcher.mockImplementation(async (url, init) => {
@@ -430,11 +435,11 @@ describe('platform completion protocol', () => {
       return result;
     });
     vi.setSystemTime(started + 21_000);
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
     expect((await current(d)).nativeSubmission?.scan).toMatchObject({ afterId: 0, verifyFlowId: 102, verifyRounds: 1 });
     vi.setSystemTime(started + 36_000);
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
     expect((await current(d)).nativeSubmission?.scan).toBeUndefined();
     expect(mocks.merge).not.toHaveBeenCalled();
@@ -448,18 +453,18 @@ describe('platform completion protocol', () => {
     const duplicate = { ...rows[0], id: 1, update_time: new Date(started - 60_000).toISOString() };
     rows = [duplicate, ...Array.from({ length: 1000 }, (_, i) => ({ ...rows[0], id: i + 2,
       source_location: 'https://oncall.example.test/chat?bm_form=other' })), targetRow];
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     vi.setSystemTime(started + 21_000);
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     expect((await current(d)).nativeSubmission?.scan).toMatchObject({ afterId: 1001, verifyFlowId: 1002, verifyRounds: 0 });
     duplicate.update_time = new Date(started + 22_000).toISOString();
     vi.setSystemTime(started + 36_000);
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
     expect((await current(d)).nativeSubmission?.scan).toMatchObject({ afterId: 0, verifyFlowId: 1002, verifyRounds: 1 });
     rows = [duplicate, targetRow];
     vi.setSystemTime(started + 51_000);
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
     expect((await current(d)).nativeSubmission?.scan).toBeUndefined();
     expect(mocks.merge).not.toHaveBeenCalled();
@@ -470,11 +475,11 @@ describe('platform completion protocol', () => {
     const targetRow = { ...rows[0], id: 101 };
     rows = [...Array.from({ length: 100 }, (_, i) => ({ ...rows[0], id: i + 1,
       source_location: 'https://oncall.example.test/chat?bm_form=other' })), targetRow];
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     expect((await current(d)).nativeSubmission?.scan).toMatchObject({ afterId: 0, verifyFlowId: 101 });
     rows = [{ ...targetRow, id: 202 }];
     vi.setSystemTime(started + 21_000);
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
     expect((await current(d)).nativeSubmission?.scan).toBeUndefined();
     expect(mocks.merge).not.toHaveBeenCalled();
@@ -485,7 +490,7 @@ describe('platform completion protocol', () => {
     const wanted = { ...rows[0], id: 1 };
     rows = [wanted, ...Array.from({ length: 999 }, (_, i) => ({ ...wanted, id: i + 2,
       source_location: 'https://oncall.example.test/chat?bm_form=other' }))];
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     const checkpoint = (await current(d)).nativeSubmission?.scan;
     expect(checkpoint).toMatchObject({ afterId: 1000, flowId: 1 });
     const respond = fetcher.getMockImplementation()!;
@@ -495,17 +500,17 @@ describe('platform completion protocol', () => {
       return respond(url, init);
     });
     vi.setSystemTime(started + 21_000);
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     expect((await current(d)).nativeSubmission?.scan).toEqual(checkpoint);
     expect(mocks.merge).not.toHaveBeenCalled();
     failConversion = false;
     vi.setSystemTime(started + 82_000);
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     expect((await current(d)).nativeSubmission?.scan).toMatchObject({ afterId: 0, verifyFlowId: 1 });
     expect(mocks.merge).not.toHaveBeenCalled();
     rows = [wanted];
     vi.setSystemTime(started + 97_000);
-    await retryPendingOncallHandoffs(appId);
+    await reconcileAndDeliver();
     expect((await current(d)).nativeSubmission?.scan).toBeUndefined();
     expect(mocks.merge).toHaveBeenCalledOnce();
   });
