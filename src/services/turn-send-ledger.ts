@@ -34,6 +34,10 @@ export interface TurnSendLedgerRecord extends TurnSendLedgerKey {
     fingerprint: string;
     messageId: string;
     deliveredAtMs: number;
+    /** Absorbed mid-turn follow-up turn IDs that this final structurally
+     *  settled, persisted atomically so crash recovery in the catch-up loop
+     *  settles them instead of promoting them as fresh execution turns. */
+    settledAbsorbedTurnIds?: string[];
   };
 }
 
@@ -461,7 +465,14 @@ export class TurnSendLedger {
     kind: TurnSendKind,
     renderedContent: string,
     dispatch: (providerUuid?: string) => Promise<string>,
-    options: { fenced?: boolean; providerUuid?: string; reuseExistingFinal?: boolean; beforeDispatch?: () => void; noSideEffect?: (error: unknown) => boolean } = {},
+    options: {
+      fenced?: boolean;
+      providerUuid?: string;
+      reuseExistingFinal?: boolean;
+      beforeDispatch?: () => void;
+      noSideEffect?: (error: unknown) => boolean;
+      resolveSettledAbsorbedTurnIds?: () => string[] | undefined;
+    } = {},
   ): Promise<TurnSendLedgerResult> {
     this.ensureSessionDirectory(key);
     return withFileLock(this.recordPath(key), async () => {
@@ -522,10 +533,14 @@ export class TurnSendLedger {
       }
       if (!messageId && kind === 'final') throw new Error('Missing primary message ID');
       if (kind === 'final') {
+        const settledAbsorbedTurnIds = options.resolveSettledAbsorbedTurnIds?.();
         record.final = {
           fingerprint: this.fingerprint(renderedContent),
           messageId,
           deliveredAtMs: Date.now(),
+          ...(settledAbsorbedTurnIds && settledAbsorbedTurnIds.length > 0
+            ? { settledAbsorbedTurnIds }
+            : {}),
         };
         delete record.publication;
         this.write(key, record);

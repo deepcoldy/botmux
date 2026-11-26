@@ -1,5 +1,6 @@
-import type { SessionReplyTarget } from './reply-target.js';
-import type { AncestorSessionContext } from './session-marker.js';
+import { compatibleAuthorityPrincipal } from './active-turn-authority.js';
+import { replyTargetKey, type SessionReplyTarget } from './reply-target.js';
+import type { AncestorSessionContext, QueuedTypeAheadTurn } from './session-marker.js';
 
 /** Reply addressing only. Never use this selection as execution/actor authority. */
 export function selectReplyMessageId(
@@ -15,10 +16,87 @@ export function selectReplyMessageId(
     return explicitMessageId;
   }
   if (marker?.sessionId === session.sessionId && marker.turnId === executionTurnId) {
-    const consumed = marker.queuedTurns?.filter(turn => turn.inputConsumed === true).at(-1);
+    const consumed = marker.queuedTurns?.filter(turn =>
+      turn.inputConsumed === true
+      && (turn.absorbedIntoTurnId === undefined
+        || (turn.absorbedIntoTurnId === executionTurnId
+          && turn.absorbedIntoDispatchAttempt === marker.dispatchAttempt)))
+      .at(-1);
     if (consumed && parseReplyMessageTarget(session.turnReplyContexts?.[consumed.turnId]?.target)) return consumed.turnId;
+    const settled = marker.settledAbsorbedTurns
+      ?.filter(turn => turn.hostTurnId === executionTurnId && turn.hostDispatchAttempt === marker.dispatchAttempt)
+      .at(-1);
+    if (settled && parseReplyMessageTarget(session.turnReplyContexts?.[settled.turnId]?.target)) return settled.turnId;
   }
   return executionTurnId;
+}
+
+export interface AbsorbedTurnSettlementContext {
+  session: {
+    sessionId: string;
+    scope?: 'chat' | 'thread';
+    turnReplyContexts?: Record<string, {
+      target?: unknown;
+      replyTargetSenderOpenId?: string;
+      crossChatOrigin?: InboundMessageLocation['crossChatOrigin'];
+    }>;
+    replyTargets?: Record<string, {
+      senderOpenId?: string;
+      crossChatOrigin?: InboundMessageLocation['crossChatOrigin'];
+    }>;
+  };
+  originSessionId: string | undefined;
+  originDispatchAttempt: number | undefined;
+  /** Absorbed turn IDs already observed on the PID marker BEFORE this send
+   *  invoked Lark HTTP. Prevents a TOCTOU swallow of messages absorbed while
+   *  the final send was in flight. */
+  preSendAbsorbedTurnIds: ReadonlySet<string>;
+  actualDeliveredTarget: SessionReplyTarget | undefined;
+  privateReply: boolean;
+  replyTargetSenderOpenId: string | undefined;
+  explicitReplyTo: string | undefined;
+  routingOverride: boolean;
+  excludedSendKind: boolean;
+  crossPrincipalInterruption: boolean;
+}
+
+/** Fail-closed send/session gate for settling a Claude mid-turn absorbed
+ *  queued turn alongside its host turn's final send. Relies purely on
+ *  structural transcript/destination/principal evidence (never message content). */
+export function buildAbsorbedTurnSettlementGate(
+  ctx: AbsorbedTurnSettlementContext,
+): (turn: QueuedTypeAheadTurn, marker: AncestorSessionContext) => boolean {
+  const sendEligible = ctx.originSessionId === ctx.session.sessionId
+    && ctx.originDispatchAttempt === undefined
+    && !ctx.routingOverride
+    && !ctx.excludedSendKind
+    && ctx.preSendAbsorbedTurnIds.size > 0;
+  return (turn, marker) => {
+    if (!sendEligible) return false;
+    if (!ctx.preSendAbsorbedTurnIds.has(turn.turnId)) return false;
+    if (ctx.explicitReplyTo !== undefined && turn.turnId !== ctx.explicitReplyTo) return false;
+    const turnCtx = ctx.session.turnReplyContexts?.[turn.turnId];
+    const turnTarget = ctx.session.replyTargets?.[turn.turnId];
+    if (turnCtx?.crossChatOrigin || turnTarget?.crossChatOrigin) return false;
+    if (ctx.privateReply) {
+      const bSender = turnTarget?.senderOpenId
+        ?? turnCtx?.replyTargetSenderOpenId
+        ?? turn.trustedCaller?.requestUserOpenId;
+      if (!bSender || !ctx.replyTargetSenderOpenId || bSender !== ctx.replyTargetSenderOpenId) {
+        return false;
+      }
+    }
+    if (ctx.session.scope !== 'thread') {
+      const bTarget = parseReplyMessageTarget(turnCtx?.target);
+      if (!ctx.actualDeliveredTarget || !bTarget) return false;
+      if (replyTargetKey(bTarget) !== replyTargetKey(ctx.actualDeliveredTarget)) return false;
+    }
+    if (ctx.crossPrincipalInterruption
+      && !compatibleAuthorityPrincipal(marker.trustedCaller, turn.trustedCaller)) {
+      return false;
+    }
+    return true;
+  };
 }
 
 export interface InboundMessageLocation {

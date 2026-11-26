@@ -1,7 +1,13 @@
 #!/usr/bin/env node
 import { scheduleCreatePlacement, scheduleSupportLines } from './core/schedule-followup.js';
 import { replyDeliveryFromEnv, sendCompletionHintKey } from './services/send-completion-hint.js';
-import { selectReplyMessageId, parseReplyMessageTarget, crossChatOriginForSend, crossChatSenderForSend } from './core/reply-message.js';
+import {
+  buildAbsorbedTurnSettlementGate,
+  selectReplyMessageId,
+  parseReplyMessageTarget,
+  crossChatOriginForSend,
+  crossChatSenderForSend,
+} from './core/reply-message.js';
 import { assertMessageTopicAvailable, assertSendTopicsAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from './cli/topic-send-guard.js';
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
 import { isMessageListenerTaskAnchor, isSilentMessageListenerSession, messageListenerSendBlocked } from './core/message-listener-silence.js';
@@ -66,6 +72,7 @@ import {
   findAncestorSessionMarkerContext as findLiveAncestorSessionContext,
   findAuthenticatedAncestorSessionContext,
   resolveSessionContext,
+  selectAbsorbedTurnsToSettle,
 } from './core/session-marker.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import {
@@ -12889,6 +12896,7 @@ async function cmdSend(
   assertSessionTransportOrExit({ chatId: s.chatId, larkAppId: s.larkAppId }, 'send');
   let deferredMaterializedByThisCommand = false;
   let deferredTopicRootMessageIdForOutput: string | undefined;
+  let privateReplyDeliveredRecipient: string | undefined;
 
   const turnSendLedger = new TurnSendLedger(resolveDataDir());
   while (!scheduleRemoveSelfRequested
@@ -12902,7 +12910,18 @@ async function cmdSend(
     };
     const activePrior = turnSendLedger.read(activeMarkerKey);
     if (activePrior?.final) {
-      const advResult = advanceAncestorSessionTurn(sendDataDir, liveMarkerCtx.markerPid, liveMarkerCtx.turnId);
+      const priorSettled = activePrior.final.settledAbsorbedTurnIds;
+      const advResult = advanceAncestorSessionTurn(
+        sendDataDir,
+        liveMarkerCtx.markerPid,
+        liveMarkerCtx.turnId,
+        priorSettled && priorSettled.length > 0
+          ? {
+              consumedDispatchAttempt: liveMarkerCtx.dispatchAttempt,
+              canSettleAbsorbed: turn => priorSettled.includes(turn.turnId),
+            }
+          : undefined,
+      );
       if (advResult.advanced && advResult.turnId) {
         liveMarkerCtx = findLiveAncestorSessionContext(sendDataDir);
         originTurnId = advResult.turnId;
@@ -12910,9 +12929,27 @@ async function cmdSend(
         originDispatchAttempt = liveMarkerCtx?.dispatchAttempt;
         continue;
       }
+      if (advResult.settledAbsorbedTurnIds && advResult.settledAbsorbedTurnIds.length > 0) {
+        liveMarkerCtx = findLiveAncestorSessionContext(sendDataDir);
+        break;
+      }
     }
     break;
   }
+  // Snapshot mid-turn absorbed queued turns BEFORE any provider I/O so a
+  // follow-up arriving/absorbed while Lark HTTP is in flight can never be
+  // silently settled by a final formulated before it existed.
+  const preSendHostTurnId = originTurnId ?? currentTurnId;
+  const preSendAbsorbedTurnIds = new Set(
+    (liveMarkerCtx?.queuedTurns ?? [])
+      .filter(q =>
+        q.inputConsumed === true
+        && !!preSendHostTurnId
+        && q.absorbedIntoTurnId === preSendHostTurnId
+        && q.absorbedIntoDispatchAttempt === originDispatchAttempt
+        && q.dispatchAttempt === undefined)
+      .map(q => q.turnId),
+  );
 
   const scheduleCleanupPlan = planScheduleFinalCleanup({
     requested: scheduleRemoveSelfRequested,
@@ -13905,6 +13942,38 @@ async function cmdSend(
       targetRootMessageId: sendInto, followThreadEpoch: (originSession ?? s).followThreadEpoch,
     });
   };
+  let resolveActualDeliveredTargetForLedger: (() => ReturnType<typeof resolveSendTarget> | undefined) | undefined;
+  const absorbedSettlementGateForTarget = (
+    actualDeliveredTarget: ReturnType<typeof resolveSendTarget> | undefined,
+  ) => buildAbsorbedTurnSettlementGate({
+    session: s,
+    originSessionId,
+    originDispatchAttempt,
+    preSendAbsorbedTurnIds,
+    actualDeliveredTarget,
+    privateReply: privateReplyDeliveredRecipient !== undefined,
+    replyTargetSenderOpenId: privateReplyDeliveredRecipient ?? replyTargetSenderOpenId,
+    explicitReplyTo,
+    routingOverride: sendTopLevel || !!overrideChatId || !!sendInto || explicitQuote !== undefined,
+    excludedSendKind: !!vcMeetingManagedSendOrigin
+      || isOriginDocCommentTurn
+      || isSlashSend
+      || !!scheduleRemoveSelfTaskId
+      || !!scheduledOriginRun,
+    crossPrincipalInterruption: config.crossPrincipalInterruption === true,
+  });
+  const absorbedSettlementAdvanceOpts = (
+    actualDeliveredTarget: ReturnType<typeof resolveSendTarget> | undefined,
+  ) => ({
+    consumedDispatchAttempt: originDispatchAttempt,
+    canSettleAbsorbed: absorbedSettlementGateForTarget(actualDeliveredTarget),
+  });
+  const resolveSettledAbsorbedTurnIdsForLedger = (): string[] | undefined => {
+    if (effectiveResponseKind !== 'final' || !liveMarkerCtx || !resolveActualDeliveredTargetForLedger) return undefined;
+    const gate = absorbedSettlementGateForTarget(resolveActualDeliveredTargetForLedger());
+    const { settled } = selectAbsorbedTurnsToSettle(liveMarkerCtx, originTurnId ?? currentTurnId, gate);
+    return settled.length > 0 ? settled.map(entry => entry.turnId) : undefined;
+  };
   const executeTurnPrimary = async (
     renderedContent: string,
     dispatch: (providerUuid?: string) => Promise<string>,
@@ -13912,6 +13981,7 @@ async function cmdSend(
     return turnSendKey
       ? turnSendLedger.execute(turnSendKey, effectiveResponseKind, renderedContent, dispatch, {
           beforeDispatch: persistOffBeforeProvider,
+          resolveSettledAbsorbedTurnIds: resolveSettledAbsorbedTurnIdsForLedger,
           ...(scheduledSendAttempt ? { noSideEffect: (error: unknown) =>
             !scheduledProviderEffectStarted && knownPreProviderRejections.has(error) } : {}),
         })
@@ -14061,12 +14131,28 @@ async function cmdSend(
     const { rmSync } = await import('node:fs');
     const targetChatId = overrideChatId ?? s.chatId;
     let voicePrimaryOutputChatId = targetChatId;
+    let voiceActualDeliveredTarget = !sendInto && !sendTopLevel && !overrideChatId && frozenTurnReplyTarget
+      ? frozenTurnReplyTarget
+      : resolveSendTarget({
+          into: sendInto,
+          topLevel: sendTopLevel,
+          chatScope: s.scope === 'chat',
+          chatId: targetChatId,
+          rootMessageId: s.rootMessageId,
+          replyTargetRootId: turnReplyTarget?.rootMessageId,
+          replyTargetTurnId: turnReplyTarget?.turnId,
+          replyTargetQuoteOnly: turnReplyTarget?.quoteOnly,
+          currentTurnId,
+        });
     let dir: string | undefined;
     let voiceDurationMs: number | undefined;
     try {
       // Attribute the send to its start, not a delayed synthesis/provider ACK
       // that may arrive after another input was folded into the native turn.
       const sentAtMs = Date.now();
+      resolveActualDeliveredTargetForLedger = () => deferredTopicRootMessageIdForOutput
+        ? { mode: 'thread', rootMessageId: deferredTopicRootMessageIdForOutput }
+        : voiceActualDeliveredTarget;
       const voiceDelivery = await executeTurnPrimary(turnRequestIdentity, async providerUuid => {
         await revalidateIsolatedOriginBeforeEffect();
         const out = await synthesizeVoiceOpus(appId, content, {
@@ -14102,10 +14188,14 @@ async function cmdSend(
           const managedProviderOptions = outboundMessageOptions(!!prepared);
           const deliveryUuid = prepared?.providerKey ?? providerUuid;
           await revalidateIsolatedOriginBeforeEffect();
+          const privateDeliveryTargetOpenId = pickTurnReplyTarget(s, currentTurnId)?.senderOpenId;
           const privateMessageId = !sendInto && !overrideChatId
             ? await sendPrivateReply(s, currentTurnId, canonicalOutput.content, canonicalOutput.msgType, deliveryUuid,
                 { beforeWrite: fenceScheduledProviderWrite })
             : undefined;
+          if (privateMessageId !== undefined) {
+            privateReplyDeliveredRecipient = privateDeliveryTargetOpenId ?? '';
+          }
           const deferred = privateMessageId !== undefined
             ? { handled: true, messageId: privateMessageId, materializedNow: false, rootMessageId: undefined }
             : !sendInto && (!overrideChatId || overrideChatId === s.chatId)
@@ -14151,6 +14241,7 @@ async function cmdSend(
                   replyTargetQuoteOnly: turnReplyTarget?.quoteOnly,
                   currentTurnId,
                 });
+            voiceActualDeliveredTarget = canonicalTarget;
             await revalidateIsolatedOrigin();
             deliveredMessageId = canonicalTarget.mode === 'plain'
               ? await sendMessage(
@@ -14217,11 +14308,16 @@ async function cmdSend(
           });
         } catch { /* best-effort：漏记只多一条兜底，不致命 */ }
       }
-      if (effectiveResponseKind === 'final' && liveMarkerCtx?.markerPid) {
+      if (!voiceDelivery.replayed && effectiveResponseKind === 'final' && liveMarkerCtx?.markerPid) {
         advanceAncestorSessionTurn(
           sendDataDir,
           liveMarkerCtx.markerPid,
           originTurnId ?? currentTurnId,
+          absorbedSettlementAdvanceOpts(
+            deferredTopicRootMessageIdForOutput
+              ? { mode: 'thread', rootMessageId: deferredTopicRootMessageIdForOutput }
+              : voiceActualDeliveredTarget,
+          ),
         );
       }
       console.error(voiceDelivery.replayed
@@ -14688,6 +14784,9 @@ async function cmdSend(
   const sendTarget = !sendInto && !sendTopLevel && !overrideChatId && frozenTurnReplyTarget
     ? frozenTurnReplyTarget
     : resolveSendTarget({ into: sendInto, topLevel: sendTopLevel, chatScope: isChatScope, chatId: targetChatId, rootMessageId: s.rootMessageId, replyTargetRootId: turnReplyTarget?.rootMessageId, replyTargetTurnId: turnReplyTarget?.turnId, replyTargetQuoteOnly: turnReplyTarget?.quoteOnly, currentTurnId });
+  resolveActualDeliveredTargetForLedger = () => deferredTopicRootMessageIdForOutput
+    ? { mode: 'thread', rootMessageId: deferredTopicRootMessageIdForOutput }
+    : sendTarget;
 
   let completionProposalRecord: CompletionProposalRecord | undefined;
   let completionProposalStore: ReturnType<typeof createCompletionProposalStore> | undefined;
@@ -14817,9 +14916,13 @@ async function cmdSend(
     // exact durable attempt/member instead of inheriting the early cmd gate.
     revalidateVcMeetingManagedSend();
     if (!sendInto && !overrideChatId) {
+      const privateDeliveryTargetOpenId = pickTurnReplyTarget(s, currentTurnId)?.senderOpenId;
       const privateMessageId = await sendPrivateReply(s, currentTurnId, content, msgType, uuid,
         { beforeWrite: fenceScheduledProviderWrite });
-      if (privateMessageId !== undefined) return privateMessageId;
+      if (privateMessageId !== undefined) {
+        privateReplyDeliveredRecipient = privateDeliveryTargetOpenId ?? '';
+        return privateMessageId;
+      }
     }
     if (!sendInto && (!overrideChatId || overrideChatId === s.chatId)) {
       const deferred = await dispatchDeferredTopicSend({
@@ -14972,6 +15075,7 @@ async function cmdSend(
     || !!(originTurnId ?? currentTurnId)
     || crossChatFollowThread !== undefined;
   let unifiedReplyUsed = false;
+  let replyCardDeliveredTarget: ReturnType<typeof resolveSendTarget> | undefined;
 
   // Quote chain (普通群): the primary message replies to the turn's target so
   // Lark renders a 引用 chain. --quote overrides, --no-quote opts out. Thread
@@ -15712,6 +15816,7 @@ async function cmdSend(
         if (replyRecord.chatId !== targetChatId) throw new Error('Reply-card destination changed; send refused');
         let delivered: Awaited<ReturnType<typeof replyStore.update>> | undefined;
         let undeliveredProgressHint = '进度已保存到本轮记录；请用 botmux send --response-kind final 发送完整答复。';
+        resolveActualDeliveredTargetForLedger = () => replyCardDeliveredTarget;
         const replyDelivery = await executeTurnPrimary(turnRequestIdentity, async providerUuid => {
           delivered = await replyStore.update(replyKey, effectiveResponseKind === 'final'
             ? { kind: 'final', text, card: replyCardJson, source: 'explicit',
@@ -15731,6 +15836,9 @@ async function cmdSend(
               await revalidateIsolatedOriginBeforeEffect();
               return readiness?.nativeThinkingVisible === true;
             },
+            deliveredTarget: () => deferredTopicRootMessageIdForOutput
+              ? { mode: 'thread', rootMessageId: deferredTopicRootMessageIdForOutput }
+              : sendTarget,
             send: (body, uuid) => dispatchPrimaryUnlocked(body, 'interactive', undefined, completionProposalRecord ? completionProposalCardDispatchUuid(completionProposalRecord) : (uuid ?? providerUuid)),
             patch: (id, body) => patchPublishedGroupCard(appId, targetChatId, id, body, replyRecord.rootId,
               effectiveResponseKind === 'final' ? groupContextAuthorOrigin : undefined,
@@ -15754,6 +15862,8 @@ async function cmdSend(
               return dispatchAfterOriginGate(JSON.stringify({ file_key: fileKey }), 'file', uuid);
             },
           });
+          replyCardDeliveredTarget = delivered.record.deliveredTarget
+            ?? parseReplyMessageTarget(s.turnReplyContexts?.[currentTurnId ?? '']?.target);
           if (!delivered.messageId && delivered.record.nativeCot && delivered.record.nativeCotVisible) {
             // Progress is expected here; asking for a final would push the
             // model to lock the turn early with an interim note.
@@ -15963,10 +16073,16 @@ async function cmdSend(
     if (effectiveResponseKind === 'final'
       && (!scheduleRemoveSelfTaskId || scheduleSelfCleanup?.removed === true)
       && liveMarkerCtx?.markerPid) {
+      const actualDeliveredTarget = unifiedReplyUsed
+        ? replyCardDeliveredTarget
+        : deferredTopicRootMessageIdForOutput
+          ? { mode: 'thread' as const, rootMessageId: deferredTopicRootMessageIdForOutput }
+          : sendTarget;
       const advResult = advanceAncestorSessionTurn(
         sendDataDir,
         liveMarkerCtx.markerPid,
         originTurnId ?? currentTurnId,
+        absorbedSettlementAdvanceOpts(actualDeliveredTarget),
       );
       if (advResult.advanced) {
         advancedNextTurnId = advResult.turnId;

@@ -1505,14 +1505,14 @@ export const messages: Record<string, string> = {
   // <identity>，附件/卡片/跨群等用法留在内置 botmux-send skill 按需查阅，见 shared-hints.ts）。
   'ai.routing.intro_transcript': '你在飞书（Lark）会话中。用户看不到终端输出；你的最终 assistant message 会由 botmux 自动转发回飞书，直接作答即可。',
   'ai.send.after_success_hint': '最终答复已成功发送。若原任务已完成或已交代具体阻碍，可让终端最终回复只输出 BOTMUX_NOTHING_TO_SEND，勿重复发送；后续补充使用 botmux send --response-kind auxiliary。',
-  'ai.send.after_success_steer_advanced': '本次发送已完成。会话已自动切换至下一排队轮次；请针对新消息使用 `botmux send --response-kind final` 发送完整答复（若无需回复则输出 BOTMUX_NOTHING_TO_SEND）。',
+  'ai.send.after_success_steer_advanced': '本次发送已完成。会话已自动切换至下一排队轮次；若新消息在其目标位置尚未获答复，请使用 `botmux send --response-kind final` 发送完整答复；若刚才在同一位置发出的回复已完整覆盖且无需另复，请直接输出 BOTMUX_NOTHING_TO_SEND，勿重复发送。',
   // 本轮发送走统一回复卡片（unified reply）时的成功回显——此时内容已进卡片，
   // 提示模型完成时用 --response-kind final 发完整答复。
   'ai.send.after_success_progress': '进度消息已发送（未标记 final）。若这条已是对原请求的完整答复，直接让最终回复只输出 BOTMUX_NOTHING_TO_SEND，不要再发总结或重复内容；若只是确认、阶段进度或任务尚未完成，继续原任务，完成或受阻时用 botmux send --response-kind final 交付结果或具体阻碍。',
   'ai.send.after_success_auxiliary': '补充消息已发送。请核对原任务的最终答复是否已成功交付；补充消息本身不证明原任务完成，已交付的内容不要重复发送。',
   // replyDelivery=transcript（自动转发最终回复）仅在排队轮次自动推进时给出事实通知；
   // 普通 botmux send 成功只打印基础回执，不附加额外劝说（见 send-completion-hint.ts）。
-  'ai.send.after_success_steer_advanced_transcript': '本次发送已完成。会话已自动切换至下一排队轮次，请继续处理新消息（若无需回复则只输出 BOTMUX_NOTHING_TO_SEND）。',
+  'ai.send.after_success_steer_advanced_transcript': '本次发送已完成。会话已自动切换至下一排队轮次；若新消息尚未处理请继续，若刚才的回复已完整覆盖且无需另复则只输出 BOTMUX_NOTHING_TO_SEND。',
   'ai.send.after_success_unified': '进度已更新到本轮卡片。完成时请用 botmux send --response-kind final 发送完整答复。',
   'ai.routing.xpi_as_hint': 'XPI 已开启：向其他 Bot 发送普通文本时必须预先声明处理方式。马上单独做用 `botmux send --as independent`；留给当前任务、等对方确认用 `--as suggestion`。',
   'ai.shell.xpi_as_hint': 'XPI 已开启：向其他 Bot 发送普通文本必须携带处理方式。马上单独做：`botmux send --as independent`；留给当前任务：`botmux send --as suggestion`。',
