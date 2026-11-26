@@ -88,7 +88,13 @@ function contextFor(input: LocalAddressContext): Context {
   const roots = (input.workspaceRoots ?? [process.cwd()]).map(root => root.replace(/\\/g, '/').replace(/\/+$/, ''));
   const hostPaths = [...roots, homedir()].filter(root => root && root !== '/').map(escaped);
   const hostNames = ['0.0.0.0', '::', '::1', ...hosts].filter(host => isIP(host))
-    .map(host => host.includes(':') ? '(?:\\[' + escaped(host) + '\\]|' + escaped(host) + ')' : escaped(host));
+    .map(host => {
+      // Bare :: is also a code operator. A bare ::1 can name loopback, but
+      // starting in the middle of a colon run would turn field:::1 into an address.
+      if (host === '::') return '\\[::\\]';
+      if (host === '::1') return '(?:\\[::1\\]|(?<!:)::1)';
+      return host.includes(':') ? '(?:\\[' + escaped(host) + '\\]|' + escaped(host) + ')' : escaped(host);
+    });
   const mappedLoopback = '::ffff:(?:127(?:\\.\\d{1,3}){3}|7f[0-9a-f]{2}:[0-9a-f]{1,4})';
   hostNames.push('(?:\\[' + mappedLoopback + '\\]|' + mappedLoopback + ')');
   // Machine names are often ordinary words (ubuntu, master, devbox). In prose
@@ -228,6 +234,17 @@ function scrubLinks(input: string, ctx: Context): string {
       }
       const normalized = md.utils.normalizeReference(reference);
       if (localDefinitions.has(normalized)) {
+        // A line like "[::]:8080/health" is also a Markdown reference definition.
+        // Match the whole endpoint before link rewriting strips its brackets.
+        if (input[labelEnd + 1] === ':' && isIP(label) === 6) {
+          const hostAt = new RegExp(ctx.hostNames, 'iyu');
+          hostAt.lastIndex = start;
+          if (hostAt.test(input)) {
+            replacements.push({ start, end: hostAt.lastIndex, text: ctx.internalFile });
+            start = hostAt.lastIndex - 1;
+            continue;
+          }
+        }
         target = env.references![normalized]!.href;
         end = pos;
       }

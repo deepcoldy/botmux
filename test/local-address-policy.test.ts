@@ -105,6 +105,40 @@ describe('local address presentation policy', () => {
       expect(output).not.toContain('::ffff:');
     });
 
+  it.each([
+    'route = rpc|example.service:staging:::|lookup|',
+    'f :: Int -> Int', '1 :: xs', 'Use `::` as scope separator', 'IPv6 default route ::/0',
+    'foo:::1', 'bar::1', 'a:::b', '2001:db8::1', 'example.service::lookup',
+  ])('preserves non-address colon syntax in prose: %s', text => {
+    expect(sanitizeLocalAddressText(text, { localHosts: ['::', '::1'] })).toBe(text);
+  });
+
+  it.each([
+    ['listen on [::] port 8080', 'listen on [F] port 8080'],
+    ['[::]:8080/health', '[F]'],
+    ['address:[::]:8080/health', 'address:[F]'],
+    ['http://[::]:3000/api', '[F]'], ['http://[::]/', '[F]'], ['ws://[::]:8080', '[F]'],
+    ['ping ::1 now', 'ping [F] now'], ['connect to ::1:8080/api', 'connect to [F]'],
+    ['[::1]:8080/api', '[F]'], ['::ffff:127.0.0.1:8080', '[F]'], ['[::ffff:127.0.0.1]:8080', '[F]'],
+    ['address:::ffff:7f00:1', 'address:[F]'],
+  ])('replaces the complete local IPv6 address in %s', (text, expected) => {
+    expect(sanitizeLocalAddressText(text, { internalFileLabel: '[F]' })).toBe(expected);
+  });
+
+  it('scrubs both a Markdown reference and its local IPv6 endpoint definition', () => {
+    const text = 'See [status][::]\n\n[::]:8080/health\nNext line';
+    expect(sanitizeLocalAddressText(text, { internalFileLabel: '[F]', unavailableLinkLabel: ' [blocked]' }))
+      .toBe('See status [blocked]\n\n[F]\nNext line');
+  });
+
+  it('preserves colon-delimited fields alongside local addresses in a fenced card', () => {
+    const card = (content: string) => JSON.stringify({ body: { elements: [{ tag: 'markdown', content }] } });
+    const header = '```text\nroute = rpc|example.service:staging:::|lookup|\n';
+    const input = card(header + '/home/alice/result.txt http://[::]:3000/api\n```');
+    expect(prepareLocalAddressContent(input, 'interactive', { internalFileLabel: '[F]' }))
+      .toBe(card(header + '[F] [F]\n```'));
+  });
+
   it('handles local service addresses after ASCII punctuation and across network protocols', () => {
     expect(sanitizeLocalAddressText('地址:localhost:3000/report')).not.toContain('localhost');
     expect(sanitizeLocalAddressText('ws://[::1]:3000/report')).not.toContain('::1');
