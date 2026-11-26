@@ -278,6 +278,7 @@ import { installStdioEpipeGuard, isIgnorableStreamError } from './utils/stdio-ep
 import { resolveDarwinCodexCaBundle } from './utils/darwin-ca-bundle.js';
 import {
   handoffQueuedDurableInputsOnBackendExit,
+  dropNoReplayPendingInputsOnBackendExit,
   inputForcesSerialTurn,
   mergeQueuedCliInput,
   pendingInputMayFlush,
@@ -6939,9 +6940,9 @@ function settleSessionRename(source: 'prompt' | 'timer'): void {
   if (source === 'timer' && !recorded && recoverUnconfirmedSessionRename(surface)) return;
   if (source === 'timer' && lastInitConfig?.cliId === 'traex' && surface === 'settled'
     && holdExpired && !recorded && !sessionRenameRecoveryPermanentlyUnavailable()) {
-    // Recovery exists for this runtime but is transiently unavailable (for
-    // example its exact live thread is still ambiguous). Keep the empty composer
-    // held with an accurate notice rather than claiming a visible draft/dialog.
+    // Recovery exists for this runtime and exact thread, but a transient
+    // restart/write fence currently prevents it. Keep the empty composer held
+    // with an accurate notice rather than claiming a visible draft/dialog.
     if (!sessionRenameHoldTimeoutLogged) {
       sessionRenameHoldTimeoutLogged = true;
       log(`WARN Native session rename recovery remains temporarily unavailable after ${recoveryAfterMs}ms; queued input stays held`);
@@ -6958,16 +6959,14 @@ function settleSessionRename(source: 'prompt' | 'timer'): void {
     forceClearSessionRenameInFlight();
     const evidence = surface === undefined ? 'unjudged' : 'recorded by the CLI';
     if (source === 'prompt') {
-      if (held || timedOut) log(timedOut
-        ? `WARN Native session rename confirmation exceeded ${SESSION_RENAME_HOLD_TIMEOUT_MS}ms; releasing queued input without a receipt (${surface}); normal delivery gates remain in force`
-        : `Native session rename confirmed (${evidence}); releasing queued input`);
+      if (held) log(`Native session rename confirmed (${evidence}); releasing queued input`);
       return;
     }
     // Restore only through the native-veto-aware path: a static empty composer
     // must not manufacture readiness over OSC-7501 approvals or held busy turns.
     restoreSessionRenameReadiness(surface, { preserveReattachGate });
     log(timedOut
-      ? `WARN Native session rename confirmation exceeded ${SESSION_RENAME_HOLD_TIMEOUT_MS}ms; releasing queued input without a receipt (${surface}); normal delivery gates remain in force`
+      ? `WARN Native session rename confirmation exceeded ${recoveryAfterMs}ms; releasing queued input without a receipt (${surface}); normal delivery gates remain in force`
       : surface === undefined
         ? `Native session rename idle timeout after ${SESSION_RENAME_IDLE_TIMEOUT_MS}ms; releasing queued input`
         : `Native session rename confirmed (${evidence}); releasing queued input`);
@@ -7009,6 +7008,7 @@ function settleSessionRename(source: 'prompt' | 'timer'): void {
  * consume the newly-ready prompt. A quiet screen still holding the command
  * is a prompt too, so an adapter that judges its composer must agree. */
 function settleSessionRenameOnPrompt(): void {
+  if (isPromptReady && !reattachOpenTurnGate) sessionRenamePreserveReattachReadiness = false;
   settleSessionRename('prompt');
 }
 
@@ -7101,7 +7101,7 @@ function recoverSessionRenameAfterPersistentReattach(): boolean {
   }
   // Preserve this provenance beyond the first surface read. A recovered draft
   // may be cleared by a human before the ordinary rename timer releases it.
-  sessionRenamePreserveReattachReadiness = true;
+  sessionRenamePreserveReattachReadiness = reattachOpenTurnGate || !isPromptReady;
   const surface = sessionRenameSurfaceNow();
   if (surface === 'unknown') {
     sessionRenameCommand = undefined;
@@ -29232,6 +29232,15 @@ async function flushPending(): Promise<void> {
   if (recoverSessionRenameAfterPersistentReattach()) return;
   if (resetTraexAutoModelBeforePendingTurn()) return;
   if (sessionRenameInFlight()) return;  // wait for /rename to finish before any user input
+  // Dedicated interaction owners run BEFORE the generic dialog/draft fallback:
+  // Hook-review must retain its actionable stuck card, and a startup trust page
+  // must retain its structured cli_startup_blocked event. The generic text hold
+  // is only for surfaces those richer paths did not claim.
+  if (hookReviewHoldsQueuedWrite()) return;
+  if (probeStartupBlocker('Flush')) {
+    log(`Holding ${pendingMessages.length} pending message(s) behind a startup dialog`);
+    return;
+  }
   const codexDirectWriteNeedsHardGuard = lastInitConfig?.cliId === 'codex'
     && (!backend.captureInputState || lastInitConfig.adoptMode === true
       || pendingSessionRename !== null || pendingRawInputs.length > 0 || pendingAdoptMessages.length > 0);
@@ -29251,10 +29260,6 @@ async function flushPending(): Promise<void> {
   // flushPendingInjections 消费完 barrier 后由其 finally 的 re-kick 排空。
   if (shouldDeferUserFlush(pendingInjections)) return;
   if (bareShellLaunchBlocked) return;  // launch is held at a bare shell — don't type prompts into it
-  // A Hook-review page has an active selection and consumes Enter/arrow keys.
-  // Re-check the screen right before a literal write; PTY chunks can arrive
-  // between idle detection and this queue drain.
-  if (hookReviewHoldsQueuedWrite()) return;
   // Screen-idle is not a durable receipt. A permission/AskUser prompt can look
   // idle while the logical delivery is unresolved, so no following IM or
   // meeting turn may cross this boundary until an explicit terminal releases
@@ -29268,13 +29273,6 @@ async function flushPending(): Promise<void> {
   // teardown retires the owner.
   if (rpcLifecycleFailClosedOwners.size > 0) {
     log(`Holding pending input behind ${rpcLifecycleFailClosedOwners.size} unresolved Codex RPC delivery owner(s)`);
-    return;
-  }
-  // Never type into a recognized startup dialog: the text is swallowed and its
-  // Enter picks an option for the user. The ready-gate fallback settle and
-  // type-ahead adapters reach this write without a prompt-ready edge.
-  if (probeStartupBlocker('Flush')) {
-    log(`Holding ${pendingMessages.length} pending message(s) behind a startup dialog`);
     return;
   }
   // Ready-gate: hold the FIRST prompt until the SessionStart hook fires a true-
@@ -29822,6 +29820,7 @@ async function flushPending(): Promise<void> {
         && cliAdapter === writeAdapter
         && codexRpcEngine === writeRpcEngine
         && !cliRestartInProgress
+        && !closeRequested
       );
       const durableWrite = item.dispatchAttempt !== undefined;
       const msg = item.content;
@@ -30361,6 +30360,14 @@ async function flushPending(): Promise<void> {
           recoveryFailureReason = transaction.recoveryFailureReason;
         } else {
           submissionBackend = writeBackend;
+          if (writeAdapter.writeInputDefersPreparation === true && !pendingMessages.includes(item)) {
+            // Keep the exact item under the ordinary pending lifecycle until its
+            // asynchronous precheck reaches beforeSubmit. backend.onExit,
+            // startup-circuit stop, killCli and durable expiry can then retire or
+            // preserve it through their existing queue paths instead of losing
+            // ownership and resurrecting it later.
+            pendingMessages.unshift(item);
+          }
           const transaction = await runAmbiguousSubmissionTransaction(
             writeBackend,
             () => writeAdapter.writeInput(
@@ -30374,11 +30381,23 @@ async function flushPending(): Promise<void> {
                   // generation. Refuse before committing ANY global turn state
                   // or pasting into the backend that is already being replaced.
                   if (!writeContinuationIsCurrent()) return false;
+                  // A lifecycle path may have retired this exact pending item
+                  // during the awaited precheck (durable handoff/expiry,
+                  // noReplay drop, startup failure or a non-preserving kill).
+                  // Missing ownership is a veto, never a reason to recreate it.
+                  const pendingIndex = pendingMessages.indexOf(item);
+                  if (pendingIndex < 0) return false;
                   // The precheck may also have waited through a prompt-ready
                   // edge. Re-open the write cycle immediately before actual paste
                   // so composerOwned/readiness cannot describe that stale window.
                   beginCliWriteCycle();
                   prepareNormalWrite();
+                  // Commit queue ownership only AFTER preparation succeeds. A
+                  // dirty Web wire (or any other preparation throw) leaves the
+                  // exact item in its original queue instead of losing it.
+                  const committedIndex = pendingMessages.indexOf(item);
+                  if (committedIndex < 0) return false;
+                  pendingMessages.splice(committedIndex, 1);
                   return true;
                 } } : {}),
                 onInputPrepared: content => { submittedText = content; },
@@ -30402,11 +30421,13 @@ async function flushPending(): Promise<void> {
         if (!writeContinuationIsCurrent() && typedIntoComposer
           && result?.submissionDisposition === 'untouched' && !normalWritePrepared) {
           // The adapter vetoed before beforeSubmit, so onWrite/carryover never
-          // owned this item either. Restore the exact FIFO head instead of
-          // emitting an ambiguous terminal: ordinary input and queued activation
-          // must both survive a generation change with zero bytes written.
-          pendingMessages.unshift(item);
-          log(`Restored untouched pre-write input after CLI generation replacement (${item.content.length} chars)`);
+          // owned this item either. Deferred-precheck items stayed in the pending
+          // lifecycle throughout; whatever queue/handoff decision their exit path
+          // made is authoritative. Never unshift a retired item back into existence.
+          if (writeAdapter.writeInputDefersPreparation !== true && !pendingMessages.includes(item)) {
+            pendingMessages.unshift(item);
+          }
+          log(`Settled untouched pre-write input after CLI generation replacement (${item.content.length} chars)`);
           break;
         }
         if (!writeContinuationIsCurrent()) {
@@ -30426,7 +30447,9 @@ async function flushPending(): Promise<void> {
       } catch (err: any) {
         if ((webWireWriteRefused || (err instanceof SubmissionWriteError && !err.submissionStarted
           && webTerminalInputWireDirty())) && !tracksCodexAppLiveness && writeContinuationIsCurrent()) {
-          pendingMessages.unshift(item);
+          if (writeAdapter.writeInputDefersPreparation !== true && !pendingMessages.includes(item)) {
+            pendingMessages.unshift(item);
+          }
           requeueUnsubmittedQueuedActivation(item);
           keepPromptReadyAfterHold();
           log('Retained definitely-unwritten input behind the dirty Web terminal wire');
@@ -30627,7 +30650,9 @@ async function flushPending(): Promise<void> {
           // original durable attempt (and ordinary IM content) queued, but do
           // not hammer the same sticky journal or burn receiver retry budget.
           // A user /restart installs a fresh backend and releases the hold.
-          pendingMessages.unshift(item);
+          if (writeAdapter.writeInputDefersPreparation !== true && !pendingMessages.includes(item)) {
+            pendingMessages.unshift(item);
+          }
           ambiguousSubmissionRecoveryHold = {
             backend: submissionBackend,
             item,
@@ -30814,7 +30839,9 @@ async function flushPending(): Promise<void> {
           // item has no durable turn, bridge mark, type-ahead or activation side
           // effects to roll back. Restore only the FIFO head. In particular a
           // queued activation stays queued: never ACK an unwritten activation.
-          pendingMessages.unshift(item);
+          if (writeAdapter.writeInputDefersPreparation !== true && !pendingMessages.includes(item)) {
+            pendingMessages.unshift(item);
+          }
           openingInputBoxSettled = false;
           keepPromptReadyAfterHold();
           holdNativeInputForHardBlock(result.failureReason ?? 'Codex input is not ready');
@@ -39923,15 +39950,11 @@ async function spawnCliBody(
     if (stashed > 0) {
       log(`CLI exited with ${stashed} in-flight message(s); will re-queue after restart`);
     }
-    const dropPendingOnExit = (item: PendingCliInput): boolean =>
-      item.noReplay === true && !(intentionalRestart && item.traexAutoModelRecovery);
-    const droppedPending = pendingMessages.filter(dropPendingOnExit).length;
+    const droppedPendingItems = dropNoReplayPendingInputsOnBackendExit(pendingMessages, { intentionalRestart });
+    const droppedPending = droppedPendingItems.length;
     if (droppedPending > 0) {
       // Remove ONLY the no-replay items still queued (never written); keep any
       // ordinary follow-up input for the restart's normal flush.
-      for (let i = pendingMessages.length - 1; i >= 0; i--) {
-        if (dropPendingOnExit(pendingMessages[i])) pendingMessages.splice(i, 1);
-      }
       log(`Dropped ${droppedPending} at-most-once pending message(s) on CLI exit (no replay)`);
       // The CLI is gone: a cut its rewind made can be put back right away.
       settleFailedTurnRewindOffQueue('dropped on a CLI exit', true);
@@ -47152,10 +47175,28 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         acknowledge('cli_fenced');
         break;
       }
-      if (removedPending > 0
-          && await retireCodexAppDispatchForDurableReplay(msg.turnId, msg.dispatchAttempt)) {
+      // Remove exact queued items BEFORE awaiting the dispatch-ledger retire.
+      // A deferred Codex precheck may finish on that await: its beforeSubmit
+      // must see the item as retired, never as still writable. If the ledger
+      // refuses or throws, restore the same FIFO order and withhold the ACK.
+      const expiredPending: PendingCliInput[] = [];
+      for (let i = pendingMessages.length - 1; i >= 0; i--) {
+        const item = pendingMessages[i]!;
+        if (item.turnId === msg.turnId && item.dispatchAttempt === msg.dispatchAttempt) {
+          expiredPending.unshift(item);
+          pendingMessages.splice(i, 1);
+        }
+      }
+      let retiredPending = false;
+      try {
+        retiredPending = expiredPending.length > 0
+          && await retireCodexAppDispatchForDurableReplay(msg.turnId, msg.dispatchAttempt);
+      } finally {
+        if (!retiredPending && expiredPending.length > 0) pendingMessages.unshift(...expiredPending);
+      }
+      if (retiredPending) {
         log(
-          `Expired ${removedPending} queued durable input(s) turn=${msg.turnId.slice(0, 12)} `
+          `Expired ${expiredPending.length} queued durable input(s) turn=${msg.turnId.slice(0, 12)} `
           + `attempt=${msg.dispatchAttempt}`,
         );
         acknowledge('queued_removed');

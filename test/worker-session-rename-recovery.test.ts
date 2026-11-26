@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { decideSessionRenameSettlement } from '../src/core/session-rename-settlement.js';
+import { beginRuntimeWriteCycle } from '../src/utils/runtime-screen-status.js';
 import { watchNativeSessionIndex } from '../src/services/native-session-index.js';
 
 const TITLE = '[BotMux·Lark] restored title';
@@ -217,6 +218,52 @@ describe('native rename recovery after persistent worker reattach', () => {
     expect(h.scope.isPromptReady).toBe(false);
     expect(h.scope.reattachOpenTurnGate).toBe(true);
     expect(h.scope.idleDetector.adoptPromptReady).not.toHaveBeenCalled();
+  });
+
+  it('restores an already-ready reattach after a real resubmit and silent settled receipt', async () => {
+    vi.useFakeTimers();
+    const h = recoveryHarness('unsubmitted');
+    Object.assign(h.scope, {
+      isPromptReady: true,
+      reattachOpenTurnGate: false,
+      rawInputRestartGate: false,
+      commandLineWritesPending: 0,
+      isFlushing: false,
+      injectionFlushing: false,
+      beginRuntimeWriteCycle,
+      pendingMessages: [{ content: 'restored follow-up', turnId: 'restored-turn' }],
+      flushPending: vi.fn(),
+      sessionRenameIdleTimer: null,
+      SESSION_RENAME_IDLE_TIMEOUT_MS: 5_000,
+      SESSION_RENAME_RECHECK_MS: 2_000,
+      SESSION_RENAME_SLOW_RECHECK_MS: 10_000,
+      SESSION_RENAME_FAST_RECHECK_WINDOW_MS: 30_000,
+      SESSION_RENAME_RECOVERY_AFTER_MS: 60_000,
+      decideSessionRenameSettlement,
+      recoverUnconfirmedSessionRename: vi.fn(() => false),
+      cliName: () => 'Codex',
+    });
+    h.scope.idleDetector.reset = vi.fn();
+    h.scope.backend.write = vi.fn(() => {
+      h.probe.mockReturnValue(true);
+      h.scope.sessionRenameSurfaceNow = () => 'settled';
+    });
+    h.scope.forceClearSessionRenameInFlight = loadWorkerFunction('forceClearSessionRenameInFlight', h.scope);
+    h.scope.beginCliWriteCycle = loadWorkerFunction('beginCliWriteCycle', h.scope);
+    h.scope.resubmitSessionRename = loadWorkerFunction('resubmitSessionRename', h.scope);
+    h.scope.settleSessionRename = loadWorkerFunction('settleSessionRename', h.scope);
+    h.scope.armSessionRenameIdleTimeout = loadWorkerFunction('armSessionRenameIdleTimeout', h.scope);
+
+    expect(h.recover()).toBe(true);
+    expect(h.scope.sessionRenamePreserveReattachReadiness).toBe(false);
+    await vi.advanceTimersByTimeAsync(46_000);
+
+    expect(h.scope.backend.write).toHaveBeenCalledExactlyOnceWith('\r');
+    expect(h.scope.isPromptReady).toBe(true);
+    expect(h.scope.reattachOpenTurnGate).toBe(false);
+    expect(h.scope.sessionRenamePhase).toBe('idle');
+    expect(h.scope.flushPending).toHaveBeenCalledOnce();
+    expect(h.scope.idleDetector.adoptPromptReady).toHaveBeenCalled();
   });
 
   it('keeps one recovery clock when an unknown surface becomes an exact surviving draft', () => {

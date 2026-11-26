@@ -147,6 +147,27 @@ describe('native rename confirmation hold cap', () => {
     expect(unavailable.scope.sessionRenamePhase).toBe('sent');
   });
 
+  it('uses the dedicated transient recovery notice instead of the draft/dialog warning', async () => {
+    vi.useFakeTimers();
+    const h = renameTimerHarness('settled');
+    h.scope.lastInitConfig = { cliId: 'traex' };
+    h.scope.sessionRenameNativeSessionIdNow = () => 'native-id';
+    h.scope.currentTraexObservedPid = () => 123;
+    h.scope.findTraexRolloutSetByPid = () => new Set(['native-id']);
+    h.scope.recoverUnconfirmedSessionRename = vi.fn(() => false);
+    h.scope.t = vi.fn((key: string) => key);
+
+    h.arm();
+    await vi.advanceTimersByTimeAsync(61_000);
+
+    expect(h.scope.send.mock.calls.map(([event]: [any]) => event.message))
+      .toContain('worker.session_rename_recovery_held');
+    expect(h.scope.send.mock.calls.map(([event]: [any]) => event.message))
+      .not.toContain('worker.session_rename_hold_timeout');
+    expect(h.scope.t).toHaveBeenCalledWith('worker.session_rename_recovery_held',
+      expect.objectContaining({ seconds: 60 }));
+  });
+
   it('does not hold forever when TRAE recovery is permanently ineligible', async () => {
     vi.useFakeTimers();
     for (const mode of ['adopt', 'already-used', 'zmx', 'sandbox-without-fd', 'multi-rollout'] as const) {

@@ -13,6 +13,9 @@ import { programStatusBlockHoldsTypeAhead } from '../src/core/program-status-gat
 import { CodexRunnerFreshnessInputQueue } from '../src/services/codex-runner-freshness.js';
 import { settleStaleWriteContinuation } from '../src/services/submit-confirmation.js';
 import { InflightInputTracker } from '../src/core/inflight-input-tracker.js';
+import { classifyStuckPage, shouldHoldInputForHookReview, shouldHoldInputForStuckPage } from '../src/utils/stuck-detector.js';
+import { redactStuckPageTail, stuckScreenTail } from '../src/core/stuck-page-catalog.js';
+import { detectCliStartupBlocker, startupBlockerKey } from '../src/core/cli-startup-blocker.js';
 import { workerSubmitHarness } from './helpers/worker-submit-harness.js';
 import { loadWorkerFunction, loadWorkerMessageHandler } from './helpers/worker-function-harness.js';
 
@@ -99,6 +102,55 @@ function inputHarness(cliId: 'codex' | 'traex', viewport: string, persistentReat
     h.scope.recoverSessionRenameAfterPersistentReattach = loadWorkerFunction('recoverSessionRenameAfterPersistentReattach', h.scope);
   }
   return { ...h, backend, adapter: h.scope.cliAdapter };
+}
+
+function wireInteraction(h: ReturnType<typeof inputHarness>, viewport: string, startupReady = false) {
+  Object.assign(h.scope, {
+    lastAnalyzerSnapshot: viewport,
+    renderer: { rawSnapshot: () => viewport, snapshot: () => ({ content: viewport }) },
+    hookReviewInputHold: false,
+    hookReviewInputHoldRevision: 0,
+    hookReviewInputHoldNotified: false,
+    hookReviewInputHoldSnapshot: '',
+    hookReviewReleaseProbeTimer: null,
+    hookReviewReleaseProbeSinceMs: null,
+    HOOK_REVIEW_RELEASE_SETTLE_MS: 150,
+    HOOK_REVIEW_RELEASE_SETTLE_CAP_MS: 2_000,
+    HOOK_REVIEW_RELEASE_STALLED_PROBE_MS: 5_000,
+    lastPtyActivityAtMs: 0,
+    cliLifetimeNonce: 1,
+    classifyStuckPage,
+    shouldHoldInputForHookReview,
+    shouldHoldInputForStuckPage,
+    stuckScreenTail,
+    redactStuckPageTail,
+    detectCliStartupBlocker,
+    startupBlockerKey,
+    startupBlocker: null,
+    reportedUntrustedWorkspaces: new Set<string>(),
+    freshCliNeverReady: () => startupReady,
+    isWorkflowWorker: () => false,
+  });
+  for (const name of [
+    'adapterRendersCodexFamilyStuckPages',
+    'hookReviewHoldBlocks',
+    'refreshHookReviewInputHold',
+    'heldInputTurnIdentity',
+    'heldStuckPage',
+    'notifyHookReviewInputHold',
+    'hookReviewAdmissionScreen',
+    'hookReviewAdmissionCapture',
+    'hookReviewAdmissionShowsPage',
+    'hookReviewHoldsQueuedWrite',
+    'scheduleHookReviewReleaseProbe',
+    'cancelHookReviewReleaseProbe',
+    'shareableStuckScreenTail',
+    'traexQuestionHoldsHeldInput',
+    'notifyTraexQuestionInputHeld',
+    'probeStartupBlocker',
+    'startupUpgradeHint',
+    'startupBlockerNotice',
+  ]) h.scope[name] = loadWorkerFunction(name, h.scope);
 }
 
 const dirs: string[] = [];
@@ -335,6 +387,43 @@ describe('native hard input-focus blocks across real delivery paths', () => {
     expect(h.scope.armNativeInputBlockRecheck).not.toHaveBeenCalled();
     expect(h.scope.pendingMessages).toHaveLength(1);
   });
+  it.each([
+    { name: 'TRAE L0', cliId: 'traex' as const, file: 'traex-0.213.1-hooks-startup-menu.txt', adopt: false },
+    { name: 'TRAE L1', cliId: 'traex' as const, file: 'traex-0.213.1-hooks-browser-l1.txt', adopt: false },
+    { name: 'Codex L2 adopt', cliId: 'codex' as const, file: 'codex-0.164.0-sessionstart-detail-l2.txt', adopt: true },
+  ])('keeps the actionable Hook-review card ahead of the generic hard block: $name', async ({ cliId, file, adopt }) => {
+    const viewport = readFileSync(new URL(`./fixtures/stuck-pages/${file}`, import.meta.url), 'utf8');
+    const h = inputHarness(cliId, viewport);
+    h.scope.lastInitConfig.adoptMode = adopt;
+    wireInteraction(h, viewport);
+
+    await h.flush();
+
+    expect(h.scope.send.mock.calls.some(([event]: [any]) => event.type === 'stuck_warning' && event.reason === 'input_held')).toBe(true);
+    expect(h.scope.send.mock.calls.map(([event]: [any]) => event.message)).not.toContain('worker.native_input_surface_held');
+    expect(h.scope.armNativeInputBlockRecheck).not.toHaveBeenCalled();
+    expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+    expect(h.scope.pendingMessages).toHaveLength(1);
+  });
+
+  it('publishes a structured startup blocker before the generic hard block', async () => {
+    const viewport = readFileSync(new URL('./fixtures/stuck-pages/traex-0.213.1-folder-trust.txt', import.meta.url), 'utf8');
+    const h = inputHarness('traex', viewport);
+    h.scope.lastInitConfig.workingDir = '/workspace';
+    wireInteraction(h, viewport, true);
+
+    await h.flush();
+
+    expect(h.scope.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'user_notify', kind: 'cli_startup_blocked',
+      startupBlocker: expect.objectContaining({ kind: 'folder_trust' }),
+    }));
+    expect(h.scope.send.mock.calls.map(([event]: [any]) => event.message)).not.toContain('worker.native_input_surface_held');
+    expect(h.scope.armNativeInputBlockRecheck).not.toHaveBeenCalled();
+    expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+    expect(h.scope.pendingMessages).toHaveLength(1);
+  });
+
   it('restores a dequeued raw command at the FIFO head when a dialog refuses it', async () => {
     const h = inputHarness('codex', codexDialog(''));
     const queue = new CodexRunnerFreshnessInputQueue<any, any>(() => 'current', () => {});
