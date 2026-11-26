@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, readlinkSync, realpathSync, existsSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdtempSync, mkdirSync, readFileSync, readlinkSync, realpathSync, existsSync, writeFileSync, rmSync, symlinkSync, chmodSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { once } from 'node:events';
 import { buildFsPolicy } from '../src/adapters/cli/fs-policy.js';
@@ -113,3 +113,67 @@ it.skipIf(!usable)('refuses a credential-root symlink instead of claiming it is 
       bytedcliBroker: true, chdir: root, home: root, cliBin: '/bin/true', cliArgs: [] })).toThrow(/protected credential root/);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+it.skipIf(!usable).each([
+  { useBwrapArgsFile: false, relative: 'gitconfig' },
+  { useBwrapArgsFile: true, relative: 'gitconfig' },
+  { useBwrapArgsFile: false, relative: 'custom/tenant/token' },
+  { useBwrapArgsFile: true, relative: 'custom/tenant/token' },
+])('masks absent protected $relative under an unwritable host parent without creating it (args file=$useBwrapArgsFile)', async ({ useBwrapArgsFile, relative }) => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'strict-absent-mask-')));
+  const parent = join(root, 'readonly-etc'), absent = join(parent, relative), trusted = join(root, 'runtime');
+  mkdirSync(parent); mkdirSync(trusted);
+  writeFileSync(join(parent, 'readable'), 'public-fixture');
+  symlinkSync('readable', join(parent, 'readable-link'));
+  writeFileSync(join(trusted, 'cli'), 'trusted-fixture');
+  chmodSync(parent, 0o555);
+  let sandbox: ReturnType<typeof prepareDirectSandbox> = null;
+  let child: ReturnType<typeof spawn> | undefined;
+  try {
+    const contract = { workerGeneration: 1, credentialRoots: [absent], executableReadOnlyRoots: [trusted] };
+    sandbox = prepareDirectSandbox({ sessionId: 'absent', dataDir: join(root, 'data'), home: root, chdir: '/',
+      bytedcliBroker: true, useBwrapArgsFile, policy: { rules: [
+        { path: '/usr', access: 'readOnly', source: 'baseline' },
+        { path: parent, access: 'readOnly', source: 'baseline' },
+        { path: trusted, access: 'readOnly', source: 'mandatory' },
+        { path: absent, access: 'deny', source: 'mandatory' },
+      ], net: true, writeRegexes: [], protectedDenyPaths: [absent], protectedReadOnlyPaths: [trusted] },
+      cliBin: '/usr/bin/sh', cliArgs: ['-c', `echo READY; read answer; test ! -f '${absent}' || exit 41; cat '${parent}/readable' '${parent}/readable-link'; echo changed > '${trusted}/cli' 2>/dev/null && exit 42; echo PASS`] });
+    expect(sandbox).not.toBeNull();
+    expect(!!sandbox!.argsFile).toBe(useBwrapArgsFile);
+    expect(existsSync(absent)).toBe(false);
+    child = spawn(sandbox!.bin, sandbox!.args, { env: { PATH: '/usr/bin:/bin', HOME: root, ...sandbox!.env }, stdio: ['pipe', 'pipe', 'pipe'] });
+    let stdout = '', stderr = '';
+    child.stdout!.on('data', data => { stdout += data; }); child.stderr!.on('data', data => { stderr += data; });
+    const exited = once(child, 'exit');
+    const deadline = Date.now() + 5_000;
+    while (!stdout.includes('READY') && child.exitCode === null && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));
+    expect(stdout, stderr).toContain('READY');
+    expect(existsSync(absent)).toBe(false);
+    const descendants = (pid: number): number[] => {
+      let children: number[] = [];
+      try { children = readFileSync(`/proc/${pid}/task/${pid}/children`, 'utf8').trim().split(/\s+/).filter(Boolean).map(Number); } catch { /* exited */ }
+      return children.flatMap(id => [id, ...descendants(id)]);
+    };
+    const cliPid = descendants(child.pid!).find(pid => observeBytedcliLinuxContainment(pid, contract));
+    expect(cliPid, stderr).toBeDefined();
+    // The trusted host may create this optional credential after launch. It
+    // remains hidden, without having to reserve a directory on the host first.
+    chmodSync(parent, 0o755);
+    mkdirSync(dirname(absent), { recursive: true });
+    writeFileSync(absent, 'future-host-secret');
+    chmodSync(parent, 0o555);
+    expect(observeBytedcliLinuxContainment(cliPid!, contract)).toBeDefined();
+    child.stdin!.end('go\n');
+    const [status] = await exited;
+    expect(status, stderr).toBe(0);
+    expect(stdout).toContain('public-fixturepublic-fixturePASS');
+    sandbox!.cleanup(); sandbox = null;
+    expect(readFileSync(absent, 'utf8')).toBe('future-host-secret');
+    expect(readFileSync(join(trusted, 'cli'), 'utf8')).toBe('trusted-fixture');
+  } finally {
+    child?.kill('SIGKILL'); sandbox?.cleanup();
+    chmodSync(parent, 0o755);
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 15_000);

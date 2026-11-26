@@ -1630,6 +1630,10 @@ export function relocateSymlinkedBaselineRules(
 }
 
 export interface CompileBwrapOpts {
+  /** Private directory views for missing strict masks. The worker enumerates
+   * existing children, without reading file contents; no host mountpoint is
+   * needed for a missing descendant. Only read-only rules may project. */
+  directoryProjections?: ReadonlyMap<string, readonly { name: string; symlinkTarget?: string }[]>;
   /** Top-level symlinks to replicate inside the tmpfs root (usrmerge /bin →
    *  usr/bin etc.). Resolved by the worker (impure readlink). */
   symlinks?: readonly { path: string; target: string }[];
@@ -1678,7 +1682,9 @@ export interface BwrapCompilation {
    *  which is exactly what closes the "host/other process creates the secret
    *  mid-session" TOCTOU. Mountpoints the worker itself had to create (didn't
    *  pre-exist) are removed at teardown IFF still empty (never a recursive rm —
-   *  content written by the host/a concurrent process is preserved). */
+   *  content written by the host/a concurrent process is preserved). Strict
+   *  directory projections instead materialize missing targets only in the
+   *  namespace; the worker excludes those from host creation/cleanup. */
   maskMounts: { path: string; kind: 'dir' | 'file' }[];
 }
 
@@ -1770,7 +1776,19 @@ export function compileToBwrap(policy: FsPolicy, opts: CompileBwrapOpts): BwrapC
       }
       continue;
     }
-    a.push(r.access === 'readWrite' ? '--bind' : '--ro-bind', r.path, r.path);
+    const projection = opts.directoryProjections?.get(r.path);
+    if (projection) {
+      if (r.access !== 'readOnly') throw new Error('private deny projection requires a read-only parent');
+      a.push('--tmpfs', r.path);
+      for (const child of projection) {
+        const path = `${r.path === '/' ? '' : r.path}/${child.name}`;
+        if (child.symlinkTarget !== undefined) a.push('--symlink', child.symlinkTarget, path);
+        else a.push('--ro-bind', path, path);
+      }
+      remountRo.push(r.path);
+    } else {
+      a.push(r.access === 'readWrite' ? '--bind' : '--ro-bind', r.path, r.path);
+    }
     exposed.push(r.path);
   }
   // Re-seal white-in-black deny masks read-only AFTER their nested carve-out
