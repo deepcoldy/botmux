@@ -72,4 +72,4 @@ botmux 只是「飞书 ↔ CLI」的桥，**不负责帮你登录 CLI**。所以
 | 终端里 CLI 能用，botmux 却找不到 | botmux 会借你的登录 shell 去找命令，装在特殊位置时可能仍找不到。在 bots.json 里把 `cliPathOverride` 设成 CLI 的绝对路径，见 [多 CLI 适配器](/adapters) |
 | `botmux start` 提示缺 tmux | 按提示的命令装好 tmux，或按上表换一个后端 |
 
-**下一步**：都准备好了，去 [5 分钟快速接入](/quickstart)。
+**下一步**：都准备好了，去[快速上手](/quickstart)。

@@ -152,6 +152,10 @@ Dashboard 的「Codex 运行时」可以直接切到「自定义兼容版」，�
 
 完整字段与更新来源见 [bots.json 的 Codex 兼容发行版章节](/bots-json#codex-runtime)。旧的 `cliPathOverride` 写法继续可用，但不会自动开启需要明确兼容声明的 Codex RPC 能力。
 
+### Codex 多账号与实例池 {#codex-instances}
+
+同一个 Bot 可以通过 `codexInstancePool` 配置多个 Codex 登录目录，并按静态权重分配给普通新会话；后续消息、失败重试和冷恢复沿用已保存的实例，不重新抽签。配置约束、初始化与登录命令、恢复语义见[会话级 Codex 实例](https://github.com/deepcoldy/botmux/blob/master/docs/codex-instances.md)。
+
 ## API / 远端适配器 {#remote-agents}
 
 下面四种适配器的 Agent 不跑在本机终端里。`riff`、`mojo`、`remote-runner` 会自动配上同名的会话后端，不用再写 `backendType`。

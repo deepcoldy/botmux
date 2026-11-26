@@ -18,6 +18,7 @@ import { pickTurnReplyTarget } from './reply-target.js';
 import { failedTurnCaller, failedTurnCrossChatOrigin } from './failed-turn-caller.js';
 import { buildFollowUpCliInput, rememberLastCliInput } from './session-manager.js';
 import { advancePendingStreamingCardTurn } from './streaming-card-post-slot.js';
+import { prepareHookEnvelopeForReplay } from './prompt-hook-replay.js';
 import { localeForBot } from '../i18n/index.js';
 import { logger } from '../utils/logger.js';
 import { inheritSessionLaunchConfiguration } from './session-launch-inheritance.js';
@@ -233,7 +234,9 @@ export function recordLimitedFailedTurn(ds: DaemonSession, turnId: string | unde
     status: 'failed',
     errorCode: `${ds.usageLimit.kind}_limited`,
   }, {
-    userPrompt: ds.lastUserPrompt, cliInput: ds.lastCliInput, codexAppInput: ds.lastCodexAppInput,
+    userPrompt: ds.lastUserPrompt, cliInput: ds.lastCliInput,
+    hookEnvelope: ds.lastHookEnvelope ?? ds.session.lastHookEnvelope,
+    codexAppInput: ds.lastCodexAppInput,
     attachments: ds.session.lastAttachments, trustedCaller: caller, silent: isSilentScheduledTurn(ds, turnId),
     originalTurnId: ds.session.failedTurnRecovery?.turnId === turnId
       ? ds.session.failedTurnRecovery.originalTurnId : turnId,
@@ -315,7 +318,9 @@ export function recordFailedTurnTerminal(
   const crossChatOrigin = failedTurnCrossChatOrigin(ds.session, terminal.turnId)
     ?? (originalTurnId ? failedTurnCrossChatOrigin(ds.session, originalTurnId) : undefined);
   const record = buildFailedTurnRecord({ ...terminal, status: terminal.status }, {
-    userPrompt: ds.lastUserPrompt, cliInput: ds.lastCliInput, codexAppInput: ds.lastCodexAppInput,
+    userPrompt: ds.lastUserPrompt, cliInput: ds.lastCliInput,
+    hookEnvelope: ds.lastHookEnvelope ?? ds.session.lastHookEnvelope,
+    codexAppInput: ds.lastCodexAppInput,
     attachments: ds.session.lastAttachments, trustedCaller: context.caller, silent: context.silent,
     originalTurnId,
   });
@@ -516,16 +521,29 @@ export async function recoverFailedTurn(sessionId: string, request: FailedTurnRe
           abandonUndispatched();
           return setState('cancelled');
         }
+        const willUseLiveWorker = !!(target.worker && !target.worker.killed);
+        const replayed = request.mode === 'retry'
+          ? prepareHookEnvelopeForReplay({
+            ds: target,
+            content: input.content,
+            turnId,
+            hookEnvelope: record.hookEnvelope,
+            willUseLiveWorker,
+          })
+          : undefined;
+        const dispatchInput: CliTurnPayload = replayed
+          ? { ...input, content: replayed.content, ...(replayed.hookEnvelope ? { hookEnvelope: replayed.hookEnvelope } : {}) }
+          : input;
         let rejected = false;
         ipcAttempted = true;
-        const accepted = target.worker && !target.worker.killed
-          ? sendWorkerInput(target, input, turnId, { trustedCaller: recoveredCaller, atMostOnce: true })
-          : forkWorker(target, input, { resume: request.mode === 'retry' && target.hasHistory,
+        const accepted = willUseLiveWorker
+          ? sendWorkerInput(target, dispatchInput, turnId, { trustedCaller: recoveredCaller, atMostOnce: true })
+          : forkWorker(target, dispatchInput, { resume: request.mode === 'retry' && target.hasHistory,
             turnId, trustedCaller: recoveredCaller, atMostOnce: true }, {
             onAdmission: admission => { rejected = admission === 'rejected'; },
           });
         if (!accepted || rejected) return setState('dispatch_unknown');
-        rememberLastCliInput(target, record.userPrompt, input, turnId);
+        rememberLastCliInput(target, record.userPrompt, dispatchInput, turnId);
         if (target.streamCardPending) advancePendingStreamingCardTurn(target);
         store.updateSession(target.session);
         return setState('accepted');

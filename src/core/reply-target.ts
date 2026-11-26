@@ -471,7 +471,7 @@ export function beginReplyTargetTurn(
   replyRootId: string | undefined,
   turnId: string,
   nowIso = new Date().toISOString(),
-  opts?: { quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; participants?: TurnParticipant[]; participantsIncomplete?: boolean; inThread?: boolean; foldedRootId?: string; sourceMessageId?: string; synthetic?: true; crossChatOrigin?: { sourceChatId: string; followedChatId: string; followedRootMessageId: string } },
+  opts?: { quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; participants?: TurnParticipant[]; participantsIncomplete?: boolean; inThread?: boolean; foldedRootId?: string; sourceMessageId?: string; synthetic?: true; registerSharedTopic?: true; crossChatOrigin?: { sourceChatId: string; followedChatId: string; followedRootMessageId: string } },
 ): void {
   if (isLarkChatId(replyRootId)) replyRootId = undefined;
   // #597: the frozen per-turn dispatch context — the authoritative reply target
@@ -558,7 +558,7 @@ export function beginReplyTargetTurn(
   );
   ds.session.replyTargets = targets;
 
-  if (ds.scope !== 'chat' || opts?.synthetic) return;
+  if (ds.scope !== 'chat' || (opts?.synthetic && !opts?.registerSharedTopic)) return;
   if (replyRootId) {
     const aliases = { ...(ds.replyThreadAliases ?? ds.session.replyThreadAliases ?? {}) };
     aliases[replyRootId] = {

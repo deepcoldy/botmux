@@ -82,6 +82,10 @@ Names are case-insensitive. Unknown or duplicate names fail before the group is 
 | `--tag <name>` | Put the new group into a message group in your Lark sidebar (up to 60 characters) |
 | `--no-tag` | Ignore the default tag |
 | `--avatar logo\|name\|off` | Avatar: gradient logo (default) / group-name text / Lark default |
+| `--dir <path>` | Bind a default working directory to the new group (used by every local bot starting a session in it) |
+| `--branch <name>` | Create a linked git worktree from `--dir` and bind it to the new group |
+| `--card` | Open the interactive group-creation card (pick directory, optional branch, optional name) |
+| `--no-card` | Skip the interactive form card this time (overrides a bot's `"card": true`) |
 | `--start` | Treat the text as a task this time: create the group and start on it there; see "Create and start a task" below |
 | `--no-start` | Only create the group this time (overrides a bot's `"autoStart": true`) |
 | `--role-profile <id>` | Apply a [role profile](/en/roles) to the bots in the group after creation |
@@ -146,7 +150,8 @@ If your team always uses the same set of bots and the same tag, give the bot def
     "agents": ["cli_review_app", "cli_build_app"],
     "tag": "Projects",
     "avatar": "name",
-    "autoStart": true
+    "autoStart": true,
+    "card": false
   }
 }
 ```
@@ -157,6 +162,7 @@ You can also send `/botconfig set groupCreation <JSON>` in Lark, and `/botconfig
 - With a default list, @-mentioning just one of those bots with `/g` still brings in the whole team (deduplicated).
 - `--no-agents`, `--no-tag` and `--avatar off` only drop defaults; they never remove bots you explicitly @-mentioned.
 - `autoStart` defaults to `false`: the text after `/g` is only the group name; with `true` it is a task the bot starts on (`--no-start` turns that off for one command).
+- `card` defaults to `false`: a bare `/g` creates the group right away and auto-titles it from the first message; with `true`, a bare `/g` opens the interactive form card to pick a directory and optional branch (`--no-card` skips it for one command; `--card` opens it on demand).
 - Without `groupCreation` and without options, only the current bot and the bots you @-mentioned join.
 
 ### Add missing bots to an existing group

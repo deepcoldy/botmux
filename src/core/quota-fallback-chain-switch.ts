@@ -41,6 +41,7 @@ import { cliSelectionSnapshot } from './cli-selection-snapshot.js';
 import { failedTurnCaller, recoverFailedTurn } from './failed-turn-recovery.js';
 import { isRemoteBackendSession } from './persistent-backend.js';
 import { sessionPromptInjection, supportsZeroPromptInjectionForBot } from './prompt-injection.js';
+import { plannedOpeningBackendType } from './opening-backend.js';
 import { noteReplyCardTurnStarted } from './reply-card-turn-start.js';
 import { pickTurnReplyTarget } from './reply-target.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
@@ -208,6 +209,7 @@ function buildInput(ds: DaemonSession, plan: PlannedSwitch, prompt: string, turn
       promptInjection: sessionPromptInjection(ds),
       larkToolResume: false,
       turnId,
+      sessionBackendType: plannedOpeningBackendType(ds, plan.next.cliId, bot.config),
     },
   );
 }
@@ -353,6 +355,9 @@ async function runSwitch(ds: DaemonSession, trigger: QuotaFallbackChainTrigger, 
         delete ds.session.lastFailedTurn;
       }
       sessionStore.updateSession(ds.session);
+      if (plan.freshCli && plan.next.cliId === 'claude-code') {
+        try { (await import('./worker-pool.js')).ensureCliEnv?.('claude-code', snapshot?.cliPathOverride ?? undefined); } catch { /* best-effort */ }
+      }
       const built = buildInput(ds, plan, prompt, turnId, snapshot, recoveredCaller, locale);
       let rejected = false;
       const accepted = forkWorker(ds, built, {

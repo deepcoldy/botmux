@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync, existsSync, readdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,10 +8,14 @@ import {
   registerHostAsk,
   restorePersistedAsks,
   startHookAskReclaim,
+  toggleAsk,
   tryResolveAsk,
+  submitAskChoices,
   submitCustomReply,
   submitDocumentAskReply,
   findPendingAskByAnchor,
+  findPendingLegacyAskByCard,
+  hydrateLegacyExplicitAskCardRoot,
   listPendingAsksByAnchor,
   setCardDispatcher,
   setCanTalkChecker,
@@ -21,6 +25,7 @@ import {
   _setHookReclaimGraceForTest,
 } from '../src/core/ask-broker.js';
 import { createAskPersistStore, askKeyFor, dispatchUuidForAsk, ASK_STORE_SENTINEL, type PersistedAsk } from '../src/core/ask-persist-store.js';
+import { createExplicitAskContinuation } from '../src/core/explicit-ask-continuation.js';
 import type { AskCardDispatcher, AskResult, CreateAskInput, PendingAsk } from '../src/core/ask-types.js';
 
 /**
@@ -110,6 +115,428 @@ function onlyPersisted(): PersistedAsk {
 }
 
 describe('ask persistence (injected store)', () => {
+  it('群会话的提问话题在恢复与重连后保留，文字候选仍按原始话题隔离', async () => {
+    const input = makeInput({ rootMessageId: null, cardRootMessageId: 'om_ask_topic' });
+    const first = mockDispatcher();
+    setCardDispatcher(first);
+    registerAsk(input);
+    await vi.waitFor(() => expect(onlyPersisted().cardMessageId).toBeDefined());
+    expect(onlyPersisted()).toMatchObject({ cardRootMessageId: 'om_ask_topic', topicIsolated: true });
+    const original = first.sendCalls[0]!;
+    _resetForTest();
+    bindStore();
+    setCardDispatcher(mockDispatcher());
+    setCanTalkChecker(() => true);
+    expect(restorePersistedAsks(Date.now(), 'cli_app')).toBe(1);
+    const waiting = registerAsk(input);
+    const route = { larkAppId: 'cli_app', chatId: 'oc_chat', anchor: 'oc_chat' };
+    expect(listPendingAsksByAnchor({ ...route, messageRootId: 'om_other_topic' })).toEqual([]);
+    expect(listPendingAsksByAnchor({ ...route, messageRootId: null })).toEqual([]);
+    const found = findPendingAskByAnchor({ ...route, messageRootId: 'om_ask_topic' });
+    expect(found?.askId).toBe(original.askId);
+    expect(submitCustomReply({ askId: found!.askId, by: 'ou_owner', text: '同话题答案' })).toBe('accepted');
+    expect(await waiting).toMatchObject({ kind: 'answered', comment: '同话题答案' });
+  });
+
+  it('新版群外层 ask 落盘携带显式隔离标记，经历一/二次重启及重新落盘后仍严格按群外层隔离', async () => {
+    const input = makeInput({
+      rootMessageId: null,
+      originKind: 'host_explicit',
+      requestId: 'req-outer-explicit',
+      questions: [{ prompt: '继续发版吗？', options: OPTIONS, multiSelect: true }],
+    });
+    const first = mockDispatcher();
+    setCardDispatcher(first);
+    void registerHostAsk(input);
+    await vi.waitFor(() => expect(onlyPersisted().cardMessageId).toBeDefined());
+    const disk1 = onlyPersisted();
+    expect(disk1.cardRootMessageId).toBeUndefined();
+    expect(disk1.topicIsolated).toBe(true);
+    const original = first.sendCalls[0]!;
+
+    // 1st restart: restore without reattach (host_explicit is active immediately)
+    _resetForTest();
+    bindStore();
+    setCardDispatcher(mockDispatcher());
+    setCanTalkChecker(() => true);
+    expect(restorePersistedAsks(Date.now(), 'cli_app')).toBe(1);
+    const route = { larkAppId: 'cli_app', chatId: 'oc_chat', anchor: 'oc_chat' };
+    expect(listPendingAsksByAnchor({ ...route, messageRootId: 'om_topic_a' })).toEqual([]);
+    expect(findPendingAskByAnchor({ ...route, messageRootId: 'om_topic_a' })).toBeUndefined();
+    expect(findPendingAskByAnchor({ ...route, messageRootId: null })?.askId).toBe(original.askId);
+
+    // Re-persist via toggleAsk and submitAskChoices(needs_empty_confirm), then 2nd restart.
+    expect(toggleAsk({ askId: original.askId, nonce: original.nonce, questionIndex: 0, key: 'yes', by: 'ou_owner' })).toBe('toggled');
+    expect(onlyPersisted().topicIsolated).toBe(true);
+    expect(submitAskChoices({ askId: original.askId, nonce: original.nonce, by: 'ou_owner', selections: [[]], fields: {}, revision: 0 })).toBe('needs_empty_confirm');
+    expect(onlyPersisted().topicIsolated).toBe(true);
+
+    _resetForTest();
+    bindStore();
+    setCardDispatcher(mockDispatcher());
+    setCanTalkChecker(() => true);
+    expect(restorePersistedAsks(Date.now(), 'cli_app')).toBe(1);
+    const reattached = registerHostAsk(input);
+    expect(listPendingAsksByAnchor({ ...route, messageRootId: 'om_topic_a' })).toEqual([]);
+    const found = findPendingAskByAnchor({ ...route, messageRootId: null });
+    expect(found?.askId).toBe(original.askId);
+    expect(submitCustomReply({ askId: found!.askId, by: 'ou_owner', text: '群外层答复' })).toBe('accepted');
+    expect(await reattached).toMatchObject({ kind: 'answered', comment: '群外层答复' });
+  });
+
+  it('新版群会话话题内 host_explicit ask 经无 presentation 重连与二次重启后仍保留冻结话题隔离', async () => {
+    const baseInput = makeInput({
+      rootMessageId: null,
+      originKind: 'host_explicit',
+      requestId: 'req-topic-explicit',
+      questions: [{ prompt: '继续发版吗？', options: OPTIONS, multiSelect: true }],
+    });
+    const first = mockDispatcher();
+    setCardDispatcher(first);
+    void registerHostAsk({ ...baseInput, cardRootMessageId: 'om_ask_topic' });
+    await vi.waitFor(() => expect(onlyPersisted().cardMessageId).toBeDefined());
+    expect(onlyPersisted()).toMatchObject({ cardRootMessageId: 'om_ask_topic', topicIsolated: true });
+    const original = first.sendCalls[0]!;
+
+    // 1st restart + sweep-style reattach without cardRootMessageId
+    _resetForTest();
+    bindStore();
+    setCardDispatcher(mockDispatcher());
+    setCanTalkChecker(() => true);
+    expect(restorePersistedAsks(Date.now(), 'cli_app')).toBe(1);
+    void registerHostAsk(baseInput); // omits cardRootMessageId like explicitAskContinuation.sweep()
+    expect(toggleAsk({ askId: original.askId, nonce: original.nonce, questionIndex: 0, key: 'yes', by: 'ou_owner' })).toBe('toggled');
+    expect(onlyPersisted()).toMatchObject({ cardRootMessageId: 'om_ask_topic', topicIsolated: true });
+
+    // 2nd restart: still strictly isolated to om_ask_topic
+    _resetForTest();
+    bindStore();
+    setCardDispatcher(mockDispatcher());
+    setCanTalkChecker(() => true);
+    expect(restorePersistedAsks(Date.now(), 'cli_app')).toBe(1);
+    const route = { larkAppId: 'cli_app', chatId: 'oc_chat', anchor: 'oc_chat' };
+    expect(listPendingAsksByAnchor({ ...route, messageRootId: null })).toEqual([]);
+    expect(listPendingAsksByAnchor({ ...route, messageRootId: 'om_other_topic' })).toEqual([]);
+    expect(findPendingAskByAnchor({ ...route, messageRootId: 'om_ask_topic' })?.askId).toBe(original.askId);
+  });
+
+  it('旧版 v2 无隔离标记的 hook 记录：dormant 期不收文字，无 cardRoot 重连走兼容回退，带 cardRoot 重连自动升级隔离', async () => {
+    const store = createAskPersistStore(join(dataDir, 'asks'));
+    const now = Date.now();
+    const legacyHookBase = (requestId: string, askId: string): PersistedAsk => ({
+      v: 2,
+      askKey: askKeyFor('cli_app', 'sess-1', 'hook', requestId),
+      requestId,
+      originKind: 'hook',
+      askId,
+      nonce: 'n_legacy',
+      larkAppId: 'cli_app',
+      chatId: 'oc_chat',
+      rootMessageId: null,
+      sessionId: 'sess-1',
+      chatType: 'group',
+      questions: [{ prompt: '继续发版吗？', options: OPTIONS, multiSelect: false }],
+      createdAt: now - 1000,
+      deadlineAt: now + 60_000,
+      timeoutMs: 60_000,
+      cardMessageId: `om_card_${askId}`,
+      selections: [[]],
+    });
+    const route = { larkAppId: 'cli_app', chatId: 'oc_chat', anchor: 'oc_chat' };
+
+    // Case A: legacy hook reconnects WITHOUT cardRootMessageId -> keeps legacy pre-upgrade fallback
+    store.put(legacyHookBase('legacy-hook-fallback', 'ask-legacy-hook-a'));
+    _resetForTest();
+    bindStore();
+    setCardDispatcher(mockDispatcher());
+    setCanTalkChecker(() => true);
+    expect(restorePersistedAsks(now, 'cli_app')).toBe(1);
+    // Still dormant -> must NOT match text before hook reconnects
+    expect(listPendingAsksByAnchor({ ...route, messageRootId: 'om_orig_topic' })).toEqual([]);
+    expect(listPendingAsksByAnchor({ ...route, messageRootId: null })).toEqual([]);
+
+    const waitingA = registerAsk(makeInput({ rootMessageId: null, requestId: 'legacy-hook-fallback' }));
+    expect(findPendingAskByAnchor({ ...route, messageRootId: 'om_orig_topic' })?.askId).toBe('ask-legacy-hook-a');
+    expect(findPendingAskByAnchor({ ...route, messageRootId: null })?.askId).toBe('ask-legacy-hook-a');
+    expect(submitCustomReply({ askId: 'ask-legacy-hook-a', by: 'ou_owner', text: '旧记录原话题答复' })).toBe('accepted');
+    expect(await waitingA).toMatchObject({ kind: 'answered', comment: '旧记录原话题答复' });
+
+    // Case B: legacy hook reconnects WITH cardRootMessageId -> hydrates and upgrades to strict topic isolation
+    store.put(legacyHookBase('legacy-hook-hydrate', 'ask-legacy-hook-b'));
+    _resetForTest();
+    bindStore();
+    setCardDispatcher(mockDispatcher());
+    setCanTalkChecker(() => true);
+    expect(restorePersistedAsks(now, 'cli_app')).toBe(1);
+    const waitingB = registerAsk(makeInput({ rootMessageId: null, requestId: 'legacy-hook-hydrate', cardRootMessageId: 'om_hydrated_topic' }));
+    expect(onlyPersisted()).toMatchObject({ cardRootMessageId: 'om_hydrated_topic', topicIsolated: true });
+    expect(listPendingAsksByAnchor({ ...route, messageRootId: null })).toEqual([]);
+    expect(listPendingAsksByAnchor({ ...route, messageRootId: 'om_other_topic' })).toEqual([]);
+    expect(findPendingAskByAnchor({ ...route, messageRootId: 'om_hydrated_topic' })?.askId).toBe('ask-legacy-hook-b');
+    expect(submitCustomReply({ askId: 'ask-legacy-hook-b', by: 'ou_owner', text: '升级后精确答复' })).toBe('accepted');
+    expect(await waitingB).toMatchObject({ kind: 'answered', comment: '升级后精确答复' });
+  });
+
+  it('旧版 v2 host_explicit 记录恢复后无需重连即生效，且经 toggle/answer-stash 再次落盘与二次重启后保持兼容形状', async () => {
+    const store = createAskPersistStore(join(dataDir, 'asks'));
+    const now = Date.now();
+    const requestId = 'legacy-explicit-1';
+    const legacyExplicit: PersistedAsk = {
+      v: 2,
+      askKey: askKeyFor('cli_app', 'sess-1', 'host_explicit', requestId),
+      requestId,
+      originKind: 'host_explicit',
+      askId: 'ask-legacy-explicit',
+      nonce: 'n_exp',
+      larkAppId: 'cli_app',
+      chatId: 'oc_chat',
+      rootMessageId: null,
+      sessionId: 'sess-1',
+      chatType: 'group',
+      questions: [{ prompt: '继续发版吗？', options: OPTIONS, multiSelect: true }],
+      createdAt: now - 1000,
+      deadlineAt: now + 60_000,
+      timeoutMs: 60_000,
+      timeoutStartsAfterDelivery: true,
+      timeoutStartedAt: now - 900,
+      cardMessageId: 'om_card_legacy_explicit',
+      selections: [[]],
+    };
+    store.put(legacyExplicit);
+
+    // 1st restart: NO reattach! host_explicit is immediately eligible via legacy fallback.
+    _resetForTest();
+    bindStore();
+    setCardDispatcher(mockDispatcher());
+    setCanTalkChecker(() => true);
+    expect(restorePersistedAsks(now, 'cli_app')).toBe(1);
+    const route = { larkAppId: 'cli_app', chatId: 'oc_chat', anchor: 'oc_chat' };
+    expect(findPendingAskByAnchor({ ...route, messageRootId: 'om_orig_topic' })?.askId).toBe('ask-legacy-explicit');
+    expect(findPendingAskByAnchor({ ...route, messageRootId: null })?.askId).toBe('ask-legacy-explicit');
+
+    // Re-persist via toggleAsk -> must NOT stamp topicIsolated: true
+    expect(toggleAsk({ askId: 'ask-legacy-explicit', nonce: 'n_exp', questionIndex: 0, key: 'yes', by: 'ou_owner' })).toBe('toggled');
+    expect(onlyPersisted().topicIsolated).toBeUndefined();
+
+    // 2nd restart: legacy compatibility still preserved; answer while dormant stashes without losing shape
+    _resetForTest();
+    bindStore();
+    setCardDispatcher(mockDispatcher());
+    setCanTalkChecker(() => true);
+    expect(restorePersistedAsks(now, 'cli_app')).toBe(1);
+    expect(findPendingAskByAnchor({ ...route, messageRootId: 'om_orig_topic' })?.askId).toBe('ask-legacy-explicit');
+    expect(submitCustomReply({ askId: 'ask-legacy-explicit', by: 'ou_owner', text: '旧显式原话题答复' })).toBe('accepted');
+    const stashed = onlyPersisted();
+    expect(stashed.topicIsolated).toBeUndefined();
+    expect(stashed.answeredResult).toMatchObject({ kind: 'answered', comment: '旧显式原话题答复' });
+
+    // 3rd restart: claimant reconnects and receives stashed answer
+    _resetForTest();
+    bindStore();
+    setCardDispatcher(mockDispatcher());
+    setCanTalkChecker(() => true);
+    expect(restorePersistedAsks(now, 'cli_app')).toBe(1);
+    const claimed = await registerHostAsk(makeInput({
+      rootMessageId: null,
+      originKind: 'host_explicit',
+      requestId,
+      questions: [{ prompt: '继续发版吗？', options: OPTIONS, multiSelect: true }],
+    }));
+    expect(claimed).toMatchObject({ kind: 'answered', comment: '旧显式原话题答复' });
+  });
+
+  it('旧版 v2 chat-scope 记录与新版精确话题 ask 共存时，精确匹配优先且不串进独立 thread/私聊子话题，显式引用旧卡仍可命中', async () => {
+    const store = createAskPersistStore(join(dataDir, 'asks'));
+    const now = Date.now();
+    store.put({
+      v: 2,
+      askKey: askKeyFor('cli_app', 'sess-legacy', 'host_explicit', 'legacy-coexist'),
+      requestId: 'legacy-coexist',
+      originKind: 'host_explicit',
+      askId: 'ask-legacy-coexist',
+      nonce: 'n_coex',
+      larkAppId: 'cli_app',
+      chatId: 'oc_chat',
+      rootMessageId: null,
+      sessionId: 'sess-legacy',
+      chatType: 'group',
+      questions: [{ prompt: '旧提问？', options: OPTIONS, multiSelect: false }],
+      createdAt: now - 2000,
+      deadlineAt: now + 60_000,
+      timeoutMs: 60_000,
+      timeoutStartsAfterDelivery: true,
+      timeoutStartedAt: now - 1900,
+      cardMessageId: 'om_legacy_card_coexist',
+      selections: [[]],
+    });
+    // Also seed a legacy v2 p2p ask: must NOT turn into wildcard for /t DM topics
+    store.put({
+      v: 2,
+      askKey: askKeyFor('cli_app', 'sess-dm', 'host_explicit', 'legacy-dm'),
+      requestId: 'legacy-dm',
+      originKind: 'host_explicit',
+      askId: 'ask-legacy-dm',
+      nonce: 'n_dm',
+      larkAppId: 'cli_app',
+      chatId: 'oc_dm',
+      rootMessageId: null,
+      sessionId: 'sess-dm',
+      chatType: 'p2p',
+      questions: [{ prompt: '旧私聊？', options: OPTIONS, multiSelect: false }],
+      createdAt: now - 2000,
+      deadlineAt: now + 60_000,
+      timeoutMs: 60_000,
+      timeoutStartsAfterDelivery: true,
+      timeoutStartedAt: now - 1900,
+      cardMessageId: 'om_legacy_dm_card',
+      selections: [[]],
+    });
+
+    _resetForTest();
+    bindStore();
+    const d = mockDispatcher();
+    setCardDispatcher(d);
+    setCanTalkChecker(() => true);
+    expect(restorePersistedAsks(now, 'cli_app')).toBe(2);
+
+    // 1. Independent thread-scope session (anchor !== chatId) is NOT shadowed by legacy chat-scope ask.
+    expect(listPendingAsksByAnchor({ larkAppId: 'cli_app', chatId: 'oc_chat', anchor: 'om_indep_topic', messageRootId: 'om_indep_topic' })).toEqual([]);
+    // 2. Legacy p2p ask matches continuous DM (anchor=oc_dm) but NOT explicit /t DM topic (anchor=om_dm_sub).
+    expect(findPendingAskByAnchor({ larkAppId: 'cli_app', chatId: 'oc_dm', anchor: 'oc_dm' })?.askId).toBe('ask-legacy-dm');
+    expect(findPendingAskByAnchor({ larkAppId: 'cli_app', chatId: 'oc_dm', anchor: 'om_dm_sub' })).toBeUndefined();
+
+    // 3. New exact-location folded topic ask in the same chat-scope session takes precedence over legacy ask.
+    void registerAsk(makeInput({
+      rootMessageId: null,
+      cardRootMessageId: 'om_topic_a',
+      sessionId: 'sess-new',
+      requestId: 'new-topic-a',
+    }));
+    await vi.waitFor(() => expect(d.sendCalls).toHaveLength(1));
+    const newTopicAskId = d.sendCalls[0]!.askId;
+    const foldedRoute = { larkAppId: 'cli_app', chatId: 'oc_chat', anchor: 'oc_chat', messageRootId: 'om_topic_a' };
+    expect(listPendingAsksByAnchor(foldedRoute).map(a => a.askId)).toEqual([newTopicAskId]);
+    expect(findPendingAskByAnchor(foldedRoute)?.askId).toBe(newTopicAskId);
+
+    // 4. Unrelated folded topic with NO exact ask still falls back to legacy ask; quoting legacy card explicitly still resolves it.
+    expect(findPendingAskByAnchor({ larkAppId: 'cli_app', chatId: 'oc_chat', anchor: 'oc_chat', messageRootId: 'om_legacy_only_topic' })?.askId)
+      .toBe('ask-legacy-coexist');
+    expect(findPendingLegacyAskByCard({ larkAppId: 'cli_app', chatId: 'oc_chat', anchor: 'oc_chat', cardMessageId: 'om_legacy_card_coexist' })?.askId)
+      .toBe('ask-legacy-coexist');
+  });
+
+  it('旧版 v2 host_explicit 经 explicitAskContinuation sweep 与重连（含未发卡重发与 active replay）自动回填 cardRootMessageId', async () => {
+    const store = createAskPersistStore(join(dataDir, 'asks'));
+    const receiptsDir = join(dataDir, 'receipts');
+    const now = Date.now();
+
+    // Case A: undelivered legacy v2 host_explicit hydrated by sweep(resolveCardRoot) BEFORE card resend
+    const inputA: CreateAskInput & { requestId: string } = {
+      ...makeInput({ rootMessageId: null, originKind: 'host_explicit', requestId: 'legacy-exp-sweep' }),
+      requestId: 'legacy-exp-sweep',
+    };
+    const contInit = createExplicitAskContinuation({
+      dir: receiptsDir, appId: 'cli_app',
+      register: () => new Promise(() => {}),
+      canResume: () => false, dispatch: async () => false, onError: () => {},
+    });
+    void contInit.wait(inputA, { turnId: 'turn-A' });
+    store.put({
+      v: 2,
+      askKey: askKeyFor('cli_app', 'sess-1', 'host_explicit', 'legacy-exp-sweep'),
+      requestId: 'legacy-exp-sweep',
+      originKind: 'host_explicit',
+      askId: 'ask-legacy-exp-sweep',
+      nonce: 'n_sw',
+      larkAppId: 'cli_app',
+      chatId: 'oc_chat',
+      rootMessageId: null,
+      sessionId: 'sess-1',
+      chatType: 'group',
+      questions: inputA.questions,
+      createdAt: now - 1000,
+      deadlineAt: now + 60_000,
+      timeoutMs: 60_000,
+      timeoutStartsAfterDelivery: true,
+      selections: [[]],
+    });
+
+    _resetForTest();
+    bindStore();
+    const d = mockDispatcher();
+    setCardDispatcher(d);
+    setCanTalkChecker(() => true);
+    expect(restorePersistedAsks(now, 'cli_app')).toBe(1);
+
+    const contRecovered = createExplicitAskContinuation({
+      dir: receiptsDir, appId: 'cli_app',
+      register: registerHostAsk,
+      resolveCardRoot: receipt => receipt.origin?.turnId === 'turn-A' ? 'om_hydrated_exp_topic' : undefined,
+      hydrateCardRoot: hydrateLegacyExplicitAskCardRoot,
+      canResume: () => true, dispatch: async () => false, onError: err => { throw err; },
+    });
+    await contRecovered.sweep();
+    await vi.waitFor(() => expect(onlyPersisted().cardMessageId).toBeDefined());
+
+    expect(d.sendCalls).toHaveLength(1);
+    expect(d.sendCalls[0]!.cardRootMessageId).toBe('om_hydrated_exp_topic');
+    expect(onlyPersisted()).toMatchObject({ cardRootMessageId: 'om_hydrated_exp_topic', topicIsolated: true });
+    expect(listPendingAsksByAnchor({ larkAppId: 'cli_app', chatId: 'oc_chat', anchor: 'oc_chat', messageRootId: 'om_other' })).toEqual([]);
+    expect(findPendingAskByAnchor({ larkAppId: 'cli_app', chatId: 'oc_chat', anchor: 'oc_chat', messageRootId: 'om_hydrated_exp_topic' })?.askId)
+      .toBe('ask-legacy-exp-sweep');
+
+    // Case B: already-running legacy host_explicit (sweep had no resolveCardRoot) hydrated when CLI reconnects with presentation
+    _resetForTest();
+    const inputB: CreateAskInput & { requestId: string } = {
+      ...makeInput({ rootMessageId: null, originKind: 'host_explicit', requestId: 'legacy-exp-join' }),
+      requestId: 'legacy-exp-join',
+    };
+    const receiptsDirB = join(dataDir, 'receipts-b');
+    const storeB = createAskPersistStore(join(dataDir, 'asks-b'));
+    setAskPersistStore(storeB);
+    setCardDispatcher(mockDispatcher());
+    setCanTalkChecker(() => true);
+    const contBInit = createExplicitAskContinuation({
+      dir: receiptsDirB, appId: 'cli_app',
+      register: () => new Promise(() => {}),
+      canResume: () => false, dispatch: async () => false, onError: () => {},
+    });
+    void contBInit.wait(inputB);
+    storeB.put({
+      v: 2,
+      askKey: askKeyFor('cli_app', 'sess-1', 'host_explicit', 'legacy-exp-join'),
+      requestId: 'legacy-exp-join',
+      originKind: 'host_explicit',
+      askId: 'ask-legacy-exp-join',
+      nonce: 'n_jn',
+      larkAppId: 'cli_app',
+      chatId: 'oc_chat',
+      rootMessageId: null,
+      sessionId: 'sess-1',
+      chatType: 'group',
+      questions: inputB.questions,
+      createdAt: now - 1000,
+      deadlineAt: now + 60_000,
+      timeoutMs: 60_000,
+      timeoutStartsAfterDelivery: true,
+      timeoutStartedAt: now - 900,
+      cardMessageId: 'om_card_join',
+      selections: [[]],
+    });
+    expect(restorePersistedAsks(now, 'cli_app')).toBe(1);
+    const contB = createExplicitAskContinuation({
+      dir: receiptsDirB, appId: 'cli_app',
+      register: registerHostAsk,
+      hydrateCardRoot: hydrateLegacyExplicitAskCardRoot,
+      canResume: () => true, dispatch: async () => false, onError: err => { throw err; },
+    });
+    await contB.sweep(); // flips dormant=false and caches promise in running
+    void contB.wait(inputB, undefined, { cardRootMessageId: 'om_joined_topic' });
+    expect(listPendingAsksByAnchor({ larkAppId: 'cli_app', chatId: 'oc_chat', anchor: 'oc_chat', messageRootId: 'om_other' })).toEqual([]);
+    expect(findPendingAskByAnchor({ larkAppId: 'cli_app', chatId: 'oc_chat', anchor: 'oc_chat', messageRootId: 'om_joined_topic' })?.askId)
+      .toBe('ask-legacy-exp-join');
+  });
+
   it('preserves document recipient, responder lock and exact-card text routing across restart', async () => {
     const target = { kind: 'document-author' as const, openId: 'ou_owner', turnId: 'turn-A',
       fileToken: 'fixture', commentId: 'comment' };

@@ -975,6 +975,14 @@ function emitTurnActivity(turn: ActiveTurn, phase: 'submitted' | 'progress' | 'c
   });
 }
 
+function publishTurnThinking(turn: ActiveTurn, method: string, params: JsonObject): void {
+  const entries = cotCollector.observe(method, params);
+  const replyTurnId = turn.accepted?.at(-1)?.replyTurnId;
+  if (!replyTurnId || entries.length === 0) return;
+  const marker = prepareCodexAppCotMarker(replyTurnId, entries);
+  if (marker) emitMarker('thinking', marker);
+}
+
 const userInputRequests = new Map<number | string, { turnId?: string; controller: AbortController }>();
 const asyncUserInputRequests = new Map<string, { turnId: string; controller: AbortController }>();
 const seenAsyncQuestions = new Set<string>();
@@ -1618,15 +1626,32 @@ function handleNotification(msg: JsonObject, replayedAfterResponse = false): voi
     turn.keepPendingDeadlineAtMs = Date.now() + keepPendingTimeoutMs();
   }
 
-  const cotEntries = cotCollector.observe(msg.method, params);
-  const cotTurnId = turn.accepted?.at(-1)?.replyTurnId;
-  if (cotTurnId && cotEntries.length > 0) {
-    const marker = prepareCodexAppCotMarker(cotTurnId, cotEntries);
-    if (marker) emitMarker('thinking', marker);
+  const item = params.item;
+  if (msg.method === 'item/completed' && item?.type === 'agentMessage' && item.delivery === 'async') {
+    const id = String(item.id);
+    turn.asyncItemIds.add(id);
+    turn.itemText.delete(id);
+    turn.allAgentText = [...turn.itemText.values()].join('');
+    // Plain async notices and async questions share the same delivery tag.
+    // Only an item with a question payload belongs to the ask broker.
+    if (item.questions != null) {
+      if (typeof notificationTurnId === 'string') handleAsyncUserInput(item, notificationTurnId, turn);
+    } else if (!turn.knownAgentItemIds.has(id)) {
+      turn.knownAgentItemIds.add(id);
+      // A plain notice carries no promise of a trailing newline; without one
+      // it fuses with the next terminal line. Keep the thinking marker on the
+      // raw text — only the PTY display gets the boundary.
+      if (typeof item.text === 'string' && item.text.trim()) {
+        output.display(item.text.endsWith('\n') ? item.text : `${item.text}\n`);
+      }
+      publishTurnThinking(turn, msg.method, params);
+    }
+    return;
   }
 
+  publishTurnThinking(turn, msg.method, params);
+
   if (msg.method === 'item/started') {
-    const item = params.item;
     if (item?.type === 'agentMessage') {
       if (item.delivery === 'async') turn.asyncItemIds.add(String(item.id));
       else {
@@ -1661,15 +1686,7 @@ function handleNotification(msg: JsonObject, replayedAfterResponse = false): voi
   }
 
   if (msg.method === 'item/completed') {
-    const item = params.item;
     if (item?.type === 'agentMessage') {
-      if (item.delivery === 'async') {
-        turn.asyncItemIds.add(String(item.id));
-        turn.itemText.delete(String(item.id));
-        turn.allAgentText = [...turn.itemText.values()].join('');
-        if (typeof notificationTurnId === 'string') handleAsyncUserInput(item, notificationTurnId, turn);
-        return;
-      }
       const id = String(item.id);
       if (!turn.knownAgentItemIds.has(id)) output.display(String(turn.itemText.get(id) ?? item.text ?? ''));
       turn.knownAgentItemIds.add(id);

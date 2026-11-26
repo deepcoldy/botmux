@@ -6,8 +6,8 @@ import { config } from '../src/config.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { CreateAskInput, PendingAsk } from '../src/core/ask-types.js';
 import { NATIVE_STANDALONE_ASK_ORIGIN } from '../src/core/ask-types.js';
-import { _allAskIds, _resetForTest, getAskSnapshot, registerAsk, setCanTalkChecker, setCardDispatcher,
-  setAskPersistStore, restorePersistedAsks, submitAskFromDesktop, invalidateReplyCardAsks } from '../src/core/ask-broker.js';
+import { _allAskIds, _resetForTest, findPendingAskByAnchor, getAskSnapshot, listPendingAsksByAnchor, registerAsk, setCanTalkChecker, setCardDispatcher,
+  setAskPersistStore, restorePersistedAsks, submitAskFromDesktop, submitCustomReply, invalidateReplyCardAsks } from '../src/core/ask-broker.js';
 import { createAskPersistStore } from '../src/core/ask-persist-store.js';
 import { createLarkAskCardDispatcher, handleAskCardAction } from '../src/im/lark/ask-card.js';
 import { publishReplyCardAsk, replyCardAskTarget } from '../src/core/turn-reply-ask.js';
@@ -17,7 +17,7 @@ import { buildTurnReplyCard, publicReplyCardActivity, publicReplyCardTools } fro
 import { buildTurnReplyAskElements } from '../src/im/lark/turn-reply-ask-elements.js';
 import { buildCanonicalFinalReplyCard } from '../src/im/lark/md-card.js';
 import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from '../src/im/lark/turn-reply-card-size.js';
-import { replyMessage, sendMessage, updateMessage } from '../src/im/lark/client.js';
+import { replyMessage, sendMessage, updateMessage, uploadFile } from '../src/im/lark/client.js';
 import { observePublishedGroupMessage } from '../src/services/group-context-runtime.js';
 import { bindGroupContextDelivery, writePreparedGroupContext } from '../src/services/group-context-delivery-store.js';
 import { groupContextEpoch } from '../src/services/group-context-prompt.js';
@@ -27,7 +27,7 @@ vi.mock('../src/im/lark/ask-grant-request.js', () => ({ requestGrantForAskClicke
 vi.mock('../src/im/lark/card-handler.js', () => ({ resolveCardOperatorUnionId: vi.fn() }));
 vi.mock('../src/core/cost-calculator.js', () => ({ getSessionUsageSnapshot: vi.fn() }));
 vi.mock('../src/bot-registry.js', () => ({ getBot: () => ({ config: { larkAppId: 'app', cliId: 'claude-code' } }), normalizeUsageDisplay: () => 'off' }));
-vi.mock('../src/im/lark/client.js', () => ({ replyMessage: vi.fn(), sendMessage: vi.fn(), sendUserMessage: vi.fn(), updateMessage: vi.fn(), MessageWithdrawnError: class extends Error {} }));
+vi.mock('../src/im/lark/client.js', () => ({ replyMessage: vi.fn(), sendMessage: vi.fn(), sendUserMessage: vi.fn(), updateMessage: vi.fn(), uploadFile: vi.fn(async () => 'file_key_overflow'), MessageWithdrawnError: class extends Error {} }));
 vi.mock('../src/services/group-context-runtime.js', () => ({ observePublishedGroupMessage: vi.fn() }));
 
 const key = { larkAppId: 'app', sessionId: 'sid', turnId: 'om_turn' };
@@ -509,6 +509,174 @@ describe('Ask inside the running reply card', () => {
     expect(hidden).not.toContain('config.ts');
     expect(hidden).toContain('已找到配置');
     expect(hidden).toContain('继续执行吗');
+  });
+
+  it('P2: 回复卡尚无 messageId（含 native CoT 抑制起始卡）时，chat-scope 内嵌 Ask 首发与文字捕获区均落到冻结话题', async () => {
+    const chatKey = { larkAppId: 'app', sessionId: 'sid-chat-p2', turnId: 'om_turn_p2' };
+    await store.prepare(chatKey, { mode: 'unified', chatId: 'oc_chat', rootId: 'oc_chat', nativeCot: true });
+    // Native CoT display suppresses the initial reply card so messageId remains absent.
+    const suppressed = await store.update(chatKey, { kind: 'start' }, {
+      ...io,
+      beforeCreate: () => true,
+      nativeThinkingLive: () => true,
+    });
+    expect(suppressed.delivered).toBe(false);
+    expect(store.read(chatKey)?.messageId).toBeUndefined();
+    vi.mocked(replyMessage).mockClear();
+    vi.mocked(sendMessage).mockClear();
+    vi.mocked(observePublishedGroupMessage).mockClear();
+
+    const ds = {
+      larkAppId: 'app', chatId: 'oc_chat', scope: 'chat' as const, replyCardRunningTurnId: 'om_turn_p2',
+      session: { sessionId: 'sid-chat-p2', scope: 'chat' as const, rootMessageId: 'oc_chat', cliId: 'claude-code' },
+    } as DaemonSession;
+    const chatAskInput: CreateAskInput = {
+      ...input,
+      sessionId: 'sid-chat-p2',
+      rootMessageId: null,
+      cardRootMessageId: 'om_ask_topic',
+      replyCardTarget: undefined,
+    };
+    const target = replyCardAskTarget(ds, chatAskInput, { originTurnId: 'om_turn_p2' });
+    expect(target).toEqual({ turnId: 'om_turn_p2' });
+
+    const waiting = registerAsk({ ...chatAskInput, replyCardTarget: target });
+    const id = _allAskIds().at(-1)!;
+    await vi.waitFor(() => expect(getAskSnapshot(id)?.cardMessageId).toBe('om_reply'));
+    await Promise.allSettled([...publishing]);
+
+    // First delivery MUST reply into the frozen topic, never sendMessage to outer chat.
+    expect(replyMessage).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(replyMessage).mock.calls[0]?.[1]).toBe('om_ask_topic');
+    expect(sendMessage).not.toHaveBeenCalled();
+    // TurnReplyCardRecord.rootId stays the session anchor ('oc_chat').
+    expect(store.read(chatKey)?.rootId).toBe('oc_chat');
+
+    // Text capture zone aligns with the card's delivered topic: outer chat & other topics see 0 candidates.
+    const route = { larkAppId: 'app', chatId: 'oc_chat', anchor: 'oc_chat' };
+    expect(listPendingAsksByAnchor({ ...route, messageRootId: null })).toEqual([]);
+    expect(listPendingAsksByAnchor({ ...route, messageRootId: 'om_other_topic' })).toEqual([]);
+    const found = findPendingAskByAnchor({ ...route, messageRootId: 'om_ask_topic' });
+    expect(found?.askId).toBe(id);
+
+    expect(submitCustomReply({ askId: id, by: 'ou_owner', text: '同话题答复' })).toBe('accepted');
+    expect(await waiting).toMatchObject({ kind: 'answered', comment: '同话题答复' });
+    await Promise.allSettled([...publishing]);
+    expect(vi.mocked(observePublishedGroupMessage).mock.calls.at(-1)?.[1]).toMatchObject({
+      message_id: 'om_reply',
+      root_id: 'om_ask_topic',
+    });
+  });
+
+  it('P2: chat-scope 内嵌 Ask 触发 sendOverflow 时同样回复进冻结话题，且外层 turn 仍发群外层', async () => {
+    const overflowKey = { larkAppId: 'app', sessionId: 'sid-chat-overflow', turnId: 'om_turn_ov' };
+    await store.prepare(overflowKey, { mode: 'unified', chatId: 'oc_chat', rootId: 'oc_chat' });
+    // Store >6000 bytes of progress on a terminal turn without finalCard so TurnReplyCardStore triggers sendOverflow.
+    await store.update(overflowKey, { kind: 'progress', text: '详细日志 '.repeat(1200) }, {
+      ...io,
+      send: (content, uuid) => replyMessage('app', 'om_ask_topic', content, 'interactive', true, uuid),
+      sendOverflow: async () => 'om_pre',
+    });
+    const record = store.read(overflowKey)!;
+    delete record.messageId;
+    delete record.overflowMessageId;
+    record.phase = 'completed';
+    store.write(overflowKey, record);
+    vi.mocked(replyMessage).mockClear();
+    vi.mocked(sendMessage).mockClear();
+    vi.mocked(uploadFile).mockClear();
+
+    const overflowAsk: PendingAsk = {
+      askId: 'ask-ov', nonce: 'nonce-ov', larkAppId: 'app', chatId: 'oc_chat',
+      rootMessageId: null, cardRootMessageId: 'om_ask_topic', sessionId: 'sid-chat-overflow',
+      replyCardTarget: { turnId: 'om_turn_ov' },
+      questions: input.questions, createdAt: 1_000, deadlineAt: 61_000, settled: false,
+    };
+    const settledResult = { kind: 'answered' as const, answers: [['yes']], by: 'ou_owner', comment: null, timedOut: false };
+    await publishReplyCardAsk(overflowAsk, settledResult);
+    expect(uploadFile).toHaveBeenCalledTimes(1);
+    const fileReply = vi.mocked(replyMessage).mock.calls.find(c => c[3] === 'file');
+    const cardReply = vi.mocked(replyMessage).mock.calls.find(c => c[3] === 'interactive');
+    expect(fileReply?.[1]).toBe('om_ask_topic');
+    expect(cardReply?.[1]).toBe('om_ask_topic');
+    expect(sendMessage).not.toHaveBeenCalled();
+
+    // Pure outer-chat turn (no cardRootMessageId, rootMessageId=null) still uses sendMessage.
+    const outerKey = { larkAppId: 'app', sessionId: 'sid-chat-outer', turnId: 'om_turn_outer' };
+    await store.prepare(outerKey, { mode: 'unified', chatId: 'oc_chat', rootId: 'oc_chat' });
+    vi.mocked(replyMessage).mockClear();
+    vi.mocked(sendMessage).mockClear();
+    vi.mocked(updateMessage).mockImplementation(async (_app, id, content) => { expect(id).toBe('om_standalone'); body = content; });
+    const outerWaiting = registerAsk({
+      ...input,
+      sessionId: 'sid-chat-outer',
+      rootMessageId: null,
+      cardRootMessageId: undefined,
+      replyCardTarget: { turnId: 'om_turn_outer' },
+    });
+    const outerId = _allAskIds().at(-1)!;
+    await vi.waitFor(() => expect(getAskSnapshot(outerId)?.cardMessageId).toBe('om_standalone'));
+    await Promise.allSettled([...publishing]);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(replyMessage).not.toHaveBeenCalled();
+    expect(listPendingAsksByAnchor({ larkAppId: 'app', chatId: 'oc_chat', anchor: 'oc_chat', messageRootId: 'om_ask_topic' })).toEqual([]);
+    expect(findPendingAskByAnchor({ larkAppId: 'app', chatId: 'oc_chat', anchor: 'oc_chat', messageRootId: null })?.askId).toBe(outerId);
+    expect(submitCustomReply({ askId: outerId, by: 'ou_owner', text: '外层回复' })).toBe('accepted');
+    await outerWaiting;
+    await Promise.allSettled([...publishing]);
+    expect(body).toContain('外层回复');
+  });
+
+  it('P2: 非法的非 om_ cardRootMessageId 不会破坏已有的合法 om_ rootMessageId', async () => {
+    const fallbackKey = { larkAppId: 'app', sessionId: 'sid-fallback', turnId: 'om_turn_fb' };
+    await store.prepare(fallbackKey, { mode: 'unified', chatId: 'oc_chat', rootId: 'om_root' });
+    vi.mocked(replyMessage).mockClear();
+    vi.mocked(sendMessage).mockClear();
+
+    const fallbackAsk: PendingAsk = {
+      askId: 'ask-fb', nonce: 'nonce-fb', larkAppId: 'app', chatId: 'oc_chat',
+      rootMessageId: 'om_root', cardRootMessageId: 'oc_chat', sessionId: 'sid-fallback',
+      replyCardTarget: { turnId: 'om_turn_fb' },
+      questions: input.questions, createdAt: 1_000, deadlineAt: 61_000, settled: false,
+    };
+    await publishReplyCardAsk(fallbackAsk);
+    expect(replyMessage).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(replyMessage).mock.calls[0]?.[1]).toBe('om_root');
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('P2: nativeCot 尚未完成排序屏障（nativeCotReady=undefined 且无 messageId）时退回独立提问卡发进冻结话题，不触发 card_delivery_failed', async () => {
+    const barrierKey = { larkAppId: 'app', sessionId: 'sid-cot-barrier', turnId: 'om_turn_barrier' };
+    await store.prepare(barrierKey, { mode: 'unified', chatId: 'oc_chat', rootId: 'oc_chat', nativeCot: true });
+    expect(store.read(barrierKey)?.nativeCotReady).toBeUndefined();
+    expect(store.read(barrierKey)?.messageId).toBeUndefined();
+    vi.mocked(replyMessage).mockClear();
+    vi.mocked(sendMessage).mockClear();
+
+    const ds = {
+      larkAppId: 'app', chatId: 'oc_chat', scope: 'chat' as const, replyCardRunningTurnId: 'om_turn_barrier',
+      session: { sessionId: 'sid-cot-barrier', scope: 'chat' as const, rootMessageId: 'oc_chat', cliId: 'claude-code' },
+    } as DaemonSession;
+    const barrierInput: CreateAskInput = {
+      ...input,
+      sessionId: 'sid-cot-barrier',
+      rootMessageId: null,
+      cardRootMessageId: 'om_barrier_topic',
+      replyCardTarget: undefined,
+    };
+    const target = replyCardAskTarget(ds, barrierInput, { originTurnId: 'om_turn_barrier' });
+    expect(target).toBeUndefined();
+
+    // Standalone Ask card delivers cleanly into om_barrier_topic instead of invalidating with card_delivery_failed.
+    const waiting = registerAsk({ ...barrierInput, replyCardTarget: target });
+    const id = _allAskIds().at(-1)!;
+    await vi.waitFor(() => expect(getAskSnapshot(id)?.cardMessageId).toBe('om_reply'));
+    expect(getAskSnapshot(id)?.settled).toBe(false);
+    expect(replyMessage).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(replyMessage).mock.calls[0]?.[1]).toBe('om_barrier_topic');
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(submitCustomReply({ askId: id, by: 'ou_owner', text: '继续' })).toBe('accepted');
+    expect(await waiting).toMatchObject({ kind: 'answered', comment: '继续' });
   });
 });
 

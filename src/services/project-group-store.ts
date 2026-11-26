@@ -60,6 +60,10 @@ export interface ProjectGroupState {
     messageId: string;
     pinned: boolean;
     updatedAt: string;
+    /** Business state committed by a producer that leaves publication to sync. */
+    refreshPending?: true;
+    /** Only newly sent cards awaiting pin confirmation are eligible for repair. */
+    pinRetryAt?: number;
   };
   createdAt: string;
   updatedAt: string;
