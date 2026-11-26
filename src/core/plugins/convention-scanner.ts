@@ -13,8 +13,14 @@ import type {
   PluginCommandsContribution,
   PluginMcpServer,
   PluginServiceMode,
+  PluginWebhooksContribution,
   ScannedPluginContributions,
 } from './types.js';
+import {
+  assertWebhookRoutesAvoidReservedEndpoints,
+  collectReservedPluginCallbackEndpoints,
+  parsePluginWebhooksContribution,
+} from './webhooks/protocol.js';
 import {
   isValidProtectedMcpCapabilityId,
   PROTECTED_MCP_SECRET_FD_ENV,
@@ -339,6 +345,16 @@ const scanCommands = (
   return { schemaVersion: 1, endpoint, commands, ...(record.afterClose === true ? { afterClose: true } : {}), ...(record.replacesCloseTag === true ? { replacesCloseTag: true } : {}) };
 };
 
+const scanWebhooks = (
+  runtimeDir: string,
+  service: ScannedPluginContributions['service'],
+): PluginWebhooksContribution | undefined => {
+  const rel = 'webhooks/index.json';
+  if (!isFile(join(runtimeDir, rel))) return undefined;
+  if (!service) throw new Error('plugin_webhooks_service_required');
+  return parsePluginWebhooksContribution(JSON.parse(readFileSync(join(runtimeDir, rel), 'utf-8')));
+};
+
 export function scanPluginContributions(runtimeDir: string, manifest: BotmuxPluginManifest): ScannedPluginContributions | undefined {
   const skills = scanSkills(runtimeDir, manifest.id);
   const mcp = scanMcp(runtimeDir, manifest.id);
@@ -347,6 +363,13 @@ export function scanPluginContributions(runtimeDir: string, manifest: BotmuxPlug
   const service = scanService(runtimeDir, manifest.service?.mode);
   const cardActions = scanCardActions(runtimeDir, service);
   const commands = scanCommands(runtimeDir, service);
+  const webhooks = scanWebhooks(runtimeDir, service);
+  if (webhooks) {
+    assertWebhookRoutesAvoidReservedEndpoints(
+      webhooks,
+      collectReservedPluginCallbackEndpoints({ cardActions, commands }),
+    );
+  }
   const prerequisiteEntry = 'prerequisites/index.mjs';
   if (manifest.prerequisites && !isFile(resolvePluginPath(runtimeDir, prerequisiteEntry, 'prerequisites_entry'))) {
     throw new Error('plugin_prerequisites_entry_not_found');
@@ -361,6 +384,7 @@ export function scanPluginContributions(runtimeDir: string, manifest: BotmuxPlug
   };
   if (cardActions) contributions.cardActions = cardActions;
   if (commands) contributions.commands = commands;
+  if (webhooks) contributions.webhooks = webhooks;
   return Object.keys(contributions).length > 0 ? contributions : undefined;
 }
 
