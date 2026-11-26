@@ -7631,7 +7631,7 @@ async function cmdProject(argv: string[]): Promise<void> {
     ipcPort,
     session.sessionId,
     'workstream' in parsed ? 'project-workstream' : 'project',
-    'workstream' in parsed ? parsed.workstream : parsed.action as unknown as Record<string, unknown>,
+    'workstream' in parsed ? parsed.workstream : { ...parsed.action, cardPublication: 'repost' },
   );
   if ('workstream' in parsed) {
     const result = await response.json().catch(() => ({})) as { ok?: boolean; error?: string; hint?: string; result?: unknown; grantId?: string };

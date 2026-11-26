@@ -8,7 +8,7 @@ const APP_ID_OWNER_RE = /^cli_[A-Za-z0-9_-]{1,128}$/u;
 
 /**
  * 同一份卡片摘要最多连续刷新 3 次，约覆盖 1.5 分钟的瞬时故障。预算耗尽后停止 PATCH。
- * 如果最后一次是飞书编辑窗口过期（230031），后台可尝试重发，每个摘要一次、每群间隔至少 10 分钟。
+ * 窗口内出现过飞书编辑过期（230031）才允许后台重发，每个摘要一次、每群间隔至少 10 分钟。
  */
 export const PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST = 3;
 const PROJECT_CARD_REPOST_COOLDOWN_MS = 10 * 60_000;
@@ -23,6 +23,7 @@ export interface ProjectCardRuntimeSyncDeps {
   refresh(project: ProjectGroupState, target: ProjectCardSyncTarget): Promise<ProjectCardPublication | undefined>;
   isMessageUpdateExpired(error: unknown): boolean;
   repostExpiredCard(project: ProjectGroupState, target: ProjectCardSyncTarget): Promise<ProjectCardPublication | undefined>;
+  retryPendingCardPin(project: ProjectGroupState, messageId: string): Promise<ProjectGroupState | undefined>;
   /** 主控在本机别的 daemon 上：只把群 ID 转过去，由主控自己重读状态。 */
   forwardToCoordinator(coordinatorAppId: string, chatId: string): void;
   onDeferred?(chatId: string, error: unknown): void;
@@ -39,55 +40,32 @@ function hasDynamicWorkstreams(project: ProjectGroupState): boolean {
     || item.owners.some(owner => APP_ID_OWNER_RE.test(owner.trim())));
 }
 
+type CardSyncState = ProjectCardSyncTarget & (
+  | { status: 'published' | 'pinPending' }
+  | { status: 'failed'; failures: number; sawExpired: boolean }
+);
+
 /**
  * 主控置顶卡的运行态刷新：会话状态变化事件、迁入关联变化与 30 秒兜底 tick 都走这里。
  * 同群刷新串行。摘要变化时重新计数，过期重发与 PATCH 分开限频。
  */
 export function createProjectCardRuntimeSync(deps: ProjectCardRuntimeSyncDeps): ProjectCardRuntimeSync {
-  const published = new Map<string, {
-    digest: string; messageId?: string; failures: number; awaitingRepost?: boolean;
-  }>();
+  const states = new Map<string, CardSyncState>();
   const reposts = new Map<string, { revision: number; cooldownUntil: number; digests: Set<string> }>();
   const syncing = new Set<string>();
   const pending = new Map<string, ReturnType<typeof setTimeout>>();
 
-  async function syncProject(project: ProjectGroupState, messageId: string): Promise<void> {
+  function rememberPublication({ project, digest }: ProjectCardPublication): void {
+    if (!project.card) return;
+    states.set(project.chatId, {
+      digest, messageId: project.card.messageId,
+      status: project.card.pinned ? 'published' : 'pinPending',
+    });
+  }
+
+  async function repostIfAllowed(project: ProjectGroupState, target: ProjectCardSyncTarget): Promise<void> {
     const { chatId } = project;
-    const mode = deps.readMode(chatId);
-    if (mode?.mode !== 'project' || mode.coordinatorAppId !== deps.larkAppId) return;
-    if (!hasDynamicWorkstreams(project)) return;
-    const runtime = await deps.resolveRuntime(project);
-    const digest = buildProjectGroupCardDigest(project, runtime);
-    const target = { messageId, digest };
-    const cached = published.get(chatId);
-    const last = cached?.digest === digest && cached.messageId === messageId ? cached : undefined;
-    if (last?.failures === 0) return;
-
-    function rememberPublished(result: ProjectCardPublication): void {
-      published.set(chatId, {
-        digest: result.digest,
-        messageId: result.project.card?.messageId,
-        failures: 0,
-      });
-    }
-
-    let failures = last?.failures ?? 0;
-    if (failures < PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST) {
-      try {
-        const updated = await deps.refresh(project, target);
-        if (updated) rememberPublished(updated);
-        return;
-      } catch (error) {
-        failures += 1;
-        const awaitingRepost = failures === PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST && deps.isMessageUpdateExpired(error);
-        published.set(chatId, { digest, messageId, failures, awaitingRepost });
-        deps.onDeferred?.(chatId, error);
-        if (!awaitingRepost) return;
-      }
-    } else if (!last?.awaitingRepost) {
-      return;
-    }
-
+    const { digest } = target;
     const previous = reposts.get(chatId);
     if (previous && Date.now() < previous.cooldownUntil) return;
     // The digest includes the monotonically increasing project revision. Keep
@@ -104,12 +82,63 @@ export function createProjectCardRuntimeSync(deps: ProjectCardRuntimeSyncDeps): 
       const updated = await deps.repostExpiredCard(project, target);
       if (updated) {
         rememberAttempt();
-        rememberPublished(updated);
+        rememberPublication(updated);
       }
     } catch (error) {
       rememberAttempt();
-      published.set(chatId, { digest, messageId, failures: failures + 1 });
+      states.set(chatId, {
+        ...target, status: 'failed', failures: PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST + 1, sawExpired: true,
+      });
       deps.onDeferred?.(chatId, error);
+    }
+  }
+
+  async function retryPinIfDue(project: ProjectGroupState): Promise<void> {
+    const { card, chatId } = project;
+    if (!card || card.pinned || card.pinRetryAt === undefined || card.pinRetryAt > Date.now()) return;
+    try {
+      const updated = await deps.retryPendingCardPin(project, card.messageId);
+      const state = states.get(chatId);
+      if (updated?.card?.messageId === card.messageId && updated.card.pinned
+        && state?.status === 'pinPending' && state.messageId === card.messageId) {
+        states.set(chatId, { ...state, status: 'published' });
+      }
+    } catch (error) {
+      deps.onDeferred?.(chatId, error);
+    }
+  }
+
+  async function syncProject(project: ProjectGroupState, messageId: string): Promise<void> {
+    const { chatId, card } = project;
+    const mode = deps.readMode(chatId);
+    if (mode && (mode.mode !== 'project' || mode.coordinatorAppId !== deps.larkAppId)) return;
+    if (!mode && !card?.refreshPending && card?.pinRetryAt === undefined) return;
+    await retryPinIfDue(project);
+    if (!card?.refreshPending && !hasDynamicWorkstreams(project)) return;
+
+    const runtime = await deps.resolveRuntime(project);
+    const digest = buildProjectGroupCardDigest(project, runtime);
+    const target = { messageId, digest };
+    const state = states.get(chatId);
+    const last = state?.digest === digest && state.messageId === messageId ? state : undefined;
+    // Even with a pin pending, the rendered content does not need another PATCH.
+    if (last && last.status !== 'failed') return;
+    let failures = last?.failures ?? 0;
+    let sawExpired = last?.sawExpired ?? false;
+    if (failures < PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST) {
+      try {
+        const updated = await deps.refresh(project, target);
+        if (updated) rememberPublication(updated);
+        return;
+      } catch (error) {
+        failures += 1;
+        sawExpired ||= deps.isMessageUpdateExpired(error);
+        states.set(chatId, { ...target, status: 'failed', failures, sawExpired });
+        deps.onDeferred?.(chatId, error);
+      }
+    }
+    if (failures === PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST && sawExpired) {
+      await repostIfAllowed(project, target);
     }
   }
 

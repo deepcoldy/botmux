@@ -439,13 +439,15 @@ describe('project group mode', () => {
       error.name = 'MessageUpdateExpiredError';
       throw error;
     });
-    const updated = await f.coordinator.run(f.context, { action: 'update', focus: '过期重发' });
+    const updated = await f.coordinator.run({ ...f.context, cardPublication: 'repost' }, {
+      action: 'update', focus: '过期重发',
+    });
     expect(updated.card).toMatchObject({ messageId: 'om_card_2', pinned: true });
     expect(updated.focus).toBe('过期重发');
     expect(f.transport.unpinMessage).toHaveBeenCalledWith('cli_coordinator', 'om_card_1');
   });
 
-  it.each(['unconfirmed', 'throws'] as const)('logs the old card ID and still replaces it when unpin %s', async outcome => {
+  it.each(['unconfirmed', 'throws'] as const)('logs and retains the old pinned card when unpin %s', async outcome => {
     const f = fixture();
     await f.coordinator.run(f.context, { action: 'init', title: '项目', goal: '完成目标' });
     vi.mocked(f.transport.updateCard).mockRejectedValue(
@@ -458,39 +460,48 @@ describe('project group mode', () => {
       vi.mocked(f.transport.unpinMessage).mockRejectedValue(new Error('unpin temporarily unavailable'));
     }
 
-    await f.coordinator.run(f.context, { action: 'update', focus: '过期重发' });
+    await expect(f.coordinator.run({ ...f.context, cardPublication: 'repost' }, {
+      action: 'update', focus: '过期重发',
+    })).rejects.toThrow(outcome === 'unconfirmed' ? 'project_card_unpin_unconfirmed' : 'unpin temporarily unavailable');
     expect(f.transport.unpinMessage).toHaveBeenCalledExactlyOnceWith('cli_coordinator', 'om_card_1');
     expect(warn).toHaveBeenCalledExactlyOnceWith(expect.stringContaining('om_card_1'));
-    expect(f.transport.pinMessage).toHaveBeenLastCalledWith('cli_coordinator', 'om_card_2');
-    expect(readProjectGroup(f.dataDir, f.context.chatId)?.card).toMatchObject({ messageId: 'om_card_2', pinned: true });
+    expect(f.transport.sendCard).toHaveBeenCalledTimes(1);
+    expect(f.transport.pinMessage).toHaveBeenCalledExactlyOnceWith('cli_coordinator', 'om_card_1');
+    expect(readProjectGroup(f.dataDir, f.context.chatId)?.card).toMatchObject({ messageId: 'om_card_1', pinned: true });
   });
 
-  it('does not unpin an expired card that was never pinned', async () => {
+  it('does not unpin an expired card again after confirmed unpin and failed send', async () => {
     const f = fixture();
-    vi.mocked(f.transport.pinMessage).mockResolvedValueOnce(false);
-    const initial = await f.coordinator.run(f.context, { action: 'init', title: '项目', goal: '完成目标' });
-    expect(initial.card?.pinned).toBe(false);
+    const manual = { ...f.context, cardPublication: 'repost' } as const;
+    await f.coordinator.run(f.context, { action: 'init', title: '项目', goal: '完成目标' });
     vi.mocked(f.transport.updateCard).mockRejectedValue(
       Object.assign(new Error('past edit window'), { name: 'MessageUpdateExpiredError' }),
     );
+    vi.mocked(f.transport.sendCard).mockRejectedValueOnce(new Error('send failed'));
+    await expect(f.coordinator.run(manual, { action: 'refresh' })).rejects.toThrow('send failed');
+    expect(readProjectGroup(f.dataDir, f.context.chatId)?.card).toMatchObject({ messageId: 'om_card_1', pinned: false });
+    expect(f.transport.unpinMessage).toHaveBeenCalledExactlyOnceWith('cli_coordinator', 'om_card_1');
 
-    await f.coordinator.run(f.context, { action: 'update', focus: '过期重发' });
-    expect(f.transport.unpinMessage).not.toHaveBeenCalled();
+    await f.coordinator.run(manual, { action: 'update', focus: '过期重发' });
+    expect(f.transport.unpinMessage).toHaveBeenCalledTimes(1);
     expect(f.transport.pinMessage).toHaveBeenLastCalledWith('cli_coordinator', 'om_card_2');
     expect(readProjectGroup(f.dataDir, f.context.chatId)?.card).toMatchObject({ messageId: 'om_card_2', pinned: true });
   });
 
-  it('only recovers from expiry inline when a refresh opts into reposting', async () => {
+  it.each([
+    { action: 'refresh' },
+    { action: 'update', focus: '手工恢复' },
+  ] as const)('only recovers from expiry inline when $action opts into reposting', async action => {
     const f = fixture();
     await f.coordinator.run(f.context, { action: 'init', title: '项目', goal: '完成目标' });
     const expired = Object.assign(new Error('past edit window'), { name: 'MessageUpdateExpiredError' });
     vi.mocked(f.transport.updateCard).mockRejectedValue(expired);
 
-    await expect(f.coordinator.run(f.context, { action: 'refresh' })).rejects.toBe(expired);
+    await expect(f.coordinator.run(f.context, action)).rejects.toBe(expired);
     expect(f.transport.sendCard).toHaveBeenCalledTimes(1);
     expect(f.transport.unpinMessage).not.toHaveBeenCalled();
 
-    const refreshed = await f.coordinator.run(f.context, { action: 'refresh', repostOnExpired: true });
+    const refreshed = await f.coordinator.run({ ...f.context, cardPublication: 'repost' }, action);
     expect(refreshed.card?.messageId).toBe('om_card_2');
     expect(f.transport.sendCard).toHaveBeenCalledTimes(2);
   });
@@ -506,11 +517,12 @@ describe('project group mode', () => {
       return false;
     });
     const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
-    const replaced = await f.coordinator.run(f.context, { action: 'update', focus: '过期重发' });
+    const manual = { ...f.context, cardPublication: 'repost' } as const;
+    const replaced = await f.coordinator.run(manual, { action: 'update', focus: '过期重发' });
     expect(replaced.card).toMatchObject({ messageId: 'om_card_2', pinned: false });
     expect(warn).toHaveBeenCalledExactlyOnceWith(expect.stringContaining('om_card_2'));
 
-    const repaired = await f.coordinator.run(f.context, { action: 'refresh', repostOnExpired: true });
+    const repaired = await f.coordinator.run(manual, { action: 'refresh' });
     expect(repaired.card).toMatchObject({ messageId: 'om_card_2', pinned: true });
     expect(f.transport.pinMessage).toHaveBeenLastCalledWith('cli_coordinator', 'om_card_2');
     expect(f.transport.sendCard).toHaveBeenCalledTimes(2);

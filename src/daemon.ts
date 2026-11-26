@@ -38743,6 +38743,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     refresh: (project, target) => projectCoordinator.refreshCard(projectCardContext(project), target),
     isMessageUpdateExpired: error => error instanceof MessageUpdateExpiredError,
     repostExpiredCard: (project, target) => projectCoordinator.repostExpiredCard(projectCardContext(project), target),
+    retryPendingCardPin: (project, messageId) => projectCoordinator.retryPendingCardPin(projectCardContext(project), messageId),
     forwardToCoordinator: (coordinatorAppId, chatId) => {
       const peer = findOnlineDaemon(coordinatorAppId, config.session.dataDir);
       if (!peer) return;

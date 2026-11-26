@@ -30,7 +30,7 @@ function gate() {
   return { promise, release };
 }
 
-async function fixture(opts: { owners?: string[]; coordinatorAppId?: string } = {}) {
+async function fixture(opts: { owners?: string[]; coordinatorAppId?: string; legacy?: boolean } = {}) {
   let runtime: ProjectGroupCardRuntime = { ownerDisplayNames: { cli_worker: 'BotAlpha' } };
   let sends = 0;
   const dataDir = mkdtempSync(join(process.env.SESSION_DATA_DIR!, 'project-card-sync-'));
@@ -49,9 +49,11 @@ async function fixture(opts: { owners?: string[]; coordinatorAppId?: string } = 
   const coordinator = new ProjectCoordinator(transport);
   const context = { dataDir, chatId: 'oc_group', larkAppId: 'cli_main', coordinatorSessionId: 'main-one' };
   async function initProject(chatId: string) {
-    await writeGroupCollaborationMode(dataDir, {
-      chatId, mode: 'project', coordinatorAppId: 'cli_main', workerAppIds: ['cli_worker'],
-    });
+    if (!opts.legacy) {
+      await writeGroupCollaborationMode(dataDir, {
+        chatId, mode: 'project', coordinatorAppId: 'cli_main', workerAppIds: ['cli_worker'],
+      });
+    }
     await coordinator.run({ ...context, chatId }, { action: 'init', title: '项目', goal: '合成目标' });
     await coordinator.run({ ...context, chatId }, {
       action: 'dispatch', dispatchRoot: 'om_ws1', title: '子任务一', purpose: '合成',
@@ -77,6 +79,9 @@ async function fixture(opts: { owners?: string[]; coordinatorAppId?: string } = 
     repostExpiredCard: vi.fn((project, target) => coordinator.repostExpiredCard({
       ...context, chatId: project.chatId, coordinatorSessionId: project.coordinatorSessionId,
     }, target)),
+    retryPendingCardPin: (project, messageId) => coordinator.retryPendingCardPin({
+      ...context, chatId: project.chatId, coordinatorSessionId: project.coordinatorSessionId,
+    }, messageId),
     forwardToCoordinator: vi.fn(),
     onDeferred: vi.fn(),
   };
@@ -148,6 +153,137 @@ describe('project card runtime sync', () => {
     await f.sync.sync();
     expect(f.updates()).toBe(PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST + 3);
     expect(f.deps.repostExpiredCard).toHaveBeenCalledTimes(1);
+  });
+
+  it('同一摘要先两次过期后一次瞬时失败，仍在预算耗尽后重发', async () => {
+    const f = await fixture();
+    const transient = new Error('network temporarily unavailable');
+    vi.mocked(f.transport.updateCard)
+      .mockRejectedValueOnce(expiredError())
+      .mockRejectedValueOnce(expiredError())
+      .mockRejectedValueOnce(transient);
+    await f.sync.sync();
+    await f.sync.sync();
+    expect(f.transport.sendCard).toHaveBeenCalledTimes(1);
+    await f.sync.sync();
+    expect(f.deps.onDeferred).toHaveBeenLastCalledWith(f.context.chatId, transient);
+    expect(f.transport.sendCard).toHaveBeenCalledTimes(2);
+    expect(readProjectGroup(f.dataDir, f.context.chatId)?.card).toMatchObject({ messageId: 'om_card_2', pinned: true });
+  });
+
+  it('解除置顶未确认时后台不换卡，也不继续尝试同一摘要', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const f = await fixture();
+    vi.mocked(f.transport.updateCard).mockRejectedValue(expiredError());
+    vi.mocked(f.transport.unpinMessage).mockResolvedValueOnce(false);
+    for (let i = 0; i < PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST; i += 1) await f.sync.sync();
+    expect(f.transport.unpinMessage).toHaveBeenCalledExactlyOnceWith('cli_main', 'om_card');
+    expect(f.transport.sendCard).toHaveBeenCalledTimes(1);
+    expect(f.transport.pinMessage).toHaveBeenCalledTimes(1);
+    expect(readProjectGroup(f.dataDir, f.context.chatId)?.card).toMatchObject({ messageId: 'om_card', pinned: true });
+
+    vi.setSystemTime(Date.now() + 11 * 60_000);
+    await f.sync.sync();
+    expect(f.transport.unpinMessage).toHaveBeenCalledTimes(1);
+    f.setRuntime({ ownerDisplayNames: { cli_worker: 'BotBeta' } });
+    for (let i = 0; i < PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST; i += 1) await f.sync.sync();
+    expect(f.transport.sendCard).toHaveBeenCalledTimes(2);
+    expect(readProjectGroup(f.dataDir, f.context.chatId)?.card).toMatchObject({ messageId: 'om_card_2', pinned: true });
+  });
+
+  it('后台新卡未确认置顶时，跨同步器重建按冷却只补 pin，不重发', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const f = await fixture();
+    vi.mocked(f.transport.updateCard).mockImplementation(async (_appId, messageId) => {
+      if (messageId === 'om_card') throw expiredError();
+    });
+    vi.mocked(f.transport.pinMessage).mockResolvedValueOnce(false).mockResolvedValueOnce(false);
+    for (let i = 0; i < PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST; i += 1) await f.sync.sync();
+    const readCard = () => readProjectGroup(f.dataDir, f.context.chatId)?.card;
+    expect(readCard()).toMatchObject({ messageId: 'om_card_2', pinned: false, pinRetryAt: expect.any(Number) });
+    const firstDue = readCard()!.pinRetryAt!;
+    expect(firstDue).toBeGreaterThan(Date.now());
+    vi.setSystemTime(firstDue - 1);
+    await f.sync.sync();
+    expect(f.transport.pinMessage).toHaveBeenCalledTimes(2);
+    expect(f.updates()).toBe(PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST);
+
+    // A fresh coordinator and sync must honor the stored retry window.
+    const coordinator = new ProjectCoordinator(f.transport);
+    const restarted = createProjectCardRuntimeSync({
+      ...f.deps,
+      retryPendingCardPin: (_project, id) => coordinator.retryPendingCardPin(f.context, id),
+    });
+    await restarted.sync();
+    expect(f.transport.pinMessage).toHaveBeenCalledTimes(2);
+    vi.setSystemTime(firstDue);
+    await restarted.sync();
+    expect(f.transport.pinMessage).toHaveBeenCalledTimes(3);
+    expect(readCard()?.pinned).toBe(false);
+    const secondDue = readCard()!.pinRetryAt!;
+    expect(secondDue).toBeGreaterThan(firstDue);
+    await restarted.sync();
+    expect(f.transport.pinMessage).toHaveBeenCalledTimes(3);
+    vi.setSystemTime(secondDue - 1);
+    await restarted.sync();
+    expect(f.transport.pinMessage).toHaveBeenCalledTimes(3);
+    vi.setSystemTime(secondDue);
+    await restarted.sync();
+    expect(f.transport.pinMessage).toHaveBeenCalledTimes(4);
+    expect(f.transport.pinMessage).toHaveBeenLastCalledWith('cli_main', 'om_card_2');
+    expect(readCard()).toMatchObject({ messageId: 'om_card_2', pinned: true });
+    expect(readCard()?.pinRetryAt).toBeUndefined();
+    expect(f.transport.sendCard).toHaveBeenCalledTimes(2);
+    expect(f.transport.unpinMessage).toHaveBeenCalledExactlyOnceWith('cli_main', 'om_card');
+  });
+
+  it('待补 pin 的旧卡再次过期时，解除置顶不确认就保留该 ID', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const f = await fixture();
+    vi.mocked(f.transport.updateCard).mockRejectedValue(expiredError());
+    vi.mocked(f.transport.pinMessage).mockResolvedValue(false);
+    vi.mocked(f.transport.unpinMessage).mockImplementation(async (_app, id) => id === 'om_card');
+    for (let i = 0; i < PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST; i += 1) await f.sync.sync();
+    vi.setSystemTime(Date.now() + 11 * 60_000);
+    f.setRuntime({ ownerDisplayNames: { cli_worker: 'BotBeta' } });
+    for (let i = 0; i < PROJECT_CARD_REFRESH_ATTEMPTS_PER_DIGEST; i += 1) await f.sync.sync();
+    expect(f.transport.unpinMessage).toHaveBeenLastCalledWith('cli_main', 'om_card_2');
+    expect(f.transport.sendCard).toHaveBeenCalledTimes(2);
+    expect(readProjectGroup(f.dataDir, f.context.chatId)?.card).toMatchObject({
+      messageId: 'om_card_2', pinned: false, pinRetryAt: expect.any(Number),
+    });
+  });
+
+  it('后台 PATCH 等待期间停用项目模式，撤回错误也不补发', async () => {
+    const f = await fixture();
+    const patching = gate();
+    const release = gate();
+    vi.mocked(f.transport.updateCard).mockImplementationOnce(async () => {
+      patching.release();
+      await release.promise;
+      throw Object.assign(new Error('withdrawn'), { name: 'MessageWithdrawnError' });
+    });
+    const syncing = f.sync.sync();
+    await patching.promise;
+    try {
+      await writeGroupCollaborationMode(f.dataDir, { chatId: f.context.chatId, mode: 'standard' });
+    } finally {
+      release.release();
+      await syncing;
+    }
+    expect(f.transport.sendCard).toHaveBeenCalledTimes(1);
+    expect(f.transport.pinMessage).toHaveBeenCalledExactlyOnceWith('cli_main', 'om_card');
+  });
+
+  it('没有群模式行的静态项目也同步已提交的排队回报', async () => {
+    const f = await fixture({ owners: ['人工负责人'], legacy: true });
+    await f.coordinator.run({ ...f.context, cardPublication: 'deferred' }, {
+      action: 'report', dispatchRoot: 'om_ws1', status: 'completed', content: '合成完成',
+    });
+    expect(f.transport.updateCard).not.toHaveBeenCalled();
+    await f.sync.sync();
+    expect(f.transport.updateCard).toHaveBeenCalledExactlyOnceWith('cli_main', 'om_card', expect.any(String));
+    expect(readProjectGroup(f.dataDir, f.context.chatId)?.card?.refreshPending).toBeUndefined();
   });
 
   it('20 个持续过期的 tick 即使摘要变化也只重发一次，冷却结束不额外 PATCH', async () => {
@@ -352,7 +488,7 @@ describe('project card runtime sync', () => {
     });
     const syncing = f.sync.sync();
     await updating.promise;
-    const command = f.coordinator.run(f.context, { action: 'update', focus: '显式操作' });
+    const command = f.coordinator.run({ ...f.context, cardPublication: 'repost' }, { action: 'update', focus: '显式操作' });
     release.release();
     const [project] = await Promise.all([command, syncing]);
 
