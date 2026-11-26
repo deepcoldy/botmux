@@ -706,6 +706,29 @@ describe('group session supervision with the session store', () => {
     expect(io.review).not.toHaveBeenCalled();
   });
 
+  it('does not treat legacy short structured text as a proven preview', async () => {
+    const { task, session, io, outcome } = storedFixture();
+    const ds = { session, chatType: 'group' } as DaemonSession;
+    noteFinalReplyText(ds, task.turnId, 'Build passes\nTAIL_FAILURE: deployment rolled back', 10);
+    stageSessionTurnInbound(dataDir, session.sessionId, task.turnId, {
+      messageId: task.turnId, text: 'Build', via: 'lark', placement: { kind: 'thread', rootMessageId: 'om_root' },
+    });
+    recordSessionTurnReply(dataDir, session.sessionId, task.turnId, {
+      messageId: 'om_legacy_short', responseKind: 'final', at: 10, text: 'Build passes',
+    });
+    const db = openDatabaseSyncOrThrow(join(dataDir, 'session-turns', 'turns.sqlite'));
+    try {
+      db.prepare("UPDATE events SET payload=json_remove(payload, '$.reply.textTruncated') WHERE session_id=? AND turn_id=?")
+        .run(session.sessionId, task.turnId);
+    } finally { db.close(); }
+    const captured = turnSupervisionFinalReply(ds, task.turnId, dataDir)!;
+    expect(captured.complete).toBe(false);
+    io.finalText.mockReturnValue(captured);
+    await outcome();
+    expect(session.groupSessionSupervision).toMatchObject({ state: 'needs_user', reason: 'review_incomplete' });
+    expect(io.review).not.toHaveBeenCalled();
+  });
+
   it('keeps the latest text-bearing final after an attachment-only final', async () => {
     const { session, io } = storedFixture();
     const turnId = session.groupSessionSupervision!.turnId;
@@ -721,7 +744,7 @@ describe('group session supervision with the session store', () => {
     });
     const ds = { session, chatType: 'group' } as DaemonSession;
     const captured = turnSupervisionFinalReply(ds, turnId, dataDir)!;
-    expect(captured).toEqual({ text: answer, complete: true });
+    expect(captured).toMatchObject({ text: answer, complete: true });
     io.finalText.mockReturnValue(captured);
     io.review.mockImplementation(async (_task, reviewAnswer, _signal, stage) => {
       if (stage === 'completion') return { verdict: 'ready' };
@@ -794,6 +817,65 @@ describe('group session supervision with the session store', () => {
     expect(session.groupSessionSupervision).toMatchObject({ state: 'needs_user', reason: 'stopped' });
   });
 
+  it('uses the newest structured final over stale memory in either direction', async () => {
+    const { task, session, io, outcome } = storedFixture();
+    const ds = { session, chatType: 'group' } as DaemonSession;
+    const corrected = 'Build passes\nTAIL_FAILURE: deployment rolled back';
+    noteFinalReplyText(ds, task.turnId, 'Build passes', 9);
+    recordExplicitFinal(session, task.turnId, corrected);
+    expect(turnSupervisionFinalReply(ds, task.turnId, dataDir)).toMatchObject({ text: corrected, complete: true, at: 10 });
+    const newestMemory = 'Build passes\nTAIL_FAILURE: memory correction wins';
+    noteFinalReplyText(ds, task.turnId, newestMemory, 11);
+    expect(turnSupervisionFinalReply(ds, task.turnId, dataDir)).toMatchObject({ text: newestMemory, complete: true, at: 11 });
+
+    io.finalText.mockImplementation(() => turnSupervisionFinalReply(ds, task.turnId, dataDir));
+    io.review.mockImplementation(async (_task, answer, _signal, stage) => {
+      if (stage === 'completion') return { verdict: 'ready' };
+      return answer.includes('TAIL_FAILURE')
+        ? { verdict: 'needs_user', reason: 'Rollback found' }
+        : { verdict: 'accepted', evidence: ['Build passes'] };
+    });
+    await outcome();
+    await outcome(undefined, 'delivered', 12);
+    expect(io.review.mock.calls.map(call => call[1])).toEqual([newestMemory, newestMemory]);
+    expect(session.groupSessionSupervision).toMatchObject({ state: 'needs_user', reason: 'needs_user' });
+  });
+
+  it('issues a fresh Magpie completion invocation after evidence correction', async () => {
+    const { task, session, io, outcome } = storedFixture();
+    const reviewer = { provider: 'magpie', model: 'claude/sonnet' } as const;
+    session.groupSessionSupervision!.reviewer = reviewer;
+    writeFileSync(join(dataDir, 'magpie-reviewer.key'), 'fixture-key', { mode: 0o600 });
+    const transport = vi.fn(async () => Response.json({ choices: [{
+      finish_reason: 'stop',
+      message: { content: JSON.stringify({
+        verdict: 'ready', evidence: [], reason: '', missing: [], minutes: 0, question: '', options: [], recommended: 0,
+      }) },
+    }] }));
+    const restore = __setLoopbackTransportForTests(transport);
+    try {
+      io.review.mockImplementation(async (reviewTask, answer, signal, stage) => reviewGroupSessionTask(reviewTask.reviewer, reviewTask, answer, signal, stage));
+      const ds = { session, chatType: 'group' } as DaemonSession;
+      noteFinalReplyText(ds, task.turnId, 'Build passes', 9);
+      io.finalText.mockImplementation(() => turnSupervisionFinalReply(ds, task.turnId, dataDir));
+      await outcome();
+      expect(session.groupSessionSupervision?.state).toBe('pending_review');
+      expect(transport).toHaveBeenCalledTimes(1);
+      const corrected = 'Build passes\nTAIL_FAILURE: deployment rolled back';
+      noteFinalReplyText(ds, task.turnId, corrected, 10);
+      await outcome(undefined, 'delivered', 11);
+      expect(session.groupSessionSupervision).toMatchObject({ state: 'watching', reviewEpoch: 1, reviewEvidence: corrected });
+      await outcome(undefined, 'delivered', 12);
+      expect(session.groupSessionSupervision).toMatchObject({ state: 'pending_review', reviewEpoch: 1 });
+      expect(session.groupSessionSupervision?.reason).toBeUndefined();
+      expect(transport).toHaveBeenCalledTimes(2);
+      const body = JSON.parse(transport.mock.calls[1]![1]!.body as string) as { messages: { content: string }[] };
+      expect(body.messages[0]!.content).toContain('TAIL_FAILURE: deployment rolled back');
+    } finally {
+      __setLoopbackTransportForTests(restore);
+    }
+  });
+
   it('replaces corrected final evidence and restarts completion review', async () => {
     const { task, session, io, outcome } = storedFixture();
     const ds = { session, chatType: 'group' } as DaemonSession;
@@ -814,7 +896,7 @@ describe('group session supervision with the session store', () => {
     noteFinalReplyText(ds, task.turnId, corrected);
     await outcome(undefined, 'delivered', 11);
     expect(session.groupSessionSupervision).toMatchObject({
-      state: 'watching', reviewEvidence: corrected, reviewEvidenceComplete: true,
+      state: 'watching', reviewEvidence: corrected, reviewEvidenceComplete: true, reviewEpoch: 1,
     });
     expect(io.review).toHaveBeenCalledTimes(1);
     await outcome(undefined, 'delivered', 12);
@@ -852,7 +934,7 @@ describe('group session supervision with the session store', () => {
     await accepting;
     expect(session.groupSessionSupervision).not.toMatchObject({ state: 'accepted' });
     expect(session.groupSessionSupervision).toMatchObject({
-      state: 'watching', reviewEvidence: corrected, reviewEvidenceComplete: true,
+      state: 'watching', reviewEvidence: corrected, reviewEvidenceComplete: true, reviewEpoch: 1,
     });
     expect(sessionStore.getSessionFresh(session.sessionId)?.groupSessionSupervision?.reviewEvidence).toBe(corrected);
     expect(io.dispatch).not.toHaveBeenCalled();

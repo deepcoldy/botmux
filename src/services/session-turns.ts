@@ -443,7 +443,7 @@ export function recordSessionTurnReply(
  * boundary. The persisted flag distinguishes full text from a scrubbed prefix. */
 export function readSessionTurnFinalReply(
   dataDir: string, sessionId: string, turnId: string,
-): { text: string; complete: boolean } | undefined {
+): { text: string; complete: boolean; at: number; prefixProven?: boolean } | undefined {
   if (!existsSync(databasePath(dataDir))) return undefined;
   return accessTurns(dataDir, false, db => {
     const rows = db.prepare(`
@@ -457,7 +457,12 @@ export function readSessionTurnFinalReply(
       if (!('reply' in event) || typeof event.reply.text !== 'string') continue;
       // Only an explicit false proves completeness. Legacy rows have no marker,
       // and post-truncation redaction can hide both length and trailing ellipsis.
-      return { text: event.reply.text, complete: event.reply.textTruncated === false };
+      return {
+        text: event.reply.text,
+        complete: event.reply.textTruncated === false,
+        at: event.reply.at,
+        prefixProven: event.reply.textTruncated === true ? true : undefined,
+      };
     }
     return undefined;
   });

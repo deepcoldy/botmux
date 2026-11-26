@@ -65,6 +65,10 @@ export interface SupervisionFinalReply {
   text: string;
   /** False when any source boundary omitted part of the delivered reply. */
   complete: boolean;
+  /** Delivery time used to order independent final corrections. */
+  at?: number;
+  /** True only when a source is proven to be a truncated prefix of a fuller reply. */
+  prefixProven?: boolean;
 }
 
 // Supervision needs the evidence and any failure qualifiers beyond the short
@@ -137,15 +141,20 @@ function boundedSupervisionFinalText(raw: unknown): string | undefined {
   return boundedReplyText(raw, SUPERVISION_FINAL_REPLY_MAX_CHARS);
 }
 
-function supervisionFinalReply(raw: unknown, complete = true): SupervisionFinalReply | undefined {
+function supervisionFinalReply(raw: unknown, complete = true, at?: number, prefixProven = false): SupervisionFinalReply | undefined {
   if (typeof raw !== 'string') return undefined;
   const text = boundedSupervisionFinalText(raw);
   if (!text) return undefined;
-  return { text, complete: complete && text === raw.trim() };
+  return {
+    text,
+    complete: complete && text === raw.trim(),
+    ...(at !== undefined ? { at } : {}),
+    ...(prefixProven || text !== raw.trim() ? { prefixProven: true } : {}),
+  };
 }
 
 /** daemon 投递最终回复时记下首行摘要和有界正文，供卡片与下一步建议使用。 */
-export function noteFinalReplyText(ds: DaemonSession, turnId: string, raw: unknown): void {
+export function noteFinalReplyText(ds: DaemonSession, turnId: string, raw: unknown, at = Date.now()): void {
   if (!turnId) return;
   noteAnswered(ds, turnId);
   const text = stripRestoredNotice(raw);
@@ -155,7 +164,7 @@ export function noteFinalReplyText(ds: DaemonSession, turnId: string, raw: unkno
   const fullText = boundedFinalText(text);
   if (fullText) remember(finalFullTexts, ds, turnId, fullText);
   if (ds.chatType === 'group' || ds.session.chatType === 'group') {
-    const supervisionReply = supervisionFinalReply(text);
+    const supervisionReply = supervisionFinalReply(text, true, at);
     if (supervisionReply) remember(finalSupervisionReplies, ds, turnId, supervisionReply, SUPERVISION_FINAL_TEXT_MEMORY);
   }
 }
@@ -181,7 +190,7 @@ export function noteFinalOutputReceipt(
     noteDiagnosticFinal(ds, turnId);
     return;
   }
-  noteFinalReplyText(ds, turnId, receipt.text);
+  noteFinalReplyText(ds, turnId, receipt.text, opts.now?.());
   noteLateFinalReply(ds, turnId, opts);
 }
 
@@ -226,7 +235,8 @@ function readFinalSendRecord(dataDir: string, sessionId: string, turnId: string)
             : typeof row.contentLength === 'number'
               ? normalized.length === row.contentLength
               : !row.previewText.endsWith('…');
-          return { text: row.previewText, complete };
+          const prefixProven = (typeof row.contentHash === 'string' || typeof row.contentLength === 'number') && !complete;
+          return { text: row.previewText, complete, ...(prefixProven ? { prefixProven: true } : {}), ...(typeof row.sentAtMs === 'number' && Number.isFinite(row.sentAtMs) ? { at: row.sentAtMs } : {}) };
         }
       } catch { /* 并发写入的半行 */ }
     }
@@ -253,16 +263,34 @@ export function turnFinalText(ds: DaemonSession, turnId: string, dataDir: string
   return finalFullTexts.get(ds)?.get(turnId) ?? boundedFinalText(readFinalSendText(dataDir, ds.session.sessionId, turnId));
 }
 
-/** Larger, supervision-only view of the delivered reply. Structured turn
- * receipts outrank the dashboard preview; every fallback carries completeness. */
+/** Larger, supervision-only view of the delivered reply. Independent final
+ * corrections are ordered by delivery time; an unorderable conflict is never complete. */
 export function turnSupervisionFinalReply(ds: DaemonSession, turnId: string, dataDir: string): SupervisionFinalReply | undefined {
-  const memory = finalSupervisionReplies.get(ds)?.get(turnId);
-  if (memory) return memory;
-  const structured = readSessionTurnFinalReply(dataDir, ds.session.sessionId, turnId);
-  if (structured) return supervisionFinalReply(structured.text, structured.complete);
-  const preview = readFinalSendRecord(dataDir, ds.session.sessionId, turnId);
-  if (preview) return supervisionFinalReply(preview.text, preview.complete);
-  return undefined;
+  const candidates = [
+    finalSupervisionReplies.get(ds)?.get(turnId),
+    (() => {
+      const structured = readSessionTurnFinalReply(dataDir, ds.session.sessionId, turnId);
+      return structured ? supervisionFinalReply(structured.text, structured.complete, structured.at, structured.prefixProven) : undefined;
+    })(),
+    (() => {
+      const preview = readFinalSendRecord(dataDir, ds.session.sessionId, turnId);
+      return preview ? supervisionFinalReply(preview.text, preview.complete, preview.at, preview.prefixProven) : undefined;
+    })(),
+  ].filter((candidate): candidate is SupervisionFinalReply => !!candidate);
+  if (!candidates.length) return undefined;
+  const coveredBy = (candidate: SupervisionFinalReply, complete: SupervisionFinalReply): boolean => {
+    if (candidate.prefixProven !== true || !complete.complete) return false;
+    const prefix = candidate.text.endsWith('…') ? candidate.text.slice(0, -1) : candidate.text;
+    return complete.text.length > prefix.length && complete.text.startsWith(prefix);
+  };
+  const timed = candidates.filter(candidate => typeof candidate.at === 'number' && Number.isFinite(candidate.at));
+  const newestAt = timed.length ? Math.max(...timed.map(candidate => candidate.at!)) : undefined;
+  const newest = newestAt === undefined ? candidates : timed.filter(candidate => candidate.at === newestAt);
+  const chosen = newest.find(candidate => newest.every(other => other === candidate || coveredBy(other, candidate))) ?? newest[0]!;
+  const tiedConflict = newest.length > 1 && newest.some(candidate => candidate.text !== chosen.text && !coveredBy(candidate, chosen));
+  const unknownConflict = timed.length < candidates.length
+    && candidates.some(candidate => candidate.text !== chosen.text && !coveredBy(candidate, chosen));
+  return { ...chosen, complete: chosen.complete && !tiedConflict && !unknownConflict };
 }
 
 export function turnFinalSummary(ds: DaemonSession, turnId: string, dataDir: string): string | undefined {

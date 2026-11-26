@@ -338,6 +338,7 @@ export async function observeGroupSessionSupervision(
         // to completion; the replacement also aborts any in-flight review.
         replaceGroupSessionSupervision(session, {
           ...task, state: 'watching', reason: undefined, checkAt: undefined, reviewAttempt: 0,
+          reviewEpoch: (task.reviewEpoch ?? 0) + 1,
           reviewEvidence: reply.text, reviewEvidenceComplete: reply.complete,
         }, io.persist);
       });
@@ -375,6 +376,7 @@ export async function observeGroupSessionSupervision(
         // against an obsolete final reply, even when it arrives mid-review.
         replaceGroupSessionSupervision(session, {
           ...task, state: 'watching', reason: undefined, checkAt: undefined, reviewAttempt: 0,
+          reviewEpoch: (task.reviewEpoch ?? 0) + 1,
           reviewEvidence: latestAtCommit.text, reviewEvidenceComplete: latestAtCommit.complete,
         }, io.persist);
         return;
