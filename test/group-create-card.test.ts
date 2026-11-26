@@ -50,6 +50,7 @@ import {
   buildGroupCreatedCard,
   buildGroupErrorCard,
   consumeGroupCreateForm,
+  formatGroupCreateDirLabels,
   getGroupCreateForm,
   openGroupCreateForm,
   resetGroupCreateForms,
@@ -118,6 +119,34 @@ describe('group-create-card form lifecycle & rendering', () => {
     }, t0);
     consumeGroupCreateForm(form2);
     expect(getGroupCreateForm(form2.id, 'ou_owner', t0)).toEqual({ ok: false, reason: 'expired' });
+  });
+
+  it('shortens dropdown directory labels to last 2 segments and disambiguates collisions', () => {
+    expect(formatGroupCreateDirLabels([
+      '/data00/home/user',
+      '/data00/home/user/agentctl',
+      '/data00/home/user/lark_sce/commerce_sale',
+      '/data00/home/user/code/commerce_sale',
+      '/work/short',
+      '/',
+    ])).toEqual([
+      'home/user',
+      'user/agentctl',
+      'lark_sce/commerce_sale',
+      'code/commerce_sale',
+      '/work/short',
+      '/',
+    ]);
+
+    expect(formatGroupCreateDirLabels([
+      '/data00/a/code/app',
+      '/data00/b/code/app',
+      '/data00/a/other/repo',
+    ])).toEqual([
+      'a/code/app',
+      'b/code/app',
+      'other/repo',
+    ]);
   });
 
   it('builds a form card with prefilled name/dir/branch and renders result & error cards', () => {

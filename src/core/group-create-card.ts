@@ -121,6 +121,37 @@ export function groupCreateDirOptions(larkAppId: string): string[] {
   return [...out].slice(0, MAX_DIR_OPTIONS);
 }
 
+/**
+ * Shorten directory paths to their last 2 segments for Lark's `select_static`
+ * dropdown (which truncates long labels on the right). Colliding labels expand
+ * upward by one segment at a time until distinct.
+ */
+export function formatGroupCreateDirLabels(dirs: readonly string[]): string[] {
+  const partsList = dirs.map(dir => dir.split(/[/\\]+/).filter(Boolean));
+  const depths = partsList.map(parts => Math.min(2, parts.length));
+  const render = (i: number): string => {
+    const parts = partsList[i]!;
+    const depth = depths[i]!;
+    return depth >= parts.length ? dirs[i]! : parts.slice(-depth).join('/');
+  };
+
+  let labels = dirs.map((_, i) => render(i));
+  for (;;) {
+    const counts = new Map<string, number>();
+    for (const label of labels) counts.set(label, (counts.get(label) ?? 0) + 1);
+    let expanded = false;
+    for (let i = 0; i < dirs.length; i++) {
+      if ((counts.get(labels[i]!) ?? 0) > 1 && depths[i]! < partsList[i]!.length) {
+        depths[i]!++;
+        expanded = true;
+      }
+    }
+    if (!expanded) break;
+    labels = dirs.map((_, i) => render(i));
+  }
+  return labels;
+}
+
 export function buildGroupCreateCard(
   form: GroupCreateForm,
   dirOptions: readonly string[],
@@ -130,13 +161,15 @@ export function buildGroupCreateCard(
   const prefilledDir = form.selectedDir;
   const dirInDropdown = !!prefilledDir && dirOptions.includes(prefilledDir);
   if (dirOptions.length > 0) {
+    const labels = formatGroupCreateDirLabels(dirOptions);
     elements.push({
       tag: 'action',
       actions: [{
         tag: 'select_static',
+        width: 'fill',
         placeholder: { tag: 'plain_text', content: t('card.group_create.dir_select', undefined, locale) },
         ...(dirInDropdown ? { initial_option: prefilledDir } : {}),
-        options: dirOptions.map(dir => ({ text: { tag: 'plain_text', content: dir }, value: dir })),
+        options: dirOptions.map((dir, i) => ({ text: { tag: 'plain_text', content: labels[i]! }, value: dir })),
         value: { action: GROUP_CREATE_DIR_ACTION, form: form.id },
       }],
     });
