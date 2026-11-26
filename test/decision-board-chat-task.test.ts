@@ -7,10 +7,12 @@ import { describe, expect, it } from 'vitest';
 import {
   aggregateChatTaskState,
   formatTaskNotice,
+  formatTaskNoticeCard,
   itemChatIds,
   itemTaskHint,
   stewardUpdatedAt,
   taskHintForChat,
+  TASK_HINT_LABELS,
   TASK_NOTICE_MAX_ENTRIES,
   type ChatSessionProbe,
   type ChatTaskState,
@@ -153,6 +155,33 @@ describe('子任务提示', () => {
     const many = formatTaskNotice(Array.from({ length: TASK_NOTICE_MAX_ENTRIES + 3 }, (_, i) => entry(i + 1)), 'zh').split('\n');
     expect(many).toHaveLength(TASK_NOTICE_MAX_ENTRIES + 2);
     expect(many.at(-1)).toBe('另有 3 条，见看板。');
+  });
+
+  it('提醒卡片：标题与群名可扫读、链接不裸贴，特殊字符转义且支持英文和无链接', () => {
+    const link = 'https://applink.feishu.cn/client/web_url/open?mode=sidebar-semi&item=1';
+    const make = (seq: number): TaskNoticeEntry => ({
+      seq, title: `事项 [${seq}]`, chatText: '修登录群 (线上)', link,
+      hint: { ...taskHintForChat(del, 0)!, summary: '修好了 *核心* 流程' },
+    });
+    const card = JSON.parse(formatTaskNoticeCard([make(1)], 'zh')!);
+    const content = card.body.elements[0].content as string;
+    expect(card.header.title.content).toContain('1');
+    const reason = `${TASK_HINT_LABELS.zh.task_delivered}（修登录群 \\(线上\\)）：修好了 \\*核心\\* 流程`;
+    expect(content).toBe(`[#1 事项 \\[1\\]](${link}) — ${reason}`);
+    expect(content).not.toContain(` ${link}`);
+    expect(card.body.elements[1].content).toMatch(/^<font color='grey'>.+<\/font>$/);
+
+    const en = JSON.parse(formatTaskNoticeCard([{ ...make(2), link: undefined }], 'en')!);
+    expect(en.header.title.content).toContain('1');
+    expect(en.body.elements[0].content).toContain('#2 事项 \\[2\\]');
+    expect(en.body.elements[0].content).toContain(TASK_HINT_LABELS.en.task_delivered);
+    expect(en.body.elements[0].content).not.toContain('](');
+
+    const many = JSON.parse(formatTaskNoticeCard(Array.from({ length: TASK_NOTICE_MAX_ENTRIES + 2 }, (_, i) => make(i + 1)), 'zh')!);
+    const lines = (many.body.elements[0].content as string).split('\n');
+    expect(many.header.title.content).toContain(String(TASK_NOTICE_MAX_ENTRIES + 2));
+    expect(lines).toHaveLength(TASK_NOTICE_MAX_ENTRIES + 1);
+    expect(lines.at(-1)).toContain('2');
   });
 });
 

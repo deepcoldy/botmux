@@ -1728,13 +1728,6 @@ export interface BotConfig {
    */
   codexBrowser?: CodexBrowserConfig;
   /**
-   * Per-turn 上下文注入方式（#794）。`auto`：对支持的 CLI（目前仅 claude-code），
-   * 把 reminder/whiteboard 从 user turn 文本挪到 UserPromptSubmit hook 注入的
-   * system-reminder，终端输入框只保留消息本身；不支持的 CLI 自动回退内联。
-   * 缺省/`off`：保持内联 envelope（历史行为）。从下一个 follow-up turn 生效。
-   */
-  envelopeInjection?: 'auto' | 'off';
-  /**
    * 最终回复投递方式。`send`（除 doubao 外所有 CLI 的默认）：模型必须自己执行
    * `botmux send` 把回复发到飞书，系统提示与每轮 reminder 都这么要求。`transcript`
    * （自动转发最终回复，按需显式开启）：daemon 从 CLI 会话记录自动取本轮最后的
@@ -4665,9 +4658,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       replyDelivery: entry.replyDelivery === 'transcript' || entry.replyDelivery === 'send' ? entry.replyDelivery : undefined,
       durableImReplies: entry.durableImReplies === true || undefined,
       promptInjection: entry.promptInjection === 'none' ? 'none' : undefined,
-      // Only the non-default hook mode is persisted; absent, 'off', and invalid
-      // values all retain the historical inline behavior.
-      envelopeInjection: entry.envelopeInjection === 'auto' ? 'auto' : undefined,
+      // Legacy `envelopeInjection` ('auto' | 'off') keys in existing bots.json
+      // are compatibly ignored: Claude Code hook injection is now default-on.
       codexBrowser,
       codexRpcInput: typeof entry.codexRpcInput === 'boolean' ? entry.codexRpcInput : undefined,
       existingAppServer,

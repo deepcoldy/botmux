@@ -1254,18 +1254,13 @@ function BotDefaultsCard(props: {
             {bot.cliId === 'codex-app' || bot.cliId === 'codex' ? (
               <section className="bd-tile" id={botDefaultsSectionDomId('codex-app-display')}><CodexAppDisplaySection bot={bot} putCardPref={putCardPref} patchBot={patchBot} /></section>
             ) : null}
-            {/* #794 hook 注入目前只验证了 claude-code，其它 CLI 隐藏避免误开。 */}
-            {bot.cliId === 'claude-code' ? (
-              <section className="bd-tile" id={botDefaultsSectionDomId('envelope-injection')}><EnvelopeInjectionSection bot={bot} patchBot={patchBot} /></section>
-            ) : null}
             {/* 自动转发最终回复开关对所有 CLI 都显示：不支持的 CLI 禁用开关并说明原因，
                 避免用户在别的 tab 找不到这个开关却在 /botconfig 里能设。 */}
             <section className="bd-tile" id={botDefaultsSectionDomId('prompt-injection')}>
               <PromptInjectionSection bot={bot} patchBot={patchBot} lock={props.linkedAgent} />
               <ReplyDeliverySection bot={bot} patchBot={patchBot} />
             </section>
-            {/* <sender> 注入对所有 CLI 都生效（每种 CLI 的 prompt 都会带这个块），
-                所以不按 cliId 收窄——不像上面的 hook 注入只验证过 claude-code。 */}
+            {/* <sender> 注入对所有 CLI 都生效（每种 CLI 的 prompt 都会带这个块），不按 cliId 收窄。 */}
             <section className="bd-tile" id={botDefaultsSectionDomId('sender-tag')}><SenderTagSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('quota-fallback')}>
               <QuotaFallbackChainSection bot={bot} cliState={cliState} startCli={cli} patchBot={patchBot} />
@@ -7314,50 +7309,6 @@ export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref
   );
 }
 
-export function EnvelopeInjectionSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
-  const tr = useT();
-  const [auto, setAuto] = useState(props.bot.envelopeInjection === 'auto');
-  const [status, setStatus] = useState<StatusMessage>(null);
-  const [busy, setBusy] = useState(false);
-
-  useEffect(() => setAuto(props.bot.envelopeInjection === 'auto'), [props.bot.envelopeInjection]);
-
-  async function save(next: boolean): Promise<void> {
-    const previous = auto;
-    setAuto(next);
-    await saveBotField({
-      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/envelope-injection`, { envelopeInjection: next ? 'auto' : 'off' }),
-      setStatus,
-      setBusy,
-      saved: tr('botDefaults.cardPrefSaved'),
-      onSaved: body => {
-        const saved = body.envelopeInjection === 'auto';
-        setAuto(saved);
-        props.patchBot(props.bot.larkAppId, { envelopeInjection: saved ? 'auto' : 'off' });
-      },
-      rollback: () => setAuto(previous),
-    });
-  }
-
-  return (
-    <section className="bd-section" data-envelope-injection>
-      <h3 className="bd-section-title">{tr('botDefaults.envelopeInjection')}</h3>
-      <ToggleRow
-        checked={auto}
-        disabled={busy}
-        dataAction="toggle-envelope-injection"
-        title={tr('botDefaults.envelopeInjectionAuto')}
-        help={tr('botDefaults.envelopeInjectionHelp')}
-        onChange={checked => void save(checked)}
-      />
-      <small className="bd-section-note">{tr('botDefaults.envelopeInjectionNote')}</small>
-      <div className="actions">
-        <StatusSpan status={status} attr={{ 'data-envelope-injection-status': '' }} />
-      </div>
-    </section>
-  );
-}
-
 function TopicUnavailablePolicySection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
   const [busy, setBusy] = useState(false);
@@ -10633,18 +10584,31 @@ function LaunchShellSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) 
 
 
 
-/** riff UI 建议主动选择的模型（服务端另有隐藏降级备胎，不在此列）。 */
-const RIFF_MODEL_SUGGESTIONS = ['gpt-5.5', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.4', 'gpt-5.4-pro'];
-/** codex 思考等级档位（与 riff 服务端对齐）；'' = 跟随 riff 默认（medium）。 */
+/** riff UI 按执行引擎给出的建议模型（服务端另有隐藏降级备胎，不在此列）。 */
+const RIFF_MODEL_SUGGESTIONS_BY_AGENT: Record<'codex' | 'claude', readonly string[]> = {
+  codex: [
+    'gpt-6.2-sol', 'GPT-6.1-Sol', 'gpt-6-astra', 'gpt-5.5',
+    'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.4', 'gpt-5.4-pro',
+    'gemini-4-neon', 'gemini-4-carbon', 'gemini-4-hydrogen', 'gemini-4-argon',
+  ],
+  claude: [
+    'glm-5.3', 'glm-5.3-flash', 'deepseek-v4.1-flash',
+    'gemini-4-neon', 'gemini-4-carbon', 'gemini-4-hydrogen', 'gemini-4-argon',
+  ],
+};
+/** riff 思考等级档位（与 riff 服务端对齐）；'' = 跟随 riff 默认（medium）。 */
 const RIFF_REASONING_EFFORT_OPTIONS = ['', 'low', 'medium', 'high', 'xhigh'];
 /** riff task-execute 的 sandboxCluster；缺省行为与服务端一致，回落 BOE。 */
 const RIFF_SANDBOX_CLUSTER_OPTIONS = ['boe', 'cn'] as const;
+/** riff task-execute 的 agent（harness）；缺省行为与服务端一致，回落 codex。 */
+const RIFF_AGENT_OPTIONS = ['codex', 'claude'] as const;
 
 function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; persistCliSelection?: () => Promise<CliPersistOutcome> }) {
   const tr = useT();
   const riff = props.bot.riff && typeof props.bot.riff === 'object' ? props.bot.riff : {};
   const [baseUrl, setBaseUrl] = useState(typeof riff.baseUrl === 'string' ? riff.baseUrl : '');
   const [sandboxCluster, setSandboxCluster] = useState(riff.sandboxCluster === 'cn' ? 'cn' : 'boe');
+  const [agent, setAgent] = useState<'codex' | 'claude'>(riff.agent === 'claude' ? 'claude' : 'codex');
   const [model, setModel] = useState(typeof riff.model === 'string' ? riff.model : '');
   const [reasoningEffort, setReasoningEffort] = useState(typeof riff.reasoningEffort === 'string' ? riff.reasoningEffort : '');
   const [jwtEnv, setJwtEnv] = useState(typeof riff.jwtEnv === 'string' ? riff.jwtEnv : '');
@@ -10659,6 +10623,7 @@ function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; persistCl
     const r = props.bot.riff && typeof props.bot.riff === 'object' ? props.bot.riff : {};
     setBaseUrl(typeof r.baseUrl === 'string' ? r.baseUrl : '');
     setSandboxCluster(r.sandboxCluster === 'cn' ? 'cn' : 'boe');
+    setAgent(r.agent === 'claude' ? 'claude' : 'codex');
     setModel(typeof r.model === 'string' ? r.model : '');
     setReasoningEffort(typeof r.reasoningEffort === 'string' ? r.reasoningEffort : '');
     setJwtEnv(typeof r.jwtEnv === 'string' ? r.jwtEnv : '');
@@ -10673,6 +10638,7 @@ function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; persistCl
       const config: Record<string, unknown> = {};
       if (baseUrl.trim()) config.baseUrl = baseUrl.trim();
       config.sandboxCluster = sandboxCluster;
+      config.agent = agent;
       if (model.trim()) config.model = model.trim();
       if (reasoningEffort) config.reasoningEffort = reasoningEffort;
       if (jwtEnv.trim()) config.jwtEnv = jwtEnv.trim();
@@ -10713,6 +10679,8 @@ function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; persistCl
     }
   }
 
+  const modelSuggestions = RIFF_MODEL_SUGGESTIONS_BY_AGENT[agent];
+
   return (
     <div className="bd-subsection">
       <h4 className="bd-subsection-title"><FieldTitle help={tr('botDefaults.riffHelp')}>{tr('botDefaults.sectionRiff')}</FieldTitle></h4>
@@ -10736,11 +10704,29 @@ function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; persistCl
         </div>
       </div>
       <div className="bd-row">
+        <div className="bd-field">
+          <span><FieldTitle help={tr('botDefaults.riffAgentHelp')}>{tr('botDefaults.riffAgent')}</FieldTitle></span>
+          <DropdownField
+            dataInput="riff-agent"
+            ariaLabel={tr('botDefaults.riffAgent')}
+            value={agent}
+            disabled={busy}
+            options={RIFF_AGENT_OPTIONS.map(value => ({ value, label: value === 'claude' ? 'Claude Code (claude)' : 'Codex (codex)' }))}
+            onChange={next => {
+              setAgent(next === 'claude' ? 'claude' : 'codex');
+              // 显式模型可能仅适用于旧引擎；切换时回到新引擎默认模型，避免保存坏组合。
+              // 建议清单不是权威目录，不能按成员关系条件清空；reasoningEffort 两引擎通用，保留。
+              setModel('');
+            }}
+          />
+        </div>
+      </div>
+      <div className="bd-row">
         <label>
           <span><FieldTitle help={tr('botDefaults.riffModelHelp')}>{tr('botDefaults.riffModel')}</FieldTitle></span>
           <input type="text" data-input="riff-model" list={`riff-model-suggestions-${props.bot.larkAppId}`} placeholder={tr('botDefaults.riffModelPlaceholder')} value={model} disabled={busy} onChange={e => setModel(e.currentTarget.value)} />
           <datalist id={`riff-model-suggestions-${props.bot.larkAppId}`}>
-            {RIFF_MODEL_SUGGESTIONS.map(item => <option value={item} key={item} />)}
+            {modelSuggestions.map(item => <option value={item} key={item} />)}
           </datalist>
         </label>
       </div>

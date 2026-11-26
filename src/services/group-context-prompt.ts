@@ -1,7 +1,7 @@
 import { getGroupContextSettings } from './group-context-settings-store.js';
 import { bindGroupContextDelivery, readPreparedGroupContext, readGroupContextDeliveryBinding, planGroupContextDispatch, recordGroupContextDispatch, type PreparedGroupContext } from './group-context-delivery-store.js';
 import { addCodexAppContext } from '../utils/codex-app-context.js';
-import { rekeyPromptContext } from './prompt-context-store.js';
+import { rekeyPromptContextWithFallback } from './prompt-context-store.js';
 import { logger } from '../utils/logger.js';
 
 /** The content a dispatch of this turn carries: the frozen bundle, or the
@@ -17,6 +17,8 @@ function dispatchView(prepared: PreparedGroupContext): PreparedGroupContext {
 
 export interface GroupContextDispatchPayload {
   content: string;
+  /** Claude per-turn envelope paired with content when a sidecar is in use. */
+  hookEnvelope?: string;
   codexAppInput?: {
     additionalContext?: Record<string, { kind: 'untrusted' | 'application'; value: string }>;
     localImages?: Array<{ path: string }>;
@@ -158,7 +160,18 @@ export function commitGroupContextDispatchIntoPayload(payload: GroupContextDispa
     }
     // The Claude hook sidecar is keyed by the PTY text the builder saw; the
     // final text is what the hook will fingerprint, so re-key it together.
-    if (payload.content !== assembledContent) rekeyPromptContext(input.sessionId, turnId, assembledContent, payload.content);
+    if (payload.content !== assembledContent) {
+      const rekeyed = rekeyPromptContextWithFallback({
+        sessionId: input.sessionId,
+        turnId,
+        previousPtyText: assembledContent,
+        nextPtyText: payload.content,
+        hookEnvelope: payload.hookEnvelope,
+      });
+      payload.content = rekeyed.content;
+      if (rekeyed.hookEnvelope) payload.hookEnvelope = rekeyed.hookEnvelope;
+      else delete payload.hookEnvelope;
+    }
     const dispatched = dispatchView({ ...prepared, dispatch });
     if (replaced) logger.info(`[group-context] dispatch carries ${dispatch.includedSeqs.length}/${prepared.includedSeqs.length} frozen source(s) turn=${turnId.slice(0, 12)}`);
     return { dispatched, replaced };

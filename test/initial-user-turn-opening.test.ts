@@ -253,6 +253,7 @@ function openingExpectations(cliId: CliId, mode: 'prompt' | 'off' | 'global') {
 describe('empty-started session — first real business turn must use the new-topic opening', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    preflightMock.mockReturnValue(false);
     // Production forkWorker has a strict boolean contract: false is reserved
     // for an unaccepted fork. Keep the default fixture on the successful path
     // so orchestration that reads the return value does not misclassify an
@@ -393,7 +394,6 @@ describe('empty-started session — first real business turn must use the new-to
       cliId: 'claude-code',
       allowedUsers: [OWNER],
       oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
-      envelopeInjection: 'auto' as const,
     });
     bot.resolvedAllowedUsers = [OWNER];
     preflightMock.mockReturnValue(true);
@@ -427,7 +427,6 @@ describe('empty-started session — first real business turn must use the new-to
       replyDelivery: 'transcript',
       allowedUsers: [OWNER],
       oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
-      envelopeInjection: 'auto' as const,
     });
     bot.resolvedAllowedUsers = [OWNER];
     preflightMock.mockReturnValue(true);
@@ -652,7 +651,6 @@ describe('empty-started session — first real business turn must use the new-to
       cliId: 'claude-code',
       allowedUsers: [OWNER],
       oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
-      envelopeInjection: 'auto' as const,
     });
     bot.resolvedAllowedUsers = [OWNER];
     bot.botName = 'TestBot';

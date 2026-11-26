@@ -9,6 +9,7 @@ import {
 } from '../session-task-status.js';
 import { isEndedState } from './hints.js';
 import type { BoardItem, BoardLink } from './model.js';
+import { compactNoticeCard, escapeNoticeMarkdown, noticeItemLink } from './notice-card.js';
 
 export type ChatTaskKind = 'needs_you' | 'interrupted' | 'working' | 'unreadable' | 'delivered' | 'idle' | 'closed' | 'no_session';
 
@@ -206,6 +207,25 @@ export function formatTaskNotice(entries: readonly TaskNoticeEntry[], locale: Lo
   const more = entries.length - shown.length;
   if (more > 0) lines.push(zh ? `另有 ${more} 条，见看板。` : `${more} more on the board.`);
   return [head, ...lines].join('\n');
+}
+
+/** 群内展示卡片；{@link formatTaskNotice} 仍是管家 prompt 与发送失败时的原文。 */
+export function formatTaskNoticeCard(entries: readonly TaskNoticeEntry[], locale: Locale): string | undefined {
+  const zh = locale !== 'en';
+  const shown = entries.slice(0, TASK_NOTICE_MAX_ENTRIES);
+  const lines = shown.map(e => {
+    const label = TASK_HINT_LABELS[locale][e.hint.kind];
+    const where = e.chatText ? (zh ? `（${oneLine(e.chatText, 40)}）` : ` (${oneLine(e.chatText, 40)})`) : '';
+    const what = e.hint.summary ?? e.hint.detail;
+    return `${noticeItemLink(e.seq, e.title, e.link)} — ${escapeNoticeMarkdown(`${label}${where}${what ? `${zh ? '：' : ': '}${oneLine(what)}` : ''}`)}`;
+  });
+  const more = entries.length - shown.length;
+  if (more > 0) lines.push(zh ? `另有 ${more} 条，见看板。` : `${more} more on the board.`);
+  return compactNoticeCard({
+    title: zh ? `决策看板 · 子任务（${entries.length} 条）` : `Decision board · subtasks (${entries.length})`,
+    lines,
+    footer: zh ? '仅提示，状态未改' : 'Hints only; no state was changed',
+  });
 }
 
 /** 送进管家会话的正文：通知 + 处理指引。 */

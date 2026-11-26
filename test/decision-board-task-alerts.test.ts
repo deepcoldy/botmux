@@ -103,6 +103,11 @@ describe('子任务提醒', () => {
     expect(prompt).toContain('修好了');
     expect(prompt).toContain(`#${b} 改文档 — 子任务中断`);
     expect(delivered[0]!.announcement.texts.join('')).toContain('【决策看板 · 子任务】');
+    const card = JSON.parse(delivered[0]!.announcement.card!);
+    expect(card.header.title.content).toContain('2');
+    expect(card.body.elements[0].content).toContain(`[#${a} 修登录](https://applink.feishu.cn/`);
+    expect(card.body.elements[0].content).not.toMatch(/ https:\/\/applink\.feishu\.cn\//);
+    expect(delivered[0]!.prompt).toContain('https://applink.feishu.cn/');
     expect(delivered[0]!.chatId).toBe('oc_steward');
     expect(delivered[0]!.turnId).toMatch(new RegExp(`^board:${APP}:hint-`));
     const after = service.store().getItem(APP, a)!;

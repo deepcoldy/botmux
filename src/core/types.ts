@@ -1008,6 +1008,8 @@ export interface DaemonSession {
   antigravityAccountId?: string;
   /** In-flight and per-turn state for Antigravity quota-limit auto-rotation. */
   antigravityRotation?: import('./antigravity-rotation.js').AntigravitySessionRotationState;
+  /** In-flight and per-turn confirmation state for Codex model-capacity downgrade. */
+  codexCapacityFallback?: import('./codex-capacity-fallback.js').CodexCapacityFallbackState;
   /** Interval that re-PATCHes the live streaming card with fresh Context/Token
    *  usage while a turn is executing (streaming display mode). Armed on the
    *  working edge, cleared on idle/turn-end/card removal. */
@@ -1023,11 +1025,15 @@ export interface DaemonSession {
     failedTurnId: string;
     mode: 'merge' | 'resend';
     content: string;
+    /** Envelope that will remain sidecar-injected in the final rewritten input;
+     * absent when the directive restored it inline. */
+    hookEnvelope?: string;
     failedUserPrompt: string;
     /** The worker process that was asked; another one never answers. */
     worker: DaemonSession['worker'];
   }>;
   lastCodexAppInput?: CodexAppTurnInput;
+  lastHookEnvelope?: string;
   replyThreadAliases?: { [rootMessageId: string]: { createdAt: string; lastUsedAt: string } };
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean };
   /** Lark turns that a still-running Claude background task was launched

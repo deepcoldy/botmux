@@ -16,6 +16,8 @@ import {
   cleanupTraexAskHooks,
   hasInstalledSessionReadyHook,
   hasInstalledPromptHook,
+  hasInstalledPromptHookCached,
+  invalidatePromptHookPreflightCache,
   installHook,
 } from '../src/adapters/hook-installer.js';
 
@@ -1137,5 +1139,55 @@ describe('installHook — zcode-hooks', () => {
     writeFileSync(configPath, corrupt);
     install(configPath);
     expect(readFileSync(configPath, 'utf8')).toBe(corrupt);
+  });
+});
+
+describe('hasInstalledPromptHookCached — negative cache avoidance and invalidation', () => {
+  it('never caches false when settings.json is provisioned externally after first check', () => {
+    const dir = makeTmpDir();
+    const settingsPath = join(dir, 'settings.json');
+    invalidatePromptHookPreflightCache(settingsPath);
+    expect(hasInstalledPromptHookCached(settingsPath)).toBe(false);
+
+    // Simulate worker subprocess provisioning <BOT_HOME>/claude/settings.json externally.
+    writeFileSync(settingsPath, JSON.stringify({
+      hooks: {
+        UserPromptSubmit: [{
+          hooks: [{ type: 'command', command: 'node /opt/botmux/dist/cli.js user-prompt-hook', timeout: 10 }],
+        }],
+      },
+    }));
+
+    expect(hasInstalledPromptHookCached(settingsPath)).toBe(true);
+  });
+
+  it('validates stat on cached true entries so external edits/removals and disableAllHooks fail closed immediately', () => {
+    const dir = makeTmpDir();
+    const settingsPath = join(dir, 'settings.json');
+    installHook('claude-code', {
+      configPath: settingsPath,
+      format: 'claude-settings',
+      userPromptSubmitCommand: 'node /opt/botmux/dist/cli.js user-prompt-hook',
+    }, 'node /opt/botmux/dist/cli.js hook claude-code');
+
+    expect(hasInstalledPromptHookCached(settingsPath)).toBe(true);
+    // External overwrite removing hooks invalidates immediately via stat check (no 60s blind spot).
+    writeFileSync(settingsPath, JSON.stringify({ hooks: {} }));
+    expect(hasInstalledPromptHookCached(settingsPath)).toBe(false);
+
+    // Re-install via installHook immediately restores true.
+    installHook('claude-code', {
+      configPath: settingsPath,
+      format: 'claude-settings',
+      userPromptSubmitCommand: 'node /opt/botmux/dist/cli.js user-prompt-hook',
+    }, 'node /opt/botmux/dist/cli.js hook claude-code');
+    expect(hasInstalledPromptHookCached(settingsPath)).toBe(true);
+
+    // Explicit disableAllHooks: true must fail closed even when hook entry exists.
+    const parsed = JSON.parse(readFileSync(settingsPath, 'utf8'));
+    parsed.disableAllHooks = true;
+    writeFileSync(settingsPath, JSON.stringify(parsed));
+    invalidatePromptHookPreflightCache(settingsPath);
+    expect(hasInstalledPromptHookCached(settingsPath)).toBe(false);
   });
 });

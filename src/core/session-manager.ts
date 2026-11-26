@@ -34,7 +34,12 @@ import { readPersistedExecutionContract } from './session-controller.js';
 import { isDurableArgvCliId, isExecutionPhaseConfirmedBeyondSubmitting, resolveQueuedActivationEffectiveTurn } from '../services/queued-activation-reconcile.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
 import { credentialSourceForcesBotHome } from '../services/cli-credential-source.js';
-import { resolveSandboxMode } from '../adapters/cli/sandbox-mode.js';
+import { resolveSandboxMode, resolveSpawnNetworkShape } from '../adapters/cli/sandbox-mode.js';
+import { assistantUserHome, isValidAssistantOpenId } from './assistant-mode.js';
+import { cliSupportsConfigDir } from './cli-config-dir.js';
+import { plannedOpeningBackendType } from './opening-backend.js';
+import { resolveEffectivePluginIds } from './plugins/effective.js';
+import { collectProtectedHttpEgressPolicies } from './protected-http-egress.js';
 import { buildBotmuxShellHints, buildManagedLarkToolPromptBlocks, buildTurnSpeakersBlock, feishuReplyPresentationGuidance, transcriptPromptTeachesSend } from '../adapters/cli/shared-hints.js';
 import { usesLarkToolBinding } from './lark-tool-binding.js';
 import { effectiveReplyDelivery, type ReplyDelivery } from './reply-delivery.js';
@@ -109,7 +114,7 @@ import { applyFollowActive, followActiveOpenedFreshTopic, recordFollowActiveFres
 import { resolveScheduleModelOverride } from './schedule-model-override.js';
 import { scanMultipleProjects } from '../services/project-scanner.js';
 import { buildRepoSelectCard } from '../im/lark/card-builder.js';
-import { repoPickerScanOptions } from '../global-config.js';
+import * as globalConfigModule from '../global-config.js';
 import { sameUsageLimit } from '../utils/cli-usage-limit.js';
 import { t, localeForBot, getDefaultLocale, type Locale } from '../i18n/index.js';
 import { parseWorkingDirList } from '../utils/working-dir.js';
@@ -130,7 +135,8 @@ import { escapeXmlTagLikeTokens } from '../utils/xml.js';
 import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { initialLinkRefSources } from './link-ref-turn.js';
 import type { LinkRefMode, LinkRefSourceType } from '../services/link-ref-types.js';
-import { writePromptContext } from '../services/prompt-context-store.js';
+import { removePromptContextForTurn, writePromptContext } from '../services/prompt-context-store.js';
+import { CLAUDE_STRIPPED_INVISIBLE_RE } from '../services/claude-transcript.js';
 import { hasInstalledPromptHookCached } from '../adapters/hook-installer.js';
 import { restoreCodexCleanupArchive } from '../services/codex-cleanup-archive.js';
 import { isSharedAdoptPersistedSession, isSharedAdoptSession } from './shared-adopt.js';
@@ -232,7 +238,7 @@ async function resumeRestoredPendingRepoSetup(
   }
   const scanDirs = getProjectScanDirs(ds).filter(dir => existsSync(dir));
   const projects = scanDirs.length > 0
-    ? scanMultipleProjects(scanDirs, 3, repoPickerScanOptions())
+    ? scanMultipleProjects(scanDirs, 3, globalConfigModule.repoPickerScanOptions())
     : [];
   if (projects.length > 0) {
     const bot = getBot(ds.larkAppId);
@@ -266,11 +272,12 @@ async function resumeRestoredPendingRepoSetup(
     forkWorker(ds, '', { resume: false, turnId: setup.turnId });
   } else {
     const bot = getBot(ds.larkAppId);
+    const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? bot.config.cliId;
     const availableBots = await getAvailableBots(ds.larkAppId, ds.chatId);
     const input = buildNewTopicCliInput(
       setup.prompt,
       ds.session.sessionId,
-      ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? bot.config.cliId,
+      cliId,
       ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? bot.config.cliPathOverride,
       ds.pendingAttachments,
       ds.pendingMentions,
@@ -284,6 +291,8 @@ async function resumeRestoredPendingRepoSetup(
         chatId: ds.chatId,
         whiteboardId: ds.session.whiteboardId,
         promptInjection: sessionPromptInjection(ds),
+        turnId: setup.turnId,
+        sessionBackendType: plannedOpeningBackendType(ds, cliId, bot.config),
         substituteTrigger: ds.pendingSubstituteTrigger,
         codexAppText: ds.pendingCodexAppText,
         acceptedInput: ds.pendingAcceptedInput,
@@ -1866,6 +1875,8 @@ export function buildNewTopicCliInput(
     turnId?: string;
     /** 会话冻结的后端类型，用于 hook 模式判定（远端后端无本地 hook 进程）。 */
     sessionBackendType?: BackendType;
+    /** 显式标明该次 worker-null 空启动首轮将冷启动（`resume: false`）且尚无先前 CLI 输入。 */
+    freshColdOpening?: boolean;
     /** 见 NewTopicOpts 同名字段。 */
     larkToolResume?: boolean;
     /** 见 NewTopicOpts 同名字段。 */
@@ -1886,25 +1897,32 @@ export function buildNewTopicCliInput(
   // buildReforkCliInput 同一兜底）；bot 未配 lang 时 localeForBot 即进程默认，
   // 与旧行为一致。否则首轮按 bot 语言、续轮回落进程默认会造成同会话语言混排。
   locale = locale ?? localeForBot(opts?.larkAppId);
-  // hook 注入模式（#794 后续）：opening 也走 sidecar——whiteboard/sender/mentions
-  // 写入 per-turn sidecar，PTY 文本只剩用户正文（+ role/summaryMemory 等稳定上下文）。
-  // 与 follow-up 同一套 sidecar/claim 机制；turnId 是 claim 的权威键，缺失或条件
-  // 不满足时回退 inline（legacy 路径），行为与历史完全一致。
+  // hook 注入模式（#794 后续）：opening 也走 sidecar——whiteboard/sender/mentions/
+  // availableBots 写入 per-turn sidecar，PTY 文本只剩用户正文（+ role/summaryMemory
+  // 等稳定上下文），不再包 `<user_message>` 外壳。无须注入的 envelope（空）时不落盘
+  // sidecar、仍去 `<user_message>`；缺失 turnId、正文/PTY 文本清洗后以 `!`/`/` 开头
+  // （防止触发 Claude 交互式 Bash 或原生斜杠命令）或条件不满足/超限时 fail-closed 回退 inline。
   const hookTurnId = opts?.turnId;
-  if (resolveEnvelopeInjectionMode({
-    cliId,
-    cliPathOverride,
-    sessionBackendType: opts?.sessionBackendType,
-    promptInjection: opts?.promptInjection,
-    larkAppId: opts?.larkAppId,
-    sessionId,
-    opening: true,
-  }) === 'hook' && hookTurnId) {
+  const mergedOpeningText = followUps && followUps.length > 0
+    ? [userMessage, ...followUps].join('\n\n')
+    : userMessage;
+  if (hookTurnId
+    && !startsWithCliComposerPrefix(mergedOpeningText)
+    && resolveEnvelopeInjectionMode({
+      cliId,
+      cliPathOverride,
+      sessionBackendType: opts?.sessionBackendType,
+      promptInjection: opts?.promptInjection,
+      larkAppId: opts?.larkAppId,
+      sessionId,
+      opening: true,
+      freshColdOpening: opts?.freshColdOpening,
+    }) === 'hook') {
     const blocks = buildNewTopicBlocks(
       userMessage, sessionId, cliId, cliPathOverride, attachments, mentions,
       availableBots, followUps, botIdentity, locale, sender, opts, true,
     );
-    const ENVELOPE_KEYS = new Set<NewTopicBlockKey>(['whiteboard', 'sender', 'mentions']);
+    const ENVELOPE_KEYS = new Set<NewTopicBlockKey>(['whiteboard', 'sender', 'mentions', 'availableBots']);
     const ptyText = blocks
       .filter((b) => !ENVELOPE_KEYS.has(b.key))
       .map((b) => b.text)
@@ -1913,11 +1931,30 @@ export function buildNewTopicCliInput(
       .filter((b) => ENVELOPE_KEYS.has(b.key))
       .map((b) => b.text)
       .join('\n\n');
-    if (hookEnvelope && hookEnvelope.length <= HOOK_ENVELOPE_MAX_CHARS) {
-      writePromptContext(sessionId, hookTurnId, ptyText, hookEnvelope);
-      return finalizeCliTurnInput({ content: ptyText }, userMessage, { ...opts, attachments, cliId });
+    if (!startsWithCliComposerPrefix(ptyText) && hookEnvelope.length <= HOOK_ENVELOPE_MAX_CHARS) {
+      const writeResult = hookEnvelope
+        ? writePromptContext(sessionId, hookTurnId, ptyText, hookEnvelope, { rejectDuplicate: true })
+        : 'written';
+      if (writeResult === 'written') {
+        // An empty-envelope rebuild must not leave an earlier sidecar for this
+        // turn to inject stale metadata into the final prompt.
+        if (!hookEnvelope) removePromptContextForTurn(sessionId, hookTurnId);
+        return finalizeCliTurnInput(
+          {
+            content: ptyText,
+            ...(hookEnvelope ? { hookEnvelope } : {}),
+            ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
+          },
+          userMessage,
+          { ...opts, attachments, cliId },
+        );
+      }
+      // A duplicate outstanding prompt or a failed sidecar write must never
+      // send stripped text: remove only this turn's stale file and fall through
+      // to the complete inline prompt below.
+      removePromptContextForTurn(sessionId, hookTurnId);
     }
-    // 无 envelope（无 whiteboard/sender/mentions）或超限 → 回退 inline。
+    // 首字节 `!`/`/`、同指纹并发轮或超限（>8k）→ 回退 inline，保留 `<user_message>` 外壳。
   }
   const content = buildNewTopicPrompt(
     userMessage, sessionId, cliId, cliPathOverride, attachments, mentions,
@@ -2215,93 +2252,269 @@ const HOOK_ENVELOPE_MAX_CHARS = 8000;
 const PROMPT_HOOK_LOCAL_BACKENDS = new Set(['pty', 'tmux', 'herdr', 'zellij', 'zmx', 'hc']);
 
 /**
- * 判定该 follow-up 是否走 hook 注入模式（#794 P1 方向 B）。四重条件全部满足：
- *  1. 适配器支持不可见 system-reminder 注入（目前仅 claude-code）；
- *  2. per-bot 开关 envelopeInjection=auto（默认 off）；
- *  3. preflight：botmux 的 UserPromptSubmit hook 已装进 **CLI 实际读取的** settings
- *     （read-isolation 下是 per-bot BOT_HOME 那份，不是全局）；
- *  4. （在 buildFollowUpCliInput 里）envelope 不超 8k。
- * 任一不满足 → inline（现状字节不变）。
- *
- * opening（buildNewTopicCliInput）复用同一判定：cfg 字段是 FollowUpOpts /
- * NewTopicOpts 的结构化子集，两边都满足。
+ * 判定该 turn 是否走 hook 注入模式（#794 默认开启）。以下守卫全部满足才走 hook，任一
+ * 不满足 fail-closed 回退 inline（不丢上下文）：
+ *  1. 非零提示词注入（`promptInjection !== 'none'`）且非 adopt 会话；
+ *  2. 会话后端在本地白名单 `PROMPT_HOOK_LOCAL_BACKENDS` 内（远端后端无本地 hook 进程）；
+ *  3. 适配器支持不可见 system-reminder 注入（目前仅 `claude-code`）；
+ *  4. 启动配置权威解析通过（活 worker 冻结 `initConfig` 优先；仅全新 opening / `/fork`
+ *     未启动子会话允许按 planned launch 推导；其余 worker-null / 死亡 worker 一律回退）；
+ *  5. 沙盒网络可直连宿主 loopback（`loopbackShared === true`：无 `--unshare-net`、无
+ *     slirp `sandboxNetworkPolicy` / `protectedHttpEgressPolicy`）；
+ *  6. preflight：botmux 的 `UserPromptSubmit` hook 已装进 **CLI 实际读取的** settings
+ *     （全局、`cliConfigDir`、per-bot `<BOT_HOME>/claude/settings.json` 或助理模式
+ *     `<BOT_HOME>/users/<owner>/claude/settings.json`）；
+ *  7. （在调用点）存在权威 `turnId` 且 envelope ≤ 8k。
  */
+/** Whether `text` begins with Claude Code's composer Bash-mode (`!`) or native
+ *  slash-command (`/`) prefix once Claude-stripped invisible characters and
+ *  leading whitespace are removed. Hook mode strips `<user_message>`, so any
+ *  turn matching this predicate MUST fall back to inline `<user_message>` to
+ *  prevent untrusted IM text from executing interactive `!` shell commands or
+ *  native `/exit`/`/config`/`/clear` commands directly in the composer. */
+function startsWithCliComposerPrefix(text: string): boolean {
+  const trimmed = text.replace(CLAUDE_STRIPPED_INVISIBLE_RE, '').trimStart();
+  return trimmed.startsWith('!') || trimmed.startsWith('/');
+}
+
 type EnvelopeInjectionCfg = {
   promptInjection?: PromptInjection;
   cliId?: CliId;
   cliPathOverride?: string;
+  cliConfigDir?: string;
   sessionBackendType?: BackendType;
   larkAppId?: string;
   sessionId?: string;
+  isAdoptMode?: boolean;
   /** A genuinely new opening has no prior worker generation to mirror. */
   opening?: boolean;
+  /** True only when an empty-started worker-null session will cold-spawn its
+   *  first real user turn with `resume: false` and has no prior CLI input. */
+  freshColdOpening?: boolean;
 };
 
+interface PromptHookLaunchPlan {
+  launchConfig: BotConfig;
+  cliConfigDir?: string;
+  assistantOwnerOpenId?: string;
+  sandboxNetwork?: boolean;
+  sandboxNetworkPolicy?: unknown;
+  protectedHttpEgressPolicy?: unknown;
+  loopbackBlocked?: boolean;
+  liveWorker?: boolean;
+  skipLiveProtectedHttpEgressLookup?: boolean;
+}
+
+function plannedSandboxFromSession(
+  session: Session | undefined,
+  botConfig: BotConfig,
+): BotConfig['sandbox'] {
+  if (session?.sandbox !== undefined) {
+    if (session.sandbox === true || session.sandbox === 'oncall') return 'oncall';
+    return session.sandbox === 'scratch' ? 'scratch' : 'off';
+  }
+  if (session?.pendingForkSession === true) return 'off';
+  return botConfig.sandbox;
+}
+
+function plannedLaunchFromSession(
+  session: Session | undefined,
+  botConfig: BotConfig,
+  cfg: EnvelopeInjectionCfg,
+): PromptHookLaunchPlan | undefined {
+  if (session?.adoptedFrom) return undefined;
+  const wrapperCli = session?.cliLaunchSnapshot
+    ? session.cliLaunchSnapshot.wrapperCli ?? undefined
+    : session?.agentFrozen
+      ? session.wrapperCli
+      : session?.wrapperCli ?? botConfig.wrapperCli;
+  const cliConfigDir = session?.adoptedFrom || session?.cliLaunchSnapshot
+    ? undefined
+    : session?.agentFrozen
+      ? (cliSupportsConfigDir(cfg.cliId) ? session.cliConfigDir : undefined)
+      : (cliSupportsConfigDir(cfg.cliId) ? (session?.cliConfigDir ?? cfg.cliConfigDir ?? botConfig.cliConfigDir) : undefined);
+  let assistantOwnerOpenId: string | undefined;
+  if (botConfig.assistantMode === true) {
+    if (!isValidAssistantOpenId(session?.assistantOwnerOpenId)) return undefined;
+    assistantOwnerOpenId = session.assistantOwnerOpenId;
+  }
+  return {
+    launchConfig: {
+      ...botConfig,
+      sandbox: plannedSandboxFromSession(session, botConfig),
+      readIsolation: botConfig.readIsolation === true,
+      wrapperCli,
+      credentialsSourceDir: botConfig.credentialsSourceDir,
+      backendType: cfg.sessionBackendType,
+    },
+    cliConfigDir,
+    assistantOwnerOpenId,
+    sandboxNetwork: session?.sandboxNetwork ?? botConfig.sandboxNetwork,
+    sandboxNetworkPolicy: session?.sandboxNetworkPolicy ?? botConfig.sandboxNetworkPolicy,
+    protectedHttpEgressPolicy: session?.protectedHttpEgressPolicy,
+    skipLiveProtectedHttpEgressLookup: session?.pendingForkSession === true,
+  };
+}
+
 /** Launch facts for the CLI generation that will actually read the settings.
- * A live worker's init is authoritative: live bot config may have moved on,
- * while its CLI/pane still uses the old home. Existing sessions without a live
- * generation fail closed to inline; only a new opening may use live config. */
-function promptHookLaunchConfig(
+ *  A live worker's init is authoritative: live bot config may have moved on,
+ *  while its CLI/pane still uses the old home. Existing sessions without a live
+ *  generation fail closed; only a virgin opening (or unstarted `/fork` child)
+ *  with no prior worker generation may derive its planned launch config. */
+function resolvePromptHookLaunchPlan(
   cfg: EnvelopeInjectionCfg,
   botConfig: BotConfig,
-): BotConfig | undefined {
-  if (!cfg.sessionId) return botConfig;
+): PromptHookLaunchPlan | undefined {
+  if (cfg.isAdoptMode === true) return undefined;
+  if (!cfg.sessionId) {
+    return plannedLaunchFromSession(undefined, botConfig, cfg);
+  }
   const registry = getActiveSessionsRegistry();
   const ds = registry
     ? [...registry.values()].find(candidate => candidate.session.sessionId === cfg.sessionId)
     : undefined;
   if (ds) {
-    const init = ds.initConfig;
-    if (!ds.worker || ds.worker.killed || ds.worker.connected === false || !init) return undefined;
-    return {
-      ...botConfig,
-      sandbox: init.sandbox,
-      readIsolation: init.readIsolation,
-      wrapperCli: init.wrapperCli,
-      credentialsSourceDir: init.credentialsSourceDir,
-      backendType: init.backendType,
-    };
+    if (ds.adoptedFrom || ds.session.adoptedFrom || ds.initConfig?.adoptMode === true) return undefined;
+    if (ds.worker !== null) {
+      const init = ds.initConfig;
+      if (ds.worker.killed || ds.worker.connected === false || !init) return undefined;
+      if (init.cliId && cfg.cliId && init.cliId !== cfg.cliId) return undefined;
+      if (init.backendType && !PROMPT_HOOK_LOCAL_BACKENDS.has(init.backendType)) return undefined;
+      return {
+        launchConfig: {
+          ...botConfig,
+          sandbox: init.sandbox,
+          readIsolation: init.readIsolation,
+          wrapperCli: init.wrapperCli,
+          credentialsSourceDir: init.credentialsSourceDir,
+          backendType: init.backendType,
+        },
+        cliConfigDir: cliSupportsConfigDir(cfg.cliId) ? init.cliConfigDir : undefined,
+        assistantOwnerOpenId: init.assistantOwnerOpenId,
+        sandboxNetwork: init.sandboxNetwork,
+        sandboxNetworkPolicy: init.sandboxNetworkPolicy,
+        protectedHttpEgressPolicy: init.protectedHttpEgressPolicy,
+        loopbackBlocked: ds.reportedIdentityModel?.loopbackShared === false,
+        liveWorker: true,
+      };
+    }
+    if (!cfg.opening) return undefined;
+    const isVirginOpening = !ds.initConfig
+      && !ds.workerGeneration
+      && !ds.session.workerGeneration
+      && !ds.hasHistory
+      && !ds.session.cliSessionId;
+    const isPendingForkOpening = ds.session.pendingForkSession === true
+      && !ds.initConfig
+      && !ds.workerGeneration
+      && !ds.session.workerGeneration;
+    const isFreshCliOpening = ds.session.cliLaunchSnapshot?.state === 'pending'
+      && ds.session.cliLaunchSnapshot.cliId === cfg.cliId
+      && !ds.hasHistory
+      && !ds.session.cliSessionId;
+    const isFreshColdEmptyOpening = cfg.freshColdOpening === true
+      && !ds.lastCliInput
+      && !ds.session.lastCliInput;
+    if (!isVirginOpening && !isPendingForkOpening && !isFreshCliOpening && !isFreshColdEmptyOpening) return undefined;
+    return plannedLaunchFromSession(ds.session, botConfig, cfg);
   }
   if (!cfg.opening) {
     try {
       if (sessionStore.getSession(cfg.sessionId)) return undefined;
     } catch { return undefined; }
+    return plannedLaunchFromSession(undefined, botConfig, cfg);
   }
-  return botConfig;
+  let persisted: Session | undefined;
+  try {
+    persisted = sessionStore.getSession(cfg.sessionId) ?? undefined;
+  } catch { return undefined; }
+  if (persisted) {
+    if (persisted.adoptedFrom) return undefined;
+    const isVirginPersisted = !persisted.workerGeneration && !persisted.cliSessionId;
+    const isPendingForkPersisted = persisted.pendingForkSession === true && !persisted.workerGeneration;
+    const isFreshCliPersisted = persisted.cliLaunchSnapshot?.state === 'pending'
+      && persisted.cliLaunchSnapshot.cliId === cfg.cliId
+      && !persisted.cliSessionId;
+    const isFreshColdEmptyPersisted = cfg.freshColdOpening === true && !persisted.lastCliInput;
+    if (!isVirginPersisted && !isPendingForkPersisted && !isFreshCliPersisted && !isFreshColdEmptyPersisted) return undefined;
+  }
+  return plannedLaunchFromSession(persisted, botConfig, cfg);
+}
+
+/** Whether the CLI inside this launch plan can reach daemon loopback IPC
+ *  (`127.0.0.1:<ipcPort>`). Sandboxes with `sandboxNetwork: false`, slirp
+ *  `sandboxNetworkPolicy`, or `protectedHttpEgressPolicy` do not share host
+ *  loopback (`loopbackShared === false`), so `botmux user-prompt-hook` cannot
+ *  claim sidecars and we must fail closed to inline. */
+function promptHookLoopbackShared(
+  plan: PromptHookLaunchPlan,
+  sandboxMode: ReturnType<typeof resolveSandboxMode>,
+): boolean {
+  if (plan.loopbackBlocked) return false;
+  if (sandboxMode === 'off') return true;
+  let effectivePolicy = plan.sandboxNetworkPolicy;
+  if (effectivePolicy === undefined && sandboxMode === 'oncall') {
+    if (plan.liveWorker) {
+      effectivePolicy = plan.protectedHttpEgressPolicy;
+    } else if (plan.protectedHttpEgressPolicy !== undefined) {
+      effectivePolicy = plan.protectedHttpEgressPolicy ?? undefined;
+    } else if (!plan.skipLiveProtectedHttpEgressLookup) {
+      try {
+        const globalCfg = typeof globalConfigModule.readGlobalConfig === 'function'
+          ? globalConfigModule.readGlobalConfig()
+          : {};
+        const effectivePluginIds = resolveEffectivePluginIds(plan.launchConfig, globalCfg);
+        if (effectivePluginIds.length > 0) {
+          const policies = collectProtectedHttpEgressPolicies(effectivePluginIds);
+          if (policies.length > 0) effectivePolicy = policies[0];
+        }
+      } catch {
+        return false;
+      }
+    }
+  }
+  return resolveSpawnNetworkShape({
+    mode: sandboxMode,
+    sandboxNetwork: plan.sandboxNetwork,
+    sandboxNetworkPolicy: effectivePolicy,
+  }).loopbackShared;
 }
 
 function resolveEnvelopeInjectionMode(cfg?: EnvelopeInjectionCfg): 'hook' | 'inline' {
-  if (!cfg?.cliId || zeroPromptInjectionForBot(cfg.larkAppId, cfg.cliId, cfg.promptInjection)) return 'inline';
+  if (!cfg?.cliId || cfg.isAdoptMode === true || zeroPromptInjectionForBot(cfg.larkAppId, cfg.cliId, cfg.promptInjection)) return 'inline';
   // 远端后端（riff 等）没有本地 Claude hook 进程，sidecar 写了没人读，
-  // 必须用会话冻结的 backendType（不是当前 bot 配置，那是 next-session 生效）。
+  // 必须用会话冻结（或 opening 计划）的 backendType。
   // 只有确知在本地跑 CLI 的后端才允许 hook 模式（白名单）。未来新增远端后端
   // 时默认 inline，不会静默丢 reminder（review hardening：黑名单会漏）。
-  // fail-closed（review B3）：sessionBackendType 缺失（null/undefined）时不再短路
-  // 放过，强制 inline。现网 spawn 的 reconcileRiffBackendType 已把 claude-code 钉在
-  // 本地后端，此条是防未来远端后端的硬化；所有调用点都传 ds.session.backendType。
+  // fail-closed（review B3）：sessionBackendType 缺失（null/undefined）时强制 inline。
   if (!cfg.sessionBackendType || !PROMPT_HOOK_LOCAL_BACKENDS.has(cfg.sessionBackendType)) return 'inline';
-  let adapter: CliAdapter;
-  try {
-    adapter = createCliAdapterSync(cfg.cliId, cfg.cliPathOverride);
-  } catch { return 'inline'; }
-  if (!adapter.supportsInvisiblePromptHook || !adapter.hookInstall?.userPromptSubmitCommand) return 'inline';
   if (!cfg.larkAppId) return 'inline';
   let botConfig: BotConfig;
   try {
     botConfig = getBot(cfg.larkAppId).config;
   } catch { return 'inline'; }
-  if (botConfig.envelopeInjection !== 'auto') return 'inline';
-  const launchConfig = promptHookLaunchConfig(cfg, botConfig);
-  if (!launchConfig) return 'inline';
-  const effectivePath = effectivePromptHookConfigPath(adapter, launchConfig, cfg.larkAppId, cfg.sessionBackendType);
+  const plan = resolvePromptHookLaunchPlan(cfg, botConfig);
+  if (!plan) return 'inline';
+  let adapter: CliAdapter;
+  try {
+    adapter = createCliAdapterSync(
+      cfg.cliId,
+      cfg.cliPathOverride,
+      plan.cliConfigDir ? { configDir: plan.cliConfigDir } : undefined,
+    );
+  } catch { return 'inline'; }
+  if (!adapter.supportsInvisiblePromptHook || !adapter.hookInstall?.userPromptSubmitCommand) return 'inline';
+  const effectivePath = effectivePromptHookConfigPath(adapter, plan, cfg.larkAppId, cfg.sessionBackendType);
   if (!effectivePath || !hasInstalledPromptHookCached(effectivePath)) return 'inline';
   return 'hook';
 }
 
 /**
- * 与 worker 的 willRedirectCliData 同条件，算出 CLI 实际读取的 Claude settings 路径。
+ * 与 worker 的 willRedirectCliData + resolveSpawnNetworkShape 同条件，先验证宿主
+ * loopback 可达，再算出 CLI 实际读取的 Claude settings 路径。
  * read-isolation（sandbox + supportsReadIsolation + 无 wrapperCli + 非 riff 后端）
- * 下，CLI 经 CLAUDE_CONFIG_DIR 读 per-bot `<BOT_HOME>/claude/settings.json`；
+ * 下，CLI 经 CLAUDE_CONFIG_DIR 读 per-bot `<BOT_HOME>/claude/settings.json`
+ * （助理模式则读 `<BOT_HOME>/users/<owner>/claude/settings.json`），而不是全局那份；
  * preflight 必须查这份而不是全局——per-bot 安装是 best-effort（provisionIsolatedBotHome
  * 吞异常），查全局会把安装失败误判为已装，导致该 session 每轮系统性丢 reminder。
  *
@@ -2315,12 +2528,13 @@ function resolveEnvelopeInjectionMode(cfg?: EnvelopeInjectionCfg): 'hook' | 'inl
  */
 function effectivePromptHookConfigPath(
   adapter: CliAdapter,
-  botConfig: BotConfig,
+  plan: PromptHookLaunchPlan,
   larkAppId: string,
   sessionBackendType?: BackendType,
 ): string | undefined {
   const base = adapter.hookInstall?.configPath;
   if (!base) return undefined;
+  const botConfig = plan.launchConfig;
   // scratch keeps the CLI's native home, like the worker (only oncall redirects).
   let sandboxMode: ReturnType<typeof resolveSandboxMode>;
   try {
@@ -2330,6 +2544,7 @@ function effectivePromptHookConfigPath(
       envValue: process.env.BOTMUX_SANDBOX,
     });
   } catch { return undefined; }
+  if (!promptHookLoopbackShared(plan, sandboxMode)) return undefined;
   const credentialSourceHome = credentialSourceForcesBotHome({
     sourceDir: botConfig.credentialsSourceDir,
     // The adapter is built from the session's frozen CLI, which may differ from
@@ -2337,14 +2552,25 @@ function effectivePromptHookConfigPath(
     cliId: adapter.id,
     sandboxRequested: sandboxMode !== 'off',
   });
-  const willRedirect = (sandboxMode === 'oncall' || credentialSourceHome)
+  const effectiveBackendType = botConfig.backendType ?? sessionBackendType;
+  const needsRedirect = (sandboxMode === 'oncall' || credentialSourceHome)
     && adapter.supportsReadIsolation === true
     && !botConfig.wrapperCli
-    && (sessionBackendType ?? botConfig.backendType) !== 'riff'
-    && !!process.env.SESSION_DATA_DIR;
-  if (!willRedirect) return base;
-  const dataDir = process.env.SESSION_DATA_DIR;
-  if (!dataDir) return base;
+    && effectiveBackendType !== 'riff';
+  // Match `forkWorkerPrepared` (which injects `SESSION_DATA_DIR: config.session.dataDir`
+  // into every spawned worker): fall back to `config.session.dataDir` when env is unset,
+  // and fail closed if redirection is required with no data dir available.
+  const dataDir = process.env.SESSION_DATA_DIR?.trim() || config.session.dataDir?.trim() || '';
+  const willRedirect = needsRedirect && !!dataDir;
+  if (plan.assistantOwnerOpenId !== undefined) {
+    if (!isValidAssistantOpenId(plan.assistantOwnerOpenId) || sandboxMode !== 'oncall' || !willRedirect) {
+      return undefined;
+    }
+    const botHome = botHomePath(dirname(dataDir), larkAppId);
+    return join(assistantUserHome(botHome, plan.assistantOwnerOpenId), 'claude', 'settings.json');
+  }
+  if (!needsRedirect) return base;
+  if (!dataDir) return undefined;
   const botmuxHome = dirname(dataDir);
   return join(botHomePath(botmuxHome, larkAppId), 'claude', 'settings.json');
 }
@@ -2357,21 +2583,25 @@ export interface PromptHookTarget {
   sessionId?: string;
 }
 
-/** Whether botmux's UserPromptSubmit hook runs on every submit of a session's
- *  CLI: run on this host, by an adapter that installs the hook, found in the
- *  settings file that CLI reads. Hook mode's preflight without its opt-in. */
+/** Whether botmux's UserPromptSubmit hook runs and can reach daemon IPC on
+ *  every submit of a session's CLI: local host backend, adapter installs the
+ *  hook, sandbox shares host loopback, and the hook is present in the settings
+ *  file that CLI reads. */
 export function promptHookRunsInCli(target: PromptHookTarget): boolean {
   if (!target.sessionBackendType || !PROMPT_HOOK_LOCAL_BACKENDS.has(target.sessionBackendType)) return false;
-  let adapter: CliAdapter;
   let botConfig: BotConfig;
   try {
-    adapter = createCliAdapterSync(target.cliId, undefined, target.cliConfigDir ? { configDir: target.cliConfigDir } : undefined);
     botConfig = getBot(target.larkAppId).config;
   } catch { return false; }
+  const plan = resolvePromptHookLaunchPlan(target, botConfig);
+  if (!plan) return false;
+  let adapter: CliAdapter;
+  try {
+    const configDir = plan.cliConfigDir ?? (cliSupportsConfigDir(target.cliId) ? target.cliConfigDir : undefined);
+    adapter = createCliAdapterSync(target.cliId, undefined, configDir ? { configDir } : undefined);
+  } catch { return false; }
   if (!adapter.hookInstall?.userPromptSubmitCommand) return false;
-  const launchConfig = promptHookLaunchConfig(target, botConfig);
-  if (!launchConfig) return false;
-  const effectivePath = effectivePromptHookConfigPath(adapter, launchConfig, target.larkAppId, target.sessionBackendType);
+  const effectivePath = effectivePromptHookConfigPath(adapter, plan, target.larkAppId, target.sessionBackendType);
   return !!effectivePath && hasInstalledPromptHookCached(effectivePath);
 }
 
@@ -2451,7 +2681,9 @@ export function buildFollowUpCliInput(
   // 输入框不再出现 <user_message>/<sender>/<mentions> 标签。代价：hook 注入内容不落
   // transcript，insight 发送者归因对 hook 模式会话降级为「未知用户」（用户已确认接受）。
   const hookTurnId = opts?.turnId;
-  if (resolveEnvelopeInjectionMode({ ...opts, sessionId }) === 'hook' && hookTurnId) {
+  if (hookTurnId
+    && !startsWithCliComposerPrefix(content)
+    && resolveEnvelopeInjectionMode({ ...opts, sessionId }) === 'hook') {
     const blocks = buildFollowUpBlocks(content, sessionId, opts, true);
     // messageLocation 是宿主元数据，与 sender 同类：hook 模式下进 envelope，
     // 输入框与 transcript 仍只有用户正文。
@@ -2464,15 +2696,25 @@ export function buildFollowUpCliInput(
       .filter((b) => ENVELOPE_KEYS.has(b.key))
       .map((b) => b.text)
       .join('\n\n');
-    if (hookEnvelope && hookEnvelope.length <= HOOK_ENVELOPE_MAX_CHARS) {
-      writePromptContext(sessionId, hookTurnId, ptyText, hookEnvelope);
-      return finalizeCliTurnInput(
-        { content: ptyText, ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) },
-        content,
-        opts,
-      );
+    if (!startsWithCliComposerPrefix(ptyText) && hookEnvelope.length <= HOOK_ENVELOPE_MAX_CHARS) {
+      const writeResult = hookEnvelope
+        ? writePromptContext(sessionId, hookTurnId, ptyText, hookEnvelope, { rejectDuplicate: true })
+        : 'written';
+      if (writeResult === 'written') {
+        if (!hookEnvelope) removePromptContextForTurn(sessionId, hookTurnId);
+        return finalizeCliTurnInput(
+          {
+            content: ptyText,
+            ...(hookEnvelope ? { hookEnvelope } : {}),
+            ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
+          },
+          content,
+          opts,
+        );
+      }
+      removePromptContextForTurn(sessionId, hookTurnId);
     }
-    // 无 envelope（理论上不会发生：claude-code 必有 reminder）或超限 → 回退 inline。
+    // 首字节 `!`/`/`、同指纹并发轮、写盘失败或超限（>8k）→ 回退完整 inline。
   }
   const legacyContent = buildFollowUpContent(content, sessionId, opts);
   if (opts?.cliId !== 'codex-app' || opts.isAdoptMode) {
@@ -2723,6 +2965,7 @@ export function persistStreamCardState(ds: DaemonSession, opts?: { forceWrite?: 
     s.modelFallback?.claudeSessionId === ds.modelFallback?.claudeSessionId &&
     s.lastUserPrompt === ds.lastUserPrompt &&
     s.lastCliInput === ds.lastCliInput &&
+    s.lastHookEnvelope === ds.lastHookEnvelope &&
     s.lastCliInputTurnId === ds.lastCliInputTurnId &&
     JSON.stringify(s.lastCodexAppInput ?? null) === JSON.stringify(ds.lastCodexAppInput ?? null) &&
     JSON.stringify(s.replyThreadAliases ?? {}) === JSON.stringify(ds.replyThreadAliases ?? {}) &&
@@ -2741,6 +2984,8 @@ export function persistStreamCardState(ds: DaemonSession, opts?: { forceWrite?: 
   s.modelFallback = ds.modelFallback;
   s.lastUserPrompt = ds.lastUserPrompt;
   s.lastCliInput = ds.lastCliInput;
+  if (ds.lastHookEnvelope) s.lastHookEnvelope = ds.lastHookEnvelope;
+  else delete s.lastHookEnvelope;
   s.lastCliInputTurnId = ds.lastCliInputTurnId;
   if (ds.lastCodexAppInput) s.lastCodexAppInput = ds.lastCodexAppInput;
   else delete s.lastCodexAppInput;
@@ -2764,6 +3009,8 @@ export function rememberLastCliInput(
   ds.lastUserPrompt = userPrompt;
   const normalized = typeof cliInput === 'string' ? { content: cliInput } : cliInput;
   ds.lastCliInput = normalized.content;
+  if (normalized.hookEnvelope) ds.lastHookEnvelope = normalized.hookEnvelope;
+  else delete ds.lastHookEnvelope;
   ds.lastCliInputTurnId = inputTurnId;
   const botCfg = getBot(ds.larkAppId).config;
   const effectiveCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId;
@@ -2785,6 +3032,8 @@ export function rememberLastCliInput(
   else delete ds.lastCodexAppInput;
   ds.session.lastUserPrompt = userPrompt;
   ds.session.lastCliInput = normalized.content;
+  if (normalized.hookEnvelope) ds.session.lastHookEnvelope = normalized.hookEnvelope;
+  else delete ds.session.lastHookEnvelope;
   ds.session.lastCliInputTurnId = inputTurnId;
   if (replayCodexAppInput) ds.session.lastCodexAppInput = replayCodexAppInput;
   else delete ds.session.lastCodexAppInput;
@@ -3376,6 +3625,7 @@ export async function restoreActiveSessions(
           modelFallback: session.modelFallback,
           lastUserPrompt: session.lastUserPrompt,
           lastCliInput: session.lastCliInput,
+          lastHookEnvelope: session.lastHookEnvelope,
           lastCliInputTurnId: session.lastCliInputTurnId,
           lastCodexAppInput: session.lastCodexAppInput,
           replyThreadAliases: session.replyThreadAliases,
@@ -3593,6 +3843,7 @@ export async function restoreActiveSessions(
       modelFallback: session.modelFallback,
       lastUserPrompt: session.lastUserPrompt,
       lastCliInput: session.lastCliInput,
+      lastHookEnvelope: session.lastHookEnvelope,
       lastCliInputTurnId: session.lastCliInputTurnId,
       lastCodexAppInput: session.lastCodexAppInput,
       replyThreadAliases: session.replyThreadAliases,
@@ -4345,6 +4596,7 @@ export async function takeOverDurableActiveRemoteSession(
       modelFallback: persisted.modelFallback,
       lastUserPrompt: persisted.lastUserPrompt,
       lastCliInput: persisted.lastCliInput,
+      lastHookEnvelope: persisted.lastHookEnvelope,
       lastCliInputTurnId: persisted.lastCliInputTurnId,
       lastCodexAppInput: persisted.lastCodexAppInput,
       replyThreadAliases: persisted.replyThreadAliases,
@@ -4634,6 +4886,7 @@ export async function resumeSession(
     modelFallback: session.modelFallback,
     lastUserPrompt: session.lastUserPrompt,
     lastCliInput: session.lastCliInput,
+    lastHookEnvelope: session.lastHookEnvelope,
     lastCliInputTurnId: session.lastCliInputTurnId,
     lastCodexAppInput: session.lastCodexAppInput,
     replyThreadAliases: session.replyThreadAliases,
@@ -5498,16 +5751,6 @@ export async function executeScheduledTask(
       sessionStore.updateSession(ds.session);
     }
     ensureSessionWhiteboard(ds);
-    const prompt = buildNewTopicCliInput(firePrompt, session.sessionId, ds.session.cliLaunchSnapshot?.cliId ?? session.cliId ?? bot.config.cliId, ds.session.cliLaunchSnapshot?.cliPathOverride ?? session.cliPathOverride ?? bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId), undefined, {
-      larkAppId,
-      chatId: task.chatId,
-      whiteboardId: ds.session.whiteboardId,
-      trustedCaller: scheduledTrustedCaller,
-      promptInjection: sessionPromptInjection(ds),
-      // This branch always creates a fresh Session; the paired forkWorker call
-      // below receives no resume flag.
-      larkToolResume: false,
-    });
     // Keep the candidate out of the live registry until authorization succeeds.
     // On rejection there is no worker or activation journal to recover: close
     // its durable row so the next fire can create a fresh candidate.
@@ -5529,6 +5772,22 @@ export async function executeScheduledTask(
         (winner ? ` to ${winner.session.sessionId}` : ''),
       );
     }
+    // Build synchronously after every await and registration so live bot config
+    // cannot drift between hook-mode preflight and forkWorker.
+    const liveScheduledBot = getBot(larkAppId);
+    const scheduledCliId = ds.session.cliLaunchSnapshot?.cliId ?? session.cliId ?? liveScheduledBot.config.cliId;
+    const prompt = buildNewTopicCliInput(firePrompt, session.sessionId, scheduledCliId, ds.session.cliLaunchSnapshot?.cliPathOverride ?? session.cliPathOverride ?? liveScheduledBot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: liveScheduledBot.botName, openId: liveScheduledBot.botOpenId }, localeForBot(larkAppId), undefined, {
+      larkAppId,
+      chatId: task.chatId,
+      whiteboardId: ds.session.whiteboardId,
+      trustedCaller: scheduledTrustedCaller,
+      promptInjection: sessionPromptInjection(ds),
+      turnId: scheduledTurnId,
+      sessionBackendType: plannedOpeningBackendType(ds, scheduledCliId, liveScheduledBot.config),
+      // This branch always creates a fresh Session; the paired forkWorker call
+      // below receives no resume flag.
+      larkToolResume: false,
+    });
     rememberLastCliInput(ds, task.prompt, prompt, scheduledTurnId);
     if (silent) armSilentScheduledTurn(ds, scheduledTurnId);
     try {
@@ -5557,8 +5816,9 @@ export interface OwnerBatchTurnInput {
   /**
    * 管家群里的回显（等同 owner 发了一条消息）：texts[0] 是横幅加逐项内容，也是话题群 /
    * new-topic 模式下的落点和 shared 模式的回复根；超长时其余段落与附图按顺序跟在后面。
+   * card 是 texts[0] 的紧凑卡片版，发送失败时用同一个去重键回退纯文本。
    */
-  announcement: { texts: string[]; images: LarkAttachment[] };
+  announcement: { texts: string[]; images: LarkAttachment[]; card?: string };
   attachments: LarkAttachment[];
   /** 提交人 = 管家 bot 的 owner（本 app 视角的 open_id）。拿不到就按无身份投递。 */
   ownerOpenId?: string;
@@ -5620,10 +5880,26 @@ export async function deliverOwnerBatchTurn(
     bannerAttempted = true;
     // 没有横幅正文（群秘书静默回合）：不发任何东西，落点回落 chat 锚点。
     if (!firstText) return undefined;
-    try {
-      bannerId = await sendMessage(larkAppId, chatId, firstText);
-    } catch (err: any) {
-      logger.warn(`[decision-board] Failed to post batch banner in ${chatId} (${err.message})`);
+    const postTextBanner = async (uuid?: string): Promise<void> => {
+      try {
+        // 无卡片的老调用保持原参数形状；卡片降级复用同一个 uuid，避免响应丢失时重复发横幅。
+        bannerId = uuid
+          ? await sendMessage(larkAppId, chatId, firstText, 'text', uuid)
+          : await sendMessage(larkAppId, chatId, firstText);
+      } catch (err: any) {
+        logger.warn(`[decision-board] Failed to post batch banner in ${chatId} (${err.message})`);
+      }
+    };
+    if (input.announcement.card) {
+      const uuid = randomUUID();
+      try {
+        bannerId = await sendMessage(larkAppId, chatId, input.announcement.card, 'interactive', uuid);
+      } catch (err: any) {
+        logger.warn(`[decision-board] Failed to post batch card in ${chatId} (${err.message}); falling back to text`);
+        await postTextBanner(uuid);
+      }
+    } else {
+      await postTextBanner();
     }
     // 其余段落与附图紧跟着发：话题群 / new-topic / shared 模式挂在横幅那条下面（不然每条都会
     // 各开一个话题），其余模式按顺序发在群里。单条失败只记日志，不挡批次投递。
@@ -5786,19 +6062,6 @@ export async function deliverOwnerBatchTurn(
       sessionStore.updateSession(ds.session);
     }
     ensureSessionWhiteboard(ds);
-    const prompt = buildNewTopicCliInput(input.prompt, session.sessionId,
-      ds.session.cliLaunchSnapshot?.cliId ?? session.cliId ?? bot.config.cliId,
-      ds.session.cliLaunchSnapshot?.cliPathOverride ?? session.cliPathOverride ?? bot.config.cliPathOverride,
-      input.attachments, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId },
-      localeForBot(larkAppId), sender, {
-        larkAppId,
-        chatId,
-        whiteboardId: ds.session.whiteboardId,
-        trustedCaller,
-        promptInjection: sessionPromptInjection(ds),
-        larkToolResume: false,
-        turnId,
-      });
     try {
       await runtime?.prepareTurnIdentity?.(ds, turnId);
     } catch (err) {
@@ -5811,6 +6074,22 @@ export async function deliverOwnerBatchTurn(
       throw new Error(`decision board batch lost active-session registration for ${anchor}`
         + (winner ? ` to ${winner.session.sessionId}` : ''));
     }
+    const liveBoardBot = getBot(larkAppId);
+    const boardCliId = ds.session.cliLaunchSnapshot?.cliId ?? session.cliId ?? liveBoardBot.config.cliId;
+    const prompt = buildNewTopicCliInput(input.prompt, session.sessionId,
+      boardCliId,
+      ds.session.cliLaunchSnapshot?.cliPathOverride ?? session.cliPathOverride ?? liveBoardBot.config.cliPathOverride,
+      input.attachments, undefined, undefined, undefined, { name: liveBoardBot.botName, openId: liveBoardBot.botOpenId },
+      localeForBot(larkAppId), sender, {
+        larkAppId,
+        chatId,
+        whiteboardId: ds.session.whiteboardId,
+        trustedCaller,
+        promptInjection: sessionPromptInjection(ds),
+        larkToolResume: false,
+        turnId,
+        sessionBackendType: plannedOpeningBackendType(ds, boardCliId, liveBoardBot.config),
+      });
     rememberLastCliInput(ds, input.prompt, prompt, turnId);
     if (input.silent) armSilentScheduledTurn(ds, turnId);
     try {
@@ -5946,19 +6225,6 @@ export async function deliverWorkflowNodeTurn(
       sessionStore.updateSession(session);
     }
     ensureSessionWhiteboard(ds);
-    const prompt = buildNewTopicCliInput(input.prompt, session.sessionId,
-      ds.session.cliLaunchSnapshot?.cliId ?? session.cliId ?? bot.config.cliId,
-      ds.session.cliLaunchSnapshot?.cliPathOverride ?? session.cliPathOverride ?? bot.config.cliPathOverride,
-      input.attachments, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId },
-      localeForBot(larkAppId), undefined, {
-        larkAppId,
-        chatId,
-        whiteboardId: ds.session.whiteboardId,
-        promptInjection: sessionPromptInjection(ds),
-        larkToolResume: false,
-        turnId,
-        workflowNodeSession: true,
-      });
     try {
       await input.prepareTurnIdentity?.(ds, turnId);
     } catch (err) {
@@ -5969,6 +6235,22 @@ export async function deliverWorkflowNodeTurn(
       await closeSession(session.sessionId);
       throw new Error(`workflow node turn lost active-session registration for ${anchor}`);
     }
+    const liveWorkflowBot = getBot(larkAppId);
+    const workflowCliId = ds.session.cliLaunchSnapshot?.cliId ?? session.cliId ?? liveWorkflowBot.config.cliId;
+    const prompt = buildNewTopicCliInput(input.prompt, session.sessionId,
+      workflowCliId,
+      ds.session.cliLaunchSnapshot?.cliPathOverride ?? session.cliPathOverride ?? liveWorkflowBot.config.cliPathOverride,
+      input.attachments, undefined, undefined, undefined, { name: liveWorkflowBot.botName, openId: liveWorkflowBot.botOpenId },
+      localeForBot(larkAppId), undefined, {
+        larkAppId,
+        chatId,
+        whiteboardId: ds.session.whiteboardId,
+        promptInjection: sessionPromptInjection(ds),
+        larkToolResume: false,
+        turnId,
+        sessionBackendType: plannedOpeningBackendType(ds, workflowCliId, liveWorkflowBot.config),
+        workflowNodeSession: true,
+      });
     rememberLastCliInput(ds, input.prompt, prompt, turnId);
     try {
       forkWorker(ds, prompt, turnId);
@@ -6092,8 +6374,9 @@ async function forkOrShowRepoCard(
     }
   }
 
-  const buildPrompt = () => buildNewTopicCliInput(
-    userContent, ds.session.sessionId, ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? bot.config.cliId, ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? bot.config.cliPathOverride,
+  const openingCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? bot.config.cliId;
+  const buildPrompt = (openingTurnId: string) => buildNewTopicCliInput(
+    userContent, ds.session.sessionId, openingCliId, ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? bot.config.cliPathOverride,
     ds.pendingAttachments, ds.pendingMentions, undefined, ds.pendingFollowUps,
     { name: bot.botName, openId: bot.botOpenId }, locale, ds.pendingSender,
     {
@@ -6101,6 +6384,8 @@ async function forkOrShowRepoCard(
       chatId: ds.chatId,
       whiteboardId: ds.session.whiteboardId,
       promptInjection: sessionPromptInjection(ds),
+      turnId: openingTurnId,
+      sessionBackendType: plannedOpeningBackendType(ds, openingCliId, bot.config),
       codexAppText: ds.pendingCodexAppText,
       acceptedInput: ds.pendingAcceptedInput,
       codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
@@ -6121,7 +6406,7 @@ async function forkOrShowRepoCard(
     if (missingDir) return showMissingStartDirPicker(ds, missingDir, userContent);
     // 没钉目录 → 复用 /repo 选择卡片让用户在群里选仓库。
     const scanDirs = getProjectScanDirs(ds).filter(d => existsSync(d));
-    const projects = scanDirs.length > 0 ? scanMultipleProjects(scanDirs, 3, repoPickerScanOptions()) : [];
+    const projects = scanDirs.length > 0 ? scanMultipleProjects(scanDirs, 3, globalConfigModule.repoPickerScanOptions()) : [];
     if (projects.length > 0) {
       const card = buildRepoSelectCard(projects, getSessionWorkingDir(ds), ds.chatId, locale, bot.config.worktreeMultiPicker);
       const { sendMessage } = await import('../im/lark/client.js');
@@ -6178,8 +6463,8 @@ async function forkOrShowRepoCard(
   }
 
   ensureSessionWhiteboard(ds);
-  const prompt = buildPrompt();
   const openingTurnId = ds.pendingTurnId ?? `opening-${randomUUID()}`;
+  const prompt = buildPrompt(openingTurnId);
   rememberLastCliInput(ds, userContent, prompt, openingTurnId);
   forkWorker(ds, prompt, { turnId: openingTurnId });
   // forkWorker pre-accept is synchronous. Keep the reservation and all input
