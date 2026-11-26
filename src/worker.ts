@@ -17347,19 +17347,20 @@ function codexBridgeStartTimer(): void {
             }
           }
         }
-        codexBridgeIngest();
         // Cursor's mirror can flush THIS turn's user line as late as the end
         // of the first assistant step (a tool-less reply flushes the whole
         // turn at once, at the end). While the CLI is visibly busy the queued
         // heads' bounded leases must not lapse waiting for that flush —
-        // refresh them each tick (the argv-baked confirmed first turn and
-        // type-ahead successors included); the 120s hard cap means a false
-        // "busy" screen still prunes and the queue recovers. Non-adopt only:
-        // adopt keeps its historical timing (an expired adopt mark degrades
-        // to local-turn synthesis, still visible in Lark).
+        // refresh them each tick BEFORE ingest's own prune (the argv-baked
+        // confirmed first turn and type-ahead successors included); the 120s
+        // hard cap means a false "busy" screen still prunes and the queue
+        // recovers. Non-adopt only: adopt keeps its historical timing (an
+        // expired adopt mark degrades to local-turn synthesis, still visible
+        // in Lark).
         if (!isPromptReady && !lastInitConfig?.adoptMode) {
           codexBridgeQueue.refreshUnstartedHeadAttributionLease(Date.now(), CURSOR_BUSY_REFRESH_MAX_MS);
         }
+        codexBridgeIngest();
         if (isPromptReady) emitReadyCodexTurns();
         return;
       }

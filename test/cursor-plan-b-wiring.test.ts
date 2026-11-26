@@ -33,8 +33,12 @@ describe('cursor plan B worker wiring (on #2009)', () => {
   it('poller refreshes queued leases while busy (non-adopt) with a hard since-mark cap', () => {
     const tickStart = source.indexOf("if (structuredBridgeIs('cursor')) {", source.indexOf('function codexBridgeStartTimer'));
     const tickBody = source.slice(tickStart, source.indexOf("if (isPromptReady) emitReadyCodexTurns();", tickStart));
-    // Refreshes EVERY queued head (argv confirmed first turn + successors).
-    expect(tickBody).toContain('codexBridgeQueue.refreshUnstartedHeadAttributionLease(Date.now(), CURSOR_BUSY_REFRESH_MAX_MS)');
+    // Refreshes EVERY queued head (argv confirmed first turn + successors),
+    // BEFORE codexBridgeIngest()'s own prune runs.
+    const refreshAt = tickBody.indexOf('codexBridgeQueue.refreshUnstartedHeadAttributionLease(Date.now(), CURSOR_BUSY_REFRESH_MAX_MS)');
+    const ingestAt = tickBody.indexOf('codexBridgeIngest()');
+    expect(refreshAt).toBeGreaterThanOrEqual(0);
+    expect(ingestAt).toBeGreaterThan(refreshAt);
     // Only while the CLI is busy and not in adopt mode.
     expect(tickBody).toContain('!isPromptReady && !lastInitConfig?.adoptMode');
     expect(source).toContain('const CURSOR_BUSY_REFRESH_MAX_MS = 120_000;');

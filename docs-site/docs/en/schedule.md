@@ -176,13 +176,16 @@ botmux schedule update <id> --schedule "every 4h"         # change the frequency
 botmux schedule update <id> --prompt-file report-prompt.md
 # Short prompts can be passed inline (--prompt or --prompt-file, not both)
 botmux schedule update <id> --prompt "new full prompt"
+# Turn silent mode on or off without recreating the task
+botmux schedule update <id> --silent
+botmux schedule update <id> --no-silent
 # Fields can be combined
 botmux schedule update <id> --schedule "0 9 * * 1-5" --prompt-file report-prompt.md
 ```
 
 `--schedule` accepts everything `schedule add` does (`每日17:50`, `every 2h`, 5-field cron, …); an expression it can't read is rejected with examples and the task is left alone. After a frequency change the next run is recomputed from now under the new rule — nothing is re-run or fired immediately — and the command prints the new rule and the next run time. A paused task stays paused. The frequency can't be changed while a run is in progress (you'll be asked to wait for it to finish), and a one-shot time can't be in the past.
 
-The task ID, silent setting, execution position, Bash precondition, work calendar, creator identity, enabled state and run history are kept. A run already in progress keeps the old configuration; the next run uses the new one. Permissions match the Dashboard edit: whoever can change the prompt can change the frequency, and delegated tasks still need a new authorization. See `botmux schedule update --help` for every field.
+The task ID, execution position, Bash precondition, work calendar, creator identity, enabled state and run history are kept; silent mode can be switched with `--silent` / `--no-silent`. A run already in progress keeps the old configuration; the next run uses the new one. Permissions match the Dashboard edit: whoever can change the prompt can change the frequency, and delegated tasks still need a new authorization. See `botmux schedule update --help` for every field.
 
 ## Run logs and multiple groups (Dashboard) {#logs-and-multi-chat}
 

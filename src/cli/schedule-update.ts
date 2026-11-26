@@ -2,9 +2,9 @@ import { readFileSync } from 'node:fs';
 import { normalizeCalendarBinding, normalizeCalendarDayType } from '../services/work-calendar.js';
 
 export const SCHEDULE_UPDATE_USAGE = [
-  'botmux schedule update <id> [--schedule 频率] [--prompt TEXT | --prompt-file FILE] [--calendar NAME | --calendar none] [--calendar-day-type workday|restday] [--lark-app-id APP]',
+  'botmux schedule update <id> [--schedule 频率] [--prompt TEXT | --prompt-file FILE] [--calendar NAME | --calendar none] [--calendar-day-type workday|restday] [--silent | --no-silent] [--lark-app-id APP]',
   '',
-  '原地修改定时任务：任务 ID、静默、执行位置、前置条件、日历规则、创建人身份和执行记录都保留；不补跑，也不立即触发。',
+  '原地修改定时任务：任务 ID、执行位置、前置条件、日历规则、创建人身份和执行记录都保留；不补跑，也不立即触发。',
   '可改的字段（至少一项，可组合）:',
   '  --schedule <频率>           执行频率，写法同 schedule add："每日17:50" / "every 4h" / "0 */4 * * *" / "30m"',
   '                              改后按新频率从现在起重新计算下次执行时间',
@@ -12,11 +12,14 @@ export const SCHEDULE_UPDATE_USAGE = [
   '  --prompt-file <文件>        从 UTF-8 文件读取新的完整提示词（与 --prompt 二选一）',
   '  --calendar <名称|none>      改绑工作日历；none 解绑',
   '  --calendar-day-type <类型>  workday 仅工作日 / restday 仅休息日',
+  '  --silent / --no-silent      开启/关闭静默执行：不发「执行中」提示，模型判断是否 botmux send 报警',
   '其他:',
   '  --lark-app-id <APP>         指定任务所属的 Bot（默认取当前会话的 Bot）',
   '示例:',
   '  botmux schedule update a1b2c3d4 --schedule "every 4h"',
   '  botmux schedule update a1b2c3d4 --schedule "0 9 * * 1-5" --prompt-file prompt.md',
+  '  botmux schedule update a1b2c3d4 --silent',
+  '  botmux schedule update a1b2c3d4 --no-silent',
 ].join('\n');
 
 export const SCHEDULE_EXPRESSION_EXAMPLES = '"每日17:50" / "每周一10:00" / "every 2h" / "30m" / "0 */4 * * *"';
@@ -34,9 +37,12 @@ export interface ScheduleUpdateInput {
   schedule?: string;
   calendar?: string | null;
   calendarDayType?: 'workday' | 'restday';
+  silent?: boolean;
 }
 
 const UPDATE_FLAGS = ['--schedule', '--prompt', '--prompt-file', '--lark-app-id', '--calendar', '--calendar-day-type'];
+/** Boolean switches: no value, at most one of each, and never both at once. */
+const UPDATE_SWITCHES = ['--silent', '--no-silent'] as const;
 
 /**
  * Parse before any mutation; preserve prompt bytes, including trailing newlines.
@@ -50,6 +56,7 @@ export function readScheduleUpdate(
 ): ScheduleUpdateInput {
   let id: string | undefined;
   const values = new Map<string, string>();
+  const switches = new Set<string>();
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg === '--help' || arg === '-h') throw new ScheduleUpdateHelpRequested();
@@ -60,6 +67,13 @@ export function readScheduleUpdate(
     }
     const equals = arg.indexOf('=');
     const flag = equals < 0 ? arg : arg.slice(0, equals);
+    if ((UPDATE_SWITCHES as readonly string[]).includes(flag)) {
+      // `--silent=true` would silently mean nothing here; refuse rather than guess.
+      if (equals >= 0) throw new ScheduleUpdateUsageError(`${flag} 不接受取值`);
+      if (switches.has(flag)) throw new ScheduleUpdateUsageError(`参数重复（duplicate）: ${flag}`);
+      switches.add(flag);
+      continue;
+    }
     if (!UPDATE_FLAGS.includes(flag)) throw new ScheduleUpdateUsageError(`不认识的参数: ${flag}`);
     if (values.has(flag)) throw new ScheduleUpdateUsageError(`参数重复（duplicate）: ${flag}`);
     const value = equals < 0 ? args[++i] : arg.slice(equals + 1);
@@ -70,7 +84,11 @@ export function readScheduleUpdate(
   if (values.has('--prompt') && values.has('--prompt-file')) {
     throw new ScheduleUpdateUsageError('--prompt 和 --prompt-file 只能二选一');
   }
-  if (!['--schedule', '--prompt', '--prompt-file', '--calendar', '--calendar-day-type'].some(flag => values.has(flag))) {
+  if (switches.has('--silent') && switches.has('--no-silent')) {
+    throw new ScheduleUpdateUsageError('--silent 和 --no-silent 只能二选一');
+  }
+  if (!['--schedule', '--prompt', '--prompt-file', '--calendar', '--calendar-day-type'].some(flag => values.has(flag))
+    && switches.size === 0) {
     throw new ScheduleUpdateUsageError('没有要修改的字段');
   }
   const schedule = values.get('--schedule')?.trim();
@@ -100,6 +118,7 @@ export function readScheduleUpdate(
     ...(prompt !== undefined ? { prompt } : {}),
     ...(calendarBinding !== undefined ? { calendar: calendarBinding } : {}),
     ...(calendarDayType ? { calendarDayType } : {}),
+    ...(switches.size > 0 ? { silent: switches.has('--silent') } : {}),
   };
 }
 
