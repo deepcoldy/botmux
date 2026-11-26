@@ -6,8 +6,12 @@ import {
   traexQuestionAnswerFromAsk, nextTraexQuestionStep, traexQuestionStepAllowed, traexQuestionSignature, traexQuestionState,
   traexQuestionFlowVisible,
 } from '../src/utils/traex-question-page.js';
-import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { loadWorkerFunction, loadWorkerMessageHandler } from './helpers/worker-function-harness.js';
 import type { AskQuestion, AskResult } from '../src/core/ask-types.js';
+import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
+import { InflightInputTracker } from '../src/core/inflight-input-tracker.js';
+import { InputTurnDeduper } from '../src/core/input-turn-dedupe.js';
+import { isOrdinaryImTurnId } from '../src/core/ordinary-im-turn.js';
 
 const fixture = (name: string) => readFileSync(new URL(`./fixtures/traex-question/${name}`, import.meta.url), 'utf8');
 const CHOICE = fixture('traex-0.216.0-async-choice.txt');
@@ -72,7 +76,8 @@ afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks();
 
 /** Native 0.216 widgets: Other is inline text, arrows select, Enter sends only
  * the current question and clears pending questions, C-u only clears text. */
-function harness() {
+function harness(runAnswer?: (page: any, result: AskResult, write: () => Promise<boolean | undefined>) => Promise<void>,
+  nativeWrite?: (write: () => boolean, page: any, final: boolean) => Promise<boolean>) {
   const questions = [{ title: 'Pick probe label', options: ['Alpha', 'Beta'], selected: 1, text: '' },
     { title: 'Type probe text', options: [] as string[], selected: 1, text: '' }];
   const state = { lifetime: 1, enabled: true, shown: false, index: 0, refuseEnter: false, captures: 0,
@@ -104,7 +109,9 @@ function harness() {
       return true;
     },
     ask: (question, signal, page) => new Promise(resolve => { asks.push({ question, pageDelivery: page?.delivery, signal, answer: resolve }); }),
-    writeKey: async key => {
+    runAnswer,
+    writeKey: async (key, page) => {
+      const write = () => {
       inputs.push(key);
       const q = questions[state.index];
       if (!q) return false;
@@ -117,6 +124,8 @@ function harness() {
         questions.length = 0;
       }
       return true;
+      };
+      return nativeWrite ? nativeWrite(write, page, key === 'Enter') : write();
     },
     paste: async text => { inputs.push(`paste:${text}`); questions[state.index]!.text += text; return true; },
     notify: key => notices.push(key), log: () => {},
@@ -337,4 +346,152 @@ describe('worker serialization guards for native question controls', () => {
     expect(await running).toBe(false);
     expect(write).not.toHaveBeenCalled();
   });
+});
+
+function answerLifecycleHarness() {
+  const queue = new CodexBridgeQueue();
+  const inflight = new InflightInputTracker();
+  const posted: string[] = [];
+  const terminals: Array<{ status: string; reason: string }> = [];
+  const scope: Record<string, any> = {
+    backend: {}, cliLifetimeNonce: 1, cliRestartInProgress: false,
+    nativeSessionForkPending: () => false, traexQuestionBridgeActive: () => true,
+    parseTraexQuestionPage, traexQuestionSignature, traexQuestionState,
+    runAfterAmbiguousSubmissionWrites: (_: any, fn: any) => fn(),
+    readinessTrackedInput: (x: any) => x, adapterInputHandle: (x: any) => x,
+    invalidatePromptReadinessEvidence: () => {}, log: () => {},
+    traexNativeAnswerInputs: new WeakMap(), traexNativeAnswerSubmission: undefined,
+    workerSessionEventScope: undefined, currentBotmuxTurnId: undefined,
+    currentBotmuxDispatchAttempt: undefined, turnTerminalEmitted: () => true,
+    queuedTypeAheadTurns: [], reserveActiveTurn: () => true,
+    renderer: { markNewTurn() {} }, usageLimitTracker: { beginTurn() {} }, currentUsageLimitSnapshot: () => ({}),
+    setCaptureIdentity: (id: string) => { scope.currentBotmuxTurnId = id; },
+    markActiveTurnStarted: () => {}, inflightInputs: inflight, noteCliInputWritten: () => {},
+    writeCliPidMarker: () => {}, publishSandboxRelayCapability: () => {},
+    codexBridgeQueue: queue,
+    codexBridgeMarkPendingTurn: (text: string, id: string, attempt: number | undefined, at: number) => {
+      queue.mark(id, text, at, attempt); return id;
+    },
+    markTurnExecutionStart: () => {}, traexAutoModelTurnReplayForbidden: false,
+    releaseActiveTurnAuthority: () => {},
+    emitTurnTerminal: (_id: string, status: string, reason: string) => terminals.push({ status, reason }),
+    codexBridgeDrainAndMaybeEmit: () => {
+      for (const turn of queue.drainEmittable()) posted.push(turn.finalText!);
+    },
+  };
+  scope.prepareTraexNativeAnswer = loadWorkerFunction('prepareTraexNativeAnswer', scope);
+  const run = loadWorkerFunction('runTraexNativeAnswer', scope);
+  const write = loadWorkerFunction('traexQuestionWrite', scope);
+  let fastFinal = false;
+  let unconfirmedSubmit = false;
+  let failedWrite = false;
+  let h: ReturnType<typeof harness>;
+  const nativeEvents = () => [{ kind: 'user' as const, uuid: 'native-user', timestampMs: Date.now(), text: 'plain text',
+    sourceSessionId: 'native-session', sourceTurnId: 'native-turn' },
+  { kind: 'assistant_final' as const, uuid: 'native-final', timestampMs: Date.now() + 1, text: 'answer delivered',
+    sourceSessionId: 'native-session', sourceTurnId: 'native-turn', terminalStatus: 'completed' as const }];
+  h = harness(run, async (literal, page, final) => write(() => {
+    if (final && failedWrite) throw new Error('Enter write failed');
+    if (final && unconfirmedSubmit) { h.inputs.push('Enter'); return true; }
+    const accepted = literal();
+    if (final && accepted && fastFinal) { queue.ingest(nativeEvents()); scope.codexBridgeDrainAndMaybeEmit(); }
+    return accepted;
+  }, page, final));
+  h.questions.shift();
+  scope.traexQuestionCapture = async () => h.screen();
+  const answer = result([], 'plain text');
+  scope.traexNativeAnswerInputs.set(answer, { type: 'message', content: 'plain text', turnId: 'native-answer', atMostOnce: true });
+  const open = async () => { h.bridge.kick(); await vi.advanceTimersByTimeAsync(1200); };
+  const respond = async () => { h.asks[0]!.answer(answer); await vi.advanceTimersByTimeAsync(1500); };
+  return { h, scope, queue, inflight, posted, terminals, open, respond, nativeEvents,
+    setFastFinal: () => { fastFinal = true; }, setUnconfirmedSubmit: () => { unconfirmedSubmit = true; },
+    setFailedWrite: () => { failedWrite = true; } };
+}
+
+describe('native asynchronous answer execution and reply ownership', () => {
+  it('registers before Enter and forwards an immediate native final once', async () => {
+    const f = answerLifecycleHarness(); f.setFastFinal(); await f.open(); await f.respond();
+    expect(f.h.inputs.filter(x => x === 'Enter')).toHaveLength(1);
+    expect(f.posted).toEqual(['answer delivered']);
+    expect(f.terminals).toEqual([]);
+    f.queue.ingest(f.nativeEvents()); f.scope.codexBridgeDrainAndMaybeEmit();
+    expect(f.posted).toHaveLength(1);
+    expect(f.scope.currentBotmuxTurnId).toBe('native-answer');
+    f.h.bridge.dispose();
+  });
+
+  it('never submits or leaves a pending reply when the original question changed', async () => {
+    const f = answerLifecycleHarness(); await f.open();
+    f.h.questions[0]!.title = 'replacement question'; await f.respond();
+    expect(f.h.inputs.filter(x => x === 'Enter')).toHaveLength(0);
+    expect(f.queue.peek()).toHaveLength(0);
+    expect(f.terminals).toEqual([{ status: 'failed', reason: 'native_question_not_submitted' }]);
+    expect(f.posted).toEqual([]);
+    f.h.bridge.dispose();
+  });
+
+  it('retires a refused native Enter without replaying it after a CLI exit', async () => {
+    const f = answerLifecycleHarness(); await f.open(); f.h.state.refuseEnter = true; await f.respond();
+    expect(f.queue.peek()).toHaveLength(0);
+    expect(f.terminals).toEqual([{ status: 'failed', reason: 'native_question_not_submitted' }]);
+    f.inflight.onCliExit();
+    expect(f.inflight.takeCarryOver()).toEqual([]);
+    expect(f.posted).toEqual([]);
+    f.h.bridge.dispose();
+  });
+
+  it('keeps a successful Enter without page confirmation for native evidence', async () => {
+    const f = answerLifecycleHarness(); f.setUnconfirmedSubmit(); await f.open(); await f.respond(); await vi.advanceTimersByTimeAsync(12_000);
+    expect(f.h.inputs.filter(x => x === 'Enter')).toHaveLength(1);
+    expect(f.terminals).toEqual([]);
+    expect(f.queue.peek()).toHaveLength(1);
+    f.queue.ingest(f.nativeEvents()); f.scope.codexBridgeDrainAndMaybeEmit();
+    expect(f.posted).toEqual(['answer delivered']);
+    f.h.bridge.dispose();
+  });
+
+  it('retires the admitted answer when the final write throws before Enter', async () => {
+    const f = answerLifecycleHarness(); f.setFailedWrite(); await f.open(); await f.respond();
+    expect(f.h.inputs.filter(x => x === 'Enter')).toHaveLength(0);
+    expect(f.queue.peek()).toHaveLength(0);
+    expect(f.terminals).toEqual([{ status: 'failed', reason: 'native_question_not_submitted' }]);
+    expect(f.posted).toEqual([]);
+    f.h.bridge.dispose();
+  });
+
+  it('does not steal a still-running predecessor capture identity', async () => {
+    const f = answerLifecycleHarness(); await f.open();
+    f.scope.currentBotmuxTurnId = 'predecessor'; f.scope.turnTerminalEmitted = () => false;
+    f.scope.reserveActiveTurn = () => false; f.setFastFinal(); await f.respond();
+    expect(f.h.inputs.filter(x => x === 'Enter')).toHaveLength(1);
+    expect(f.scope.currentBotmuxTurnId).toBe('predecessor');
+    expect(f.scope.queuedTypeAheadTurns).toMatchObject([{ turnId: 'native-answer' }]);
+    expect(f.posted).toEqual(['answer delivered']);
+    f.h.bridge.dispose();
+  });
+});
+
+it('re-ACKs a repeated native registration without cancelling the admitted answer', async () => {
+  const events: Array<{ type: string }> = [];
+  const accepted: unknown[] = [];
+  const scope: Record<string, any> = {
+    lastInitConfig: { adoptMode: false }, restoredDeploymentTurnId: undefined,
+    backend: {}, crashDiagnosticStopped: false, applyWorkerLaunchModel: () => {},
+    applyRespawnConfigPatch: () => {}, respawnConfigPatchFromMessage: () => ({}),
+    isOrdinaryImTurnId, finalHandoffAdmissionEnabled: false, activeTurnBlocks: () => false,
+    ordinaryImTurnDedupe: new InputTurnDeduper(256),
+    universalOutputHandoff: undefined, send: (event: { type: string }) => events.push(event),
+    traexNativeAnswerAdmissions: new Map([['request', (input: unknown) => accepted.push(input)]]),
+    log: () => {}, emitTurnTerminal: () => events.push({ type: 'terminal' }),
+  };
+  scope.acknowledgeTurnInputReceived = loadWorkerFunction('acknowledgeTurnInputReceived', scope);
+  scope.acknowledgeTurnInputCommitted = loadWorkerFunction('acknowledgeTurnInputCommitted', scope);
+  scope.receiveOrdinaryImTurn = loadWorkerFunction('receiveOrdinaryImTurn', scope);
+  const handle = loadWorkerMessageHandler('message', scope);
+  const input = { type: 'message', turnId: 'native-question-answer-request', content: 'plain text',
+    nativeQuestionAnswer: { requestId: 'request' }, atMostOnce: true };
+  await handle(input); await handle(input);
+  expect(accepted).toEqual([input]);
+  expect(events.filter(event => event.type === 'turn_input_committed')).toHaveLength(2);
+  expect(events.filter(event => event.type === 'terminal')).toEqual([]);
 });
