@@ -5,10 +5,11 @@ import { join } from 'node:path';
 import { stopPluginServices } from '../src/core/plugins/service-manager.js';
 import { pluginSupervisorDir, pluginSupervisorDesiredPath, pluginSupervisorResultPath, pluginSupervisorStatePath } from '../src/core/plugins/supervisor-store.js';
 
-const runtime = vi.hoisted(() => ({ identity: vi.fn(), signal: vi.fn() }));
+const runtime = vi.hoisted(() => ({ identity: vi.fn(), zombie: vi.fn(), signal: vi.fn() }));
 vi.mock('../src/utils/process-identity.js', async importOriginal => ({
   ...await importOriginal<typeof import('../src/utils/process-identity.js')>(),
   readDurableProcessIdentity: runtime.identity,
+  isLinuxZombie: runtime.zombie,
 }));
 vi.mock('../src/core/fleet-process-identity.js', async importOriginal => ({
   ...await importOriginal<typeof import('../src/core/fleet-process-identity.js')>(),
@@ -25,6 +26,7 @@ describe('explicit plugin host shutdown failures', () => {
     vi.stubEnv('HOME', home);
     mkdirSync(pluginSupervisorDir(), { recursive: true });
     runtime.identity.mockReset().mockReturnValue('known-birth');
+    runtime.zombie.mockReset().mockReturnValue(false);
     runtime.signal.mockReset().mockReturnValue(true); // never signal the test process
   });
   afterEach(() => {
@@ -97,6 +99,51 @@ describe('explicit plugin host shutdown failures', () => {
     await vi.waitFor(() => expect(runtime.signal).toHaveBeenCalled());
     await vi.advanceTimersByTimeAsync(20_000);
     await assertion;
+  });
+  it('does not let a historical result error veto a later shutdown retry', async () => {
+    result({ processStart: 'known-birth', error: 'old stop failure' });
+    state({ supervisorPid: process.pid, supervisorProcessStart: 'known-birth', procs: [] });
+    runtime.signal.mockImplementation(() => {
+      state({ supervisorPid: 0, procs: [] });
+      runtime.zombie.mockReturnValue(true);
+      return true;
+    });
+    await expect(stopAll()).resolves.toEqual([]);
+    expect(runtime.signal).toHaveBeenCalledTimes(1);
+  });
+  it('accepts a zombie host only after its completed state is durable', async () => {
+    result({ processStart: 'known-birth' });
+    state({ supervisorPid: process.pid, supervisorProcessStart: 'known-birth', procs: [] });
+    runtime.signal.mockImplementation(() => {
+      state({ supervisorPid: 0, procs: [] });
+      runtime.zombie.mockReturnValue(true);
+      return true;
+    });
+    vi.useFakeTimers();
+    const completion = expect(stopAll()).resolves.toEqual([]);
+    await vi.waitFor(() => expect(runtime.signal).toHaveBeenCalled());
+    await vi.advanceTimersByTimeAsync(20_000);
+    await completion;
+  });
+  it('rejects a zombie host while its durable state is still incomplete', async () => {
+    result({ processStart: 'known-birth' });
+    state({ supervisorPid: process.pid, supervisorProcessStart: 'known-birth',
+      procs: [{ name: 'botmux-plugin-lost', appId: '', pid: 0, status: 'launching' }] });
+    runtime.zombie.mockReturnValue(true);
+    await expect(stopAll()).rejects.toThrow('plugin_supervisor_shutdown_incomplete');
+    expect(runtime.signal).not.toHaveBeenCalled();
+  });
+  it('ignores a retained result whose live PID belongs to a new process after completion', async () => {
+    result({ processStart: 'old-birth' });
+    state({ supervisorPid: 0, procs: [] });
+    await expect(stopAll()).resolves.toEqual([]);
+    expect(runtime.signal).not.toHaveBeenCalled();
+  });
+  it('does not let a completed state conceal the same still-live host generation', async () => {
+    result({ processStart: 'known-birth' });
+    state({ supervisorPid: 0, procs: [] });
+    await expect(stopAll()).rejects.toThrow('plugin_supervisor_identity_mismatch');
+    expect(runtime.signal).not.toHaveBeenCalled();
   });
   it('rejects a dead host with unfinished member state', async () => {
     result({ pid: 2_147_483_647, processStart: 'old-birth' });

@@ -52,7 +52,7 @@ describe('plugin services on the built-in supervisor', () => {
     rmSync(home, { recursive: true, force: true });
   });
 
-  function fixture(id: string, options: { auto?: boolean; linked?: boolean; autorestart?: boolean; body?: string } = {}) {
+  function fixture(id: string, options: { auto?: boolean; linked?: boolean; autorestart?: boolean; killTimeoutMs?: number; body?: string } = {}) {
     const root = join(home, id);
     mkdirSync(join(root, 'dist', 'service'), { recursive: true });
     mkdirSync(join(root, 'dist', 'botmux-build'));
@@ -65,7 +65,7 @@ describe('plugin services on the built-in supervisor', () => {
       pm2: { script: './service/server.cjs', args: ['hello world'],
         env: { MARKER: ${JSON.stringify(join(home, id + '.ready'))},
           OWN_VALUE: 'kept', CODEX_HOME: '/must-not-leak', BOTMUX_SESSION_ID: 'forged' },
-        autorestart: ${options.autorestart !== false}, killTimeoutMs: 150, watchDelayMs: 150 }
+        autorestart: ${options.autorestart !== false}, killTimeoutMs: ${options.killTimeoutMs ?? 150}, watchDelayMs: 150 }
     };`);
     writeFileSync(join(root, 'dist', 'service', 'server.cjs'), options.body ?? `
       const fs = require('node:fs');
@@ -84,6 +84,19 @@ describe('plugin services on the built-in supervisor', () => {
       setInterval(() => {}, 1000);
     `);
     return { ...installLocalPlugin(root, { link: options.linked }), root };
+  }
+  function signalFixtureBody(exitDelayMs?: number): string {
+    return `
+      const fs = require('node:fs');
+      process.on('SIGTERM', () => {
+        fs.writeFileSync(process.env.MARKER + '.term', String(process.pid));
+        ${exitDelayMs === undefined ? '' : `setTimeout(() => process.exit(0), ${exitDelayMs});`}
+      });
+      const tmp = process.env.MARKER + '.tmp';
+      fs.writeFileSync(tmp, JSON.stringify({ pid: process.pid }));
+      fs.renameSync(tmp, process.env.MARKER);
+      setInterval(() => {}, 1000);
+    `;
   }
   const proc = (id: string) => readPluginProcesses().find(p => p.name === `botmux-plugin-${id}`);
   // A predicate that THROWS aborts the poll loop and reports the parse error as
@@ -168,6 +181,57 @@ describe('plugin services on the built-in supervisor', () => {
     expect(existsSync(join(pluginSupervisorDir(), 'owner.lock'))).toBe(false);
     expect(readPluginProcesses().every(p => !p.pid && p.status === 'stopped')).toBe(true);
   }, 60_000);
+
+  it('keeps shutdown signals idempotent during asynchronous member cleanup', async () => {
+    fixture('repeated-signal', { killTimeoutMs: 1_500, body: signalFixtureBody() });
+    await startPluginServices(['repeated-signal']);
+    await ready('repeated-signal');
+    const owner = readFleetState(pluginSupervisorStatePath())!.supervisorPid;
+    process.kill(owner, 'SIGTERM');
+    await until(() => existsSync(join(home, 'repeated-signal.ready.term')), 'member stop started');
+    process.kill(owner, 'SIGTERM');
+    await until(() => !pidAlive(owner), 'host exits after repeated signal', 8_000);
+    const stopped = readFleetState(pluginSupervisorStatePath());
+    expect(stopped?.supervisorPid).toBe(0);
+    expect(stopped?.procs).toMatchObject([{ pid: 0, status: 'stopped' }]);
+    expect(existsSync(join(pluginSupervisorDir(), 'owner.lock'))).toBe(false);
+  }, 30_000);
+
+  it('reconciles an exited member when the stop deadline expires during a host pause', async () => {
+    fixture('paused-stop', { killTimeoutMs: 1_000, body: signalFixtureBody(200) });
+    await startPluginServices(['paused-stop']);
+    await ready('paused-stop');
+    const owner = readFleetState(pluginSupervisorStatePath())!.supervisorPid;
+    process.kill(owner, 'SIGTERM');
+    await until(() => existsSync(join(home, 'paused-stop.ready.term')), 'member stop before pause');
+    process.kill(owner, 'SIGSTOP');
+    await delay(6_200);
+    process.kill(owner, 'SIGCONT');
+    await until(() => !pidAlive(owner), 'paused host exits', 8_000);
+    const stopped = readFleetState(pluginSupervisorStatePath());
+    expect(stopped?.supervisorPid).toBe(0);
+    expect(stopped?.procs).toMatchObject([{ pid: 0, status: 'stopped' }]);
+    expect(existsSync(join(pluginSupervisorDir(), 'owner.lock'))).toBe(false);
+  }, 30_000);
+
+  it('starts the post-SIGKILL deadline after escalation across a host pause', async () => {
+    fixture('paused-kill', { killTimeoutMs: 1_000, body: signalFixtureBody() });
+    await startPluginServices(['paused-kill']);
+    await ready('paused-kill');
+    const owner = readFleetState(pluginSupervisorStatePath())!.supervisorPid;
+    const member = proc('paused-kill')!.pid!;
+    process.kill(owner, 'SIGTERM');
+    await until(() => existsSync(join(home, 'paused-kill.ready.term')), 'member stop before kill pause');
+    process.kill(member, 'SIGSTOP');
+    process.kill(owner, 'SIGSTOP');
+    await delay(6_200);
+    process.kill(owner, 'SIGCONT');
+    await until(() => !pidAlive(owner), 'host exits after delayed escalation', 12_000);
+    const stopped = readFleetState(pluginSupervisorStatePath());
+    expect(stopped?.supervisorPid).toBe(0);
+    expect(stopped?.procs).toMatchObject([{ pid: 0, status: 'stopped' }]);
+    expect(existsSync(join(pluginSupervisorDir(), 'owner.lock'))).toBe(false);
+  }, 30_000);
 
   it('installs and queries without creating a supervisor; update/uninstall guard checks actual liveness', async () => {
     const { root, runtimeDir } = fixture('demo');

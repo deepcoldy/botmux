@@ -108,6 +108,10 @@ function supervisorAlive(): boolean {
     && readDurableProcessIdentity(result.pid) === result.processStart;
 }
 
+function supervisorProcessExited(pid: number): boolean {
+  return !pidNotProvablyGone(pid) || isLinuxZombie(pid);
+}
+
 function assertSupervisorIdentity(result: PluginSupervisorResult) {
   if (!result.processStart) throw new Error(`plugin_supervisor_identity_unknown:${result.pid}`);
   const identity = readDurableProcessIdentity(result.pid);
@@ -141,12 +145,29 @@ export async function shutdownPluginSupervisor(): Promise<void> {
       throw new Error('plugin_supervisor_shutdown_incomplete');
     }
   };
+  const durableStateComplete = () => {
+    try {
+      assertComplete();
+      return true;
+    } catch (error) {
+      if (error instanceof Error && error.message === 'plugin_supervisor_shutdown_incomplete') return false;
+      throw error;
+    }
+  };
   if (!initial) {
     if (existsSync(ownerLock)) throw new Error('plugin_supervisor_identity_unknown');
     assertComplete();
     return;
   }
-  if (!pidNotProvablyGone(initial.pid)) {
+  const initialExited = supervisorProcessExited(initial.pid);
+  if (durableStateComplete()) {
+    if (initialExited) return;
+    const currentIdentity = readDurableProcessIdentity(initial.pid);
+    // A completed state makes a retained result stale. A live PID is safe to
+    // ignore only when its birth proves that it belongs to a different process.
+    if (initial.processStart && currentIdentity && currentIdentity !== initial.processStart) return;
+  }
+  if (initialExited) {
     assertComplete();
     return;
   }
@@ -159,15 +180,16 @@ export async function shutdownPluginSupervisor(): Promise<void> {
   if (!result || result.pid !== initial.pid || result.processStart !== initial.processStart) {
     throw new Error('plugin_supervisor_identity_mismatch');
   }
-  if (result.error) throw new Error(result.error);
+  // changePluginService throws an error ACK for every revision issued above.
+  // Any remaining error is historical and must not permanently veto recovery.
   if (Object.values(desired.services).some(item => item.running)) throw new Error('plugin_supervisor_members_running');
-  if (!pidNotProvablyGone(result.pid)) {
+  if (supervisorProcessExited(result.pid)) {
     assertComplete();
     return;
   }
   const processStart = assertSupervisorOwner(result);
   if (!signalAttestedFleetProcess({ pid: result.pid, processStart }, 'SIGTERM')) {
-    if (pidNotProvablyGone(result.pid)) {
+    if (!supervisorProcessExited(result.pid)) {
       assertSupervisorIdentity(result);
       throw new Error(`plugin_supervisor_signal_failed:${result.pid}`);
     }
@@ -177,7 +199,7 @@ export async function shutdownPluginSupervisor(): Promise<void> {
   const longestStop = Math.max(8_000, ...Object.values(desired.services).map(item => item.spec.external.killTimeoutMs ?? 8_000));
   const deadline = Date.now() + longestStop + 6_000;
   while (Date.now() < deadline) {
-    if (!pidNotProvablyGone(result.pid)) {
+    if (supervisorProcessExited(result.pid)) {
       assertComplete();
       return;
     }
