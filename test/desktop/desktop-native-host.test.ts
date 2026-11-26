@@ -506,3 +506,56 @@ describe('in-app self-update only targets the seeded app runtime', () => {
     expect(runtimeSelfUpdateAllowed({ standalone: true, runtimePath: `${seeded}-old`, home })).toBe(false);
   });
 });
+
+describe('native host launchPolicy supports 0-bot onboarding on app launch only', () => {
+  it('starts bundled 0-bot onboarding when appLaunch=true and skips on background host relaunch', async () => {
+    const zeroBotState = {
+      status: 'not_configured' as const,
+      appVersion: '3.0.0',
+      runtimeVersion: '3.0.0',
+      runtimeSource: 'bundled' as const,
+      runtimeManaged: true,
+      runtimePath: '/Users/u/.botmux/app-runtime/botmux',
+      botCount: 0,
+      onlineDaemonCount: 0,
+      attentionCount: 0,
+      dashboardUrl: null,
+    };
+    const startLaunch = vi.fn(async () => ({ code: 0, stdout: '', stderr: '' }));
+    expect(await launchPolicy({
+      runtime: { start: startLaunch, takeover: vi.fn(), restartBundled: vi.fn() },
+      state: zeroBotState,
+      alignment: async () => ({ kind: 'aligned' as const }),
+      runtimeReplaced: false,
+      appLaunch: true,
+      ownedByApp: () => false,
+      log: () => {},
+    })).toBe('started');
+    expect(startLaunch).toHaveBeenCalledOnce();
+
+    const startRelaunch = vi.fn(async () => ({ code: 0, stdout: '', stderr: '' }));
+    expect(await launchPolicy({
+      runtime: { start: startRelaunch, takeover: vi.fn(), restartBundled: vi.fn() },
+      state: zeroBotState,
+      alignment: async () => ({ kind: 'aligned' as const }),
+      runtimeReplaced: false,
+      appLaunch: false,
+      ownedByApp: () => false,
+      log: () => {},
+    })).toBe('none');
+    expect(startRelaunch).not.toHaveBeenCalled();
+
+    // Older packaged external 0-bot supervisor must NOT be auto-hijacked by launchPolicy.
+    const takeoverZeroBot = vi.fn(async () => ({ code: 0, stdout: '', stderr: '' }));
+    expect(await launchPolicy({
+      runtime: { start: vi.fn(), takeover: takeoverZeroBot, restartBundled: vi.fn() },
+      state: { ...zeroBotState, status: 'running', runtimeSource: 'global-cli' },
+      alignment: async () => ({ kind: 'owner-older' as const, ownerVersion: '3.40.0', appVersion: '3.60.0', auto: true }),
+      runtimeReplaced: false,
+      appLaunch: true,
+      ownedByApp: () => false,
+      log: () => {},
+    })).toBe('none');
+    expect(takeoverZeroBot).not.toHaveBeenCalled();
+  });
+});

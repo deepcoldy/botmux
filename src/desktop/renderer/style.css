@@ -785,3 +785,73 @@ input:disabled {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+
+.empty-card {
+  max-width: 460px;
+  width: 100%;
+  padding: 28px 28px 24px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--surface-raised);
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.empty-card-config_error {
+  border-color: rgba(248, 113, 113, 0.45);
+}
+
+.empty-card-title {
+  margin: 0;
+  font-size: 18px;
+  line-height: 1.3;
+  font-weight: 650;
+  color: var(--text);
+}
+
+.empty-card-body {
+  margin: 0;
+  font-size: 13.5px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+
+.empty-card-detail {
+  display: block;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-soft);
+  background: var(--surface-muted);
+  color: var(--danger);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  word-break: break-word;
+}
+
+.empty-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 6px;
+}
+
+.empty-card-primary {
+  height: 36px;
+  padding: 0 16px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #0b1117;
+  font-size: 13.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.empty-card-primary:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+

@@ -11,6 +11,7 @@ import {
   BotsJsonStaleSnapshotError,
   writeBotsJsonAtomic,
   readBotsJsonOrEmpty,
+  readConfiguredBotCount,
   mutateBotsJsonAtomic,
 } from '../src/setup/bots-store.js';
 import { persistRenamedBotName } from '../src/services/bot-name-sync.js';
@@ -168,5 +169,36 @@ describe('readBotsJsonOrEmpty', () => {
   it('returns parsed array when file is valid', () => {
     writeBotsJsonAtomic(botsPath, [{ larkAppId: 'a', larkAppSecret: 's' }, { larkAppId: 'b', larkAppSecret: 's' }], null);
     expect(readBotsJsonOrEmpty(botsPath).map((b: any) => b.larkAppId)).toEqual(['a', 'b']);
+  });
+
+  it('returns [] on non-array JSON while mutateBotsJsonAtomic fails closed without overwriting it', () => {
+    for (const raw of ['{}', '"corrupt-string"', '123']) {
+      writeFileSync(botsPath, raw);
+      expect(readBotsJsonOrEmpty(botsPath)).toEqual([]);
+      expect(() => mutateBotsJsonAtomic(botsPath, prev => ({ bots: prev, result: null })))
+        .toThrow('must contain a JSON array');
+      expect(readFileSync(botsPath, 'utf-8')).toBe(raw);
+    }
+  });
+});
+
+describe('readConfiguredBotCount', () => {
+  it('distinguishes missing/empty (0), configured (N), and corrupt/invalid (null)', () => {
+    expect(readConfiguredBotCount(botsPath)).toBe(0);
+
+    writeFileSync(botsPath, '[]');
+    expect(readConfiguredBotCount(botsPath)).toBe(0);
+
+    writeFileSync(botsPath, JSON.stringify([{ larkAppId: 'local_ok', apiOnly: true, localIdentity: true }]));
+    expect(readConfiguredBotCount(botsPath)).toBe(1);
+
+    writeFileSync(botsPath, '{ broken');
+    expect(readConfiguredBotCount(botsPath)).toBeNull();
+
+    writeFileSync(botsPath, '{}');
+    expect(readConfiguredBotCount(botsPath)).toBeNull();
+
+    writeFileSync(botsPath, JSON.stringify([{ larkAppId: 'cli_missing_secret' }]));
+    expect(readConfiguredBotCount(botsPath)).toBeNull();
   });
 });

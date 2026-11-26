@@ -29,7 +29,7 @@ import {
 } from './route-lifecycle.js';
 import { maybeReloadBrowserForStaleRouteChunk } from './stale-chunk-reload.js';
 import { buildBotCards, loadGroupsSnapshot } from './overview.js';
-import { BotOnboardingDialog, OPEN_BOT_ONBOARDING_EVENT, openBotOnboarding } from './bot-onboarding.js';
+import { BOT_ONBOARDING_COMPLETED_EVENT, BotOnboardingDialog, OPEN_BOT_ONBOARDING_EVENT, openBotOnboarding } from './bot-onboarding.js';
 import { requestOpenCreateSession } from './create-session-entry.js';
 import { InfoTip } from './dashboard-components.js';
 import { PLUGIN_PINS_CHANGED_EVENT } from './plugin-events.js';
@@ -1727,6 +1727,7 @@ async function loadAuthState(): Promise<void> {
       taskRoutingNavVisible = isAuthed && j.settings?.taskRouting?.enabled === true;
       publicReadOnly = !!(j.settings && j.settings.publicReadOnly);
       ui.publicReadOnly = publicReadOnly;
+      ui.setConfiguredBotCount(isAuthed && typeof j.configuredBotCount === 'number' ? j.configuredBotCount : null);
       authStateKnown = true;
       const serverLocale = readShellLocale() ?? normalizeDashboardLocale(j.lang);
       if (serverLocale) ui.setLocale(serverLocale);
@@ -1740,6 +1741,7 @@ async function loadAuthState(): Promise<void> {
       taskRoutingNavVisible = false;
       publicReadOnly = false;
       ui.publicReadOnly = false;
+      ui.setConfiguredBotCount(null);
       authStateKnown = true;
     } else if (r.status === 401) {
       isAuthed = false;
@@ -1747,6 +1749,7 @@ async function loadAuthState(): Promise<void> {
       ui.workbenchAuthed = false;
       ui.hostTerminal = false;
       taskRoutingNavVisible = false;
+      ui.setConfiguredBotCount(null);
       authStateKnown = true;
       const loginUrl = r.headers.get('x-botmux-login-url') ?? undefined;
       showAuthExpiredOverlay(loginUrl);
@@ -1973,6 +1976,12 @@ void (async () => {
   await loadAuthState();
   renderShell();
   window.addEventListener(PLUGIN_PINS_CHANGED_EVENT, () => { void loadPinnedPluginNavItems(); });
+  // Keep Overview's configuredBotCount & group snapshot fresh even when onboarding
+  // finishes while the user is on another route (e.g. #/bot-defaults or #/settings).
+  window.addEventListener(BOT_ONBOARDING_COMPLETED_EVENT, () => {
+    if (isAuthed) void ui.refreshConfiguredBotCount(origFetch);
+    void loadGroupsSnapshot({ force: true }).then(renderShell);
+  });
   // Bot 配置里开关管家后会发这个事件，侧边栏随之出现 / 消失。
   window.addEventListener(DECISION_BOARD_CHANGED_EVENT, () => { void loadDecisionBoardNav(); });
   // 全局设置里开关任务分配后会发这个事件，侧边栏随之出现 / 消失。
@@ -2028,7 +2037,9 @@ void (async () => {
     },
     onBotsChanged: listener => { store.onBotsChanged(listener); },
     reloadNameMaps: () => {
-      void reloadNameMaps().then(() => {
+      if (isAuthed) void ui.refreshConfiguredBotCount(origFetch);
+      void reloadNameMaps().then(async () => {
+        await loadGroupsSnapshot();
         store.relabelBots(botNameForAppId);
         renderShell();
       });

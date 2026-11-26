@@ -131,19 +131,25 @@ export async function findInvalidFleetCredentials(
 ): Promise<Array<{ appId: string; reason: string }>> {
   const invalid: Array<{ appId: string; reason: string }> = [];
   for (const bot of bots) {
-    if (bot.larkAppId && opts.blockedBotIds?.has(bot.larkAppId)) continue;
-    if (botSkipsFeishuCredentialCheck(bot)) continue;
-    if (!bot.larkAppId || !bot.larkAppSecret) {
-      invalid.push({ appId: bot.larkAppId || '(空 appId)', reason: 'larkAppId/larkAppSecret 缺失' });
+    if (!bot || typeof bot !== 'object' || Array.isArray(bot)) {
+      invalid.push({ appId: '(无效条目)', reason: 'bots.json 条目必须是对象' });
       continue;
     }
-    const verdict = await opts.validate(bot.larkAppId, bot.larkAppSecret, opts.brandOf(bot));
+    const appId = typeof bot.larkAppId === 'string' ? bot.larkAppId.trim() : '';
+    const appSecret = typeof bot.larkAppSecret === 'string' ? bot.larkAppSecret.trim() : '';
+    if (appId && opts.blockedBotIds?.has(appId)) continue;
+    if (botSkipsFeishuCredentialCheck(bot)) continue;
+    if (!appId || !appSecret) {
+      invalid.push({ appId: appId || '(空 appId)', reason: 'larkAppId/larkAppSecret 缺失' });
+      continue;
+    }
+    const verdict = await opts.validate(appId, appSecret, opts.brandOf(bot));
     if (verdict.ok) continue;
     if (verdict.error === 'invalid_credentials') {
-      invalid.push({ appId: bot.larkAppId, reason: verdict.message });
+      invalid.push({ appId, reason: verdict.message });
       continue;
     }
-    opts.warn?.(`⚠️  [${bot.larkAppId}] 启动前凭证验证未成功（${verdict.error}）: ${verdict.message}`);
+    opts.warn?.(`⚠️  [${appId}] 启动前凭证验证未成功（${verdict.error}）: ${verdict.message}`);
     opts.warn?.('   daemon 仍会启动；启动后 dispatcher 会自行重试。');
   }
   return invalid;

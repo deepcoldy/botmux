@@ -56,6 +56,9 @@ class DashboardUiState {
   // 的协管者 authed 但不能拿宿主 shell（平台机器 Dashboard `m-` 反代不带角色头，那里进来
   // 的机器主人和协管者就是 legacy 身份）。服务端 /api/settings 的 `hostTerminal` 写入，默认关。
   hostTerminal = false;
+  // Configured bot count mirrored from authenticated GET /api/settings:
+  // 0 = confirmed empty (show 0-bot onboarding banner); null = unknown or corrupt bots.json.
+  configuredBotCount: number | null = null;
   private listeners = new Set<UiListener>();
   private translate = createDashboardTranslator(this.locale);
   private mediaQuery: MediaQueryList | null = null;
@@ -110,6 +113,34 @@ class DashboardUiState {
     this.applyTheme();
     this.applySkin(skinChanged);
     this.emit();
+  }
+
+  private configuredBotCountSeq = 0;
+  private configuredBotCountInFlight: Promise<void> | null = null;
+
+  setConfiguredBotCount(count: number | null): void {
+    if (this.configuredBotCount === count) return;
+    this.configuredBotCount = count;
+    this.emit();
+  }
+
+  refreshConfiguredBotCount(fetcher: typeof fetch = fetch): Promise<void> {
+    if (!this.authed) return Promise.resolve();
+    if (this.configuredBotCountInFlight) return this.configuredBotCountInFlight;
+    const seq = ++this.configuredBotCountSeq;
+    const req = Promise.resolve()
+      .then(() => fetcher('/api/settings', { cache: 'no-store' }))
+      .then(r => (r.ok ? r.json() : null))
+      .then(body => {
+        if (!body || seq !== this.configuredBotCountSeq) return;
+        this.setConfiguredBotCount(body.authed && typeof body.configuredBotCount === 'number' ? body.configuredBotCount : null);
+      })
+      .catch(() => { /* keep previous count on transient fetch error */ })
+      .finally(() => {
+        if (this.configuredBotCountInFlight === req) this.configuredBotCountInFlight = null;
+      });
+    this.configuredBotCountInFlight = req;
+    return req;
   }
 
   on(fn: UiListener): () => void {

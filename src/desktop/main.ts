@@ -8,20 +8,49 @@ import { resolveDesktopPaths } from './main/paths.js';
 import { resolveBundledRuntimeCandidate } from './main/bundled-runtime.js';
 import { probeShellPathEnv } from './main/external-runtime.js';
 import { listFleetApps } from './main/fleet-apps.js';
+import { runRuntimeAction, type RuntimeStateMonitor } from './main/runtime-actions.js';
 import { createRuntimeService } from './main/runtime-service.js';
 import { createDesktopTray } from './main/tray.js';
 import { createMainWindow } from './main/window.js';
+import {
+  createZeroBotLifecycle,
+  isSupervisorOwnedByBundledRuntime,
+  readLiveSupervisorSnapshot,
+} from './main/zero-bot-lifecycle.js';
 import { normalizeBotmuxVersion, resolveEffectiveBotmuxVersion } from '../utils/version-info.js';
 
 const dashboardWebviewPartition = 'persist:botmux-dashboard';
 let quitting = false;
+let quitCleanupState: 'idle' | 'cleaning' | 'ready' = 'idle';
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
+let activeMonitor: RuntimeStateMonitor | null = null;
+let activeZeroBotLifecycle: ReturnType<typeof createZeroBotLifecycle> | null = null;
 
 configureDesktopCommandLine();
 
-app.on('before-quit', () => {
+app.on('before-quit', event => {
   quitting = true;
+  activeZeroBotLifecycle?.markClosing();
+  if (quitCleanupState === 'ready') return;
+  if (quitCleanupState === 'cleaning') {
+    event.preventDefault();
+    return;
+  }
+  if (!activeZeroBotLifecycle?.needsQuitCleanup()) {
+    activeMonitor?.stop();
+    quitCleanupState = 'ready';
+    return;
+  }
+  event.preventDefault();
+  quitCleanupState = 'cleaning';
+  activeMonitor?.stop();
+  void activeZeroBotLifecycle.cleanupOnQuit({ totalTimeoutMs: 5_000 })
+    .catch(error => console.warn('[desktop] 0-bot quit cleanup failed', error))
+    .finally(() => {
+      quitCleanupState = 'ready';
+      app.quit();
+    });
 });
 
 app.on('activate', () => {
@@ -70,7 +99,7 @@ async function bootstrap(): Promise<void> {
     appVersion,
     env: process.env,
   });
-  const runtime = createRuntimeService({
+  const rawRuntime = createRuntimeService({
     paths,
     appVersion,
     execPath: process.execPath,
@@ -82,13 +111,24 @@ async function bootstrap(): Promise<void> {
     shellPathEnv: () => probeShellPathEnv(),
     fleetApps: () => listFleetApps(paths),
   });
+  const zeroBotLifecycle = createZeroBotLifecycle({
+    runtime: rawRuntime,
+    readLiveSupervisor: () => readLiveSupervisorSnapshot(paths.botmuxHome),
+    isOwnedByApp: live => isSupervisorOwnedByBundledRuntime(live, bundledRuntime),
+    warn: message => console.warn(`[desktop] ${message}`),
+  });
+  activeZeroBotLifecycle = zeroBotLifecycle;
+  const runtime = zeroBotLifecycle.runtime;
 
   const win = createMainWindow(join(desktopDir, 'preload.cjs'), join(desktopDir, 'renderer'));
   mainWindow = win;
   let ownershipRepair: Promise<void> | null = null;
   const monitor = createRuntimeStateMonitor({
     runtime,
+    watchDir: paths.botmuxHome,
     sendState: state => {
+      if (quitting) return;
+      zeroBotLifecycle.observeState(state);
       if (!win.isDestroyed()) win.webContents.send('desktop:state-changed', state);
       // A user may invoke an older/global `botmux restart` after Desktop has
       // launched. Reclaim the fleet instead of allowing the external runtime
@@ -101,12 +141,15 @@ async function bootstrap(): Promise<void> {
       }
     },
   });
+  activeMonitor = monitor;
   registerDesktopIpc({ paths, runtime, monitor });
   void autoStartCliRuntimeOnLaunch({
     runtime,
     monitor,
     warn: message => console.warn(`[desktop] ${message}`),
-  }).finally(() => monitor.start());
+  }).finally(() => {
+    if (!quitting) monitor.start();
+  });
   win.on('close', event => {
     // Closing the window should not stop the supervised daemon; explicit Quit
     // exits the shell, explicit Stop controls the runtime.
@@ -120,13 +163,13 @@ async function bootstrap(): Promise<void> {
     iconPath: join(desktopDir, 'assets', 'trayTemplate.png'),
     window: win,
     onStart: () => {
-      void runtime.start();
+      void runRuntimeAction(() => runtime.start(), monitor);
     },
     onStop: () => {
-      void runtime.stop();
+      void runRuntimeAction(() => runtime.stop(), monitor);
     },
     onRestart: () => {
-      void runtime.restart();
+      void runRuntimeAction(() => runtime.restart(), monitor);
     },
     onOpenLogs: () => {
       void shell.openPath(paths.logsDir);

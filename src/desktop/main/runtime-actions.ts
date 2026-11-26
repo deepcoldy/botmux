@@ -1,4 +1,4 @@
-import { closeSync, existsSync, openSync, readSync, readdirSync, statSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readSync, readdirSync, statSync, watch, type FSWatcher } from 'node:fs';
 import type { DashboardLocateResult, DesktopPaths, DesktopRuntimeState, LogTail } from '../shared/types.js';
 import { listLogTargets, tailLogText } from './log-service.js';
 import { validateDashboardCompat } from './dashboard-compat.js';
@@ -16,20 +16,80 @@ export interface RuntimeStateMonitor {
   refresh(): Promise<void>;
 }
 
+const WATCHED_RUNTIME_FILES = new Set(['bots.json', 'fleet-state.json']);
+const WATCH_DEBOUNCE_MS = 150;
+
 export function createRuntimeStateMonitor(args: {
   runtime: Pick<RuntimeService, 'getState'>;
   sendState: (state: DesktopRuntimeState) => void;
   intervalMs?: number;
+  /** Optional `~/.botmux` directory to watch for `bots.json` / `fleet-state.json`
+   *  updates so 0->1 bot transitions reflect in <250ms without waiting for the 5s poll. */
+  watchDir?: string;
 }): RuntimeStateMonitor {
   const intervalMs = args.intervalMs ?? 5000;
   let timer: ReturnType<typeof setInterval> | null = null;
   let inFlight: Promise<void> | null = null;
+  let watcher: FSWatcher | null = null;
+  let watchDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  let running = false;
+  // Separate from `running` so pre-start `refresh()` (e.g. during launch
+  // auto-start) still works, while any refresh settling after `stop()` never
+  // invokes `sendState`.
+  let stopped = false;
+  let pendingWatchRefresh = false;
+
+  function scheduleWatchRefresh(): void {
+    if (!running || stopped || watchDebounceTimer || pendingWatchRefresh) return;
+    watchDebounceTimer = setTimeout(() => {
+      watchDebounceTimer = null;
+      if (!running || stopped) return;
+      if (inFlight) {
+        pendingWatchRefresh = true;
+        return;
+      }
+      void refresh();
+    }, WATCH_DEBOUNCE_MS);
+    watchDebounceTimer.unref?.();
+  }
+
+  function ensureWatcher(): void {
+    if (!running || stopped || watcher || !args.watchDir || !existsSync(args.watchDir)) return;
+    try {
+      watcher = watch(args.watchDir, (_eventType, filename) => {
+        if (!filename || WATCHED_RUNTIME_FILES.has(String(filename))) {
+          scheduleWatchRefresh();
+        }
+      });
+      watcher.on('error', () => {
+        closeWatcher();
+      });
+      watcher.unref?.();
+    } catch {
+      // Best-effort acceleration: 5s interval polling always stays active.
+      watcher = null;
+    }
+  }
+
+  function closeWatcher(): void {
+    if (watchDebounceTimer) {
+      clearTimeout(watchDebounceTimer);
+      watchDebounceTimer = null;
+    }
+    if (watcher) {
+      try { watcher.close(); } catch { /* ignore */ }
+      watcher = null;
+    }
+  }
 
   async function refresh(): Promise<void> {
+    if (stopped) return;
     if (inFlight) return inFlight;
     inFlight = (async () => {
       try {
+        ensureWatcher();
         const state = await args.runtime.getState();
+        if (stopped) return;
         // Push complete state snapshots; the renderer validates the IPC payload
         // before trusting it to drive controls or dashboard navigation.
         args.sendState(state);
@@ -37,6 +97,10 @@ export function createRuntimeStateMonitor(args: {
         console.warn('[desktop] runtime state refresh failed', error);
       } finally {
         inFlight = null;
+        if (pendingWatchRefresh && running && !stopped) {
+          pendingWatchRefresh = false;
+          void refresh();
+        }
       }
     })();
     return inFlight;
@@ -45,12 +109,19 @@ export function createRuntimeStateMonitor(args: {
   return {
     start() {
       if (timer) return;
+      stopped = false;
+      running = true;
+      ensureWatcher();
       void refresh();
       timer = setInterval(() => {
         void refresh();
       }, intervalMs);
     },
     stop() {
+      stopped = true;
+      running = false;
+      pendingWatchRefresh = false;
+      closeWatcher();
       if (!timer) return;
       clearInterval(timer);
       timer = null;

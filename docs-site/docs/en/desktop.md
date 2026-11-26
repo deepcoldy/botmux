@@ -39,12 +39,13 @@ But **only one side can manage the bots at a time**. When the app opens it takes
 
 **You've used the CLI before**: just open the app. It picks up the bots already in `~/.botmux`, takes them over, and starts them.
 
-**You've never configured a bot**: the bottom-left corner shows "Setup needed" and the dashboard can't load. Add your first bot first:
+**You've never configured a bot**: just double-click the app — no terminal or pre-installed CLI needed. The app automatically starts a local-only (`127.0.0.1`) dashboard and opens the "Add Bot" wizard:
 
-- Run `botmux setup` once from a terminal. A Feishu QR scan creates the app for you. This step needs the CLI installed first; see steps 1 and 2 of [Quick Start](/en/quickstart). Then go back to the app and click "Start".
-- Or write `~/.botmux/bots.json` by hand following [bots.json](/en/bots-json) ("Open folder" in the app's top bar opens that directory).
+- **Feishu QR scan** (recommended): scan once in Feishu to automatically create the app, configure permissions, and bring the bot online.
+- **Manual App ID / Secret**: if you already have a Feishu or Lark Open Platform app, switch to "Manual App ID / Secret" and enter the credentials and administrator.
+- **Local only**: create a local bot without connecting to Feishu.
 
-Once the first bot exists and the service is running, you can add more bots with "Add bot" in the app's top bar.
+Once the first bot is saved, the app brings it online and transitions to Running automatically — no app restart needed. If you quit the app before configuring any bot, the local onboarding service is cleanly stopped too. You can add more bots any time via "Add bot" in the top bar.
 
 ## Everyday use
 

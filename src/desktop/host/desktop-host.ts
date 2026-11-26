@@ -15,7 +15,7 @@
  * but never stops the fleet — the daemon outlives the app by design.
  */
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -29,7 +29,7 @@ import { appRuntimeBinaryPath } from '../../core/binary-install-shape.js';
 import { resolveBotmuxWrapperBinDir } from '../../core/botmux-wrapper.js';
 import { botmuxVersion } from '../../utils/install-info.js';
 import { ensurePathEntry } from '../../../scripts/install-path-entry.mjs';
-import { shouldAutoStartCliRuntime } from '../main/auto-start.js';
+import { shouldAutoStartCliRuntime, shouldAutoStartEmptyOnboardingRuntime } from '../main/auto-start.js';
 import { probeShellPathEnv } from '../main/external-runtime.js';
 import { listFleetApps } from '../main/fleet-apps.js';
 import {
@@ -41,6 +41,12 @@ import {
   tailLogTarget,
 } from '../main/runtime-actions.js';
 import { createRuntimeService, type BundledRuntimeCandidate } from '../main/runtime-service.js';
+import {
+  createFileZeroBotOwnershipStore,
+  createZeroBotLifecycle,
+  isSupervisorOwnedByBundledRuntime,
+  readLiveSupervisorSnapshot,
+} from '../main/zero-bot-lifecycle.js';
 import type { DesktopPaths, DesktopRuntimeState } from '../shared/types.js';
 import { fetchReleaseLatestVersion, isNewerVersion } from '../../core/update-check.js';
 import { computeFleetAlignment, type FleetAlignment } from './alignment.js';
@@ -206,7 +212,52 @@ export interface DesktopOverview {
 
 const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60_000;
 
+function createDesktopHostLeaseRegistry(botmuxHome: string, selfPid = process.pid) {
+  const leaseDir = join(botmuxHome, '.desktop-host-leases');
+  const selfFile = join(leaseDir, `host-${selfPid}.json`);
+  let registered = false;
+
+  const ensureRegistered = () => {
+    if (registered || !existsSync(botmuxHome)) return;
+    try {
+      if (!existsSync(leaseDir)) mkdirSync(leaseDir, { recursive: true, mode: 0o700 });
+      writeFileSync(selfFile, `${JSON.stringify({ pid: selfPid, startedAt: new Date().toISOString() })}\n`, { mode: 0o600 });
+      registered = true;
+    } catch { /* best-effort */ }
+  };
+
+  const unregister = () => {
+    registered = false;
+    try { rmSync(selfFile, { force: true }); } catch { /* ignore */ }
+  };
+
+  const hasOtherActiveHost = (): boolean => {
+    if (!existsSync(leaseDir)) return false;
+    try {
+      for (const name of readdirSync(leaseDir)) {
+        const match = /^host-(\d+)\.json$/.exec(name);
+        if (!match) continue;
+        const pid = Number(match[1]);
+        if (!Number.isSafeInteger(pid) || pid <= 0 || pid === selfPid) continue;
+        if (pidAlive(pid)) return true;
+        try { rmSync(join(leaseDir, name), { force: true }); } catch { /* ignore */ }
+      }
+    } catch { /* ignore */ }
+    return false;
+  };
+
+  return { ensureRegistered, unregister, hasOtherActiveHost };
+}
+
 export async function runDesktopHost(): Promise<void> {
+  let closing = false;
+  const ignoreBrokenPipe = (err: NodeJS.ErrnoException) => {
+    if (err.code === 'EPIPE' || err.code === 'ERR_STREAM_DESTROYED') return;
+    throw err;
+  };
+  process.stdout.on('error', ignoreBrokenPipe);
+  process.stderr.on('error', ignoreBrokenPipe);
+
   const home = homedir();
   const botmuxHome = join(home, '.botmux');
   const paths: DesktopPaths = {
@@ -214,6 +265,8 @@ export async function runDesktopHost(): Promise<void> {
     dataDir: join(botmuxHome, 'data'),
     logsDir: join(botmuxHome, 'logs'),
   };
+  const hostLease = createDesktopHostLeaseRegistry(botmuxHome);
+  hostLease.ensureRegistered();
   // The host runs from the binary bundled with the app (its protocol matches the
   // shell); the FLEET runs from the self-updatable runtime the app passes in
   // (~/.botmux/app-runtime/botmux). A runtime updated to a release that predates
@@ -226,9 +279,15 @@ export async function runDesktopHost(): Promise<void> {
     argv1: process.argv[1],
     version,
   });
-  const write = (text: string) => { process.stdout.write(text); };
+  const write = (text: string) => {
+    if (closing || process.stdout.destroyed || !process.stdout.writable) return;
+    process.stdout.write(text);
+  };
   const emit = (event: string, data: unknown) => write(frame({ event, data }));
-  const log = (message: string) => process.stderr.write(`[desktop-host] ${message}\n`);
+  const log = (message: string) => {
+    if (process.stderr.destroyed || !process.stderr.writable) return;
+    process.stderr.write(`[desktop-host] ${message}\n`);
+  };
 
   const fleetStatePath = join(botmuxHome, 'fleet-state.json');
   const readState = () => (existsSync(fleetStatePath) ? readFleetState(fleetStatePath) : null);
@@ -253,7 +312,7 @@ export async function runDesktopHost(): Promise<void> {
   // update entry point must then refuse rather than write into the signed .app.
   const selfUpdateAllowed = runtimeSelfUpdateAllowed({ standalone: isStandaloneBinary(), runtimePath, home });
   const RESEED_FAILED_MESSAGE = '运行时未成功植入到 App 运行时目录（~/.botmux/app-runtime），请重新安装 Botmux App 后再更新';
-  const runtime = createRuntimeService({
+  const rawRuntime = createRuntimeService({
     paths,
     appVersion: version,
     execPath: process.execPath,
@@ -264,6 +323,17 @@ export async function runDesktopHost(): Promise<void> {
     fleetApps: () => listFleetApps(paths),
     fleetOwner,
   });
+  const appSessionId = process.env.BOTMUX_DESKTOP_APP_SESSION?.trim()
+    || (process.ppid > 1 ? `ppid:${process.ppid}` : null);
+  const zeroBotLifecycle = createZeroBotLifecycle({
+    runtime: rawRuntime,
+    readLiveSupervisor: () => readLiveSupervisorSnapshot(botmuxHome),
+    isOwnedByApp: live => ownedByApp() || isSupervisorOwnedByBundledRuntime(live, bundled),
+    ownershipStore: appSessionId ? createFileZeroBotOwnershipStore(botmuxHome, appSessionId) : undefined,
+    hasOtherActiveHost: () => hostLease.hasOtherActiveHost(),
+    warn: message => log(message),
+  });
+  const runtime = zeroBotLifecycle.runtime;
 
   const shellVersion = process.env.BOTMUX_DESKTOP_SHELL_VERSION || null;
   const update: DesktopUpdateStatus = {
@@ -304,7 +374,11 @@ export async function runDesktopHost(): Promise<void> {
   const publish = () => { if (lastState) emit('overview', overview(lastState)); };
   const monitor = createRuntimeStateMonitor({
     runtime,
+    watchDir: botmuxHome,
     sendState: state => {
+      if (closing) return;
+      hostLease.ensureRegistered();
+      zeroBotLifecycle.observeState(state);
       lastState = state;
       emit('state', state);
       publish();
@@ -388,7 +462,8 @@ export async function runDesktopHost(): Promise<void> {
       if (!target) return { ok: false, message: '无法获取最新版本（网络不可达或 registry 异常）' };
       if (!isNewerVersion(target, version)) return { ok: true, message: `已是最新版本（${version}）` };
       const lock = globalInstallUpdateLockTarget();
-      mkdirSync(dirname(lock), { recursive: true });
+      if (!existsSync(botmuxHome)) mkdirSync(botmuxHome, { recursive: true, mode: 0o700 });
+      mkdirSync(dirname(lock), { recursive: true, mode: 0o700 });
       const replaced = await withFileLock(lock, () => replaceStandaloneBinary(target, bundled.cliPath), { maxWaitMs: 5_000 });
       const output = `${replaced.asset} → ${replaced.target}（${version} → ${target}，source=${replaced.source}）`;
       // The binary at our own path was replaced. If the fleet runs from it,
@@ -453,39 +528,91 @@ export async function runDesktopHost(): Promise<void> {
 
   const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
   rl.on('line', line => {
-    void dispatchHostLine(line, handlers).then(out => { if (out) write(out); });
+    if (closing) return;
+    void dispatchHostLine(line, handlers).then(out => { if (out && !closing) write(out); });
   });
-  const closed = new Promise<void>(resolve => rl.once('close', () => resolve()));
+  let quitCleanupTask: Promise<unknown> | null = null;
+  let updateInitialTimer: ReturnType<typeof setTimeout> | null = null;
+  let updatePollTimer: ReturnType<typeof setInterval> | null = null;
+
+  const closed = new Promise<void>(resolve => rl.once('close', () => {
+    closing = true;
+    if (updateInitialTimer) { clearTimeout(updateInitialTimer); updateInitialTimer = null; }
+    if (updatePollTimer) { clearInterval(updatePollTimer); updatePollTimer = null; }
+    monitor.stop();
+    hostLease.unregister();
+    zeroBotLifecycle.markClosing();
+    if (zeroBotLifecycle.needsQuitCleanup()) {
+      // Trigger cleanup immediately on EOF so an in-flight 0-bot launchPolicy
+      // start is aborted promptly instead of waiting 15-30s.
+      quitCleanupTask = zeroBotLifecycle.cleanupOnQuit({ totalTimeoutMs: 5_000 });
+    }
+    resolve();
+  }));
 
   try {
-    const outcome = await launchPolicy({
-      runtime,
-      state: await runtime.getState(),
-      alignment: () => runtime.getState().then(state => overview(state).alignment),
-      runtimeReplaced: existsSync(restartMarker),
-      // Auto-takeover only when the APP starts — never when the host merely
-      // relaunched (after its own update, a crash, a runtime swap), which would
-      // otherwise restart every bot at an arbitrary background moment.
-      appLaunch: process.env.BOTMUX_DESKTOP_APP_LAUNCH === '1',
-      ownedByApp,
-      log,
-    });
-    // A stopped fleet + marker + background relaunch returns 'none' here: there
-    // is no old-build fleet to restart, so removing the marker is the correct
-    // outcome (settleRestartMarker), not a conflict with restart-failed keeping it.
-    if (settleRestartMarker(outcome) === 'remove') rmSync(restartMarker, { force: true });
-  } catch (error) {
-    log(`launch policy failed: ${error instanceof Error ? error.message : String(error)}`);
-  }
-  monitor.start();
-  emit('ready', { version });
-  if (bundled.selfDispatching) {
-    setTimeout(() => { void checkForUpdate(); }, 10_000).unref?.();
-    setInterval(() => { void checkForUpdate(); }, UPDATE_CHECK_INTERVAL_MS).unref?.();
-  }
+    const launchTask = (async () => {
+      try {
+        const initialState = await runtime.getState();
+        if (closing) return;
+        const appLaunch = process.env.BOTMUX_DESKTOP_APP_LAUNCH === '1';
+        if (appLaunch && initialState.status === 'running' && initialState.botCount === 0 && ownedByApp()) {
+          // A reopened app adopting a still-live app-owned 0-bot supervisor takes
+          // over cleanup ownership and records its lease so an exiting prior host
+          // will not kill it underneath us.
+          hostLease.ensureRegistered();
+          zeroBotLifecycle.adoptRunningZeroBot();
+        }
+        const outcome = await launchPolicy({
+          runtime,
+          state: initialState,
+          alignment: () => runtime.getState().then(state => overview(state).alignment),
+          runtimeReplaced: existsSync(restartMarker),
+          // Auto-takeover only when the APP starts — never when the host merely
+          // relaunched (after its own update, a crash, a runtime swap), which would
+          // otherwise restart every bot at an arbitrary background moment.
+          appLaunch,
+          ownedByApp,
+          log,
+        });
+        hostLease.ensureRegistered();
+        // A stopped fleet + marker + background relaunch returns 'none' here: there
+        // is no old-build fleet to restart, so removing the marker is the correct
+        // outcome (settleRestartMarker), not a conflict with restart-failed keeping it.
+        if (!closing && settleRestartMarker(outcome) === 'remove') rmSync(restartMarker, { force: true });
+      } catch (error) {
+        log(`launch policy failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    })();
 
-  await closed;
-  monitor.stop();
+    await Promise.race([launchTask, closed]);
+
+    if (!closing) {
+      monitor.start();
+      emit('ready', { version });
+      if (bundled.selfDispatching) {
+        updateInitialTimer = setTimeout(() => { void checkForUpdate(); }, 10_000);
+        updateInitialTimer.unref?.();
+        updatePollTimer = setInterval(() => { void checkForUpdate(); }, UPDATE_CHECK_INTERVAL_MS);
+        updatePollTimer.unref?.();
+      }
+    }
+
+    await closed;
+    monitor.stop();
+    if (quitCleanupTask) {
+      await quitCleanupTask;
+    } else if (zeroBotLifecycle.needsQuitCleanup()) {
+      await zeroBotLifecycle.cleanupOnQuit({ totalTimeoutMs: 5_000 });
+    }
+  } finally {
+    if (updateInitialTimer) clearTimeout(updateInitialTimer);
+    if (updatePollTimer) clearInterval(updatePollTimer);
+    monitor.stop();
+    hostLease.unregister();
+    process.stdout.off('error', ignoreBrokenPipe);
+    process.stderr.off('error', ignoreBrokenPipe);
+  }
 }
 
 /**
@@ -531,14 +658,21 @@ export async function launchPolicy(input: {
     // The runtimeSource === 'bundled' guard stays: on a first app launch where a
     // separately installed CLI owns a stopped fleet, auto-starting the app
     // runtime would hijack that install's fleet.
-    if (shouldAutoStartCliRuntime(input.state) && input.state.runtimeSource === 'bundled') {
+    if (
+      (shouldAutoStartCliRuntime(input.state) && input.state.runtimeSource === 'bundled')
+      || shouldAutoStartEmptyOnboardingRuntime(input.state)
+    ) {
       report('auto-start', await input.runtime.start());
       return 'started';
     }
     return 'none';
   }
   const alignment = await input.alignment();
-  if (alignment.kind === 'owner-older' && alignment.auto) {
+  if (
+    alignment.kind === 'owner-older'
+    && alignment.auto
+    && (input.state.botCount > 0 || input.state.onlineDaemonCount > 0)
+  ) {
     input.log(`aligning fleet ${alignment.ownerVersion} → app ${alignment.appVersion}`);
     report('align', await input.runtime.takeover());
     return 'aligned';

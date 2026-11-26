@@ -1,9 +1,17 @@
 import { existsSync, readFileSync, rmSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { readBotsJsonOrEmpty, writeBotsJsonAtomic, mutateBotsJsonAtomic } from '../setup/bots-store.js';
+import { validateBotConfigEntries } from '../setup/bots-config-validation.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { logger } from '../utils/logger.js';
-import { cloneBotConfig, normalizeBotConfig, findInvalidAllowedUserEntries, hasOwnerEntry } from '../setup/bot-config-editor.js';
+import {
+  assertUniqueBotProcessNames,
+  cloneBotConfig,
+  normalizeBotConfig,
+  parseBotConfigsJson,
+  findInvalidAllowedUserEntries,
+  hasOwnerEntry,
+} from '../setup/bot-config-editor.js';
 import {
   detectUnusableOwnerEntries,
   resolveScannerAllowedUser,
@@ -57,6 +65,48 @@ import { invalidWorkingDirs } from '../utils/working-dir.js';
 // = …` CJS; ESM default-import interop gives the export on both Node and Bun.
 import QRCode from 'qrcode-terminal/vendor/QRCode/index.js';
 import QRErrorCorrectLevel from 'qrcode-terminal/vendor/QRCode/QRErrorCorrectLevel.js';
+
+export const MANUAL_FEISHU_APP_ID_RE = /^cli_[A-Za-z0-9]{1,64}$/;
+export const MANUAL_APP_SECRET_MAX_LENGTH = 256;
+// eslint-disable-next-line no-control-regex
+const CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/;
+
+export class DuplicateAppIdError extends Error {
+  readonly code = 'DUPLICATE_APP_ID' as const;
+  constructor(readonly appId: string) {
+    super(`应用 ${appId} 已存在于 bots.json 中，请勿重复添加。`);
+    this.name = 'DuplicateAppIdError';
+  }
+}
+
+export class InvalidBotsJsonError extends Error {
+  readonly code = 'INVALID_BOTS_JSON' as const;
+  constructor(message: string) {
+    super(message);
+    this.name = 'InvalidBotsJsonError';
+  }
+}
+
+/** Fail closed if `bots.json` exists on disk and is malformed, non-array, unreadable, or has invalid entries. */
+export function assertBotsJsonValidOrAbsent(botsJsonPath: string): void {
+  if (!existsSync(botsJsonPath)) return;
+  let parsed: unknown;
+  try {
+    parsed = parseBotConfigsJson(readFileSync(botsJsonPath, 'utf-8'), botsJsonPath);
+  } catch (err) {
+    throw new InvalidBotsJsonError(err instanceof Error ? err.message : String(err));
+  }
+  const validation = validateBotConfigEntries(parsed);
+  if (!validation.ok) {
+    throw new InvalidBotsJsonError(validation.message);
+  }
+}
+
+export function isValidManualAppSecret(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const trimmed = value.trim();
+  return trimmed.length > 0 && trimmed.length <= MANUAL_APP_SECRET_MAX_LENGTH && !CONTROL_CHAR_RE.test(trimmed);
+}
 
 export type BotOnboardingStatus =
   | 'starting'
@@ -137,7 +187,7 @@ export interface BotOnboardingSnapshot {
   permissionStatusMsg?: string;
   appId?: string;
   appName?: string;
-  registrationMode?: 'sdk' | 'web' | 'compat' | 'local';
+  registrationMode?: 'sdk' | 'web' | 'compat' | 'local' | 'manual';
   /** Existing onboarding job whose exact App permission setup is being resumed. */
   recoveryOfJobId?: string;
   /** Monotonic permission-recovery attempt within the same immutable target lineage. */
@@ -190,8 +240,16 @@ export interface BotOnboardingInput {
   /** 飞书应用名称；普通创建留空生成 botmux-N，克隆留空生成 源名称-copy-时间戳。 */
   appName?: string;
   cloneSourceAppId?: string;
-  /** 默认 Feishu 单码主路径；compat 是 SDK 兼容模式；sdk 是官方注册清单（仅显式传入）；local 不创建飞书应用。 */
-  registrationMode?: 'sdk' | 'web' | 'compat' | 'local';
+  /** 默认 Feishu 单码主路径；compat 是 SDK 兼容模式；sdk 是官方注册清单（仅显式传入）；local 不创建飞书应用；manual 手动填入已有飞书/Lark App ID 与 Secret。 */
+  registrationMode?: 'sdk' | 'web' | 'compat' | 'local' | 'manual';
+  /** manual 模式：租户品牌（feishu | lark），默认 feishu。 */
+  brand?: Brand;
+  /** manual 模式：已有飞书/Lark 应用的 App ID（cli_...）。 */
+  appId?: string;
+  /** manual 模式：已有飞书/Lark 应用的 App Secret（绝不进入 snapshot/日志）。 */
+  appSecret?: string;
+  /** manual 模式：应用 owner 白名单（邮箱/手机号/on_/ou_），经目标应用校验后落盘。 */
+  allowedUsers?: string[];
   /**
    * reuse: 使用表单已展示并确认的身份，缓存失效时不静默弹码；
    * qr: 用户明确选择首次登录/更换账号，强制生成新二维码。
@@ -354,6 +412,7 @@ export interface BotOnboardingManagerOptions {
   /** 官方注册接口。 */
   registerApp?: RegisterAppFn;
   validateCredentials?: ValidateCredentialsFn;
+  detectUnusableOwners?: typeof detectUnusableOwnerEntries;
   automateOpenPlatform?: AutomateOpenPlatformFn;
   completeRegisteredApp?: typeof completeRegisteredApp;
   verifyCriticalScopes?: VerifyCriticalScopesFn;
@@ -472,6 +531,7 @@ export class BotOnboardingManager {
   private readonly inspectSession: InspectSessionFn;
   private readonly registerApp: RegisterAppFn;
   private readonly validateCredentials: ValidateCredentialsFn;
+  private readonly detectUnusableOwners: typeof detectUnusableOwnerEntries;
   private readonly automateOpenPlatform: AutomateOpenPlatformFn;
   private readonly completeRegisteredApp: typeof completeRegisteredApp;
   private readonly verifyCriticalScopes: VerifyCriticalScopesFn;
@@ -494,6 +554,7 @@ export class BotOnboardingManager {
     this.inspectSession = opts.inspectSession ?? (() => inspectCachedFeishuOpenPlatformSession());
     this.registerApp = opts.registerApp ?? tryRegisterApp;
     this.validateCredentials = opts.validateCredentials ?? validateCredentials;
+    this.detectUnusableOwners = opts.detectUnusableOwners ?? detectUnusableOwnerEntries;
     this.automateOpenPlatform = opts.automateOpenPlatform ?? automateOpenPlatformSetup;
     this.completeRegisteredApp = opts.completeRegisteredApp ?? completeRegisteredApp;
     this.verifyCriticalScopes = opts.verifyCriticalScopes ?? readCriticalScopesFromApplicationInfo;
@@ -1198,6 +1259,12 @@ export class BotOnboardingManager {
   }
 
   private async reconcileInterruptedManagedActivations(): Promise<void> {
+    try {
+      assertBotsJsonValidOrAbsent(this.opts.botsJsonPath);
+    } catch (err) {
+      this.permissionRecoveryStateError = err instanceof Error ? err.message : String(err);
+      return;
+    }
     const targets = readBotsJsonOrEmpty(this.opts.botsJsonPath).flatMap((bot: any, index) => {
       const marker = managedActivationMarker(bot);
       if (!marker) {
@@ -1361,12 +1428,24 @@ export class BotOnboardingManager {
   start(input: BotOnboardingInput = {}): BotOnboardingJob {
     const id = `bot_${Math.random().toString(36).slice(2)}_${this.now().toString(36)}`;
     const createdAt = this.now();
+    const secretToRedact = typeof input.appSecret === 'string' && input.appSecret.trim()
+      ? input.appSecret.trim()
+      : '';
+    const sanitizeErrorMessage = (raw: string): string => (
+      secretToRedact ? raw.split(secretToRedact).join('[REDACTED]') : raw
+    );
     this.jobs.set(id, { id, status: 'starting', createdAt, updatedAt: createdAt });
     const done = this.run(id, input).catch(err => {
+      const error = err instanceof InvalidBotsJsonError
+        ? 'invalid_bots_json'
+        : err instanceof DuplicateAppIdError
+          ? 'duplicate_app'
+          : 'unexpected_error';
+      const rawMessage = err instanceof Error ? err.message : String(err);
       this.patch(id, {
         status: 'failed',
-        error: 'unexpected_error',
-        message: err instanceof Error ? err.message : String(err),
+        error,
+        message: sanitizeErrorMessage(rawMessage),
       });
     });
     return { id, done };
@@ -1688,6 +1767,7 @@ export class BotOnboardingManager {
   /** Persist a local bot. Does not call Feishu, scan a QR, or create an app. */
   private async runLocal(id: string, input: BotOnboardingInput): Promise<void> {
     this.patch(id, { registrationMode: 'local' });
+    assertBotsJsonValidOrAbsent(this.opts.botsJsonPath);
     if (input.cloneSourceAppId) {
       this.patch(id, {
         status: 'failed',
@@ -1762,11 +1842,176 @@ export class BotOnboardingManager {
     });
   }
 
+  /**
+   * Persist an existing Feishu/Lark app supplied via manual App ID + App Secret.
+   *
+   * Security boundaries:
+   * - Fail-closed on corrupt/non-array `bots.json` before any remote call or write.
+   * - Validates credentials via `validateCredentials` and verifies owner entries
+   *   against the target app via `src/setup/owner-identity.ts` (`detectUnusableOwnerEntries`).
+   * - Create-only atomic append under lock (rejects duplicate `larkAppId` instead of
+   *   silently overwriting an existing bot).
+   * - `appSecret` never enters job snapshots, logs, pending files, or error messages.
+   */
+  private async runManual(id: string, input: BotOnboardingInput): Promise<void> {
+    this.patch(id, { registrationMode: 'manual' });
+    assertBotsJsonValidOrAbsent(this.opts.botsJsonPath);
+    if (input.cloneSourceAppId) {
+      this.patch(id, {
+        status: 'failed',
+        error: 'manual_clone_unsupported',
+        message: '手动填入已有应用凭证不支持克隆其他机器人配置。',
+      });
+      return;
+    }
+    if (input.requireCriticalScopesBeforeActivation === true) {
+      this.patch(id, {
+        status: 'failed',
+        error: 'manual_scope_gate_unsupported',
+        message: '手动模式不走开放平台自动权限激活。',
+      });
+      return;
+    }
+    const brand: Brand = input.brand === 'lark' ? 'lark' : 'feishu';
+    const appId = typeof input.appId === 'string' ? input.appId.trim() : '';
+    const appSecret = typeof input.appSecret === 'string' ? input.appSecret.trim() : '';
+    if (!MANUAL_FEISHU_APP_ID_RE.test(appId)) {
+      this.patch(id, {
+        status: 'failed',
+        error: 'invalid_app_id',
+        message: 'App ID 格式无效，请填写飞书/Lark 开放平台提供的 cli_ 开头 App ID。',
+      });
+      return;
+    }
+    if (!isValidManualAppSecret(appSecret)) {
+      this.patch(id, {
+        status: 'failed',
+        error: 'invalid_app_secret',
+        message: 'App Secret 不能为空且不能包含控制字符。',
+      });
+      return;
+    }
+    const workingDir = input.workingDir?.trim() || '~';
+    const bad = invalidWorkingDirs({ workingDir });
+    if (bad.length > 0) {
+      this.patch(id, {
+        status: 'failed',
+        error: 'invalid_working_dir',
+        message: `目录不存在或不是目录: ${bad.join(', ')}`,
+      });
+      return;
+    }
+    const entries = (input.allowedUsers ?? []).map(entry => entry.trim()).filter(Boolean);
+    const invalidOwners = findInvalidAllowedUserEntries(entries);
+    if (invalidOwners.length > 0) {
+      this.patch(id, {
+        status: 'failed',
+        error: 'invalid_entries',
+        message: `不是完整邮箱、手机号（大陆 11 位 / 海外带 + 国家码）、union_id(on_) 或 open_id(ou_)：${invalidOwners.join(', ')}`,
+      });
+      return;
+    }
+    if (!hasOwnerEntry(entries)) {
+      this.patch(id, {
+        status: 'failed',
+        error: 'no_owner',
+        message: '至少需要填写一个完整邮箱、手机号（大陆 11 位 / 海外带 + 国家码）、union_id(on_) 或 open_id(ou_) 作为管理员。',
+      });
+      return;
+    }
+    const configuredBots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
+    if (configuredBots.some((bot: any) => bot?.larkAppId === appId)) {
+      throw new DuplicateAppIdError(appId);
+    }
+    const cliId: CliId = input.cliId ?? 'claude-code';
+    const appName = input.appName?.trim() || undefined;
+    try {
+      validateCliLaunchModeConfig({
+        cliId,
+        cliLaunchMode: input.cliLaunchMode,
+        wrapperCli: input.wrapperCli,
+      }, 'Dashboard manual bot');
+    } catch (error) {
+      this.patch(id, {
+        status: 'failed',
+        error: 'invalid_launch_mode_config',
+        message: error instanceof Error ? error.message : String(error),
+      });
+      return;
+    }
+
+    this.patch(id, {
+      status: 'verifying',
+      appId,
+      brand,
+      cliId,
+      workingDir,
+      ...(appName ? { appName } : {}),
+    });
+
+    const cred = await this.validateCredentials(appId, appSecret, brand);
+    if (!cred.ok) {
+      const reason = 'message' in cred && typeof cred.message === 'string' && cred.message.trim()
+        ? cred.message.split(appSecret).join('[REDACTED]')
+        : 'App ID 或 App Secret 校验未通过，请确认凭证及飞书/Lark 区域选择是否正确。';
+      this.patch(id, {
+        status: 'failed',
+        error: 'credential_validation_failed',
+        message: reason,
+      });
+      return;
+    }
+
+    const unusable = await this.detectUnusableOwners(appId, appSecret, brand, entries);
+    if (unusable.length > 0) {
+      this.patch(id, {
+        status: 'failed',
+        error: 'unusable_owner',
+        message: `以下管理员身份在当前应用中无法解析（可能是其他应用的 open_id，或邮箱/手机号不在本企业）：${unusable.join(', ')}。请改用本企业邮箱、手机号或 union_id(on_)。`,
+      });
+      return;
+    }
+
+    const bot: Record<string, any> = {
+      larkAppId: appId,
+      larkAppSecret: appSecret,
+      cliId,
+      ...(input.wrapperCli ? { wrapperCli: input.wrapperCli } : {}),
+      ...(input.cliLaunchMode ? { cliLaunchMode: input.cliLaunchMode } : {}),
+      ...(input.dirMode === 'fixed' ? { defaultWorkingDir: workingDir } : { workingDir }),
+      ...(input.model ? { model: input.model } : {}),
+      // Match web/sdk onboarding: keep free-text user labels in `displayName`,
+      // never copying them into supervisor process identifier `name` (where
+      // "dashboard", "plugin-*", or duplicate labels would break live start/restart).
+      ...(appName ? { displayName: appName } : {}),
+      ...(brand === 'lark' ? { brand: 'lark' } : {}),
+      allowedUsers: entries,
+    };
+
+    const addedBotIndex = await this.persistNewManualBot(bot);
+    await this.runLiveStart(id, appId);
+    this.patch(id, {
+      status: 'completed',
+      appId,
+      appName: appName ?? appId,
+      brand,
+      cliId,
+      workingDir,
+      addedBotIndex,
+      remainingSteps: buildRemainingSteps(appId, brand),
+    });
+  }
+
   private async run(id: string, input: BotOnboardingInput = {}): Promise<void> {
     if (input.registrationMode === 'local') {
       await this.runLocal(id, input);
       return;
     }
+    if (input.registrationMode === 'manual') {
+      await this.runManual(id, input);
+      return;
+    }
+    assertBotsJsonValidOrAbsent(this.opts.botsJsonPath);
     const configuredBots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
     const cloneSource = input.cloneSourceAppId
       ? configuredBots.find((bot: any) => bot?.larkAppId === input.cloneSourceAppId)
@@ -2071,6 +2316,38 @@ export class BotOnboardingManager {
     });
   }
 
+  /**
+   * Locked read-modify-write that re-validates the on-disk `bots.json` entries
+   * INSIDE the file lock, closing TOCTOU gaps where `bots.json` was corrupted
+   * while remote validation or QR login was in flight.
+   */
+  private mutateBotsJsonValidated<T>(
+    mutation: (previous: any[]) => { bots: any[]; result: T },
+  ): T {
+    let callbackEntered = false;
+    try {
+      return mutateBotsJsonAtomic(this.opts.botsJsonPath, previous => {
+        callbackEntered = true;
+        const validation = validateBotConfigEntries(previous);
+        if (!validation.ok) {
+          throw new InvalidBotsJsonError(validation.message);
+        }
+        return mutation(previous);
+      });
+    } catch (err) {
+      if (
+        !callbackEntered
+        && (
+          err instanceof SyntaxError
+          || (err instanceof Error && err.message === `${this.opts.botsJsonPath} must contain a JSON array`)
+        )
+      ) {
+        throw new InvalidBotsJsonError(err.message);
+      }
+      throw err;
+    }
+  }
+
   /** Create-only local append: allocate against the locked generation, never upsert. */
   private async persistNewLocalBot<T extends {
     larkAppId?: string;
@@ -2079,7 +2356,7 @@ export class BotOnboardingManager {
   }>(record: T): Promise<{ bot: T & { larkAppId: string }; index: number }> {
     let allocated: (T & { larkAppId: string }) | undefined;
     try {
-      return await this.runBotsMutation(() => mutateBotsJsonAtomic(this.opts.botsJsonPath, bots => {
+      return await this.runBotsMutation(() => this.mutateBotsJsonValidated(bots => {
         allocated = normalizeBotConfig(reallocateLocalBotId(
           record,
           bots.map((bot: any) => String(bot?.larkAppId ?? '')).filter(Boolean),
@@ -2109,22 +2386,36 @@ export class BotOnboardingManager {
     }
   }
 
+  /** Create-only atomic append for manual onboarding: rejects duplicate larkAppId & colliding process names under lock. */
+  private async persistNewManualBot(bot: Record<string, any>): Promise<number> {
+    const normalized = normalizeBotConfig(bot);
+    return this.runBotsMutation(() => this.mutateBotsJsonValidated(previous => {
+      if (previous.some((entry: any) => entry?.larkAppId === normalized.larkAppId)) {
+        throw new DuplicateAppIdError(String(normalized.larkAppId));
+      }
+      const index = previous.length;
+      const next = [...previous, normalized];
+      assertUniqueBotProcessNames(next);
+      return {
+        bots: next,
+        result: index,
+      };
+    }));
+  }
+
   /** 把 bot append/更新进 bots.json（按 larkAppId upsert, 幂等），返回它的行号。 */
   private async persistBot(bot: Record<string, any>): Promise<number> {
-    return this.runBotsMutation(() => {
-      const bots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
-      const normalized = normalizeBotConfig(bot);
-      const existing = bots.findIndex((b: any) => b?.larkAppId === bot.larkAppId);
+    const normalized = normalizeBotConfig(bot);
+    return this.runBotsMutation(() => this.mutateBotsJsonValidated(previous => {
+      const existing = previous.findIndex((b: any) => b?.larkAppId === bot.larkAppId);
       if (existing >= 0) {
-        const next = [...bots];
+        const next = [...previous];
         next[existing] = normalized;
-        writeBotsJsonAtomic(this.opts.botsJsonPath, next, bots);
-        return existing;
+        return { bots: next, result: existing };
       }
-      const index = bots.length;
-      writeBotsJsonAtomic(this.opts.botsJsonPath, [...bots, normalized], bots);
-      return index;
-    });
+      const index = previous.length;
+      return { bots: [...previous, normalized], result: index };
+    }));
   }
 
   /**
@@ -2153,7 +2444,17 @@ export class BotOnboardingManager {
     const appSecret = typeof pending.larkAppSecret === 'string' ? pending.larkAppSecret : '';
     const brand: Brand = job.brand ?? 'feishu';
 
-    const unusable = await detectUnusableOwnerEntries(appId, appSecret, brand, entries);
+    try {
+      assertBotsJsonValidOrAbsent(this.opts.botsJsonPath);
+    } catch (err) {
+      return {
+        ok: false,
+        error: 'invalid_bots_json',
+        message: err instanceof Error ? err.message : String(err),
+      };
+    }
+
+    const unusable = await this.detectUnusableOwners(appId, appSecret, brand, entries);
     if (unusable.length > 0) {
       return {
         ok: false,
@@ -2163,7 +2464,15 @@ export class BotOnboardingManager {
     }
 
     // 校验通过才落盘：此刻 bot 第一次进入 bots.json, 且带着非空 allowedUsers。
-    const addedBotIndex = await this.persistBot({ ...pending, allowedUsers: entries });
+    let addedBotIndex: number;
+    try {
+      addedBotIndex = await this.persistBot({ ...pending, allowedUsers: entries });
+    } catch (err) {
+      if (err instanceof InvalidBotsJsonError) {
+        return { ok: false, error: 'invalid_bots_json', message: err.message };
+      }
+      throw err;
+    }
     this.pendingBots.delete(id);
     if (pending.activationPending === true) {
       this.patch(id, { activationPending: true });

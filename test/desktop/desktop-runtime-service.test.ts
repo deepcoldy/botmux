@@ -600,4 +600,130 @@ describe('runtime service', () => {
     });
     expect(state.message).toContain('Invalid fleet state');
   });
+
+  it('reports running with botCount=0 when bundled 0-bot dashboard is live, and starts with --allow-empty + 127.0.0.1 when idle', async () => {
+    const run = vi.fn(async () => ({ code: 0, stdout: 'ok', stderr: '' }));
+    let apps: Array<{ name: string; status: string; script?: string }> = [];
+    const svc = createRuntimeService({
+      paths,
+      appVersion: '1.0.0',
+      execPath: '/Electron',
+      env: { BOTMUX_SESSION_ID: 'inherited-session-id' },
+      fs: { existsSync: () => false, readFileSync: () => '' },
+      bundledRuntime: bundledRuntime(),
+      run,
+      fleetApps: async () => apps,
+    });
+
+    const idle = await svc.getState();
+    expect(idle).toMatchObject({
+      status: 'not_configured',
+      runtimeSource: 'bundled',
+      runtimeManaged: true,
+      botCount: 0,
+      onlineDaemonCount: 0,
+    });
+
+    await svc.start();
+    expect(run).toHaveBeenCalledWith(expect.objectContaining({
+      command: bundledRuntime().nodePath,
+      args: [bundledRuntime().cliPath, 'start', '--allow-empty'],
+      env: expect.objectContaining({
+        BOTMUX_DASHBOARD_HOST: '127.0.0.1',
+      }),
+    }));
+    const startEnv = run.mock.calls[0]?.[0]?.env as Record<string, string | undefined>;
+    expect(startEnv.BOTMUX_SESSION_ID).toBeUndefined();
+
+    apps = [{
+      name: 'botmux-dashboard',
+      status: 'online',
+      script: '/Applications/Botmux.app/Contents/Resources/runtime/dist/index-supervisor.js',
+    }];
+    const live = await svc.getState();
+    expect(live).toMatchObject({
+      status: 'running',
+      runtimeSource: 'bundled',
+      runtimeManaged: true,
+      botCount: 0,
+      onlineDaemonCount: 0,
+    });
+
+    await svc.stopIfEmpty({ supervisorPid: 4321, timeoutMs: 3_000 });
+    expect(run).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        args: [bundledRuntime().cliPath, 'stop', '--if-empty', '--supervisor-pid', '4321'],
+      }),
+      { timeoutMs: 3_000 },
+    );
+  });
+
+  it('accepts local apiOnly bots without larkAppSecret instead of flipping to degraded', async () => {
+    const localBotJson = JSON.stringify([
+      { larkAppId: 'local_mybot', apiOnly: true, localIdentity: true, cliId: 'claude-code' },
+    ]);
+    const svc = createRuntimeService({
+      paths,
+      appVersion: '1.0.0',
+      execPath: '/Electron',
+      env: {},
+      fs: { existsSync: () => true, readFileSync: () => localBotJson },
+      bundledRuntime: bundledRuntime(),
+      fleetApps: async () => [],
+    });
+
+    const state = await svc.getState();
+    expect(state).toMatchObject({
+      status: 'stopped',
+      runtimeSource: 'bundled',
+      runtimeManaged: true,
+      botCount: 1,
+      onlineDaemonCount: 0,
+    });
+  });
+
+  it('never sends --allow-empty to external fleetOwner CLIs and tags explicit degradedReason values', async () => {
+    const run = vi.fn(async () => ({ code: 0, stdout: 'ok', stderr: '' }));
+    const owner = globalCli({ version: '3.40.0' });
+    const svc = createRuntimeService({
+      paths,
+      appVersion: '3.60.0',
+      execPath: '/Electron',
+      env: {},
+      fs: { existsSync: () => false, readFileSync: () => '' },
+      bundledRuntime: bundledRuntime(),
+      fleetOwner: () => owner,
+      run,
+      fleetApps: async () => [{ name: 'botmux-dashboard', status: 'online', script: owner.cliPath }],
+    });
+
+    await svc.restart();
+    expect(run).toHaveBeenCalledWith(expect.objectContaining({
+      command: owner.binPath,
+      args: ['restart'],
+    }));
+    const env = run.mock.calls[0]?.[0]?.env as Record<string, string | undefined>;
+    expect(env.BOTMUX_DASHBOARD_HOST).toBeUndefined();
+
+    const invalidSvc = createRuntimeService({
+      paths,
+      appVersion: '3.60.0',
+      execPath: '/Electron',
+      env: {},
+      fs: { existsSync: () => true, readFileSync: () => '{bad' },
+      bundledRuntime: bundledRuntime(),
+    });
+    expect((await invalidSvc.getState()).degradedReason).toBe('invalid_bots_json');
+
+    const fleetErrSvc = createRuntimeService({
+      paths,
+      appVersion: '3.60.0',
+      execPath: '/Electron',
+      env: {},
+      fs: { existsSync: () => false, readFileSync: () => '' },
+      bundledRuntime: bundledRuntime(),
+      fleetApps: async () => { throw new Error('Invalid fleet state'); },
+    });
+    expect((await fleetErrSvc.getState()).degradedReason).toBe('fleet_discovery');
+  });
 });
