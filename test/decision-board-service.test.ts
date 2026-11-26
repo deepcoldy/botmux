@@ -649,6 +649,13 @@ describe('提交与投递', () => {
       '收到 2 项（#1）\n\n#1 a（待拍板）\n选：A 合\n说明：\n合吧\n附图：1 张（见下方图片）\n\n#2 b（待拍板）\n选：未选\n说明：\n先别动',
     ]);
     expect(msg.announcement.texts.join('')).not.toContain('botmux board');
+    const card = JSON.parse(msg.announcement.card!);
+    const cardText = card.body.elements[0].content as string;
+    expect(card.schema).toBe('2.0');
+    expect(cardText).toContain('[#1 a](https://applink.feishu.cn/');
+    expect(cardText).toContain('[#2 b](https://applink.feishu.cn/');
+    expect(cardText).not.toMatch(/ https:\/\/applink\.feishu\.cn\//);
+    // 卡片只改群内展示；上面的原 prompt 逐项断言保持不动。
     expect(msg.announcement.images.map(i => i.path)).toEqual(msg.attachments.map(i => i.path));
     expect(msg.attachments).toHaveLength(1);
     expect(readFileSync(msg.attachments[0].path).toString('base64')).toBe(PNG_B64);
@@ -664,6 +671,7 @@ describe('提交与投递', () => {
     const d = service.putDraft(a.seq, 'owner', { choice: 'B', text: longText, baseRev: a.rev }).draft!;
     await service.submit({ author: 'owner', nonce: 'long', items: [{ seq: a.seq, draftUpdatedAt: d.updatedAt }] });
     const { texts } = delivered[0].announcement;
+    expect(delivered[0].announcement.card).toBeUndefined();
     expect(texts.length).toBeGreaterThan(1);
     for (const t of texts) expect(Buffer.byteLength(t, 'utf8')).toBeLessThanOrEqual(30 * 1024);
     const whole = texts.join('');

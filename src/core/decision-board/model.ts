@@ -9,6 +9,7 @@
  */
 import type { Locale } from '../../i18n/types.js';
 import { chatAppLink, larkHosts, type Brand } from '../../im/lark/lark-hosts.js';
+import { compactNoticeCard, escapeNoticeMarkdown, noticeItemLink, noticeMarkdownLink } from './notice-card.js';
 
 export const BOARD_STATES = ['decide', 'accept', 'active', 'waiting', 'done', 'closed'] as const;
 export type BoardState = typeof BOARD_STATES[number];
@@ -856,6 +857,8 @@ export interface BatchMessageEntry {
   fileCount: number;
   /** 这一项的主群：管家群里的回显和批次消息都带上，点了直接进群。 */
   primaryChat?: { text: string; url: string };
+  /** 看板详情地址：只用于群内卡片的事项标题链接，不进管家 prompt。 */
+  link?: string;
   /** 在管家群的拍板卡片上点的、或本机外部客户端提交的（缺省 = 网页看板）。 */
   source?: BatchSource;
   /** 提交之后管家改过问题或选项：选项键可能已经换了意思，不附现在的选项原文。 */
@@ -975,6 +978,33 @@ export function formatBatchMessage(input: BatchMessageInput): string {
  */
 export function formatBatchEcho(input: { header: string; entries: readonly BatchMessageEntry[]; locale: Locale }): string {
   return `${input.header}\n\n${formatBatchEntries(input.entries, input.locale, 'below')}`;
+}
+
+/**
+ * 群内卡片版回显。逐项内容仍由 {@link formatBatchEntries} 生成，只在转义后把标题 / 主群改成
+ * 可点击文案；因此选择、覆盖关系、说明原文与附图说明不会和纯文本降级分叉。
+ */
+export function formatBatchEchoCard(input: { header: string; entries: readonly BatchMessageEntry[]; locale: Locale }): string | undefined {
+  const zh = input.locale !== 'en';
+  const blocks = input.entries.map(e => {
+    let block = escapeNoticeMarkdown(formatBatchEntries([e], input.locale, 'below'));
+    const plainTitle = `#${e.seq} ${e.title}`;
+    const escapedTitle = escapeNoticeMarkdown(plainTitle);
+    if (block.startsWith(escapedTitle)) {
+      block = `${noticeItemLink(e.seq, e.title, e.link)}${block.slice(escapedTitle.length)}`;
+    }
+    if (e.primaryChat) {
+      const label = zh ? '主群：' : 'Main chat: ';
+      const text = e.primaryChat.text.replace(/\s+/g, ' ').trim();
+      const plainLine = `${label}${text} ${e.primaryChat.url}`;
+      block = block.replace(escapeNoticeMarkdown(plainLine), `${label}${noticeMarkdownLink(text, e.primaryChat.url)}`);
+    }
+    return block;
+  });
+  return compactNoticeCard({
+    title: zh ? '决策看板 · 批次' : 'Decision board · batch',
+    lines: [`**${escapeNoticeMarkdown(input.header)}**\n\n${blocks.join('\n\n')}`],
+  });
 }
 
 /**

@@ -5,6 +5,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   cleanChatName,
+  BOARD_STATE_LABELS,
   formatBatchEntries,
   composeStewardGuide,
   effectivePrimaryChat,
@@ -12,6 +13,7 @@ import {
   itemMissingChat,
   linkDefaultLabel,
   formatBatchEcho,
+  formatBatchEchoCard,
   formatBatchMessage,
   splitEchoText,
   formatBoardTurnId,
@@ -233,6 +235,44 @@ describe('批次消息', () => {
     expect(prompt.slice(prompt.indexOf('\n\n') + 2).replace('（已随消息附上）', '（见下方图片）'))
       .toBe(echo.slice(echo.indexOf('\n\n') + 2));
     expect(echo).not.toContain('botmux');
+  });
+
+  it('卡片回显：事项和主群都是可点击文案，标题 / 群名 / 说明里的 Markdown 字符已转义', () => {
+    const itemLink = 'https://applink.feishu.cn/client/web_url/open?mode=sidebar-semi&item=31';
+    const chatLink = 'https://applink.feishu.cn/client/chat/open?openChatId=oc_review';
+    const entries = [{
+      seq: 31, title: '授信 [方式] (新版) *灰度*', state: 'decide' as const, stage: '在审', choice: 'A',
+      choiceLabel: '恢复', recommended: true, text: '保留 *星号* 与 [括号]', fileCount: 1, link: itemLink,
+      primaryChat: { text: '主群 [评审] (正式)', url: chatLink },
+    }];
+    const plain = formatBatchEcho({ header: '📥 收到 1 项（批次 #8）', entries, locale: 'zh' });
+    expect(plain).toContain(`主群：主群 [评审] (正式) ${chatLink}`);
+    const card = JSON.parse(formatBatchEchoCard({ header: '📥 收到 1 项（批次 #8）', entries, locale: 'zh' })!);
+    expect(card).toMatchObject({ schema: '2.0', header: { template: 'blue', title: { tag: 'plain_text' } } });
+    const content = card.body.elements[0].content as string;
+    expect(content).toContain(`[#31 授信 \\[方式\\] \\(新版\\) \\*灰度\\*](${itemLink})（待拍板·在审）`);
+    expect(content).toContain(`主群：[主群 \\[评审\\] \\(正式\\)](${chatLink})`);
+    expect(content).toContain('保留 \\*星号\\* 与 \\[括号\\]');
+    expect(content).not.toContain(` ${itemLink}`);
+    expect(content).not.toContain(` ${chatLink}`);
+  });
+
+  it('卡片回显支持英文；没有链接时标题与主群退为普通文字', () => {
+    const content = (JSON.parse(formatBatchEchoCard({
+      header: '📥 1 decision (batch #8)',
+      entries: [{ seq: 9, title: 'API [v2]', state: 'active', text: '', fileCount: 0, primaryChat: { text: 'Review [API]', url: '' } }],
+      locale: 'en',
+    })!).body.elements[0].content as string);
+    expect(content).toContain(`#9 API \\[v2\\]（${BOARD_STATE_LABELS.en.active}）`);
+    expect(content).toContain('Review \\[API\\]');
+    expect(content).not.toContain('](');
+  });
+
+  it('卡片预算放不下长说明时返回空，不截断 owner 原文', () => {
+    const text = '甲'.repeat(10_000);
+    expect(formatBatchEchoCard({
+      header: 'batch', entries: [{ seq: 1, title: 'long', state: 'decide', text, fileCount: 0 }], locale: 'en',
+    })).toBeUndefined();
   });
 });
 
