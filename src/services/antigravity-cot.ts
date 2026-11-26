@@ -102,7 +102,11 @@ export function extractAntigravityCotEntriesFromRecord(
       d.tool_calls.forEach((tc: any, idx: number) => {
         if (!tc || typeof tc !== 'object') return;
         const toolName = typeof tc.name === 'string' && tc.name ? tc.name : 'tool';
-        const id = tc.id || `call_${d.step_index ?? 'step'}_${idx}`;
+        // A numeric id is kept as its string; anything else falls back, so the
+        // worker's shape guard (string ids, used to pair a call with its result)
+        // never drops a real tool call.
+        const rawId = typeof tc.id === 'string' || typeof tc.id === 'number' ? String(tc.id) : '';
+        const id = rawId || `call_${d.step_index ?? 'step'}_${idx}`;
         pendingTools.push({ id, name: toolName });
         let argsStr = '';
         if (typeof tc.args === 'string') {

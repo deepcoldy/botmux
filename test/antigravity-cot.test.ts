@@ -15,6 +15,18 @@ import * as jsonlCursor from '../src/services/jsonl-cursor.js';
 import { jsonl, writeAntigravityTwoLogs } from './helpers/antigravity-two-logs.js';
 
 describe('antigravity-cot', () => {
+  // The worker only keeps tool entries with string ids (they pair a call with
+  // its result): a numeric id is kept as its string, any other id falls back.
+  it('keeps a numeric tool call id as a string and replaces a non-scalar one', () => {
+    const pending: { id: string; name: string }[] = [];
+    const entries = extractAntigravityCotEntriesFromRecord({
+      step_index: 9, source: 'MODEL', type: 'PLANNER_RESPONSE',
+      tool_calls: [{ id: 42, name: 'run_command', args: {} }, { id: { v: 1 }, name: 'run_command', args: {} }],
+    }, pending);
+    expect(entries.map(e => (e as { id: string }).id)).toEqual(['42', 'call_9_1']);
+    expect(pending.map(p => p.id)).toEqual(['42', 'call_9_1']);
+  });
+
   let tmpDir: string;
 
   beforeEach(() => {
