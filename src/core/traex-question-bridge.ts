@@ -342,7 +342,14 @@ export class TraexQuestionBridge {
   }
 
   private onResult(card: OpenCard, result: AskResult): void {
-    if (this.card !== card || card.controller.signal.aborted) return;
+    if (this.card !== card || card.controller.signal.aborted) {
+      if (result.kind === 'answered' && card.page.delivery === 'async' && this.deps.runAnswer) {
+        void this.deps.runAnswer(card.page, result, async () => false).catch(error => {
+          this.deps.log(`TraeX native answer cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+        });
+      }
+      return;
+    }
     if (result.kind !== 'answered') {
       this.card = undefined;
       this.settled.set(card.signature, card.lifetime);
@@ -356,14 +363,14 @@ export class TraexQuestionBridge {
       return;
     }
     const answer = traexQuestionAnswerFromAsk(card.page, result);
-    if (typeof answer === 'string') {
-      this.card = undefined;
-      this.notWritten(card, answer, 'failed');
-      this.kick();
-      return;
-    }
     card.answering = true;
-    const write = () => this.enter(card, answer);
+    const write = async () => {
+      if (typeof answer === 'string') {
+        this.notWritten(card, answer, 'failed');
+        return false;
+      }
+      return this.enter(card, answer);
+    };
     void (this.deps.runAnswer ? this.deps.runAnswer(card.page, result, write) : write()).catch(error => {
       this.notWritten(card, error instanceof Error ? error.message : String(error), 'failed');
     }).finally(() => {

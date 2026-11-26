@@ -24092,11 +24092,16 @@ function prepareTraexNativeAnswer(): boolean {
   return true;
 }
 
-async function runTraexNativeAnswer(page: TraexQuestionPage, result: AskResult, write: () => Promise<boolean | undefined>): Promise<void> {
-  const input = traexNativeAnswerInputs.get(result);
+async function runTraexNativeAnswer(
+  page: TraexQuestionPage,
+  result: AskResult | undefined,
+  write: () => Promise<boolean | undefined>,
+  admittedInput?: TraexNativeAnswerInput,
+): Promise<void> {
+  const input = admittedInput ?? (result ? traexNativeAnswerInputs.get(result) : undefined);
   if (page.delivery !== 'async') { await write(); return; }
   if (!input) throw new Error('Native question answer admission unavailable');
-  traexNativeAnswerInputs.delete(result);
+  if (result) traexNativeAnswerInputs.delete(result);
   const submission = { input, prepared: false, written: undefined as boolean | undefined };
   const run = async (): Promise<void> => {
     traexNativeAnswerSubmission = submission;
@@ -24140,8 +24145,12 @@ const traexQuestionBridge = new TraexQuestionBridge({
     const cfg = lastInitConfig;
     if (!cfg) return Promise.reject(new Error('session not initialised'));
     const requestId = page?.delivery === 'async' ? randomUUID() : undefined;
+    let admittedInput: TraexNativeAnswerInput | undefined;
+    let answerHandedOff = false;
     let resolveAdmission: ((input?: TraexNativeAnswerInput) => void) | undefined;
-    const admitted = requestId ? new Promise<TraexNativeAnswerInput | undefined>(resolve => { resolveAdmission = resolve; }) : undefined;
+    const admitted = requestId ? new Promise<TraexNativeAnswerInput | undefined>(resolve => {
+      resolveAdmission = input => { if (input) admittedInput = input; resolve(input); };
+    }) : undefined;
     const abort = () => resolveAdmission?.();
     if (requestId) {
       traexNativeAnswerAdmissions.set(requestId, resolveAdmission!);
@@ -24165,12 +24174,19 @@ const traexQuestionBridge = new TraexQuestionBridge({
         const input = await admitted;
         if (!input) throw new Error('Native question answer admission unavailable');
         traexNativeAnswerInputs.set(result, input);
+        answerHandedOff = true;
       }
       return result;
     } finally {
       if (timer) clearTimeout(timer);
       signal.removeEventListener('abort', abort);
       if (requestId) traexNativeAnswerAdmissions.delete(requestId);
+      // The daemon can commit the native answer before its HTTP response returns.
+      // If abort or transport failure prevents the bridge handoff, retire it through
+      // the same answer lifecycle without writing to a withdrawn question page.
+      if (page && admittedInput && !answerHandedOff) {
+        await runTraexNativeAnswer(page, undefined, async () => false, admittedInput);
+      }
     }
   },
   runAnswer: runTraexNativeAnswer,

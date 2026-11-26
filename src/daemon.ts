@@ -12450,6 +12450,9 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
         : askSession.session.rootMessageId,
     });
   }
+  if (boundAsk.originKind === NATIVE_STANDALONE_ASK_ORIGIN && !boundAsk.requestId) {
+    return jsonRes(res, 409, { ok: false, error: 'native_question_request_required' });
+  }
   if (askSession?.session.vcMeetingReceiver) {
     // A meeting receiver ask would post a Lark card outside the managed action
     // ledger/provider-idempotency boundary. Durable replay could therefore

@@ -24,6 +24,7 @@ import { codexAsyncAnswerNeedsRawInput, codexAsyncAskOriginEligible } from '../s
 import * as sessionControllers from '../src/core/session-controller.js';
 import { SessionContractStore } from '../src/services/session-contract-store.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { NATIVE_STANDALONE_ASK_ORIGIN } from '../src/core/ask-types.js';
 
 // 执行 daemon.ts 里真实的 handleAskRequest，配真实 broker / 显式 ask 回执 / 飞书发卡器，
 // 只把飞书发送接口换成记录器：断言卡片实际发到哪、文字答复能否结算。
@@ -80,6 +81,7 @@ describe('chat-scope 会话里 ask 卡片跟随发起 turn 的冻结回复目标
       readJsonBody: async () => body,
       jsonRes: (_res: unknown, status: number, payload: unknown) => { responses.push({ status, payload }); },
       parseAskBody,
+      NATIVE_STANDALONE_ASK_ORIGIN,
       findActiveBySessionId: (id: string) => id === ds.session.sessionId ? ds : undefined,
       shouldReturnAskStartupNotReady: () => false,
       isTrustedHostIpcRequest: () => true,
@@ -168,6 +170,20 @@ describe('chat-scope 会话里 ask 卡片跟随发起 turn 的冻结回复目标
     } finally {
       lookup.mockRestore(); store.close();
     }
+  });
+
+  it('rejects a standalone native question without a request identity before registering a card', async () => {
+    const ds = chatScopeSession({ status: 'active', workerGeneration: 1, cliId: 'traex' });
+    const { done, responses } = post(ds, askBody(TURN, {
+      originKind: NATIVE_STANDALONE_ASK_ORIGIN,
+      requestId: undefined,
+    }));
+    await vi.waitFor(() => expect(responses.length + sent.length).toBeGreaterThan(0));
+    expect(responses).toHaveLength(1);
+    expect(responses[0]).toMatchObject({ status: 409, payload: { ok: false } });
+    expect(sent).toEqual([]);
+    expect(listPendingAsksByAnchor({ larkAppId: APP, chatId: CHAT, anchor: CHAT })).toEqual([]);
+    await done;
   });
 
   it('rejects a native question whose threadId does not match the live runtime', async () => {

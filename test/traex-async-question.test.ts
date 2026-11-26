@@ -348,7 +348,7 @@ describe('worker serialization guards for native question controls', () => {
   });
 });
 
-function answerLifecycleHarness() {
+function answerLifecycleHarness(questionKind: 'text' | 'choice' = 'text') {
   const queue = new CodexBridgeQueue();
   const inflight = new InflightInputTracker();
   const posted: string[] = [];
@@ -397,7 +397,8 @@ function answerLifecycleHarness() {
     if (final && accepted && fastFinal) { queue.ingest(nativeEvents()); scope.codexBridgeDrainAndMaybeEmit(); }
     return accepted;
   }, page, final));
-  h.questions.shift();
+  if (questionKind === 'choice') h.questions.pop();
+  else h.questions.shift();
   scope.traexQuestionCapture = async () => h.screen();
   const answer = result([], 'plain text');
   scope.traexNativeAnswerInputs.set(answer, { type: 'message', content: 'plain text', turnId: 'native-answer', atMostOnce: true });
@@ -456,6 +457,41 @@ describe('native asynchronous answer execution and reply ownership', () => {
     expect(f.queue.peek()).toHaveLength(0);
     expect(f.terminals).toEqual([{ status: 'failed', reason: 'native_question_not_submitted' }]);
     expect(f.posted).toEqual([]);
+    f.h.bridge.dispose();
+  });
+
+  it.each([
+    ['empty custom answer', { ...result([]), customAnswers: ['\x1b'] }],
+    ['native placeholder', result([], 'Other')],
+    ['unknown option key', result(['missing'])],
+    ['empty selection', result([])],
+    ['multiple options for a single-choice question', result(['1', '2'])],
+    ['option plus note', { ...result(['1']), notes: ['请附日志'] }],
+  ] as Array<[string, AskResult]>)('retires an admitted unenterable answer exactly once: %s', async (_name, answer) => {
+    const f = answerLifecycleHarness('choice'); await f.open();
+    f.scope.traexNativeAnswerInputs.set(answer, { type: 'message', content: 'plain text', turnId: 'native-answer', atMostOnce: true });
+    f.h.asks[0]!.answer(answer);
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect(f.h.inputs.filter(x => x === 'Enter')).toHaveLength(0);
+    expect(f.scope.traexNativeAnswerInputs.get(answer)).toBeUndefined();
+    expect(f.queue.peek()).toHaveLength(0);
+    expect(f.terminals).toEqual([{ status: 'failed', reason: 'native_question_not_submitted' }]);
+    expect(f.posted).toEqual([]);
+    f.inflight.onCliExit();
+    expect(f.inflight.takeCarryOver()).toEqual([]);
+    f.h.bridge.dispose();
+  });
+
+  it('submits an enterable option through the same native lifecycle', async () => {
+    const f = answerLifecycleHarness('choice'); await f.open();
+    const answer = result(['1']);
+    f.scope.traexNativeAnswerInputs.set(answer, { type: 'message', content: 'Alpha', turnId: 'native-answer', atMostOnce: true });
+    f.h.asks[0]!.answer(answer);
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(f.h.inputs.filter(x => x === 'Enter')).toHaveLength(1);
+    expect(f.scope.traexNativeAnswerInputs.get(answer)).toBeUndefined();
+    expect(f.terminals).toEqual([]);
+    expect(f.queue.peek()).toHaveLength(1);
     f.h.bridge.dispose();
   });
 
