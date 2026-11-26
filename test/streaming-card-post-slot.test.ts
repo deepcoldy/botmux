@@ -310,7 +310,8 @@ describe('streaming-card-post-slot pure UUID & state machine', () => {
     expect(manual3Retry2.reused).toBe(true);
     expect(manual3Retry2.slot.uuid).toBe(manual3.slot.uuid);
 
-    // Legacy migration: per-retireMessageId slots, FIFO capped at MAX_LEGACY_MIGRATION_SLOTS
+    // Legacy migration: unresolved commit-unknown slots are never evicted, even
+    // when retaining them temporarily exceeds the soft capacity limit.
     const firstLegacy = acquireLegacyMigrationStreamingCardPostSlot(ds, {
       ...turnInput,
       retireMessageId: 'om_legacy_0',
@@ -331,12 +332,31 @@ describe('streaming-card-post-slot pure UUID & state machine', () => {
       });
       recordStreamingCardPostFailure(ds, slot.slot, err500, hashStreamingCardBody(`l${i}`), 'idle');
     }
-    // om_legacy_0 was evicted when slot #9 was inserted
-    const evictedRetry = acquireLegacyMigrationStreamingCardPostSlot(ds, {
+    const preservedRetry = acquireLegacyMigrationStreamingCardPostSlot(ds, {
       ...turnInput,
       retireMessageId: 'om_legacy_0',
     });
-    expect(evictedRetry.reused).toBe(false);
+    expect(preservedRetry.reused).toBe(true);
+    expect(preservedRetry.slot.uuid).toBe(firstLegacy.slot.uuid);
+
+    // On a separate session, clean slots still use bounded FIFO eviction.
+    const cleanDs = makeSession();
+    const cleanFirst = acquireLegacyMigrationStreamingCardPostSlot(cleanDs, {
+      ...turnInput,
+      retireMessageId: 'om_legacy_0',
+    });
+    for (let i = 1; i <= MAX_LEGACY_MIGRATION_SLOTS; i++) {
+      acquireLegacyMigrationStreamingCardPostSlot(cleanDs, {
+        ...turnInput,
+        retireMessageId: `om_legacy_${i}`,
+      });
+    }
+    const evictedCleanRetry = acquireLegacyMigrationStreamingCardPostSlot(cleanDs, {
+      ...turnInput,
+      retireMessageId: 'om_legacy_0',
+    });
+    expect(evictedCleanRetry.reused).toBe(false);
+    expect(evictedCleanRetry.slot.uuid).not.toBe(cleanFirst.slot.uuid);
 
     // Resume slot: reuses after commit_unknown for same staleCardId
     const res1 = acquireResumeStreamingCardPostSlot(ds, {

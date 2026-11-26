@@ -519,10 +519,20 @@ export function acquireLegacyMigrationStreamingCardPostSlot(
   if (existing) {
     map.delete(input.retireMessageId);
   }
+  // This is a soft cap for clean slots. Never evict an unresolved
+  // commit-unknown slot: its UUID is the only way to recover the message that
+  // Feishu may already have committed. If every retained slot is unresolved,
+  // temporarily exceed the cap until a later success/retirement releases them.
   while (map.size >= MAX_LEGACY_MIGRATION_SLOTS) {
-    const oldestKey = map.keys().next().value;
-    if (oldestKey === undefined) break;
-    map.delete(oldestKey);
+    let oldestCleanKey: string | undefined;
+    for (const [key, candidate] of map) {
+      if (!hasUnknownOutcomeHistory(candidate)) {
+        oldestCleanKey = key;
+        break;
+      }
+    }
+    if (oldestCleanKey === undefined) break;
+    map.delete(oldestCleanKey);
   }
 
   const slotToken = (gen?.nextSlotToken ?? defaultNextSlotToken)();

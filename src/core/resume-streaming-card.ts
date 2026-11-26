@@ -144,7 +144,7 @@ export async function reconcileResumedStreamingCard(
   if (freshCardId) {
     const latestCardJson = buildStreamingCardJson(ds);
     if (dedupStale || hashStreamingCardBody(latestCardJson) !== bodyHash) {
-      scheduleCardPatch(ds, latestCardJson);
+      scheduleCardPatch(ds, latestCardJson, undefined, { dedupRetry: { retryIndex: 0 } });
     }
     continuePublishedStreamingCardPinChain(ds, freshCardId, priorCardId ? [priorCardId] : []);
   }

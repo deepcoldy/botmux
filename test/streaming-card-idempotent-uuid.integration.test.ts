@@ -849,6 +849,41 @@ describe('streaming status card idempotent UUID (real worker-pool + daemon sessi
     expect(reopenedUuid).not.toBe(firstResumeAttempt.uuid);
   });
 
+  it('retries a failed resume dedup reconciliation PATCH with the shared bounded backoff', async () => {
+    vi.useFakeTimers();
+    try {
+      const ds = makeDs({ scope: 'thread', rootMessageId: 'om_resume_patch_retry_root' });
+      ds.streamCardId = 'om_closed_card';
+      ds.lastScreenStatus = 'idle';
+      let failResume = true;
+      sim.nextPostMode = () => (failResume ? '500_commit' : 'ok');
+      const postCard = (cardJson: string, uuid?: string) =>
+        sessionReply('om_resume_patch_retry_root', cardJson, 'interactive', APP, undefined, uuid ? { uuid } : undefined);
+      await expect(reconcileResumedStreamingCard(ds, 'om_closed_card', postCard)).rejects.toThrow();
+
+      failResume = false;
+      ds.currentTurnTitle = 'updated-after-resume';
+      sim.nextPatchMode = () => '500_fail';
+      const committed = await reconcileResumedStreamingCard(ds, 'om_closed_card', postCard);
+      expect(committed).toMatchObject({ status: 'committed', reposted: true });
+      await vi.advanceTimersByTimeAsync(100);
+      const failedPatchCalls = mocks.patch.mock.calls.length;
+      expect(failedPatchCalls).toBeGreaterThan(0);
+
+      sim.nextPatchMode = () => 'ok';
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(mocks.patch.mock.calls.length).toBeGreaterThan(failedPatchCalls);
+      const messageId = ds.streamCardId!;
+      expect(sim.byId.get(messageId)?.content).toContain('updated-after-resume');
+
+      const deliveredPatchCalls = mocks.patch.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(mocks.patch.mock.calls.length).toBe(deliveredPatchCalls);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('retains commit-unknown slot when a worker exits mid-POST under HTTP 500 so replacement worker dedups with zero orphan cards', async () => {
     const ds = makeDs({ scope: 'thread', rootMessageId: 'om_root_worker_swap' });
     const worker1 = createFakeWorker();
@@ -889,6 +924,31 @@ describe('streaming status card idempotent UUID (real worker-pool + daemon sessi
     expect(attempt2.cardNonce).toBe(attempt1.cardNonce);
     expect(sim.byId.size).toBe(1);
     expect(ds.streamCardId).toBe(attempt1.messageId);
+  });
+
+  it('falls through to a fresh ready card when the restored-card PATCH rejects deterministically', async () => {
+    const ds = makeDs({ scope: 'thread', rootMessageId: 'om_root_reuse_400' });
+    ds.currentTurnId = 'om_turn_r400_replacement';
+    ds.streamCardPending = true;
+    ds.streamCardPendingTurnId = 'om_turn_r400_replacement';
+    expect(await postTurnStartingCard(ds, sessionReply, 'om_turn_r400_replacement')).toBe(true);
+    const oldCard = ds.streamCardId!;
+
+    const worker = createFakeWorker();
+    ds.worker = worker as any;
+    ds.workerReady = false;
+    ds.workerGeneration = 2;
+    ds.session.workerGeneration = 2;
+    setupWorkerHandlers(ds, worker as any, undefined, 2);
+    mocks.patch.mockRejectedValueOnce(makeAxios400Deterministic());
+    const attemptsBefore = sim.wireAttempts.length;
+    worker.emit('message', { type: 'ready', port: 9122, token: 'tok_r400_replacement' });
+    await flush();
+
+    expect(ds.streamCardId).toBeTruthy();
+    expect(ds.streamCardId).not.toBe(oldCard);
+    expect(sim.wireAttempts.length).toBe(attemptsBefore + 1);
+    expect(sim.wireAttempts.at(-1)!.uuid).toMatch(/^sc_t_[0-9a-f]{32}$/);
   });
 
   it('keeps existing live card on case ready transient reuse-PATCH 500 and parks expired 230031 card for recall', async () => {
@@ -1079,6 +1139,120 @@ describe('streaming status card idempotent UUID (real worker-pool + daemon sessi
     worker.emit('message', { type: 'screen_update', content: 'stopped', status: 'idle', turnId: 'om_turn_cancel' });
     await flush();
     expect(extractCardTemplate(sim.byId.get(ds.streamCardId!)!.content)).toBe(STREAM_STATUS_TEMPLATE_MAP.interrupted);
+  });
+
+  async function expectTerminalDedupPatchRetry(terminalStatus: 'cancelled' | 'completed'): Promise<void> {
+    vi.useFakeTimers();
+    try {
+      const turnId = `om_turn_${terminalStatus}_dedup_retry`;
+      const ds = makeDs({ scope: 'thread', rootMessageId: `om_root_${terminalStatus}_dedup_retry` });
+      const worker = createFakeWorker();
+      ds.worker = worker as any;
+      ds.workerGeneration = 1;
+      ds.session.workerGeneration = 1;
+      setupWorkerHandlers(ds, worker as any, undefined, 1);
+      ds.currentTurnId = turnId;
+      ds.streamCardPending = true;
+      ds.streamCardPendingTurnId = turnId;
+      ds.streamCardTurnGeneration = 1;
+
+      sim.nextPostMode = () => '500_commit';
+      expect(await postTurnStartingCard(ds, sessionReply, turnId)).toBe(false);
+      worker.emit('message', {
+        type: 'turn_terminal', sessionId: ds.session.sessionId, turnId, status: terminalStatus,
+      });
+      await vi.advanceTimersByTimeAsync(0);
+
+      sim.nextPostMode = () => 'ok';
+      sim.nextPatchMode = () => '500_fail';
+      // Force a divergent body so the deduplicated POST must reconcile the
+      // original starting card rather than merely accepting its message id.
+      ds.currentTurnTitle = `${terminalStatus}-updated-after-unknown`;
+      if (terminalStatus === 'cancelled') {
+        worker.emit('message', { type: 'screen_update', content: 'stopped', status: 'idle', turnId });
+      } else {
+        // A busy post-terminal frame would be discarded as stale. Retry the
+        // starting-card entry directly so completed takes the late-publication
+        // settleStaleBusyCardStatus path rather than the ordinary live-frame path.
+        expect(await postTurnStartingCard(ds, sessionReply, turnId)).toBe(true);
+      }
+      await vi.advanceTimersByTimeAsync(100);
+      const failedPatchCalls = mocks.patch.mock.calls.length;
+      expect(failedPatchCalls).toBeGreaterThan(0);
+
+      sim.nextPatchMode = () => 'ok';
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(mocks.patch.mock.calls.length).toBeGreaterThan(failedPatchCalls);
+      const expectedTemplate = terminalStatus === 'cancelled'
+        ? STREAM_STATUS_TEMPLATE_MAP.interrupted
+        : STREAM_STATUS_TEMPLATE_MAP.idle;
+      expect(extractCardTemplate(sim.byId.get(ds.streamCardId!)!.content)).toBe(expectedTemplate);
+
+      const deliveredPatchCalls = mocks.patch.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(mocks.patch.mock.calls.length).toBe(deliveredPatchCalls);
+    } finally {
+      vi.useRealTimers();
+    }
+  }
+
+  it('retries a failed cancelled-terminal dedup PATCH with the shared bounded backoff', async () => {
+    await expectTerminalDedupPatchRetry('cancelled');
+  });
+
+  it('retries a failed completed-terminal dedup PATCH with the shared bounded backoff', async () => {
+    await expectTerminalDedupPatchRetry('completed');
+  });
+
+  it('suppresses a cancelled-terminal dedup retry after a newer working revision', async () => {
+    vi.useFakeTimers();
+    try {
+      const turnId = 'om_turn_cancelled_retry_superseded';
+      const ds = makeDs({ scope: 'thread', rootMessageId: 'om_root_cancelled_retry_superseded' });
+      const worker = createFakeWorker();
+      ds.worker = worker as any;
+      ds.workerGeneration = 1;
+      ds.session.workerGeneration = 1;
+      setupWorkerHandlers(ds, worker as any, undefined, 1);
+      ds.currentTurnId = turnId;
+      ds.streamCardPending = true;
+      ds.streamCardPendingTurnId = turnId;
+      ds.streamCardTurnGeneration = 1;
+
+      sim.nextPostMode = () => '500_commit';
+      expect(await postTurnStartingCard(ds, sessionReply, turnId)).toBe(false);
+      worker.emit('message', {
+        type: 'turn_terminal', sessionId: ds.session.sessionId, turnId, status: 'cancelled',
+      });
+      await vi.advanceTimersByTimeAsync(0);
+
+      sim.nextPostMode = () => 'ok';
+      sim.nextPatchMode = () => '500_fail';
+      ds.currentTurnTitle = 'cancelled-diverged-body';
+      worker.emit('message', { type: 'screen_update', content: 'stopped', status: 'idle', turnId });
+      await vi.advanceTimersByTimeAsync(100);
+      const interruptedPatchCalls = mocks.patch.mock.calls.length;
+      expect(interruptedPatchCalls).toBeGreaterThan(0);
+
+      // A newer working frame owns the card and bumps the render revision. Its
+      // PATCH also fails, so it must not clear the older dedup retry by accident.
+      worker.emit('message', { type: 'screen_update', content: 'resumed', status: 'working', turnId });
+      await vi.advanceTimersByTimeAsync(100);
+      const workingPatchCalls = mocks.patch.mock.calls.length;
+      expect(workingPatchCalls).toBeGreaterThan(interruptedPatchCalls);
+
+      sim.nextPatchMode = () => 'ok';
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(mocks.patch.mock.calls.length).toBe(workingPatchCalls);
+
+      // The current live state remains retryable by a fresh frame even though
+      // the obsolete terminal retry was suppressed.
+      worker.emit('message', { type: 'screen_update', content: 'resumed', status: 'working', turnId });
+      await vi.advanceTimersByTimeAsync(100);
+      expect(extractCardTemplate(sim.byId.get(ds.streamCardId!)!.content)).toBe(STREAM_STATUS_TEMPLATE_MAP.working);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('guards postFreshStreamingCard against silent listener sessions and does not cascade postTurnStartingCard after ownership loss on catch', async () => {

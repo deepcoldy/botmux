@@ -7846,6 +7846,7 @@ function settleStaleBusyCardStatus(
   requireLiveWorker: boolean,
   ownsWorker?: () => boolean,
   startingCardPublished?: boolean,
+  dedupRetry?: { retryIndex?: number },
 ): boolean {
   try {
     if (!ownsSettleTarget(ds, requireLiveWorker, ownsWorker)) return false;
@@ -7889,15 +7890,19 @@ function settleStaleBusyCardStatus(
     };
     postTerminalCardSettles.set(ds, receipt);
     const terminalAttempt = ds.lastTurnTerminalDispatchAttempt;
+    const ownsPatch = (): boolean => ownsSettleTarget(ds, requireLiveWorker, ownsWorker)
+      && ds.lastTurnTerminalStatus === 'completed'
+      && ds.lastTurnTerminalTurnId === turnId
+      && ds.lastTurnTerminalDispatchAttempt === terminalAttempt
+      && receipt.revision === (ds.streamCardStatusRevision ?? 0)
+      && !hasUnsettledAcceptedInput(ds) && !ds.usageLimit
+      && (ds.backgroundTaskCount ?? 0) === 0;
     const accepted = scheduleCardPatch(ds, cardJson, turnId, {
       visibleStatus: 'idle',
-      owns: () => ownsSettleTarget(ds, requireLiveWorker, ownsWorker)
-        && ds.lastTurnTerminalStatus === 'completed'
-        && ds.lastTurnTerminalTurnId === turnId
-        && ds.lastTurnTerminalDispatchAttempt === terminalAttempt
-        && receipt.revision === (ds.streamCardStatusRevision ?? 0)
-        && !hasUnsettledAcceptedInput(ds) && !ds.usageLimit
-        && (ds.backgroundTaskCount ?? 0) === 0,
+      owns: ownsPatch,
+      ...(dedupRetry
+        ? { dedupRetry: { retryIndex: dedupRetry.retryIndex ?? 0, statusOverride: 'idle' as const, owns: ownsPatch } }
+        : {}),
       onSettled: delivered => {
         receipt.pending = false;
         receipt.delivered = delivered;
@@ -8122,6 +8127,7 @@ function scheduleDedupReconcileRetry(
   cardId: string,
   turnId: string | undefined,
   retryIndex: number,
+  opts?: { statusOverride?: StreamStatus; owns?: () => boolean },
 ): void {
   if (retryIndex >= DEDUP_RECONCILE_RETRY_DELAYS_MS.length) return;
   const sessionAtSchedule = ds.session;
@@ -8136,8 +8142,14 @@ function scheduleDedupReconcileRetry(
     if (ds.streamCardId !== cardId || ds.streamCardNonce !== nonceAtSchedule || ds.streamCardPending) return;
     if (ds.workerGeneration !== workerGenAtSchedule) return;
     if (ds.pendingCardId === cardId || (ds.cardPatchInFlight && ds.cardPatchInFlightMessageId === cardId)) return;
-    const status = effectiveCardRenderStatus(ds, turnId);
-    reconcilePostedStartingCard(ds, turnId, -1, status, { retryOnFailure: true, retryIndex: retryIndex + 1 });
+    if (opts?.owns && !opts.owns()) return;
+    const status = opts?.statusOverride ?? effectiveCardRenderStatus(ds, turnId);
+    reconcilePostedStartingCard(ds, turnId, -1, status, {
+      retryOnFailure: true,
+      retryIndex: retryIndex + 1,
+      ...(opts?.statusOverride !== undefined ? { retryStatusOverride: opts.statusOverride } : {}),
+      ...(opts?.owns ? { owns: opts.owns } : {}),
+    });
   }, delayMs);
   timer.unref?.();
   dedupReconcileRetryTimers.set(ds, { cardId, timer });
@@ -8148,11 +8160,15 @@ function reconcilePostedStartingCard(
   turnId: string | undefined,
   revisionAtPost: number,
   statusOverride?: StreamStatus,
-  opts?: { retryOnFailure?: boolean; retryIndex?: number },
+  opts?: {
+    retryOnFailure?: boolean;
+    retryIndex?: number;
+    retryStatusOverride?: StreamStatus;
+    owns?: () => boolean;
+  },
 ): StreamStatus | undefined {
   if ((ds.streamCardStatusRevision ?? 0) === revisionAtPost) return undefined;
   if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || ds.streamCardPending) return undefined;
-  const targetCardId = ds.streamCardId;
   const botCfg = getBot(ds.larkAppId).config;
   const effectiveCliId = sessionCliId(ds, botCfg);
   const status = statusOverride
@@ -8188,16 +8204,13 @@ function reconcilePostedStartingCard(
   );
   scheduleCardPatch(ds, cardJson, turnId, {
     visibleStatus: status,
+    ...(opts?.owns ? { owns: opts.owns } : {}),
     ...(opts?.retryOnFailure
       ? {
-          onSettled: delivered => {
-            if (delivered) {
-              clearDedupReconcileRetryTimer(ds, targetCardId);
-              return;
-            }
-            if (ds.streamCardId !== targetCardId || ds.streamCardPending) return;
-            if (ds.pendingCardId === targetCardId || (ds.cardPatchInFlight && ds.cardPatchInFlightMessageId === targetCardId)) return;
-            scheduleDedupReconcileRetry(ds, targetCardId, turnId, opts.retryIndex ?? 0);
+          dedupRetry: {
+            retryIndex: opts.retryIndex ?? 0,
+            ...(opts.retryStatusOverride !== undefined ? { statusOverride: opts.retryStatusOverride } : {}),
+            ...(opts.owns ? { owns: opts.owns } : {}),
           },
         }
       : {}),
@@ -8329,6 +8342,7 @@ function startingCardTurnTerminalCurrent(ds: DaemonSession, turnId: string): boo
 function reconcilePublishedStartingCardTerminal(
   ds: DaemonSession,
   turnId: string,
+  opts?: { retryOnFailure?: boolean; retryIndex?: number },
 ): { terminalCurrent: boolean; settled: boolean } {
   const terminalStatus = ds.lastTurnTerminalStatus;
   if (!terminalStatus || !startingCardTurnTerminalCurrent(ds, turnId)) {
@@ -8356,18 +8370,44 @@ function reconcilePublishedStartingCardTerminal(
   if (terminalStatus === 'completed') {
     // The late starting render is itself proof of a busy display. Do not require
     // a worker frame to have populated lastScreenStatus before correcting it.
-    accepted = settleStaleBusyCardStatus(ds, turnId, 'late-starting-publication', false, undefined, true);
+    accepted = settleStaleBusyCardStatus(
+      ds,
+      turnId,
+      'late-starting-publication',
+      false,
+      undefined,
+      true,
+      opts?.retryOnFailure ? { retryIndex: opts.retryIndex ?? 0 } : undefined,
+    );
   } else {
     if (terminalStatus === 'failed' || terminalStatus === 'ambiguous') {
       ds.failedIdleTurnId = turnId;
       ds.completedIdleTurnId = undefined;
     }
     const terminalRenderStatus: StreamStatus = terminalStatus === 'cancelled' ? 'interrupted' : 'idle';
+    const ownsPatch = (): boolean => startingCardTurnTerminalCurrent(ds, turnId)
+      && ds.lastTurnTerminalStatus === terminalStatus
+      && ds.lastTurnTerminalDispatchAttempt === terminalAttempt;
+    // A terminal PATCH that failed may retry only while no newer render owns
+    // the card. Unlike the initial write, a delayed retry must also fence the
+    // render revision and current turn so a fixed terminal status can never
+    // overwrite a subsequent working frame from the same worker generation.
+    const revisionAtPost = ds.streamCardStatusRevision ?? 0;
+    const ownsRetry = (): boolean => ownsPatch()
+      && ds.currentTurnId === turnId
+      && (ds.streamCardStatusRevision ?? 0) === revisionAtPost;
     accepted = scheduleCardPatch(ds, buildStreamingCardJson(ds, terminalRenderStatus), turnId, {
       visibleStatus: terminalRenderStatus,
-      owns: () => startingCardTurnTerminalCurrent(ds, turnId)
-        && ds.lastTurnTerminalStatus === terminalStatus
-        && ds.lastTurnTerminalDispatchAttempt === terminalAttempt,
+      owns: ownsPatch,
+      ...(opts?.retryOnFailure
+        ? {
+            dedupRetry: {
+              retryIndex: opts.retryIndex ?? 0,
+              statusOverride: terminalRenderStatus,
+              owns: ownsRetry,
+            },
+          }
+        : {}),
     });
   }
   if (accepted) {
@@ -8481,7 +8521,7 @@ function reconcilePublishedStartingCard(
     && !(opts.status === 'limited' && ds.usageLimit)
     && !(opts.status === 'idle' && ds.lastTurnTerminalStatus === 'completed')
     && opts.status !== 'interrupted') {
-    const outcome = reconcilePublishedStartingCardTerminal(ds, turnId);
+    const outcome = reconcilePublishedStartingCardTerminal(ds, turnId, dedupRetryOpt);
     terminalCurrent = outcome.terminalCurrent;
     terminalSettled = outcome.settled;
     if (terminalSettled) {
@@ -9539,7 +9579,17 @@ export function scheduleCardPatch(
   ds: DaemonSession,
   cardJson: string,
   turnId?: string,
-  opts?: { userInitiated?: boolean; onSettled?: (delivered: boolean) => void; owns?: () => boolean; visibleStatus?: StreamStatus },
+  opts?: {
+    userInitiated?: boolean;
+    onSettled?: (delivered: boolean) => void;
+    owns?: () => boolean;
+    visibleStatus?: StreamStatus;
+    dedupRetry?: {
+      retryIndex?: number;
+      statusOverride?: StreamStatus;
+      owns?: () => boolean;
+    };
+  },
 ): boolean {
   // A late screen/config callback must not repaint a closed session as working.
   if (ds.session.status === 'closed') return false;
@@ -9555,10 +9605,27 @@ export function scheduleCardPatch(
   if (streamingCardDisabled(ds, turnId)) return false;
   const cardId = ds.streamCardId;
   if (!cardId || cardId === CARD_POSTING_SENTINEL) return false;
-  if (!opts?.onSettled) postTerminalCardSettles.delete(ds);
+  const userOnSettled = opts?.onSettled;
+  const dedupRetry = opts?.dedupRetry;
+  if (!userOnSettled && !dedupRetry) postTerminalCardSettles.delete(ds);
   pendingStreamingCardPatchSettlement.get(ds)?.(false);
   pendingStreamingCardPatchSettlement.delete(ds);
-  if (opts?.onSettled) pendingStreamingCardPatchSettlement.set(ds, opts.onSettled);
+  if (userOnSettled || dedupRetry) {
+    pendingStreamingCardPatchSettlement.set(ds, delivered => {
+      userOnSettled?.(delivered);
+      if (!dedupRetry) return;
+      if (delivered) {
+        clearDedupReconcileRetryTimer(ds, cardId);
+        return;
+      }
+      if (ds.streamCardId !== cardId || ds.streamCardPending) return;
+      if (ds.pendingCardId === cardId || (ds.cardPatchInFlight && ds.cardPatchInFlightMessageId === cardId)) return;
+      scheduleDedupReconcileRetry(ds, cardId, turnId, dedupRetry.retryIndex ?? 0, {
+        ...(dedupRetry.statusOverride !== undefined ? { statusOverride: dedupRetry.statusOverride } : {}),
+        ...(dedupRetry.owns ? { owns: dedupRetry.owns } : {}),
+      });
+    });
+  }
   const cardFence = captureStreamingCardPatchFence(ds, cardId, turnId);
   pendingStreamingCardPatchFence.set(ds, () => cardFence() && (!opts?.owns || opts.owns()));
   const resolvedVisibleStatus: StreamStatus | undefined = ds.cliStartupFailureReason
@@ -26172,8 +26239,11 @@ function setupWorkerHandlers(
             const isExpired = isMessageUpdateExpiredError(err);
             const isWithdrawn = patchDisposition.kind === 'withdrawn';
             const isTopicBlocked = patchDisposition.kind === 'topic_blocked';
+            const keepRestoredCard = patchDisposition.kind === 'commit_unknown'
+              || patchDisposition.kind === 'never_landed'
+              || patchDisposition.kind === 'topic_check_failed';
 
-            if (!isExpired && !isWithdrawn && !isTopicBlocked) {
+            if (keepRestoredCard && !isExpired && !isWithdrawn && !isTopicBlocked) {
               // Transient/unknown failure (HTTP 500/429/timeout, LarkCircuitOpenError,
               // TOPIC_SEND_CHECK_FAILED, etc.): keep the surviving live card reference so
               // subsequent screen_updates keep PATCHing it after recovery instead of
@@ -26205,7 +26275,7 @@ function setupWorkerHandlers(
               break;
             }
 
-            logger.info(`[${t}] Existing streaming card ${isExpired ? 'expired' : 'withdrawn'} (${err instanceof Error ? err.message : err}), posting new one`);
+            logger.info(`[${t}] Existing streaming card ${isExpired ? 'expired' : isWithdrawn ? 'withdrawn' : 'rejected'} (${err instanceof Error ? err.message : err}), posting new one`);
           }
         }
 
