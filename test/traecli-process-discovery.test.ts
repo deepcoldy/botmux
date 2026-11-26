@@ -10,6 +10,16 @@ vi.mock('node:os', () => {
   const actual = require('node:os') as typeof import('node:os');
   return { ...actual, platform: () => 'darwin' };
 });
+vi.mock('node:fs', () => {
+  const actual = require('node:fs') as typeof import('node:fs');
+  // Bun can preload discovery before the platform mock on Linux. Deny procfs
+  // explicitly so this BSD-protocol fixture never reads a real host PID 123.
+  return {
+    ...actual,
+    readFileSync: vi.fn(() => { throw new Error('procfs unavailable in BSD fixture'); }),
+    readlinkSync: vi.fn(() => { throw new Error('procfs unavailable in BSD fixture'); }),
+  };
+});
 
 import { execFileSync, execSync } from 'node:child_process';
 import { cliIdFromCommArgv, readComm } from '../src/core/session-discovery.js';
