@@ -53,6 +53,7 @@ import {
   readDashboardWorkbenchShell,
 } from './client-shell.js';
 import { dashboardLoginHref } from './auth-login.js';
+import { classifyFetchUnauthorized } from './fetch-auth-guard.js';
 import { ToastStack } from './toast.js';
 import { createHashChangeHandler } from './leave-guard.js';
 import { ConfirmModalRoot } from './confirm-modal.js';
@@ -1678,15 +1679,15 @@ window.fetch = async function patchedFetch(
 ): ReturnType<typeof fetch> {
   const res = await origFetch(...args);
   if (res.status === 401) {
-    // Management reads are intentionally outside an H5/platform Workbench
-    // identity's capability map. The server marks that expected narrow denial;
-    // an unmarked 401 still means the identity expired and opens the login UI.
-    if (res.headers.get('x-botmux-auth-scope') === 'workbench') return res;
-    const loginUrl = res.headers.get('x-botmux-login-url') ?? undefined;
-    const method = (args[1]?.method ?? 'GET').toUpperCase();
-    const isRead = method === 'GET' || method === 'HEAD';
-    if (loginUrl || (isRead && !publicReadOnly)) showAuthExpiredOverlay(loginUrl);
-    else showReadOnlyToast();
+    const action = classifyFetchUnauthorized({
+      input: args[0],
+      init: args[1],
+      response: res,
+      locationHref: window.location.href,
+      publicReadOnly,
+    });
+    if (action.kind === 'auth-expired') showAuthExpiredOverlay(action.loginUrl);
+    else if (action.kind === 'readonly-toast') showReadOnlyToast();
   }
   return res;
 };
