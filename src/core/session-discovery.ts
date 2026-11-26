@@ -448,7 +448,11 @@ function resolveTraeAliasComm(pid: number, comm: string): string {
   }
   if (!executable) {
     try {
-      const out = execFileSync('lsof', ['-n', '-P', '-a', '-p', String(pid), '-d', 'txt', '-Fn'], LSOF_EXEC_OPTIONS);
+      // -F fn: bare -Fn omits the structural `ftxt` field on real lsof
+      // (4.95.0 measured; upstream gates every field except `p` behind the
+      // selector), so f must be requested explicitly or the strict record
+      // check below can never match.
+      const out = execFileSync('lsof', ['-n', '-P', '-a', '-p', String(pid), '-d', 'txt', '-F', 'fn'], LSOF_EXEC_OPTIONS);
       // The first text record is the executable, followed by mapped libraries.
       // Never scan later mappings for a familiar basename or another pid.
       const lines = out.split('\n');

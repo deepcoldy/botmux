@@ -41,7 +41,7 @@ describe('macOS traecli process identity', () => {
       expect(cliIdFromCommArgv(comm, ['/opt/bin/traecli'], 'coco')).toBeUndefined();
       expect(isTraexProcess(123)).toBe(true);
       expect(execFileSync).toHaveBeenCalledWith(
-        'lsof', ['-n', '-P', '-a', '-p', '123', '-d', 'txt', '-Fn'], LSOF_EXEC_OPTIONS,
+        'lsof', ['-n', '-P', '-a', '-p', '123', '-d', 'txt', '-F', 'fn'], LSOF_EXEC_OPTIONS,
       );
       expect(LSOF_EXEC_OPTIONS.timeout).toBeGreaterThan(0);
     },
@@ -80,6 +80,24 @@ describe('macOS traecli process identity', () => {
     vi.mocked(execFileSync).mockImplementation(() => { throw new Error('inspection unavailable'); });
     expect(readComm(123)).toBe('traecli');
     expect(isTraexProcess(123)).toBe(false);
+  });
+
+  it('takes the first txt record from a real -F fn capture, ignoring later mappings', () => {
+    // Shape captured from lsof 4.95.0 with `-F fn` (a second txt mapping,
+    // e.g. the Darwin dynamic linker, must never override the executable).
+    vi.mocked(execFileSync).mockReturnValue('p123\nftxt\nn/opt/traex\nftxt\nn/usr/lib/dyld\n');
+    expect(readComm(123)).toBe('traex');
+  });
+
+  it('cannot read identity from the bare -Fn shape, which omits the structural ftxt record', () => {
+    // Real lsof (4.95.0 measured) prints only `p`/`n` under bare -Fn: the f
+    // field is emitted only when requested. This guards the -F fn argv: if the
+    // selector regresses to -Fn, the strict record check fails closed and the
+    // legacy alias is retained instead of misreading the first n line blindly.
+    vi.mocked(execFileSync).mockReturnValue('p123\nn/opt/traex\n');
+    expect(readComm(123)).toBe('traecli');
+    const argv = vi.mocked(execFileSync).mock.calls.at(-1)![1]!;
+    expect(argv).toContain('fn');
   });
 
   it('does not probe the executable or guess a name when ps cannot read the process', () => {
