@@ -1,5 +1,5 @@
 import { normalizeSessionTitle } from './session-board.js';
-import { stripBotmuxDisplayBlocks } from '../utils/prompt-display-strip.js';
+import { stripBotmuxEnvelopeBlocks, unwrapBotmuxTaskTags } from '../utils/prompt-display-strip.js';
 
 export function stripLeadingKnownTitleMentions(raw: string, mentions?: readonly { name: string }[]): string {
   let content = raw.trimStart();
@@ -19,7 +19,8 @@ export function stripLeadingKnownTitleMentions(raw: string, mentions?: readonly 
 
 function normalizedInput(raw: unknown, mentions?: readonly { name: string }[]): string {
   if (typeof raw !== 'string') return '';
-  const text = raw.match(/<user_message>\s*([\s\S]*?)\s*<\/user_message>/)?.[1] ?? stripBotmuxDisplayBlocks(raw);
+  const text = raw.match(/<user_message>\s*([\s\S]*?)\s*<\/user_message>/)?.[1]
+    ?? unwrapBotmuxTaskTags(stripBotmuxEnvelopeBlocks(raw, { replacement: ' ' }));
   return stripLeadingKnownTitleMentions(text.replace(/^\s*\[用户引用了消息[^\n]*\]\s*$/gm, '')
     .replace(/^\s*\[来自[^\n]*@mention[^\n]*\]\s*$/gm, '')
     .replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ').replace(/\s+/g, ' '), mentions).trim();

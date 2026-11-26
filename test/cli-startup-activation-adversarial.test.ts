@@ -197,6 +197,20 @@ describe('raw activation admission: SQLite boundaries and human intervention', (
     expect(pool.hasQueuedActivationAdmissionGate(h.ds)).toBe(true);
     expect(h.ds.pendingRawInput).toBe('/goal exact raw opening');
   });
+  it('preserves a Claude hook envelope through gated input, SQLite tail and promotion', () => {
+    const h = parked();
+    const envelope = '<botmux_reminder>QUEUED_ACTIVATION_ENVELOPE</botmux_reminder>';
+    expect(pool.sendWorkerInput(h.ds, { content: 'raw task', hookEnvelope: envelope }, 'om_hook_tail')).toBe(true);
+    const staged = h.disk().queuedActivationTail?.find(entry => entry.turnId === 'om_hook_tail');
+    expect(staged?.cliInput.content).toBe('raw task');
+    expect(staged?.cliInput.hookEnvelope).toBe(envelope);
+
+    h.ds.session.queuedActivationPending = false;
+    h.ds.session.queuedActivationInput = undefined;
+    expect(pool.promoteQueuedActivationTail(h.ds, { send: false })).toBe(true);
+    expect(h.disk().queuedActivationInput?.content).toBe('raw task');
+    expect(h.disk().queuedActivationInput?.hookEnvelope).toBe(envelope);
+  });
 });
 
 describe('worker raw activation: circuit, cancellation and asynchronous boundaries', () => {
