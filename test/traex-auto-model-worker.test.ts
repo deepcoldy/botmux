@@ -316,6 +316,11 @@ describe('auto-model Worker admission and original-input retirement', () => {
         decideSessionRenameSettlement,
       });
       h.scope.forceClearSessionRenameInFlight = loadWorkerFunction('forceClearSessionRenameInFlight', h.scope);
+      Object.assign(h.scope, {
+        idleDetector: { programStatusHeldBusy: () => false, adoptPromptReady: vi.fn() },
+        programStatusBlockedHoldsTypeAhead: () => false,
+      });
+      h.scope.restoreSessionRenameReadiness = loadWorkerFunction('restoreSessionRenameReadiness', h.scope);
       h.scope.settleSessionRename = loadWorkerFunction('settleSessionRename', h.scope);
       expect(h.scope.activeTurnAuthority.snapshot()).toMatchObject({ turnId: 'turn', started: true });
       loadWorkerFunction<() => void>('armSessionRenameIdleTimeout', h.scope)();

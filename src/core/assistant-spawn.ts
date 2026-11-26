@@ -18,6 +18,40 @@ export type AssistantSpawn =
   | { kind: 'owner'; openId: string; workDir: string }
   | { kind: 'unclaimed' };
 
+/** bot 处于助理模式且不允许多人群（assistantGroupChat 没开）：群里真人超过 1 个时不工作。 */
+export function assistantMultiUserGroupsOff(larkAppId: string): boolean {
+  let cfg: BotConfig;
+  try { cfg = getBot(larkAppId).config; } catch { return false; }
+  return cfg.assistantMode === true && cfg.assistantGroupChat !== true;
+}
+
+export type AssistantSoloGroupAdmission =
+  | { ok: true; ownerOpenId: string }
+  | { ok: false; reason: 'multi_user' | 'unclaimed' | 'owner_absent' | 'lookup_failed'; ownerOpenId?: string };
+
+/**
+ * 不允许多人群时，群里能不能用主人的目录干活：现拉成员列表（不含 bot），去重后恰好一个真人、
+ * 且就是登记的主人才放行；拉不到按拒处理。人数缓存只能用来提前拒，放行必须走这里。
+ */
+export async function assistantSoloGroupAdmission(larkAppId: string, chatId: string): Promise<AssistantSoloGroupAdmission> {
+  const owner = resolveAssistantOwnerOpenId({
+    chatType: 'group',
+    sessionGroupOwnerOpenId: getSessionGroup(chatId)?.ownerOpenId,
+    stored: getAssistantOwner(config.session.dataDir, larkAppId, chatId),
+  }) ?? undefined;
+  let members: string[];
+  try {
+    const { listChatMemberOpenIds } = await import('../im/lark/client.js');
+    members = [...new Set(await listChatMemberOpenIds(larkAppId, chatId))];
+  } catch {
+    return { ok: false, reason: 'lookup_failed', ownerOpenId: owner };
+  }
+  if (members.length !== 1) return { ok: false, reason: 'multi_user', ownerOpenId: owner };
+  if (!owner) return { ok: false, reason: 'unclaimed' };
+  if (members[0] !== owner) return { ok: false, reason: 'owner_absent', ownerOpenId: owner };
+  return { ok: true, ownerOpenId: owner };
+}
+
 export function resolveAssistantSpawn(
   larkAppId: string,
   chatId: string,
