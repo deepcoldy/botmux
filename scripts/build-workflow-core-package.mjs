@@ -109,6 +109,7 @@ function assertBundleInputsAllowed(metafile) {
     'src/utils/fs-durability.ts',
     'src/utils/logger.ts',
     'src/utils/process-identity.ts',
+    'src/utils/traex-runtime-env.ts', // leaf: TraeX env key constants, no imports
     'src/workflows/shared/idempotency-key.ts',
     'src/workflows/v3/artifact-contract.ts',
     'src/workflows/v3/artifact-contract-declarations.ts',

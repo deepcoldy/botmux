@@ -376,9 +376,11 @@ export function scrubSessionCliHomeEnv(env: NodeJS.ProcessEnv): void {
  * REDACTED_CHILD_ENV_KEYS so a server botmux bootstraps can never seed them
  * into its global env either.
  */
-export const TRAEX_OCCUPANT_ID_ENV_KEY = 'BOTMUX_TRAEX_OCCUPANT_ID';
-export const TRAEX_DOMAIN_KEY_ENV_KEY = 'BOTMUX_TRAEX_DOMAIN_KEY';
-export const TRAEX_SNAPSHOT_DIR_ENV_KEY = 'BOTMUX_TRAEX_SNAPSHOT_DIR';
+export {
+  TRAEX_OCCUPANT_ID_ENV_KEY,
+  TRAEX_DOMAIN_KEY_ENV_KEY,
+  TRAEX_SNAPSHOT_DIR_ENV_KEY,
+} from './traex-runtime-env.js';
 
 export const BOTMUX_INJECTED_ENV_KEYS = [
   '__OWNER_OPEN_ID',

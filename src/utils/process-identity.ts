@@ -3,7 +3,7 @@ import { existsSync, readdirSync, readFileSync, readlinkSync, realpathSync, stat
 import { basename, dirname, join } from 'node:path';
 
 import { procStatStartTime } from './proc-stat.js';
-import { TRAEX_DOMAIN_KEY_ENV_KEY, TRAEX_OCCUPANT_ID_ENV_KEY } from './child-env.js';
+import { TRAEX_DOMAIN_KEY_ENV_KEY, TRAEX_OCCUPANT_ID_ENV_KEY } from './traex-runtime-env.js';
 
 export interface TraexProcessOwnership {
   occupantId: string;
