@@ -58,10 +58,13 @@ const DEFAULT_RIFF_SYSTEM_PROMPT = [
  * so npm install works. Any user-configured setupCommands are appended AFTER
  * these mandatory commands.
  */
-/** riff（codex bridge）接受的思考等级档位——与服务端 shared/reasoningEffort 对齐。 */
+/** riff 接受的思考等级档位——与服务端 shared/reasoningEffort 对齐（codex 写入 model_reasoning_effort，claude 写入 CLAUDE_CODE_EFFORT_LEVEL）。 */
 export const RIFF_REASONING_EFFORTS = ['low', 'medium', 'high', 'xhigh'] as const;
 export const RIFF_SANDBOX_CLUSTERS = ['boe', 'cn'] as const;
 export type RiffSandboxCluster = typeof RIFF_SANDBOX_CLUSTERS[number];
+/** riff task-execute 支持的 harness / agent（与服务端 modelValidation 对齐；codex 默认，claude 支持 Claude Code 与 Gemini 4 强度）。 */
+export const RIFF_AGENTS = ['codex', 'claude'] as const;
+export type RiffAgent = typeof RIFF_AGENTS[number];
 
 const MANDATORY_SETUP_COMMANDS = [
   // Unconditional install/upgrade: a `which botmux` guard would skip the
@@ -82,12 +85,10 @@ export interface RiffBackendConfig {
   /** Worker-only dispatch factory. Never supplied by the Riff API or sandbox. */
   hostToolsBinding?: () => import('../../services/riff-host-tools.js').RiffHostBinding | undefined;
   templateId?: string;
-  /** @deprecated riff 服务端已收敛仅支持 codex（其它值 400）；本字段不再被读取，
-   *  任务一律以 agent=codex 创建。保留仅为兼容存量 bots.json。 */
+  /** riff task-execute 的执行引擎（`codex` 默认 / `claude`）。存量 bots.json 里的已下线值（如 `aiden`）会在运行时回落为 `codex`。 */
   agent?: string;
   model?: string;
-  /** codex 思考等级（low/medium/high/xhigh），写入沙箱 config.toml 的
-   *  model_reasoning_effort；留空走 riff 默认 medium。非法值静默丢弃。 */
+  /** 思考等级（low/medium/high/xhigh）：codex 写入沙箱 config.toml 的 model_reasoning_effort，claude 写入受控 flag settings 的 CLAUDE_CODE_EFFORT_LEVEL；留空走 riff 默认 medium。非法值静默丢弃。 */
   reasoningEffort?: string;
   /** Direct JWT token (takes precedence over jwtEnv). */
   jwt?: string;
@@ -238,6 +239,17 @@ export function isValidRiffHostToolsUrl(v: unknown): v is string {
 
 export function isValidRiffSandboxCluster(v: unknown): v is RiffSandboxCluster {
   return RIFF_SANDBOX_CLUSTERS.includes(v as RiffSandboxCluster);
+}
+
+export function isValidRiffAgent(v: unknown): v is RiffAgent {
+  return RIFF_AGENTS.includes(v as RiffAgent);
+}
+
+/** Resolve the effective Riff `config.agent` for `/api/task-execute`.
+ *  Configured `codex` / `claude` pass through; unset or legacy retired values
+ *  (e.g. `aiden` in older `bots.json`) fall back to `codex`. */
+export function resolveRiffAgent(v: unknown): RiffAgent {
+  return isValidRiffAgent(v) ? v : 'codex';
 }
 
 /** Valid `riff.jwtHome` for the spawn gate: an absolute path, OR a blank string.
@@ -1902,11 +1914,10 @@ export class RiffBackend implements SessionBackend {
     const url = `${this.config.baseUrl}/api/task-execute`;
 
     // riff task-execute body: origin at top level, prompt inside config.userPrompt
-    // agent 写死 codex：riff 服务端已下线其它 runner（aiden 等一律 400
-    // UNSUPPORTED_TASK_AGENT），配置项不再暴露。
+    // agent 支持 codex（默认）/ claude；存量已下线值（如 aiden）回落 codex，避免服务端 400。
     const config: Record<string, unknown> = {
       userPrompt: this.injectSystemPrompt(prompt),
-      agent: 'codex',
+      agent: resolveRiffAgent(this.config.agent),
     };
     if (this.config.model) config.model = this.config.model;
     if (RIFF_REASONING_EFFORTS.includes(this.config.reasoningEffort as typeof RIFF_REASONING_EFFORTS[number])) {

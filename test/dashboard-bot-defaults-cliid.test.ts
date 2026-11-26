@@ -2242,10 +2242,14 @@ describe('riff CLI switch persistence (PR #467 P1)', () => {
     // （DropdownField 是自定义组件：按组件 prop dataInput 定位并调用其 onChange）
     act(() => { root.findByProps({ dataInput: 'agentCliId' }).props.onChange('riff'); });
     expect(root.findAllByProps({ 'data-action': 'save-agent' })).toHaveLength(0);
-    // Agent 配置已下线：面板不得再渲染 riff-agent 输入框
-    expect(root.findAllByProps({ 'data-input': 'riff-agent' })).toHaveLength(0);
+    // Riff Agent 下拉默认 codex，支持切换到 claude；切到 claude 后模型建议列表同步切换。
+    expect(root.findByProps({ dataInput: 'riff-agent' }).props.value).toBe('codex');
+    act(() => { root.findByProps({ dataInput: 'riff-agent' }).props.onChange('claude'); });
+    const datalistOptions = root.findByType('datalist').findAllByType('option').map(o => o.props.value);
+    expect(datalistOptions).toContain('gemini-4-neon');
+    expect(datalistOptions).toContain('glm-5.3');
     // 运行环境选择 CN、思考等级选择 xhigh → 保存的 PUT /riff 必须一起携带
-    // sandboxCluster / reasoningEffort。
+    // sandboxCluster / agent / reasoningEffort。
     act(() => { root.findByProps({ dataInput: 'riff-sandbox-cluster' }).props.onChange('cn'); });
     act(() => { root.findByProps({ dataInput: 'riff-reasoning-effort' }).props.onChange('xhigh'); });
     const baseUrlInput = root.findByProps({ 'data-input': 'riff-base-url' });
@@ -2256,7 +2260,7 @@ describe('riff CLI switch persistence (PR #467 P1)', () => {
     const puts = requests.filter(r => r.method === 'PUT');
     expect(puts.map(r => r.url.split('/').pop())).toEqual(['riff', 'agent']);
     expect(puts[1]!.body).toEqual({ cliId: 'riff', model: '' });
-    expect(JSON.parse(puts[0]!.body.riff)).toMatchObject({ sandboxCluster: 'cn', reasoningEffort: 'xhigh' });
+    expect(JSON.parse(puts[0]!.body.riff)).toMatchObject({ sandboxCluster: 'cn', agent: 'claude', reasoningEffort: 'xhigh' });
   });
 
   it('resets the native-subagent editor from the authoritative Trae-to-Riff response', async () => {

@@ -367,4 +367,46 @@ describe('Riff worker session environment', () => {
       rmTree(root);
     }
   }, 25_000);
+
+  it('rejects unsupported riff.agent at the worker spawn gate before dispatch', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-riff-agent-'));
+    let outbound = 0;
+    const server = createServer((req, res) => {
+      if (req.method === 'POST' && (req.url === '/api/task-execute' || req.url === '/api/task-follow-up')) outbound++;
+      res.writeHead(404); res.end();
+    });
+    let child: ChildProcess | undefined;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const port = await listen(server);
+      const appId = 'cli_riff_bad_agent', botsPath = join(root, 'bots.json');
+      writeFileSync(botsPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'test-secret',
+        cliId: 'riff', backendType: 'riff', riff: { baseUrl: `http://127.0.0.1:${port}`, agent: 'bogus' } }]));
+      child = spawnTsScript(resolve('src/worker.ts'), [], { cwd: resolve('.'),
+        env: { ...process.env, HOME: root, SESSION_DATA_DIR: root, BOTS_CONFIG: botsPath,
+          BOTMUX_SESSION_ID: 'sid-riff-bad-agent', LARK_APP_ID: appId, LARK_APP_SECRET: 'test-secret' },
+        stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
+      const logs: string[] = [];
+      child.stdout!.on('data', chunk => logs.push(String(chunk)));
+      child.stderr!.on('data', chunk => logs.push(String(chunk)));
+      const error = new Promise<string>((resolvePromise, reject) => {
+        child!.on('message', (raw: WorkerToDaemon) => { if (raw.type === 'error') resolvePromise(raw.message); });
+        child!.once('error', reject);
+        child!.once('exit', () => reject(new Error(`worker exited before reporting config failure: ${logs.join('')}`)));
+        timeout = setTimeout(() => reject(new Error(`worker error timeout: ${logs.join('')}`)), 15_000);
+      });
+      child.send({ type: 'init', sessionId: 'sid-riff-bad-agent', chatId: 'oc_test', rootMessageId: 'om_root',
+        workingDir: root, cliId: 'riff', backendType: 'riff', larkAppId: appId, larkAppSecret: 'test-secret',
+        prompt: 'must not be dispatched', turnId: 'turn-bad-agent',
+        backendConfig: { baseUrl: `http://127.0.0.1:${port}`, jwt: 'test-jwt', agent: 'bogus' },
+      } satisfies DaemonToWorker);
+      expect(await error).toContain('riff agent 非法');
+      expect(outbound).toBe(0);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      await new Promise<void>(resolvePromise => server.close(() => resolvePromise()));
+      rmTree(root);
+    }
+  }, 25_000);
 });
