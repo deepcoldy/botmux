@@ -9,6 +9,7 @@ import { canInviterTalkToMeeting } from '../../services/vc-meeting-inviter-acces
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { normalizeCardActionData } from './card-action-data.js';
 import { logCardActionDiagnostics } from './card-action-diagnostics.js';
+import { createCardActionTimeProbe, type CardActionTimeProbeOptions } from './card-action-time-probe.js';
 import { createHash } from 'node:crypto';
 import { startLarkConnection, type LarkConnection } from './transport/connection.js';
 import { getBot, getAllBots, getBotOpenId, findOncallChat, getOwnerOpenId, loadBotConfigs, loadBotConfigsCached, vcMeetingAgentConfigActive, type BotConfig, type BotState, type SubstituteModeConfig } from '../../bot-registry.js';
@@ -5745,6 +5746,8 @@ export interface LarkEventDispatcherRuntime {
 }
 
 export interface LarkEventDispatcherRuntimeOptions {
+  /** Host-owned, offline/test-card-only observation; no production config switch. */
+  cardActionTimeProbe?: CardActionTimeProbeOptions;
   /** Realtime event ingress. In primary multi-replica mode every connected
    * Lark SDK client must be allowed to persist the event selected for it. */
   enqueuePrimary?: (input: {
@@ -5820,6 +5823,8 @@ export function createLarkEventDispatcherRuntime(
   durableInboxShadow?: DurableInboxStore,
   runtimeOptions: LarkEventDispatcherRuntimeOptions = {},
 ): LarkEventDispatcherRuntime {
+  const cardActionTimeProbe = runtimeOptions.cardActionTimeProbe
+    ? createCardActionTimeProbe(runtimeOptions.cardActionTimeProbe) : undefined;
   const forwardFollowups = new ForwardFollowupBuffer<PendingForwardTopicPayload>(
     config.daemon.forwardFollowupWaitMs,
     err => logger.error(`Error flushing delayed topic seed: ${err}`),
@@ -8096,6 +8101,7 @@ export function createLarkEventDispatcherRuntime(
     [VC_PARTICIPANT_MEETING_JOINED_EVENT]: (data: any) =>
       handleVcMeetingPushEventAckSafe(data, larkAppId, handlers, 'participant_meeting_joined', VC_PARTICIPANT_MEETING_JOINED_EVENT),
     'card.action.trigger': async (data: any) => {
+      cardActionTimeProbe?.observe(data);
       const normalized = normalizeCardActionData(data);
       logCardActionDiagnostics('dispatcher', data, normalized);
       data = normalized;
@@ -8389,7 +8395,8 @@ export function createLarkEventDispatcherRuntime(
           logger.info(`[ws-event] ${larkAppId} event_type=${et}`);
         }
       } catch { /* 诊断不阻断分发 */ }
-      return __origInvoke(data);
+      return cardActionTimeProbe
+        ? cardActionTimeProbe.invoke(data, __origInvoke) : __origInvoke(data);
     };
   }
 
