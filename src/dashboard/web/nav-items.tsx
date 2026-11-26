@@ -36,7 +36,7 @@ export const NAV_ITEMS: NavItem[] = [
     ),
   },
   { id: 'sessions', href: '#/sessions', labelKey: 'nav.sessions', aliases: ['对话', 'conversations', 'chats'], icon: <path d="M2 3.5h12v7H6l-3 3v-3H2z" /> },
-  // 决策看板：只有至少一个 Bot 设为管家时才出现在侧边栏（见 app.tsx 的 sidebarNavItems）。
+  // 决策看板：至少一个 Bot 设为管家时可在精简侧边栏自动浮现。
   // 不是 manage 项：飞书 H5 免登的 owner 也要能从侧边栏进来。
   {
     id: 'decision-board',
@@ -45,7 +45,7 @@ export const NAV_ITEMS: NavItem[] = [
     aliases: ['拍板', 'decisions'],
     icon: <><rect x="2.5" y="2" width="11" height="12" rx="1.8" /><path d="M5 5.6l1.1 1.1 2.1-2.1M5 10.4l1.1 1.1 2.1-2.1M9.9 5.7h1.6M9.9 10.5h1.6" /></>,
   },
-  // 任务分配：默认关闭，仅在全局设置开启「Bot 任务分配」后显示（见 app.tsx 的 sidebarNavItems）。
+  // 任务分配：在全局设置开启后可在精简侧边栏自动浮现。
   {
     id: 'task-routing',
     href: '#/assign',
@@ -134,7 +134,7 @@ export const NAV_GROUPS: Array<{ id: string; labelKey: string; items: string[] }
   { id: 'overview', labelKey: 'nav.group.overview', items: ['overview'] },
   { id: 'collab', labelKey: 'nav.group.collab', items: ['sessions', 'decision-board', 'task-routing', 'agent-workbench', 'groups', 'schedules', 'workflows'] },
   { id: 'workforce', labelKey: 'nav.group.workforce', items: ['roles', 'skills', 'customization', 'message-listeners', 'doc-watches', 'bot-defaults', 'agents'] },
-  { id: 'analytics', labelKey: 'nav.group.analytics', items: ['monitoring', 'insights', 'feedback'] },
+  { id: 'analytics', labelKey: 'nav.group.analytics', items: ['monitoring', 'insights', 'feedback', 'usage'] },
   { id: 'manage', labelKey: 'nav.group.manage', items: ['terminal', 'connectors', 'plugins', 'whiteboards', 'settings'] },
 ];
 
@@ -172,6 +172,3 @@ export const PALETTE_UNINDEXED_ROUTES: Readonly<Record<string, string>> = {
   'agent-workbench-dock': '桌面壳 / 沉浸式入口嵌入的驾驶舱界面，不是独立页面',
   'webhook-logs': '#/connectors/logs 的旧别名',
 };
-
-// Register Token usage in the analytics navigation group.
-NAV_GROUPS.find(group => group.id === 'analytics')?.items.push('usage');
