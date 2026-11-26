@@ -96,8 +96,8 @@ const CLI_COMM_MAP: Record<string, CliId> = {
   // 改写过；macOS 下 `ps -o comm=` 拿到的是真实 argv[0]，因此这里需要
   // 把别名 traecli 也识别成 coco，否则 /adopt 扫不到这种会话。
   traecli: 'coco',
-  // TRAE（traex）是另一套 Codex 系 CLI，可执行就叫 `traex`，与上面 CoCo 的
-  // traecli 别名是两个不同的二进制（traecli 是 coco 的软链）。
+  // 新 TRAE 也可能把进程标题改成 traecli。readComm 会用已加载的可执行文件
+  // 消解这个别名；没有可验证身份时仍保留上面的旧 CoCo 映射。
   traex: 'traex',
   opencode: 'opencode',
   opencode2: 'opencode2',
@@ -410,13 +410,15 @@ function shellescape(s: string): string {
  *
  * 注意 macOS 的 `ps -o comm=` 返回完整可执行路径（如 `/usr/local/bin/claude`），
  * 所以这里统一做一次 basename，让上层匹配 CLI_COMM_MAP 的逻辑保持不变。
+ * `traecli` 名称有歧义时，用进程已加载的文件核验为 traex / coco；读不到身份
+ * 或文件名未知则保持原名，不凭调用方的 CLI 筛选猜测。
  *
  * 返回 undefined 表示进程不存在或读不到。
  */
 export function readComm(pid: number): string | undefined {
   if (IS_LINUX) {
     try {
-      return readFileSync(`/proc/${pid}/comm`, 'utf-8').trim();
+      return resolveTraeAliasComm(pid, readFileSync(`/proc/${pid}/comm`, 'utf-8').trim());
     } catch {
       // 落到下面的 ps 兜底
     }
@@ -427,10 +429,36 @@ export function readComm(pid: number): string | undefined {
       stdio: ['pipe', 'pipe', 'pipe'],
     }).trim();
     if (!out) return undefined;
-    return out.includes('/') ? basename(out) : out;
+    return resolveTraeAliasComm(pid, out.includes('/') ? basename(out) : out);
   } catch {
     return undefined;
   }
+}
+
+/** `traecli` is a legacy CoCo alias AND a modern TRAE process title. Only the
+ * loaded executable can disambiguate them: argv[0] / the installation symlink
+ * can still carry the alias, or can have been retargeted since this pid started.
+ * Keep unknown identities on the legacy mapping; never choose a CLI merely
+ * because that is what the caller wants. No cache: a pid may be reused. */
+function resolveTraeAliasComm(pid: number, comm: string): string {
+  if ((comm.startsWith('.') ? comm.slice(1) : comm) !== 'traecli') return comm;
+  let executable: string | undefined;
+  if (IS_LINUX) {
+    try { executable = readlinkSync(`/proc/${pid}/exe`); } catch { /* fall back to lsof */ }
+  }
+  if (!executable) {
+    try {
+      const out = execFileSync('lsof', ['-n', '-P', '-a', '-p', String(pid), '-d', 'txt', '-Fn'], LSOF_EXEC_OPTIONS);
+      // The first text record is the executable, followed by mapped libraries.
+      // Never scan later mappings for a familiar basename or another pid.
+      const lines = out.split('\n');
+      if (lines[0] === `p${pid}` && lines[1] === 'ftxt' && lines[2]?.startsWith('n/')) {
+        executable = lines[2].slice(1);
+      }
+    } catch { /* inspection denied / process exited: keep the legacy alias */ }
+  }
+  const name = executable ? basename(executable.replace(/ \(deleted\)$/, '')) : undefined;
+  return name === 'traex' || name === 'coco' ? name : comm;
 }
 
 /**
