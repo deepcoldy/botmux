@@ -5,7 +5,7 @@ import {
   buildCredentialIsolationRules, buildSeatbeltProfile,
 } from '../src/adapters/cli/read-isolation.js';
 import {
-  accessForPath, buildFsPolicy, compileToBwrap, type FsPolicyContext,
+  accessForPath, buildFsPolicy, compileToBwrap, compileToSeatbelt, FsPolicyConfigError, normalizeFsPath, type FsPolicyContext,
 } from '../src/adapters/cli/fs-policy.js';
 import { buildCredentialOnlySandboxArgs } from '../src/adapters/backend/sandbox.js';
 
@@ -35,6 +35,7 @@ describe('project authority directory isolation', () => {
         join(dataDir, '.dashboard-secret.project-imports'),
         join(dataDir, '.dashboard-secret.dispatch-task-decisions'),
         join(dataDir, '.dashboard-secret.cross-chat-follow-thread'),
+        join(dataDir, 'session-turns'),
       ]);
     },
   );
@@ -122,4 +123,75 @@ describe('project authority directory isolation', () => {
       expect(compiled.args.slice(index - 2, index)).toEqual(['--ro-bind', '/sandbox-empty']);
     }
   });
+
+  it('self-protects session-turns in buildFsPolicy and Seatbelt finalDenyPaths even without hostOnlyDenyPaths', () => {
+    const context: FsPolicyContext = {
+      platform: 'darwin',
+      homeDir: HOME,
+      botmuxHome: `${HOME}/.botmux`,
+      sessionDataDir: DATA,
+      sessionId: 'project-session',
+      currentAppId: 'cli_project_self',
+      botHome: `${HOME}/.botmux/bots/cli_project_self`,
+      workingDir: `${HOME}/workspace`,
+      redirectedCliData: true,
+      userPaths: { readWrite: [`${DATA}/session-turns`, `${DATA}/session-turns/turns.sqlite`] },
+    };
+    const policy = buildFsPolicy(context);
+    expect(accessForPath(policy.rules, `${DATA}/session-turns/turns.sqlite`).access).toBe('deny');
+    expect(policy.finalDenyPaths).toContain(`${DATA}/session-turns`);
+    const profile = compileToSeatbelt(policy);
+    const denyRead = `(deny file-read* (subpath "${DATA}/session-turns"))`;
+    const denyWrite = `(deny file-write* (subpath "${DATA}/session-turns"))`;
+    expect(profile.lastIndexOf(denyRead)).toBeGreaterThan(-1);
+    expect(profile.lastIndexOf(denyWrite)).toBeGreaterThan(-1);
+    // Final Seatbelt deny pass must sit AFTER any finalReadOnlyPaths rules.
+    for (const ro of policy.finalReadOnlyPaths ?? []) {
+      const roIdx = profile.indexOf(`(allow file-read* (subpath "${ro}"))`);
+      if (roIdx >= 0) {
+        expect(profile.lastIndexOf(denyRead)).toBeGreaterThan(roIdx);
+        expect(profile.lastIndexOf(denyWrite)).toBeGreaterThan(roIdx);
+      }
+    }
+    expect(() => buildFsPolicy({ ...context, workingDir: `${DATA}/session-turns` }))
+      .toThrow(FsPolicyConfigError);
+    // Uncollapsed // and /./ segments must not bypass hostOnlyRoots or workingDir rejection.
+    expect(normalizeFsPath(`${DATA}//session-turns/./turns.sqlite`)).toBe(`${DATA}/session-turns/turns.sqlite`);
+    expect(normalizeFsPath(`${DATA}/session-turns/..`)).toBeNull();
+    const sneakyPolicy = buildFsPolicy({
+      ...context,
+      userPaths: { readWrite: [`${DATA}/./session-turns`, `${DATA}//session-turns/turns.sqlite`] },
+    });
+    expect(accessForPath(sneakyPolicy.rules, `${DATA}/session-turns/turns.sqlite`).access).toBe('deny');
+    expect(() => buildFsPolicy({ ...context, workingDir: `${DATA}/./session-turns` }))
+      .toThrow(FsPolicyConfigError);
+  });
+
+  it.each(['linux', 'darwin'] as const)(
+    'protects BOTH custom SESSION_DATA_DIR and default ~/.botmux/data/session-turns on %s even under user sandboxPaths',
+    platform => {
+      const customData = '/srv/custom-botmux-data';
+      const defaultData = `${HOME}/.botmux/data`;
+      const policy = buildFsPolicy({
+        platform,
+        homeDir: HOME,
+        botmuxHome: '/srv/custom-botmux',
+        defaultBotmuxHome: `${HOME}/.botmux`,
+        sessionDataDir: customData,
+        sessionId: 'project-session',
+        currentAppId: 'cli_project_self',
+        botHome: '/srv/custom-botmux/bots/cli_project_self',
+        workingDir: `${HOME}/workspace`,
+        redirectedCliData: true,
+        userPaths: {
+          readWrite: [`${defaultData}/session-turns`, `${customData}/session-turns`],
+          readOnly: [defaultData],
+        },
+      });
+      expect(accessForPath(policy.rules, `${defaultData}/session-turns/turns.sqlite`).access).toBe('deny');
+      expect(accessForPath(policy.rules, `${customData}/session-turns/turns.sqlite`).access).toBe('deny');
+      expect(policy.finalDenyPaths).toContain(`${defaultData}/session-turns`);
+      expect(policy.finalDenyPaths).toContain(`${customData}/session-turns`);
+    },
+  );
 });

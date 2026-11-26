@@ -17,6 +17,13 @@ const store = new Map<string, Session>();
 let sessionSeq = 0;
 const assistant = vi.hoisted(() => ({ spawn: { kind: 'off' } as any }));
 vi.mock('../src/core/assistant-spawn.js', () => ({ resolveAssistantSpawn: () => assistant.spawn }));
+// Group-level directory bindings recorded by /g --dir (created-groups.json).
+const groupDirState = vi.hoisted(() => ({ value: undefined as string | undefined }));
+vi.mock('../src/services/created-groups-store.js', () => ({
+  createdGroupWorkingDir: vi.fn((_chatId: string) => groupDirState.value),
+  getCreatedGroup: vi.fn(() => undefined),
+  recordCreatedGroup: vi.fn(),
+}));
 vi.mock('../src/services/session-store.js', () => ({
   registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
   cleanupSessionBridgeSendMarkers: vi.fn(),
@@ -81,6 +88,7 @@ let activeRegistryMock: Map<string, DaemonSession> | null = null;
 vi.mock('../src/core/worker-pool.js', () => ({
   dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
   forkWorker: (...a: any[]) => forkWorkerMock(...a),
+  settleOfflineReconciledQueuedActivation: vi.fn(),
   recordTurnExplicitMention: (...a: any[]) => recordTurnExplicitMentionMock(...a),
   sendWorkerInput: (...a: any[]) => sendWorkerInputMock(...a),
   forkAdoptWorker: vi.fn(),
@@ -198,6 +206,7 @@ beforeEach(() => {
     botName: 'TestBot',
     botOpenId: 'ou_bot',
   } as any);
+  groupDirState.value = undefined;
 });
 
 describe('spawnDashboardSession — backlog (待办池) parks without starting the CLI', () => {
@@ -1526,5 +1535,58 @@ describe('executeScheduledTask — workerless owner semantics', () => {
     expect(ds?.initialStartPending).toBe(true);
     expect(ds?.pendingPrompt).toBe('scheduled prompt');
     expect(ds?.worker).toBeNull();
+  });
+});
+
+describe('P2-2: /g --dir binding must not be mistaken for the bot default by auto-worktree', () => {
+  function enableAutoWorktreeBot(): void {
+    vi.mocked(getBot).mockReturnValue({
+      config: { cliId: 'claude-code', cliPathOverride: undefined, defaultWorkingDir: '/tmp', defaultWorkingDirAutoWorktree: true },
+      botName: 'TestBot',
+      botOpenId: 'ou_bot',
+    } as any);
+  }
+
+  it('A: group binding equal to the bot default starts in place — no auto-worktree, no pendingRepo', async () => {
+    enableAutoWorktreeBot();
+    groupDirState.value = '/tmp';
+    const active = new Map<string, DaemonSession>();
+    activeRegistryMock = active;
+    runAutoWorktreeCommitMock.mockClear();
+    const r = await spawnDashboardSession(active, undefined, {
+      larkAppId: APP, chatId: CHAT, content: '开干', column: 'in_progress', role: 'solo', postBanner: false,
+    });
+    expect(r.ok).toBe(true);
+    expect(runAutoWorktreeCommitMock).not.toHaveBeenCalled();
+    const ds = active.get(sessionKey(CHAT, APP))!;
+    expect(ds.pendingRepo).toBeFalsy();
+    expect(ds.workingDir).toBe('/tmp');
+  });
+
+  it('B: group binding to a different dir is kept verbatim and does not auto-worktree', async () => {
+    enableAutoWorktreeBot();
+    groupDirState.value = '/tmp/some-other-repo';
+    const active = new Map<string, DaemonSession>();
+    activeRegistryMock = active;
+    runAutoWorktreeCommitMock.mockClear();
+    const r = await spawnDashboardSession(active, undefined, {
+      larkAppId: APP, chatId: CHAT, content: '开干', column: 'in_progress', role: 'solo', postBanner: false,
+    });
+    expect(r.ok).toBe(true);
+    expect(runAutoWorktreeCommitMock).not.toHaveBeenCalled();
+    expect(active.get(sessionKey(CHAT, APP))!.workingDir).toBe('/tmp/some-other-repo');
+  });
+
+  it('C: without a group binding, the bot default still drives auto-worktree (existing behavior)', async () => {
+    enableAutoWorktreeBot();
+    groupDirState.value = undefined;
+    const active = new Map<string, DaemonSession>();
+    activeRegistryMock = active;
+    runAutoWorktreeCommitMock.mockClear();
+    const r = await spawnDashboardSession(active, undefined, {
+      larkAppId: APP, chatId: CHAT, content: '开干', column: 'in_progress', role: 'solo', postBanner: false,
+    });
+    expect(r.ok).toBe(true);
+    expect(runAutoWorktreeCommitMock).toHaveBeenCalledTimes(1);
   });
 });

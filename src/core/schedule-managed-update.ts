@@ -5,13 +5,14 @@ import type { CalendarDayType } from '../services/work-calendar.js';
 import type { ScheduledTask } from '../types.js';
 
 /** Fields `botmux schedule update` may change through the daemon's managed
- *  mutation route. Everything else on the task (id, silent, position, creator,
+ *  mutation route. Everything else on the task (id, position, creator,
  *  run history, precondition) is left exactly as it is. */
 export interface ManagedScheduleUpdate {
   prompt?: string;
   schedule?: string;
   calendar?: string | null;
   calendarDayType?: CalendarDayType;
+  silent?: boolean;
 }
 
 /** What the CLI prints after a successful update. */
@@ -23,6 +24,7 @@ export interface ManagedScheduleUpdateReceipt {
   disabledReason?: ScheduledTask['disabledReason'];
   calendar?: string;
   nextEligibleRunAt?: string | null;
+  silent: boolean;
 }
 
 /** The longest schedule expression accepted from the managed route; the CLI
@@ -36,18 +38,23 @@ export function readManagedScheduleUpdate(
   const hasPrompt = typeof body.prompt === 'string' && body.prompt.trim().length > 0;
   const hasSchedule = typeof body.schedule === 'string' && body.schedule.trim().length > 0;
   const hasCalendar = body.calendar !== undefined || body.calendarDayType !== undefined;
+  const hasSilent = body.silent !== undefined;
   if (body.prompt !== undefined && !hasPrompt) return { ok: false, error: 'invalid_schedule_prompt' };
   if (body.schedule !== undefined
     && (!hasSchedule || Array.from(body.schedule as string).length > MAX_SCHEDULE_CHARS)) {
     return { ok: false, error: 'invalid_schedule_expression' };
   }
-  if (!hasPrompt && !hasSchedule && !hasCalendar) return { ok: false, error: 'invalid_schedule_update' };
+  if (!hasPrompt && !hasSchedule && !hasCalendar && !hasSilent) return { ok: false, error: 'invalid_schedule_update' };
   if (body.calendar !== undefined && body.calendar !== null && typeof body.calendar !== 'string') {
     return { ok: false, error: 'invalid_schedule_calendar' };
   }
   if (body.calendarDayType !== undefined
     && body.calendarDayType !== 'workday' && body.calendarDayType !== 'restday') {
     return { ok: false, error: 'invalid_schedule_calendar_day_type' };
+  }
+  // A non-boolean here would flip a task's quiet mode by accident; refuse it.
+  if (hasSilent && typeof body.silent !== 'boolean') {
+    return { ok: false, error: 'invalid_schedule_silent' };
   }
   return {
     ok: true,
@@ -56,6 +63,7 @@ export function readManagedScheduleUpdate(
       ...(hasSchedule ? { schedule: (body.schedule as string).trim() } : {}),
       ...(body.calendar !== undefined ? { calendar: body.calendar as string | null } : {}),
       ...(body.calendarDayType !== undefined ? { calendarDayType: body.calendarDayType as CalendarDayType } : {}),
+      ...(hasSilent ? { silent: body.silent as boolean } : {}),
     },
   };
 }
@@ -70,6 +78,7 @@ function receiptFor(task: ScheduledTask, appId: string): ManagedScheduleUpdateRe
     ...(!task.enabled && task.disabledReason ? { disabledReason: task.disabledReason } : {}),
     ...(task.calendar !== undefined ? { calendar: task.calendar } : {}),
     ...(calendar ? { nextEligibleRunAt: calendar.nextEligibleRunAt } : {}),
+    silent: task.silent === true,
   };
 }
 

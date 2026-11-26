@@ -18,6 +18,7 @@
 |---|---|---|---|
 | 每天自动装新版 | 系统与维护 → 自动维护 → 自动更新 | `maintenance.autoUpdate` | 关 |
 | 装完新版自动重启 | 系统与维护 → 自动维护 → 自动重启 | `maintenance.autoRestart` | 关 |
+| 发现新版时私聊主机器人管理员 | 系统与维护 → 自动维护 → 新版私聊提醒 | `maintenance.notifyOnNewVersion` | 关 |
 | 定时关掉长期不用的会话 | 通用设置 → 定时任务 → 定时自动清理空闲会话 | `sessionCleanup` | 关 |
 | 机器过载时收到私信 | 通用设置 → 机器过载告警 | `hostOverloadAlert` | 关 |
 | 定时任务按某个时区算 | 通用设置 → 定时任务 → 时区 | `scheduleTimeZone` | 跟随主机 |
@@ -47,6 +48,12 @@
   }
 }
 ```
+
+### 新版私聊提醒 {#version-notifications}
+
+「新版私聊提醒」默认关闭，可在 Dashboard 的自动维护设置或飞书 `/dashboard settings` 设置卡中开启。对应配置为 `"maintenance": { "notifyOnNewVersion": true }`。
+
+开启后每小时检查一次新版本，只由主机器人私聊它解析出的主管理员；不会逐个通知其它机器人。它与自动更新、自动重启和重启报告相互独立，只查询版本并提醒，不会安装更新。关闭时不会查询版本或发送提醒。投递、去重和失败重试细节见[版本通知](https://github.com/deepcoldy/botmux/blob/master/docs/version-notifications.md)。
 
 ### 自动升级会话里的 Codex
 

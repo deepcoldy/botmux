@@ -36,7 +36,7 @@ export const NAV_ITEMS: NavItem[] = [
     ),
   },
   { id: 'sessions', href: '#/sessions', labelKey: 'nav.sessions', aliases: ['对话', 'conversations', 'chats'], icon: <path d="M2 3.5h12v7H6l-3 3v-3H2z" /> },
-  // 决策看板：只有至少一个 Bot 设为管家时才出现在侧边栏（见 app.tsx 的 sidebarNavItems）。
+  // 决策看板：至少一个 Bot 设为管家时可在精简侧边栏自动浮现。
   // 不是 manage 项：飞书 H5 免登的 owner 也要能从侧边栏进来。
   {
     id: 'decision-board',
@@ -45,7 +45,7 @@ export const NAV_ITEMS: NavItem[] = [
     aliases: ['拍板', 'decisions'],
     icon: <><rect x="2.5" y="2" width="11" height="12" rx="1.8" /><path d="M5 5.6l1.1 1.1 2.1-2.1M5 10.4l1.1 1.1 2.1-2.1M9.9 5.7h1.6M9.9 10.5h1.6" /></>,
   },
-  // 任务分配：默认关闭，仅在全局设置开启「Bot 任务分配」后显示（见 app.tsx 的 sidebarNavItems）。
+  // 任务分配：在全局设置开启后可在精简侧边栏自动浮现。
   {
     id: 'task-routing',
     href: '#/assign',
@@ -134,9 +134,35 @@ export const NAV_GROUPS: Array<{ id: string; labelKey: string; items: string[] }
   { id: 'overview', labelKey: 'nav.group.overview', items: ['overview'] },
   { id: 'collab', labelKey: 'nav.group.collab', items: ['sessions', 'decision-board', 'task-routing', 'agent-workbench', 'groups', 'schedules', 'workflows'] },
   { id: 'workforce', labelKey: 'nav.group.workforce', items: ['roles', 'skills', 'customization', 'message-listeners', 'doc-watches', 'bot-defaults', 'agents'] },
-  { id: 'analytics', labelKey: 'nav.group.analytics', items: ['monitoring', 'insights', 'feedback'] },
+  { id: 'analytics', labelKey: 'nav.group.analytics', items: ['monitoring', 'insights', 'feedback', 'usage'] },
   { id: 'manage', labelKey: 'nav.group.manage', items: ['terminal', 'connectors', 'plugins', 'whiteboards', 'settings'] },
 ];
+
+/**
+ * 侧边栏鉴权可见性的纯判定。app.tsx 持有模块级登录态且 import 即有 DOM 启动副作用，
+ * 无法直接单测，故把判定抽到这个无副作用模块。
+ */
+
+/**
+ * manage 项只在 /api/settings 明确回答登录态、且当前是 owner 时可见。
+ * 登录态未知时 isAuthed 的默认值 true 不可信（见 app.tsx authStateKnown 注释），
+ * 探测失败期间宁可不展示管理入口，也不给只读访客露出会 401 的页面。
+ */
+export function isManageNavAllowed(authStateKnown: boolean, isAuthed: boolean): boolean {
+  return authStateKnown && isAuthed;
+}
+
+/**
+ * 决策看板入口可见性：owner 在尚未配置管家时也允许看到入口（页面本身是引导配置的空态）；
+ * 登录态未知、或明确的只读访客都不显示。已经探测到管家看板的历史路径保持不变。
+ */
+export function isDecisionBoardNavVisible(input: {
+  authStateKnown: boolean;
+  isAuthed: boolean;
+  stewardBoardExists: boolean;
+}): boolean {
+  return (input.authStateKnown && input.isAuthed) || input.stewardBoardExists;
+}
 
 /**
  * 不在侧边栏、但有独立地址的页面 / 页内 tab，⌘K 照样收录。父项在侧边栏里不可见（没权限、
@@ -172,6 +198,3 @@ export const PALETTE_UNINDEXED_ROUTES: Readonly<Record<string, string>> = {
   'agent-workbench-dock': '桌面壳 / 沉浸式入口嵌入的驾驶舱界面，不是独立页面',
   'webhook-logs': '#/connectors/logs 的旧别名',
 };
-
-// Register Token usage in the analytics navigation group.
-NAV_GROUPS.find(group => group.id === 'analytics')?.items.push('usage');

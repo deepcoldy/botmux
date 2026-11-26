@@ -512,7 +512,11 @@ export function buildSeatbeltProfile(
 // before those mounts must not warm-reattach and retain access to the new WAL.
 // 20 adds the host send relay to macOS Seatbelt oncall panes. A persistent pane
 // launched without that environment cannot acquire it during warm reattach.
-export const ISOLATION_PANE_MARKER_VERSION = 20;
+// 21 masks host-only `<DATA_DIR>/session-turns` (shared multi-bot `turns.sqlite`)
+// across credential-only and scratch panes. A persistent pane launched before
+// this version must cold-spawn once so it cannot retain unmasked read/write
+// access to other bots' and sessions' structured turns.
+export const ISOLATION_PANE_MARKER_VERSION = 21;
 
 export type IsolationCapability = 'credential' | 'read' | 'write';
 
