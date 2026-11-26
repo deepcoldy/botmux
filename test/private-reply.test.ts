@@ -142,4 +142,42 @@ describe('durable private output', () => {
     await expect(sendPrivateReply(session(), 'turn_a', 'answer', 'text', 'stable', { senderOpenId: 'ou_original', failClosed: true })).rejects.toThrow('receipt lost');
     expect(replyMessage).not.toHaveBeenCalled();
   });
+
+  function makeInternalError500(): Error {
+    return Object.assign(new Error('Request failed with status code 500'), {
+      isAxiosError: true,
+      response: { status: 500, data: { code: 2200, msg: 'internal error' } },
+    });
+  }
+
+  function makeDeterministic400(): Error {
+    return Object.assign(new Error('Request failed with status code 400'), {
+      isAxiosError: true,
+      response: { status: 400, data: { code: 230099, msg: 'bad request' } },
+    });
+  }
+
+  it('does not fall back to the group when a uuid-tagged DM fails with commit-unknown HTTP 500', async () => {
+    writeRoleReplyPrivately(APP, GROUP, true);
+    vi.mocked(sendUserMessage).mockRejectedValueOnce(makeInternalError500());
+    await expect(sendPrivateReply(session(), 'turn_a', 'answer', 'text', 'sc_t_dedup_token')).rejects.toThrow('status code 500');
+    expect(sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(replyMessage).not.toHaveBeenCalled();
+  });
+
+  it('still falls back when the same commit-unknown error has no caller uuid', async () => {
+    writeRoleReplyPrivately(APP, GROUP, true);
+    vi.mocked(sendUserMessage).mockRejectedValueOnce(makeInternalError500());
+    expect(await sendPrivateReply(session(), 'turn_a', 'answer')).toBeUndefined();
+    expect(sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(replyMessage).not.toHaveBeenCalled();
+  });
+
+  it('falls back on a deterministic 400 even with a caller uuid since nothing could have landed', async () => {
+    writeRoleReplyPrivately(APP, GROUP, true);
+    vi.mocked(sendUserMessage).mockRejectedValueOnce(makeDeterministic400());
+    expect(await sendPrivateReply(session(), 'turn_a', 'answer', 'text', 'sc_t_dedup_token')).toBeUndefined();
+    expect(sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(replyMessage).not.toHaveBeenCalled();
+  });
 });
