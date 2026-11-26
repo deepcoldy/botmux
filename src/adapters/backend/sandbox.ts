@@ -2100,6 +2100,37 @@ export function validateRelayRequest(
  * is false → rejected here). Reads from the fd (not the path), so the inode can't
  * be swapped under us. Returns false (reject) on symlink / non-regular / any error.
  */
+/**
+ * The sandbox-side CLI copies each attachment into the outbox as
+ * `<request id>-<8 hex>-<original basename>` so concurrent sends can't collide.
+ * Recover the original basename so the uploaded file keeps the name the agent
+ * gave it; anything not carrying that exact prefix is returned unchanged.
+ */
+export function relayOriginalAttachmentName(requestId: string, outboxName: string): string {
+  const prefix = `${requestId}-`;
+  if (!outboxName.startsWith(prefix)) return outboxName;
+  const rest = outboxName.slice(prefix.length);
+  const m = /^[0-9a-f]{8}-(.+)$/.exec(rest);
+  return m ? m[1] : outboxName;
+}
+
+/**
+ * Stage one outbox file into its own private subdirectory of `staging`, under
+ * its original basename: the per-file directory keeps concurrent requests apart
+ * while the upload (which names the file after its path) shows the real name.
+ * Returns the staged path, or null when the outbox entry is not a regular file.
+ */
+export function stageRelayMedia(staging: string, outbox: string, requestId: string, slot: string, outboxName: string): string | null {
+  const dir = join(staging, `${requestId}-${slot}`);
+  try { mkdirSync(dir, { mode: 0o700 }); } catch { return null; }
+  const dest = join(dir, relayOriginalAttachmentName(requestId, outboxName));
+  if (!materializeOutboxFile(outbox, outboxName, dest)) {
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* */ }
+    return null;
+  }
+  return dest;
+}
+
 export function materializeOutboxFile(outbox: string, name: string, dest: string): boolean {
   let fd: number;
   try { fd = openSync(join(outbox, name), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK); }
@@ -2260,7 +2291,7 @@ export function startOutboxWatcher(
     }
     // else: the outbox was replaced while serving this request — the response
     // is dropped and the sandbox-side CLI reports its relay timeout.
-    for (const p of staged) { try { rmSync(p, { force: true }); } catch { /* */ } }
+    for (const p of staged) { try { rmSync(p, { recursive: true, force: true }); } catch { /* */ } }
     inFlight.delete(name);
   };
 
@@ -2375,36 +2406,36 @@ export function startOutboxWatcher(
       const imagePaths: string[] = [];
       v.value.imageNames.forEach((imageName, i) => {
         if (imageBad) return;
-        const dest = join(staging, `${id}-image${i}-${imageName}`);
-        if (!materializeOutboxFile(outbox, imageName, dest)) { imageBad = true; return; }
-        staged.push(dest); imagePaths.push(dest);
+        const dest = stageRelayMedia(staging, outbox, id, `image${i}`, imageName);
+        if (!dest) { imageBad = true; return; }
+        staged.push(dirname(dest)); imagePaths.push(dest);
       });
       if (imageBad) { finish(id, reqPath, name, staged, 1, '', 'relay rejected: image not a regular file in outbox'); continue; }
       let attBad = false;
       const attPaths: string[] = [];
       v.value.attachmentNames.forEach((an, i) => {
         if (attBad) return;
-        const dest = join(staging, `${id}-att${i}-${an}`);
-        if (!materializeOutboxFile(outbox, an, dest)) { attBad = true; return; }
-        staged.push(dest); attPaths.push(dest);
+        const dest = stageRelayMedia(staging, outbox, id, `att${i}`, an);
+        if (!dest) { attBad = true; return; }
+        staged.push(dirname(dest)); attPaths.push(dest);
       });
       if (attBad) { finish(id, reqPath, name, staged, 1, '', 'relay rejected: attachment not a regular file in outbox'); continue; }
       let videoBad = false;
       const videoPaths: string[] = [];
       v.value.videoNames.forEach((vn, i) => {
         if (videoBad) return;
-        const dest = join(staging, `${id}-video${i}-${vn}`);
-        if (!materializeOutboxFile(outbox, vn, dest)) { videoBad = true; return; }
-        staged.push(dest); videoPaths.push(dest);
+        const dest = stageRelayMedia(staging, outbox, id, `video${i}`, vn);
+        if (!dest) { videoBad = true; return; }
+        staged.push(dirname(dest)); videoPaths.push(dest);
       });
       if (videoBad) { finish(id, reqPath, name, staged, 1, '', 'relay rejected: video not a regular file in outbox'); continue; }
       let coverBad = false;
       const videoCoverPaths: string[] = [];
       v.value.videoCoverNames.forEach((cn, i) => {
         if (coverBad) return;
-        const dest = join(staging, `${id}-video-cover${i}-${cn}`);
-        if (!materializeOutboxFile(outbox, cn, dest)) { coverBad = true; return; }
-        staged.push(dest); videoCoverPaths.push(dest);
+        const dest = stageRelayMedia(staging, outbox, id, `video-cover${i}`, cn);
+        if (!dest) { coverBad = true; return; }
+        staged.push(dirname(dest)); videoCoverPaths.push(dest);
       });
       if (coverBad) { finish(id, reqPath, name, staged, 1, '', 'relay rejected: video cover not a regular file in outbox'); continue; }
 
