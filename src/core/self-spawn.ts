@@ -1,5 +1,6 @@
 import { spawn, fork, type ChildProcess, type StdioOptions } from 'node:child_process';
 import { join } from 'node:path';
+import { existsSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 
 /**
@@ -37,7 +38,7 @@ export type BotmuxEntry =
   // process.execPath and the runner is argv[0]). They need the same treatment for
   // the same reason — see RUNNER_ENTRIES below.
   | 'codex-app-runner' | 'dsh-runner' | 'mira-runner' | 'mir-runner'
-  | 'minimax-runner' | 'antigravity-runner' | 'lark-tool-runner' | 'cli-identity-runner';
+  | 'minimax-runner' | 'antigravity-runner' | 'lark-tool-runner' | 'cli-identity-runner' | 'bytedcli-exec-runner';
 
 /** Hidden CLI subcommand that runs a given entry inline (see cli.ts dispatch). */
 const ENTRY_SUBCOMMAND: Record<BotmuxEntry, string> = {
@@ -62,6 +63,7 @@ const ENTRY_SUBCOMMAND: Record<BotmuxEntry, string> = {
   'antigravity-runner': '__antigravity-runner',
   'lark-tool-runner': '__lark-tool-runner',
   'cli-identity-runner': '__cli-identity-runner',
+  'bytedcli-exec-runner': '__bytedcli-exec-runner',
 };
 
 /** dist/<entry>.js filename for the Node path. */
@@ -87,6 +89,7 @@ const ENTRY_SCRIPT: Record<BotmuxEntry, string> = {
   'antigravity-runner': 'antigravity-runner.js',
   'lark-tool-runner': 'lark-tool-runner.js',
   'cli-identity-runner': 'cli-identity-runner.js',
+  'bytedcli-exec-runner': 'bytedcli-exec-runner.js',
 };
 
 /**
@@ -108,7 +111,7 @@ const ENTRY_SCRIPT: Record<BotmuxEntry, string> = {
  */
 export const RUNNER_ENTRIES: readonly BotmuxEntry[] = [
   'codex-app-runner', 'dsh-runner', 'mira-runner', 'mir-runner', 'minimax-runner',
-  'antigravity-runner', 'lark-tool-runner', 'cli-identity-runner',
+  'antigravity-runner', 'lark-tool-runner', 'cli-identity-runner', 'bytedcli-exec-runner',
 ] as const;
 
 /**
@@ -163,7 +166,16 @@ export function resolveEntrySpawn(entry: BotmuxEntry, distDir: string): { comman
   if (isStandaloneBinary()) {
     return { command: process.execPath, args: [ENTRY_SUBCOMMAND[entry]] };
   }
-  return { command: process.execPath, args: [join(distDir, ENTRY_SCRIPT[entry])] };
+  const script=join(distDir, ENTRY_SCRIPT[entry]);
+  if(entry==='bytedcli-exec-runner' && !existsSync(script)) {
+    const source=script.replace(/\.js$/,'.ts');
+    // Source Bun is supported natively. Source Node needs an explicit TS
+    // runtime supplied by the embedding, not a guessed nonexistent JS file.
+    if(typeof (globalThis as {Bun?:unknown}).Bun!=='undefined' && existsSync(source))
+      return {command:process.execPath,args:[source]};
+    throw new Error('bytedcli broker client entry is unavailable');
+  }
+  return { command: process.execPath, args: [script] };
 }
 
 /**

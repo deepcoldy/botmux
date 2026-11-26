@@ -21,6 +21,8 @@ import { backgroundAuthorityKey, backgroundCredentialPolicyKey, backgroundPeerBe
 import { noteSenderUnionId } from './platform-credential-source.js';
 import { resolveScheduledRunIdentity, type ScheduledRunIdentity } from './schedule-identity-claim.js';
 import { parseScheduledTurnId } from './scheduled-turn-provenance.js';
+import { bytecloudBrokerEnabled } from './identity-policy.js';
+import { bytedcliSessionWasStrict } from './bytedcli-broker-containment.js';
 import * as scheduler from './scheduler.js';
 import { publishTurnCliIdentity } from './turn-cli-identity.js';
 import { clearRestoredLapses } from './capability-authorization.js';
@@ -192,6 +194,14 @@ export async function resolveDetachedScheduledExecutionIdentity(input: {
 }): Promise<{ larkAppId: string; identityTurnId: string; env: string } | null> {
   const ctx = resolveRegisteredBackgroundContext(input);
   if (!ctx) return null;
+  const strict = () => {
+    const ds=findActiveBySessionId(input.sessionId);
+    const row=ds?.session ?? sessionStore.getOwnedSession(input.sessionId);
+    let live:BotConfig|undefined;
+    try { live=getBot(ctx.larkAppId).config; } catch { return true; }
+    return bytecloudBrokerEnabled(live.triggerUserAuth) || !!row?.bytecloudBrokerStrict || !!(ds && bytedcliSessionWasStrict(ds));
+  };
+  if(input.tool!=='lark-cli' && strict())return null;
   const turnId = `background:${ctx.job.id}`;
   const referenceTool = input.tool === 'codebase' || input.tool === 'bitscli' ? 'bytedcli' : input.tool;
   const current = () => recallProvenIdentityContent(input.sessionDataDir, input.sessionId, turnId, input.tool);
@@ -205,7 +215,10 @@ export async function resolveDetachedScheduledExecutionIdentity(input: {
         if (!backgroundContextStillValid(input, ctx)) return;
         noteSenderUnionId(ctx.larkAppId, ctx.job.openId, ctx.job.unionId);
         try {
-          const outcomes = await publishTurnCliIdentity({ botConfig: ctx.botConfig, sessionDataDir: input.sessionDataDir,
+          const safeConfig = strict() ? {...ctx.botConfig,triggerUserAuth:{...ctx.botConfig.triggerUserAuth,
+            enabled:true,tools:['lark-cli' as const],capabilities:['lark-user' as const]}} : ctx.botConfig;
+          if(input.tool!=='lark-cli' && strict())return;
+          const outcomes = await publishTurnCliIdentity({ botConfig: safeConfig, sessionDataDir: input.sessionDataDir,
             sessionId: input.sessionId, senderOpenId: ctx.job.openId,
             locale: localeForBot(ctx.larkAppId), turnId, storageModel: 'proven' });
           clearRestoredLapses({ appId: ctx.larkAppId, taskId: ctx.taskId, openId: ctx.job.openId, outcomes });
@@ -235,6 +248,7 @@ export async function resolveDetachedScheduledExecutionIdentity(input: {
     cleanupBackgroundJobHome(ctx.job.id);
     return null;
   }
+  if(input.tool!=='lark-cli' && strict())return null;
   const env = current();
   return env ? { larkAppId: ctx.larkAppId, identityTurnId: ctx.job.turnId, env } : null;
 }

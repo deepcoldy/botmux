@@ -598,6 +598,8 @@ export interface WorkflowNodeSessionMarker {
 }
 
 export interface Session {
+  /** Host-sticky strict launch fence; a policy edit never reopens credential exports. */
+  bytecloudBrokerStrict?: true;
   /** Last settled fixed context for one TraeX native thread. */
   traexNativeContextReceipt?: import('./core/traex-native-context.js').TraexNativeContextReceipt;
   nativeGoalStatusCard?: import('./core/goal-status-card.js').GoalStatusCardRecord;

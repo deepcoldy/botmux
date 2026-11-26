@@ -46,7 +46,7 @@ import { lookupTurnResultRequest } from './turn-result-routes.js';
 import { normalizeCalendarBinding, normalizeCalendarDayType, listWorkCalendars, previewTaskCalendar } from '../services/work-calendar.js';
 import { resolveWorkspace } from './workspace-metadata.js';
 // src/core/dashboard-ipc-server.ts
-import { canOperate } from '../im/lark/event-dispatcher.js';
+import { canOperate, canTalk } from '../im/lark/event-dispatcher.js';
 import { resolveRunAs } from './run-as.js';
 import {
   DASHBOARD_SCHEDULE_CREATOR_HEADER,
@@ -703,7 +703,11 @@ import { sessionAuthRequests } from './session-auth-requests.js';
 import { chooseTurnSpeaker, governedSpeakers } from './turn-speakers.js';
 import { resolveUserToken } from '../utils/user-token.js';
 import { currentLarkToolDelegation, getLarkToolDelegation } from './lark-tool-delegation.js';
-import { capabilityOfTool } from './identity-policy.js';
+import { capabilityOfTool, bytecloudBrokerEnabled } from './identity-policy.js';
+import { BYTEDCLI_EXEC_ROUTE } from '../cli/bytedcli-exec-protocol.js';
+import { createProductionBytedcliBroker, type BytedcliBroker, type BytedcliHostLayout } from './bytedcli-broker.js';
+import { bytedcliSessionWasStrict, markBytedcliStrictSession } from './bytedcli-broker-containment.js';
+import { resolveVerifiedUserIdentityByUnionId } from '../im/lark/identity-cache.js';
 import { activePlatformCredentialBindingKey, reasonTag, platformAuthorizeUrl } from './platform-credential-source.js';
 import { askPlatformToAuthorize, type PlatformAuthorizationRequestResult } from './platform-authorization-request.js';
 import { hasReason, PLATFORM_WILL_NOT_ISSUE_REASONS } from './refusal-reasons.js';
@@ -791,6 +795,7 @@ type HeadlessReasoningEffort = NonNullable<HeadlessSessionRecord['reasoningEffor
 export interface IpcServerHandle {
   port: number;
   close: () => Promise<void>;
+  retireBytedcliSession: (sessionId: string) => Promise<void>;
 }
 
 export type Handler = (
@@ -1447,6 +1452,7 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
   // capability because those are writable by an unconfined same-UID Agent.
   if (method === 'POST' && pathname === CURRENT_ACTOR_ROUTE) return true;
   if (method === 'POST' && pathname === CURRENT_EXECUTION_ROUTE) return true;
+  if (method === 'POST' && pathname === BYTEDCLI_EXEC_ROUTE) return true;
   // Same lineage proof as current-execution; the reply carries identity env
   // CONTENT, so it is admitted only through this exact route.
   if (method === 'POST' && pathname === CURRENT_EXECUTION_IDENTITY_ROUTE) return true;
@@ -1738,6 +1744,23 @@ ipcRoute('POST', MANAGED_ORIGIN_ATTEST_ROUTE, async (req, res) => {
   }
 });
 
+const requestBytedcliBrokers = new WeakMap<IncomingMessage, BytedcliBroker>();
+ipcRoute('POST', BYTEDCLI_EXEC_ROUTE, (req, res) => requestBytedcliBrokers.get(req)!.handle(req, res));
+
+/** Sticky host session fence: disabling the live policy cannot reopen a
+ * ByteCloud export to a process launched under strict policy. */
+function strictBytecloudExportRefused(sessionId: string, appId?: string): boolean {
+  const ds = findActiveBySessionId(sessionId);
+  const row = ds?.session ?? sessionStore.getOwnedSession(sessionId);
+  if (ds && bytedcliSessionWasStrict(ds) || row?.bytecloudBrokerStrict) return true;
+  try {
+    const policy = getBot(ds?.larkAppId ?? appId ?? row?.larkAppId ?? '').config.triggerUserAuth;
+    if (!bytecloudBrokerEnabled(policy)) return false;
+    if (ds) markBytedcliStrictSession(ds);
+    return true;
+  } catch { return false; }
+}
+
 // Like current-actor, even a host-signed request must prove the live socket peer.
 // This route does not resolve a human identity or grant an action permission.
 ipcRoute('POST', CURRENT_EXECUTION_ROUTE, async (req, res) => {
@@ -1863,6 +1886,8 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
     return jsonRes(res, 400, blocked('invalid_request'));
   }
   const requestedAs = record?.as as string | undefined;
+  const strictExport = () => tool !== 'lark-cli' && strictBytecloudExportRefused(sessionId);
+  if (strictExport()) return jsonRes(res, 403, blocked('broker_export_disabled'));
   const peer = await resolveLoopbackPeerProcesses({
     remoteAddress: req.socket.remoteAddress, remotePort: req.socket.remotePort, localPort: req.socket.localPort,
   });
@@ -1932,6 +1957,7 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
     const originCapability = ds.managedTurnOrigin?.capability;
     const callerOpenId = ds.managedTurnOrigin?.callerOpenId;
     const executionStillCurrent = () => {
+      if (strictExport()) return false;
       const origin = ds.managedTurnOrigin;
       if (findActiveBySessionId(sessionId) !== ds || ds.worker !== worker || !worker
         || worker.killed || worker.connected === false || ds.workerGeneration !== document.workerGeneration
@@ -1955,6 +1981,7 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
       // treats a throwing reader as a refusal to publish.
       currentPolicy,
     });
+    if (strictExport()) return jsonRes(res, 403, blocked('broker_export_disabled'));
     let env = recallProvenIdentityContent(config.session.dataDir, sessionId, speakerTurnId, tool);
     if (!env) {
       // The turn's identity may still be on its way (a new session's opening
@@ -1985,6 +2012,7 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
           openId: choice.speaker?.openId, message: `${hint}\n${reasonTag(consent ? 'platform_consent_missing' : 'platform_not_authorized')}` });
       }
     }
+    if (strictExport() || !executionStillCurrent()) return jsonRes(res, 403, blocked('broker_export_disabled'));
     if (env) {
       return jsonRes(res, 200, {
         schema: CURRENT_EXECUTION_IDENTITY_SCHEMA, status: 'verified',
@@ -1995,6 +2023,7 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
     const detachedFromLive = requestedAs !== undefined ? null : await resolveDetachedScheduledExecutionIdentity({
       sessionDataDir: config.session.dataDir, sessionId, tool, peer: peer.peer,
     });
+    if (strictExport()) return jsonRes(res, 403, blocked('broker_export_disabled'));
     if (detachedFromLive) {
       return jsonRes(res, 200, {
         schema: CURRENT_EXECUTION_IDENTITY_SCHEMA, status: 'verified',
@@ -2013,6 +2042,7 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
   const detached = await resolveDetachedScheduledExecutionIdentity({
     sessionDataDir: config.session.dataDir, sessionId, tool, peer: peer.peer,
   });
+  if (strictExport()) return jsonRes(res, 403, blocked('broker_export_disabled'));
   if (detached) {
     return jsonRes(res, 200, {
       schema: CURRENT_EXECUTION_IDENTITY_SCHEMA, status: 'verified',
@@ -15324,6 +15354,10 @@ export function startIpcServer(opts: {
    * deliberate secret repair cannot strand a daemon on a stale cached key.
    * Tests that omit this option retain the lightweight in-process server. */
   authRequired?: boolean;
+  /** Trusted embedding seam: never selected by request body or Agent env. */
+  bytedcliBroker?: BytedcliBroker;
+  /** Share the daemon-frozen layout with Task4 worker isolation. */
+  bytedcliHostLayout?: BytedcliHostLayout;
   /** Daemon restore barrier.  The socket/health route may come up early so its
    * descriptor is discoverable, but every state-bearing route waits until all
    * durable session owners have been registered. */
@@ -15350,7 +15384,15 @@ export function startIpcServer(opts: {
     },
   });
   let boundPort = opts.port;
+  const bytedcliBroker = opts.bytedcliBroker ?? createProductionBytedcliBroker({
+    daemonBootId: getDaemonBootId(), dataDir: config.session.dataDir, findSession: findActiveBySessionId,
+    policy: ds => getBot(ds.larkAppId).config.triggerUserAuth,
+    canTalk: (ds, openId, unionId) => canTalk(ds.larkAppId, ds.chatId, openId, undefined, unionId, ds.chatType),
+    identity: resolveVerifiedUserIdentity, unionIdentity: resolveVerifiedUserIdentityByUnionId,
+    schedule: (app, taskId) => scheduler.getScheduleAuthorityRecord(taskId, app),
+  }, opts.bytedcliHostLayout);
   const server: Server = createServer(async (req, res) => {
+    requestBytedcliBrokers.set(req, bytedcliBroker);
     try {
       const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
       const method = req.method ?? 'GET';
@@ -15447,10 +15489,13 @@ export function startIpcServer(opts: {
     // handlers run on — teardown callers already have to cope with that, since
     // the daemon can exit mid-request. listen-with-probe's release path tears
     // sockets down for the same reason.
-    close: () => new Promise<void>(r => {
+    retireBytedcliSession: sessionId => bytedcliBroker.retireSession(sessionId),
+    close: async () => {
       server.closeAllConnections?.();
-      server.close(() => r());
-    }),
+      const stopped = new Promise<void>(resolve => server.close(() => resolve()));
+      await bytedcliBroker.close();
+      await stopped;
+    },
   };
   });
 }

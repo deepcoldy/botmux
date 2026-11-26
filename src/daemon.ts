@@ -36231,6 +36231,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   };
   const memoryAdmissionOwnerAlerts = new WorkerAdmissionOwnerAlerts(ownerAlertDependencies);
   const workerOwnerDiagnostics = new WorkerOwnerDiagnostics(ownerAlertDependencies);
+  let bytedcliRetireSession: ((sessionId: string) => Promise<void>) | undefined;
   initWorkerPool({
     onOwnerDiagnostic: (ds, diagnostic) =>
       workerOwnerDiagnostics.report(ds.larkAppId, ds.session.sessionId, diagnostic),
@@ -36647,6 +36648,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     },
     async onSessionClosed(session, context) {
       autoCompactCoordinator.cancel(session.sessionId);
+      await bytedcliRetireSession?.(session.sessionId);
       await finalizeClosedXpiSharedCwdMember(session, context);
     },
     onReceiverResetReady(_ds, context) {
@@ -36979,6 +36981,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // never silently drift to another (client would dial a dead port).
     ...(coreOnly ? { maxProbe: 0 } : {}),
   });
+  bytedcliRetireSession = ipcHandle.retireBytedcliSession;
   // startIpcServer probes upward on EADDRINUSE (e.g. a second botmux instance on
   // this host already holds ipcBasePort+idx), so the bound port may differ from
   // the requested one. Republish the ACTUAL port into the descriptor before it
@@ -39443,7 +39446,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // writer cannot slip a commit under a write-back that is still coming.
     claimOccupancy();
     removeDaemonDescriptor(cfg.larkAppId, desc.bootInstanceId);
-    ipcHandle.close().catch(() => { /* swallow */ });
+    await ipcHandle.close().catch(() => { logger.warn('[bytedcli-broker] IPC close failed after cancellation'); });
     if (terminalProxy) terminalProxy.close().catch(() => { /* swallow */ });
 
     // Producer-closed fence. We must not close the turn-terminal queue admission
