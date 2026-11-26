@@ -33437,6 +33437,12 @@ a.card-menu-item {
 .bd-oncall-field { display: flex; flex-direction: column; align-items: stretch; gap: 8px; min-width: 0; color: var(--fg); font-size: 13px; }
 .bd-oncall-field-wide { grid-column: 1 / -1; }
 .bd-oncall-field .bd-section-note { margin: 0; }
+.bd-oncall-form-followup {
+  margin-top: 4px;
+  margin-inline-start: 8px;
+  padding-inline-start: 12px;
+  border-inline-start: 1px solid var(--border-soft);
+}
 .bd-oncall-field .connector-group-picker,
 .bot-defaults-page .bd-oncall-field .bd-field-menu { width: 100%; max-width: none; min-width: 0; }
 .bot-defaults-page .bd-tile .bd-oncall-field input[type=password] {
