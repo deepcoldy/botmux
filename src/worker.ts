@@ -9391,8 +9391,7 @@ interface AntigravityFoldedReconcileResult {
 
 interface AntigravityFoldedReconcilePending {
   cliSpawnGeneration: number;
-  ptyOutputGeneration: number;
-  webTerminalInputGeneration: number;
+  webTerminalSubmitGeneration: number;
   currentTurnId: string | undefined;
   currentDispatchAttempt: number | undefined;
   promotedTurnId: string | undefined;
@@ -9406,14 +9405,30 @@ interface AntigravityFoldedReconcilePending {
   watcher?: FSWatcher;
 }
 
+/** A sibling-proven completed turn waiting only for its live background work.
+ * PTY output is deliberately not an identity fence: background redraws advance
+ * it without changing the turn. Spawn, turn and direct-submit identities still are. */
+interface AntigravityFoldedBackgroundHold {
+  cliSpawnGeneration: number;
+  turnId: string;
+  dispatchAttempt: number | undefined;
+  webTerminalSubmitGeneration: number;
+  /** A later folded successor still needs its own sibling reconciliation. */
+  resumeTranscriptPath?: string;
+  timer?: ReturnType<typeof setTimeout>;
+}
+
 const ANTIGRAVITY_FOLDED_RECONCILE_INITIAL_DELAY_MS = 50;
 const ANTIGRAVITY_FOLDED_RECONCILE_MAX_DELAY_MS = 1_000;
 const ANTIGRAVITY_FOLDED_RECONCILE_MAX_ATTEMPTS = 20;
 const ANTIGRAVITY_FOLDED_RECONCILE_MAX_WATCH_WAKEUPS = 50;
 const ANTIGRAVITY_FOLDED_RECONCILE_MAX_WINDOW_MS = 15_000;
 let antigravityFoldedReconcilePending: AntigravityFoldedReconcilePending | undefined;
+let antigravityFoldedBackgroundHold: AntigravityFoldedBackgroundHold | undefined;
 
 function cancelAntigravityFoldedReconcilePending(): void {
+  if (antigravityFoldedBackgroundHold?.timer) clearTimeout(antigravityFoldedBackgroundHold.timer);
+  antigravityFoldedBackgroundHold = undefined;
   const pending = antigravityFoldedReconcilePending;
   if (!pending) return;
   antigravityFoldedReconcilePending = undefined;
@@ -9615,15 +9630,91 @@ function reconcileCompletedAntigravityTurnsAtPromptReady(
   };
 }
 
+function settleCompletedAntigravityFoldedTurn(promotedTurnId: string, reason: string): void {
+  markTurnRetired(promotedTurnId);
+  releaseActiveTurnAuthority(reason);
+  syncQueuedTurnsFromMarkerDisk();
+  if (queuedTypeAheadTurns.length > 0) {
+    advanceQueuedTypeAheadTurn(reason);
+    queuedTurnAdvanceConsumedForPrompt = undefined;
+  }
+  writeCliPidMarker();
+  if (renderer && pendingMessages.length === 0 && pendingAdoptMessages.length === 0
+    && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
+    const { content } = renderer.snapshot();
+    send({
+      type: 'screen_update',
+      content,
+      ...classifyUsageLimitWithNativeEvidence(content, projectedRuntimeScreenStatus()),
+      ...backgroundWaitPayload(),
+      ...modelRequestPayload(),
+      turnId: currentBotmuxTurnId,
+      dispatchAttempt: currentBotmuxDispatchAttempt,
+    });
+  }
+}
+
+function trySettleAntigravityFoldedBackgroundHold(reason: string): boolean {
+  const hold = antigravityFoldedBackgroundHold;
+  if (!hold) return false;
+  const active = activeTurnAuthority.snapshot();
+  if (
+    !isPromptReady
+    || cliSpawnGeneration !== hold.cliSpawnGeneration
+    || cliRestartInProgress
+    || webTerminalSubmitGeneration !== hold.webTerminalSubmitGeneration
+    || currentBotmuxTurnId !== hold.turnId
+    || currentBotmuxDispatchAttempt !== hold.dispatchAttempt
+    || active?.turnId !== hold.turnId
+    || active.dispatchAttempt !== hold.dispatchAttempt
+    || active.started !== true
+    || durableTurnInFlight
+    || pendingMessages.length > 0
+    || pendingRawInputs.length > 0
+    || isFlushing
+  ) {
+    cancelAntigravityFoldedReconcilePending();
+    return false;
+  }
+  if (typeof hasLiveAntigravityPendingTasks === 'function' && hasLiveAntigravityPendingTasks()) {
+    publishScreenStatus('working');
+    return true;
+  }
+  // The sibling proof is durable turn history. Later tool/transcript activity
+  // cannot retract it; fresh live-work/interruption evidence decides settling.
+  const resumeTranscriptPath = hold.resumeTranscriptPath;
+  cancelAntigravityFoldedReconcilePending();
+  settleCompletedAntigravityFoldedTurn(hold.turnId, `prompt_ready_reconciled:${reason}`);
+  if (resumeTranscriptPath) {
+    const active = activeTurnAuthority.snapshot();
+    const nextPromotedTurnId = currentBotmuxTurnId
+      && currentBotmuxDispatchAttempt === undefined
+      && !retiredTurnIds.has(currentBotmuxTurnId)
+      && active?.turnId === currentBotmuxTurnId
+      && active.dispatchAttempt === undefined
+      && active.started === true
+      ? currentBotmuxTurnId
+      : undefined;
+    // The retired hold's window ended with B. A remaining successor starts its
+    // own bounded sibling episode only after the background handoff completes.
+    if (nextPromotedTurnId || queuedTypeAheadTurns.some(q => q.dispatchAttempt === undefined)) {
+      armAntigravityFoldedReconcilePending(resumeTranscriptPath, nextPromotedTurnId);
+    }
+  }
+  return true;
+}
+
 function tryReconcilePendingAntigravityFoldedTurns(reason: string): boolean {
   const pending = antigravityFoldedReconcilePending;
   if (!pending) return false;
+  // Do not fence on PTY output here: background footer redraws advance it.
+  // Spawn/turn/direct-submit identities invalidate stale work; the reconcile
+  // below always reads fresh transcript evidence for that exact identity.
   if (
     !isPromptReady
     || cliSpawnGeneration !== pending.cliSpawnGeneration
     || cliRestartInProgress
-    || ptyOutputGeneration.snapshot() !== pending.ptyOutputGeneration
-    || webTerminalInputGeneration !== pending.webTerminalInputGeneration
+    || webTerminalSubmitGeneration !== pending.webTerminalSubmitGeneration
     || currentBotmuxTurnId !== pending.currentTurnId
     || currentBotmuxDispatchAttempt !== pending.currentDispatchAttempt
     || durableTurnInFlight
@@ -9639,7 +9730,6 @@ function tryReconcilePendingAntigravityFoldedTurns(reason: string): boolean {
   const res = reconcileCompletedAntigravityTurnsAtPromptReady(pending.promotedTurnId);
   if (res.reconciled) {
     const promotedTurnId = pending.promotedTurnId;
-    cancelAntigravityFoldedReconcilePending();
     if (
       res.completedCurrentTurn
       && promotedTurnId
@@ -9649,29 +9739,22 @@ function tryReconcilePendingAntigravityFoldedTurns(reason: string): boolean {
     ) {
       const stillPendingTasks = typeof hasLiveAntigravityPendingTasks === 'function'
         && hasLiveAntigravityPendingTasks();
-      if (!stillPendingTasks) {
-        markTurnRetired(promotedTurnId);
-        releaseActiveTurnAuthority(`prompt_ready_reconciled:${reason}`);
-        syncQueuedTurnsFromMarkerDisk();
-        if (queuedTypeAheadTurns.length > 0) {
-          advanceQueuedTypeAheadTurn(`prompt_ready_reconciled:${reason}`);
-          queuedTurnAdvanceConsumedForPrompt = undefined;
-        }
-        writeCliPidMarker();
-        if (renderer && pendingMessages.length === 0 && pendingAdoptMessages.length === 0
-          && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
-          const { content } = renderer.snapshot();
-          send({
-            type: 'screen_update',
-            content,
-            ...classifyUsageLimitWithNativeEvidence(content, projectedRuntimeScreenStatus()),
-            ...backgroundWaitPayload(),
-            ...modelRequestPayload(),
-            turnId: currentBotmuxTurnId,
-            dispatchAttempt: currentBotmuxDispatchAttempt,
-          });
-        }
+      if (stillPendingTasks) {
+        cancelAntigravityFoldedReconcilePending();
+        antigravityFoldedBackgroundHold = {
+          cliSpawnGeneration: pending.cliSpawnGeneration,
+          turnId: promotedTurnId,
+          dispatchAttempt: currentBotmuxDispatchAttempt,
+          webTerminalSubmitGeneration: pending.webTerminalSubmitGeneration,
+          resumeTranscriptPath: res.pendingSibling ? res.transcriptPath : undefined,
+        };
+        publishScreenStatus('working');
+        return true;
       }
+      cancelAntigravityFoldedReconcilePending();
+      settleCompletedAntigravityFoldedTurn(promotedTurnId, `prompt_ready_reconciled:${reason}`);
+    } else {
+      cancelAntigravityFoldedReconcilePending();
     }
     // Partial reconciliation (e.g. om_B flushed to compact before om_C): re-arm
     // within the original budget whenever sibling skew still holds on live work.
@@ -9762,8 +9845,7 @@ function armAntigravityFoldedReconcilePending(
   cancelAntigravityFoldedReconcilePending();
   const pending: AntigravityFoldedReconcilePending = {
     cliSpawnGeneration,
-    ptyOutputGeneration: ptyOutputGeneration.snapshot(),
-    webTerminalInputGeneration,
+    webTerminalSubmitGeneration,
     currentTurnId: currentBotmuxTurnId,
     currentDispatchAttempt: currentBotmuxDispatchAttempt,
     promotedTurnId,
@@ -11436,6 +11518,16 @@ function observeAntigravityFooterBackgroundTasks(screen: string | undefined): vo
   const parsed = parseAntigravityFooterBackgroundTasks(screen);
   if (parsed === undefined) return;
   antigravityFooterBackgroundTasks = parsed;
+  const hold = parsed === 0 ? antigravityFoldedBackgroundHold : undefined;
+  if (!hold || hold.timer) return;
+  // A footer clear need not write either transcript. Re-drive outside the
+  // sampler stack; all normal generation/turn fences run when the timer fires.
+  hold.timer = setTimeout(() => {
+    if (antigravityFoldedBackgroundHold !== hold) return;
+    hold.timer = undefined;
+    trySettleAntigravityFoldedBackgroundHold('footer_clear');
+  }, 0);
+  hold.timer.unref();
 }
 
 function computeBackgroundCotHold(nowMs = Date.now()): boolean {
@@ -27402,6 +27494,10 @@ function markPromptReady(): void {
   }
   if (isPromptReady) {
     stopStructuredStartGraceRecheck();
+    if (antigravityFoldedBackgroundHold) {
+      trySettleAntigravityFoldedBackgroundHold('prompt_ready_reentry');
+      return;
+    }
     if (typeof antigravityFoldedReconcilePending !== 'undefined'
       && antigravityFoldedReconcilePending
       && typeof tryReconcilePendingAntigravityFoldedTurns === 'function') {

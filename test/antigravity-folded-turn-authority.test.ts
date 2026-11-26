@@ -15,6 +15,8 @@ import { TurnTerminalDeduper } from '../src/services/turn-terminal-deduper.js';
 import { atomicWriteFileSync } from '../src/utils/atomic-write.js';
 import { isValidMarkerIdentityTurnId } from '../src/core/turn-id-shape.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { isAntigravityInterruptedScreen, parseAntigravityFooterBackgroundTasks } from '../src/adapters/cli/antigravity.js';
+import { PtyOutputGeneration } from '../src/utils/runtime-screen-status.js';
 
 function withTempWorkspace(fn: (dir: string) => void): void {
   const dir = mkdtempSync(join(tmpdir(), 'agy-folded-turn-'));
@@ -692,10 +694,20 @@ describe('Antigravity prompt_ready folded-turn reconciliation', () => {
               plannerDoneRecord(3),
             ].join('\n') + '\n';
 
+            const idleFooter = '────────\n>\n────────\n? for shortcuts';
+            const pendingFooter = `${idleFooter} · gemini-4-neon · 1 task(s) · /tasks`;
+            const interruptedFooter = [
+              '  ⎿  Interrupted · What should Antigravity CLI do instead?',
+              '────────',
+              '>',
+              '────────',
+              '? for shortcuts · gemini-4-neon · 1 task(s) · /tasks',
+            ].join('\n');
+
             // Compact sibling is transiently missing on first ready.
             writeFileSync(fullPath, doneLines);
 
-            const makeReadyScope = () => {
+            const makeReadyScope = (liveScreen?: () => string) => {
               const h = workerHarness({ markerPath: marker, transcriptPath: fullPath, cliSessionId: 'conv-heal' });
               Object.assign(h, {
                 isPromptReady: false,
@@ -711,7 +723,9 @@ describe('Antigravity prompt_ready folded-turn reconciliation', () => {
                 pendingSessionRename: null,
                 isFlushing: false,
                 webTerminalInputGeneration: 0,
+                webTerminalSubmitGeneration: 0,
                 renderer: undefined,
+                publishScreenStatus: vi.fn(),
                 idleDetector: undefined,
                 stuckDetector: undefined,
                 awaitingFirstPrompt: false,
@@ -762,9 +776,25 @@ describe('Antigravity prompt_ready folded-turn reconciliation', () => {
                 settleRestartAttemptOnReady: () => {},
                 decideQueuedReadyTransition,
               });
+              if (liveScreen) {
+                Object.assign(h, {
+                  structuredBridgeIs: (id: string) => id === 'antigravity',
+                  backendScreenEvidenceIsAuthoritativeForMutation: () => true,
+                  captureBackendScreen: () => liveScreen(),
+                  isAntigravityInterruptedScreen,
+                  parseAntigravityFooterBackgroundTasks,
+                  codexBridgeFallbackActive: () => false,
+                  resolveLiveAntigravityTranscriptPath: () => undefined,
+                });
+                h.cliAdapter.runnerFramedInput = false;
+                h.ptyOutputGeneration = new PtyOutputGeneration();
+                h.hasLiveAntigravityPendingTasks = loadWorkerFunction('hasLiveAntigravityPendingTasks', h);
+                h.observeAntigravityFooterBackgroundTasks = loadWorkerFunction('observeAntigravityFooterBackgroundTasks', h);
+              }
               h.armAntigravityFoldedReconcilePending = loadWorkerFunction('armAntigravityFoldedReconcilePending', h);
               h.tryReconcilePendingAntigravityFoldedTurns = loadWorkerFunction('tryReconcilePendingAntigravityFoldedTurns', h);
               h.cancelAntigravityFoldedReconcilePending = loadWorkerFunction('cancelAntigravityFoldedReconcilePending', h);
+              h.trySettleAntigravityFoldedBackgroundHold = loadWorkerFunction('trySettleAntigravityFoldedBackgroundHold', h);
               h.markPromptReady = loadWorkerFunction('markPromptReady', h);
               h.setCaptureIdentity('om_B');
               h.markActiveTurnStarted({ turnId: 'om_B' });
@@ -775,7 +805,7 @@ describe('Antigravity prompt_ready folded-turn reconciliation', () => {
             };
 
             // Experiment A: timer retry heals automatically once compact sibling lands.
-            const hTimer = makeReadyScope();
+            const hTimer = makeReadyScope(() => idleFooter);
             hTimer.markPromptReady();
             expect(hTimer.isPromptReady).toBe(true);
             expect(hTimer.currentBotmuxTurnId).toBe('om_B');
@@ -790,6 +820,137 @@ describe('Antigravity prompt_ready folded-turn reconciliation', () => {
             expect(hTimer.retiredTurnIds.has('om_B')).toBe(true);
             expect(hTimer.antigravityFoldedReconcilePending).toBeUndefined();
             hTimer.cancelAntigravityFoldedReconcilePending();
+
+            // Footer-only background work keeps a spawn/turn-scoped hold across
+            // real output-generation advances and repeated ready/fs-watch edges.
+            // Its clear redraw needs no transcript write and may arrive after the
+            // folded reconcile window has ended.
+            let liveScreen = idleFooter;
+            rmSync(compactPath, { force: true });
+            const hBackground = makeReadyScope(() => liveScreen);
+            const feedBackground = (screen: string) => {
+              liveScreen = screen;
+              hBackground.ptyOutputGeneration.observe();
+            };
+            hBackground.markPromptReady();
+            expect(hBackground.antigravityFoldedReconcilePending).toMatchObject({ attempts: 0 });
+            feedBackground(pendingFooter);
+            writeFileSync(compactPath, doneLines);
+            vi.advanceTimersByTime(60);
+            expect(hBackground.currentBotmuxTurnId).toBe('om_B');
+            expect(hBackground.queuedTypeAheadTurns.map((t: any) => t.turnId)).toEqual(['om_C']);
+            expect(hBackground.antigravityFoldedReconcilePending).toBeUndefined();
+            expect(hBackground.antigravityFoldedBackgroundHold).toMatchObject({
+              cliSpawnGeneration: 1,
+              turnId: 'om_B',
+            });
+            expect(hBackground.antigravityFoldedBackgroundHold?.timer).toBeUndefined();
+            expect(hBackground.isPromptReady).toBe(true);
+            expect(hBackground.publishScreenStatus).toHaveBeenCalledWith('working');
+
+            // Later transcript activity cannot retract the already-proven B
+            // completion or cancel the independent background hold.
+            writeFileSync(compactPath, doneLines + JSON.stringify({
+              step_index: 4, source: 'MODEL', type: 'GENERIC', status: 'RUNNING', content: 'background output',
+            }) + '\n');
+            expect(hBackground.tryReconcilePendingAntigravityFoldedTurns('fs_watch')).toBe(false);
+            hBackground.trySettleAntigravityFoldedBackgroundHold('fs_watch');
+            expect(hBackground.antigravityFoldedBackgroundHold?.turnId).toBe('om_B');
+            writeFileSync(compactPath, doneLines);
+
+            feedBackground(pendingFooter);
+            hBackground.markPromptReady();
+            expect({
+              current: hBackground.currentBotmuxTurnId,
+              queued: hBackground.queuedTypeAheadTurns.map((t: any) => t.turnId),
+              authority: hBackground.activeTurnAuthority.snapshot()?.turnId,
+              ready: hBackground.isPromptReady,
+              hold: hBackground.antigravityFoldedBackgroundHold?.turnId,
+            }).toEqual({ current: 'om_B', queued: ['om_C'], authority: 'om_B', ready: true, hold: 'om_B' });
+
+            vi.advanceTimersByTime(30_000);
+            expect(hBackground.currentBotmuxTurnId).toBe('om_B');
+            expect(hBackground.queuedTypeAheadTurns.map((t: any) => t.turnId)).toEqual(['om_C']);
+
+            feedBackground(idleFooter);
+            hBackground.observeAntigravityFooterBackgroundTasks(liveScreen);
+            expect(hBackground.antigravityFoldedBackgroundHold?.timer).toBeDefined();
+            // Ordinary Web Terminal typing is not a new turn and must not cancel
+            // the already-queued clear settlement.
+            hBackground.webTerminalInputGeneration++;
+            vi.advanceTimersByTime(0);
+            expect(hBackground.currentBotmuxTurnId).toBe('om_C');
+            expect(hBackground.activeTurnAuthority.snapshot()?.turnId).toBe('om_C');
+            expect(hBackground.queuedTypeAheadTurns).toEqual([]);
+            expect(hBackground.retiredTurnIds.has('om_B')).toBe(true);
+            expect(hBackground.antigravityFoldedBackgroundHold).toBeUndefined();
+            hBackground.cancelAntigravityFoldedReconcilePending();
+
+            // A footer-clear timer already queued for the old CLI generation
+            // must cancel itself rather than release/advance the replaced turn.
+            let generationScreen = idleFooter;
+            rmSync(compactPath, { force: true });
+            const hHeldGeneration = makeReadyScope(() => generationScreen);
+            const feedGeneration = (screen: string) => {
+              generationScreen = screen;
+              hHeldGeneration.ptyOutputGeneration.observe();
+            };
+            hHeldGeneration.markPromptReady();
+            feedGeneration(pendingFooter);
+            writeFileSync(compactPath, doneLines);
+            vi.advanceTimersByTime(60);
+            expect(hHeldGeneration.antigravityFoldedBackgroundHold?.turnId).toBe('om_B');
+            feedGeneration(idleFooter);
+            hHeldGeneration.observeAntigravityFooterBackgroundTasks(generationScreen);
+            expect(hHeldGeneration.antigravityFoldedBackgroundHold?.timer).toBeDefined();
+            hHeldGeneration.cliSpawnGeneration = 2;
+            vi.advanceTimersByTime(0);
+            expect(hHeldGeneration.currentBotmuxTurnId).toBe('om_B');
+            expect(hHeldGeneration.activeTurnAuthority.snapshot()?.turnId).toBe('om_B');
+            expect(hHeldGeneration.queuedTypeAheadTurns.map((t: any) => t.turnId)).toEqual(['om_C']);
+            expect(hHeldGeneration.antigravityFoldedBackgroundHold).toBeUndefined();
+            hHeldGeneration.cancelAntigravityFoldedReconcilePending();
+
+            // A direct Web submit, unlike ordinary typing, starts new local work
+            // and must invalidate the old hold before its clear timer fires.
+            let submitScreen = idleFooter;
+            rmSync(compactPath, { force: true });
+            const hHeldSubmit = makeReadyScope(() => submitScreen);
+            hHeldSubmit.markPromptReady();
+            submitScreen = pendingFooter;
+            hHeldSubmit.ptyOutputGeneration.observe();
+            writeFileSync(compactPath, doneLines);
+            vi.advanceTimersByTime(60);
+            expect(hHeldSubmit.antigravityFoldedBackgroundHold?.turnId).toBe('om_B');
+            submitScreen = idleFooter;
+            hHeldSubmit.ptyOutputGeneration.observe();
+            hHeldSubmit.observeAntigravityFooterBackgroundTasks(submitScreen);
+            expect(hHeldSubmit.antigravityFoldedBackgroundHold?.timer).toBeDefined();
+            hHeldSubmit.webTerminalSubmitGeneration++;
+            vi.advanceTimersByTime(0);
+            expect(hHeldSubmit.currentBotmuxTurnId).toBe('om_B');
+            expect(hHeldSubmit.queuedTypeAheadTurns.map((t: any) => t.turnId)).toEqual(['om_C']);
+            expect(hHeldSubmit.antigravityFoldedBackgroundHold).toBeUndefined();
+            hHeldSubmit.cancelAntigravityFoldedReconcilePending();
+
+            // Explicit interruption is fresh terminal evidence even though its
+            // redraw advances output generation and still shows a task count.
+            let interruptedScreen = idleFooter;
+            rmSync(compactPath, { force: true });
+            const hHeldInterrupt = makeReadyScope(() => interruptedScreen);
+            hHeldInterrupt.markPromptReady();
+            interruptedScreen = pendingFooter;
+            hHeldInterrupt.ptyOutputGeneration.observe();
+            writeFileSync(compactPath, doneLines);
+            vi.advanceTimersByTime(60);
+            expect(hHeldInterrupt.antigravityFoldedBackgroundHold?.turnId).toBe('om_B');
+            interruptedScreen = interruptedFooter;
+            hHeldInterrupt.ptyOutputGeneration.observe();
+            hHeldInterrupt.markPromptReady();
+            expect(hHeldInterrupt.currentBotmuxTurnId).toBe('om_C');
+            expect(hHeldInterrupt.queuedTypeAheadTurns).toEqual([]);
+            expect(hHeldInterrupt.antigravityFoldedBackgroundHold).toBeUndefined();
+            hHeldInterrupt.cancelAntigravityFoldedReconcilePending();
 
             // Experiment B: markPromptReady() re-entry while isPromptReady===true reconciles immediately.
             rmSync(compactPath, { force: true });
@@ -839,11 +1000,21 @@ describe('Antigravity prompt_ready folded-turn reconciliation', () => {
               plannerDoneRecord(5),
             ].join('\n') + '\n';
             writeFileSync(fullPath, bothDoneFull);
-            const hPartial = makeReadyScope();
+            let partialScreen = idleFooter;
+            const hPartial = makeReadyScope(() => partialScreen);
             hPartial.markPromptReady();
-            // Step 1: compact only flushed through om_B DONE -> advances B -> C and re-arms for C!
+            // Step 1: compact only flushed through om_B DONE. Footer work holds B
+            // without consuming C's later sibling reconciliation.
+            partialScreen = pendingFooter;
+            hPartial.ptyOutputGeneration.observe();
             writeFileSync(compactPath, doneLines);
             vi.advanceTimersByTime(60);
+            expect(hPartial.currentBotmuxTurnId).toBe('om_B');
+            expect(hPartial.antigravityFoldedBackgroundHold?.turnId).toBe('om_B');
+            partialScreen = idleFooter;
+            hPartial.ptyOutputGeneration.observe();
+            hPartial.observeAntigravityFooterBackgroundTasks(partialScreen);
+            vi.advanceTimersByTime(0);
             expect(hPartial.currentBotmuxTurnId).toBe('om_C');
             expect(hPartial.antigravityFoldedReconcilePending).toBeDefined();
             // Step 2: compact flushes om_C DONE -> releases authority completely!
