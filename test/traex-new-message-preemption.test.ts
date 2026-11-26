@@ -7,6 +7,10 @@ import { workerSubmitHarness } from './helpers/worker-submit-harness.js';
 import { traexRestoredComposerReady, traexComposerHoldsInput } from '../src/adapters/cli/traex-footer.js';
 import { inputForcesSerialTurn, pendingInputAllowsTypeAhead } from '../src/utils/pending-input-queue.js';
 import { shouldWriteNow } from '../src/utils/input-gate.js';
+import { shouldAllowTypeAheadOnReattach } from '../src/services/queued-activation-reconcile.js';
+import { decideQueuedReadyTransition } from '../src/core/queued-ready-transition.js';
+import { isStructuredBridgeLifecycleBlockingCli } from '../src/services/structured-bridge-clis.js';
+import { TurnExecutionClock } from '../src/services/turn-execution-clock.js';
 
 const busy = readFileSync(new URL('./fixtures/session-rename/traex-0.216.0-renamed-while-busy.txt', import.meta.url), 'utf8');
 const caller = { senderType: 'user' as const, requestUserOpenId: 'owner', requestLarkAppId: 'app' };
@@ -180,6 +184,7 @@ describe('ordinary TraeX new-message preemption', () => {
     Object.assign(h.scope, {
       initPromptMaterialized: true, rememberTurnLinkRefMode: vi.fn(), inputForcesSerialTurn,
       runtimePtyInputPolicy: () => ({ supportsTypeAhead: true, allowBackToBackWrites: true }),
+      reattachOpenTurnGate: true, shouldAllowTypeAheadOnReattach,
       pendingInputAllowsTypeAhead, directRpcTurnBlocksTypeAhead: () => false, activeTurnBlocks: () => false,
       traexAutoModelRuntimeEligible: () => false, shouldWriteNow, idleDetector: { isStartupComplete: () => true, reset: vi.fn() },
       shouldHoldCodexRunnerInput: () => false,
@@ -194,10 +199,91 @@ describe('ordinary TraeX new-message preemption', () => {
     arrival('correction', 'om_new', { trustedCaller: caller });
     await vi.waitFor(() => expect(order).toEqual(['om_new']));
     expect(h.scope.flushPending).not.toHaveBeenCalled();
+    expect(h.scope.reattachOpenTurnGate).toBe(true);
     Object.assign(submission.scope, { lastInitConfig: { cliId: 'traex' },
       traexPreemptionHoldsWrites: () => true, armTraexPreemptionPoll: vi.fn() });
     await submission.flush();
     expect(submission.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+  });
+
+  it('releases the reattach gate through real prompt readiness only after exact abort and an empty composer', async () => {
+    const h = harness();
+    const submission = workerSubmitHarness();
+    const idle = busy.replace(/^◆ Working[^\n]*\n/m, '');
+    submission.queue.mark('om_old', 'original task', Date.now());
+    submission.queue.ingest([{ kind: 'user', text: 'original task', uuid: 'old-input',
+      sourceSessionId: 'native-sid', sourceTurnId: 'native-old', timestampMs: Date.now() }]);
+    Object.assign(h.scope, {
+      reattachOpenTurnGate: true, shouldAllowTypeAheadOnReattach,
+      codexBridgeQueue: submission.queue, isStructuredBridgeLifecycleBlockingCli,
+      rpcTurnsAwaitingActivation: new Map(), rpcLifecycleFailClosedOwners: new Map(),
+      rpcTerminalHydrationOwners: new Map(), turnExecutionClock: new TurnExecutionClock(),
+      retiredTurnIds: new Set(),
+      workerSessionEventScope: undefined,
+      traexNativeStartupInputIsPending: () => false, traexFirstPromptViewportRejects: () => false,
+      currentPostTerminalInputFence: () => false, probeStartupBlocker: () => false,
+      holdForNativeSessionFork: () => false, stopBusyPatternIdleProbe: vi.fn(),
+      stopStructuredStartGraceRecheck: vi.fn(),
+      readyGate: { shouldHold: () => false }, freshnessInputQueue: { onPromptReady: () => 'continue' },
+      spawnArgvTurnStartGateHolds: () => false,
+      releaseInterruptedStructuredBridgeOnFirstPrompt: vi.fn(),
+      ptyOutputGeneration: { snapshot: () => 1 }, queuedTypeAheadTurns: [], decideQueuedReadyTransition,
+      releaseActiveTurnAuthority: (_reason: string, identity: any) => {
+        if (identity) h.scope.activeTurnAuthority.releaseExact(identity);
+      },
+      setCaptureIdentity: (turnId?: string, attempt?: number) => {
+        h.scope.currentBotmuxTurnId = turnId; h.scope.currentBotmuxDispatchAttempt = attempt;
+      },
+      writeCliPidMarker: vi.fn(), judgeClaudeBridgeTurn: vi.fn(),
+      bridgeQueue: { cliQueueDrained: vi.fn() }, settleSessionRenameOnPrompt: vi.fn(),
+      syncQueuedTurnsFromMarkerDisk: () => false, stuckDetector: null,
+      maybeEmitWorkflowTranscriptOutput: vi.fn(),
+      refreshBackgroundWait: vi.fn(), settleRestartAttemptOnReady: vi.fn(),
+      shouldFlushInjectionsFirst: () => false,
+      idleDetector: { isStartupPending: () => false, reset: vi.fn(), adoptPromptReady: vi.fn() },
+    });
+    h.scope.inflightInputs.onTurnComplete = vi.fn();
+    h.scope.hasStructuredLifecycleBlock = loadWorkerFunction('hasStructuredLifecycleBlock', h.scope);
+    h.scope.markTurnRetired = loadWorkerFunction('markTurnRetired', h.scope);
+    h.scope.retireStructuredTurnAttribution = loadWorkerFunction('retireStructuredTurnAttribution', h.scope);
+    h.scope.releaseRawInputRestartGate = loadWorkerFunction('releaseRawInputRestartGate', h.scope);
+    h.scope.markPromptReady = loadWorkerFunction('markPromptReady', h.scope);
+    h.scope.flushPending = vi.fn(async () => {
+      Object.assign(submission.scope, {
+        pendingMessages: h.scope.pendingMessages, lastInitConfig: { cliId: 'traex' },
+        reattachOpenTurnGate: h.scope.reattachOpenTurnGate, shouldAllowTypeAheadOnReattach,
+        pendingInputAllowsTypeAhead, isPromptReady: h.scope.isPromptReady,
+        traexPreemptionHoldsWrites: () => !!h.scope.traexPreemption,
+      });
+      submission.scope.freshnessInputQueue.takeNormal = () => h.scope.pendingMessages.shift();
+      submission.scope.cliAdapter.writeInput.mockResolvedValue({ submitted: true });
+      await submission.flush();
+    });
+    h.preempt(h.scope.pendingMessages[0], h.target);
+    await vi.waitFor(() => expect(h.target.sendSpecialKeys).toHaveBeenCalledOnce());
+    h.scope.markPromptReady();
+    expect(h.scope.reattachOpenTurnGate).toBe(true);
+    expect(h.scope.isPromptReady).toBe(false);
+    expect(submission.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+    const aborted = { kind: 'assistant_final' as const, text: '',
+      uuid: 'old-abort', timestampMs: Date.now(),
+      terminalStatus: 'ambiguous', terminalErrorCode: 'traex_turn_aborted:interrupted',
+      sourceSessionId: 'native-sid', sourceTurnId: 'native-old' };
+    submission.queue.ingest([aborted]);
+    h.scope.observeTraexPreemptionTerminal([aborted]);
+    expect(h.scope.hasStructuredLifecycleBlock()).toBe(false);
+    expect(h.scope.activeTurnAuthority.snapshot()).toBeUndefined();
+    expect(h.scope.reattachOpenTurnGate).toBe(true);
+    h.target.captureInputState = () => ({ viewport: idle });
+    await h.scope.resolveTraexPreemption();
+    expect(h.scope.traexPreemption).toBeUndefined();
+    expect(h.scope.reattachOpenTurnGate).toBe(false);
+    await vi.waitFor(() => expect(submission.scope.cliAdapter.writeInput).toHaveBeenCalledOnce());
+    expect(h.scope.pendingMessages).toHaveLength(0);
+    expect(h.scope.emitTurnTerminal).toHaveBeenCalledExactlyOnceWith(
+      'om_old', 'cancelled', 'preempted_by_user_message', undefined,
+    );
+    expect(h.scope.send.mock.calls.map(([event]) => event).filter(event => event.type === 'prompt_ready')).toHaveLength(1);
   });
 
   it('observes the exact abort after the real TraeX bridge ingestion and before final emission', async () => {

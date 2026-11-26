@@ -8,6 +8,7 @@ import { stripAnsiScreenText } from '../src/utils/idle-detector.js';
 import { shouldWriteNow, decideFirstWriteLiveness } from '../src/utils/input-gate.js';
 import { loadWorkerFunction, loadWorkerMessageHandler } from './helpers/worker-function-harness.js';
 import { workerSubmitHarness } from './helpers/worker-submit-harness.js';
+import { shouldAllowTypeAheadOnReattach } from '../src/services/queued-activation-reconcile.js';
 
 const busy = readFileSync(new URL('./fixtures/session-rename/traex-0.216.0-renamed-while-busy.txt', import.meta.url), 'utf8');
 const caller = { senderType: 'user' as const, requestUserOpenId: 'owner', requestLarkAppId: 'app' };
@@ -80,6 +81,18 @@ function reattachHarness() {
 }
 
 describe('plain TRAE busy input after persistent worker reattach', () => {
+  it('keeps the live reattach gate armed even when the busy composer has exact ownership evidence', async () => {
+    const h = reattachHarness();
+    Object.assign(h.scope, { reattachOpenTurnGate: true, shouldAllowTypeAheadOnReattach });
+    await h.flush();
+    expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+    expect(h.scope.pendingMessages).toHaveLength(1);
+    expect(h.scope.reattachOpenTurnGate).toBe(true);
+    expect(h.scope.isPromptReady).toBe(false);
+    expect(h.scope.awaitingFirstPrompt).toBe(true);
+    expect(h.scope.sessionRenamePhase).toBe('idle');
+  });
+
   it('flushes a fresh human correction without a new idle event or rename recovery', async () => {
     const h = reattachHarness();
     await h.flush();

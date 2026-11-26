@@ -244,6 +244,8 @@ function lifecycleHarness() {
     },
     rpcTurnsAwaitingActivationIdentities: new Map(), rpcTurnsAwaitingActivationReplayAnchors: new Map(),
     pendingRpcTurnTerminals: new Map(), rpcLifecycleFailClosedIdentities: new Map(),
+    // These ordinary steering fixtures have no tokened queued activation.
+    ambiguousRpcActivationTokens: new Map(), pendingAmbiguousFreshRpcActivation: undefined,
     rpcTerminalHydrationTimers: new Map(), rpcTerminalHydrationTerminals: new Map(),
     CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS: [10, 20],
     universalOutputHandoff: false, checkpointCodexAdoptRecovery: vi.fn(), checkpointStructuredBridgeRecovery: vi.fn(),
