@@ -17,7 +17,13 @@ function harness() {
   const inputSet = inputs.set.bind(inputs);
   inputs.set = (result: object, input: any) => { handoffs.push({ result, input }); return inputSet(result, input); };
   const events: Array<Record<string, any>> = [];
-  const requests: Array<{ body: any; resolve: (response: Response) => void; reject: (error: Error) => void }> = [];
+  type Request = { body: any; resolve: (response: Response) => void; reject: (error: Error) => void };
+  const requests: Request[] = [];
+  const requestWaiters: Array<(request: Request) => void> = [];
+  const takeRequest = (): Promise<Request> => {
+    const queued = requests.shift();
+    return queued ? Promise.resolve(queued) : new Promise(resolve => requestWaiters.push(resolve));
+  };
   const postCodexAsk = productionFunction('src/services/codex-user-input.ts', 'postCodexAsk', {
     randomUUID,
     NATIVE_STANDALONE_ASK_ORIGIN,
@@ -30,7 +36,10 @@ function harness() {
     findOnlineDaemon: () => undefined,
     loopbackFetch: () => { throw new Error('unexpected loopback fetch'); },
     fetchDaemonIpc: (_port: number, _path: string, init: RequestInit) => new Promise<Response>((resolve, reject) => {
-      requests.push({ body: JSON.parse(String(init.body)), resolve, reject });
+      const request = { body: JSON.parse(String(init.body)), resolve, reject };
+      const waiter = requestWaiters.shift();
+      if (waiter) waiter(request);
+      else requests.push(request);
     }),
   });
   const lastInitConfig = {
@@ -93,8 +102,7 @@ function harness() {
   async function start() {
     const controller = new AbortController();
     const pending = bridge.deps.ask(question, controller.signal, { delivery: 'async' });
-    while (requests.length === 0) await Promise.resolve();
-    const request = requests.shift()!;
+    const request = await takeRequest();
     const input = {
       type: 'message', turnId: `native-question-answer-${request.body.requestId}`, content: 'Alpha',
       nativeQuestionAnswer: { requestId: request.body.requestId }, atMostOnce: true,
@@ -102,7 +110,7 @@ function harness() {
     await handleMessage(input);
     return { controller, pending, request, input };
   }
-  return { admissions, inputs, handoffs, events, requests, queue, inflight, releaseActiveTurnAuthority, bridge, handleMessage, start };
+  return { admissions, inputs, handoffs, events, takeRequest, queue, inflight, releaseActiveTurnAuthority, bridge, handleMessage, start };
 }
 
 const answered = () => ({ kind: 'answered', answers: [['1']], by: 'ou_probe', comment: null, timedOut: false });
@@ -130,13 +138,13 @@ describe('native answer admission handoff', () => {
   it.each(['abort', 'transport failure'])('settles an admitted answer once when %s prevents the HTTP handoff', async failure => {
     const h = harness();
     const { controller, pending, request, input } = await h.start();
-    const rejection = expect(pending).rejects.toThrow(failure === 'abort' ? 'question left the screen' : 'connection reset');
     if (failure === 'abort') {
       controller.abort(new Error('question left the screen'));
       request.resolve(response(answered()));
     } else {
       request.reject(new Error('connection reset'));
     }
+    const rejection = expect(pending).rejects.toThrow(failure === 'abort' ? 'question left the screen' : 'connection reset');
     await rejection;
     expect(h.handoffs).toHaveLength(0);
     expect(h.admissions.size).toBe(0);
@@ -164,8 +172,7 @@ describe('native answer admission handoff', () => {
       options: [{ number: 1, label: 'Alpha', other: false }, { number: 2, label: 'Beta', other: false }],
     };
     h.bridge.open(page, 'signature', 1);
-    while (h.requests.length === 0) await Promise.resolve();
-    const request = h.requests.shift()!;
+    const request = await h.takeRequest();
     request.resolve(response(answered()));
     await vi.advanceTimersByTimeAsync(0);
     expect(h.handoffs).toHaveLength(0);
