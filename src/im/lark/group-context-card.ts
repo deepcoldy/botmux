@@ -198,9 +198,10 @@ function buttonLink(node: CardNode): string | undefined {
 }
 
 /** An Ask's question or option as plain text: the card's own styling (colour and tag markup,
- * bold markers, Markdown escapes added for display) is not part of what was asked. */
+ * bold markers, Markdown escapes added for display) is not part of what was asked. The synthetic
+ * question number renders as `1\. ` on the card, so the escaped dot is unescaped here too. */
 function plainAskText(text: string): string {
-  return text.replace(/<\/?(?:font|text_tag)\b[^>]*>/g, '').replace(/(?<!\\)\*\*/g, '').replace(/\\([\\`*_~[\]])/g, '$1');
+  return text.replace(/<\/?(?:font|text_tag)\b[^>]*>/g, '').replace(/(?<!\\)\*\*/g, '').replace(/\\([\\`*_~[\].])/g, '$1');
 }
 
 /** Visible option text of an options region: legacy buttons, checker rows, one-click rows (their

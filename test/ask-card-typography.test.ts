@@ -3,6 +3,9 @@ import type { AskResult, PendingAsk } from '../src/core/ask-types.js';
 import { buildAskCard } from '../src/im/lark/ask-card.js';
 import { buildAskListBody, buildAskSettledBody, escapeQuestion, optionControls } from '../src/im/lark/ask-card-look.js';
 import { buildTurnReplyAskElements } from '../src/im/lark/turn-reply-ask-elements.js';
+import { t } from '../src/i18n/index.js';
+
+const recommendedTag = `<text_tag color='green'>${t('card.ask.recommended', undefined, 'zh')}</text_tag>`;
 
 const all = (value: unknown): any[] => value && typeof value === 'object' ? [value, ...Object.values(value).flatMap(all)] : [];
 const ask: PendingAsk = {
@@ -23,7 +26,7 @@ describe('Ask uses regular-weight questions and options', () => {
     const card = surface === 'embedded' ? buildTurnReplyAskElements({ ask: current }, 'zh') : JSON.parse(buildAskCard(current));
     expect(all(card).filter(n => n.text_size === 'heading').map(n => n.content))
       .toContain((surface === 'input_form' ? '1\\. ' : '') + '确认本次变更吗？');
-    expect(labelLines(card)).toEqual(["同意本次变更 <text_tag color='green'>推荐</text_tag>", '暂不修改']);
+    expect(labelLines(card)).toEqual([`同意本次变更 ${recommendedTag}`, '暂不修改']);
     expect(JSON.stringify(card)).toContain('保留现有交互');
     expect(JSON.stringify(card)).toContain('只修改显示样式，不改变提交行为。');
   });
@@ -37,14 +40,14 @@ describe('Ask uses regular-weight questions and options', () => {
     expect(all(card).find(n => n.text_size === 'heading').content).toBe('确认本次变更吗？');
     if (result.kind === 'answered') {
       expect(all(card).find(n => n.tag === 'markdown' && n.content.startsWith('✓ ')).content)
-        .toBe("✓ 同意本次变更 <text_tag color='green'>推荐</text_tag>\n<font color='grey'>保留现有交互</font>");
+        .toBe(`✓ 同意本次变更 ${recommendedTag}\n<font color='grey'>保留现有交互</font>`);
     }
     expect(all(card).filter(n => n.tag === 'checker')).toEqual([]);
   });
 
   it('compact controls and list fallback do not reintroduce bold', () => {
     const compact = optionControls(ask.questions[0], 0, new Set(['yes']), 'zh', 'compact', Infinity);
-    expect(labelLines(compact.elements)).toEqual(["同意本次变更 <text_tag color='green'>推荐</text_tag>", '暂不修改']);
+    expect(labelLines(compact.elements)).toEqual([`同意本次变更 ${recommendedTag}`, '暂不修改']);
     expect(all(compact.elements).filter(n => n.tag === 'checker').map(c => c.checked)).toEqual([true, false]);
     const options = { locale: 'zh' as const, prompt: escapeQuestion, descriptionCap: Infinity };
     const list = buildAskListBody(ask, options).elements[0].content;
