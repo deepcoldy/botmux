@@ -1,26 +1,34 @@
 import {
   capabilitiesOf,
+  credentialSourceOf,
   type TriggerUserAuthCapability,
   type TriggerUserAuthConfig,
   type TriggerUserAuthCredentialSource,
+  type TriggerUserAuthCredentialSourceCapability,
   type IdentityRouteTool,
 } from '../services/trigger-user-auth.js';
 
 export interface IdentityPolicy {
   /** Capabilities that run as the message sender; empty while the policy is off. */
   capabilities: ReadonlySet<TriggerUserAuthCapability>;
-  credentialSource: TriggerUserAuthCredentialSource;
+  credentialSources: Readonly<Record<TriggerUserAuthCredentialSourceCapability, TriggerUserAuthCredentialSource>>;
 }
 
 export function policyFromConfig(
   config: Pick<TriggerUserAuthConfig, 'enabled' | 'tools' | 'capabilities' | 'credentialSource'> | null | undefined,
 ): IdentityPolicy {
-  return { capabilities: capabilitiesOf(config), credentialSource: config?.credentialSource ?? 'auto' };
+  return {
+    capabilities: capabilitiesOf(config),
+    credentialSources: {
+      'lark-user': credentialSourceOf(config, 'lark-user'),
+      bytecloud: credentialSourceOf(config, 'bytecloud'),
+    },
+  };
 }
 
 /** The capability whose switch governs a published tool's identity. Meego is
  *  published through bytedcli but is its own switch (see publishMeegoOnly). */
-export function capabilityOfTool(tool: IdentityRouteTool): TriggerUserAuthCapability {
+export function capabilityOfTool(tool: IdentityRouteTool): TriggerUserAuthCredentialSourceCapability {
   return tool === 'lark-cli' ? 'lark-user' : 'bytecloud';
 }
 

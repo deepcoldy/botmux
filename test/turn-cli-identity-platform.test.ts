@@ -128,6 +128,37 @@ describe('credentialSource = local', () => {
   });
 });
 
+describe('credentialSource by capability on a bound host', () => {
+  it('uses local Lark and platform ByteCloud in the same turn', async () => {
+    larkHomes.set(ALICE, '/homes/alice');
+    bytedcliJwts.set(ALICE, { cloudJwt: 'local-cloud' });
+    grantResponse = granted('bytedcli');
+    const out = await publish(botConfig({
+      enabled: true, capabilities: ['lark-user', 'bytecloud'],
+      credentialSource: { 'lark-user': 'local', bytecloud: 'platform' },
+    }), ALICE);
+    expect(out).toEqual([{ tool: 'lark-cli', state: 'user' }, { tool: 'bytedcli', state: 'user' }]);
+    expect(grantCalls.map(req => req.tool)).toEqual(['bytedcli']);
+    expect(read('lark-cli')).toContain("BOTMUX_IDENTITY_MODE='user-home'");
+    expect(read('bytedcli')).toContain("BYTEDCLI_USER_CLOUD_JWT='cloud-jwt'");
+  });
+
+  it('uses local ByteCloud and refuses a missing platform Lark grant even with a local login', async () => {
+    larkHomes.set(ALICE, '/homes/alice');
+    bytedcliJwts.set(ALICE, { cloudJwt: 'local-cloud' });
+    const out = await publish(botConfig({
+      enabled: true, capabilities: ['lark-user', 'bytecloud'],
+      credentialSource: { default: 'platform', bytecloud: 'local' },
+    }), ALICE);
+    expect(out).toEqual([{ tool: 'lark-cli', state: 'needs-authorization' }, { tool: 'bytedcli', state: 'user' }]);
+    expect(grantCalls.map(req => req.tool)).toEqual(['lark-cli']);
+    expect(resolveLarkCliHomeForTurn).not.toHaveBeenCalled();
+    expect(beginLarkCliLogin).not.toHaveBeenCalled();
+    expect(read('lark-cli')).toContain('[reason=platform_not_authorized]');
+    expect(read('bytedcli')).toContain("BYTEDCLI_USER_CLOUD_JWT='local-cloud'");
+  });
+});
+
 describe('credentialSource = auto, machine unbound', () => {
   beforeEach(() => { bound = false; });
 

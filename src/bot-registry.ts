@@ -1542,8 +1542,7 @@ export interface BotConfig {
   brand?: Brand;
   /**
    * `botmux setup add|configure --extra-scopes-file` 记下的追加权限清单绝对路径，之后不带参的
-   * `setup configure` 沿用它。只有 setup 脚本化命令直接读写 bots.json 里的这个字段；
-   * {@link parseBotConfigsFromText} 不携带它，daemon 运行时也不用。
+   * `setup configure` 沿用它。daemon 用清单的 user 桶校验显式请求的 scope 名称。
    */
   extraScopesFile?: string;
   /**
@@ -4601,6 +4600,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // brand：只认精确的 'lark'，其余 → undefined（下游 normalizeBrand 当
       // feishu）。feishu 故意存成 undefined，保持旧 bots.json 干净、不写死字段。
       brand: entry.brand === 'lark' ? 'lark' : undefined,
+      extraScopesFile: typeof entry.extraScopesFile === 'string' ? entry.extraScopesFile.trim() || undefined : undefined,
       approvalDeferredScopes: normalizeApprovalDeferredScopes(entry.approvalDeferredScopes),
       cardActionAckTimeoutMs: normalizeCardActionAckTimeoutMs(entry.cardActionAckTimeoutMs),
       name: typeof entry.name === 'string' && entry.name.trim() ? entry.name.trim() : undefined,

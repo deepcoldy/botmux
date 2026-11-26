@@ -1,5 +1,5 @@
 import { getBot, getBotClient, getOwnerOpenId } from '../bot-registry.js';
-import { platformIncrementalAuthorizeUrl, resolveBoundLarkUserCredential } from '../core/lark-tool-platform-credential.js';
+import { boundLarkPlatformPolicy, platformIncrementalAuthorizeUrl, resolveBoundLarkUserCredential } from '../core/lark-tool-platform-credential.js';
 import { platformAuthorizeUrl } from '../core/platform-credential-source.js';
 import { askPlatformToAuthorize } from '../core/platform-authorization-request.js';
 import { hasReason, NOT_AUTHORIZED_REASONS } from '../core/refusal-reasons.js';
@@ -12,6 +12,9 @@ import { createOwnerGroupFollower, OwnerGroupFollowError } from './owner-group-f
 
 const AUTH_CODES = new Set([99991661, 99991663, 99991664, 99991668, 99991672, 99991677, 99991679]);
 const FOLLOW_SCOPES = ['im:chat:read', 'im:chat.members:write_only', 'offline_access'] as const;
+
+/** Internal cancellation: the follower releases, rather than retains, its notice claim. */
+class OwnerGroupFollowNotificationCancelled extends Error {}
 
 function apiData(json: any, status = 200): any {
   if (status >= 200 && status < 300 && json?.code === 0) return json.data;
@@ -124,6 +127,7 @@ export function startOwnerGroupFollow(appId: string, dataDir: string): { stop():
     },
     token: async (ownerOpenId, signal) => {
       const cfg = getBot(appId).config;
+      const policy = boundLarkPlatformPolicy(cfg);
       signal.throwIfAborted();
       const result = await resolveBoundLarkUserCredential({
         bot: cfg, openId: ownerOpenId, delegated: false,
@@ -133,6 +137,7 @@ export function startOwnerGroupFollow(appId: string, dataDir: string): { stop():
         botAppToken: id => resolveUserToken(appId, cfg.larkAppSecret, normalizeBrand(cfg.brand), id, signal),
       });
       signal.throwIfAborted();
+      if (policy !== boundLarkPlatformPolicy(getBot(appId).config)) throw new OwnerGroupFollowError(true);
       if (!result.ok && result.reason === 'platform') {
         throw new OwnerGroupFollowError(true, true, {
           authorizationSource: 'platform', authorizeUrl: result.authorizeUrl, guidance: result.error,
@@ -176,11 +181,13 @@ export function startOwnerGroupFollow(appId: string, dataDir: string): { stop():
       const cfg = getBot(appId).config;
       const currentOwner = () => !stopped && current() && getOwnerOpenId(appId) === ownerOpenId
         && getBot(appId).config.ownerGroupFollow?.enabled === true && !getBot(appId).config.apiOnly;
-      if (!currentOwner()) return;
+      const platformAllowed = () => boundLarkPlatformPolicy(getBot(appId).config) !== 'off';
+      if (!currentOwner()) return false;
+      if (issue?.authorizationSource === 'platform' && !platformAllowed()) return false;
       let platformNotice: string | undefined;
       if (issue?.authorizationSource === 'platform' && issue.authorizationRequired) {
         const requested = await askPlatformToAuthorize({ botConfig: cfg, openId: ownerOpenId, scopes: FOLLOW_SCOPES });
-        if (!currentOwner()) return;
+        if (!currentOwner() || !platformAllowed()) return false;
         switch (requested.kind) {
           case 'sent': platformNotice = '自动跟随需要你的群操作授权。平台已私聊发送授权卡片，请在卡片中完成授权，后台会在下一次检查时继续。'; break;
           case 'ready': platformNotice = '平台确认你的授权已可用，自动跟随会在下一次检查时继续。'; break;
@@ -205,13 +212,21 @@ export function startOwnerGroupFollow(appId: string, dataDir: string): { stop():
         : chatId
         ? `自动跟随未能把机器人加进这个群：\n${chatAppLink(chatId, normalizeBrand(cfg.brand))}\n请检查你是否有邀请权限，以及该群是否允许此机器人加入。自动重试已停止。`
         : '自动跟随新群已开启，但缺少可用的用户授权或群权限。请为本机器人授权 im:chat:read、im:chat.members:write_only 和 offline_access（也可使用已有 im:chat 授权），完成授权后后台会继续检查。首次成功检查只记录已有群。');
-      await sendUserMessage(appId, ownerOpenId, content, 'text', undefined, undefined, {
-        // The gate can queue or retry after this notify() was validated.
-        // Recheck immediately before every provider write as well.
-        beforeWrite: () => {
-          if (!currentOwner()) throw new Error('owner group follow notification cancelled');
-        },
-      });
+      try {
+        await sendUserMessage(appId, ownerOpenId, content, 'text', undefined, undefined, {
+          // The gate can queue or retry after this notify() was validated.
+          // Recheck immediately before every provider write as well.
+          beforeWrite: () => {
+            if (!currentOwner() || (issue?.authorizationSource === 'platform' && !platformAllowed())) {
+              throw new OwnerGroupFollowNotificationCancelled();
+            }
+          },
+        });
+        return true;
+      } catch (error) {
+        if (error instanceof OwnerGroupFollowNotificationCancelled) return false;
+        throw error;
+      }
     },
     log: message => logger.warn(`[owner-group-follow:${appId}] ${message}`),
   });
