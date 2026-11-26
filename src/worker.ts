@@ -519,7 +519,7 @@ import { pinWorkerTraeHome } from './services/traex-paths.js';
 import { drainTraexRollout, traexResumeTargetLeftInDefaultHome, resolveTraexResumeSessionId, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, traexSessionIdFromRolloutPath, traexProcessFileSource, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
 import { bridgeCodexUserInput, postCodexAsk } from './services/codex-user-input.js';
 import { TraexQuestionBridge } from './core/traex-question-bridge.js';
-import type { AskQuestion } from './core/ask-types.js';
+import type { AskQuestion, AskResult } from './core/ask-types.js';
 import { traexQuestionFlowVisible, traexPendingAsyncQuestionCount, traexPendingAsyncQuestionVisible, parseTraexQuestionPage, traexQuestionSignature, traexQuestionState, type TraexQuestionPage } from './utils/traex-question-page.js';
 import { antigravityBlockingPageTail } from './utils/antigravity-blocking-page.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
@@ -24482,7 +24482,7 @@ function traexQuestionSubmitGuard(item: Pick<PendingCliInput, 'turnId' | 'dispat
 
 /** One answer input into the current CLI, serialized with other terminal
  *  writes; false when the backend changed or refused it. */
-async function traexQuestionWrite(write: (input: PtyHandle) => boolean | void, expected?: TraexQuestionPage): Promise<boolean> {
+async function traexQuestionWrite(write: (input: PtyHandle) => boolean | void, expected?: TraexQuestionPage, final = false): Promise<boolean> {
   const target = backend;
   const lifetime = cliLifetimeNonce;
   if (!target || cliRestartInProgress || nativeSessionForkPending()) return false;
@@ -24499,11 +24499,15 @@ async function traexQuestionWrite(write: (input: PtyHandle) => boolean | void, e
           if (!page || traexQuestionSignature(page) !== traexQuestionSignature(expected)
             || traexQuestionState(page) !== traexQuestionState(expected)) return false;
         }
+        if (final && expected?.delivery === 'async' && !prepareTraexNativeAnswer()) return false;
         invalidatePromptReadinessEvidence();
-        return write(readinessTrackedInput(adapterInputHandle(target))) !== false;
+        const written = write(readinessTrackedInput(adapterInputHandle(target))) !== false;
+        if (final && traexNativeAnswerSubmission) traexNativeAnswerSubmission.written = written;
+        return written;
       },
     );
   } catch (err: any) {
+    if (final && traexNativeAnswerSubmission) traexNativeAnswerSubmission.written = false;
     log(`TraeX question answer write failed: ${err?.message ?? err}`);
     return false;
   }
@@ -24541,6 +24545,79 @@ async function traexQuestionOpenPending(known?: TraexQuestionPage): Promise<bool
   }
 }
 
+type TraexNativeAnswerInput = Extract<DaemonToWorker, { type: 'message' }>;
+const traexNativeAnswerAdmissions = new Map<string, (input?: TraexNativeAnswerInput) => void>();
+const traexNativeAnswerInputs = new WeakMap<AskResult, TraexNativeAnswerInput>();
+let traexNativeAnswerSubmission: { input: TraexNativeAnswerInput; prepared: boolean; written?: boolean } | undefined;
+
+function prepareTraexNativeAnswer(): boolean {
+  const submission = traexNativeAnswerSubmission;
+  if (!submission || submission.prepared) return true;
+  const input = submission.input;
+  const typeAhead = !!currentBotmuxTurnId && currentBotmuxTurnId !== input.turnId
+    && !turnTerminalEmitted(currentBotmuxTurnId, currentBotmuxDispatchAttempt);
+  if ((!typeAhead && !reserveActiveTurn(input)) || (workerSessionEventScope && !workerSessionEventScope.canSubmit(input.turnId, input.dispatchAttempt))) return false;
+  workerSessionEventScope?.enterTurn(input.turnId, input.dispatchAttempt);
+  const item: PendingCliInput = { ...input, noReplay: true };
+  if (typeAhead && input.turnId) {
+    queuedTypeAheadTurns.push({ turnId: input.turnId, dispatchAttempt: input.dispatchAttempt,
+      linkRefMode: input.linkRefMode, trustedCaller: input.trustedCaller, trustedController: input.trustedController,
+      turnCallerOpenId: input.turnCallerOpenId ?? input.trustedCaller?.requestUserOpenId });
+  } else {
+    renderer?.markNewTurn();
+    usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
+    setCaptureIdentity(input.turnId, input.dispatchAttempt, input.turnCallerOpenId ?? input.trustedCaller?.requestUserOpenId);
+    currentBotmuxLinkRefMode = input.linkRefMode;
+    markActiveTurnStarted(input);
+  }
+  workerSessionEventScope?.recordSubmission(input.turnId, input.dispatchAttempt);
+  inflightInputs.onWrite(item);
+  noteCliInputWritten(item);
+  writeCliPidMarker();
+  publishSandboxRelayCapability();
+  const turnId = codexBridgeMarkPendingTurn(input.content, input.turnId, input.dispatchAttempt, Date.now(), input.linkRefMode);
+  if (turnId) codexBridgeQueue.beginSubmitVerification(turnId, undefined, input.dispatchAttempt);
+  markTurnExecutionStart(input.turnId, input.dispatchAttempt);
+  traexAutoModelTurnReplayForbidden = true;
+  submission.prepared = true;
+  return true;
+}
+
+async function runTraexNativeAnswer(
+  page: TraexQuestionPage,
+  result: AskResult | undefined,
+  write: () => Promise<boolean | undefined>,
+  admittedInput?: TraexNativeAnswerInput,
+): Promise<void> {
+  const input = admittedInput ?? (result ? traexNativeAnswerInputs.get(result) : undefined);
+  if (page.delivery !== 'async') { await write(); return; }
+  if (!input) throw new Error('Native question answer admission unavailable');
+  if (result) traexNativeAnswerInputs.delete(result);
+  const submission = { input, prepared: false, written: undefined as boolean | undefined };
+  const run = async (): Promise<void> => {
+    traexNativeAnswerSubmission = submission;
+    try {
+      await write();
+    } finally {
+      if (traexNativeAnswerSubmission === submission) traexNativeAnswerSubmission = undefined;
+      if (!submission.prepared || submission.written === false) {
+        if (input.turnId) {
+          codexBridgeQueue.dropPendingTurn(input.turnId, input.dispatchAttempt, true);
+          inflightInputs.retireTurn(input.turnId);
+          releaseActiveTurnAuthority('native_question_not_submitted', { turnId: input.turnId, dispatchAttempt: input.dispatchAttempt });
+          emitTurnTerminal(input.turnId, 'failed', 'native_question_not_submitted', input.dispatchAttempt);
+        }
+      } else if (input.turnId) {
+        codexBridgeQueue.finishSubmitVerification(input.turnId, undefined, input.dispatchAttempt);
+        codexBridgeDrainAndMaybeEmit();
+      }
+    }
+  };
+  const binding = workerSessionEventScope?.currentBinding();
+  if (binding && workerSessionEventScope) await workerSessionEventScope.run(binding, run, input.sessionCommand?.execution);
+  else await run();
+}
+
 const traexQuestionBridge = new TraexQuestionBridge({
   now: () => Date.now(),
   setTimer: (fn, ms) => {
@@ -24555,24 +24632,60 @@ const traexQuestionBridge = new TraexQuestionBridge({
   openPending: traexQuestionOpenPending,
   mayOpenPending: traexQuestionMayOpenPending,
   // The same daemon ask broker (and card) as the RPC path's native questions.
-  ask: (question, signal, page) => {
+  ask: async (question, signal, page) => {
     const cfg = lastInitConfig;
     if (!cfg) return Promise.reject(new Error('session not initialised'));
-    return postCodexAsk({
-      sessionId: cfg.sessionId,
-      larkAppId: cfg.larkAppId,
-      chatId: cfg.chatId,
-      rootMessageId: cfg.rootMessageId,
-      originTurnId: currentBotmuxTurnId,
-      originDispatchAttempt: currentBotmuxDispatchAttempt,
-      ...(page?.delivery === 'async' ? { standalone: true } : {}),
-    }, [question], signal);
+    const requestId = page?.delivery === 'async' ? randomUUID() : undefined;
+    let admittedInput: TraexNativeAnswerInput | undefined;
+    let answerHandedOff = false;
+    let resolveAdmission: ((input?: TraexNativeAnswerInput) => void) | undefined;
+    const admitted = requestId ? new Promise<TraexNativeAnswerInput | undefined>(resolve => {
+      resolveAdmission = input => { if (input) admittedInput = input; resolve(input); };
+    }) : undefined;
+    const abort = () => resolveAdmission?.();
+    if (requestId) {
+      traexNativeAnswerAdmissions.set(requestId, resolveAdmission!);
+      signal.addEventListener('abort', abort, { once: true });
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = await postCodexAsk({
+        sessionId: cfg.sessionId,
+        larkAppId: cfg.larkAppId,
+        chatId: cfg.chatId,
+        rootMessageId: cfg.rootMessageId,
+        originTurnId: currentBotmuxTurnId,
+        originDispatchAttempt: currentBotmuxDispatchAttempt,
+        ...(requestId ? { requestId } : {}),
+        ...(page?.delivery === 'async' ? { standalone: true } : {}),
+      }, [question], signal);
+      if (result.kind === 'answered' && admitted) {
+        timer = setTimeout(abort, 30_000);
+        timer.unref?.();
+        const input = await admitted;
+        if (!input) throw new Error('Native question answer admission unavailable');
+        traexNativeAnswerInputs.set(result, input);
+        answerHandedOff = true;
+      }
+      return result;
+    } finally {
+      if (timer) clearTimeout(timer);
+      signal.removeEventListener('abort', abort);
+      if (requestId) traexNativeAnswerAdmissions.delete(requestId);
+      // The daemon can commit the native answer before its HTTP response returns.
+      // If abort or transport failure prevents the bridge handoff, retire it through
+      // the same answer lifecycle without writing to a withdrawn question page.
+      if (page && admittedInput && !answerHandedOff) {
+        await runTraexNativeAnswer(page, undefined, async () => false, admittedInput);
+      }
+    }
   },
+  runAnswer: runTraexNativeAnswer,
   writeKey: (key, expected) => traexQuestionWrite(target => {
     if (target.sendSpecialKeys) return target.sendSpecialKeys(key);
     target.write(KEY_TO_ANSI[key] ?? key);
     return true;
-  }, expected),
+  }, expected, key === 'Enter'),
   paste: (text, expected) => traexQuestionWrite(target => {
     if (target.pasteText) target.pasteText(text);
     else target.write(wrapBracketedPaste(text));
@@ -47562,7 +47675,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         && msg.dispatchAttempt === undefined
         // ordinary-turn 前缀族（om_ / bmx-recovery- / board: 决策看板批次）共用一套
         // 收到/提交去重；board: 的 id 按批次稳定，重投/补投是同一个回合。
-        && isOrdinaryImTurnId(msg.turnId)
+        && (isOrdinaryImTurnId(msg.turnId) || msg.nativeQuestionAnswer !== undefined)
         ? msg.turnId
         : undefined;
       if (ordinaryImTurnId) {
@@ -47651,6 +47764,17 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
             ...(active?.caller ? { activeCaller: active.caller } : {}),
             ...(active?.controller ? { activeController: active.controller } : {}),
           });
+        }
+        break;
+      }
+      if (msg.nativeQuestionAnswer) {
+        const admit = traexNativeAnswerAdmissions.get(msg.nativeQuestionAnswer.requestId);
+        if (admit) {
+          traexNativeAnswerAdmissions.delete(msg.nativeQuestionAnswer.requestId);
+          admit(msg);
+          acknowledgeTurnInputCommitted(msg.turnId, msg.dispatchAttempt, msg.durablePrimaryInbox);
+        } else if (msg.turnId) {
+          emitTurnTerminal(msg.turnId, 'cancelled', 'native_question_no_longer_pending', msg.dispatchAttempt);
         }
         break;
       }
