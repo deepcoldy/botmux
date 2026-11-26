@@ -69,7 +69,17 @@ const INPUT_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 export function decodeBytedcliBase64(value: unknown, maxBytes: number, field = 'base64'): Buffer {
   const data = text(value, field);
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 0 || data.length > 4 * Math.ceil(maxBytes / 3)
-    || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(data)) fail(field);
+    || data.length % 4 !== 0) fail(field);
+  const padding = data.endsWith('==') ? 2 : data.endsWith('=') ? 1 : 0;
+  const contentLength = data.length - padding;
+  if (data.length / 4 * 3 - padding > maxBytes) fail(field);
+  // Repeated-group regexes exhaust JS engine matching limits on valid output
+  // near 16 MiB. Scan once with constant stack space; '=' is trailing only.
+  for (let index = 0; index < contentLength; index++) {
+    const code = data.charCodeAt(index);
+    if (!((code >= 65 && code <= 90) || (code >= 97 && code <= 122)
+      || (code >= 48 && code <= 57) || code === 43 || code === 47)) fail(field);
+  }
   const decoded = Buffer.from(data, 'base64');
   if (decoded.length > maxBytes || decoded.toString('base64') !== data) fail(field);
   return decoded;

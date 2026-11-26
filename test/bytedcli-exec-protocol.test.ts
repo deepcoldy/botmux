@@ -6,6 +6,29 @@ const response = { schema: 'botmux.bytedcli-exec.v1', requestId: 'request-1', op
   effectiveIdentity: { kind: 'machine' }, outcome: 'completed', stdoutBase64: 'b2sK', stderrBase64: '', exitCode: 0 };
 
 describe('ByteCloud broker wire validation', () => {
+  it.each([[16, 0], [8, 8], [0, 16]])('accepts canonical output at the limit with %i MiB stdout and %i MiB stderr', (stdoutMiB, stderrMiB) => {
+    const output = { ...response,
+      stdoutBase64: Buffer.alloc(stdoutMiB * 1024 * 1024, 0x61).toString('base64'),
+      stderrBase64: Buffer.alloc(stderrMiB * 1024 * 1024, 0x62).toString('base64') };
+    const parsed = protocol.parseBytedcliExecResponse(JSON.stringify(output));
+    expect(parsed.outcome).toBe('completed');
+    expect(parsed.exitCode).toBe(0);
+    expect(parsed.stdoutBase64).toBe(output.stdoutBase64);
+    expect(parsed.stderrBase64).toBe(output.stderrBase64);
+    const stdout = Buffer.from(parsed.stdoutBase64, 'base64');
+    const stderr = Buffer.from(parsed.stderrBase64, 'base64');
+    expect(stdout.length).toBe(stdoutMiB * 1024 * 1024);
+    expect(stderr.length).toBe(stderrMiB * 1024 * 1024);
+    if (stdout.length) expect([stdout[0], stdout[stdout.length - 1]]).toEqual([0x61, 0x61]);
+    if (stderr.length) expect([stderr[0], stderr[stderr.length - 1]]).toEqual([0x62, 0x62]);
+  });
+
+  it('rejects individually valid streams whose combined decoded output exceeds the limit', () => {
+    expect(() => protocol.parseBytedcliExecResponse({ ...response,
+      stdoutBase64: Buffer.alloc(8 * 1024 * 1024).toString('base64'),
+      stderrBase64: Buffer.alloc(8 * 1024 * 1024 + 1).toString('base64') })).toThrow();
+  });
+
   it('roundtrips request bytes without allowing authoritative identity fields', () => {
     const parsed = protocol.parseBytedcliExecRequest(JSON.stringify({ ...request, inputs: { stdinBase64: 'dGV4dA==' } }));
     expect(parsed).toEqual({ ...request, inputs: { stdinBase64: 'dGV4dA==' } });
@@ -21,6 +44,7 @@ describe('ByteCloud broker wire validation', () => {
       expect(() => protocol.parseBytedcliExecRequest({ ...request, argv })).toThrow();
     }
     for (const inputs of [{ stdinBase64: 'not base64!' }, { stdinBase64: 'Zh==' }, { stdinBase64: 'YQ' },
+      ...['Y==A', '====', 'AAA===', 'A===', 'AA_A', 'AA-A', 'AA A', 'AA\nA'].map(stdinBase64 => ({ stdinBase64 })),
       { files: [{ id: '/etc/passwd', dataBase64: '' }] }, { files: [{ id: 'a', dataBase64: '', path: '/etc/passwd' }] },
       { files: [{ id: 'a', dataBase64: '' }, { id: 'a', dataBase64: '' }] },
       { stdinBase64: Buffer.alloc(2 * 1024 * 1024 + 1).toString('base64') }]) {
