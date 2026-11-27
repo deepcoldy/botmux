@@ -716,12 +716,13 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
   const activeSessionId = (pty: Pick<PtyHandle, 'cliPid' | 'cliCwd'>): string | undefined => {
     const fromLog = sessionLog?.read().currentId;
     if (fromLog) return fromLog;
-    // On a fresh launch (`!resume && !reattach`), agy creates no conversation
-    // until the first prompt is submitted, while startup `ListConversations`
-    // opens historical/sibling conversation `.db` files in parallel. Once agy
-    // is actively writing `--log-file`, wait for its authoritative
-    // `Streaming conversation <uuid>` line instead of probing transient startup fds.
-    if (awaitNativeStreamLog && sessionLog?.hasLogFile()) return undefined;
+    // On a fresh launch (`!reattach && !(resume && resumeSessionId)`), buildArgs
+    // always wires a process-scoped `--log-file` and agy creates no conversation
+    // until the first prompt is submitted, while startup `ListConversations` can
+    // open historical/sibling conversation `.db` files before `--log-file` is
+    // created or flushed. Never probe transient startup fds — wait for this
+    // process's own `--log-file` to emit `Streaming conversation <uuid>`.
+    if (awaitNativeStreamLog && sessionLog) return undefined;
     // Managed sessions (`buildArgs` wired `--log-file`) must never fall back to
     // workspace summaries when `cliPid` is unset — that hijacks a concurrent or
     // historical conversation sharing the same working directory.
@@ -764,7 +765,7 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
 
     buildArgs({ sessionId, resume, resumeSessionId, disableCliBypass, model, reasoningEffort, cliVersion, reattach }) {
       bracketedPasteSupported = reattach === false && supportsAntigravityBracketedPaste(cliVersion);
-      awaitNativeStreamLog = !resume && !reattach;
+      awaitNativeStreamLog = !reattach && !(resume && resumeSessionId);
       const args = disableCliBypass ? [] : ['--dangerously-skip-permissions'];
       sessionLog = new AntigravitySessionLog(sessionId);
       args.push('--log-file', sessionLog.path);
@@ -878,9 +879,9 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       const preSize = initialTranscriptPath ? currentFileSize(initialTranscriptPath) : null;
       // No transcript exists yet for the conversation this input lands in: a
       // known id whose brain file agy creates lazily (e.g. right after /new),
-      // or a fresh launch whose native log has not streamed any conversation
-      // (activeSessionId withholds an id only in that state). Any USER_INPUT
-      // that later appears there is this submit's.
+      // or a fresh launch whose native log is already being written with no
+      // streamed conversation yet. Any USER_INPUT that later appears there is
+      // this submit's.
       const transcriptCreatedAfterSubmit = !initialTranscriptPath
         && (!!initialCid || (awaitNativeStreamLog && !!sessionLog?.hasLogFile()));
 

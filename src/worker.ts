@@ -17918,8 +17918,11 @@ function rebindAntigravityBridgeTurn(nextPath: string): boolean {
   // The unstarted head's own record is deliberately NOT absorbed below.
   codexBridgeQueue.absorb(committed.map(match => match.event));
   log(`Antigravity bridge authoritatively rebound ${previousPath ?? '?'} → ${nextPath}`);
+  const attachMode = firstLiveOffset !== undefined
+    ? 'fresh-empty'
+    : antigravityLateAttachMode(nextPath);
   codexBridgeDetachFile();
-  codexBridgeAttach(nextPath, 'fresh-empty');
+  codexBridgeAttach(nextPath, attachMode);
   if (firstLiveOffset !== undefined) codexBridgeOffset = firstLiveOffset;
   return true;
 }
@@ -17939,15 +17942,26 @@ function resolveLiveAntigravityTranscriptPath(): string | undefined {
   const discoveredCid = cliAdapter?.resolveActiveSessionId
     ? cliAdapter.resolveActiveSessionId({ cliPid: effectivePid, cliCwd: lastInitConfig.workingDir })
     : (effectivePid ? (findAntigravityConversationIdByPid(effectivePid) ?? undefined) : undefined);
-  const cid = discoveredCid ?? lastSpawnEffectiveCliSessionId ?? lastInitConfig.cliSessionId;
+  const observedCid = typeof inputDeliveryObservedCliSessionId === 'string'
+    ? inputDeliveryObservedCliSessionId
+    : undefined;
+  // Never fall back to stale lastInitConfig.cliSessionId after a Tier-1/Tier-2
+  // fresh demotion (which clears effectiveCliSessionId & observedCid).
+  const cid = discoveredCid
+    ?? observedCid
+    ?? lastSpawnEffectiveCliSessionId
+    ?? (lastInitConfig.adoptMode === true ? lastInitConfig.cliSessionId : undefined);
+  // Never bypass cliAdapter.resolveActiveSessionId (or a known cid whose
+  // transcript has not been created yet) by falling back to locate.byPid.
+  if (!cid) return undefined;
   const relocatedHome = lastInitConfig.env?.HOME;
-  if (cid && relocatedHome) {
+  if (relocatedHome) {
     const relocated = resolveAntigravityTranscriptPath(cid, {
       brainDir: join(relocatedHome, '.gemini', 'antigravity-cli', 'brain'),
     });
     if (relocated) return relocated;
   }
-  return resolveFileBridgePath('antigravity', { sessionId: cid, pid: effectivePid });
+  return resolveFileBridgePath('antigravity', { sessionId: cid });
 }
 
 /** Re-anchor only on the current turn's unique authenticated envelope in the
@@ -18316,6 +18330,7 @@ function codexBridgeStartTimer(): void {
           // must be retried here once the authoritative brain file appears.
           // A managed process can announce a new ID before its transcript
           // exists, while the previous conversation remains bound.
+          let tickerDiscoveredCid: string | undefined;
           const action = decideAntigravityTickerAction({
             boundPath: codexBridgeRolloutPath,
             pendingSid: codexBridgePendingSessionId,
@@ -18328,6 +18343,17 @@ function codexBridgeStartTimer(): void {
               // after /fork it disambiguates child vs retained parent DB fds.
               if (cliAdapter?.resolveActiveSessionId) {
                 const activeId = cliAdapter.resolveActiveSessionId({ cliPid: pid, cliCwd: lastInitConfig?.workingDir });
+                // On a cold resume whose target transcript is not bound yet, do
+                // not claim or persist a transient sibling fd that disagrees with
+                // the explicit resume target (mirrors observeAntigravityCliSessionId).
+                if (activeId
+                  && !codexBridgeRolloutPath
+                  && lastSpawnEffectiveResume
+                  && lastSpawnEffectiveCliSessionId
+                  && lastSpawnEffectiveCliSessionId !== activeId) {
+                  return undefined;
+                }
+                tickerDiscoveredCid = activeId;
                 return activeId ? resolveFileBridgePath('antigravity', { sessionId: activeId }) : undefined;
               }
               return pid ? resolveFileBridgePath('antigravity', { pid }) : undefined;
@@ -18339,11 +18365,16 @@ function codexBridgeStartTimer(): void {
               // not a /new. Failed reconciliation keeps both the old binding
               // and the pending marker so a later REAL append can retry.
               if (rebindAntigravityBridgeTurn(action.path)) {
+                const reboundCid = tickerDiscoveredCid ?? codexBridgePendingSessionId;
                 codexBridgePendingSessionId = undefined;
                 antigravityPendingRebind = false;
                 codexAdoptPendingPid = undefined;
+                if (reboundCid && typeof persistCliSessionId === 'function') {
+                  persistCliSessionId(reboundCid);
+                }
               }
             } else {
+              const rotatedCid = tickerDiscoveredCid ?? codexBridgePendingSessionId;
               codexBridgePendingSessionId = undefined;
               codexAdoptPendingPid = undefined;
               // A real /new abandons the retired conversation's unfinished
@@ -18358,12 +18389,19 @@ function codexBridgeStartTimer(): void {
               log(`Antigravity bridge late-rotated ${codexBridgeRolloutPath ?? '?'} → ${action.path}`);
               codexBridgeDetachFile();
               codexBridgeAttach(action.path, 'fresh-empty');
+              if (rotatedCid && typeof persistCliSessionId === 'function') {
+                persistCliSessionId(rotatedCid);
+              }
             }
           } else if (action.kind === 'bind-initial') {
+            const boundCid = tickerDiscoveredCid ?? codexBridgePendingSessionId;
             codexBridgePendingSessionId = undefined;
             antigravityPendingRebind = false;
             codexAdoptPendingPid = undefined;
             codexBridgeAttach(action.path, antigravityLateAttachMode(action.path));
+            if (boundCid && typeof persistCliSessionId === 'function') {
+              persistCliSessionId(boundCid);
+            }
           } else if (action.kind === 'clear-pending') {
             // Provenance: only a direct SID hit reaches here. A pid hit on the
             // bound path returns 'idle' and leaves a pending NEW id intact
@@ -19029,6 +19067,42 @@ function ensureAntigravityCotReader(cliSessionId: string): void {
   }
 }
 
+/** Whether a post-submit confirmation for `submittedTurnId` should preserve
+ *  that turn on an authoritative conversation switch rather than retiring
+ *  it as an older pre-/new turn. True only when the submitted turn itself
+ *  was prematurely started on a misbound transcript and no older turn is
+ *  still open on the previous conversation. */
+function shouldPreserveAntigravitySubmittedTurn(submittedTurnId: string | undefined): boolean {
+  if (!submittedTurnId || typeof codexBridgeQueue?.peek !== 'function') return false;
+  const turns = codexBridgeQueue.peek();
+  return turns.some(
+    turn => turn.turnId === submittedTurnId && turn.started && turn.finalText === undefined,
+  ) && !turns.some(
+    turn => turn.turnId !== submittedTurnId && turn.started && turn.finalText === undefined,
+  );
+}
+
+/** Single authoritative entry point for committing a verified Antigravity
+ *  conversation ID: persists to daemon, switches/starts the CoT reader, and
+ *  notifies the structured bridge (when active) in one place so CoT and
+ *  Structured Bridge can never drift onto different conversations. */
+function applyAuthoritativeAntigravitySessionId(
+  cliSessionId: string,
+  options: { preserveLiveTurn?: boolean; tryRebindLiveTurn?: boolean; adoptRotationStartMs?: number } = {},
+): void {
+  if (!cliSessionId) return;
+  if (cliAdapter?.runnerFramedInput) return;
+  if (lastInitConfig?.cliId !== 'antigravity') return;
+  if (nativeSessionForkPending()) return;
+  persistCliSessionId(cliSessionId);
+  if (typeof ensureAntigravityCotReader === 'function') {
+    ensureAntigravityCotReader(cliSessionId);
+  }
+  if (typeof codexBridgeFallbackActive === 'function' && codexBridgeFallbackActive()) {
+    codexBridgeNotifyCliSessionId(cliSessionId, options);
+  }
+}
+
 function armAntigravityCotForTurn(): void {
   if (cliAdapter?.runnerFramedInput) return;
   if (lastInitConfig?.cliId !== 'antigravity') return;
@@ -19037,10 +19111,21 @@ function armAntigravityCotForTurn(): void {
   const discoveredCid = cliAdapter?.resolveActiveSessionId
     ? cliAdapter.resolveActiveSessionId({ cliPid: effectivePid, cliCwd: lastInitConfig.workingDir })
     : (effectivePid ? (findAntigravityConversationIdByPid(effectivePid) ?? undefined) : undefined);
-  const cid = discoveredCid ?? lastInitConfig?.cliSessionId ?? lastSpawnEffectiveCliSessionId;
+  const observedCid = typeof inputDeliveryObservedCliSessionId === 'string'
+    ? inputDeliveryObservedCliSessionId
+    : undefined;
+  // Never fall back to stale lastInitConfig.cliSessionId after a Tier-1/Tier-2
+  // fresh demotion — doing so would re-bind CoT and Structured Bridge to the
+  // abandoned conversation before the fresh launch streams its own ID.
+  const cid = discoveredCid
+    ?? observedCid
+    ?? lastSpawnEffectiveCliSessionId
+    ?? (lastInitConfig.adoptMode === true ? lastInitConfig.cliSessionId : undefined);
   if (!cid) return;
-  persistCliSessionId(cid);
-  ensureAntigravityCotReader(cid);
+  // Try a synchronous non-sticky rebind if an already-started turn is already
+  // present in cid's transcript, without arming a sticky pending-rebind freeze
+  // that would poison or deadlock an ordinary pre-write `/new` rotation.
+  applyAuthoritativeAntigravitySessionId(cid, { tryRebindLiveTurn: true });
 }
 
 // ─── Kimi activity observer (read-only) ─────────────────────────────────
@@ -19159,6 +19244,7 @@ function codexBridgeDetachFile(): void {
   antigravityQuietCandidateKey = undefined;
   antigravityQuietCandidateCompleteOffset = undefined;
   antigravityFullUpgradeAttemptKey = undefined;
+  antigravityPendingRebind = false;
   structuredMissingFinalWatchdog?.observe(undefined);
 }
 
@@ -19477,7 +19563,7 @@ function noteTraexProcessFileSource(pid: number): void {
  *  remembers the sid so the 1s poller can keep retrying. */
 function codexBridgeNotifyCliSessionId(
   cliSessionId: string,
-  options: { preserveLiveTurn?: boolean; adoptRotationStartMs?: number } = {},
+  options: { preserveLiveTurn?: boolean; tryRebindLiveTurn?: boolean; adoptRotationStartMs?: number } = {},
 ): void {
   if (!codexBridgeFallbackActive()) return;
   // A reported (proven) id supersedes any not-yet-owned history candidate.
@@ -19701,11 +19787,11 @@ function codexBridgeNotifyCliSessionId(
   }
   if (structuredBridgeIs('antigravity')) {
     // cliSessionId is agy's conversation UUID, which names the brain
-    // transcript directory. writeInput and the native --log-file observer
-    // report the id on every submit/stream switch, and `codexBridgeRolloutPath`
-    // above falls through for Antigravity so this handles both initial attach
-    // and in-binding rotation/rebind (e.g. `/new`, `/fork`, or correcting an
-    // early misbound transcript).
+    // transcript directory. writeInput, armAntigravityCotForTurn, and the
+    // native --log-file observer report the id on every submit/stream switch,
+    // and `codexBridgeRolloutPath` above falls through for Antigravity so this
+    // handles both initial attach and in-binding rotation/rebind (e.g. `/new`,
+    // `/fork`, or correcting an early misbound transcript).
     const agyPath = resolveFileBridgePath('antigravity', { sessionId: cliSessionId });
     // Compared by conversation, not path: a compact-log bind resolves to the
     // full log here once agy has created it, and that is NOT a /new. The
@@ -19716,9 +19802,13 @@ function codexBridgeNotifyCliSessionId(
       antigravityPendingRebind = false;
       return;
     }
-    if (action.kind === 'rotate' && options.preserveLiveTurn) {
-      // The startup observer corrected an early sibling bind for this same
-      // live turn. Attach only after every active owner matches the REAL file.
+    const pendingSameIdRebind = antigravityPendingRebind
+      && codexBridgePendingSessionId?.toLowerCase() === cliSessionId.toLowerCase();
+    if (action.kind === 'rotate' && (options.preserveLiveTurn || pendingSameIdRebind)) {
+      // An authoritative observation corrected an early/stale bind for this
+      // same live turn (or a prior pending rebind for this exact id is still
+      // waiting to reconcile). Attach only after every active owner matches
+      // the REAL file (or immediately when no unfinished turn is queued).
       if (rebindAntigravityBridgeTurn(action.path)) {
         codexBridgePendingSessionId = undefined;
         antigravityPendingRebind = false;
@@ -19732,8 +19822,22 @@ function codexBridgeNotifyCliSessionId(
     }
     if (action.kind !== 'wait-pending') {
       if (action.kind === 'rotate') {
+        const hasStartedTurn = codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined);
+        // Pre-write tryRebindLiveTurn: if an already-started turn is already
+        // present in action.path BEFORE the new prompt is written, migrate it
+        // cleanly without retiring; otherwise fall through to normal rotation
+        // without arming a sticky pending-rebind freeze.
+        if (options.tryRebindLiveTurn && hasStartedTurn && rebindAntigravityBridgeTurn(action.path)) {
+          codexBridgePendingSessionId = undefined;
+          antigravityPendingRebind = false;
+          codexBridgeIngest();
+          return;
+        }
         // A real /new abandons unfinished work in the retired conversation.
-        if (codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined) || codexBridgeQueue.peek().length > 1) {
+        // Clear any stale pending-rebind freeze BEFORE retiring so
+        // retireAntigravityBridgeTurn's flush ingest actually drains the old file.
+        antigravityPendingRebind = false;
+        if (hasStartedTurn || codexBridgeQueue.peek().length > 1) {
           try {
             retireAntigravityBridgeTurn();
           } catch (err: any) {
@@ -19741,8 +19845,11 @@ function codexBridgeNotifyCliSessionId(
           }
         }
         log(`Antigravity bridge rebound ${codexBridgeRolloutPath ?? '?'} → ${action.path}`);
+        const attachMode = codexBridgeQueue.peek().length === 0
+          ? antigravityLateAttachMode(action.path)
+          : 'fresh-empty';
         codexBridgeDetachFile();
-        codexBridgeAttach(action.path, 'fresh-empty');
+        codexBridgeAttach(action.path, attachMode);
       } else {
         codexBridgeAttach(action.path, antigravityLateAttachMode(action.path));
       }
@@ -19752,8 +19859,14 @@ function codexBridgeNotifyCliSessionId(
     } else {
       // The brain file is created lazily after submit — keep id pending and
       // let the 1s ticker late-attach or rotate once the file appears.
+      // Preserve an already-armed pending rebind for this exact id (e.g. a
+      // type-ahead follow-up confirming the same id while an earlier startup
+      // rebind is still waiting for REAL's lazy brain file), without letting a
+      // pre-write `/new` arm a sticky pending-rebind freeze.
+      const keepPendingRebind = Boolean(codexBridgeRolloutPath)
+        && (options.preserveLiveTurn === true || pendingSameIdRebind);
       codexBridgePendingSessionId = cliSessionId;
-      antigravityPendingRebind = options.preserveLiveTurn === true;
+      antigravityPendingRebind = keepPendingRebind;
       codexBridgeStartTimer();
     }
     return;
@@ -21427,6 +21540,7 @@ function stopCodexBridge(): void {
   antigravityCotReaderSessionId = undefined;
   stopKimiActivityObserver();
   codexBridgePendingSessionId = undefined;
+  antigravityPendingRebind = false;
   codexBridgeUnprovenSession = undefined;
   codexAdoptPendingPid = undefined;
   codexAdoptStartMs = undefined;
@@ -28537,8 +28651,12 @@ function holdForNativeSessionFork(): boolean {
     if (!childId || childId === cfg.cliSessionId) throw new Error('Native fork did not create an independent conversation');
     cfg.forkSession = false;
     lastSpawnEffectiveCliSessionId = childId;
-    persistCliSessionId(childId);
-    if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(childId);
+    if (cfg.cliId === 'antigravity' && !cliAdapter?.runnerFramedInput) {
+      applyAuthoritativeAntigravitySessionId(childId);
+    } else {
+      persistCliSessionId(childId);
+      if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(childId);
+    }
     nativeSessionForkInFlight = undefined;
     log(`Native session fork confirmed: ${childId}`);
     markPromptReady();
@@ -29204,13 +29322,11 @@ function observeAntigravityCliSessionId(pid: number, label = 'spawn'): void {
         log(`Observed Antigravity conversationId via pid ${realPid}${realPid === pid ? '' : ` (launcher ${pid})`} (${label}) but kept existing resume target ${lastSpawnEffectiveCliSessionId}`);
         return;
       }
-      persistCliSessionId(cid);
       log(`Observed Antigravity conversationId via pid ${realPid}${realPid === pid ? '' : ` (launcher ${pid})`} (${label}): ${cid}`);
-      ensureAntigravityCotReader(cid);
-      // Bind the zero-prompt transcript bridge as soon as the conversation is
-      // known (its brain file may not exist yet — notify then leaves the id
-      // pending for the 1s ticker). No-op in default mode (bridge inactive).
-      if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(cid, { preserveLiveTurn: true });
+      // Persist, switch CoT reader, and bind/rebind the structured bridge in
+      // one unified entry point (its brain file may not exist yet — notify then
+      // leaves the id pending for the 1s ticker).
+      applyAuthoritativeAntigravitySessionId(cid, { preserveLiveTurn: true });
       return;
     }
     attempts++;
@@ -29569,10 +29685,18 @@ function scheduleSubmitFailureNotify(
         }
         queuePostSubmitNativeSessionTitle(turnIdentity?.nativeSessionTitle);
         if (cliSessionId) {
-          persistCliSessionId(cliSessionId);
-          if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(cliSessionId, {
-            adoptRotationStartMs: activityBaselineMs,
-          });
+          if (lastInitConfig?.cliId === 'antigravity' && !cliAdapter?.runnerFramedInput) {
+            const preserveLiveTurn = shouldPreserveAntigravitySubmittedTurn(bridgeTurnId);
+            applyAuthoritativeAntigravitySessionId(cliSessionId, {
+              adoptRotationStartMs: activityBaselineMs,
+              ...(preserveLiveTurn ? { preserveLiveTurn: true } : {}),
+            });
+          } else {
+            persistCliSessionId(cliSessionId);
+            if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(cliSessionId, {
+              adoptRotationStartMs: activityBaselineMs,
+            });
+          }
           void syncFreshCodexNativeSessionTitle(cliSessionId, codexRpcEngine);
         } else if (settlement.unprovenCliSessionId) {
           // The confirmation above renewed this turn's lease, and the history
@@ -30176,8 +30300,13 @@ function observeQueuedActivationReceipt(
           recordStructuredInput(item.turnId, submittedText, item.structuredSourceTurnIds,
             cliSessionId, !unprovenCliSessionId);
           if (cliSessionId) {
-            persistCliSessionId(cliSessionId);
-            if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(cliSessionId);
+            if (lastInitConfig?.cliId === 'antigravity' && !cliAdapter?.runnerFramedInput) {
+              const preserveLiveTurn = shouldPreserveAntigravitySubmittedTurn(watchTurnId);
+              applyAuthoritativeAntigravitySessionId(cliSessionId, preserveLiveTurn ? { preserveLiveTurn: true } : {});
+            } else {
+              persistCliSessionId(cliSessionId);
+              if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(cliSessionId);
+            }
             void syncFreshCodexNativeSessionTitle(cliSessionId, codexRpcEngine);
           }
           opts?.onSettledExtra?.(proof);
@@ -32467,11 +32596,16 @@ async function flushPending(): Promise<void> {
       // outcome — the rotation is real even when the current Enter didn't
       // land, and we want next-resume to use the right id.
       if (result?.cliSessionId) {
-        persistCliSessionId(result.cliSessionId);
-        // First successful Codex submit also reveals the rollout path.
-        // Late-attach now so subsequent assistant_final events get
-        // attributed to this turn.
-        if (codexBridgeActive) codexBridgeNotifyCliSessionId(result.cliSessionId);
+        if (lastInitConfig?.cliId === 'antigravity' && !cliAdapter?.runnerFramedInput) {
+          const preserveLiveTurn = shouldPreserveAntigravitySubmittedTurn(bridgeTurnId);
+          applyAuthoritativeAntigravitySessionId(result.cliSessionId, preserveLiveTurn ? { preserveLiveTurn: true } : {});
+        } else {
+          persistCliSessionId(result.cliSessionId);
+          // First successful Codex submit also reveals the rollout path.
+          // Late-attach now so subsequent assistant_final events get
+          // attributed to this turn.
+          if (codexBridgeActive) codexBridgeNotifyCliSessionId(result.cliSessionId);
+        }
       } else if (result?.unprovenCliSessionId && codexBridgeActive) {
         codexBridgeNoteUnprovenCliSessionId(result.unprovenCliSessionId, {
           turnId: item.turnId, bridgeTurnId, dispatchAttempt: item.dispatchAttempt,
