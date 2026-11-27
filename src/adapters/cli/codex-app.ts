@@ -6,6 +6,7 @@ import type { CliAdapter, PtyHandle } from './types.js';
 import { writeRunnerInput } from './runner-input.js';
 import { runnerArgv0 } from '../../core/self-spawn.js';
 import { resolveRunnerPath } from './runner-path.js';
+import { readGlobalConfig } from '../../global-config.js';
 
 function pushOpt(args: string[], key: string, value: string | undefined): void {
   if (value === undefined || value.length === 0) return;
@@ -69,6 +70,7 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
       pushOpt(args, '--bot-name', botName);
       pushOpt(args, '--bot-open-id', botOpenId);
       pushOpt(args, '--locale', locale);
+      pushOpt(args, '--title-prefix', readGlobalConfig().codexAppTitlePrefix);
       // Per-turn overrides (async trigger API). The runner injects them into the
       // app-server thread/start (model + config.model_reasoning_effort).
       pushOpt(args, '--model', model && model.trim() ? model.trim() : undefined);

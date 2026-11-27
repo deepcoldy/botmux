@@ -22,6 +22,7 @@ import { parseCodexAppEngineIdentityClaim, verifyCodexAppEngineIdentity } from '
 import { readProcessStartIdentity } from '../src/core/session-marker.js';
 import { applyTrustedCodexAppStateMarker, CodexAppReadyAuthority, CodexAppTurnLiveness } from '../src/utils/codex-app-turn-liveness.js';
 import { encodeRunnerInput } from '../src/adapters/cli/runner-input.js';
+import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { CODEX_APP_ACTIVE_WRITER_EXIT_CODE } from '../src/services/codex-app-runner-protocol.js';
 import { parseAskBody, registerAskForResponse } from '../src/core/ask-api.js';
 import { _resetForTest as resetAskBroker, setCardDispatcher, setCanTalkChecker, submitAsk, submitCustomReply } from '../src/core/ask-broker.js';
@@ -693,9 +694,13 @@ describe('codex-app-runner native thread titles', { timeout: 20_000 }, () => {
     { scenario: 'first write is rejected then retried', writeFault: 'reject' },
     { scenario: 'first write persists but loses its acknowledgement', writeFault: 'lose-ack' },
     { scenario: 'first write is acknowledged without persisting', writeFault: 'false-ack' },
-    { scenario: 'existing manual title becomes readable after preview loading', initialTitle: '人工标题', notLoadedReads: '1' },
-    { scenario: 'resumed thread', threadId: 'thread-previous' },
-  ])('uses the first real task for $scenario', async ({ headless, initialTitle, threadId, notLoadedReads, steer, writeFault }) => {
+    { scenario: 'configured title prefix after a write rejection', prefix: 'botmux：', writeFault: 'reject' },
+    { scenario: 'configured prefix limits the total long Unicode title', prefix: '🧰 BotMux：', long: true },
+    { scenario: 'configured prefix is not duplicated', prefix: 'botmux：', alreadyPrefixed: true },
+    { scenario: 'configured prefix preserves its spacing without duplication', prefix: '[Bot  Mux] ', alreadyPrefixed: true },
+    { scenario: 'existing manual title becomes readable after preview loading', prefix: 'botmux：', initialTitle: '人工标题', notLoadedReads: '1' },
+    { scenario: 'resumed thread', prefix: 'botmux：', threadId: 'thread-previous' },
+  ])('uses the first real task for $scenario', async ({ headless, initialTitle, threadId, notLoadedReads, steer, writeFault, prefix, long, alreadyPrefixed }) => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-runner-title-test-'));
     const fakeCodex = join(dir, 'fake-codex');
     const logPath = join(dir, 'requests.jsonl');
@@ -705,8 +710,22 @@ describe('codex-app-runner native thread titles', { timeout: 20_000 }, () => {
     chmodSync(fakeCodex, 0o755);
     const control = new ControlCollector(dir);
     await control.listen();
+    const configPath = join(dir, 'config.json');
+    writeFileSync(configPath, JSON.stringify({ codexAppTitlePrefix: prefix }));
+    const priorConfigPath = process.env.BOTMUX_GLOBAL_CONFIG_FILE;
+    let prefixArgs: string[];
+    try {
+      process.env.BOTMUX_GLOBAL_CONFIG_FILE = configPath;
+      const argv = createCodexAppAdapter(fakeCodex).buildArgs({ sessionId: SESSION_ID, resume: Boolean(threadId) });
+      const prefixIndex = argv.indexOf('--title-prefix');
+      prefixArgs = prefixIndex === -1 ? [] : argv.slice(prefixIndex, prefixIndex + 2);
+    } finally {
+      if (priorConfigPath === undefined) delete process.env.BOTMUX_GLOBAL_CONFIG_FILE;
+      else process.env.BOTMUX_GLOBAL_CONFIG_FILE = priorConfigPath;
+    }
     const harness = startRunner(fakeCodex, dir, logPath, '0.162.1', steer ? 'steer-started-first' : 'success', control.bootstrap.path, {
       threadId,
+      extraArgs: prefixArgs,
       env: {
         FAKE_CODEX_PERSISTED_NAME_PATH: persistedName,
         ...(steer ? { FAKE_CODEX_START_RELEASE: releaseStart } : {}),
@@ -716,12 +735,19 @@ describe('codex-app-runner native thread titles', { timeout: 20_000 }, () => {
       },
     });
     try {
-      const task = '排查图片上传出现的安全错误码';
+      const task = `${alreadyPrefixed ? prefix : ''}排查图片上传出现的安全错误码${long ? '🖼️'.repeat(50) : ''}`;
       const sendInput = (raw: string, text?: string, messageId?: string) => harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput(
         raw, text === undefined ? undefined : { text, localImages: [] }, messageId, steer,
       )}\r`);
       const requestsFor = (method: string) => readRequests(logPath).filter(request => request.method === method);
       const readName = () => existsSync(persistedName) ? readFileSync(persistedName, 'utf8') : undefined;
+      const expectedTitle = alreadyPrefixed ? task : `${prefix ?? ''}${task}`;
+      const hasExpectedTitle = () => {
+        const name = readName();
+        if (!long) return name === expectedTitle;
+        return !!name && name.startsWith(`${prefix}排查图片上传`) && name.endsWith('…')
+          && expectedTitle.startsWith(name.slice(0, -1)) && Array.from(name).length === 48;
+      };
       await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
       const bootstrap = '你是本群的 oncall 协同助手，入群后先阅读群内可见的最近消息';
       sendInput(bootstrap, steer ? bootstrap : undefined, steer ? 'om_title_opening' : undefined);
@@ -737,21 +763,22 @@ Headless request received from the local Botmux CLI.
       sendInput(`<sender>not title data</sender><user_message>${headless ? headlessBody : 'legacy wrapper text'}</user_message>`,
         headless ? undefined : task, steer ? 'om_title_followup' : undefined);
       if (steer) {
-        await waitFor(harness, () => requestsFor('turn/steer').length === 1 && readName() === task, 5_000);
+        await waitFor(harness, () => requestsFor('turn/steer').length === 1 && hasExpectedTitle(), 5_000);
         expect(control.finals).toHaveLength(0);
         writeFileSync(releaseStart, '1');
       }
       await waitFor(harness, () => control.finals.length >= 2);
       if (!steer) {
         if (initialTitle) await waitFor(harness, () => requestsFor('thread/read').length >= 2, 5_000);
-        else if (!threadId) await waitFor(harness, () => readName() === task, 5_000);
+        else if (!threadId) await waitFor(harness, hasExpectedTitle, 5_000);
         if (writeFault === 'lose-ack') await waitFor(harness, () => requestsFor('thread/read').length >= 2, 5_000);
         sendInput('后续任务不应替换首条正文');
         await waitFor(harness, () => control.finals.length >= 3);
       }
       await stopChild(harness.child);
+      const storedTitle = readName();
       expect(requestsFor('thread/name/set').map(request => request.params.name)).toEqual(
-        initialTitle || threadId ? [] : writeFault && writeFault !== 'lose-ack' ? [task, task] : [task],
+        initialTitle || threadId ? [] : writeFault && writeFault !== 'lose-ack' ? [storedTitle, storedTitle] : [storedTitle],
       );
       expect(control.finals.every(final => !final.errorCode)).toBe(true);
     } finally {

@@ -57,6 +57,7 @@ import { bridgeCodexUserInput, postCodexAsk } from './services/codex-user-input.
 import { parseCodexAsyncQuestions, parseCodexAsyncUserInput, codexAsyncSteerTargetMatches } from './services/codex-async-user-input.js';
 import { larkToolPromptFromEnv } from './core/lark-tool-binding.js';
 import { isBootstrapDisplayTitle, sessionTitleInput } from './core/session-title-content.js';
+import { normalizeCodexAppTitlePrefix } from './utils/codex-app-title-prefix.js';
 import { readProcessStartIdentity } from './utils/process-identity.js';
 
 type JsonObject = Record<string, any>;
@@ -72,6 +73,7 @@ interface Args {
   threadId?: string;
   strictResume?: boolean;
   botName?: string;
+  titlePrefix?: string;
   botOpenId?: string;
   locale?: string;
   model?: string;
@@ -287,6 +289,7 @@ function parseArgs(argv: string[]): Args {
     else if (key === '--thread-id' && val !== undefined) { out.threadId = val; i++; }
     else if (key === '--strict-resume') out.strictResume = true;
     else if (key === '--bot-name' && val !== undefined) { out.botName = val; i++; }
+    else if (key === '--title-prefix' && val !== undefined) { out.titlePrefix = normalizeCodexAppTitlePrefix(val); i++; }
     else if (key === '--bot-open-id' && val !== undefined) { out.botOpenId = val; i++; }
     else if (key === '--locale' && val !== undefined) { out.locale = val; i++; }
     else if (key === '--model' && val !== undefined) { out.model = val; i++; }
@@ -1897,8 +1900,11 @@ function queueThreadTitle(targetThreadId: string, accepted: readonly Dispatch[])
         : body;
       const { text } = sessionTitleInput(task, mentions);
       if (!text || isBootstrapDisplayTitle(text)) continue;
-      const chars = Array.from(text);
-      pending.name = chars.length > 48 ? `${chars.slice(0, 47).join('').trimEnd()}…` : text;
+      const prefix = args.titlePrefix ?? '';
+      const normalizedPrefix = prefix.trimStart().replace(/\s+/g, ' ');
+      const title = `${prefix}${text.startsWith(normalizedPrefix) ? text.slice(normalizedPrefix.length) : text}`;
+      const chars = Array.from(title);
+      pending.name = chars.length > 48 ? `${chars.slice(0, 47).join('').trimEnd()}…` : title;
       break;
     }
   }
