@@ -130,11 +130,21 @@ async function startWorker(opts: {
   const fakeCli = join(root, 'fake-cli');
   writeFileSync(fakeCli, `#!${tsRunnerPrefix().command}
 const fs = require('node:fs');
+const path = require('node:path');
 fs.writeFileSync(${JSON.stringify(cliPidFile + '.tmp')}, String(process.pid));
 fs.renameSync(${JSON.stringify(cliPidFile + '.tmp')}, ${JSON.stringify(cliPidFile)});
+const args = process.argv.slice(2);
+const logIdx = args.indexOf('--log-file');
+const logFile = logIdx >= 0 ? args[logIdx + 1] : undefined;
+const emitStreamLog = id => {
+  if (!logFile) return;
+  fs.mkdirSync(path.dirname(logFile), { recursive: true });
+  fs.appendFileSync(logFile, 'I1120 12:00:00.000000 100 conversation_manager.go:1044] Streaming conversation ' + id + '\\n');
+};
 // Keep the old database open across a native conversation switch.
 const convFd = fs.openSync(${JSON.stringify(conversationDb)}, 'a');
 let presenceFd = fs.openSync(${JSON.stringify(join(presenceDir, `${nativeId}.lock`))}, 'a');
+let activeId = ${JSON.stringify(nativeId)};
 let compact = ${JSON.stringify(join(logsDir, 'transcript.jsonl'))};
 let full = ${JSON.stringify(join(logsDir, 'transcript_full.jsonl'))};
 const prep = ${JSON.stringify(prep)};
@@ -157,6 +167,8 @@ process.stdin.on('data', chunk => {
       fs.openSync(${JSON.stringify(nextConversationDb)}, 'a');
       fs.closeSync(presenceFd);
       presenceFd = fs.openSync(${JSON.stringify(join(presenceDir, `${nextNativeId}.lock`))}, 'a');
+      activeId = ${JSON.stringify(nextNativeId)};
+      emitStreamLog(activeId);
       compact = ${JSON.stringify(join(nextLogsDir, 'transcript.jsonl'))};
       full = ${JSON.stringify(join(nextLogsDir, 'transcript_full.jsonl'))};
       fs.writeFileSync(${JSON.stringify(switchReceipt)}, '');
@@ -166,6 +178,7 @@ process.stdin.on('data', chunk => {
   }
 });
 function submit(n, payload) {
+  emitStreamLog(activeId);
   fs.appendFileSync(history, JSON.stringify({ display: payload, workspace, timestamp: Date.now() }) + '\\n');
   process.stdout.write('\\x1b[2J\\x1b[H  Working…  esc to cancel\\n');
   const user = JSON.stringify({
