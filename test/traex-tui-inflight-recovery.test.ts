@@ -90,6 +90,7 @@ describe('plain TRAE busy input after persistent worker reattach', () => {
     h.scope.pendingMessages.length = 0;
     h.scope.sendToPty(input().content, input().turnId, { trustedCaller: caller });
     await h.scope.flushPending.mock.results.at(-1).value;
+    await h.flush();
     expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledOnce();
     expect(h.scope.pendingMessages).toHaveLength(0);
     expect(h.scope.reattachOpenTurnGate).toBe(true);

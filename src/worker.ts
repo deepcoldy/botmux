@@ -31438,7 +31438,7 @@ async function flushPending(): Promise<void> {
       )
     : runtimeSupportsTypeAhead;
   const typeAheadAllowed = pendingInputAllowsTypeAhead(
-    effectiveSupportsTypeAhead,
+    effectiveSupportsTypeAhead || (!!reattachSteerFence?.nativeInstant && runtimeSupportsTypeAhead),
     durableTurnInFlight,
     pendingMessages[0],
     directRpcTurnBlocksTypeAhead() || programStatusBlockedHoldsTypeAhead(),
