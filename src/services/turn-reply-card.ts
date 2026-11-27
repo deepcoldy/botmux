@@ -256,7 +256,17 @@ export class TurnReplyCardStore {
    * daemon-side publisher's next recover/sweep re-renders and PATCHes the card
    * (the renderer now treats externalFinal as delivery fact and empties that
    * body); a mark arriving before the terminal needs no flag, as that terminal
-   * update renders the card with the flag already present. */
+   * update renders the card with the flag already present.
+   *
+   * A pendingPatch left by a failed terminal PATCH holds a body rendered from
+   * the PRE-externalFinal record, so replaying it verbatim would pin the wrong
+   * silence/missing-answer text and clear the refresh evidence on success. This
+   * mark is a render revision: invalidate that stale pendingPatch so recover
+   * re-renders from the latest record. Safe here because a record that can be
+   * marked has no finalCard (guarded above), hence pendingPatch.final is always
+   * false and dropping it cannot affect final-delivery accounting. A failed
+   * re-render re-persists a fresh, correct pendingPatch and keeps publishPending,
+   * so the evidence clears only after the new body is actually PATCHed. */
   async noteExternalFinal(key: TurnReplyCardKey, chatId: string): Promise<boolean> {
     if (!this.read(key)) return false;
     return withFileLock(this.path(key), async () => {
@@ -264,7 +274,10 @@ export class TurnReplyCardStore {
       if (!record || record.chatId !== chatId || record.finalCard || record.withdrawn) return false;
       if (record.externalFinal) return true;
       record.externalFinal = true;
-      if (record.messageId && replyCardIsTerminal(record)) record.publishPending = true;
+      if (record.messageId && replyCardIsTerminal(record)) {
+        delete record.pendingPatch;
+        record.publishPending = true;
+      }
       this.write(key, record);
       return true;
     }, { maxWaitMs: 8_000 });

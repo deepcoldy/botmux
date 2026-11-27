@@ -1055,6 +1055,66 @@ describe('one reply card per turn', () => {
     expect(progressElements(recovered)).toHaveLength(0);
   });
 
+  it('re-renders instead of replaying a stale pendingPatch when externalFinal invalidates it', async () => {
+    // The terminal PATCH fails, leaving a pendingPatch that carries the wrong body.
+    const realPatch = vi.mocked(io.patch).getMockImplementation()!;
+    vi.mocked(io.patch).mockImplementation(async () => { throw new Error('PATCH unavailable'); });
+    await store.update(key, { kind: 'start' }, io);
+    await expect(store.update(key, { kind: 'terminal', phase: 'completed', silent: true }, io)).rejects.toThrow('PATCH unavailable');
+    const stuck = store.read(key)!;
+    expect(stuck.pendingPatch).toBeDefined();
+    expect(stuck.pendingPatch!.content).toContain(silentReceipt());
+
+    // Transport recovers; the external-final mark is a render revision.
+    vi.mocked(io.patch).mockImplementation(realPatch);
+    expect(await store.noteExternalFinal(key, input.chatId)).toBe(true);
+    const marked = store.read(key)!;
+    expect(marked.externalFinal).toBe(true);
+    expect(marked.pendingPatch).toBeUndefined();
+    expect(marked.publishPending).toBe(true);
+
+    // recover must re-render from the latest record, not replay the stale body.
+    const patchesBefore = vi.mocked(io.patch).mock.calls.length;
+    await new TurnReplyCardStore(dir).update(key, { kind: 'recover' }, io);
+    const recovered = store.read(key)!;
+    expect(vi.mocked(io.patch).mock.calls.length).toBeGreaterThan(patchesBefore);
+    expect(recovered.pendingPatch).toBeUndefined();
+    expect(recovered.publishPending).toBeUndefined();
+    expect(recovered.lastCard).not.toContain(silentReceipt());
+    expect(progressElements(recovered)).toHaveLength(0);
+
+    // A second recover is now a genuine no-op.
+    const patchesAfter = vi.mocked(io.patch).mock.calls.length;
+    await new TurnReplyCardStore(dir).update(key, { kind: 'recover' }, io);
+    expect(vi.mocked(io.patch).mock.calls.length).toBe(patchesAfter);
+  });
+
+  it('keeps the refresh evidence when the re-render PATCH after a late mark also fails', async () => {
+    const realPatch = vi.mocked(io.patch).getMockImplementation()!;
+    vi.mocked(io.patch).mockImplementation(async () => { throw new Error('PATCH unavailable'); });
+    await store.update(key, { kind: 'start' }, io);
+    await expect(store.update(key, { kind: 'terminal', phase: 'completed', silent: true }, io)).rejects.toThrow('PATCH unavailable');
+    vi.mocked(io.patch).mockImplementation(realPatch);
+    await store.noteExternalFinal(key, input.chatId);
+
+    // recover re-renders, but this PATCH fails too: evidence must survive.
+    vi.mocked(io.patch).mockImplementation(async () => { throw new Error('still down'); });
+    await expect(new TurnReplyCardStore(dir).update(key, { kind: 'recover' }, io)).rejects.toThrow('still down');
+    const failed = store.read(key)!;
+    expect(failed.publishPending).toBe(true);
+    // The persisted pendingPatch now carries the CORRECT (external-final) body.
+    expect(failed.pendingPatch).toBeDefined();
+    expect(failed.pendingPatch!.content).not.toContain(silentReceipt());
+
+    // Next recover replays that correct body and clears the evidence on success.
+    vi.mocked(io.patch).mockImplementation(realPatch);
+    await new TurnReplyCardStore(dir).update(key, { kind: 'recover' }, io);
+    const recovered = store.read(key)!;
+    expect(recovered.publishPending).toBeUndefined();
+    expect(recovered.pendingPatch).toBeUndefined();
+    expect(recovered.lastCard).not.toContain(silentReceipt());
+  });
+
   it('never marks a user-cancelled turn as deliberately silent', async () => {
     await store.update(key, { kind: 'start' }, io);
     await store.update(key, { kind: 'phase', phase: 'stopping' }, io);
