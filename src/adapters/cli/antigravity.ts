@@ -91,6 +91,13 @@ import {
  *      next message reaches the model.
  */
 
+/** First agy release whose OSC 7501 reports are enabled by botmux:
+ *  1.4.0 introduced OSC 7501 (`AGY_CLI_OSC7501=on` / `AGY_CLI_OSC7501_MESSAGES=brief`),
+ *  and 1.5.10 fixed premature `done` while waiting for background subagents/tasks
+ *  (daemon tasks such as dev servers do not count). Older/unknown versions keep
+ *  the screen + transcript path unchanged. */
+export const ANTIGRAVITY_PROGRAM_STATUS_MIN_VERSION = '1.5.10';
+
 const HISTORY_PATH = join(homedir(), '.gemini', 'antigravity-cli', 'history.jsonl');
 
 
@@ -1035,6 +1042,31 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
           && isAntigravityIdleComposerScreen(screen)) return false;
       } catch { /* Missing viewport is not evidence of cancellation. */ }
       return true;
+    },
+    // OSC 7501 (`ESC]7501;state=…:app=antigravity BEL`), verified live on agy
+    // 1.5.18 (raw PTY and private tmux pipe-pane):
+    //   startup  idle on ready composer (blocked kind=question on setup wizard,
+    //            blocked kind=permission on folder trust);
+    //   turn     [idle on first keystroke after done] → working →
+    //            [blocked kind=permission|question → working] → done | error | idle (Esc);
+    //   /model, /help: no report at all.
+    // Under tmux pipe-pane the startup `7501;?` probe goes unanswered, so
+    // `AGY_CLI_OSC7501=on` skips the handshake and `AGY_CLI_OSC7501_MESSAGES=brief`
+    // keeps `msg` compact (without raw reply/command/question bodies). Startup
+    // stays on the composer gates; each write cycle hands idle to the screen
+    // until agy reports busy; from there working → blocked → done/idle/error is
+    // authoritative, blocked holds queued input off approval dialogs, and a
+    // confirmed transcript terminal still releases a lingering `working` (never
+    // `blocked`). Older/unknown versions, adopted panes, and explicit
+    // `AGY_CLI_OSC7501=off` keep the screen + transcript path unchanged.
+    supportsProgramStatus: true,
+    programStatusMinVersion: ANTIGRAVITY_PROGRAM_STATUS_MIN_VERSION,
+    programStatusFollowsInputCycle: true,
+    programStatusYieldsToTranscriptTerminal: true,
+    programStatusBlockedHoldsInput: true,
+    spawnEnv: {
+      AGY_CLI_OSC7501: 'on',
+      AGY_CLI_OSC7501_MESSAGES: 'brief',
     },
     systemHints: BOTMUX_SHELL_HINTS,
     skillsDir: '~/.gemini/config/skills',
