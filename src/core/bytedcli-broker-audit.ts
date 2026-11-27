@@ -1,4 +1,5 @@
-import { constants, lstatSync, mkdirSync, openSync, fstatSync, fsyncSync, closeSync, writeSync } from 'node:fs';
+import { constants, lstatSync, mkdirSync, openSync, fstatSync, fsyncSync, closeSync, writeSync, renameSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { dirname, isAbsolute, join, parse, resolve } from 'node:path';
 import type { BytedcliExecErrorCode, BytedcliExecOutcome } from '../cli/bytedcli-exec-protocol.js';
 
@@ -65,21 +66,29 @@ function safeRecord(record: BytedcliAuditRecord): string {
   return encoded;
 }
 
-/** Append+fsync serializes each line inside this daemon, without promising
- * cross-daemon transactions or cross-restart exactly-once execution. */
+/** Each record is published independently after a complete write and fsync.
+ * A torn file remains .pending, never a committed intent. No shared log tail
+ * is modified, so another daemon's history/active append cannot be truncated. */
 export class BytedcliBrokerAudit implements BytedcliAuditSink {
   constructor(private readonly root: string, private readonly sync: (fd: number) => void = fsyncSync) {}
   async append(record: BytedcliAuditRecord): Promise<void> {
     const bytes = Buffer.from(safeRecord(record)); ensureBytedcliPrivateDirectory(this.root, this.sync);
-    const fd = openSync(join(this.root, 'audit.jsonl'), constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);
+    const records = join(this.root, 'records'); ensureBytedcliPrivateDirectory(records, this.sync);
+    const id = randomUUID(); const pending = join(records, id + '.pending');
+    const fd = openSync(pending, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
     try {
       const stat = fstatSync(fd);
       if (!stat.isFile() || stat.nlink !== 1 || (stat.mode & 0o777) !== 0o600
         || (process.getuid && stat.uid !== process.getuid())) throw new Error('unsafe_audit_file');
       let offset = 0;
-      while (offset < bytes.length) offset += writeSync(fd, bytes, offset, bytes.length - offset);
+      while (offset < bytes.length) {
+        const written = writeSync(fd, bytes, offset, bytes.length - offset);
+        if (!Number.isSafeInteger(written) || written <= 0) throw new Error('audit_write_no_progress');
+        offset += written;
+      }
       this.sync(fd);
-      const directory = openSync(this.root, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+      renameSync(pending, join(records, id + '.json'));
+      const directory = openSync(records, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
       try { this.sync(directory); } finally { closeSync(directory); }
     } finally { closeSync(fd); }
   }

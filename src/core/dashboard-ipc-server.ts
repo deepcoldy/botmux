@@ -15488,13 +15488,10 @@ export function startIpcServer(opts: {
     // global fetch on a keep-alive connection, it stays open until the runtime
     // reclaims it about 6 s later, and close() waits all that time (node:http
     // clients, which every production loopback caller uses, do not leave it).
-    // Tests awaiting close() paid for that; the daemon's teardown does not await
-    // close() and exits explicitly, so shutdown itself was never held up.
-    // Closing every connection before the listener makes close() resolve at
-    // once. It also resets requests still in flight at that moment while their
-    // handlers run on — teardown callers already have to cope with that, since
-    // the daemon can exit mid-request. listen-with-probe's release path tears
-    // sockets down for the same reason.
+    // Daemon teardown awaits this close. Close connections before stopping the
+    // listener to avoid keep-alive delays, then cancel and join broker-owned
+    // provider/child cleanup even when an HTTP response has already finished.
+    // In-flight clients can see a reset while that owned cleanup settles.
     retireBytedcliSession: (sessionId, generation) => bytedcliBroker.retireSession(sessionId, generation),
     close: async () => {
       server.closeAllConnections?.();

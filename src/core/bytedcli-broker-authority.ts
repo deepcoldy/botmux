@@ -146,5 +146,5 @@ export async function resolveBytedcliAuthority(deps:BytedcliAuthorityDependencie
   return {ok:true,authority:Object.freeze({daemonBootId:deps.daemonBootId,botAppId:ds.larkAppId,sessionId,
     turnId:execution.turnId,identityTurnId:identityTurn,workerGeneration:execution.workerGeneration,
     // Authenticated sentinel: ordinary topics do not have dispatch attempts.
-    dispatchAttempt:execution.dispatchAttempt ?? 0,policyFingerprint:fingerprint,...(actor?{actor}:{}),recheck})};
+    dispatchAttempt:execution.dispatchAttempt ?? 0,policyFingerprint:fingerprint,...(actor?{actor}:{}),recheck,current:synchronousCheck})};
 }

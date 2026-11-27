@@ -32,6 +32,10 @@
 
 宿主 bytedcli 和 Botmux 安装树在严格会话内只读，全部 SDK profiles、个人凭据、epoch 与 broker/audit 根不可读写。不能在运行该宿主的安装树里原地开发；其他项目使用独立项目授权。凭据根本身是 leaf symlink 的组合不支持。缺失受保护文件的父目录使用冷启动时的私有目录视图，之后新增的宿主兄弟文件要等新一代才能看到。
 
+bytedcli 的只读边界包括祖先 `node_modules` 搜索路径、兄弟/提升依赖及软链的规范目标，宿主启动时冻结完整文件树，并在探测与执行时核验。Node 标准 runtime-prefix `lib/node` 全局搜索树同样受保护；探测到其他无法由冻结边界覆盖的全局搜索路径时拒绝。私有空 HOME 中的搜索目录无需读取宿主 HOME。外部软链指向工作区时，该依赖和可替换它的祖先也受保护；该工作区不能同时允许修改这段依赖。遍历超过 100,000 个节点、硬链接、特殊文件、断链或不安全权限的安装无法证明完整性，严格执行拒绝；普通旧模式仍可装配。管理员改变安装或证书后应重建严格会话。
+
+网络只继承宿主冻结的 `HTTP_PROXY`、`HTTPS_PROXY`、`NO_PROXY` 及对应小写变量。审核版本的原生传输不支持 `ALL_PROXY`/`all_proxy`；配置这些变量会明确标记严格宿主不可用，须改成所支持的 HTTP(S) 代理后重建，不能静默忽略路由。`NODE_EXTRA_CA_CERTS`、`SSL_CERT_FILE`、`SSL_CERT_DIR` 的规范路径、软链目标及祖先同样受保护并核验；无法证明的证书布局拒绝严格执行。以上限制不改变其他 CLI 或旧身份模式的网络合同。
+
 严格包装器不导出 ByteCloud token；独立 `codebase` / `bitscli` / `bits-cli`、git askpass 和 `BOTMUX_AS` 拒绝。独立 Meego、Lark 和旧模式保留原有合同；严格 bytedcli 中未登记的 Meego 子命令仍拒绝。
 
 ## 当前命令目录
@@ -67,5 +71,9 @@ MR 操作须显式提供仓库，不从 Agent cwd 推断。`--body-file` / `-F` 
 ## 写入结果与审计
 
 写入前必须先 fsync 宿主 intent，完成后记录结果；审计只保留结构化元数据和摘要，不落完整 body 或 token。排队、取票、派发和返回时都重新检查执行与授权。写入已派发但响应丢失、撤权、超时或结果落盘失败，返回 `write_outcome_unknown` 和 request ID。客户端不会自动重试；先核对上游状态再由真人决定下一步。
+
+审计根为 `~/.botmux/host-authority/bytedcli-broker/audit`。新记录写入私有 `records/<UUID>.pending`，完整写入和文件 fsync 后原子发布为 `<UUID>.json`，目录 fsync 成功才确认 intent。多个 daemon 各自发布独立记录；按 daemonBootId、sessionId、generation、turnId、requestId 关联 intent/result，不依赖目录顺序。旧 `audit.jsonl` 原样保留供历史核对；不再续写或截断它。失败留下的 `.pending` 只能用于排查，不能当成已确认 intent；由管理员核对存储恢复和上游结果后归档，broker 不自动删除或重跑。短写、ENOSPC 或 fsync 失败时，本次派发拒绝，恢复后新记录仍有独立、可解析的持久边界。
+
+HTTP 响应超时与资源清理分别计时。首个执行器授权复查开始前即绑定 request ID、取得配额并注册清理所有权；超时后仍保留名额直到忽略取消的 provider 真正结束，重复 ID 不创建新的同一复查。独立 follower 可取消而不终止 primary；关闭/退役会等待真实清理。拒绝响应只复核冻结宿主状态，不启动新的委托 provider；成功业务结果仍做完整授权复查。
 
 本功能的验收使用临时 HOME、假 provider/CLI、真实 HTTP/client/executor 和 Linux 隔离测试。未做真实业务写入，也未自动修改或重启现有部署。

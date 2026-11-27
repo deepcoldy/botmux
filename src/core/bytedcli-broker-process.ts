@@ -3,6 +3,8 @@ import { constants, accessSync, lstatSync, realpathSync, statSync } from 'node:f
 import { dirname, isAbsolute, delimiter, relative, resolve } from 'node:path';
 import { BYTEDCLI_AUDITED_RELEASE, assertBytedcliAuditedRelease } from './bytedcli-operation-policy.js';
 import type { BytedcliExecErrorCode } from '../cli/bytedcli-exec-protocol.js';
+import { snapshotBytedcliRuntimeTrees } from './bytedcli-runtime-integrity.js';
+import { BYTEDCLI_HOST_NETWORK_KEYS } from './bytedcli-host-network.js';
 
 export class BytedcliBrokerError extends Error {
   constructor(readonly code: BytedcliExecErrorCode) { super(code); this.name = 'BytedcliBrokerError'; }
@@ -20,8 +22,7 @@ export interface BytedcliChildInvocation {
 }
 export interface BytedcliChildResult { readonly stdout: Buffer; readonly stderr: Buffer; readonly exitCode: number }
 export type BytedcliChildRunner = (invocation: BytedcliChildInvocation) => Promise<BytedcliChildResult>;
-const networkKeys = new Set(['HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'https_proxy', 'http_proxy', 'no_proxy',
-  'NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE', 'SSL_CERT_DIR']);
+const networkKeys: ReadonlySet<string> = new Set(BYTEDCLI_HOST_NETWORK_KEYS);
 export function bytedcliMinimalEnv(home: string, cwd: string, path: string, network: Readonly<NodeJS.ProcessEnv> = {}): NodeJS.ProcessEnv {
   if (!isAbsolute(home) || !isAbsolute(cwd) || !path.split(delimiter).every(dir => isAbsolute(dir) && resolve(dir) === dir)) {
     throw new BytedcliBrokerError('executor_unavailable');
@@ -81,6 +82,7 @@ export const runBoundedBytedcliChild: BytedcliChildRunner = async invocation => 
 export async function discoverBytedcliTrustedCli(options: {
   readonly candidates: readonly string[]; readonly installationRoots: readonly string[]; readonly path: string;
   readonly runtimeExecutable: string;
+  readonly runtimeStillCurrent?: () => boolean;
   readonly probeHome: string; readonly probeCwd: string; readonly signal: AbortSignal; readonly run?: BytedcliChildRunner;
 }): Promise<BytedcliTrustedCli> {
   const owned = (path: string) => {
@@ -93,13 +95,15 @@ export async function discoverBytedcliTrustedCli(options: {
   const path = [dirname(runtime), ...options.path.split(delimiter)].join(delimiter);
   if (!path.split(delimiter).every(dir => isAbsolute(dir) && owned(realpathSync(dir)))) throw new BytedcliBrokerError('executor_unavailable');
   for (const candidate of options.candidates) {
-    let entrypoint: string; let installationRoot: string; let stillCurrent: () => boolean;
+    let entrypoint: string; let installationRoot: string; let stillCurrent: () => boolean; let trees: ReturnType<typeof snapshotBytedcliRuntimeTrees>;
     try {
       if (!isAbsolute(candidate)) continue; entrypoint = realpathSync(candidate);
       installationRoot = options.installationRoots.map(root => realpathSync(root)).find(root => {
         const rel = relative(root, entrypoint); return rel && !rel.startsWith('..') && !isAbsolute(rel);
       })!;
       if (!installationRoot || !owned(installationRoot) || !owned(entrypoint) || !statSync(entrypoint).isFile()) continue;
+      trees = snapshotBytedcliRuntimeTrees(entrypoint, installationRoot, runtime);
+      if (options.runtimeStillCurrent?.() === false) continue;
       const snapshots = new Map<string, { dev: number; ino: number; mode: number; uid: number; size?: number; mtimeMs?: number; ctimeMs?: number }>();
       // Ownership above the configured trust root can legitimately belong to
       // another host administrator. Freeze those ancestors rather than assuming
@@ -117,7 +121,8 @@ export async function discoverBytedcliTrustedCli(options: {
       }
       stillCurrent = () => {
         try {
-          if (realpathSync(candidate) !== entrypoint || realpathSync(options.runtimeExecutable) !== runtime) return false;
+          if (realpathSync(candidate) !== entrypoint || realpathSync(options.runtimeExecutable) !== runtime
+            || !trees.stillCurrent() || options.runtimeStillCurrent?.() === false) return false;
           for (const [file, before] of snapshots) {
             const now = lstatSync(file);
             if (now.dev !== before.dev || now.ino !== before.ino || now.mode !== before.mode || now.uid !== before.uid
@@ -130,17 +135,22 @@ export async function discoverBytedcliTrustedCli(options: {
     const run = options.run ?? runBoundedBytedcliChild;
     const invocation = { executable: runtime, cwd: options.probeCwd, env: bytedcliMinimalEnv(options.probeHome, options.probeCwd, path),
       signal: options.signal, timeoutMs: 5000, outputLimitBytes: 4096 };
-    const runtimeResult = await run({ ...invocation, argv: ['-p', 'JSON.stringify({node:process.release.name,major:Number(process.versions.node.split(".")[0]),bun:!!process.versions.bun})'] });
-    let runtimeInfo: { node?: string; major?: number; bun?: boolean };
+    const runtimeResult = await run({ ...invocation, argv: ['-p', 'JSON.stringify({node:process.release.name,major:Number(process.versions.node.split(".")[0]),bun:!!process.versions.bun,globalPaths:require("node:module").globalPaths})'] });
+    let runtimeInfo: { node?: string; major?: number; bun?: boolean; globalPaths?: unknown };
     try { runtimeInfo = JSON.parse(runtimeResult.stdout.toString()); } catch { throw new BytedcliBrokerError('executor_unavailable'); }
-    if (runtimeResult.exitCode !== 0 || runtimeInfo.node !== 'node' || runtimeInfo.bun || !runtimeInfo.major || runtimeInfo.major < 22) {
+    const privateSearchPaths = [resolve(options.probeHome, '.node_modules'), resolve(options.probeHome, '.node_libraries')];
+    if (runtimeResult.exitCode !== 0 || runtimeInfo.node !== 'node' || runtimeInfo.bun || !runtimeInfo.major || runtimeInfo.major < 22
+      || !Array.isArray(runtimeInfo.globalPaths) || runtimeInfo.globalPaths.some(file => typeof file !== 'string'
+        || !isAbsolute(file) || !privateSearchPaths.includes(file) && !trees.protectedPaths.some(root => {
+          const rel = relative(root, file); return rel === '' || !rel.startsWith('..') && !isAbsolute(rel);
+        }))) {
       throw new BytedcliBrokerError('executor_unavailable');
     }
     const result = await run({ ...invocation, argv: [entrypoint, '--version'] });
     if (result.exitCode !== 0 || !stillCurrent()) throw new BytedcliBrokerError('executor_unavailable');
     assertBytedcliAuditedRelease(result.stdout.toString().trim());
     return Object.freeze({ executable: runtime, prefixArgs: Object.freeze([entrypoint]), path, version: BYTEDCLI_AUDITED_RELEASE,
-      protectedPaths: Object.freeze([installationRoot, runtime, dirname(runtime)]), stillCurrent });
+      protectedPaths: Object.freeze([...trees!.protectedPaths, runtime, dirname(runtime)]), stillCurrent });
   }
   throw new BytedcliBrokerError('executor_unavailable');
 }

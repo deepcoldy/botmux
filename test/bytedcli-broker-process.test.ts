@@ -43,4 +43,15 @@ describe('private bounded CLI processes', () => {
     expect(cli.path.split(':')[0]).toBe(dirname(node)); expect(cli.stillCurrent()).toBe(true);
     writeFileSync(entry, 'console.log("0.200.0")'); expect(cli.stillCurrent()).toBe(false);
   });
+  it('refuses a runtime with a global module search path outside the frozen installation closure before invoking the CLI', async () => {
+    const root = setup(); const entry = join(root, 'bytedcli.mjs'); writeFileSync(entry, 'console.log("0.199.0")');
+    const node = realpathSync(resolveNodeExecutable()!); let cliRan = false;
+    await expect(discoverBytedcliTrustedCli({ candidates: [entry], installationRoots: [root], runtimeExecutable: node,
+      path: '/usr/bin:/bin', probeHome: root, probeCwd: root, signal: new AbortController().signal,
+      run: async invocation => {
+        if (invocation.argv[0] === entry) { cliRan = true; return { stdout: Buffer.from('0.199.0'), stderr: Buffer.alloc(0), exitCode: 0 }; }
+        return { stdout: Buffer.from(JSON.stringify({ node: 'node', major: 22, bun: false, globalPaths: ['/agent-writable/global-packages'] })), stderr: Buffer.alloc(0), exitCode: 0 };
+      } })).rejects.toMatchObject({ code: 'executor_unavailable' });
+    expect(cliRan).toBe(false);
+  });
 });

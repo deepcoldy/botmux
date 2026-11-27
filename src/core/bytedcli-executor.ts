@@ -16,6 +16,9 @@ export interface BytedcliFrozenAuthority {
   readonly turnId: string; readonly identityTurnId?: string; readonly workerGeneration: number;
   readonly dispatchAttempt: number; readonly policyFingerprint: string;
   readonly actor?: BytedcliVerifiedActor; readonly recheck: BytedcliAuthorityRecheck;
+  /** Frozen host state check without starting delegated provider work. Used
+   * only for refusals that expose no business data or execution authority. */
+  readonly current?: () => BytedcliExecErrorCode | undefined;
 }
 export interface BytedcliExecutionRequest {
   readonly requestId: string; readonly operation: BytedcliOperation;
@@ -49,7 +52,7 @@ async function joinOwnedWork(work: readonly Promise<unknown>[]): Promise<void> {
 interface Waiter { request: BytedcliExecutionRequest; resolve: (release: () => void) => void; reject: (error: Error) => void; cleanup: () => void }
 interface Entry { digest: string; tuple: string; sessionId: string; workerGeneration:number; promise: Promise<BytedcliExecResponse>; settled: boolean;
   outputBytes: number; revalidate?: BytedcliCredentialLease['stillCurrent']; controller?: AbortController;
-  identity?: BytedcliEffectiveIdentity; dispatched?: boolean }
+  identity?: BytedcliEffectiveIdentity; dispatched?: boolean; overflow?: boolean }
 /** Response cancellation and underlying resource settlement are separate.
  * Keep quota and lifecycle ownership until every started provider has ended. */
 class OwnedBytedcliRequest {
@@ -121,8 +124,11 @@ export class BytedcliExecutor {
   private readonly waiters: Waiter[] = []; private readonly entries = new Map<string, Entry>();
   constructor(private readonly deps: BytedcliExecutorDependencies) {}
   async execute(raw: BytedcliExecutionRequest): Promise<BytedcliExecResponse> {
+    if (this.closed) return rejectResponse(raw, 'executor_unavailable');
+    if (this.generationRetiring(raw.authority.sessionId, raw.authority.workerGeneration)) return rejectResponse(raw, 'execution_stale');
     if (this.admissions >= 80) return rejectResponse(raw, 'busy');
     this.admissions++;
+    let ownedAdmission = false;
     const started = Date.now();
     let request = raw;
     try {
@@ -133,28 +139,27 @@ export class BytedcliExecutor {
       if (operation.effect !== 'read' && operation.effect !== 'write') throw new BytedcliBrokerError('unsupported_operation');
       if (operation.effect === 'write' && (!authority.actor || !authority.actor.verifiedEmail)) throw new BytedcliBrokerError('actor_required');
       const deadline = started + operation.timeoutMs;
-      await this.beforeDeadline(this.check(request), deadline, request.signal);
       const tuple = tupleOf(authority); const key = JSON.stringify([tuple, request.requestId]);
-      for (const [oldKey, old] of this.entries) {
-        if (old.settled && old.sessionId === authority.sessionId && old.tuple !== tuple) {
-          this.outputBytes -= old.outputBytes; this.entries.delete(oldKey);
-        }
-      }
       const digest = bytedcliSafeFingerprint([operation.argv, operation.stagedInputs.map(input => input.dataBase64),
         operation.timeoutMs, operation.outputLimitBytes, operation.inputLimitBytes]);
       const prior = this.entries.get(key);
       if (prior) {
         if (prior.digest !== digest) return rejectResponse(request, 'invalid_request');
+        ownedAdmission = true;
         return await this.replay(request, prior, deadline);
       }
-      if (this.entries.size >= 4096) throw new BytedcliBrokerError('busy');
+      const overflow = this.entries.size >= 4096;
+      if (overflow && ![...this.entries.values()].some(old => old.settled && old.sessionId === authority.sessionId && old.tuple !== tuple)) {
+        throw new BytedcliBrokerError('busy');
+      }
       const entry: Entry = { digest, tuple, sessionId: authority.sessionId, workerGeneration:authority.workerGeneration, promise: Promise.resolve(rejectResponse(request, 'internal_error')),
-        settled: false, outputBytes: 0 };
+        settled: false, outputBytes: 0, overflow };
       this.entries.set(key, entry);
+      ownedAdmission = true;
       entry.promise = this.executeOnce(request, digest, entry, deadline);
       return await entry.promise;
     } catch (error) { return rejectResponse(request, errorCode(error)); }
-    finally { this.admissions--; }
+    finally { if (!ownedAdmission) this.admissions--; }
   }
   private async check(request: BytedcliExecutionRequest): Promise<void> {
     if (this.closed) throw new BytedcliBrokerError('executor_unavailable');
@@ -209,14 +214,8 @@ export class BytedcliExecutor {
       promise.then(resolveResult, reject).finally(() => signal.removeEventListener('abort', abort));
     });
   }
-  private beforeDeadline<T>(promise: Promise<T>, deadline: number, signal?: AbortSignal): Promise<T> {
-    return new Promise((resolveResult, reject) => {
-      const timer = setTimeout(() => reject(new BytedcliBrokerError('timeout')), Math.max(0, deadline - Date.now()));
-      this.abortable(promise, signal).then(resolveResult, reject).finally(() => clearTimeout(timer));
-    });
-  }
   private async replay(request: BytedcliExecutionRequest, entry: Entry, deadline: number): Promise<BytedcliExecResponse> {
-    if (this.waiters.length + this.duplicateWaiters >= 64) return rejectResponse(request, 'busy');
+    if (this.waiters.length + this.duplicateWaiters >= 64) { this.admissions--; return rejectResponse(request, 'busy'); }
     this.duplicateWaiters++; let counted = true; let release: (() => void) | undefined; let timedOut = false;
     const controller = new AbortController(); const abort = () => controller.abort();
     const owner = this.own(request.authority.sessionId, request.authority.workerGeneration, controller);
@@ -241,7 +240,7 @@ export class BytedcliExecutor {
     } finally {
       if (counted) this.duplicateWaiters--; clearTimeout(timer);
       try { request.signal?.removeEventListener('abort', abort); }
-      finally { owner.finish(() => release?.()); }
+      finally { owner.finish(() => { release?.(); this.admissions--; }); }
     }
   }
   private fits(request: BytedcliExecutionRequest): boolean {
@@ -281,7 +280,13 @@ export class BytedcliExecutor {
   private async executeOnce(request: BytedcliExecutionRequest, digest: string, entry: Entry, deadline: number): Promise<BytedcliExecResponse> {
     const controller = new AbortController(); let timeout = false; let dispatched = false;
     const owner = this.own(request.authority.sessionId, request.authority.workerGeneration, controller);
-    void owner.cleanup.then(() => { entry.settled = true; });
+    void owner.cleanup.then(() => {
+      entry.settled = true;
+      if (entry.overflow) {
+        const key = JSON.stringify([entry.tuple, request.requestId]);
+        if (this.entries.get(key) === entry) this.entries.delete(key);
+      }
+    });
     entry.controller = controller;
     const abort = () => controller.abort(); request.signal?.addEventListener('abort', abort, { once: true });
     const timer = setTimeout(() => { timeout = true; controller.abort(); }, Math.max(0, deadline - Date.now()));
@@ -293,6 +298,18 @@ export class BytedcliExecutor {
     try {
       if (request.signal?.aborted) controller.abort();
       release = await this.acquire(active); await bounded(this.check(active));
+      // A new tuple may retire cached old responses only after host authority
+      // succeeds. Its initial asynchronous check is already owned and deduped.
+      for (const [oldKey, old] of this.entries) {
+        if (old.settled && old.sessionId === request.authority.sessionId && old.tuple !== entry.tuple) {
+          this.outputBytes -= old.outputBytes; this.entries.delete(oldKey);
+        }
+      }
+      // At most the bounded admission set can provisionally exceed retained
+      // cache capacity. Such entries remain deduped/owned during authorization,
+      // never dispatch without room, and failed placeholders retire on cleanup.
+      if (this.entries.size > 4096) throw new BytedcliBrokerError('busy');
+      entry.overflow = false;
       const leaseRequest = { region: request.operation.region, actor: request.authority.actor, recheck: request.authority.recheck,
         signal: controller.signal, sessionId: request.authority.sessionId, botAppId: request.authority.botAppId,
         identityTurnId: request.authority.identityTurnId ?? request.authority.turnId };
@@ -385,6 +402,7 @@ export class BytedcliExecutor {
           this.outputBytes -= heldOutput;
           if (root) { try { rmSync(root, { recursive: true, force: true }); } catch { /* private root remains inaccessible to Agent */ } }
           release?.();
+          this.admissions--;
         });
       }
     }

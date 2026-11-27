@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BytedcliExecutor } from '../src/core/bytedcli-executor.js';
 import { BytedcliCredentialResolver } from '../src/core/bytedcli-broker-credentials.js';
+import { BytedcliBrokerError } from '../src/core/bytedcli-broker-process.js';
 import { parseBytedcliOperation } from '../src/core/bytedcli-operation-policy.js';
 const roots: string[] = [];
 afterEach(() => roots.splice(0).forEach(root => rmSync(root, { recursive: true, force: true })));
@@ -23,6 +24,12 @@ function setup(leases: any, run: any = async () => empty) {
   const request = (operation = read(), requestId = 'request', extra: any = {}) => ({ authority, operation, requestId, ...extra });
   return { executor, request, authority };
 }
+async function fillRetainedCache(s: ReturnType<typeof setup>) {
+  for (let id = 0; id < 8192; id++) {
+    if ((await s.executor.execute(s.request(read(), 'cache-' + id))).errorCode === 'busy') return;
+  }
+  throw new Error('response cache did not remain bounded');
+}
 function platformProvider() {
   let active = 0; let maximum = 0; const pending: Array<{ gate: ReturnType<typeof deferred>; signal: AbortSignal }> = [];
   const resolver = new BytedcliCredentialResolver({ machineHome: '/trusted/home', localHome: () => '/trusted/person',
@@ -35,6 +42,47 @@ function platformProvider() {
   return { resolver, pending, active: () => active, maximum: () => maximum, release: () => pending.forEach(item => item.gate.release()) };
 }
 describe('underlying broker work ownership', () => {
+  it('admits an authorized successor after the previous frozen tuple fills the retained response cache', async () => {
+    let renewed = false; let dispatches = 0;
+    const lease = { jwt: 'fake-only', kind: 'machine' as const, region: 'cn' as const, expiresAt: Date.now() + 60_000,
+      accountFingerprint: 'sha256:machine', source: 'machine' as const, stillCurrent: async () => undefined };
+    const s = setup({ machine: async () => { if (!renewed) throw new BytedcliBrokerError('machine_auth_required'); return lease; }, actor: async () => { throw new Error('unexpected actor'); } }, async () => { dispatches++; return empty; });
+    await fillRetainedCache(s);
+    renewed = true;
+    const next = await s.executor.execute(s.request(read(), 'successor', { authority: { ...s.authority, workerGeneration: 2, turnId: 'next-turn' } }));
+    await s.executor.close();
+    expect(next.outcome).toBe('completed'); expect(dispatches).toBe(1);
+  });
+  it.each(['denied', 'timeout'] as const)('cleans a %s full-cache placeholder after owned authority settlement and admits an explicit successor', async mode => {
+    const gate = deferred(); let checks = 0; let renewed = false; let dispatches = 0;
+    const lease = { jwt: 'fake-only', kind: 'actor', region: 'cn', expiresAt: Date.now() + 60_000,
+      accountFingerprint: 'sha256:actor', source: 'local', stillCurrent: async () => undefined };
+    const s = setup({ machine: async () => { throw new BytedcliBrokerError('machine_auth_required'); },
+      actor: async () => { if (!renewed) throw new Error('placeholder reached credential resolution'); return lease; } }, async () => { dispatches++; return empty; });
+    await fillRetainedCache(s);
+    const authority = { ...s.authority, workerGeneration: 2, turnId: 'placeholder-turn', recheck: async () => {
+      checks++; if (mode === 'timeout') await gate.promise; return 'permission_denied' as const;
+    } };
+    const request = s.request({ ...write(), timeoutMs: 25 }, 'placeholder', { authority });
+    expect((await s.executor.execute(request)).errorCode).toBe(mode === 'timeout' ? 'timeout' : 'permission_denied');
+    if (mode === 'timeout') expect((await s.executor.execute(request)).errorCode).toBe('timeout');
+    expect(checks).toBe(1); expect(dispatches).toBe(0);
+    gate.release(); await drain(); renewed = true;
+    const successor = await s.executor.execute(s.request(write(), 'explicit-successor', { authority: { ...s.authority, workerGeneration: 3, turnId: 'successor-turn' } }));
+    await s.executor.close(); expect(successor.outcome).toBe('completed'); expect(dispatches).toBe(1);
+  });
+  it.each(['close', 'retireSession'] as const)('binds repeated IDs and joins the initial authority wait after timeout during %s', async method => {
+    const gate = deferred(); let active = 0; let maximum = 0; let dispatches = 0;
+    const s = setup({ machine: async () => { throw new Error('unexpected lease'); }, actor: async () => { throw new Error('unexpected lease'); } }, async () => { dispatches++; return empty; });
+    const authority = { ...s.authority, recheck: async () => { active++; maximum = Math.max(maximum, active); try { await gate.promise; } finally { active--; } } };
+    const responses = [];
+    for (let id = 0; id < 5; id++) responses.push(await s.executor.execute(s.request({ ...write(), timeoutMs: 25 }, 'same-id', { authority })));
+    let closed = false; const stop = (method === 'close' ? s.executor.close() : s.executor.retireSession('session', 1)).then(() => closed = true);
+    await drain(); const premature = closed; const retained = active;
+    gate.release(); await stop;
+    expect(responses.every(response => response.errorCode === 'timeout')).toBe(true);
+    expect(retained).toBe(1); expect(maximum).toBe(1); expect(premature).toBe(false); expect(dispatches).toBe(0);
+  });
   it.each(['cancel', 'timeout'])('keeps a personal write slot until platform cleanup actually ends after %s', async mode => {
     const provider = platformProvider(); let dispatches = 0; const s = setup(provider.resolver, async () => { dispatches++; return empty; });
     const abort = new AbortController(); const first = s.executor.execute(s.request({ ...write(), timeoutMs: mode === 'timeout' ? 35 : 1000 }, 'first', { signal: abort.signal }));

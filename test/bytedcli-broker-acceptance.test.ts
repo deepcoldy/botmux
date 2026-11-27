@@ -8,6 +8,7 @@ import { BytedcliBroker } from '../src/core/bytedcli-broker.js';
 import { resolveBytedcliAuthority } from '../src/core/bytedcli-broker-authority.js';
 import { BytedcliExecutor } from '../src/core/bytedcli-executor.js';
 import { BytedcliBrokerAudit } from '../src/core/bytedcli-broker-audit.js';
+import { readCommittedBytedcliAudit } from './helpers/bytedcli-audit-records.js';
 import { BytedcliCredentialResolver } from '../src/core/bytedcli-broker-credentials.js';
 import { runBytedcliExecClient } from '../src/cli/bytedcli-exec.js';
 import { readProcessStartIdentity } from '../src/utils/process-identity.js';
@@ -111,7 +112,7 @@ it.each(['policy','epoch'] as const)('withdrawal of %s during a provider wait pr
 it('a partial durable write is unknown and the client never retries it',async()=>{
  const f=await setup({failResultAudit:true});const result=await f.client(write);
  expect(result.exitCode).toBe(77);expect(result.stderr).toContain('write_outcome_unknown');expect(f.dispatches).toHaveLength(1);
- const records=readFileSync(join(f.auditRoot,'audit.jsonl'),'utf8').trim().split('\n').map(line=>JSON.parse(line));
+ const records=readCommittedBytedcliAudit(f.auditRoot);
  expect(f.writes()).toEqual([{account:'a@example.test'}]);expect(records.map(record=>record.phase)).toEqual(['intent']);expect(JSON.stringify(records)).not.toContain('signature');
  expect(readdirSync(join(f.root,'private'))).toEqual([]);
 });
@@ -172,6 +173,6 @@ it('worker generation replacement during a provider wait rejects the old write a
  expect(f.dispatches).toEqual([]);expect(f.writes()).toEqual([]);expect(f.attempts()).toEqual([]);
  activateActor(f,'ou_A','om_successor');const successor=await f.client(write);expect(successor.exitCode).toBe(0);
  expect(f.writes()).toEqual([{account:'a@example.test'}]);
- const records=readFileSync(join(f.auditRoot,'audit.jsonl'),'utf8').trim().split('\n').map(line=>JSON.parse(line));
- expect(records.map(record=>[record.workerGeneration,record.phase])).toEqual([[2,'intent'],[2,'result']]);
+ const records=readCommittedBytedcliAudit(f.auditRoot);
+ expect(records.map(record=>[record.workerGeneration,record.phase]).sort()).toEqual([[2,'intent'],[2,'result']]);
 });

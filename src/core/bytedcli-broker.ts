@@ -11,7 +11,7 @@ import { resolveBytedcliAuthority } from './bytedcli-broker-authority.js';
 import { BytedcliExecutor, type BytedcliExecutionRequest } from './bytedcli-executor.js';
 import { createBytedcliHostCredentialResolver } from './bytedcli-broker-credentials.js';
 import { BytedcliBrokerAudit, ensureBytedcliPrivateDirectory } from './bytedcli-broker-audit.js';
-import { discoverBytedcliTrustedCli, type BytedcliTrustedCli } from './bytedcli-broker-process.js';
+import { BytedcliBrokerError, discoverBytedcliTrustedCli, type BytedcliTrustedCli } from './bytedcli-broker-process.js';
 import { bytedcliContainmentAvailable, markBytedcliStrictSession } from './bytedcli-broker-containment.js';
 import { bytecloudBrokerEnabled } from './identity-policy.js';
 import type { BytedcliOperation } from './bytedcli-operation-policy.js';
@@ -121,7 +121,11 @@ export class BytedcliBroker {
       const response=safe ? await runBytedcliSafeCommand(execution,this.deps.personalLeases)
         : await this.deps.executor.execute(execution);
       executorOutcome=response.outcome;
-      const after=await result.authority.recheck();
+      // A refusal/unknown result releases no business data or authority. Do
+      // not start another delegated verifier after its executor deadline;
+      // successful results still require the frozen result-authority check.
+      const refused = response.outcome === 'rejected' || response.outcome === 'write_outcome_unknown';
+      const after=refused && result.authority.current ? result.authority.current() : await result.authority.recheck();
       if(after||controller.signal.aborted)return answer(res,403,failed(after??(deadline?'timeout':'cancelled')));
       answer(res,200,response);
     }catch(error){
@@ -162,10 +166,11 @@ export function createProductionBytedcliBroker(host:Omit<import('./bytedcli-brok
   layout:BytedcliHostLayout=freezeBytedcliHostLayout()):BytedcliBroker{
   let executor:BytedcliExecutor|undefined,pending:Promise<BytedcliExecutor>|undefined,closed=false;
   const trustedCli=async(signal:AbortSignal):Promise<BytedcliTrustedCli>=>{
+    if (layout.unavailableReason || !layout.runtimeStillCurrent()) throw new BytedcliBrokerError('executor_unavailable');
     ensureBytedcliPrivateDirectory(layout.privateRoot);const root=mkdtempSync(join(layout.privateRoot,'probe-'));
     const home=join(root,'home'),cwd=join(root,'cwd');mkdirSync(home,{mode:0o700});mkdirSync(cwd,{mode:0o700});
     try{return await discoverBytedcliTrustedCli({candidates:layout.candidates,installationRoots:layout.installationRoots,
-      runtimeExecutable:layout.runtimeExecutable,path:layout.path,probeHome:home,probeCwd:cwd,signal});}
+      runtimeExecutable:layout.runtimeExecutable,path:layout.path,runtimeStillCurrent:layout.runtimeStillCurrent,probeHome:home,probeCwd:cwd,signal});}
     finally{rmSync(root,{recursive:true,force:true});}
   };
   let personalLeases: Promise<import('./bytedcli-broker-credentials.js').BytedcliLeaseResolver> | undefined;
@@ -177,6 +182,7 @@ export function createProductionBytedcliBroker(host:Omit<import('./bytedcli-brok
   })();
   return new BytedcliBroker({personalLeases:getLeases,currentWorkerGeneration:id=>host.findSession(id)?.workerGeneration,authority:(sessionId,peer,operation,context)=>resolveBytedcliAuthority({...host,contains:ds=>{
     if(bytecloudBrokerEnabled(host.policy(ds)))markBytedcliStrictSession(ds);
+    if(layout.unavailableReason || !layout.runtimeStillCurrent()) return false;
     return bytedcliContainmentAvailable(ds,layout.protectedRoots);
   }},sessionId,peer,operation,context),executor:{execute:async request=>{
     if(closed)return refusal('broker_disabled',request.requestId,request.operation.id);
