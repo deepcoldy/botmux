@@ -984,6 +984,42 @@ describe('one reply card per turn', () => {
     expect(buildTurnReplyCard(saved, presentation)).not.toContain(silentReceipt());
   });
 
+  it('renders no reply-status body when the final was delivered as a separate message, even with a silent terminal', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    // `botmux send` already delivered the answer externally (cli noteExternalFinal).
+    expect(await store.noteExternalFinal(key, input.chatId)).toBe(true);
+    // The worker still classifies the bare sentinel turn as nothing_to_send.
+    await store.update(key, { kind: 'terminal', phase: 'completed', silent: true }, io);
+    const saved = store.read(key)!;
+    expect(saved.externalFinal).toBe(true);
+    expect(saved.silentTurn).toBe(true);
+    // Delivery fact overrides the silence inference: no receipt, no missing-answer warning.
+    expect(buildTurnReplyCard(saved, presentation)).not.toContain(silentReceipt());
+    expect(progressElements(saved)).toHaveLength(0);
+    expect(statusElement(saved)).toBeDefined();
+  });
+
+  it('renders no missing-answer warning for an externally delivered turn without a silence marker', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    await store.noteExternalFinal(key, input.chatId);
+    await store.update(key, { kind: 'terminal', phase: 'completed' }, io);
+    const saved = store.read(key)!;
+    expect(progressElements(saved)).toHaveLength(0);
+    expect(buildTurnReplyCard(saved, presentation)).not.toContain(silentReceipt());
+  });
+
+  it('still shows live progress text on an externally delivered turn when progress exists', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    await store.update(key, { kind: 'progress', text: '正在核对' }, io);
+    await store.noteExternalFinal(key, input.chatId);
+    await store.update(key, { kind: 'terminal', phase: 'completed', silent: true }, io);
+    const saved = store.read(key)!;
+    const bodies = progressElements(saved);
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0].content).toContain('正在核对');
+    expect(buildTurnReplyCard(saved, presentation)).not.toContain(silentReceipt());
+  });
+
   it('never marks a user-cancelled turn as deliberately silent', async () => {
     await store.update(key, { kind: 'start' }, io);
     await store.update(key, { kind: 'phase', phase: 'stopping' }, io);

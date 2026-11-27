@@ -32673,14 +32673,23 @@ function setupWorkerHandlers(
         // turn_terminal type narrowing on the mutable `msg` binding.
         const historicalSessionId = msg.sessionId;
         const historicalDispatchAttempt = msg.dispatchAttempt;
-        // Both durable reads (sink here, the send ledger lazily inside the
-        // helper) are exception-contained so presentation evidence can never
-        // block deliver()/ACK; an unreadable sink means no provable requirement.
-        const historicalSink = readHistoricalSink(journal, historicalSessionId, turnId);
-        const historicalCardTerminal = cardTerminalForHistoricalReply(msg, historicalSink, () =>
-          new TurnSendLedger(config.session.dataDir).readFinalForAttempt({
-            larkAppId: ds.larkAppId, sessionId: historicalSessionId, turnId, dispatchAttempt: historicalDispatchAttempt,
-          })?.messageId);
+        // Legacy cards early-return inside settleTurnReplyCardTerminal. Resolve
+        // the mode first so a legacy replay does no pointless sink/ledger reads
+        // (and cannot emit ledger warnings). A mode probe failure must not block
+        // the event: fall through to the evidence path, whose reads are already
+        // exception-contained.
+        let historicalLegacy = false;
+        try {
+          historicalLegacy = replyCardModeFor(ds, turnId) === 'legacy';
+        } catch (error) {
+          logger.warn(`[${t}] historical reply-card terminal: mode probe failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        const historicalCardTerminal = historicalLegacy
+          ? msg
+          : cardTerminalForHistoricalReply(msg, readHistoricalSink(journal, historicalSessionId, turnId), () =>
+            new TurnSendLedger(config.session.dataDir).readFinalForAttempt({
+              larkAppId: ds.larkAppId, sessionId: historicalSessionId, turnId, dispatchAttempt: historicalDispatchAttempt,
+            })?.messageId);
         await settleTurnReplyCardTerminal(ds, historicalCardTerminal,
           (body, type, uuid, beforeWrite) => scopedReply(body, type, turnId, { uuid, beforeWrite }), ownsDisplay)
           .catch(error => logger.warn(`[${t}] historical reply-card terminal: ${error.message}`));
