@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -13,6 +15,9 @@ import { loadPluginServiceDefinition } from '../src/core/plugins/runtime.js';
 import { changePluginService, readPluginProcesses } from '../src/core/plugins/supervisor-client.js';
 import { readPluginSupervisorDesired, pluginSupervisorStatePath, pluginSupervisorResultPath, pluginSupervisorDir } from '../src/core/plugins/supervisor-store.js';
 import { readFleetState } from '../src/core/fleet-state-store.js';
+import {
+  inspectFleetProcess, inspectSupervisorState, signalAttestedFleetProcess,
+} from '../src/core/fleet-process-identity.js';
 import { pidAlive } from '../src/core/fleet-supervisor.js';
 import { userSystemdBusEnv } from '../src/core/session-scope.js';
 
@@ -43,11 +48,20 @@ describe('plugin services on the built-in supervisor', () => {
   afterEach(async () => {
     const path = pluginSupervisorStatePath();
     const state = readFleetState(path);
-    if (state && state.supervisorPid > 1 && pidAlive(state.supervisorPid)) {
+    if (state && state.supervisorPid > 1 && state.supervisorPid !== process.pid
+      && inspectSupervisorState(state).status === 'exact') {
       process.kill(state.supervisorPid, 'SIGTERM');
       await until(() => !pidAlive(state.supervisorPid), 'supervisor shutdown');
     }
-    for (const p of state?.procs ?? []) if (pidAlive(p.pid)) process.kill(p.pid, 'SIGKILL');
+    for (const p of state?.procs ?? []) {
+      if (p.pid <= 1 || p.pid === process.pid) continue;
+      const inspection = inspectFleetProcess(
+        p.pid, p.processStart, undefined, () => false, undefined, /* verifyPersistedCommand */ false,
+      );
+      if (inspection.status === 'exact') {
+        signalAttestedFleetProcess(inspection.attestation, 'SIGKILL');
+      }
+    }
     vi.unstubAllEnvs();
     rmSync(home, { recursive: true, force: true });
   });
@@ -428,5 +442,51 @@ describe('plugin services on the built-in supervisor', () => {
     writeFileSync(pluginSupervisorResultPath(), '{}');
     expect(() => installLocalPlugin(root)).toThrow('plugin_supervisor_invalid_result');
     expect(() => assertPluginServiceStopped('corrupt', 'uninstall')).toThrow('plugin_supervisor_invalid_result');
+  }, 30_000);
+
+  it('recovers and starts a plugin service when its persisted pid was recycled by an unrelated process', async () => {
+    fixture('recycled', { auto: true });
+    const unrelated = spawn(process.execPath, ['-e', 'console.log("ready"); setInterval(() => {}, 1000);'], {
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        let output = '';
+        const timer = setTimeout(() => reject(new Error('unrelated fixture did not become ready')), 5_000);
+        unrelated.stdout!.on('data', (chunk: Buffer) => {
+          output += chunk.toString();
+          if (output.includes('ready')) { clearTimeout(timer); resolve(); }
+        });
+        unrelated.once('exit', () => { clearTimeout(timer); reject(new Error('unrelated fixture exited before ready')); });
+      });
+      mkdirSync(join(home, '.botmux', 'plugin-supervisor'), { recursive: true });
+      writeFileSync(pluginSupervisorStatePath(), JSON.stringify({
+        supervisorPid: 0,
+        supervisorStartedAt: '2026-01-01T00:00:00.000Z',
+        procs: [{
+          name: 'botmux-plugin-recycled',
+          appId: '',
+          pid: unrelated.pid!,
+          generation: 1,
+          status: 'online',
+          restarts: 0,
+          lastExitCode: null,
+          startedAt: '2026-01-01T00:00:00.000Z',
+          processStart: 'utc:Thu Jan 01 00:00:00 1970',
+        }],
+      }));
+      const reports = await startPluginServices(['recycled']);
+      expect(reports[0].action).toBe('started');
+      await ready('recycled');
+      expect(proc('recycled')!.status).toBe('online');
+      expect(proc('recycled')!.pid).not.toBe(unrelated.pid);
+      expect(pidAlive(unrelated.pid!)).toBe(true);
+    } finally {
+      if (unrelated.exitCode === null && unrelated.signalCode === null) {
+        const exited = once(unrelated, 'exit');
+        unrelated.kill('SIGKILL');
+        await exited;
+      }
+    }
   }, 30_000);
 });

@@ -19,7 +19,7 @@ import { join } from 'node:path';
 import { openRotatedAppendLog } from '../utils/log-rotate.js';
 import { isStandaloneBinary, resolveEntrySpawn, type BotmuxEntry } from './self-spawn.js';
 import { scrubExternalMemberEnv } from '../utils/child-env.js';
-import { isLinuxZombie, readDurableProcessIdentity } from '../utils/process-identity.js';
+import { isLinuxZombie, isTimezoneStableProcessIdentity, readDurableProcessIdentity } from '../utils/process-identity.js';
 import { pidNotProvablyGone } from '../utils/process-alive.js';
 import {
   builtinFleetEntryMatches,
@@ -129,6 +129,19 @@ export interface FleetSupervisorOptions {
 export function pidAlive(pid: number): boolean {
   if (!Number.isSafeInteger(pid) || pid <= 1) return false;
   try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+// 仅当时区稳定的持久化 processStart 与同 PID 当前身份均有效且不等时，才判定原进程已死且 PID 被系统复用；
+// 未带时区稳定格式的旧 lstart 字符串、缺失或不可读身份一律保持 fail-closed
+function isRecycledPid(
+  proc: Pick<FleetProcState, 'pid' | 'processStart'>,
+  runtime: FleetProcessIdentityRuntime,
+): boolean {
+  if (!isTimezoneStableProcessIdentity(proc.processStart) || !Number.isSafeInteger(proc.pid) || proc.pid <= 1) {
+    return false;
+  }
+  const current = runtime.readIdentity(proc.pid);
+  return Boolean(isTimezoneStableProcessIdentity(current) && current !== proc.processStart);
 }
 
 export class FleetSupervisor {
@@ -244,7 +257,7 @@ export class FleetSupervisor {
       // Live aliases remain durable while retirement is pending or unverifiable.
       // Sending SIGTERM alone does not prove that a daemon has stopped.
       cur.procs = cur.procs.filter(p => specByName.has(p.name)
-        || (p.pid > 1 && identityRuntime.pidExists(p.pid)
+        || (p.pid > 1 && identityRuntime.pidExists(p.pid) && !isRecycledPid(p, identityRuntime)
           && (this.specForProc(p) || p.status === 'launching' || this.children.has(p.name) || this.orphanStops.has(p.name))));
       for (const p of cur.procs) {
         if (p.status === 'online' && !identityRuntime.pidExists(p.pid)) {
@@ -302,7 +315,7 @@ export class FleetSupervisor {
         : builtinFleetEntryMatches(spec.entry ?? 'daemon', command),
       runtime, /* removed members must re-prove their built-in command */ retireOnly);
     if (inspection.status === 'unverifiable') throw new Error(`cannot verify unowned ${proc.name} (pid ${proc.pid})`);
-    if (retireOnly && inspection.status === 'stale' && runtime.pidExists(proc.pid)) {
+    if (retireOnly && inspection.status === 'stale' && runtime.pidExists(proc.pid) && !isRecycledPid(proc, runtime)) {
       throw new Error(`cannot prove removed ${proc.name} (pid ${proc.pid}) is a botmux daemon`);
     }
     if (inspection.status === 'exact') {
@@ -529,7 +542,7 @@ export class FleetSupervisor {
     const unowned = (readFleetState(this.opts.statePath)?.procs ?? []).filter(p =>
       (p.name === spec.name
         || (!spec.external && (spec.entry ?? 'daemon') === 'daemon' && spec.appId && p.appId === spec.appId))
-      && p.pid > 1 && runtime.pidExists(p.pid) && !this.children.has(p.name));
+      && p.pid > 1 && runtime.pidExists(p.pid) && !isRecycledPid(p, runtime) && !this.children.has(p.name));
     if (unowned.length > 0) {
       if (unowned.some(p => this.orphanStops.has(p.name))) {
         // The same cancellable start slot covers recovery and crash backoff.
@@ -788,13 +801,14 @@ export class FleetSupervisor {
     // Reflect the stop in the durable record. onChildExit ignored these exits
     // (stopping=true), so without this the state file would keep the now-dead
     // pids as 'online'. Clear supervisorPid too: this supervisor is exiting.
+    const identityRuntime = this.opts.processIdentityRuntime ?? fleetProcessIdentityRuntime;
     mutateFleetState(this.opts.statePath, (cur) => {
       for (const p of cur.procs) {
         // Unverifiable or failed orphan retirement must survive shutdown for the
         // next supervisor/operator; do not turn a live PID into a stopped row.
         // pid=0 is a pending retry, not an orphan; kill(0, 0) probes our group.
         if (p.pid > 1 && !pending.some(([name]) => name === p.name)
-          && (this.opts.processIdentityRuntime ?? fleetProcessIdentityRuntime).pidExists(p.pid)) continue;
+          && identityRuntime.pidExists(p.pid) && !isRecycledPid(p, identityRuntime)) continue;
         if (p.status === 'online' || p.status === 'launching') { p.status = 'stopped'; p.pid = 0; }
       }
       cur.supervisorPid = 0;

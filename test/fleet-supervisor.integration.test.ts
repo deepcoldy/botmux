@@ -273,6 +273,110 @@ console.log('daemon pid=' + process.pid);
     } finally { vi.useRealTimers(); signals.mockRestore(); await sup.stopAll(); }
   });
 
+  it.each(['online', 'launching'] as const)('clears a stale %s non-daemon row when its pid was recycled without signaling the unrelated process', async status => {
+    const root = tmp(); const statePath = join(root, 'fleet.json');
+    const unrelated = await spawnReadyOrphan(['-e', `console.log('daemon pid=' + process.pid); setInterval(() => {}, 1000);`]);
+    mutateFleetState(statePath, () => ({
+      supervisorPid: 0, supervisorStartedAt: 'prior',
+      procs: [{ name: 'botmux-plugin-recycled', appId: '', pid: unrelated.pid!, generation: 1,
+        status, restarts: 0, lastExitCode: null, startedAt: 'T',
+        processStart: 'utc:Thu Jan 01 00:00:00 1970' }],
+    }));
+    const logs: string[] = [];
+    const sup = new FleetSupervisor({ statePath, distDir: '', daemonEnv: {}, cwd: root, killTimeoutMs: 50, log: m => logs.push(m) });
+    const signals = vi.spyOn(process, 'kill');
+    try {
+      sup.start([]);
+      expect(await waitFor(() => (readFleetState(statePath)?.procs.length ?? 0) === 0)).toBe(true);
+      expect(logs.some(m => m.includes('cannot prove removed'))).toBe(false);
+      expect(signals.mock.calls.filter(([pid, signal]) => pid === unrelated.pid && signal !== 0)).toEqual([]);
+      expect(pidAlive(unrelated.pid!)).toBe(true);
+      await sup.upsertExternal({
+        name: 'botmux-plugin-recycled', appId: '', botIndex: -1,
+        external: { command: process.execPath, args: ['-e', 'setInterval(() => {}, 1000);'] },
+      });
+      const row = readFleetState(statePath)!.procs.find(p => p.name === 'botmux-plugin-recycled');
+      expect(row?.status).toBe('online');
+      expect(row?.pid).toBeGreaterThan(1);
+      expect(row?.pid).not.toBe(unrelated.pid);
+    } finally { signals.mockRestore(); await sup.stopAll(); }
+  });
+
+  it('keeps a live non-daemon row fail-closed when an untagged legacy lstart drifts across timezones', async () => {
+    const root = tmp(); const statePath = join(root, 'fleet.json');
+    const orphan = await spawnReadyOrphan(['-e', `console.log('daemon pid=' + process.pid); setInterval(() => {}, 1000);`]);
+    mutateFleetState(statePath, () => ({
+      supervisorPid: 0, supervisorStartedAt: 'prior',
+      procs: [{ name: 'botmux-plugin-tz', appId: '', pid: orphan.pid!, generation: 1,
+        status: 'online', restarts: 0, lastExitCode: null, startedAt: 'T',
+        processStart: 'Fri Nov 27 19:32:34 2026' }],
+    }));
+    const sup = new FleetSupervisor({
+      statePath, distDir: '', daemonEnv: {}, cwd: root, killTimeoutMs: 50, log: () => {},
+      processIdentityRuntime: {
+        ...fleetProcessIdentityRuntime,
+        readIdentity: pid => pid === orphan.pid ? 'Sat Nov 28 03:32:34 2026' : fleetProcessIdentityRuntime.readIdentity(pid),
+      },
+    });
+    const signals = vi.spyOn(process, 'kill');
+    try {
+      sup.start([]);
+      await delay(100);
+      expect(signals.mock.calls.filter(([pid, signal]) => pid === orphan.pid && signal !== 0)).toEqual([]);
+      expect(pidAlive(orphan.pid!)).toBe(true);
+      expect(readFleetState(statePath)!.procs).toMatchObject([{ name: 'botmux-plugin-tz', status: 'launching', pid: orphan.pid }]);
+      await expect(sup.upsertExternal({
+        name: 'botmux-plugin-tz', appId: '', botIndex: -1,
+        external: { command: process.execPath, args: ['-e', 'setInterval(() => {}, 1000);'] },
+      })).rejects.toThrow(/failed to start/);
+      expect(pidAlive(orphan.pid!)).toBe(true);
+    } finally { signals.mockRestore(); await sup.stopAll(); }
+  });
+
+  it('allows direct upsertExternal to spawn past a persisted recycled pid without prior start()', async () => {
+    const root = tmp(); const statePath = join(root, 'fleet.json');
+    const unrelated = await spawnReadyOrphan(['-e', `console.log('daemon pid=' + process.pid); setInterval(() => {}, 1000);`]);
+    mutateFleetState(statePath, () => ({
+      supervisorPid: 0, supervisorStartedAt: 'prior',
+      procs: [{ name: 'botmux-plugin-direct', appId: '', pid: unrelated.pid!, generation: 1,
+        status: 'launching', restarts: 0, lastExitCode: null, startedAt: 'T',
+        processStart: 'utc:Thu Jan 01 00:00:00 1970' }],
+    }));
+    const sup = new FleetSupervisor({ statePath, distDir: '', daemonEnv: {}, cwd: root, killTimeoutMs: 50, log: () => {} });
+    const signals = vi.spyOn(process, 'kill');
+    try {
+      await sup.upsertExternal({
+        name: 'botmux-plugin-direct', appId: '', botIndex: -1,
+        external: { command: process.execPath, args: ['-e', 'setInterval(() => {}, 1000);'] },
+      });
+      const row = readFleetState(statePath)!.procs.find(p => p.name === 'botmux-plugin-direct');
+      expect(row?.status).toBe('online');
+      expect(row?.pid).toBeGreaterThan(1);
+      expect(row?.pid).not.toBe(unrelated.pid);
+      expect(signals.mock.calls.filter(([pid, signal]) => pid === unrelated.pid && signal !== 0)).toEqual([]);
+      expect(pidAlive(unrelated.pid!)).toBe(true);
+    } finally { signals.mockRestore(); await sup.stopAll(); }
+  });
+
+  it('clears a persisted recycled pid row on stopAll without signaling the unrelated process', async () => {
+    const root = tmp(); const statePath = join(root, 'fleet.json');
+    const unrelated = await spawnReadyOrphan(['-e', `console.log('daemon pid=' + process.pid); setInterval(() => {}, 1000);`]);
+    mutateFleetState(statePath, () => ({
+      supervisorPid: 0, supervisorStartedAt: 'prior',
+      procs: [{ name: 'botmux-plugin-stopall', appId: '', pid: unrelated.pid!, generation: 1,
+        status: 'launching', restarts: 0, lastExitCode: null, startedAt: 'T',
+        processStart: 'utc:Thu Jan 01 00:00:00 1970' }],
+    }));
+    const sup = new FleetSupervisor({ statePath, distDir: '', daemonEnv: {}, cwd: root, killTimeoutMs: 50, log: () => {} });
+    const signals = vi.spyOn(process, 'kill');
+    try {
+      await sup.stopAll();
+      expect(readFleetState(statePath)!.procs).toMatchObject([{ name: 'botmux-plugin-stopall', status: 'stopped', pid: 0 }]);
+      expect(signals.mock.calls.filter(([pid, signal]) => pid === unrelated.pid && signal !== 0)).toEqual([]);
+      expect(pidAlive(unrelated.pid!)).toBe(true);
+    } finally { signals.mockRestore(); }
+  });
+
   it('reclaims every live alias after a hard supervisor death and rename', async () => {
     const root = tmp(); const statePath = join(root, 'fleet.json');
     const distDir = fakeDist(root, STAY);

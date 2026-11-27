@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, readlinkSync } from 'node:fs';
-import { readDurableProcessIdentity } from '../utils/process-identity.js';
+import { durableProcessIdentityMatches, readDurableProcessIdentity } from '../utils/process-identity.js';
 import { pidNotProvablyGone } from '../utils/process-alive.js';
 import type { FleetState } from './fleet-supervisor-policy.js';
 import type { BotmuxEntry } from './self-spawn.js';
@@ -125,7 +125,9 @@ export function inspectFleetProcess(
 ): FleetProcessInspection {
   if (!Number.isSafeInteger(pid) || pid <= 1) return { status: 'stale' };
   const first = runtime.readIdentity(pid);
-  if (recordedProcessStart && first && first !== recordedProcessStart) return { status: 'stale' };
+  if (recordedProcessStart && first && !durableProcessIdentityMatches(pid, recordedProcessStart, first)) {
+    return { status: 'stale' };
+  }
   const pidNamespace = runtime.readPidNamespace(pid);
   if (recordedPidNamespace && pidNamespace && pidNamespace !== recordedPidNamespace) return { status: 'stale' };
   if (!first || (recordedPidNamespace && !pidNamespace)) {

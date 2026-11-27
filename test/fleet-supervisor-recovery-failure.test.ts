@@ -19,9 +19,11 @@ vi.mock('../src/utils/atomic-write.js', async importOriginal => {
     atomicWriteFileSync: (...args: Parameters<typeof actual.atomicWriteFileSync>) => {
       if (args[0] === fault.path && !fault.failed) {
         const state = JSON.parse(String(args[1])) as FleetState;
-        if (state.procs.some(p => fault.transition === 'admission'
-          ? p.pid === fault.pid && p.status === 'launching'
-          : p.name === 'botmux-old' && p.pid === 0 && p.status === 'stopped')) {
+        if (fault.transition === 'retire-drop'
+          ? state.procs.length === 0
+          : state.procs.some(p => fault.transition === 'admission'
+            ? p.pid === fault.pid && p.status === 'launching'
+            : p.name === 'botmux-old' && p.pid === 0 && p.status === 'stopped')) {
           fault.failed = true;
           throw Object.assign(new Error('injected ENOSPC'), { code: 'ENOSPC' });
         }
@@ -113,6 +115,42 @@ describe('fleet orphan retirement with a failed durable write', () => {
       }
       if (vi.isFakeTimers()) await vi.advanceTimersByTimeAsync(2000);
       vi.useRealTimers();
+      await sup.stopAll();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('drops an unconfigured recycled pid row in start() filter when retireUnowned completion write fails', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'fleet-recycled-filter-'));
+    const statePath = join(root, 'fleet.json');
+    const distDir = join(root, 'dist'); mkdirSync(distDir);
+    const script = join(distDir, 'unrelated.js');
+    writeFileSync(script, "setInterval(() => {}, 1000); console.log('ready');");
+    const unrelated = spawnTsScript(script, [], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const sup = new FleetSupervisor({ statePath, distDir, cwd: root, daemonEnv: {}, log: () => {} });
+    try {
+      let output = '';
+      for await (const data of unrelated.stdout!) {
+        output += data.toString();
+        if (output.includes('ready')) break;
+      }
+      writeFleetState(statePath, {
+        supervisorPid: 0, supervisorStartedAt: 'prior',
+        procs: [{
+          ...freshProc('botmux-plugin-recycled', '', unrelated.pid!, 'T'),
+          processStart: 'utc:Thu Jan 01 00:00:00 1970',
+        }],
+      });
+      Object.assign(fault, { path: statePath, pid: unrelated.pid!, transition: 'retire-drop', failed: false });
+      sup.start([]);
+      expect(fault.failed).toBe(true);
+      expect(readFleetState(statePath)!.procs).toEqual([]);
+      expect(pidAlive(unrelated.pid!)).toBe(true);
+    } finally {
+      fault.path = '';
+      if (unrelated.exitCode === null && unrelated.signalCode === null) {
+        const exited = once(unrelated, 'exit'); unrelated.kill('SIGKILL'); await exited;
+      }
       await sup.stopAll();
       rmSync(root, { recursive: true, force: true });
     }

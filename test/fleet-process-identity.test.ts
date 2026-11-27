@@ -5,6 +5,10 @@ import {
   signalAttestedFleetProcess,
   type FleetProcessIdentityRuntime,
 } from '../src/core/fleet-process-identity.js';
+import {
+  isTimezoneStableProcessIdentity,
+  readDurableProcessIdentity,
+} from '../src/utils/process-identity.js';
 
 function runtime(identities: Array<string | undefined>, commands: Array<string | undefined>): FleetProcessIdentityRuntime {
   return {
@@ -146,5 +150,29 @@ describe('fleet process identity', () => {
       'SIGTERM',
       runtime(['boot-a:123', 'boot-a:123'], ['/opt/botmux __supervisor']),
     )).toThrow(/operation not permitted/);
+  });
+
+  it('distinguishes timezone-stable durable identities from untagged legacy lstart strings', () => {
+    expect(isTimezoneStableProcessIdentity('utc:Fri Nov 27 19:32:34 2026')).toBe(true);
+    expect(isTimezoneStableProcessIdentity('550e8400-e29b-41d4-a716-446655440000:12345')).toBe(true);
+    expect(isTimezoneStableProcessIdentity('638683423540000000')).toBe(true);
+    expect(isTimezoneStableProcessIdentity('Fri Nov 27 19:32:34 2026')).toBe(false);
+    expect(isTimezoneStableProcessIdentity(undefined)).toBe(false);
+  });
+
+  it('produces a timezone-stable durable identity for the current process across TZ changes', () => {
+    const prevTz = process.env.TZ;
+    try {
+      process.env.TZ = 'UTC0';
+      const inUtc = readDurableProcessIdentity(process.pid);
+      process.env.TZ = 'Asia/Shanghai';
+      const inShanghai = readDurableProcessIdentity(process.pid);
+      expect(inUtc).toBeTruthy();
+      expect(inShanghai).toBe(inUtc);
+      expect(isTimezoneStableProcessIdentity(inUtc)).toBe(true);
+    } finally {
+      if (prevTz === undefined) delete process.env.TZ;
+      else process.env.TZ = prevTz;
+    }
   });
 });

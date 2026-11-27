@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { FleetSupervisor, pidAlive } from './core/fleet-supervisor.js';
 import { withFileLock } from './utils/file-lock.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
-import { isLinuxZombie, readDurableProcessIdentity } from './utils/process-identity.js';
+import { durableProcessIdentityMatches, isLinuxZombie, readDurableProcessIdentity } from './utils/process-identity.js';
 import { scrubExternalMemberEnv } from './utils/child-env.js';
 import { installStdioEpipeGuard } from './utils/stdio-epipe-guard.js';
 import { moveSupervisorIntoFleetScope } from './core/fleet-scope.js';
@@ -50,8 +50,8 @@ async function reapOrphans(): Promise<void> {
     if (!alive()) continue;
     const identity = readDurableProcessIdentity(proc.pid);
     if (!proc.processStart || !identity) throw new Error(`plugin_supervisor_orphan_identity_unknown:${proc.name}:${proc.pid}`);
-    if (identity !== proc.processStart) continue; // stale row, never signal a recycled PID
-    const same = () => readDurableProcessIdentity(proc.pid) === proc.processStart;
+    if (!durableProcessIdentityMatches(proc.pid, proc.processStart, identity)) continue; // stale row, never signal a recycled PID
+    const same = () => durableProcessIdentityMatches(proc.pid, proc.processStart, readDurableProcessIdentity(proc.pid));
     try { process.kill(proc.pid, 'SIGTERM'); } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
     }
