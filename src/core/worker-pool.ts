@@ -1260,7 +1260,7 @@ import {
   prepareAutomaticSessionTitle,
   type AutomaticSessionTitlePlan,
 } from './session-title.js';
-import { applyAutomaticSessionTitle, hasAutomaticSessionTitle, hasManualSessionTitle } from './session-title-content.js';
+import { applyAutomaticSessionTitle, hasAutomaticSessionTitle, hasManualSessionTitle, isBootstrapDisplayTitle } from './session-title-content.js';
 import { resolveGroupJoinPrompt } from './auto-start.js';
 import { acknowledgeSessionReady } from './session-ready-handshake.js';
 import { recordDispatchInputCommit, resolveProseBotMentions, unboundInputCommitLogLevel } from './dispatch.js';
@@ -22736,7 +22736,14 @@ function forkWorkerPrepared(
     prompt = promptPayload.content;
   }
   ensureCliEnv(agentCfg.cliId, agentCfg.cliPathOverride, { configDir: agentCfg.cliConfigDir });
+  // Only a join session still awaiting real content may strip the bootstrap.
+  // Ordinary entry-point titles (topic/schedule/trigger) keep their full input,
+  // even when a real task happens to start with the same words.
+  const groupJoinTitlePending = !ds.adoptedFrom && !isSharedAdoptSession(ds) && !hasManualSessionTitle(ds.session)
+    && (ds.session.nativeSessionTitleAwaitingContent === true || isBootstrapDisplayTitle(ds.session.title));
   const initTitlePlan = prepareInputTitle(ds, promptPayload, agentCfg.cliId, !resume && !ds.session.cliSessionId);
+  const groupJoinTitleBootstrap = groupJoinTitlePending
+    ? (initTitlePlan?.bootstrap ?? ds.session.automaticTitleBootstrap) : undefined;
   let nativeSessionTitle: string | undefined = initTitlePlan?.nativeTitle;
   let nativeSessionTitlePrompt: string | undefined = initTitlePlan?.nativePrompt;
   if (!nativeSessionTitle && supportsBotmuxLarkNativeSessionTitle(agentCfg.cliId) && !isSharedAdoptSession(ds)
@@ -23379,6 +23386,10 @@ function forkWorkerPrepared(
     botName: bot.botName,
     botOpenId: bot.botOpenId,
     locale: botLocale(botCfg),
+    ...(groupJoinTitlePending ? {
+      groupJoinPrompt: resolveGroupJoinPrompt(botCfg.autoStartOnGroupJoinPrompt, botLocale(botCfg)),
+    } : {}),
+    ...(groupJoinTitleBootstrap ? { groupJoinTitleBootstrap } : {}),
     turnId: initAttributionTurnId,
     ...(initReplyTurnId ? { replyTurnId: initReplyTurnId } : {}),
     dispatchAttempt: initDispatchAttempt,

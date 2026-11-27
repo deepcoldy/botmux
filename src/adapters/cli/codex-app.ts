@@ -8,6 +8,7 @@ import { runnerArgv0 } from '../../core/self-spawn.js';
 import { resolveRunnerPath } from './runner-path.js';
 import { runnerIdentityArgs } from './shared-hints.js';
 import { isNativeGatewayCoreProcess } from '../../core/runtime-mode.js';
+import { readGlobalConfig } from '../../global-config.js';
 
 function pushOpt(args: string[], key: string, value: string | undefined): void {
   if (value === undefined || value.length === 0) return;
@@ -57,7 +58,7 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
       return [(cachedCodexBin ??= resolveCommandReal(rawCodexBin))];
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, quietResume, workingDir, botName, botOpenId, larkAppId, locale, model, reasoningEffort, allowCodexReasoningCatalog, serviceTier, codexBrowser }) {
+    buildArgs({ sessionId, resume, resumeSessionId, quietResume, workingDir, botName, groupJoinPrompt, groupJoinTitleBootstrap, botOpenId, larkAppId, locale, model, reasoningEffort, allowCodexReasoningCatalog, serviceTier, codexBrowser }) {
       const args = [
         runnerArgv0('codex-app-runner', resolveRunnerPath('codex-app-runner.js', { testOverrideEnv: 'BOTMUX_TEST_CODEX_APP_RUNNER_PATH' })),
         '--session-id', sessionId,
@@ -74,6 +75,10 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
       // it, so its instructions describe the channel gateway instead of Lark.
       if (isNativeGatewayCoreProcess()) args.push('--native-gateway');
       pushOpt(args, '--locale', locale);
+      pushOpt(args, '--group-join-prompt', groupJoinPrompt);
+      pushOpt(args, '--group-join-title-digest', groupJoinTitleBootstrap?.digest);
+      pushOpt(args, '--group-join-title-length', groupJoinTitleBootstrap ? String(groupJoinTitleBootstrap.length) : undefined);
+      pushOpt(args, '--title-prefix', readGlobalConfig().codexAppTitlePrefix);
       // Per-turn overrides (async trigger API). The runner injects them into the
       // app-server thread/start (model + config.model_reasoning_effort).
       pushOpt(args, '--model', model && model.trim() ? model.trim() : undefined);

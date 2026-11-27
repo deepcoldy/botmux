@@ -4240,6 +4240,7 @@ function observeAuthoritativeClaudeTurnStart(
     },
     { source: 'structured-transcript', ...(cliSessionId ? { cliSessionId } : {}) },
   );
+  if (typeof resumeQueuedInputAfterClaudePtyStart === 'function') resumeQueuedInputAfterClaudePtyStart(turn);
 }
 
 function observeAuthoritativeStructuredTurnStart(
@@ -4315,6 +4316,9 @@ function notifyTerminalTurnStarted(
       'wakeNonTerminalMonitor' | 'isLocal' | 'userUuid' | 'isScheduled' | 'isBackgroundWake' | 'backgroundWakeUnrouted' | 'terminalOutcome'
     >>,
 ): void {
+  if ((turn.isScheduled || (turn.isLocal && turn.userUuid && !turn.isBackgroundWake
+    && !turn.backgroundWakeUnrouted && !turn.wakeNonTerminalMonitor))
+    && typeof revokeDeferredClaudePtyAuthority === 'function') revokeDeferredClaudePtyAuthority();
   const suppressedMonitorWake = isSuppressedNonTerminalMonitorWake({
     wakeNonTerminalMonitor: turn.wakeNonTerminalMonitor,
     isLocal: turn.isLocal,
@@ -7497,6 +7501,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
         // credential snapshot has to be applied here — at the write moment, which
         // is the same point flushPending applies it for a queued message. Without
         // this, a cleared or rotated JWT did not take effect on these turns.
+        if (typeof revokeDeferredClaudePtyAuthority === 'function') revokeDeferredClaudePtyAuthority();
         applyMojoLivePatch(msg.mojoLivePatch);
         rawInputWriteGeneration += 1;
         renderer?.markNewTurn();
@@ -16533,6 +16538,137 @@ function openClaudeLifecycleTurn(): BridgePendingTurn | undefined {
   return hasSubmittedUnstartedClaudeHead(head) ? head : undefined;
 }
 
+// PTY paste can leave the previous composer visible even after the adapter's
+// short submit polling budget. Bound this window from the literal write, not
+// from the first idle observation or subsequent redraws.
+const CLAUDE_PTY_START_GRACE_MS = 30_000;
+const CLAUDE_PTY_BUSY_START_CAP_MS = 60_000;
+let lastClaudePtyLocalInputAtMs = -Infinity;
+let deferredClaudePtyReady: {
+  turn: BridgePendingTurn;
+  backend: SessionBackend;
+  cliGeneration: number;
+  writeAt: number;
+  timer: ReturnType<typeof setTimeout>;
+} | undefined;
+
+function ownsDeferredClaudePtyReady(deferred: NonNullable<typeof deferredClaudePtyReady>): boolean {
+  const { turn, cliGeneration, writeAt } = deferred;
+  const owner = activeTurnAuthority.identity();
+  return backend === deferred.backend && cliSpawnGeneration === cliGeneration && !cliRestartInProgress
+    && currentBotmuxTurnId === turn.turnId && currentBotmuxDispatchAttempt === undefined
+    && owner.turnId === turn.turnId && owner.dispatchAttempt === undefined
+    && inputDeliveryEvidence.writeStartedAtMs({ turnId: turn.turnId, cliGeneration }) === writeAt;
+}
+
+function currentUnstartedDeferredClaudePtyReady(): typeof deferredClaudePtyReady {
+  const deferred = deferredClaudePtyReady;
+  return deferred && ownsDeferredClaudePtyReady(deferred)
+    && !deferred.turn.started && !hasSubmittedUnstartedClaudeHead(deferred.turn) ? deferred : undefined;
+}
+
+function resumeQueuedInputAfterClaudePtyStart(turn: { turnId: string; dispatchAttempt?: number }): void {
+  const deferred = deferredClaudePtyReady;
+  if (turn.dispatchAttempt === undefined && deferred?.turn.turnId === turn.turnId
+    && ownsDeferredClaudePtyReady(deferred)) queueMicrotask(flushQueuedInputAfterTurnStartEvidence);
+}
+
+function revokeDeferredClaudePtyAuthority(): void {
+  if (lastInitConfig?.cliId !== 'claude-code' || lastInitConfig.adoptMode) return;
+  lastClaudePtyLocalInputAtMs = Date.now();
+  const deferred = currentUnstartedDeferredClaudePtyReady();
+  if (!deferred) return;
+  clearTimeout(deferred.timer);
+  deferredClaudePtyReady = undefined;
+  releaseActiveTurnAuthority('claude_pty_start_superseded', { turnId: deferred.turn.turnId });
+}
+
+function deferClaudePtyReadyWhileStarting(): boolean {
+  if (lastInitConfig?.cliId !== 'claude-code' || lastInitConfig.adoptMode
+    || (effectiveBackendType !== 'pty' && effectiveBackendType !== 'tmux')
+    || !backend || !idleDetector || !bridgeJsonlPath) return false;
+  const head = bridgeQueue.peek()[0];
+  const active = activeTurnAuthority.snapshot();
+  if (!head || head.started || head.isLocal || head.restoredFromJournal || head.carriedAcrossGeneration
+    || head.dispatchAttempt !== undefined || !active?.started || active.provenanceIncomplete
+    || active.caller?.senderType !== 'user' || !active.caller.requestUserOpenId
+    || active.turnId !== head.turnId || active.dispatchAttempt !== undefined
+    || currentBotmuxTurnId !== head.turnId || currentBotmuxDispatchAttempt !== undefined
+    || turnTerminalEmitted(head.turnId) || hasSubmittedUnstartedClaudeHead(head)) return false;
+
+  const key = { turnId: head.turnId, cliGeneration: cliSpawnGeneration };
+  const writeAt = inputDeliveryEvidence.writeStartedAtMs(key);
+  if (writeAt === undefined || writeAt <= lastClaudePtyLocalInputAtMs) return false;
+  const remainingMs = writeAt + CLAUDE_PTY_START_GRACE_MS - Date.now();
+  const webAtWrite = inputDeliveryEvidence.externalInputGenerationAtWrite(key);
+  const interruptAtWrite = inputDeliveryEvidence.interruptGenerationAtWrite(key);
+  if (remainingMs <= 0 || webAtWrite !== webTerminalInputGeneration
+    || interruptAtWrite !== cliInterruptGeneration) return false;
+
+  const detector = idleDetector;
+  const observedBackend = backend;
+  const outputGeneration = ptyOutputGeneration.snapshot();
+  const rawAtIdle = rawInputWriteGeneration;
+  if (deferredClaudePtyReady?.turn !== head) {
+    log(`Deferring prompt-ready while Claude PTY submission is unconfirmed (turn=${head.turnId.slice(0, 12)})`);
+  }
+  if (deferredClaudePtyReady) clearTimeout(deferredClaudePtyReady.timer);
+  detector.reset();
+  const deferred = {
+    turn: head, backend: observedBackend, cliGeneration: key.cliGeneration, writeAt,
+    timer: setTimeout(recheck, remainingMs),
+  };
+  deferred.timer.unref?.();
+  deferredClaudePtyReady = deferred;
+  return true;
+
+  function recheck(): void {
+    if (deferredClaudePtyReady !== deferred) return;
+    if (!ownsDeferredClaudePtyReady(deferred) || idleDetector !== detector || isPromptReady) {
+      deferredClaudePtyReady = undefined;
+      return;
+    }
+    // A matching start may have landed without another PTY repaint. Drain it
+    // before ending the bounded hold. Release stale authority even when the
+    // viewport cannot prove that another input would be safe to deliver.
+    try { bridgeIngest(); } catch { /* best effort */ }
+    if (deferredClaudePtyReady !== deferred) return;
+    deferredClaudePtyReady = undefined;
+    if (!ownsDeferredClaudePtyReady(deferred) || isPromptReady) return;
+    const noInterveningInput = rawAtIdle === rawInputWriteGeneration
+      && webAtWrite === webTerminalInputGeneration && interruptAtWrite === cliInterruptGeneration
+      && deferred.writeAt > lastClaudePtyLocalInputAtMs;
+    let screen: string | undefined;
+    if (backendScreenEvidenceIsAuthoritativeForMutation()) {
+      try { screen = captureBackendScreen(observedBackend); } catch { /* no current screen */ }
+    }
+    const programBusy = detector.programStatusHeldBusy();
+    const screenBusy = !!screen && cliAdapter?.busyPattern?.test(busyProbeRegion(screen)) === true;
+    const busy = programBusy || screenBusy;
+    if (!deferred.turn.started && !hasSubmittedUnstartedClaudeHead(deferred.turn)) {
+      // Busy is useful to avoid revoking during a late startup but cannot
+      // identify a caller. Only exact hook/transcript evidence outlives the cap.
+      const busyRemainingMs = deferred.writeAt + CLAUDE_PTY_BUSY_START_CAP_MS - Date.now();
+      if (busy && noInterveningInput && busyRemainingMs > 0) {
+        deferred.timer = setTimeout(recheck, busyRemainingMs);
+        deferred.timer.unref?.();
+        deferredClaudePtyReady = deferred;
+        return;
+      }
+      releaseActiveTurnAuthority('claude_pty_start_timeout', { turnId: head.turnId });
+    }
+    if (busy) return;
+    if (ptyOutputGeneration.isCurrent(outputGeneration) && noInterveningInput) {
+      // Use the normal idle path so it re-reads the transcript before settling.
+      detector.fireIdle();
+    } else if (screen) {
+      // A repaint may have invalidated the saved edge. Rediscover readiness
+      // from the new viewport and let quiescence/busy detection decide again.
+      detector.feed(screen);
+    }
+  }
+}
+
 function claudeOpenTurnKey(turn: BridgePendingTurn | undefined): string | undefined {
   if (!turn) return undefined;
   return `${bridgeTranscriptGeneration}:${turn.turnId}:${turn.dispatchAttempt ?? ''}`;
@@ -24797,6 +24933,7 @@ async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
   // `esc` is not treated as stop — it commonly just dismisses a TUI menu (e.g.
   // /model), and retiring there would swallow the still-running turn.
   if (criticalInterrupt && requestedKey === 'ctrlc') {
+    if (typeof revokeDeferredClaudePtyAuthority === 'function') revokeDeferredClaudePtyAuthority();
     if (typeof supersedeBackgroundAuthorityHold === 'function') supersedeBackgroundAuthorityHold('superseded_by_interrupt');
     retireDoubaoBridgeTurnOnInterrupt(currentBotmuxTurnId, currentBotmuxDispatchAttempt);
     if (typeof noteClaudeOpenTurnUserStop === 'function') {
@@ -24886,6 +25023,7 @@ async function handleExactTurnInterrupt(requestId: string, turnId: string): Prom
   }
   if (traexQuotaPending?.failedTurn) settleStoppedTraexRecovery(turnId);
   if (delivered) {
+    if (typeof revokeDeferredClaudePtyAuthority === 'function') revokeDeferredClaudePtyAuthority();
     if (typeof supersedeBackgroundAuthorityHold === 'function') supersedeBackgroundAuthorityHold('superseded_by_interrupt');
     // Ctrl+C can exit the CLI and enter its ordinary crash-replay path. Retire
     // only this exact turn BEFORE acknowledging interruption to the daemon;
@@ -28606,11 +28744,11 @@ function recoverBareShellLaunchFromPty(observedBackend: SessionBackend): boolean
   return true;
 }
 
-function markPromptReadyFromPty(observedBackend: SessionBackend): void {
+function markPromptReadyFromPty(observedBackend: SessionBackend, source: IdleEvidenceSource = 'screen'): void {
   if (!recoverBareShellLaunchFromPty(observedBackend)) return;
   postSessionStartPromptEvidenceInFlight = true;
   try {
-    markPromptReady();
+    markPromptReady(source);
   } finally {
     postSessionStartPromptEvidenceInFlight = false;
   }
@@ -29108,7 +29246,7 @@ function holdForNativeSessionFork(): boolean {
   return true;
 }
 
-function markPromptReady(): void {
+function markPromptReady(source?: IdleEvidenceSource): void {
   if (workerSessionEventScope && !hasCurrentSessionRuntime()) {
     warnPromptReadySkipped('turn-authority-missing');
     return;
@@ -29301,6 +29439,8 @@ function markPromptReady(): void {
     scheduleSpawnArgvTurnStartFailOpen();
     return;
   }
+  if (source !== 'program-status' && typeof deferClaudePtyReadyWhileStarting === 'function'
+    && deferClaudePtyReadyWhileStarting()) return;
   // Screen prompt/quiescence is only a UI heuristic. Structured transcript
   // bridges have the stronger lifecycle signal: a transcript-started turn
   // without assistant_final is still running even if the TUI redraw exposes a
@@ -31350,6 +31490,9 @@ async function flushPending(): Promise<void> {
     try { bridgeIngest(); } catch { /* best-effort */ }
   }
   const { supportsTypeAhead: runtimeSupportsTypeAhead, allowBackToBackWrites } = runtimePtyInputPolicy();
+  // Do not fold another message into a turn whose only start signal is a host
+  // write. Real start evidence restores the adapter's ordinary type-ahead path.
+  if (typeof currentUnstartedDeferredClaudePtyReady === 'function' && currentUnstartedDeferredClaudePtyReady()) return;
   // Hold incoming writes while a background wake-up micro-turn is actively
   // running so another message cannot type-ahead/fold into principal A's wake.
   if (typeof backgroundAuthorityHold !== 'undefined' && backgroundAuthorityHold.isWakeActive()) {
@@ -31682,6 +31825,7 @@ async function flushPending(): Promise<void> {
       // The entry check protects a new drain. These checks protect subsequent
       // items when a terminal or late receipt arrives during awaited writes.
       if (currentInputDeliveryQuarantine()) break;
+      if (typeof currentUnstartedDeferredClaudePtyReady === 'function' && currentUnstartedDeferredClaudePtyReady()) break;
       // TRAE's question page can come up while an earlier item of this drain
       // still awaits its receipt: the next item must not be pasted into it.
       if (traexQuestionBridgeActive() && hookReviewHoldsQueuedWrite()) {
@@ -37907,6 +38051,8 @@ async function spawnCliBody(
     initialPrompt: preparedInitialPrompt,
     nativeSessionTitle: cfg.nativeSessionTitle,
     botName: cfg.botName,
+    groupJoinPrompt: cfg.groupJoinPrompt,
+    groupJoinTitleBootstrap: cfg.groupJoinTitleBootstrap,
     botOpenId: cfg.botOpenId,
     larkAppId: cfg.larkAppId,
     // No-transport (apiOnly core-only bot OR HTTP virtual chat): drop the
@@ -41693,7 +41839,7 @@ async function spawnCliBody(
     // OSC 7501 done/idle/error is a real prompt edge. It has to take the PTY
     // path so the post-SessionStart fence accepts it, and it must not fall
     // through to the footer veto below: Claude's ❯ stays up while busy.
-    else if (evidenceSource === 'program-status') markPromptReadyFromPty(observedBackend);
+    else if (evidenceSource === 'program-status') markPromptReadyFromPty(observedBackend, evidenceSource);
     else markPromptReady();
   };
   const drainBridgesThenMarkReady = (evidenceSource?: string): void => {
@@ -43460,6 +43606,7 @@ function makeWebTerminalInputController(ws: WebSocket, auditUser: string | undef
     onUserInput: (_target, data, submits) => {
       noteTerminalEffortInput(ws, data);
       if (submits || data.includes('\x03')) {
+        revokeDeferredClaudePtyAuthority();
         supersedeBackgroundAuthorityHold(data.includes('\x03') ? 'superseded_by_interrupt' : 'superseded_by_local_turn');
       }
       if (!countHuman) return;
@@ -50590,6 +50737,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       if (submitted) {
         claudeUserPromptSubmittedTurnId = submitted.turnId;
         claudeUserPromptSubmittedDispatchAttempt = submitted.dispatchAttempt;
+        if (typeof resumeQueuedInputAfterClaudePtyStart === 'function') resumeQueuedInputAfterClaudePtyStart(submitted);
         send({
           type: 'prompt_submitted_input',
           turnId: submitted.turnId,

@@ -274,6 +274,12 @@ export interface CliAdapter {
      *  launch-time title flag may consume it; others should ignore it. */
     nativeSessionTitle?: string;
     botName?: string;
+    /** Resolved per-bot join bootstrap, frozen for this launch so native-title
+     * adapters can distinguish setup instructions from the first real task. */
+    groupJoinPrompt?: string;
+    /** Persisted normalized bootstrap used to recognize replay after its
+     * configured text changes between runner generations. */
+    groupJoinTitleBootstrap?: { digest: string; length: number };
     botOpenId?: string;
     /** This bot's larkAppId. Lets injectsSessionContext adapters (genius) resolve
      *  their per-bot built-in skill injection mode for the system-prompt catalog;
