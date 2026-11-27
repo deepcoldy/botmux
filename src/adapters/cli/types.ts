@@ -545,6 +545,14 @@ export interface CliAdapter {
    * handles (Antigravity after /fork). Prefer over the generic first-FD probe. */
   resolveActiveSessionId?(pty: Pick<PtyHandle, 'cliPid' | 'cliCwd'>): string | undefined;
 
+  /** Atomic identity + provenance when the adapter has both an authoritative
+   * native stream log and weaker process/fd discovery. Cold-resume policy must
+   * fence only the latter without rejecting a later native-log `/new`. */
+  resolveActiveSessionIdObservation?(pty: Pick<PtyHandle, 'cliPid' | 'cliCwd'>): {
+    sessionId: string;
+    source: 'native-log' | 'process-discovery';
+  } | undefined;
+
   /** True when this adapter finds the native session to resume by itself
    *  from the botmux session id (Kimi: its index + wire logs; the
    *  session it was started under), so no `cliSessionId` is needed. Whether a

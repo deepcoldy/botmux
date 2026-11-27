@@ -593,6 +593,7 @@ import {
   decideAntigravityFullUpgrade,
   decideAntigravityNotifyAction,
   decideAntigravityTickerAction,
+  shouldAcceptAntigravityDiscoveredSessionId,
 } from './services/antigravity-bridge-decision.js';
 import { shouldObserveCursorChatId, shouldPersistObservedCursorChatId } from './services/cursor-resume-policy.js';
 import { extractKiroSessionIdFromOutput } from './services/kiro-session.js';
@@ -2580,12 +2581,11 @@ function runtimeIdentityForContract(binding: RuntimeEventBinding): RuntimeIdenti
       // worker was attached was refused before that id caught up. A fresh
       // launch has no predecessor to match, and while agy starts up it briefly
       // holds sibling conversations open: leave its id to the later observation.
-      const cid = cliAdapter?.resolveActiveSessionId
-        ? cliAdapter.resolveActiveSessionId({ cliPid: childPid, cliCwd: lastInitConfig.workingDir })
-        : findAntigravityConversationIdByPid(childPid) ?? undefined;
-      if (cid && !(lastSpawnEffectiveResume && lastSpawnEffectiveCliSessionId && lastSpawnEffectiveCliSessionId !== cid)) {
-        nativeSessionId = cid;
-      }
+      const cid = resolveAcceptedCurrentAntigravitySessionId({
+        cliPid: childPid,
+        cliCwd: lastInitConfig.workingDir,
+      });
+      if (cid) nativeSessionId = cid;
     } else if (!nativeSessionId && cliAdapter?.claudeDataDir) {
       // Likewise a re-attached Claude may be mid-turn and write nothing until
       // that turn ends. Without its conversation the contract cannot tell this
@@ -18296,6 +18296,38 @@ function antigravityBridgeState(): AntigravityTranscriptState {
   return (structuredBridgeDriverState as AntigravityTranscriptState | undefined) ?? {};
 }
 
+/** Resolve and admit one atomically observed native identity. Only weaker
+ * process/fd discovery is fenced by a cold-resume target; an authoritative
+ * native stream record may describe a later `/new`. UUIDs are canonicalized to
+ * lowercase before persistence or Linux transcript lookup. */
+function resolveAcceptedCurrentAntigravitySessionId(pty: {
+  cliPid?: number;
+  cliCwd?: string;
+}): string | undefined {
+  let discoveredSessionId: string | undefined;
+  let discoverySource: 'native-log' | 'process-discovery' = 'process-discovery';
+  if (cliAdapter?.resolveActiveSessionIdObservation) {
+    const observation = cliAdapter.resolveActiveSessionIdObservation(pty);
+    if (!observation) return undefined;
+    discoveredSessionId = observation.sessionId;
+    discoverySource = observation.source;
+  } else if (cliAdapter?.resolveActiveSessionId) {
+    discoveredSessionId = cliAdapter.resolveActiveSessionId(pty);
+  } else {
+    discoveredSessionId = pty.cliPid ? (findAntigravityConversationIdByPid(pty.cliPid) ?? undefined) : undefined;
+  }
+  if (!discoveredSessionId) return undefined;
+  if (!shouldAcceptAntigravityDiscoveredSessionId({
+    discoveredSessionId,
+    discoverySource,
+    effectiveResume: lastSpawnEffectiveResume,
+    resumeSessionId: lastSpawnEffectiveCliSessionId,
+    persistentReattach: lastSpawnPersistentReattach,
+    adoptMode: lastInitConfig?.adoptMode === true,
+  })) return undefined;
+  return discoveredSessionId.toLowerCase();
+}
+
 /** Resolve the live Antigravity transcript path even when the structured bridge
  *  is inactive (ordinary `replyDelivery: 'send'` mode) or has not yet bound. */
 function resolveLiveAntigravityTranscriptPath(): string | undefined {
@@ -18303,9 +18335,10 @@ function resolveLiveAntigravityTranscriptPath(): string | undefined {
   const effectivePid = typeof currentAntigravityObservedPid === 'function'
     ? currentAntigravityObservedPid()
     : undefined;
-  const discoveredCid = cliAdapter?.resolveActiveSessionId
-    ? cliAdapter.resolveActiveSessionId({ cliPid: effectivePid, cliCwd: lastInitConfig.workingDir })
-    : (effectivePid ? (findAntigravityConversationIdByPid(effectivePid) ?? undefined) : undefined);
+  const discoveredCid = resolveAcceptedCurrentAntigravitySessionId({
+    cliPid: effectivePid,
+    cliCwd: lastInitConfig.workingDir,
+  });
   const observedCid = typeof inputDeliveryObservedCliSessionId === 'string'
     ? inputDeliveryObservedCliSessionId
     : undefined;
@@ -18317,15 +18350,16 @@ function resolveLiveAntigravityTranscriptPath(): string | undefined {
     ?? (lastInitConfig.adoptMode === true ? lastInitConfig.cliSessionId : undefined);
   // Never bypass cliAdapter.resolveActiveSessionId (or a known cid whose
   // transcript has not been created yet) by falling back to locate.byPid.
-  if (!cid) return undefined;
+  const canonicalCid = cid?.toLowerCase();
+  if (!canonicalCid) return undefined;
   const relocatedHome = lastInitConfig.env?.HOME;
   if (relocatedHome) {
-    const relocated = resolveAntigravityTranscriptPath(cid, {
+    const relocated = resolveAntigravityTranscriptPath(canonicalCid, {
       brainDir: join(relocatedHome, '.gemini', 'antigravity-cli', 'brain'),
     });
     if (relocated) return relocated;
   }
-  return resolveFileBridgePath('antigravity', { sessionId: cid });
+  return resolveFileBridgePath('antigravity', { sessionId: canonicalCid });
 }
 
 /** Re-anchor only on the current turn's unique authenticated envelope in the
@@ -18669,11 +18703,12 @@ function codexBridgeStartTimer(): void {
         return;
       }
       if (structuredBridgeIs('antigravity')) {
-        const authoritativeRebindPending = lastInitConfig?.adoptMode
-          && codexBridgeRolloutPath
-          && codexBridgePendingSessionId
-          && antigravityPendingRebind;
-        if (lastInitConfig?.adoptMode && !authoritativeRebindPending) {
+        const adoptPendingNativeSession = lastInitConfig?.adoptMode
+          && codexBridgePendingSessionId;
+        // A reported native ID owns late rotation even when it is NOT a sticky
+        // authoritative rebind. Otherwise a lazy adopt `/new` remains pending
+        // forever in the initial PID-discovery branch after the old path binds.
+        if (lastInitConfig?.adoptMode && !adoptPendingNativeSession) {
           // A new pane can create its conversation and log on the first submit.
           if (!codexBridgeRolloutPath && codexBridgeQueue.peek().length > 0) {
             const pid = currentAntigravityObservedPid();
@@ -18701,26 +18736,16 @@ function codexBridgeStartTimer(): void {
             resolveBySid: sid => resolveFileBridgePath('antigravity', { sessionId: sid }),
             resolveByPid: () => {
               const pid = currentAntigravityObservedPid();
-              // Honor cliAdapter.resolveActiveSessionId when present: on a
+              // Honor the adapter's atomic identity + provenance: on a fresh
               // fresh launch it withholds transient startup ListConversations
               // DB fds until --log-file records `Streaming conversation`, and
               // after /fork it disambiguates child vs retained parent DB fds.
-              if (cliAdapter?.resolveActiveSessionId) {
-                const activeId = cliAdapter.resolveActiveSessionId({ cliPid: pid, cliCwd: lastInitConfig?.workingDir });
-                // On a cold resume whose target transcript is not bound yet, do
-                // not claim or persist a transient sibling fd that disagrees with
-                // the explicit resume target (mirrors observeAntigravityCliSessionId).
-                if (activeId
-                  && !codexBridgeRolloutPath
-                  && lastSpawnEffectiveResume
-                  && lastSpawnEffectiveCliSessionId
-                  && lastSpawnEffectiveCliSessionId !== activeId) {
-                  return undefined;
-                }
-                tickerDiscoveredCid = activeId;
-                return activeId ? resolveFileBridgePath('antigravity', { sessionId: activeId }) : undefined;
-              }
-              return pid ? resolveFileBridgePath('antigravity', { pid }) : undefined;
+              const activeId = resolveAcceptedCurrentAntigravitySessionId({
+                cliPid: pid,
+                cliCwd: lastInitConfig?.workingDir,
+              });
+              tickerDiscoveredCid = activeId;
+              return activeId ? resolveFileBridgePath('antigravity', { sessionId: activeId }) : undefined;
             },
           });
           if (action.kind === 'rotate') {
@@ -19458,6 +19483,16 @@ function applyAuthoritativeAntigravitySessionId(
   if (cliAdapter?.runnerFramedInput) return;
   if (lastInitConfig?.cliId !== 'antigravity') return;
   if (nativeSessionForkPending()) return;
+  cliSessionId = cliSessionId.toLowerCase();
+  // Admit stale bound IDs as a whole before ANY identity write. A late report
+  // for A must not move daemon/CoT back while a different REAL_B rotation is
+  // pending, whether or not that pending uses the sticky rebind freeze. A
+  // genuinely different C still rotates and supersedes the pending ID.
+  if (codexBridgeRolloutPath && codexBridgePendingSessionId
+    && codexBridgePendingSessionId.toLowerCase() !== cliSessionId.toLowerCase()) {
+    const reportedPath = resolveFileBridgePath('antigravity', { sessionId: cliSessionId });
+    if (decideAntigravityNotifyAction(codexBridgeRolloutPath, reportedPath).kind === 'same') return;
+  }
   persistCliSessionId(cliSessionId);
   if (typeof ensureAntigravityCotReader === 'function') {
     ensureAntigravityCotReader(cliSessionId);
@@ -19472,9 +19507,10 @@ function armAntigravityCotForTurn(): void {
   if (lastInitConfig?.cliId !== 'antigravity') return;
   if (nativeSessionForkPending()) return;
   const effectivePid = currentAntigravityObservedPid();
-  const discoveredCid = cliAdapter?.resolveActiveSessionId
-    ? cliAdapter.resolveActiveSessionId({ cliPid: effectivePid, cliCwd: lastInitConfig.workingDir })
-    : (effectivePid ? (findAntigravityConversationIdByPid(effectivePid) ?? undefined) : undefined);
+  const discoveredCid = resolveAcceptedCurrentAntigravitySessionId({
+    cliPid: effectivePid,
+    cliCwd: lastInitConfig.workingDir,
+  });
   const observedCid = typeof inputDeliveryObservedCliSessionId === 'string'
     ? inputDeliveryObservedCliSessionId
     : undefined;
@@ -19929,6 +19965,7 @@ function codexBridgeNotifyCliSessionId(
   cliSessionId: string,
   options: { preserveLiveTurn?: boolean; tryRebindLiveTurn?: boolean; adoptRotationStartMs?: number } = {},
 ): void {
+  if (structuredBridgeIs('antigravity')) cliSessionId = cliSessionId.toLowerCase();
   if (!codexBridgeFallbackActive()) return;
   // A reported (proven) id supersedes any not-yet-owned history candidate.
   codexBridgeUnprovenSession = undefined;
@@ -20162,8 +20199,14 @@ function codexBridgeNotifyCliSessionId(
     // ticker moves the bind over at a turn boundary.
     const action = decideAntigravityNotifyAction(codexBridgeRolloutPath, agyPath);
     if (action.kind === 'same') {
-      codexBridgePendingSessionId = undefined;
-      antigravityPendingRebind = false;
+      const pendingMatchesReport = !codexBridgePendingSessionId
+        || codexBridgePendingSessionId.toLowerCase() === cliSessionId.toLowerCase();
+      // A late report for the old bound conversation must not cancel a REAL
+      // authoritative rebind that is still waiting for its lazy transcript.
+      if (pendingMatchesReport) {
+        codexBridgePendingSessionId = undefined;
+        antigravityPendingRebind = false;
+      }
       return;
     }
     const pendingSameIdRebind = antigravityPendingRebind
@@ -29553,6 +29596,7 @@ function persistCliSessionId(cliSessionId: string): void {
   // During an interactive fork the CLI temporarily resumes the parent. Its
   // early PID/transcript observations must never acknowledge the pending fork.
   if (nativeSessionForkPending()) return;
+  if (lastInitConfig?.cliId === 'antigravity') cliSessionId = cliSessionId.toLowerCase();
   const previousCliSessionId = inputDeliveryObservedCliSessionId;
   inputDeliveryObservedCliSessionId = cliSessionId;
   if (lastInitConfig?.cliId === 'antigravity' && previousCliSessionId && previousCliSessionId !== cliSessionId) {
@@ -29682,19 +29726,19 @@ function observeAntigravityCliSessionId(pid: number, label = 'spawn'): void {
     if (currentPid && currentPid !== pid) return;
 
     const realPid = findLaunchedCliPid(pid, 'antigravity') ?? pid;
-    const cid = cliAdapter?.resolveActiveSessionId
-      ? cliAdapter.resolveActiveSessionId({ cliPid: realPid, cliCwd: lastInitConfig?.workingDir })
-      : findAntigravityConversationIdByPid(realPid);
+    const cid = resolveAcceptedCurrentAntigravitySessionId({
+      cliPid: realPid,
+      cliCwd: lastInitConfig?.workingDir,
+    });
     if (cid) {
-      if (lastSpawnEffectiveResume && lastSpawnEffectiveCliSessionId && lastSpawnEffectiveCliSessionId !== cid) {
-        log(`Observed Antigravity conversationId via pid ${realPid}${realPid === pid ? '' : ` (launcher ${pid})`} (${label}) but kept existing resume target ${lastSpawnEffectiveCliSessionId}`);
-        return;
-      }
       log(`Observed Antigravity conversationId via pid ${realPid}${realPid === pid ? '' : ` (launcher ${pid})`} (${label}): ${cid}`);
-      // Persist, switch CoT reader, and bind/rebind the structured bridge in
-      // one unified entry point (its brain file may not exist yet — notify then
-      // leaves the id pending for the 1s ticker).
-      applyAuthoritativeAntigravitySessionId(cid, { preserveLiveTurn: true });
+      // A surviving pane's different native ID may be a genuine offline `/new`.
+      // Try an atomic live-owner rebind, but allow normal retirement when the
+      // new transcript disproves ownership instead of freezing it forever.
+      const options = lastSpawnPersistentReattach || lastInitConfig?.adoptMode === true
+        ? { tryRebindLiveTurn: true } as const
+        : { preserveLiveTurn: true } as const;
+      applyAuthoritativeAntigravitySessionId(cid, options);
       return;
     }
     attempts++;

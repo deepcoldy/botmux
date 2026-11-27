@@ -1010,6 +1010,286 @@ describe('Antigravity bridge ticker and spawn observer honor the adapter session
     expect(pidProbe).not.toHaveBeenCalled();
   });
 
+  it('spawn observer keeps the explicit target when cold-resume discovery sees a sibling', async () => {
+    vi.resetModules();
+    const discovery = await import('../src/services/antigravity-discovery.js');
+    let discovered = SIBLING_ID;
+    vi.spyOn(discovery, 'findAntigravityConversationId').mockImplementation(opts => (
+      opts.pid === AGY_PID ? discovered : null
+    ));
+    const { createAntigravityAdapter } = await import('../src/adapters/cli/antigravity.js');
+    const adapter = createAntigravityAdapter('/usr/local/bin/agy');
+    adapter.buildArgs({
+      sessionId: 'cold-observer-resume-target',
+      resume: true,
+      resumeSessionId: REAL_ID,
+      reattach: false,
+    });
+    const timers: Array<() => void> = [];
+    const persistCliSessionId = vi.fn();
+    const ensureAntigravityCotReader = vi.fn();
+    const codexBridgeNotifyCliSessionId = vi.fn();
+    const scope: Record<string, any> = {
+      cliAdapter: adapter,
+      lastInitConfig: { cliId: 'antigravity', workingDir: root, cliSessionId: REAL_ID },
+      backend: { getChildPid: () => AGY_PID },
+      lastSpawnEffectiveResume: true,
+      lastSpawnEffectiveCliSessionId: REAL_ID,
+      lastSpawnPersistentReattach: false,
+      nativeSessionForkPending: () => false,
+      findLaunchedCliPid: () => AGY_PID,
+      persistCliSessionId,
+      ensureAntigravityCotReader,
+      codexBridgeFallbackActive: () => true,
+      codexBridgeNotifyCliSessionId,
+      setTimeout: (callback: () => void) => { timers.push(callback); return timers.length; },
+      log: vi.fn(),
+    };
+    loadWorkerFunction<(pid: number) => void>('observeAntigravityCliSessionId', scope)(AGY_PID);
+    expect(timers).toHaveLength(1);
+    timers.shift()!();
+
+    expect(persistCliSessionId).not.toHaveBeenCalled();
+    expect(ensureAntigravityCotReader).not.toHaveBeenCalled();
+    expect(codexBridgeNotifyCliSessionId).not.toHaveBeenCalled();
+    expect(timers).toHaveLength(1);
+
+    discovered = REAL_ID;
+    timers.shift()!();
+    expect(persistCliSessionId.mock.calls).toEqual([[REAL_ID]]);
+    expect(ensureAntigravityCotReader.mock.calls).toEqual([[REAL_ID]]);
+    expect(codexBridgeNotifyCliSessionId.mock.calls).toEqual([[REAL_ID, { preserveLiveTurn: true }]]);
+    expect(timers).toEqual([]);
+  });
+
+  it('cold-resume observer canonicalizes UUID casing before persistence and transcript lookup', async () => {
+    vi.resetModules();
+    const discovery = await import('../src/services/antigravity-discovery.js');
+    vi.spyOn(discovery, 'findAntigravityConversationId').mockImplementation(opts => (
+      opts.pid === AGY_PID ? REAL_ID.toUpperCase() : null
+    ));
+    const { createAntigravityAdapter } = await import('../src/adapters/cli/antigravity.js');
+    const adapter = createAntigravityAdapter('/usr/local/bin/agy');
+    adapter.buildArgs({
+      sessionId: 'cold-observer-canonical-uuid',
+      resume: true,
+      resumeSessionId: REAL_ID,
+      reattach: false,
+    });
+    const h = bridgeHarness(adapter);
+    h.scope.lastInitConfig = { cliId: 'antigravity', workingDir: root, cliSessionId: REAL_ID };
+    h.scope.lastSpawnEffectiveResume = true;
+    h.scope.lastSpawnPersistentReattach = false;
+    h.scope.lastSpawnEffectiveCliSessionId = REAL_ID;
+    h.scope.persistCliSessionId = vi.fn();
+    h.scope.ensureAntigravityCotReader = vi.fn();
+    h.scope.codexBridgeNotifyCliSessionId = h.notify;
+    h.scope.backend = { getChildPid: () => AGY_PID };
+    h.scope.findLaunchedCliPid = () => AGY_PID;
+    const realPath = h.makeTranscript(REAL_ID);
+    const timers: Array<() => void> = [];
+    h.scope.setTimeout = (callback: () => void) => { timers.push(callback); return timers.length; };
+
+    loadWorkerFunction<(pid: number) => void>('observeAntigravityCliSessionId', h.scope)(AGY_PID);
+    expect(timers).toHaveLength(1);
+    timers.shift()!();
+
+    expect(h.scope.persistCliSessionId.mock.calls).toEqual([[REAL_ID]]);
+    expect(h.scope.ensureAntigravityCotReader.mock.calls).toEqual([[REAL_ID]]);
+    expect(h.scope.codexBridgeRolloutPath).toBe(realPath);
+    expect(h.scope.codexBridgePendingSessionId).toBeUndefined();
+  });
+
+  it('cold spawn ignores a previous-generation native log while warm reattach retains it', async () => {
+    vi.resetModules();
+    const discovery = await import('../src/services/antigravity-discovery.js');
+    vi.spyOn(discovery, 'findAntigravityConversationId').mockReturnValue(null);
+    const { createAntigravityAdapter } = await import('../src/adapters/cli/antigravity.js');
+    const sessionId = 'two-generation-native-log';
+    const first = createAntigravityAdapter('/usr/local/bin/agy');
+    const firstArgs = first.buildArgs({ sessionId, resume: false, reattach: false });
+    const logPath = firstArgs[firstArgs.indexOf('--log-file') + 1]!;
+    writeFileSync(logPath, streamingLine(SIBLING_ID));
+
+    const warm = createAntigravityAdapter('/usr/local/bin/agy');
+    warm.buildArgs({ sessionId, resume: true, resumeSessionId: SIBLING_ID, reattach: true });
+    expect(warm.resolveActiveSessionIdObservation?.({ cliPid: AGY_PID })).toEqual({
+      sessionId: SIBLING_ID,
+      source: 'native-log',
+    });
+
+    const cold = createAntigravityAdapter('/usr/local/bin/agy');
+    cold.buildArgs({ sessionId, resume: true, resumeSessionId: REAL_ID, reattach: false });
+    const h = bridgeHarness(cold);
+    h.scope.lastInitConfig = { cliId: 'antigravity', workingDir: root, cliSessionId: REAL_ID };
+    h.scope.lastSpawnEffectiveResume = true;
+    h.scope.lastSpawnPersistentReattach = false;
+    h.scope.lastSpawnEffectiveCliSessionId = REAL_ID;
+    h.scope.persistCliSessionId = vi.fn();
+    h.scope.ensureAntigravityCotReader = vi.fn();
+    h.scope.codexBridgeNotifyCliSessionId = h.notify;
+    h.scope.backend = { getChildPid: () => AGY_PID };
+    h.scope.findLaunchedCliPid = () => AGY_PID;
+    const realPath = h.makeTranscript(REAL_ID);
+    const timers: Array<() => void> = [];
+    h.scope.setTimeout = (callback: () => void) => { timers.push(callback); return timers.length; };
+    loadWorkerFunction<(pid: number) => void>('observeAntigravityCliSessionId', h.scope)(AGY_PID);
+
+    expect(timers).toHaveLength(1);
+    timers.shift()!();
+    expect(h.scope.persistCliSessionId).not.toHaveBeenCalled();
+    expect(h.scope.codexBridgeRolloutPath).toBeUndefined();
+    expect(timers).toHaveLength(1);
+
+    appendFileSync(logPath, streamingLine(REAL_ID));
+    timers.shift()!();
+    expect(h.scope.persistCliSessionId.mock.calls).toEqual([[REAL_ID]]);
+    expect(h.scope.ensureAntigravityCotReader.mock.calls).toEqual([[REAL_ID]]);
+    expect(h.scope.codexBridgeRolloutPath).toBe(realPath);
+    expect(timers).toEqual([]);
+  });
+
+  it('spawn observer follows a native /new completed before persistent reattach', async () => {
+    const { createAntigravityAdapter } = await import('../src/adapters/cli/antigravity.js');
+    const adapter = createAntigravityAdapter('/usr/local/bin/agy');
+    const args = adapter.buildArgs({
+      sessionId: 'warm-observer-native-rotation',
+      resume: true,
+      resumeSessionId: SIBLING_ID,
+      reattach: true,
+    });
+    const logPath = args[args.indexOf('--log-file') + 1]!;
+    writeFileSync(logPath, streamingLine(REAL_ID));
+
+    const timers: Array<() => void> = [];
+    const persistCliSessionId = vi.fn();
+    const ensureAntigravityCotReader = vi.fn();
+    const codexBridgeNotifyCliSessionId = vi.fn();
+    const scope: Record<string, any> = {
+      cliAdapter: adapter,
+      lastInitConfig: { cliId: 'antigravity', workingDir: root, cliSessionId: SIBLING_ID },
+      backend: { getChildPid: () => AGY_PID },
+      lastSpawnEffectiveResume: true,
+      lastSpawnEffectiveCliSessionId: SIBLING_ID,
+      lastSpawnPersistentReattach: true,
+      nativeSessionForkPending: () => false,
+      findLaunchedCliPid: () => AGY_PID,
+      persistCliSessionId,
+      ensureAntigravityCotReader,
+      codexBridgeFallbackActive: () => true,
+      codexBridgeNotifyCliSessionId,
+      setTimeout: (callback: () => void) => { timers.push(callback); return timers.length; },
+      log: vi.fn(),
+    };
+    loadWorkerFunction<(pid: number) => void>('observeAntigravityCliSessionId', scope)(AGY_PID);
+    expect(timers).toHaveLength(1);
+    timers.shift()!();
+
+    expect(persistCliSessionId.mock.calls).toEqual([[REAL_ID]]);
+    expect(ensureAntigravityCotReader.mock.calls).toEqual([[REAL_ID]]);
+    expect(codexBridgeNotifyCliSessionId.mock.calls).toEqual([[REAL_ID, { tryRebindLiveTurn: true }]]);
+    expect(timers).toEqual([]);
+  });
+
+  it('persistent observer canonicalizes an uppercase newly rotated ID before binding its lowercase transcript', async () => {
+    const { createAntigravityAdapter } = await import('../src/adapters/cli/antigravity.js');
+    const adapter = createAntigravityAdapter('/usr/local/bin/agy');
+    const args = adapter.buildArgs({
+      sessionId: 'warm-observer-uppercase-new-id',
+      resume: true,
+      resumeSessionId: SIBLING_ID,
+      reattach: true,
+    });
+    const logPath = args[args.indexOf('--log-file') + 1]!;
+    writeFileSync(logPath, streamingLine(REAL_ID.toUpperCase()));
+    expect(adapter.resolveActiveSessionIdObservation?.({ cliPid: AGY_PID })).toEqual({
+      sessionId: REAL_ID,
+      source: 'native-log',
+    });
+    const h = bridgeHarness(adapter);
+    h.scope.lastInitConfig = { cliId: 'antigravity', workingDir: root, cliSessionId: SIBLING_ID };
+    h.scope.lastSpawnEffectiveResume = true;
+    h.scope.lastSpawnPersistentReattach = true;
+    h.scope.lastSpawnEffectiveCliSessionId = SIBLING_ID;
+    h.scope.persistCliSessionId = vi.fn();
+    h.scope.ensureAntigravityCotReader = vi.fn();
+    h.scope.codexBridgeNotifyCliSessionId = h.notify;
+    h.scope.backend = { getChildPid: () => AGY_PID };
+    h.scope.findLaunchedCliPid = () => AGY_PID;
+    const realPath = h.makeTranscript(REAL_ID);
+    const timers: Array<() => void> = [];
+    h.scope.setTimeout = (callback: () => void) => { timers.push(callback); return timers.length; };
+
+    loadWorkerFunction<(pid: number) => void>('observeAntigravityCliSessionId', h.scope)(AGY_PID);
+    timers.shift()!();
+
+    expect(h.scope.persistCliSessionId.mock.calls).toEqual([[REAL_ID]]);
+    expect(h.scope.ensureAntigravityCotReader.mock.calls).toEqual([[REAL_ID]]);
+    expect(h.scope.codexBridgeRolloutPath).toBe(realPath);
+    expect(h.scope.codexBridgePendingSessionId).toBeUndefined();
+  });
+
+  it.each([
+    { persistentReattach: true, adoptMode: false, lazyTranscript: false },
+    { persistentReattach: true, adoptMode: false, lazyTranscript: true },
+    { persistentReattach: false, adoptMode: true, lazyTranscript: false },
+    { persistentReattach: false, adoptMode: true, lazyTranscript: true },
+  ])('native /new retires an unfinished old turn instead of sticking forever (persistent=$persistentReattach, adopt=$adoptMode, lazy=$lazyTranscript)', ({ persistentReattach, adoptMode, lazyTranscript }) => {
+    const h = bridgeHarness({
+      id: 'antigravity',
+      runnerFramedInput: false,
+      postTerminalPromptFence: false,
+      resolveActiveSessionId: () => REAL_ID,
+    });
+    h.scope.persistCliSessionId = vi.fn();
+    h.scope.ensureAntigravityCotReader = vi.fn();
+    h.scope.codexBridgeNotifyCliSessionId = h.notify;
+    h.scope.backend = { getChildPid: () => AGY_PID };
+    h.scope.findLaunchedCliPid = () => AGY_PID;
+
+    const oldPath = h.makeTranscript(SIBLING_ID);
+    h.notify(SIBLING_ID);
+    h.queue.mark('om_retired_native', 'old unfinished request', Date.now());
+    writeAntigravityUserStep(oldPath, 1, 'old unfinished request');
+    appendFileSync(oldPath, JSON.stringify({ type: 'GENERIC', status: 'DONE', content: 'Created the following subagent:\n{ "conversationId": "pending-agent" }' }) + '\n');
+    writeAntigravityFinalStep(oldPath, 3, 'old unfinished waiting narration');
+    h.scope.codexBridgeIngest();
+    expect(h.queue.peek()[0]?.started).toBe(true);
+    expect(h.queue.peek()[0]?.finalText).toBeUndefined();
+
+    // Model an already-restored live owner; only then apply the next spawn's mode.
+    h.scope.lastInitConfig = { cliId: 'antigravity', workingDir: root, adoptMode };
+    h.scope.lastSpawnEffectiveResume = true;
+    h.scope.lastSpawnPersistentReattach = persistentReattach;
+    h.scope.lastSpawnEffectiveCliSessionId = SIBLING_ID;
+
+    let realPath = lazyTranscript ? undefined : h.makeTranscript(REAL_ID);
+    if (realPath) writeAntigravityUserStep(realPath, 1, 'different request after native new');
+    const timers: Array<() => void> = [];
+    h.scope.setTimeout = (callback: () => void) => { timers.push(callback); return timers.length; };
+    loadWorkerFunction<(pid: number) => void>('observeAntigravityCliSessionId', h.scope)(AGY_PID);
+    expect(timers).toHaveLength(1);
+    timers.shift()!();
+
+    if (lazyTranscript) {
+      expect(h.scope.codexBridgeRolloutPath).toBe(oldPath);
+      expect(h.scope.codexBridgePendingSessionId).toBe(REAL_ID);
+      expect(h.scope.antigravityPendingRebind).toBe(false);
+      const applyAuthoritative = loadWorkerFunction<(id: string) => void>('applyAuthoritativeAntigravitySessionId', h.scope);
+      applyAuthoritative(SIBLING_ID);
+      expect(h.scope.persistCliSessionId.mock.calls).toEqual([[REAL_ID]]);
+      expect(h.scope.ensureAntigravityCotReader.mock.calls).toEqual([[REAL_ID]]);
+      expect(h.scope.codexBridgePendingSessionId).toBe(REAL_ID);
+      realPath = h.makeTranscript(REAL_ID);
+      writeAntigravityUserStep(realPath, 1, 'different request after native new');
+      h.tick();
+    }
+    expect(h.scope.codexBridgeRolloutPath).toBe(realPath);
+    expect(h.scope.codexBridgePendingSessionId).toBeUndefined();
+    expect(h.scope.antigravityPendingRebind).toBe(false);
+    expect(h.scope.persistCliSessionId).toHaveBeenCalledWith(REAL_ID);
+  });
+
   it('ticker late-rotation to a lazily created transcript drops a misbound sibling without draining it', () => {
     let streamingId: string | undefined = SIBLING_ID;
     const h = bridgeHarness({ resolveActiveSessionId: () => streamingId });
@@ -1581,6 +1861,85 @@ describe('Antigravity bridge ticker and spawn observer honor the adapter session
     expect(h.emittedFinals).toEqual([]);
   });
 
+  it('cold-resume arm and live-path reject a transient sibling and retain the explicit target', async () => {
+    vi.resetModules();
+    const discovery = await import('../src/services/antigravity-discovery.js');
+    vi.spyOn(discovery, 'findAntigravityConversationId').mockImplementation(opts => (
+      opts.pid === AGY_PID ? SIBLING_ID : null
+    ));
+    const { createAntigravityAdapter } = await import('../src/adapters/cli/antigravity.js');
+    const adapter = createAntigravityAdapter('/usr/local/bin/agy');
+    adapter.buildArgs({
+      sessionId: 'cold-arm-resume-target',
+      resume: true,
+      resumeSessionId: REAL_ID,
+      reattach: false,
+    });
+    const h = bridgeHarness(adapter);
+    h.scope.lastSpawnEffectiveResume = true;
+    h.scope.lastSpawnPersistentReattach = false;
+    h.scope.lastSpawnEffectiveCliSessionId = REAL_ID;
+    h.scope.inputDeliveryObservedCliSessionId = undefined;
+    h.scope.persistCliSessionId = vi.fn();
+    h.scope.ensureAntigravityCotReader = vi.fn();
+    h.scope.codexBridgeNotifyCliSessionId = h.notify;
+    h.scope.resolveAntigravityTranscriptPath = resolveAntigravityTranscriptPath;
+    h.scope.join = join;
+    const siblingPath = h.makeTranscript(SIBLING_ID);
+
+    const armCot = loadWorkerFunction<() => void>('armAntigravityCotForTurn', h.scope);
+    const resolveLive = loadWorkerFunction<() => string | undefined>('resolveLiveAntigravityTranscriptPath', h.scope);
+    armCot();
+
+    expect(h.scope.persistCliSessionId).toHaveBeenCalledWith(REAL_ID);
+    expect(h.scope.ensureAntigravityCotReader).toHaveBeenCalledWith(REAL_ID);
+    expect(h.scope.persistCliSessionId).not.toHaveBeenCalledWith(SIBLING_ID);
+    expect(h.scope.codexBridgeRolloutPath).not.toBe(siblingPath);
+    expect(h.scope.codexBridgePendingSessionId).toBe(REAL_ID);
+    expect(resolveLive()).toBeUndefined();
+
+    const realPath = h.makeTranscript(REAL_ID);
+    h.tick();
+    expect(h.scope.codexBridgeRolloutPath).toBe(realPath);
+  });
+
+  it('cold-resume native log accepts a later authoritative rotation after the requested target', async () => {
+    const { createAntigravityAdapter } = await import('../src/adapters/cli/antigravity.js');
+    const adapter = createAntigravityAdapter('/usr/local/bin/agy');
+    const args = adapter.buildArgs({
+      sessionId: 'cold-native-log-later-rotation',
+      resume: true,
+      resumeSessionId: SIBLING_ID,
+      reattach: false,
+    });
+    const logPath = args[args.indexOf('--log-file') + 1]!;
+    writeFileSync(logPath, streamingLine(SIBLING_ID));
+    const h = bridgeHarness(adapter);
+    h.scope.lastSpawnEffectiveResume = true;
+    h.scope.lastSpawnPersistentReattach = false;
+    h.scope.lastSpawnEffectiveCliSessionId = SIBLING_ID;
+    h.scope.inputDeliveryObservedCliSessionId = undefined;
+    h.scope.persistCliSessionId = vi.fn();
+    h.scope.ensureAntigravityCotReader = vi.fn();
+    h.scope.codexBridgeNotifyCliSessionId = h.notify;
+    h.scope.resolveAntigravityTranscriptPath = resolveAntigravityTranscriptPath;
+    h.scope.join = join;
+    const oldPath = h.makeTranscript(SIBLING_ID);
+    const realPath = h.makeTranscript(REAL_ID);
+    const armCot = loadWorkerFunction<() => void>('armAntigravityCotForTurn', h.scope);
+    const resolveLive = loadWorkerFunction<() => string | undefined>('resolveLiveAntigravityTranscriptPath', h.scope);
+
+    armCot();
+    expect(h.scope.codexBridgeRolloutPath).toBe(oldPath);
+    appendFileSync(logPath, streamingLine(REAL_ID));
+    armCot();
+
+    expect(h.scope.persistCliSessionId).toHaveBeenCalledWith(REAL_ID);
+    expect(h.scope.ensureAntigravityCotReader).toHaveBeenCalledWith(REAL_ID);
+    expect(h.scope.codexBridgeRolloutPath).toBe(realPath);
+    expect(resolveLive()).toBe(realPath);
+  });
+
   it('cold-resume ticker ignores a transient sibling fd that disagrees with the explicit resume target', () => {
     const RESUME_TARGET = REAL_ID;
     const h = bridgeHarness({
@@ -1601,6 +1960,31 @@ describe('Antigravity bridge ticker and spawn observer honor the adapter session
     expect(h.scope.codexBridgeRolloutPath).toBeUndefined();
     expect(persistedIds).toEqual([]);
     expect(h.scope.codexBridgePendingSessionId).toBe(RESUME_TARGET);
+  });
+
+  it('persistent-reattach ticker binds and persists a native /new completed while the worker was down', async () => {
+    const { createAntigravityAdapter } = await import('../src/adapters/cli/antigravity.js');
+    const adapter = createAntigravityAdapter('/usr/local/bin/agy');
+    const args = adapter.buildArgs({
+      sessionId: 'warm-ticker-native-rotation',
+      resume: true,
+      resumeSessionId: SIBLING_ID,
+      reattach: true,
+    });
+    const logPath = args[args.indexOf('--log-file') + 1]!;
+    writeFileSync(logPath, streamingLine(REAL_ID));
+    const h = bridgeHarness(adapter);
+    h.scope.lastSpawnEffectiveResume = true;
+    h.scope.lastSpawnPersistentReattach = true;
+    h.scope.lastSpawnEffectiveCliSessionId = SIBLING_ID;
+    h.scope.persistCliSessionId = vi.fn();
+    const realPath = h.makeTranscript(REAL_ID);
+    h.scope.codexBridgeStartTimer();
+
+    h.tick();
+    expect(h.scope.codexBridgeRolloutPath).toBe(realPath);
+    expect(h.scope.persistCliSessionId).toHaveBeenCalledWith(REAL_ID);
+    expect(h.scope.codexBridgePendingSessionId).toBeUndefined();
   });
 
   it('preserves a submitted turn that was prematurely misattributed to a sibling during writeInput and avoids setting pendingRebind when unbound', () => {
@@ -1641,6 +2025,83 @@ describe('Antigravity bridge ticker and spawn observer honor the adapter session
     expect(h.scope.antigravityPendingRebind).toBe(false);
     h.flushQuietFinal();
     expect(h.emittedFinals).toEqual([{ turnId: 'om_submitted', text: 'REAL_SUBMITTED_ANSWER' }]);
+  });
+
+  it('applyAuthoritative canonicalizes direct write-result UUID casing before bridge lookup', () => {
+    const h = bridgeHarness({ id: 'antigravity', postTerminalPromptFence: false });
+    h.scope.persistCliSessionId = vi.fn();
+    h.scope.ensureAntigravityCotReader = vi.fn();
+    h.scope.codexBridgeNotifyCliSessionId = h.notify;
+    const realPath = h.makeTranscript(REAL_ID);
+    const applyAuthoritative = loadWorkerFunction<(id: string) => void>('applyAuthoritativeAntigravitySessionId', h.scope);
+
+    applyAuthoritative(REAL_ID.toUpperCase());
+
+    expect(h.scope.persistCliSessionId.mock.calls).toEqual([[REAL_ID]]);
+    expect(h.scope.ensureAntigravityCotReader.mock.calls).toEqual([[REAL_ID]]);
+    expect(h.scope.codexBridgeRolloutPath).toBe(realPath);
+    expect(h.scope.codexBridgePendingSessionId).toBeUndefined();
+  });
+
+  it('stale pre-write arm keeps a different REAL pending rebind frozen until the real transcript arrives', () => {
+    let activeId: string | undefined = SIBLING_ID;
+    const h = bridgeHarness({
+      id: 'antigravity',
+      runnerFramedInput: false,
+      postTerminalPromptFence: false,
+      resolveActiveSessionId: () => activeId,
+    });
+    h.scope.persistCliSessionId = vi.fn();
+    h.scope.ensureAntigravityCotReader = vi.fn();
+    h.scope.codexBridgeNotifyCliSessionId = h.notify;
+    h.scope.lastSpawnEffectiveCliSessionId = undefined;
+    const armCot = loadWorkerFunction<() => void>('armAntigravityCotForTurn', h.scope);
+    const applyAuthoritative = loadWorkerFunction<(
+      id: string,
+      options?: { preserveLiveTurn?: boolean },
+    ) => void>('applyAuthoritativeAntigravitySessionId', h.scope);
+
+    const siblingPath = h.makeTranscript(SIBLING_ID);
+    h.notify(SIBLING_ID);
+    h.queue.mark('om_stale_1', 'first prompt', Date.now());
+    writeAntigravityUserStep(siblingPath, 1, 'first prompt');
+    appendFileSync(siblingPath, JSON.stringify({ type: 'GENERIC', status: 'DONE', content: 'Created the following subagent:\n{ "conversationId": "pending-agent" }' }) + '\n');
+    writeAntigravityFinalStep(siblingPath, 3, 'WRONG_SIBLING_WAIT');
+    h.scope.codexBridgeIngest();
+
+    applyAuthoritative(REAL_ID, { preserveLiveTurn: true });
+    expect(h.scope.codexBridgePendingSessionId).toBe(REAL_ID);
+    expect(h.scope.antigravityPendingRebind).toBe(true);
+
+    // A late direct confirmation for the bound old ID must not cancel REAL.
+    h.notify(SIBLING_ID);
+    expect(h.scope.codexBridgePendingSessionId).toBe(REAL_ID);
+    expect(h.scope.antigravityPendingRebind).toBe(true);
+
+    applyAuthoritative(SIBLING_ID);
+    expect(h.scope.persistCliSessionId.mock.calls).toEqual([[REAL_ID]]);
+    expect(h.scope.ensureAntigravityCotReader.mock.calls).toEqual([[REAL_ID]]);
+    expect(h.scope.codexBridgePendingSessionId).toBe(REAL_ID);
+    expect(h.scope.antigravityPendingRebind).toBe(true);
+
+    h.queue.mark('om_stale_2', 'second prompt', Date.now());
+    activeId = SIBLING_ID;
+    armCot();
+    expect(h.scope.persistCliSessionId).not.toHaveBeenCalledWith(SIBLING_ID);
+    expect(h.scope.ensureAntigravityCotReader).not.toHaveBeenCalledWith(SIBLING_ID);
+    expect(h.scope.codexBridgePendingSessionId).toBe(REAL_ID);
+    expect(h.scope.antigravityPendingRebind).toBe(true);
+    h.flushQuietFinal();
+    expect(h.emittedFinals).toEqual([]);
+
+    activeId = REAL_ID;
+    const realPath = h.makeTranscript(REAL_ID);
+    writeAntigravityUserStep(realPath, 1, 'first prompt');
+    writeAntigravityFinalStep(realPath, 2, 'REAL_FIRST_ANSWER');
+    h.tick();
+    h.flushQuietFinal();
+    expect(h.scope.codexBridgeRolloutPath).toBe(realPath);
+    expect(h.emittedFinals).toEqual([{ turnId: 'om_stale_1', text: 'REAL_FIRST_ANSWER' }]);
   });
 
   it('rebinds an idle bridge immediately when authoritative id switches with preserveLiveTurn: true', () => {

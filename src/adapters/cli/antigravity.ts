@@ -713,9 +713,12 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
   // Only a newly launched --conversation process can inherit unfinished work
   // from a dead predecessor. A reattached process can still be doing that work.
   let coldResumeTail: { conversationId: string; step: string } | undefined;
-  const activeSessionId = (pty: Pick<PtyHandle, 'cliPid' | 'cliCwd'>): string | undefined => {
+  const activeSessionIdObservation = (pty: Pick<PtyHandle, 'cliPid' | 'cliCwd'>): {
+    sessionId: string;
+    source: 'native-log' | 'process-discovery';
+  } | undefined => {
     const fromLog = sessionLog?.read().currentId;
-    if (fromLog) return fromLog;
+    if (fromLog) return { sessionId: fromLog.toLowerCase(), source: 'native-log' };
     // On a fresh launch (`!reattach && !(resume && resumeSessionId)`), buildArgs
     // always wires a process-scoped `--log-file` and agy creates no conversation
     // until the first prompt is submitted, while startup `ListConversations` can
@@ -728,8 +731,11 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
     // historical conversation sharing the same working directory.
     const cwd = sessionLog ? undefined : pty.cliCwd;
     if (!pty.cliPid && !cwd) return undefined;
-    return findAntigravityConversationId({ pid: pty.cliPid, cwd }) ?? undefined;
+    const discovered = findAntigravityConversationId({ pid: pty.cliPid, cwd }) ?? undefined;
+    return discovered ? { sessionId: discovered.toLowerCase(), source: 'process-discovery' } : undefined;
   };
+  const activeSessionId = (pty: Pick<PtyHandle, 'cliPid' | 'cliCwd'>): string | undefined =>
+    activeSessionIdObservation(pty)?.sessionId;
   const recordConfirmedSubmit = (
     pty: Pick<PtyHandle, 'cliPid' | 'cliCwd'>,
     preSize: number | null,
@@ -767,7 +773,7 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       bracketedPasteSupported = reattach === false && supportsAntigravityBracketedPaste(cliVersion);
       awaitNativeStreamLog = !reattach && !(resume && resumeSessionId);
       const args = disableCliBypass ? [] : ['--dangerously-skip-permissions'];
-      sessionLog = new AntigravitySessionLog(sessionId);
+      sessionLog = new AntigravitySessionLog(sessionId, undefined, { startAtEnd: !reattach });
       args.push('--log-file', sessionLog.path);
       // Resume: only when we have agy's own conversation UUID. We never
       // map botmux's sessionId here because agy generates its own id at
@@ -820,6 +826,7 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
     },
 
     resolveActiveSessionId: activeSessionId,
+    resolveActiveSessionIdObservation: activeSessionIdObservation,
 
     forkSessionAfterReady(opts) {
       if (!sessionLog) throw new Error('Antigravity fork has no process-scoped native log');
