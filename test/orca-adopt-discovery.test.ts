@@ -148,6 +148,62 @@ describe('Orca adopt discovery', () => {
     expect(candidate?.paneSizeVerified).toBe(true);
   });
 
+  it.each([
+    ['cursor-agent-local', '/opt/cursor-agent-local'],
+    ['cursor-agent-lo', '/usr/bin/electron'],
+  ])('binds an Agent Local Cursor terminal by exact process identity (%s)', async (comm, executable) => {
+    mockOrcaLists({ server: { ok: true, value: {
+      terminals: [{ ...serverTerminal, agentIdentity: 'cursor' }],
+    } } });
+    state.daemon.mockResolvedValue(new Map([['term_1', { pid: 100, cols: 120, rows: 40 }]]));
+    state.readdir.mockReturnValue(['100', '101']);
+    state.readFile.mockImplementation((path: string, encoding?: string) => {
+      if (path.endsWith('/status')) {
+        const pid = Number(path.split('/')[2]);
+        return `Name:\tt\nPPid:\t${pid === 101 ? 100 : 1}\n`;
+      }
+      if (path.endsWith('/environ')) {
+        return Buffer.from(path.includes('/101/') ? 'ORCA_TERMINAL_HANDLE=term_1\0' : '');
+      }
+      if (path.endsWith('/comm')) return encoding ? `${comm}\n` : Buffer.from(`${comm}\n`);
+      if (path.endsWith('/cmdline')) return Buffer.from('/opt/cursor-agent-local\0--authless\0');
+      throw new Error(`unexpected read ${path}`);
+    });
+    state.readlink.mockReturnValue(executable);
+
+    const [candidate] = await discoverAdoptableOrcaSessions('cursor');
+    expect(candidate).toMatchObject({ cliId: 'cursor', cliPid: 101 });
+  });
+
+  it.each(['nested', 'sibling'])('does not let an Agent Local Electron helper displace the main process (%s)', async layout => {
+    mockOrcaLists({ server: { ok: true, value: {
+      terminals: [{ ...serverTerminal, agentIdentity: 'cursor' }],
+    } } });
+    state.daemon.mockResolvedValue(new Map([['term_1', { pid: 100, cols: 120, rows: 40 }]]));
+    state.readdir.mockReturnValue(['100', '101', '102']);
+    state.readFile.mockImplementation((path: string, encoding?: string) => {
+      if (path.endsWith('/status')) {
+        const pid = Number(path.split('/')[2]);
+        const parent = pid === 101 ? 100 : pid === 102 ? (layout === 'nested' ? 101 : 100) : 1;
+        return `Name:\tt\nPPid:\t${parent}\n`;
+      }
+      if (path.endsWith('/environ')) {
+        return Buffer.from(path.includes('/101/') || path.includes('/102/')
+          ? 'ORCA_TERMINAL_HANDLE=term_1\0' : '');
+      }
+      if (path.endsWith('/comm')) return encoding ? 'cursor-agent-lo\n' : Buffer.from('cursor-agent-lo\n');
+      if (path.endsWith('/cmdline')) {
+        const role = path.includes('/102/') ? '--type=gpu-process' : '--authless';
+        return Buffer.from(`/opt/cursor-agent-local\0${role}\0`);
+      }
+      throw new Error(`unexpected read ${path}`);
+    });
+    state.readlink.mockReturnValue('/usr/bin/electron');
+
+    const [candidate] = await discoverAdoptableOrcaSessions('cursor');
+    expect(candidate).toMatchObject({ cliId: 'cursor', cliPid: 101 });
+  });
+
   it('binds server-terminal transcripts and geometry through the terminal daemon', async () => {
     mockOrcaLists({ server: { ok: true, value: { terminals: [serverTerminal] } } });
     state.daemon.mockResolvedValue(new Map([['term_1', { pid: 100, cols: 120, rows: 40 }]]));

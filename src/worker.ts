@@ -16733,7 +16733,7 @@ function captureClaudeOpenTurnObservation(
           readyPatternVisible = cliAdapter.readyPattern.test(stripAnsiScreenText(content));
         }
         if (cliAdapter?.busyPattern) {
-          busyPatternVisible = cliAdapter.busyPattern.test(busyProbeRegion(content));
+          busyPatternVisible = cliAdapter.busyPattern.test(busyProbeRegion(content, cliAdapter.id));
         }
       }
     } catch { /* unreadable viewport falls back to readyPatternVisible=true */ }
@@ -20898,7 +20898,7 @@ function maybeFlushAntigravityTrailingFinalOnQuietTick(): void {
   try {
     const screen = captureBackendScreen(backend);
     if (!screen) return;
-    if (cliAdapter.busyPattern.test(busyProbeRegion(screen))) return;
+    if (cliAdapter.busyPattern.test(busyProbeRegion(screen, cliAdapter.id))) return;
     if (!cliAdapter.readyPattern.test(stripAnsiScreenText(screen))) return;
     if ((parseAntigravityFooterBackgroundTasks(screen) ?? 0) > 0) return;
   } catch (err: any) {
@@ -25122,7 +25122,7 @@ function preemptActiveTurnForNewMessage(
   if (!cliAdapter.busyPattern) return false;
   let screen = '';
   try { screen = captureBackendScreen(targetBackend); } catch { return false; }
-  if (!screen || !cliAdapter.busyPattern.test(busyProbeRegion(screen))) return false;
+  if (!screen || !cliAdapter.busyPattern.test(busyProbeRegion(screen, cliAdapter.id))) return false;
 
   const interruptKey: CriticalInterruptKey = cliAdapter.interruptKey === 'esc' ? 'esc' : 'ctrlc';
   preemptedTurnId = activeTurnId;
@@ -30572,7 +30572,7 @@ function scheduleSubmitFailureNotify(
     const busyNow = nativeWorking || (() => {
       if (!cliAdapter?.busyPattern || !submitDiagnosisScreen) return false;
       try {
-        return cliAdapter.busyPattern.test(busyProbeRegion(submitDiagnosisScreen));
+        return cliAdapter.busyPattern.test(busyProbeRegion(submitDiagnosisScreen, cliAdapter.id));
       } catch { return false; }
     })();
     const passedBySuccessor = isPassedBySuccessor();
@@ -34682,7 +34682,7 @@ function viewportShowsIdlePrompt(be: SessionBackend): boolean {
   try {
     const content = captureBackendScreen(be);
     if (!content) return false;
-    const region = busyProbeRegion(content);
+    const region = busyProbeRegion(content, cliAdapter.id);
     if (cliAdapter.busyPattern.test(region)) return false;
     return !cliAdapter.readyPattern || cliAdapter.readyPattern.test(region);
   } catch (err: any) {
@@ -34736,7 +34736,7 @@ function deferPromptReadyWhileBusy(source: string, be: SessionBackend): boolean 
   if (!backendScreenEvidenceIsAuthoritativeForMutation() || !cliAdapter?.busyPattern) return false;
   try {
     const content = captureBackendScreen(be);
-    if (!content || !cliAdapter.busyPattern.test(busyProbeRegion(content))) return false;
+    if (!content || !cliAdapter.busyPattern.test(busyProbeRegion(content, cliAdapter.id))) return false;
     deferBusyReady('busy-marker', source);
     log(`${source}: authoritative viewport still shows busy marker; deferring prompt ready (reason=deferred-busy-marker)`);
     idleDetector?.reset();
@@ -34817,7 +34817,7 @@ function probeBusyPatternIdle(
     try {
       const content = captureBackendScreen(be);
       if (!content) return false;
-      if (cliAdapter.busyPattern.test(busyProbeRegion(content))) return false;
+      if (cliAdapter.busyPattern.test(busyProbeRegion(content, cliAdapter.id))) return false;
       // At startup an absent busy marker proves nothing: a CLI that has not
       // drawn its UI yet has no busy marker either (2026-10-20: a blank pane
       // was marked ready 15s into a 66s cold start). Require the input box.
