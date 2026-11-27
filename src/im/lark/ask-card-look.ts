@@ -208,8 +208,11 @@ export function formatAskDeadline(deadlineAt: number, locale: Locale, createdAt?
 }
 
 /** Who may answer: plain footer text, or a designated answerer's mention (kept out of the grey font). */
-function answerable(ask: Pick<PendingAsk, 'answererOpenId' | 'originKind'>, locale: Locale): { text: string } | { mention: string } {
+function answerable(ask: Pick<PendingAsk, 'answererOpenId' | 'ownerAnswererOpenId' | 'originKind'>, locale: Locale): { text: string } | { mention: string } {
   if (!ask.answererOpenId) return { text: t('card.ask.footer.talk_members', undefined, locale) };
+  if (ask.ownerAnswererOpenId && ask.ownerAnswererOpenId !== ask.answererOpenId) {
+    return { text: t('card.ask.footer.designated_or_owner', undefined, locale) };
+  }
   // XPI can resolve this id from union_id in another app. It is valid for the broker's callback
   // authorization, but embedding it as an at resource can make Lark reject the card with 230099.
   if (ask.originKind?.startsWith('host_cross_principal_')) return { text: t('card.ask.footer.designated', undefined, locale) };
@@ -222,7 +225,7 @@ export function askFooter(first: string, extraLines: string[] = []): El {
 }
 
 /** 「截止 … · 本群可对话成员可答」, or 「截止 … · @someone 可答」 for a designated answerer. */
-export function deadlineLine(ask: Pick<PendingAsk, 'deadlineAt' | 'createdAt' | 'answererOpenId' | 'originKind'>, locale: Locale): string {
+export function deadlineLine(ask: Pick<PendingAsk, 'deadlineAt' | 'createdAt' | 'answererOpenId' | 'ownerAnswererOpenId' | 'originKind'>, locale: Locale): string {
   const who = answerable(ask, locale);
   return 'text' in who ? grey(`${deadlineText(ask, locale)} · ${who.text}`)
     : `${grey(`${deadlineText(ask, locale)} · `)}${who.mention}${grey(t('card.ask.footer.may_answer', undefined, locale))}`;

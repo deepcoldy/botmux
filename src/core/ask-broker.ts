@@ -32,6 +32,7 @@ import { AskDispatchError } from './ask-types.js';
 import { supportsAskCustomInput, parseAskCustomFields } from './ask-custom-input.js';
 import { askChoiceProblem, splitAskTexts } from './ask-choice.js';
 import { isHookPermissionAsk } from './ask-hook/types.js';
+import { allowsTaskOwnerAnswer, type AskOwnerBinding } from './ask-owner-answer.js';
 
 /** Origins for which restart-resume + durable handoff are enabled. Only a
  *  caller that has a reconnecting claimant after a daemon restart may persist:
@@ -188,6 +189,17 @@ let canTalkChecker:
   | ((larkAppId: string, chatId: string, openId: string, chatType?: 'group' | 'p2p', actor?: AskAnswerActor) => boolean)
   | null = null;
 
+let askOwnerResolver: ((ask: AskOwnerBinding) => string | undefined) | null = null;
+
+/** Host-only owner lookup. Re-evaluated on every answer, including after restore. */
+export function setAskOwnerResolver(resolver: (ask: AskOwnerBinding) => string | undefined): void {
+  askOwnerResolver = resolver;
+}
+
+function ownerAnswerer(ask: AskOwnerBinding): string | undefined {
+  return allowsTaskOwnerAnswer(ask) ? askOwnerResolver?.(ask) : undefined;
+}
+
 /** Wire the canTalk predicate. Called once during daemon bootstrap. */
 export function setCanTalkChecker(
   fn: (larkAppId: string, chatId: string, openId: string, chatType?: 'group' | 'p2p', actor?: AskAnswerActor) => boolean,
@@ -200,7 +212,8 @@ export function setCanTalkChecker(
  *  so it follows the canTalk gate — not the stricter canOperate / allowedUsers.
  *  `actor` is only supplied by the text-reply path; card clicks omit it. */
 function isAuthorizedToAnswer(ask: InternalPending, by: string, actor?: AskAnswerActor): boolean {
-  if (ask.answererOpenId && ask.answererOpenId !== by) return false;
+  if (ask.answererOpenId && ask.answererOpenId !== by
+    && (actor?.botSender || ownerAnswerer(ask) !== by)) return false;
   if (ask.deliveryTarget && (ask.deliveryTarget.openId !== by || actor?.botSender)) return false;
   return canTalkChecker?.(ask.larkAppId, ask.chatId, by, ask.deliveryTarget ? 'p2p' : ask.chatType, actor) ?? false;
 }
@@ -1632,6 +1645,7 @@ function snapshot(ask: InternalPending): PendingAsk {
   } = ask;
   return {
     ...rest,
+    ownerAnswererOpenId: ownerAnswerer(ask),
     ...(ask.customAnswers ? { customAnswers: [...ask.customAnswers] } : {}),
     ...(ask.deliveryTarget ? { deliveryTarget: { ...ask.deliveryTarget } } : {}),
     ...(ask.terminalResult ? { result: ask.terminalResult } : {}),
@@ -1790,6 +1804,7 @@ export function _resetForTest(): void {
   pending.clear();
   dispatcher = null;
   canTalkChecker = null;
+  askOwnerResolver = null;
   explicitAskSessionChecker = null;
   handoffRetentionMs = HANDOFF_RETENTION_MS; // restore default retention
   hookReclaimGraceMs = HOOK_RECLAIM_GRACE_MS;

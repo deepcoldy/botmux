@@ -37,7 +37,8 @@ export interface AskApiBody {
   mentionedOpenId?: string;
   acknowledge?: boolean;
   asyncUserInput?: CodexAsyncUserInput;
-  /** Optional narrowing only; never grants talk/approval authority. */
+  /** Narrows ordinary respondents; the host-verified task owner retains access.
+   * Never grants talk/approval authority. */
   answererOpenId?: string;
   asyncFailure?: 'limit' | 'invalid_questions';
 }

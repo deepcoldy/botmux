@@ -61,7 +61,8 @@ import { plannedOpeningBackendType } from './core/opening-backend.js';
 import { stripDispatchCompletionProtocol } from './core/dispatch.js';
 import { withConfiguredBotOwner } from './core/bot-owner-attribution.js';
 import { readCanonicalBotActorOwnerBindings } from './core/bot-actor-owner-binding.js';
-import { releaseExplicitAskHandoff, hasExplicitAskHandoff, hydrateLegacyExplicitAskCardRoot, invalidateExplicitAsk, setExplicitAskSessionChecker, retireExplicitAsk, explicitAskSnapshot } from './core/ask-broker.js';
+import { releaseExplicitAskHandoff, hasExplicitAskHandoff, hydrateLegacyExplicitAskCardRoot, invalidateExplicitAsk, setExplicitAskSessionChecker, retireExplicitAsk, explicitAskSnapshot, setAskOwnerResolver } from './core/ask-broker.js';
+import { createAskOwnerResolver } from './core/ask-owner-answer.js';
 import { createExplicitAskContinuation, explicitAskRecoveryRequest, explicitAskOriginIsLive, explicitAskRetirementBound, explicitAskSessionBound } from './core/explicit-ask-continuation.js';
 import { createManagedAskControl, parseManagedAskControl } from './core/managed-ask-control.js';
 import { canSafelyReclaimWorkerForInstallChange, suspendWorkerAsync } from './core/worker-pool.js';
@@ -35961,6 +35962,20 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   );
   setExplicitAskSessionChecker(ask => !sessionsRestored
     || explicitAskSessionBound(ask, findActiveBySessionId(ask.sessionId)));
+  setAskOwnerResolver(createAskOwnerResolver({
+    session: sessionId => {
+      const ds = findActiveBySessionId(sessionId);
+      if (!ds || ds.session.status !== 'active') return undefined;
+      return {
+        larkAppId: ds.larkAppId, chatId: ds.chatId,
+        rootMessageId: ds.session.scope === 'chat' ? null : ds.session.rootMessageId,
+        ownerOpenId: ds.session.ownerOpenId,
+      };
+    },
+    botOwner: getOwnerOpenId,
+    canOperate,
+    isPeerBot: (appId, openId) => isKnownPeerBot(config.session.dataDir, appId, openId),
+  }));
 
   // Resume pending `botmux ask` cards that outlived a daemon restart. Each is
   // restored as a DORMANT ask (card still live in Feishu, no waiter yet). The

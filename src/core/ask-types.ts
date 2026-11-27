@@ -212,8 +212,8 @@ export interface CreateAskInput {
   /** 发起 ask 的会话类型。仅用于点击鉴权时把 chatType 喂给 canTalk（p2pOpen 腿）；
    *  缺省时该腿 fail-closed，鉴权退回原语义。 */
   chatType?: 'group' | 'p2p';
-  /** Optional exact responder lock for host-owned approval asks. Ordinary
-   * agent asks omit it and retain the existing canTalk-any-member policy. */
+  /** Exact responder for system approvals. Explicit agent asks additionally
+   * admit the host-verified task owner with existing management authority. */
   answererOpenId?: string;
   /** 显式 `botmux ask --mention <open_id>` 要 @ 的人。daemon 只在通讯录确认是本应用的
    *  真人后填入（at 到 bot 会让整卡 100290），卡片在第一问前注入真实 `<at>`。
@@ -244,8 +244,12 @@ export interface PendingAsk {
   sessionId: string;
   /** 发起 ask 的会话类型（见 CreateAskInput.chatType）。 */
   chatType?: 'group' | 'p2p';
-  /** When present, only this app-scoped open_id may settle the ask. */
+  /** Exact responder for system approvals; ordinary explicit asks also admit
+   * the live task owner when the host verifies their management authority. */
   answererOpenId?: string;
+  /** Runtime-only presentation of the host-verified task owner. Never accepted
+   * from IPC or persisted as authority; the broker resolves it on every answer. */
+  ownerAnswererOpenId?: string;
   /** 显式 ask 要 @ 的人类 open_id（见 CreateAskInput.mentionedOpenId）。 */
   mentionedOpenId?: string;
   /** 问题列表，替代旧的 `options` + `prompt`。 */
