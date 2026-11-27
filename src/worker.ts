@@ -13054,10 +13054,36 @@ function observeCotEntries(entries: readonly CotEntry[], turn: { turnId: string;
     return;
   }
   for (const entry of kept) {
+    const chars = cotEntryChars(entry);
+    if (thinkingTotalChars + chars > THINKING_ACCUMULATED_CAP) {
+      // The cap holds per entry, not per batch: one long entry or a large batch
+      // must not carry the total past it. Text keeps what still fits; a tool
+      // entry is not cut (its args/result would no longer parse) and is left
+      // out. Either way the timeline ends with the「…」node now, not on the
+      // next batch.
+      const head = cotTextHead(entry, THINKING_ACCUMULATED_CAP - thinkingTotalChars);
+      if (head) {
+        thinkingEntries.push(head);
+        thinkingTotalChars += cotEntryChars(head);
+      }
+      thinkingCapNoted = true;
+      thinkingEntries.push({ kind: 'thinking', text: '…' });
+      break;
+    }
     thinkingEntries.push(entry);
-    thinkingTotalChars += cotEntryChars(entry);
+    thinkingTotalChars += chars;
   }
   scheduleThinkingEmit();
+}
+
+/** The first `budget` characters of a thinking or text entry (never splitting a
+ *  surrogate pair), or null for a tool entry, no budget, or nothing left. */
+function cotTextHead(entry: CotEntry, budget: number): CotEntry | null {
+  if ((entry.kind !== 'thinking' && entry.kind !== 'text') || budget <= 0) return null;
+  let end = Math.min(budget, entry.text.length);
+  const last = entry.text.charCodeAt(end - 1);
+  if (end < entry.text.length && last >= 0xd800 && last <= 0xdbff) end -= 1;
+  return end > 0 ? { kind: entry.kind, text: entry.text.slice(0, end) } : null;
 }
 
 /** Opt-in per bot (foldBackgroundUpdates), as this worker process started with it.
