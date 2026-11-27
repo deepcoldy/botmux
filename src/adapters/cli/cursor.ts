@@ -8,7 +8,9 @@ import { TMUX_INITIAL_PROMPT_ARG_BUDGET, type CliAdapter, type PtyHandle, type S
 import { busyProbeRegion } from '../../utils/busy-probe.js';
 import { stripAnsiScreenText } from '../../utils/idle-detector.js';
 import { delay } from '../../utils/timing.js';
+import { normaliseTranscriptFingerprintCandidates } from '../../services/claude-transcript.js';
 import { drainCursorTranscript, findCursorTranscriptByChatId, findCursorTranscriptByPid } from '../../services/cursor-transcript.js';
+import type { CodexBridgeEvent } from '../../services/codex-transcript.js';
 import { builtinPluginDirForSession } from '../../skills/workflow-node-plugin-dir.js';
 
 /** PTYs that have already received a writeInput. The first write lands while
@@ -30,7 +32,23 @@ export const CURSOR_PLUGIN_DIR = join(homedir(), '.botmux', 'cursor-plugin');
  *  adopt baselines history by byte offset instead of the timestamp-cutoff
  *  split-live. */
 export const cursorBridgeSpec: StructuredBridgeSpec = {
-  drain: (path, offset) => drainCursorTranscript(path, offset),
+  drain(path, offset, ctx) {
+    const result = drainCursorTranscript(path, offset);
+    if (ctx.backendType !== 'pty' || ctx.adoptMode) return result;
+    let input = (ctx.state as { input?: CodexBridgeEvent['softNewlineInput'] } | undefined)?.input;
+    for (const event of result.events) {
+      if (event.kind === 'user') {
+        const [, candidate] = normaliseTranscriptFingerprintCandidates(event.text);
+        input = candidate === undefined ? undefined : { candidate };
+        if (input) event.softNewlineInput = input;
+      } else if (event.kind === 'assistant_final') {
+        if (input) event.softNewlineInput = input;
+        input = undefined;
+      }
+    }
+    return { ...result, state: { input } };
+  },
+  stateCommit: 'ingest',
   locate: {
     bySessionId: sessionId => findCursorTranscriptByChatId(sessionId),
     byPid: pid => findCursorTranscriptByPid(pid)?.path,
@@ -216,10 +234,9 @@ export function createCursorAdapter(pathOverride?: string): CliAdapter {
       // bytes arriving densely:
       //   - tmux: Ctrl+J, cursor's native soft-newline — renders cleanly and
       //     send-keys spaces the bytes out enough to never fold.
-      //   - raw PTY: a fast write('\n') folds, so send `\` + CR; cursor eats the
-      //     backslash-before-CR as a soft-newline (not part of the submitted
-      //     text) and no LF byte hits the stream, making it fold-immune. Costs a
-      //     cosmetic trailing `\` in the local TUI render only.
+      //   - raw PTY: a fast write('\n') folds, so send `\` + CR. No LF byte
+      //     hits the stream. Some Cursor versions retain the backslash in
+      //     the submitted text; the transcript bridge handles that residue.
       // Submit is always a bare Enter (\r). No on-disk submit verification —
       // cursor's transcript path isn't documented, so the worker relies on
       // idle detection + the bridge fallback timer.
