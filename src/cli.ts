@@ -186,6 +186,7 @@ import { defaultStatFile, parseSendInvocation, validateClientSendInvocation, typ
 import { parseDispatchArgs } from './cli/dispatch-args.js';
 import { safeRequirementUrl } from './core/dispatch-task-tree.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
+import { botOneShotEnv } from './core/session-env-resolve.js';
 import { isCodexReasoningEffort, type CodexReasoningEffort } from './services/codex-reasoning-effort.js';
 import { resolveDispatchLaunchSpec } from './core/dispatch-launch-spec.js';
 import {
@@ -18431,11 +18432,25 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   let effectiveRuntime: { model: string; reasoningEffort?: CodexReasoningEffort } | undefined;
   if (hasLaunchOverride) {
     const target = botConfigs.find(cfg => cfg.larkAppId === parsedBotApps[0]!.appId)!;
-    const adapter = createCliAdapterSync(target.cliId, target.cliRuntime?.executable ?? target.cliPathOverride);
+    const adapter = createCliAdapterSync(
+      target.cliId,
+      target.cliRuntime?.executable ?? target.cliPathOverride,
+      { configDir: target.cliConfigDir },
+    );
+    // Validate against the catalogue THIS bot will actually see: a gateway
+    // bot's models only exist behind its own env, and a profile bot's models
+    // live in its own config dir.
+    const probeEnv = botOneShotEnv(process.env, target);
+    // 与 services/model-catalog.ts 同一条规则：Claude 网关 wrapper 的模型集合
+    // 由网关定义，原生探测会答成宿主机官方账户。宁可拒绝显式 model，也不要拿
+    // 另一套目录去校验它。
+    const detectModels = target.cliId === 'claude-code' && target.wrapperCli
+      ? () => Promise.resolve<readonly string[] | null>(null)
+      : () => adapter.detectModels?.({ env: probeEnv }) ?? Promise.resolve(null);
     const resolved = await resolveDispatchLaunchSpec({
       requested: { model: dispatchArgs.model, reasoningEffort: dispatchArgs.reasoningEffort },
       target,
-      detectModels: () => adapter.detectModels?.() ?? Promise.resolve(null),
+      detectModels,
     });
     if (!resolved.ok) { console.error(resolved.error); process.exit(1); }
     requestedLaunch = resolved.requested;

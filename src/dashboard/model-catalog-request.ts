@@ -13,6 +13,10 @@ export interface ModelCatalogProbeContext {
   runtimeContext: string | undefined;
   probeEnv: NodeJS.ProcessEnv | undefined;
   fingerprint: string | undefined;
+  /** Per-bot CLI profile dir. Probes must read this account, not `~/.claude`. */
+  configDir: string | undefined;
+  /** False when this Bot's persisted launch shape can't be probed safely. */
+  canProbe: boolean;
 }
 
 /**
@@ -37,13 +41,20 @@ export function modelCatalogProbeContext(
     ? runtimeExecutableForBotSelection(key, botConfig)
     : undefined;
   const probe = runtimeApplies ? botOneShotProbeEnv(baseEnv, botConfig) : undefined;
+  const configDir = runtimeApplies ? botConfig.cliConfigDir : undefined;
   return {
     cliId,
     runtimeExecutable,
+    // configDir 参与身份：同一 CLI 的不同 profile 是不同账户，缓存不能混。
     runtimeContext: runtimeApplies
-      ? `${botConfig.larkAppId}:${cliId}:${runtimeExecutable ?? 'default'}`
+      ? `${botConfig.larkAppId}:${cliId}:${runtimeExecutable ?? 'default'}${configDir ? `:${configDir}` : ''}`
       : undefined,
     probeEnv: probe?.env,
     fingerprint: probe?.fingerprint,
+    configDir,
+    // Without a Bot we probe the host default CLI (the pre-bot behaviour).
+    // With a Bot, only an exactly matching launch shape may be probed: an
+    // unknown wrapper must not borrow the host's native catalogue.
+    canProbe: botConfig === undefined || runtimeApplies,
   };
 }

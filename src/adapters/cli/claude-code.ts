@@ -24,6 +24,7 @@ import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { shellQuote } from '../../core/cli-launch-mode.js';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
+import { detectClaudeModels } from './claude-model-catalog.js';
 import { resolveCommand } from './registry.js';
 import { claudeCompactionHookCommand, claudeStopFailureHookCommand, sessionReadyHookCommand, statuslineHookCommand, userPromptHookCommand } from '../hook-command.js';
 import type { CliAdapter, CliId, PtyHandle } from './types.js';
@@ -1007,6 +1008,12 @@ export interface ClaudeFamilyVariant {
    *  aliases; forks whose model set is gateway-defined
    *  pass undefined so setup skips the prompt. */
   readonly modelChoices?: readonly string[];
+  /** Live model catalogue probe for the dashboard / session model picker:
+   *  the endpoint this bot actually points at, then the signed catalogue the
+   *  CLI caches on disk (`<config dir>/cache/model-catalog/published-*.json`).
+   *  Forks whose model set is gateway-defined leave it undefined so the
+   *  static list applies. */
+  readonly detectModels?: (options?: { env?: NodeJS.ProcessEnv }) => Promise<readonly string[] | null>;
   /** Auth/login paths kept real+writable in the file sandbox (see CliAdapter.authPaths). */
   readonly authPaths?: readonly string[];
   /** Opt in only after this concrete fork passes the terminal contract. */
@@ -1068,9 +1075,11 @@ export function createClaudeCodeAdapter(pathOverride?: string, configDir?: strin
     stateJsonPath: join(homedir(), '.claude.json'),
     ...(configDir ? claudeConfigProfileVariant(configDir) : {}),
     // alias（fable/opus/sonnet/haiku）由 Claude Code 解析到当前推荐版本
-    // （`claude --help` 确认）；具体 ID 锁版本（5 代全名 + 当前 haiku 版本）。
-    // Claude Code 无枚举接口（--model 只吃 alias/全名），故无 detectModels。
+    // （`claude --help` 确认）；具体 ID 锁版本。候选按「bot 实际指向的端点 →
+    // CLI 缓存的签名目录 → 静态表」取（见 claude-model-catalog.ts）：网关 bot 的
+    // 可选集合只有 /v1/models 知道，官方账户则与 /model 选择器同源。
     modelChoices: CLI_MODEL_CHOICES['claude-code'],
+    detectModels: (options) => detectClaudeModels({ env: options?.env, configDir }),
   }, pathOverride ?? 'claude');
 }
 
@@ -1700,6 +1709,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
     // 候选 model 由 variant 决定（Claude 给 Anthropic alias；Seed 走网关交给 setup 跳过）。
     // setup 选 Other 可自由填，比如要回退或试 canary 模型。
     modelChoices: variant.modelChoices,
+    ...(variant.detectModels ? { detectModels: variant.detectModels } : {}),
     // askUserQuestion hook 写各 variant 的 settings.json（matcher='AskUserQuestion' 的
     // PreToolUse），把事件转发到 `botmux hook <id>`。Claude 用全局 ~/.claude/settings.json
     // 是为了 adopt 模式（接管的 claude 会话拿不到进程级 --settings，只读全局那条）；hook

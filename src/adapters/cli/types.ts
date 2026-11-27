@@ -1112,9 +1112,10 @@ export interface CliAdapter {
    *  `modelChoices`. Contract:
    *  - MUST be fail-soft: return null on any error, timeout, or unparseable
    *    output, never throw (the caller falls back to `modelChoices`);
-   *  - MUST be self-contained: one short-lived subprocess (or pure file read)
-   *    with a tight timeout (≤10s) and a capped output buffer — catalogue
-   *    JSON can be hundreds of KB;
+   *  - MUST be self-contained: one short-lived subprocess, a pure file read, or
+   *    a short-timeout (≤10s) request to an endpoint the CLI itself is already
+   *    configured for, with a tight timeout and a capped output buffer —
+   *    catalogue JSON can be hundreds of KB;
    *  - absent = the CLI cannot enumerate its models; the picker shows
    *    `modelChoices` only. */
   readonly detectModels?: (options?: { env?: NodeJS.ProcessEnv }) => Promise<readonly string[] | null>;

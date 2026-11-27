@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';
 import {
   MODEL_DETECT_TTL_MS,
   buildModelChoicesResponse,
@@ -140,8 +141,8 @@ describe('detectModels（live 探测，fail-soft）', () => {
     expect(calls).toBe(2);
   });
 
-  it('适配器无 detectModels（claude-code）→ null', async () => {
-    expect(await detectModels('claude-code')).toBeNull();
+  it('适配器无 detectModels（cursor）→ null', async () => {
+    expect(await detectModels('cursor')).toBeNull();
   });
 
   it('ttadk 网关项（ttadk-x-claude）→ null（模型由网关建议列表承载）', async () => {
@@ -152,6 +153,20 @@ describe('detectModels（live 探测，fail-soft）', () => {
     expect(await catalog.detectModels('ttadk-x-coco', { adapterFactory: factory })).toBeNull();
     expect(calls).toBe(0);
   });
+
+  it.each(['aiden-x-claude', 'cjadk-x-claude'])(
+    'claude 网关 wrapper（%s）不探测：不借宿主官方目录',
+    async key => {
+      const catalog = createModelCatalog();
+      let calls = 0;
+      const models = await catalog.detectModels(key, {
+        adapterFactory: () => { calls++; return fakeAdapter(async () => ['host-official-model']); },
+      });
+      // 网关的可选集合由网关定义，宿主机目录里的模型对它没有意义。
+      expect(models).toBeNull();
+      expect(calls).toBe(0);
+    },
+  );
 
   it('cjadk-x-codex 保留底层 Codex live 探测', async () => {
     const catalog = createModelCatalog();
@@ -166,6 +181,24 @@ describe('detectModels（live 探测，fail-soft）', () => {
     });
     expect(models).toEqual(['cjadk-live']);
     expect(calls).toBe(1);
+  });
+
+  it('claude-code 把真实适配器接进目录层：profile 目录的缓存就是 live 结果', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-catalog-wire-'));
+    try {
+      const dir = join(root, 'cache', 'model-catalog');
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'published-a.json'), JSON.stringify({
+        surfaces: { cc: { model_selector_config: [{ models: [{ id: 'profile-only-model' }] }] } },
+      }));
+      const catalog = createModelCatalog();
+      const models = await catalog.detectModels('claude-code', {
+        adapterFactory: () => createClaudeCodeAdapter(undefined, root),
+      });
+      expect(models).toEqual(['profile-only-model']);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('未知 key → null', async () => {
@@ -494,9 +527,9 @@ describe('parseAidenCodexModelsJson', () => {
 
 describe('buildModelChoicesResponse（端点 200 响应体构造）', () => {
   it('无 live 探测能力时：静态候选 + source=static + detectedAt', async () => {
-    // claude-code 无 detectModels → live=null → source=static
-    const body = await buildModelChoicesResponse('claude-code', { now: () => 42_000 });
-    expect(body.models).toContain('sonnet');
+    // cursor 无 detectModels → live=null → source=static
+    const body = await buildModelChoicesResponse('cursor', { now: () => 42_000 });
+    expect(body.models).toContain('auto');
     expect(body.source).toBe('static');
     expect(body.detectedAt).toBe(42_000);
   });

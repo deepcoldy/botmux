@@ -152,10 +152,15 @@ async function detectModelCatalogWith(
     ?? ((cliId: CliId, pathOverride?: string) => createCliAdapterSync(cliId, pathOverride));
   try {
     const opt = lookupCliSelection(key);
-    // Only ttadk owns its model list. Other registered wrappers (including
-    // cjadk) retain the underlying adapter's live slug discovery; Aiden Codex
-    // is handled by its dedicated detector below.
+    // Only ttadk owns its model list. Other registered wrappers keep the
+    // underlying adapter's live slug discovery — except the Claude gateways
+    // below; Aiden Codex is handled by its dedicated detector.
     if (!opt || isTtadkWrapper(opt.wrapperCli)) return null;
+    // Claude 网关 wrapper（aiden-x-claude、cjadk-x-claude）的模型集合由网关定义。
+    // 原生 claude-code 探测器没有 Bot 时会退到宿主机的官方账户目录，给出的列表
+    // 与网关无关，因此这类 wrapper 一律回退静态候选（与 ClaudeFamilyVariant 的
+    // 注释一致；cli dispatch 侧有同一条守卫）。
+    if (opt.cliId === 'claude-code' && opt.wrapperCli) return null;
 
     // Pi reads local configuration in the effective environment, including
     // ambient HOME/agent-dir when no Bot-specific probe env was supplied.
