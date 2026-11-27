@@ -38,6 +38,14 @@ describe('Lark callback payload normalization', () => {
     expect(data.action?.value).toEqual(value);
   });
 
+  it('uses flattened action_value when action exists without value', () => {
+    const data = normalizeCardActionData({
+      action: { tag: 'button' },
+      action_value: JSON.stringify(value),
+    });
+    expect(data.action).toMatchObject({ tag: 'button', value });
+  });
+
   it.each(['broken JSON', 'null', '[]', '42', '"feedback_submit"', [], null, 42].map(raw => [raw]))(
     'does not promote an invalid explicit value into a callback action: %j', raw => {
       const data = normalizeCardActionData({ action: {

@@ -1562,6 +1562,7 @@ export function rawMessageIngressAnchor(larkAppId: string, message: any): string
 // round-trip inside the 3s window. It is resolved for every callback so a
 // `/botconfig` update takes effect without reconnecting the dispatcher.
 const CARD_ACTION_TIMEOUT = Symbol('card-action-timeout');
+const CARD_ACTION_DEFERRED_CARD_SCHEDULED = Symbol('card-action-deferred-card-scheduled');
 const cardActionInFlight = new Set<string>();
 
 function cardActionMessageId(data: any): string | undefined {
@@ -1659,17 +1660,21 @@ function serializeRawCardForPatch(cardData: any): string | undefined {
   return typeof cardData === 'string' ? cardData : JSON.stringify(cardData);
 }
 
+function cardActionPatchErrorDetail(err: unknown): string {
+  const shape = extractLarkErrorShape(err);
+  const responseData = (err as any)?.response?.data;
+  return `${shape.message}`
+    + `${shape.httpStatus !== undefined ? ` httpStatus=${shape.httpStatus}` : ''}`
+    + `${shape.larkCode !== undefined ? ` larkCode=${shape.larkCode}` : ''}`
+    + `${responseData ? ` response=${JSON.stringify(responseData).slice(0, 1000)}` : ''}`;
+}
+
 function cardActionToken(data: any): string | undefined {
   const token = data?.token ?? data?.event?.token;
   return typeof token === 'string' && token.trim() ? token.trim() : undefined;
 }
 
-function cardActionOperatorOpenId(data: any): string | undefined {
-  const openId = data?.operator?.open_id ?? data?.operator_id ?? data?.event?.operator?.open_id;
-  return typeof openId === 'string' && openId.trim() ? openId.trim() : undefined;
-}
-
-function normalizeDelayedUpdateCard(raw: any, operatorOpenId?: string): Record<string, unknown> | undefined {
+function delayedUpdateCardFromRaw(raw: any): Record<string, unknown> | undefined {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
   const card = (raw as any).card && typeof (raw as any).card === 'object' && !Array.isArray((raw as any).card)
     ? (raw as any).card
@@ -1677,19 +1682,14 @@ function normalizeDelayedUpdateCard(raw: any, operatorOpenId?: string): Record<s
   if (!card || typeof card !== 'object' || Array.isArray(card)) return undefined;
 
   // interactive/v1/card/update targets the callback token, not the message id.
-  // For legacy Card 1.0 bodies Feishu requires card.open_ids to be non-empty
-  // (otherwise code 300090 "openid empty"). Template/CardKit updates do not
-  // need it, but adding it to plain 1.0 raw cards is the safest delayed-update
-  // default and matches lark-cli's card.action.trigger reference.
-  if (
-    operatorOpenId
-    && !(card as any).schema
-    && (card as any).type !== 'template'
-    && !Array.isArray((card as any).open_ids)
-  ) {
-    return { ...(card as Record<string, unknown>), open_ids: [operatorOpenId] };
-  }
-  return card as Record<string, unknown>;
+  // Use it only for card shapes whose delayed-update semantics are shared:
+  // template cards (e.g. the FaaS confirm flow fixed here) and Card 2.0. For
+  // legacy Card 1.0, Feishu requires `open_ids`, whose value scopes visibility
+  // to only those users. Injecting the click operator would make shared group
+  // state cards update for the clicker only, so keep Card 1.0 on message.patch.
+  if ((card as any).type === 'template') return card as Record<string, unknown>;
+  if ((card as any).schema === '2.0') return card as Record<string, unknown>;
+  return undefined;
 }
 
 async function patchTimedOutCardActionResult(larkAppId: string, data: any, shapedResult: any): Promise<void> {
@@ -1698,17 +1698,36 @@ async function patchTimedOutCardActionResult(larkAppId: string, data: any, shape
   if (!card) return;
   const raw = card.type === 'raw' ? card.data : card;
   const token = cardActionToken(data);
+  let tokenError: unknown;
   if (token) {
-    const delayedCard = normalizeDelayedUpdateCard(raw, cardActionOperatorOpenId(data));
+    const delayedCard = delayedUpdateCardFromRaw(raw);
     if (delayedCard) {
-      await updateInteractiveCardByToken(larkAppId, token, delayedCard);
-      return;
+      try {
+        await updateInteractiveCardByToken(larkAppId, token, delayedCard);
+        return;
+      } catch (err) {
+        tokenError = err;
+        logger.warn(`[card-action] token card update failed; falling back to message.patch: ${cardActionPatchErrorDetail(err)}`);
+      }
     }
   }
-  if (!messageId) return;
+  if (!messageId) {
+    if (tokenError) throw tokenError;
+    return;
+  }
   const body = serializeRawCardForPatch(raw);
-  if (!body) return;
-  await updateMessage(larkAppId, messageId, body);
+  if (!body) {
+    if (tokenError) throw tokenError;
+    return;
+  }
+  try {
+    await updateMessage(larkAppId, messageId, body);
+  } catch (err) {
+    if (tokenError) {
+      throw new Error(`token card update failed (${cardActionPatchErrorDetail(tokenError)}); fallback message.patch failed (${cardActionPatchErrorDetail(err)})`);
+    }
+    throw err;
+  }
 }
 
 async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: EventHandlers): Promise<any> {
@@ -1744,14 +1763,7 @@ async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: E
         setTimeout(() => {
           void patchTimedOutCardActionResult(larkAppId, data, result)
             .catch(err => {
-              const shape = extractLarkErrorShape(err);
-              const responseData = (err as any)?.response?.data;
-              logger.warn(
-                `Failed to patch deferred card action result: ${shape.message}`
-                + `${shape.httpStatus !== undefined ? ` httpStatus=${shape.httpStatus}` : ''}`
-                + `${shape.larkCode !== undefined ? ` larkCode=${shape.larkCode}` : ''}`
-                + `${responseData ? ` response=${JSON.stringify(responseData).slice(0, 1000)}` : ''}`,
-              );
+              logger.warn(`Failed to patch deferred card action result: ${cardActionPatchErrorDetail(err)}`);
             });
         }, 0);
       }
@@ -1765,7 +1777,9 @@ async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: E
             .catch(err => logger.warn(`Failed to run deferred card continuation: ${err}`));
         }, 0);
       }
-      if (result.deferredCard) return result.toast ? { toast: result.toast } : {};
+      if (result.deferredCard) return result.toast
+        ? { toast: result.toast, [CARD_ACTION_DEFERRED_CARD_SCHEDULED]: true }
+        : { [CARD_ACTION_DEFERRED_CARD_SCHEDULED]: true };
       const { afterAck: _afterAck, ...response } = result;
       return response;
     })
@@ -1776,7 +1790,7 @@ async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: E
 
   void work.then(result => {
     if (!timedOut || !result) return;
-    if (!result.card && result.toast) {
+    if (!result.card && result.toast && !(result as any)[CARD_ACTION_DEFERRED_CARD_SCHEDULED]) {
       // A toast-only result can't be re-surfaced after we already ACKed with the
       // generic "后台处理中" toast: toasts ride the synchronous callback response,
       // and the message-update API only patches the card. Log rather than drop.
