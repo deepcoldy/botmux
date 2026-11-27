@@ -586,4 +586,20 @@ describe('summarizeUserText', () => {
     const bare = '继续看一下这个 PR\n\n<botmux_formatting>短进度优先纯文本；强调仅包短词或无中文标点的短语，标点和后文放在 `**` 外。</botmux_formatting>';
     expect(summarizeUserText(bare)).toBe('继续看一下这个 PR');
   });
+
+  it('hook 模式无 <user_message> 外壳时剥掉开场与尾部 BotMux 上下文块体，且保留内联 <user_message> 内的用户原话', () => {
+    const hookOpening = [
+      '<role context="group">On-call assistant role</role>',
+      '<summary_memory>Long summary memory</summary_memory>',
+      '<chat_context_policy>Policy instructions</chat_context_policy>',
+      '<shared_group_context>Earlier chat log</shared_group_context>',
+      '排查订单超时告警',
+      '<sender name="User" open_id="ou_1" />',
+      '<botmux_skills mode="priority">- alert-triage</botmux_skills>',
+    ].join('\n\n');
+    expect(summarizeUserText(hookOpening)).toBe('排查订单超时告警');
+
+    // Inline <user_message> discussing <role> keeps user prose intact (only tags removed).
+    expect(summarizeUserText('<user_message>\n检查 <role> 块里的内容\n</user_message>')).toBe('检查 块里的内容');
+  });
 });

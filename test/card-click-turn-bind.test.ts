@@ -11,12 +11,19 @@ const mocks = vi.hoisted(() => ({
   sendWorkerInput: vi.fn(() => true),
   getIdentity: vi.fn(),
   createSession: vi.fn(),
+  closeSession: vi.fn(),
   updateSession: vi.fn(),
   isTeamBot: vi.fn(() => false),
   secretPaths: [] as string[],
   assistantSpawn: { kind: 'off' } as { kind: 'off' } | { kind: 'unclaimed' } | { kind: 'owner'; openId: string; workDir: string },
+  multiUserGroupsOff: false,
+  soloGroupAdmission: vi.fn(async (): Promise<{ ok: boolean; reason?: string }> => ({ ok: true })),
 }));
-vi.mock('../src/core/assistant-spawn.js', () => ({ resolveAssistantSpawn: () => mocks.assistantSpawn }));
+vi.mock('../src/core/assistant-spawn.js', () => ({
+  resolveAssistantSpawn: () => mocks.assistantSpawn,
+  assistantMultiUserGroupsOff: () => mocks.multiUserGroupsOff,
+  assistantSoloGroupAdmission: (...a: unknown[]) => mocks.soloGroupAdmission(...a),
+}));
 
 vi.mock('../src/core/worker-pool.js', () => ({
   dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
@@ -33,6 +40,7 @@ vi.mock('../src/core/session-manager.js', () => ({
 }));
 vi.mock('../src/services/session-store.js', () => ({
   createSession: mocks.createSession,
+  closeSession: mocks.closeSession,
   updateSession: mocks.updateSession,
 }));
 vi.mock('../src/im/lark/identity-cache.js', () => ({
@@ -87,8 +95,12 @@ afterEach(() => {
   mocks.isTeamBot.mockReset();
   mocks.isTeamBot.mockReturnValue(false);
   mocks.createSession.mockReset();
+  mocks.closeSession.mockReset();
   mocks.secretPaths.length = 0;
   mocks.assistantSpawn = { kind: 'off' };
+  mocks.multiUserGroupsOff = false;
+  mocks.soloGroupAdmission.mockReset();
+  mocks.soloGroupAdmission.mockResolvedValue({ ok: true });
   delete process.env.BOTMUX_XPI_ENABLED;
 });
 
@@ -245,6 +257,197 @@ describe('card click turn binder', () => {
     const refused = await run('nonce-assistant-unc1');
     expect(refused.started.ok).toBe(false);
     expect(refused.created).toBeUndefined();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('assistant mode without multi-user groups: a click runs only while the owner is the one person in the group', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'card-click-bind-'));
+    dirs.push(dataDir);
+    mocks.multiUserGroupsOff = true;
+    try {
+      const click = async (activeSessions: Map<string, DaemonSession>, nonce: string) => {
+        const binder = createCardClickTurnBinder({
+          activeSessions, dataDir: () => dataDir, noteTurnReceived: async () => undefined, beginNewTurn: () => undefined,
+          trustedCallerForInboundTurn: async (_app, openId) => ({ requestUserOpenId: openId, requestLarkAppId: 'cli_app', senderType: 'user' as const }),
+        });
+        const issued = issueCardClickTurn({ secret: 'secret', larkAppId: 'cli_app', prompt: 'p', chatId: 'oc_chat', workingDir: '/tmp', now: Date.now(), nonce });
+        if (!issued.ok) throw new Error(issued.error);
+        return binder.accept({ larkAppId: 'cli_app', operatorOpenId: 'ou_clicker', payload: issued.payload, sig: issued.sig });
+      };
+      mocks.assistantSpawn = { kind: 'owner', openId: 'ou_owner_a', workDir: '/home/u/ou_owner_a/work' };
+      mocks.soloGroupAdmission.mockResolvedValue({ ok: false, reason: 'owner_absent' });
+      const fresh = new Map<string, DaemonSession>();
+      expect(await click(fresh, 'nonce-assistant-grp1')).toEqual({ ok: false, reason: 'assistant_group' });
+      expect(fresh.size).toBe(0);
+      const ds = session();
+      const live = new Map([['oc_chat::cli_app', ds]]);
+      expect(await click(live, 'nonce-assistant-grp2')).toEqual({ ok: false, reason: 'assistant_group' });
+      expect(mocks.soloGroupAdmission).toHaveBeenCalledWith('cli_app', 'oc_chat');
+      expect(mocks.sendWorkerInput).not.toHaveBeenCalled();
+      expect(mocks.forkWorker).not.toHaveBeenCalled();
+
+      mocks.soloGroupAdmission.mockResolvedValue({ ok: true });
+      const accepted = await click(live, 'nonce-assistant-grp3');
+      expect(accepted.ok).toBe(true);
+    } finally {
+      mocks.multiUserGroupsOff = false;
+      mocks.assistantSpawn = { kind: 'off' };
+    }
+  });
+
+  it('rechecks membership after accept before injecting an existing session', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'card-click-bind-'));
+    dirs.push(dataDir);
+    mocks.multiUserGroupsOff = true;
+    mocks.assistantSpawn = { kind: 'owner', openId: 'ou_owner', workDir: '/home/u/ou_owner/work' };
+    mocks.soloGroupAdmission.mockResolvedValue({ ok: true });
+    const ds = session();
+    const binder = createCardClickTurnBinder({
+      activeSessions: new Map([['oc_chat::cli_app', ds]]),
+      dataDir: () => dataDir,
+      noteTurnReceived: async () => undefined,
+      beginNewTurn: () => undefined,
+      trustedCallerForInboundTurn: async (_app, openId) => ({ requestUserOpenId: openId, requestLarkAppId: 'cli_app', senderType: 'user' as const }),
+    });
+    const issued = issueCardClickTurn({ secret: 'secret', larkAppId: 'cli_app', sessionId: ds.session.sessionId, prompt: 'p', now: Date.now(), nonce: 'nonce-assistant-race' });
+    if (!issued.ok) throw new Error(issued.error);
+    const accepted = await binder.accept({ larkAppId: 'cli_app', operatorOpenId: 'ou_owner', payload: issued.payload, sig: issued.sig });
+    expect(accepted.ok).toBe(true);
+    if (!accepted.ok) return;
+
+    mocks.soloGroupAdmission.mockResolvedValue({ ok: false, reason: 'multi_user' });
+    expect(await accepted.run()).toEqual({ ok: false, reason: 'delivery_failed' });
+    expect(mocks.sendWorkerInput).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(ds.activeInteractiveTurn).toBeUndefined();
+    expect(mocks.closeSession).not.toHaveBeenCalled();
+  });
+
+  it('discards a newly created empty session when the final gate refuses', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'card-click-bind-'));
+    dirs.push(dataDir);
+    mocks.multiUserGroupsOff = true;
+    mocks.assistantSpawn = { kind: 'owner', openId: 'ou_owner_a', workDir: '/home/u/ou_owner_a/work' };
+    mocks.soloGroupAdmission.mockResolvedValue({ ok: true });
+    mocks.createSession.mockImplementation((chatId: string, root: string, title: string, chatType: 'group' | 'p2p', scope: 'chat') => ({
+      sessionId: 'created-session-final-refusal', chatId, rootMessageId: root, title, chatType, scope, status: 'active',
+    }));
+    const activeSessions = new Map<string, DaemonSession>();
+    const binder = createCardClickTurnBinder({
+      activeSessions, dataDir: () => dataDir, noteTurnReceived: async () => undefined, beginNewTurn: () => undefined,
+      trustedCallerForInboundTurn: async (_app, openId) => ({ requestUserOpenId: openId, requestLarkAppId: 'cli_app', senderType: 'user' as const }),
+    });
+    const issued = issueCardClickTurn({ secret: 'secret', larkAppId: 'cli_app', prompt: 'p', chatId: 'oc_new', workingDir: '/tmp', now: Date.now(), nonce: 'nonce-assistant-new-race' });
+    if (!issued.ok) throw new Error(issued.error);
+    const accepted = await binder.accept({ larkAppId: 'cli_app', operatorOpenId: 'ou_owner_a', payload: issued.payload, sig: issued.sig });
+    expect(accepted.ok).toBe(true);
+    if (!accepted.ok) return;
+    expect(activeSessions.size).toBe(1);
+
+    mocks.soloGroupAdmission.mockResolvedValue({ ok: false, reason: 'multi_user' });
+    expect(await accepted.run()).toEqual({ ok: false, reason: 'delivery_failed' });
+    expect(activeSessions.size).toBe(0);
+    expect(mocks.closeSession).toHaveBeenCalledWith('created-session-final-refusal');
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(mocks.sendWorkerInput).not.toHaveBeenCalled();
+  });
+
+  it('does not discard a session while another click is taking it over', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'card-click-bind-'));
+    dirs.push(dataDir);
+    mocks.multiUserGroupsOff = true;
+    mocks.assistantSpawn = { kind: 'owner', openId: 'ou_owner_a', workDir: '/home/u/ou_owner_a/work' };
+    mocks.soloGroupAdmission.mockResolvedValue({ ok: true });
+    mocks.createSession.mockImplementation((chatId: string, root: string, title: string, chatType: 'group' | 'p2p', scope: 'chat') => ({
+      sessionId: 'created-session-shared-click', chatId, rootMessageId: root, title, chatType, scope, status: 'active',
+    }));
+    const activeSessions = new Map<string, DaemonSession>();
+    let trustedCalls = 0;
+    let releaseSecond!: () => void;
+    const binder = createCardClickTurnBinder({
+      activeSessions,
+      dataDir: () => dataDir,
+      noteTurnReceived: async () => undefined,
+      beginNewTurn: () => undefined,
+      trustedCallerForInboundTurn: async (_app, openId) => {
+        trustedCalls++;
+        if (trustedCalls === 1) await new Promise<void>(resolve => { releaseSecond = resolve; });
+        return { requestUserOpenId: openId, requestLarkAppId: 'cli_app', senderType: 'user' as const };
+      },
+    });
+    const accept = async (nonce: string) => {
+      const issued = issueCardClickTurn({ secret: 'secret', larkAppId: 'cli_app', prompt: 'p', chatId: 'oc_new', workingDir: '/tmp', now: Date.now(), nonce });
+      if (!issued.ok) throw new Error(issued.error);
+      const accepted = await binder.accept({ larkAppId: 'cli_app', operatorOpenId: 'ou_owner_a', payload: issued.payload, sig: issued.sig });
+      expect(accepted.ok).toBe(true);
+      if (!accepted.ok) throw new Error('accept failed');
+      return accepted;
+    };
+    const first = await accept('nonce-shared-click-first');
+    const second = await accept('nonce-shared-click-second');
+    const secondRun = second.run();
+    await vi.waitFor(() => expect(trustedCalls).toBe(1));
+
+    mocks.soloGroupAdmission.mockResolvedValue({ ok: false, reason: 'multi_user' });
+    expect(await first.run()).toEqual({ ok: false, reason: 'delivery_failed' });
+    expect(activeSessions.size).toBe(1);
+    expect(mocks.closeSession).not.toHaveBeenCalled();
+
+    mocks.soloGroupAdmission.mockResolvedValue({ ok: true });
+    releaseSecond();
+    expect((await secondRun).ok).toBe(true);
+    expect(activeSessions.size).toBe(1);
+    expect(mocks.closeSession).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).toHaveBeenCalledOnce();
+  });
+
+  it('refuses delivery when the accepted session was closed or replaced before the final send', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'card-click-bind-'));
+    dirs.push(dataDir);
+    mocks.multiUserGroupsOff = true;
+    mocks.assistantSpawn = { kind: 'owner', openId: 'ou_owner', workDir: '/home/u/ou_owner/work' };
+    mocks.soloGroupAdmission.mockResolvedValue({ ok: true });
+    const ds = session();
+    const activeSessions = new Map([['oc_chat::cli_app', ds]]);
+    const binder = createCardClickTurnBinder({
+      activeSessions, dataDir: () => dataDir, noteTurnReceived: async () => undefined, beginNewTurn: () => undefined,
+      trustedCallerForInboundTurn: async (_app, openId) => ({ requestUserOpenId: openId, requestLarkAppId: 'cli_app', senderType: 'user' as const }),
+    });
+    const issued = issueCardClickTurn({ secret: 'secret', larkAppId: 'cli_app', sessionId: ds.session.sessionId, prompt: 'p', now: Date.now(), nonce: 'nonce-session-replaced' });
+    if (!issued.ok) throw new Error(issued.error);
+    const accepted = await binder.accept({ larkAppId: 'cli_app', operatorOpenId: 'ou_owner', payload: issued.payload, sig: issued.sig });
+    expect(accepted.ok).toBe(true);
+    if (!accepted.ok) return;
+    activeSessions.clear();
+    expect(await accepted.run()).toEqual({ ok: false, reason: 'delivery_failed' });
+    expect(mocks.sendWorkerInput).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('keeps a failed-to-close empty session registered for a later retry', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'card-click-bind-'));
+    dirs.push(dataDir);
+    mocks.multiUserGroupsOff = true;
+    mocks.assistantSpawn = { kind: 'owner', openId: 'ou_owner_a', workDir: '/home/u/ou_owner_a/work' };
+    mocks.soloGroupAdmission.mockResolvedValue({ ok: true });
+    mocks.createSession.mockImplementation((chatId: string, root: string, title: string, chatType: 'group' | 'p2p', scope: 'chat') => ({
+      sessionId: 'created-session-close-failure', chatId, rootMessageId: root, title, chatType, scope, status: 'active',
+    }));
+    mocks.closeSession.mockImplementation(() => { throw new Error('sqlite busy'); });
+    const activeSessions = new Map<string, DaemonSession>();
+    const binder = createCardClickTurnBinder({
+      activeSessions, dataDir: () => dataDir, noteTurnReceived: async () => undefined, beginNewTurn: () => undefined,
+      trustedCallerForInboundTurn: async (_app, openId) => ({ requestUserOpenId: openId, requestLarkAppId: 'cli_app', senderType: 'user' as const }),
+    });
+    const issued = issueCardClickTurn({ secret: 'secret', larkAppId: 'cli_app', prompt: 'p', chatId: 'oc_new', workingDir: '/tmp', now: Date.now(), nonce: 'nonce-close-failure' });
+    if (!issued.ok) throw new Error(issued.error);
+    const accepted = await binder.accept({ larkAppId: 'cli_app', operatorOpenId: 'ou_owner_a', payload: issued.payload, sig: issued.sig });
+    expect(accepted.ok).toBe(true);
+    if (!accepted.ok) return;
+    mocks.soloGroupAdmission.mockResolvedValue({ ok: false, reason: 'multi_user' });
+    expect(await accepted.run()).toEqual({ ok: false, reason: 'delivery_failed' });
+    expect(mocks.closeSession).toHaveBeenCalledWith('created-session-close-failure');
+    expect(activeSessions.size).toBe(1);
     expect(mocks.forkWorker).not.toHaveBeenCalled();
   });
 

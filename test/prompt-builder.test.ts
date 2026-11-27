@@ -1500,7 +1500,7 @@ describe('builder locale fallback when the caller omits locale', () => {
 
 
 describe('per-bot zero prompt injection', () => {
-  afterEach(() => { delete mockBotConfig.promptInjection; delete mockBotConfig.envelopeInjection; mockGetSession.mockReset(); });
+  afterEach(() => { delete mockBotConfig.promptInjection; mockGetSession.mockReset(); });
 
   it.each(['default', 'none'] as const)('keeps persisted %s policy through bot toggles and cold resume', mode => {
     mockGetSession.mockReturnValue({ sessionId: 'frozen', promptInjection: mode });
@@ -1528,7 +1528,6 @@ describe('per-bot zero prompt injection', () => {
   for (const cliId of ['codex', 'claude-code', 'traex', 'coco', 'hermes', 'mtr', 'pi', 'oh-my-pi', 'ebsd', 'grok'] as const) {
     it(`${cliId}: opening, follow-up, hook and refork preserve only the task and attachment facts`, () => {
       mockBotConfig.promptInjection = 'none';
-      mockBotConfig.envelopeInjection = 'auto';
       const task = '检查 <botmux_reminder> 字样，保留用户原文';
       const opts = { larkAppId: 'app_test', chatId: 'oc_group', whiteboardId: 'board',
         cliId, sessionBackendType: 'pty' as const, turnId: 'om_turn',

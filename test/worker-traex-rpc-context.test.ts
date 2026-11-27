@@ -7,6 +7,7 @@ import { TurnExecutionClock } from '../src/services/turn-execution-clock.js';
 import { pendingInputMayFlush } from '../src/utils/pending-input-queue.js';
 import { workerSubmitHarness } from './helpers/worker-submit-harness.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { parseScheduledTurnId } from '../src/core/scheduled-turn-provenance.js';
 
 const prompt = (role: string, text: string) =>
   `<role>${role}</role>\n\n<user_message>${text}</user_message>`;
@@ -32,8 +33,11 @@ function rpcHarness() {
     lastInitConfig: { cliId: 'traex', codexRpcInput: true, cliSessionId: 'thread' },
     codexRpcEngine: {
       activeThreadId: 'thread', activeNativeTurnId: undefined,
+      canSteerTurn: () => false,
       sendTurn: acceptingSendTurn(),
     },
+    rpcTurnsAwaitingActivation: new Map(), rpcActiveOwners: new Map(),
+    settlingRpcTerminalOwners: new Map(), rpcTerminalHydrationOwners: new Map(),
     installAwaitingRpcActivation: vi.fn(),
     clearAwaitingRpcActivation: vi.fn(),
     runAfterAmbiguousSubmissionWrites: async (_backend: unknown, action: () => unknown) => action(),
@@ -47,6 +51,9 @@ function rpcHarness() {
     maybeQueuePostSubmitNativeSessionTitle: () => false,
     stampMojoTurnMark: vi.fn(),
   });
+  h.scope.hybridRpcInputMaySteer = loadWorkerFunction('hybridRpcInputMaySteer', h.scope);
+  h.scope.rpcTurnOwnerKey = loadWorkerFunction('rpcTurnOwnerKey', h.scope);
+  h.scope.hybridRpcTurnBlocksAdministrativeInput = loadWorkerFunction('hybridRpcTurnBlocksAdministrativeInput', h.scope);
   h.scope.publishTraexNativeContextReceipt = loadWorkerFunction('publishTraexNativeContextReceipt', h.scope);
   h.scope.invalidateTraexNativeContextReceipt = loadWorkerFunction('invalidateTraexNativeContextReceipt', h.scope);
   return h;
@@ -60,6 +67,17 @@ function deadSocketEngine() {
   return engine;
 }
 
+function scheduledRpcTurn(h: ReturnType<typeof rpcHarness>, decisions: Array<'allow' | 'reject'>, onDecision?: () => void) {
+  const turnId = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+  Object.assign(h.scope.pendingMessages[0], {
+    turnId, dispatchAttempt: undefined,
+    scheduledRun: { taskId: 'a1b2c3d4', runId: 'run-1', turnId, trigger: 'scheduler' },
+  });
+  h.scope.requestScheduledInputAdmission = vi.fn()
+    .mockImplementation(async () => { onDecision?.(); return decisions.shift() ?? 'allow'; });
+  return h.scope.pendingMessages[0];
+}
+
 /** Real per-turn submission bookkeeping, so a half-committed write is observable. */
 function withRealSubmissionScope(h: ReturnType<typeof rpcHarness>) {
   const scope = new WorkerSessionEventScope({ appId: 'cli_app', sessionId: 'sid' } as any, { workerId: 'w1', generation: 1 } as any);
@@ -71,6 +89,37 @@ function withRealSubmissionScope(h: ReturnType<typeof rpcHarness>) {
 }
 
 describe('actual worker TraeX RPC write edge', () => {
+  it('applies the late scheduled rejection before an unsettled native lifecycle can retain the input', async () => {
+    const h = rpcHarness();
+    const scheduled = scheduledRpcTurn(h, ['allow', 'reject'],
+      () => h.scope.settlingRpcTerminalOwners.set('another-owner', {}));
+    await h.flush();
+    expect(h.scope.requestScheduledInputAdmission).toHaveBeenCalledTimes(2);
+    expect(h.scope.codexRpcEngine.sendTurn).not.toHaveBeenCalled();
+    expect(h.scope.pendingMessages).toEqual([]);
+    expect(h.scope.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'turn_input_rejected', turnId: scheduled.turnId,
+    }));
+    expect(h.scope.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      message: expect.stringContaining('RPC 消息尚未发送'),
+    }));
+  });
+
+  it('retains the exact scheduled FIFO head when native lifecycle settling rejects a fully admitted write', async () => {
+    const h = rpcHarness();
+    const scheduled = scheduledRpcTurn(h, ['allow', 'allow'],
+      () => h.scope.settlingRpcTerminalOwners.set('another-owner', {}));
+    await h.flush();
+    expect(h.scope.requestScheduledInputAdmission).toHaveBeenCalledTimes(2);
+    expect(h.scope.codexRpcEngine.sendTurn).not.toHaveBeenCalled();
+    expect(h.scope.pendingMessages).toEqual([scheduled]);
+    expect(h.scope.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'turn_input_rejected' }));
+    expect(h.scope.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'user_notify', turnId: scheduled.turnId,
+      message: expect.stringContaining('RPC 消息尚未发送'),
+    }));
+  });
+
   it('publishes accepted context only after the native ACK', async () => {
     const h = rpcHarness();
     h.scope.pendingMessages[0].content = prompt('A', 'hello');
@@ -280,6 +329,7 @@ function engageHarness(opts: {
   const noop = () => undefined;
   const base: Record<string, any> = {
     ...context,
+    parseScheduledTurnId,
     CodexRpcEngine: FakeEngine,
     CliSpawnSupersededError: class extends Error {},
     CodexRpcEngineDiedDuringEngagementError: class extends Error {},

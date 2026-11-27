@@ -27,7 +27,18 @@ import {
   runFailedTurnRewindMaintenance,
   transcriptTurnFailedWithoutOutput,
 } from '../src/core/failed-turn-rewind.js';
+import { captureTraexPromptCheckpoint, inspectTraexFailedPrompt, withTraexFailedPrompt } from '../src/services/traex-prompt-checkpoint.js';
+import { resolveTraexImagePurgeTarget } from '../src/services/traex-tool-image-recovery.js';
 import type { FailedTurnRewindDirective } from '../src/types.js';
+import { config } from '../src/config.js';
+
+import {
+  claimPromptContext,
+  fingerprintPromptText,
+  prefixOf,
+  removePromptContextForTurn,
+  writePromptContext,
+} from '../src/services/prompt-context-store.js';
 
 const SID = '858ca892-1234-4abc-9def-0123456789ab';
 
@@ -88,6 +99,7 @@ function setup(transcript: string, overrides: Record<string, unknown> = {}, d = 
     isRemoteBackendType: () => false,
     effectiveBackendType: 'tmux',
     cliRestartInProgress: false,
+    cliRestartEpoch: 0,
     lastResolvedSandboxMode: 'off',
     isPromptReady: true,
     isFlushing: false,
@@ -133,7 +145,10 @@ function setup(transcript: string, overrides: Record<string, unknown> = {}, d = 
   };
   // The real restart fences input synchronously: from here on a message waits
   // in the queue for the replacement CLI.
-  const restartCliProcess = vi.fn(async (_reason: string, _opts: RestartOpts) => { scope.cliRestartInProgress = true; });
+  const restartCliProcess = vi.fn(async (_reason: string, _opts: RestartOpts) => {
+    scope.cliRestartEpoch = (scope.cliRestartEpoch as number) + 1;
+    scope.cliRestartInProgress = true;
+  });
   scope.restartCliProcess ??= restartCliProcess;
   scope.saveUnsentInputsForSuccessor ??= loadWorkerFunction('saveUnsentInputsForSuccessor', scope);
   const start = loadWorkerFunction<(turnId: string | undefined, d: FailedTurnRewindDirective, enqueue: () => void) => void>(
@@ -207,6 +222,92 @@ describe('startFailedTurnRewind', () => {
     expect(reports()).toEqual([expect.objectContaining({
       type: 'failed_turn_rewind', turnId: 'trg_new', failedTurnId: 'board:app:hint-1', outcome: 'rewound',
     })]);
+  });
+
+  it('retires an inline merge sidecar only after the rewritten input is accepted', async () => {
+    const oldEnvelope = '<sender name="OLD_ENVELOPE" />';
+    const newEnvelope = '<sender name="NEW_ENVELOPE" />';
+    const d = directive({
+      content: `${oldEnvelope}\n\n${FAILED_INPUT}\n\n${newEnvelope}\n\n继续`,
+      inlineEnvelope: true,
+    });
+    const { pendingMessages, cutAfterExit, settle } = setup(failedTranscript(), {}, d);
+    const dir = join(process.env.SESSION_DATA_DIR!, 'prompt-ctx', 'sess-rewind');
+    writePromptContext('sess-rewind', 'trg_new', '继续', newEnvelope);
+    try {
+      expect(readdirSync(dir)).toHaveLength(1);
+      await cutAfterExit();
+      expect(pendingMessages).toEqual([{ content: d.content, turnId: 'trg_new' }]);
+      // Before the new generation accepts the rewrite, rollback must still be possible.
+      expect(readdirSync(dir)).toHaveLength(1);
+      settle('spawned');
+      expect(existsSync(dir) ? readdirSync(dir) : []).toHaveLength(0);
+    } finally {
+      removePromptContextForTurn('sess-rewind', 'trg_new');
+    }
+  });
+
+  it('retires an inline sidecar when a cut message hands off before normal settlement', async () => {
+    const newEnvelope = '<sender name="NEW_ENVELOPE" />';
+    const d = directive({ content: `${newEnvelope}\n\n${FAILED_INPUT}\n\n继续`, inlineEnvelope: true });
+    const { cutAfterExit, goAway, successorInputs, reports } = setup(failedTranscript(), {}, d);
+    const dir = join(process.env.SESSION_DATA_DIR!, 'prompt-ctx', 'sess-rewind');
+    writePromptContext('sess-rewind', 'trg_new', '继续', newEnvelope);
+    try {
+      await cutAfterExit();
+      goAway();
+      expect(successorInputs()).toEqual([{ content: d.content, turnId: 'trg_new' }]);
+      expect(existsSync(dir) ? readdirSync(dir) : []).toHaveLength(0);
+      expect(reports()).toEqual([expect.objectContaining({ outcome: 'rewound', inlineEnvelope: true })]);
+    } finally {
+      removePromptContextForTurn('sess-rewind', 'trg_new');
+    }
+  });
+
+  it('keeps the original sidecar when an inline merge is rolled back after a failed respawn', async () => {
+    const newEnvelope = '<sender name="NEW_ENVELOPE" />';
+    const d = directive({ content: `${newEnvelope}\n\n${FAILED_INPUT}\n\n继续`, inlineEnvelope: true });
+    const original = failedTranscript();
+    const { jsonl, cutAfterExit, settle } = setup(original, {}, d);
+    writePromptContext('sess-rewind', 'trg_new', '继续', newEnvelope);
+    try {
+      await cutAfterExit();
+      settle('failed');
+      expect(readFileSync(jsonl, 'utf8')).toBe(original);
+      expect(claimPromptContext(
+        'sess-rewind', 'trg_new', fingerprintPromptText('继续'), prefixOf('继续'),
+      )).toBe(newEnvelope);
+    } finally {
+      removePromptContextForTurn('sess-rewind', 'trg_new');
+    }
+  });
+
+  it('falls back to inline hand-off when restoring a rekeyed resend sidecar also fails', async () => {
+    const envelope = '<botmux_reminder>ROLLBACK_WRITE_FAILURE_ENVELOPE</botmux_reminder>';
+    const d = directive({
+      mode: 'resend', content: FAILED_INPUT, hookEnvelope: envelope,
+    });
+    const { cutAfterExit, settle, successorInputs } = setup(failedTranscript(), {}, d);
+    const originalDataDir = config.session.dataDir;
+    const blockedRoot = mkdtempSync(join(tmpdir(), 'botmux-pctx-blocked-'));
+    roots.push(blockedRoot);
+    const blocked = join(blockedRoot, 'not-a-directory');
+    writeFileSync(blocked, 'x');
+    writePromptContext('sess-rewind', 'trg_new', '继续', envelope);
+    try {
+      await cutAfterExit();
+      // Only the sidecar store moves onto an unwritable shape; transcript
+      // put-back and the unsent-input journal retain their original paths.
+      (config.session as any).dataDir = blocked;
+      settle('failed');
+      expect(successorInputs()).toEqual([{ content: `${envelope}\n\n继续`, turnId: 'trg_new' }]);
+      expect(claimPromptContext(
+        'sess-rewind', 'trg_new', fingerprintPromptText('继续'), prefixOf('继续'),
+      )).toBeUndefined();
+    } finally {
+      (config.session as any).dataDir = originalDataDir;
+      removePromptContextForTurn('sess-rewind', 'trg_new');
+    }
   });
 
   it('carries on the skill catalog the worker appended to the cut turn when it wrote it', async () => {
@@ -841,4 +942,146 @@ describe('turnFailedWithoutOutput', () => {
     expect(check(failedTranscript(), {}, 'write_input_threw')).toBe(false);
     expect(check(failedTranscript(), { lastInitConfig: { cliId: 'codex' } })).toBe(false);
   });
+});
+
+describe('TRAE checkpoint worker transaction', () => {
+  const prefix = line({ type: 'session_meta', payload: { id: SID } }) + line({ type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'earlier task' }] } });
+  const failed = line({ type: 'event_msg', payload: { type: 'user_message', message: FAILED_INPUT } })
+    + line({ type: 'event_msg', payload: { type: 'task_complete', error: { message: 'failed image' }, last_agent_message: null } });
+  function native(overrides: Record<string, unknown> = {}) {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-traex-worker-retry-')); roots.push(root);
+    const path = join(root, `rollout-test-${SID}.jsonl`); writeFileSync(path, prefix);
+    const checkpoint = captureTraexPromptCheckpoint(path, root)!; appendFileSync(path, failed);
+    const h = setup('', { lastInitConfig: { cliId: 'traex' }, codexBridgeRolloutPath: path, traeSessionsRoot: () => root,
+      resolveTraexImagePurgeTarget, inspectTraexFailedPrompt, withTraexFailedPrompt, rewindBackupDirForSession,
+      ...overrides,
+    }, directive({ mode: 'edit', content: 'edited request', traexPromptCheckpoint: checkpoint, requireRewind: true }));
+    return { ...h, path, root, checkpoint };
+  }
+  it('resumes the same native session and writes exactly the edited request after cutting', async () => {
+    const h = native(); expect(h.restartOpts().exactResumeSessionId).toBe(SID);
+    await h.cutAfterExit(); expect(readFileSync(h.path, 'utf8')).toBe(prefix);
+    expect(h.pendingMessages[0].content).toBe('edited request');
+    h.settle('spawned'); expect(h.reachWriteEdge()).toBe('write');
+    expect(h.reports()).toEqual([expect.objectContaining({ outcome: 'rewound' })]);
+  });
+  it('does not enqueue a strict retry when the worker is busy', () => {
+    const h = native({ isPromptReady: false });
+    expect(h.enqueue).not.toHaveBeenCalled(); expect(h.written).toEqual([]);
+    expect(h.restartCliProcess).not.toHaveBeenCalled();
+    expect((h.scope.send as any).mock.calls.map(([m]: any[]) => m)).toContainEqual(expect.objectContaining({ type: 'turn_input_rejected' }));
+  });
+  it('rejects a strict retry after a concurrent new turn without writing the replacement', async () => {
+    const h = native(); appendFileSync(h.path, line({ type: 'event_msg', payload: { type: 'user_message', message: 'new turn' } }));
+    const before = readFileSync(h.path); await h.cutAfterExit();
+    expect(readFileSync(h.path)).toEqual(before); expect(h.pendingMessages).toEqual([]);
+    h.settle('spawned'); expect(h.written).toEqual([]);
+    expect(h.reports()).toEqual([expect.objectContaining({ outcome: 'declined' })]);
+  });
+  it('keeps the original history and withholds a stopped retry during exit wait', async () => {
+    const h = native(); const before = readFileSync(h.path); expect(h.stop()).toBe(true);
+    await h.cutAfterExit(); h.settle('spawned');
+    expect(readFileSync(h.path)).toEqual(before); expect(h.pendingMessages).toEqual([]);
+  });
+  it('restores the failed turn and drops the retry when native respawn fails', async () => {
+    const h = native(); const before = readFileSync(h.path); await h.cutAfterExit(); h.settle('failed');
+    expect(readFileSync(h.path)).toEqual(before);
+    expect(h.successorInputs()).toEqual([]);
+  });
+  it('does not journal a retry when concurrent prefix changes prevent restoration after failed respawn', async () => {
+    const h = native(); await h.cutAfterExit();
+    writeFileSync(h.path, readFileSync(h.path, 'utf8').replace('earlier task', 'changed task'));
+    h.settle('failed');
+    expect(h.pendingMessages).toEqual([]); expect(h.successorInputs()).toEqual([]);
+  });
+  it('restores the failed turn and drops the retry when a different restart supersedes its replacement', async () => {
+    const h = native(); const before = readFileSync(h.path);
+    const backupDir = rewindBackupDirForSession(process.env.SESSION_DATA_DIR!, 'sess-rewind');
+    const priorBackups = new Set(existsSync(backupDir) ? readdirSync(backupDir) : []);
+    await h.cutAfterExit(); h.scope.backend = null; h.settle('superseded');
+    expect(h.restartCliProcess).toHaveBeenCalledTimes(2);
+    expect(readFileSync(h.path, 'utf8')).toBe(prefix);
+    await h.restartOpts(1).beforeRespawn!({ processScope: [] });
+    h.restartOpts(1).onRespawnSettled!('spawned');
+    expect(readFileSync(h.path)).toEqual(before);
+    expect(h.pendingMessages).toEqual([]); expect(h.successorInputs()).toEqual([]);
+    expect(h.reports()).toEqual([expect.objectContaining({ outcome: 'declined', reason: expect.stringMatching(/cut restored/) })]);
+    const backups = readdirSync(backupDir).filter(name => !priorBackups.has(name));
+    expect(backups).toHaveLength(1);
+    expect(readFileSync(join(backupDir, backups[0]!), 'utf8')).toBe(failed);
+  });
+  it('waits for a spawned winning CLI to exit before restoring a superseded cut', async () => {
+    const h = native(); const before = readFileSync(h.path); await h.cutAfterExit();
+    h.settle('superseded');
+    expect(h.restartCliProcess).toHaveBeenCalledTimes(2);
+    expect(h.restartOpts(1)).toMatchObject({ exactResumeSessionId: SID, preservePending: true });
+    expect(readFileSync(h.path, 'utf8')).toBe(prefix);
+    expect(h.pendingMessages).toHaveLength(1);
+    await h.restartOpts(1).beforeRespawn!({ pid: 4243, processScope: [4243] });
+    h.restartOpts(1).onRespawnSettled!('spawned');
+    expect(readFileSync(h.path)).toEqual(before);
+    expect(h.pendingMessages).toEqual([]); expect(h.successorInputs()).toEqual([]);
+    expect(h.reports()).toEqual([expect.objectContaining({ outcome: 'declined', reason: expect.stringMatching(/superseded after the cut; cut restored/) })]);
+  });
+  it('uses a detached winning process scope instead of treating backend=null as quiescent', async () => {
+    const wait = vi.fn().mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error('4243 is still alive'));
+    const h = native({ waitForProcessQuiescence: wait });
+    await h.cutAfterExit();
+    h.scope.backend = null;
+    h.scope.latestCliRetirement = { pid: 4243, processScope: [4243] };
+    h.scope.latestCliRetirementUncertain = false;
+    h.settle('superseded');
+    await h.restartOpts(1).beforeRespawn!({ processScope: [] });
+    expect(wait).toHaveBeenCalledTimes(2);
+    expect(wait.mock.calls[1][0]).toBe(4243);
+    expect(readFileSync(h.path, 'utf8')).toBe(prefix);
+    expect(h.reports()).toEqual([expect.objectContaining({ outcome: 'declined', reason: expect.stringMatching(/cut NOT restored/) })]);
+  });
+  it('does not cut after its restart loses ownership during the exit wait', async () => {
+    const h = native(); const before = readFileSync(h.path);
+    h.scope.cliRestartEpoch = (h.scope.cliRestartEpoch as number) + 1;
+    await h.cutAfterExit();
+    expect(readFileSync(h.path)).toEqual(before);
+    expect(h.pendingMessages).toEqual([]);
+    expect(h.reports()).toEqual([expect.objectContaining({ outcome: 'declined' })]);
+  });
+  it('revokes no-work proof for another generation, external delivery, or tool activity', () => {
+    const h = native();
+    const scope: Record<string, any> = { lastInitConfig: { cliId: 'traex' }, codexBridgeRolloutPath: h.path,
+      lastTraexPromptCheckpoint: { turnId: 'failed', generation: 1, checkpoint: h.checkpoint }, cliSpawnGeneration: 1,
+      lastWrittenCliInput: { turnId: 'failed', content: FAILED_INPUT }, rawInputWriteGeneration: 1,
+      lastWrittenCliInputRawGen: 1, webTerminalSubmitGeneration: 1, lastWrittenCliInputWebSubmitGen: 1,
+      readSendMarkers: () => [], traeSessionsRoot: () => h.root, inspectTraexFailedPrompt,
+      isRemoteBackendType: () => false,
+    };
+    const proof = loadWorkerFunction<(turn: string, code: string) => boolean>('turnFailedWithoutOutput', scope);
+    expect(proof('failed', 'traex_tool_image_upload_failed')).toBe(true);
+    scope.cliSpawnGeneration = 2; expect(proof('failed', 'traex_tool_image_upload_failed')).toBe(false);
+    scope.cliSpawnGeneration = 1; scope.readSendMarkers = () => [{ turnId: 'failed' }];
+    expect(proof('failed', 'traex_tool_image_upload_failed')).toBe(false);
+    scope.readSendMarkers = () => []; appendFileSync(h.path, line({ type: 'response_item', payload: { type: 'custom_tool_call', name: 'exec_command' } }));
+    expect(proof('failed', 'traex_tool_image_upload_failed')).toBe(false);
+  });
+});
+
+it('freezes the native rollout boundary before the actual input writer runs', async () => {
+  vi.useFakeTimers();
+  try {
+  const root = mkdtempSync(join(tmpdir(), 'botmux-checkpoint-write-edge-')); roots.push(root);
+  const path = join(root, `rollout-test-${SID}.jsonl`);
+  const prefix = line({ type: 'session_meta', payload: { id: SID } }); writeFileSync(path, prefix);
+  const h = workerSubmitHarness();
+  h.scope.codexBridgeRolloutPath = path;
+  h.scope.bridgeJsonlPath = undefined;
+  h.scope.traeSessionsRoot = () => root;
+  h.scope.cliAdapter.writeInput.mockImplementation(async () => {
+    expect(h.scope.lastTraexPromptCheckpoint).toMatchObject({ turnId: 'delivery', generation: 7,
+      checkpoint: { sessionId: SID, offset: Buffer.byteLength(prefix) } });
+    appendFileSync(path, line({ type: 'event_msg', payload: { type: 'user_message', message: 'payload' } }));
+    return { submitted: false, recheck: h.recheck };
+  });
+  await h.flush();
+  expect(h.scope.cliAdapter.writeInput, JSON.stringify(h.scope.log.mock.calls)).toHaveBeenCalledOnce();
+  expect(h.scope.lastTraexPromptCheckpoint.checkpoint.offset).toBe(Buffer.byteLength(prefix));
+  } finally { vi.clearAllTimers(); vi.useRealTimers(); }
 });

@@ -35,6 +35,51 @@ Check in order (PersonalAgent comes configured; normally you don't need to touch
 
 > To have an agent investigate, see "General troubleshooting approach" in [Common Pitfalls](/en/pitfalls): use `botmux logs` to find the launch command and reproduce it locally, then check the real error in the web terminal.
 
+#### Finish Open Platform setup manually {#manual-open-platform-setup}
+
+You need to finish the Open Platform configuration yourself when:
+
+- setup was run as `botmux setup --no-open-platform-auto`, explicitly skipping automatic configuration;
+- automatic configuration failed.
+
+Setup lists the remaining items and their links: enable bot capability, configure long-connection event subscriptions, import permissions, set the redirect URL, and create and publish a version. The full permission list is written to `~/.botmux/lark-scopes.json`. Choosing availability “Visible to me only” usually gets the version approved automatically. The checklist above covers the bot capability, `im.message.receive_v1`, `card.action.trigger`, and release required for ordinary messages.
+
+#### Let an AI run read-only diagnostics {#ai-diagnostics}
+
+Your installed AI CLI can inspect status and logs and suggest the most likely cause. First save the diagnostic task in a variable:
+
+```bash
+DIAG='botmux is not receiving messages in the Lark group. Diagnose read-only (do NOT change anything), run these in order and give the most likely cause + fix: botmux status (is the daemon running); botmux logs --lines 150 --no-follow (look for WebSocket connection failures, token/auth errors, permission errors 401/403/411/400, CLI spawn failures); cat ~/.botmux/bots.json (check AppID/Secret/CLI config); judge whether the long-lived WebSocket is blocked by a corporate network/proxy/firewall. Conclude at the end.'
+```
+
+Then run the line for your installed CLI:
+
+```bash
+claude -p "$DIAG" --allowedTools "Bash"   # Claude Code
+codex exec "$DIAG"                         # Codex
+coco  -p "$DIAG" --yolo                    # TRAE CLI 1.0 / CoCo (legacy)
+cursor-agent -p "$DIAG"                    # Cursor
+```
+
+All are non-interactive and print their conclusions before exiting. The `--allowedTools` / `--yolo` options only let the agent run commands to read logs.
+
+For manual troubleshooting, start with `botmux status`; after changing configuration, run `botmux restart`. If permissions are incomplete or the bot was built from an old app, recreate it with the latest `botmux setup` QR flow. If the long connection cannot get out, `botmux logs` usually shows a connection error. See [Common Pitfalls](/en/pitfalls) for more.
+
+#### Optional events: @ by editing, recall sync, disbanded groups {#optional-events}
+
+Missing any of these **does not affect ordinary messages**; only the related small feature. New bots subscribe to them automatically; for older bots, botmux tries to add them at startup using this machine's existing Open Platform login.
+
+| Event | Used for |
+|---|---|
+| `im.message.updated_v1` | Editing a message that didn't @ the bot to add the @, which then triggers a task |
+| `im.message.recalled_v1` | In group context sharing (`/context-sharing`), marking recalled messages in the record. Only added when that feature is on |
+| `im.chat.disbanded_v1` | Ending the bot's sessions in a group once it is disbanded (like `/close`: they can be resumed and worktrees are kept). Without it, those sessions are only closed at the next daemon restart |
+
+Things to note:
+
+- The startup top-up only adds events to the existing long-connection config. It does **not** change the delivery mode, change permissions, or publish a version. A log line saying the update request succeeded doesn't mean it's live. For production apps, review pending changes in the Open Platform, publish a version, then verify by editing a message that hasn't triggered the bot to add an @.
+- If the sender's chat access comes from team membership, an edited message also needs a contact lookup to get their `union_id`. This requires contact read permission (the default permission list includes `contact:user.id:readonly`) and the sender must be within the app's visibility scope. If the lookup fails, access is judged only by the original author's `open_id`; the editor's identity is never borrowed.
+
 ### B. Others can't use it
 
 botmux has two permission layers:

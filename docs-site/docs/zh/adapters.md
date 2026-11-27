@@ -54,6 +54,7 @@ macOS 上用 Codex / Codex App 时，如果 PATH 里找不到 `codex`，botmux �
 | `reasonix` | Reasonix | `reasonix` | 本地进程 | ✅ |
 | `zcode` | ZCode | `zcode` | 本地进程 | ✅ |
 | `doubao` | Doubao CLI（见 [Doubao 使用指南](https://github.com/deepcoldy/botmux/blob/master/docs/doubao.md)） | `doubao` | 本地进程 | ✅ |
+| `nca` | NCA | `nca` | 本地进程 | ✅ |
 | `pi` | Pi | `pi` | 本地进程 | ✅ |
 | `oh-my-pi` | Oh My Pi（Pi 的分支） | `omp` | 本地进程 | ✅ |
 | `aiden` | Aiden（原生 agent） | `aiden` | 本地进程 | |
@@ -152,6 +153,10 @@ Dashboard 的「Codex 运行时」可以直接切到「自定义兼容版」，�
 
 完整字段与更新来源见 [bots.json 的 Codex 兼容发行版章节](/bots-json#codex-runtime)。旧的 `cliPathOverride` 写法继续可用，但不会自动开启需要明确兼容声明的 Codex RPC 能力。
 
+### Codex 多账号与实例池 {#codex-instances}
+
+同一个 Bot 可以通过 `codexInstancePool` 配置多个 Codex 登录目录，并按静态权重分配给普通新会话；后续消息、失败重试和冷恢复沿用已保存的实例，不重新抽签。配置约束、初始化与登录命令、恢复语义见[会话级 Codex 实例](https://github.com/deepcoldy/botmux/blob/master/docs/codex-instances.md)。
+
 ## API / 远端适配器 {#remote-agents}
 
 下面四种适配器的 Agent 不跑在本机终端里。`riff`、`mojo`、`remote-runner` 会自动配上同名的会话后端，不用再写 `backendType`。
@@ -248,7 +253,7 @@ Remote Runner 通过 JSONL 协议接任意远端 Agent 平台。botmux 起一个
 
 ### 新接入的 CLI 怎么用 {#new-clis}
 
-Grok Build、Reasonix、OpenCode 2、DeepSeek Harness（dsh / dsh-tui）、MiniMax Code（mcode）、MiMoCode、CodeM、ZCode、Doubao 都是内置适配器，不用额外开关。启用步骤和换别的 CLI 一样（见上文[怎么给机器人换 CLI](#怎么给机器人换-cli)）：先在 daemon 的系统用户下装好对应命令并登录，然后把 Bot 的 `cliId` 设成下表的值。
+Grok Build、Reasonix、OpenCode 2、DeepSeek Harness（dsh / dsh-tui）、MiniMax Code（mcode）、MiMoCode、CodeM、ZCode、Doubao、NCA 都是内置适配器，不用额外开关。启用步骤和换别的 CLI 一样（见上文[怎么给机器人换 CLI](#怎么给机器人换-cli)）：先在 daemon 的系统用户下装好对应命令并登录，然后把 Bot 的 `cliId` 设成下表的值。
 
 | CLI | `cliId` | 默认命令 |
 |---|---|---|
@@ -261,6 +266,7 @@ Grok Build、Reasonix、OpenCode 2、DeepSeek Harness（dsh / dsh-tui）、MiniM
 | CodeM | `codem` | `codem` |
 | ZCode | `zcode` | `zcode` |
 | Doubao | `doubao` | `doubao` |
+| NCA | `nca` | `nca` |
 
 **Forge × TraeX**：想经 Forge 启动 TraeX，在 `botmux setup` 或 Dashboard 的 CLI 菜单里选「Forge x TraeX」，或在 `bots.json` 写 `"cliId": "traex", "cliLaunchMode": "forge-traex"`。botmux 会改用 `forge run --agent traex --agent-args ...` 启动，所以 `forge` 要在 PATH 上。这种启动方式只能配 `cliId: "traex"`，而且不能和 `wrapperCli`、`cliRuntime`、`cliPathOverride`、文件沙盒或 `readIsolation` 一起用，否则配置会被拒绝。
 
@@ -375,6 +381,12 @@ mircli mcp status
 ```bash
 MIRCLI_AUTO_START_MIRAMCP=0 botmux start
 ```
+
+### NCA
+
+先用运行 BotMux daemon 的同一账号安装和配置本地 `nca`，并确认它能正常回复，再在 Setup 选择 NCA 或设置 `cliId: "nca"`。已验证 NCA 3.0.20 的 PTY 和 tmux 会话。
+
+`model` 可填 NCA 原生 `/model` 可用的模型 ID。自定义会话目录时，将 `NCA_DATA_HOME` 配到 BotMux daemon 的环境，或在 `CLI_EXTRA_ARGS` 中传绝对路径 `--home /path/to/harness`。目录语义与原生 NCA 一致：`NCA_DATA_HOME=X` 使用 `X/harness`，而 `--home X` 直接使用 `X`。文件沙盒会把原生用户数据根（默认 `~/.nca`，或 `NCA_DATA_HOME` 指定目录）以及额外的 `--home` harness 目录绑定到宿主，保证登录态和历史持久化，且桥接能读取会话记录。BotMux 会匹配它发送的消息和 NCA 会话记录。在可操作终端执行 `/new` 后，从飞书发一条消息来绑定新线程，再关闭或恢复该会话。
 
 ### Doubao CLI
 

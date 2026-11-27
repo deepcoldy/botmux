@@ -16,7 +16,7 @@ import type { CliId } from '../src/adapters/cli/types.js';
 // Absolute fake binary path: resolveCommand returns absolute paths verbatim, so
 // constructing pi / oh-my-pi (which resolve eagerly) never shells out.
 const FAKE_BIN = '/usr/local/bin/fake-cli';
-const FILE_BACKED: CliId[] = ['codex', 'traex', 'coco', 'cursor', 'antigravity', 'pi', 'oh-my-pi', 'ebsd', 'grok', 'doubao'];
+const FILE_BACKED: CliId[] = ['codex', 'traex', 'coco', 'cursor', 'antigravity', 'pi', 'oh-my-pi', 'ebsd', 'grok', 'doubao', 'nca'];
 
 describe('bridgeSpecFor (static lookup) vs adapter.bridgeSpec', () => {
   it.each(FILE_BACKED)('%s: the adapter instance exposes exactly the spec the registry looks up', cliId => {

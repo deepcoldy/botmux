@@ -72,7 +72,8 @@ import { tryHandleChatTabsCommand } from './chat-tabs-command.js';
 import { tryHandleMentionModeCommand } from './mention-mode-command.js';
 import { tryHandleSecretaryCommand } from './secretary-command.js';
 import { observeGroupSecretaryMessage } from '../../services/group-secretary-runtime.js';
-import { tryHandleAssistantCommand } from './assistant-command.js';
+import { assistantGroupIsMultiUser, assistantSoloGroupOwnerCheck, tryHandleAssistantCommand, tryHandleAssistantMultiUserGroup } from './assistant-command.js';
+import { assistantMultiUserGroupsOff, assistantSoloGroupAdmission } from '../../core/assistant-spawn.js';
 import { isChatManager } from '../../services/chat-manager.js';
 import { resolveSubstituteAppMentions, substituteMentionIdentities } from './substitute-app-mentions.js';
 import { tryHandleSubstituteCommand } from './substitute-command.js';
@@ -88,7 +89,7 @@ import {
 } from '../../services/grant-store.js';
 import { ForwardFollowupBuffer } from './forward-followup-buffer.js';
 import { listForwardFollowups, putForwardFollowup, removeForwardFollowup } from './forward-followup-store.js';
-import { claimMessageOnce, _resetCacheForTest as _resetSeenMessagesForTest } from '../../services/seen-message-store.js';
+import { claimMessageOnce, hasClaimedMessage, _resetCacheForTest as _resetSeenMessagesForTest } from '../../services/seen-message-store.js';
 import {
   acquireReverifySlot,
   contentHasMentionPlaceholder,
@@ -4380,6 +4381,28 @@ async function dispatchPolledMessageListenerMatch(input: {
   chatId: string;
   messageId: string;
 }): Promise<void> {
+  // 只读预检避免合法重复消息每拍重新查成员。真正的 claim 在准入后：明确非法的丢弃是终态，
+  // 但 lookup_failed 只是本轮 fail closed，绝不能消费消息、挡住 Lark 恢复后的重试。
+  if (hasClaimedMessage(input.larkAppId, input.messageId)) {
+    logger.debug(`[message-listener:${input.larkAppId}] polled duplicate ignored msg=${input.messageId.substring(0, 12)}`);
+    return;
+  }
+  if (assistantMultiUserGroupsOff(input.larkAppId)) {
+    const admission = await assistantSoloGroupAdmission(input.larkAppId, input.chatId);
+    if (!admission.ok && admission.reason === 'lookup_failed') {
+      logger.debug(`[message-listener:${input.larkAppId}] owner lookup failed for ${input.chatId.substring(0, 12)}; retry next poll`);
+      return;
+    }
+    if (!admission.ok && admission.reason !== 'unclaimed') {
+      if (admission.reason === 'owner_absent' && admission.ownerOpenId) {
+        logger.info(`[assistant-mode:${input.larkAppId}] owner ${admission.ownerOpenId.slice(0, 12)}… absent before polled routing in ${input.chatId.substring(0, 12)}; treating as left`);
+        await input.handlers.handleChatMemberUserDeleted?.(input.chatId, [admission.ownerOpenId], input.larkAppId);
+      }
+      claimMessageOnce(input.larkAppId, input.messageId);
+      logger.debug(`[message-listener:${input.larkAppId}] polled message ignored permanently: ${admission.reason}`);
+      return;
+    }
+  }
   if (!claimMessageOnce(input.larkAppId, input.messageId)) {
     logger.debug(`[message-listener:${input.larkAppId}] polled duplicate ignored msg=${input.messageId.substring(0, 12)}`);
     return;
@@ -6076,6 +6099,21 @@ export function createLarkEventDispatcherRuntime(
       const chatType = (message.chat_type === 'p2p' ? 'p2p' : 'group') as 'group' | 'p2p';
       const messageId = message.message_id;
 
+      // 个人助理模式且不允许多人群：真人 ≥2 的群里什么都不做（不旁听、不路由、不认领），被真人 @ 时回一句。
+      if (chatType === 'group') {
+        const st = sender?.sender_type;
+        const senderIsBot = st === 'app' || st === 'bot';
+        if (await tryHandleAssistantMultiUserGroup(larkAppId, message, sender?.sender_id?.open_id, senderIsBot)) return;
+        // 单人群里主人已不在（真人发言者不是主人，或 bot 发言时现查成员没有主人）：按主人退群处理，
+        // 之后这条消息按未认领的群走。bot 发言且核对不了 ⇒ 丢弃。
+        const { drop, absentOwner } = await assistantSoloGroupOwnerCheck(larkAppId, message, sender?.sender_id?.open_id, senderIsBot);
+        if (drop) return;
+        if (absentOwner) {
+          logger.info(`[assistant-mode:${larkAppId}] owner ${absentOwner.slice(0, 12)}… is not in solo group ${chatId.substring(0, 12)}; treating as left`);
+          await handlers.handleChatMemberUserDeleted?.(chatId, [absentOwner], larkAppId);
+        }
+      }
+
       // 群聊上下文共享：静默旁听写入（group-context-ingest），放在任何 sender 分支 /
       // self return / mention gate 之前，让没被 @ 的消息也进共享记录。它自带开关
       // （默认关）与错误隔离，永不抛出、不推进 seen-message 去重、不启动 worker；
@@ -7686,7 +7724,9 @@ export function createLarkEventDispatcherRuntime(
       data.__groupContextHandled = true;
       try {
         const editedChatId: string | undefined = data.message?.chat_id;
-        if (editedChatId && data.message.chat_type !== 'p2p' && isGroupContextEnabled(larkAppId, editedChatId)) {
+        // 个人助理模式不允许多人群：多人群的编辑不旁听（私聊本就不采集）。
+        if (editedChatId && data.message.chat_type !== 'p2p' && isGroupContextEnabled(larkAppId, editedChatId)
+          && !(assistantMultiUserGroupsOff(larkAppId) && await assistantGroupIsMultiUser(larkAppId, editedChatId))) {
           const mode = getCachedChatMode(larkAppId, editedChatId) ?? await getChatModeStrict(larkAppId, editedChatId);
           if (mode === 'p2p') data.message.chat_type = 'p2p';
           else if (mode === 'group' || mode === 'topic') {
@@ -8014,6 +8054,12 @@ export function createLarkEventDispatcherRuntime(
         // 这次入群不跑入群钩子 / 入群命令 / 拉 owner / 自动开工，不发言也不开会话。
         if (isStewardSilentJoin(config.session.dataDir, larkAppId, chatId)) {
           logger.info(`[steward-join] joined chat=${chatId.substring(0, 12)} silently as a steward; skipping group-join actions`);
+          return;
+        }
+        // 个人助理模式不允许多人群：被拉进真人 ≥2 的群时入群钩子 / 入群命令 / 拉 owner / 归属 / 自动开工一概不做。
+        if (assistantMultiUserGroupsOff(larkAppId)
+          && (await getGroupStats(larkAppId, chatId, { requireFresh: true })).userCount !== 1) {
+          logger.info(`[assistant-mode:${larkAppId}] bot added to multi-user group ${chatId.substring(0, 12)}; ignoring`);
           return;
         }
         logger.info(`[auto-start:入群] bot added to chat=${chatId.substring(0, 12)} by ${String(operatorOpenId ?? '?').substring(0, 12)}`);

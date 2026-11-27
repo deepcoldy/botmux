@@ -80,7 +80,8 @@ describe('calendar admission before task side effects', () => {
   it.each([
     ['2026-10-01T01:00:00Z', true],
     ['2026-10-10T01:00:00Z', false],
-    ['2027-01-01T01:00:00Z', false],
+    ['2027-01-01T01:00:00Z', true],
+    ['2028-01-01T01:00:00Z', false],
   ])('runs rest-day tasks only on confirmed CN rest dates at %s', async (now, allowed) => {
     vi.setSystemTime(new Date(now));
     const task = create('cn', { calendarDayType: 'restday' });
@@ -90,7 +91,7 @@ describe('calendar admission before task side effects', () => {
     expect(gate.bash).toHaveBeenCalledTimes(allowed ? 1 : 0);
     expect(gate.model).toHaveBeenCalledTimes(allowed ? 1 : 0);
     expect(snapshot(task.id)).toMatchObject({ calendarDayType: 'restday', repeat: { completed: allowed ? 1 : 0 } });
-    if (!allowed && !now.startsWith('2027')) {
+    if (!allowed && !now.startsWith('2028')) {
       expect(queryScheduleRunLogs(task.id, {}, APP).logs[0]).toMatchObject({ outcome: 'calendar_skipped', calendarCheck: { status: 'working', dayType: 'restday', matches: false, displayNames: { zh: '中国法定工作日历' } } });
     }
   });
@@ -117,6 +118,8 @@ describe('calendar admission before task side effects', () => {
     ['2026-10-01T01:00:00Z', false],
     ['2026-10-10T01:00:00Z', true],
     ['2027-01-01T01:00:00Z', false],
+    ['2027-01-31T01:00:00Z', true],
+    ['2028-01-01T01:00:00Z', false],
   ])('admits CN official rest/makeup/unknown dates before Bash at %s', async (now, allowed) => {
     vi.setSystemTime(new Date(now));
     rmSync(workCalendarPath(APP));
@@ -127,7 +130,7 @@ describe('calendar admission before task side effects', () => {
     expect(gate.bash).toHaveBeenCalledTimes(allowed ? 1 : 0);
     expect(gate.model).toHaveBeenCalledTimes(allowed ? 1 : 0);
     expect(snapshot(task.id)).toMatchObject({ calendar: 'cn', repeat: { completed: allowed ? 1 : 0 } });
-    if (!allowed) expect(snapshot(task.id).lastCalendarCheck).toMatchObject({ reason: now.startsWith('2027') ? 'calendar_out_of_coverage' : 'rest_date' });
+    if (!allowed) expect(snapshot(task.id).lastCalendarCheck).toMatchObject({ reason: now.startsWith('2028') ? 'calendar_out_of_coverage' : 'rest_date' });
   });
   it('skips before Bash/model, preserves repeat/follow-active/multi-chat and records a non-failure reason', async () => {
     const task = create('demo', { chatIds: ['fixture_chat', 'fixture_chat_2'], executionPosition: 'new-topic' });

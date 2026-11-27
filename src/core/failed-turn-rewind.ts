@@ -27,6 +27,7 @@ import { isHttpVirtualSession, type DaemonSession } from './types.js';
 import { isSilentScheduledTurn } from './silent-schedule-turns.js';
 import { isTriggerFinalSuppressed } from './trigger-final-suppression.js';
 import { normaliseForFingerprint, normaliseTranscriptFingerprintCandidates } from '../services/claude-transcript.js';
+import { inlinePromptContext } from '../services/prompt-context-store.js';
 import type { PurgeResumeTarget } from '../services/transcript-image-purge.js';
 import { isInClaudeProjectsRoot, type ClaudeProjectsRoot } from '../services/claude-projects-root.js';
 import { inspectLastClaudeTurn, withOpenTranscript, type LastTurnInspection, type RewindResult, type TranscriptTreeScope } from './context-rewind.js';
@@ -70,20 +71,40 @@ export function planFailedTurnRewind(input: {
   /** This input's own turn id. */
   turnId: string | undefined;
   content: string;
-  mode: 'merge' | 'resend';
+  /** Envelope paired with the incoming payload, when its sidecar is usable. */
+  nextHookEnvelope?: string;
+  mode: 'merge' | 'resend' | 'edit';
 }): FailedTurnRewindDirective | undefined {
   const record = input.record;
   if (!record || record.directFailure !== true || record.status !== 'failed') return undefined;
-  if (record.limitedSnapshot || record.recovery || record.retryable === false) return undefined;
-  if (!rewindableErrorCode(record.errorCode)) return undefined;
+  if (record.limitedSnapshot || record.recovery || (record.retryable === false && !record.traexPromptCheckpoint)) return undefined;
+  if (!record.traexPromptCheckpoint && !rewindableErrorCode(record.errorCode)) return undefined;
   if (!record.turnId || (input.turnId !== undefined && input.turnId === record.turnId)) return undefined;
   if (!record.cliInput.trim() || isCliCommandInput(record.cliInput)) return undefined;
   if (input.mode === 'merge' && isCliCommandInput(input.content)) return undefined;
+  // A resend whose replay preflight fell back to inline must keep that envelope
+  // in the rewritten input too. A merge cannot have two independent sidecars:
+  // restore each turn's own envelope before joining them, preserving both the
+  // old task and the new sender/mentions without duplication or an 8k hook cap.
+  const inlineEnvelope = input.mode === 'edit' ? false : input.mode === 'merge'
+    ? Boolean(record.hookEnvelope || input.nextHookEnvelope)
+    : Boolean(record.hookEnvelope && !input.nextHookEnvelope);
+  const content = input.mode === 'edit' ? input.content : input.mode === 'resend'
+    ? inlinePromptContext(record.cliInput, inlineEnvelope ? record.hookEnvelope : undefined)
+    : mergeFailedTurnInput(
+      inlinePromptContext(record.cliInput, record.hookEnvelope),
+      inlinePromptContext(input.content, input.nextHookEnvelope),
+    );
   return {
     failedTurnId: record.turnId,
     failedInput: record.cliInput,
     mode: input.mode,
-    content: input.mode === 'resend' ? record.cliInput : mergeFailedTurnInput(record.cliInput, input.content),
+    content,
+    ...(inlineEnvelope ? { inlineEnvelope: true as const } : {}),
+    ...(input.mode === 'resend' && input.nextHookEnvelope
+      ? { hookEnvelope: input.nextHookEnvelope }
+      : {}),
+    ...(record.traexPromptCheckpoint ? { traexPromptCheckpoint: { ...record.traexPromptCheckpoint }, requireRewind: true as const } : {}),
   };
 }
 
@@ -247,7 +268,7 @@ export function planFailedTurnRewindRequest(input: {
   directive: FailedTurnRewindDirective;
   inspect: (jsonlPath: string) => LastTurnInspection;
 }): FailedTurnRewindPlan {
-  if (input.cliId !== 'claude-code' || !input.localOwnedSession || !input.target) {
+  if (!['claude-code', 'traex'].includes(input.cliId ?? '') || (input.cliId === 'traex' && !input.directive.traexPromptCheckpoint) || !input.localOwnedSession || !input.target) {
     return { kind: 'decline', reason: 'no worker-owned local Claude Code transcript' };
   }
   if (input.restartInProgress) return { kind: 'decline', reason: 'a CLI restart is already in progress' };

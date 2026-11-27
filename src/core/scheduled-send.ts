@@ -6,17 +6,79 @@ import { TurnSendLedger } from '../services/turn-send-ledger.js';
 import { isManualScheduledTurn, parseScheduledTurnId } from './scheduled-turn-provenance.js';
 import type { ScheduleAuthorityRecord } from '../services/schedule-authority-store.js';
 
-type ScheduleSession = Pick<Session, 'sessionId' | 'larkAppId' | 'chatId' | 'scheduledRun' | 'scheduledRuns'>;
+type ScheduleSession = Pick<Session, 'sessionId' | 'larkAppId' | 'chatId' | 'scheduledRun' | 'scheduledRuns' | 'scheduledRunOutstanding' | 'ordinaryTurnRecovery'>;
+
+export type ScheduledRunTriggerEvidence = (taskId: string, runId: string) => 'scheduler' | 'dashboard' | undefined;
 
 export function scheduledSessionRun(session: ScheduleSession | undefined, turnId: string | undefined): Session['scheduledRun'] {
   if (!session || !turnId) return;
-  return session.scheduledRuns?.[turnId]
+  const run = session.scheduledRuns?.[turnId]
     ?? (session.scheduledRun?.turnId === turnId ? session.scheduledRun : undefined);
+  const recovery = session.ordinaryTurnRecovery;
+  // Pre-provenance archives did not mark continuations on their run row. The
+  // current host recovery state supplies the same proof for a live legacy turn.
+  if (run && !run.recoveryOfTurnId && recovery?.currentTurnId === turnId
+    && recovery.logicalTurnId !== turnId && parseScheduledTurnId(recovery.logicalTurnId) === run.taskId) {
+    return { ...run, recoveryOfTurnId: recovery.logicalTurnId };
+  }
+  return run;
+}
+
+export function scheduledSessionRunWithEvidence(
+  session: ScheduleSession | undefined,
+  turnId: string | undefined,
+  loadTrigger: ScheduledRunTriggerEvidence,
+): Session['scheduledRun'] {
+  const run = scheduledSessionRun(session, turnId);
+  if (!run || run.trigger) return run;
+  const trigger = loadTrigger(run.taskId, run.runId);
+  return trigger ? { ...run, trigger } : run;
+}
+
+function pruneScheduledSessionRuns(session: Session): void {
+  const outstanding = session.scheduledRunOutstanding ?? {};
+  const entries = Object.entries(session.scheduledRuns ?? {});
+  const settled = entries.filter(([turnId]) => !outstanding[turnId]).slice(-100);
+  const keep = new Set([...Object.keys(outstanding), ...settled.map(([turnId]) => turnId)]);
+  session.scheduledRuns = Object.fromEntries(entries.filter(([turnId]) => keep.has(turnId)));
 }
 
 export function recordScheduledSessionRun(session: Session, run: NonNullable<Session['scheduledRun']>): void {
+  // Upgrade migration: retain the previous bounded cache as legacy outstanding
+  // work so an old unwritten dashboard turn cannot be evicted by new ticks. It is
+  // still bounded by the old 100-entry limit; new growth is limited to unsettled turns.
+  if (!session.scheduledRunOutstanding) {
+    const legacyRuns = { ...session.scheduledRuns };
+    if (session.scheduledRun && !legacyRuns[session.scheduledRun.turnId]) {
+      legacyRuns[session.scheduledRun.turnId] = session.scheduledRun;
+    }
+    session.scheduledRuns = legacyRuns;
+    session.scheduledRunOutstanding = Object.fromEntries(Object.keys(legacyRuns).map(turnId => [turnId, true as const]));
+  }
   session.scheduledRun = run;
-  session.scheduledRuns = Object.fromEntries(Object.entries({ ...session.scheduledRuns, [run.turnId]: run }).slice(-100));
+  session.scheduledRunOutstanding[run.turnId] = true;
+  session.scheduledRuns = { ...session.scheduledRuns, [run.turnId]: run };
+  pruneScheduledSessionRuns(session);
+}
+
+/** Move a terminal/rejected turn out of outstanding storage. Its binding remains
+ * in the separately capped settled history for late output and audit readers. */
+export function settleScheduledSessionRun(session: Session, turnId: string): boolean {
+  if (!session.scheduledRunOutstanding?.[turnId]) return false;
+  const settledRun = session.scheduledRuns?.[turnId]
+    ?? (session.scheduledRun?.turnId === turnId ? session.scheduledRun : undefined);
+  if (settledRun) {
+    // Delivery failure reconciliation runs AFTER the terminal callback. Move the
+    // just-settled binding to the newest settled end so the 100-entry history cap
+    // evicts an older settled run, not the turn whose delivery is still being reconciled.
+    session.scheduledRuns = Object.fromEntries([
+      ...Object.entries(session.scheduledRuns ?? {}).filter(([id]) => id !== turnId),
+      [turnId, settledRun],
+    ]);
+  }
+  delete session.scheduledRunOutstanding[turnId];
+  pruneScheduledSessionRuns(session);
+  return true;
 }
 
 /** Only the daemon's recovery coordinator may link its freshly minted turn to
@@ -40,7 +102,7 @@ export function prepareScheduledRecoveryRun(session: Session, turnId: string, de
         && deps.admitManualTurn(taskId, original.runId, turnId)))) {
     throw new Error('scheduled recovery no longer owns its original execution');
   }
-  recordScheduledSessionRun(session, { ...original, turnId });
+  recordScheduledSessionRun(session, { ...original, turnId, recoveryOfTurnId: recovery.logicalTurnId });
   deps.persist();
 }
 

@@ -176,13 +176,16 @@ botmux schedule update <id> --schedule "every 4h"         # change the frequency
 botmux schedule update <id> --prompt-file report-prompt.md
 # Short prompts can be passed inline (--prompt or --prompt-file, not both)
 botmux schedule update <id> --prompt "new full prompt"
+# Turn silent mode on or off without recreating the task
+botmux schedule update <id> --silent
+botmux schedule update <id> --no-silent
 # Fields can be combined
 botmux schedule update <id> --schedule "0 9 * * 1-5" --prompt-file report-prompt.md
 ```
 
 `--schedule` accepts everything `schedule add` does (`每日17:50`, `every 2h`, 5-field cron, …); an expression it can't read is rejected with examples and the task is left alone. After a frequency change the next run is recomputed from now under the new rule — nothing is re-run or fired immediately — and the command prints the new rule and the next run time. A paused task stays paused. The frequency can't be changed while a run is in progress (you'll be asked to wait for it to finish), and a one-shot time can't be in the past.
 
-The task ID, silent setting, execution position, Bash precondition, work calendar, creator identity, enabled state and run history are kept. A run already in progress keeps the old configuration; the next run uses the new one. Permissions match the Dashboard edit: whoever can change the prompt can change the frequency, and delegated tasks still need a new authorization. See `botmux schedule update --help` for every field.
+The task ID, execution position, Bash precondition, work calendar, creator identity, enabled state and run history are kept; silent mode can be switched with `--silent` / `--no-silent`. A run already in progress keeps the old configuration; the next run uses the new one. Permissions match the Dashboard edit: whoever can change the prompt can change the frequency, and delegated tasks still need a new authorization. See `botmux schedule update --help` for every field.
 
 ## Run logs and multiple groups (Dashboard) {#logs-and-multi-chat}
 
@@ -316,9 +319,9 @@ botmux schedule calendars                                                # list 
 
 ### Built-in China statutory calendar
 
-ID `cn`, shown as "China Statutory Work Calendar", time zone `Asia/Shanghai`, including holidays and weekend make-up workdays. **Currently verified for 2026-01-01 to 2026-12-31**, based on the [State Council General Office notice on 2026 holidays](https://www.gov.cn/zhengce/zhengceku/202511/content_7047091.htm) (Guobanfa Mingdian [2025] No. 7). `schedule calendars` prints the source details.
+ID `cn`, shown as "China Statutory Work Calendar", time zone `Asia/Shanghai`, including holidays and weekend make-up workdays. **Currently verified for 2026-01-01 to 2027-12-31**, based on the [State Council General Office notice on 2026 holidays](https://www.gov.cn/zhengce/zhengceku/202511/content_7047091.htm) and the [2027 notice](https://www.gov.cn/zhengce/content/202611/content_7085101.htm). `schedule calendars` prints the source details.
 
-It represents the nationwide holiday arrangement, not every organization's actual shifts; local holidays, company rosters, Hong Kong/Macao/Taiwan and other countries are out of scope. Dates outside coverage (such as the not-yet-verified 2027) are never guessed: the task stops running automatically and records `calendar_out_of_coverage`. Upgrade to a release with next year's data before the year ends.
+It represents the nationwide holiday arrangement, not every organization's actual shifts; local holidays, company rosters, Hong Kong/Macao/Taiwan and other countries are out of scope. Dates outside coverage are never guessed: the task stops running automatically and records `calendar_out_of_coverage`. Upgrade to a release with next year's data before the year ends.
 
 ### Custom calendars
 

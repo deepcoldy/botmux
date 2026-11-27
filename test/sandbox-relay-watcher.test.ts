@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 
 import { startOutboxWatcher } from '../src/adapters/backend/sandbox.js';
 
@@ -88,14 +88,58 @@ describe('sandbox relay watcher host handoff', () => {
         '--session-id', 'forced-source',
       ]);
       const stagedImage = argv[argv.indexOf('--images') + 1];
-      expect(stagedImage.endsWith(`${id}-image0-${imageName}`)).toBe(true);
+      // Staged under the original basename (outbox prefix stripped) in a per-file dir.
+      expect(basename(stagedImage)).toBe('chart.png');
       // The bytes cross via the host-private staging dir, a sibling of the outbox —
       // never via a path that still names the sandbox-writable outbox. The fixture
       // reads them while the child runs because finish() deletes staging right after.
-      expect(dirname(stagedImage)).toBe(join(root, 'relay-staging'));
+      expect(dirname(dirname(stagedImage))).toBe(join(root, 'relay-staging'));
       expect(stagedImage.startsWith(outbox)).toBe(false);
       const { imageBytes } = JSON.parse(response.stdout) as { imageBytes: string };
       expect(imageBytes).toBe('PNG-BYTES');
+    } finally {
+      stop();
+    }
+  });
+
+  it('uploads relayed files under their original names and cleans the per-file staging dirs', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-relay-files-'));
+    roots.push(root);
+    const outbox = join(root, 'outbox');
+    mkdirSync(outbox);
+    const fixture = join(root, 'send-echo-files.mjs');
+    writeFileSync(fixture, `
+      import { readFileSync } from 'node:fs';
+      const argv = process.argv.slice(2);
+      const files = argv.flatMap((a, i) => a === '--files' ? [argv[i + 1]] : []);
+      process.stdout.write(JSON.stringify({ argv, files, bytes: files.map(f => readFileSync(f, 'utf8')) }));
+    `);
+    const id = 'files-1';
+    // Two attachments that share an original basename must not collide in staging.
+    const first = `${id}-0a1b2c3d-报告.xlsx`;
+    const second = `${id}-4e5f6a7b-报告.xlsx`;
+    const plain = 'notes.txt';
+    writeFileSync(join(outbox, `${id}.content`), 'files attached');
+    writeFileSync(join(outbox, first), 'ONE');
+    writeFileSync(join(outbox, second), 'TWO');
+    writeFileSync(join(outbox, plain), 'THREE');
+    writeFileSync(join(outbox, `${id}.req.json`), JSON.stringify({
+      contentFile: `${id}.content`,
+      attachments: [first, second, plain],
+      flags: ['--no-mention'],
+    }));
+    const stop = startOutboxWatcher(outbox, { ...process.env }, 'forced-source', { cliPath: fixture });
+    try {
+      const responsePath = join(outbox, `${id}.res.json`);
+      await vi.waitFor(() => expect(existsSync(responsePath)).toBe(true), { timeout: 5_000 });
+      const response = JSON.parse(readFileSync(responsePath, 'utf8')) as { code: number; stdout: string; stderr: string };
+      expect(response.code, response.stderr).toBe(0);
+      const { files, bytes } = JSON.parse(response.stdout) as { files: string[]; bytes: string[] };
+      expect(files.map(f => basename(f))).toEqual(['报告.xlsx', '报告.xlsx', 'notes.txt']);
+      expect(new Set(files.map(f => dirname(f))).size).toBe(3);
+      for (const f of files) expect(dirname(dirname(f))).toBe(join(root, 'relay-staging'));
+      expect(bytes).toEqual(['ONE', 'TWO', 'THREE']);
+      expect(readdirSync(join(root, 'relay-staging'))).toEqual([]);
     } finally {
       stop();
     }

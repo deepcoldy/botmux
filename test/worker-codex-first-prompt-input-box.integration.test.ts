@@ -327,7 +327,7 @@ for (const [holder, passGateFirst, holdLog] of [
 it.skipIf(!tmuxAvailable)('releases the follow-ups behind a queued activation that the write itself refused', async () => {
   await withWorker({
     steps: [0, 200, 500].map(atMs => ({ atMs, frame: READY })),
-    onSignal: [DRAFT],
+    onSignal: [DRAFT, DRAFT_ERASED],
   }, async h => {
     await h.waitFor(() => committed(h.messages, 'om_first'), 20_000);
     // A draft appears after the opening check settled, as a human typing does.
@@ -335,8 +335,12 @@ it.skipIf(!tmuxAvailable)('releases the follow-ups behind a queued activation th
     h.signal();
     await new Promise(r => setTimeout(r, 500));
     h.send({ type: 'message', content: 'activation', turnId: 'om_second', queuedActivationToken: 'qa-token-3' });
+    await h.waitFor(() => h.messages.some(m => m.type === 'user_notify' && m.message.includes('existing draft')), 15_000);
+    // Refusal must not acknowledge an activation that never reached the CLI.
+    expect(activationAcked(h.messages, 'qa-token-3')).toBe(false);
+    h.signal(); // clear the draft without producing a new prompt-ready edge
     await h.waitFor(() => activationAcked(h.messages, 'qa-token-3'), 15_000);
-    expect(pasted(h.input(), 'activation')).toBe(0);
+    expect(pasted(h.input(), 'activation')).toBe(1);
     expect(h.messages.some(m => m.type === 'user_notify' && m.message.includes('existing draft')), h.logs()).toBe(true);
   });
 }, 60_000);

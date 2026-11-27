@@ -8,6 +8,23 @@ What botmux does fits in one sentence: **it turns Lark messages into input for a
 
 ![botmux processes: the supervisor starts a daemon per bot, the Dashboard and plugin services; each daemon runs a worker per topic, which reaches the CLI through a session backend such as tmux](/img/arch-overview-en.png)
 
+## Design choice: bridge the complete CLI {#cli-bridge-design}
+
+botmux **does not reimplement** agent capabilities. Memory, context management, tool calls, permissions, plan mode, `/` commands, and MCP stay with the CLI itself. Most native CLI capabilities need no duplicate implementation, and CLI upgrades usually benefit botmux directly; when interfaces, parameters, output formats, or resume semantics change, the matching adapter may still need an update.
+
+Users keep writing in plain language. The daemon wraps the message and system instructions separately in a structured format (XML tags) before handing them to the CLI, so users never need to write any special format themselves.
+
+The table below compares only **verifiable integration boundaries** with an Agent-SDK-based approach; it does not claim what other approaches necessarily lack:
+
+| Integration boundary | botmux | Agent-SDK-based approach |
+|---|---|---|
+| What gets bridged | The full CLI process, including its built-in hooks / memory / plan mode / MCP / `/` commands | Whatever the SDK exposes |
+| CLI upgrades | Most capabilities benefit directly; the adapter catches up when interfaces / resume change | Depends on the SDK version and integration |
+| Memory / context | Reuses the CLI's built-in implementation | Depends on the SDK or a custom build |
+| Multiple CLIs / agents | 30+ adapters, selected in configuration | Depends on SDK coverage |
+| Multiple bots | Several bots in one group, dispatched by @ | Depends on the implementation |
+| Direct terminal access | With the tmux backend, `tmux attach` reaches the real CLI process | Depends on the implementation |
+
 ## What each process does
 
 | Process | How many | What it does |

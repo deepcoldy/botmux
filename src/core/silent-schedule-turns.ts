@@ -63,6 +63,11 @@ export function isSilentScheduledTurn(
   turnId?: string,
   now = Date.now(),
 ): boolean {
+  const run = turnId ? ds.session?.scheduledRuns?.[turnId]
+    ?? (ds.session?.scheduledRun?.turnId === turnId ? ds.session.scheduledRun : undefined) : undefined;
+  // Admission-frozen policy survives restart and registry eviction. Missing
+  // policy retains legacy behavior; a different run cannot inherit silence.
+  if (run?.turnId === turnId && typeof run?.silent === 'boolean') return run.silent;
   // A deferred run owns a dedicated session. Retirement can clear the worker's
   // capture identity before its trailing idle frame; neither that nor registry
   // expiry may make this still-hidden run loud. Explicit other turns stay exact.

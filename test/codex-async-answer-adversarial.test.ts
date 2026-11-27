@@ -264,6 +264,9 @@ describe('correlated async answer adversarial production probes', () => {
       process: { env: { SESSION_DATA_DIR: dir } }, config: { session: { dataDir: dir } },
       parseDaemonIpcPort: () => undefined, randomBytes, managedOriginCapabilityPath,
       replaceManagedOriginCapabilityFile, writeCliPidMarker: vi.fn(), send: vi.fn(), log: vi.fn(),
+      // markActiveTurnStarted now calls the AGY footer-baseline hook first; this
+      // is a Codex turn-origin probe with no AGY viewport, so stub it to a no-op.
+      baselineAntigravityFooterTasksForActiveTurn: () => {},
     };
     scope.turnAuthorityIdentity = productionFunction('src/worker.ts', 'turnAuthorityIdentity', scope);
     const mark = productionFunction('src/worker.ts', 'markActiveTurnStarted', scope);

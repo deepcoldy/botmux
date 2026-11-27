@@ -428,6 +428,180 @@ describe('POST /api/current-execution', () => {
     }
   });
 
+  it.each([
+    'renewed', 'stale', 'malformed', 'unavailable', 'turn advanced', 'worker replaced', 'policy changed', 'split-source policy changed',
+    'binding changed', 'snapshot replaced', 'revoked', 'consent missing', 'CN uses default', 'CN has its own JWT', 'default does not claim CN',
+  ] as const)('handles default ByteCloud renewal in the proven turn: %s', async scenario => {
+    const { publishTurnCliIdentity } = await import('../src/core/turn-cli-identity.js');
+    const { __setPlatformCredentialDepsForTest } = await import('../src/core/platform-credential-source.js');
+    const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
+    const { dropPublishedIdentitiesForOpenId } = await import('../src/core/cli-identity.js');
+    const ds = session();
+    const turnId = ds.managedTurnOrigin.turnId;
+    const senderOpenId = 'ou_alice';
+    ds.managedTurnOrigin.callerOpenId = senderOpenId;
+    vi.spyOn(workerPool, 'identityModelRefusalReason').mockReturnValue(undefined);
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 's-execution' ? ds : undefined);
+    const attestation = await import('../src/core/current-actor-attestation.js');
+    vi.spyOn(attestation, 'resolveLoopbackPeerProcesses').mockResolvedValue({
+      ok: true, peer: { pid: process.pid, procStart: '1' },
+    });
+    const attest = vi.spyOn(attestation, 'attestCurrentExecutionLoopbackPeer').mockImplementation(() => ({
+      ds, turnId: ds.managedTurnOrigin.turnId, generation: ds.workerGeneration,
+      dispatchAttempt: ds.managedTurnOrigin.dispatchAttempt, capability: ds.managedTurnOrigin.capability,
+      workerPid: process.pid, workerProcStart: '1', processIdentities: [],
+    }));
+    const botConfig = {
+      larkAppId: 'cli_execution', larkToolBinding: true, backendType: 'pty',
+      triggerUserAuth: parseTriggerUserAuthConfig({ enabled: true, tools: ['bytedcli'],
+        credentialSource: scenario === 'split-source policy changed'
+          ? { 'lark-user': 'platform', bytecloud: 'platform' } : 'platform' }),
+    } as any;
+    vi.spyOn(await import('../src/bot-registry.js'), 'getBot').mockReturnValue({ config: botConfig } as any);
+    ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const dataDir = mkdtempSync(join(tmpdir(), 'cli-identity-default-renewal-'));
+    previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+
+    let now = Date.now();
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const jwt = (region: string, remainingSeconds: number) =>
+      `e30.${Buffer.from(JSON.stringify({ region, exp: Math.floor(now / 1_000) + remainingSeconds })).toString('base64url')}.fixture`;
+    const original = jwt(scenario === 'default does not claim CN' ? 'i18n' : 'cn', 5);
+    const newer = jwt('cn', 3_600);
+    const originalRegional = jwt('tx', 600);
+    const independentCn = scenario === 'CN has its own JWT' ? jwt('cn', 900) : undefined;
+    const requestedRegion = scenario === 'CN uses default' || independentCn || scenario === 'default does not claim CN'
+      ? 'cn' : 'default';
+    let machineId = 'm-1';
+    let releaseGrant!: () => void;
+    const grantHeld = new Promise<void>(resolve => { releaseGrant = resolve; });
+    let grants = 0;
+    const requestGrant = vi.fn(async (req: CredentialGrantRequest): Promise<CredentialGrantResult> => {
+      const first = ++grants === 1;
+      if (!first) await grantHeld;
+      if (grants === 2 && scenario === 'unavailable') return { ok: false, reason: 'network', error: 'fixture unavailable' };
+      if (grants === 2 && scenario === 'consent missing') return { ok: false, reason: 'consent_missing', error: 'machine consent missing' };
+      const cloudJwt = first || scenario === 'stale' ? original
+        : scenario === 'malformed' ? newer.slice(0, newer.lastIndexOf('.')) : newer;
+      return { ok: true, value: {
+        tool: 'bytedcli', unionId: req.unionId, expiresAt: now + 3_600_000,
+        variables: first
+          ? {
+              BYTEDCLI_USER_CLOUD_JWT: cloudJwt, BYTEDCLI_USER_CODE_JWT: 'original-codebase',
+              BYTEDCLI_USER_CLOUD_JWT_TX: originalRegional,
+              ...(independentCn ? { BYTEDCLI_USER_CLOUD_JWT_CN: independentCn } : {}),
+            }
+          : { BYTEDCLI_USER_CLOUD_JWT: cloudJwt, BYTEDCLI_USER_CODE_JWT: 'replacement-codebase' },
+      } };
+    });
+    __setPlatformCredentialDepsForTest({
+      readBinding: () => ({ platformUrl: 'https://platform.example.test', machineToken: 'mt', machineId }),
+      resolveUnionId: async () => 'on_alice',
+      requestGrant,
+    });
+    const fetchIdentity = async (region?: 'default' | 'cn') => {
+      const response = await fetch(`http://127.0.0.1:${ipc!.port}/api/current-execution-identity`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId: 's-execution', tool: 'bytedcli', region }),
+      });
+      return { status: response.status, body: await response.json() };
+    };
+    const published = () => recallProvenIdentityContent(dataDir, 's-execution', turnId, 'bytedcli');
+    try {
+      await publishTurnCliIdentity({
+        botConfig, sessionDataDir: dataDir, sessionId: 's-execution', senderOpenId, turnId, storageModel: 'proven',
+      });
+      const startingSnapshot = published();
+      expect(await fetchIdentity(requestedRegion)).toMatchObject({ status: 200, body: { env: startingSnapshot } });
+      expect(requestGrant).toHaveBeenCalledTimes(1);
+
+      now += 10_000;
+      // A caller that does not need the default ByteCloud JWT does not wait on its renewal.
+      expect(await fetchIdentity()).toMatchObject({ status: 200, body: { env: startingSnapshot } });
+      expect(requestGrant).toHaveBeenCalledTimes(1);
+      if (independentCn || scenario === 'default does not claim CN') {
+        const response = await fetchIdentity('cn');
+        expect(response).toMatchObject({ status: 200, body: { env: startingSnapshot } });
+        if (independentCn) expect(response.body.env).toContain(`BOTMUX_IDENTITY_CLOUD_JWT_CN='${independentCn}'`);
+        else expect(response.body.env).not.toContain('BOTMUX_IDENTITY_CLOUD_JWT_CN');
+        expect(requestGrant).toHaveBeenCalledTimes(1);
+        return;
+      }
+      const first = fetchIdentity(requestedRegion);
+      await vi.waitFor(() => expect(requestGrant).toHaveBeenCalledTimes(2));
+      expect(requestGrant).toHaveBeenLastCalledWith(expect.objectContaining({
+        unionId: 'on_alice', appId: 'cli_execution', sessionId: 's-execution', turnId,
+      }), expect.anything());
+
+      if (scenario === 'renewed' || scenario === 'CN uses default') {
+        const proofs = attest.mock.calls.length;
+        const concurrent = fetchIdentity('default');
+        await vi.waitFor(() => expect(attest).toHaveBeenCalledTimes(proofs + 1));
+        expect(requestGrant).toHaveBeenCalledTimes(2);
+        releaseGrant();
+        const [firstResponse, concurrentResponse] = await Promise.all([first, concurrent]);
+        expect(firstResponse).toEqual(concurrentResponse);
+        expect(firstResponse).toMatchObject({ status: 200, body: { identityTurnId: turnId, env: published() } });
+        expect(firstResponse.body.env).toContain(`BYTEDCLI_USER_CLOUD_JWT='${newer}'`);
+        expect(firstResponse.body.env).toContain(`BOTMUX_IDENTITY_CLOUD_JWT_CN='${newer}'`);
+        expect(firstResponse.body.env).toContain(`BOTMUX_IDENTITY_OPEN_ID='${senderOpenId}'`);
+        expect(firstResponse.body.env).toContain(originalRegional);
+        expect(firstResponse.body.env).toContain('original-codebase');
+        expect(firstResponse.body.env).not.toContain('replacement-codebase');
+        expect(firstResponse.body.env).not.toContain(original);
+        expect(await fetchIdentity(requestedRegion)).toEqual(firstResponse);
+        expect(requestGrant).toHaveBeenCalledTimes(2);
+        return;
+      }
+
+      if (scenario === 'turn advanced') ds.managedTurnOrigin.turnId = 'trigger-next';
+      if (scenario === 'worker replaced') ds.workerGeneration++;
+      if (scenario === 'policy changed' || scenario === 'split-source policy changed') {
+        botConfig.triggerUserAuth = parseTriggerUserAuthConfig({ enabled: true, tools: ['bytedcli'],
+          credentialSource: scenario === 'split-source policy changed'
+            ? { 'lark-user': 'platform', bytecloud: 'local' } : 'local' });
+      }
+      if (scenario === 'binding changed') machineId = 'm-2';
+      if (scenario === 'snapshot replaced') {
+        writeSessionIdentity(dataDir, 's-execution', {
+          tool: 'bytedcli', cloudJwt: jwt('cn', 900), turnId, openId: senderOpenId,
+        }, 'proven');
+        expect(published()).not.toBe(startingSnapshot);
+      }
+      if (scenario === 'revoked') expect(dropPublishedIdentitiesForOpenId(dataDir, senderOpenId)).toBeGreaterThan(0);
+      const snapshotBeforeResponse = published();
+      releaseGrant();
+      const response = await first;
+      if (scenario === 'consent missing') {
+        expect(response).toMatchObject({ status: 200 });
+        expect(response.body.env).toContain('[reason=platform_consent_missing]');
+        expect(published()).toBe(snapshotBeforeResponse);
+        return;
+      }
+      expect(response.body.env).toBeUndefined();
+      if (scenario === 'stale' || scenario === 'malformed' || scenario === 'unavailable') {
+        expect(response).toMatchObject({ status: 503, body: { reason: 'bytecloud_grant_unavailable' } });
+        expect(await fetchIdentity('default')).toEqual(response);
+        expect(requestGrant).toHaveBeenCalledTimes(2);
+      } else {
+        expect(scenario === 'revoked' ? [403, 404] : [403]).toContain(response.status);
+      }
+      expect(published()).toBe(snapshotBeforeResponse);
+      if (scenario === 'unavailable') {
+        now += 10_001;
+        expect(await fetchIdentity('default')).toMatchObject({
+          status: 200, body: { identityTurnId: turnId, env: expect.stringContaining(newer) },
+        });
+        expect(requestGrant).toHaveBeenCalledTimes(3);
+      }
+    } finally {
+      releaseGrant();
+      __setPlatformCredentialDepsForTest(null);
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
   it('a requester who authorizes mid-turn gets the grant on a later fetch of the same turn (#3312)', async () => {
     const { publishTurnCliIdentity, __resetTransientRefusalsForTest, NOT_AUTHORIZED_RETRY_INTERVAL_MS } = await import('../src/core/turn-cli-identity.js');
     const { __setPlatformCredentialDepsForTest } = await import('../src/core/platform-credential-source.js');
@@ -748,14 +922,14 @@ describe('POST /api/current-execution', () => {
     expect(lookup).not.toHaveBeenCalled();
   });
 
-  it('rejects an unknown or non-overseas region on the identity route before session work', async () => {
+  it('rejects an unsupported or inapplicable region on the identity route before session work', async () => {
     const lookup = vi.spyOn(workerPool, 'findActiveBySessionId');
     ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
     const postIdentity = (body: unknown) => fetch(`http://127.0.0.1:${ipc!.port}/api/current-execution-identity`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
     });
     for (const body of [
-      { sessionId: 's-execution', tool: 'bytedcli', region: 'cn' },
+      { sessionId: 's-execution', tool: 'bytedcli', region: 'boe' },
       { sessionId: 's-execution', tool: 'bytedcli', region: 'bogus' },
       { sessionId: 's-execution', tool: 'bytedcli', region: 42 },
       { sessionId: 's-execution', tool: 'lark-cli', region: 'i18n' },

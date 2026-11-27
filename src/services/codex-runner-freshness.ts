@@ -88,6 +88,11 @@ export class CodexRunnerFreshnessInputQueue<TNormal, TRaw> {
     this.raw.push(input);
   }
 
+  /** Restore a just-dequeued head without reversing the remaining raw FIFO. */
+  prependRaw(input: TRaw): void {
+    this.raw.unshift(input);
+  }
+
   takeNormal(): TNormal | undefined {
     if (shouldHoldCodexRunnerInput(this.getState())) return undefined;
     return this.normal.shift();

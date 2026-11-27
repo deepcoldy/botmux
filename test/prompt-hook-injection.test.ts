@@ -60,7 +60,7 @@ vi.mock('../src/im/lark/client.js', () => ({
 }));
 
 const getBotMock = vi.fn(() => ({
-  config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'auto' as const },
+  config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' } as Record<string, unknown>,
 }));
 // core/reply-delivery.ts 读 per-bot replyDelivery 的入口。本文件的 hook 注入用例都以
 // **显式 send** 为前提（除下方专门覆盖缺省 send 与显式 transcript 的用例），
@@ -111,11 +111,18 @@ vi.mock('../src/adapters/hook-installer.js', () => ({
   hasInstalledPromptHookCached: (...args: unknown[]) => preflightMock(...args),
 }));
 
+const collectProtectedHttpEgressMock = vi.fn((..._args: unknown[]): unknown[] => []);
+vi.mock('../src/core/protected-http-egress.js', () => ({
+  collectProtectedHttpEgressPolicies: (...args: unknown[]) => collectProtectedHttpEgressMock(...args),
+}));
+
 // ─── 被测模块 ──────────────────────────────────────────────────────────────
 
 import { buildFollowUpCliInput, buildNewTopicCliInput, promptHookRunsInCli } from '../src/core/session-manager.js';
-import { DEFAULT_CLAUDE_DATA_DIR } from '../src/adapters/cli/claude-code.js';
-import { claimPromptContext, fingerprintPromptText, prefixOf } from '../src/services/prompt-context-store.js';
+import { plannedOpeningBackendType } from '../src/core/opening-backend.js';
+import { prepareHookEnvelopeForReplay } from '../src/core/prompt-hook-replay.js';
+import { DEFAULT_CLAUDE_DATA_DIR, sanitizeClaudeInput } from '../src/adapters/cli/claude-code.js';
+import { claimPromptContext, claimPromptContextAmongTurns, fingerprintPromptText, prefixOf } from '../src/services/prompt-context-store.js';
 
 const SESSION_ID = 'hook-session-789';
 const LARK_APP_ID = 'app_test';
@@ -156,25 +163,28 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     prevDataDir = process.env.SESSION_DATA_DIR;
     process.env.SESSION_DATA_DIR = '/tmp/test-sessions';
     getBotMock.mockReturnValue({
-      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'auto' as const },
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
     });
     activeRegistryMock.mockReturnValue(undefined);
     getSessionMock.mockReturnValue(undefined);
+    preflightMock.mockReset();
     preflightMock.mockReturnValue(true);
+    collectProtectedHttpEgressMock.mockReset();
+    collectProtectedHttpEgressMock.mockReturnValue([]);
   });
   afterEach(() => {
     if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
     else process.env.SESSION_DATA_DIR = prevDataDir;
   });
 
-  it.each(['auto', 'off'] as const)('exposes message location in %s mode', (mode) => {
-    getBotMock.mockReturnValue({ config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: mode } });
+  it.each(['hook', 'inline'] as const)('exposes message location in %s mode', (mode) => {
+    preflightMock.mockReturnValue(mode === 'hook');
     for (const root of [undefined, 'om_topic']) {
       const messageLocation = { messageId: 'om_followup', ...(root ? { rootMessageId: root } : {}) };
       const result = buildFollowUpCliInput('followup', SESSION_ID, followUpOpts({ messageLocation }));
       // hook 模式：位置元数据随 sender 一起进 envelope，输入框只剩正文。
-      const visible = mode === 'auto' ? claimByPrompt(SESSION_ID, TURN_ID, result.content)! : result.content;
-      if (mode === 'auto') {
+      const visible = mode === 'hook' ? claimByPrompt(SESSION_ID, TURN_ID, result.content)! : result.content;
+      if (mode === 'hook') {
         expect(result.content).toBe('followup');
         expect(visible).toBeDefined();
       }
@@ -185,7 +195,7 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     }
   });
 
-  it('auto + claude-code + preflight 通过：reminder/whiteboard/sender/mentions 进 sidecar，PTY 文本只剩正文', () => {
+  it('默认开启 + claude-code + preflight 通过：reminder/whiteboard/sender/mentions 进 sidecar，PTY 文本只剩正文', () => {
     const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ whiteboardId: 'wb_1' }));
 
     // PTY 文本：只剩用户正文，无 user_message 外壳 / sender / mentions / reminder / whiteboard
@@ -208,21 +218,51 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     expect(envelope).not.toContain('至少 botmux send 回应一次');
   });
 
-  it('off：完全 inline（reminder 在 PTY 文本里，无 sidecar）', () => {
-    getBotMock.mockReturnValue({
-      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'off' as const },
-    });
-    const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts());
-    expect(result.content).toContain('<botmux_reminder>');
-    expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
+  it('相同正文的后续 type-ahead 自动保留完整 inline，首轮仍可唯一 claim', () => {
+    const first = buildFollowUpCliInput('继续', SESSION_ID, followUpOpts({ turnId: 'turn-duplicate-A' }));
+    const second = buildFollowUpCliInput('继续', SESSION_ID, followUpOpts({ turnId: 'turn-duplicate-B' }));
+    expect(first.content).toBe('继续');
+    expect(second.content).toContain('<user_message>');
+    expect(second.content).toContain('<botmux_reminder>');
+    expect(second.hookEnvelope).toBeUndefined();
+
+    const claimed = claimPromptContextAmongTurns(
+      SESSION_ID,
+      ['turn-duplicate-A', 'turn-duplicate-B'],
+      fingerprintPromptText(first.content),
+      prefixOf(first.content),
+    );
+    expect(claimed?.turnId).toBe('turn-duplicate-A');
+    expect(claimed?.envelope).toContain('<botmux_reminder>');
+    expect(claimByPrompt(SESSION_ID, 'turn-duplicate-B', second.content)).toBeUndefined();
   });
 
-  it('缺省（未配置 envelopeInjection）：inline', () => {
-    getBotMock.mockReturnValue({
-      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
-    });
-    const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts());
-    expect(result.content).toContain('<botmux_reminder>');
+  it('sidecar 写盘失败时回退完整 inline，而不是发送去壳正文', async () => {
+    const fs = await import('node:fs');
+    fs.mkdirSync('/tmp', { recursive: true });
+    fs.rmSync('/tmp/test-sessions', { recursive: true, force: true });
+    fs.writeFileSync('/tmp/test-sessions', 'not a directory');
+    try {
+      const result = buildFollowUpCliInput('task requiring delivery', SESSION_ID, followUpOpts({ turnId: 'turn-write-failed' }));
+      expect(result.content).toContain('<user_message>');
+      expect(result.content).toContain('<botmux_reminder>');
+      expect(result.hookEnvelope).toBeUndefined();
+    } finally {
+      fs.rmSync('/tmp/test-sessions', { force: true, recursive: true });
+      fs.mkdirSync('/tmp/test-sessions', { recursive: true });
+    }
+  });
+
+  it('兼容忽略遗留配置字段 envelopeInjection（off/auto）并默认走 hook 模式', () => {
+    for (const legacy of ['off', 'auto', undefined] as const) {
+      getBotMock.mockReturnValue({
+        config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', ...(legacy ? { envelopeInjection: legacy } : {}) },
+      });
+      const turnId = `turn-legacy-${legacy ?? 'unset'}`;
+      const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ turnId }));
+      expect(result.content).toBe('帮我修个 bug');
+      expect(claimByPrompt(SESSION_ID, turnId, result.content)).toContain('<botmux_reminder>');
+    }
   });
 
   it('不支持的 CLI（codex）即使 auto 也 inline', () => {
@@ -258,7 +298,7 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     // <BOT_HOME>/claude/settings.json；preflight 必须查这份，否则 per-bot
     // 安装失败时会误判已装 → 每轮系统性丢 reminder。
     getBotMock.mockReturnValue({
-      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'auto' as const, sandbox: true },
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', sandbox: true },
     });
     preflightMock.mockClear();
     const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts());
@@ -274,7 +314,7 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
 
   it('read-isolation 下 per-bot 未装 hook（preflight false）→ 回退 inline', () => {
     getBotMock.mockReturnValue({
-      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'auto' as const, sandbox: true },
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', sandbox: true },
     });
     preflightMock.mockReturnValue(false);
     const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts());
@@ -287,7 +327,7 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     // 否则会去查不存在的 BOT_HOME 文件 → 误判 inline（或更糟：BOT_HOME 有旧文件
     // 时误判 hook 模式，但远端 CLI 根本没有 hook → reminder 丢）。
     getBotMock.mockReturnValue({
-      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'auto' as const, sandbox: true, backendType: 'riff' as const },
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', sandbox: true, backendType: 'riff' as const },
     });
     preflightMock.mockClear();
     const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ sessionBackendType: 'riff' as const }));
@@ -308,7 +348,7 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     vi.stubEnv('BOTMUX_SANDBOX', env);
     try {
       getBotMock.mockReturnValue({
-        config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'auto' as const, ...config },
+        config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', ...config },
       });
       preflightMock.mockClear();
       buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts());
@@ -324,7 +364,7 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     getBotMock.mockReturnValue({
       config: {
         larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'codex', wrapperCli: 'gateway codex',
-        envelopeInjection: 'auto' as const, credentialsSourceDir: '/acc/b',
+        credentialsSourceDir: '/acc/b',
       },
     });
     mockLiveWorker({ cliId: 'claude-code', wrapperCli: undefined, credentialsSourceDir: '/acc/b', sandbox: 'off' });
@@ -341,7 +381,7 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
 
   it('运行中删除来源：旧 worker 仍按 init 查 per-bot settings，不跟 live 配置走', () => {
     getBotMock.mockReturnValue({
-      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'auto' as const },
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
     });
     mockLiveWorker({ cliId: 'claude-code', credentialsSourceDir: '/acc/a', sandbox: 'off' });
     const perBotSettings = '/tmp/bots/app_test/claude/settings.json';
@@ -358,7 +398,7 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     getBotMock.mockReturnValue({
       config: {
         larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code',
-        envelopeInjection: 'auto' as const, credentialsSourceDir: '/acc/b',
+        credentialsSourceDir: '/acc/b',
       },
     });
     mockLiveWorker({ cliId: 'claude-code', credentialsSourceDir: undefined, sandbox: 'off' });
@@ -397,7 +437,7 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     getBotMock.mockReturnValue({
       config: {
         larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code',
-        envelopeInjection: 'auto' as const, credentialsSourceDir: '/acc/b',
+        credentialsSourceDir: '/acc/b',
       },
     });
     preflightMock.mockClear();
@@ -438,7 +478,7 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
 
   it('未知后端类型（白名单外）：强制 inline（hardening）', () => {
     getBotMock.mockReturnValue({
-      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'auto' as const },
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
     });
     const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ sessionBackendType: 'future-remote' as any }));
     expect(result.content).toContain('<botmux_reminder>');
@@ -449,7 +489,7 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     // review B3：旧实现 `opts.sessionBackendType && !LOCAL_BACKENDS.has(...)` 在
     // undefined 时短路放过，误进 hook 模式。改为 fail-closed 后必须 inline。
     getBotMock.mockReturnValue({
-      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'auto' as const },
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
     });
     const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ sessionBackendType: undefined }));
     expect(result.content).toContain('<botmux_reminder>');
@@ -512,6 +552,142 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
       replyDeliveryMock.mockReturnValue('send');
     }
   });
+  it('hook 模式下 empty envelope（noTransport + omitReminder + 无 whiteboard/sender/mentions）去壳且不写 sidecar', () => {
+    getBotMock.mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', apiOnly: true },
+    });
+    const result = buildFollowUpCliInput('静默续轮', SESSION_ID, followUpOpts({
+      chatId: 'oc_api_only',
+      omitReminder: true,
+      whiteboardId: undefined,
+      sender: undefined,
+      mentions: undefined,
+    }));
+    expect(result.content).toBe('静默续轮');
+    expect(result.content).not.toContain('<user_message>');
+    expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
+  });
+
+  it('adopt 会话（isAdoptMode / live adoptMode / ds.adoptedFrom）fail-closed 回退 inline', () => {
+    // 1. 显式 isAdoptMode: true（如 trigger-session 触发 adopted claude-code）
+    const r1 = buildFollowUpCliInput('trigger adopt', SESSION_ID, followUpOpts({ isAdoptMode: true }));
+    expect(r1.content).toContain('<botmux_reminder>');
+    expect(claimByPrompt(SESSION_ID, TURN_ID, r1.content)).toBeUndefined();
+
+    // 2. 活 worker 的 initConfig.adoptMode = true
+    mockLiveWorker({ cliId: 'claude-code', adoptMode: true });
+    const r2 = buildFollowUpCliInput('live adopt worker', SESSION_ID, followUpOpts());
+    expect(r2.content).toContain('<botmux_reminder>');
+    expect(claimByPrompt(SESSION_ID, TURN_ID, r2.content)).toBeUndefined();
+    expect(promptHookRunsInCli({ cliId: 'claude-code', sessionBackendType: 'pty', larkAppId: LARK_APP_ID, sessionId: SESSION_ID })).toBe(false);
+
+    // 3. ds.adoptedFrom 置位
+    activeRegistryMock.mockReturnValue(new Map([['k', {
+      session: { sessionId: SESSION_ID, status: 'active' },
+      larkAppId: LARK_APP_ID,
+      adoptedFrom: 'tmux-1',
+      initConfig: { sessionId: SESSION_ID, backendType: 'pty', cliId: 'claude-code' },
+      worker: { killed: false, connected: true },
+    }]]));
+    const r3 = buildFollowUpCliInput('ds adoptedFrom', SESSION_ID, followUpOpts());
+    expect(r3.content).toContain('<botmux_reminder>');
+    expect(promptHookRunsInCli({ cliId: 'claude-code', sessionBackendType: 'pty', larkAppId: LARK_APP_ID, sessionId: SESSION_ID })).toBe(false);
+  });
+
+  it('非回环沙盒（sandboxNetwork:false / sandboxNetworkPolicy / protectedHttpEgressPolicy / reportedIdentityModel.loopbackShared:false）fail-closed 回退 inline', () => {
+    // 1. oncall + sandboxNetwork: false
+    getBotMock.mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', sandbox: 'oncall', sandboxNetwork: false },
+    });
+    expect(buildFollowUpCliInput('no net oncall', SESSION_ID, followUpOpts()).content).toContain('<botmux_reminder>');
+    expect(promptHookRunsInCli({ cliId: 'claude-code', sessionBackendType: 'pty', larkAppId: LARK_APP_ID, sessionId: SESSION_ID })).toBe(false);
+
+    // 2. scratch + sandboxNetwork: false
+    getBotMock.mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', sandbox: 'scratch', sandboxNetwork: false },
+    });
+    expect(buildFollowUpCliInput('no net scratch', SESSION_ID, followUpOpts()).content).toContain('<botmux_reminder>');
+
+    // 3. sandbox: off + sandboxNetwork: false → 沙盒未启用，loopback 仍共享，正常走 hook
+    getBotMock.mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', sandbox: 'off', sandboxNetwork: false },
+    });
+    expect(buildFollowUpCliInput('sandbox off', SESSION_ID, followUpOpts()).content).toBe('sandbox off');
+
+    // 4. oncall + sandboxNetworkPolicy（slirp netns 不共享宿主 loopback）
+    getBotMock.mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', sandbox: 'oncall', sandboxNetworkPolicy: { allow: ['example.com'] } },
+    });
+    expect(buildFollowUpCliInput('slirp policy', SESSION_ID, followUpOpts()).content).toContain('<botmux_reminder>');
+    expect(promptHookRunsInCli({ cliId: 'claude-code', sessionBackendType: 'pty', larkAppId: LARK_APP_ID, sessionId: SESSION_ID })).toBe(false);
+
+    // 5. oncall + live plugin protectedHttpEgressPolicy
+    getBotMock.mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', sandbox: 'oncall', plugins: ['egress-plugin'] },
+    });
+    collectProtectedHttpEgressMock.mockReturnValue([{ pluginId: 'egress-plugin', policy: { allow: ['api.example.com'] }, policyDigest: 'd1' }]);
+    expect(buildFollowUpCliInput('protected egress', SESSION_ID, followUpOpts()).content).toContain('<botmux_reminder>');
+    expect(promptHookRunsInCli({ cliId: 'claude-code', sessionBackendType: 'pty', larkAppId: LARK_APP_ID, sessionId: SESSION_ID })).toBe(false);
+    collectProtectedHttpEgressMock.mockReturnValue([]);
+
+    // 6. live worker 上报 reportedIdentityModel.loopbackShared === false 或 initConfig.protectedHttpEgressPolicy
+    getBotMock.mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', sandbox: 'oncall' },
+    });
+    activeRegistryMock.mockReturnValue(new Map([['k', {
+      session: { sessionId: SESSION_ID, status: 'active' },
+      larkAppId: LARK_APP_ID,
+      initConfig: { sessionId: SESSION_ID, backendType: 'pty', cliId: 'claude-code', sandbox: 'oncall' },
+      reportedIdentityModel: { model: 'single', sandboxEngaged: true, loopbackShared: false, workerPid: 1, workerGeneration: 1, reportedAt: 1 },
+      worker: { killed: false, connected: true },
+    }]]));
+    expect(buildFollowUpCliInput('reported loopback false', SESSION_ID, followUpOpts()).content).toContain('<botmux_reminder>');
+    expect(promptHookRunsInCli({ cliId: 'claude-code', sessionBackendType: 'pty', larkAppId: LARK_APP_ID, sessionId: SESSION_ID })).toBe(false);
+
+    mockLiveWorker({ cliId: 'claude-code', sandbox: 'oncall', protectedHttpEgressPolicy: { pluginId: 'p', policy: {}, policyDigest: 'd' } });
+    expect(buildFollowUpCliInput('init protected egress', SESSION_ID, followUpOpts()).content).toContain('<botmux_reminder>');
+  });
+
+  it('自定义 cliConfigDir 与助理模式 assistantMode 精确检查生效 settings 路径', () => {
+    // 1. 非沙盒 bot 配了 cliConfigDir：查 <cliConfigDir>/settings.json，不查全局
+    getBotMock.mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', cliConfigDir: '/profiles/custom-claude' },
+    });
+    preflightMock.mockClear();
+    preflightMock.mockImplementation((path: unknown) => path === '/profiles/custom-claude/settings.json');
+    expect(buildFollowUpCliInput('custom profile', SESSION_ID, followUpOpts()).content).toBe('custom profile');
+    expect(preflightMock).toHaveBeenCalledWith('/profiles/custom-claude/settings.json');
+
+    // 2. 活 worker 的 initConfig.cliConfigDir 覆盖 live botConfig.cliConfigDir
+    mockLiveWorker({ cliId: 'claude-code', cliConfigDir: '/profiles/frozen-worker', sandbox: 'off' });
+    preflightMock.mockClear();
+    preflightMock.mockImplementation((path: unknown) => path === '/profiles/frozen-worker/settings.json');
+    expect(buildFollowUpCliInput('frozen profile', SESSION_ID, followUpOpts()).content).toBe('frozen profile');
+    expect(preflightMock).toHaveBeenCalledWith('/profiles/frozen-worker/settings.json');
+
+    // 3. 助理模式活 worker：查 <BOT_HOME>/users/<owner>/claude/settings.json
+    const owner = 'ou_0123456789abcdef0123456789abcdef';
+    const assistantSettings = `/tmp/bots/app_test/users/${owner}/claude/settings.json`;
+    getBotMock.mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', sandbox: 'oncall', assistantMode: true },
+    });
+    mockLiveWorker({ cliId: 'claude-code', sandbox: 'oncall', assistantOwnerOpenId: owner });
+    preflightMock.mockClear();
+    preflightMock.mockImplementation((path: unknown) => path === assistantSettings);
+    expect(buildFollowUpCliInput('assistant live', SESSION_ID, followUpOpts()).content).toBe('assistant live');
+    expect(preflightMock).toHaveBeenCalledWith(assistantSettings);
+
+    // 4. 助理模式但 assistantOwnerOpenId 非法或未开 oncall 沙盒：fail-closed 回退 inline
+    mockLiveWorker({ cliId: 'claude-code', sandbox: 'off', assistantOwnerOpenId: owner });
+    preflightMock.mockClear();
+    expect(buildFollowUpCliInput('assistant bad sandbox', SESSION_ID, followUpOpts()).content).toContain('<botmux_reminder>');
+    expect(preflightMock).not.toHaveBeenCalled();
+
+    mockLiveWorker({ cliId: 'claude-code', sandbox: 'oncall', assistantOwnerOpenId: 'bad_owner' });
+    preflightMock.mockClear();
+    expect(buildFollowUpCliInput('assistant bad owner', SESSION_ID, followUpOpts()).content).toContain('<botmux_reminder>');
+    expect(preflightMock).not.toHaveBeenCalled();
+  });
 });
 
 describe('buildNewTopicCliInput — hook 注入模式（opening）', () => {
@@ -520,11 +696,14 @@ describe('buildNewTopicCliInput — hook 注入模式（opening）', () => {
     prevDataDir = process.env.SESSION_DATA_DIR;
     process.env.SESSION_DATA_DIR = '/tmp/test-sessions';
     getBotMock.mockReturnValue({
-      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'auto' as const },
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
     });
     activeRegistryMock.mockReturnValue(undefined);
     getSessionMock.mockReturnValue(undefined);
+    preflightMock.mockReset();
     preflightMock.mockReturnValue(true);
+    collectProtectedHttpEgressMock.mockReset();
+    collectProtectedHttpEgressMock.mockReturnValue([]);
   });
   afterEach(() => {
     if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
@@ -539,31 +718,36 @@ describe('buildNewTopicCliInput — hook 注入模式（opening）', () => {
     ...overrides,
   });
 
-  it('auto + claude-code + preflight 通过 + turnId：whiteboard/sender/mentions 进 sidecar，PTY 文本只剩正文', () => {
+  it('默认开启 + claude-code + preflight 通过 + turnId：whiteboard/sender/mentions/availableBots 进 sidecar，PTY 文本只剩正文且保留 trustedCaller', () => {
+    const trustedCaller = { openId: 'ou_creator', unionId: 'on_creator', isBot: false };
     const result = buildNewTopicCliInput(
       '帮我修个 bug', SESSION_ID, 'claude-code', undefined,
       undefined,
       [{ name: 'Bob', openId: 'ou_bob' }],
-      undefined, undefined,
+      [{ name: 'Helper', displayName: 'Helper', openId: 'ou_helper' }],
+      undefined,
       { name: 'Bot', openId: 'ou_bot' },
       undefined,
       { openId: 'ou_sender', type: 'user' as const, name: 'Sender' },
-      openingOpts(),
+      openingOpts({ trustedCaller }),
     );
 
-    // PTY 文本：只剩用户正文，无 user_message 外壳 / sender / mentions / whiteboard
+    // PTY 文本：只剩用户正文，无 user_message 外壳 / sender / mentions / whiteboard / available_bots
     expect(result.content).toBe('帮我修个 bug');
+    expect(result.trustedCaller).toEqual(trustedCaller);
     expect(result.content).not.toContain('<user_message>');
     expect(result.content).not.toContain('<sender ');
     expect(result.content).not.toContain('<mentions>');
     expect(result.content).not.toContain('<whiteboard');
+    expect(result.content).not.toContain('<available_bots');
 
-    // sidecar：含 whiteboard + sender + mentions
+    // sidecar：含 whiteboard + sender + mentions + available_bots
     const envelope = claimByPrompt(SESSION_ID, TURN_ID, result.content);
     expect(envelope).toBeDefined();
     expect(envelope).toContain('<whiteboard');
     expect(envelope).toContain('<sender ');
     expect(envelope).toContain('<mentions>');
+    expect(envelope).toContain('<available_bots');
   });
 
   it('缺 turnId：回退 inline（有 user_message 外壳，无 sidecar）', () => {
@@ -580,9 +764,9 @@ describe('buildNewTopicCliInput — hook 注入模式（opening）', () => {
     expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
   });
 
-  it('off：完全 inline（无 sidecar）', () => {
+  it('遗留配置含 envelopeInjection: off：兼容忽略，opening 仍默认走 hook 模式', () => {
     getBotMock.mockReturnValue({
-      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'off' as const },
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'off' },
     });
     const result = buildNewTopicCliInput(
       '帮我修个 bug', SESSION_ID, 'claude-code', undefined,
@@ -592,22 +776,297 @@ describe('buildNewTopicCliInput — hook 注入模式（opening）', () => {
       { openId: 'ou_sender', type: 'user' as const, name: 'Sender' },
       openingOpts(),
     );
-    expect(result.content).toContain('<user_message>');
-    expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
+    expect(result.content).toBe('帮我修个 bug');
+    expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toContain('<sender ');
   });
 
-  it('无 whiteboard/sender/mentions（envelope 为空）：回退 inline，保留外壳', () => {
-    // envelope 为空时不写 sidecar，回退 inline——外壳保留给会话发现/标题提取用。
+  it('无 whiteboard/sender/mentions/availableBots（envelope 为空）且有 turnId：去 <user_message> 外壳、不写 sidecar、保留 trustedCaller', () => {
+    const trustedCaller = { openId: 'ou_sched', isBot: false };
     const result = buildNewTopicCliInput(
       '帮我修个 bug', SESSION_ID, 'claude-code', undefined,
       undefined, undefined, undefined, undefined,
       undefined,
       undefined,
       undefined,
-      openingOpts({ whiteboardId: undefined }),
+      openingOpts({ whiteboardId: undefined, trustedCaller }),
+    );
+    expect(result.content).toBe('帮我修个 bug');
+    expect(result.content).not.toContain('<user_message>');
+    expect(result.trustedCaller).toEqual(trustedCaller);
+    expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
+  });
+
+  it('opening envelope 超过 8000 字符上限：无损回退 inline', () => {
+    const hugeMentions = Array.from({ length: 160 }, (_, idx) => ({
+      name: `Collaborator_${idx}_${'x'.repeat(30)}`,
+      openId: `ou_${String(idx).padStart(32, '0')}`,
+    }));
+    const result = buildNewTopicCliInput(
+      '帮我修个 bug', SESSION_ID, 'claude-code', undefined,
+      undefined, hugeMentions, undefined, undefined,
+      { name: 'Bot', openId: 'ou_bot' },
+      undefined,
+      { openId: 'ou_sender', type: 'user' as const, name: 'Sender' },
+      openingOpts(),
     );
     expect(result.content).toContain('<user_message>');
+    expect(result.content).toContain('<mentions>');
     expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
+  });
+
+  it('已登记在 activeSessions 的全新 opening（worker: null、无历史/generation）：走 hook 模式并叠加冻结会话字段', () => {
+    const owner = 'ou_abcdef0123456789abcdef0123456789';
+    const assistantSettings = `/tmp/bots/app_test/users/${owner}/claude/settings.json`;
+    getBotMock.mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', sandbox: 'oncall', assistantMode: true },
+    });
+    activeRegistryMock.mockReturnValue(new Map([['k', {
+      session: { sessionId: SESSION_ID, status: 'active', assistantOwnerOpenId: owner },
+      larkAppId: LARK_APP_ID,
+      worker: null,
+      hasHistory: false,
+    }]]));
+    preflightMock.mockImplementation((path: unknown) => path === assistantSettings);
+    const result = buildNewTopicCliInput(
+      '全新话题消息', SESSION_ID, 'claude-code', undefined,
+      undefined, undefined, undefined, undefined,
+      { name: 'Bot', openId: 'ou_bot' },
+      undefined,
+      { openId: 'ou_sender', type: 'user' as const, name: 'Sender' },
+      openingOpts(),
+    );
+    expect(result.content).toBe('全新话题消息');
+    expect(preflightMock).toHaveBeenCalledWith(assistantSettings);
+    expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toContain('<sender ');
+  });
+
+  it('已登记在 activeSessions 的 /fork 子会话（worker: null + pendingForkSession: true）：走 hook 模式且未设 sandbox 折算为 off', () => {
+    getBotMock.mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', sandbox: 'oncall' },
+    });
+    activeRegistryMock.mockReturnValue(new Map([['k', {
+      session: { sessionId: SESSION_ID, status: 'active', pendingForkSession: true, cliSessionId: 'parent-cli-sid' },
+      larkAppId: LARK_APP_ID,
+      worker: null,
+      hasHistory: true,
+    }]]));
+    const globalSettings = `${DEFAULT_CLAUDE_DATA_DIR}/settings.json`;
+    preflightMock.mockImplementation((path: unknown) => path === globalSettings);
+    const result = buildNewTopicCliInput(
+      '分身任务', SESSION_ID, 'claude-code', undefined,
+      undefined, undefined, undefined, undefined,
+      { name: 'Bot', openId: 'ou_bot' },
+      undefined,
+      { openId: 'ou_sender', type: 'user' as const, name: 'Sender' },
+      openingOpts(),
+    );
+    expect(result.content).toBe('分身任务');
+    expect(preflightMock).toHaveBeenCalledWith(globalSettings);
+    expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toContain('<sender ');
+  });
+
+  it.each([
+    ['已有 hasHistory', { worker: null, hasHistory: true, session: { sessionId: SESSION_ID, status: 'active' } }],
+    ['已有 workerGeneration', { worker: null, hasHistory: false, workerGeneration: 1, session: { sessionId: SESSION_ID, status: 'active', workerGeneration: 1 } }],
+    ['已有 cliSessionId', { worker: null, hasHistory: false, session: { sessionId: SESSION_ID, status: 'active', cliSessionId: 'prior-sid' } }],
+    ['已有 initConfig', { worker: null, hasHistory: false, initConfig: { backendType: 'pty', cliId: 'claude-code' }, session: { sessionId: SESSION_ID, status: 'active' } }],
+    ['死亡 worker', { worker: { killed: true, connected: false }, hasHistory: false, initConfig: { backendType: 'pty', cliId: 'claude-code' }, session: { sessionId: SESSION_ID, status: 'active' } }],
+    ['adopted 会话', { worker: null, hasHistory: false, adoptedFrom: 'tmux-1', session: { sessionId: SESSION_ID, status: 'active', adoptedFrom: 'tmux-1' } }],
+  ] as const)('已登记在 activeSessions 的非全新 opening（%s）：fail-closed 回退 inline', (_label, dsEntry) => {
+    activeRegistryMock.mockReturnValue(new Map([['k', { larkAppId: LARK_APP_ID, ...dsEntry }]]));
+    preflightMock.mockClear();
+    const result = buildNewTopicCliInput(
+      '不应误走 hook', SESSION_ID, 'claude-code', undefined,
+      undefined, undefined, undefined, undefined,
+      { name: 'Bot', openId: 'ou_bot' },
+      undefined,
+      { openId: 'ou_sender', type: 'user' as const, name: 'Sender' },
+      openingOpts(),
+    );
+    expect(result.content).toContain('<user_message>');
+    expect(preflightMock).not.toHaveBeenCalled();
+    expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
+  });
+
+  it('未登记但持久化行已有先前 workerGeneration 的 opening：fail-closed 回退 inline', () => {
+    getSessionMock.mockReturnValue({ sessionId: SESSION_ID, status: 'active', workerGeneration: 2 });
+    preflightMock.mockClear();
+    const result = buildNewTopicCliInput(
+      '旧持久化行', SESSION_ID, 'claude-code', undefined,
+      undefined, undefined, undefined, undefined,
+      { name: 'Bot', openId: 'ou_bot' },
+      undefined,
+      { openId: 'ou_sender', type: 'user' as const, name: 'Sender' },
+      openingOpts(),
+    );
+    expect(result.content).toContain('<user_message>');
+    expect(preflightMock).not.toHaveBeenCalled();
+  });
+
+  it('plannedOpeningBackendType 严格与 forkWorker 后端优先级和远端配对规则一致', () => {
+    expect(plannedOpeningBackendType({ initConfig: { backendType: 'tmux' } as any, session: { backendType: 'pty' } }, 'claude-code', { backendType: 'herdr' })).toBe('tmux');
+    expect(plannedOpeningBackendType({ initConfig: undefined, session: { backendType: 'tmux' } }, 'claude-code', { backendType: 'herdr' })).toBe('tmux');
+    expect(plannedOpeningBackendType({ initConfig: undefined, session: { backendType: undefined } }, 'claude-code', { backendType: 'herdr' })).toBe('herdr');
+    expect(plannedOpeningBackendType({ initConfig: undefined, session: { backendType: undefined } }, 'claude-code', { backendType: undefined })).toBe('pty');
+    // claude-code 遇到误配的远端后端 → 折回 daemon 默认本地后端
+    expect(plannedOpeningBackendType({ initConfig: undefined, session: { backendType: undefined } }, 'claude-code', { backendType: 'riff' })).toBe('pty');
+    // 远端 CLI 强制走其同名远端后端
+    expect(plannedOpeningBackendType({ initConfig: undefined, session: { backendType: 'pty' } }, 'riff', { backendType: 'pty' })).toBe('riff');
+    // Retired initConfig from a different CLI must not shadow the new CLI's planned backend.
+    expect(plannedOpeningBackendType({ initConfig: { cliId: 'codex', backendType: 'tmux' } as any, session: { backendType: undefined } }, 'claude-code', { backendType: 'pty' })).toBe('pty');
+  });
+
+  it('首字节为 ! 或 /（含不可见字符或前导空白，或前挂 sharedGroupContext）：fail-closed 保留 <user_message> 防 Bash/斜杠命令直达输入框', () => {
+    const zwsp = String.fromCharCode(0x200B);
+    const dangerousInputs = [
+      '!rm -rf /tmp/x',
+      `${zwsp}!id`,
+      '!env\nline2',
+      '/exit',
+      '   /exit',
+      '/exit\nexplain',
+      '/config',
+      '/permissions',
+      '/hooks',
+      '/clear',
+      '/var/log/app.log',
+    ];
+    for (const [idx, text] of dangerousInputs.entries()) {
+      const opening = buildNewTopicCliInput(
+        text, SESSION_ID, 'claude-code', undefined,
+        undefined, undefined, undefined, undefined,
+        { name: 'Bot', openId: 'ou_bot' },
+        undefined,
+        { openId: 'ou_sender', type: 'user' as const, name: 'Sender' },
+        openingOpts({ turnId: `t-open-${idx}`, sharedGroupContext: '<shared_group_context>bg</shared_group_context>' }),
+      );
+      expect(opening.content, `opening ${text}`).toContain('<user_message>');
+      expect(sanitizeClaudeInput(opening.content).trimStart(), `opening ${text}`).not.toMatch(/^[/!]/);
+      expect(claimByPrompt(SESSION_ID, `t-open-${idx}`, opening.content)).toBeUndefined();
+
+      const followUp = buildFollowUpCliInput(text, SESSION_ID, followUpOpts({
+        turnId: `t-fu-${idx}`,
+        sharedGroupContext: '<shared_group_context>bg</shared_group_context>',
+      }));
+      expect(followUp.content, `followup ${text}`).toContain('<user_message>');
+      expect(sanitizeClaudeInput(followUp.content).trimStart(), `followup ${text}`).not.toMatch(/^[/!]/);
+      expect(claimByPrompt(SESSION_ID, `t-fu-${idx}`, followUp.content)).toBeUndefined();
+    }
+  });
+
+  it('process.env.SESSION_DATA_DIR 未设时仍按 config.session.dataDir 查 per-bot BOT_HOME settings', () => {
+    delete process.env.SESSION_DATA_DIR;
+    getBotMock.mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', sandbox: 'oncall' },
+    });
+    preflightMock.mockClear();
+    const res = buildNewTopicCliInput(
+      '查一下状态', SESSION_ID, 'claude-code', undefined,
+      undefined, undefined, undefined, undefined,
+      { name: 'Bot', openId: 'ou_bot' },
+      undefined,
+      { openId: 'ou_sender', type: 'user' as const, name: 'Sender' },
+      openingOpts(),
+    );
+    expect(res.content).toBe('查一下状态');
+    expect(preflightMock).toHaveBeenCalledWith('/tmp/bots/app_test/claude/settings.json');
+  });
+
+  it('freshCliOpening（pending cliLaunchSnapshot）与 freshColdOpening（worker-null 空启动首轮）可进 hook，已有 lastCliInput 的续轮仍 fail-closed', () => {
+    // 1. quota-fallback pending fresh CLI launch
+    activeRegistryMock.mockReturnValue(new Map([['k', {
+      session: {
+        sessionId: SESSION_ID,
+        status: 'active',
+        workerGeneration: 1,
+        cliLaunchSnapshot: { state: 'pending', cliId: 'claude-code' },
+      },
+      larkAppId: LARK_APP_ID,
+      worker: null,
+      workerGeneration: 1,
+      hasHistory: false,
+    }]]));
+    const freshCli = buildNewTopicCliInput(
+      '切换后继续', SESSION_ID, 'claude-code', undefined,
+      undefined, undefined, undefined, undefined,
+      { name: 'Bot', openId: 'ou_bot' },
+      undefined,
+      { openId: 'ou_sender', type: 'user' as const, name: 'Sender' },
+      openingOpts({ turnId: 't-fresh-cli' }),
+    );
+    expect(freshCli.content).toBe('切换后继续');
+    expect(freshCli.hookEnvelope).toContain('<sender ');
+    expect(claimByPrompt(SESSION_ID, 't-fresh-cli', freshCli.content)).toContain('<sender ');
+
+    // 2. worker-null empty-start cold opening (freshColdOpening: true, no lastCliInput)
+    activeRegistryMock.mockReturnValue(new Map([['k', {
+      session: { sessionId: SESSION_ID, status: 'active', workerGeneration: 1 },
+      larkAppId: LARK_APP_ID,
+      worker: null,
+      workerGeneration: 1,
+      hasHistory: true,
+    }]]));
+    const emptyCold = buildNewTopicCliInput(
+      '空启动首条消息', SESSION_ID, 'claude-code', undefined,
+      undefined, undefined, undefined, undefined,
+      { name: 'Bot', openId: 'ou_bot' },
+      undefined,
+      { openId: 'ou_sender', type: 'user' as const, name: 'Sender' },
+      openingOpts({ turnId: 't-empty-cold', freshColdOpening: true }),
+    );
+    expect(emptyCold.content).toBe('空启动首条消息');
+    expect(claimByPrompt(SESSION_ID, 't-empty-cold', emptyCold.content)).toContain('<sender ');
+
+    // 3. Same worker-null session once lastCliInput exists -> fail-closed inline
+    activeRegistryMock.mockReturnValue(new Map([['k', {
+      session: { sessionId: SESSION_ID, status: 'active', workerGeneration: 1, lastCliInput: 'earlier' },
+      larkAppId: LARK_APP_ID,
+      worker: null,
+      workerGeneration: 1,
+      hasHistory: true,
+    }]]));
+    const withPriorInput = buildNewTopicCliInput(
+      '已有前置输入', SESSION_ID, 'claude-code', undefined,
+      undefined, undefined, undefined, undefined,
+      { name: 'Bot', openId: 'ou_bot' },
+      undefined,
+      { openId: 'ou_sender', type: 'user' as const, name: 'Sender' },
+      openingOpts({ turnId: 't-prior-input', freshColdOpening: true }),
+    );
+    expect(withPriorInput.content).toContain('<user_message>');
+  });
+
+  it('prepareHookEnvelopeForReplay：活 worker 走新 turnId sidecar，休眠 fork 回退内联不丢信封', () => {
+    const envelope = '<botmux_reminder>本会话通过 botmux 桥接飞书</botmux_reminder>\n\n<sender name="User" />';
+    const liveDs = {
+      session: { sessionId: SESSION_ID, status: 'active' },
+      larkAppId: LARK_APP_ID,
+      worker: { killed: false, connected: true },
+      initConfig: { sessionId: SESSION_ID, cliId: 'claude-code', backendType: 'pty', sandbox: 'off' },
+    } as any;
+
+    const liveReplay = prepareHookEnvelopeForReplay({
+      ds: liveDs,
+      content: '重发任务',
+      turnId: 'retry-live-1',
+      hookEnvelope: envelope,
+      willUseLiveWorker: true,
+    });
+    expect(liveReplay.content).toBe('重发任务');
+    expect(liveReplay.hookEnvelope).toBe(envelope);
+    expect(claimByPrompt(SESSION_ID, 'retry-live-1', liveReplay.content)).toBe(envelope);
+
+    const dormantReplay = prepareHookEnvelopeForReplay({
+      ds: { ...liveDs, worker: null },
+      content: '重发任务',
+      turnId: 'retry-fork-2',
+      hookEnvelope: envelope,
+      willUseLiveWorker: false,
+    });
+    expect(dormantReplay.content).toContain('<botmux_reminder>');
+    expect(dormantReplay.content).toContain('重发任务');
+    expect(dormantReplay.hookEnvelope).toBeUndefined();
+    expect(claimByPrompt(SESSION_ID, 'retry-fork-2', dormantReplay.content)).toBeUndefined();
   });
 
   it('skill catalog 追加到 prompt 尾部后：全量指纹 miss，prefix 兜底仍能 claim', () => {

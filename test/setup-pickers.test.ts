@@ -196,6 +196,41 @@ describe('fetchOpenPlatformAppSecret', () => {
 });
 
 describe('createOpenPlatformAppWithClient', () => {
+  it('propagates cancellation through upload and prevents every later create/switch write', async () => {
+    const calls: string[] = [];
+    let releaseUpload!: () => void;
+    let uploadStarted!: () => void;
+    let uploadSignal: AbortSignal | undefined;
+    const started = new Promise<void>(resolve => { uploadStarted = resolve; });
+    const controller = new AbortController();
+    const client: OpenPlatformApiClient = {
+      apiOrigin: 'https://open.feishu.cn',
+      postJson: async path => { calls.push(path); return { code: 0, data: {} }; },
+      postJsonIdempotent: async path => { calls.push(path); return { code: 0, data: {} }; },
+      postForm: async (path, _body, options) => {
+        calls.push(path);
+        uploadSignal = options?.signal;
+        uploadStarted();
+        await new Promise<void>(resolve => { releaseUpload = resolve; });
+        return { code: 0, data: { url: 'https://cdn.example/botmux.png' } };
+      },
+    };
+
+    const pending = createOpenPlatformAppWithClient(client, {
+      name: 'botmux-cancel',
+      creatorUserId: 'u_creator',
+      signal: controller.signal,
+    });
+    await started;
+    controller.abort(new Error('user cancelled'));
+    releaseUpload();
+
+    await expect(pending).rejects.toMatchObject({ reason: 'aborted' });
+    expect(uploadSignal).toBe(controller.signal);
+    expect(calls).toEqual(['/developers/v1/app/upload/image']);
+    expect(calls.some(path => path.includes('upsert_by_template') || path.includes('/switch/'))).toBe(false);
+  });
+
   it('uploads the icon, creates via template, publishes an enabling version, then reads its secret', async () => {
     const client = stubClient([
       { code: 0, data: { url: 'https://cdn.example/botmux.png' } }, // upload/image

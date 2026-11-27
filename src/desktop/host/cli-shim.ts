@@ -1,5 +1,5 @@
 import { existsSync, lstatSync, mkdirSync, openSync, readSync, closeSync, readFileSync, realpathSync } from 'node:fs';
-import { delimiter, join } from 'node:path';
+import { delimiter, dirname, join } from 'node:path';
 import { botmuxWrapperFiles } from '../../core/botmux-wrapper.js';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 
@@ -108,7 +108,9 @@ export function ensureBotmuxShim(input: {
     // followed to wherever it used to point.
     atomicWriteFileSync(path, content, { mode, followTargetSymlink: false });
   });
-  mkdirSync(input.binDir, { recursive: true });
+  const parentDir = dirname(input.binDir);
+  if (!existsSync(parentDir)) mkdirSync(parentDir, { recursive: true, mode: 0o700 });
+  mkdirSync(input.binDir, { recursive: true, mode: 0o700 });
   // Same files (and the same compiled-binary form) the daemon itself writes, so a
   // later daemon start sees identical content and leaves them untouched.
   for (const file of botmuxWrapperFiles('', input.bundledBinary, process.platform, true)) {

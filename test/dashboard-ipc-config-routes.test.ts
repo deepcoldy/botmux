@@ -63,8 +63,8 @@ const CASES: readonly Case[] = [
   ['/api/bot-owner-group-follow', '{"ownerGroupFollow":{"excludeChatIds":["ou_other"]}}', 400, { ok: false, error: 'invalid_json' }],
   ['/api/bot-p2p-mode', '{"p2pMode":"thread"}', 200, { ok: true, p2pMode: 'thread' }, { p2pMode: 'thread' }],
   ['/api/bot-p2p-mode', '{"p2pMode":5}', 200, { ok: true, p2pMode: 'chat' }, { p2pMode: undefined }],
-  ['/api/bot-envelope-injection', '{"envelopeInjection":"auto"}', 200, { ok: true, envelopeInjection: 'auto' }, { envelopeInjection: 'auto' }],
-  ['/api/bot-envelope-injection', '{"envelopeInjection":"off"}', 200, { ok: true, envelopeInjection: 'off' }, { envelopeInjection: undefined }],
+  ['/api/bot-envelope-injection', '{"envelopeInjection":"auto"}', 200, { ok: true, envelopeInjection: 'auto' }, { envelopeInjection: undefined }],
+  ['/api/bot-envelope-injection', '{"envelopeInjection":"off"}', 200, { ok: true, envelopeInjection: 'auto' }, { envelopeInjection: undefined }],
   ['/api/bot-topic-unavailable-policy', '{"topicUnavailablePolicy":"stop"}', 200, { ok: true, topicUnavailablePolicy: 'stop' }, { topicUnavailablePolicy: 'stop' }],
   ['/api/bot-topic-unavailable-policy', '{"topicUnavailablePolicy":"x"}', 400, { ok: false, error: 'invalid_topic_unavailable_policy' }],
   ['/api/bot-topic-unavailable-policy', '[]', 400, { ok: false, error: 'invalid_topic_unavailable_policy' }],
@@ -136,7 +136,12 @@ const CASES: readonly Case[] = [
     ok: true,
     riff: '{\n  "baseUrl": "https://riff.example.com",\n  "model": "m",\n  "sandboxCluster": "boe"\n}',
   }, { riff: { baseUrl: 'https://riff.example.com', model: 'm', sandboxCluster: 'boe' } }],
+  ['/api/bot-riff', '{"riff":"{\\"baseUrl\\":\\"https://riff.example.com\\",\\"agent\\":\\"claude\\",\\"model\\":\\"gemini-4-neon\\"}"}', 200, {
+    ok: true,
+    riff: '{\n  "baseUrl": "https://riff.example.com",\n  "agent": "claude",\n  "model": "gemini-4-neon",\n  "sandboxCluster": "boe"\n}',
+  }, { riff: { baseUrl: 'https://riff.example.com', agent: 'claude', model: 'gemini-4-neon', sandboxCluster: 'boe' } }],
   ['/api/bot-riff', '{"riff":"   "}', 200, { ok: true, riff: '' }, { riff: undefined }],
+  ['/api/bot-riff', '{"riff":"{\\"baseUrl\\":\\"https://riff.example.com\\",\\"agent\\":\\"bogus\\"}"}', 400, { ok: false, error: 'invalid_agent' }],
   ['/api/bot-riff', '{"riff":"{\\"baseUrl\\":\\"https://riff.example.com\\",\\"sandboxCluster\\":\\"nope\\"}"}', 400, { ok: false, error: 'invalid_sandbox_cluster' }],
   ['/api/bot-riff', '{"riff":"{\\"baseUrl\\":\\"ftp://x\\"}"}', 400, { ok: false, error: 'invalid_base_url' }],
   // herdr：合法值经 normalizeHerdrBackendConfig 归一落盘；非法字段显式拒绝；空串 / 空对象清除。
@@ -477,5 +482,30 @@ describe('config-field PUT routes (botConfigPutRoute)', () => {
         expect(await res.text(), `${path} ${body}`).not.toContain('spec_missing');
       }
     }
+  });
+
+  it('keeps /api/bot-envelope-injection as a read-only no-op compat route and reports auto on /api/bot-default-oncall', async () => {
+    const rawBefore = JSON.stringify([{
+      larkAppId: APP_ID,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      envelopeInjection: 'off',
+    }]);
+    writeFileSync(configPath, rawBefore);
+
+    const resOff = await put('/api/bot-envelope-injection', JSON.stringify({ envelopeInjection: 'off' }));
+    expect(resOff.status).toBe(200);
+    expect(await resOff.json()).toEqual({ ok: true, envelopeInjection: 'auto' });
+
+    const resAuto = await put('/api/bot-envelope-injection', JSON.stringify({ envelopeInjection: 'auto' }));
+    expect(resAuto.status).toBe(200);
+    expect(await resAuto.json()).toEqual({ ok: true, envelopeInjection: 'auto' });
+
+    // Must not mutate bots.json on disk.
+    expect(readFileSync(configPath, 'utf8')).toBe(rawBefore);
+
+    const defaultsRes = await fetch(`http://127.0.0.1:${handle!.port}/api/bot-default-oncall`);
+    expect(defaultsRes.status).toBe(200);
+    expect(await defaultsRes.json()).toMatchObject({ envelopeInjection: 'auto' });
   });
 });

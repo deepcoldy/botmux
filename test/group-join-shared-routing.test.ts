@@ -2075,6 +2075,18 @@ async function collaborativeSession() {
 }
 
 describe('configured serial group input', () => {
+  it('keeps ordinary TraeX RPC corrections steerable unless the group explicitly serializes input', async () => {
+    const { ds, owner } = await collaborativeSession();
+    ds.session.cliId = 'traex';
+    ds.initConfig = { ...ds.initConfig, cliId: 'traex', codexRpcInput: true } as typeof ds.initConfig;
+    const cfg = modules.registry.getBot(ds.larkAppId).config;
+    cfg.groupSerialInput = undefined;
+    expect(modules.policy.shouldQueueAfterActiveTurn(ds, { turnId: 'om_correction', caller: owner })).toBe(false);
+    cfg.groupSerialInput = { [ds.chatId]: true };
+    expect(modules.policy.shouldQueueAfterActiveTurn(ds, { turnId: 'om_correction', caller: owner })).toBe(true);
+    expect(modules.policy.shouldQueueAfterActiveTurn(ds, { turnId: 'om_correction', caller: owner, dispatchAttempt: 1 })).toBe(false);
+  });
+
   it.each(['false', 'true'])('admits another member in order without an owner question with XPI=%s', async (xpiEnabled) => {
     vi.stubEnv('BOTMUX_XPI_ENABLED', xpiEnabled);
     const { ds, other } = await collaborativeSession();
@@ -2202,4 +2214,306 @@ it('does not resurrect a removed input when its outstanding card fails', async (
   await pending;
   expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
   expect(ds.crossPrincipalWaitTimer).toBeUndefined();
+});
+
+describe('native-topic cross-principal text answers', () => {
+  let broker: typeof import('../src/core/ask-broker.js') | undefined;
+
+  beforeEach(async () => {
+    vi.stubEnv('BOTMUX_XPI_ENABLED', 'true');
+    broker = await vi.importActual<typeof import('../src/core/ask-broker.js')>('../src/core/ask-broker.js');
+    broker._resetForTest();
+    broker.setAskPersistStore(null);
+    broker.setCanTalkChecker(() => true);
+    broker.setCardDispatcher({
+      send: async ask => ({ messageId: `om_card_${ask.askId}` }),
+      onSettle: () => {},
+    });
+    mocks.registerHostAsk.mockReset().mockImplementation(input => broker!.registerHostAsk(input));
+  });
+
+  afterEach(() => {
+    broker?._resetForTest();
+    broker = undefined;
+    mocks.registerHostAsk.mockReset();
+    manualHostSequence = 0;
+  });
+
+  let manualHostSequence = 0;
+
+  function registerManualHost(ds: any, originKind: string, answererOpenId: string, timeoutMs = 3_600_000,
+    sessionId = ds.session.sessionId) {
+    const before = new Set(broker!._allAskIds());
+    const requestId = `manual-${originKind}-${++manualHostSequence}`;
+    const waiting = broker!.registerHostAsk({
+      larkAppId: ds.larkAppId, chatId: ds.chatId, rootMessageId: null,
+      sessionId, originKind, requestId, answererOpenId,
+      chatType: 'group', timeoutMs,
+      questions: [{ prompt: 'manual host choice', multiSelect: false,
+        options: [{ key: 'yes', label: 'yes' }, { key: 'no', label: 'no' }] }],
+    });
+    const askId = broker!._allAskIds().find(id => !before.has(id))!;
+    return { askId, waiting };
+  }
+
+  function hostOrigin(stage: 'classification' | 'wait'): string {
+    return stage === 'classification' ? 'host_cross_principal_classification' : 'host_cross_principal_wait';
+  }
+
+  async function stageHostScenario(stage: 'classification' | 'wait') {
+    const { ds, owner, other } = await collaborativeSession();
+    const { record } = modules.interruptions.stageCrossPrincipalInterruptionRecord({
+      session: ds.session, ownerTurnId: 'om_owner_active', owner, proposer: other,
+      message: { turnId: `om_${stage}_candidate_case`, text: 'evidence', userPrompt: 'evidence', createdAt: new Date().toISOString() },
+    });
+    if (stage === 'wait') {
+      record.phase = 'awaiting_owner';
+      record.ownerWaitDeadlineAt = Date.now() - 1;
+    }
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    return { ds, owner, other, record };
+  }
+
+  async function currentHosts(ds: any, originKind: string) {
+    await vi.waitFor(() => {
+      const delivered = broker!._allAskIds().some(id => {
+        const ask = broker!._getPending(id);
+        return ask?.sessionId === ds.session.sessionId && ask.originKind === originKind && !!ask.cardMessageId;
+      });
+      expect(delivered).toBe(true);
+    });
+    return broker!._allAskIds().map(id => broker!._getPending(id)!).filter(ask =>
+      ask.sessionId === ds.session.sessionId && ask.originKind === originKind && !ask.settled);
+  }
+
+  async function sendNativeChoice(ds: any, proposer: any, stage: 'classification' | 'wait', text: string, parentId?: string) {
+    const messageId = `om_${stage}_choice_${parentId ? 'quoted' : 'plain'}_${++manualHostSequence}`;
+    await modules.daemon.__testOnly_handleThreadReply({
+      sender: { sender_id: { open_id: proposer.requestUserOpenId }, sender_type: 'user' },
+      message: { message_id: messageId, chat_id: ds.chatId, chat_type: 'group', message_type: 'text',
+        root_id: 'om_native_choice_topic', parent_id: parentId ?? 'om_native_choice_parent', thread_id: 'omt_native_choice',
+        content: JSON.stringify({ text }), create_time: String(Date.now()) },
+    }, { chatId: ds.chatId, messageId, chatType: 'group', scope: 'chat',
+      anchor: ds.chatId, replyRootId: 'om_native_choice_topic', larkAppId: ds.larkAppId });
+  }
+
+  it.each([
+    { stage: 'classification', text: '对当前任务的建议', unauthorizedExact: false },
+    { stage: 'classification', text: '对当前任务的建议', unauthorizedExact: true },
+    { stage: 'wait', text: '继续等待', unauthorizedExact: false },
+    { stage: 'wait', text: '继续等待', unauthorizedExact: true },
+  ])('$stage 原生话题文字选择后，原卡超时不得再终止已推进的记录（精确 Ask 鉴权冲突=$unauthorizedExact）', async ({ stage, text, unauthorizedExact }) => {
+    const { ds, owner, other } = await collaborativeSession();
+    const { record } = modules.interruptions.stageCrossPrincipalInterruptionRecord({
+      session: ds.session, ownerTurnId: 'om_owner_active', owner, proposer: other,
+      message: { turnId: `om_${stage}_native_choice`, text: 'evidence', userPrompt: 'evidence', createdAt: new Date().toISOString() },
+    });
+    if (stage === 'wait') {
+      record.phase = 'awaiting_owner';
+      record.ownerWaitDeadlineAt = Date.now() - 1;
+    }
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    let ordinaryAskId: string | undefined;
+    if (unauthorizedExact) {
+      // The exact ordinary Ask wins candidate ordering but rejects `other`;
+      // the rootless XPI card must remain available to its authorized proposer.
+      void broker!.registerAsk({
+        larkAppId: ds.larkAppId, chatId: ds.chatId, rootMessageId: 'om_native_choice_topic',
+        sessionId: `ordinary-${stage}`, originKind: 'explicit', chatType: 'group',
+        answererOpenId: owner.requestUserOpenId, timeoutMs: 3_600_000,
+        questions: [{ prompt: 'ordinary exact question', multiSelect: false,
+          options: [{ key: 'yes', label: 'yes' }, { key: 'no', label: 'no' }] }],
+      });
+      const exactRoute = { larkAppId: ds.larkAppId, chatId: ds.chatId,
+        anchor: ds.chatId, messageRootId: 'om_native_choice_topic' };
+      await vi.waitFor(() => expect(broker!.listPendingAsksByAnchor(exactRoute)).toHaveLength(1));
+      ordinaryAskId = broker!.listPendingAsksByAnchor(exactRoute)[0]!.askId;
+    }
+    const driving = modules.daemon.__testOnly_driveCrossPrincipalInterruptions(ds);
+    await vi.waitFor(() => expect(mocks.registerHostAsk).toHaveBeenCalledTimes(1));
+    const pendingAsk = (await currentHosts(ds, hostOrigin(stage)))[0]!;
+    const originalCardDeadline = pendingAsk.deadlineAt;
+
+    // Move the human answer inside the card window, but far enough forward that
+    // the newly extended owner-wait deadline is strictly after the old card deadline.
+    await vi.advanceTimersByTimeAsync(1_000);
+    await modules.daemon.__testOnly_handleThreadReply({
+      sender: { sender_id: { open_id: other.requestUserOpenId }, sender_type: 'user' },
+      message: { message_id: `om_${stage}_choice`, chat_id: ds.chatId, chat_type: 'group', message_type: 'text',
+        root_id: 'om_native_choice_topic', parent_id: 'om_native_choice_parent', thread_id: 'omt_native_choice',
+        content: JSON.stringify({ text }), create_time: String(Date.now()) },
+    }, { chatId: ds.chatId, messageId: `om_${stage}_choice`, chatType: 'group', scope: 'chat',
+      anchor: ds.chatId, replyRootId: 'om_native_choice_topic', larkAppId: ds.larkAppId });
+
+    await vi.waitFor(() => expect(record.phase).toBe('awaiting_owner'));
+    const settledAfterText = broker!._getPending(pendingAsk.askId)?.settled === true;
+    const ordinarySettledAfterText = ordinaryAskId
+      ? broker!._getPending(ordinaryAskId)?.settled === true
+      : undefined;
+    const extendedDeadline = record.ownerWaitDeadlineAt;
+    await vi.advanceTimersByTimeAsync(originalCardDeadline - Date.now());
+    await driving;
+
+    expect({
+      settledAfterText,
+      ordinarySettledAfterText,
+      waitExtendedBeyondOldCardDeadline: extendedDeadline! > originalCardDeadline,
+      queueAfterOriginalCardTimeout: ds.session.crossPrincipalInterruptions?.map(item => item.id) ?? [],
+    }).toEqual({
+      settledAfterText: true,
+      ordinarySettledAfterText: unauthorizedExact ? false : undefined,
+      waitExtendedBeyondOldCardDeadline: true,
+      queueAfterOriginalCardTimeout: [record.id],
+    });
+  });
+
+  it.each(['classification', 'wait'] as const)('%s 的旧卡结果不得覆盖已经推进的 phase/round', async stage => {
+    const { ds, owner, other } = await collaborativeSession();
+    const { record } = modules.interruptions.stageCrossPrincipalInterruptionRecord({
+      session: ds.session, ownerTurnId: 'om_owner_active', owner, proposer: other,
+      message: { turnId: `om_${stage}_stale_result`, text: 'evidence', userPrompt: 'evidence', createdAt: new Date().toISOString() },
+    });
+    if (stage === 'wait') {
+      record.phase = 'awaiting_owner';
+      record.ownerWaitDeadlineAt = Date.now() - 1;
+    }
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    const driving = modules.daemon.__testOnly_driveCrossPrincipalInterruptions(ds);
+    await vi.waitFor(() => expect(mocks.registerHostAsk).toHaveBeenCalledTimes(1));
+    const pendingAsk = (await currentHosts(ds, hostOrigin(stage)))[0]!;
+    const originalCardDeadline = pendingAsk.deadlineAt;
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    if (stage === 'classification') {
+      modules.interruptions.markCrossPrincipalSuggestionWaiting(record, Date.now(), 600_000);
+    } else {
+      modules.interruptions.continueCrossPrincipalOwnerWait(record, Date.now(), 600_000);
+    }
+    const advancedPhase = record.phase;
+    const advancedRound = record.waitDecisionRound ?? 0;
+    await vi.advanceTimersByTimeAsync(originalCardDeadline - Date.now());
+    await driving;
+
+    expect({
+      advancedPhase,
+      advancedRound,
+      waitExtendedBeyondOldCardDeadline: record.ownerWaitDeadlineAt! > originalCardDeadline,
+      queueAfterOriginalCardTimeout: ds.session.crossPrincipalInterruptions?.map(item => item.id) ?? [],
+    }).toEqual({
+      advancedPhase: 'awaiting_owner',
+      advancedRound: stage === 'wait' ? 1 : 0,
+      waitExtendedBeyondOldCardDeadline: true,
+      queueAfterOriginalCardTimeout: [record.id],
+    });
+  });
+
+  it.each(['classification', 'wait'] as const)('%s 不得按注册顺序误答旧 session 的同 kind 卡', async stage => {
+    const { ds, other, record } = await stageHostScenario(stage);
+    const stale = registerManualHost(ds, hostOrigin(stage), other.requestUserOpenId, 3_600_000, 'stale-xpi-session');
+    const driving = modules.daemon.__testOnly_driveCrossPrincipalInterruptions(ds);
+    const [current] = await currentHosts(ds, hostOrigin(stage));
+    const originalCardDeadline = current.deadlineAt;
+    await vi.advanceTimersByTimeAsync(1_000);
+    await sendNativeChoice(ds, other, stage, stage === 'classification' ? '对当前任务的建议' : '继续等待');
+    await vi.advanceTimersByTimeAsync(0);
+    const staleResult = broker!._getPending(stale.askId)?.result?.kind;
+    const currentResult = broker!._getPending(current.askId)?.result?.kind;
+    await vi.advanceTimersByTimeAsync(originalCardDeadline - Date.now());
+    await driving;
+    expect({
+      staleResult,
+      currentResult,
+      queueAfterOriginalCardTimeout: ds.session.crossPrincipalInterruptions?.map(item => item.id) ?? [],
+    }).toEqual({ staleResult: undefined, currentResult: 'answered', queueAfterOriginalCardTimeout: [record.id] });
+  });
+
+  it('异 kind host 候选不得挡住当前 wait 卡接受继续等待', async () => {
+    const { ds, other, record } = await stageHostScenario('wait');
+    const wrongKind = registerManualHost(ds, 'host_cross_principal_classification', other.requestUserOpenId);
+    const driving = modules.daemon.__testOnly_driveCrossPrincipalInterruptions(ds);
+    const [current] = await currentHosts(ds, 'host_cross_principal_wait');
+    const originalCardDeadline = current.deadlineAt;
+    await vi.advanceTimersByTimeAsync(1_000);
+    await sendNativeChoice(ds, other, 'wait', '继续等待');
+    await vi.waitFor(() => expect(record.waitDecisionRound).toBe(1));
+    const wrongKindResult = broker!._getPending(wrongKind.askId)?.result?.kind;
+    const currentResult = broker!._getPending(current.askId)?.result?.kind;
+    await vi.advanceTimersByTimeAsync(originalCardDeadline - Date.now());
+    await driving;
+    expect({
+      wrongKindResult,
+      currentResult,
+      queueAfterOriginalCardTimeout: ds.session.crossPrincipalInterruptions?.map(item => item.id) ?? [],
+    }).toEqual({ wrongKindResult: undefined, currentResult: 'answered', queueAfterOriginalCardTimeout: [record.id] });
+  });
+
+  it('首张 host 候选已过期时仍可选择后续有效卡', async () => {
+    const { ds, owner, other, record } = await stageHostScenario('wait');
+    const expired = registerManualHost(ds, 'host_cross_principal_wait', other.requestUserOpenId, 500);
+    void broker!.registerAsk({
+      larkAppId: ds.larkAppId, chatId: ds.chatId, rootMessageId: 'om_native_choice_topic',
+      sessionId: 'ordinary-expired-coexist', originKind: 'explicit', chatType: 'group',
+      answererOpenId: owner.requestUserOpenId, timeoutMs: 3_600_000,
+      questions: [{ prompt: 'ordinary exact question', multiSelect: false,
+        options: [{ key: 'yes', label: 'yes' }, { key: 'no', label: 'no' }] }],
+    });
+    void modules.daemon.__testOnly_driveCrossPrincipalInterruptions(ds);
+    const [current] = (await currentHosts(ds, 'host_cross_principal_wait')).filter(ask => ask.askId !== expired.askId);
+    // Move past the first card deadline WITHOUT firing its timer: submission,
+    // not the timeout callback, must be what adjudicates it as expired.
+    vi.setSystemTime(Date.now() + 1_000);
+    await sendNativeChoice(ds, other, 'wait', '继续等待');
+    await vi.advanceTimersByTimeAsync(0);
+    expect({
+      expiredResult: broker!._getPending(expired.askId)?.result?.kind,
+      roundAfterText: record.waitDecisionRound ?? 0,
+      currentResult: broker!._getPending(current.askId)?.result?.kind,
+      queue: ds.session.crossPrincipalInterruptions?.map(item => item.id) ?? [],
+    }).toEqual({ expiredResult: 'timedOut', roundAfterText: 1, currentResult: 'answered', queue: [record.id] });
+  });
+
+  it.each([false, true])('多个有效同 kind host 未引用时不猜卡，显式引用后才结算目标卡（普通精确鉴权冲突=%s）', async ordinaryConflict => {
+    const { ds, owner, other, record } = await stageHostScenario('wait');
+    const otherWait = registerManualHost(ds, 'host_cross_principal_wait', other.requestUserOpenId);
+    if (ordinaryConflict) {
+      void broker!.registerAsk({
+        larkAppId: ds.larkAppId, chatId: ds.chatId, rootMessageId: 'om_native_choice_topic',
+        sessionId: 'ordinary-ambiguous-coexist', originKind: 'explicit', chatType: 'group',
+        answererOpenId: owner.requestUserOpenId, timeoutMs: 3_600_000,
+        questions: [{ prompt: 'ordinary exact question', multiSelect: false,
+          options: [{ key: 'yes', label: 'yes' }, { key: 'no', label: 'no' }] }],
+      });
+    }
+    const driving = modules.daemon.__testOnly_driveCrossPrincipalInterruptions(ds);
+    const current = (await currentHosts(ds, 'host_cross_principal_wait'))
+      .find(ask => ask.askId !== otherWait.askId)!;
+    const originalCardDeadline = current.deadlineAt;
+    const originalOwnerDeadline = record.ownerWaitDeadlineAt;
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    await sendNativeChoice(ds, other, 'wait', '继续等待');
+    const unquoted = {
+      otherResult: broker!._getPending(otherWait.askId)?.result?.kind,
+      currentResult: broker!._getPending(current.askId)?.result?.kind,
+      round: ds.session.crossPrincipalInterruptions?.[0]?.waitDecisionRound ?? 0,
+      deadlineUnchanged: ds.session.crossPrincipalInterruptions?.[0]?.ownerWaitDeadlineAt === originalOwnerDeadline,
+    };
+    expect(unquoted).toEqual({ otherResult: undefined, currentResult: undefined, round: 0, deadlineUnchanged: true });
+
+    await sendNativeChoice(ds, other, 'wait', '继续等待', current.cardMessageId);
+    await vi.waitFor(() => expect(ds.session.crossPrincipalInterruptions?.[0]?.waitDecisionRound).toBe(1));
+    const quoted = {
+      otherResult: broker!._getPending(otherWait.askId)?.result?.kind,
+      currentResult: broker!._getPending(current.askId)?.result?.kind,
+      ordinaryResult: ordinaryConflict ? broker!.listPendingAsksByAnchor({
+        larkAppId: ds.larkAppId, chatId: ds.chatId, anchor: ds.chatId, messageRootId: 'om_native_choice_topic',
+      })[0]?.result?.kind : undefined,
+    };
+    await vi.advanceTimersByTimeAsync(originalCardDeadline - Date.now());
+    await driving;
+    expect({
+      ...quoted,
+      queueAfterOriginalCardTimeout: ds.session.crossPrincipalInterruptions?.map(item => item.id) ?? [],
+    }).toEqual({ otherResult: undefined, currentResult: 'answered', ordinaryResult: undefined, queueAfterOriginalCardTimeout: [record.id] });
+  });
 });

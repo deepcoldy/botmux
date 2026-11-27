@@ -23,6 +23,10 @@ import { getAskSnapshot, invalidateReplyCardAsks } from './ask-broker.js';
 import { getSession } from '../services/session-store.js';
 import { MessageWithdrawnError, uploadFile, replyMessage, sendMessage } from '../im/lark/client.js';
 import { observeAcknowledgedGroupPublication, patchPublishedGroupCard, readGroupContextAuthorOrigin } from '../services/group-context-publication.js';
+import { appendFailedPromptActions } from '../im/lark/failed-prompt-card.js';
+import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
+import { isRemoteBackendSession } from './persistent-backend.js';
+import { isSharedAdoptSession } from './shared-adopt.js';
 import { buildTurnReplyCard, publicReplyCardActivity, publicReplyCardTools, replyCardPresentation } from '../im/lark/turn-reply-card.js';
 import {
   normalizeReplyCardMode, replyCardIsTerminal, supportsUnifiedReplyCardCli, TurnReplyCardStore,
@@ -261,7 +265,18 @@ export async function updateTurnReplyCard(
         showLiveUsage: normalizeUsageDisplay(cfg) === 'streaming',
         canStop: presentation.canStop && ds.initConfig?.codexRpcInput !== true,
       });
-      return prepareLocalAddressContent(attachOncallGroupButton(raw, cfg.oncallGroup, ds.chatId, ds.chatType, {
+      // A failed final can be published before its ordered terminal has recorded
+      // lastFailedTurn. Later terminal refreshes re-read that exact session/turn
+      // record here, without persisting a second copy in the card store.
+      const withFailedPrompt = record.finalCard ? appendFailedPromptActions(raw, {
+        cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? cfg.cliId,
+        record: ds.session.lastFailedTurn, turnId: record.turnId,
+        rootId: record.rootId, sessionId: record.sessionId, locale: localeForBot(ds.larkAppId),
+        localOwnedSession: !ds.session.headless && !replyCardSandboxBlocked(ds)
+          && !hasProtectedSessionMutationOwnership(ds) && !isSharedAdoptSession(ds)
+          && !isRemoteBackendSession(ds) && !ds.adoptedFrom && !ds.initConfig?.adoptMode,
+      }) : raw;
+      return prepareLocalAddressContent(attachOncallGroupButton(withFailedPrompt, cfg.oncallGroup, ds.chatId, ds.chatType, {
         appId: ds.larkAppId, sessionId: session.sessionId, questionId: turnId,
         phase: record.finalCard || replyCardIsTerminal(record) ? 'final' : 'first', nativeLink: nativeOncallLink, messageId: record.messageId,
       }), 'interactive', localAddressContextForBot(ds.larkAppId, ds.workingDir ?? ds.session.workingDir));
@@ -319,7 +334,18 @@ export async function updateTurnReplyCard(
 }
 
 type ToolsUpdate = { turnId: string; dispatchAttempt?: number; entries: import('../types.js').CotEntry[] };
-type PendingTools = { msg: ToolsUpdate; send: ReplyCardSender; owns: () => boolean; timer?: ReturnType<typeof setTimeout> };
+type PendingTools = {
+  msg: ToolsUpdate;
+  send: ReplyCardSender;
+  owns: () => boolean;
+  timer?: ReturnType<typeof setTimeout>;
+  /** Captured at queue time against the exact turn key. The releasing
+   *  `screen_update` can clear `ds.cotHeldForBackground` BEFORE this 1200ms
+   *  debounce flushes: reading the hold only at flush time would make a
+   *  completed unified card reject the last batch of folded background
+   *  progress. Sticky for the pending entry's lifetime. */
+  allowWhileTerminalAtQueue?: boolean;
+};
 const pendingTools = new WeakMap<DaemonSession, Map<string, PendingTools>>();
 const toolFlushes = new WeakMap<DaemonSession, Map<string, Promise<void>>>();
 // Sessions owning queued/in-flight tool flushes. WeakMaps are not enumerable, so
@@ -356,14 +382,24 @@ export function queueTurnReplyTools(ds: DaemonSession, msg: ToolsUpdate, send: R
   let pending = pendingTools.get(ds);
   if (!pending) { pending = new Map(); pendingTools.set(ds, pending); }
   const key = `${msg.turnId}:${msg.dispatchAttempt ?? ''}`;
+  // Snapshot the hold at EVERY enqueue against the exact turn key. A hold can
+  // be established between two batches merged into this same pending entry:
+  // keeping only the first batch's verdict would drop the later batch's
+  // progress once the release frame clears the live hold before the debounce
+  // fires. OR-ing the current match makes any batch observed while armed stick
+  // for the entry's lifetime; a release frame racing the 1200ms timer cannot
+  // retroactively strip it.
+  const holdMatchesNow = ds.cotHeldForBackground?.turnId === msg.turnId
+    && ds.cotHeldForBackground.dispatchAttempt === msg.dispatchAttempt;
   const existing = pending.get(key);
   if (existing) {
     existing.msg = msg;
     existing.send = send;
     existing.owns = owns;
+    existing.allowWhileTerminalAtQueue = existing.allowWhileTerminalAtQueue === true || holdMatchesNow;
     return;
   }
-  const next: PendingTools = { msg, send, owns };
+  const next: PendingTools = { msg, send, owns, allowWhileTerminalAtQueue: holdMatchesNow };
   pending.set(key, next);
   trackedToolSessions.add(ds);
   next.timer = setTimeout(() => {
@@ -390,9 +426,16 @@ export async function flushTurnReplyTools(ds: DaemonSession, turnId: string, dis
   pending!.delete(key);
   const cfg = getBot(ds.larkAppId).config;
   const visible = ds.cotForced || replyCardPresentation(cfg, ds.chatId).showProcess;
+  // OR of the queue-time snapshot and the live hold: the snapshot covers a
+  // release frame that won the race against this debounce, while the live read
+  // still admits holds established after the first batch was enqueued.
+  const allowWhileTerminal = next.allowWhileTerminalAtQueue === true
+    || (ds.cotHeldForBackground?.turnId === turnId
+      && ds.cotHeldForBackground.dispatchAttempt === dispatchAttempt);
   const work = updateTurnReplyCard(ds, turnId, {
     kind: 'tools', tools: visible ? publicReplyCardTools(next.msg.entries, cfg.thinkingCardToolResult !== false) : [],
     activity: visible ? publicReplyCardActivity(next.msg.entries) : [],
+    ...(allowWhileTerminal ? { allowWhileTerminal: true } : {}),
   }, next.send, { dispatchAttempt, owns: next.owns }).then(() => undefined);
   let running = toolFlushes.get(ds);
   if (!running) { running = new Map(); toolFlushes.set(ds, running); }
@@ -421,25 +464,43 @@ export async function settleTurnReplyCardTerminal(
 
 /** UI retirement never asserts native task failure or changes task settlement. */
 export async function retireReplyCardDisplay(
-  ds: DaemonSession, msg: { turnId: string; dispatchAttempt?: number; message: string },
+  ds: DaemonSession, msg: { turnId: string; dispatchAttempt?: number; message?: string; silent?: boolean },
   send: ReplyCardSender, owns: () => boolean,
 ): Promise<boolean> {
+  if (!owns()) return false;
   if (replyCardModeFor(ds, msg.turnId) === 'legacy') {
-    finalizeCotMessage(ds, msg.turnId, 'ambiguous', msg.dispatchAttempt);
+    finalizeCotMessage(ds, msg.turnId, msg.silent ? 'completed' : 'ambiguous', msg.dispatchAttempt);
     return false;
   }
   try {
-    if (ds.replyCardRunningTurnId === msg.turnId) ds.replyCardRunningTurnId = undefined;
-    await flushTurnReplyTools(ds, msg.turnId, msg.dispatchAttempt).catch(error => {
-      // A failed cosmetic PATCH must not prevent persisting the terminal notice.
-      logger.warn(`[reply-card] retirement tool flush: ${error.message}`);
-    });
-    const retired = await updateTurnReplyCard(ds, msg.turnId, { kind: 'display_retired', notice: msg.message }, send,
-      { dispatchAttempt: msg.dispatchAttempt, owns });
+    const existing = msg.silent
+      ? new TurnReplyCardStore(config.session.dataDir).read(replyCardKey(ds, msg.turnId, msg.dispatchAttempt))
+      : undefined;
+    // Match supersede: buffered activity must not create an otherwise empty
+    // card for a silent, never-shown display. An existing/uncertain POST still
+    // needs its last activity flushed before the display-only close.
+    if (!msg.silent || existing?.messageId || existing?.pendingCreate) {
+      await flushTurnReplyTools(ds, msg.turnId, msg.dispatchAttempt).catch(error => {
+        // A failed cosmetic PATCH must not prevent persisting the terminal notice.
+        logger.warn(`[reply-card] retirement tool flush: ${error.message}`);
+      });
+    }
+    // Silent retirement uses the ordinary publisher: its lock, beforeEffect/
+    // owns gate and pendingCreate UUID replay also cover this display-only edge.
+    const retired = await updateTurnReplyCard(ds, msg.turnId, {
+      kind: 'display_retired', ...(msg.message ? { notice: msg.message } : {}), silent: msg.silent === true,
+    }, send, { dispatchAttempt: msg.dispatchAttempt, owns });
+    if (retired && owns() && ds.replyCardRunningTurnId === msg.turnId) ds.replyCardRunningTurnId = undefined;
     return retired !== undefined;
   } finally {
-    const record = new TurnReplyCardStore(config.session.dataDir).read(replyCardKey(ds, msg.turnId, msg.dispatchAttempt));
-    finalizeCotMessage(ds, msg.turnId, record?.finalDelivered && record.phase === 'completed' ? 'completed' : 'ambiguous', msg.dispatchAttempt);
+    if (owns()) {
+      const record = new TurnReplyCardStore(config.session.dataDir).read(replyCardKey(ds, msg.turnId, msg.dispatchAttempt));
+      // Silent retirement is a DISPLAY-only close after delivery/an earlier
+      // notice; it must not turn that evidence into a native failure assertion.
+      finalizeCotMessage(ds, msg.turnId,
+        msg.silent ? 'completed' : record?.finalDelivered && record.phase === 'completed' ? 'completed' : 'ambiguous',
+        msg.dispatchAttempt);
+    }
   }
 }
 

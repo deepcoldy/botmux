@@ -106,9 +106,12 @@ export function createLarkAskCardDispatcher(
       // 但在 chat-scope 下它实际是 chat_id (oc_...) 而非 message_id (om_...).
       // 飞书 /messages/{id}/reply 只接受 om_ — 用 oc_ 会 400 invalid message_id.
       // 所以这里要按前缀判断是否真的能 reply.
-      const replyRoot = ask.cardRootMessageId ?? ask.rootMessageId;
-      const canReplyToRoot = !ask.deliveryTarget &&
-        typeof replyRoot === 'string' && replyRoot.startsWith('om_');
+      const replyRoot = typeof ask.cardRootMessageId === 'string' && ask.cardRootMessageId.startsWith('om_')
+        ? ask.cardRootMessageId
+        : typeof ask.rootMessageId === 'string' && ask.rootMessageId.startsWith('om_')
+          ? ask.rootMessageId
+          : undefined;
+      const canReplyToRoot = !ask.deliveryTarget && replyRoot !== undefined;
       const sendToRecipient = (content: string, type: string, uuid?: string) => ask.deliveryTarget
         ? sendUser(ask.larkAppId, ask.deliveryTarget.openId, content, type, uuid)
         : send(ask.larkAppId, ask.chatId, content, type, uuid);
@@ -749,7 +752,9 @@ function escalateUnauthorized(
       larkAppId: ask.larkAppId,
       chatId: ask.chatId,
       cardMessageId: ask.cardMessageId,
-      rootMessageId: ask.rootMessageId,
+      rootMessageId: typeof ask.cardRootMessageId === 'string' && ask.cardRootMessageId.startsWith('om_')
+        ? ask.cardRootMessageId
+        : ask.rootMessageId,
     },
     clickerOpenId,
   );

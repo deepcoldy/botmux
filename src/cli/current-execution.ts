@@ -1,5 +1,5 @@
 import { loopbackFetchImpl } from '../core/loopback-fetch.js';
-import { isBytedcliOverseasRegion, type BytedcliOverseasRegion } from '../platform/bytedcli-grant-regions.js';
+import { isBytedcliIdentityRegion, type BytedcliIdentityRegion } from '../platform/bytedcli-grant-regions.js';
 import { GRANT_ROUTE_CLIENT_TIMEOUT_MS } from '../platform/credential-grant-budget.js';
 import { findOnlineDaemon, parseDaemonIpcPort } from '../utils/daemon-discovery.js';
 import { IDENTITY_ROUTE_TOOLS } from '../services/trigger-user-auth.js';
@@ -144,6 +144,7 @@ export const IDENTITY_REFUSAL_REASONS = [
   'identity_decision_missing', 'identity_decision_conflict', 'identity_model_single',
   // daemon: caller proven, no identity material for the turn (HTTP 404)
   'identity_material_unavailable',
+  'bytecloud_grant_unavailable', 'bytecloud_grant_denied',
   // daemon: caller proven, BOTMUX_AS names nobody who spoke in this turn / cannot name anyone here
   'as_not_speaker', 'as_unavailable',
   // client side
@@ -184,13 +185,13 @@ export async function resolveCurrentExecutionIdentity(options: {
   tool: string;
   /** `BOTMUX_AS`: the speaker of the current turn this call runs as. */
   as?: string;
-  region?: BytedcliOverseasRegion;
+  region?: BytedcliIdentityRegion;
   fetchImpl?: typeof fetch;
 }): Promise<CurrentExecutionIdentityDocument> {
   if (!Number.isSafeInteger(options.ipcPort) || options.ipcPort <= 0 || options.ipcPort > 65535
     || !identifier(options.sessionId) || !identifier(options.larkAppId)
     || !identityTool(options.tool)
-    || (options.region !== undefined && (options.tool !== 'bytedcli' || !isBytedcliOverseasRegion(options.region)))) {
+    || (options.region !== undefined && (options.tool !== 'bytedcli' || !isBytedcliIdentityRegion(options.region)))) {
     throw new CurrentExecutionIdentityError('current_execution_route_unavailable', 'invalid_invocation');
   }
   let response: Response;

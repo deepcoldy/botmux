@@ -10,7 +10,7 @@
  * 不在助理模式的 bot 一律回「未启用」；私聊永远归发消息的人，命令只回状态。
  * 设计见 docs/design/2026-11-20-assistant-mode.md §5.1。
  */
-import { isBotMentioned, canOperate, extractMessageTextForRouting } from './event-dispatcher.js';
+import { isBotMentioned, canOperate, extractMessageTextForRouting, getGroupStats } from './event-dispatcher.js';
 import { mentionOpenId, stripLeadingMentions } from './message-parser.js';
 import { replyMessage } from './client.js';
 import { localeForBot, t } from '../../i18n/index.js';
@@ -19,9 +19,91 @@ import { config } from '../../config.js';
 import { getSessionGroup } from '../../services/session-groups-store.js';
 import { getAssistantOwner, setAssistantOwner } from '../../services/assistant-owner-store.js';
 import { isValidAssistantOpenId, notifyAssistantOwnerChanged, resolveAssistantOwnerOpenId } from '../../core/assistant-mode.js';
+import { assistantMultiUserGroupsOff, assistantSoloGroupAdmission } from '../../core/assistant-spawn.js';
 import { logger } from '../../utils/logger.js';
 
 export const ASSISTANT_COMMAND_RE = /^\/assistant(?:\s|$)/i;
+
+const MULTI_USER_NOTICE_MS = 10 * 60_000;
+const multiUserNoticeAt = new Map<string, number>();
+
+/**
+ * 助理模式不允许多人群（assistantGroupChat 没开）时群消息的总闸，放在一切群内处理（旁听、
+ * 命令、认领、建会话）之前：群里真人 ≥2 时整条吞掉，只有真人 @ 本 bot 时回一句，同群
+ * 10 分钟最多一次。人数查不到时按多人群处理。返回 true = 已吞掉。
+ */
+export async function tryHandleAssistantMultiUserGroup(
+  larkAppId: string,
+  message: any,
+  senderOpenId: string | undefined,
+  senderIsBot: boolean,
+  now = Date.now(),
+): Promise<boolean> {
+  const chatId: string | undefined = message?.chat_id;
+  if (message?.chat_type === 'p2p' || !chatId || !assistantMultiUserGroupsOff(larkAppId)) return false;
+  // 真人 @ 本 bot 时不信缓存、现查：有人退群而退群事件没推到本 app（主动退群是另一种事件）时，
+  // 缓存会停在多人，@ 是让它立即恢复的唯一信号。被 @ 的消息少，多一次查询可以接受。
+  const mentioned = !senderIsBot && isBotMentioned(larkAppId, message, senderOpenId);
+  if (!(await assistantGroupIsMultiUser(larkAppId, chatId, { fresh: mentioned }))) return false;
+  if (!mentioned) return true;
+  const key = `${larkAppId}:${chatId}`;
+  if ((multiUserNoticeAt.get(key) ?? -Infinity) > now - MULTI_USER_NOTICE_MS) return true;
+  multiUserNoticeAt.set(key, now);
+  logger.info(`[assistant-mode:${larkAppId}] multi-user group ${chatId.slice(0, 12)}; notice sent`);
+  const messageId: string | undefined = message.message_id;
+  if (messageId) {
+    await replyMessage(larkAppId, messageId, t('cmd.assistant.multi_user_group', undefined, localeForBot(larkAppId)), 'text', false)
+      .catch(err => logger.warn(`[assistant-mode] multi-user-group notice failed: ${err?.message ?? err}`));
+  }
+  return true;
+}
+
+/**
+ * 群里的真人数是否不是恰好 1 个（bot 不计；字段缺失、查不到都算多人）。缓存说是多人就照用；
+ * 说是单人时强制重查一次：有人刚进群、而进群事件推给了别的副本时，缓存会停在 1 人。
+ * `fresh`：直接现查，不看缓存。
+ */
+export async function assistantGroupIsMultiUser(
+  larkAppId: string,
+  chatId: string,
+  opts: { fresh?: boolean } = {},
+): Promise<boolean> {
+  if (!opts.fresh && (await getGroupStats(larkAppId, chatId)).userCount !== 1) return true;
+  return (await getGroupStats(larkAppId, chatId, { requireFresh: true })).userCount !== 1;
+}
+
+/**
+ * 单人群（tryHandleAssistantMultiUserGroup 已放行）里，主人是不是还在群里。主人主动退群不推事件，
+ * 登记会停在旧主人，所以：
+ * - 真人发言且不是主人 ⇒ 主人已不在，返回 absentOwner，调用方按「主人退群」处理；
+ * - bot 发言没法拿发言人比，现拉成员列表核对：主人不在 ⇒ absentOwner；人数不对或拉不到 ⇒ drop；
+ * - 还没认领的群不管（没有主人目录可进）。
+ */
+export async function assistantSoloGroupOwnerCheck(
+  larkAppId: string,
+  message: any,
+  senderOpenId: string | undefined,
+  senderIsBot: boolean,
+): Promise<{ drop?: true; absentOwner?: string }> {
+  const chatId: string | undefined = message?.chat_id;
+  if (message?.chat_type === 'p2p' || !chatId || !assistantMultiUserGroupsOff(larkAppId)) return {};
+  const owner = resolveAssistantOwnerOpenId({
+    chatType: 'group',
+    sessionGroupOwnerOpenId: getSessionGroup(chatId)?.ownerOpenId,
+    stored: getAssistantOwner(config.session.dataDir, larkAppId, chatId),
+  });
+  if (!owner) return {};
+  if (!senderIsBot && senderOpenId) return owner !== senderOpenId ? { absentOwner: owner } : {};
+  const admission = await assistantSoloGroupAdmission(larkAppId, chatId);
+  if (admission.ok) return {};
+  if (admission.reason === 'owner_absent') return { absentOwner: owner };
+  return { drop: true };
+}
+
+/** 测试用：清空限频记录。 */
+export function resetAssistantMultiUserNoticesForTest(): void {
+  multiUserNoticeAt.clear();
+}
 
 export async function tryHandleAssistantCommand(
   larkAppId: string,

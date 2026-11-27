@@ -44,6 +44,8 @@ function recoveryHarness(extra: Record<string, unknown> = {}) {
     shouldRecoverUnconfirmedSessionRename, send: vi.fn(), t: (key: string) => key, cliName: () => 'TRAE', log: vi.fn(),
     restartCliProcess: vi.fn(), ...extra,
   };
+  scope.sessionRenameRecoveryRuntimeAllowed = loadWorkerFunction('sessionRenameRecoveryRuntimeAllowed', scope);
+  scope.sessionRenameOwnedRecoverySessionId = loadWorkerFunction('sessionRenameOwnedRecoverySessionId', scope);
   const recover = loadWorkerFunction<(surface: string) => boolean>('recoverUnconfirmedSessionRename', scope);
   return { scope, followUp, recover };
 }

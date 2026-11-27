@@ -29,6 +29,7 @@ export type PurgeRequestPlan =
 
 export interface PurgeRequestInput {
   cliId: string | undefined;
+  repairKind?: 'traex_tool_images';
   /** Adopted panes and remote backends have no worker-owned local transcript. */
   localOwnedSession: boolean;
   target: PurgeResumeTarget | undefined;
@@ -42,7 +43,8 @@ export interface PurgeRequestInput {
 }
 
 export function planPurgeRequest(input: PurgeRequestInput): PurgeRequestPlan {
-  if (input.cliId !== 'claude-code' || !input.localOwnedSession || !input.target) {
+  const supported = input.repairKind === 'traex_tool_images' ? input.cliId === 'traex' : input.cliId === 'claude-code';
+  if (!supported || !input.localOwnedSession || !input.target) {
     return { kind: 'decline', noticeKey: 'worker.purge_images_unsupported', logReason: 'no worker-owned local Claude Code transcript' };
   }
   if (input.restartInProgress) {
@@ -120,6 +122,27 @@ export type PurgeOutcomeNotice = { key?: string; params?: Record<string, string>
   | { deliverContinuation: true }
   | { deliverContinuation: false; rejectReason: string }
 );
+
+/** A repair holds its continuation outside the CLI queue while the old process
+ * exits. Stop or a successor input revokes it before any further write; reject
+ * exactly once so the daemon can refund the click without undoing a new turn. */
+export class PurgeContinuationLease {
+  private live = true;
+  constructor(readonly turnId: string, private readonly reject: (reason: string) => void) {}
+  get pending(): boolean { return this.live; }
+  cancel(): boolean {
+    if (!this.live) return false;
+    this.live = false;
+    this.reject(PURGE_CONTINUATION_WITHHELD);
+    return true;
+  }
+  settle(notice: PurgeOutcomeNotice, enqueue: () => void): void {
+    if (!this.live) return;
+    this.live = false;
+    if (notice.deliverContinuation) enqueue();
+    else this.reject(notice.rejectReason);
+  }
+}
 
 /** Decided once the respawn settled: a failed spawn exits the worker, so a
  *  continuation queued for a replacement that never came would be lost while

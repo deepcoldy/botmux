@@ -41,6 +41,7 @@ function harness(
     ? { sendSpecialKeys: (key: string) => { specialKeys.push(key); return true; } }
     : { write: (data: string) => { written.push(data); return true; } };
   const state: Record<string, any> = {
+    activeTranscriptImagePurge: undefined,
     lastInitConfig: null,
     cliAdapter: adapter ?? (interruptKey ? { id: 'zcode', interruptKey } : { id: 'codex' }),
     backend,
@@ -85,6 +86,7 @@ function harness(
   // This bespoke with(state) factory bypasses the shared harness resolver; the
   // real stop gate stays inert because no failed-turn rewind is modelled here.
   state.stopHeldFailedTurnRewind = loadWorkerFunction('stopHeldFailedTurnRewind', state);
+  state.discardScheduledBacklogForStop = loadWorkerFunction('discardScheduledBacklogForStop', state);
   const factory = new Function('state', `with (state) { ${slice}; return { handleTermAction }; }`);
   const handler = factory(state) as { handleTermAction: (key: string) => Promise<void> };
   return {

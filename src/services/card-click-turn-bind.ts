@@ -5,7 +5,7 @@
  * getOwnerOpenId, and it never copies the session owner or creator into the
  * caller or the reply-target sender.
  */
-import { resolveAssistantSpawn } from '../core/assistant-spawn.js';
+import { assistantMultiUserGroupsOff, assistantSoloGroupAdmission, resolveAssistantSpawn } from '../core/assistant-spawn.js';
 import { existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -28,6 +28,7 @@ import { extractLarkBusinessCode } from '../im/lark/lark-errors.js';
 import { beginReplyTargetTurn } from '../core/reply-target.js';
 import { activeSessionKey, sessionAnchorId, sessionKey, type DaemonSession } from '../core/types.js';
 import { sessionPromptInjection } from '../core/prompt-injection.js';
+import { plannedOpeningBackendType } from '../core/opening-backend.js';
 import { markSessionActivity } from '../core/session-activity.js';
 import { normalizeLastTurn } from '../core/session-task-status.js';
 import { buildFollowUpCliInput, buildNewTopicCliInput, rememberLastCliInput } from '../core/session-manager.js';
@@ -116,6 +117,7 @@ export function cardClickOperatorIsBotOrApp(
 
 export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
   const nonceStores = new Map<string, CardClickNonceStore>();
+  const pendingCardTurns = new WeakMap<DaemonSession, Set<string>>();
   const nonceStore = (larkAppId: string) => {
     const existing = nonceStores.get(larkAppId);
     if (existing) return existing;
@@ -142,7 +144,7 @@ export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
     claims: CardClickTurnClaims,
     senderOpenId: string,
     chatType: 'group' | 'p2p',
-  ): Promise<{ ok: true; session: CardClickBoundSession } | { ok: false; reason: string }> {
+  ): Promise<{ ok: true; session: CardClickBoundSession; created: boolean } | { ok: false; reason: string }> {
     if (!claims.chatId || !claims.workingDir) return { ok: false, reason: 'working_dir_required' };
     // 个人助理模式：会话归该 chat 的主人、cwd 在主人 work/（不用卡片里签的目录）；未认领不建。
     const assistantSpawn = resolveAssistantSpawn(larkAppId, claims.chatId, chatType, senderOpenId);
@@ -189,7 +191,20 @@ export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
     if (!registered.created && claims.workingDir && existingDir && existingDir !== claims.workingDir) {
       return { ok: false, reason: 'working_dir_mismatch' };
     }
-    return { ok: true, session: boundFrom(registered.ds) };
+    return { ok: true, session: boundFrom(registered.ds), created: registered.created };
+  }
+
+  async function discardCreatedSession(bound: CardClickBoundSession): Promise<void> {
+    const ds = liveSession(bound);
+    const key = activeSessionKey(ds);
+    await withActiveSessionKeyLock(deps.activeSessions, key, async () => {
+      if (deps.activeSessions.get(key) !== ds || ds.session.status !== 'active' || pendingCardTurns.has(ds)) return;
+      if ((ds.worker && !ds.worker.killed) || ds.hasHistory || ds.session.cliSessionId
+        || ds.pendingPrompt || ds.initialStartPending || ds.currentTurnId || ds.activeInteractiveTurn || ds.session.lastTurn) return;
+      // close 是可能抛错的 durable 写入；只有成功落盘后才删除 registry，失败时保留可重试的同一对象。
+      sessionStore.closeSession(ds.session.sessionId);
+      deps.activeSessions.delete(key);
+    });
   }
 
   function nextStepCurrent(session: CardClickBoundSession, turnId: string): boolean {
@@ -220,7 +235,12 @@ export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
     return delivered?.turnId === turnId && delivered.outcome === 'delivered' && delivered.startedAt !== undefined;
   }
 
-  async function startTurn(
+  async function assistantGroupAllowed(larkAppId: string, chatId: string, chatType: 'group' | 'p2p'): Promise<boolean> {
+    if (chatType === 'p2p' || !assistantMultiUserGroupsOff(larkAppId)) return true;
+    return assistantSoloGroupAdmission(larkAppId, chatId).then(admission => admission.ok, () => false);
+  }
+
+  async function startTurnInner(
     session: CardClickBoundSession,
     args: { senderOpenId: string; memberUnionId?: string; prompt: string; responseToTurnId?: string },
   ): Promise<{ ok: true; turnId: string } | { ok: false; reason: string }> {
@@ -289,34 +309,6 @@ export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
       participants: [{ openId: senderOpenId, isBot: false }],
       inThread: ds.scope === 'thread',
     });
-    const bot = getBot(ds.larkAppId);
-    const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? bot.config.cliId;
-    const opening = !ds.hasHistory && (!ds.worker || ds.worker.killed);
-    const input = opening
-      ? buildNewTopicCliInput(
-        args.prompt, ds.session.sessionId, cliId, undefined, undefined, undefined, undefined, undefined,
-        { name: bot.botName, openId: bot.botOpenId }, localeForBot(ds.larkAppId), sender,
-        {
-          promptInjection: sessionPromptInjection(ds),
-          larkAppId: ds.larkAppId,
-          chatId: ds.chatId,
-          turnId,
-          trustedCaller,
-          sessionBackendType: ds.session.backendType,
-          selfMention: { name: bot.botName, openId: bot.botOpenId },
-        },
-      )
-      : buildFollowUpCliInput(args.prompt, ds.session.sessionId, {
-        cliId,
-        sender,
-        turnId,
-        larkAppId: ds.larkAppId,
-        chatId: ds.chatId,
-        selfMention: { name: bot.botName, openId: bot.botOpenId },
-        sessionBackendType: ds.session.backendType,
-        promptInjection: sessionPromptInjection(ds),
-        trustedCaller,
-      });
     // Identity preparation can await Lark. A newer input may take over while
     // we wait, and its routing state must never be replaced by our rollback.
     const mayRollback = () => args.responseToTurnId === undefined
@@ -334,12 +326,54 @@ export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
       if (mayRollback()) rollback();
       return { ok: false, reason: 'expired' };
     }
+    // accept 后可能跨 ACK / 身份准备等待；最终复查后不再 await。
+    if (!(await assistantGroupAllowed(ds.larkAppId, ds.chatId, ds.chatType))) {
+      if (mayRollback()) rollback();
+      return { ok: false, reason: 'delivery_failed' };
+    }
+    if (args.responseToTurnId !== undefined && !nextStepCurrent(session, args.responseToTurnId)) {
+      if (mayRollback()) rollback();
+      return { ok: false, reason: 'expired' };
+    }
+    // 等待期间被关闭 / 被其它会话替换时，绝不能继续 fork 到失联 row。
+    if (deps.activeSessions.get(activeSessionKey(ds)) !== ds || ds.session.status !== 'active') {
+      if (mayRollback()) rollback();
+      return { ok: false, reason: 'delivery_failed' };
+    }
+    const bot = getBot(ds.larkAppId);
+    const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? bot.config.cliId;
+    const live = !!ds.worker && !ds.worker.killed;
+    const opening = !ds.hasHistory && !live;
+    const input = opening
+      ? buildNewTopicCliInput(
+        args.prompt, ds.session.sessionId, cliId, undefined, undefined, undefined, undefined, undefined,
+        { name: bot.botName, openId: bot.botOpenId }, localeForBot(ds.larkAppId), sender,
+        {
+          promptInjection: sessionPromptInjection(ds),
+          larkAppId: ds.larkAppId,
+          chatId: ds.chatId,
+          turnId,
+          trustedCaller,
+          sessionBackendType: plannedOpeningBackendType(ds, cliId, bot.config),
+          selfMention: { name: bot.botName, openId: bot.botOpenId },
+        },
+      )
+      : buildFollowUpCliInput(args.prompt, ds.session.sessionId, {
+        cliId,
+        sender,
+        turnId,
+        larkAppId: ds.larkAppId,
+        chatId: ds.chatId,
+        selfMention: { name: bot.botName, openId: bot.botOpenId },
+        sessionBackendType: ds.session.backendType,
+        promptInjection: sessionPromptInjection(ds),
+        trustedCaller,
+      });
     ds.activeInteractiveTurn = {
       turnId,
       caller: { ...trustedCaller },
       userPrompt: args.prompt,
     };
-    const live = !!ds.worker && !ds.worker.killed;
     const sent = live
       ? sendWorkerInput(ds, input, turnId, { trustedCaller })
       : forkWorker(ds, input, { resume: ds.hasHistory, turnId, trustedCaller });
@@ -357,6 +391,23 @@ export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
     return { ok: true, turnId };
   }
 
+  async function startTurn(
+    session: CardClickBoundSession,
+    args: { senderOpenId: string; memberUnionId?: string; prompt: string; responseToTurnId?: string },
+  ): Promise<{ ok: true; turnId: string } | { ok: false; reason: string }> {
+    const ds = liveSession(session);
+    const token = randomUUID();
+    const pending = pendingCardTurns.get(ds) ?? new Set<string>();
+    pending.add(token);
+    pendingCardTurns.set(ds, pending);
+    try {
+      return await startTurnInner(session, args);
+    } finally {
+      pending.delete(token);
+      if (pending.size === 0) pendingCardTurns.delete(ds);
+    }
+  }
+
   const runtimeDeps = (larkAppId: string): CardClickTurnRuntimeDeps => ({
     now: () => Date.now(),
     secret: () => secret(larkAppId),
@@ -371,6 +422,7 @@ export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
     grantCommandRestriction: (appId, chatId, openId) => grantCommandRestriction(appId, chatId, openId),
     findSession,
     createSession,
+    discardCreatedSession,
     workingDirReady: directoryReady,
     setWorkingDir: (session, dir) => {
       const ds = liveSession(session);
@@ -384,6 +436,7 @@ export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
       return 'ok';
     },
     nextStepCurrent,
+    assistantGroupAdmitted: assistantGroupAllowed,
     startTurn,
   });
 

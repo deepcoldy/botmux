@@ -11,9 +11,16 @@ export function createCliAvailabilityCache(options: { ttlMs?: number; concurrenc
   const entries = new Map<string, { expires: number; pending: Promise<CliAvailabilityProbe> }>();
   let running = 0;
   const waiting: (() => void)[] = [];
-  return async (key: string, probe: () => Promise<CliAvailabilityProbe>): Promise<CliAvailabilityProbe> => {
+  return async (
+    key: string,
+    probe: () => Promise<CliAvailabilityProbe>,
+    callOptions?: { bypassCache?: boolean },
+  ): Promise<CliAvailabilityProbe> => {
     const prior = entries.get(key);
-    if (prior && prior.expires > now()) return prior.pending;
+    if (prior) {
+      if (prior.expires === Infinity) return prior.pending;
+      if (!callOptions?.bypassCache && prior.expires > now()) return prior.pending;
+    }
     if (waiting.length >= 64) return { available: false, localExecutableRequired: true, status: 'unknown' };
     const pending = (async () => {
       if (running >= (options.concurrency ?? 4)) {
@@ -54,6 +61,7 @@ export async function cliAvailabilityResponse(
   key: string, botConfig: BotConfig | undefined, baseEnv: NodeJS.ProcessEnv,
   probe = checkCliAvailabilityAsync,
   cache = cachedProbe,
+  options?: { refresh?: boolean },
 ): Promise<{ statusCode: number; body: { ok?: false; error?: string; status?: CliAvailabilityProbe['status']; command?: string } }> {
   if (!isKnownSelectionKey(key)) return { statusCode: 400, body: { ok: false, error: 'unknown_selection_key' } };
   const selection = resolveCliSelection(key);
@@ -61,7 +69,7 @@ export async function cliAvailabilityResponse(
   const cacheKey = JSON.stringify([key, botConfig?.larkAppId, context.runtimeExecutable, context.fingerprint]);
   const availability = await cache(cacheKey, () => probe({ ...selection, cliPathOverride: context.runtimeExecutable }, {
     env: context.probeEnv ?? baseEnv, timeoutMs: 1_000, shellFallback: true,
-  }));
+  }), { bypassCache: Boolean(options?.refresh) });
   // command is an operator-facing configured command and may be a private path.
   // Never expose resolvedPath or environment values in this endpoint.
   return { statusCode: 200, body: { status: availability.status, command: availability.command } };

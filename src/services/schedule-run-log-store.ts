@@ -404,6 +404,19 @@ export function queryScheduleRunLogs(
   };
 }
 
+/** Host-side provenance for pre-trigger scheduledRun rows. Missing history is
+ * different from a read failure: callers may retain on the latter, but must not
+ * guess scheduler/dashboard semantics on the former. */
+export function findScheduleRunTrigger(
+  taskId: string,
+  runId: string,
+  appId: string,
+  dataDir: string = config.session.dataDir,
+): ScheduleRunTrigger | undefined {
+  return queryScheduleRunLogs(taskId, { limit: MAX_SCHEDULE_RUN_LOG_ENTRIES }, appId, dataDir)
+    .logs.find(entry => entry.id === runId)?.trigger;
+}
+
 /** Delete only the selected task's history. Returns whether a file existed. */
 export function removeScheduleRunLogs(
   taskId: string,

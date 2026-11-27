@@ -3217,6 +3217,48 @@ describe('automateOpenPlatformSetup', () => {
     if (!result.ok) expect(result.redirectWarning).toContain('超时');
   }, 5000);
 
+  it('caller abort during the auth page prevents every later automation POST', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-abort-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const controller = new AbortController();
+    let releaseAuth!: () => void;
+    let authStarted!: () => void;
+    const started = new Promise<void>(resolve => { authStarted = resolve; });
+    const postAfterAbort: string[] = [];
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href.endsWith('/auth')) {
+        authStarted();
+        await new Promise<void>(resolve => { releaseAuth = resolve; });
+        return new Response('<script>window.csrfToken="csrf_auto"</script>', { status: 200 });
+      }
+      if ((init?.method ?? 'GET').toUpperCase() === 'POST') {
+        if (controller.signal.aborted) postAfterAbort.push(href);
+        expect(init?.signal).toBe(controller.signal);
+        if (href.includes('/safe_setting/update/')) return Response.json({ code: 0 });
+        if (href.includes('/safe_setting/')) return Response.json({ code: 0, data: { redirectURL: [] } });
+        if (href.includes('/scope/all/')) return new Response('forbidden', { status: 403 });
+      }
+      throw new Error(`unexpected url: ${href}`);
+    }) as typeof fetch;
+
+    const pending = automateOpenPlatformSetup({
+      appId: 'cli_x',
+      sessionFilePath: sessionFile,
+      fetchImpl,
+      signal: controller.signal,
+    });
+    await started;
+    controller.abort(new Error('user cancelled'));
+    releaseAuth();
+    await pending;
+
+    expect(postAfterAbort).toEqual([]);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   it('keeps going and reports a warning when the redirect whitelist cannot be written', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-'));
     const sessionFile = join(dir, 'feishu-session.json');
