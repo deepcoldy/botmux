@@ -1,6 +1,6 @@
-import { mkdtempSync, existsSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { OWNER_GROUP_FOLLOW_PRESETS } from '../src/dashboard/web/owner-group-follow-rules.js';
 import { createOwnerGroupFollower, OwnerGroupFollowError, type OwnerGroupFollowContext, type OwnerGroupFollowIssue } from '../src/services/owner-group-follow.js';
@@ -78,6 +78,55 @@ describe('owner group follow', () => {
     expect(h.invite).toHaveBeenCalledWith('oc_new', 'token:ou_owner', expect.any(AbortSignal));
     expect(h.token).toHaveBeenCalledTimes(3);
     await h.scan(); expect(h.invite).toHaveBeenCalledTimes(1);
+  });
+  it('does not invite an existing chat that returns after a transient successful-list omission', async () => {
+    const h = harness(); h.chats(['oc_old', 'oc_stable']); await h.scan();
+    h.chats(['oc_stable']); await h.scan();
+    expect(h.store.read()?.knownChatIds).toContain('oc_old');
+    h.chats(['oc_old', 'oc_stable']); await h.scan();
+    h.chats(['oc_stable']); await h.scan();
+    h.chats(['oc_old', 'oc_stable']); await h.scan();
+    expect(h.invite).not.toHaveBeenCalled();
+    expect(h.store.read()?.entries.oc_old).toBeUndefined();
+  });
+  it('treats a returning chat as new after consecutive complete snapshots confirm its absence', async () => {
+    const h = harness(); h.chats(['oc_old', 'oc_stable']); await h.scan();
+    h.chats(['oc_stable']); await h.scan(); await h.scan();
+    expect(h.store.read()?.knownChatIds).not.toContain('oc_old');
+    h.chats(['oc_old', 'oc_stable']); await h.scan();
+    expect(h.invite).toHaveBeenCalledTimes(1);
+    expect(h.invite).toHaveBeenCalledWith('oc_old', 'token:ou_owner', expect.any(AbortSignal));
+  });
+  it('keeps a permanent invitation failure stopped across a confirmed owner departure and return', async () => {
+    const h = harness(); h.chats(['oc_old', 'oc_stable']); await h.scan();
+    h.chats(['oc_old', 'oc_stable', 'oc_new']);
+    h.invite.mockRejectedValueOnce(new OwnerGroupFollowError(false)); await h.scan();
+    expect(h.store.read()?.entries.oc_new).toEqual({ status: 'failed', attempts: 1 });
+    h.chats(['oc_old', 'oc_stable']); await h.scan(); await h.scan();
+    expect(h.store.read()?.knownChatIds).not.toContain('oc_new');
+    h.chats(['oc_old', 'oc_stable', 'oc_new']); await h.scan(3600);
+    expect(h.invite).toHaveBeenCalledTimes(1);
+    expect(h.store.read()?.entries.oc_new).toEqual({ status: 'failed', attempts: 1 });
+  });
+  it('upgrades a legacy version-1 journal without losing its baseline or membership markers', async () => {
+    const h = harness();
+    const legacy = {
+      version: 1, scope: 'feishu:ou_owner', active: true, epoch: 'legacy-epoch', revision: 7,
+      initialized: true, knownChatIds: ['oc_old', 'oc_removed', 'oc_joined'],
+      entries: {
+        oc_removed: { status: 'removed', attempts: 1 },
+        oc_joined: { status: 'joined', attempts: 2 },
+      },
+    };
+    mkdirSync(dirname(h.store.path), { recursive: true });
+    writeFileSync(h.store.path, JSON.stringify(legacy));
+    h.bots(['oc_joined', 'oc_removed']);
+    expect(h.store.read()).toEqual(legacy);
+    h.chats([]); await h.scan();
+    expect(h.store.read()).toMatchObject({ version: 1, revision: 8, knownChatIds: legacy.knownChatIds, entries: legacy.entries });
+    h.chats(legacy.knownChatIds); await h.scan();
+    expect(h.store.read()).toMatchObject({ version: 1, revision: 9, knownChatIds: legacy.knownChatIds, entries: legacy.entries });
+    expect(h.invite).not.toHaveBeenCalled();
   });
   it('invites every eligible new chat while advancing the round revision through its own writes', async () => {
     const h = harness(); await h.scan();
@@ -188,7 +237,7 @@ describe('owner group follow', () => {
     await h.scan();
     expect(h.store.read()?.entries.oc_new).toEqual({ status: 'joined', attempts: 1 });
     h.bots([]);
-    await h.scan();
+    await h.scan(); await h.scan();
     expect(h.store.read()?.entries.oc_new.status).toBe('removed');
     expect(h.invite).toHaveBeenCalledTimes(1);
   });
@@ -219,8 +268,45 @@ describe('owner group follow', () => {
     expect(h.store.read()?.entries.oc_new.status).toBe('removed');
     await h.scan(); expect(h.invite).toHaveBeenCalledTimes(1);
   });
-  it('detects removal through a membership snapshot even if the push event was missed', async () => {
-    const h = harness(); h.bots(['oc_old']); await h.scan(); h.bots([]); await h.scan();
+  it('does not mark a joined chat as removed after a transient bot-list omission', async () => {
+    const h = harness(); h.bots(['oc_old']); await h.scan();
+    expect(h.store.read()?.entries.oc_old.status).toBe('joined');
+    h.bots([]); await h.scan();
+    expect(h.store.read()?.entries.oc_old.status).toBe('joined');
+    h.bots(['oc_old']); await h.scan();
+    h.bots([]); await h.scan();
+    h.bots(['oc_old']); await h.scan();
+    expect(h.store.read()?.entries.oc_old.status).toBe('joined');
+  });
+  it('recovers scan-inferred removal when bot membership returns but preserves explicit removal', async () => {
+    const h = harness(); h.bots(['oc_old']); await h.scan();
+    h.bots([]); await h.scan(); await h.scan();
+    expect(h.store.read()?.entries.oc_old.status).toBe('removed');
+    h.bots(['oc_old']); await h.scan();
+    expect(h.store.read()?.entries.oc_old.status).toBe('joined');
+    h.store.removed('oc_old'); await h.scan();
+    expect(h.store.read()?.entries.oc_old.status).toBe('removed');
+    await h.scan(); expect(h.store.read()?.entries.oc_old.status).toBe('removed');
+  });
+  it('uses bot membership evidence to reset absence counts while the owner chat is missing', async () => {
+    const h = harness(); h.bots(['oc_old']); await h.scan();
+    h.bots([]); await h.scan();
+    expect(h.store.read()?.entries.oc_old.status).toBe('joined');
+    h.chats([]); h.bots(['oc_old']); await h.scan();
+    h.chats(['oc_old']); h.bots([]); await h.scan();
+    expect(h.store.read()?.entries.oc_old.status).toBe('joined');
+  });
+  it('recovers scan-inferred removal when bot membership returns while the owner chat is missing', async () => {
+    const h = harness(); h.bots(['oc_old']); await h.scan();
+    h.bots([]); await h.scan(); await h.scan();
+    expect(h.store.read()?.entries.oc_old.status).toBe('removed');
+    h.chats([]); h.bots(['oc_old']); await h.scan();
+    expect(h.store.read()?.entries.oc_old.status).toBe('joined');
+    h.chats(['oc_old']); h.bots([]); await h.scan();
+    expect(h.store.read()?.entries.oc_old.status).toBe('joined');
+  });
+  it('detects removal through consecutive membership snapshots even if the push event was missed', async () => {
+    const h = harness(); h.bots(['oc_old']); await h.scan(); h.bots([]); await h.scan(); await h.scan();
     expect(h.store.read()?.entries.oc_old.status).toBe('removed');
     h.chats([]); await h.scan(); h.chats(['oc_old']); await h.scan();
     expect(h.invite).not.toHaveBeenCalled();
@@ -397,7 +483,7 @@ describe('owner group follow', () => {
     });
     followers.push(second);
     await second.tick();
-    expect(h.store.read()?.knownChatIds).toEqual(['oc_old']);
+    expect(h.store.read()?.knownChatIds).toEqual(['oc_old', 'oc_new']);
     fresh.resolve('fresh-token'); await olderScan;
     expect(h.invite).not.toHaveBeenCalled();
     expect(h.store.read()?.entries.oc_new.status).toBe('pending');

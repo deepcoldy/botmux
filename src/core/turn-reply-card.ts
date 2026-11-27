@@ -25,6 +25,10 @@ import { getAskSnapshot, invalidateReplyCardAsks } from './ask-broker.js';
 import { getSession } from '../services/session-store.js';
 import { MessageWithdrawnError, uploadFile, replyMessage, sendMessage } from '../im/lark/client.js';
 import { observeAcknowledgedGroupPublication, patchPublishedGroupCard, readGroupContextAuthorOrigin } from '../services/group-context-publication.js';
+import { appendFailedPromptActions } from '../im/lark/failed-prompt-card.js';
+import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
+import { isRemoteBackendSession } from './persistent-backend.js';
+import { isSharedAdoptSession } from './shared-adopt.js';
 import { buildTurnReplyCard, publicReplyCardActivity, publicReplyCardTools, replyCardPresentation } from '../im/lark/turn-reply-card.js';
 import {
   normalizeReplyCardMode, replyCardIsTerminal, supportsUnifiedReplyCardCli, TurnReplyCardStore,
@@ -265,7 +269,18 @@ export async function updateTurnReplyCard(
         showLiveUsage: normalizeUsageDisplay(cfg) === 'streaming',
         canStop: presentation.canStop && ds.initConfig?.codexRpcInput !== true,
       });
-      return prepareLocalAddressContent(attachOncallGroupButton(raw, cfg.oncallGroup, ds.chatId, ds.chatType, {
+      // A failed final can be published before its ordered terminal has recorded
+      // lastFailedTurn. Later terminal refreshes re-read that exact session/turn
+      // record here, without persisting a second copy in the card store.
+      const withFailedPrompt = record.finalCard ? appendFailedPromptActions(raw, {
+        cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? cfg.cliId,
+        record: ds.session.lastFailedTurn, turnId: record.turnId,
+        rootId: record.rootId, sessionId: record.sessionId, locale: localeForBot(ds.larkAppId),
+        localOwnedSession: !ds.session.headless && !replyCardSandboxBlocked(ds)
+          && !hasProtectedSessionMutationOwnership(ds) && !isSharedAdoptSession(ds)
+          && !isRemoteBackendSession(ds) && !ds.adoptedFrom && !ds.initConfig?.adoptMode,
+      }) : raw;
+      return prepareLocalAddressContent(attachOncallGroupButton(withFailedPrompt, cfg.oncallGroup, ds.chatId, ds.chatType, {
         appId: ds.larkAppId, sessionId: session.sessionId, questionId: turnId,
         phase: record.finalCard || replyCardIsTerminal(record) ? 'final' : 'first', nativeLink: nativeOncallLink, messageId: record.messageId, privateIntake,
       }), 'interactive', localAddressContextForBot(ds.larkAppId, ds.workingDir ?? ds.session.workingDir));

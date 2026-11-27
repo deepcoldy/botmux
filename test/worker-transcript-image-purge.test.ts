@@ -136,7 +136,9 @@ describe('startTranscriptImagePurge', () => {
 
   it('restarts on the active transcript, purges after the exit is proven, and continues once the replacement runs', async () => {
     const { jsonl, enqueue, restartCliProcess, notices, rejections, purgeAfterExit, settleRespawn } = setup(transcriptWith(1, 1), {
-      lastResolvedSandboxMode: 'scratch',
+      // Scratch views are reusable only on Linux; other hosts exercise the
+      // same successful purge with an unsandboxed worker.
+      lastResolvedSandboxMode: process.platform === 'linux' ? 'scratch' : 'off',
     });
     expect(restartCliProcess).toHaveBeenCalledTimes(1);
     expect(restartCliProcess.mock.calls[0][1]).toMatchObject({
