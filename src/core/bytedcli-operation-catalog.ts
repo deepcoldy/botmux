@@ -1,8 +1,9 @@
+import { SKILL_API_OPERATIONS } from './bytedcli-skill-api.js';
 import packagedCatalog from './bytedcli-operation-catalog.json' with { type: 'json' };
 import { BYTEDCLI_BUSINESS_COMMAND_CATALOG } from './bytedcli-business-command-catalog.js';
 
 export const BYTEDCLI_AUDITED_RELEASE = '0.199.0' as const;
-export const BYTEDCLI_OPERATION_CATALOG_VERSION = '2026-11-27.1' as const;
+export const BYTEDCLI_OPERATION_CATALOG_VERSION = '2026-11-27.2' as const;
 export type BytedcliOperationEffect = 'read' | 'write' | 'unknown' | 'auth' | 'help';
 export type BytedcliOperationExecution = 'audited-native' | 'isolated-native' | 'host-api';
 export function isBytedcliWriteLike(effect: string): effect is 'write' | 'unknown' { return effect === 'write' || effect === 'unknown'; }
@@ -188,7 +189,7 @@ function validateCatalog(raw: unknown): BytedcliOperationGrammar {
 export const BYTEDCLI_OPERATION_GRAMMAR = validateCatalog(packagedCatalog);
 /** Informational support catalog, derived from the parser's validated grammar. */
 export const BYTEDCLI_OPERATION_CATALOG: readonly BytedcliOperationCatalogEntry[] = deepFreeze(
-  [...BYTEDCLI_OPERATION_GRAMMAR.entries.map(entry => ({ id: entry.id, path: entry.path, aliases: entry.aliases,
+  [...SKILL_API_OPERATIONS.map(entry => ({ ...entry, path: entry.id.startsWith('skill-api.') ? ['skill-api', entry.id.slice(10)] : ['es', 'search'], aliases: [], allowedFlags: entry.id.startsWith('skill-api.') ? ['--request', '--body-file', '--json', '--site'] : ['--psm', '--idc', '--index', '--method', '--query', '--size', '--json', '--site'], cliVersion: BYTEDCLI_AUDITED_RELEASE, execution: 'host-api' as const })), ...BYTEDCLI_OPERATION_GRAMMAR.entries.map(entry => ({ id: entry.id, path: entry.path, aliases: entry.aliases,
     effect: entry.effect, allowedFlags: [...entry.flags.map(flag => flag.name), '--json', '--site', '--help'],
     cliVersion: BYTEDCLI_AUDITED_RELEASE, execution: (entry.effect === 'auth' || entry.effect === 'help' ? 'host-api' : 'audited-native') as BytedcliOperationExecution })),
   ...BYTEDCLI_BUSINESS_COMMAND_CATALOG.map(entry => ({ id: entry.id, path: entry.path, aliases: entry.aliases,

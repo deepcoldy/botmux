@@ -1,6 +1,6 @@
 # bytedcli 精确业务目录与隔离执行
 
-CLI 审核版本为 `0.199.0`，目录为 `2026-11-27.1`。原 JSON grammar 保留 18 行，新纯模块 `src/core/bytedcli-business-command-catalog.ts` 增加 40 个精确签名。合并后的目录供 parser、Dashboard、help 和策略状态使用；每行包含真实 effect、允许参数、匹配条件、输入快照及执行方式。运行配置不能添加目录条目或改变 effect。
+CLI 审核版本为 `0.199.0`，目录为 `2026-11-27.2`。原 JSON grammar 保留 18 行，新纯模块 `src/core/bytedcli-business-command-catalog.ts` 增加 40 个精确签名。合并后的目录供 parser、Dashboard、help 和策略状态使用；每行包含真实 effect、允许参数、匹配条件、输入快照及执行方式。运行配置不能添加目录条目或改变 effect。
 
 | 签名 | 效果与限制 |
 | --- | --- |
@@ -42,4 +42,6 @@ RDS 还需要预装 DB 二进制。宿主启动时冻结 `DB_CLI_BINARY`，或�
 
 响应新增可选 `operationEffect`：新宿主输出已解析操作的实际效果，解析前错误和旧宿主可省略。客户端核对本地规范操作；未知效果值、unknown+machine、read+write_outcome_unknown 等组合拒绝。请求仍不能提交 effect/identity。客户端在丢失或不可信响应后，按本地 write/unknown 保守返回 write_outcome_unknown。
 
-尚未证明的 ES/DoAs 调用没有机器条目，不能用目录中其他 RPC 或 SQL 行代替；其非交互认证及受管 API 适配需要独立完成。目录审核不等于真实服务权限已开通；没有执行真实业务/认证网络验证。
+固定 Picko ES 分布查询与 GDPR realm、JWT 型 Skill 最终 API 已在 [受管 Skill 合同](bytedcli-managed-skill-api.md) 补充；其他 ES/DoAs 调用仍无机器条目，不能用其他 RPC 或 SQL 行代替。目录审核不等于真实服务权限已开通；没有执行真实业务/认证网络验证。
+
+受管最终 API、场景完整预设与源码安装边界见 [受管 Skill 合同](bytedcli-managed-skill-api.md)。

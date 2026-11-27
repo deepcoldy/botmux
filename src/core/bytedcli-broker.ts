@@ -1,3 +1,6 @@
+import { createSkillMcpRunner } from './bytedcli-skill-mcp.js';
+import { createBytedcliHostApiRunner } from './bytedcli-skill-api-transport.js';
+import { createBytedcliGdprLeaseResolver } from './bytedcli-gdpr-lease.js';
 import { runBytedcliSafeCommand } from './bytedcli-safe-commands.js';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
@@ -194,7 +197,12 @@ export function createProductionBytedcliBroker(host:Omit<import('./bytedcli-brok
   const getLeases=()=>personalLeases??=createBytedcliHostCredentialResolver({machineHome:layout.machineHome,machineProfile:layout.machineProfile,privateRoot:layout.privateRoot,trustedCli,networkEnv:layout.networkEnv});
   const getExecutor=()=>pending??=(async()=>{
     const leases=await getLeases();
-    executor=new BytedcliExecutor({privateRoot:layout.privateRoot,trustedCli,leases,audit:new BytedcliBrokerAudit(layout.auditRoot),networkEnv:layout.networkEnv,dbRuntime:layout.dbRuntime});
+    const httpApi = (() => {
+      try { return createBytedcliHostApiRunner(layout.networkEnv,layout.runtimeStillCurrent); }
+      catch { return async () => { throw new BytedcliBrokerError('executor_unavailable'); }; }
+    })();
+    const mcpApi = createSkillMcpRunner(layout.mcpRuntime,layout.networkEnv);
+    executor=new BytedcliExecutor({privateRoot:layout.privateRoot,trustedCli,leases:{machine:r=>leases.machine(r),actor:r=>leases.actor(r),realm:createBytedcliGdprLeaseResolver(layout.gdprMachineFile)},hostApi: input => input.descriptor.id === 'skill-api.oncall.knowledge.search' ? mcpApi(input) : httpApi(input),audit:new BytedcliBrokerAudit(layout.auditRoot),networkEnv:layout.networkEnv,dbRuntime:layout.dbRuntime});
     if(closed)await executor.close();return executor;
   })();
   return new BytedcliBroker({operationPolicy,personalLeases:getLeases,currentWorkerGeneration:id=>host.findSession(id)?.workerGeneration,authority:(sessionId,peer,operation,context)=>resolveBytedcliAuthority({...host,operationPolicy,contains:ds=>{

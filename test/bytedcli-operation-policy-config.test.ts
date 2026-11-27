@@ -17,7 +17,7 @@ describe('versioned bytedcli operation policy', () => {
     const raw = { ...base, rules: { 'codebase.mr.list': 'actor', 'codebase.mr.close': 'deny' } };
     const parsed = parseBytedcliOperationPolicy(raw)!;
     raw.rules['codebase.mr.list'] = 'machine';
-    expect(parsed).toEqual({ ...base, schema: 'botmux.bytedcli-operation-policy.v2', catalogVersion: '2026-11-27.1', rules: { 'codebase.mr.close': 'deny', 'codebase.mr.list': 'actor' } });
+    expect(parsed).toEqual({ ...base, schema: 'botmux.bytedcli-operation-policy.v2', catalogVersion: '2026-11-27.2', rules: { 'codebase.mr.close': 'deny', 'codebase.mr.list': 'actor' } });
     expect(parsed.schema).toBe(BYTEDCLI_OPERATION_POLICY_SCHEMA);
     expect(Object.keys(parsed.rules)).toEqual(['codebase.mr.close', 'codebase.mr.list']);
     expect(Object.isFrozen(parsed)).toBe(true);
@@ -29,7 +29,7 @@ describe('versioned bytedcli operation policy', () => {
   it('clears optional config only on absent or null input and accepts explicit inheritance', () => {
     expect(parseBytedcliOperationPolicy(undefined)).toBeUndefined();
     expect(parseBytedcliOperationPolicy(null)).toBeUndefined();
-    expect(policy({})).toEqual({ ...base, schema: 'botmux.bytedcli-operation-policy.v2', catalogVersion: '2026-11-27.1', rules: {} });
+    expect(policy({})).toEqual({ ...base, schema: 'botmux.bytedcli-operation-policy.v2', catalogVersion: '2026-11-27.2', rules: {} });
   });
 
   it('lets explicit v2 machine rules override write defaults while preserving actor floors and denial', () => {

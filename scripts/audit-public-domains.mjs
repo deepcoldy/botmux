@@ -26,6 +26,17 @@ const allowedHosts = new Set([
 // Require at least one label so bare corporate TLD mentions in assertions/comments
 // do not trip the gate; catch accidental private subdomains under either suffix.
 const hostnamePattern = /\b(?:[a-z0-9-]+\.)+(?:bytedance\.net|byted\.org)\b/gi;
+// Exact audited bytedcli API contracts and their evidence. Never a host-wide
+// exemption: the same hostname in any other file still fails this gate.
+const reviewedBytedcliHosts = new Map([
+  ['src/core/bytedcli-business-command-catalog.ts', ['slardar.bytedance.net', 'bits.bytedance.net']],
+  ['src/core/bytedcli-skill-api.ts', ['bits.bytedance.net', 'kibana-bytees.bytedance.net']],
+  ['src/core/bytedcli-skill-api-services.ts', ['selfdo.bytedance.net', 'cloud.bytedance.net', 'eops.bytedance.net']],
+  ['test/bytedcli-business-command-catalog.test.ts', ['slardar.bytedance.net', 'bits.bytedance.net']],
+  ['test/bytedcli-skill-api.test.ts', ['slardar.bytedance.net']],
+  ['test/bytedcli-skill-api-transport.test.ts', ['bits.bytedance.net']],
+  ['docs/bytedcli-business-command-catalog.md', ['slardar.bytedance.net']],
+]);
 const allowedHostSuffixes = [];
 const generatedDirectories = new Set(['node_modules', 'dist', 'doc_build']);
 const selfPath = fileURLToPath(import.meta.url);
@@ -54,6 +65,7 @@ for (const file of files) {
   for (const match of source.matchAll(hostnamePattern)) {
     const hostname = match[0].toLowerCase();
     if (allowedHosts.has(hostname)) continue;
+    if (reviewedBytedcliHosts.get(relative(repoRoot, file))?.includes(hostname)) continue;
     if (allowedHostSuffixes.some(suffix => hostname.endsWith(suffix))) continue;
     const line = source.slice(0, match.index).split('\n').length;
     violations.push(`${relative(repoRoot, file)}:${line}: ${hostname}`);

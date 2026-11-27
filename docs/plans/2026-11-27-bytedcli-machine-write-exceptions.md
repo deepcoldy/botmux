@@ -82,12 +82,12 @@ expect(() => parseBytedcliOperation(['codebase','mr','close','1','--repo','org/r
 
 ```ts
 expect(MIX_SKILL_MACHINE_PRESET.rules['skill-api.bits.release.owner.update']).toBe('machine');
-expect(MIX_SKILL_MACHINE_PRESET.rules['codebase.mr.create']).toBeUndefined();
+expect(MIX_SKILL_MACHINE_PRESET.rules['codebase.mr.create']).toBe('actor');
 ```
 
 - [ ] 实现固定源/路径/方法/body的受管API dispatcher，发送前intent并重新核验；拒绝任意URL、redirect、header/credential选择，HTTP代理使用冻结宿主网络合同。nativefake与HTTPfake通过同一真实executor组合验证。
 - [ ] release-owner读列表/单详情/关联研发单/PUT approvers改走受管操作，dry-run无写调用，apply machine例外与actor默认可观察且结果未知无自动重试。其他JWT型Skill按照实际最终API effect适配，不能导出机器JWT；必要MCP调用限定工具和server。源码改造/安装交付每项记录路径和验证，不与运行版本混淆。
-- [ ] 提供全部选定Skill精确命令的machinepreset JSON；Dashboard应用按钮展示write例外并保存完整配置，global actor/deny不能放宽。未选定write（MRcreate、SelfDo、MindAI产物）不加入preset。
+- [ ] 提供全部选定Skill精确命令的machinepreset JSON；Dashboard应用按钮展示write例外并保存完整配置，global actor/deny不能放宽。未选定的所有已登记 read/write（含 MRcreate、SelfDo、MindAI 产物）显式 actor；选定签名 machine；宿主 actor/deny 保持上限。
 - [ ] 更新使用说明、审核证据和真实假数据UI截图；targettests+private mutations覆盖preset遗漏、写效果丢失、任意目标、token泄露、dryrun误写。中文提交并报告。
 
 ### Task 4: 当前提交验证与独立对抗复核、交付
@@ -99,3 +99,5 @@ expect(MIX_SKILL_MACHINE_PRESET.rules['codebase.mr.create']).toBeUndefined();
 - [ ] 按AGENTS.md独立真实组件+可控时钟攻击：人工改machine→actor/deny；intent成功/结果失败/半写策略恢复；长machine取票/未知actor执行×timeout/重试/下一轮交叠。检验不重复写、不泄漏身份、不遗留资源。
 - [ ] 每个任务review清洁，最终review只覆盖本轮`2145d2e80..HEAD`；存在真实finding交原作者合并修复和scoped复核，影响验证重跑。
 - [ ] 检查源码与验证目录clean/diff hygiene/无package-lock改动，普通推送既有功能分支并确认remoteHEAD相等。保留证据，报告配置入口、实际覆盖与部署尚需执行的步骤。
+
+最终场景裁定（覆盖早先未选 write 省略示例）：预设对所有未选已登记业务 read/write 显式 actor，确保其他业务使用触发者，即使宿主此前明确 machine。应用后仍可手动调整已登记操作例外；global actor/deny 不可放宽。

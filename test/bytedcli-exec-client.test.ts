@@ -52,3 +52,11 @@ it('snapshots bounded stdin once inside the client',async()=>{
   const rejected=await runBytedcliExecClient({sessionId:'s',port,argv,stdin:Readable.from([Buffer.alloc(2*1024*1024+1)]),stdout:()=>{},stderr:()=>{}});
   expect(rejected).toBe(77);
 });
+
+it('snapshots large Skill JSON before host admission without transmitting caller paths',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'skill-client-'));roots.push(dir);const file=join(dir,'request.json');
+ const body={name:'chart.png',mimeType:'image/png',dataBase64:Buffer.alloc(90000,1).toString('base64')};writeFileSync(file,JSON.stringify(body));let received:any;
+ const port=await host((req:any,res:any)=>{let text='';req.on('data',(b:Buffer)=>text+=b);req.on('end',()=>{received=JSON.parse(text);writeFileSync(file,'changed');const op=parseBytedcliOperation(received.argv,received.inputs);res.end(JSON.stringify({schema:'botmux.bytedcli-exec.v1',requestId:received.requestId,operationId:op.id,operationEffect:op.effect,effectiveIdentity:{kind:'actor'},outcome:'completed',stdoutBase64:'',stderrBase64:'',exitCode:0}));});});
+ expect(await runBytedcliExecClient({sessionId:'s',port,argv:['skill-api','mindai.attachment.upload','--body-file',file],stdout:()=>{},stderr:()=>{}})).toBe(0);
+ expect(JSON.stringify(received)).not.toContain(file);expect(JSON.parse(Buffer.from(received.inputs.files[0].dataBase64,'base64').toString())).toEqual(body);
+});

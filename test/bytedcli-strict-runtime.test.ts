@@ -84,3 +84,15 @@ it('removes caller credential and config overrides while retaining unrelated mod
   scrubBytedcliBrokerEnv(env);
   expect(env).toEqual({ LARKSUITE_CLI_USER_ACCESS_TOKEN: 'lark', ANTHROPIC_AUTH_TOKEN: 'model', PATH: '/bin' });
 });
+
+it('exposes zero-authority managed Skill routing only on strict bytedcli wrappers', () => {
+ const root=mkdtempSync(join(tmpdir(),'skill-hint-'));
+ try {
+  const wrapper=join(root,'bytedcli');
+  writeFileSync(wrapper,renderIdentityWrapper('bytedcli','/bin/false','single',undefined,{brokerClient:['/bin/false']}),{mode:0o700});
+  const result=spawnSync(wrapper,['--botmux-skill-api-contract'],{encoding:'utf8'});
+  expect(result.status).toBe(0);expect(result.stdout.trim()).toBe('botmux.skill-api.v1');
+  writeFileSync(wrapper,renderIdentityWrapper('bytedcli','/bin/false','single',undefined,{bytecloud:true}),{mode:0o700});
+  expect(spawnSync(wrapper,['--botmux-skill-api-contract'],{encoding:'utf8',env:{...process.env,BOTMUX_SESSION_ID:'nonstrict'}}).stdout).not.toContain('botmux.skill-api.v1');
+ } finally {rmSync(root,{recursive:true,force:true});}
+});

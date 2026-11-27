@@ -94,7 +94,7 @@ describe('selected business signatures', () => {
   });
   it('only migrates old catalog policies with IDs present in that reviewed catalog', () => {
     const old = { schema: 'botmux.bytedcli-operation-policy.v1', cliVersion: '0.199.0', catalogVersion: '2026-11-26.1', rules: { 'codebase.repo.get': 'machine' } };
-    expect(parseBytedcliOperationPolicy(old)?.catalogVersion).toBe('2026-11-27.1');
+    expect(parseBytedcliOperationPolicy(old)?.catalogVersion).toBe('2026-11-27.2');
     expect(() => parseBytedcliOperationPolicy({ ...old, rules: { 'bits.pipeline': 'machine' } })).toThrow();
     expect(() => parseBytedcliOperationPolicy({ ...old, rules: { 'codebase.mr.close': 'machine' } })).toThrow();
     expect(() => parseBytedcliOperationPolicy({ ...old, catalogVersion: '2026-01-01.1' })).toThrow();

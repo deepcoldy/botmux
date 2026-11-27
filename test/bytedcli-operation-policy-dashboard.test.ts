@@ -152,3 +152,19 @@ it('global actor floors remain visible when a write row saves machine',async()=>
   expect(p.renderer.root.findAllByProps({'data-action':'bytedcli-machine-exception-codebase.mr.close'})).toHaveLength(0);
  }finally{await p.close();}
 });
+it('applies selected MIX machine preset, preserves full settings and global floors', async()=>{
+ const p=await panel(full,summary(full,{'skill-api.bits.release.owner.update':'actor','tos.upload-object.c4-report':'deny','codebase.mr.create':'machine'}));
+ try {
+  const button=p.renderer.root.findAllByProps({'data-action':'bytedcli-policy-mix-preset'});
+  expect(button).toHaveLength(1);
+  await act(async()=>button[0]!.props.onClick());
+  const saved=p.requests.at(-1);expect(saved).toMatchObject({credentialSource:full.credentialSource,dispatchOnly:full.dispatchOnly});
+  expect(saved.bytedcliOperationPolicy.rules['skill-api.bits.release.owner.update']).toBe('machine');
+  expect(saved.bytedcliOperationPolicy.rules['codebase.mr.create']).toBe('actor');
+  expect(saved.bytedcliOperationPolicy.rules['bits.pipelines.run']).toBe('actor');
+  expect(saved.bytedcliOperationPolicy.rules['skill-api.argos.duties.get']).toBe('actor');
+  expect(p.control('bytedcli-effective-skill-api.bits.release.owner.update').props['data-identity']).toBe('actor');
+  expect(p.control('bytedcli-effective-tos.upload-object.c4-report').props['data-enabled']).toBe(false);
+  expect(p.control('bytedcli-effective-codebase.mr.create').props['data-identity']).toBe('actor');
+ }finally{await p.close();}
+});

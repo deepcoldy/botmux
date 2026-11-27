@@ -1,0 +1,21 @@
+{
+  "skill": "mindai-chart-generation",
+  "source": "source repository not found; installed input version hashes",
+  "files": [
+    {
+      "path": "scripts/mindai_chart_client_core/auth.py",
+      "inputSha256": "fcb2a25e65afc9497a58ce779521eb5f21b831051c13b1292eb7af012dc45f13",
+      "outputSha256": "01efc9a9399580f6f712f7ef9951677727a6be14c744de76c680cc7a1596af28"
+    },
+    {
+      "path": "scripts/mindai_chart_client_core/http_client.py",
+      "inputSha256": "834d3c568842dccf67f372cc461e315c20351f29ef0f24c084f20bd53e2f81f0",
+      "outputSha256": "2ffa515822fb7949f16494d160b045b23a55d392e39d3f3459d3d0e9fbca92ee"
+    },
+    {
+      "path": "scripts/mindai_chart_client_core/managed.py",
+      "inputSha256": null,
+      "outputSha256": "594cee965400f89014e2471f6dd26cdad12ac79350e7e2b57a1fee66dc619757"
+    }
+  ]
+}

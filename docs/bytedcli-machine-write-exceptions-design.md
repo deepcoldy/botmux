@@ -10,7 +10,7 @@
 
 配置入口仍为宿主固定的私有策略文件与 Bot 的 triggerUserAuth.bytedcliOperationPolicy。省略/null/关闭模式保留/清除合同不变。界面允许写行选择机器，始终显示 write 效果和最终身份。提供可审阅的 MIX/Picko 机器例外 JSON 与 Dashboard 预设；应用动作写完整 Bot 配置，不能绕过宿主明确限制。源码改造期间不修改现网文件或重启 daemon。
 
-已实现的目录版本为 `2026-11-27.1`，精确签名、执行方式、DB 运行时前提和旧目录闭合迁移见 [业务目录合同](bytedcli-business-command-catalog.md)。unknown opaque ID 不进入可配置目录，只能 actor；所有针对该 ID 的规则均拒绝。exec.v1 响应增加可选 `operationEffect`，新宿主填真实效果，客户端核对，保留旧响应省略兼容。
+已实现的目录版本为 `2026-11-27.2`，精确签名、执行方式、DB 运行时前提和旧目录闭合迁移见 [业务目录合同](bytedcli-business-command-catalog.md)。unknown opaque ID 不进入可配置目录，只能 actor；所有针对该 ID 的规则均拒绝。exec.v1 响应增加可选 `operationEffect`，新宿主填真实效果，客户端核对，保留旧响应省略兼容。
 
 ## 受管执行
 
@@ -27,3 +27,5 @@
 ## 验证和交付
 
 围绕 machine write 的正常结果、持久 intent 失败、结果丢失、策略改变、同轮重放、长取票与下一轮交叠做行为测试与变异验证。真实 Linux 隔离探针证明未登记 CLI 看不到宿主凭据、不能写安装树/策略、不能读取其他请求。client/broker/authority/executor/API adapter 与 Dashboard 的组合验收必须覆盖真实新规则。最终同一提交完成 native typecheck/build、Linux standalone 与编译客户端验收，按 AGENTS.md 执行独立对抗复核后普通推送既有功能分支。无发布、合并或部署。
+
+受管最终 API、场景完整预设与源码安装边界见 [受管 Skill 合同](bytedcli-managed-skill-api.md)。

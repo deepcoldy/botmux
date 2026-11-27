@@ -180,6 +180,13 @@ add('slardar.web.data.list.mix-profile', 'slardar web data list', 'read', {
   validate: tokens => Number(get(tokens, '--end-time')) > Number(get(tokens, '--start-time')) && Number(get(tokens, '--end-time')) - Number(get(tokens, '--start-time')) <= 3600,
   condition: 'slardar.bytedance.net mix_h5 production web/view; one UID/DID filter; reviewed metrics; <= 1 hour / 20 rows',
 });
+const mixScope: Fields = { '--origin': one('https://slardar.bytedance.net'), '--bid': one('mix_h5'), '--env': one('production'), '--site-type': one('web') };
+add('slardar.web.data.get.mix-profile', 'slardar web data get', 'read', { ...mixScope, '--ev-type': one('view', 'http', 'js_error', 'resource_error', 'custom'), '--dh-key': name },
+  [...Object.keys(mixScope), '--ev-type', '--dh-key'], [], { matches: t => get(t, '--bid') === 'mix_h5', condition: 'mix_h5 production web; exact event dh_key; no request overrides' });
+add('slardar.web.data.session-list.mix-profile', 'slardar web data session-list', 'read', { ...mixScope, '--session-id': name, '--start-time': positive, '--end-time': positive },
+  [...Object.keys(mixScope), '--session-id', '--start-time', '--end-time'], [], { matches: t => get(t, '--bid') === 'mix_h5',
+    validate: t => Number(get(t,'--end-time')) > Number(get(t,'--start-time')) && Number(get(t,'--end-time')) - Number(get(t,'--start-time')) <= 3600,
+    condition: 'mix_h5 production web; explicit session and <=1 hour; no request overrides or unbounded pagination' });
 add('bits.anywhere.share.get', 'bits anywhere share get', 'read', { '--url': value => {
   try { const url = new URL(value); return url.origin === 'https://bits.bytedance.net' && !url.username && !url.password && !url.hash
     && url.pathname === '/anywheredoor/proxy/share' && [...url.searchParams.keys()].length === 3

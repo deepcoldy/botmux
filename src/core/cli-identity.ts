@@ -1691,7 +1691,7 @@ export function renderIdentityWrapper(
   if (nativeCapabilities.brokerClient && tool !== 'lark-cli') {
     return ['#!/bin/sh', IDENTITY_WRAPPER_MARKER, refuseBotmuxAs('exit'),
       tool === 'bytedcli'
-        ? `exec ${nativeCapabilities.brokerClient.map(shellSingleQuote).join(' ')} "$@"`
+        ? `[ "$#" = 1 ] && [ "$1" = --botmux-skill-api-contract ] && { printf '%s\\n' 'botmux.skill-api.v1'; exit 0; }; exec ${nativeCapabilities.brokerClient.map(shellSingleQuote).join(' ')} "$@"`
         : `printf '%s\\n' 'botmux: standalone credential tools are unavailable in broker mode' >&2; exit 77`,
       ''].join('\n');
   }

@@ -60,7 +60,7 @@ Bot 使用同一种版本化对象，例如：
 
 规则使用[审核表](bytedcli-operation-audit.md)中的规范 operationId。`codebase pr list` 等别名先归一化为同一个 ID，再应用规则。省略某项表示继承，`machine`、`actor` 均允许真实读取或写入，`deny` 禁用调用。两层规则中任一 deny 都禁用；任一显式 actor 都优先于 machine；显式 machine 可覆盖默认写入身份。没有身份规则时，read 默认 machine，write 默认 actor。Bot 的机器规则不能覆盖宿主明确 actor 或 deny。未知 ID、错误版本或字段会原子拒绝，原配置不变。
 
-当前 policy 与 status schema 都是 v2，CLI/catalog 版本为 `0.199.0` / `2026-11-27.1`。合法旧 `botmux.bytedcli-operation-policy.v1` 对象先按旧合同严格校验，再规范化为 v2；旧 v1 的 machine write 仍拒绝。Dashboard 只接受 v2 status；面对旧 daemon 禁止保存命令规则，仍允许紧急关闭模式。
+当前 policy 与 status schema 都是 v2，CLI/catalog 版本为 `0.199.0` / `2026-11-27.2`。合法旧 `botmux.bytedcli-operation-policy.v1` 对象先按旧合同严格校验，再规范化为 v2；旧 v1 的 machine write 仍拒绝。Dashboard 只接受 v2 status；面对旧 daemon 禁止保存命令规则，仍允许紧急关闭模式。
 
 现有 PUT `/api/bots/:app/trigger-user-auth` 保存完整对象；旧客户端省略 `bytedcliOperationPolicy` 时保留已存规则，显式 `bytedcliOperationPolicy:null` 清除 Bot 规则并恢复继承。整份 `triggerUserAuth:null` 仍清除全部鉴权配置。源选择、owner、委托、git 等字段随保存保留。
 
@@ -133,3 +133,5 @@ HTTP 响应超时与资源清理分别计时。首个执行器授权复查开始
 本功能的验收使用临时 HOME、假 provider/CLI、真实 HTTP/client/executor 和 Linux 隔离测试。未做真实业务写入，也未自动修改或重启现有部署。
 
 新增精确业务签名、未知命令 actor 隔离、历史目录迁移与 DB 二进制前提见 [业务目录合同](bytedcli-business-command-catalog.md)。
+
+受管最终 API、场景完整预设与源码安装边界见 [受管 Skill 合同](bytedcli-managed-skill-api.md)。

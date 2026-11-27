@@ -1,3 +1,4 @@
+import { matchSkillApi } from './bytedcli-skill-api.js';
 import {
   BYTEDCLI_EXEC_LIMITS, decodeBytedcliBase64, parseBytedcliExecInputs, validateBytedcliArgv,
   type BytedcliExecInputs,
@@ -215,6 +216,11 @@ function buildOperation(entry: Entry, parsed: Parsed, rest: string[], inputs: By
 export function parseBytedcliOperation(argv: readonly string[], inputs?: BytedcliExecInputs): BytedcliOperation {
   const args = validateBytedcliArgv(argv);
   const snapshots = inputs === undefined ? {} : parseBytedcliExecInputs(inputs);
+  const skillApi = matchSkillApi(args, snapshots);
+  if (skillApi) {
+    const staged: BytedcliStagedInput[] = skillApi.stagedRequest ? [{...skillApi.stagedRequest, id:skillApi.stagedRequest.id === '-' ? 'stdin' : skillApi.stagedRequest.id, flag:'--body-file', argvIndex:skillApi.argv.indexOf('--body-file')+1, encoding:'utf8'}] : [];
+    return result(skillApi.descriptor.id, skillApi.descriptor.effect, skillApi.argv, {}, staged, 'host-api');
+  }
   for (const entry of entries) {
     let parsed: Parsed;
     try { parsed = parseTokens(args, entry); } catch (error) {

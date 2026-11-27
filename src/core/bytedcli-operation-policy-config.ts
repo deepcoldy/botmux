@@ -42,6 +42,48 @@ const legacyEffects: Readonly<Record<string, 'read' | 'write'>> = Object.freeze(
   'bits.develop.list': 'read', 'log.search-log-matchers': 'read',
 });
 
+const previousIds = new Set([...Object.keys(legacyEffects),
+  'api-test.rpc-call.picko-troubleshoot',
+  'api-test.rpc-call.picko-troubleshoot-ticket',
+  'api-test.rpc-call.picko-size',
+  'api-test.rpc-call.picko-size-ticket',
+  'api-test.rpc-call.picko-is-online',
+  'api-test.rpc-call.picko-is-online-ticket',
+  'api-test.rpc-call.picko-export-pids',
+  'api-test.rpc-call.picko-export-pids-ticket',
+  'api-test.rpc-call.picko-user-email',
+  'api-test.rpc-call.picko-user-email-ticket',
+  'api-test.rpc-call.assign-info',
+  'api-test.rpc-call.assign-info-ticket',
+  'api-test.http-call.picko-tag-enum',
+  'tcc.config.get.picko-rules',
+  'rds.db.query',
+  'cache.execute-command.picko-hget',
+  'bam.method.get',
+  'tce.service.get',
+  'tce.service.search',
+  'scm.repo.search',
+  'log.get-logid-log',
+  'log.search-psm-log',
+  'iam.permission.apply.check-only',
+  'iam.permission.apply.submit',
+  'slardar.web.chat.check-auth',
+  'slardar.web.chat.get',
+  'slardar.web.chat.send',
+  'libra.layer.get',
+  'libra.experiment.list',
+  'libra.experiment.get-batch',
+  'tos.upload-object.c4-report',
+  'bits.release.search',
+  'bits.pipeline',
+  'bits.develop.get',
+  'bits.pipelines.vars',
+  'bits.pipelines.run',
+  'slardar.web.analyze-url',
+  'slardar.web.data.list.mix-profile',
+  'bits.anywhere.share.get',
+  'codebase.repo.file']);
+
 /** Optional Bot config may be absent/null. A present host file must additionally require an object. */
 export function parseBytedcliOperationPolicy(raw: unknown): BytedcliOperationPolicy | undefined {
   if (raw === undefined || raw === null) return undefined;
@@ -49,7 +91,7 @@ export function parseBytedcliOperationPolicy(raw: unknown): BytedcliOperationPol
   const keys = ['schema', 'cliVersion', 'catalogVersion', 'rules'];
   if (Object.keys(rec).length !== keys.length || keys.some(key => !Object.hasOwn(rec, key))
     || ![BYTEDCLI_OPERATION_POLICY_SCHEMA, 'botmux.bytedcli-operation-policy.v1'].includes(rec.schema as string) || rec.cliVersion !== BYTEDCLI_AUDITED_RELEASE
-    || ![BYTEDCLI_OPERATION_CATALOG_VERSION, '2026-11-26.1'].includes(rec.catalogVersion as string)) invalid();
+    || ![BYTEDCLI_OPERATION_CATALOG_VERSION, '2026-11-27.1', '2026-11-26.1'].includes(rec.catalogVersion as string)) invalid();
   if (rec.schema === 'botmux.bytedcli-operation-policy.v1' && rec.catalogVersion !== '2026-11-26.1') invalid();
   const rawRules = record(rec.rules);
   const operationIds = Object.keys(rawRules).sort();
@@ -58,7 +100,8 @@ export function parseBytedcliOperationPolicy(raw: unknown): BytedcliOperationPol
   for (const operationId of operationIds) {
     const operation = businessOperations.get(operationId);
     const rule = rawRules[operationId];
-    if ((rec.catalogVersion === '2026-11-26.1' && !Object.hasOwn(legacyEffects, operationId))
+    if ((rec.catalogVersion === '2026-11-27.1' && !previousIds.has(operationId))
+      || (rec.catalogVersion === '2026-11-26.1' && !Object.hasOwn(legacyEffects, operationId))
       || !operation || typeof rule !== 'string' || !['machine', 'actor', 'deny'].includes(rule)
       || (rec.schema === 'botmux.bytedcli-operation-policy.v1' && legacyEffects[operationId] === 'write' && rule === 'machine')) invalid();
     rules[operationId] = rule as BytedcliOperationRule;

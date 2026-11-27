@@ -1,3 +1,4 @@
+import { MIX_SKILL_MACHINE_PRESET, MIX_MACHINE_WRITE_EXCEPTIONS } from '../../core/bytedcli-skill-machine-preset.js';
 import { BYTEDCLI_OPERATION_CATALOG, BYTEDCLI_AUDITED_RELEASE, BYTEDCLI_OPERATION_CATALOG_VERSION } from '../../core/bytedcli-operation-catalog.js';
 import { BYTEDCLI_OPERATION_POLICY_SCHEMA, BYTEDCLI_OPERATION_POLICY_STATUS_SCHEMA, parseBytedcliOperationPolicy, resolveBytedcliOperationRule, type BytedcliOperationPolicyStatus } from '../../core/bytedcli-operation-policy-config.js';
 import { bytecloudBrokerEnabled } from '../../core/identity-policy.js';
@@ -5254,6 +5255,11 @@ export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: P
         </div>
         <div className="actions">
           <button type="button" disabled={busy || policyState === 'pending' || policyState === 'inactive'} onClick={() => setPolicyRefresh(value => value + 1)}>{tr('botDefaults.bytedcliPolicyRefresh')}</button>
+          <button type="button" data-action="bytedcli-policy-mix-preset" disabled={busy || policyState !== 'ready'}
+            onClick={() => { if (!busy && policyState === 'ready') void save({ ...policyWith({}), enabled, bytedcliOperationPolicy: MIX_SKILL_MACHINE_PRESET }, true); }}>
+            {tr('botDefaults.bytedcliPolicyMixPreset')}
+          </button>
+          <small data-action="bytedcli-policy-mix-writes">{tr('botDefaults.bytedcliPolicyMixWrites')}: {MIX_MACHINE_WRITE_EXCEPTIONS.join(', ')}</small>
           <button type="button" data-action="bytedcli-policy-clear" disabled={busy || policyState !== 'ready'}
             onClick={() => { if (!busy && policyState === 'ready') void save({ ...policyWith({}), enabled, bytedcliOperationPolicy: null }, true); }}>
             {tr('botDefaults.bytedcliPolicyClear')}

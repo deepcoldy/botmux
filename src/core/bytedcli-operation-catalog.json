@@ -1,7 +1,7 @@
 {
   "schema": "botmux.bytedcli-operation-catalog.v1",
   "cliVersion": "0.199.0",
-  "catalogVersion": "2026-11-27.1",
+  "catalogVersion": "2026-11-27.2",
   "validators": {
     "numeric-id": {
       "kind": "integer",

@@ -1,3 +1,5 @@
+import { matchSkillApi } from './bytedcli-skill-api.js';
+import type { BytedcliHostApiRunner } from './bytedcli-skill-api-transport.js';
 import { constants, closeSync, mkdtempSync, mkdirSync, openSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { BYTEDCLI_EXEC_SCHEMA, BYTEDCLI_EXEC_LIMITS, BYTEDCLI_EXEC_ERROR_CODES, decodeBytedcliBase64,
@@ -34,6 +36,7 @@ export interface BytedcliExecutorDependencies {
   readonly leases: BytedcliLeaseResolver; readonly audit: BytedcliAuditSink;
   readonly networkEnv?: Readonly<NodeJS.ProcessEnv>; readonly run?: BytedcliChildRunner;
   readonly dbRuntime?: BytedcliTrustedDbRuntime;
+  readonly hostApi?: BytedcliHostApiRunner;
 }
 export function redactBytedcliOutput(buffer: Buffer, activeSecrets: readonly string[]): Buffer {
   let text = buffer.toString('utf8');
@@ -351,16 +354,23 @@ export class BytedcliExecutor {
         identityTurnId: request.authority.identityTurnId ?? request.authority.turnId };
       const dbRuntime = request.operation.requiredRuntime === 'db-cli' ? this.deps.dbRuntime : undefined;
       if (request.operation.requiredRuntime === 'db-cli' && (!dbRuntime || !dbRuntime.stillCurrent())) throw new BytedcliBrokerError('executor_unavailable');
+      const api = request.operation.execution === 'host-api' ? matchSkillApi(request.operation.argv, request.operation.stagedInputs.length ? {files:request.operation.stagedInputs.filter(i=>i.id!=='stdin').map(i=>({id:i.id,dataBase64:i.dataBase64})), ...(request.operation.stagedInputs.find(i=>i.id==='stdin') ? {stdinBase64:request.operation.stagedInputs.find(i=>i.id==='stdin')!.dataBase64} : {})} : undefined)?.descriptor : undefined;
+      if (request.operation.execution === 'host-api' && (!api || !this.deps.hostApi)) throw new BytedcliBrokerError('executor_unavailable');
       const kind = executionIdentityOf(request);
-      lease = await bounded(kind === 'machine' ? this.deps.leases.machine(leaseRequest) : this.deps.leases.actor(leaseRequest));
+      if (api?.realm === 'gdpr') {
+        if (!this.deps.leases.realm) throw new BytedcliBrokerError('region_auth_required');
+        lease = await bounded(this.deps.leases.realm('gdpr', kind, leaseRequest));
+        if (lease.realm !== 'gdpr') throw new BytedcliBrokerError('actor_identity_unverified');
+      } else lease = await bounded(kind === 'machine' ? this.deps.leases.machine(leaseRequest) : this.deps.leases.actor(leaseRequest));
       entry.revalidate = lease.stillCurrent;
       if (lease.kind !== kind || !/^sha256:[A-Za-z0-9_-]+$/.test(lease.accountFingerprint)) throw new BytedcliBrokerError('actor_identity_unverified');
       identity = Object.freeze({ kind, accountFingerprint: lease.accountFingerprint });
       entry.identity = identity;
       if (lease.region !== request.operation.region || !lease.jwt || lease.expiresAt <= Date.now()) throw new BytedcliBrokerError('region_auth_required');
       await bounded(this.check(active));
-      const trustedCli = await bounded(this.deps.trustedCli(controller.signal)); assertBytedcliAuditedRelease(trustedCli.version);
-      const cli = dbRuntime ? Object.freeze({ ...trustedCli, dbRuntime, stillCurrent: () => trustedCli.stillCurrent() && dbRuntime.stillCurrent() }) : trustedCli;
+      const trustedCli = api ? undefined : await bounded(this.deps.trustedCli(controller.signal));
+      if (trustedCli) assertBytedcliAuditedRelease(trustedCli.version);
+      const cli = dbRuntime ? Object.freeze({ ...trustedCli, dbRuntime, stillCurrent: () => trustedCli!.stillCurrent() && dbRuntime.stillCurrent() }) : trustedCli;
       ensureBytedcliPrivateDirectory(this.deps.privateRoot); root = mkdtempSync(join(this.deps.privateRoot, 'request-'));
       const home = join(root, 'home'); const cwd = join(root, 'cwd'); mkdirSync(home, { mode: 0o700 }); mkdirSync(cwd, { mode: 0o700 });
       const stage = (name: string, bytes: Buffer) => {
@@ -373,7 +383,7 @@ export class BytedcliExecutor {
         const bytes = decodeBytedcliBase64(input.dataBase64, request.operation.inputLimitBytes - inputBytes); inputBytes += bytes.length;
         argv[input.argvIndex] = stage(`input-${index}`, bytes);
       }
-      const jwtPath = stage('request.jwt', Buffer.from(lease.jwt)); argv.unshift('--bytecloud-user-jwt-file', jwtPath);
+      if (!api) { const jwtPath = stage('request.jwt', Buffer.from(lease.jwt)); argv.unshift('--bytecloud-user-jwt-file', jwtPath); }
       const authority = request.authority;
       auditBase = { daemonBootId: authority.daemonBootId, botAppId: authority.botAppId, sessionId: authority.sessionId,
         turnId: authority.turnId, workerGeneration: authority.workerGeneration, dispatchAttempt: authority.dispatchAttempt,
@@ -387,23 +397,26 @@ export class BytedcliExecutor {
         catch { throw new BytedcliBrokerError('audit_unavailable'); }
       }
       await bounded(this.check(active)); const leaseCode = await bounded(lease.stillCurrent()); if (leaseCode) throw new BytedcliBrokerError(leaseCode);
-      await bounded(this.check(active)); if (!cli.stillCurrent()) throw new BytedcliBrokerError('executor_unavailable');
-      const runner = this.deps.run ?? runBoundedBytedcliChild;
-      // An injected runner is a trusted host boundary; conservatively assume
-      // dispatch on entry. The default runner reports the actual spawn event.
-      const invocation = { executable: cli.executable, argv: [...(cli.prefixArgs ?? []), ...argv], cwd,
-        env: { ...bytedcliMinimalEnv(home, cwd, cli.path, this.deps.networkEnv), ...(dbRuntime ? { DB_CLI_BINARY: dbRuntime.executable } : {}) }, signal: controller.signal,
-        timeoutMs: Math.max(1, request.operation.timeoutMs - (Date.now() - started)), outputLimitBytes: request.operation.outputLimitBytes,
-        onDispatch: () => { dispatched = true; entry.dispatched = true; }, reserveOutput: (bytes: number) => {
-          if (this.outputBytes + bytes > GLOBAL_OUTPUT_LIMIT) return false;
-          this.outputBytes += bytes; heldOutput += bytes; return true;
-        } };
-      const prepared = request.operation.execution === 'isolated-native' ? isolateBytedcliInvocation(invocation, cli, root) : invocation;
-      if (this.deps.run) { dispatched = true; entry.dispatched = true; }
-      const childWork = runner(prepared);
-      let result;
-      try { result = await bounded(childWork); }
-      catch (error) { if (!this.deps.run) await childWork.catch(() => undefined); throw error; }
+      await bounded(this.check(active)); if (cli && !cli.stillCurrent()) throw new BytedcliBrokerError('executor_unavailable');
+      const onDispatch = () => { dispatched = true; entry.dispatched = true; };
+      const reserveOutput = (bytes: number) => {
+        if (this.outputBytes + bytes > GLOBAL_OUTPUT_LIMIT) return false;
+        this.outputBytes += bytes; heldOutput += bytes; return true;
+      };
+      let childWork;
+      if (api) {
+        childWork = this.deps.hostApi!({ requestRoot: root, home, cwd, descriptor: api, lease, signal: controller.signal,
+          outputLimitBytes: request.operation.outputLimitBytes, onDispatch, reserveOutput });
+      } else {
+        const invocation = { executable: cli!.executable!, argv: [...(cli!.prefixArgs ?? []), ...argv], cwd,
+          env: { ...bytedcliMinimalEnv(home, cwd, cli!.path!, this.deps.networkEnv), ...(dbRuntime ? { DB_CLI_BINARY: dbRuntime.executable } : {}) }, signal: controller.signal,
+          timeoutMs: Math.max(1, request.operation.timeoutMs - (Date.now() - started)), outputLimitBytes: request.operation.outputLimitBytes,
+          onDispatch, reserveOutput };
+        const prepared = request.operation.execution === 'isolated-native' ? isolateBytedcliInvocation(invocation, cli! as BytedcliTrustedCli, root) : invocation;
+        if (this.deps.run) onDispatch();
+        childWork = (this.deps.run ?? runBoundedBytedcliChild)(prepared);
+      }
+      const result = await bounded(childWork);
       if (isBytedcliWriteLike(request.operation.effect) && result.exitCode !== 0) throw new BytedcliBrokerError('upstream_failed');
       if (result.stdout.length + result.stderr.length > request.operation.outputLimitBytes) throw new BytedcliBrokerError('output_limit');
       if (heldOutput === 0) { // injected runners still obey the global budget
@@ -412,7 +425,7 @@ export class BytedcliExecutor {
         this.outputBytes += heldOutput;
       }
       await bounded(this.check(active)); const current = await bounded(lease.stillCurrent()); if (current) throw new BytedcliBrokerError(current);
-      if (!cli.stillCurrent()) throw new BytedcliBrokerError('executor_unavailable');
+      if (cli && !cli.stillCurrent()) throw new BytedcliBrokerError('executor_unavailable');
       const stdout = redactBytedcliOutput(result.stdout, [lease.jwt]); const stderr = redactBytedcliOutput(result.stderr, [lease.jwt]);
       if (stdout.length + stderr.length > request.operation.outputLimitBytes) throw new BytedcliBrokerError('output_limit');
       const response: BytedcliExecResponse = Object.freeze({ schema: BYTEDCLI_EXEC_SCHEMA, requestId: request.requestId,

@@ -19,11 +19,13 @@ export interface BytedcliLeaseRequest {
   readonly signal: AbortSignal; readonly sessionId?: string; readonly identityTurnId?: string; readonly botAppId?: string;
 }
 export interface BytedcliCredentialLease {
+  readonly realm?: 'bytecloud' | 'gdpr';
   readonly jwt: string; readonly kind: 'machine' | 'actor'; readonly region: 'cn'; readonly expiresAt: number;
   readonly accountFingerprint: string; readonly source: 'machine' | 'local' | 'platform';
   readonly stillCurrent: (signal?: AbortSignal) => Promise<BytedcliExecErrorCode | undefined>;
 }
 export interface BytedcliLeaseResolver {
+  realm?(realm: 'gdpr', kind: 'machine' | 'actor', request: BytedcliLeaseRequest): Promise<BytedcliCredentialLease>;
   machine(request: BytedcliLeaseRequest): Promise<BytedcliCredentialLease>;
   actor(request: BytedcliLeaseRequest): Promise<BytedcliCredentialLease>;
 }
