@@ -2221,6 +2221,25 @@ describe('contract gateway and real worker boundaries', () => {
     expect(first.outputs[0].state).toBe('pending'); expect(next.outputs[0].state).toBe('processing');
     expect(next.execution.phase).toBe('succeeded'); expect(next.resultRevision).toBeGreaterThan(first.resultRevision);
   });
+  it('admits a scoped internal output without publishing it as the execution answer', () => {
+    const s = fixture();
+    const execution = s.controller.admitInput('om_turn');
+    s.store.bindQueuedExecution(s.ref, execution, s.runtime);
+    const internal = {
+      type: 'final_output' as const, sessionId: s.ref.sessionId, turnId: 'om_turn', content: 'ROUTE: generic',
+      lastUuid: 'internal', sessionContract: s.context(1, { runtime: s.runtime, execution }),
+    };
+    const admission = s.controller.ingest(internal, s.worker, undefined, { suppressOutputProjection: true });
+    expect(admission.kind).toBe('current');
+    expect(s.store.execution(s.ref, execution.executionId)?.output).toBeUndefined();
+    expect(internal.content).toBe('ROUTE: generic');
+    const realAnswer = { ...internal, lastUuid: 'answer', content: 'I am here.',
+      sessionContract: s.context(2, { runtime: s.runtime, execution }) };
+    expect(s.controller.ingest(realAnswer, s.worker).kind).toBe('current');
+    expect(s.store.execution(s.ref, execution.executionId)?.output).toMatchObject({
+      availability: 'available', content: 'I am here.', completeness: 'final',
+    });
+  });
   it.each(['restart', 'interrupt_turn', 'suspend', 'close_commit', 'raw_input', 'term_action', 'inject_command', 'session_ready', 'turn_idle'])('requires a frozen RuntimeRef for %s', type => {
     const s = fixture(); expect(admitSessionCommand(type, { version: 2, operationId: 'op' }, s.runtime, 'op').allowed).toBe(false);
   });

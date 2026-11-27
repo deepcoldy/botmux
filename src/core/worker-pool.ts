@@ -389,7 +389,7 @@ import { readBridgeTurnJournal } from '../services/bridge-turn-journal.js';
 import { isHumanInboundTurnId, setFinalOutputOriginRecorder } from './reply-target.js';
 import { durableImRepliesEnabled } from '../bot-registry.js';
 import { outputSnapshot } from '../services/universal-output-handoff.js';
-import { outputDeliveryJournal, type OutputDeliveryRecord, type OutputReceipt, type OutputSink } from '../services/output-delivery-journal.js';
+import { outputDeliveryJournal, type OutputDeliveryJournal, type OutputDeliveryRecord, type OutputReceipt, type OutputSink } from '../services/output-delivery-journal.js';
 import { OutputDeliveryCoordinator, OutputDeliveryTerminalError, type OutputDeliveryControl } from '../services/output-delivery-coordinator.js';
 import { TurnSendLedger, FinalPublicationUnknownError } from '../services/turn-send-ledger.js';
 import { createTurnResultRuntime, setTurnResultRuntime } from './turn-result-runtime.js';
@@ -1740,9 +1740,11 @@ export function initWorkerPool(cb: WorkerPoolCallbacks): void {
       && isStructuredBridgeLifecycleBlockingCli(sessionCliId(ds, getBot(ds.larkAppId).config));
     if (!global && !answerRequired) return;
     if (ordinaryIm) {
+      const bridgeFinalExcludedTexts = answerRequired ? getBot(ds.larkAppId).config.imBridgeFinalExcludedTexts : undefined;
       outputDeliveryJournal(config.session.dataDir, ds.larkAppId).rememberSink(ds.session.sessionId, turnId,
         { kind: 'im', context, chatId: ds.chatId, chatType: ds.chatType, privateReply: privateReplyEnabled(ds.session),
-          ...(answerRequired ? { answerRequired: true } : {}) });
+          ...(answerRequired ? { answerRequired: true } : {}),
+          ...(bridgeFinalExcludedTexts?.length ? { bridgeFinalExcludedTexts } : {}) });
     }
     new TurnSendLedger(config.session.dataDir).enableHandoffFence({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId }, answerRequired);
     if (global && turnId.startsWith('om_')) finalOutputHandoffHost(ds.larkAppId).store.rememberOrigin(ds.session.sessionId, turnId, context.target, context.requesterOpenId, Date.now(), { chatId: ds.chatId, chatType: ds.chatType });
@@ -1973,6 +1975,12 @@ async function recoverColdImReplies(ds: DaemonSession): Promise<void> {
   const journal = outputDeliveryJournal(dataDir, appId);
   const fileCopy = new Map(producer.readPending().map(snapshot => [snapshot.id, snapshot]));
   if (fileCopy.size === 0 && !journal.hasUnsettled(session.sessionId)) return;
+  const removeProducerCopy = (record: OutputDeliveryRecord): void => {
+    const copy = fileCopy.get(record.id);
+    if (!copy || copy.fingerprint !== record.fingerprint || !owns()) return;
+    try { producer.remove(copy); }
+    catch (error) { logger.warn(`[${tag(ds)}] Settled IM reply cleanup deferred: ${String(error)}`); }
+  };
   const controller = controllerForSession(ds);
   const proveExecution = (snapshot: Pick<OutputDeliveryRecord, 'origin' | 'output'>) => {
     const origin = snapshot.origin && controller?.outputOrigin(snapshot.origin);
@@ -1997,7 +2005,10 @@ async function recoverColdImReplies(ds: DaemonSession): Promise<void> {
     if (sink?.kind !== 'im' || !sink.answerRequired) continue;
     const recorded = journal.read(snapshot.id);
     if (recorded) {
-      if (recorded.state === 'settled' && recorded.fingerprint === snapshot.fingerprint) producer.remove(snapshot);
+      if (recorded.state === 'settled'
+        || (recorded.state === 'rejected' && recorded.reason === INTERNAL_BRIDGE_FINAL_REJECTION)) {
+        removeProducerCopy(recorded);
+      }
       continue;
     }
     const proof = proveExecution(snapshot);
@@ -2034,16 +2045,14 @@ async function recoverColdImReplies(ds: DaemonSession): Promise<void> {
         } catch (error) { throw classifyFinalPublicationError(error); }
       },
       settled: settled => {
-        const copy = fileCopy.get(settled.id);
-        if (copy) {
-          try { producer.remove(copy); }
-          catch (error) { logger.warn(`[${tag(ds)}] Settled IM reply cleanup deferred: ${String(error)}`); }
-        }
+        removeProducerCopy(settled);
         try {
           if (settled.receipt?.status === 'delivered' && settled.receipt.messageId
             && !settled.output.turnFailed && !settled.output.emptyCompletedNotice) {
             const { turnId, dispatchAttempt, content } = settled.output;
-            noteFinalOutputReceipt(ds, turnId, { text: content }, { exactAttempt: { dispatchAttempt } });
+            noteFinalOutputReceipt(ds, turnId,
+              { text: settled.receipt.owner === REUSED_IM_FINAL_RECEIPT ? undefined : content },
+              { exactAttempt: { dispatchAttempt } });
             // A worker-less session in the same daemon can still own this exact
             // in-memory hold. After a daemon restart the CoT and hold are gone;
             // deliverFinalOutput has already persisted the visible final reply.
@@ -2062,6 +2071,9 @@ async function recoverColdImReplies(ds: DaemonSession): Promise<void> {
           publishAttentionPatch(ds);
         }
       },
+      rejected: record => {
+        if (record.reason === INTERNAL_BRIDGE_FINAL_REJECTION) removeProducerCopy(record);
+      },
       error: (error, terminal) => {
         if (!(error instanceof OutputDeliveryTerminalError && error.message === 'output_execution_cancelled')) {
           showFailure(output.turnId, sink, error, terminal);
@@ -2069,6 +2081,15 @@ async function recoverColdImReplies(ds: DaemonSession): Promise<void> {
       },
     });
   }
+}
+
+export const INTERNAL_BRIDGE_FINAL_REJECTION = 'output_internal_bridge_text';
+export const REUSED_IM_FINAL_RECEIPT = 'reused_im_final_receipt';
+
+export function isInternalBridgeFinal(sink: OutputSink | undefined, msg: Extract<WorkerToDaemon, { type: 'final_output' }>): boolean {
+  // Codex App output also commits its native FIFO. Keep its settlement path intact.
+  return sink?.kind === 'im' && sink.answerRequired === true && !msg.codexAppSettlement
+    && (!msg.kind || msg.kind === 'bridge') && sink.bridgeFinalExcludedTexts?.includes(msg.content.trim()) === true;
 }
 
 function assertFrozenImDeliveryAllowed(ds: DaemonSession, sink: Extract<OutputSink, { kind: 'im' }>): void {
@@ -14297,7 +14318,7 @@ function isSynthesizedBackgroundTurnId(turnId: string | undefined): boolean {
 function finalizeOrHoldCotMessage(
   ds: DaemonSession,
   msg: CotTerminal,
-  opts?: { finishStatus?: 'completed' | 'failed'; replyPending?: boolean },
+  opts?: { finishStatus?: 'completed' | 'failed'; replyPending?: boolean; preserveEarlierHold?: boolean },
 ): void {
   const requiredKey = requiredReplyCotHoldKey(msg.turnId, msg.dispatchAttempt);
   if (ds.requiredReplyCotHolds?.has(requiredKey) || isReplayOfHeldCotTerminal(ds, msg)) return;
@@ -14310,7 +14331,7 @@ function finalizeOrHoldCotMessage(
     && isSynthesizedBackgroundTurnId(msg.turnId) && !hasCotMessageForTurn(ds, msg)) {
     return;
   }
-  releaseHeldCotMessage(ds);
+  if (!opts?.preserveEarlierHold) releaseHeldCotMessage(ds);
   // A replay of an already finalized turn must not create a fresh hold. In
   // particular, an interrupted CLI exit is terminal, not a new background wait.
   if (cotMessageFinishStatus(ds, msg)) return;
@@ -14382,21 +14403,66 @@ function settleRequiredReplyCotMessage(
   ds: DaemonSession,
   turnId: string,
   dispatchAttempt?: number,
+  status: 'completed' | 'failed' = 'completed',
 ): boolean {
   const key = requiredReplyCotHoldKey(turnId, dispatchAttempt);
   const pendingReceipts = ds.pendingRequiredReplyMissingReceipts;
-  pendingReceipts?.delete(key);
-  if (pendingReceipts?.size === 0) ds.pendingRequiredReplyMissingReceipts = undefined;
+  if (status === 'completed') {
+    pendingReceipts?.delete(key);
+    if (pendingReceipts?.size === 0) ds.pendingRequiredReplyMissingReceipts = undefined;
+  }
   const held = ds.requiredReplyCotHolds?.get(key);
   if (!held) return false;
   held.replyPending = false;
-  held.finishStatus = 'completed';
+  held.finishStatus = status;
   if (!held.backgroundPending) {
     ds.requiredReplyCotHolds!.delete(key);
     finalizeCotMessage(ds, held.turnId, held.finishStatus, held.dispatchAttempt);
     if (ds.requiredReplyCotHolds!.size === 0) ds.requiredReplyCotHolds = undefined;
+    const pendingReceipt = pendingReceipts?.get(key);
+    if (pendingReceipt) {
+      pendingReceipts!.delete(key);
+      if (pendingReceipts!.size === 0) ds.pendingRequiredReplyMissingReceipts = undefined;
+      pendingReceipt.publish();
+    }
   }
   return true;
+}
+
+async function settleHistoricalTurnDisplay(
+  ds: DaemonSession,
+  msg: Extract<WorkerToDaemon, { type: 'turn_terminal' }>,
+  journal: OutputDeliveryJournal | undefined,
+  send: Parameters<typeof settleTurnReplyCardTerminal>[2],
+  ownsDisplay: () => boolean,
+  suppressCard: boolean,
+): Promise<void> {
+  if (!ownsDisplay()) return;
+  const sink = msg.status === 'completed' ? journal?.sink(msg.sessionId, msg.turnId) : undefined;
+  const requiresReply = sink?.kind === 'im' && sink.answerRequired === true;
+  const hasReply = requiresReply && !!new TurnSendLedger(config.session.dataDir).readFinalForAttempt({
+    larkAppId: ds.larkAppId, sessionId: msg.sessionId, turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt,
+  })?.messageId;
+  const missing = requiresReply && !hasReply
+    && (msg.outputDisposition === 'nothing_to_send' || msg.outputDisposition === 'empty_answer'
+      || journal?.forTurn(msg.sessionId, msg.turnId).some(record =>
+        record.output.dispatchAttempt === msg.dispatchAttempt && record.state === 'rejected') === true);
+  const pending = requiresReply && !hasReply && !missing;
+  const terminal = missing ? { ...msg, status: 'failed' as const } : msg;
+  if (!isReplayOfHeldCotTerminal(ds, msg)) {
+    if (pending) {
+      finalizeOrHoldCotMessage(ds, msg, { replyPending: true, preserveEarlierHold: true });
+    } else if (!(requiresReply && settleRequiredReplyCotMessage(ds, msg.turnId, msg.dispatchAttempt, missing ? 'failed' : 'completed'))) {
+      finalizeCotMessage(ds, msg.turnId, terminal.status, msg.dispatchAttempt);
+    }
+  }
+  if (suppressCard) return;
+  if (pending) {
+    await retireReplyCardDisplay(ds, { ...msg, preserveCot: true,
+      message: tr('worker.required_reply_pending', undefined, localeForBot(ds.larkAppId)) }, send, ownsDisplay);
+  } else {
+    await settleTurnReplyCardTerminal(ds, terminal, send, ownsDisplay);
+  }
 }
 
 function failRequiredReplyCotHolds(ds: DaemonSession): void {
@@ -25640,6 +25706,13 @@ function setupWorkerHandlers(
         // Keep suppressed partial answers and machine receipts out of chat.
         // Older workers lacking a separate diagnostic retain fail-closed silence.
         const finalOutput = triggerFailureNotice ? { ...msg, content: triggerFailureNotice } : msg;
+        // Late recovery can mint a synthetic turn ID. The original turn still
+        // owns the IM filter, including when global V2 handoff is enabled.
+        if (journal && msg.sessionId === ds.session.sessionId && policyTurnId !== msg.turnId
+          && isInternalBridgeFinal(journal.sink(msg.sessionId, policyTurnId), finalOutput)) {
+          logger.warn(`[${t}] Ignored internal final text recovered for turn ${policyTurnId.substring(0, 8)}`);
+          return { status: 'suppressed', owner: INTERNAL_BRIDGE_FINAL_REJECTION };
+        }
         if (!msg.sessionId) {
           logger.warn(`[${t}] final_output missing sessionId; accepting for compatibility (session=${ds.session.sessionId}, turn=${msg.turnId.substring(0, 8)})`);
         }
@@ -25734,6 +25807,8 @@ function setupWorkerHandlers(
         return receipt;
       },
       settled: async record => {
+        const reusedImFinal = record.receipt?.owner === REUSED_IM_FINAL_RECEIPT;
+        const internalBridgeText = reusedImFinal || record.receipt?.owner === INTERNAL_BRIDGE_FINAL_REJECTION;
         const requiredReplyDelivered = record.sink.kind === 'im' && record.sink.answerRequired === true
           && record.receipt?.status === 'delivered' && !!record.receipt.messageId
           && !record.output.turnFailed && !record.output.emptyCompletedNotice;
@@ -25750,14 +25825,18 @@ function setupWorkerHandlers(
         }
         if (sessionController && record.origin?.scope.execution) {
           sessionController.store.apply(sessionController.ref, { type: 'execution_output', execution: record.origin.scope.execution,
-            output: { availability: record.output.content ? 'available' : 'empty', content: record.output.content, completeness: record.output.turnFailed ? 'partial' : 'final' },
+            output: internalBridgeText ? { availability: 'unavailable' } : {
+              availability: record.output.content ? 'available' : 'empty', content: record.output.content,
+              completeness: record.output.turnFailed ? 'partial' : 'final',
+            },
             delivery: { outputId: record.id, status: record.receipt?.status === 'delivered' ? 'delivered' : record.receipt?.status === 'suppressed' ? 'suppressed' : 'partial', ...(record.receipt?.messageId ? { messageId: record.receipt.messageId } : {}) } }, `delivery:${record.id}:${record.receipt?.status}`);
         }
         await sessionController?.flushPrimary();
         const claim = { type: 'final_output_settled' as const, id: record.id, fingerprint: record.fingerprint, token: ds.initConfig?.finalOutputHandoff?.token ?? '' };
         if (authority() && requiredReplyDelivered) {
           const { turnId, content } = record.output;
-          noteFinalOutputReceipt(ds, turnId, { text: content }, { exactAttempt: { dispatchAttempt: record.output.dispatchAttempt } });
+          noteFinalOutputReceipt(ds, turnId, { text: reusedImFinal ? undefined : content },
+            { exactAttempt: { dispatchAttempt: record.output.dispatchAttempt } });
           // A delivered reply alone is not terminal evidence. Only an exact hold
           // or the registered completed turn may settle the reaction.
           if (cotSettled || hasCompletedTurn(ds, turnId, record.output.dispatchAttempt)) {
@@ -25790,6 +25869,24 @@ function setupWorkerHandlers(
             if (!stillPending) { ds.agentAttention = undefined; publishAttentionPatch(ds); }
           } catch (error) { logger.warn(`[${t}] Final output attention clear deferred: ${String(error)}`); }
         }
+      },
+      rejected: record => {
+        if (!authority()) return;
+        const { turnId, dispatchAttempt } = record.output;
+        const sink = record.sink;
+        if (sink.kind === 'im' && sink.answerRequired && ds.requiredReplyCotHolds?.has(requiredReplyCotHoldKey(turnId, dispatchAttempt))) {
+          const hasReply = !!new TurnSendLedger(config.session.dataDir).readFinalForAttempt({
+            larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId, dispatchAttempt,
+          })?.messageId;
+          settleRequiredReplyCotMessage(ds, turnId, dispatchAttempt, hasReply ? 'completed' : 'failed');
+        }
+        if (record.reason !== INTERNAL_BRIDGE_FINAL_REJECTION) return;
+        // This only clears the producer retry. The durable rejection remains
+        // visible and never enters the delivered or DONE paths.
+        try {
+          worker.send({ type: 'final_output_settled', id: record.id, fingerprint: record.fingerprint,
+            token: ds.initConfig?.finalOutputHandoff?.token ?? '' });
+        } catch { /* an exact replay can acknowledge the same rejection */ }
       },
       error: (error, terminal) => {
         if (raiseDaemonAttention(ds, 'blocked', FINAL_HANDOFF_DELIVERY_REASON, record.output.turnId)) {
@@ -30622,7 +30719,7 @@ function setupWorkerHandlers(
           const waitingForReply = requiresReply && msg.status === 'completed' && !answered() && !emptyRequiredReply;
           const cardTerminal = emptyRequiredReply && !answered() ? { ...msg, status: 'failed' as const } : msg;
           const settleCard = waitingForReply
-            ? retireReplyCardDisplay(ds, { ...msg, message: tr('worker.required_reply_pending', undefined, localeForBot(ds.larkAppId)) },
+            ? retireReplyCardDisplay(ds, { ...msg, preserveCot: true, message: tr('worker.required_reply_pending', undefined, localeForBot(ds.larkAppId)) },
               replyCardSend, ownsLifecycleMutation)
             : settleTurnReplyCardTerminal(ds, cardTerminal, replyCardSend, ownsLifecycleMutation);
           terminalCardSettlement = settleCard;
@@ -32594,7 +32691,10 @@ function setupWorkerHandlers(
       ds.managedTurnOrigin = liveOrigin;
       logger.warn(`[${t}] Applied fail-closed policy-capability revoke backstop after contract reject (${reason})`);
     };
-    let admission = sessionController.ingest(msg as unknown as import('./session-controller.js').ControlledWorkerMessage, contractWorker, recoveredOrigin);
+    const suppressOutputProjection = msg.type === 'final_output' && journal && msg.sessionId === ds.session.sessionId
+      && isInternalBridgeFinal(journal.sink(msg.sessionId, finalOutputPolicyTurnId(msg)), msg);
+    let admission = sessionController.ingest(msg as unknown as import('./session-controller.js').ControlledWorkerMessage,
+      contractWorker, recoveredOrigin, suppressOutputProjection ? { suppressOutputProjection: true } : undefined);
     if (admission.kind === 'reject') {
       logRejected(admission.reason);
       if (msg.type === 'managed_turn_origin_revoked') {
@@ -32662,13 +32762,20 @@ function setupWorkerHandlers(
     if (admission.kind === 'historical' && msg.type === 'turn_terminal' && !msg.continuationFailure) {
       const ownsDisplay = () => ownsWorkerSession() && !isSessionTransferring(ds);
       const turnId = msg.turnId;
-      if (ownsDisplay() && !isReplayOfHeldCotTerminal(ds, msg)) {
-        finalizeCotMessage(ds, msg.turnId, msg.status, msg.dispatchAttempt);
-      }
-      if (!managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
-        await settleTurnReplyCardTerminal(ds, msg,
-          (body, type, uuid, beforeWrite) => scopedReply(body, type, turnId, { uuid, beforeWrite }), ownsDisplay)
+      const send: Parameters<typeof settleTurnReplyCardTerminal>[2] =
+        (body, type, uuid, beforeWrite) => scopedReply(body, type, turnId, { uuid, beforeWrite });
+      const suppressCard = managedAuxUiSuppressed(turnId, msg.dispatchAttempt);
+      if (journal) {
+        await settleHistoricalTurnDisplay(ds, msg, journal, send, ownsDisplay, suppressCard)
           .catch(error => logger.warn(`[${t}] historical reply-card terminal: ${error.message}`));
+      } else {
+        if (ownsDisplay() && !isReplayOfHeldCotTerminal(ds, msg)) {
+          finalizeCotMessage(ds, turnId, msg.status, msg.dispatchAttempt);
+        }
+        if (!suppressCard) {
+          await settleTurnReplyCardTerminal(ds, msg, send, ownsDisplay)
+            .catch(error => logger.warn(`[${t}] historical reply-card terminal: ${error.message}`));
+        }
       }
     }
     let physicalExitClaimOwner: string | undefined;
@@ -33219,6 +33326,7 @@ async function deliverFinalOutputWithOutputControl(
     });
   };
   if (control.record.sink.kind !== 'im') return dispatch();
+  const internalBridgeFinal = isInternalBridgeFinal(control.record.sink, msg);
   let receipt: OutputReceipt | undefined;
   const ledger = new TurnSendLedger(config.session.dataDir);
   const publication = await ledger.execute({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt },
@@ -33228,8 +33336,14 @@ async function deliverFinalOutputWithOutputControl(
       if (!receipt?.messageId) throw new Error('output_publication_unconfirmed');
       return receipt.messageId;
     }, { fenced: true, providerUuid: msg.codexAppSettlement ? `ca_${msg.codexAppSettlement.dispatchId}`.slice(0, 50) : bridgeFinalOutputUuid(ds, msg), reuseExistingFinal: true,
-      beforeDispatch: () => { if (!control.owns()) throw new Error('output_authority_changed'); } });
-  return receipt ?? { status: 'delivered', messageId: publication.messageId };
+    beforeDispatch: () => {
+      if (!control.owns()) throw new Error('output_authority_changed');
+      // The ledger checks for an exact-attempt final receipt before this gate.
+      // A reserved bridge value must never acquire a provider publication.
+      if (internalBridgeFinal) throw new OutputDeliveryTerminalError(INTERNAL_BRIDGE_FINAL_REJECTION);
+    } });
+  return receipt ?? { status: 'delivered', messageId: publication.messageId,
+    ...(internalBridgeFinal ? { owner: REUSED_IM_FINAL_RECEIPT } : {}) };
 }
 
 // ─── HTTP steer-group fan-out (options.steer → codex-app native turn/steer) ──

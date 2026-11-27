@@ -6,7 +6,7 @@ import { mergeOutputReplay, validateOutputSnapshot, isOutputJournalAppId, type O
 import type { FrozenSessionReplyContext } from '../types.js';
 
 export type OutputSink =
-  | { kind: 'im'; context: FrozenSessionReplyContext; chatId: string; chatType: 'group' | 'p2p'; privateReply?: boolean; answerRequired?: true }
+  | { kind: 'im'; context: FrozenSessionReplyContext; chatId: string; chatType: 'group' | 'p2p'; privateReply?: boolean; answerRequired?: true; bridgeFinalExcludedTexts?: readonly string[] }
   | { kind: 'http'; mode: 'wait' | 'async' }
   | { kind: 'doc'; context: Record<string, unknown> }
   | { kind: 'managed' }
