@@ -607,6 +607,20 @@ describe('TurnSendLedger per-session layout', () => {
       );
       expect(seqReplay).toEqual({ messageId: 'doc:comment_1', replayed: true, sentAtMs: sentAtMs + 50 });
 
+      // Master-era records carry sentAtMs without any derived/provenance marker.
+      // Their primary and companion replay timestamps must remain visible.
+      const masterKey = { ...key, turnId: 'turn_master_sent_at' };
+      await ledger.execute(masterKey, 'final', 'master reply', async () => 'om_master', { sentAtMs });
+      expect(await ledger.replayOrThrow(masterKey, 'final', 'master reply'))
+        .toEqual({ messageId: 'om_master', replayed: true, sentAtMs });
+      const masterSeqKey = { ...key, turnId: 'turn_master_doc_seq' };
+      await ledger.executeNonIdempotentSequence(
+        masterSeqKey, 'final', 'master doc reply', 1, async () => {}, 'doc:master', { sentAtMs },
+      );
+      expect(await ledger.executeNonIdempotentSequence(
+        masterSeqKey, 'final', 'master doc reply', 1, async () => { throw new Error('must not run'); }, 'doc:master', { sentAtMs: sentAtMs + 999 },
+      )).toEqual({ messageId: 'doc:master', replayed: true, sentAtMs });
+
       // Legacy records without sentAtMs still replay cleanly with sentAtMs omitted.
       const legacyKey = { ...key, turnId: 'turn_legacy_no_sent_at' };
       await ledger.execute(legacyKey, 'final', 'legacy', async () => 'om_legacy');

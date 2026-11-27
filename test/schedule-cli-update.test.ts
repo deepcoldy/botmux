@@ -891,9 +891,9 @@ describe('work calendar CLI configuration and persisted manual intent', () => {
     const listed = await f.run(['calendars']);
     expect(listed.code, listed.output).toBe(0);
     const cn = listed.output.split('\n').filter(line => line.startsWith('{')).map(line => JSON.parse(line)).find(row => row.name === 'cn');
-    expect(cn).toMatchObject({ name: 'cn', kind: 'builtin', region: 'CN', dataVersion: '2026.1',
-      timeZone: 'Asia/Shanghai', coverage: { start: '2026-01-01', end: '2026-12-31' },
-      source: { authority: '国务院办公厅', documentNo: '国办发明电〔2025〕7号' } });
+    expect(cn).toMatchObject({ name: 'cn', kind: 'builtin', region: 'CN', dataVersion: '2027.1',
+      timeZone: 'Asia/Shanghai', coverage: { start: '2026-01-01', end: '2027-12-31' },
+      source: { authority: '国务院办公厅', documentNo: '国办发明电〔2026〕10号' } });
     const updated = await f.run(['update', f.task.id, '--calendar', 'cn']);
     expect(updated.code, updated.output).toBe(0);
     expect(f.read()[f.task.id]).toMatchObject({ calendar: 'cn', ownerOpenId: f.task.ownerOpenId });

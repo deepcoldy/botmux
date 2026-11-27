@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { readManagedOriginCapability } from './managed-origin-capability.js';
+import { isValidMarkerIdentityTurnId } from './turn-id-shape.js';
 import {
   readProcessStartIdentity,
 } from '../utils/process-identity.js';
@@ -27,11 +28,23 @@ export interface QueuedTypeAheadTurn {
   turnId: string;
   /** The CLI consumed this input; queue admission alone is insufficient. */
   inputConsumed?: true;
+  /** Structural proof (Claude mid-turn `attachment(queued_command)`) that this
+   *  input folded into `(absorbedIntoTurnId, absorbedIntoDispatchAttempt)`
+   *  rather than starting an independent turn. Valid only with `inputConsumed: true`. */
+  absorbedIntoTurnId?: string;
+  absorbedIntoDispatchAttempt?: number;
   dispatchAttempt?: number;
   linkRefMode?: Exclude<LinkRefMode, 'disabled'>;
   trustedCaller?: TrustedCaller;
   trustedController?: TrustedCaller;
   antigravityReconcileHint?: AntigravityReconcileHint;
+}
+
+export interface SettledAbsorbedTurn {
+  turnId: string;
+  dispatchAttempt?: number;
+  hostTurnId: string;
+  hostDispatchAttempt?: number;
 }
 
 export interface AncestorSessionContext {
@@ -43,7 +56,14 @@ export interface AncestorSessionContext {
   trustedController?: TrustedCaller;
   queuedTurnId?: string;
   queuedTurns?: QueuedTypeAheadTurn[];
+  settledAbsorbedTurns?: SettledAbsorbedTurn[];
   steerPromotedTurn?: boolean;
+  /** Set only when an absorbed-but-not-settled follow-up was promoted. This
+   *  preserves exact replay identity for its previous host, never for ordinary
+   *  unconsumed successor turns. */
+  promotedAbsorbedTurn?: true;
+  promotedFromTurnId?: string;
+  promotedFromDispatchAttempt?: number;
   antigravityReconcileHint?: AntigravityReconcileHint;
 }
 
@@ -103,6 +123,71 @@ function parseDispatchAttempt(value: unknown): number | undefined {
     : undefined;
 }
 
+/** Validate mid-turn absorption metadata on one queued type-ahead entry.
+ *  Fail-closed: requires a valid `turnId`, `inputConsumed === true`, a valid
+ *  distinct host turn id, valid (or absent/null) `dispatchAttempt`, and an
+ *  atomic `absorbedIntoDispatchAttempt` when present. */
+export function parseAbsorbedHostBinding(
+  raw: Record<string, unknown> | null | undefined,
+  turnId: string,
+): { absorbedIntoTurnId: string; absorbedIntoDispatchAttempt?: number } | undefined {
+  if (!raw || raw.inputConsumed !== true) return undefined;
+  if (!isValidMarkerIdentityTurnId(turnId)) return undefined;
+  if (!isValidMarkerIdentityTurnId(raw.absorbedIntoTurnId)) return undefined;
+  if (raw.absorbedIntoTurnId === turnId) return undefined;
+  if ('dispatchAttempt' in raw && raw.dispatchAttempt !== undefined && raw.dispatchAttempt !== null
+    && parseDispatchAttempt(raw.dispatchAttempt) === undefined) {
+    return undefined;
+  }
+  const hasAttemptField = 'absorbedIntoDispatchAttempt' in raw && raw.absorbedIntoDispatchAttempt !== undefined;
+  const hostAttempt = parseDispatchAttempt(raw.absorbedIntoDispatchAttempt);
+  if (hasAttemptField && hostAttempt === undefined) return undefined;
+  return {
+    absorbedIntoTurnId: raw.absorbedIntoTurnId,
+    ...(hostAttempt !== undefined ? { absorbedIntoDispatchAttempt: hostAttempt } : {}),
+  };
+}
+
+/** Parse and deduplicate settled absorbed turn records persisted on the PID marker. */
+export function parseSettledAbsorbedTurns(value: unknown): SettledAbsorbedTurn[] | undefined {
+  if (!Array.isArray(value) || value.length === 0) return undefined;
+  const deduped = new Map<string, SettledAbsorbedTurn>();
+  for (const item of value) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const rec = item as Record<string, unknown>;
+    if (!isValidMarkerIdentityTurnId(rec.turnId) || !isValidMarkerIdentityTurnId(rec.hostTurnId)) continue;
+    if (rec.turnId === rec.hostTurnId) continue;
+    const hasAttempt = 'dispatchAttempt' in rec && rec.dispatchAttempt !== undefined;
+    const attempt = parseDispatchAttempt(rec.dispatchAttempt);
+    if (hasAttempt && attempt === undefined) continue;
+    const hasHostAttempt = 'hostDispatchAttempt' in rec && rec.hostDispatchAttempt !== undefined;
+    const hostAttempt = parseDispatchAttempt(rec.hostDispatchAttempt);
+    if (hasHostAttempt && hostAttempt === undefined) continue;
+    const key = `${rec.turnId}\0${attempt ?? ''}`;
+    deduped.delete(key);
+    deduped.set(key, {
+      turnId: rec.turnId,
+      ...(attempt !== undefined ? { dispatchAttempt: attempt } : {}),
+      hostTurnId: rec.hostTurnId,
+      ...(hostAttempt !== undefined ? { hostDispatchAttempt: hostAttempt } : {}),
+    });
+  }
+  if (deduped.size === 0) return undefined;
+  // These are live tombstones, not merely historical diagnostics. Truncating
+  // them before the worker has pruned its in-memory queue requeues the omitted
+  // turns. Terminal cleanup, rather than a size cap, bounds their lifetime;
+  // the settled set never exceeds the absorbed queue it replaces.
+  return [...deduped.values()];
+}
+
+function mergeSettledAbsorbedTurns(
+  existing: readonly SettledAbsorbedTurn[] | undefined,
+  added: readonly SettledAbsorbedTurn[],
+): SettledAbsorbedTurn[] | undefined {
+  if ((!existing || existing.length === 0) && added.length === 0) return undefined;
+  return parseSettledAbsorbedTurns([...(existing ?? []), ...added]);
+}
+
 function parseAntigravityReconcileHint(value: unknown): AntigravityReconcileHint | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const hint = value as Record<string, unknown>;
@@ -144,7 +229,11 @@ function parseIdentityBoundSessionMarker(raw: string): IdentityBoundSessionMarke
       procStart?: unknown;
       queuedTurnId?: unknown;
       queuedTurns?: unknown;
+      settledAbsorbedTurns?: unknown;
       steerPromotedTurn?: unknown;
+      promotedAbsorbedTurn?: unknown;
+      promotedFromTurnId?: unknown;
+      promotedFromDispatchAttempt?: unknown;
       capability?: unknown;
       antigravityReconcileHint?: unknown;
     };
@@ -156,11 +245,14 @@ function parseIdentityBoundSessionMarker(raw: string): IdentityBoundSessionMarke
       ? parsed.queuedTurns
           .filter((t: any) => typeof t?.turnId === 'string' && t.turnId)
           .map((t: any) => {
+            const turnId = String(t.turnId);
             const attempt = parseDispatchAttempt(t.dispatchAttempt);
             const reconcileHint = parseAntigravityReconcileHint(t.antigravityReconcileHint);
+            const absorbed = parseAbsorbedHostBinding(t, turnId);
             return {
-              turnId: String(t.turnId),
+              turnId,
               ...(t.inputConsumed === true ? { inputConsumed: true as const } : {}),
+              ...(absorbed ?? {}),
               ...(attempt !== undefined ? { dispatchAttempt: attempt } : {}),
               ...(t.linkRefMode === 'observe' || t.linkRefMode === 'enabled'
                 ? { linkRefMode: t.linkRefMode }
@@ -171,10 +263,18 @@ function parseIdentityBoundSessionMarker(raw: string): IdentityBoundSessionMarke
             };
           })
       : undefined;
+    const settledAbsorbedTurns = parseSettledAbsorbedTurns(parsed.settledAbsorbedTurns);
     const queuedTurnId = typeof parsed.queuedTurnId === 'string' && parsed.queuedTurnId
       ? parsed.queuedTurnId
       : (queuedTurns && queuedTurns.length > 0 ? queuedTurns[0].turnId : undefined);
     const reconcileHint = parseAntigravityReconcileHint(parsed.antigravityReconcileHint);
+    const promotedFromTurnId = typeof parsed.promotedFromTurnId === 'string'
+      && isValidMarkerIdentityTurnId(parsed.promotedFromTurnId)
+      ? parsed.promotedFromTurnId
+      : undefined;
+    const promotedFromDispatchAttempt = parseDispatchAttempt(parsed.promotedFromDispatchAttempt);
+    const promotedAbsorbed = parsed.promotedAbsorbedTurn === true && promotedFromTurnId
+      && promotedFromTurnId !== parsed.turnId;
     return {
       sessionId: typeof parsed.sessionId === 'string' ? parsed.sessionId : '',
       ...(typeof parsed.turnId === 'string' && parsed.turnId ? { turnId: parsed.turnId } : {}),
@@ -185,7 +285,13 @@ function parseIdentityBoundSessionMarker(raw: string): IdentityBoundSessionMarke
       ...(typeof parsed.procStart === 'string' ? { procStart: parsed.procStart } : {}),
       ...(queuedTurnId ? { queuedTurnId } : {}),
       ...(queuedTurns && queuedTurns.length > 0 ? { queuedTurns } : {}),
+      ...(settledAbsorbedTurns && settledAbsorbedTurns.length > 0 ? { settledAbsorbedTurns } : {}),
       ...(parsed.steerPromotedTurn === true ? { steerPromotedTurn: true } : {}),
+      ...(promotedAbsorbed ? {
+        promotedAbsorbedTurn: true as const,
+        promotedFromTurnId,
+        ...(promotedFromDispatchAttempt !== undefined ? { promotedFromDispatchAttempt } : {}),
+      } : {}),
       ...(typeof parsed.capability === 'string' ? { capability: parsed.capability } : {}),
       ...(reconcileHint ? { antigravityReconcileHint: reconcileHint } : {}),
     };
@@ -261,6 +367,8 @@ export function findAuthenticatedAncestorSessionContext(
         procStart: marker.procStart,
         ...(marker.queuedTurnId ? { queuedTurnId: marker.queuedTurnId } : {}),
         ...(marker.queuedTurns && marker.queuedTurns.length > 0 ? { queuedTurns: marker.queuedTurns } : {}),
+        ...(marker.settledAbsorbedTurns && marker.settledAbsorbedTurns.length > 0
+          ? { settledAbsorbedTurns: marker.settledAbsorbedTurns } : {}),
         ...(marker.steerPromotedTurn ? { steerPromotedTurn: true } : {}),
         ...(marker.antigravityReconcileHint ? { antigravityReconcileHint: marker.antigravityReconcileHint } : {}),
       };
@@ -343,7 +451,15 @@ export function findAncestorSessionMarkerContext(
           markerPid: pid,
           ...(marker.queuedTurnId ? { queuedTurnId: marker.queuedTurnId } : {}),
           ...(marker.queuedTurns && marker.queuedTurns.length > 0 ? { queuedTurns: marker.queuedTurns } : {}),
+          ...(marker.settledAbsorbedTurns && marker.settledAbsorbedTurns.length > 0
+            ? { settledAbsorbedTurns: marker.settledAbsorbedTurns } : {}),
           ...(marker.steerPromotedTurn ? { steerPromotedTurn: true } : {}),
+          ...(marker.promotedAbsorbedTurn && marker.promotedFromTurnId ? {
+            promotedAbsorbedTurn: true as const,
+            promotedFromTurnId: marker.promotedFromTurnId,
+            ...(marker.promotedFromDispatchAttempt !== undefined
+              ? { promotedFromDispatchAttempt: marker.promotedFromDispatchAttempt } : {}),
+          } : {}),
           ...(marker.antigravityReconcileHint ? { antigravityReconcileHint: marker.antigravityReconcileHint } : {}),
         };
       }
@@ -367,20 +483,109 @@ export function findAncestorSessionContext(
   return ctx;
 }
 
+export interface AdvanceAncestorSessionTurnOptions {
+  /** Expected dispatchAttempt of the consumed host turn (optional; guards cross-attempt mismatch). */
+  consumedDispatchAttempt?: number;
+  /** Caller-provided gate deciding whether a leading queued turn structurally
+   *  proven absorbed into the host turn may be settled with this final instead
+   *  of promoted into a new execution turn. Fail-closed when omitted. */
+  canSettleAbsorbed?: (
+    turn: QueuedTypeAheadTurn,
+    marker: AncestorSessionContext,
+  ) => boolean;
+  /** Runs inside the PID-marker lock before the marker is read. A final sender
+   *  uses this to publish its bridge-send marker and advance the queue as one
+   *  ordered cross-process transition. Called even when the PID file vanished,
+   *  so the delivery marker is not lost with the queue-advance opportunity. */
+  beforeTransition?: () => void;
+}
+
+export interface AdvanceAncestorSessionTurnResult {
+  advanced: boolean;
+  turnId?: string;
+  /** Omitted when empty so existing `{ advanced, turnId }` expectations stay unchanged. */
+  settledAbsorbedTurnIds?: string[];
+}
+
+/** Determine which leading contiguous absorbed turns bound to `consumedTurnId`
+ *  are structurally eligible to settle with this host turn's final. Scans only
+ *  within the contiguous block absorbed into `consumedTurnId` (stopping at the
+ *  first non-absorbed or other-host turn), preserving original FIFO order for
+ *  any turn not settled. */
+export function selectAbsorbedTurnsToSettle(
+  marker: AncestorSessionContext,
+  consumedTurnId: string | undefined,
+  canSettleAbsorbed: ((turn: QueuedTypeAheadTurn, marker: AncestorSessionContext) => boolean) | undefined,
+): { settled: SettledAbsorbedTurn[]; remaining: QueuedTypeAheadTurn[] } {
+  const queuedTurns = marker.queuedTurns ? [...marker.queuedTurns] : [];
+  if (queuedTurns.length === 0 && marker.queuedTurnId) {
+    queuedTurns.push({ turnId: marker.queuedTurnId });
+  }
+  if (!canSettleAbsorbed
+    || !consumedTurnId
+    || marker.turnId !== consumedTurnId
+    || marker.dispatchAttempt !== undefined
+    || marker.trustedCaller?.taskContinuation !== undefined) {
+    return { settled: [], remaining: queuedTurns };
+  }
+  const settled: SettledAbsorbedTurn[] = [];
+  const remaining: QueuedTypeAheadTurn[] = [];
+  let inAbsorbedBlock = true;
+  for (const item of queuedTurns) {
+    if (!inAbsorbedBlock) {
+      remaining.push(item);
+      continue;
+    }
+    const absorbedIntoThisHost = item.inputConsumed === true
+      && isValidMarkerIdentityTurnId(item.turnId)
+      && item.absorbedIntoTurnId === consumedTurnId
+      && item.absorbedIntoDispatchAttempt === marker.dispatchAttempt;
+    if (!absorbedIntoThisHost) {
+      inAbsorbedBlock = false;
+      remaining.push(item);
+      continue;
+    }
+    const structurallyEligible = item.dispatchAttempt === undefined
+      && !item.turnId.startsWith('schedule:')
+      && !item.turnId.startsWith('wf:')
+      && item.trustedCaller?.source !== 'schedule_creator'
+      && item.trustedCaller?.taskContinuation === undefined
+      && canSettleAbsorbed(item, marker);
+    if (structurallyEligible) {
+      settled.push({
+        turnId: item.turnId,
+        hostTurnId: consumedTurnId,
+      });
+    } else {
+      remaining.push(item);
+    }
+  }
+  return { settled, remaining };
+}
+
 /**
  * Atomically advances the ancestor process-tree marker to the next queued type-ahead turn.
  * Used when a turn's final response has been successfully delivered so subsequent subcommands
  * inside the same long-lived CLI process will immediately observe the successor turn.
+ *
+ * When `opts.canSettleAbsorbed` is provided, leading queued turns structurally proven to have
+ * been absorbed mid-turn into the just-completed host turn (Claude `attachment(queued_command)`)
+ * are settled with that final rather than promoted into a new execution turn.
  */
 export function advanceAncestorSessionTurn(
   dataDir: string,
   markerPid: number,
   consumedTurnId?: string,
-): { advanced: boolean; turnId?: string } {
+  opts?: AdvanceAncestorSessionTurnOptions,
+): AdvanceAncestorSessionTurnResult {
   const markersDir = join(dataDir, '.botmux-cli-pids');
   const markerPath = join(markersDir, String(markerPid));
-  if (!existsSync(markerPath)) return { advanced: false };
+  // Without a marker callback the old early return avoids touching the lock.
+  // A final-delivery callback must still run when the PID file disappeared.
+  if (!existsSync(markerPath) && !opts?.beforeTransition) return { advanced: false };
   return withFileLockSync(markerPath, () => {
+    opts?.beforeTransition?.();
+    if (!existsSync(markerPath)) return { advanced: false };
     try {
       const raw = readFileSync(markerPath, 'utf-8');
       const marker = parseIdentityBoundSessionMarker(raw);
@@ -388,19 +593,65 @@ export function advanceAncestorSessionTurn(
       if (consumedTurnId && marker.turnId && marker.turnId !== consumedTurnId) {
         return { advanced: false, turnId: marker.turnId };
       }
-      const queuedTurns = marker.queuedTurns ? [...marker.queuedTurns] : [];
-      if (queuedTurns.length === 0 && marker.queuedTurnId) {
-        queuedTurns.push({ turnId: marker.queuedTurnId });
-      }
-      if (queuedTurns.length === 0) {
+      if (opts?.consumedDispatchAttempt !== undefined
+        && marker.dispatchAttempt !== opts.consumedDispatchAttempt) {
         return { advanced: false, turnId: marker.turnId };
+      }
+      let rawObj: Record<string, unknown> | undefined;
+      if (raw.trim().startsWith('{')) {
+        try { rawObj = JSON.parse(raw) as Record<string, unknown>; } catch { /* handled by parseIdentityBoundSessionMarker */ }
+      }
+      const rootAttemptCorrupted = !!rawObj
+        && 'dispatchAttempt' in rawObj
+        && rawObj.dispatchAttempt !== undefined
+        && rawObj.dispatchAttempt !== null
+        && parseDispatchAttempt(rawObj.dispatchAttempt) === undefined;
+      // A malformed root tuple cannot authorize either half of the transition:
+      // settling would consume follow-ups for an unknown host, while promoting
+      // would fabricate a successor from that same corrupt host identity.
+      if (rootAttemptCorrupted) return { advanced: false, turnId: marker.turnId };
+      const initialQueuedCount = marker.queuedTurns?.length ?? (marker.queuedTurnId ? 1 : 0);
+      if (initialQueuedCount === 0) {
+        return { advanced: false, turnId: marker.turnId };
+      }
+      const { settled, remaining: queuedTurns } = selectAbsorbedTurnsToSettle(
+        marker,
+        consumedTurnId,
+        opts?.canSettleAbsorbed,
+      );
+      const mergedSettled = mergeSettledAbsorbedTurns(marker.settledAbsorbedTurns, settled);
+      if (queuedTurns.length === 0) {
+        if (settled.length === 0) return { advanced: false, turnId: marker.turnId };
+        // Preserve every host-turn field on disk verbatim (capability,
+        // identityTurnId, callerOpenId, backgroundHeld, etc.) when staying on
+        // the host turn.
+        const preservedHost = rawObj ? { ...rawObj } : (JSON.parse(raw) as Record<string, unknown>);
+        delete preservedHost.queuedTurnId;
+        delete preservedHost.queuedTurns;
+        if (mergedSettled && mergedSettled.length > 0) {
+          preservedHost.settledAbsorbedTurns = mergedSettled;
+        }
+        atomicWriteFileSync(markerPath, JSON.stringify(preservedHost), { mode: 0o600, followTargetSymlink: false });
+        return {
+          advanced: false,
+          turnId: marker.turnId,
+          settledAbsorbedTurnIds: settled.map(s => s.turnId),
+        };
       }
       const nextTurn = queuedTurns.shift()!;
       const nextQueuedTurnId = queuedTurns[0]?.turnId;
+      const promotedAbsorbed = nextTurn.inputConsumed === true
+        && nextTurn.absorbedIntoTurnId === marker.turnId
+        && nextTurn.absorbedIntoDispatchAttempt === marker.dispatchAttempt;
       const updatedPayload: Record<string, unknown> = {
         sessionId: marker.sessionId,
         turnId: nextTurn.turnId,
         steerPromotedTurn: true,
+        ...(promotedAbsorbed ? {
+          promotedAbsorbedTurn: true,
+          promotedFromTurnId: marker.turnId,
+          ...(marker.dispatchAttempt !== undefined ? { promotedFromDispatchAttempt: marker.dispatchAttempt } : {}),
+        } : {}),
         ...(nextTurn.dispatchAttempt !== undefined ? { dispatchAttempt: nextTurn.dispatchAttempt } : {}),
         ...(nextTurn.linkRefMode ? { linkRefMode: nextTurn.linkRefMode } : {}),
         ...(nextTurn.trustedCaller ? { trustedCaller: nextTurn.trustedCaller } : {}),
@@ -409,9 +660,14 @@ export function advanceAncestorSessionTurn(
         ...(marker.procStart ? { procStart: marker.procStart } : {}),
         ...(nextQueuedTurnId ? { queuedTurnId: nextQueuedTurnId } : {}),
         ...(queuedTurns.length > 0 ? { queuedTurns } : {}),
+        ...(mergedSettled && mergedSettled.length > 0 ? { settledAbsorbedTurns: mergedSettled } : {}),
       };
-      atomicWriteFileSync(markerPath, JSON.stringify(updatedPayload));
-      return { advanced: true, turnId: nextTurn.turnId };
+      atomicWriteFileSync(markerPath, JSON.stringify(updatedPayload), { mode: 0o600, followTargetSymlink: false });
+      return {
+        advanced: true,
+        turnId: nextTurn.turnId,
+        ...(settled.length > 0 ? { settledAbsorbedTurnIds: settled.map(s => s.turnId) } : {}),
+      };
     } catch {
       return { advanced: false };
     }

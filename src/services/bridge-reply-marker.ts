@@ -1,5 +1,6 @@
-import { appendFileSync, existsSync, mkdirSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { withFileLockSync } from '../utils/file-lock.js';
 import {
   buildBridgeSendMarkerContent,
   type BridgeSendMarker,
@@ -29,6 +30,44 @@ export interface RecordBridgeReplyMarkerInput {
   followThreadEpoch?: BridgeSendMarker['followThreadEpoch'];
 }
 
+export type BridgeReplyMarkerSnapshot = Omit<BridgeSendMarker,
+  'sessionId' | 'sentAtMs' | 'messageId' | 'turnId'>;
+
+export type RecordBridgeReplyMarkerSnapshotInput = BridgeReplyMarkerSnapshot & {
+  dataDir: string;
+  sessionId: string;
+  sentAtMs: number;
+  messageId?: string;
+  turnId?: string;
+};
+
+function persistBridgeReplyMarker(
+  dataDir: string,
+  sessionId: string,
+  marker: BridgeSendMarker,
+): BridgeSendMarker {
+  const markerDir = join(dataDir, 'turn-sends');
+  if (!existsSync(markerDir)) mkdirSync(markerDir, { recursive: true });
+  appendFileSync(join(markerDir, `${sessionId}.jsonl`), `${JSON.stringify(marker)}\n`);
+  recordCrossChatFollowThreadBinding(dataDir, sessionId, marker);
+  return marker;
+}
+
+/** Restore the exact persisted content fingerprint/preview and delivery metadata
+ * without retaining the full response body in the catch-up ledger. */
+export function recordBridgeReplyMarkerSnapshot(
+  input: RecordBridgeReplyMarkerSnapshotInput,
+): BridgeSendMarker {
+  const { dataDir, sessionId, sentAtMs, messageId, turnId, ...snapshot } = input;
+  return persistBridgeReplyMarker(dataDir, sessionId, {
+    ...snapshot,
+    sessionId,
+    sentAtMs,
+    ...(messageId ? { messageId } : {}),
+    ...(turnId ? { turnId } : {}),
+  });
+}
+
 /**
  * Append one successful, user-visible CLI delivery to the owning worker's
  * bridge journal. Callers deliberately invoke this only after the provider or
@@ -56,9 +95,40 @@ export function recordBridgeReplyMarker(input: RecordBridgeReplyMarkerInput): Br
     ...(input.followThreadEpoch ? { followThreadEpoch: input.followThreadEpoch } : {}),
     ...buildBridgeSendMarkerContent(input.content),
   };
-  const markerDir = join(input.dataDir, 'turn-sends');
-  if (!existsSync(markerDir)) mkdirSync(markerDir, { recursive: true });
-  appendFileSync(join(markerDir, `${input.sessionId}.jsonl`), `${JSON.stringify(marker)}\n`);
-  recordCrossChatFollowThreadBinding(input.dataDir, input.sessionId, marker);
-  return marker;
+  return persistBridgeReplyMarker(input.dataDir, input.sessionId, marker);
+}
+
+/** Serialize a marker existence check with its subsequent append, including
+ *  replay paths where PID advancement is forbidden or the PID lock failed. */
+export function withBridgeReplyMarkerLock<T>(dataDir: string, sessionId: string, fn: () => T): T {
+  const directory = join(dataDir, 'turn-sends');
+  if (!existsSync(directory)) mkdirSync(directory, { recursive: true });
+  return withFileLockSync(join(directory, `${sessionId}.jsonl`), fn);
+}
+
+/** Exact delivery identity used by replay/recovery before appending a marker.
+ * The caller normally holds the PID-marker lock, so the check and subsequent
+ * append serialize with other senders of the same turn. */
+export function hasBridgeReplyMarker(input: {
+  dataDir: string;
+  sessionId: string;
+  turnId: string | undefined;
+  messageId: string | undefined;
+  responseKind?: BridgeSendMarker['responseKind'];
+}): boolean {
+  if (!input.turnId || !input.messageId) return false;
+  const path = join(input.dataDir, 'turn-sends', `${input.sessionId}.jsonl`);
+  if (!existsSync(path)) return false;
+  try {
+    for (const line of readFileSync(path, 'utf-8').split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        const marker = JSON.parse(line) as BridgeSendMarker;
+        if (typeof marker.sentAtMs !== 'number') continue;
+        if (marker.turnId === input.turnId && marker.messageId === input.messageId
+          && (input.responseKind === undefined || marker.responseKind === input.responseKind)) return true;
+      } catch { /* skip malformed lines, matching the worker reader */ }
+    }
+  } catch { /* an unreadable journal cannot prove prior publication */ }
+  return false;
 }

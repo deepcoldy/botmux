@@ -195,6 +195,7 @@ export const messages: Record<string, string> = {
   // {reason} ends the line; the no-reason variant adds nothing.
   'card.model_fallback.reason': ' ({reason})',
   'card.model_fallback.no_reason': '',
+  'worker.final_transition_retrying': '⏳ Turn handoff is still unresolved. Retrying; pending inputs are retained. Do not resend them.',
   'worker.rate_limit_notify.rate': '⚠️ {cliName} hit a rate limit — this turn is paused. Resend the last task after {retryLabel}, or send a new message to continue.',
   'worker.rate_limit_notify.usage': '⚠️ {cliName} hit its usage limit — this turn is paused. Once the quota resets ({retryLabel}), resend the last task or send a new message to continue.',
   'worker.agy_rotate.switching': '🔄 Antigravity account {fromAccount} hit its quota limit. Rotated to {toAccount}; restarting the session and retrying this turn…',
@@ -1557,14 +1558,14 @@ export const messages: Record<string, string> = {
   // built-in `botmux-send` skill; see shared-hints.ts).
   'ai.routing.intro_transcript': 'You are in a Lark (Feishu) conversation. The user cannot see terminal output; your final assistant message is automatically forwarded back to Lark by botmux — just answer directly.',
   'ai.send.after_success_hint': 'The final answer was sent successfully. If the task is complete or its concrete blocker has been delivered, end with BOTMUX_NOTHING_TO_SEND without resending. Use botmux send --response-kind auxiliary for later supplements.',
-  'ai.send.after_success_steer_advanced': 'This send is complete. The session has automatically advanced to the next queued turn; send the full answer for the new message with `botmux send --response-kind final` (or output BOTMUX_NOTHING_TO_SEND if no response is needed).',
+  'ai.send.after_success_steer_advanced': 'This send is complete. The session has automatically advanced to the next queued turn; if the queued message still needs an answer at its destination, send the full answer with `botmux send --response-kind final`; if the reply you just sent to the same destination already covers it completely, output BOTMUX_NOTHING_TO_SEND without resending.',
   'ai.send.after_success_progress': 'Progress was sent (not marked final). If this message already contains the complete answer to the request, end with just BOTMUX_NOTHING_TO_SEND; do not send a summary or repeat it. If it was only an acknowledgement or interim progress, or the task is unfinished, continue the original task and deliver the result or a concrete blocker with botmux send --response-kind final.',
   'ai.send.after_success_auxiliary': 'The supplement was sent. Check whether the original final answer was delivered successfully; a supplement alone does not prove completion. Do not resend content already delivered.',
   'ai.send.after_success_unified': 'Progress was posted to this turn’s card. When done, send the full answer with `botmux send --response-kind final`.',
   // replyDelivery=transcript (auto-forward final reply): only emit a factual
   // state-change notice when a queued turn was promoted; normal sends print
   // only the bare delivery receipt with no extra persuasion.
-  'ai.send.after_success_steer_advanced_transcript': 'This send is complete. The session has automatically advanced to the next queued turn; continue with the new message (or output BOTMUX_NOTHING_TO_SEND if no response is needed).',
+  'ai.send.after_success_steer_advanced_transcript': 'This send is complete. The session has automatically advanced to the next queued turn; continue if the queued message still needs handling, or output only BOTMUX_NOTHING_TO_SEND if already covered.',
   'ai.routing.xpi_as_hint': 'XPI is enabled: every plain-text message directed to another bot must declare its handling up front. Start a separate task with `botmux send --as independent`; leave it for the current task with `--as suggestion`.',
   'ai.shell.xpi_as_hint': 'XPI is enabled: every plain-text message to another bot must include a handling choice. Start separately: `botmux send --as independent`. Leave it for the current task: `botmux send --as suggestion`.',
   'xpi.choice.independent': 'Start a new task',

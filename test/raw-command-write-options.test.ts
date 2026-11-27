@@ -3,14 +3,30 @@ import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
 import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';
 import { createMinimaxAdapter } from '../src/adapters/cli/minimax.js';
+import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 import { rawCommandWriteOptionsFor } from '../src/core/raw-command-write-options.js';
 
 describe('raw command write options', () => {
-  it('maps OpenCode raw command capability to paste-line delivery', () => {
+  it.each([
+    { name: 'a single-line title', command: '/rename 项目 A', framed: true },
+    { name: 'another command', command: '/help 项目 A', framed: false },
+    { name: 'an empty title', command: '/rename ', framed: false },
+    { name: 'a multiline title', command: '/rename first\nsecond', framed: false },
+    { name: 'an escape character', command: '/rename first\x1bsecond', framed: false },
+    { name: 'a C1 control character', command: '/rename first\u0085second', framed: false },
+  ])('selects the TraeX input mode for $name', ({ command, framed }) => {
+    const adapter = createTraexAdapter('/bin/traex');
+    const options = rawCommandWriteOptionsFor(adapter, 'traex', command);
+
+    expect(Boolean(options.bracketedPaste)).toBe(framed);
+  });
+
+  it.each([undefined, '/rename 项目 A'])('uses OpenCode paste-line delivery for %s', command => {
     const adapter = createOpenCodeAdapter('/bin/opencode');
 
-    const options = rawCommandWriteOptionsFor(adapter, 'opencode');
+    const options = rawCommandWriteOptionsFor(adapter, 'opencode', command);
 
+    expect(options.bracketedPaste).toBeFalsy();
     expect(options.pasteLine).toBe(true);
     expect(options.pasteSettleMs).toEqual(expect.any(Number));
     expect(Number.isFinite(options.pasteSettleMs)).toBe(true);
