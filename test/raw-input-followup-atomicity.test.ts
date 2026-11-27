@@ -394,7 +394,7 @@ describe('worker input fences', () => {
     expect(topLevelBody('function recoverBareShellLaunchFromPty('))
       .toMatch(/backend !== observedBackend[\s\S]*isBareShellComm\([\s\S]*bareShellLaunchBlocked = false/);
 
-    const markReady = topLevelBody('function markPromptReady(): void');
+    const markReady = topLevelBody('function markPromptReady(');
     const hold = markReady.search(/if \(bareShellLaunchBlocked\)/);
     expect(hold).toBeGreaterThanOrEqual(0);
     expect(markReady.indexOf('isPromptReady = true')).toBeGreaterThan(hold);

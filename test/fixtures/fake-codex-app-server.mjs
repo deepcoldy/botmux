@@ -20,6 +20,9 @@ if (args[0] !== 'app-server') {
 const logPath = process.env.FAKE_CODEX_LOG;
 const pidPath = process.env.FAKE_CODEX_PID_PATH;
 const behavior = process.env.FAKE_CODEX_BEHAVIOR ?? 'success';
+const persistedNamePath = process.env.FAKE_CODEX_PERSISTED_NAME_PATH;
+const firstNameWriteFault = process.env.FAKE_CODEX_FIRST_NAME_WRITE_FAULT;
+const startReleasePath = process.env.FAKE_CODEX_START_RELEASE;
 const previewDelayReads = Number(process.env.FAKE_CODEX_PREVIEW_DELAY_READS ?? '0');
 const threadNotLoadedReads = Number(process.env.FAKE_CODEX_THREAD_NOT_LOADED_READS ?? '0');
 const updatedDelayReads = Number(process.env.FAKE_CODEX_UPDATED_DELAY_READS ?? '0');
@@ -71,7 +74,8 @@ let inputBuffer = '';
 let turnAttempt = 0;
 let threadReadAttempt = 0;
 let nameSetSeen = false;
-let currentThreadName;
+let nameWriteAttempt = 0;
+let currentThreadName = process.env.FAKE_CODEX_INITIAL_TITLE;
 let goalTurn = null;
 let reconciledTurn = null;
 let activeTurn;
@@ -619,8 +623,19 @@ function handle(request) {
   }
   if (request.method === 'thread/name/set') {
     if (behavior === 'hang-name') return;
+    const fault = ++nameWriteAttempt === 1 ? firstNameWriteFault : undefined;
+    if (fault === 'reject') {
+      reject(request.id, -32000, 'temporary write failure');
+      return;
+    }
+    if (fault === 'false-ack') {
+      respond(request.id, {});
+      return;
+    }
     currentThreadName = request.params.name;
     nameSetSeen = true;
+    if (persistedNamePath) writeFileSync(persistedNamePath, currentThreadName);
+    if (fault === 'lose-ack') return;
     if (nameSetDelayMs > 0) setTimeout(() => respond(request.id, {}), nameSetDelayMs);
     else respond(request.id, {});
     return;
@@ -1048,7 +1063,16 @@ function handle(request) {
     });
     // Small delay before the response so the runner observes turn/started (and
     // can steer) strictly before the start response returns.
-    setTimeout(() => respond(request.id, { turn: { id: turnId } }), 120);
+    if (startReleasePath) {
+      const release = setInterval(() => {
+        if (!existsSync(startReleasePath)) return;
+        clearInterval(release);
+        respond(request.id, { turn: { id: turnId } });
+      }, 10);
+      release.unref();
+    } else {
+      setTimeout(() => respond(request.id, { turn: { id: turnId } }), 120);
+    }
     return;
   }
   if (behavior === 'completion-before-response-mismatch') {

@@ -6,25 +6,20 @@ import {
   normalizeOwnerReminderQuietHours,
   type SessionOwnerReminderQuietHours,
 } from './session-owner-reminder-quiet-hours.js';
+import {
+  SESSION_OWNER_REMINDER_STATES,
+  type SessionOwnerReminderConfig,
+  type SessionOwnerReminderState,
+} from './session-owner-reminder-config.js';
 
-export const SESSION_OWNER_REMINDER_STATES = [
-  'idle',
-  'dormant',
-  'pending_repo',
-  'tui_prompt',
-  'agent_attention',
-  'limited',
-] as const;
-
-export type SessionOwnerReminderState = typeof SESSION_OWNER_REMINDER_STATES[number];
-
-export interface SessionOwnerReminderConfig {
-  enabled: boolean;
-  intervalMinutes: number;
-  text: string;
-  states: SessionOwnerReminderState[];
-  quietHours?: SessionOwnerReminderQuietHours;
-}
+export {
+  DEFAULT_SESSION_OWNER_REMINDER,
+  SESSION_OWNER_REMINDER_STATES,
+} from './session-owner-reminder-config.js';
+export type {
+  SessionOwnerReminderConfig,
+  SessionOwnerReminderState,
+} from './session-owner-reminder-config.js';
 
 export interface SessionOwnerReminderRecord {
   sessionId: string;
@@ -36,14 +31,6 @@ export interface SessionOwnerReminderRecord {
 }
 
 export type SessionOwnerReminderRecords = Record<string, SessionOwnerReminderRecord>;
-
-export const DEFAULT_SESSION_OWNER_REMINDER: SessionOwnerReminderConfig = {
-  enabled: false,
-  intervalMinutes: 30,
-  text: '该会话已等待处理，请继续跟进。',
-  states: [...SESSION_OWNER_REMINDER_STATES],
-  quietHours: { ...DEFAULT_OWNER_REMINDER_QUIET_HOURS },
-};
 
 const MIN_INTERVAL_MINUTES = 1;
 const MAX_INTERVAL_MINUTES = 10_080;

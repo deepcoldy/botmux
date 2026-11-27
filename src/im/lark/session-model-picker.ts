@@ -105,9 +105,11 @@ export { DEFAULT_MODEL_VALUE_PATTERN, MODEL_SLUG_PATTERN };
 async function detectPickerModels(key: string, botConfig: BotConfig | undefined): Promise<readonly string[] | null> {
   try {
     const probe = modelCatalogProbeContext(key, botConfig, process.env);
+    if (!probe.canProbe) return null;
     return await detectModels(key, {
       runtimeContext: probe.runtimeContext,
       probeEnv: probe.probeEnv,
+      probeSettingsEnv: probe.probeSettingsEnv,
       runtimeExecutable: probe.runtimeExecutable,
       adapterFactory: requestedCliId => createCliAdapterSync(
         requestedCliId,

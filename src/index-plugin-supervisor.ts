@@ -155,8 +155,9 @@ async function main(): Promise<void> {
         await delay(250);
       }
     } finally {
-      process.removeListener('SIGTERM', requestShutdown);
-      process.removeListener('SIGINT', requestShutdown);
+      // Keep both handlers installed through stopAll, owner-lock release and
+      // process exit. A repeated signal must stay a no-op instead of reverting
+      // to the default action and abandoning durable cleanup halfway through.
       await supervisor.stopAll();
     }
   }, { maxWaitMs: 1_000 });

@@ -720,22 +720,29 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
   // Only a newly launched --conversation process can inherit unfinished work
   // from a dead predecessor. A reattached process can still be doing that work.
   let coldResumeTail: { conversationId: string; step: string } | undefined;
-  const activeSessionId = (pty: Pick<PtyHandle, 'cliPid' | 'cliCwd'>): string | undefined => {
+  const activeSessionIdObservation = (pty: Pick<PtyHandle, 'cliPid' | 'cliCwd'>): {
+    sessionId: string;
+    source: 'native-log' | 'process-discovery';
+  } | undefined => {
     const fromLog = sessionLog?.read().currentId;
-    if (fromLog) return fromLog;
-    // On a fresh launch (`!resume && !reattach`), agy creates no conversation
-    // until the first prompt is submitted, while startup `ListConversations`
-    // opens historical/sibling conversation `.db` files in parallel. Once agy
-    // is actively writing `--log-file`, wait for its authoritative
-    // `Streaming conversation <uuid>` line instead of probing transient startup fds.
-    if (awaitNativeStreamLog && sessionLog?.hasLogFile()) return undefined;
+    if (fromLog) return { sessionId: fromLog.toLowerCase(), source: 'native-log' };
+    // On a fresh launch (`!reattach && !(resume && resumeSessionId)`), buildArgs
+    // always wires a process-scoped `--log-file` and agy creates no conversation
+    // until the first prompt is submitted, while startup `ListConversations` can
+    // open historical/sibling conversation `.db` files before `--log-file` is
+    // created or flushed. Never probe transient startup fds — wait for this
+    // process's own `--log-file` to emit `Streaming conversation <uuid>`.
+    if (awaitNativeStreamLog && sessionLog) return undefined;
     // Managed sessions (`buildArgs` wired `--log-file`) must never fall back to
     // workspace summaries when `cliPid` is unset — that hijacks a concurrent or
     // historical conversation sharing the same working directory.
     const cwd = sessionLog ? undefined : pty.cliCwd;
     if (!pty.cliPid && !cwd) return undefined;
-    return findAntigravityConversationId({ pid: pty.cliPid, cwd }) ?? undefined;
+    const discovered = findAntigravityConversationId({ pid: pty.cliPid, cwd }) ?? undefined;
+    return discovered ? { sessionId: discovered.toLowerCase(), source: 'process-discovery' } : undefined;
   };
+  const activeSessionId = (pty: Pick<PtyHandle, 'cliPid' | 'cliCwd'>): string | undefined =>
+    activeSessionIdObservation(pty)?.sessionId;
   const recordConfirmedSubmit = (
     pty: Pick<PtyHandle, 'cliPid' | 'cliCwd'>,
     preSize: number | null,
@@ -771,9 +778,9 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
 
     buildArgs({ sessionId, resume, resumeSessionId, disableCliBypass, model, reasoningEffort, cliVersion, reattach }) {
       bracketedPasteSupported = reattach === false && supportsAntigravityBracketedPaste(cliVersion);
-      awaitNativeStreamLog = !resume && !reattach;
+      awaitNativeStreamLog = !reattach && !(resume && resumeSessionId);
       const args = disableCliBypass ? [] : ['--dangerously-skip-permissions'];
-      sessionLog = new AntigravitySessionLog(sessionId);
+      sessionLog = new AntigravitySessionLog(sessionId, undefined, { startAtEnd: !reattach });
       args.push('--log-file', sessionLog.path);
       // Resume: only when we have agy's own conversation UUID. We never
       // map botmux's sessionId here because agy generates its own id at
@@ -826,6 +833,7 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
     },
 
     resolveActiveSessionId: activeSessionId,
+    resolveActiveSessionIdObservation: activeSessionIdObservation,
 
     forkSessionAfterReady(opts) {
       if (!sessionLog) throw new Error('Antigravity fork has no process-scoped native log');
@@ -885,9 +893,9 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       const preSize = initialTranscriptPath ? currentFileSize(initialTranscriptPath) : null;
       // No transcript exists yet for the conversation this input lands in: a
       // known id whose brain file agy creates lazily (e.g. right after /new),
-      // or a fresh launch whose native log has not streamed any conversation
-      // (activeSessionId withholds an id only in that state). Any USER_INPUT
-      // that later appears there is this submit's.
+      // or a fresh launch whose native log is already being written with no
+      // streamed conversation yet. Any USER_INPUT that later appears there is
+      // this submit's.
       const transcriptCreatedAfterSubmit = !initialTranscriptPath
         && (!!initialCid || (awaitNativeStreamLog && !!sessionLog?.hasLogFile()));
 

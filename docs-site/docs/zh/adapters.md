@@ -141,6 +141,36 @@ macOS 上用 Codex / Codex App 时，如果 PATH 里找不到 `codex`，botmux �
 
 > 排查 wrapper 问题：`botmux logs` 里找 `Spawning fresh CLI:` 那一行，把完整命令复制出来在终端手动跑一遍，基本能定位是权限、参数还是登录态的问题。
 
+### Cursor Agent Local 接入自定义模型 API
+
+如果你能获取 Cursor Agent Local，保留 `cliId: "cursor"`，把 `cliPathOverride` 指向可执行启动脚本。下面以本地 OpenAI 兼容网关为例，已用 `cursor-agent-local` 版本 `2026.11.22-e9042b2` 验证。此配置需要单独的 Agent Local 可执行文件。
+
+```sh
+#!/bin/sh
+set -eu
+export CURSOR_LOCAL_AGENT_BASE_URL="http://127.0.0.1:8080/v1"
+: "${CURSOR_LOCAL_AGENT_API_KEY:?请通过启动环境注入限权的本地网关令牌}"
+export CURSOR_LOCAL_AGENT_API_KEY
+export CURSOR_CONFIG_DIR="$HOME/.cursor"
+export CURSOR_DATA_DIR="$HOME/.cursor"
+exec /path/to/cursor-agent-local --authless --disable-auto-update "$@"
+```
+
+将上游模型密钥保存在网关内。通过服务的密钥配置给启动脚本传入限权的本地网关令牌。如果机器人使用[严格环境变量模式](/zh/bots-json#strict-env)过滤该环境，在允许列表加入 `CURSOR_LOCAL_AGENT_API_KEY`。网关需提供 `GET /models` 和流式 `POST /chat/completions`。使用工作区工具时，网关还需支持流式工具调用。
+
+```json
+{
+  "cliId": "cursor",
+  "cliPathOverride": "/path/to/cursor-local-launcher",
+  "model": "gateway-model",
+  "customModels": ["gateway-model"]
+}
+```
+
+`model` 填写网关公布的模型 ID。`customModels` 可以把网关模型加入飞书选择器。网关负责校验允许使用的模型。
+
+Botmux 从守护进程用户的 `~/.cursor` 读取会话记录。启动脚本使用同一服务账号，并将数据目录设到这里。如果 Linux 进程保护导致 Botmux 无法发现会话记录，已验证的版本支持在启动脚本中设置 `CURSOR_AGENT_ALLOW_PROCESS_INSPECTION=1`。这会允许同一用户下的进程检查，仅在需要时启用，并使用专用服务账号。
+
 ## Codex 兼容发行版
 
 如果你用的是**严格兼容 Codex** 的独立发行版，用 `cliId: "codex"` + `cliRuntime`：`cliId` 选 Codex 协议适配器，`cliRuntime` 指定真正运行、独立发版的二进制。这样它能复用模型参数、恢复会话、空闲检测和 Codex RPC，又不会被当成官方 Codex 去检查版本。

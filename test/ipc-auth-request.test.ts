@@ -1225,9 +1225,9 @@ describe('provider authorization asked for by the bytedcli wrapper', () => {
         currentPolicy: () => botRegistry.getBot('cli_test').config.triggerUserAuth,
         executionStillCurrent: () => true, waitMs: 10_000,
       };
-      const unforced = turnCliIdentity.refreshExpiredPlatformBytedcliDefault(args);
+      const unforced = turnCliIdentity.refreshExpiredPlatformBytedcli(args);
       await vi.waitFor(() => expect(requestGrant).toHaveBeenCalledTimes(1));
-      const forced = turnCliIdentity.refreshExpiredPlatformBytedcliDefault({ ...args, force: true });
+      const forced = turnCliIdentity.refreshExpiredPlatformBytedcli({ ...args, force: true });
       const fresh = cloudJwt(Date.now() + 3_600_000);
       requestGrant.mockResolvedValueOnce(byteCloudGrant(fresh));
       refuse({ ok: false, reason: 'not_authorized', error: 'stale refusal' });
@@ -1247,9 +1247,9 @@ describe('provider authorization asked for by the bytedcli wrapper', () => {
         currentPolicy: () => botRegistry.getBot('cli_test').config.triggerUserAuth,
         executionStillCurrent: () => true, waitMs: 10_000, force: true,
       };
-      const first = turnCliIdentity.refreshExpiredPlatformBytedcliDefault(args);
+      const first = turnCliIdentity.refreshExpiredPlatformBytedcli(args);
       await vi.waitFor(() => expect(requestGrant).toHaveBeenCalledTimes(1));
-      const second = turnCliIdentity.refreshExpiredPlatformBytedcliDefault(args);
+      const second = turnCliIdentity.refreshExpiredPlatformBytedcli(args);
       refuse({ ok: false, reason: 'not_authorized', error: 'still unauthorized' });
 
       expect(await first).toBe('not_authorized');
