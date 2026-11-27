@@ -32,6 +32,7 @@ import {
   normalizeReplyCardMode, replyCardIsTerminal, supportsUnifiedReplyCardCli, TurnReplyCardStore,
   type TurnReplyCardMode, type TurnReplyCardEvent, type TurnReplyCardKey,
 } from '../services/turn-reply-card.js';
+import type { OutputSink } from '../services/output-delivery-journal.js';
 import { isSubstituteTurn } from './reply-target.js';
 import { isSilentScheduledTurn } from './silent-schedule-turns.js';
 import { privateReplyEnabled } from './private-reply.js';
@@ -446,12 +447,45 @@ export async function flushTurnReplyTools(ds: DaemonSession, turnId: string, dis
   }
 }
 
+/** Fail-closed presentation for an empty completed turn. Both terminal paths
+ *  (the live worker handler and replayed-history settlement) must apply the
+ *  same rule: when the IM sink required an answer and the send ledger has no
+ *  final, `nothing_to_send` / `empty_answer` settles the card as failed rather
+ *  than styling a missing required reply as deliberate silence. */
+export function cardTerminalForRequiredReply<
+  M extends {
+    status: 'completed' | 'failed' | 'cancelled' | 'ambiguous';
+    outputDisposition?: 'nothing_to_send' | 'empty_answer' | 'boundary_unobserved' | 'explicit_final_delivered';
+  },
+>(msg: M, answerRequired: boolean, answered: boolean): M {
+  if (answerRequired && !answered && msg.status === 'completed'
+    && (msg.outputDisposition === 'nothing_to_send' || msg.outputDisposition === 'empty_answer')) {
+    return { ...msg, status: 'failed' };
+  }
+  return msg;
+}
+
+/** Decision for a terminal replayed from history after a restart. The durable
+ *  delivery journal is the only source of the original answer requirement on
+ *  that path, and the send ledger proves whether the final was delivered. A
+ *  missing or non-IM sink means no required reply is provable, so the terminal
+ *  keeps its original status. */
+export function cardTerminalForHistoricalReply<
+  M extends {
+    status: 'completed' | 'failed' | 'cancelled' | 'ambiguous';
+    outputDisposition?: 'nothing_to_send' | 'empty_answer' | 'boundary_unobserved' | 'explicit_final_delivered';
+  },
+>(msg: M, sink: OutputSink | undefined, finalMessageId: string | undefined): M {
+  const answerRequired = sink?.kind === 'im' && sink.answerRequired === true;
+  return cardTerminalForRequiredReply(msg, answerRequired, !answerRequired || !!finalMessageId);
+}
+
 /** An admitted terminal updates its exact turn's reply card without changing
  * runtime state. Callers settle the turn's CoT stream synchronously themselves:
  * it must not wait on this card's network PATCH. */
 export async function settleTurnReplyCardTerminal(
   ds: DaemonSession, msg: { turnId: string; dispatchAttempt?: number; status: 'completed' | 'failed' | 'cancelled' | 'ambiguous'; durationMs?: number; completedAtMs?: number;
-    outputDisposition?: string },
+    outputDisposition?: 'nothing_to_send' | 'empty_answer' | 'boundary_unobserved' | 'explicit_final_delivered' },
   send: ReplyCardSender, owns: () => boolean,
 ): Promise<void> {
   if (!owns() || replyCardModeFor(ds, msg.turnId) === 'legacy') return;

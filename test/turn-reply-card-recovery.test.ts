@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { stat } from 'node:fs/promises';
 import { config } from '../src/config.js';
 import { getBot } from '../src/bot-registry.js';
-import { sweepInterruptedReplyCards, settleTurnReplyCardTerminal } from '../src/core/turn-reply-card.js';
+import { cardTerminalForHistoricalReply, cardTerminalForRequiredReply, sweepInterruptedReplyCards, settleTurnReplyCardTerminal } from '../src/core/turn-reply-card.js';
 import { updateMessage } from '../src/im/lark/client.js';
 import { TurnReplyCardStore, type TurnReplyCardTransport } from '../src/services/turn-reply-card.js';
 import { buildTurnReplyCard } from '../src/im/lark/turn-reply-card.js';
@@ -60,6 +60,23 @@ describe('reply-card recovery under partial writes and overlapping writers', () 
   expect(store.read(key)?.disconnected).toBeUndefined();
   expect(remote).toContain('RECOVERY_OK');expect(remote).not.toContain('执行状态待确认');
   expect(ds.replyCardRunningTurnId).toBe('successor');
+ });
+ it('forwards a nothing-to-send terminal into the persisted silent-turn card',async()=>{
+  const ds:any={larkAppId:key.larkAppId,chatId:input.chatId,chatType:'group',rootMessageId:input.rootId,
+    session:{sessionId:key.sessionId,status:'active',rootMessageId:input.rootId}};
+  await drain(settleTurnReplyCardTerminal(ds,{turnId:key.turnId,status:'completed',durationMs:123,
+    outputDisposition:'nothing_to_send'},async()=>{throw Error('must patch existing card')},()=>true));
+  expect(store.read(key)).toMatchObject({phase:'completed',silentTurn:true,durationMs:123});
+  expect(remote).toContain('worker.turn_terminal_receipt.silent_superseded');
+  expect(remote).not.toContain('本轮没有提供最终答复');
+ });
+ it('does not mark a failed required-reply turn as deliberately silent',async()=>{
+  const ds:any={larkAppId:key.larkAppId,chatId:input.chatId,chatType:'group',rootMessageId:input.rootId,
+    session:{sessionId:key.sessionId,status:'active',rootMessageId:input.rootId}};
+  await drain(settleTurnReplyCardTerminal(ds,{turnId:key.turnId,status:'failed',durationMs:88,
+    outputDisposition:'nothing_to_send'},async()=>{throw Error('must patch existing card')},()=>true));
+  expect(store.read(key)?.silentTurn).toBeUndefined();
+  expect(remote).not.toContain('silent_superseded');
  });
  it('masks a content-audit-rejected recovery PATCH instead of leaving the card unsettled',async()=>{
   // The final (with an email) is already in the card; the terminal PATCH is left
@@ -162,4 +179,54 @@ describe('reply-card recovery under partial writes and overlapping writers', () 
   await expect(store.update(key, { kind: 'recover' },io)).rejects.toThrow('fsync');expect(remote).toBe(expected);expect(store.read(key)?.pendingPatch).toBeDefined();
   fail.mockRestore();await new TurnReplyCardStore(dir).update(key, { kind: 'recover' },io);expect(patches).toBe(2);expect(remote).toBe(expected);expect(store.read(key)?.pendingPatch).toBeUndefined();
  });
+});
+
+describe('cardTerminalForRequiredReply fail-closed rule', () => {
+  const base = { turnId: 'om_probe', status: 'completed' as const, outputDisposition: 'nothing_to_send' as const };
+  it('rewrites an unanswered required empty turn to failed while preserving its fields', () => {
+    const result = cardTerminalForRequiredReply(base, true, false);
+    expect(result).toMatchObject({ turnId: 'om_probe', status: 'failed', outputDisposition: 'nothing_to_send' });
+    expect(result).not.toBe(base);
+  });
+  it.each([
+    ['the answer is already on the send ledger', true, true],
+    ['the sink did not require an answer', false, false],
+  ])('keeps a completed terminal when %s', (_name, answerRequired, answered) => {
+    expect(cardTerminalForRequiredReply(base, answerRequired, answered).status).toBe('completed');
+  });
+  it('leaves non-completed terminals untouched even when an answer is still required', () => {
+    for (const status of ['failed', 'cancelled', 'ambiguous'] as const) {
+      expect(cardTerminalForRequiredReply({ ...base, status }, true, false).status).toBe(status);
+    }
+  });
+  it('treats only nothing_to_send and empty_answer as silence-shaped empty output', () => {
+    expect(cardTerminalForRequiredReply({ ...base, outputDisposition: 'empty_answer' }, true, false).status).toBe('failed');
+    for (const outputDisposition of ['boundary_unobserved', 'explicit_final_delivered', undefined] as const) {
+      expect(cardTerminalForRequiredReply({ ...base, outputDisposition }, true, false).status).toBe('completed');
+    }
+  });
+});
+
+describe('cardTerminalForHistoricalReply replayed-terminal rule', () => {
+  const base = { turnId: 'om_probe', status: 'completed' as const, outputDisposition: 'nothing_to_send' as const };
+  const imRequired = { kind: 'im', context: {} as any, chatId: 'oc_probe', chatType: 'p2p' as const, answerRequired: true };
+  const imOptional = { kind: 'im', context: {} as any, chatId: 'oc_probe', chatType: 'group' as const };
+  it('rewrites a required, unanswered replayed silent turn to failed', () => {
+    expect(cardTerminalForHistoricalReply(base, imRequired, undefined).status).toBe('failed');
+  });
+  it('keeps completed when the send ledger proves the final was delivered', () => {
+    expect(cardTerminalForHistoricalReply(base, imRequired, 'om_final').status).toBe('completed');
+  });
+  it('keeps completed for an IM sink without an answer requirement', () => {
+    expect(cardTerminalForHistoricalReply(base, imOptional, undefined).status).toBe('completed');
+  });
+  it.each([
+    ['an http sink', { kind: 'http', mode: 'wait' as const }],
+    ['a missing sink', undefined],
+  ])('keeps completed when no required reply is provable (%s)', (_name, sink) => {
+    expect(cardTerminalForHistoricalReply(base, sink as any, undefined).status).toBe('completed');
+  });
+  it('also fails closed for empty_answer on a required unanswered turn', () => {
+    expect(cardTerminalForHistoricalReply({ ...base, outputDisposition: 'empty_answer' }, imRequired, undefined).status).toBe('failed');
+  });
 });

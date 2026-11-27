@@ -984,6 +984,32 @@ describe('one reply card per turn', () => {
     expect(store.read(key)!.activity!.map(item => item.kind)).toEqual(['thinking', 'tool', 'thinking']);
   });
 
+  it.each(['progress', 'ask'] as const)(
+    'keeps a re-emitted thinking paragraph when a store-only %s stage delimits the two snapshots', async stage => {
+      await store.update(key, { kind: 'tools', tools: [], activity: publicReplyCardActivity([
+        { kind: 'thinking', text: 'THINK_X' },
+      ]) }, io);
+      if (stage === 'progress') await store.update(key, { kind: 'progress', text: '阶段分隔' }, io);
+      else await store.update(key, { kind: 'ask', entry: nativeAsk('stage-ask') }, io);
+      // The cumulative snapshot carries the paragraph at two source positions;
+      // the store-only delimiter is absent from this snapshot.
+      await store.update(key, { kind: 'tools', tools: [], activity: publicReplyCardActivity([
+        { kind: 'thinking', text: 'THINK_X' }, { kind: 'text', text: 'THINK_X' },
+      ]) }, io);
+      expect(store.read(key)!.activity!.map(item => item.kind)).toEqual(['thinking', stage, 'thinking']);
+    });
+
+  it('merges adjacent thinking entries whose text differs only in whitespace', async () => {
+    const entries: CotEntry[] = [
+      { kind: 'thinking', text: '同一段\n思考' }, { kind: 'thinking', text: ' 同一段  思考 ' },
+    ];
+    await store.update(key, { kind: 'tools', tools: [], activity: publicReplyCardActivity(entries) }, io);
+    const thinking = store.read(key)!.activity!.filter(item => item.kind === 'thinking');
+    expect(thinking).toHaveLength(1);
+    // The first occurrence keeps its original text and id.
+    expect(thinking[0]).toMatchObject({ id: 'thinking:0', text: '同一段\n思考' });
+  });
+
   it('serializes independent publishers and fences progress after final delivery', async () => {
     const secondProcess = new TurnReplyCardStore(dir);
     let release!: () => void;

@@ -112,17 +112,31 @@ export type TurnReplyCardEvent =
   | { kind: 'recap'; markdown?: string }
   | { kind: 'recover'; beforeMs?: number; orphanAskIds?: string[] };
 
-/** Activity as the card shows it: blank thinking is dropped and a thinking
- *  item repeating the one right before it is collapsed. The first occurrence
- *  keeps its id, so a cumulative snapshot re-applied later stays idempotent. */
-export function collapseThinkingActivity(items: readonly ReplyCardActivity[]): ReplyCardActivity[] {
+/** Activity as the card shows it. Blank thinking is always dropped, and a
+ *  thinking paragraph is shown once per stage segment: a run of thinking items
+ *  bounded by tool / progress / ask items, which delimit distinct execution
+ *  stages whose repeated paragraphs must stay visible. Text is compared after
+ *  whitespace normalization, so the same paragraph re-emitted with different
+ *  line breaks still collapses. The first occurrence keeps its id, so a
+ *  cumulative snapshot re-applied later stays idempotent.
+ *
+ *  A cumulative CoT snapshot cannot see progress/ask items that live only in
+ *  the store. Callers merging a snapshot pass `dedupe: false` (blank filtering
+ *  still applies) and re-run the full-sequence pass after the merge, where the
+ *  real stage delimiters are visible. */
+export function collapseThinkingActivity(items: readonly ReplyCardActivity[], dedupe = true): ReplyCardActivity[] {
+  const normalizedText = (text: string) => text.trim().replace(/\s+/g, ' ');
   const result: ReplyCardActivity[] = [];
+  const seenInSegment = new Set<string>();
   for (const item of items) {
     if (item.kind === 'thinking') {
-      const text = item.text.trim();
+      const text = normalizedText(item.text);
       if (!text) continue;
-      const prev = result.at(-1);
-      if (prev?.kind === 'thinking' && prev.text.trim() === text) continue;
+      if (dedupe && seenInSegment.has(text)) continue;
+      seenInSegment.add(text);
+    } else {
+      // A tool, progress narration or ask opens a new stage segment.
+      seenInSegment.clear();
     }
     result.push(item);
   }
@@ -377,11 +391,15 @@ export class TurnReplyCardStore {
       } else if (!terminal || allowBackgroundTools) {
         if (event.kind === 'tools') {
           record.tools = event.tools;
-          const incoming = collapseThinkingActivity(event.activity ?? event.tools.map(tool => ({ kind: 'tool' as const, id: tool.id })));
+          // Only blank-filter the incoming snapshot: store-only progress/ask
+          // delimiters are absent from it, so segment dedupe waits until the
+          // full merged sequence is visible below.
+          const incoming = collapseThinkingActivity(event.activity ?? event.tools.map(tool => ({ kind: 'tool' as const, id: tool.id })), false);
           const ids = new Set(record.activity.map(item => `${item.kind}:${item.id}`));
           for (const item of incoming) {
             if (!ids.has(`${item.kind}:${item.id}`)) record.activity.push(item);
           }
+          record.activity = collapseThinkingActivity(record.activity);
         } else if (event.kind === 'start' && !record.finalDelivered) {
           record.phase = 'working';
           record.startedAtMs ??= Date.now();
