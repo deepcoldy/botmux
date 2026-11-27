@@ -6,14 +6,17 @@ import { join } from 'node:path';
 const supervisor = vi.hoisted(() => ({
   capture: vi.fn<(...args: any[]) => any[]>(),
   run: vi.fn(),
+  shutdown: vi.fn(),
 }));
 
 vi.mock('../src/core/plugins/supervisor-client.js', () => ({
   readPluginProcesses: supervisor.capture,
   changePluginService: supervisor.run,
+  shutdownPluginSupervisor: supervisor.shutdown,
 }));
 
 import {
+  stopPluginServices,
   assertPluginServiceStopped,
   deletePluginServicesOrThrowUnlocked,
   PluginServiceDeleteError,
@@ -51,12 +54,23 @@ describe('plugin service lifecycle guard', () => {
     vi.stubEnv('HOME', home);
     supervisor.capture.mockReset();
     supervisor.run.mockReset();
+    supervisor.shutdown.mockReset();
     supervisor.capture.mockReturnValue([]);
   });
 
   afterEach(() => {
     vi.unstubAllEnvs();
     rmSync(home, { recursive: true, force: true });
+  });
+
+  it('explicit all reports failed members and keeps the host available for recovery', async () => {
+    writePluginSource(source, '0.1.0', 'v1');
+    installLocalPlugin(source);
+    supervisor.capture.mockReturnValue(supervisorList('online', 4123));
+    supervisor.run.mockRejectedValue(new Error('simulated member stop failure'));
+    await expect(stopPluginServices(undefined, { shutdownSupervisor: true } as any))
+      .rejects.toThrow('plugin_service_stop_failed');
+    expect(supervisor.shutdown).not.toHaveBeenCalled();
   });
 
   it('allows absent, stopped, and errored supervisor apps', () => {

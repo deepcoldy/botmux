@@ -111,6 +111,8 @@ function larkCard(bot: Record<string, unknown>): React.ReactElement {
   return React.createElement(BotDefaultsCard, {
     bot: { larkAppId: 'cli_fixture', botName: 'Fixture', online: true, ...bot } as any,
     bots: [], cliState, patchBot: () => {}, brandEnabled: true, activeTab: 'common', onTabChange: () => {},
+    onLocate: () => {}, filterQuery: '', onFilterQuery: () => {}, modifiedOnly: false,
+    onModifiedOnly: () => {}, onClearFilter: () => {},
   });
 }
 

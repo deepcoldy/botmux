@@ -6,13 +6,31 @@
 
 :root {
   /* ── 颜色：表面层 ── */
-  --bg: #f4f5f8;
+  --bg: #f1f3f8;
   --bg-soft: #eceef4;
   --surface: #ffffff;
   --surface-raised: #ffffff;
   --surface-muted: #f7f8fa;
   --surface-subtle: #f7f8fa;
   --surface-hover: #f3f4f8;
+
+  /* 浮动顶栏、弹出菜单与模态框的材质 */
+  --mat-chrome-bg: rgba(255, 255, 255, .88);
+  --mat-sidebar-bg: rgba(255, 255, 255, .96);
+  --mat-sidebar-solid-bg: #ffffff;
+  --workspace-bg: var(--bg);
+  --workspace-card-bg: var(--surface);
+  --sidebar-divider: rgba(18, 26, 44, .10);
+  --sidebar-shadow: 1px 0 8px rgba(18, 26, 44, .03);
+  --topbar-divider: rgba(18, 26, 44, .09);
+  --sidebar-control-bg: #f4f6fa;
+  --sidebar-control-hover: #ffffff;
+  --sidebar-active-bg: var(--accent-soft);
+  --sidebar-active-shadow: none;
+  --mat-chrome-blur: blur(20px) saturate(180%);
+  --mat-popover-bg: rgba(255, 255, 255, .88);
+  --mat-popover-blur: blur(24px) saturate(185%);
+  --mat-edge-highlight: rgba(255, 255, 255, .72);
 
   /* ── 颜色：文字 ── */
   --fg: #1a2233;
@@ -30,6 +48,8 @@
 
   /* ── 颜色：品牌 ── */
   --accent: #4f56e8;
+  --accent-fill: #4f56e8;
+  --accent-fill-hover: color-mix(in srgb, var(--accent-fill) 96%, var(--on-accent));
   --accent-strong: #4047de;
   --accent-hover: #4047de;
   --accent-bright: #8b91ff;
@@ -81,6 +101,11 @@
   --lh-title: 1.35;
   --lh-body: 1.55;
 
+  --tr-display: -0.025em;
+  --tr-title: -0.016em;
+  --tr-body: 0em;
+  --tr-micro: 0.012em;
+
   /* ── 间距（4px 基准） ── */
   --sp-1: 4px;
   --sp-2: 8px;
@@ -109,12 +134,17 @@
   --modal-shadow: 0 24px 80px rgba(0, 0, 0, .25);
   --modal-backdrop: rgba(10, 14, 18, .48);
 
-  /* ── 动效（2 档） ── */
-  --t-fast: 120ms ease-out;
-  --t-norm: 180ms ease-out;
+  /* ── 动效 ── */
+  --ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-press: cubic-bezier(0.2, 0, 0, 1);
+  --t-press: 90ms var(--ease-press);
+  --t-fast: 140ms var(--ease-spring);
+  --t-norm: 220ms var(--ease-spring);
+  --t-sheet: 280ms var(--ease-spring);
 
   /* ── 布局 ── */
-  --topbar-h: 56px;
+  --topbar-h: 52px;
+  --topbar-height: var(--topbar-h);
   --sidebar-w: 248px;
   --button-height: 32px;
   --button-compact-height: 28px;
@@ -141,13 +171,28 @@
 
 /* ═══ 暗色主题（纯 token 切换） ═══ */
 :root[data-theme="dark"] {
-  --bg: #0d1117;
+  --bg: #0a0d14;
   --bg-soft: #0e141d;
-  --surface: #151b26;
+  --surface: #131926;
   --surface-raised: #1b2330;
   --surface-muted: #121821;
   --surface-subtle: #121821;
   --surface-hover: #1c2431;
+
+  --mat-chrome-bg: rgba(15, 20, 29, .76);
+  --mat-sidebar-bg: rgba(21, 28, 41, .94);
+  --mat-sidebar-solid-bg: #151c29;
+  --sidebar-divider: rgba(255, 255, 255, .10);
+  --sidebar-shadow: 1px 0 8px rgba(0, 0, 0, .28);
+  --topbar-divider: rgba(255, 255, 255, .10);
+  --sidebar-control-bg: #20293a;
+  --sidebar-control-hover: #283449;
+  --sidebar-active-bg: rgba(130, 137, 255, .18);
+  --sidebar-active-shadow: inset 0 0 0 1px rgba(130, 137, 255, .34);
+  --mat-chrome-blur: blur(20px) saturate(160%);
+  --mat-popover-bg: rgba(23, 30, 42, .88);
+  --mat-popover-blur: blur(24px) saturate(170%);
+  --mat-edge-highlight: rgba(255, 255, 255, .08);
 
   --fg: #dde4f0;
   --muted: #99a4b8;
@@ -161,13 +206,14 @@
   --border-subtle: #1e2734;
   --border-strong: #3a4658;
 
-  --accent: #7b82f5;
+  --accent: #8289ff;
+  --accent-fill: #555de6;
   --accent-strong: #8d93f7;
   --accent-hover: #8d93f7;
   --accent-bright: #a5aaf8;
   --accent-soft: rgba(123, 130, 245, .13);
   --accent-border: rgba(123, 130, 245, .32);
-  --on-accent: #10131f;
+  --on-accent: #ffffff;
   --brand-accent: #7b82f5;
   --brand-accent-strong: #8d93f7;
   --brand-accent-bright: #a5aaf8;
@@ -201,12 +247,48 @@
   --term-bg: #0b0e13;
 }
 
+@media (prefers-reduced-transparency: reduce) {
+  :root,
+  :root[data-theme="dark"] {
+    --mat-chrome-bg: var(--bg);
+    --mat-chrome-blur: none;
+    --mat-sidebar-bg: var(--mat-sidebar-solid-bg);
+    --mat-popover-bg: var(--surface-raised);
+    --mat-popover-blur: none;
+  }
+  :root[data-theme="dark"] {
+    --sidebar-active-bg: color-mix(in srgb, var(--accent) 18%, var(--mat-sidebar-solid-bg));
+  }
+}
+
+@media (prefers-contrast: more) {
+  :root,
+  :root[data-theme="dark"] {
+    --sidebar-divider: var(--border);
+    --topbar-divider: var(--border);
+  }
+  :root {
+    --border: #8c96aa;
+    --border-soft: #a1aabb;
+    --muted: #414b61;
+    --mat-chrome-bg: var(--bg);
+    --mat-popover-bg: var(--surface-raised);
+  }
+  :root[data-theme="dark"] {
+    --border: #77849a;
+    --border-soft: #606d83;
+    --muted: #c2cbe0;
+  }
+}
+
 /* ═══ 基础排版 ═══ */
 html {
   font-size: var(--fs-13);
 }
 body {
   font-family: var(--font);
+  font-optical-sizing: auto;
+  letter-spacing: var(--tr-body);
   font-size: var(--fs-13);
   line-height: var(--lh-body);
   color: var(--fg);
@@ -224,6 +306,6 @@ body {
 
 /* ═══ 选中 ═══ */
 ::selection {
-  background: var(--accent);
+  background: var(--accent-fill);
   color: var(--on-accent);
 }

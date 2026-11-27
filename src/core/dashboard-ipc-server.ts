@@ -12304,9 +12304,12 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     larkBotName = bot.botName ?? null;
   } catch { /* none */ }
   const sandboxPathsForDashboard = sandboxStore.getBotSandboxPaths(cachedLarkAppId);
+  const currentBotConfig = getBot(cachedLarkAppId).config;
   jsonRes(res, 200, {
     larkAppId: cachedLarkAppId,
-    apiOnly: getBot(cachedLarkAppId).config.apiOnly === true,
+    apiOnly: currentBotConfig.apiOnly === true,
+    commandTriggersConfigured: Boolean(currentBotConfig.commandTriggers?.commands.length),
+    blockedUsersConfigured: Boolean(currentBotConfig.blockedUsers?.length),
     botName: getBotName(),
     displayName,
     larkBotName,
@@ -12394,9 +12397,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     sandboxMode: sandboxStore.getBotSandboxMode(cachedLarkAppId),
     // Machine-wide BOTMUX_SANDBOX force the worker applies over this bot's own
     // selection (null = none). Lets the page say why "关闭" is not what runs.
-    sandboxEnvForce: (() => {
-      try { const m = envSandboxMode(process.env.BOTMUX_SANDBOX); return m === 'off' ? null : m; } catch { return null; }
-    })(),
+    sandboxEnvForce: dashboardSandboxEnvForce(),
     scratchStorage: (() => { try { return getBot(cachedLarkAppId).config.scratchStorage ?? null; } catch { return null; } })(),
     scratchTmpfsSizeMb: (() => { try { return getBot(cachedLarkAppId).config.scratchTmpfsSizeMb ?? null; } catch { return null; } })(),
     scratchDenyPaths: (() => { try { return getBot(cachedLarkAppId).config.scratchDenyPaths ?? null; } catch { return null; } })(),
@@ -13904,6 +13905,13 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
       // rejected above; retain the legacy cleared flag for older clients.
       readIsolation: bot.config.readIsolation === true,
       readIsolationSupported: readIsolationEnforceableFor(bot.config),
+      // The summary must follow the just-saved CLI/backend pairing without a full page reload.
+      localSandboxApplies: localSandboxApplies(
+        resolvePairedBackendId(bot.config.cliId, bot.config.backendType, config.daemon.backendType) ?? 'pty',
+        bot.config.mojo,
+      ),
+      effectiveSandboxMode: effectiveBotSandboxMode(bot.config),
+      sandboxEnvForce: dashboardSandboxEnvForce(),
       readIsolationCleared: false,
       codexBrowserCleared,
       agentAvailable: availability.available,
@@ -14675,6 +14683,16 @@ botConfigPutRoute<{ enabled?: unknown; autoAvoidApproval?: unknown }>('/api/bot-
   },
   respond: value => ({ ok: true, autoAvoidApproval: value !== false }),
 });
+/** Machine-wide sandbox override reported consistently by dashboard GET and agent PUT. */
+function dashboardSandboxEnvForce(): 'oncall' | 'scratch' | null {
+  try {
+    const mode = envSandboxMode(process.env.BOTMUX_SANDBOX);
+    return mode === 'off' ? null : mode;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * The sandbox mode the worker will spawn this bot's CLI under
  * (resolveLocalSandboxMode: global BOTMUX_SANDBOX and the legacy readIsolation

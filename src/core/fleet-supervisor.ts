@@ -20,6 +20,7 @@ import { openRotatedAppendLog } from '../utils/log-rotate.js';
 import { isStandaloneBinary, resolveEntrySpawn, type BotmuxEntry } from './self-spawn.js';
 import { scrubExternalMemberEnv } from '../utils/child-env.js';
 import { isLinuxZombie, readDurableProcessIdentity } from '../utils/process-identity.js';
+import { pidNotProvablyGone } from '../utils/process-alive.js';
 import {
   builtinFleetEntryMatches,
   inspectFleetProcess,
@@ -1145,16 +1146,38 @@ export class FleetSupervisor {
     if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
     return new Promise((resolve, reject) => {
       let done = false;
-      const finish = () => { if (done) return; done = true; clearTimeout(killTimer); clearTimeout(deadline); resolve(); };
       const timeout = this.knownSpecs.get(name)?.external?.killTimeoutMs ?? this.killTimeoutMs;
-      const killTimer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* already gone */ } }, timeout);
-      killTimer.unref?.();
-      const deadline = setTimeout(() => {
+      const childExited = () => child.exitCode !== null || child.signalCode !== null
+        || (child.pid !== undefined && (isLinuxZombie(child.pid) || !pidNotProvablyGone(child.pid)));
+      let deadline: ReturnType<typeof setTimeout> | undefined;
+      const finish = () => {
         if (done) return;
+        done = true;
+        clearTimeout(killTimer);
+        if (deadline) clearTimeout(deadline);
+        resolve();
+      };
+      const failIfNotExited = () => {
+        if (done) return;
+        // A paused supervisor can resume after the child has exited but before
+        // its exit listener ran. Terminal child/kernel state wins over the timer;
+        // rejecting here would skip stopAll's durable state reconciliation.
+        if (childExited()) { finish(); return; }
         done = true;
         child.removeListener('exit', finish);
         reject(new Error(`fleet: stop not confirmed for ${name}`));
-      }, timeout + 5_000);
+      };
+      const killTimer = setTimeout(() => {
+        if (done) return;
+        if (childExited()) { finish(); return; }
+        try { child.kill('SIGKILL'); } catch { /* already gone */ }
+        if (childExited()) { finish(); return; }
+        // Start the confirmation window only after escalation. If the host was
+        // paused, the graceful and hard-stop timers must not expire back-to-back
+        // before the child's exit can be observed.
+        deadline = setTimeout(failIfNotExited, 5_000);
+      }, timeout);
+      killTimer.unref?.();
       child.once('exit', finish);
       try { child.kill('SIGTERM'); } catch { /* wait for exit or the deadline */ }
     });

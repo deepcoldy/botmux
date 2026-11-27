@@ -207,9 +207,13 @@ describe('WeCom bot card layout in the real browser', () => {
         // 每个专属格子都有自己的保存按钮（常用分类没有本地业务设置那一格）。
         expect(found.wecomSaves.length, `${tab}: save buttons`).toBeGreaterThanOrEqual(wecomTileIds(tab).length);
       }
-      // 夹具确实铺出了这些控件（不是因为一个都没找到才通过）。
-      expect(counts.inputs).toBeGreaterThan(10);
-      expect(counts.menus).toBeGreaterThan(10);
+      // 夹具确实铺出了这些控件（不是因为一个都没找到才通过）。企业微信专属格子按设计
+      // 以开关/下拉/文本域为主：四个分类共 4 个单行输入框（总结 3 + 额度 1）、2 个下拉框
+      // （授权时长、额度交接对象）、每个带内容的格子各 1 个保存按钮；阈值钉住真实下限，
+      // 控件被整块裁掉时仍会变红。
+      expect(counts.inputs).toBeGreaterThanOrEqual(4);
+      expect(counts.menus).toBeGreaterThanOrEqual(2);
+      expect(counts.saves).toBeGreaterThanOrEqual(4);
       expect(errors).toEqual([]);
     } finally {
       await page.close();

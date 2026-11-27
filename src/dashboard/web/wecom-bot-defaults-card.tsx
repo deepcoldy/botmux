@@ -321,7 +321,7 @@ export function WecomBotDefaultsCard(props: WecomBotDefaultsCardProps) {
               ) : null}
               {shows('command-trigger') ? (
                 <section className="bd-tile" id={botDefaultsSectionDomId('command-trigger')}>
-                  <CommandTriggerSection bot={bot} />
+                  <CommandTriggerSection bot={bot} patchBot={patchBot} />
                 </section>
               ) : null}
               {shows('session-cap') ? (

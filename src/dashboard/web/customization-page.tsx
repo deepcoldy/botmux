@@ -787,7 +787,7 @@ const PAGE_CSS = `
 .cz-tabs{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:12px;}
 .cz-stage-tab{border:1px solid var(--border-soft);background:var(--surface);color:var(--muted);border-radius:12px;padding:9px 18px;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;display:inline-flex;align-items:center;gap:8px;min-height:0;transition:all .15s;}
 .cz-stage-tab:hover{border-color:var(--accent);color:var(--accent-strong);}
-.cz-stage-tab-on{background:var(--accent);border-color:var(--accent);color:var(--on-accent);box-shadow:var(--shadow);}
+.cz-stage-tab-on{background:var(--accent-fill);border-color:var(--accent);color:var(--on-accent);box-shadow:var(--shadow);}
 .cz-stage-tab-on:hover{color:var(--on-accent);}
 .cz-tab-badge{background:var(--warning-soft);color:var(--warning);border-radius:999px;font-size:11px;font-weight:700;min-width:18px;height:18px;line-height:18px;text-align:center;padding:0 5px;}
 .cz-stage-tab-on .cz-tab-badge{background:rgba(0,0,0,.18);color:inherit;}
@@ -802,7 +802,7 @@ const PAGE_CSS = `
 .cz-search:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft);}
 .cz-toolbar-spacer{flex:1;}
 .cz-btn{border:none;border-radius:10px;height:32px;padding:0 13px;font-size:12.5px;font-weight:600;cursor:pointer;font-family:inherit;display:inline-flex;align-items:center;gap:6px;text-decoration:none;}
-.cz-btn-primary{background:var(--accent);color:var(--on-accent);}
+.cz-btn-primary{background:var(--accent-fill);color:var(--on-accent);}
 .cz-btn-ghost{background:var(--surface);border:1px solid var(--border);color:var(--fg);}
 .cz-btn-ghost:hover{border-color:var(--accent);color:var(--accent-strong);}
 .cz-btn-danger{background:var(--danger-soft);color:var(--danger);}

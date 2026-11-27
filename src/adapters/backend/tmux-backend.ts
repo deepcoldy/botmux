@@ -3,7 +3,7 @@ import { lstatSync, readFileSync } from 'node:fs';
 import { basename } from 'node:path';
 import type { SessionProbe } from './types.js';
 import { probeTmuxFunctional, scrubTmuxServerGlobalEnv, tmuxEnv, getTmuxVersionCached, tmuxVersionAtLeast } from '../../setup/ensure-tmux.js';
-import { BOTMUX_INJECTED_ENV_KEYS, CA_BUNDLE_ENV_KEYS, GIT_CONFIG_PAIR_ENV_KEY, GIT_CONFIG_PAIR_ENV_SHELL_PATTERN, PROXY_ENV_KEYS, REDACTED_CHILD_ENV_KEYS, SESSION_TEMP_ENV_KEYS, WORKFLOW_WORKER_ENV_KEYS } from '../../utils/child-env.js';
+import { ANTIGRAVITY_OSC7501_TRANSPORT_ENV_KEYS, BOTMUX_INJECTED_ENV_KEYS, CA_BUNDLE_ENV_KEYS, GIT_CONFIG_PAIR_ENV_KEY, GIT_CONFIG_PAIR_ENV_SHELL_PATTERN, PROXY_ENV_KEYS, REDACTED_CHILD_ENV_KEYS, SESSION_TEMP_ENV_KEYS, WORKFLOW_WORKER_ENV_KEYS } from '../../utils/child-env.js';
 import { sanitizePerBotEnv } from '../../core/per-bot-env.js';
 import { sessionEnvUnsetFlags, trustedSessionEnvUnsetFlags } from '../../core/session-env.js';
 import { logger } from '../../utils/logger.js';
@@ -772,6 +772,14 @@ export function buildBotmuxEnvAssignments(
     // CLI and overrides a stale server-global one, while a user's own value on
     // their tmux server survives untouched for every other CLI.
     for (const key of CA_BUNDLE_ENV_KEYS) {
+      const val = env[key];
+      if (val === undefined) continue;
+      out.push(`${key}=${val}`);
+    }
+    // Antigravity OSC 7501 knobs: forwarded per pane when present on childEnv
+    // (same pattern as CA_BUNDLE_ENV_KEYS) without scrubbing user-owned server
+    // globals or rcfile exports on older agy / ACP / non-botmux panes.
+    for (const key of ANTIGRAVITY_OSC7501_TRANSPORT_ENV_KEYS) {
       const val = env[key];
       if (val === undefined) continue;
       out.push(`${key}=${val}`);
