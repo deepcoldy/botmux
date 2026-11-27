@@ -184,8 +184,8 @@ export type LocalSessionReadyRead =
 let claimSeq = 0;
 
 /**
- * Worker side. Claims (renames away) whatever is at the signal path, then
- * validates it. Each written signal is consumed exactly once.
+ * Claim the latest signal by rename before validating it. Writes between
+ * polls coalesce; a claimed record cannot be delivered by a later poll.
  */
 export function consumeLocalSessionReadySignal(channel: Pick<LocalSessionReadyChannel, 'filePath' | 'nonce'>): LocalSessionReadyRead {
   const claimed = join(dirname(channel.filePath), `.claimed.${process.pid}.${++claimSeq}`);
