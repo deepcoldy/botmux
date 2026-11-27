@@ -132,6 +132,20 @@ const CANCELLATION_SNAPSHOT_KEYS = [
   'queuedActivationRawInput',
   'queuedActivationRawTurnId',
 ] as const;
+type CancellationSnapshot = ReadonlyArray<readonly [typeof CANCELLATION_SNAPSHOT_KEYS[number], unknown]>;
+
+function captureCancellationSnapshot(ds: DaemonSession): CancellationSnapshot {
+  const session = ds.session;
+  return CANCELLATION_SNAPSHOT_KEYS.flatMap(key => session[key] === undefined
+    ? []
+    : [[key, structuredClone(session[key])] as const]);
+}
+
+function restoreCancellationSnapshot(ds: DaemonSession, snapshot: CancellationSnapshot): void {
+  const target = ds.session as unknown as Record<string, unknown>;
+  for (const key of CANCELLATION_SNAPSHOT_KEYS) delete target[key];
+  for (const [key, value] of snapshot) target[key] = value;
+}
 
 /** Retry the exact in-memory tombstone/tail/journal state before any later
  * promotion. A transient write failure must not become a permanent quarantine. */
@@ -140,21 +154,38 @@ export function retryCancelledActivationPersistence(
   update: (session: DaemonSession['session']) => void = sessionStore.updateSession,
 ): boolean {
   if (!ds.activationCancellationPending) return true;
-  const session = ds.session;
-  const target = session as unknown as Record<string, unknown>;
   // sessionStore.updateSession restores the durable row into the caller's object
   // on failure. Preserve the cancellation-owned snapshot across that rollback,
   // or the next successful retry would promote the resurrected old tail.
-  const snapshot = CANCELLATION_SNAPSHOT_KEYS.flatMap(key => session[key] === undefined
-    ? []
-    : [[key, structuredClone(session[key])] as const]);
+  const snapshot = captureCancellationSnapshot(ds);
   try {
-    update(session);
+    update(ds.session);
     ds.activationCancellationPending = undefined;
     return true;
   } catch {
-    for (const key of CANCELLATION_SNAPSHOT_KEYS) delete target[key];
-    for (const [key, value] of snapshot) target[key] = value;
+    restoreCancellationSnapshot(ds, snapshot);
+    ds.activationCancellationPending = true;
+    return false;
+  }
+}
+
+/** Clear a cancelled journal head without letting a store rollback make it
+ * executable again. Success lets the caller continue with the next live tail. */
+export function clearTombstonedActivationHeadForRelease(
+  ds: DaemonSession,
+  update: (session: DaemonSession['session']) => void = sessionStore.updateSession,
+): boolean {
+  if (!ds.session.queuedActivationPending) return true;
+  const turnId = ds.session.queuedActivationTurnId;
+  if (!turnId || !(ds.session.cancelledActivationTurnIds ?? []).includes(turnId)) return true;
+  const snapshot = captureCancellationSnapshot(ds);
+  if (!clearCancelledActivationJournal(ds, new Set([turnId]))) return false;
+  try {
+    update(ds.session);
+    ds.activationCancellationPending = undefined;
+    return true;
+  } catch {
+    restoreCancellationSnapshot(ds, snapshot);
     ds.activationCancellationPending = true;
     return false;
   }
@@ -194,10 +225,12 @@ export function cancelPreReadyScheduledWorkers(
     // Write-ahead cancellation: the tombstone becomes durable BEFORE any tail
     // or journal entry is removed. If the cleanup write later fails and the
     // daemon restarts, recovery still filters this exact turn from the old tail.
+    const writeAheadSnapshot = captureCancellationSnapshot(ds);
     try {
       update(ds.session);
       ds.activationCancellationPending = undefined;
     } catch (error) {
+      restoreCancellationSnapshot(ds, writeAheadSnapshot);
       ds.activationCancellationPending = true;
       logger.warn(`[scheduler] Cancellation tombstone write-ahead for run ${runId} failed; worker execution is still blocked: ${String(error)}`);
     }
@@ -212,10 +245,12 @@ export function cancelPreReadyScheduledWorkers(
       ds.pendingPrompt = undefined;
       ds.scheduledStagedInput = undefined;
     }
+    const cleanupSnapshot = captureCancellationSnapshot(ds);
     try {
       update(ds.session);
       ds.activationCancellationPending = undefined;
     } catch (error) {
+      restoreCancellationSnapshot(ds, cleanupSnapshot);
       ds.activationCancellationPending = true;
       logger.warn(`[scheduler] Cancellation cleanup write for run ${runId} failed; retained in-memory tombstones and pruned state for retry: ${String(error)}`);
     }
@@ -324,10 +359,11 @@ export async function releaseCancelledActivationWork(
   const released = await deps.release();
   if ((!ds.worker || ds.worker.killed)
     && ds.session.queuedActivationPending && ds.session.queuedActivationInput) {
-    deps.startJournal();
+    if (!ds.activationCancellationPending && hasRecoverableActivationHead(ds.session)) deps.startJournal();
+    else deps.scheduleRetry();
     return;
   }
-  if (released) return;
+  if (released && !ds.activationCancellationPending) return;
   deps.scheduleRetry();
 }
 

@@ -21,7 +21,7 @@ function shutdownHarness(existingAppServerEndpoint?: string) {
     stopStructuredStartGraceRecheck: vi.fn(),
     saveUnsentInputsForSuccessor: vi.fn(),
     cliOutlivesWorker: false, backend: null, retiredRuntimeBackend: null, currentBotmuxTurnId: null,
-    isCodexAppCliId: () => false, handsCliPidMarkerToSuccessor: () => false,
+    isCodexAppCliId: () => false, handsCliPidMarkerToSuccessor: vi.fn(() => false),
     cancelRetiredRuntimeExit: vi.fn(),
     sendAndFlush: vi.fn(async () => {}),
     stopBridgeWatcher: vi.fn(), stopCodexBridge: vi.fn(),
@@ -51,6 +51,7 @@ describe('worker RPC shutdown barrier', () => {
     h.release();
     await result;
     expect(h.scope.killCli).toHaveBeenCalledOnce();
+    expect(h.scope.handsCliPidMarkerToSuccessor).toHaveBeenCalledWith(expect.objectContaining({ rpcEngineEngaged: true }));
     expect(h.scope.process.exit).toHaveBeenCalledWith(0);
   });
 

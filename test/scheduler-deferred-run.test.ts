@@ -1111,7 +1111,7 @@ describe('deferred scheduled run lifecycle', () => {
   it('cold-starts a retained human journal after a proven worker retirement', async () => {
     const ds = {
       worker: null,
-      session: { queuedActivationPending: true, queuedActivationInput: { content: 'human' } },
+      session: { queuedActivationPending: true, queuedActivationInput: { content: 'human' }, queuedActivationTurnId: 'om_human_retained' },
     } as any;
     const startJournal = vi.fn();
     const scheduleRetry = vi.fn();

@@ -20683,6 +20683,7 @@ export function promoteQueuedActivationTail(
     );
     promotedTitleUpdate = applyPreparedInputTitle(ds, promotedTitlePlan);
     sessionStore.updateSession(ds.session);
+    ds.quarantinedActivationTailPromotion = undefined;
   } catch (err) {
     if (promotedTitleUpdate) Object.assign(ds.session, promotedTitleUpdate.previous);
     restoreQueuedActivationJournal(ds.session, priorJournal);

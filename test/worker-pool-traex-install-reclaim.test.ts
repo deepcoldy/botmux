@@ -114,7 +114,7 @@ import {
   hasPendingOrdinaryImInput,
   recordWorkerCliInputBacklog,
 } from '../src/core/worker-pool.js';
-import { releaseCancelledActivationWork } from '../src/core/deferred-schedule-settlement.js';
+import { releaseCancelledActivationWork, retryCancelledActivationPersistence, clearTombstonedActivationHeadForRelease, hasRecoverableActivationHead } from '../src/core/deferred-schedule-settlement.js';
 import { beginFinalOutputDelivery } from '../src/core/final-output-delivery-drain.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { ExecutableIdentity } from '../src/services/cli-install-identity.js';
@@ -1133,6 +1133,7 @@ describe('activation tail claim cancellation', () => {
       randomUUID: () => 'replacement-claim',
       runSessionTurn: async (_id: string, action: () => Promise<void>) => action(),
       promoteQueuedActivationTail,
+      hasRecoverableActivationHead,
       isCodexAppCliId: () => false,
       getBot: () => ({ config: { cliId: 'traex' } }),
       forkWorker,
@@ -1186,6 +1187,70 @@ describe('activation tail claim cancellation', () => {
     expect(ds.session.queuedActivationTail).toHaveLength(1);
   });
 
+  it.each(['tombstoned', 'dirty'] as const)('refuses to start a %s promoted journal', async mode => {
+    const ds = makeDs({ worker: null, initialStartPending: true });
+    Object.assign(ds.session, {
+      queuedActivationPending: true,
+      queuedActivationToken: `tok-${mode}-journal`,
+      queuedActivationInput: { content: `${mode}-journal` },
+      queuedActivationTurnId: 'schedule:replacement-journal',
+      cancelledActivationTurnIds: mode === 'tombstoned' ? ['schedule:replacement-journal'] : [],
+    });
+    ds.activationCancellationPending = mode === 'dirty' ? true : undefined;
+    const forkWorker = vi.fn();
+    const start = loadDaemonFunction({
+      traexReplacementStartInFlight: new Set<string>(),
+      findActiveBySessionId: () => ds,
+      randomUUID: () => `claim-${mode}-journal`,
+      runSessionTurn: async (_id: string, action: () => Promise<void>) => action(),
+      promoteQueuedActivationTail,
+      hasRecoverableActivationHead,
+      isCodexAppCliId: () => false,
+      getBot: () => ({ config: { cliId: 'traex' } }),
+      forkWorker,
+      clearInitialStartClaim: vi.fn(),
+      logger: { warn: vi.fn() },
+      tag: () => 'traex-test',
+    });
+    start(ds, true);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(ds.initialStartClaimToken).toBeUndefined();
+  });
+
+  it('rechecks promoted-journal recoverability after the turn-queue wait', async () => {
+    const ds = makeDs({ worker: null, initialStartPending: true });
+    Object.assign(ds.session, {
+      queuedActivationPending: true,
+      queuedActivationToken: 'tok-async-recheck',
+      queuedActivationInput: { content: 'live until the queue wait' },
+      queuedActivationTurnId: 'schedule:async-recheck',
+      cancelledActivationTurnIds: [],
+    });
+    let openTurnQueue!: () => void;
+    const turnQueueGate = new Promise<void>(resolve => { openTurnQueue = resolve; });
+    const forkWorker = vi.fn();
+    const start = loadDaemonFunction({
+      traexReplacementStartInFlight: new Set<string>(),
+      findActiveBySessionId: () => ds,
+      randomUUID: () => 'claim-async-recheck',
+      runSessionTurn: async (_id: string, action: () => Promise<void>) => { await turnQueueGate; await action(); },
+      promoteQueuedActivationTail,
+      hasRecoverableActivationHead,
+      isCodexAppCliId: () => false,
+      getBot: () => ({ config: { cliId: 'traex' } }),
+      forkWorker,
+      clearInitialStartClaim: vi.fn(),
+      logger: { warn: vi.fn() },
+      tag: () => 'traex-test',
+    });
+    start(ds, true);
+    ds.session.cancelledActivationTurnIds = ['schedule:async-recheck'];
+    openTurnQueue();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(forkWorker).not.toHaveBeenCalled();
+  });
+
   it('starts a replacement when a late-built replacement tail lands after the old worker is gone', async () => {
     const ds = makeDs({ worker: null, initialStartPending: false });
     ds.session.queuedActivationTail = [tailFor('om_late_build_tail')];
@@ -1199,6 +1264,7 @@ describe('activation tail claim cancellation', () => {
       randomUUID: () => 'replacement-claim',
       runSessionTurn: async (_id: string, action: () => Promise<void>) => action(),
       promoteQueuedActivationTail,
+      hasRecoverableActivationHead,
       isCodexAppCliId: () => false,
       getBot: () => ({ config: { cliId: 'traex' } }),
       forkWorker,
@@ -1333,6 +1399,7 @@ describe('activation tail claim cancellation', () => {
     ds.activationCancellationPending = true;
     ds.initialStartClaimToken = 'claim-dirty-empty-tail';
     const releaseNow = loadDaemonFunction({
+      retryCancelledActivationPersistence, clearTombstonedActivationHeadForRelease,
       promoteQueuedActivationTail,
       clearInitialStartBuffers: vi.fn(),
       clearInitialStartClaim: vi.fn(() => {
@@ -1366,6 +1433,32 @@ describe('activation tail claim cancellation', () => {
     expect(ds.initialStartClaimToken).toBeUndefined();
     expect(scheduleRetry).toHaveBeenCalledOnce();
     expect(startJournal).not.toHaveBeenCalled();
+  });
+
+  it('clears a tombstoned pending head, promotes the human tail, and clears stale quarantine', () => {
+    const ds = makeDs({ worker: null, initialStartPending: true });
+    Object.assign(ds.session, {
+      queuedActivationPending: true,
+      queuedActivationToken: 'tok-tombstoned-release',
+      queuedActivationInput: { content: 'CANCELLED_PENDING_RELEASE' },
+      queuedActivationTurnId: 'schedule:tombstoned-release',
+      queuedActivationTail: [tailFor('om_human_pending_release')],
+      cancelledActivationTurnIds: ['schedule:tombstoned-release'],
+    });
+    ds.quarantinedActivationTailPromotion = true;
+    const rememberLastCliInput = vi.fn();
+    const releaseNow = loadDaemonFunction({
+      retryCancelledActivationPersistence, clearTombstonedActivationHeadForRelease,
+      startReplacementRuntimeAfterReclaim: vi.fn(),
+      promoteQueuedActivationTail, hasCleanlyDrainedQueuedActivationTail,
+      installReclaimPendingForCurrentGeneration,
+      clearInitialStartBuffers: vi.fn(), clearInitialStartClaim: vi.fn(), rememberLastCliInput,
+    }, 'releaseQueuedActivationReservationNow');
+    expect(releaseNow(ds)).toBe(true);
+    expect(ds.session.queuedActivationPending).toBe(true);
+    expect(ds.session.queuedActivationTurnId).toBe('om_human_pending_release');
+    expect(ds.quarantinedActivationTailPromotion).toBeUndefined();
+    expect(rememberLastCliInput).toHaveBeenCalledWith(ds, 'prompt-om_human_pending_release', expect.anything(), 'om_human_pending_release', expect.anything());
   });
 });
 

@@ -51362,6 +51362,7 @@ async function shutdownWorkerForParentExitImpl(reason: string, exitCode = 0): Pr
     process.exit(exitCode);
     return;
   }
+  const rpcEngineWasEngaged = !!codexRpcEngine;
   await stopCodexRpcEngine();
   // A persistent sandboxed pane (oncall / scratch / credential-only) survives
   // this exit (backend.kill() only detaches) and still runs against its
@@ -51384,7 +51385,7 @@ async function shutdownWorkerForParentExitImpl(reason: string, exitCode = 0): Pr
     cliRunning: backend !== null,
     adoptMode: !!lastInitConfig?.adoptMode,
     codexApp: isCodexAppCliId(lastInitConfig?.cliId),
-    rpcEngineEngaged: !!codexRpcEngine,
+    rpcEngineEngaged: rpcEngineWasEngaged,
   });
   if (preserveCliPidMarker && currentBotmuxTurnId) {
     log(`Leaving executing turn ${currentBotmuxTurnId.slice(0, 12)} in the CLI PID marker for the successor worker (${reason})`);

@@ -863,6 +863,9 @@ import {
   cancelPreReadyScheduledWorkers,
   releaseCancelledActivationWork,
   retireCancelledActivationWorker,
+  hasRecoverableActivationHead,
+  retryCancelledActivationPersistence,
+  clearTombstonedActivationHeadForRelease,
 } from './core/deferred-schedule-settlement.js';
 import {
   renderMessageListenerPrompt,
@@ -24149,6 +24152,11 @@ function releaseQueuedActivationReservationNow(ds: DaemonSession, acknowledgedTo
   // A prior callback retry may observe the successor already promoted. That is
   // success for the acknowledged predecessor; never append/send the same tail
   // head a second time while its fresh token owns the journal.
+  if (ds.activationCancellationPending && !retryCancelledActivationPersistence(ds)) return false;
+  if (ds.session.queuedActivationPending
+    && ds.session.queuedActivationTurnId
+    && (ds.session.cancelledActivationTurnIds ?? []).includes(ds.session.queuedActivationTurnId)
+    && !clearTombstonedActivationHeadForRelease(ds)) return false;
   if (ds.session.queuedActivationPending) {
     return acknowledgedToken !== undefined
       && ds.session.queuedActivationToken !== acknowledgedToken;
@@ -24341,7 +24349,9 @@ function startReplacementRuntimeAfterReclaim(ds: DaemonSession, promotedJournalR
   const hasParked = (ds.session.queuedActivationTail ?? [])
     .some(entry => entry.ownerRuntime === 'new');
   const hasPromotedJournal = promotedJournalRecovery && ds.session.queuedActivationPending === true
-    && ds.session.queuedActivationInput !== undefined;
+    && ds.session.queuedActivationInput !== undefined
+    && !ds.activationCancellationPending
+    && hasRecoverableActivationHead(ds.session);
   // Worker-exit promotion sets initialStartPending without a claim token. It is
   // the journal we are explicitly recovering, not a competing start.
   if (ds.initialStartPending && !hasPromotedJournal) return;
@@ -24368,7 +24378,8 @@ function startReplacementRuntimeAfterReclaim(ds: DaemonSession, promotedJournalR
         logger.warn(`[${tag(ds)}] Replacement runtime start deferred: activation head promotion failed`);
         return;
       }
-      if (!ds.session.queuedActivationPending || !ds.session.queuedActivationInput) return;
+      if (ds.activationCancellationPending || !hasRecoverableActivationHead(ds.session)
+        || !ds.session.queuedActivationInput) return;
       const recoverThroughCodexLedger = isCodexAppCliId(
         ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId,
       );
