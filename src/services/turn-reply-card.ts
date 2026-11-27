@@ -91,17 +91,21 @@ export interface TurnReplyCardRecord extends TurnReplyCardKey {
   nextStep?: import('../im/lark/next-step-card.js').NextStepButton;
   /** The「本轮回顾」panel body shown on a completed turn's card. */
   recap?: { markdown: string };
+  /** Visible Lark destination where the card was initially created (when
+   *  created by `botmux send`, which may target a consumed mid-turn follow-up
+   *  in chat scope rather than the host turn's original topic). */
+  deliveredTarget?: import('../core/reply-target.js').SessionReplyTarget;
 }
 
 export type TurnReplyCardEvent =
   | { kind: 'start' }
-  | { kind: 'tools'; tools: ReplyCardTool[]; activity?: ReplyCardActivity[] }
+  | { kind: 'tools'; tools: ReplyCardTool[]; activity?: ReplyCardActivity[]; allowWhileTerminal?: boolean }
   | { kind: 'ask'; entry: ReplyCardAsk }
   | { kind: 'progress'; text: string }
   | { kind: 'final'; text: string; card: string; source: 'explicit' | 'bridge'; feedback?: TurnReplyCardRecord['feedback'] }
   | { kind: 'phase'; phase: 'working' | 'waiting' | 'stopping' }
   | { kind: 'terminal'; phase: 'completed' | 'failed' | 'cancelled' | 'ambiguous' | 'superseded'; notice?: string; durationMs?: number; completedAtMs?: number; disconnected?: boolean; orphanAskIds?: string[] }
-  | { kind: 'display_retired'; notice: string }
+  | { kind: 'display_retired'; notice?: string; silent?: boolean }
   | { kind: 'refresh' }
   /** Set or clear the next-step row; valid after the terminal edge too. */
   | { kind: 'next_step'; nextStep?: import('../im/lark/next-step-card.js').NextStepButton }
@@ -130,6 +134,8 @@ export interface TurnReplyCardTransport {
   forceVisible?: boolean;
   /** Card callback ACK may restore the pre-click view despite an earlier PATCH. */
   forcePatch?: boolean;
+  /** Visible destination used if `send()` creates a fresh card in this update. */
+  deliveredTarget?(): import('../core/reply-target.js').SessionReplyTarget | undefined;
   usage?: import('../im/lark/md-card.js').CardUsageSnapshot;
 }
 
@@ -252,11 +258,26 @@ export class TurnReplyCardStore {
           ? { kind: 'refresh' }
           : { kind: 'terminal', phase: 'ambiguous', disconnected: true, orphanAskIds: event.orphanAskIds };
       }
+      if (event.kind === 'display_retired' && event.silent) {
+        // A genuinely unshown display needs no provider write. This fast path
+        // deliberately shares update()'s lock and beforeEffect/owns barrier:
+        // an uncertain first POST, any final payload or an existing terminal
+        // outcome must instead use the full publication/recovery protocol below.
+        if ((!replyCardIsTerminal(record) || (record.displayRetired && record.phase === 'completed'))
+          && !record.messageId && !record.pendingCreate && !record.finalCard) {
+          record.displayRetired = true;
+          record.phase = 'completed';
+          delete record.pendingPatch;
+          delete record.publishPending;
+          this.write(key, record);
+          return { delivered: false, record };
+        }
+      }
       const displayRetirement = event.kind === 'display_retired';
       if (event.kind === 'display_retired') {
         if (!replyCardIsTerminal(record) || record.displayRetired) record.displayRetired = true;
-        event = { kind: 'terminal', phase: record.finalDelivered ? 'completed' : 'ambiguous',
-          ...(record.finalDelivered ? {} : { notice: event.notice }) };
+        event = { kind: 'terminal', phase: record.finalDelivered || event.silent ? 'completed' : 'ambiguous',
+          ...(record.finalDelivered || event.silent ? {} : { notice: event.notice }) };
       }
       const terminal = replyCardIsTerminal(record) && !record.disconnected;
       record.updatedAtMs = Date.now();
@@ -264,8 +285,12 @@ export class TurnReplyCardStore {
       if (event.kind === 'progress' && (terminal || record.finalDelivered)) {
         throw new Error('This turn has finished; progress was not delivered');
       }
+      const allowBackgroundTools = event.kind === 'tools'
+        && event.allowWhileTerminal === true
+        && record.phase === 'completed'
+        && !record.displayRetired;
       if ((event.kind === 'final' && record.finalDelivered)
-        || (terminal && ['tools', 'phase', 'start'].includes(event.kind))) {
+        || (terminal && !allowBackgroundTools && ['tools', 'phase', 'start'].includes(event.kind))) {
         if (event.kind === 'final' && event.source === 'explicit' && record.finalText !== event.text) {
           throw new Error('This turn already delivered a different final answer');
         }
@@ -334,7 +359,7 @@ export class TurnReplyCardStore {
           record.disconnected = event.disconnected;
           if (!displayRetirement && !recovering) delete record.displayRetired;
         }
-      } else if (!terminal) {
+      } else if (!terminal || allowBackgroundTools) {
         if (event.kind === 'tools') {
           record.tools = event.tools;
           const incoming = event.activity ?? event.tools.map(tool => ({ kind: 'tool' as const, id: tool.id }));
@@ -474,6 +499,8 @@ export class TurnReplyCardStore {
           this.write(key, record);
           record.messageId = await publish(record.pendingCreate.content, body => io.send(body, `brc_${this.id(key)}`));
           if (!record.messageId) throw new Error('Missing reply-card message ID');
+          const createdTarget = io.deliveredTarget?.();
+          if (createdTarget) record.deliveredTarget = createdTarget;
           record.lastCard = record.pendingCreate.content;
           delete record.pendingCreate;
           this.write(key, record);

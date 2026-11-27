@@ -56,7 +56,7 @@ const configSchema = z.object({
 }).strict();
 
 async function canonicalDirectory(dataDir: string): Promise<string> {
-  await mkdir(dataDir, { recursive: true });
+  await mkdir(dataDir, { recursive: true, mode: 0o700 });
   return realpath(dataDir);
 }
 

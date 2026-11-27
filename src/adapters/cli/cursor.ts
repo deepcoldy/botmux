@@ -5,6 +5,7 @@ import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { TMUX_INITIAL_PROMPT_ARG_BUDGET, type CliAdapter, type PtyHandle, type StructuredBridgeSpec } from './types.js';
 
+import { busyProbeRegion } from '../../utils/busy-probe.js';
 import { stripAnsiScreenText } from '../../utils/idle-detector.js';
 import { delay } from '../../utils/timing.js';
 import { drainCursorTranscript, findCursorTranscriptByChatId, findCursorTranscriptByPid } from '../../services/cursor-transcript.js';
@@ -40,6 +41,40 @@ export const cursorBridgeSpec: StructuredBridgeSpec = {
 
 /** The mounted composer's placeholder (empty composer); see readyPattern. */
 const CURSOR_EMPTY_COMPOSER = /→\s+(?:Plan, search, build anything|Add a follow-up)/;
+
+/** Active-turn composer row: Cursor renders `rightPlaceholder: "ctrl+c to stop"`
+ *  on the same row as the `→ ` composer prompt while a turn runs, and clears it
+ *  when the turn ends. Requiring both anchors on one row prevents transcript
+ *  prose mentioning `ctrl+c to stop` from pinning an idle session busy. */
+export const CURSOR_BUSY_COMPOSER = /^\s*→\s+.*\bctrl\+c to stop\s*$/im;
+
+/** Cursor's `follow-ups` queue box (`┌─ follow-ups ────┐`), drawn directly
+ *  above the composer while one or more submitted follow-ups remain queued. */
+export const CURSOR_FOLLOW_UPS_PANEL = /^\s*┌─ follow-ups ─+┐\s*$/m;
+
+/** Cursor is visibly still holding input it already accepted: a turn is
+ *  running (`ctrl+c to stop` on the composer row) or its `follow-ups` queue
+ *  panel is drawn. Cursor appends a queued follow-up's `user` record to
+ *  `transcript.jsonl` only after the predecessor turn ends AND the dequeued
+ *  turn's first model step flushes, so unstarted queue heads keep their
+ *  pre-start lease while either signal is visible. */
+export function cursorScreenHoldsSubmittedInput(screen: string): boolean {
+  const region = busyProbeRegion(screen);
+  return CURSOR_BUSY_COMPOSER.test(region) || CURSOR_FOLLOW_UPS_PANEL.test(region);
+}
+
+/** Cursor holds no pending input at all: no turn is running, no `follow-ups`
+ *  panel is drawn, and the bottom composer row shows its empty placeholder. */
+export function cursorScreenShowsNoPendingInput(screen: string): boolean {
+  const region = busyProbeRegion(screen);
+  if (CURSOR_BUSY_COMPOSER.test(region) || CURSOR_FOLLOW_UPS_PANEL.test(region)) return false;
+  const lines = region.split(/\r?\n/);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (!/^\s*→(?:\s|$)/.test(lines[i]!)) continue;
+    return CURSOR_EMPTY_COMPOSER.test(lines[i]!);
+  }
+  return false;
+}
 
 /** True when a stopped Cursor turn left a queued follow-up parked: the turn has
  *  ended, the follow-ups panel offers `enter steer`, and the composer is empty,
@@ -213,6 +248,10 @@ export function createCursorAdapter(pathOverride?: string): CliAdapter {
     },
 
     completionPattern: undefined,
+    busyPattern: CURSOR_BUSY_COMPOSER,
+    idleToBusyPattern: CURSOR_BUSY_COMPOSER,
+    screenHoldsSubmittedInput: cursorScreenHoldsSubmittedInput,
+    screenShowsNoPendingInput: cursorScreenShowsNoPendingInput,
     // The mounted composer's placeholder, matched to prove the real input box
     // exists (unlike the browser-login and startup screens). Once it has
     // appeared at least once the worker may safely type-ahead subsequent Lark

@@ -49,7 +49,9 @@ import {
   isMainThreadApiRequestEvent,
   isIntraTurnAttachmentEvent,
   eventTimeMs,
+  hasTranscriptRole,
   backgroundTaskLaunches,
+  backgroundTaskSettledIds,
   parseTaskNotification,
   isTranscriptRateLimitEvent,
   isSyntheticAssistantRecord,
@@ -57,6 +59,9 @@ import {
   classifyClaudeTerminalEvent,
   apiErrorMessageText,
   AbsorbedReplyCollector,
+  type BackgroundTaskKind,
+  type BackgroundTaskLaunch,
+  type ParsedTaskNotification,
   type ClaudeTerminalOutcome,
   type TranscriptEvent,
 } from './claude-transcript.js';
@@ -163,6 +168,23 @@ export interface BridgePendingTurn {
    *  Unused in thread scope, where the session root is the anchor. For a
    *  background wake: the Lark turn that launched the task. */
   replyAnchorTurnId?: string;
+  /** Durable dispatch attempt of {@link replyAnchorTurnId} when the launching
+   *  Lark turn carried one. Keeps CoT forwarding on the exact `turnId|attempt`
+   *  key of the launching turn instead of superseding its live CoT bubble. */
+  replyAnchorDispatchAttempt?: number;
+  /** Set ONLY on a headless local turn opened by `<task-notification>` when
+   *  EVERY notice opening or folded into the turn (pre-synthesis and mid-turn)
+   *  is a system-origin non-terminal, non-expiry, non-expired event from a
+   *  known non-persistent (`persistent === false`) Monitor, with no mid-turn
+   *  human prompt folded in. Fail-open (unset) for all other turns. */
+  wakeNonTerminalMonitor?: true;
+  /** Sticky CoT anchor that actually received leading `thinking_update`
+   *  entries before this wake turn was synthesised or unrouted. Lets Loop 2
+   *  flush buffered anchor CoT even if `replyAnchorTurnId` was later cleared. */
+  cotAnchor?: BackgroundTaskAnchor;
+  /** Monitor task ids that opened this headless wake (used to disarm
+   *  `wakeNonTerminalMonitor` if any of them is killed mid-wake). */
+  monitorWakeTaskIds?: Set<string>;
   /** Transcript uuid of the user event that started this turn. Stored for
    *  local turns so emit can fetch the user-typed content from the source
    *  jsonl alongside the assistant uuids. Lark turns don't need it because
@@ -245,6 +267,9 @@ export interface BridgePendingTurn {
    *  running (a mid-turn system reminder) instead of starting its own. It has
    *  no reply of its own and ends when that turn ends — see `absorbedTurns`. */
   absorbedIntoTurnId?: string;
+  /** Durable dispatchAttempt of the host turn that absorbed this input
+   *  (`undefined` when absorbed into an ordinary non-durable host turn). */
+  absorbedIntoDispatchAttempt?: number;
   /** uuid of the `attachment(queued_command)` record that folded this turn's
    *  input into the host turn: where its reply starts in the transcript (see
    *  absorbedInputReplyText). Set together with `absorbedIntoTurnId`. */
@@ -293,6 +318,44 @@ export const CLI_QUEUE_HOLD_MAX_MS = 30 * 60_000;
 const CLI_QUEUE_MARK_SKEW_MS = 5_000;
 /** Background-task launch anchors kept per queue (oldest evicted first). */
 const BACKGROUND_TASK_ANCHORS_MAX = 256;
+/** Background-task launch metadata entries kept per queue (oldest evicted first). */
+const BACKGROUND_TASK_META_MAX = 512;
+
+export interface BackgroundTaskAnchor {
+  turnId: string;
+  dispatchAttempt?: number;
+}
+
+export interface BackgroundTaskLaunchMeta {
+  kind: BackgroundTaskKind;
+  persistent?: boolean;
+  expiresAtMs?: number;
+}
+
+/** Read-only side-channel observer for leading thinking/tool records during an
+ *  armed non-terminal Monitor wake BEFORE the first visible text block (and for
+ *  text-less Monitor wakes that close at `turn_duration` with no visible text). */
+export interface PendingWakeCotObserver {
+  onActivity?: (ev: TranscriptEvent, anchor: BackgroundTaskAnchor) => void;
+  onTextlessComplete?: (anchor: BackgroundTaskAnchor) => void;
+}
+
+interface PendingBackgroundWake {
+  anchor: BackgroundTaskAnchor | null;
+  nonTerminalMonitor: boolean;
+  hasAssistantActivity: boolean;
+  /** Sticky anchor that already received at least one `onActivity` CoT event. */
+  emittedAnchorCot?: BackgroundTaskAnchor;
+  /** Non-terminal Monitor task ids observed in this armed wake. */
+  monitorTaskIds: Set<string>;
+}
+
+function sameBackgroundTaskAnchor(
+  a: BackgroundTaskAnchor | undefined | null,
+  b: BackgroundTaskAnchor | undefined | null,
+): boolean {
+  return !!a && !!b && a.turnId === b.turnId && a.dispatchAttempt === b.dispatchAttempt;
+}
 
 /** Change detector for the worker's `background_task_pins_sync` snapshots
  *  (see BridgeTurnQueue.backgroundTaskAnchorTurnIds). It starts as "never
@@ -690,18 +753,25 @@ export class BridgeTurnQueue {
    *  would route cross-topic after a restart. Restored by the worker from the
    *  durable anchor store on startup. */
   private scheduledTaskAnchors = new Map<string, string | undefined>();
-  /** Background task id → Lark turn whose tool_result acked its launch
-   *  (inherited through a scheduled / background-wake turn's own anchor).
-   *  Tasks launched from terminal-typed turns, or before this queue existed,
-   *  have no entry: their wake stays an ordinary local turn. */
-  private backgroundTaskAnchors = new Map<string, string>();
+  /** Background task id → launch metadata (kind, Monitor persistence, timeout
+   *  deadline). Recorded for ALL main-thread launches (including local/zero-
+   *  injection turns and re-attached seeded tasks), independent of whether a
+   *  Lark topic anchor exists. */
+  private backgroundTaskMeta = new Map<string, BackgroundTaskLaunchMeta>();
+  /** Background task id → Lark turn (`turnId` + optional `dispatchAttempt`)
+   *  whose tool_result acked its launch (inherited through a scheduled /
+   *  background-wake turn's own anchor). Tasks launched from terminal-typed
+   *  turns, or before this queue existed, have no entry: their wake stays an
+   *  ordinary local turn. */
+  private backgroundTaskAnchors = new Map<string, BackgroundTaskAnchor>();
   /** Background wake armed by the `<task-notification>`s that opened the next
    *  turn and have not yet produced the visible text that synthesises its
    *  headless turn. Claude may answer several notices in one turn, so this
    *  accumulates: the shared anchor while every notice resolves to the same
-   *  launching Lark turn, `null` (ambiguous — fail closed, stay local) once
-   *  two differ or any one has no anchor, `undefined` when nothing pending. */
-  private pendingBackgroundWake: string | null | undefined;
+   *  launching Lark turn (`null` once two differ or any one has no anchor),
+   *  plus whether every notice so far is a qualifying non-terminal Monitor
+   *  mid-stream event (`nonTerminalMonitor`). `undefined` when nothing pending. */
+  private pendingBackgroundWake: PendingBackgroundWake | undefined;
   /** Records written before this queue existed were written while no worker
    *  of this process was watching: replaying them (journal restore, rotation)
    *  must never open a background-wake delivery. */
@@ -965,13 +1035,68 @@ export class BridgeTurnQueue {
   }
 
   /** Register events as historical — their uuids are now considered seen
-   *  but no attribution happens. Used at attach time to baseline. */
-  absorb(events: TranscriptEvent[]): void {
+   *  but no attribution happens. Used at attach time to baseline. Also retains
+   *  background-task launch metadata (not Lark anchors) so Monitor mid-stream
+   *  events after attach still know whether the Monitor is persistent/bounded.
+   *  When `opts.liveSinceMs` is passed, launches stamped earlier than that CLI
+   *  lifetime floor are ignored (preventing dead-CLI Monitors from leaking on
+   *  `/resume`). */
+  absorb(events: TranscriptEvent[], opts?: { liveSinceMs?: number }): void {
+    const liveSinceMs = opts?.liveSinceMs;
     for (const ev of events) {
       if (ev.uuid) this.seen.add(ev.uuid);
       if (isClaudeTurnDurationEvent(ev)) this.durationMarkerSeen = true;
       if (isMainThreadApiRequestEvent(ev)) this.apiRequestObservedInGeneration = true;
+      const atMs = liveSinceMs !== undefined ? eventTimeMs(ev) : undefined;
+      if (liveSinceMs === undefined || (atMs !== undefined && atMs >= liveSinceMs)) {
+        this.recordBackgroundTaskMetadata(backgroundTaskLaunches(ev));
+      }
+      for (const id of backgroundTaskSettledIds(ev)) this.backgroundTaskMeta.delete(id);
     }
+  }
+
+  /** Seed background-task launch metadata from a re-attach transcript scan
+   *  (metadata only: never writes `seen`, Lark anchors, or turn state). */
+  seedBackgroundTasks(tasks: readonly BackgroundTaskLaunch[]): void {
+    this.recordBackgroundTaskMetadata(tasks);
+  }
+
+  /** Seed background-task launch metadata from a historical event batch,
+   *  ignoring launches older than (or missing timestamps under) `liveSinceMs`. */
+  seedBackgroundTasksFromHistory(events: readonly TranscriptEvent[], liveSinceMs: number): void {
+    for (const ev of events) {
+      const atMs = eventTimeMs(ev);
+      if (atMs === undefined || atMs < liveSinceMs) continue;
+      this.recordBackgroundTaskMetadata(backgroundTaskLaunches(ev));
+      for (const id of backgroundTaskSettledIds(ev)) this.backgroundTaskMeta.delete(id);
+    }
+  }
+
+  /** Forget all tracked background-task metadata, anchors, and any armed wake
+   *  when the backing CLI process is replaced (its background tasks died). */
+  resetBackgroundTasks(): void {
+    this.backgroundTaskMeta.clear();
+    this.backgroundTaskAnchors.clear();
+    this.pendingBackgroundWake = undefined;
+  }
+
+  /** True while a non-terminal Monitor mid-stream wake is armed (pre-text) or
+   *  actively collecting (before `turn_duration`). Keeps the launching turn's
+   *  held CoT bubble open if the Monitor crosses `expiresAtMs` mid-micro-turn. */
+  hasActiveSuppressedMonitorWake(): boolean {
+    if (this.pendingBackgroundWake?.nonTerminalMonitor === true) return true;
+    const running = this.collecting?.closedByDurationMarker ? null : this.collecting;
+    return running?.wakeNonTerminalMonitor === true;
+  }
+
+  /** True while a non-local (IM/API) turn is actively collecting. Prevents
+   *  `computeBackgroundCotHold()` from holding an earlier turn's CoT during a
+   *  brand-new human turn, while excluding Scenario 3 late-recovery continuations
+   *  of an already-terminated launching turn. */
+  hasActiveNonLocalTurn(): boolean {
+    const running = this.collecting?.closedByDurationMarker ? null : this.collecting;
+    return !!running && !running.isLocal && !running.terminalObserved
+      && !this.reattachedFromUnobserved.has(running);
   }
 
   /** Push a new pending turn for the next Lark message. `contentFingerprint`
@@ -1181,12 +1306,17 @@ export class BridgeTurnQueue {
      *  turn identity, so a replayed previous turn's marker cannot settle the
      *  current unread run. Must not mutate the queue or influence attribution. */
     onTurnDurationAttributed?: (ev: TranscriptEvent, turn: BridgePendingTurn) => void,
+    /** Read-only observer for leading thinking/tool records during an armed
+     *  non-terminal Monitor wake before the first visible text block (and for
+     *  text-less Monitor wakes closed by `system/turn_duration`). */
+    pendingWakeObserver?: PendingWakeCotObserver,
   ): void {
     if (sourceJsonlPath && events.length > 0) this.onEventsRead?.(events, sourceJsonlPath);
     let batchMadeUuidProgress = false;
     for (const ev of events) {
       if (ev.type === 'queue-operation') {
         this.observeCliQueueOperation(ev);
+        this.settleBackgroundTasksFromEvent(ev, true);
         continue;
       }
       if (isClaudeApiRequestBlob(ev)) continue;
@@ -1226,14 +1356,14 @@ export class BridgeTurnQueue {
         }
         continue;
       }
-      const role = ev.message?.role ?? ev.type;
-      if (role === 'user') {
+      if (hasTranscriptRole(ev, 'user')) {
         // Built-in CronCreate fire: isMeta + turnOrigin:"scheduled". It is
         // NOT a meaningful human event (fingerprint matching must never bind a
         // pending Lark mark to the scheduler's prompt), but it DOES open a
         // real model turn whose final belongs in the originating Lark thread.
         // Handle it before the isMeaningfulUserEvent filter below.
         if (isScheduledTurnStartEvent(ev)) {
+          this.clearPendingBackgroundWake(pendingWakeObserver);
           this.handleScheduledTurnStart(uuid, ev, sourceJsonlPath);
           continue;
         }
@@ -1257,8 +1387,9 @@ export class BridgeTurnQueue {
         this.handleCronCreateAcks(ev);
         this.recordBackgroundTaskLaunches(ev);
         this.notePendingBackgroundWake(ev);
+        this.settleBackgroundTasksFromEvent(ev, isPureToolResultUserEvent(ev.message?.content));
         if (isClaudeUserInterruptEvent(ev)) {
-          this.pendingBackgroundWake = undefined;
+          this.clearPendingBackgroundWake(pendingWakeObserver);
           this.recentUnobservedTurn = null;
           if (this.collecting && !this.collecting.closedByDurationMarker) {
             const live = this.recordChainUuid(this.collecting, uuid, ev);
@@ -1282,10 +1413,18 @@ export class BridgeTurnQueue {
         if (!isMeaningfulUserEvent(ev)) {
           // Pure tool_result events are intra-turn tool output — never a
           // turn boundary, but the CoT observer wants them for the tool
-          // timeline of the currently-collecting turn.
+          // timeline of the currently-collecting turn (or an armed pre-text
+          // non-terminal Monitor wake that has already emitted assistant work).
           if (isPureToolResultUserEvent(ev.message?.content)) {
             if (this.collecting && onAssistantAttributed) {
               try { onAssistantAttributed(ev, this.collecting); } catch { /* observer channel — never break attribution */ }
+            } else if (!this.collecting
+              && pendingWakeObserver?.onActivity
+              && this.pendingBackgroundWake?.nonTerminalMonitor === true
+              && this.pendingBackgroundWake.hasAssistantActivity
+              && this.pendingBackgroundWake.anchor !== null) {
+              this.pendingBackgroundWake.emittedAnchorCot ??= { ...this.pendingBackgroundWake.anchor };
+              try { pendingWakeObserver.onActivity(ev, { ...this.pendingBackgroundWake.anchor }); } catch { /* observer channel */ }
             }
             if (this.collecting && !this.collecting.terminalObserved && !this.collecting.closedByDurationMarker) {
               const live = this.recordChainUuid(this.collecting, uuid, ev);
@@ -1327,9 +1466,11 @@ export class BridgeTurnQueue {
           }
           continue;
         }
+        this.clearPendingBackgroundWake(pendingWakeObserver);
         this.handleTurnStart(uuid, ev, sourceJsonlPath);
       } else if (ev.type === 'attachment' && ev.attachment?.type === 'queued_command') {
         this.noteAbsorbedBackgroundNotice(ev);
+        this.settleBackgroundTasksFromEvent(ev, false);
         // Type-ahead path: Claude writes `attachment(queued_command)` the
         // moment it dequeues a queued submit, immediately before the
         // assistant text for that turn starts streaming. Equivalent to
@@ -1340,7 +1481,18 @@ export class BridgeTurnQueue {
         // assistant text would either be dropped or attributed to a
         // sibling turn.
         if (isMidTurnAbsorbedQueuedCommand(ev)) {
-          const matched = this.handleAbsorbedInput(ev, sourceJsonlPath);
+          // A human prompt folded into a Monitor wake turn means the model's
+          // reply now answers the human too. Try binding a pending Lark mark
+          // first (which promotes that Lark turn to `collecting` instead of
+          // burying it inside a headless background wake); if the prompt did
+          // not promote a new collecting turn (e.g. local-typed mid-turn input),
+          // fail open by disarming the Monitor wake so its answer is delivered.
+          const beforeHost = this.collecting;
+          if (this.pendingBackgroundWake) this.pendingBackgroundWake.nonTerminalMonitor = false;
+          const matched = this.handleAbsorbedInput(ev, sourceJsonlPath, pendingWakeObserver);
+          if (this.collecting === beforeHost) {
+            this.disarmCollectingMonitorWake();
+          }
           if (!matched) {
             if (this.collecting && !this.collecting.terminalObserved && !this.collecting.closedByDurationMarker) {
               const live = this.recordChainUuid(this.collecting, uuid, ev);
@@ -1362,6 +1514,7 @@ export class BridgeTurnQueue {
           }
           continue;
         }
+        this.clearPendingBackgroundWake(pendingWakeObserver);
         this.handleTurnStart(uuid, ev, sourceJsonlPath);
       } else if (isIntraTurnAttachmentEvent(ev)) {
         if (this.collecting && !this.collecting.terminalObserved && !this.collecting.closedByDurationMarker) {
@@ -1385,14 +1538,17 @@ export class BridgeTurnQueue {
           && matchesRecentUnobservedLineage(ev, sourceJsonlPath, this.recentUnobservedTurn, Date.now())) {
           this.extendRecentUnobservedChain(uuid, ev, true);
         }
-      } else if (role === 'assistant') {
-        // An assistant record after the collecting turn's duration marker opens
-        // the next turn, one that began without a meaningful user line (a
-        // `<task-notification>` wake-up). A live drain has emitted the closed
-        // turn by then; a batch spanning several turns — a rotation switch
-        // replaying what the bridge did not read — must not fold the next
-        // turn's reply into it.
-        if (this.collecting?.closedByDurationMarker) this.collecting = null;
+      } else if (hasTranscriptRole(ev, 'assistant')) {
+        // An assistant record after the collecting turn's duration marker (or
+        // after a markerless turn's `end_turn` once a `<task-notification>`
+        // armed a new background wake) opens the next turn. A live drain has
+        // emitted the closed turn by then; a batch spanning several turns must
+        // not fold the next turn's reply into it.
+        if (this.collecting?.closedByDurationMarker
+          || (this.collecting?.terminalObserved && !this.isAwaitingDurationMarker(this.collecting)
+            && this.pendingBackgroundWake !== undefined)) {
+          this.collecting = null;
+        }
         // Capture CronCreate calls with the topic anchor of the turn that is
         // running them: when the ack returns the task id, fires of that task
         // route back to THIS topic even if other topics receive messages
@@ -1403,7 +1559,9 @@ export class BridgeTurnQueue {
           // anchor (a task (re)created during a scheduled run belongs in that
           // same topic); otherwise the latest started Lark turn; else none.
           const anchor = this.collecting && !this.collecting.isLocal
-            ? this.collecting.turnId
+            ? (this.reattachedFromUnobserved.has(this.collecting) && this.collecting.replyAnchorTurnId
+              ? this.collecting.replyAnchorTurnId
+              : this.collecting.turnId)
             : this.collecting?.isScheduled
               ? this.collecting.replyAnchorTurnId
               : this.lastLarkTurnId;
@@ -1422,8 +1580,8 @@ export class BridgeTurnQueue {
         // and bounded retry are owned by the worker/daemon, respectively.
         if (isTranscriptRateLimitEvent(ev)) {
           // Ends a wake cut before any visible text, like the API-error
-          // records below.
-          this.pendingBackgroundWake = undefined;
+          // records below; flush any leading anchor CoT first.
+          this.clearPendingBackgroundWake(pendingWakeObserver);
           this.recentUnobservedTurn = null;
           if (this.collecting) {
             this.collecting.rateLimited = true;
@@ -1450,7 +1608,7 @@ export class BridgeTurnQueue {
           // a duration marker follows: left armed it would claim whatever
           // headless text comes next — a continuation of the failed turn or
           // an unrelated turn — for the launching topic.
-          this.pendingBackgroundWake = undefined;
+          this.clearPendingBackgroundWake(pendingWakeObserver);
           this.recentUnobservedTurn = null;
           if (this.collecting) {
             const live = this.liveStates.get(this.collecting);
@@ -1522,6 +1680,7 @@ export class BridgeTurnQueue {
               ? {
                   turnId: `late-recovery-${uuid}`,
                   replyAnchorTurnId: anchor.turnId,
+                  ...(anchor.dispatchAttempt !== undefined ? { replyAnchorDispatchAttempt: anchor.dispatchAttempt } : {}),
                   ...(anchor.linkRefMode ? { linkRefMode: anchor.linkRefMode } : {}),
                   started: true,
                   isLocal: false,
@@ -1568,14 +1727,21 @@ export class BridgeTurnQueue {
           // Headless turns have no userUuid; emit-side formatting omits
           // the user block. Inserted at the head of the unstarted region
           // so a subsequent normal turn doesn't get reordered ahead of it.
-          const wakeAnchor = this.pendingBackgroundWake;
+          const wake = this.pendingBackgroundWake;
           this.pendingBackgroundWake = undefined;
           const headless: BridgePendingTurn = {
             turnId: `local-headless-${uuid}`,
             started: true,
             isLocal: true,
-            ...(typeof wakeAnchor === 'string' ? { isBackgroundWake: true, replyAnchorTurnId: wakeAnchor } : {}),
-            ...(wakeAnchor === null ? { backgroundWakeUnrouted: true } : {}),
+            ...(wake?.anchor ? {
+              isBackgroundWake: true,
+              replyAnchorTurnId: wake.anchor.turnId,
+              ...(wake.anchor.dispatchAttempt !== undefined ? { replyAnchorDispatchAttempt: wake.anchor.dispatchAttempt } : {}),
+            } : {}),
+            ...(wake && wake.anchor === null ? { backgroundWakeUnrouted: true } : {}),
+            ...(wake?.nonTerminalMonitor ? { wakeNonTerminalMonitor: true as const } : {}),
+            ...(wake?.emittedAnchorCot ? { cotAnchor: { ...wake.emittedAnchorCot } } : {}),
+            ...(wake?.monitorTaskIds.size ? { monitorWakeTaskIds: new Set(wake.monitorTaskIds) } : {}),
             userUuid: undefined,
             replyContextTurnId: this.lastLocalTurnId,
             precedingLarkTurnId: this.lastLarkTurnId,
@@ -1613,6 +1779,18 @@ export class BridgeTurnQueue {
           if (toolIds.length > 0) live.hasTrailingVisibleText = false;
           else if (hasVisibleText) live.hasTrailingVisibleText = true;
           if (ev.message?.stop_reason === 'pause_turn') live.awaitingPostToolAssistant = true;
+        } else if (this.pendingBackgroundWake) {
+          // Text-less leading assistant record (thinking / tool_use) during an
+          // armed background wake: do not synthesise early, but expose CoT
+          // entries to the anchor observer while the wake stays a pure
+          // non-terminal Monitor mid-stream event.
+          this.pendingBackgroundWake.hasAssistantActivity = true;
+          if (pendingWakeObserver?.onActivity
+            && this.pendingBackgroundWake.nonTerminalMonitor
+            && this.pendingBackgroundWake.anchor !== null) {
+            this.pendingBackgroundWake.emittedAnchorCot ??= { ...this.pendingBackgroundWake.anchor };
+            try { pendingWakeObserver.onActivity(ev, { ...this.pendingBackgroundWake.anchor }); } catch { /* observer channel */ }
+          }
         }
         if (hasVisibleText) this.collecting?.assistantUuids.push(uuid);
         if (this.collecting && onAssistantAttributed) {
@@ -1639,8 +1817,9 @@ export class BridgeTurnQueue {
         // as the next-turn-start compatibility boundary below.
         if (isClaudeTurnDurationEvent(ev)) {
           this.durationMarkerSeen = true;
-          // A wake turn that ended without visible text has nothing to forward.
-          this.pendingBackgroundWake = undefined;
+          // Flush any anchor CoT buffered during a text-less pre-text wake
+          // (even if the wake was later disarmed mid-turn) before clearing it.
+          this.clearPendingBackgroundWake(pendingWakeObserver);
         }
         if (this.collecting) {
           const live = this.recordChainUuid(this.collecting, uuid, ev);
@@ -1707,87 +1886,248 @@ export class BridgeTurnQueue {
     }
   }
 
-  /** File the Lark anchor of the running turn under each background task a
-   *  main-thread tool_result just acked as launched. A wake turn that has not
-   *  said anything yet has no headless turn collecting; the wake it armed is
-   *  what is running, so its launches inherit that anchor (never an ambiguous
-   *  one). */
+  private recordBackgroundTaskMetadata(launches: Iterable<BackgroundTaskLaunch>): void {
+    for (const launch of launches) {
+      this.backgroundTaskMeta.delete(launch.taskId);
+      this.backgroundTaskMeta.set(launch.taskId, {
+        kind: launch.kind,
+        ...(launch.persistent !== undefined ? { persistent: launch.persistent } : {}),
+        ...(launch.expiresAtMs !== undefined ? { expiresAtMs: launch.expiresAtMs } : {}),
+      });
+    }
+    while (this.backgroundTaskMeta.size > BACKGROUND_TASK_META_MAX) {
+      this.backgroundTaskMeta.delete(this.backgroundTaskMeta.keys().next().value!);
+    }
+  }
+
+  /** File the launch metadata (always) and Lark anchor (when known) of the
+   *  running turn under each background task a main-thread tool_result just
+   *  acked as launched. A wake turn that has not said anything yet has no
+   *  headless turn collecting; the wake it armed is what is running, so its
+   *  launches inherit that anchor (never an ambiguous one). */
   private recordBackgroundTaskLaunches(ev: TranscriptEvent): void {
     const launches = backgroundTaskLaunches(ev);
     if (launches.length === 0) return;
-    const running = this.collecting;
-    const anchor = running && !running.isLocal
-      ? running.turnId
-      : running?.isScheduled || running?.isBackgroundWake ? running.replyAnchorTurnId
-      : !running && typeof this.pendingBackgroundWake === 'string' ? this.pendingBackgroundWake
-      : undefined;
-    if (anchor === undefined) return;
+    this.recordBackgroundTaskMetadata(launches);
+    const running = this.collecting?.closedByDurationMarker ? null : this.collecting;
+    const isLateRecovery = !!running && this.reattachedFromUnobserved.has(running) && !!running.replyAnchorTurnId;
+    const anchor: BackgroundTaskAnchor | undefined = running && !running.isLocal
+      ? {
+        turnId: isLateRecovery ? running.replyAnchorTurnId! : running.turnId,
+        ...((isLateRecovery ? running.replyAnchorDispatchAttempt : running.dispatchAttempt) !== undefined
+          ? { dispatchAttempt: isLateRecovery ? running.replyAnchorDispatchAttempt : running.dispatchAttempt }
+          : {}),
+      }
+      : (running?.isScheduled || running?.isBackgroundWake) && running.replyAnchorTurnId
+        ? {
+          turnId: running.replyAnchorTurnId,
+          ...(running.replyAnchorDispatchAttempt !== undefined ? { dispatchAttempt: running.replyAnchorDispatchAttempt } : {}),
+        }
+        : !running && this.pendingBackgroundWake?.anchor
+          ? this.pendingBackgroundWake.anchor
+          : undefined;
+    if (!anchor) return;
     for (const launch of launches) {
       this.backgroundTaskAnchors.delete(launch.taskId);
-      this.backgroundTaskAnchors.set(launch.taskId, anchor);
+      this.backgroundTaskAnchors.set(launch.taskId, { ...anchor });
     }
     while (this.backgroundTaskAnchors.size > BACKGROUND_TASK_ANCHORS_MAX) {
       this.backgroundTaskAnchors.delete(this.backgroundTaskAnchors.keys().next().value!);
     }
   }
 
-  /** A delivered main-thread `role:user` `<task-notification>` that OPENS a
-   *  turn (nothing collecting, or the last turn closed by its duration marker)
-   *  for a task with a known launch anchor arms a background wake for the
-   *  headless turn its reply synthesises. A notice folded into a running turn,
-   *  a sidechain one, one written before this queue existed, one not written
-   *  by Claude Code itself (`promptSource` other than `system`: a typed
-   *  message that merely starts with the tag), or one for a task without an
-   *  anchor arms nothing — and, since Claude may answer every notice that piled
-   *  up in one turn, also disarms any wake already pending: a mixed or
-   *  cross-topic answer has no single safe destination.
-   *
-   *  The `attachment(queued_command, commandMode:'task-notification')` form
-   *  never arms (see {@link noteAbsorbedBackgroundNotice}): current Claude Code
-   *  writes it only for a notice absorbed into a turn already running. */
-  private notePendingBackgroundWake(ev: TranscriptEvent): void {
-    if (ev.isSidechain === true || ev.type !== 'user') return;
-    const notice = parseTaskNotification(ev);
-    if (!notice) return;
-    const opensTurn = !this.collecting || this.collecting.closedByDurationMarker === true;
-    if (!opensTurn) this.unrouteCollectingWake(this.backgroundTaskAnchors.get(notice.taskId));
+  /** Strict predicate for whether a delivered `<task-notification>` is a pure
+   *  non-terminal mid-stream event from a known non-persistent (`persistent:
+   *  false`) Monitor that has not reached its expiry boundary. Fails open
+   *  (`false`) on any uncertainty (including missing event timestamp when the
+   *  Monitor carries an `expiresAtMs` deadline) so terminal/persistent/expired
+   *  notices are never suppressed. */
+  private isNonTerminalMonitorNotice(ev: TranscriptEvent, notice: ParsedTaskNotification): boolean {
+    if (ev.type !== 'attachment' && ev.promptSource !== 'system') return false;
+    if (notice.hasTerminalStatus || notice.isMonitorExpiry) return false;
+    const meta = this.backgroundTaskMeta.get(notice.taskId);
+    if (!meta || meta.kind !== 'monitor' || meta.persistent !== false) return false;
     const atMs = eventTimeMs(ev);
-    const anchor = opensTurn && ev.promptSource === 'system' && atMs !== undefined && atMs >= this.liveSinceMs
-      ? this.backgroundTaskAnchors.get(notice.taskId)
-      : undefined;
-    const pending = this.pendingBackgroundWake;
-    this.pendingBackgroundWake = anchor !== undefined && (pending === undefined || pending === anchor)
-      ? anchor
-      : null;
+    if (meta.expiresAtMs !== undefined && (atMs === undefined || atMs >= meta.expiresAtMs)) return false;
+    return true;
   }
 
-  /** A `<task-notification>` Claude Code folded into a turn already under way
-   *  (`attachment(queued_command)`, commandMode `task-notification`): the
-   *  turn's answer now covers that task too. It only ever DISARMS — a wake
-   *  armed or collecting for another topic, or for a task this notice cannot
-   *  vouch for (no anchor), has no single safe destination any more and stays
-   *  an ordinary local turn. A notice of a task from the same launching turn
-   *  changes nothing. */
-  private noteAbsorbedBackgroundNotice(ev: TranscriptEvent): void {
-    if (ev.isSidechain === true || ev.attachment?.commandMode !== 'task-notification') return;
+  /** Clear `pendingBackgroundWake` and flush any anchor CoT that already
+   *  streamed pre-text records to `pendingWakeObserver`. */
+  private clearPendingBackgroundWake(pendingWakeObserver?: PendingWakeCotObserver): void {
+    const cotAnchor = this.pendingBackgroundWake?.emittedAnchorCot
+      ? { ...this.pendingBackgroundWake.emittedAnchorCot }
+      : undefined;
+    this.pendingBackgroundWake = undefined;
+    if (cotAnchor && pendingWakeObserver?.onTextlessComplete) {
+      try { pendingWakeObserver.onTextlessComplete(cotAnchor); } catch { /* observer channel */ }
+    }
+  }
+
+  /** Retire settled background tasks from `backgroundTaskMeta` so late notices
+   *  fail open, and disarm any active/armed Monitor wake when Claude explicitly
+   *  stops a task (`TaskStop`) or the TUI kills the wake's own Monitor. */
+  private settleBackgroundTasksFromEvent(ev: TranscriptEvent, disarmActiveWake: boolean): void {
+    const settled = backgroundTaskSettledIds(ev);
+    if (settled.length === 0) return;
+    for (const id of settled) this.backgroundTaskMeta.delete(id);
+    if (!disarmActiveWake) return;
+    const isTaskStop = hasTranscriptRole(ev, 'user') && isPureToolResultUserEvent(ev.message?.content);
+    const running = this.collecting?.closedByDurationMarker ? null : this.collecting;
+    if (isTaskStop) {
+      if (this.pendingBackgroundWake) this.pendingBackgroundWake.nonTerminalMonitor = false;
+      this.disarmCollectingMonitorWake();
+      return;
+    }
+    // `queue-operation: enqueue` (e.g. TUI kill): disarm only if one of the
+    // settled task ids belongs to the currently armed/collecting Monitor wake.
+    if (this.pendingBackgroundWake?.nonTerminalMonitor
+      && settled.some(id => this.pendingBackgroundWake!.monitorTaskIds.has(id))) {
+      this.pendingBackgroundWake.nonTerminalMonitor = false;
+    }
+    if (running?.wakeNonTerminalMonitor
+      && settled.some(id => running.monitorWakeTaskIds?.has(id) === true)) {
+      delete running.wakeNonTerminalMonitor;
+    }
+  }
+
+  /** True when `this.collecting` is no longer open for a new `<task-notification>`
+   *  to fold into (nothing collecting, closed by `system/turn_duration`, or a
+   *  markerless turn that already observed `end_turn`). */
+  private isCollectingClosedForWake(): boolean {
+    return !this.collecting
+      || this.collecting.closedByDurationMarker === true
+      || (this.collecting.terminalObserved === true && !this.isAwaitingDurationMarker(this.collecting));
+  }
+
+  /** A delivered main-thread `role:user` `<task-notification>` that OPENS a
+   *  turn (nothing collecting, or the last turn already terminated) for a task
+   *  with a known launch anchor arms a background wake for the headless turn
+   *  its reply synthesises. Independently of Lark anchoring, it tracks whether
+   *  EVERY notice opening this turn is a qualifying non-terminal Monitor
+   *  mid-stream event (`nonTerminalMonitor`). A notice folded into a running
+   *  turn, a sidechain one, one written before this queue existed, one not
+   *  written by Claude Code itself (`promptSource` other than `system`), or
+   *  one for a task without an anchor arms no Lark route — and any mixed or
+   *  id-less batch fails open regardless of arrival order. */
+  private notePendingBackgroundWake(ev: TranscriptEvent): void {
+    if (ev.isSidechain === true || !hasTranscriptRole(ev, 'user')) return;
+    const opensTurn = this.isCollectingClosedForWake();
     const notice = parseTaskNotification(ev);
-    if (!notice) return;
-    const anchor = this.backgroundTaskAnchors.get(notice.taskId);
-    if (typeof this.pendingBackgroundWake === 'string' && this.pendingBackgroundWake !== anchor) {
-      this.pendingBackgroundWake = null;
+    if (!notice) {
+      // Defensive fail-open: an id-less `<task-notification>` still poisons a
+      // wake batch regardless of whether it arrived before or after a Monitor
+      // notice, without retroactively mutating an already-closed turn.
+      if (!isPureToolResultUserEvent(ev.message?.content)
+        && extractTurnStartText(ev).trimStart().startsWith('<task-notification>')) {
+        if (opensTurn) {
+          this.pendingBackgroundWake = {
+            anchor: null,
+            nonTerminalMonitor: false,
+            hasAssistantActivity: this.pendingBackgroundWake?.hasAssistantActivity ?? false,
+            ...(this.pendingBackgroundWake?.emittedAnchorCot ? { emittedAnchorCot: this.pendingBackgroundWake.emittedAnchorCot } : {}),
+            monitorTaskIds: this.pendingBackgroundWake?.monitorTaskIds ?? new Set(),
+          };
+        } else {
+          this.unrouteCollectingWake(undefined);
+          this.disarmCollectingMonitorWake();
+        }
+      }
+      return;
+    }
+    const isNonTerminalMon = this.isNonTerminalMonitorNotice(ev, notice);
+    if (!opensTurn) {
+      this.unrouteCollectingWake(this.backgroundTaskAnchors.get(notice.taskId));
+      if (!isNonTerminalMon) this.disarmCollectingMonitorWake();
+      return;
+    }
+    const atMs = eventTimeMs(ev);
+    const liveAnchor = ev.promptSource === 'system' && atMs !== undefined && atMs >= this.liveSinceMs
+      ? this.backgroundTaskAnchors.get(notice.taskId)
+      : undefined;
+    const prev = this.pendingBackgroundWake;
+    if (!prev) {
+      this.pendingBackgroundWake = {
+        anchor: liveAnchor ? { ...liveAnchor } : null,
+        nonTerminalMonitor: isNonTerminalMon,
+        hasAssistantActivity: false,
+        monitorTaskIds: new Set(isNonTerminalMon ? [notice.taskId] : []),
+      };
+    } else {
+      const monitorTaskIds = prev.monitorTaskIds;
+      if (isNonTerminalMon) monitorTaskIds.add(notice.taskId);
+      this.pendingBackgroundWake = {
+        anchor: sameBackgroundTaskAnchor(prev.anchor, liveAnchor) ? prev.anchor : null,
+        nonTerminalMonitor: prev.nonTerminalMonitor && isNonTerminalMon,
+        hasAssistantActivity: prev.hasAssistantActivity,
+        ...(prev.emittedAnchorCot ? { emittedAnchorCot: prev.emittedAnchorCot } : {}),
+        monitorTaskIds,
+      };
+    }
+  }
+
+  /** A `<task-notification>` Claude Code folded into a turn via
+   *  `attachment(queued_command)` (with `commandMode: 'task-notification'` OR
+   *  whose prompt starts with `<task-notification>`): the turn's answer now
+   *  covers that task too. It only ever DISARMS — never arms an anchor or
+   *  suppression — and poisons `pendingBackgroundWake` even if it arrives
+   *  before a `role:user` Monitor notice while idle, without mutating a turn
+   *  already closed by `turn_duration`. */
+  private noteAbsorbedBackgroundNotice(ev: TranscriptEvent): void {
+    if (ev.isSidechain === true) return;
+    const isTaskNoticeAttachment = ev.attachment?.commandMode === 'task-notification'
+      || extractTurnStartText(ev).trimStart().startsWith('<task-notification>');
+    if (!isTaskNoticeAttachment) return;
+    const opensTurn = this.isCollectingClosedForWake();
+    const notice = parseTaskNotification(ev);
+    const anchor = notice ? this.backgroundTaskAnchors.get(notice.taskId) : undefined;
+    const isNonTerminalMon = notice !== undefined && this.isNonTerminalMonitorNotice(ev, notice);
+    if (opensTurn) {
+      if (this.pendingBackgroundWake) {
+        if (this.pendingBackgroundWake.anchor !== null
+          && !sameBackgroundTaskAnchor(this.pendingBackgroundWake.anchor, anchor)) {
+          this.pendingBackgroundWake.anchor = null;
+        }
+        if (!isNonTerminalMon) this.pendingBackgroundWake.nonTerminalMonitor = false;
+        else if (notice) this.pendingBackgroundWake.monitorTaskIds.add(notice.taskId);
+      } else {
+        // Poison when idle so a subsequent role:user Monitor notice in the same
+        // batch cannot arm suppression or single-topic routing over this notice.
+        this.pendingBackgroundWake = {
+          anchor: null,
+          nonTerminalMonitor: false,
+          hasAssistantActivity: false,
+          monitorTaskIds: new Set(),
+        };
+      }
+      return;
     }
     this.unrouteCollectingWake(anchor);
+    if (!isNonTerminalMon) this.disarmCollectingMonitorWake();
   }
 
   /** A notice folded into the collecting wake turn whose launch anchor differs
    *  (or is unknown): the merged answer no longer belongs to one topic, so the
    *  turn falls back to an ordinary local turn (logged as unrouted). */
-  private unrouteCollectingWake(noticeAnchor: string | undefined): void {
-    const running = this.collecting;
-    if (!running?.isBackgroundWake || running.replyAnchorTurnId === noticeAnchor) return;
+  private unrouteCollectingWake(noticeAnchor: BackgroundTaskAnchor | undefined): void {
+    const running = this.collecting?.closedByDurationMarker ? null : this.collecting;
+    if (!running?.isBackgroundWake) return;
+    const current: BackgroundTaskAnchor | undefined = running.replyAnchorTurnId
+      ? {
+        turnId: running.replyAnchorTurnId,
+        ...(running.replyAnchorDispatchAttempt !== undefined ? { dispatchAttempt: running.replyAnchorDispatchAttempt } : {}),
+      }
+      : undefined;
+    if (sameBackgroundTaskAnchor(current, noticeAnchor)) return;
     delete running.isBackgroundWake;
     delete running.replyAnchorTurnId;
+    delete running.replyAnchorDispatchAttempt;
     running.backgroundWakeUnrouted = true;
+  }
+
+  private disarmCollectingMonitorWake(): void {
+    const running = this.collecting?.closedByDurationMarker ? null : this.collecting;
+    if (running?.wakeNonTerminalMonitor) delete running.wakeNonTerminalMonitor;
   }
 
   /** Distinct Lark turns that the given (still running) background tasks
@@ -1800,7 +2140,7 @@ export class BridgeTurnQueue {
     const live = new Set(liveTaskIds);
     const out = new Set<string>();
     for (const [taskId, anchor] of this.backgroundTaskAnchors) {
-      if (live.has(taskId)) out.add(anchor);
+      if (live.has(taskId)) out.add(anchor.turnId);
     }
     return [...out];
   }
@@ -1965,7 +2305,11 @@ export class BridgeTurnQueue {
    *  real turn start — and end it together with the turn that absorbed it;
    *  otherwise the mark expires unmatched and its turn never gets a terminal.
    *  A non-matching or unfingerprinted mark is left alone. */
-  private handleAbsorbedInput(ev: TranscriptEvent, sourceJsonlPath?: string): boolean {
+  private handleAbsorbedInput(
+    ev: TranscriptEvent,
+    sourceJsonlPath?: string,
+    pendingWakeObserver?: PendingWakeCotObserver,
+  ): boolean {
     const next = this.queue.find(t => !t.started);
     if (!next?.contentFingerprint) return false;
     const evaluations = evaluateMarksAgainstTranscript(
@@ -1988,8 +2332,30 @@ export class BridgeTurnQueue {
     if (!next.sourceJsonlPath) next.sourceJsonlPath = sourceJsonlPath;
     next.markTimeMs = eventTimeMs;
     const host = this.collecting;
-    if (host && !host.terminalObserved) {
+    if (host && !host.terminalObserved
+      && host.isLocal && !host.userUuid && (host.wakeNonTerminalMonitor || host.isBackgroundWake)) {
+      // A real Lark turn folded mid-turn into a headless background-wake turn:
+      // promote the Lark turn to own subsequent output instead of burying it
+      // inside `host.absorbedTurns` (which would swallow it in send mode or
+      // misroute it to the Monitor's launching topic in transcript mode).
+      host.terminalObserved = true;
+      const hostLive = this.liveStates.get(host);
+      if (hostLive) {
+        hostLive.pendingToolUseIds.clear();
+        hostLive.apiRequestInFlight = false;
+        hostLive.awaitingPostToolAssistant = false;
+      }
+      this.clearPendingBackgroundWake(pendingWakeObserver);
+      this.recentUnobservedTurn = null;
+      this.collecting = next;
+      if (typeof ev.uuid === 'string' && ev.uuid) {
+        const live = this.recordChainUuid(next, ev.uuid, ev);
+        live.startUuid = ev.uuid;
+        live.awaitingPostToolAssistant = true;
+      }
+    } else if (host && !host.terminalObserved) {
       next.absorbedIntoTurnId = host.turnId;
+      if (host.dispatchAttempt !== undefined) next.absorbedIntoDispatchAttempt = host.dispatchAttempt;
       if (typeof ev.uuid === 'string' && ev.uuid) next.absorbedAtUuid = ev.uuid;
       const activitySeq = host.attributedActivitySeq ?? 0;
       const previous = host.absorbedTurns?.at(-1);
@@ -2004,6 +2370,7 @@ export class BridgeTurnQueue {
     } else {
       // Nothing is collecting (e.g. the worker restarted mid-turn and lost the
       // running turn): what the model does from here on answers this input.
+      this.clearPendingBackgroundWake(pendingWakeObserver);
       this.recentUnobservedTurn = null;
       this.collecting = next;
       if (typeof ev.uuid === 'string' && ev.uuid) {

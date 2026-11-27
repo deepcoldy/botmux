@@ -619,9 +619,10 @@ Edit it visually in Dashboard "Bot Config → Message Cards → Final answer fee
 | `senderTagHideEmail` | Off by default. When on, the `<sender>` tag leaves out the email; name and ID stay |
 | `hideLocalAddresses` | Off by default: model replies reach Feishu as written. When on, host paths and local service addresses are kept out of replies. See [Hide development host addresses](#hide-local-addresses) below |
 | `promptInjection` | `"default"` (default) or `"none"`. `none` is zero-injection mode: botmux adds no system prompt or reminders, passes only the task and attachments, and forwards the final answer automatically. See below |
-| `envelopeInjection` | Claude Code only: `auto` moves the per-turn reminder into a hook, so the terminal input box shows only the message itself. Default `off` keeps it as is |
-| `topicUnavailablePolicy` | What to do when the original topic is deleted or unavailable. See [Topic unavailable policy](/en/topic-unavailable-policy) |
+| `topicUnavailablePolicy` | What to do when the original topic is unavailable. See [Topic unavailable policy](/en/topic-unavailable-policy) |
 | `turnResults` | Structured per-turn results for external systems to read. See [Turn results](/en/turn-results) |
+
+> For Claude Code on local backends with the `UserPromptSubmit` hook installed, per-turn context injection via hook is now enabled by default (falling back automatically to inline when zero-injection is set, on remote backends, in non-loopback sandboxes, or when the hook is absent). Legacy `envelopeInjection` entries in existing `bots.json` files are compatibly ignored without errors.
 
 ### Auto-forward final reply (`replyDelivery: "transcript"`)
 
@@ -692,7 +693,7 @@ When off (the default), replies and cards are sent as written and no related rul
 - Reply processing and the per-turn reminder apply immediately; the full rule in the system prompt applies from the next new session.
 - The Dashboard switch "Bot Config → Message Cards → Development host addresses" writes this field.
 
-### Zero prompt injection (`promptInjection: "none"`)
+### Zero prompt injection (`promptInjection: "none"`) {#zero-prompt-injection}
 
 For multi-agent pipelines where a lead bot hands out work and sub-bots just execute, or whenever you don't want botmux adding anything to the prompt.
 

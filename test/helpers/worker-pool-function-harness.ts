@@ -9,13 +9,17 @@ import { controllerForSession } from '../../src/core/session-controller.js';
 import { activeSessionKey } from '../../src/core/types.js';
 import { isCodexAppCliId } from '../../src/adapters/cli/types.js';
 import { contractTerminalStatus, executionObserverSupported, sameExecution } from '../../src/services/session-contract.js';
+import { decideCodexAppSettlementActivationToken } from '../../src/services/queued-activation-reconcile.js';
 import { hasConfirmedNativeGrokEffort, noteExplicitEffortPreferenceEdit } from '../../src/core/terminal-effort-writeback.js';
 import { assertSessionLaunchModelChoiceAllowed } from '../../src/core/session-model.js';
 import { cliModelMayKeepReasoningEffort } from '../../src/services/codex-reasoning-effort.js';
 import { runtimeStartRefusal } from '../../src/services/runtime-reservation.js';
 import { cotMessageFinishStatus } from '../../src/im/lark/cot-message.js';
 import { resetStartingCardHealth } from '../../src/core/starting-card-health.js';
+import { isStructuredNoticeProtocolMessage } from '../../src/services/structured-notice-protocol.js';
 import { ProtectedResultStore } from '../../src/services/protected-result-store.js';
+import { scheduledSessionRunWithEvidence, settleScheduledSessionRun } from '../../src/core/scheduled-send.js';
+import { findScheduleRunTrigger } from '../../src/services/schedule-run-log-store.js';
 
 /** deliverFinalOutput's protected final gate reads `config.session.dataDir` and
  * constructs ProtectedResultStore. Sliced closures do not load module imports,
@@ -53,6 +57,10 @@ const WORKER_POOL_WEAK_CONTAINERS: Record<string, () => WeakMap<object, any> | W
   inFlightStreamingCardPatchVisibleStatus: () => new WeakMap(),
   completedTerminalTurns: () => new WeakMap(),
   postTerminalDirectSubmitSessions: () => new WeakSet(),
+  // Streaming-card idempotent-uuid module-scope state (worker-pool.ts). Sliced
+  // lifecycle closures such as clearWorkerRuntimeProvenance reach these.
+  activeReadyFallbackTokens: () => new WeakMap(),
+  dedupReconcileRetryTimers: () => new WeakMap(),
 };
 
 function resolvePoolDependency(scope: Record<string, any>, key: string | symbol): unknown {
@@ -66,7 +74,9 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
   if (key === 'activeSessionKey') return activeSessionKey;
   if (key === 'runtimeStartRefusal') return runtimeStartRefusal;
   if (key === 'cotMessageFinishStatus') return cotMessageFinishStatus;
+  if (key === 'hasCotMessageForTurn') return () => false;
   if (key === 'resetStartingCardHealth') return resetStartingCardHealth;
+  if (key === 'isStructuredNoticeProtocolMessage') return isStructuredNoticeProtocolMessage;
   if (key === 'cancelAntigravityRotationReplay') return cancelAntigravityRotationReplay;
   if (key === 'clearInFlightAntigravityRotation') return clearInFlightAntigravityRotation;
   if (key === 'formatAntigravityCooldown') return formatAntigravityCooldown;
@@ -78,21 +88,33 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
   if (key === 'executionObserverSupported') return executionObserverSupported;
   if (key === 'contractTerminalStatus') return contractTerminalStatus;
   if (key === 'sameExecution') return sameExecution;
+  if (key === 'decideCodexAppSettlementActivationToken') return decideCodexAppSettlementActivationToken;
+  if (typeof key === 'string' && [
+    'ownsCodexAppSettlementActivation',
+    'matchCodexAppSettlementActivationToken',
+    'settleCodexAppQueuedActivationIfMatched',
+  ].includes(key)) {
+    return scope[key] ??= loadWorkerPoolClosure(key, scope);
+  }
   if (key === 'hasConfirmedNativeGrokEffort') return hasConfirmedNativeGrokEffort;
   if (key === 'noteExplicitEffortPreferenceEdit') return noteExplicitEffortPreferenceEdit;
   if (key === 'assertSessionLaunchModelChoiceAllowed') return assertSessionLaunchModelChoiceAllowed;
   if (key === 'cliModelMayKeepReasoningEffort') return cliModelMayKeepReasoningEffort;
   if (key === 'config') return { terminalEffortWriteback: false, session: { dataDir: getHarnessDataDir() } };
   if (key === 'ProtectedResultStore') return ProtectedResultStore;
+  if (key === 'scheduledSessionRunWithEvidence') return scheduledSessionRunWithEvidence;
+  if (key === 'settleScheduledSessionRun') return settleScheduledSessionRun;
+  if (key === 'findScheduleRunTrigger') return findScheduleRunTrigger;
   if (key === 'pendingOrdinaryImDeliveries') return scope.pendingOrdinaryImDeliveries ??= new Map();
   if (key === 'workerCommittedTurnIds') return scope.workerCommittedTurnIds ??= new WeakMap();
   if (key === 'collectSessionTurnGarbage') return () => {};
   if (typeof key === 'string' && ['canForkRegisteredSession', 'ownsCodexAppFinalDelivery', 'completeWorkerOrdinaryImDelivery',
     'clearOrdinaryImDelivery', 'recordWorkerCommittedTurn', 'speculateStatuslineLaunchGen',
     'recordLaunchModel', 'assistantLiveInputAdmission', 'assistantTransferInputDeliveryAllowed',
-    'releaseHeldCotMessage', 'isReplayOfHeldCotTerminal', 'finalizeOrHoldCotMessage',
+    'releaseHeldCotMessage', 'isReplayOfHeldCotTerminal', 'isSynthesizedBackgroundTurnId', 'finalizeOrHoldCotMessage',
     'requiredReplyCotHoldKey', 'settleRequiredReplyBackground', 'settleRequiredReplyCotMessage',
-    'failRequiredReplyCotHolds', 'clearWorkerRuntimeProvenance'].includes(key)) {
+    'failRequiredReplyCotHolds', 'clearWorkerRuntimeProvenance', 'clearDedupReconcileRetryTimer',
+    'scheduledRunForWorker', 'scheduledRunsForWorker', 'scheduledRunTriggerForWorker', 'settleScheduledRunBinding'].includes(key)) {
     return scope[key] ??= loadWorkerPoolFunction(key, scope);
   }
   return (globalThis as any)[key];

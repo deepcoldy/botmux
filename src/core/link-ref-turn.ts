@@ -2,6 +2,7 @@ import { closeSync, constants, fstatSync, openSync, readFileSync } from 'node:fs
 import { extname } from 'node:path';
 import type { LarkAttachment, CliTurnPayload } from '../types.js';
 import type { LinkRefRuntime } from '../services/link-ref-runtime.js';
+import { rekeyPromptContextWithFallback } from '../services/prompt-context-store.js';
 import type {
   LinkRefMode,
   LinkRefSourceInput,
@@ -90,7 +91,8 @@ export function prepareLinkRefTurnPayload(input: {
   mode: LinkRefMode;
   payload: CliTurnPayload;
 }): CliTurnPayload {
-  return input.runtime.prepareTurn({
+  const previousContent = input.payload.content;
+  const prepared = input.runtime.prepareTurn({
     key: input.key,
     mode: input.mode,
     payload: input.payload.linkRefs?.sources
@@ -104,4 +106,20 @@ export function prepareLinkRefTurnPayload(input: {
         }
       : input.payload,
   });
+  if (prepared.content !== previousContent) {
+    const rekeyed = rekeyPromptContextWithFallback({
+      sessionId: input.key.sessionId,
+      turnId: input.key.turnId,
+      previousPtyText: previousContent,
+      nextPtyText: prepared.content,
+      hookEnvelope: input.payload.hookEnvelope,
+    });
+    const { hookEnvelope: _previousEnvelope, ...withoutEnvelope } = prepared;
+    return {
+      ...withoutEnvelope,
+      content: rekeyed.content,
+      ...(rekeyed.hookEnvelope ? { hookEnvelope: rekeyed.hookEnvelope } : {}),
+    };
+  }
+  return prepared;
 }

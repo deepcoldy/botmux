@@ -3,6 +3,29 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+const clientMocks = vi.hoisted(() => ({
+  replyMessage: vi.fn(async () => 'om_inline_reply'),
+  sendMessage: vi.fn(async () => 'om_inline_outer'),
+  updateMessage: vi.fn(async () => undefined),
+  uploadFile: vi.fn(async () => 'file_key_inline'),
+}));
+
+vi.mock('../src/im/lark/client.js', async () => {
+  const actual = await vi.importActual<any>('../src/im/lark/client.js');
+  return {
+    ...actual,
+    replyMessage: clientMocks.replyMessage,
+    sendMessage: clientMocks.sendMessage,
+    updateMessage: clientMocks.updateMessage,
+    uploadFile: clientMocks.uploadFile,
+  };
+});
+
+import { config } from '../src/config.js';
+import { registerBot } from '../src/bot-registry.js';
+import { replyCardAskTarget } from '../src/core/turn-reply-ask.js';
+import { TurnReplyCardStore } from '../src/services/turn-reply-card.js';
+
 import {
   _resetForTest,
   listPendingAsksByAnchor,
@@ -24,6 +47,7 @@ import { codexAsyncAnswerNeedsRawInput, codexAsyncAskOriginEligible } from '../s
 import * as sessionControllers from '../src/core/session-controller.js';
 import { SessionContractStore } from '../src/services/session-contract-store.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { NATIVE_STANDALONE_ASK_ORIGIN } from '../src/core/ask-types.js';
 
 // 执行 daemon.ts 里真实的 handleAskRequest，配真实 broker / 显式 ask 回执 / 飞书发卡器，
 // 只把飞书发送接口换成记录器：断言卡片实际发到哪、文字答复能否结算。
@@ -53,12 +77,20 @@ function askBody(originTurnId: string, extra: Record<string, unknown> = {}) {
 
 describe('chat-scope 会话里 ask 卡片跟随发起 turn 的冻结回复目标', () => {
   let dir: string;
+  let prevDataDir: string;
   let continuation: ReturnType<typeof createExplicitAskContinuation>;
   const sent: Array<{ via: 'reply' | 'send'; target: string }> = [];
 
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), 'ask-chat-scope-'));
+    prevDataDir = config.session.dataDir;
+    config.session.dataDir = dir;
     sent.length = 0;
+    clientMocks.replyMessage.mockClear();
+    clientMocks.sendMessage.mockClear();
+    clientMocks.updateMessage.mockClear();
+    clientMocks.uploadFile.mockClear();
+    registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code' });
     setCanTalkChecker(() => true);
     setCardDispatcher(createLarkAskCardDispatcher({
       replyMessage: (async (_app: string, root: string) => { sent.push({ via: 'reply', target: root }); return `om_card_${sent.length}`; }) as any,
@@ -71,6 +103,7 @@ describe('chat-scope 会话里 ask 卡片跟随发起 turn 的冻结回复目标
   });
   afterEach(() => {
     _resetForTest();
+    config.session.dataDir = prevDataDir;
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -80,6 +113,7 @@ describe('chat-scope 会话里 ask 卡片跟随发起 turn 的冻结回复目标
       readJsonBody: async () => body,
       jsonRes: (_res: unknown, status: number, payload: unknown) => { responses.push({ status, payload }); },
       parseAskBody,
+      NATIVE_STANDALONE_ASK_ORIGIN,
       findActiveBySessionId: (id: string) => id === ds.session.sessionId ? ds : undefined,
       shouldReturnAskStartupNotReady: () => false,
       isTrustedHostIpcRequest: () => true,
@@ -168,6 +202,20 @@ describe('chat-scope 会话里 ask 卡片跟随发起 turn 的冻结回复目标
     } finally {
       lookup.mockRestore(); store.close();
     }
+  });
+
+  it('rejects a standalone native question without a request identity before registering a card', async () => {
+    const ds = chatScopeSession({ status: 'active', workerGeneration: 1, cliId: 'traex' });
+    const { done, responses } = post(ds, askBody(TURN, {
+      originKind: NATIVE_STANDALONE_ASK_ORIGIN,
+      requestId: undefined,
+    }));
+    await vi.waitFor(() => expect(responses.length + sent.length).toBeGreaterThan(0));
+    expect(responses).toHaveLength(1);
+    expect(responses[0]).toMatchObject({ status: 409, payload: { ok: false } });
+    expect(sent).toEqual([]);
+    expect(listPendingAsksByAnchor({ larkAppId: APP, chatId: CHAT, anchor: CHAT })).toEqual([]);
+    await done;
   });
 
   it('rejects a native question whose threadId does not match the live runtime', async () => {
@@ -314,6 +362,65 @@ describe('chat-scope 会话里 ask 卡片跟随发起 turn 的冻结回复目标
     expect(await cardThenTextAnswer(ds, askBody(TURN))).toEqual({ via: 'reply', target: ROOT });
   });
 
+  it('内嵌 ask 也保留冻结话题供文字隔离，其他话题不会结算', async () => {
+    const ds = chatScopeSession({
+      turnReplyContexts: { [TURN]: { target: { mode: 'thread', rootMessageId: ROOT } } },
+    });
+    setCardDispatcher({ async send() { sent.push({ via: 'reply', target: ROOT }); return { messageId: 'om_inline' }; } });
+    const { done, responses } = post(ds, askBody(TURN), { replyCardAskTarget: () => ({ turnId: TURN }) });
+    await vi.waitFor(() => expect(sent).toHaveLength(1));
+    const route = { larkAppId: APP, chatId: CHAT, anchor: CHAT };
+    expect(listPendingAsksByAnchor({ ...route, messageRootId: 'om_other' })).toEqual([]);
+    const [pending] = listPendingAsksByAnchor({ ...route, messageRootId: ROOT });
+    expect(pending?.cardRootMessageId).toBe(ROOT);
+    expect(submitCustomReply({ askId: pending!.askId, by: 'ou_user', text: '继续' })).toBe('accepted');
+    await done;
+    expect(responses.at(-1)).toMatchObject({ status: 200 });
+  });
+
+  it('P2: 真实 dispatcher + 真实 replyCardAskTarget + 回复卡尚无 messageId 时，内嵌 ask 首发进冻结话题且仅该话题可文字答复', async () => {
+    const store = new TurnReplyCardStore(dir);
+    await store.prepare(
+      { larkAppId: APP, sessionId: 'sess-chat-scope', turnId: TURN, dispatchAttempt: 1 },
+      { mode: 'unified', chatId: CHAT, rootId: CHAT },
+    );
+    expect(store.read({ larkAppId: APP, sessionId: 'sess-chat-scope', turnId: TURN, dispatchAttempt: 1 })?.messageId).toBeUndefined();
+
+    const ds = {
+      ...chatScopeSession({
+        turnReplyContexts: { [TURN]: { target: { mode: 'thread', rootMessageId: ROOT } } },
+      }),
+      replyCardRunningTurnId: TURN,
+    };
+    setCardDispatcher(createLarkAskCardDispatcher());
+
+    const draftlessBody = {
+      sessionId: 'sess-chat-scope', chatId: CHAT, larkAppId: APP, rootMessageId: null,
+      questions: [{ prompt: '是否继续？', allowCustom: false, multiSelect: false,
+        options: [{ key: 'yes', label: 'yes' }, { key: 'no', label: 'no' }] }],
+      timeoutMs: 60_000, originKind: 'explicit', requestId: `req-inline-real-${TURN}`,
+      originTurnId: TURN, originDispatchAttempt: 1,
+    };
+    const { done, responses } = post(ds, draftlessBody, { replyCardAskTarget });
+    const route = { larkAppId: APP, chatId: CHAT, anchor: CHAT };
+    await vi.waitFor(() => {
+      expect(listPendingAsksByAnchor({ ...route, messageRootId: ROOT })[0]?.cardMessageId).toBeDefined();
+    });
+
+    expect(clientMocks.replyMessage).toHaveBeenCalledTimes(1);
+    expect(clientMocks.replyMessage.mock.calls[0]?.[1]).toBe(ROOT);
+    expect(clientMocks.sendMessage).not.toHaveBeenCalled();
+
+    expect(listPendingAsksByAnchor({ ...route, messageRootId: null })).toEqual([]);
+    expect(listPendingAsksByAnchor({ ...route, messageRootId: 'om_other' })).toEqual([]);
+    const [pending] = listPendingAsksByAnchor({ ...route, messageRootId: ROOT });
+    expect(pending?.cardRootMessageId).toBe(ROOT);
+    expect(pending?.cardMessageId).toBe('om_inline_reply');
+    expect(submitCustomReply({ askId: pending!.askId, by: 'ou_user', text: '继续' })).toBe('accepted');
+    await done;
+    expect(responses.at(-1)).toMatchObject({ status: 200, payload: { kind: 'answered', comment: '继续' } });
+  });
+
   it('hook 发起的 ask 同样跟随话题落点', async () => {
     const ds = chatScopeSession({
       turnReplyContexts: { [TURN]: { target: { mode: 'thread', rootMessageId: ROOT } } },
@@ -383,6 +490,7 @@ describe('chat-scope 会话里 ask 卡片跟随发起 turn 的冻结回复目标
     const scope: Record<string, any> = {
       createExplicitAskContinuation: (deps: unknown) => deps, join, config: { session: { dataDir: dir } },
       sessionsRestored: true, findActiveBySessionId: () => ds, explicitAskSessionBound,
+      frozenReplyContextForTurn, hydrateLegacyExplicitAskCardRoot: () => {},
       releaseExplicitAskHandoff: () => {}, hasExplicitAskHandoff: () => true, invalidateExplicitAsk: () => {},
     };
     const deps = productionConst('src/daemon.ts', 'explicitAskContinuation', scope);

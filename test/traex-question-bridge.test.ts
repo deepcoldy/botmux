@@ -6,8 +6,10 @@ import {
   TRAEX_QUESTION_POLL_MS,
   TRAEX_QUESTION_STABLE_MS,
   TraexQuestionBridge,
+  type TraexQuestionBridgeDeps,
   type TraexQuestionNoticeKey,
 } from '../src/core/traex-question-bridge.js';
+import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
 /**
  * A TRAE question page as traecli 0.214.1 behaves (probed live, see
@@ -113,7 +115,7 @@ interface Harness {
   };
 }
 
-function harness(questions: Question[]): Harness {
+function harness(questions: Question[], runAnswer?: TraexQuestionBridgeDeps['runAnswer']): Harness {
   const tui = new FakeTraexQuestions(questions);
   const asks: Harness['asks'] = [];
   const notices: TraexQuestionNoticeKey[] = [];
@@ -133,6 +135,7 @@ function harness(questions: Question[]): Harness {
       asks.push({ question, signal, answer: resolve, fail: reject });
       signal.addEventListener('abort', () => reject(new Error('aborted')));
     }),
+    runAnswer,
     writeKey: async key => {
       if (state.refuse?.(key)) return false;
       const lag = state.keyLagMs?.(key);
@@ -190,6 +193,20 @@ describe('TraexQuestionBridge', () => {
     expect(h.tui.answers).toEqual(['1:MySQL']);
     expect(h.notices).toEqual([]);
     expect(h.bridge.hasOpenCard()).toBe(false);
+  });
+
+  it('keeps synchronous conversion failures outside native turn cleanup', async () => {
+    const scope = { traexNativeAnswerInputs: new WeakMap(), emitTurnTerminal: vi.fn() };
+    const runAnswer = vi.fn(loadWorkerFunction('runTraexNativeAnswer', scope));
+    const h = harness([DB], runAnswer);
+    await raiseCard(h);
+    h.asks[0]!.answer(answered([]));
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(runAnswer).toHaveBeenCalledTimes(1);
+    expect(h.tui.inputs).toEqual([]);
+    expect(h.notices).toEqual(['worker.traex_question.write_failed']);
+    expect(scope.emitTurnTerminal).not.toHaveBeenCalled();
+    h.bridge.dispose();
   });
 
   it('a page seen only once (mid-redraw) raises no card', async () => {

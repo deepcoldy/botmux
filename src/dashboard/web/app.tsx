@@ -29,7 +29,7 @@ import {
 } from './route-lifecycle.js';
 import { maybeReloadBrowserForStaleRouteChunk } from './stale-chunk-reload.js';
 import { buildBotCards, loadGroupsSnapshot } from './overview.js';
-import { BotOnboardingDialog, OPEN_BOT_ONBOARDING_EVENT, openBotOnboarding } from './bot-onboarding.js';
+import { BOT_ONBOARDING_COMPLETED_EVENT, BotOnboardingDialog, OPEN_BOT_ONBOARDING_EVENT, openBotOnboarding } from './bot-onboarding.js';
 import { requestOpenCreateSession } from './create-session-entry.js';
 import { InfoTip } from './dashboard-components.js';
 import { PLUGIN_PINS_CHANGED_EVENT } from './plugin-events.js';
@@ -54,7 +54,7 @@ import {
 } from './client-shell.js';
 import { dashboardLoginHref } from './auth-login.js';
 import { classifyFetchUnauthorized } from './fetch-auth-guard.js';
-import { ToastStack } from './toast.js';
+import { ToastStack, toast } from './toast.js';
 import { createHashChangeHandler } from './leave-guard.js';
 import { ConfirmModalRoot } from './confirm-modal.js';
 import {
@@ -62,7 +62,32 @@ import {
   parseWorkbenchCapabilities,
 } from './agent-workbench-capabilities.js';
 import { isMacLike, isPaletteHotkey, paletteShortcutLabel } from './command-palette-model.js';
-import { NAV_GROUPS, NAV_ITEMS, NAV_SUBPAGES, type NavItem } from './nav-items.js';
+import {
+  NAV_GROUPS,
+  NAV_ITEMS,
+  NAV_SUBPAGES,
+  isDecisionBoardNavVisible,
+  isManageNavAllowed,
+  type NavItem,
+} from './nav-items.js';
+import {
+  FeatureCatalogModal,
+  WorkspaceGuideBanner,
+  createWorkspaceCatalogActions,
+  createWorkspaceGuideActions,
+} from './workspace-catalog.js';
+import {
+  CORE_NAV_IDS,
+  WORKSPACE_PRESETS,
+  detectActivePreset,
+  filterSidebarItemsForWorkspace,
+  createWorkspacePersonalizationStore,
+  subscribeWorkspacePersonalizationStore,
+  unpinCapability,
+  type WorkspaceMode,
+  type WorkspacePersonalizationState,
+  type WorkspacePersonalizationUpdateOptions,
+} from './workspace-personalization.js';
 import { DECISION_BOARD_CHANGED_EVENT, boardsFromResponse } from './decision-board-model.js';
 import { TASK_ROUTING_CHANGED_EVENT } from './task-routing-model.js';
 import { parseWorkflowSidebarHash } from '../../core/workflow-sidebar-link.js';
@@ -193,8 +218,11 @@ function sidebarNavItems(): NavItem[] {
     if (clientShell && item.id === 'workflows') return false;
     // 网页终端在 Desktop/Mobile 客户端壳里归原生会话面管（见 dashboardShellAllowsWebTerminal）。
     if (item.id === 'terminal') return !clientShell && ui.hostTerminal;
-    if (item.id === 'decision-board') return decisionBoardNavVisible;
-    if (item.id === 'task-routing') return taskRoutingNavVisible;
+    // Owners can discover these pages before setting them up. Scoped identities
+    // retain the existing access check for the decision board.
+    if (item.id === 'decision-board') {
+      return isDecisionBoardNavVisible({ authStateKnown, isAuthed, stewardBoardExists: decisionBoardNavVisible });
+    }
     return true;
   });
   if (pinnedPluginNavItems.length === 0) return builtInItems;
@@ -207,11 +235,15 @@ function sidebarNavItems(): NavItem[] {
   ];
 }
 
+function permittedSidebarNavItems(): NavItem[] {
+  return sidebarNavItems().filter(item => isManageNavAllowed(authStateKnown, isAuthed) || !item.manage);
+}
+
 /** ⌘K 面板的「页面」条目：与侧边栏同一份可见性（权限 / 客户端壳 / pinned 插件）。 */
 function paletteNavPages(): PalettePageEntry[] {
   const groupOf = new Map<string, string>();
   for (const group of NAV_GROUPS) for (const id of group.items) groupOf.set(id, group.labelKey);
-  const visible = sidebarNavItems().filter(item => isAuthed || !item.manage);
+  const visible = permittedSidebarNavItems();
   const byId = new Map(visible.map(item => [item.id, item]));
   const pages: PalettePageEntry[] = visible.map(item => {
     const groupKey = groupOf.get(item.plugin ? 'plugins' : item.id);
@@ -263,6 +295,7 @@ function navClassName(item: NavItem): string | undefined {
 function renderNavAnchor(item: NavItem): React.JSX.Element {
   return (
     <a
+      key={item.id}
       href={item.href}
       data-route={item.id}
       className={[navClassName(item), item.plugin ? 'sidebar-plugin-item' : ''].filter(Boolean).join(' ') || undefined}
@@ -1376,6 +1409,9 @@ function TopbarVersionControl(props: {
 
 function DashboardShell(): React.JSX.Element {
   const statusSummary = dashboardStatusSummary();
+  const [workspaceStore] = useState(() => createWorkspacePersonalizationStore());
+  const [workspace, setWorkspace] = useState(workspaceStore.read);
+  const [catalogOpen, setCatalogOpen] = useState(false);
   const [botOnboardingOpen, setBotOnboardingOpen] = useState(false);
   const [authExpiredOpen, setAuthExpiredOpen] = useState(false);
   const [statusAutoOpen, setStatusAutoOpen] = useState(false);
@@ -1387,6 +1423,21 @@ function DashboardShell(): React.JSX.Element {
   const paletteOpenRef = useRef(false);
   const paletteEnabledRef = useRef(true);
   paletteOpenRef.current = palette.open;
+
+  useEffect(() => subscribeWorkspacePersonalizationStore(
+    workspaceStore,
+    window,
+    () => window.localStorage,
+    setWorkspace,
+  ), [workspaceStore]);
+
+  const updateWorkspace = (
+    edit: (state: WorkspacePersonalizationState) => WorkspacePersonalizationState,
+    options?: WorkspacePersonalizationUpdateOptions,
+  ) => {
+    setWorkspace(workspaceStore.update(edit, options));
+  };
+  const setWorkspaceMode = (mode: WorkspaceMode) => updateWorkspace(state => ({ ...state, mode }));
 
   const closePalette = useCallback(() => setPalette(prev => (prev.open ? { ...prev, open: false } : prev)), []);
   // 允许叠在会话详情抽屉等原生模态框之上：面板 showModal 后是 top layer 最上层，
@@ -1507,6 +1558,28 @@ function DashboardShell(): React.JSX.Element {
       </>
     );
   }
+  const permittedItems = permittedSidebarNavItems();
+  const autoActiveMap = new Map<string, { active: true; count?: number }>();
+  if (store.schedules.size > 0) autoActiveMap.set('schedules', { active: true, count: store.schedules.size });
+  if (decisionBoardNavVisible) autoActiveMap.set('decision-board', { active: true });
+  if (taskRoutingNavVisible) autoActiveMap.set('task-routing', { active: true });
+  const catalogActions = createWorkspaceCatalogActions(workspace, autoActiveMap, updateWorkspace);
+  const guideActions = createWorkspaceGuideActions(updateWorkspace);
+  const visibleItems = filterSidebarItemsForWorkspace(permittedItems, workspace, autoActiveMap.keys());
+  const visibleById = new Map(visibleItems.map(item => [item.id, item]));
+  const pinnedPlugins = visibleItems.filter(item => item.plugin);
+  const hiddenCount = permittedItems.length - visibleItems.length;
+  const focused = workspace.mode === 'focused';
+  const activePreset = detectActivePreset(workspace);
+  const presetLabel = activePreset && activePreset !== 'minimal'
+    ? WORKSPACE_PRESETS.find(preset => preset.id === activePreset)?.labelKey
+    : undefined;
+  const workspaceLabel = focused
+    ? t('workspace.sidebar.focusedCount', { name: t(presetLabel ?? 'workspace.sidebar.focused'), count: visibleItems.length })
+    : t('workspace.sidebar.all');
+  const catalogLabel = t(focused ? 'workspace.sidebar.add' : 'workspace.sidebar.customize');
+  const currentNavItem = permittedItems.find(item => isActiveNav(item, activeHash));
+
   return (
     <>
       <div className="aurora" aria-hidden="true"><i className="a1" /><i className="a2" /><i className="a3" /></div>
@@ -1583,32 +1656,85 @@ function DashboardShell(): React.JSX.Element {
                 </button>
               </div>
             ) : null}
-            <nav className="sidebar-nav" aria-label="Dashboard">
-              {(() => {
-                const visible = sidebarNavItems().filter(item => isAuthed || !item.manage);
-                const byId = new Map(visible.map(item => [item.id, item]));
-                // pinned plugin 项没有自己的组，跟在「管理」组的「插件」之后。
-                const pinnedPlugins = visible.filter(item => item.plugin);
-                return NAV_GROUPS.map(group => {
-                  const items = group.items.flatMap(id => {
-                    const item = byId.get(id);
-                    if (!item) return [];
-                    return item.id === 'plugins' ? [item, ...pinnedPlugins] : [item];
-                  });
-                  if (items.length === 0) return null;
-                  return (
-                    <div className="nav-group" key={group.id}>
-                      <div className="nav-group-title">{t(group.labelKey)}</div>
-                      {items.map(renderNavAnchor)}
-                    </div>
-                  );
+            <div className="sidebar-workspace-bar" data-workspace-mode={workspace.mode}>
+              <button
+                type="button"
+                className="sidebar-workspace-label"
+                aria-haspopup="dialog"
+                title={workspaceLabel}
+                onClick={() => setCatalogOpen(true)}
+              >
+                {workspaceLabel}
+              </button>
+              <button
+                type="button"
+                className="sidebar-workspace-toggle"
+                data-action="toggle-workspace-mode"
+                aria-label={t(focused ? 'workspace.mode.switchAll' : 'workspace.mode.switchFocused')}
+                onClick={() => setWorkspaceMode(focused ? 'all' : 'focused')}
+              >
+                {t(focused ? 'workspace.mode.allShort' : 'workspace.mode.focusedShort')}
+              </button>
+            </div>
+            <nav className="sidebar-nav" aria-label="Dashboard" data-workspace-mode={workspace.mode}>
+              {NAV_GROUPS.map(group => {
+                const items = group.items.flatMap(id => {
+                  const item = visibleById.get(id);
+                  if (id === 'plugins') return item ? [item, ...pinnedPlugins] : pinnedPlugins;
+                  return item ? [item] : [];
                 });
-              })()}
+                if (items.length === 0) return null;
+                return (
+                  <div className="nav-group" key={group.id}>
+                    <div className="nav-group-title">{t(group.labelKey)}</div>
+                    {items.map(item => focused && !item.plugin && !CORE_NAV_IDS.includes(item.id) ? (
+                      <div className="sidebar-nav-removable" key={item.id}>
+                        {renderNavAnchor(item)}
+                        <button
+                          type="button"
+                          className="sidebar-nav-unpin"
+                          data-action="unpin-nav-item"
+                          data-nav-id={item.id}
+                          aria-label={t('workspace.sidebar.unpin', { name: labelOf(item) })}
+                          onClick={() => {
+                            updateWorkspace(state => unpinCapability(state, item.id));
+                            toast(t('workspace.sidebar.unpinned'));
+                          }}
+                        >×</button>
+                      </div>
+                    ) : renderNavAnchor(item))}
+                  </div>
+                );
+              })}
             </nav>
+            <div className="sidebar-workspace-footer">
+              <button
+                type="button"
+                data-action="open-feature-catalog"
+                aria-haspopup="dialog"
+                onClick={() => setCatalogOpen(true)}
+              >
+                {icon(focused
+                  ? <path d="M8 3.25v9.5M3.25 8h9.5" />
+                  : <path d="M3 4.5h10M3 8h10M3 11.5h10M6 3v3m4 .5v3m-4 .5v3" />)}
+                <span>{catalogLabel}</span>
+                {focused && hiddenCount > 0 && (
+                  <span className="sidebar-workspace-count" aria-label={t('workspace.sidebar.hiddenCount', { count: hiddenCount })}>
+                    +{hiddenCount}
+                  </span>
+                )}
+              </button>
+            </div>
           </aside>
           <div className="workspace">
             <dialog id="create-session-modal" className="create-session-modal" />
             <BotOnboardingDialog open={botOnboardingOpen} onClose={() => setBotOnboardingOpen(false)} />
+            <WorkspaceGuideBanner
+              item={currentNavItem}
+              state={workspace}
+              tr={t}
+              {...guideActions}
+            />
             <main id="root" ref={setRouteRoot} />
           </div>
         </div>
@@ -1618,6 +1744,20 @@ function DashboardShell(): React.JSX.Element {
         loginUrl={dashboardLoginHref(authLoginBaseUrl, location.hash)}
         onClose={closeAuthExpired}
       />
+      {catalogOpen && (
+        <FeatureCatalogModal
+          state={workspace}
+          permittedItems={permittedItems}
+          autoActiveInfo={autoActiveMap}
+          visibleCount={visibleItems.length}
+          shortcut={paletteShortcutLabel(PALETTE_MAC)}
+          tr={t}
+          onClose={() => setCatalogOpen(false)}
+          onMode={setWorkspaceMode}
+          {...catalogActions}
+          onNavigate={href => { location.hash = href; }}
+        />
+      )}
       {PaletteView ? (
         <PaletteView
           key={palette.seq}
@@ -1727,6 +1867,7 @@ async function loadAuthState(): Promise<void> {
       taskRoutingNavVisible = isAuthed && j.settings?.taskRouting?.enabled === true;
       publicReadOnly = !!(j.settings && j.settings.publicReadOnly);
       ui.publicReadOnly = publicReadOnly;
+      ui.setConfiguredBotCount(isAuthed && typeof j.configuredBotCount === 'number' ? j.configuredBotCount : null);
       authStateKnown = true;
       const serverLocale = readShellLocale() ?? normalizeDashboardLocale(j.lang);
       if (serverLocale) ui.setLocale(serverLocale);
@@ -1740,6 +1881,7 @@ async function loadAuthState(): Promise<void> {
       taskRoutingNavVisible = false;
       publicReadOnly = false;
       ui.publicReadOnly = false;
+      ui.setConfiguredBotCount(null);
       authStateKnown = true;
     } else if (r.status === 401) {
       isAuthed = false;
@@ -1747,6 +1889,7 @@ async function loadAuthState(): Promise<void> {
       ui.workbenchAuthed = false;
       ui.hostTerminal = false;
       taskRoutingNavVisible = false;
+      ui.setConfiguredBotCount(null);
       authStateKnown = true;
       const loginUrl = r.headers.get('x-botmux-login-url') ?? undefined;
       showAuthExpiredOverlay(loginUrl);
@@ -1973,6 +2116,12 @@ void (async () => {
   await loadAuthState();
   renderShell();
   window.addEventListener(PLUGIN_PINS_CHANGED_EVENT, () => { void loadPinnedPluginNavItems(); });
+  // Keep Overview's configuredBotCount & group snapshot fresh even when onboarding
+  // finishes while the user is on another route (e.g. #/bot-defaults or #/settings).
+  window.addEventListener(BOT_ONBOARDING_COMPLETED_EVENT, () => {
+    if (isAuthed) void ui.refreshConfiguredBotCount(origFetch);
+    void loadGroupsSnapshot({ force: true }).then(renderShell);
+  });
   // Bot 配置里开关管家后会发这个事件，侧边栏随之出现 / 消失。
   window.addEventListener(DECISION_BOARD_CHANGED_EVENT, () => { void loadDecisionBoardNav(); });
   // 全局设置里开关任务分配后会发这个事件，侧边栏随之出现 / 消失。
@@ -2028,7 +2177,9 @@ void (async () => {
     },
     onBotsChanged: listener => { store.onBotsChanged(listener); },
     reloadNameMaps: () => {
-      void reloadNameMaps().then(() => {
+      if (isAuthed) void ui.refreshConfiguredBotCount(origFetch);
+      void reloadNameMaps().then(async () => {
+        await loadGroupsSnapshot();
         store.relabelBots(botNameForAppId);
         renderShell();
       });

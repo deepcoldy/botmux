@@ -14,6 +14,9 @@ import {
   _pendingCount,
   _resetForTest,
   findPendingAskByAnchor,
+  findPendingLegacyAskByCard,
+  listPendingHostChoicesByAnchor,
+  listPendingAsksByAnchor,
   invalidateAll,
   registerAsk,
   registerHostAsk,
@@ -843,6 +846,118 @@ describe('自定义回复 findPendingAskByAnchor + submitCustomReply', () => {
     await Promise.resolve();
     const found = findPendingAskByAnchor({ larkAppId: 'cli_app', chatId: 'oc_chat', anchor: 'oc_chat' });
     expect(found?.askId).toBe(d.sendCalls[0]!.askId);
+  });
+
+  it('群级 ask 不作为同群话题文字的候选，话题与群级候选各自隔离', async () => {
+    const d = mockDispatcher();
+    setCardDispatcher(d);
+    registerAsk(makeInput({ rootMessageId: null, sessionId: 'chat-session' }));
+    await Promise.resolve();
+    await Promise.resolve();
+    const groupId = d.sendCalls[0]!.askId;
+    const topic = { larkAppId: 'cli_app', chatId: 'oc_chat', anchor: 'om_root' };
+    expect(findPendingAskByAnchor(topic)).toBeUndefined();
+    expect(listPendingAsksByAnchor(topic)).toEqual([]);
+    expect(listPendingAsksByAnchor({ ...topic, anchor: 'oc_chat', messageRootId: 'om_root' })).toEqual([]);
+    expect(listPendingAsksByAnchor({ ...topic, anchor: 'oc_chat', messageRootId: null }).map(ask => ask.askId)).toEqual([groupId]);
+
+    registerAsk(makeInput());
+    await Promise.resolve();
+    await Promise.resolve();
+    const topicId = d.sendCalls[1]!.askId;
+    expect(findPendingAskByAnchor(topic)?.askId).toBe(topicId);
+    expect(listPendingAsksByAnchor(topic).map(ask => ask.askId)).toEqual([topicId]);
+    expect(listPendingAsksByAnchor({ ...topic, anchor: 'oc_chat' }).map(ask => ask.askId)).toEqual([groupId]);
+    expect(listPendingAsksByAnchor({ ...topic, anchor: 'om_other' })).toEqual([]);
+    expect(listPendingAsksByAnchor({ ...topic, chatId: 'oc_other' })).toEqual([]);
+
+    registerAsk(makeInput({ rootMessageId: null, cardRootMessageId: 'om_chat_topic', sessionId: 'chat-topic-session' }));
+    await Promise.resolve();
+    await Promise.resolve();
+    const chatTopicId = d.sendCalls[2]!.askId;
+    expect(listPendingAsksByAnchor({ larkAppId: 'cli_app', chatId: 'oc_chat', anchor: 'oc_chat', messageRootId: 'om_chat_topic' }).map(ask => ask.askId))
+      .toEqual([chatTopicId]);
+    expect(listPendingAsksByAnchor({ larkAppId: 'cli_app', chatId: 'oc_chat', anchor: 'oc_chat', messageRootId: null }).map(ask => ask.askId))
+      .toEqual([groupId]);
+    expect(listPendingAsksByAnchor({ larkAppId: 'cli_app', chatId: 'oc_chat', anchor: 'oc_chat', messageRootId: 'om_root' }).map(ask => ask.askId))
+      .toEqual([topicId]);
+  });
+
+  it.each(['host_cross_principal_classification', 'host_cross_principal_wait', 'host_cross_principal_owner'] as const)
+  ('rootless %s 仅保留折叠会话的群内选择词答复，独立 thread 未引用不命中且精确 Ask 优先', async originKind => {
+    const d = mockDispatcher();
+    setCardDispatcher(d);
+    void registerHostAsk(makeInput({ rootMessageId: null, originKind, requestId: originKind }));
+    await vi.waitFor(() => expect(d.sendCalls).toHaveLength(1));
+    const hostId = d.sendCalls[0]!.askId;
+    const foldedRoute = { larkAppId: 'cli_app', chatId: 'oc_chat', anchor: 'oc_chat', messageRootId: 'om_native_choice' };
+    expect(listPendingAsksByAnchor(foldedRoute)).toEqual([]);
+    expect(listPendingHostChoicesByAnchor({ ...foldedRoute, by: 'ou_owner' }).map(ask => ask.askId)).toEqual([hostId]);
+    expect(listPendingHostChoicesByAnchor({ ...foldedRoute, by: 'ou_owner', sessionId: 'sess-other' })).toEqual([]);
+    const independentRoute = { larkAppId: 'cli_app', chatId: 'oc_chat',
+      anchor: 'om_native_choice', messageRootId: 'om_native_choice' };
+    expect(listPendingHostChoicesByAnchor({ ...independentRoute, by: 'ou_owner' })).toEqual([]);
+    expect(findPendingAskByAnchor({ larkAppId: 'cli_app', chatId: 'oc_other',
+      anchor: 'om_native_choice', messageRootId: 'om_native_choice' })).toBeUndefined();
+
+    // A normal exact-topic Ask wins over the rootless host-choice fallback.
+    void registerAsk(makeInput({ rootMessageId: 'om_native_choice', sessionId: 'sess-exact-choice' }));
+    await vi.waitFor(() => expect(d.sendCalls).toHaveLength(2));
+    const exactId = d.sendCalls[1]!.askId;
+    expect(listPendingAsksByAnchor(foldedRoute).map(ask => ask.askId)).toEqual([exactId]);
+    // Explicitly quoting the host card still identifies it from an independent thread.
+    expect(findPendingLegacyAskByCard({ larkAppId: 'cli_app', chatId: 'oc_chat',
+      anchor: 'om_native_choice', cardMessageId: `om_card_${hostId}` })?.askId).toBe(hostId);
+  });
+
+  it('交叉身份选择卡一旦带冻结话题根，就不使用 rootless 群内回退', async () => {
+    const d = mockDispatcher();
+    setCardDispatcher(d);
+    void registerHostAsk(makeInput({ rootMessageId: null, cardRootMessageId: 'om_frozen_choice',
+      originKind: 'host_cross_principal_wait', requestId: 'wait-frozen-choice' }));
+    await vi.waitFor(() => expect(d.sendCalls).toHaveLength(1));
+    const askId = d.sendCalls[0]!.askId;
+    expect(findPendingAskByAnchor({ larkAppId: 'cli_app', chatId: 'oc_chat',
+      anchor: 'oc_chat', messageRootId: 'om_frozen_choice' })?.askId).toBe(askId);
+    expect(findPendingAskByAnchor({ larkAppId: 'cli_app', chatId: 'oc_chat',
+      anchor: 'oc_chat', messageRootId: 'om_other_choice' })).toBeUndefined();
+  });
+
+  it('在群外层 ask 卡片上直接开话题回复（messageRootId === cardMessageId）可精确命中对应外层 ask，且不波及无关话题', async () => {
+    let seq = 0;
+    const d = mockDispatcher();
+    const ids: string[] = [];
+    setCardDispatcher({
+      async send(ask) {
+        d.sendCalls.push(ask);
+        const messageId = `om_outer_card_${++seq}`;
+        ids.push(messageId);
+        return { messageId };
+      },
+      onSettle: d.onSettle,
+    });
+    registerAsk(makeInput({ rootMessageId: null, sessionId: 'chat-s1' }));
+    registerAsk(makeInput({ rootMessageId: null, sessionId: 'chat-s2' }));
+    await Promise.resolve();
+    await Promise.resolve();
+    const ask1 = d.sendCalls[0]!.askId;
+    const ask2 = d.sendCalls[1]!.askId;
+    const route = { larkAppId: 'cli_app', chatId: 'oc_chat', anchor: 'oc_chat' };
+
+    expect(listPendingAsksByAnchor({ ...route, messageRootId: ids[0] }).map(a => a.askId)).toEqual([ask1]);
+    expect(listPendingAsksByAnchor({ ...route, messageRootId: ids[1] }).map(a => a.askId)).toEqual([ask2]);
+    expect(listPendingAsksByAnchor({ ...route, messageRootId: 'om_unrelated_thread' })).toEqual([]);
+  });
+
+  it('registerAsk 归一化空字符串或 chatId 形态的 cardRootMessageId，避免快照与持久化漂移', async () => {
+    const d = mockDispatcher();
+    setCardDispatcher(d);
+    registerAsk(makeInput({ rootMessageId: 'om_root', cardRootMessageId: '' }));
+    registerAsk(makeInput({ rootMessageId: null, cardRootMessageId: 'oc_chat', sessionId: 'chat-norm' }));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(d.sendCalls[0]!.cardRootMessageId).toBeUndefined();
+    expect(d.sendCalls[1]!.cardRootMessageId).toBeUndefined();
   });
 
   it('findPendingAskByAnchor: anchor 不匹配 → undefined', async () => {

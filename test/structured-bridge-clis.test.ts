@@ -34,11 +34,12 @@ describe('structured-bridge-clis', () => {
     expect(STRUCTURED_BRIDGE_ADOPT_CLI_IDS).not.toContain('hermes');
     expect(isStructuredBridgeAdoptCli('hermes')).toBe(false);
     for (const id of STRUCTURED_BRIDGE_ALWAYS_CLI_IDS) {
-      // doubao has no /adopt transcript branch (like hermes/omp/ebsd).
-      if (id === 'hermes' || id === 'oh-my-pi' || id === 'ebsd' || id === 'doubao') continue;
+      // Doubao and NCA have no /adopt transcript branch (like hermes/omp/ebsd).
+      if (id === 'hermes' || id === 'oh-my-pi' || id === 'ebsd' || id === 'doubao' || id === 'nca') continue;
       expect(STRUCTURED_BRIDGE_ADOPT_CLI_IDS).toContain(id);
     }
     expect(STRUCTURED_BRIDGE_ADOPT_CLI_IDS).not.toContain('doubao');
+    expect(STRUCTURED_BRIDGE_ADOPT_CLI_IDS).not.toContain('nca');
     expect(STRUCTURED_BRIDGE_ADOPT_CLI_IDS).not.toContain('oh-my-pi');
     expect(STRUCTURED_BRIDGE_ADOPT_CLI_IDS).not.toContain('ebsd');
   });

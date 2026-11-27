@@ -179,6 +179,25 @@ export function inspectSupervisorState(
 }
 
 /** Re-check the birth identity immediately before addressing a PID. */
+export function captureFleetProcessIdentity(
+  pid: number = process.pid,
+  runtime: FleetProcessIdentityRuntime = fleetProcessIdentityRuntime,
+): FleetProcessAttestation | null {
+  if (!Number.isSafeInteger(pid) || pid <= 1) return null;
+  const first = runtime.readIdentity(pid);
+  if (!first) return null;
+  const pidNamespace = runtime.readPidNamespace(pid);
+  const commandLine = runtime.readCommandLine(pid);
+  const second = runtime.readIdentity(pid);
+  if (!second || second !== first) return null;
+  return {
+    pid,
+    processStart: first,
+    ...(commandLine !== undefined ? { commandLine } : {}),
+    ...(pidNamespace ? { pidNamespace } : {}),
+  };
+}
+
 export function signalAttestedFleetProcess(
   target: FleetProcessAttestation,
   signal: NodeJS.Signals,

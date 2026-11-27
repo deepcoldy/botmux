@@ -129,8 +129,10 @@ export async function tryRegisterApp(opts: RegisterAppOptions = {}): Promise<Reg
       userOpenId,
     };
   } catch (err: unknown) {
-    const failure = err as { code?: string; description?: string; message?: string } | undefined;
-    if (failure?.code === 'abort') return { ok: false, error: 'aborted', message: '用户取消确认' };
+    const failure = err as { code?: string; name?: string; description?: string; message?: string } | undefined;
+    if (opts.signal?.aborted || failure?.code === 'abort' || failure?.name === 'AbortError') {
+      return { ok: false, error: 'aborted', message: '用户取消确认' };
+    }
     // SDK uses the same code for a local polling deadline and a platform expiry.
     const pollingTimedOut = (failure?.description ?? failure?.message) === 'Polling timed out';
     if (failure?.code === 'expired_token' && !pollingTimedOut) {

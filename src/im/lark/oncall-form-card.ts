@@ -5,29 +5,6 @@ import { buildOncallGroupColumn } from './oncall-card-actions.js';
 export function buildOncallFormCard(draft: OncallFormDraft): string {
   const value = (action: string) => ({ action, draftId: draft.id, version: draft.version });
   const sidebar = (link: string) => draft.nativeSubmission?.attempts.find(item => item.sidebarLink?.href === link)?.sidebarLink?.hostedHref ?? link;
-  if (draft.botmuxFields?.length) {
-    const category = draft.choices.regions[draft.region]?.find(item => item.id === draft.typeId);
-    const plainText = (content: string) => ({ tag: 'plain_text', content });
-    return JSON.stringify({
-      config: { update_multi: draft.visibility === 'thread', wide_screen_mode: true },
-      header: { title: plainText('补充 Oncall 信息'), template: 'blue' },
-      elements: [
-        { tag: 'div', text: plainText([draft.region, category?.name, draft.priority].filter(Boolean).join(' · ')) },
-        { tag: 'form', name: 'botmux_oncall_custom_form', elements: [
-          ...draft.botmuxFields.map((field, index) => ({
-            tag: 'input', name: oncallFieldName(index), label: plainText(field.label), label_position: 'top',
-            required: field.required, max_length: ONCALL_FIELD_LIMIT,
-          })),
-          { tag: 'button', name: 'botmux_oncall_submit', type: 'primary', text: plainText('提交并创建人工 Oncall 群'),
-            action_type: 'form_submit', value: value('oncall_group_form_botmux_submit') },
-        ] },
-        { tag: 'action', actions: [
-          { tag: 'button', text: plainText('返回分类选择'), value: value('oncall_group_form_back') },
-          { tag: 'button', text: plainText('取消'), value: value('oncall_group_form_cancel') },
-        ] },
-      ],
-    });
-  }
   if (draft.nativeEntry) return JSON.stringify({ schema: '2.0', config: { update_multi: true, width_mode: 'fill' },
     header: { title: { tag: 'plain_text', content: '发起人工 Oncall' }, template: 'blue' }, body: { elements: [
       { tag: 'markdown', content: draft.description },
@@ -46,6 +23,33 @@ export function buildOncallFormCard(draft: OncallFormDraft): string {
   });
   const categories = draft.choices.regions[draft.region] ?? [];
   if (Object.keys(draft.choices.regions).length > 100 || categories.length > 100) throw new Error('当前分类数量超出卡片展示范围，请选择原生侧栏');
+  const plainText = (content: string) => ({ tag: 'plain_text', content });
+  const fields = draft.botmuxFields ?? [];
+  const cancel = { tag: 'button', text: plainText('取消'), value: value('oncall_group_form_cancel') };
+  // Keep selectors outside the form so their callbacks run before submission.
+  const submission = fields.length ? [
+    { tag: 'note', elements: [plainText('更改上方选项后，需要重新填写附加信息。')] },
+    { tag: 'form', name: 'botmux_oncall_custom_form', elements: [
+      ...fields.map((field, index) => ({
+        tag: 'input', name: oncallFieldName(index), label: plainText(field.label), label_position: 'top',
+        required: field.required, max_length: ONCALL_FIELD_LIMIT,
+      })),
+      { tag: 'column_set', flex_mode: 'none', horizontal_spacing: 'small', columns: [
+        { tag: 'button', name: 'botmux_oncall_submit', type: 'primary', text: plainText('提交并建群'),
+          action_type: 'form_submit', value: value('oncall_group_form_botmux_submit') },
+        // Send the cancel action without submitting or resetting the form.
+        { ...cancel, name: 'botmux_oncall_cancel', type: 'default', action_type: 'request' },
+      ].map(button => ({ tag: 'column', width: 'auto', vertical_align: 'center', elements: [button] })) },
+    ] },
+  ] : [
+    { tag: 'note', elements: [plainText(draft.nativeFormLink ? '请在侧栏补充自定义信息并确认提单，成功后将按交接设置同步当前会话。' : '将同步本问题的对话及附件。')] },
+    { tag: 'action', actions: [
+      { tag: 'button', text: plainText('确认发起人工 Oncall'), type: 'primary',
+        disabled: !draft.region || !draft.typeId,
+        ...(draft.nativeFormLink ? { url: sidebar(draft.nativeFormLink) } : { value: value('oncall_group_form_submit') }) },
+      cancel,
+    ] },
+  ];
   return JSON.stringify({ config: { wide_screen_mode: true, update_multi: draft.visibility === 'thread' },
     header: { title: { tag: 'plain_text', content: '发起人工 Oncall' }, template: 'blue' }, elements: [
       { tag: 'div', text: { tag: 'plain_text', content: draft.description || '使用当前问题的公开对话作为问题描述' } },
@@ -57,12 +61,6 @@ export function buildOncallFormCard(draft: OncallFormDraft): string {
         select('priority', '问题等级', [{ value: 'P2', label: 'P2 一般问题，如咨询等' },
           { value: 'P1', label: 'P1 阻塞离线业务／有潜在重大影响' }, { value: 'P0', label: 'P0 用户可感知／阻塞在线业务（谨慎选择）' }], draft.priority),
       ].map(element => ({ tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center', elements: [element] })) },
-      { tag: 'note', elements: [{ tag: 'plain_text', content: draft.nativeFormLink ? '请在侧栏补充自定义信息并确认提单，成功后将按交接设置同步当前会话。' : '将同步本问题的对话及附件。' }] },
-      { tag: 'action', actions: [
-        { tag: 'button', text: { tag: 'plain_text', content: '确认发起人工 Oncall' }, type: 'primary',
-          disabled: !draft.region || !draft.typeId,
-          ...(draft.nativeFormLink ? { url: sidebar(draft.nativeFormLink) } : { value: value('oncall_group_form_submit') }) },
-        { tag: 'button', text: { tag: 'plain_text', content: '取消' }, value: value('oncall_group_form_cancel') },
-      ] },
+      ...submission,
     ] });
 }

@@ -18,7 +18,7 @@ import {
   createDispatchReportBinding, verifyDispatchReportBinding,
   type DispatchReportAttachment,
 } from '../core/dispatch-report-binding.js';
-import type { ProjectCoordinatorAction, ProjectCoordinatorContext } from './project-coordinator.js';
+import type { ProjectCardPublicationPolicy, ProjectCoordinatorAction, ProjectCoordinatorContext } from './project-coordinator.js';
 import {
   mutateProjectGroup, type ProjectGroupState, type ProjectWorkstreamStatus,
 } from './project-group-store.js';
@@ -51,6 +51,8 @@ export interface ProjectAttachmentActor {
   chatId: string;
   scope: 'chat';
   ownerKey?: string;
+  /** Host-proved direct operation, never taken from request JSON. */
+  repostOnExpired?: boolean;
   /** Source owner proved by a host-signed consent scoped to this exact source
    * route and coordinator. The route must never accept this field from JSON. */
   authorizedSourceOwnerKey?: string;
@@ -168,8 +170,13 @@ function view(record: ProjectAttachmentRecord): ProjectAttachmentView {
     reportCapability: record.source.reportCapability,
   };
 }
-function context(actor: ProjectAttachmentActor, dataDir: string): ProjectCoordinatorContext {
-  return { dataDir, chatId: actor.chatId, larkAppId: actor.larkAppId, coordinatorSessionId: actor.sessionId };
+function context(
+  actor: ProjectAttachmentActor, dataDir: string, policy: ProjectCardPublicationPolicy = 'patch',
+): ProjectCoordinatorContext {
+  return {
+    dataDir, chatId: actor.chatId, larkAppId: actor.larkAppId, coordinatorSessionId: actor.sessionId,
+    cardPublication: actor.repostOnExpired ? 'repost' : policy,
+  };
 }
 function journalDir(dataDir: string): string {
   return join(dataDir, '.dashboard-secret.project-attachments');
@@ -565,6 +572,8 @@ export function createProjectWorkstreamAttachments(deps: ProjectWorkstreamAttach
       if (request.progress !== undefined && (!Number.isInteger(request.progress) || request.progress < 0 || request.progress > 100)) {
         fail('invalid_workstream_progress');
       }
+      const projectContext = context(actor, deps.dataDir, 'deferred');
+      const inline = projectContext.cardPublication !== 'deferred';
       return withRecordLock(projectAttachmentRecordPath(deps.dataDir, request.rootMessageId), async path => {
         const project = authorizeActor(actor);
         const record = readRecord(path);
@@ -597,7 +606,7 @@ export function createProjectWorkstreamAttachments(deps: ProjectWorkstreamAttach
           let updated: ProjectGroupState | undefined;
           let cardError: string | undefined;
           try {
-            updated = await deps.projectRun(context(actor, deps.dataDir), {
+            updated = await deps.projectRun(projectContext, {
               action: 'report', dispatchRoot: request.rootMessageId,
               content, status: request.status, progress: request.progress, remaining, milestone,
             }, actorCommitGuard(actor, project.createdAt));
@@ -619,7 +628,7 @@ export function createProjectWorkstreamAttachments(deps: ProjectWorkstreamAttach
               status: request.status, content, at: reportAt,
             });
           });
-          return { registered: true, cardSynced: !cardError, project: updated, ...(cardError ? { error: cardError } : {}) };
+          return { registered: true, cardSynced: inline && !cardError, project: updated, ...(cardError ? { error: cardError } : {}) };
         }
         if (record.phase !== 'active' || record.chatId !== actor.chatId
           || record.coordinatorLarkAppId !== actor.larkAppId
@@ -640,7 +649,7 @@ export function createProjectWorkstreamAttachments(deps: ProjectWorkstreamAttach
         };
         saveRecord(path, record);
         try {
-          updated = await deps.projectRun(context(actor, deps.dataDir), {
+          updated = await deps.projectRun(projectContext, {
             action: 'report', dispatchRoot: request.rootMessageId,
             content,
             status: request.status, progress: request.progress,
@@ -667,7 +676,7 @@ export function createProjectWorkstreamAttachments(deps: ProjectWorkstreamAttach
         });
         delete record.pendingReport;
         saveRecord(path, record);
-        return { registered: true, cardSynced: !cardError, attachment: view(record), project: updated,
+        return { registered: true, cardSynced: inline && !cardError, attachment: view(record), project: updated,
           ...(cardError ? { error: cardError } : {}) };
       });
     },
@@ -848,16 +857,17 @@ export function createProjectWorkstreamAttachments(deps: ProjectWorkstreamAttach
     /** A source daemon observed an existing source leave/close/change lifetime.
      * This method may only DOWNGRADE an existing association. It cannot claim a
      * new source, revive a moved attachment or change coordinator authority. */
-    async observe(source: ProjectAttachmentSource): Promise<void> {
-      if (!id(source.sessionId) || !id(source.larkAppId, 'cli_')) return;
+    async observe(source: ProjectAttachmentSource): Promise<string[]> {
+      if (!id(source.sessionId) || !id(source.larkAppId, 'cli_')) return [];
       let files: string[];
       try {
         if (lstatSync(journalDir(deps.dataDir)).isSymbolicLink()) fail('unsafe_attachment_directory');
         files = readdirSync(journalDir(deps.dataDir)).filter(file => /^[a-f0-9]{64}\.json$/u.test(file)).slice(0, 512);
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
         throw error;
       }
+      const projectChats = new Set<string>();
       for (const file of files) {
         const candidate = readRecord(join(journalDir(deps.dataDir), file));
         if (!candidate
@@ -891,15 +901,13 @@ export function createProjectWorkstreamAttachments(deps: ProjectWorkstreamAttach
           }
           const mode = deps.getMode(record.chatId);
           if (mode?.mode === 'project' && mode.coordinatorAppId === record.coordinatorLarkAppId) {
-            try {
-              await deps.projectRun({
-                dataDir: deps.dataDir, chatId: record.chatId,
-                larkAppId: record.coordinatorLarkAppId, coordinatorSessionId: record.coordinatorSessionId,
-              }, { action: 'refresh' });
-            } catch { /* Only the view failed; status/reconcile can repair it. */ }
+            projectChats.add(record.chatId);
           }
         });
       }
+      // The daemon feeds these groups into runtime sync so association events
+      // share the same PATCH budget as task events and periodic ticks.
+      return [...projectChats];
     },
   };
 }

@@ -11,6 +11,7 @@
 import { stripAnsiScreenText } from '../utils/idle-detector.js';
 import { doubaoComposerState } from '../adapters/cli/doubao-screen.js';
 import { classifyStuckPage } from '../utils/stuck-detector.js';
+import { CLAUDE_STRIPPED_INVISIBLE_RE } from './claude-transcript.js';
 
 export type SubmitFailureDiagnosisReason =
   | 'logged_out'        // 登录/鉴权门
@@ -35,6 +36,8 @@ export interface SubmitFailureDiagnosisInput {
   lastActivityAtMs?: number;
   /** Claude-only composer parsing; avoid interpreting other CLI prompts as drafts. */
   cliId?: string;
+  /** Exact input text submitted to the CLI, used to detect plain hook-mode drafts parked in Claude's composer. */
+  submittedInput?: string;
   nowMs?: number;                       // 测试注入
   activeWindowMs?: number;              // 默认 SUBMIT_FAILURE_ACTIVE_WINDOW_MS
 }
@@ -119,7 +122,9 @@ function claudeComposerDraftMatch(screen: string): string | undefined {
   // Only the last input box, bounded by two full-width rules, is evidence.
   // Assistant transcript text or an idle suggestion outside it is not a draft.
   for (const { body } of claudeComposerBodies(screen)) {
-    if (/<\/?user_message>/.test(body)) return 'draft_parked:claude_composer';
+    if (/<\/?(?:user_message|role|attachments|substitute_trigger|chat_context|chat_context_policy|shared_group_context|project_group_mode|available_bots|summary_memory|botmux_(?:group_join|skills|skills_refresh|link_refs|steward|credentials|reminder|formatting|task|headless_session|http_response_mode|silent_schedule|lead_dispatch|collab))(?:\s|>)/.test(body)) {
+      return 'draft_parked:claude_composer';
+    }
     if (CLAUDE_PASTED_TEXT_CHIP.test(body)) return 'draft_parked:claude_pasted_chip';
     return undefined;
   }
@@ -127,10 +132,10 @@ function claudeComposerDraftMatch(screen: string): string | undefined {
 }
 
 /** Whether Claude's last input box still holds `input`: the chip of a multi-line
- *  paste, or the opening or closing text of its `<user_message>` body, else of the whole input (compared without whitespace and the `\` of typed
+ *  paste, or the opening or closing text of its `<user_message>` body, else of the whole input (compared without whitespace, Claude-stripped invisible chars, and the `\` of typed
  *  soft newlines, so wrapped or multi-line drafts still match). */
 export function claudeComposerHoldsInput(screenText: string, input: string): boolean {
-  const compact = (text: string) => text.replace(/[\s\\]+/g, '');
+  const compact = (text: string) => text.replace(CLAUDE_STRIPPED_INVISIBLE_RE, '').replace(/[\s\\]+/g, '');
   const open = input.indexOf('<user_message>');
   const close = input.lastIndexOf('</user_message>');
   const compactInput = compact(open >= 0 && close > open ? input.slice(open + '<user_message>'.length, close) : input);
@@ -163,6 +168,9 @@ export function diagnoseSubmitFailure(input: SubmitFailureDiagnosisInput): Submi
   if (input.cliId === 'claude-code') {
     const composerDraft = claudeComposerDraftMatch(screen);
     if (composerDraft) return { reason: 'draft_parked', evidence: 'screen', matched: composerDraft };
+    if (screen && input.submittedInput && claudeComposerHoldsInput(screen, input.submittedInput)) {
+      return { reason: 'draft_parked', evidence: 'screen', matched: 'draft_parked:claude_composer_input' };
+    }
   }
   // Doubao keeps a draft whose Enter it refused in its `❯` composer box.
   if (input.cliId === 'doubao' && doubaoComposerState(screen) === 'draft') {
@@ -190,6 +198,8 @@ export interface BackendSubmitFailureInput {
   capturedScreenText?: string;
   /** Session CLI id — the Claude composer rules are claude-code-only. */
   cliId?: string;
+  /** Submitted CLI input text for plain hook-mode composer draft detection. */
+  submittedInput?: string;
   lastActivityAtMs?: number;
   nowMs?: number;
   activeWindowMs?: number;
@@ -202,6 +212,7 @@ export function diagnoseBackendSubmitFailure(input: BackendSubmitFailureInput): 
   return diagnoseSubmitFailure({
     cliId: input.cliId,
     screenText: input.backendType === 'zmx' ? '' : input.capturedScreenText,
+    submittedInput: input.submittedInput,
     lastActivityAtMs: input.lastActivityAtMs,
     nowMs: input.nowMs,
     activeWindowMs: input.activeWindowMs,

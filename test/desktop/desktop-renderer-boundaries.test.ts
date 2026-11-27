@@ -3,8 +3,10 @@ import type { DesktopRuntimeState } from '../../src/desktop/shared/types.js';
 import {
   buildRuntimeMeta,
   buildVersionLine,
+  classifyEmptyDashboardView,
   emptyDashboardMessage,
   isRuntimeState,
+  shouldAutoOpenZeroBotOnboarding,
   shouldKeepLoadedDashboardDuringDegradedState,
 } from '../../src/desktop/renderer/runtime-state.js';
 import {
@@ -70,6 +72,78 @@ describe('desktop renderer runtime boundary', () => {
     expect(isRuntimeState({ ...runtimeState(), runtimeSource: 'unknown' })).toBe(false);
     expect(isRuntimeState({ ...runtimeState(), dashboardUrl: 123 })).toBe(false);
     expect(isRuntimeState({ ...runtimeState(), message: 123 })).toBe(false);
+  });
+
+  it('auto-opens 0-bot onboarding once per cold launch and classifies empty dashboard views cleanly', () => {
+    const zeroBotRunning = runtimeState({ status: 'running', botCount: 0, onlineDaemonCount: 0 });
+    expect(shouldAutoOpenZeroBotOnboarding(zeroBotRunning, {
+      alreadyOpened: false,
+      userNavigated: false,
+      hasLoadedDashboard: false,
+    })).toBe(true);
+    expect(shouldAutoOpenZeroBotOnboarding(zeroBotRunning, {
+      alreadyOpened: true,
+      userNavigated: false,
+      hasLoadedDashboard: false,
+    })).toBe(false);
+    expect(shouldAutoOpenZeroBotOnboarding(zeroBotRunning, {
+      alreadyOpened: false,
+      userNavigated: true,
+      hasLoadedDashboard: false,
+    })).toBe(false);
+    expect(shouldAutoOpenZeroBotOnboarding(runtimeState({ status: 'running', botCount: 1 }), {
+      alreadyOpened: false,
+      userNavigated: false,
+      hasLoadedDashboard: false,
+    })).toBe(false);
+
+    expect(classifyEmptyDashboardView(
+      runtimeState({ status: 'not_configured', runtimeManaged: true, runtimeSource: 'bundled', botCount: 0 }),
+      { bootstrappingZeroBot: true },
+    ).kind).toBe('bootstrapping');
+    expect(classifyEmptyDashboardView(
+      runtimeState({ status: 'not_configured', runtimeManaged: true, runtimeSource: 'bundled', botCount: 0 }),
+      { bootstrappingZeroBot: false },
+    ).kind).toBe('onboarding_welcome');
+    expect(classifyEmptyDashboardView(
+      runtimeState({
+        status: 'degraded',
+        degradedReason: 'invalid_bots_json',
+        runtimeManaged: false,
+        runtimeSource: 'none',
+        botCount: 0,
+        onlineDaemonCount: 0,
+        message: 'bots.json must contain a JSON array',
+      }),
+    )).toMatchObject({
+      kind: 'config_error',
+      detail: 'bots.json must contain a JSON array',
+    });
+    // Non-config 0-bot degraded states must NOT be misclassified as bots.json corruption.
+    expect(classifyEmptyDashboardView(
+      runtimeState({
+        status: 'degraded',
+        degradedReason: 'fleet_discovery',
+        runtimeManaged: false,
+        runtimeSource: 'bundled',
+        botCount: 0,
+        onlineDaemonCount: 0,
+        message: 'Invalid fleet state',
+      }),
+    ).kind).toBe('degraded');
+    expect(classifyEmptyDashboardView(
+      runtimeState({
+        status: 'degraded',
+        degradedReason: 'external_unmanaged',
+        runtimeManaged: false,
+        runtimeSource: 'global-cli',
+        botCount: 0,
+        onlineDaemonCount: 0,
+        message: '检测到由其他 botmux 安装启动的运行时',
+      }),
+    ).kind).toBe('degraded');
+    expect(isRuntimeState({ ...runtimeState(), degradedReason: 'invalid_bots_json' })).toBe(true);
+    expect(isRuntimeState({ ...runtimeState(), degradedReason: 'bogus_reason' })).toBe(false);
   });
 });
 

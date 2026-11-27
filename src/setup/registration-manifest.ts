@@ -152,16 +152,31 @@ export async function completeRegisteredApp(
   identity: RegistrationIdentity,
   addons: AppAddons,
   web: WebAutomation,
-  options: Pick<OpenPlatformAutomationOptions, 'onQrCode' | 'onStatus' | 'disableQrLogin' | 'sessionFilePath' | 'disableBytedcliFallback' | 'autoAvoidApproval' | 'excludeScopes'> = {},
+  options: Pick<OpenPlatformAutomationOptions, 'onQrCode' | 'onStatus' | 'disableQrLogin' | 'sessionFilePath' | 'disableBytedcliFallback' | 'autoAvoidApproval' | 'excludeScopes' | 'signal'> = {},
 ): Promise<OpenPlatformAutomationResult> {
+  if (options.signal?.aborted) {
+    return { ok: false, reason: 'aborted', message: '用户已取消操作', redirectConfigured: false };
+  }
   const wanted = { tenant: addons.scopes?.tenant ?? [], user: addons.scopes?.user ?? [] };
   const token = await registrationToken(identity);
+  if (options.signal?.aborted) {
+    return { ok: false, reason: 'aborted', message: '用户已取消操作', redirectConfigured: false };
+  }
   const { appId, brand } = identity;
   let scopeRead = token ? await readGrants(brand, token, wanted) : undefined;
   if (token && (scopeRead?.denied || (scopeRead?.grants && classifyCreationGrants(wanted, scopeRead.grants) === 'likely_ignored'))) {
     // 刚确认时授权可能仍在传播。再读一次后才决定是否进入网页补配。
-    await delay(2_000);
+    try {
+      await delay(2_000, undefined, options.signal ? { signal: options.signal } : undefined);
+    } catch {
+      if (options.signal?.aborted) {
+        return { ok: false, reason: 'aborted', message: '用户已取消操作', redirectConfigured: false };
+      }
+    }
     scopeRead = await readGrants(brand, token, wanted);
+  }
+  if (options.signal?.aborted) {
+    return { ok: false, reason: 'aborted', message: '用户已取消操作', redirectConfigured: false };
   }
   const readback = scopeRead?.grants;
   const status = readback ? classifyCreationGrants(wanted, readback) : 'unverified';

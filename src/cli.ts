@@ -1,7 +1,14 @@
 #!/usr/bin/env node
 import { scheduleCreatePlacement, scheduleSupportLines } from './core/schedule-followup.js';
 import { replyDeliveryFromEnv, sendCompletionHintKey } from './services/send-completion-hint.js';
-import { selectReplyMessageId, parseReplyMessageTarget, crossChatOriginForSend, crossChatSenderForSend } from './core/reply-message.js';
+import {
+  buildAbsorbedTurnSettlementGate,
+  selectReplyMessageId,
+  parseReplyMessageTarget,
+  crossChatOriginForSend,
+  crossChatSenderForSend,
+  resolvePromotedAbsorbedTurnForCompletion,
+} from './core/reply-message.js';
 import { assertMessageTopicAvailable, assertSendTopicsAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from './cli/topic-send-guard.js';
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
 import { isMessageListenerTaskAnchor, isSilentMessageListenerSession, messageListenerSendBlocked } from './core/message-listener-silence.js';
@@ -66,6 +73,7 @@ import {
   findAncestorSessionMarkerContext as findLiveAncestorSessionContext,
   findAuthenticatedAncestorSessionContext,
   resolveSessionContext,
+  selectAbsorbedTurnsToSettle,
 } from './core/session-marker.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import {
@@ -106,6 +114,11 @@ import {
   trackBotsJsonSnapshot,
   writeBotsJsonAtomic as writeBotsAtomic,
 } from './setup/bots-store.js';
+import { validateBotConfigEntries } from './setup/bots-config-validation.js';
+import {
+  formatStopIfEmptyCliOutcome,
+  hasOtherActiveDesktopHostLease,
+} from './core/desktop-host-leases.js';
 import { findQuotaFallbackCycles } from './services/quota-fallback.js';
 import { findRetiredCliBots, retiredCliNotice } from './adapters/cli/retired-cli.js';
 import {
@@ -238,7 +251,7 @@ import { CardStreamStore } from './services/card-stream-store.js';
 import { TurnReplyCardStore } from './services/turn-reply-card.js';
 import { patchPublishedGroupCard, readGroupContextAuthorOrigin } from './services/group-context-publication.js';
 import { markGroupContextCardPurpose } from './im/lark/group-context-card.js';
-import { TurnSendLedger, type TurnSendKind } from './services/turn-send-ledger.js';
+import { TurnSendLedger, type TurnSendKind, type TurnSendLedgerKey, type TurnSendLedgerRecord } from './services/turn-send-ledger.js';
 import { feedbackPolicyForScheduledSend, ScheduleSendAttempt, scheduledSessionRun } from './core/scheduled-send.js';
 import { buildTurnReplyCard, replyCardPresentation } from './im/lark/turn-reply-card.js';
 import { CardRuntimeStatusBridge } from './services/card-runtime-status-bridge.js';
@@ -430,9 +443,21 @@ import {
   isFinalBridgeSendMarker,
   stripTrailingOaiMemoryCitation,
 } from './services/bridge-fallback-gate.js';
-import { recordBridgeReplyMarker } from './services/bridge-reply-marker.js';
+import {
+  hasBridgeReplyMarker,
+  recordBridgeReplyMarker,
+  recordBridgeReplyMarkerSnapshot,
+  withBridgeReplyMarkerLock,
+} from './services/bridge-reply-marker.js';
 import { effectiveCrossChatFollowThreadMode, ensureCrossChatFollowThreadAtBinding, persistCrossChatFollowThreadOffBeforeProvider } from './services/cross-chat-follow-thread-store.js';
-import { recordSessionTurnReply } from './services/session-turns.js';
+import { recordSessionTurnReplies, type SessionTurnReply } from './services/session-turns.js';
+import {
+  buildRelayedTurnReplyPortCandidates,
+  postRelayedTurnReplies,
+  recordStructuredTurnRepliesWithFallback,
+  RELAYED_TURN_REPLY_ROUTE,
+  type RelayedTurnReplyClientClaim,
+} from './core/relayed-turn-reply.js';
 import {
   commitRestartIntentAttemptTo,
   consumeRestartIntentTo,
@@ -559,8 +584,10 @@ function pm2StartVerifyTimeoutMs(processCount: number): number {
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function ensureConfigDir(): void {
+  // Create ~/.botmux and its child state directories with mode 0o700 so strict
+  // parent/ancestor checks (`(mode & 0o022) === 0`) pass even under umask 0o002.
   for (const dir of [CONFIG_DIR, DATA_DIR, LOG_DIR, HEAPSHOT_DIR]) {
-    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
 }
 
@@ -2323,12 +2350,18 @@ export async function cmdSetupScripted(
     });
     let bot = draft;
     try {
-      if (cmd.flags.cliRuntime?.trim()) {
+      if (cmd.flags.cliRuntime?.trim() || cmd.flags.foldBackgroundUpdates !== undefined) {
         // Shared editor semantics: validate the runtime against cliId/wrapper
-        // and persist its executable as the exact downgrade path shadow.
+        // and persist its executable as the exact downgrade path shadow, plus
+        // any opt-in boolean flags supported on local bots.
         bot = applyBotConfigEdits(draft, {
-          cliRuntime: parseCliRuntimeFlag(cmd.flags.cliRuntime),
-          cliPathOverride: cmd.flags.cliPath,
+          ...(cmd.flags.cliRuntime?.trim()
+            ? {
+              cliRuntime: parseCliRuntimeFlag(cmd.flags.cliRuntime),
+              cliPathOverride: cmd.flags.cliPath,
+            }
+            : {}),
+          foldBackgroundUpdates: cmd.flags.foldBackgroundUpdates,
         });
       }
       validateCliLaunchModeConfig({
@@ -3395,19 +3428,28 @@ async function cmdStart(): Promise<void> {
   // FIRST STATEMENT, before any await or dependency probe: those run as child
   // processes and would inherit the marker. See consumeAutostartUnitMarker.
   const bootHookStart = consumeAutostartUnitMarker();
-  await (await import('./setup/feedback-storage.js')).configureFeedbackStorage(resolveDataDir());
+  const allowEmpty = !watchdogStart && process.argv.includes('--allow-empty');
   applyCompanionOptions(process.argv.slice(3));
   // `--systemd-service` and the PM2-God ownership gating that used to live here
   // are gone with pm2 itself: the built-in supervisor owns single-owner exclusion
   // via fleet-state (liveness check under the fleet mutation lock, completed by
   // the supervisor's own ownership claim at boot), so there is no God process
   // whose cgroup/generation has to be proven before starting.
-  if (!hasConfig()) {
+  if (!hasConfig() && !allowEmpty) {
     console.error('❌ 未找到配置文件');
     console.error('   请先运行: botmux setup');
     process.exit(1);
   }
+  const initialBots = loadBotsJson();
+  if (allowEmpty) {
+    const validation = validateBotConfigEntries(initialBots);
+    if (!validation.ok) {
+      console.error(`❌ ${validation.message}`);
+      process.exit(1);
+    }
+  }
   ensureConfigDir();
+  await (await import('./setup/feedback-storage.js')).configureFeedbackStorage(resolveDataDir());
   if (watchdogStart) {
     // The periodic path must stay local and cheap while healthy. In particular,
     // do not run dependency installers or one credential request per bot every
@@ -3432,12 +3474,15 @@ async function cmdStart(): Promise<void> {
     // explicit stop and re-arms crash recovery.
     clearWatchdogStopped(CONFIG_DIR);
   }
-  await ensureSystemDependencies();
+  const skipDepsForEmptyOnboarding = allowEmpty && initialBots.length === 0;
+  if (!skipDepsForEmptyOnboarding) {
+    await ensureSystemDependencies();
+  }
 
   const botsForCheck = await preflightConfiguredBotCredentials();
   // The boot hook marks itself so purely presentational waiting can be skipped
   // there (see startConfiguredFleet).
-  await startConfiguredFleet(botsForCheck, { bootHookStart, watchdogStart });
+  await startConfiguredFleet(botsForCheck, { bootHookStart, watchdogStart, allowEmpty });
 }
 
 async function cmdWatchdog(): Promise<void> {
@@ -3478,9 +3523,10 @@ async function preflightConfiguredBotCredentials() {
 
 async function startConfiguredFleet(
   botsForCheck: ReturnType<typeof loadBotsJson>,
-  options: { bootHookStart?: boolean; watchdogStart?: boolean } = {},
+  options: { bootHookStart?: boolean; watchdogStart?: boolean; allowEmpty?: boolean } = {},
 ): Promise<void> {
   let skippedForIntentionalStop = false;
+  let startedEmptyOnboarding = false;
 
   await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
     await withFileLock(BOTS_JSON_FILE, async () => {
@@ -3513,7 +3559,19 @@ async function startConfiguredFleet(
       // "refuse partial live fleet" dance needed; the running supervisor keeps
       // the fleet reconciled itself.
       const { startFleetViaSupervisor } = await import('./core/fleet-runtime.js');
-      const result = startFleetViaSupervisor();
+      const emptyOnboarding = options.allowEmpty === true && lockedBots.length === 0;
+      const sessionRefresh = Boolean(process.env.BOTMUX_SESSION_ID?.trim());
+      const result = startFleetViaSupervisor(emptyOnboarding
+        ? {
+            defaultDashboardHost: '127.0.0.1',
+            // Inside a managed session, explicitly refresh from persisted .env
+            // with NO inherited read-failure fallback so an absent ~/.botmux/.env
+            // falls back to 127.0.0.1 instead of inheriting a foreign session's
+            // BOTMUX_DASHBOARD_HOST=0.0.0.0. Desktop already strips BOTMUX_SESSION_ID.
+            ...(sessionRefresh ? { refreshPersistedEnv: true } : {}),
+          }
+        : {});
+      startedEmptyOnboarding = emptyOnboarding;
       if (result.action === 'already-running') {
         if (process.env.BOTMUX_COMPANION_SECRET_FILE || process.env.BOTMUX_COMPANION_BOT_APP_ID) {
           throw new Error('fleet is already running; use `botmux restart` to apply companion options');
@@ -3523,6 +3581,12 @@ async function startConfiguredFleet(
     }, { maxWaitMs: 5_000 });
   }, { maxWaitMs: 5_000 });
   if (skippedForIntentionalStop) return;
+  if (startedEmptyOnboarding && !options.bootHookStart) {
+    // Wait briefly outside the locks so fleet-state.json has botmux-dashboard
+    // attested online before Desktop queries getState() / locateDashboard().
+    const { resolveDashboardSpec, waitFleetOnline } = await import('./core/fleet-runtime.js');
+    waitFleetOnline([resolveDashboardSpec()], 10_000);
+  }
   await reconcilePluginServicesForCli(undefined, {
     autoOnly: true,
   });
@@ -3568,7 +3632,9 @@ async function startConfiguredFleet(
   // failure and, under the default KillMode=control-group, take the freshly
   // started supervisor down with the unit — so fixing the unit's path would be
   // undone by waiting inside it. Purely presentational: skip it.
-  if (!options.bootHookStart) await printDashboardHintWithRetry();
+  if (!options.bootHookStart) {
+    await printDashboardHintWithRetry(startedEmptyOnboarding ? { budgetMs: 15_000 } : undefined);
+  }
 }
 
 /**
@@ -3617,8 +3683,111 @@ function cleanupLegacyPm2(_op?: 'stop' | 'restart'): boolean {
 }
 
 
+function parseOptionalPositivePidFlag(argv: string[], flag: string): number | undefined {
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    let raw: string | undefined;
+    if (arg === flag) {
+      raw = argv[i + 1];
+    } else if (arg.startsWith(`${flag}=`)) {
+      raw = arg.slice(flag.length + 1);
+    } else {
+      continue;
+    }
+    if (!raw || !/^\d+$/.test(raw)) {
+      throw new Error(`${flag} 需要正整数 PID`);
+    }
+    const parsed = Number(raw);
+    if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+      throw new Error(`${flag} 需要正整数 PID`);
+    }
+    return parsed;
+  }
+  return undefined;
+}
+
 async function cmdStop(): Promise<void> {
-  const includePluginServices = process.argv.includes('--with-plugin');
+  const stopArgs = process.argv.slice(3);
+  const includePluginServices = stopArgs.includes('--with-plugin');
+  const ifEmpty = stopArgs.includes('--if-empty');
+  const expectedSupervisorPid = parseOptionalPositivePidFlag(stopArgs, '--supervisor-pid');
+  const callerHostPid = parseOptionalPositivePidFlag(stopArgs, '--host-pid');
+  if ((expectedSupervisorPid !== undefined || callerHostPid !== undefined) && !ifEmpty) {
+    console.error('--supervisor-pid / --host-pid 必须与 --if-empty 一起使用。');
+    process.exit(2);
+  }
+
+  if (ifEmpty) {
+    // Desktop 0-bot quit cleanup: never create ~/.botmux on an untouched host,
+    // never leave a watchdog-stopped marker, re-verify 0 configured bots AND
+    // check attested Desktop host leases atomically under the exact same lock
+    // order as cmdStart (fleet lock -> bots.json lock).
+    if (!existsSync(CONFIG_DIR)) {
+      console.log(formatStopIfEmptyCliOutcome('skipped:not-running'));
+      console.log('daemon 未在运行。');
+      return;
+    }
+    await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
+      await withFileLock(BOTS_JSON_FILE, async () => {
+        if (existsSync(BOTS_JSON_FILE)) {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(readFileSync(BOTS_JSON_FILE, 'utf-8'));
+          } catch {
+            console.log(formatStopIfEmptyCliOutcome('skipped:invalid-config'));
+            console.log('bots.json 存在且不可解析，跳过 --if-empty 停止。');
+            return;
+          }
+          const validation = validateBotConfigEntries(parsed);
+          if (!validation.ok) {
+            console.log(formatStopIfEmptyCliOutcome('skipped:invalid-config'));
+            console.log('bots.json 存在且结构无效，跳过 --if-empty 停止。');
+            return;
+          }
+          if (validation.count > 0) {
+            console.log(formatStopIfEmptyCliOutcome('skipped:configured'));
+            console.log('已存在配置机器人，跳过 --if-empty 停止。');
+            return;
+          }
+        }
+        if (hasOtherActiveDesktopHostLease(CONFIG_DIR, { excludePid: callerHostPid, pruneStale: true })) {
+          console.log(formatStopIfEmptyCliOutcome('skipped:other-host'));
+          console.log('检测到其他活跃的 Botmux Desktop 实例，跳过 --if-empty 停止。');
+          return;
+        }
+        const { liveSupervisorTarget, stopFleet } = await import('./core/fleet-runtime.js');
+        const target = liveSupervisorTarget();
+        if (!target) {
+          console.log(formatStopIfEmptyCliOutcome('skipped:not-running'));
+          console.log('daemon 未在运行。');
+          return;
+        }
+        if (expectedSupervisorPid !== undefined && target.pid !== expectedSupervisorPid) {
+          console.log(formatStopIfEmptyCliOutcome('skipped:pid-mismatch'));
+          console.log(`supervisor pid (${target.pid}) 与目标 (${expectedSupervisorPid}) 不一致，跳过 --if-empty 停止。`);
+          return;
+        }
+        const result = stopFleet(FLEET_DAEMON_EXIT_WAIT_MS);
+        if (result.action === 'not-running') {
+          cleanupStaleDaemonDescriptors();
+          console.log(formatStopIfEmptyCliOutcome('skipped:not-running'));
+          console.log('daemon 未在运行。');
+          return;
+        }
+        if (result.action === 'timeout') {
+          throw new Error(
+            `[stop] supervisor (pid ${result.supervisorPid}) 未在超时时间内退出；已发送 SIGKILL，`
+            + `请用 \`botmux status\` 复核 fleet 状态。`,
+          );
+        }
+        cleanupStaleDaemonDescriptors();
+        console.log(formatStopIfEmptyCliOutcome('stopped'));
+        console.log(`✅ 0-bot 引导服务已停止 (supervisor pid ${result.supervisorPid})`);
+      }, { maxWaitMs: 5_000 });
+    }, { maxWaitMs: 5_000 });
+    return;
+  }
+
   ensureConfigDir();
   // Persist intent before taking the fleet lock so a concurrently-fired
   // watchdog cannot resurrect the fleet after this stop completes.
@@ -3662,11 +3831,18 @@ async function cmdStop(): Promise<void> {
 }
 
 async function cmdRestart(): Promise<void> {
+  const allowEmpty = process.argv.includes('--allow-empty');
   applyCompanionOptions(process.argv.slice(3));
   const { refreshPersistedEnv, readFailureFallback } = prepareRestartDriverContext();
-  if (!hasConfig()) {
+  if (!hasConfig() && !allowEmpty) {
     console.error('❌ 未找到配置文件');
     console.error('   请先运行: botmux setup');
+    process.exit(1);
+  }
+  const initialBots = loadBotsJson();
+  const initialValidation = validateBotConfigEntries(initialBots);
+  if (!initialValidation.ok) {
+    console.error(`❌ ${initialValidation.message}`);
     process.exit(1);
   }
   ensureConfigDir();
@@ -3677,10 +3853,15 @@ async function cmdRestart(): Promise<void> {
   // `start-bot` time out and fail. The value is a login shell's PATH, so
   // reading it a moment earlier is harmless.
   const restartAutostartLoginPath = autostartHookFileExists() ? resolveLoginShellPath() : undefined;
+  let restartedEmptyOnboarding = false;
   await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
     // Report recovery guidance before any live-fleet mutation. The locked
     // check below repeats against the exact generation used for restart.
     const botsBeforeRestart = loadBotsJson();
+    const preRestartValidation = validateBotConfigEntries(botsBeforeRestart);
+    if (!preRestartValidation.ok) {
+      throw new Error(`[restart] ${preRestartValidation.message}`);
+    }
     preflightQuotaFallbackTopology(botsBeforeRestart, 'restart');
     preflightRetiredClis(botsBeforeRestart, 'restart');
     const includePluginServices = process.argv.includes('--with-plugin');
@@ -3692,13 +3873,22 @@ async function cmdRestart(): Promise<void> {
     } catch { /* intent reporting is best-effort */ }
 
     preflightNodeSanity();
-    await ensureSystemDependencies();
+    const skipDepsForEmptyOnboarding = allowEmpty && botsBeforeRestart.length === 0;
+    if (!skipDepsForEmptyOnboarding) {
+      await ensureSystemDependencies();
+    }
     cleanupLegacyPm2('restart'); // reap any pre-migration pm2 God still holding botmux procs
     if (includePluginServices) await stopPluginServicesForCli(undefined, { autoOnly: true });
     cleanupStaleDaemonDescriptors();
 
     await withFileLock(BOTS_JSON_FILE, async () => {
       const restartBots = loadBotsJson();
+      const lockedValidation = validateBotConfigEntries(restartBots);
+      if (!lockedValidation.ok) {
+        throw new Error(`[restart] ${lockedValidation.message}`);
+      }
+      const emptyOnboarding = allowEmpty && restartBots.length === 0;
+      restartedEmptyOnboarding = emptyOnboarding;
       // Recompute the skip set source against the locked config generation;
       // resolveFleetMembers applies the same projection in the new supervisor.
       preflightQuotaFallbackTopology(restartBots, 'restart', false);
@@ -3720,10 +3910,17 @@ async function cmdRestart(): Promise<void> {
       const { restartFleet, fleetHealthMembers, waitFleetOnline } = await import('./core/fleet-runtime.js');
       let health: ReturnType<typeof waitFleetOnline>;
       try {
+        const sessionOriginRestart = Boolean(process.env.BOTMUX_SESSION_ID?.trim());
+        const effectiveReadFailureFallback = emptyOnboarding && readFailureFallback
+          ? (sessionOriginRestart
+              ? undefined
+              : { ...readFailureFallback, BOTMUX_DASHBOARD_HOST: '' })
+          : readFailureFallback;
         const r = restartFleet({
           timeoutMs: FLEET_DAEMON_EXIT_WAIT_MS,
           refreshPersistedEnv,
-          readFailureFallback,
+          readFailureFallback: effectiveReadFailureFallback,
+          ...(emptyOnboarding ? { defaultDashboardHost: '127.0.0.1' } : {}),
         });
         if (r.stop.action === 'timeout') {
           throw new Error(
@@ -3780,13 +3977,13 @@ async function cmdRestart(): Promise<void> {
   // whole time, and those callers give up after 5s with a lock timeout. The
   // restart itself, its health gate, the plugin reconcile and the autostart sync
   // all stay inside.
-  await printDashboardHintWithRetry();
+  await printDashboardHintWithRetry(restartedEmptyOnboarding ? { budgetMs: 15_000 } : undefined);
 }
 
 
 export type StartBotLiveResult =
   | { ok: true; state: 'started' | 'already-online'; processName: string }
-  | { ok: false; reason: 'not_found' | 'not_ready' | 'fleet_down' | 'timeout' | 'supervisor_error' | 'config_dir_not_writable'; message: string };
+  | { ok: false; reason: 'not_found' | 'not_ready' | 'fleet_down' | 'timeout' | 'supervisor_error' | 'config_dir_not_writable' | 'dependency_missing'; message: string };
 
 export type StopBotLiveResult =
   | { ok: true; state: 'stopped' | 'already-stopped'; processName: string }
@@ -3858,48 +4055,113 @@ async function ensureBotDaemonStopped(
  * The activation-readiness gate (activationPending/starting/committed/
  * deactivating) is orthogonal to how the daemon is launched and is preserved.
  */
+function validateBotActivationGate(appId: string, bot: any): StartBotLiveResult | null {
+  if (bot?.activationPending === true) {
+    return { ok: false, reason: 'not_ready', message: `appId ${appId} is still activation pending` };
+  }
+  const activationStarting = bot?.activationStarting;
+  const activationCommitted = bot?.activationCommitted;
+  const activationDeactivating = bot?.activationDeactivating;
+  if (activationDeactivating !== undefined) {
+    return { ok: false, reason: 'not_ready', message: `appId ${appId} is still deactivating` };
+  }
+  if (activationStarting !== undefined && activationCommitted !== undefined) {
+    return { ok: false, reason: 'not_ready', message: `appId ${appId} has conflicting activation markers` };
+  }
+  const activationMarker = activationStarting ?? activationCommitted;
+  const activationJobId = (
+    activationMarker
+    && typeof activationMarker === 'object'
+    && !Array.isArray(activationMarker)
+    && activationMarker.appId === appId
+    && typeof activationMarker.jobId === 'string'
+    && activationMarker.jobId
+  )
+    ? String(activationMarker.jobId)
+    : undefined;
+  if (activationMarker !== undefined && !activationJobId) {
+    return { ok: false, reason: 'not_ready', message: `appId ${appId} has an invalid activation marker` };
+  }
+  return null;
+}
+
 async function ensureBotDaemonStarted(
   appId: string,
   opts: { quiet?: boolean } = {},
 ): Promise<StartBotLiveResult> {
   ensureConfigDir();
   try {
-    return await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
+    // Phase 1 (under fleet lock): verify writability, target bot readiness, and
+    // live supervisor status before releasing the lock for any dependency install.
+    type Phase1Result =
+      | { done: true; result: StartBotLiveResult }
+      | {
+          done: false;
+          effectiveBackend: string;
+          cliId?: import('./adapters/cli/types.js').CliId;
+          isApiOnly: boolean;
+          isFirstBotTransition: boolean;
+        };
+
+    const phase1: Phase1Result = await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
       cleanupLegacyPm2(); // reap a pre-migration pm2 God if one is still around
+      const bots = loadBotsJson();
+      const index = bots.findIndex(b => b?.larkAppId === appId);
+      if (index < 0) {
+        return { done: true, result: { ok: false, reason: 'not_found', message: `appId ${appId} 不在 bots.json 中` } };
+      }
+      const bot = bots[index];
+      const gateFailure = validateBotActivationGate(appId, bot);
+      if (gateFailure) return { done: true, result: gateFailure };
+
+      const { liveSupervisorTarget, readFleetStatus } = await import('./core/fleet-runtime.js');
+      if (!liveSupervisorTarget()) {
+        return { done: true, result: { ok: false, reason: 'fleet_down', message: 'daemon 未在运行，请先 botmux start' } };
+      }
+      const fleetStatus = readFleetStatus();
+      const existingRow = fleetStatus?.rows.find(row => row.appId === appId && row.status === 'online' && row.alive);
+      if (existingRow) {
+        return { done: true, result: { ok: true, state: 'already-online', processName: existingRow.name } };
+      }
+      const hasOnlineBotDaemon = Boolean(fleetStatus?.rows.some(row => Boolean(row.appId) && row.status === 'online' && row.alive));
+      return {
+        done: false,
+        effectiveBackend: bot?.backendType ?? config.daemon.backendType,
+        cliId: bot?.cliId,
+        isApiOnly: bot?.apiOnly === true,
+        isFirstBotTransition: !hasOnlineBotDaemon,
+      };
+    }, { maxWaitMs: 5_000 });
+
+    if (phase1.done) return phase1.result;
+
+    // Phase 2 (outside fleet lock): run single-bot dependency preflight so a
+    // 0->1 transition after `start --allow-empty` provisions tmux/herdr/fonts
+    // (or fails cleanly with dependency_missing) before spawning the daemon.
+    const { ensureBotStartDependencies } = await import('./setup/index.js');
+    const depCheck = await ensureBotStartDependencies({
+      effectiveBackend: phase1.effectiveBackend,
+      cliId: phase1.cliId,
+      isApiOnly: phase1.isApiOnly,
+      isFirstBotTransition: phase1.isFirstBotTransition,
+      ptyOptIn: (process.env.BACKEND_TYPE ?? '').toLowerCase() === 'pty',
+      quiet: opts.quiet,
+      installTimeoutMs: 90_000,
+      skipFontsDownload: process.env.BOTMUX_FENCED_RUN === '1',
+    });
+    if (!depCheck.ok) {
+      return depCheck;
+    }
+
+    // Phase 3 (re-acquire fleet lock): re-validate bot & spawn via supervisor.
+    return await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
       const bots = loadBotsJson();
       const index = bots.findIndex(b => b?.larkAppId === appId);
       if (index < 0) {
         return { ok: false, reason: 'not_found', message: `appId ${appId} 不在 bots.json 中` };
       }
-      const bot = bots[index];
-      // Activation-readiness gate (managed onboarding) — unchanged by the pm2→
-      // supervisor migration; a not-yet-ready bot must not be launched.
-      if (bot?.activationPending === true) {
-        return { ok: false, reason: 'not_ready', message: `appId ${appId} is still activation pending` };
-      }
-      const activationStarting = bot?.activationStarting;
-      const activationCommitted = bot?.activationCommitted;
-      const activationDeactivating = bot?.activationDeactivating;
-      if (activationDeactivating !== undefined) {
-        return { ok: false, reason: 'not_ready', message: `appId ${appId} is still deactivating` };
-      }
-      if (activationStarting !== undefined && activationCommitted !== undefined) {
-        return { ok: false, reason: 'not_ready', message: `appId ${appId} has conflicting activation markers` };
-      }
-      const activationMarker = activationStarting ?? activationCommitted;
-      const activationJobId = (
-        activationMarker
-        && typeof activationMarker === 'object'
-        && !Array.isArray(activationMarker)
-        && activationMarker.appId === appId
-        && typeof activationMarker.jobId === 'string'
-        && activationMarker.jobId
-      )
-        ? String(activationMarker.jobId)
-        : undefined;
-      if (activationMarker !== undefined && !activationJobId) {
-        return { ok: false, reason: 'not_ready', message: `appId ${appId} has an invalid activation marker` };
-      }
+      const gateFailure = validateBotActivationGate(appId, bots[index]);
+      if (gateFailure) return gateFailure;
 
       const { startBotViaSupervisor } = await import('./core/fleet-runtime.js');
       const r = startBotViaSupervisor(
@@ -3956,7 +4218,7 @@ async function cmdStartBot(argv: string[]): Promise<void> {
   }
   if (r.reason === 'fleet_down') {
     console.error('ℹ️  daemon 未在运行。请用 `botmux start` 启动整个进程组。');
-  } else if (r.reason === 'config_dir_not_writable') {
+  } else if (r.reason === 'config_dir_not_writable' || r.reason === 'dependency_missing') {
     console.error(`❌ ${r.message}`);
   } else {
     console.error(`❌ 拉起失败 (${r.reason}): ${r.message}`);
@@ -4626,8 +4888,9 @@ async function dashboardMemberComingUp(): Promise<boolean | null> {
  * of hanging for the whole budget. A fast boot is unaffected — the loop returns the
  * moment the dashboard answers.
  */
-async function printDashboardHintWithRetry(): Promise<void> {
+async function printDashboardHintWithRetry(opts?: { budgetMs?: number }): Promise<void> {
   const stepMs = 500;
+  const budgetMs = opts?.budgetMs ?? DASHBOARD_READY_WAIT_MS;
   const started = Date.now();
   let last: Awaited<ReturnType<typeof callDashboardEndpoint>> | null = null;
   for (;;) {
@@ -4644,7 +4907,7 @@ async function printDashboardHintWithRetry(): Promise<void> {
     // endpoint，绝不创建/轮换 token。两者都结束本循环，所以只导出一次。导出超时
     // 按剩余预算钳制，重读与轮询同样带 requestTimeoutMs。
     const exportTimeoutMs = dashboardExportTimeoutForBudget(
-      DASHBOARD_READY_WAIT_MS - (Date.now() - started),
+      budgetMs - (Date.now() - started),
     );
     last = await exportAfterDashboardAnswer(
       last,
@@ -4662,8 +4925,10 @@ async function printDashboardHintWithRetry(): Promise<void> {
       for (const line of rest) console.log(`   ${line}`);
       return;
     }
+    const elapsedMs = Date.now() - started;
+    if (elapsedMs >= budgetMs) break;
     const keepWaiting = shouldKeepWaitingForDashboard({
-      elapsedMs: Date.now() - started,
+      elapsedMs,
       failure: last,
       // Only asked when a retry is otherwise possible, so a fast boot never pays
       // for reading the fleet state.
@@ -6872,40 +7137,58 @@ async function noteTurnFinalOutsideReplyCard(
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
-  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'chat-manager' | 'rename' | 'project' | 'project-workstream' | 'decision-board' | 'continuation' | 'durable-send' | 'turn-delivery' | 'reply-card-ready' | 'feedback-bind' | typeof DEFERRED_TOPIC_CLAIM_ROUTE | typeof FEEDBACK_SEND_LEASE_ROUTE | 'link-refs/register' | 'link-refs/resolve',
+  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'chat-manager' | 'rename' | 'project' | 'project-workstream' | 'decision-board' | 'continuation' | 'durable-send' | 'turn-delivery' | typeof RELAYED_TURN_REPLY_ROUTE | 'reply-card-ready' | 'feedback-bind' | typeof DEFERRED_TOPIC_CLAIM_ROUTE | typeof FEEDBACK_SEND_LEASE_ROUTE | 'link-refs/register' | 'link-refs/resolve',
   payload: Record<string, unknown>,
   signal?: AbortSignal,
+  opts?: { originClaim?: RelayedTurnReplyClientClaim | null; relayHeaders?: Record<string, string> },
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };
+  const headers: Record<string, string> = { 'content-type': 'application/json' };
   let hostSecret: string | undefined;
   if (!process.env.BOTMUX_SEND_RELAY) {
     try { hostSecret = loadDaemonIpcSecret(); } catch { /* sandboxed/read-isolated: capability fallback below */ }
   }
-  if (!hostSecret || route === 'chat-manager' || route === 'project-workstream') {
-    const claim = readManagedOriginCapability(
-      resolveDataDir(),
-      sessionId,
-      process.env.BOTMUX_SEND_RELAY,
-      process.env.BOTMUX_ORIGIN_CHANNEL_ID,
-    );
-    if (claim) {
-      requestBody.originCapability = claim.capability;
-      if (claim.turnId) requestBody.originTurnId = claim.turnId;
-      if (claim.dispatchAttempt !== undefined) requestBody.originDispatchAttempt = claim.dispatchAttempt;
-    }
-    if (!claim && (route === 'chat-manager' || route === 'project-workstream') && !process.env.BOTMUX_SEND_RELAY && !process.env.BOTMUX_ORIGIN_CHANNEL_ID) {
-      const marker = findAuthenticatedAncestorSessionContext(resolveDataDir());
-      if (marker?.sessionId === sessionId && marker.capability) {
-        requestBody.originCapability = marker.capability;
-        requestBody.originTurnId = marker.turnId;
-        requestBody.originDispatchAttempt = marker.dispatchAttempt;
-      }
+  if (route === RELAYED_TURN_REPLY_ROUTE) {
+    // This route accepts only sealed payloads. Never attach the raw bearer
+    // capability: the request/response HMACs use it strictly as local key material.
+    if (!opts?.relayHeaders) throw new Error('Missing protected turn-reply envelope');
+    Object.assign(headers, opts.relayHeaders);
+  } else if (!hostSecret || route === 'chat-manager' || route === 'project-workstream') {
+    const resolvedClaim = opts && 'originClaim' in opts
+      ? opts.originClaim ?? null
+      : (() => {
+          const claim = readManagedOriginCapability(
+            resolveDataDir(),
+            sessionId,
+            process.env.BOTMUX_SEND_RELAY,
+            process.env.BOTMUX_ORIGIN_CHANNEL_ID,
+          );
+          if (claim) return claim;
+          if ((route === 'chat-manager' || route === 'project-workstream')
+            && !process.env.BOTMUX_SEND_RELAY && !process.env.BOTMUX_ORIGIN_CHANNEL_ID) {
+            try {
+              const marker = findAuthenticatedAncestorSessionContext(resolveDataDir());
+              if (marker?.sessionId === sessionId && marker.capability) {
+                return {
+                  capability: marker.capability,
+                  turnId: marker.turnId,
+                  dispatchAttempt: marker.dispatchAttempt,
+                };
+              }
+            } catch { /* legacy/incomplete pid marker: let daemon reject or host HMAC authenticate */ }
+          }
+          return null;
+        })();
+    if (resolvedClaim) {
+      requestBody.originCapability = resolvedClaim.capability;
+      if (resolvedClaim.turnId) requestBody.originTurnId = resolvedClaim.turnId;
+      if (resolvedClaim.dispatchAttempt !== undefined) requestBody.originDispatchAttempt = resolvedClaim.dispatchAttempt;
     }
   }
   const path = `/api/sessions/${encodeURIComponent(sessionId)}/${route}`;
   const init = {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers,
     body: JSON.stringify(requestBody),
     ...(signal ? { signal } : {}),
   } satisfies RequestInit;
@@ -7631,7 +7914,7 @@ async function cmdProject(argv: string[]): Promise<void> {
     ipcPort,
     session.sessionId,
     'workstream' in parsed ? 'project-workstream' : 'project',
-    'workstream' in parsed ? parsed.workstream : parsed.action as unknown as Record<string, unknown>,
+    'workstream' in parsed ? parsed.workstream : { ...parsed.action, cardPublication: 'repost' },
   );
   if ('workstream' in parsed) {
     const result = await response.json().catch(() => ({})) as { ok?: boolean; error?: string; hint?: string; result?: unknown; grantId?: string };
@@ -10246,6 +10529,15 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
         console.error(`⚠️ 当前 Bot daemon 版本过旧，未修改执行频率${updates.prompt !== undefined || updates.calendar !== undefined || updates.calendarDayType !== undefined ? '（其余字段已更新）' : ''}；请先重启/升级 daemon 再改频率。`);
         process.exit(1);
       }
+      if (updates.silent !== undefined && (!task || !('silent' in task))) {
+        // A daemon from before silent edits ignores the field and its receipt
+        // carries no silent value; never confirm a quiet-mode change that did
+        // not commit (the stored task may still be silent).
+        const otherFieldsChanged = updates.schedule !== undefined || updates.prompt !== undefined
+          || updates.calendar !== undefined || updates.calendarDayType !== undefined;
+        console.error(`⚠️ 当前 Bot daemon 版本过旧，未修改静默设置${otherFieldsChanged ? '（其余字段已更新）' : ''}；请先重启/升级 daemon 再切换静默执行。`);
+        process.exit(1);
+      }
       console.log(`✅ 已更新任务 ${id} 的配置；后续执行生效，未触发补跑。`);
       if (task) {
         const fmt = (iso: string) => new Date(iso).toLocaleString('zh-CN', { timeZone: scheduleTimeZone() });
@@ -10261,6 +10553,9 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
               : '任务已结束，不会自动执行'
             : '任务已暂停，恢复后按此频率执行';
         console.log(`   下次执行: ${nextLine}`);
+        if (updates.silent !== undefined) {
+          console.log(`   静默执行: ${task.silent ? '已开启' : '已关闭'}`);
+        }
         if (task.enabled && task.calendar !== undefined) {
           console.log(`   日历 ${task.calendar} 允许的下次执行: ${task.nextEligibleRunAt ? fmt(task.nextEligibleRunAt) : '—'}`);
         }
@@ -12883,8 +13178,94 @@ async function cmdSend(
   assertSessionTransportOrExit({ chatId: s.chatId, larkAppId: s.larkAppId }, 'send');
   let deferredMaterializedByThisCommand = false;
   let deferredTopicRootMessageIdForOutput: string | undefined;
+  let privateReplyDeliveredRecipient: string | undefined;
 
   const turnSendLedger = new TurnSendLedger(resolveDataDir());
+  const preCatchupTurnId = originTurnId ?? currentTurnId;
+  const preCatchupDispatchAttempt = originDispatchAttempt;
+  const preCatchupKey = preCatchupTurnId ? {
+    larkAppId: originSession?.larkAppId ?? s.larkAppId!,
+    sessionId: originSessionId ?? sid,
+    turnId: preCatchupTurnId,
+    ...(preCatchupDispatchAttempt !== undefined ? { dispatchAttempt: preCatchupDispatchAttempt } : {}),
+  } : undefined;
+  const recordCatchupFinalMarker = (
+    key: TurnSendLedgerKey,
+    final: NonNullable<TurnSendLedgerRecord['final']>,
+  ): void => {
+    const markerSessionId = originSessionId ?? sid;
+    const markerTurnId = key.turnId;
+    const replyTurnId = explicitReplyTo
+      ?? selectReplyMessageId(s, markerTurnId, liveMarkerCtx, explicitReplyTo)
+      ?? markerTurnId;
+    const turnTarget = parseReplyMessageTarget(s.turnReplyContexts?.[replyTurnId]?.target);
+    const targetChatId = overrideChatId ?? s.chatId;
+    const target = resolveSendTarget({
+      into: sendInto, topLevel: sendTopLevel, chatScope: s.scope === 'chat', chatId: targetChatId,
+      rootMessageId: s.rootMessageId,
+      replyTargetRootId: turnTarget && turnTarget.mode !== 'plain' ? turnTarget.rootMessageId : undefined,
+      replyTargetTurnId: replyTurnId,
+      replyTargetQuoteOnly: s.replyTargets?.[replyTurnId]?.quoteOnly,
+      currentTurnId: markerTurnId,
+    });
+    const detoured = !!sendTopLevel || !!overrideChatId || !!sendInto || markerSessionId !== sid;
+    const catchupContent = stripTrailingOaiMemoryCitation(sendPlan.contentFile
+      ? readFileSync(sendPlan.contentFile, 'utf-8')
+      : (sendPlan.stdinContent ?? normalizePositionalSendContent(sendPlan.invocation.positionals.join(' '))));
+    withBridgeReplyMarkerLock(resolveDataDir(), markerSessionId, () => {
+      if (hasBridgeReplyMarker({
+        dataDir: resolveDataDir(), sessionId: markerSessionId, turnId: markerTurnId,
+        messageId: final.messageId, responseKind: 'final',
+      })) return;
+      const identity = {
+        dataDir: resolveDataDir(),
+        sessionId: markerSessionId,
+        sentAtMs: final.sentAtMs ?? final.deliveredAtMs,
+        messageId: final.messageId,
+        turnId: markerTurnId,
+        responseKind: 'final' as const,
+      };
+      if (final.marker) {
+        recordBridgeReplyMarkerSnapshot({ ...final.marker, ...identity });
+        return;
+      }
+      // Pre-upgrade ledger rows have no marker snapshot. Keep their legacy
+      // recovery path, but never relabel the old delivery as auxiliary/progress.
+      recordBridgeReplyMarker({
+        ...identity,
+        deliveryKind: detoured ? 'detoured_send' : 'current_session_send',
+        content: catchupContent,
+        dispatchAttempt: key.dispatchAttempt,
+        targetChatId,
+        targetRootMessageId: deferredTopicRootMessageIdForOutput
+          ?? (target && target.mode !== 'plain' ? target.rootMessageId : undefined),
+        targetSessionId: sid,
+        crossChatFollowThread: effectiveCrossChatFollowThreadMode({
+          targetChatId, sourceChatId: (originSession ?? s).chatId, noFollowThread,
+        }),
+        followThreadEpoch: (originSession ?? s).followThreadEpoch,
+      });
+    });
+  };
+  // A crash can leave a committed final without its bridge marker even when
+  // there is no queued successor to advance. Restore that marker independently
+  // of the queue-advance loop; the journal lock keeps the operation idempotent.
+  if (!scheduleRemoveSelfRequested
+    && liveMarkerCtx?.markerPid && liveMarkerCtx.turnId
+    && !liveMarkerCtx.queuedTurnId && !(liveMarkerCtx.queuedTurns && liveMarkerCtx.queuedTurns.length > 0)) {
+    const activeMarkerKey = {
+      larkAppId: originSession?.larkAppId ?? s.larkAppId,
+      sessionId: originSessionId ?? sid,
+      turnId: liveMarkerCtx.turnId,
+      ...(liveMarkerCtx.dispatchAttempt !== undefined
+        ? { dispatchAttempt: liveMarkerCtx.dispatchAttempt }
+        : {}),
+    };
+    const activePrior = turnSendLedger.read(activeMarkerKey);
+    if (activePrior?.final && activePrior.dispatchAttempt === liveMarkerCtx.dispatchAttempt) {
+      recordCatchupFinalMarker(activeMarkerKey, activePrior.final);
+    }
+  }
   while (!scheduleRemoveSelfRequested
     && liveMarkerCtx?.markerPid && liveMarkerCtx.turnId
     && (liveMarkerCtx.queuedTurnId || (liveMarkerCtx.queuedTurns && liveMarkerCtx.queuedTurns.length > 0))) {
@@ -12896,7 +13277,19 @@ async function cmdSend(
     };
     const activePrior = turnSendLedger.read(activeMarkerKey);
     if (activePrior?.final) {
-      const advResult = advanceAncestorSessionTurn(sendDataDir, liveMarkerCtx.markerPid, liveMarkerCtx.turnId);
+      const priorSettled = activePrior.final.settledAbsorbedTurnIds;
+      const advResult = advanceAncestorSessionTurn(
+        sendDataDir,
+        liveMarkerCtx.markerPid,
+        liveMarkerCtx.turnId,
+        {
+          consumedDispatchAttempt: liveMarkerCtx.dispatchAttempt,
+          ...(priorSettled && priorSettled.length > 0
+            ? { canSettleAbsorbed: (turn: import('./core/session-marker.js').QueuedTypeAheadTurn) => priorSettled.includes(turn.turnId) }
+            : {}),
+          beforeTransition: () => recordCatchupFinalMarker(activeMarkerKey, activePrior.final!),
+        },
+      );
       if (advResult.advanced && advResult.turnId) {
         liveMarkerCtx = findLiveAncestorSessionContext(sendDataDir);
         originTurnId = advResult.turnId;
@@ -12904,9 +13297,29 @@ async function cmdSend(
         originDispatchAttempt = liveMarkerCtx?.dispatchAttempt;
         continue;
       }
+      if (advResult.settledAbsorbedTurnIds && advResult.settledAbsorbedTurnIds.length > 0) {
+        liveMarkerCtx = findLiveAncestorSessionContext(sendDataDir);
+        break;
+      }
     }
     break;
   }
+  const catchupAdvanced = preCatchupTurnId !== (originTurnId ?? currentTurnId)
+    || preCatchupDispatchAttempt !== originDispatchAttempt;
+  // Snapshot mid-turn absorbed queued turns BEFORE any provider I/O so a
+  // follow-up arriving/absorbed while Lark HTTP is in flight can never be
+  // silently settled by a final formulated before it existed.
+  const preSendHostTurnId = originTurnId ?? currentTurnId;
+  const preSendAbsorbedTurnIds = new Set(
+    (liveMarkerCtx?.queuedTurns ?? [])
+      .filter(q =>
+        q.inputConsumed === true
+        && !!preSendHostTurnId
+        && q.absorbedIntoTurnId === preSendHostTurnId
+        && q.absorbedIntoDispatchAttempt === originDispatchAttempt
+        && q.dispatchAttempt === undefined)
+      .map(q => q.turnId),
+  );
 
   const scheduleCleanupPlan = planScheduleFinalCleanup({
     requested: scheduleRemoveSelfRequested,
@@ -13899,13 +14312,255 @@ async function cmdSend(
       targetRootMessageId: sendInto, followThreadEpoch: (originSession ?? s).followThreadEpoch,
     });
   };
+  let resolveActualDeliveredTargetForLedger: (() => ReturnType<typeof resolveSendTarget> | undefined) | undefined;
+  const absorbedSettlementGateForTarget = (
+    actualDeliveredTarget: ReturnType<typeof resolveSendTarget> | undefined,
+  ) => buildAbsorbedTurnSettlementGate({
+    session: s,
+    originSessionId,
+    originDispatchAttempt,
+    preSendAbsorbedTurnIds,
+    actualDeliveredTarget,
+    privateReply: privateReplyDeliveredRecipient !== undefined,
+    replyTargetSenderOpenId: privateReplyDeliveredRecipient ?? replyTargetSenderOpenId,
+    explicitReplyTo,
+    routingOverride: sendTopLevel || !!overrideChatId || !!sendInto || explicitQuote !== undefined,
+    excludedSendKind: !!vcMeetingManagedSendOrigin
+      || isOriginDocCommentTurn
+      || isSlashSend
+      || !!scheduleRemoveSelfTaskId
+      || !!scheduledOriginRun,
+    crossPrincipalInterruption: config.crossPrincipalInterruption === true,
+  });
+  const absorbedSettlementAdvanceOpts = (
+    actualDeliveredTarget: ReturnType<typeof resolveSendTarget> | undefined,
+  ) => ({
+    consumedDispatchAttempt: originDispatchAttempt,
+    canSettleAbsorbed: absorbedSettlementGateForTarget(actualDeliveredTarget),
+  });
+  const resolveSettledAbsorbedTurnIdsForLedger = (): string[] | undefined => {
+    if (effectiveResponseKind !== 'final' || !liveMarkerCtx || !resolveActualDeliveredTargetForLedger) return undefined;
+    const gate = absorbedSettlementGateForTarget(resolveActualDeliveredTargetForLedger());
+    const { settled } = selectAbsorbedTurnsToSettle(liveMarkerCtx, originTurnId ?? currentTurnId, gate);
+    return settled.length > 0 ? settled.map(entry => entry.turnId) : undefined;
+  };
+  type LedgerFinalRecord = NonNullable<TurnSendLedgerRecord['final']>;
+  let finalQueueTransitionDeferred = false;
+  /** Replay and crash recovery share one durable convergence point. The ledger
+   *  supplies the original message ID/time and the exact settlement allow-list;
+   *  no destination decision is recomputed from mutable session state. */
+  const ensureLedgerFinalTransition = (opts: {
+    key: TurnSendLedgerKey;
+    markerSessionId: string;
+    markerTurnId: string | undefined;
+    allowAdvance?: boolean;
+    writeMarker: (final: LedgerFinalRecord) => void;
+  }): ReturnType<typeof advanceAncestorSessionTurn> => {
+    let final: LedgerFinalRecord | undefined;
+    try { final = turnSendLedger.read(opts.key)?.final; } catch { /* handled as deferred below */ }
+    if (!final) {
+      finalQueueTransitionDeferred = true;
+      console.error('botmux send: 最终答复已投递，但发送账本暂不可读；请原样重试以补做轮次交接（不会重复发送 final）');
+      return { advanced: false, turnId: opts.markerTurnId };
+    }
+    const committedFinal = final;
+    let writeAttempted = false;
+    const writeMarkerOnce = () => {
+      if (writeAttempted) return;
+      writeAttempted = true;
+      try {
+        // The existence check and append are one journal-locked operation even
+        // when schedule cleanup forbids PID advancement or the PID lock failed.
+        withBridgeReplyMarkerLock(resolveDataDir(), opts.markerSessionId, () => {
+          if (hasBridgeReplyMarker({
+            dataDir: resolveDataDir(), sessionId: opts.markerSessionId,
+            turnId: opts.markerTurnId ?? opts.key.turnId,
+            messageId: committedFinal.messageId, responseKind: 'final',
+          })) return;
+          opts.writeMarker(committedFinal);
+        });
+      } catch (error) {
+        finalQueueTransitionDeferred = true;
+        console.error(`botmux send: 最终答复已投递，但回复标记补记失败（${error instanceof Error ? error.message : String(error)}）；请原样重试`);
+      }
+    };
+    if (opts.allowAdvance === false || !liveMarkerCtx?.markerPid) {
+      writeMarkerOnce();
+      return { advanced: false, turnId: liveMarkerCtx?.turnId ?? opts.markerTurnId };
+    }
+    try {
+      return advanceAncestorSessionTurn(
+        sendDataDir,
+        liveMarkerCtx.markerPid,
+        opts.markerTurnId,
+        {
+          consumedDispatchAttempt: originDispatchAttempt,
+          canSettleAbsorbed: turn => committedFinal.settledAbsorbedTurnIds?.includes(turn.turnId) === true,
+          beforeTransition: writeMarkerOnce,
+        },
+      );
+    } catch (error) {
+      // Provider delivery already succeeded. Publish an idempotent fallback
+      // marker and ask for an exact replay instead of reporting total failure.
+      writeMarkerOnce();
+      finalQueueTransitionDeferred = true;
+      console.error(`botmux send: 最终答复已投递，但轮次交接暂未落盘（${error instanceof Error ? error.message : String(error)}）；请原样重试（不会重复发送 final）`);
+      return { advanced: false, turnId: liveMarkerCtx.turnId };
+    }
+  };
+
+  // Require parent-PID-verified `trustedRelayCtx` (never raw child-mutable
+  // `BOTMUX_HOST_RELAY_AUTHORIZED=1`) before trusting local turns.sqlite access.
+  const mustProxyStructuredReply = !trustedRelayCtx && (
+    isolatedSendRequired
+    || kernelReadIsolationDetected
+    || process.env.BOTMUX_READ_ISOLATED === '1'
+    || !!isolatedAttestationContext
+  );
+  async function collectDeliveredCompanionAttachmentIds(
+    primaryMessageId: string,
+    deliveryChatId: string | undefined,
+  ): Promise<string[]> {
+    if (!primaryMessageId.startsWith('om_') || !deliveryChatId?.startsWith('oc_')) return [];
+    try {
+      const { ReplyDeliveryStore } = await import('./services/reply-delivery-store.js');
+      const delivery = new ReplyDeliveryStore(resolveDataDir()).read(appId, primaryMessageId, deliveryChatId);
+      if (!delivery) return [];
+      const seen = new Set<string>([primaryMessageId]);
+      const out: string[] = [];
+      for (const item of delivery.attachments) {
+        if (item.status === 'sent' && item.messageId && !seen.has(item.messageId)) {
+          seen.add(item.messageId);
+          out.push(item.messageId);
+        }
+      }
+      return out;
+    } catch {
+      return [];
+    }
+  }
+  async function recordStructuredSendReceipts(
+    markerSessionId: string,
+    markerTurnId: string | undefined,
+    entries: ReadonlyArray<{ messageId: string | undefined; at: number; text?: string }>,
+  ): Promise<void> {
+    if (!markerTurnId || entries.length === 0) return;
+    const replies: SessionTurnReply[] = [];
+    for (const entry of entries) {
+      if (!entry.messageId) continue;
+      replies.push({
+        messageId: entry.messageId,
+        responseKind: effectiveResponseKind,
+        at: entry.at,
+        ...(entry.text ? { text: entry.text } : {}),
+      });
+    }
+    if (replies.length === 0) return;
+
+    const readClaimForSession = (): RelayedTurnReplyClientClaim | null => {
+      const claim = readManagedOriginCapability(
+        resolveDataDir(),
+        markerSessionId,
+        relayDir,
+        inheritedOriginChannelId,
+      );
+      if (claim) {
+        return {
+          capability: claim.capability,
+          ...(claim.turnId ? { turnId: claim.turnId } : {}),
+          ...(claim.dispatchAttempt !== undefined ? { dispatchAttempt: claim.dispatchAttempt } : {}),
+          ...(claim.ipcPort !== undefined ? { ipcPort: claim.ipcPort } : {}),
+          ...(claim.larkAppId ? { larkAppId: claim.larkAppId } : {}),
+        };
+      }
+      if (!relayDir && !inheritedOriginChannelId) {
+        try {
+          const marker = findAuthenticatedAncestorSessionContext(resolveDataDir());
+          if (marker?.sessionId === markerSessionId && marker.capability) {
+            return {
+              capability: marker.capability,
+              ...(marker.turnId ? { turnId: marker.turnId } : {}),
+              ...(marker.dispatchAttempt !== undefined ? { dispatchAttempt: marker.dispatchAttempt } : {}),
+            };
+          }
+        } catch { /* legacy/incomplete pid marker: rely on host HMAC if available */ }
+      }
+      return null;
+    };
+
+    const resolvePortsForSession = (claim: RelayedTurnReplyClientClaim | null): number[] => {
+      const originAppId = claim?.larkAppId
+        ?? (markerSessionId === originSessionId
+          ? isolatedAttestationContext?.larkAppId ?? originSession?.larkAppId
+          : undefined)
+        ?? (markerSessionId === sid ? appId : undefined)
+        ?? process.env.BOTMUX_LARK_APP_ID?.trim();
+      let discoveredPort: number | undefined;
+      if (originAppId) {
+        try { discoveredPort = findDaemon(originAppId)?.ipcPort; } catch { /* sandbox may deny dashboard-daemons */ }
+      }
+      const envPort = resolveDaemonIpcPort(undefined, process.env.BOTMUX_DAEMON_IPC_PORT);
+      const fallbackPort = markerSessionId === isolatedAttestationContext?.sessionId
+        ? isolatedAttestationContext.ipcPortFallback
+        : undefined;
+      let hasHostSecret = false;
+      if (!relayDir && !mustProxyStructuredReply) {
+        try { hasHostSecret = !!loadDaemonIpcSecret(); } catch { /* capability-only */ }
+      }
+      // Trusted-host HMAC callers read live daemon descriptors directly, so try
+      // `discoveredPort` ahead of a potentially stale claim port; capability
+      // callers keep host-written `claim.ipcPort` first on the happy path and
+      // fail over to `discoveredPort` on port drift / stale-port reuse.
+      return buildRelayedTurnReplyPortCandidates(
+        hasHostSecret
+          ? [discoveredPort, claim?.ipcPort, fallbackPort, envPort]
+          : [claim?.ipcPort, discoveredPort, fallbackPort, envPort],
+      );
+    };
+
+    try {
+      const outcome = await recordStructuredTurnRepliesWithFallback({
+        sessionId: markerSessionId,
+        turnId: markerTurnId,
+        replies,
+        mustProxy: mustProxyStructuredReply,
+        recordLocal: batch => recordSessionTurnReplies(resolveDataDir(), markerSessionId, markerTurnId, batch),
+        postRelay: batch => postRelayedTurnReplies({
+          sessionId: markerSessionId,
+          expectedTurnId: markerTurnId,
+          replies: batch,
+          readClaim: readClaimForSession,
+          readHostSecret: () => {
+            if (relayDir) return undefined;
+            try { return loadDaemonIpcSecret(); } catch { return undefined; }
+          },
+          preferCapability: mustProxyStructuredReply,
+          resolvePorts: resolvePortsForSession,
+          postBatch: ({ ipcPort, sessionId: targetSid, payload, headers, signal }) =>
+            postSessionCliIpc(ipcPort, targetSid, RELAYED_TURN_REPLY_ROUTE,
+              payload as unknown as Record<string, unknown>, signal, { relayHeaders: headers }),
+          allowTurnUnboundRetry: !isolatedAttestationContext,
+        }),
+      });
+      if (!outcome.ok) {
+        console.error('botmux: could not record structured reply');
+      }
+    } catch {
+      console.error('botmux: could not record structured reply');
+    }
+  }
   const executeTurnPrimary = async (
     renderedContent: string,
     dispatch: (providerUuid?: string) => Promise<string>,
-  ): Promise<{ messageId: string; replayed: boolean }> => {
+    sentAtMs?: number,
+    marker?: import('./services/turn-send-ledger.js').TurnSendLedgerMarkerSource,
+  ): Promise<{ messageId: string; replayed: boolean; sentAtMs?: number }> => {
     return turnSendKey
       ? turnSendLedger.execute(turnSendKey, effectiveResponseKind, renderedContent, dispatch, {
+          ...(sentAtMs !== undefined ? { sentAtMs } : {}),
+          ...(marker ? { marker } : {}),
           beforeDispatch: persistOffBeforeProvider,
+          resolveSettledAbsorbedTurnIds: resolveSettledAbsorbedTurnIdsForLedger,
           ...(scheduledSendAttempt ? { noSideEffect: (error: unknown) =>
             !scheduledProviderEffectStarted && knownPreProviderRejections.has(error) } : {}),
         })
@@ -13913,49 +14568,208 @@ async function cmdSend(
           // No-turn sends have no ledger to validate, but the same pre-provider
           // off contract still applies: a failed tombstone aborts before Lark.
           persistOffBeforeProvider();
-          return { messageId: await dispatch(), replayed: false };
+          return {
+            messageId: await dispatch(),
+            replayed: false,
+            ...(sentAtMs !== undefined ? { sentAtMs } : {}),
+          };
         })();
   };
-  let existingTurnPrimary: { messageId: string; replayed: boolean } | undefined;
+  const turnRequestIdentityForReplayHost = (hostTurnId: string): string => {
+    const crossOrigin = crossChatOriginForSend({
+      replyContext: s.turnReplyContexts?.[hostTurnId],
+      replyTarget: s.replyTargets?.[hostTurnId],
+      frozenTurnDispatch,
+    });
+    const sender = explicitVcMeetingImOrigin?.replyTargetSenderOpenId ?? crossChatSenderForSend({
+      crossChatOrigin: crossOrigin,
+      sendingToOriginSessionChat,
+      frozenTurnSender: pickTurnReplyTarget(s, hostTurnId)?.senderOpenId
+        ?? s.turnReplyContexts?.[hostTurnId]?.replyTargetSenderOpenId,
+      legacySender: undefined,
+      originQuoteSender: s.quoteTargetSenderOpenId,
+      originLastCaller: s.lastCallerOpenId,
+      originOwner: s.ownerOpenId,
+    });
+    const identity = JSON.parse(turnRequestIdentity) as any;
+    return canonicalJson({
+      ...identity,
+      addressing: { ...identity.addressing, replyTargetSenderOpenId: sender },
+    });
+  };
+  let replayTurnKey: TurnSendLedgerKey | undefined = turnSendKey;
+  let replayMarkerTurnId = originTurnId ?? currentTurnId;
+  let replayDispatchAttempt = originDispatchAttempt;
+  const resolveReplayPrimaryTarget = () => {
+    const replayChatId = overrideChatId ?? s.chatId;
+    return !sendInto && !sendTopLevel && !overrideChatId && frozenTurnReplyTarget
+      ? frozenTurnReplyTarget
+      : resolveSendTarget({
+          into: sendInto, topLevel: sendTopLevel, chatScope: s.scope === 'chat', chatId: replayChatId,
+          rootMessageId: s.rootMessageId, replyTargetRootId: turnReplyTarget?.rootMessageId,
+          replyTargetTurnId: turnReplyTarget?.turnId, replyTargetQuoteOnly: turnReplyTarget?.quoteOnly,
+          currentTurnId: replayMarkerTurnId,
+        });
+  };
+  const recordReplayPrimaryBridgeMarker = (final: LedgerFinalRecord) => {
+    const replayText = customFinal ? expectedLinkRenderedContent : extractCardText(content);
+    const replayChatId = overrideChatId ?? s.chatId;
+    const replayTarget = resolveReplayPrimaryTarget();
+    const markerSessionId = originSessionId ?? sid;
+    const markerTurnId = replayMarkerTurnId;
+    if (final.marker) {
+      recordBridgeReplyMarkerSnapshot({
+        ...final.marker,
+        dataDir: resolveDataDir(),
+        sessionId: markerSessionId,
+        sentAtMs: final.sentAtMs ?? final.deliveredAtMs,
+        messageId: final.messageId,
+        turnId: markerTurnId,
+        responseKind: 'final',
+      });
+      return;
+    }
+    const detoured = !!sendTopLevel || !!overrideChatId || !!sendInto || markerSessionId !== sid;
+    const pureFile = fileOnlyPrimaryRequested && !replayText.trim()
+      && images.length === 0 && mentionArgs.length === 0;
+    const pureVideo = customCard ? false : shouldSendAsPureVideo({
+      hasBodyText: !!replayText.trim(), imageCount: images.length,
+      fileCount: files.length, videoCount: videoAttachments.length, mentionCount: mentionArgs.length,
+    });
+    const nonPatchable = asVoice || isOriginDocCommentTurn || (customCard && !customFinal)
+      || pureFile || pureVideo;
+    recordBridgeReplyMarker({
+      dataDir: resolveDataDir(), sessionId: markerSessionId,
+      sentAtMs: final.sentAtMs ?? final.deliveredAtMs, messageId: final.messageId,
+      deliveryKind: detoured ? 'detoured_send' : 'current_session_send',
+      content: replayText, responseKind: effectiveResponseKind, turnId: markerTurnId,
+      terminalCarrier: nonPatchable ? 'non_patchable' : 'standard_reply_card',
+      dispatchAttempt: replayDispatchAttempt,
+      targetChatId: replayChatId,
+      targetRootMessageId: deferredTopicRootMessageIdForOutput
+        ?? (replayTarget.mode === 'plain' ? undefined : replayTarget.rootMessageId),
+      targetSessionId: sid,
+      crossChatFollowThread: effectiveFollowThreadMode,
+      followThreadEpoch: (originSession ?? s).followThreadEpoch,
+    });
+  };
+
+  let existingTurnPrimary: { messageId: string; replayed: boolean; sentAtMs?: number } | undefined;
   try {
-    existingTurnPrimary = turnSendKey
-      ? await turnSendLedger.replayOrThrow(turnSendKey, effectiveResponseKind, turnRequestIdentity)
-      : undefined;
+    // Catch-up may have moved the active turn before request identity was
+    // computed. Try the original host first so an exact replay can never turn
+    // into "new turn B's final delivered to old host A".
+    if (catchupAdvanced && preCatchupKey && effectiveResponseKind === 'final') {
+      try {
+        const originalReplay = await turnSendLedger.replayOrThrow(
+          preCatchupKey, effectiveResponseKind, turnRequestIdentityForReplayHost(preCatchupTurnId!),
+        );
+        if (originalReplay) {
+          existingTurnPrimary = originalReplay;
+          replayTurnKey = preCatchupKey;
+          replayMarkerTurnId = preCatchupTurnId;
+          replayDispatchAttempt = preCatchupDispatchAttempt;
+        }
+      } catch (error) {
+        // Reuse is safe only for an exact replay. A same-root turn is not
+        // necessarily an old request: only an explicit old-turn binding can
+        // create the forbidden "B final delivered to A" combination.
+        if (explicitReplyTo === preCatchupTurnId || replyMessageId === preCatchupTurnId) {
+          throw new Error(`会话已从 ${preCatchupTurnId} 晋升，不能沿用旧宿主 final 请求；请为新轮次重新选择回复目标`, { cause: error });
+        }
+        // A different reply target or ordinary new B reply remains legitimate.
+      }
+    }
+    if (!existingTurnPrimary && !catchupAdvanced && effectiveResponseKind === 'final'
+      && liveMarkerCtx?.promotedAbsorbedTurn && liveMarkerCtx.promotedFromTurnId) {
+      const previousTurnId = liveMarkerCtx.promotedFromTurnId;
+      const previousKey: TurnSendLedgerKey = {
+        larkAppId: originSession?.larkAppId ?? s.larkAppId!,
+        sessionId: originSessionId ?? sid,
+        turnId: previousTurnId,
+        ...(liveMarkerCtx.promotedFromDispatchAttempt !== undefined
+          ? { dispatchAttempt: liveMarkerCtx.promotedFromDispatchAttempt } : {}),
+      };
+      try {
+        const previousReplay = await turnSendLedger.replayOrThrow(
+          previousKey, effectiveResponseKind, turnRequestIdentityForReplayHost(previousTurnId),
+        );
+        if (previousReplay) {
+          existingTurnPrimary = previousReplay;
+          replayTurnKey = previousKey;
+          replayMarkerTurnId = previousTurnId;
+          replayDispatchAttempt = liveMarkerCtx.promotedFromDispatchAttempt;
+        }
+      } catch (error) {
+        // A different destination is a genuinely new answer. Reusing the old
+        // host's destination with a different request is never safe: require
+        // the caller to construct the promoted turn's request explicitly.
+        if (explicitReplyTo === previousTurnId || replyMessageId === previousTurnId) {
+          throw new Error(`会话已从 ${previousTurnId} 晋升，不能沿用旧宿主 final 请求；请为新轮次重新选择回复目标`, { cause: error });
+        }
+      }
+    }
+    if (!existingTurnPrimary) {
+      existingTurnPrimary = turnSendKey
+        ? await turnSendLedger.replayOrThrow(turnSendKey, effectiveResponseKind, turnRequestIdentity)
+        : undefined;
+    }
   } catch (error) {
     console.error(`botmux send refused: ${error instanceof Error ? error.message : String(error)}`);
     process.exit(2);
   }
   if (existingTurnPrimary) {
+    if (existingTurnPrimary.sentAtMs !== undefined) {
+      const replaySessionId = isOriginDocCommentTurn ? originSessionId! : (originSessionId ?? sid);
+      const replayTurnId = replayMarkerTurnId;
+      const replayPureVideo = !customCard && !asChoice && shouldSendAsPureVideo(primaryShape);
+      const replayStructuredText = asVoice || isOriginDocCommentTurn
+        ? content
+        : (!customCard && !fileOnlyPrimaryRequested && !replayPureVideo
+            ? (preparedText ?? extractCardText(content))
+            : undefined);
+      const companionIds = !asVoice && !isOriginDocCommentTurn && !fileOnlyPrimaryRequested
+        ? await collectDeliveredCompanionAttachmentIds(existingTurnPrimary.messageId, followThreadTargetChatId)
+        : [];
+      await recordStructuredSendReceipts(replaySessionId, replayTurnId, [
+        {
+          messageId: existingTurnPrimary.messageId,
+          at: existingTurnPrimary.sentAtMs,
+          ...(replayStructuredText ? { text: replayStructuredText } : {}),
+        },
+        ...companionIds.map(id => ({ messageId: id, at: existingTurnPrimary.sentAtMs! })),
+      ]);
+    }
     if (effectiveFollowThreadMode === 'at') {
       const bound = ensureCrossChatFollowThreadAtBinding({
         dataDir: resolveDataDir(), sessionId: originSessionId ?? sid, sentAtMs: Date.now(),
         messageId: existingTurnPrimary.messageId, targetChatId: followThreadTargetChatId,
         ...(sendInto ? { targetRootMessageId: sendInto } : {}),
         followThreadEpoch: (originSession ?? s).followThreadEpoch,
-        sourceTurnId: originTurnId ?? currentTurnId,
+        sourceTurnId: replayMarkerTurnId,
       });
       if (!bound) console.error('botmux send: 已复用投递，但跨群话题绑定补建失败');
     }
     // A retry after a lost reply-card mark completes it; a final already on
     // the card is left alone by the store.
-    if (effectiveResponseKind === 'final' && currentTurnId) {
-      await noteTurnFinalOutsideReplyCard({ larkAppId: appId, sessionId: sid, turnId: currentTurnId, dispatchAttempt: originDispatchAttempt },
+    if (effectiveResponseKind === 'final' && replayMarkerTurnId) {
+      await noteTurnFinalOutsideReplyCard({ larkAppId: appId, sessionId: sid, turnId: replayMarkerTurnId, dispatchAttempt: replayDispatchAttempt },
         overrideChatId ?? s.chatId, sendTopLevel || !!sendInto || !!overrideChatId);
     }
     await removeScheduleSelfAfterFinal();
-    if (scheduleSelfCleanup?.removed && liveMarkerCtx?.markerPid) {
-      advanceAncestorSessionTurn(
-        sendDataDir,
-        liveMarkerCtx.markerPid,
-        originTurnId ?? currentTurnId,
-      );
-    }
+    ensureLedgerFinalTransition({
+      key: replayTurnKey!,
+      markerSessionId: originSessionId ?? sid,
+      markerTurnId: replayMarkerTurnId,
+      allowAdvance: !scheduleRemoveSelfTaskId || scheduleSelfCleanup?.removed === true,
+      writeMarker: recordReplayPrimaryBridgeMarker,
+    });
     console.error(`✓ 已复用本轮最终回答 ${existingTurnPrimary.messageId}`);
     console.log(JSON.stringify({
       success: true,
       messageId: existingTurnPrimary.messageId,
       sessionId: sid,
-      turnId: currentTurnId,
+      turnId: replayMarkerTurnId,
       replayed: true,
       ...(scheduleSelfCleanup ? { scheduleSelfCleanup } : {}),
     }));
@@ -14055,12 +14869,52 @@ async function cmdSend(
     const { rmSync } = await import('node:fs');
     const targetChatId = overrideChatId ?? s.chatId;
     let voicePrimaryOutputChatId = targetChatId;
+    let voiceActualDeliveredTarget = !sendInto && !sendTopLevel && !overrideChatId && frozenTurnReplyTarget
+      ? frozenTurnReplyTarget
+      : resolveSendTarget({
+          into: sendInto,
+          topLevel: sendTopLevel,
+          chatScope: s.scope === 'chat',
+          chatId: targetChatId,
+          rootMessageId: s.rootMessageId,
+          replyTargetRootId: turnReplyTarget?.rootMessageId,
+          replyTargetTurnId: turnReplyTarget?.turnId,
+          replyTargetQuoteOnly: turnReplyTarget?.quoteOnly,
+          currentTurnId,
+        });
     let dir: string | undefined;
     let voiceDurationMs: number | undefined;
     try {
       // Attribute the send to its start, not a delayed synthesis/provider ACK
       // that may arrive after another input was folded into the native turn.
       const sentAtMs = Date.now();
+      resolveActualDeliveredTargetForLedger = () => deferredTopicRootMessageIdForOutput
+        ? { mode: 'thread', rootMessageId: deferredTopicRootMessageIdForOutput }
+        : voiceActualDeliveredTarget;
+      const voiceCrossChatFollowThread = effectiveCrossChatFollowThreadMode({
+        targetChatId: voicePrimaryOutputChatId,
+        sourceChatId: (originSession ?? s).chatId,
+        noFollowThread,
+      });
+      const voiceMarkerMetadata = (): import('./services/turn-send-ledger.js').TurnSendLedgerMarkerInput => {
+        const markerSessionId = originSessionId ?? sid;
+        const detoured = !!sendTopLevel || !!overrideChatId || !!sendInto || markerSessionId !== sid;
+        return {
+          deliveryKind: detoured ? 'detoured_send' : 'current_session_send',
+          content,
+          responseKind: effectiveResponseKind,
+          terminalCarrier: 'non_patchable',
+          dispatchAttempt: originDispatchAttempt,
+          targetChatId: voicePrimaryOutputChatId,
+          targetRootMessageId: deferredTopicRootMessageIdForOutput ?? sendInto
+            ?? (voiceActualDeliveredTarget && voiceActualDeliveredTarget.mode !== 'plain'
+              ? voiceActualDeliveredTarget.rootMessageId
+              : undefined),
+          targetSessionId: sid,
+          crossChatFollowThread: voiceCrossChatFollowThread,
+          followThreadEpoch: (originSession ?? s).followThreadEpoch,
+        };
+      };
       const voiceDelivery = await executeTurnPrimary(turnRequestIdentity, async providerUuid => {
         await revalidateIsolatedOriginBeforeEffect();
         const out = await synthesizeVoiceOpus(appId, content, {
@@ -14096,10 +14950,14 @@ async function cmdSend(
           const managedProviderOptions = outboundMessageOptions(!!prepared);
           const deliveryUuid = prepared?.providerKey ?? providerUuid;
           await revalidateIsolatedOriginBeforeEffect();
+          const privateDeliveryTargetOpenId = pickTurnReplyTarget(s, currentTurnId)?.senderOpenId;
           const privateMessageId = !sendInto && !overrideChatId
             ? await sendPrivateReply(s, currentTurnId, canonicalOutput.content, canonicalOutput.msgType, deliveryUuid,
                 { beforeWrite: fenceScheduledProviderWrite })
             : undefined;
+          if (privateMessageId !== undefined) {
+            privateReplyDeliveredRecipient = privateDeliveryTargetOpenId ?? '';
+          }
           const deferred = privateMessageId !== undefined
             ? { handled: true, messageId: privateMessageId, materializedNow: false, rootMessageId: undefined }
             : !sendInto && (!overrideChatId || overrideChatId === s.chatId)
@@ -14145,6 +15003,7 @@ async function cmdSend(
                   replyTargetQuoteOnly: turnReplyTarget?.quoteOnly,
                   currentTurnId,
                 });
+            voiceActualDeliveredTarget = canonicalTarget;
             await revalidateIsolatedOrigin();
             deliveredMessageId = canonicalTarget.mode === 'plain'
               ? await sendMessage(
@@ -14161,62 +15020,96 @@ async function cmdSend(
           }
         }
         return deliveredMessageId;
-      });
+      }, sentAtMs, voiceMarkerMetadata);
       const messageId = voiceDelivery.messageId;
       recordVcMeetingPrimaryOutput(messageId, voicePrimaryOutputChatId);
       // 语音也是一次可见回复。当前会话和具备精确 source turn 的 detour
       // 都记录；无 turn 的手工 detour 不写，避免靠时间窗压掉别的回复。
-      const voiceCrossChatFollowThread = effectiveCrossChatFollowThreadMode({
-        targetChatId: voicePrimaryOutputChatId,
-        sourceChatId: (originSession ?? s).chatId,
-        noFollowThread,
-      });
-      if (voiceDelivery.replayed && voiceCrossChatFollowThread === 'at') {
-        const voiceFollowRoot = deferredTopicRootMessageIdForOutput ?? sendInto;
-        const bound = ensureCrossChatFollowThreadAtBinding({
-          dataDir: resolveDataDir(), sessionId: originSessionId ?? sid, sentAtMs, messageId,
-          targetChatId: voicePrimaryOutputChatId,
-          ...(voiceFollowRoot ? { targetRootMessageId: voiceFollowRoot } : {}),
-          followThreadEpoch: (originSession ?? s).followThreadEpoch,
-          sourceTurnId: originTurnId ?? currentTurnId,
-        });
-        if (!bound) console.error('botmux send: 已复用语音投递，但跨群话题绑定补建失败');
-      }
-      if (!voiceDelivery.replayed && ((!sendTopLevel && !overrideChatId && !sendInto)
-        || !!(originTurnId ?? currentTurnId)
-        || !!deferredTopicRootMessageIdForOutput
-        || voiceCrossChatFollowThread !== undefined)) {
-        try {
-          const markerSessionId = originSessionId ?? sid;
-          const markerTurnId = originTurnId ?? currentTurnId;
-          recordStructuredSendReceipt(markerSessionId, markerTurnId, messageId, sentAtMs, content);
-          const detoured = !!sendTopLevel || !!overrideChatId || !!sendInto
-            || markerSessionId !== sid;
-          recordBridgeReplyMarker({
-            dataDir: resolveDataDir(),
-            sessionId: markerSessionId,
-            sentAtMs,
-            messageId,
-            deliveryKind: detoured ? 'detoured_send' : 'current_session_send',
-            content,
-            responseKind: effectiveResponseKind,
-            terminalCarrier: 'non_patchable',
-            turnId: markerTurnId,
-            dispatchAttempt: originDispatchAttempt,
+      if (voiceDelivery.replayed) {
+        if (voiceDelivery.sentAtMs !== undefined) {
+          await recordStructuredSendReceipts(
+            originSessionId ?? sid,
+            originTurnId ?? currentTurnId,
+            [{ messageId, at: voiceDelivery.sentAtMs, text: content }],
+          );
+        }
+        if (voiceCrossChatFollowThread === 'at') {
+          const voiceFollowRoot = deferredTopicRootMessageIdForOutput ?? sendInto;
+          const bound = ensureCrossChatFollowThreadAtBinding({
+            dataDir: resolveDataDir(), sessionId: originSessionId ?? sid, sentAtMs, messageId,
             targetChatId: voicePrimaryOutputChatId,
-            targetRootMessageId: deferredTopicRootMessageIdForOutput ?? sendInto,
-            targetSessionId: sid,
-            crossChatFollowThread: voiceCrossChatFollowThread,
+            ...(voiceFollowRoot ? { targetRootMessageId: voiceFollowRoot } : {}),
             followThreadEpoch: (originSession ?? s).followThreadEpoch,
+            sourceTurnId: originTurnId ?? currentTurnId,
           });
-        } catch { /* best-effort：漏记只多一条兜底，不致命 */ }
+          if (!bound) console.error('botmux send: 已复用语音投递，但跨群话题绑定补建失败');
+        }
       }
-      if (effectiveResponseKind === 'final' && liveMarkerCtx?.markerPid) {
-        advanceAncestorSessionTurn(
-          sendDataDir,
-          liveMarkerCtx.markerPid,
+      const recordVoiceBridgeMarker = (final?: LedgerFinalRecord) => {
+        if (final === undefined && voiceDelivery.replayed) return;
+        if (((!sendTopLevel && !overrideChatId && !sendInto)
+          || !!(originTurnId ?? currentTurnId)
+          || !!deferredTopicRootMessageIdForOutput
+          || voiceCrossChatFollowThread !== undefined)) {
+          try {
+            const markerSessionId = originSessionId ?? sid;
+            const markerTurnId = originTurnId ?? currentTurnId;
+            const markerMessageId = final?.messageId ?? messageId;
+            const markerSentAtMs = final?.sentAtMs ?? final?.deliveredAtMs ?? sentAtMs;
+            const identity = {
+              dataDir: resolveDataDir(),
+              sessionId: markerSessionId,
+              sentAtMs: markerSentAtMs,
+              messageId: markerMessageId,
+              turnId: markerTurnId,
+            };
+            if (final?.marker) {
+              recordBridgeReplyMarkerSnapshot({
+                ...final.marker, ...identity, responseKind: 'final',
+              });
+            } else {
+              recordBridgeReplyMarker({
+                ...voiceMarkerMetadata(),
+                ...identity,
+                ...(final ? { responseKind: 'final' as const } : {}),
+              });
+            }
+          } catch { /* best-effort：漏记只多一条兜底，不致命 */ }
+        }
+      };
+      if (!voiceDelivery.replayed) {
+        await recordStructuredSendReceipts(
+          originSessionId ?? sid,
           originTurnId ?? currentTurnId,
+          [{ messageId, at: sentAtMs, text: content }],
         );
+      }
+      if (effectiveResponseKind === 'final' && turnSendKey) {
+        ensureLedgerFinalTransition({
+          key: turnSendKey,
+          markerSessionId: originSessionId ?? sid,
+          markerTurnId: originTurnId ?? currentTurnId,
+          writeMarker: recordVoiceBridgeMarker,
+        });
+      } else {
+        recordVoiceBridgeMarker();
+        if (!voiceDelivery.replayed && effectiveResponseKind === 'final' && liveMarkerCtx?.markerPid) {
+          try {
+            advanceAncestorSessionTurn(
+              sendDataDir,
+              liveMarkerCtx.markerPid,
+              originTurnId ?? currentTurnId,
+              absorbedSettlementAdvanceOpts(
+                deferredTopicRootMessageIdForOutput
+                  ? { mode: 'thread', rootMessageId: deferredTopicRootMessageIdForOutput }
+                  : voiceActualDeliveredTarget,
+              ),
+            );
+          } catch (error) {
+            finalQueueTransitionDeferred = true;
+            console.error(`botmux send: 语音已投递，但轮次交接暂未落盘（${error instanceof Error ? error.message : String(error)}）；请原样重试`);
+          }
+        }
       }
       console.error(voiceDelivery.replayed
         ? `✓ 已复用本轮已发送语音 ${messageId}`
@@ -14274,6 +15167,13 @@ async function cmdSend(
       const chunks = chunkCommentText(content);
       const docMessageId = `doc:${exactDocTarget.commentId}`;
       const sentAtMs = Date.now();
+      const docMarkerMetadata = (): import('./services/turn-send-ledger.js').TurnSendLedgerMarkerInput => ({
+        deliveryKind: 'current_session_send',
+        content,
+        responseKind: effectiveResponseKind,
+        dispatchAttempt: originDispatchAttempt,
+        targetSessionId: originSessionId,
+      });
       const docDelivery = turnSendKey
         ? await turnSendLedger.executeNonIdempotentSequence(
             turnSendKey,
@@ -14295,6 +15195,7 @@ async function cmdSend(
               );
             },
             docMessageId,
+            { sentAtMs, marker: docMarkerMetadata },
           )
         : await (async () => {
             for (let i = 0; i < chunks.length; i++) {
@@ -14307,7 +15208,7 @@ async function cmdSend(
                 { beforeProviderEffect: fenceIsolatedOriginBeforeEffect },
               );
             }
-            return { messageId: docMessageId, replayed: false };
+            return { messageId: docMessageId, replayed: false, sentAtMs };
           })();
       // 清理 "Typing" reaction（bot 已回复完毕）。未知分块会在上方 fail closed，
       // 不会误删指示器并把一份可能不完整的回复伪装成完成。
@@ -14326,30 +15227,63 @@ async function cmdSend(
           });
       }
       // 写 bridge send marker → 抑制 worker 的 final_output 兜底（否则会再补一条评论）。
-      if (!docDelivery.replayed) {
-        recordStructuredSendReceipt(originSessionId!, originTurnId ?? exactDocTarget.turnId,
-          docDelivery.messageId, sentAtMs, content);
+      const recordDocBridgeMarker = (final?: LedgerFinalRecord) => {
+        if (final === undefined && docDelivery.replayed) return;
+        const markerMessageId = final?.messageId ?? docDelivery.messageId;
+        const markerSentAtMs = final?.sentAtMs ?? final?.deliveredAtMs ?? sentAtMs;
         try {
-          recordBridgeReplyMarker({
+          const identity = {
             dataDir: resolveDataDir(),
             sessionId: originSessionId!,
-            sentAtMs,
-            messageId: docDelivery.messageId,
-            deliveryKind: 'current_session_send',
-            content,
-            responseKind: effectiveResponseKind,
+            sentAtMs: markerSentAtMs,
+            messageId: markerMessageId,
             turnId: originTurnId ?? exactDocTarget.turnId,
-            dispatchAttempt: originDispatchAttempt,
-            targetSessionId: originSessionId,
-          });
+          };
+          if (final?.marker) {
+            recordBridgeReplyMarkerSnapshot({
+              ...final.marker, ...identity, responseKind: 'final',
+            });
+          } else {
+            recordBridgeReplyMarker({
+              ...docMarkerMetadata(),
+              ...identity,
+              ...(final ? { responseKind: 'final' as const } : {}),
+            });
+          }
         } catch { /* best-effort：漏记只多一条兜底 */ }
-      }
-      if (effectiveResponseKind === 'final' && liveMarkerCtx?.markerPid) {
-        advanceAncestorSessionTurn(
-          sendDataDir,
-          liveMarkerCtx.markerPid,
-          originTurnId ?? currentTurnId,
+      };
+      if (docDelivery.replayed) {
+        if (docDelivery.sentAtMs !== undefined) {
+          await recordStructuredSendReceipts(
+            originSessionId!,
+            originTurnId ?? exactDocTarget.turnId,
+            [{ messageId: docDelivery.messageId, at: docDelivery.sentAtMs, text: content }],
+          );
+        }
+      } else {
+        await recordStructuredSendReceipts(
+          originSessionId!,
+          originTurnId ?? exactDocTarget.turnId,
+          [{ messageId: docDelivery.messageId, at: sentAtMs, text: content }],
         );
+      }
+      if (effectiveResponseKind === 'final' && turnSendKey) {
+        ensureLedgerFinalTransition({
+          key: turnSendKey,
+          markerSessionId: originSessionId!,
+          markerTurnId: originTurnId ?? exactDocTarget.turnId,
+          writeMarker: recordDocBridgeMarker,
+        });
+      } else {
+        recordDocBridgeMarker();
+        if (effectiveResponseKind === 'final' && liveMarkerCtx?.markerPid) {
+          try {
+            advanceAncestorSessionTurn(sendDataDir, liveMarkerCtx.markerPid, originTurnId ?? currentTurnId);
+          } catch (error) {
+            finalQueueTransitionDeferred = true;
+            console.error(`botmux send: 文档评论已投递，但轮次交接暂未落盘（${error instanceof Error ? error.message : String(error)}）；请原样重试`);
+          }
+        }
       }
       // Do not write this startup snapshot back after the async provider calls:
       // the daemon may have advanced the dispatch ledger or accepted another
@@ -14682,6 +15616,9 @@ async function cmdSend(
   const sendTarget = !sendInto && !sendTopLevel && !overrideChatId && frozenTurnReplyTarget
     ? frozenTurnReplyTarget
     : resolveSendTarget({ into: sendInto, topLevel: sendTopLevel, chatScope: isChatScope, chatId: targetChatId, rootMessageId: s.rootMessageId, replyTargetRootId: turnReplyTarget?.rootMessageId, replyTargetTurnId: turnReplyTarget?.turnId, replyTargetQuoteOnly: turnReplyTarget?.quoteOnly, currentTurnId });
+  resolveActualDeliveredTargetForLedger = () => deferredTopicRootMessageIdForOutput
+    ? { mode: 'thread', rootMessageId: deferredTopicRootMessageIdForOutput }
+    : sendTarget;
 
   let completionProposalRecord: CompletionProposalRecord | undefined;
   let completionProposalStore: ReturnType<typeof createCompletionProposalStore> | undefined;
@@ -14811,9 +15748,13 @@ async function cmdSend(
     // exact durable attempt/member instead of inheriting the early cmd gate.
     revalidateVcMeetingManagedSend();
     if (!sendInto && !overrideChatId) {
+      const privateDeliveryTargetOpenId = pickTurnReplyTarget(s, currentTurnId)?.senderOpenId;
       const privateMessageId = await sendPrivateReply(s, currentTurnId, content, msgType, uuid,
         { beforeWrite: fenceScheduledProviderWrite });
-      if (privateMessageId !== undefined) return privateMessageId;
+      if (privateMessageId !== undefined) {
+        privateReplyDeliveredRecipient = privateDeliveryTargetOpenId ?? '';
+        return privateMessageId;
+      }
     }
     if (!sendInto && (!overrideChatId || overrideChatId === s.chatId)) {
       const deferred = await dispatchDeferredTopicSend({
@@ -14901,57 +15842,45 @@ async function cmdSend(
   // 删除需同步改测试。
   void dispatch;
   const crossChatFollowThread = effectiveFollowThreadMode;
-  function recordStructuredSendReceipt(
-    markerSessionId: string,
-    markerTurnId: string | undefined,
-    messageId: string | undefined,
-    sentAtMs: number,
-    text?: string,
-  ): void {
-    if (!markerTurnId || !messageId) return;
-    try {
-      recordSessionTurnReply(resolveDataDir(), markerSessionId, markerTurnId, {
-        messageId, responseKind: effectiveResponseKind, at: sentAtMs,
-        ...(text ? { text } : {}),
-      });
-    } catch {
-      console.error('botmux: could not record structured reply');
-    }
-  }
+  const primaryMarkerMetadata = (
+    sentContent: string,
+    terminalCarrier?: TurnTerminalCarrierKind,
+    unifiedReply = unifiedReplyUsed,
+  ): import('./services/turn-send-ledger.js').TurnSendLedgerMarkerInput => {
+    const markerSessionId = originSessionId ?? sid;
+    const detoured = !!sendTopLevel || !!overrideChatId || !!sendInto || markerSessionId !== sid;
+    return {
+      deliveryKind: detoured ? 'detoured_send' : 'current_session_send',
+      content: sentContent,
+      responseKind: effectiveResponseKind,
+      dispatchAttempt: originDispatchAttempt,
+      replyCardResponseKind: unifiedReply ? effectiveResponseKind : undefined,
+      terminalIndependent: remoteRunnerOutbound && effectiveResponseKind !== 'final' ? true : undefined,
+      terminalCarrier,
+      targetChatId,
+      targetRootMessageId: deferredTopicRootMessageIdForOutput
+        ?? (sendTarget.mode === 'plain' ? undefined : sendTarget.rootMessageId),
+      targetSessionId: sid,
+      crossChatFollowThread,
+      followThreadEpoch: (originSession ?? s).followThreadEpoch,
+    };
+  };
   const recordBridgeSendMarker = (
     sentAtMs: number,
     messageId: string,
     sentContent: string,
     terminalCarrier?: TurnTerminalCarrierKind,
-    structuredText?: string,
   ): void => {
     const markerSessionId = originSessionId ?? sid;
     const markerTurnId = originTurnId ?? currentTurnId;
-    recordStructuredSendReceipt(markerSessionId, markerTurnId, messageId, sentAtMs, structuredText);
     try {
-      const detoured = !!sendTopLevel || !!overrideChatId || !!sendInto
-        || markerSessionId !== sid;
       recordBridgeReplyMarker({
+        ...primaryMarkerMetadata(sentContent, terminalCarrier),
         dataDir: resolveDataDir(),
         sessionId: markerSessionId,
         sentAtMs,
         messageId,
-        deliveryKind: detoured ? 'detoured_send' : 'current_session_send',
-        content: sentContent,
-        responseKind: effectiveResponseKind,
         turnId: markerTurnId,
-        dispatchAttempt: originDispatchAttempt,
-        replyCardResponseKind: unifiedReplyUsed ? effectiveResponseKind : undefined,
-        terminalIndependent: remoteRunnerOutbound && effectiveResponseKind !== 'final'
-          ? true
-          : undefined,
-        terminalCarrier,
-        targetChatId,
-        targetRootMessageId: deferredTopicRootMessageIdForOutput
-          ?? (sendTarget.mode === 'plain' ? undefined : sendTarget.rootMessageId),
-        targetSessionId: sid,
-        crossChatFollowThread,
-        followThreadEpoch: (originSession ?? s).followThreadEpoch,
       });
     } catch { /* best-effort: marker miss only causes a redundant fallback message */ }
   };
@@ -14966,6 +15895,7 @@ async function cmdSend(
     || !!(originTurnId ?? currentTurnId)
     || crossChatFollowThread !== undefined;
   let unifiedReplyUsed = false;
+  let replyCardDeliveredTarget: ReturnType<typeof resolveSendTarget> | undefined;
 
   // Quote chain (普通群): the primary message replies to the turn's target so
   // Lark renders a 引用 chain. --quote overrides, --no-quote opts out. Thread
@@ -15170,6 +16100,8 @@ async function cmdSend(
     return result.messageId;
   };
   let turnPrimaryReplayed = false;
+  let turnPrimaryReplayedSentAtMs: number | undefined;
+  let primarySentAtMs: number | undefined;
   // A --mention handoff to a bot on this machine carries this turn's sender to
   // it, as `botmux dispatch` does: the daemon decides who that human is and
   // signs the delegation for the exact message; this process only names the
@@ -15218,7 +16150,9 @@ async function cmdSend(
     primaryContent: string,
     msgType: string,
     originAlreadyRevalidated = false,
-    uuid?: string,
+    uuid: string | undefined,
+    markerContent: string,
+    terminalCarrier: TurnTerminalCarrierKind = 'standard_reply_card',
   ): Promise<string> => {
     const handoffDeliveryId = await prepareMentionHandoff();
     let result: Awaited<ReturnType<typeof executeTurnPrimary>>;
@@ -15231,12 +16165,17 @@ async function cmdSend(
           originAlreadyRevalidated,
           uuid ?? providerUuid,
         ),
+        primarySentAtMs,
+        () => primaryMarkerMetadata(markerContent, terminalCarrier),
       );
     } catch (error) {
       await bindMentionHandoff(handoffDeliveryId, undefined);
       throw error;
     }
-    turnPrimaryReplayed ||= result.replayed;
+    if (result.replayed) {
+      turnPrimaryReplayed = true;
+      turnPrimaryReplayedSentAtMs ??= result.sentAtMs;
+    }
     // A replayed primary was sent (and bound) by the concurrent attempt that
     // won; this registration has nothing of its own to bind, so withdraw it.
     await bindMentionHandoff(handoffDeliveryId, result.replayed ? undefined : result.messageId);
@@ -15448,6 +16387,7 @@ async function cmdSend(
     // that turn's fallback emit. Pre-dispatch timestamp captures the moment
     // we committed to sending — that's the boundary the gate cares about.
     const sentAtMs = Date.now();
+    primarySentAtMs = sentAtMs;
     let messageId: string;
     let feedbackBaseCard: Record<string, unknown> | undefined;
     let failedAttachments: { path: string; error: string }[] = [];
@@ -15479,7 +16419,7 @@ async function cmdSend(
       replyLayout = undefined;
     }
     if (customCard && !customFinal) {
-      messageId = await dispatchPrimary(JSON.stringify(customCard), 'interactive');
+      messageId = await dispatchPrimary(JSON.stringify(customCard), 'interactive', false, undefined, text, 'non_patchable');
     } else if (isSlashSend) {
       // --slash: deliver the command as a single-line plain-`text` message so the
       // receiving daemon's parseSlashCommandInvocation sees a bare `/cmd` (the
@@ -15492,7 +16432,7 @@ async function cmdSend(
       if (!slash.ok) { console.error(`botmux send: ${slash.error}`); process.exit(2); }
       const atPrefix = mentions.map(m => `<at user_id="${m.open_id}"></at>`).join(' ');
       const slashText = atPrefix ? `${atPrefix} ${slash.command}` : slash.command;
-      messageId = await dispatchPrimary(slashText, 'text');
+      messageId = await dispatchPrimary(slashText, 'text', false, undefined, text);
     } else if (pureFileSend) {
       // The single attachment IS the primary message. Keep upload + send under
       // the turn ledger lock so a concurrent final cannot upload or post a
@@ -15506,8 +16446,11 @@ async function cmdSend(
           false,
           providerUuid,
         );
-      });
-      turnPrimaryReplayed ||= fileDelivery.replayed;
+      }, sentAtMs, () => primaryMarkerMetadata(text, 'non_patchable'));
+      if (fileDelivery.replayed) {
+        turnPrimaryReplayed = true;
+        turnPrimaryReplayedSentAtMs ??= fileDelivery.sentAtMs;
+      }
       messageId = fileDelivery.messageId;
       attachmentMessageIds = [messageId];
     } else if (pureVideoSend) {
@@ -15523,13 +16466,17 @@ async function cmdSend(
       // and updates primaryQuotedId). Otherwise a bare `--videos … --no-mention`
       // reply in a 普通群 lands as a standalone message that doesn't quote the
       // trigger — unlike file-only/image-only sends whose primary card quotes.
+      const sentVideoIndices: number[] = [];
       const videoResult = await sendVideoAttachments(
         {
           uploadFile,
           uploadImage,
           dispatch: dispatchAfterOriginGate,
-          primaryDispatch: (body, type) => dispatchPrimary(body, type, true),
+          primaryDispatch: (body, type) => dispatchPrimary(body, type, true, undefined, text, 'non_patchable'),
           beforeEffect: fenceIsolatedOriginBeforeEffect,
+          onResult: (index, outcome) => {
+            if ('messageId' in outcome) sentVideoIndices.push(index);
+          },
           ...(vcMeetingManagedSendOrigin ? { maxMessages: 1 } : {}),
         },
         appId,
@@ -15542,6 +16489,33 @@ async function cmdSend(
         throw new Error(`视频发送失败: ${first}`);
       }
       messageId = videoResult.sent[0];
+      if (!turnPrimaryReplayed && videoMessageIds.length > 1) {
+        try {
+          const { ReplyDeliveryStore } = await import('./services/reply-delivery-store.js');
+          const deliveryStore = new ReplyDeliveryStore(resolveDataDir());
+          const secondary = videoMessageIds.slice(1).map((candidateId, position) => ({
+            messageId: candidateId,
+            sourceIndex: sentVideoIndices[position + 1]!,
+          }));
+          if (secondary.length > 0) {
+            const videoDeliveryId = deliveryStore.begin(
+              appId,
+              messageId,
+              targetChatId,
+              // `sent` is compressed after failures. Use the original indices
+              // reported by onResult rather than treating position+1 as the
+              // source attachment, or C's id can be recorded under B's name.
+              secondary.map(({ sourceIndex }) => ({
+                path: videoAttachments[sourceIndex]?.videoPath ?? `video-${sourceIndex + 1}.mp4`,
+                type: 'media' as const,
+              })),
+            );
+            for (let idx = 0; idx < secondary.length; idx++) {
+              deliveryStore.record(appId, messageId, targetChatId, videoDeliveryId, idx, { messageId: secondary[idx]!.messageId });
+            }
+          }
+        } catch { /* best-effort delivery index for replay healing */ }
+      }
     } else {
       // 回复一律卡片（纯文本 post 路径已删）。
       const customReplyCard = customCard as unknown as ReplyCardV2 | undefined;
@@ -15706,6 +16680,7 @@ async function cmdSend(
         if (replyRecord.chatId !== targetChatId) throw new Error('Reply-card destination changed; send refused');
         let delivered: Awaited<ReturnType<typeof replyStore.update>> | undefined;
         let undeliveredProgressHint = '进度已保存到本轮记录；请用 botmux send --response-kind final 发送完整答复。';
+        resolveActualDeliveredTargetForLedger = () => replyCardDeliveredTarget;
         const replyDelivery = await executeTurnPrimary(turnRequestIdentity, async providerUuid => {
           delivered = await replyStore.update(replyKey, effectiveResponseKind === 'final'
             ? { kind: 'final', text, card: replyCardJson, source: 'explicit',
@@ -15725,6 +16700,9 @@ async function cmdSend(
               await revalidateIsolatedOriginBeforeEffect();
               return readiness?.nativeThinkingVisible === true;
             },
+            deliveredTarget: () => deferredTopicRootMessageIdForOutput
+              ? { mode: 'thread', rootMessageId: deferredTopicRootMessageIdForOutput }
+              : sendTarget,
             send: (body, uuid) => dispatchPrimaryUnlocked(body, 'interactive', undefined, completionProposalRecord ? completionProposalCardDispatchUuid(completionProposalRecord) : (uuid ?? providerUuid)),
             patch: (id, body) => patchPublishedGroupCard(appId, targetChatId, id, body, replyRecord.rootId,
               effectiveResponseKind === 'final' ? groupContextAuthorOrigin : undefined,
@@ -15748,14 +16726,22 @@ async function cmdSend(
               return dispatchAfterOriginGate(JSON.stringify({ file_key: fileKey }), 'file', uuid);
             },
           });
+          // An existing card is PATCHed where it already lives. Never invent
+          // that destination from the host turn: daemon-created and historical
+          // records may predate deliveredTarget. Unknown means fail closed and
+          // keep the absorbed turn on the legacy promotion path.
+          replyCardDeliveredTarget = delivered.record.deliveredTarget;
           if (!delivered.messageId && delivered.record.nativeCot && delivered.record.nativeCotVisible) {
             // Progress is expected here; asking for a final would push the
             // model to lock the turn early with an interim note.
             undeliveredProgressHint = '进度已记录到本轮：执行过程由原生思考区展示，进度会随最终答复卡一并归档。中间进度继续按默认方式发送即可；完成后再用 botmux send --response-kind final 发送完整答复。';
           }
           return delivered.messageId ?? '';
-        });
-        turnPrimaryReplayed ||= replyDelivery.replayed;
+        }, sentAtMs, () => primaryMarkerMetadata(text, 'standard_reply_card', true));
+        if (replyDelivery.replayed) {
+          turnPrimaryReplayed = true;
+          turnPrimaryReplayedSentAtMs ??= replyDelivery.sentAtMs;
+        }
         unifiedReplyUsed = true;
         if (!replyDelivery.messageId) {
           console.error(undeliveredProgressHint);
@@ -15771,6 +16757,7 @@ async function cmdSend(
           'interactive',
           false,
           completionProposalRecord ? completionProposalCardDispatchUuid(completionProposalRecord) : undefined,
+          text,
         );
       }
 
@@ -15794,37 +16781,54 @@ async function cmdSend(
     // after waiting. Stop here so the losing process cannot repeat indexing,
     // attachments, urgency, bridge markers, or attention side effects.
     if (turnPrimaryReplayed) {
+      if (turnPrimaryReplayedSentAtMs !== undefined) {
+        const companionIds = !pureFileSend
+          ? await collectDeliveredCompanionAttachmentIds(messageId, targetChatId)
+          : [];
+        await recordStructuredSendReceipts(
+          originSessionId ?? sid,
+          replayMarkerTurnId,
+          [
+            {
+              messageId,
+              at: turnPrimaryReplayedSentAtMs,
+              ...(!customCard && !pureFileSend && !pureVideoSend && text ? { text } : {}),
+            },
+            ...companionIds.map(id => ({ messageId: id, at: turnPrimaryReplayedSentAtMs! })),
+          ],
+        );
+      }
       if (crossChatFollowThread === 'at') {
         const bound = ensureCrossChatFollowThreadAtBinding({
           dataDir: resolveDataDir(), sessionId: originSessionId ?? sid, sentAtMs, messageId,
           targetChatId,
           ...(sendTarget.mode !== 'plain' ? { targetRootMessageId: sendTarget.rootMessageId } : {}),
           followThreadEpoch: (originSession ?? s).followThreadEpoch,
-          sourceTurnId: originTurnId ?? currentTurnId,
+          sourceTurnId: replayMarkerTurnId,
         });
         if (!bound) console.error('botmux send: 已复用投递，但跨群话题绑定补建失败');
       }
       // Reusing a receipt is not a new send. Preserve the original marker's
       // time, including when another input arrived while we waited on the lock.
       // The first sender may have lost the reply-card mark; it is idempotent.
-      if (effectiveResponseKind === 'final' && currentTurnId) {
-        await noteTurnFinalOutsideReplyCard({ larkAppId: appId, sessionId: sid, turnId: currentTurnId, dispatchAttempt: originDispatchAttempt },
+      if (effectiveResponseKind === 'final' && replayMarkerTurnId) {
+        await noteTurnFinalOutsideReplyCard({ larkAppId: appId, sessionId: sid, turnId: replayMarkerTurnId, dispatchAttempt: replayDispatchAttempt },
           targetChatId, sendTopLevel || !!sendInto || !!overrideChatId);
       }
       await removeScheduleSelfAfterFinal();
-      if (scheduleSelfCleanup?.removed && liveMarkerCtx?.markerPid) {
-        advanceAncestorSessionTurn(
-          sendDataDir,
-          liveMarkerCtx.markerPid,
-          originTurnId ?? currentTurnId,
-        );
-      }
+      ensureLedgerFinalTransition({
+        key: replayTurnKey!,
+        markerSessionId: originSessionId ?? sid,
+        markerTurnId: replayMarkerTurnId,
+        allowAdvance: !scheduleRemoveSelfTaskId || scheduleSelfCleanup?.removed === true,
+        writeMarker: recordReplayPrimaryBridgeMarker,
+      });
       console.error(`✓ 已复用本轮最终回答 ${messageId}`);
       console.log(JSON.stringify({
         success: true,
         messageId,
         sessionId: sid,
-        turnId: currentTurnId,
+        turnId: replayMarkerTurnId,
         replayed: true,
         ...(scheduleSelfCleanup ? { scheduleSelfCleanup } : {}),
       }));
@@ -15941,31 +16945,75 @@ async function cmdSend(
     // Bridge fallback marker — append-only jsonl on the source session. A
     // successful detour is recorded with explicit destination metadata when an
     // exact source turn is available; it must not be mistaken for no reply.
-    if (shouldRecordBridgeMarker || deferredTopicRootMessageIdForOutput) {
-      recordBridgeSendMarker(
-        sentAtMs,
-        messageId,
-        text,
-        (!customCard || customFinal) && !pureFileSend && !pureVideoSend
-          ? 'standard_reply_card'
-          : 'non_patchable',
-        !customCard && !pureFileSend && !pureVideoSend ? text : undefined,
+    let primaryBridgeMarkerAttempted = false;
+    const recordPrimaryBridgeMarker = () => {
+      if (primaryBridgeMarkerAttempted) return;
+      primaryBridgeMarkerAttempted = true;
+      if (shouldRecordBridgeMarker || deferredTopicRootMessageIdForOutput) {
+        const markerSessionId = originSessionId ?? sid;
+        withBridgeReplyMarkerLock(resolveDataDir(), markerSessionId, () => {
+          if (hasBridgeReplyMarker({
+            dataDir: resolveDataDir(), sessionId: markerSessionId,
+            turnId: originTurnId ?? currentTurnId, messageId, responseKind: effectiveResponseKind,
+          })) return;
+          recordBridgeSendMarker(
+            sentAtMs,
+            messageId,
+            text,
+            (!customCard || customFinal) && !pureFileSend && !pureVideoSend
+              ? 'standard_reply_card'
+              : 'non_patchable',
+          );
+        });
+      }
+    };
+    const actualDeliveredTarget = unifiedReplyUsed
+      ? replyCardDeliveredTarget
+      : deferredTopicRootMessageIdForOutput
+        ? { mode: 'thread' as const, rootMessageId: deferredTopicRootMessageIdForOutput }
+        : sendTarget;
+    let advancedNextTurnId: string | undefined;
+    const advanceAfterPrimaryFinal = (writeMarker: boolean) => {
+      if (effectiveResponseKind !== 'final' || !liveMarkerCtx?.markerPid) return;
+      let advResult: ReturnType<typeof advanceAncestorSessionTurn>;
+      try {
+        advResult = advanceAncestorSessionTurn(
+          sendDataDir,
+          liveMarkerCtx.markerPid,
+          originTurnId ?? currentTurnId,
+          {
+            ...absorbedSettlementAdvanceOpts(actualDeliveredTarget),
+            ...(writeMarker ? { beforeTransition: recordPrimaryBridgeMarker } : {}),
+          },
+        );
+      } catch (error) {
+        recordPrimaryBridgeMarker();
+        finalQueueTransitionDeferred = true;
+        console.error(`botmux send: 最终答复已投递，但轮次交接暂未落盘（${error instanceof Error ? error.message : String(error)}）；请原样重试（不会重复发送 final）`);
+        return;
+      }
+      // A worker may have completed the ledger-authorized transition while
+      // recovering a crashed sender. Preserve the same model-facing guidance
+      // only for a snapshotted absorbed turn carrying fresh promotion proof.
+      let freshMarker: ReturnType<typeof findLiveAncestorSessionContext> | undefined;
+      if (!advResult.advanced && advResult.turnId && preSendAbsorbedTurnIds.has(advResult.turnId)) {
+        try { freshMarker = findLiveAncestorSessionContext(sendDataDir); } catch { /* guidance is best-effort */ }
+      }
+      advancedNextTurnId = resolvePromotedAbsorbedTurnForCompletion(
+        advResult, preSendAbsorbedTurnIds, freshMarker,
       );
+    };
+    const markerSessionId = originSessionId ?? sid;
+    const markerTurnId = originTurnId ?? currentTurnId;
+    recordPrimaryBridgeMarker();
+    if (shouldRecordBridgeMarker || deferredTopicRootMessageIdForOutput) {
+      await recordStructuredSendReceipts(markerSessionId, markerTurnId, [{
+        messageId,
+        at: sentAtMs,
+        ...(!customCard && !pureFileSend && !pureVideoSend && text ? { text } : {}),
+      }]);
     }
     await removeScheduleSelfAfterFinal();
-    let advancedNextTurnId: string | undefined;
-    if (effectiveResponseKind === 'final'
-      && (!scheduleRemoveSelfTaskId || scheduleSelfCleanup?.removed === true)
-      && liveMarkerCtx?.markerPid) {
-      const advResult = advanceAncestorSessionTurn(
-        sendDataDir,
-        liveMarkerCtx.markerPid,
-        originTurnId ?? currentTurnId,
-      );
-      if (advResult.advanced) {
-        advancedNextTurnId = advResult.turnId;
-      }
-    }
 
     // Send attachments as separate messages — best-effort. The primary message
     // is already delivered above; a failing attachment must not throw out to the
@@ -15974,46 +17022,74 @@ async function cmdSend(
     // the success JSON. Pure-video sends have no text/card primary, so the media
     // message above is the primary and failures before any media is sent still
     // surface as command failure.
+    // Keep the current turn's marker active until attachments and their
+    // structured receipts complete so a queued type-ahead turn cannot rotate
+    // `ds.managedTurnOrigin` mid-upload; advance in `finally` for delivered finals.
     const attachmentTrackingErrors: string[] = [];
     let replyDeliveryId: string | undefined;
-    if (!pureFileSend && !pureVideoSend && !vcMeetingListenerReplyReplay && !turnPrimaryReplayed) {
-      const { ReplyDeliveryStore } = await import('./services/reply-delivery-store.js');
-      const deliveryStore = new ReplyDeliveryStore(resolveDataDir());
-      if (files.length || videoAttachments.length) {
-        try {
-          replyDeliveryId = deliveryStore.begin(appId, messageId, targetChatId, [
-            ...files.map(path => ({ path, type: 'file' as const })),
-            ...videoAttachments.map(video => ({ path: video.videoPath, type: 'media' as const })),
-          ]);
-        } catch (error) { attachmentTrackingErrors.push(error instanceof Error ? error.message : String(error)); }
+    let separateAttachmentMessageIds: string[] = [];
+    try {
+      if (!pureFileSend && !pureVideoSend && !vcMeetingListenerReplyReplay && !turnPrimaryReplayed) {
+        const { ReplyDeliveryStore } = await import('./services/reply-delivery-store.js');
+        const deliveryStore = new ReplyDeliveryStore(resolveDataDir());
+        if (files.length || videoAttachments.length) {
+          try {
+            replyDeliveryId = deliveryStore.begin(appId, messageId, targetChatId, [
+              ...files.map(path => ({ path, type: 'file' as const })),
+              ...videoAttachments.map(video => ({ path: video.videoPath, type: 'media' as const })),
+            ]);
+          } catch (error) { attachmentTrackingErrors.push(error instanceof Error ? error.message : String(error)); }
+        }
+        const onResult = replyDeliveryId ? (index: number, outcome: { messageId: string } | { failed: true }) =>
+          deliveryStore.record(appId, messageId, targetChatId, replyDeliveryId!, index, outcome) : undefined;
+        const fileResult = await sendFileAttachments(
+          { uploadFile, dispatch: dispatchAfterOriginGate, beforeEffect: fenceIsolatedOriginBeforeEffect, onResult }, appId, files,
+        );
+        attachmentMessageIds = fileResult.sent;
+        failedAttachments = fileResult.failed;
+        attachmentTrackingErrors.push(...(fileResult.trackingErrors ?? []).map(item => item.error));
+        const videoResult = await sendVideoAttachments(
+          { uploadFile, uploadImage, dispatch: dispatchAfterOriginGate, beforeEffect: fenceIsolatedOriginBeforeEffect,
+            onResult: onResult ? (index, outcome) => onResult(files.length + index, outcome) : undefined }, appId, videoAttachments,
+        );
+        failedVideoAttachments = videoResult.failed;
+        videoMessageIds = videoResult.sent;
+        attachmentTrackingErrors.push(...(videoResult.trackingErrors ?? []).map(item => item.error));
       }
-      const onResult = replyDeliveryId ? (index: number, outcome: { messageId: string } | { failed: true }) =>
-        deliveryStore.record(appId, messageId, targetChatId, replyDeliveryId!, index, outcome) : undefined;
-      const fileResult = await sendFileAttachments(
-        { uploadFile, dispatch: dispatchAfterOriginGate, beforeEffect: fenceIsolatedOriginBeforeEffect, onResult }, appId, files,
-      );
-      attachmentMessageIds = fileResult.sent;
-      failedAttachments = fileResult.failed;
-      attachmentTrackingErrors.push(...(fileResult.trackingErrors ?? []).map(item => item.error));
-      const videoResult = await sendVideoAttachments(
-        { uploadFile, uploadImage, dispatch: dispatchAfterOriginGate, beforeEffect: fenceIsolatedOriginBeforeEffect,
-          onResult: onResult ? (index, outcome) => onResult(files.length + index, outcome) : undefined }, appId, videoAttachments,
-      );
-      failedVideoAttachments = videoResult.failed;
-      videoMessageIds = videoResult.sent;
-      attachmentTrackingErrors.push(...(videoResult.trackingErrors ?? []).map(item => item.error));
-    }
-    for (const error of attachmentTrackingErrors) console.error(`⚠️ 正文/附件关联记录未完整保存（已发送的消息请勿重发）: ${error}`);
-    // Attachments are independent Lark messages posted after the main reply
-    // card. Record the actual bottom-most carrier so terminal auto mode never
-    // PATCHes an earlier card and leaves a file/voice/custom carrier below it
-    // looking like the unfinished tail of the turn. This second append is an
-    // ordered carrier refinement; the first marker above remains the early
-    // fallback-suppression proof if the process dies during attachment work.
-    const trailingCarrierMessageId = videoMessageIds.at(-1) ?? attachmentMessageIds.at(-1);
-    if (trailingCarrierMessageId
-      && (shouldRecordBridgeMarker || deferredTopicRootMessageIdForOutput)) {
-      recordBridgeSendMarker(sentAtMs, trailingCarrierMessageId, '', 'non_patchable');
+      for (const error of attachmentTrackingErrors) console.error(`⚠️ 正文/附件关联记录未完整保存（已发送的消息请勿重发）: ${error}`);
+      // Attachments are independent Lark messages posted after the main reply
+      // card. Record the actual bottom-most carrier so terminal auto mode never
+      // PATCHes an earlier card and leaves a file/voice/custom carrier below it
+      // looking like the unfinished tail of the turn. This second append is an
+      // ordered carrier refinement; the first marker above remains the early
+      // fallback-suppression proof if the process dies during attachment work.
+      const trailingCarrierMessageId = videoMessageIds.at(-1) ?? attachmentMessageIds.at(-1);
+      if (trailingCarrierMessageId
+        && (shouldRecordBridgeMarker || deferredTopicRootMessageIdForOutput)) {
+        recordBridgeSendMarker(sentAtMs, trailingCarrierMessageId, '', 'non_patchable');
+      }
+      // On the pure-video path the first video IS the primary message
+      // (`messageId = videoResult.sent[0]` above), so listing it here would print
+      // the primary id while claiming the primary message cannot carry it.
+      // Filtering by id keeps one wording correct on every path instead of
+      // branching on `pureVideoSend`; the JSON fields stay unfiltered so the
+      // caller's "one id per requested attachment" check is unaffected.
+      separateAttachmentMessageIds = [...attachmentMessageIds, ...videoMessageIds]
+        .filter(id => id !== messageId);
+      if (separateAttachmentMessageIds.length > 0
+        && (shouldRecordBridgeMarker || deferredTopicRootMessageIdForOutput)) {
+        await recordStructuredSendReceipts(
+          markerSessionId,
+          markerTurnId,
+          separateAttachmentMessageIds.map(id => ({ messageId: id, at: sentAtMs })),
+        );
+      }
+    } finally {
+      if (effectiveResponseKind === 'final'
+        && (!scheduleRemoveSelfTaskId || scheduleSelfCleanup?.removed === true)
+        && liveMarkerCtx?.markerPid) {
+        advanceAfterPrimaryFinal(false);
+      }
     }
     for (const f of failedAttachments) {
       console.error(`⚠️ 附件未发送（主消息已送达 ${messageId}，请勿重发）: ${f.path} — ${f.error}`);
@@ -16028,14 +17104,6 @@ async function cmdSend(
     // --mention 的 open_id 解析（在上方 mentions 数组里完成）仍然必要，它让
     // Lark 在消息里渲染真正的 @at 元素，从而触发对方 bot 的 WS 事件投递。
 
-    // On the pure-video path the first video IS the primary message
-    // (`messageId = videoResult.sent[0]` above), so listing it here would print
-    // the primary id while claiming the primary message cannot carry it.
-    // Filtering by id keeps one wording correct on every path instead of
-    // branching on `pureVideoSend`; the JSON fields stay unfiltered so the
-    // caller's "one id per requested attachment" check is unaffected.
-    const separateAttachmentMessageIds = [...attachmentMessageIds, ...videoMessageIds]
-      .filter(id => id !== messageId);
     if (separateAttachmentMessageIds.length > 0) {
       console.error(
         `   附件消息: ${separateAttachmentMessageIds.join(', ')}`
@@ -16057,7 +17125,9 @@ async function cmdSend(
     // REPLY_DELIVERY_ENV is the spawn snapshot of how this pane's final reply
     // reaches Lark. Under transcript (auto-forward final reply), normal sends
     // return null so the receipt stays purely factual with no extra persuasion.
-    const completionHintKey = sendCompletionHintKey(effectiveResponseKind, unifiedReplyUsed, advancedNextTurnId,
+    const completionHintKey = finalQueueTransitionDeferred
+      ? null
+      : sendCompletionHintKey(effectiveResponseKind, unifiedReplyUsed, advancedNextTurnId,
       replyDeliveryFromEnv(process.env));
     if (completionHintKey) {
       console.error(t(completionHintKey, undefined, sendLocale));
@@ -16533,6 +17603,7 @@ async function cmdCard(rest: string[]): Promise<void> {
 
 async function cmdAuth(rest: string[]): Promise<void> {
   const { AUTH_REQUEST_USAGE, parseAuthRequestArgs, providerAuthAnswerTag, providerAuthExitCode } = await import('./cli/auth-request.js');
+  const { PROVIDER_AUTH_REQUEST_CLIENT_TIMEOUT_MS } = await import('./platform/credential-grant-budget.js');
   let parsed;
   try {
     parsed = parseAuthRequestArgs(rest);
@@ -16590,7 +17661,7 @@ async function cmdAuth(rest: string[]): Promise<void> {
         ...(process.env.BOTMUX_AS ? { as: process.env.BOTMUX_AS } : {}),
       };
       // A request may start a device login, or ask the platform to send a card, before it answers.
-      const requestTimeout = Math.min(parsed.command === 'request' ? 60_000 : 10_000, Math.max(1, remaining));
+      const requestTimeout = Math.min(parsed.command === 'request' ? PROVIDER_AUTH_REQUEST_CLIENT_TIMEOUT_MS : 10_000, Math.max(1, remaining));
       const authPath = `/api/sessions/${encodeURIComponent(sid)}/auth-${parsed.command === 'wait' ? 'status' : 'request'}`;
       const response = toolBinding
         ? await loopbackFetch(`http://127.0.0.1:${toolBinding.ipcPort}${authPath}`, {
@@ -20364,24 +21435,25 @@ async function cmdUserPromptHook(): Promise<void> {
     const larkAppId = process.env.BOTMUX_LARK_APP_ID;
     let discoveredPort: number | undefined;
     try { discoveredPort = findDaemon(larkAppId)?.ipcPort; } catch { /* masked/unreadable registry */ }
-    const ipcPort = resolveDaemonIpcPort(
-      discoveredPort,
-      process.env.BOTMUX_DAEMON_IPC_PORT,
-    );
-    if (!ipcPort) process.exit(0);
 
     let hostSecret: string | undefined;
     if (!process.env.BOTMUX_SEND_RELAY) {
       try { hostSecret = loadDaemonIpcSecret(); } catch { /* Seatbelt/read-isolated CLI */ }
     }
+    const staticIpcPort = resolveDaemonIpcPort(
+      discoveredPort,
+      process.env.BOTMUX_DAEMON_IPC_PORT,
+    );
+    if (hostSecret && !staticIpcPort) process.exit(0);
     const readOrigin = hostSecret ? undefined : () => readManagedOriginCapability(
       resolveDataDir(),
       sessionId,
       process.env.BOTMUX_SEND_RELAY,
       process.env.BOTMUX_ORIGIN_CHANNEL_ID,
     ) ?? undefined;
-    // A queued turn may advance and rotate its capability during a 404 retry.
-    // Keep a live reader; each attempt constructs a fresh authenticated body.
+    // A queued turn may advance and rotate its capability (and on reattached
+    // persistent panes, its live daemon ipcPort) during a retry. Keep a live
+    // reader; each attempt constructs a fresh authenticated body + port.
     const fingerprint = fingerprintPromptText(prompt);
     const prefix = prefixOf(prompt);
     const path = `/api/sessions/${encodeURIComponent(sessionId)}/prompt-ctx/claim`;
@@ -20389,15 +21461,21 @@ async function cmdUserPromptHook(): Promise<void> {
       fingerprint,
       prefix,
       readOrigin,
-      request: body => {
+      request: (body, claim) => {
+        const attemptPort = hostSecret
+          ? staticIpcPort
+          : resolveDaemonIpcPort(claim?.ipcPort ?? discoveredPort, process.env.BOTMUX_DAEMON_IPC_PORT);
+        if (!attemptPort) {
+          return Promise.resolve(new Response(JSON.stringify({ error: 'no_ipc_port' }), { status: 503 }));
+        }
         const init = {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify(body),
         } satisfies RequestInit;
         return hostSecret
-          ? fetchDaemonIpc(ipcPort, path, init, hostSecret)
-          : loopbackFetch(`http://127.0.0.1:${ipcPort}${path}`, init);
+          ? fetchDaemonIpc(attemptPort, path, init, hostSecret)
+          : loopbackFetch(`http://127.0.0.1:${attemptPort}${path}`, init);
       },
     });
     if (envelope) {
@@ -21502,13 +22580,13 @@ const ROOT_FLEET_MUTATION_COMMANDS = new Set(['start', 'stop', 'restart', 'upgra
 // there — its meaning on stop/restart is "also tear the plugin service down",
 // and start has no tear-down phase.
 const FLEET_KNOWN_FLAGS: Record<string, readonly string[]> = {
-  start: ['--companion-secret-file', '--companion-bot'],
-  stop: ['--with-plugin'],
-  restart: ['--with-plugin', '--companion-secret-file', '--companion-bot'],
+  start: ['--allow-empty', '--companion-secret-file', '--companion-bot'],
+  stop: ['--with-plugin', '--if-empty', '--supervisor-pid', '--host-pid'],
+  restart: ['--with-plugin', '--allow-empty', '--companion-secret-file', '--companion-bot'],
   upgrade: ['--canary', '--beta', '--rc', '--next', '--latest'],
   update: ['--canary', '--beta', '--rc', '--next', '--latest'],
 };
-const FLEET_VALUE_FLAGS = new Set(['--companion-secret-file', '--companion-bot']);
+const FLEET_VALUE_FLAGS = new Set(['--companion-secret-file', '--companion-bot', '--supervisor-pid', '--host-pid']);
 if (ROOT_FLEET_MUTATION_COMMANDS.has(command ?? '')) {
   const fleetArgs = process.argv.slice(3);
   if (fleetArgs.some(arg => arg === '--help' || arg === '-h')) {
@@ -21534,6 +22612,19 @@ if (ROOT_FLEET_MUTATION_COMMANDS.has(command ?? '')) {
     console.error(`未知参数: ${unknownArgs.join(' ')}`);
     console.error(`  \`botmux ${command}\` 只接受: ${['--help', ...knownFleetFlags].join(' ')}。`);
     console.error('  为避免把一个看起来像「只检查」的参数当成「执行」，这里直接中止，不做任何改动。');
+    process.exit(2);
+  }
+  if (
+    command === 'stop'
+    && fleetArgs.some(arg => (
+      arg === '--supervisor-pid'
+      || arg.startsWith('--supervisor-pid=')
+      || arg === '--host-pid'
+      || arg.startsWith('--host-pid=')
+    ))
+    && !fleetArgs.includes('--if-empty')
+  ) {
+    console.error('--supervisor-pid / --host-pid 必须与 --if-empty 一起使用。');
     process.exit(2);
   }
   if ((command === 'upgrade' || command === 'update') && fleetArgs.filter(a => a !== '--help' && a !== '-h').length > 1) {

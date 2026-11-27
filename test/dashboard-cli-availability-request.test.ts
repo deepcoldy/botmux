@@ -91,4 +91,29 @@ describe('bounded readiness probe cache', () => {
     await Promise.all(pending);
     expect(peak).toBe(2);
   });
+
+  it('bypasses completed TTL cache entries when refresh=true is requested', async () => {
+    let now = 0;
+    const cache = createCliAvailabilityCache({ now: () => now, ttlMs: 15_000 });
+    let installed = false;
+    const probe = vi.fn<typeof checkCliAvailabilityAsync>(async () => (
+      installed
+        ? available
+        : { available: false, localExecutableRequired: true, status: 'unavailable' as const, command: 'claude' }
+    ));
+
+    const first = await cliAvailabilityResponse('claude-code', undefined, {}, probe, cache);
+    expect(first.body.status).toBe('unavailable');
+    expect(probe).toHaveBeenCalledTimes(1);
+
+    installed = true;
+    now = 5_000;
+    const cached = await cliAvailabilityResponse('claude-code', undefined, {}, probe, cache);
+    expect(cached.body.status).toBe('unavailable');
+    expect(probe).toHaveBeenCalledTimes(1);
+
+    const refreshed = await cliAvailabilityResponse('claude-code', undefined, {}, probe, cache, { refresh: true });
+    expect(refreshed.body.status).toBe('available');
+    expect(probe).toHaveBeenCalledTimes(2);
+  });
 });

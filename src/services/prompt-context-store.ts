@@ -29,7 +29,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, unl
 import { join } from 'node:path';
 import { config } from '../config.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
-import { normaliseForFingerprint } from './claude-transcript.js';
+import { CLAUDE_STRIPPED_INVISIBLE_RE, normaliseForFingerprint } from './claude-transcript.js';
 
 /** sidecar 保留上限：超出按 mtime 淘汰最旧的。 */
 const SIDECAR_MAX_FILES = 100;
@@ -38,18 +38,22 @@ const SIDECAR_TTL_MS = 24 * 60 * 60 * 1000;
 /** 前缀兜底匹配长度：与 makeSubmitFingerprint 一致，足以覆盖 paste 污染前的完好区。 */
 const PREFIX_FALLBACK_LEN = 30;
 
-function sessionDir(sessionId: string): string {
-  return join(config.session.dataDir, 'prompt-ctx', sessionId);
+function normalisePromptKeyText(text: string): string {
+  return normaliseForFingerprint(text.replace(CLAUDE_STRIPPED_INVISIBLE_RE, ''));
 }
 
-/** 全量指纹：normalise 后 sha256（hex）。主键，无前缀碰撞。 */
+function sessionDir(sessionId: string, dataDir = config.session.dataDir): string {
+  return join(dataDir, 'prompt-ctx', sessionId);
+}
+
+/** 全量指纹：去除 Claude PTY 会剥离的不可见字符并 normalise 后 sha256（hex）。主键，无前缀碰撞。 */
 export function fingerprintPromptText(text: string): string {
-  return createHash('sha256').update(normaliseForFingerprint(text), 'utf8').digest('hex');
+  return createHash('sha256').update(normalisePromptKeyText(text), 'utf8').digest('hex');
 }
 
-/** 前缀指纹：normalise 后取前 N 字符。仅用于 paste 污染时的兜底匹配。 */
+/** 前缀指纹：与全量指纹同口径归一化后取前 N 字符。仅用于 paste 污染时的兜底匹配。 */
 export function prefixOf(text: string): string {
-  return normaliseForFingerprint(text).slice(0, PREFIX_FALLBACK_LEN);
+  return normalisePromptKeyText(text).slice(0, PREFIX_FALLBACK_LEN);
 }
 
 /** turnId 文件名键：全量 sha256(turnId) hex。
@@ -60,28 +64,59 @@ function turnIdKey(turnId: string): string {
   return createHash('sha256').update(turnId, 'utf8').digest('hex');
 }
 
+export type PromptContextWriteResult = 'written' | 'duplicate' | 'failed';
+
+/** Restore an envelope onto the visible prompt when its sidecar cannot be used. */
+export function inlinePromptContext(content: string, envelope?: string): string {
+  return envelope ? `${envelope}\n\n${content}` : content;
+}
+
 /**
- * daemon 侧：写 per-turn sidecar。best-effort——写失败只意味着该轮 hook no-op
- * （reminder 丢失），不允许影响消息主路径。原子写（tmp + rename）。
- *
- * 文件名带 turnId：(fingerprint, turnId) 唯一确定一条，claim 按权威 turnId 精确取。
+ * daemon 侧：写 per-turn sidecar。调用方必须检查返回值：只有 `written` 才能
+ * 安全发送去壳正文；`duplicate`（显式启用）与 `failed` 都必须回退 inline。
+ * 原子写（tmp + rename），文件名带 turnId：(fingerprint, turnId) 唯一确定一条。
  */
-export function writePromptContext(sessionId: string, turnId: string, ptyText: string, envelope: string): void {
+export function writePromptContext(
+  sessionId: string,
+  turnId: string,
+  ptyText: string,
+  envelope: string,
+  opts?: { rejectDuplicate?: boolean; dataDir?: string },
+): PromptContextWriteResult {
   try {
-    const dir = sessionDir(sessionId);
+    const dir = sessionDir(sessionId, opts?.dataDir);
     mkdirSync(dir, { recursive: true, mode: 0o700 });
-    const file = join(dir, `${fingerprintPromptText(ptyText)}.${turnIdKey(turnId)}.json`);
+    const key = turnIdKey(turnId);
+    const suffix = `.${key}.json`;
+    const fingerprint = fingerprintPromptText(ptyText);
+    const file = join(dir, `${fingerprint}${suffix}`);
+    if (opts?.rejectDuplicate && readdirSync(dir).some(existing =>
+      existing.startsWith(`${fingerprint}.`) && !existing.endsWith(suffix))) {
+      return 'duplicate';
+    }
     const payload = JSON.stringify({
       version: 3,
       envelope,
       prefix: prefixOf(ptyText),
-      fingerprint: fingerprintPromptText(ptyText),
+      fingerprint,
       turnId,
       createdAt: Date.now(),
     }) + '\n';
     atomicWriteFileSync(file, payload, { mode: 0o600, followTargetSymlink: false });
+    // Maintain the single-sidecar-per-turn invariant: remove any earlier file
+    // for the same turnId (e.g. rebuild/retry with different text) after the
+    // new sidecar has landed atomically.
+    for (const existing of readdirSync(dir)) {
+      if (!existing.endsWith(suffix)) continue;
+      const existingFull = join(dir, existing);
+      if (existingFull === file) continue;
+      try { unlinkSync(existingFull); } catch { /* best-effort */ }
+    }
     pruneSidecars(dir, file);
-  } catch { /* best-effort */ }
+    return 'written';
+  } catch {
+    return 'failed';
+  }
 }
 
 /**
@@ -90,29 +125,91 @@ export function writePromptContext(sessionId: string, turnId: string, ptyText: s
  * claim 为空，reminder/sender 随之丢失。精确命中旧指纹就改它；没有旧指纹时按
  * turnId 定域找到该轮唯一一条也改它。best-effort，不影响主路径。
  */
-export function rekeyPromptContext(sessionId: string, turnId: string, previousPtyText: string, nextPtyText: string): boolean {
+export function rekeyPromptContext(
+  sessionId: string,
+  turnId: string,
+  previousPtyText: string,
+  nextPtyText: string,
+  dataDir?: string,
+): boolean {
   try {
     if (previousPtyText === nextPtyText) return false;
-    const dir = sessionDir(sessionId);
+    const dir = sessionDir(sessionId, dataDir);
     if (!existsSync(dir)) return false;
     const key = turnIdKey(turnId);
-    const exact = join(dir, `${fingerprintPromptText(previousPtyText)}.${key}.json`);
+    const suffix = `.${key}.json`;
+    const nextFingerprint = fingerprintPromptText(nextPtyText);
+    // Never create the same-fingerprint/different-turn ambiguity that the claim
+    // path deliberately refuses. The caller can still inline the new turn.
+    if (readdirSync(dir).some(file => file.startsWith(`${nextFingerprint}.`) && !file.endsWith(suffix))) {
+      return false;
+    }
+    const exact = join(dir, `${fingerprintPromptText(previousPtyText)}${suffix}`);
     const candidates = existsSync(exact) ? [exact]
-      : readdirSync(dir).filter((f) => f.endsWith(`.${key}.json`)).map((f) => join(dir, f));
+      : readdirSync(dir).filter((f) => f.endsWith(suffix)).map((f) => join(dir, f));
     if (candidates.length !== 1) return false;
     const parsed = JSON.parse(readFileSync(candidates[0], 'utf8'));
     if (typeof parsed?.envelope !== 'string' || parsed.turnId !== turnId) return false;
-    const next = join(dir, `${fingerprintPromptText(nextPtyText)}.${key}.json`);
+    const next = join(dir, `${nextFingerprint}${suffix}`);
     atomicWriteFileSync(next, JSON.stringify({
       ...parsed,
       prefix: prefixOf(nextPtyText),
-      fingerprint: fingerprintPromptText(nextPtyText),
+      fingerprint: nextFingerprint,
     }) + '\n', { mode: 0o600, followTargetSymlink: false });
     if (candidates[0] !== next) unlinkSync(candidates[0]);
     return true;
   } catch {
     return false;
   }
+}
+
+/** Read the unique envelope without consuming it; ambiguity is a failure. */
+function readPromptContextEnvelopeForTurn(sessionId: string, turnId: string, dataDir?: string): string | undefined {
+  try {
+    const dir = sessionDir(sessionId, dataDir);
+    const suffix = `.${turnIdKey(turnId)}.json`;
+    const candidates = readdirSync(dir).filter(file => file.endsWith(suffix));
+    if (candidates.length !== 1) return undefined;
+    const parsed = JSON.parse(readFileSync(join(dir, candidates[0]!), 'utf8'));
+    return parsed?.turnId === turnId && typeof parsed?.envelope === 'string' && parsed.envelope
+      ? parsed.envelope : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Rekey after a post-build rewrite, with a lossless fallback for callers that
+ * are about to send `nextPtyText`. On any read/write/ambiguity failure, consume
+ * no other turn's sidecar, remove this turn's stale file and return the same
+ * envelope inline instead of letting a hook silently lose it.
+ */
+export function rekeyPromptContextWithFallback(input: {
+  sessionId: string;
+  turnId: string;
+  previousPtyText: string;
+  nextPtyText: string;
+  dataDir?: string;
+  /** Daemon payload copy, used if the sidecar is already missing. */
+  hookEnvelope?: string;
+}): { content: string; hookEnvelope?: string; rekeyed: boolean } {
+  const { sessionId, turnId, previousPtyText, nextPtyText, dataDir } = input;
+  const storedEnvelope = readPromptContextEnvelopeForTurn(sessionId, turnId, dataDir);
+  const envelope = storedEnvelope ?? input.hookEnvelope;
+  if (!envelope) return { content: nextPtyText, rekeyed: false };
+  if (previousPtyText === nextPtyText && storedEnvelope) {
+    return { content: nextPtyText, hookEnvelope: envelope, rekeyed: true };
+  }
+  if (rekeyPromptContext(sessionId, turnId, previousPtyText, nextPtyText, dataDir)) {
+    return { content: nextPtyText, hookEnvelope: envelope, rekeyed: true };
+  }
+  // A missing/stale original file can still be rebuilt from the daemon payload.
+  // Only a real write/duplicate failure requires the inline fallback.
+  if (writePromptContext(sessionId, turnId, nextPtyText, envelope, { rejectDuplicate: true, dataDir }) === 'written') {
+    return { content: nextPtyText, hookEnvelope: envelope, rekeyed: true };
+  }
+  removePromptContextForTurn(sessionId, turnId, dataDir);
+  return { content: inlinePromptContext(nextPtyText, envelope), rekeyed: false };
 }
 
 /** 单轮领取保留给普通调用方；多轮 type-ahead 必须使用候选集 API。 */
@@ -245,9 +342,9 @@ function pruneSidecars(dir: string, currentFile: string): void {
 }
 
 /** 删除一个已失效 queued turn 的全部 sidecar；不影响其它轮次。 */
-export function removePromptContextForTurn(sessionId: string, turnId: string): void {
+export function removePromptContextForTurn(sessionId: string, turnId: string, dataDir?: string): void {
   try {
-    const dir = sessionDir(sessionId);
+    const dir = sessionDir(sessionId, dataDir);
     if (!existsSync(dir)) return;
     const suffix = `.${turnIdKey(turnId)}.json`;
     for (const file of readdirSync(dir)) {

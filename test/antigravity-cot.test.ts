@@ -12,9 +12,62 @@ import {
 } from '../src/services/antigravity-cot.js';
 import { isAntigravityTranscriptBusy } from '../src/adapters/cli/antigravity.js';
 import * as jsonlCursor from '../src/services/jsonl-cursor.js';
+import { publicReplyCardTools } from '../src/im/lark/turn-reply-card.js';
 import { jsonl, writeAntigravityTwoLogs } from './helpers/antigravity-two-logs.js';
 
 describe('antigravity-cot', () => {
+  // Same-text numeric and string ids must remain distinct whether they share a
+  // record or arrive in separate ones.
+  it.each([
+    {
+      layout: 'in the same record',
+      records: [[{ id: 42, name: 'run_command', args: {} }, { id: '42', name: 'read_file', args: {} }]],
+    },
+    {
+      layout: 'across records in one turn',
+      records: [[{ id: 42, name: 'run_command', args: {} }], [{ id: '42', name: 'read_file', args: {} }]],
+    },
+  ])('keeps numeric and same-text string ids distinct $layout', ({ records }) => {
+    const pending: { id: string; name: string }[] = [];
+    const entries = records.flatMap(toolCalls => extractAntigravityCotEntriesFromRecord({
+      step_index: 9, source: 'MODEL', type: 'PLANNER_RESPONSE', tool_calls: toolCalls,
+    }, pending));
+    const callIds = entries.map(e => (e as { id: string }).id);
+    expect(new Set(callIds).size).toBe(2);
+    expect(pending.map(p => p.id)).toEqual(callIds);
+
+    for (const content of ['result-A', 'result-B']) {
+      entries.push(...extractAntigravityCotEntriesFromRecord({
+        step_index: 10, source: 'MODEL', type: 'GENERIC', content,
+      }, pending));
+    }
+    expect(publicReplyCardTools(entries, true)).toEqual([
+      { id: callIds[0], name: 'run_command', subject: '', completed: true, result: 'result-A' },
+      { id: callIds[1], name: 'read_file', subject: '', completed: true, result: 'result-B' },
+    ]);
+  });
+
+  it('allocates unique fallback ids across records even after the pending queue empties', () => {
+    const pending: { id: string; name: string }[] = [];
+    const call = (rawId?: unknown) => extractAntigravityCotEntriesFromRecord({
+      step_index: 9, source: 'MODEL', type: 'PLANNER_RESPONSE',
+      tool_calls: [{ id: rawId, name: 'run_command', args: {} }],
+    }, pending);
+    const result = () => extractAntigravityCotEntriesFromRecord({
+      step_index: 10, source: 'MODEL', type: 'GENERIC', content: 'ok',
+    }, pending);
+
+    const firstId = (call()[0] as { id: string }).id;
+    // The first non-conflicting fallback keeps its pre-fix form for upgrades.
+    expect(firstId).toBe('call_9_0');
+    result();
+    // Pending emptiness does not end a native turn: a repeated step/index still
+    // must not reuse the id already present on the reply card.
+    const secondId = (call({ value: 'not an id' })[0] as { id: string }).id;
+    expect(secondId).not.toBe(firstId);
+    result();
+  });
+
   let tmpDir: string;
 
   beforeEach(() => {
@@ -139,6 +192,80 @@ describe('antigravity-cot', () => {
     appendFileSync(transcriptPath, jsonl([{ step_index: 2, source: 'MODEL', type: 'GENERIC', content: 'result after restore' }]));
     await vi.advanceTimersByTimeAsync(40);
     expect(received).toEqual([{ kind: 'tool_result', id: 'call_pending', result: 'result after restore' }]);
+  });
+
+  it('keeps non-conflicting legacy ids pairable when a running turn is restored after upgrade', async () => {
+    vi.useFakeTimers();
+    const transcriptPath = join(tmpDir, 'resume-upgrade-ids.jsonl');
+    writeFileSync(transcriptPath, jsonl([
+      { type: 'USER_INPUT', content: 'current turn' },
+      { step_index: 7, type: 'PLANNER_RESPONSE', tool_calls: [{ id: 'legacy-string', name: 'string_tool', args: {} }] },
+      { step_index: 7, type: 'PLANNER_RESPONSE', tool_calls: [{ name: 'fallback_tool', args: {} }] },
+      { step_index: 7, type: 'PLANNER_RESPONSE', tool_calls: [{ id: 42, name: 'numeric_tool', args: {} }] },
+    ]));
+    // These are the call ids emitted by the pre-fix PR code. An in-place upgrade
+    // must not orphan their already-published cards when only results remain.
+    const preUpgradeCalls: AntigravityCotEntry[] = [
+      { kind: 'tool_call', id: 'legacy-string', name: 'string_tool', args: '{}' },
+      { kind: 'tool_call', id: 'call_7_0', name: 'fallback_tool', args: '{}' },
+      { kind: 'tool_call', id: '42', name: 'numeric_tool', args: '{}' },
+    ];
+    const restored: AntigravityCotEntry[] = [];
+    startAntigravityCot('conv-upgrade-ids', entries => restored.push(...entries), {
+      transcriptPath, pollIntervalMs: 20,
+    });
+    appendFileSync(transcriptPath, jsonl([
+      { step_index: 8, source: 'MODEL', type: 'GENERIC', content: 'string done' },
+      { step_index: 9, source: 'MODEL', type: 'GENERIC', content: 'fallback done' },
+      { step_index: 10, source: 'MODEL', type: 'GENERIC', content: 'numeric done' },
+    ]));
+    await vi.advanceTimersByTimeAsync(40);
+    expect(restored.map(entry => entry.kind === 'tool_result' ? entry.id : '')).toEqual(
+      preUpgradeCalls.map(entry => entry.kind === 'tool_call' ? entry.id : ''),
+    );
+    expect(publicReplyCardTools([...preUpgradeCalls, ...restored], true).map(tool => ({
+      name: tool.name, completed: tool.completed, result: tool.result,
+    }))).toEqual([
+      { name: 'string_tool', completed: true, result: 'string done' },
+      { name: 'fallback_tool', completed: true, result: 'fallback done' },
+      { name: 'numeric_tool', completed: true, result: 'numeric done' },
+    ]);
+  });
+
+  it('replays the live fallback id sequence when restoring pending tools', async () => {
+    vi.useFakeTimers();
+    const transcriptPath = join(tmpDir, 'resume-fallback-ids.jsonl');
+    writeFileSync(transcriptPath, jsonl([
+      { type: 'USER_INPUT', content: 'previous turn' },
+      { step_index: 7, type: 'PLANNER_RESPONSE', tool_calls: [{ name: 'old_tool', args: {} }] },
+      { step_index: 7, source: 'MODEL', type: 'GENERIC', content: 'old result' },
+      { type: 'USER_INPUT', content: 'current turn' },
+      { step_index: 7, type: 'PLANNER_RESPONSE', tool_calls: [{ name: 'run_command', args: {} }] },
+      { step_index: 7, type: 'PLANNER_RESPONSE', tool_calls: [{ id: { invalid: true }, name: 'read_file', args: {} }] },
+    ]));
+    const live: AntigravityCotEntry[] = [];
+    startAntigravityCot('conv-live-fallback-ids', entries => live.push(...entries), {
+      transcriptPath, mode: 'fresh', pollIntervalMs: 20,
+    });
+    const liveCalls = live.filter(entry => entry.kind === 'tool_call');
+    expect(liveCalls).toHaveLength(3);
+    const liveIds = liveCalls.slice(-2).map(entry => entry.id);
+    expect(new Set(liveIds).size).toBe(2);
+    stopAntigravityCot('conv-live-fallback-ids');
+
+    const restored: AntigravityCotEntry[] = [];
+    startAntigravityCot('conv-restored-fallback-ids', entries => restored.push(...entries), {
+      transcriptPath, pollIntervalMs: 20,
+    });
+    appendFileSync(transcriptPath, jsonl([
+      { step_index: 8, source: 'MODEL', type: 'GENERIC', content: 'result-A' },
+      { step_index: 9, source: 'MODEL', type: 'GENERIC', content: 'result-B' },
+    ]));
+    await vi.advanceTimersByTimeAsync(40);
+    expect(restored).toEqual([
+      { kind: 'tool_result', id: liveIds[0], result: 'result-A' },
+      { kind: 'tool_result', id: liveIds[1], result: 'result-B' },
+    ]);
   });
 
   it('restores pending tools from the latest input instead of replaying old turns', async () => {

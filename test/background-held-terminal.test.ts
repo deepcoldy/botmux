@@ -614,6 +614,89 @@ describe('CoT message of a turn that ended with background tasks running', () =>
     expect(finalizeCotMessageMock).toHaveBeenCalledWith(ds, 'om_turn', 'completed', 1);
   });
 
+  it('keeps held CoT open across working/idle frames carrying cotHoldForBackground:true and releases once cleared', () => {
+    const { ds, worker } = setup({ cliId: 'claude-code' });
+    terminal(worker, { backgroundTasks: 1 });
+    expect(ds.cotHeldForBackground).toEqual({ turnId: 'om_turn', dispatchAttempt: 1 });
+
+    // During a suppressed Monitor micro-turn, backgroundWait() drops to 0 while
+    // the bounded Monitor is still live; worker sends cotHoldForBackground: true.
+    worker.emit('message', {
+      type: 'screen_update', content: 'checking monitor', status: 'working',
+      turnId: 'om_turn', dispatchAttempt: 1, cotHoldForBackground: true,
+    });
+    expect(ds.backgroundTaskCount).toBeUndefined();
+    expect(ds.cotHeldForBackground).toEqual({ turnId: 'om_turn', dispatchAttempt: 1 });
+    expect(finalizeCotMessageMock).not.toHaveBeenCalled();
+
+    worker.emit('message', {
+      type: 'screen_update', content: 'prompt ready', status: 'idle',
+      turnId: 'om_turn', dispatchAttempt: 1, cotHoldForBackground: true,
+    });
+    expect(ds.cotHeldForBackground).toEqual({ turnId: 'om_turn', dispatchAttempt: 1 });
+    expect(finalizeCotMessageMock).not.toHaveBeenCalled();
+
+    // Once the Monitor stops/expires or the switch turns off, cotHoldForBackground clears.
+    screen(worker);
+    expect(finalizeCotMessageMock).toHaveBeenCalledTimes(1);
+    expect(finalizeCotMessageMock).toHaveBeenCalledWith(ds, 'om_turn', 'completed', 1);
+    expect(ds.cotHeldForBackground).toBeUndefined();
+  });
+
+  it('keeps om_turn held CoT open when a sibling synthesized local wake completes with remaining backgroundTasks', () => {
+    const { ds, worker } = setup({ cliId: 'claude-code' });
+    terminal(worker, { backgroundTasks: 2 });
+    expect(ds.cotHeldForBackground).toEqual({ turnId: 'om_turn', dispatchAttempt: 1 });
+
+    // Sibling subagent finishes while bounded Monitor still runs (backgroundTasks: 1).
+    terminal(worker, { turnId: 'local-headless-ag1', dispatchAttempt: undefined, backgroundTasks: 1 });
+    expect(finalizeCotMessageMock).not.toHaveBeenCalled();
+    expect(ds.cotHeldForBackground).toEqual({ turnId: 'om_turn', dispatchAttempt: 1 });
+
+    // When the final background task finishes (backgroundTasks: 0), om_turn CoT closes cleanly.
+    terminal(worker, { turnId: 'local-headless-m1-done', dispatchAttempt: undefined });
+    expect(finalizeCotMessageMock).toHaveBeenCalledWith(ds, 'om_turn', 'completed', 1);
+    expect(ds.cotHeldForBackground).toBeUndefined();
+  });
+
+  it('allows TurnReplyCardStore tools updates on a completed unified card ONLY when allowWhileTerminal is set', async () => {
+    const { mkdtempSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { TurnReplyCardStore } = await import('../src/services/turn-reply-card.js');
+    const dir = mkdtempSync(join(tmpdir(), 'unified-bg-cot-'));
+    try {
+      const store = new TurnReplyCardStore(dir);
+      const key = { botId: 'app', sessionId: 's1', turnId: 'om_turn', dispatchAttempt: 1 };
+      await store.prepare(key, { mode: 'unified', chatId: 'oc_1', rootId: 'om_root' });
+      const patches: string[] = [];
+      const io = {
+        beforeEffect: () => {},
+        render: (r: any) => JSON.stringify({ phase: r.phase, tools: r.tools.map((t: any) => t.name) }),
+        send: async (body: string) => { patches.push(body); return 'om_card_1'; },
+        patch: async (_id: string, body: string) => { patches.push(body); },
+      };
+      await store.update(key, { kind: 'tools', tools: [{ id: 't1', name: 'Monitor', subject: 'CI' }] }, io);
+      await store.update(key, { kind: 'terminal', phase: 'completed' }, io);
+      const afterTerminal = patches.length;
+
+      // Without allowWhileTerminal: completed card stays immutable.
+      await store.update(key, { kind: 'tools', tools: [{ id: 't1', name: 'Monitor', subject: 'CI' }, { id: 't2', name: 'Read', subject: 'x' }] }, io);
+      expect(patches.length).toBe(afterTerminal);
+
+      // With allowWhileTerminal (held background Monitor): activity appends and patches!
+      await store.update(key, {
+        kind: 'tools',
+        allowWhileTerminal: true,
+        tools: [{ id: 't1', name: 'Monitor', subject: 'CI' }, { id: 't2', name: 'Bash', subject: 'check' }],
+      }, io);
+      expect(patches.length).toBeGreaterThan(afterTerminal);
+      expect(patches.at(-1)).toContain('"Bash"');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('retains ds.managedTurnOrigin on completed turn_terminal ONLY when authorityHeldForBackground is true', () => {
     const { ds, worker } = setup({ cliId: 'claude-code' });
     ds.managedTurnOrigin = {

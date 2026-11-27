@@ -1501,6 +1501,27 @@ describe('isMeaningfulUserEvent', () => {
   it('rejects assistant-role events', () => {
     expect(isMeaningfulUserEvent(assistantEv('hi'))).toBe(false);
   });
+  it('rejects non-user record types (such as api-request-blob) carrying message.role:"user"', () => {
+    const blob = {
+      type: 'api-request-blob',
+      hash: 'deadbeef',
+      message: { role: 'user', content: [{ type: 'text', text: 'check PR status' }] },
+    } as unknown as TranscriptEvent;
+    expect(isMeaningfulUserEvent(blob)).toBe(false);
+  });
+  it('still accepts synthetic user events that omit ev.type', () => {
+    const synthetic = { message: { role: 'user', content: 'synthetic prompt' } } as TranscriptEvent;
+    expect(isMeaningfulUserEvent(synthetic)).toBe(true);
+  });
+  it('trailingAssistantText ignores interleaved api-request-blob records', () => {
+    const events: TranscriptEvent[] = [
+      userEv('hello'),
+      { type: 'assistant', uuid: 'a1', message: { role: 'assistant', content: [{ type: 'text', text: 'final answer' }] } } as TranscriptEvent,
+      { type: 'api-request-blob', hash: 'h1', message: { role: 'assistant', content: [{ type: 'tool_use', id: 'tu-blob', name: 'Bash', input: {} }] } } as unknown as TranscriptEvent,
+      { type: 'api-request-blob', hash: 'h2', message: { role: 'user', content: 'copied prompt' } } as unknown as TranscriptEvent,
+    ];
+    expect(trailingAssistantText(events, ['a1'])).toBe('final answer');
+  });
 });
 
 describe('isScheduledTurnStartEvent', () => {

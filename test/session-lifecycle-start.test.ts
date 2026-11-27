@@ -330,6 +330,7 @@ import {
   managedOriginCapabilityDirectory,
   readManagedOriginCapability,
 } from '../src/core/managed-origin-capability.js';
+import { claimPromptContext, fingerprintPromptText, prefixOf } from '../src/services/prompt-context-store.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { SessionController } from '../src/core/session-controller.js';
 import { SessionContractStore } from '../src/services/session-contract-store.js';
@@ -967,6 +968,7 @@ describe('worker start operation', () => {
       else forkWorker(ds, '');
       const init = send.mock.calls[0][0];
       expect(init.type).toBe('init');
+      expect(init.structuredNoticeAck).toBe(true);
       expect(controller.operation()).toMatchObject({ kind: 'restart', operationId: init.restartAttemptId });
       expect(controller.operation(stop.operationId)).toMatchObject({ phase: 'uncertain', error: 'superseded_by_restart' });
     } finally {
@@ -8216,7 +8218,7 @@ describe('Codex App clean-input feature gate', () => {
   });
 });
 
-describe('TraeX RPC ordinary follow-up FIFO policy', () => {
+describe('TraeX RPC ordinary follow-up steer policy', () => {
   const caller = {
     requestUserOpenId: 'ou_owner',
     requestUserUnionId: 'on_owner',
@@ -8244,7 +8246,7 @@ describe('TraeX RPC ordinary follow-up FIFO policy', () => {
     return { ds, worker };
   }
 
-  it('queues an ordinary interactive follow-up without requiring groupSerialInput', () => {
+  it('admits an ordinary interactive follow-up to the worker steering gate', () => {
     const { ds, worker } = traexRpcSession();
 
     expect(sendWorkerInput(ds, 'follow-up', 'om_followup', { trustedCaller: caller })).toBe(true);
@@ -8252,11 +8254,11 @@ describe('TraeX RPC ordinary follow-up FIFO policy', () => {
     expect(worker.send).toHaveBeenLastCalledWith(expect.objectContaining({
       type: 'message',
       turnId: 'om_followup',
-      queueAfterActiveTurn: true,
     }));
+    expect(worker.send.mock.calls.at(-1)?.[0]).not.toHaveProperty('queueAfterActiveTurn');
   });
 
-  it('queues an ordinary human follow-up even when the legacy Codex-App flag is true', () => {
+  it('admits an ordinary human follow-up independently of the legacy Codex-App flag', () => {
     const { ds, worker } = traexRpcSession();
 
     expect(sendWorkerInput(ds, 'human follow-up', 'om_human_followup', {
@@ -8268,8 +8270,8 @@ describe('TraeX RPC ordinary follow-up FIFO policy', () => {
       type: 'message',
       turnId: 'om_human_followup',
       codexAppSteerable: true,
-      queueAfterActiveTurn: true,
     }));
+    expect(worker.send.mock.calls.at(-1)?.[0]).not.toHaveProperty('queueAfterActiveTurn');
   });
 
   it.each([
@@ -8405,6 +8407,7 @@ describe('adopt worker re-fork forwards the incoming turn (PR#293 issue #3)', ()
       adoptMode: true,
       adoptSource: 'tmux',
       adoptTmuxTarget: 'work:0.0',
+      structuredNoticeAck: true,
       cliId: 'claude-code',
       prompt: '<bridge>hello from Lark</bridge>',
       turnId: 'om_refork_turn',
@@ -12088,7 +12091,11 @@ describe('ordinary-turn recovery admission (scheduled turns, type-ahead)', () =>
 describe('providerRecovery switch (Claude auto-continue)', () => {
   const RETRY_AT_OFFSET = 117_000;
 
-  async function boot(botConfig: Record<string, unknown>, prepare?: (ds: any) => void) {
+  async function boot(
+    botConfig: Record<string, unknown>,
+    prepare?: (ds: any) => void,
+    openingInput: Parameters<typeof forkWorker>[1] = 'warm up',
+  ) {
     vi.useFakeTimers();
     const bot = defaultBot({ cliId: 'claude-code', ...botConfig });
     vi.mocked(getBot).mockImplementation(() => bot as any);
@@ -12101,7 +12108,7 @@ describe('providerRecovery switch (Claude auto-continue)', () => {
     });
     const ds = makeDs();
     prepare?.(ds);
-    forkWorker(ds, 'warm up', 'om_original');
+    forkWorker(ds, openingInput, 'om_original');
     const worker = forkMock.mock.results.at(-1)!.value;
     worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
     worker.emit('message', { type: 'turn_input_received', turnId: 'om_original' });
@@ -12354,6 +12361,54 @@ describe('providerRecovery switch (Claude auto-continue)', () => {
     expect(ds.session.ordinaryTurnRecovery?.status).toBe('backoff');
     await vi.advanceTimersByTimeAsync(2_000);
     expect(continuations(worker)).toHaveLength(1);
+  });
+
+  it('carries the saved hook envelope into a non-direct-failure live continuation', async () => {
+    const envelope = '<botmux_reminder>LIVE_CONTINUATION_ENVELOPE</botmux_reminder>';
+    const { ds, worker } = await boot(
+      { providerRecovery: { enabled: true } }, undefined,
+      { content: 'warm up', hookEnvelope: envelope },
+    );
+    fail(ds, worker, 'om_original');
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(2_000);
+    const continuation = continuations(worker)[0];
+    expect(continuation.content).toContain('[BOTMUX_RECOVERY]');
+    const visible = continuation.content.includes(envelope)
+      ? continuation.content
+      : claimPromptContext(
+        ds.session.sessionId,
+        continuation.turnId,
+        fingerprintPromptText(continuation.content),
+        prefixOf(continuation.content),
+      );
+    expect(visible).toContain(envelope);
+  });
+
+  it('carries the saved hook envelope into a direct-failure continuation that reforks', async () => {
+    const envelope = '<botmux_reminder>DORMANT_CONTINUATION_ENVELOPE</botmux_reminder>';
+    const { ds, worker } = await boot(
+      { providerRecovery: { enabled: true } }, undefined,
+      { content: 'warm up', hookEnvelope: envelope },
+    );
+    worker.emit('message', {
+      type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_original', status: 'failed',
+      errorCode: 'provider_server_error', retryable: true, directFailure: true,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    ds.session.lastFailedTurn = {
+      turnId: 'om_original', userPrompt: 'warm up', cliInput: 'warm up', hookEnvelope: envelope,
+      failedAt: new Date().toISOString(), status: 'failed', directFailure: true, retryCount: 0,
+    };
+    worker.killed = true;
+    ds.worker = null;
+    await vi.advanceTimersByTimeAsync(2_000);
+    const next = forkMock.mock.results.at(-1)!.value;
+    expect(next).not.toBe(worker);
+    const init = vi.mocked(next.send).mock.calls.map(call => call[0])
+      .find(message => message?.type === 'init' && message?.turnId?.startsWith('bmx-recovery-'));
+    expect(init.prompt).toContain('[BOTMUX_RECOVERY]');
+    expect(init.prompt).toContain(envelope);
   });
 });
 
@@ -13003,6 +13058,18 @@ describe('folded-turn reply relay', () => {
       inits.push(ds.initConfig);
     }
     expect(inits.map(init => init?.followUpReply)).toEqual(Array(3).fill(followUpReply ? true : undefined));
+  });
+
+  it.each([true, false])('hands foldBackgroundUpdates=%s to primary workers and omits it from adopt workers', foldBackgroundUpdates => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ foldBackgroundUpdates }));
+    initWorkerPool({ sessionReply: vi.fn(async () => 'om_reply'), getSessionWorkingDir: () => REPO, getActiveCount: () => 1, closeSession: vi.fn() });
+    const fresh = makeDs(claudeSession);
+    expect(forkWorker(fresh, 'hello', false)).toBe(true);
+    const adoptedDs = makeDs({ adoptedFrom: { tmuxTarget: 'adopt-switch:0.0', originalCliPid: 23456, sessionId: 'adopted-native', cliId: 'claude-code', cwd: REPO } });
+    forkMock.mockImplementationOnce(() => makeFakeWorker());
+    expect(forkAdoptWorker(adoptedDs)).toBe('accepted');
+    expect(fresh.initConfig?.foldBackgroundUpdates).toBe(foldBackgroundUpdates ? true : undefined);
+    expect(adoptedDs.initConfig?.foldBackgroundUpdates).toBeUndefined();
   });
 
   it('posts nothing while followUpReply is off, checked when the reply arrives', async () => {

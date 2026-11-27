@@ -18,7 +18,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import ts from 'typescript';
 import { isStructuredBridgeLifecycleBlockingCli } from '../src/services/structured-bridge-clis.js';
-import { handoffQueuedDurableInputsOnBackendExit, terminalReleasesDurableTurn } from '../src/utils/pending-input-queue.js';
+import { dropNoReplayPendingInputsOnBackendExit, handoffQueuedDurableInputsOnBackendExit, terminalReleasesDurableTurn } from '../src/utils/pending-input-queue.js';
 import { loadWorkerFunction, loadWorkerMessageHandler } from './helpers/worker-function-harness.js';
 
 type Terminal = { type: string; turnId: string; status: string; errorCode?: string; retryable?: boolean; durationMs?: number };
@@ -402,6 +402,7 @@ function exitHarness(cliId = 'pi') {
     isPromptReady: true, promptReadyEdgesAtFreshCliStart: 0, promptReadyEdges: 1,
     spawnArgvNeedsWorkingSeed: false, spawnArgvTurnStartEvidenceSeen: false,
     isCliStartupFailure, isStructuredBridgeLifecycleBlockingCli, exitMarksServerReplaced, handoffQueuedDurableInputsOnBackendExit,
+    dropNoReplayPendingInputsOnBackendExit,
     isCodexAppCliId: () => false, cliName: () => cliId,
     stopSessionMcpGatewayHost: vi.fn(), completeManagedTurnOriginRevocation: vi.fn(),
     cleanupCodexAppControlBootstrap: vi.fn(), stopCodexAppControlChannel: vi.fn(),

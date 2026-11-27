@@ -54,6 +54,7 @@ The table lists the built-in adapters. "Default command" is the executable botmu
 | `reasonix` | Reasonix | `reasonix` | local process | ✅ |
 | `zcode` | ZCode | `zcode` | local process | ✅ |
 | `doubao` | Doubao CLI (see [Doubao guide](https://github.com/deepcoldy/botmux/blob/master/docs/doubao.en.md)) | `doubao` | local process | ✅ |
+| `nca` | NCA | `nca` | local process | ✅ |
 | `pi` | Pi | `pi` | local process | ✅ |
 | `oh-my-pi` | Oh My Pi (Pi fork) | `omp` | local process | ✅ |
 | `aiden` | Aiden (native agent) | `aiden` | local process | |
@@ -152,6 +153,10 @@ In the Dashboard, switch "Codex Runtime" to "Custom Compatible" and fill in the 
 
 For all fields and update sources see [the Codex-compatible distributions section of `bots.json`](/en/bots-json#codex-runtime). The older `cliPathOverride` setup keeps working, but it does not turn on Codex RPC features that require an explicit compatibility declaration.
 
+### Codex multi-account instance pools {#codex-instances}
+
+One bot can use `codexInstancePool` to configure multiple Codex login homes and assign them to ordinary new sessions with static weights. Follow-up messages, retries, and cold restores keep the saved instance instead of drawing again. See [Session-level Codex instances](https://github.com/deepcoldy/botmux/blob/master/docs/codex-instances.md) (Chinese) for configuration limits, initialization and login commands, and recovery semantics.
+
 ## API / remote adapters {#remote-agents}
 
 The agents behind these four adapters don't run in a local terminal. `riff`, `mojo` and `remote-runner` are paired with the session backend of the same name automatically, so you don't need to set `backendType`.
@@ -248,7 +253,7 @@ Remote Runner connects any remote agent platform over a JSONL protocol. botmux s
 
 ### Using the newly added CLIs {#new-clis}
 
-Grok Build, Reasonix, OpenCode 2, DeepSeek Harness (dsh / dsh-tui), MiniMax Code (mcode), MiMoCode, CodeM, ZCode and Doubao are all built-in adapters with no extra switch. Turning one on works like switching to any other CLI (see [Switching a bot's CLI](#switching-a-bots-cli) above): install the command and log in under the daemon's system user, then set the bot's `cliId` to the value below.
+Grok Build, Reasonix, OpenCode 2, DeepSeek Harness (dsh / dsh-tui), MiniMax Code (mcode), MiMoCode, CodeM, ZCode, Doubao and NCA are all built-in adapters with no extra switch. Turning one on works like switching to any other CLI (see [Switching a bot's CLI](#switching-a-bots-cli) above): install the command and log in under the daemon's system user, then set the bot's `cliId` to the value below.
 
 | CLI | `cliId` | Default command |
 |---|---|---|
@@ -261,6 +266,7 @@ Grok Build, Reasonix, OpenCode 2, DeepSeek Harness (dsh / dsh-tui), MiniMax Code
 | CodeM | `codem` | `codem` |
 | ZCode | `zcode` | `zcode` |
 | Doubao | `doubao` | `doubao` |
+| NCA | `nca` | `nca` |
 
 **Forge × TraeX**: to start TraeX through Forge, pick **Forge x TraeX** in the CLI menu of `botmux setup` or the Dashboard, or write `"cliId": "traex", "cliLaunchMode": "forge-traex"` in `bots.json`. botmux then launches `forge run --agent traex --agent-args ...`, so `forge` must be on PATH. This launch mode only works with `cliId: "traex"` and can't be combined with `wrapperCli`, `cliRuntime`, `cliPathOverride`, the file sandbox or `readIsolation`; such configs are rejected.
 
@@ -375,6 +381,12 @@ or disable it for the botmux process only:
 ```bash
 MIRCLI_AUTO_START_MIRAMCP=0 botmux start
 ```
+
+### NCA
+
+Install and configure the local `nca` CLI under the account running the BotMux daemon and confirm it can answer a prompt. Then choose NCA in Setup or set `cliId: "nca"`. PTY and tmux sessions have been tested with NCA 3.0.20.
+
+Set `model` to an ID accepted by NCA's native `/model` command. To customize the session directory, set `NCA_DATA_HOME` in the BotMux daemon environment or pass an absolute path such as `--home /path/to/harness` in `CLI_EXTRA_ARGS`. Directory semantics match native NCA: `NCA_DATA_HOME=X` uses `X/harness`, while `--home X` uses `X` directly. The file sandbox binds the native user-data root (`~/.nca` by default, or the directory selected by `NCA_DATA_HOME`) plus any additional `--home` harness directory to the host, preserving login state and history while keeping transcripts visible to the bridge. BotMux binds the native thread by matching its submitted messages. After running `/new` in the writable terminal, send a message from Lark to bind the new thread before closing or resuming the session.
 
 ### Doubao CLI
 

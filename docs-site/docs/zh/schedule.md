@@ -176,13 +176,16 @@ botmux schedule update <id> --schedule "every 4h"         # 改执行频率，�
 botmux schedule update <id> --prompt-file report-prompt.md
 # 短提示词也可以直接传（--prompt 与 --prompt-file 二选一）
 botmux schedule update <id> --prompt "新的完整提示词"
+# 不用删任务就能开关静默执行
+botmux schedule update <id> --silent
+botmux schedule update <id> --no-silent
 # 可以一起改
 botmux schedule update <id> --schedule "0 9 * * 1-5" --prompt-file report-prompt.md
 ```
 
 `--schedule` 接受和 `schedule add` 一样的写法（`每日17:50`、`every 2h`、5 段 cron 等），写错了会直接报错并给出示例，任务不受影响。改频率后按新规则从现在起重新计算下次执行时间，不补跑、也不立即触发，命令输出会显示新规则和下次执行时间；暂停中的任务改完仍是暂停。任务正在执行的那几分钟里不能改频率（会提示等这次执行完），一次性时间也不能设成已经过去的时间。
 
-任务 ID、静默设置、执行位置、Bash 前置条件、工作日历、创建人身份、启停状态和运行记录都保留。正在跑的那次继续用旧配置，下一次用新的。权限与 Dashboard 编辑一致：能改提示词的人就能改频率；委托创建的任务需要重新授权。完整字段见 `botmux schedule update --help`。
+任务 ID、执行位置、Bash 前置条件、工作日历、创建人身份、启停状态和运行记录都保留；静默设置可用 `--silent` / `--no-silent` 切换。正在跑的那次继续用旧配置，下一次用新的。权限与 Dashboard 编辑一致：能改提示词的人就能改频率；委托创建的任务需要重新授权。完整字段见 `botmux schedule update --help`。
 
 ## 执行日志与多群绑定（Dashboard） {#logs-and-multi-chat}
 
@@ -314,9 +317,9 @@ botmux schedule calendars                                  # 查看可用日历
 
 ### 内置中国法定工作日历
 
-ID 为 `cn`，显示为「中国法定工作日历」，时区 `Asia/Shanghai`，包含放假和周末补班。**目前已核实覆盖 2026-01-01 至 2026-12-31**，依据是[国务院办公厅关于2026年部分节假日安排的通知](https://www.gov.cn/zhengce/zhengceku/202511/content_7047091.htm)（国办发明电〔2025〕7号）。`schedule calendars` 会显示来源信息。
+ID 为 `cn`，显示为「中国法定工作日历」，时区 `Asia/Shanghai`，包含放假和周末补班。**目前已核实覆盖 2026-01-01 至 2027-12-31**，依据是[国务院办公厅关于2026年部分节假日安排的通知](https://www.gov.cn/zhengce/zhengceku/202511/content_7047091.htm)和[2027 年通知](https://www.gov.cn/zhengce/content/202611/content_7085101.htm)。`schedule calendars` 会显示来源信息。
 
-它表示全国统一的放假调休，不代表每个单位的实际排班；地方节日、企业排班、港澳台及其他国家不在内置范围。超出覆盖范围的日期（比如还没核实的 2027 年）不会推算，任务会停止自动执行并记录 `calendar_out_of_coverage`，跨年前请升级到包含下一年数据的版本。
+它表示全国统一的放假调休，不代表每个单位的实际排班；地方节日、企业排班、港澳台及其他国家不在内置范围。超出覆盖范围的日期不会推算，任务会停止自动执行并记录 `calendar_out_of_coverage`，跨年前请升级到包含下一年数据的版本。
 
 ### 自定义日历
 

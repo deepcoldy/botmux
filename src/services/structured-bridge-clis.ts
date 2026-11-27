@@ -42,6 +42,7 @@ export const STRUCTURED_BRIDGE_ALWAYS_CLI_IDS = [
   // Like coco/cursor it lacks a complete interrupted/error terminal contract
   // and stays OUT of the lifecycle-blocking list.
   'doubao',
+  'nca',
 ] as const satisfies readonly CliId[];
 
 /** Adopt must forward pid/cwd/cliSessionId for these (CLIs whose worker

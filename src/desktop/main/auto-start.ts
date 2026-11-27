@@ -17,11 +17,19 @@ export function shouldAutoStartCliRuntime(state: DesktopRuntimeState): boolean {
   return state.status === 'stopped' && state.runtimeManaged && state.runtimeSource !== 'none';
 }
 
+export function shouldAutoStartEmptyOnboardingRuntime(state: DesktopRuntimeState): boolean {
+  return state.status === 'not_configured'
+    && state.runtimeManaged
+    && state.runtimeSource === 'bundled'
+    && state.botCount === 0;
+}
+
 export function shouldTakeOverExternalRuntime(state: DesktopRuntimeState): boolean {
   return state.status === 'degraded'
     && !state.runtimeManaged
     && state.runtimeSource === 'global-cli'
-    && Boolean(state.runtimePath);
+    && Boolean(state.runtimePath)
+    && (state.botCount > 0 || state.onlineDaemonCount > 0);
 }
 
 export async function autoStartCliRuntimeOnLaunch(args: {
@@ -32,7 +40,9 @@ export async function autoStartCliRuntimeOnLaunch(args: {
   try {
     const state = await args.runtime.getState();
     const takeover = shouldTakeOverExternalRuntime(state);
-    if (!shouldAutoStartCliRuntime(state) && !takeover) return 'skipped';
+    if (!shouldAutoStartCliRuntime(state) && !shouldAutoStartEmptyOnboardingRuntime(state) && !takeover) {
+      return 'skipped';
+    }
 
     const result = takeover ? await args.runtime.takeover() : await args.runtime.start();
     await refreshAfterLaunchAction(args.monitor, args.warn);

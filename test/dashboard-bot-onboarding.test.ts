@@ -554,6 +554,162 @@ describe('BotOnboardingManager', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  it('rejects an invalid next generation produced by cloning a pending source and leaves the job cancellable', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-next-generation-'));
+    const botsJsonPath = join(dir, 'bots.json');
+    const original = JSON.stringify([{
+      larkAppId: 'cli_pending_source',
+      larkAppSecret: 'source-secret',
+      activationPending: true,
+      // Pending rows are intentionally skipped by the daemon loader. Cloning
+      // removes that marker, so this malformed field becomes active in `next`.
+      sandboxNetwork: 'false',
+    }], null, 2) + '\n';
+    writeFileSync(botsJsonPath, original);
+    try {
+      const manager = new BotOnboardingManager({
+        botsJsonPath,
+        registerApp: async () => ({
+          ok: true,
+          appId: 'cli_cloned_target',
+          appSecret: 'target-secret',
+          brand: 'feishu',
+        }),
+        validateCredentials: async () => ({ ok: true }),
+        automateOpenPlatform: async () => autoOk(),
+        renderQrDataUrl: () => 'data:image/svg+xml;base64,qr',
+      });
+      const job = manager.start({ registrationMode: 'sdk', cloneSourceAppId: 'cli_pending_source' });
+      await job.done;
+      expect(manager.get(job.id)?.status).toBe('needs_owner');
+
+      batchGetIdMock.mockResolvedValueOnce({
+        code: 0,
+        data: { user_list: [{ email: 'owner@corp.com', user_id: 'ou_owner' }] },
+      });
+      expect(await manager.submitOwner(job.id, ['owner@corp.com'])).toMatchObject({
+        ok: false,
+        error: 'invalid_bots_json',
+      });
+      expect(readFileSync(botsJsonPath, 'utf8')).toBe(original);
+      // A next-generation validation failure happened before the write. It must
+      // not leave committedJobs claiming that cancel is already impossible.
+      expect(manager.cancel(job.id)).toMatchObject({ ok: true, job: { error: 'cancelled' } });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('reconciles a successful owner write when the durable coordinator loses its commit ACK', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-owner-ack-'));
+    const botsJsonPath = join(dir, 'bots.json');
+    let loseCommitAck = false;
+    const startBotLive = vi.fn(async () => ({ ok: true }));
+    try {
+      const manager = new BotOnboardingManager({
+        botsJsonPath,
+        registerApp: async () => ({
+          ok: true,
+          appId: 'cli_owner_ack',
+          appSecret: 'owner-ack-secret',
+          brand: 'feishu',
+          userOpenId: 'ou_unusable',
+        }),
+        validateCredentials: async () => ({ ok: true }),
+        automateOpenPlatform: async () => autoOk(),
+        renderQrDataUrl: () => 'data:image/svg+xml;base64,qr',
+        startBotLive,
+        runBotsMutation: async mutation => {
+          const result = await mutation();
+          if (loseCommitAck) throw new Error('post-commit coordinator ACK lost');
+          return result;
+        },
+      });
+      const job = manager.start({ registrationMode: 'sdk', workingDir: dir });
+      await job.done;
+      expect(manager.get(job.id)?.status).toBe('needs_owner');
+
+      batchGetIdMock.mockResolvedValueOnce({
+        code: 0,
+        data: { user_list: [{ email: 'owner@corp.com', user_id: 'ou_owner' }] },
+      });
+      loseCommitAck = true;
+      expect(await manager.submitOwner(job.id, ['owner@corp.com'])).toEqual({ ok: true });
+      expect(manager.get(job.id)).toMatchObject({ status: 'completed', addedBotIndex: 0 });
+      expect(startBotLive).toHaveBeenCalledWith('cli_owner_ack');
+      expect(existsSync(`${botsJsonPath}.onboarding-pending.json`)).toBe(false);
+      expect(JSON.parse(readFileSync(botsJsonPath, 'utf8'))[0]).toMatchObject({
+        larkAppId: 'cli_owner_ack',
+        allowedUsers: ['owner@corp.com'],
+      });
+      expect(manager.cancel(job.id)).toMatchObject({
+        ok: false,
+        error: 'already_completed',
+        job: { status: 'completed' },
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects an ACK-lost owner write when any unlisted config field drifted after rename', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-owner-drift-'));
+    const botsJsonPath = join(dir, 'bots.json');
+    const pendingStorePath = `${botsJsonPath}.onboarding-pending.json`;
+    let injectDrift = false;
+    const startBotLive = vi.fn(async () => ({ ok: true }));
+    try {
+      const manager = new BotOnboardingManager({
+        botsJsonPath,
+        registerApp: async () => ({
+          ok: true,
+          appId: 'cli_ack_drift',
+          appSecret: 'ack-drift-secret',
+          brand: 'feishu',
+          userOpenId: 'ou_unusable',
+        }),
+        validateCredentials: async () => ({ ok: true }),
+        automateOpenPlatform: async () => autoOk(),
+        renderQrDataUrl: () => 'data:image/svg+xml;base64,qr',
+        startBotLive,
+        runBotsMutation: async mutation => {
+          const result = await mutation();
+          if (injectDrift) {
+            const drifted = JSON.parse(readFileSync(botsJsonPath, 'utf8'));
+            drifted[0].autoAvoidApproval = true;
+            writeFileSync(botsJsonPath, JSON.stringify(drifted, null, 2));
+            throw new Error('post-commit coordinator ACK lost');
+          }
+          return result;
+        },
+      });
+      const job = manager.start({
+        registrationMode: 'sdk',
+        workingDir: dir,
+        autoAvoidApproval: false,
+      });
+      await job.done;
+      expect(manager.get(job.id)?.status).toBe('needs_owner');
+
+      batchGetIdMock.mockResolvedValueOnce({
+        code: 0,
+        data: { user_list: [{ email: 'owner@corp.com', user_id: 'ou_owner' }] },
+      });
+      injectDrift = true;
+      await expect(manager.submitOwner(job.id, ['owner@corp.com'])).rejects.toThrow('ACK lost');
+      expect(manager.get(job.id)?.status).toBe('needs_owner');
+      expect(startBotLive).not.toHaveBeenCalled();
+      expect(JSON.parse(readFileSync(botsJsonPath, 'utf8'))[0].autoAvoidApproval).toBe(true);
+      expect(existsSync(pendingStorePath)).toBe(true);
+      // The record mismatch proves this manager did not commit the drifted value;
+      // cancellation must remain possible and clear the private recovery file.
+      expect(manager.cancel(job.id)).toMatchObject({ ok: true, job: { error: 'cancelled' } });
+      expect(existsSync(pendingStorePath)).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('submitOwner accepts a resolvable mobile owner and queries the mobiles field (not emails)', async () => {
     // Regression for the P2 where detectUnusableOwnerEntries sent a mobile into
     // the `emails` query → code 0 + empty user_list → a valid mobile owner was

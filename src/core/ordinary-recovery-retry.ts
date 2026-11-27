@@ -22,6 +22,8 @@
 import { randomUUID } from 'node:crypto';
 import type { TrustedCaller } from '../types.js';
 import type { DaemonSession } from './types.js';
+import { advancePendingStreamingCardTurn } from './streaming-card-post-slot.js';
+import { prepareHookEnvelopeForReplay } from './prompt-hook-replay.js';
 import * as sessionStore from '../services/session-store.js';
 import {
   buildRecoveryRetryContent,
@@ -134,6 +136,14 @@ export async function retryOrdinaryRecoveryNotice(
     if (!fenced?.retried) throw new Error('retry fence was not persisted');
     marked = true;
     await prepareFailedTurnRecoveryIdentity(ds, turnId);
+    const willUseLiveWorker = !!(ds.worker && !ds.worker.killed);
+    const replayed = prepareHookEnvelopeForReplay({
+      ds,
+      content,
+      turnId,
+      hookEnvelope: record.retry.hookEnvelope,
+      willUseLiveWorker,
+    });
     let rejected = false;
     // sendWorkerInput reports IPC failure as `false`; forkWorker only throws
     // before spawning (e.g. a deleted working directory). Either way nothing
@@ -141,16 +151,16 @@ export async function retryOrdinaryRecoveryNotice(
     // cannot be admitted right now (memory pressure, device activation) say so
     // synchronously instead of reporting `deferred` and failing later, after
     // this click was already recorded as accepted.
-    const accepted = ds.worker && !ds.worker.killed
-      ? sendWorkerInput(ds, { content }, turnId, { trustedCaller: recoveredCaller, atMostOnce: true, failedTurnResendOf: logicalTurnId })
-      : forkWorker(ds, { content }, {
+    const accepted = willUseLiveWorker
+      ? sendWorkerInput(ds, replayed, turnId, { trustedCaller: recoveredCaller, atMostOnce: true, failedTurnResendOf: logicalTurnId })
+      : forkWorker(ds, replayed, {
         resume: ds.hasHistory, turnId, trustedCaller: recoveredCaller, atMostOnce: true,
       }, {
         deferDuringDeviceIsolation: false,
         onAdmission: admission => { rejected = admission === 'rejected'; },
       });
     if (!accepted || rejected) throw new Error('worker refused the re-delivery');
-    rememberLastCliInput(ds, userPrompt, { content }, turnId);
+    rememberLastCliInput(ds, userPrompt, replayed, turnId);
     const settled = updateOrdinaryRecoveryNotice(ds, logicalTurnId, entry => {
       if (entry.retried?.turnId === turnId) entry.retried.state = 'accepted';
     }) ?? findOrdinaryRecoveryNotice(ds, logicalTurnId) ?? record;
@@ -249,7 +259,7 @@ export async function handleOrdinaryRecoveryRetryClick(
   );
   // Same live-card hand-off as the other retry buttons: the card shows work.
   ds.lastScreenStatus = 'working';
-  ds.streamCardPending = true;
+  advancePendingStreamingCardTurn(ds);
   ds.currentTurnTitle = (result.record.task || ds.currentTurnTitle || ds.session.title || '').substring(0, 50);
   ds.currentImageKey = undefined;
   try { persistStreamCardState(ds); } catch { /* card bookkeeping is best effort */ }

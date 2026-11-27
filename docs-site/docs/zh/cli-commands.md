@@ -30,7 +30,7 @@ botmux setup
 
 打开交互界面，可以首次配置、添加、编辑或删除机器人。默认会用飞书扫码登录，自动帮你建应用、开权限、配回调和发版本；不想自动配置开放平台可以加 `--no-open-platform-auto`。
 
-### 脚本化配置（不进交互界面）
+### 脚本化配置（不进交互界面） {#scripted-setup}
 
 适合写脚本或让 AI 帮你操作：
 
@@ -44,6 +44,31 @@ botmux setup
 | `botmux setup remove <进程名\|AppID> --yes` | 删除机器人 |
 
 `--allowed-users` 填机器人主人。新建应用时请用**完整邮箱、手机号或 `on_` 开头的 union_id**，不要填 `ou_` 开头的 open_id：open_id 只在签发它的那个飞书应用里有效，新应用还不存在，不可能有合法的 open_id。完整字段列表见 `botmux setup help`。
+
+只想在本机使用、不连接飞书时，可以创建本地机器人：
+
+```bash
+botmux setup add --local --name 研究室 --cli codex --default-working-dir ~ --json
+```
+
+也可以在 Dashboard「添加机器人」里选「仅本地」。这条路径不扫码，也不需要飞书 App ID / Secret；写进 `bots.json` 的 `local_*` id 是稳定的本机身份，不是飞书 App ID。`--name`、`--cli`、`--default-working-dir` 和 `--json` 都是可选参数，完整参数见 `botmux setup help`。
+
+#### 添加内置清单之外的权限 {#extra-scopes}
+
+脚本化添加时传 `--extra-scopes-file <json>`（仅飞书租户；Lark 需在开放平台手动添加）：
+
+```bash
+botmux setup add --create-app --allowed-users <邮箱> --extra-scopes-file ./scopes.json
+botmux setup configure <进程名|AppID> --extra-scopes-file ./scopes.json
+```
+
+文件格式同 `lark-scopes.json`（`{"scopes":{"tenant":[],"user":[]}}`）；也接受 `{"scopes":[{"scope":"x:y"}]}`，但这种写法一律按 user 权限申请，要申请 tenant 权限请用 `{"scopes":{"tenant":["x:y"]}}`。当前租户目录里没有的权限（包括只有另一种身份才有的权限）会跳过并列在结果里，不会中断流程。
+
+文件路径会记到该机器人配置，之后重跑 `configure` 自动沿用；记下的文件读不到时只提示并按内置清单继续。不再需要时运行下面的命令清除：
+
+```bash
+botmux setup configure <进程名|AppID> --extra-scopes-file -
+```
 
 ### 复制一个机器人
 
@@ -103,7 +128,7 @@ botmux lang en --bot 0   # 只改 bots.json 里第 0 个机器人
 
 `start` / `restart` 还接受 `--companion-secret-file <绝对路径> --companion-bot <appId>`，两个一起给时会为一个隔离测试机器人开启封闭的本机 API，见 [本地 Companion API](/companion-api)。
 
-## 升级
+## 升级 {#upgrade}
 
 ```bash
 botmux upgrade            # 升级到最新正式版（别名 botmux update）
@@ -112,6 +137,8 @@ botmux upgrade 3.28.0     # 安装指定版本
 ```
 
 升级完成后按提示运行 `botmux restart` 让新版本生效。如果你是从源码 checkout 运行的，`upgrade` 会改为 `git pull` + 重新构建 + 重启。v3.18.0 之前的老版本请改用 curl 安装脚本升级，见 [FAQ · 怎么升级？](/faq#怎么升级)。
+
+源码安装的 Dashboard「设置 → 版本与更新」还支持普通更新，以及预览、确认并备份后强制覆盖本地改动。强制更新会移除当前源码中的本地定制功能；操作前会展示改动并保存 Git 备份。恢复方法和安全限制见[本地源码更新](https://github.com/deepcoldy/botmux/blob/master/docs/local-source-update.md)。
 
 ## 管理会话
 
@@ -204,7 +231,7 @@ Dashboard 的功能见 [Dashboard](/dashboard)。
 
 owner 私信在 2 秒窗口内按机器人合并，受影响会话按唯一 session 计数。每个机器人与 owner 组合最多每 5 分钟尝试发送一次，冷却记录跨 daemon 重启保留；发送失败也进入冷却，后续拒绝在冷却结束后可再次触发通知。owner 暂时无法解析时只记日志。无法写入冷却记录时退化为进程内去重。此通知独立于 Dashboard 中可选的主机负载监控。
 
-## 开机自启
+## 开机自启 {#autostart}
 
 ```bash
 botmux autostart enable   # 注册开机自启（不需要 sudo）

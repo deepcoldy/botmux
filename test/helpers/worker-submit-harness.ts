@@ -3,7 +3,7 @@ import { CodexBridgeQueue } from '../../src/services/codex-bridge-queue.js';
 import { InputDeliveryEvidenceTracker } from '../../src/services/input-delivery-evidence.js';
 import { createSubmitFailureChainController } from '../../src/services/submit-failure-chain.js';
 import { createQueuedActivationReceiptObserver } from '../../src/services/queued-activation-receipts.js';
-import { combineSubmitCurrentFences, settleDeferredSubmitConfirmation } from '../../src/services/submit-confirmation.js';
+import { combineSubmitCurrentFences, decideSubmitConfirmationAction, settleDeferredSubmitConfirmation } from '../../src/services/submit-confirmation.js';
 import { screenMayShowCredential } from '../../src/core/cli-startup-blocker.js';
 import { buildSubmitMessagePreview } from '../../src/services/submit-notification.js';
 import { diagnoseSubmitFailure } from '../../src/services/submit-failure-diagnosis.js';
@@ -28,7 +28,7 @@ export function workerSubmitHarness() {
     FIRST_PROMPT_HARD_TIMEOUT_MS: CODEX_APP_CONTROL_STARTUP_TIMEOUT_MS,
     cliRestartInProgress: false, isPromptReady: true, isFlushing: false,
     codexModelMigrationCheckNeeded: () => false,
-    idleDetector: { isStartupPending: () => false, programStatusHeldWorking: () => false },
+    idleDetector: { isStartupPending: () => false, programStatusHeldWorking: () => false, programStatusHeldBusy: () => false, adoptPromptReady: vi.fn() },
     shouldHoldCodexRunnerInput: () => false,
     currentInputDeliveryQuarantine: () => null,
     hasPendingInputForFlush: () => pendingMessages.length > 0,
@@ -88,7 +88,7 @@ export function workerSubmitHarness() {
     },
     isCodexAppCliId: () => false,
     runAmbiguousSubmissionTransaction: async (_backend: unknown, write: () => Promise<unknown>,
-      _accepted: unknown, prepare: () => void) => { prepare(); return { result: await write() }; },
+      _accepted: unknown, prepare: () => void) => { prepare?.(); return { result: await write() }; },
     adapterInputHandle: (backend: unknown) => backend,
     settleVerifiableSubmissionForJournal: vi.fn(),
     armInputDeliveryQuarantine: vi.fn(() => null),
@@ -99,6 +99,7 @@ export function workerSubmitHarness() {
     screenMayShowCredential, diagnoseSubmitFailure,
     SUBMIT_DEFERRED_RECHECK_MAX_ATTEMPTS: 2, unscopedSubmitFailureChainSequence: 0,
     combineSubmitCurrentFences,
+    decideSubmitConfirmationAction,
     settleDeferredSubmitConfirmation: async (...args: Parameters<typeof settleDeferredSubmitConfirmation>) => {
       const settlement = await settleDeferredSubmitConfirmation(...args);
       settlements.push(settlement);
@@ -107,7 +108,9 @@ export function workerSubmitHarness() {
     submitActivityEvidenceSince: () => 'pty-output',
     releaseInputDeliveryQuarantine: vi.fn(),
     deferNativeCodexInputCommit: () => false,
+    deferTurnInputCommitUntilSubmission: () => false,
     queuePostSubmitNativeSessionTitle: vi.fn(), persistCliSessionId: vi.fn(),
+    maybeQueuePostSubmitNativeSessionTitle: vi.fn(),
     syncFreshCodexNativeSessionTitle: vi.fn(async () => {}),
     projectedRuntimeScreenStatus: () => (scope.isPromptReady ? 'idle' : 'working'),
     publishScreenStatus: vi.fn(),
@@ -122,12 +125,14 @@ export function workerSubmitHarness() {
         readonly submissionStarted = true,
         readonly runnerGenerationUnsafe = false,
         readonly traexCatalogAdmissionRequired = false,
+        readonly retainPendingInput = false,
       ) { super(message); }
     },
     emitTurnTerminal: vi.fn(),
     shouldStopPendingBatch: () => true,
   };
   scope.nativeSessionForkPending = loadWorkerFunction('nativeSessionForkPending', scope);
+  scope.restoreSessionRenameReadiness = loadWorkerFunction('restoreSessionRenameReadiness', scope);
   scope.screenShowsCredentialPage = loadWorkerFunction('screenShowsCredentialPage', scope);
   // Real write-edge transport fold: a no-op unless an item carries a parked
   // TraeX RPC catalog and no RPC engine will write it.
@@ -142,6 +147,8 @@ export function workerSubmitHarness() {
   scope.acknowledgeQueuedActivation = loadWorkerFunction('acknowledgeQueuedActivation', scope);
   scope.probeAuthoritativeQueuedActivationEvidence = loadWorkerFunction('probeAuthoritativeQueuedActivationEvidence', scope);
   scope.observeQueuedActivationReceipt = vi.fn(loadWorkerFunction('observeQueuedActivationReceipt', scope));
+  scope.observeUnconfirmedQueuedActivation = vi.fn(loadWorkerFunction('observeUnconfirmedQueuedActivation', scope));
   const flush = loadWorkerFunction<() => Promise<void>>('flushPending', scope);
+  scope.flushPending = flush;
   return { scope, queue, flush, schedule, recheck, settlements, submitFailureChains, inputDeliveryEvidence, queuedActivationReceipts };
 }

@@ -5,18 +5,19 @@
  * the daemon route instead of failing with EPERM, and a writable data dir must
  * keep the local sidecar with no daemon round-trip.
  */
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import { TurnSendLedger } from '../src/services/turn-send-ledger.js';
 import { spawnSyncTsScript } from './helpers/ts-runner.js';
 import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 
 const fixture = fileURLToPath(new URL('./fixtures/send-reply-card-capture.ts', import.meta.url));
 const key = { larkAppId: 'cli_test', sessionId: 'sid_deferred', turnId: 'schedule:task-1:run-1' };
 
-function runSend(sidecarWritable: boolean, rootFacts?: Record<string, unknown>) {
+function runSend(sidecarWritable: boolean, rootFacts?: Record<string, unknown>, final = false) {
   const root = mkdtempSync(join(tmpdir(), 'botmux-send-deferred-'));
   const dataDir = join(root, 'data');
   const daemonDataDir = join(root, 'daemon-data');
@@ -52,7 +53,9 @@ function runSend(sidecarWritable: boolean, rootFacts?: Record<string, unknown>) 
     chatId: 'oc_test',
     managedTurnOrigin: { capability: 'cap', turnId: key.turnId },
   };
-  const result = spawnSyncTsScript(fixture, ['send', '--no-mention', '刷新成功'], {
+  const execute = () => spawnSyncTsScript(fixture, [
+    'send', ...(final ? ['--response-kind', 'final'] : []), '--no-mention', '刷新成功',
+  ], {
     cwd: fileURLToPath(new URL('..', import.meta.url)),
     env: {
       PATH: process.env.PATH,
@@ -71,14 +74,15 @@ function runSend(sidecarWritable: boolean, rootFacts?: Record<string, unknown>) 
     encoding: 'utf8',
     timeout: 30_000,
   });
+  const result = execute();
   const lines = String(result.stdout).split('\n');
   const parse = (prefix: string) => lines.filter(l => l.startsWith(prefix)).map(l => JSON.parse(l.slice(prefix.length)));
-  return { root, dataDir, daemonDataDir, result, daemon: parse('CAPTURE_DAEMON='), lark: parse('CAPTURE_REPLY=') };
+  return { root, dataDir, daemonDataDir, result, rerun: execute, daemon: parse('CAPTURE_DAEMON='), lark: parse('CAPTURE_REPLY=') };
 }
 
 describe('botmux send in a deferred schedule run', () => {
   it('claims the topic through the daemon when the sidecar is not writable', () => {
-    const run = runSend(false);
+    const run = runSend(false, undefined, true);
     try {
       expect(run.result.status, String(run.result.stderr)).toBe(0);
       expect(String(run.result.stderr)).not.toContain('EPERM');
@@ -95,6 +99,23 @@ describe('botmux send in a deferred schedule run', () => {
       });
       const binding = JSON.parse(readFileSync(join(run.daemonDataDir, 'deferred-topics', `${key.sessionId}.json`), 'utf8'));
       expect(binding).toMatchObject({ sessionId: key.sessionId, turnId: key.turnId, chatId: 'oc_test', rootMessageId: 'om_separate_message' });
+      const durableFinal = new TurnSendLedger(run.dataDir).read(key)?.final;
+      expect(durableFinal?.marker).toMatchObject({
+        targetChatId: 'oc_test', targetRootMessageId: 'om_separate_message', responseKind: 'final',
+      });
+
+      // Crash between ledger commit and journal publication. The exact replay
+      // must restore the real deferred root without another provider write.
+      unlinkSync(join(run.dataDir, 'turn-sends', `${key.sessionId}.jsonl`));
+      const replay = run.rerun();
+      expect(replay.status, String(replay.stderr)).toBe(0);
+      expect(String(replay.stdout)).not.toContain('CAPTURE_REPLY=');
+      const recovered = readFileSync(join(run.dataDir, 'turn-sends', `${key.sessionId}.jsonl`), 'utf8')
+        .trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+      expect(recovered.find(marker => marker.messageId === 'om_separate_message')).toMatchObject({
+        turnId: key.turnId, responseKind: 'final',
+        targetChatId: 'oc_test', targetRootMessageId: 'om_separate_message',
+      });
       // Correlation is the daemon's to derive: the CLI never names a turn or chat.
       for (const r of run.daemon) {
         for (const field of ['turnId', 'chatId', 'larkAppId', 'routingAnchor']) expect(r.body).not.toHaveProperty(field);
