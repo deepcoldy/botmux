@@ -31,8 +31,10 @@ const CATALOG_SUBDIR = join('cache', 'model-catalog');
 const CLAUDE_CODE_SURFACE = 'cc';
 /** 端点探测的超时：模型下拉是同步等待的，宁可回退也不能挂住请求。 */
 const ENDPOINT_TIMEOUT_MS = 3_000;
-/** 端点响应的上限，防止异常端点把内存打满。 */
+/** 端点响应的累计上限，防止异常端点把内存打满。 */
 const ENDPOINT_MAX_BYTES = 1_000_000;
+/** 多页目录也必须是有界操作；游标重复会更快失败。 */
+const ENDPOINT_MAX_PAGES = 20;
 
 type FetchImpl = typeof fetch;
 
@@ -112,24 +114,22 @@ export function parseClaudeModelCatalog(
 }
 
 /**
- * 依次尝试的 CLI 数据根：显式配置（`configDir` 或 `CLAUDE_CONFIG_DIR`）优先。
+ * 选择唯一的 CLI 数据根：显式 `configDir` 独占，否则才看 `CLAUDE_CONFIG_DIR`。
  *
- * 指定了 profile 目录时**不再**追加 `~/.claude`：那是另一个账户的数据根，
- * 拿它兜底会把别的账户的模型列到当前 bot 上。
+ * 指定了 profile 目录时**不再**追加 env 根或 `~/.claude`：那是另一个账户的
+ * 数据根，拿它兜底会把别的账户的模型列到当前 bot 上。dispatch 还可禁用
+ * 隐式宿主根，避免把调用方会话的 settings/cache 当成目标身份。
  */
-function catalogRoots(options: { env?: NodeJS.ProcessEnv; configDir?: string }): string[] {
-  const explicit = [options.configDir, options.env?.CLAUDE_CONFIG_DIR]
-    .filter((candidate): candidate is string => typeof candidate === 'string' && candidate.trim() !== '')
-    .map(candidate => resolve(expandHomePath(candidate.trim())));
-  const candidates = explicit.length > 0 ? explicit : [join(homedir(), '.claude')];
-  const roots: string[] = [];
-  const seen = new Set<string>();
-  for (const candidate of candidates) {
-    if (seen.has(candidate)) continue;
-    seen.add(candidate);
-    roots.push(candidate);
-  }
-  return roots;
+function catalogRoots(options: {
+  env?: NodeJS.ProcessEnv;
+  configDir?: string;
+  allowImplicitConfigRoot?: boolean;
+}): string[] {
+  // configDir is an account boundary, not merely a first search suggestion:
+  // never fall through to a second env root when the explicit profile is empty.
+  const configured = options.configDir?.trim() || options.env?.CLAUDE_CONFIG_DIR?.trim();
+  if (configured) return [resolve(expandHomePath(configured))];
+  return options.allowImplicitConfigRoot === false ? [] : [join(homedir(), '.claude')];
 }
 
 /** 读一个数据根下 mtime 最新的 `published-*.json`；没有可用文件时返回 null。 */
@@ -164,11 +164,15 @@ export function readClaudeModelCatalogFromRoot(root: string): readonly string[] 
 }
 
 /**
- * 读取本机 Claude CLI 的模型目录。所有数据根都没有可用缓存时返回 null
+ * 读取选中数据根下的 Claude CLI 模型目录。没有可用缓存时返回 null
  * （调用方回退静态候选），绝不抛异常。
  */
 export async function readClaudeModelCatalog(
-  options: { env?: NodeJS.ProcessEnv; configDir?: string } = {},
+  options: {
+    env?: NodeJS.ProcessEnv;
+    configDir?: string;
+    allowImplicitConfigRoot?: boolean;
+  } = {},
 ): Promise<readonly string[] | null> {
   try {
     for (const root of catalogRoots(options)) {
@@ -200,20 +204,22 @@ function readSettingsEnvFile(root: string): Record<string, string> {
 }
 
 /**
- * 端点探测用的有效环境：bot 自己的启动环境优先；没有 base override 时，按 CLI 的
- * 解析顺序补上 `<config dir>/settings.json` 的 env —— 用户级 settings 的
- * `ANTHROPIC_BASE_URL`/`AUTH_TOKEN` 在 CLI 启动时同样生效，只读 process.env 会漏掉它。
+ * 端点探测用的有效环境，按 CLI 的 settings 源逐 key 合并：
+ * botmux `--settings` overlay > 用户 settings env > 普通继承 env。
+ * 调用方可禁止隐式宿主根；显式 configDir 始终保留。
  */
 export function resolveEndpointEnvironment(
   env: NodeJS.ProcessEnv | undefined,
   configDir?: string,
+  settingsEnv: NodeJS.ProcessEnv = {},
+  allowImplicitConfigRoot = true,
 ): NodeJS.ProcessEnv {
-  if (env?.ANTHROPIC_BASE_URL?.trim()) return env;
-  for (const root of catalogRoots({ env, configDir })) {
-    const fileEnv = readSettingsEnvFile(root);
-    if (fileEnv.ANTHROPIC_BASE_URL?.trim()) return { ...fileEnv, ...env };
-  }
-  return env ?? {};
+  const root = catalogRoots({ env, configDir, allowImplicitConfigRoot })[0];
+  const fileEnv = root ? readSettingsEnvFile(root) : {};
+  // Match the real launcher per key: botmux --settings overlay > user settings
+  // env > ordinary inherited env. A base-only overlay still inherits the
+  // settings token; conversely plain inherited values must not shadow settings.
+  return { ...env, ...fileEnv, ...settingsEnv };
 }
 
 /** 从 bot 环境里取探测目标；没有 base override 或没有凭据时返回 null。 */
@@ -260,14 +266,15 @@ export function parseEndpointModelsJson(body: unknown): readonly string[] | null
  * 有流就按块累加、超限 cancel；测试里的假 response 没有流，退回整读后按
  * **字节数**（不是 UTF-16 码元数）判定。
  */
-async function readCappedBody(response: Response, limit: number): Promise<string | null> {
+async function readCappedBody(response: Response, limit: number): Promise<{ text: string; bytes: number } | null> {
   const declared = Number(response.headers?.get?.('content-length') ?? Number.NaN);
   if (Number.isFinite(declared) && declared > limit) return null;
   const stream = (response as { body?: ReadableStream<Uint8Array> | null }).body;
   const reader = stream?.getReader?.();
   if (!reader) {
     const text = await response.text();
-    return Buffer.byteLength(text, 'utf8') > limit ? null : text;
+    const bytes = Buffer.byteLength(text, 'utf8');
+    return bytes > limit ? null : { text, bytes };
   }
   const chunks: Uint8Array[] = [];
   let total = 0;
@@ -286,7 +293,10 @@ async function readCappedBody(response: Response, limit: number): Promise<string
   } finally {
     try { reader.releaseLock(); } catch { /* 已取消/已释放 */ }
   }
-  return Buffer.concat(chunks.map(chunk => Buffer.from(chunk))).toString('utf8');
+  return {
+    text: Buffer.concat(chunks.map(chunk => Buffer.from(chunk))).toString('utf8'),
+    bytes: total,
+  };
 }
 
 /**
@@ -307,22 +317,49 @@ export async function detectModelsViaEndpoint(
   // 探针不该让进程多活 3 秒（daemon 里这会是每个请求的尾巴）。
   (timer as { unref?: () => void }).unref?.();
   try {
-    const response = await fetchImpl(`${target.base}/v1/models`, {
-      method: 'GET',
-      // Fetch can retain custom headers such as x-api-key across redirects.
-      redirect: 'error',
-      headers: {
-        authorization: `Bearer ${target.token}`,
-        'x-api-key': target.token,
-        'anthropic-version': '2023-06-01',
-        accept: 'application/json',
-      },
-      signal: controller.signal,
-    });
-    if (!response.ok) return null;
-    const text = await readCappedBody(response, ENDPOINT_MAX_BYTES);
-    if (text === null) return null;
-    return parseEndpointModelsJson(parseJsonRecord(text));
+    const endpoint = `${target.base}/v1/models`;
+    let nextUrl: string = endpoint;
+    let totalBytes = 0;
+    const models: string[] = [];
+    const seenModels = new Set<string>();
+    const seenCursors = new Set<string>();
+    for (let page = 0; page < ENDPOINT_MAX_PAGES; page++) {
+      const response = await fetchImpl(nextUrl, {
+        method: 'GET',
+        // Fetch can retain custom headers such as x-api-key across redirects.
+        redirect: 'error',
+        headers: {
+          authorization: `Bearer ${target.token}`,
+          'x-api-key': target.token,
+          'anthropic-version': '2023-06-01',
+          accept: 'application/json',
+        },
+        signal: controller.signal,
+      });
+      if (!response.ok) return null;
+      const body = await readCappedBody(response, ENDPOINT_MAX_BYTES - totalBytes);
+      if (body === null) return null;
+      totalBytes += body.bytes;
+      const json = parseJsonRecord(body.text);
+      const pageModels = parseEndpointModelsJson(json);
+      // Never expose a partial catalogue when any page is malformed.
+      if (!json || !pageModels) return null;
+      for (const model of pageModels) {
+        if (seenModels.has(model)) continue;
+        seenModels.add(model);
+        models.push(model);
+      }
+      if (json.has_more !== true) return models.length > 0 ? models : null;
+
+      const cursor = typeof json.last_id === 'string' ? json.last_id.trim() : '';
+      if (!cursor || seenCursors.has(cursor)) return null;
+      seenCursors.add(cursor);
+      const next = new URL(endpoint);
+      next.searchParams.set('after_id', cursor);
+      nextUrl = next.toString();
+    }
+    // A directory that still has more pages after the budget is not authoritative.
+    return null;
   } catch {
     return null;
   } finally {
@@ -335,10 +372,23 @@ export async function detectModelsViaEndpoint(
  * 绝不抛异常。
  */
 export async function detectClaudeModels(
-  options: { env?: NodeJS.ProcessEnv; configDir?: string; fetchImpl?: FetchImpl } = {},
+  options: {
+    env?: NodeJS.ProcessEnv;
+    /** Botmux-owned --settings overlay; env still carries the effective merge. */
+    settingsEnv?: NodeJS.ProcessEnv;
+    configDir?: string;
+    /** False excludes an implicit ~/.claude root; explicit configDir still works. */
+    allowImplicitConfigRoot?: boolean;
+    fetchImpl?: FetchImpl;
+  } = {},
 ): Promise<readonly string[] | null> {
   const viaEndpoint = await detectModelsViaEndpoint(
-    resolveEndpointEnvironment(options.env, options.configDir),
+    resolveEndpointEnvironment(
+      options.env,
+      options.configDir,
+      options.settingsEnv,
+      options.allowImplicitConfigRoot,
+    ),
     options.fetchImpl,
   );
   if (viaEndpoint) return viaEndpoint;
@@ -346,6 +396,10 @@ export async function detectClaudeModels(
   // 而磁盘目录是官方账户的签名目录。端点一次失败就退回官方列表，会让网关
   // bot 拿到一批根本跑不到的模型，所以这里直接回退静态表。
   // base URL 来自用户自己的 settings.json 时不设限——那正是「本机 CLI」。
-  if (options.env?.ANTHROPIC_BASE_URL?.trim()) return null;
-  return readClaudeModelCatalog({ env: options.env, configDir: options.configDir });
+  if (options.env?.ANTHROPIC_BASE_URL?.trim() || options.settingsEnv?.ANTHROPIC_BASE_URL?.trim()) return null;
+  return readClaudeModelCatalog({
+    env: options.env,
+    configDir: options.configDir,
+    allowImplicitConfigRoot: options.allowImplicitConfigRoot,
+  });
 }

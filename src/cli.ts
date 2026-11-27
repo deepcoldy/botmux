@@ -186,7 +186,7 @@ import { defaultStatFile, parseSendInvocation, validateClientSendInvocation, typ
 import { parseDispatchArgs } from './cli/dispatch-args.js';
 import { safeRequirementUrl } from './core/dispatch-task-tree.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
-import { botOneShotEnv } from './core/session-env-resolve.js';
+import { createDispatchModelDetector } from './cli/dispatch-model-probe.js';
 import { isCodexReasoningEffort, type CodexReasoningEffort } from './services/codex-reasoning-effort.js';
 import { resolveDispatchLaunchSpec } from './core/dispatch-launch-spec.js';
 import {
@@ -18437,16 +18437,14 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       target.cliRuntime?.executable ?? target.cliPathOverride,
       { configDir: target.cliConfigDir },
     );
-    // Validate against the catalogue THIS bot will actually see: a gateway
-    // bot's models only exist behind its own env, and a profile bot's models
-    // live in its own config dir.
-    const probeEnv = botOneShotEnv(process.env, target);
-    // 与 services/model-catalog.ts 同一条规则：Claude 网关 wrapper 的模型集合
-    // 由网关定义，原生探测会答成宿主机官方账户。宁可拒绝显式 model，也不要拿
-    // 另一套目录去校验它。
-    const detectModels = target.cliId === 'claude-code' && target.wrapperCli
-      ? () => Promise.resolve<readonly string[] | null>(null)
-      : () => adapter.detectModels?.({ env: probeEnv }) ?? Promise.resolve(null);
+    // The caller's session is not the target worker's identity baseline. The
+    // shared detector strips that identity and fail-closes when no trusted
+    // target profile/endpoint is available; Claude wrappers never probe native.
+    const detectModels = createDispatchModelDetector({
+      target,
+      callerEnv: process.env,
+      adapter,
+    });
     const resolved = await resolveDispatchLaunchSpec({
       requested: { model: dispatchArgs.model, reasoningEffort: dispatchArgs.reasoningEffort },
       target,

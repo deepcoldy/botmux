@@ -55,6 +55,8 @@ export interface DetectModelsOptions {
   readonly runtimeContext?: string;
   /** Bot-specific environment for a capability probe. */
   readonly probeEnv?: NodeJS.ProcessEnv;
+  /** Botmux-owned global/Bot overlay, kept separate from inherited probeEnv. */
+  readonly probeSettingsEnv?: NodeJS.ProcessEnv;
   /** Trusted executable selected from the target Bot's persisted native runtime. */
   readonly runtimeExecutable?: string;
   /** Command resolver injection for deterministic cache-identity tests. */
@@ -217,7 +219,12 @@ async function detectModelCatalogWith(
               ? await (opts?.aidenCodexDetector ?? detectAidenCodexModels)()
               : adapter?.detectModelCapabilities
                 ? capabilities?.map(model => model.slug) ?? null
-                : await adapter?.detectModels?.({ env: probeEnv }) ?? null;
+                : await adapter?.detectModels?.({
+                    env: probeEnv,
+                    ...(opts?.probeSettingsEnv && Object.keys(opts.probeSettingsEnv).length > 0
+                      ? { settingsEnv: opts.probeSettingsEnv }
+                      : {}),
+                  }) ?? null;
             // 只缓存非空成功结果；失败（null/空数组/异常）不缓存，下次调用重试。
             if (models === null) return null;
             if (models.length === 0) return { models: [] };

@@ -27,7 +27,7 @@ import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { detectClaudeModels } from './claude-model-catalog.js';
 import { resolveCommand } from './registry.js';
 import { claudeCompactionHookCommand, claudeStopFailureHookCommand, sessionReadyHookCommand, statuslineHookCommand, userPromptHookCommand } from '../hook-command.js';
-import type { CliAdapter, CliId, PtyHandle } from './types.js';
+import type { CliAdapter, CliId, CliModelDetectionOptions, PtyHandle } from './types.js';
 import { CLAUDE_STRIPPED_INVISIBLE_RE, findJsonlContainingFingerprint, jsonlContainsFingerprint, normaliseForFingerprint } from '../../services/claude-transcript.js';
 import { CLAUDE_REASONING_EFFORTS } from '../../services/codex-reasoning-effort.js';
 import { GOAL_ENV } from '../../workflows/v3/contract.js';
@@ -1013,7 +1013,7 @@ export interface ClaudeFamilyVariant {
    *  CLI caches on disk (`<config dir>/cache/model-catalog/published-*.json`).
    *  Forks whose model set is gateway-defined leave it undefined so the
    *  static list applies. */
-  readonly detectModels?: (options?: { env?: NodeJS.ProcessEnv }) => Promise<readonly string[] | null>;
+  readonly detectModels?: (options?: CliModelDetectionOptions) => Promise<readonly string[] | null>;
   /** Auth/login paths kept real+writable in the file sandbox (see CliAdapter.authPaths). */
   readonly authPaths?: readonly string[];
   /** Opt in only after this concrete fork passes the terminal contract. */
@@ -1079,7 +1079,12 @@ export function createClaudeCodeAdapter(pathOverride?: string, configDir?: strin
     // CLI 缓存的签名目录 → 静态表」取（见 claude-model-catalog.ts）：网关 bot 的
     // 可选集合只有 /v1/models 知道，官方账户则与 /model 选择器同源。
     modelChoices: CLI_MODEL_CHOICES['claude-code'],
-    detectModels: (options) => detectClaudeModels({ env: options?.env, configDir }),
+    detectModels: (options) => detectClaudeModels({
+      env: options?.env,
+      settingsEnv: options?.settingsEnv,
+      allowImplicitConfigRoot: options?.allowImplicitConfigRoot,
+      configDir,
+    }),
   }, pathOverride ?? 'claude');
 }
 

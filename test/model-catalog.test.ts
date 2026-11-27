@@ -201,6 +201,35 @@ describe('detectModels（live 探测，fail-soft）', () => {
     }
   });
 
+  it('Claude 的三层环境经目录服务保留 botmux overlay 优先级', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-catalog-layered-'));
+    writeFileSync(join(root, 'settings.json'), JSON.stringify({
+      env: { ANTHROPIC_BASE_URL: 'http://settings.invalid', ANTHROPIC_AUTH_TOKEN: 'settings-token' },
+    }));
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      text: async () => JSON.stringify({ data: [{ id: 'bot-gateway-model' }] }),
+    })) as unknown as typeof fetch;
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      const catalog = createModelCatalog();
+      const overlay = { ANTHROPIC_BASE_URL: 'http://bot.invalid' };
+      const models = await catalog.detectModels('claude-code', {
+        runtimeExecutable: '/virtual/claude',
+        resolveExecutable: () => '/virtual/claude',
+        probeEnv: overlay,
+        probeSettingsEnv: overlay,
+        adapterFactory: () => createClaudeCodeAdapter('/virtual/claude', root),
+      });
+      expect(models).toEqual(['bot-gateway-model']);
+      expect(fetchMock).toHaveBeenCalledOnce();
+      expect(String(vi.mocked(fetchMock).mock.calls[0]?.[0])).toBe('http://bot.invalid/v1/models');
+    } finally {
+      vi.unstubAllGlobals();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('未知 key → null', async () => {
     expect(await detectModels('does-not-exist')).toBeNull();
   });

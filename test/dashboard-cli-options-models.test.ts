@@ -146,6 +146,7 @@ describe('GET /api/cli-options/models — Bot runtime 上下文', () => {
       runtimeExecutable: undefined,
       runtimeContext: undefined,
       probeEnv: undefined,
+      probeSettingsEnv: undefined,
       configDir: undefined,
       canProbe: false,
     });
@@ -182,5 +183,45 @@ describe('GET /api/cli-options/models — Bot runtime 上下文', () => {
     const ctx = modelCatalogProbeContext('claude-code', bot, { PATH: '/x' });
     expect(ctx.canProbe).toBe(false);
     expect(ctx.configDir).toBeUndefined();
+  });
+
+  it.each([
+    ['oncall sandbox', { sandbox: true }, {}],
+    ['legacy read isolation', { readIsolation: true }, {}],
+    ['credential-source home', { credentialsSourceDir: '/accounts/target' }, {}],
+    ['env-forced sandbox', {}, { BOTMUX_SANDBOX: '1' }],
+  ])('worker 会重定向 Claude 数据根时禁止借用探测根：%s', (_name, shape, baseEnv) => {
+    const bot = {
+      larkAppId: 'cli_redirected',
+      cliId: 'claude-code',
+      ...shape,
+    } as BotConfig;
+    expect(modelCatalogProbeContext('claude-code', bot, baseEnv).canProbe).toBe(false);
+  });
+
+  it('scratch 与其他 CLI 不因 oncall 的 Claude 重定向规则误停探测', () => {
+    expect(modelCatalogProbeContext('claude-code', {
+      larkAppId: 'cli_scratch', cliId: 'claude-code', sandbox: 'scratch',
+    } as BotConfig, {}).canProbe).toBe(true);
+    expect(modelCatalogProbeContext('codex', {
+      larkAppId: 'cli_codex_sandbox', cliId: 'codex', sandbox: true,
+    } as BotConfig, {}).canProbe).toBe(true);
+  });
+
+  it('保留 botmux overlay 与继承 env 的分层', () => {
+    const bot = {
+      larkAppId: 'cli_layered',
+      cliId: 'claude-code',
+      env: { ANTHROPIC_BASE_URL: 'https://from-bot' },
+    } as BotConfig;
+    const ctx = modelCatalogProbeContext('claude-code', bot, {
+      ANTHROPIC_BASE_URL: 'https://inherited',
+      ANTHROPIC_AUTH_TOKEN: 'inherited-token',
+    });
+    expect(ctx.probeEnv).toMatchObject({
+      ANTHROPIC_BASE_URL: 'https://from-bot',
+      ANTHROPIC_AUTH_TOKEN: 'inherited-token',
+    });
+    expect(ctx.probeSettingsEnv).toEqual({ ANTHROPIC_BASE_URL: 'https://from-bot' });
   });
 });

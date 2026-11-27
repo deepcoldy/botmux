@@ -6584,6 +6584,7 @@ const server = createServer(async (req, res) => {
       const body = await buildModelChoicesResponse(key, {
         runtimeContext: probeContext.runtimeContext,
         probeEnv: probeContext.probeEnv,
+        probeSettingsEnv: probeContext.probeSettingsEnv,
         runtimeExecutable: probeContext.runtimeExecutable,
         resolveExecutable,
         supportsModelDiscovery: requestedCliId => {

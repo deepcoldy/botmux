@@ -165,6 +165,23 @@ describe('readClaudeModelCatalog', () => {
 
     expect(await readClaudeModelCatalog({ configDir: explicit, env: { CLAUDE_CONFIG_DIR: fromEnv } }))
       .toEqual(['claude-opus-5-5']);
+
+    // 显式 profile 是独占边界：无缓存时也不能落到另一个 env 数据根。
+    expect(await readClaudeModelCatalog({ configDir: tempRoot(), env: { CLAUDE_CONFIG_DIR: fromEnv } }))
+      .toBeNull();
+  });
+
+  it('可禁止隐式宿主根，同时保留显式 profile', async () => {
+    const homeCatalog = writeCatalog(join(homedir(), '.claude'), 'published-no-implicit.json', catalogDocument([{ id: 'host-model' }]));
+    const explicit = tempRoot();
+    writeCatalog(explicit, 'published-a.json', catalogDocument([{ id: 'explicit-model' }]));
+    try {
+      expect(await readClaudeModelCatalog({ env: {}, allowImplicitConfigRoot: false })).toBeNull();
+      expect(await readClaudeModelCatalog({ configDir: explicit, allowImplicitConfigRoot: false }))
+        .toEqual(['explicit-model']);
+    } finally {
+      rmSync(homeCatalog, { force: true });
+    }
   });
 });
 
@@ -247,6 +264,56 @@ describe('detectModelsViaEndpoint', () => {
     expect(called).toBe(0);
   });
 
+  it('按 has_more/last_id 有界翻页，保序合并并去重', async () => {
+    const calls: string[] = [];
+    const fetchImpl = (async (url: string) => {
+      calls.push(url);
+      const after = new URL(url).searchParams.get('after_id');
+      const firstPage = Array.from({ length: 20 }, (_, i) => ({ id: `model-${i + 1}` }));
+      return {
+        ok: true,
+        text: async () => JSON.stringify(after ? {
+          data: [{ id: 'model-20' }, { id: 'model-21' }],
+          has_more: false,
+          last_id: 'model-21',
+        } : {
+          data: firstPage,
+          has_more: true,
+          last_id: 'model-20',
+        }),
+      } as Response;
+    }) as unknown as typeof fetch;
+
+    const models = await detectModelsViaEndpoint(env, fetchImpl);
+    expect(models).toHaveLength(21);
+    expect(models?.at(-1)).toBe('model-21');
+    expect(calls).toHaveLength(2);
+    expect(new URL(calls[1]!).searchParams.get('after_id')).toBe('model-20');
+  });
+
+  it('游标重复或后续页失败时返回 null，不把部分目录当权威结果', async () => {
+    let repeatedCalls = 0;
+    const repeated = (async () => {
+      repeatedCalls++;
+      return {
+        ok: true,
+        text: async () => JSON.stringify({
+          data: [{ id: 'only-model' }], has_more: true, last_id: 'same-cursor',
+        }),
+      } as Response;
+    }) as unknown as typeof fetch;
+    expect(await detectModelsViaEndpoint(env, repeated)).toBeNull();
+    expect(repeatedCalls).toBe(2);
+
+    const secondPageFails = (async (url: string) => ({
+      ok: !new URL(url).searchParams.has('after_id'),
+      text: async () => JSON.stringify({
+        data: [{ id: 'partial-model' }], has_more: true, last_id: 'next',
+      }),
+    }) as Response) as unknown as typeof fetch;
+    expect(await detectModelsViaEndpoint(env, secondPageFails)).toBeNull();
+  });
+
   it('Content-Length 已超限时不读响应体', async () => {
     let readBody = false;
     const fetchImpl = (async () => ({
@@ -288,23 +355,50 @@ describe('detectModelsViaEndpoint', () => {
 });
 
 describe('resolveEndpointEnvironment', () => {
-  it('bot env 已有 base URL 时不读 settings.json', () => {
+  it('botmux --settings overlay 覆盖用户 settings 与普通继承 env', () => {
     const root = tempRoot();
-    mkdirSync(root, { recursive: true });
     writeFileSync(join(root, 'settings.json'), JSON.stringify({
       env: { ANTHROPIC_BASE_URL: 'https://from-settings', ANTHROPIC_AUTH_TOKEN: 's' },
     }));
-    expect(resolveEndpointEnvironment({ ANTHROPIC_BASE_URL: 'https://from-bot', ANTHROPIC_AUTH_TOKEN: 'b' }, root))
-      .toEqual({ ANTHROPIC_BASE_URL: 'https://from-bot', ANTHROPIC_AUTH_TOKEN: 'b' });
+    const resolved = resolveEndpointEnvironment({
+      ANTHROPIC_BASE_URL: 'https://inherited',
+      ANTHROPIC_AUTH_TOKEN: 'i',
+    }, root, {
+      ANTHROPIC_BASE_URL: 'https://from-bot',
+      ANTHROPIC_AUTH_TOKEN: 'b',
+    });
+    expect(resolved).toMatchObject({
+      ANTHROPIC_BASE_URL: 'https://from-bot',
+      ANTHROPIC_AUTH_TOKEN: 'b',
+    });
   });
 
-  it('bot env 没有 base URL 时补上 settings.json 的 env', () => {
+  it('没有 botmux overlay 时，用户 settings 覆盖普通继承 env', () => {
     const root = tempRoot();
     writeFileSync(join(root, 'settings.json'), JSON.stringify({
-      env: { ANTHROPIC_BASE_URL: 'http://127.0.0.1:3425', ANTHROPIC_AUTH_TOKEN: 'from-settings' },
+      env: { ANTHROPIC_BASE_URL: 'https://from-settings', ANTHROPIC_AUTH_TOKEN: 's' },
     }));
-    expect(resolveEndpointEnvironment(undefined, root))
-      .toEqual({ ANTHROPIC_BASE_URL: 'http://127.0.0.1:3425', ANTHROPIC_AUTH_TOKEN: 'from-settings' });
+    expect(resolveEndpointEnvironment({
+      ANTHROPIC_BASE_URL: 'https://inherited',
+      ANTHROPIC_AUTH_TOKEN: 'i',
+    }, root)).toMatchObject({
+      ANTHROPIC_BASE_URL: 'https://from-settings',
+      ANTHROPIC_AUTH_TOKEN: 's',
+    });
+  });
+
+  it('base-only botmux overlay 仍逐 key 继承 settings-only token', () => {
+    const root = tempRoot();
+    writeFileSync(join(root, 'settings.json'), JSON.stringify({
+      env: { ANTHROPIC_AUTH_TOKEN: 'from-settings' },
+    }));
+    const resolved = resolveEndpointEnvironment({
+      ANTHROPIC_BASE_URL: 'https://from-bot',
+    }, root, { ANTHROPIC_BASE_URL: 'https://from-bot' });
+    expect(resolved).toMatchObject({
+      ANTHROPIC_BASE_URL: 'https://from-bot',
+      ANTHROPIC_AUTH_TOKEN: 'from-settings',
+    });
   });
 });
 
@@ -322,6 +416,26 @@ describe('detectClaudeModels（优先级：端点 → 目录 → null）', () =>
       configDir: root,
       fetchImpl,
     })).toEqual(['coding-plan/deepseek-v4.1-flash']);
+  });
+
+  it('base-only overlay 能搭配 settings token 完成端点探测', async () => {
+    const root = tempRoot();
+    writeFileSync(join(root, 'settings.json'), JSON.stringify({
+      env: { ANTHROPIC_AUTH_TOKEN: 'settings-token' },
+    }));
+    const fetchImpl = vi.fn(async () => ({
+      ok: true,
+      text: async () => JSON.stringify({ data: [{ id: 'gateway-only-model' }] }),
+    })) as unknown as typeof fetch;
+    const overlay = { ANTHROPIC_BASE_URL: 'http://127.0.0.1:3425' };
+
+    expect(await detectClaudeModels({
+      env: overlay,
+      settingsEnv: overlay,
+      configDir: root,
+      fetchImpl,
+    })).toEqual(['gateway-only-model']);
+    expect(fetchImpl).toHaveBeenCalledOnce();
   });
 
   it('官方账户（无 base override）直接读磁盘目录', async () => {
