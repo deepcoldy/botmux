@@ -225,11 +225,15 @@ async function runNodeWithLogs(
   // snapshot: a run paused before the mode was enabled resumes from its stored
   // snapshot, and a workflow worker has no per-owner session (it would get the
   // bot-wide BOT_HOME). Refuse before any side effect.
-  assertNotAssistantModeBot(req.botSnapshot.larkAppId);
+  // An attempt already cancelled on arrival takes the cancel path below
+  // (fence closed as pre_aborted, status cancelled) without reading bots.json:
+  // a config fault must not turn a cancellation into a node failure.
+  const cancelSignal = req.attemptLease?.signal ?? req.cancelSignal;
+  const cancelledOnArrival = cancelSignal?.aborted === true;
+  if (!cancelledOnArrival) assertNotAssistantModeBot(req.botSnapshot.larkAppId);
   // Resolve the env overlay before any side effect too: a bots.json read
   // failure must reject this node here, not after a worker has been forked.
-  const workerSessionEnv = v3WorkerSessionEnv(req.botSnapshot.larkAppId, deps.resolveBot);
-  const cancelSignal = req.attemptLease?.signal ?? req.cancelSignal;
+  const workerSessionEnv = cancelledOnArrival ? {} : v3WorkerSessionEnv(req.botSnapshot.larkAppId, deps.resolveBot);
   const manifestPath = req.env[GOAL_ENV.MANIFEST_PATH] ?? join(req.attemptDir, 'manifest.json');
   const ptyLogPath = join(req.attemptDir, 'pty.log');
   if (!req.workerFence) await mkdir(req.attemptDir, { recursive: true });

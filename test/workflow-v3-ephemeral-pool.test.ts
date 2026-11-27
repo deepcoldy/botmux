@@ -518,6 +518,38 @@ describe('v3 ephemeral pool', () => {
       expect(failure.message).toContain(botsPath);
     });
 
+    it('returns cancelled (not a config failure) for an attempt already aborted while bots.json is invalid', async () => {
+      configureBots([{ larkAppId: 'cli_app', larkAppSecret: 'test-only', cliId: 'claude-code' }]);
+      writeFileSync(join(dir, 'bots.json'), '{ not json');
+      const factory = factoryFor(new ScriptedWorker());
+      const ac = new AbortController();
+      ac.abort({ kind: 'run', cancelRequestId: 'cancel-before-config' });
+      await expect(createEphemeralPool({ factory, workerPath: '/tmp/worker.js', resolveLarkAppSecret: () => 'secret' })
+        .runNode({ ...request(), cancelSignal: ac.signal })).resolves.toMatchObject({
+        status: 'cancelled',
+        cancelReason: { kind: 'run', cancelRequestId: 'cancel-before-config' },
+      });
+      expect(readV3AttemptWorkerFence(request().attemptDir, request())).toMatchObject({
+        phase: 'closed_no_spawn',
+        reason: 'pre_aborted',
+      });
+      expect(factory.lastOpts).toBeUndefined();
+    });
+
+    it('fails an unregistered node bot when the default config directory is a dangling symlink', async (ctx) => {
+      const home = join(dir, 'home');
+      mkdirSync(home, { recursive: true });
+      const configDir = join(home, '.botmux');
+      try { symlinkSync(join(dir, 'moved-config-dir'), configDir); } catch { ctx.skip(); }
+      // os.homedir() reads USERPROFILE on Windows, HOME elsewhere.
+      vi.stubEnv('HOME', home);
+      vi.stubEnv('USERPROFILE', home);
+      vi.stubEnv('BOTS_CONFIG', '');
+      const failure = await rejectsBeforeSpawn();
+      expect(failure.message).toContain('cli_app');
+      expect(failure.cause).toMatchObject({ reason: 'unreadable' });
+    });
+
     it('keeps starting a hosted node bot from the registry while bots.json is invalid', async () => {
       const bot: BotConfig = { larkAppId: 'cli_app', larkAppSecret: 'test-only', cliId: 'claude-code',
         apiOnly: true, env: { MODEL_AUTH: 'registered-sentinel' } };

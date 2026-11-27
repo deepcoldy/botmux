@@ -14,7 +14,7 @@ import { parseSandboxNetworkPolicy } from './core/sandbox-network-policy.js';
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { normalizeCodexInstancePool, registerCodexInstanceBot, clearCodexInstanceBots, validateCodexInstanceRoster } from './services/codex-instance-pool.js';
 import { readFileSync, existsSync, lstatSync, statSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { underReadIsolation } from './adapters/cli/read-isolation.js';
 import { retiredCli, retiredCliNotice } from './adapters/cli/retired-cli.js';
 import {
@@ -3751,9 +3751,12 @@ function resolveBotConfigPath(): string {
     statSync(defaultPath);
   } catch (err: any) {
     if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') {
-      // stat() follows symlinks: a bots.json link whose target moved is a
-      // broken configuration, not an absent one.
-      if (pathEntryExists(defaultPath)) throw new BotConfigLoadError('unreadable', defaultPath, err.code, err);
+      // stat() follows symlinks: a bots.json link whose target moved, or a
+      // config directory that is itself a dangling link, is a broken
+      // configuration, not an absent one.
+      if (pathEntryExists(defaultPath) || danglingEntry(dirname(defaultPath))) {
+        throw new BotConfigLoadError('unreadable', defaultPath, err.code, err);
+      }
       throw new BotConfigNotFoundError(
         'No bot configuration found. Set BOTS_CONFIG or create ~/.botmux/bots.json.\nSee README for config format.'
       );
@@ -3803,6 +3806,16 @@ export class BotConfigLoadError extends Error {
 function pathEntryExists(path: string): boolean {
   try { lstatSync(path); return true; } catch (err: any) {
     if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') return false;
+    throw botConfigAccessError(path, err);
+  }
+}
+
+/** A directory entry exists (lstat) but what it points at does not (stat
+ *  ENOENT/ENOTDIR): a dangling symlink. Other stat errors are read faults. */
+function danglingEntry(path: string): boolean {
+  if (!pathEntryExists(path)) return false;
+  try { statSync(path); return false; } catch (err: any) {
+    if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') return true;
     throw botConfigAccessError(path, err);
   }
 }
