@@ -2395,10 +2395,10 @@ export function normaliseForFingerprint(s: string): string {
 }
 
 /**
- * Normalisation candidates for TEXT READ BACK FROM A CLAUDE TRANSCRIPT.
+ * Normalisation candidates for input read back from a CLI transcript.
  * The first candidate is always the legacy identity above. The second drops
  * at most one backslash immediately before each LF/CRLF, tolerating the
- * soft-newline marker that Ink sometimes leaves behind in paste-burst mode.
+ * soft-newline markers that CLIs can leave behind (e.g. Ink paste bursts).
  *
  * The second candidate is comparison-only: never use it to create a mark, a
  * persisted hash, or full-content consumption evidence. In particular, a

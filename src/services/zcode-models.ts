@@ -11,7 +11,7 @@ export interface ZcodePersonalProvider {
 /** ZCODE_DATA_BASE_DIR is the parent of .zcode, as in the native CLI. */
 export function zcodePersonalConfigPath(env: NodeJS.ProcessEnv = process.env): string {
   return env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE?.trim()
-    || join(env.ZCODE_DATA_BASE_DIR?.trim() || homedir(), '.zcode', 'v2', 'provider_config.json');
+    || join(env.ZCODE_DATA_BASE_DIR?.trim() || env.HOME?.trim() || homedir(), '.zcode', 'v2', 'provider_config.json');
 }
 
 export function readZcodeProviders(env: NodeJS.ProcessEnv = process.env): ZcodePersonalProvider[] {

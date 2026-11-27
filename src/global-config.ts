@@ -24,6 +24,7 @@ import type { VcMeetingConsumerProfileConfig } from './types.js';
 import { normalizePluginIdList } from './core/plugins/ids.js';
 import { assertDurableConfigMutationAllowed } from './services/durable-config-mutation.js';
 import { withFileLockSync } from './utils/file-lock.js';
+import { normalizeCodexAppTitlePrefix } from './utils/codex-app-title-prefix.js';
 import { normalizeLinkRefConfig } from './services/link-ref-config.js';
 import type { LinkRefConfig } from './services/link-ref-types.js';
 import { applyEnvOps, envLayerWithinBudget, globalEnvLayer, isEmptyEnvLayer, type EnvLayer, type EnvOp } from './core/session-env.js';
@@ -311,6 +312,7 @@ export const SCHEDULE_CHILD_ONE_SHOT_MAX_TASKS_PER_TURN = 16;
 
 export interface GlobalConfig {
   lang?: Locale;
+  codexAppTitlePrefix?: string;
   /** Machine-wide LinkRef rollout setting. Missing keeps legacy behavior. */
   linkRefs?: LinkRefConfig;
   /** Machine-wide default prefix for groups created via `/group` or `/g`.
@@ -1116,6 +1118,8 @@ export function readGlobalConfig(): GlobalConfig {
   lastConfiguredProtectedMcpEnvKeys = protectedMcpConfiguredEnvKeys(raw.protectedMcpCapabilities);
   const out: GlobalConfig = {};
   if (isLocale(raw.lang)) out.lang = raw.lang;
+  const codexAppTitlePrefix = normalizeCodexAppTitlePrefix(raw.codexAppTitlePrefix);
+  if (codexAppTitlePrefix) out.codexAppTitlePrefix = codexAppTitlePrefix;
   const linkRefs = normalizeLinkRefConfig(raw.linkRefs);
   if (linkRefs) out.linkRefs = linkRefs;
   const groupNamePrefix = normalizeGroupNamePrefix(raw.groupNamePrefix);

@@ -8,6 +8,7 @@ import { readDurableProcessIdentity } from '../utils/process-identity.js';
 import { openDatabaseSync, type DatabaseSyncLike } from './sqlite-compat.js';
 import { readFeedbackStorageConfig } from './feedback-storage-config.js';
 import { FEEDBACK_TABLES } from './feedback-tables.js';
+import { isWecomFleetMemberName } from '../im/wecom/config/fleet-member-name.js';
 // `pg`-backed modules are loaded lazily: this module is statically imported by
 // daemon startup and `botmux send`, which must run with SQLite-only installs.
 import { inspectSendRecovery, recoveryAcknowledged, webhookRecoveryFingerprint } from './feedback-recovery.js';
@@ -239,6 +240,11 @@ export async function inspectFeedbackMaintenance(dataDir: string, migrationId: s
     if (!Array.isArray(fleet.procs)) throw new Error('feedback_fleet_state_invalid');
     for (const processState of fleet.procs) {
       if (processState.name === 'botmux-dashboard' || processState.name === 'topic-index' || processState.entry === 'dashboard' || processState.external || !processState.pid) continue;
+      // A WeCom gateway is not a Feishu daemon: its feedback outbox lives in its
+      // own bridge state and its core keeps its own data directory, so it never
+      // opens this feedback store, has no participant to register here and
+      // must not block the migration as an `unsupported_daemon`.
+      if (typeof processState.name === 'string' && isWecomFleetMemberName(processState.name)) continue;
       const identity = readDurableProcessIdentity(processState.pid);
       if (!identity) continue;
       if (!participants.some(participant => participant.processId === processState.pid && participant.processStartId === identity)) {

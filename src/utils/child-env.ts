@@ -1,3 +1,7 @@
+// Node built-ins only: this boundary module imports no other repo module.
+import { realpathSync } from 'node:fs';
+import { basename, delimiter as pathDelimiter, dirname, join } from 'node:path';
+
 /**
  * Session-identity markers Claude Code exports into every Bash child it runs
  * (`CLAUDECODE` plus the `CLAUDE_CODE_*`/`CLAUDE_PID` family). Any process
@@ -56,6 +60,169 @@ export const WORKFLOW_WORKER_ENV_KEYS = [
 /** Remove workflow-only identity from a non-workflow process boundary. */
 export function scrubWorkflowWorkerEnv(env: NodeJS.ProcessEnv): void {
   for (const key of WORKFLOW_WORKER_ENV_KEYS) delete env[key];
+}
+
+/**
+ * Configuration of a dedicated core-only service (index-core-only.ts: the WeCom
+ * managed core, `botmux serve --api-only`). Whenever BOTMUX_CORE_ONLY=1,
+ * bot-registry ignores bots.json and synthesizes the service's single apiOnly
+ * bot from these keys; core-only workers keep them (strict envPolicy included)
+ * so they load the same synthetic config. The service also exports
+ * BOTMUX_CORE_ONLY_DATA_DIR, the inert marker of its dedicated store (see
+ * pinCoreOnlyServiceDataDir).
+ *
+ * BOTMUX_NATIVE_GATEWAY_CORE marks the one kind of core-only service a native
+ * gateway's managed-core launcher starts (core/runtime-mode.ts decides from it).
+ *
+ * The service's workers inherit the family, and on the PTY backend so do its
+ * CLI sessions — except the bot profile and the native gateway mark, which stop
+ * at the CLI boundary (REDACTED_CHILD_ENV_KEYS). A `botmux start/restart` typed
+ * in such a session must not hand it to the fleet: every supervised daemon would
+ * boot the core's fake apiOnly bot instead of its own Feishu bot (see
+ * scrubCoreOnlyServiceEnv).
+ */
+export const CORE_ONLY_SERVICE_ENV_KEYS = [
+  'BOTMUX_CORE_ONLY',
+  'BOTMUX_CORE_ONLY_DATA_DIR',
+  'BOTMUX_NATIVE_GATEWAY_CORE',
+  'BOTMUX_CORE_BOT_CONFIG',
+  'BOTMUX_API_ONLY_BOT',
+  'BOTMUX_API_PORT',
+  'BOTMUX_CORE_CLI',
+  'BOTMUX_CORE_MODEL',
+  'BOTMUX_CORE_BACKEND',
+  'BOTMUX_CORE_WORKING_DIR',
+  'BOTMUX_CORE_STATE_DIR',
+  'BOTMUX_CORE_SKIP_DOTENV',
+  'BOTMUX_CORE_CODEX_AUTH_SYNC',
+  // A managed core's own terminal-proxy base (im/wecom/config/managed-core-env.ts).
+  // The core entry consumes it before any worker starts; listed here so a fleet
+  // can never inherit it even if it did reach a session.
+  'BOTMUX_CORE_WEB_PROXY_BASE_PORT',
+  // The customization store a native gateway hands its core
+  // (core/runtime-mode.ts NATIVE_GATEWAY_CUSTOMIZATION_DIR_ENV): the core's
+  // workers resolve prompt overrides from it, so they need it (strict envPolicy
+  // included). It stops at the CLI boundary (redactChildEnv), and a fleet
+  // started from anywhere inside the service drops it with the rest.
+  'BOTMUX_CORE_CUSTOMIZATION_DIR',
+] as const;
+
+/**
+ * Freeze a core-only service's dedicated store (index-core-only.ts) and mark it.
+ *
+ * SESSION_DATA_DIR alone cannot tell a core-only store from a fleet's once it
+ * reaches a session, and BOTMUX_CORE_ONLY never reaches a tmux/zellij pane (the
+ * pane only receives BOTMUX_INJECTED_ENV_KEYS). The marker rides that list next
+ * to SESSION_DATA_DIR, so a session on every backend still knows whose store it
+ * carries. It is inert: nothing derives an identity from it (bot-registry keys
+ * core-only synthesis off BOTMUX_CORE_ONLY alone), so a pane's own `botmux`
+ * commands behave exactly as without it.
+ */
+export function pinCoreOnlyServiceDataDir(env: NodeJS.ProcessEnv, dataDir: string): void {
+  env.SESSION_DATA_DIR = dataDir;
+  env.BOTMUX_CORE_ONLY_DATA_DIR = dataDir;
+}
+
+/** True when `env` came from a dedicated core-only service: the service process,
+ * its workers, or one of its sessions on any backend. */
+export function inheritedFromCoreOnlyService(env: NodeJS.ProcessEnv): boolean {
+  return env.BOTMUX_CORE_ONLY === '1' || Boolean(env.BOTMUX_CORE_ONLY_DATA_DIR?.trim());
+}
+
+/**
+ * Remove what a core-only service left in an environment that is about to become
+ * a fleet member's. Any other environment (a Feishu session, an ordinary shell) is
+ * left exactly as it is.
+ *
+ * The service's own store is never the fleet's, so SESSION_DATA_DIR goes when it
+ * is that store: the marker names it; a core started before the marker existed
+ * pinned SESSION_DATA_DIR to its store itself. A different, explicitly set value
+ * (`SESSION_DATA_DIR=… botmux start` typed in such a session) is kept.
+ */
+export function scrubCoreOnlyServiceEnv(env: NodeJS.ProcessEnv): void {
+  if (!inheritedFromCoreOnlyService(env)) return;
+  const coreDataDir = env.BOTMUX_CORE_ONLY_DATA_DIR?.trim();
+  // The service's own wrapper directory, while the markers it is derived from
+  // are still here (they are removed just below).
+  dropCoreOnlyWrapperDir(env, coreDataDir || env.SESSION_DATA_DIR?.trim());
+  if (env.BOTMUX_NO_CLAIM === MANAGED_CORE_NO_CLAIM_ENV.BOTMUX_NO_CLAIM) delete env.BOTMUX_NO_CLAIM;
+  if (!coreDataDir || env.SESSION_DATA_DIR?.trim() === coreDataDir) delete env.SESSION_DATA_DIR;
+  for (const key of CORE_ONLY_SERVICE_ENV_KEYS) delete env[key];
+}
+
+/**
+ * The wrapper-claim opt-out a managed WeCom core is started with
+ * (im/wecom/config/managed-core-env.ts), so a core never repoints the global
+ * `botmux`. Its sessions inherit it; a fleet started from one must not, or a
+ * `bun run use:here` in any Feishu session would quietly skip the claim
+ * (scripts/claim-botmux-bin.mjs is the reader).
+ */
+export const MANAGED_CORE_NO_CLAIM_ENV = { BOTMUX_NO_CLAIM: '1' } as const;
+
+/**
+ * A core-only service's `botmux` wrapper directory — `<its store>/bin`, the way
+ * resolveBotmuxWrapperBinDir (core/botmux-wrapper.ts) derives it in core-only,
+ * realpath included — reaches its sessions as BOTMUX_WRAPPER_BIN and at the
+ * front of PATH. Handed to a fleet, every Feishu daemon would write its wrapper
+ * into that directory instead of ~/.botmux/bin, and every Feishu session would
+ * resolve `botmux` there: through another install's wrapper, and to nothing
+ * once the connection's store is deleted. Drop exactly that directory: an
+ * explicit BOTMUX_WRAPPER_BIN naming any other directory (a candidate build's,
+ * see CLAUDE.md) and every other PATH entry stay, in order.
+ */
+function dropCoreOnlyWrapperDir(env: NodeJS.ProcessEnv, coreDataDir: string | undefined): void {
+  if (!coreDataDir) return;
+  const lexical = join(coreDataDir, 'bin');
+  const forms = new Set([lexical, canonicalPath(lexical)]);
+  const explicit = env.BOTMUX_WRAPPER_BIN?.trim();
+  if (explicit && (forms.has(explicit) || forms.has(canonicalPath(explicit)))) delete env.BOTMUX_WRAPPER_BIN;
+  if (env.PATH !== undefined) {
+    env.PATH = env.PATH.split(pathDelimiter).filter(entry => !forms.has(entry)).join(pathDelimiter);
+  }
+}
+
+/** realpath, also for a directory that no longer exists (a deleted connection's
+ * store): its nearest existing ancestor is resolved and the rest appended, so
+ * `/var/…` and `/private/var/…` still compare equal on macOS. */
+function canonicalPath(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    const parent = dirname(path);
+    return parent === path ? path : join(canonicalPath(parent), basename(path));
+  }
+}
+
+/**
+ * The loopback values a core-only service freezes into its own environment
+ * (index-core-only.ts; a managed WeCom core is also handed them by
+ * im/wecom/config/managed-core-env.ts): its workers bind their web terminals
+ * there and its terminal links name that host. Everything the service starts
+ * inherits them, its sessions included — none of it is a fleet setting.
+ */
+export const CORE_ONLY_FROZEN_LOOPBACK_ENV = {
+  BOTMUX_WORKER_HTTP_HOST: '127.0.0.1',
+  WEB_EXTERNAL_HOST: '127.0.0.1',
+} as const;
+
+/**
+ * `source` without the loopback values a core-only service froze, for use as
+ * where a fleet's lifecycle settings are taken from. Only when `invoker` came
+ * from such a service, and only a value still equal to the frozen one: a value
+ * set explicitly to something else is kept, the same rule
+ * scrubCoreOnlyServiceEnv applies to SESSION_DATA_DIR. Any other invoker gets
+ * `source` itself back, untouched.
+ */
+export function withoutCoreOnlyFrozenLoopback<T extends Partial<Record<string, string | undefined>>>(
+  source: T,
+  invoker: NodeJS.ProcessEnv,
+): T {
+  if (!inheritedFromCoreOnlyService(invoker)) return source;
+  const kept: Partial<Record<string, string | undefined>> = { ...source };
+  for (const [key, frozen] of Object.entries(CORE_ONLY_FROZEN_LOOPBACK_ENV)) {
+    if (kept[key] === frozen) delete kept[key];
+  }
+  return kept as T;
 }
 
 /** Boundary-only companion to the markers. A CLAUDE_EFFORT inherited THROUGH
@@ -226,6 +393,13 @@ export function stripCompanionStartupEnv(env: NodeJS.ProcessEnv): void {
 }
 
 export const REDACTED_CHILD_ENV_KEYS = [
+  // Dedicated core configuration belongs to the host/worker boundary. It can
+  // contain per-bot env values, including names removed at the CLI boundary.
+  'BOTMUX_CORE_BOT_CONFIG',
+  // The native gateway core mark stops here too: a core-only service started
+  // from inside one of its CLI sessions (`botmux serve --api-only`) is a bare
+  // core, with no gateway polling its asks.
+  'BOTMUX_NATIVE_GATEWAY_CORE',
   'LARK_APP_ID',
   'LARK_APP_SECRET',
   'GITHUB_TOKEN',
@@ -393,6 +567,11 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // session's identity file.
   'BOTMUX_AIDEN_CODEX_SHELL_CONFIG_FILE',
   'SESSION_DATA_DIR',
+  // Inert marker that this session's SESSION_DATA_DIR is a core-only service's
+  // dedicated store (pinCoreOnlyServiceDataDir). Must travel with it into panes:
+  // BOTMUX_CORE_ONLY itself never reaches one, and a fleet started from such a
+  // session would otherwise adopt the core's store (scrubCoreOnlyServiceEnv).
+  'BOTMUX_CORE_ONLY_DATA_DIR',
   'IS_SANDBOX',
   // botmux ask/hooks use these to locate the daemon and route back to the
   // current session/thread. The worker refreshes them per pane/turn.
@@ -489,6 +668,11 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // session-scoped, capability-gated routes (v3 workflow relay, vc-agent).
   // A port marker, not a credential — every route authenticates independently.
   'BOTMUX_DAEMON_IPC_PORT',
+  // Workflow worker's per-spawn SessionStart channel (utils/session-ready-
+  // local-signal.ts). Forwarded only into the owning pane; scrubbed from the
+  // shared terminal server so a co-tenant pane never sees another spawn's path.
+  'BOTMUX_SESSION_READY_SIGNAL_FILE',
+  'BOTMUX_SESSION_READY_SIGNAL_NONCE',
   // Deployment-wide coordination mode. In primary mode the in-session CLI
   // must route botmux send through the owning daemon instead of calling the
   // provider directly. This is classification only; IPC auth remains required.
@@ -631,6 +815,9 @@ export const SESSION_TURN_MARKER_ENV_KEYS = [
   // Owning daemon's per-boot IPC port; the daemon self-sets the real value at
   // boot (daemon.ts), so an inherited copy is always a stale foreign port.
   'BOTMUX_DAEMON_IPC_PORT',
+  // A new process boundary must never reuse another workflow launch's hook channel.
+  'BOTMUX_SESSION_READY_SIGNAL_FILE',
+  'BOTMUX_SESSION_READY_SIGNAL_NONCE',
   // Per-session read-isolation / apiOnly / sandbox verdicts (worker-owned).
   'BOTMUX_READ_ISOLATION',
   'BOTMUX_READ_ISOLATED',
@@ -1064,6 +1251,18 @@ export function redactChildEnv(
   const env: NodeJS.ProcessEnv = { ...base };
   for (const key of REDACTED_CHILD_ENV_KEYS) delete env[key];
   for (const key of additionalKeys) delete env[key];
+  // The customization store a native gateway hands its core is for prompt
+  // rendering, which only the core and its workers do; no CLI child reads it
+  // (it lacks the native mark the reader requires). Deleted here rather than
+  // listed above: that list is also every tmux pane's `unset` line, and panes
+  // never receive it anyway (the tmux client env drops every BOTMUX_* key).
+  delete env.BOTMUX_CORE_CUSTOMIZATION_DIR;
+  // The credential a native gateway shares with its core
+  // (core/native-gateway-credential.ts NATIVE_GATEWAY_CORE_CREDENTIAL_ENV). The
+  // core entry already removed it from its environment before any child
+  // existed; deleted here too, for the same reason and in the same way as the
+  // key above, so no CLI child can ever carry it.
+  delete env.BOTMUX_NATIVE_GATEWAY_CORE_CREDENTIAL;
   // Defense in depth for direct/PTY children and one-shot helpers. Long-lived
   // Botmux boundaries scrub this earlier, but old or externally launched
   // workers must not be able to pass the broken Trae hook contract onward.

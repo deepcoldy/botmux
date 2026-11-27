@@ -10,7 +10,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { BackendType } from '../src/adapters/backend/types.js';
 import { botInjectedEnv, buildSessionChildEnv, type EnvPolicy } from '../src/core/env-policy.js';
 import { applyGlobalSessionEnvOps, invalidateGlobalConfigCache, readGlobalConfig } from '../src/global-config.js';
-import { botOneShotEnv, resolveSessionEnv, sessionEnvLockContextForBot, sessionNetworkPolicyEnvView } from '../src/core/session-env-resolve.js';
+import { botOneShotEnv, botOneShotProbeEnv, resolveSessionEnv, sessionEnvLockContextForBot, sessionNetworkPolicyEnvView } from '../src/core/session-env-resolve.js';
 import { emptyEnvLayer } from '../src/core/session-env.js';
 import { readSessionEnvStamp, sessionEnvFingerprint, writeSessionEnvStamp } from '../src/services/session-env-stamp.js';
 
@@ -119,6 +119,20 @@ describe('resolveSessionEnv', () => {
     expect(resolveSessionEnv({ bot: { env }, backendType: 'tmux', facts: { larkBindingOff: true } }).env).toEqual(env);
     expect(resolveSessionEnv({ bot: { env, triggerUserAuth: { enabled: true, tools: ['bytedcli'] } }, backendType: 'tmux', facts: { larkBindingOff: true } }).env).toEqual({ OTHER: 'x' });
     expect(botOneShotEnv({}, { env })).toMatchObject(env);
+  });
+
+  it('keeps the one-shot botmux settings overlay separate from inherited env', () => {
+    const probe = botOneShotProbeEnv({
+      ANTHROPIC_BASE_URL: 'https://inherited',
+      ANTHROPIC_AUTH_TOKEN: 'inherited-token',
+      OTHER: 'kept',
+    }, { env: { ANTHROPIC_BASE_URL: 'https://from-bot' } });
+    expect(probe.env).toMatchObject({
+      ANTHROPIC_BASE_URL: 'https://from-bot',
+      ANTHROPIC_AUTH_TOKEN: 'inherited-token',
+      OTHER: 'kept',
+    });
+    expect(probe.settingsEnv).toEqual({ ANTHROPIC_BASE_URL: 'https://from-bot' });
   });
 
   it('judges the identity lock by the backend the session launches on, not the bot default', () => {

@@ -33,6 +33,7 @@ import { accessForPath, compileToBwrap, relocateSymlinkedBaselineRules, type FsP
 import { bwrapExecutable, bwrapNamespaceDocUrl, classifyBwrapNamespaceFailure, type BwrapNamespaceFailure } from '../../core/system-bwrap.js';
 import { CA_BUNDLE_ENV_KEYS, PROXY_ENV_KEYS } from '../../utils/child-env.js';
 import { isStandaloneBinary } from '../../core/self-spawn.js';
+import { isCoreOnlyProcess } from '../../core/runtime-mode.js';
 import { linuxIsolationLaunch, linuxIsolationLaunchViaArgsFile } from '../../core/linux-isolation.js';
 import {
   MCP_GATEWAY_REQUIRED_ENV,
@@ -804,7 +805,7 @@ export function coreOnlyPidNamespaceDegrade(
   opts: { credentialBearingHostChannel?: boolean } = {},
 ): boolean {
   if (opts.credentialBearingHostChannel) return false;
-  const coreOnly = process.env.BOTMUX_CORE_ONLY === '1';
+  const coreOnly = isCoreOnlyProcess();
   if (!coreOnly) return false;
   return coreOnlyPidNamespaceDegradeDecision({
     coreOnly,

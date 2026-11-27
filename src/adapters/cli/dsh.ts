@@ -7,6 +7,8 @@ import type { CliAdapter, PtyHandle } from './types.js';
 import { writeRunnerInput } from './runner-input.js';
 import { runnerArgv0 } from '../../core/self-spawn.js';
 import { resolveRunnerPath } from './runner-path.js';
+import { runnerIdentityArgs } from './shared-hints.js';
+import { isNativeGatewayCoreProcess } from '../../core/runtime-mode.js';
 import { ensureDshQuestionBridgePatch, type DshQuestionBridgePatch } from '../dsh-question-bridge.js';
 
 function pushOpt(args: string[], key: string, value: string | undefined): void {
@@ -59,7 +61,7 @@ export function createDshAdapter(pathOverride?: string): CliAdapter {
       return bridge ? [bridge.readonlyRoot] : [];
     },
 
-    buildArgs({ sessionId, workingDir, botName, botOpenId, locale, model, turnTimeoutMs, dshProfile }) {
+    buildArgs({ sessionId, workingDir, botName, botOpenId, larkAppId, locale, model, turnTimeoutMs, dshProfile }) {
       // Pre-create the native dsh home + sessions subdir in the real HOME
       // before the worker enters the sandbox: the sandbox's keepExisting
       // filter drops authPaths that don't exist yet, and the runner can't
@@ -76,8 +78,11 @@ export function createDshAdapter(pathOverride?: string): CliAdapter {
         '--dsh-bin', (cachedDshBin ??= resolveCommandReal(rawDshBin)),
       ];
       pushOpt(args, '--cwd', workingDir);
-      pushOpt(args, '--bot-name', botName);
-      pushOpt(args, '--bot-open-id', botOpenId);
+      // Native gateway core: display name only, never an open_id (runnerIdentityArgs).
+      args.push(...runnerIdentityArgs(botName, botOpenId, larkAppId));
+      // The runner is a CLI child and never sees the native gateway marker: tell
+      // it, so its first-turn preamble describes the channel gateway, not Feishu.
+      if (isNativeGatewayCoreProcess()) args.push('--native-gateway');
       pushOpt(args, '--locale', locale);
       pushOpt(args, '--model', model && model.trim() ? model.trim() : undefined);
       const profile = dshProfile && dshProfile.trim() ? dshProfile.trim() : 'botmux';

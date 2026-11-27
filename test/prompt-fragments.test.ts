@@ -2,9 +2,12 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { feishuReplyPresentationGuidance } from '../src/adapters/cli/shared-hints.js';
 import {
   PROMPT_FRAGMENTS,
+  PROMPT_FRAGMENT_CATALOG,
   PROMPT_STAGES,
   BLOCK_META,
   fragmentStages,
+  getFragmentSpec,
+  overridableFragmentKeys,
   validateFragmentOverride,
   type PromptFragmentSpec,
 } from '../src/skills/prompt-fragments.js';
@@ -134,6 +137,33 @@ describe('prompt fragment catalog matches what each stage reads', () => {
     for (const f of PROMPT_FRAGMENTS) {
       if (f.block !== 'routing_system' && f.block !== 'routing_shell') continue;
       expect(fragmentStages(f), f.key).toEqual(['new']);
+    }
+  });
+});
+
+describe('channel-marked fragments', () => {
+  const marked = PROMPT_FRAGMENT_CATALOG.filter((f) => f.channel !== undefined);
+
+  it('stay out of every existing listing and lookup', () => {
+    expect(marked.length).toBeGreaterThan(0);
+    const listed = new Set(overridableFragmentKeys());
+    for (const f of marked) {
+      expect(PROMPT_FRAGMENTS.some((g) => g.key === f.key), f.key).toBe(false);
+      expect(listed.has(f.key), f.key).toBe(false);
+      expect(getFragmentSpec(f.key), f.key).toBeUndefined();
+    }
+  });
+
+  it('meet the same integrity rules as listed fragments', () => {
+    const keys = PROMPT_FRAGMENT_CATALOG.map((f) => f.key);
+    expect(new Set(keys).size).toBe(keys.length);
+    for (const f of marked) {
+      expect(BLOCK_META[f.block], `block ${f.block} of ${f.key}`).toBeTruthy();
+      for (const loc of SUPPORTED_LOCALES) {
+        const text = shippedText(f.key, loc);
+        expect(text, `${f.key} [${loc}] resolves`).not.toBe(f.key);
+        expect(text.trim().length, `${f.key} [${loc}] non-empty`).toBeGreaterThan(0);
+      }
     }
   });
 });

@@ -30,12 +30,13 @@ export function parseAidenCodexModelsJson(stdout: string): string[] {
 }
 
 /** Query Aiden's authenticated AIPROXY catalog. All failures are fail-soft. */
-export async function detectAidenCodexModels(): Promise<readonly string[] | null> {
+export async function detectAidenCodexModels(env?: NodeJS.ProcessEnv): Promise<readonly string[] | null> {
   try {
     const execFileAsync = promisify(execFile);
     const { stdout } = await execFileAsync('aiden', [
       'x', 'models', '--codex', '--json', '--timeout', '10000',
     ], {
+      ...(env ? { env } : {}),
       timeout: 15_000,
       maxBuffer: 2 * 1024 * 1024,
       windowsHide: true,

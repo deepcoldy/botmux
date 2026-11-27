@@ -15,6 +15,7 @@ import { drainOmpTranscript, type OmpTranscriptState } from '../../services/omp-
 import { delay } from '../../utils/timing.js';
 import { wrapBracketedPaste } from './tui-input.js';
 import { builtinPluginDirForSession } from '../../skills/workflow-node-plugin-dir.js';
+import { builtinSkillsOffered, nativeGatewayAskHintBlock } from '../../skills/injection-mode.js';
 
 export const OMP_PLUGIN_DIR = join(homedir(), '.botmux', 'omp-plugin');
 
@@ -198,6 +199,7 @@ export function createOhMyPiAdapter(
       locale,
       botName,
       botOpenId,
+      larkAppId,
       replyDelivery,
       triggerUserAuth,
       larkToolAppId,
@@ -221,7 +223,8 @@ export function createOhMyPiAdapter(
       if (model?.trim()) args.push('--model', model.trim());
       if (workingDir) args.push('--cwd', workingDir);
       if (promptInjection !== 'none') {
-        args.push('--plugin-dir', builtinPluginDirForSession(OMP_PLUGIN_DIR));
+        // Shared with the Feishu fleet; not offered in a native gateway's core.
+        if (builtinSkillsOffered()) args.push('--plugin-dir', builtinPluginDirForSession(OMP_PLUGIN_DIR));
         if (skillPluginDir) args.push('--plugin-dir', skillPluginDir);
       }
       const effectiveReplyDelivery = process.env[GOAL_ENV.V3_MARKER] === '1' ? 'send' : replyDelivery;
@@ -229,12 +232,16 @@ export function createOhMyPiAdapter(
         locale,
         botName,
         botOpenId,
+        larkAppId,
         noTransport,
         triggerUserAuth,
         larkToolAppId,
         replyDelivery: effectiveReplyDelivery,
         solo,
         hideLocalAddresses,
+        // A native gateway's core gives this CLI no built-in plugin dir, which
+        // is where it found the ask skill; it gets the ask hint here instead.
+        builtinSkillBlock: builtinSkillsOffered() ? undefined : nativeGatewayAskHintBlock(locale),
         cliId: 'oh-my-pi',
       });
 

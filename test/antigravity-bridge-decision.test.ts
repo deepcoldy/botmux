@@ -12,11 +12,36 @@ import {
   decideAntigravityFullUpgrade,
   decideAntigravityNotifyAction,
   decideAntigravityTickerAction,
+  shouldAcceptAntigravityDiscoveredSessionId,
   type AntigravityFullUpgradeInput,
 } from '../src/services/antigravity-bridge-decision.js';
 
 const A = '/home/u/.gemini/antigravity-cli/brain/A/.system_generated/logs/transcript.jsonl';
 const B = '/home/u/.gemini/antigravity-cli/brain/B/.system_generated/logs/transcript.jsonl';
+
+describe('shouldAcceptAntigravityDiscoveredSessionId', () => {
+  const coldResume = {
+    discoveredSessionId: 'bbbbbbbb-0000-4000-8000-000000000000',
+    effectiveResume: true,
+    resumeSessionId: 'aaaaaaaa-0000-4000-8000-000000000000',
+    persistentReattach: false,
+    adoptMode: false,
+    discoverySource: 'process-discovery' as 'native-log' | 'process-discovery',
+  };
+
+  const cases: Array<[string, Partial<typeof coldResume>, boolean]> = [
+    ['rejects a transient sibling only during an explicit cold resume', {}, false],
+    ['accepts a later authoritative native-log rotation during cold resume', { discoverySource: 'native-log' }, true],
+    ['accepts the exact target without UUID casing changing identity', { discoveredSessionId: 'AAAAAAAA-0000-4000-8000-000000000000' }, true],
+    ['does not invent a target for a fresh launch', { effectiveResume: false }, true],
+    ['does not invent a target when resume was demoted to a fresh launch', { resumeSessionId: undefined }, true],
+    ['follows the current conversation of a persistent reattached pane', { persistentReattach: true }, true],
+    ['follows the current conversation of an adopted pane', { adoptMode: true }, true],
+  ];
+  it.each(cases)('%s', (_name, patch, expected) => {
+    expect(shouldAcceptAntigravityDiscoveredSessionId({ ...coldResume, ...patch })).toBe(expected);
+  });
+});
 
 describe('decideAntigravityTickerAction', () => {
   it('unbound + pending sid resolves → initial bind', () => {

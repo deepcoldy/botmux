@@ -369,6 +369,10 @@ export interface CodexBridgeEvent {
    * (e.g. TRAE's native skill expansion). An empty list requires the recorded
    * input itself to match exactly. Never derived from assistant text. */
   inputTextAliases?: string[];
+  /** Comparison-only input after soft-newline residue is stripped. The driver
+   * shares this object with the matching final so an ambiguous turn can be
+   * ignored as a unit, including during buffered replay. */
+  softNewlineInput?: { candidate: string };
   /** For kind 'cot': the thinking / tool-call entries parsed from this line. */
   cotEntries?: CodexCotEntry[];
   /** For kind 'async_question': a non-blocking question the model asked. The

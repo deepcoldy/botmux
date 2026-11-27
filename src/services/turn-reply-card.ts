@@ -77,6 +77,11 @@ export interface TurnReplyCardRecord extends TurnReplyCardKey {
   lastCard?: string;
   /** Exact PATCH awaiting provider acknowledgement; replay never creates a card. */
   pendingPatch?: { content: string; final: boolean };
+  /** The published card must be re-PATCHed once even when the rendered body is
+   *  unchanged: a forcePatch attempt (provider ACK can restore the pre-click
+   *  view) failed and its same-content pendingPatch was invalidated by a later
+   *  render revision such as externalFinal. Cleared only after a PATCH lands. */
+  forceRepublish?: boolean;
   /** State changed but its rendered update has not been acknowledged yet. */
   publishPending?: boolean;
   /** Preserve a recovery's final visibility decision across partial writes. */
@@ -85,6 +90,9 @@ export interface TurnReplyCardRecord extends TurnReplyCardKey {
   disconnected?: boolean;
   /** Capture expiry closed only the display, without proving native failure. */
   displayRetired?: boolean;
+  /** The turn ended by deliberately sending nothing (worker terminal
+   *  outputDisposition `nothing_to_send`), so the card is not a missing answer. */
+  silentTurn?: boolean;
   overflowMessageId?: string;
   usage?: import('../im/lark/md-card.js').CardUsageSnapshot;
   /** The CLI's next-input suggestion shown on a completed turn's card. */
@@ -104,7 +112,7 @@ export type TurnReplyCardEvent =
   | { kind: 'progress'; text: string }
   | { kind: 'final'; text: string; card: string; source: 'explicit' | 'bridge'; feedback?: TurnReplyCardRecord['feedback'] }
   | { kind: 'phase'; phase: 'working' | 'waiting' | 'stopping' }
-  | { kind: 'terminal'; phase: 'completed' | 'failed' | 'cancelled' | 'ambiguous' | 'superseded'; notice?: string; durationMs?: number; completedAtMs?: number; disconnected?: boolean; orphanAskIds?: string[] }
+  | { kind: 'terminal'; phase: 'completed' | 'failed' | 'cancelled' | 'ambiguous' | 'superseded'; notice?: string; durationMs?: number; completedAtMs?: number; disconnected?: boolean; orphanAskIds?: string[]; silent?: boolean }
   | { kind: 'display_retired'; notice?: string; silent?: boolean }
   | { kind: 'refresh' }
   /** Set or clear the next-step row; valid after the terminal edge too. */
@@ -112,6 +120,39 @@ export type TurnReplyCardEvent =
   /** Set or clear the「本轮回顾」panel; valid after the terminal edge too. */
   | { kind: 'recap'; markdown?: string }
   | { kind: 'recover'; beforeMs?: number; orphanAskIds?: string[] };
+
+/** Display-only view over the canonical stored activity. Blank thinking is
+ *  always dropped, and a thinking paragraph is shown once per stage segment: a
+ *  run of thinking items bounded by tool / progress / ask items, which delimit
+ *  distinct execution stages whose repeated paragraphs must stay visible. Text
+ *  is compared after whitespace normalization, so the same paragraph re-emitted
+ *  with different line breaks still collapses. The first occurrence keeps its
+ *  id. This never mutates the stored sequence, so collapsing the same record
+ *  twice yields the same view.
+ *
+ *  The store merges snapshots with `dedupe: false` (blank filtering only): it
+ *  cannot see store-only progress/ask delimiters inside an incoming cumulative
+ *  snapshot, and must keep every source id for idempotent replay. Segment
+ *  dedupe runs here, where the full merged sequence and its real delimiters are
+ *  visible. */
+export function collapseThinkingActivity(items: readonly ReplyCardActivity[], dedupe = true): ReplyCardActivity[] {
+  const normalizedText = (text: string) => text.trim().replace(/\s+/g, ' ');
+  const result: ReplyCardActivity[] = [];
+  const seenInSegment = new Set<string>();
+  for (const item of items) {
+    if (item.kind === 'thinking') {
+      const text = normalizedText(item.text);
+      if (!text) continue;
+      if (dedupe && seenInSegment.has(text)) continue;
+      seenInSegment.add(text);
+    } else {
+      // A tool, progress narration or ask opens a new stage segment.
+      seenInSegment.clear();
+    }
+    result.push(item);
+  }
+  return result;
+}
 
 export function replyCardIsTerminal(record: Pick<TurnReplyCardRecord, 'phase'>): boolean {
   return ['completed', 'failed', 'cancelled', 'ambiguous', 'superseded'].includes(record.phase);
@@ -218,7 +259,32 @@ export class TurnReplyCardStore {
   /** Record that this turn's final was delivered as a separate message in the
    * card's chat. Persistence only: no provider I/O, no card creation. A turn
    * without a reply-card record, a different destination or an answer already
-   * on the card is left untouched. Returns whether the record was marked. */
+   * on the card is left untouched. Returns whether the record was marked.
+   *
+   * When the mark lands AFTER the card has already settled and been published,
+   * the published card still shows the silence/missing-answer body because this
+   * short-lived CLI process has no transport. Flag it publishPending so the
+   * daemon-side publisher's next recover/sweep re-renders and PATCHes the card
+   * (the renderer now treats externalFinal as delivery fact and empties that
+   * body); a mark arriving before the terminal needs no flag, as that terminal
+   * update renders the card with the flag already present.
+   *
+   * A pendingPatch left by a failed terminal PATCH holds a body rendered from
+   * the PRE-externalFinal record, so replaying it verbatim would pin the wrong
+   * silence/missing-answer text and clear the refresh evidence on success. This
+   * mark is a render revision: invalidate that stale pendingPatch so recover
+   * re-renders from the latest record. Safe here because a record that can be
+   * marked has no finalCard (guarded above), hence pendingPatch.final is always
+   * false and dropping it cannot affect final-delivery accounting. A failed
+   * re-render re-persists a fresh, correct pendingPatch and keeps publishPending,
+   * so the evidence clears only after the new body is actually PATCHed.
+   *
+   * A same-content pendingPatch (its content equals lastCard) is different: it
+   * carries a forcePatch republish intent — the provider may have restored the
+   * pre-click view, so that body must be re-PATCHed even though re-rendering
+   * produces identical text (an unresolved Ask makes externalFinal a no-op for
+   * the body). Dropping it would let recover skip the PATCH and clear the
+   * evidence, so preserve the intent as forceRepublish. */
   async noteExternalFinal(key: TurnReplyCardKey, chatId: string): Promise<boolean> {
     if (!this.read(key)) return false;
     return withFileLock(this.path(key), async () => {
@@ -226,6 +292,13 @@ export class TurnReplyCardStore {
       if (!record || record.chatId !== chatId || record.finalCard || record.withdrawn) return false;
       if (record.externalFinal) return true;
       record.externalFinal = true;
+      if (record.messageId && replyCardIsTerminal(record)) {
+        if (record.pendingPatch && record.pendingPatch.content === record.lastCard) {
+          record.forceRepublish = true;
+        }
+        delete record.pendingPatch;
+        record.publishPending = true;
+      }
       this.write(key, record);
       return true;
     }, { maxWaitMs: 8_000 });
@@ -269,6 +342,7 @@ export class TurnReplyCardStore {
           record.phase = 'completed';
           delete record.pendingPatch;
           delete record.publishPending;
+          delete record.forceRepublish;
           this.write(key, record);
           return { delivered: false, record };
         }
@@ -345,24 +419,52 @@ export class TurnReplyCardStore {
         }
         // A persisted terminal phase does not prove its provider PATCH was
         // acknowledged. Keep rendering it on retry without changing its facts.
-        if (!terminal || (record.displayRetired && (!displayRetirement || record.finalDelivered))) {
-          // Publish a retirement notice with its terminal edge under one lock.
-          // A duplicate retirement must never append progress after completion
-          // or turn an already-delivered answer into a missing-output warning.
-          if (!record.finalDelivered && event.notice?.trim() && record.progress.at(-1) !== event.notice) {
-            record.progress.push(event.notice);
-            record.activity.push({ kind: 'progress', id: `progress:${record.progress.length - 1}`, text: event.notice });
+        // Narrow reconciliation: historical fail-closed evidence proving that a
+        // completed silent turn actually owed a required reply and never sent
+        // it downgrades the record to failed. Deliberately tight — same card key
+        // already pins turn/dispatchAttempt, no final delivery evidence, and a
+        // silent completed record only — every other terminal keeps the
+        // idempotent gate below.
+        const silentFailureReconciliation = terminal
+          && record.phase === 'completed' && record.silentTurn === true
+          && event.phase === 'failed'
+          && !record.finalDelivered && !record.finalCard && !record.displayRetired;
+        if (!terminal || silentFailureReconciliation
+          || (record.displayRetired && (!displayRetirement || record.finalDelivered))) {
+          if (silentFailureReconciliation) {
+            record.phase = 'failed';
+            delete record.silentTurn;
+          } else {
+            // Publish a retirement notice with its terminal edge under one lock.
+            // A duplicate retirement must never append progress after completion
+            // or turn an already-delivered answer into a missing-output warning.
+            if (!record.finalDelivered && event.notice?.trim() && record.progress.at(-1) !== event.notice) {
+              record.progress.push(event.notice);
+              record.activity.push({ kind: 'progress', id: `progress:${record.progress.length - 1}`, text: event.notice });
+            }
+            record.phase = record.phase === 'stopping' && event.phase === 'completed' ? 'cancelled' : event.phase;
+            record.durationMs = event.durationMs;
+            record.completedAtMs = event.completedAtMs;
+            record.disconnected = event.disconnected;
+            // silentTurn is meaningful only while the persisted phase is
+            // completed: judge the persisted phase, not the event's (a stopping
+            // turn whose terminal arrives as completed is recorded as
+            // cancelled), and drop the marker on every non-completed outcome so
+            // a failed/cancelled card can never also read "no reply needed".
+            if (event.silent && record.phase === 'completed') record.silentTurn = true;
+            else if (record.phase !== 'completed') delete record.silentTurn;
+            if (!displayRetirement && !recovering) delete record.displayRetired;
           }
-          record.phase = record.phase === 'stopping' && event.phase === 'completed' ? 'cancelled' : event.phase;
-          record.durationMs = event.durationMs;
-          record.completedAtMs = event.completedAtMs;
-          record.disconnected = event.disconnected;
-          if (!displayRetirement && !recovering) delete record.displayRetired;
         }
       } else if (!terminal || allowBackgroundTools) {
         if (event.kind === 'tools') {
           record.tools = event.tools;
-          const incoming = event.activity ?? event.tools.map(tool => ({ kind: 'tool' as const, id: tool.id }));
+          // The stored activity is the canonical, un-collapsed sequence: blank
+          // thinking is filtered at the edge, but segment dedupe happens only
+          // at render time. Merging by source id keeps an identical cumulative
+          // snapshot replay idempotent — a paragraph collapsed for display must
+          // not lose its id here and get resurrected by the next replay.
+          const incoming = collapseThinkingActivity(event.activity ?? event.tools.map(tool => ({ kind: 'tool' as const, id: tool.id })), false);
           const ids = new Set(record.activity.map(item => `${item.kind}:${item.id}`));
           for (const item of incoming) {
             if (!ids.has(`${item.kind}:${item.id}`)) record.activity.push(item);
@@ -505,7 +607,7 @@ export class TurnReplyCardStore {
           delete record.pendingCreate;
           this.write(key, record);
         }
-        if (record.lastCard !== card || io.forcePatch) {
+        if (record.lastCard !== card || io.forcePatch || record.forceRepublish) {
           const messageId = record.messageId;
           record.pendingPatch = { content: card, final: !!record.finalCard && !(event.kind === 'terminal' && event.disconnected) };
           this.write(key, record);
@@ -514,6 +616,7 @@ export class TurnReplyCardStore {
         }
         delete record.pendingPatch;
         delete record.publishPending;
+        delete record.forceRepublish;
         delete record.recoveryHideFinal;
         if (record.finalCard && !(event.kind === 'terminal' && event.disconnected)) {
           record.finalDelivered = true;
@@ -560,6 +663,7 @@ export class TurnReplyCardStore {
       }
       delete record.pendingPatch;
       delete record.publishPending;
+      delete record.forceRepublish;
       delete record.recoveryHideFinal;
       record.updatedAtMs = Date.now();
       this.write(key, record);

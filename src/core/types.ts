@@ -221,6 +221,18 @@ export interface DaemonSession {
   resumeFreshFallbackNotified?: boolean;
   workingDir?: string;
   initConfig?: Extract<DaemonToWorker, { type: 'init' }>;   // stored for restart
+  /** Actual turn-terminal capability reported by a correlated, successful
+   *  in-place restart. Scoped to that worker generation: a refork invalidates
+   *  the report automatically, while an in-place respawn keeps the generation.
+   *  Before the first such report the fork-time initConfig is sufficient; while
+   *  workerReady is false the current capability is unknown and consumers must
+   *  fail closed rather than reuse this attestation. */
+  inPlaceRestartTurnTerminal?: { workerGeneration: number; reliableTurnTerminal: boolean };
+  /** A live restart has invalidated the previous attestation and no correlated
+   *  success has confirmed the replacement yet. Kept after failure/timeout and
+   *  across parked prompt_ready recovery; only an untouched receipt may restore
+   *  the previous state. A worker exit/refork makes this generation stale. */
+  inPlaceRestartTurnTerminalPending?: { workerGeneration: number | undefined; attemptId: string };
   /**
    * Unprovable launcher-env keys this worker generation was ever HANDED, kept as
    * a monotonically growing set for the life of the generation.
@@ -507,7 +519,9 @@ export interface DaemonSession {
    *  bare force flag could otherwise miss a turn whose thinking already
    *  ended). Cleared on turn_terminal: a bubble created after its turn
    *  settled would never receive RUN_FINISHED and spin forever. */
-  lastThinkingUpdate?: { entries: CotEntry[]; turnId: string; dispatchAttempt?: number };
+  lastThinkingUpdate?: { entries: CotEntry[]; turnId: string; dispatchAttempt?: number; workerGeneration?: number };
+  /** Ephemeral native gateway projection; never promotes an old worker/turn snapshot. */
+  lastNativeGatewayGoal?: { goal: import('../services/native-goal-state.js').NativeGoalState | null; turnId: string; dispatchAttempt?: number; workerGeneration: number };
   /** Bounded per-turn admission times for optional reply timing; not restored or guessed. */
   turnReceivedAtMs?: Map<string, number>;
   /** Native write observations, scoped to the worker generation and exact attempt. */
@@ -969,6 +983,15 @@ export interface DaemonSession {
   directInputEpoch?: number;
   /** Latest timestamp of a direct Web Terminal submission (cancels pending recovery/replay). */
   lastDirectTerminalInputAt?: number;
+  /** Structured usage / rate limit a native gateway may show for one exact turn (rememberCoreOnlyLimit). */
+  nativeGatewayLimit?: {
+    turnId: string;
+    workerGeneration: number;
+    dispatchAttempt?: number;
+    key: string;
+    kind: 'usage' | 'rate';
+    retryAtMs: number;
+  };
   /** A failed persistence must be retried even if the next frame is identical. */
   usageLimitPersistPending?: boolean;
   usageLimitRetryTimer?: NodeJS.Timeout;

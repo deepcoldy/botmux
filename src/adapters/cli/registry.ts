@@ -20,6 +20,7 @@ import { createOpenCode2Adapter } from './opencode2.js';
 import { createMiMoCodeAdapter } from './mimocode.js';
 import { createAntigravityAdapter, antigravityBridgeSpec } from './antigravity.js';
 import { createAntigravityAcpAdapter } from './antigravity-acp.js';
+import { antigravityTransport } from '../../services/antigravity-transport.js';
 import { createMtrAdapter } from './mtr.js';
 import { createHermesAdapter } from './hermes.js';
 import { createMiraAdapter } from './mira.js';
@@ -482,6 +483,29 @@ export function createCliAdapterSync(id: CliId, pathOverride?: string, opts?: Cl
       // fails with the migration notice, not a bare "unknown adapter".
       if (retiredCli(id)) throw new Error(retiredCliNotice(id));
       throw new Error(`Unknown CLI adapter: ${id}`);
+  }
+}
+
+/** Whether a CLI adapter exposes a reliable turn-terminal contract under the
+ *  effective launch environment (for example, Antigravity only provides one
+ *  when `AGY_BOTMUX_TRANSPORT=acp`). Fails closed on unknown CLIs or invalid
+ *  transport values. */
+export function cliAdapterHasReliableTurnTerminal(
+  cliId: string | undefined,
+  cliPathOverride?: string,
+  env?: Readonly<Record<string, string>>,
+): boolean {
+  if (!cliId) return false;
+  try {
+    const normalized = cliId.toLowerCase() as CliId;
+    const agyTransport = normalized === 'antigravity' ? antigravityTransport(env) : undefined;
+    return createCliAdapterSync(
+      normalized,
+      cliPathOverride,
+      agyTransport ? { antigravityTransport: agyTransport } : undefined,
+    ).reliableTurnTerminal === true;
+  } catch {
+    return false;
   }
 }
 

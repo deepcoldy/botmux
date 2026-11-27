@@ -142,6 +142,11 @@ const CONSUMERS: Record<string, Rule> = {
     why: 'The chat was disbanded or the bot was removed, so there is no surface left to report to; '
       + 'a refusal or residual is logged per session and never counted as closed.',
   },
+  'core/dashboard-ipc-server.ts::closeSessionsOfReplacedAgent::closeCliMismatchedSessionsForBot': {
+    category: 'background',
+    why: 'Native gateway core profile route: the gateway has no surface for the sweep, so the '
+      + 'closed / residual / failed counts are logged, and the sweep logs each refusal and residual.',
+  },
   'core/session-manager.ts::closeActiveSessionIfCliMismatch::closeSession': {
     category: 'background',
     why: 'Returns close_failed / closed_with_residual to the sweep; a refusal is '
@@ -471,6 +476,16 @@ const RESPONSE_CONSUMERS: Record<string, ResponseRule> = {
     why: '/dismiss closes peer bots\' sessions in the group; residual is reported and keeps the group.',
     mustParse: true,
   },
+  'im/wecom/gateway/core-client.ts::close::close-route': {
+    why: 'WeCom reply-card close: a residual is logged and reported as not ok, so the '
+      + 'control intent stays uncertain and the Dashboard keeps the management lock.',
+    mustParse: true,
+  },
+  'im/wecom/gateway/command.ts::requestWecomCoreSessionAction::close-route': {
+    why: 'Dashboard host close/archive of a WeCom session: a residual is logged and '
+      + 'reported as not ok, so the Dashboard receives an uncertain result, not completed.',
+    mustParse: true,
+  },
   'core/dashboard-ipc-server.ts::<module>::close-route': {
     why: 'Serves the route; replays the residual on the closed-row fast path.',
     mustParse: false,
@@ -483,10 +498,15 @@ function expressionName(expression: ts.Expression): string | undefined {
   return undefined;
 }
 
+/** Calls that name a session action by a literal segment instead of a path:
+ * the CLI's IPC helper, and the native gateway contract's path builder
+ * (core/native-gateway-contract.ts). */
+const SESSION_ACTION_ROUTE_CALLEES = new Set(['postSessionCliIpc', 'nativeGatewaySessionActionPath']);
+
 /** True only for the immediate call that carries the close route. */
 function isCloseRouteCall(node: ts.CallExpression, sf: ts.SourceFile): boolean {
   const callee = expressionName(node.expression);
-  if (callee === 'postSessionCliIpc') {
+  if (callee && SESSION_ACTION_ROUTE_CALLEES.has(callee)) {
     return node.arguments.some(arg => ts.isStringLiteralLike(arg) && arg.text === 'close');
   }
   const routeTexts: string[] = [];
@@ -679,6 +699,16 @@ describe('close consumer matrix (call-site)', () => {
       { key: 'probe.ts::p::close-route', parses: true },
       { key: 'probe.ts::p::close-route', parses: true },
     ]);
+  });
+
+  it('counts a close built with the native gateway path builder, and only a close', () => {
+    const sites = responseCloseSitesIn(probe(
+      "import { nativeGatewaySessionActionPath } from './native-gateway-contract.js';\n"
+      + 'export async function p(port: number, id: string) {\n'
+      + "  await request(port, nativeGatewaySessionActionPath(id, 'close'), {});\n"
+      + "  await request(port, nativeGatewaySessionActionPath(id, 'prune'), {});\n}\n",
+    ), 'probe.ts');
+    expect(sites).toEqual([{ key: 'probe.ts::p::close-route', parses: false }]);
   });
 
   it('does NOT count a call written in a comment or a string', () => {

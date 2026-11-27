@@ -151,7 +151,7 @@ export interface VcMeetingConsumerProfilesApiDeps {
   /** Online DaemonInfo botName lookup; undefined when the daemon is offline. */
   onlineBotName(appId: string): string | undefined;
   isOnline(appId: string): boolean;
-  adapterReliableTurnTerminal(cliId: string | undefined, cliPathOverride?: string): boolean;
+  adapterReliableTurnTerminal(bot: BotConfig): boolean;
   managedSideEffectEligible(bot: BotConfig): boolean;
   sandboxIsolated(bot: BotConfig): boolean;
   /** Called after a successful PUT so the live daemon reloads changed bots.json. */
@@ -385,7 +385,7 @@ export function buildVcMeetingAgentOptions(
       ...(bot.cliId ? { cliId: bot.cliId } : {}),
       online: deps.isOnline(bot.larkAppId),
       workingDirReady,
-      reliableTurnTerminal: deps.adapterReliableTurnTerminal(bot.cliId, bot.cliPathOverride),
+      reliableTurnTerminal: deps.adapterReliableTurnTerminal(bot),
       managedSideEffectEligible: deps.managedSideEffectEligible(bot),
       sandboxIsolated: deps.sandboxIsolated(bot),
       // 缺省 = 开启：VC 对每个连着飞书的 bot 默认可用，enabled:false 才是退出。

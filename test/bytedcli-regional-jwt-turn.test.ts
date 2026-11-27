@@ -44,7 +44,7 @@ vi.mock('../src/services/lark-cli-auth.js', () => ({
 
 const { publishTurnCliIdentity, retryMissingRegionalGrant } = await import('../src/core/turn-cli-identity.js');
 const {
-  renderIdentityWrapper, IDENTITY_DENIED_EXIT_CODE, recallProvenIdentityContent, forgetProvenIdentityContent,
+  renderIdentityEnv, renderIdentityWrapper, IDENTITY_DENIED_EXIT_CODE, recallProvenIdentityContent, forgetProvenIdentityContent,
 } = await import('../src/core/cli-identity.js');
 const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
 const { renewExpiringBytedcliIdentities, forgetBytedcliIdentityRenewals } = await import('../src/core/bytedcli-identity-renewal.js');
@@ -158,6 +158,12 @@ function bytedcli(...args: string[]): { status: number; jwt: string; stderr: str
 }
 
 function bytedcliWithEnv(env: Record<string, string>, ...args: string[]): { status: number; jwt: string; stderr: string } {
+  return runBytedcli(args, { env });
+}
+
+function runBytedcli(args: string[], {
+  env = {}, followup,
+}: { env?: Record<string, string>; followup?: { region: 'tx' | 'default'; body: string } } = {}): { status: number; jwt: string; stderr: string } {
   const tool = join(dir, 'real-bytedcli.sh');
   writeFileSync(tool, '#!/bin/sh\nprintf "%s" "$BYTEDCLI_USER_CLOUD_JWT"\n');
   chmodSync(tool, 0o755);
@@ -173,6 +179,14 @@ function bytedcliWithEnv(env: Record<string, string>, ...args: string[]): { stat
     writeFileSync(resolver[0]!, [
       '#!/bin/sh',
       'printf "%s\\n" "$*" >> "$SESSION_DATA_DIR/resolver-args"',
+      ...(followup ? [
+        `if [ "$2" = --region ] && [ "$3" = ${followup.region} ]; then`,
+        "cat <<'BOTMUX_IDENTITY_EOF'",
+        followup.body,
+        'BOTMUX_IDENTITY_EOF',
+        'exit',
+        'fi',
+      ] : []),
       "cat <<'BOTMUX_IDENTITY_EOF'",
       body,
       'BOTMUX_IDENTITY_EOF',
@@ -193,6 +207,10 @@ function expectRefused(r: ReturnType<typeof bytedcli>, region: string, hint?: st
   expect(r.stderr).toContain(`属于 ${region} 分区`);
   if (hint) expect(r.stderr).toContain(hint);
   expect(r.stderr).toContain('[reason=regional_jwt_missing]');
+}
+
+function resolverArgs(): string {
+  return readFileSync(join(dir, 'resolver-args'), 'utf8').trim();
 }
 
 describe.each(['single', 'proven'] as const)('%s identity storage', model => {
@@ -324,8 +342,7 @@ it('tells the proven identity resolver which ByteCloud ticket a command needs', 
   platform.partitions.on_alice = ['i18n'];
   await publishFor('platform', ALICE);
   const site = { BYTEDCLI_CLOUD_SITE: 'EU-TTP' };
-  const resolverArgs = () => readFileSync(join(dir, 'resolver-args'), 'utf8').trim();
-  for (const args of [['aa', 'query'], ['--cloud-site=ROW', 'aa', 'query']]) {
+  for (const args of [['aa', 'query'], ['--cloud-site=ROW', 'aa', 'query'], ['--site', 'EU-TTP', 'aa', 'query', '--site', 'i18n-tt']]) {
     expect(bytedcliWithEnv(site, ...args).status).toBe(0);
     expect(resolverArgs()).toBe('bytedcli --region i18n');
   }
@@ -353,12 +370,18 @@ it('tells the proven identity resolver which ByteCloud ticket a command needs', 
   expect(bytedcliWithEnv({ BYTEDCLI_CLOUD_SITE: 'cn' }, 'scm', 'repo', 'build'))
     .toMatchObject({ status: 0, jwt: jwt('cn', 'on_alice') });
   expect(resolverArgs()).toBe('bytedcli --region cn');
+});
+
+it('resolves the selected subcommand ticket or its default fallback after the global prerequisite', async () => {
+  storageModel = 'proven';
+  platform.partitions.on_alice = ['i18n'];
+  await publishFor('platform', ALICE);
   expect(bytedcli('--site', 'cn', 'aa', 'query', '--site', 'boei18n'))
     .toMatchObject({ status: 0, jwt: jwt('cn', 'on_alice') });
   expect(resolverArgs()).toBe('bytedcli --region default');
   expect(bytedcli('--site', 'cn', 'aa', 'query', '--site', 'i18n-tt'))
     .toMatchObject({ status: 0, jwt: jwt('i18n', 'on_alice') });
-  expect(resolverArgs()).toBe('bytedcli');
+  expect(resolverArgs()).toBe('bytedcli\nbytedcli --region i18n');
   expect(bytedcli('aa', 'query', '--site', 'cn'))
     .toMatchObject({ status: 0, jwt: jwt('cn', 'on_alice') });
   expect(resolverArgs()).toBe('bytedcli --region cn');
@@ -376,15 +399,71 @@ it('tells the proven identity resolver which ByteCloud ticket a command needs', 
   expect(resolverArgs()).toBe('bytedcli --region i18n\nbytedcli --region default');
   expectRefused(bytedcli('--site', 'us-ttp', 'aa', 'query'), 'tx');
   expect(resolverArgs()).toBe('bytedcli --region tx');
-
-  for (const args of [['aa', 'query', '--help'], ['codebase', 'mr', 'list'], ['meego', 'workitem', 'list']]) {
-    expect(bytedcliWithEnv(site, ...args).status).toBe(0);
-    expect(resolverArgs()).toBe('bytedcli');
-  }
+  expectRefused(bytedcli('--site', 'us-ttp', 'aa', 'query', '--site', 'i18n-tt'), 'tx');
+  expect(resolverArgs()).toBe('bytedcli --region tx');
   // The subcommand owns this site flag and already has its own partition JWT.
   expect(bytedcli('bytecloud', 'list-legacy-vregions', '--site', 'eu-ttp'))
     .toMatchObject({ status: 0, jwt: jwt('i18n', 'on_alice') });
-  expect(resolverArgs()).toBe('bytedcli');
+  expect(resolverArgs()).toBe('bytedcli\nbytedcli --region i18n');
+});
+
+it('requests the Codebase ticket for nested commands while leaving help and Meego independent', async () => {
+  storageModel = 'proven';
+  await publishFor('platform', ALICE);
+  const site = { BYTEDCLI_CLOUD_SITE: 'EU-TTP' };
+  for (const args of [
+    ['--profile', 'value', 'codebase', 'mr', 'list'],
+    ['--network-profile', 'office', 'codebase', 'mr', 'list'],
+    ['--network-profile=office', 'codebase', 'mr', 'list'],
+    ['--verbose', 'codebase', 'mr', 'list'],
+    ['-v', 'codebase', 'mr', 'list'],
+    ['-json', 'codebase', 'mr', 'list'],
+    ['-jv', 'codebase', 'mr', 'list'],
+  ]) {
+    expect(bytedcliWithEnv(site, ...args).status).toBe(0);
+    expect(resolverArgs()).toBe('bytedcli --codebase');
+  }
+  for (const args of [
+    ['aa', 'query', '--help'], ['meego', 'workitem', 'list'], ['codebase'], ['codebase', 'help'],
+    ['codebase', 'mr', '--help'], ['codebase', 'mr', '-h'], ['codebase', 'mr', '--all-help'], ['--version', 'codebase', 'mr'],
+  ]) {
+    expect(bytedcliWithEnv(site, ...args).status).toBe(0);
+    expect(resolverArgs()).toBe('bytedcli');
+  }
+});
+
+it.each([
+  { label: 'same turn and sender', openId: ALICE, turnId: 'om_turn_1', hasSelected: true, reason: undefined },
+  { label: 'new turn', openId: ALICE, turnId: 'om_turn_2', hasSelected: true, reason: 'lineage_unproven' },
+  { label: 'different sender', openId: BOB, turnId: 'om_turn_1', hasSelected: true, reason: 'lineage_unproven' },
+  { label: 'withdrawn selected token', openId: ALICE, turnId: 'om_turn_1', hasSelected: false, reason: 'regional_jwt_missing' },
+])('uses a distinct selected region only when its second lookup serves the same identity ($label)', async ({ openId, turnId, hasSelected, reason }) => {
+  storageModel = 'proven';
+  platform.partitions.on_alice = ['i18n', 'tx'];
+  await publishFor('platform', ALICE);
+  const renewed = jwt('tx', 'on_alice', EXP + 3_600);
+  const body = renderIdentityEnv({ tool: 'bytedcli', openId, turnId, cloudJwt: jwt('cn', 'on_alice'),
+    regionalCloudJwts: { i18n: jwt('i18n', 'on_alice'), ...(hasSelected ? { tx: renewed } : {}) } });
+  const result = runBytedcli(['--site', 'i18n-tt', 'aa', 'query', '--site', 'us-ttp'], { followup: { region: 'tx', body } });
+  expect(resolverArgs()).toBe('bytedcli --region i18n\nbytedcli --region tx');
+  if (reason) {
+    expect(result).toMatchObject({ status: IDENTITY_DENIED_EXIT_CODE, jwt: '' });
+    expect(result.stderr).toContain(`[reason=${reason}]`);
+  } else {
+    expect(result).toMatchObject({ status: 0, jwt: renewed });
+  }
+});
+
+it('keeps the resolved default fallback if a concurrent publication adds the selected token', async () => {
+  storageModel = 'proven';
+  platform.partitions.on_alice = ['i18n'];
+  await publishFor('platform', ALICE);
+  const renewed = jwt('cn', 'on_alice', EXP + 3_600);
+  const body = renderIdentityEnv({ tool: 'bytedcli', openId: ALICE, turnId: 'om_turn_1', cloudJwt: renewed,
+    regionalCloudJwts: { i18n: jwt('i18n', 'on_alice'), tx: jwt('tx', 'on_alice') } });
+  const result = runBytedcli(['--site', 'i18n-tt', 'aa', 'query', '--site', 'us-ttp'], { followup: { region: 'default', body } });
+  expect(resolverArgs()).toBe('bytedcli --region i18n\nbytedcli --region default');
+  expect(result).toMatchObject({ status: 0, jwt: renewed });
 });
 
 it.each([

@@ -16,9 +16,10 @@ import { sessionContractsEnabled } from '../../services/session-contract.js';
 import type { DaemonSession } from '../../core/types.js';
 import { resolveSessionEnv, type SessionEnvBotInput } from '../../core/session-env-resolve.js';
 import { effectiveDefaultWorkingDir, getBot, loadBotConfigsCached, type BotConfig } from '../../bot-registry.js';
-import { realpathSync, statSync } from 'node:fs';
-import { appendFile, mkdir } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { lstatSync, readlinkSync, realpathSync, statSync } from 'node:fs';
+import { mkdir } from 'node:fs/promises';
+import { BoundedLogFile } from '../../utils/bounded-log-file.js';
+import { basename, dirname, join, resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import type { WorkerToDaemon } from '../../types.js';
@@ -167,6 +168,32 @@ async function runNodeImpl(
   req: RunNodeRequest,
   deps: RunNodeInternalDeps,
 ): Promise<RunNodeResult> {
+  const logLimit = new AbortController();
+  const openLog = (path: string, name: string) => new BoundedLogFile(path, {
+    onLimit: kind => logLimit.abort(`${name} exceeded the ${kind} limit`),
+  });
+  const stdout = openLog(stdoutPath(req), 'stdout.log');
+  const stderr = logFileKey(stdout.path) === logFileKey(stderrPath(req)) ? stdout : openLog(stderrPath(req), 'stderr.log');
+  try {
+    const result = await runNodeWithLogs(req, deps, stdout, stderr, logLimit);
+    // Pipe data and the final receipt can arrive after success is claimed but before close.
+    if (logLimit.signal.aborted && result.status !== 'cancelled') {
+      const error = { code: 'WORKFLOW_LOG_LIMIT', message: String(logLimit.signal.reason) };
+      return { ...result, status: 'fail', error, failureDetail: error.message };
+    }
+    return result;
+  } finally {
+    await Promise.all([stdout.end(), stderr.end()]);
+  }
+}
+
+async function runNodeWithLogs(
+  req: RunNodeRequest,
+  deps: RunNodeInternalDeps,
+  stdout: BoundedLogFile,
+  stderr: BoundedLogFile,
+  logLimit: AbortController,
+): Promise<RunNodeResult> {
   if (req.attemptLease && req.attemptLease.attemptId !== req.attemptId) {
     throw new Error(
       `v3 pool: attempt lease "${req.attemptLease.attemptId}" does not match request "${req.attemptId}"`,
@@ -210,8 +237,12 @@ async function runNodeImpl(
   }
 
   try {
-    await mkdir(dirname(stdoutPath(req)), { recursive: true });
-    await mkdir(dirname(stderrPath(req)), { recursive: true });
+    await mkdir(dirname(stdout.path), { recursive: true });
+    await mkdir(dirname(stderr.path), { recursive: true });
+    const ptyKey = logFileKey(ptyLogPath);
+    if (logFileKey(stdout.path) === ptyKey || logFileKey(stderr.path) === ptyKey) {
+      throw new Error('workflow stdout/stderr cannot share the worker-owned pty.log');
+    }
   } catch (err) {
     closeV3ArmedFenceWithoutSpawn(req.attemptDir, armedFence, 'setup_failed');
     throw err;
@@ -246,11 +277,15 @@ async function runNodeImpl(
   } catch (error) {
     // Trust is optional. A missing cwd or profile must still take the normal
     // worker startup path and surface the actual launch error or dialog.
-    await appendLine(stderrPath(req), `[v3] folder trust preparation skipped: ${error}`);
+    stderr.writeLine(`[v3] folder trust preparation skipped: ${error}`);
   }
   if (cancelSignal?.aborted) {
     closeV3ArmedFenceWithoutSpawn(req.attemptDir, armedFence, 'pre_aborted');
     return { status: 'cancelled', manifestPath, cancelReason: cancelSignal.reason };
+  }
+  if (logLimit.signal.aborted) {
+    closeV3ArmedFenceWithoutSpawn(req.attemptDir, armedFence, 'setup_failed');
+    return { status: 'fail', manifestPath };
   }
   // Where the worker writes this attempt's skill manifest + snapshot (its own
   // SESSION_DATA_DIR, i.e. config.session.dataDir unless req.env overrides it).
@@ -292,7 +327,7 @@ async function runNodeImpl(
   // EventEmitter error and crash the daemon. Once the main settle state
   // exists, forward the first deferred error into its ordinary failure path.
   worker.on('error', (err) => {
-    void appendLine(stderrPath(req), `[worker] process error: ${err.message}`);
+    stderr.writeLine(`[worker] process error: ${err.message}`);
     if (forwardWorkerError) forwardWorkerError(err);
     else deferredWorkerError ??= err;
   });
@@ -302,7 +337,7 @@ async function runNodeImpl(
       attemptDir: req.attemptDir,
       armed: armedFence,
       onCleanupError: (err) => {
-        void appendLine(stderrPath(req), `[v3] worker fence close failed: ${err instanceof Error ? err.message : String(err)}`);
+        stderr.writeLine(`[v3] worker fence close failed: ${err instanceof Error ? err.message : String(err)}`);
       },
     });
   } catch (bindError) {
@@ -335,7 +370,8 @@ async function runNodeImpl(
     void resolveOuterClose;
   }
 
-  drainWorkerDiagnostics(worker, req);
+  worker.stdout?.on('data', (chunk: Buffer | string) => stdout.write(chunk));
+  worker.stderr?.on('data', (chunk: Buffer | string) => stderr.write(chunk));
 
   // Real chat binding (when the run was born in chat) over synthetic ids: the
   // worker forwards chatId/chatType/rootMessageId/ownerOpenId into the CLI
@@ -405,7 +441,10 @@ async function runNodeImpl(
   const generation = (controller?.store.read(controller.ref)?.worker?.generation ?? 0) + 1;
   const bootstrap = controller?.bindWorker(generation);
   const execution = controller?.admitInput(req.attemptId, undefined, req.attemptId);
-  const scopedInit = bootstrap ? { ...init, sessionContract: bootstrap, sessionCommand: { version: 2 as const, execution } } : init;
+  // The empty init starts the CLI before the goal is dispatched. Attaching the
+  // queued execution here would tag prompt_ready with an as-yet unbound turn.
+  // Its execution scope belongs on raw_input in sendGoalIfReady().
+  const scopedInit = bootstrap ? { ...init, sessionContract: bootstrap } : init;
   const goalBinding = req.botSnapshot.cliInstanceBinding?.source === 'goal'
     ? req.botSnapshot.cliInstanceBinding
     : undefined;
@@ -487,7 +526,7 @@ async function runNodeImpl(
           ptyLogPath,
         });
       } catch (err) {
-        void appendLine(stderrPath(req), `[v3] onSessionReady callback failed: ${err instanceof Error ? err.message : String(err)}`);
+        stderr.writeLine(`[v3] onSessionReady callback failed: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
 
@@ -503,7 +542,7 @@ async function runNodeImpl(
       // If close+SIGTERM cannot stop it, use the same bounded hard fallback as
       // cancellation; never leave the runtime waiting forever on a wedged child.
       sigkillTimer = setTimeout(() => {
-        void appendLine(stderrPath(req), `[v3] worker exit grace expired; escalating to SIGKILL`);
+        stderr.writeLine(`[v3] worker exit grace expired; escalating to SIGKILL`);
         try { worker.kill('SIGKILL'); } catch { /* worker may be gone */ }
       }, 250 + deps.cancelGraceMs);
     }
@@ -527,7 +566,7 @@ async function runNodeImpl(
         ...(outcome.detail ? { detail: outcome.detail } : {}),
         ...(outcome.error ? { error: outcome.error } : {}),
       };
-      void appendLine(stderrPath(req), `[v3] worker outcome claimed status=${status} reason=${reason}; waiting for worker exit`);
+      stderr.writeLine(`[v3] worker outcome claimed status=${status} reason=${reason}; waiting for worker exit`);
       requestWorkerExit();
     }
 
@@ -553,14 +592,17 @@ async function runNodeImpl(
         clearTimeout(sigkillTimer);
         sigkillTimer = undefined;
       }
-      void appendLine(stderrPath(req), `[v3] cancel signal received; sending close+SIGINT`);
+      stderr.writeLine(`[v3] cancel signal received; sending close+SIGINT`);
       try { sendClose(); } catch { /* already gone */ }
       try { worker.kill('SIGINT'); } catch { /* already gone */ }
       sigkillTimer = setTimeout(() => {
-        void appendLine(stderrPath(req), `[v3] cancel grace expired; escalating to SIGKILL`);
+        stderr.writeLine(`[v3] cancel grace expired; escalating to SIGKILL`);
         try { worker.kill('SIGKILL'); } catch { /* already gone */ }
       }, deps.cancelGraceMs);
     }
+
+    const onLogLimit = () => finish('fail', 'log-limit');
+    logLimit.signal.addEventListener('abort', onLogLimit, { once: true });
 
     if (cancelSignal) {
       if (cancelSignal.aborted) setImmediate(onAbort);
@@ -635,8 +677,12 @@ async function runNodeImpl(
         // PTY, file descriptors, or sandbox cleanup, so no IPC message may
         // settle cancellation; only ChildProcess 'close' below is the fence.
         if (event.type === 'claude_exit') {
-          void appendLine(stderrPath(req), `[worker] cli exited while cancellation waits for worker exit`);
+          stderr.writeLine(`[worker] cli exited while cancellation waits for worker exit`);
         }
+        return;
+      }
+      if (event.type === 'error' && event.workflowLogLimit) {
+        logLimit.abort(event.message);
         return;
       }
       if (pendingResult) return;
@@ -653,8 +699,8 @@ async function runNodeImpl(
           }
           break;
         case 'final_output':
-          void appendLine(stdoutPath(req), event.content);
-          armQuiesce();
+          stdout.writeLine(event.content);
+          if (!logLimit.signal.aborted) armQuiesce();
           break;
         case 'screen_update':
           break;
@@ -683,25 +729,25 @@ async function runNodeImpl(
                 + `before the goal was sent; complete that step with this bot's CLI profile${profile}, then retry the node`,
               retryable: true,
             };
-            void appendLine(stderrPath(req), `[v3] ${error.code}: ${event.message}`);
+            stderr.writeLine(`[v3] ${error.code}: ${event.message}`);
             finish('fail', 'startup-blocked', { error });
           }
           break;
         case 'error':
-          void appendLine(stderrPath(req), `[worker] ${event.message}`);
+          stderr.writeLine(`[worker] ${event.message}`);
           if (event.goalAborted && goalSent && isRegularFile(manifestPath)) {
             // Claude gave up on a call AFTER the goal wrote its manifest (e.g.
             // the context ran out on the closing turn). The work may be on
             // disk: let the manifest watch settle it and the runtime judge it,
             // keeping the cause in case that manifest is not valid.
             goalAbortedAfterManifest = event.message;
-            void appendLine(stderrPath(req), '[v3] goal cleared after the manifest was written; settling on the manifest');
+            stderr.writeLine('[v3] goal cleared after the manifest was written; settling on the manifest');
             break;
           }
           finish('fail', 'worker-error', { detail: event.message });
           break;
         case 'claude_exit':
-          void appendLine(stderrPath(req), `[worker] cli exit code=${event.code ?? 'null'} signal=${event.signal ?? 'null'}`);
+          stderr.writeLine(`[worker] cli exit code=${event.code ?? 'null'} signal=${event.signal ?? 'null'}`);
           finish(event.code === 0 ? 'ok' : 'fail', 'cli-exit',
             { detail: `CLI exited code=${event.code ?? 'null'} signal=${event.signal ?? 'null'}` });
           break;
@@ -727,6 +773,7 @@ async function runNodeImpl(
       if (quiesceTimer) clearTimeout(quiesceTimer);
       if (manifestTimer) clearTimeout(manifestTimer);
       cancelSignal?.removeEventListener('abort', onAbort);
+      logLimit.signal.removeEventListener('abort', onLogLimit);
       if (controller && bootstrap) {
         const operation = controller.operation();
         if (operation?.kind === 'close') controller.controlResult(operation.operationId, 'confirmed');
@@ -735,7 +782,7 @@ async function runNodeImpl(
       contractStore?.close();
       if (cancelRequested) {
         settled = true;
-        void appendLine(stderrPath(req), `[v3] worker closed after cancellation code=${code ?? 'null'}`);
+        stderr.writeLine(`[v3] worker closed after cancellation code=${code ?? 'null'}`);
         resolve({
           status: 'cancelled',
           manifestPath,
@@ -752,9 +799,9 @@ async function runNodeImpl(
       const status = runtimeError ? 'fail' : workerStatus;
       const reason = pendingResult?.reason ?? 'worker-exit';
       if (runtimeError) {
-        void appendLine(stderrPath(req), `[v3] ${runtimeError.code}: ${runtimeError.message}`);
+        stderr.writeLine(`[v3] ${runtimeError.code}: ${runtimeError.message}`);
       }
-      void appendLine(stderrPath(req), `[v3] worker closed status=${status} reason=${reason} code=${code ?? 'null'}`);
+      stderr.writeLine(`[v3] worker closed status=${status} reason=${reason} code=${code ?? 'null'}`);
       const processDetail = workerStatus !== 'fail' ? undefined
         : pendingResult
           // The pool itself closed the worker (send failure, …): its exit code says nothing.
@@ -775,6 +822,10 @@ async function runNodeImpl(
       });
     });
 
+    if (logLimit.signal.aborted) {
+      onLogLimit();
+      return;
+    }
     try {
       sendInit();
     } catch {
@@ -886,6 +937,22 @@ function defaultWorkerPath(): string {
   return join(here, '..', '..');
 }
 
+/** Identify hard links and resolve symlinks even when the target log is still missing. */
+function logFileKey(path: string, remainingLinks = 40): string {
+  const absolute = resolvePath(path);
+  try {
+    const file = statSync(absolute, { throwIfNoEntry: false });
+    if (file) return `${file.dev}:${file.ino}`;
+    if (remainingLinks > 0 && lstatSync(absolute, { throwIfNoEntry: false })?.isSymbolicLink()) {
+      return logFileKey(resolvePath(dirname(absolute), readlinkSync(absolute)), remainingLinks - 1);
+    }
+    return join(logFileKey(dirname(absolute), remainingLinks), basename(absolute));
+  } catch {
+    // Unreadable diagnostics keep the writer's existing best-effort I/O behavior.
+    return absolute;
+  }
+}
+
 function stdoutPath(req: RunNodeRequest): string {
   return req.stdoutPath ?? join(req.attemptDir, 'stdout.log');
 }
@@ -922,27 +989,4 @@ function manifestIsStable(
     done: now - previous.firstSeenMs >= settleMs,
     candidate: previous,
   };
-}
-
-function drainWorkerDiagnostics(worker: WorkerHandle, req: RunNodeRequest): void {
-  worker.stdout?.on?.('data', (chunk: Buffer | string) => {
-    void appendRaw(stdoutPath(req), String(chunk));
-  });
-  worker.stderr?.on?.('data', (chunk: Buffer | string) => {
-    void appendRaw(stderrPath(req), String(chunk));
-  });
-}
-
-async function appendLine(path: string, line: string): Promise<void> {
-  await appendRaw(path, line.endsWith('\n') ? line : `${line}\n`);
-}
-
-async function appendRaw(path: string, text: string): Promise<void> {
-  try {
-    await mkdir(dirname(path), { recursive: true });
-    await appendFile(path, text, 'utf-8');
-  } catch {
-    // Logging is best-effort; runtime state is driven by the returned status
-    // and manifest validation, not by diagnostic log writes.
-  }
 }

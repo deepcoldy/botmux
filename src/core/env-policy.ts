@@ -1,7 +1,12 @@
 import { isAbsolute } from 'node:path';
 import { sanitizePerBotEnv, isReservedPerBotEnvKey } from './per-bot-env.js';
 import { resolveTmuxSocketRoot } from '../adapters/backend/tmux-socket-root.js';
-import { BOTMUX_INJECTED_ENV_KEYS, WORKFLOW_WORKER_ENV_KEYS, redactChildEnv } from '../utils/child-env.js';
+import {
+  BOTMUX_INJECTED_ENV_KEYS,
+  CORE_ONLY_SERVICE_ENV_KEYS,
+  WORKFLOW_WORKER_ENV_KEYS,
+  redactChildEnv,
+} from '../utils/child-env.js';
 import { applySessionEnvUnset } from './session-env.js';
 import {
   protectedMcpRedactedEnvKeys,
@@ -94,8 +99,11 @@ export function buildBotWorkerEnv(
 ): NodeJS.ProcessEnv {
   const env = inheritBotEnv(base, policy);
   if (policy?.mode === 'strict') {
+    // CORE_ONLY_SERVICE_ENV_KEYS: a core-only worker re-synthesizes the same
+    // apiOnly bot as its daemon (bot-registry), so it needs the whole family.
     for (const key of [...BOTMUX_INJECTED_ENV_KEYS, ...WORKFLOW_WORKER_ENV_KEYS,
-      'BOTMUX_SANDBOX', 'BOTMUX_CORE_ONLY', 'BOTMUX_HOME', 'BOTMUX_CONFIG_DIR',
+      ...CORE_ONLY_SERVICE_ENV_KEYS,
+      'BOTMUX_SANDBOX', 'BOTMUX_HOME', 'BOTMUX_CONFIG_DIR',
       'BOTMUX_DATA_DIR', 'BOTMUX_NO_CLAIM', 'BOTMUX_BOT_INDEX',
       'BOTMUX_WORKFLOW_ENABLED', 'BOTMUX_REQUIRE_MENTION_DECISION', 'BOTMUX_LANG',
       'BOTMUX_WORKER_HTTP_HOST', 'BOTMUX_WORKER_HOST', 'LARK_APP_ID', 'LARK_APP_SECRET',

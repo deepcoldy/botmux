@@ -6,12 +6,16 @@
 import { type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { spawnTsScript } from './helpers/ts-runner.js';
 import { RELAY_ORIGIN_CAPABILITY_BASENAME } from '../src/core/managed-origin-capability.js';
+import {
+  consumeLocalSessionReadySignal,
+  createLocalSessionReadyChannel,
+} from '../src/utils/session-ready-local-signal.js';
 
 const CLI_PATH = join(__dirname, '..', 'src', 'cli.ts');
 const tempDirs: string[] = [];
@@ -70,6 +74,16 @@ async function startCapturingDaemon(): Promise<{
 }> {
   const received = { url: '', body: '' };
   const server = createServer((req, res) => {
+    // Host agents (e.g. moshi-hook on developer machines) probe every freshly
+    // bound loopback port with a bare `GET /`. Botmux's hook signals are all
+    // POST with a JSON body; ignore unrelated probe traffic so it cannot
+    // overwrite the request this test is asserting on.
+    if (req.method !== 'POST') {
+      req.resume();
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"ok":true}');
+      return;
+    }
     received.url = req.url ?? '';
     req.setEncoding('utf8');
     req.on('data', chunk => { received.body += chunk; });
@@ -152,6 +166,47 @@ describe('botmux __claude-compaction-v1 — never steers or blocks compaction', 
       expect(daemon.received.url).toBe('');
     } finally {
       await daemon.close();
+    }
+  });
+});
+
+describe('botmux session-ready — workflow worker local channel', () => {
+  it('hands the signal to the worker channel and does not call the daemon', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-session-ready-data-'));
+    const relayDir = mkdtempSync(join(tmpdir(), 'botmux-session-ready-relay-'));
+    const channelRoot = mkdtempSync(join(tmpdir(), 'botmux-session-ready-channel-'));
+    tempDirs.push(dataDir, relayDir, channelRoot);
+    const channel = createLocalSessionReadyChannel(channelRoot);
+    const daemon = await startCapturingDaemon();
+    try {
+      const result = await runSessionReady(dataDir, relayDir, daemon.port, 'session-ready', channel.env());
+      expect(result).toEqual({ status: 0, stdout: '', stderr: '' });
+      expect(consumeLocalSessionReadySignal(channel)).toMatchObject({ kind: 'signal', source: 'startup' });
+      expect(daemon.received.url).toBe('');
+    } finally {
+      await daemon.close();
+      channel.dispose();
+    }
+  });
+
+  it('falls back to the daemon route when the channel is not usable', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-session-ready-data-'));
+    const relayDir = mkdtempSync(join(tmpdir(), 'botmux-session-ready-relay-'));
+    const channelRoot = mkdtempSync(join(tmpdir(), 'botmux-session-ready-channel-'));
+    tempDirs.push(dataDir, relayDir, channelRoot);
+    const channel = createLocalSessionReadyChannel(channelRoot);
+    // No longer private: the hook must not write here.
+    chmodSync(dirname(channel.filePath), 0o755);
+    const daemon = await startCapturingDaemon();
+    try {
+      const result = await runSessionReady(dataDir, relayDir, daemon.port, 'session-ready', channel.env());
+      expect(result).toEqual({ status: 0, stdout: '', stderr: '' });
+      expect(daemon.received.url).toBe('/api/session-ready');
+      chmodSync(dirname(channel.filePath), 0o700);
+      expect(consumeLocalSessionReadySignal(channel)).toEqual({ kind: 'none' });
+    } finally {
+      await daemon.close();
+      channel.dispose();
     }
   });
 });

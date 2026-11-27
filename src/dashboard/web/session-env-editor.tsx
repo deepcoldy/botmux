@@ -1,5 +1,6 @@
 import type React from 'react';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { BotProfileRequestContext } from './wecom-bot-config.js';
+import { useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import { parsePerBotEnvText, sanitizePerBotEnv, sessionEnvLock } from '../../core/per-bot-env.js';
 import { ENV_NAME_RE, MAX_SESSION_ENV_LAYER_BYTES, type EnvOp, type SessionEnvRow } from '../../core/session-env.js';
 import { confirm } from './confirm-modal.js';
@@ -7,6 +8,8 @@ import { sendJson } from './dashboard-api.js';
 import { FieldTitle } from './dashboard-components.js';
 import { ModalDialog } from './modal-dialog.js';
 import { useT } from './react-hooks.js';
+import { providerCopy } from './providers/registry.js';
+import type { ProviderId } from './providers/types.js';
 
 /**
  * 「会话环境变量」编辑器（core/session-env.ts）：全局层放在「设置」，Bot 层放在
@@ -16,7 +19,7 @@ import { useT } from './react-hooks.js';
 
 export type SessionEnvScope =
   | { kind: 'global' }
-  | { kind: 'bot'; larkAppId: string; onPolicySaved?(policy: SessionEnvPolicy): void; onEnvSaved?(): void };
+  | { kind: 'bot'; provider?: ProviderId; larkAppId: string; profileKey?:string; onPolicySaved?(policy: SessionEnvPolicy): void; onEnvSaved?(): void };
 
 export interface SessionEnvPolicy { mode: 'inherit' | 'strict'; inherit?: string[] }
 
@@ -221,6 +224,7 @@ function opsErrorText(tr: ReturnType<typeof useT>, body: any): string {
 
 /** 继承方式（即原来的 envPolicy）：放在 Bot 层表格上方。 */
 function InheritControl(props: { larkAppId: string; policy: SessionEnvPolicy; onSaved(policy: SessionEnvPolicy): void }) {
+  const sendJson = useContext(BotProfileRequestContext);
   const tr = useT();
   const [mode, setMode] = useState(props.policy.mode);
   const [names, setNames] = useState((props.policy.inherit ?? []).join(', '));
@@ -348,6 +352,7 @@ function TmuxServers(props: { servers: TmuxServerView[]; sessions: SessionInfo[]
 }
 
 export function SessionEnvEditor(props: { scope: SessionEnvScope }): React.JSX.Element {
+  const sendJson = useContext(BotProfileRequestContext);
   const tr = useT();
   const { scope } = props;
   const url = scopeUrl(scope);
@@ -368,7 +373,7 @@ export function SessionEnvEditor(props: { scope: SessionEnvScope }): React.JSX.E
       if (res.ok) { setView(res.body as ScopeView); setLoadError(null); }
       else setLoadError(opsErrorText(tr, res.body));
     } catch (e: any) { setLoadError(e?.message ?? String(e)); }
-  }, [url, tr]);
+  }, [url, tr, sendJson, scope.kind==='bot'?scope.profileKey:undefined]);
 
   useEffect(() => { setView(null); setStatus(null); setDraft(null); setShowInherited(false); void load(); }, [load]);
 
@@ -558,7 +563,7 @@ export function SessionEnvEditor(props: { scope: SessionEnvScope }): React.JSX.E
       </div>
       {shellWrapped && <p className="muted se-intro">ⓘ {tr('sessionEnv.shellNote')}</p>}
       <p className="muted se-intro">ⓘ {tr('sessionEnv.cliConfigNote')}</p>
-      {!canReveal && <p className="muted se-intro">{tr('sessionEnv.revealOwnerOnly')}</p>}
+      {!canReveal && <p className="muted se-intro">{tr(scope.kind === 'bot' ? providerCopy(scope).envMaskedNote : 'sessionEnv.revealOwnerOnly')}</p>}
 
       {scope.kind === 'global' && view.tmuxServers && (
         <TmuxServers servers={view.tmuxServers} sessions={view.sessions ?? []} canReveal={canReveal} onChanged={() => void load()} />

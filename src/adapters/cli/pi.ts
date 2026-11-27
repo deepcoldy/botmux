@@ -19,6 +19,7 @@ import { delay } from '../../utils/timing.js';
 import { logger } from '../../utils/logger.js';
 import { drainPiTranscript, findPiTranscriptBySessionId, findPiTranscriptByPid, piBotmuxSessionTranscript } from '../../services/pi-transcript.js';
 import { builtinPluginDirForSession } from '../../skills/workflow-node-plugin-dir.js';
+import { builtinSkillsOffered, nativeGatewayAskHintBlock } from '../../skills/injection-mode.js';
 
 /** botmux ships its built-in skills for Pi here and injects it per-session via
  *  `--skill` (see buildArgs). Kept out of the global `~/.pi/agent/skills` so a
@@ -359,6 +360,7 @@ export function createPiAdapter(
       reasoningEffort,
       botName,
       botOpenId,
+      larkAppId,
       locale,
       noTransport,
       triggerUserAuth,
@@ -380,12 +382,16 @@ export function createPiAdapter(
         locale,
         botName,
         botOpenId,
+        larkAppId,
         noTransport,
         triggerUserAuth,
         larkToolAppId,
         replyDelivery: effectiveReplyDelivery,
         solo,
         hideLocalAddresses,
+        // A native gateway's core gives this CLI no built-in plugin dir, which
+        // is where it found the ask skill; it gets the ask hint here instead.
+        builtinSkillBlock: builtinSkillsOffered() ? undefined : nativeGatewayAskHintBlock(locale),
         cliId: 'pi',
       });
 
@@ -437,7 +443,7 @@ export function createPiAdapter(
         model: resolvedModel,
         thinking,
         turnBoundaryExtension: turnBoundaryExt,
-        builtinSkillsDir: promptInjection === 'none' ? undefined : join(builtinPluginDirForSession(PI_PLUGIN_DIR), 'skills'),
+        builtinSkillsDir: promptInjection === 'none' || !builtinSkillsOffered() ? undefined : join(builtinPluginDirForSession(PI_PLUGIN_DIR), 'skills'),
         skillPluginDir: promptInjection === 'none' ? undefined : skillPluginDir,
       });
     },

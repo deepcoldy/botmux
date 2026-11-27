@@ -40,7 +40,7 @@ import { cliSupportsConfigDir } from './cli-config-dir.js';
 import { plannedOpeningBackendType } from './opening-backend.js';
 import { resolveEffectivePluginIds } from './plugins/effective.js';
 import { collectProtectedHttpEgressPolicies } from './protected-http-egress.js';
-import { buildBotmuxShellHints, buildManagedLarkToolPromptBlocks, buildTurnSpeakersBlock, feishuReplyPresentationGuidance, transcriptPromptTeachesSend } from '../adapters/cli/shared-hints.js';
+import { buildBotmuxShellHints, buildManagedLarkToolPromptBlocks, buildTurnSpeakersBlock, feishuReplyPresentationGuidance, nativeGatewayIdentityBlock, transcriptPromptTeachesSend } from '../adapters/cli/shared-hints.js';
 import { usesLarkToolBinding } from './lark-tool-binding.js';
 import { effectiveReplyDelivery, type ReplyDelivery } from './reply-delivery.js';
 import {
@@ -48,10 +48,13 @@ import {
   builtinSkillEntries,
   buildBuiltinSkillCatalogBlock,
   builtinSkillHelpPointer,
+  builtinSkillsOffered,
   chatManagerEnabledForApp,
+  nativeGatewayAskHintBlock,
   type BuiltinSkillEntry,
 } from '../skills/injection-mode.js';
 import { compactSkillTriggerSummary } from './skills/prompt.js';
+import { isNativeGatewayCoreProcess } from './runtime-mode.js';
 import { resolveConditionalLine } from '../skills/effective-builtins.js';
 import {
   getSessionPersistentBackendType,
@@ -1635,9 +1638,18 @@ function buildNewTopicBlocks(
   // help. `global` mode installs files (worker-pool ensureCliSkills) and adds
   // nothing to the prompt. Claude-family (injectsSessionContext) inject skills
   // via --plugin-dir, so they're excluded.
+  // A native gateway's core offers no built-in skills (builtinSkillsOffered):
+  // no catalog and no help pointer either.
   let skillBlock = '';
   const remoteRunnerSkillCatalog = (cliId === 'remote-runner' || opts?.sessionBackendType === 'remote-runner') && !noTransport;
-  if (remoteRunnerSkillCatalog) {
+  if (!builtinSkillsOffered()) {
+    // Only the ask hint, for a CLI that used to learn about `botmux ask` from
+    // this catalog / help pointer or from an ask skill file in its plugin or
+    // global skills dir, and does not take questions through its own hook.
+    if (!adapter.injectsSessionContext && !adapter.asksViaHook && (adapter.skillsDir || adapter.pluginDir)) {
+      skillBlock = nativeGatewayAskHintBlock(locale);
+    }
+  } else if (remoteRunnerSkillCatalog) {
     // A Remote Runner executes in an ephemeral environment and has no host
     // skillsDir/pluginDir to discover. Force only the durable-schedule entry
     // into its opening catalog; explicit user disable still wins in
@@ -1670,7 +1682,11 @@ function buildNewTopicBlocks(
 
   const unknown = t('ai.identity.unknown', undefined, locale);
   let identityBlock = '';
-  if (botIdentity && (botIdentity.name || botIdentity.openId)) {
+  if (isNativeGatewayCoreProcess()) {
+    // Native gateway core: only a human display name, never the internal bot id
+    // or the synthetic open_id; nothing when no display name is known.
+    identityBlock = nativeGatewayIdentityBlock(botIdentity?.name, opts?.larkAppId).join('\n');
+  } else if (botIdentity && (botIdentity.name || botIdentity.openId)) {
     // No-transport (apiOnly bot / HTTP virtual chat): keep name/open_id but drop
     // the short_routing rule (--mention collaboration requirement) — same gate as
     // the routing block above and the system-prompt identity path in
@@ -2150,8 +2166,11 @@ function buildFollowUpBlocks(
     // 同样调本函数、但把 reminder 走 per-turn sidecar；只在 inline 分支 gate 会让 hook
     // 模式的续轮 reminder 从 sidecar 漏出去。哨兵语义只在本轮内容的
     // <botmux_http_response_mode> 出现一次（迁移不删，#808 async settle 依赖它）。
+    // A native gateway's core: still no transport of its own, but the gateway
+    // posts the reply into a chat people read, and the turn's <botmux_task> may
+    // hand the model a delivery command — so not the program-only reminder.
     const reminderKey = noTransport
-      ? 'ai.followup.reminder_no_transport'
+      ? (isNativeGatewayCoreProcess() ? 'ai.followup.reminder_native_gateway' : 'ai.followup.reminder_no_transport')
       : hookMode
         ? 'ai.followup.reminder_hook'
         : resolveConditionalLine('ai.followup.reminder_no_resend', config.noVisibleOutputHint)

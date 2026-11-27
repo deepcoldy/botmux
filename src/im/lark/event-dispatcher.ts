@@ -14,7 +14,7 @@ import { startLarkConnection, type LarkConnection } from './transport/connection
 import { getBot, getAllBots, getBotOpenId, findOncallChat, getOwnerOpenId, loadBotConfigs, loadBotConfigsCached, vcMeetingAgentConfigActive, type BotConfig, type BotState, type SubstituteModeConfig } from '../../bot-registry.js';
 import { botHasConfiguredAllowlist } from '../../core/bot-allowlist.js';
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
-import { getChatInfo, getChatMode, getChatModeStrict, getCachedChatMode, getChatName, getUserProfile, getMessageDetail, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, resolveUnionIdFromOpenId, resolveUnionIdFromOpenIdStrict, replyMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
+import { getChatInfo, getChatMode, getChatModeStrict, getCachedChatMode, getChatName, getUserProfile, getMessageDetail, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, resolveUnionIdFromOpenId, resolveUnionIdFromOpenIdStrict, replyMessage, sendUserMessage, isHumanOpenId, updateInteractiveCardByToken, updateMessage } from './client.js';
 import * as larkClient from './client.js';
 import type { SubtopicMentionlessHandoff } from '../../services/subtopic-mentionless-handoff.js';
 import { listChats, type ChatBrief } from '../../services/groups-store.js';
@@ -1565,7 +1565,7 @@ const CARD_ACTION_TIMEOUT = Symbol('card-action-timeout');
 const cardActionInFlight = new Set<string>();
 
 function cardActionMessageId(data: any): string | undefined {
-  return data?.context?.open_message_id ?? data?.open_message_id;
+  return data?.context?.open_message_id ?? data?.open_message_id ?? data?.message_id;
 }
 
 const PRIMARY_UNSAFE_SESSION_LIFECYCLE_ACTIONS = new Set([
@@ -1640,7 +1640,13 @@ function shapeCardActionResult(result: any): any {
   // The handler may return:
   //   - an already-shaped Lark response ({toast} and/or {card}) -> pass through;
   //   - a raw card body (e.g. toggle_stream) -> wrap as an in-place card patch.
-  if (result && (result.toast || result.card || result.deferredCard || result.afterAck)) return result;
+  if (result && (result.toast || result.card || result.deferredCard || result.afterAck)) {
+    if (result.card && !result.deferredCard) {
+      const { card, ...rest } = result;
+      return { ...rest, deferredCard: card };
+    }
+    return result;
+  }
   if (result) return { card: { type: 'raw', data: result } };
   // The Lark WS SDK only serializes callback `data` for truthy results. An
   // empty object therefore means "ACK with no UI update", while undefined
@@ -1653,11 +1659,72 @@ function serializeRawCardForPatch(cardData: any): string | undefined {
   return typeof cardData === 'string' ? cardData : JSON.stringify(cardData);
 }
 
+function cardActionPatchErrorDetail(err: unknown): string {
+  const shape = extractLarkErrorShape(err);
+  const responseData = (err as any)?.response?.data;
+  return `${shape.message}`
+    + `${shape.httpStatus !== undefined ? ` httpStatus=${shape.httpStatus}` : ''}`
+    + `${shape.larkCode !== undefined ? ` larkCode=${shape.larkCode}` : ''}`
+    + `${responseData ? ` response=${JSON.stringify(responseData).slice(0, 1000)}` : ''}`;
+}
+
+function cardActionToken(data: any): string | undefined {
+  const token = data?.token ?? data?.event?.token;
+  return typeof token === 'string' && token.trim() ? token.trim() : undefined;
+}
+
+function cardActionOperatorOpenId(data: any): string | undefined {
+  const openId = data?.operator?.open_id ?? data?.operator_id ?? data?.event?.operator?.open_id;
+  return typeof openId === 'string' && openId.trim() ? openId.trim() : undefined;
+}
+
+function delayedUpdateCardFromRaw(raw: any, operatorOpenId?: string): Record<string, unknown> | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const card = (raw as any).card && typeof (raw as any).card === 'object' && !Array.isArray((raw as any).card)
+    ? (raw as any).card
+    : raw;
+  if (!card || typeof card !== 'object' || Array.isArray(card)) return undefined;
+
+  // interactive/v1/card/update targets the callback token, not the message id.
+  // Card 1.0 uses update_multi to select the audience: shared cards update every
+  // recipient and must NOT carry open_ids; exclusive cards (including the
+  // default update_multi=false) require a non-empty recipient list (300090).
+  // Card 2.0 and template updates do not use this legacy field.
+  const legacyCard = !(card as any).schema && (card as any).type !== 'template';
+  const sharedLegacyCard = legacyCard && (card as any).config?.update_multi === true;
+  if (sharedLegacyCard) {
+    if (!Object.hasOwn(card, 'open_ids')) return card as Record<string, unknown>;
+    const { open_ids: _openIds, ...sharedCard } = card as Record<string, unknown>;
+    return sharedCard;
+  }
+  const hasLegacyRecipients = Array.isArray((card as any).open_ids) && (card as any).open_ids.length > 0;
+  if (legacyCard && !hasLegacyRecipients) {
+    // Do not spend one of the two token uses on a request that must fail with
+    // 300090, and do not fall through to message.patch (which cannot perform an
+    // exclusive/partial update). The deferred lane catches this and still runs
+    // the business continuation.
+    if (!operatorOpenId) {
+      throw new Error('Delayed update of an exclusive Card 1.0 requires an operator open_id or non-empty open_ids');
+    }
+    return { ...(card as Record<string, unknown>), open_ids: [operatorOpenId] };
+  }
+  return card as Record<string, unknown>;
+}
+
 async function patchTimedOutCardActionResult(larkAppId: string, data: any, shapedResult: any): Promise<void> {
   const messageId = cardActionMessageId(data);
   const card = shapedResult?.card ?? shapedResult?.deferredCard;
-  if (!messageId || !card) return;
+  if (!card) return;
   const raw = card.type === 'raw' ? card.data : card;
+  const token = cardActionToken(data);
+  if (token) {
+    const delayedCard = delayedUpdateCardFromRaw(raw, cardActionOperatorOpenId(data));
+    if (delayedCard) {
+      await updateInteractiveCardByToken(larkAppId, token, delayedCard);
+      return;
+    }
+  }
+  if (!messageId) return;
   const body = serializeRawCardForPatch(raw);
   if (!body) return;
   await updateMessage(larkAppId, messageId, body);
@@ -1685,6 +1752,7 @@ async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: E
   const ackTimeoutMs = resolveCardActionAckTimeoutMs(getBot(larkAppId).config.cardActionAckTimeoutMs);
   cardActionInFlight.add(key);
   let timedOut = false;
+  let deferredCardUpdateScheduled = false;
   const work = handlers.handleCardAction(data, larkAppId)
     .then(shapeCardActionResult)
     .then(result => {
@@ -1692,22 +1760,33 @@ async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: E
       // ACK the callback before patching. If we await message.patch here, Lark
       // applies the callback completion after the API patch and can restore the
       // pre-click card, making the expanded follow-up flash and disappear.
-      if (result.deferredCard) {
-        setTimeout(() => {
-          void patchTimedOutCardActionResult(larkAppId, data, result)
-            .catch(err => logger.warn(`Failed to patch deferred card action result: ${err}`));
-        }, 0);
-      }
-      if (typeof result.afterAck === 'function') {
-        setTimeout(() => {
-          // Pass the REAL ACK-timeout state observed by this wrapper. Existing
-          // afterAck callbacks ignore the extra argument; callbacks that must
-          // decide between a synchronous toast and a visible fallback (e.g. the
-          // substitute toggle) use it instead of estimating elapsed time.
-          void Promise.resolve(result.afterAck(timedOut))
-            .catch(err => logger.warn(`Failed to run deferred card continuation: ${err}`));
-        }, 0);
-      }
+      // A result such as {card: running, afterAck: publishResult} has two writes
+      // to the same message. Settle the intermediate update before starting the
+      // continuation; otherwise a slow token request can overwrite the result.
+      if (result.deferredCard) deferredCardUpdateScheduled = true;
+      setTimeout(() => {
+        void (async () => {
+          if (result.deferredCard) {
+            try {
+              await patchTimedOutCardActionResult(larkAppId, data, result);
+            } catch (err) {
+              logger.warn(`Failed to patch deferred card action result: ${cardActionPatchErrorDetail(err)}`);
+            }
+          }
+          if (typeof result.afterAck === 'function') {
+            try {
+              // Pass the REAL ACK-timeout state observed by this wrapper. Existing
+              // afterAck callbacks ignore the extra argument; callbacks that must
+              // decide between a synchronous toast and a visible fallback (e.g. the
+              // substitute toggle) use it instead of estimating elapsed time.
+              // A card-update failure must not suppress the business continuation.
+              await result.afterAck(timedOut);
+            } catch (err) {
+              logger.warn(`Failed to run deferred card continuation: ${err}`);
+            }
+          }
+        })();
+      }, 0);
       if (result.deferredCard) return result.toast ? { toast: result.toast } : {};
       const { afterAck: _afterAck, ...response } = result;
       return response;
@@ -1719,6 +1798,10 @@ async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: E
 
   void work.then(result => {
     if (!timedOut || !result) return;
+    // The deferred lane already owns this card update. Its stripped ACK-shaped
+    // result may still contain a toast; do not misreport that as toast-only or
+    // issue a second, empty patch from this timeout fallback.
+    if (deferredCardUpdateScheduled) return;
     if (!result.card && result.toast) {
       // A toast-only result can't be re-surfaced after we already ACKed with the
       // generic "后台处理中" toast: toasts ride the synchronous callback response,

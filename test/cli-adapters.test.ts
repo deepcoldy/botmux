@@ -40,7 +40,7 @@ import { createAidenAdapter } from '../src/adapters/cli/aiden.js';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
-import { createCursorAdapter, CURSOR_PLUGIN_DIR } from '../src/adapters/cli/cursor.js';
+import { createCursorAdapter, CURSOR_PLUGIN_DIR, cursorStopLeftParkedFollowUp } from '../src/adapters/cli/cursor.js';
 import { createGeniusAdapter } from '../src/adapters/cli/genius.js';
 import { createOpenCodeAdapter, isOpenCodeSessionId } from '../src/adapters/cli/opencode.js';
 import { createMiMoCodeAdapter } from '../src/adapters/cli/mimocode.js';
@@ -1330,6 +1330,20 @@ describe('codex-app buildArgs', () => {
     expect(args).not.toContain('--strict-resume');
   });
 
+  it('passes the frozen join bootstrap and replay fingerprint to the runner', () => {
+    const previous = { digest: 'a'.repeat(64), length: 42 };
+    const args = adapter.buildArgs({
+      sessionId: 'sess-app', resume: false,
+      groupJoinPrompt: '入群后等待真实任务', groupJoinTitleBootstrap: previous,
+    });
+    const promptIndex = args.indexOf('--group-join-prompt');
+    const digestIndex = args.indexOf('--group-join-title-digest');
+    const lengthIndex = args.indexOf('--group-join-title-length');
+    expect(args[promptIndex + 1]).toBe('入群后等待真实任务');
+    expect(args[digestIndex + 1]).toBe(previous.digest);
+    expect(args[lengthIndex + 1]).toBe('42');
+  });
+
   it('disables the runner fallback catalogue when the bare Codex runtime cannot attest the provider', () => {
     const direct = adapter.buildArgs({ sessionId: 'sess-app', resume: false });
     expect(direct).not.toContain('--codex-reasoning-catalog');
@@ -2165,6 +2179,73 @@ describe('cursor buildArgs', () => {
     // Guard against over-broad matching: the arrow-prefixed composer glyph is
     // required, so unrelated screen text with the phrase must not false-match.
     expect(adapter.readyPattern?.test('Plan, search, build anything')).toBe(false);
+  });
+
+  it('recognizes the Agent Local composer before, during, and after a turn', () => {
+    const empty = '  > Plan, search, build anything';
+    const busy = '  > Add a follow-up    ctrl+c to stop';
+    const busyAnsi = ' \u001b[48;5;233m \u001b[2m> \u001b[22m\u001b[7mA\u001b[27m\u001b[2mdd a follow-up\u001b[22m    \u001b[2mctrl+c to stop\u001b[22m \u001b[49m\r\n';
+    const idle = '  > Add a follow-up  \r\n';
+
+    expect(adapter.readyPattern?.test(`Cursor Agent (local-agent)\n${empty}`)).toBe(true);
+    expect(adapter.readyPattern?.test(idle)).toBe(true);
+    expect(adapter.readyPattern?.test(busy)).toBe(true);
+    expect(adapter.readyPattern?.test('Example: > Add a follow-up')).toBe(false);
+    expect(adapter.readyPattern?.test('> Add a follow-up before noon')).toBe(false);
+    expect(adapter.readyPattern?.test('>\nAdd a follow-up')).toBe(false);
+    expect(adapter.busyPattern?.test(busy)).toBe(true);
+    expect(adapter.busyPattern?.test('> press ctrl+c to stop')).toBe(false);
+    expect(adapter.screenShowsNoPendingInput?.('> press Escape    ctrl+c to stop\n  → Add a follow-up')).toBe(true);
+    expect(adapter.busyPattern?.test('> \npress ctrl+c to stop')).toBe(false);
+    expect(adapter.screenHoldsSubmittedInput?.(busyAnsi)).toBe(true);
+    expect(adapter.screenShowsNoPendingInput?.(busyAnsi)).toBe(false);
+    expect(adapter.screenShowsNoPendingInput?.(idle)).toBe(true);
+    expect(adapter.screenShowsNoPendingInput?.(`${idle}\n  > half-typed draft`)).toBe(false);
+    expect(adapter.screenHoldsSubmittedInput?.(`${busy}\r\n${idle}`)).toBe(false);
+    expect(adapter.screenShowsNoPendingInput?.(`${busy}\r\n${idle}`)).toBe(true);
+    expect(adapter.screenHoldsSubmittedInput?.(`${idle}\r\n${busy}`)).toBe(true);
+  });
+
+  it.each(['→', '>'])('recognizes the Cursor composer while a plan is available for review (%s)', glyph => {
+    const placeholder = `  ${glyph} Add a follow-up — /plan to review and build`;
+    expect(adapter.readyPattern?.test(placeholder)).toBe(true);
+    expect(adapter.readyPattern?.test(`${placeholder}    ctrl+c to stop`)).toBe(true);
+    expect(adapter.screenShowsNoPendingInput?.(placeholder)).toBe(true);
+  });
+
+  it('finds the Agent Local composer and queue above tmux viewport padding', () => {
+    const paddedViewport = (rows: string[]) => [
+      ...Array.from({ length: 19 }, (_, index) => `Earlier output ${index}`),
+      ...rows,
+      '  gateway-model',
+      ...Array<string>(16).fill('\u001b[49m    '),
+    ].join('\r\n');
+    const idle = '  > Add a follow-up';
+    const busy = `${idle}    ctrl+c to stop`;
+    const queued = ['  ┌─ follow-ups ────┐', '  │ Next request    │', '  └────────────────┘', idle];
+
+    expect(adapter.screenHoldsSubmittedInput?.(paddedViewport([busy]))).toBe(true);
+    expect(adapter.screenHoldsSubmittedInput?.(paddedViewport(queued))).toBe(true);
+    expect(adapter.screenShowsNoPendingInput?.(paddedViewport(queued))).toBe(false);
+    expect(adapter.screenShowsNoPendingInput?.(paddedViewport([idle]))).toBe(true);
+    expect(adapter.busyPattern?.test(busyProbeRegion(paddedViewport([busy]), 'cursor'))).toBe(true);
+    expect(adapter.busyPattern?.test(busyProbeRegion(paddedViewport([busy]), 'codex'))).toBe(false);
+  });
+
+  it('keeps an Agent Local draft starting with the placeholder pending', () => {
+    const placeholder = '  > Add a follow-up';
+    const draft = `${placeholder} before noon`;
+    const parked = '  ┌─ follow-ups ────┐\n  │ enter steer    │\n  └────────────────┘\n';
+
+    expect(adapter.screenShowsNoPendingInput?.(placeholder)).toBe(true);
+    expect(adapter.screenShowsNoPendingInput?.(`${placeholder}\n${draft}`)).toBe(false);
+    expect(adapter.screenShowsNoPendingInput?.('  > quote → Add a follow-up')).toBe(false);
+    expect(adapter.screenShowsNoPendingInput?.(`  → existing draft\n${placeholder}`)).toBe(false);
+    expect(adapter.screenShowsNoPendingInput?.('  → Add a follow-up\n  > interrupted draft')).toBe(false);
+    expect(cursorStopLeftParkedFollowUp(`${parked}${placeholder}`)).toBe(true);
+    expect(cursorStopLeftParkedFollowUp(`Example: enter steer\n${placeholder}`)).toBe(false);
+    expect(cursorStopLeftParkedFollowUp(`${parked}${placeholder}\n${draft}`)).toBe(false);
+    expect(cursorStopLeftParkedFollowUp(`  → Add a follow-up\n${parked}${draft}`)).toBe(false);
   });
 
   it('detects active composer busy state and follow-ups queue without matching scrollback prose', () => {

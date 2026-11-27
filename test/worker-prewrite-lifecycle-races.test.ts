@@ -162,6 +162,7 @@ describe('Codex deferred-precheck lifecycle ownership', () => {
     h.scope.idleDetector.dispose = vi.fn();
     Object.assign(h.scope, {
       stopNativeSessionTitleSync: vi.fn(), stopSessionMcpGatewayHost: vi.fn(),
+      stopLocalSessionReadyChannel: vi.fn(),
       stopCodexRpcEngine: vi.fn(), cleanupCodexAppControlBootstrap: vi.fn(),
       stopCodexAppControlChannel: vi.fn(), destroyCrashDiagnosticTerminal: vi.fn(),
       stopReattachIdleProbe: vi.fn(), stopBusyPatternIdleProbe: vi.fn(),

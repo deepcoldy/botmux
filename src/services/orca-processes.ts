@@ -1,6 +1,7 @@
 import type { CliId } from '../adapters/cli/types.js';
 import { readdirSync, readFileSync, readlinkSync } from 'node:fs';
 import { basename } from 'node:path';
+import { isElectronHelperProcessArgv } from '../utils/electron-process.js';
 
 export function scanLocalOrcaCliPids(
   rootPidByHandle: ReadonlyMap<string, number>,
@@ -43,6 +44,8 @@ export function scanLocalOrcaCliPids(
     traex: 'traex',
     traecli: 'traex',
     'cursor-agent': 'cursor',
+    'cursor-agent-local': 'cursor',
+    'cursor-agent-lo': 'cursor',
     opencode: 'opencode',
     opencode2: 'opencode2',
     mtr: 'mtr',
@@ -68,6 +71,13 @@ export function scanLocalOrcaCliPids(
         && (expectedCliId === 'traex' || expectedCliId === 'coco')
         ? expectedCliId
         : processName;
+      if (cliId === 'cursor') {
+        // Helpers inherit both the executable and ORCA_TERMINAL_HANDLE. Without
+        // this check the deepest-first ranking below prefers a GPU/renderer
+        // helper over the main process that owns the Cursor chat store.
+        const argv = readFileSync(`/proc/${pid}/cmdline`).toString('utf-8').split('\0').filter(Boolean);
+        if (isElectronHelperProcessArgv(argv)) continue;
+      }
       const depth = depthFrom(pid, rootPid);
       if (!cliId || (expectedCliId && cliId !== expectedCliId) || depth === undefined) continue;
       const list = candidates.get(handleMatch[1]!) ?? [];
