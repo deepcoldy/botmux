@@ -425,8 +425,11 @@ describe('v3 ephemeral pool', () => {
       expect(readV3AttemptWorkerFence(req.attemptDir, req)).toBeNull();
     });
 
-    // Real permission bits; root bypasses them, so the probe would prove nothing there.
-    const permissionsEnforced = typeof process.getuid !== 'function' || process.getuid() !== 0;
+    // Real permission bits: POSIX only, and root bypasses them, so the probe
+    // would prove nothing there. bot-registry.test.ts covers the errno mapping
+    // with mocked fs on every platform.
+    const permissionsEnforced = process.platform !== 'win32'
+      && typeof process.getuid === 'function' && process.getuid() !== 0;
     const rejectsBeforeSpawn = async () => {
       const spawn = vi.fn((): WorkerHandle => { throw new Error('unexpected spawn'); });
       const failure = await createEphemeralPool({ factory: { spawn }, workerPath: '/tmp/worker.js',
@@ -450,6 +453,36 @@ describe('v3 ephemeral pool', () => {
         expect(failure.message).toContain('cli_app');
         expect(failure.message).toMatch(/EACCES|EPERM/);
       } finally { chmodSync(configDir, 0o700); }
+    });
+
+    it.skipIf(!permissionsEnforced)('fails an unregistered node bot when the pinned BOTS_CONFIG parent cannot be searched', async () => {
+      const pinnedDir = join(dir, 'pinned');
+      mkdirSync(pinnedDir);
+      const pinnedPath = join(pinnedDir, 'bots.json');
+      writeFileSync(pinnedPath, JSON.stringify([{ larkAppId: 'cli_app', larkAppSecret: 'test-only',
+        cliId: 'claude-code', env: { MODEL_AUTH: 'node-sentinel' } }]));
+      vi.stubEnv('BOTS_CONFIG', pinnedPath);
+      chmodSync(pinnedDir, 0o000);
+      try {
+        const failure = await rejectsBeforeSpawn();
+        expect(failure.message).toContain('cli_app');
+        expect(failure.message).toContain(pinnedPath);
+        expect(failure.cause).toMatchObject({ reason: 'permission_denied' });
+      } finally { chmodSync(pinnedDir, 0o700); }
+    });
+
+    it('fails an unregistered node bot when the default bots.json is a dangling symlink', async (ctx) => {
+      const home = join(dir, 'home');
+      const configDir = join(home, '.botmux');
+      mkdirSync(configDir, { recursive: true });
+      const linkPath = join(configDir, 'bots.json');
+      try { symlinkSync(join(dir, 'moved-away.json'), linkPath); } catch { ctx.skip(); }
+      vi.stubEnv('HOME', home);
+      vi.stubEnv('BOTS_CONFIG', '');
+      const failure = await rejectsBeforeSpawn();
+      expect(failure.message).toContain('cli_app');
+      expect(failure.message).toContain(linkPath);
+      expect(failure.cause).toMatchObject({ reason: 'unreadable' });
     });
 
     it.skipIf(!permissionsEnforced)('fails an unregistered node bot on an unreadable bots.json even under read isolation', async () => {

@@ -13,7 +13,7 @@ import { getTurnResultRuntime } from './core/turn-result-runtime.js';
 import { parseSandboxNetworkPolicy } from './core/sandbox-network-policy.js';
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { normalizeCodexInstancePool, registerCodexInstanceBot, clearCodexInstanceBots, validateCodexInstanceRoster } from './services/codex-instance-pool.js';
-import { readFileSync, existsSync, statSync } from 'node:fs';
+import { readFileSync, existsSync, lstatSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { underReadIsolation } from './adapters/cli/read-isolation.js';
 import { retiredCli, retiredCliNotice } from './adapters/cli/retired-cli.js';
@@ -3712,7 +3712,16 @@ function resolveBotConfigPath(): string {
   const botsConfigPath = process.env.BOTS_CONFIG;
   if (botsConfigPath) {
     const resolved = resolve(botsConfigPath);
-    if (!existsSync(resolved)) {
+    let pinnedMissing = false;
+    try {
+      statSync(resolved);
+    } catch (err: any) {
+      // A parent that cannot be searched is a permission fault, not "gone";
+      // either way the pinned registry stays authoritative (no fallback).
+      if (err?.code !== 'ENOENT' && err?.code !== 'ENOTDIR') throw botConfigAccessError(resolved, err);
+      pinnedMissing = true;
+    }
+    if (pinnedMissing) {
       // FAIL CLOSED, and deliberately so. For a daemon-spawned CLI child this
       // path is the registry the daemon actually parsed (pinned by spawnCli), so
       // "it is gone now" must NOT degrade into "resolve my own HOME's default
@@ -3741,6 +3750,9 @@ function resolveBotConfigPath(): string {
     statSync(defaultPath);
   } catch (err: any) {
     if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') {
+      // stat() follows symlinks: a bots.json link whose target moved is a
+      // broken configuration, not an absent one.
+      if (pathEntryExists(defaultPath)) throw new BotConfigLoadError('unreadable', defaultPath, err.code, err);
       throw new BotConfigNotFoundError(
         'No bot configuration found. Set BOTS_CONFIG or create ~/.botmux/bots.json.\nSee README for config format.'
       );
@@ -3783,6 +3795,11 @@ export class BotConfigLoadError extends Error {
     }[reason];
     super(`bots.json ${category}${code ? ` (${code})` : ''}${path ? ` (file: ${path})` : ''}`, { cause });
   }
+}
+
+/** The directory entry itself exists (lstat: a dangling symlink counts). */
+function pathEntryExists(path: string): boolean {
+  try { lstatSync(path); return true; } catch { return false; }
 }
 
 function fsErrorCode(err: unknown): string | undefined {

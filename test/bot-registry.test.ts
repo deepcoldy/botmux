@@ -2126,10 +2126,10 @@ describe('findOncallChatForAnyBot', () => {
   it('refreshes the sibling oncall cache when bots.json mtime changes', () => {
     process.env.BOTS_CONFIG = '/tmp/bots.json';
     fsMock.existsSync.mockReturnValue(true);
-    fsMock.statSync
-      .mockReturnValueOnce({ mtimeMs: 1 })
-      .mockReturnValueOnce({ mtimeMs: 2 })
-      .mockReturnValueOnce({ mtimeMs: 2 });
+    // Path resolution stats bots.json too, so drive the file's mtime as state
+    // rather than as a per-call sequence.
+    let mtimeMs = 1;
+    fsMock.statSync.mockImplementation(() => ({ mtimeMs }));
     fsMock.readFileSync.mockReturnValueOnce(JSON.stringify([{ larkAppId: 'app_a', larkAppSecret: 'sa' }]));
 
     const configs = mod.loadBotConfigs();
@@ -2140,6 +2140,7 @@ describe('findOncallChatForAnyBot', () => {
     expect(mod.findOncallChatForAnyBot('oc_new')).toBeUndefined();
 
     // A later mtime causes the cache to refresh and pick up sibling bindings.
+    mtimeMs = 2;
     fsMock.readFileSync.mockReturnValueOnce(JSON.stringify([
       { larkAppId: 'app_a', larkAppSecret: 'sa' },
       { larkAppId: 'app_b', larkAppSecret: 'sb', oncallChats: [{ chatId: 'oc_new', workingDir: '/repo' }] },
@@ -2261,6 +2262,7 @@ describe('loadBotConfigs', () => {
   it('should throw when BOTS_CONFIG env points to a missing file', () => {
     process.env.BOTS_CONFIG = '/tmp/nowhere/bots.json';
     fsMock.existsSync.mockReturnValue(false);
+    fsMock.statSync.mockImplementation(() => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); });
     expect(() => mod.loadBotConfigs()).toThrow('BOTS_CONFIG file not found');
   });
 
@@ -2891,6 +2893,23 @@ describe('default bots.json path is decided by statSync()', () => {
     try { mod.loadBotConfigsCached(); } catch (err) { failure = err; }
     expect(failure).toBeInstanceOf(mod.BotConfigLoadError);
     expect(failure).toMatchObject({ reason: 'permission_denied', code });
+  });
+
+  it.each(['EACCES', 'EPERM'])('reports %s on a pinned BOTS_CONFIG as a permission fault without falling back', (code) => {
+    process.env.BOTS_CONFIG = '/pinned/bots.json';
+    vi.mocked(fs.statSync).mockImplementation((path: unknown) => {
+      if (String(path) === '/pinned/bots.json') throw fsError(code);
+      return { mtimeMs: 0 } as never;
+    });
+    vi.mocked(fs.readFileSync).mockReturnValue(JSON.stringify([
+      { larkAppId: 'cli_default_registry', larkAppSecret: 'x', cliId: 'claude-code' },
+    ]) as never);
+    for (const load of [() => mod.loadBotConfigs(), () => mod.loadBotConfigsCached({ strictRead: true })]) {
+      let failure: unknown;
+      try { load(); } catch (err) { failure = err; }
+      expect(failure).toBeInstanceOf(mod.BotConfigLoadError);
+      expect(failure).toMatchObject({ reason: 'permission_denied', code, path: '/pinned/bots.json' });
+    }
   });
 
   it('loads a file that a stat proves present even though existsSync() said no', () => {
