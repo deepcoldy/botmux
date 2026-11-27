@@ -37845,6 +37845,12 @@ async function spawnCliBody(
     )
     : cfg.reasoningEffort;
 
+  // The oncall sandbox re-opens this directory for writes. The transcript
+  // bridge must follow the same directory that the adapter receives.
+  const sandboxSessionDir = sandboxRequested && !scratchRequested
+    ? cliAdapter.sandboxSessionDir?.(effectiveAdapterSessionId)
+    : undefined;
+
   // Trigger-user identity vars the CLI must forward to the SHELL COMMANDS it
   // runs. Computed here rather than in the wrapper-install block below because
   // buildArgs runs first; these are pure path derivations, so naming them early
@@ -37895,9 +37901,6 @@ async function spawnCliBody(
   if (cfg.cliId === 'traex' && !cfg.adoptMode && effectiveResume && effectiveCliSessionId) {
     noteTraexResumeTargetLeftInDefaultHome(effectiveCliSessionId);
   }
-  const sandboxSessionDir = sandboxRequested && !scratchRequested
-    ? cliAdapter.sandboxSessionDir?.(effectiveAdapterSessionId)
-    : undefined;
   const args = cliAdapter.buildArgs({
     sessionId: effectiveAdapterSessionId,
     resume: effectiveResume,
@@ -37973,8 +37976,6 @@ async function spawnCliBody(
     bypassHookTrust: config.bypassCodexHookTrust,
     hideRateLimitModelNudge: config.hideCodexRateLimitModelNudge,
     skillPluginDir: cfg.skillPluginDir,
-    // Same predicate and session id as the oncall sandbox block below, which
-    // creates this dir and re-opens it read-write inside the masked tree.
     sandboxSessionDir,
     // Per-bot CODEX_HOME can be enabled without the OS sandbox. Only the latter
     // needs Codex's read-isolation shell-env behavior.
