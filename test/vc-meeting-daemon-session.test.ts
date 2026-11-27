@@ -440,6 +440,7 @@ vi.mock('../src/services/vc-meeting-runtime-store.js', () => ({
 }));
 
 import { getBot, registerBot } from '../src/bot-registry.js';
+import * as cliRegistry from '../src/adapters/cli/registry.js';
 import { config } from '../src/config.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { __testOnly_activeSessions, __vcMeetingAgentTest } from '../src/daemon.js';
@@ -11712,6 +11713,48 @@ describe('VC meeting daemon session lifecycle', () => {
         cliId: 'antigravity',
       } as any;
       expect(__vcMeetingAgentTest.resolveReceiverSession(sid)?.reliableTurnTerminal).toBe(false);
+    });
+
+    it('prefers the frozen session cliPathOverride over the live bot-level default', async () => {
+      const agyAppId = 'cli_agy_path_frozen';
+      registerBot({
+        larkAppId: agyAppId,
+        larkAppSecret: 'agent-secret',
+        name: 'Antigravity Path Frozen',
+        cliId: 'antigravity',
+        cliPathOverride: '/bot-level/agy',
+        backendType: 'pty',
+        workingDir: process.cwd(),
+        env: { AGY_BOTMUX_TRANSPORT: 'acp' },
+      });
+
+      const res = await __vcMeetingAgentTest.registerReceiverMember(
+        memberProjectionRequest(agyAppId, 'oc_agy_path', 'm_agy_path'),
+        agyAppId,
+      );
+      expect(res.status).toBe(200);
+      const sid = (res.body as { receiverSessionId: string }).receiverSessionId;
+      const ds = [...__testOnly_activeSessions.values()].find(candidate => candidate.session.sessionId === sid)!;
+
+      // Legacy frozen session (no structured cliLaunchSnapshot): its own
+      // shadow-written cliPathOverride must win over the live bot default,
+      // matching the three-tier resolver used at spawn time.
+      ds.session.cliLaunchSnapshot = undefined;
+      ds.session.cliPathOverride = '/frozen-session/agy';
+
+      const frozenSpy = vi.spyOn(cliRegistry, 'createCliAdapterSync');
+      __vcMeetingAgentTest.resolveReceiverSession(sid);
+      const frozenCalls = frozenSpy.mock.calls.filter(call => call[0] === 'antigravity');
+      expect(frozenCalls.at(-1)?.[1]).toBe('/frozen-session/agy');
+      frozenSpy.mockRestore();
+
+      // Once the session-level freeze is gone, the bot-level default applies.
+      ds.session.cliPathOverride = undefined;
+      const botSpy = vi.spyOn(cliRegistry, 'createCliAdapterSync');
+      __vcMeetingAgentTest.resolveReceiverSession(sid);
+      const botCalls = botSpy.mock.calls.filter(call => call[0] === 'antigravity');
+      expect(botCalls.at(-1)?.[1]).toBe('/bot-level/agy');
+      botSpy.mockRestore();
     });
   });
 });

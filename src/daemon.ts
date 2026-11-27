@@ -3447,7 +3447,12 @@ function resolveVcMeetingReceiverSession(sessionId: string): VcMeetingReceiverSe
   try {
     const bot = getBot(ds.larkAppId);
     const cliId = (ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? bot.config.cliId) as CliId;
+    // Same three-tier precedence as every spawn-time resolver
+    // (session-manager/trigger-session): a legacy session's own frozen
+    // cliPathOverride shadows the live bot default; the bot fallback only
+    // applies when the session still runs the bot's configured CLI.
     const cliPathOverride = ds.session.cliLaunchSnapshot?.cliPathOverride
+      ?? ds.session.cliPathOverride
       ?? (cliId === bot.config.cliId ? bot.config.cliPathOverride : undefined);
     const backendType = resolvePairedSpawnBackendType(
       cliId,
