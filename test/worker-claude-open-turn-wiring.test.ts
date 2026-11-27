@@ -240,6 +240,7 @@ describe('Claude PTY readiness before native submit evidence', () => {
       backendScreenEvidenceIsAuthoritativeForMutation: () => true,
       captureBackendScreen: () => '❯ ',
       busyProbeRegion: (screen: string) => screen,
+      log: vi.fn(),
       releaseActiveTurnAuthority: release,
     };
     for (const name of ['hasSubmittedUnstartedClaudeHead', 'ownsDeferredClaudePtyReady',

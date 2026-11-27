@@ -187,7 +187,8 @@ describe('Claude Code open-turn hold, authority retention, and Scenario 3 recove
     // while the fake CLI still withholds both its submit hook and user row.
     await waitUntil(() => w.logs.slice(logFrom).join('').includes('submit not confirmed after retries'), w.logs);
     writeFileSync(w.delayedSubmission!.showPrompt, '');
-    await waitUntil(() => w.logs.slice(logFrom).join('').includes('Prompt detected (idle)'), w.logs);
+    await waitUntil(() => w.logs.slice(logFrom).join('').includes('Deferring prompt-ready while Claude PTY submission is unconfirmed')
+      || w.messages.slice(from).some(m => m.type === 'managed_turn_origin_revoked' && m.turnId === turnId), w.logs);
     writeFileSync(w.delayedSubmission!.acceptInput, '');
 
     await waitUntil(

@@ -16509,6 +16509,9 @@ function deferClaudePtyReadyWhileStarting(): boolean {
   const observedBackend = backend;
   const outputGeneration = ptyOutputGeneration.snapshot();
   const rawAtIdle = rawInputWriteGeneration;
+  if (deferredClaudePtyReady?.turn !== head) {
+    log(`Deferring prompt-ready while Claude PTY submission is unconfirmed (turn=${head.turnId.slice(0, 12)})`);
+  }
   if (deferredClaudePtyReady) clearTimeout(deferredClaudePtyReady.timer);
   detector.reset();
   const deferred = {
