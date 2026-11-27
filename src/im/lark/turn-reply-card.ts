@@ -2,7 +2,7 @@ import type { BotConfig } from '../../bot-registry.js';
 import type { CotEntry } from '../../types.js';
 import { subjectFromArgsString } from '../../services/cot-subject.js';
 import {
-  replyCardIsTerminal, type ReplyCardTool, type TurnReplyCardRecord, type ReplyCardActivity,
+  normalizeReplyCardActivity, replyCardIsTerminal, type ReplyCardTool, type TurnReplyCardRecord, type ReplyCardActivity,
 } from '../../services/turn-reply-card.js';
 import { buildTurnReplyAskElements, turnReplyAskSummary } from './turn-reply-ask-elements.js';
 import { ASK_CARD_COLORS, ASK_CARD_ELEMENT_LIMIT, countCardElements } from './ask-card-look.js';
@@ -43,11 +43,13 @@ export function publicReplyCardTools(entries: readonly CotEntry[], showResults: 
   return [...tools.values()];
 }
 
-/** Only text already emitted by the CLI is available here (often a summary). */
+/** Only text already emitted by the CLI is available here (often a summary).
+ * Filter blank paragraphs at the source, but retain distinct source occurrences
+ * until the store can see any progress/ask delimiters between their updates. */
 export function publicReplyCardActivity(entries: readonly CotEntry[]): ReplyCardActivity[] {
-  return entries.flatMap((entry, index): ReplyCardActivity[] => entry.kind === 'thinking' || entry.kind === 'text'
+  return normalizeReplyCardActivity(entries.flatMap((entry, index): ReplyCardActivity[] => entry.kind === 'thinking' || entry.kind === 'text'
     ? [{ kind: 'thinking', id: `thinking:${index}`, text: entry.text }]
-    : entry.kind === 'tool_call' ? [{ kind: 'tool', id: entry.id }] : []);
+    : entry.kind === 'tool_call' ? [{ kind: 'tool', id: entry.id }] : []), false);
 }
 
 function bounded(text: string, bytes: number, measure = (value: string) => Buffer.byteLength(value, 'utf8')): string {
@@ -174,6 +176,11 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
   const en = presentation.locale === 'en';
   const terminal = replyCardIsTerminal(record);
   const pendingAsks = (record.asks ?? []).filter(entry => !entry.result && !entry.ask.settled);
+  const deliberateSilence = record.phase === 'completed' && record.outputDisposition === 'nothing_to_send' && !record.finalCard;
+  const activity = normalizeReplyCardActivity(record.activity ?? [
+    ...record.progress.map((text, i) => ({ kind: 'progress' as const, id: String(i), text })),
+    ...record.tools.map(tool => ({ kind: 'tool' as const, id: tool.id })),
+  ]);
   // Native thinking carries the runtime status, so only its opt-in turns drop the in-card chrome.
   const simpleFinal = record.nativeCot === true && !!record.finalCard && record.phase === 'completed' && !pendingAsks.length;
   const compactRuntime = record.nativeCot === true && !terminal && !record.finalCard && !pendingAsks.length;
@@ -185,7 +192,8 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
   const duration = record.durationMs !== undefined ? record.durationMs
     : !terminal && record.startedAtMs ? Date.now() - record.startedAtMs : undefined;
   const title = [
-    pendingAsks.length ? (en ? 'Waiting for your response' : '等待你确认') : phaseLabels[record.phase],
+    pendingAsks.length ? (en ? 'Waiting for your response' : '等待你确认')
+      : deliberateSilence ? (en ? 'Handled · No reply needed' : '已处理 · 判定无需回复') : phaseLabels[record.phase],
     duration !== undefined ? `${(Math.max(0, duration) / 1000).toFixed(1)}s` : '',
   ].filter(Boolean).join(' · ');
 
@@ -228,7 +236,7 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
       ? ''
       : latest
         ? stripCardMarkdownImages(prepareCardMarkdown(bounded(latest, 6000), presentation.workingDir, 'disabled'))
-        : terminal ? (en ? 'No final answer was provided. See the turn record below.' : '本轮没有提供最终答复，可查看下方过程记录。')
+        : terminal ? (deliberateSilence ? '' : en ? 'No final answer was provided. See the turn record below.' : '本轮没有提供最终答复，可查看下方过程记录。')
           : (en ? 'Working on your request…' : '正在处理你的请求…');
     card.body.elements.push(...buildCardBodyElements(content, presentation.workingDir, 'disabled')
       .map((element, index) => ({ ...element, element_id: element.element_id ?? `botmux_turn_progress_${index}` })));
@@ -239,7 +247,7 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
   if (presentation.showProcess) {
     // A coalesced snapshot often ends in a tool call; keep its preceding
     // narration visible until a newer narration or another card view replaces it.
-    const latest = record.activity?.slice().reverse().find(item => item.kind === 'thinking' && item.text.trim());
+    const latest = activity.slice().reverse().find(item => item.kind === 'thinking');
     if (!terminal && !record.finalCard && !pendingAsks.length && latest?.kind === 'thinking') {
       // Compose first, then strip: the `💭 ` prefix shifts the first line and can
       // un-fence it, exposing image syntax that was inert in the bare text.
@@ -251,10 +259,6 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
       ).join('\n')) });
     }
   }
-  const activity: ReplyCardActivity[] = record.activity ?? [
-    ...record.progress.map((text, i) => ({ kind: 'progress' as const, id: String(i), text })),
-    ...record.tools.map(tool => ({ kind: 'tool' as const, id: tool.id })),
-  ];
   for (const item of activity) {
     if (item.kind === 'progress') {
       if (terminal || record.finalCard || record.progress.length > 1 || pendingAsks.length) process.push({ kind: 'text', content: `💬 ${narrationText(item.text)}` });

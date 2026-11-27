@@ -450,7 +450,7 @@ export async function flushTurnReplyTools(ds: DaemonSession, turnId: string, dis
  * runtime state. Callers settle the turn's CoT stream synchronously themselves:
  * it must not wait on this card's network PATCH. */
 export async function settleTurnReplyCardTerminal(
-  ds: DaemonSession, msg: { turnId: string; dispatchAttempt?: number; status: 'completed' | 'failed' | 'cancelled' | 'ambiguous'; durationMs?: number; completedAtMs?: number },
+  ds: DaemonSession, msg: { turnId: string; dispatchAttempt?: number; status: 'completed' | 'failed' | 'cancelled' | 'ambiguous'; durationMs?: number; completedAtMs?: number; outputDisposition?: 'nothing_to_send' | 'empty_answer' | 'boundary_unobserved' | 'explicit_final_delivered' },
   send: ReplyCardSender, owns: () => boolean,
 ): Promise<void> {
   if (!owns() || replyCardModeFor(ds, msg.turnId) === 'legacy') return;
@@ -459,6 +459,7 @@ export async function settleTurnReplyCardTerminal(
   });
   await updateTurnReplyCard(ds, msg.turnId, {
     kind: 'terminal', phase: msg.status, durationMs: msg.durationMs, completedAtMs: msg.completedAtMs,
+    ...(msg.outputDisposition !== undefined ? { outputDisposition: msg.outputDisposition } : {}),
   }, send, { dispatchAttempt: msg.dispatchAttempt, owns });
 }
 

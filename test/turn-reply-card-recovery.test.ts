@@ -61,6 +61,15 @@ describe('reply-card recovery under partial writes and overlapping writers', () 
   expect(remote).toContain('RECOVERY_OK');expect(remote).not.toContain('执行状态待确认');
   expect(ds.replyCardRunningTurnId).toBe('successor');
  });
+ it('forwards deliberate-silence output disposition through runtime terminal settlement',async()=>{
+  const ds:any={larkAppId:key.larkAppId,chatId:input.chatId,chatType:'group',rootMessageId:input.rootId,
+    session:{sessionId:key.sessionId,status:'active',rootMessageId:input.rootId}};
+  await drain(settleTurnReplyCardTerminal(ds,{turnId:key.turnId,status:'completed',durationMs:123,
+    outputDisposition:'nothing_to_send'},async()=>{throw Error('must patch existing card')},()=>true));
+  expect(store.read(key)).toMatchObject({phase:'completed',outputDisposition:'nothing_to_send',durationMs:123});
+  expect(remote).toContain('已处理 · 判定无需回复');
+  expect(remote).not.toContain('本轮没有提供最终答复');
+ });
  it('masks a content-audit-rejected recovery PATCH instead of leaving the card unsettled',async()=>{
   // The final (with an email) is already in the card; the terminal PATCH is left
   // pending, and recovery re-renders the whole card including that final.

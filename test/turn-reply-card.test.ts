@@ -52,6 +52,39 @@ it('keeps the initial answer compact while preserving stop and the final answer 
   expect(extractCardContent(JSON.stringify(final))).toContain('完整答复');
 });
 
+describe('terminal output disposition presentation', () => {
+  const terminalRecord = (outputDisposition?: TurnReplyCardRecord['outputDisposition']): TurnReplyCardRecord => ({
+    ...key, ...input, version: 1, phase: 'completed', createdAtMs: 1, progress: [], tools: [],
+    ...(outputDisposition ? { outputDisposition } : {}),
+  });
+
+  it.each([
+    { locale: 'zh' as const, label: '已处理 · 判定无需回复', warning: '本轮没有提供最终答复' },
+    { locale: 'en' as const, label: 'Handled · No reply needed', warning: 'No final answer was provided' },
+  ])('renders deliberate silence as a successful $locale outcome, not a missing answer', ({ locale, label, warning }) => {
+    const raw = buildTurnReplyCard(terminalRecord('nothing_to_send'), { ...presentation, locale });
+    const card = JSON.parse(raw);
+    expect(card.body.elements.find((element: any) => element.element_id === 'botmux_turn_status').content)
+      .toBe(`✅ **${label}**`);
+    expect(raw).not.toContain(warning);
+  });
+
+  it.each([undefined, 'empty_answer', 'boundary_unobserved'] as const)(
+    'keeps the missing-answer warning for legacy/empty/unobserved completion (%s)', outputDisposition => {
+      for (const [locale, label, warning] of [
+        ['zh', '已完成', '本轮没有提供最终答复，可查看下方过程记录。'],
+        ['en', 'Completed', 'No final answer was provided. See the turn record below.'],
+      ] as const) {
+        const raw = buildTurnReplyCard(terminalRecord(outputDisposition), { ...presentation, locale });
+        expect(raw).toContain(label);
+        expect(raw).toContain(warning);
+        expect(raw).not.toContain(locale === 'zh' ? '判定无需回复' : 'No reply needed');
+      }
+    },
+  );
+});
+
+
 describe('one reply card per turn', () => {
   let dir: string;
   let store: TurnReplyCardStore;
@@ -797,6 +830,80 @@ describe('one reply card per turn', () => {
     expect(final.record.finalCard).toContain('![Preview](img_v3_valid)');
   });
 
+  it('persists deliberate silence at the terminal edge and after reopening the record', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    await store.update(key, {
+      kind: 'terminal', phase: 'completed', outputDisposition: 'nothing_to_send', durationMs: 1200,
+    }, io);
+    const reopened = new TurnReplyCardStore(dir);
+    const saved = reopened.read(key)!;
+    expect(saved).toMatchObject({ phase: 'completed', outputDisposition: 'nothing_to_send' });
+    expect(saved.lastCard).toContain('已处理 · 判定无需回复');
+    expect(saved.lastCard).not.toContain('本轮没有提供最终答复');
+    await reopened.update(key, { kind: 'refresh' }, io);
+    expect(reopened.read(key)?.lastCard).toContain('已处理 · 判定无需回复');
+  });
+
+  it('normalizes blank and adjacent duplicate thinking at the store boundary without merging stages', async () => {
+    const same = (id: string, text = '同一段\n  思考') => ({ kind: 'thinking' as const, id, text });
+    await store.update(key, {
+      kind: 'tools', tools: [{ id: 'tool', name: 'Read', subject: 'config.ts' }],
+      activity: [
+        same('blank', ' \n\t '), same('first'), same('adjacent-duplicate', ' 同一段 思考 '),
+        { kind: 'tool', id: 'tool' }, same('after-tool'), { kind: 'progress', id: 'p', text: '进度' },
+        same('after-progress'), { kind: 'ask', id: 'ask' }, same('after-ask'),
+      ],
+    }, io);
+    expect(store.read(key)?.activity).toEqual([
+      same('first'), { kind: 'tool', id: 'tool' }, same('after-tool'),
+      { kind: 'progress', id: 'p', text: '进度' }, same('after-progress'),
+      { kind: 'ask', id: 'ask' }, same('after-ask'),
+    ]);
+  });
+
+  it.each(['none', 'progress', 'ask'] as const)(
+    'deduplicates cumulative CoT snapshots only around persisted stage boundaries (%s)', async stage => {
+      const first: CotEntry[] = [{ kind: 'thinking', text: '同一段\n  思考' }];
+      const second: CotEntry[] = [...first, { kind: 'text', text: ' 同一段 思考 ' }];
+      const publish = (entries: CotEntry[]) => store.update(key, {
+        kind: 'tools', tools: [], activity: publicReplyCardActivity(entries),
+      }, io);
+      await publish(first);
+      if (stage === 'progress') await store.update(key, { kind: 'progress', text: '阶段分隔' }, io);
+      if (stage === 'ask') await store.update(key, { kind: 'ask', entry: nativeAsk('stage-ask') }, io);
+      await publish(second);
+      const saved = store.read(key)!;
+      expect(saved.activity?.map(item => item.kind)).toEqual(
+        stage === 'none' ? ['thinking'] : ['thinking', stage, 'thinking'],
+      );
+      const panel = JSON.parse(saved.lastCard!).body.elements
+        .find((element: any) => element.element_id === 'botmux_turn_process');
+      expect(panel.elements[0].content.match(/💭/g) ?? []).toHaveLength(stage === 'none' ? 1 : 2);
+    },
+  );
+
+  it('deserializes a pre-disposition record and normalizes its legacy activity only for rendering', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    const legacy = store.read(key)!;
+    delete legacy.outputDisposition;
+    legacy.phase = 'completed';
+    legacy.progress = [];
+    legacy.activity = [
+      { kind: 'thinking', id: 'blank', text: ' \n ' },
+      { kind: 'thinking', id: 'first', text: '旧记录中的\n同一段思考' },
+      { kind: 'thinking', id: 'duplicate', text: ' 旧记录中的 同一段思考 ' },
+    ];
+    writeFileSync(join(store.directory, `${store.id(key)}.json`), JSON.stringify(legacy));
+    const restored = new TurnReplyCardStore(dir).read(key)!;
+    expect(restored.outputDisposition).toBeUndefined();
+    expect(restored.activity).toHaveLength(3);
+    const raw = buildTurnReplyCard(restored, presentation);
+    expect(raw).toContain('本轮没有提供最终答复，可查看下方过程记录。');
+    const panel = JSON.parse(raw).body.elements.find((element: any) => element.element_id === 'botmux_turn_process');
+    expect(panel.elements[0].content).toBe('💭 旧记录中的\n同一段思考');
+    expect(panel.elements[0].content).not.toContain('💭 \n');
+  });
+
   it('updates tools, progress and final in the original message, then preserves it for the next turn', async () => {
     const start = await store.update(key, { kind: 'start' }, io);
     await store.update(key, { kind: 'progress', text: '正在检查仓库' }, io);
@@ -1173,6 +1280,38 @@ describe('public process and fallback compatibility', () => {
     const card = JSON.parse(buildTurnReplyCard(record, options));
     return card.body.elements.find((element: any) => element.tag === 'collapsible_panel');
   }
+
+  it('filters blank CoT paragraphs at the public source without losing stage-boundary occurrences', () => {
+    const entries: CotEntry[] = [
+      { kind: 'thinking', text: ' \n\t ' },
+      { kind: 'text', text: '先核对\n  配置' },
+      { kind: 'thinking', text: ' 先核对 配置 ' },
+      { kind: 'tool_call', id: 'read', name: 'Read', args: '{}', subject: 'config.ts' },
+      { kind: 'thinking', text: '先核对 配置' },
+      { kind: 'text', text: '先核对\n配置' },
+    ];
+    expect(publicReplyCardActivity(entries)).toEqual([
+      { kind: 'thinking', id: 'thinking:1', text: '先核对\n  配置' },
+      { kind: 'thinking', id: 'thinking:2', text: ' 先核对 配置 ' },
+      { kind: 'tool', id: 'read' },
+      { kind: 'thinking', id: 'thinking:4', text: '先核对 配置' },
+      { kind: 'thinking', id: 'thinking:5', text: '先核对\n配置' },
+    ]);
+  });
+
+  it('renders old persisted blank and adjacent duplicate thinking once, preserving repeats across tools', () => {
+    const record = processRecord(1, 0);
+    record.activity = [
+      { kind: 'thinking', id: 'blank', text: ' \n ' },
+      { kind: 'thinking', id: 'a', text: '同一\n  思考' },
+      { kind: 'thinking', id: 'b', text: ' 同一 思考 ' },
+      { kind: 'tool', id: 't0' },
+      { kind: 'thinking', id: 'c', text: '同一 思考' },
+    ];
+    const history: string = processPanel(record).elements[0].content;
+    expect(history.match(/💭/g)).toHaveLength(2);
+    expect(history).toBe('💭 同一\n  思考\n🔧 **TOOL_0** ✓\n💭 同一 思考');
+  });
 
   it('keeps the latest nonempty narration outside the collapsed panel after subsequent tool events', () => {
     const record = processRecord(2, 0);

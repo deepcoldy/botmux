@@ -34,6 +34,29 @@ export interface ReplyCardTool { id: string; name: string; subject: string; comp
 export type ReplyCardActivity =
   | { kind: 'thinking' | 'progress'; id: string; text: string }
   | { kind: 'tool' | 'ask'; id: string };
+
+/** Keep source snapshots and legacy persisted activity on the same display
+ * contract. IDs identify source positions, so they cannot deduplicate the same
+ * paragraph emitted at two positions. Only ADJACENT thinking is coalesced:
+ * tools, progress and asks delimit distinct stages and must preserve repeats.
+ * A cumulative CoT snapshot does NOT contain store-only progress/ask entries:
+ * pass dedupeAdjacent=false before the store merge so those stages stay visible
+ * to the full-sequence pass. Blank filtering always applies. */
+export function normalizeReplyCardActivity(activity: readonly ReplyCardActivity[], dedupeAdjacent = true): ReplyCardActivity[] {
+  const normalized: ReplyCardActivity[] = [];
+  const thinkingText = (text: string) => text.trim().replace(/\s+/g, ' ');
+  for (const item of activity) {
+    if (item.kind === 'thinking') {
+      const text = thinkingText(item.text);
+      if (!text) continue;
+      const previous = normalized.at(-1);
+      if (dedupeAdjacent && previous?.kind === 'thinking' && thinkingText(previous.text) === text) continue;
+    }
+    normalized.push(item);
+  }
+  return normalized;
+}
+
 export interface ReplyCardAsk { ask: PendingAsk; result?: AskResult; confirmEmptyArmed?: boolean; runtimeInvalidated?: boolean }
 export interface TurnReplyCardRecord extends TurnReplyCardKey {
   version: 1;
@@ -68,6 +91,10 @@ export interface TurnReplyCardRecord extends TurnReplyCardKey {
   finalCard?: string;
   finalText?: string;
   finalSource?: 'explicit' | 'bridge';
+  /** Worker-declared terminal output semantics. Optional because records written
+   * by older versions have no disposition; only deliberate silence changes the
+   * no-final presentation, while empty/unobserved outcomes keep their warning. */
+  outputDisposition?: 'nothing_to_send' | 'empty_answer' | 'boundary_unobserved' | 'explicit_final_delivered';
   feedback?: { policy: import('./feedback-policy.js').FeedbackPolicy; requesterSubjectId?: string };
   finalDelivered?: boolean;
   /** Persist a provider-confirmed image rejection across publishers/retries. */
@@ -100,7 +127,7 @@ export type TurnReplyCardEvent =
   | { kind: 'progress'; text: string }
   | { kind: 'final'; text: string; card: string; source: 'explicit' | 'bridge'; feedback?: TurnReplyCardRecord['feedback'] }
   | { kind: 'phase'; phase: 'working' | 'waiting' | 'stopping' }
-  | { kind: 'terminal'; phase: 'completed' | 'failed' | 'cancelled' | 'ambiguous' | 'superseded'; notice?: string; durationMs?: number; completedAtMs?: number; disconnected?: boolean; orphanAskIds?: string[] }
+  | { kind: 'terminal'; phase: 'completed' | 'failed' | 'cancelled' | 'ambiguous' | 'superseded'; notice?: string; durationMs?: number; completedAtMs?: number; disconnected?: boolean; orphanAskIds?: string[]; outputDisposition?: TurnReplyCardRecord['outputDisposition'] }
   | { kind: 'display_retired'; notice?: string; silent?: boolean }
   | { kind: 'refresh' }
   /** Set or clear the next-step row; valid after the terminal edge too. */
@@ -290,10 +317,10 @@ export class TurnReplyCardStore {
         }
         return { messageId: record.messageId, delivered: !!record.messageId, card: record.lastCard, record };
       }
-      record.activity ??= [
+      record.activity = normalizeReplyCardActivity(record.activity ?? [
         ...record.progress.map((text, i) => ({ kind: 'progress' as const, id: `progress:${i}`, text })),
         ...record.tools.map(tool => ({ kind: 'tool' as const, id: tool.id })),
-      ];
+      ]);
       const priorOverflowText = record.overflowMessageId ? record.finalText ?? record.progress.join('\n\n') : undefined;
       if (event.kind === 'ask') {
         record.asks ??= [];
@@ -348,6 +375,9 @@ export class TurnReplyCardStore {
             record.activity.push({ kind: 'progress', id: `progress:${record.progress.length - 1}`, text: event.notice });
           }
           record.phase = record.phase === 'stopping' && event.phase === 'completed' ? 'cancelled' : event.phase;
+          if (record.phase === 'completed' && event.outputDisposition !== undefined) {
+            record.outputDisposition = event.outputDisposition;
+          }
           record.durationMs = event.durationMs;
           record.completedAtMs = event.completedAtMs;
           record.disconnected = event.disconnected;
@@ -356,11 +386,12 @@ export class TurnReplyCardStore {
       } else if (!terminal || allowBackgroundTools) {
         if (event.kind === 'tools') {
           record.tools = event.tools;
-          const incoming = event.activity ?? event.tools.map(tool => ({ kind: 'tool' as const, id: tool.id }));
+          const incoming = normalizeReplyCardActivity(event.activity ?? event.tools.map(tool => ({ kind: 'tool' as const, id: tool.id })), false);
           const ids = new Set(record.activity.map(item => `${item.kind}:${item.id}`));
           for (const item of incoming) {
             if (!ids.has(`${item.kind}:${item.id}`)) record.activity.push(item);
           }
+          record.activity = normalizeReplyCardActivity(record.activity);
         } else if (event.kind === 'start' && !record.finalDelivered) {
           record.phase = 'working';
           record.startedAtMs ??= Date.now();
