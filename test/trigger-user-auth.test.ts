@@ -26,7 +26,7 @@ describe('parseTriggerUserAuthConfig', () => {
     for (const settings of [{ enabled: false }, { enabled: true, bytecloudExecution: 'trigger-user' },
       { enabled: true, capabilities: ['lark-user'] }, { enabled: true, tools: ['bytedcli'] }]) {
       const config = parseTriggerUserAuthConfig({ ...settings, bytedcliOperationPolicy });
-      expect(config).toHaveProperty('bytedcliOperationPolicy', bytedcliOperationPolicy);
+      expect(config).toHaveProperty('bytedcliOperationPolicy', { ...bytedcliOperationPolicy, schema: 'botmux.bytedcli-operation-policy.v2' });
       expect(parseTriggerUserAuthConfig(JSON.parse(JSON.stringify(config)))).toEqual(config);
       expect(parseTriggerUserAuthConfig({ ...config, bytedcliOperationPolicy: null }))
         .not.toHaveProperty('bytedcliOperationPolicy');

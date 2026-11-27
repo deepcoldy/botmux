@@ -1,10 +1,10 @@
-# bytedcli 读取用机器身份、写入用执行人身份
+# bytedcli 默认机器读取与触发者写入
 
-这是可选的 ByteCloud 执行模式。默认业务读取由宿主共享账号执行，不要求当前执行人先授权。版本化命令规则可以把读取收紧为执行人身份，或禁用业务命令；业务写入只使用本次执行所归属的已核验真人账号，缺少授权、账号不匹配或权限不足都会拒绝。多人话题里后来到达的消息不会替换正在执行的一轮身份。
+这是可选的 ByteCloud 执行模式。默认业务读取由宿主共享账号执行，不要求当前执行人先授权。版本化命令规则可以要求执行人身份、禁用业务命令，或为已登记写入显式选择机器例外。写入默认使用本次执行所归属的已核验真人账号；宿主明确 actor 或 deny 时，Bot 不能放宽。执行人授权缺失、账号不匹配或权限不足都会拒绝。多人话题里后来到达的消息不会替换正在执行的一轮身份。
 
 ## 配置与启用
 
-在 Dashboard → Bot 配置 → 权限与安全 → 按触发人身份调用 CLI 中，开启总开关、勾选 ByteCloud，再选择“读取使用机器身份，写入使用当前执行人”。等价的 Bot 配置为：
+在 Dashboard → Bot 配置 → 权限与安全 → 按触发人身份调用 CLI 中，开启总开关、勾选 ByteCloud，再选择“默认机器读取、触发者写入，允许显式例外”。等价的 Bot 配置为：
 
 ```json
 {"triggerUserAuth":{"enabled":true,"capabilities":["bytecloud"],"credentialSource":{"bytecloud":"local"},"bytecloudExecution":"read-machine-write-actor"}}
@@ -26,13 +26,13 @@
 
 ## 逐命令规则与宿主限制
 
-选中严格模式后，Dashboard 显示命令的实际效果、宿主规则、Bot 规则和最终状态。读取可选继承、机器身份、执行人身份或禁用；写入只有继承、执行人身份或禁用。规则保存在 Bot 配置中，只有 `enabled`、ByteCloud 和 `read-machine-write-actor` 同时启用时生效；关闭总开关或切回旧模式保留有效规则。
+选中严格模式后，Dashboard 显示命令的实际效果、宿主规则、Bot 规则和最终状态。读取和写入均可选继承、机器身份、执行人身份或禁用。写入默认触发者；最终身份为机器时，界面显示“机器写入例外”，实际效果仍显示写入。规则保存在 Bot 配置中，只有 `enabled`、ByteCloud 和 `read-machine-write-actor` 同时启用时生效；关闭总开关或切回旧模式保留有效规则。
 
 宿主管理员通过固定文件 `~/.botmux/host-authority/bytedcli-broker/policy/operation-policy.json` 设置全局规则。文件缺失时沿用审核默认；不从 Agent 参数、环境或请求选择路径。目录须为当前宿主用户所有、权限 `0700`，文件为 `0600` 的单链接普通文件，禁止软链、特殊文件及超过 32 KiB 的 UTF-8 JSON。全局文件示例：
 
 ```json
 {
-  "schema": "botmux.bytedcli-operation-policy.v1",
+  "schema": "botmux.bytedcli-operation-policy.v2",
   "cliVersion": "0.199.0",
   "catalogVersion": "2026-11-26.1",
   "rules": { "codebase.mr.list": "actor", "codebase.mr.close": "deny" }
@@ -49,16 +49,18 @@ Bot 使用同一种版本化对象，例如：
     "bytecloudExecution": "read-machine-write-actor",
     "credentialSource": { "bytecloud": "local" },
     "bytedcliOperationPolicy": {
-      "schema": "botmux.bytedcli-operation-policy.v1",
+      "schema": "botmux.bytedcli-operation-policy.v2",
       "cliVersion": "0.199.0",
       "catalogVersion": "2026-11-26.1",
-      "rules": { "codebase.mr.list": "actor", "bits.develop.list": "deny" }
+      "rules": { "codebase.mr.list": "actor", "codebase.mr.reopen": "machine", "bits.develop.list": "deny" }
     }
   }
 }
 ```
 
-规则使用[审核表](bytedcli-operation-audit.md)中的规范 operationId。`codebase pr list` 等别名先归一化为同一个 ID，再应用规则。省略某项表示继承，`machine` 只允许真实读取，`actor` 允许读取或写入，`deny` 禁用调用。按审核默认 → 宿主 → Bot 合成，禁用优先于执行人，执行人优先于机器。Bot 的机器读取不能覆盖宿主的执行人规则，也不能解除宿主禁用。未知 ID、错误版本或字段、写入选机器都会原子拒绝，原配置不变。
+规则使用[审核表](bytedcli-operation-audit.md)中的规范 operationId。`codebase pr list` 等别名先归一化为同一个 ID，再应用规则。省略某项表示继承，`machine`、`actor` 均允许真实读取或写入，`deny` 禁用调用。两层规则中任一 deny 都禁用；任一显式 actor 都优先于 machine；显式 machine 可覆盖默认写入身份。没有身份规则时，read 默认 machine，write 默认 actor。Bot 的机器规则不能覆盖宿主明确 actor 或 deny。未知 ID、错误版本或字段会原子拒绝，原配置不变。
+
+当前 policy 与 status schema 都是 v2，CLI/catalog 版本仍为 `0.199.0` / `2026-11-26.1`。合法旧 `botmux.bytedcli-operation-policy.v1` 对象先按旧合同严格校验，再规范化为 v2；旧 v1 的 machine write 仍拒绝。Dashboard 只接受 v2 status；面对旧 daemon 禁止保存命令规则，仍允许紧急关闭模式。
 
 现有 PUT `/api/bots/:app/trigger-user-auth` 保存完整对象；旧客户端省略 `bytedcliOperationPolicy` 时保留已存规则，显式 `bytedcliOperationPolicy:null` 清除 Bot 规则并恢复继承。整份 `triggerUserAuth:null` 仍清除全部鉴权配置。源选择、owner、委托、git 等字段随保存保留。
 
@@ -66,7 +68,7 @@ Bot 使用同一种版本化对象，例如：
 
 命令策略摘要由已有 GET `/api/bots/:app/trigger-user-auth-status` 从实际冻结的宿主 reader 投影，返回版本、全局规则及修订、Bot 规则与最终效果/身份。该摘要不查询个人授权、不开始登录、不返回凭据或原始宿主路径；带 `openId` 的既有个人授权状态查询保留原合同。界面用同一审核 resolver 合成当前 Bot 编辑。宿主无兼容版本化状态时显示不可用并禁止保存命令规则，须更新宿主后刷新；全局配置无效时显示明确错误并拒绝严格调用，仍可关闭模式。点击“刷新宿主规则”获取热更新后的展示状态。
 
-![真实命令策略界面，临时 HOME 与假数据](assets/bytedcli-read-write-identity/command-policies.png)
+![v2 机器写入例外与宿主 actor 限制，真实 Chromium、临时 HOME 和假数据](assets/bytedcli-read-write-identity/machine-write-exceptions.png)
 
 读取改为执行人身份后，仍按读取额度与结果语义处理，不写业务 intent，不产生写入未知结果；但必须有当前已核验真人的个人授权、正式账号匹配及相应委托/定时任务权限。授权缺失或账号不匹配时拒绝，不退回共享账号。auth/help 不属于业务规则，保留专用个人控制边界；help 同样显示当前有效业务策略，不触发个人授权查询。
 
@@ -97,7 +99,7 @@ bytedcli 的只读边界包括祖先 `node_modules` 搜索路径、兄弟/提升
 | 类型 | 命令 |
 | --- | --- |
 | 默认机器读取 | `codebase repo get/view/list`；`codebase mr get/view/list/count/diff/files/status` |
-| 执行人写入 | `codebase mr create/update/edit/close/reopen` |
+| 默认执行人写入，可显式机器例外 | `codebase mr create/update/edit/close/reopen` |
 | 默认机器读取 | `bits develop list`；`log search-log-matchers`（仅 console 输出） |
 | 宿主安全说明 | 根或上述命令/分组的 `--help`；根 `--version`；下述个人 auth 适配器 |
 
@@ -122,7 +124,7 @@ MR 操作须显式提供仓库，不从 Agent cwd 推断。`--body-file` / `-F` 
 
 ## 写入结果与审计
 
-写入前必须先 fsync 宿主 intent，完成后记录结果；审计只保留结构化元数据和摘要，不落完整 body 或 token。排队、取票、派发和返回时都重新检查执行与授权。写入已派发但响应丢失、撤权、超时或结果落盘失败，返回 `write_outcome_unknown` 和 request ID。客户端不会自动重试；先核对上游状态再由真人决定下一步。
+写入无论执行身份均须先 fsync 宿主 intent，完成后记录结果；审计通过 source 与账号摘要记录实际机器/个人身份，只保留结构化元数据和摘要，不落完整 body 或 token。机器写入仍按写入额度和防重放处理，且执行器要求宿主冻结的、由当前 parser 生成的有效 policy 明确选中 machine；单独传入 executionIdentity=machine 不能授权写入。排队、取票、派发和返回时都重新检查执行与授权。写入已派发但响应丢失、撤权、超时或结果落盘失败，返回 `write_outcome_unknown` 和 request ID。客户端不会自动重试；先核对上游状态再由真人决定下一步。
 
 审计根为 `~/.botmux/host-authority/bytedcli-broker/audit`。新记录写入私有 `records/<UUID>.pending`，完整写入和文件 fsync 后原子发布为 `<UUID>.json`，目录 fsync 成功才确认 intent。多个 daemon 各自发布独立记录；按 daemonBootId、sessionId、generation、turnId、requestId 关联 intent/result，不依赖目录顺序。旧 `audit.jsonl` 原样保留供历史核对；不再续写或截断它。失败留下的 `.pending` 只能用于排查，不能当成已确认 intent；由管理员核对存储恢复和上游结果后归档，broker 不自动删除或重跑。短写、ENOSPC 或 fsync 失败时，本次派发拒绝，恢复后新记录仍有独立、可解析的持久边界。
 

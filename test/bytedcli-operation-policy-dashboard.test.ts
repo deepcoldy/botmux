@@ -31,15 +31,19 @@ async function panel(initial:any, status:any) {
   const control=(action:string)=>renderer.root.findByProps({'data-action':action});
   return {requests,renderer,control,close:async()=>{await act(async()=>renderer.unmount());}};
 }
-it('command controls expose true effect and the global floor; writes cannot select machine',async()=>{
+it('command controls expose true effect and the global floor; writes expose explicit machine exceptions',async()=>{
  const p=await panel(full,summary());try{
   const read=p.control('bytedcli-policy-codebase.mr.list');expect(read.props.value).toBe('machine');
   expect(p.control('bytedcli-effective-codebase.mr.list').props['data-identity']).toBe('actor');
   expect(p.control('bytedcli-effective-codebase.repo.list').props['data-enabled']).toBe(false);
-  const write=p.control('bytedcli-policy-codebase.mr.close');expect(write.findAllByType('option').map(o=>o.props.value)).toEqual(['','actor','deny']);
+  const write=p.control('bytedcli-policy-codebase.mr.close');expect(write.findAllByType('option').map(o=>o.props.value)).toEqual(['','machine','actor','deny']);
   expect(p.control('bytedcli-effect-codebase.mr.close').props['data-effect']).toBe('write');
+  await act(async()=>write.props.onChange({currentTarget:{value:'machine'}}));
+  expect(p.requests.at(-1).bytedcliOperationPolicy).toEqual(config({'codebase.mr.list':'machine','codebase.mr.close':'machine'}));
+  expect(p.control('bytedcli-effective-codebase.mr.close').props['data-identity']).toBe('machine');
+  expect(p.control('bytedcli-machine-exception-codebase.mr.close').children.join('')).toMatch(/机器|Machine/);
   await act(async()=>read.props.onChange({currentTarget:{value:'actor'}}));
-  expect(p.requests.at(-1)).toMatchObject({...full,bytedcliOperationPolicy:config({'codebase.mr.list':'actor','codebase.mr.close':'deny'})});
+  expect(p.requests.at(-1)).toMatchObject({...full,bytedcliOperationPolicy:config({'codebase.mr.list':'actor','codebase.mr.close':'machine'})});
   await act(async()=>p.control('bytedcli-policy-codebase.mr.close').props.onChange({currentTarget:{value:''}}));
   expect(p.requests.at(-1).bytedcliOperationPolicy.rules).toEqual({'codebase.mr.list':'actor'});
   await act(async()=>p.control('trigger-user-auth-source-default').props.onChange({currentTarget:{value:'platform'}}));
@@ -65,7 +69,7 @@ it('unselected ByteCloud keeps command preview inactive and selecting it loads t
   expect(p.control('bytedcli-effective-codebase.mr.list').props['data-identity']).toBe('actor');
  }finally{await p.close();}
 });
-it.each([{label:'old daemon',status:undefined},{label:'unknown catalog',status:{...summary(),catalogVersion:'old'}},{label:'invalid global',status:{...summary(),global:{state:'invalid',revision:'invalid',errorCode:'operation_policy_invalid'}}}])('unavailable or invalid host state blocks rule saves but permits emergency disable ($label)',async ({status})=>{
+it.each([{label:'old daemon',status:undefined},{label:'v1 daemon',status:{...summary(),schema:'botmux.bytedcli-operation-policy-status.v1'}},{label:'unknown catalog',status:{...summary(),catalogVersion:'old'}},{label:'invalid global',status:{...summary(),global:{state:'invalid',revision:'invalid',errorCode:'operation_policy_invalid'}}}])('unavailable or invalid host state blocks rule saves but permits emergency disable ($label)',async ({status})=>{
  const p=await panel(full,status);try{
   const select=p.control('bytedcli-policy-codebase.mr.list');expect(select.props.disabled).toBe(true);
   await act(async()=>select.props.onChange({currentTarget:{value:'deny'}}));expect(p.requests).toEqual([]);
@@ -111,7 +115,7 @@ it('legacy HTTP status does not initialize host policy files; selected dormant s
  }finally{cfg.triggerUserAuth=original;}
 });
 it('status shares the trusted runtime root, projects restrictions and sanitizes invalid host configuration',async()=>{
- const first=(await get()).bytedcliOperationPolicy;expect(first).toMatchObject({schema:'botmux.bytedcli-operation-policy-status.v1',global:{state:'default'},botRules:{'codebase.mr.close':'deny'}});
+ const first=(await get()).bytedcliOperationPolicy;expect(first).toMatchObject({schema:'botmux.bytedcli-operation-policy-status.v2',global:{state:'default'},botRules:{'codebase.mr.close':'deny'}});
  writeFileSync(policyFile,JSON.stringify(config({'codebase.mr.list':'actor','codebase.repo.list':'deny'})),{mode:0o600});
  const second=(await get()).bytedcliOperationPolicy;expect(second.global.revision).not.toBe(first.global.revision);
  expect(second.effectiveEntries.find((r:any)=>r.operationId==='codebase.mr.list')).toMatchObject({effect:'read',enabled:true,identity:'actor'});
@@ -126,8 +130,25 @@ it('actual old-client updates retain rules; explicit null clears, and invalid po
  const stored=()=>JSON.parse(readFileSync(botsFile,'utf8'))[0].triggerUserAuth;
  expect((await put({enabled:false,bytedcliOperationPolicy:full.bytedcliOperationPolicy})).status).toBe(200);
  expect((await put({gitCommitIdentity:false})).status).toBe(200);expect(stored().bytedcliOperationPolicy).toEqual(full.bytedcliOperationPolicy);
- for(const bad of [config({'unknown.read':'actor'}),{...config({}),catalogVersion:'bad'},config({'codebase.mr.close':'machine'})]){
+ for(const bad of [config({'unknown.read':'actor'}),{...config({}),catalogVersion:'bad'},{...config({'codebase.mr.close':'machine'}),schema:'botmux.bytedcli-operation-policy.v1'}]){
   const before=readFileSync(botsFile,'utf8');expect((await put({bytedcliOperationPolicy:bad})).status).toBe(400);expect(readFileSync(botsFile,'utf8')).toBe(before);
  }
  expect((await put({bytedcliOperationPolicy:null})).status).toBe(200);expect(stored()).not.toHaveProperty('bytedcliOperationPolicy');expect(stored()).toMatchObject({enabled:false,allowOwnerActor:true,dispatchOnly:full.dispatchOnly});
+});
+
+it('writes saved by the real HTTP route keep machine effect and migrate valid legacy rules atomically',async()=>{
+ expect((await put({bytedcliOperationPolicy:config({'codebase.mr.close':'machine'})})).status).toBe(200);
+ const machine=(await get()).bytedcliOperationPolicy;
+ expect(machine.effectiveEntries.find((row:any)=>row.operationId==='codebase.mr.close')).toMatchObject({effect:'write',identity:'machine',enabled:true});
+ const legacy={...config({'codebase.mr.close':'actor','codebase.mr.list':'machine'}),schema:'botmux.bytedcli-operation-policy.v1'};
+ expect((await put({bytedcliOperationPolicy:legacy})).status).toBe(200);
+ expect(JSON.parse(readFileSync(botsFile,'utf8'))[0].triggerUserAuth.bytedcliOperationPolicy).toEqual(config(legacy.rules));
+});
+it('global actor floors remain visible when a write row saves machine',async()=>{
+ const p=await panel(full,summary(full,{'codebase.mr.close':'actor'}));try{
+  await act(async()=>p.control('bytedcli-policy-codebase.mr.close').props.onChange({currentTarget:{value:'machine'}}));
+  expect(p.requests.at(-1).bytedcliOperationPolicy.rules['codebase.mr.close']).toBe('machine');
+  expect(p.control('bytedcli-effective-codebase.mr.close').props['data-identity']).toBe('actor');
+  expect(p.renderer.root.findAllByProps({'data-action':'bytedcli-machine-exception-codebase.mr.close'})).toHaveLength(0);
+ }finally{await p.close();}
 });

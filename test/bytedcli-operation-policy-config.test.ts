@@ -9,6 +9,7 @@ import { BYTEDCLI_OPERATION_CATALOG, BYTEDCLI_OPERATION_GRAMMAR } from '../src/c
 import { parseBytedcliOperation } from '../src/core/bytedcli-operation-policy.js';
 
 const base = { schema: 'botmux.bytedcli-operation-policy.v1', cliVersion: '0.199.0', catalogVersion: '2026-11-26.1' };
+const v2 = (rules: Record<string, unknown>) => parseBytedcliOperationPolicy({ ...base, schema: 'botmux.bytedcli-operation-policy.v2', rules });
 const policy = (rules: Record<string, unknown>) => parseBytedcliOperationPolicy({ ...base, rules });
 
 describe('versioned bytedcli operation policy', () => {
@@ -16,7 +17,7 @@ describe('versioned bytedcli operation policy', () => {
     const raw = { ...base, rules: { 'codebase.mr.list': 'actor', 'codebase.mr.close': 'deny' } };
     const parsed = parseBytedcliOperationPolicy(raw)!;
     raw.rules['codebase.mr.list'] = 'machine';
-    expect(parsed).toEqual({ ...base, rules: { 'codebase.mr.close': 'deny', 'codebase.mr.list': 'actor' } });
+    expect(parsed).toEqual({ ...base, schema: 'botmux.bytedcli-operation-policy.v2', rules: { 'codebase.mr.close': 'deny', 'codebase.mr.list': 'actor' } });
     expect(parsed.schema).toBe(BYTEDCLI_OPERATION_POLICY_SCHEMA);
     expect(Object.keys(parsed.rules)).toEqual(['codebase.mr.close', 'codebase.mr.list']);
     expect(Object.isFrozen(parsed)).toBe(true);
@@ -28,10 +29,22 @@ describe('versioned bytedcli operation policy', () => {
   it('clears optional config only on absent or null input and accepts explicit inheritance', () => {
     expect(parseBytedcliOperationPolicy(undefined)).toBeUndefined();
     expect(parseBytedcliOperationPolicy(null)).toBeUndefined();
-    expect(policy({})).toEqual({ ...base, rules: {} });
+    expect(policy({})).toEqual({ ...base, schema: 'botmux.bytedcli-operation-policy.v2', rules: {} });
   });
 
-  it('rejects machine identity for every write even before policies are composed', () => {
+  it('lets explicit v2 machine rules override write defaults while preserving actor floors and denial', () => {
+    const close = 'codebase.mr.close';
+    expect(resolveBytedcliOperationRule(close)).toMatchObject({ effect: 'write', enabled: true, identity: 'actor' });
+    expect(resolveBytedcliOperationRule(close, undefined, v2({ [close]: 'machine' })))
+      .toEqual({ operationId: close, effect: 'write', enabled: true, identity: 'machine' });
+    expect(resolveBytedcliOperationRule(close, v2({ [close]: 'machine' }))).toMatchObject({ identity: 'machine' });
+    expect(resolveBytedcliOperationRule(close, v2({ [close]: 'actor' }), v2({ [close]: 'machine' }))).toMatchObject({ identity: 'actor' });
+    expect(resolveBytedcliOperationRule(close, v2({ [close]: 'machine' }), v2({ [close]: 'actor' }))).toMatchObject({ identity: 'actor' });
+    expect(resolveBytedcliOperationRule(close, v2({ [close]: 'deny' }), v2({ [close]: 'machine' }))).toMatchObject({ enabled: false });
+    expect(resolveBytedcliOperationRule(close, v2({ [close]: 'machine' }), v2({ [close]: 'deny' }))).toMatchObject({ enabled: false });
+  });
+
+  it('rejects machine identity for every legacy v1 write before migration', () => {
     for (const operationId of ['codebase.mr.create', 'codebase.mr.update', 'codebase.mr.close', 'codebase.mr.reopen']) {
       expect(() => policy({ [operationId]: 'machine' })).toThrow();
       expect(policy({ [operationId]: 'actor' })?.rules[operationId]).toBe('actor');

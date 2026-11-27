@@ -14,7 +14,7 @@ import { readProcessStartIdentity } from '../src/utils/process-identity.js';
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0)) await cleanup(); });
 const empty = { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), exitCode: 0 };
-const config = (rules: Record<string, string> = {}) => ({ schema: 'botmux.bytedcli-operation-policy.v1', cliVersion: '0.199.0', catalogVersion: '2026-11-26.1', rules });
+const config = (rules: Record<string, string> = {}) => ({ schema: 'botmux.bytedcli-operation-policy.v2', cliVersion: '0.199.0', catalogVersion: '2026-11-26.1', rules });
 const read = () => parseBytedcliOperation(['codebase', 'mr', 'list', '--repo', 'org/repo']);
 const write = () => parseBytedcliOperation(['codebase', 'mr', 'close', '1', '--repo', 'org/repo']);
 function deferred() { let release!: () => void; const promise = new Promise<void>(r => release = r); return { promise, release }; }
@@ -50,6 +50,14 @@ describe('hot host policy through real authority, credentials and executor', () 
  it('default reads tolerate request staging without policy churn and touch machine only',async()=>{
   const s=await setup();s.grant(false);const before=s.reader();expect((await s.execute()).outcome).toBe('completed');
   expect(s.dispatches).toEqual(['machine']);expect(s.minted).toEqual(['machine']);expect(s.identityLookups()).toBe(0);expect(s.reader().revision).toBe(before.revision);
+ });
+ it.each(['global','bot'])('explicit %s machine write never looks up actor or personal grant and reverting restores actor gates',async layer=>{
+  const s=await setup();s.grant(false);
+  (layer==='global'?s.setGlobal:s.setBot)({'codebase.mr.close':'machine'});
+  const result=await s.execute(write());expect(result).toMatchObject({outcome:'completed',effectiveIdentity:{kind:'machine'}});
+  expect(s.identityLookups()).toBe(0);expect(s.minted).toEqual(['machine']);expect(s.dispatches).toEqual(['machine']);
+  expect(s.audit.map(row=>[row.phase,row.effect,row.source])).toEqual([['intent','write','machine'],['result','write','machine']]);
+  s.setGlobal({'codebase.mr.close':'actor'});expect((await s.execute(write(),'actor-restored')).errorCode).toBe('actor_auth_required');expect(s.identityLookups()).toBe(1);expect(s.dispatches).toEqual(['machine']);
  });
  it('actor-read uses the officially matched personal grant and cannot fall back',async()=>{
   const s=await setup();s.setGlobal({'codebase.mr.list':'actor'});const result=await s.execute();expect(result.outcome).toBe('completed');

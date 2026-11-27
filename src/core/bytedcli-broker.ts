@@ -3,7 +3,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { BYTEDCLI_EXEC_LIMITS, BYTEDCLI_EXEC_SCHEMA, BYTEDCLI_EXEC_ERROR_CODES, parseBytedcliExecRequest,
-  type BytedcliExecErrorCode, type BytedcliExecResponse } from '../cli/bytedcli-exec-protocol.js';
+  type BytedcliExecErrorCode, type BytedcliExecResponse, type BytedcliEffectiveIdentity } from '../cli/bytedcli-exec-protocol.js';
 import { parseBytedcliOperation, BytedcliOperationPolicyError } from './bytedcli-operation-policy.js';
 import { resolveLoopbackPeerProcesses } from './current-actor-attestation.js';
 import type { BytedcliAuthorityResult, BytedcliAuthorityRequestContext } from './bytedcli-broker-authority.js';
@@ -95,11 +95,12 @@ export class BytedcliBroker {
     const controller=owner.controller;
     let deadline=false,submitted=false,write=false;
     let executorOutcome:BytedcliExecResponse['outcome']|undefined;
+    let effectiveIdentity:BytedcliEffectiveIdentity={kind:'none'};
     let requestId='unparsed',operationId='unparsed';
     const unsafeWrite=()=>submitted&&write&&executorOutcome!=='rejected';
     const failed=(code:BytedcliExecErrorCode):BytedcliExecResponse=>{
       const rejected=refusal(code,requestId,operationId);
-      return unsafeWrite()?{...rejected,effectiveIdentity:{kind:'actor'},outcome:'write_outcome_unknown',errorCode:'write_outcome_unknown'}:rejected;
+      return unsafeWrite()?{...rejected,effectiveIdentity,outcome:'write_outcome_unknown',errorCode:'write_outcome_unknown'}:rejected;
     };
     const abort=()=>controller.abort();
     const responseClosed=()=>{if(!res.writableFinished)abort();};
@@ -127,11 +128,13 @@ export class BytedcliBroker {
       // Keep the preauth slot until safe adapter provider work settles. Business
       // operations transfer ownership to the executor's bounded queue instead.
       if (!safe) { this.preauth--;preauthHeld=false; }
+      effectiveIdentity={kind:result.authority.executionIdentity??(operation.effect==='read'?'machine':'actor')};
       submitted=!safe;
       const execution = {requestId,operation,authority:result.authority,signal:controller.signal};
       const response=safe ? await runBytedcliSafeCommand(execution,this.deps.personalLeases)
         : await this.deps.executor.execute(execution);
       executorOutcome=response.outcome;
+      effectiveIdentity=response.effectiveIdentity;
       // A refusal/unknown result releases no business data or authority. Do
       // not start another delegated verifier after its executor deadline;
       // successful results still require the frozen result-authority check.

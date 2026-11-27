@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BytedcliExecutor } from '../src/core/bytedcli-executor.js';
 import { parseBytedcliOperation } from '../src/core/bytedcli-operation-policy.js';
+import { parseBytedcliOperationPolicy } from '../src/core/bytedcli-operation-policy-config.js';
 import { parseBytedcliExecResponse } from '../src/cli/bytedcli-exec-protocol.js';
 
 const roots: string[] = [];
@@ -29,7 +30,50 @@ function setup(options: Record<string, any> = {}) {
   const request = (operation = read(), requestId = 'request', extra: Record<string, any> = {}) => ({ operation, requestId, authority, ...extra });
   return { executor, request, dispatches, audit, providers, root, authority };
 }
+const machinePolicy = () => Object.freeze({ globalRevision: 'explicit', botPolicy: parseBytedcliOperationPolicy({
+  schema: 'botmux.bytedcli-operation-policy.v2', cliVersion: '0.199.0', catalogVersion: '2026-11-26.1', rules: { 'codebase.mr.close': 'machine' },
+}) });
+const machineAuthority = (authority: any) => ({ ...authority, actor: undefined, executionIdentity: 'machine', operationPolicy: machinePolicy() });
 describe('bounded host business execution', () => {
+  it('explicit parsed machine writes use only machine leases and retain intent, result and replay', async () => {
+    const s = setup(), authority = machineAuthority(s.authority);
+    const request = s.request(write(), 'machine-write', { authority });
+    const result = await s.executor.execute(request);
+    expect(parseBytedcliExecResponse(result)).toMatchObject({ outcome: 'completed', effectiveIdentity: { kind: 'machine' } });
+    expect(s.providers).toEqual(['machine']); expect(s.dispatches).toHaveLength(1);
+    expect(s.audit.map(row => [row.phase, row.effect, row.source])).toEqual([['intent', 'write', 'machine'], ['result', 'write', 'machine']]);
+    expect(await s.executor.execute(request)).toEqual(result); expect(s.dispatches).toHaveLength(1);
+    expect(await s.executor.execute({ ...request, authority: { ...s.authority, policyFingerprint: 'changed', executionIdentity: 'actor' } }))
+      .toMatchObject({ outcome: 'write_outcome_unknown', effectiveIdentity: { kind: 'machine' } });
+    expect(s.dispatches).toHaveLength(1);
+  });
+  it.each(['absent', 'unfrozen', 'unparsed', 'inherited', 'actor-floor', 'denied'])('refuses machine write with %s policy proof before leasing', async proof => {
+    const s = setup(), parsed = machinePolicy();
+    const operationPolicy = proof === 'absent' ? undefined : proof === 'unfrozen' ? { ...parsed }
+      : proof === 'unparsed' ? Object.freeze({ ...parsed, botPolicy: Object.freeze({ ...parsed.botPolicy }) })
+      : proof === 'inherited' ? Object.freeze({ globalRevision: 'default' })
+      : Object.freeze({ ...parsed, globalPolicy: parseBytedcliOperationPolicy({ ...parsed.botPolicy, rules: { 'codebase.mr.close': proof === 'denied' ? 'deny' : 'actor' } }) });
+    const result = await s.executor.execute(s.request(write(), proof, { authority: { ...s.authority, executionIdentity: 'machine', operationPolicy } }));
+    expect(result.errorCode).toBe('actor_required'); expect(s.providers).toEqual([]); expect(s.dispatches).toEqual([]);
+  });
+  it.each(['intent', 'result'])('retains durable %s failure behavior for machine writes', async phase => {
+    const s = setup({ auditFails: phase });
+    const result = await s.executor.execute(s.request(write(), phase, { authority: machineAuthority(s.authority) }));
+    expect(parseBytedcliExecResponse(result)).toMatchObject({ outcome: phase === 'intent' ? 'rejected' : 'write_outcome_unknown',
+      errorCode: phase === 'intent' ? 'audit_unavailable' : 'write_outcome_unknown', effectiveIdentity: { kind: 'machine' } });
+    expect(s.providers).toEqual(['machine']); expect(s.dispatches).toHaveLength(phase === 'intent' ? 0 : 1);
+  });
+  it('machine writes retain the one-write-per-session quota while a second request waits', async () => {
+    let release!: () => void, started!: () => void;
+    const gate = new Promise<void>(resolve => release = resolve), entered = new Promise<void>(resolve => started = resolve);
+    const s = setup({ run: async () => { started(); await gate; return { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), exitCode: 0 }; } });
+    const authority = machineAuthority(s.authority);
+    const first = s.executor.execute(s.request(write(), 'first-machine', { authority })); await entered;
+    const controller = new AbortController();
+    const second = s.executor.execute(s.request(write(), 'second-machine', { authority, signal: controller.signal }));
+    controller.abort(); expect((await second).errorCode).toBe('cancelled'); expect(s.providers).toEqual(['machine']);
+    release(); expect((await first).outcome).toBe('completed'); expect(s.dispatches).toHaveLength(1);
+  });
   it('reads with only the machine lease even when the actor has no auth', async () => {
     const s = setup(); delete (s.authority as any).actor;
     const result = await s.executor.execute(s.request());

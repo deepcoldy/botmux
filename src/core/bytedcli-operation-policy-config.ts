@@ -2,7 +2,7 @@ import {
   BYTEDCLI_AUDITED_RELEASE, BYTEDCLI_OPERATION_CATALOG_VERSION, BYTEDCLI_OPERATION_CATALOG,
 } from './bytedcli-operation-catalog.js';
 
-export const BYTEDCLI_OPERATION_POLICY_SCHEMA = 'botmux.bytedcli-operation-policy.v1' as const;
+export const BYTEDCLI_OPERATION_POLICY_SCHEMA = 'botmux.bytedcli-operation-policy.v2' as const;
 export type BytedcliOperationRule = 'machine' | 'actor' | 'deny';
 export interface BytedcliOperationPolicy {
   readonly schema: typeof BYTEDCLI_OPERATION_POLICY_SCHEMA;
@@ -26,6 +26,11 @@ function record(raw: unknown): Record<string, unknown> {
   })) invalid();
   return raw as Record<string, unknown>;
 }
+const parsedPolicies = new WeakSet<object>();
+/** Only parser-issued immutable policies prove explicit host-selected authority. */
+export function isParsedBytedcliOperationPolicy(policy: unknown): policy is BytedcliOperationPolicy {
+  return !!policy && typeof policy === 'object' && parsedPolicies.has(policy);
+}
 const businessOperations = new Map(BYTEDCLI_OPERATION_CATALOG
   .filter(entry => entry.effect === 'read' || entry.effect === 'write').map(entry => [entry.id, entry]));
 
@@ -35,7 +40,7 @@ export function parseBytedcliOperationPolicy(raw: unknown): BytedcliOperationPol
   const rec = record(raw);
   const keys = ['schema', 'cliVersion', 'catalogVersion', 'rules'];
   if (Object.keys(rec).length !== keys.length || keys.some(key => !Object.hasOwn(rec, key))
-    || rec.schema !== BYTEDCLI_OPERATION_POLICY_SCHEMA || rec.cliVersion !== BYTEDCLI_AUDITED_RELEASE
+    || ![BYTEDCLI_OPERATION_POLICY_SCHEMA, 'botmux.bytedcli-operation-policy.v1'].includes(rec.schema as string) || rec.cliVersion !== BYTEDCLI_AUDITED_RELEASE
     || rec.catalogVersion !== BYTEDCLI_OPERATION_CATALOG_VERSION) invalid();
   const rawRules = record(rec.rules);
   const operationIds = Object.keys(rawRules).sort();
@@ -45,14 +50,16 @@ export function parseBytedcliOperationPolicy(raw: unknown): BytedcliOperationPol
     const operation = businessOperations.get(operationId);
     const rule = rawRules[operationId];
     if (!operation || typeof rule !== 'string' || !['machine', 'actor', 'deny'].includes(rule)
-      || (operation.effect === 'write' && rule === 'machine')) invalid();
+      || (rec.schema === 'botmux.bytedcli-operation-policy.v1' && operation.effect === 'write' && rule === 'machine')) invalid();
     rules[operationId] = rule as BytedcliOperationRule;
   }
-  return Object.freeze({ schema: BYTEDCLI_OPERATION_POLICY_SCHEMA, cliVersion: BYTEDCLI_AUDITED_RELEASE,
+  const policy = Object.freeze({ schema: BYTEDCLI_OPERATION_POLICY_SCHEMA, cliVersion: BYTEDCLI_AUDITED_RELEASE,
     catalogVersion: BYTEDCLI_OPERATION_CATALOG_VERSION, rules: Object.freeze(rules) });
+  parsedPolicies.add(policy);
+  return policy;
 }
 
-/** Deny > actor > machine. Neither a Bot nor the host can weaken the audited default. */
+/** Explicit deny > actor > machine. Audited defaults apply only without identity rules. */
 export function resolveBytedcliOperationRule(
   operationId: string, globalPolicy?: BytedcliOperationPolicy, botPolicy?: BytedcliOperationPolicy,
 ): { readonly operationId: string; readonly effect: 'read' | 'write'; readonly enabled: boolean; readonly identity: 'machine' | 'actor' } {
@@ -61,10 +68,12 @@ export function resolveBytedcliOperationRule(
   const globalRule = globalPolicy?.rules[operationId];
   const botRule = botPolicy?.rules[operationId];
   return Object.freeze({ operationId, effect: operation.effect, enabled: globalRule !== 'deny' && botRule !== 'deny',
-    identity: operation.effect === 'write' || globalRule === 'actor' || botRule === 'actor' ? 'actor' : 'machine' });
+    identity: globalRule === 'actor' || botRule === 'actor' ? 'actor'
+      : globalRule === 'machine' || botRule === 'machine' ? 'machine'
+      : operation.effect === 'read' ? 'machine' : 'actor' });
 }
 
-export const BYTEDCLI_OPERATION_POLICY_STATUS_SCHEMA = 'botmux.bytedcli-operation-policy-status.v1' as const;
+export const BYTEDCLI_OPERATION_POLICY_STATUS_SCHEMA = 'botmux.bytedcli-operation-policy-status.v2' as const;
 export interface BytedcliOperationPolicyStatus {
   readonly schema: typeof BYTEDCLI_OPERATION_POLICY_STATUS_SCHEMA;
   readonly cliVersion: typeof BYTEDCLI_AUDITED_RELEASE;

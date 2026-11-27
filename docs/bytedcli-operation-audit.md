@@ -6,9 +6,9 @@
 
 随 Botmux 发布的 `src/core/bytedcli-operation-catalog.json` 是审核数据，包含 release/catalog 版本、规范 ID、命令路径与别名、真实效果和封闭参数 grammar；纯 TypeScript loader 验证并冻结整份目录。新增命令、选项或改变效果必须重新审核实际 handler/service/API 链，更新该文件与行为测试，再发布新版本。宿主规则文件和 Bot 配置不能加载外部目录、登记未审核 ID、改变 read/write 效果或绕过参数重建。
 
-运行规则采用 `botmux.bytedcli-operation-policy.v1`、CLI `0.199.0`、catalog `2026-11-26.1`。宿主固定文件为 `~/.botmux/host-authority/bytedcli-broker/policy/operation-policy.json`；Bot 为 `triggerUserAuth.bytedcliOperationPolicy`。二者使用规范 ID 的 `machine` / `actor` / `deny` 映射，缺项继承。`machine` 仅用于真实读取；写入始终执行人；禁用优先，Bot 只能进一步收紧宿主。所有已登记别名继承同一规范 ID 的规则。auth/help 保留专用适配器与个人控制边界。
+运行规则采用 `botmux.bytedcli-operation-policy.v2`、CLI `0.199.0`、catalog `2026-11-26.1`。宿主固定文件为 `~/.botmux/host-authority/bytedcli-broker/policy/operation-policy.json`；Bot 为 `triggerUserAuth.bytedcliOperationPolicy`。二者使用规范 ID 的 `machine` / `actor` / `deny` 映射，缺项继承。read 默认 machine，write 默认 actor；v2 的显式 `machine` 可选择机器写入例外。任一 deny 禁用，任一明确 actor 优先于 machine；Bot 不能覆盖宿主明确 actor/deny，默认写身份不作为明确宿主限制。合法旧 v1 按旧合同校验后迁移为 v2，v1 machine write 仍拒绝。状态 schema 同样为 v2。所有已登记别名继承同一规范 ID 的规则。auth/help 保留专用适配器与个人控制边界。
 
-[配置示例、私有权限、Dashboard 与失效恢复](bytedcli-read-write-identity.md#逐命令规则与宿主限制)说明全局和 Bot JSON、旧客户端保留与显式清除语义。运行时验证文件及修订，身份查询之前拒绝禁用/无效配置；排队、取票、派发和返回持续绑定修订。actor-read 的真实效果仍为 read，使用读额度/结果审计；业务 write 仍须 durable intent。已派发写入在同一执行中保留 request ID 派发记录，策略变动不会解除重复写入防线；结果未知无自动重试。
+[配置示例、私有权限、Dashboard 与失效恢复](bytedcli-read-write-identity.md#逐命令规则与宿主限制)说明全局和 Bot JSON、旧客户端保留与显式清除语义。运行时验证文件及修订，身份查询之前拒绝禁用/无效配置；排队、取票、派发和返回持续绑定修订。actor-read 的真实效果仍为 read，使用读额度/结果审计；业务 write 无论机器或个人身份仍须 durable intent、写入限额与结果落盘；机器写入要求实际 parser 生成且冻结的显式有效策略证明。已派发写入在同一执行中保留 request ID 派发记录，策略变动不会解除重复写入防线；结果未知无自动重试。
 
 ## 参数与输出边界
 

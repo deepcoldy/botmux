@@ -5239,12 +5239,14 @@ export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: P
                   disabled={busy || policyState !== 'ready'} aria-label={`${tr('botDefaults.bytedcliPolicyOverride')}: ${row.path.join(' ')}`}
                   onChange={event => saveOperationRule(row.id, event.currentTarget.value)}>
                   <option value="">{tr('botDefaults.bytedcliPolicyRule.inherit')}</option>
-                  {row.effect === 'read' ? <option value="machine">{tr('botDefaults.bytedcliPolicyRule.machine')}</option> : null}
+                  <option value="machine">{tr('botDefaults.bytedcliPolicyRule.machine')}</option>
                   <option value="actor">{tr('botDefaults.bytedcliPolicyRule.actor')}</option>
                   <option value="deny">{tr('botDefaults.bytedcliPolicyRule.deny')}</option>
                 </select></td>
                 <td data-action={`bytedcli-effective-${row.id}`} data-enabled={effective?.enabled} data-identity={effective?.identity}>
                   {effective ? tr(`botDefaults.bytedcliPolicyRule.${effective.enabled ? effective.identity : 'deny'}`) : '—'}
+                  {row.effect === 'write' && effective?.enabled && effective.identity === 'machine' ?
+                    <small data-action={`bytedcli-machine-exception-${row.id}`} style={{ display: 'block' }}>{tr('botDefaults.bytedcliPolicyMachineException')}</small> : null}
                 </td>
               </tr>;
             })}</tbody>

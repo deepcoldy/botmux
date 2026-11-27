@@ -84,8 +84,8 @@ async function setup(options:{failResultAudit?:boolean;denyActorWrites?:readonly
   }
   const exitCode=await runBytedcliExecClient({sessionId:'acceptance',port,requestId:`acceptance-${++sequence}`,argv,stdout:b=>stdout+=b,stderr:b=>stderr+=b,...extra});return {exitCode,stdout,stderr};
  };
- const setGlobal=(rules:Record<string,string>)=>{operationPolicy();const next=join(privateRoot,'policy','next');writeFileSync(next,JSON.stringify({schema:'botmux.bytedcli-operation-policy.v1',cliVersion:'0.199.0',catalogVersion:'2026-11-26.1',rules}),{mode:0o600});renameSync(next,join(privateRoot,'policy','operation-policy.json'));};
- return {client,setGlobal,setBot:(rules:Record<string,string>)=>policy={...policy,bytedcliOperationPolicy:parseBytedcliOperationPolicy({schema:'botmux.bytedcli-operation-policy.v1',cliVersion:'0.199.0',catalogVersion:'2026-11-26.1',rules})},calls,dispatches,ds,root,auditRoot,mintedAccounts,identityLookups,requests:()=>requestCount,writes:()=>rows(writesFile),attempts:()=>rows(attemptsFile),waitDispatch:()=>{dispatchGate=deferred();return {entered:dispatchEntered.promise,release:dispatchGate.resolve};},lookup:()=>lookup,grant:(v:boolean)=>grant=v,revoke:()=>epoch++,changePolicy:()=>policy={...policy,credentialSource:'platform'},
+ const setGlobal=(rules:Record<string,string>)=>{operationPolicy();const next=join(privateRoot,'policy','next');writeFileSync(next,JSON.stringify({schema:'botmux.bytedcli-operation-policy.v2',cliVersion:'0.199.0',catalogVersion:'2026-11-26.1',rules}),{mode:0o600});renameSync(next,join(privateRoot,'policy','operation-policy.json'));};
+ return {client,setGlobal,setBot:(rules:Record<string,string>)=>policy={...policy,bytedcliOperationPolicy:parseBytedcliOperationPolicy({schema:'botmux.bytedcli-operation-policy.v2',cliVersion:'0.199.0',catalogVersion:'2026-11-26.1',rules})},calls,dispatches,ds,root,auditRoot,mintedAccounts,identityLookups,requests:()=>requestCount,writes:()=>rows(writesFile),attempts:()=>rows(attemptsFile),waitDispatch:()=>{dispatchGate=deferred();return {entered:dispatchEntered.promise,release:dispatchGate.resolve};},lookup:()=>lookup,grant:(v:boolean)=>grant=v,revoke:()=>epoch++,changePolicy:()=>policy={...policy,credentialSource:'platform'},
  waitProvider:()=>{providerGate=deferred();return {entered:entered.promise,release:providerGate.resolve};}};
 }
 const read=['codebase','repo','list'];const write=['codebase','mr','close','42','--repo','org/repo'];
@@ -208,4 +208,23 @@ it('global policy replacement after native write suppresses output and retains o
  const result=await pending;expect(result.stderr).toContain('write_outcome_unknown');expect(result.stdout).toBe('');
  expect(f.attempts()).toEqual([{account:'a@example.test',operation:'write',denied:false}]);expect(f.writes()).toEqual([{account:'a@example.test'}]);
  const audit=readCommittedBytedcliAudit(f.auditRoot);expect(audit.some(row=>row.phase==='intent')).toBe(true);
+});
+
+it('real HTTP and client machine writes persist intent/result without personal lookup or grants',async()=>{
+ const f=await setup();f.grant(false);f.setBot({'codebase.mr.close':'machine'});
+ const result=await f.client(write,{requestId:'explicit-machine-write'});
+ expect(result.exitCode).toBe(0);expect(JSON.parse(result.stdout).account).toBe('machine');expect(f.identityLookups).toEqual([]);expect(f.mintedAccounts).toEqual(['machine']);
+ expect(f.writes()).toEqual([{account:'machine'}]);
+ const records=readCommittedBytedcliAudit(f.auditRoot);
+ expect(records.sort((a,b)=>a.phase.localeCompare(b.phase)).map(row=>[row.phase,row.effect,row.source])).toEqual([['intent','write','machine'],['result','write','machine']]);
+ f.setGlobal({'codebase.mr.close':'actor'});
+ const repeated=await f.client(write,{requestId:'explicit-machine-write'});expect(repeated.stderr).toContain('write_outcome_unknown');expect(repeated.stdout).toBe('');expect(f.writes()).toEqual([{account:'machine'}]);
+ const restored=await f.client(write);expect(restored.stderr).toContain('actor_auth_required');expect(f.writes()).toEqual([{account:'machine'}]);
+});
+it('machine write result loss reaches the real client as unknown without automatic retry after policy change',async()=>{
+ const f=await setup({failResultAudit:true});f.grant(false);f.setGlobal({'codebase.mr.close':'machine'});
+ const result=await f.client(write,{requestId:'lost-machine-result'});expect(result.exitCode).toBe(77);expect(result.stderr).toContain('write_outcome_unknown');expect(result.stdout).toBe('');
+ expect(f.requests()).toBe(1);expect(f.writes()).toEqual([{account:'machine'}]);expect(f.lookup()).toBe(0);
+ f.setBot({'codebase.mr.close':'actor'});
+ const repeated=await f.client(write,{requestId:'lost-machine-result'});expect(repeated.stderr).toContain('write_outcome_unknown');expect(repeated.stdout).toBe('');expect(f.writes()).toEqual([{account:'machine'}]);
 });

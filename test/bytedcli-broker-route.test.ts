@@ -26,14 +26,14 @@ describe('credential-free broker HTTP boundary', () => {
   });
 });
 
-function fixture(options:{blocked?:boolean;wait?:boolean;maxPreauth?:number}={}) {
+function fixture(options:{blocked?:boolean;wait?:boolean;maxPreauth?:number;machine?:boolean}={}) {
   let calls=0,aborted=false;let started!:()=>void;const entered=new Promise<void>(r=>started=r);
   const authority:any={daemonBootId:'boot',botAppId:'cli_broker',sessionId:'s-broker',turnId:'turn-A',identityTurnId:'A',workerGeneration:1,dispatchAttempt:0,policyFingerprint:'frozen',
-    actor:{verifiedEmail:'a@example.com',credentialOpenId:'ou_A',source:'local'},recheck:async()=>options.blocked?'policy_changed':undefined};
+    executionIdentity:options.machine?'machine':'actor',actor:{verifiedEmail:'a@example.com',credentialOpenId:'ou_A',source:'local'},recheck:async()=>options.blocked?'policy_changed':undefined};
   const broker=new BytedcliBroker({deadlineMs:1000,maxPreauth:options.maxPreauth,authority:async(sid,peer)=>sid==='s-broker'&&peer.pid===process.pid?{ok:true,authority}:{ok:false,errorCode:'execution_unverified'},
     executor:{execute:async request=>{
       calls++;started();if(options.wait)await new Promise<void>(resolve=>{request.signal!.addEventListener('abort',()=>{aborted=true;resolve();},{once:true});});
-      return {schema:BYTEDCLI_EXEC_SCHEMA,requestId:request.requestId,operationId:request.operation.id,effectiveIdentity:{kind:'actor'},outcome:'completed',stdoutBase64:'b2sK',stderrBase64:'',exitCode:0};
+      return {schema:BYTEDCLI_EXEC_SCHEMA,requestId:request.requestId,operationId:request.operation.id,effectiveIdentity:{kind:options.machine?'machine':'actor',accountFingerprint:'sha256:broker-account'},outcome:'completed',stdoutBase64:'b2sK',stderrBase64:'',exitCode:0};
     },retireSession:async()=>{},close:async()=>{}}});
   return {broker,entered,calls:()=>calls,aborted:()=>aborted};
 }
@@ -142,4 +142,16 @@ it.each(['retire','close'] as const)('joins pending authority even when executor
  await new Promise(r=>setTimeout(r,15));const premature=settled;release();
  const result=await stop;await pending;
  expect(premature).toBe(false);expect(result).toBe(cleanupError);
+});
+
+it('broker deadlines preserve frozen machine write identity before executor settlement',async()=>{
+ const f=fixture({wait:true,machine:true});ipc=await startIpcServer({port:0,host:'127.0.0.1',authRequired:true,bytedcliBroker:f.broker});
+ const pending=post({...body,argv:['codebase','mr','close','1','--repo','ns/repo']});await f.entered;
+ const result=await (await pending).json();expect(result).toMatchObject({outcome:'write_outcome_unknown',effectiveIdentity:{kind:'machine'},stdoutBase64:''});
+});
+it('broker post-result revocation preserves machine write identity and account fingerprint',async()=>{
+ let finished=false;const authority:any={daemonBootId:'boot',botAppId:'app',sessionId:'s-broker',turnId:'t',workerGeneration:1,dispatchAttempt:0,policyFingerprint:'p',executionIdentity:'machine',recheck:async()=>finished?'policy_changed':undefined};
+ const broker=new BytedcliBroker({authority:async()=>({ok:true,authority}),executor:{execute:async r=>{finished=true;return {schema:BYTEDCLI_EXEC_SCHEMA,requestId:r.requestId,operationId:r.operation.id,effectiveIdentity:{kind:'machine',accountFingerprint:'sha256:actual-machine'},outcome:'completed',stdoutBase64:'cHJpdmF0ZQ==',stderrBase64:'',exitCode:0};},retireSession:async()=>{},close:async()=>{}}});
+ ipc=await startIpcServer({port:0,host:'127.0.0.1',authRequired:true,bytedcliBroker:broker});
+ expect(await (await post({...body,argv:['codebase','mr','close','1','--repo','ns/repo']})).json()).toMatchObject({outcome:'write_outcome_unknown',effectiveIdentity:{kind:'machine',accountFingerprint:'sha256:actual-machine'},stdoutBase64:''});
 });

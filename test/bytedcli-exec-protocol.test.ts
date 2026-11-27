@@ -60,6 +60,9 @@ describe('ByteCloud broker wire validation', () => {
     const unknown = { ...response, effectiveIdentity: { kind: 'actor', accountFingerprint: 'sha256:abc' },
       outcome: 'write_outcome_unknown', exitCode: 1, errorCode: 'write_outcome_unknown' };
     expect(protocol.parseBytedcliExecResponse(JSON.stringify(unknown))).toEqual(unknown);
+    expect(protocol.parseBytedcliExecResponse({ ...unknown, effectiveIdentity: { kind: 'machine', accountFingerprint: 'sha256:machine' } }))
+      .toMatchObject({ outcome: 'write_outcome_unknown', effectiveIdentity: { kind: 'machine' } });
+    expect(() => protocol.parseBytedcliExecResponse({ ...unknown, effectiveIdentity: { kind: 'none' } })).toThrow();
     for (const extra of [{ token: 'secret' }, { exitCode: -1 }, { stdoutBase64: 'bad!' }, { errorCode: 'arbitrary-secret' },
       { effectiveIdentity: { kind: 'actor', email: 'person@example.com' } }, { outcome: 'write_outcome_unknown', exitCode: 0 },
       { stdoutBase64: Buffer.alloc(16 * 1024 * 1024 + 1).toString('base64') }]) {

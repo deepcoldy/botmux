@@ -142,7 +142,7 @@ export function parseBytedcliExecResponse(raw: unknown): BytedcliExecResponse {
   if (rec.errorCode !== undefined && !(BYTEDCLI_EXEC_ERROR_CODES as readonly unknown[]).includes(rec.errorCode)) fail('errorCode');
   if (rec.outcome !== 'completed' && (rec.exitCode === 0 || rec.errorCode === undefined)) fail('failure result');
   if (rec.outcome === 'write_outcome_unknown'
-    && (rec.errorCode !== 'write_outcome_unknown' || identity.kind !== 'actor')) fail('unknown write result');
+    && (rec.errorCode !== 'write_outcome_unknown' || !['actor', 'machine'].includes(identity.kind))) fail('unknown write result');
   const stdout = decodeBytedcliBase64(rec.stdoutBase64, BYTEDCLI_EXEC_LIMITS.outputBytes, 'stdout');
   decodeBytedcliBase64(rec.stderrBase64, BYTEDCLI_EXEC_LIMITS.outputBytes - stdout.length, 'stderr');
   return Object.freeze({ schema: BYTEDCLI_EXEC_SCHEMA, requestId: text(rec.requestId, 'requestId', ID),

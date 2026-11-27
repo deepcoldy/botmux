@@ -39,17 +39,18 @@ it('UI edits preserve hidden identity options, and enabling depends on ByteCloud
  }finally{await act(async()=>renderer.unmount());}
 });
 it('new and old Dashboard saves, reload, explicit legacy and reset preserve the supported policy contract',async()=>{
+ const migrated={...full,bytedcliOperationPolicy:{...full.bytedcliOperationPolicy,schema:'botmux.bytedcli-operation-policy.v2'}};
  const root=mkdtempSync(join(tmpdir(),'bytedcli-config-'));roots.push(root);const file=join(root,'bots.json');vi.stubEnv('BOTS_CONFIG',file);
  writeFileSync(file,JSON.stringify([{larkAppId:'cli_mode_config',larkAppSecret:'fake',cliId:'codex',triggerUserAuth:full}]));
  loadBotConfigs().forEach(registerBot);setLarkAppId('cli_mode_config');ipc=await startIpcServer({port:0,host:'127.0.0.1'});
  const put=(value:any)=>fetch(`http://127.0.0.1:${ipc!.port}/api/bot-trigger-user-auth`,{method:'PUT',body:JSON.stringify({triggerUserAuth:value})});
  const stored=()=>JSON.parse(readFileSync(file,'utf8'))[0].triggerUserAuth;
- expect((await put({enabled:true,tools:['bytedcli']})).status).toBe(200);expect(stored()).toMatchObject(full);
- const reloaded=loadBotConfigs()[0]!.triggerUserAuth;expect(reloaded).toMatchObject(full);expect(bytecloudBrokerEnabled(reloaded)).toBe(true);
- const payload=botDefaultsPayload({larkAppId:'cli_mode_config'} as any,{triggerUserAuth:reloaded});expect(payload.triggerUserAuth).toMatchObject(full);
+ expect((await put({enabled:true,tools:['bytedcli']})).status).toBe(200);expect(stored()).toMatchObject(migrated);
+ const reloaded=loadBotConfigs()[0]!.triggerUserAuth;expect(reloaded).toMatchObject(migrated);expect(bytecloudBrokerEnabled(reloaded)).toBe(true);
+ const payload=botDefaultsPayload({larkAppId:'cli_mode_config'} as any,{triggerUserAuth:reloaded});expect(payload.triggerUserAuth).toMatchObject(migrated);
  const unchanged=stored();expect((await put({bytecloudExecution:'machine'})).status).toBe(400);expect(stored()).toEqual(unchanged);
- expect((await put({enabled:false})).status).toBe(200);expect(stored()).toMatchObject({...full,enabled:false});expect(bytecloudBrokerEnabled(loadBotConfigs()[0]!.triggerUserAuth)).toBe(false);
- expect((await put({enabled:true,bytecloudExecution:'trigger-user'})).status).toBe(200);expect(stored()).toMatchObject({...full,bytecloudExecution:'trigger-user'});
+ expect((await put({enabled:false})).status).toBe(200);expect(stored()).toMatchObject({...migrated,enabled:false});expect(bytecloudBrokerEnabled(loadBotConfigs()[0]!.triggerUserAuth)).toBe(false);
+ expect((await put({enabled:true,bytecloudExecution:'trigger-user'})).status).toBe(200);expect(stored()).toMatchObject({...migrated,bytecloudExecution:'trigger-user'});
  expect((await put({bytedcliOperationPolicy:null})).status).toBe(200);expect(stored()).not.toHaveProperty('bytedcliOperationPolicy');
  expect(stored()).toMatchObject({credentialSource:full.credentialSource,dispatchOnly:full.dispatchOnly});
  expect((await put(null)).status).toBe(200);expect(stored()).toBeUndefined();

@@ -9,6 +9,7 @@ import { bytedcliSafeFingerprint, type BytedcliAuthorityRecheck, type BytedcliVe
 import { BytedcliBrokerError, bytedcliMinimalEnv, runBoundedBytedcliChild,
   type BytedcliChildRunner, type BytedcliTrustedCli } from './bytedcli-broker-process.js';
 import { maskCredentialShapes } from './stuck-page-catalog.js';
+import { isParsedBytedcliOperationPolicy, resolveBytedcliOperationRule } from './bytedcli-operation-policy-config.js';
 import type { BytedcliFrozenOperationPolicy } from './bytedcli-host-operation-policy.js';
 
 /** Constructed only by host peer/admission/turn/delegation resolution. */
@@ -100,6 +101,15 @@ function executionOf(authority: BytedcliFrozenAuthority): string {
 function executionIdentityOf(request: BytedcliExecutionRequest): 'machine' | 'actor' {
   return request.authority.executionIdentity ?? (request.operation.effect === 'read' ? 'machine' : 'actor');
 }
+function provesExplicitMachineWrite(request: BytedcliExecutionRequest): boolean {
+  const policy = request.authority.operationPolicy;
+  if (!policy || !Object.isFrozen(policy) || typeof policy.globalRevision !== 'string' || !policy.globalRevision
+    || (policy.globalPolicy !== undefined && !isParsedBytedcliOperationPolicy(policy.globalPolicy))
+    || (policy.botPolicy !== undefined && !isParsedBytedcliOperationPolicy(policy.botPolicy))) return false;
+  const selected = resolveBytedcliOperationRule(request.operation.id, policy.globalPolicy, policy.botPolicy);
+  return selected.enabled && selected.identity === 'machine'
+    && (policy.globalPolicy?.rules[request.operation.id] === 'machine' || policy.botPolicy?.rules[request.operation.id] === 'machine');
+}
 function snapshotOperation(operation: BytedcliOperation): BytedcliOperation {
   // Reparse even host descriptors: input bytes and canonical argv must remain
   // bound to one audited schema. Only host-selected lower limits are retained.
@@ -148,7 +158,7 @@ export class BytedcliExecutor {
       if (operation.effect !== 'read' && operation.effect !== 'write') throw new BytedcliBrokerError('unsupported_operation');
       const identity = executionIdentityOf(request);
       if (!['machine', 'actor'].includes(identity)) throw new BytedcliBrokerError('invalid_request');
-      if ((operation.effect === 'write' && identity !== 'actor')
+      if ((operation.effect === 'write' && identity === 'machine' && !provesExplicitMachineWrite(request))
         || (identity === 'actor' && (!authority.actor || !authority.actor.verifiedEmail))) throw new BytedcliBrokerError('actor_required');
       const deadline = started + operation.timeoutMs;
       const tuple = tupleOf(authority); const key = JSON.stringify([tuple, request.requestId]);
