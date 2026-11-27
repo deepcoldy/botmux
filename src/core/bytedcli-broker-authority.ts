@@ -21,6 +21,9 @@ import {isAutoCompletedSchedule} from '../services/schedule-until-done.js';
 import {isManualScheduledTurn} from './scheduled-turn-provenance.js';
 import type { RequestOwnedIdentityQueryOptions } from '../im/lark/identity-cache.js';
 import type { TrustedCaller } from '../types.js';
+import { parseBytedcliOperationPolicy, resolveBytedcliOperationRule } from './bytedcli-operation-policy-config.js';
+import type { BytedcliHostOperationPolicySnapshot } from './bytedcli-host-operation-policy.js';
+import { bytedcliSafeFingerprint } from './bytedcli-broker-credentials.js';
 export interface BytedcliAuthorityDependencies {
   readonly daemonBootId: string; readonly dataDir: string;
   readonly findSession: CurrentTurnPeerAttestationInput['findSession'];
@@ -32,6 +35,7 @@ export interface BytedcliAuthorityDependencies {
   readonly schedule: (app: string, taskId: string) => ScheduleAuthorityRecord | undefined;
   readonly procRoot?: string;
   readonly authEpoch?: typeof readCliAuthEpoch; readonly bindingKey?: typeof activePlatformCredentialBindingKey;
+  readonly operationPolicy?: () => BytedcliHostOperationPolicySnapshot;
 }
 export interface BytedcliAuthorityRequestContext {
   readonly signal:AbortSignal;
@@ -64,9 +68,26 @@ export async function resolveBytedcliAuthority(deps:BytedcliAuthorityDependencie
   if(context?.freezeGeneration && !context.freezeGeneration(execution.workerGeneration))return fail('execution_stale');
   const ds = proof.ds, worker = ds.worker;
   const identityTurn = execution.identityTurnId ?? execution.turnId;
-  const needsActor = operation.effect === 'write' || operation.effect === 'auth';
-  const policy = deps.policy(ds), fingerprint = stable(policy);
+  const policy = deps.policy(ds), policyKey = stable(policy);
   if (!bytecloudBrokerEnabled(policy)) return fail('broker_disabled');
+  let globalSnapshot: BytedcliHostOperationPolicySnapshot;
+  let operationPolicy: BytedcliFrozenAuthority['operationPolicy'];
+  let executionIdentity: BytedcliFrozenAuthority['executionIdentity'];
+  try {
+    globalSnapshot = deps.operationPolicy?.() ?? { revision: 'audited-default' };
+    if (globalSnapshot.errorCode) return fail('operation_policy_invalid');
+    const globalPolicy = parseBytedcliOperationPolicy(globalSnapshot.policy);
+    const botPolicy = parseBytedcliOperationPolicy(policy?.bytedcliOperationPolicy);
+    operationPolicy = Object.freeze({ globalRevision: globalSnapshot.revision,
+      ...(globalPolicy ? { globalPolicy } : {}), ...(botPolicy ? { botPolicy } : {}) });
+    if (operation.effect === 'read' || operation.effect === 'write') {
+      const selected = resolveBytedcliOperationRule(operation.id, globalPolicy, botPolicy);
+      if (!selected.enabled) return fail('operation_disabled');
+      executionIdentity = selected.identity;
+    }
+  } catch { return fail('operation_policy_invalid'); }
+  const fingerprint = bytedcliSafeFingerprint([policyKey, globalSnapshot.revision]);
+  const needsActor = executionIdentity === 'actor' || operation.effect === 'auth';
   if (!deps.contains(ds)) return fail('broker_containment_unavailable');
   const caller = callerFor(ds,identityTurn), callerKey = stable(caller);
   const delegated = currentLarkToolDelegation(deps.dataDir,sessionId,identityTurn), delegationKey = stable(delegated);
@@ -82,7 +103,7 @@ export async function resolveBytedcliAuthority(deps:BytedcliAuthorityDependencie
     const current = deps.schedule(ds.larkAppId,taskId);
     try { assertScheduledAuthorityCurrent(schedule,current,{turnId:identityTurn,allowCompleted:true}); }
     catch { return false; }
-    if(operation.effect==='read'){
+    if(operation.effect==='read' && !needsActor){
       if(!current || current.task.id!==taskId || (current.task.larkAppId && current.task.larkAppId!==ds.larkAppId))return false;
       try{if(!effectiveScheduleChatIds(current.task).includes(ds.chatId))return false;}catch{return false;}
       if(current.task.enabled===false && !((current.state==='completed'&&isAutoCompletedSchedule(current.task))
@@ -110,7 +131,11 @@ export async function resolveBytedcliAuthority(deps:BytedcliAuthorityDependencie
     if (!currentTurnPeerAttestationStable(proof,input) || ds.worker !== worker
       || (ds.managedTurnOrigin?.identityTurnId ?? ds.managedTurnOrigin?.turnId) !== identityTurn
       || stable(callerFor(ds,identityTurn)) !== callerKey) return 'execution_stale';
-    if (stable(deps.policy(ds)) !== fingerprint || credentialSourceOf(deps.policy(ds),'bytecloud') !== source) return 'policy_changed';
+    if (stable(deps.policy(ds)) !== policyKey || credentialSourceOf(deps.policy(ds),'bytecloud') !== source) return 'policy_changed';
+    try {
+      const current = deps.operationPolicy?.();
+      if (current && (current.errorCode || current.revision !== globalSnapshot.revision)) return 'policy_changed';
+    } catch { return 'policy_changed'; }
     if (!deps.contains(ds)) return 'broker_containment_unavailable';
     if (!conversationGate()) return 'permission_denied';
     if (!scheduleGate()) return 'delegation_revoked';
@@ -146,5 +171,6 @@ export async function resolveBytedcliAuthority(deps:BytedcliAuthorityDependencie
   return {ok:true,authority:Object.freeze({daemonBootId:deps.daemonBootId,botAppId:ds.larkAppId,sessionId,
     turnId:execution.turnId,identityTurnId:identityTurn,workerGeneration:execution.workerGeneration,
     // Authenticated sentinel: ordinary topics do not have dispatch attempts.
-    dispatchAttempt:execution.dispatchAttempt ?? 0,policyFingerprint:fingerprint,...(actor?{actor}:{}),recheck,current:synchronousCheck})};
+    dispatchAttempt:execution.dispatchAttempt ?? 0,policyFingerprint:fingerprint,
+    ...(executionIdentity ? { executionIdentity } : {}),operationPolicy,...(actor?{actor}:{}),recheck,current:synchronousCheck})};
 }

@@ -9,12 +9,15 @@ import { bytedcliSafeFingerprint, type BytedcliAuthorityRecheck, type BytedcliVe
 import { BytedcliBrokerError, bytedcliMinimalEnv, runBoundedBytedcliChild,
   type BytedcliChildRunner, type BytedcliTrustedCli } from './bytedcli-broker-process.js';
 import { maskCredentialShapes } from './stuck-page-catalog.js';
+import type { BytedcliFrozenOperationPolicy } from './bytedcli-host-operation-policy.js';
 
 /** Constructed only by host peer/admission/turn/delegation resolution. */
 export interface BytedcliFrozenAuthority {
   readonly daemonBootId: string; readonly botAppId: string; readonly sessionId: string;
   readonly turnId: string; readonly identityTurnId?: string; readonly workerGeneration: number;
   readonly dispatchAttempt: number; readonly policyFingerprint: string;
+  readonly executionIdentity?: 'machine' | 'actor';
+  readonly operationPolicy?: BytedcliFrozenOperationPolicy;
   readonly actor?: BytedcliVerifiedActor; readonly recheck: BytedcliAuthorityRecheck;
   /** Frozen host state check without starting delegated provider work. Used
    * only for refusals that expose no business data or execution authority. */
@@ -50,7 +53,7 @@ async function joinOwnedWork(work: readonly Promise<unknown>[]): Promise<void> {
   if (failed) throw failed.reason;
 }
 interface Waiter { request: BytedcliExecutionRequest; resolve: (release: () => void) => void; reject: (error: Error) => void; cleanup: () => void }
-interface Entry { digest: string; tuple: string; sessionId: string; workerGeneration:number; promise: Promise<BytedcliExecResponse>; settled: boolean;
+interface Entry { digest: string; tuple: string; execution: string; requestId: string; effect: 'read' | 'write'; sessionId: string; workerGeneration:number; promise: Promise<BytedcliExecResponse>; settled: boolean;
   outputBytes: number; revalidate?: BytedcliCredentialLease['stillCurrent']; controller?: AbortController;
   identity?: BytedcliEffectiveIdentity; dispatched?: boolean; overflow?: boolean }
 /** Response cancellation and underlying resource settlement are separate.
@@ -87,9 +90,15 @@ function rejectResponse(request: BytedcliExecutionRequest, code: BytedcliExecErr
     stdoutBase64: '', stderrBase64: '', exitCode: 77, errorCode: unknownWrite ? 'write_outcome_unknown' : code });
 }
 function tupleOf(authority: BytedcliFrozenAuthority): string {
+  return JSON.stringify([executionOf(authority), authority.policyFingerprint, authority.executionIdentity ?? null, authority.actor ?? null]);
+}
+function executionOf(authority: BytedcliFrozenAuthority): string {
   return JSON.stringify([authority.daemonBootId, authority.botAppId, authority.sessionId, authority.workerGeneration,
     authority.dispatchAttempt, authority.turnId, authority.identityTurnId ?? authority.turnId,
-    authority.policyFingerprint, authority.actor ?? null]);
+  ]);
+}
+function executionIdentityOf(request: BytedcliExecutionRequest): 'machine' | 'actor' {
+  return request.authority.executionIdentity ?? (request.operation.effect === 'read' ? 'machine' : 'actor');
 }
 function snapshotOperation(operation: BytedcliOperation): BytedcliOperation {
   // Reparse even host descriptors: input bytes and canonical argv must remain
@@ -137,7 +146,10 @@ export class BytedcliExecutor {
       request = Object.freeze({ ...raw, operation, authority });
       if (!/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(request.requestId)) throw new BytedcliBrokerError('invalid_request');
       if (operation.effect !== 'read' && operation.effect !== 'write') throw new BytedcliBrokerError('unsupported_operation');
-      if (operation.effect === 'write' && (!authority.actor || !authority.actor.verifiedEmail)) throw new BytedcliBrokerError('actor_required');
+      const identity = executionIdentityOf(request);
+      if (!['machine', 'actor'].includes(identity)) throw new BytedcliBrokerError('invalid_request');
+      if ((operation.effect === 'write' && identity !== 'actor')
+        || (identity === 'actor' && (!authority.actor || !authority.actor.verifiedEmail))) throw new BytedcliBrokerError('actor_required');
       const deadline = started + operation.timeoutMs;
       const tuple = tupleOf(authority); const key = JSON.stringify([tuple, request.requestId]);
       const digest = bytedcliSafeFingerprint([operation.argv, operation.stagedInputs.map(input => input.dataBase64),
@@ -148,11 +160,18 @@ export class BytedcliExecutor {
         ownedAdmission = true;
         return await this.replay(request, prior, deadline);
       }
+      const execution = executionOf(authority);
+      // A policy/account change invalidates cached output, never the fact that
+      // this execution already dispatched a write. Keep that fence in the same
+      // bounded entry set rather than an unbounded secondary history.
+      const dispatched = [...this.entries.values()].find(old => old.execution === execution && old.requestId === request.requestId
+        && old.effect === 'write' && old.dispatched);
+      if (dispatched) return rejectResponse(request, 'policy_changed', dispatched.identity ?? { kind: 'actor' }, operation.effect === 'write');
       const overflow = this.entries.size >= 4096;
-      if (overflow && ![...this.entries.values()].some(old => old.settled && old.sessionId === authority.sessionId && old.tuple !== tuple)) {
+      if (overflow && ![...this.entries.values()].some(old => this.retirable(old, authority, tuple))) {
         throw new BytedcliBrokerError('busy');
       }
-      const entry: Entry = { digest, tuple, sessionId: authority.sessionId, workerGeneration:authority.workerGeneration, promise: Promise.resolve(rejectResponse(request, 'internal_error')),
+      const entry: Entry = { digest, tuple, execution, requestId: request.requestId, effect: operation.effect, sessionId: authority.sessionId, workerGeneration:authority.workerGeneration, promise: Promise.resolve(rejectResponse(request, 'internal_error')),
         settled: false, outputBytes: 0, overflow };
       this.entries.set(key, entry);
       ownedAdmission = true;
@@ -160,6 +179,10 @@ export class BytedcliExecutor {
       return await entry.promise;
     } catch (error) { return rejectResponse(request, errorCode(error)); }
     finally { if (!ownedAdmission) this.admissions--; }
+  }
+  private retirable(entry: Entry, authority: BytedcliFrozenAuthority, tuple: string): boolean {
+    return entry.settled && entry.sessionId === authority.sessionId && entry.tuple !== tuple
+      && !(entry.effect === 'write' && entry.dispatched && entry.execution === executionOf(authority));
   }
   private async check(request: BytedcliExecutionRequest): Promise<void> {
     if (this.closed) throw new BytedcliBrokerError('executor_unavailable');
@@ -301,7 +324,7 @@ export class BytedcliExecutor {
       // A new tuple may retire cached old responses only after host authority
       // succeeds. Its initial asynchronous check is already owned and deduped.
       for (const [oldKey, old] of this.entries) {
-        if (old.settled && old.sessionId === request.authority.sessionId && old.tuple !== entry.tuple) {
+        if (this.retirable(old, request.authority, entry.tuple)) {
           this.outputBytes -= old.outputBytes; this.entries.delete(oldKey);
         }
       }
@@ -313,9 +336,9 @@ export class BytedcliExecutor {
       const leaseRequest = { region: request.operation.region, actor: request.authority.actor, recheck: request.authority.recheck,
         signal: controller.signal, sessionId: request.authority.sessionId, botAppId: request.authority.botAppId,
         identityTurnId: request.authority.identityTurnId ?? request.authority.turnId };
-      lease = await bounded(request.operation.effect === 'read' ? this.deps.leases.machine(leaseRequest) : this.deps.leases.actor(leaseRequest));
+      const kind = executionIdentityOf(request);
+      lease = await bounded(kind === 'machine' ? this.deps.leases.machine(leaseRequest) : this.deps.leases.actor(leaseRequest));
       entry.revalidate = lease.stillCurrent;
-      const kind = request.operation.effect === 'read' ? 'machine' : 'actor';
       if (lease.kind !== kind || !/^sha256:[A-Za-z0-9_-]+$/.test(lease.accountFingerprint)) throw new BytedcliBrokerError('actor_identity_unverified');
       identity = Object.freeze({ kind, accountFingerprint: lease.accountFingerprint });
       entry.identity = identity;

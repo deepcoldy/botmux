@@ -42,6 +42,24 @@ function platformProvider() {
   return { resolver, pending, active: () => active, maximum: () => maximum, release: () => pending.forEach(item => item.gate.release()) };
 }
 describe('underlying broker work ownership', () => {
+  it('bounds retained dispatched-write fences across policy changes and frees them only for a genuine successor', async () => {
+    let dispatches = 0;
+    const lease = { jwt:'fake-only',kind:'actor',region:'cn',expiresAt:Date.now()+120_000,accountFingerprint:'sha256:actor',source:'local',stillCurrent:async()=>undefined };
+    const s = setup({actor:async()=>lease,machine:async()=>{throw new Error('no machine');}},async()=>{dispatches++;return empty;});
+    let retained = 0;
+    for (;retained<8192;retained++) {
+      const result=await s.executor.execute(s.request(write(),`fenced-${retained}`));
+      if(result.errorCode==='busy')break;
+      expect(result.outcome).toBe('completed');
+    }
+    expect(retained).toBe(4096);expect(dispatches).toBe(4096);
+    const changed={...s.authority,policyFingerprint:'policy-new'};
+    expect((await s.executor.execute(s.request(write(),'fresh',{authority:changed}))).errorCode).toBe('busy');
+    expect((await s.executor.execute(s.request(write(),'fenced-0',{authority:changed}))).outcome).toBe('write_outcome_unknown');expect(dispatches).toBe(4096);
+    const successor={...changed,turnId:'explicit-next-turn',workerGeneration:2};
+    expect((await s.executor.execute(s.request(write(),'fenced-0',{authority:successor}))).outcome).toBe('completed');
+    await s.executor.close();expect(dispatches).toBe(4097);
+  }, 20_000);
   it('admits an authorized successor after the previous frozen tuple fills the retained response cache', async () => {
     let renewed = false; let dispatches = 0;
     const lease = { jwt: 'fake-only', kind: 'machine' as const, region: 'cn' as const, expiresAt: Date.now() + 60_000,

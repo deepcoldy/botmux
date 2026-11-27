@@ -3,6 +3,17 @@ import { BYTEDCLI_AUDITED_RELEASE, BYTEDCLI_OPERATION_CATALOG, BYTEDCLI_OPERATIO
 import { BytedcliBrokerError } from './bytedcli-broker-process.js';
 import type { BytedcliLeaseResolver } from './bytedcli-broker-credentials.js';
 import type { BytedcliExecutionRequest } from './bytedcli-executor.js';
+import type { BytedcliFrozenOperationPolicy } from './bytedcli-host-operation-policy.js';
+import { resolveBytedcliOperationRule } from './bytedcli-operation-policy-config.js';
+
+/** Credential-free effective catalog; trusted status callers can reuse it. */
+export function projectBytedcliSafeCatalog(policy?: BytedcliFrozenOperationPolicy) {
+  return Object.freeze(BYTEDCLI_OPERATION_CATALOG.map(entry => {
+    if (entry.effect !== 'read' && entry.effect !== 'write') return entry;
+    const rule = resolveBytedcliOperationRule(entry.id, policy?.globalPolicy, policy?.botPolicy);
+    return Object.freeze({ ...entry, enabled: rule.enabled, executionIdentity: rule.identity });
+  }));
+}
 
 /** Host projection only. Never execute SDK help/device flows or serialize a
  * provider envelope. Personal control stays with the existing private flow. */
@@ -28,8 +39,9 @@ export async function runBytedcliSafeCommand(
   await check();
   if (operation.effect === 'help') {
     const prefix = operation.id.slice('help.'.length);
-    const catalog = prefix === 'root' ? BYTEDCLI_OPERATION_CATALOG
-      : BYTEDCLI_OPERATION_CATALOG.filter(entry => entry.id === prefix || entry.id.startsWith(prefix + '.'));
+    const projected = projectBytedcliSafeCatalog(authority.operationPolicy);
+    const catalog = prefix === 'root' ? projected
+      : projected.filter(entry => entry.id === prefix || entry.id.startsWith(prefix + '.'));
     return response({ auditedCliVersion: BYTEDCLI_AUDITED_RELEASE, catalogVersion: BYTEDCLI_OPERATION_CATALOG_VERSION,
       versionScope: 'audited-contract-not-installed-version',
       ...(prefix === 'version' ? {} : { catalog, restrictions: ['cn-only', 'noninteractive', 'explicit-repository',

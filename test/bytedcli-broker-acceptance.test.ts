@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { afterEach, expect, it } from 'vitest';
 import { createServer, type Server } from 'node:http';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, realpathSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, realpathSync, existsSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BytedcliBroker } from '../src/core/bytedcli-broker.js';
@@ -14,11 +14,13 @@ import { runBytedcliExecClient } from '../src/cli/bytedcli-exec.js';
 import { readProcessStartIdentity } from '../src/utils/process-identity.js';
 import { beginReplyTargetTurn } from '../src/core/reply-target.js';
 import { BYTEDCLI_OPERATION_CATALOG } from '../src/core/bytedcli-operation-policy.js';
+import { createBytedcliHostOperationPolicyReader } from '../src/core/bytedcli-host-operation-policy.js';
 let cleanup: (()=>Promise<void>) | undefined;
 afterEach(async()=>{await cleanup?.();cleanup=undefined;});
 function deferred(){let resolve!:()=>void;const promise=new Promise<void>(r=>resolve=r);return {promise,resolve};}
 async function setup(options:{failResultAudit?:boolean;denyActorWrites?:readonly string[]}={}){
  const root=mkdtempSync(join(tmpdir(),'bytedcli-acceptance-')),privateRoot=join(root,'private'),auditRoot=join(root,'audit');
+ const operationPolicy=createBytedcliHostOperationPolicyReader(privateRoot);
  const business=join(root,'fake-business.cjs'),writesFile=join(root,'fake-upstream-writes.jsonl'),attemptsFile=join(root,'fake-upstream-attempts.jsonl');
  writeFileSync(business,`
   const fs=require('node:fs'),args=process.argv.slice(2);
@@ -61,7 +63,7 @@ async function setup(options:{failResultAudit?:boolean;denyActorWrites?:readonly
  trustedCli:async()=>({executable:node,prefixArgs:[business],path:'/usr/bin:/bin',version:'0.199.0',stillCurrent:()=>true}),
  run:async invocation=>{dispatches.push(invocation.argv.join(' '));const {runBoundedBytedcliChild}=await import('../src/core/bytedcli-broker-process.js');const result=await runBoundedBytedcliChild(invocation);if(dispatchGate){dispatchEntered.resolve();await dispatchGate.promise;}return result;}});
  const broker=new BytedcliBroker({authority:(id,peer,op,context)=>resolveBytedcliAuthority({daemonBootId:'boot',dataDir:root,findSession:s=>s==='acceptance'?ds:undefined,
- policy:()=>policy,contains:()=>true,canTalk:()=>true,identity:async(_app,openId)=>{lookup++;identityLookups.push(openId);return actors[openId]?{openId,type:'user',email:actors[openId]}:undefined;},unionIdentity:async()=>undefined,schedule:()=>undefined,authEpoch:()=>epoch,bindingKey:()=>undefined},id,peer,op,context),executor,personalLeases:async()=>leases} as any);
+ policy:()=>policy,operationPolicy,contains:()=>true,canTalk:()=>true,identity:async(_app,openId)=>{lookup++;identityLookups.push(openId);return actors[openId]?{openId,type:'user',email:actors[openId]}:undefined;},unionIdentity:async()=>undefined,schedule:()=>undefined,authEpoch:()=>epoch,bindingKey:()=>undefined},id,peer,op,context),executor,personalLeases:async()=>leases} as any);
  let requestCount=0;
  const server:Server=createServer((req,res)=>{requestCount++;void broker.handle(req,res);});await new Promise<void>(r=>server.listen(0,'127.0.0.1',r));const port=(server.address() as any).port;
  cleanup=async()=>{providerGate?.resolve();dispatchGate?.resolve();await broker.close();await new Promise<void>(r=>server.close(()=>r()));rmSync(root,{recursive:true,force:true});};
@@ -69,7 +71,7 @@ async function setup(options:{failResultAudit?:boolean;denyActorWrites?:readonly
  const client=async(argv:string[],extra:any={})=>{
   let stdout='',stderr='';
   const binary=process.env.BOTMUX_BYTEDCLI_ACCEPTANCE_BINARY;
-  if(binary){
+  if(binary && !extra.requestId){
    const child=spawn(binary,['__bytedcli-exec-runner','--session-id','acceptance','--ipc-port',String(port),'--',...argv],{
     cwd:binaryHome,env:{HOME:binaryHome,PATH:process.env.PATH,BOTS_CONFIG:join(binaryHome,'bots.json'),SESSION_DATA_DIR:join(binaryHome,'data'),BOTMUX_NO_CLAIM:'1',BOTMUX_FENCED_RUN:'1'},stdio:['ignore','pipe','pipe']});
    const childStart=readProcessStartIdentity(child.pid!)!;
@@ -81,15 +83,32 @@ async function setup(options:{failResultAudit?:boolean;denyActorWrites?:readonly
   }
   const exitCode=await runBytedcliExecClient({sessionId:'acceptance',port,requestId:`acceptance-${++sequence}`,argv,stdout:b=>stdout+=b,stderr:b=>stderr+=b,...extra});return {exitCode,stdout,stderr};
  };
- return {client,calls,dispatches,ds,root,auditRoot,mintedAccounts,identityLookups,requests:()=>requestCount,writes:()=>rows(writesFile),attempts:()=>rows(attemptsFile),waitDispatch:()=>{dispatchGate=deferred();return {entered:dispatchEntered.promise,release:dispatchGate.resolve};},lookup:()=>lookup,grant:(v:boolean)=>grant=v,revoke:()=>epoch++,changePolicy:()=>policy={...policy,credentialSource:'platform'},
+ const setGlobal=(rules:Record<string,string>)=>{operationPolicy();const next=join(privateRoot,'policy','next');writeFileSync(next,JSON.stringify({schema:'botmux.bytedcli-operation-policy.v1',cliVersion:'0.199.0',catalogVersion:'2026-11-26.1',rules}),{mode:0o600});renameSync(next,join(privateRoot,'policy','operation-policy.json'));};
+ return {client,setGlobal,calls,dispatches,ds,root,auditRoot,mintedAccounts,identityLookups,requests:()=>requestCount,writes:()=>rows(writesFile),attempts:()=>rows(attemptsFile),waitDispatch:()=>{dispatchGate=deferred();return {entered:dispatchEntered.promise,release:dispatchGate.resolve};},lookup:()=>lookup,grant:(v:boolean)=>grant=v,revoke:()=>epoch++,changePolicy:()=>policy={...policy,credentialSource:'platform'},
  waitProvider:()=>{providerGate=deferred();return {entered:entered.promise,release:providerGate.resolve};}};
 }
 const read=['codebase','repo','list'];const write=['codebase','mr','close','42','--repo','org/repo'];
+it('HTTP fixed write ID never retries a fake upstream mutation after policy replacement or cache GC',async()=>{
+ const f=await setup({failResultAudit:true});const first=await f.client(write,{requestId:'fixed-policy-write'});
+ expect(first.stderr).toContain('write_outcome_unknown');expect(f.writes()).toEqual([{account:'a@example.test'}]);
+ f.setGlobal({'codebase.repo.list':'actor'});expect((await f.client(read,{requestId:'policy-gc'})).exitCode).toBe(77);
+ const repeated=await f.client(write,{requestId:'fixed-policy-write'});expect(repeated.stderr).toContain('write_outcome_unknown');expect(repeated.stdout).toBe('');
+ expect(f.attempts().filter(row=>row.operation==='write')).toEqual([{account:'a@example.test',operation:'write',denied:false}]);
+ f.ds.managedTurnOrigin.turnId='next-policy-turn';f.ds.managedTurnOrigin.identityTurnId='next-policy-identity';
+ await f.client(write,{requestId:'fixed-policy-write'});expect(f.writes()).toEqual([{account:'a@example.test'},{account:'a@example.test'}]);
+});
+it('HTTP actor-read authenticates the exact official personal account and deny precedes identity lookup',async()=>{
+ const f=await setup();f.setGlobal({'codebase.repo.list':'actor'});const personal=await f.client(read);expect(personal.exitCode).toBe(0);expect(JSON.parse(personal.stdout).account).toBe('a@example.test');
+ expect(f.mintedAccounts).toEqual(['a@example.test']);expect(f.writes()).toEqual([]);
+ f.grant(false);expect((await f.client(read)).stderr).toContain('actor_auth_required');
+ const lookups=f.lookup();f.setGlobal({'codebase.repo.list':'deny'});expect((await f.client(read)).stderr).toContain('operation_disabled');expect(f.lookup()).toBe(lookups);
+ expect(f.attempts()).toEqual([{account:'a@example.test',operation:'read',denied:false}]);
+});
 it('real HTTP and client execute machine reads without grants, and only A writes while B has arrived',async()=>{
  const f=await setup();f.grant(false);const readResult=await f.client(read);expect(readResult.exitCode).toBe(0);expect(JSON.parse(readResult.stdout)).toMatchObject({account:'machine',cwdEmpty:true,homeEmpty:true,injected:false});expect(f.lookup()).toBe(0);
  expect(f.calls.every(c=>c.endsWith('machine'))).toBe(true);expect((await f.client(write)).stderr).toContain('actor_auth_required');expect(f.dispatches).toHaveLength(1);
  f.grant(true);const written=await f.client(write);expect(written.exitCode).toBe(0);expect(JSON.parse(written.stdout).account).toBe('a@example.test');expect(f.ds.managedTurnOrigin.turnId).toBe('arrival-B');expect(f.dispatches).toHaveLength(2);expect(f.writes()).toEqual([{account:'a@example.test'}]);
- expect(readdirSync(join(f.root,'private'))).toEqual([]);
+ expect(readdirSync(join(f.root,'private'))).toEqual(['policy']);expect(readdirSync(join(f.root,'private','policy'))).toEqual([]);
 });
 it('help/version report the audited catalog without identity lookup or a credential provider',async()=>{
  const f=await setup();f.grant(false);const help=await f.client(['--help']);expect(help.exitCode).toBe(0);
@@ -114,7 +133,7 @@ it('a partial durable write is unknown and the client never retries it',async()=
  expect(result.exitCode).toBe(77);expect(result.stderr).toContain('write_outcome_unknown');expect(f.dispatches).toHaveLength(1);
  const records=readCommittedBytedcliAudit(f.auditRoot);
  expect(f.writes()).toEqual([{account:'a@example.test'}]);expect(records.map(record=>record.phase)).toEqual(['intent']);expect(JSON.stringify(records)).not.toContain('signature');
- expect(readdirSync(join(f.root,'private'))).toEqual([]);
+ expect(readdirSync(join(f.root,'private'))).toEqual(['policy']);expect(readdirSync(join(f.root,'private','policy'))).toEqual([]);
 });
 it('revocation after the real child wrote suppresses success without a second write',async()=>{
  const f=await setup(),gate=f.waitDispatch();const pending=f.client(write);await gate.entered;f.revoke();gate.release();const result=await pending;

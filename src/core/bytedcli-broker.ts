@@ -16,6 +16,7 @@ import { bytedcliContainmentAvailable, markBytedcliStrictSession } from './byted
 import { bytecloudBrokerEnabled } from './identity-policy.js';
 import type { BytedcliOperation } from './bytedcli-operation-policy.js';
 import type { ProcessIdentity } from './current-actor-attestation.js';
+import { createBytedcliHostOperationPolicyReader } from './bytedcli-host-operation-policy.js';
 export interface BytedcliBrokerDependencies {
   readonly authority: (sessionId:string,peer:ProcessIdentity,operation:BytedcliOperation,context?:BytedcliAuthorityRequestContext) => Promise<BytedcliAuthorityResult>;
   readonly personalLeases?: () => Promise<import('./bytedcli-broker-credentials.js').BytedcliLeaseResolver>;
@@ -165,6 +166,7 @@ import { freezeBytedcliHostLayout, type BytedcliHostLayout } from './bytedcli-ho
 export function createProductionBytedcliBroker(host:Omit<import('./bytedcli-broker-authority.js').BytedcliAuthorityDependencies,'contains'>,
   layout:BytedcliHostLayout=freezeBytedcliHostLayout()):BytedcliBroker{
   let executor:BytedcliExecutor|undefined,pending:Promise<BytedcliExecutor>|undefined,closed=false;
+  const operationPolicy = createBytedcliHostOperationPolicyReader(layout.privateRoot);
   const trustedCli=async(signal:AbortSignal):Promise<BytedcliTrustedCli>=>{
     if (layout.unavailableReason || !layout.runtimeStillCurrent()) throw new BytedcliBrokerError('executor_unavailable');
     ensureBytedcliPrivateDirectory(layout.privateRoot);const root=mkdtempSync(join(layout.privateRoot,'probe-'));
@@ -180,7 +182,7 @@ export function createProductionBytedcliBroker(host:Omit<import('./bytedcli-brok
     executor=new BytedcliExecutor({privateRoot:layout.privateRoot,trustedCli,leases,audit:new BytedcliBrokerAudit(layout.auditRoot),networkEnv:layout.networkEnv});
     if(closed)await executor.close();return executor;
   })();
-  return new BytedcliBroker({personalLeases:getLeases,currentWorkerGeneration:id=>host.findSession(id)?.workerGeneration,authority:(sessionId,peer,operation,context)=>resolveBytedcliAuthority({...host,contains:ds=>{
+  return new BytedcliBroker({personalLeases:getLeases,currentWorkerGeneration:id=>host.findSession(id)?.workerGeneration,authority:(sessionId,peer,operation,context)=>resolveBytedcliAuthority({...host,operationPolicy,contains:ds=>{
     if(bytecloudBrokerEnabled(host.policy(ds)))markBytedcliStrictSession(ds);
     if(layout.unavailableReason || !layout.runtimeStillCurrent()) return false;
     return bytedcliContainmentAvailable(ds,layout.protectedRoots);

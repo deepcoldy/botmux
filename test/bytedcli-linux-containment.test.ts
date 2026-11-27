@@ -8,6 +8,7 @@ import { buildFsPolicy } from '../src/adapters/cli/fs-policy.js';
 import { prepareDirectSandbox } from '../src/adapters/backend/sandbox.js';
 import { observeBytedcliLinuxContainment, assertBytedcliLaunchSupported, createBytedcliContainmentReport } from '../src/core/bytedcli-linux-containment.js';
 import { rememberBytedcliContainment, bytedcliContainmentAvailable, acceptBytedcliWorkerContainment } from '../src/core/bytedcli-broker-containment.js';
+import { createBytedcliHostOperationPolicyReader } from '../src/core/bytedcli-host-operation-policy.js';
 
 const usable = process.platform === 'linux' && spawnSync('bwrap', ['--unshare-user', '--unshare-pid', '--tmpfs', '/',
   '--proc', '/proc', '--ro-bind', '/usr', '/usr', '--symlink', 'usr/lib', '/lib', '--symlink', 'usr/lib64', '/lib64', '/usr/bin/true']).status === 0;
@@ -39,10 +40,13 @@ it.skipIf(!usable).each([false, true])('real direct sandbox (tmux args file=%s) 
   // Existing directory profiles are supported; a symlink leaf is explicitly refused below.
   mkdirSync(alias);
   const absent = join(root, 'future-store');
+  const hostAuthority = join(root, '.botmux', 'host-authority');
+  const hostPolicyRoot = join(hostAuthority, 'bytedcli-broker');
+  const hostPolicyFile = join(hostPolicyRoot, 'policy', 'operation-policy.json');
   const context = { platform: 'linux' as const, homeDir: root, botmuxHome: join(root, '.botmux'), sessionDataDir: data,
     workingDir: trusted, botmuxInstallRoot: trusted, botmuxInstallRootMaskPaths: [join(trusted, 'src/private')],
     botHome: join(root, '.botmux/bots/app'), sessionId: 's', currentAppId: 'app', redirectedCliData: true,
-    protectedDenyPaths: [credential, alias, absent], protectedReadOnlyPaths: [trusted],
+    protectedDenyPaths: [credential, alias, absent, hostAuthority], protectedReadOnlyPaths: [trusted],
     authPaths: [join(credential, 'profile')], mandatoryReadOnlyPaths: [join(credential, 'profile/token'), join(trusted, 'src/private/token')],
     userPaths: { readWrite: [root, join(credential, 'profile'), trusted, join(trusted, 'bin'), join(trusted, 'src')] } };
   const policy = buildFsPolicy(context);
@@ -51,7 +55,7 @@ it.skipIf(!usable).each([false, true])('real direct sandbox (tmux args file=%s) 
   let child: ReturnType<typeof spawn> | undefined;
   try {
     sandbox = prepareDirectSandbox({ sessionId: 's', dataDir: data, policy, home: root, chdir: trusted,
-      bytedcliBroker: true, useBwrapArgsFile, cliBin: '/bin/sh', cliArgs: ['-c', `echo READY; read answer; test ! -r '${credential}/profile/token' || exit 21; test ! -r '${credential}/future' || exit 22; test ! -r '${alias}/profile/token' || exit 25; test ! -r '${absent}/token' || exit 26; test ! -r '${trusted}/src/private/token' || exit 29; test ! -r /proc/${process.pid}/environ || exit 23; echo changed > '${trusted}/bin/cli' 2>/dev/null && exit 24; echo changed > '${trusted}/src/worker.ts' 2>/dev/null && exit 27; echo changed > '${trusted}/src/core/bytedcli-broker-client.ts' 2>/dev/null && exit 28; mv '${root}/install' '${root}/install-replaced' 2>/dev/null && exit 30; cat '${root}/model-login'; echo PASS` ] });
+      bytedcliBroker: true, useBwrapArgsFile, cliBin: '/bin/sh', cliArgs: ['-c', `echo READY; read answer; test ! -r '${credential}/profile/token' || exit 21; test ! -r '${credential}/future' || exit 22; test ! -r '${alias}/profile/token' || exit 25; test ! -r '${absent}/token' || exit 26; test ! -r '${hostPolicyFile}' || exit 31; echo changed > '${hostPolicyFile}' 2>/dev/null && exit 32; test ! -r '${trusted}/src/private/token' || exit 29; test ! -r /proc/${process.pid}/environ || exit 23; echo changed > '${trusted}/bin/cli' 2>/dev/null && exit 24; echo changed > '${trusted}/src/worker.ts' 2>/dev/null && exit 27; echo changed > '${trusted}/src/core/bytedcli-broker-client.ts' 2>/dev/null && exit 28; mv '${root}/install' '${root}/install-replaced' 2>/dev/null && exit 30; cat '${root}/model-login'; echo PASS` ] });
     expect(sandbox).not.toBeNull();
     child = spawn(sandbox!.bin, sandbox!.args, { env: { PATH: '/usr/bin:/bin', HOME: root, ...sandbox!.env }, stdio: ['pipe', 'pipe', 'pipe'] });
     let stdout = '', stderr = '';
@@ -65,7 +69,7 @@ it.skipIf(!usable).each([false, true])('real direct sandbox (tmux args file=%s) 
       try { children = readFileSync(`/proc/${pid}/task/${pid}/children`, 'utf8').trim().split(/\s+/).filter(Boolean).map(Number); } catch { /* exited */ }
       return children.flatMap(id => [id, ...descendants(id)]);
     };
-    const contract = { workerGeneration: 1, credentialRoots: [credential, alias, absent], executableReadOnlyRoots: [trusted] };
+    const contract = { workerGeneration: 1, credentialRoots: [credential, alias, absent, hostAuthority], executableReadOnlyRoots: [trusted] };
     const pid = descendants(child.pid!).find(id => observeBytedcliLinuxContainment(id, contract));
     expect(pid, stderr).toBeDefined();
     const observed = observeBytedcliLinuxContainment(pid!, contract)!;
@@ -88,6 +92,9 @@ it.skipIf(!usable).each([false, true])('real direct sandbox (tmux args file=%s) 
     writeFileSync(join(credential, 'future'), 'late-fixture');
     mkdirSync(absent, { recursive: true });
     writeFileSync(join(absent, 'token'), 'late-store-fixture');
+    const hostReader = createBytedcliHostOperationPolicyReader(hostPolicyRoot); expect(hostReader().errorCode).toBeUndefined();
+    const hostPolicy = JSON.stringify({schema:'botmux.bytedcli-operation-policy.v1',cliVersion:'0.199.0',catalogVersion:'2026-11-26.1',rules:{'codebase.mr.list':'actor'}});
+    writeFileSync(hostPolicyFile, hostPolicy, { mode:0o600 });expect(hostReader().policy?.rules['codebase.mr.list']).toBe('actor');
     child.stdin!.end('go\n');
     const [status] = await exited;
     expect(status, stderr).toBe(0);
@@ -95,6 +102,7 @@ it.skipIf(!usable).each([false, true])('real direct sandbox (tmux args file=%s) 
     expect(readFileSync(join(trusted, 'bin/cli'), 'utf8')).toBe('trusted-fixture');
     expect(readFileSync(join(trusted, 'src/worker.ts'), 'utf8')).toBe('trusted-worker');
     expect(readFileSync(join(trusted, 'src/core/bytedcli-broker-client.ts'), 'utf8')).toBe('trusted-client');
+    expect(readFileSync(hostPolicyFile, 'utf8')).toBe(hostPolicy);
   } finally {
     child?.kill('SIGKILL');
     sandbox?.cleanup();
