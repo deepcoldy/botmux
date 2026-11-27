@@ -1,7 +1,14 @@
 #!/usr/bin/env node
 import { scheduleCreatePlacement, scheduleSupportLines } from './core/schedule-followup.js';
 import { replyDeliveryFromEnv, sendCompletionHintKey } from './services/send-completion-hint.js';
-import { selectReplyMessageId, parseReplyMessageTarget, crossChatOriginForSend, crossChatSenderForSend } from './core/reply-message.js';
+import {
+  buildAbsorbedTurnSettlementGate,
+  selectReplyMessageId,
+  parseReplyMessageTarget,
+  crossChatOriginForSend,
+  crossChatSenderForSend,
+  resolvePromotedAbsorbedTurnForCompletion,
+} from './core/reply-message.js';
 import { assertMessageTopicAvailable, assertSendTopicsAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from './cli/topic-send-guard.js';
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
 import { isMessageListenerTaskAnchor, isSilentMessageListenerSession, messageListenerSendBlocked } from './core/message-listener-silence.js';
@@ -66,6 +73,7 @@ import {
   findAncestorSessionMarkerContext as findLiveAncestorSessionContext,
   findAuthenticatedAncestorSessionContext,
   resolveSessionContext,
+  selectAbsorbedTurnsToSettle,
 } from './core/session-marker.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import {
@@ -243,7 +251,7 @@ import { CardStreamStore } from './services/card-stream-store.js';
 import { TurnReplyCardStore } from './services/turn-reply-card.js';
 import { patchPublishedGroupCard, readGroupContextAuthorOrigin } from './services/group-context-publication.js';
 import { markGroupContextCardPurpose } from './im/lark/group-context-card.js';
-import { TurnSendLedger, type TurnSendKind } from './services/turn-send-ledger.js';
+import { TurnSendLedger, type TurnSendKind, type TurnSendLedgerKey, type TurnSendLedgerRecord } from './services/turn-send-ledger.js';
 import { feedbackPolicyForScheduledSend, ScheduleSendAttempt, scheduledSessionRun } from './core/scheduled-send.js';
 import { buildTurnReplyCard, replyCardPresentation } from './im/lark/turn-reply-card.js';
 import { CardRuntimeStatusBridge } from './services/card-runtime-status-bridge.js';
@@ -435,7 +443,12 @@ import {
   isFinalBridgeSendMarker,
   stripTrailingOaiMemoryCitation,
 } from './services/bridge-fallback-gate.js';
-import { recordBridgeReplyMarker } from './services/bridge-reply-marker.js';
+import {
+  hasBridgeReplyMarker,
+  recordBridgeReplyMarker,
+  recordBridgeReplyMarkerSnapshot,
+  withBridgeReplyMarkerLock,
+} from './services/bridge-reply-marker.js';
 import { effectiveCrossChatFollowThreadMode, ensureCrossChatFollowThreadAtBinding, persistCrossChatFollowThreadOffBeforeProvider } from './services/cross-chat-follow-thread-store.js';
 import { recordSessionTurnReplies, type SessionTurnReply } from './services/session-turns.js';
 import {
@@ -13165,8 +13178,94 @@ async function cmdSend(
   assertSessionTransportOrExit({ chatId: s.chatId, larkAppId: s.larkAppId }, 'send');
   let deferredMaterializedByThisCommand = false;
   let deferredTopicRootMessageIdForOutput: string | undefined;
+  let privateReplyDeliveredRecipient: string | undefined;
 
   const turnSendLedger = new TurnSendLedger(resolveDataDir());
+  const preCatchupTurnId = originTurnId ?? currentTurnId;
+  const preCatchupDispatchAttempt = originDispatchAttempt;
+  const preCatchupKey = preCatchupTurnId ? {
+    larkAppId: originSession?.larkAppId ?? s.larkAppId!,
+    sessionId: originSessionId ?? sid,
+    turnId: preCatchupTurnId,
+    ...(preCatchupDispatchAttempt !== undefined ? { dispatchAttempt: preCatchupDispatchAttempt } : {}),
+  } : undefined;
+  const recordCatchupFinalMarker = (
+    key: TurnSendLedgerKey,
+    final: NonNullable<TurnSendLedgerRecord['final']>,
+  ): void => {
+    const markerSessionId = originSessionId ?? sid;
+    const markerTurnId = key.turnId;
+    const replyTurnId = explicitReplyTo
+      ?? selectReplyMessageId(s, markerTurnId, liveMarkerCtx, explicitReplyTo)
+      ?? markerTurnId;
+    const turnTarget = parseReplyMessageTarget(s.turnReplyContexts?.[replyTurnId]?.target);
+    const targetChatId = overrideChatId ?? s.chatId;
+    const target = resolveSendTarget({
+      into: sendInto, topLevel: sendTopLevel, chatScope: s.scope === 'chat', chatId: targetChatId,
+      rootMessageId: s.rootMessageId,
+      replyTargetRootId: turnTarget && turnTarget.mode !== 'plain' ? turnTarget.rootMessageId : undefined,
+      replyTargetTurnId: replyTurnId,
+      replyTargetQuoteOnly: s.replyTargets?.[replyTurnId]?.quoteOnly,
+      currentTurnId: markerTurnId,
+    });
+    const detoured = !!sendTopLevel || !!overrideChatId || !!sendInto || markerSessionId !== sid;
+    const catchupContent = stripTrailingOaiMemoryCitation(sendPlan.contentFile
+      ? readFileSync(sendPlan.contentFile, 'utf-8')
+      : (sendPlan.stdinContent ?? normalizePositionalSendContent(sendPlan.invocation.positionals.join(' '))));
+    withBridgeReplyMarkerLock(resolveDataDir(), markerSessionId, () => {
+      if (hasBridgeReplyMarker({
+        dataDir: resolveDataDir(), sessionId: markerSessionId, turnId: markerTurnId,
+        messageId: final.messageId, responseKind: 'final',
+      })) return;
+      const identity = {
+        dataDir: resolveDataDir(),
+        sessionId: markerSessionId,
+        sentAtMs: final.sentAtMs ?? final.deliveredAtMs,
+        messageId: final.messageId,
+        turnId: markerTurnId,
+        responseKind: 'final' as const,
+      };
+      if (final.marker) {
+        recordBridgeReplyMarkerSnapshot({ ...final.marker, ...identity });
+        return;
+      }
+      // Pre-upgrade ledger rows have no marker snapshot. Keep their legacy
+      // recovery path, but never relabel the old delivery as auxiliary/progress.
+      recordBridgeReplyMarker({
+        ...identity,
+        deliveryKind: detoured ? 'detoured_send' : 'current_session_send',
+        content: catchupContent,
+        dispatchAttempt: key.dispatchAttempt,
+        targetChatId,
+        targetRootMessageId: deferredTopicRootMessageIdForOutput
+          ?? (target && target.mode !== 'plain' ? target.rootMessageId : undefined),
+        targetSessionId: sid,
+        crossChatFollowThread: effectiveCrossChatFollowThreadMode({
+          targetChatId, sourceChatId: (originSession ?? s).chatId, noFollowThread,
+        }),
+        followThreadEpoch: (originSession ?? s).followThreadEpoch,
+      });
+    });
+  };
+  // A crash can leave a committed final without its bridge marker even when
+  // there is no queued successor to advance. Restore that marker independently
+  // of the queue-advance loop; the journal lock keeps the operation idempotent.
+  if (!scheduleRemoveSelfRequested
+    && liveMarkerCtx?.markerPid && liveMarkerCtx.turnId
+    && !liveMarkerCtx.queuedTurnId && !(liveMarkerCtx.queuedTurns && liveMarkerCtx.queuedTurns.length > 0)) {
+    const activeMarkerKey = {
+      larkAppId: originSession?.larkAppId ?? s.larkAppId,
+      sessionId: originSessionId ?? sid,
+      turnId: liveMarkerCtx.turnId,
+      ...(liveMarkerCtx.dispatchAttempt !== undefined
+        ? { dispatchAttempt: liveMarkerCtx.dispatchAttempt }
+        : {}),
+    };
+    const activePrior = turnSendLedger.read(activeMarkerKey);
+    if (activePrior?.final && activePrior.dispatchAttempt === liveMarkerCtx.dispatchAttempt) {
+      recordCatchupFinalMarker(activeMarkerKey, activePrior.final);
+    }
+  }
   while (!scheduleRemoveSelfRequested
     && liveMarkerCtx?.markerPid && liveMarkerCtx.turnId
     && (liveMarkerCtx.queuedTurnId || (liveMarkerCtx.queuedTurns && liveMarkerCtx.queuedTurns.length > 0))) {
@@ -13178,7 +13277,19 @@ async function cmdSend(
     };
     const activePrior = turnSendLedger.read(activeMarkerKey);
     if (activePrior?.final) {
-      const advResult = advanceAncestorSessionTurn(sendDataDir, liveMarkerCtx.markerPid, liveMarkerCtx.turnId);
+      const priorSettled = activePrior.final.settledAbsorbedTurnIds;
+      const advResult = advanceAncestorSessionTurn(
+        sendDataDir,
+        liveMarkerCtx.markerPid,
+        liveMarkerCtx.turnId,
+        {
+          consumedDispatchAttempt: liveMarkerCtx.dispatchAttempt,
+          ...(priorSettled && priorSettled.length > 0
+            ? { canSettleAbsorbed: (turn: import('./core/session-marker.js').QueuedTypeAheadTurn) => priorSettled.includes(turn.turnId) }
+            : {}),
+          beforeTransition: () => recordCatchupFinalMarker(activeMarkerKey, activePrior.final!),
+        },
+      );
       if (advResult.advanced && advResult.turnId) {
         liveMarkerCtx = findLiveAncestorSessionContext(sendDataDir);
         originTurnId = advResult.turnId;
@@ -13186,9 +13297,29 @@ async function cmdSend(
         originDispatchAttempt = liveMarkerCtx?.dispatchAttempt;
         continue;
       }
+      if (advResult.settledAbsorbedTurnIds && advResult.settledAbsorbedTurnIds.length > 0) {
+        liveMarkerCtx = findLiveAncestorSessionContext(sendDataDir);
+        break;
+      }
     }
     break;
   }
+  const catchupAdvanced = preCatchupTurnId !== (originTurnId ?? currentTurnId)
+    || preCatchupDispatchAttempt !== originDispatchAttempt;
+  // Snapshot mid-turn absorbed queued turns BEFORE any provider I/O so a
+  // follow-up arriving/absorbed while Lark HTTP is in flight can never be
+  // silently settled by a final formulated before it existed.
+  const preSendHostTurnId = originTurnId ?? currentTurnId;
+  const preSendAbsorbedTurnIds = new Set(
+    (liveMarkerCtx?.queuedTurns ?? [])
+      .filter(q =>
+        q.inputConsumed === true
+        && !!preSendHostTurnId
+        && q.absorbedIntoTurnId === preSendHostTurnId
+        && q.absorbedIntoDispatchAttempt === originDispatchAttempt
+        && q.dispatchAttempt === undefined)
+      .map(q => q.turnId),
+  );
 
   const scheduleCleanupPlan = planScheduleFinalCleanup({
     requested: scheduleRemoveSelfRequested,
@@ -14181,6 +14312,103 @@ async function cmdSend(
       targetRootMessageId: sendInto, followThreadEpoch: (originSession ?? s).followThreadEpoch,
     });
   };
+  let resolveActualDeliveredTargetForLedger: (() => ReturnType<typeof resolveSendTarget> | undefined) | undefined;
+  const absorbedSettlementGateForTarget = (
+    actualDeliveredTarget: ReturnType<typeof resolveSendTarget> | undefined,
+  ) => buildAbsorbedTurnSettlementGate({
+    session: s,
+    originSessionId,
+    originDispatchAttempt,
+    preSendAbsorbedTurnIds,
+    actualDeliveredTarget,
+    privateReply: privateReplyDeliveredRecipient !== undefined,
+    replyTargetSenderOpenId: privateReplyDeliveredRecipient ?? replyTargetSenderOpenId,
+    explicitReplyTo,
+    routingOverride: sendTopLevel || !!overrideChatId || !!sendInto || explicitQuote !== undefined,
+    excludedSendKind: !!vcMeetingManagedSendOrigin
+      || isOriginDocCommentTurn
+      || isSlashSend
+      || !!scheduleRemoveSelfTaskId
+      || !!scheduledOriginRun,
+    crossPrincipalInterruption: config.crossPrincipalInterruption === true,
+  });
+  const absorbedSettlementAdvanceOpts = (
+    actualDeliveredTarget: ReturnType<typeof resolveSendTarget> | undefined,
+  ) => ({
+    consumedDispatchAttempt: originDispatchAttempt,
+    canSettleAbsorbed: absorbedSettlementGateForTarget(actualDeliveredTarget),
+  });
+  const resolveSettledAbsorbedTurnIdsForLedger = (): string[] | undefined => {
+    if (effectiveResponseKind !== 'final' || !liveMarkerCtx || !resolveActualDeliveredTargetForLedger) return undefined;
+    const gate = absorbedSettlementGateForTarget(resolveActualDeliveredTargetForLedger());
+    const { settled } = selectAbsorbedTurnsToSettle(liveMarkerCtx, originTurnId ?? currentTurnId, gate);
+    return settled.length > 0 ? settled.map(entry => entry.turnId) : undefined;
+  };
+  type LedgerFinalRecord = NonNullable<TurnSendLedgerRecord['final']>;
+  let finalQueueTransitionDeferred = false;
+  /** Replay and crash recovery share one durable convergence point. The ledger
+   *  supplies the original message ID/time and the exact settlement allow-list;
+   *  no destination decision is recomputed from mutable session state. */
+  const ensureLedgerFinalTransition = (opts: {
+    key: TurnSendLedgerKey;
+    markerSessionId: string;
+    markerTurnId: string | undefined;
+    allowAdvance?: boolean;
+    writeMarker: (final: LedgerFinalRecord) => void;
+  }): ReturnType<typeof advanceAncestorSessionTurn> => {
+    let final: LedgerFinalRecord | undefined;
+    try { final = turnSendLedger.read(opts.key)?.final; } catch { /* handled as deferred below */ }
+    if (!final) {
+      finalQueueTransitionDeferred = true;
+      console.error('botmux send: 最终答复已投递，但发送账本暂不可读；请原样重试以补做轮次交接（不会重复发送 final）');
+      return { advanced: false, turnId: opts.markerTurnId };
+    }
+    const committedFinal = final;
+    let writeAttempted = false;
+    const writeMarkerOnce = () => {
+      if (writeAttempted) return;
+      writeAttempted = true;
+      try {
+        // The existence check and append are one journal-locked operation even
+        // when schedule cleanup forbids PID advancement or the PID lock failed.
+        withBridgeReplyMarkerLock(resolveDataDir(), opts.markerSessionId, () => {
+          if (hasBridgeReplyMarker({
+            dataDir: resolveDataDir(), sessionId: opts.markerSessionId,
+            turnId: opts.markerTurnId ?? opts.key.turnId,
+            messageId: committedFinal.messageId, responseKind: 'final',
+          })) return;
+          opts.writeMarker(committedFinal);
+        });
+      } catch (error) {
+        finalQueueTransitionDeferred = true;
+        console.error(`botmux send: 最终答复已投递，但回复标记补记失败（${error instanceof Error ? error.message : String(error)}）；请原样重试`);
+      }
+    };
+    if (opts.allowAdvance === false || !liveMarkerCtx?.markerPid) {
+      writeMarkerOnce();
+      return { advanced: false, turnId: liveMarkerCtx?.turnId ?? opts.markerTurnId };
+    }
+    try {
+      return advanceAncestorSessionTurn(
+        sendDataDir,
+        liveMarkerCtx.markerPid,
+        opts.markerTurnId,
+        {
+          consumedDispatchAttempt: originDispatchAttempt,
+          canSettleAbsorbed: turn => committedFinal.settledAbsorbedTurnIds?.includes(turn.turnId) === true,
+          beforeTransition: writeMarkerOnce,
+        },
+      );
+    } catch (error) {
+      // Provider delivery already succeeded. Publish an idempotent fallback
+      // marker and ask for an exact replay instead of reporting total failure.
+      writeMarkerOnce();
+      finalQueueTransitionDeferred = true;
+      console.error(`botmux send: 最终答复已投递，但轮次交接暂未落盘（${error instanceof Error ? error.message : String(error)}）；请原样重试（不会重复发送 final）`);
+      return { advanced: false, turnId: liveMarkerCtx.turnId };
+    }
+  };
+
   // Require parent-PID-verified `trustedRelayCtx` (never raw child-mutable
   // `BOTMUX_HOST_RELAY_AUTHORIZED=1`) before trusting local turns.sqlite access.
   const mustProxyStructuredReply = !trustedRelayCtx && (
@@ -14325,11 +14553,14 @@ async function cmdSend(
     renderedContent: string,
     dispatch: (providerUuid?: string) => Promise<string>,
     sentAtMs?: number,
+    marker?: import('./services/turn-send-ledger.js').TurnSendLedgerMarkerSource,
   ): Promise<{ messageId: string; replayed: boolean; sentAtMs?: number }> => {
     return turnSendKey
       ? turnSendLedger.execute(turnSendKey, effectiveResponseKind, renderedContent, dispatch, {
           ...(sentAtMs !== undefined ? { sentAtMs } : {}),
+          ...(marker ? { marker } : {}),
           beforeDispatch: persistOffBeforeProvider,
+          resolveSettledAbsorbedTurnIds: resolveSettledAbsorbedTurnIdsForLedger,
           ...(scheduledSendAttempt ? { noSideEffect: (error: unknown) =>
             !scheduledProviderEffectStarted && knownPreProviderRejections.has(error) } : {}),
         })
@@ -14344,11 +14575,145 @@ async function cmdSend(
           };
         })();
   };
+  const turnRequestIdentityForReplayHost = (hostTurnId: string): string => {
+    const crossOrigin = crossChatOriginForSend({
+      replyContext: s.turnReplyContexts?.[hostTurnId],
+      replyTarget: s.replyTargets?.[hostTurnId],
+      frozenTurnDispatch,
+    });
+    const sender = explicitVcMeetingImOrigin?.replyTargetSenderOpenId ?? crossChatSenderForSend({
+      crossChatOrigin: crossOrigin,
+      sendingToOriginSessionChat,
+      frozenTurnSender: pickTurnReplyTarget(s, hostTurnId)?.senderOpenId
+        ?? s.turnReplyContexts?.[hostTurnId]?.replyTargetSenderOpenId,
+      legacySender: undefined,
+      originQuoteSender: s.quoteTargetSenderOpenId,
+      originLastCaller: s.lastCallerOpenId,
+      originOwner: s.ownerOpenId,
+    });
+    const identity = JSON.parse(turnRequestIdentity) as any;
+    return canonicalJson({
+      ...identity,
+      addressing: { ...identity.addressing, replyTargetSenderOpenId: sender },
+    });
+  };
+  let replayTurnKey: TurnSendLedgerKey | undefined = turnSendKey;
+  let replayMarkerTurnId = originTurnId ?? currentTurnId;
+  let replayDispatchAttempt = originDispatchAttempt;
+  const resolveReplayPrimaryTarget = () => {
+    const replayChatId = overrideChatId ?? s.chatId;
+    return !sendInto && !sendTopLevel && !overrideChatId && frozenTurnReplyTarget
+      ? frozenTurnReplyTarget
+      : resolveSendTarget({
+          into: sendInto, topLevel: sendTopLevel, chatScope: s.scope === 'chat', chatId: replayChatId,
+          rootMessageId: s.rootMessageId, replyTargetRootId: turnReplyTarget?.rootMessageId,
+          replyTargetTurnId: turnReplyTarget?.turnId, replyTargetQuoteOnly: turnReplyTarget?.quoteOnly,
+          currentTurnId: replayMarkerTurnId,
+        });
+  };
+  const recordReplayPrimaryBridgeMarker = (final: LedgerFinalRecord) => {
+    const replayText = customFinal ? expectedLinkRenderedContent : extractCardText(content);
+    const replayChatId = overrideChatId ?? s.chatId;
+    const replayTarget = resolveReplayPrimaryTarget();
+    const markerSessionId = originSessionId ?? sid;
+    const markerTurnId = replayMarkerTurnId;
+    if (final.marker) {
+      recordBridgeReplyMarkerSnapshot({
+        ...final.marker,
+        dataDir: resolveDataDir(),
+        sessionId: markerSessionId,
+        sentAtMs: final.sentAtMs ?? final.deliveredAtMs,
+        messageId: final.messageId,
+        turnId: markerTurnId,
+        responseKind: 'final',
+      });
+      return;
+    }
+    const detoured = !!sendTopLevel || !!overrideChatId || !!sendInto || markerSessionId !== sid;
+    const pureFile = fileOnlyPrimaryRequested && !replayText.trim()
+      && images.length === 0 && mentionArgs.length === 0;
+    const pureVideo = customCard ? false : shouldSendAsPureVideo({
+      hasBodyText: !!replayText.trim(), imageCount: images.length,
+      fileCount: files.length, videoCount: videoAttachments.length, mentionCount: mentionArgs.length,
+    });
+    const nonPatchable = asVoice || isOriginDocCommentTurn || (customCard && !customFinal)
+      || pureFile || pureVideo;
+    recordBridgeReplyMarker({
+      dataDir: resolveDataDir(), sessionId: markerSessionId,
+      sentAtMs: final.sentAtMs ?? final.deliveredAtMs, messageId: final.messageId,
+      deliveryKind: detoured ? 'detoured_send' : 'current_session_send',
+      content: replayText, responseKind: effectiveResponseKind, turnId: markerTurnId,
+      terminalCarrier: nonPatchable ? 'non_patchable' : 'standard_reply_card',
+      dispatchAttempt: replayDispatchAttempt,
+      targetChatId: replayChatId,
+      targetRootMessageId: deferredTopicRootMessageIdForOutput
+        ?? (replayTarget.mode === 'plain' ? undefined : replayTarget.rootMessageId),
+      targetSessionId: sid,
+      crossChatFollowThread: effectiveFollowThreadMode,
+      followThreadEpoch: (originSession ?? s).followThreadEpoch,
+    });
+  };
+
   let existingTurnPrimary: { messageId: string; replayed: boolean; sentAtMs?: number } | undefined;
   try {
-    existingTurnPrimary = turnSendKey
-      ? await turnSendLedger.replayOrThrow(turnSendKey, effectiveResponseKind, turnRequestIdentity)
-      : undefined;
+    // Catch-up may have moved the active turn before request identity was
+    // computed. Try the original host first so an exact replay can never turn
+    // into "new turn B's final delivered to old host A".
+    if (catchupAdvanced && preCatchupKey && effectiveResponseKind === 'final') {
+      try {
+        const originalReplay = await turnSendLedger.replayOrThrow(
+          preCatchupKey, effectiveResponseKind, turnRequestIdentityForReplayHost(preCatchupTurnId!),
+        );
+        if (originalReplay) {
+          existingTurnPrimary = originalReplay;
+          replayTurnKey = preCatchupKey;
+          replayMarkerTurnId = preCatchupTurnId;
+          replayDispatchAttempt = preCatchupDispatchAttempt;
+        }
+      } catch (error) {
+        // Reuse is safe only for an exact replay. A same-root turn is not
+        // necessarily an old request: only an explicit old-turn binding can
+        // create the forbidden "B final delivered to A" combination.
+        if (explicitReplyTo === preCatchupTurnId || replyMessageId === preCatchupTurnId) {
+          throw new Error(`会话已从 ${preCatchupTurnId} 晋升，不能沿用旧宿主 final 请求；请为新轮次重新选择回复目标`, { cause: error });
+        }
+        // A different reply target or ordinary new B reply remains legitimate.
+      }
+    }
+    if (!existingTurnPrimary && !catchupAdvanced && effectiveResponseKind === 'final'
+      && liveMarkerCtx?.promotedAbsorbedTurn && liveMarkerCtx.promotedFromTurnId) {
+      const previousTurnId = liveMarkerCtx.promotedFromTurnId;
+      const previousKey: TurnSendLedgerKey = {
+        larkAppId: originSession?.larkAppId ?? s.larkAppId!,
+        sessionId: originSessionId ?? sid,
+        turnId: previousTurnId,
+        ...(liveMarkerCtx.promotedFromDispatchAttempt !== undefined
+          ? { dispatchAttempt: liveMarkerCtx.promotedFromDispatchAttempt } : {}),
+      };
+      try {
+        const previousReplay = await turnSendLedger.replayOrThrow(
+          previousKey, effectiveResponseKind, turnRequestIdentityForReplayHost(previousTurnId),
+        );
+        if (previousReplay) {
+          existingTurnPrimary = previousReplay;
+          replayTurnKey = previousKey;
+          replayMarkerTurnId = previousTurnId;
+          replayDispatchAttempt = liveMarkerCtx.promotedFromDispatchAttempt;
+        }
+      } catch (error) {
+        // A different destination is a genuinely new answer. Reusing the old
+        // host's destination with a different request is never safe: require
+        // the caller to construct the promoted turn's request explicitly.
+        if (explicitReplyTo === previousTurnId || replyMessageId === previousTurnId) {
+          throw new Error(`会话已从 ${previousTurnId} 晋升，不能沿用旧宿主 final 请求；请为新轮次重新选择回复目标`, { cause: error });
+        }
+      }
+    }
+    if (!existingTurnPrimary) {
+      existingTurnPrimary = turnSendKey
+        ? await turnSendLedger.replayOrThrow(turnSendKey, effectiveResponseKind, turnRequestIdentity)
+        : undefined;
+    }
   } catch (error) {
     console.error(`botmux send refused: ${error instanceof Error ? error.message : String(error)}`);
     process.exit(2);
@@ -14356,9 +14721,7 @@ async function cmdSend(
   if (existingTurnPrimary) {
     if (existingTurnPrimary.sentAtMs !== undefined) {
       const replaySessionId = isOriginDocCommentTurn ? originSessionId! : (originSessionId ?? sid);
-      const replayTurnId = isOriginDocCommentTurn
-        ? (originTurnId ?? docTarget?.turnId)
-        : (originTurnId ?? currentTurnId);
+      const replayTurnId = replayMarkerTurnId;
       const replayPureVideo = !customCard && !asChoice && shouldSendAsPureVideo(primaryShape);
       const replayStructuredText = asVoice || isOriginDocCommentTurn
         ? content
@@ -14383,30 +14746,30 @@ async function cmdSend(
         messageId: existingTurnPrimary.messageId, targetChatId: followThreadTargetChatId,
         ...(sendInto ? { targetRootMessageId: sendInto } : {}),
         followThreadEpoch: (originSession ?? s).followThreadEpoch,
-        sourceTurnId: originTurnId ?? currentTurnId,
+        sourceTurnId: replayMarkerTurnId,
       });
       if (!bound) console.error('botmux send: 已复用投递，但跨群话题绑定补建失败');
     }
     // A retry after a lost reply-card mark completes it; a final already on
     // the card is left alone by the store.
-    if (effectiveResponseKind === 'final' && currentTurnId) {
-      await noteTurnFinalOutsideReplyCard({ larkAppId: appId, sessionId: sid, turnId: currentTurnId, dispatchAttempt: originDispatchAttempt },
+    if (effectiveResponseKind === 'final' && replayMarkerTurnId) {
+      await noteTurnFinalOutsideReplyCard({ larkAppId: appId, sessionId: sid, turnId: replayMarkerTurnId, dispatchAttempt: replayDispatchAttempt },
         overrideChatId ?? s.chatId, sendTopLevel || !!sendInto || !!overrideChatId);
     }
     await removeScheduleSelfAfterFinal();
-    if (scheduleSelfCleanup?.removed && liveMarkerCtx?.markerPid) {
-      advanceAncestorSessionTurn(
-        sendDataDir,
-        liveMarkerCtx.markerPid,
-        originTurnId ?? currentTurnId,
-      );
-    }
+    ensureLedgerFinalTransition({
+      key: replayTurnKey!,
+      markerSessionId: originSessionId ?? sid,
+      markerTurnId: replayMarkerTurnId,
+      allowAdvance: !scheduleRemoveSelfTaskId || scheduleSelfCleanup?.removed === true,
+      writeMarker: recordReplayPrimaryBridgeMarker,
+    });
     console.error(`✓ 已复用本轮最终回答 ${existingTurnPrimary.messageId}`);
     console.log(JSON.stringify({
       success: true,
       messageId: existingTurnPrimary.messageId,
       sessionId: sid,
-      turnId: currentTurnId,
+      turnId: replayMarkerTurnId,
       replayed: true,
       ...(scheduleSelfCleanup ? { scheduleSelfCleanup } : {}),
     }));
@@ -14506,12 +14869,52 @@ async function cmdSend(
     const { rmSync } = await import('node:fs');
     const targetChatId = overrideChatId ?? s.chatId;
     let voicePrimaryOutputChatId = targetChatId;
+    let voiceActualDeliveredTarget = !sendInto && !sendTopLevel && !overrideChatId && frozenTurnReplyTarget
+      ? frozenTurnReplyTarget
+      : resolveSendTarget({
+          into: sendInto,
+          topLevel: sendTopLevel,
+          chatScope: s.scope === 'chat',
+          chatId: targetChatId,
+          rootMessageId: s.rootMessageId,
+          replyTargetRootId: turnReplyTarget?.rootMessageId,
+          replyTargetTurnId: turnReplyTarget?.turnId,
+          replyTargetQuoteOnly: turnReplyTarget?.quoteOnly,
+          currentTurnId,
+        });
     let dir: string | undefined;
     let voiceDurationMs: number | undefined;
     try {
       // Attribute the send to its start, not a delayed synthesis/provider ACK
       // that may arrive after another input was folded into the native turn.
       const sentAtMs = Date.now();
+      resolveActualDeliveredTargetForLedger = () => deferredTopicRootMessageIdForOutput
+        ? { mode: 'thread', rootMessageId: deferredTopicRootMessageIdForOutput }
+        : voiceActualDeliveredTarget;
+      const voiceCrossChatFollowThread = effectiveCrossChatFollowThreadMode({
+        targetChatId: voicePrimaryOutputChatId,
+        sourceChatId: (originSession ?? s).chatId,
+        noFollowThread,
+      });
+      const voiceMarkerMetadata = (): import('./services/turn-send-ledger.js').TurnSendLedgerMarkerInput => {
+        const markerSessionId = originSessionId ?? sid;
+        const detoured = !!sendTopLevel || !!overrideChatId || !!sendInto || markerSessionId !== sid;
+        return {
+          deliveryKind: detoured ? 'detoured_send' : 'current_session_send',
+          content,
+          responseKind: effectiveResponseKind,
+          terminalCarrier: 'non_patchable',
+          dispatchAttempt: originDispatchAttempt,
+          targetChatId: voicePrimaryOutputChatId,
+          targetRootMessageId: deferredTopicRootMessageIdForOutput ?? sendInto
+            ?? (voiceActualDeliveredTarget && voiceActualDeliveredTarget.mode !== 'plain'
+              ? voiceActualDeliveredTarget.rootMessageId
+              : undefined),
+          targetSessionId: sid,
+          crossChatFollowThread: voiceCrossChatFollowThread,
+          followThreadEpoch: (originSession ?? s).followThreadEpoch,
+        };
+      };
       const voiceDelivery = await executeTurnPrimary(turnRequestIdentity, async providerUuid => {
         await revalidateIsolatedOriginBeforeEffect();
         const out = await synthesizeVoiceOpus(appId, content, {
@@ -14547,10 +14950,14 @@ async function cmdSend(
           const managedProviderOptions = outboundMessageOptions(!!prepared);
           const deliveryUuid = prepared?.providerKey ?? providerUuid;
           await revalidateIsolatedOriginBeforeEffect();
+          const privateDeliveryTargetOpenId = pickTurnReplyTarget(s, currentTurnId)?.senderOpenId;
           const privateMessageId = !sendInto && !overrideChatId
             ? await sendPrivateReply(s, currentTurnId, canonicalOutput.content, canonicalOutput.msgType, deliveryUuid,
                 { beforeWrite: fenceScheduledProviderWrite })
             : undefined;
+          if (privateMessageId !== undefined) {
+            privateReplyDeliveredRecipient = privateDeliveryTargetOpenId ?? '';
+          }
           const deferred = privateMessageId !== undefined
             ? { handled: true, messageId: privateMessageId, materializedNow: false, rootMessageId: undefined }
             : !sendInto && (!overrideChatId || overrideChatId === s.chatId)
@@ -14596,6 +15003,7 @@ async function cmdSend(
                   replyTargetQuoteOnly: turnReplyTarget?.quoteOnly,
                   currentTurnId,
                 });
+            voiceActualDeliveredTarget = canonicalTarget;
             await revalidateIsolatedOrigin();
             deliveredMessageId = canonicalTarget.mode === 'plain'
               ? await sendMessage(
@@ -14612,16 +15020,11 @@ async function cmdSend(
           }
         }
         return deliveredMessageId;
-      }, sentAtMs);
+      }, sentAtMs, voiceMarkerMetadata);
       const messageId = voiceDelivery.messageId;
       recordVcMeetingPrimaryOutput(messageId, voicePrimaryOutputChatId);
       // 语音也是一次可见回复。当前会话和具备精确 source turn 的 detour
       // 都记录；无 turn 的手工 detour 不写，避免靠时间窗压掉别的回复。
-      const voiceCrossChatFollowThread = effectiveCrossChatFollowThreadMode({
-        targetChatId: voicePrimaryOutputChatId,
-        sourceChatId: (originSession ?? s).chatId,
-        noFollowThread,
-      });
       if (voiceDelivery.replayed) {
         if (voiceDelivery.sentAtMs !== undefined) {
           await recordStructuredSendReceipts(
@@ -14642,45 +15045,71 @@ async function cmdSend(
           if (!bound) console.error('botmux send: 已复用语音投递，但跨群话题绑定补建失败');
         }
       }
-      if (!voiceDelivery.replayed && ((!sendTopLevel && !overrideChatId && !sendInto)
-        || !!(originTurnId ?? currentTurnId)
-        || !!deferredTopicRootMessageIdForOutput
-        || voiceCrossChatFollowThread !== undefined)) {
-        const markerSessionId = originSessionId ?? sid;
-        const markerTurnId = originTurnId ?? currentTurnId;
+      const recordVoiceBridgeMarker = (final?: LedgerFinalRecord) => {
+        if (final === undefined && voiceDelivery.replayed) return;
+        if (((!sendTopLevel && !overrideChatId && !sendInto)
+          || !!(originTurnId ?? currentTurnId)
+          || !!deferredTopicRootMessageIdForOutput
+          || voiceCrossChatFollowThread !== undefined)) {
+          try {
+            const markerSessionId = originSessionId ?? sid;
+            const markerTurnId = originTurnId ?? currentTurnId;
+            const markerMessageId = final?.messageId ?? messageId;
+            const markerSentAtMs = final?.sentAtMs ?? final?.deliveredAtMs ?? sentAtMs;
+            const identity = {
+              dataDir: resolveDataDir(),
+              sessionId: markerSessionId,
+              sentAtMs: markerSentAtMs,
+              messageId: markerMessageId,
+              turnId: markerTurnId,
+            };
+            if (final?.marker) {
+              recordBridgeReplyMarkerSnapshot({
+                ...final.marker, ...identity, responseKind: 'final',
+              });
+            } else {
+              recordBridgeReplyMarker({
+                ...voiceMarkerMetadata(),
+                ...identity,
+                ...(final ? { responseKind: 'final' as const } : {}),
+              });
+            }
+          } catch { /* best-effort：漏记只多一条兜底，不致命 */ }
+        }
+      };
+      if (!voiceDelivery.replayed) {
         await recordStructuredSendReceipts(
-          markerSessionId,
-          markerTurnId,
+          originSessionId ?? sid,
+          originTurnId ?? currentTurnId,
           [{ messageId, at: sentAtMs, text: content }],
         );
-        try {
-          const detoured = !!sendTopLevel || !!overrideChatId || !!sendInto
-            || markerSessionId !== sid;
-          recordBridgeReplyMarker({
-            dataDir: resolveDataDir(),
-            sessionId: markerSessionId,
-            sentAtMs,
-            messageId,
-            deliveryKind: detoured ? 'detoured_send' : 'current_session_send',
-            content,
-            responseKind: effectiveResponseKind,
-            terminalCarrier: 'non_patchable',
-            turnId: markerTurnId,
-            dispatchAttempt: originDispatchAttempt,
-            targetChatId: voicePrimaryOutputChatId,
-            targetRootMessageId: deferredTopicRootMessageIdForOutput ?? sendInto,
-            targetSessionId: sid,
-            crossChatFollowThread: voiceCrossChatFollowThread,
-            followThreadEpoch: (originSession ?? s).followThreadEpoch,
-          });
-        } catch { /* best-effort：漏记只多一条兜底，不致命 */ }
       }
-      if (effectiveResponseKind === 'final' && liveMarkerCtx?.markerPid) {
-        advanceAncestorSessionTurn(
-          sendDataDir,
-          liveMarkerCtx.markerPid,
-          originTurnId ?? currentTurnId,
-        );
+      if (effectiveResponseKind === 'final' && turnSendKey) {
+        ensureLedgerFinalTransition({
+          key: turnSendKey,
+          markerSessionId: originSessionId ?? sid,
+          markerTurnId: originTurnId ?? currentTurnId,
+          writeMarker: recordVoiceBridgeMarker,
+        });
+      } else {
+        recordVoiceBridgeMarker();
+        if (!voiceDelivery.replayed && effectiveResponseKind === 'final' && liveMarkerCtx?.markerPid) {
+          try {
+            advanceAncestorSessionTurn(
+              sendDataDir,
+              liveMarkerCtx.markerPid,
+              originTurnId ?? currentTurnId,
+              absorbedSettlementAdvanceOpts(
+                deferredTopicRootMessageIdForOutput
+                  ? { mode: 'thread', rootMessageId: deferredTopicRootMessageIdForOutput }
+                  : voiceActualDeliveredTarget,
+              ),
+            );
+          } catch (error) {
+            finalQueueTransitionDeferred = true;
+            console.error(`botmux send: 语音已投递，但轮次交接暂未落盘（${error instanceof Error ? error.message : String(error)}）；请原样重试`);
+          }
+        }
       }
       console.error(voiceDelivery.replayed
         ? `✓ 已复用本轮已发送语音 ${messageId}`
@@ -14738,6 +15167,13 @@ async function cmdSend(
       const chunks = chunkCommentText(content);
       const docMessageId = `doc:${exactDocTarget.commentId}`;
       const sentAtMs = Date.now();
+      const docMarkerMetadata = (): import('./services/turn-send-ledger.js').TurnSendLedgerMarkerInput => ({
+        deliveryKind: 'current_session_send',
+        content,
+        responseKind: effectiveResponseKind,
+        dispatchAttempt: originDispatchAttempt,
+        targetSessionId: originSessionId,
+      });
       const docDelivery = turnSendKey
         ? await turnSendLedger.executeNonIdempotentSequence(
             turnSendKey,
@@ -14759,7 +15195,7 @@ async function cmdSend(
               );
             },
             docMessageId,
-            { sentAtMs },
+            { sentAtMs, marker: docMarkerMetadata },
           )
         : await (async () => {
             for (let i = 0; i < chunks.length; i++) {
@@ -14791,6 +15227,31 @@ async function cmdSend(
           });
       }
       // 写 bridge send marker → 抑制 worker 的 final_output 兜底（否则会再补一条评论）。
+      const recordDocBridgeMarker = (final?: LedgerFinalRecord) => {
+        if (final === undefined && docDelivery.replayed) return;
+        const markerMessageId = final?.messageId ?? docDelivery.messageId;
+        const markerSentAtMs = final?.sentAtMs ?? final?.deliveredAtMs ?? sentAtMs;
+        try {
+          const identity = {
+            dataDir: resolveDataDir(),
+            sessionId: originSessionId!,
+            sentAtMs: markerSentAtMs,
+            messageId: markerMessageId,
+            turnId: originTurnId ?? exactDocTarget.turnId,
+          };
+          if (final?.marker) {
+            recordBridgeReplyMarkerSnapshot({
+              ...final.marker, ...identity, responseKind: 'final',
+            });
+          } else {
+            recordBridgeReplyMarker({
+              ...docMarkerMetadata(),
+              ...identity,
+              ...(final ? { responseKind: 'final' as const } : {}),
+            });
+          }
+        } catch { /* best-effort：漏记只多一条兜底 */ }
+      };
       if (docDelivery.replayed) {
         if (docDelivery.sentAtMs !== undefined) {
           await recordStructuredSendReceipts(
@@ -14805,27 +15266,24 @@ async function cmdSend(
           originTurnId ?? exactDocTarget.turnId,
           [{ messageId: docDelivery.messageId, at: sentAtMs, text: content }],
         );
-        try {
-          recordBridgeReplyMarker({
-            dataDir: resolveDataDir(),
-            sessionId: originSessionId!,
-            sentAtMs,
-            messageId: docDelivery.messageId,
-            deliveryKind: 'current_session_send',
-            content,
-            responseKind: effectiveResponseKind,
-            turnId: originTurnId ?? exactDocTarget.turnId,
-            dispatchAttempt: originDispatchAttempt,
-            targetSessionId: originSessionId,
-          });
-        } catch { /* best-effort：漏记只多一条兜底 */ }
       }
-      if (effectiveResponseKind === 'final' && liveMarkerCtx?.markerPid) {
-        advanceAncestorSessionTurn(
-          sendDataDir,
-          liveMarkerCtx.markerPid,
-          originTurnId ?? currentTurnId,
-        );
+      if (effectiveResponseKind === 'final' && turnSendKey) {
+        ensureLedgerFinalTransition({
+          key: turnSendKey,
+          markerSessionId: originSessionId!,
+          markerTurnId: originTurnId ?? exactDocTarget.turnId,
+          writeMarker: recordDocBridgeMarker,
+        });
+      } else {
+        recordDocBridgeMarker();
+        if (effectiveResponseKind === 'final' && liveMarkerCtx?.markerPid) {
+          try {
+            advanceAncestorSessionTurn(sendDataDir, liveMarkerCtx.markerPid, originTurnId ?? currentTurnId);
+          } catch (error) {
+            finalQueueTransitionDeferred = true;
+            console.error(`botmux send: 文档评论已投递，但轮次交接暂未落盘（${error instanceof Error ? error.message : String(error)}）；请原样重试`);
+          }
+        }
       }
       // Do not write this startup snapshot back after the async provider calls:
       // the daemon may have advanced the dispatch ledger or accepted another
@@ -15158,6 +15616,9 @@ async function cmdSend(
   const sendTarget = !sendInto && !sendTopLevel && !overrideChatId && frozenTurnReplyTarget
     ? frozenTurnReplyTarget
     : resolveSendTarget({ into: sendInto, topLevel: sendTopLevel, chatScope: isChatScope, chatId: targetChatId, rootMessageId: s.rootMessageId, replyTargetRootId: turnReplyTarget?.rootMessageId, replyTargetTurnId: turnReplyTarget?.turnId, replyTargetQuoteOnly: turnReplyTarget?.quoteOnly, currentTurnId });
+  resolveActualDeliveredTargetForLedger = () => deferredTopicRootMessageIdForOutput
+    ? { mode: 'thread', rootMessageId: deferredTopicRootMessageIdForOutput }
+    : sendTarget;
 
   let completionProposalRecord: CompletionProposalRecord | undefined;
   let completionProposalStore: ReturnType<typeof createCompletionProposalStore> | undefined;
@@ -15287,9 +15748,13 @@ async function cmdSend(
     // exact durable attempt/member instead of inheriting the early cmd gate.
     revalidateVcMeetingManagedSend();
     if (!sendInto && !overrideChatId) {
+      const privateDeliveryTargetOpenId = pickTurnReplyTarget(s, currentTurnId)?.senderOpenId;
       const privateMessageId = await sendPrivateReply(s, currentTurnId, content, msgType, uuid,
         { beforeWrite: fenceScheduledProviderWrite });
-      if (privateMessageId !== undefined) return privateMessageId;
+      if (privateMessageId !== undefined) {
+        privateReplyDeliveredRecipient = privateDeliveryTargetOpenId ?? '';
+        return privateMessageId;
+      }
     }
     if (!sendInto && (!overrideChatId || overrideChatId === s.chatId)) {
       const deferred = await dispatchDeferredTopicSend({
@@ -15377,6 +15842,29 @@ async function cmdSend(
   // 删除需同步改测试。
   void dispatch;
   const crossChatFollowThread = effectiveFollowThreadMode;
+  const primaryMarkerMetadata = (
+    sentContent: string,
+    terminalCarrier?: TurnTerminalCarrierKind,
+    unifiedReply = unifiedReplyUsed,
+  ): import('./services/turn-send-ledger.js').TurnSendLedgerMarkerInput => {
+    const markerSessionId = originSessionId ?? sid;
+    const detoured = !!sendTopLevel || !!overrideChatId || !!sendInto || markerSessionId !== sid;
+    return {
+      deliveryKind: detoured ? 'detoured_send' : 'current_session_send',
+      content: sentContent,
+      responseKind: effectiveResponseKind,
+      dispatchAttempt: originDispatchAttempt,
+      replyCardResponseKind: unifiedReply ? effectiveResponseKind : undefined,
+      terminalIndependent: remoteRunnerOutbound && effectiveResponseKind !== 'final' ? true : undefined,
+      terminalCarrier,
+      targetChatId,
+      targetRootMessageId: deferredTopicRootMessageIdForOutput
+        ?? (sendTarget.mode === 'plain' ? undefined : sendTarget.rootMessageId),
+      targetSessionId: sid,
+      crossChatFollowThread,
+      followThreadEpoch: (originSession ?? s).followThreadEpoch,
+    };
+  };
   const recordBridgeSendMarker = (
     sentAtMs: number,
     messageId: string,
@@ -15386,29 +15874,13 @@ async function cmdSend(
     const markerSessionId = originSessionId ?? sid;
     const markerTurnId = originTurnId ?? currentTurnId;
     try {
-      const detoured = !!sendTopLevel || !!overrideChatId || !!sendInto
-        || markerSessionId !== sid;
       recordBridgeReplyMarker({
+        ...primaryMarkerMetadata(sentContent, terminalCarrier),
         dataDir: resolveDataDir(),
         sessionId: markerSessionId,
         sentAtMs,
         messageId,
-        deliveryKind: detoured ? 'detoured_send' : 'current_session_send',
-        content: sentContent,
-        responseKind: effectiveResponseKind,
         turnId: markerTurnId,
-        dispatchAttempt: originDispatchAttempt,
-        replyCardResponseKind: unifiedReplyUsed ? effectiveResponseKind : undefined,
-        terminalIndependent: remoteRunnerOutbound && effectiveResponseKind !== 'final'
-          ? true
-          : undefined,
-        terminalCarrier,
-        targetChatId,
-        targetRootMessageId: deferredTopicRootMessageIdForOutput
-          ?? (sendTarget.mode === 'plain' ? undefined : sendTarget.rootMessageId),
-        targetSessionId: sid,
-        crossChatFollowThread,
-        followThreadEpoch: (originSession ?? s).followThreadEpoch,
       });
     } catch { /* best-effort: marker miss only causes a redundant fallback message */ }
   };
@@ -15423,6 +15895,7 @@ async function cmdSend(
     || !!(originTurnId ?? currentTurnId)
     || crossChatFollowThread !== undefined;
   let unifiedReplyUsed = false;
+  let replyCardDeliveredTarget: ReturnType<typeof resolveSendTarget> | undefined;
 
   // Quote chain (普通群): the primary message replies to the turn's target so
   // Lark renders a 引用 chain. --quote overrides, --no-quote opts out. Thread
@@ -15677,7 +16150,9 @@ async function cmdSend(
     primaryContent: string,
     msgType: string,
     originAlreadyRevalidated = false,
-    uuid?: string,
+    uuid: string | undefined,
+    markerContent: string,
+    terminalCarrier: TurnTerminalCarrierKind = 'standard_reply_card',
   ): Promise<string> => {
     const handoffDeliveryId = await prepareMentionHandoff();
     let result: Awaited<ReturnType<typeof executeTurnPrimary>>;
@@ -15691,6 +16166,7 @@ async function cmdSend(
           uuid ?? providerUuid,
         ),
         primarySentAtMs,
+        () => primaryMarkerMetadata(markerContent, terminalCarrier),
       );
     } catch (error) {
       await bindMentionHandoff(handoffDeliveryId, undefined);
@@ -15943,7 +16419,7 @@ async function cmdSend(
       replyLayout = undefined;
     }
     if (customCard && !customFinal) {
-      messageId = await dispatchPrimary(JSON.stringify(customCard), 'interactive');
+      messageId = await dispatchPrimary(JSON.stringify(customCard), 'interactive', false, undefined, text, 'non_patchable');
     } else if (isSlashSend) {
       // --slash: deliver the command as a single-line plain-`text` message so the
       // receiving daemon's parseSlashCommandInvocation sees a bare `/cmd` (the
@@ -15956,7 +16432,7 @@ async function cmdSend(
       if (!slash.ok) { console.error(`botmux send: ${slash.error}`); process.exit(2); }
       const atPrefix = mentions.map(m => `<at user_id="${m.open_id}"></at>`).join(' ');
       const slashText = atPrefix ? `${atPrefix} ${slash.command}` : slash.command;
-      messageId = await dispatchPrimary(slashText, 'text');
+      messageId = await dispatchPrimary(slashText, 'text', false, undefined, text);
     } else if (pureFileSend) {
       // The single attachment IS the primary message. Keep upload + send under
       // the turn ledger lock so a concurrent final cannot upload or post a
@@ -15970,7 +16446,7 @@ async function cmdSend(
           false,
           providerUuid,
         );
-      }, sentAtMs);
+      }, sentAtMs, () => primaryMarkerMetadata(text, 'non_patchable'));
       if (fileDelivery.replayed) {
         turnPrimaryReplayed = true;
         turnPrimaryReplayedSentAtMs ??= fileDelivery.sentAtMs;
@@ -15996,7 +16472,7 @@ async function cmdSend(
           uploadFile,
           uploadImage,
           dispatch: dispatchAfterOriginGate,
-          primaryDispatch: (body, type) => dispatchPrimary(body, type, true),
+          primaryDispatch: (body, type) => dispatchPrimary(body, type, true, undefined, text, 'non_patchable'),
           beforeEffect: fenceIsolatedOriginBeforeEffect,
           onResult: (index, outcome) => {
             if ('messageId' in outcome) sentVideoIndices.push(index);
@@ -16204,6 +16680,7 @@ async function cmdSend(
         if (replyRecord.chatId !== targetChatId) throw new Error('Reply-card destination changed; send refused');
         let delivered: Awaited<ReturnType<typeof replyStore.update>> | undefined;
         let undeliveredProgressHint = '进度已保存到本轮记录；请用 botmux send --response-kind final 发送完整答复。';
+        resolveActualDeliveredTargetForLedger = () => replyCardDeliveredTarget;
         const replyDelivery = await executeTurnPrimary(turnRequestIdentity, async providerUuid => {
           delivered = await replyStore.update(replyKey, effectiveResponseKind === 'final'
             ? { kind: 'final', text, card: replyCardJson, source: 'explicit',
@@ -16223,6 +16700,9 @@ async function cmdSend(
               await revalidateIsolatedOriginBeforeEffect();
               return readiness?.nativeThinkingVisible === true;
             },
+            deliveredTarget: () => deferredTopicRootMessageIdForOutput
+              ? { mode: 'thread', rootMessageId: deferredTopicRootMessageIdForOutput }
+              : sendTarget,
             send: (body, uuid) => dispatchPrimaryUnlocked(body, 'interactive', undefined, completionProposalRecord ? completionProposalCardDispatchUuid(completionProposalRecord) : (uuid ?? providerUuid)),
             patch: (id, body) => patchPublishedGroupCard(appId, targetChatId, id, body, replyRecord.rootId,
               effectiveResponseKind === 'final' ? groupContextAuthorOrigin : undefined,
@@ -16246,13 +16726,18 @@ async function cmdSend(
               return dispatchAfterOriginGate(JSON.stringify({ file_key: fileKey }), 'file', uuid);
             },
           });
+          // An existing card is PATCHed where it already lives. Never invent
+          // that destination from the host turn: daemon-created and historical
+          // records may predate deliveredTarget. Unknown means fail closed and
+          // keep the absorbed turn on the legacy promotion path.
+          replyCardDeliveredTarget = delivered.record.deliveredTarget;
           if (!delivered.messageId && delivered.record.nativeCot && delivered.record.nativeCotVisible) {
             // Progress is expected here; asking for a final would push the
             // model to lock the turn early with an interim note.
             undeliveredProgressHint = '进度已记录到本轮：执行过程由原生思考区展示，进度会随最终答复卡一并归档。中间进度继续按默认方式发送即可；完成后再用 botmux send --response-kind final 发送完整答复。';
           }
           return delivered.messageId ?? '';
-        }, sentAtMs);
+        }, sentAtMs, () => primaryMarkerMetadata(text, 'standard_reply_card', true));
         if (replyDelivery.replayed) {
           turnPrimaryReplayed = true;
           turnPrimaryReplayedSentAtMs ??= replyDelivery.sentAtMs;
@@ -16272,6 +16757,7 @@ async function cmdSend(
           'interactive',
           false,
           completionProposalRecord ? completionProposalCardDispatchUuid(completionProposalRecord) : undefined,
+          text,
         );
       }
 
@@ -16301,7 +16787,7 @@ async function cmdSend(
           : [];
         await recordStructuredSendReceipts(
           originSessionId ?? sid,
-          originTurnId ?? currentTurnId,
+          replayMarkerTurnId,
           [
             {
               messageId,
@@ -16318,31 +16804,31 @@ async function cmdSend(
           targetChatId,
           ...(sendTarget.mode !== 'plain' ? { targetRootMessageId: sendTarget.rootMessageId } : {}),
           followThreadEpoch: (originSession ?? s).followThreadEpoch,
-          sourceTurnId: originTurnId ?? currentTurnId,
+          sourceTurnId: replayMarkerTurnId,
         });
         if (!bound) console.error('botmux send: 已复用投递，但跨群话题绑定补建失败');
       }
       // Reusing a receipt is not a new send. Preserve the original marker's
       // time, including when another input arrived while we waited on the lock.
       // The first sender may have lost the reply-card mark; it is idempotent.
-      if (effectiveResponseKind === 'final' && currentTurnId) {
-        await noteTurnFinalOutsideReplyCard({ larkAppId: appId, sessionId: sid, turnId: currentTurnId, dispatchAttempt: originDispatchAttempt },
+      if (effectiveResponseKind === 'final' && replayMarkerTurnId) {
+        await noteTurnFinalOutsideReplyCard({ larkAppId: appId, sessionId: sid, turnId: replayMarkerTurnId, dispatchAttempt: replayDispatchAttempt },
           targetChatId, sendTopLevel || !!sendInto || !!overrideChatId);
       }
       await removeScheduleSelfAfterFinal();
-      if (scheduleSelfCleanup?.removed && liveMarkerCtx?.markerPid) {
-        advanceAncestorSessionTurn(
-          sendDataDir,
-          liveMarkerCtx.markerPid,
-          originTurnId ?? currentTurnId,
-        );
-      }
+      ensureLedgerFinalTransition({
+        key: replayTurnKey!,
+        markerSessionId: originSessionId ?? sid,
+        markerTurnId: replayMarkerTurnId,
+        allowAdvance: !scheduleRemoveSelfTaskId || scheduleSelfCleanup?.removed === true,
+        writeMarker: recordReplayPrimaryBridgeMarker,
+      });
       console.error(`✓ 已复用本轮最终回答 ${messageId}`);
       console.log(JSON.stringify({
         success: true,
         messageId,
         sessionId: sid,
-        turnId: currentTurnId,
+        turnId: replayMarkerTurnId,
         replayed: true,
         ...(scheduleSelfCleanup ? { scheduleSelfCleanup } : {}),
       }));
@@ -16459,17 +16945,68 @@ async function cmdSend(
     // Bridge fallback marker — append-only jsonl on the source session. A
     // successful detour is recorded with explicit destination metadata when an
     // exact source turn is available; it must not be mistaken for no reply.
+    let primaryBridgeMarkerAttempted = false;
+    const recordPrimaryBridgeMarker = () => {
+      if (primaryBridgeMarkerAttempted) return;
+      primaryBridgeMarkerAttempted = true;
+      if (shouldRecordBridgeMarker || deferredTopicRootMessageIdForOutput) {
+        const markerSessionId = originSessionId ?? sid;
+        withBridgeReplyMarkerLock(resolveDataDir(), markerSessionId, () => {
+          if (hasBridgeReplyMarker({
+            dataDir: resolveDataDir(), sessionId: markerSessionId,
+            turnId: originTurnId ?? currentTurnId, messageId, responseKind: effectiveResponseKind,
+          })) return;
+          recordBridgeSendMarker(
+            sentAtMs,
+            messageId,
+            text,
+            (!customCard || customFinal) && !pureFileSend && !pureVideoSend
+              ? 'standard_reply_card'
+              : 'non_patchable',
+          );
+        });
+      }
+    };
+    const actualDeliveredTarget = unifiedReplyUsed
+      ? replyCardDeliveredTarget
+      : deferredTopicRootMessageIdForOutput
+        ? { mode: 'thread' as const, rootMessageId: deferredTopicRootMessageIdForOutput }
+        : sendTarget;
+    let advancedNextTurnId: string | undefined;
+    const advanceAfterPrimaryFinal = (writeMarker: boolean) => {
+      if (effectiveResponseKind !== 'final' || !liveMarkerCtx?.markerPid) return;
+      let advResult: ReturnType<typeof advanceAncestorSessionTurn>;
+      try {
+        advResult = advanceAncestorSessionTurn(
+          sendDataDir,
+          liveMarkerCtx.markerPid,
+          originTurnId ?? currentTurnId,
+          {
+            ...absorbedSettlementAdvanceOpts(actualDeliveredTarget),
+            ...(writeMarker ? { beforeTransition: recordPrimaryBridgeMarker } : {}),
+          },
+        );
+      } catch (error) {
+        recordPrimaryBridgeMarker();
+        finalQueueTransitionDeferred = true;
+        console.error(`botmux send: 最终答复已投递，但轮次交接暂未落盘（${error instanceof Error ? error.message : String(error)}）；请原样重试（不会重复发送 final）`);
+        return;
+      }
+      // A worker may have completed the ledger-authorized transition while
+      // recovering a crashed sender. Preserve the same model-facing guidance
+      // only for a snapshotted absorbed turn carrying fresh promotion proof.
+      let freshMarker: ReturnType<typeof findLiveAncestorSessionContext> | undefined;
+      if (!advResult.advanced && advResult.turnId && preSendAbsorbedTurnIds.has(advResult.turnId)) {
+        try { freshMarker = findLiveAncestorSessionContext(sendDataDir); } catch { /* guidance is best-effort */ }
+      }
+      advancedNextTurnId = resolvePromotedAbsorbedTurnForCompletion(
+        advResult, preSendAbsorbedTurnIds, freshMarker,
+      );
+    };
     const markerSessionId = originSessionId ?? sid;
     const markerTurnId = originTurnId ?? currentTurnId;
+    recordPrimaryBridgeMarker();
     if (shouldRecordBridgeMarker || deferredTopicRootMessageIdForOutput) {
-      recordBridgeSendMarker(
-        sentAtMs,
-        messageId,
-        text,
-        (!customCard || customFinal) && !pureFileSend && !pureVideoSend
-          ? 'standard_reply_card'
-          : 'non_patchable',
-      );
       await recordStructuredSendReceipts(markerSessionId, markerTurnId, [{
         messageId,
         at: sentAtMs,
@@ -16477,7 +17014,6 @@ async function cmdSend(
       }]);
     }
     await removeScheduleSelfAfterFinal();
-    let advancedNextTurnId: string | undefined;
 
     // Send attachments as separate messages — best-effort. The primary message
     // is already delivered above; a failing attachment must not throw out to the
@@ -16552,14 +17088,7 @@ async function cmdSend(
       if (effectiveResponseKind === 'final'
         && (!scheduleRemoveSelfTaskId || scheduleSelfCleanup?.removed === true)
         && liveMarkerCtx?.markerPid) {
-        const advResult = advanceAncestorSessionTurn(
-          sendDataDir,
-          liveMarkerCtx.markerPid,
-          originTurnId ?? currentTurnId,
-        );
-        if (advResult.advanced) {
-          advancedNextTurnId = advResult.turnId;
-        }
+        advanceAfterPrimaryFinal(false);
       }
     }
     for (const f of failedAttachments) {
@@ -16596,7 +17125,9 @@ async function cmdSend(
     // REPLY_DELIVERY_ENV is the spawn snapshot of how this pane's final reply
     // reaches Lark. Under transcript (auto-forward final reply), normal sends
     // return null so the receipt stays purely factual with no extra persuasion.
-    const completionHintKey = sendCompletionHintKey(effectiveResponseKind, unifiedReplyUsed, advancedNextTurnId,
+    const completionHintKey = finalQueueTransitionDeferred
+      ? null
+      : sendCompletionHintKey(effectiveResponseKind, unifiedReplyUsed, advancedNextTurnId,
       replyDeliveryFromEnv(process.env));
     if (completionHintKey) {
       console.error(t(completionHintKey, undefined, sendLocale));
