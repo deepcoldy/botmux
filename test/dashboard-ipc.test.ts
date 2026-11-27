@@ -11677,6 +11677,50 @@ describe('PUT /api/bot-agent riff backend pairing', () => {
     }
   });
 
+  it('returns freshly resolved sandbox fields after switching from a remote to a local CLI', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-sandbox-refresh-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-agent-sandbox-refresh';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const prevSandbox = process.env.BOTMUX_SANDBOX;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      process.env.BOTMUX_SANDBOX = 'scratch';
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'riff',
+        backendType: 'riff',
+        riff: { baseUrl: 'https://riff.example' },
+        sandbox: true,
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      const before = await (await fetch(`http://127.0.0.1:${handle.port}/api/bot-default-oncall`)).json();
+      expect(before).toMatchObject({
+        localSandboxApplies: false, effectiveSandboxMode: 'off', sandboxEnvForce: 'scratch',
+      });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'codex', model: '' }),
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({
+        cliId: 'codex',
+        localSandboxApplies: true, effectiveSandboxMode: 'scratch', sandboxEnvForce: 'scratch',
+      });
+    } finally {
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      if (prevSandbox === undefined) delete process.env.BOTMUX_SANDBOX;
+      else process.env.BOTMUX_SANDBOX = prevSandbox;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('keeps a manual non-riff backend override when switching CLIs', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-tmux-ipc-'));
     const configPath = join(dir, 'bots.json');

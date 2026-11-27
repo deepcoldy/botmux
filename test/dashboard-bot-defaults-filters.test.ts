@@ -6,6 +6,8 @@ import {
 } from '../src/dashboard/web/bot-defaults.js';
 import { BotDefaultsPage } from '../src/dashboard/web/bot-defaults-page.js';
 import { t } from '../src/dashboard/web/ui.js';
+import { DEFAULT_SESSION_OWNER_REMINDER } from '../src/core/session-owner-reminder-config.js';
+import { botDefaultsPayload, sparseOverridesFromRawBotConfig } from '../src/dashboard/bot-payload.js';
 
 const cedar: BotDefaultsRow = {
   larkAppId: 'demo-cedar', botName: 'Cedar', cliId: 'codex', model: 'gpt-5',
@@ -17,7 +19,10 @@ const cedar: BotDefaultsRow = {
   },
   startupCommands: 'pnpm --version',
 };
-const maple: BotDefaultsRow = { larkAppId: 'demo-maple', botName: 'Maple', cliId: 'claude-code' };
+const maple: BotDefaultsRow = {
+  larkAppId: 'demo-maple', botName: 'Maple', cliId: 'claude-code',
+  commandTriggersConfigured: false, blockedUsersConfigured: false,
+};
 
 describe('Bot settings summaries', () => {
   it('summarizes manual, default directory and on-call configurations', () => {
@@ -51,6 +56,7 @@ describe('Bot settings summaries', () => {
       streamingCardFoldedLayout: true, autoInviteOwnerOnGroupAdd: true, botToBotSameDir: true,
       replyDelivery: 'transcript', replyDeliveryDefault: 'transcript', sandboxMode: 'off',
       effectiveSandboxMode: 'scratch', replyStyle: {}, ownerGroupFollow: { enabled: false },
+      sessionOwnerReminder: DEFAULT_SESSION_OWNER_REMINDER,
       hiddenStreamingCardButtons: [], autoGrantRequestCards: true,
     })]).toEqual([]);
     const modified = botModifiedSectionIds({
@@ -63,6 +69,48 @@ describe('Bot settings summaries', () => {
       'agent', 'working-dir', 'command-trigger', 'codex-archive', 'prompt-cache', 'startup-commands', 'sandbox',
       'trigger-user-auth', 'lark-tool-binding', 'blocked-users', 'card-behavior', 'local-address', 'reply-delivery',
     ]));
+  });
+
+  it('treats resolved owner-reminder defaults as unmodified and preserves offline overrides', () => {
+    const online = botDefaultsPayload({ larkAppId: 'owner-default' }, {
+      sessionOwnerReminder: DEFAULT_SESSION_OWNER_REMINDER,
+      commandTriggersConfigured: false,
+      blockedUsersConfigured: false,
+    }) as BotDefaultsRow;
+    expect(botModifiedSectionIds(online).has('owner-reminder')).toBe(false);
+
+    const saved = { ...DEFAULT_SESSION_OWNER_REMINDER, enabled: true };
+    const offline = botDefaultsPayload(
+      { larkAppId: 'owner-offline' },
+      sparseOverridesFromRawBotConfig({ sessionOwnerReminder: saved }),
+    ) as BotDefaultsRow;
+    expect(offline.sessionOwnerReminder).toEqual(saved);
+    expect(botModifiedSectionIds(offline).has('owner-reminder')).toBe(true);
+  });
+
+  it('recognizes explicit standard, topic stop, and a preserved oncall directory as customized', () => {
+    expect(botModifiedSectionIds({ ...maple, modelBackendVariant: 'standard' }), 'explicit Standard')
+      .toContain('agent');
+    expect(botModifiedSectionIds({ ...maple, topicUnavailablePolicy: 'stop' }), 'topic Stop')
+      .toContain('reply-delivery');
+    expect(botModifiedSectionIds({
+      ...maple, defaultOncall: { enabled: false, workingDir: '/repo/x', since: 1 },
+    }), 'preserved Oncall directory').toContain('working-dir');
+    expect(botModifiedSectionIds({
+      ...maple, defaultOncall: { enabled: false, workingDir: '', since: 0 },
+    }), 'pristine Oncall state').not.toContain('working-dir');
+  });
+
+  it('fails open when an older daemon cannot report trigger or blocked-user configuration', () => {
+    const unknown = botModifiedSectionIds({
+      ...maple, commandTriggersConfigured: undefined, blockedUsersConfigured: undefined,
+    });
+    expect([...unknown]).toEqual(expect.arrayContaining(['command-trigger', 'blocked-users']));
+    const empty = botModifiedSectionIds({
+      ...maple, commandTriggersConfigured: false, blockedUsersConfigured: false,
+    });
+    expect(empty).not.toContain('command-trigger');
+    expect(empty).not.toContain('blocked-users');
   });
 });
 

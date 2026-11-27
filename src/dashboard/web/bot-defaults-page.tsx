@@ -4,6 +4,7 @@ import {
   type TaskRoutingCostTier,
 } from '../../core/task-routing/model.js';
 import { DEFAULT_OWNER_REMINDER_QUIET_HOURS, normalizeOwnerReminderQuietHours } from '../../core/session-owner-reminder-quiet-hours.js';
+import { DEFAULT_SESSION_OWNER_REMINDER } from '../../core/session-owner-reminder-config.js';
 import type { OncallPresetOptions } from '../../services/oncall-preset-options.js';
 import { normalizePassthroughCommand, parseCustomPassthroughInput } from '../../core/passthrough-commands.js';
 import type { OncallGroupBusinessTarget } from '../../services/oncall-group-client.js';
@@ -2364,15 +2365,8 @@ const OWNER_REMINDER_STATE_OPTIONS = [
   { value: 'limited', labelKey: 'botDefaults.ownerReminderStateLimited' },
 ] as const;
 
-// Offline/error rows can lack the daemon-provided default payload. Keep this
-// browser fallback aligned with DEFAULT_SESSION_OWNER_REMINDER.
-const DEFAULT_OWNER_REMINDER = {
-  enabled: false,
-  intervalMinutes: 30,
-  text: '该会话已等待处理，请继续跟进。',
-  states: OWNER_REMINDER_STATE_OPTIONS.map(option => option.value),
-  quietHours: DEFAULT_OWNER_REMINDER_QUIET_HOURS,
-};
+// Offline/error rows can lack the daemon-provided default payload.
+const DEFAULT_OWNER_REMINDER = DEFAULT_SESSION_OWNER_REMINDER;
 
 function SessionOwnerReminderSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
@@ -3675,6 +3669,13 @@ export function BotAgentSection(props: {
           agentSelectionKey: res.body.selectionKey ?? cliKey,
           readIsolation: res.body.readIsolation === true,
           readIsolationSupported: res.body.readIsolationSupported === true,
+          // Older agent PUT responses omit these: use the summary's legacy/config fallback,
+          // not stale capability values from the previous CLI/backend pairing.
+          localSandboxApplies: typeof res.body.localSandboxApplies === 'boolean' ? res.body.localSandboxApplies : null,
+          sandboxEnvForce: res.body.sandboxEnvForce === 'oncall' || res.body.sandboxEnvForce === 'scratch'
+            ? res.body.sandboxEnvForce : null,
+          effectiveSandboxMode: res.body.effectiveSandboxMode === 'off' || res.body.effectiveSandboxMode === 'oncall'
+            || res.body.effectiveSandboxMode === 'scratch' ? res.body.effectiveSandboxMode : null,
         });
       if (editorSaveEpoch.current !== saveEpoch) {
         if (res.ok && res.body.ok) syncSavedBot();
