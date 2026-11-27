@@ -1048,7 +1048,7 @@ export interface DaemonSession {
    *  input's turn id; bounded, in-memory (a dead worker never reports). */
   pendingFailedTurnRewinds?: Map<string, {
     failedTurnId: string;
-    mode: 'merge' | 'resend';
+    mode: 'merge' | 'resend' | 'edit';
     content: string;
     /** Envelope that will remain sidecar-injected in the final rewritten input;
      * absent when the directive restored it inline. */

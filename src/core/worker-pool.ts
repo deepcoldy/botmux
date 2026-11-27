@@ -208,6 +208,8 @@ import {
 import { noteReplyCardTurnStarted } from './reply-card-turn-start.js';
 import type { QuotaFallbackChainTrigger } from './quota-fallback-chain-switch.js';
 import { TRAEX_QUOTA_ERROR_CODE } from '../services/traex-quota.js';
+import { appendFailedPromptActions } from '../im/lark/failed-prompt-card.js';
+import { appendTraexImageRecoveryAction } from '../im/lark/traex-image-recovery-card.js';
 import { takePurgeClickRollback } from '../services/image-purge-recovery.js';
 import { hashUrlForLog, type RiffBackendConfig } from '../adapters/backend/riff-backend.js';
 import { cancelMojoSessionById } from '../adapters/backend/mojo-backend.js';
@@ -2783,6 +2785,39 @@ function recordTurnTerminalCarrier(
   }
 }
 
+/** A legacy failed final may have been posted before terminal bookkeeping made
+ * its recovery record available. Patch that exact acknowledged carrier after
+ * the terminal, never a replacement or another turn's card. */
+async function patchLegacyFailedPromptCarrier(
+  ds: DaemonSession,
+  msg: Pick<Extract<WorkerToDaemon, { type: 'turn_terminal' }>, 'turnId'>,
+  owns: () => boolean,
+): Promise<void> {
+  const record = ds.session.lastFailedTurn;
+  const carrier = ds.turnTerminalCarriers?.get(msg.turnId);
+  if (!record || record.turnId !== msg.turnId || !isFinalTurnTerminalCarrier(carrier)) return;
+  const localOwned = (): boolean => !ds.session.headless && !replyCardSandboxBlocked(ds)
+    && !hasProtectedSessionMutationOwnership(ds) && !hasQueuedActivationAdmissionGate(ds)
+    && !isSharedAdoptSession(ds) && !isRemoteBackendSession(ds)
+    && !ds.adoptedFrom && !ds.initConfig?.adoptMode;
+  if (!localOwned()) return;
+  const detail = await getTopicMessageDetail(ds.larkAppId, carrier.messageId, { userCardContent: true });
+  const cardJson = messageCardContent(detail, ds.chatId);
+  if (!cardJson) return;
+  const patched = appendFailedPromptActions(cardJson, {
+    cliId: 'traex', record, turnId: msg.turnId, rootId: sessionAnchorId(ds),
+    sessionId: ds.session.sessionId, locale: localeForBot(ds.larkAppId), localOwnedSession: true,
+  });
+  if (patched === cardJson) return;
+  const session = ds.session;
+  await updateMessage(ds.larkAppId, carrier.messageId, patched, { beforeWrite: () => {
+    if (!owns() || ds.session !== session || session.status === 'closed'
+      || ds.session.lastFailedTurn?.turnId !== msg.turnId
+      || ds.turnTerminalCarriers?.get(msg.turnId)?.messageId !== carrier.messageId
+      || !localOwned()) throw new Error('Failed-prompt recovery carrier no longer owned');
+  } });
+}
+
 /** `patched`: the footer carries the receipt. `no_footer`: an editable reply
  * card of this chat without a footer (the bot turned it off) — rows still go
  * on it. `unpatchable`: gone, another chat's, or not a schema 2.0 card. */
@@ -3371,7 +3406,7 @@ function buildSessionTurnFailedCard(
   // 绝不 @ bot——那会触发对方新一轮）。
   const mentionOpenId = daemonCardFooterRecipientOpenId(ds, effectiveCliId)
     ?? failureNoticeFallbackMentionOpenId(ds);
-  return buildTurnFailedCard({
+  const card = buildTurnFailedCard({
     rootId: sessionAnchorId(ds),
     sessionId: ds.session.sessionId,
     cliId: effectiveCliId,
@@ -3389,6 +3424,12 @@ function buildSessionTurnFailedCard(
     ...(failedTurn ? { retryTurnId: failedTurn.turnId } : {}),
     ...(mentionOpenId ? { mentionOpenId } : {}),
     terminalUrl: readableTerminalUrlFor(ds),
+    locale: localeForBot(ds.larkAppId),
+  });
+  return appendFailedPromptActions(card, {
+    cliId: effectiveCliId, localOwnedSession: !hasProtectedSessionMutationOwnership(ds) && !isSharedAdoptSession(ds)
+      && !isRemoteBackendSession(ds) && !ds.adoptedFrom && !ds.initConfig?.adoptMode && !ds.session.headless,
+    record: failedTurn, turnId: failedTurn?.turnId ?? '', rootId: sessionAnchorId(ds), sessionId: ds.session.sessionId,
     locale: localeForBot(ds.larkAppId),
   });
 }
@@ -19649,20 +19690,23 @@ function failedTurnRewindForInput(
   cliId: string | undefined,
   opts: {
     failedTurnResendOf?: string;
+    failedTurnEditedInput?: true;
     purgeUndersizedImages?: true;
+    purgeToolImages?: true;
     dispatchAttempt?: number;
     durablePrimaryInbox?: true;
     trustedCaller?: TrustedCaller;
     viaTransferGate: boolean;
   },
 ): FailedTurnRewindDirective | undefined {
-  if (cliId !== 'claude-code' || !turnId || opts.viaTransferGate || !ds.worker || ds.worker.killed) return undefined;
-  if (opts.purgeUndersizedImages || opts.dispatchAttempt !== undefined || opts.durablePrimaryInbox
+  if (!['claude-code', 'traex'].includes(cliId ?? '') || (cliId === 'traex' && !opts.failedTurnResendOf)
+    || !turnId || opts.viaTransferGate || !ds.worker || ds.worker.killed) return undefined;
+  if (opts.purgeUndersizedImages || opts.purgeToolImages || opts.dispatchAttempt !== undefined || opts.durablePrimaryInbox
     || payload.codexAppInput) return undefined;
   if (isRemoteBackendSession(ds) || isSharedAdoptSession(ds) || ds.adoptedFrom || ds.initConfig?.adoptMode) {
     return undefined;
   }
-  const mode = opts.failedTurnResendOf !== undefined ? 'resend' : 'merge';
+  const mode = opts.failedTurnEditedInput ? 'edit' : opts.failedTurnResendOf !== undefined ? 'resend' : 'merge';
   // An input already on its way to carry this failed turn on (its CLI restart
   // is running): another one would run the failed input twice.
   const record = ds.session.lastFailedTurn;
@@ -19671,7 +19715,7 @@ function failedTurnRewindForInput(
   // old card pressed after another turn failed must not cut and re-send that
   // other turn. The record qualifies when it is that turn, or the turn a
   // chain of cuts that started from it carries it on in now.
-  if (mode === 'resend' && record) {
+  if (mode !== 'merge' && record) {
     const chain = ds.session.failedTurnRewindChain;
     const same = record.turnId === opts.failedTurnResendOf
       || (chain?.turnId === record.turnId && chain.originTurnId === opts.failedTurnResendOf);
@@ -19736,7 +19780,7 @@ export function applyFailedTurnRewindResult(
   // failed turn as the latest, which they now replace.
   const carriedHookEnvelope = result.inlineEnvelope ? undefined : pending.hookEnvelope;
   if (ds.lastCliInputTurnId === result.turnId || ds.lastCliInputTurnId === result.failedTurnId) {
-    const userPrompt = pending.mode === 'merge' && ds.lastCliInputTurnId === result.turnId && ds.lastUserPrompt
+    const userPrompt = pending.mode === 'edit' ? ds.lastUserPrompt ?? pending.failedUserPrompt : pending.mode === 'merge' && ds.lastCliInputTurnId === result.turnId && ds.lastUserPrompt
       ? mergeFailedTurnInput(pending.failedUserPrompt, ds.lastUserPrompt)
       : pending.failedUserPrompt;
     ds.lastUserPrompt = userPrompt;
@@ -19831,6 +19875,7 @@ export function sendWorkerInput(
      *  session transcript (drops undersized image blocks), respawns with
      *  --resume, and this turn is delivered only after the fresh CLI is ready. */
     purgeUndersizedImages?: true;
+    purgeToolImages?: true;
     trustedCaller?: TrustedCaller;
     /** Queue behind a running turn instead of folding into it (type-ahead):
      *  the input must start as a turn of its own. */
@@ -19842,6 +19887,7 @@ export function sendWorkerInput(
      *  it and re-sends its input instead of this content. Any other input is
      *  sent together with such a failed input (core/failed-turn-rewind.ts). */
     failedTurnResendOf?: string;
+    failedTurnEditedInput?: true;
   } = {},
 ): boolean {
   cancelDeploymentContinuation(ds.session, previous => sessionStore.updateDeploymentContinuation(ds.session, previous));
@@ -19878,7 +19924,7 @@ export function sendWorkerInput(
   if ((!ds.worker || ds.worker.killed) && !transferGate) return false;
   // The purge is a live-worker action; a staged tail would replay as a plain
   // continuation onto the unpurged transcript.
-  if (opts.purgeUndersizedImages && hasQueuedActivationAdmissionGate(ds)) return false;
+  if ((opts.purgeUndersizedImages || opts.purgeToolImages) && hasQueuedActivationAdmissionGate(ds)) return false;
   let normalized = typeof payload === 'string' ? { content: payload } : payload;
   const trustedController = trustedSessionController(ds);
   const bot = getBot(ds.larkAppId);
@@ -20038,6 +20084,7 @@ export function sendWorkerInput(
     ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
     ...(opts.atMostOnce ? { atMostOnce: true } : {}),
     ...(opts.purgeUndersizedImages ? { purgeUndersizedImages: true as const } : {}),
+    ...(opts.purgeToolImages ? { purgeToolImages: true as const } : {}),
     ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     ...(trustedController ? { trustedController } : {}),
     ...(normalized.rerouteEnvelope ? { rerouteEnvelope: normalized.rerouteEnvelope } : {}),
@@ -30869,16 +30916,19 @@ function setupWorkerHandlers(
         // (RUN_FINISHED auto-completes the CoT server-side). Also consumes the
         // one-shot `/cot show` force and drops the mid-turn thinking cache (a
         // post-terminal summon would create a bubble nobody ever finishes).
+        let terminalCardSettlement: Promise<unknown> | undefined;
+        let terminalReplyCardSend: Parameters<typeof settleTurnReplyCardTerminal>[2] | undefined;
         if (!managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt) && replyCardModeFor(ds, msg.turnId) !== 'legacy') {
           if (ds.replyCardRunningTurnId === msg.turnId) ds.replyCardRunningTurnId = undefined;
-          const replyCardSend: Parameters<typeof settleTurnReplyCardTerminal>[2] =
-            (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.turnId, { uuid, beforeWrite });
+          terminalReplyCardSend = (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.turnId, { uuid, beforeWrite });
+          const replyCardSend = terminalReplyCardSend;
           const waitingForReply = requiresReply && msg.status === 'completed' && !answered() && !emptyRequiredReply;
           const cardTerminal = emptyRequiredReply && !answered() ? { ...msg, status: 'failed' as const } : msg;
           const settleCard = waitingForReply
             ? retireReplyCardDisplay(ds, { ...msg, message: tr('worker.required_reply_pending', undefined, localeForBot(ds.larkAppId)) },
               replyCardSend, ownsLifecycleMutation)
             : settleTurnReplyCardTerminal(ds, cardTerminal, replyCardSend, ownsLifecycleMutation);
+          terminalCardSettlement = settleCard;
           void settleCard
             .then(async () => {
               if (cardTerminal.status !== 'completed' || waitingForReply) return;
@@ -31003,6 +31053,22 @@ function setupWorkerHandlers(
           if (msg.continuationFailure) throw err;
         }
         if (terminalPersisted) publishTurnFinished(ds, msg);
+        // A TRAE failed final is allowed to precede its terminal. Now that the
+        // exact failed-turn record is durable, add its recovery controls to the
+        // same carrier instead of posting a second card.
+        if (terminalPersisted && terminalCliId === 'traex' && ['failed', 'ambiguous'].includes(msg.status)) {
+          if (terminalCardSettlement && terminalReplyCardSend) {
+            const send = terminalReplyCardSend;
+            void terminalCardSettlement
+              .then(() => updateTurnReplyCard(ds, msg.turnId, { kind: 'refresh' }, send, {
+                dispatchAttempt: msg.dispatchAttempt, owns: ownsLifecycleMutation,
+              }))
+              .catch(error => logger.warn(`[${t}] failed-prompt reply-card refresh: ${error.message}`));
+          } else if (replyCardModeFor(ds, msg.turnId) === 'legacy') {
+            void patchLegacyFailedPromptCarrier(ds, msg, ownsLifecycleMutation)
+              .catch(error => logger.warn(`[${t}] failed-prompt legacy-card patch: ${error.message}`));
+          }
+        }
         // The turn is over: whatever its rewind directive did is settled.
         ds.pendingFailedTurnRewinds?.delete(msg.turnId);
         // The re-sent failed input got through (or was stopped / cut short):
@@ -34769,6 +34835,13 @@ function deliverFinalOutput(
             presentation: renderSnapshot,
             ...(replyCardActionBinding ? { cardActions: replyCardActionBinding } : {}),
           });
+      if (msg.turnFailed) cardJson = appendTraexImageRecoveryAction(cardJson, {
+        cliId: effectiveCliId, errorCode: msg.turnFailureCode, turnId: msg.turnId,
+        rootId: sessionAnchorId(ds), sessionId: ds.session.sessionId, locale: localeForBot(ds.larkAppId),
+        localOwnedSession: !managedReceiver && !ds.session.headless && !replyCardSandboxBlocked(ds)
+          && !hasProtectedSessionMutationOwnership(ds) && !hasQueuedActivationAdmissionGate(ds) && !isSharedAdoptSession(ds)
+          && !isRemoteBackendSession(ds) && !ds.adoptedFrom && !ds.initConfig?.adoptMode,
+      });
       if (effectiveCliId === 'minimax' && msg.turnFailed
           && ['turn_budget_exhausted', 'execution_failed'].includes(msg.turnFailureCode ?? '')) {
         // MiniMax uses the legacy reply-card path. Keep the machine-readable
@@ -34781,6 +34854,13 @@ function deliverFinalOutput(
           content: tr('card.turn_failed.field_error', { errorCode: `\`${msg.turnFailureCode}\`` }, localeForBot(ds.larkAppId)) });
         cardJson = JSON.stringify(failedCard);
       }
+      if (msg.turnFailed) cardJson = appendFailedPromptActions(cardJson, {
+        cliId: effectiveCliId, record: ds.session.lastFailedTurn, turnId: msg.turnId,
+        rootId: sessionAnchorId(ds), sessionId: ds.session.sessionId, locale: localeForBot(ds.larkAppId),
+        localOwnedSession: !managedReceiver && !ds.session.headless && !replyCardSandboxBlocked(ds)
+          && !hasProtectedSessionMutationOwnership(ds) && !hasQueuedActivationAdmissionGate(ds) && !isSharedAdoptSession(ds)
+          && !isRemoteBackendSession(ds) && !ds.adoptedFrom && !ds.initConfig?.adoptMode,
+      });
       const nativeLink = !managedReceiver ? await prepareNativeOncallCard(ds.larkAppId, ds.chatId, msg.replyTurnId ?? msg.turnId, ds.session.sessionId) : undefined;
       if (!managedReceiver) {
         cardJson = attachOncallGroupButton(cardJson, getBot(ds.larkAppId).config.oncallGroup, ds.chatId, ds.chatType, {

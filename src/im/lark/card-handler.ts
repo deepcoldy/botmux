@@ -119,6 +119,8 @@ import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-sto
 import { resumeSuccessMessage } from '../../core/resume-result-message.js';
 import { cliHasNoRawPassthroughSurface, cliSupportsCompactAction } from '../../core/passthrough-commands.js';
 import { coordinationModeIsPrimary } from '../../services/durable-coordination-runtime.js';
+import { buildFailedPromptEditCard, failedPromptCanRetry, FAILED_PROMPT_FIELD, FAILED_IMAGE_FIELD, MAX_FAILED_PROMPT_CHARS } from './failed-prompt-card.js';
+import { editFailedPrompt } from '../../services/failed-prompt-edit.js';
 import { REPLY_CARD_MENU_ACTION } from './reply-card-actions.js';
 import { sessionReasoningControl, updateCodexCliEffort, topicReasoningControl, setTopicReasoningEffort, isSessionRestartInFlight, setSessionReasoningEffort, sessionSupportsIdleAutoCompact, sessionSupportsKimiCacheExpiryAutoCompact, sendKimiCacheExpiryAutoCompactSetting, forkWorker, killWorker, suspendWorker, sendWorkerInput, sendWorkerSessionInput, interruptCodexAppTurn, codexAppStopCardTarget, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, cachedStreamingCardStatus, cachedStreamCardLabel, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, liveReadableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, freezeSessionSandboxDecision, sessionAcceptsDirectCommand, buildStreamingCardJson, substituteCardControlFor, streamCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof, streamingCardPresentationImageKey } from '../../core/worker-pool.js';
 import { reconcileResumedStreamingCard } from '../../core/resume-streaming-card.js';
@@ -4636,7 +4638,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       });
     }
 
-    if (actionType === 'retry_turn' && ds) {
+    if (['retry_turn', 'edit_failed_prompt', 'retry_edited_prompt'].includes(actionType) && ds) {
       const locDs = localeForBot(ds.larkAppId);
       if (isSessionTransferring(ds)) {
         return {
@@ -4659,6 +4661,38 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           + `current=${failedTurn.turnId.slice(0, 8)}) — refused`,
         );
         return { toast: { type: 'warning', content: t('card.action.retry_turn_stale', undefined, locDs) } };
+      }
+      const promptRecovery = sessionCliId(ds) === 'traex';
+      const editing = actionType === 'retry_edited_prompt';
+      if (promptRecovery && (ds.session.headless || ds.adoptedFrom || ds.initConfig?.adoptMode
+        || isSharedAdoptSession(ds) || isRemoteBackendSession(ds) || hasProtectedSessionMutationOwnership(ds)
+        || (ds.lastCliInputTurnId && ds.lastCliInputTurnId !== failedTurn.turnId)
+        || !isLiveWorkerIdleOrLimited(ds) || !ds.worker || ds.worker.killed)) {
+        return { toast: { type: 'warning', content: t('card.action.retry_turn_stale', undefined, locDs) } };
+      }
+      if (actionType !== 'retry_turn' && (!promptRecovery || !failedPromptCanRetry(failedTurn))) {
+        return { toast: { type: 'warning', content: t('card.action.retry_turn_stale', undefined, locDs) } };
+      }
+      if (actionType === 'edit_failed_prompt') {
+        const card = buildFailedPromptEditCard(failedTurn, { rootId: sessionAnchorId(ds), sessionId: ds.session.sessionId }, locDs);
+        // Keep the original carrier: a principal-lane card is authorized by
+        // this message's provenance. A new ephemeral message would lose it.
+        return { card: { type: 'raw', data: JSON.parse(card) },
+          toast: { type: 'success', content: locDs === 'en' ? 'Edit the saved prompt; nothing has been sent.' : '可编辑已保存的输入；尚未发送。' } };
+      }
+      let editedInput: ReturnType<typeof editFailedPrompt>;
+      let editedText: string | undefined;
+      if (editing) {
+        const text = action?.form_value?.[FAILED_PROMPT_FIELD];
+        const imageChoice = action?.form_value?.[FAILED_IMAGE_FIELD];
+        const hasImages = failedTurn.attachments?.some(a => a.type === 'image');
+        if (typeof text !== 'string' || !text.trim() || text.length > MAX_FAILED_PROMPT_CHARS
+          || (hasImages && imageChoice !== 'keep' && imageChoice !== 'remove')) {
+          return { toast: { type: 'warning', content: locDs === 'en' ? 'Enter a prompt and choose whether to keep the original image.' : '请输入文本并选择是否保留原图。' } };
+        }
+        editedText = text;
+        editedInput = editFailedPrompt(failedTurn, text, imageChoice !== 'remove');
+        if (!editedInput) return { toast: { type: 'warning', content: t('card.action.retry_turn_submit_failed', undefined, locDs) } };
       }
       const cooldownMs = retryCooldownRemaining(failedTurn);
       if (cooldownMs > 0) {
@@ -4688,7 +4722,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       //               （读现场 → 从 checkpoint 接着做 → 判断不了就交回人工）。
       // 旧卡片没有 mode 字段：按 continue 处理（fail-safe —— 宁可让模型先看
       // 现场，也不要在可能已执行过的轮次上闷头重发一遍）。
-      const continueMode = value?.mode !== 'resend';
+      const continueMode = !editing && (value?.mode !== 'resend' || (promptRecovery && !failedPromptCanRetry(failedTurn)));
       // 续跑不带原任务文本：这个 fork 走 resume（下面 ds.hasHistory），CLI 自己
       // 就能读到原任务和它已经做过的事，重复一遍纯属浪费 token。
       const submittedContent = continueMode
@@ -4696,16 +4730,18 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         : failedTurn.cliInput;
       const retryTurnId = `retry-${randomUUID()}`;
       const willUseLiveWorker = !!(ds.worker && !ds.worker.killed);
-      const replayed = prepareHookEnvelopeForReplay({
+      const replayed = editing ? undefined : prepareHookEnvelopeForReplay({
         ds,
         content: submittedContent,
         turnId: retryTurnId,
         hookEnvelope: failedTurn.hookEnvelope,
         willUseLiveWorker,
       });
-      const retryInput = {
-        content: replayed.content,
-        ...(replayed.hookEnvelope ? { hookEnvelope: replayed.hookEnvelope } : {}),
+      const retryInput = editedInput ?? {
+        content: replayed?.content ?? submittedContent,
+        ...(replayed?.hookEnvelope ? { hookEnvelope: replayed.hookEnvelope } : {}),
+        ...(!continueMode && failedTurn.attachments ? { attachments: structuredClone(failedTurn.attachments) } : {}),
+        ...(failedTurn.trustedCaller ? { trustedCaller: { ...failedTurn.trustedCaller } } : {}),
         // codexAppInput 描述的是「原样重发那条结构化输入」。续跑发的是一条新指令，
         // 带上旧 sidecar 会让 CLI 收到与正文不符的结构化载荷。
         ...(!continueMode && retryCodexAppInput ? { codexAppInput: retryCodexAppInput } : {}),
@@ -4716,7 +4752,11 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         // A turn that failed without any output is cut first and its input
         // re-sent as it was — nothing ran, so there is nothing to continue
         // from (core/failed-turn-rewind.ts). Otherwise the mode above applies.
-        if (willUseLiveWorker) accepted = sendWorkerInput(ds, retryInput, retryTurnId, { failedTurnResendOf: failedTurn.turnId });
+        if (willUseLiveWorker) accepted = sendWorkerInput(ds, retryInput, retryTurnId, {
+          ...(failedTurn.trustedCaller ? { trustedCaller: { ...failedTurn.trustedCaller } } : {}),
+          ...(!continueMode ? { failedTurnResendOf: failedTurn.turnId } : {}),
+          ...(editing ? { failedTurnEditedInput: true } : {}),
+        });
         else {
           accepted = forkManualTurn(ds, retryInput, retryTurnId, forkWorker);
         }
@@ -4733,8 +4773,10 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       }
       // Start the cooldown only after acceptance: a rejected click must not
       // burn it (same post-acceptance ordering as /retry and retry_last_task).
-      markRetryAttempt(ds.session);
-      rememberLastCliInput(ds, failedTurn.userPrompt, retryInput, retryTurnId);
+      const restoreTurnState = captureTurnStateBeforePurgeClick(ds);
+      const receipt = markRetryAttempt(ds.session);
+      if (promptRecovery && !continueMode) holdPurgeClickRollback(ds, retryTurnId, { ...(receipt ? { receipt } : {}), restoreTurnState });
+      rememberLastCliInput(ds, editedText ?? failedTurn.userPrompt, retryInput, retryTurnId);
       // The retry is this session's latest turn now: retire the previous card's rows.
       noteReplyCardTurnStarted(ds, retryTurnId);
       sessionStore.updateSession(ds.session);
@@ -4762,6 +4804,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     }
 
     if (actionType === 'purge_images_continue' && ds) {
+      const toolImages = value?.image_kind === 'traex_tool_images';
       const locDs = localeForBot(ds.larkAppId);
       // Same gates as retry_turn, plus the /restart gate set: the worker action
       // rewrites the transcript and respawns --resume, which shared-adopt and
@@ -4774,7 +4817,8 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       if (isSharedAdoptSession(ds) || isRemoteBackendSession(ds)) {
         return { toast: { type: 'warning', content: t('card.action.purge_images_unsupported', undefined, locDs) } };
       }
-      if (sessionCliId(ds) !== 'claude-code') {
+      if (sessionCliId(ds) !== (toolImages ? 'traex' : 'claude-code') || ds.session.headless
+        || ds.adoptedFrom || ds.initConfig?.adoptMode) {
         return { toast: { type: 'warning', content: t('card.action.purge_images_unsupported', undefined, locDs) } };
       }
       if (hasProtectedSessionMutationOwnership(ds)) {
@@ -4783,6 +4827,11 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       const failedTurn = ds.session.lastFailedTurn;
       if (!failedTurn) {
         return { toast: { type: 'warning', content: t('card.action.retry_turn_missing', undefined, locDs) } };
+      }
+      if (toolImages && (failedTurn.errorCode !== 'traex_tool_image_upload_failed'
+        || failedTurn.status !== 'failed'
+        || (ds.lastCliInputTurnId && ds.lastCliInputTurnId !== failedTurn.turnId))) {
+        return { toast: { type: 'warning', content: t('card.action.retry_turn_stale', undefined, locDs) } };
       }
       const clickedTurnId = value?.turn_id;
       if (!clickedTurnId || clickedTurnId !== failedTurn.turnId) {
@@ -4801,7 +4850,9 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           },
         };
       }
-      const continueInput = { content: buildTurnContinuePrompt() };
+      const continueInput = { content: buildTurnContinuePrompt() + (toolImages
+        ? '\n历史工具图片因上传失败已移除。先用文本与工作区状态检查已完成工作；图片服务恢复前不要再次调用返回图片的工具。若剩余任务必须读图，请明确说明阻碍，不要猜测图片内容或声称任务完成。'
+        : '') };
       // Same turnId handling as retry_turn: never reuse failedTurn.turnId — that
       // om_ id is a committed ordinary turn the worker would dedupe before the
       // purge branch.
@@ -4812,7 +4863,8 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         // No live worker: nothing to purge-and-respawn. Reject rather than a
         // plain fork that would replay the poisoned transcript.
         if (ds.worker && !ds.worker.killed) {
-          accepted = sendWorkerInput(ds, continueInput, retryTurnId, { purgeUndersizedImages: true });
+          accepted = sendWorkerInput(ds, continueInput, retryTurnId, toolImages
+            ? { purgeToolImages: true } : { purgeUndersizedImages: true });
         }
       } catch (err) {
         logger.warn(
@@ -4844,7 +4896,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         `[${tag(ds)}] purge_images_continue accepted for turn ${failedTurn.turnId.slice(0, 8)} `
         + `(attempt #${ds.session.lastFailedTurn?.retryCount ?? 1})`,
       );
-      return { toast: { type: 'success', content: t('card.action.purge_images_started', undefined, locDs) } };
+      return { toast: { type: 'success', content: t(toolImages ? 'card.action.purge_tool_images_started' : 'card.action.purge_images_started', undefined, locDs) } };
     }
 
     // Safe keys on the "CLI is stuck on a blocking page" card. Deliberately

@@ -31,6 +31,7 @@ describe('Codex effort menu input ownership', () => {
       let release!: () => void;
       const cancelled = new Promise<void>(resolve => { release = resolve; });
       const state = {
+        activeTranscriptImagePurge: undefined,
         lastInitConfig: null,
         backend: {}, cliAdapter: {}, cliLifetimeNonce: 1,
         codexCliEffortOperation: {}, cancelCodexCliEffort: vi.fn(() => cancelled),

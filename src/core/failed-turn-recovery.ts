@@ -296,7 +296,7 @@ export function clearLimitedFailedTurn(
  * active turn; a late terminal must not erase an already-claimed receipt. */
 export function recordFailedTurnTerminal(
   ds: DaemonSession,
-  terminal: { turnId: string; status: string; errorCode?: string; retryable?: boolean; directFailure?: true },
+  terminal: { turnId: string; status: string; errorCode?: string; retryable?: boolean; directFailure?: true; traexPromptCheckpoint?: FailedTurnRecord["traexPromptCheckpoint"] },
   context: { workerGeneration: number; caller: TrustedCaller | undefined; silent: boolean },
 ): void {
   const pendingRecordRetry = limitedFailedTurnRecordRetries.get(ds);

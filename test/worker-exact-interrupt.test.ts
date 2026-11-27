@@ -30,6 +30,7 @@ function harness(delivered = true, interruptKey?: 'ctrlc' | 'esc', cliId = 'code
   const retireDoubaoBridgeTurnOnInterrupt = vi.fn(() => false);
   const submitCursorParkedFollowUpAfterStop = vi.fn();
   const context = createContext({
+    activeTranscriptImagePurge: undefined,
     workerSessionEventScope: undefined,
     currentBotmuxTurnId: 'stop', currentBotmuxDispatchAttempt: undefined, backend: {}, lastInitConfig: { cliId }, effectiveBackendType: 'pty', isCodexAppCliId,
     codexCliEffortOperation: undefined, cliLifetimeNonce: 1,

@@ -9,6 +9,7 @@ import {
   PURGE_CONTINUATION_WITHHELD,
   PURGE_IMAGES_NOT_APPLIED,
   planPurgeRequest,
+  PurgeContinuationLease,
   purgeOutcomeNotice,
   runPurgeMaintenance,
   takePurgeClickRollback,
@@ -33,6 +34,28 @@ function report(overrides: Partial<PurgeReport> = {}): PurgeReport {
 }
 
 const REMOVABLE = report({ files: [{ file: TARGET.jsonlPath, removed: 1 }], removed: 1, imageBlocks: 1 });
+
+describe('held image repair continuation', () => {
+  it('revokes persistence and continuation exactly once after stop or successor input', () => {
+    const reject = vi.fn(); const enqueue = vi.fn();
+    const lease = new PurgeContinuationLease('repair', reject);
+    expect(lease.pending).toBe(true);
+    expect(lease.cancel()).toBe(true);
+    expect(lease.pending).toBe(false);
+    expect(lease.cancel()).toBe(false);
+    lease.settle({ deliverContinuation: true }, enqueue);
+    expect(enqueue).not.toHaveBeenCalled();
+    expect(reject).toHaveBeenCalledExactlyOnceWith(PURGE_CONTINUATION_WITHHELD);
+  });
+  it('cannot enqueue twice when respawn completion is repeated', () => {
+    const reject = vi.fn(); const enqueue = vi.fn();
+    const lease = new PurgeContinuationLease('repair', reject);
+    lease.settle({ deliverContinuation: true }, enqueue);
+    lease.settle({ deliverContinuation: true }, enqueue);
+    expect(enqueue).toHaveBeenCalledTimes(1);
+    expect(reject).not.toHaveBeenCalled();
+  });
+});
 
 function input(overrides: Partial<PurgeRequestInput> = {}): PurgeRequestInput {
   return {

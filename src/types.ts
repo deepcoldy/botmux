@@ -334,6 +334,7 @@ export interface FailedTurnRecord {
   /** The worker saw this turn end on API errors alone (turn_terminal
    *  `directFailure`): the next input may cut it out and re-send its input. */
   directFailure?: true;
+  traexPromptCheckpoint?: import("./services/traex-prompt-checkpoint.js").TraexPromptCheckpoint;
   /** Current-turn transcript boundary backing an Antigravity limited snapshot's
    *  directFailure proof. Missing legacy boundaries fail closed for auto-replay. */
   antigravityWriteBoundary?: AntigravityTranscriptWriteBoundary;
@@ -364,7 +365,9 @@ export interface FailedTurnRewindDirective {
   failedInput: string;
   /** `resend`: the failed input again (retry button / automatic continuation).
    *  `merge`: the failed input followed by this message's input. */
-  mode: 'resend' | 'merge';
+  mode: 'resend' | 'merge' | 'edit';
+  requireRewind?: true;
+  traexPromptCheckpoint?: import('./services/traex-prompt-checkpoint.js').TraexPromptCheckpoint;
   /** What the CLI gets once the turn is cut. */
   content: string;
   /** The final content already carries every hook envelope inline. The worker
@@ -2460,7 +2463,7 @@ type DaemonToWorkerBase =
    *  three-state contract (undefined = not carried → keep snapshot; null = launch
    *  with no model). It never affects the CLI already running. */
   | { type: 'request_next_step'; turnId: string; dispatchAttempt?: number; userPrompt?: string; answer: string }
-  | { type: 'message'; queueAfterActiveTurn?: true; content: string; nativeQuestionAnswer?: { requestId: string }; codexAppInput?: CodexAppTurnInput; linkRefMode?: 'observe' | 'enabled'; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; durablePrimaryInbox?: true; codexAppDispatchId?: string; codexAppSteerable?: true; queuedActivationToken?: string; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; rerouteEnvelope?: CrossPrincipalInterruptionMessage; atMostOnce?: true; mojoLivePatch?: MojoLivePatch; model?: string | null; reasoningEffort?: import('./services/codex-reasoning-effort.js').CodexReasoningEffort | null; larkToolBinding?: boolean | null; triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig | null; replyDelivery?: 'send' | 'transcript'; startupCommands?: string[] | null; launchShell?: string | null; taskContinuation?: TaskContinuationDispatchMarker; turnCallerOpenId?: string; purgeUndersizedImages?: true; failedTurnRewind?: FailedTurnRewindDirective }
+  | { type: 'message'; queueAfterActiveTurn?: true; content: string; nativeQuestionAnswer?: { requestId: string }; codexAppInput?: CodexAppTurnInput; linkRefMode?: 'observe' | 'enabled'; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; durablePrimaryInbox?: true; codexAppDispatchId?: string; codexAppSteerable?: true; queuedActivationToken?: string; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; rerouteEnvelope?: CrossPrincipalInterruptionMessage; atMostOnce?: true; mojoLivePatch?: MojoLivePatch; model?: string | null; reasoningEffort?: import('./services/codex-reasoning-effort.js').CodexReasoningEffort | null; larkToolBinding?: boolean | null; triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig | null; replyDelivery?: 'send' | 'transcript'; startupCommands?: string[] | null; launchShell?: string | null; taskContinuation?: TaskContinuationDispatchMarker; turnCallerOpenId?: string; purgeUndersizedImages?: true; purgeToolImages?: true; failedTurnRewind?: FailedTurnRewindDirective }
   | { type: 'codex_app_dispatch_persisted'; requestId: string; ok: boolean; error?: string }
   /** Literal slash-command passthrough. `followUpContent` rides along so the
    *  worker enqueues it strictly AFTER the slash command's Enter — two separate
@@ -3439,6 +3442,7 @@ export type WorkerToDaemonBase =
        *  next input may cut it out instead of stacking on top (see
        *  services/failed-turn-rewind.ts). */
       directFailure?: true;
+      traexPromptCheckpoint?: import("./services/traex-prompt-checkpoint.js").TraexPromptCheckpoint;
     }
   | {
       /** Outcome of a message's {@link FailedTurnRewindDirective}, sent before
