@@ -24,7 +24,9 @@ export function validateModelPin(
 ): string | undefined {
   if (!/^[A-Za-z0-9][A-Za-z0-9._:/@+-]*(\[[A-Za-z0-9_.-]+\])?$/.test(input.model) || input.model.length > 64) return '模型名无效（仅支持不含空白的 ASCII 模型 ID，最长 64 字符）';
   if (!botAcceptsLaunchModel(cfg)) return `CLI ${cfg.cliId ?? 'unknown'} / ${cfg.backendType ?? 'default'} 不支持启动模型覆盖`;
-  if (input.effort !== undefined && (!isCodexReasoningEffort(input.effort) || !cliModelSupportsReasoningEffort(cfg.cliId, input.model, input.effort, catalog))) return `模型 ${input.model} 不支持推理强度 ${input.effort}`;
+  // An explicit pin has to apply on restart. Pi restores the transcript's
+  // thinking level on resume, so only the model can be pinned here.
+  if (input.effort !== undefined && (cfg.cliId === 'pi' || !isCodexReasoningEffort(input.effort) || !cliModelSupportsReasoningEffort(cfg.cliId, input.model, input.effort, catalog))) return `模型 ${input.model} 不支持推理强度 ${input.effort}`;
   return undefined;
 }
 

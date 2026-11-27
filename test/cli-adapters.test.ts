@@ -2477,6 +2477,38 @@ describe('pi buildArgs', () => {
     expect(args[0]).toBe('--extension');
   });
 
+  it('passes a saved reasoning effort to Pi as --thinking, without a model required', () => {
+    // Dashboard 保存的档位必须抵达 Pi 进程：`--thinking` 与 `--model` 相互独立，
+    // 未显式配置模型的 Bot 也要能带上已保存档位启动。
+    const args = adapter.buildArgs({
+      sessionId: 'sess-pi',
+      resume: false,
+      reasoningEffort: 'xhigh',
+    });
+    const idx = args.indexOf('--thinking');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx + 1]).toBe('xhigh');
+    expect(args).not.toContain('--model');
+  });
+
+  it('lets Pi restore the session thinking level when resuming', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-pi', resume: true, reasoningEffort: 'high' });
+    expect(args).not.toContain('--thinking');
+    expect(args[args.indexOf('--session-id') + 1]).toBe('sess-pi');
+  });
+
+  it('never puts a level Pi rejects (ultra) on Pi argv and adds no override when unset', () => {
+    // Hand-edited bots.json is filtered in the adapter too: `ultra` 不是 Pi
+    // `--thinking` 的合法值，绝不能进入启动 argv。
+    for (const effort of ['ultra', 'off', 'minimal'] as const) {
+      const args = adapter.buildArgs({ sessionId: 'sess-pi', resume: false, reasoningEffort: effort });
+      expect(args).not.toContain('--thinking');
+    }
+    // Pi 原生默认（未保存档位）不加额外覆盖。
+    const args = adapter.buildArgs({ sessionId: 'sess-pi', resume: false });
+    expect(args).not.toContain('--thinking');
+  });
+
   it('injects session context and builtin skills via extension env and --skill', () => {
     expect(adapter.injectsSessionContext).toBe(true);
     expect(adapter.pluginDir).toBe(PI_PLUGIN_DIR);

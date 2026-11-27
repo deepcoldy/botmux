@@ -74,6 +74,7 @@ describe('explicit topic launch choice', () => {
     [{ cliId: 'codex' }, { model: 'x y' }],
     [{ cliId: 'codex' }, { model: 'gpt-5.2', effort: 'ultra' }],
     [{ cliId: 'cursor' }, { model: 'm', effort: 'high' }],
+    [{ cliId: 'pi' }, { model: 'provider/new', effort: 'high' }],
   ] as const)('rejects unsupported explicit writes %j %j', (cfg, input) => {
     expect(validateModelPin(input, cfg)).toBeTruthy();
   });
