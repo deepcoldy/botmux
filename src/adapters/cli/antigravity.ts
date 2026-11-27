@@ -91,6 +91,13 @@ import {
  *      next message reaches the model.
  */
 
+/** First agy release whose OSC 7501 reports are enabled by botmux:
+ *  1.4.0 introduced OSC 7501 (`AGY_CLI_OSC7501=on` / `AGY_CLI_OSC7501_MESSAGES=brief`),
+ *  and 1.5.10 fixed premature `done` while waiting for background subagents/tasks
+ *  (daemon tasks such as dev servers do not count). Older/unknown versions keep
+ *  the screen + transcript path unchanged. */
+export const ANTIGRAVITY_PROGRAM_STATUS_MIN_VERSION = '1.5.10';
+
 const HISTORY_PATH = join(homedir(), '.gemini', 'antigravity-cli', 'history.jsonl');
 
 
@@ -713,22 +720,29 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
   // Only a newly launched --conversation process can inherit unfinished work
   // from a dead predecessor. A reattached process can still be doing that work.
   let coldResumeTail: { conversationId: string; step: string } | undefined;
-  const activeSessionId = (pty: Pick<PtyHandle, 'cliPid' | 'cliCwd'>): string | undefined => {
+  const activeSessionIdObservation = (pty: Pick<PtyHandle, 'cliPid' | 'cliCwd'>): {
+    sessionId: string;
+    source: 'native-log' | 'process-discovery';
+  } | undefined => {
     const fromLog = sessionLog?.read().currentId;
-    if (fromLog) return fromLog;
-    // On a fresh launch (`!resume && !reattach`), agy creates no conversation
-    // until the first prompt is submitted, while startup `ListConversations`
-    // opens historical/sibling conversation `.db` files in parallel. Once agy
-    // is actively writing `--log-file`, wait for its authoritative
-    // `Streaming conversation <uuid>` line instead of probing transient startup fds.
-    if (awaitNativeStreamLog && sessionLog?.hasLogFile()) return undefined;
+    if (fromLog) return { sessionId: fromLog.toLowerCase(), source: 'native-log' };
+    // On a fresh launch (`!reattach && !(resume && resumeSessionId)`), buildArgs
+    // always wires a process-scoped `--log-file` and agy creates no conversation
+    // until the first prompt is submitted, while startup `ListConversations` can
+    // open historical/sibling conversation `.db` files before `--log-file` is
+    // created or flushed. Never probe transient startup fds — wait for this
+    // process's own `--log-file` to emit `Streaming conversation <uuid>`.
+    if (awaitNativeStreamLog && sessionLog) return undefined;
     // Managed sessions (`buildArgs` wired `--log-file`) must never fall back to
     // workspace summaries when `cliPid` is unset — that hijacks a concurrent or
     // historical conversation sharing the same working directory.
     const cwd = sessionLog ? undefined : pty.cliCwd;
     if (!pty.cliPid && !cwd) return undefined;
-    return findAntigravityConversationId({ pid: pty.cliPid, cwd }) ?? undefined;
+    const discovered = findAntigravityConversationId({ pid: pty.cliPid, cwd }) ?? undefined;
+    return discovered ? { sessionId: discovered.toLowerCase(), source: 'process-discovery' } : undefined;
   };
+  const activeSessionId = (pty: Pick<PtyHandle, 'cliPid' | 'cliCwd'>): string | undefined =>
+    activeSessionIdObservation(pty)?.sessionId;
   const recordConfirmedSubmit = (
     pty: Pick<PtyHandle, 'cliPid' | 'cliCwd'>,
     preSize: number | null,
@@ -764,9 +778,9 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
 
     buildArgs({ sessionId, resume, resumeSessionId, disableCliBypass, model, reasoningEffort, cliVersion, reattach }) {
       bracketedPasteSupported = reattach === false && supportsAntigravityBracketedPaste(cliVersion);
-      awaitNativeStreamLog = !resume && !reattach;
+      awaitNativeStreamLog = !reattach && !(resume && resumeSessionId);
       const args = disableCliBypass ? [] : ['--dangerously-skip-permissions'];
-      sessionLog = new AntigravitySessionLog(sessionId);
+      sessionLog = new AntigravitySessionLog(sessionId, undefined, { startAtEnd: !reattach });
       args.push('--log-file', sessionLog.path);
       // Resume: only when we have agy's own conversation UUID. We never
       // map botmux's sessionId here because agy generates its own id at
@@ -819,6 +833,7 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
     },
 
     resolveActiveSessionId: activeSessionId,
+    resolveActiveSessionIdObservation: activeSessionIdObservation,
 
     forkSessionAfterReady(opts) {
       if (!sessionLog) throw new Error('Antigravity fork has no process-scoped native log');
@@ -878,9 +893,9 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       const preSize = initialTranscriptPath ? currentFileSize(initialTranscriptPath) : null;
       // No transcript exists yet for the conversation this input lands in: a
       // known id whose brain file agy creates lazily (e.g. right after /new),
-      // or a fresh launch whose native log has not streamed any conversation
-      // (activeSessionId withholds an id only in that state). Any USER_INPUT
-      // that later appears there is this submit's.
+      // or a fresh launch whose native log is already being written with no
+      // streamed conversation yet. Any USER_INPUT that later appears there is
+      // this submit's.
       const transcriptCreatedAfterSubmit = !initialTranscriptPath
         && (!!initialCid || (awaitNativeStreamLog && !!sessionLog?.hasLogFile()));
 
@@ -1035,6 +1050,31 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
           && isAntigravityIdleComposerScreen(screen)) return false;
       } catch { /* Missing viewport is not evidence of cancellation. */ }
       return true;
+    },
+    // OSC 7501 (`ESC]7501;state=…:app=antigravity BEL`), verified live on agy
+    // 1.5.18 (raw PTY and private tmux pipe-pane):
+    //   startup  idle on ready composer (blocked kind=question on setup wizard,
+    //            blocked kind=permission on folder trust);
+    //   turn     [idle on first keystroke after done] → working →
+    //            [blocked kind=permission|question → working] → done | error | idle (Esc);
+    //   /model, /help: no report at all.
+    // Under tmux pipe-pane the startup `7501;?` probe goes unanswered, so
+    // `AGY_CLI_OSC7501=on` skips the handshake and `AGY_CLI_OSC7501_MESSAGES=brief`
+    // keeps `msg` compact (without raw reply/command/question bodies). Startup
+    // stays on the composer gates; each write cycle hands idle to the screen
+    // until agy reports busy; from there working → blocked → done/idle/error is
+    // authoritative, blocked holds queued input off approval dialogs, and a
+    // confirmed transcript terminal still releases a lingering `working` (never
+    // `blocked`). Older/unknown versions, adopted panes, and explicit
+    // `AGY_CLI_OSC7501=off` keep the screen + transcript path unchanged.
+    supportsProgramStatus: true,
+    programStatusMinVersion: ANTIGRAVITY_PROGRAM_STATUS_MIN_VERSION,
+    programStatusFollowsInputCycle: true,
+    programStatusYieldsToTranscriptTerminal: true,
+    programStatusBlockedHoldsInput: true,
+    spawnEnv: {
+      AGY_CLI_OSC7501: 'on',
+      AGY_CLI_OSC7501_MESSAGES: 'brief',
     },
     systemHints: BOTMUX_SHELL_HINTS,
     skillsDir: '~/.gemini/config/skills',

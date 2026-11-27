@@ -1,12 +1,14 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { closeSync, mkdirSync, openSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { isLinuxZombie, readDurableProcessIdentity } from '../../utils/process-identity.js';
 import { scrubExternalMemberEnv } from '../../utils/child-env.js';
+import { pidNotProvablyGone } from '../../utils/process-alive.js';
+import { signalAttestedFleetProcess } from '../fleet-process-identity.js';
 import { pidAlive } from '../fleet-supervisor.js';
 import { isStandaloneBinary, resolveEntrySpawn } from '../self-spawn.js';
 import { liveGodAt } from '../legacy-pm2-reaper.js';
@@ -14,7 +16,7 @@ import { botmuxHome } from './paths.js';
 import {
   pluginServiceName, pluginSupervisorDir, readPluginSupervisorState,
   pluginSupervisorDesiredPath, readPluginSupervisorDesired, readPluginSupervisorResult,
-  type PluginServiceSpec,
+  type PluginServiceSpec, type PluginSupervisorResult,
 } from './supervisor-store.js';
 
 export interface PluginProcessInfo {
@@ -106,6 +108,107 @@ function supervisorAlive(): boolean {
     && readDurableProcessIdentity(result.pid) === result.processStart;
 }
 
+function supervisorProcessExited(pid: number): boolean {
+  return !pidNotProvablyGone(pid) || isLinuxZombie(pid);
+}
+
+function assertSupervisorIdentity(result: PluginSupervisorResult) {
+  if (!result.processStart) throw new Error(`plugin_supervisor_identity_unknown:${result.pid}`);
+  const identity = readDurableProcessIdentity(result.pid);
+  if (!identity) throw new Error(`plugin_supervisor_identity_unknown:${result.pid}`);
+  if (identity !== result.processStart) throw new Error(`plugin_supervisor_identity_mismatch:${result.pid}`);
+  return result.processStart;
+}
+
+function assertSupervisorOwner(result: PluginSupervisorResult) {
+  const identity = assertSupervisorIdentity(result);
+  const state = readPluginSupervisorState();
+  if (state?.supervisorPid !== result.pid) throw new Error(`plugin_supervisor_identity_mismatch:${result.pid}`);
+  if (!state.supervisorProcessStart) throw new Error(`plugin_supervisor_identity_unknown:${result.pid}`);
+  if (state.supervisorProcessStart !== identity) throw new Error(`plugin_supervisor_identity_mismatch:${result.pid}`);
+  return identity;
+}
+
+/** Caller holds the service-manager lock. Explicit --all also covers desired
+ * members absent from the installed registry, including failed-start retries.
+ * Reuse the host's signal/finally path; a delivered signal is not completion. */
+export async function shutdownPluginSupervisor(): Promise<void> {
+  assertNoLegacyPluginPm2();
+  readPluginSupervisorDesired(); // validate uncertainty even without a host result
+  const initial = readPluginSupervisorResult();
+  const ownerLock = join(pluginSupervisorDir(), 'owner.lock');
+  const assertComplete = () => {
+    const state = readPluginSupervisorState();
+    if (Object.values(readPluginSupervisorDesired().services).some(item => item.running)
+      || existsSync(ownerLock) || (initial && !state) || state?.supervisorPid
+      || state?.procs.some(proc => proc.pid > 1 || proc.status === 'online' || proc.status === 'launching')) {
+      throw new Error('plugin_supervisor_shutdown_incomplete');
+    }
+  };
+  const durableStateComplete = () => {
+    try {
+      assertComplete();
+      return true;
+    } catch (error) {
+      if (error instanceof Error && error.message === 'plugin_supervisor_shutdown_incomplete') return false;
+      throw error;
+    }
+  };
+  if (!initial) {
+    if (existsSync(ownerLock)) throw new Error('plugin_supervisor_identity_unknown');
+    assertComplete();
+    return;
+  }
+  const initialExited = supervisorProcessExited(initial.pid);
+  if (durableStateComplete()) {
+    if (initialExited) return;
+    const currentIdentity = readDurableProcessIdentity(initial.pid);
+    // A completed state makes a retained result stale. A live PID is safe to
+    // ignore only when its birth proves that it belongs to a different process.
+    if (initial.processStart && currentIdentity && currentIdentity !== initial.processStart) return;
+  }
+  if (initialExited) {
+    assertComplete();
+    return;
+  }
+  assertSupervisorOwner(initial);
+  for (const [id, item] of Object.entries(readPluginSupervisorDesired().services)) {
+    if (item.running) await changePluginService(id, 'stop', undefined, { existingSupervisorOnly: true });
+  }
+  const desired = readPluginSupervisorDesired();
+  const result = readPluginSupervisorResult();
+  if (!result || result.pid !== initial.pid || result.processStart !== initial.processStart) {
+    throw new Error('plugin_supervisor_identity_mismatch');
+  }
+  // changePluginService throws an error ACK for every revision issued above.
+  // Any remaining error is historical and must not permanently veto recovery.
+  if (Object.values(desired.services).some(item => item.running)) throw new Error('plugin_supervisor_members_running');
+  if (supervisorProcessExited(result.pid)) {
+    assertComplete();
+    return;
+  }
+  const processStart = assertSupervisorOwner(result);
+  if (!signalAttestedFleetProcess({ pid: result.pid, processStart }, 'SIGTERM')) {
+    if (!supervisorProcessExited(result.pid)) {
+      assertSupervisorIdentity(result);
+      throw new Error(`plugin_supervisor_signal_failed:${result.pid}`);
+    }
+    assertComplete();
+    return;
+  }
+  const longestStop = Math.max(8_000, ...Object.values(desired.services).map(item => item.spec.external.killTimeoutMs ?? 8_000));
+  const deadline = Date.now() + longestStop + 6_000;
+  while (Date.now() < deadline) {
+    if (supervisorProcessExited(result.pid)) {
+      assertComplete();
+      return;
+    }
+    assertSupervisorIdentity(result);
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  throw new Error(`plugin_supervisor_shutdown_timeout:${result.pid}`);
+}
+
 function launchSupervisor(): void {
   const root = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
   const resolved = resolveEntrySpawn('plugin-supervisor', root);
@@ -136,8 +239,14 @@ export async function changePluginService(
   pluginId: string,
   operation: 'start' | 'stop' | 'remove',
   spec?: PluginServiceSpec,
+  options: { existingSupervisorOnly?: boolean } = {},
 ): Promise<void> {
   assertNoLegacyPluginPm2();
+  const current = options.existingSupervisorOnly ? readPluginSupervisorResult() : undefined;
+  if (options.existingSupervisorOnly) {
+    if (!current || !pidNotProvablyGone(current.pid)) throw new Error('plugin_supervisor_shutdown_incomplete');
+    assertSupervisorOwner(current);
+  }
   const desired = readPluginSupervisorDesired();
   const killTimeoutMs = spec?.external.killTimeoutMs ?? desired.services[pluginId]?.spec.external.killTimeoutMs ?? 8_000;
   const name = pluginServiceName(pluginId);
@@ -155,12 +264,15 @@ export async function changePluginService(
   desired.target = pluginId;
   mkdirSync(pluginSupervisorDir(), { recursive: true, mode: 0o700 });
   atomicWriteFileSync(pluginSupervisorDesiredPath(), JSON.stringify(desired), { mode: 0o600, durable: true, followTargetSymlink: false });
-  if (!supervisorAlive()) launchSupervisor();
+  if (!current && !supervisorAlive()) launchSupervisor();
   const timeoutMs = Math.max(30_000, killTimeoutMs + 10_000);
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const result = readPluginSupervisorResult();
     if (result?.revision === desired.revision) {
+      if (current && (result.pid !== current.pid || result.processStart !== current.processStart)) {
+        throw new Error('plugin_supervisor_identity_mismatch');
+      }
       if (result.error) throw new Error(result.error);
       return;
     }

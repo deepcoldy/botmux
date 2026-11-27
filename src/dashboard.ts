@@ -3554,6 +3554,8 @@ async function configuredBotDefaultsRecoveryRows(
         }, {
           displayName: bot.displayName ?? null,
           larkBotName: persistedNames.get(bot.larkAppId) ?? null,
+          commandTriggersConfigured: Boolean(bot.commandTriggers?.commands.length),
+          blockedUsersConfigured: Boolean(bot.blockedUsers?.length),
           // 离线行也要带上磁盘里的保存值（如竖放排版、默认关的 larkToolBinding），
           // 否则 daemon 不在线时 Dashboard 会把已保存的非默认态显示回默认态。
           ...sparseOverridesFromRawBotConfig(rawEntry),
@@ -6584,9 +6586,13 @@ const server = createServer(async (req, res) => {
       const body = await buildModelChoicesResponse(key, {
         runtimeContext: probeContext.runtimeContext,
         probeEnv: probeContext.probeEnv,
+        probeSettingsEnv: probeContext.probeSettingsEnv,
         runtimeExecutable: probeContext.runtimeExecutable,
         resolveExecutable,
         supportsModelDiscovery: requestedCliId => {
+          // A Bot whose persisted launch shape doesn't match the request (for
+          // example an unknown wrapper) must not borrow the host's catalogue.
+          if (!probeContext.canProbe) return false;
           // Capability fields are static for a CLI. An absolute placeholder
           // keeps even eager constructors (for example pi) from resolving the
           // real command before this preflight has proved discovery is needed.
@@ -6595,7 +6601,11 @@ const server = createServer(async (req, res) => {
         },
         adapterFactory: async (requestedCliId, pathOverride) => {
           const command = pathOverride ?? rawCliExecutable(requestedCliId);
-          return createCliAdapterSync(requestedCliId, command ? await resolveExecutable(command) : undefined);
+          return createCliAdapterSync(
+            requestedCliId,
+            command ? await resolveExecutable(command) : undefined,
+            { configDir: probeContext.configDir },
+          );
         },
       });
       return jsonRes(res, 200, body);

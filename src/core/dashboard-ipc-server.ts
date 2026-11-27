@@ -203,7 +203,7 @@ import {
   CURRENT_EXECUTION_IDENTITY_ROUTE,
   CURRENT_EXECUTION_IDENTITY_SCHEMA,
 } from '../cli/current-execution.js';
-import { isBytedcliIdentityRegion } from '../platform/bytedcli-grant-regions.js';
+import { isBytedcliIdentityRegion, isBytedcliOverseasRegion } from '../platform/bytedcli-grant-regions.js';
 import { GRANT_WAIT_CAP_MS, PROVIDER_AUTH_REQUEST_ROUTE_BUDGET_MS } from '../platform/credential-grant-budget.js';
 import { resolveDaemonCurrentExecution } from './current-execution.js';
 import { configuredCliExecutionMode, sessionCliExecutionInfo } from './cli-execution-mode.js';
@@ -705,10 +705,11 @@ import { resolveUserToken } from '../utils/user-token.js';
 import { currentLarkToolDelegation, getLarkToolDelegation } from './lark-tool-delegation.js';
 import { capabilityOfTool } from './identity-policy.js';
 import { activePlatformCredentialBindingKey, reasonTag, platformAuthorizeUrl } from './platform-credential-source.js';
+import { platformLarkAuthorization, refreshPlatformLarkGrant } from './platform-lark-identity-renewal.js';
 import { askPlatformToAuthorize, type PlatformAuthorizationRequestResult } from './platform-authorization-request.js';
 import { hasReason, PLATFORM_WILL_NOT_ISSUE_REASONS } from './refusal-reasons.js';
 import { requestUnattendedAuthorization, noticeUnattendedLapse, clearUnattendedLapse, definitelyNotAuthorized, missingAuthorizationEntries, privateNoticeSender, unattendedTask, unattendedRefusalText, type UnattendedNoticeOutcome, type UnattendedProvider } from './capability-authorization.js';
-import { publishDelegationRefusal, adoptLocalBytedcliAuthorization, refreshExpiredPlatformBytedcliDefault, retryMissingRegionalGrant, retryTransientTurnIdentity, awaitTurnIdentityPublication } from './turn-cli-identity.js';
+import { publishDelegationRefusal, adoptLocalBytedcliAuthorization, refreshExpiredPlatformBytedcli, hasExpiredPlatformBitscliCredential, retryMissingRegionalGrant, retryTransientTurnIdentity, awaitTurnIdentityPublication } from './turn-cli-identity.js';
 import { boundLarkPlatformPolicy, platformAuthRequestRedirect, resolveBoundLarkUserCredential } from './lark-tool-platform-credential.js';
 import type { ReplyStyleConfig } from '../im/lark/reply-card-style.js';
 import {
@@ -1858,8 +1859,10 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
   const tool: IdentityRouteTool | '' = (identityRouteTools as readonly string[]).includes(toolValue)
     ? toolValue as IdentityRouteTool : '';
   const region = record?.region;
+  const codebase = record?.codebase;
   if (!sessionId || !tool || (record?.as !== undefined && typeof record.as !== 'string')
-    || (region !== undefined && (tool !== 'bytedcli' || !isBytedcliIdentityRegion(region)))) {
+    || (region !== undefined && (tool !== 'bytedcli' || !isBytedcliIdentityRegion(region)))
+    || (codebase !== undefined && (tool !== 'bytedcli' || codebase !== true || region !== undefined))) {
     return jsonRes(res, 400, blocked('invalid_request'));
   }
   const requestedAs = record?.as as string | undefined;
@@ -1963,26 +1966,52 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
       await awaitTurnIdentityPublication(config.session.dataDir, sessionId);
       env = recallProvenIdentityContent(config.session.dataDir, sessionId, speakerTurnId, tool);
     }
-    if (env && region && !delegation) {
+    const credential = tool === 'codebase' || codebase ? 'codebase' : tool === 'bitscli' ? 'default' : region;
+    if (env && credential && !delegation) {
       const refresh = {
         sessionDataDir: dataDir, sessionId, turnId: speakerTurnId, speakerOpenId: choice.speaker?.openId,
         currentPolicy, executionStillCurrent, waitMs: grantDeadline - Date.now(),
       };
-      const renewed = region === 'default' || region === 'cn'
-        ? await refreshExpiredPlatformBytedcliDefault({ ...refresh, region })
-        : await retryMissingRegionalGrant({ ...refresh, region });
-      if (!executionStillCurrent() || renewed === 'superseded') return jsonRes(res, 403, blocked('lineage_unproven'));
-      if (renewed === 'unavailable') return jsonRes(res, 503, blocked('bytecloud_grant_unavailable'));
-      if (renewed === 'denied') return jsonRes(res, 403, blocked('bytecloud_grant_denied'));
+      const credentials = tool === 'bitscli' ? ['default', 'codebase'] as const : [credential] as const;
+      const renewals = await Promise.all(credentials.map(credential => refreshExpiredPlatformBytedcli({ ...refresh, credential })));
+      if (renewals[0] === 'untracked' && isBytedcliOverseasRegion(region)) {
+        await retryMissingRegionalGrant({ ...refresh, region });
+      }
+      if (!executionStillCurrent() || renewals.includes('superseded')) return jsonRes(res, 403, blocked('lineage_unproven'));
+      if (renewals.includes('denied')) return jsonRes(res, 403, blocked('bytecloud_grant_denied'));
+      if (renewals.includes('regional_authorization_required')) return jsonRes(res, 403, blocked('bytecloud_region_authorization_required'));
+      if (renewals.includes('codebase_authorization_required')) return jsonRes(res, 403, blocked('codebase_grant_authorization_required'));
       env = recallProvenIdentityContent(dataDir, sessionId, speakerTurnId, tool);
-      if (renewed === 'not_authorized' || renewed === 'consent_missing') {
+      const consent = renewals.includes('consent_missing');
+      if (consent || renewals.includes('not_authorized')) {
         // Refuse this command without overwriting the turn's other credentials.
         // The existing wrapper flow can ask the platform for authorization.
-        const consent = renewed === 'consent_missing';
         const hint = t(consent ? 'trigger_user_auth.denied_platform_consent' : 'trigger_user_auth.denied_platform_login',
           { tool, provider: 'ByteCloud' }, localeForBot(liveAppId));
-        env = renderIdentityEnv({ tool: 'bytedcli', mode: 'denied', turnId: speakerTurnId,
+        env = renderIdentityEnv({ tool, mode: 'denied', turnId: speakerTurnId,
           openId: choice.speaker?.openId, message: `${hint}\n${reasonTag(consent ? 'platform_consent_missing' : 'platform_not_authorized')}` });
+      } else if (renewals.includes('unavailable') || (tool === 'bitscli' && hasExpiredPlatformBitscliCredential(refresh))) {
+        return jsonRes(res, 503, blocked('bytecloud_grant_unavailable'));
+      }
+    }
+    if (env && tool === 'lark-cli') {
+      const renewed = await refreshPlatformLarkGrant({
+        sessionDataDir: dataDir, sessionId, turnId: speakerTurnId, speakerOpenId: choice.speaker?.openId,
+        currentPolicy, executionStillCurrent, waitMs: grantDeadline - Date.now(),
+      });
+      if (renewed === 'superseded' || (renewed !== 'untracked' && !executionStillCurrent())) {
+        return jsonRes(res, 403, blocked('lineage_unproven'));
+      }
+      if (renewed === 'unavailable') return jsonRes(res, 503, blocked('lark_grant_unavailable'));
+      if (renewed === 'denied') return jsonRes(res, 403, blocked('lark_grant_denied'));
+      if (renewed === 'ready') env = recallProvenIdentityContent(dataDir, sessionId, speakerTurnId, tool);
+      if (renewed === 'not_authorized' || renewed === 'consent_missing') {
+        const consent = renewed === 'consent_missing';
+        const locale = localeForBot(liveAppId);
+        const hint = t(consent ? 'trigger_user_auth.denied_platform_consent' : 'trigger_user_auth.denied_platform_login',
+          { tool, provider: t('trigger_user_auth.provider_lark', undefined, locale) }, locale);
+        env = renderIdentityEnv({ tool, mode: 'denied', turnId: speakerTurnId, openId: choice.speaker?.openId,
+          message: `${hint}\n${reasonTag(consent ? 'platform_consent_missing' : 'platform_not_authorized')}` });
       }
     }
     if (env) {
@@ -5456,19 +5485,24 @@ async function handleProviderAuthRequest(
         || identityStorageModelForDaemonSession(ds) !== 'proven') return false;
       if (as === undefined) return true;
       try {
-        return governedSpeakers({ policy: currentPolicy(), tool: 'bytedcli',
+        return governedSpeakers({ policy: currentPolicy(), tool: provider === 'lark-cli' ? 'lark-cli' : 'bytedcli',
           sessionDataDir: dataDir, sessionId, origin: live })
           ?.some(speaker => speaker.openId === openId && speaker.turnId === publishedTurnId) ?? false;
       } catch { return false; }
     };
     const routeDeadline = Date.now() + PROVIDER_AUTH_REQUEST_ROUTE_BUDGET_MS;
     const grantDeadline = Math.min(routeDeadline, Date.now() + GRANT_WAIT_CAP_MS);
+    const larkRefresh = { sessionDataDir: dataDir, sessionId, turnId: publishedTurnId, speakerOpenId: openId,
+      currentPolicy, executionStillCurrent };
+    const larkAuthorization = provider === 'lark-cli' ? platformLarkAuthorization(larkRefresh) : undefined;
+    const larkAuthorizationFence = larkAuthorization?.stillAllowed;
+    const refuseStaleLarkAuthorization = () => jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
     const refreshBytedcli = ({ afterPlatformReady = false } = {}) => {
       // A ready answer authorizes one immediate re-ask, past the previous
       // refusal's cooldown. It gets its own grant window, bounded by this
       // request's overall route budget so the CLI can still receive an answer.
       const deadline = afterPlatformReady ? Math.min(routeDeadline, Date.now() + GRANT_WAIT_CAP_MS) : grantDeadline;
-      return refreshExpiredPlatformBytedcliDefault({
+      return refreshExpiredPlatformBytedcli({
         sessionDataDir: dataDir, sessionId, turnId: publishedTurnId, speakerOpenId: openId,
         currentPolicy, executionStillCurrent, waitMs: deadline - Date.now(), force: afterPlatformReady,
       });
@@ -5502,11 +5536,13 @@ async function handleProviderAuthRequest(
       needsRenewalAuthorization = true;
     }
     const asked = await askPlatformToAuthorize({ botConfig: cfg, openId,
-      ...(needsRenewalAuthorization ? { stillAllowed: canRequestRenewalAuthorization } : {}),
+      ...(needsRenewalAuthorization ? { stillAllowed: canRequestRenewalAuthorization } : larkAuthorization),
     });
     if (needsRenewalAuthorization && !canRequestRenewalAuthorization()) return renewalUnavailable(true);
+    if (larkAuthorizationFence?.() === false) return refuseStaleLarkAuthorization();
     if (asked.kind === 'legacy') {
-      const delivered = await deliverPlatformAuthorization(ds, cfg, openId, platformUrl, provider as AuthProvider | 'lark-cli', published);
+      const delivered = await deliverPlatformAuthorization(ds, cfg, openId, platformUrl,
+        provider as AuthProvider | 'lark-cli', published, larkAuthorizationFence);
       return jsonRes(res, 200, { ok: true, provider, ...delivered });
     }
     if (asked.kind === 'ready') {
@@ -5523,12 +5559,21 @@ async function handleProviderAuthRequest(
         if (renewed === 'denied') return renewalDenied();
         if (renewed !== 'ready' && renewed !== 'untracked') return renewalUnavailable(renewed === 'superseded');
       }
+      if (provider === 'lark-cli' && published?.('lark-cli')?.includes("BOTMUX_IDENTITY_MODE='user'")) {
+        const renewed = await refreshPlatformLarkGrant({ ...larkRefresh,
+          waitMs: Math.min(routeDeadline - Date.now(), GRANT_WAIT_CAP_MS), force: true });
+        if (renewed === 'superseded' || larkAuthorizationFence?.() === false) return refuseStaleLarkAuthorization();
+        if (renewed === 'denied') return renewalDenied();
+        if (renewed !== 'ready' && renewed !== 'untracked') return jsonRes(res, 200, { ok: true, provider, status: 'unavailable',
+          message: t('trigger_user_auth.denied_platform_unavailable_retryable',
+            { tool: provider, provider: t('trigger_user_auth.provider_lark', undefined, loc) }, loc) });
+      }
       const effective = recallProvenIdentityContent(config.session.dataDir, sessionId, publishedTurnId, provider as TriggerUserAuthTool)
         ?.includes("BOTMUX_IDENTITY_MODE='user'");
       return jsonRes(res, 200, { ok: true, provider, status: 'ready',
         message: t(effective ? 'provider_auth.platform_ready_now' : 'provider_auth.platform_ready', undefined, loc) });
     }
-    return jsonRes(res, 200, { ok: true, provider, ...await platformCardOutcome(ds, asked) });
+    return jsonRes(res, 200, { ok: true, provider, ...await platformCardOutcome(ds, asked, larkAuthorizationFence) });
   }
   const localBytecloudPolicyCurrent = provider === 'bytedcli' ? () => {
     try {
@@ -12037,9 +12082,12 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     larkBotName = bot.botName ?? null;
   } catch { /* none */ }
   const sandboxPathsForDashboard = sandboxStore.getBotSandboxPaths(cachedLarkAppId);
+  const currentBotConfig = getBot(cachedLarkAppId).config;
   jsonRes(res, 200, {
     larkAppId: cachedLarkAppId,
-    apiOnly: getBot(cachedLarkAppId).config.apiOnly === true,
+    apiOnly: currentBotConfig.apiOnly === true,
+    commandTriggersConfigured: Boolean(currentBotConfig.commandTriggers?.commands.length),
+    blockedUsersConfigured: Boolean(currentBotConfig.blockedUsers?.length),
     botName: getBotName(),
     displayName,
     larkBotName,
@@ -12127,9 +12175,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     sandboxMode: sandboxStore.getBotSandboxMode(cachedLarkAppId),
     // Machine-wide BOTMUX_SANDBOX force the worker applies over this bot's own
     // selection (null = none). Lets the page say why "关闭" is not what runs.
-    sandboxEnvForce: (() => {
-      try { const m = envSandboxMode(process.env.BOTMUX_SANDBOX); return m === 'off' ? null : m; } catch { return null; }
-    })(),
+    sandboxEnvForce: dashboardSandboxEnvForce(),
     scratchStorage: (() => { try { return getBot(cachedLarkAppId).config.scratchStorage ?? null; } catch { return null; } })(),
     scratchTmpfsSizeMb: (() => { try { return getBot(cachedLarkAppId).config.scratchTmpfsSizeMb ?? null; } catch { return null; } })(),
     scratchDenyPaths: (() => { try { return getBot(cachedLarkAppId).config.scratchDenyPaths ?? null; } catch { return null; } })(),
@@ -13637,6 +13683,13 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
       // rejected above; retain the legacy cleared flag for older clients.
       readIsolation: bot.config.readIsolation === true,
       readIsolationSupported: readIsolationEnforceableFor(bot.config),
+      // The summary must follow the just-saved CLI/backend pairing without a full page reload.
+      localSandboxApplies: localSandboxApplies(
+        resolvePairedBackendId(bot.config.cliId, bot.config.backendType, config.daemon.backendType) ?? 'pty',
+        bot.config.mojo,
+      ),
+      effectiveSandboxMode: effectiveBotSandboxMode(bot.config),
+      sandboxEnvForce: dashboardSandboxEnvForce(),
       readIsolationCleared: false,
       codexBrowserCleared,
       agentAvailable: availability.available,
@@ -14408,6 +14461,16 @@ botConfigPutRoute<{ enabled?: unknown; autoAvoidApproval?: unknown }>('/api/bot-
   },
   respond: value => ({ ok: true, autoAvoidApproval: value !== false }),
 });
+/** Machine-wide sandbox override reported consistently by dashboard GET and agent PUT. */
+function dashboardSandboxEnvForce(): 'oncall' | 'scratch' | null {
+  try {
+    const mode = envSandboxMode(process.env.BOTMUX_SANDBOX);
+    return mode === 'off' ? null : mode;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * The sandbox mode the worker will spawn this bot's CLI under
  * (resolveLocalSandboxMode: global BOTMUX_SANDBOX and the legacy readIsolation

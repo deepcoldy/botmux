@@ -16,6 +16,28 @@ describe('cliIdFromCommArgv', () => {
     expect(cliIdFromCommArgv('node', ['node', '/home/u/.local/bin/cursor-agent'])).toBe('cursor');
   });
 
+  it('detects Agent Local by native comm and by constrained MainThread executable argv', () => {
+    expect(cliIdFromCommArgv('cursor-agent-local', ['/opt/cursor-agent-local'])).toBe('cursor');
+    // Linux TASK_COMM_LEN truncates the 18-byte executable name to 15 bytes.
+    expect(cliIdFromCommArgv('cursor-agent-lo', ['/opt/cursor-agent-local'])).toBe('cursor');
+    expect(cliIdFromCommArgv('MainThread', ['/opt/cursor-agent-local', '--authless'], 'cursor')).toBe('cursor');
+    expect(cliIdFromCommArgv('MainThread', ['/opt/cursor-agent-local'])).toBeUndefined();
+    expect(cliIdFromCommArgv('MainThread', ['/opt/cursor-agent-local'], 'codex')).toBeUndefined();
+    expect(cliIdFromCommArgv(
+      'MainThread',
+      ['node', '/srv/unrelated.js', '/opt/cursor-agent-local'],
+      'cursor',
+    )).toBeUndefined();
+    // Zellij collapses ancestor matches after this shared classification. A
+    // helper must never survive to replace the main process in that collapse.
+    expect(cliIdFromCommArgv(
+      'MainThread', ['/opt/cursor-agent-local', '--type=gpu-process'], 'cursor',
+    )).toBeUndefined();
+    expect(cliIdFromCommArgv(
+      'cursor-agent-lo', ['/opt/cursor-agent-local', '--type=renderer'], 'cursor',
+    )).toBeUndefined();
+  });
+
   it('only treats generic agent as Cursor when the Cursor bot filters adopt sessions', () => {
     expect(cliIdFromCommArgv('agent', ['agent'])).toBeUndefined();
     expect(cliIdFromCommArgv('agent', ['agent'], 'cursor')).toBe('cursor');

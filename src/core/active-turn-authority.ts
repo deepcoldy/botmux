@@ -46,7 +46,7 @@ function frozenCaller(caller: TrustedCaller | undefined): TrustedCaller | undefi
   }) : undefined;
 }
 
-function compatibleAuthorityPrincipal(
+export function compatibleAuthorityPrincipal(
   left: TrustedCaller | undefined,
   right: TrustedCaller | undefined,
 ): boolean {

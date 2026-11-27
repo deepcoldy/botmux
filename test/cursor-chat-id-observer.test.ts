@@ -96,6 +96,66 @@ describe('observeCursorCliSessionId behind botmux launch layers', () => {
     expect(persistCliSessionId).toHaveBeenCalledWith(CHAT);
   });
 
+  it.each([
+    ['native comm', 'cursor-agent-local', ['/opt/cursor-agent-local', '--authless']],
+    ['Linux-truncated comm', 'cursor-agent-lo', ['/opt/cursor-agent-local', '--authless']],
+    ['MainThread executable argv', 'MainThread', ['/opt/cursor-agent-local', '--authless']],
+  ])('persists Agent Local chat id below a persistent wrapper using %s', (_label, comm, cmdline) => {
+    const procs: Record<number, Proc> = {
+      [PANE]: { comm: 'sh', cmdline: ['sh'], children: [CURSOR] },
+      [CURSOR]: { comm, cmdline, children: [], chatId: CHAT },
+    };
+    const backend = { getChildPid: () => PANE };
+    const { observe, scheduler, persistCliSessionId } = harness({ procs, backend });
+
+    observe(PANE);
+    scheduler.runAll();
+
+    expect(persistCliSessionId).toHaveBeenCalledWith(CHAT);
+  });
+
+  it('keeps an already-identified Agent Local main pid when its Electron helper shares the identity', () => {
+    const procs: Record<number, Proc> = {
+      [PANE]: {
+        comm: 'MainThread',
+        cmdline: ['/opt/cursor-agent-local', '--authless'],
+        children: [CURSOR],
+        chatId: CHAT,
+      },
+      [CURSOR]: {
+        comm: 'MainThread',
+        cmdline: ['/opt/cursor-agent-local', '--type=gpu-process'],
+        children: [],
+      },
+    };
+    const backend = { getChildPid: () => PANE };
+    const { observe, scheduler, persistCliSessionId } = harness({ procs, backend });
+
+    observe(PANE);
+    scheduler.runAll();
+
+    expect(persistCliSessionId).toHaveBeenCalledWith(CHAT);
+  });
+
+  it('does not bind a MainThread wrapper merely naming Agent Local in a program argument', () => {
+    const procs: Record<number, Proc> = {
+      [PANE]: { comm: 'sh', cmdline: ['sh'], children: [CURSOR] },
+      [CURSOR]: {
+        comm: 'MainThread',
+        cmdline: ['node', '/srv/unrelated.js', '/opt/cursor-agent-local'],
+        children: [],
+        chatId: CHAT,
+      },
+    };
+    const backend = { getChildPid: () => PANE };
+    const { observe, scheduler, persistCliSessionId } = harness({ procs, backend });
+
+    observe(PANE);
+    scheduler.runAll();
+
+    expect(persistCliSessionId).not.toHaveBeenCalled();
+  });
+
   it('stops once a later spawn supersedes this one', () => {
     const backend: { getChildPid: () => number; cliPid?: number } = { getChildPid: () => PANE };
     const { observe, scheduler, persistCliSessionId, scope } = harness({ procs: scopedCursorTree(), backend });

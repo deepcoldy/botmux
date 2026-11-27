@@ -99,6 +99,10 @@ export interface TurnReplyCardRecord extends TurnReplyCardKey {
   nextStep?: import('../im/lark/next-step-card.js').NextStepButton;
   /** The「本轮回顾」panel body shown on a completed turn's card. */
   recap?: { markdown: string };
+  /** Visible Lark destination where the card was initially created (when
+   *  created by `botmux send`, which may target a consumed mid-turn follow-up
+   *  in chat scope rather than the host turn's original topic). */
+  deliveredTarget?: import('../core/reply-target.js').SessionReplyTarget;
 }
 
 export type TurnReplyCardEvent =
@@ -171,6 +175,8 @@ export interface TurnReplyCardTransport {
   forceVisible?: boolean;
   /** Card callback ACK may restore the pre-click view despite an earlier PATCH. */
   forcePatch?: boolean;
+  /** Visible destination used if `send()` creates a fresh card in this update. */
+  deliveredTarget?(): import('../core/reply-target.js').SessionReplyTarget | undefined;
   usage?: import('../im/lark/md-card.js').CardUsageSnapshot;
 }
 
@@ -595,6 +601,8 @@ export class TurnReplyCardStore {
           this.write(key, record);
           record.messageId = await publish(record.pendingCreate.content, body => io.send(body, `brc_${this.id(key)}`));
           if (!record.messageId) throw new Error('Missing reply-card message ID');
+          const createdTarget = io.deliveredTarget?.();
+          if (createdTarget) record.deliveredTarget = createdTarget;
           record.lastCard = record.pendingCreate.content;
           delete record.pendingCreate;
           this.write(key, record);

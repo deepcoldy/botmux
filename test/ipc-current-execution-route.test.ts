@@ -35,6 +35,35 @@ function session(): any {
     managedTurnOrigin: { capability: 'ca'.repeat(32), turnId: 'trigger-current', dispatchAttempt: 3,
       preexistingProcessIdentities: [`${process.pid}:${readProcessStartIdentity(process.pid)}`] } };
 }
+
+async function startProvenPlatformTurn() {
+  const ds = session();
+  const turnId = ds.managedTurnOrigin.turnId;
+  ds.managedTurnOrigin.callerOpenId = 'ou_alice';
+  vi.spyOn(workerPool, 'identityModelRefusalReason').mockReturnValue(undefined);
+  vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 's-execution' ? ds : undefined);
+  const attestation = await import('../src/core/current-actor-attestation.js');
+  vi.spyOn(attestation, 'resolveLoopbackPeerProcesses').mockResolvedValue({
+    ok: true, peer: { pid: process.pid, procStart: '1' },
+  });
+  const attest = vi.spyOn(attestation, 'attestCurrentExecutionLoopbackPeer').mockImplementation(() => ({
+    ds, turnId: ds.managedTurnOrigin.turnId, generation: ds.workerGeneration,
+    dispatchAttempt: ds.managedTurnOrigin.dispatchAttempt, capability: ds.managedTurnOrigin.capability,
+    workerPid: process.pid, workerProcStart: '1', processIdentities: [],
+  }));
+  const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
+  const botConfig = {
+    larkAppId: 'cli_execution', larkToolBinding: true, backendType: 'pty',
+    triggerUserAuth: parseTriggerUserAuthConfig({ enabled: true, tools: ['bytedcli'], credentialSource: 'platform' }),
+  } as any;
+  vi.spyOn(await import('../src/bot-registry.js'), 'getBot').mockReturnValue({ config: botConfig } as any);
+  ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+  const dataDir = mkdtempSync(join(tmpdir(), 'cli-identity-platform-renewal-'));
+  previousDataDir = config.session.dataDir;
+  config.session.dataDir = dataDir;
+  return { ds, turnId, attest, botConfig, dataDir };
+}
+
 async function request(body: unknown) {
   return fetch(`http://127.0.0.1:${ipc!.port}/api/current-execution`, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
@@ -597,6 +626,444 @@ describe('POST /api/current-execution', () => {
       }
     } finally {
       releaseGrant();
+      __setPlatformCredentialDepsForTest(null);
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['concurrent overseas renewal', 'dedicated CN renewal', 'network failure', 'stale response',
+    'reauth required', 'worker replaced'] as const)(
+    'renews only the expired platform partition in a proven turn: %s', async scenario => {
+      const { publishTurnCliIdentity } = await import('../src/core/turn-cli-identity.js');
+      const { __setPlatformCredentialDepsForTest } = await import('../src/core/platform-credential-source.js');
+      const { ds, turnId, attest, botConfig, dataDir } = await startProvenPlatformTurn();
+
+      let now = Math.floor(Date.now() / 1_000) * 1_000;
+      vi.spyOn(Date, 'now').mockImplementation(() => now);
+      const jwt = (region: string, ttlSeconds: number) =>
+        `e30.${Buffer.from(JSON.stringify({ region, exp: now / 1_000 + ttlSeconds })).toString('base64url')}.fixture`;
+      const region = scenario === 'dedicated CN renewal' ? 'cn' : 'i18n';
+      const oldJwt = jwt(region, 600);
+      const newJwt = jwt(region, 3_600);
+      const oldTx = jwt('tx', scenario === 'concurrent overseas renewal' ? 600 : 3_600);
+      const newTx = jwt('tx', 3_600);
+      const primaryJwt = jwt('cn', 5_400);
+      const stableI18nbd = jwt('i18nbd', 3_600);
+      const variable = `BYTEDCLI_USER_CLOUD_JWT_${region.toUpperCase()}`;
+      const envLine = (token: string) => `BOTMUX_IDENTITY_CLOUD_JWT_${region.toUpperCase()}='${token}'`;
+      let releaseGrant!: () => void;
+      const grantHeld = new Promise<void>(resolve => { releaseGrant = resolve; });
+      let grants = 0;
+      const requestGrant = vi.fn(async (req: CredentialGrantRequest): Promise<CredentialGrantResult> => {
+        const attempt = ++grants;
+        const requested = req.cloudJwtRegions?.[0];
+        if (attempt > 1) await grantHeld;
+        if (attempt === 2 && scenario === 'network failure') return { ok: false, reason: 'network', error: 'fixture unavailable' };
+        if (attempt > 1 && scenario === 'reauth required') return { ok: true, value: {
+          tool: 'bytedcli', unionId: req.unionId, expiresAt: now + 3_600_000,
+          cloudJwtRegionStates: { [region]: 'reauth_required' }, variables: { BYTEDCLI_USER_CLOUD_JWT: 'other-default' },
+        } };
+        return { ok: true, value: {
+          tool: 'bytedcli', unionId: req.unionId, expiresAt: now + 3_600_000,
+          cloudJwtRegions: attempt === 1 ? ['cn', 'i18n', 'i18nbd', 'tx'] : [...(req.cloudJwtRegions ?? [])],
+          variables: attempt === 1
+            ? { BYTEDCLI_USER_CLOUD_JWT: primaryJwt, BYTEDCLI_USER_CODE_JWT: 'original-codebase',
+                BYTEDCLI_USER_CLOUD_JWT_CN: jwt('cn', 3_600), BYTEDCLI_USER_CLOUD_JWT_I18N: jwt('i18n', 3_600),
+                BYTEDCLI_USER_CLOUD_JWT_I18NBD: stableI18nbd, BYTEDCLI_USER_CLOUD_JWT_TX: oldTx, [variable]: oldJwt }
+            : { BYTEDCLI_USER_CLOUD_JWT: 'other-default', BYTEDCLI_USER_CODE_JWT: 'other-codebase',
+                ...(requested === 'tx' ? { BYTEDCLI_USER_CLOUD_JWT_TX: newTx }
+                  : { [variable]: scenario === 'stale response' ? oldJwt : newJwt }) },
+        } };
+      });
+      __setPlatformCredentialDepsForTest({
+        readBinding: () => ({ platformUrl: 'https://platform.example.test', machineToken: 'mt', machineId: 'm-1' }),
+        resolveUnionId: async () => 'on_alice', requestGrant,
+      });
+      const fetchIdentity = async (demand: 'cn' | 'i18n' | 'tx' | 'i18nbd' = region) => {
+        const response = await fetch(`http://127.0.0.1:${ipc!.port}/api/current-execution-identity`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ sessionId: 's-execution', tool: 'bytedcli', region: demand }),
+        });
+        return { status: response.status, body: await response.json() };
+      };
+      const published = () => recallProvenIdentityContent(dataDir, 's-execution', turnId, 'bytedcli');
+      const refreshed = { status: 200, body: { identityTurnId: turnId, env: expect.stringContaining(envLine(newJwt)) } };
+      try {
+        await publishTurnCliIdentity({
+          botConfig, sessionDataDir: dataDir, sessionId: 's-execution', senderOpenId: 'ou_alice', turnId, storageModel: 'proven',
+        });
+        const initial = published();
+        expect(initial).toContain(envLine(oldJwt));
+        expect(await fetchIdentity()).toMatchObject({ status: 200, body: { env: initial } });
+        expect(requestGrant).toHaveBeenCalledTimes(1);
+        now += 600_000;
+        expect(await fetchIdentity('i18nbd')).toMatchObject({ status: 200, body: { env: initial } });
+
+        const first = fetchIdentity();
+        await vi.waitFor(() => expect(requestGrant).toHaveBeenCalledTimes(2));
+        expect(requestGrant).toHaveBeenLastCalledWith(expect.objectContaining({
+          unionId: 'on_alice', appId: 'cli_execution', sessionId: 's-execution', turnId, cloudJwtRegions: [region],
+        }), expect.anything());
+        if (scenario === 'concurrent overseas renewal') {
+          const proofs = attest.mock.calls.length;
+          const concurrent = fetchIdentity();
+          const tx = fetchIdentity('tx');
+          await vi.waitFor(() => {
+            expect(attest).toHaveBeenCalledTimes(proofs + 2);
+            expect(requestGrant).toHaveBeenCalledTimes(3);
+          });
+          expect(requestGrant).toHaveBeenLastCalledWith(expect.objectContaining({ cloudJwtRegions: ['tx'] }), expect.anything());
+          releaseGrant();
+          const [firstResult, concurrentResult, txResult] = await Promise.all([first, concurrent, tx]);
+          expect(firstResult).toMatchObject(refreshed);
+          expect(concurrentResult).toMatchObject(refreshed);
+          expect(txResult).toMatchObject({ status: 200, body: { env: expect.stringContaining(newTx) } });
+          expect(published()).toContain(envLine(newJwt));
+          expect(published()).toContain(newTx);
+          expect(published()).not.toContain(oldTx);
+          expect(requestGrant).toHaveBeenCalledTimes(3);
+        } else {
+          if (scenario === 'worker replaced') ds.workerGeneration++;
+          releaseGrant();
+          const result = await first;
+          if (scenario === 'worker replaced' || scenario === 'reauth required') {
+            expect(result).toMatchObject({ status: 403, body: {
+              reason: scenario === 'worker replaced' ? 'lineage_unproven' : 'bytecloud_region_authorization_required',
+            } });
+            expect(result.body.env).toBeUndefined();
+            expect(published()).toBe(initial);
+            return;
+          }
+          if (scenario === 'network failure' || scenario === 'stale response') {
+            expect(result).toMatchObject({ status: 503, body: { reason: 'bytecloud_grant_unavailable' } });
+            expect(result.body.env).toBeUndefined();
+            expect(published()).toBe(initial);
+            expect(await fetchIdentity()).toEqual(result);
+            expect(requestGrant).toHaveBeenCalledTimes(2);
+            if (scenario === 'stale response') return;
+            now += 60_000;
+          } else {
+            expect(result).toMatchObject(refreshed);
+          }
+        }
+        expect(await fetchIdentity()).toMatchObject(refreshed);
+        expect(published()).not.toContain(oldJwt);
+        expect(published()).toContain(`BYTEDCLI_USER_CLOUD_JWT='${primaryJwt}'`);
+        expect(published()).toContain(stableI18nbd);
+        expect(published()).toContain('original-codebase');
+        expect(published()).not.toContain('other-codebase');
+        expect(requestGrant).toHaveBeenCalledTimes(scenario === 'dedicated CN renewal' ? 2 : 3);
+      } finally {
+        releaseGrant();
+        __setPlatformCredentialDepsForTest(null);
+        rmSync(dataDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.each([
+    ['Bits ByteCloud', 'bitscli', 'cloud'],
+    ['Bits Codebase', 'bitscli', 'code'],
+    ['Bits ByteCloud and Codebase together', 'bitscli', 'both'],
+    ['Bits Codebase while ByteCloud expires', 'bitscli', 'code then cloud'],
+    ['standalone Codebase', 'codebase', 'code'],
+    ['standalone Codebase needing authorization', 'codebase', 'code requiring authorization'],
+    ['bytedcli Codebase', 'bytedcli', 'code'],
+  ] as const)('renews the expired platform JWT for %s in a proven turn', async (_label, tool, expired) => {
+    const { publishTurnCliIdentity } = await import('../src/core/turn-cli-identity.js');
+    const { __setPlatformCredentialDepsForTest } = await import('../src/core/platform-credential-source.js');
+    const { turnId, botConfig, dataDir } = await startProvenPlatformTurn();
+
+    let now = Math.floor(Date.now() / 1_000) * 1_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const jwt = (ttlSeconds: number, claims: Record<string, string> = {}) =>
+      `e30.${Buffer.from(JSON.stringify({ ...claims, exp: now / 1_000 + ttlSeconds })).toString('base64url')}.fixture`;
+    const expireCloud = expired === 'cloud' || expired === 'both';
+    const expireCode = expired !== 'cloud';
+    const expireCloudWhileWaiting = expired === 'code then cloud';
+    const requiresAuthorization = expired === 'code requiring authorization';
+    const originalCloud = jwt(expireCloud ? 600 : expireCloudWhileWaiting ? 601 : 3_600, { region: 'cn' });
+    const originalCode = jwt(expireCode ? 600 : 3_600);
+    const newerCloud = jwt(7_200, { region: 'cn' });
+    const newerCode = jwt(7_200);
+    const originalTx = jwt(3_600, { region: 'tx' });
+    const grant = (request: CredentialGrantRequest, cloud: string, code: string, tx?: string): CredentialGrantResult => ({
+      ok: true, value: { tool: 'bytedcli', unionId: request.unionId, expiresAt: now + 3_600_000, variables: {
+        BYTEDCLI_USER_CLOUD_JWT: cloud, BYTEDCLI_USER_CODE_JWT: code, ...(tx ? { BYTEDCLI_USER_CLOUD_JWT_TX: tx } : {}),
+      } },
+    });
+    let releaseGrant!: () => void;
+    const grantHeld = new Promise<void>(resolve => { releaseGrant = resolve; });
+    const requestGrant = vi.fn(async (req: CredentialGrantRequest): Promise<CredentialGrantResult> => {
+      if (expireCloudWhileWaiting) await grantHeld;
+      if (requiresAuthorization) return { ok: false, reason: 'not_authorized', error: 'fixture requires authorization' };
+      return grant(req, newerCloud, newerCode);
+    })
+      .mockImplementationOnce(async (req: CredentialGrantRequest) => grant(req, originalCloud, originalCode, originalTx));
+    __setPlatformCredentialDepsForTest({
+      readBinding: () => ({ platformUrl: 'https://platform.example.test', machineToken: 'mt', machineId: 'm-1' }),
+      resolveUnionId: async () => 'on_alice', requestGrant,
+    });
+    const envFor = (demand: 'bitscli' | 'codebase' | 'bytedcli') => recallProvenIdentityContent(dataDir, 's-execution', turnId, demand);
+    const fetchIdentity = async () => {
+      const response = await fetch(`http://127.0.0.1:${ipc!.port}/api/current-execution-identity`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId: 's-execution', tool, ...(tool === 'bytedcli' ? { codebase: true } : {}) }),
+      });
+      return { status: response.status, body: await response.json() };
+    };
+    try {
+      await publishTurnCliIdentity({
+        botConfig, sessionDataDir: dataDir, sessionId: 's-execution', senderOpenId: 'ou_alice', turnId, storageModel: 'proven',
+      });
+      const selectedKey = expireCloud ? 'AIME_USER_CLOUD_JWT'
+        : tool === 'bytedcli' ? 'BYTEDCLI_USER_CODE_JWT' : 'CODEBASE_CLI_USER_JWT';
+      const selectedOriginal = expireCloud ? originalCloud : originalCode;
+      const selectedNewer = expireCloud ? newerCloud : newerCode;
+      expect(await fetchIdentity()).toMatchObject({ status: 200, body: {
+        identityTurnId: turnId, env: expect.stringContaining(`${selectedKey}='${selectedOriginal}'`),
+      } });
+      expect(requestGrant).toHaveBeenCalledTimes(1);
+      now += 600_000;
+
+      if (expireCloudWhileWaiting) {
+        const pending = fetchIdentity();
+        await vi.waitFor(() => expect(requestGrant).toHaveBeenCalledTimes(2));
+        now += 1_000;
+        releaseGrant();
+        const result = await pending;
+        expect(result).toMatchObject({ status: 503, body: { reason: 'bytecloud_grant_unavailable' } });
+        expect(result.body.env).toBeUndefined();
+        expect(envFor('codebase')).toContain(`CODEBASE_CLI_USER_JWT='${newerCode}'`);
+        const retry = await fetchIdentity();
+        expect(retry.status).toBe(200);
+        expect(retry.body.env.split('\n')).toEqual(expect.arrayContaining([
+          `CLOUD_JWT='${newerCloud}'`, `CODEBASE_CLI_USER_JWT='${newerCode}'`,
+        ]));
+        expect(requestGrant).toHaveBeenCalledTimes(3);
+        return;
+      }
+      const response = await fetchIdentity();
+      if (requiresAuthorization) {
+        expect(response).toMatchObject({ status: 403, body: { reason: 'codebase_grant_authorization_required' } });
+        expect(response.body.env).toBeUndefined();
+        expect(envFor('codebase')).toContain(`CODEBASE_CLI_USER_JWT='${originalCode}'`);
+        expect(await fetchIdentity()).toEqual(response);
+        expect(requestGrant).toHaveBeenCalledTimes(2);
+        return;
+      }
+      expect(response).toMatchObject({ status: 200, body: { identityTurnId: turnId, env: envFor(tool) } });
+      expect(response.body.env).toContain(`${selectedKey}='${selectedNewer}'`);
+      expect(response.body.env).not.toContain(selectedOriginal);
+      expect(envFor('bytedcli')).toContain(originalTx);
+      expect(envFor('bytedcli')).not.toContain(expireCloud ? originalCloud : newerCloud);
+      expect(envFor('bytedcli')).not.toContain(expireCode ? originalCode : newerCode);
+      const expectedCloud = expireCloud ? newerCloud : originalCloud;
+      const expectedCode = expireCode ? newerCode : originalCode;
+      expect(envFor('bytedcli')).toContain(`BYTEDCLI_USER_CLOUD_JWT='${expectedCloud}'`);
+      expect(envFor('bytedcli')).toContain(`BYTEDCLI_USER_CODE_JWT='${expectedCode}'`);
+      expect(envFor('bitscli')?.split('\n')).toEqual(expect.arrayContaining([
+        `AIME_USER_CLOUD_JWT='${expectedCloud}'`, `CLOUD_JWT='${expectedCloud}'`,
+        `BYTEDCLI_USER_CLOUD_JWT='${expectedCloud}'`, `CODEBASE_CLI_USER_JWT='${expectedCode}'`,
+      ]));
+      expect(envFor('codebase')).toContain(`CODEBASE_CLI_USER_JWT='${expectedCode}'`);
+      expect(await fetchIdentity()).toEqual(response);
+      expect(requestGrant).toHaveBeenCalledTimes(2);
+    } finally {
+      releaseGrant();
+      __setPlatformCredentialDepsForTest(null);
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    { label: 'Codebase JWT', credential: 'codebase', hasExp: true, missing: false },
+    { label: 'regional JWT', credential: 'i18n', hasExp: true, missing: false },
+    { label: 'missing regional JWT', credential: 'i18n', hasExp: true, missing: true },
+    { label: 'Codebase JWT without exp', credential: 'codebase', hasExp: false, missing: false },
+    { label: 'default JWT without exp', credential: 'default', hasExp: false, missing: false },
+  ] as const)('renews the $label when the platform grant expires first', async ({ credential, hasExp, missing }) => {
+    const { publishTurnCliIdentity } = await import('../src/core/turn-cli-identity.js');
+    const { __setPlatformCredentialDepsForTest } = await import('../src/core/platform-credential-source.js');
+    const { turnId, botConfig, dataDir } = await startProvenPlatformTurn();
+    let now = Math.floor(Date.now() / 1_000) * 1_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const jwt = (marker: string, ttlSeconds?: number, region?: string) => `e30.${Buffer.from(JSON.stringify({
+      marker, ...(region ? { region } : {}), ...(ttlSeconds === undefined ? {} : { exp: now / 1_000 + ttlSeconds }),
+    })).toString('base64url')}.fixture`;
+    const oldDefault = jwt('old-default', credential === 'default' && !hasExp ? undefined : 3_600, 'cn');
+    const oldCode = jwt('old-code', credential === 'codebase' && !hasExp ? undefined : 3_600);
+    const oldRegional = jwt('old-regional', 3_600, 'i18n');
+    const newDefault = jwt('new-default', credential === 'default' && !hasExp ? undefined : 7_200, 'cn');
+    const newCode = jwt('new-code', credential === 'codebase' && !hasExp ? undefined : 7_200);
+    const newRegional = jwt('new-regional', 7_200, 'i18n');
+    const requestGrant = vi.fn(async (req: CredentialGrantRequest): Promise<CredentialGrantResult> => ({
+      ok: true, value: { tool: 'bytedcli', unionId: req.unionId, expiresAt: now + 3_600_000,
+        cloudJwtRegions: ['i18n'], variables: {
+          BYTEDCLI_USER_CLOUD_JWT: newDefault, BYTEDCLI_USER_CODE_JWT: newCode,
+          BYTEDCLI_USER_CLOUD_JWT_I18N: newRegional,
+        } },
+    })).mockImplementationOnce(async (req: CredentialGrantRequest): Promise<CredentialGrantResult> => ({
+      ok: true, value: { tool: 'bytedcli', unionId: req.unionId, expiresAt: now + 600_000,
+        cloudJwtRegions: ['i18n'], variables: {
+          BYTEDCLI_USER_CLOUD_JWT: oldDefault, BYTEDCLI_USER_CODE_JWT: oldCode,
+          ...(missing ? {} : { BYTEDCLI_USER_CLOUD_JWT_I18N: oldRegional }),
+        } },
+    }));
+    __setPlatformCredentialDepsForTest({
+      readBinding: () => ({ platformUrl: 'https://platform.example.test', machineToken: 'mt', machineId: 'm-1' }),
+      resolveUnionId: async () => 'on_alice', requestGrant,
+    });
+    try {
+      await publishTurnCliIdentity({ botConfig, sessionDataDir: dataDir, sessionId: 's-execution',
+        senderOpenId: 'ou_alice', turnId, storageModel: 'proven' });
+      now += 600_000;
+      const response = await fetch(`http://127.0.0.1:${ipc!.port}/api/current-execution-identity`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId: 's-execution', tool: 'bytedcli',
+          ...(credential === 'codebase' ? { codebase: true } : { region: credential }) }),
+      });
+      expect(response.status).toBe(200);
+      const body = await response.json() as { env: string };
+      const variable = credential === 'default' ? 'BYTEDCLI_USER_CLOUD_JWT'
+        : credential === 'codebase' ? 'BYTEDCLI_USER_CODE_JWT' : 'BOTMUX_IDENTITY_CLOUD_JWT_I18N';
+      const oldJwt = credential === 'default' ? oldDefault : credential === 'codebase' ? oldCode : oldRegional;
+      const newJwt = credential === 'default' ? newDefault : credential === 'codebase' ? newCode : newRegional;
+      expect(body.env).toContain(`${variable}='${newJwt}'`);
+      expect(body.env).not.toContain(oldJwt);
+      expect(requestGrant).toHaveBeenCalledTimes(2);
+      expect(requestGrant.mock.calls[1]?.[0]).toMatchObject({
+        cloudJwtRegions: credential === 'i18n' ? ['i18n'] : [],
+      });
+      if (missing) {
+        const cached = await fetch(`http://127.0.0.1:${ipc!.port}/api/current-execution-identity`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ sessionId: 's-execution', tool: 'bytedcli', region: credential }),
+        });
+        expect(cached.status).toBe(200);
+        expect(requestGrant).toHaveBeenCalledTimes(2);
+      }
+    } finally {
+      __setPlatformCredentialDepsForTest(null);
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not extend the default grant deadline when only Codebase renews', async () => {
+    const { publishTurnCliIdentity } = await import('../src/core/turn-cli-identity.js');
+    const { __setPlatformCredentialDepsForTest } = await import('../src/core/platform-credential-source.js');
+    const { turnId, botConfig, dataDir } = await startProvenPlatformTurn();
+    let now = Math.floor(Date.now() / 1_000) * 1_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const jwt = (marker: string, region?: string) => `e30.${Buffer.from(JSON.stringify({
+      marker, ...(region ? { region } : {}), exp: now / 1_000 + 7_200,
+    })).toString('base64url')}.fixture`;
+    const oldDefault = jwt('old-default', 'cn');
+    const ignoredDefault = jwt('ignored-default', 'cn');
+    const newDefault = jwt('new-default', 'cn');
+    const oldCode = jwt('old-code');
+    const newCode = jwt('new-code');
+    let calls = 0;
+    const requestGrant = vi.fn(async (req: CredentialGrantRequest): Promise<CredentialGrantResult> => {
+      calls++;
+      const initial = calls === 1;
+      const codebaseOnly = calls === 2;
+      return { ok: true, value: { tool: 'bytedcli', unionId: req.unionId,
+        expiresAt: initial ? now + 600_000 : now + 3_600_000,
+        variables: {
+          BYTEDCLI_USER_CLOUD_JWT: initial ? oldDefault : codebaseOnly ? ignoredDefault : newDefault,
+          BYTEDCLI_USER_CODE_JWT: initial ? oldCode : newCode,
+        } } };
+    });
+    __setPlatformCredentialDepsForTest({
+      readBinding: () => ({ platformUrl: 'https://platform.example.test', machineToken: 'mt', machineId: 'm-1' }),
+      resolveUnionId: async () => 'on_alice', requestGrant,
+    });
+    const fetchIdentity = async (body: Record<string, unknown>) => {
+      const response = await fetch(`http://127.0.0.1:${ipc!.port}/api/current-execution-identity`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId: 's-execution', ...body }),
+      });
+      return { status: response.status, body: await response.json() as { env?: string } };
+    };
+    try {
+      await publishTurnCliIdentity({ botConfig, sessionDataDir: dataDir, sessionId: 's-execution',
+        senderOpenId: 'ou_alice', turnId, storageModel: 'proven' });
+      now += 600_000;
+      const codebase = await fetchIdentity({ tool: 'bytedcli', codebase: true });
+      expect(codebase.status).toBe(200);
+      expect(codebase.body.env).toContain(`BYTEDCLI_USER_CODE_JWT='${newCode}'`);
+      const afterCodebase = recallProvenIdentityContent(dataDir, 's-execution', turnId, 'bytedcli');
+      expect(afterCodebase).toContain(`BYTEDCLI_USER_CLOUD_JWT='${oldDefault}'`);
+      expect(afterCodebase).not.toContain(ignoredDefault);
+
+      const bits = await fetchIdentity({ tool: 'bitscli' });
+      expect(bits.status).toBe(200);
+      expect(bits.body.env).toContain(`CLOUD_JWT='${newDefault}'`);
+      expect(bits.body.env).toContain(`CODEBASE_CLI_USER_JWT='${newCode}'`);
+      expect(bits.body.env).not.toContain(oldDefault);
+      expect(requestGrant).toHaveBeenCalledTimes(3);
+    } finally {
+      __setPlatformCredentialDepsForTest(null);
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('blocks Bits when the default grant expires during Codebase renewal, even without a JWT exp', async () => {
+    const { publishTurnCliIdentity } = await import('../src/core/turn-cli-identity.js');
+    const { __setPlatformCredentialDepsForTest } = await import('../src/core/platform-credential-source.js');
+    const { turnId, botConfig, dataDir } = await startProvenPlatformTurn();
+    let now = Math.floor(Date.now() / 1_000) * 1_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const jwt = (marker: string, ttlSeconds?: number, region?: string) => `e30.${Buffer.from(JSON.stringify({
+      marker, ...(region ? { region } : {}), ...(ttlSeconds === undefined ? {} : { exp: now / 1_000 + ttlSeconds }),
+    })).toString('base64url')}.fixture`;
+    const oldDefault = jwt('old-default', undefined, 'cn');
+    const newDefault = jwt('new-default', undefined, 'cn');
+    const oldCode = jwt('old-code', 600);
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    let calls = 0;
+    const requestGrant = vi.fn(async (req: CredentialGrantRequest): Promise<CredentialGrantResult> => {
+      calls++;
+      if (calls === 1) return { ok: true, value: { tool: 'bytedcli', unionId: req.unionId,
+        expiresAt: now + 601_000, variables: {
+          BYTEDCLI_USER_CLOUD_JWT: oldDefault, BYTEDCLI_USER_CODE_JWT: oldCode,
+        } } };
+      if (calls === 2) await held;
+      return { ok: true, value: { tool: 'bytedcli', unionId: req.unionId, expiresAt: now + 3_600_000,
+        variables: {
+          BYTEDCLI_USER_CLOUD_JWT: newDefault, BYTEDCLI_USER_CODE_JWT: jwt('new-code', 7_200),
+        } } };
+    });
+    __setPlatformCredentialDepsForTest({
+      readBinding: () => ({ platformUrl: 'https://platform.example.test', machineToken: 'mt', machineId: 'm-1' }),
+      resolveUnionId: async () => 'on_alice', requestGrant,
+    });
+    const fetchBits = async () => {
+      const response = await fetch(`http://127.0.0.1:${ipc!.port}/api/current-execution-identity`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId: 's-execution', tool: 'bitscli' }),
+      });
+      return { status: response.status, body: await response.json() as { env?: string } };
+    };
+    try {
+      await publishTurnCliIdentity({ botConfig, sessionDataDir: dataDir, sessionId: 's-execution',
+        senderOpenId: 'ou_alice', turnId, storageModel: 'proven' });
+      now += 600_000;
+      const pending = fetchBits();
+      await vi.waitFor(() => expect(requestGrant).toHaveBeenCalledTimes(2));
+      now += 1_000;
+      release();
+      const blocked = await pending;
+      expect(blocked.status).toBe(503);
+      expect(blocked.body.env).toBeUndefined();
+      expect(await fetchBits()).toMatchObject({ status: 200, body: {
+        env: expect.stringContaining(`CLOUD_JWT='${newDefault}'`),
+      } });
+      expect(requestGrant).toHaveBeenCalledTimes(3);
+    } finally {
+      release();
       __setPlatformCredentialDepsForTest(null);
       rmSync(dataDir, { recursive: true, force: true });
     }

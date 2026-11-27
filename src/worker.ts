@@ -76,7 +76,8 @@ import {
  *   7. On 'restart', kills CLI and re-spawns with --resume
  */
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
+import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, watch as fsWatch, constants as fsConstants, type FSWatcher } from 'node:fs';
+import { BoundedLogFile } from './utils/bounded-log-file.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative, extname, isAbsolute, resolve } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
@@ -167,7 +168,14 @@ import { classifyRawDispatchFailure, rewrapSubmissionFailure } from './core/raw-
 import { publishCliSessionIdToDaemon } from './core/cli-session-id-publisher.js';
 import { ActiveTurnAuthority, type TurnAuthorityIdentity } from './core/active-turn-authority.js';
 import { isValidMarkerIdentityTurnId } from './core/turn-id-shape.js';
-import { markerBelongsToLiveProcess, readProcessStartIdentity } from './core/session-marker.js';
+import {
+  advanceAncestorSessionTurn,
+  markerBelongsToLiveProcess,
+  parseAbsorbedHostBinding,
+  parseSettledAbsorbedTurns,
+  readProcessStartIdentity,
+  type SettledAbsorbedTurn,
+} from './core/session-marker.js';
 import { hostAuthorityPaths } from './services/project-authority-paths.js';
 import { CodexAppEngineRootWaitCancelled, parseCodexAppEngineIdentityClaim, verifyCodexAppEngineIdentity, type CodexAppEngineIdentity } from './services/codex-app-engine-identity.js';
 import { cliSurvivesWorkerExit, handsCliPidMarkerToSuccessor } from './core/cli-pid-marker-handoff.js';
@@ -586,6 +594,7 @@ import {
   decideAntigravityFullUpgrade,
   decideAntigravityNotifyAction,
   decideAntigravityTickerAction,
+  shouldAcceptAntigravityDiscoveredSessionId,
 } from './services/antigravity-bridge-decision.js';
 import { shouldObserveCursorChatId, shouldPersistObservedCursorChatId } from './services/cursor-resume-policy.js';
 import { extractKiroSessionIdFromOutput } from './services/kiro-session.js';
@@ -839,7 +848,18 @@ import {
 } from './utils/idle-detector.js';
 import { ProgramStatusFramingStream } from './utils/program-status-parser.js';
 import { programStatusRelayLaunch } from './core/program-status-relay-launch.js';
-import { programStatusBlockHoldsTypeAhead, programStatusEnabledForLaunch, startupIdleReportScreenAdmits } from './core/program-status-gate.js';
+import {
+  applyAdapterSpawnEnv,
+  effectiveProgramStatusEnv,
+  filterAppliedAdapterEnvUnset,
+  programStatusBlockHoldsTypeAhead,
+  programStatusDisabledByEnv,
+  programStatusEnabledForLaunch,
+  refreshStructuredPreStartLeaseFromProgramStatus,
+  shouldDeferAntigravityQuietFinalForProgramStatus,
+  shouldFireIdleAfterAntigravityQuietFlush,
+  startupIdleReportScreenAdmits,
+} from './core/program-status-gate.js';
 import { shouldFenceTraexStartupInput, traexStartupInputReady } from './core/traex-startup-input.js';
 import { busyProbeRegion } from './utils/busy-probe.js';
 import { BusyReadyFallbackGate } from './utils/busy-ready-fallback.js';
@@ -853,6 +873,7 @@ import {
   ClaudeTranscriptTurnEnd,
   claudeTranscriptLatestTurnState,
   STALE_PROGRAM_STATUS_CHECK_MS,
+  STALE_PROGRAM_STATUS_QUIET_MS,
   staleProgramStatusVerdict,
 } from './utils/stale-program-status.js';
 import {
@@ -2472,7 +2493,8 @@ function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigi
   // It is this worker's account of its own input queue, like the backlog.
   // Type-ahead registrations, drops and restore snapshots are queue observations
   // too: they may name a queued execution, but never assert that it has started.
-  if (msg.type === 'cli_input_backlog' || msg.type === 'failed_turn_rewind'
+  // The PTY log also belongs to the worker and can fill while its CLI is closing.
+  if ((msg.type === 'error' && msg.workflowLogLimit) || msg.type === 'cli_input_backlog' || msg.type === 'failed_turn_rewind'
     || msg.type === 'type_ahead_queued' || msg.type === 'type_ahead_turn_dropped'
     || msg.type === 'type_ahead_queue_snapshot' || msg.type === 'queued_activation_submitted') {
     delete context.scope.execution;
@@ -2573,12 +2595,11 @@ function runtimeIdentityForContract(binding: RuntimeEventBinding): RuntimeIdenti
       // worker was attached was refused before that id caught up. A fresh
       // launch has no predecessor to match, and while agy starts up it briefly
       // holds sibling conversations open: leave its id to the later observation.
-      const cid = cliAdapter?.resolveActiveSessionId
-        ? cliAdapter.resolveActiveSessionId({ cliPid: childPid, cliCwd: lastInitConfig.workingDir })
-        : findAntigravityConversationIdByPid(childPid) ?? undefined;
-      if (cid && !(lastSpawnEffectiveResume && lastSpawnEffectiveCliSessionId && lastSpawnEffectiveCliSessionId !== cid)) {
-        nativeSessionId = cid;
-      }
+      const cid = resolveAcceptedCurrentAntigravitySessionId({
+        cliPid: childPid,
+        cliCwd: lastInitConfig.workingDir,
+      });
+      if (cid) nativeSessionId = cid;
     } else if (!nativeSessionId && cliAdapter?.claudeDataDir) {
       // Likewise a re-attached Claude may be mid-turn and write nothing until
       // that turn ends. Without its conversation the contract cannot tell this
@@ -3810,19 +3831,36 @@ const traexNativeViewportEvidence = new TraexNativeViewportEvidenceStore();
 const traexNativeViewportRefresh = new TraexNativeViewportRefreshController();
 
 function shouldEnableProgramStatus(
-  cfg: Pick<Extract<DaemonToWorker, { type: 'init' }>, 'cliId' | 'cliVersion' | 'adoptMode'>,
+  cfg: Pick<Extract<DaemonToWorker, { type: 'init' }>, 'cliId' | 'cliVersion' | 'adoptMode' | 'env' | 'envPolicy' | 'envUnset'>,
   adapter?: CliAdapter | null,
   opts: { quiet?: boolean } = {},
 ): boolean {
-  let declared = adapter?.supportsProgramStatus !== undefined ? adapter : undefined;
+  let declared = adapter ?? undefined;
   if (!declared && cfg.cliId) {
-    try { declared = createCliAdapterSync(cfg.cliId as CliId); } catch { return false; }
+    try {
+      const agyTransport = cfg.cliId === 'antigravity' ? antigravityTransport(cfg.env) : undefined;
+      declared = createCliAdapterSync(cfg.cliId as CliId, undefined, { antigravityTransport: agyTransport });
+    } catch { return false; }
   }
-  const launch = { cliVersion: cfg.cliVersion, adoptMode: cfg.adoptMode === true, remoteViewer: !!remoteWsUrl };
+  const effectiveEnv = effectiveProgramStatusEnv(process.env, {
+    botEnv: cfg.env,
+    envPolicy: cfg.envPolicy,
+    envUnset: cfg.envUnset,
+  });
+  const launch = {
+    cliVersion: cfg.cliVersion,
+    adoptMode: cfg.adoptMode === true,
+    remoteViewer: !!remoteWsUrl,
+    env: effectiveEnv,
+  };
   const enabled = programStatusEnabledForLaunch(declared, launch);
-  if (!enabled && !opts.quiet && declared?.supportsProgramStatus === true && declared.programStatusMinVersion) {
-    const why = launch.adoptMode ? 'adopted pane' : launch.remoteViewer ? 'RPC viewer'
-      : `version ${JSON.stringify(cfg.cliVersion?.split('\n')[0] ?? 'unknown')} < ${declared.programStatusMinVersion}`;
+  if (!enabled && !opts.quiet && declared?.supportsProgramStatus === true) {
+    const why = programStatusDisabledByEnv(declared.id, effectiveEnv) ? 'disabled by env'
+      : launch.adoptMode ? 'adopted pane'
+        : launch.remoteViewer ? 'RPC viewer'
+          : declared.programStatusMinVersion
+            ? `version ${JSON.stringify(cfg.cliVersion?.split('\n')[0] ?? 'unknown')} < ${declared.programStatusMinVersion}`
+            : 'disabled';
     log(`[program-status] ${declared.id} reports not parsed (${why}); idle stays on screen heuristics`);
   }
   return enabled;
@@ -4110,7 +4148,15 @@ function zeroPromptTerminalSync(): boolean {
  *  marked input. Fingerprint-prefix / truncation binds attribute replies but
  *  do not prove envelope consumption, so they stay on the terminal fallback. */
 function notifyNativeTranscriptConsumedLarkTurn(
-  turn: { turnId: string; userUuid?: string; isLocal?: boolean; isScheduled?: boolean },
+  turn: {
+    turnId: string;
+    userUuid?: string;
+    dispatchAttempt?: number;
+    isLocal?: boolean;
+    isScheduled?: boolean;
+    absorbedIntoTurnId?: string;
+    absorbedIntoDispatchAttempt?: number;
+  },
   evidence: { fullContentMatch: boolean; sourceJsonlPath?: string },
 ): void {
   if (!evidence.fullContentMatch || turn.isLocal || turn.isScheduled) return;
@@ -4120,7 +4166,24 @@ function notifyNativeTranscriptConsumedLarkTurn(
     ? base.slice(0, -'.jsonl'.length)
     : undefined;
   const resolvedSessionId = nativeSessionId ?? lastInitConfig?.cliSessionId;
-  if (turn.userUuid) {
+  const absorbedHost = turn.absorbedIntoTurnId && turn.absorbedIntoTurnId !== turn.turnId
+    ? {
+      hostTurnId: turn.absorbedIntoTurnId,
+      ...(turn.absorbedIntoDispatchAttempt !== undefined
+        ? { hostDispatchAttempt: turn.absorbedIntoDispatchAttempt }
+        : {}),
+    }
+    : undefined;
+  if (absorbedHost) {
+    acknowledgeNativeInputConsumed(
+      turn.turnId,
+      'claude_transcript_user_record',
+      resolvedSessionId,
+      turn.userUuid,
+      turn.dispatchAttempt,
+      absorbedHost,
+    );
+  } else if (turn.userUuid) {
     acknowledgeNativeInputConsumed(turn.turnId, 'claude_transcript_user_record', resolvedSessionId, turn.userUuid);
   } else {
     acknowledgeNativeInputConsumed(turn.turnId, 'claude_transcript_user_record', resolvedSessionId);
@@ -4178,6 +4241,7 @@ function observeAuthoritativeClaudeTurnStart(
     },
     { source: 'structured-transcript', ...(cliSessionId ? { cliSessionId } : {}) },
   );
+  if (typeof resumeQueuedInputAfterClaudePtyStart === 'function') resumeQueuedInputAfterClaudePtyStart(turn);
 }
 
 function observeAuthoritativeStructuredTurnStart(
@@ -4253,6 +4317,9 @@ function notifyTerminalTurnStarted(
       'wakeNonTerminalMonitor' | 'isLocal' | 'userUuid' | 'isScheduled' | 'isBackgroundWake' | 'backgroundWakeUnrouted' | 'terminalOutcome'
     >>,
 ): void {
+  if ((turn.isScheduled || (turn.isLocal && turn.userUuid && !turn.isBackgroundWake
+    && !turn.backgroundWakeUnrouted && !turn.wakeNonTerminalMonitor))
+    && typeof revokeDeferredClaudePtyAuthority === 'function') revokeDeferredClaudePtyAuthority();
   const suppressedMonitorWake = isSuppressedNonTerminalMonitorWake({
     wakeNonTerminalMonitor: turn.wakeNonTerminalMonitor,
     isLocal: turn.isLocal,
@@ -4966,6 +5033,21 @@ function holdStructuredStartLeaseWhileDriverAwaitsInput(): void {
   const next = driverPendingInputTurn();
   if (!next) return;
   codexBridgeQueue.refreshUnstartedHeadAttributionLease(Date.now(), CLI_HELD_INPUT_MAX_MS, turn => turn === next);
+}
+
+/** Antigravity's cold-start first turn can report OSC 7501 `working` / `blocked`
+ *  before `transcript.jsonl` is created and `USER_INPUT` is written (>20s on
+ *  heavy workspaces / slow RPC boot). Keep unstarted pre-start leases refreshed
+ *  while OSC 7501 actively holds busy, bounded by the 120s hard ceiling so a
+ *  truly wedged CLI still expires and recovers. */
+function holdStructuredStartLeasesWhileProgramStatusBusy(): void {
+  refreshStructuredPreStartLeaseFromProgramStatus({
+    cliId: lastInitConfig?.cliId,
+    adoptMode: lastInitConfig?.adoptMode === true,
+    runnerFramedInput: cliAdapter?.runnerFramedInput === true,
+    programStatusHeldBusy: idleDetector?.programStatusHeldBusy() === true,
+    queue: codexBridgeQueue,
+  });
 }
 
 /** The CLI sends input it holds in submit order (screenHoldsSubmittedInput
@@ -5964,12 +6046,61 @@ class SubmissionWriteError extends Error {
     /** The catalog changed before any byte was written; requeue and rotate
      * instead of classifying this proven pre-write refusal as ambiguous. */
     readonly traexCatalogAdmissionRequired = false,
+    /** A final-driven queue transition did not complete. The input never
+     *  reached the CLI; restore the exact head and retry after the sender's
+     *  cross-process transition has had another chance to finish. */
+    readonly retainPendingInput = false,
   ) {
     super(message);
     this.name = 'SubmissionWriteError';
   }
 }
 
+let finalTransitionRetryDelayMs = 100;
+let finalTransitionRetryAttempts = 0;
+let finalTransitionRetryTimer: ReturnType<typeof setTimeout> | undefined;
+let finalTransitionRetryItem: PendingCliInput | undefined;
+let finalTransitionRetryGeneration: number | undefined;
+const FINAL_TRANSITION_RETRY_MAX_DELAY_MS = 5_000;
+function resetFinalTransitionRetryBackoff(): void {
+  if (finalTransitionRetryTimer) clearTimeout(finalTransitionRetryTimer);
+  finalTransitionRetryTimer = undefined;
+  finalTransitionRetryItem = undefined;
+  finalTransitionRetryGeneration = undefined;
+  finalTransitionRetryDelayMs = 100;
+  finalTransitionRetryAttempts = 0;
+}
+function scheduleFinalTransitionRetry(item: PendingCliInput, isCurrent: () => boolean, generation: number): void {
+  // External flush triggers may repeatedly hit the same unresolved edge. Only
+  // the fired timer advances the backoff; one episode never creates parallel
+  // retry chains. A replacement item/generation is a new episode.
+  if (finalTransitionRetryTimer
+    && finalTransitionRetryItem === item
+    && finalTransitionRetryGeneration === generation) return;
+  if (finalTransitionRetryTimer) resetFinalTransitionRetryBackoff();
+  finalTransitionRetryAttempts++;
+  const delay = finalTransitionRetryDelayMs;
+  finalTransitionRetryDelayMs = Math.min(delay * 2, FINAL_TRANSITION_RETRY_MAX_DELAY_MS);
+  if (finalTransitionRetryAttempts === 3) {
+    send({
+      type: 'user_notify',
+      turnId: item.turnId,
+      message: t('worker.final_transition_retrying'),
+    });
+  }
+  const retry = setTimeout(() => {
+    if (finalTransitionRetryTimer === retry) {
+      finalTransitionRetryTimer = undefined;
+      finalTransitionRetryItem = undefined;
+      finalTransitionRetryGeneration = undefined;
+    }
+    if (isCurrent() && pendingMessages[0] === item) void flushPending();
+  }, delay);
+  finalTransitionRetryTimer = retry;
+  finalTransitionRetryItem = item;
+  finalTransitionRetryGeneration = generation;
+  retry.unref?.();
+}
 async function sendRawCommandLineWithRecoveryFence(
   be: NonNullable<typeof backend>,
   content: string,
@@ -7371,6 +7502,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
         // credential snapshot has to be applied here — at the write moment, which
         // is the same point flushPending applies it for a queued message. Without
         // this, a cleared or rotated JWT did not take effect on these turns.
+        if (typeof revokeDeferredClaudePtyAuthority === 'function') revokeDeferredClaudePtyAuthority();
         applyMojoLivePatch(msg.mojoLivePatch);
         rawInputWriteGeneration += 1;
         renderer?.markNewTurn();
@@ -7678,6 +7810,11 @@ function setCaptureIdentity(
   forceAnnouncement = false,
 ): void {
   const changed = turnId !== currentBotmuxTurnId || dispatchAttempt !== currentBotmuxDispatchAttempt;
+  if (changed) {
+    currentPromotedFromTurnId = currentBotmuxTurnId;
+    currentPromotedFromDispatchAttempt = currentBotmuxDispatchAttempt;
+    currentPromotedAbsorbedTurn = false;
+  }
   if (changed && lastInitConfig?.cliId === 'minimax') minimaxFinalReceiver.reset();
   currentBotmuxTurnId = turnId;
   currentBotmuxDispatchAttempt = dispatchAttempt;
@@ -7700,6 +7837,9 @@ function setCaptureIdentity(
 }
 let currentVcMeetingImTurnOrigin: VcMeetingImTurnOrigin | undefined;
 let currentTurnSteerPromoted = false;
+let currentPromotedAbsorbedTurn = false;
+let currentPromotedFromTurnId: string | undefined;
+let currentPromotedFromDispatchAttempt: number | undefined;
 interface AntigravityReconcileHint {
   textSha256: string;
   sampledTranscriptPath?: string;
@@ -7709,6 +7849,8 @@ interface AntigravityReconcileHint {
 interface QueuedTypeAheadTurnRecord {
   turnId: string;
   inputConsumed?: true;
+  absorbedIntoTurnId?: string;
+  absorbedIntoDispatchAttempt?: number;
   identityTurnId?: string;
   dispatchAttempt?: number;
   linkRefMode?: 'observe' | 'enabled';
@@ -7719,6 +7861,119 @@ interface QueuedTypeAheadTurnRecord {
   antigravityReconcileHint?: AntigravityReconcileHint;
 }
 let queuedTypeAheadTurns: QueuedTypeAheadTurnRecord[] = [];
+/** Absorbed type-ahead turns already settled alongside their host turn's
+ *  explicit `final` on disk. These are durable requeue tombstones AND reply
+ *  addressing evidence: keep them through terminals and worker restarts so
+ *  replay/auxiliary delivery remains valid, while `writeCliPidMarker` never
+ *  resurrects them as queued work and `retireTerminatedQueuedTurn` still records
+ *  `foldedTypeAheadTurn` on `status === 'completed'`. */
+const settledAbsorbedTurnsByKey = new Map<string, SettledAbsorbedTurn>();
+function settledAbsorbedKey(turnId: string, dispatchAttempt?: number): string {
+  return `${turnId}\0${dispatchAttempt ?? ''}`;
+}
+function rememberSettledAbsorbedTurn(entry: SettledAbsorbedTurn): void {
+  if (typeof settledAbsorbedTurnsByKey === 'undefined') return;
+  const key = settledAbsorbedKey(entry.turnId, entry.dispatchAttempt);
+  settledAbsorbedTurnsByKey.delete(key);
+  settledAbsorbedTurnsByKey.set(key, entry);
+  // Never evict a live tombstone: the next marker write would resurrect its
+  // absorbed queue entry. emitTurnTerminal/retireTerminatedQueuedTurn remove
+  // entries when their exact turn closes, which is the safe lifecycle bound.
+}
+function syncSettledAbsorbedTurnsFromParsed(parsed: unknown): void {
+  if (typeof parseSettledAbsorbedTurns !== 'function') return;
+  const parsedObj = parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : null;
+  const entries = parseSettledAbsorbedTurns(parsedObj?.settledAbsorbedTurns);
+  if (!entries || entries.length === 0) return;
+  const parsedTurnId = typeof parsedObj?.turnId === 'string' && parsedObj.turnId ? parsedObj.turnId : undefined;
+  const parsedDispatchAttempt = typeof parsedObj?.dispatchAttempt === 'number' ? parsedObj.dispatchAttempt : undefined;
+  const parsedQueuedTurns = Array.isArray(parsedObj?.queuedTurns) ? parsedObj.queuedTurns : [];
+  for (const entry of entries) {
+    if (entry.turnId === currentBotmuxTurnId && entry.dispatchAttempt === currentBotmuxDispatchAttempt) continue;
+    if (entry.turnId === parsedTurnId && entry.dispatchAttempt === parsedDispatchAttempt) continue;
+    // Terminal turns are historical reply evidence as well as queue tombstones.
+    // Keep loading them after restart: retirement prevents requeueing, but replay
+    // and auxiliary sends still need the absorbed turn's original destination.
+    if (typeof settledAbsorbedTurnsByKey !== 'undefined') {
+      rememberSettledAbsorbedTurn(entry);
+    }
+    const hasLiveSibling = entry.turnId === currentBotmuxTurnId
+      || entry.turnId === parsedTurnId
+      || queuedTypeAheadTurns.some(
+        q => q.turnId === entry.turnId && q.dispatchAttempt !== entry.dispatchAttempt,
+      )
+      || parsedQueuedTurns.some((q: any) =>
+        q?.turnId === entry.turnId
+        && (typeof q.dispatchAttempt === 'number' ? q.dispatchAttempt : undefined) !== entry.dispatchAttempt);
+    // Attempt-agnostic tombstones in `retiredTurnIds` would also reject a live
+    // durable retry (`dispatchAttempt + 1`). `settledAbsorbedTurnsByKey` keys by
+    // exact `(turnId, dispatchAttempt)` and blocks resurrection in
+    // `markerQueuedTurnStillLive` without clobbering sibling durable attempts.
+    const canTombstone = !hasLiveSibling && entry.dispatchAttempt === undefined;
+    if (typeof dropQueuedTurnRecord === 'function') {
+      dropQueuedTurnRecord(entry.turnId, entry.dispatchAttempt, { tombstone: canTombstone });
+    } else {
+      queuedTypeAheadTurns = queuedTypeAheadTurns.filter(
+        q => q.turnId !== entry.turnId
+          || (q.dispatchAttempt !== undefined && q.dispatchAttempt !== entry.dispatchAttempt),
+      );
+    }
+    if (canTombstone && typeof markTurnRetired === 'function') {
+      markTurnRetired(entry.turnId);
+    }
+  }
+}
+function retireSkippedQueuedPrefix(skippedCount: number): void {
+  if (skippedCount <= 0) return;
+  const skipped = queuedTypeAheadTurns.slice(0, skippedCount);
+  const surviving = queuedTypeAheadTurns.slice(skippedCount);
+  for (const record of skipped) {
+    const hasLiveSibling = surviving.some(q => q.turnId === record.turnId);
+    if (!hasLiveSibling && typeof send === 'function') {
+      send({ type: 'type_ahead_turn_dropped', turnId: record.turnId });
+    }
+    if (!hasLiveSibling && typeof markTurnRetired === 'function') {
+      markTurnRetired(record.turnId);
+    }
+  }
+}
+function mergeMarkerQueuedTurnIntoMemory(qt: any): void {
+  if (!qt?.turnId || qt.turnId === currentBotmuxTurnId) return;
+  const dispatchAttempt = typeof qt.dispatchAttempt === 'number' ? qt.dispatchAttempt : undefined;
+  const absorbed = typeof parseAbsorbedHostBinding === 'function'
+    ? parseAbsorbedHostBinding(qt, qt.turnId)
+    : undefined;
+  const existing = queuedTypeAheadTurns.find(
+    t => t.turnId === qt.turnId && t.dispatchAttempt === dispatchAttempt,
+  );
+  if (existing) {
+    if (qt.inputConsumed === true) existing.inputConsumed = true;
+    if (absorbed && !existing.absorbedIntoTurnId) {
+      existing.absorbedIntoTurnId = absorbed.absorbedIntoTurnId;
+      if (absorbed.absorbedIntoDispatchAttempt !== undefined) {
+        existing.absorbedIntoDispatchAttempt = absorbed.absorbedIntoDispatchAttempt;
+      }
+    }
+    return;
+  }
+  if (!markerQueuedTurnStillLive(qt) || queuedTypeAheadTurns.some(t => t.turnId === qt.turnId)) return;
+  queuedTypeAheadTurns.push({
+    turnId: qt.turnId,
+    ...(qt.inputConsumed === true ? { inputConsumed: true as const } : {}),
+    ...(absorbed ?? {}),
+    ...(markerIdentityTurnId(qt.identityTurnId) ? { identityTurnId: markerIdentityTurnId(qt.identityTurnId)! } : {}),
+    ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+    ...(qt.linkRefMode === 'observe' || qt.linkRefMode === 'enabled'
+      ? { linkRefMode: qt.linkRefMode }
+      : {}),
+    ...(qt.trustedCaller && typeof qt.trustedCaller === 'object' ? { trustedCaller: qt.trustedCaller } : {}),
+    ...(qt.trustedController && typeof qt.trustedController === 'object' ? { trustedController: qt.trustedController } : {}),
+    ...(typeof qt.callerOpenId === 'string' && qt.callerOpenId ? { turnCallerOpenId: qt.callerOpenId } : {}),
+    ...(qt.antigravityReconcileHint && typeof qt.antigravityReconcileHint.textSha256 === 'string'
+      ? { antigravityReconcileHint: qt.antigravityReconcileHint }
+      : {}),
+  });
+}
 /** Newest type-ahead turn retired at its terminal while folded into the turn
  *  owning the screen (see retireTerminatedQueuedTurn). */
 let foldedTypeAheadTurn: FoldedTypeAheadTurn | undefined;
@@ -9279,12 +9534,25 @@ function authorizeManagedSend(
     dispatchAttempt: capability.dispatchAttempt,
     currentImTurnOrigin: imOrigin,
   });
+  const relayReplyMessageId = capability.turnId === currentBotmuxTurnId && !requiresCodexAppLedger && !imOrigin
+    ? (queuedTypeAheadTurns.filter(t =>
+        t.inputConsumed === true
+        && (t.absorbedIntoTurnId === undefined
+          || (t.absorbedIntoTurnId === currentBotmuxTurnId
+            && t.absorbedIntoDispatchAttempt === currentBotmuxDispatchAttempt)))
+        .at(-1)?.turnId
+      ?? (typeof settledAbsorbedTurnsByKey !== 'undefined'
+        ? [...settledAbsorbedTurnsByKey.values()]
+            .filter(entry => entry.hostTurnId === currentBotmuxTurnId
+              && entry.hostDispatchAttempt === currentBotmuxDispatchAttempt)
+            .at(-1)?.turnId
+        : undefined))
+    : undefined;
   return decision.ok
     ? {
         ok: true,
         origin: {
-          ...(capability.turnId === currentBotmuxTurnId && !requiresCodexAppLedger && !imOrigin
-            ? { replyMessageId: queuedTypeAheadTurns.filter(t => t.inputConsumed).at(-1)?.turnId } : {}),
+          ...(relayReplyMessageId ? { replyMessageId: relayReplyMessageId } : {}),
           ...(capability.turnId ? { turnId: capability.turnId } : {}),
           ...(capability.dispatchAttempt !== undefined
             ? { dispatchAttempt: capability.dispatchAttempt }
@@ -9486,6 +9754,7 @@ function writeCliPidMarker(): void {
           try {
             const raw = readFileSync(markerPath, 'utf-8');
             const parsed = JSON.parse(raw);
+            syncSettledAbsorbedTurnsFromParsed(parsed);
             if (parsed && typeof parsed.turnId === 'string' && parsed.turnId && (parsed.turnId !== currentBotmuxTurnId || ((typeof backend === 'undefined' || !backend || ('isReattach' in backend && backend.isReattach === true)) && (activeTurnAuthority.snapshot() ? !activeAuthorityMatchesMarker(parsed) : !activeTurnAuthority.matchesLastRelease(parsed))))) {
               const markerSettled = typeof workerSessionEventScope?.isExecutionSettled === 'function'
                 && workerSessionEventScope.isExecutionSettled(
@@ -9503,6 +9772,7 @@ function writeCliPidMarker(): void {
                 if (idx >= 0) {
                   const prevTurnId = currentBotmuxTurnId;
                   markTurnRetired(prevTurnId);
+                  retireSkippedQueuedPrefix(idx);
                   const advancedRecord = queuedTypeAheadTurns[idx]!;
                   setCaptureIdentity(
                     parsed.turnId,
@@ -9541,24 +9811,18 @@ function writeCliPidMarker(): void {
             }
             if (parsed && Array.isArray(parsed.queuedTurns)) {
               for (const qt of parsed.queuedTurns) {
-                if (qt?.turnId && qt.turnId !== currentBotmuxTurnId && markerQueuedTurnStillLive(qt) && !queuedTypeAheadTurns.some(t => t.turnId === qt.turnId)) {
-                  queuedTypeAheadTurns.push({
-                    turnId: qt.turnId,
-                ...(qt.inputConsumed === true ? { inputConsumed: true as const } : {}),
-                    ...(markerIdentityTurnId(qt.identityTurnId) ? { identityTurnId: markerIdentityTurnId(qt.identityTurnId)! } : {}),
-                    ...(typeof qt.dispatchAttempt === 'number' ? { dispatchAttempt: qt.dispatchAttempt } : {}),
-                    ...(qt.linkRefMode === 'observe' || qt.linkRefMode === 'enabled'
-                      ? { linkRefMode: qt.linkRefMode }
-                      : {}),
-                    ...(qt.trustedCaller && typeof qt.trustedCaller === 'object' ? { trustedCaller: qt.trustedCaller } : {}),
-                    ...(qt.trustedController && typeof qt.trustedController === 'object' ? { trustedController: qt.trustedController } : {}),
-                    ...(typeof qt.callerOpenId === 'string' && qt.callerOpenId ? { turnCallerOpenId: qt.callerOpenId } : {}),
-                    ...(qt.antigravityReconcileHint && typeof qt.antigravityReconcileHint.textSha256 === 'string'
-                      ? { antigravityReconcileHint: qt.antigravityReconcileHint }
-                      : {}),
-                  });
-                }
+                mergeMarkerQueuedTurnIntoMemory(qt);
               }
+            }
+            if (parsed && parsed.turnId === currentBotmuxTurnId
+              && parsed.promotedAbsorbedTurn === true
+              && typeof parsed.promotedFromTurnId === 'string'
+              && isValidMarkerIdentityTurnId(parsed.promotedFromTurnId)) {
+              currentPromotedAbsorbedTurn = true;
+              currentPromotedFromTurnId = parsed.promotedFromTurnId;
+              currentPromotedFromDispatchAttempt = typeof parsed.promotedFromDispatchAttempt === 'number'
+                ? parsed.promotedFromDispatchAttempt
+                : undefined;
             }
           } catch {
             // best-effort
@@ -9585,6 +9849,14 @@ function writeCliPidMarker(): void {
           return {
             turnId: t.turnId,
             ...(t.inputConsumed === true ? { inputConsumed: true as const } : {}),
+            ...(t.inputConsumed === true && t.absorbedIntoTurnId
+              ? {
+                absorbedIntoTurnId: t.absorbedIntoTurnId,
+                ...(t.absorbedIntoDispatchAttempt !== undefined
+                  ? { absorbedIntoDispatchAttempt: t.absorbedIntoDispatchAttempt }
+                  : {}),
+              }
+              : {}),
             ...(markerIdentityTurnId(t.identityTurnId) ? { identityTurnId: markerIdentityTurnId(t.identityTurnId)! } : {}),
             ...(t.dispatchAttempt !== undefined ? { dispatchAttempt: t.dispatchAttempt } : {}),
             ...(t.linkRefMode ? { linkRefMode: t.linkRefMode } : {}),
@@ -9594,6 +9866,11 @@ function writeCliPidMarker(): void {
             ...(reconcileHint ? { antigravityReconcileHint: reconcileHint } : {}),
           };
         });
+        const currentHostSettled = typeof settledAbsorbedTurnsByKey !== 'undefined' && currentBotmuxTurnId
+          ? [...settledAbsorbedTurnsByKey.values()].filter(entry =>
+            entry.hostTurnId === currentBotmuxTurnId
+            && entry.hostDispatchAttempt === currentBotmuxDispatchAttempt)
+          : [];
         const queuedTurnId = queuedTurns[0]?.turnId;
         const authority = activeTurnAuthority.snapshot();
         const effectiveCaller = authority?.caller;
@@ -9616,8 +9893,15 @@ function writeCliPidMarker(): void {
           ...(activeReconcileHint ? { antigravityReconcileHint: activeReconcileHint } : {}),
           ...(queuedTurnId ? { queuedTurnId } : {}),
           ...(queuedTurns.length > 0 ? { queuedTurns } : {}),
+          ...(currentHostSettled.length > 0 ? { settledAbsorbedTurns: currentHostSettled } : {}),
           ...(procStart ? { procStart } : {}),
           ...(currentTurnSteerPromoted ? { steerPromotedTurn: true } : {}),
+          ...(currentTurnSteerPromoted && currentPromotedAbsorbedTurn && currentPromotedFromTurnId ? {
+            promotedAbsorbedTurn: true as const,
+            promotedFromTurnId: currentPromotedFromTurnId,
+            ...(currentPromotedFromDispatchAttempt !== undefined
+              ? { promotedFromDispatchAttempt: currentPromotedFromDispatchAttempt } : {}),
+          } : {}),
           ...(markerTurnNonResurrectable ? { backgroundHeld: true as const } : {}),
           ...(sandboxRelayCapability && sandboxRelayCapability.turnId === currentBotmuxTurnId
             && sandboxRelayCapability.dispatchAttempt === currentBotmuxDispatchAttempt
@@ -9648,6 +9932,7 @@ function restoreQueuedTurnsFromMarkerDisk(markerPath: string): void {
     withPidMarkerLock(markerPath, () => {
       const raw = readFileSync(markerPath, 'utf-8');
       const parsed = JSON.parse(raw);
+      syncSettledAbsorbedTurnsFromParsed(parsed);
       if (parsed && typeof parsed.turnId === 'string' && parsed.turnId && (parsed.turnId !== currentBotmuxTurnId || ((typeof backend === 'undefined' || !backend || ('isReattach' in backend && backend.isReattach === true)) && (activeTurnAuthority.snapshot() ? !activeAuthorityMatchesMarker(parsed) : !activeTurnAuthority.matchesLastRelease(parsed))))) {
         const markerSettled = typeof workerSessionEventScope?.isExecutionSettled === 'function'
           && workerSessionEventScope.isExecutionSettled(
@@ -9678,20 +9963,7 @@ function restoreQueuedTurnsFromMarkerDisk(markerPath: string): void {
       }
       if (parsed && Array.isArray(parsed.queuedTurns) && parsed.queuedTurns.length > 0) {
         for (const t of parsed.queuedTurns) {
-          if (t && typeof t.turnId === 'string' && t.turnId !== currentBotmuxTurnId && markerQueuedTurnStillLive(t) && !queuedTypeAheadTurns.some(q => q.turnId === t.turnId)) {
-            queuedTypeAheadTurns.push({
-              turnId: t.turnId,
-              ...(t.inputConsumed === true ? { inputConsumed: true as const } : {}),
-              ...(markerIdentityTurnId(t.identityTurnId) ? { identityTurnId: markerIdentityTurnId(t.identityTurnId)! } : {}),
-              ...(typeof t.dispatchAttempt === 'number' ? { dispatchAttempt: t.dispatchAttempt } : {}),
-              ...(t.linkRefMode === 'observe' || t.linkRefMode === 'enabled'
-                ? { linkRefMode: t.linkRefMode }
-                : {}),
-              ...(t.trustedCaller && typeof t.trustedCaller === 'object' ? { trustedCaller: t.trustedCaller } : {}),
-              ...(t.trustedController && typeof t.trustedController === 'object' ? { trustedController: t.trustedController } : {}),
-              ...(typeof t.callerOpenId === 'string' && t.callerOpenId ? { turnCallerOpenId: t.callerOpenId } : {}),
-            });
-          }
+          mergeMarkerQueuedTurnIntoMemory(t);
         }
       } else if (parsed && typeof parsed.queuedTurnId === 'string' && parsed.queuedTurnId) {
         if (parsed.queuedTurnId !== currentBotmuxTurnId && markerQueuedTurnStillLive({ turnId: parsed.queuedTurnId }) && !queuedTypeAheadTurns.some(q => q.turnId === parsed.queuedTurnId)) {
@@ -9773,6 +10045,7 @@ function syncQueuedTurnsFromMarkerDisk(): boolean {
       withPidMarkerLock(markerPath, () => {
         const raw = readFileSync(markerPath, 'utf-8');
         const parsed = JSON.parse(raw);
+        syncSettledAbsorbedTurnsFromParsed(parsed);
         if (parsed && typeof parsed.turnId === 'string' && parsed.turnId && (parsed.turnId !== currentBotmuxTurnId || ((typeof backend === 'undefined' || !backend || ('isReattach' in backend && backend.isReattach === true)) && (activeTurnAuthority.snapshot() ? !activeAuthorityMatchesMarker(parsed) : !activeTurnAuthority.matchesLastRelease(parsed))))) {
           const markerSettled = typeof workerSessionEventScope?.isExecutionSettled === 'function'
             && workerSessionEventScope.isExecutionSettled(
@@ -9789,6 +10062,7 @@ function syncQueuedTurnsFromMarkerDisk(): boolean {
             if (idx >= 0) {
               const prevTurnId = currentBotmuxTurnId;
               markTurnRetired(prevTurnId);
+              retireSkippedQueuedPrefix(idx);
               const advancedRecord = queuedTypeAheadTurns[idx]!;
               setCaptureIdentity(
                 parsed.turnId,
@@ -9822,20 +10096,7 @@ function syncQueuedTurnsFromMarkerDisk(): boolean {
         }
         if (parsed && Array.isArray(parsed.queuedTurns)) {
           for (const qt of parsed.queuedTurns) {
-            if (qt?.turnId && qt.turnId !== currentBotmuxTurnId && markerQueuedTurnStillLive(qt) && !queuedTypeAheadTurns.some(t => t.turnId === qt.turnId)) {
-              queuedTypeAheadTurns.push({
-                turnId: qt.turnId,
-                ...(qt.inputConsumed === true ? { inputConsumed: true as const } : {}),
-                ...(markerIdentityTurnId(qt.identityTurnId) ? { identityTurnId: markerIdentityTurnId(qt.identityTurnId)! } : {}),
-                ...(qt.linkRefMode === 'observe' || qt.linkRefMode === 'enabled'
-                  ? { linkRefMode: qt.linkRefMode }
-                  : {}),
-                ...(typeof qt.dispatchAttempt === 'number' ? { dispatchAttempt: qt.dispatchAttempt } : {}),
-                ...(qt.trustedCaller && typeof qt.trustedCaller === 'object' ? { trustedCaller: qt.trustedCaller } : {}),
-                ...(qt.trustedController && typeof qt.trustedController === 'object' ? { trustedController: qt.trustedController } : {}),
-                ...(typeof qt.callerOpenId === 'string' && qt.callerOpenId ? { turnCallerOpenId: qt.callerOpenId } : {}),
-              });
-            }
+            mergeMarkerQueuedTurnIntoMemory(qt);
           }
         }
       });
@@ -9848,21 +10109,76 @@ function syncQueuedTurnsFromMarkerDisk(): boolean {
 }
 
 function advanceQueuedTypeAheadTurn(reason: string): boolean {
-  if (syncQueuedTurnsFromMarkerDisk()) return true;
-  while (queuedTypeAheadTurns[0]
-    && turnTerminalEmitted(queuedTypeAheadTurns[0].turnId, queuedTypeAheadTurns[0].dispatchAttempt)) {
-    const finished = queuedTypeAheadTurns[0];
-    dropQueuedTurnRecord(finished.turnId, finished.dispatchAttempt);
-    log(`Skipped type-ahead turn ${finished.turnId.slice(0, 12)} whose terminal already went out (${reason})`);
+  // A published final is not itself settlement evidence. Resolve it through
+  // the immutable ledger (or legacy no-settlement transition) before the
+  // terminal-fold cleanup below may remove any absorbed follow-up.
+  if (currentTurnHasFinalEvidence()) {
+    advanceQueuedTypeAheadTurnAfterFinal();
+    return true;
   }
-  if (queuedTypeAheadTurns.length === 0) return false;
+  if (syncQueuedTurnsFromMarkerDisk()) return true;
+  let droppedAny = false;
+  while (queuedTypeAheadTurns[0]) {
+    const head = queuedTypeAheadTurns[0];
+    if (turnTerminalEmitted(head.turnId, head.dispatchAttempt)) {
+      dropQueuedTurnRecord(head.turnId, head.dispatchAttempt);
+      droppedAny = true;
+      log(`Skipped type-ahead turn ${head.turnId.slice(0, 12)} whose terminal already went out (${reason})`);
+      continue;
+    }
+    const alreadySettled = typeof settledAbsorbedTurnsByKey !== 'undefined'
+      && settledAbsorbedTurnsByKey.has(`${head.turnId}\0${head.dispatchAttempt ?? ''}`);
+    const absorbedIntoCurrentHost = head.inputConsumed === true
+      && !!currentBotmuxTurnId
+      && head.absorbedIntoTurnId === currentBotmuxTurnId
+      && head.absorbedIntoDispatchAttempt === currentBotmuxDispatchAttempt;
+    const absorbedIntoFinishedHost = absorbedIntoCurrentHost
+      && !!currentBotmuxTurnId
+      && turnTerminalEmitted(currentBotmuxTurnId, currentBotmuxDispatchAttempt);
+    if (alreadySettled || absorbedIntoFinishedHost) {
+      if (absorbedIntoFinishedHost && typeof rememberSettledAbsorbedTurn === 'function' && currentBotmuxTurnId) {
+        rememberSettledAbsorbedTurn({
+          turnId: head.turnId,
+          ...(head.dispatchAttempt !== undefined ? { dispatchAttempt: head.dispatchAttempt } : {}),
+          hostTurnId: currentBotmuxTurnId,
+          ...(currentBotmuxDispatchAttempt !== undefined ? { hostDispatchAttempt: currentBotmuxDispatchAttempt } : {}),
+        });
+      }
+      const canTombstone = head.dispatchAttempt === undefined;
+      dropQueuedTurnRecord(head.turnId, head.dispatchAttempt, { tombstone: canTombstone });
+      droppedAny = true;
+      log(`Skipped type-ahead turn ${head.turnId.slice(0, 12)} already absorbed into host turn (${reason})`);
+      continue;
+    }
+    break;
+  }
+  if (queuedTypeAheadTurns.length === 0) {
+    if (droppedAny) writeCliPidMarker();
+    return false;
+  }
+  // An input absorbed mid-turn into the STILL-OPEN host turn belongs to that
+  // host, never a standalone successor turn: do not promote it on prompt_ready
+  // or queued_input_consumed while the host stays active on disk.
+  const head = queuedTypeAheadTurns[0]!;
+  if (head.inputConsumed === true
+    && !!currentBotmuxTurnId
+    && head.absorbedIntoTurnId === currentBotmuxTurnId
+    && head.absorbedIntoDispatchAttempt === currentBotmuxDispatchAttempt
+    && (reason === 'queued_input_consumed' || reason.startsWith('prompt_ready'))) {
+    if (droppedAny) writeCliPidMarker();
+    return false;
+  }
   const next = queuedTypeAheadTurns.shift()!;
   const prevTurnId = currentBotmuxTurnId;
+  const prevDispatchAttempt = currentBotmuxDispatchAttempt;
   markTurnRetired(prevTurnId);
   setCaptureIdentity(next.turnId, next.dispatchAttempt, next.turnCallerOpenId);
   currentBotmuxLinkRefMode = next.linkRefMode;
   currentVcMeetingImTurnOrigin = next.vcMeetingImTurnOrigin;
   currentTurnSteerPromoted = true;
+  currentPromotedAbsorbedTurn = next.inputConsumed === true
+    && next.absorbedIntoTurnId === prevTurnId
+    && next.absorbedIntoDispatchAttempt === prevDispatchAttempt;
   rememberQueuedTurnAdvanceForPendingReady(prevTurnId);
   markActiveTurnStarted(next);
   writeCliPidMarker();
@@ -9870,6 +10186,64 @@ function advanceQueuedTypeAheadTurn(reason: string): boolean {
   cancelAntigravityFoldedReconcilePending();
   log(`Advanced active turn (${reason}): ${prevTurnId?.slice(0, 12)} -> ${currentBotmuxTurnId?.slice(0, 12)} (remaining queued: ${queuedTypeAheadTurns.length})`);
   return true;
+}
+
+type FinalDeliverySettlementAuthorization =
+  | { kind: 'ledger'; turnIds: ReadonlySet<string> }
+  | { kind: 'legacy' }
+  | { kind: 'unknown' };
+
+/** Distinguish an immutable final decision from a legacy marker and from an
+ * actually unreadable/incomplete ledger. Unknown state authorizes neither a
+ * settlement nor a promotion: the incoming write must retain its queue head. */
+function finalDeliverySettlementAuthorization(hostTurnId: string): FinalDeliverySettlementAuthorization {
+  const dataDir = process.env.SESSION_DATA_DIR;
+  const larkAppId = lastInitConfig?.larkAppId;
+  if (!dataDir || !sessionId || !larkAppId) return { kind: 'unknown' };
+  try {
+    const record = new TurnSendLedger(dataDir).read({
+      larkAppId, sessionId, turnId: hostTurnId,
+      ...(currentBotmuxDispatchAttempt !== undefined ? { dispatchAttempt: currentBotmuxDispatchAttempt } : {}),
+    });
+    if (!record) return { kind: 'legacy' };
+    if (record.dispatchAttempt !== currentBotmuxDispatchAttempt || !record.final) return { kind: 'unknown' };
+    return { kind: 'ledger', turnIds: new Set(record.final.settledAbsorbedTurnIds ?? []) };
+  } catch (error: any) {
+    log(`Could not read absorbed-turn settlement authorization: ${error?.message ?? error}`);
+    return { kind: 'unknown' };
+  }
+}
+
+/** A bridge final marker is published inside advanceAncestorSessionTurn's PID
+ * marker lock. Seeing it here means the sender either completed that transition
+ * or died trying; both are resolved through the same core transition, with the
+ * immutable TurnSendLedger final as the only settlement authorization. */
+function advanceQueuedTypeAheadTurnAfterFinal(): void {
+  const hostTurnId = currentBotmuxTurnId;
+  const markerPath = cliPidMarker;
+  const dataDir = process.env.SESSION_DATA_DIR;
+  const markerPid = Number(basename(markerPath ?? ''));
+  if (!hostTurnId || !markerPath || !dataDir || !Number.isSafeInteger(markerPid) || markerPid <= 0) return;
+  const authorization = finalDeliverySettlementAuthorization(hostTurnId);
+  if (authorization.kind === 'unknown') return;
+  // A crashed sender may have removed the PID file after committing its ledger.
+  // Rebuild only from this worker's still-live in-memory queue, then let the
+  // normal locked transition settle or promote according to the final decision.
+  if (!existsSync(markerPath)) writeCliPidMarker();
+  if (!existsSync(markerPath)) return;
+  const authorized = authorization.kind === 'ledger' ? authorization.turnIds : new Set<string>();
+  try {
+    advanceAncestorSessionTurn(dataDir, markerPid, hostTurnId, {
+      consumedDispatchAttempt: currentBotmuxDispatchAttempt,
+      canSettleAbsorbed: turn => authorized.has(turn.turnId),
+    });
+  } catch (error: any) {
+    // Do not use the generic queue advance as a fallback: its terminal-fold
+    // cleanup is valid for other reasons, but cannot distinguish these three
+    // authorization states. prepareNormalWrite's invariant retains the input.
+    log(`Final-driven queue transition failed closed: ${error?.message ?? error}`);
+  }
+  syncQueuedTurnsFromMarkerDisk();
 }
 
 interface AntigravityFoldedReconcileResult {
@@ -13032,7 +13406,10 @@ let thinkingTurnKey: string | undefined;
 let thinkingTurn: { turnId: string; dispatchAttempt?: number } | undefined;
 /** Thinking paragraphs, interim assistant narration and tool calls/results
  *  in transcript order — each becomes its own node in the native CoT message.
- *  Append-only within a turn. */
+ *  Append-only within a turn, except zero-length tool completion markers may
+ *  be inserted before the terminal cap ellipsis. The IPC flush withholds that
+ *  ellipsis while any displayed tool call is open, so the daemon's append-only
+ *  consumer never sees an insertion into an already-sent prefix. */
 let thinkingEntries: CotEntry[] = [];
 let thinkingTotalChars = 0;
 let thinkingCapNoted = false;
@@ -13129,27 +13506,114 @@ function observeCotEntries(entries: readonly CotEntry[], turn: { turnId: string;
   const key = `${turn.turnId}|${turn.dispatchAttempt ?? ''}`;
   if (key !== thinkingTurnKey) {
     // Preserve the previous turn's trailing update before a steer/new turn
-    // replaces the accumulator inside the throttle window.
-    flushThinkingUpdate();
+    // replaces the accumulator inside the throttle window. This is the old
+    // timeline's final flush, so settle any capped tools still awaiting a
+    // result before releasing the terminal ellipsis.
+    flushThinkingUpdate(true);
     thinkingTurnKey = key;
     thinkingTurn = { turnId: turn.turnId, dispatchAttempt: turn.dispatchAttempt };
     thinkingEntries = [];
     thinkingTotalChars = 0;
     thinkingCapNoted = false;
   }
+  // Once the timeline has ended with a「…」node it never reopens for text or
+  // new tool calls. The sole exception is a zero-length completion marker for
+  // an already-displayed tool call: its real result may arrive after the cap,
+  // and pairing it before the ellipsis keeps the tool from spinning forever.
+  if (thinkingCapNoted) {
+    if (completeCotToolResultsAfterCap(kept)) scheduleThinkingEmit();
+    return;
+  }
   if (thinkingTotalChars >= THINKING_ACCUMULATED_CAP) {
-    if (!thinkingCapNoted) {
-      thinkingCapNoted = true;
-      thinkingEntries.push({ kind: 'thinking', text: '…' });
-      scheduleThinkingEmit();
-    }
+    thinkingCapNoted = true;
+    thinkingEntries.push({ kind: 'thinking', text: '…' });
+    completeCotToolResultsAfterCap(kept);
+    scheduleThinkingEmit();
     return;
   }
   for (const entry of kept) {
+    const chars = cotEntryChars(entry);
+    if (thinkingTotalChars + chars > THINKING_ACCUMULATED_CAP) {
+      // The cap holds per entry, not per batch: one long entry or a large batch
+      // must not carry the total past it. Text keeps what still fits; a tool
+      // entry is not cut (its args/result would no longer parse) and is left
+      // out. Either way the timeline ends with the「…」node now, not on the
+      // next batch.
+      const head = cotTextHead(entry, THINKING_ACCUMULATED_CAP - thinkingTotalChars);
+      if (head) {
+        thinkingEntries.push(head);
+        thinkingTotalChars += cotEntryChars(head);
+      }
+      thinkingCapNoted = true;
+      thinkingEntries.push({ kind: 'thinking', text: '…' });
+      break;
+    }
     thinkingEntries.push(entry);
-    thinkingTotalChars += cotEntryChars(entry);
+    thinkingTotalChars += chars;
   }
+  completeCotToolResultsAfterCap(kept);
   scheduleThinkingEmit();
+}
+
+/** The first `budget` characters of a thinking or text entry (never splitting a
+ *  surrogate pair), or null for a tool entry, no budget, or nothing left. */
+function cotTextHead(entry: CotEntry, budget: number): CotEntry | null {
+  if ((entry.kind !== 'thinking' && entry.kind !== 'text') || budget <= 0) return null;
+  let end = Math.min(budget, entry.text.length);
+  const last = entry.text.charCodeAt(end - 1);
+  if (end < entry.text.length && last >= 0xd800 && last <= 0xdbff) end -= 1;
+  return end > 0 ? { kind: entry.kind, text: entry.text.slice(0, end) } : null;
+}
+
+/** Ids of displayed calls without a displayed result. Set preserves call order
+ *  for the terminal fallback; a result removes its id regardless of call order. */
+function cotOpenToolCallIds(entries: readonly CotEntry[]): Set<string> {
+  const open = new Set<string>();
+  for (const entry of entries) {
+    if (entry.kind === 'tool_call') open.add(entry.id);
+    else if (entry.kind === 'tool_result') open.delete(entry.id);
+  }
+  return open;
+}
+
+function cotCapEllipsisIsTerminal(): boolean {
+  // Array.isArray also keeps extracted-function probes with a minimal cap-only
+  // scope inert; the production global is always an array.
+  const last = Array.isArray(thinkingEntries) ? thinkingEntries.at(-1) : undefined;
+  return thinkingCapNoted && last?.kind === 'thinking' && last.text === '…';
+}
+
+/** Preserve pairing for results observed after the cap without reopening the
+ *  text timeline or spending any of the character budget. The empty result is
+ *  already rendered as a compact completion marker by both card paths. Always
+ *  insert immediately before the ellipsis: flushThinkingUpdate keeps that node
+ *  off the wire until every open call is settled, so this remains append-only
+ *  from the daemon's perspective. */
+function completeCotToolResultsAfterCap(entries: readonly CotEntry[]): boolean {
+  if (!cotCapEllipsisIsTerminal()) return false;
+  const open = cotOpenToolCallIds(thinkingEntries);
+  if (open.size === 0) return false;
+  let changed = false;
+  for (const entry of entries) {
+    if (entry.kind !== 'tool_result' || !open.delete(entry.id)) continue;
+    thinkingEntries.splice(thinkingEntries.length - 1, 0, { kind: 'tool_result', id: entry.id, result: '' });
+    changed = true;
+  }
+  return changed;
+}
+
+/** Final-flush fallback for calls whose result never arrived. Prefer a bounded
+ *  UI closure over an eternally spinning tool after the turn has ended. This is
+ *  not execution evidence and does not synthesize a turn/tool terminal: the
+ *  empty result only closes the cosmetic node, including on failed/cancelled
+ *  turns where "done" means no longer running rather than successful output. */
+function settleCappedThinkingTools(): boolean {
+  if (!cotCapEllipsisIsTerminal()) return false;
+  const open = cotOpenToolCallIds(thinkingEntries);
+  if (open.size === 0) return false;
+  thinkingEntries.splice(thinkingEntries.length - 1, 0,
+    ...[...open].map(id => ({ kind: 'tool_result', id, result: '' }) satisfies CotEntry));
+  return true;
 }
 
 /** Opt-in per bot (foldBackgroundUpdates), as this worker process started with it.
@@ -13497,17 +13961,26 @@ function scheduleThinkingEmit(): void {
 
 /** Drain a pending update synchronously before its terminal IPC. A short turn
  * can be read in one batch; emitting after turn_terminal would open a bubble
- * that never receives its completion. */
-function flushThinkingUpdate(): void {
+ * that never receives its completion.
+ *
+ * A capped ellipsis stays internal while any already-displayed tool call is
+ * open; this lets a later empty completion marker join the wire tail BEFORE
+ * the ellipsis instead of invalidating the daemon's append-only sentCount.
+ * A final flush settles such calls first, guaranteeing the ellipsis and every
+ * completion are emitted before the turn's terminal IPC. */
+function flushThinkingUpdate(finalForTurn = false): void {
+  if (finalForTurn && settleCappedThinkingTools()) scheduleThinkingEmit();
   if (!thinkingEmitTimer) return;
   clearTimeout(thinkingEmitTimer);
   thinkingEmitTimer = null;
-  if (!thinkingTurn || thinkingEntries.length === 0) return;
+  const withholdCapEllipsis = cotCapEllipsisIsTerminal() && cotOpenToolCallIds(thinkingEntries).size > 0;
+  const visibleEntries = withholdCapEllipsis ? thinkingEntries.slice(0, -1) : thinkingEntries;
+  if (!thinkingTurn || visibleEntries.length === 0) return;
   thinkingLastEmitMs = Date.now();
   send({
     type: 'thinking_update',
     ...(sessionId ? { sessionId } : {}),
-    entries: thinkingEntries.slice(),
+    entries: visibleEntries.slice(),
     turnId: thinkingTurn.turnId,
     ...(thinkingTurn.dispatchAttempt !== undefined ? { dispatchAttempt: thinkingTurn.dispatchAttempt } : {}),
   });
@@ -13632,7 +14105,7 @@ function observeCodexCotSuperseded(turn: CodexPendingTurn): void {
   // first update/terminal. Never synthesize a durable terminal for this UI.
   // A dynamic reply card can exist before any activity was observed.
   // Still retire that card, without flushing/resetting another turn's CoT.
-  if (ownsThinking) flushThinkingUpdate();
+  if (ownsThinking) flushThinkingUpdate(true);
   send({
     type: 'thinking_superseded', sessionId, turnId: turn.turnId,
     ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
@@ -13648,6 +14121,7 @@ let ompQuietCandidateCompleteOffset: number | undefined;
  *  in `structuredBridgeDriverState`), same shape as OMP's. */
 let antigravityQuietCandidateKey: string | undefined;
 let antigravityQuietCandidateCompleteOffset: number | undefined;
+let antigravityQuietCandidateFirstSeenAtMs: number | undefined;
 /** Last compact→full offset mapping attempt (bound path, offset, full log
  *  size) — a mapping that failed is not re-read every tick until one of them
  *  moves. */
@@ -14282,6 +14756,34 @@ function attributableExplicitReplyMarkersForTurnWindow(
   const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;
   return markers.filter(marker => marker.sentAtMs >= lower && marker.sentAtMs < upper
     && marker.turnId === turnId);
+}
+
+function currentTurnHasFinalMarker(): boolean {
+  return !!currentBotmuxTurnId && readSendMarkers().some(marker =>
+    marker.turnId === currentBotmuxTurnId
+    && marker.responseKind === 'final'
+    && marker.dispatchAttempt === currentBotmuxDispatchAttempt);
+}
+
+function currentTurnHasFinalEvidence(): boolean {
+  if (currentTurnHasFinalMarker()) return true;
+  if (!currentBotmuxTurnId) return false;
+  const dataDir = process.env.SESSION_DATA_DIR;
+  const larkAppId = lastInitConfig?.larkAppId;
+  if (!dataDir || !sessionId || !larkAppId) return false;
+  try {
+    const record = new TurnSendLedger(dataDir).read({
+      larkAppId, sessionId, turnId: currentBotmuxTurnId,
+      ...(currentBotmuxDispatchAttempt !== undefined
+        ? { dispatchAttempt: currentBotmuxDispatchAttempt }
+        : {}),
+    });
+    return !!record?.final && record.dispatchAttempt === currentBotmuxDispatchAttempt;
+  } catch {
+    // An unreadable existing record cannot authorize native terminal-fold
+    // cleanup either. The final-driven transition will remain fail-closed.
+    return true;
+  }
 }
 
 function notifyExplicitRepliesObserved(
@@ -16037,6 +16539,137 @@ function openClaudeLifecycleTurn(): BridgePendingTurn | undefined {
   return hasSubmittedUnstartedClaudeHead(head) ? head : undefined;
 }
 
+// PTY paste can leave the previous composer visible even after the adapter's
+// short submit polling budget. Bound this window from the literal write, not
+// from the first idle observation or subsequent redraws.
+const CLAUDE_PTY_START_GRACE_MS = 30_000;
+const CLAUDE_PTY_BUSY_START_CAP_MS = 60_000;
+let lastClaudePtyLocalInputAtMs = -Infinity;
+let deferredClaudePtyReady: {
+  turn: BridgePendingTurn;
+  backend: SessionBackend;
+  cliGeneration: number;
+  writeAt: number;
+  timer: ReturnType<typeof setTimeout>;
+} | undefined;
+
+function ownsDeferredClaudePtyReady(deferred: NonNullable<typeof deferredClaudePtyReady>): boolean {
+  const { turn, cliGeneration, writeAt } = deferred;
+  const owner = activeTurnAuthority.identity();
+  return backend === deferred.backend && cliSpawnGeneration === cliGeneration && !cliRestartInProgress
+    && currentBotmuxTurnId === turn.turnId && currentBotmuxDispatchAttempt === undefined
+    && owner.turnId === turn.turnId && owner.dispatchAttempt === undefined
+    && inputDeliveryEvidence.writeStartedAtMs({ turnId: turn.turnId, cliGeneration }) === writeAt;
+}
+
+function currentUnstartedDeferredClaudePtyReady(): typeof deferredClaudePtyReady {
+  const deferred = deferredClaudePtyReady;
+  return deferred && ownsDeferredClaudePtyReady(deferred)
+    && !deferred.turn.started && !hasSubmittedUnstartedClaudeHead(deferred.turn) ? deferred : undefined;
+}
+
+function resumeQueuedInputAfterClaudePtyStart(turn: { turnId: string; dispatchAttempt?: number }): void {
+  const deferred = deferredClaudePtyReady;
+  if (turn.dispatchAttempt === undefined && deferred?.turn.turnId === turn.turnId
+    && ownsDeferredClaudePtyReady(deferred)) queueMicrotask(flushQueuedInputAfterTurnStartEvidence);
+}
+
+function revokeDeferredClaudePtyAuthority(): void {
+  if (lastInitConfig?.cliId !== 'claude-code' || lastInitConfig.adoptMode) return;
+  lastClaudePtyLocalInputAtMs = Date.now();
+  const deferred = currentUnstartedDeferredClaudePtyReady();
+  if (!deferred) return;
+  clearTimeout(deferred.timer);
+  deferredClaudePtyReady = undefined;
+  releaseActiveTurnAuthority('claude_pty_start_superseded', { turnId: deferred.turn.turnId });
+}
+
+function deferClaudePtyReadyWhileStarting(): boolean {
+  if (lastInitConfig?.cliId !== 'claude-code' || lastInitConfig.adoptMode
+    || (effectiveBackendType !== 'pty' && effectiveBackendType !== 'tmux')
+    || !backend || !idleDetector || !bridgeJsonlPath) return false;
+  const head = bridgeQueue.peek()[0];
+  const active = activeTurnAuthority.snapshot();
+  if (!head || head.started || head.isLocal || head.restoredFromJournal || head.carriedAcrossGeneration
+    || head.dispatchAttempt !== undefined || !active?.started || active.provenanceIncomplete
+    || active.caller?.senderType !== 'user' || !active.caller.requestUserOpenId
+    || active.turnId !== head.turnId || active.dispatchAttempt !== undefined
+    || currentBotmuxTurnId !== head.turnId || currentBotmuxDispatchAttempt !== undefined
+    || turnTerminalEmitted(head.turnId) || hasSubmittedUnstartedClaudeHead(head)) return false;
+
+  const key = { turnId: head.turnId, cliGeneration: cliSpawnGeneration };
+  const writeAt = inputDeliveryEvidence.writeStartedAtMs(key);
+  if (writeAt === undefined || writeAt <= lastClaudePtyLocalInputAtMs) return false;
+  const remainingMs = writeAt + CLAUDE_PTY_START_GRACE_MS - Date.now();
+  const webAtWrite = inputDeliveryEvidence.externalInputGenerationAtWrite(key);
+  const interruptAtWrite = inputDeliveryEvidence.interruptGenerationAtWrite(key);
+  if (remainingMs <= 0 || webAtWrite !== webTerminalInputGeneration
+    || interruptAtWrite !== cliInterruptGeneration) return false;
+
+  const detector = idleDetector;
+  const observedBackend = backend;
+  const outputGeneration = ptyOutputGeneration.snapshot();
+  const rawAtIdle = rawInputWriteGeneration;
+  if (deferredClaudePtyReady?.turn !== head) {
+    log(`Deferring prompt-ready while Claude PTY submission is unconfirmed (turn=${head.turnId.slice(0, 12)})`);
+  }
+  if (deferredClaudePtyReady) clearTimeout(deferredClaudePtyReady.timer);
+  detector.reset();
+  const deferred = {
+    turn: head, backend: observedBackend, cliGeneration: key.cliGeneration, writeAt,
+    timer: setTimeout(recheck, remainingMs),
+  };
+  deferred.timer.unref?.();
+  deferredClaudePtyReady = deferred;
+  return true;
+
+  function recheck(): void {
+    if (deferredClaudePtyReady !== deferred) return;
+    if (!ownsDeferredClaudePtyReady(deferred) || idleDetector !== detector || isPromptReady) {
+      deferredClaudePtyReady = undefined;
+      return;
+    }
+    // A matching start may have landed without another PTY repaint. Drain it
+    // before ending the bounded hold. Release stale authority even when the
+    // viewport cannot prove that another input would be safe to deliver.
+    try { bridgeIngest(); } catch { /* best effort */ }
+    if (deferredClaudePtyReady !== deferred) return;
+    deferredClaudePtyReady = undefined;
+    if (!ownsDeferredClaudePtyReady(deferred) || isPromptReady) return;
+    const noInterveningInput = rawAtIdle === rawInputWriteGeneration
+      && webAtWrite === webTerminalInputGeneration && interruptAtWrite === cliInterruptGeneration
+      && deferred.writeAt > lastClaudePtyLocalInputAtMs;
+    let screen: string | undefined;
+    if (backendScreenEvidenceIsAuthoritativeForMutation()) {
+      try { screen = captureBackendScreen(observedBackend); } catch { /* no current screen */ }
+    }
+    const programBusy = detector.programStatusHeldBusy();
+    const screenBusy = !!screen && cliAdapter?.busyPattern?.test(busyProbeRegion(screen)) === true;
+    const busy = programBusy || screenBusy;
+    if (!deferred.turn.started && !hasSubmittedUnstartedClaudeHead(deferred.turn)) {
+      // Busy is useful to avoid revoking during a late startup but cannot
+      // identify a caller. Only exact hook/transcript evidence outlives the cap.
+      const busyRemainingMs = deferred.writeAt + CLAUDE_PTY_BUSY_START_CAP_MS - Date.now();
+      if (busy && noInterveningInput && busyRemainingMs > 0) {
+        deferred.timer = setTimeout(recheck, busyRemainingMs);
+        deferred.timer.unref?.();
+        deferredClaudePtyReady = deferred;
+        return;
+      }
+      releaseActiveTurnAuthority('claude_pty_start_timeout', { turnId: head.turnId });
+    }
+    if (busy) return;
+    if (ptyOutputGeneration.isCurrent(outputGeneration) && noInterveningInput) {
+      // Use the normal idle path so it re-reads the transcript before settling.
+      detector.fireIdle();
+    } else if (screen) {
+      // A repaint may have invalidated the saved edge. Rediscover readiness
+      // from the new viewport and let quiescence/busy detection decide again.
+      detector.feed(screen);
+    }
+  }
+}
+
 function claudeOpenTurnKey(turn: BridgePendingTurn | undefined): string | undefined {
   if (!turn) return undefined;
   return `${bridgeTranscriptGeneration}:${turn.turnId}:${turn.dispatchAttempt ?? ''}`;
@@ -16102,7 +16735,7 @@ function captureClaudeOpenTurnObservation(
           readyPatternVisible = cliAdapter.readyPattern.test(stripAnsiScreenText(content));
         }
         if (cliAdapter?.busyPattern) {
-          busyPatternVisible = cliAdapter.busyPattern.test(busyProbeRegion(content));
+          busyPatternVisible = cliAdapter.busyPattern.test(busyProbeRegion(content, cliAdapter.id));
         }
       }
     } catch { /* unreadable viewport falls back to readyPatternVisible=true */ }
@@ -17086,12 +17719,18 @@ function emitReadyTurns(opts: EmitReadyTurnsOptions = {}): void {
   // Retire the journal entries of turns the queue dropped head-of-line. These
   // never reach `ready`, so this must run BEFORE the empty-`ready` early return
   // below — a drop very often coincides with a tick that emits nothing.
+  let droppedAbsorbedFromQueue = false;
   for (const dropped of bridgeQueue.takeDroppedNeedingJournalClear()) {
     journalBridgeTurnClear(dropped.turnId, dropped.dispatchAttempt);
     if (dropped.contentFingerprint) bridgeFingerprintScanLastMs.delete(dropped.contentFingerprint);
+    if (dropped.absorbedIntoTurnId && typeof dropQueuedTurnRecord === 'function'
+      && dropQueuedTurnRecord(dropped.turnId, dropped.dispatchAttempt, { tombstone: dropped.dispatchAttempt === undefined })) {
+      droppedAbsorbedFromQueue = true;
+    }
     log(`Bridge journal cleared for head-of-line dropped turn ${dropped.turnId.substring(0, 8)} `
       + `— it produced no assistant text and a newer turn started`);
   }
+  if (droppedAbsorbedFromQueue && typeof writeCliPidMarker === 'function') writeCliPidMarker();
   const release = opts.releaseHeldTerminals ? { releaseHeldTerminals: true } : {};
   // Adopt sessions never arm the open-turn watchdog and keep headless/fold
   // attribution; tell the queue not to mint a Scenario 3 recovery anchor.
@@ -17526,7 +18165,14 @@ function emitReadyTurns(opts: EmitReadyTurnsOptions = {}): void {
     const turn = ready[i];
     if (unsubmitted.has(turn.turnId) || workerFinalOutputHandoff?.hasTurn(turn.turnId)) continue;
     if (universalOutputHandoff || handoffTurnIds.has(turn.turnId)) journalBridgeTurnClear(turn.turnId, turn.dispatchAttempt);
-    if (turn.rateLimited) continue;
+    if (turn.rateLimited) {
+      if (turn.absorbedIntoTurnId && typeof dropQueuedTurnRecord === 'function'
+        && dropQueuedTurnRecord(turn.turnId, turn.dispatchAttempt, { tombstone: turn.dispatchAttempt === undefined })
+        && typeof writeCliPidMarker === 'function') {
+        writeCliPidMarker();
+      }
+      continue;
+    }
     if (suppressedMonitorWakes.has(turn)) {
       // Flush any buffered CoT entries attributed to the launching turn's
       // anchor, and skip `emitTurnTerminal` so the daemon does not release
@@ -17918,8 +18564,11 @@ function rebindAntigravityBridgeTurn(nextPath: string): boolean {
   // The unstarted head's own record is deliberately NOT absorbed below.
   codexBridgeQueue.absorb(committed.map(match => match.event));
   log(`Antigravity bridge authoritatively rebound ${previousPath ?? '?'} → ${nextPath}`);
+  const attachMode = firstLiveOffset !== undefined
+    ? 'fresh-empty'
+    : antigravityLateAttachMode(nextPath);
   codexBridgeDetachFile();
-  codexBridgeAttach(nextPath, 'fresh-empty');
+  codexBridgeAttach(nextPath, attachMode);
   if (firstLiveOffset !== undefined) codexBridgeOffset = firstLiveOffset;
   return true;
 }
@@ -17929,6 +18578,38 @@ function antigravityBridgeState(): AntigravityTranscriptState {
   return (structuredBridgeDriverState as AntigravityTranscriptState | undefined) ?? {};
 }
 
+/** Resolve and admit one atomically observed native identity. Only weaker
+ * process/fd discovery is fenced by a cold-resume target; an authoritative
+ * native stream record may describe a later `/new`. UUIDs are canonicalized to
+ * lowercase before persistence or Linux transcript lookup. */
+function resolveAcceptedCurrentAntigravitySessionId(pty: {
+  cliPid?: number;
+  cliCwd?: string;
+}): string | undefined {
+  let discoveredSessionId: string | undefined;
+  let discoverySource: 'native-log' | 'process-discovery' = 'process-discovery';
+  if (cliAdapter?.resolveActiveSessionIdObservation) {
+    const observation = cliAdapter.resolveActiveSessionIdObservation(pty);
+    if (!observation) return undefined;
+    discoveredSessionId = observation.sessionId;
+    discoverySource = observation.source;
+  } else if (cliAdapter?.resolveActiveSessionId) {
+    discoveredSessionId = cliAdapter.resolveActiveSessionId(pty);
+  } else {
+    discoveredSessionId = pty.cliPid ? (findAntigravityConversationIdByPid(pty.cliPid) ?? undefined) : undefined;
+  }
+  if (!discoveredSessionId) return undefined;
+  if (!shouldAcceptAntigravityDiscoveredSessionId({
+    discoveredSessionId,
+    discoverySource,
+    effectiveResume: lastSpawnEffectiveResume,
+    resumeSessionId: lastSpawnEffectiveCliSessionId,
+    persistentReattach: lastSpawnPersistentReattach,
+    adoptMode: lastInitConfig?.adoptMode === true,
+  })) return undefined;
+  return discoveredSessionId.toLowerCase();
+}
+
 /** Resolve the live Antigravity transcript path even when the structured bridge
  *  is inactive (ordinary `replyDelivery: 'send'` mode) or has not yet bound. */
 function resolveLiveAntigravityTranscriptPath(): string | undefined {
@@ -17936,18 +18617,31 @@ function resolveLiveAntigravityTranscriptPath(): string | undefined {
   const effectivePid = typeof currentAntigravityObservedPid === 'function'
     ? currentAntigravityObservedPid()
     : undefined;
-  const discoveredCid = cliAdapter?.resolveActiveSessionId
-    ? cliAdapter.resolveActiveSessionId({ cliPid: effectivePid, cliCwd: lastInitConfig.workingDir })
-    : (effectivePid ? (findAntigravityConversationIdByPid(effectivePid) ?? undefined) : undefined);
-  const cid = discoveredCid ?? lastSpawnEffectiveCliSessionId ?? lastInitConfig.cliSessionId;
+  const discoveredCid = resolveAcceptedCurrentAntigravitySessionId({
+    cliPid: effectivePid,
+    cliCwd: lastInitConfig.workingDir,
+  });
+  const observedCid = typeof inputDeliveryObservedCliSessionId === 'string'
+    ? inputDeliveryObservedCliSessionId
+    : undefined;
+  // Never fall back to stale lastInitConfig.cliSessionId after a Tier-1/Tier-2
+  // fresh demotion (which clears effectiveCliSessionId & observedCid).
+  const cid = discoveredCid
+    ?? observedCid
+    ?? lastSpawnEffectiveCliSessionId
+    ?? (lastInitConfig.adoptMode === true ? lastInitConfig.cliSessionId : undefined);
+  // Never bypass cliAdapter.resolveActiveSessionId (or a known cid whose
+  // transcript has not been created yet) by falling back to locate.byPid.
+  const canonicalCid = cid?.toLowerCase();
+  if (!canonicalCid) return undefined;
   const relocatedHome = lastInitConfig.env?.HOME;
-  if (cid && relocatedHome) {
-    const relocated = resolveAntigravityTranscriptPath(cid, {
+  if (relocatedHome) {
+    const relocated = resolveAntigravityTranscriptPath(canonicalCid, {
       brainDir: join(relocatedHome, '.gemini', 'antigravity-cli', 'brain'),
     });
     if (relocated) return relocated;
   }
-  return resolveFileBridgePath('antigravity', { sessionId: cid, pid: effectivePid });
+  return resolveFileBridgePath('antigravity', { sessionId: canonicalCid });
 }
 
 /** Re-anchor only on the current turn's unique authenticated envelope in the
@@ -18291,11 +18985,12 @@ function codexBridgeStartTimer(): void {
         return;
       }
       if (structuredBridgeIs('antigravity')) {
-        const authoritativeRebindPending = lastInitConfig?.adoptMode
-          && codexBridgeRolloutPath
-          && codexBridgePendingSessionId
-          && antigravityPendingRebind;
-        if (lastInitConfig?.adoptMode && !authoritativeRebindPending) {
+        const adoptPendingNativeSession = lastInitConfig?.adoptMode
+          && codexBridgePendingSessionId;
+        // A reported native ID owns late rotation even when it is NOT a sticky
+        // authoritative rebind. Otherwise a lazy adopt `/new` remains pending
+        // forever in the initial PID-discovery branch after the old path binds.
+        if (lastInitConfig?.adoptMode && !adoptPendingNativeSession) {
           // A new pane can create its conversation and log on the first submit.
           if (!codexBridgeRolloutPath && codexBridgeQueue.peek().length > 0) {
             const pid = currentAntigravityObservedPid();
@@ -18316,21 +19011,23 @@ function codexBridgeStartTimer(): void {
           // must be retried here once the authoritative brain file appears.
           // A managed process can announce a new ID before its transcript
           // exists, while the previous conversation remains bound.
+          let tickerDiscoveredCid: string | undefined;
           const action = decideAntigravityTickerAction({
             boundPath: codexBridgeRolloutPath,
             pendingSid: codexBridgePendingSessionId,
             resolveBySid: sid => resolveFileBridgePath('antigravity', { sessionId: sid }),
             resolveByPid: () => {
               const pid = currentAntigravityObservedPid();
-              // Honor cliAdapter.resolveActiveSessionId when present: on a
+              // Honor the adapter's atomic identity + provenance: on a fresh
               // fresh launch it withholds transient startup ListConversations
               // DB fds until --log-file records `Streaming conversation`, and
               // after /fork it disambiguates child vs retained parent DB fds.
-              if (cliAdapter?.resolveActiveSessionId) {
-                const activeId = cliAdapter.resolveActiveSessionId({ cliPid: pid, cliCwd: lastInitConfig?.workingDir });
-                return activeId ? resolveFileBridgePath('antigravity', { sessionId: activeId }) : undefined;
-              }
-              return pid ? resolveFileBridgePath('antigravity', { pid }) : undefined;
+              const activeId = resolveAcceptedCurrentAntigravitySessionId({
+                cliPid: pid,
+                cliCwd: lastInitConfig?.workingDir,
+              });
+              tickerDiscoveredCid = activeId;
+              return activeId ? resolveFileBridgePath('antigravity', { sessionId: activeId }) : undefined;
             },
           });
           if (action.kind === 'rotate') {
@@ -18339,11 +19036,16 @@ function codexBridgeStartTimer(): void {
               // not a /new. Failed reconciliation keeps both the old binding
               // and the pending marker so a later REAL append can retry.
               if (rebindAntigravityBridgeTurn(action.path)) {
+                const reboundCid = tickerDiscoveredCid ?? codexBridgePendingSessionId;
                 codexBridgePendingSessionId = undefined;
                 antigravityPendingRebind = false;
                 codexAdoptPendingPid = undefined;
+                if (reboundCid && typeof persistCliSessionId === 'function') {
+                  persistCliSessionId(reboundCid);
+                }
               }
             } else {
+              const rotatedCid = tickerDiscoveredCid ?? codexBridgePendingSessionId;
               codexBridgePendingSessionId = undefined;
               codexAdoptPendingPid = undefined;
               // A real /new abandons the retired conversation's unfinished
@@ -18358,12 +19060,19 @@ function codexBridgeStartTimer(): void {
               log(`Antigravity bridge late-rotated ${codexBridgeRolloutPath ?? '?'} → ${action.path}`);
               codexBridgeDetachFile();
               codexBridgeAttach(action.path, 'fresh-empty');
+              if (rotatedCid && typeof persistCliSessionId === 'function') {
+                persistCliSessionId(rotatedCid);
+              }
             }
           } else if (action.kind === 'bind-initial') {
+            const boundCid = tickerDiscoveredCid ?? codexBridgePendingSessionId;
             codexBridgePendingSessionId = undefined;
             antigravityPendingRebind = false;
             codexAdoptPendingPid = undefined;
             codexBridgeAttach(action.path, antigravityLateAttachMode(action.path));
+            if (boundCid && typeof persistCliSessionId === 'function') {
+              persistCliSessionId(boundCid);
+            }
           } else if (action.kind === 'clear-pending') {
             // Provenance: only a direct SID hit reaches here. A pid hit on the
             // bound path returns 'idle' and leaves a pending NEW id intact
@@ -19029,18 +19738,76 @@ function ensureAntigravityCotReader(cliSessionId: string): void {
   }
 }
 
+/** Whether a post-submit confirmation for `submittedTurnId` should preserve
+ *  that turn on an authoritative conversation switch rather than retiring
+ *  it as an older pre-/new turn. True only when the submitted turn itself
+ *  was prematurely started on a misbound transcript and no older turn is
+ *  still open on the previous conversation. */
+function shouldPreserveAntigravitySubmittedTurn(submittedTurnId: string | undefined): boolean {
+  if (!submittedTurnId || typeof codexBridgeQueue?.peek !== 'function') return false;
+  const turns = codexBridgeQueue.peek();
+  return turns.some(
+    turn => turn.turnId === submittedTurnId && turn.started && turn.finalText === undefined,
+  ) && !turns.some(
+    turn => turn.turnId !== submittedTurnId && turn.started && turn.finalText === undefined,
+  );
+}
+
+/** Single authoritative entry point for committing a verified Antigravity
+ *  conversation ID: persists to daemon, switches/starts the CoT reader, and
+ *  notifies the structured bridge (when active) in one place so CoT and
+ *  Structured Bridge can never drift onto different conversations. */
+function applyAuthoritativeAntigravitySessionId(
+  cliSessionId: string,
+  options: { preserveLiveTurn?: boolean; tryRebindLiveTurn?: boolean; adoptRotationStartMs?: number } = {},
+): void {
+  if (!cliSessionId) return;
+  if (cliAdapter?.runnerFramedInput) return;
+  if (lastInitConfig?.cliId !== 'antigravity') return;
+  if (nativeSessionForkPending()) return;
+  cliSessionId = cliSessionId.toLowerCase();
+  // Admit stale bound IDs as a whole before ANY identity write. A late report
+  // for A must not move daemon/CoT back while a different REAL_B rotation is
+  // pending, whether or not that pending uses the sticky rebind freeze. A
+  // genuinely different C still rotates and supersedes the pending ID.
+  if (codexBridgeRolloutPath && codexBridgePendingSessionId
+    && codexBridgePendingSessionId.toLowerCase() !== cliSessionId.toLowerCase()) {
+    const reportedPath = resolveFileBridgePath('antigravity', { sessionId: cliSessionId });
+    if (decideAntigravityNotifyAction(codexBridgeRolloutPath, reportedPath).kind === 'same') return;
+  }
+  persistCliSessionId(cliSessionId);
+  if (typeof ensureAntigravityCotReader === 'function') {
+    ensureAntigravityCotReader(cliSessionId);
+  }
+  if (typeof codexBridgeFallbackActive === 'function' && codexBridgeFallbackActive()) {
+    codexBridgeNotifyCliSessionId(cliSessionId, options);
+  }
+}
+
 function armAntigravityCotForTurn(): void {
   if (cliAdapter?.runnerFramedInput) return;
   if (lastInitConfig?.cliId !== 'antigravity') return;
   if (nativeSessionForkPending()) return;
   const effectivePid = currentAntigravityObservedPid();
-  const discoveredCid = cliAdapter?.resolveActiveSessionId
-    ? cliAdapter.resolveActiveSessionId({ cliPid: effectivePid, cliCwd: lastInitConfig.workingDir })
-    : (effectivePid ? (findAntigravityConversationIdByPid(effectivePid) ?? undefined) : undefined);
-  const cid = discoveredCid ?? lastInitConfig?.cliSessionId ?? lastSpawnEffectiveCliSessionId;
+  const discoveredCid = resolveAcceptedCurrentAntigravitySessionId({
+    cliPid: effectivePid,
+    cliCwd: lastInitConfig.workingDir,
+  });
+  const observedCid = typeof inputDeliveryObservedCliSessionId === 'string'
+    ? inputDeliveryObservedCliSessionId
+    : undefined;
+  // Never fall back to stale lastInitConfig.cliSessionId after a Tier-1/Tier-2
+  // fresh demotion — doing so would re-bind CoT and Structured Bridge to the
+  // abandoned conversation before the fresh launch streams its own ID.
+  const cid = discoveredCid
+    ?? observedCid
+    ?? lastSpawnEffectiveCliSessionId
+    ?? (lastInitConfig.adoptMode === true ? lastInitConfig.cliSessionId : undefined);
   if (!cid) return;
-  persistCliSessionId(cid);
-  ensureAntigravityCotReader(cid);
+  // Try a synchronous non-sticky rebind if an already-started turn is already
+  // present in cid's transcript, without arming a sticky pending-rebind freeze
+  // that would poison or deadlock an ordinary pre-write `/new` rotation.
+  applyAuthoritativeAntigravitySessionId(cid, { tryRebindLiveTurn: true });
 }
 
 // ─── Kimi activity observer (read-only) ─────────────────────────────────
@@ -19120,7 +19887,7 @@ function settleKimiActivityBeforeIdle(): void {
   if (!kimiActivityObserver || !currentBotmuxTurnId) return;
   drainKimiActivityInto({ turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
   if (thinkingTurn?.turnId === currentBotmuxTurnId && thinkingTurn.dispatchAttempt === currentBotmuxDispatchAttempt) {
-    flushThinkingUpdate();
+    flushThinkingUpdate(true);
   }
 }
 
@@ -19159,6 +19926,7 @@ function codexBridgeDetachFile(): void {
   antigravityQuietCandidateKey = undefined;
   antigravityQuietCandidateCompleteOffset = undefined;
   antigravityFullUpgradeAttemptKey = undefined;
+  antigravityPendingRebind = false;
   structuredMissingFinalWatchdog?.observe(undefined);
 }
 
@@ -19477,8 +20245,9 @@ function noteTraexProcessFileSource(pid: number): void {
  *  remembers the sid so the 1s poller can keep retrying. */
 function codexBridgeNotifyCliSessionId(
   cliSessionId: string,
-  options: { preserveLiveTurn?: boolean; adoptRotationStartMs?: number } = {},
+  options: { preserveLiveTurn?: boolean; tryRebindLiveTurn?: boolean; adoptRotationStartMs?: number } = {},
 ): void {
+  if (structuredBridgeIs('antigravity')) cliSessionId = cliSessionId.toLowerCase();
   if (!codexBridgeFallbackActive()) return;
   // A reported (proven) id supersedes any not-yet-owned history candidate.
   codexBridgeUnprovenSession = undefined;
@@ -19701,24 +20470,34 @@ function codexBridgeNotifyCliSessionId(
   }
   if (structuredBridgeIs('antigravity')) {
     // cliSessionId is agy's conversation UUID, which names the brain
-    // transcript directory. writeInput and the native --log-file observer
-    // report the id on every submit/stream switch, and `codexBridgeRolloutPath`
-    // above falls through for Antigravity so this handles both initial attach
-    // and in-binding rotation/rebind (e.g. `/new`, `/fork`, or correcting an
-    // early misbound transcript).
+    // transcript directory. writeInput, armAntigravityCotForTurn, and the
+    // native --log-file observer report the id on every submit/stream switch,
+    // and `codexBridgeRolloutPath` above falls through for Antigravity so this
+    // handles both initial attach and in-binding rotation/rebind (e.g. `/new`,
+    // `/fork`, or correcting an early misbound transcript).
     const agyPath = resolveFileBridgePath('antigravity', { sessionId: cliSessionId });
     // Compared by conversation, not path: a compact-log bind resolves to the
     // full log here once agy has created it, and that is NOT a /new. The
     // ticker moves the bind over at a turn boundary.
     const action = decideAntigravityNotifyAction(codexBridgeRolloutPath, agyPath);
     if (action.kind === 'same') {
-      codexBridgePendingSessionId = undefined;
-      antigravityPendingRebind = false;
+      const pendingMatchesReport = !codexBridgePendingSessionId
+        || codexBridgePendingSessionId.toLowerCase() === cliSessionId.toLowerCase();
+      // A late report for the old bound conversation must not cancel a REAL
+      // authoritative rebind that is still waiting for its lazy transcript.
+      if (pendingMatchesReport) {
+        codexBridgePendingSessionId = undefined;
+        antigravityPendingRebind = false;
+      }
       return;
     }
-    if (action.kind === 'rotate' && options.preserveLiveTurn) {
-      // The startup observer corrected an early sibling bind for this same
-      // live turn. Attach only after every active owner matches the REAL file.
+    const pendingSameIdRebind = antigravityPendingRebind
+      && codexBridgePendingSessionId?.toLowerCase() === cliSessionId.toLowerCase();
+    if (action.kind === 'rotate' && (options.preserveLiveTurn || pendingSameIdRebind)) {
+      // An authoritative observation corrected an early/stale bind for this
+      // same live turn (or a prior pending rebind for this exact id is still
+      // waiting to reconcile). Attach only after every active owner matches
+      // the REAL file (or immediately when no unfinished turn is queued).
       if (rebindAntigravityBridgeTurn(action.path)) {
         codexBridgePendingSessionId = undefined;
         antigravityPendingRebind = false;
@@ -19732,8 +20511,22 @@ function codexBridgeNotifyCliSessionId(
     }
     if (action.kind !== 'wait-pending') {
       if (action.kind === 'rotate') {
+        const hasStartedTurn = codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined);
+        // Pre-write tryRebindLiveTurn: if an already-started turn is already
+        // present in action.path BEFORE the new prompt is written, migrate it
+        // cleanly without retiring; otherwise fall through to normal rotation
+        // without arming a sticky pending-rebind freeze.
+        if (options.tryRebindLiveTurn && hasStartedTurn && rebindAntigravityBridgeTurn(action.path)) {
+          codexBridgePendingSessionId = undefined;
+          antigravityPendingRebind = false;
+          codexBridgeIngest();
+          return;
+        }
         // A real /new abandons unfinished work in the retired conversation.
-        if (codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined) || codexBridgeQueue.peek().length > 1) {
+        // Clear any stale pending-rebind freeze BEFORE retiring so
+        // retireAntigravityBridgeTurn's flush ingest actually drains the old file.
+        antigravityPendingRebind = false;
+        if (hasStartedTurn || codexBridgeQueue.peek().length > 1) {
           try {
             retireAntigravityBridgeTurn();
           } catch (err: any) {
@@ -19741,8 +20534,11 @@ function codexBridgeNotifyCliSessionId(
           }
         }
         log(`Antigravity bridge rebound ${codexBridgeRolloutPath ?? '?'} → ${action.path}`);
+        const attachMode = codexBridgeQueue.peek().length === 0
+          ? antigravityLateAttachMode(action.path)
+          : 'fresh-empty';
         codexBridgeDetachFile();
-        codexBridgeAttach(action.path, 'fresh-empty');
+        codexBridgeAttach(action.path, attachMode);
       } else {
         codexBridgeAttach(action.path, antigravityLateAttachMode(action.path));
       }
@@ -19752,8 +20548,14 @@ function codexBridgeNotifyCliSessionId(
     } else {
       // The brain file is created lazily after submit — keep id pending and
       // let the 1s ticker late-attach or rotate once the file appears.
+      // Preserve an already-armed pending rebind for this exact id (e.g. a
+      // type-ahead follow-up confirming the same id while an earlier startup
+      // rebind is still waiting for REAL's lazy brain file), without letting a
+      // pre-write `/new` arm a sticky pending-rebind freeze.
+      const keepPendingRebind = Boolean(codexBridgeRolloutPath)
+        && (options.preserveLiveTurn === true || pendingSameIdRebind);
       codexBridgePendingSessionId = cliSessionId;
-      antigravityPendingRebind = options.preserveLiveTurn === true;
+      antigravityPendingRebind = keepPendingRebind;
       codexBridgeStartTimer();
     }
     return;
@@ -19959,6 +20761,7 @@ function codexBridgeIngest(opts: {
   flushOmpTrailingFinal?: boolean;
   flushAntigravityTrailingFinal?: boolean;
   retireAntigravityPendingTurns?: boolean;
+  onDrainedEvents?: (events: readonly CodexBridgeEvent[]) => void;
 } = {}): boolean {
   // An authoritative rebind is pending: freeze the possibly-misbound file.
   // This includes quiet flushes, whose waiting narration or sibling answer
@@ -20053,6 +20856,7 @@ function codexBridgeIngest(opts: {
   // After ingest so the latch's delivery re-kick observes the started turn —
   // the flush's own bridge mark must queue behind it, not ahead of it.
   noteSpawnArgvTurnStartTranscriptEvidence(result.events);
+  opts.onDrainedEvents?.(result.events);
   pruneExpiredStructuredHeadsAndEmit('structured ingest');
   // TRAE's structured assistant_final is authoritative. Emit immediately so
   // result delivery never depends on the remote TUI composer being recognized
@@ -20213,6 +21017,7 @@ function maybeFlushAntigravityTrailingFinalOnQuietTick(): void {
   if (antigravityPendingRebind) {
     antigravityQuietCandidateKey = undefined;
     antigravityQuietCandidateCompleteOffset = undefined;
+    antigravityQuietCandidateFirstSeenAtMs = undefined;
     return;
   }
   const candidate = antigravityBridgeState().provisionalFinal;
@@ -20222,23 +21027,38 @@ function maybeFlushAntigravityTrailingFinalOnQuietTick(): void {
     // arm the quiet latch on screen evidence the transcript contradicts).
     antigravityQuietCandidateKey = undefined;
     antigravityQuietCandidateCompleteOffset = undefined;
+    antigravityQuietCandidateFirstSeenAtMs = undefined;
     return;
   }
+  const now = Date.now();
   const key = candidate.uuid;
   if (antigravityQuietCandidateKey !== key
     || antigravityQuietCandidateCompleteOffset !== codexBridgeOffset) {
     antigravityQuietCandidateKey = key;
     antigravityQuietCandidateCompleteOffset = codexBridgeOffset;
+    antigravityQuietCandidateFirstSeenAtMs = now;
     return;
   }
   if (codexBridgePendingTail || !backend
     || !backendScreenEvidenceIsAuthoritativeForMutation()
     || !cliAdapter?.busyPattern || !cliAdapter.readyPattern) return;
+  if (shouldDeferAntigravityQuietFinalForProgramStatus({
+    blocked: !!idleDetector?.programStatusBlock(),
+    heldWorking: idleDetector?.programStatusHeldWorking() === true,
+    programStatusQuietMs: idleDetector?.programStatusQuietMs(now) ?? Number.POSITIVE_INFINITY,
+    candidateAgeMs: antigravityQuietCandidateFirstSeenAtMs !== undefined
+      ? now - antigravityQuietCandidateFirstSeenAtMs
+      : 0,
+    staleQuietMs: STALE_PROGRAM_STATUS_QUIET_MS,
+  })) {
+    return;
+  }
   try {
     const screen = captureBackendScreen(backend);
     if (!screen) return;
-    if (cliAdapter.busyPattern.test(busyProbeRegion(screen))) return;
+    if (cliAdapter.busyPattern.test(busyProbeRegion(screen, cliAdapter.id))) return;
     if (!cliAdapter.readyPattern.test(stripAnsiScreenText(screen))) return;
+    if ((parseAntigravityFooterBackgroundTasks(screen) ?? 0) > 0) return;
   } catch (err: any) {
     log(`Antigravity quiet-final viewport capture failed: ${err.message}`);
     return;
@@ -20246,7 +21066,28 @@ function maybeFlushAntigravityTrailingFinalOnQuietTick(): void {
 
   antigravityQuietCandidateKey = undefined;
   antigravityQuietCandidateCompleteOffset = undefined;
-  codexBridgeIngest({ flushAntigravityTrailingFinal: true });
+  antigravityQuietCandidateFirstSeenAtMs = undefined;
+  let flushedCandidateFinal = false;
+  codexBridgeIngest({
+    flushAntigravityTrailingFinal: true,
+    onDrainedEvents: events => {
+      flushedCandidateFinal = events.some(
+        event => event.kind === 'assistant_final' && event.uuid === key,
+      );
+    },
+  });
+  // Only release a stale OSC `working` hold when this ingest explicitly emitted
+  // the held candidate as `assistant_final` AND left neither pending background
+  // tasks nor an active started turn (a concurrent tool call or follow-up
+  // USER_INPUT can clear `provisionalFinal` without ending the live turn).
+  if (shouldFireIdleAfterAntigravityQuietFlush({
+    flushedCandidateFinal,
+    heldWorking: idleDetector?.programStatusHeldWorking() === true,
+    hasPendingTasks: hasAntigravityPendingTasks(antigravityBridgeState()),
+    hasActiveStartedTurn: codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined),
+  })) {
+    idleDetector?.fireIdle();
+  }
   // A surviving pane can already be idle when a replacement worker attaches.
   // The viewport just confirmed completion, even without a new ready edge.
   if (lastInitConfig?.adoptMode) emitReadyCodexTurns();
@@ -20984,6 +21825,9 @@ function pruneExpiredStructuredHeadsAndEmit(source: string): boolean {
   holdStructuredStartLeasesWhileCliStarting();
   holdStructuredStartLeasesWhileCliHoldsInput();
   holdStructuredStartLeaseWhileDriverAwaitsInput();
+  if (typeof holdStructuredStartLeasesWhileProgramStatusBusy === 'function') {
+    holdStructuredStartLeasesWhileProgramStatusBusy();
+  }
   let fenceCurrentRpcEngine = false;
   const settledByTerminal = new Set<CodexPendingTurn>();
   const displayRetirements: CodexPendingTurn[] = [];
@@ -21427,6 +22271,7 @@ function stopCodexBridge(): void {
   antigravityCotReaderSessionId = undefined;
   stopKimiActivityObserver();
   codexBridgePendingSessionId = undefined;
+  antigravityPendingRebind = false;
   codexBridgeUnprovenSession = undefined;
   codexAdoptPendingPid = undefined;
   codexAdoptStartMs = undefined;
@@ -23406,7 +24251,7 @@ function isWorkflowWorker(): boolean {
  *  don't leave empty `pty.log` files behind.  Closed at worker exit by the
  *  process-shutdown hook below.
  */
-let workflowPtyLogStream: WriteStream | undefined;
+let workflowPtyLogStream: BoundedLogFile | undefined;
 let workflowPtyLogOpenFailed = false;
 function appendWorkflowPtyLog(data: string): void {
   if (!isWorkflowWorker() || workflowPtyLogOpenFailed) return;
@@ -23415,9 +24260,9 @@ function appendWorkflowPtyLog(data: string): void {
   if (!workflowPtyLogStream) {
     try {
       mkdirSync(dirname(path), { recursive: true });
-      workflowPtyLogStream = createWriteStream(path, { flags: 'a' });
-      workflowPtyLogStream.on('error', (err) => {
-        log(`workflow pty log write error: ${err.message}`);
+      workflowPtyLogStream = new BoundedLogFile(path, {
+        onLimit: kind => send({ type: 'error', workflowLogLimit: true, message: `pty.log exceeded the ${kind} limit` }),
+        onError: err => log(`workflow pty log write error: ${err.message}`),
       });
     } catch (err: any) {
       workflowPtyLogOpenFailed = true;
@@ -24244,6 +25089,7 @@ async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
   // `esc` is not treated as stop — it commonly just dismisses a TUI menu (e.g.
   // /model), and retiring there would swallow the still-running turn.
   if (criticalInterrupt && requestedKey === 'ctrlc') {
+    if (typeof revokeDeferredClaudePtyAuthority === 'function') revokeDeferredClaudePtyAuthority();
     if (typeof supersedeBackgroundAuthorityHold === 'function') supersedeBackgroundAuthorityHold('superseded_by_interrupt');
     retireDoubaoBridgeTurnOnInterrupt(currentBotmuxTurnId, currentBotmuxDispatchAttempt);
     if (typeof noteClaudeOpenTurnUserStop === 'function') {
@@ -24333,6 +25179,7 @@ async function handleExactTurnInterrupt(requestId: string, turnId: string): Prom
   }
   if (traexQuotaPending?.failedTurn) settleStoppedTraexRecovery(turnId);
   if (delivered) {
+    if (typeof revokeDeferredClaudePtyAuthority === 'function') revokeDeferredClaudePtyAuthority();
     if (typeof supersedeBackgroundAuthorityHold === 'function') supersedeBackgroundAuthorityHold('superseded_by_interrupt');
     // Ctrl+C can exit the CLI and enter its ordinary crash-replay path. Retire
     // only this exact turn BEFORE acknowledging interruption to the daemon;
@@ -24434,7 +25281,7 @@ function preemptActiveTurnForNewMessage(
   if (!cliAdapter.busyPattern) return false;
   let screen = '';
   try { screen = captureBackendScreen(targetBackend); } catch { return false; }
-  if (!screen || !cliAdapter.busyPattern.test(busyProbeRegion(screen))) return false;
+  if (!screen || !cliAdapter.busyPattern.test(busyProbeRegion(screen, cliAdapter.id))) return false;
 
   const interruptKey: CriticalInterruptKey = cliAdapter.interruptKey === 'esc' ? 'esc' : 'ctrlc';
   preemptedTurnId = activeTurnId;
@@ -27786,6 +28633,9 @@ function onPtyData(data: string, isLiveStream = true): void {
       }
       const wasAuthoritative = idleDetector?.programStatusActive() ?? false;
       idleDetector?.observeProgramStatus(part.event);
+      if (part.event.state === 'working' || part.event.state === 'blocked') {
+        holdStructuredStartLeasesWhileProgramStatusBusy();
+      }
       if (part.event.state === 'working' && cliAdapter?.stuckPageFamily === 'kimi') {
         kimiCacheExpiry?.programStatusWorking();
       }
@@ -28046,11 +28896,11 @@ function recoverBareShellLaunchFromPty(observedBackend: SessionBackend): boolean
   return true;
 }
 
-function markPromptReadyFromPty(observedBackend: SessionBackend): void {
+function markPromptReadyFromPty(observedBackend: SessionBackend, source: IdleEvidenceSource = 'screen'): void {
   if (!recoverBareShellLaunchFromPty(observedBackend)) return;
   postSessionStartPromptEvidenceInFlight = true;
   try {
-    markPromptReady();
+    markPromptReady(source);
   } finally {
     postSessionStartPromptEvidenceInFlight = false;
   }
@@ -28537,8 +29387,12 @@ function holdForNativeSessionFork(): boolean {
     if (!childId || childId === cfg.cliSessionId) throw new Error('Native fork did not create an independent conversation');
     cfg.forkSession = false;
     lastSpawnEffectiveCliSessionId = childId;
-    persistCliSessionId(childId);
-    if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(childId);
+    if (cfg.cliId === 'antigravity' && !cliAdapter?.runnerFramedInput) {
+      applyAuthoritativeAntigravitySessionId(childId);
+    } else {
+      persistCliSessionId(childId);
+      if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(childId);
+    }
     nativeSessionForkInFlight = undefined;
     log(`Native session fork confirmed: ${childId}`);
     markPromptReady();
@@ -28548,7 +29402,7 @@ function holdForNativeSessionFork(): boolean {
   return true;
 }
 
-function markPromptReady(): void {
+function markPromptReady(source?: IdleEvidenceSource): void {
   if (workerSessionEventScope && !hasCurrentSessionRuntime()) {
     warnPromptReadySkipped('turn-authority-missing');
     return;
@@ -28741,6 +29595,8 @@ function markPromptReady(): void {
     scheduleSpawnArgvTurnStartFailOpen();
     return;
   }
+  if (source !== 'program-status' && typeof deferClaudePtyReadyWhileStarting === 'function'
+    && deferClaudePtyReadyWhileStarting()) return;
   // Screen prompt/quiescence is only a UI heuristic. Structured transcript
   // bridges have the stronger lifecycle signal: a transcript-started turn
   // without assistant_final is still running even if the TUI redraw exposes a
@@ -28832,7 +29688,11 @@ function markPromptReady(): void {
   const readyContinuesTurn = (spawnArgvInitialPromptBusy
       || ((backgroundTaskTracker.pendingTurnAgents() > 0 || antigravityPendingTasks) && !spawnArgvNeedsWorkingSeed))
     && !!renderer
-    && queuedTypeAheadTurns.length === 0
+    && !queuedTypeAheadTurns.some(q =>
+      !(q.inputConsumed === true
+        && !!currentBotmuxTurnId
+        && q.absorbedIntoTurnId === currentBotmuxTurnId
+        && q.absorbedIntoDispatchAttempt === currentBotmuxDispatchAttempt))
     && pendingMessages.length === 0
     && pendingRawInputs.length === 0
     && pendingSessionRename === null
@@ -29067,6 +29927,7 @@ function persistCliSessionId(cliSessionId: string): void {
   // During an interactive fork the CLI temporarily resumes the parent. Its
   // early PID/transcript observations must never acknowledge the pending fork.
   if (nativeSessionForkPending()) return;
+  if (lastInitConfig?.cliId === 'antigravity') cliSessionId = cliSessionId.toLowerCase();
   const previousCliSessionId = inputDeliveryObservedCliSessionId;
   inputDeliveryObservedCliSessionId = cliSessionId;
   if (lastInitConfig?.cliId === 'antigravity' && previousCliSessionId && previousCliSessionId !== cliSessionId) {
@@ -29196,21 +30057,19 @@ function observeAntigravityCliSessionId(pid: number, label = 'spawn'): void {
     if (currentPid && currentPid !== pid) return;
 
     const realPid = findLaunchedCliPid(pid, 'antigravity') ?? pid;
-    const cid = cliAdapter?.resolveActiveSessionId
-      ? cliAdapter.resolveActiveSessionId({ cliPid: realPid, cliCwd: lastInitConfig?.workingDir })
-      : findAntigravityConversationIdByPid(realPid);
+    const cid = resolveAcceptedCurrentAntigravitySessionId({
+      cliPid: realPid,
+      cliCwd: lastInitConfig?.workingDir,
+    });
     if (cid) {
-      if (lastSpawnEffectiveResume && lastSpawnEffectiveCliSessionId && lastSpawnEffectiveCliSessionId !== cid) {
-        log(`Observed Antigravity conversationId via pid ${realPid}${realPid === pid ? '' : ` (launcher ${pid})`} (${label}) but kept existing resume target ${lastSpawnEffectiveCliSessionId}`);
-        return;
-      }
-      persistCliSessionId(cid);
       log(`Observed Antigravity conversationId via pid ${realPid}${realPid === pid ? '' : ` (launcher ${pid})`} (${label}): ${cid}`);
-      ensureAntigravityCotReader(cid);
-      // Bind the zero-prompt transcript bridge as soon as the conversation is
-      // known (its brain file may not exist yet — notify then leaves the id
-      // pending for the 1s ticker). No-op in default mode (bridge inactive).
-      if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(cid, { preserveLiveTurn: true });
+      // A surviving pane's different native ID may be a genuine offline `/new`.
+      // Try an atomic live-owner rebind, but allow normal retirement when the
+      // new transcript disproves ownership instead of freezing it forever.
+      const options = lastSpawnPersistentReattach || lastInitConfig?.adoptMode === true
+        ? { tryRebindLiveTurn: true } as const
+        : { preserveLiveTurn: true } as const;
+      applyAuthoritativeAntigravitySessionId(cid, options);
       return;
     }
     attempts++;
@@ -29569,10 +30428,18 @@ function scheduleSubmitFailureNotify(
         }
         queuePostSubmitNativeSessionTitle(turnIdentity?.nativeSessionTitle);
         if (cliSessionId) {
-          persistCliSessionId(cliSessionId);
-          if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(cliSessionId, {
-            adoptRotationStartMs: activityBaselineMs,
-          });
+          if (lastInitConfig?.cliId === 'antigravity' && !cliAdapter?.runnerFramedInput) {
+            const preserveLiveTurn = shouldPreserveAntigravitySubmittedTurn(bridgeTurnId);
+            applyAuthoritativeAntigravitySessionId(cliSessionId, {
+              adoptRotationStartMs: activityBaselineMs,
+              ...(preserveLiveTurn ? { preserveLiveTurn: true } : {}),
+            });
+          } else {
+            persistCliSessionId(cliSessionId);
+            if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(cliSessionId, {
+              adoptRotationStartMs: activityBaselineMs,
+            });
+          }
           void syncFreshCodexNativeSessionTitle(cliSessionId, codexRpcEngine);
         } else if (settlement.unprovenCliSessionId) {
           // The confirmation above renewed this turn's lease, and the history
@@ -29875,7 +30742,7 @@ function scheduleSubmitFailureNotify(
     const busyNow = nativeWorking || (() => {
       if (!cliAdapter?.busyPattern || !submitDiagnosisScreen) return false;
       try {
-        return cliAdapter.busyPattern.test(busyProbeRegion(submitDiagnosisScreen));
+        return cliAdapter.busyPattern.test(busyProbeRegion(submitDiagnosisScreen, cliAdapter.id));
       } catch { return false; }
     })();
     const passedBySuccessor = isPassedBySuccessor();
@@ -30176,8 +31043,13 @@ function observeQueuedActivationReceipt(
           recordStructuredInput(item.turnId, submittedText, item.structuredSourceTurnIds,
             cliSessionId, !unprovenCliSessionId);
           if (cliSessionId) {
-            persistCliSessionId(cliSessionId);
-            if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(cliSessionId);
+            if (lastInitConfig?.cliId === 'antigravity' && !cliAdapter?.runnerFramedInput) {
+              const preserveLiveTurn = shouldPreserveAntigravitySubmittedTurn(watchTurnId);
+              applyAuthoritativeAntigravitySessionId(cliSessionId, preserveLiveTurn ? { preserveLiveTurn: true } : {});
+            } else {
+              persistCliSessionId(cliSessionId);
+              if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(cliSessionId);
+            }
             void syncFreshCodexNativeSessionTitle(cliSessionId, codexRpcEngine);
           }
           opts?.onSettledExtra?.(proof);
@@ -30786,6 +31658,9 @@ async function flushPending(): Promise<void> {
     try { bridgeIngest(); } catch { /* best-effort */ }
   }
   const { supportsTypeAhead: runtimeSupportsTypeAhead, allowBackToBackWrites } = runtimePtyInputPolicy();
+  // Do not fold another message into a turn whose only start signal is a host
+  // write. Real start evidence restores the adapter's ordinary type-ahead path.
+  if (typeof currentUnstartedDeferredClaudePtyReady === 'function' && currentUnstartedDeferredClaudePtyReady()) return;
   // Hold incoming writes while a background wake-up micro-turn is actively
   // running so another message cannot type-ahead/fold into principal A's wake.
   if (typeof backgroundAuthorityHold !== 'undefined' && backgroundAuthorityHold.isWakeActive()) {
@@ -31118,6 +31993,7 @@ async function flushPending(): Promise<void> {
       // The entry check protects a new drain. These checks protect subsequent
       // items when a terminal or late receipt arrives during awaited writes.
       if (currentInputDeliveryQuarantine()) break;
+      if (typeof currentUnstartedDeferredClaudePtyReady === 'function' && currentUnstartedDeferredClaudePtyReady()) break;
       // TRAE's question page can come up while an earlier item of this drain
       // still awaits its receipt: the next item must not be pasted into it.
       if (traexQuestionBridgeActive() && hookReviewHoldsQueuedWrite()) {
@@ -31437,15 +32313,22 @@ async function flushPending(): Promise<void> {
         }
         syncQueuedTurnsFromMarkerDisk();
 
-        let currentTurnFinalDelivered = Boolean(
-          currentBotmuxTurnId
-            && readSendMarkers().some(m => m.turnId === currentBotmuxTurnId && m.responseKind === 'final')
-        );
+        let currentTurnFinalDelivered = currentTurnHasFinalEvidence();
         if (currentTurnFinalDelivered && queuedTypeAheadTurns.length > 0) {
-          advanceQueuedTypeAheadTurn('final_delivered');
-          currentTurnFinalDelivered = Boolean(
-            currentBotmuxTurnId
-              && readSendMarkers().some(m => m.turnId === currentBotmuxTurnId && m.responseKind === 'final')
+          advanceQueuedTypeAheadTurnAfterFinal();
+          currentTurnFinalDelivered = currentTurnHasFinalEvidence();
+        }
+
+        if (currentTurnFinalDelivered && queuedTypeAheadTurns.some(q =>
+          q.inputConsumed === true
+          && q.absorbedIntoTurnId === currentBotmuxTurnId
+          && q.absorbedIntoDispatchAttempt === currentBotmuxDispatchAttempt)) {
+          // Never rotate an incoming item over an absorbed turn whose final
+          // settlement is unresolved. In particular, the markNewTurn branch
+          // below must not become an independent final-delivered bypass.
+          throw new SubmissionWriteError(
+            'Absorbed-turn final transition is still unresolved',
+            undefined, false, false, false, true,
           );
         }
 
@@ -31453,12 +32336,17 @@ async function flushPending(): Promise<void> {
           && ((typeof retiredTurnIds !== 'undefined' && retiredTurnIds.has(currentBotmuxTurnId))
             || (typeof turnTerminalEmitted === 'function'
               && turnTerminalEmitted(currentBotmuxTurnId, currentBotmuxDispatchAttempt)));
+        const hasUnabsorbedQueuedTurn = queuedTypeAheadTurns.some(q =>
+          !(q.inputConsumed === true
+            && !!currentBotmuxTurnId
+            && q.absorbedIntoTurnId === currentBotmuxTurnId
+            && q.absorbedIntoDispatchAttempt === currentBotmuxDispatchAttempt));
         const isTypeAhead = !!currentBotmuxTurnId
           && !currentTurnFinalDelivered
           && !!item.turnId
           && item.turnId !== currentBotmuxTurnId
           && (itemsWrittenInThisFlush > 0
-            || queuedTypeAheadTurns.length > 0
+            || hasUnabsorbedQueuedTurn
             || (!promptReadyAtFlushStart && !currentTurnAlreadyTerminated));
         if (lastInitConfig?.cliId === 'traex') {
           lastTraexPromptCheckpoint = undefined;
@@ -31548,8 +32436,35 @@ async function flushPending(): Promise<void> {
           }
         } else {
           renderer?.markNewTurn();
-          if (currentBotmuxTurnId && currentBotmuxTurnId !== item.turnId) {
-            markTurnRetired(currentBotmuxTurnId);
+          const prevActiveTurnId = currentBotmuxTurnId;
+          const prevActiveDispatchAttempt = currentBotmuxDispatchAttempt;
+          if (prevActiveTurnId && prevActiveTurnId !== item.turnId) {
+            markTurnRetired(prevActiveTurnId);
+            // A final alone is NOT proof that this entry may be retired here:
+            // advanceQueuedTypeAheadTurnAfterFinal above has already applied the
+            // sender's destination-gated decision. This inline cleanup is only
+            // for terminal-fold cleanup or a settlement already synced from disk.
+            const absorbedIntoPrev = queuedTypeAheadTurns.filter(q =>
+              q.inputConsumed === true
+              && q.absorbedIntoTurnId === prevActiveTurnId
+              && q.absorbedIntoDispatchAttempt === prevActiveDispatchAttempt
+              && (turnTerminalEmitted(prevActiveTurnId, prevActiveDispatchAttempt)
+                || settledAbsorbedTurnsByKey.has(settledAbsorbedKey(q.turnId, q.dispatchAttempt))));
+            for (const absorbed of absorbedIntoPrev) {
+              if (typeof rememberSettledAbsorbedTurn === 'function') {
+                rememberSettledAbsorbedTurn({
+                  turnId: absorbed.turnId,
+                  ...(absorbed.dispatchAttempt !== undefined ? { dispatchAttempt: absorbed.dispatchAttempt } : {}),
+                  hostTurnId: prevActiveTurnId,
+                  ...(prevActiveDispatchAttempt !== undefined ? { hostDispatchAttempt: prevActiveDispatchAttempt } : {}),
+                });
+              }
+              if (typeof dropQueuedTurnRecord === 'function') {
+                dropQueuedTurnRecord(absorbed.turnId, absorbed.dispatchAttempt, { tombstone: absorbed.dispatchAttempt === undefined });
+              } else {
+                queuedTypeAheadTurns = queuedTypeAheadTurns.filter(q => q !== absorbed);
+              }
+            }
           }
           setCaptureIdentity(
             item.turnId,
@@ -31694,6 +32609,7 @@ async function flushPending(): Promise<void> {
         markTurnExecutionStart(item.turnId, item.dispatchAttempt, {
           evidenceAlreadyStarted: !!preAssignedEvidenceTurnId,
         });
+        resetFinalTransitionRetryBackoff();
         if (isCodexAppCliId(lastInitConfig?.cliId)) {
           log(
             `Writing Codex App input to PTY (flush): `
@@ -32103,6 +33019,15 @@ async function flushPending(): Promise<void> {
           log('Retained definitely-unwritten input behind the dirty Web terminal wire');
           break;
         }
+        if (err instanceof SubmissionWriteError && err.retainPendingInput && writeContinuationIsCurrent()) {
+          if (!pendingMessages.includes(item)) pendingMessages.unshift(item);
+          requeueUnsubmittedQueuedActivation(item);
+          keepPromptReadyAfterHold();
+          if (writeContinuationIsCurrent() && pendingMessages[0] === item) {
+            scheduleFinalTransitionRetry(item, writeContinuationIsCurrent, writeGeneration);
+          }
+          break;
+        }
         if (err instanceof SubmissionWriteError && err.traexCatalogAdmissionRequired) {
           // prepareNormalWrite threw before invoking the adapter. This is a
           // proven pre-write refusal, never an ambiguous submission: restore
@@ -32467,11 +33392,16 @@ async function flushPending(): Promise<void> {
       // outcome — the rotation is real even when the current Enter didn't
       // land, and we want next-resume to use the right id.
       if (result?.cliSessionId) {
-        persistCliSessionId(result.cliSessionId);
-        // First successful Codex submit also reveals the rollout path.
-        // Late-attach now so subsequent assistant_final events get
-        // attributed to this turn.
-        if (codexBridgeActive) codexBridgeNotifyCliSessionId(result.cliSessionId);
+        if (lastInitConfig?.cliId === 'antigravity' && !cliAdapter?.runnerFramedInput) {
+          const preserveLiveTurn = shouldPreserveAntigravitySubmittedTurn(bridgeTurnId);
+          applyAuthoritativeAntigravitySessionId(result.cliSessionId, preserveLiveTurn ? { preserveLiveTurn: true } : {});
+        } else {
+          persistCliSessionId(result.cliSessionId);
+          // First successful Codex submit also reveals the rollout path.
+          // Late-attach now so subsequent assistant_final events get
+          // attributed to this turn.
+          if (codexBridgeActive) codexBridgeNotifyCliSessionId(result.cliSessionId);
+        }
       } else if (result?.unprovenCliSessionId && codexBridgeActive) {
         codexBridgeNoteUnprovenCliSessionId(result.unprovenCliSessionId, {
           turnId: item.turnId, bridgeTurnId, dispatchAttempt: item.dispatchAttempt,
@@ -33932,7 +34862,7 @@ function viewportShowsIdlePrompt(be: SessionBackend): boolean {
   try {
     const content = captureBackendScreen(be);
     if (!content) return false;
-    const region = busyProbeRegion(content);
+    const region = busyProbeRegion(content, cliAdapter.id);
     if (cliAdapter.busyPattern.test(region)) return false;
     return !cliAdapter.readyPattern || cliAdapter.readyPattern.test(region);
   } catch (err: any) {
@@ -33986,7 +34916,7 @@ function deferPromptReadyWhileBusy(source: string, be: SessionBackend): boolean 
   if (!backendScreenEvidenceIsAuthoritativeForMutation() || !cliAdapter?.busyPattern) return false;
   try {
     const content = captureBackendScreen(be);
-    if (!content || !cliAdapter.busyPattern.test(busyProbeRegion(content))) return false;
+    if (!content || !cliAdapter.busyPattern.test(busyProbeRegion(content, cliAdapter.id))) return false;
     deferBusyReady('busy-marker', source);
     log(`${source}: authoritative viewport still shows busy marker; deferring prompt ready (reason=deferred-busy-marker)`);
     idleDetector?.reset();
@@ -34067,7 +34997,7 @@ function probeBusyPatternIdle(
     try {
       const content = captureBackendScreen(be);
       if (!content) return false;
-      if (cliAdapter.busyPattern.test(busyProbeRegion(content))) return false;
+      if (cliAdapter.busyPattern.test(busyProbeRegion(content, cliAdapter.id))) return false;
       // At startup an absent busy marker proves nothing: a CLI that has not
       // drawn its UI yet has no busy marker either (2026-10-20: a blank pane
       // was marked ready 15s into a 66s cold start). Require the input box.
@@ -34908,13 +35838,15 @@ async function spawnCliBody(
     waitedForMissingCli = launchAdapter.waited;
   }
   // Re-verify capability once effectiveCliId (e.g. dsh-tui) and cliPathOverride are resolved into cliAdapter.
-  // A version-gated adapter (codex / traex) is decided per launch either way.
+  // A version-gated adapter (codex / traex / antigravity) is decided per launch either way.
   if (cliAdapter.programStatusMinVersion !== undefined) {
     programStatusStream = shouldEnableProgramStatus(cfg, cliAdapter)
       ? programStatusStream ?? new ProgramStatusFramingStream()
       : null;
-  } else if (cliAdapter.supportsProgramStatus && !programStatusStream) {
-    programStatusStream = new ProgramStatusFramingStream();
+  } else if (cliAdapter.supportsProgramStatus) {
+    if (!programStatusStream) programStatusStream = new ProgramStatusFramingStream();
+  } else {
+    programStatusStream = null;
   }
   traexNativeStartupInputPending = shouldFenceTraexStartupInput({
     cliId: cfg.cliId,
@@ -37292,6 +38224,8 @@ async function spawnCliBody(
     initialPrompt: preparedInitialPrompt,
     nativeSessionTitle: cfg.nativeSessionTitle,
     botName: cfg.botName,
+    groupJoinPrompt: cfg.groupJoinPrompt,
+    groupJoinTitleBootstrap: cfg.groupJoinTitleBootstrap,
     botOpenId: cfg.botOpenId,
     larkAppId: cfg.larkAppId,
     // No-transport (apiOnly core-only bot OR HTTP virtual chat): drop the
@@ -37733,10 +38667,14 @@ async function spawnCliBody(
   if (injectClaudeSandbox) childEnv.IS_SANDBOX = '1';
   if (claudeResumeTokenThreshold) childEnv.CLAUDE_CODE_RESUME_TOKEN_THRESHOLD = claudeResumeTokenThreshold;
   // Adapter-supplied env: points Claude-family forks at their data root (Seed's
-  // CLAUDE_CONFIG_DIR → `.claude-runtime`). Keys here are also in the tmux
+  // CLAUDE_CONFIG_DIR → `.claude-runtime`) and enables opt-in OSC 7501 where
+  // supported (Kimi / Antigravity >= 1.5.10). Keys here are also in the tmux
   // passthrough whitelist (BOTMUX_INJECTED_ENV_KEYS) so the tmux backend forwards
   // them past the server's global env.
-  if (cliAdapter.spawnEnv) Object.assign(childEnv, cliAdapter.spawnEnv);
+  const appliedAdapterSpawnEnvKeys = applyAdapterSpawnEnv(childEnv, cliAdapter, {
+    programStatusEnabled: programStatusStream !== null,
+    botEnv: perBotInjectEnv,
+  });
   if (Object.keys(piInitialPromptEnv).length > 0) {
     Object.assign(childEnv, piInitialPromptEnv);
   }
@@ -39784,7 +40722,7 @@ async function spawnCliBody(
     const spawnEnvPlan = planChildSpawnEnv({
       baseEnv: childEnv,
       botEnv: perBotInjectKeys.length ? perBotInjectEnv : undefined,
-      envUnset: cfg.envUnset,
+      envUnset: filterAppliedAdapterEnvUnset(cfg.envUnset, appliedAdapterSpawnEnvKeys),
       scope: dshTuiResumeScope({
         resume: effectiveResume,
         cliId: cliAdapter.id,
@@ -41074,7 +42012,7 @@ async function spawnCliBody(
     // OSC 7501 done/idle/error is a real prompt edge. It has to take the PTY
     // path so the post-SessionStart fence accepts it, and it must not fall
     // through to the footer veto below: Claude's ❯ stays up while busy.
-    else if (evidenceSource === 'program-status') markPromptReadyFromPty(observedBackend);
+    else if (evidenceSource === 'program-status') markPromptReadyFromPty(observedBackend, evidenceSource);
     else markPromptReady();
   };
   const drainBridgesThenMarkReady = (evidenceSource?: string): void => {
@@ -41792,6 +42730,7 @@ async function spawnCliBody(
     setCaptureIdentity(undefined, undefined);
     currentBotmuxLinkRefMode = undefined;
     queuedTypeAheadTurns = [];
+    if (typeof settledAbsorbedTurnsByKey !== 'undefined') settledAbsorbedTurnsByKey.clear();
     foldedTypeAheadTurn = undefined;
     queuedTurnAdvanceConsumedForPrompt = undefined;
     retiredTurnIds.clear();
@@ -42277,6 +43216,7 @@ function killCli(opts: {
   setCaptureIdentity(undefined, undefined);
   currentBotmuxLinkRefMode = undefined;
   queuedTypeAheadTurns = [];
+  if (typeof settledAbsorbedTurnsByKey !== 'undefined') settledAbsorbedTurnsByKey.clear();
   foldedTypeAheadTurn = undefined;
   queuedTurnAdvanceConsumedForPrompt = undefined;
   retiredTurnIds.clear();
@@ -42839,6 +43779,7 @@ function makeWebTerminalInputController(ws: WebSocket, auditUser: string | undef
     onUserInput: (_target, data, submits) => {
       noteTerminalEffortInput(ws, data);
       if (submits || data.includes('\x03')) {
+        revokeDeferredClaudePtyAuthority();
         supersedeBackgroundAuthorityHold(data.includes('\x03') ? 'superseded_by_interrupt' : 'superseded_by_local_turn');
       }
       if (!countHuman) return;
@@ -46002,12 +46943,26 @@ function releaseTerminatedActiveTurnAuthority(): void {
  *  turn that never sees another terminal. Drop the record once its terminal is
  *  out; the tombstone keeps the PID-marker sync from re-adding it. */
 function retireTerminatedQueuedTurn(turnId: string, dispatchAttempt?: number, status?: TurnTerminalStatus): void {
-  if (turnId === currentBotmuxTurnId) return;
-  if (dropQueuedTurnRecord(turnId, dispatchAttempt)) {
+  if (turnId === currentBotmuxTurnId && dispatchAttempt === currentBotmuxDispatchAttempt) return;
+  const settledKey = `${turnId}\0${dispatchAttempt ?? ''}`;
+  const settled = typeof settledAbsorbedTurnsByKey !== 'undefined'
+    ? settledAbsorbedTurnsByKey.get(settledKey)
+    : undefined;
+  // Keep the settled entry even after host/B terminals and worker restarts. It
+  // is both a requeue tombstone and durable reply-addressing evidence; only the
+  // PID marker file's own lifecycle may discard it.
+  const dropped = dropQueuedTurnRecord(turnId, dispatchAttempt);
+  if (dropped || settled) {
     // A completed fold answers the next prompt suggestion, which still shows
     // under the turn owning the screen; a failed write folded nothing.
-    if (status === 'completed') foldedTypeAheadTurn = { turnId, dispatchAttempt, into: currentBotmuxTurnId };
-    writeCliPidMarker();
+    if (status === 'completed'
+      && turnId !== currentBotmuxTurnId
+      && (!settled
+        || (settled.hostTurnId === currentBotmuxTurnId
+          && settled.hostDispatchAttempt === currentBotmuxDispatchAttempt))) {
+      foldedTypeAheadTurn = { turnId, dispatchAttempt, into: currentBotmuxTurnId };
+    }
+    if (typeof writeCliPidMarker === 'function') writeCliPidMarker();
   }
 }
 
@@ -46025,10 +46980,12 @@ function dropQueuedTurnRecord(
     || (queued.dispatchAttempt !== undefined && queued.dispatchAttempt !== dispatchAttempt));
   if (queuedTypeAheadTurns.length === before) return false;
   // A retry of the same turn under another attempt is still live work. Its
-  // sidecar is keyed by turnId, so only the last queued sibling may retire it.
-  const hasLiveSibling = queuedTypeAheadTurns.some(queued => queued.turnId === turnId);
-  if (!hasLiveSibling) send({ type: 'type_ahead_turn_dropped', turnId });
-  if (opts.tombstone !== false && !hasLiveSibling) markTurnRetired(turnId);
+  // sidecar is keyed by turnId, so only the last queued/current sibling may
+  // retire it. A late terminal for attempt N must not kill active attempt N+1.
+  const hasLiveSibling = queuedTypeAheadTurns.some(queued => queued.turnId === turnId)
+    || (currentBotmuxTurnId === turnId && currentBotmuxDispatchAttempt !== dispatchAttempt);
+  if (!hasLiveSibling && typeof send === 'function') send({ type: 'type_ahead_turn_dropped', turnId });
+  if (opts.tombstone !== false && !hasLiveSibling && typeof markTurnRetired === 'function') markTurnRetired(turnId);
   return true;
 }
 
@@ -46057,6 +47014,8 @@ function markerQueuedTurnStillLive(qt: { turnId?: unknown; dispatchAttempt?: unk
   if (typeof qt?.turnId !== 'string' || !qt.turnId) return false;
   if (retiredTurnIds.has(qt.turnId)) return false;
   const dispatchAttempt = typeof qt.dispatchAttempt === 'number' ? qt.dispatchAttempt : undefined;
+  if (typeof settledAbsorbedTurnsByKey !== 'undefined'
+    && settledAbsorbedTurnsByKey.has(`${qt.turnId}\0${dispatchAttempt ?? ''}`)) return false;
   if (turnTerminalEmitted(qt.turnId, dispatchAttempt)) return false;
   if (dispatchAttempt !== undefined && sessionId) {
     const genericStatus = emittedTurnTerminals.statusOf(sessionId, qt.turnId, undefined);
@@ -46250,6 +47209,9 @@ function emitTurnTerminal(
   const hasOtherQueuedTypeAhead = typeof queuedTypeAheadTurns !== 'undefined'
     && Array.isArray(queuedTypeAheadTurns) && queuedTypeAheadTurns.some(q =>
     q.turnId !== turnId
+    && !(q.inputConsumed === true
+      && q.absorbedIntoTurnId === turnId
+      && q.absorbedIntoDispatchAttempt === dispatchAttempt)
     && (typeof turnTerminalEmitted === 'function' ? !turnTerminalEmitted(q.turnId, q.dispatchAttempt) : true));
   const authorityHeldForBackground = typeof backgroundAuthorityHold !== 'undefined'
     && backgroundAuthorityHold.onForegroundTurnTerminal(
@@ -46268,7 +47230,7 @@ function emitTurnTerminal(
   }
   if (kimiActivityObserver) drainKimiActivityInto({ turnId, dispatchAttempt });
   if (thinkingTurn?.turnId === turnId && thinkingTurn.dispatchAttempt === dispatchAttempt) {
-    flushThinkingUpdate();
+    flushThinkingUpdate(true);
   }
   const diagnostics = captureTurnFailureDiagnostics && (status === 'failed' || status === 'ambiguous')
     ? turnFailureDiagnostics({ errorDetail, screen: turnFailureScreen() })
@@ -46320,9 +47282,14 @@ function emitTurnTerminal(
   // Publish authority retirement only after terminal acceptance. A stale
   // terminal from a superseded same-principal steer still cannot clear the
   // newer turn's authority, while an IPC failure leaves the exact turn held.
-  if (!releaseActiveTurnAuthority('turn_terminal', { turnId, dispatchAttempt })) {
+  const releasedAuthority = releaseActiveTurnAuthority('turn_terminal', { turnId, dispatchAttempt });
+  if (!releasedAuthority) {
     releaseTerminatedActiveTurnAuthority();
-  } else {
+  }
+  if (releasedAuthority
+    || (!activeTurnAuthority.snapshot()
+      && turnId === currentBotmuxTurnId
+      && dispatchAttempt === currentBotmuxDispatchAttempt)) {
     scheduleConsumedQueuedTurnAdvance();
   }
   retireTerminatedQueuedTurn(turnId, dispatchAttempt, status);
@@ -46500,10 +47467,29 @@ function acknowledgeTurnInputReceived(turnId?: string): void {
  * never because writeInput returned: CoCo and Antigravity's queue mode accept a
  * busy-time Enter but park it until the running turn ends, so a write-time mark
  * would send the running turn's own answer to the still-unread message. */
-function markReplyInputConsumed(turnId: string | undefined): void {
-  const queued = queuedTypeAheadTurns.find(turn => turn.turnId === turnId);
-  if (!queued || queued.inputConsumed) return;
+function markReplyInputConsumed(
+  turnId: string | undefined,
+  dispatchAttempt?: number,
+  absorbedHost?: { hostTurnId: string; hostDispatchAttempt?: number },
+): void {
+  const queued = queuedTypeAheadTurns.find(turn =>
+    turn.turnId === turnId && (dispatchAttempt === undefined || turn.dispatchAttempt === dispatchAttempt));
+  if (!queued) return;
+  const validHostId = absorbedHost?.hostTurnId
+    && (typeof isValidMarkerIdentityTurnId !== 'function' || isValidMarkerIdentityTurnId(absorbedHost.hostTurnId))
+    && absorbedHost.hostTurnId !== queued.turnId
+    ? absorbedHost.hostTurnId
+    : undefined;
+  const validHostAttempt = validHostId ? absorbedHost?.hostDispatchAttempt : undefined;
+  const absorptionChanged = !!validHostId
+    && (queued.absorbedIntoTurnId !== validHostId || queued.absorbedIntoDispatchAttempt !== validHostAttempt);
+  if (queued.inputConsumed && !absorptionChanged) return;
   queued.inputConsumed = true;
+  if (validHostId) {
+    queued.absorbedIntoTurnId = validHostId;
+    if (validHostAttempt !== undefined) queued.absorbedIntoDispatchAttempt = validHostAttempt;
+    else delete queued.absorbedIntoDispatchAttempt;
+  }
   writeCliPidMarker();
   scheduleConsumedQueuedTurnAdvance();
 }
@@ -46518,7 +47504,12 @@ function scheduleConsumedQueuedTurnAdvance(): void {
   queueMicrotask(() => {
     if (activeTurnAuthority.snapshot()) return;
     if (currentBotmuxTurnId && !turnTerminalEmitted(currentBotmuxTurnId, currentBotmuxDispatchAttempt)) return;
-    const next = queuedTypeAheadTurns.find(queued => !turnTerminalEmitted(queued.turnId, queued.dispatchAttempt));
+    const next = queuedTypeAheadTurns.find(queued =>
+      !turnTerminalEmitted(queued.turnId, queued.dispatchAttempt)
+      && !(queued.inputConsumed === true
+        && !!currentBotmuxTurnId
+        && queued.absorbedIntoTurnId === currentBotmuxTurnId
+        && queued.absorbedIntoDispatchAttempt === currentBotmuxDispatchAttempt));
     if (next?.inputConsumed) advanceQueuedTypeAheadTurn('queued_input_consumed');
   });
 }
@@ -46568,6 +47559,7 @@ function acknowledgeNativeInputConsumed(
   nativeSessionId?: string,
   nativeTurnId?: string,
   dispatchAttempt?: number,
+  absorbedHost?: { hostTurnId: string; hostDispatchAttempt?: number },
 ): void {
   if (!turnId) return;
   if (process.env.SESSION_DATA_DIR && sessionId && (nativeSessionId || nativeTurnId)) {
@@ -46578,7 +47570,11 @@ function acknowledgeNativeInputConsumed(
     }
   }
   startupNativeInputSeen = true;
-  markReplyInputConsumed(turnId);
+  if (dispatchAttempt !== undefined || absorbedHost) {
+    markReplyInputConsumed(turnId, dispatchAttempt, absorbedHost);
+  } else {
+    markReplyInputConsumed(turnId);
+  }
   // The CLI has the input in its own history: a crash no longer re-delivers
   // it to a resumed CLI (see InflightInputTracker.onTurnStarted).
   inflightInputs.onTurnStarted(turnId);
@@ -46872,7 +47868,13 @@ function startFailedTurnRewind(
         : pendingMessages.length > 0 || pendingRawInputs.length > 0 ? 'input queued'
           : tuiPromptBlocking ? 'a TUI prompt is open'
             : sessionRenameInFlight() ? 'renaming the session'
-              : durableTurnInFlight || queuedTypeAheadTurns.length > 0 || activeTurnAuthority.snapshot()?.turnId
+              : durableTurnInFlight
+                || queuedTypeAheadTurns.some(q =>
+                  !(q.inputConsumed === true
+                    && !!currentBotmuxTurnId
+                    && q.absorbedIntoTurnId === currentBotmuxTurnId
+                    && q.absorbedIntoDispatchAttempt === currentBotmuxDispatchAttempt))
+                || activeTurnAuthority.snapshot()?.turnId
                 ? 'a turn is running' : undefined,
     directive,
     inspect: path => traexCheckpoint
@@ -49908,6 +50910,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       if (submitted) {
         claudeUserPromptSubmittedTurnId = submitted.turnId;
         claudeUserPromptSubmittedDispatchAttempt = submitted.dispatchAttempt;
+        if (typeof resumeQueuedInputAfterClaudePtyStart === 'function') resumeQueuedInputAfterClaudePtyStart(submitted);
         send({
           type: 'prompt_submitted_input',
           turnId: submitted.turnId,
@@ -50154,6 +51157,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       clearSendMarkers();
       clearBridgeTurnJournalFile();
       cleanup();
+      if (typeof workflowPtyLogStream !== 'undefined') await workflowPtyLogStream.end();
       process.exit(0);
     }
 
@@ -50580,10 +51584,7 @@ function cleanup(): void {
   if (wsHeartbeat) { wsHeartbeat.stop(); wsHeartbeat = null; }
   if (wss) { wss.close(); wss = null; }
   if (httpServer) { httpServer.close(); httpServer = null; }
-  if (workflowPtyLogStream) {
-    try { workflowPtyLogStream.end(); } catch { /* already closed */ }
-    workflowPtyLogStream = undefined;
-  }
+  void workflowPtyLogStream?.end();
   // Publisher ownership spans every CLI generation in this worker. Releasing
   // from killCli/restart would reopen a stale-publish window; only process-level
   // cleanup retires the lease. SIGKILL residue is reclaimed by the next worker.

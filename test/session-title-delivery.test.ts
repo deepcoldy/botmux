@@ -403,9 +403,10 @@ describe('automatic titles beside entry-point titles and session-group naming', 
   const joinPrompt = '加入后先阅读最近的群消息，等待明确分配的任务再开始处理，不要自行推断目标。';
 
   it('titles a join opening from a question folded after the bootstrap on a non-native CLI', async () => {
-    const { ds } = coldFresh('claude-code', joinPrompt.substring(0, 50), 'thread', true);
+    const { ds, sentInit } = coldFresh('claude-code', joinPrompt.substring(0, 50), 'thread', true);
     bot.config.autoStartOnGroupJoinPrompt = joinPrompt;
     expect(pool.forkWorker(ds, `<user_message>\n${joinPrompt}\n\n排查 rule 456 的失败\n</user_message>`, { resume: false, turnId: 'om_folded_open' })).toBe(true);
+    expect(sentInit()?.groupJoinPrompt).toBe(joinPrompt);
     await vi.advanceTimersByTimeAsync(10);
     const row = disk(ds);
     expect(row.title).toBe('排查 rule 456 的失败');
@@ -413,9 +414,10 @@ describe('automatic titles beside entry-point titles and session-group naming', 
   });
 
   it.each(['claude-code', 'codex'] as const)('keeps the entry point title when a non-join %s opening starts with the join prompt', async cli => {
-    const { ds } = coldFresh(cli, '[定时] 每日告警汇总');
+    const { ds, sentInit } = coldFresh(cli, '[定时] 每日告警汇总');
     bot.config.autoStartOnGroupJoinPrompt = joinPrompt;
     expect(pool.forkWorker(ds, `${joinPrompt} 今日巡检 rule 1 的告警`, { resume: false, turnId: 'om_prefixed_open' })).toBe(true);
+    expect(sentInit()?.groupJoinPrompt).toBeUndefined();
     await vi.advanceTimersByTimeAsync(10);
     expect(disk(ds).title).toBe('[定时] 每日告警汇总');
     expect(disk(ds).titleSource).toBeUndefined();
