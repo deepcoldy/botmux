@@ -2,7 +2,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { WecomDashboardConfig } from '../src/dashboard/wecom/config.js';
 import { wecomConfigId } from '../src/im/wecom/config/discovery.js';
 import { handleWecomConnectionsApi } from '../src/dashboard/wecom/api.js';
@@ -32,6 +33,62 @@ else console.log(JSON.stringify({models:[{slug:source,visibility:'list',service_
   writeFileSync(join(root, 'config-registry.json'), JSON.stringify({ version: 1, paths: [join(root, 'second.json')] }));
   return { root, log, ids, service: new WecomDashboardConfig(root) };
 }
+/** 与 Claude CLI 缓存同形的模型目录，写到数据根下。 */
+function writeClaudeCatalog(dataRoot: string, model: string): void {
+  const dir = join(dataRoot, 'cache', 'model-catalog'); mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'published-1.json'), JSON.stringify({ schema_version: 1, version: 1,
+    surfaces: { cc: { model_selector_config: [{ id: 'cc', models: [{ id: model, name: model, section: 'main' }] }] } } }));
+}
+/** 一条保存为 Claude Code 的连接；本机默认数据根（HOME/.claude）里放一份只含 host-account-model 的目录。 */
+function claudeFixture(botConfig: Record<string, unknown> = {}) {
+  const root = mkdtempSync(join(tmpdir(), 'wecom-claude-probe-')); roots.push(root);
+  const hostHome = join(root, 'host-home'), bin = join(root, 'claude');
+  writeClaudeCatalog(join(hostHome, '.claude'), 'host-account-model');
+  writeFileSync(bin, '#!/bin/sh\nexit 0\n', { mode: 0o700 });
+  const file = join(root, 'config.json');
+  writeFileSync(file, JSON.stringify({ botId: 'claude-source', secretEnv: 'STRANGE_TRANSPORT_CREDENTIAL', allowedUsers: ['alice'], coreUrl: 'http://127.0.0.1:19710',
+    managedCore: { botId: 'local_claude_source', cli: 'claude-code', backend: 'pty', port: 19710, workingDirectory: root, stateDir: join(root, 'core'),
+      botConfig: { cliPathOverride: bin, ...botConfig } } }), { mode: 0o600 });
+  vi.stubEnv('HOME', hostHome);
+  for (const key of ['CLAUDE_CONFIG_DIR', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY', 'BOTMUX_SANDBOX']) vi.stubEnv(key, '');
+  return { root, hostHome, id: wecomConfigId(file), service: new WecomDashboardConfig(root) };
+}
+describe('WeCom model probe for a connection saved as Claude Code reads that connection\'s own account', () => {
+  it('lists the catalog of the default data root when the connection uses it', async () => {
+    const f = claudeFixture();
+    expect((await f.service.cliProbe(f.id, 'models', 'claude-code')).models).toContain('host-account-model');
+  });
+  it('lists the catalog of the connection\'s CLI profile directory instead of the default data root', async () => {
+    const profile = join(mkdtempSync(join(tmpdir(), 'wecom-claude-profile-')), 'profile'); roots.push(join(profile, '..'));
+    writeClaudeCatalog(profile, 'profile-account-model');
+    const f = claudeFixture({ cliConfigDir: profile });
+    const models = (await f.service.cliProbe(f.id, 'models', 'claude-code')).models;
+    expect(models).toContain('profile-account-model'); expect(models).not.toContain('host-account-model');
+  });
+  it('does not list the default data root for a read-isolated connection, whose data root only the worker can place', async () => {
+    const f = claudeFixture({ readIsolation: true });
+    expect((await f.service.cliProbe(f.id, 'models', 'claude-code')).models).not.toContain('host-account-model');
+  });
+  it('asks the gateway the connection\'s own environment points at, over the one in the host settings', async () => {
+    const seen: string[] = [];
+    const server = createServer((req, res) => {
+      seen.push(req.url ?? '');
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: [{ id: req.url?.startsWith('/connection/') ? 'connection-gateway-model' : 'host-gateway-model' }] }));
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+      const f = claudeFixture({ env: { ANTHROPIC_BASE_URL: `${base}/connection`, ANTHROPIC_AUTH_TOKEN: 'fake-connection-token' } });
+      writeFileSync(join(f.hostHome, '.claude', 'settings.json'), JSON.stringify({ env: { ANTHROPIC_BASE_URL: `${base}/host`, ANTHROPIC_AUTH_TOKEN: 'fake-host-token' } }));
+      const models = (await f.service.cliProbe(f.id, 'models', 'claude-code')).models;
+      expect(models).toContain('connection-gateway-model'); expect(models).not.toContain('host-gateway-model');
+      expect(seen).toEqual(['/connection/v1/models']);
+    } finally {
+      await new Promise(resolve => server.close(resolve));
+    }
+  });
+});
 describe('WeCom read-only CLI probes keep each source environment isolated', () => {
   it.each(['models', 'availability'] as const)('does not pass the persisted core profile to a different-selection %s probe', async kind => {
     const f = fixture(), log = join(f.root, `mismatch-${kind}.json`);
@@ -61,6 +118,12 @@ const fs=require('node:fs');fs.writeFileSync(${JSON.stringify(log)},JSON.stringi
     vi.stubEnv('ZCODE_PERSONAL_PROVIDER_CONFIG_FILE', ambient);
     await f.service.patch(f.ids[0], { revision: f.service.get(f.ids[0]).revision, cli: 'zcode', replaceCliSelection: true, botConfig: { env: { ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: source } } });
     expect((await f.service.cliProbe(f.ids[0], 'models', 'zcode')).models).toEqual(['source/model']);
+  });
+  it('still probes a selection the connection is not saved with, in the sanitized environment', async () => {
+    const f = fixture(), catalog = join(f.root, 'providers.json');
+    writeFileSync(catalog, JSON.stringify({ config: { providerConfigRules: { providerRules: [{ providerId: 'tryout', config: { personalModelIds: ['model'] } }] } } }));
+    vi.stubEnv('ZCODE_PERSONAL_PROVIDER_CONFIG_FILE', catalog);
+    expect((await f.service.cliProbe(f.ids[0], 'models', 'zcode')).models).toEqual(['tryout/model']);
   });
   it('strips custom transport credentials from the special Aiden model detector too', async () => {
     const f = fixture(), log = join(f.root, 'aiden-probe.json');

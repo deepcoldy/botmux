@@ -156,13 +156,24 @@ export class WecomDashboardConfig {
     if (!isKnownSelectionKey(key)) throw new Error('wecom_unknown_cli_selection');
     if (kind === 'availability') return (await cliAvailabilityResponse(key, bot, env)).body;
     const context = modelCatalogProbeContext(key, bot, env);
+    // The requested selection is the one this connection is saved with: only
+    // then does the probe context carry the connection's own launch shape.
+    const savedSelection = context.runtimeContext !== undefined;
     return buildModelChoicesResponse(key, {
       runtimeExecutable: context.runtimeExecutable,
       runtimeContext: context.runtimeContext,
       probeEnv: context.probeEnv ?? env,
+      probeSettingsEnv: context.probeSettingsEnv,
       // `env` is the managed core's sanitized environment, not this Dashboard
       // process's: every probe must run inside it (no gateway credentials).
       isolatedProbeEnv: true,
+      // Same account boundary as the Feishu Dashboard for the saved selection:
+      // a Claude data root that only the worker can place (read isolation, a
+      // credential source) is not probed, and a CLI profile directory is read
+      // instead of the host's default one. Trying out another selection keeps
+      // probing in the sanitized environment, as before.
+      supportsModelDiscovery: () => context.canProbe || !savedSelection,
+      adapterFactory: (cliId, pathOverride) => createCliAdapterSync(cliId, pathOverride, { configDir: context.configDir }),
     });
   }
   private runtime(core: NonNullable<ReturnType<typeof parseWecomConfig>['managedCore']>) {
