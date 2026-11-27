@@ -34,6 +34,19 @@ describe('dispatch launch spec validation', () => {
       detectModels: async () => ['gpt-5.4'] })).resolves.toMatchObject({ ok: false, error: expect.stringContaining('不支持') });
   });
 
+  it('leaves Pi thinking session-local while allowing a classic dispatch model override', async () => {
+    const target = { cliId: 'pi' as const, model: 'provider/default', reasoningEffort: 'high' as const };
+    const detectModels = vi.fn(async () => ['provider/selected']);
+    const model = 'provider/selected';
+    await expect(resolveDispatchLaunchSpec({
+      requested: { model, reasoningEffort: 'high' }, target, detectModels,
+    })).resolves.toMatchObject({ ok: false });
+    expect(detectModels).not.toHaveBeenCalled();
+    await expect(resolveDispatchLaunchSpec({
+      requested: { model }, target, detectModels,
+    })).resolves.toEqual({ ok: true, requested: { model }, effective: { model } });
+  });
+
   it('fails closed on an unknown model or unavailable catalog', async () => {
     for (const detectModels of [async () => ['gpt-5.6-sol'], async () => null]) {
       await expect(resolveDispatchLaunchSpec({ requested: { model: 'gpt-nope', reasoningEffort: 'high' }, target, detectModels }))

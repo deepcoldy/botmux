@@ -418,6 +418,11 @@ export function createPiAdapter(
       // config only ever carries a level the service layer vouched for, but a
       // hand-edited bots.json must not leak a level Pi rejects onto argv.
       const thinking = reasoningEffort && piThinkingLevels.has(reasoningEffort) ? reasoningEffort : undefined;
+      // Pi may create a new conversation even on a requested resume. The
+      // extension sees the actual session it opened, including custom stores.
+      if (env && resume && thinking && !extraArgs?.includes('--thinking')) {
+        env.BOTMUX_PI_RESUME_FALLBACK_THINKING = thinking;
+      }
 
       return buildPiArgs({
         sessionId,

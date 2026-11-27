@@ -212,18 +212,15 @@ export async function resolveTopicSpec(header: TopicHeader, ctx: TopicSpecContex
       errors.push({ kind: 'effort_invalid', arg: effortArg });
     } else if (!isConfigurableReasoningCliId(botCfg.cliId)) {
       errors.push({ kind: 'effort_unsupported_cli', ...(botCfg.cliId ? { cliId: botCfg.cliId } : {}) });
-    } else if (botCfg.cliId === 'pi' && spec.model) {
-      // Pi resume 时从会话 transcript 还原 thinking（见 adapters/cli/pi.ts 的 resume 分支），
-      // 绑进 modelPin 的显式档位在恢复后无法落实。validateModelPin 已在 /modelpin、卡片与
-      // 容量回退入口拒绝同一组合，这里补上话题指令头入口。仅 /effort（不绑模型）不受影响：
-      // 它落 session.reasoningEffort，只在全新 spawn 经 --thinking 生效，与 Dashboard 默认档位等价。
-      errors.push({ kind: 'effort_pin_unsupported_cli', ...(botCfg.cliId ? { cliId: botCfg.cliId } : {}) });
     } else if ((botCfg.cliId !== 'traex' || !!spec.model) && !cliModelSupportsReasoningEffort(botCfg.cliId, effectiveModel, effortArg)) {
       errors.push({
         kind: 'effort_unsupported_model',
         effort: effortArg,
         ...(effectiveModel ? { model: effectiveModel } : {}),
       });
+    } else if (botCfg.cliId === 'pi' && spec.model) {
+      // 仅 /effort 是新会话的默认值。绑进 modelPin 的档位无法在 Pi 恢复时落实。
+      errors.push({ kind: 'effort_pin_unsupported_cli', cliId: botCfg.cliId });
     } else {
       spec.reasoningEffort = effortArg;
     }

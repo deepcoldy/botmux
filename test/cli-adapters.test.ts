@@ -34,6 +34,7 @@ import { busyProbeRegion } from '../src/utils/busy-probe.js';
 import { shouldWriteNow } from '../src/utils/input-gate.js';
 import { isTypeAheadBlockedByBypass, resolvePtyInputPolicy } from '../src/utils/pty-input-policy.js';
 import { TERMINAL_CANCEL_COOLDOWN_MS } from '../src/adapters/backend/critical-control-key.js';
+import { buildBotmuxEnvAssignments } from '../src/adapters/backend/tmux-backend.js';
 import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';
 import { createAidenAdapter } from '../src/adapters/cli/aiden.js';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
@@ -2495,6 +2496,38 @@ describe('pi buildArgs', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-pi', resume: true, reasoningEffort: 'high' });
     expect(args).not.toContain('--thinking');
     expect(args[args.indexOf('--session-id') + 1]).toBe('sess-pi');
+  });
+
+  it.each(['missing', 'present', 'removed after load'] as const)('handles Pi resume when the transcript is %s', (transcriptState) => {
+    const dir = mkdtempSync(join(tmpdir(), 'pi-resume-thinking-'));
+    const env: NodeJS.ProcessEnv = {};
+    try {
+      const sessionId = randomUUID();
+      const transcript = join(dir, `session_${sessionId}.jsonl`);
+      if (transcriptState === 'present') writeFileSync(transcript, JSON.stringify({ type: 'session', id: sessionId, cwd: dir }) + '\n');
+      // A predicted reattach can become a cold spawn if its pane disappears.
+      expect(adapter.buildArgs({ sessionId, resume: true, reattach: true, reasoningEffort: 'high', env })).not.toContain('--thinking');
+
+      const setThinkingLevel = vi.fn();
+      const ctx = { sessionManager: {
+        getSessionFile: () => transcript,
+        getEntries: () => transcriptState === 'removed after load' ? [{ type: 'message' }] : [],
+      } };
+      let start: ((event: { reason: string }, context: typeof ctx) => void) | undefined;
+      registerBotmuxTurnBoundaryExtension({
+        on: (name, handler) => { if (name === 'session_start') start = handler as typeof start; },
+        appendEntry: vi.fn(), setThinkingLevel,
+      });
+      const assignments = buildBotmuxEnvAssignments(env);
+      const marker = assignments.find(value => value.startsWith('BOTMUX_PI_RESUME_FALLBACK_THINKING='));
+      vi.stubEnv('BOTMUX_PI_RESUME_FALLBACK_THINKING', marker?.split('=')[1]);
+      start!({ reason: 'startup' }, ctx);
+      start!({ reason: 'new' }, ctx);
+      expect(setThinkingLevel.mock.calls).toEqual(transcriptState === 'missing' ? [['high']] : []);
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('never puts a level Pi rejects (ultra) on Pi argv and adds no override when unset', () => {

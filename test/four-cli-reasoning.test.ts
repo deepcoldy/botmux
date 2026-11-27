@@ -76,6 +76,12 @@ describe('four CLI reasoning observations', () => {
     expect(wire.patched.at(-1)?.reasoningEffort).toBeUndefined();
   });
 
+  it('does not display the saved Pi default as the resumed conversation’s thinking level', () => {
+    const state = { session: { cliId: 'pi', reasoningEffort: 'high' } } as DaemonSession;
+    const card = withCardRuntimeIdentity(state, { context: null, tokens: null });
+    expect(card.reasoningEffort).toBeUndefined();
+  });
+
   it('native process attestation retires the previous Grok display generation', () => {
     const state = ds('grok'); state.localProcessAttestation = { cliSpawnGeneration: 1 } as any;
     const handle = loadWorkerPoolMessageHandlers(['native_reasoning', 'local_process_attestation'], {

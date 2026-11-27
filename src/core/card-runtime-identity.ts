@@ -25,10 +25,10 @@ export function withCardRuntimeIdentity(
   // Antigravity reports effort only over ACP. Its default terminal transport
   // has no observation channel, so without an ACP reading it keeps showing the
   // configured launch effort exactly as before.
-  const strictEffort = ['claude-code', 'codex', 'traex', 'grok'].includes(effectiveCliId ?? '')
+  const strictEffort = ['claude-code', 'codex', 'traex', 'grok', 'pi'].includes(effectiveCliId ?? '')
     || (effectiveCliId === 'antigravity' && candidate?.cliId === 'antigravity');
   // CLI-local settings can change independently of the frozen launch preference.
-  // The explicitly observed CLIs never show an unlabelled launch effort.
+  // Suppress the saved default where it doesn't represent the live effort.
   const reasoningEffort = (effectiveCliId !== 'grok' ? ds.activeReasoningEffort?.trim() : undefined)
     || (!strictEffort ? ds.session.reasoningEffort?.trim() : undefined);
   const remoteRunner = (ds.initConfig?.backendType ?? ds.session.backendType) === 'remote-runner';

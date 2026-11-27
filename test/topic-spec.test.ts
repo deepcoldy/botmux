@@ -184,7 +184,9 @@ describe('resolveTopicSpec —— /effort 的拒绝分支', () => {
     // 非法档位仍优先报 effort_invalid，不被新分支吞掉。
     expect(errorKinds(await resolve('/t /model provider/new /effort turbo 干活', PI)))
       .toEqual(['effort_invalid']);
-    // ultra 不在 Pi 的五档交集里，effort-only 也拒绝。
+    // 档位不受支持时优先报告具体档位，和 effort-only 的诊断一致。
+    expect(errorKinds(await resolve('/t /model provider/new /effort ultra 干活', PI)))
+      .toEqual(['effort_unsupported_model']);
     expect(errorKinds(await resolve('/t /effort ultra 干活', PI))).toEqual(['effort_unsupported_model']);
   });
 });
