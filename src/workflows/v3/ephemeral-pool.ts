@@ -405,7 +405,10 @@ async function runNodeImpl(
   const generation = (controller?.store.read(controller.ref)?.worker?.generation ?? 0) + 1;
   const bootstrap = controller?.bindWorker(generation);
   const execution = controller?.admitInput(req.attemptId, undefined, req.attemptId);
-  const scopedInit = bootstrap ? { ...init, sessionContract: bootstrap, sessionCommand: { version: 2 as const, execution } } : init;
+  // The empty init starts the CLI before the goal is dispatched. Attaching the
+  // queued execution here would tag prompt_ready with an as-yet unbound turn.
+  // Its execution scope belongs on raw_input in sendGoalIfReady().
+  const scopedInit = bootstrap ? { ...init, sessionContract: bootstrap } : init;
   const goalBinding = req.botSnapshot.cliInstanceBinding?.source === 'goal'
     ? req.botSnapshot.cliInstanceBinding
     : undefined;

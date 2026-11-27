@@ -20647,6 +20647,18 @@ async function cmdSessionReady(): Promise<void> {
     if (p && typeof p.session_id === 'string') nativeSessionId = p.session_id;
   } catch { /* 非 JSON / 空 → 不带 source */ }
 
+  // v3 workflow worker 没有 daemon 会话记录，daemon 路由会静默丢弃信号；worker
+  // 为本次 spawn 注入了本地通道时直接交给它（见 utils/session-ready-local-signal.ts）。
+  // 通道不可用（env 缺失/目录不私有/写失败）时退回原 daemon 路由。
+  // 与 daemon 路由同构：等 worker 跑完 handler 的 ack（上限 2s，超时 fail-open），
+  // 保证 Claude 在 hook 退出后才画出的提示符落在 SessionStart 边界之后。
+  const { writeLocalSessionReadySignal, waitForLocalSessionReadyAck } = await import('./utils/session-ready-local-signal.js');
+  const localSignalId = writeLocalSessionReadySignal(process.env, source);
+  if (localSignalId) {
+    await waitForLocalSessionReadyAck(process.env, localSignalId, 2_000);
+    process.exit(0);
+  }
+
   await postSessionScopedSignal('/api/session-ready', { source, nativeSessionId });
   process.exit(0);
 }

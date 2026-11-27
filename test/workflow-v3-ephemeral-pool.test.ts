@@ -1790,7 +1790,10 @@ class ScriptedWorker extends EventEmitter implements WorkerHandle {
 
   emitMessage(msg: unknown): void {
     const binding = this.contractScope?.currentBinding();
-    this.emit('message', binding && this.contractScope ? { ...(msg as any), sessionContract: this.contractScope.envelope({ bindingId: binding.bindingId, runtime: binding.runtime }) } : msg);
+    // Startup timers capture the execution supplied with init, just as spawnCli does.
+    const execution = (msg as any).type === 'prompt_ready' ? this.init?.sessionCommand?.execution : undefined;
+    const origin = binding && { bindingId: binding.bindingId, runtime: binding.runtime, execution };
+    this.emit('message', this.contractScope && origin ? { ...(msg as any), sessionContract: this.contractScope.envelope(origin) } : msg);
   }
 
   emitExit(code: number | null): void {
