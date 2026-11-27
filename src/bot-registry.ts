@@ -3751,10 +3751,11 @@ function resolveBotConfigPath(): string {
     statSync(defaultPath);
   } catch (err: any) {
     if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') {
-      // stat() follows symlinks: a bots.json link whose target moved, or a
-      // config directory that is itself a dangling link, is a broken
-      // configuration, not an absent one.
-      if (pathEntryExists(defaultPath) || danglingEntry(dirname(defaultPath))) {
+      // Only a truly absent file under an absent-or-real config directory is
+      // "no configuration". ENOTDIR (the config dir is a file, or a link to
+      // one), a bots.json link whose target moved, and a config dir that is a
+      // dangling link are all broken configurations.
+      if (!defaultConfigProvenAbsent(defaultPath, err.code)) {
         throw new BotConfigLoadError('unreadable', defaultPath, err.code, err);
       }
       throw new BotConfigNotFoundError(
@@ -3810,13 +3811,16 @@ function pathEntryExists(path: string): boolean {
   }
 }
 
-/** A directory entry exists (lstat) but what it points at does not (stat
- *  ENOENT/ENOTDIR): a dangling symlink. Other stat errors are read faults. */
-function danglingEntry(path: string): boolean {
-  if (!pathEntryExists(path)) return false;
-  try { statSync(path); return false; } catch (err: any) {
-    if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') return true;
-    throw botConfigAccessError(path, err);
+/** stat(file) said ENOENT/ENOTDIR: true only when the file entry is absent
+ *  and its directory is absent or a real directory. Read faults on the way
+ *  (EACCES, EIO, …) throw. */
+function defaultConfigProvenAbsent(file: string, statCode: string): boolean {
+  if (statCode !== 'ENOENT' || pathEntryExists(file)) return false;
+  const dir = dirname(file);
+  if (!pathEntryExists(dir)) return true;
+  try { return statSync(dir).isDirectory(); } catch (err: any) {
+    if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') return false;
+    throw botConfigAccessError(dir, err);
   }
 }
 

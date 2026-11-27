@@ -7,6 +7,7 @@
 // the data-dir fence instead of touching live botmux data (see the helper).
 import './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { resolve as resolvePath } from 'node:path';
 
 // ─── Mocks ────────────────────────────────────────────────────────────────
 
@@ -2865,6 +2866,9 @@ describe('loadBotConfigs when bots.json exists but is unreadable', () => {
   });
 });
 
+// resolve() as the loader does: drive letter and backslashes on Windows.
+const PINNED_BOTS_CONFIG = resolvePath('pinned', 'bots.json');
+
 describe('default bots.json path is decided by statSync()', () => {
   let mod: Awaited<ReturnType<typeof freshImport>>;
   let fs: typeof import('node:fs');
@@ -2886,9 +2890,17 @@ describe('default bots.json path is decided by statSync()', () => {
     vi.mocked(fs.readFileSync).mockReturnValue('' as never);
   });
 
-  it.each(['ENOENT', 'ENOTDIR'])('reports "no configuration" when the file is proven absent (%s)', (code) => {
-    vi.mocked(fs.statSync).mockImplementation(() => { throw fsError(code); });
+  it('reports "no configuration" when the file is proven absent (ENOENT)', () => {
+    vi.mocked(fs.statSync).mockImplementation(() => { throw fsError('ENOENT'); });
     expect(() => mod.loadBotConfigs()).toThrow(mod.BotConfigNotFoundError);
+  });
+
+  it('reports ENOTDIR (the config directory is not a directory) as unreadable, not "no configuration"', () => {
+    vi.mocked(fs.statSync).mockImplementation(() => { throw fsError('ENOTDIR'); });
+    let failure: unknown;
+    try { mod.loadBotConfigsCached({ strictRead: true }); } catch (err) { failure = err; }
+    expect(failure).toBeInstanceOf(mod.BotConfigLoadError);
+    expect(failure).toMatchObject({ reason: 'unreadable', code: 'ENOTDIR' });
   });
 
   it.each(['EACCES', 'EPERM'])('surfaces %s on the config path instead of "no configuration"', (code) => {
@@ -2900,9 +2912,9 @@ describe('default bots.json path is decided by statSync()', () => {
   });
 
   it.each(['EACCES', 'EPERM'])('reports %s on a pinned BOTS_CONFIG as a permission fault without falling back', (code) => {
-    process.env.BOTS_CONFIG = '/pinned/bots.json';
+    process.env.BOTS_CONFIG = PINNED_BOTS_CONFIG;
     vi.mocked(fs.statSync).mockImplementation((path: unknown) => {
-      if (String(path) === '/pinned/bots.json') throw fsError(code);
+      if (String(path) === PINNED_BOTS_CONFIG) throw fsError(code);
       return { mtimeMs: 0 } as never;
     });
     vi.mocked(fs.readFileSync).mockReturnValue(JSON.stringify([
@@ -2912,7 +2924,7 @@ describe('default bots.json path is decided by statSync()', () => {
       let failure: unknown;
       try { load(); } catch (err) { failure = err; }
       expect(failure).toBeInstanceOf(mod.BotConfigLoadError);
-      expect(failure).toMatchObject({ reason: 'permission_denied', code, path: '/pinned/bots.json' });
+      expect(failure).toMatchObject({ reason: 'permission_denied', code, path: PINNED_BOTS_CONFIG });
     }
   });
 
@@ -2926,13 +2938,13 @@ describe('default bots.json path is decided by statSync()', () => {
   });
 
   it.each(['ENOENT', 'ENOTDIR'])('keeps the errno of a pinned BOTS_CONFIG that is gone (%s) for a strict reader', (code) => {
-    process.env.BOTS_CONFIG = '/pinned/bots.json';
+    process.env.BOTS_CONFIG = PINNED_BOTS_CONFIG;
     vi.mocked(fs.statSync).mockImplementation(() => { throw fsError(code); });
     expect(() => mod.loadBotConfigs()).toThrow(/BOTS_CONFIG file not found/);
     let failure: unknown;
     try { mod.loadBotConfigsCached({ strictRead: true }); } catch (err) { failure = err; }
     expect(failure).toBeInstanceOf(mod.BotConfigLoadError);
-    expect(failure).toMatchObject({ reason: 'unreadable', code, path: '/pinned/bots.json' });
+    expect(failure).toMatchObject({ reason: 'unreadable', code, path: PINNED_BOTS_CONFIG });
   });
 
   it('loads a file that a stat proves present even though existsSync() said no', () => {
