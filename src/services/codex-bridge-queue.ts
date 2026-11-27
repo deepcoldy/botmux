@@ -375,6 +375,11 @@ export class CodexBridgeQueue {
   private wholeInputTimestampGranularityMs = 1;
   private bufferedUnmatched: CodexBridgeEvent[] = [];
   private readonly ambiguousSoftNewlineInputs = new WeakSet<NonNullable<CodexBridgeEvent['softNewlineInput']>>();
+  /** Drop conflict observed at least once while this input was being ingested.
+   * Unlike an ambiguous verdict, this does NOT suppress a later raw-exact retry.
+   * It is consulted only when the stripped candidate tries to claim a turn, so
+   * buffered replay cannot lose the conflict to tombstone expiry or eviction. */
+  private readonly softNewlineObservedDropConflicts = new WeakSet<NonNullable<CodexBridgeEvent['softNewlineInput']>>();
   private readonly recentlyDroppedInputs: Array<{ hashes: readonly string[]; droppedAtMs: number }> = [];
   private lastClosedAssistantFinalTimeMs: number | undefined;
   /** Lower bound (ms) for synthesising local turns — protects against a
@@ -433,25 +438,36 @@ export class CodexBridgeQueue {
     return stripped !== undefined && wholeInputHash(stripped) === turn.wholeInputHash;
   }
 
-  /** Match a transport-rewritten input to the FIFO head. The original
-   * record may instead be a later mark with a literal line-ending backslash. */
-  private matchSoftNewlineInput(turn: CodexPendingTurn, event: CodexBridgeEvent): 'matched' | 'ambiguous' | undefined {
-    const candidate = event.softNewlineInput?.candidate;
-    if (!candidate || event.inputTextAliases !== undefined || !this.matchesWholeInput(turn, candidate)) return undefined;
+  /** Snapshot drop evidence while it is observable. The verdict remains
+   * deferred: a raw-exact retry may still own the record, but a later soft
+   * candidate match must not reinterpret it after the evidence ring expires. */
+  private observeSoftNewlineDropConflict(event: CodexBridgeEvent): void {
+    const input = event.softNewlineInput;
+    if (!input || event.inputTextAliases !== undefined || this.softNewlineObservedDropConflicts.has(input)) return;
     const original = normaliseForFingerprint(event.text);
-    const competingMark = this.queue.some(other => other !== turn && !other.started && other.finalText === undefined
-      && (other.markTimeMs === undefined || event.timestampMs >= other.markTimeMs - UNMATCHED_REPLAY_WINDOW_MS)
-      && this.matchesWholeInput(other, original));
-    if (competingMark) return 'ambiguous';
     const originalHashes = [wholeInputHash(original)];
     if (CORRELATION_TRAILER_RE.test(original)) {
       originalHashes.push(wholeInputHash(original.replace(CORRELATION_TRAILER_RE, '')));
     }
     const nowMs = this.now();
-    const competingDrop = this.recentlyDroppedInputs.some(({ hashes, droppedAtMs }) =>
+    const conflictObserved = this.recentlyDroppedInputs.some(({ hashes, droppedAtMs }) =>
       nowMs - droppedAtMs <= CURSOR_BUSY_REFRESH_MAX_MS + STRUCTURED_SUBMIT_START_GRACE_MS
       && hashes.some(hash => originalHashes.includes(hash)));
-    return competingDrop ? 'ambiguous' : 'matched';
+    if (conflictObserved) this.softNewlineObservedDropConflicts.add(input);
+  }
+
+  /** Match a transport-rewritten input to the FIFO head. The original
+   * record may instead be a later mark with a literal line-ending backslash. */
+  private matchSoftNewlineInput(turn: CodexPendingTurn, event: CodexBridgeEvent): 'matched' | 'ambiguous' | undefined {
+    const input = event.softNewlineInput;
+    const candidate = input?.candidate;
+    if (!input || !candidate || event.inputTextAliases !== undefined || !this.matchesWholeInput(turn, candidate)) return undefined;
+    const original = normaliseForFingerprint(event.text);
+    const competingMark = this.queue.some(other => other !== turn && !other.started && other.finalText === undefined
+      && (other.markTimeMs === undefined || event.timestampMs >= other.markTimeMs - UNMATCHED_REPLAY_WINDOW_MS)
+      && this.matchesWholeInput(other, original));
+    if (competingMark) return 'ambiguous';
+    return this.softNewlineObservedDropConflicts.has(input) ? 'ambiguous' : 'matched';
   }
 
   /** A mark the CLI may still deliver: never passed over. */
@@ -1562,6 +1578,7 @@ export class CodexBridgeQueue {
       return;
     }
     if (ev.kind === 'user') {
+      this.observeSoftNewlineDropConflict(ev);
       const messageKey = this.nativeUserMessageKey(ev);
       if (messageKey && this.seenNativeUserMessages.has(messageKey)) return;
       // task_started can precede the response_item/user by well over the

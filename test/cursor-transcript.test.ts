@@ -544,6 +544,17 @@ describe('cursor bridge attribution across footer rewrites (drain + CodexBridgeQ
     return q.drainEmittable().map(t => `${t.turnId}:${t.finalText}`);
   }
 
+  function ingestRawPty(q: CodexBridgeQueue): () => void {
+    let offset = 0;
+    let state: unknown;
+    return () => {
+      const result = cursorBridgeSpec.drain(path, offset, { ...rawPtyContext, state });
+      offset = result.newOffset;
+      state = result.state;
+      q.ingest(result.events);
+    };
+  }
+
   it('zero-prompt fresh spawn: every turn starts and closes, not just the first', () => {
     const q = new CodexBridgeQueue();
     let offset = 0; // fresh-empty attach
@@ -661,6 +672,81 @@ describe('cursor bridge attribution across footer rewrites (drain + CodexBridgeQ
     writeCursorTurn(path, turnBody(clean, 'successor answer'));
     q.ingest(cursorBridgeSpec.drain(path, first.newOffset, rawPtyContext).events);
     expect(emittedFinals(q)).toEqual(['successor:successor answer']);
+  });
+
+  it('does not reassign a buffered literal turn after its drop evidence expires', () => {
+    let now = Date.now();
+    const startedAt = now;
+    const q = new CodexBridgeQueue(() => now);
+    const ingest = ingestRawPty(q);
+    const literal = '<task>\\\nRead the example project.';
+    const clean = '<task>\nRead the example project.';
+    q.mark('unrelated', 'A completely unrelated head prompt.');
+    q.mark('cancelled', literal);
+    q.mark('successor', clean);
+    expect(q.dropPendingTurn('cancelled')).toMatchObject({ turnId: 'cancelled' });
+
+    now = startedAt + 1_000;
+    writeCursorTurn(path, turnBody(literal, 'buffered literal answer'));
+    ingest();
+    expect(emittedFinals(q)).toEqual([]);
+    expect(q.peek().map(turn => turn.turnId)).toEqual(['unrelated', 'successor']);
+
+    for (let elapsed = 20_000; elapsed <= CURSOR_BUSY_REFRESH_MAX_MS; elapsed += 20_000) {
+      now = startedAt + elapsed;
+      q.refreshUnstartedHeadAttributionLease(now, CURSOR_BUSY_REFRESH_MAX_MS);
+    }
+    now = startedAt + CURSOR_BUSY_REFRESH_MAX_MS + STRUCTURED_SUBMIT_START_GRACE_MS + 1;
+    const dropped = q.pruneExpiredPreStartHeads(now);
+    expect(emittedFinals(q)).toEqual([]);
+    expect(dropped.map(turn => turn.turnId)).toEqual(['unrelated', 'successor']);
+    expect(dropped.every(turn => !turn.started && turn.finalText === undefined)).toBe(true);
+    expect(q.peek()).toEqual([]);
+  });
+
+  it('does not reassign a buffered literal turn after its drop evidence is evicted', () => {
+    let now = Date.now();
+    const q = new CodexBridgeQueue(() => now);
+    const ingest = ingestRawPty(q);
+    const literal = '<task>\\\nRead the example project.';
+    const clean = '<task>\nRead the example project.';
+    q.mark('unrelated', 'A completely unrelated head prompt.');
+    q.mark('cancelled', literal);
+    q.mark('successor', clean);
+    for (let i = 0; i < 20; i++) q.mark(`other-${i}`, `Other pending prompt ${i}.`);
+    expect(q.dropPendingTurn('cancelled')).toMatchObject({ turnId: 'cancelled' });
+
+    now += 1_000;
+    writeCursorTurn(path, turnBody(literal, 'buffered literal answer'));
+    ingest();
+    expect(emittedFinals(q)).toEqual([]);
+    for (let i = 0; i < 20; i++) {
+      expect(q.dropPendingTurn(`other-${i}`)).toMatchObject({ turnId: `other-${i}` });
+      expect(emittedFinals(q)).toEqual([]);
+    }
+    expect(q.dropPendingTurn('unrelated')).toMatchObject({ turnId: 'unrelated' });
+    expect(emittedFinals(q)).toEqual([]);
+    expect(q.peek()).toEqual([expect.objectContaining({ turnId: 'successor', started: false })]);
+
+    writeCursorTurn(path, turnBody(clean, 'clean successor answer'));
+    ingest();
+    expect(emittedFinals(q)).toEqual(['successor:clean successor answer']);
+  });
+
+  it('allows a raw-exact literal retry after observing its cancelled predecessor conflict', () => {
+    const q = new CodexBridgeQueue();
+    const ingest = ingestRawPty(q);
+    const literal = '<task>\\\nRead the example project.';
+    q.mark('unrelated', 'A completely unrelated head prompt.');
+    q.mark('cancelled', literal);
+    expect(q.dropPendingTurn('cancelled')).toMatchObject({ turnId: 'cancelled' });
+    q.mark('retry', literal);
+
+    writeCursorTurn(path, turnBody(literal, 'literal retry answer'));
+    ingest();
+    expect(emittedFinals(q)).toEqual([]);
+    expect(q.dropPendingTurn('unrelated')).toMatchObject({ turnId: 'unrelated' });
+    expect(emittedFinals(q)).toEqual(['retry:literal retry answer']);
   });
 
   it.each([
