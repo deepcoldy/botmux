@@ -32997,7 +32997,9 @@ async function flushPending(): Promise<void> {
       } catch (err: any) {
         if (lateScheduledHold && !normalWritePrepared) {
           if (lateScheduledHold === 'reject') discardUnwrittenScheduledInput(item);
-          else pendingMessages.unshift(item);
+          // Deferred-preparation adapters (Codex) keep the item queued until
+          // beforeSubmit, so a write-edge retain finds it still in place.
+          else if (!pendingMessages.includes(item)) pendingMessages.unshift(item);
           keepPromptReadyAfterHold();
           if (lateScheduledHold === 'reject') continue;
           break;
