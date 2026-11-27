@@ -490,7 +490,7 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
       return dependencies.get(key);
     }
     if (key === 'traexQuestionFlowVisible') return traexQuestionFlowVisible;
-    if (typeof key === 'string' && ['nativeInstantInputCaller', 'settleNativeInstantSupersededTurns', 'bindNativeInstantPendingRecovery',
+    if (typeof key === 'string' && ['nativeInstantInputCaller', 'settleNativeInstantSupersededTurns', 'bindNativeInstantPendingRecovery', 'nativeInstantRolloutFileIdentity',
       'traexNativeInstantInputEnabled', 'traexNativeInstantInputEligible', 'traexNativeInstantComposerReady',
       'traexPersistentReattachBusyComposerFence', 'traexPersistentReattachSteeringFence'].includes(key)) {
       if (!dependencies.has(key)) dependencies.set(key, loadWorkerFunction(key, scope));

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { appendFileSync, mkdtempSync, rmSync, writeFileSync, statSync, existsSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, rmSync, writeFileSync, statSync, existsSync, symlinkSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { drainTraexRollout } from '../src/services/traex-transcript.js';
@@ -15,6 +15,7 @@ import { terminalReleasesDurableTurn } from '../src/utils/pending-input-queue.js
 import { bindNativeInstantPendingTurns, checkpointNativeInstantPendingTurn, checkpointCodexAdoptTurns, restoreCodexAdoptTurns } from '../src/services/codex-adopt-recovery.js';
 import { planBridgeTurnRecovery, readBridgeTurnJournal, selectRestorableBridgeTurns, writeBridgeTurnJournal } from '../src/services/bridge-turn-journal.js';
 import { baselineJsonlCursor } from '../src/services/jsonl-cursor.js';
+import { canonicalPathNearest } from '../src/core/cli-identity.js';
 
 const SID = '00000000-0000-7000-8000-000000000001';
 const NATIVE = '00000000-0000-7000-8000-000000000002';
@@ -66,7 +67,7 @@ function nativeMarkHarness() {
     structuredBridgeRecoveryCursorAtMark: () => ({ jsonlPath: path, offsetAtMark: 0 }),
     checkpointCodexAdoptRecovery: vi.fn(), checkpointCodexAdoptTurns,
     checkpointNativeInstantPendingTurn, bindNativeInstantPendingTurns, readBridgeTurnJournal, restoreCodexAdoptTurns,
-    planBridgeTurnRecovery, statSync, drainTraexRollout,
+    planBridgeTurnRecovery, statSync, drainTraexRollout, canonicalPathNearest,
     structuredBridgeJournalPath: () => journal, structuredBridgeRecoveryAttempted: false,
     codexBridgeRolloutPath: undefined, codexBridgeOffset: 0, traexQuotaPending: undefined,
     lastSpawnPersistentReattach: false, traexNativeInstantInputEnabled: () => true,
@@ -79,12 +80,37 @@ function nativeMarkHarness() {
   });
   h.scope.checkpointStructuredBridgeRecovery = loadWorkerFunction('checkpointStructuredBridgeRecovery', h.scope);
   h.scope.bindNativeInstantPendingRecovery = loadWorkerFunction('bindNativeInstantPendingRecovery', h.scope);
+  h.scope.nativeInstantRolloutFileIdentity = loadWorkerFunction('nativeInstantRolloutFileIdentity', h.scope);
   h.scope.codexBridgeAttach = loadWorkerFunction('codexBridgeAttach', h.scope);
   const mark = loadWorkerFunction('codexBridgeMarkPendingTurn', h.scope);
   return { ...h, owner, journal, mark };
 }
 
 describe('TRAE messages merged into one native turn', () => {
+  it.each(['same file alias', 'different inode'] as const)('binds the actual owned rollout through %s without relaxing native identity', variant => {
+    const h = nativeMarkHarness();
+    h.scope.findTraexRolloutSetByPid = () => new Set();
+    h.scope.findTraexRolloutByPid = () => undefined;
+    h.scope.structuredBridgeRecoveryCursorAtMark = () => undefined;
+    h.mark('Task', 'om_first', undefined, START, undefined, undefined, h.owner);
+    h.scope.codexBridgeQueue = new CodexBridgeQueue(() => START + 1_000);
+    append(input('Task', 'first'));
+    const aliasDir = join(dir, 'alias');
+    const otherDir = join(dir, 'other');
+    symlinkSync(dir, aliasDir, 'dir');
+    mkdirSync(otherDir);
+    const name = path.slice(path.lastIndexOf('/') + 1);
+    const ownedPath = variant === 'same file alias' ? join(aliasDir, name) : join(otherDir, name);
+    if (variant === 'different inode') writeFileSync(ownedPath, '');
+    h.scope.findTraexRolloutSetByPid = () => new Set([SID]);
+    h.scope.findTraexRolloutByPid = () => ({ path: ownedPath, cliSessionId: SID });
+    vi.spyOn(Date, 'now').mockReturnValue(START + 1_000);
+    try { h.scope.bindNativeInstantPendingRecovery(path); } finally { vi.restoreAllMocks(); }
+    const [entry] = readBridgeTurnJournal(h.journal);
+    expect(entry.jsonlPath).toBe(variant === 'same file alias' ? path : '');
+    expect(h.scope.codexBridgeQueue.peek()[0]?.exactUserInputMatch).toBe(variant === 'same file alias' ? true : undefined);
+  });
+
   it('retains a pre-path root through actual empty attach checkpoint and binds its later User before the correction mark', () => {
     const h = nativeMarkHarness();
     h.scope.findTraexRolloutSetByPid = () => new Set();

@@ -20665,29 +20665,37 @@ function structuredBridgeRecoveryCursorAtMark(): { jsonlPath: string; offsetAtMa
 /** A first User can create the rollout after its pre-paste mark. Bind that
  * admission journal only at the existing owned-file attach boundary. */
 function bindNativeInstantPendingRecovery(rolloutPath: string): void {
-  if (!traexNativeInstantInputEnabled()) return;
   const journal = structuredBridgeJournalPath();
   const pending = journal ? readBridgeTurnJournal(journal).filter(entry => !!entry.nativeInstantPendingProcess) : [];
   if (!journal || !pending.length) return;
+  const instantEnabled = traexNativeInstantInputEnabled();
   const cfg = lastInitConfig, target = backend, adapter = cliAdapter;
   const generation = cliSpawnGeneration, lifetime = cliLifetimeNonce, interrupt = cliInterruptGeneration;
   const pid = currentTraexObservedPid();
   const birth = pid ? readProcessStartIdentity(pid) : undefined;
   const owned = pid ? findTraexRolloutSetByPid(pid) : undefined;
   const rollout = pid && owned?.size === 1 ? findTraexRolloutByPid(pid) : undefined;
-  if (!pid || !birth || !rollout || rollout.path !== rolloutPath || !owned?.has(rollout.cliSessionId.toLowerCase())) return;
+  if (!instantEnabled) return;
+  const selectedFile = rollout ? nativeInstantRolloutFileIdentity(rollout.path) : undefined;
+  const targetFile = nativeInstantRolloutFileIdentity(rolloutPath);
+  const sameFile = (left: typeof selectedFile, right: typeof targetFile): boolean =>
+    !!left && !!right && left.path === right.path && left.dev === right.dev && left.ino === right.ino;
+  if (!pid || !birth || !rollout || !sameFile(selectedFile, targetFile) || !owned?.has(rollout.cliSessionId.toLowerCase())) return;
   const current = (): boolean => {
     const currentOwned = findTraexRolloutSetByPid(pid);
     const selected = currentOwned?.size === 1 ? findTraexRolloutByPid(pid) : undefined;
     return cfg === lastInitConfig && target === backend && adapter === cliAdapter
       && generation === cliSpawnGeneration && lifetime === cliLifetimeNonce && interrupt === cliInterruptGeneration
       && !cliRestartInProgress && currentTraexObservedPid() === pid && readProcessStartIdentity(pid) === birth
-      && traexNativeInstantInputEnabled() && selected?.path === rolloutPath
+      && traexNativeInstantInputEnabled() && selected?.path === rollout.path
+      && sameFile(nativeInstantRolloutFileIdentity(selected.path), selectedFile)
+      && sameFile(nativeInstantRolloutFileIdentity(rolloutPath), targetFile)
       && selected.cliSessionId === rollout.cliSessionId && currentOwned?.has(rollout.cliSessionId.toLowerCase()) === true;
   };
   let size: number;
   try { size = statSync(rolloutPath).size; } catch { return; }
-  if (planBridgeTurnRecovery(pending, size).kind !== 'recover') return;
+  const recoveryPlan = planBridgeTurnRecovery(pending, size);
+  if (recoveryPlan.kind !== 'recover') return;
   const events = drainTraexRollout(rolloutPath, 0, { probe: true }).events;
   const bound = bindNativeInstantPendingTurns(journal, rolloutPath, codexBridgeQueue, pid, birth, rollout.cliSessionId, events, Date.now(), current);
   if (bound) {
@@ -20700,6 +20708,17 @@ function bindNativeInstantPendingRecovery(rolloutPath: string): void {
     codexBridgeQueue.ingest(recovery.live);
     if (recovery.restored) log(`TRAE native instant pending recovery restored ${recovery.restored} root(s)`);
   }
+}
+
+/** A shortened session-temp path and procfs fd path can name the same file.
+ * Canonical path plus inode/device rejects a reused symlink or same basename. */
+function nativeInstantRolloutFileIdentity(path: string): { path: string; dev: number; ino: number } | undefined {
+  try {
+    const canonical = canonicalPathNearest(path);
+    const file = statSync(path);
+    if (!file.isFile()) return;
+    return { path: canonical, dev: file.dev, ino: file.ino };
+  } catch { return; }
 }
 
 function codexBridgeMarkPendingTurn(
@@ -20736,17 +20755,22 @@ function codexBridgeMarkPendingTurn(
     const birth = pid ? readProcessStartIdentity(pid) : undefined;
     const owned = pid ? findTraexRolloutSetByPid(pid) : undefined;
     const rollout = pid && owned?.size === 1 ? findTraexRolloutByPid(pid) : undefined;
-    if (pid && birth && rollout && owned?.has(rollout.cliSessionId.toLowerCase())) {
+    const file = rollout ? nativeInstantRolloutFileIdentity(rollout.path) : undefined;
+    if (pid && birth && rollout && file && owned?.has(rollout.cliSessionId.toLowerCase())) {
       codexBridgeAttach(rollout.path, 'fresh-empty');
       const stillOwned = findTraexRolloutSetByPid(pid);
       const stillRollout = stillOwned?.size === 1 ? findTraexRolloutByPid(pid) : undefined;
+      const attachedFile = codexBridgeRolloutPath ? nativeInstantRolloutFileIdentity(codexBridgeRolloutPath) : undefined;
+      const currentFile = stillRollout ? nativeInstantRolloutFileIdentity(stillRollout.path) : undefined;
       if (lastInitConfig !== cfg || backend !== target || cliAdapter !== adapter
         || cliSpawnGeneration !== generation || cliLifetimeNonce !== lifetime
         || cliInterruptGeneration !== interrupt || cliRestartInProgress
         || lastSpawnPersistentReattach || cfg?.resume || currentTraexObservedPid() !== pid
         || readProcessStartIdentity(pid) !== birth || !traexNativeInstantInputEnabled()
-        || codexBridgeRolloutPath !== rollout.path || stillRollout?.path !== rollout.path
-        || stillRollout.cliSessionId !== rollout.cliSessionId
+        || !attachedFile || !currentFile || attachedFile.path !== file.path || currentFile.path !== file.path
+        || attachedFile.dev !== file.dev || attachedFile.ino !== file.ino
+        || currentFile.dev !== file.dev || currentFile.ino !== file.ino
+        || stillRollout?.cliSessionId !== rollout.cliSessionId
         || !stillOwned?.has(rollout.cliSessionId.toLowerCase())) {
         throw new SubmissionWriteError('Native TRAE root identity changed during rollout binding', undefined, false);
       }
