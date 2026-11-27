@@ -22,6 +22,7 @@
 import { randomUUID } from 'node:crypto';
 import type { TrustedCaller } from '../types.js';
 import type { DaemonSession } from './types.js';
+import { advancePendingStreamingCardTurn } from './streaming-card-post-slot.js';
 import { prepareHookEnvelopeForReplay } from './prompt-hook-replay.js';
 import * as sessionStore from '../services/session-store.js';
 import {
@@ -258,7 +259,7 @@ export async function handleOrdinaryRecoveryRetryClick(
   );
   // Same live-card hand-off as the other retry buttons: the card shows work.
   ds.lastScreenStatus = 'working';
-  ds.streamCardPending = true;
+  advancePendingStreamingCardTurn(ds);
   ds.currentTurnTitle = (result.record.task || ds.currentTurnTitle || ds.session.title || '').substring(0, 50);
   ds.currentImageKey = undefined;
   try { persistStreamCardState(ds); } catch { /* card bookkeeping is best effort */ }

@@ -13036,16 +13036,17 @@ let thinkingCapNoted = false;
 
 /** Whether an entry has the fields its kind promises. Entries are parsed from
  *  CLI transcripts, so the type is not a guarantee: a missing string would throw
- *  in `cotEntryChars`, and an unknown kind would make the running total NaN and
- *  switch off the accumulated cap. */
+ *  in `cotEntryChars`, an unknown kind would make the running total NaN and
+ *  switch off the accumulated cap, and a tool entry's `id` pairs a call with its
+ *  result downstream (`publicReplyCardTools`). */
 function cotEntryWellFormed(entry: CotEntry): boolean {
   const e = entry as Partial<Record<string, unknown>> | null;
   switch (e?.kind) {
     case 'thinking':
     case 'text': return typeof e.text === 'string';
-    case 'tool_call': return typeof e.name === 'string' && typeof e.args === 'string'
+    case 'tool_call': return typeof e.id === 'string' && typeof e.name === 'string' && typeof e.args === 'string'
       && (e.subject === undefined || typeof e.subject === 'string');
-    case 'tool_result': return typeof e.result === 'string';
+    case 'tool_result': return typeof e.id === 'string' && typeof e.result === 'string';
     default: return false;
   }
 }
@@ -13095,12 +13096,17 @@ function cotEntryWithoutSentinel(entry: CotEntry): CotEntry | null {
 }
 
 function observeCotEntries(entries: readonly CotEntry[], turn: { turnId: string; dispatchAttempt?: number }): void {
-  if (entries.length === 0) return;
+  // Malformed entries are dropped before anything reads them: counting one would
+  // throw out of the transcript drain and lose the rest of the turn's activity,
+  // and the progress signal below reads the last entry's kind. A batch with no
+  // well-formed entry is no observed activity.
+  const wellFormed = entries.filter(cotEntryWellFormed);
+  if (wellFormed.length === 0) return;
   // Independent of the capped/display-only CoT buffer. No text, args or results
   // leave this signal; terminal spinners and process heartbeats never count.
   if (lastInitConfig?.cliId === 'traex'
     || (lastInitConfig?.cliId === 'codex' && lastInitConfig.noProgressNotify?.cliEnabled === true)) {
-    const last = entries[entries.length - 1];
+    const last = wellFormed[wellFormed.length - 1];
     send({ type: 'turn_progress', turnId: turn.turnId,
       ...(turn.dispatchAttempt === undefined ? {} : { dispatchAttempt: turn.dispatchAttempt }),
       stage: last.kind === 'tool_call' ? 'tool_started'
@@ -13110,10 +13116,7 @@ function observeCotEntries(entries: readonly CotEntry[], turn: { turnId: string;
   // exists, so `bridge-fallback-gate` deliberately does NOT strip it there and
   // the reply card shows it verbatim. Stripping it from the bubble alone would
   // make the two messages of one turn contradict each other.
-  // Both paths drop a malformed entry: counting it would throw out of the
-  // transcript drain and lose the rest of the turn's activity.
   const adoptMode = lastInitConfig?.adoptMode === true;
-  const wellFormed = entries.filter(cotEntryWellFormed);
   const kept = adoptMode
     ? wellFormed
     : wellFormed.flatMap(entry => {

@@ -616,4 +616,58 @@ describe('sessionReply chat-scope chokepoint — shared fold-back anchoring', ()
     expect(beforeQuoteFallback).toHaveBeenCalledTimes(1);
     expect(mocks.sendMessage).not.toHaveBeenCalled();
   });
+
+  it('forwards caller uuid on thread-scope and shared-chat fold-back thread replies', async () => {
+    // 1. Thread-scope session -> replyMessage(..., replyInThread=true, uuid)
+    const threadDs = seedSharedSession();
+    activeSessions.clear();
+    threadDs.scope = 'thread';
+    threadDs.session.scope = 'thread';
+    threadDs.session.rootMessageId = 'om_thread_root';
+    activeSessions.set(sessionKey('om_thread_root', APP), threadDs);
+    await sessionReply('om_thread_root', '{"card":"thread"}', 'interactive', APP, 'turn-thread', {
+      sourceSessionId: threadDs.session.sessionId,
+      replyTarget: { mode: 'thread', rootMessageId: 'om_thread_root' },
+      uuid: 'sc_t_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    });
+    expect(mocks.replyMessage).toHaveBeenCalledWith(
+      APP, 'om_thread_root', '{"card":"thread"}', 'interactive', true, 'sc_t_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', expect.any(Object),
+    );
+
+    // 2. Chat-scope session folded into a shared thread -> replyMessage(..., replyInThread=true, uuid)
+    mocks.replyMessage.mockClear();
+    activeSessions.clear();
+    seedSharedSession({ rootMessageId: 'om_folded_root', turnId: 'turn-folded', updatedAt: NOW });
+    await sessionReply(CHAT, '{"card":"folded"}', 'interactive', APP, 'turn-folded', {
+      replyTarget: { mode: 'thread', rootMessageId: 'om_folded_root' },
+      uuid: 'sc_t_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+    });
+    expect(mocks.replyMessage).toHaveBeenCalledWith(
+      APP, 'om_folded_root', '{"card":"folded"}', 'interactive', true, 'sc_t_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', expect.any(Object),
+    );
+  });
+
+  it('domain-separates uuid when a plain chat-scope session redirects into topic mode', async () => {
+    activeSessions.clear();
+    seedSharedSession();
+    mocks.getChatMode.mockResolvedValue('topic');
+    const plainUuid = 'sc_t_cccccccccccccccccccccccccccccccc';
+
+    // Explicit plain replyTarget -> topic redirect derives deterministic tr_<32hex> !== plainUuid
+    await sessionReply(CHAT, '{"card":"plain"}', 'interactive', APP, 'turn-plain', {
+      replyTarget: { mode: 'plain', chatId: CHAT },
+      uuid: plainUuid,
+    });
+    const redirected1 = mocks.replyMessage.mock.calls[0][5];
+    expect(redirected1).toMatch(/^tr_[0-9a-f]{32}$/);
+    expect(redirected1.length).toBeLessThanOrEqual(50);
+    expect(redirected1).not.toBe(plainUuid);
+
+    // Second retry derives the exact same tr_<32hex>
+    await sessionReply(CHAT, '{"card":"plain"}', 'interactive', APP, 'turn-plain', {
+      replyTarget: { mode: 'plain', chatId: CHAT },
+      uuid: plainUuid,
+    });
+    expect(mocks.replyMessage.mock.calls[1][5]).toBe(redirected1);
+  });
 });

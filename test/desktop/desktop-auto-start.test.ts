@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { DesktopRuntimeState } from '../../src/desktop/shared/types.js';
-import { autoStartCliRuntimeOnLaunch, shouldAutoStartCliRuntime, shouldTakeOverExternalRuntime } from '../../src/desktop/main/auto-start.js';
+import {
+  autoStartCliRuntimeOnLaunch,
+  shouldAutoStartCliRuntime,
+  shouldAutoStartEmptyOnboardingRuntime,
+  shouldTakeOverExternalRuntime,
+} from '../../src/desktop/main/auto-start.js';
 
 function runtimeState(overrides: Partial<DesktopRuntimeState>): DesktopRuntimeState {
   return {
@@ -64,5 +69,55 @@ describe('desktop launch auto-start', () => {
     expect(shouldAutoStartCliRuntime(runtimeState({ status: 'degraded' }))).toBe(false);
     expect(shouldAutoStartCliRuntime(runtimeState({ runtimeManaged: false }))).toBe(false);
     expect(shouldAutoStartCliRuntime(runtimeState({ runtimeSource: 'none' }))).toBe(false);
+  });
+
+  it('auto-starts the bundled runtime for 0-bot first-launch onboarding without touching external CLIs or corrupt configs', async () => {
+    expect(shouldAutoStartEmptyOnboardingRuntime(runtimeState({
+      status: 'not_configured',
+      runtimeSource: 'bundled',
+      runtimeManaged: true,
+      botCount: 0,
+    }))).toBe(true);
+    expect(shouldAutoStartEmptyOnboardingRuntime(runtimeState({
+      status: 'not_configured',
+      runtimeSource: 'global-cli',
+      runtimeManaged: true,
+      botCount: 0,
+    }))).toBe(false);
+    expect(shouldAutoStartEmptyOnboardingRuntime(runtimeState({
+      status: 'not_configured',
+      runtimeSource: 'bundled',
+      runtimeManaged: false,
+      botCount: 0,
+    }))).toBe(false);
+
+    // Corrupted bots.json under global-cli (botCount=0, onlineDaemonCount=0) must NOT loop takeover.
+    expect(shouldTakeOverExternalRuntime(runtimeState({
+      status: 'degraded',
+      runtimeManaged: false,
+      runtimeSource: 'global-cli',
+      botCount: 0,
+      onlineDaemonCount: 0,
+      message: 'bots.json entry 0 is missing larkAppId',
+    }))).toBe(false);
+
+    const start = vi.fn().mockResolvedValue({ code: 0, stdout: 'started', stderr: '' });
+    const monitor = { refresh: vi.fn().mockResolvedValue(undefined) };
+    const result = await autoStartCliRuntimeOnLaunch({
+      runtime: {
+        getState: vi.fn().mockResolvedValue(runtimeState({
+          status: 'not_configured',
+          runtimeSource: 'bundled',
+          runtimeManaged: true,
+          botCount: 0,
+        })),
+        start,
+        takeover: vi.fn(),
+      },
+      monitor,
+    });
+    expect(result).toBe('started');
+    expect(start).toHaveBeenCalledOnce();
+    expect(monitor.refresh).toHaveBeenCalledOnce();
   });
 });
