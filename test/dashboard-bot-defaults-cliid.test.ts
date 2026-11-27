@@ -1,7 +1,7 @@
 import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { displayCliId, type BotDefaultsRow } from '../src/dashboard/web/bot-defaults.js';
+import { botEffectiveSummary, displayCliId, type BotDefaultsRow } from '../src/dashboard/web/bot-defaults.js';
 import { normalizeOwnerGroupFollowConfig } from '../src/services/owner-group-follow-policy.js';
 import {
   BotAgentSection,
@@ -1554,6 +1554,42 @@ describe('Codex-compatible runtime editor', () => {
         cliRuntime: null,
         cliPathOverride: legacyPath,
       }));
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('syncs authoritative sandbox fields into the effective summary after an agent save', async () => {
+    const previousFetch = globalThis.fetch;
+    (globalThis as any).fetch = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        ok: true,
+        cliId: 'codex', cliRuntime: null, cliPathOverride: null, wrapperCli: null,
+        model: '', selectionKey: 'codex', closedMismatchedSessions: 0,
+        localSandboxApplies: true, effectiveSandboxMode: 'scratch', sandboxEnvForce: 'scratch',
+      }),
+    } as any));
+    const original: BotDefaultsRow = {
+      larkAppId: 'cli_runtime', cliId: 'codex', model: '', sandboxMode: 'oncall',
+      localSandboxApplies: false, effectiveSandboxMode: 'off', sandboxEnvForce: 'oncall',
+    };
+    expect(botEffectiveSummary(original).sandbox).toBe('off');
+    try {
+      const { root, renderer, patchBot } = renderAgent(original);
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(patchBot).toHaveBeenCalled();
+      const patch = patchBot.mock.calls.at(-1)![1] as Partial<BotDefaultsRow>;
+      expect(patch).toMatchObject({
+        localSandboxApplies: true, effectiveSandboxMode: 'scratch', sandboxEnvForce: 'scratch',
+      });
+      expect(botEffectiveSummary({ ...original, ...patch }).sandbox).toBe('scratch');
+      act(() => renderer.unmount());
     } finally {
       (globalThis as any).fetch = previousFetch;
     }
