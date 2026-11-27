@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { detectCliStartupBlocker } from '../src/core/cli-startup-blocker.js';
+import { stripAnsiScreenText } from '../src/utils/idle-detector.js';
 
 function harness() {
   const target = { sendSpecialKeys: vi.fn(() => true) };
@@ -70,5 +72,68 @@ describe('TraeX native instant input configuration', () => {
     h.scope.readCmdline = () => ['/native/traex', '-c', 'features.instant_interrupt=true'];
     h.scope.currentTraexObservedPid = vi.fn().mockReturnValueOnce(123).mockReturnValue(456);
     expect(h.enabled()).toBe(false);
+  });
+});
+
+describe('native-mode trust input after observer reattach', () => {
+  const trust = ['Folder access', '/fixture', 'Do you trust the contents of this directory?',
+    '❯ 1. Yes, continue', '  2. No, quit', '  enter continue  |  esc quit'].join('\n');
+  const current = '◆ Working… (2s • esc to interrupt)\n────────\n❯ Use /skills to list available skills\n────────\n  mock-model · ~ · Context 100% left';
+  function trustHarness(viewport: string) {
+    const h = harness();
+    Object.assign(h.scope, {
+      readCmdline: () => ['/native/traex', '-c', 'features.instant_interrupt=true'],
+      trustHandled: false, TRUST_DIALOG_PATTERN: /Yes, I trust this folder|Yes, continue|Trust and continue/,
+      dismissAidenCodexUpdateDialog: () => false, noticeCodexModelMigrationDialog: vi.fn(),
+      isWorkflowWorker: () => false,
+      detectCliStartupBlocker, stripAnsiScreenText, backendScreenEvidenceIsAuthoritativeForMutation: () => true,
+      cliSpawnGeneration: 1, cliLifetimeNonce: 2, cliInterruptGeneration: 0,
+      webTerminalInputGeneration: 0, promptReadinessRevision: 0, closeRequested: false,
+      rawInputRestartGate: false, fatalWorkerErrorPending: false, cliSubmissionInFlight: undefined,
+      sessionRenameInFlight: () => false, nativeSessionForkPending: () => false,
+      pendingWebTerminalInput: () => false, webTerminalInputWireDirty: () => false,
+    });
+    h.target.captureViewport = () => viewport;
+    return { ...h, handle: loadWorkerFunction('handleVisibleStartupInteraction', h.scope),
+      setViewport: (text: string) => { viewport = text; } };
+  }
+
+  it('ignores replayed trust scrollback while the native viewport is already working', async () => {
+    vi.useFakeTimers();
+    try {
+      const h = trustHarness(current);
+      expect(h.handle(trust)).toBe(false);
+      expect(h.scope.trustHandled).toBe(false);
+      await vi.advanceTimersByTimeAsync(500);
+      expect(h.target.sendSpecialKeys).not.toHaveBeenCalled();
+      expect(h.scope.invalidatePromptReadinessEvidence).not.toHaveBeenCalled();
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
+  it.each([
+    ['viewport', (h: ReturnType<typeof trustHarness>) => h.setViewport(current)],
+    ['interrupt generation', (h: ReturnType<typeof trustHarness>) => { h.scope.cliInterruptGeneration++; }],
+    ['Web epoch', (h: ReturnType<typeof trustHarness>) => { h.scope.webTerminalInputGeneration++; }],
+    ['active write', (h: ReturnType<typeof trustHarness>) => { h.scope.isFlushing = true; }],
+  ])('rechecks %s before the delayed trust Enter', async (_name, change) => {
+    vi.useFakeTimers();
+    try {
+      const h = trustHarness(trust);
+      expect(h.handle(trust)).toBe(true);
+      change(h);
+      await vi.advanceTimersByTimeAsync(500);
+      expect(h.target.sendSpecialKeys).not.toHaveBeenCalled();
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
+  it('accepts the current selected trust page once when its lease stays current', async () => {
+    vi.useFakeTimers();
+    try {
+      const h = trustHarness(trust);
+      expect(h.handle(trust)).toBe(true);
+      expect(h.handle(trust)).toBe(false);
+      await vi.advanceTimersByTimeAsync(500);
+      expect(h.target.sendSpecialKeys).toHaveBeenCalledExactlyOnceWith('Enter');
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
   });
 });

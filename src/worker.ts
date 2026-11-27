@@ -26633,6 +26633,36 @@ function handleVisibleStartupInteraction(data: string): boolean {
   const stripped = data.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
   if (!TRUST_DIALOG_PATTERN.test(stripped)) return false;
 
+  const traexTrust = lastInitConfig?.cliId === 'traex' && traexNativeInstantInputEnabled();
+  const backendAtSchedule = backend;
+  const generationAtSchedule = cliSpawnGeneration;
+  const lifetimeAtSchedule = traexTrust ? cliLifetimeNonce : undefined;
+  const interruptAtSchedule = traexTrust ? cliInterruptGeneration : undefined;
+  const webInputAtSchedule = traexTrust ? webTerminalInputGeneration : undefined;
+  const readinessAtSchedule = traexTrust ? promptReadinessRevision : undefined;
+  const currentTraexTrustDialog = (): boolean => {
+    if (!backendAtSchedule || !backendScreenEvidenceIsAuthoritativeForMutation()) return false;
+    try {
+      const viewport = backendAtSchedule.captureViewport?.()
+        ?? backendAtSchedule.captureInputState?.()?.viewport
+        ?? (!backendAtSchedule.captureCurrentScreen ? renderer?.rawSnapshot() : undefined);
+      if (!viewport || detectCliStartupBlocker(viewport)?.rule !== 'codex-family-folder-trust') return false;
+      const selections = stripAnsiScreenText(viewport).split(/\r?\n/)
+        .filter(line => /^[ \t]*[❯›]/.test(line));
+      return /^[ \t]*[❯›][ \t]*1[.)][ \t]*(?:Yes, continue|Trust and continue)[ \t]*$/.test(selections.at(-1) ?? '');
+    } catch { return false; }
+  };
+  const currentTraexTrustLease = (): boolean => backend === backendAtSchedule
+    && cliSpawnGeneration === generationAtSchedule && cliLifetimeNonce === lifetimeAtSchedule
+    && cliInterruptGeneration === interruptAtSchedule && webTerminalInputGeneration === webInputAtSchedule
+    && promptReadinessRevision === readinessAtSchedule && !closeRequested
+    && !cliRestartInProgress && !rawInputRestartGate && !fatalWorkerErrorPending
+    && !codexRpcEngine && traexNativeInstantInputEnabled()
+    && !isFlushing && !injectionFlushing && !cliSubmissionInFlight && commandLineWritesPending === 0
+    && !sessionRenameInFlight() && !nativeSessionForkPending()
+    && !pendingWebTerminalInput() && !webTerminalInputWireDirty();
+  if (traexTrust && (!currentTraexTrustLease() || !currentTraexTrustDialog() || !currentTraexTrustLease())) return false;
+
   trustHandled = true;
   log('Trust dialog detected, auto-accepting...');
   // Codex 0.149 的按键处理器在信任框渲染的瞬间尚未就绪，同步发出的 Enter 会
@@ -26641,10 +26671,9 @@ function handleVisibleStartupInteraction(data: string): boolean {
   // trustHandled 已同步置位，后续 chunk 重复命中同一文案不会重入。
   // 围栏：400ms 内若发生 respawn（崩溃/配置切换/restart），旧 timer 不得把
   // Enter 发进新会话的 backend（与本文件其它延迟回调的围栏约定一致）。
-  const backendAtSchedule = backend;
-  const generationAtSchedule = cliSpawnGeneration;
   setTimeout(() => {
     if (backend !== backendAtSchedule || cliSpawnGeneration !== generationAtSchedule) return;
+    if (traexTrust && (!currentTraexTrustLease() || !currentTraexTrustDialog() || !currentTraexTrustLease())) return;
     try {
       if (backend) invalidatePromptReadinessEvidence();
       if (backend && 'sendSpecialKeys' in backend) {
@@ -33623,6 +33652,9 @@ function sendToPty(
     return true;
   }
   if (!cliAdapter) return false;
+  const nativeInstantSteerFence = lastInitConfig?.cliId === 'traex' && traexNativeInstantInputEnabled()
+    ? traexPersistentReattachSteeringFence(next) : undefined;
+  const nativeInstantSteerReady = nativeInstantSteerFence?.nativeInstant === true;
   const sendSupportsTypeAhead = typeof shouldAllowTypeAheadOnReattach === 'function'
     ? shouldAllowTypeAheadOnReattach(
         typeof reattachOpenTurnGate === 'boolean' && reattachOpenTurnGate && !isCodexAppCliId(lastInitConfig?.cliId),
@@ -33630,13 +33662,13 @@ function sendToPty(
       )
     : runtimePtyInputPolicy().supportsTypeAhead;
   const supportsTypeAhead = pendingInputAllowsTypeAhead(
-    sendSupportsTypeAhead,
+    sendSupportsTypeAhead || (nativeInstantSteerReady && runtimePtyInputPolicy().supportsTypeAhead),
     durableTurnInFlight,
     next,
     directRpcTurnBlocksTypeAhead() || programStatusBlockedHoldsTypeAhead(),
   ) && !activeTurnBlocks(next);
-  const reattachSteerReady = (lastSpawnPersistentReattach || traexNativeInstantInputEnabled()) && lastInitConfig?.cliId === 'traex'
-    && traexPersistentReattachSteeringFence(next) !== undefined;
+  const reattachSteerReady = nativeInstantSteerReady || (lastSpawnPersistentReattach && lastInitConfig?.cliId === 'traex'
+    && traexPersistentReattachSteeringFence(next) !== undefined);
   const shouldMergeQueued = !traexAutoModelRuntimeEligible()
     && opts.dispatchAttempt === undefined && !durableTurnInFlight
     && !isFlushing && !shouldWriteNow({

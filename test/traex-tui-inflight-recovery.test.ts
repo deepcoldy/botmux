@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 import { traexActiveEmptyComposerReady, traexSessionRenameSurface } from '../src/adapters/cli/traex-footer.js';
-import { pendingInputAllowsTypeAhead, pendingInputMayFlush, inputForcesSerialTurn, shouldStopPendingBatch } from '../src/utils/pending-input-queue.js';
+import { pendingInputAllowsTypeAhead, pendingInputMayFlush, inputForcesSerialTurn, shouldStopPendingBatch, shouldAllowTypeAheadOnReattach } from '../src/utils/pending-input-queue.js';
 import { ActiveTurnAuthority, sameTrustedPrincipal } from '../src/core/active-turn-authority.js';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 import { stripAnsiScreenText } from '../src/utils/idle-detector.js';
@@ -81,6 +81,39 @@ function reattachHarness() {
 }
 
 describe('plain TRAE busy input after persistent worker reattach', () => {
+  it('kicks the ordinary native head despite the global reattach hold without publishing readiness', async () => {
+    const h = reattachHarness();
+    h.scope.readCmdline = () => ['/native/traex', '-c', 'features.instant_interrupt=true'];
+    h.scope.readProcessStartIdentity = () => 'birth';
+    h.scope.reattachOpenTurnGate = true;
+    h.scope.shouldAllowTypeAheadOnReattach = shouldAllowTypeAheadOnReattach;
+    h.scope.pendingMessages.length = 0;
+    h.scope.sendToPty(input().content, input().turnId, { trustedCaller: caller });
+    await h.scope.flushPending.mock.results.at(-1).value;
+    expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledOnce();
+    expect(h.scope.pendingMessages).toHaveLength(0);
+    expect(h.scope.reattachOpenTurnGate).toBe(true);
+    expect(h.scope.isPromptReady).toBe(false);
+    expect(h.scope.awaitingFirstPrompt).toBe(true);
+  });
+
+  it.each([
+    ['foreign principal', { trustedCaller: { ...caller, requestUserOpenId: 'foreign' } }],
+    ['explicit FIFO', { queueAfterActiveTurn: true }],
+    ['durable attempt', { dispatchAttempt: 1 }],
+  ])('does not kick %s through the native reattach lease', (_name, options) => {
+    const h = reattachHarness();
+    h.scope.readCmdline = () => ['/native/traex', '-c', 'features.instant_interrupt=true'];
+    h.scope.readProcessStartIdentity = () => 'birth';
+    h.scope.reattachOpenTurnGate = true;
+    h.scope.shouldAllowTypeAheadOnReattach = shouldAllowTypeAheadOnReattach;
+    h.scope.pendingMessages.length = 0;
+    h.scope.sendToPty(input().content, input().turnId, { trustedCaller: caller, ...options });
+    expect(h.scope.flushPending).not.toHaveBeenCalled();
+    expect(h.scope.pendingMessages).toHaveLength(1);
+    expect(h.scope.reattachOpenTurnGate).toBe(true);
+  });
+
   it('writes a flagged fresh native correction through the existing adapter without requiring a first-idle edge', async () => {
     const h = reattachHarness();
     h.scope.lastSpawnPersistentReattach = false;
