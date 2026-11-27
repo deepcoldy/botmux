@@ -22,6 +22,7 @@ import type { BotConfig } from '../bot-registry.js';
 import { getBot } from '../bot-registry.js';
 import type { CliTurnPayload, LarkAttachment, Session, TrustedCaller } from '../types.js';
 import type { DaemonSession } from './types.js';
+import { advancePendingStreamingCardTurn } from './streaming-card-post-slot.js';
 import * as sessionStore from '../services/session-store.js';
 import { cancelOrdinaryTurnRecoveryForUserInput } from '../services/ordinary-turn-recovery.js';
 import { resetCodexModelSelection } from '../services/codex-model-selection.js';
@@ -525,9 +526,21 @@ async function runDowngrade(
           overloadedModels: [...plan.overloadedModels],
         };
       }
+      // A capacity hop starts a brand-new turn on the downgraded worker. Move
+      // BOTH currentTurnId and the streaming-card turn to the hop's turnId
+      // BEFORE the fallible bookkeeping below, mirroring beginNewTurn:
+      //  - generation bumps and prior-turn commit-unknown slots are cleared so
+      //    the old uuid can never be reused;
+      //  - display target, the starting-card health watchdog and turn_terminal
+      //    ownership all key off currentTurnId, so retaining the pre-hop id would
+      //    bind the replacement card to the dead turn and reject the new turn's
+      //    terminal;
+      //  - running the rotation first means a bookkeeping throw can no longer
+      //    skip it while the switch still reports 'switched'.
+      ds.currentTurnId = turnId;
+      advancePendingStreamingCardTurn(ds, turnId);
       rememberInput(ds, plan.userPrompt, input, turnId);
       noteStarted(ds, turnId);
-      ds.streamCardPending = true;
       persistCard(ds);
       updateSession(ds.session);
       if (plan.mode === 'pin') {

@@ -1,4 +1,5 @@
 import type { DaemonSession } from './types.js';
+import { invalidateTurnStreamingCardPostSlot } from './streaming-card-post-slot.js';
 
 export type HandoffCardEvent = {
   turnId: string; sequence: number;
@@ -101,6 +102,7 @@ export async function applyHandoffCardEvent(ds: DaemonSession, event: HandoffCar
   ds.streamCardNonce = undefined;
   ds.streamCardPending = false;
   ds.streamCardPendingTurnId = undefined;
+  invalidateTurnStreamingCardPostSlot(ds);
   ds.pendingCardJson = undefined;
   ds.pendingCardId = undefined;
   io.clear();

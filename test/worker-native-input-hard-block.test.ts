@@ -101,6 +101,10 @@ function inputHarness(cliId: 'codex' | 'traex' | 'kimi', viewport: string, persi
   h.scope.holdOpeningInput = loadWorkerFunction('holdOpeningInput', h.scope);
   h.scope.notifyHeldInput = loadWorkerFunction('notifyHeldInput', h.scope);
   if (persistentReattach) {
+    // This fixture holds a rename dialog, never an initialized empty busy composer.
+    h.scope.traexActiveEmptyComposerReady = () => false;
+    h.scope.traexPersistentReattachBusyComposerFence = () => undefined;
+    h.scope.traexPersistentReattachSteeringFence = loadWorkerFunction('traexPersistentReattachSteeringFence', h.scope);
     h.scope.recoverSessionRenameAfterPersistentReattach = loadWorkerFunction('recoverSessionRenameAfterPersistentReattach', h.scope);
   }
   return { ...h, backend, adapter: h.scope.cliAdapter };

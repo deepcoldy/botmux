@@ -18,7 +18,7 @@ import { resolveBotmuxDataDir } from './data-dir.js';
 import { enqueueFleetCommand } from './fleet-command-queue.js';
 import type { FleetProcState, FleetState } from './fleet-supervisor-policy.js';
 import { FLEET_GRACEFUL_EXIT_CODE } from './fleet-supervisor-policy.js';
-import { botProcessName } from '../setup/bot-config-editor.js';
+import { botProcessName, parseBotConfigsJson } from '../setup/bot-config-editor.js';
 import { resolveDaemonEnv } from '../cli/daemon-lifecycle-env.js';
 import { scrubDetachedRestartEnvRefresh } from './restart-env-refresh.js';
 import type { RestartEnvFallback } from './restart-env-refresh.js';
@@ -146,12 +146,14 @@ export function resolveFleetDaemonEnv(
   const lifecycleSource = envFileRead.status === 'failed' && refreshPersistedEnv
     ? readFailureFallback ?? {}
     : inheritedEnv;
+  const defaultDashboardHost = typeof options === 'boolean' ? undefined : options.defaultDashboardHost;
   const env: NodeJS.ProcessEnv = {
     ...inheritedEnv,
     ...resolveDaemonEnv(
       lifecycleSource,
       envFileRead.status === 'loaded' ? envFileRead.text : undefined,
       envFileRead.status === 'failed' ? false : refreshPersistedEnv,
+      defaultDashboardHost ? { defaultDashboardHost } : undefined,
     ),
   };
   scrubDetachedRestartEnvRefresh(env);
@@ -199,10 +201,7 @@ export function resolveFleetDaemonEnv(
 export function resolveFleetBots(): FleetBotSpec[] {
   const botsJson = join(CONFIG_DIR, 'bots.json');
   if (!existsSync(botsJson)) return [];
-  let bots: unknown;
-  try { bots = JSON.parse(readFileSync(botsJson, 'utf-8')); } catch { return []; }
-  const list = Array.isArray(bots) ? bots : (bots as { bots?: unknown[] })?.bots;
-  if (!Array.isArray(list)) return [];
+  const list = parseBotConfigsJson(readFileSync(botsJson, 'utf-8'), botsJson);
   return resolveFleetBotsFromEntries(list);
 }
 
@@ -331,6 +330,7 @@ export interface StartFleetResult {
 export interface StartFleetOptions {
   refreshPersistedEnv?: boolean;
   readFailureFallback?: RestartEnvFallback;
+  defaultDashboardHost?: string;
 }
 
 export function startFleetViaSupervisor(options: StartFleetOptions = {}): StartFleetResult {
@@ -339,7 +339,8 @@ export function startFleetViaSupervisor(options: StartFleetOptions = {}): StartF
   if (existing !== undefined) {
     return { action: 'already-running', supervisorPid: existing, botCount: bots.length };
   }
-  mkdirSync(LOG_DIR, { recursive: true });
+  if (!existsSync(CONFIG_DIR)) mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+  mkdirSync(LOG_DIR, { recursive: true, mode: 0o700 });
   const out = openSync(join(LOG_DIR, 'supervisor-out.log'), 'a');
   const err = openSync(join(LOG_DIR, 'supervisor-err.log'), 'a');
   const { command, args } = resolveEntrySpawn('supervisor', fleetDistDir());
@@ -409,6 +410,7 @@ export function restartFleet(options: RestartFleetOptions = {}): RestartFleetRes
   const start = startFleetViaSupervisor({
     refreshPersistedEnv: options.refreshPersistedEnv,
     readFailureFallback: options.readFailureFallback,
+    defaultDashboardHost: options.defaultDashboardHost,
   });
   return { stop, start };
 }

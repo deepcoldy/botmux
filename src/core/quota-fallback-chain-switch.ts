@@ -22,6 +22,7 @@ import type { ChildProcess } from 'node:child_process';
 import type { CliId } from '../adapters/cli/types.js';
 import type { CliTurnPayload, LarkAttachment, Session, SessionCliLaunchSnapshotV1, TrustedCaller } from '../types.js';
 import type { DaemonSession } from './types.js';
+import { advancePendingStreamingCardTurn } from './streaming-card-post-slot.js';
 import { getBot } from '../bot-registry.js';
 import * as sessionStore from '../services/session-store.js';
 import { resolveSessionTranscriptPath } from '../services/transcript-resolver.js';
@@ -383,7 +384,7 @@ async function runSwitch(ds: DaemonSession, trigger: QuotaFallbackChainTrigger, 
     try {
       rememberLastCliInput(ds, userPrompt, input, turnId);
       noteReplyCardTurnStarted(ds, turnId);
-      ds.streamCardPending = true;
+      advancePendingStreamingCardTurn(ds);
       persistStreamCardState(ds);
       sessionStore.updateSession(ds.session);
     } catch (error) {

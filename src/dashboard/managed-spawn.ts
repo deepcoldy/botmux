@@ -27,10 +27,27 @@ export interface BotLifecycleSpawnResult {
   message?: string;
 }
 
+/** Kill a lifecycle CLI and any dependency installer it spawned. */
+export function killBotLifecycleProcessTree(child: ReturnType<typeof spawn>): void {
+  const pid = child.pid;
+  try {
+    if (pid && pid > 0 && process.platform === 'win32') {
+      spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+      return;
+    }
+    if (pid && pid > 0) {
+      process.kill(-pid, 'SIGKILL');
+      return;
+    }
+  } catch { /* fall through to the direct child / already exited */ }
+  try { child.kill('SIGKILL'); } catch { /* already exited */ }
+}
+
 /** `botmux <verb>-bot <appId> --json` with a redacted env. */
 function spawnBotLifecycleCli(
   verb: 'start-bot' | 'stop-bot',
   appId: string,
+  timeoutMs: number,
   timeoutLabel: string,
   okMessage: (processName: string) => string,
 ): Promise<BotLifecycleSpawnResult> {
@@ -53,11 +70,14 @@ function spawnBotLifecycleCli(
         // package update replaces that dir, so a still-running dashboard would spawn
         // start-bot in a deleted directory (uv_cwd/ENOENT). See globalInstallUpdateCwd.
         cwd: globalInstallUpdateCwd(),
+        // Dependency provisioning may spawn brew/apt/curl. Own the POSIX process
+        // group so a timeout cannot leave those installers running after failure.
+        detached: process.platform !== 'win32',
       });
       const timer = setTimeout(() => {
-        try { child.kill('SIGKILL'); } catch { /* already gone */ }
+        killBotLifecycleProcessTree(child);
         done({ ok: false, message: timeoutLabel });
-      }, 30_000);
+      }, timeoutMs);
       timer.unref?.();
       child.stdout?.on('data', (d) => { out += String(d); });
       child.stderr?.on('data', (d) => { err += String(d); });
@@ -83,22 +103,14 @@ function spawnBotLifecycleCli(
   });
 }
 
-/**
- * Bring a freshly-onboarded bot online without a fleet-wide restart by spawning
- * `botmux start-bot <appId> --json` (see cli.ts:ensureBotDaemonStarted). The new
- * daemon is forked+supervised by pm2 (reparented off this process), self-registers
- * and opens its Feishu WSClient, then publishes a descriptor the DaemonRegistry
- * auto-discovers — so no dashboard reload is needed either. Runs `botmux` on the
- * SAME host as the dashboard (shared pm2 home / bots.json — the documented
- * dashboard↔daemon co-location assumption). Resolves best-effort; the caller
- * falls back to the restart hint on failure.
- */
 export function spawnStartBotLive(appId: string): Promise<BotLifecycleSpawnResult> {
-  return spawnBotLifecycleCli('start-bot', appId, 'start-bot 超时（30s）', name => `${name} 已上线`);
+  // 120s budget covers 0->1 cold-machine dependency provisioning (e.g. brew bottle
+  // install of tmux capped at 90s) while healthy hosts still return in ~1-2s.
+  return spawnBotLifecycleCli('start-bot', appId, 120_000, 'start-bot 超时（120s）', name => `${name} 已上线`);
 }
 
 export function spawnStopBotLive(appId: string): Promise<BotLifecycleSpawnResult> {
-  return spawnBotLifecycleCli('stop-bot', appId, 'stop-bot 超时（30s）', name => `${name} 已停止`);
+  return spawnBotLifecycleCli('stop-bot', appId, 30_000, 'stop-bot 超时（30s）', name => `${name} 已停止`);
 }
 
 /**

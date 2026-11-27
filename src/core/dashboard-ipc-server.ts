@@ -8757,7 +8757,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => 
     void reconcileResumedStreamingCard(
       ds,
       staleCardId,
-      cardJson => replyMessage(ds.larkAppId, rootMessageId, cardJson, 'interactive', true),
+      (cardJson, uuid) => replyMessage(ds.larkAppId, rootMessageId, cardJson, 'interactive', true, uuid),
     ).then(async (result) => {
       if (result.status === 'committed') await postResumeNotice();
     }).catch(async (err) => {

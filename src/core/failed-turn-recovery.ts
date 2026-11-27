@@ -17,6 +17,7 @@ import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.j
 import { pickTurnReplyTarget } from './reply-target.js';
 import { failedTurnCaller, failedTurnCrossChatOrigin } from './failed-turn-caller.js';
 import { buildFollowUpCliInput, rememberLastCliInput } from './session-manager.js';
+import { advancePendingStreamingCardTurn } from './streaming-card-post-slot.js';
 import { prepareHookEnvelopeForReplay } from './prompt-hook-replay.js';
 import { localeForBot } from '../i18n/index.js';
 import { logger } from '../utils/logger.js';
@@ -295,7 +296,7 @@ export function clearLimitedFailedTurn(
  * active turn; a late terminal must not erase an already-claimed receipt. */
 export function recordFailedTurnTerminal(
   ds: DaemonSession,
-  terminal: { turnId: string; status: string; errorCode?: string; retryable?: boolean; directFailure?: true },
+  terminal: { turnId: string; status: string; errorCode?: string; retryable?: boolean; directFailure?: true; traexPromptCheckpoint?: FailedTurnRecord["traexPromptCheckpoint"] },
   context: { workerGeneration: number; caller: TrustedCaller | undefined; silent: boolean },
 ): void {
   const pendingRecordRetry = limitedFailedTurnRecordRetries.get(ds);
@@ -543,6 +544,7 @@ export async function recoverFailedTurn(sessionId: string, request: FailedTurnRe
           });
         if (!accepted || rejected) return setState('dispatch_unknown');
         rememberLastCliInput(target, record.userPrompt, dispatchInput, turnId);
+        if (target.streamCardPending) advancePendingStreamingCardTurn(target);
         store.updateSession(target.session);
         return setState('accepted');
       } catch {

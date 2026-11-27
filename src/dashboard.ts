@@ -38,7 +38,9 @@ import {
   writeTeamRoleFile,
   writeTeamRoleInjectMode,
 } from './core/role-resolver.js';
-import { readBotsJsonOrEmpty } from './setup/bots-store.js';
+import { readBotsJsonOrEmpty, readConfiguredBotCount } from './setup/bots-store.js';
+import { resolveBotsConfigFile } from './core/config-dir.js';
+import { findInvalidAllowedUserEntries, hasOwnerEntry, isMobileEntry } from './setup/bot-config-editor.js';
 import { listenWithProbe, LISTEN_RELEASE_WEDGED_CODE, type VerifyBoundResult } from './utils/listen-with-probe.js';
 import {
   parseCookie, buildSetCookie, verifyHmac, cliAuthBind,
@@ -157,7 +159,12 @@ import { normalizeBotsInfoRouteEntries } from './services/bots-info-shape.js';
 import { createBotDisplayNameLookup, readPersistedBotNameMap } from './services/bot-display-name.js';
 import { handleFederationSpokeApi, syncAllMemberships, autoBindOwnerIfUnambiguous, type TeamSessionRowLike } from './dashboard/federation-spoke-api.js';
 import type { TeamGroupCreateResult, TeamGroupOwnerTransferResult } from './dashboard/federated-group-core.js';
-import { BotOnboardingManager } from './dashboard/bot-onboarding.js';
+import {
+  assertBotsJsonValidOrAbsent,
+  BotOnboardingManager,
+  isValidManualAppSecret,
+  MANUAL_FEISHU_APP_ID_RE,
+} from './dashboard/bot-onboarding.js';
 import { FeishuLoginManager } from './dashboard/feishu-login.js';
 import {
   createDashboardH5AuthController,
@@ -479,7 +486,7 @@ const dashboardAutostart = createDashboardAutostartController({
 /** Per-daemon budget for the cross-daemon insight overview fan-out — bounds
  *  aggregate latency when one daemon's insight parse is slow or hung. */
 const INSIGHT_FANOUT_TIMEOUT_MS = 10_000;
-const BOTS_JSON_PATH = join(homedir(), '.botmux', 'bots.json');
+const BOTS_JSON_PATH = resolveBotsConfigFile();
 const queryDashboardUsage = createUsageAnalytics();
 const REGISTRY_DIR = join(resolveBotmuxDataDir(), 'dashboard-daemons');
 // The dashboard probes upward if its configured port is busy (e.g. a second
@@ -3267,7 +3274,7 @@ async function handlePluginManagementApi(
 
 const pluginMarket = createHostPluginMarket(id => {
   if (readGlobalConfig().plugins?.includes(id)) return true;
-  return loadBotConfigs().some(bot => bot.plugins?.includes(id));
+  return loadBotConfigsAllowMissingDefault().some(bot => bot.plugins?.includes(id));
 });
 
 function pluginProxyForbiddenPorts(): Set<number> {
@@ -4066,6 +4073,29 @@ function dashboardSkillsPayload(): Record<string, unknown> {
 
 // --- Skill pack dashboard helpers ------------------------------------------
 
+function parseOwnerEntries(raw: string): string[] {
+  const entries: string[] = [];
+  for (const segment of raw.split(/[,，;；\r\n]+/)) {
+    const trimmed = segment.trim();
+    if (!trimmed) continue;
+    // Preserve space-formatted international mobile numbers like "+86 130-1111-2222"
+    // while still splitting whitespace-separated non-mobile lists like "ou_a ou_b".
+    if (isMobileEntry(trimmed)) {
+      entries.push(trimmed);
+    } else {
+      for (const token of trimmed.split(/\s+/)) {
+        if (token) entries.push(token);
+      }
+    }
+  }
+  return entries;
+}
+
+function loadBotConfigsAllowMissingDefault(): BotConfig[] {
+  if (!process.env.BOTS_CONFIG && !existsSync(BOTS_JSON_PATH)) return [];
+  return loadBotConfigs();
+}
+
 function loadBotConfigsSafe(): BotConfig[] {
   try { return loadBotConfigs(); } catch { return []; }
 }
@@ -4254,7 +4284,7 @@ function terminalControlAvailability(sessionId: string):
  */
 async function liveDashboardSummary(): Promise<ReturnType<typeof buildDashboardSummary>> {
   const daemons = registry.list();
-  const configuredBots = loadBotConfigs();
+  const configuredBots = loadBotConfigsAllowMissingDefault();
   const snapshots = await Promise.all(daemons.map(async daemon => {
     const [sessionsResponse, schedulesResponse] = await Promise.all([
       fetchDaemonIpc(daemon.ipcPort, '/api/sessions', {
@@ -5284,6 +5314,7 @@ const server = createServer(async (req, res) => {
         // 那里进来的机器主人和协管者都解析成 legacy 身份，能看到。
         hostTerminal: legacyAuthed,
         bound: readPlatformBinding() !== null,
+        ...(authed ? { configuredBotCount: readConfiguredBotCount(BOTS_JSON_PATH) } : {}),
       });
     }
     if (req.method === 'PUT' && url.pathname === '/api/settings') {
@@ -5383,7 +5414,7 @@ const server = createServer(async (req, res) => {
       const latest = latestResult.value;
       let configuredUpdateTargets: ReturnType<typeof selectCodexRuntimeUpdateTargets> = [];
       try {
-        configuredUpdateTargets = await resolveDashboardRuntimeUpdateTargets(loadBotConfigs());
+        configuredUpdateTargets = await resolveDashboardRuntimeUpdateTargets(loadBotConfigsAllowMissingDefault());
       } catch {
         // Config unreadable or an adapter unavailable: fail closed and hide
         // persisted badges whose continued relevance cannot be established.
@@ -6525,7 +6556,8 @@ const server = createServer(async (req, res) => {
       } catch {
         botConfig = undefined;
       }
-      const response = await cliAvailabilityResponse(key, botConfig, process.env);
+      const refresh = url.searchParams.get('refresh') === '1';
+      const response = await cliAvailabilityResponse(key, botConfig, process.env, undefined, undefined, { refresh });
       return jsonRes(res, response.statusCode, response.body);
     }
 
@@ -6570,6 +6602,7 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && url.pathname === '/api/bot-onboarding/start') {
+      const MAX_ONBOARDING_BODY_BYTES = 64 * 1024;
       let parsed: {
         appName?: unknown;
         cloneSourceAppId?: unknown;
@@ -6582,14 +6615,36 @@ const server = createServer(async (req, res) => {
         model?: unknown;
         autoAvoidApproval?: unknown;
         requireCriticalScopesBeforeActivation?: unknown;
+        brand?: unknown;
+        appId?: unknown;
+        appSecret?: unknown;
+        owner?: unknown;
+        allowedUsers?: unknown;
       };
       try {
         const chunks: Buffer[] = [];
-        for await (const c of req) chunks.push(c as Buffer);
+        let totalBytes = 0;
+        for await (const c of req) {
+          const buf = Buffer.isBuffer(c) ? c : Buffer.from(c);
+          totalBytes += buf.length;
+          if (totalBytes > MAX_ONBOARDING_BODY_BYTES) {
+            return jsonRes(res, 413, { ok: false, error: 'payload_too_large', message: '请求体过大。' });
+          }
+          chunks.push(buf);
+        }
         const raw = Buffer.concat(chunks).toString('utf8');
         parsed = raw ? JSON.parse(raw) : {};
       } catch {
         return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      try {
+        assertBotsJsonValidOrAbsent(BOTS_JSON_PATH);
+      } catch (err: any) {
+        return jsonRes(res, 400, {
+          ok: false,
+          error: 'invalid_bots_json',
+          message: `现有 bots.json 格式损坏或不可读，已拒绝写入以保护原有配置：${err?.message ?? String(err)}`,
+        });
       }
       // CLI: 把下拉传来的选择键 (普通 cliId 或 aiden-x-claude/codex) 解析成
       // { cliId, wrapperCli }——空 → 默认 claude-code; 非法键 → 400.
@@ -6636,17 +6691,77 @@ const server = createServer(async (req, res) => {
         return jsonRes(res, 400, { ok: false, error: 'invalid_app_name', message: '应用名称不能超过 64 个字符' });
       }
       const registrationModeRaw = typeof parsed.registrationMode === 'string' ? parsed.registrationMode.trim() : '';
-      if (registrationModeRaw && registrationModeRaw !== 'sdk' && registrationModeRaw !== 'web' && registrationModeRaw !== 'compat' && registrationModeRaw !== 'local') {
-        return jsonRes(res, 400, { ok: false, error: 'invalid_registration_mode', message: 'registrationMode 必须是 sdk、web、compat 或 local' });
+      if (
+        registrationModeRaw
+        && registrationModeRaw !== 'sdk'
+        && registrationModeRaw !== 'web'
+        && registrationModeRaw !== 'compat'
+        && registrationModeRaw !== 'local'
+        && registrationModeRaw !== 'manual'
+      ) {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_registration_mode', message: 'registrationMode 必须是 sdk、web、compat、local 或 manual' });
       }
       // 缺省走网页会话流程（内置表单同样走网页流程）；sdk 只在调用方显式传入时使用。
-      const registrationMode = registrationModeRaw === 'sdk' || registrationModeRaw === 'compat' || registrationModeRaw === 'local'
+      const registrationMode = registrationModeRaw === 'sdk'
+        || registrationModeRaw === 'compat'
+        || registrationModeRaw === 'local'
+        || registrationModeRaw === 'manual'
         ? registrationModeRaw : 'web';
       if (registrationMode === 'local' && typeof parsed.cloneSourceAppId === 'string' && parsed.cloneSourceAppId.trim()) {
         return jsonRes(res, 400, { ok: false, error: 'local_clone_unsupported', message: '本地模式不克隆飞书机器人。' });
       }
       if (registrationMode === 'local' && parsed.requireCriticalScopesBeforeActivation === true) {
         return jsonRes(res, 400, { ok: false, error: 'local_scope_gate_unsupported', message: '本地机器人没有飞书权限可校验。' });
+      }
+      if (registrationMode === 'manual' && typeof parsed.cloneSourceAppId === 'string' && parsed.cloneSourceAppId.trim()) {
+        return jsonRes(res, 400, { ok: false, error: 'manual_clone_unsupported', message: '手动填入已有应用凭证不支持克隆其他机器人配置。' });
+      }
+      if (registrationMode === 'manual' && parsed.requireCriticalScopesBeforeActivation === true) {
+        return jsonRes(res, 400, { ok: false, error: 'manual_scope_gate_unsupported', message: '手动模式不走开放平台自动权限激活。' });
+      }
+      let manualParams: { brand: 'feishu' | 'lark'; appId: string; appSecret: string; allowedUsers: string[] } | undefined;
+      if (registrationMode === 'manual') {
+        const brandRaw = typeof parsed.brand === 'string' ? parsed.brand.trim().toLowerCase() : '';
+        if (brandRaw && brandRaw !== 'feishu' && brandRaw !== 'lark') {
+          return jsonRes(res, 400, { ok: false, error: 'invalid_brand', message: 'brand 必须是 feishu 或 lark' });
+        }
+        const brand = brandRaw === 'lark' ? 'lark' as const : 'feishu' as const;
+        const appId = typeof parsed.appId === 'string' ? parsed.appId.trim() : '';
+        if (!MANUAL_FEISHU_APP_ID_RE.test(appId)) {
+          return jsonRes(res, 400, { ok: false, error: 'invalid_app_id', message: 'App ID 格式无效，请填写飞书/Lark 开放平台提供的 cli_ 开头 App ID。' });
+        }
+        if (!isValidManualAppSecret(parsed.appSecret)) {
+          return jsonRes(res, 400, { ok: false, error: 'invalid_app_secret', message: 'App Secret 不能为空且不能包含控制字符。' });
+        }
+        const appSecret = parsed.appSecret.trim();
+        const manualOwners = Array.isArray(parsed.allowedUsers)
+          ? parsed.allowedUsers.filter((v): v is string => typeof v === 'string').map(v => v.trim()).filter(Boolean)
+          : typeof parsed.owner === 'string'
+            ? parseOwnerEntries(parsed.owner)
+            : [];
+        const invalidOwners = findInvalidAllowedUserEntries(manualOwners);
+        if (invalidOwners.length > 0) {
+          return jsonRes(res, 400, {
+            ok: false,
+            error: 'invalid_entries',
+            message: `不是完整邮箱、手机号（大陆 11 位 / 海外带 + 国家码）、union_id(on_) 或 open_id(ou_)：${invalidOwners.join(', ')}`,
+          });
+        }
+        if (!hasOwnerEntry(manualOwners)) {
+          return jsonRes(res, 400, {
+            ok: false,
+            error: 'no_owner',
+            message: '至少需要填写一个完整邮箱、手机号（大陆 11 位 / 海外带 + 国家码）、union_id(on_) 或 open_id(ou_) 作为管理员。',
+          });
+        }
+        if (readBotsJsonOrEmpty(BOTS_JSON_PATH).some((entry: any) => entry?.larkAppId === appId)) {
+          return jsonRes(res, 409, {
+            ok: false,
+            error: 'duplicate_app',
+            message: `应用 ${appId} 已存在，请勿重复添加。`,
+          });
+        }
+        manualParams = { brand, appId, appSecret, allowedUsers: manualOwners };
       }
       const sessionModeRaw = typeof parsed.sessionMode === 'string' ? parsed.sessionMode.trim() : '';
       if (registrationMode !== 'web' && sessionModeRaw) {
@@ -6683,16 +6798,21 @@ const server = createServer(async (req, res) => {
           : {}),
         registrationMode,
         ...(registrationMode === 'web' ? { sessionMode, expectedIdentity } : {}),
+        ...(manualParams ? manualParams : {}),
         cliId,
         wrapperCli,
         cliLaunchMode,
         workingDir,
         dirMode,
         model,
-        ...(typeof parsed.autoAvoidApproval === 'boolean' ? { autoAvoidApproval: parsed.autoAvoidApproval } : {}),
-        ...(parsed.requireCriticalScopesBeforeActivation === true
-          ? { requireCriticalScopesBeforeActivation: true }
-          : {}),
+        ...(registrationMode === 'local' || registrationMode === 'manual'
+          ? {}
+          : {
+              ...(typeof parsed.autoAvoidApproval === 'boolean' ? { autoAvoidApproval: parsed.autoAvoidApproval } : {}),
+              ...(parsed.requireCriticalScopesBeforeActivation === true
+                ? { requireCriticalScopesBeforeActivation: true }
+                : {}),
+            }),
       });
       return jsonRes(res, 202, { job: botOnboarding.get(job.id) });
     }
@@ -6801,18 +6921,37 @@ const server = createServer(async (req, res) => {
       } catch {
         return jsonRes(res, 400, { ok: false, error: 'bad_json' });
       }
-      // 接受 owner 字符串 (逗号/空白分隔) 或 allowedUsers 数组。
+      // 接受 owner 字符串 (逗号/空白分隔，保留带空格的国际手机号) 或 allowedUsers 数组。
       const entries = Array.isArray(parsedOwner.allowedUsers)
         ? parsedOwner.allowedUsers.filter((v): v is string => typeof v === 'string')
         : typeof parsedOwner.owner === 'string'
-          ? parsedOwner.owner.split(/[,\s]+/).map(s => s.trim()).filter(Boolean)
+          ? parseOwnerEntries(parsedOwner.owner)
           : [];
       const r = await botOnboarding.submitOwner(onboardingId, entries);
       if (!r.ok) {
-        const status = r.error === 'unknown_onboarding_job' ? 404 : 400;
+        const status = r.error === 'unknown_onboarding_job'
+          ? 404
+          : r.error === 'onboarding_cancelled'
+            ? 409
+            : 400;
         return jsonRes(res, status, r);
       }
       return jsonRes(res, 200, { job: botOnboarding.get(onboardingId) });
+    }
+    let mCancel: RegExpMatchArray | null;
+    if (req.method === 'POST' && (mCancel = url.pathname.match(/^\/api\/bot-onboarding\/([^/]+)\/cancel$/))) {
+      let onboardingId: string;
+      try {
+        onboardingId = decodeURIComponent(mCancel[1]);
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_request' });
+      }
+      const r = botOnboarding.cancel(onboardingId);
+      if (!r.ok) {
+        const status = r.error === 'unknown_onboarding_job' ? 404 : 409;
+        return jsonRes(res, status, r);
+      }
+      return jsonRes(res, 200, { ok: true, job: r.job });
     }
     let mOnboard: RegExpMatchArray | null;
     if (req.method === 'GET' && (mOnboard = url.pathname.match(/^\/api\/bot-onboarding\/([^/]+)$/))) {

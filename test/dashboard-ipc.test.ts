@@ -7111,6 +7111,7 @@ describe('POST /api/sessions/:sessionId/resume', () => {
         expect.stringContaining('resume topic card'),
         'interactive',
         true,
+        expect.stringMatching(/^sc_r_[0-9a-f]{32}$/),
       );
       expect(deleteSpy).toHaveBeenCalledWith(appId, 'om_closed_topic_card');
       const interactiveCall = replySpy.mock.calls.findIndex(call => call[3] === 'interactive');

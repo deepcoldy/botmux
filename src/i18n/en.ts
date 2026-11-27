@@ -1,5 +1,10 @@
 /** English translations — mirrors the keys defined in `zh.ts`. */
 export const messages: Record<string, string> = {
+  'worker.empty_final_failed_tool_image_upload': '⚠️ {cliName} could not upload a tool image: {reason}\nThe conversation remains active. Saved tool images can make later text-only messages fail too; restarting or resending alone may repeat the error. “Remove tool images and continue” removes all saved tool-image blocks and resumes with text context and completed work preserved. User images and original files are kept; this cannot fix the upstream image service.',
+  'worker.traex_tool_images_done': 'Removed {removed} saved tool-image block(s). The original transcript is backed up as .botmux-tool-images-bak-* alongside. TRAE resumed the same session and is inspecting completed work before continuing; text context and user images are kept.',
+  'worker.traex_tool_images_unavailable': 'Tool-image repair did not complete with a confirmed resumed CLI, so automatic continuation was withheld. Any completed repair has an original transcript backup; the conversation remains available. Check the Web Terminal before continuing.',
+  'card.btn.purge_tool_images_continue': 'Remove tool images and continue',
+  'card.action.purge_tool_images_started': 'Removing saved tool images and resuming the same conversation…',
   'worker.startup_unavailable': '⚠️ The execution environment cannot start right now. Please retry later.',
   'worker.startup_owner_alert': '⚠️ {botName} worker process startup failed\nAffected sessions: {count}\nLatest reported CLI: {cliName}\nLatest error: {reason}\nCheck the bot installation and runtime environment.',
   'worker.install_owner_alert': '⚠️ {botName} detected a CLI installation change\nAffected sessions: {count}\nLatest reported CLI: {cliName}\nRunning version: {running}; installed version: {installed}\nAffected sessions suspend after their current task settles and start on the new version with the next input.',

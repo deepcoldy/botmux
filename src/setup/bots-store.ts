@@ -13,6 +13,7 @@ import { assertQuotaFallbackGraphAcyclic } from '../services/quota-fallback.js';
 import { assertChangedBotConfigInvariants } from '../services/bot-config-invariants.js';
 import { assertDurableConfigMutationAllowed } from '../services/durable-config-mutation.js';
 import { assertNextBotsGenerationContent } from '../services/config-store.js';
+import { validateBotConfigEntries } from './bots-config-validation.js';
 
 export interface BotsJsonMutation<T> {
   bots: any[];
@@ -73,8 +74,15 @@ export function mutateBotsJsonAtomic<T>(
     // Compare exact contents rather than mtime: atomic rename, coarse filesystem
     // timestamps and same-ms writes must not make two generations look equal.
     const revision = existsSync(botsJsonPath) ? readFileSync(botsJsonPath, 'utf8') : null;
-    const previous = revision === null ? [] : JSON.parse(revision) as any[];
+    const parsedPrevious = revision === null ? [] : JSON.parse(revision);
+    if (!Array.isArray(parsedPrevious)) {
+      throw new Error(`${botsJsonPath} must contain a JSON array`);
+    }
+    const previous = parsedPrevious as any[];
     const { bots, result } = mutation(previous, { revision });
+    if (!Array.isArray(bots)) {
+      throw new Error(`bots.json mutation must return a JSON array: ${botsJsonPath}`);
+    }
     assertCodexInstanceConfigWrite(previous, bots);
     assertChangedBotConfigInvariants(previous, bots);
     assertQuotaFallbackGraphAcyclic(bots);
@@ -126,10 +134,28 @@ export function readBotsJsonOrEmpty(botsJsonPath: string): any[] {
   try {
     const revision = readFileSync(botsJsonPath, 'utf8');
     const bots = JSON.parse(revision);
-    // Preserve the legacy read helper's permissive scalar/object behavior; only
-    // arrays can serve as whole-file snapshot sources for the writer.
-    return Array.isArray(bots) ? trackBotsJsonSnapshot(bots, botsJsonPath, revision) : bots;
+    // Only valid JSON arrays are usable by callers and trackable as whole-file
+    // snapshot sources. Non-array JSON degrades to an untracked `[]` so read-only
+    // callers never crash with TypeError, while any write attempt still fails closed.
+    return Array.isArray(bots) ? trackBotsJsonSnapshot(bots, botsJsonPath, revision) : [];
   } catch {
     return [];
+  }
+}
+
+/**
+ * Count configured bots on disk for UI gating:
+ * - `0` when `bots.json` is absent or `[]`
+ * - `N` when `bots.json` is a valid bot array
+ * - `null` when `bots.json` exists but is malformed, unreadable, or has invalid entries
+ */
+export function readConfiguredBotCount(botsJsonPath: string): number | null {
+  if (!existsSync(botsJsonPath)) return 0;
+  try {
+    const parsed = JSON.parse(readFileSync(botsJsonPath, 'utf8'));
+    const validation = validateBotConfigEntries(parsed);
+    return validation.ok ? validation.count : null;
+  } catch {
+    return null;
   }
 }

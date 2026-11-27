@@ -1,10 +1,21 @@
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
 import { callDashboard, type DashboardResult } from '../../cli/dashboard-endpoint.js';
+import { validateBotConfigEntries } from '../../setup/bots-config-validation.js';
 import type { DesktopPaths, DesktopRuntimeState, RuntimeSource } from '../shared/types.js';
 import { buildBundledBotmuxCommand, buildExternalBotmuxCommand, type BotmuxCommand } from './node-command.js';
 import { classifyRuntimeSource, countActiveBotmuxDaemonApps, type FleetAppSummary } from './runtime-source.js';
 import { sanitizeDeviceStatusCommandResult } from './device-status.js';
+
+export type BotConfigStatus =
+  | { status: 'not_configured'; count: 0 }
+  | { status: 'configured'; count: number }
+  | { status: 'invalid'; message: string };
+
+/** True when Desktop is running the local 0-bot onboarding dashboard (no configured bots yet). */
+export function isZeroBotOnboardingRunning(state: DesktopRuntimeState): boolean {
+  return state.status === 'running' && state.botCount === 0;
+}
 
 export interface RunResult {
   code: number;
@@ -13,9 +24,10 @@ export interface RunResult {
   signal?: NodeJS.Signals | null;
 }
 
-interface RunCommandOptions {
+export interface RunCommandOptions {
   timeoutMs?: number;
   maxOutputBytes?: number;
+  signal?: AbortSignal;
 }
 
 type RunCommand = (cmd: BotmuxCommand, options?: RunCommandOptions) => Promise<RunResult>;
@@ -55,41 +67,70 @@ function defaultRun(
   cmd: BotmuxCommand,
   timeoutMs = defaultCommandTimeoutMs,
   maxOutputBytes = defaultCommandOutputLimitBytes,
+  signal?: AbortSignal,
 ): Promise<RunResult> {
+  if (signal?.aborted) {
+    return Promise.resolve({
+      code: 1,
+      stdout: '',
+      stderr: 'Command aborted',
+      signal: null,
+    });
+  }
   return new Promise(resolve => {
     const child = spawn(cmd.command, cmd.args, { env: cmd.env, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
     let outputBytes = 0;
     let settled = false;
+    let terminationMessage: string | null = null;
     let forceKillTimer: NodeJS.Timeout | undefined;
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      // Timeout is surfaced as an ordinary failed action so renderer controls
-      // can recover and show the last error without waiting for child close.
-      child.kill();
-      forceKillTimer = setTimeout(() => {
-        if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
-      }, 1_000);
-      forceKillTimer.unref?.();
-      resolve({
-        code: 1,
-        stdout,
-        stderr: `Command timed out after ${timeoutMs}ms`,
-        signal: null,
-      });
-    }, timeoutMs);
+    let postKillTimer: NodeJS.Timeout | undefined;
 
     const finish = (result: RunResult) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      resolve(result);
+      if (forceKillTimer) clearTimeout(forceKillTimer);
+      if (postKillTimer) clearTimeout(postKillTimer);
+      signal?.removeEventListener('abort', onAbort);
+      resolve(terminationMessage !== null
+        ? { code: 1, stdout, stderr: terminationMessage, signal: result.signal ?? null }
+        : result);
     };
 
+    const terminateChild = (forceDelayMs: number, message: string) => {
+      if (settled || terminationMessage !== null) return;
+      terminationMessage = message;
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      if (child.exitCode !== null || child.signalCode !== null) {
+        finish({ code: 1, stdout, stderr: message, signal: child.signalCode });
+        return;
+      }
+      // Wait for actual child exit (bounded by SIGTERM -> forceDelayMs -> SIGKILL
+      // -> 200ms fallback) so abortGraceMs genuinely lets the child stop before
+      // callers inspect fleet-state.json.
+      child.kill();
+      forceKillTimer = setTimeout(() => {
+        if (settled) return;
+        if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+        postKillTimer = setTimeout(() => {
+          finish({ code: 1, stdout, stderr: message, signal: null });
+        }, 200);
+        postKillTimer.unref?.();
+      }, forceDelayMs);
+    };
+    const onAbort = () => {
+      terminateChild(500, 'Command aborted');
+    };
+    const timer = setTimeout(() => {
+      terminateChild(1_000, `Command timed out after ${timeoutMs}ms`);
+    }, timeoutMs);
+    signal?.addEventListener('abort', onAbort, { once: true });
+
     const appendOutput = (target: 'stdout' | 'stderr', chunk: Buffer | string) => {
-      if (settled) return;
+      if (settled || terminationMessage !== null) return;
       const text = String(chunk);
       const bytes = Buffer.byteLength(text);
       if (outputBytes + bytes > maxOutputBytes) {
@@ -116,14 +157,20 @@ function defaultRun(
     child.on('error', error => {
       finish({ code: 1, stdout, stderr: stderr || error.message, signal: null });
     });
-    child.on('close', (code, signal) => {
-      if (forceKillTimer) clearTimeout(forceKillTimer);
+    child.on('exit', (_code, exitSignal) => {
+      // On abort/timeout, settle immediately on child exit instead of waiting for
+      // stdio 'close' in case a grandchild inherited open pipes.
+      if (terminationMessage !== null) {
+        finish({ code: 1, stdout, stderr: terminationMessage, signal: exitSignal });
+      }
+    });
+    child.on('close', (code, closeSignal) => {
       // Signal-only exits still represent a failed desktop action to the UI.
       finish({
         code: code ?? 1,
         stdout,
-        stderr: signal && !stderr ? `Process terminated by signal ${signal}` : stderr,
-        signal,
+        stderr: closeSignal && !stderr ? `Process terminated by signal ${closeSignal}` : stderr,
+        signal: closeSignal,
       });
     });
   });
@@ -174,13 +221,14 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
     cmd,
     options?.timeoutMs ?? deps.commandTimeoutMs,
     options?.maxOutputBytes ?? defaultCommandOutputLimitBytes,
+    options?.signal,
   ));
   const botsPath = join(deps.paths.botmuxHome, 'bots.json');
   const installCliMessage = deps.bundledRuntime
     ? 'The bundled botmux runtime is unavailable. Reinstall Botmux Desktop.'
     : 'Install the global botmux CLI with `npm install -g botmux`, then reopen Botmux Desktop.';
 
-  function command(runtime: RuntimeLaunchTarget, args: string[]): BotmuxCommand {
+  function command(runtime: RuntimeLaunchTarget, args: string[], extraEnv?: NodeJS.ProcessEnv): BotmuxCommand {
     if (runtime.kind === 'bundled') {
       return buildBundledBotmuxCommand({
         nodePath: runtime.nodePath,
@@ -189,6 +237,7 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
         args,
         baseEnv: deps.env,
         pathEnv: deps.shellPathEnv?.(),
+        extraEnv,
       });
     }
     return buildExternalBotmuxCommand({
@@ -198,7 +247,16 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
       baseEnv: deps.env,
       pathEnv: runtime.pathEnv,
       interpreterPath: runtime.interpreterPath,
+      extraEnv,
     });
+  }
+
+  function zeroBotLoopbackExtraEnv(): NodeJS.ProcessEnv {
+    // 0-bot onboarding has no persisted operator host preference yet; always pin
+    // strictly to loopback even if the parent shell inherited 0.0.0.0.
+    return {
+      BOTMUX_DASHBOARD_HOST: '127.0.0.1',
+    };
   }
 
   function currentExternalRuntime(): ExternalRuntimeCandidate | null {
@@ -218,11 +276,23 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
     };
   }
 
-  async function runCliAction(args: string[]): Promise<RunResult> {
+  function invokeRun(cmd: BotmuxCommand, options?: RunCommandOptions): Promise<RunResult> {
+    if (!options) return run(cmd);
+    const cleaned: RunCommandOptions = {};
+    if (options.timeoutMs !== undefined) cleaned.timeoutMs = options.timeoutMs;
+    if (options.maxOutputBytes !== undefined) cleaned.maxOutputBytes = options.maxOutputBytes;
+    if (options.signal !== undefined) cleaned.signal = options.signal;
+    return Object.keys(cleaned).length > 0 ? run(cmd, cleaned) : run(cmd);
+  }
+
+  async function runCliAction(
+    args: string[],
+    options?: RunCommandOptions & { extraEnv?: NodeJS.ProcessEnv },
+  ): Promise<RunResult> {
     // A fleet owned by another install is driven through that install, so the
     // app and a manually installed CLI never fight over the same bots.
     const owner = deps.fleetOwner?.() ?? null;
-    if (owner) return run(command(owner, args));
+    if (owner) return invokeRun(command(owner, args, options?.extraEnv), options);
     const runtime = activeRuntime();
     if (!runtime) return rejectedCliRequired();
 
@@ -235,7 +305,32 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
         signal: null,
       };
     }
-    return run(command(runtime, args));
+    return invokeRun(command(runtime, args, options?.extraEnv), options);
+  }
+
+  async function runStartOrRestartAction(
+    action: 'start' | 'restart',
+    options?: RunCommandOptions,
+  ): Promise<RunResult> {
+    // External CLIs (including older global installs via fleetOwner) may reject
+    // `--allow-empty`; only pass `--allow-empty` + loopback override to our
+    // bundled runtime when 0 bots are configured.
+    const owner = deps.fleetOwner?.() ?? null;
+    if (owner) return invokeRun(command(owner, [action]), options);
+    const runtime = activeRuntime();
+    if (!runtime) return rejectedCliRequired();
+
+    const state = await service.getState();
+    if (!state.runtimeManaged && (state.status === 'running' || state.status === 'degraded')) {
+      return {
+        code: 1,
+        stdout: '',
+        stderr: state.message ?? 'Current botmux runtime is not controlled by the selected CLI',
+        signal: null,
+      };
+    }
+    const inv = startOrRestartInvocation(action, runtime);
+    return invokeRun(command(runtime, inv.args, inv.extraEnv), options);
   }
 
   function externalSource(runtime: RuntimeLaunchTarget): RuntimeSource {
@@ -248,23 +343,14 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
     return ownedPath && (!sourceVersion || sourceVersion === runtime.version);
   }
 
-  function readBotConfig(): { status: 'not_configured'; count: 0 } | { status: 'configured'; count: number } | { status: 'invalid'; message: string } {
+  function readBotConfig(): BotConfigStatus {
     if (!deps.fs.existsSync(botsPath)) return { status: 'not_configured', count: 0 };
     try {
       const parsed = JSON.parse(deps.fs.readFileSync(botsPath, 'utf-8'));
-      if (!Array.isArray(parsed)) return { status: 'invalid', message: 'bots.json must contain a JSON array' };
-      if (parsed.length === 0) return { status: 'not_configured', count: 0 };
-      for (let i = 0; i < parsed.length; i += 1) {
-        const bot = parsed[i] as { larkAppId?: unknown; larkAppSecret?: unknown } | null;
-        if (!bot || typeof bot !== 'object') return { status: 'invalid', message: `bots.json entry ${i} must be an object` };
-        if (typeof bot.larkAppId !== 'string' || bot.larkAppId.length === 0) {
-          return { status: 'invalid', message: `bots.json entry ${i} is missing larkAppId` };
-        }
-        if (typeof bot.larkAppSecret !== 'string' || bot.larkAppSecret.length === 0) {
-          return { status: 'invalid', message: `bots.json entry ${i} is missing larkAppSecret` };
-        }
-      }
-      return { status: 'configured', count: parsed.length };
+      const validation = validateBotConfigEntries(parsed);
+      if (!validation.ok) return { status: 'invalid', message: validation.message };
+      if (validation.count === 0) return { status: 'not_configured', count: 0 };
+      return { status: 'configured', count: validation.count };
     } catch (err) {
       return { status: 'invalid', message: err instanceof Error ? err.message : String(err) };
     }
@@ -281,6 +367,7 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
       // A malformed bots.json is actionable user state, not an empty setup.
       return {
         status: 'degraded',
+        degradedReason: 'invalid_bots_json',
         appVersion: deps.appVersion,
         runtimeVersion: active?.version ?? null,
         runtimeSource: selectedSource,
@@ -294,25 +381,25 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
       };
     }
 
-    if (config.status === 'not_configured') {
-      return {
-        status: 'not_configured',
-        appVersion: deps.appVersion,
-        runtimeVersion: active?.version ?? null,
-        runtimeSource: selectedSource,
-        runtimeManaged: Boolean(active),
-        runtimePath: active?.cliPath ?? null,
-        botCount: 0,
-        onlineDaemonCount: 0,
-        attentionCount: 0,
-        dashboardUrl: null,
-        message: active ? undefined : installCliMessage,
-      };
-    }
-
     if (!active) {
+      if (config.status === 'not_configured') {
+        return {
+          status: 'not_configured',
+          appVersion: deps.appVersion,
+          runtimeVersion: null,
+          runtimeSource: 'none',
+          runtimeManaged: false,
+          runtimePath: null,
+          botCount: 0,
+          onlineDaemonCount: 0,
+          attentionCount: 0,
+          dashboardUrl: null,
+          message: installCliMessage,
+        };
+      }
       return {
         status: 'degraded',
+        degradedReason: 'missing_runtime',
         appVersion: deps.appVersion,
         runtimeVersion: null,
         runtimeSource: 'none',
@@ -351,6 +438,7 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
             }
             return {
               status: 'degraded',
+              degradedReason: 'external_unmanaged',
               appVersion: deps.appVersion,
               runtimeVersion: active.version,
               runtimeSource: 'global-cli',
@@ -381,6 +469,7 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
         // silently pretending the runtime is stopped.
         return {
           status: 'degraded',
+          degradedReason: 'fleet_discovery',
           appVersion: deps.appVersion,
           runtimeVersion: active.version,
           runtimeSource: selectedSource,
@@ -393,6 +482,21 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
           message: err instanceof Error ? err.message : String(err),
         };
       }
+    }
+
+    if (config.status === 'not_configured') {
+      return {
+        status: 'not_configured',
+        appVersion: deps.appVersion,
+        runtimeVersion: active.version,
+        runtimeSource: selectedSource,
+        runtimeManaged: true,
+        runtimePath: active.cliPath,
+        botCount: 0,
+        onlineDaemonCount: 0,
+        attentionCount: 0,
+        dashboardUrl: null,
+      };
     }
 
     return {
@@ -409,7 +513,26 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
     };
   }
 
+  function startOrRestartInvocation(
+    action: 'start' | 'restart',
+    runtime: RuntimeLaunchTarget,
+  ): {
+    args: string[];
+    extraEnv?: NodeJS.ProcessEnv;
+  } {
+    if (runtime.kind === 'bundled' && readBotConfig().status === 'not_configured') {
+      return {
+        args: [action, '--allow-empty'],
+        extraEnv: zeroBotLoopbackExtraEnv(),
+      };
+    }
+    return { args: [action] };
+  }
+
   const service = {
+    readBotConfigStatus(): BotConfigStatus {
+      return readBotConfig();
+    },
     getState(): Promise<DesktopRuntimeState> {
       if (stateInFlight) return stateInFlight;
       // Desktop has both polling and renderer-initiated refreshes. Coalesce
@@ -420,23 +543,36 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
       });
       return stateInFlight;
     },
-    async start(): Promise<RunResult> {
-      return runCliAction(['start']);
+    async start(options?: { signal?: AbortSignal }): Promise<RunResult> {
+      return runStartOrRestartAction('start', { signal: options?.signal });
     },
-    async stop(): Promise<RunResult> {
-      return runCliAction(['stop']);
+    async stop(options?: { timeoutMs?: number }): Promise<RunResult> {
+      return runCliAction(['stop'], { timeoutMs: options?.timeoutMs });
     },
-    async restart(): Promise<RunResult> {
-      return runCliAction(['restart']);
+    async stopIfEmpty(options?: { supervisorPid?: number; hostPid?: number; timeoutMs?: number }): Promise<RunResult> {
+      const runtime = deps.bundledRuntime ?? activeRuntime();
+      if (!runtime) return rejectedCliRequired();
+      const args = ['stop', '--if-empty'];
+      if (typeof options?.supervisorPid === 'number' && Number.isSafeInteger(options.supervisorPid) && options.supervisorPid > 0) {
+        args.push('--supervisor-pid', String(options.supervisorPid));
+      }
+      if (typeof options?.hostPid === 'number' && Number.isSafeInteger(options.hostPid) && options.hostPid > 0) {
+        args.push('--host-pid', String(options.hostPid));
+      }
+      return invokeRun(command(runtime, args), { timeoutMs: options?.timeoutMs });
+    },
+    async restart(options?: { signal?: AbortSignal }): Promise<RunResult> {
+      return runStartOrRestartAction('restart', { signal: options?.signal });
     },
     async takeover(): Promise<RunResult> {
       const state = await this.getState();
       const runtime = activeRuntime();
       if (!runtime) return rejectedCliRequired();
       if (runtime.kind === 'bundled') {
+        const inv = startOrRestartInvocation('restart', runtime);
         // Replace core processes only. The generated ecosystem pins their
         // interpreter to bundled Node, while unrelated plugin services survive.
-        return run(command(runtime, ['restart']));
+        return invokeRun(command(runtime, inv.args, inv.extraEnv));
       }
       return {
         code: state.runtimeManaged ? 0 : 1,
@@ -447,9 +583,10 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
         signal: null,
       };
     },
-    async restartBundled(): Promise<RunResult> {
+    async restartBundled(options?: { signal?: AbortSignal }): Promise<RunResult> {
       if (!deps.bundledRuntime) return rejectedCliRequired();
-      return run(command(deps.bundledRuntime, ['restart']));
+      const inv = startOrRestartInvocation('restart', deps.bundledRuntime);
+      return invokeRun(command(deps.bundledRuntime, inv.args, inv.extraEnv), { signal: options?.signal });
     },
     async dashboard(): Promise<RunResult> {
       const runtime = activeRuntime();

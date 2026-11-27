@@ -41,30 +41,31 @@ function probeHerdrVersion(): string | undefined {
 /** Run `curl -fsSL https://herdr.dev/install.sh | sh`. Returns true on
  *  exit 0. Output is inherited so the user sees the installer's progress
  *  and any error it prints. */
-function runCurlInstaller(): boolean {
+function runCurlInstaller(opts?: { quiet?: boolean; timeoutMs?: number }): boolean {
   // Use bash -c with a pipeline so we can capture failure of either side via
   // pipefail. Without pipefail, `curl ... | sh` reports `sh`'s status only,
   // which is useless when the network fetch silently 404s.
   const cmd = 'set -o pipefail; curl -fsSL https://herdr.dev/install.sh | sh';
   const result = spawnSync('bash', ['-c', cmd], {
-    stdio: 'inherit',
-    timeout: 5 * 60_000, // 5 min — slow networks downloading a release binary
+    stdio: opts?.quiet ? 'ignore' : 'inherit',
+    timeout: opts?.timeoutMs ?? 5 * 60_000, // 5 min — slow networks downloading a release binary
   });
   return result.status === 0;
 }
 
-export async function ensureHerdr(): Promise<HerdrResult> {
+export async function ensureHerdr(opts?: { quiet?: boolean; installTimeoutMs?: number }): Promise<HerdrResult> {
   const existing = probeHerdrVersion();
   if (existing) {
     return { installed: true, version: existing, freshInstall: false };
   }
 
-  console.log('⚠️  herdr 未检测到，正在通过官方 install.sh 安装...');
-  const ok = runCurlInstaller();
+  const quiet = opts?.quiet === true;
+  if (!quiet) console.log('⚠️  herdr 未检测到，正在通过官方 install.sh 安装...');
+  const ok = runCurlInstaller({ quiet, timeoutMs: opts?.installTimeoutMs });
   if (ok) {
     const after = probeHerdrVersion();
     if (after) {
-      console.log(`✅ herdr ${after} 安装完成`);
+      if (!quiet) console.log(`✅ herdr ${after} 安装完成`);
       return { installed: true, version: after, freshInstall: true };
     }
     return {

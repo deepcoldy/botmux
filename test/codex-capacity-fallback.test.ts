@@ -25,6 +25,16 @@ import {
 } from '../src/core/codex-capacity-fallback.js';
 import { config } from '../src/config.js';
 import * as sessionStore from '../src/services/session-store.js';
+import {
+  bindStreamCardDisplayTarget,
+  schedulePostTerminalStatusSettle,
+} from '../src/core/worker-pool.js';
+import {
+  acquireTurnStreamingCardPostSlot,
+  classifyStreamingCardPostError,
+  hashStreamingCardBody,
+  recordStreamingCardPostFailure,
+} from '../src/core/streaming-card-post-slot.js';
 
 const APP = 'cli_codex_cap';
 const CHAT = 'oc_chat';
@@ -349,6 +359,147 @@ describe('handleCodexCapacityRetry', () => {
     expect(harness.askInputs).toHaveLength(2);
     expect(harness.askInputs[1]?.requestId).toBe(`${nextTurnId}:gpt-5.4:gpt-5.3-codex`);
     expect(harness.forkedCalls[1]?.spawnModelOverride).toBe('gpt-5.3-codex');
+  });
+
+  it('moves both current and pending turn to the hop turn and rotates slots so the new card never reuses the prior uuid', async () => {
+    // Pre-hop turn: currentTurnId and pendingTurnId both hold the overloaded turn.
+    const ds = makeDs({
+      currentTurnId: TURN,
+      streamCardTurnGeneration: 7,
+      streamCardPending: true,
+      streamCardPendingTurnId: TURN,
+    });
+    // Simulate an overloaded-turn card that landed but returned 500: its
+    // commit-unknown slot would otherwise be sticky for same-generation retries.
+    const seeded = acquireTurnStreamingCardPostSlot(ds, {
+      sessionId: ds.session.sessionId,
+      larkAppId: APP,
+      anchorId: 'om_root',
+      replyTargetKey: 'thread:om_root',
+      turnGeneration: 7,
+      canonicalTurnId: TURN,
+    });
+    recordStreamingCardPostFailure(
+      ds,
+      seeded.slot,
+      classifyStreamingCardPostError({ isAxiosError: true, response: { status: 500, data: { code: 2200 } } }),
+      hashStreamingCardBody('overloaded-turn'),
+      'working',
+    );
+
+    const harness = makeDeps(ds);
+    const { trigger } = makeTrigger(ds);
+    expect(handleCodexCapacityRetry(ds, trigger, harness.deps)).toBe(true);
+    await flushMicrotasks();
+
+    const hopTurnId = harness.forkedCalls[0]?.opts.turnId as string;
+    expect(hopTurnId).toBeTruthy();
+    expect(hopTurnId).not.toBe(TURN);
+
+    // Both turn anchors move to the downgraded worker's hop turn. This is the
+    // shared precondition for display binding, the health watchdog arm gate
+    // (currentTurnId === turnId) and turn_terminal ownership.
+    expect(ds.currentTurnId).toBe(hopTurnId);
+    expect(ds.streamCardPendingTurnId).toBe(hopTurnId);
+    expect(ds.streamCardPending).toBe(true);
+    expect(ds.streamCardTurnGeneration).toBe(8);
+
+    // The downgraded worker's card allocates a fresh slot instead of
+    // deduplicating onto the overloaded turn's possibly-landed message.
+    const after = acquireTurnStreamingCardPostSlot(ds, {
+      sessionId: ds.session.sessionId,
+      larkAppId: APP,
+      anchorId: 'om_root',
+      replyTargetKey: 'thread:om_root',
+      turnGeneration: 8,
+      canonicalTurnId: hopTurnId,
+    });
+    expect(after.reused).toBe(false);
+    expect(after.slot.uuid).not.toBe(seeded.slot.uuid);
+  });
+
+  it('binds the replacement card display and accepts the hop turn terminal while rejecting the dead old turn', async () => {
+    const ds = makeDs({
+      currentTurnId: TURN,
+      streamCardId: 'om_cap_live_card',
+      workerGeneration: 2,
+      streamCardTurnGeneration: 7,
+      streamCardPending: true,
+      streamCardPendingTurnId: TURN,
+    });
+    ds.session.workerGeneration = 2;
+    ds.lastTurnTerminalStatus = 'completed';
+    const harness = makeDeps(ds);
+    const { trigger } = makeTrigger(ds);
+    expect(handleCodexCapacityRetry(ds, trigger, harness.deps)).toBe(true);
+    await flushMicrotasks();
+    const hopTurnId = harness.forkedCalls[0]?.opts.turnId as string;
+    expect(ds.currentTurnId).toBe(hopTurnId);
+
+    // Display target follows the hop turn, not the dead overloaded turn.
+    bindStreamCardDisplayTarget(ds, 'om_cap_live_card', ds.streamCardPendingTurnId);
+    expect(ds.streamCardDisplayTarget?.turnId).toBe(hopTurnId);
+
+    // A completed terminal for the hop turn is accepted (schedules a settle
+    // timer); one for the old turn is rejected by the currentTurnId gate.
+    vi.useFakeTimers();
+    try {
+      const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+      schedulePostTerminalStatusSettle(ds, { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: TURN, status: 'completed' } as any);
+      const afterOldTurn = setTimeoutSpy.mock.calls.length;
+      schedulePostTerminalStatusSettle(ds, { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: hopTurnId, status: 'completed' } as any);
+      expect(setTimeoutSpy.mock.calls.length).toBeGreaterThan(afterOldTurn);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('still moves both turn anchors and rotates the slot when post-switch bookkeeping throws, since the hop runs first', async () => {
+    const ds = makeDs({
+      currentTurnId: TURN,
+      streamCardTurnGeneration: 7,
+      streamCardPending: true,
+      streamCardPendingTurnId: TURN,
+    });
+    const seeded = acquireTurnStreamingCardPostSlot(ds, {
+      sessionId: ds.session.sessionId,
+      larkAppId: APP,
+      anchorId: 'om_root',
+      replyTargetKey: 'thread:om_root',
+      turnGeneration: 7,
+      canonicalTurnId: TURN,
+    });
+    recordStreamingCardPostFailure(
+      ds,
+      seeded.slot,
+      classifyStreamingCardPostError({ isAxiosError: true, response: { status: 500, data: { code: 2200 } } }),
+      hashStreamingCardBody('overloaded-turn-2'),
+      'working',
+    );
+
+    // rememberLastCliInput failing must not skip the turn rotation: the switch
+    // still reports 'switched', but the generation/slot/anchor change happens first.
+    const harness = makeDeps(ds, {
+      rememberLastInput: () => { throw new Error('bookkeeping boom'); },
+    });
+    const { trigger } = makeTrigger(ds);
+    expect(handleCodexCapacityRetry(ds, trigger, harness.deps)).toBe(true);
+    await flushMicrotasks();
+
+    const hopTurnId = harness.forkedCalls[0]?.opts.turnId as string;
+    expect(ds.streamCardTurnGeneration).toBe(8);
+    expect(ds.currentTurnId).toBe(hopTurnId);
+    expect(ds.streamCardPendingTurnId).toBe(hopTurnId);
+    const after = acquireTurnStreamingCardPostSlot(ds, {
+      sessionId: ds.session.sessionId,
+      larkAppId: APP,
+      anchorId: 'om_root',
+      replyTargetKey: 'thread:om_root',
+      turnGeneration: 8,
+      canonicalTurnId: hopTurnId,
+    });
+    expect(after.reused).toBe(false);
+    expect(after.slot.uuid).not.toBe(seeded.slot.uuid);
   });
 
   it('pins the fallback model for the topic when user chooses pin and has operate permission', async () => {

@@ -75,7 +75,7 @@ The bot updates its card as it works and posts the result when finished. You can
 
 - **New-user path**: [Documentation home](https://deepcoldy.github.io/botmux/en/) · [Quickstart](https://deepcoldy.github.io/botmux/en/quickstart) · [FAQ](https://deepcoldy.github.io/botmux/en/faq)
 - **More ways to collaborate**: [Parallel topics](https://deepcoldy.github.io/botmux/en/multi-topic) · [Roles and teams](https://deepcoldy.github.io/botmux/en/roles) · [Separate sessions per person](https://deepcoldy.github.io/botmux/en/global-settings#xpi) · [Voice summaries](https://deepcoldy.github.io/botmux/en/voice)
-- **Supported AI tools**: 30+ CLI / agent adapters; [see the full list and configuration](https://deepcoldy.github.io/botmux/en/adapters).
+- **Supported AI tools**: 30+ CLI / agent adapters, including local NCA. [See the full list and configuration](https://deepcoldy.github.io/botmux/en/adapters).
 - **Go deeper when needed**: [Command reference](https://deepcoldy.github.io/botmux/en/cli-commands) · [bots.json configuration](https://deepcoldy.github.io/botmux/en/bots-json) · [Zero prompt injection](https://deepcoldy.github.io/botmux/en/bots-json#zero-prompt-injection) · [Best practices](https://deepcoldy.github.io/botmux/en/best-practices) · [Architecture](https://deepcoldy.github.io/botmux/en/architecture)
 - **Multiple machines and teams**: self-host the open-source [Central Platform](https://deepcoldy.github.io/botmux/en/platform); a single machine doesn't need it.
 - **Updates and maintenance**: [Upgrade guide](https://deepcoldy.github.io/botmux/en/cli-commands#upgrade) · [Global settings](https://deepcoldy.github.io/botmux/en/global-settings) · [Common pitfalls](https://deepcoldy.github.io/botmux/en/pitfalls)
