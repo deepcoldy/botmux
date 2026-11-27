@@ -30444,9 +30444,14 @@ function scheduleSubmitFailureNotify(
         }
         // A late exact history match is the same owned-log evidence as an
         // immediate one; other CLIs' rechecks stay on the terminal fallback.
-        if (settlement.ownershipProven === true && codexHistoryMatchProvesConsumption()) {
-          acknowledgeNativeInputConsumed(turnIdentity?.turnId, 'codex_history_match',
+        const deferredProofKind = settlement.ownershipProven === true || settlement.proveConsumed
+          ? ownedSubmitConsumptionProofKind() : undefined;
+        if (deferredProofKind && settlement.ownershipProven === true) {
+          acknowledgeNativeInputConsumed(turnIdentity?.turnId, deferredProofKind,
             cliSessionId ?? lastInitConfig?.cliSessionId, undefined, turnIdentity?.dispatchAttempt);
+        } else if (deferredProofKind && settlement.proveConsumed) {
+          watchDeferredConsumptionProof(turnIdentity?.turnId, turnIdentity?.dispatchAttempt, deferredProofKind,
+            settlement.proveConsumed, settlement.settleConsumed);
         }
         onConfirmed?.(cliSessionId, settlement.unprovenCliSessionId);
         log(`Deferred recheck found submit in ${transcriptLabel} — suppressing warning. preview="${preview}"`);
@@ -33406,9 +33411,15 @@ async function flushPending(): Promise<void> {
       // same native conversation that the match was attributed to.
       // `submitted` keeps its meaning (an exact same-text line appeared); only a
       // POSITIVELY owned line proves this pane consumed the input.
-      if (result?.submitted === true && result.ownershipProven === true && codexHistoryMatchProvesConsumption()) {
-        acknowledgeNativeInputConsumed(item.turnId, 'codex_history_match',
+      const immediateProofKind = result?.submitted === true
+        && (result.ownershipProven === true || typeof result.proveConsumed === 'function')
+        ? ownedSubmitConsumptionProofKind() : undefined;
+      if (immediateProofKind && result?.ownershipProven === true) {
+        acknowledgeNativeInputConsumed(item.turnId, immediateProofKind,
           result.cliSessionId ?? lastInitConfig?.cliSessionId, undefined, item.dispatchAttempt);
+      } else if (immediateProofKind && typeof result?.proveConsumed === 'function') {
+        watchDeferredConsumptionProof(item.turnId, item.dispatchAttempt, immediateProofKind,
+          result.proveConsumed, result.settleConsumed);
       }
       if (lastInitConfig?.cliId === 'codex' && result?.submitted !== false) {
         const threadId = result?.cliSessionId
@@ -33631,12 +33642,13 @@ async function flushPending(): Promise<void> {
                       dispatchAttempt: item.dispatchAttempt,
                     });
                   }
-                  if (proof.ownershipProven === true
-                    && typeof codexHistoryMatchProvesConsumption === 'function'
-                    && codexHistoryMatchProvesConsumption()) {
+                  const activationProofKind = proof.ownershipProven === true
+                    && typeof ownedSubmitConsumptionProofKind === 'function'
+                    ? ownedSubmitConsumptionProofKind() : undefined;
+                  if (activationProofKind) {
                     acknowledgeNativeInputConsumed?.(
                       item.turnId,
-                      'codex_history_match',
+                      activationProofKind,
                       proof.cliSessionId ?? lastInitConfig?.cliSessionId,
                       undefined,
                       item.dispatchAttempt,
@@ -47520,8 +47532,9 @@ function initializeWorkerSessionContract(msg: Extract<DaemonToWorker, { type: 'i
 
 /** Native acceptance proof for shared group background coverage. Emitted only
  * from boundaries where the CLI itself evidenced this exact input: Codex's
- * exact owned history line, a Codex RPC turn/start acknowledgement, or a
- * Claude transcript user record whose full normalised content matched. Never
+ * exact owned history line, a Codex RPC turn/start acknowledgement, a
+ * Claude transcript user record whose full normalised content matched, or an
+ * Antigravity USER_INPUT in the pane's own conversation transcript. Never
  * from IPC arrival, queue ownership or a generic adapter `submitted` flag. */
 function recordStructuredInput(
   turnId: string | undefined,
@@ -47612,6 +47625,59 @@ function publishTraexNativeContextReceipt(
  * text in the owned history.jsonl. RPC and adopted panes have other owners. */
 function codexHistoryMatchProvesConsumption(): boolean {
   return lastInitConfig?.cliId === 'codex' && !lastInitConfig.adoptMode && !codexRpcEngine;
+}
+
+/** Proof kind an adapter submit result with `ownershipProven: true` carries:
+ * Codex's exact owned history line, or Antigravity's USER_INPUT record in the
+ * pane's own (process-log-resolved) conversation transcript. Adopted panes and
+ * CLIs whose `ownershipProven` means something weaker yield no proof. */
+function ownedSubmitConsumptionProofKind():
+  | 'codex_history_match' | 'antigravity_transcript_user_input' | undefined {
+  if (codexHistoryMatchProvesConsumption()) return 'codex_history_match';
+  if (lastInitConfig?.cliId === 'antigravity' && !lastInitConfig.adoptMode) return 'antigravity_transcript_user_input';
+  return undefined;
+}
+
+/** How long a submitted-but-unproven input keeps being probed for native
+ * consumption. A queued type-ahead input is only fed to the model when the
+ * running turn ends, which may take minutes. */
+const DEFERRED_CONSUMPTION_PROOF_WINDOW_MS = 15 * 60_000;
+const DEFERRED_CONSUMPTION_PROOF_MIN_POLL_MS = 500;
+const DEFERRED_CONSUMPTION_PROOF_MAX_POLL_MS = 5_000;
+
+/** Poll an adapter's read-only consumption probe off the write path, and send
+ * the same receipt an immediate `ownershipProven` would have. Stops at the
+ * proof, the turn's terminal (settling the probe), a CLI respawn, close, or
+ * the window's end; a missed proof only leaves coverage to the existing
+ * terminal fallback. */
+function watchDeferredConsumptionProof(
+  turnId: string | undefined,
+  dispatchAttempt: number | undefined,
+  proofKind: NonNullable<ReturnType<typeof ownedSubmitConsumptionProofKind>>,
+  prove: () => { cliSessionId?: string } | undefined,
+  settle?: () => void,
+): void {
+  if (!turnId) return;
+  const generation = cliSpawnGeneration;
+  const deadline = Date.now() + scaleMs(DEFERRED_CONSUMPTION_PROOF_WINDOW_MS);
+  let interval = DEFERRED_CONSUMPTION_PROOF_MIN_POLL_MS;
+  const schedule = () => {
+    const timer = setTimeout(tick, scaleMs(interval));
+    timer.unref?.();
+    interval = Math.min(interval * 2, DEFERRED_CONSUMPTION_PROOF_MAX_POLL_MS);
+  };
+  const tick = () => {
+    // A finished turn's input either already has its record or was dropped:
+    // release it so it cannot take a later identical input's record.
+    if (turnTerminalEmitted(turnId, dispatchAttempt)) { try { settle?.(); } catch { /* best effort */ } return; }
+    if (closeRequested || cliSpawnGeneration !== generation || Date.now() > deadline) return;
+    let proof: { cliSessionId?: string } | undefined;
+    try { proof = prove(); } catch { proof = undefined; }
+    if (!proof) { schedule(); return; }
+    acknowledgeNativeInputConsumed(turnId, proofKind,
+      proof.cliSessionId ?? lastInitConfig?.cliSessionId, undefined, dispatchAttempt);
+  };
+  schedule();
 }
 
 function receiveOrdinaryImTurn(turnId: string): 'new' | 'inflight' | 'committed' {

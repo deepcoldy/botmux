@@ -65,7 +65,8 @@ export type GroupContextNativeInputProofKind =
   | 'codex_history_match'
   | 'codex_rpc_turn_start'
   | 'codex_rpc_turn_steer'
-  | 'claude_transcript_user_record';
+  | 'claude_transcript_user_record'
+  | 'antigravity_transcript_user_input';
 
 export interface GroupContextNativeInputProof {
   kind: GroupContextNativeInputProofKind;
@@ -75,6 +76,7 @@ export interface GroupContextNativeInputProof {
 
 export const GROUP_CONTEXT_NATIVE_INPUT_PROOF_KINDS: readonly GroupContextNativeInputProofKind[] = [
   'codex_history_match', 'codex_rpc_turn_start', 'codex_rpc_turn_steer', 'claude_transcript_user_record',
+  'antigravity_transcript_user_input',
 ];
 
 interface StoredContext {

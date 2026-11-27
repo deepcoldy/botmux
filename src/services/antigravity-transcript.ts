@@ -1287,19 +1287,19 @@ export function resolveAntigravityCandidateMinByteOffset(
   return null;
 }
 
-/** 统计 transcriptPath 的 [minByteOffset, maxByteOffset) 区间内，正文 SHA-256 命中 textSha256 的 USER_INPUT 次数。 */
-export function countAntigravityUserInputMatches(
+/** transcriptPath 的 [minByteOffset, maxByteOffset) 区间内，正文 SHA-256 命中 textSha256 的 USER_INPUT 行起始偏移（升序）。 */
+export function listAntigravityUserInputMatchOffsets(
   transcriptPath: string,
   textSha256: string,
   minByteOffset = 0,
   maxByteOffset?: number,
-): number {
-  if (!transcriptPath || !existsSync(transcriptPath)) return 0;
-  if (maxByteOffset !== undefined && maxByteOffset <= minByteOffset) return 0;
-  let count = 0;
+): number[] {
+  if (!transcriptPath || !existsSync(transcriptPath)) return [];
+  if (maxByteOffset !== undefined && maxByteOffset <= minByteOffset) return [];
+  const offsets: number[] = [];
   scanJsonlFromOffset(transcriptPath, minByteOffset, {
     ...(maxByteOffset !== undefined ? { endOffset: maxByteOffset } : {}),
-    onLine: line => {
+    onLine: (line, lineStart) => {
       if (!line.trim()) return;
       let rec: any;
       try {
@@ -1309,10 +1309,20 @@ export function countAntigravityUserInputMatches(
       }
       if (!isExplicitUserInput(rec)) return;
       const unwrapped = unwrapAntigravityUserInput(typeof rec.content === 'string' ? rec.content : '');
-      if (hashAntigravitySubmittedText(unwrapped) === textSha256) count += 1;
+      if (hashAntigravitySubmittedText(unwrapped) === textSha256) offsets.push(lineStart);
     },
   });
-  return count;
+  return offsets;
+}
+
+/** 统计 transcriptPath 的 [minByteOffset, maxByteOffset) 区间内，正文 SHA-256 命中 textSha256 的 USER_INPUT 次数。 */
+export function countAntigravityUserInputMatches(
+  transcriptPath: string,
+  textSha256: string,
+  minByteOffset = 0,
+  maxByteOffset?: number,
+): number {
+  return listAntigravityUserInputMatchOffsets(transcriptPath, textSha256, minByteOffset, maxByteOffset).length;
 }
 
 const COMPLETED_TURN_INITIAL_TAIL_BYTES = 256 * 1024;

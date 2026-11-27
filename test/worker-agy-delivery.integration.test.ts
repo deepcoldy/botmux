@@ -70,7 +70,11 @@ async function waitFor(check: () => boolean, logs: string[], timeout = 10_000): 
   throw new Error(`Worker condition timed out\n${logs.join('')}`);
 }
 
-function startWorker(mode: 'delayed' | 'interrupted' | 'manual' | 'native-error' | 'quota' | 'quota-with-footer' | 'expired-quota' | 'running' | 'foreground-tool', cliId: 'antigravity' | 'traex' = 'antigravity') {
+function startWorker(
+  mode: 'prompt' | 'delayed' | 'interrupted' | 'manual' | 'native-error' | 'quota' | 'quota-with-footer' | 'expired-quota' | 'running' | 'foreground-tool',
+  cliId: 'antigravity' | 'traex' = 'antigravity',
+  opts: { ownTranscript?: boolean; followupDelayMs?: number; transcriptLagMs?: number; followupTranscriptLagMs?: number } = {},
+) {
   // Closing a worker also stops its OS session scope. A fixed session ID would
   // let parallel runtime/test invocations terminate each other's fake CLI.
   const sessionId = `agy-delivery-${randomUUID()}`;
@@ -140,6 +144,12 @@ const screen = ${JSON.stringify(screen)};
 const delayed = ${mode === 'delayed'};
 const manual = ${mode === 'manual'};
 const foregroundTool = ${mode === 'foreground-tool'};
+const ownTranscript = ${opts.ownTranscript === true};
+const fullTranscript = ${JSON.stringify(join(transcriptDir, 'transcript_full.jsonl'))};
+const logFileAt = process.argv.indexOf('--log-file');
+const logFile = logFileAt >= 0 ? process.argv[logFileAt + 1] : '';
+// Real agy writes its --log-file from startup, then names the conversation it streams.
+if (logFile) fs.appendFileSync(logFile, 'I1127 00:00:00.000000 1 main.go:1] starting\\n');
 const initialScreenGate = ${JSON.stringify(initialScreenGate)};
 process.stdin.setRawMode?.(true);
 const drawInitialScreen = () => process.stdout.write('\\x1b[2J\\x1b[H' + screen);
@@ -173,7 +183,14 @@ process.stdin.on('data', chunk => {
         ? { display: marker, workspace: ${JSON.stringify(dataDir)}, timestamp: Date.now() }
         : { text: marker, session_id: ${JSON.stringify(nativeId)}, ts: Date.now() };
       fs.appendFileSync(history, JSON.stringify(row) + '\\n');
-    }, delayed ? 9_000 : 0);
+      // Real agy names the conversation it streams in its own --log-file.
+      if (logFile) fs.appendFileSync(logFile, 'I1127 00:00:01.000000 1 x.go:1] Streaming conversation ' + ${JSON.stringify(nativeId)} + '\\n');
+      if (ownTranscript) setTimeout(() => {
+        // agy feeds the input to its model: this pane's own conversation transcript.
+        fs.appendFileSync(fullTranscript, JSON.stringify({ type: 'USER_INPUT', source: 'USER_EXPLICIT', status: 'DONE',
+          content: '<USER_REQUEST>\\n' + marker + '\\n</USER_REQUEST>\\n<ADDITIONAL_METADATA>\\nnow\\n</ADDITIONAL_METADATA>' }) + '\\n');
+      }, marker === 'FOLLOWUP_UNIQUE_MARKER' ? ${opts.followupTranscriptLagMs ?? opts.transcriptLagMs ?? 0} : ${opts.transcriptLagMs ?? 0});
+    }, marker === 'FOLLOWUP_UNIQUE_MARKER' && ${opts.followupDelayMs ?? -1} >= 0 ? ${opts.followupDelayMs ?? -1} : delayed ? 9_000 : 0);
     if (foregroundTool) continue; // Keep the same composer on screen while the tool runs.
     // Force several idle edges before the delayed receipt appears. Re-enqueueing
     // the activation on a false submit result used to paste the whole input again.
@@ -276,6 +293,66 @@ describe('worker delayed activation and interrupted Antigravity delivery', () =>
 
     appendFileSync(worker.transcript, JSON.stringify({ type: 'PLANNER_RESPONSE', content: 'Finished.' }) + '\n');
     await waitFor(() => frames().some(m => m.type === 'prompt_ready'), worker.logs, 15_000);
+  }, 60_000);
+
+  const consumedReceipts = (messages: WorkerToDaemon[]) => messages.filter(m => m.type === 'native_input_consumed');
+
+  it('acknowledges native consumption of the activation and a follow-up once the own transcript records them', async () => {
+    const worker = startWorker('prompt', 'antigravity', { ownTranscript: true });
+    await waitFor(() => consumedReceipts(worker.messages).some(m => m.type === 'native_input_consumed' && m.turnId === 'om_initial'),
+      worker.logs, 30_000);
+    expect(consumedReceipts(worker.messages)).toEqual([expect.objectContaining({
+      type: 'native_input_consumed', turnId: 'om_initial', proofKind: 'antigravity_transcript_user_input',
+      nativeSessionId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+    })]);
+    await waitFor(() => worker.messages.some(m => m.type === 'prompt_ready'), worker.logs, 20_000);
+    worker.child.send({ type: 'message', content: 'FOLLOWUP_UNIQUE_MARKER', turnId: 'om_followup' } satisfies DaemonToWorker);
+    await waitFor(() => consumedReceipts(worker.messages).some(m => m.type === 'native_input_consumed' && m.turnId === 'om_followup'),
+      worker.logs, 20_000);
+    expect(consumedReceipts(worker.messages).filter(m => m.type === 'native_input_consumed' && m.turnId === 'om_followup'))
+      .toEqual([expect.objectContaining({ proofKind: 'antigravity_transcript_user_input' })]);
+  }, 60_000);
+
+  it('acknowledges native consumption of a follow-up whose receipt only the deferred recheck sees', async () => {
+    // History lands before the 20s recheck; agy feeds the input only after it.
+    const worker = startWorker('prompt', 'antigravity', { ownTranscript: true, followupDelayMs: 600, followupTranscriptLagMs: 22_000 });
+    await waitFor(() => consumedReceipts(worker.messages).some(m => m.type === 'native_input_consumed' && m.turnId === 'om_initial'),
+      worker.logs, 30_000);
+    await waitFor(() => worker.messages.some(m => m.type === 'prompt_ready'), worker.logs, 20_000);
+    worker.child.send({ type: 'message', content: 'FOLLOWUP_UNIQUE_MARKER', turnId: 'om_late' } satisfies DaemonToWorker);
+    // The deferred recheck runs on its unscaled 20s timer.
+    await waitFor(() => consumedReceipts(worker.messages).some(m => m.type === 'native_input_consumed' && m.turnId === 'om_late'),
+      worker.logs, 45_000);
+    expect(worker.logs.join('')).toMatch(/Deferred recheck found submit/);
+    expect(worker.input().match(/FOLLOWUP_UNIQUE_MARKER/g)).toHaveLength(1);
+  }, 100_000);
+
+  it('acknowledges native consumption that agy records only after the submit returned', async () => {
+    const worker = startWorker('prompt', 'antigravity', { ownTranscript: true, transcriptLagMs: 1_500 });
+    await waitFor(() => worker.messages.some(m => m.type === 'queued_activation_submitted'), worker.logs, 30_000);
+    expect(consumedReceipts(worker.messages)).toEqual([]);
+    await waitFor(() => consumedReceipts(worker.messages).length > 0, worker.logs, 15_000);
+    expect(consumedReceipts(worker.messages)).toEqual([expect.objectContaining({
+      type: 'native_input_consumed', turnId: 'om_initial', proofKind: 'antigravity_transcript_user_input',
+    })]);
+  }, 60_000);
+
+  it('does not acknowledge native consumption from a history line alone', async () => {
+    const worker = startWorker('prompt', 'antigravity');
+    await waitFor(() => worker.messages.some(m => m.type === 'queued_activation_submitted'), worker.logs, 30_000);
+    // Outlast the in-band transcript poll.
+    await new Promise(resolve => setTimeout(resolve, 2_000));
+    expect(consumedReceipts(worker.messages)).toEqual([]);
+  }, 45_000);
+
+  it('acknowledges native consumption of a slow activation through its deferred receipt', async () => {
+    const worker = startWorker('delayed', 'antigravity', { ownTranscript: true });
+    await waitFor(() => worker.messages.some(m => m.type === 'queued_activation_submitted'), worker.logs, 40_000);
+    await waitFor(() => consumedReceipts(worker.messages).length > 0, worker.logs, 5_000);
+    expect(consumedReceipts(worker.messages)).toEqual([expect.objectContaining({
+      type: 'native_input_consumed', turnId: 'om_initial', proofKind: 'antigravity_transcript_user_input',
+    })]);
+    expect(worker.input().match(/ACTIVATION_UNIQUE_MARKER/g)).toHaveLength(1);
   }, 60_000);
 
   it.each(['antigravity', 'traex'] as const)('%s writes a slow activation once and acknowledges its deferred receipt', async cliId => {

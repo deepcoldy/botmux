@@ -24,8 +24,14 @@ import {
   antigravityFullTranscriptPath,
   antigravityTranscriptPath,
   resolveAntigravityTranscriptPath,
+  hashAntigravitySubmittedText,
   type AntigravityTranscriptState,
 } from '../../services/antigravity-transcript.js';
+import {
+  AntigravitySubmitLedger,
+  snapshotAntigravityConversations,
+  type AntigravitySubmitBaseline,
+} from '../../services/antigravity-submit-ledger.js';
 
 /**
  * Adapter for Google Antigravity CLI (`agy`).
@@ -720,6 +726,8 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
   // Only a newly launched --conversation process can inherit unfinished work
   // from a dead predecessor. A reattached process can still be doing that work.
   let coldResumeTail: { conversationId: string; step: string } | undefined;
+  // Claims each USER_INPUT for at most one submit (see antigravity-submit-ledger).
+  const submitLedger = new AntigravitySubmitLedger();
   const activeSessionIdObservation = (pty: Pick<PtyHandle, 'cliPid' | 'cliCwd'>): {
     sessionId: string;
     source: 'native-log' | 'process-discovery';
@@ -898,6 +906,34 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       // this submit's.
       const transcriptCreatedAfterSubmit = !initialTranscriptPath
         && (!!initialCid || (awaitNativeStreamLog && !!sessionLog?.hasLogFile()));
+      const preexistingConversations = transcriptCreatedAfterSubmit && !initialCid
+        ? snapshotAntigravityConversations(join(homedir(), '.gemini', 'antigravity-cli', 'brain'))
+        : undefined;
+      const submitBaseline: AntigravitySubmitBaseline = {
+        ...(initialCid ? { conversationId: initialCid } : {}),
+        transcriptPath: initialTranscriptPath,
+        transcriptSize: preSize ?? 0,
+        transcriptCreatedAfter: transcriptCreatedAfterSubmit,
+        ...(preexistingConversations ? { preexistingConversations } : {}),
+      };
+      const submittedSha = hashAntigravitySubmittedText(content);
+      let ledgerEntry: ReturnType<AntigravitySubmitLedger['register']> | undefined;
+      // Adopted panes have no process-scoped log; their conversation id comes
+      // from a cwd guess that may name a sibling window, so they never prove.
+      const proveOwned = (cliSessionId: string | undefined): boolean => !!sessionLog && !!ledgerEntry
+        && submitLedger.tryClaim(ledgerEntry, cliSessionId);
+      const settleConsumed = (): void => { if (ledgerEntry) submitLedger.settle(ledgerEntry); };
+      // Read-only, never blocks the write path: agy writes USER_INPUT only once
+      // it feeds the input to the model (a busy agy parks or defers it).
+      const proveConsumed = (): { cliSessionId?: string } | undefined => {
+        const proofCid = activeSessionId(pty) ?? knownCliSessionId;
+        if (!proveOwned(proofCid)) return undefined;
+        knownCliSessionId = proofCid;
+        return { cliSessionId: proofCid };
+      };
+      const confirmedResult = (cliSessionId: string | undefined, owned: boolean) => (cliSessionId
+        ? { submitted: true as const, cliSessionId, ...(owned ? { ownershipProven: true as const } : { proveConsumed, settleConsumed }) }
+        : undefined);
 
       const trySendEnter = (): boolean => {
         try {
@@ -957,6 +993,10 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
         if (!trySendEnter()) return { submitted: false };
       }
 
+      // The input may now reach agy: from here on it can own a USER_INPUT, so a
+      // later identical submit must not take that record.
+      if (sessionLog) ledgerEntry = submitLedger.register(submittedSha, submitBaseline);
+
       // Single Enter only — do NOT retry it. agy's history.jsonl append can
       // lag well past a short per-attempt window (cold start, large initial
       // prompt, network-bound auth), and a retry Enter lands on the
@@ -966,7 +1006,11 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       // recheck, not by a second Enter (same pattern as the grok adapter).
       if (await waitForHistoryAppend(HISTORY_PATH, baseByte, marker, 3_200)) {
         const cliSessionId = recordConfirmedSubmit(pty, preSize, transcriptCreatedAfterSubmit);
-        return cliSessionId ? { submitted: true, cliSessionId } : undefined;
+        // The Enter landed; ownership is a separate, stricter question, checked
+        // once here and otherwise left to the worker's background probe.
+        const proof = proveConsumed();
+        if (proof?.cliSessionId) return confirmedResult(proof.cliSessionId, true);
+        return confirmedResult(cliSessionId, false);
       }
 
       // In-band budget exhausted. Hand the worker a recheck closure so a
@@ -975,7 +1019,9 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       const recheck = (): SubmitRecheckResult => {
         if (!historyDeltaContains(HISTORY_PATH, baseByte, marker)) return false;
         const cliSessionId = recordConfirmedSubmit(pty, preSize, transcriptCreatedAfterSubmit);
-        return cliSessionId ? { submitted: true, cliSessionId } : true;
+        const proofCid = cliSessionId ?? knownCliSessionId;
+        if (proveOwned(proofCid)) return confirmedResult(proofCid, true)!;
+        return confirmedResult(cliSessionId, false) ?? true;
       };
       return { submitted: false, recheck };
     },

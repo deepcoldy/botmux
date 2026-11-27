@@ -390,7 +390,7 @@ describe('antigravity writeInput — single-Enter submit', () => {
       resetHistory();
       const convId = 'aaaaaaaa-0000-4000-8000-000000000001';
       const { selected, fake } = freshLaunch('agy-grace-fresh-finished', convId);
-      expect(await selected.writeInput(fake.pty, 'quick question')).toEqual({ submitted: true, cliSessionId: convId });
+      expect(await selected.writeInput(fake.pty, 'quick question')).toEqual({ submitted: true, cliSessionId: convId, proveConsumed: expect.any(Function), settleConsumed: expect.any(Function) });
 
       // Before agy creates the transcript, the grace still holds the turn busy.
       expect(selected.isSessionBusy!({ cliSessionId: convId, getCurrentScreen: () => idleScreen })).toBe(true);
@@ -410,7 +410,7 @@ describe('antigravity writeInput — single-Enter submit', () => {
       writeFileSync(nativeLogOf('agy-grace-new'), `Streaming conversation ${oldId}\nStreaming conversation ${newId}\n`);
       const fake = makePty();
       fake.pty.submitBracketedPaste = text => { appendHistory(text); return true; };
-      expect(await selected.writeInput(fake.pty, 'first turn after new')).toEqual({ submitted: true, cliSessionId: newId });
+      expect(await selected.writeInput(fake.pty, 'first turn after new')).toEqual({ submitted: true, cliSessionId: newId, proveConsumed: expect.any(Function), settleConsumed: expect.any(Function) });
       writeFileSync(transcriptOf(newId), finishedTurn);
       expect(selected.isSessionBusy!({ cliSessionId: newId, getCurrentScreen: () => idleScreen })).toBe(false);
     });

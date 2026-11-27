@@ -142,6 +142,7 @@ export function workerSubmitHarness() {
   // Real predicates for flushPending's native-consumption proof (traex harness →
   // no Codex history proof); markReplyInputConsumed is a no-op on the empty queue.
   scope.codexHistoryMatchProvesConsumption = loadWorkerFunction('codexHistoryMatchProvesConsumption', scope);
+  scope.ownedSubmitConsumptionProofKind = loadWorkerFunction('ownedSubmitConsumptionProofKind', scope);
   scope.markReplyInputConsumed = loadWorkerFunction('markReplyInputConsumed', scope);
   scope.acknowledgeQueuedActivationToken = loadWorkerFunction('acknowledgeQueuedActivationToken', scope);
   scope.acknowledgeQueuedActivation = loadWorkerFunction('acknowledgeQueuedActivation', scope);

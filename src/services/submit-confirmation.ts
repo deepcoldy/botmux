@@ -185,6 +185,9 @@ export interface CurrentDeferredSubmitConfirmationSettlement {
   ownershipProven?: boolean;
   /** Not-yet-owned session id candidate reported by the recheck (see SubmitRecheckResult). */
   unprovenCliSessionId?: string;
+  /** Deferred consumption probe reported by the recheck (see SubmitRecheckResult). */
+  proveConsumed?: () => { cliSessionId?: string } | undefined;
+  settleConsumed?: () => void;
   recheckError?: unknown;
   lifecycle: 'confirmed' | 'verification-finished' | 'unchanged';
 }
@@ -272,6 +275,8 @@ export async function settleDeferredSubmitConfirmation(
   let cliSessionId: string | undefined;
   let unprovenCliSessionId: string | undefined;
   let ownershipProven = false;
+  let proveConsumed: (() => { cliSessionId?: string } | undefined) | undefined;
+  let settleConsumed: (() => void) | undefined;
   let recheckError: unknown;
   if (input.recheck) {
     try {
@@ -283,6 +288,12 @@ export async function settleDeferredSubmitConfirmation(
         : undefined;
       unprovenCliSessionId = typeof result === 'object' && result && typeof result.unprovenCliSessionId === 'string'
         ? result.unprovenCliSessionId
+        : undefined;
+      proveConsumed = typeof result === 'object' && result && !ownershipProven && typeof result.proveConsumed === 'function'
+        ? result.proveConsumed
+        : undefined;
+      settleConsumed = proveConsumed && typeof result === 'object' && typeof result.settleConsumed === 'function'
+        ? result.settleConsumed
         : undefined;
     } catch (err) {
       recheckError = err;
@@ -322,6 +333,8 @@ export async function settleDeferredSubmitConfirmation(
     ...(cliSessionId ? { cliSessionId } : {}),
     ...(ownershipProven ? { ownershipProven: true } : {}),
     ...(unprovenCliSessionId ? { unprovenCliSessionId } : {}),
+    ...(proveConsumed ? { proveConsumed } : {}),
+    ...(settleConsumed ? { settleConsumed } : {}),
     ...(recheckError !== undefined ? { recheckError } : {}),
     lifecycle,
   };
