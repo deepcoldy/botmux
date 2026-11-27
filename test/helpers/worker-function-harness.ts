@@ -1,4 +1,5 @@
 import { PurgeContinuationLease } from '../../src/services/image-purge-recovery.js';
+import { ActiveTurnAuthority } from '../../src/core/active-turn-authority.js';
 import { captureTraexPromptCheckpoint, inspectTraexFailedPrompt, withTraexFailedPrompt } from '../../src/services/traex-prompt-checkpoint.js';
 import { traeSessionsRoot } from '../../src/services/traex-paths.js';
 /**
@@ -23,7 +24,7 @@ import { awaySummaryFocusRefusal } from '../../src/services/away-summary-focus.j
 import { paneReplyDeliveryFromProcessTree } from '../../src/services/pane-reply-delivery.js';
 import { createUsageLimitTracker } from '../../src/utils/usage-limit-tracker.js';
 import { REPLY_DELIVERY_ENV } from '../../src/services/send-completion-hint.js';
-import { automaticScheduledInputTask, coalesceAutomaticScheduledInputs, promoteInteractiveInputPastQuotaSchedules, scheduledRecoveryInputTask } from '../../src/utils/pending-input-queue.js';
+import { automaticScheduledInputTask, coalesceAutomaticScheduledInputs, inputForcesSerialTurn, promoteInteractiveInputPastQuotaSchedules, scheduledRecoveryInputTask } from '../../src/utils/pending-input-queue.js';
 import { parseScheduledTurnId } from '../../src/core/scheduled-turn-provenance.js';
 import { isCriticalInterruptKey } from '../../src/adapters/backend/critical-control-key.js';
 import { removeTakenUnsentInputs } from '../../src/services/unsent-input-journal.js';
@@ -258,6 +259,10 @@ function transpiledWorkerFunction(name: string): string {
  * `undefined` for keys this does not own so callers keep their own fallbacks.
  */
 function defaultScopedWorkerState(scope: Record<string, unknown>, key: string | symbol): unknown {
+  if (key === 'pendingAdoptTriggerInputs') return (scope.pendingAdoptTriggerInputs ??= new Set());
+  if (key === 'activeTurnAuthority') return (scope.activeTurnAuthority ??= new ActiveTurnAuthority());
+  if (key === 'turnAuthorityIdentity') return loadWorkerFunction('turnAuthorityIdentity', scope);
+  if (key === 'inputForcesSerialTurn') return inputForcesSerialTurn;
   if (key === 'automaticScheduledInputTask') return automaticScheduledInputTask;
   if (key === 'scheduledRecoveryInputTask') return scheduledRecoveryInputTask;
   if (key === 'promoteInteractiveInputPastQuotaSchedules') return promoteInteractiveInputPastQuotaSchedules;

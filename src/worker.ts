@@ -3611,6 +3611,9 @@ let structuredRejectedReadyEvidenceGeneration: number | undefined;
 let structuredRejectedReadyEvidenceStartUuid: string | undefined;
 const ptyOutputGeneration = new PtyOutputGeneration();
 const adoptWriteQueue = new AsyncSerialQueue();
+// Include trigger writes waiting inside the mutex in subsequent admission.
+// Otherwise earlier human inputs can hide there while later ones enter FIFO.
+const pendingAdoptTriggerInputs = new Set<PendingCliInput>();
 /** The effectiveResume flag used by the most recent spawnCli call. Written
  *  immediately after the two-tier fallback check so late-attach timers
  *  (hermes, cursor, etc.) can read THE SAME semantics the spawn used,
@@ -9102,6 +9105,11 @@ function activeTurnBlocks(input: {
   trustedCaller?: TrustedCaller;
   trustedController?: TrustedCaller;
 }): boolean {
+  const active = activeTurnAuthority.snapshot();
+  const executionTurnId = active?.identityTurnId ?? active?.turnId;
+  if (executionTurnId?.startsWith('trg_') && inputForcesSerialTurn(input, active?.caller, executionTurnId)) {
+    return activeTurnAuthority.blocks({ ...turnAuthorityIdentity(input), queueAfterActiveTurn: true });
+  }
   // Group FIFO is independent of the experimental cross-principal question gate.
   if (!input.queueAfterActiveTurn && !crossPrincipalIsolationOn()) return false;
   return activeTurnAuthority.blocks(turnAuthorityIdentity(input));
@@ -23881,24 +23889,34 @@ async function runAdoptMessageForCapturedGeneration(
     requeued = true;
     requeue();
   };
+  if (item.turnId?.startsWith('trg_')) pendingAdoptTriggerInputs.add(item);
   const queued = await runAdoptQueuedWriteSequence({
     queue: adoptWriteQueue,
     isCurrent: () => adoptWriteFenceIsCurrent(fence),
     onStale: requeueOnce,
-    write: () => writeAdoptMessage(
-      item.content,
-      item.turnId,
-      item.dispatchAttempt,
-      item.linkRefMode,
-      item.vcMeetingImTurnOrigin,
-      item.trustedCaller,
-      item.trustedController,
-      fence,
-      item.queueAfterActiveTurn,
-      item.scheduledRun,
-      item,
-    ),
-  });
+    write: async () => {
+      // The mutex may have waited behind a trigger not visible in the pending
+      // array at admission. Freeze the real input's serial policy at this edge.
+      const active = activeTurnAuthority.snapshot();
+      if (inputForcesSerialTurn(item, active?.caller, active?.identityTurnId ?? active?.turnId)) {
+        item.queueAfterActiveTurn = true;
+        if (activeTurnAuthority.blocks(turnAuthorityIdentity(item))) return 'stale-before-write' as const;
+      }
+      return writeAdoptMessage(
+        item.content,
+        item.turnId,
+        item.dispatchAttempt,
+        item.linkRefMode,
+        item.vcMeetingImTurnOrigin,
+        item.trustedCaller,
+        item.trustedController,
+        fence,
+        item.queueAfterActiveTurn,
+        item.scheduledRun,
+        item,
+      );
+    },
+  }).finally(() => { pendingAdoptTriggerInputs.delete(item); });
   if (queued.status === 'stale-before-write') return 'stale-before-write';
   if (queued.value === 'stale-before-write') requeueOnce();
   return queued.value;
@@ -23913,7 +23931,12 @@ async function admitAdoptMessage(item: PendingCliInput): Promise<void> {
   // A callerless follow-up must not adopt a live continuation's authority when
   // cross-principal isolation is off. Freeze the serial marker onto the durable
   // queue item before any await so the eventual write starts its own turn.
-  if ((!!(item.turnId && parseScheduledTurnId(item.turnId)) || inputForcesSerialTurn(item, activeTurnAuthority.snapshot()?.caller))
+  const active = activeTurnAuthority.snapshot();
+  if ((!!(item.turnId && parseScheduledTurnId(item.turnId))
+    || inputForcesSerialTurn(item, active?.caller, active?.identityTurnId ?? active?.turnId)
+    || [...pendingAdoptTriggerInputs].some(queued => inputForcesSerialTurn(item, undefined, queued.turnId))
+    || pendingAdoptMessages.some(queued => queued.turnId?.startsWith('trg_')
+      && inputForcesSerialTurn(item, undefined, queued.turnId)))
     && !item.queueAfterActiveTurn) {
     item = { ...item, queueAfterActiveTurn: true };
   }
@@ -31643,6 +31666,10 @@ async function flushPending(): Promise<void> {
       return;
     }
     if (adoptInputReady && pendingAdoptMessages.length > 0) {
+      if (activeTurnBlocks(pendingAdoptMessages[0]!)) {
+        revokePromptReadiness();
+        return;
+      }
       const item = pendingAdoptMessages.shift()!;
       const outcome = await runAdoptMessageForCapturedGeneration(item, () => {
         pendingAdoptMessages.unshift(item);
@@ -33524,10 +33551,13 @@ function sendToPty(
   // when another reply from the same peer bot currently owns the CLI. Keep it
   // on the terminal boundary instead of letting adapter type-ahead, queue
   // merging, or isolation-off envelope adoption splice tasks together.
+  const active = activeTurnAuthority.snapshot();
   const queueAfterActiveTurn = inputForcesSerialTurn(
-    { ...opts, ...((turnId && parseScheduledTurnId(turnId)) ? { queueAfterActiveTurn: true as const } : {}) },
-    activeTurnAuthority.snapshot()?.caller,
-  );
+    { ...opts, turnId, ...((turnId && parseScheduledTurnId(turnId)) ? { queueAfterActiveTurn: true as const } : {}) },
+    active?.caller,
+    active?.identityTurnId ?? active?.turnId,
+  ) || pendingMessages.some(queued => queued.turnId?.startsWith('trg_')
+    && inputForcesSerialTurn({ ...opts, turnId }, undefined, queued.turnId));
   const next: PendingCliInput = {
     scheduledRun: opts.scheduledRun,
     content,
@@ -48238,11 +48268,12 @@ let nextStepGeneration: AbortController | undefined;
 
 async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Promise<void> {
   const received = raw as DaemonToWorker;
+  const active = activeTurnAuthority.snapshot();
   // A promoted durable tail may bypass sendWorkerInput's explicit serial flag.
   // Normalize before the authority precheck so continuation inputs queue rather
   // than being rejected or adopted into the active turn on either IPC path.
   const msg = received.type === 'message'
-    && inputForcesSerialTurn(received, activeTurnAuthority.snapshot()?.caller)
+    && inputForcesSerialTurn(received, active?.caller, active?.identityTurnId ?? active?.turnId)
     && !received.queueAfterActiveTurn
     ? { ...received, queueAfterActiveTurn: true as const }
     : received;

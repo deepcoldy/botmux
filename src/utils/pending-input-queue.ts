@@ -159,14 +159,22 @@ export function dropNoReplayPendingInputsOnBackendExit(
  *  daemon gate in sendWorkerInput. */
 export function inputForcesSerialTurn(
   input: {
+    turnId?: string;
     queueAfterActiveTurn?: true;
-    trustedCaller?: Pick<TrustedCaller, 'taskContinuation'>;
+    trustedCaller?: Pick<TrustedCaller, 'taskContinuation' | 'senderType' | 'source'>;
   },
   activeCaller?: Pick<TrustedCaller, 'taskContinuation'>,
+  activeTurnId?: string,
 ): boolean {
   return input.queueAfterActiveTurn === true
     || !!input.trustedCaller?.taskContinuation
-    || !!activeCaller?.taskContinuation;
+    || !!activeCaller?.taskContinuation
+    // A real request must open its own turn after a trigger. Folding it into
+    // the synthetic turn cannot authorize human-only writes such as schedules.
+    || (activeTurnId?.startsWith('trg_') === true
+      && input.turnId?.startsWith('om_') === true
+      && input.trustedCaller?.senderType === 'user'
+      && input.trustedCaller.source === undefined);
 }
 
 export function shouldDeferScheduledInitialPrompt(opts: { turnId?: string; adoptMode?: boolean }): boolean {
@@ -213,6 +221,8 @@ export function mergeQueuedCliInput(
 ): boolean {
   const tail = pending[pending.length - 1];
   if (!tail) return false;
+  if ((tail.turnId?.startsWith('trg_') && inputForcesSerialTurn(next, tail.trustedCaller, tail.turnId))
+    || (next.turnId?.startsWith('trg_') && inputForcesSerialTurn(tail, next.trustedCaller, next.turnId))) return false;
   // A durable delivery is an immutable envelope. Neither a later IM message
   // nor another delivery may be concatenated into it (and a durable `next`
   // must likewise start its own turn). Structured Codex App turns also carry
