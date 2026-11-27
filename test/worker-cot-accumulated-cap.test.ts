@@ -86,4 +86,31 @@ describe('worker CoT accumulated cap', () => {
     expect(w.thinkingTotalChars).toBe(CAP);
     expect(w.thinkingCapNoted).toBe(false);
   });
+
+  it('never reopens the timeline after a dropped tool entry left residual budget', () => {
+    const w = worker();
+    const text: CotEntry = { kind: 'text', text: 't'.repeat(90) };
+    const tool: CotEntry = { kind: 'tool_call', id: 'c1', name: 'Bash', args: JSON.stringify({ command: 'y'.repeat(40) }) };
+    w.observeCotEntries([text, tool], { turnId: 'om_tool_residual' });
+    // A later batch in the same turn: small entries would fit in the residual
+    // 10 chars, a large one would overshoot again. Neither may land after the
+    // ellipsis, and no second ellipsis node may appear.
+    w.observeCotEntries([
+      { kind: 'text', text: 'a'.repeat(5) },
+      { kind: 'text', text: 'z'.repeat(30) },
+    ], { turnId: 'om_tool_residual' });
+    expect(w.thinkingEntries).toEqual([text, ellipsis]);
+    expect(w.thinkingEntries.filter((e: CotEntry) => e.kind === 'thinking' && e.text === '…')).toHaveLength(1);
+    expect(w.thinkingEntries.at(-1)).toEqual(ellipsis);
+    expect(w.thinkingTotalChars).toBe(90);
+  });
+
+  it('keeps the ellipsis terminal when a surrogate back-off left one char of budget', () => {
+    const w = worker();
+    w.observeCotEntries([{ kind: 'text', text: 'a'.repeat(CAP - 1) + '😀tail' }], { turnId: 'om_emoji_residual' });
+    w.observeCotEntries([{ kind: 'text', text: 'q' }], { turnId: 'om_emoji_residual' });
+    expect(w.thinkingEntries).toEqual([{ kind: 'text', text: 'a'.repeat(CAP - 1) }, ellipsis]);
+    expect(w.thinkingEntries.at(-1)).toEqual(ellipsis);
+    expect(w.thinkingTotalChars).toBe(CAP - 1);
+  });
 });

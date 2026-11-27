@@ -13137,12 +13137,17 @@ function observeCotEntries(entries: readonly CotEntry[], turn: { turnId: string;
     thinkingTotalChars = 0;
     thinkingCapNoted = false;
   }
+  // Once the timeline has ended with a「…」node it never reopens. A tool entry
+  // dropped for lack of room, or a surrogate-pair back-off, can leave
+  // thinkingTotalChars below the cap: the residual budget must not let a later
+  // batch append after the ellipsis or add a second one.
+  if (thinkingCapNoted) {
+    return;
+  }
   if (thinkingTotalChars >= THINKING_ACCUMULATED_CAP) {
-    if (!thinkingCapNoted) {
-      thinkingCapNoted = true;
-      thinkingEntries.push({ kind: 'thinking', text: '…' });
-      scheduleThinkingEmit();
-    }
+    thinkingCapNoted = true;
+    thinkingEntries.push({ kind: 'thinking', text: '…' });
+    scheduleThinkingEmit();
     return;
   }
   for (const entry of kept) {
