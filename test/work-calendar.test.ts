@@ -6,7 +6,6 @@ import { config } from '../src/config.js';
 import {
   checkTaskCalendar, checkWorkCalendar, normalizeCalendarBinding, parseWorkCalendar,
   previewTaskCalendar, workCalendarPath,
-  BUILTIN_WORK_CALENDARS,
   normalizeCalendarDayType, listWorkCalendars, manualCalendarCheck,
 } from '../src/services/work-calendar.js';
 import type { ScheduledTask } from '../src/types.js';
@@ -146,28 +145,34 @@ describe('calendar loading, isolation and next eligible trigger', () => {
   });
 });
 
-describe('mainland China official 2026 snapshot', () => {
+describe('mainland China official calendar', () => {
   const cnTask = { ...task, calendar: 'cn' };
-  it('matches all 365 days against the seven official rest ranges and six makeup dates', () => {
-    // Independently transcribed from 国办发明电〔2025〕7号, not generated from the bundled date arrays.
-    const ranges = [
-      ['2026-01-01', '2026-01-03'], ['2026-02-15', '2026-02-23'],
-      ['2026-04-04', '2026-04-06'], ['2026-05-01', '2026-05-05'],
-      ['2026-06-19', '2026-06-21'], ['2026-09-25', '2026-09-27'], ['2026-10-01', '2026-10-07'],
-    ];
-    const makeup = new Set(['2026-01-04', '2026-02-14', '2026-02-28', '2026-05-09', '2026-09-20', '2026-10-10']);
-    const calendar = parseWorkCalendar(BUILTIN_WORK_CALENDARS.cn.calendar);
-    expect(calendar.restDates).toHaveLength(33);
-    expect(calendar.workDates).toHaveLength(6);
-    for (let day = new Date('2026-01-01T01:00:00Z'); day.getUTCFullYear() === 2026; day = new Date(+day + 86_400_000)) {
+  // Official rest ranges and makeup days, transcribed independently of the date arrays.
+  it.each([
+    {
+      year: 2026, // 国办发明电〔2025〕7号
+      ranges: [['01-01', '01-03'], ['02-15', '02-23'], ['04-04', '04-06'], ['05-01', '05-05'],
+        ['06-19', '06-21'], ['09-25', '09-27'], ['10-01', '10-07']],
+      makeup: ['01-04', '02-14', '02-28', '05-09', '09-20', '10-10'],
+    },
+    {
+      year: 2027, // 国办发明电〔2026〕10号
+      ranges: [['01-01', '01-03'], ['02-05', '02-13'], ['04-03', '04-05'], ['05-01', '05-05'],
+        ['06-09', '06-09'], ['09-15', '09-15'], ['10-01', '10-07']],
+      makeup: ['01-31', '02-14', '05-08', '09-26', '10-09'],
+    },
+  ])('matches every date in $year against the official notice', ({ year, ranges, makeup }) => {
+    for (let day = new Date(Date.UTC(year, 0, 1, 1)); day.getUTCFullYear() === year; day = new Date(+day + 86_400_000)) {
       const date = day.toISOString().slice(0, 10);
-      const rest = ranges.some(([start, end]) => date >= start && date <= end);
-      const working = makeup.has(date) || (!rest && day.getUTCDay() >= 1 && day.getUTCDay() <= 5);
-      expect(checkTaskCalendar(cnTask, app, day), date).toMatchObject({ date, timeZone: 'Asia/Shanghai', status: working ? 'working' : 'rest' });
+      const mmdd = date.slice(5);
+      const weekday = day.getUTCDay() >= 1 && day.getUTCDay() <= 5;
+      let reason = weekday ? 'work_week' : 'rest_week';
+      if (ranges.some(([start, end]) => mmdd >= start && mmdd <= end)) reason = 'rest_date';
+      if (makeup.includes(mmdd)) reason = 'work_date';
+      expect(checkTaskCalendar(cnTask, app, day), date).toMatchObject({
+        date, timeZone: 'Asia/Shanghai', reason, status: reason.startsWith('work') ? 'working' : 'rest',
+      });
     }
-    expect(BUILTIN_WORK_CALENDARS.cn).toMatchObject({ region: 'CN', dataVersion: '2026.1', source: {
-      authority: '国务院办公厅', documentNo: '国办发明电〔2025〕7号', publishedAt: '2025-11-04',
-    } });
   });
   it('requires no local file and cannot be replaced by a bot-local cn definition', () => {
     rmSync(workCalendarPath(app));
@@ -182,7 +187,9 @@ describe('mainland China official 2026 snapshot', () => {
     ['2025-12-31T15:59:59Z', 'error', '2025-12-31'],
     ['2025-12-31T16:00:00Z', 'rest', '2026-01-01'],
     ['2026-12-31T15:59:59Z', 'working', '2026-12-31'],
-    ['2026-12-31T16:00:00Z', 'error', '2027-01-01'],
+    ['2026-12-31T16:00:00Z', 'rest', '2027-01-01'],
+    ['2027-12-31T15:59:59Z', 'working', '2027-12-31'],
+    ['2027-12-31T16:00:00Z', 'error', '2028-01-01'],
   ])('uses the CN date and stops outside confirmed coverage at %s', (instant, status, date) => {
     expect(checkTaskCalendar(cnTask, app, new Date(instant))).toMatchObject({ status, date });
     if (status === 'error') expect(checkTaskCalendar(cnTask, app, new Date(instant))?.reason).toBe('calendar_out_of_coverage');
@@ -192,6 +199,7 @@ describe('mainland China official 2026 snapshot', () => {
     expect(checkTaskCalendar({ ...cnTask, calendarDayType: 'invalid' as never }, app)?.displayNames?.en).toBe('China Statutory Work Calendar');
     expect(checkTaskCalendar({ ...cnTask, parsed: { kind: 'once', display: 'once' } }, app)?.displayNames?.zh).toBe('中国法定工作日历');
     expect(previewTaskCalendar(cnTask, app, new Date('2026-10-09T02:00:00Z'))?.nextEligibleRunAt).toBe('2026-10-10T01:00:00.000Z');
-    expect(previewTaskCalendar(cnTask, app, new Date('2026-12-31T02:00:00Z'))).toMatchObject({ nextEligibleRunAt: null, calendarCheck: { reason: 'calendar_out_of_coverage' } });
+    expect(previewTaskCalendar(cnTask, app, new Date('2026-12-31T02:00:00Z'))?.nextEligibleRunAt).toBe('2027-01-04T01:00:00.000Z');
+    expect(previewTaskCalendar(cnTask, app, new Date('2027-12-31T02:00:00Z'))).toMatchObject({ nextEligibleRunAt: null, calendarCheck: { reason: 'calendar_out_of_coverage' } });
   });
 });

@@ -55,7 +55,7 @@ function idlePreflightProbe(options: { reply?: ReplyKind; catalog?: typeof backu
     TRAEX_AUTO_MODEL_DEFAULT_OVERLOAD_THRESHOLD_PERCENT: 100,
     pendingTraexModelPoolPrunes: pendingPrunes, randomUUID: () => `prune-${pruneRequests.length + 1}`,
     traexAutoModelPolicyKey,
-    process: { send: vi.fn((msg: any) => {
+    process: { env: process.env, send: vi.fn((msg: any) => {
       pruneRequests.push(msg);
       if (replyKind === 'timeout') return;
       const entry = pendingPrunes.get(msg.requestId);
@@ -196,7 +196,7 @@ function queuedProbe(reply: 'superseded' | 'sibling' | 'failed' | 'timeout') {
     currentTraexLoadSnapshot: vi.fn(async () => catalog),
     TRAEX_AUTO_MODEL_DEFAULT_PREFLIGHT_TIMEOUT_MS: 8_000,
     pendingTraexModelPoolPrunes: pendingPrunes, randomUUID: () => 'queued-prune', traexAutoModelPolicyKey,
-    process: { send: vi.fn((msg: any) => {
+    process: { env: process.env, send: vi.fn((msg: any) => {
       if (reply === 'timeout') return;
       const entry = pendingPrunes.get(msg.requestId);
       clearTimeout(entry.timeout); pendingPrunes.delete(msg.requestId);
