@@ -568,7 +568,10 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
       const syncQueuedTurnsFromMarkerDisk = () => false;
       // No terminal has gone out for any queued record in this scenario.
       const turnTerminalEmitted = () => false, dropQueuedTurnRecord = () => false;
-      const readSendMarkers = () => [];
+      // This capture-only scenario has no final delivery evidence; the shared
+      // queue/preparation callbacks must retain their original promotion path.
+      const currentTurnHasFinalEvidence = () => false;
+      const resetFinalTransitionRetryBackoff = () => {};
       const markActiveTurnStarted = record => started.push(record);
       const writeCliPidMarker = () => {}, publishSandboxRelayCapability = () => {}, cancelAntigravityFoldedReconcilePending = () => {}, log = () => {};
       // Restart bookkeeping (restored-input settle) is short-circuited here; it is

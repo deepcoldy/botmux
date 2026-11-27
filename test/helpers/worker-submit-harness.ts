@@ -125,6 +125,7 @@ export function workerSubmitHarness() {
         readonly submissionStarted = true,
         readonly runnerGenerationUnsafe = false,
         readonly traexCatalogAdmissionRequired = false,
+        readonly retainPendingInput = false,
       ) { super(message); }
     },
     emitTurnTerminal: vi.fn(),

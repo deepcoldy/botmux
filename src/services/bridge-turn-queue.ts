@@ -267,6 +267,9 @@ export interface BridgePendingTurn {
    *  running (a mid-turn system reminder) instead of starting its own. It has
    *  no reply of its own and ends when that turn ends — see `absorbedTurns`. */
   absorbedIntoTurnId?: string;
+  /** Durable dispatchAttempt of the host turn that absorbed this input
+   *  (`undefined` when absorbed into an ordinary non-durable host turn). */
+  absorbedIntoDispatchAttempt?: number;
   /** uuid of the `attachment(queued_command)` record that folded this turn's
    *  input into the host turn: where its reply starts in the transcript (see
    *  absorbedInputReplyText). Set together with `absorbedIntoTurnId`. */
@@ -2352,6 +2355,7 @@ export class BridgeTurnQueue {
       }
     } else if (host && !host.terminalObserved) {
       next.absorbedIntoTurnId = host.turnId;
+      if (host.dispatchAttempt !== undefined) next.absorbedIntoDispatchAttempt = host.dispatchAttempt;
       if (typeof ev.uuid === 'string' && ev.uuid) next.absorbedAtUuid = ev.uuid;
       const activitySeq = host.attributedActivitySeq ?? 0;
       const previous = host.absorbedTurns?.at(-1);

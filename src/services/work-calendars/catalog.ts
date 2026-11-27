@@ -1,4 +1,4 @@
-import cn2026 from './cn-2026.json' with { type: 'json' };
+import cn from './cn.json' with { type: 'json' };
 
 /** A calendar's identity is its catalog key. Region and provenance describe it, not how it runs. */
 export interface WorkCalendarEntity {
@@ -12,5 +12,5 @@ export interface WorkCalendarEntity {
 
 /** Add an entity and its data here; scheduler admission and date evaluation stay unchanged. */
 export const BUILTIN_WORK_CALENDARS: Readonly<Record<string, WorkCalendarEntity>> = {
-  cn: cn2026,
+  cn,
 };

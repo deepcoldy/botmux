@@ -319,9 +319,9 @@ botmux schedule calendars                                                # list 
 
 ### Built-in China statutory calendar
 
-ID `cn`, shown as "China Statutory Work Calendar", time zone `Asia/Shanghai`, including holidays and weekend make-up workdays. **Currently verified for 2026-01-01 to 2026-12-31**, based on the [State Council General Office notice on 2026 holidays](https://www.gov.cn/zhengce/zhengceku/202511/content_7047091.htm) (Guobanfa Mingdian [2025] No. 7). `schedule calendars` prints the source details.
+ID `cn`, shown as "China Statutory Work Calendar", time zone `Asia/Shanghai`, including holidays and weekend make-up workdays. **Currently verified for 2026-01-01 to 2027-12-31**, based on the [State Council General Office notice on 2026 holidays](https://www.gov.cn/zhengce/zhengceku/202511/content_7047091.htm) and the [2027 notice](https://www.gov.cn/zhengce/content/202611/content_7085101.htm). `schedule calendars` prints the source details.
 
-It represents the nationwide holiday arrangement, not every organization's actual shifts; local holidays, company rosters, Hong Kong/Macao/Taiwan and other countries are out of scope. Dates outside coverage (such as the not-yet-verified 2027) are never guessed: the task stops running automatically and records `calendar_out_of_coverage`. Upgrade to a release with next year's data before the year ends.
+It represents the nationwide holiday arrangement, not every organization's actual shifts; local holidays, company rosters, Hong Kong/Macao/Taiwan and other countries are out of scope. Dates outside coverage are never guessed: the task stops running automatically and records `calendar_out_of_coverage`. Upgrade to a release with next year's data before the year ends.
 
 ### Custom calendars
 
