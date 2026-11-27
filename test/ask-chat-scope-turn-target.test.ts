@@ -41,6 +41,7 @@ import { createExplicitAskContinuation, explicitAskOriginIsLive, explicitAskSess
 import { frozenReplyContextForTurn } from '../src/core/reply-target.js';
 import { createLarkAskCardDispatcher } from '../src/im/lark/ask-card.js';
 import { isSilentMessageListenerSession } from '../src/core/message-listener-silence.js';
+import { resolveAskDeliveryRoute } from '../src/core/native-gateway-ask-dispatch.js';
 import { productionConst } from './helpers/codex-async-answer-function-harness.js';
 import { captureCodexAsyncAskOrigin } from '../src/core/codex-async-ask-origin.js';
 import { codexAsyncAnswerNeedsRawInput, codexAsyncAskOriginEligible } from '../src/services/codex-async-user-input.js';
@@ -120,6 +121,8 @@ describe('chat-scope 会话里 ask 卡片跟随发起 turn 的冻结回复目标
       authorizeSessionScopedIpc,
       bindSessionScopedIpcIdentity,
       larkTransportEnabled: () => true,
+      resolveAskDeliveryRoute,
+      isNativeGatewayCoreProcess: () => false,
       isSilentMessageListenerSession,
       getBot: () => ({ config: { apiOnly: false, cliId: 'codex-app' } }),
       resolveDocumentAskDelivery: async () => undefined,

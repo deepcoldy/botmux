@@ -5,6 +5,7 @@ import { GoalStatusCardController, goalStatusCardOrigin } from '../src/core/goal
 import { loadWorkerPoolClosure } from './helpers/worker-pool-function-harness.js';
 import { loadWorkerPoolMessageHandlers } from './helpers/worker-pool-message-harness.js';
 import { isSilentScheduledTurn } from '../src/core/silent-schedule-turns.js';
+import { rememberCoreOnlyGoal } from '../src/core/core-only-progress.js';
 
 function fixture(silent = false) {
   const botConfig: any = { apiOnly: false, goalStatusCard: true };
@@ -21,7 +22,7 @@ function fixture(silent = false) {
     GoalStatusCardController, goalStatusCard: undefined, MessageWithdrawnError, MessageUpdateExpiredError, TopicSendError,
     sessionStore: { updateSession(s: any) { if (diskFails && s.nativeGoalStatusCard) throw new Error('disk write failed'); } },
     fallbackTurnId: (_ds: any, turn: any) => turn, larkTransportEnabled: () => true, isSilentMessageListenerSession: () => false,
-    isSilentScheduledTurn, isMeetingDrivenTurn: () => false, isSubstituteTurn: () => false, isTriggerFinalSuppressed: () => false,
+    isSilentScheduledTurn, rememberCoreOnlyGoal, isMeetingDrivenTurn: () => false, isSubstituteTurn: () => false, isTriggerFinalSuppressed: () => false,
     getMessageChatId: async () => ds.chatId, resolveCardKitId: async () => 'card_id',
     updateCardJson: async (_app: any, _id: any, id: string, card: string, sequence: number, _uuid: any, opts: any) => {
       opts.beforeWrite(); if (patchError) throw patchError(); patches.push({ id, card: JSON.parse(card), sequence });

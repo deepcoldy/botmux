@@ -113,7 +113,7 @@ function harness() {
     codexUpgradeInspectionBlock: undefined,
     codexRunnerFreshness: 'current',
     shouldHoldCodexRunnerInput: () => false,
-    cliAdapter: {},
+    cliAdapter: { reliableTurnTerminal: true },
     hasPendingInputForFlush: vi.fn(() => false),
     log: vi.fn(),
     send: vi.fn(),
@@ -596,7 +596,7 @@ describe('worker Codex session automatic upgrade', () => {
     expect(await done).toBeUndefined();
     expect(h.state.spawnCli).toHaveBeenCalledTimes(1);
     expect(restartReceipts(h)).toEqual([
-      { type: 'restart_result', attemptId: 'folded-same-settings', status: 'succeeded', category: 'prompt_ready' },
+      { type: 'restart_result', attemptId: 'folded-same-settings', status: 'succeeded', category: 'prompt_ready', reliableTurnTerminal: true },
     ]);
     // After verification published the runtime version, prompt_ready first
     // (the daemon cleared cliReady when it requested this attempt).
@@ -656,7 +656,7 @@ describe('worker Codex session automatic upgrade', () => {
     expect(await done).toBeUndefined();
     expect(h.state.inspectCodexUpgradeRuntime).toHaveBeenCalledTimes(2);
     expect(restartReceipts(h)).toEqual([
-      { type: 'restart_result', attemptId: 'folded-config-edit', status: 'succeeded', category: 'prompt_ready' },
+      { type: 'restart_result', attemptId: 'folded-config-edit', status: 'succeeded', category: 'prompt_ready', reliableTurnTerminal: true },
     ]);
     const steps = h.steps;
     expect(steps.lastIndexOf('verify thread fd')).toBeGreaterThan(steps.lastIndexOf('spawn'));

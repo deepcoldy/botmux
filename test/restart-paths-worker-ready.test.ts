@@ -279,6 +279,58 @@ describe('#1863 CLI crash auto-restart (reason cli_crash)', () => {
     expect(ds.workerReady).toBe(false);
   });
 
+  it('records only correlated successful turn-terminal attestations and scopes them to the worker generation', async () => {
+    const { ds, worker } = armSession();
+    const observer = { source: 'slash' as const, notify: vi.fn() };
+
+    const first = workerPool.requestSessionRestart(ds, observer)!;
+    expect(ds.inPlaceRestartTurnTerminalPending).toEqual({
+      workerGeneration: ds.workerGeneration,
+      attemptId: first.attemptId,
+    });
+    worker.emit('message', {
+      type: 'restart_result', attemptId: first.attemptId, status: 'succeeded', reliableTurnTerminal: true,
+    });
+    expect(ds.inPlaceRestartTurnTerminal).toEqual({
+      workerGeneration: ds.workerGeneration,
+      reliableTurnTerminal: true,
+    });
+    expect(ds.inPlaceRestartTurnTerminalPending).toBeUndefined();
+
+    const second = workerPool.requestSessionRestart(ds, observer)!;
+    expect(ds.workerReady).toBe(false);
+    worker.emit('message', { type: 'restart_result', attemptId: second.attemptId, status: 'failed' });
+    expect(ds.inPlaceRestartTurnTerminal?.reliableTurnTerminal).toBe(true);
+    expect(ds.inPlaceRestartTurnTerminalPending?.attemptId).toBe(second.attemptId);
+    worker.emit('message', {
+      type: 'restart_result', attemptId: second.attemptId, status: 'succeeded', reliableTurnTerminal: false,
+    });
+    expect(ds.inPlaceRestartTurnTerminal?.reliableTurnTerminal).toBe(true);
+    expect(ds.inPlaceRestartTurnTerminalPending?.attemptId).toBe(second.attemptId);
+
+    const third = workerPool.requestSessionRestart(ds, observer)!;
+    worker.emit('message', {
+      type: 'restart_result', attemptId: third.attemptId, status: 'succeeded', reliableTurnTerminal: false,
+    });
+    expect(ds.inPlaceRestartTurnTerminal).toEqual({
+      workerGeneration: ds.workerGeneration,
+      reliableTurnTerminal: false,
+    });
+    expect(ds.inPlaceRestartTurnTerminalPending).toBeUndefined();
+
+    const untouched = workerPool.requestSessionRestart(ds, observer)!;
+    worker.emit('message', {
+      type: 'restart_result', attemptId: untouched.attemptId, status: 'failed', untouched: true,
+    });
+    expect(ds.inPlaceRestartTurnTerminalPending).toBeUndefined();
+    expect(ds.inPlaceRestartTurnTerminal?.reliableTurnTerminal).toBe(false);
+
+    const attestedGeneration = ds.workerGeneration;
+    workerPool.reserveWorkerGeneration(ds);
+    expect(ds.workerGeneration).not.toBe(attestedGeneration);
+    expect(ds.inPlaceRestartTurnTerminal?.workerGeneration).toBe(attestedGeneration);
+  });
+
   it('a crash while a /restart attempt is in flight joins it instead of stacking a second respawn', async () => {
     const { ds, worker, sessionId } = armSession();
     const manual = workerPool.requestSessionRestart(ds, { source: 'slash', notify: vi.fn() })!;

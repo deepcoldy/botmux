@@ -1,6 +1,7 @@
 /**
  * Readable answers for fleet commands (`botmux status / logs / start / stop /
- * restart / start-bot / stop-bot`) run from inside a botmux session sandbox.
+ * restart / start-bot / stop-bot / wecom start|stop|restart`) run from inside a
+ * botmux session sandbox.
  *
  * Every Linux sandbox flavour (oncall/scratch file sandbox, credential-only
  * bwrap) runs under `bwrap --unshare-pid` with a fresh /proc: the supervisor
@@ -34,7 +35,9 @@ export function detectSandboxContext(
   };
 }
 
-export type FleetCommand = 'status' | 'logs' | 'start' | 'stop' | 'restart' | 'start-bot' | 'stop-bot';
+export type FleetCommand =
+  | 'status' | 'logs' | 'start' | 'stop' | 'restart' | 'start-bot' | 'stop-bot'
+  | 'wecom start' | 'wecom stop' | 'wecom restart';
 
 /** Refusal shown instead of running a fleet command whose answer (status) or
  *  effect (start/stop/restart) would be wrong because host processes are not

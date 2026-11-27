@@ -79,8 +79,9 @@ describe('bridgeSpecFor (static lookup) vs adapter.bridgeSpec', () => {
     expect(bridgeSpecFor('antigravity')).toMatchObject({ stateCommit: 'ingest', spawn: { baseline: 'birth-aware' } });
     expect(bridgeSpecFor('antigravity')?.adopt).toBeUndefined();
     // cursor: no per-event timestamps → byte-offset baseline on adopt; the
-    // spawn bridge is always-on (send-marker-gated) since #932.
-    expect(bridgeSpecFor('cursor')).toMatchObject({ adopt: { attach: 'baseline-skip-tail' }, spawn: { baseline: 'resume-aware' } });
+    // spawn bridge is always-on (send-marker-gated) since #932. Raw PTY
+    // user and final records can land on different live ingest ticks.
+    expect(bridgeSpecFor('cursor')).toMatchObject({ stateCommit: 'ingest', adopt: { attach: 'baseline-skip-tail' }, spawn: { baseline: 'resume-aware' } });
     // id-addressed isolated sessions (no pid discovery) fall back to the adapter session id.
     for (const id of ['oh-my-pi', 'ebsd'] as const) {
       expect(bridgeSpecFor(id)?.locate.byPid).toBeUndefined();
@@ -111,8 +112,8 @@ describe('spec.drain threads driver state', () => {
     expect(result.state).toBeDefined();
   });
 
-  it('stateless drivers (traex / cursor / pi / grok / coco) return no state to commit', () => {
-    for (const id of ['traex', 'cursor', 'pi', 'grok', 'coco'] as const) {
+  it('stateless drivers (traex / pi / grok / coco) return no state to commit', () => {
+    for (const id of ['traex', 'pi', 'grok', 'coco'] as const) {
       const spec = bridgeSpecFor(id)!;
       expect(spec.stateCommit, id).toBeUndefined();
       expect(spec.drain(join(dir, 'nope.jsonl'), 0, { adoptMode: false, state: undefined }).state, id).toBeUndefined();

@@ -1,11 +1,14 @@
 import { useEffect, useState } from 'react';
 import { toast } from './toast.js';
+import { providerDescriptor } from './providers/registry.js';
+import type { ProviderKind } from './providers/types.js';
 
 type Tr = (key: string, values?: Record<string, string | number>) => string;
 type JsonResponse = { ok: boolean; status: number; body: any };
 
 /**
  * 「静默模式」一键预设：卡内与原生思考过程关 + 静默表情回应开 + 流式卡关。
+ * 企业微信没有表情回应和原生思考气泡，预设改为关工具过程（见 providers/ 的 quietPreset）。
  *
  * 这是一次性写入的便捷开关，不与四个独立开关的状态绑定：
  * - 打开 = 恰好一次 PUT，body 恰好四个键；
@@ -14,23 +17,28 @@ type JsonResponse = { ok: boolean; status: number; body: any };
  */
 export function QuietPresetSection(props: {
   tr: Tr;
+  /** 缺省按飞书。 */
+  provider?: ProviderKind;
+  replyCardShowTools?:boolean;
   cotEnabled: boolean;
   replyCardNativeCot: boolean;
   silentReactions: boolean;
   disableStreaming: boolean;
   putCardPref(patch: {
     cotEnabled: boolean;
-    replyCardNativeCot: boolean;
-    silentTurnReactions: boolean;
+    replyCardNativeCot?: boolean;
+    silentTurnReactions?: boolean;
+    replyCardShowTools?:boolean;
     disableStreamingCard: boolean;
   }): Promise<JsonResponse>;
   onApplied(): void;
 }) {
   const { tr } = props;
-  const derived = props.cotEnabled === false
-    && props.replyCardNativeCot === false
-    && props.silentReactions === true
-    && props.disableStreaming === true;
+  const descriptor = providerDescriptor(props.provider ?? 'lark');
+  const hidesTools = descriptor.profile.quietPreset === 'tools';
+  const copy = descriptor.copy;
+  const derived = props.cotEnabled === false && props.disableStreaming === true
+    && (hidesTools ? props.replyCardShowTools === false : props.replyCardNativeCot === false && props.silentReactions === true);
   const [on, setOn] = useState(derived);
   const [busy, setBusy] = useState(false);
 
@@ -50,8 +58,7 @@ export function QuietPresetSection(props: {
     try {
       const res = await props.putCardPref({
         cotEnabled: false,
-        replyCardNativeCot: false,
-        silentTurnReactions: true,
+        ...(hidesTools ? { replyCardShowTools: false } : { replyCardNativeCot: false, silentTurnReactions: true }),
         disableStreamingCard: true,
       });
       if (res.ok) {
@@ -72,7 +79,7 @@ export function QuietPresetSection(props: {
   return (
     <section className="bd-card-setting-group" data-quiet-preset>
       <h4 className="bd-card-setting-heading">{tr('quietPreset.title')}</h4>
-      <p><small>{tr('quietPreset.description')}</small></p>
+      <p><small>{tr(copy.quietPresetDescription)}</small></p>
       <label className="toggle-row">
         <input
           type="checkbox"
@@ -91,7 +98,7 @@ export function QuietPresetSection(props: {
           <summary>{tr('quietPreset.detailsSummary')}</summary>
           <ul>
             <li>{tr('quietPreset.thinkingOff')}</li>
-            <li>{tr('quietPreset.silentOn')}</li>
+            <li>{tr(copy.quietPresetSecondEffect)}</li>
             <li>{tr('quietPreset.streamingOff')}</li>
           </ul>
         </details>

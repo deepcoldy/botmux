@@ -2,6 +2,7 @@ import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { lstatSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { readSecureHostFileSync, withSecureHostParentSync } from '../platform/secure-host-file.js';
+import { isCoreOnlyProcess } from './runtime-mode.js';
 
 const DOMAIN = 'botmux.dispatch-report-binding.v1';
 
@@ -55,7 +56,7 @@ export function dispatchReportBindingSecretPath(
   dataDir: string,
   options: { coreOnly?: boolean } = {},
 ): string {
-  const coreOnly = options.coreOnly ?? process.env.BOTMUX_CORE_ONLY === '1';
+  const coreOnly = options.coreOnly ?? isCoreOnlyProcess();
   return coreOnly
     ? join(dataDir, '.dashboard-secret.report-binding')
     : join(dirname(dataDir), '.dashboard-secret.report-binding');
@@ -73,7 +74,7 @@ export function loadOrCreateDispatchReportBindingSecret(
   dataDir: string,
   options: { coreOnly?: boolean } = {},
 ): string {
-  const coreOnly = options.coreOnly ?? process.env.BOTMUX_CORE_ONLY === '1';
+  const coreOnly = options.coreOnly ?? isCoreOnlyProcess();
   const currentPath = dispatchReportBindingSecretPath(dataDir, { coreOnly });
   return withSecureHostParentSync(currentPath, (parent) => parent.withLeafLock(() => {
     const current = parent.readLeaf(256)?.trim();
@@ -120,7 +121,7 @@ export function loadOrCreateDispatchReportBindingSecret(
  * credentials. Returns undefined when absent or unreadable.
  */
 export function readDispatchReportBindingSecret(dataDir: string): string | undefined {
-  const coreOnly = process.env.BOTMUX_CORE_ONLY === '1';
+  const coreOnly = isCoreOnlyProcess();
   try {
     const secret = readSecureHostFileSync(
       dispatchReportBindingSecretPath(dataDir, { coreOnly }),

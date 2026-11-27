@@ -1,4 +1,5 @@
 // Sessions page shared helpers: pure display helpers and small API utilities.
+import { isWecomSource, providerBotKey, sessionSupports } from './providers/registry.js';
 import {
   botDisplayName,
   chatDisplayTitle,
@@ -174,6 +175,13 @@ export function sessionDirectChatText(s: any): string {
 }
 
 export function sessionLocationText(s: any): string {
+  if (isWecomSource(s)) {
+    const kind = s.chatType === 'single' || s.chatType === 'p2p' ? t('sessions.wecomDirectChat') : t('sessions.wecomGroupChat');
+    const name = String(s.chatDisplayName ?? '').trim();
+    // 服务端给没取到群名的会话填的是「企微私聊」这类占位名，不重复显示。
+    const showName = name && !/^(?:企微|企业微信)?(?:私聊|单聊|群聊)$/.test(name);
+    return `${t('provider.wecom')} · ${kind}${showName ? ` · ${name}` : ''}`;
+  }
   const chatId = String(s?.chatId ?? '').trim();
   if (s?.chatType === 'p2p') return sessionDirectChatText(s);
   const name = chatDisplayTitle(s);
@@ -258,8 +266,10 @@ export function filterSessionRows<T extends Record<string, any>>(
     } else if (filters.status !== SESSION_STATUS_ANY && !matchesStatusFilter(s, filters.status)) {
       return false;
     }
-    if (filters.adopt && (filters.adopt === 'yes') !== !!s.adopt) return false;
-    if (filters.bot && String(s.larkAppId ?? '') !== filters.bot) return false;
+    if (filters.adopt === 'wecom') { if (!isWecomSource(s)) return false; }
+    else if (filters.adopt === 'lark') { if (isWecomSource(s)) return false; }
+    else if (filters.adopt && (filters.adopt === 'yes') !== !!s.adopt) return false;
+    if (filters.bot && providerBotKey(s) !== filters.bot) return false;
     if (filters.chat && String(s.chatId ?? '') !== filters.chat) return false;
     if (q && !sessionSearchText(s).includes(q)) return false;
     return true;
@@ -421,7 +431,22 @@ export function canRestartSession(s: any): boolean {
   // No restart for ANY remote CLI, matching the Feishu card render surface and
   // the server's 409 (remote_restart_unsupported): a riff worker refuses the
   // IPC, and a mojo worker executes it — cancelling the remote session.
-  return s.status !== 'closed' && !s.adopt && !s.pendingRepo && !isRemoteCliId(s.cliId);
+  return sessionSupports(s, 'restart') && s.status !== 'closed' && !s.adopt && !s.pendingRepo && !isRemoteCliId(s.cliId);
+}
+
+/**
+ * 会话详情抽屉底部的主操作组：'resume' 只放「恢复」，'live' 放接管 / 重启 / 关闭等
+ * 运行中操作，'none' 两组都不放。
+ *
+ * 飞书（不带 provider 的 legacy 行）只有 closed 才是「恢复」：dormant 只是 worker 退出后
+ * 的展示状态，底层会话没有关闭，对它发 resume 会被服务端以 not_closed 拒绝，所以它仍然
+ * 走运行中操作。企业微信行按服务端下发的能力：dormant 且声明可恢复时只放「恢复」。
+ */
+export function drawerFootActions(s: any): 'resume' | 'live' | 'none' {
+  const closed = s.status === 'closed';
+  if (!isWecomSource(s)) return closed ? 'resume' : 'live';
+  if ((closed || s.status === 'dormant') && sessionSupports(s, 'resume')) return 'resume';
+  return closed ? 'none' : 'live';
 }
 
 export interface PickerBot { larkAppId: string; botName: string; }

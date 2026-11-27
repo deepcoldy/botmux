@@ -1,3 +1,6 @@
+import { resolveAskDeliveryRoute } from './core/native-gateway-ask-dispatch.js';
+import { wireAskCardDelivery } from './core/native-gateway-ask-control.js';
+import { isCoreOnlyProcess, isNativeGatewayCoreProcess } from './core/runtime-mode.js';
 import { createdGroupWorkingDir } from './services/created-groups-store.js';
 import { configuredCliExecutionMode, delegatedCliExecutionAllowed } from './core/cli-execution-mode.js';
 import { advancePendingStreamingCardTurn } from './core/streaming-card-post-slot.js';
@@ -515,6 +518,7 @@ import { isLocalCliOpenReady } from './services/local-cli-opener.js';
 import { RECEIVED_REACTION_EMOJI_TYPE, SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE } from './core/pending-response.js';
 import { t as tr, localeForBot } from './i18n/index.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
+import { antigravityTransport } from './services/antigravity-transport.js';
 import {
   initWorkerPool,
   setActiveSessionsRegistry,
@@ -588,6 +592,7 @@ import {
   sendFoldBackgroundUpdatesSetting,
   resetUsageLimitForNewTurn,
   scheduleUsageLimitPersistenceRetry,
+  resolveSessionEnvForSession,
 } from './core/worker-pool.js';
 import { notePromptCacheKeepaliveTurnStarted, runPromptCacheKeepaliveSweep, statuslineContextTokens } from './core/prompt-cache-keepalive.js';
 import { invalidateIdleAutoCompactRetryForTurn, isLocalCliCommand, noteIdleAutoCompactTurnStarted, runIdleAutoCompactSweep, type IdleAutoCompactNotice, type IdleAutoCompactRefusalReason } from './core/idle-auto-compact.js';
@@ -1195,7 +1200,6 @@ import { createRepoWorktree, isGitWorkTree } from './services/git-worktree.js';
 import { recordCreatedWorktree } from './services/botmux-worktree-store.js';
 import { escapeXmlAttr, escapeXmlText } from './utils/xml.js';
 import {
-  setCardDispatcher as setAskCardDispatcher,
   setCanTalkChecker as setAskCanTalkChecker,
   setAskPersistStore as setAskPersistStoreBroker,
   registerAsk as registerAskBroker,
@@ -3444,8 +3448,7 @@ function resolveVcMeetingReceiverSession(sessionId: string): VcMeetingReceiverSe
   if (!ds) return undefined;
   try {
     const bot = getBot(ds.larkAppId);
-    const cliId = (ds.session.cliId as CliId | undefined) ?? bot.config.cliId;
-    const adapter = createCliAdapterSync(cliId, bot.config.cliPathOverride);
+    const cliId = (ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? bot.config.cliId) as CliId;
     const backendType = resolvePairedSpawnBackendType(
       cliId,
       ds.initConfig?.backendType ?? ds.session.backendType,
@@ -3458,11 +3461,55 @@ function resolveVcMeetingReceiverSession(sessionId: string): VcMeetingReceiverSe
       backendType,
     });
     if (!isolation.ok) return undefined;
+
+    const hasLiveWorker = !!(ds.worker && !ds.worker.killed);
+    const restartTurnTerminal = ds.inPlaceRestartTurnTerminal;
+    const restartTurnTerminalPending = ds.inPlaceRestartTurnTerminalPending;
+    const restartPending = !!(hasLiveWorker
+      && restartTurnTerminalPending
+      && restartTurnTerminalPending.workerGeneration === ds.workerGeneration);
+    const attested = hasLiveWorker
+      && restartTurnTerminal
+      && restartTurnTerminal.workerGeneration === ds.workerGeneration
+      ? restartTurnTerminal.reliableTurnTerminal
+      : undefined;
+    let reliableTurnTerminal = false;
+    // A live restart hides the previous attestation until its correlated
+    // success receipt arrives. Failure/timeout keep the generation-scoped
+    // pending marker, including across parked prompt_ready recovery; a late
+    // receipt cannot clear it. An untouched receipt restores the old readiness
+    // and attestation together. A workerless session instead resolves the same
+    // live env that its next cold fork will use, ignoring stale restart state.
+    if (!(hasLiveWorker && (ds.workerReady === false || restartPending))) {
+      if (attested !== undefined) {
+        reliableTurnTerminal = attested;
+      } else {
+        // Same three-tier precedence as every spawn-time resolver
+        // (session-manager/trigger-session): a legacy session's own frozen
+        // cliPathOverride shadows the live bot default; the bot fallback only
+        // applies when the session still runs the bot's configured CLI.
+        const cliPathOverride = ds.session.cliLaunchSnapshot?.cliPathOverride
+          ?? ds.session.cliPathOverride
+          ?? (cliId === bot.config.cliId ? bot.config.cliPathOverride : undefined);
+        const sessionEnv = hasLiveWorker && ds.initConfig
+          ? ds.initConfig.env
+          : resolveSessionEnvForSession(ds, bot.config, backendType).env;
+        const agyTransport = cliId.toLowerCase() === 'antigravity'
+          ? antigravityTransport(sessionEnv)
+          : undefined;
+        const adapter = createCliAdapterSync(
+          cliId,
+          cliPathOverride,
+          agyTransport ? { antigravityTransport: agyTransport } : undefined,
+        );
+        reliableTurnTerminal = adapter.reliableTurnTerminal === true;
+      }
+    }
     return {
       sessionId: ds.session.sessionId,
       chatId: ds.chatId,
       agentAppId: ds.larkAppId,
-      reliableTurnTerminal: adapter.reliableTurnTerminal === true,
+      reliableTurnTerminal,
     };
   } catch {
     return undefined;
@@ -6548,7 +6595,7 @@ function writePidFile(): void {
   // signpost for bare-shell CLIs; a core-only service must not rewrite it to point
   // a same-HOME host operator at the core-only store. Core-only's own workers get
   // the data dir via the frozen SESSION_DATA_DIR env, not this breadcrumb.
-  if (process.env.BOTMUX_CORE_ONLY !== '1') {
+  if (!isCoreOnlyProcess()) {
     const breadcrumb = join(homedir(), '.botmux', '.data-dir');
     try {
       mkdirSync(join(homedir(), '.botmux'), { recursive: true });
@@ -12511,15 +12558,60 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
   }
   // No-transport session (apiOnly bot or HTTP virtual chat): `botmux ask` posts
   // an interactive Lark card and blocks the turn on a human click — impossible
-  // without a real Feishu chat. Fail fast with `unsupported` instead of letting
-  // it fall into the Lark dispatcher and hang the agent on a card that can never
-  // render. (Structured HTTP awaiting_input is a separate, future capability.)
-  if (askSession && !larkTransportEnabled({ chatId: askSession.chatId, apiOnly: getBot(askSession.larkAppId).config.apiOnly })) {
+  // without a real Feishu chat. The one exception is a native gateway core,
+  // whose gateway delivers the ask itself (native gateway asks, polled over host
+  // HMAC) for a turn it dispatched. Everything else — including a bare
+  // core-only service with no gateway — fails fast with `unsupported` instead
+  // of hanging the agent on a card that can never render. On a native gateway
+  // core an ask whose turn is no longer live (no live turn, or the caller names
+  // another turn / attempt than the live one) ends with a terminal
+  // `invalidated`; the caller's names can only refuse, never route.
+  const askRoute = askSession
+    ? resolveAskDeliveryRoute({
+      nativeGatewayCore: isNativeGatewayCoreProcess(),
+      larkTransport: larkTransportEnabled({ chatId: askSession.chatId, apiOnly: getBot(askSession.larkAppId).config.apiOnly }),
+      turnOrigin: askSession.managedTurnOrigin,
+      workerGeneration: askSession.workerGeneration,
+      claimedTurnId: typeof body.originTurnId === 'string' && body.originTurnId ? body.originTurnId : undefined,
+      claimedDispatchAttempt: typeof body.originDispatchAttempt === 'number' ? body.originDispatchAttempt : undefined,
+    })
+    : undefined;
+  if (askRoute?.kind === 'unsupported') {
     return jsonRes(res, 400, {
       ok: false,
       error: 'unsupported',
       detail: 'botmux ask requires a Feishu chat; this session has no Lark transport (apiOnly / HTTP virtual session)',
     });
+  }
+  // A Codex App asynchronous question is answered after its turn moved on, and
+  // the answer is admitted as a new daemon-started turn. A native gateway core
+  // runs only turns its gateway dispatched (nothing could deliver that turn's
+  // output), so such a question is refused here rather than shown.
+  if (boundAsk.asyncUserInput && (askRoute?.kind === 'native_gateway' || askRoute?.kind === 'ended')) {
+    return jsonRes(res, 400, {
+      ok: false,
+      error: 'async_question_unsupported',
+      detail: 'asynchronous questions are not supported on a native gateway core: the answer would start a turn the gateway did not dispatch',
+    });
+  }
+  if (askRoute?.kind === 'ended') {
+    // An explicit ask whose answer was already recorded keeps that answer,
+    // whichever execution happens to be live now.
+    const recorded = askSession && boundAsk.originKind === 'explicit' && boundAsk.requestId
+      ? explicitAskContinuation.recordedResult({
+        larkAppId: boundAsk.larkAppId,
+        chatId: boundAsk.chatId,
+        rootMessageId: boundAsk.rootMessageId,
+        sessionId: boundAsk.sessionId,
+        questions: boundAsk.questions,
+        timeoutMs: boundAsk.timeoutMs,
+        chatType: askSession.chatType,
+        originKind: 'host_explicit',
+        requestId: boundAsk.requestId,
+        ...(boundAsk.answererOpenId ? { answererOpenId: boundAsk.answererOpenId } : {}),
+      })
+      : undefined;
+    return jsonRes(res, 200, recorded ?? askRoute.result);
   }
 
   // Silent listener tasks must never surface an ask card in the source group.
@@ -12613,13 +12705,17 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
     logger.warn(`[ask:${boundAsk.larkAppId}] no active session for ${boundAsk.sessionId.substring(0, 8)}; chatType unknown (p2pOpen answer gate falls back to allowlist)`);
   }
   const askInput = {
+    ...(askRoute?.kind === 'native_gateway' ? { nativeGatewayOrigin: askRoute.origin } : {}),
     larkAppId: boundAsk.larkAppId,
     chatId: boundAsk.chatId,
     rootMessageId: boundAsk.rootMessageId,
     sessionId: boundAsk.sessionId,
     questions: boundAsk.questions,
-    // Async asks outlive their originating reply card; document asks are delivered privately.
-    replyCardTarget: asyncInput || documentDelivery ? undefined : replyCardAskTarget(askSession, boundAsk, body),
+    // Async asks outlive their originating reply card; document asks are
+    // delivered privately; a native gateway shows its asks itself.
+    replyCardTarget: asyncInput || documentDelivery || askRoute?.kind === 'native_gateway'
+      ? undefined
+      : replyCardAskTarget(askSession, boundAsk, body),
     deliveryTarget: documentDelivery,
     timeoutMs: boundAsk.timeoutMs,
     chatType: askChatType,
@@ -23238,6 +23334,9 @@ async function handleVcMeetingPush(ctx: VcMeetingPushContext): Promise<void> {
 export const __vcMeetingAgentTest = {
   handlePush: handleVcMeetingPush,
   handleCardAction: handleVcMeetingCardAction,
+  resolveReceiverSession: resolveVcMeetingReceiverSession,
+  registerReceiverMember: (raw: unknown, receiverAppId?: string) =>
+    registerVcMeetingMember(raw, vcMeetingDeliveryReceiverDeps(receiverAppId)),
   receiverSessionSnapshot: (sessionId: string) => {
     const ds = [...activeSessions.values()].find(candidate =>
       candidate.session.sessionId === sessionId);
@@ -35645,7 +35744,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // SKIP in core-only (codex P1-2): this reads + backs-up + rewrites the on-disk
   // fleet bots.json. A headless core-only service must never touch an ambient
   // host fleet config — its identity is a synthesized in-memory apiOnly bot.
-  if (process.env.BOTMUX_CORE_ONLY !== '1') {
+  if (!isCoreOnlyProcess()) {
     await migrateSandboxConfigAtStartup();
   }
 
@@ -35699,7 +35798,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // 把本 bot 在 bots.json 上残留的授权字段并入并删除，再灌入内存缓存。必须先于任何事件处理；
   // 授权库不可用即拒绝启动（空授权会把只配了 globalGrants 的 bot 误判为开放模式）。
   // core-only 的 bot 是内存合成的 apiOnly 身份，不在 fleet bots.json 里，也没有飞书授权。
-  if (process.env.BOTMUX_CORE_ONLY !== '1') {
+  if (!isCoreOnlyProcess()) {
     await initGrantStateForDaemon({ larkAppId: cfg.larkAppId, dataDir: config.session.dataDir });
   }
   // Host-executed schedule conditions are authority material. Create and
@@ -35899,7 +35998,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   ));
   scheduleStore.startExternalWriteWatcher();
   logger.info(`Bot ${idx}/${botConfigs.length}: ${cfg.larkAppId} (cli: ${cfg.cliId})`)
-  setAskCardDispatcher(createLarkAskCardDispatcher());
+  // A native gateway core delivers asks through its gateway (handleAskRequest
+  // only admits asks it can route there); every other daemon, including a bare
+  // core-only service, keeps the Lark card dispatcher. A native gateway ask lives
+  // exactly as long as the gateway can still see the execution that asked.
+  wireAskCardDelivery({
+    nativeGatewayCore: isNativeGatewayCoreProcess(),
+    larkDispatcher: createLarkAskCardDispatcher,
+    findSession: findActiveBySessionId,
+  });
   // Honour the bot's canTalk gate for `botmux ask` answers: a clicker who may
   // address the bot in this chat may answer an implicit-approver ask.
   //
@@ -35940,7 +36047,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // BOTMUX_API_PORT and must NOT drift via the fleet's upward EADDRINUSE probe —
   // a silent drift would leave the client dialing a dead port. Fleet daemons
   // keep the ipcBasePort+idx scheme + probe (a port race must not crash boot).
-  const coreOnlyApiPort = process.env.BOTMUX_CORE_ONLY === '1'
+  const coreOnlyApiPort = isCoreOnlyProcess()
     ? Number(process.env.BOTMUX_API_PORT) || 0
     : 0;
   const ipcPort = coreOnlyApiPort || config.dashboard.ipcBasePort + idx;
@@ -37056,7 +37163,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   loadOrCreateDispatchReportBindingSecret(config.session.dataDir);
   let markIpcReady!: () => void;
   const ipcReady = new Promise<void>((resolve) => { markIpcReady = resolve; });
-  const coreOnly = process.env.BOTMUX_CORE_ONLY === '1';
+  const coreOnly = isCoreOnlyProcess();
   // Core-only keeps the trusted-host HMAC ON (codex P1: authRequired:false opened
   // ALL 96 IPC routes — a co-resident model turn could read/perturb sessions,
   // scheduler, mutations). Instead we allowlist ONLY the tight riff-facing routes

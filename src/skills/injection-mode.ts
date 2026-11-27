@@ -28,7 +28,7 @@ import { readGlobalConfig } from '../global-config.js';
 import { loadBotConfigs } from '../bot-registry.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliId } from '../adapters/cli/types.js';
-import type { Locale } from '../i18n/index.js';
+import { t, type Locale } from '../i18n/index.js';
 import { escapeXmlText } from '../utils/xml.js';
 import { isMultiTopicOrchestrationEnabled, isWorkflowFeatureEnabled } from '../global-config.js';
 import { workflowSessionKind, workflowSessionPolicy, type WorkflowSessionKind } from '../workflows/session-kind.js';
@@ -46,6 +46,37 @@ import {
   isBuiltinSkillBodyOverridden,
 } from './effective-builtins.js';
 import { renderBotmuxSendSkill } from './reply-style-guide.js';
+import { isNativeGatewayCoreProcess } from '../core/runtime-mode.js';
+
+/**
+ * Whether this process offers botmux's built-in skills at all — through any
+ * channel: plugin dir, global skills dir, prompt catalog or help pointer.
+ *
+ * A native IM gateway's dedicated core (and its workers) does not. Every
+ * built-in skill drives the Feishu/Lark transport that core has no access to
+ * (send, history, schedule, handoff, ask cards, …), and the dirs those skills
+ * are materialised into (`~/.botmux/<cli>-plugin`, `~/.codex/skills`, …) are
+ * keyed by HOME and shared with the Feishu fleet on the same host: that core
+ * re-materialising or pruning them from its own (empty) customization store
+ * and bot list would overwrite what the fleet decided. So it neither advertises
+ * the skills nor writes or prunes those dirs. Every other process is unchanged.
+ */
+export function builtinSkillsOffered(): boolean {
+  return !isNativeGatewayCoreProcess();
+}
+
+/**
+ * What a native gateway's core tells a CLI about `botmux ask` in place of the
+ * built-in skills it no longer offers. Asks do work there: the gateway posts
+ * the card into the current chat and it stays answerable only within the turn
+ * that asked (core/native-gateway-ask-dispatch.ts). Rendered where the skill
+ * catalog / help pointer / ask skill file used to reach the CLI — the opening
+ * turn, or the system prompt for system-prompt CLIs — and only for CLIs that do
+ * not take questions through their own hook. Channel-neutral on purpose.
+ */
+export function nativeGatewayAskHintBlock(locale?: Locale): string {
+  return `<botmux_ask>\n${escapeXmlText(t('ai.native_gateway.ask_hint', undefined, locale))}\n</botmux_ask>`;
+}
 
 /** Built-ins the model is told about up front (prompt catalog / `botmux skill
  *  list`). The independent multi-topic switch filters `botmux-orchestrate`;
@@ -423,6 +454,7 @@ export function builtinSkillBlockForInjectsSessionContext(
   locale: Locale | undefined,
   opts: { asksViaHook?: boolean; whiteboardEnabled?: boolean; hasRoutingBlock?: boolean } = {},
 ): string {
+  if (!builtinSkillsOffered()) return opts.asksViaHook ? '' : nativeGatewayAskHintBlock(locale);
   const mode = resolveSkillInjectionModeForApp(larkAppId);
   const hasRoutingBlock = opts.hasRoutingBlock !== false;
   if (mode === 'prompt') {

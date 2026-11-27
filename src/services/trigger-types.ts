@@ -97,6 +97,14 @@ export interface TriggerRequest {
     status?: 'firing' | 'resolved' | string;
     waitForFinalOutput?: boolean;
     asyncReturnSessionId?: boolean;
+    /** Working directory a native gateway selected for a NEW core-only session
+     * (absolute; rejected together with `target.sessionId`). Not authenticated:
+     * core-only `/api/trigger` is a public route, so the daemon independently
+     * requires the realpath to stay inside the bot's configured root
+     * (resolveNativeGatewayWorkingDirectory) and an apiOnly HTTP virtual session.
+     * The wire name predates the native gateway naming and is kept: the gateway
+     * persists each frozen request in its state file and replays it on retry. */
+    connectorWorkingDirectory?: string;
     /** Permit explicit botmux send for messages authorized by this request in the
      * existing real group. The caller determines message content and timing.
      * Final output still returns to the caller. Defaults to false; turn-local.
@@ -355,6 +363,9 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
   if (options.steer === true && options.dryRun === true) {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.steer is not supported with options.dryRun' } };
   }
+  if (options.connectorWorkingDirectory !== undefined && !validNativeGatewayWorkingDirectory(options.connectorWorkingDirectory, raw)) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'invalid connector working directory' } };
+  }
   const waitForFinalOutput = options.waitForFinalOutput === true;
   const asyncReturnSessionId = options.asyncReturnSessionId === true;
   const hasChatId = typeof target.chatId === 'string' && target.chatId.trim().length > 0;
@@ -494,4 +505,12 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
     }
   }
   return { ok: true, request: raw as unknown as TriggerRequest };
+}
+
+/** Shape check only (absolute, no NUL, new sessions only); containment in the
+ * configured root is enforced by the daemon at session creation. */
+function validNativeGatewayWorkingDirectory(value: unknown, raw: Record<string, unknown>): boolean {
+  if (typeof value !== 'string' || !value.startsWith('/') || value.includes('\0')) return false;
+  const target = raw.target as Record<string, unknown> | undefined;
+  return !target?.sessionId;
 }

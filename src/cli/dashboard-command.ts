@@ -17,6 +17,7 @@ import type { DashboardEndpoint, DashboardResult } from './dashboard-endpoint.js
 export const DASHBOARD_LOCAL_TOKEN_FLAG = '--i-am-the-owner-show-token-link';
 
 export const DASHBOARD_COMMAND_USAGE = `用法:
+  首次安装未配置机器人时，会自动启动零 Bot Dashboard 供配置使用。
   botmux dashboard           获取当前 Dashboard 登录 URL（没有则创建，不轮换已有 token）
   botmux dashboard current   获取当前 Dashboard 登录 URL（没有则创建，不轮换已有 token）
   botmux dashboard rotate    轮换 token，并打印新的 Dashboard 登录 URL`;

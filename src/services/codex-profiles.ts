@@ -27,7 +27,7 @@ export function normalizeCodexProfile(raw: unknown): string | undefined {
   if (typeof raw !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(raw)) fail('invalid_name');
   return raw as string;
 }
-export type ProfileLaunch = Pick<Partial<BotConfig>, 'cliId' | 'wrapperCli' | 'cliLaunchMode' | 'cliPathOverride' | 'env' | 'envPolicy' | 'sandbox' | 'readIsolation' | 'codexAuthSync' | 'codexInstancePool' | 'existingAppServer' | 'startupCommands' | 'backendType' | 'serviceTier' | 'codexRpcInput'> & { cliRuntime?: { executable: string } };
+export type ProfileLaunch = Pick<Partial<BotConfig>, 'cliId' | 'wrapperCli' | 'cliLaunchMode' | 'cliPathOverride' | 'env' | 'envPolicy' | 'sandbox' | 'readIsolation' | 'codexAuthSync' | 'codexInstancePool' | 'existingAppServer' | 'startupCommands' | 'backendType' | 'serviceTier' | 'codexRpcInput'> & { cliRuntime?: { executable: string }; probeBaseEnv?: NodeJS.ProcessEnv };
 export type CodexProfileCapability = { version: string; format: 'files' | 'legacy' };
 /**
  * 配置层门控：结论只由 bots.json 条目自身的字段决定，不读任何 process.env、
@@ -53,7 +53,7 @@ export function assertCodexProfileConfig(cfg: ProfileLaunch): void {
 export function assertCodexProfileRuntime(cfg: ProfileLaunch): void {
   assertCodexProfileConfig(cfg);
   if (!['linux', 'darwin'].includes(process.platform)) fail('unsupported_launch');
-  if (envSandboxMode(process.env.BOTMUX_SANDBOX) !== 'off') fail('unsupported_launch');
+  if (envSandboxMode((cfg.probeBaseEnv ?? process.env).BOTMUX_SANDBOX) !== 'off') fail('unsupported_launch');
 }
 /**
  * Loader-level content gate reusable by every bots.json WRITE surface without
@@ -84,7 +84,7 @@ export function assertChangedBotsCodexProfile(previous: any[], next: any[]): voi
  * tracked as follow-up after #2203.
  */
 export function codexProfileEnvironment(cfg: ProfileLaunch): NodeJS.ProcessEnv {
-  return { ...buildSessionChildEnv(process.env, cfg.envPolicy), ...botInjectedEnv(cfg.env, cfg.envPolicy) };
+  return { ...buildSessionChildEnv(cfg.probeBaseEnv ?? process.env, cfg.envPolicy), ...botInjectedEnv(cfg.env, cfg.envPolicy) };
 }
 export function resolveCodexProfileHome(cfg: ProfileLaunch): string {
   const env = codexProfileEnvironment(cfg);

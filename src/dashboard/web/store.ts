@@ -1,4 +1,6 @@
 // Reactive client cache + SSE consumer for the botmux dashboard SPA.
+import { isWecomSource } from './providers/registry.js';
+
 type Session = Record<string, any> & { sessionId: string; status: string };
 type Schedule = Record<string, any> & { id: string };
 
@@ -10,6 +12,7 @@ interface SessionPageResponse {
   closedTotal?: number;
   contentMatches?: Array<{ sessionId: string; snippet: string; time: number | null }>;
   contentSearch?: string;
+  wecomSessionIds?:string[];
 }
 
 export interface StoreSnapshot {
@@ -76,6 +79,8 @@ export class Store {
   private closedCursor: string | null = null;
   private closedTotal = 0;
   private sessionGeneration = 0;
+  private providerSessionIds: Set<string> | null = null;
+  private providerAvailabilityGeneration = 0;
   private sessionReads = new Map<string, Promise<number | typeof STALE_PAGE>>();
   private historyLoad: Promise<void> | null = null;
   private sessionReadEvents = new Set<Array<{ type: string; body: Record<string, unknown> }>>();
@@ -119,7 +124,7 @@ export class Store {
    * 快照照常落库**——P1-14 的整个要害就是别让排程的失败连累会话列表。
    */
   replaceSnapshot(rows: Session[], schedules: Schedule[] | null, scheduleTimeZone?: string,
-    history?: { closedCursor?: string | null; closedTotal?: number }) {
+    history?: { closedCursor?: string | null; closedTotal?: number; wecomSessionIds?: string[] }) {
     this.replaceSessionRows(rows, history);
     this.schedules.clear();
     for (const schedule of schedules ?? []) this.schedules.set(schedule.id, schedule);
@@ -133,7 +138,7 @@ export class Store {
     }
   }
   /** Commit the critical session list without waiting for optional schedules. */
-  replaceSessionsSnapshot(rows: Session[], history?: { closedCursor?: string | null; closedTotal?: number }) {
+  replaceSessionsSnapshot(rows: Session[], history?: { closedCursor?: string | null; closedTotal?: number; wecomSessionIds?: string[] }) {
     this.replaceSessionRows(rows, history);
     this.bootstrapped = true;
     this.emit();
@@ -149,8 +154,9 @@ export class Store {
     if (schedules !== null) for (const fn of this.scheduleRunLogListeners) fn();
   }
 
-  private replaceSessionRows(rows: Session[], history?: { closedCursor?: string | null; closedTotal?: number }) {
+  private replaceSessionRows(rows: Session[], history?: { closedCursor?: string | null; closedTotal?: number; wecomSessionIds?: string[] }) {
     this.sessionGeneration += 1;
+    if (Array.isArray(history?.wecomSessionIds)) { this.providerSessionIds = new Set(history.wecomSessionIds); this.providerAvailabilityGeneration++; }
     this.closedCursor = history?.closedCursor ?? null;
     this.closedTotal = history?.closedTotal ?? 0;
     // A paginated snapshot only carries the newest closed rows. Older closed rows
@@ -160,7 +166,7 @@ export class Store {
     // field) is complete, so nothing is carried over.
     const keptClosed = history?.closedCursor === undefined
       ? []
-      : [...this.sessions.values()].filter(row => row.status === 'closed');
+      : [...this.sessions.values()].filter(row => row.status === 'closed' && (!isWecomSource(row) || !Array.isArray(history?.wecomSessionIds) || history.wecomSessionIds.includes(row.sessionId)));
     this.sessions.clear();
     for (const row of rows) this.sessions.set(row.sessionId, row);
     for (const row of keptClosed) {
@@ -256,6 +262,7 @@ export class Store {
     path: string, history: boolean, accept?: (page: SessionPageResponse) => boolean, dedupKey = '',
   ): Promise<number | typeof STALE_PAGE> {
     const generation = this.sessionGeneration;
+    const providerGeneration = this.providerAvailabilityGeneration;
     const key = `${generation}:${path}:${dedupKey}`;
     const existing = this.sessionReads.get(key);
     if (existing) return existing;
@@ -267,8 +274,15 @@ export class Store {
       const page: SessionPageResponse = await response.json();
       if (!Array.isArray(page.sessions)) throw new Error('invalid_session_page');
       if (generation !== this.sessionGeneration || (accept && !accept(page))) return STALE_PAGE;
+      // A current history page may discover a newly added source. Never let an
+      // older in-flight page override a newer provider deletion snapshot.
+      if (providerGeneration === this.providerAvailabilityGeneration && Array.isArray(page.wecomSessionIds)) {
+        this.providerSessionIds = new Set(page.wecomSessionIds); this.providerAvailabilityGeneration++;
+        for (const [id,row] of this.sessions) if(isWecomSource(row) && !this.providerSessionIds.has(id)) this.sessions.delete(id);
+      }
       const added = new Set<string>();
       for (const row of page.sessions) {
+        if (isWecomSource(row) && this.providerSessionIds && !this.providerSessionIds.has(row.sessionId)) continue;
         if (!this.sessions.has(row.sessionId)) {
           this.sessions.set(row.sessionId, row);
           added.add(row.sessionId);
@@ -362,6 +376,35 @@ export class Store {
     if (changed) this.emit();
     return changed;
   }
+  /**
+   * Replace the separately read native-provider rows without overwriting Lark SSE updates.
+   * With `allIds` (a complete read) every open provider row is replaced and closed ones
+   * not listed are dropped; without it nothing is deleted.
+   */
+  replaceProviderRows(rows: Session[], allIds?: readonly string[]): void {
+    const available = allIds ? new Set(allIds) : undefined;
+    if (available) {
+      this.providerSessionIds = available;
+      this.providerAvailabilityGeneration++;
+      for (const [id, row] of this.sessions) {
+        if (isWecomSource(row) && (!available.has(id) || row.status !== 'closed')) this.sessions.delete(id);
+      }
+    }
+    for (const row of rows) {
+      if (isWecomSource(row) && (!available || available.has(row.sessionId))) this.sessions.set(row.sessionId, row);
+    }
+    this.emit();
+  }
+
+  /** 缓存里是否有、或最近一次完整快照里是否列出了 provider 会话。 */
+  hasProviderSessions(): boolean {
+    if (this.providerSessionIds && this.providerSessionIds.size > 0) return true;
+    for (const row of this.sessions.values()) {
+      if (isWecomSource(row)) return true;
+    }
+    return false;
+  }
+
   onBotsChanged(fn: () => void) { this.botsListeners.add(fn); return () => this.botsListeners.delete(fn); }
   onScheduleRunLogsChanged(fn: (taskId?: string) => void) {
     this.scheduleRunLogListeners.add(fn);
@@ -407,7 +450,22 @@ export interface DashboardBootstrapOptions {
    * 快照**——那条容错在 {@link fetchSchedulesSnapshot} 里兜底。
    */
   canReadSchedules?: () => boolean;
+  /** 本次身份能否读到 provider（企业微信）会话；不给就从不读 provider 会话。 */
+  canReadProviderSessions?: () => boolean;
+  /**
+   * 每份看板快照（启动、对齐）和每次企业微信会话读取落库之后回调一次，供名册读取其中的
+   * 附加字段（`wecomConnectionCount`）。
+   */
+  onSessionSnapshot?: (body: Record<string, unknown>) => void;
 }
+
+/**
+ * 服务端有企业微信会话变化时，只往本机管理身份的 `/events` 推这个不带数据的提示帧
+ * （dashboard/wecom/session-observer.ts 的 WECOM_SESSIONS_HINT_EVENT），浏览器收到后
+ * 读一次 {@link WECOM_SESSIONS_PATH}。前端不能 import 服务端模块，两边的名字靠测试对齐。
+ */
+const WECOM_SESSIONS_HINT = 'wecom.sessions.changed';
+const WECOM_SESSIONS_PATH = '/api/wecom/sessions';
 
 interface SchedulesSnapshot {
   schedules: Schedule[];
@@ -471,9 +529,13 @@ export async function bootstrap(options: DashboardBootstrapOptions = {}) {
     'session.spawned', 'session.update', 'session.exited',
     'schedule.created', 'schedule.updated', 'schedule.deleted',
     'schedule.fired', 'schedule.timezone', 'bots.changed', 'bots.roster', 'heartbeat',
+    WECOM_SESSIONS_HINT,
   ];
 
   let syncInFlight: Promise<void> | null = null;
+  // 企业微信会话读取（见 readProviderSessions）：在途的那一次，以及在途期间又来了提示。
+  let providerRead: Promise<void> | null = null;
+  let providerReadWanted = false;
   let requestedReconcile = 0;
   let completedReconcile = 0;
   const reconcileSnapshot = (): Promise<void> => {
@@ -494,6 +556,7 @@ export async function bootstrap(options: DashboardBootstrapOptions = {}) {
           if (!response.ok) throw new Error('session_snapshot_unavailable');
           const s = await response.json();
           store.replaceSessionsSnapshot(s.sessions ?? [], s);
+          options.onSessionSnapshot?.(s);
           sessionsReady = true;
           // Session events must remain live even while an optional schedule
           // response hangs. Keep schedule events buffered until its own snapshot
@@ -517,8 +580,39 @@ export async function bootstrap(options: DashboardBootstrapOptions = {}) {
       }
     })().finally(() => {
       syncInFlight = null;
+      // 对齐期间到达的企业微信提示等快照落库之后再读（见 readProviderSessions）。
+      if (providerReadWanted) readProviderSessions();
     });
     return syncInFlight;
+  };
+
+  // 企业微信会话不在 `/events` 里：服务端只给本机管理身份的流推一个不带数据的提示帧，收到后
+  // 经 REST 读一次，能不能读由那条接口把关。读取在途时又来提示，结束后再读一次，不并发、不丢
+  // 最后一次；全量对齐在途时等它落库之后再读，免得对齐里较早取的看板快照盖掉较新的企业微信行。
+  // 断线期间漏掉的提示由每次重连的全量对齐补上。纯飞书部署收不到提示帧，这里一次都不会走到。
+  const readProviderSessions = (): void => {
+    const canRead = options.canReadProviderSessions;
+    if (!canRead?.()) return;
+    providerReadWanted = true;
+    if (providerRead || syncInFlight) return;
+    providerRead = (async () => {
+      while (providerReadWanted && !syncInFlight) {
+        providerReadWanted = false;
+        try {
+          const response = await fetch(WECOM_SESSIONS_PATH);
+          if (!response.ok) continue;
+          const body = await response.json();
+          if (!canRead() || !Array.isArray(body?.sessions)) continue;
+          const providerIds = Array.isArray(body.wecomSessionIds) ? body.wecomSessionIds : undefined;
+          store.replaceProviderRows(body.sessions, providerIds);
+          options.onSessionSnapshot?.(body);
+        } catch {
+          // 下一次提示或对齐会再读。
+        }
+      }
+    })().finally(() => {
+      providerRead = null;
+    });
   };
 
   // 当前这条流及其活性记录；后台挂起期间为 null。流被替换后，旧流迟到的回调一律按
@@ -549,6 +643,10 @@ export async function bootstrap(options: DashboardBootstrapOptions = {}) {
   };
 
   const onFrame = (stream: LiveStream, type: string, body: any): void => {
+    if (type === WECOM_SESSIONS_HINT) {
+      readProviderSessions();
+      return;
+    }
     if (type === 'heartbeat') {
       // 只看 dashboard 自己的心跳：daemon 的心跳也经 aggregator 转发进来，几条挤在同一刻
       // 到达很正常，拿它们比节奏会把实时链路误判成「攒批」。

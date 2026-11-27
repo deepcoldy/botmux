@@ -2,6 +2,16 @@
 // 各自的原始数据转成统一的 PaletteItem。只做「数据 → 条目」的映射与跳转目标，
 // 匹配排序规则在 command-palette-model，渲染与交互在 command-palette。
 import type { ReactNode } from 'react';
+import { deploymentAdditionalProviders, deploymentProvider } from './provider-roster.js';
+import {
+  botProfileCapabilities,
+  botProfileFieldSupported,
+  botProfileOwnSection,
+  botProfileSectionSupported,
+  botProfileTabs,
+} from './providers/profile.js';
+import { providerDescriptor, providerLabelKey } from './providers/registry.js';
+import type { ProviderId } from './providers/types.js';
 import {
   attentionReason,
   attentionWaitSince,
@@ -16,7 +26,7 @@ import {
 import { createDashboardTranslator, type DashboardLocale } from './i18n.js';
 import { THEME_OPTIONS } from './theme-menu.js';
 import { sourceLabel } from './skills/shared.js';
-import { BOT_DEFAULTS_SECTIONS, BOT_DEFAULTS_TABS, BOT_DEFAULTS_TAB_LABEL_KEYS, botDefaultsHref } from './bot-defaults.js';
+import { BOT_DEFAULTS_SECTIONS, BOT_DEFAULTS_TAB_LABEL_KEYS, botDefaultsHref, type BotDefaultsSection } from './bot-defaults.js';
 import { BOT_DEFAULTS_ALIASES } from './nav-items.js';
 import { SETTINGS_SECTIONS, type SettingsSection } from './settings-sections.js';
 import type { SkillRow } from './skills/types.js';
@@ -49,6 +59,7 @@ export interface PaletteShellContext {
    */
   manageDataReady: boolean;
   setLocale(locale: DashboardLocale): void;
+  larkCreateSupported?:boolean;
   openCreateSession(): void;
   openCreateBot(): void;
 }
@@ -269,11 +280,15 @@ export function buildBotItems(bots: ReadonlyArray<{ larkAppId: string; name: str
     });
 }
 
-/** Bot 配置页内的分类（常用 / 会话 / 权限与安全 / 消息卡片 / 高级），直接按 BOT_DEFAULTS_TABS 生成。 */
+/**
+ * Bot 配置页内的分类（常用 / 会话 / 权限与安全 / 消息卡片 / 高级）。和配置页读同一张能力表：
+ * 部署按哪个平台走（见 deploymentProvider），就列那个平台的配置页上出现的分类。
+ */
 export function buildBotDefaultsTabItems(): PaletteItem[] {
   if (!ui.authed) return [];
+  const supported = botProfileTabs(botProfileCapabilities(deploymentProvider()));
   const botConfig = t('nav.botDefaults');
-  return BOT_DEFAULTS_TABS.map(tab => ({
+  return supported.map(tab => ({
     key: `setting:bot-defaults:${tab}`,
     kind: 'setting' as const,
     // 带上父页面名：「常用」「会话」「高级」单独做标题会全等命中，抢掉「会话控制」等主页面的首条。
@@ -292,41 +307,82 @@ export function buildBotDefaultsTabItems(): PaletteItem[] {
  * 搜「Bot 配置」时五个分类在前，搜「new bot」时「新建机器人」不被配置项挤下去。
  * 区块不拿分类名做副标题，否则搜「常用」「高级」时区块会全等命中、排在分类本身前面。
  * 同一区块里译文重复的配置项只收第一个。
+ * 区块与配置项是否列出，和配置页用同一张能力表判定（providers/profile.ts）。
+ * 标题与关键词用部署平台配置页上实际显示的措辞：条目按飞书标签键登记，经 providerLabelKey 换成该平台
+ * 的键（飞书与混合部署原样不变；只有企业微信的部署换成企业微信页面上的标签）。
+ * 区块登记了其它叫法（aliasKeys）时，两种语言的叫法也进区块条目的关键词。
+ * 混合部署里，另一个平台（deploymentAdditionalProviders）只另列它自己的条目（见 botProfileOwnSection），
+ * 排在部署平台的条目之后，原有条目一条不动。
  */
 export function buildBotDefaultsSectionItems(): PaletteItem[] {
   if (!ui.authed) return [];
+  const items = botDefaultsSectionItemsFor(deploymentProvider());
+  for (const provider of deploymentAdditionalProviders()) {
+    items.push(...botDefaultsSectionItemsFor(provider, { additional: true }));
+  }
+  return items;
+}
+
+/**
+ * 某个平台的区块与配置项条目。`additional` 是混合部署里另列的平台：只收它自己的区块；条目键带
+ * `@平台` 后缀（会话模式这类共用区块和部署平台的同名条目不撞键），深链带 `provider=平台`，副标题前标
+ * 平台名（与 Bot 配置名单、会话位置的「企业微信 · …」同一写法），平台名的两种语言也进关键词。
+ * 平台专属区块的深链总带它的平台（配置页只认带 provider 的专属区块链接，见 readBotDefaultsDeepLink）。
+ */
+function botDefaultsSectionItemsFor(provider: ProviderId, options: { additional?: boolean } = {}): PaletteItem[] {
+  const caps = botProfileCapabilities(provider);
+  const labelKey = (key: string) => providerLabelKey(provider, key);
   const botConfig = t('nav.botDefaults');
   const titleContext = `${botConfig} › `.length;
+  const platformKey = options.additional ? providerDescriptor(provider).nameKey : undefined;
+  const keySuffix = options.additional ? `@${provider}` : '';
+  const platformKeywords = platformKey ? bilingual(platformKey) : [];
+  const withPlatform = (text: string) => (platformKey ? `${t(platformKey)} · ${text}` : text);
+  const href = (section: BotDefaultsSection, field?: string) => {
+    const linkProvider = options.additional ? provider : section.provider;
+    return botDefaultsHref({ ...(linkProvider ? { provider: linkProvider } : {}), section: section.id, ...(field ? { field } : {}) });
+  };
   const items: PaletteItem[] = [];
   for (const section of BOT_DEFAULTS_SECTIONS) {
+    if (!botProfileSectionSupported(caps, section)) continue;
+    if (options.additional && !botProfileOwnSection(caps, section)) continue;
     const tabKey = BOT_DEFAULTS_TAB_LABEL_KEYS[section.tab];
-    const sectionTitle = t(section.titleKey);
+    const sectionTitleKey = labelKey(section.titleKey);
+    const sectionTitle = t(sectionTitleKey);
     items.push({
-      key: `setting:bot-defaults-section:${section.id}`,
+      key: `setting:bot-defaults-section:${section.id}${keySuffix}`,
       kind: 'setting',
       title: `${botConfig} › ${sectionTitle}`,
       titleContext,
-      keywords: bilingualTrail(['nav.botDefaults', tabKey, section.titleKey]),
+      // 区块平时不带副标题（见上）；另列的平台只标平台名。
+      ...(platformKey ? { subtitle: t(platformKey) } : {}),
+      keywords: [
+        ...bilingualTrail(['nav.botDefaults', tabKey, sectionTitleKey]),
+        ...(section.aliasKeys ?? []).flatMap(bilingual),
+        ...platformKeywords,
+      ],
       // 同分时分类排在区块前面、区块排在配置项前面。
       boost: -0.1,
       iconId: 'bot',
-      primary: { label: t('palette.actionGoto'), href: botDefaultsHref({ section: section.id }) },
+      primary: { label: t('palette.actionGoto'), href: href(section) },
     });
     const seen = new Set([sectionTitle]);
     for (const field of section.fieldKeys ?? []) {
-      const fieldTitle = t(field);
+      if (!botProfileFieldSupported(caps, section.id, field)) continue;
+      const fieldTitleKey = labelKey(field);
+      const fieldTitle = t(fieldTitleKey);
       if (seen.has(fieldTitle)) continue;
       seen.add(fieldTitle);
       items.push({
-        key: `setting:bot-defaults-field:${section.id}:${field}`,
+        key: `setting:bot-defaults-field:${section.id}:${field}${keySuffix}`,
         kind: 'setting',
         title: `${botConfig} › ${fieldTitle}`,
         titleContext,
-        subtitle: `${t(tabKey)} › ${sectionTitle}`,
-        keywords: bilingualTrail(['nav.botDefaults', tabKey, section.titleKey, field]),
+        subtitle: withPlatform(`${t(tabKey)} › ${sectionTitle}`),
+        keywords: [...bilingualTrail(['nav.botDefaults', tabKey, sectionTitleKey, fieldTitleKey]), ...platformKeywords],
         boost: -0.15,
         iconId: 'bot',
-        primary: { label: t('palette.actionGoto'), href: botDefaultsHref({ section: section.id, field }) },
+        primary: { label: t('palette.actionGoto'), href: href(section, field) },
       });
     }
   }
@@ -423,9 +479,9 @@ export function buildPageItems(pages: readonly PalettePageEntry[]): PaletteItem[
   }));
 }
 
-export function buildActionItems(ctx: Pick<PaletteShellContext, 'openCreateSession' | 'openCreateBot'>): PaletteItem[] {
+export function buildActionItems(ctx: Pick<PaletteShellContext, 'openCreateSession' | 'openCreateBot'|'larkCreateSupported'>): PaletteItem[] {
   const items: PaletteItem[] = [];
-  if (ui.authed) {
+  if (ui.authed&&ctx.larkCreateSupported!==false) {
     items.push({
       key: 'action:create-session',
       kind: 'action',
@@ -434,6 +490,8 @@ export function buildActionItems(ctx: Pick<PaletteShellContext, 'openCreateSessi
       iconId: 'create-session',
       primary: { label: t('palette.actionRun'), run: ctx.openCreateSession },
     });
+  }
+  if (ui.authed) {
     items.push({
       key: 'action:create-bot',
       kind: 'action',

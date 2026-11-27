@@ -22,6 +22,7 @@ import { resolveConditionalLine } from '../../skills/effective-builtins.js';
 import type { ReplyDelivery } from '../../core/reply-delivery.js';
 import { larkUserNative, triggerUserAuthApplies, type TriggerUserAuthConfig } from '../../services/trigger-user-auth.js';
 import { larkToolPrompt } from '../../core/lark-tool-binding.js';
+import { isNativeGatewayCoreProcess } from '../../core/runtime-mode.js';
 import type { CliId } from './types.js';
 
 /** The gated "no visible output is OK" hint reads `config.noVisibleOutputHint`
@@ -348,10 +349,50 @@ export function buildManagedLarkToolPromptBlocks(
   return [credentialBoundary, larkToolBoundary].filter(Boolean).join('\n\n');
 }
 
+/**
+ * The bot's human display name, as a native IM gateway's dedicated core may show
+ * it. That core runs a synthetic apiOnly bot: its id (`local_<slug>`) and the
+ * open_id seeded from it (`bot_local_<slug>`) are internal and mean nothing to
+ * the people in the chat, and the core's bot name falls back to that id when no
+ * display name was configured. Returns undefined for any of those, and when the
+ * caller cannot name the bot id to compare against.
+ */
+export function nativeGatewayDisplayName(botName: string | undefined, larkAppId: string | undefined): string | undefined {
+  const name = botName?.trim();
+  if (!name || !larkAppId) return undefined;
+  if (name === larkAppId || name === `bot_${larkAppId}` || /^(?:bot_)?local_/.test(name)) return undefined;
+  return name;
+}
+
+/**
+ * `--bot-name` / `--bot-open-id` for a runner CLI (codex-app, mir, mira, dsh),
+ * whose runner renders them into its own instructions. A native gateway's core
+ * passes only a human display name (nativeGatewayDisplayName) and never an
+ * open_id; every other process passes both, as each adapter always did.
+ */
+export function runnerIdentityArgs(botName: string | undefined, botOpenId: string | undefined, larkAppId: string | undefined): string[] {
+  if (isNativeGatewayCoreProcess()) {
+    const name = nativeGatewayDisplayName(botName, larkAppId);
+    return name ? ['--bot-name', name] : [];
+  }
+  return [...(botName ? ['--bot-name', botName] : []), ...(botOpenId ? ['--bot-open-id', botOpenId] : [])];
+}
+
+/** `<identity>` lines for a native gateway's core: the display name only (no
+ *  open_id, no routing rules), or nothing when no display name is known. */
+export function nativeGatewayIdentityBlock(botName: string | undefined, larkAppId: string | undefined): string[] {
+  const name = nativeGatewayDisplayName(botName, larkAppId);
+  return name ? ['<identity>', `  <name>${escapeXmlText(name)}</name>`, '</identity>'] : [];
+}
+
 export function buildBotmuxSystemPromptText(opts: {
   locale?: Locale;
   botName?: string;
   botOpenId?: string;
+  /** The bot id. Read only in a native gateway's core, to tell a configured
+   *  display name from the id-shaped fallback (nativeGatewayDisplayName);
+   *  without it that core shows no identity at all. */
+  larkAppId?: string;
   /** Optional built-in skill catalog / help pointer for injectsSessionContext
    *  CLIs that have a global `skillsDir` (genius/grok) running in `prompt` / `off`
    *  mode — appended after the routing/identity blocks. Claude Code delivers
@@ -410,7 +451,7 @@ export function buildBotmuxSystemPromptText(opts: {
    *  same text as before the field existed. */
   cliId: CliId | undefined;
 }): string {
-  const { locale, botName, botOpenId, builtinSkillBlock, noTransport, triggerUserAuth, larkToolAppId, replyDelivery, solo, leadOnly, cliId, hideLocalAddresses } = opts;
+  const { locale, botName, botOpenId, larkAppId, builtinSkillBlock, noTransport, triggerUserAuth, larkToolAppId, replyDelivery, solo, leadOnly, cliId, hideLocalAddresses } = opts;
   const transcript = !noTransport && replyDelivery === 'transcript';
   const unknown = t('ai.identity.unknown', undefined, locale);
   const workflowHint = workflowDiscoveryHint(locale);
@@ -430,8 +471,12 @@ export function buildBotmuxSystemPromptText(opts: {
   // 在 solo 会话里没有对象。transcript 非 solo 保留全部归属规则，含 mention_must：
   // 自动转发的最终回复卡不会 @ 触发本轮的 bot，回复或 @ 别的 bot 协作仍要靠
   // `botmux send --mention` / `--mention-back`（doubao 例外，不教 send）。
-  const identityBlock =
-    botName || botOpenId
+  // A native gateway's core (and its workers) shows only a human display name —
+  // see nativeGatewayIdentityBlock; every other process is unchanged.
+  const nativeIdentity = isNativeGatewayCoreProcess() ? nativeGatewayIdentityBlock(botName, larkAppId) : undefined;
+  const identityBlock = nativeIdentity
+    ? (nativeIdentity.length > 0 ? ['', ...nativeIdentity] : [])
+    : botName || botOpenId
       ? [
         '',
         '<identity>',

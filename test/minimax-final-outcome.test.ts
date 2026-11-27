@@ -4,7 +4,8 @@ import { resolveCodexAppFinalTurnIdentity } from '../src/adapters/cli/codex-app-
 import { isCodexAppCliId } from '../src/adapters/cli/types.js';
 import { normalizeFinalUsage } from '../src/services/codex-app-runner-protocol.js';
 import { bridgePostText } from '../src/services/bridge-fallback-gate.js';
-import { runnerFinalOutcome } from '../src/services/runner-final-outcome.js';
+import { runnerFinalOutcome, appRunnerSilenceDisposition } from '../src/services/runner-final-outcome.js';
+import { isNativeGatewayCoreProcess } from '../src/core/runtime-mode.js';
 import { MinimaxFinalReceiver } from '../src/services/minimax-final-control.js';
 import { InflightInputTracker } from '../src/core/inflight-input-tracker.js';
 
@@ -17,7 +18,7 @@ function runner(cliId = 'minimax') {
   const inflightInputs = new InflightInputTracker();
   const scope = {
     lastInitConfig: { cliId }, isCodexAppCliId, normalizeFinalUsage,
-    resolveCodexAppFinalTurnIdentity, bridgePostText, runnerFinalOutcome,
+    resolveCodexAppFinalTurnIdentity, bridgePostText, runnerFinalOutcome, appRunnerSilenceDisposition, isNativeGatewayCoreProcess,
     currentBotmuxTurnId: 'om_current', currentBotmuxDispatchAttempt: 2,
     send, emitTurnTerminal: terminal, log: vi.fn(), cliName: () => cliId,
     inflightInputs,

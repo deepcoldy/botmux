@@ -1,3 +1,4 @@
+import { isWecomSource, sessionSupports } from './providers/registry.js';
 import { sessionDisplayTitle, sessionLastActivityAt } from './sessions.js';
 import { ModelPinChip } from './model-pin.js';
 import type React from 'react';
@@ -62,6 +63,7 @@ export interface SessionsKanbanCallbacks {
   lockActionLabel: (row: any) => string;
   sessionStatusText: (status: unknown) => string;
   onClose?: (row: any, button?: HTMLButtonElement) => void;
+  onInterrupt?: (row: any, button?: HTMLButtonElement) => void;
   onDetails: (row: any) => void;
   onHistory: (row: any) => void;
   onMoveRows: (moves: SessionsKanbanMove[]) => void;
@@ -550,13 +552,13 @@ function KanbanCardBase(props: {
 
   const menuItems: CardMenuItem[] = [];
   // 「详情」不放菜单里：单击卡片就是打开详情。
-  menuItems.push({
+  if (sessionSupports(row, 'history')) menuItems.push({
     key: 'history',
     label: t('sessions.history.title'),
     icon: callbacks.icons.history,
     onSelect: () => callbacks.onHistory(row),
   });
-  if (row.feishuChatLink) {
+  if (!isWecomSource(row) && row.feishuChatLink) {
     menuItems.push({
       key: 'feishu',
       label: t('sessions.kanban.openFeishu'),
@@ -572,13 +574,21 @@ function KanbanCardBase(props: {
       onSelect: button => callbacks.onRestart(row, button as HTMLButtonElement),
     });
   }
-  menuItems.push({
+  if (sessionSupports(row, 'lock')) menuItems.push({
     key: 'lock',
     label: callbacks.lockActionLabel(row),
     icon: row.locked ? callbacks.icons.unlock : callbacks.icons.lock,
     onSelect: button => callbacks.onToggleLock(row, button as HTMLButtonElement),
   });
-  if (row.status !== 'closed' && callbacks.onClose) {
+  if (sessionSupports(row, 'interrupt') && callbacks.onInterrupt) {
+    menuItems.push({
+      key: 'interrupt',
+      label: t('sessions.interruptTask'),
+      icon: callbacks.icons.close,
+      onSelect: button => callbacks.onInterrupt?.(row, button as HTMLButtonElement),
+    });
+  }
+  if (sessionSupports(row, 'close') && row.status !== 'closed' && callbacks.onClose) {
     menuItems.push({
       key: 'close',
       label: t('sessions.close'),
@@ -596,7 +606,7 @@ function KanbanCardBase(props: {
       tabIndex={0}
       role="button"
       aria-label={String(title)}
-      draggable
+      draggable={sessionSupports(row, 'board')}
       onClick={event => props.onCardClick(row, event)}
       onKeyDown={event => props.onCardKeyDown(row, event)}
       onDragStart={event => props.onDragStartCard(row, event)}
@@ -606,7 +616,7 @@ function KanbanCardBase(props: {
           type="checkbox"
           className="kanban-card-check"
           checked={selected}
-          disabled={row.status === 'closed'}
+          disabled={row.status === 'closed' || !(sessionSupports(row, 'close') || sessionSupports(row, 'lock') || sessionSupports(row, 'monitorRoom'))}
           aria-label={t('sessions.selectSession')}
           onClick={event => event.stopPropagation()}
           onChange={() => callbacks.onToggleSelect(row)}
@@ -619,9 +629,9 @@ function KanbanCardBase(props: {
           />
         ) : null}
         <span className={`badge cli-${cssToken(row.cliId)}`}>{row.cliId ?? 'unknown'}</span>
-        {row.adopt ? <span className="badge">adopt</span> : null}
+        {row.adopt ?<span className="badge">adopt</span> : null}
         {row.locked ? <span className="session-lock-badge" title={t('sessions.locked')}>{t('sessions.locked')}</span> : null}
-        <SandboxDriftChip row={row} /><ModelPinChip row={row} />
+        <SandboxDriftChip row={row} />{sessionSupports(row, 'modelPin') ? <ModelPinChip row={row} /> : null}
         {menuItems.length ? <CardMenu items={menuItems} /> : null}
       </div>
       <div className="kanban-card-title-row">
@@ -633,6 +643,7 @@ function KanbanCardBase(props: {
             title={String(row.title ?? title)}
             onDoubleClick={(event) => {
               event.stopPropagation();
+              if (!sessionSupports(row, 'rename')) return;
               props.cancelOpen();
               props.onBeginEdit(row);
             }}
@@ -668,7 +679,7 @@ function KanbanCardBase(props: {
             title={sessionTaskStatusText(row)}
           />
         </span>
-        {row.webPort && callbacks.onOpenTerminal ? (
+        {sessionSupports(row, 'terminal') && (row.webPort || row.terminalUrl) && callbacks.onOpenTerminal ? (
           <button
             type="button"
             className="kanban-card-term"
@@ -712,6 +723,7 @@ const KanbanCard = memo(KanbanCardBase, (prev, next) => {
     || a.lockActionLabel !== b.lockActionLabel
     || a.sessionStatusText !== b.sessionStatusText
     || a.onClose !== b.onClose
+    || a.onInterrupt !== b.onInterrupt
     || a.onDetails !== b.onDetails
     || a.onToggleSelect !== b.onToggleSelect
     || a.onHistory !== b.onHistory
