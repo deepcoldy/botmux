@@ -253,7 +253,9 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
       ).join('\n')) });
     }
   }
-  // Records persisted before the write-side collapse may still hold blank or repeated thinking.
+  // The stored activity is canonical and un-collapsed; blank filtering and
+  // per-stage thinking dedupe are display-only and also cover records written
+  // by older versions that already hold blank or repeated thinking.
   const activity: ReplyCardActivity[] = collapseThinkingActivity(record.activity ?? [
     ...record.progress.map((text, i) => ({ kind: 'progress' as const, id: String(i), text })),
     ...record.tools.map(tool => ({ kind: 'tool' as const, id: tool.id })),

@@ -85,6 +85,14 @@ describe('one reply card per turn', () => {
     questions: [{ prompt: 'Continue?', options: [{ key: 'yes', label: 'Yes' }, { key: 'no', label: 'No' }], multiSelect: false }],
   } }) as ReplyCardAsk;
 
+  // The store keeps the canonical un-collapsed activity; display collapsing is
+  // a render-time behaviour, so assertions about duplicate/blank thinking read
+  // the process panel the user actually sees.
+  const processPanelContent = (record: TurnReplyCardRecord = store.read(key)!) => {
+    const card = JSON.parse(buildTurnReplyCard(record, presentation));
+    return card.body.elements.find((element: any) => element.tag === 'collapsible_panel').elements[0].content as string;
+  };
+
   it('keeps native CoT progress off the answer surface and publishes one final after reopening', async () => {
     const nativeKey = await nativeTurn('om_native_quiet');
     for (const event of [{ kind: 'start' as const }, { kind: 'progress' as const, text: 'I will check the evidence.' },
@@ -963,16 +971,86 @@ describe('one reply card per turn', () => {
     expect(buildTurnReplyCard(saved, presentation)).toContain('本轮没有提供最终答复');
   });
 
-  it('records one thinking item when a snapshot repeats it around a blank entry', async () => {
+  it('never marks a user-cancelled turn as deliberately silent', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    await store.update(key, { kind: 'phase', phase: 'stopping' }, io);
+    await store.update(key, { kind: 'terminal', phase: 'completed', silent: true }, io);
+    const saved = store.read(key)!;
+    expect(saved.phase).toBe('cancelled');
+    expect(saved.silentTurn).toBeUndefined();
+    const card = buildTurnReplyCard(saved, presentation);
+    expect(card).toContain('已停止');
+    expect(card).not.toContain('AI 判断无需回复');
+  });
+
+  it('reconciles a persisted silent completed turn to failed when later evidence proves a required reply was missing', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    await store.update(key, { kind: 'terminal', phase: 'completed', silent: true }, io);
+    expect(store.read(key)!.silentTurn).toBe(true);
+    // Historical replay (after restart) carries the fail-closed failed terminal.
+    await store.update(key, { kind: 'terminal', phase: 'failed', silent: true }, io);
+    const saved = store.read(key)!;
+    expect(saved.phase).toBe('failed');
+    expect(saved.silentTurn).toBeUndefined();
+    const card = buildTurnReplyCard(saved, presentation);
+    expect(card).toContain('执行失败');
+    expect(card).not.toContain('AI 判断无需回复');
+  });
+
+  it('does not reconcile a silent completed turn once a final answer has been delivered', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    await store.update(key, { kind: 'terminal', phase: 'completed', silent: true }, io);
+    await store.update(key, { kind: 'final', text: '迟到的答复', source: 'explicit', card: finalEvent('迟到的答复').card }, io);
+    const before = JSON.stringify(store.read(key)!.phase) + JSON.stringify(store.read(key)!.silentTurn);
+    await store.update(key, { kind: 'terminal', phase: 'failed', silent: true }, io);
+    const saved = store.read(key)!;
+    expect(JSON.stringify(saved.phase) + JSON.stringify(saved.silentTurn)).toBe(before);
+    expect(saved.phase).toBe('completed');
+  });
+
+  it('leaves the ordinary idempotent gate intact for non-silent terminal corrections', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    await store.update(key, { kind: 'terminal', phase: 'completed' }, io);
+    await store.update(key, { kind: 'terminal', phase: 'failed' }, io);
+    // Only the narrow completed+silent → failed reconciliation is open.
+    expect(store.read(key)!.phase).toBe('completed');
+    expect(store.read(key)!.silentTurn).toBeUndefined();
+  });
+
+  it('drops the silence marker when a retired silent card later settles as failed', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    await store.update(key, { kind: 'terminal', phase: 'completed', silent: true }, io);
+    // Simulate a record whose display was retired before the failed evidence came.
+    const retired = store.read(key)!;
+    retired.displayRetired = true;
+    writeFileSync(join(store.directory, `${store.id(key)}.json`), JSON.stringify(retired));
+    await new TurnReplyCardStore(dir).update(key, { kind: 'terminal', phase: 'failed', silent: true }, io);
+    const saved = new TurnReplyCardStore(dir).read(key)!;
+    expect(saved.phase).toBe('failed');
+    expect(saved.silentTurn).toBeUndefined();
+    const card = buildTurnReplyCard(saved, presentation);
+    expect(card).not.toContain('AI 判断无需回复');
+  });
+
+  it('keeps blank thinking out of the canonical record and shows a repeated paragraph once per stage', async () => {
     const entries: CotEntry[] = [
       { kind: 'thinking', text: 'THINK_X' }, { kind: 'thinking', text: '  \n' }, { kind: 'thinking', text: 'THINK_X' },
       { kind: 'thinking', text: 'THINK_Y' },
     ];
-    for (let i = 0; i < 2; i++) {
-      await store.update(key, { kind: 'tools', tools: [], activity: publicReplyCardActivity(entries) }, io);
-    }
+    const snapshot = publicReplyCardActivity(entries);
+    await store.update(key, { kind: 'tools', tools: [], activity: snapshot }, io);
+    // Blank thinking never enters the canonical record; repeats stay stored for
+    // idempotent replay but collapse to one visible paragraph at render time.
     expect(store.read(key)!.activity!.filter(item => item.kind === 'thinking').map(item => (item as any).text))
-      .toEqual(['THINK_X', 'THINK_Y']);
+      .toEqual(['THINK_X', 'THINK_X', 'THINK_Y']);
+    expect(processPanelContent().split('\n').filter(line => line.startsWith('💭')))
+      .toEqual(['💭 THINK_X', '💭 THINK_Y']);
+    // Replaying the exact same snapshot must not change the stored sequence.
+    const beforeReplay = JSON.stringify(store.read(key)!.activity);
+    await store.update(key, { kind: 'tools', tools: [], activity: snapshot }, io);
+    expect(JSON.stringify(store.read(key)!.activity)).toBe(beforeReplay);
+    expect(processPanelContent().split('\n').filter(line => line.startsWith('💭')))
+      .toEqual(['💭 THINK_X', '💭 THINK_Y']);
   });
 
   it('keeps the same thinking text when a tool call separates the two occurrences', async () => {
@@ -997,17 +1075,36 @@ describe('one reply card per turn', () => {
         { kind: 'thinking', text: 'THINK_X' }, { kind: 'text', text: 'THINK_X' },
       ]) }, io);
       expect(store.read(key)!.activity!.map(item => item.kind)).toEqual(['thinking', stage, 'thinking']);
+      // The two stages each show the paragraph once in the rendered panel.
+      expect(processPanelContent().split('\n').filter(line => line === '💭 THINK_X')).toHaveLength(2);
     });
 
-  it('merges adjacent thinking entries whose text differs only in whitespace', async () => {
+  it.each(['progress', 'ask'] as const)(
+    'does not resurrect collapsed thinking when the identical snapshot is replayed after a store-only %s', async stage => {
+      const snapshot = publicReplyCardActivity([
+        { kind: 'thinking', text: 'THINK_X' }, { kind: 'thinking', text: 'THINK_X' },
+      ]);
+      await store.update(key, { kind: 'tools', tools: [], activity: snapshot }, io);
+      if (stage === 'progress') await store.update(key, { kind: 'progress', text: '阶段分隔' }, io);
+      else await store.update(key, { kind: 'ask', entry: nativeAsk('replay-ask') }, io);
+      const beforeReplay = JSON.stringify(store.read(key)!.activity);
+      await store.update(key, { kind: 'tools', tools: [], activity: snapshot }, io);
+      expect(JSON.stringify(store.read(key)!.activity)).toBe(beforeReplay);
+      // Only the first stage's paragraph is visible; the replay adds nothing.
+      expect(processPanelContent().split('\n').filter(line => line === '💭 THINK_X')).toHaveLength(1);
+    });
+
+  it('merges adjacent thinking entries whose text differs only in whitespace at render time', async () => {
     const entries: CotEntry[] = [
       { kind: 'thinking', text: '同一段\n思考' }, { kind: 'thinking', text: ' 同一段  思考 ' },
     ];
     await store.update(key, { kind: 'tools', tools: [], activity: publicReplyCardActivity(entries) }, io);
+    // The canonical record preserves both source positions and original text.
     const thinking = store.read(key)!.activity!.filter(item => item.kind === 'thinking');
-    expect(thinking).toHaveLength(1);
-    // The first occurrence keeps its original text and id.
+    expect(thinking).toHaveLength(2);
     expect(thinking[0]).toMatchObject({ id: 'thinking:0', text: '同一段\n思考' });
+    // The rendered panel shows the paragraph once, using the first occurrence.
+    expect(processPanelContent()).toBe('💭 同一段\n思考');
   });
 
   it('serializes independent publishers and fences progress after final delivery', async () => {

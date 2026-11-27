@@ -112,18 +112,20 @@ export type TurnReplyCardEvent =
   | { kind: 'recap'; markdown?: string }
   | { kind: 'recover'; beforeMs?: number; orphanAskIds?: string[] };
 
-/** Activity as the card shows it. Blank thinking is always dropped, and a
- *  thinking paragraph is shown once per stage segment: a run of thinking items
- *  bounded by tool / progress / ask items, which delimit distinct execution
- *  stages whose repeated paragraphs must stay visible. Text is compared after
- *  whitespace normalization, so the same paragraph re-emitted with different
- *  line breaks still collapses. The first occurrence keeps its id, so a
- *  cumulative snapshot re-applied later stays idempotent.
+/** Display-only view over the canonical stored activity. Blank thinking is
+ *  always dropped, and a thinking paragraph is shown once per stage segment: a
+ *  run of thinking items bounded by tool / progress / ask items, which delimit
+ *  distinct execution stages whose repeated paragraphs must stay visible. Text
+ *  is compared after whitespace normalization, so the same paragraph re-emitted
+ *  with different line breaks still collapses. The first occurrence keeps its
+ *  id. This never mutates the stored sequence, so collapsing the same record
+ *  twice yields the same view.
  *
- *  A cumulative CoT snapshot cannot see progress/ask items that live only in
- *  the store. Callers merging a snapshot pass `dedupe: false` (blank filtering
- *  still applies) and re-run the full-sequence pass after the merge, where the
- *  real stage delimiters are visible. */
+ *  The store merges snapshots with `dedupe: false` (blank filtering only): it
+ *  cannot see store-only progress/ask delimiters inside an incoming cumulative
+ *  snapshot, and must keep every source id for idempotent replay. Segment
+ *  dedupe runs here, where the full merged sequence and its real delimiters are
+ *  visible. */
 export function collapseThinkingActivity(items: readonly ReplyCardActivity[], dedupe = true): ReplyCardActivity[] {
   const normalizedText = (text: string) => text.trim().replace(/\s+/g, ' ');
   const result: ReplyCardActivity[] = [];
@@ -373,33 +375,56 @@ export class TurnReplyCardStore {
         }
         // A persisted terminal phase does not prove its provider PATCH was
         // acknowledged. Keep rendering it on retry without changing its facts.
-        if (!terminal || (record.displayRetired && (!displayRetirement || record.finalDelivered))) {
-          // Publish a retirement notice with its terminal edge under one lock.
-          // A duplicate retirement must never append progress after completion
-          // or turn an already-delivered answer into a missing-output warning.
-          if (!record.finalDelivered && event.notice?.trim() && record.progress.at(-1) !== event.notice) {
-            record.progress.push(event.notice);
-            record.activity.push({ kind: 'progress', id: `progress:${record.progress.length - 1}`, text: event.notice });
+        // Narrow reconciliation: historical fail-closed evidence proving that a
+        // completed silent turn actually owed a required reply and never sent
+        // it downgrades the record to failed. Deliberately tight — same card key
+        // already pins turn/dispatchAttempt, no final delivery evidence, and a
+        // silent completed record only — every other terminal keeps the
+        // idempotent gate below.
+        const silentFailureReconciliation = terminal
+          && record.phase === 'completed' && record.silentTurn === true
+          && event.phase === 'failed'
+          && !record.finalDelivered && !record.finalCard && !record.displayRetired;
+        if (!terminal || silentFailureReconciliation
+          || (record.displayRetired && (!displayRetirement || record.finalDelivered))) {
+          if (silentFailureReconciliation) {
+            record.phase = 'failed';
+            delete record.silentTurn;
+          } else {
+            // Publish a retirement notice with its terminal edge under one lock.
+            // A duplicate retirement must never append progress after completion
+            // or turn an already-delivered answer into a missing-output warning.
+            if (!record.finalDelivered && event.notice?.trim() && record.progress.at(-1) !== event.notice) {
+              record.progress.push(event.notice);
+              record.activity.push({ kind: 'progress', id: `progress:${record.progress.length - 1}`, text: event.notice });
+            }
+            record.phase = record.phase === 'stopping' && event.phase === 'completed' ? 'cancelled' : event.phase;
+            record.durationMs = event.durationMs;
+            record.completedAtMs = event.completedAtMs;
+            record.disconnected = event.disconnected;
+            // silentTurn is meaningful only while the persisted phase is
+            // completed: judge the persisted phase, not the event's (a stopping
+            // turn whose terminal arrives as completed is recorded as
+            // cancelled), and drop the marker on every non-completed outcome so
+            // a failed/cancelled card can never also read "no reply needed".
+            if (event.silent && record.phase === 'completed') record.silentTurn = true;
+            else if (record.phase !== 'completed') delete record.silentTurn;
+            if (!displayRetirement && !recovering) delete record.displayRetired;
           }
-          record.phase = record.phase === 'stopping' && event.phase === 'completed' ? 'cancelled' : event.phase;
-          record.durationMs = event.durationMs;
-          record.completedAtMs = event.completedAtMs;
-          record.disconnected = event.disconnected;
-          if (event.silent && event.phase === 'completed') record.silentTurn = true;
-          if (!displayRetirement && !recovering) delete record.displayRetired;
         }
       } else if (!terminal || allowBackgroundTools) {
         if (event.kind === 'tools') {
           record.tools = event.tools;
-          // Only blank-filter the incoming snapshot: store-only progress/ask
-          // delimiters are absent from it, so segment dedupe waits until the
-          // full merged sequence is visible below.
+          // The stored activity is the canonical, un-collapsed sequence: blank
+          // thinking is filtered at the edge, but segment dedupe happens only
+          // at render time. Merging by source id keeps an identical cumulative
+          // snapshot replay idempotent — a paragraph collapsed for display must
+          // not lose its id here and get resurrected by the next replay.
           const incoming = collapseThinkingActivity(event.activity ?? event.tools.map(tool => ({ kind: 'tool' as const, id: tool.id })), false);
           const ids = new Set(record.activity.map(item => `${item.kind}:${item.id}`));
           for (const item of incoming) {
             if (!ids.has(`${item.kind}:${item.id}`)) record.activity.push(item);
           }
-          record.activity = collapseThinkingActivity(record.activity);
         } else if (event.kind === 'start' && !record.finalDelivered) {
           record.phase = 'working';
           record.startedAtMs ??= Date.now();
