@@ -3740,9 +3740,16 @@ function resolveBotConfigPath(): string {
     return defaultPath;
   }
 
-  throw new Error(
+  throw new BotConfigNotFoundError(
     'No bot configuration found. Set BOTS_CONFIG or create ~/.botmux/bots.json.\nSee README for config format.'
   );
+}
+
+/** No bots.json exists at all (BOTS_CONFIG unset, default file absent). Lets a
+ *  caller tell "nothing is configured" apart from a file it failed to read or
+ *  parse; a pinned-but-missing BOTS_CONFIG is a fault and stays a plain Error. */
+export class BotConfigNotFoundError extends Error {
+  override name = 'BotConfigNotFoundError';
 }
 
 const warnedRetiredCliApps = new Set<string>();

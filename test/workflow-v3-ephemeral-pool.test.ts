@@ -408,6 +408,41 @@ describe('v3 ephemeral pool', () => {
       expect(spawn).not.toHaveBeenCalled();
     });
 
+    it('fails an unregistered node bot with the read error when bots.json turns invalid instead of starting without its env', async () => {
+      configureBots([{ larkAppId: 'cli_app', larkAppSecret: 'test-only', cliId: 'claude-code',
+        env: { MODEL_AUTH: 'node-sentinel' } }]);
+      const botsPath = join(dir, 'bots.json');
+      // Rewritten mid-run (hand edit, torn write): no longer valid JSON.
+      writeFileSync(botsPath, '[{"larkAppId": "cli_app", "env": {');
+      const spawn = vi.fn((): WorkerHandle => { throw new Error('unexpected spawn'); });
+      const req = request();
+      const failure = await createEphemeralPool({ factory: { spawn }, workerPath: '/tmp/worker.js',
+        resolveLarkAppSecret: () => 'secret' }).runNode(req).then(() => undefined, (err: unknown) => err);
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).toContain('cli_app');
+      expect((failure as Error).message).toContain(botsPath);
+      expect(spawn).not.toHaveBeenCalled();
+      expect(readV3AttemptWorkerFence(req.attemptDir, req)).toBeNull();
+    });
+
+    it('keeps starting a hosted node bot from the registry while bots.json is invalid', async () => {
+      const bot: BotConfig = { larkAppId: 'cli_app', larkAppSecret: 'test-only', cliId: 'claude-code',
+        apiOnly: true, env: { MODEL_AUTH: 'registered-sentinel' } };
+      registerBot(bot);
+      configureBots([bot]);
+      writeFileSync(join(dir, 'bots.json'), '{ not json');
+      const worker = new ScriptedWorker();
+      const running = createEphemeralPool({ factory: factoryFor(worker), workerPath: '/tmp/worker.js',
+        resolveLarkAppSecret: () => 'secret' }).runNode(request());
+      try {
+        await worker.waitForInit();
+        expect(worker.init.env?.MODEL_AUTH).toBe('registered-sentinel');
+      } finally {
+        worker.emitExit(0);
+        await running;
+      }
+    });
+
     it.each(['missing', 'throwing'] as const)('does not override an explicit %s resolver with bots.json', async (behavior) => {
       configureBots([{ larkAppId: 'cli_app', larkAppSecret: 'test-only', cliId: 'claude-code',
         env: { MODEL_AUTH: 'file-sentinel' } }]);

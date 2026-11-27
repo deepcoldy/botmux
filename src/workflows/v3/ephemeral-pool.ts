@@ -15,7 +15,7 @@ import { SessionContractStore } from '../../services/session-contract-store.js';
 import { sessionContractsEnabled } from '../../services/session-contract.js';
 import type { DaemonSession } from '../../core/types.js';
 import { resolveSessionEnv, type SessionEnvBotInput } from '../../core/session-env-resolve.js';
-import { effectiveDefaultWorkingDir, getBot, loadBotConfigsCached, type BotConfig } from '../../bot-registry.js';
+import { BotConfigNotFoundError, effectiveDefaultWorkingDir, getBot, loadBotConfigsCached, type BotConfig } from '../../bot-registry.js';
 import { lstatSync, readlinkSync, realpathSync, statSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { BoundedLogFile } from '../../utils/bounded-log-file.js';
@@ -89,10 +89,23 @@ export interface EphemeralPoolDeps {
 
 /** Live config of a node's bot. A daemon registers only its own bot, and
  *  standalone runs register none, while workflow nodes may use any configured
- *  bot: fall back to live bots.json. */
+ *  bot: fall back to live bots.json. Only "this bot is not configured" (absent
+ *  from the file, or no bots.json at all) yields undefined; an unreadable or
+ *  invalid bots.json throws, so callers never mistake a broken file for a bot
+ *  without env or assistant mode. */
 function liveBotConfig(larkAppId: string): BotConfig | undefined {
   try { return getBot(larkAppId).config; } catch { /* not hosted by this daemon */ }
-  try { return loadBotConfigsCached().find(b => b.larkAppId === larkAppId); } catch { return undefined; }
+  let configs: readonly BotConfig[];
+  try {
+    configs = loadBotConfigsCached();
+  } catch (err) {
+    if (err instanceof BotConfigNotFoundError) return undefined;
+    throw new Error(
+      `v3 workflow cannot read live bot config for ${larkAppId}: ${err instanceof Error ? err.message : String(err)}`,
+      { cause: err },
+    );
+  }
+  return configs.find(b => b.larkAppId === larkAppId);
 }
 
 /** A run may override its cwd or replay an old profile. Only seed the live
@@ -131,7 +144,14 @@ function v3WorkerSessionEnv(
   resolveBot: EphemeralPoolDeps['resolveBot'],
 ): { env?: Record<string, string>; envUnset?: string[] } {
   let bot: SessionEnvBotInput | undefined;
-  try { bot = (resolveBot ?? liveBotConfig)(larkAppId); } catch { bot = undefined; }
+  if (resolveBot) {
+    // An explicit resolver owns the lookup outright, including when it throws.
+    try { bot = resolveBot(larkAppId); } catch { bot = undefined; }
+  } else {
+    // A bots.json read failure fails this node instead of starting it
+    // without its env overlay.
+    bot = liveBotConfig(larkAppId);
+  }
   if (!bot) return {};
   // Workflow workers never install the identity wrappers (usesLarkToolBinding).
   const resolved = resolveSessionEnv({ bot, backendType: v3WorkerBackendType(), facts: { unwrapped: true } });
@@ -204,6 +224,9 @@ async function runNodeWithLogs(
   // snapshot, and a workflow worker has no per-owner session (it would get the
   // bot-wide BOT_HOME). Refuse before any side effect.
   assertNotAssistantModeBot(req.botSnapshot.larkAppId);
+  // Resolve the env overlay before any side effect too: a bots.json read
+  // failure must reject this node here, not after a worker has been forked.
+  const workerSessionEnv = v3WorkerSessionEnv(req.botSnapshot.larkAppId, deps.resolveBot);
   const cancelSignal = req.attemptLease?.signal ?? req.cancelSignal;
   const manifestPath = req.env[GOAL_ENV.MANIFEST_PATH] ?? join(req.attemptDir, 'manifest.json');
   const ptyLogPath = join(req.attemptDir, 'pty.log');
@@ -379,7 +402,6 @@ async function runNodeWithLogs(
   // permission isolation (BOTMUX_OWNER_OPEN_ID is daemon-authenticated at run
   // birth — a CLI child cannot forge it).  Standalone/dev runs keep synthetic
   // values and get no owner env at all.
-  const workerSessionEnv = v3WorkerSessionEnv(req.botSnapshot.larkAppId, deps.resolveBot);
   for (const key of protectedEnvKeys) {
     if (workerSessionEnv.env) delete workerSessionEnv.env[key];
   }
