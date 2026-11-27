@@ -54,6 +54,10 @@ vi.mock('node:fs', async (importOriginal) => {
       if (!existsSync(path)) throw Object.assign(new Error(`ENOENT: no such file or directory, stat '${String(path)}'`), { code: 'ENOENT' });
       return { mtimeMs: 0 };
     }),
+    // Only consulted after stat said ENOENT/ENOTDIR (dangling-symlink check).
+    lstatSync: vi.fn((path: unknown) => {
+      throw Object.assign(new Error(`ENOENT: no such file or directory, lstat '${String(path)}'`), { code: 'ENOENT' });
+    }),
   };
 });
 
@@ -2910,6 +2914,25 @@ describe('default bots.json path is decided by statSync()', () => {
       expect(failure).toBeInstanceOf(mod.BotConfigLoadError);
       expect(failure).toMatchObject({ reason: 'permission_denied', code, path: '/pinned/bots.json' });
     }
+  });
+
+  it.each(['EACCES', 'EIO'])('treats a %s from the follow-up lstat as a read fault, not as "no configuration"', (code) => {
+    vi.mocked(fs.statSync).mockImplementation(() => { throw fsError('ENOENT'); });
+    vi.mocked(fs.lstatSync).mockImplementationOnce(() => { throw fsError(code); });
+    let failure: unknown;
+    try { mod.loadBotConfigsCached({ strictRead: true }); } catch (err) { failure = err; }
+    expect(failure).toBeInstanceOf(mod.BotConfigLoadError);
+    expect(failure).toMatchObject({ code, reason: code === 'EACCES' ? 'permission_denied' : 'unreadable' });
+  });
+
+  it.each(['ENOENT', 'ENOTDIR'])('keeps the errno of a pinned BOTS_CONFIG that is gone (%s) for a strict reader', (code) => {
+    process.env.BOTS_CONFIG = '/pinned/bots.json';
+    vi.mocked(fs.statSync).mockImplementation(() => { throw fsError(code); });
+    expect(() => mod.loadBotConfigs()).toThrow(/BOTS_CONFIG file not found/);
+    let failure: unknown;
+    try { mod.loadBotConfigsCached({ strictRead: true }); } catch (err) { failure = err; }
+    expect(failure).toBeInstanceOf(mod.BotConfigLoadError);
+    expect(failure).toMatchObject({ reason: 'unreadable', code, path: '/pinned/bots.json' });
   });
 
   it('loads a file that a stat proves present even though existsSync() said no', () => {

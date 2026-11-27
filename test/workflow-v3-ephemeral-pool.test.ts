@@ -477,7 +477,9 @@ describe('v3 ephemeral pool', () => {
       mkdirSync(configDir, { recursive: true });
       const linkPath = join(configDir, 'bots.json');
       try { symlinkSync(join(dir, 'moved-away.json'), linkPath); } catch { ctx.skip(); }
+      // os.homedir() reads USERPROFILE on Windows, HOME elsewhere.
       vi.stubEnv('HOME', home);
+      vi.stubEnv('USERPROFILE', home);
       vi.stubEnv('BOTS_CONFIG', '');
       const failure = await rejectsBeforeSpawn();
       expect(failure.message).toContain('cli_app');

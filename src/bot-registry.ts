@@ -3712,14 +3712,14 @@ function resolveBotConfigPath(): string {
   const botsConfigPath = process.env.BOTS_CONFIG;
   if (botsConfigPath) {
     const resolved = resolve(botsConfigPath);
-    let pinnedMissing = false;
+    let pinnedMissing: string | undefined;
     try {
       statSync(resolved);
     } catch (err: any) {
       // A parent that cannot be searched is a permission fault, not "gone";
       // either way the pinned registry stays authoritative (no fallback).
       if (err?.code !== 'ENOENT' && err?.code !== 'ENOTDIR') throw botConfigAccessError(resolved, err);
-      pinnedMissing = true;
+      pinnedMissing = err.code;
     }
     if (pinnedMissing) {
       // FAIL CLOSED, and deliberately so. For a daemon-spawned CLI child this
@@ -3729,12 +3729,13 @@ function resolveBotConfigPath(): string {
       // DIFFERENT fleet's registry, and quietly switching authority would run
       // this bot against another fleet's secret and routing. Losing the file is
       // an operator-visible fault; changing registries behind their back is worse.
-      throw new Error(
+      // Keep the errno (ENOENT vs ENOTDIR) so a strict reader can say which.
+      throw Object.assign(new Error(
         `BOTS_CONFIG file not found: ${resolved}`
         + ` — refusing to fall back to a different registry.`
         + ` (For a botmux-spawned CLI this is the exact bots.json the daemon loaded;`
         + ` if it was moved or unmounted, restore it or restart the daemon.)`,
-      );
+      ), { code: pinnedMissing });
     }
     loadedConfigPath = resolved;
     loadedConfigProvenance = 'loaded';
@@ -3797,9 +3798,13 @@ export class BotConfigLoadError extends Error {
   }
 }
 
-/** The directory entry itself exists (lstat: a dangling symlink counts). */
+/** The directory entry itself exists (lstat: a dangling symlink counts). Only
+ *  ENOENT/ENOTDIR mean absent; any other lstat failure is a read fault. */
 function pathEntryExists(path: string): boolean {
-  try { lstatSync(path); return true; } catch { return false; }
+  try { lstatSync(path); return true; } catch (err: any) {
+    if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') return false;
+    throw botConfigAccessError(path, err);
+  }
 }
 
 function fsErrorCode(err: unknown): string | undefined {
