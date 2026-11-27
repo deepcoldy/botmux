@@ -25,9 +25,39 @@ export interface SelectItem {
   readonly searchText?: string;
   /** 选中后还有二级菜单（渲染 ▸）。 */
   readonly submenu?: boolean;
+  /**
+   * 分隔行：`label` 作分区标题，只展示、不可选中——↑/↓ 跳过、⏎ 选不中、初始光标与
+   * defaultIndex 都不落在它上面；有搜索词时不显示。非 TTY 回退打印成不带序号的一行，
+   * 序号只数可选项。选择结果始终是原始 `items` 里的下标。
+   */
+  readonly separator?: boolean;
 }
 
 const ESC = '\x1b';
+
+/** 分隔行的展示文本（TTY 与非 TTY 共用）。 */
+function separatorRule(label: string): string {
+  return `──────── ${label} ────────`;
+}
+
+/**
+ * 从 `from` 出发按 `step` 方向（含首尾环绕）找第一个可选行，`includeFrom` 决定是否先看
+ * `from` 本身；没有可选行时原样返回 `from`。没有分隔行的列表里它就是 `from ± 1` 取模，
+ * 与原先的光标移动一致。
+ */
+function nextSelectable(
+  rows: ReadonlyArray<SelectItem>,
+  from: number,
+  step: 1 | -1,
+  includeFrom: boolean,
+): number {
+  const n = rows.length;
+  for (let k = includeFrom ? 0 : 1; k <= n; k++) {
+    const i = (((from + step * k) % n) + n) % n;
+    if (!rows[i].separator) return i;
+  }
+  return from;
+}
 
 function isPrintable(s: string): boolean {
   return s.length === 1 && s >= ' ' && s !== '\x7f';
@@ -57,6 +87,8 @@ export function truncateToWidth(s: string, max: number): string {
 
 export function matchesSelectItem(item: SelectItem, query: string): boolean {
   const q = query.trim().toLowerCase();
+  // 分隔行只在未搜索时显示：搜索结果里一行分区标题既不能选、也说明不了匹配。
+  if (item.separator) return !q;
   return !q || `${item.label} ${item.hint ?? ''} ${item.searchText ?? ''}`.toLowerCase().includes(q);
 }
 
@@ -106,13 +138,25 @@ export function interactiveSelect(opts: {
   let top = 0;
   let filtered: number[] = currentItems.map((_, i) => i);
 
+  /** 当前可见的行（`filtered` 映射回 items）。 */
+  function visibleRows(): SelectItem[] {
+    return filtered.map((i) => currentItems[i]);
+  }
+
+  /** 光标停在分隔行上时顺延到下一个可选行（没有分隔行时什么都不做）。 */
+  function settleCursor(): void {
+    if (filtered.length) cursor = nextSelectable(visibleRows(), cursor, 1, true);
+  }
+
   function refilter(): void {
     filtered = currentItems
       .map((_, i) => i)
       .filter((i) => matchesSelectItem(currentItems[i], query));
     if (cursor >= filtered.length) cursor = Math.max(0, filtered.length - 1);
     if (cursor < 0) cursor = 0;
+    settleCursor();
   }
+  settleCursor();
 
   function render(): void {
     // 视口窗口化：列表超过终端高度时只画光标附近的一窗，配 ↑/↓ 溢出指示——
@@ -126,10 +170,14 @@ export function interactiveSelect(opts: {
     // 每项压进一行（宽度截断），防软换行破坏高度计算。
     const cols = output.columns ?? 80;
 
+    // 位置计数只数可选项（没有分隔行时就是 cursor + 1 / filtered.length）。
+    const selectableBefore = filtered.slice(0, cursor + 1).filter((i) => !currentItems[i].separator).length;
+    const selectableTotal = filtered.filter((i) => !currentItems[i].separator).length;
+
     output.write('\x1b[H\x1b[J');
     output.write(`\x1b[1m ${currentTitle}\x1b[0m\n`);
     output.write(`\x1b[2m ${t('setup.select.hint')}\x1b[0m\n\n`);
-    output.write(` \x1b[36m🔍\x1b[0m ${query || `\x1b[2m${t('setup.select.all')}\x1b[0m`}${filtered.length > capacity ? `  \x1b[2m(${cursor + 1}/${filtered.length})\x1b[0m` : ''}\n\n`);
+    output.write(` \x1b[36m🔍\x1b[0m ${query || `\x1b[2m${t('setup.select.all')}\x1b[0m`}${filtered.length > capacity ? `  \x1b[2m(${selectableBefore}/${selectableTotal})\x1b[0m` : ''}\n\n`);
 
     if (filtered.length === 0) {
       output.write(`   \x1b[2m${t('setup.select.no_matches')}\x1b[0m\n`);
@@ -137,6 +185,11 @@ export function interactiveSelect(opts: {
       if (top > 0) output.write(`   \x1b[2m${t('setup.select.more_above', { count: top })}\x1b[0m\n`);
       for (let row = top; row < end; row++) {
         const it = currentItems[filtered[row]];
+        if (it.separator) {
+          // 与选项的 label 对齐（pointer 与 label 两侧边距共 4 列），暗色、不带 pointer。
+          output.write(`    \x1b[2m${truncateToWidth(separatorRule(it.label), Math.max(10, cols - 8))}\x1b[0m\n`);
+          continue;
+        }
         const selected = row === cursor;
         const pointer = selected ? '\x1b[36m❯\x1b[0m' : ' ';
         const arrow = it.submenu ? ' \x1b[2m▸\x1b[0m' : '';
@@ -195,12 +248,12 @@ export function interactiveSelect(opts: {
         return;
       }
 
-      // 方向键 / Ctrl-P / Ctrl-N
-      if (key === `${ESC}[A` || key === '\x10') { if (filtered.length) cursor = (cursor - 1 + filtered.length) % filtered.length; render(); return; }
-      if (key === `${ESC}[B` || key === '\x0e') { if (filtered.length) cursor = (cursor + 1) % filtered.length; render(); return; }
-      // Enter
+      // 方向键 / Ctrl-P / Ctrl-N（跳过分隔行，首尾环绕）
+      if (key === `${ESC}[A` || key === '\x10') { if (filtered.length) cursor = nextSelectable(visibleRows(), cursor, -1, false); render(); return; }
+      if (key === `${ESC}[B` || key === '\x0e') { if (filtered.length) cursor = nextSelectable(visibleRows(), cursor, 1, false); render(); return; }
+      // Enter（分隔行选不中：整张列表只剩分隔行时光标才可能停在上面）
       if (key === '\r' || key === '\n') {
-        if (filtered.length) cleanup(filtered[cursor]);
+        if (filtered.length && !currentItems[filtered[cursor]].separator) cleanup(filtered[cursor]);
         return;
       }
       // Backspace
@@ -253,8 +306,20 @@ export async function pickChoice(
     let currentFooter = opts.footer;
     let currentDef = opts.defaultIndex;
 
+    // 序号只数可选项：第 n 个可选项 → 原始下标。没有分隔行时就是 n - 1。
+    const selectableIndices = () => currentItems.flatMap((o, i) => (o.separator ? [] : [i]));
+    // defaultIndex 落在分隔行上时顺延到下一个可选项（同 TTY 的初始光标）；没有可选项就当没有默认。
+    const effectiveDefault = (): number | undefined => {
+      if (currentDef === undefined || !currentItems[currentDef]?.separator) return currentDef;
+      const next = nextSelectable(currentItems, currentDef, 1, true);
+      return currentItems[next].separator ? undefined : next;
+    };
+
     const renderNonTtyMenu = () => {
-      const lines = currentItems.map((o, i) => `  ${i + 1}) ${o.label}${o.hint ? `（${o.hint}）` : ''}`);
+      let ordinal = 0;
+      const lines = currentItems.map((o) => (o.separator
+        ? `  ${separatorRule(o.label)}`
+        : `  ${++ordinal}) ${o.label}${o.hint ? `（${o.hint}）` : ''}`));
       const toggleHint = allowLangToggle
         ? (getDefaultLocale() === 'zh'
             ? t('setup.footer.lang_toggle_to_en')
@@ -266,9 +331,12 @@ export async function pickChoice(
 
     renderNonTtyMenu();
     for (;;) {
-      const defLabel = currentDef !== undefined ? ` [${currentDef + 1}]` : '';
-      const ans = (await new Promise<string>((res) => rl.question(t('setup.select.choose_prompt', { max: currentItems.length, default: defLabel }), res))).trim();
-      if (!ans) return currentDef ?? null;
+      const selectable = selectableIndices();
+      const def = effectiveDefault();
+      // 默认项的序号 = 它前面的可选项个数 + 1（没有分隔行时就是 def + 1）。
+      const defLabel = def !== undefined ? ` [${def + 1 - currentItems.slice(0, def).filter((o) => o.separator).length}]` : '';
+      const ans = (await new Promise<string>((res) => rl.question(t('setup.select.choose_prompt', { max: selectable.length, default: defLabel }), res))).trim();
+      if (!ans) return def ?? null;
       if (allowLangToggle && (ans === 'l' || ans === 'L')) {
         const next = getDefaultLocale() === 'zh' ? 'en' : 'zh';
         setDefaultLocale(next);
@@ -285,7 +353,7 @@ export async function pickChoice(
         continue;
       }
       const n = Number(ans);
-      if (Number.isInteger(n) && n >= 1 && n <= currentItems.length) return n - 1;
+      if (Number.isInteger(n) && n >= 1 && n <= selectable.length) return selectable[n - 1];
       output.write(t('setup.select.invalid_choice', { choice: ans }) + '\n');
     }
   }

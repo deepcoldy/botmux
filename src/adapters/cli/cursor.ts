@@ -10,6 +10,7 @@ import { stripAnsiScreenText } from '../../utils/idle-detector.js';
 import { delay } from '../../utils/timing.js';
 import { drainCursorTranscript, findCursorTranscriptByChatId, findCursorTranscriptByPid } from '../../services/cursor-transcript.js';
 import { builtinPluginDirForSession } from '../../skills/workflow-node-plugin-dir.js';
+import { builtinSkillsOffered } from '../../skills/injection-mode.js';
 
 /** PTYs that have already received a writeInput. The first write lands while
  *  cursor-agent's TUI is still doing its startup render, so it needs a longer
@@ -125,7 +126,8 @@ export function createCursorAdapter(pathOverride?: string): CliAdapter {
         base.push('--model', model.trim());
       }
       if (promptInjection !== 'none') {
-        base.push('--plugin-dir', builtinPluginDirForSession(CURSOR_PLUGIN_DIR));
+        // Shared with the Feishu fleet; not offered in a native gateway's core.
+        if (builtinSkillsOffered()) base.push('--plugin-dir', builtinPluginDirForSession(CURSOR_PLUGIN_DIR));
         if (skillPluginDir) base.push('--plugin-dir', skillPluginDir);
       }
       if (!resume) {

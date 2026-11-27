@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { buildBotWorkerEnv, buildSessionChildEnv, botInjectedEnv, inheritBotEnv, normalizeEnvPolicy } from '../src/core/env-policy.js';
 import { applySessionOwnerEnv } from '../src/utils/child-env.js';
+import { wecomManagedCoreEnvironment } from '../src/im/wecom/config/managed-core-env.js';
 import { envPolicyId, envPolicyRequiresColdStart, readEnvPolicyStamp, writeEnvPolicyStamp } from '../src/services/env-policy-stamp.js';
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -78,6 +79,20 @@ describe('per-bot environment policy', () => {
     for (const key of Object.keys(base).filter(key => key !== 'UNKNOWN_CREDENTIAL')) expect(worker[key]).toBe(base[key as keyof typeof base]);
     const child = buildSessionChildEnv(worker, { mode: 'strict' });
     for (const key of Object.keys(base)) expect(key in child, key).toBe(false);
+  });
+  it('keeps the whole core-only configuration in a strict worker, so it re-synthesizes its daemon bot', () => {
+    // The worker reloads bot configs itself; under BOTMUX_CORE_ONLY=1 that is
+    // the synthetic bot built from these keys, which must match the daemon's.
+    const coreEnv: NodeJS.ProcessEnv = {
+      ...wecomManagedCoreEnvironment({
+        managedCore: { botId: 'local_wecom_fixture', cli: 'codex', backend: 'pty', workingDirectory: '/test/work', port: 19997, stateDir: '/test/core', model: 'fixture-model' },
+      }, { HOME: '/test/home', PATH: '/usr/bin' }),
+      BOTMUX_CORE_CODEX_AUTH_SYNC: 'isolated',
+    };
+    const worker = buildBotWorkerEnv(coreEnv, { mode: 'strict' });
+    const coreKeys = Object.keys(coreEnv).filter(key => /^BOTMUX_(CORE_|API_)/.test(key));
+    expect(coreKeys).toContain('BOTMUX_CORE_CODEX_AUTH_SYNC');
+    for (const key of coreKeys) expect(worker[key], key).toBe(coreEnv[key]);
   });
   it('keeps the fenced-run marker through strict worker, CLI and backend boundaries', () => {
     const worker = buildBotWorkerEnv({ ...host, BOTMUX_FENCED_RUN: '1' }, strict);

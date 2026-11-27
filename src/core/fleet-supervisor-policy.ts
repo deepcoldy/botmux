@@ -108,6 +108,68 @@ export const DEFAULT_RESTART_POLICY = {
   resetAfterMs: 60_000,
 } satisfies RestartPolicy;
 
+/**
+ * Opt-in restart policy for ONE external member, carried on its spec. A member
+ * without it is handled by the supervisor-wide {@link RestartPolicy} exactly as
+ * before; nothing here applies to bot daemons, the dashboard or plugin services.
+ *
+ * It exists for a member whose failures are not all worth retrying and whose
+ * retries are expensive (today: a WeCom gateway, which starts its own core on
+ * every launch):
+ *  - some exits mean "retrying cannot help" (the member was replaced by another
+ *    instance of the same bot, its credentials were rejected, its configuration
+ *    is invalid). The member says so with one of `noRestartExitCodes` and is
+ *    parked 'errored' instead of being restarted into the same failure.
+ *  - every other exit is retried forever with exponential backoff (up to
+ *    `maxDelayMs`) instead of the supervisor-wide fast retries followed by a
+ *    fixed cooldown.
+ *  - a generation that stayed up for `stableRunMs` starts a fresh backoff
+ *    streak, so an exit after hours of service waits the initial delay again.
+ */
+export interface ExternalRestartPolicy {
+  /** Exit codes (with no signal) after which the member is not restarted. */
+  noRestartExitCodes: readonly number[];
+  /** Delay before the first restart of a backoff streak (ms). */
+  initialDelayMs: number;
+  /** Upper bound of the doubling delay (ms). */
+  maxDelayMs: number;
+  /** A generation that ran at least this long before exiting resets the streak (ms). */
+  stableRunMs: number;
+}
+
+export type ExternalPolicyExitDecision =
+  | { action: 'park'; reason: 'no_restart_exit_code' }
+  | { action: 'restart'; nextRestarts: number; delayMs: number };
+
+/** Delay before the `attempt`-th consecutive restart (1-based): doubles from
+ *  `initialDelayMs`, capped at `maxDelayMs`. */
+export function externalRestartDelayMs(policy: ExternalRestartPolicy, attempt: number): number {
+  const exponent = Math.min(Math.max(attempt, 1) - 1, 30);
+  return Math.min(policy.maxDelayMs, policy.initialDelayMs * 2 ** exponent);
+}
+
+/**
+ * Decide what to do when a member that carries an {@link ExternalRestartPolicy}
+ * exits on its own. `restarts` is the persisted streak so far; `ranMs` is how
+ * long the generation that just exited was up.
+ *   • a no-restart exit code (signal-less) → park 'errored'
+ *   • anything else                         → restart after the backoff delay
+ * A signal death is always retried: a code from the list only counts when the
+ * member chose to exit with it.
+ */
+export function decideExternalPolicyExit(
+  proc: { restarts: number; ranMs: number },
+  exit: ChildExit,
+  policy: ExternalRestartPolicy,
+): ExternalPolicyExitDecision {
+  if (exit.signal === null && exit.code !== null && policy.noRestartExitCodes.includes(exit.code)) {
+    return { action: 'park', reason: 'no_restart_exit_code' };
+  }
+  const streak = proc.ranMs >= policy.stableRunMs ? 0 : proc.restarts;
+  const nextRestarts = streak + 1;
+  return { action: 'restart', nextRestarts, delayMs: externalRestartDelayMs(policy, nextRestarts) };
+}
+
 /** A child exit as reported by the OS: a numeric code XOR a signal. */
 export interface ChildExit {
   code: number | null;

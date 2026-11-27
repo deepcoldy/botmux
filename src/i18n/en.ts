@@ -1651,6 +1651,8 @@ export const messages: Record<string, string> = {
   // depends on it); this reminder MUST NOT carry send/@/BOTMUX_NOTHING_TO_SEND,
   // or it would conflict with http_response_mode again.
   'ai.followup.reminder_no_transport': 'This turn is a program-driven request/response: your entire reply is returned verbatim to the caller, not shown in any chat. Just follow the <botmux_http_response_mode> instructions in this turn\'s content; do not call botmux send, do not post to Feishu/Lark.',
+  'ai.followup.reminder_native_gateway': 'Your final reply this turn is delivered by the channel gateway into the current chat, where people will read it. Follow the <botmux_http_response_mode> instructions in this turn\'s content; send nothing yourself unless <botmux_task> gives you a delivery instruction for this turn, and then use exactly that (no other form of botmux send, nothing to Feishu/Lark).',
+  'ai.native_gateway.ask_hint': 'When the user must choose between a few clear options and the next steps have to wait for that answer, you can post a question card to the current chat: `botmux ask buttons --options "yes=Continue,no=Stop" "Continue?"`. The command waits until someone picks an option (up to 300 seconds by default) and prints the chosen key (e.g. yes) to stdout. A question is valid only within this turn and is void once the turn ends; a timeout, a void question or a text-only reply means no option was chosen, which is not consent. Never use a question to ask for passwords, keys or other secrets.',
   'ai.cursor.sender_note': 'The sender tag is metadata identifying the current speaker — never copy its open_id or name (e.g. ou_xxx:Alice) into your botmux send body or opening line; to @ the triggerer use botmux send --mention-back.',
   // Cursor moves a shell command that outlives its wait limit into a background
   // task; when it completes Cursor injects a synthetic user prompt ("Briefly
@@ -2132,6 +2134,22 @@ export const messages: Record<string, string> = {
   'setup.menu.overwrite_env': 'Overwrite current configuration',
   'setup.menu.migrate_env_hint': 'Migrate .env to bots.json multi-bot configuration',
   'setup.menu.single_bot_current': 'Currently using single-bot configuration: {file}',
+
+  'setup.platform.error_duplicate': 'setup: --platform may be given only once',
+  'setup.platform.error_invalid': 'setup: --platform must be feishu, lark or wecom',
+  'setup.platform.error_manual_requires_wecom': '--manual requires --platform wecom',
+  'setup.platform.usage_hint': 'WeCom: run botmux setup and, in the "WeCom" section at the end of "App Source", choose "Scan to create a new bot" or "Enter BotID/Secret manually" (with bots already configured, choose "Add new bot" first); both pair by private message and go online automatically, stored separately, Feishu configuration is not modified. Direct form of scan-to-create: botmux setup --platform wecom (--manual is still manual configuration of credentials and real userids, without connecting)',
+  'setup.platform.help_setup_wecom': 'Direct form of WeCom scan-to-create, the same flow as setup\'s "App Source" → "WeCom" → "Scan to create a new bot" (pair by private message, save and go online automatically; for a bot already created in WeCom choose "Enter BotID/Secret manually" in the same section); --manual for manual credentials',
+  'setup.platform.help_wecom_command': 'Start the configured WeCom gateway and its dedicated local core (add a WeCom bot with setup first: in the "WeCom" section of "App Source", scan to create or enter BotID/Secret, or run setup --platform wecom to scan to create directly; see wecom --help)',
+  'setup.platform.source_wecom_section': 'WeCom',
+  'setup.platform.source_wecom_qr': 'Scan to create a new bot',
+  'setup.platform.source_wecom_qr_hint': 'Create by scanning with WeCom, pair by private message, go online automatically',
+  'setup.platform.source_wecom_manual': 'Enter BotID/Secret manually',
+  'setup.platform.source_wecom_manual_hint': 'Bot already created in WeCom; pair by private message, go online automatically',
+  'setup.wecom.dashboard_not_running': 'The local Dashboard is not running. WeCom QR setup works through it, and setup does not start it for you. Run `botmux start` first, then run `botmux setup --platform wecom` again.',
+  'setup.wecom.dashboard_not_running_sandbox': 'The local Dashboard is not running. WeCom QR setup works through it. This process is inside a botmux sandbox and cannot see host processes, so `botmux start` is refused here. Start botmux in a terminal on the host (`botmux start` if bots are already configured, `botmux dashboard` if not), then come back and run `botmux setup --platform wecom` again.',
+  'setup.wecom.completed_name_note': '“{name}” is the display name in botmux. The bot\'s name and avatar in WeCom have to be changed in WeCom.',
+  'setup.wecom.completed_name_note_unnamed': 'The bot\'s name and avatar in WeCom have to be changed in WeCom; botmux does not change them.',
 
   'setup.common.cancelled': 'Cancelled.',
   'setup.common.cancelled_abort': 'Cancelled (Esc). Setup aborted without writing any configuration.',

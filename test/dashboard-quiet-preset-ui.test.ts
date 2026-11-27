@@ -17,6 +17,8 @@ async function settle(times = 3): Promise<void> {
 }
 
 function renderSection(overrides?: Partial<{
+  provider:'wecom';
+  replyCardShowTools:boolean;
   cotEnabled: boolean;
   replyCardNativeCot: boolean;
   silentReactions: boolean;
@@ -138,4 +140,12 @@ describe('QuietPresetSection', () => {
     expect(putCardPref).not.toHaveBeenCalled();
     expect(onApplied).not.toHaveBeenCalled();
   });
+});
+
+it('applies the native WeCom quiet preset once without requesting unavailable reactions or native bubbles',async()=>{
+ const {renderer,putCardPref}=renderSection({provider:'wecom',replyCardShowTools:true});
+ await act(async()=>switchInput(renderer).props.onChange({currentTarget:{checked:true}}));await settle();
+ expect(putCardPref).toHaveBeenCalledExactlyOnceWith({cotEnabled:false,replyCardShowTools:false,disableStreamingCard:true});
+ expect(JSON.stringify(renderer.toJSON())).not.toContain('quietPreset.silentOn');
+ await act(async()=>renderer.unmount());
 });

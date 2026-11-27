@@ -384,7 +384,7 @@ describe('CLI transport gate for a managed no-transport turn', () => {
 });
 
 describe('core-only entrypoint', () => {
-  it('freezes a dedicated state root, strips BOTS_CONFIG and pins worker HTTP to loopback before the daemon starts', async () => {
+  it('freezes and marks a dedicated state root, strips BOTS_CONFIG and pins worker HTTP to loopback before the daemon starts', async () => {
     const home = mkdtempSync(join(tmpdir(), 'core-only-entry-'));
     const before = { ...process.env };
     let envAtStart: NodeJS.ProcessEnv | undefined;
@@ -397,6 +397,8 @@ describe('core-only entrypoint', () => {
         BOTMUX_API_PORT: '45931',
         BOTS_CONFIG: '/fleet/bots.json',
         SESSION_DATA_DIR: '/fleet/data',
+        // A stale marker inherited from an outer core's session must not survive.
+        BOTMUX_CORE_ONLY_DATA_DIR: '/outer/core/data',
         BOTMUX_WORKER_HTTP_HOST: '0.0.0.0',
         BOTMUX_WORKER_HOST: '0.0.0.0',
       });
@@ -407,6 +409,8 @@ describe('core-only entrypoint', () => {
       expect(envAtStart!.BOTMUX_CORE_ONLY).toBe('1');
       expect(envAtStart!.BOTS_CONFIG).toBeUndefined();
       expect(envAtStart!.SESSION_DATA_DIR).toBe(join(home, '.botmux', 'core-only', 'local_riff', 'data'));
+      // Sessions on every backend inherit this marker of whose store they carry.
+      expect(envAtStart!.BOTMUX_CORE_ONLY_DATA_DIR).toBe(envAtStart!.SESSION_DATA_DIR);
       expect(envAtStart!.BOTMUX_WORKER_HTTP_HOST).toBe('127.0.0.1');
       expect(envAtStart!.BOTMUX_WORKER_HOST).toBeUndefined();
       expect(exit).not.toHaveBeenCalled();
@@ -436,12 +440,12 @@ describe('source-structure guards (no injectable seam)', () => {
   // 的沙箱迁移、不改写共享 HOME 的 ~/.botmux/.data-dir；就绪闸门在 bind 前布防、session 恢复后才放行，
   // ready 行（riff 解析的契约）只在放行后打印——否则 trigger 会撞上未完成的持久恢复而重发。来历：#668 codex P1 第 2/3 轮、P1-3。
   it('core-only daemon never touches fleet-wide host state and holds triggers until restore completes', () => {
-    expect(daemonSource).toMatch(/if \(process\.env\.BOTMUX_CORE_ONLY !== '1'\) \{\s*await migrateSandboxConfigAtStartup\(\);/);
+    expect(daemonSource).toMatch(/if \(!isCoreOnlyProcess\(\)\) \{\s*await migrateSandboxConfigAtStartup\(\);/);
     const maintenance = braceBlock(daemonSource, 'if (idx === 0 && !coreOnly) {');
     for (const call of ['startMaintenance(', 'startCliRuntimeUpdateMonitor(', 'sendRestartReportIfPending(']) {
       expect(maintenance, call).toContain(call);
     }
-    const breadcrumbGuard = braceBlock(braceBlock(daemonSource, 'function writePidFile('), "BOTMUX_CORE_ONLY !== '1'");
+    const breadcrumbGuard = braceBlock(braceBlock(daemonSource, 'function writePidFile('), 'if (!isCoreOnlyProcess())');
     expect(breadcrumbGuard).toContain("'.data-dir'");
 
     const armAt = daemonSource.indexOf('armCoreOnlyReadinessGate()');

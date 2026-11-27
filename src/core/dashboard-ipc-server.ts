@@ -1,3 +1,21 @@
+import { nativeGatewayAskSnapshots, nativeGatewayAskDecision, type NativeGatewayAskOrigin } from './native-gateway-ask-control.js';
+import {
+  EXPECTED_CORE_BOOT_HEADER,
+  NATIVE_GATEWAY_EXCLUSIVE_ROUTE_PATTERNS,
+  NATIVE_GATEWAY_ROUTE_PATTERNS,
+  type NativeGatewayAskCallbackResponse,
+  type NativeGatewayAsksResponse,
+  type NativeGatewayCoreProfileResponse,
+  type NativeGatewayProgressResponse,
+  type NativeGatewayReminderStateResponse,
+  type NativeGatewaySourceIdentity,
+} from './native-gateway-contract.js';
+import { applyNativeGatewayCoreProfile } from './native-gateway-core-profile.js';
+import { nativeGatewayCoreCredential } from './native-gateway-credential.js';
+import { isCoreOnlyProcess, isNativeGatewayCoreProcess } from './runtime-mode.js';
+import {projectCoreOnlyReminderState} from './core-only-reminder-state.js';
+import { getTerminalAdvertisedPort } from './terminal-url.js';
+import { readDurableProcessIdentity } from '../utils/process-identity.js';
 import { isFeedGroupSelection, setChatFeedGroup } from '../services/chat-feed-groups.js';
 import { readOncallDeploymentEnv } from '../services/oncall-deployment-config.js';
 import { loadOncallPresetOptions } from '../services/oncall-preset-options.js';
@@ -126,6 +144,7 @@ import {
   tmuxServersEnvView,
 } from './session-env-host.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
+import { projectCoreOnlyProgress } from './core-only-progress.js';
 import { resolveAsyncTriggerState, decideAsyncOwnership } from '../services/async-trigger-state.js';
 import { isLoopbackPeer } from '../utils/loopback-peers.js';
 import * as scheduleStore from '../services/schedule-store.js';
@@ -326,7 +345,7 @@ import {
   updateTaskWithOptionalPrecondition,
   type SchedulePreconditionMutation,
 } from './schedule-precondition-config.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, closeSessionForBackgroundCleanup, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, suspendWorkerAsync, killWorker, requestSessionRestart, isSessionRestartInFlight, getDaemonReplyCardUsageSnapshot, getDaemonReplyCardRenderSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, interruptExactWorkerTurn, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId, CARD_POSTING_SENTINEL, ensureReadonlyTaskContinuationAttached, isSessionEffortChangeInFlight, scheduleActiveRuntimePatch, updateHandoffLiveCard, isSessionLifecycleInFlight, hasPendingOrdinaryImDelivery, manualSuspendWaits, queueManualSuspend, identityStorageModelForDaemonSession, identityDecisionConflict, identityModelRefusalReason, dshRuntimeForSession } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, closeSessionForBackgroundCleanup, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, suspendWorkerAsync, killWorker, requestSessionRestart, isSessionRestartInFlight, getDaemonSessionUsageSnapshot, getDaemonReplyCardUsageSnapshot, getDaemonReplyCardRenderSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, interruptExactWorkerTurn, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId, CARD_POSTING_SENTINEL, ensureReadonlyTaskContinuationAttached, isSessionEffortChangeInFlight, scheduleActiveRuntimePatch, updateHandoffLiveCard, isSessionLifecycleInFlight, hasPendingOrdinaryImDelivery, manualSuspendWaits, queueManualSuspend, identityStorageModelForDaemonSession, identityDecisionConflict, identityModelRefusalReason, dshRuntimeForSession } from './worker-pool.js';
 import {
   awaitReadonlyTaskContinuationUser,
   cancelReadonlyTaskContinuationExplicit,
@@ -824,6 +843,24 @@ export function ipcRoute(method: string, path: string, handler: Handler): void {
     '^' + path.replace(/:([a-zA-Z]+)/g, (_, k) => { keys.push(k); return '([^/]+)'; }) + '$',
   );
   routes.push({ method: method.toUpperCase(), pattern, keys, handler });
+}
+
+/**
+ * EXPECTED_CORE_BOOT_HEADER pins a request to one boot of a core-only
+ * service (a native gateway / its Dashboard sends it so a restarted core, or a
+ * different daemon now owning the port, can never act on a stale session id).
+ * Requests without the header — every fleet caller — pass unchanged. A request
+ * carrying it passes only on a core-only service whose current boot id matches;
+ * any other daemon, including a fleet daemon, answers 409 rather than serve a
+ * caller that expected a specific core.
+ */
+function coreBootMismatch(
+  header: string | string[] | undefined,
+  coreOnly: boolean,
+  bootId: string,
+): boolean {
+  if (header === undefined) return false;
+  return !coreOnly || header !== bootId;
 }
 
 const groupSendStorePath = (larkAppId: string): string => join(config.session.dataDir, `group-sends-${larkAppId}.json`);
@@ -1331,8 +1368,11 @@ function routeHasPublicAccess(method: string, pathname: string): boolean {
  * Core-only ONLY: the exact riff-facing routes that bypass the trusted-host HMAC
  * when the daemon runs headless in riff's sandbox. Everything else STILL requires
  * the HMAC (codex P1: authRequired:false opened all 96 IPC routes — a co-resident
- * model turn could read/perturb sessions, scheduler, mutations). This is a tight
- * allowlist of drive-my-own-turn + poll-my-own-output surfaces:
+ * model turn could read/perturb sessions, scheduler, mutations). A native gateway
+ * core holding its gateway's credential requires the HMAC on these as well (the
+ * credential, or the Dashboard secret where NATIVE_GATEWAY_EXCLUSIVE_ROUTE_PATTERNS
+ * allows it). This is a tight allowlist of drive-my-own-turn + poll-my-own-output
+ * surfaces:
  *   POST /api/trigger                              (start a turn)
  *       · options.steer=true authorizes a best-effort native turn/steer into
  *         a live codex-app turn; same drive-my-own-turn trust surface, no extra
@@ -1355,6 +1395,15 @@ function routeIsCoreOnlyPublic(method: string, pathname: string): boolean {
       || /^\/api\/sessions\/[^/]+\/host-facts$/.test(pathname);
   }
   return false;
+}
+
+const NATIVE_GATEWAY_EXCLUSIVE_ROUTES = NATIVE_GATEWAY_EXCLUSIVE_ROUTE_PATTERNS.map(pattern => new RegExp(
+  '^' + pattern.replace(/:([a-zA-Z]+)/g, '([^/]+)') + '$',
+));
+
+/** Whether `pathname` is a route only the native gateway calls (any method). */
+function routeIsNativeGatewayExclusive(pathname: string): boolean {
+  return NATIVE_GATEWAY_EXCLUSIVE_ROUTES.some(route => route.test(pathname));
 }
 
 export function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean {
@@ -1490,6 +1539,41 @@ function trustedHostAuthorized(
     ? { ok: true }
     : { ok: false, reason: verified.reason ?? 'unauthorized' };
 }
+
+// Trusted-host only: no entry in the core-only public route allowlist.
+ipcRoute('GET', NATIVE_GATEWAY_ROUTE_PATTERNS.sourceIdentity, (req, res) => {
+  let apiOnly = false;
+  try { apiOnly = getBot(cachedLarkAppId).config.apiOnly === true; } catch { /* fail closed */ }
+  if (!isCoreOnlyProcess() || !apiOnly) return jsonRes(res, 404, { ok: false });
+  const sid = new URL(req.url ?? '/', 'http://localhost').searchParams.get('sessionId');
+  const ds = sid ? findActiveBySessionId(sid) : undefined;
+  const worker = ds?.worker;
+  // Only a live worker of this bot's session has a terminal to prove.
+  const workerLive = !!ds
+    && ds.larkAppId === cachedLarkAppId
+    && worker?.connected === true
+    && !worker.killed
+    && worker.exitCode === null
+    && worker.signalCode === null;
+  const terminal = workerLive && sid && worker?.pid
+    ? {
+      sessionId: sid,
+      workerPid: worker.pid,
+      workerProcessStart: readDurableProcessIdentity(worker.pid),
+      proxyPort: getTerminalAdvertisedPort(),
+    }
+    : undefined;
+  const identity: NativeGatewaySourceIdentity = {
+    ok: true,
+    coreOnly: true,
+    coreBotId: cachedLarkAppId,
+    bootInstanceId: getDaemonBootId(),
+    pid: process.pid,
+    processStart: readDurableProcessIdentity(process.pid),
+    ...(terminal ? { terminal } : {}),
+  };
+  return jsonRes(res, 200, identity);
+});
 
 ipcRoute('GET', '/__health', (_req, res) => {
   jsonRes(res, 200, { ok: true });
@@ -7663,7 +7747,7 @@ function buildAsyncTriggerLookupResponse(
   // on explicit /write-link request). buildTerminalUrl carries ?viewToken=
   // inline; the write token is never included. Closed/restored sessions have no
   // live worker terminal, so no stale URL is ever advertised.
-  if (process.env.BOTMUX_CORE_ONLY === '1' && ds && ds.workerPort && ds.workerViewToken) {
+  if (isCoreOnlyProcess() && ds && ds.workerPort && ds.workerViewToken) {
     resolved.readOnlyUrl = buildTerminalUrl(ds, { viewScope: 'worker' });
     resolved.viewToken = ds.workerViewToken;
   }
@@ -8290,11 +8374,193 @@ ipcRoute('GET', '/api/sessions/:sessionId/trigger-result', (req, res, params) =>
 });
 
 /**
+ * The exact live execution a native gateway may act for: `triggerId` must be
+ * the pending turn of an apiOnly HTTP virtual session of this core-only
+ * service's own bot, running on the current worker generation under the live
+ * managed origin.
+ *
+ * The ask projection and decisions built on this require trusted-host HMAC even
+ * in core-only mode — never add these routes to the unauthenticated core-only
+ * allowlist. Identity is asserted only by the authenticated gateway after its
+ * own callback ACL, never by Desktop or a worker session capability.
+ */
+function currentNativeGatewayAskOrigin(
+  sessionId: string,
+  triggerId: string,
+): { origin: NativeGatewayAskOrigin; appId: string; chatId: string } | undefined {
+  const ds = findActiveBySessionId(sessionId);
+  let apiOnly = false;
+  try {
+    apiOnly = !!cachedLarkAppId && getBot(cachedLarkAppId).config.apiOnly === true;
+  } catch { /* fail closed */ }
+  if (!isCoreOnlyProcess() || !apiOnly || !ds || ds.larkAppId !== cachedLarkAppId
+    || ds.session.larkAppId !== cachedLarkAppId || !isHttpVirtualSession(ds.chatId)) {
+    return;
+  }
+  const progress = projectCoreOnlyProgress(ds, triggerId);
+  if (!progress) return;
+  // A dispatch attempt is numbered per turn: it identifies this trigger's
+  // execution only while the live managed origin is this very turn.
+  const managedOrigin = ds.managedTurnOrigin;
+  if (managedOrigin?.turnId !== triggerId) return;
+  return {
+    origin: {
+      sessionId,
+      turnId: triggerId,
+      workerGeneration: progress.workerGeneration,
+      dispatchAttempt: managedOrigin.dispatchAttempt,
+    },
+    appId: ds.larkAppId,
+    chatId: ds.chatId,
+  };
+}
+
+ipcRoute('GET', NATIVE_GATEWAY_ROUTE_PATTERNS.asks, (req, res, params) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  const url = new URL(req.url ?? '/', 'http://localhost');
+  const values = url.searchParams.getAll('triggerId');
+  if (values.length !== 1 || url.searchParams.size !== 1 || !values[0] || values[0].length > 256) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_trigger_id' });
+  }
+  const current = currentNativeGatewayAskOrigin(params.sessionId, values[0]);
+  res.setHeader('cache-control', 'no-store');
+  const body: NativeGatewayAsksResponse = {
+    ok: true,
+    asks: current ? nativeGatewayAskSnapshots(current.origin, current.appId, current.chatId) : [],
+  };
+  return jsonRes(res, 200, body);
+});
+
+ipcRoute('POST', NATIVE_GATEWAY_ROUTE_PATTERNS.asks, async (req, res, params) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  const body = await readJsonBodyOrBadJson<Record<string, unknown>>(req, res);
+  if (body === BAD_JSON) return;
+  const origin = body.origin as NativeGatewayAskOrigin | undefined;
+  const current = currentNativeGatewayAskOrigin(params.sessionId, origin?.turnId ?? '');
+  if (!current) return jsonRes(res, 409, { ok: false, error: 'stale_execution' });
+  const outcome = nativeGatewayAskDecision(body, current.origin, current.appId, current.chatId);
+  const response: NativeGatewayAskCallbackResponse = { ok: true, outcome };
+  return jsonRes(res, 200, response);
+});
+
+ipcRoute('GET', NATIVE_GATEWAY_ROUTE_PATTERNS.progress, (req, res, params) => {
+  res.setHeader('cache-control', 'no-store');
+  const ds = findActiveBySessionId(params.sessionId);
+  const url = new URL(req.url ?? '/', 'http://localhost');
+  const values = url.searchParams.getAll('triggerId');
+  const triggerId = values.length === 1 ? values[0] : '';
+  let apiOnly = false;
+  try { apiOnly = !!cachedLarkAppId && getBot(cachedLarkAppId).config.apiOnly === true; } catch { /* fail closed */ }
+  if (!apiOnly || !cachedLarkAppId || !ds || ds.larkAppId !== cachedLarkAppId
+    || ds.session.larkAppId !== cachedLarkAppId || !isHttpVirtualSession(ds.chatId)) {
+    return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  }
+  if (!triggerId || triggerId.length > 256 || url.searchParams.size !== 1) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_trigger_id' });
+  }
+  const progress = projectCoreOnlyProgress(ds, triggerId);
+  let usage: ReturnType<typeof getDaemonSessionUsageSnapshot> | undefined;
+  if (progress) {
+    try { usage = getDaemonSessionUsageSnapshot(ds); } catch { /* no observed usage */ }
+  }
+  // `usage` copies the card usage snapshot's context, cumulative tokens and
+  // turn delta, in the shape CoreOnlyProgressUsage declares.
+  const body: NativeGatewayProgressResponse = {
+    ok: true,
+    progress: progress
+      ? {
+        ...progress,
+        ...(ds.activeModel ? { model: ds.activeModel } : {}),
+        ...(usage
+          ? { usage: { context: usage.context, tokens: usage.tokens, turnTokens: usage.turnTokens ?? null } }
+          : {}),
+      }
+      : null,
+  };
+  return jsonRes(res, 200, body);
+});
+
+/** Native recipient reminders remain trusted-host only, like native gateway progress. */
+ipcRoute('GET', NATIVE_GATEWAY_ROUTE_PATTERNS.reminderState, (req, res, params) => {
+  res.setHeader('cache-control', 'no-store');
+  const ds = findActiveBySessionId(params.sessionId);
+  const url = new URL(req.url ?? '/', 'http://localhost');
+  const values = url.searchParams.getAll('triggerId');
+  const triggerId = values.length === 1 ? values[0] : '';
+  let apiOnly = false;
+  try { apiOnly = !!cachedLarkAppId && getBot(cachedLarkAppId).config.apiOnly === true; } catch { /* fail closed */ }
+  if (!apiOnly || !cachedLarkAppId || !ds || ds.larkAppId !== cachedLarkAppId
+    || ds.session.larkAppId !== cachedLarkAppId || !isHttpVirtualSession(ds.chatId)) {
+    return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  }
+  if (!triggerId || triggerId.length > 256 || url.searchParams.size !== 1) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_trigger_id' });
+  }
+  let observed = ds;
+  if (!ds.latestAsyncTriggerId) {
+    // Restored dormant workers can lack the in-memory latest pointer. Only a
+    // strict, bot-owned durable latest receipt may replace that missing fact.
+    const receipt = asyncTriggerStore.lookupStrict(params.sessionId);
+    if (receipt?.ownerLarkAppId !== cachedLarkAppId || receipt.triggerId !== triggerId) {
+      const none: NativeGatewayReminderStateResponse = { ok: true, reminder: null };
+      return jsonRes(res, 200, none);
+    }
+    observed = { ...ds, latestAsyncTriggerId: receipt.triggerId };
+  }
+  const body: NativeGatewayReminderStateResponse = {
+    ok: true,
+    reminder: projectCoreOnlyReminderState(observed, triggerId) ?? null,
+  };
+  return jsonRes(res, 200, body);
+});
+
+/**
+ * After a native gateway core took a new core profile: close the sessions frozen
+ * on a CLI the bot no longer runs, with the sweep a Feishu bot's Agent save runs
+ * (POST /api/bots/:larkAppId/cli). Sessions it skips (protected ownership, a
+ * routing transfer) or fails to close stay as they are; only the counts are
+ * logged, the per-session refusal or residual is logged by the sweep itself.
+ */
+async function closeSessionsOfReplacedAgent(larkAppId: string): Promise<void> {
+  const swept = await closeCliMismatchedSessionsForBot(larkAppId);
+  logger.info(
+    `[native-gateway] core profile replaced; new sessions use the new settings; `
+    + `sessions on a previous agent: closed=${swept.closed} residual=${swept.residual} failed=${swept.failed}`,
+  );
+}
+
+/**
+ * The gateway's configuration changed: the core settings new sessions use
+ * (core/native-gateway-core-profile.ts). Exists only in a native gateway core;
+ * there the server-wide gate admits it with the gateway's own credential alone
+ * (NATIVE_GATEWAY_EXCLUSIVE_ROUTE_PATTERNS).
+ *
+ * Like a Feishu bot's Agent save, the profile is replaced and the sessions of a
+ * replaced CLI are closed inside one exclusive bot turn mutation, and the answer
+ * follows both: no turn is admitted in between, and a turn the gateway sends
+ * after this answer never reaches a session of the previous CLI.
+ */
+ipcRoute('POST', NATIVE_GATEWAY_ROUTE_PATTERNS.coreProfile, async (req, res) => {
+  if (!isNativeGatewayCoreProcess() || !cachedLarkAppId) return jsonRes(res, 404, { ok: false, error: 'not_found' });
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  const body = await readJsonBodyOrBadJson(req, res, 1024 * 1024);
+  if (body === BAD_JSON) return;
+  const larkAppId = cachedLarkAppId;
+  return withBotTurnMutation(larkAppId, async () => {
+    const result = applyNativeGatewayCoreProfile(larkAppId, body);
+    if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.error });
+    if (result.changed) await closeSessionsOfReplacedAgent(larkAppId);
+    const response: NativeGatewayCoreProfileResponse = { ok: true, changed: result.changed };
+    return jsonRes(res, 200, response);
+  });
+});
+
+/**
  * core-only 会话宿主事实：供嵌入方读取会话、CLI、后端、worker 与 native session 状态。
  *
- * 路由只在 startIpcServer({ coreOnlyPublicRoutes:true }) 时免 HMAC；普通 fleet 仍需可信
- * host 鉴权。即使在 core-only 下也只允许本 daemon 的 apiOnly HTTP virtual session，且
- * 永不返回 tmux socket、worker token、PID、环境变量或任意终端写 capability。
+ * 路由只在 startIpcServer({ coreOnlyPublicRoutes:true }) 时免 HMAC（持有网关凭据的原生网关
+ * core 除外）；普通 fleet 仍需可信 host 鉴权。即使在 core-only 下也只允许本 daemon 的
+ * apiOnly HTTP virtual session，且永不返回 tmux socket、worker token、PID、环境变量或任意终端写 capability。
  */
 ipcRoute('GET', '/api/sessions/:sessionId/host-facts', (_req, res, params) => {
   const ds = findActiveBySessionId(params.sessionId);
@@ -8525,7 +8791,8 @@ ipcRoute('POST', '/api/sessions/:sessionId/rename', async (req, res, params) => 
   const source = normalizeSessionTitleSource(body.source, 'dashboard');
   const updated = updateSessionTitle(session, title, source);
   if (!updated.ok) return jsonRes(res, 400, { ok: false, error: updated.error });
-  const agentSync = active
+  const localSourceMetadata = isCoreOnlyProcess() && typeof req.headers[EXPECTED_CORE_BOOT_HEADER] === 'string';
+  const agentSync = active && !localSourceMetadata
     ? requestAgentSessionRename(active, updated.title)
     : { status: 'not_running' as const };
   jsonRes(res, 200, {
@@ -15356,9 +15623,13 @@ export function startIpcServer(opts: {
    * port — riff's task-runner is told a fixed port and must not have the service
    * silently drift to another one. */
   maxProbe?: number;
-  /** Core-only: additionally treat the tight riff-facing route allowlist
-   * (routeIsCoreOnlyPublic) as public (no HMAC). Every OTHER route still requires
-   * the trusted-host HMAC — this does NOT disable auth wholesale (codex P1). */
+  /** Core-only: this is a core-only service. The tight riff-facing route
+   * allowlist (routeIsCoreOnlyPublic) answers 503 while restoring and is public
+   * (no HMAC) — unless this process holds its native gateway's credential
+   * (core/native-gateway-credential.ts), which requires a signature there too.
+   * Every OTHER route still requires the trusted-host HMAC — this does NOT
+   * disable auth wholesale (codex P1). Also what EXPECTED_CORE_BOOT_HEADER is
+   * matched against. */
   coreOnlyPublicRoutes?: boolean;
 }): Promise<IpcServerHandle> {
   setProjectWorkstreamPool({ findActiveBySessionId });
@@ -15376,30 +15647,49 @@ export function startIpcServer(opts: {
     try {
       const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
       const method = req.method ?? 'GET';
-      const coreOnlyPublic = opts.coreOnlyPublicRoutes === true && routeIsCoreOnlyPublic(method, url.pathname);
+      const coreOnlyRoute = opts.coreOnlyPublicRoutes === true && routeIsCoreOnlyPublic(method, url.pathname);
+      // Unsigned on a core-only service, except on a native gateway core that
+      // holds its gateway's credential: there they authenticate like any route.
+      const coreOnlyPublic = coreOnlyRoute && !nativeGatewayCoreCredential();
       const publicRoute = routeHasPublicAccess(method, url.pathname) || coreOnlyPublic;
-      // Readiness barrier (codex P1): the core-only public control routes
-      // (trigger / trigger-result / insight) must NOT enter their handlers until
-      // restore completes — a trigger during 'starting' races durable restore.
-      // Gate them at the server level so it doesn't depend on the caller probing
-      // /healthz first. /healthz itself reports 503 via its own handler.
-      if (coreOnlyPublic && coreOnlyNotReady()) {
+      // Readiness barrier (codex P1): the core-only control routes
+      // (routeIsCoreOnlyPublic) must NOT enter their handlers until restore
+      // completes — a trigger during 'starting' races durable restore. Gate
+      // them at the server level, before authentication, so it doesn't depend
+      // on the caller probing /healthz first; they answer 503 rather than wait
+      // on `ready`. /healthz itself reports 503 via its own handler.
+      if (coreOnlyRoute && coreOnlyNotReady()) {
         return jsonRes(res, 503, { ok: false, status: 'starting', error: 'core-only service is still restoring; retry after /healthz returns 200' });
       }
       const capabilityRoute = routeHasNarrowUntrustedAuth(method, url.pathname);
       if (opts.authRequired && !publicRoute) {
-        const secret = ipcAuthSecret();
-        const auth = secret
-          ? trustedHostAuthorized(req, url.pathname, boundPort, secret)
-          : { ok: false as const, reason: 'secret_unavailable' };
+        // A native gateway core that received its gateway's credential also
+        // trusts a request signed with it (core/native-gateway-credential.ts).
+        // Tried first: a failed verification records no nonce, so a request
+        // signed with the Dashboard secret still verifies below. Everywhere
+        // else there is no such credential and this is the Dashboard secret
+        // check alone.
+        const gatewaySecret = nativeGatewayCoreCredential();
+        const gatewayAuth = gatewaySecret
+          ? trustedHostAuthorized(req, url.pathname, boundPort, gatewaySecret)
+          : undefined;
+        const secret = gatewayAuth?.ok ? gatewaySecret : ipcAuthSecret();
+        const auth = gatewayAuth?.ok
+          ? gatewayAuth
+          : secret
+            ? trustedHostAuthorized(req, url.pathname, boundPort, secret)
+            : { ok: false as const, reason: 'secret_unavailable' };
         if (auth.ok) {
           trustedHostRequests.add(req);
           trustedHostRequestSecrets.set(req, secret!);
         } else if (!capabilityRoute) {
           return jsonRes(res, 401, { ok: false, error: 'unauthorized', reason: auth.reason });
         }
+        if (gatewaySecret && !gatewayAuth?.ok && routeIsNativeGatewayExclusive(url.pathname)) {
+          return jsonRes(res, 403, { ok: false, error: 'native_gateway_credential_required' });
+        }
       }
-      if (!publicRoute && opts.ready) {
+      if (!publicRoute && !coreOnlyRoute && opts.ready) {
         await opts.ready;
         if (req.aborted || req.destroyed || res.destroyed) return;
       }
@@ -15417,6 +15707,10 @@ export function startIpcServer(opts: {
             return jsonRes(res, 400, { ok: false, error: 'invalid_url_encoding' });
           }
           throw err;
+        }
+        const expectedCoreBoot = req.headers[EXPECTED_CORE_BOOT_HEADER];
+        if (coreBootMismatch(expectedCoreBoot, opts.coreOnlyPublicRoutes === true, getDaemonBootId())) {
+          return jsonRes(res, 409, { ok: false, error: 'core_boot_changed' });
         }
         await r.handler(req, res, params);
         return;

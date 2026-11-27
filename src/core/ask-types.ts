@@ -135,8 +135,12 @@ export type AskResult =
        *  a missing answer. claimant_gone / answer_undelivered: the hook never
        *  re-attached, so the asking CLI is no longer waiting (the latter: an
        *  answer had been given but could not reach it). cli_resolved: the asking
-       *  CLI ended this permission confirmation itself; see `cliOutcome`. */
-      failureCode?: 'card_delivery_failed' | 'claimant_gone' | 'answer_undelivered' | 'cli_resolved';
+       *  CLI ended this permission confirmation itself; see `cliOutcome`.
+       *  execution_ended (native gateway asks only): the exact turn execution that
+       *  asked — turn, dispatch attempt and worker generation — is no longer
+       *  live (the turn finished, its worker was replaced, or the daemon
+       *  restarted), so the gateway can no longer show or deliver the ask. */
+      failureCode?: 'card_delivery_failed' | 'claimant_gone' | 'answer_undelivered' | 'cli_resolved' | 'execution_ended';
       cliOutcome?: CliPermissionOutcome;
       selected: null;
       by: null;
@@ -165,12 +169,26 @@ export interface AskJsonOutput {
   timedOut: boolean;
 }
 
+/** The exact turn execution a native gateway dispatched and can see. */
+export interface NativeGatewayAskTurnOrigin {
+  turnId: string;
+  workerGeneration: number;
+  dispatchAttempt?: number;
+}
+
 /** Input accepted by broker.registerAsk. Caller (CLI subcommand → daemon IPC
  *  handler) is responsible for env validation and parameter parsing. Click
  *  authorization is the bot's canTalk gate, injected via `setCanTalkChecker`.
  *
  *  v0.1.8 变更：`options`/`prompt` 字段替换为 `questions: ReadonlyArray<AskQuestion>`。 */
 export interface CreateAskInput {
+  /** Daemon-bound for a native gateway core: the ask is shown to, and answered
+   *  through, the gateway only while this exact execution is live. Never
+   *  written to the ask store — neither the HTTP turn nor the worker
+   *  generation survives a daemon restart; an explicit-ask receipt keeps it
+   *  only to recognise itself as a native gateway receipt. Never accepted from
+   *  CLI JSON. */
+  nativeGatewayOrigin?: NativeGatewayAskTurnOrigin;
   /** Frozen by the daemon from the exact document turn, never CLI-supplied. */
   deliveryTarget?: AskDeliveryTarget;
   /** Daemon-bound presentation target; never accepted directly from CLI JSON. */
@@ -226,6 +244,7 @@ export interface CreateAskInput {
  *
  *  v0.1.8 变更：`options`/`prompt` 替换为 `questions`。 */
 export interface PendingAsk {
+  nativeGatewayOrigin?: NativeGatewayAskTurnOrigin;
   deliveryTarget?: AskDeliveryTarget;
   replyCardTarget?: CreateAskInput['replyCardTarget'];
   result?: AskResult;
@@ -356,11 +375,33 @@ export interface AskCardDispatcher {
  */
 export class AskDispatchError extends Error {
   readonly retryable: boolean;
-  constructor(message: string, retryable: boolean) {
+  /** The dispatcher released this pending send because the broker settled the
+   *  ask (its `onSettle` ran). Nothing is waiting on the card any more, so the
+   *  broker does not record it as a delivery failure. Only the native gateway
+   *  dispatcher sets this; every other failure is reported as before. */
+  readonly releasedBySettle: boolean;
+  constructor(message: string, retryable: boolean, options: { releasedBySettle?: boolean } = {}) {
     super(message);
     this.name = 'AskDispatchError';
     this.retryable = retryable;
+    this.releasedBySettle = options.releasedBySettle === true;
   }
+}
+
+/** Terminal result for a native gateway ask whose exact turn execution is no longer
+ *  live. The broker settles with it, the daemon answers a waiter that
+ *  reconnects after a restart with it, and an explicit-ask receipt of such an
+ *  ask is closed with it. */
+export function nativeGatewayExecutionEndedResult(): AskResult {
+  return {
+    kind: 'invalidated',
+    reason: 'the turn that asked this question is no longer running (it finished, its worker was replaced, or the daemon restarted)',
+    failureCode: 'execution_ended',
+    selected: null,
+    by: null,
+    comment: null,
+    timedOut: false,
+  };
 }
 
 /**

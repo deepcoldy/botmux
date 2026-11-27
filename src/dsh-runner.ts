@@ -498,6 +498,7 @@ let inputBuffer = '';
 let processing = false;
 
 function buildPreamble(): string {
+  if (args.nativeGateway) return buildNativeGatewayPreamble();
   const name = args.botName?.trim() || 'bot';
   const locale = args.locale?.trim() || 'zh';
   return [
@@ -510,6 +511,28 @@ function buildPreamble(): string {
       const prompt = larkToolPromptFromEnv(locale);
       return prompt ? [`- ${prompt}`] : [];
     })(),
+    '</botmux_identity>',
+    '',
+  ].join('\n');
+}
+
+/**
+ * First-turn preamble in a native IM gateway's core. The channel gateway posts
+ * the final reply into the chat the turn came from; `botmux send` follows the
+ * turn's <botmux_task> (as <botmux_http_response_mode> says). No Feishu/Lark
+ * identity or tools there (an apiOnly bot gets no lark-cli binding), and the
+ * name is a configured display name or nothing (runnerIdentityArgs).
+ */
+function buildNativeGatewayPreamble(): string {
+  const name = args.botName?.trim();
+  const locale = args.locale?.trim() || 'zh';
+  return [
+    '<botmux_identity>',
+    name ? `你是「${name}」，通过 botmux 运行在 deepseek-harness 上。` : '你通过 botmux 运行在 deepseek-harness 上。',
+    '- 你的最终回复文本会由通道网关发到当前聊天，聊天里的人会看到它；只输出最终回答。',
+    '- 不要自己发送消息：只有本轮 `<botmux_task>` 明确给出了发送方式时，才严格按它发送，不使用其它形式的 `botmux send`。',
+    '- 每轮任务结束时必须给出最终回复，明确成功、失败或待确认；部署成功必须有实际观测依据，未经核实不得宣称成功。',
+    `- 工作目录：${cwd}。语言：${locale}。`,
     '</botmux_identity>',
     '',
   ].join('\n');

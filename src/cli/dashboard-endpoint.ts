@@ -277,6 +277,9 @@ export async function callDashboard(opts: {
   requestTimeoutMs?: number;
   /** Override the whole-scan budget (default DISCOVERY_TOTAL_BUDGET_MS). */
   discoveryBudgetMs?: number;
+  /** The actual loopback transport port, never a host/port from response URLs.
+   * Consumers of local management APIs must keep credentials on this port. */
+  onDashboardPort?: (port: number) => void;
 }): Promise<DashboardResult> {
   const host = opts.host ?? '127.0.0.1';
   const probeSpan = opts.probeSpan ?? 20;
@@ -316,7 +319,10 @@ export async function callDashboard(opts: {
     host, port: candidate, path: opts.path, secret, fetchImpl,
     ...(firstTimeoutMs === undefined ? {} : { timeoutMs: firstTimeoutMs }),
   });
-  if (reachedDashboard(first)) return first;
+  if (reachedDashboard(first)) {
+    if (first.ok) opts.onDashboardPort?.(candidate);
+    return first;
+  }
 
   // 2. Rediscover when the recorded port provably cannot be the dashboard:
   //    something answered but failed identity checks (wrong-service 404 /
@@ -366,9 +372,11 @@ export async function callDashboard(opts: {
       // Found the dashboard — perform the actually-requested op on its port. The
       // real request gets its own fresh timeout: it is not discovery, and it must
       // not inherit whatever the scan already spent.
-      return requestDashboardAt({
+      const result = await requestDashboardAt({
         host, port: p, path: opts.path, secret, fetchImpl, timeoutMs: probeTimeoutMs,
       });
+      if (result.ok) opts.onDashboardPort?.(p);
+      return result;
     }
   }
   // No dashboard found in the probe range; surface the original failure

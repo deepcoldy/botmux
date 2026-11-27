@@ -1644,6 +1644,8 @@ export const messages: Record<string, string> = {
   // <botmux_http_response_mode> 出现一次（迁移不删，#808 async settle 依赖它），
   // 这条 reminder 绝不能再带 send/@/BOTMUX_NOTHING_TO_SEND，否则又和 http_response_mode 打架。
   'ai.followup.reminder_no_transport': '本轮是程序发起的请求-应答：完整回复会原样回传给调用方，不显示在任何聊天里。按本轮内容里的 <botmux_http_response_mode> 指示作答即可；不要调用 botmux send，不要发飞书。',
+  'ai.followup.reminder_native_gateway': '本轮的最终回复由通道网关发到当前聊天，聊天里的人会看到。按本轮内容里的 <botmux_http_response_mode> 指示作答；不要自己发送消息——只有 <botmux_task> 给出了本轮的发送方式时，才严格按它发送（不用其它形式的 botmux send，不发飞书）。',
+  'ai.native_gateway.ask_hint': '需要用户在几个明确选项中做决定、且后续步骤必须等答案时，可以向当前聊天发一张提问卡片：`botmux ask buttons --options "yes=继续,no=停止" "要继续吗？"`。命令会一直等到有人点选（默认最多 300 秒），并把所选项的 key（例如 yes）输出到 stdout。提问只在本轮内有效，本轮结束即作废；超时、作废或只收到文字回复时都没有选中项，不能当作同意。不要通过提问索取密码、密钥等秘密。',
   'ai.cursor.sender_note': 'sender 标签只是元信息（标识当前发言人），不要把其中的 open_id 或名字（例如 ou_xxx:高鹏）抄进 botmux send 的正文或开头；要 @ 回触发者请用 botmux send --mention-back。',
   // Cursor 会把超过等待时限的 shell 命令转成后台任务，任务完成后由 Cursor 自动注入一条
   // 合成 user 提示（"Briefly inform the user about the task result…"）再开一轮——它不是
@@ -2136,6 +2138,22 @@ export const messages: Record<string, string> = {
   'setup.menu.overwrite_env': '覆盖当前配置',
   'setup.menu.migrate_env_hint': '迁移 .env 到 bots.json 多机器人配置',
   'setup.menu.single_bot_current': '当前使用单机器人配置: {file}',
+
+  'setup.platform.error_duplicate': 'setup 的 --platform 只能指定一次',
+  'setup.platform.error_invalid': 'setup 的 --platform 必须为 feishu、lark 或 wecom',
+  'setup.platform.error_manual_requires_wecom': '--manual 需要同时指定 --platform wecom',
+  'setup.platform.usage_hint': '企业微信：运行 botmux setup，在「飞书应用来源」末尾的「企业微信」分区选「扫码创建新机器人」或「手动输入 BotID/Secret」（已有机器人时先选「添加新机器人」）；两种方式都私聊配对、自动上线，独立存储，不修改飞书配置。扫码创建的直达写法：botmux setup --platform wecom（--manual 仍是手工配置凭据与真实 userid，不自动连接）',
+  'setup.platform.help_setup_wecom': '企业微信扫码创建的直达写法，与 setup 里「飞书应用来源」→「企业微信」→「扫码创建新机器人」同一流程（私聊配对、保存并自动上线；已有机器人在同一分区选「手动输入 BotID/Secret」）；--manual 使用手工凭据配置',
+  'setup.platform.help_wecom_command': '启动已配置的企业微信网关及专用本机 core（先用 setup 添加企业微信机器人：「飞书应用来源」的「企业微信」分区选扫码创建或手动输入 BotID/Secret，或直达 setup --platform wecom 扫码创建；详见 wecom --help）',
+  'setup.platform.source_wecom_section': '企业微信',
+  'setup.platform.source_wecom_qr': '扫码创建新机器人',
+  'setup.platform.source_wecom_qr_hint': '企业微信扫码创建、私聊配对、自动上线',
+  'setup.platform.source_wecom_manual': '手动输入 BotID/Secret',
+  'setup.platform.source_wecom_manual_hint': '已在企业微信里创建好机器人；私聊配对、自动上线',
+  'setup.wecom.dashboard_not_running': '本机 Dashboard 没有在运行，企业微信扫码 setup 需要通过它完成，setup 不会代为启动。请先运行 `botmux start`，再重新运行 `botmux setup --platform wecom`。',
+  'setup.wecom.dashboard_not_running_sandbox': '本机 Dashboard 没有在运行，企业微信扫码 setup 需要通过它完成。当前在 botmux 沙盒内，看不到宿主进程，`botmux start` 在这里会被拒绝。请到宿主终端启动 botmux（已有机器人配置时运行 `botmux start`，尚未配置时运行 `botmux dashboard`），再回来重新运行 `botmux setup --platform wecom`。',
+  'setup.wecom.completed_name_note': '「{name}」是 botmux 里的显示名；企业微信里的机器人名称和头像需要在企业微信里修改。',
+  'setup.wecom.completed_name_note_unnamed': '机器人在企业微信里的名称和头像需要在企业微信里修改，botmux 不会改动它们。',
 
   'setup.common.cancelled': '已取消。',
   'setup.common.cancelled_abort': '已取消（Esc），setup 中止，不写任何配置。',

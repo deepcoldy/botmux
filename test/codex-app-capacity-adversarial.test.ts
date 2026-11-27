@@ -3,7 +3,8 @@ import { generateKeyPairSync } from 'node:crypto';
 import * as recovery from '../src/services/ordinary-turn-recovery.js';
 import { CODEX_CAPACITY_ERROR_CODE } from '../src/services/codex-transcript.js';
 import { codexCapacityRecoveryCli } from '../src/services/codex-app-failure.js';
-import { runnerFinalOutcome, codexAppSettlementOutcome } from '../src/services/runner-final-outcome.js';
+import { runnerFinalOutcome, codexAppSettlementOutcome, appRunnerSilenceDisposition } from '../src/services/runner-final-outcome.js';
+import { isNativeGatewayCoreProcess } from '../src/core/runtime-mode.js';
 import { isCodexAppCliId } from '../src/adapters/cli/types.js';
 import { normalizeFinalUsage } from '../src/services/codex-app-runner-protocol.js';
 import { bridgePostText } from '../src/services/bridge-fallback-gate.js';
@@ -144,6 +145,7 @@ function signedWorker() {
   const send = vi.fn(), terminal = vi.fn();
   const scope: any = {
     lastInitConfig: { cliId: 'codex-app' }, isCodexAppCliId, normalizeFinalUsage, bridgePostText, runnerFinalOutcome,
+    appRunnerSilenceDisposition, isNativeGatewayCoreProcess,
     codexAppTurnDispatchQueue: queue, codexAppCompletionAwaitingFinal: true,
     codexAppTurnLiveness: { completeCurrent: vi.fn() }, codexAppGenerationCommits: [], codexAppRecoveredDispatches: [],
     randomBytes: () => ({ toString: () => 'request' }), turnExecutionClock: { peek: () => undefined },

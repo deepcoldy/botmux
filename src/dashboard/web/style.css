@@ -36929,3 +36929,67 @@ button.wc-done { min-width: 62px; box-shadow: none; }
   .wc-guide-actions { order: 2; }
   .wc-guide-actions:empty { display: none; }
 }
+
+.drawer-session-id { display:flex; align-items:center; gap:8px; min-width:0; max-width:100%; }
+#drawer .drawer-session-id code { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#drawer .drawer-session-id button { flex-shrink:0; }
+
+/* The common creation wizard also hosts native WeCom pairing. */
+.onboarding-provider {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+  margin: 0;
+  padding: 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
+}
+.onboarding-provider legend { padding: 0 4px; color: var(--muted); font-size: 12px; }
+/* 次要的平台切换入口：压在弹窗最下方，不占飞书流程的步骤。 */
+.onboarding-platform-switch { display: flex; justify-content: flex-end; margin-top: 4px; }
+.onboarding-provider label { display: flex; align-items: center; gap: 5px; font-size: 12px; }
+.onboarding-provider input[type="radio"] { width: auto; margin: 0; }
+.onboarding-progress { display: flex; gap: 6px; list-style: none; margin: 0 0 12px; padding: 0; }
+.onboarding-progress li { flex: 1; min-width: 0; border-bottom: 2px solid var(--border-soft); padding: 6px 0; color: var(--muted); font-size: 11px; text-align: center; }
+.onboarding-progress li[aria-current="step"] { border-color: var(--accent); color: var(--accent-strong); }
+.onboarding-pairing { padding: 12px; border: 1px solid var(--border-soft); border-radius: var(--radius-md); }
+.onboarding-pairing p { margin: 0 0 10px; line-height: 1.6; font-size: 13px; }
+.onboarding-pairing-code { display: block; padding: 12px; margin-bottom: 12px; overflow-wrap: anywhere; text-align: center; font-size: 24px; font-weight: 800; letter-spacing: 2px; user-select: all; background: var(--bg); border-radius: var(--radius-md); }
+.onboarding-card > *, .onboarding-card [data-wecom-onboarding-status] { min-width: 0; }
+.onboarding-technical code { white-space: pre-wrap; overflow-wrap: anywhere; }
+dialog.onboarding-dialog .onboarding-field > input[type="password"] { box-sizing: border-box; width: 100%; min-width: 0; height: var(--button-height); padding: 0 var(--button-padding-x); border: 1px solid var(--border-soft); border-radius: var(--radius-full); background: var(--surface); color: var(--fg); font: inherit; }
+
+/* 企业微信专属格子（data-provider-only="wecom"）里的签名密钥密码框：与同页格子里的单行输入框同一套
+   尺寸、字体与配色——格子输入框的通用规则只认 type=text / number。:not() 链与那条通用规则一样，
+   用来压过全局表单规则 input:not(...)（同为七个 :not 的特异度）。 */
+.bot-defaults-page .bd-tile[data-provider-only="wecom"] input[type="password"]:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]) {
+  box-sizing: border-box;
+  width: 100%;
+  height: var(--button-height);
+  min-height: var(--button-height);
+  max-height: var(--button-height);
+  padding: 0 var(--button-padding-x);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  color: var(--fg);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: normal;
+  box-shadow: none;
+  outline: none;
+}
+.bot-defaults-page .bd-tile[data-provider-only="wecom"] input[type="password"]:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]):hover:not(:disabled),
+.bot-defaults-page .bd-tile[data-provider-only="wecom"] input[type="password"]:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]):focus {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  color: var(--accent-strong);
+  box-shadow: none;
+}
+/* 企业微信本地业务设置格子里合放着业务账本：两段各自包在带无障碍名称的 section 里，通用的
+   `.bd-tile .bd-section + .bd-section` 分隔线够不着，这里补上同一条分隔（同沙盒 + 网络策略那一格）。 */
+.bot-defaults-page .bd-tile[data-provider-only="wecom"] > section + section > .bd-section {
+  margin-top: 14px;
+  border-top: 1px solid var(--border-soft);
+}

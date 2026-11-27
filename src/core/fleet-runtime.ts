@@ -10,19 +10,28 @@ import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { existsSync, readFileSync, openSync, mkdirSync, statSync } from 'node:fs';
 import { spawn } from 'node:child_process';
-import type { FleetBotSpec } from './fleet-supervisor.js';
+import type { FleetBotSpec, FleetGroupResolution } from './fleet-supervisor.js';
 import { pidAlive } from './fleet-supervisor.js';
 import { resolveEntrySpawn } from './self-spawn.js';
 import { readFleetState } from './fleet-state-store.js';
 import { resolveBotmuxDataDir } from './data-dir.js';
-import { enqueueFleetCommand } from './fleet-command-queue.js';
+import {
+  enqueueFleetCommand,
+  withdrawFleetCommand,
+  type FleetCommandResult,
+  type FleetMemberCommandOp,
+} from './fleet-command-queue.js';
+import { resolveWecomFleetMembers } from './fleet-wecom-members.js';
+import { WECOM_GATEWAY_KILL_TIMEOUT_MS } from '../im/wecom/config/gateway-budgets.js';
+import { isWecomFleetMemberName } from '../im/wecom/config/fleet-member-name.js';
+import { FLEET_DAEMON_EXIT_SLACK_MS, FLEET_SUCCESSOR_SETTLE_MS } from './shutdown-budgets.js';
 import type { FleetProcState, FleetState } from './fleet-supervisor-policy.js';
 import { FLEET_GRACEFUL_EXIT_CODE } from './fleet-supervisor-policy.js';
 import { botProcessName, parseBotConfigsJson } from '../setup/bot-config-editor.js';
 import { resolveDaemonEnv } from '../cli/daemon-lifecycle-env.js';
 import { scrubDetachedRestartEnvRefresh } from './restart-env-refresh.js';
 import type { RestartEnvFallback } from './restart-env-refresh.js';
-import { stripDashboardH5Env } from '../utils/child-env.js';
+import { scrubCoreOnlyServiceEnv, stripDashboardH5Env, withoutCoreOnlyFrozenLoopback } from '../utils/child-env.js';
 import { scrubSessionTempEnv } from './session-temp.js';
 import { findQuotaFallbackCycles } from '../services/quota-fallback.js';
 import { findRetiredCliBots } from '../adapters/cli/retired-cli.js';
@@ -55,6 +64,11 @@ export function fleetLogDir(): string {
 /** Path to the CLI→supervisor single-bot command queue (start-bot / stop-bot). */
 export function fleetCommandPath(): string {
   return join(CONFIG_DIR, 'fleet-commands.json');
+}
+
+/** Path where the supervisor records the outcome of start-member / stop-member. */
+export function fleetCommandResultsPath(): string {
+  return join(CONFIG_DIR, 'fleet-command-results.json');
 }
 
 /** dist/ directory of THIS build (Node path). Under the standalone binary the
@@ -143,9 +157,15 @@ export function resolveFleetDaemonEnv(
   const readFailureFallback = typeof options === 'boolean'
     ? (options ? inheritedEnv : undefined)
     : options.readFailureFallback ?? (inferredSessionRefresh ? inheritedEnv : undefined);
-  const lifecycleSource = envFileRead.status === 'failed' && refreshPersistedEnv
-    ? readFailureFallback ?? {}
-    : inheritedEnv;
+  // From a core-only service's session, its frozen loopback settings are not the
+  // fleet's: taken as unset here, they fall back to the persisted file or the
+  // defaults instead of moving every Feishu worker and terminal link to 127.0.0.1.
+  // scrubCoreOnlyServiceEnv below comes too late for lifecycle keys: they are
+  // resolved from this source first.
+  const lifecycleSource = withoutCoreOnlyFrozenLoopback(
+    envFileRead.status === 'failed' && refreshPersistedEnv ? readFailureFallback ?? {} : inheritedEnv,
+    inheritedEnv,
+  );
   const defaultDashboardHost = typeof options === 'boolean' ? undefined : options.defaultDashboardHost;
   const env: NodeJS.ProcessEnv = {
     ...inheritedEnv,
@@ -159,6 +179,16 @@ export function resolveFleetDaemonEnv(
   scrubDetachedRestartEnvRefresh(env);
   stripDashboardH5Env(env);
   scrubSessionTempEnv(env);
+  // A `botmux start/restart` typed inside a session of a dedicated core-only
+  // service (the WeCom managed core, `serve --api-only`) inherits what that
+  // service froze: on PTY its whole identity, on every backend its dedicated
+  // SESSION_DATA_DIR. No supervised member is ever core-only — left in place,
+  // every Feishu daemon would boot the core's synthetic apiOnly bot, or adopt
+  // the core's store and repoint the ~/.botmux/.data-dir breadcrumb at it. The
+  // scrub drops both, so the pin below re-resolves the fleet's own store
+  // (daemon breadcrumb, else ~/.botmux/data). Any other invoker keeps its
+  // environment exactly as before.
+  scrubCoreOnlyServiceEnv(env);
   //
   // MIGRATION-CRITICAL: pin SESSION_DATA_DIR for every supervised child. The old
   // pm2 ecosystem injected `SESSION_DATA_DIR: DATA_DIR` into both the bot daemons
@@ -265,15 +295,57 @@ export function resolveTopicIndexSpec(): FleetBotSpec {
   };
 }
 
+export interface ResolveFleetMembersOptions {
+  /** The base env the supervisor gives every member (WeCom members take
+   *  `.env` keys only where it has none). Defaults to this process's env. */
+  baseEnv?: NodeJS.ProcessEnv;
+  /** Receives why WeCom members could not be resolved, and per-connection notes. */
+  log?: (msg: string) => void;
+}
+
 /**
- * Every process the supervisor manages: the bot daemons from bots.json PLUS the
- * dashboard. This is the list the supervisor `start()` reconciles and the set
- * `botmux restart` health-gates on. Kept separate from `resolveFleetBots()`,
+ * Every process the supervisor manages: the bot daemons from bots.json, the
+ * dashboard, the topic indexer (unless BOTMUX_TOPIC_SEARCH=0), then one member
+ * per WeCom connection whose desired state is `running`. This is the list the
+ * supervisor `start()` reconciles. Kept separate from `resolveFleetBots()`,
  * which stays bot-only so bot addressing (start-bot/stop-bot by appId, status
  * rows) is unaffected.
+ *
+ * WeCom members come last, so without any WeCom configuration the list — and
+ * the spawn order — is exactly the members before them. A WeCom
+ * source that cannot be read contributes no members and is logged; it never
+ * keeps the Feishu bots or the dashboard from starting.
  */
-export function resolveFleetMembers(): FleetBotSpec[] {
-  return [...resolveFleetBots(), resolveDashboardSpec(), ...(process.env.BOTMUX_TOPIC_SEARCH === '0' ? [] : [resolveTopicIndexSpec()])];
+export function resolveFleetMembers(options: ResolveFleetMembersOptions = {}): FleetBotSpec[] {
+  return [...resolveFleetBots(), resolveDashboardSpec(), ...(process.env.BOTMUX_TOPIC_SEARCH === '0' ? [] : [resolveTopicIndexSpec()]), ...resolveWecomMembersOrNone(options)];
+}
+
+function resolveWecomMembersOrNone(options: ResolveFleetMembersOptions): FleetBotSpec[] {
+  try {
+    const resolution = resolveWecomGroup(options.baseEnv ?? process.env);
+    for (const note of resolution.notes) options.log?.(`wecom: ${note}`);
+    return [...resolution.members];
+  } catch (err) {
+    options.log?.(`wecom: connections not started — ${err instanceof Error ? err.message : String(err)}`);
+    return [];
+  }
+}
+
+/**
+ * Fresh resolution of the WeCom member group for the supervisor (boot,
+ * start-member / stop-member, SIGHUP reconcile). Reads ~/.botmux/.env each time
+ * so a member started later gets the current proxy settings. Throws when the
+ * WeCom registry or desired-state file cannot be trusted.
+ */
+export function resolveWecomGroup(baseEnv: NodeJS.ProcessEnv): FleetGroupResolution & { notes: string[] } {
+  return resolveWecomFleetMembers({
+    distDir: fleetDistDir(),
+    baseEnv,
+    readEnvFileText: () => {
+      const envFile = readFleetDaemonEnvFile();
+      return envFile.status === 'loaded' ? envFile.text : undefined;
+    },
+  });
 }
 
 export function liveSupervisorTarget(
@@ -290,14 +362,29 @@ export function liveSupervisorTarget(
   return inspection.status === 'exact' ? inspection.attestation : undefined;
 }
 
-function attestedSupervisorAlive(target: FleetProcessAttestation): boolean {
+function attestedSupervisorAlive(
+  target: FleetProcessAttestation,
+  runtime: FleetProcessIdentityRuntime = fleetProcessIdentityRuntime,
+): boolean {
   const inspection = inspectFleetProcess(
     target.pid,
     target.processStart,
     target.pidNamespace,
     commandLine => commandLine === target.commandLine,
+    runtime,
   );
   return inspection.status === 'exact';
+}
+
+/**
+ * Is this exact supervisor generation (pid, birth identity, command line) still
+ * running? A different supervisor that took over in the meantime is not it.
+ */
+export function fleetSupervisorStillRunning(
+  target: FleetProcessAttestation,
+  runtime: FleetProcessIdentityRuntime = fleetProcessIdentityRuntime,
+): boolean {
+  return attestedSupervisorAlive(target, runtime);
 }
 
 /** True only when fleet-state identifies this exact supervisor generation. */
@@ -358,6 +445,37 @@ export function startFleetViaSupervisor(options: StartFleetOptions = {}): StartF
 const STOP_POLL_INTERVAL_MS = 100;
 const DEFAULT_STOP_TIMEOUT_MS = 15_000;
 
+/**
+ * How long a stop waits for the supervisor while a WeCom gateway is live: the
+ * gateway's kill timeout plus the same successor/exit slack the Feishu wait
+ * (FLEET_DAEMON_EXIT_WAIT_MS) adds to the daemon kill timeout.
+ *
+ * It has to stay below systemd's default TimeoutStopSec (90 s): the Linux boot
+ * unit stops the fleet with `ExecStop=botmux stop` and sets no timeout of its
+ * own, so what `botmux stop` does around this wait — starting up, taking the
+ * fleet mutation lock, the final check — has to fit in the rest; past 90 s
+ * systemd kills what is left of the unit's processes. The gateway's kill timeout
+ * counts its core's stop and its drain as running side by side, as they do
+ * (im/wecom/config/gateway-budgets.ts), which leaves that rest at about 28 s
+ * with the current budgets.
+ */
+export const WECOM_FLEET_EXIT_WAIT_MS =
+  WECOM_GATEWAY_KILL_TIMEOUT_MS + FLEET_SUCCESSOR_SETTLE_MS + FLEET_DAEMON_EXIT_SLACK_MS;
+
+/**
+ * The wait a stop/restart gives the supervisor to exit. A gateway's kill
+ * timeout is longer than a bot daemon's, and the supervisor only exits after
+ * stopAll has seen every child go — cutting the wait short would SIGKILL the
+ * supervisor mid-stop and leave fleet-state unfinalized. So while fleet-state
+ * shows a live WeCom gateway the wait covers its kill timeout; otherwise (every
+ * Feishu-only fleet) it is exactly the caller's `requestedMs`.
+ */
+export function fleetStopWaitMs(requestedMs: number, state: FleetState | null): number {
+  const liveGateway = (state?.procs ?? []).some(p =>
+    isWecomFleetMemberName(p.name) && p.status === 'online' && pidAlive(p.pid));
+  return liveGateway ? Math.max(requestedMs, WECOM_FLEET_EXIT_WAIT_MS) : requestedMs;
+}
+
 export interface StopFleetResult {
   action: 'stopped' | 'not-running' | 'timeout';
   supervisorPid: number;
@@ -371,6 +489,9 @@ export interface StopFleetResult {
  * with kill-0 until it's gone; on timeout we escalate to SIGKILL of the
  * supervisor itself (its children still received SIGTERM and self-reap).
  *
+ * The wait is `timeoutMs`, lengthened only while fleet-state shows a live WeCom
+ * gateway (see fleetStopWaitMs).
+ *
  * NOTE: caller must hold the fleet-mutation lock (single stop/start/restart at
  * a time), same contract as startFleetViaSupervisor.
  */
@@ -378,8 +499,9 @@ export function stopFleet(timeoutMs = DEFAULT_STOP_TIMEOUT_MS): StopFleetResult 
   const target = liveSupervisorTarget();
   if (!target) return { action: 'not-running', supervisorPid: 0 };
   const pid = target.pid;
+  const waitMs = fleetStopWaitMs(timeoutMs, readFleetState(fleetStatePath()));
   if (!signalAttestedFleetProcess(target, 'SIGTERM')) return { action: 'not-running', supervisorPid: pid };
-  const deadline = Date.now() + Math.max(0, timeoutMs);
+  const deadline = Date.now() + Math.max(0, waitMs);
   while (Date.now() < deadline) {
     if (!attestedSupervisorAlive(target)) return { action: 'stopped', supervisorPid: pid };
     sleepSyncMs(STOP_POLL_INTERVAL_MS);
@@ -529,9 +651,27 @@ export function waitFleetOnline(
 }
 
 /** Members `botmux restart` health-gates on: the bot daemons plus the
- *  dashboard. The topic indexer is excluded so a restart never waits on it. */
+ *  dashboard. The topic indexer is excluded so a restart never waits on it.
+ *
+ *  WeCom members are deliberately NOT in it either: a connection replaced by
+ *  another instance or holding revoked credentials must not fail a Feishu
+ *  restart or roll back an update. Their state is reported separately
+ *  (wecomFleetMemberNames). */
 export function fleetHealthMembers(): FleetBotSpec[] {
-  return resolveFleetMembers().filter((m) => m.entry !== 'topic-indexer');
+  return resolveFleetMembers().filter((m) => m.entry !== 'topic-indexer' && m.group !== 'wecom');
+}
+
+/** Names of the WeCom members the supervisor is expected to run (desired
+ *  `running`, configuration present). Empty when there is no WeCom
+ *  configuration or it cannot be read. For reporting their state next to the
+ *  health gate — e.g. `waitFleetOnline(wecomFleetMemberNames(), …)` and a
+ *  warning line per pending name — never for the gate itself. */
+export function wecomFleetMemberNames(): string[] {
+  try {
+    return resolveWecomGroup(process.env).members.map((m) => m.name);
+  } catch {
+    return [];
+  }
 }
 
 /** Resolve one bot's fleet spec by larkAppId (null if not in bots.json). */
@@ -640,4 +780,81 @@ export function stopBotViaSupervisor(
     if (Date.now() >= deadline) return { ok: false, reason: 'timeout', message: `${spec.name} 未在超时时间内停止`, name: spec.name };
     sleepSyncMs(150);
   }
+}
+
+export type FleetMemberRequestResult =
+  | { ok: true; state: Extract<FleetCommandResult, { ok: true }>['state']; name: string }
+  | {
+    ok: false;
+    reason: Extract<FleetCommandResult, { ok: false }>['reason'] | 'fleet_down' | 'timeout';
+    message: string;
+    name: string;
+  };
+
+/** Default wait for a stop-member: the gateway's whole stop budget plus the
+ *  supervisor's exit confirmation and some slack. */
+export const FLEET_MEMBER_STOP_WAIT_MS = WECOM_GATEWAY_KILL_TIMEOUT_MS + 10_000;
+/** Default wait for a start-member (the supervisor answers once exec succeeded). */
+export const FLEET_MEMBER_START_WAIT_MS = 30_000;
+
+export interface FleetMemberSubmitOptions {
+  idFactory: () => string;
+  nowIso: () => string;
+  /** Tests only. */
+  paths?: { statePath: string; commandPath: string };
+  /** Tests only. */
+  identityRuntime?: FleetProcessIdentityRuntime;
+}
+
+export type FleetMemberSubmission =
+  | { ok: true; id: string; name: string; supervisor: FleetProcessAttestation }
+  | { ok: false; reason: 'fleet_down'; message: string; name: string };
+
+/**
+ * Hand one group member op (by name) to the LIVE supervisor — the core of
+ * `botmux wecom start|stop|restart`: enqueue it and SIGHUP the attested
+ * supervisor. The caller waits for the outcome the supervisor records under
+ * the returned id (without holding the fleet mutation lock while it waits) and
+ * compares the returned supervisor generation to tell whether it is still the
+ * one that was asked.
+ *
+ * fleet_down: no supervisor is running (the desired state still applies on the
+ * next `botmux start`), or the signal could not be delivered — then the op is
+ * taken back out of the queue, so no later supervisor finds a command whose
+ * caller was told it did not go through.
+ */
+export function submitFleetMemberCommand(
+  op: FleetMemberCommandOp,
+  name: string,
+  options: FleetMemberSubmitOptions,
+): FleetMemberSubmission {
+  const statePath = options.paths?.statePath ?? fleetStatePath();
+  const commandPath = options.paths?.commandPath ?? fleetCommandPath();
+  const supervisorTarget = liveSupervisorTarget(statePath, options.identityRuntime);
+  if (!supervisorTarget) {
+    return { ok: false, reason: 'fleet_down', message: 'daemon 未在运行', name };
+  }
+  const id = options.idFactory();
+  enqueueFleetCommand(commandPath, { id, op, name, appId: '', botIndex: -1, at: options.nowIso() });
+  if (!signalAttestedFleetProcess(supervisorTarget, 'SIGHUP', options.identityRuntime)) {
+    withdrawFleetCommand(commandPath, id);
+    return { ok: false, reason: 'fleet_down', message: 'supervisor 已不在运行', name };
+  }
+  return { ok: true, id, name, supervisor: supervisorTarget };
+}
+
+/**
+ * SIGHUP the live supervisor so it reconciles the member groups with their
+ * current configuration and desired state (start connections newly set to
+ * `running`, stop and remove those set to `stopped` or deleted). For a caller
+ * that changed desired state without a per-member command. Returns false when
+ * no attested supervisor is running.
+ */
+export function signalFleetReconcile(
+  statePath: string = fleetStatePath(),
+  identityRuntime?: FleetProcessIdentityRuntime,
+): boolean {
+  const supervisorTarget = liveSupervisorTarget(statePath, identityRuntime);
+  if (!supervisorTarget) return false;
+  return signalAttestedFleetProcess(supervisorTarget, 'SIGHUP', identityRuntime);
 }

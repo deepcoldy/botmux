@@ -5,7 +5,7 @@ import { resolveCommand } from './registry.js';
 import { detectModelsViaExec } from './model-catalog-json.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { wrapBracketedPaste } from './tui-input.js';
-import { TMUX_INITIAL_PROMPT_ARG_BUDGET, type CliAdapter, type PtyHandle, type ResumableSession } from './types.js';
+import { TMUX_INITIAL_PROMPT_ARG_BUDGET, type CliAdapter, type ModelProbeOptions, type PtyHandle, type ResumableSession } from './types.js';
 import { opencodeDbPath } from '../../services/opencode-paths.js';
 
 import { delay, scaleMs } from '../../utils/timing.js';
@@ -733,8 +733,12 @@ export function createOpenCodeLikeAdapter(pathOverride: string | undefined, runt
     // 展示元数据，见 parseModelList）。仅 dashboard 在用户选中该 CLI 时按需调用，
     // 不在 daemon/worker 启动路径上；任何异常（spawn 失败/超时/输出为空）一律
     // fail-soft 返回 null，picker 回退到下面的 modelChoices。
-    async detectModels(): Promise<readonly string[] | null> {
-      return detectModelsViaExec(this.resolvedBin, runtime.modelListArgs, parseModelList);
+    // 命令始终按 login shell 解析（resolvedBin）。子进程环境默认沿用本进程；
+    // 只有调用方声明 isolatedEnv（为另行启动的 core 探测，如企微托管 core）
+    // 时才改用传入的 env。
+    async detectModels(options?: ModelProbeOptions): Promise<readonly string[] | null> {
+      const env = options?.isolatedEnv ? options.env : undefined;
+      return detectModelsViaExec(this.resolvedBin, runtime.modelListArgs, parseModelList, env);
     },
     // OpenCode model 通常 provider/name 形式（anthropic/claude-sonnet-4、openai/gpt-5），
     // 自由度高，候选只做引导，setup 时选 Other 自定义最常见。

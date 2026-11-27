@@ -9,6 +9,8 @@ export function cliAvailabilityRevision(bot: {
     bot.cliPathOverride ?? '', bot.cliRuntime?.executable ?? '', bot.envRevision ?? '']);
 }
 
+export interface ProviderProbeTarget { provider:'wecom'; id:string }
+
 type Option = { available?: boolean; availabilityStatus?: CliAvailabilityStatus };
 
 export function cliAvailabilityStatus(option: Option | undefined): CliAvailabilityStatus {
@@ -22,12 +24,13 @@ export async function fetchCliAvailability(
   appId?: string,
   signal?: AbortSignal,
   options?: { refresh?: boolean },
+  provider?:ProviderProbeTarget,
 ): Promise<CliAvailabilityStatus | null> {
   try {
     const query = new URLSearchParams({ key });
     if (appId) query.set('bot', appId);
     if (options?.refresh) query.set('refresh', '1');
-    const response = await fetch(`/api/cli-options/availability?${query}`, { signal });
+    const response = await fetch(provider ? `/api/wecom/connections/${encodeURIComponent(provider.id)}/cli-options/availability?${query}` : `/api/cli-options/availability?${query}`, { signal });
     const body = await response.json();
     return response.ok && ['available', 'unavailable', 'unknown'].includes(body?.status) ? body.status : null;
   } catch {
@@ -42,6 +45,7 @@ export function useCliAvailability(
   appId?: string,
   revision?: string,
   options?: { refresh?: boolean },
+  provider?:ProviderProbeTarget,
 ): CliAvailabilityStatus {
   const refreshOnImmediateProbe = Boolean(options?.refresh);
   const [result, setResult] = useState<{
@@ -57,7 +61,7 @@ export function useCliAvailability(
       const current = new AbortController();
       controller = current;
       timeout = setTimeout(() => current.abort(), 45_000);
-      void fetchCliAvailability(key, appId, current.signal, bypassCache ? { refresh: true } : undefined).then(status => {
+      void fetchCliAvailability(key, appId, current.signal, bypassCache ? { refresh: true } : undefined,provider).then(status => {
         if (timeout && controller === current) clearTimeout(timeout);
         if (!disposed && !current.signal.aborted) setResult({ key, appId, revision, status });
       });
@@ -69,7 +73,7 @@ export function useCliAvailability(
       if (typeof document === 'undefined' || document.visibilityState !== 'hidden') probe(false);
     }, 30_000);
     return () => { disposed = true; clearInterval(refresh); if (timeout) clearTimeout(timeout); controller?.abort(); };
-  }, [key, appId, revision, refreshOnImmediateProbe]);
+  }, [key, appId, revision, refreshOnImmediateProbe,provider?.id]);
   return result?.key === key && result.appId === appId && result.revision === revision && result.status
     ? result.status : cliAvailabilityStatus(option);
 }

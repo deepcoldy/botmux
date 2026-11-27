@@ -992,7 +992,8 @@ import { TRAEX_MODEL_ACCESS_ERROR_CODE } from './services/traex-model-access.js'
 import { parseDaemonIpcPort } from './utils/daemon-discovery.js';
 import { withCodexAppContext } from './utils/codex-app-context.js';
 import { resolveCodexAppFinalTurnIdentity } from './adapters/cli/codex-app-turn.js';
-import { runnerFinalOutcome } from './services/runner-final-outcome.js';
+import { appRunnerSilenceDisposition, runnerFinalOutcome } from './services/runner-final-outcome.js';
+import { isNativeGatewayCoreProcess } from './core/runtime-mode.js';
 import { MinimaxFinalReceiver } from './services/minimax-final-control.js';
 import { RunnerControlDecoder } from './adapters/cli/runner-control-channel.js';
 import {
@@ -17042,6 +17043,7 @@ function maybeEmitStructuredRateLimit(events: readonly TranscriptEvent[]): void 
       content: currentUsageLimitSnapshot(),
       status: 'limited',
       usageLimit,
+      structuredNativeGatewayLimit: true,
       ...backgroundWaitPayload(),
       turnId: currentBotmuxTurnId,
       dispatchAttempt: currentBotmuxDispatchAttempt,
@@ -20628,6 +20630,7 @@ function maybeEmitCodexStructuredRateLimit(events: readonly CodexBridgeEvent[]):
       content: currentUsageLimitSnapshot(),
       status: 'limited',
       usageLimit,
+      structuredNativeGatewayLimit: true,
       ...backgroundWaitPayload(),
       turnId: currentBotmuxTurnId,
       dispatchAttempt: currentBotmuxDispatchAttempt,
@@ -27414,7 +27417,11 @@ async function handleTrustedCodexAppMarker(
     // The app-server runner timestamps its own completion; prefer that instant
     // over "whenever this worker got around to handling the marker". The clock
     // clamps it to now, so a skewed runner cannot mint a future completion.
-    emitTurnTerminal(turnId, outcome.status, outcome.errorCode, dispatchAttempt, undefined, undefined, completedAtMs);
+    // A native gateway's core settles a silent runner final through this flag
+    // (appRunnerSilenceDisposition); every other process passes undefined, as before.
+    emitTurnTerminal(turnId, outcome.status, outcome.errorCode, dispatchAttempt, appRunnerSilenceDisposition({
+      finalContent, status: outcome.status, nativeGatewayCore: isNativeGatewayCoreProcess(),
+    }), undefined, completedAtMs);
     return true;
   }
   rejectCodexAppControlMarker(`unsupported signed ${kind}`);

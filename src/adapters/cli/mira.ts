@@ -2,6 +2,7 @@ import type { CliAdapter, PtyHandle } from './types.js';
 import { writeRunnerInput } from './runner-input.js';
 import { runnerArgv0 } from '../../core/self-spawn.js';
 import { resolveRunnerPath } from './runner-path.js';
+import { runnerIdentityArgs } from './shared-hints.js';
 
 function pushOpt(args: string[], key: string, value: string | undefined): void {
   if (value === undefined || value.length === 0) return;
@@ -13,14 +14,14 @@ export function createMiraAdapter(_pathOverride?: string): CliAdapter {
     id: 'mira',
     resolvedBin: process.execPath,
 
-    buildArgs({ sessionId, resume, resumeSessionId, botName, botOpenId, locale }) {
+    buildArgs({ sessionId, resume, resumeSessionId, botName, botOpenId, larkAppId, locale }) {
       const args = [
         runnerArgv0('mira-runner', resolveRunnerPath('mira-runner.js')),
         '--session-id', sessionId,
       ];
       if (resume && resumeSessionId) args.push('--mira-session-id', resumeSessionId);
-      pushOpt(args, '--bot-name', botName);
-      pushOpt(args, '--bot-open-id', botOpenId);
+      // Native gateway core: display name only, never an open_id (runnerIdentityArgs).
+      args.push(...runnerIdentityArgs(botName, botOpenId, larkAppId));
       pushOpt(args, '--locale', locale);
       return args;
     },
