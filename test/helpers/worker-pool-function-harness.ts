@@ -55,6 +55,10 @@ const WORKER_POOL_WEAK_CONTAINERS: Record<string, () => WeakMap<object, any> | W
   inFlightStreamingCardPatchVisibleStatus: () => new WeakMap(),
   completedTerminalTurns: () => new WeakMap(),
   postTerminalDirectSubmitSessions: () => new WeakSet(),
+  // Streaming-card idempotent-uuid module-scope state (worker-pool.ts). Sliced
+  // lifecycle closures such as clearWorkerRuntimeProvenance reach these.
+  activeReadyFallbackTokens: () => new WeakMap(),
+  dedupReconcileRetryTimers: () => new WeakMap(),
 };
 
 function resolvePoolDependency(scope: Record<string, any>, key: string | symbol): unknown {
@@ -104,7 +108,7 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
     'recordLaunchModel', 'assistantLiveInputAdmission', 'assistantTransferInputDeliveryAllowed',
     'releaseHeldCotMessage', 'isReplayOfHeldCotTerminal', 'isSynthesizedBackgroundTurnId', 'finalizeOrHoldCotMessage',
     'requiredReplyCotHoldKey', 'settleRequiredReplyBackground', 'settleRequiredReplyCotMessage',
-    'failRequiredReplyCotHolds', 'clearWorkerRuntimeProvenance'].includes(key)) {
+    'failRequiredReplyCotHolds', 'clearWorkerRuntimeProvenance', 'clearDedupReconcileRetryTimer'].includes(key)) {
     return scope[key] ??= loadWorkerPoolFunction(key, scope);
   }
   return (globalThis as any)[key];
