@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
+import { createAntigravityAdapter, isAntigravityInterruptedScreen, parseAntigravityFooterBackgroundTasks } from '../src/adapters/cli/antigravity.js';
 import { bridgeSpecFor } from '../src/adapters/cli/registry.js';
 import {
   antigravityRecoveryBindPath,
@@ -13,11 +14,14 @@ import {
 } from '../src/services/antigravity-bridge-decision.js';
 import {
   drainAntigravityTranscript,
+  hasAntigravityPendingTasks,
   mapAntigravityCompactOffsetToFull,
   resolveAntigravityTranscriptPath,
   type AntigravityTranscriptState,
 } from '../src/services/antigravity-transcript.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { busyProbeRegion } from '../src/utils/busy-probe.js';
+import { stripAnsiScreenText } from '../src/utils/idle-detector.js';
 
 const SIBLING_ID = '61fc8ef7-1886-40af-9bac-c6ee8f8d172e';
 const REAL_ID = 'a4331552-f261-4f1f-a460-e15e7f2fe0ea';
@@ -191,14 +195,13 @@ describe('Antigravity startup session discovery & zero-prompt bridge rebind', ()
       nativeSessionForkPending: () => false,
       resolveFileBridgePath: (_cliId: string, opts: { sessionId?: string }) =>
         resolveAntigravityTranscriptPath(opts.sessionId, { brainDir }) ?? undefined,
-      structuredBridgeIngestPath: (path: string, offset: number, opts?: { flushAntigravityTrailingFinal?: boolean; retireAntigravityPendingTurns?: boolean }) => {
+      structuredBridgeIngestPath: (path: string, offset: number, opts?: { flushAntigravityTrailingFinal?: boolean }) => {
         const res = drainAntigravityTranscript(
           path,
           offset,
           (scope.structuredBridgeDriverState as AntigravityTranscriptState | undefined) ?? {},
           {
             flushTrailingFinal: opts?.flushAntigravityTrailingFinal,
-            retirePendingTurns: opts?.retireAntigravityPendingTurns,
             adoptMode: scope.lastInitConfig?.adoptMode === true,
           },
         );
@@ -309,14 +312,13 @@ describe('Antigravity startup session discovery & zero-prompt bridge rebind', ()
       nativeSessionForkPending: () => false,
       resolveFileBridgePath: (_cliId: string, opts: { sessionId?: string }) =>
         resolveAntigravityTranscriptPath(opts.sessionId, { brainDir }) ?? undefined,
-      structuredBridgeIngestPath: (path: string, offset: number, opts?: { flushAntigravityTrailingFinal?: boolean; retireAntigravityPendingTurns?: boolean }) => {
+      structuredBridgeIngestPath: (path: string, offset: number, opts?: { flushAntigravityTrailingFinal?: boolean }) => {
         const res = drainAntigravityTranscript(
           path,
           offset,
           (scope.structuredBridgeDriverState as AntigravityTranscriptState | undefined) ?? {},
           {
             flushTrailingFinal: opts?.flushAntigravityTrailingFinal,
-            retirePendingTurns: opts?.retireAntigravityPendingTurns,
             adoptMode: scope.lastInitConfig?.adoptMode === true,
           },
         );
@@ -531,14 +533,13 @@ describe('Antigravity bridge ticker and spawn observer honor the adapter session
         }
         return undefined;
       },
-      structuredBridgeIngestPath: (path: string, offset: number, opts?: { flushAntigravityTrailingFinal?: boolean; retireAntigravityPendingTurns?: boolean }) => {
+      structuredBridgeIngestPath: (path: string, offset: number, opts?: { flushAntigravityTrailingFinal?: boolean }) => {
         const res = drainAntigravityTranscript(
           path,
           offset,
           (scope.structuredBridgeDriverState as AntigravityTranscriptState | undefined) ?? {},
           {
             flushTrailingFinal: opts?.flushAntigravityTrailingFinal,
-            retirePendingTurns: opts?.retireAntigravityPendingTurns,
             adoptMode: scope.lastInitConfig?.adoptMode === true,
           },
         );
@@ -902,7 +903,7 @@ describe('Antigravity bridge ticker and spawn observer honor the adapter session
     expect(h.queue.peek()).toEqual([]);
   });
 
-  it('threads retirement through the real ingest path and adapter for managed buffered input', () => {
+  it('discards waiting narration through the real ingest path when managed input supersedes a pending turn', () => {
     const path = join(root, 'managed-retirement.jsonl');
     writeFileSync(path, '');
     writeAntigravityUserStep(path, 1, 'Old request');
@@ -925,12 +926,72 @@ describe('Antigravity bridge ticker and spawn observer honor the adapter session
     const ingest = loadWorkerFunction<(
       path: string,
       offset: number,
-      opts?: { retireAntigravityPendingTurns?: boolean },
     ) => ReturnType<typeof drainAntigravityTranscript>>('structuredBridgeIngestPath', scope);
-    const retired = ingest(path, first.newOffset, { retireAntigravityPendingTurns: true });
+    const retired = ingest(path, first.newOffset);
     expect(retired.events.map(event => event.kind)).toEqual(['turn_aborted', 'user']);
     expect(retired.events[0]).toMatchObject({ text: '' });
     expect(retired.events[1]).toMatchObject({ text: 'Intermediate request' });
+  });
+
+  it.each(['held answer', 'running tool'])('retires an interrupted %s without publishing a reply', phase => {
+    const path = join(root, 'interrupted.jsonl');
+    const queue = new CodexBridgeQueue();
+    queue.mark('om_first', 'First request', Date.now());
+    writeAntigravityUserStep(path, 1, 'First request');
+    if (phase === 'held answer') writeAntigravityFinalStep(path, 2, 'A provisional plan');
+    const initial = drainAntigravityTranscript(path, 0);
+    queue.ingest(initial.events);
+    const interruptedScreen = [
+      '● Bash(sleep 30)', '  ⎿  Interrupted · What should Antigravity CLI do instead?',
+      '────────────────────────', '>', '────────────────────────', '? for shortcuts',
+    ].join('\n');
+    expect(isAntigravityInterruptedScreen(interruptedScreen)).toBe(true);
+    let screen = 'Working…\nesc to cancel';
+    const scope: Record<string, any> = {
+      structuredBridgeIs: (id: string) => id === 'antigravity',
+      structuredBridgeDriverState: initial.state,
+      antigravityBridgeState: () => scope.structuredBridgeDriverState,
+      hasAntigravityPendingTasks,
+      antigravityPendingRebind: false,
+      antigravityQuietCandidateKey: undefined,
+      antigravityQuietCandidateCompleteOffset: undefined,
+      antigravityQuietCandidateFirstSeenAtMs: undefined,
+      antigravityObservedWorkingOwner: undefined,
+      codexBridgeOffset: initial.newOffset,
+      codexBridgePendingTail: initial.pendingTail,
+      backend: {},
+      backendScreenEvidenceIsAuthoritativeForMutation: () => true,
+      cliAdapter: createAntigravityAdapter(),
+      idleDetector: undefined,
+      shouldDeferAntigravityQuietFinalForProgramStatus: () => false,
+      STALE_PROGRAM_STATUS_QUIET_MS: 1000,
+      captureBackendScreen: () => screen,
+      busyProbeRegion, stripAnsiScreenText, isAntigravityInterruptedScreen, parseAntigravityFooterBackgroundTasks,
+      codexBridgeQueue: queue,
+      emitReadyCodexTurns: () => {},
+      codexBridgeIngest: () => { throw new Error('Interrupted text must not be flushed'); },
+      log: () => {},
+    };
+    const tick = loadWorkerFunction<() => void>('maybeFlushAntigravityTrailingFinalOnQuietTick', scope);
+    tick();
+    screen = interruptedScreen;
+    tick();
+    expect(scope.structuredBridgeDriverState.provisionalFinal).toBeUndefined();
+    expect(queue.drainEmittable()).toMatchObject([{
+      turnId: 'om_first', finalText: '', terminalStatus: 'ambiguous',
+      terminalErrorCode: 'antigravity_interrupted',
+    }]);
+    queue.mark('om_next', 'Next request', Date.now());
+    writeAntigravityUserStep(path, 3, 'Next request');
+    writeAntigravityFinalStep(path, 4, 'The next answer');
+    const next = drainAntigravityTranscript(path, initial.newOffset, scope.structuredBridgeDriverState);
+    scope.structuredBridgeDriverState = next.state;
+    scope.codexBridgeOffset = next.newOffset;
+    queue.ingest(next.events);
+    tick();
+    tick();
+    expect(queue.drainEmittable()).toEqual([]);
+    expect(scope.structuredBridgeDriverState.provisionalFinal?.text).toBe('The next answer');
   });
 
   it('ticker stays unbound through the startup window instead of pid-probing a sibling DB, then binds the streamed conversation', async () => {

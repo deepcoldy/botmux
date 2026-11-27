@@ -7,6 +7,7 @@
  * is now a pure function.
  */
 import { describe, it, expect } from 'vitest';
+import { hasStructuredBridgeTurnTerminal } from '../src/services/turn-terminal-capability.js';
 import {
   antigravityRecoveryBindPath,
   decideAntigravityFullUpgrade,
@@ -17,6 +18,24 @@ import {
 
 const A = '/home/u/.gemini/antigravity-cli/brain/A/.system_generated/logs/transcript.jsonl';
 const B = '/home/u/.gemini/antigravity-cli/brain/B/.system_generated/logs/transcript.jsonl';
+
+describe('Antigravity terminal reply fallback', () => {
+  it('collects ordinary turns from a supported local terminal', () => {
+    expect(hasStructuredBridgeTurnTerminal({ cliId: 'antigravity', backendType: 'tmux' })).toBe(true);
+    expect(hasStructuredBridgeTurnTerminal({ cliId: 'antigravity', backendType: 'pty' })).toBe(true);
+  });
+
+  it('defers to existing reply paths where the terminal transcript cannot be confirmed', () => {
+    expect(hasStructuredBridgeTurnTerminal({ cliId: 'antigravity', backendType: 'zmx' })).toBe(false);
+    expect(hasStructuredBridgeTurnTerminal({ cliId: 'antigravity', backendType: 'orca' })).toBe(false);
+    expect(hasStructuredBridgeTurnTerminal({ cliId: 'antigravity', backendType: 'remote-runner' })).toBe(false);
+    expect(hasStructuredBridgeTurnTerminal({ cliId: 'antigravity', backendType: 'tmux', scratch: true })).toBe(false);
+    expect(hasStructuredBridgeTurnTerminal({
+      cliId: 'antigravity', backendType: 'tmux', adapter: { runnerFramedInput: true },
+    })).toBe(false);
+    expect(hasStructuredBridgeTurnTerminal({ cliId: 'antigravity', adoptMode: true })).toBe(true);
+  });
+});
 
 describe('decideAntigravityTickerAction', () => {
   it('unbound + pending sid resolves → initial bind', () => {

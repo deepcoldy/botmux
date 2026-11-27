@@ -621,7 +621,7 @@ export const antigravityBridgeSpec: StructuredBridgeSpec = {
     (ctx.state as AntigravityTranscriptState | undefined) ?? {},
     {
       flushTrailingFinal: ctx.flushTrailingFinal,
-      retirePendingTurns: ctx.retirePendingTurns,
+      expectedTrailingFinal: ctx.expectedTrailingFinal,
       adoptMode: ctx.adoptMode,
     },
   ),

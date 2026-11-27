@@ -14115,6 +14115,7 @@ let ompQuietCandidateCompleteOffset: number | undefined;
 let antigravityQuietCandidateKey: string | undefined;
 let antigravityQuietCandidateCompleteOffset: number | undefined;
 let antigravityQuietCandidateFirstSeenAtMs: number | undefined;
+let antigravityObservedWorkingOwner: CodexPendingTurn | undefined;
 /** Last compact→full offset mapping attempt (bound path, offset, full log
  *  size) — a mapping that failed is not re-read every tick until one of them
  *  moves. */
@@ -18291,6 +18292,7 @@ function codexBridgeFallbackActive(): boolean {
     adapter: cliAdapter,
     adoptMode: lastInitConfig?.adoptMode === true,
     zeroPrompt: lastInitConfig?.promptInjection === 'none',
+    backendType: effectiveBackendType,
     scratch: lastResolvedSandboxMode === 'scratch',
   });
 }
@@ -18623,7 +18625,7 @@ function structuredBridgeIngestPath(
   opts: {
     flushOmpTrailingFinal?: boolean;
     flushAntigravityTrailingFinal?: boolean;
-    retireAntigravityPendingTurns?: boolean;
+    expectedAntigravityTrailingFinal?: { uuid: string; offset: number };
   } = {},
 ): StructuredBridgeDrainResult {
   const spec = bridgeSpecFor(lastInitConfig?.cliId);
@@ -18654,7 +18656,7 @@ function structuredBridgeIngestPath(
       // The two flags are never set for the "other" driver: every caller sits
       // under its own structuredBridgeIs('oh-my-pi' | 'antigravity') guard.
       flushTrailingFinal: opts.flushOmpTrailingFinal || opts.flushAntigravityTrailingFinal,
-      retirePendingTurns: opts.retireAntigravityPendingTurns,
+      expectedTrailingFinal: opts.expectedAntigravityTrailingFinal,
     });
     if (spec.stateCommit === 'drain') structuredBridgeDriverState = result.state;
     if ((nativeGoalSourcePath !== path || nativeGoalGeneration !== cliSpawnGeneration) && nativeGoalCardEnabled()) {
@@ -20467,6 +20469,7 @@ function codexBridgeIngest(opts: {
   flushOmpTrailingFinal?: boolean;
   flushAntigravityTrailingFinal?: boolean;
   retireAntigravityPendingTurns?: boolean;
+  expectedAntigravityTrailingFinal?: { uuid: string; offset: number };
   onDrainedEvents?: (events: readonly CodexBridgeEvent[]) => void;
 } = {}): boolean {
   // An authoritative rebind is pending: freeze the possibly-misbound file.
@@ -20507,7 +20510,7 @@ function codexBridgeIngest(opts: {
   const result = structuredBridgeIngestPath(codexBridgeRolloutPath, codexBridgeOffset, {
     flushOmpTrailingFinal: opts.flushOmpTrailingFinal,
     flushAntigravityTrailingFinal: opts.flushAntigravityTrailingFinal,
-    retireAntigravityPendingTurns: opts.retireAntigravityPendingTurns,
+    expectedAntigravityTrailingFinal: opts.expectedAntigravityTrailingFinal,
   });
   codexBridgeOffset = result.newOffset;
   codexBridgePendingTail = result.pendingTail;
@@ -20721,13 +20724,45 @@ function maybeUpgradeAntigravityBridgeToFull(): void {
 function maybeFlushAntigravityTrailingFinalOnQuietTick(): void {
   if (!structuredBridgeIs('antigravity')) return;
   if (antigravityPendingRebind) {
+    antigravityObservedWorkingOwner = undefined;
     antigravityQuietCandidateKey = undefined;
     antigravityQuietCandidateCompleteOffset = undefined;
     antigravityQuietCandidateFirstSeenAtMs = undefined;
     return;
   }
-  const candidate = antigravityBridgeState().provisionalFinal;
-  if (!candidate || hasAntigravityPendingTasks(antigravityBridgeState())) {
+  const state = antigravityBridgeState();
+  const candidate = state.provisionalFinal;
+  const owner = codexBridgeQueue.peek().find(turn => turn.started && turn.finalText === undefined
+    && (!state.sourceTurnId || state.sourceTurnId === turn.sourceTurnId));
+  let screen: string | undefined;
+  if ((candidate || owner) && backend && backendScreenEvidenceIsAuthoritativeForMutation()
+    && cliAdapter?.busyPattern && cliAdapter.readyPattern) {
+    try { screen = captureBackendScreen(backend); }
+    catch (err: any) { log(`Antigravity quiet-final viewport capture failed: ${err.message}`); }
+  }
+  const busy = !!screen && cliAdapter?.busyPattern?.test(busyProbeRegion(screen));
+  if (busy) antigravityObservedWorkingOwner = owner;
+  if (screen && !busy && isAntigravityInterruptedScreen(screen)) {
+    // A surviving viewport can show the previous turn's interrupt after the
+    // next input was recorded. Only retire a turn we observed working.
+    if (!owner || antigravityObservedWorkingOwner !== owner) return;
+    const { ignoredDaemonTaskIds } = state;
+    structuredBridgeDriverState = ignoredDaemonTaskIds ? { ignoredDaemonTaskIds } : {};
+    antigravityObservedWorkingOwner = undefined;
+    codexBridgeQueue.ingest([{
+      uuid: `${owner.turnId}:${owner.dispatchAttempt ?? 0}:antigravity_interrupted`,
+      timestampMs: Date.now(),
+      kind: 'turn_aborted',
+      text: '',
+      sourceSessionId: owner.sourceSessionId,
+      sourceTurnId: owner.sourceTurnId,
+      terminalErrorCode: 'antigravity_interrupted',
+    }]);
+    emitReadyCodexTurns();
+    return;
+  }
+  if (antigravityObservedWorkingOwner !== owner) antigravityObservedWorkingOwner = undefined;
+  if (!candidate || hasAntigravityPendingTasks(state)) {
     // No candidate, or the transcript itself proves a background task is still
     // outstanding (the TUI shows the ready composer during that wait — do not
     // arm the quiet latch on screen evidence the transcript contradicts).
@@ -20745,9 +20780,9 @@ function maybeFlushAntigravityTrailingFinalOnQuietTick(): void {
     antigravityQuietCandidateFirstSeenAtMs = now;
     return;
   }
-  if (codexBridgePendingTail || !backend
-    || !backendScreenEvidenceIsAuthoritativeForMutation()
-    || !cliAdapter?.busyPattern || !cliAdapter.readyPattern) return;
+  if (codexBridgePendingTail || !screen || busy
+    || !cliAdapter?.readyPattern?.test(stripAnsiScreenText(screen))
+    || (parseAntigravityFooterBackgroundTasks(screen) ?? 0) > 0) return;
   if (shouldDeferAntigravityQuietFinalForProgramStatus({
     blocked: !!idleDetector?.programStatusBlock(),
     heldWorking: idleDetector?.programStatusHeldWorking() === true,
@@ -20759,23 +20794,13 @@ function maybeFlushAntigravityTrailingFinalOnQuietTick(): void {
   })) {
     return;
   }
-  try {
-    const screen = captureBackendScreen(backend);
-    if (!screen) return;
-    if (cliAdapter.busyPattern.test(busyProbeRegion(screen))) return;
-    if (!cliAdapter.readyPattern.test(stripAnsiScreenText(screen))) return;
-    if ((parseAntigravityFooterBackgroundTasks(screen) ?? 0) > 0) return;
-  } catch (err: any) {
-    log(`Antigravity quiet-final viewport capture failed: ${err.message}`);
-    return;
-  }
-
   antigravityQuietCandidateKey = undefined;
   antigravityQuietCandidateCompleteOffset = undefined;
   antigravityQuietCandidateFirstSeenAtMs = undefined;
   let flushedCandidateFinal = false;
   codexBridgeIngest({
     flushAntigravityTrailingFinal: true,
+    expectedAntigravityTrailingFinal: { uuid: key, offset: codexBridgeOffset },
     onDrainedEvents: events => {
       flushedCandidateFinal = events.some(
         event => event.kind === 'assistant_final' && event.uuid === key,
