@@ -5,7 +5,7 @@ import { resolveCommand } from './registry.js';
 import { detectModelsViaExec } from './model-catalog-json.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { wrapBracketedPaste } from './tui-input.js';
-import { TMUX_INITIAL_PROMPT_ARG_BUDGET, type CliAdapter, type ModelProbeOptions, type PtyHandle, type ResumableSession } from './types.js';
+import { TMUX_INITIAL_PROMPT_ARG_BUDGET, type CliAdapter, type CliModelDetectionOptions, type PtyHandle, type ResumableSession } from './types.js';
 import { opencodeDbPath } from '../../services/opencode-paths.js';
 
 import { delay, scaleMs } from '../../utils/timing.js';
@@ -736,7 +736,7 @@ export function createOpenCodeLikeAdapter(pathOverride: string | undefined, runt
     // 命令始终按 login shell 解析（resolvedBin）。子进程环境默认沿用本进程；
     // 只有调用方声明 isolatedEnv（为另行启动的 core 探测，如企微托管 core）
     // 时才改用传入的 env。
-    async detectModels(options?: ModelProbeOptions): Promise<readonly string[] | null> {
+    async detectModels(options?: CliModelDetectionOptions): Promise<readonly string[] | null> {
       const env = options?.isolatedEnv ? options.env : undefined;
       return detectModelsViaExec(this.resolvedBin, runtime.modelListArgs, parseModelList, env);
     },

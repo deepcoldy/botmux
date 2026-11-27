@@ -360,7 +360,7 @@ import { resolveSubstituteCardControl, type SubstituteCardControl } from '../im/
 import { isLarkContentAuditError, larkErrorCode } from '../im/lark/content-audit.js';
 import { contentAuditRedactionOutcome, sendWithContentAuditRedaction } from '../im/lark/content-audit-redaction.js';
 import { LARK_CODE_CARD_CONTENT_REJECTED, LARK_CODE_MESSAGE_CONTENT_TOO_LONG } from '../im/lark/lark-errors.js';
-import { isRetryableLarkError } from '../im/lark/api-gate.js';
+import { getLarkGatePriorAttemptErrors, isRetryableLarkError } from '../im/lark/api-gate.js';
 import { resolvePricingConfig, type ResolvedModelPricing } from '../services/model-pricing.js';
 import type { BotConfig } from '../bot-registry.js';
 import { RestartCoordinator, type RestartObserver, type RestartSource } from './restart-coordinator.js';
@@ -25487,16 +25487,18 @@ function setupWorkerHandlers(
                 );
               }
               const alreadyDelivered = ds.lastBridgeEmittedUuid === finalOutputDedupeKey(ds, msg);
+              const ownsNativeDelivery = () => ownsCodexAppFinalDelivery(ds,
+                outputControl?.record.origin ? { ...msg, sessionOutputOrigin: outputControl.record.origin } : msg,
+                sessionController, contractWorker, () => ownsWorkerSession() && !isSessionTransferring(ds), ownsLifecycleMutation);
               const owned = deliverySuppressed || !msg.content.trim() || alreadyDelivered
                 ? true
                 : outputControl
-                  ? !!await deliverFinalOutputWithOutputControl(ds, msg, t, outputControl,
+                  ? !!await deliverFinalOutputWithOutputControl(ds, msg, t,
+                      { ...outputControl, owns: () => outputControl.owns() && ownsNativeDelivery() },
                       outputControl.record.sink.kind === 'im' ? outputControl.record.sink.context.target : preview.settledEntry.replyTarget)
                   : await new Promise<boolean>(resolve => {
-                    deliverFinalOutput(ds, msg, t, 0, resolve,
-                      () => ownsCodexAppFinalDelivery(ds, msg, sessionController, contractWorker,
-                        () => ownsWorkerSession() && !isSessionTransferring(ds), ownsLifecycleMutation),
-                      preview.settledEntry.replyTarget);
+                    deliverFinalOutput(ds, msg, t, 0, (owned, _messageId, withdrawn) => resolve(owned || !!withdrawn),
+                      ownsNativeDelivery, preview.settledEntry.replyTarget);
                   });
               if (!owned) return false;
 
@@ -33233,8 +33235,10 @@ async function deliverFinalOutputWithOutputControl(
       }
     }
     return new Promise((resolve, reject) => {
-      try { deliverFinalOutput(ds, msg, t, 0, (ok, messageId) => {
-        finish(); resolve(ok ? { status: control.rejectedReason ? 'suppressed' : messageId || control.record.sink.kind === 'doc' ? 'delivered' : control.record.sink.kind === 'http' ? 'captured' : 'suppressed', ...(messageId ? { messageId } : {}), ...(control.rejectedReason ? { owner: `rejected:${control.rejectedReason}` } : {}) } : undefined);
+      try { deliverFinalOutput(ds, msg, t, 0, (ok, messageId, withdrawn) => {
+        finish();
+        if (withdrawn) { reject(withdrawn); return; }
+        resolve(ok ? { status: control.rejectedReason ? 'suppressed' : messageId || control.record.sink.kind === 'doc' ? 'delivered' : control.record.sink.kind === 'http' ? 'captured' : 'suppressed', ...(messageId ? { messageId } : {}), ...(control.rejectedReason ? { owner: `rejected:${control.rejectedReason}` } : {}) } : undefined);
       }, control.owns, target, undefined, frozenInitiator, undefined, undefined, control); }
       catch (error) { finish(); reject(error); }
     });
@@ -33249,7 +33253,14 @@ async function deliverFinalOutputWithOutputControl(
       if (!receipt?.messageId) throw new Error('output_publication_unconfirmed');
       return receipt.messageId;
     }, { fenced: true, providerUuid: msg.codexAppSettlement ? `ca_${msg.codexAppSettlement.dispatchId}`.slice(0, 50) : bridgeFinalOutputUuid(ds, msg), reuseExistingFinal: true,
-      beforeDispatch: () => { if (!control.owns()) throw new Error('output_authority_changed'); } });
+      beforeDispatch: () => { if (!control.owns()) throw new Error('output_authority_changed'); },
+      noSideEffect: error => error instanceof MessageWithdrawnError,
+    }).catch(error => {
+      // The ledger preserves any earlier uncertain publication as FinalPublicationUnknownError.
+      if (error instanceof MessageWithdrawnError) return undefined;
+      throw error;
+    });
+  if (!publication) return { status: 'suppressed', owner: 'rejected:message_withdrawn' };
   return receipt ?? { status: 'delivered', messageId: publication.messageId };
 }
 
@@ -33878,7 +33889,7 @@ function deliverFinalOutput(
   msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
   t: string,
   attempt: number,
-  onComplete?: (owned: boolean, messageId?: string) => void,
+  onComplete?: (owned: boolean, messageId?: string, withdrawn?: MessageWithdrawnError) => void,
   isStillOwned: () => boolean = () => true,
   frozenReplyTarget?: FrozenSessionReplyTarget,
   frozenRenderSnapshot?: ReplyCardRenderSnapshot,
@@ -34981,6 +34992,14 @@ function deliverFinalOutput(
         const deliveredParts = partialResultMessages();
         observeTurnResultDelivery(resultBinding, { status: 'unavailable', reason: 'message_withdrawn' },
           resultReceipt(deliveredParts.length ? 'partial' : 'failed', deliveredParts, 'message_withdrawn'));
+        // A first-attempt withdrawal can settle the native turn. Earlier attempts
+        // or delivered fragments still need their own publication reconciliation.
+        if (msg.codexAppSettlement && !managedReceiver && !resolveDocCommentTarget(ds, msg.turnId)
+          && attempt === 0 && !deliveredParts.length && !getLarkGatePriorAttemptErrors(err).length) {
+          logger.info(`[${t}] Codex App final reply target withdrawn; finishing turn without IM delivery`);
+          onComplete?.(false, undefined, err);
+          return;
+        }
         // Withdrawal is permanent for this target, but it is not explicit
         // abandon. Keep an unsettled FIFO owner recoverable; only ledger-empty
         // sessions may commit the dedupe marker and auto-close.

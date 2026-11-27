@@ -1,7 +1,7 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { resolveCommand } from './registry.js';
-import type { CliAdapter, ModelProbeOptions } from './types.js';
+import type { CliAdapter, CliModelDetectionOptions } from './types.js';
 import { delay } from '../../utils/timing.js';
 import { readZcodeModelChoices } from '../../services/zcode-models.js';
 import { readZcodeSubmissionReceipt, readZcodeSubmissionReceiptsAfter, zcodeInputSha256, zcodeNativeSessionExists, zcodeSessionDbPath } from '../../services/zcode-session.js';
@@ -169,7 +169,7 @@ export function createZcodeAdapter(pathOverride?: string): CliAdapter {
     // Reads this process's provider config, like `modelChoices`. Only a caller
     // probing for a separately launched core (isolatedEnv, e.g. the WeCom
     // managed core) resolves the config path from the given env instead.
-    async detectModels(options?: ModelProbeOptions) {
+    async detectModels(options?: CliModelDetectionOptions) {
       const env = options?.isolatedEnv ? options.env : undefined;
       try {
         return readZcodeModelChoices(env);

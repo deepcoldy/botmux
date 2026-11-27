@@ -23,7 +23,7 @@ import {
 import { createCliAdapterSync, rawCliExecutable, resolveCommand } from '../adapters/cli/registry.js';
 import { CLI_MODEL_CHOICES } from '../adapters/cli/model-choices.js';
 import type { DebugModelCapabilities } from '../adapters/cli/model-catalog-json.js';
-import type { CliAdapter, CliId, ModelProbeOptions } from '../adapters/cli/types.js';
+import type { CliAdapter, CliId, CliModelDetectionOptions } from '../adapters/cli/types.js';
 import { detectAidenCodexModels } from './aiden-model-catalog.js';
 import { codexConfigIdentity } from './codex-service-tier-catalog.js';
 import { createHash } from 'node:crypto';
@@ -55,6 +55,8 @@ export interface DetectModelsOptions {
   readonly runtimeContext?: string;
   /** Bot-specific environment for a capability probe. */
   readonly probeEnv?: NodeJS.ProcessEnv;
+  /** Botmux-owned global/Bot overlay, kept separate from inherited probeEnv. */
+  readonly probeSettingsEnv?: NodeJS.ProcessEnv;
   /**
    * `probeEnv` belongs to a separately launched core (the WeCom managed core),
    * not to this process: every probe must run in it and inherit nothing from
@@ -160,10 +162,15 @@ async function detectModelCatalogWith(
     ?? ((cliId: CliId, pathOverride?: string) => createCliAdapterSync(cliId, pathOverride));
   try {
     const opt = lookupCliSelection(key);
-    // Only ttadk owns its model list. Other registered wrappers (including
-    // cjadk) retain the underlying adapter's live slug discovery; Aiden Codex
-    // is handled by its dedicated detector below.
+    // Only ttadk owns its model list. Other registered wrappers keep the
+    // underlying adapter's live slug discovery — except the Claude gateways
+    // below; Aiden Codex is handled by its dedicated detector.
     if (!opt || isTtadkWrapper(opt.wrapperCli)) return null;
+    // Claude 网关 wrapper（aiden-x-claude、cjadk-x-claude）的模型集合由网关定义。
+    // 原生 claude-code 探测器没有 Bot 时会退到宿主机的官方账户目录，给出的列表
+    // 与网关无关，因此这类 wrapper 一律回退静态候选（与 ClaudeFamilyVariant 的
+    // 注释一致；cli dispatch 侧有同一条守卫）。
+    if (opt.cliId === 'claude-code' && opt.wrapperCli) return null;
 
     // Pi reads local configuration in the effective environment, including
     // ambient HOME/agent-dir when no Bot-specific probe env was supplied.
@@ -218,8 +225,11 @@ async function detectModelCatalogWith(
               ? await adapter.detectModelCapabilities({ env: opts?.probeEnv })
               : undefined;
             const aidenDetector = opts?.aidenCodexDetector ?? detectAidenCodexModels;
-            const adapterProbeOptions: ModelProbeOptions = {
+            const adapterProbeOptions: CliModelDetectionOptions = {
               env: probeEnv,
+              ...(opts?.probeSettingsEnv && Object.keys(opts.probeSettingsEnv).length > 0
+                ? { settingsEnv: opts.probeSettingsEnv }
+                : {}),
               ...(isolated ? { isolatedEnv: true } : {}),
             };
             const models = opt.key === 'aiden-x-codex'
