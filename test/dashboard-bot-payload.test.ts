@@ -6,6 +6,16 @@ import { invalidateGlobalConfigCache } from '../src/global-config.js';
 import { botDefaultsPayload, botSummaryPayload, brandMapByAppId, mergeBotOncallFields, sparseOverridesFromRawBotConfig, withConfiguredCliId } from '../src/dashboard/bot-payload.js';
 
 describe('dashboard bot payload helpers', () => {
+  it('exposes whether command triggers and blocked users are customized without their contents', () => {
+    const bot = { larkAppId: 'demo-bot' };
+    const row = botDefaultsPayload(bot, { commandTriggersConfigured: true, blockedUsersConfigured: true,
+      commandTriggers: { commands: ['demo'] }, blockedUsers: ['demo-user'] });
+    expect(row).toMatchObject({ commandTriggersConfigured: true, blockedUsersConfigured: true });
+    expect(row).not.toHaveProperty('commandTriggers');
+    expect(row).not.toHaveProperty('blockedUsers');
+    expect(botDefaultsPayload(bot, {})).toMatchObject({ commandTriggersConfigured: false, blockedUsersConfigured: false });
+  });
+
   it.each([
     [false, false],
     [true, true],

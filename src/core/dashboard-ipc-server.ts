@@ -12037,9 +12037,12 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     larkBotName = bot.botName ?? null;
   } catch { /* none */ }
   const sandboxPathsForDashboard = sandboxStore.getBotSandboxPaths(cachedLarkAppId);
+  const currentBotConfig = getBot(cachedLarkAppId).config;
   jsonRes(res, 200, {
     larkAppId: cachedLarkAppId,
-    apiOnly: getBot(cachedLarkAppId).config.apiOnly === true,
+    apiOnly: currentBotConfig.apiOnly === true,
+    commandTriggersConfigured: Boolean(currentBotConfig.commandTriggers?.commands.length),
+    blockedUsersConfigured: Boolean(currentBotConfig.blockedUsers?.length),
     botName: getBotName(),
     displayName,
     larkBotName,

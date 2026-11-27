@@ -9584,6 +9584,8 @@ esac
           }
           createRoot(document.getElementById('root')).render(<App/>);
         `, resolveDir: process.cwd(), loader: 'tsx' },
+        // This fixture serves style.css separately and never renders the plugin market.
+        loader: { '.css': 'empty' },
         bundle: true, write: false, platform: 'browser', format: 'esm', minify: true,
       });
       const server = createServer((req, res) => {
@@ -9928,6 +9930,8 @@ esac
           }
           createRoot(document.getElementById('root')).render(<App/>);
         `, resolveDir: process.cwd(), loader: 'tsx' },
+        // This isolated control fixture never renders the plugin market.
+        loader: { '.css': 'empty' },
         bundle: true, write: false, platform: 'browser', format: 'esm', minify: true,
       });
       const server = createServer((req, res) => {
