@@ -4,6 +4,23 @@ import { basename, dirname, join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { FileLockTimeoutError, withFileLock } from '../utils/file-lock.js';
 import { PROVIDER_TTL_MS } from '../workflows/shared/provider-reconciler.js';
+import { buildBridgeSendMarkerContent } from './bridge-fallback-gate.js';
+import type {
+  BridgeReplyMarkerSnapshot,
+  RecordBridgeReplyMarkerInput,
+} from './bridge-reply-marker.js';
+
+export type TurnSendLedgerMarker = BridgeReplyMarkerSnapshot;
+export type TurnSendLedgerMarkerInput = Omit<RecordBridgeReplyMarkerInput,
+  'dataDir' | 'sessionId' | 'turnId' | 'messageId' | 'sentAtMs'>;
+/** Evaluated only after provider dispatch succeeds, when deferred topics and
+ * canonical voice/card destinations have their actual values. */
+export type TurnSendLedgerMarkerSource = TurnSendLedgerMarkerInput | (() => TurnSendLedgerMarkerInput);
+
+function snapshotTurnSendLedgerMarker(marker: TurnSendLedgerMarkerInput): TurnSendLedgerMarker {
+  const { content, ...metadata } = marker;
+  return { ...metadata, ...buildBridgeSendMarkerContent(content) };
+}
 
 export type TurnSendKind = 'progress' | 'final' | 'auxiliary';
 
@@ -29,13 +46,27 @@ export interface TurnSendLedgerRecord extends TurnSendLedgerKey {
     stepCount: number;
     completedSteps: number;
     inFlightStep?: number;
+    /** Provider dispatch start of the first chunk, preserved across replay. */
+    sentAtMs?: number;
   };
   final?: {
     fingerprint: string;
     messageId: string;
     deliveredAtMs: number;
-    /** Exact pre-dispatch send timestamp used for structured reply event_key deduplication. */
+    /** Exact pre-dispatch send timestamp used for structured reply event_key
+     *  deduplication and for restoring bridge-marker windows after replay. */
     sentAtMs?: number;
+    /** Present only for internally derived replay-only timestamps. Explicitly
+     *  injected values (including master-era records without this marker) stay
+     *  visible in TurnSendLedgerResult. */
+    sentAtMsDerived?: true;
+    /** Original bridge marker metadata, allowing catch-up to restore the exact
+     *  final instead of borrowing the next command's kind/content/routing. */
+    marker?: TurnSendLedgerMarker;
+    /** Absorbed mid-turn follow-up turn IDs that this final structurally
+     *  settled, persisted atomically so crash recovery in the catch-up loop
+     *  settles them instead of promoting them as fresh execution turns. */
+    settledAbsorbedTurnIds?: string[];
   };
 }
 
@@ -196,6 +227,8 @@ export class TurnSendLedger {
       !sequence.fingerprint
       || !sequence.target
       || !Number.isSafeInteger(sequence.stepCount)
+      || (sequence.sentAtMs !== undefined
+        && (!Number.isSafeInteger(sequence.sentAtMs) || sequence.sentAtMs <= 0))
       || sequence.stepCount <= 0
       || !Number.isSafeInteger(sequence.completedSteps)
       || sequence.completedSteps < 0
@@ -466,7 +499,7 @@ export class TurnSendLedger {
       return {
         messageId: final.messageId,
         replayed: true,
-        ...(final.sentAtMs !== undefined ? { sentAtMs: final.sentAtMs } : {}),
+        ...(final.sentAtMs !== undefined && final.sentAtMsDerived !== true ? { sentAtMs: final.sentAtMs } : {}),
       };
     }, { maxWaitMs: 60_000 });
   }
@@ -476,7 +509,7 @@ export class TurnSendLedger {
     kind: TurnSendKind,
     renderedContent: string,
     dispatch: (providerUuid?: string) => Promise<string>,
-    options: { fenced?: boolean; providerUuid?: string; reuseExistingFinal?: boolean; sentAtMs?: number; beforeDispatch?: () => void; noSideEffect?: (error: unknown) => boolean } = {},
+    options: { fenced?: boolean; providerUuid?: string; reuseExistingFinal?: boolean; sentAtMs?: number; marker?: TurnSendLedgerMarkerSource; beforeDispatch?: () => void; noSideEffect?: (error: unknown) => boolean; resolveSettledAbsorbedTurnIds?: () => string[] | undefined } = {},
   ): Promise<TurnSendLedgerResult> {
     this.ensureSessionDirectory(key);
     return withFileLock(this.recordPath(key), async () => {
@@ -504,7 +537,7 @@ export class TurnSendLedger {
         return {
           messageId: record.final.messageId,
           replayed: true,
-          ...(record.final.sentAtMs !== undefined ? { sentAtMs: record.final.sentAtMs } : {}),
+          ...(record.final.sentAtMs !== undefined && record.final.sentAtMsDerived !== true ? { sentAtMs: record.final.sentAtMs } : {}),
         };
       }
 
@@ -526,6 +559,7 @@ export class TurnSendLedger {
         record.publication ??= { fingerprint, providerUuid, startedAtMs: Date.now() };
         this.write(key, record);
       }
+      const sentAtMs = record.publication?.startedAtMs ?? Date.now();
       let messageId: string;
       try { messageId = await dispatch(providerUuid); }
       catch (error) {
@@ -540,13 +574,22 @@ export class TurnSendLedger {
         throw error;
       }
       if (!messageId && kind === 'final') throw new Error('Missing primary message ID');
-      const normalizedSentAtMs = normalizeSentAtMs(options.sentAtMs);
+      const normalizedSentAtMs = normalizeSentAtMs(options.sentAtMs ?? sentAtMs);
       if (kind === 'final') {
+        const settledAbsorbedTurnIds = options.resolveSettledAbsorbedTurnIds?.();
+        const marker = typeof options.marker === 'function' ? options.marker() : options.marker;
         record.final = {
           fingerprint: this.fingerprint(renderedContent),
           messageId,
           deliveredAtMs: Date.now(),
           ...(normalizedSentAtMs !== undefined ? { sentAtMs: normalizedSentAtMs } : {}),
+          ...(options.sentAtMs === undefined && normalizedSentAtMs !== undefined
+            ? { sentAtMsDerived: true as const }
+            : {}),
+          ...(marker ? { marker: snapshotTurnSendLedgerMarker(marker) } : {}),
+          ...(settledAbsorbedTurnIds && settledAbsorbedTurnIds.length > 0
+            ? { settledAbsorbedTurnIds }
+            : {}),
         };
         delete record.publication;
         this.write(key, record);
@@ -554,7 +597,9 @@ export class TurnSendLedger {
       return {
         messageId,
         replayed: false,
-        ...(normalizedSentAtMs !== undefined ? { sentAtMs: normalizedSentAtMs } : {}),
+        ...(options.sentAtMs !== undefined && normalizedSentAtMs !== undefined
+          ? { sentAtMs: normalizedSentAtMs }
+          : {}),
       };
     }, { maxWaitMs: 60_000 });
   }
@@ -580,7 +625,7 @@ export class TurnSendLedger {
     stepCount: number,
     dispatchStep: (index: number, effects: NonIdempotentStepEffects) => Promise<void>,
     messageId: string,
-    options: { sentAtMs?: number } = {},
+    options: { sentAtMs?: number; marker?: TurnSendLedgerMarkerSource } = {},
   ): Promise<TurnSendLedgerResult> {
     if (kind !== 'final') throw new Error('分块投递只允许 final 回复；请使用 --response-kind final');
     if (!Number.isSafeInteger(stepCount) || stepCount <= 0) throw new Error('Non-idempotent delivery sequence must contain at least one step');
@@ -597,7 +642,7 @@ export class TurnSendLedger {
         return {
           messageId: record.final.messageId,
           replayed: true,
-          ...(record.final.sentAtMs !== undefined ? { sentAtMs: record.final.sentAtMs } : {}),
+          ...(record.final.sentAtMs !== undefined && record.final.sentAtMsDerived !== true ? { sentAtMs: record.final.sentAtMs } : {}),
         };
       }
 
@@ -606,6 +651,7 @@ export class TurnSendLedger {
         target: messageId,
         stepCount,
         completedSteps: 0,
+        sentAtMs: Date.now(),
       };
       if (sequence.fingerprint !== fingerprint
         || sequence.target !== messageId
@@ -645,18 +691,25 @@ export class TurnSendLedger {
         this.write(key, record);
       }
 
-      const normalizedSentAtMs = normalizeSentAtMs(options.sentAtMs);
+      const normalizedSentAtMs = normalizeSentAtMs(options.sentAtMs ?? sequence.sentAtMs);
+      const marker = typeof options.marker === 'function' ? options.marker() : options.marker;
       record.final = {
         fingerprint,
         messageId,
         deliveredAtMs: Date.now(),
         ...(normalizedSentAtMs !== undefined ? { sentAtMs: normalizedSentAtMs } : {}),
+        ...(options.sentAtMs === undefined && normalizedSentAtMs !== undefined
+          ? { sentAtMsDerived: true as const }
+          : {}),
+        ...(marker ? { marker: snapshotTurnSendLedgerMarker(marker) } : {}),
       };
       this.write(key, record);
       return {
         messageId,
         replayed: false,
-        ...(normalizedSentAtMs !== undefined ? { sentAtMs: normalizedSentAtMs } : {}),
+        ...(options.sentAtMs !== undefined && normalizedSentAtMs !== undefined
+          ? { sentAtMs: normalizedSentAtMs }
+          : {}),
       };
     }, { maxWaitMs: 60_000 });
   }
