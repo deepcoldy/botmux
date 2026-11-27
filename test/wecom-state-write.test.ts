@@ -7,6 +7,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   existsSync,
+  linkSync,
   lstatSync,
   lutimesSync,
   mkdirSync,
@@ -82,7 +83,14 @@ describe('writing state.json', () => {
     const bridge = h.create();
     await bridge.receive(message('a1'));
     await bridge.tick();
-    const settled = statSync(stateFile).ino;
+    // A hardlink pins the settled inode. On filesystems that recycle a just
+    // unlinked inode number immediately (ext4 tmpfs-like reuse), comparing two
+    // bare stats cannot tell a rewrite from a skip; the pinned inode can never
+    // be reallocated while the witness links it, so a real atomic replace must
+    // land on a different inode on every POSIX filesystem.
+    const witness = join(root, 'state.json.witness');
+    linkSync(stateFile, witness);
+    const settled = statSync(witness).ino;
     await bridge.tick();
     vi.setSystemTime(Date.now() + WECOM_PRUNE_INTERVAL_MS);
     await bridge.tick();
