@@ -416,6 +416,9 @@ describe('Architect rerun in one run (#3129)', () => {
   it('starts the next round while the previous round\'s terminal session is still alive, and leaves that round\'s attempt as it was', async () => {
     const base = mkdtempSync(join(tmpdir(), 'v3-architect-rerun-'));
     vi.stubEnv('SESSION_DATA_DIR', join(base, 'data'));
+    // The default pool path requires the node bot in the live bots.json.
+    writeFileSync(join(base, 'bots.json'), JSON.stringify([{ larkAppId: BOT.larkAppId, larkAppSecret: 'secret', cliId: BOT.cliId }]));
+    vi.stubEnv('BOTS_CONFIG', join(base, 'bots.json'));
     try {
       const { runDir } = toApprovedSpec(base);
       const tmux = new LingeringTmux();

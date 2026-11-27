@@ -89,25 +89,35 @@ export interface EphemeralPoolDeps {
 
 /** Live config of a node's bot. A daemon registers only its own bot, and
  *  standalone runs register none, while workflow nodes may use any configured
- *  bot: fall back to live bots.json. Only "this bot is not configured" (absent
- *  from the file, or no bots.json at all) yields undefined; an unreadable or
- *  invalid bots.json throws, so callers never mistake a broken file for a bot
- *  without env or assistant mode. */
-function liveBotConfig(larkAppId: string): BotConfig | undefined {
+ *  bot: fall back to live bots.json. An unreadable or invalid bots.json always
+ *  throws, so callers never mistake a broken file for a bot without env or
+ *  assistant mode.
+ *
+ *  `required`: the node bot came from the run's own bots.json snapshot (the
+ *  default daemon-run / architect path), so "not configured now" means it was
+ *  removed after the run started — with the secret still pinned in memory.
+ *  Fail instead of yielding undefined, or the node would pass the assistant
+ *  check and start without its env overlay. */
+function liveBotConfig(larkAppId: string, required = false): BotConfig | undefined {
   try { return getBot(larkAppId).config; } catch { /* not hosted by this daemon */ }
   let configs: readonly BotConfig[];
   try {
     // Strict: under read isolation an EPERM/EACCES must not read as "no bots".
     configs = loadBotConfigsCached({ strictRead: true });
   } catch (err) {
-    if (err instanceof BotConfigNotFoundError) return undefined;
+    if (err instanceof BotConfigNotFoundError) {
+      if (required) throw new Error(`v3 workflow cannot find live bot config for ${larkAppId}: no bots.json is configured`, { cause: err });
+      return undefined;
+    }
     // This message is persisted as the node failure. Strict loads only throw
     // BotConfigLoadError, whose message never quotes bots.json content (any
     // bot's validator text may carry raw values); keep the rest on `cause`.
     const reason = err instanceof BotConfigLoadError ? err.message : 'bots.json unreadable';
     throw new Error(`v3 workflow cannot read live bot config for ${larkAppId}: ${reason}`, { cause: err });
   }
-  return configs.find(b => b.larkAppId === larkAppId);
+  const bot = configs.find(b => b.larkAppId === larkAppId);
+  if (!bot && required) throw new Error(`v3 workflow cannot find live bot config for ${larkAppId}: the bot is no longer in bots.json`);
+  return bot;
 }
 
 /** A run may override its cwd or replay an old profile. Only seed the live
@@ -132,11 +142,12 @@ async function prepareNodeFolderTrust(
   if (configured) await prepareWorkflowClaudeTrust(canonical, adapter.claudeStateJsonPath, signal);
 }
 
-/** Throws when the live bot runs personal-assistant mode (see runNodeImpl). */
-export function assertNotAssistantModeBot(larkAppId: string): void {
-  // A bot absent from both sources has no secret to launch with either, so
-  // that case is left to the credential resolver.
-  const assistant = liveBotConfig(larkAppId)?.assistantMode === true;
+/** Throws when the live bot runs personal-assistant mode (see runNodeImpl).
+ *  With `requireConfigured` (the default pool path) a bot missing from the live
+ *  config also throws: fail closed rather than read it as non-assistant. */
+export function assertNotAssistantModeBot(larkAppId: string, requireConfigured = false): void {
+  // Otherwise a bot absent from both sources is left to the credential resolver.
+  const assistant = liveBotConfig(larkAppId, requireConfigured)?.assistantMode === true;
   if (assistant) throw new Error(`v3 workflow does not support personal-assistant mode; bot ${larkAppId} has assistantMode=true`);
 }
 
@@ -150,9 +161,9 @@ function v3WorkerSessionEnv(
     // An explicit resolver owns the lookup outright, including when it throws.
     try { bot = resolveBot(larkAppId); } catch { bot = undefined; }
   } else {
-    // A bots.json read failure fails this node instead of starting it
-    // without its env overlay.
-    bot = liveBotConfig(larkAppId);
+    // A bots.json read failure, or a node bot removed from it mid-run, fails
+    // this node instead of starting it without its env overlay.
+    bot = liveBotConfig(larkAppId, true);
   }
   if (!bot) return {};
   // Workflow workers never install the identity wrappers (usesLarkToolBinding).
@@ -230,7 +241,7 @@ async function runNodeWithLogs(
   // a config fault must not turn a cancellation into a node failure.
   const cancelSignal = req.attemptLease?.signal ?? req.cancelSignal;
   const cancelledOnArrival = cancelSignal?.aborted === true;
-  if (!cancelledOnArrival) assertNotAssistantModeBot(req.botSnapshot.larkAppId);
+  if (!cancelledOnArrival) assertNotAssistantModeBot(req.botSnapshot.larkAppId, !deps.resolveBot);
   // Resolve the env overlay before any side effect too: a bots.json read
   // failure must reject this node here, not after a worker has been forked.
   const workerSessionEnv = cancelledOnArrival ? {} : v3WorkerSessionEnv(req.botSnapshot.larkAppId, deps.resolveBot);

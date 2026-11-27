@@ -9,7 +9,7 @@ import { dirname, join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { createEphemeralPool, buildGoalCommand, GOAL_COMMAND, spawnWorkerFactory, v3WorkerBackendType } from '../src/workflows/v3/ephemeral-pool.js';
+import { assertNotAssistantModeBot, createEphemeralPool, buildGoalCommand, GOAL_COMMAND, spawnWorkerFactory, v3WorkerBackendType } from '../src/workflows/v3/ephemeral-pool.js';
 import { config } from '../src/config.js';
 import { GOAL_COMMAND_OBJECTIVE, GOAL_ENV, isBotmuxGoalObjective, V3_NATIVE_GOAL_COMMAND_CLIS, type RunNodeRequest } from '../src/workflows/v3/contract.js';
 import { syntheticSessionUuid, type WorkerHandle, type WorkerProcessFactory, type WorkerSpawnOptions } from '../src/workflows/shared/worker-process.js';
@@ -54,6 +54,14 @@ beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'wf-v3-pool-'));
   config.session.dataDir = join(dir, 'data');
   vi.stubEnv('SESSION_DATA_DIR', config.session.dataDir);
+  // Default-path nodes come from the run's bots.json, so the node bot that
+  // request() names must be configured there (tests may overwrite this file).
+  // Its profile differs from request()'s snapshot, so folder-trust seeding
+  // stays out of tests that do not exercise it.
+  const botsPath = join(dir, 'bots.json');
+  writeFileSync(botsPath, JSON.stringify([{ larkAppId: 'cli_app', larkAppSecret: 'test-only', cliId: 'claude-code',
+    cliConfigDir: join(dir, 'fixture-profile') }]));
+  vi.stubEnv('BOTS_CONFIG', botsPath);
 });
 
 afterEach(() => {
@@ -613,15 +621,76 @@ describe('v3 ephemeral pool', () => {
       }
     });
 
-    it('does not substitute another configured bot when the node bot is absent', async () => {
-      configureBots([{ larkAppId: 'cli_other', larkAppSecret: 'test-only', cliId: 'claude-code',
-        env: { MODEL_AUTH: 'other-sentinel' } }]);
+    // The run pins secrets in memory at start, so a node bot that disappears
+    // from bots.json mid-run still resolves a secret. The default path must not
+    // read that as "not configured": no env-less worker, no assistant pass.
+    const startsWithEnv = async () => {
       const worker = new ScriptedWorker();
       const running = createEphemeralPool({ factory: factoryFor(worker), workerPath: '/tmp/worker.js',
         resolveLarkAppSecret: () => 'secret' }).runNode(request());
       try {
         await worker.waitForInit();
-        expect(worker.init.env?.MODEL_AUTH).toBeUndefined();
+        expect(worker.init.env?.MODEL_AUTH).toBe('node-sentinel');
+      } finally {
+        worker.emitExit(0);
+        await running;
+      }
+    };
+    const nodeBot: BotConfig = { larkAppId: 'cli_app', larkAppSecret: 'test-only', cliId: 'claude-code',
+      env: { MODEL_AUTH: 'node-sentinel' } };
+    const otherBot: BotConfig = { larkAppId: 'cli_other', larkAppSecret: 'test-only', cliId: 'claude-code',
+      env: { MODEL_AUTH: 'other-sentinel' } };
+
+    it('fails before spawn when the node bot is removed from bots.json mid-run', async () => {
+      configureBots([nodeBot, otherBot]);
+      await startsWithEnv();
+      configureBots([otherBot]);
+      const failure = await rejectsBeforeSpawn();
+      expect(failure.message).toContain('cli_app');
+      expect(failure.message).toContain('bots.json');
+      expect(failure.message).not.toContain('other-sentinel');
+    });
+
+    it('fails before spawn when the default bots.json is deleted mid-run', async () => {
+      const home = join(dir, 'home');
+      const homeBots = join(home, '.botmux', 'bots.json');
+      mkdirSync(dirname(homeBots), { recursive: true });
+      writeFileSync(homeBots, JSON.stringify([nodeBot]));
+      vi.stubEnv('HOME', home);
+      vi.stubEnv('BOTS_CONFIG', '');
+      await startsWithEnv();
+      rmSync(homeBots);
+      const failure = await rejectsBeforeSpawn();
+      expect(failure.message).toContain('cli_app');
+      expect(failure.message).toContain('bots.json');
+    });
+
+    it('fails the assistant-mode check closed for a default-path bot missing from bots.json', () => {
+      configureBots([otherBot]);
+      expect(() => assertNotAssistantModeBot('cli_app', true)).toThrow(/cli_app/);
+      // Explicit-resolver callers keep leaving an absent bot to the credential resolver.
+      expect(() => assertNotAssistantModeBot('cli_app')).not.toThrow();
+    });
+
+    it('still returns cancelled for an attempt aborted on arrival after its bot left bots.json', async () => {
+      configureBots([otherBot]);
+      const factory = factoryFor(new ScriptedWorker());
+      const ac = new AbortController();
+      ac.abort('user-requested');
+      await expect(createEphemeralPool({ factory, workerPath: '/tmp/worker.js', resolveLarkAppSecret: () => 'secret' })
+        .runNode({ ...request(), cancelSignal: ac.signal })).resolves.toMatchObject({ status: 'cancelled' });
+      expect(factory.lastOpts).toBeUndefined();
+    });
+
+    it('keeps an explicit resolver authoritative when the node bot is absent from bots.json', async () => {
+      configureBots([otherBot]);
+      const worker = new ScriptedWorker();
+      const running = createEphemeralPool({ factory: factoryFor(worker), workerPath: '/tmp/worker.js',
+        resolveLarkAppSecret: () => 'secret', resolveBot: appId => appId === nodeBot.larkAppId ? nodeBot : undefined })
+        .runNode(request());
+      try {
+        await worker.waitForInit();
+        expect(worker.init.env?.MODEL_AUTH).toBe('node-sentinel');
       } finally {
         worker.emitExit(0);
         await running;
