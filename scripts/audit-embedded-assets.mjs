@@ -50,6 +50,11 @@ const CODE_SUFFIXES = ['.js', '.js.map', '.d.ts', '.d.ts.map', '.mjs', '.cjs'];
  */
 const EMBED_MECHANISMS = [
   {
+    id: 'bytedcli-operation-catalog-json-import',
+    covers: (rel) => rel === 'core/bytedcli-operation-catalog.json',
+    proof: 'core/bytedcli-operation-catalog.ts statically imports with { type: "json" }; operation-policy.ts and operation-policy-config.ts reach it, and test/bytedcli-operation-catalog-embedded.test.ts executes their compiled graph after deleting every source/JSON fixture',
+  },
+  {
     id: 'cn-work-calendar-json-import',
     covers: (rel) => rel === 'services/work-calendars/cn-2026.json',
     proof: 'services/work-calendars/catalog.ts statically imports with { type: "json" }; the calendar module compile smoke verifies CN rest/makeup/coverage without an on-disk JSON file',
