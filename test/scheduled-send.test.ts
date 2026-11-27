@@ -9,6 +9,7 @@ import {
   recordScheduledSessionRun,
   ScheduleSendAttempt,
   scheduledTurnsOfCurrentRuns,
+  settleScheduledSessionRun,
   settleScheduledSend,
 } from '../src/core/scheduled-send.js';
 import { TURN_SEND_LEDGER_COMPLETED_RETENTION_MS, TurnSendLedger } from '../src/services/turn-send-ledger.js';
@@ -33,6 +34,45 @@ describe('scheduled feedback policy', () => {
     expect(feedbackPolicyForScheduledSend({ ...input, requesterSubjectId: 'ou_claimant' })).toEqual(policy);
     expect(feedbackPolicyForScheduledSend({ ...input, policy: { audience: 'everyone' } })).toEqual({ audience: 'everyone' });
     expect(feedbackPolicyForScheduledSend({ ...input, policy: { audience: 'reviewers' } })).toEqual({ audience: 'reviewers' });
+  });
+});
+
+describe('scheduled run binding retention', () => {
+  it('keeps an outstanding dashboard binding past 100 newer runs and returns it to settled history on settlement', () => {
+    const dashboardTurn = 'schedule:abcdef12:bbbbbbbb-1234-1234-1234-123456789abc';
+    const reused = { sessionId: 's', larkAppId: 'cli_app', chatId: 'oc_chat' } as Session;
+    recordScheduledSessionRun(reused, { taskId: 'abcdef12', runId: 'run-0', turnId: dashboardTurn, trigger: 'dashboard' });
+    for (let n = 1; n <= 100; n++) {
+      const nextTurn = `schedule:abcdef12:${n.toString(16).padStart(8, '0')}-1234-1234-1234-123456789abc`;
+      recordScheduledSessionRun(reused, { taskId: 'abcdef12', runId: `run-${n}`, turnId: nextTurn, trigger: 'scheduler' });
+      settleScheduledSessionRun(reused, nextTurn);
+    }
+    expect(reused.scheduledRuns?.[dashboardTurn]).toMatchObject({ runId: 'run-0', trigger: 'dashboard' });
+    expect(reused.scheduledRunOutstanding?.[dashboardTurn]).toBe(true);
+    expect(settleScheduledSessionRun(reused, dashboardTurn)).toBe(true);
+    expect(reused.scheduledRuns?.[dashboardTurn]).toMatchObject({ runId: 'run-0', trigger: 'dashboard' });
+    expect(reused.scheduledRunOutstanding?.[dashboardTurn]).toBeUndefined();
+    for (let n = 101; n <= 200; n++) {
+      const nextTurn = `schedule:abcdef12:${n.toString(16).padStart(8, '0')}-1234-1234-1234-123456789abc`;
+      recordScheduledSessionRun(reused, { taskId: 'abcdef12', runId: `run-${n}`, turnId: nextTurn, trigger: 'scheduler' });
+      settleScheduledSessionRun(reused, nextTurn);
+    }
+    expect(reused.scheduledRuns?.[dashboardTurn]).toBeUndefined();
+  });
+
+  it('keeps a just-settled run readable for late delivery failure reconciliation', () => {
+    const dataDir = dir();
+    const reused = { sessionId: 's', larkAppId: 'cli_app', chatId: 'oc_chat' } as Session;
+    recordScheduledSessionRun(reused, session.scheduledRun!);
+    new ScheduleSendAttempt(dataDir, reused, turnId).fail(new Error('provider rejected'));
+    for (let n = 1; n <= 100; n++) {
+      const nextTurn = `schedule:abcdef12:${n.toString(16).padStart(8, '0')}-1234-1234-1234-123456789abc`;
+      recordScheduledSessionRun(reused, { taskId: 'abcdef12', runId: `run-${n}`, turnId: nextTurn, trigger: 'scheduler' });
+      settleScheduledSessionRun(reused, nextTurn);
+    }
+    expect(settleScheduledSend(dataDir, reused, turnId)).toMatchObject({ state: 'failed', runId: 'run-1' });
+    expect(settleScheduledSessionRun(reused, turnId)).toBe(true);
+    expect(settleScheduledSend(dataDir, reused, turnId)).toMatchObject({ state: 'failed', runId: 'run-1' });
   });
 });
 

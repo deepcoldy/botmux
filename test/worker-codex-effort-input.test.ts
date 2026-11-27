@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { isCriticalInterruptKey } from '../src/adapters/backend/critical-control-key.js';
 import { hasEmptyCodexComposer, parseCodexEffortMenu } from '../src/utils/codex-effort-menu.js';
 import { stripAnsiScreenText } from '../src/utils/idle-detector.js';
+import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
 // Exercise the production input boundaries without starting worker.ts's IPC server.
 const parsed = ts.createSourceFile('worker.ts', readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8'),
@@ -30,7 +31,7 @@ describe('Codex effort menu input ownership', () => {
     '$name ($args) never forwards input to a CLI replaced during menu cancellation', async ({ name, args }) => {
       let release!: () => void;
       const cancelled = new Promise<void>(resolve => { release = resolve; });
-      const state = {
+      const state: Record<string, any> = {
         activeTranscriptImagePurge: undefined,
         lastInitConfig: null,
         backend: {}, cliAdapter: {}, cliLifetimeNonce: 1,
@@ -40,6 +41,7 @@ describe('Codex effort menu input ownership', () => {
         // No failed-turn rewind holds a message here.
         stopHeldFailedTurnRewind: () => false,
       };
+      state.discardScheduledBacklogForStop = loadWorkerFunction('discardScheduledBacklogForStop', state);
       const handler = evaluate<(...args: any[]) => Promise<unknown>>(name, state);
       const result = handler(...args);
       expect(state.cancelCodexCliEffort).toHaveBeenCalledOnce();
