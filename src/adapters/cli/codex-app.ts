@@ -56,7 +56,7 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
       return [(cachedCodexBin ??= resolveCommandReal(rawCodexBin))];
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, quietResume, workingDir, botName, botOpenId, locale, model, reasoningEffort, allowCodexReasoningCatalog, serviceTier, codexBrowser }) {
+    buildArgs({ sessionId, resume, resumeSessionId, quietResume, workingDir, botName, groupJoinPrompt, groupJoinTitleBootstrap, botOpenId, locale, model, reasoningEffort, allowCodexReasoningCatalog, serviceTier, codexBrowser }) {
       const args = [
         runnerArgv0('codex-app-runner', resolveRunnerPath('codex-app-runner.js', { testOverrideEnv: 'BOTMUX_TEST_CODEX_APP_RUNNER_PATH' })),
         '--session-id', sessionId,
@@ -70,6 +70,9 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
       pushOpt(args, '--bot-name', botName);
       pushOpt(args, '--bot-open-id', botOpenId);
       pushOpt(args, '--locale', locale);
+      pushOpt(args, '--group-join-prompt', groupJoinPrompt);
+      pushOpt(args, '--group-join-title-digest', groupJoinTitleBootstrap?.digest);
+      pushOpt(args, '--group-join-title-length', groupJoinTitleBootstrap ? String(groupJoinTitleBootstrap.length) : undefined);
       pushOpt(args, '--title-prefix', readGlobalConfig().codexAppTitlePrefix);
       // Per-turn overrides (async trigger API). The runner injects them into the
       // app-server thread/start (model + config.model_reasoning_effort).

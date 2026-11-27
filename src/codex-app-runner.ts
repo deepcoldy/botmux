@@ -57,6 +57,7 @@ import { bridgeCodexUserInput, postCodexAsk } from './services/codex-user-input.
 import { parseCodexAsyncQuestions, parseCodexAsyncUserInput, codexAsyncSteerTargetMatches } from './services/codex-async-user-input.js';
 import { larkToolPromptFromEnv } from './core/lark-tool-binding.js';
 import { isBootstrapDisplayTitle, sessionTitleInput } from './core/session-title-content.js';
+import { titleBootstrapDigest } from './core/session-title-digest.js';
 import { normalizeCodexAppTitlePrefix } from './utils/codex-app-title-prefix.js';
 import { readProcessStartIdentity } from './utils/process-identity.js';
 
@@ -73,6 +74,9 @@ interface Args {
   threadId?: string;
   strictResume?: boolean;
   botName?: string;
+  groupJoinPrompt?: string;
+  groupJoinTitleDigest?: string;
+  groupJoinTitleLength?: number;
   titlePrefix?: string;
   botOpenId?: string;
   locale?: string;
@@ -289,6 +293,13 @@ function parseArgs(argv: string[]): Args {
     else if (key === '--thread-id' && val !== undefined) { out.threadId = val; i++; }
     else if (key === '--strict-resume') out.strictResume = true;
     else if (key === '--bot-name' && val !== undefined) { out.botName = val; i++; }
+    else if (key === '--group-join-prompt' && val !== undefined) { out.groupJoinPrompt = val; i++; }
+    else if (key === '--group-join-title-digest' && val !== undefined) { out.groupJoinTitleDigest = val; i++; }
+    else if (key === '--group-join-title-length' && val !== undefined) {
+      const length = Number(val);
+      if (Number.isInteger(length) && length > 0) out.groupJoinTitleLength = length;
+      i++;
+    }
     else if (key === '--title-prefix' && val !== undefined) { out.titlePrefix = normalizeCodexAppTitlePrefix(val); i++; }
     else if (key === '--bot-open-id' && val !== undefined) { out.botOpenId = val; i++; }
     else if (key === '--locale' && val !== undefined) { out.locale = val; i++; }
@@ -1834,6 +1845,10 @@ async function ensureThread(startupDeadlineAtMs?: number): Promise<string> {
       threadId = resumedThreadId;
       currentModel = resumed.model;
       threadReady = true;
+      // A bootstrap-only opening deliberately persists no title. Its daemon-side
+      // awaiting-content marker re-arms naming on the next runner generation;
+      // ordinary/legacy resume has no groupJoinPrompt and remains untouched.
+      if (args.groupJoinPrompt) pendingThreadTitle = { threadId: resumedThreadId, attempts: 0 };
       emitMarker('thread', { threadId: resumedThreadId });
       return resumedThreadId;
     } catch (err: any) {
@@ -1892,13 +1907,15 @@ function queueThreadTitle(targetThreadId: string, accepted: readonly Dispatch[])
   if (titleWritesStopped || pending?.threadId !== targetThreadId || pending.writing || pending.attempts >= 2) return;
   const mentions = args.botName ? [{ name: args.botName }] : undefined;
   if (!pending.name) {
+    const previous = args.groupJoinTitleDigest && args.groupJoinTitleLength !== undefined
+      ? { digest: args.groupJoinTitleDigest, length: args.groupJoinTitleLength } : undefined;
     for (const { input } of accepted) {
       const raw = input.codexAppInput?.text ?? input.content;
       const body = raw.match(/<user_message>\s*([\s\S]*?)\s*<\/user_message>/)?.[1] ?? raw;
       const task = body.trimStart().startsWith('<botmux_headless_session trusted="true">')
         ? body.match(/<botmux_task trusted="true">([\s\S]*?)<\/botmux_task>/)?.[1] ?? ''
         : body;
-      const { text } = sessionTitleInput(task, mentions);
+      const { text } = sessionTitleInput(task, mentions, args.groupJoinPrompt ? [args.groupJoinPrompt] : [], previous, titleBootstrapDigest);
       if (!text || isBootstrapDisplayTitle(text)) continue;
       const prefix = args.titlePrefix ?? '';
       const normalizedPrefix = prefix.trimStart().replace(/\s+/g, ' ');

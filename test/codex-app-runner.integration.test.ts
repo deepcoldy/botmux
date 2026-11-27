@@ -23,6 +23,7 @@ import { readProcessStartIdentity } from '../src/core/session-marker.js';
 import { applyTrustedCodexAppStateMarker, CodexAppReadyAuthority, CodexAppTurnLiveness } from '../src/utils/codex-app-turn-liveness.js';
 import { encodeRunnerInput } from '../src/adapters/cli/runner-input.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
+import { captureTitleBootstrap } from '../src/core/session-title.js';
 import { CODEX_APP_ACTIVE_WRITER_EXIT_CODE } from '../src/services/codex-app-runner-protocol.js';
 import { parseAskBody, registerAskForResponse } from '../src/core/ask-api.js';
 import { _resetForTest as resetAskBroker, setCardDispatcher, setCanTalkChecker, submitAsk, submitCustomReply } from '../src/core/ask-broker.js';
@@ -700,7 +701,8 @@ describe('codex-app-runner native thread titles', { timeout: 20_000 }, () => {
     { scenario: 'configured prefix preserves its spacing without duplication', prefix: '[Bot  Mux] ', alreadyPrefixed: true },
     { scenario: 'existing manual title becomes readable after preview loading', prefix: 'botmux：', initialTitle: '人工标题', notLoadedReads: '1' },
     { scenario: 'resumed thread', prefix: 'botmux：', threadId: 'thread-previous' },
-  ])('uses the first real task for $scenario', async ({ headless, initialTitle, threadId, notLoadedReads, steer, writeFault, prefix, long, alreadyPrefixed }) => {
+    { scenario: 'resumed bootstrap-pending thread keeps its manual title', prefix: 'botmux：', threadId: 'thread-previous', initialTitle: '人工标题', joinPrompt: '入群后等待真实任务', notLoadedReads: '1' },
+  ])('uses the first real task for $scenario', async ({ headless, initialTitle, threadId, notLoadedReads, steer, writeFault, prefix, long, alreadyPrefixed, joinPrompt }) => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-runner-title-test-'));
     const fakeCodex = join(dir, 'fake-codex');
     const logPath = join(dir, 'requests.jsonl');
@@ -716,9 +718,13 @@ describe('codex-app-runner native thread titles', { timeout: 20_000 }, () => {
     let prefixArgs: string[];
     try {
       process.env.BOTMUX_GLOBAL_CONFIG_FILE = configPath;
-      const argv = createCodexAppAdapter(fakeCodex).buildArgs({ sessionId: SESSION_ID, resume: Boolean(threadId) });
+      const argv = createCodexAppAdapter(fakeCodex).buildArgs({ sessionId: SESSION_ID, resume: Boolean(threadId), groupJoinPrompt: joinPrompt });
       const prefixIndex = argv.indexOf('--title-prefix');
-      prefixArgs = prefixIndex === -1 ? [] : argv.slice(prefixIndex, prefixIndex + 2);
+      const joinPromptIndex = argv.indexOf('--group-join-prompt');
+      prefixArgs = [
+        ...(prefixIndex === -1 ? [] : argv.slice(prefixIndex, prefixIndex + 2)),
+        ...(joinPromptIndex === -1 ? [] : argv.slice(joinPromptIndex, joinPromptIndex + 2)),
+      ];
     } finally {
       if (priorConfigPath === undefined) delete process.env.BOTMUX_GLOBAL_CONFIG_FILE;
       else process.env.BOTMUX_GLOBAL_CONFIG_FILE = priorConfigPath;
@@ -781,6 +787,113 @@ Headless request received from the local Botmux CLI.
         initialTitle || threadId ? [] : writeFault && writeFault !== 'lose-ack' ? [storedTitle, storedTitle] : [storedTitle],
       );
       expect(control.finals.every(final => !final.errorCode)).toBe(true);
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    { scenario: 'default bootstrap folded with the first task', bootstrap: '你是本群的 oncall 协同助手。入群后先阅读群内可见的最近消息、卡片和转发内容，只做只读总结。', folded: true },
+    { scenario: 'custom bootstrap folded with the first task', bootstrap: '加入后先阅读最近的群消息，等待明确分配的任务再开始处理，不要自行推断目标。', folded: true },
+    { scenario: 'custom bootstrap alone before the first task', bootstrap: '加入后先阅读最近的群消息，等待明确分配的任务再开始处理，不要自行推断目标。' },
+    { scenario: 'default bootstrap alone before the first task', bootstrap: '你是本群的 oncall 协同助手。入群后先阅读群内可见的最近消息、卡片和转发内容，只做只读总结。' },
+    { scenario: 'ordinary task without a bootstrap', bootstrap: undefined },
+  ])('uses bootstrap-aware title input for $scenario', async ({ bootstrap, folded }) => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-runner-title-bootstrap-test-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const configPath = join(dir, 'config.json');
+    writeFileSync(configPath, '{}');
+    const priorConfigPath = process.env.BOTMUX_GLOBAL_CONFIG_FILE;
+    let extraArgs: string[];
+    try {
+      process.env.BOTMUX_GLOBAL_CONFIG_FILE = configPath;
+      const argv = createCodexAppAdapter(fakeCodex).buildArgs({ sessionId: SESSION_ID, resume: false, groupJoinPrompt: bootstrap });
+      const promptIndex = argv.indexOf('--group-join-prompt');
+      extraArgs = promptIndex === -1 ? [] : argv.slice(promptIndex, promptIndex + 2);
+    } finally {
+      if (priorConfigPath === undefined) delete process.env.BOTMUX_GLOBAL_CONFIG_FILE;
+      else process.env.BOTMUX_GLOBAL_CONFIG_FILE = priorConfigPath;
+    }
+    const harness = startRunner(fakeCodex, dir, logPath, '0.162.1', 'success', control.bootstrap.path, { extraArgs });
+    try {
+      const task = '排查 rule 456 的失败';
+      const nameWrites = () => readRequests(logPath).filter(request => request.method === 'thread/name/set');
+      const sendInput = (text: string) => harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput(
+        `<user_message>\n${text}\n</user_message>`, { text, localImages: [] },
+      )}\r`);
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      const bootstrapOnly = !!bootstrap && !folded;
+      sendInput(bootstrapOnly ? bootstrap : folded ? `${bootstrap}\n${task}` : task);
+      await waitFor(harness, () => control.finals.length >= 1);
+      if (bootstrapOnly) {
+        expect(nameWrites()).toEqual([]);
+        sendInput(task);
+        await waitFor(harness, () => control.finals.length >= 2);
+      }
+      await waitFor(harness, () => nameWrites().some(request => request.params.name === task), 5_000);
+      sendInput('后续任务不应替换首条正文');
+      await waitFor(harness, () => control.finals.length >= (bootstrapOnly ? 3 : 2));
+      await stopChild(harness.child);
+      expect(nameWrites().map(request => request.params.name)).toEqual([task]);
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('resumes a bootstrap-pending title after restart and a prompt configuration change', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-runner-title-restart-test-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    let control = new ControlCollector(dir);
+    await control.listen();
+    const oldBootstrap = '你是本群的 oncall 协同助手。入群后先阅读群内可见的最近消息、卡片和转发内容，只做只读总结。';
+    const newBootstrap = '新的入群配置不应破坏旧 bootstrap replay';
+    const task = '排查重启后的 rule 789';
+    const previous = captureTitleBootstrap(oldBootstrap);
+    const nameWrites = () => readRequests(logPath).filter(request => request.method === 'thread/name/set');
+    let harness = startRunner(fakeCodex, dir, logPath, '0.162.1', 'success', control.bootstrap.path, {
+      extraArgs: ['--group-join-prompt', oldBootstrap],
+    });
+    const sendInput = (text: string) => harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput(
+      `<user_message>\n${text}\n</user_message>`, { text, localImages: [] },
+    )}\r`);
+    try {
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      sendInput(oldBootstrap);
+      await waitFor(harness, () => control.finals.length >= 1);
+      expect(nameWrites()).toEqual([]);
+      await stopChild(harness.child);
+      await control.close();
+
+      control = new ControlCollector(dir);
+      await control.listen();
+      harness = startRunner(fakeCodex, dir, logPath, '0.162.1', 'success', control.bootstrap.path, {
+        threadId: 'thread-fake',
+        extraArgs: [
+          '--group-join-prompt', newBootstrap,
+          '--group-join-title-digest', previous.digest,
+          '--group-join-title-length', String(previous.length),
+        ],
+      });
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      sendInput(`${oldBootstrap}\n${task}`);
+      await waitFor(harness, () => control.finals.length >= 1);
+      await waitFor(harness, () => nameWrites().some(request => request.params.name === task), 5_000);
+      await stopChild(harness.child);
+      expect(nameWrites().map(request => request.params.name)).toEqual([task]);
+      expect(readRequests(logPath).map(request => request.method).filter(method => method === 'thread/start' || method === 'thread/resume'))
+        .toEqual(['thread/start', 'thread/resume']);
     } finally {
       await stopChild(harness.child);
       await control.close();

@@ -37709,6 +37709,8 @@ async function spawnCliBody(
     initialPrompt: preparedInitialPrompt,
     nativeSessionTitle: cfg.nativeSessionTitle,
     botName: cfg.botName,
+    groupJoinPrompt: cfg.groupJoinPrompt,
+    groupJoinTitleBootstrap: cfg.groupJoinTitleBootstrap,
     botOpenId: cfg.botOpenId,
     larkAppId: cfg.larkAppId,
     // No-transport (apiOnly core-only bot OR HTTP virtual chat): drop the
