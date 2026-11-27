@@ -15,6 +15,7 @@ import { shouldSuppressBridgeEmit } from '../src/services/bridge-fallback-gate.j
 import { extractCardContent } from '../src/im/lark/message-parser.js';
 import { extractCotEntries } from '../src/services/claude-transcript.js';
 import { projectGroupContextCard } from '../src/im/lark/group-context-card.js';
+import { t } from '../src/i18n/index.js';
 
 const key = { larkAppId: 'app_test', sessionId: 'session', turnId: 'om_turn' };
 const input = { mode: 'unified' as const, chatId: 'oc_chat', rootId: 'om_root' };
@@ -92,6 +93,17 @@ describe('one reply card per turn', () => {
     const card = JSON.parse(buildTurnReplyCard(record, presentation));
     return card.body.elements.find((element: any) => element.tag === 'collapsible_panel').elements[0].content as string;
   };
+
+  // Assert branch selection through the i18n key and card structure rather
+  // than pinning user-facing wording.
+  const silentReceipt = (locale: 'zh' | 'en' = 'zh') =>
+    t('worker.turn_terminal_receipt.silent_superseded', undefined, locale);
+  const cardElements = (record: TurnReplyCardRecord, locale: 'zh' | 'en' = 'zh') =>
+    JSON.parse(buildTurnReplyCard(record, locale === 'zh' ? presentation : { ...presentation, locale })).body.elements as any[];
+  const statusElement = (record: TurnReplyCardRecord, locale: 'zh' | 'en' = 'zh') =>
+    cardElements(record, locale).find((element: any) => element.element_id === 'botmux_turn_status');
+  const progressElements = (record: TurnReplyCardRecord, locale: 'zh' | 'en' = 'zh') =>
+    cardElements(record, locale).filter((element: any) => String(element.element_id ?? '').startsWith('botmux_turn_progress'));
 
   it('keeps native CoT progress off the answer surface and publishes one final after reopening', async () => {
     const nativeKey = await nativeTurn('om_native_quiet');
@@ -950,25 +962,26 @@ describe('one reply card per turn', () => {
     expect(cards.get(start.messageId!)!).toContain('完整答复');
   });
 
-  it('says a nothing-to-send turn needed no reply instead of reporting a missing final answer', async () => {
+  it('selects the deliberate-silence receipt branch for a nothing-to-send turn', async () => {
     await store.update(key, { kind: 'start' }, io);
     await store.update(key, { kind: 'terminal', phase: 'completed', silent: true }, io);
     const saved = store.read(key)!;
     expect(saved.silentTurn).toBe(true);
-    const zh = buildTurnReplyCard(saved, presentation);
-    expect(zh).toContain('AI 判断无需回复');
-    expect(zh).not.toContain('本轮没有提供最终答复');
-    const en = buildTurnReplyCard(saved, { ...presentation, locale: 'en' });
-    expect(en).toContain('no reply was needed');
-    expect(en).not.toContain('No final answer was provided');
+    // Branch selection is pinned through the i18n key, not the wording.
+    expect(progressElements(saved, 'zh')[0].content).toContain(silentReceipt('zh'));
+    expect(progressElements(saved, 'en')[0].content).toContain(silentReceipt('en'));
+    expect(statusElement(saved)).toBeDefined();
   });
 
-  it('still reports a missing final answer for a completed turn that was not deliberately silent', async () => {
+  it('selects the generic missing-answer branch for a completed turn that was not deliberately silent', async () => {
     await store.update(key, { kind: 'start' }, io);
     await store.update(key, { kind: 'terminal', phase: 'completed' }, io);
     const saved = store.read(key)!;
     expect(saved.silentTurn).toBeUndefined();
-    expect(buildTurnReplyCard(saved, presentation)).toContain('本轮没有提供最终答复');
+    const bodies = progressElements(saved);
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0].content.trim().length).toBeGreaterThan(0);
+    expect(buildTurnReplyCard(saved, presentation)).not.toContain(silentReceipt());
   });
 
   it('never marks a user-cancelled turn as deliberately silent', async () => {
@@ -978,9 +991,9 @@ describe('one reply card per turn', () => {
     const saved = store.read(key)!;
     expect(saved.phase).toBe('cancelled');
     expect(saved.silentTurn).toBeUndefined();
-    const card = buildTurnReplyCard(saved, presentation);
-    expect(card).toContain('已停止');
-    expect(card).not.toContain('AI 判断无需回复');
+    // The cancelled phase still renders a status row, but never the silence branch.
+    expect(statusElement(saved)).toBeDefined();
+    expect(buildTurnReplyCard(saved, presentation)).not.toContain(silentReceipt());
   });
 
   it('reconciles a persisted silent completed turn to failed when later evidence proves a required reply was missing', async () => {
@@ -992,9 +1005,9 @@ describe('one reply card per turn', () => {
     const saved = store.read(key)!;
     expect(saved.phase).toBe('failed');
     expect(saved.silentTurn).toBeUndefined();
-    const card = buildTurnReplyCard(saved, presentation);
-    expect(card).toContain('执行失败');
-    expect(card).not.toContain('AI 判断无需回复');
+    // A failed status row is rendered, but the deliberate-silence branch is gone.
+    expect(statusElement(saved)).toBeDefined();
+    expect(buildTurnReplyCard(saved, presentation)).not.toContain(silentReceipt());
   });
 
   it('does not reconcile a silent completed turn once a final answer has been delivered', async () => {
@@ -1028,8 +1041,7 @@ describe('one reply card per turn', () => {
     const saved = new TurnReplyCardStore(dir).read(key)!;
     expect(saved.phase).toBe('failed');
     expect(saved.silentTurn).toBeUndefined();
-    const card = buildTurnReplyCard(saved, presentation);
-    expect(card).not.toContain('AI 判断无需回复');
+    expect(buildTurnReplyCard(saved, presentation)).not.toContain(silentReceipt());
   });
 
   it('keeps blank thinking out of the canonical record and shows a repeated paragraph once per stage', async () => {

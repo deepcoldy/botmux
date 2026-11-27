@@ -299,7 +299,7 @@ import { getSessionUsageSnapshot } from './cost-calculator.js';
 import { repairReplyMarkdown } from '../services/reply-markdown.js';
 import { renderBrandTemplate } from '../im/lark/brand-template.js';
 import { handleCotThinkingUpdate, handleCotThinkingSuperseded, finalizeCotMessage, hasCotMessageForTurn, cotMessageFinishStatus, abortCotMessage, resumeCotMessage, cotEnabled } from '../im/lark/cot-message.js';
-import { cardTerminalForHistoricalReply, cardTerminalForRequiredReply, retireReplyCardDisplay, settleTurnReplyCardTerminal, replyCardDispatchAttempt, updateReplyCardNativeThinking, replyCardModeFor, replyCardSandboxBlocked, updateTurnReplyCard, queueTurnReplyTools, flushTurnReplyTools, settleTurnReplyCards, supersedeTurnReplyCard } from './turn-reply-card.js';
+import { cardTerminalForHistoricalReply, cardTerminalForRequiredReply, readHistoricalSink, retireReplyCardDisplay, settleTurnReplyCardTerminal, replyCardDispatchAttempt, updateReplyCardNativeThinking, replyCardModeFor, replyCardSandboxBlocked, updateTurnReplyCard, queueTurnReplyTools, flushTurnReplyTools, settleTurnReplyCards, supersedeTurnReplyCard } from './turn-reply-card.js';
 import { captureTerminalReplyContext } from './terminal-reply-context.js';
 import { ReplyCardWithdrawnError, TurnReplyCardStore } from '../services/turn-reply-card.js';
 import { readGroupContextAuthorOrigin } from '../services/group-context-publication.js';
@@ -30620,7 +30620,7 @@ function setupWorkerHandlers(
           terminalReplyCardSend = (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.turnId, { uuid, beforeWrite });
           const replyCardSend = terminalReplyCardSend;
           const waitingForReply = requiresReply && msg.status === 'completed' && !answered() && !emptyRequiredReply;
-          const cardTerminal = cardTerminalForRequiredReply(msg, requiresReply, answered());
+          const cardTerminal = cardTerminalForRequiredReply(msg, requiresReply, answered);
           const settleCard = waitingForReply
             ? retireReplyCardDisplay(ds, { ...msg, message: tr('worker.required_reply_pending', undefined, localeForBot(ds.larkAppId)) },
               replyCardSend, ownsLifecycleMutation)
@@ -32669,13 +32669,18 @@ function setupWorkerHandlers(
         // Mirror the live handler's fail-closed rule: a required IM reply with
         // no deliverable output must not be styled as deliberate silence just
         // because its terminal is replayed from history after a daemon restart.
-        const historicalSink = journal?.sink(msg.sessionId, turnId);
-        const historicalFinalMessageId = historicalSink?.kind === 'im'
-          ? new TurnSendLedger(config.session.dataDir).readFinalForAttempt({
-            larkAppId: ds.larkAppId, sessionId: msg.sessionId, turnId, dispatchAttempt: msg.dispatchAttempt,
-          })?.messageId
-          : undefined;
-        const historicalCardTerminal = cardTerminalForHistoricalReply(msg, historicalSink, historicalFinalMessageId);
+        // Capture the narrowed fields here: the closure below cannot keep the
+        // turn_terminal type narrowing on the mutable `msg` binding.
+        const historicalSessionId = msg.sessionId;
+        const historicalDispatchAttempt = msg.dispatchAttempt;
+        // Both durable reads (sink here, the send ledger lazily inside the
+        // helper) are exception-contained so presentation evidence can never
+        // block deliver()/ACK; an unreadable sink means no provable requirement.
+        const historicalSink = readHistoricalSink(journal, historicalSessionId, turnId);
+        const historicalCardTerminal = cardTerminalForHistoricalReply(msg, historicalSink, () =>
+          new TurnSendLedger(config.session.dataDir).readFinalForAttempt({
+            larkAppId: ds.larkAppId, sessionId: historicalSessionId, turnId, dispatchAttempt: historicalDispatchAttempt,
+          })?.messageId);
         await settleTurnReplyCardTerminal(ds, historicalCardTerminal,
           (body, type, uuid, beforeWrite) => scopedReply(body, type, turnId, { uuid, beforeWrite }), ownsDisplay)
           .catch(error => logger.warn(`[${t}] historical reply-card terminal: ${error.message}`));

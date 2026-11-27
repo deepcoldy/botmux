@@ -451,33 +451,66 @@ export async function flushTurnReplyTools(ds: DaemonSession, turnId: string, dis
  *  (the live worker handler and replayed-history settlement) must apply the
  *  same rule: when the IM sink required an answer and the send ledger has no
  *  final, `nothing_to_send` / `empty_answer` settles the card as failed rather
- *  than styling a missing required reply as deliberate silence. */
+ *  than styling a missing required reply as deliberate silence. The answer
+ *  probe is lazy (short-circuited), so failed/cancelled terminals and
+ *  non-required turns never touch the send ledger. */
 export function cardTerminalForRequiredReply<
   M extends {
     status: 'completed' | 'failed' | 'cancelled' | 'ambiguous';
     outputDisposition?: 'nothing_to_send' | 'empty_answer' | 'boundary_unobserved' | 'explicit_final_delivered';
   },
->(msg: M, answerRequired: boolean, answered: boolean): M {
-  if (answerRequired && !answered && msg.status === 'completed'
-    && (msg.outputDisposition === 'nothing_to_send' || msg.outputDisposition === 'empty_answer')) {
+>(msg: M, answerRequired: boolean, isAnswered: () => boolean): M {
+  if (answerRequired && msg.status === 'completed'
+    && (msg.outputDisposition === 'nothing_to_send' || msg.outputDisposition === 'empty_answer')
+    && !isAnswered()) {
     return { ...msg, status: 'failed' };
   }
   return msg;
 }
 
+/** Safe read of the durable output sink for a replayed historical event. The
+ *  journal is durable state read before deliver()/ACK, so a read failure must
+ *  surface as "no provable sink" (the terminal then keeps its status) rather
+ *  than throw and block event acknowledgement. */
+export function readHistoricalSink(
+  journal: { sink: (sessionId: string, turnId: string) => OutputSink | undefined } | undefined,
+  sessionId: string, turnId: string,
+): OutputSink | undefined {
+  if (!journal) return undefined;
+  try {
+    return journal.sink(sessionId, turnId);
+  } catch (error) {
+    logger.warn(`historical reply-card terminal: output sink unreadable: ${error instanceof Error ? error.message : String(error)}`);
+    return undefined;
+  }
+}
+
 /** Decision for a terminal replayed from history after a restart. The durable
  *  delivery journal is the only source of the original answer requirement on
  *  that path, and the send ledger proves whether the final was delivered. A
- *  missing or non-IM sink means no required reply is provable, so the terminal
- *  keeps its original status. */
+ *  missing or non-IM sink, or a terminal that cannot be silence-shaped, means
+ *  no ledger evidence is needed and the probe is never invoked. When the probe
+ *  runs but throws (for example a corrupted ledger file), the error is
+ *  contained in this presentation-only helper: the event keeps its delivery
+ *  and acknowledgement path, and the turn fails closed as unanswered. */
 export function cardTerminalForHistoricalReply<
   M extends {
     status: 'completed' | 'failed' | 'cancelled' | 'ambiguous';
     outputDisposition?: 'nothing_to_send' | 'empty_answer' | 'boundary_unobserved' | 'explicit_final_delivered';
   },
->(msg: M, sink: OutputSink | undefined, finalMessageId: string | undefined): M {
+>(msg: M, sink: OutputSink | undefined, readFinalMessageId: () => string | undefined): M {
   const answerRequired = sink?.kind === 'im' && sink.answerRequired === true;
-  return cardTerminalForRequiredReply(msg, answerRequired, !answerRequired || !!finalMessageId);
+  if (!answerRequired || msg.status !== 'completed'
+    || (msg.outputDisposition !== 'nothing_to_send' && msg.outputDisposition !== 'empty_answer')) {
+    return msg;
+  }
+  let answered = false;
+  try {
+    answered = !!readFinalMessageId();
+  } catch (error) {
+    logger.warn(`historical reply-card terminal: send-ledger evidence unreadable, failing closed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return cardTerminalForRequiredReply(msg, true, () => answered);
 }
 
 /** An admitted terminal updates its exact turn's reply card without changing
