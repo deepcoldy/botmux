@@ -1428,7 +1428,7 @@ export interface StructuredBridgeSpec {
   readonly stateCommit?: 'drain' | 'ingest';
   /** Transcript discovery. Lookups by session id are tried before pid. */
   readonly locate: {
-    bySessionId(sessionId: string, cwd?: string): string | undefined;
+    bySessionId(sessionId: string, cwd?: string, nativeSessionDir?: string): string | undefined;
     /** Absent for drivers addressed only by id (oh-my-pi, ebsd). */
     byPid?(pid: number): string | undefined;
   };

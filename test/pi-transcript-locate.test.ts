@@ -11,7 +11,7 @@
  * file Pi never wrote again, and every final of those sessions was lost.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
@@ -19,6 +19,8 @@ import {
   drainPiTranscript,
   findPiTranscriptBySessionId,
   piBotmuxSessionDirIn,
+  piPersistentTranscriptDir,
+  piProfileTranscriptDir,
   piSessionDirName,
   resetPiPendingTurnState,
 } from '../src/services/pi-transcript.js';
@@ -75,6 +77,36 @@ describe('piSessionDirName mirrors Pi getDefaultSessionDirPath', () => {
     ['/root/iserver/', '--root-iserver--'],
   ])('%s → %s', (cwd, dir) => {
     expect(piSessionDirName(cwd)).toBe(dir);
+  });
+});
+
+describe('Pi launch profile', () => {
+  it('uses the exact directory selected by the environment or Pi settings before the native cwd bucket', () => {
+    const cwd = join(ROOT, 'work');
+    mkdirSync(join(cwd, '.pi'), { recursive: true });
+    const realCwd = realpathSync(cwd);
+    const profile = join(realCwd, 'profile');
+    mkdirSync(profile);
+    const env = { PI_CODING_AGENT_DIR: 'profile' };
+    expect(piProfileTranscriptDir(env, cwd)).toBe(join(profile, 'sessions', piSessionDirName(realCwd)));
+    writeFileSync(join(profile, 'settings.json'), JSON.stringify({ sessionDir: '~/shared' }));
+    expect(piProfileTranscriptDir({ ...env, HOME: ROOT }, cwd)).toBe(join(ROOT, 'shared'));
+    writeFileSync(join(cwd, '.pi', 'settings.json'), JSON.stringify({ sessionDir: 'project-records' }));
+    expect(piProfileTranscriptDir(env, cwd)).toBe(join(realCwd, 'project-records'));
+    expect(piProfileTranscriptDir({ ...env, PI_CODING_AGENT_SESSION_DIR: 'env-records' }, cwd)).toBe(join(realCwd, 'env-records'));
+    expect(piProfileTranscriptDir({ ...env, HOME: ROOT }, cwd, false)).toBe(join(ROOT, 'shared'));
+  });
+
+  it('reattaches using the live pane’s directory across config edits, then replaces it on cold launch', () => {
+    const first = join(ROOT, 'first');
+    const second = join(ROOT, 'second');
+    expect(piPersistentTranscriptDir(ROOT, SID, first, true)).toBeUndefined();
+    expect(piPersistentTranscriptDir(ROOT, SID, first, false)).toBe(first);
+    expect(piPersistentTranscriptDir(ROOT, SID, second, true)).toBe(first);
+    expect(piPersistentTranscriptDir(ROOT, SID, second, false)).toBe(second);
+    expect(piPersistentTranscriptDir(ROOT, SID, undefined, true)).toBe(second);
+    expect(piPersistentTranscriptDir(ROOT, SID, undefined, false)).toBeUndefined();
+    expect(piPersistentTranscriptDir(ROOT, SID, first, true)).toBeUndefined();
   });
 });
 
@@ -142,6 +174,24 @@ describe('Pi transcript layout follows the session across a sandbox switch', () 
     expect(findPiTranscriptBySessionId(SID, cwd, SESSIONS)).toBe(adopted.status === 'copied' ? adopted.to : '');
     // A second sandboxed restart leaves the own copy alone.
     expect(adoptPiTranscriptIntoBotmuxDir(SID, cwd, SESSIONS)).toEqual({ status: 'skipped', reason: 'already-own' });
+  });
+
+  it('copies only this profile’s native history into the managed sandbox directory', () => {
+    const cwd = join(ROOT, 'wt');
+    const file = `2026-10-01T00-00-00-000Z_${SID}.jsonl`;
+    writeSession(piSessionDirName(cwd), file, [header(cwd)]);
+    const profileRoot = join(ROOT, 'private-profile', 'sessions');
+    const bucket = join(profileRoot, piSessionDirName(cwd));
+    expect(findPiTranscriptBySessionId(SID, cwd, SESSIONS, bucket)).toBeUndefined();
+    mkdirSync(bucket, { recursive: true });
+    const native = join(bucket, file);
+    const contents = [header(cwd), { type: 'session_info', name: 'profile history' }].map(row => JSON.stringify(row)).join('\n');
+    writeFileSync(native, contents);
+    expect(findPiTranscriptBySessionId(SID, cwd, SESSIONS, bucket)).toBe(native);
+    const copied = join(ownDir(), file);
+    expect(adoptPiTranscriptIntoBotmuxDir(SID, cwd, SESSIONS, join(ROOT, 'new-profile'), bucket)).toEqual({ status: 'copied', from: native, to: copied });
+    expect(readFileSync(copied, 'utf8')).toBe(contents);
+    expect(findPiTranscriptBySessionId(SID, cwd, SESSIONS, bucket)).toBe(copied);
   });
 
   it('on → off: the own dir keeps winning over a stale or missing cwd-bucket file', () => {

@@ -50,7 +50,8 @@ function fakePiSource(answer: string): string {
   const args = process.argv.slice(2);
   const sid = args[args.indexOf('--session-id') + 1];
   const cwd = process.cwd();
-  const dir = path.join(os.homedir(), '.pi', 'agent', 'sessions',
+  const profile = process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), '.pi', 'agent');
+  const dir = path.join(profile, 'sessions',
     '--' + cwd.replace(/^[/\\\\]/, '').replace(/[/\\\\:]/g, '-') + '--');
   fs.mkdirSync(dir, { recursive: true });
   const existing = fs.readdirSync(dir).find(name => name.endsWith('_' + sid + '.jsonl'));
@@ -86,7 +87,7 @@ function fakePiSource(answer: string): string {
 `;
 }
 
-function startResumedWorker(answer: string) {
+function startPiWorker(answer: string, profile?: string, resume = true) {
   root = mkdtempSync(join(tmpdir(), 'botmux-worker-pi-cwd-move-'));
   const dataDir = join(root, 'data');
   const newCwd = join(root, 'home');
@@ -125,7 +126,8 @@ function startResumedWorker(answer: string) {
   child.stderr?.on('data', chunk => logs.push(chunk.toString()));
   child.send({
     type: 'init', sessionId: cliSessionId, chatId: 'oc_test', rootMessageId: 'om_root',
-    workingDir: newCwd, cliId: 'pi', cliPathOverride: fakePi, cliSessionId, resume: true,
+    env: profile ? { PI_CODING_AGENT_DIR: join(root, profile) } : undefined,
+    workingDir: newCwd, cliId: 'pi', cliPathOverride: fakePi, cliSessionId: resume ? cliSessionId : undefined, resume,
     backendType: 'pty', prompt: '@Pure(pi) #1809 接着做完复审，给结论', larkAppId: 'app_test', larkAppSecret: 'test-only',
     turnId: 'om_pi_turn', promptInjection: 'none',
   } satisfies DaemonToWorker);
@@ -133,9 +135,13 @@ function startResumedWorker(answer: string) {
 }
 
 describe('Pi worker: a session resumed in a different cwd', () => {
-  it('reads the transcript Pi starts in the new cwd and forwards the conclusion', async () => {
+  it.each([
+    { profile: undefined, resume: true },
+    { profile: 'bot-profile', resume: true },
+    { profile: 'bot-profile', resume: false },
+  ])('forwards the reply with profile $profile and resume=$resume', async ({ profile, resume }) => {
     const answer = '已跑完，结论先给：head 64b84e46 可以直接合。';
-    const { messages, logs, oldTranscript, oldBytes, newCwd } = startResumedWorker(answer);
+    const { messages, logs, oldTranscript, oldBytes, newCwd } = startPiWorker(answer, profile, resume);
 
     await waitUntil(() => messages.some(msg => msg.type === 'final_output'), logs);
     const finals = messages.filter((msg): msg is Extract<WorkerToDaemon, { type: 'final_output' }> => msg.type === 'final_output');
@@ -145,11 +151,12 @@ describe('Pi worker: a session resumed in a different cwd', () => {
     // The bridge followed Pi's new file, not the old one Pi never touched.
     const attached = logs.join('').match(/Codex bridge fresh-empty: (\S+)/)?.[1];
     expect(attached).toContain(`/${piSessionDirName(newCwd)}/`);
+    if (profile) expect(attached).toContain(`/${profile}/sessions/`);
     expect(readFileSync(oldTranscript, 'utf8')).toBe(oldBytes);
   }, 30_000);
 
   it('tells the thread when the turn never shows up in the transcript', async () => {
-    const { messages, logs } = startResumedWorker('');
+    const { messages, logs } = startPiWorker('');
 
     await waitUntil(() => messages.some(msg => msg.type === 'user_notify'), logs, 40_000);
     const notice = messages.find((msg): msg is Extract<WorkerToDaemon, { type: 'user_notify' }> => msg.type === 'user_notify')!;

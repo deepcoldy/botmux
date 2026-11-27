@@ -1,7 +1,7 @@
 /**
  * Reader for Pi agent's per-session JSONL transcript.
  *
- * Pi stores sessions under:
+ * By default, Pi stores sessions under:
  *   ~/.pi/agent/sessions/<workspace-encoded>/<timestamp>_<sessionId>.jsonl
  *
  * Bridge contract (same structured queue as Codex/Grok/CoCo):
@@ -66,9 +66,11 @@
  * matching turn — identical to Codex/Grok. Non-steered turns stay strictly
  * interleaved (user → assistant_final → user → assistant_final).
  */
-import { closeSync, copyFileSync, existsSync, mkdirSync, openSync, readSync, readdirSync, realpathSync, renameSync, rmSync, statSync } from 'node:fs';
+import { closeSync, constants, copyFileSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, rmSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { writeFileAtomic0600 } from './cli-credential-source.js';
 import { codexTaskFailureCode, safeFailureSummary, type CodexCotEntry } from './codex-transcript.js';
 import { boundSubjectForTransport, subjectFromInputObject } from './cot-subject.js';
 import { beginJsonlDrain, iterateJsonlLines } from './jsonl-cursor.js';
@@ -203,6 +205,69 @@ function piCwdVariants(cwd: string): string[] {
   return variants;
 }
 
+/** Read only bounded regular settings files. A project may supply .pi/settings.json. */
+function configuredSessionDir(file: string): string | undefined {
+  let fd: number | undefined;
+  try {
+    fd = openSync(file, constants.O_RDONLY | constants.O_NONBLOCK);
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || stat.size > 1024 * 1024) return undefined;
+    const bytes = Buffer.alloc(stat.size);
+    const count = readSync(fd, bytes, 0, bytes.length, 0);
+    const dir = JSON.parse(bytes.toString('utf8', 0, count).replace(/^\uFEFF/, '')).sessionDir;
+    return typeof dir === 'string' && dir ? dir : undefined;
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+/** Mirror Pi's directory choice for an unsandboxed profile. The worker passes
+ *  its own --session-dir separately when a managed sandbox takes precedence. */
+export function piProfileTranscriptDir(env: NodeJS.ProcessEnv, cwd: string, readProjectSettings = true): string | undefined {
+  const home = env.HOME || homedir();
+  if (!env.PI_CODING_AGENT_DIR && !env.PI_CODING_AGENT_SESSION_DIR && home === homedir()) return undefined;
+  const actualCwd = piCwdVariants(cwd).at(-1)!;
+  const absolute = (path: string) => {
+    if (path === '~') return home;
+    if (path.startsWith('~/')) return join(home, path.slice(2));
+    if (path.startsWith('file://')) return fileURLToPath(path);
+    return resolve(actualCwd, path);
+  };
+  const profile = absolute(env.PI_CODING_AGENT_DIR || join(home, '.pi', 'agent'));
+  const exact = env.PI_CODING_AGENT_SESSION_DIR
+    || (readProjectSettings && configuredSessionDir(join(actualCwd, '.pi', 'settings.json')))
+    || configuredSessionDir(join(profile, 'settings.json'));
+  return exact ? absolute(exact) : join(profile, 'sessions', piSessionDirName(actualCwd));
+}
+
+export function piPreviousTranscriptDir(dataDir: string, sessionId: string): string | undefined {
+  if (!SESSION_UUID_RE.test(sessionId)) return undefined;
+  try {
+    const saved: unknown = JSON.parse(readFileSync(join(dataDir, 'sessions', sessionId + '.pi-transcript-dir'), 'utf8'));
+    return typeof saved === 'string' && isAbsolute(saved) ? saved : undefined;
+  } catch { return undefined; }
+}
+
+/** Reattaching a worker leaves the live Pi process and its original profile
+ *  in place. Only custom launches need a record. A missing record retains
+ *  the default lookup used before profile-aware workers. */
+export function piPersistentTranscriptDir(
+  dataDir: string, sessionId: string, dir: string | undefined, reattach: boolean,
+): string | undefined {
+  if (!SESSION_UUID_RE.test(sessionId)) return dir;
+  if (reattach) return piPreviousTranscriptDir(dataDir, sessionId);
+  const file = join(dataDir, 'sessions', sessionId + '.pi-transcript-dir');
+  if (!dir) {
+    rmSync(file, { force: true });
+    return undefined;
+  }
+  mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+  writeFileAtomic0600(file, JSON.stringify(dir));
+  return dir;
+}
+
 /** Pi's own cap on how far it scans for a session header (session-manager.js
  *  MAX_SESSION_HEADER_SCAN_BYTES); beyond it Pi does not treat the file as a
  *  session either. */
@@ -214,7 +279,8 @@ const PI_SESSION_HEADER_SCAN_BYTES = 1024 * 1024;
 function piTranscriptHeaderCwd(path: string): string | undefined {
   let fd: number | undefined;
   try {
-    fd = openSync(path, 'r');
+    fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+    if (!fstatSync(fd).isFile()) return undefined;
     const buf = Buffer.alloc(64 * 1024);
     const chunks: Buffer[] = [];
     let scanned = 0;
@@ -324,6 +390,7 @@ export function findPiTranscriptBySessionId(
   cliSessionId: string,
   cwd?: string,
   sessionsRoot: string = PI_SESSIONS_ROOT,
+  nativeSessionDir?: string,
 ): string | undefined {
   if (!cliSessionId || !SESSION_UUID_RE.test(cliSessionId)) return undefined;
   const cwds = cwd ? piCwdVariants(cwd) : [];
@@ -334,6 +401,7 @@ export function findPiTranscriptBySessionId(
   if (piSessionUsesBotmuxDir(cliSessionId, sessionsRoot)) {
     return piBotmuxSessionTranscript(cliSessionId, sessionsRoot, cwds);
   }
+  if (nativeSessionDir) return piTranscriptInDir(nativeSessionDir, cliSessionId, cwds);
   return findPiNativeTranscript(cliSessionId, cwds, sessionsRoot);
 }
 
@@ -394,9 +462,12 @@ export function piBotmuxSessionTranscript(
   cwds: readonly string[] = [],
 ): string | undefined {
   if (!sessionId || !SESSION_UUID_RE.test(sessionId)) return undefined;
-  const dir = piBotmuxSessionDirIn(sessionsRoot, sessionId);
+  return piTranscriptInDir(piBotmuxSessionDirIn(sessionsRoot, sessionId), sessionId, cwds);
+}
+
+function piTranscriptInDir(dir: string, sessionId: string, cwds: readonly string[]): string | undefined {
   let names: string[];
-  try { names = readdirSync(dir); } catch { return undefined; }
+  try { names = readdirSync(dir, { withFileTypes: true }).filter(e => e.isFile()).map(e => e.name); } catch { return undefined; }
   const name = names
     .filter(n => n.endsWith(`_${sessionId}.jsonl`))
     .sort()
@@ -422,13 +493,21 @@ export function adoptPiTranscriptIntoBotmuxDir(
   sessionId: string,
   cwd: string | undefined,
   sessionsRoot: string = PI_SESSIONS_ROOT,
+  nativeSessionDir?: string,
+  previousSessionDir?: string,
 ): { status: 'copied'; from: string; to: string } | { status: 'skipped'; reason: 'already-own' | 'not-found' } {
   const cwds = cwd ? piCwdVariants(cwd) : [];
   // Per cwd, as Pi resumes per cwd: a session that moved dirs may have history
   // for this cwd only in the native bucket even though its own dir has another.
   if (piBotmuxSessionTranscript(sessionId, sessionsRoot, cwds)) return { status: 'skipped', reason: 'already-own' };
   // Native buckets only: the own-dir lookup above already came up empty.
-  const from = findPiNativeTranscript(sessionId, cwds, sessionsRoot);
+  // On a sandbox switch the old pane may have used a project sessionDir.
+  // Recover its recorded launch directory without reading project settings
+  // on behalf of the sandbox. A /cd can require the new cwd's native bucket.
+  const previous = previousSessionDir && piTranscriptInDir(previousSessionDir, sessionId, cwds);
+  const from = previous || (nativeSessionDir
+    ? piTranscriptInDir(nativeSessionDir, sessionId, cwds)
+    : findPiNativeTranscript(sessionId, cwds, sessionsRoot));
   if (!from) return { status: 'skipped', reason: 'not-found' };
   const dir = piBotmuxSessionDirIn(sessionsRoot, sessionId);
   const to = join(dir, from.slice(from.lastIndexOf('/') + 1));

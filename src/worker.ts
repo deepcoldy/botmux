@@ -498,7 +498,7 @@ import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
 import { CODEX_CAPACITY_ERROR_CODE, CODEX_AUTH_ERROR_CODE, CODEX_PAYLOAD_TOO_LARGE_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, readCodexLiveSessionId, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexGenerationSessionIdFromRolloutPath, isCodexRateLimitEvent, codexSessionsRootFromRolloutPath, scanCodexThreadSettings, readLatestCodexRuntime, codexRolloutHasAsyncQuestionReply, findPendingCodexAsyncQuestion, selectNewCodexAsyncQuestions, type CodexAsyncQuestionRecord, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
 import { parseCodexAsyncQuestions } from './services/codex-async-user-input.js';
 import { codexConsumedRolloutEvents, codexEventsWithStableIds } from './services/codex-rollout-replay.js';
-import { PI_CREDENTIAL_ERROR_CODE, adoptPiTranscriptIntoBotmuxDir, piSessionUsesBotmuxDir } from './services/pi-transcript.js';
+import { PI_CREDENTIAL_ERROR_CODE, adoptPiTranscriptIntoBotmuxDir, piPersistentTranscriptDir, piPreviousTranscriptDir, piProfileTranscriptDir, piSessionUsesBotmuxDir } from './services/pi-transcript.js';
 import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './services/codex-service-tier.js';
 import { CodexCapacityMonitor } from './services/codex-capacity-monitor.js';
 import { readCodexModelSettingsCursor, spawnWithCodexModelLaunch, type CodexModelLaunchObservation } from './services/codex-model-selection.js';
@@ -14016,6 +14016,8 @@ let codexBridgeBaselineDone = false;
  *  ~/.cursor/projects reader, so cursor's transcript fallback must not
  *  activate there outside adopt (adopted panes run unsandboxed). */
 let lastResolvedSandboxMode: string | undefined;
+/** Native transcript directory for the current Pi launch, including late attach. */
+let piBridgeSessionDir: string | undefined;
 /** Hard ceiling for the busy-tick attribution-lease refresh, measured from
  *  the mark. The screen "busy" signal (isPromptReady=false) is a regex
  *  heuristic and can stay asserted with no real work (swallowed Enter /
@@ -18909,6 +18911,7 @@ function codexBridgeStartTimer(): void {
         // new local/App-side turns after it available for forwarding.
         const path = resolveFileBridgePath(lastInitConfig?.cliId, {
           sessionId: codexBridgePendingSessionId,
+          nativeSessionDir: piBridgeSessionDir,
           cwd: lastInitConfig?.workingDir,
           pid: lastInitConfig?.adoptMode ? codexAdoptPendingPid : undefined,
         });
@@ -20301,6 +20304,7 @@ function codexBridgeNotifyCliSessionId(
   const path = resolveFileBridgePath(lastInitConfig?.cliId, {
     sessionId: cliSessionId,
     cwd: lastInitConfig?.workingDir,
+    nativeSessionDir: piBridgeSessionDir,
   });
   if (path) {
     codexBridgePendingSessionId = undefined;
@@ -20835,6 +20839,7 @@ function structuredBridgeRecoveryCursorAtMark(): { jsonlPath: string; offsetAtMa
     ?? lastInitConfig?.cliSessionId;
   const jsonlPath = (sessionIdAtMark ? resolveFileBridgePath(cliId, {
     sessionId: sessionIdAtMark,
+    nativeSessionDir: piBridgeSessionDir,
     cwd: lastInitConfig?.workingDir,
   }) : undefined) ?? (cliId === 'traex' && currentTraexObservedPid()
     ? findTraexRolloutByPid(currentTraexObservedPid()!)?.path : undefined);
@@ -21981,6 +21986,7 @@ function stopCodexBridge(): void {
   codexAdoptPendingPid = undefined;
   codexAdoptStartMs = undefined;
   lastResolvedSandboxMode = undefined;
+  piBridgeSessionDir = undefined;
   grokBridgePidProbeLastMs = 0;
   traexBridgePidProbeLastMs = 0;
   traexFileSourceLogKey = undefined;
@@ -34111,7 +34117,7 @@ function attachStructuredBridgeAtSpawn(
     ? ids.cliSessionId
     : (ids.cliSessionId ?? ids.adapterSessionId);
   const path = sid
-    ? resolveFileBridgePath(cfg.cliId, { sessionId: sid, cwd: cfg.workingDir })
+    ? resolveFileBridgePath(cfg.cliId, { sessionId: sid, cwd: cfg.workingDir, nativeSessionDir: piBridgeSessionDir })
     : undefined;
   if (path) {
     const mode = sharesAppServer
@@ -37359,6 +37365,12 @@ async function spawnCliBody(
       log(`WARN OMP legacy resume migration skipped (${migrated.reason}${migrated.detail ? `: ${migrated.detail}` : ''})`);
     }
   }
+  const piProfileDir = cfg.cliId === 'pi' && !cfg.adoptMode && !scratchRequested
+    ? piProfileTranscriptDir({
+      ...buildSessionChildEnv(process.env, cfg.envPolicy, cfg.envUnset, cfg.protectedMcpPolicy),
+      ...botInjectedEnv(cfg.env, cfg.envPolicy, cfg.protectedMcpPolicy),
+    }, cfg.workingDir, !sandboxRequested)
+    : undefined;
   // Pi resumes inside its own session dir once it is sandboxed, or once it ever
   // was (the dir then holds its history). History for this cwd that only
   // exists in Pi's native cwd bucket (the session started unsandboxed, or ran
@@ -37367,7 +37379,8 @@ async function spawnCliBody(
   if (cfg.cliId === 'pi' && effectiveResume && !willReattachPersistent && !cfg.adoptMode
       && ((sandboxRequested && !scratchRequested) || piSessionUsesBotmuxDir(effectiveAdapterSessionId))) {
     try {
-      const adopted = adoptPiTranscriptIntoBotmuxDir(effectiveAdapterSessionId, cfg.workingDir);
+      const previousDir = piPreviousTranscriptDir(config.session.dataDir, cfg.sessionId);
+      const adopted = adoptPiTranscriptIntoBotmuxDir(effectiveAdapterSessionId, cfg.workingDir, undefined, piProfileDir, previousDir);
       if (adopted.status === 'copied') log(`Pi sandbox resume transcript copied: ${adopted.from} → ${adopted.to}`);
     } catch (err) {
       log(`WARN Pi sandbox resume transcript copy failed: ${(err as Error).message}`);
@@ -37882,6 +37895,9 @@ async function spawnCliBody(
   if (cfg.cliId === 'traex' && !cfg.adoptMode && effectiveResume && effectiveCliSessionId) {
     noteTraexResumeTargetLeftInDefaultHome(effectiveCliSessionId);
   }
+  const sandboxSessionDir = sandboxRequested && !scratchRequested
+    ? cliAdapter.sandboxSessionDir?.(effectiveAdapterSessionId)
+    : undefined;
   const args = cliAdapter.buildArgs({
     sessionId: effectiveAdapterSessionId,
     resume: effectiveResume,
@@ -37959,9 +37975,7 @@ async function spawnCliBody(
     skillPluginDir: cfg.skillPluginDir,
     // Same predicate and session id as the oncall sandbox block below, which
     // creates this dir and re-opens it read-write inside the masked tree.
-    sandboxSessionDir: sandboxRequested && !scratchRequested
-      ? cliAdapter.sandboxSessionDir?.(effectiveAdapterSessionId)
-      : undefined,
+    sandboxSessionDir,
     // Per-bot CODEX_HOME can be enabled without the OS sandbox. Only the latter
     // needs Codex's read-isolation shell-env behavior.
     readIsolation: sandboxRequested && willRedirectCliData,
@@ -40589,6 +40603,22 @@ async function spawnCliBody(
   cliOutlivesWorker = cliSurvivesWorkerExit({ backendType: effectiveBackendType, persistentSessionName });
   const actuallyReattachedPersistent = 'isReattach' in backend
     && backend.isReattach === true;
+  // --session-dir takes precedence over Pi's profile, even before the first
+  // JSONL exists. A fresh sandboxed worker must wait for its own file.
+  piBridgeSessionDir = cfg.cliId === 'pi' ? sandboxSessionDir ?? piProfileDir : undefined;
+  if (cfg.cliId === 'pi' && !cfg.adoptMode && !isRemoteBackendType(effectiveBackendType)) {
+    // A later sandbox migration may need the previous directory even when
+    // the preceding generation used a plain PTY.
+    try {
+      piBridgeSessionDir = piPersistentTranscriptDir(
+        config.session.dataDir, cfg.sessionId, piBridgeSessionDir, actuallyReattachedPersistent,
+      );
+    } catch (err) {
+      // The CLI already started. This worker can still follow its launch
+      // directory even if the record for a future reattach could not be saved.
+      log(`WARN Pi transcript directory not saved for reattach: ${String(err)}`);
+    }
+  }
   lastSpawnPersistentReattach = actuallyReattachedPersistent;
   prepareDeploymentContinuationForSpawn(cfg, actuallyReattachedPersistent);
   // A NEW process resuming the same conversation — not a re-attach, whose CLI
