@@ -126,6 +126,18 @@ describe('native submission completion', () => {
     await reconcileAndDeliver(); expect(mocks.merge).toHaveBeenCalledOnce();
     expect(fetcher.mock.calls.filter(([url]) => new URL(url).pathname.endsWith('/chat/'))).toHaveLength(0);
   });
+  it('stops looking for unconfirmed sidebar submissions when the draft expires', async () => {
+    await open();
+    vi.setSystemTime(started + 24 * 60 * 60_000);
+    fetcher.mockClear();
+    await reconcileAndDeliver();
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(new OncallFormStore(dir).pendingNativeSubmissions(appId)).toEqual([]);
+    expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
+    expect(mocks.update).not.toHaveBeenCalled();
+    expect(mocks.merge).not.toHaveBeenCalled();
+  });
+
   it('waits for submission and never treats an open sidebar as a created group', async () => {
     await open(); await reconcileAndDeliver();
     expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined(); expect(mocks.merge).not.toHaveBeenCalled(); expect(mocks.withdraw).not.toHaveBeenCalled();

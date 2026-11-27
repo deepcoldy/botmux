@@ -40,6 +40,8 @@ export interface OncallGroupRequest {
   flowId?: string;
   openChatId?: string;
   inviteLink?: string;
+  /** Original group message awaiting the public join button for this private intake. */
+  pendingOriginReplyTo?: string;
   submittedAtMs?: number;
   operatorOpenId?: string;
   forwarded?: string[];
@@ -192,7 +194,7 @@ export class OncallGroupStore {
         return Date.now() - (request.submittedAtMs ?? 0) < 24 * 60 * 60_000;
       }
       return request?.status === 'succeeded'
-        && (request.formClosePending
+        && (request.formClosePending || !!request.pendingOriginReplyTo
           || (((!source.privateIntake && !request.inviteLink) || request.cardRefreshPending) && !!request.openChatId)
           || (Date.now() - (request.submittedAtMs ?? 0) < 24 * 60 * 60_000
             && (!!request.cardRefreshPending || oncallForwardingPending(request))));
@@ -342,6 +344,7 @@ export class OncallGroupStore {
       // A crashed or timed-out request may already have created a group.
       if (previous && previous.status !== 'failed') return false;
       this.write(file, { status: 'pending', questionId: source.questionId, sourceMessageId: source.messageId,
+        ...(source.privateIntake && { pendingOriginReplyTo: source.privateIntake.groupMessageId }),
         ...(creation ? { creation } : {}),
         ...(source.sessionId || creation ? { attemptId: randomUUID(), submittedAtMs: snapshot?.cutoffMs ?? Date.now() } : {}),
         ...(source.sessionId ? { messageIdsSnapshot: snapshot?.forwardMode === 'none' ? [] : snapshot?.messageIds ?? this.messageIds(source),
@@ -361,6 +364,7 @@ export class OncallGroupStore {
       if (previous && previous.status !== 'failed') return previous.status === 'succeeded'
         && previous.flowId === result.flowId && previous.openChatId === result.openChatId;
       this.write(file, { status: 'succeeded', questionId: source.questionId, sourceMessageId: source.messageId,
+        ...(source.privateIntake && { pendingOriginReplyTo: source.privateIntake.groupMessageId }),
         attemptId: randomUUID(), operatorOpenId, submittedAtMs: snapshot.cutoffMs,
         messageIdsSnapshot: snapshot.forwardMode === 'none' ? [] : snapshot.messageIds, forwardMode: snapshot.forwardMode,
         ...result, cardRefreshPending: true });

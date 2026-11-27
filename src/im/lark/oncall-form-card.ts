@@ -39,7 +39,7 @@ export function buildOncallFormCard(draft: OncallFormDraft): string {
   const confirmText = plainText('确认发起人工 Oncall');
   // Keep selectors outside the form so their callbacks run before submission.
   const submission = fields.length ? [
-    { tag: 'markdown', content: privateIntake ? '仅把这里填写的内容交给值班人员。切换分类会清空未提交内容。' : '更改上方选项后，需要重新填写附加信息。', text_size: 'notation' },
+    { tag: 'markdown', content: privateIntake ? '建群后按交接设置处理本次私聊。切换分类会清空未提交内容。' : '更改上方选项后，需要重新填写附加信息。', text_size: 'notation' },
     { tag: 'form', name: `botmux_oncall_custom_form_${draft.version}`, elements: [
       ...fields.flatMap((field, index): Record<string, unknown>[] => field.type === 'radio' || field.type === 'select'
         ? [
@@ -62,8 +62,8 @@ export function buildOncallFormCard(draft: OncallFormDraft): string {
     ] },
   ] : [
     { tag: 'markdown', text_size: 'notation', content: draft.nativeFormLink
-      ? [draft.nativeFormReason, privateIntake ? '请在侧栏填写要交给值班人员的信息并提交。' : '请在侧栏补充自定义信息并确认提单，成功后将按交接设置同步当前会话。'].filter(Boolean).join('\n')
-      : privateIntake ? '仅创建人工群，私聊记录和附件不会自动转交。' : '建群后将按当前交接设置处理对话和附件。' },
+      ? [draft.nativeFormReason, '请在侧栏补充自定义信息并确认提单，成功后将按交接设置同步当前会话。'].filter(Boolean).join('\n')
+      : '建群后将按当前交接设置处理对话和附件。' },
     actionRow({ tag: 'button', text: confirmText, type: 'primary',
       disabled: !draft.region || !draft.typeId, behaviors: [draft.nativeFormLink
         ? { type: 'open_url', default_url: sidebar(draft.nativeFormLink) }

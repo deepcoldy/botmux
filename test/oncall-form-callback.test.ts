@@ -68,6 +68,7 @@ describe('delivered Oncall cards across intake configuration changes', () => {
   }
 
   it('continues an old public card in the clicker DM without copying or forwarding the old conversation', async () => {
+    mocks.bot.config.oncallGroup.forwardMode = 'none';
     expect((await handleOncallGroupAction(event('oncall_group_create'), 'app')).toast.type).toBe('info');
     expect(mocks.userReceipt).toHaveBeenCalledWith('app', 'ou_owner', expect.any(String), 'interactive', expect.any(String),
       expect.objectContaining({ timeoutMs: expect.any(Number) }), expect.objectContaining({ beforeWrite: expect.any(Function) }));
@@ -106,6 +107,7 @@ describe('delivered Oncall cards across intake configuration changes', () => {
   });
 
   it('submits only the configured fields when an old group card opens a private form', async () => {
+    mocks.bot.config.oncallGroup.forwardMode = 'none';
     mocks.bot.config.oncallGroup.customFormMode = 'botmux';
     const workflow = [
       { base: { key: 'details', label: '说明', type: 'textArea' } },
@@ -144,7 +146,7 @@ describe('delivered Oncall cards across intake configuration changes', () => {
     await handleOncallGroupAction(event('oncall_group_create'), 'app');
     const card = JSON.parse(mocks.update.mock.calls.at(-1)![2]);
     const button = card.body.elements.at(-1).columns.at(-1).elements[0];
-    expect(button.confirm.text.content).toContain('不自动转发对话记录');
+    expect(button.confirm.text.content).toContain('合并为聊天记录');
     expect(button.behaviors[0].value.action).toBe('oncall_group_create');
     expect(mocks.reply).not.toHaveBeenCalled();
     expect(fetcher).not.toHaveBeenCalled();
@@ -252,7 +254,7 @@ describe('private Oncall intake', () => {
     const privateIntake = { appId: 'app', groupChatId: 'oc_source', groupMessageId: 'om_public_question',
       chatId: 'oc_dm', rootMessageId: 'om_dm_root', ownerOpenId: 'ou_owner', createdAtMs: Date.now() };
     const dm: OncallGroupSource = { ...source, chatId: privateIntake.chatId, rootId: privateIntake.rootMessageId,
-      sessionId: 'private_session', messageId: 'om_dm_answer', questionId: 'om_dm_question', privateIntake };
+      sessionId: 'private_session', messageId: 'om_dmanswer', questionId: 'om_dmquestion', privateIntake };
     const groups = new OncallGroupStore(dir);
     groups.recordSource({ ...dm, cardJson: JSON.stringify({ schema: '2.0', body: { elements: [] } }) });
     mocks.bot.config.oncallGroup = { enabled: true, chatIds: ['oc_source'], privateIntakeChatIds: ['oc_source'],
@@ -267,6 +269,7 @@ describe('private Oncall intake', () => {
 
   it('keeps the entry in the linked DM and accepts an owner-supplied summary from a legacy card', async () => {
     const { dm, groups, act } = setupPrivateIntake();
+    mocks.bot.config.oncallGroup.forwardMode = 'none';
     const raw = JSON.stringify({ schema: '2.0', body: { elements: [] } });
     const policy = mocks.bot.config.oncallGroup;
     const context = { appId: 'app', sessionId: dm.sessionId, questionId: dm.questionId, phase: 'final' as const };
@@ -303,12 +306,16 @@ describe('private Oncall intake', () => {
     expect(mocks.thread).not.toHaveBeenCalled();
     expect(mocks.forward).not.toHaveBeenCalled();
     expect(mocks.merge).not.toHaveBeenCalled();
-    expect(mocks.invite).not.toHaveBeenCalled();
+    expect(mocks.invite).toHaveBeenCalledWith('app', 'oc_created');
+    const notices = mocks.reply.mock.calls.filter(([, id]) => id === dm.privateIntake!.groupMessageId);
+    expect(notices).toHaveLength(1);
+    expect(notices[0][2]).not.toContain('请检查支付状态');
     expect(mocks.update.mock.calls.some(([, id, card]) => id === dm.messageId && card.includes('/client/chat/open?openChatId=oc_created'))).toBe(true);
   });
 
   it('uses the preset directly in the DM and creates one ticket without private content', async () => {
     const { dm, groups, act } = setupPrivateIntake();
+    mocks.bot.config.oncallGroup.forwardMode = 'none';
     mocks.bot.config.oncallGroup.flowMode = 'direct';
     fetcher.mockResolvedValue(response({ oncall_flow_id: '123', open_chat_id: 'oc_created' }));
     for (let i = 0; i < 2; i++) await handleOncallGroupAction(act('oncall_group_create'), 'app');
@@ -318,12 +325,83 @@ describe('private Oncall intake', () => {
     });
     expect(groups.getRequest(dm)).toMatchObject({ status: 'succeeded', forwardMode: 'none', messageIdsSnapshot: [] });
     expect(mocks.detail).not.toHaveBeenCalled();
-    expect(mocks.reply).not.toHaveBeenCalled();
+    expect(mocks.reply).toHaveBeenCalledOnce();
+    const [, anchor, raw, type, inThread] = mocks.reply.mock.calls[0];
+    expect([anchor, type, inThread]).toEqual(['om_public_question', 'interactive', true]);
+    const button = JSON.parse(raw).body.elements[1].columns[0].elements[0];
+    expect(button.text.content).toBe('进入人工 Oncall 群');
+    expect(button.behaviors).toEqual([{ type: 'open_url', default_url: await mocks.invite.mock.results[0].value }]);
     expect(mocks.forward).not.toHaveBeenCalled();
     expect(mocks.update.mock.calls.at(-1)?.[2]).toContain('oc_created');
   });
 
-  it('opens a blank native form and stores no automatic forwarding for complex private categories', async () => {
+  it.each(['merge', 'individual'] as const)('forwards only the submitted private consultation to its Oncall group (%s)', async mode => {
+    const { dm, groups, act } = setupPrivateIntake();
+    const now = Date.now();
+    mocks.bot.config.oncallGroup.flowMode = 'direct';
+    mocks.bot.config.oncallGroup.forwardMode = mode;
+    groups.registerTurn('app', dm.sessionId!, dm.questionId);
+    groups.registerTurn('app', dm.sessionId!, 'om_quoted');
+    mocks.thread.mockResolvedValue({ verifiedThread: false, messages: [
+      { message_id: dm.questionId, create_time: now - 5000 },
+      { message_id: 'om_file', parent_id: dm.questionId, msg_type: 'file', create_time: now - 4000 },
+      { message_id: 'om_otherdm', create_time: now - 3000 },
+      { message_id: dm.messageId, create_time: now - 1000 },
+      { message_id: 'om_later', parent_id: dm.questionId, create_time: now + 60_000 },
+    ] });
+    mocks.detail.mockResolvedValue({ items: [{ message_id: 'om_quoted', chat_id: dm.chatId, create_time: now - 2000 }] });
+    mocks.merge.mockResolvedValue({ messageId: 'om_merged', invalidMessageIds: [] });
+    fetcher.mockResolvedValue(response({ oncall_flow_id: '123', open_chat_id: 'oc_created' }));
+    await handleOncallGroupAction(act('oncall_group_create'), 'app');
+    const ids = [dm.questionId, 'om_file', 'om_quoted', dm.messageId];
+    expect(groups.getRequest(dm)).toMatchObject({ status: 'succeeded', forwardMode: mode, messageIdsSnapshot: ids, forwarded: ids });
+    if (mode === 'merge') {
+      expect(mocks.merge).toHaveBeenCalledWith('app', ids, 'oc_created', expect.any(String));
+      expect(mocks.forward).not.toHaveBeenCalled();
+    } else {
+      expect(mocks.forward.mock.calls.map(([, id, chat]) => [id, chat])).toEqual(ids.map(id => [id, 'oc_created']));
+      expect(mocks.merge).not.toHaveBeenCalled();
+    }
+    expect(mocks.reply).toHaveBeenCalledOnce();
+    expect(mocks.reply.mock.calls[0].slice(1, 3)).toEqual(['om_public_question', expect.stringContaining('进入人工 Oncall 群')]);
+  });
+
+  it.each(['pending', 'unknown'] as const)('stops querying an unconfirmed %s create after the existing 24-hour window', async status => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const { dm, groups } = setupPrivateIntake();
+    mocks.bot.config.oncallGroup.flowMode = 'direct';
+    const target = { endpoint: 'https://oncall.example.test/api/inf/v1/chat/', tenantId: 12, typeId: 999, region: 'legacy', emailDomain: 'example.test' };
+    groups.claim(dm, 'ou_owner', { cutoffMs: Date.now(), messageIds: [], forwardMode: 'none' },
+      { target, username: 'owner', region: target.region, typeId: target.typeId });
+    const attemptId = groups.getRequest(dm)!.attemptId!;
+    if (status === 'unknown') groups.finish(dm, { status }, attemptId);
+    vi.setSystemTime(Date.now() + 24 * 60 * 60_000);
+    await retryPendingOncallHandoffs('app');
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(mocks.reply).not.toHaveBeenCalled();
+    expect(groups.getRequest(dm)?.status).toBe(status);
+    expect(groups.pendingHandoffs('app')).toEqual([]);
+  });
+
+  it('recovers a pending original-thread invitation a day after native adoption and settles it once', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const { dm, groups } = setupPrivateIntake();
+    groups.adoptNativeGroup(dm, 'ou_owner', { flowId: '123', openChatId: 'oc_created' },
+      { cutoffMs: Date.now(), messageIds: [], forwardMode: 'none' });
+    mocks.reply.mockRejectedValueOnce(new Error('network timeout'));
+    await expect(prepareOncallGroupInvite(dm)).rejects.toThrow('network timeout');
+    expect(groups.getRequest(dm)?.pendingOriginReplyTo).toBe('om_public_question');
+    vi.setSystemTime(Date.now() + 25 * 60 * 60_000);
+    await retryPendingOncallHandoffs('app');
+    await prepareOncallGroupInvite(dm);
+    expect(mocks.reply).toHaveBeenCalledTimes(2);
+    expect(mocks.reply.mock.calls[1][5]).toBe(mocks.reply.mock.calls[0][5]);
+    expect(mocks.invite).toHaveBeenCalledOnce();
+    expect(groups.getRequest(dm)?.pendingOriginReplyTo).toBeUndefined();
+    expect(groups.pendingHandoffs('app')).toEqual([]);
+  });
+
+  it('opens a blank native form and saves the configured handoff for complex private categories', async () => {
     const { act } = setupPrivateIntake();
     const sidebar = new URL('https://oncall.example.test/chat?tenant=12');
     fetcher.mockImplementation(async (url: string) => {
@@ -342,7 +420,7 @@ describe('private Oncall intake', () => {
     const attempts = await new OncallFormStore(dir).use('app', cancel.value.draftId, 'ou_owner',
       async draft => draft.nativeSubmission?.attempts);
     expect(attempts).toHaveLength(1);
-    expect(attempts?.[0]?.forwardMode).toBe('none');
+    expect(attempts?.[0]?.forwardMode).toBe('merge');
     expect(mocks.detail).not.toHaveBeenCalled();
   });
 
@@ -351,7 +429,7 @@ describe('private Oncall intake', () => {
     mocks.bot.config.oncallGroup.privateIntakeChatIds = [];
     expect((await handleOncallGroupAction(act('oncall_group_create'), 'app')).toast.type).toBe('info');
     expect(mocks.reply).toHaveBeenCalledTimes(1);
-    expect(mocks.reply.mock.calls[0]?.[1]).toBe('om_dm_answer');
+    expect(mocks.reply.mock.calls[0]?.[1]).toBe('om_dmanswer');
     expect((await handleOncallGroupAction(act('oncall_group_create', undefined, 'ou_other'), 'app')).toast.type).toBe('error');
     expect(mocks.reply).toHaveBeenCalledTimes(1);
     expect(mocks.detail).not.toHaveBeenCalled(); expect(mocks.userReceipt).not.toHaveBeenCalled();

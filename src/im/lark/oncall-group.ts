@@ -86,7 +86,7 @@ export function attachOncallGroupButton(raw: string, policy: OncallGroupPolicy |
         if (presentation && region && category) destination = `业务线：${presentation.tenantName}\n受理区域：${region.label}\n问题分类：${category.label}`;
       } catch { /* Confirmation still explains the consequences when labels are unavailable. */ }
     }
-    const handoff = privateIntake || policy?.forwardMode === 'none' ? '不自动转发对话记录' : `转交提交前的当前会话对话及附件（${policy?.forwardMode === 'merge' ? '合并为聊天记录' : '逐条消息'}）`;
+    const handoff = policy?.forwardMode === 'none' ? '不自动转发对话记录' : `转交提交前的当前会话对话及附件（${policy?.forwardMode === 'merge' ? '合并为聊天记录' : '逐条消息'}）`;
     options.confirmText = `${destination}\n对话交接：${handoff}。\n确认后将创建人工群并通知对应值班人员；取消不会发起 Oncall。`;
   }
   const card = JSON.parse(raw);
@@ -324,7 +324,7 @@ async function continueOncallInPrivate(source: OncallGroupSource, operator: NonN
       const delivery = intakes.findDelivery(source.appId, ownerOpenId, anchor.messageId);
       let binding = delivery?.binding;
       const cardJson = JSON.stringify({ schema: '2.0', body: { elements: [
-        { tag: 'markdown', content: '本次转人工不会自动转交私聊记录和附件。' },
+        { tag: 'markdown', content: '请在此私聊继续转人工，建群后按对话交接设置处理本次咨询。' },
       ] } });
       if (!binding) {
         // A provider timeout is retryable only inside its deduplication window.
@@ -526,7 +526,7 @@ async function prepareOncallFormSelection(draft: OncallFormDraft, username = dra
   if (nativeFormLink && username) {
     draft.nativeFormLink = recordNativeSubmissionAttempt(draft, nativeFormLink, {
       sourceLocation: new URL(nativeFormLink).searchParams.get('url')!.slice(0, 200), username,
-      preparedAtMs: Date.now(), policyFingerprint, forwardMode: draft.source.privateIntake ? 'none' : bot.oncallGroup?.forwardMode ?? 'individual',
+      preparedAtMs: Date.now(), policyFingerprint, forwardMode: bot.oncallGroup?.forwardMode ?? 'individual',
       typeId: category.id, region: draft.region,
     }, publicBase);
   } else delete draft.nativeFormLink;
@@ -772,7 +772,7 @@ export async function handleOncallFormAction(data: CardActionData, appId: string
           draft.oncallUsername = username;
           const href = recordNativeSubmissionAttempt(draft, nativeLink, {
             sourceLocation: new URL(nativeLink).searchParams.get('url')!.slice(0, 200), username,
-            preparedAtMs: Date.now(), policyFingerprint, forwardMode: source.privateIntake ? 'none' : currentPolicy?.forwardMode ?? 'individual',
+            preparedAtMs: Date.now(), policyFingerprint, forwardMode: currentPolicy?.forwardMode ?? 'individual',
             typeId: selection.id, region: draft.region,
           }, publicBase);
           draft.nativeEntry = { href, categoryName: selection.name, policyFingerprint };
@@ -907,15 +907,29 @@ export async function handleOncallFormAction(data: CardActionData, appId: string
 }
 
 /** One permanent invitation per created group; failures never recreate a ticket. */
-export async function prepareOncallGroupInvite(source: OncallGroupSource): Promise<void> {
-  if (source.privateIntake) return;
+export async function prepareOncallGroupInvite(source: OncallGroupSource, beforeWrite?: () => void): Promise<void> {
   const groups = new OncallGroupStore(config.session.dataDir);
   await withFileLock(join(config.session.dataDir, 'oncall-groups', `invite-${groups.handoffKey(source)}`), async () => {
     const request = groups.getRequest(source);
-    if (request?.status !== 'succeeded' || !request.openChatId || request.inviteLink) return;
+    if (request?.status !== 'succeeded' || !request.openChatId || (source.privateIntake && !request.pendingOriginReplyTo)) return;
+    beforeWrite?.();
     const { getChatInviteLink } = await import('./client.js');
-    const inviteLink = await getChatInviteLink(source.appId, request.openChatId);
-    groups.finish(source, { status: 'succeeded', openChatId: request.openChatId, inviteLink }, request.attemptId);
+    const inviteLink = request.inviteLink ?? await getChatInviteLink(source.appId, request.openChatId);
+    if (!request.inviteLink) groups.finish(source, { status: 'succeeded', inviteLink }, request.attemptId);
+    if (!request.pendingOriginReplyTo) return;
+    const card = JSON.stringify({ schema: '2.0', body: { elements: [
+      { tag: 'div', text: { tag: 'plain_text', content: '人工 Oncall 群已创建' } },
+      { tag: 'column_set', columns: [buildOncallGroupColumn({ href: inviteLink, status: '进入人工 Oncall 群', joinGroup: true })] },
+    ] } });
+    try {
+      beforeWrite?.();
+      await replyMessage(source.appId, request.pendingOriginReplyTo, card, 'interactive', true,
+        privateIntakeDeliveryId(source.appId, `origin-join:${request.openChatId}:${request.pendingOriginReplyTo}`),
+        undefined, { beforeWrite });
+    } catch (error) {
+      if (oncallCardUnchangeable(error) !== 'gone') throw error;
+    }
+    groups.finish(source, { status: 'succeeded', pendingOriginReplyTo: undefined }, request.attemptId);
   });
 }
 
@@ -938,7 +952,7 @@ export async function refreshOncallSessionCard(source: OncallGroupSource, option
   const started = performance.now();
   const groups = new OncallGroupStore(config.session.dataDir);
   if (options.prepareInvite !== false) {
-    await prepareOncallGroupInvite(source).catch(() => logger.warn('[oncall-group] Native group invitation is unavailable; retrying with the existing group'));
+    await prepareOncallGroupInvite(source, options.beforeWrite).catch(() => logger.warn('[oncall-group] Native group invitation is unavailable; retrying with the existing group'));
   }
   const beforeRefresh = groups.getRequest(source);
   const { TurnReplyCardStore } = await import('../../services/turn-reply-card.js');
@@ -994,11 +1008,11 @@ export async function refreshOncallSessionCard(source: OncallGroupSource, option
   }
 }
 
-/** Read the original public container before claiming: a partial or failed scan
+/** Read the consultation's original container before claiming: a partial or failed scan
  * must not silently produce a ticket with an incomplete conversation. */
 export async function snapshotOncallConversation(source: OncallGroupSource, options: { cutoffMs?: number; forwardMode?: OncallForwardMode } = {}): Promise<{ messageIds: string[]; cutoffMs: number; forwardMode: OncallForwardMode }> {
   const cutoffMs = options.cutoffMs ?? Date.now();
-  const forwardMode = source.privateIntake ? 'none' : options.forwardMode ?? getBot(source.appId).config.oncallGroup?.forwardMode ?? 'individual';
+  const forwardMode = options.forwardMode ?? getBot(source.appId).config.oncallGroup?.forwardMode ?? 'individual';
   if (forwardMode === 'none') return { messageIds: [], cutoffMs, forwardMode };
   const client = await import('./client.js');
   const store = new OncallGroupStore(config.session.dataDir);
@@ -1007,10 +1021,21 @@ export async function snapshotOncallConversation(source: OncallGroupSource, opti
   const excluded = otherSessions.messages;
   let messages: any[];
   let verifiedThread = false;
-  if (source.rootId?.startsWith('om_')) {
-    const thread = await client.listThreadMessagesWithContext(source.appId, source.chatId, source.rootId, 0);
+  const rootId = source.privateIntake?.rootMessageId ?? source.rootId;
+  if (rootId?.startsWith('om_')) {
+    const thread = await client.listThreadMessagesWithContext(source.appId, source.chatId, rootId, 0);
     messages = thread.messages;
     verifiedThread = thread.verifiedThread;
+    if (source.privateIntake) {
+      // A quoted DM can belong to the consultation without appearing in its Lark thread.
+      const listed = new Set(messages.map(item => item.message_id));
+      for (const id of known.filter(id => !listed.has(id))) {
+        const detail = await client.getMessageDetail(source.appId, id, { userCardContent: false });
+        const item = detail?.items?.find((row: any) => row.message_id === id && row.chat_id === source.chatId);
+        if (!item) throw new Error('本次私聊的消息暂不可读取，请稍后重试');
+        messages.push(item);
+      }
+    }
   } else {
     const firstId = known[0] ?? source.questionId;
     messages = await client.listChatMessagesUntil(source.appId, source.chatId, { stopAfter: item => item.message_id === firstId });
@@ -1039,6 +1064,9 @@ export async function snapshotOncallConversation(source: OncallGroupSource, opti
   });
   const messageIds = [...new Set(messages.map(item => item.message_id).filter(id => typeof id === 'string' && /^om_[a-zA-Z0-9]+$/.test(id)))];
   if (!messageIds.includes(source.questionId) || !messageIds.includes(source.messageId)) throw new Error('原问题或回复卡暂不可读取，请稍后重试');
+  if (source.privateIntake && source.sessionId?.startsWith('oncall-private-')) {
+    return { messageIds: messageIds.filter(id => id !== rootId), cutoffMs, forwardMode };
+  }
   return { messageIds, cutoffMs, forwardMode };
 }
 
@@ -1054,7 +1082,7 @@ function isOncallFormMessage(message: any): boolean {
 }
 
 export async function forwardOncallConversation(source: OncallGroupSource, owns: () => boolean = () => true): Promise<void> {
-  const mayForward = () => !source.privateIntake && owns() && oncallSourceEnabled(getBot(source.appId).config.oncallGroup, source);
+  const mayForward = () => owns() && oncallSourceEnabled(getBot(source.appId).config.oncallGroup, source);
   const store = new OncallGroupStore(config.session.dataDir);
   const key = store.handoffKey(source);
   await withFileLock(join(config.session.dataDir, 'oncall-groups', `handoff-${key}`), async () => {
@@ -1343,7 +1371,9 @@ export async function retryPendingOncallHandoffs(appId: string, owns: () => bool
     let inviteFailed = false;
     let refreshFailed = false;
     try {
-      if (!waiting) await prepareOncallGroupInvite(source).catch(() => { inviteFailed = true; });
+      if (!waiting) await prepareOncallGroupInvite(source, () => {
+        if (!owns()) throw new Error('Oncall handoff recovery stopped');
+      }).catch(() => { inviteFailed = true; });
       if (!owns()) return;
       // Backfill old invite buttons without re-opening the expired handoff window,
       // and check membership only when conversation forwarding is still owed.
