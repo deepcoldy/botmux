@@ -76,7 +76,8 @@ import {
  *   7. On 'restart', kills CLI and re-spawns with --resume
  */
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
+import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, watch as fsWatch, constants as fsConstants, type FSWatcher } from 'node:fs';
+import { BoundedLogFile } from './utils/bounded-log-file.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative, extname, isAbsolute, resolve } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
@@ -2492,7 +2493,8 @@ function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigi
   // It is this worker's account of its own input queue, like the backlog.
   // Type-ahead registrations, drops and restore snapshots are queue observations
   // too: they may name a queued execution, but never assert that it has started.
-  if (msg.type === 'cli_input_backlog' || msg.type === 'failed_turn_rewind'
+  // The PTY log also belongs to the worker and can fill while its CLI is closing.
+  if ((msg.type === 'error' && msg.workflowLogLimit) || msg.type === 'cli_input_backlog' || msg.type === 'failed_turn_rewind'
     || msg.type === 'type_ahead_queued' || msg.type === 'type_ahead_turn_dropped'
     || msg.type === 'type_ahead_queue_snapshot' || msg.type === 'queued_activation_submitted') {
     delete context.scope.execution;
@@ -24249,7 +24251,7 @@ function isWorkflowWorker(): boolean {
  *  don't leave empty `pty.log` files behind.  Closed at worker exit by the
  *  process-shutdown hook below.
  */
-let workflowPtyLogStream: WriteStream | undefined;
+let workflowPtyLogStream: BoundedLogFile | undefined;
 let workflowPtyLogOpenFailed = false;
 function appendWorkflowPtyLog(data: string): void {
   if (!isWorkflowWorker() || workflowPtyLogOpenFailed) return;
@@ -24258,9 +24260,9 @@ function appendWorkflowPtyLog(data: string): void {
   if (!workflowPtyLogStream) {
     try {
       mkdirSync(dirname(path), { recursive: true });
-      workflowPtyLogStream = createWriteStream(path, { flags: 'a' });
-      workflowPtyLogStream.on('error', (err) => {
-        log(`workflow pty log write error: ${err.message}`);
+      workflowPtyLogStream = new BoundedLogFile(path, {
+        onLimit: kind => send({ type: 'error', workflowLogLimit: true, message: `pty.log exceeded the ${kind} limit` }),
+        onError: err => log(`workflow pty log write error: ${err.message}`),
       });
     } catch (err: any) {
       workflowPtyLogOpenFailed = true;
@@ -51155,6 +51157,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       clearSendMarkers();
       clearBridgeTurnJournalFile();
       cleanup();
+      if (typeof workflowPtyLogStream !== 'undefined') await workflowPtyLogStream.end();
       process.exit(0);
     }
 
@@ -51581,10 +51584,7 @@ function cleanup(): void {
   if (wsHeartbeat) { wsHeartbeat.stop(); wsHeartbeat = null; }
   if (wss) { wss.close(); wss = null; }
   if (httpServer) { httpServer.close(); httpServer = null; }
-  if (workflowPtyLogStream) {
-    try { workflowPtyLogStream.end(); } catch { /* already closed */ }
-    workflowPtyLogStream = undefined;
-  }
+  void workflowPtyLogStream?.end();
   // Publisher ownership spans every CLI generation in this worker. Releasing
   // from killCli/restart would reopen a stale-publish window; only process-level
   // cleanup retires the lease. SIGKILL residue is reclaimed by the next worker.
