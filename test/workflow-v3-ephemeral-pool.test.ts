@@ -454,6 +454,7 @@ describe('v3 ephemeral pool', () => {
       writeFileSync(join(configDir, 'bots.json'), JSON.stringify([{ larkAppId: 'cli_app', larkAppSecret: 'test-only',
         cliId: 'claude-code', env: { MODEL_AUTH: 'node-sentinel' } }]));
       vi.stubEnv('HOME', home);
+      vi.stubEnv('USERPROFILE', home);
       vi.stubEnv('BOTS_CONFIG', '');
       chmodSync(configDir, 0o000);
       try {
@@ -657,12 +658,62 @@ describe('v3 ephemeral pool', () => {
       mkdirSync(dirname(homeBots), { recursive: true });
       writeFileSync(homeBots, JSON.stringify([nodeBot]));
       vi.stubEnv('HOME', home);
+      vi.stubEnv('USERPROFILE', home);
       vi.stubEnv('BOTS_CONFIG', '');
       await startsWithEnv();
       rmSync(homeBots);
       const failure = await rejectsBeforeSpawn();
       expect(failure.message).toContain('cli_app');
       expect(failure.message).toContain('bots.json');
+    });
+
+    it('fails before spawn when the node bot is removed while its secret is being resolved', async () => {
+      configureBots([nodeBot, otherBot]);
+      const spawn = vi.fn((): WorkerHandle => { throw new Error('unexpected spawn'); });
+      const req = request();
+      const failure = await createEphemeralPool({ factory: { spawn }, workerPath: '/tmp/worker.js',
+        resolveLarkAppSecret: async () => {
+          // The entry check already passed; the bot leaves bots.json during the wait.
+          configureBots([otherBot]);
+          return 'secret';
+        } }).runNode(req).then(() => undefined, (err: unknown) => err);
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).toContain('cli_app');
+      expect((failure as Error).message).not.toContain('other-sentinel');
+      expect(spawn).not.toHaveBeenCalled();
+      expect(readV3AttemptWorkerFence(req.attemptDir, req)).toMatchObject({ phase: 'closed_no_spawn', reason: 'setup_failed' });
+    });
+
+    it('launches with the env from the final pre-spawn read when bots.json changes during the wait', async () => {
+      configureBots([nodeBot]);
+      const worker = new ScriptedWorker();
+      const running = createEphemeralPool({ factory: factoryFor(worker), workerPath: '/tmp/worker.js',
+        resolveLarkAppSecret: async () => {
+          configureBots([{ ...nodeBot, env: { MODEL_AUTH: 'rotated-sentinel' } }]);
+          return 'secret';
+        } }).runNode(request());
+      try {
+        await worker.waitForInit();
+        expect(worker.init.env?.MODEL_AUTH).toBe('rotated-sentinel');
+      } finally {
+        worker.emitExit(0);
+        await running;
+      }
+    });
+
+    it('still returns cancelled when the attempt is cancelled during the wait in which its bot left bots.json', async () => {
+      configureBots([nodeBot]);
+      const factory = factoryFor(new ScriptedWorker());
+      const ac = new AbortController();
+      const req = request();
+      await expect(createEphemeralPool({ factory, workerPath: '/tmp/worker.js',
+        resolveLarkAppSecret: async () => {
+          configureBots([otherBot]);
+          ac.abort('user-requested');
+          return 'secret';
+        } }).runNode({ ...req, cancelSignal: ac.signal })).resolves.toMatchObject({ status: 'cancelled' });
+      expect(factory.lastOpts).toBeUndefined();
+      expect(readV3AttemptWorkerFence(req.attemptDir, req)).toMatchObject({ phase: 'closed_no_spawn', reason: 'pre_aborted' });
     });
 
     it('fails the assistant-mode check closed for a default-path bot missing from bots.json', () => {

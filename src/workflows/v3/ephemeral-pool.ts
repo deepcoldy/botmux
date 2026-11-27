@@ -147,23 +147,30 @@ async function prepareNodeFolderTrust(
  *  config also throws: fail closed rather than read it as non-assistant. */
 export function assertNotAssistantModeBot(larkAppId: string, requireConfigured = false): void {
   // Otherwise a bot absent from both sources is left to the credential resolver.
-  const assistant = liveBotConfig(larkAppId, requireConfigured)?.assistantMode === true;
-  if (assistant) throw new Error(`v3 workflow does not support personal-assistant mode; bot ${larkAppId} has assistantMode=true`);
+  rejectAssistantModeBot(larkAppId, liveBotConfig(larkAppId, requireConfigured));
 }
 
-/** Session env overlay for a workflow worker, from the live bot config. */
-function v3WorkerSessionEnv(
+function rejectAssistantModeBot(larkAppId: string, live: BotConfig | undefined): void {
+  if (live?.assistantMode === true) throw new Error(`v3 workflow does not support personal-assistant mode; bot ${larkAppId} has assistantMode=true`);
+}
+
+/** The launch-time verdict for a node bot from ONE live config read: presence
+ *  (default path), assistant mode, and the session env overlay handed to the
+ *  worker. An explicit resolver still owns the env lookup outright, including
+ *  when it throws. */
+function v3NodeLaunchConfig(
   larkAppId: string,
   resolveBot: EphemeralPoolDeps['resolveBot'],
 ): { env?: Record<string, string>; envUnset?: string[] } {
+  // A bots.json read failure, or a default-path node bot removed from it
+  // mid-run, fails this node instead of starting it without its env overlay.
+  const live = liveBotConfig(larkAppId, !resolveBot);
+  rejectAssistantModeBot(larkAppId, live);
   let bot: SessionEnvBotInput | undefined;
   if (resolveBot) {
-    // An explicit resolver owns the lookup outright, including when it throws.
     try { bot = resolveBot(larkAppId); } catch { bot = undefined; }
   } else {
-    // A bots.json read failure, or a node bot removed from it mid-run, fails
-    // this node instead of starting it without its env overlay.
-    bot = liveBotConfig(larkAppId, true);
+    bot = live;
   }
   if (!bot) return {};
   // Workflow workers never install the identity wrappers (usesLarkToolBinding).
@@ -241,10 +248,9 @@ async function runNodeWithLogs(
   // a config fault must not turn a cancellation into a node failure.
   const cancelSignal = req.attemptLease?.signal ?? req.cancelSignal;
   const cancelledOnArrival = cancelSignal?.aborted === true;
+  // Fast rejection before any side effect. The authoritative read (assistant
+  // mode, presence and the env the worker gets) repeats right before spawn.
   if (!cancelledOnArrival) assertNotAssistantModeBot(req.botSnapshot.larkAppId, !deps.resolveBot);
-  // Resolve the env overlay before any side effect too: a bots.json read
-  // failure must reject this node here, not after a worker has been forked.
-  const workerSessionEnv = cancelledOnArrival ? {} : v3WorkerSessionEnv(req.botSnapshot.larkAppId, deps.resolveBot);
   const manifestPath = req.env[GOAL_ENV.MANIFEST_PATH] ?? join(req.attemptDir, 'manifest.json');
   const ptyLogPath = join(req.attemptDir, 'pty.log');
   if (!req.workerFence) await mkdir(req.attemptDir, { recursive: true });
@@ -326,6 +332,17 @@ async function runNodeWithLogs(
   if (logLimit.signal.aborted) {
     closeV3ArmedFenceWithoutSpawn(req.attemptDir, armedFence, 'setup_failed');
     return { status: 'fail', manifestPath };
+  }
+  // The secret and folder-trust waits above may have outlived the live config
+  // read at entry. Re-read it once after the last await and launch with
+  // exactly that verdict; there is no await between here and spawn, so a
+  // cancellation observed above still wins.
+  let workerSessionEnv: ReturnType<typeof v3NodeLaunchConfig>;
+  try {
+    workerSessionEnv = v3NodeLaunchConfig(req.botSnapshot.larkAppId, deps.resolveBot);
+  } catch (err) {
+    closeV3ArmedFenceWithoutSpawn(req.attemptDir, armedFence, 'setup_failed');
+    throw err;
   }
   // Where the worker writes this attempt's skill manifest + snapshot (its own
   // SESSION_DATA_DIR, i.e. config.session.dataDir unless req.env overrides it).
