@@ -17,6 +17,8 @@ import type {
   VcMeetingSharedConsumerCatalogSnapshot,
 } from '../src/services/vc-meeting-shared-consumer-catalog-store.js';
 import type { BotConfig } from '../src/bot-registry.js';
+import { cliAdapterHasReliableTurnTerminal } from '../src/adapters/cli/registry.js';
+import { resolveSessionEnv } from '../src/core/session-env-resolve.js';
 
 const READ = 'meeting.read';
 const OUTPUT = 'meeting.output.request';
@@ -700,6 +702,59 @@ describe('handleVcMeetingConsumerProfilesPut', () => {
       realtimeVoiceEnabled: false,
       effectiveVoiceOutputPolicy: 'deny',
     });
+  });
+
+  it('passes full bot config to adapterReliableTurnTerminal and recognizes antigravity ACP vs terminal', () => {
+    const terminalBot = {
+      larkAppId: 'app_agy_terminal',
+      cliId: 'antigravity',
+    } as unknown as BotConfig;
+    const explicitTerminalBot = {
+      larkAppId: 'app_agy_terminal_explicit',
+      cliId: 'antigravity',
+      env: { AGY_BOTMUX_TRANSPORT: 'terminal' },
+    } as unknown as BotConfig;
+    const acpBot = {
+      larkAppId: 'app_agy_acp',
+      cliId: 'antigravity',
+      env: { AGY_BOTMUX_TRANSPORT: 'acp' },
+    } as unknown as BotConfig;
+    const invalidTransportBot = {
+      larkAppId: 'app_agy_invalid',
+      cliId: 'antigravity',
+      env: { AGY_BOTMUX_TRANSPORT: 'bogus' },
+    } as unknown as BotConfig;
+
+    const adapterReliableTurnTerminal = vi.fn((bot: BotConfig) => {
+      if (!bot.cliId) return false;
+      const sessionEnv = resolveSessionEnv({ bot, backendType: bot.backendType ?? 'pty' }).env;
+      return cliAdapterHasReliableTurnTerminal(bot.cliId, bot.cliPathOverride, sessionEnv);
+    });
+    const deps = makeDeps({
+      loadBotConfigs: vi.fn(() => [terminalBot, explicitTerminalBot, acpBot, invalidTransportBot]),
+      adapterReliableTurnTerminal,
+    });
+
+    const options = buildVcMeetingAgentOptions(deps);
+    expect(adapterReliableTurnTerminal).toHaveBeenCalledWith(acpBot);
+    expect(options.map(o => [o.appId, o.reliableTurnTerminal])).toEqual([
+      ['app_agy_acp', true],
+      ['app_agy_invalid', false],
+      ['app_agy_terminal', false],
+      ['app_agy_terminal_explicit', false],
+    ]);
+  });
+});
+
+describe('cliAdapterHasReliableTurnTerminal', () => {
+  it('distinguishes antigravity transport modes and fails closed on invalid values', () => {
+    expect(cliAdapterHasReliableTurnTerminal('antigravity')).toBe(false);
+    expect(cliAdapterHasReliableTurnTerminal('antigravity', undefined, { AGY_BOTMUX_TRANSPORT: 'terminal' })).toBe(false);
+    expect(cliAdapterHasReliableTurnTerminal('antigravity', undefined, { AGY_BOTMUX_TRANSPORT: 'acp' })).toBe(true);
+    expect(cliAdapterHasReliableTurnTerminal('antigravity', undefined, { AGY_BOTMUX_TRANSPORT: 'invalid' })).toBe(false);
+    expect(cliAdapterHasReliableTurnTerminal('claude-code', undefined, { AGY_BOTMUX_TRANSPORT: 'invalid' })).toBe(true);
+    expect(cliAdapterHasReliableTurnTerminal(undefined)).toBe(false);
+    expect(cliAdapterHasReliableTurnTerminal('nonexistent-cli')).toBe(false);
   });
 });
 

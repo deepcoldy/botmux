@@ -221,6 +221,18 @@ export interface DaemonSession {
   resumeFreshFallbackNotified?: boolean;
   workingDir?: string;
   initConfig?: Extract<DaemonToWorker, { type: 'init' }>;   // stored for restart
+  /** Actual turn-terminal capability reported by a correlated, successful
+   *  in-place restart. Scoped to that worker generation: a refork invalidates
+   *  the report automatically, while an in-place respawn keeps the generation.
+   *  Before the first such report the fork-time initConfig is sufficient; while
+   *  workerReady is false the current capability is unknown and consumers must
+   *  fail closed rather than reuse this attestation. */
+  inPlaceRestartTurnTerminal?: { workerGeneration: number; reliableTurnTerminal: boolean };
+  /** A live restart has invalidated the previous attestation and no correlated
+   *  success has confirmed the replacement yet. Kept after failure/timeout and
+   *  across parked prompt_ready recovery; only an untouched receipt may restore
+   *  the previous state. A worker exit/refork makes this generation stale. */
+  inPlaceRestartTurnTerminalPending?: { workerGeneration: number | undefined; attemptId: string };
   /**
    * Unprovable launcher-env keys this worker generation was ever HANDED, kept as
    * a monotonically growing set for the life of the generation.

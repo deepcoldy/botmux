@@ -338,7 +338,8 @@ import { listProjectGroups, type ProjectGroupState } from './services/project-gr
 import { resolveProjectProgressCardConfig } from './services/project-progress-card-config.js';
 import { listTeamReports, readTeamBoard, setTeamBoardEntry } from './services/team-board-store.js';
 import type { CliId } from './adapters/cli/types.js';
-import { ALL_CLI_IDS, CLI_ALIASES, createCliAdapterSync, rawCliExecutable, resolveCommandReal } from './adapters/cli/registry.js';
+import { ALL_CLI_IDS, CLI_ALIASES, cliAdapterHasReliableTurnTerminal, createCliAdapterSync, rawCliExecutable, resolveCommandReal } from './adapters/cli/registry.js';
+import { resolveSessionEnv } from './core/session-env-resolve.js';
 import { createDashboardExecutableResolver, resolveDashboardRuntimeUpdateTargets } from './dashboard/cli-executable-resolver.js';
 import type { ConnectorDefinition } from './services/connector-store.js';
 import {
@@ -1629,10 +1630,17 @@ function vcMeetingConsumerProfilesApiDeps(): VcMeetingConsumerProfilesApiDeps {
     effectiveDefaultWorkingDir,
     onlineBotName: appId => nameOf(appId),
     isOnline: appId => !!registry.getByAppId(appId),
-    adapterReliableTurnTerminal: (cliId, cliPathOverride) => {
-      if (!cliId) return false;
+    adapterReliableTurnTerminal: bot => {
+      if (!bot.cliId) return false;
       try {
-        return createCliAdapterSync(cliId as CliId, cliPathOverride).reliableTurnTerminal === true;
+        const backendType = resolvePairedSpawnBackendType(
+          bot.cliId,
+          undefined,
+          bot.backendType,
+          config.daemon.backendType,
+        );
+        const sessionEnv = resolveSessionEnv({ bot, backendType }).env;
+        return cliAdapterHasReliableTurnTerminal(bot.cliId, bot.cliPathOverride, sessionEnv);
       } catch {
         return false;
       }
