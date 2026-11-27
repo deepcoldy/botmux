@@ -438,7 +438,12 @@ import {
   isFinalBridgeSendMarker,
   stripTrailingOaiMemoryCitation,
 } from './services/bridge-fallback-gate.js';
-import { hasBridgeReplyMarker, recordBridgeReplyMarker, withBridgeReplyMarkerLock } from './services/bridge-reply-marker.js';
+import {
+  hasBridgeReplyMarker,
+  recordBridgeReplyMarker,
+  recordBridgeReplyMarkerSnapshot,
+  withBridgeReplyMarkerLock,
+} from './services/bridge-reply-marker.js';
 import { effectiveCrossChatFollowThreadMode, ensureCrossChatFollowThreadAtBinding, persistCrossChatFollowThreadOffBeforeProvider } from './services/cross-chat-follow-thread-store.js';
 import { recordSessionTurnReplies, type SessionTurnReply } from './services/session-turns.js';
 import {
@@ -12964,21 +12969,33 @@ async function cmdSend(
       replyTargetQuoteOnly: s.replyTargets?.[replyTurnId]?.quoteOnly,
       currentTurnId: markerTurnId,
     });
+    const detoured = !!sendTopLevel || !!overrideChatId || !!sendInto || markerSessionId !== sid;
     const catchupContent = stripTrailingOaiMemoryCitation(sendPlan.contentFile
       ? readFileSync(sendPlan.contentFile, 'utf-8')
       : (sendPlan.stdinContent ?? normalizePositionalSendContent(sendPlan.invocation.positionals.join(' '))));
-    const detoured = !!sendTopLevel || !!overrideChatId || !!sendInto || markerSessionId !== sid;
     withBridgeReplyMarkerLock(resolveDataDir(), markerSessionId, () => {
       if (hasBridgeReplyMarker({
         dataDir: resolveDataDir(), sessionId: markerSessionId, turnId: markerTurnId,
         messageId: final.messageId, responseKind: 'final',
       })) return;
-      recordBridgeReplyMarker({
-        dataDir: resolveDataDir(), sessionId: markerSessionId,
+      const identity = {
+        dataDir: resolveDataDir(),
+        sessionId: markerSessionId,
         sentAtMs: final.sentAtMs ?? final.deliveredAtMs,
         messageId: final.messageId,
+        turnId: markerTurnId,
+        responseKind: 'final' as const,
+      };
+      if (final.marker) {
+        recordBridgeReplyMarkerSnapshot({ ...final.marker, ...identity });
+        return;
+      }
+      // Pre-upgrade ledger rows have no marker snapshot. Keep their legacy
+      // recovery path, but never relabel the old delivery as auxiliary/progress.
+      recordBridgeReplyMarker({
+        ...identity,
         deliveryKind: detoured ? 'detoured_send' : 'current_session_send',
-        content: catchupContent, responseKind: effectiveResponseKind, turnId: markerTurnId,
+        content: catchupContent,
         dispatchAttempt: key.dispatchAttempt,
         targetChatId,
         targetRootMessageId: deferredTopicRootMessageIdForOutput
@@ -12991,6 +13008,25 @@ async function cmdSend(
       });
     });
   };
+  // A crash can leave a committed final without its bridge marker even when
+  // there is no queued successor to advance. Restore that marker independently
+  // of the queue-advance loop; the journal lock keeps the operation idempotent.
+  if (!scheduleRemoveSelfRequested
+    && liveMarkerCtx?.markerPid && liveMarkerCtx.turnId
+    && !liveMarkerCtx.queuedTurnId && !(liveMarkerCtx.queuedTurns && liveMarkerCtx.queuedTurns.length > 0)) {
+    const activeMarkerKey = {
+      larkAppId: originSession?.larkAppId ?? s.larkAppId,
+      sessionId: originSessionId ?? sid,
+      turnId: liveMarkerCtx.turnId,
+      ...(liveMarkerCtx.dispatchAttempt !== undefined
+        ? { dispatchAttempt: liveMarkerCtx.dispatchAttempt }
+        : {}),
+    };
+    const activePrior = turnSendLedger.read(activeMarkerKey);
+    if (activePrior?.final && activePrior.dispatchAttempt === liveMarkerCtx.dispatchAttempt) {
+      recordCatchupFinalMarker(activeMarkerKey, activePrior.final);
+    }
+  }
   while (!scheduleRemoveSelfRequested
     && liveMarkerCtx?.markerPid && liveMarkerCtx.turnId
     && (liveMarkerCtx.queuedTurnId || (liveMarkerCtx.queuedTurns && liveMarkerCtx.queuedTurns.length > 0))) {
@@ -14278,10 +14314,12 @@ async function cmdSend(
     renderedContent: string,
     dispatch: (providerUuid?: string) => Promise<string>,
     sentAtMs?: number,
+    marker?: import('./services/turn-send-ledger.js').TurnSendLedgerMarkerSource,
   ): Promise<{ messageId: string; replayed: boolean; sentAtMs?: number }> => {
     return turnSendKey
       ? turnSendLedger.execute(turnSendKey, effectiveResponseKind, renderedContent, dispatch, {
           ...(sentAtMs !== undefined ? { sentAtMs } : {}),
+          ...(marker ? { marker } : {}),
           beforeDispatch: persistOffBeforeProvider,
           resolveSettledAbsorbedTurnIds: resolveSettledAbsorbedTurnIdsForLedger,
           ...(scheduledSendAttempt ? { noSideEffect: (error: unknown) =>
@@ -14340,6 +14378,18 @@ async function cmdSend(
     const replayTarget = resolveReplayPrimaryTarget();
     const markerSessionId = originSessionId ?? sid;
     const markerTurnId = replayMarkerTurnId;
+    if (final.marker) {
+      recordBridgeReplyMarkerSnapshot({
+        ...final.marker,
+        dataDir: resolveDataDir(),
+        sessionId: markerSessionId,
+        sentAtMs: final.sentAtMs ?? final.deliveredAtMs,
+        messageId: final.messageId,
+        turnId: markerTurnId,
+        responseKind: 'final',
+      });
+      return;
+    }
     const detoured = !!sendTopLevel || !!overrideChatId || !!sendInto || markerSessionId !== sid;
     const pureFile = fileOnlyPrimaryRequested && !replayText.trim()
       && images.length === 0 && mentionArgs.length === 0;
@@ -14602,6 +14652,30 @@ async function cmdSend(
       resolveActualDeliveredTargetForLedger = () => deferredTopicRootMessageIdForOutput
         ? { mode: 'thread', rootMessageId: deferredTopicRootMessageIdForOutput }
         : voiceActualDeliveredTarget;
+      const voiceCrossChatFollowThread = effectiveCrossChatFollowThreadMode({
+        targetChatId: voicePrimaryOutputChatId,
+        sourceChatId: (originSession ?? s).chatId,
+        noFollowThread,
+      });
+      const voiceMarkerMetadata = (): import('./services/turn-send-ledger.js').TurnSendLedgerMarkerInput => {
+        const markerSessionId = originSessionId ?? sid;
+        const detoured = !!sendTopLevel || !!overrideChatId || !!sendInto || markerSessionId !== sid;
+        return {
+          deliveryKind: detoured ? 'detoured_send' : 'current_session_send',
+          content,
+          responseKind: effectiveResponseKind,
+          terminalCarrier: 'non_patchable',
+          dispatchAttempt: originDispatchAttempt,
+          targetChatId: voicePrimaryOutputChatId,
+          targetRootMessageId: deferredTopicRootMessageIdForOutput ?? sendInto
+            ?? (voiceActualDeliveredTarget && voiceActualDeliveredTarget.mode !== 'plain'
+              ? voiceActualDeliveredTarget.rootMessageId
+              : undefined),
+          targetSessionId: sid,
+          crossChatFollowThread: voiceCrossChatFollowThread,
+          followThreadEpoch: (originSession ?? s).followThreadEpoch,
+        };
+      };
       const voiceDelivery = await executeTurnPrimary(turnRequestIdentity, async providerUuid => {
         await revalidateIsolatedOriginBeforeEffect();
         const out = await synthesizeVoiceOpus(appId, content, {
@@ -14707,16 +14781,11 @@ async function cmdSend(
           }
         }
         return deliveredMessageId;
-      }, sentAtMs);
+      }, sentAtMs, voiceMarkerMetadata);
       const messageId = voiceDelivery.messageId;
       recordVcMeetingPrimaryOutput(messageId, voicePrimaryOutputChatId);
       // 语音也是一次可见回复。当前会话和具备精确 source turn 的 detour
       // 都记录；无 turn 的手工 detour 不写，避免靠时间窗压掉别的回复。
-      const voiceCrossChatFollowThread = effectiveCrossChatFollowThreadMode({
-        targetChatId: voicePrimaryOutputChatId,
-        sourceChatId: (originSession ?? s).chatId,
-        noFollowThread,
-      });
       if (voiceDelivery.replayed) {
         if (voiceDelivery.sentAtMs !== undefined) {
           await recordStructuredSendReceipts(
@@ -14748,28 +14817,24 @@ async function cmdSend(
             const markerTurnId = originTurnId ?? currentTurnId;
             const markerMessageId = final?.messageId ?? messageId;
             const markerSentAtMs = final?.sentAtMs ?? final?.deliveredAtMs ?? sentAtMs;
-            const detoured = !!sendTopLevel || !!overrideChatId || !!sendInto
-              || markerSessionId !== sid;
-            recordBridgeReplyMarker({
+            const identity = {
               dataDir: resolveDataDir(),
               sessionId: markerSessionId,
               sentAtMs: markerSentAtMs,
               messageId: markerMessageId,
-              deliveryKind: detoured ? 'detoured_send' : 'current_session_send',
-              content,
-              responseKind: effectiveResponseKind,
-              terminalCarrier: 'non_patchable',
               turnId: markerTurnId,
-              dispatchAttempt: originDispatchAttempt,
-              targetChatId: voicePrimaryOutputChatId,
-              targetRootMessageId: deferredTopicRootMessageIdForOutput ?? sendInto
-                ?? (voiceActualDeliveredTarget && voiceActualDeliveredTarget.mode !== 'plain'
-                  ? voiceActualDeliveredTarget.rootMessageId
-                  : undefined),
-              targetSessionId: sid,
-              crossChatFollowThread: voiceCrossChatFollowThread,
-              followThreadEpoch: (originSession ?? s).followThreadEpoch,
-            });
+            };
+            if (final?.marker) {
+              recordBridgeReplyMarkerSnapshot({
+                ...final.marker, ...identity, responseKind: 'final',
+              });
+            } else {
+              recordBridgeReplyMarker({
+                ...voiceMarkerMetadata(),
+                ...identity,
+                ...(final ? { responseKind: 'final' as const } : {}),
+              });
+            }
           } catch { /* best-effort：漏记只多一条兜底，不致命 */ }
         }
       };
@@ -14863,6 +14928,13 @@ async function cmdSend(
       const chunks = chunkCommentText(content);
       const docMessageId = `doc:${exactDocTarget.commentId}`;
       const sentAtMs = Date.now();
+      const docMarkerMetadata = (): import('./services/turn-send-ledger.js').TurnSendLedgerMarkerInput => ({
+        deliveryKind: 'current_session_send',
+        content,
+        responseKind: effectiveResponseKind,
+        dispatchAttempt: originDispatchAttempt,
+        targetSessionId: originSessionId,
+      });
       const docDelivery = turnSendKey
         ? await turnSendLedger.executeNonIdempotentSequence(
             turnSendKey,
@@ -14884,7 +14956,7 @@ async function cmdSend(
               );
             },
             docMessageId,
-            { sentAtMs },
+            { sentAtMs, marker: docMarkerMetadata },
           )
         : await (async () => {
             for (let i = 0; i < chunks.length; i++) {
@@ -14921,18 +14993,24 @@ async function cmdSend(
         const markerMessageId = final?.messageId ?? docDelivery.messageId;
         const markerSentAtMs = final?.sentAtMs ?? final?.deliveredAtMs ?? sentAtMs;
         try {
-          recordBridgeReplyMarker({
+          const identity = {
             dataDir: resolveDataDir(),
             sessionId: originSessionId!,
             sentAtMs: markerSentAtMs,
             messageId: markerMessageId,
-            deliveryKind: 'current_session_send',
-            content,
-            responseKind: effectiveResponseKind,
             turnId: originTurnId ?? exactDocTarget.turnId,
-            dispatchAttempt: originDispatchAttempt,
-            targetSessionId: originSessionId,
-          });
+          };
+          if (final?.marker) {
+            recordBridgeReplyMarkerSnapshot({
+              ...final.marker, ...identity, responseKind: 'final',
+            });
+          } else {
+            recordBridgeReplyMarker({
+              ...docMarkerMetadata(),
+              ...identity,
+              ...(final ? { responseKind: 'final' as const } : {}),
+            });
+          }
         } catch { /* best-effort：漏记只多一条兜底 */ }
       };
       if (docDelivery.replayed) {
@@ -15525,6 +15603,29 @@ async function cmdSend(
   // 删除需同步改测试。
   void dispatch;
   const crossChatFollowThread = effectiveFollowThreadMode;
+  const primaryMarkerMetadata = (
+    sentContent: string,
+    terminalCarrier?: TurnTerminalCarrierKind,
+    unifiedReply = unifiedReplyUsed,
+  ): import('./services/turn-send-ledger.js').TurnSendLedgerMarkerInput => {
+    const markerSessionId = originSessionId ?? sid;
+    const detoured = !!sendTopLevel || !!overrideChatId || !!sendInto || markerSessionId !== sid;
+    return {
+      deliveryKind: detoured ? 'detoured_send' : 'current_session_send',
+      content: sentContent,
+      responseKind: effectiveResponseKind,
+      dispatchAttempt: originDispatchAttempt,
+      replyCardResponseKind: unifiedReply ? effectiveResponseKind : undefined,
+      terminalIndependent: remoteRunnerOutbound && effectiveResponseKind !== 'final' ? true : undefined,
+      terminalCarrier,
+      targetChatId,
+      targetRootMessageId: deferredTopicRootMessageIdForOutput
+        ?? (sendTarget.mode === 'plain' ? undefined : sendTarget.rootMessageId),
+      targetSessionId: sid,
+      crossChatFollowThread,
+      followThreadEpoch: (originSession ?? s).followThreadEpoch,
+    };
+  };
   const recordBridgeSendMarker = (
     sentAtMs: number,
     messageId: string,
@@ -15534,29 +15635,13 @@ async function cmdSend(
     const markerSessionId = originSessionId ?? sid;
     const markerTurnId = originTurnId ?? currentTurnId;
     try {
-      const detoured = !!sendTopLevel || !!overrideChatId || !!sendInto
-        || markerSessionId !== sid;
       recordBridgeReplyMarker({
+        ...primaryMarkerMetadata(sentContent, terminalCarrier),
         dataDir: resolveDataDir(),
         sessionId: markerSessionId,
         sentAtMs,
         messageId,
-        deliveryKind: detoured ? 'detoured_send' : 'current_session_send',
-        content: sentContent,
-        responseKind: effectiveResponseKind,
         turnId: markerTurnId,
-        dispatchAttempt: originDispatchAttempt,
-        replyCardResponseKind: unifiedReplyUsed ? effectiveResponseKind : undefined,
-        terminalIndependent: remoteRunnerOutbound && effectiveResponseKind !== 'final'
-          ? true
-          : undefined,
-        terminalCarrier,
-        targetChatId,
-        targetRootMessageId: deferredTopicRootMessageIdForOutput
-          ?? (sendTarget.mode === 'plain' ? undefined : sendTarget.rootMessageId),
-        targetSessionId: sid,
-        crossChatFollowThread,
-        followThreadEpoch: (originSession ?? s).followThreadEpoch,
       });
     } catch { /* best-effort: marker miss only causes a redundant fallback message */ }
   };
@@ -15826,7 +15911,9 @@ async function cmdSend(
     primaryContent: string,
     msgType: string,
     originAlreadyRevalidated = false,
-    uuid?: string,
+    uuid: string | undefined,
+    markerContent: string,
+    terminalCarrier: TurnTerminalCarrierKind = 'standard_reply_card',
   ): Promise<string> => {
     const handoffDeliveryId = await prepareMentionHandoff();
     let result: Awaited<ReturnType<typeof executeTurnPrimary>>;
@@ -15840,6 +15927,7 @@ async function cmdSend(
           uuid ?? providerUuid,
         ),
         primarySentAtMs,
+        () => primaryMarkerMetadata(markerContent, terminalCarrier),
       );
     } catch (error) {
       await bindMentionHandoff(handoffDeliveryId, undefined);
@@ -16092,7 +16180,7 @@ async function cmdSend(
       replyLayout = undefined;
     }
     if (customCard && !customFinal) {
-      messageId = await dispatchPrimary(JSON.stringify(customCard), 'interactive');
+      messageId = await dispatchPrimary(JSON.stringify(customCard), 'interactive', false, undefined, text, 'non_patchable');
     } else if (isSlashSend) {
       // --slash: deliver the command as a single-line plain-`text` message so the
       // receiving daemon's parseSlashCommandInvocation sees a bare `/cmd` (the
@@ -16105,7 +16193,7 @@ async function cmdSend(
       if (!slash.ok) { console.error(`botmux send: ${slash.error}`); process.exit(2); }
       const atPrefix = mentions.map(m => `<at user_id="${m.open_id}"></at>`).join(' ');
       const slashText = atPrefix ? `${atPrefix} ${slash.command}` : slash.command;
-      messageId = await dispatchPrimary(slashText, 'text');
+      messageId = await dispatchPrimary(slashText, 'text', false, undefined, text);
     } else if (pureFileSend) {
       // The single attachment IS the primary message. Keep upload + send under
       // the turn ledger lock so a concurrent final cannot upload or post a
@@ -16119,7 +16207,7 @@ async function cmdSend(
           false,
           providerUuid,
         );
-      }, sentAtMs);
+      }, sentAtMs, () => primaryMarkerMetadata(text, 'non_patchable'));
       if (fileDelivery.replayed) {
         turnPrimaryReplayed = true;
         turnPrimaryReplayedSentAtMs ??= fileDelivery.sentAtMs;
@@ -16145,7 +16233,7 @@ async function cmdSend(
           uploadFile,
           uploadImage,
           dispatch: dispatchAfterOriginGate,
-          primaryDispatch: (body, type) => dispatchPrimary(body, type, true),
+          primaryDispatch: (body, type) => dispatchPrimary(body, type, true, undefined, text, 'non_patchable'),
           beforeEffect: fenceIsolatedOriginBeforeEffect,
           onResult: (index, outcome) => {
             if ('messageId' in outcome) sentVideoIndices.push(index);
@@ -16410,7 +16498,7 @@ async function cmdSend(
             undeliveredProgressHint = '进度已记录到本轮：执行过程由原生思考区展示，进度会随最终答复卡一并归档。中间进度继续按默认方式发送即可；完成后再用 botmux send --response-kind final 发送完整答复。';
           }
           return delivered.messageId ?? '';
-        }, sentAtMs);
+        }, sentAtMs, () => primaryMarkerMetadata(text, 'standard_reply_card', true));
         if (replyDelivery.replayed) {
           turnPrimaryReplayed = true;
           turnPrimaryReplayedSentAtMs ??= replyDelivery.sentAtMs;
@@ -16430,6 +16518,7 @@ async function cmdSend(
           'interactive',
           false,
           completionProposalRecord ? completionProposalCardDispatchUuid(completionProposalRecord) : undefined,
+          text,
         );
       }
 

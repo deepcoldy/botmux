@@ -18,6 +18,7 @@ import {
 } from '../src/core/session-marker.js';
 import { isValidMarkerIdentityTurnId } from '../src/core/turn-id-shape.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { buildBridgeSendMarkerContent } from '../src/services/bridge-fallback-gate.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from '../src/services/bridge-turn-queue.js';
 import { recordBridgeReplyMarker } from '../src/services/bridge-reply-marker.js';
 import { sendCompletionHintKey } from '../src/services/send-completion-hint.js';
@@ -171,6 +172,16 @@ function prepareIncomingNormalWrite(
     bridgeQueue: { holdForWrite: () => {} },
     markTurnExecutionStart: () => {},
     submissionPreparationFailed: false,
+    SubmissionWriteError: class SubmissionWriteError extends Error {
+      constructor(
+        message: string,
+        readonly recoveryFailureReason?: string,
+        readonly submissionStarted = true,
+        readonly runnerGenerationUnsafe = false,
+        readonly traexCatalogAdmissionRequired = false,
+        readonly retainPendingInput = false,
+      ) { super(message); }
+    },
   });
   h.scope.inflightInputs.onWrite = () => {};
   h.scope.adoptActiveTurnWhenIsolationOff = loadWorkerFunction('adoptActiveTurnWhenIsolationOff', h.scope);
@@ -1089,6 +1100,95 @@ describe('worker <-> PID marker synchronization & lifecycle invariants', () => {
     expect(h3.scope.currentBotmuxTurnId).toBe('om_B');
   });
 
+  it('uses only ledger authorization when final and terminal both exist, retaining terminal fold without final', async () => {
+    const finalDir = makeTempDir('worker-final-terminal-ledger-');
+    const withFinal = createWorkerHarness(finalDir, [
+      { turnId: 'om_B', inputConsumed: true, absorbedIntoTurnId: 'om_A' },
+    ]);
+    withFinal.scope.writeCliPidMarker();
+    await new TurnSendLedger(finalDir).execute(
+      { larkAppId: 'cli_test', sessionId: 'sid', turnId: 'om_A' },
+      'final', 'A only', async () => 'om_A_final',
+      { resolveSettledAbsorbedTurnIds: () => [] },
+    );
+    recordBridgeReplyMarker({
+      dataDir: finalDir, sessionId: 'sid', sentAtMs: Date.now(), messageId: 'om_A_final',
+      deliveryKind: 'current_session_send', content: 'A only', responseKind: 'final', turnId: 'om_A',
+    });
+    withFinal.scope.emittedTurnTerminals.claim('sid', 'om_A', undefined, 'completed');
+    const previousDataDir = process.env.SESSION_DATA_DIR;
+    process.env.SESSION_DATA_DIR = finalDir;
+    try { withFinal.scope.advanceQueuedTypeAheadTurn('prompt_ready'); }
+    finally {
+      if (previousDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = previousDataDir;
+    }
+    // The host terminal cannot mint settlement authority. B remains live and is
+    // promoted for its own answer rather than remembered as answered by A.
+    expect(withFinal.scope.currentBotmuxTurnId).toBe('om_B');
+    expect(withFinal.readMarker().turnId).toBe('om_B');
+    expect(withFinal.readMarker().settledAbsorbedTurns).toBeUndefined();
+    expect(withFinal.scope.send).not.toHaveBeenCalledWith({ type: 'type_ahead_turn_dropped', turnId: 'om_B' });
+
+    const nativeDir = makeTempDir('worker-native-terminal-fold-');
+    const nativeOnly = createWorkerHarness(nativeDir, [
+      { turnId: 'om_B', inputConsumed: true, absorbedIntoTurnId: 'om_A' },
+    ]);
+    nativeOnly.scope.writeCliPidMarker();
+    nativeOnly.scope.emittedTurnTerminals.claim('sid', 'om_A', undefined, 'completed');
+    nativeOnly.scope.advanceQueuedTypeAheadTurn('prompt_ready');
+    expect(nativeOnly.scope.currentBotmuxTurnId).toBe('om_A');
+    expect(nativeOnly.scope.queuedTypeAheadTurns).toEqual([]);
+    expect(nativeOnly.readMarker().settledAbsorbedTurns).toEqual([{ turnId: 'om_B', hostTurnId: 'om_A' }]);
+  });
+
+  it('uses ledger final authorization at host terminal even when the bridge marker was lost in a crash', async () => {
+    const dataDir = makeTempDir('worker-ledger-final-without-marker-');
+    const h = createWorkerHarness(dataDir, [
+      { turnId: 'om_B', inputConsumed: true, absorbedIntoTurnId: 'om_A' },
+    ]);
+    h.scope.writeCliPidMarker();
+    await new TurnSendLedger(dataDir).execute(
+      { larkAppId: 'cli_test', sessionId: 'sid', turnId: 'om_A' },
+      'final', 'A only', async () => 'om_A_final',
+      { resolveSettledAbsorbedTurnIds: () => [] },
+    );
+    h.scope.emittedTurnTerminals.claim('sid', 'om_A', undefined, 'completed');
+    const previousDataDir = process.env.SESSION_DATA_DIR;
+    process.env.SESSION_DATA_DIR = dataDir;
+    try { h.scope.advanceQueuedTypeAheadTurn('prompt_ready'); }
+    finally {
+      if (previousDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = previousDataDir;
+    }
+
+    expect(h.scope.currentBotmuxTurnId).toBe('om_B');
+    expect(h.readMarker().turnId).toBe('om_B');
+    expect(h.readMarker().settledAbsorbedTurns).toBeUndefined();
+    expect(h.scope.send).not.toHaveBeenCalledWith({ type: 'type_ahead_turn_dropped', turnId: 'om_B' });
+  });
+
+  it('does not tombstone an active same-turn durable retry when an older queued attempt terminates', () => {
+    const dataDir = makeTempDir('worker-late-terminal-live-retry-');
+    const h = createWorkerHarness(dataDir, [{ turnId: 'om_B', dispatchAttempt: 1 }]);
+    h.scope.currentBotmuxTurnId = 'om_B';
+    h.scope.currentBotmuxDispatchAttempt = 2;
+    h.scope.activeTurnAuthority.clear();
+    h.scope.markActiveTurnStarted({ turnId: 'om_B', dispatchAttempt: 2 });
+    h.scope.writeCliPidMarker();
+    h.scope.send.mockClear();
+
+    h.scope.retireTerminatedQueuedTurn('om_B', 1, 'completed');
+
+    expect(h.scope.currentBotmuxTurnId).toBe('om_B');
+    expect(h.scope.currentBotmuxDispatchAttempt).toBe(2);
+    expect(h.scope.queuedTypeAheadTurns).toEqual([]);
+    expect(h.scope.retiredTurnIds.has('om_B')).toBe(false);
+    expect(h.scope.foldedTypeAheadTurn).toBeUndefined();
+    expect(h.scope.send).not.toHaveBeenCalledWith({ type: 'type_ahead_turn_dropped', turnId: 'om_B' });
+    expect(h.readMarker()).toMatchObject({ turnId: 'om_B', dispatchAttempt: 2 });
+  });
+
   it('emitTurnTerminal triggers scheduleConsumedQueuedTurnAdvance for standalone C even when prompt_ready already released A authority', () => {
     const dataDir = makeTempDir('worker-terminal-after-prompt-ready-');
     const h = createWorkerHarness(dataDir, [
@@ -1226,6 +1326,36 @@ describe('adversarial regression matrix (crash recovery, multi-destination, priv
     expect(f.marker().settledAbsorbedTurns).toBeUndefined();
   });
 
+  it('ignores an old-attempt final when preparing input for the current durable attempt', async () => {
+    const dataDir = makeTempDir('worker-stale-final-attempt-');
+    const h = createWorkerHarness(dataDir, [{
+      turnId: 'om_B', inputConsumed: true,
+      absorbedIntoTurnId: 'om_A', absorbedIntoDispatchAttempt: 2,
+    }]);
+    h.scope.currentBotmuxDispatchAttempt = 2;
+    h.scope.activeTurnAuthority.clear();
+    h.scope.markActiveTurnStarted({ turnId: 'om_A', dispatchAttempt: 2 });
+    h.scope.writeCliPidMarker();
+    await new TurnSendLedger(dataDir).execute(
+      { larkAppId: 'cli_test', sessionId: 'sid', turnId: 'om_A', dispatchAttempt: 1 },
+      'final', 'old attempt answer', async () => 'om_A_attempt_1',
+    );
+    recordBridgeReplyMarker({
+      dataDir, sessionId: 'sid', sentAtMs: Date.now(), messageId: 'om_A_attempt_1',
+      deliveryKind: 'current_session_send', content: 'old attempt answer', responseKind: 'final',
+      turnId: 'om_A', dispatchAttempt: 1,
+    });
+
+    // Attempt 1's marker is not attempt 2's completion evidence. C therefore
+    // follows the still-open attempt-2 queue instead of being retained forever
+    // behind an unreadable/nonexistent attempt-2 final ledger decision.
+    prepareIncomingNormalWrite(h, dataDir);
+    expect(h.scope.currentBotmuxTurnId).toBe('om_A');
+    expect(h.scope.currentBotmuxDispatchAttempt).toBe(2);
+    expect(h.scope.queuedTypeAheadTurns.map((turn: { turnId: string }) => turn.turnId)).toEqual(['om_B', 'om_C']);
+    expect(h.readMarker()).toMatchObject({ turnId: 'om_A', dispatchAttempt: 2 });
+  });
+
   it('primary final lock timeout keeps delivery successful and exact retry converges marker and queue', () => {
     const f = setupSendFixture({
       queuedTurns: [{ turnId: 'om_B', inputConsumed: true, absorbedIntoTurnId: 'om_A' }],
@@ -1282,6 +1412,88 @@ describe('adversarial regression matrix (crash recovery, multi-destination, priv
     expect(markers.map(marker => marker.turnId)).toEqual(['om_A', 'om_B']);
     expect(markers[0]).toMatchObject({ messageId: 'om_A_final', responseKind: 'final' });
   }, 30_000);
+
+  it('catch-up restores the original final kind, visible content and route after a later auxiliary detour', () => {
+    const f = setupSendFixture({
+      queuedTurns: [{ turnId: 'om_B', inputConsumed: true, absorbedIntoTurnId: 'om_A' }],
+    });
+    const first = f.run(['--response-kind', 'final', '--no-mention'], 'original final body');
+    expect(first.status, String(first.stderr)).toBe(0);
+    const ledgerKey = { larkAppId: 'cli_test', sessionId: 'sid', turnId: 'om_A' };
+    const originalFinal = new TurnSendLedger(f.data).read(ledgerKey)?.final;
+    expect(originalFinal?.marker).toMatchObject({
+      responseKind: 'final',
+      ...buildBridgeSendMarkerContent('original final body'),
+      targetChatId: 'oc_test', targetRootMessageId: 'om_root',
+    });
+    expect(originalFinal?.marker).not.toHaveProperty('content');
+
+    // Reproduce a winner that committed its ledger but died before publishing
+    // the bridge marker or advancing the on-disk queue. The next command has a
+    // deliberately different kind, body and destination.
+    unlinkSync(join(f.data, 'turn-sends', 'sid.jsonl'));
+    writeFileSync(f.markerPath, JSON.stringify({
+      sessionId: 'sid', turnId: 'om_A', queuedTurnId: 'om_B',
+      queuedTurns: [{ turnId: 'om_B', inputConsumed: true, absorbedIntoTurnId: 'om_A' }],
+    }));
+    const second = f.run(
+      ['--response-kind', 'auxiliary', '--chat-id', 'oc_other', '--no-mention'],
+      'new auxiliary body',
+    );
+    expect(second.status, String(second.stderr)).toBe(0);
+
+    const markers = readFileSync(join(f.data, 'turn-sends', 'sid.jsonl'), 'utf8')
+      .trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+    const restored = markers.find(marker => marker.turnId === 'om_A'
+      && marker.messageId === originalFinal?.messageId);
+    expect(restored).toMatchObject({
+      responseKind: 'final', previewText: 'original final body',
+      targetChatId: 'oc_test', targetRootMessageId: 'om_root', targetSessionId: 'sid',
+    });
+    expect(restored.previewText).not.toContain('new auxiliary body');
+  }, 60_000);
+
+  it('restores a missing final marker without a queued successor and preserves legacy detour routing', async () => {
+    const noQueue = setupSendFixture();
+    const noQueueKey = { larkAppId: 'cli_test', sessionId: 'sid', turnId: 'om_A' };
+    await new TurnSendLedger(noQueue.data).execute(
+      noQueueKey, 'final', 'original final body', async () => 'om_original_final',
+      {
+        marker: {
+          deliveryKind: 'current_session_send', content: 'original final body', responseKind: 'final',
+          targetChatId: 'oc_test', targetRootMessageId: 'om_root', targetSessionId: 'sid',
+        },
+      },
+    );
+    const auxiliary = noQueue.run(
+      ['--response-kind', 'auxiliary', '--chat-id', 'oc_other', '--no-mention'],
+      'separate auxiliary body',
+    );
+    expect(auxiliary.status, String(auxiliary.stderr)).toBe(0);
+    const noQueueMarkers = readFileSync(join(noQueue.data, 'turn-sends', 'sid.jsonl'), 'utf8')
+      .trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+    expect(noQueueMarkers.find(marker => marker.messageId === 'om_original_final')).toMatchObject({
+      turnId: 'om_A', responseKind: 'final', previewText: 'original final body',
+      targetChatId: 'oc_test', targetRootMessageId: 'om_root',
+    });
+
+    const legacy = setupSendFixture({ queuedTurns: [{ turnId: 'om_B' }] });
+    const legacyKey = { larkAppId: 'cli_test', sessionId: 'sid', turnId: 'om_A' };
+    await new TurnSendLedger(legacy.data).execute(
+      legacyKey, 'final', 'legacy cross-chat body', async () => 'om_legacy_final',
+    );
+    const replay = legacy.run(
+      ['--response-kind', 'final', '--chat-id', 'oc_other', '--no-mention'],
+      'legacy cross-chat body',
+    );
+    expect(replay.status, String(replay.stderr)).toBe(0);
+    const legacyMarkers = readFileSync(join(legacy.data, 'turn-sends', 'sid.jsonl'), 'utf8')
+      .trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+    expect(legacyMarkers.find(marker => marker.messageId === 'om_legacy_final')).toMatchObject({
+      turnId: 'om_A', responseKind: 'final',
+      deliveryKind: 'detoured_send', targetChatId: 'oc_other', targetSessionId: 'sid',
+    });
+  }, 60_000);
 
   it('explicit old-target lock retry replays A on every subsequent command instead of minting B final to A', () => {
     const f = setupSendFixture({
@@ -1702,24 +1914,41 @@ describe('adversarial regression matrix (crash recovery, multi-destination, priv
     expect(String(res.stderr)).toContain(t('ai.send.after_success_steer_advanced', undefined, 'zh'));
   });
 
-  it('rejects settlement fail-closed when PID marker has corrupted non-null dispatchAttempt or invalid queued turnId', () => {
-    const cases: Array<{ name: string; payload: Record<string, unknown> }> = [
+  it('fails closed for malformed root attempts and missing expected durable attempts', () => {
+    const cases: Array<{
+      name: string;
+      payload: Record<string, unknown>;
+      expectedAttempt?: number;
+      expectedAdvanced: boolean;
+    }> = [
       {
-        name: 'corrupted queued dispatchAttempt',
+        name: 'corrupted queued dispatchAttempt remains ineligible for settlement',
         payload: {
           sessionId: 'sid',
           turnId: 'om_A',
           queuedTurns: [{ turnId: 'om_B', dispatchAttempt: '1', inputConsumed: true, absorbedIntoTurnId: 'om_A' }],
         },
+        expectedAdvanced: true,
       },
       {
-        name: 'corrupted root dispatchAttempt',
+        name: 'corrupted root dispatchAttempt blocks settlement and promotion',
         payload: {
           sessionId: 'sid',
           turnId: 'om_A',
           dispatchAttempt: '2',
           queuedTurns: [{ turnId: 'om_B', inputConsumed: true, absorbedIntoTurnId: 'om_A' }],
         },
+        expectedAdvanced: false,
+      },
+      {
+        name: 'missing root dispatchAttempt does not match an expected durable attempt',
+        payload: {
+          sessionId: 'sid',
+          turnId: 'om_A',
+          queuedTurns: [{ turnId: 'om_B', inputConsumed: true, absorbedIntoTurnId: 'om_A' }],
+        },
+        expectedAttempt: 1,
+        expectedAdvanced: false,
       },
       {
         name: 'invalid queued turnId containing control char',
@@ -1728,16 +1957,24 @@ describe('adversarial regression matrix (crash recovery, multi-destination, priv
           turnId: 'om_A',
           queuedTurns: [{ turnId: 'om_B\nevil', inputConsumed: true, absorbedIntoTurnId: 'om_A' }],
         },
+        expectedAdvanced: true,
       },
     ];
     for (const tc of cases) {
       const dir = makeTempDir('malformed-marker-');
       const markerDir = join(dir, '.botmux-cli-pids');
       mkdirSync(markerDir, { recursive: true });
-      writeFileSync(join(markerDir, String(process.pid)), JSON.stringify(tc.payload));
-      const res = advanceAncestorSessionTurn(dir, process.pid, 'om_A', { canSettleAbsorbed: () => true });
-      expect(res.advanced, tc.name).toBe(true);
+      const markerPath = join(markerDir, String(process.pid));
+      writeFileSync(markerPath, JSON.stringify(tc.payload));
+      const res = advanceAncestorSessionTurn(dir, process.pid, 'om_A', {
+        canSettleAbsorbed: () => true,
+        ...(tc.expectedAttempt !== undefined ? { consumedDispatchAttempt: tc.expectedAttempt } : {}),
+      });
+      expect(res.advanced, tc.name).toBe(tc.expectedAdvanced);
       expect(res.settledAbsorbedTurnIds, tc.name).toBeUndefined();
+      if (!tc.expectedAdvanced) {
+        expect(JSON.parse(readFileSync(markerPath, 'utf8')), tc.name).toEqual(tc.payload);
+      }
     }
   });
 });

@@ -193,6 +193,7 @@ export const messages: Record<string, string> = {
   // {reason} 是行尾：全角括号自带视觉间距，前面不补空格；没有原因就什么都不加。
   'card.model_fallback.reason': '（{reason}）',
   'card.model_fallback.no_reason': '',
+  'worker.final_transition_retrying': '⏳ 轮次交接尚未完成，正在重试；后续输入仍保留，请勿重复发送。',
   'worker.rate_limit_notify.rate': '⚠️ {cliName} 触发限流，本轮任务已暂停。请在 {retryLabel} 后重发上一条任务，或直接发送新消息继续。',
   'worker.rate_limit_notify.usage': '⚠️ {cliName} 已达使用限额，本轮任务已暂停。额度刷新后（{retryLabel}）请重发上一条任务，或直接发送新消息继续。',
   'worker.agy_rotate.switching': '🔄 Antigravity 账号 {fromAccount} 已达限额，已自动轮换至 {toAccount}，正在重启会话并重试本轮消息…',

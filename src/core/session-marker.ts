@@ -594,7 +594,6 @@ export function advanceAncestorSessionTurn(
         return { advanced: false, turnId: marker.turnId };
       }
       if (opts?.consumedDispatchAttempt !== undefined
-        && marker.dispatchAttempt !== undefined
         && marker.dispatchAttempt !== opts.consumedDispatchAttempt) {
         return { advanced: false, turnId: marker.turnId };
       }
@@ -607,6 +606,10 @@ export function advanceAncestorSessionTurn(
         && rawObj.dispatchAttempt !== undefined
         && rawObj.dispatchAttempt !== null
         && parseDispatchAttempt(rawObj.dispatchAttempt) === undefined;
+      // A malformed root tuple cannot authorize either half of the transition:
+      // settling would consume follow-ups for an unknown host, while promoting
+      // would fabricate a successor from that same corrupt host identity.
+      if (rootAttemptCorrupted) return { advanced: false, turnId: marker.turnId };
       const initialQueuedCount = marker.queuedTurns?.length ?? (marker.queuedTurnId ? 1 : 0);
       if (initialQueuedCount === 0) {
         return { advanced: false, turnId: marker.turnId };
@@ -614,7 +617,7 @@ export function advanceAncestorSessionTurn(
       const { settled, remaining: queuedTurns } = selectAbsorbedTurnsToSettle(
         marker,
         consumedTurnId,
-        rootAttemptCorrupted ? undefined : opts?.canSettleAbsorbed,
+        opts?.canSettleAbsorbed,
       );
       const mergedSettled = mergeSettledAbsorbedTurns(marker.settledAbsorbedTurns, settled);
       if (queuedTurns.length === 0) {

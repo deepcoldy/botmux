@@ -5973,6 +5973,51 @@ class SubmissionWriteError extends Error {
   }
 }
 
+let finalTransitionRetryDelayMs = 100;
+let finalTransitionRetryAttempts = 0;
+let finalTransitionRetryTimer: ReturnType<typeof setTimeout> | undefined;
+let finalTransitionRetryItem: PendingCliInput | undefined;
+let finalTransitionRetryGeneration: number | undefined;
+const FINAL_TRANSITION_RETRY_MAX_DELAY_MS = 5_000;
+function resetFinalTransitionRetryBackoff(): void {
+  if (finalTransitionRetryTimer) clearTimeout(finalTransitionRetryTimer);
+  finalTransitionRetryTimer = undefined;
+  finalTransitionRetryItem = undefined;
+  finalTransitionRetryGeneration = undefined;
+  finalTransitionRetryDelayMs = 100;
+  finalTransitionRetryAttempts = 0;
+}
+function scheduleFinalTransitionRetry(item: PendingCliInput, isCurrent: () => boolean, generation: number): void {
+  // External flush triggers may repeatedly hit the same unresolved edge. Only
+  // the fired timer advances the backoff; one episode never creates parallel
+  // retry chains. A replacement item/generation is a new episode.
+  if (finalTransitionRetryTimer
+    && finalTransitionRetryItem === item
+    && finalTransitionRetryGeneration === generation) return;
+  if (finalTransitionRetryTimer) resetFinalTransitionRetryBackoff();
+  finalTransitionRetryAttempts++;
+  const delay = finalTransitionRetryDelayMs;
+  finalTransitionRetryDelayMs = Math.min(delay * 2, FINAL_TRANSITION_RETRY_MAX_DELAY_MS);
+  if (finalTransitionRetryAttempts === 3) {
+    send({
+      type: 'user_notify',
+      turnId: item.turnId,
+      message: t('worker.final_transition_retrying'),
+    });
+  }
+  const retry = setTimeout(() => {
+    if (finalTransitionRetryTimer === retry) {
+      finalTransitionRetryTimer = undefined;
+      finalTransitionRetryItem = undefined;
+      finalTransitionRetryGeneration = undefined;
+    }
+    if (isCurrent() && pendingMessages[0] === item) void flushPending();
+  }, delay);
+  finalTransitionRetryTimer = retry;
+  finalTransitionRetryItem = item;
+  finalTransitionRetryGeneration = generation;
+  retry.unref?.();
+}
 async function sendRawCommandLineWithRecoveryFence(
   be: NonNullable<typeof backend>,
   content: string,
@@ -9944,6 +9989,13 @@ function syncQueuedTurnsFromMarkerDisk(): boolean {
 }
 
 function advanceQueuedTypeAheadTurn(reason: string): boolean {
+  // A published final is not itself settlement evidence. Resolve it through
+  // the immutable ledger (or legacy no-settlement transition) before the
+  // terminal-fold cleanup below may remove any absorbed follow-up.
+  if (currentTurnHasFinalEvidence()) {
+    advanceQueuedTypeAheadTurnAfterFinal();
+    return true;
+  }
   if (syncQueuedTurnsFromMarkerDisk()) return true;
   let droppedAny = false;
   while (queuedTypeAheadTurns[0]) {
@@ -14338,6 +14390,34 @@ function attributableExplicitReplyMarkersForTurnWindow(
   const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;
   return markers.filter(marker => marker.sentAtMs >= lower && marker.sentAtMs < upper
     && marker.turnId === turnId);
+}
+
+function currentTurnHasFinalMarker(): boolean {
+  return !!currentBotmuxTurnId && readSendMarkers().some(marker =>
+    marker.turnId === currentBotmuxTurnId
+    && marker.responseKind === 'final'
+    && marker.dispatchAttempt === currentBotmuxDispatchAttempt);
+}
+
+function currentTurnHasFinalEvidence(): boolean {
+  if (currentTurnHasFinalMarker()) return true;
+  if (!currentBotmuxTurnId) return false;
+  const dataDir = process.env.SESSION_DATA_DIR;
+  const larkAppId = lastInitConfig?.larkAppId;
+  if (!dataDir || !sessionId || !larkAppId) return false;
+  try {
+    const record = new TurnSendLedger(dataDir).read({
+      larkAppId, sessionId, turnId: currentBotmuxTurnId,
+      ...(currentBotmuxDispatchAttempt !== undefined
+        ? { dispatchAttempt: currentBotmuxDispatchAttempt }
+        : {}),
+    });
+    return !!record?.final && record.dispatchAttempt === currentBotmuxDispatchAttempt;
+  } catch {
+    // An unreadable existing record cannot authorize native terminal-fold
+    // cleanup either. The final-driven transition will remain fail-closed.
+    return true;
+  }
 }
 
 function notifyExplicitRepliesObserved(
@@ -31246,16 +31326,10 @@ async function flushPending(): Promise<void> {
         }
         syncQueuedTurnsFromMarkerDisk();
 
-        let currentTurnFinalDelivered = Boolean(
-          currentBotmuxTurnId
-            && readSendMarkers().some(m => m.turnId === currentBotmuxTurnId && m.responseKind === 'final')
-        );
+        let currentTurnFinalDelivered = currentTurnHasFinalEvidence();
         if (currentTurnFinalDelivered && queuedTypeAheadTurns.length > 0) {
           advanceQueuedTypeAheadTurnAfterFinal();
-          currentTurnFinalDelivered = Boolean(
-            currentBotmuxTurnId
-              && readSendMarkers().some(m => m.turnId === currentBotmuxTurnId && m.responseKind === 'final')
-          );
+          currentTurnFinalDelivered = currentTurnHasFinalEvidence();
         }
 
         if (currentTurnFinalDelivered && queuedTypeAheadTurns.some(q =>
@@ -31540,6 +31614,7 @@ async function flushPending(): Promise<void> {
         markTurnExecutionStart(item.turnId, item.dispatchAttempt, {
           evidenceAlreadyStarted: !!preAssignedEvidenceTurnId,
         });
+        resetFinalTransitionRetryBackoff();
         if (isCodexAppCliId(lastInitConfig?.cliId)) {
           log(
             `Writing Codex App input to PTY (flush): `
@@ -31896,13 +31971,12 @@ async function flushPending(): Promise<void> {
           break;
         }
         if (err instanceof SubmissionWriteError && err.retainPendingInput && writeContinuationIsCurrent()) {
-          pendingMessages.unshift(item);
+          if (!pendingMessages.includes(item)) pendingMessages.unshift(item);
           requeueUnsubmittedQueuedActivation(item);
           keepPromptReadyAfterHold();
-          const retry = setTimeout(() => {
-            if (writeContinuationIsCurrent() && pendingMessages[0] === item) void flushPending();
-          }, 100);
-          retry.unref?.();
+          if (writeContinuationIsCurrent() && pendingMessages[0] === item) {
+            scheduleFinalTransitionRetry(item, writeContinuationIsCurrent, writeGeneration);
+          }
           break;
         }
         if (err instanceof SubmissionWriteError && err.traexCatalogAdmissionRequired) {
@@ -45803,6 +45877,7 @@ function retireTerminatedQueuedTurn(turnId: string, dispatchAttempt?: number, st
     // A completed fold answers the next prompt suggestion, which still shows
     // under the turn owning the screen; a failed write folded nothing.
     if (status === 'completed'
+      && turnId !== currentBotmuxTurnId
       && (!settled
         || (settled.hostTurnId === currentBotmuxTurnId
           && settled.hostDispatchAttempt === currentBotmuxDispatchAttempt))) {
@@ -45826,8 +45901,10 @@ function dropQueuedTurnRecord(
     || (queued.dispatchAttempt !== undefined && queued.dispatchAttempt !== dispatchAttempt));
   if (queuedTypeAheadTurns.length === before) return false;
   // A retry of the same turn under another attempt is still live work. Its
-  // sidecar is keyed by turnId, so only the last queued sibling may retire it.
-  const hasLiveSibling = queuedTypeAheadTurns.some(queued => queued.turnId === turnId);
+  // sidecar is keyed by turnId, so only the last queued/current sibling may
+  // retire it. A late terminal for attempt N must not kill active attempt N+1.
+  const hasLiveSibling = queuedTypeAheadTurns.some(queued => queued.turnId === turnId)
+    || (currentBotmuxTurnId === turnId && currentBotmuxDispatchAttempt !== dispatchAttempt);
   if (!hasLiveSibling && typeof send === 'function') send({ type: 'type_ahead_turn_dropped', turnId });
   if (opts.tombstone !== false && !hasLiveSibling && typeof markTurnRetired === 'function') markTurnRetired(turnId);
   return true;

@@ -190,6 +190,7 @@ export const messages: Record<string, string> = {
   // {reason} ends the line; the no-reason variant adds nothing.
   'card.model_fallback.reason': ' ({reason})',
   'card.model_fallback.no_reason': '',
+  'worker.final_transition_retrying': '⏳ Turn handoff is still unresolved. Retrying; pending inputs are retained. Do not resend them.',
   'worker.rate_limit_notify.rate': '⚠️ {cliName} hit a rate limit — this turn is paused. Resend the last task after {retryLabel}, or send a new message to continue.',
   'worker.rate_limit_notify.usage': '⚠️ {cliName} hit its usage limit — this turn is paused. Once the quota resets ({retryLabel}), resend the last task or send a new message to continue.',
   'worker.agy_rotate.switching': '🔄 Antigravity account {fromAccount} hit its quota limit. Rotated to {toAccount}; restarting the session and retrying this turn…',
