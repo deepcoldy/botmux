@@ -4335,7 +4335,11 @@ async function dispatchHumanMessageViaHandlers(
   capMs?: number,
 ): Promise<void> {
   const appId = payload.ctx.larkAppId ?? larkAppId;
-  if (payload.ctx.chatType === 'group' && oncallPrivateIntakeEnabled(getBot(appId).config.oncallGroup, payload.ctx.chatId)) return;
+  // This helper is also a dispatch seam for flows that may run without a registered
+  // bot (tests, in-flight unregistration). Resolve policy defensively; an unknown
+  // app must fall through to the ordinary handlers, not throw "Bot not registered".
+  const intakePolicy = getAllBots().find(bot => bot.config.larkAppId === appId)?.config.oncallGroup;
+  if (payload.ctx.chatType === 'group' && oncallPrivateIntakeEnabled(intakePolicy, payload.ctx.chatId)) return;
   const messageId = payload.ctx.messageId;
   // Primary retries must reach the daemon's existing-turn admission receipt.
   const primaryIntake = payload.ctx.oncallPrivateIntake && payload.ctx.durablePrimaryDispatch;
