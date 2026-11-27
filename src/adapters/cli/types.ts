@@ -3,6 +3,7 @@ import type { TriggerUserAuthConfig } from '../../services/trigger-user-auth.js'
 import type { CodexServiceTier } from '../../services/codex-service-tier.js';
 import type { DebugModelCapabilities } from './model-catalog-json.js';
 import type { BackgroundTaskSignals, CodexBridgeEvent } from '../../services/codex-transcript.js';
+import type { BackendType } from '../backend/types.js';
 
 export interface PtyHandle {
   /** `false` means the backend rejected the write before it could confirm
@@ -1365,6 +1366,8 @@ export interface StructuredBridgeDrainContext {
   /** Terminal `/adopt`: the drainer must post transcript text verbatim (no
    *  synthesised bare-sentinel). */
   adoptMode: boolean;
+  /** Effective backend used to submit the session's input. */
+  backendType?: BackendType;
   /** `state` returned by the previous drain; undefined right after attach/detach. */
   state: unknown;
   /** Release a provisionally held trailing final (drivers that hold one). */

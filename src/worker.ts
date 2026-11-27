@@ -470,7 +470,7 @@ import {
   SESSION_ID_FILENAME_RE,
   type PidFollowResult,
 } from './services/bridge-rotation-policy.js';
-import { CodexBridgeQueue, CodexMidTurnReplyCollector, pruneExpiredPreStartHeadsAndEmit, selectStaleRestoredJournalTurns, type CodexPendingTurn } from './services/codex-bridge-queue.js';
+import { CodexBridgeQueue, CodexMidTurnReplyCollector, CURSOR_BUSY_REFRESH_MAX_MS, pruneExpiredPreStartHeadsAndEmit, selectStaleRestoredJournalTurns, type CodexPendingTurn } from './services/codex-bridge-queue.js';
 import { uncollectedTurnsNeedingNotice } from './services/structured-uncollected-notice.js';
 import { StructuredMissingFinalWatchdog } from './services/structured-missing-final.js';
 import {
@@ -14016,14 +14016,6 @@ let codexBridgeBaselineDone = false;
  *  ~/.cursor/projects reader, so cursor's transcript fallback must not
  *  activate there outside adopt (adopted panes run unsandboxed). */
 let lastResolvedSandboxMode: string | undefined;
-/** Hard ceiling for the busy-tick attribution-lease refresh, measured from
- *  the mark. The screen "busy" signal (isPromptReady=false) is a regex
- *  heuristic and can stay asserted with no real work (swallowed Enter /
- *  modal redraw); past this age the head prunes on its ordinary 20s grace,
- *  so the queue and structured_start_timeout always recover. Generous
- *  enough for a cold cursor-agent startup (store.db discovery alone is
- *  budgeted 30s) plus the late whole-turn mirror flush. */
-const CURSOR_BUSY_REFRESH_MAX_MS = 120_000;
 let codexAdoptRecoveryAttempted = false;
 let structuredBridgeRecoveryAttempted = false;
 let publishedActiveRuntime: TraexRuntimeSnapshot = {};
@@ -18632,6 +18624,7 @@ function structuredBridgeIngestPath(
       // adoptMode gates the drainer's bare-sentinel synthesis: adopt posts
       // transcript text verbatim, so a synthesised token would leak into Lark.
       adoptMode: lastInitConfig?.adoptMode === true,
+      backendType: lastInitConfig?.cliId === 'cursor' ? effectiveBackendType : undefined,
       state: structuredBridgeDriverState,
       // Doubao's two-file drainer (assignment.md at submit / trajectory.jsonl
       // at completion) needs the count of turns the QUEUE holds open: the

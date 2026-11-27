@@ -56,6 +56,10 @@ export function wholeInputHash(text: string): string {
 
 const UNMATCHED_REPLAY_WINDOW_MS = 5_000;
 const MAX_BUFFERED_UNMATCHED_EVENTS = 20;
+const CORRELATION_TRAILER_RE = / <botmux_routing> botmux_input_id: [0-9a-f]{32} <\/botmux_routing>$/;
+/** Bound busy-screen lease refresh for Cursor's delayed transcript. A stuck
+ *  busy marker leaves only the ordinary attribution lease after this age. */
+export const CURSOR_BUSY_REFRESH_MAX_MS = 120_000;
 /** A verified submit may be parked in a type-ahead queue before its transcript
  *  user event is written. Keep that hand-off busy for a bounded interval: long
  *  enough for the active turn to finish and dequeue it, but never forever if
@@ -370,6 +374,8 @@ export class CodexBridgeQueue {
    *  passing (e.g. 1_000 for RFC3339 1-second timestamps such as agy). */
   private wholeInputTimestampGranularityMs = 1;
   private bufferedUnmatched: CodexBridgeEvent[] = [];
+  private readonly ambiguousSoftNewlineInputs = new WeakSet<NonNullable<CodexBridgeEvent['softNewlineInput']>>();
+  private readonly recentlyDroppedInputs: Array<{ hashes: readonly string[]; droppedAtMs: number }> = [];
   private lastClosedAssistantFinalTimeMs: number | undefined;
   /** Lower bound (ms) for synthesising local turns — protects against a
    *  fresh-empty attach replaying historical iTerm conversation as
@@ -407,22 +413,45 @@ export class CodexBridgeQueue {
       && !turn.wholeInputHash && !turn.nativeInputText && !turn.submittedInputText) {
       return false;
     }
-    const normalised = normaliseForFingerprint(event.text);
-    const correlationTrailerRe = / <botmux_routing> botmux_input_id: [0-9a-f]{32} <\/botmux_routing>$/;
-    const stripped = correlationTrailerRe.test(normalised)
-      ? normalised.replace(correlationTrailerRe, '')
+    return this.matchesWholeInput(turn, normaliseForFingerprint(event.text));
+  }
+
+  private matchesWholeInput(turn: CodexPendingTurn, normalised: string): boolean {
+    const stripped = CORRELATION_TRAILER_RE.test(normalised)
+      ? normalised.replace(CORRELATION_TRAILER_RE, '')
       : undefined;
     if (turn.nativeInputText || turn.submittedInputText) {
       const matchesTarget = (target: string | undefined): boolean => {
         if (!target) return false;
         if (normalised === target) return true;
-        return stripped !== undefined && !correlationTrailerRe.test(target) && stripped === target;
+        return stripped !== undefined && !CORRELATION_TRAILER_RE.test(target) && stripped === target;
       };
       return matchesTarget(turn.nativeInputText) || matchesTarget(turn.submittedInputText);
     }
     if (!turn.wholeInputHash) return false;
     if (wholeInputHash(normalised) === turn.wholeInputHash) return true;
     return stripped !== undefined && wholeInputHash(stripped) === turn.wholeInputHash;
+  }
+
+  /** Match a transport-rewritten input to the FIFO head. The original
+   * record may instead be a later mark with a literal line-ending backslash. */
+  private matchSoftNewlineInput(turn: CodexPendingTurn, event: CodexBridgeEvent): 'matched' | 'ambiguous' | undefined {
+    const candidate = event.softNewlineInput?.candidate;
+    if (!candidate || event.inputTextAliases !== undefined || !this.matchesWholeInput(turn, candidate)) return undefined;
+    const original = normaliseForFingerprint(event.text);
+    const competingMark = this.queue.some(other => other !== turn && !other.started && other.finalText === undefined
+      && (other.markTimeMs === undefined || event.timestampMs >= other.markTimeMs - UNMATCHED_REPLAY_WINDOW_MS)
+      && this.matchesWholeInput(other, original));
+    if (competingMark) return 'ambiguous';
+    const originalHashes = [wholeInputHash(original)];
+    if (CORRELATION_TRAILER_RE.test(original)) {
+      originalHashes.push(wholeInputHash(original.replace(CORRELATION_TRAILER_RE, '')));
+    }
+    const nowMs = this.now();
+    const competingDrop = this.recentlyDroppedInputs.some(({ hashes, droppedAtMs }) =>
+      nowMs - droppedAtMs <= CURSOR_BUSY_REFRESH_MAX_MS + STRUCTURED_SUBMIT_START_GRACE_MS
+      && hashes.some(hash => originalHashes.includes(hash)));
+    return competingDrop ? 'ambiguous' : 'matched';
   }
 
   /** A mark the CLI may still deliver: never passed over. */
@@ -851,6 +880,7 @@ export class CodexBridgeQueue {
     const dropped = this.queue.splice(0);
     if (this.collecting && dropped.includes(this.collecting)) this.collecting = null;
     this.bufferedUnmatched = [];
+    this.recentlyDroppedInputs.length = 0;
     this.lastClosedAssistantFinalTimeMs = undefined;
     this.lastTranscriptEventTimeMs = undefined;
     return dropped;
@@ -874,6 +904,16 @@ export class CodexBridgeQueue {
     );
     if (index < 0) return null;
     const [dropped] = this.queue.splice(index, 1);
+    if (dropped && !dropped.started && dropped.finalText === undefined) {
+      // A cancelled or expired input can still reach the transcript. Retain
+      // its whole-input digests as short-lived conflict evidence only.
+      const hashes = dropped.wholeInputHash === undefined ? [] : [dropped.wholeInputHash];
+      if (dropped.submittedInputText) hashes.push(wholeInputHash(dropped.submittedInputText));
+      if (hashes.length > 0) {
+        this.recentlyDroppedInputs.push({ hashes, droppedAtMs: this.now() });
+        if (this.recentlyDroppedInputs.length > MAX_BUFFERED_UNMATCHED_EVENTS) this.recentlyDroppedInputs.shift();
+      }
+    }
     if (this.collecting === dropped) this.collecting = null;
     if (allowStarted) this.refreshNextPreStartLease();
     // A later turn's user event can already be buffered behind this failed
@@ -1386,6 +1426,7 @@ export class CodexBridgeQueue {
   }
 
   private ingestOne(ev: CodexBridgeEvent, bufferUnmatched: boolean): void {
+    if (ev.softNewlineInput && this.ambiguousSoftNewlineInputs.has(ev.softNewlineInput)) return;
     // A stable-id replay from a closed turn is never evidence for the current
     // id-less turn. Reject it before any compatibility fallback can run.
     if (ev.sourceTurnId && this.isClosedNativeTurn(ev.sourceSessionId, ev.sourceTurnId)) return;
@@ -1592,9 +1633,15 @@ export class CodexBridgeQueue {
       // Both the HOL-drop and the actual start key off this decision.
       const { next, passed } = this.userRecordOwner(ev);
       const tooOld = !!next && next.markTimeMs !== undefined && ev.timestampMs < next.markTimeMs - UNMATCHED_REPLAY_WINDOW_MS;
-      let fingerprintOk = true;
-      if (next) fingerprintOk = this.matchesUserInput(next, ev);
-      const willStartNext = !!next && !tooOld && fingerprintOk;
+      const rawMatch = !!next && !tooOld && this.matchesUserInput(next, ev);
+      const softNewlineMatch = next && !tooOld && !rawMatch ? this.matchSoftNewlineInput(next, ev) : undefined;
+      // Buffering cannot resolve two possible owners: cancelling or expiring
+      // one mark would let the other claim the same ambiguous record on replay.
+      if (softNewlineMatch === 'ambiguous' && ev.softNewlineInput) {
+        this.ambiguousSoftNewlineInputs.add(ev.softNewlineInput);
+        return;
+      }
+      const willStartNext = rawMatch || softNewlineMatch === 'matched';
       const willSynthLocal = !willStartNext && this.localTurnsEnabled && ev.timestampMs >= this.localLowerBoundMs - UNMATCHED_REPLAY_WINDOW_MS;
       if (willStartNext) this.revalidateRestoredMerge(next!, ev);
 
