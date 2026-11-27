@@ -6,7 +6,7 @@ import { BytedcliBrokerError, type BytedcliChildInvocation, type BytedcliTrusted
 const libraries = ['/lib/x86_64-linux-gnu', '/usr/lib/x86_64-linux-gnu', '/lib/aarch64-linux-gnu', '/usr/lib/aarch64-linux-gnu', '/lib64', '/usr/lib64'];
 const networkFiles = ['/etc/resolv.conf', '/etc/hosts', '/etc/nsswitch.conf', '/etc/ssl/certs', '/etc/pki/tls/certs'];
 const contains = (parent: string, child: string) => { const rel = relative(parent, child); return rel === '' || !rel.startsWith('..') && !isAbsolute(rel); };
-const fail = (): never => { throw new BytedcliBrokerError('executor_unavailable'); };
+function fail(): never { throw new BytedcliBrokerError('executor_unavailable'); }
 
 /** Only the runtime, frozen installation/dependency trees, fixed system
  * libraries/CA/DNS and this request enter a new root. In particular, neither

@@ -74,8 +74,14 @@ describe('selected business signatures', () => {
     ]) expect(() => parse(argv)).toThrow();
   });
   it.each(['SELECT 1; DELETE FROM pick_package', 'SELECT 1 INTO OUTFILE "/tmp/x"', 'SELECT load_file("/etc/passwd")',
-    'SELECT malicious_function()', 'SELECT `malicious_function`()', 'SELECT "malicious_function"()', 'SELECT unreviewed.COUNT()', 'SELECT unreviewed . IFNULL (1, 0)', 'SELECT @x:=1', 'SELECT 1 /*!50000 INTO OUTFILE "/tmp/x" */', 'SELECT 1 FOR UPDATE'])('rejects SQL with effects: %s', sql => {
+    'SELECT malicious_function()', 'SELECT `malicious_function`()', 'SELECT "malicious_function"()', 'SELECT unreviewed.COUNT()', 'SELECT unreviewed . IFNULL (1, 0)',
+    'SELECT business_mutator$()', 'SELECT $COUNT()', 'SELECT 123COUNT()', 'SELECT 0xCOUNT()', 'SELECT a$b()',
+    'SELECT @x:=1', 'SELECT 1 /*!50000 INTO OUTFILE "/tmp/x" */', 'SELECT 1 FOR UPDATE'])('rejects SQL with effects: %s', sql => {
     expect(() => parse(['rds', 'db', 'query', 'ecom_market_pick', sql, '--region', 'cn'])).toThrow();
+  });
+  it('keeps dollar and digit-prefixed function text harmless inside SQL literals',()=>{
+    const operation=parse(['rds','query-db','ecom_market_pick',"SELECT COUNT(*) FROM pick_package WHERE description = '$COUNT() 123COUNT() business_mutator$()'",'--region','cn']);
+    expect(operation).toMatchObject({id:'rds.db.query',effect:'read'});
   });
   it('normalizes only escaped JSON double quotes inside the Skill SQL single-quoted LIKE literal', () => {
     const sql = String.raw`SELECT COUNT(*) AS cnt FROM pick_package WHERE IFNULL(is_test_picko,0)=0 AND op_rules LIKE '%\"column_name\":\"field\"%'`;

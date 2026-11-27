@@ -70,7 +70,10 @@ export function isBytedcliReadOnlySql(sql: string): boolean {
   // A schema-qualified name can select a stored function even when its leaf
   // matches an otherwise safe built-in, e.g. app.COUNT().
   if (/\.\s*[A-Za-z_][A-Za-z0-9_]*\s*\(/.test(code)) return false;
-  for (const match of code.matchAll(/([A-Za-z_][A-Za-z0-9_]*)\s*\(/g)) if (!functions.has(match[1]!.toUpperCase())) return false;
+  // MySQL identifiers may start with digits and contain $. Match the entire
+  // ASCII token so 123COUNT(), $COUNT() or business_mutator$() cannot be
+  // reduced to a whitelisted suffix or skipped by the function scan.
+  for (const match of code.matchAll(/([A-Za-z0-9_$]+)\s*\(/g)) if (!functions.has(match[1]!.toUpperCase())) return false;
   return true;
 }
 const rows: BytedcliBusinessCommand[] = [];

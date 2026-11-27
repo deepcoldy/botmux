@@ -116,18 +116,42 @@ function parseTokens(argv: readonly string[], entry: Entry): Parsed {
 function paths(entry: Entry): readonly (readonly string[])[] {
   return [entry.path, ...entry.aliases];
 }
-function legacyCommandWords(argv: readonly string[]): string[] {
-  const flags = [...common, ...entries.flatMap(entry => entry.flags)]; const words: string[] = [];
-  for (let index = 0; index < argv.length; index++) {
-    const token = argv[index]!;
-    if (token === '--') { words.push(...argv.slice(index + 1)); break; }
-    if (!token.startsWith('-')) { words.push(token); continue; }
-    if (token.includes('=')) continue;
-    const flag = flags.find(flag => flag.name === token || flag.aliases?.includes(token));
-    if (flag?.arity === 'value' || flag?.arity === 'optional-boolean' && boolean(argv[index + 1] ?? '')) index++;
-    else if (!flag && argv[index + 1] && !argv[index + 1]!.startsWith('-')) index++;
-  }
-  return words;
+// Root option arities from audited CLI 0.199.0 (including hidden options and
+// Commander help/version aliases). This is recognition only, not permission
+// to pass these flags: parseTokens above still enforces each closed grammar.
+const nativeGlobalArities = new Map<string, 'flag' | 'value'>([
+  ...['--debug', '-d', '--json', '-j', '--nomask', '--yes', '--color', '--no-color', '--tls1.2', '--http-debug',
+    '--no-auto-upgrade', '--all-help', '--help', '-h', '--version', '-V'].map(name => [name, 'flag'] as const),
+  ...['--jq', '--site', '--network-profile', '--auth-site', '--as', '--ai-auth-subject', '--ai-auth-app-key',
+    '--bytecloud-user-jwt-file', '--profile', '--vregion', '--vdc', '--socks5-proxy', '--http-proxy', '--http-header',
+    '--http-print', '--http-trace-file', '--http-body-limit', '--http-timeout-ms', '--http-retry-count',
+    '--http-retry-base-delay-ms', '--http-retry-max-delay-ms'].map(name => [name, 'value'] as const),
+]);
+function hasRegisteredLegacyCommand(argv: readonly string[]): boolean {
+  return entries.some(entry => paths(entry).some(path => {
+    const flags = [...entry.flags, ...common]; // command-local arity wins
+    const memo = new Map<string, boolean>();
+    const visit = (index: number, matched: number, separator = false): boolean => {
+      if (matched === path.length) return true;
+      if (index >= argv.length) return false;
+      const key = `${index}:${matched}:${separator}`;
+      if (memo.has(key)) return memo.get(key)!;
+      const token = argv[index]!; let found: boolean;
+      if (!separator && token === '--') found = visit(index + 1, matched, true);
+      else if (separator || !token.startsWith('-')) found = token === path[matched] && visit(index + 1, matched + 1, separator);
+      else if (token.includes('=')) found = visit(index + 1, matched);
+      else {
+        const arity = flags.find(flag => flag.name === token || flag.aliases?.includes(token))?.arity ?? nativeGlobalArities.get(token);
+        if (arity === 'value' || arity === 'optional-boolean' && boolean(argv[index + 1] ?? '')) found = visit(index + 2, matched);
+        else if (arity) found = visit(index + 1, matched);
+        // Unknown arity cannot hide a registered path by consuming one of
+        // its words. Explore both interpretations; memoization bounds work.
+        else found = visit(index + 1, matched) || !!argv[index + 1] && !argv[index + 1]!.startsWith('-') && visit(index + 2, matched);
+      }
+      memo.set(key, found); return found;
+    };
+    return visit(0, 0);
+  }));
 }
 function result(id: string, effect: BytedcliOperationEffect, argv: string[], resources: Record<string, string>,
   stagedInputs: BytedcliStagedInput[] = [], execution: BytedcliOperationExecution = effect === 'auth' || effect === 'help' ? 'host-api' : 'audited-native', requiredRuntime?: 'db-cli'): BytedcliOperation {
@@ -206,8 +230,7 @@ export function parseBytedcliOperation(argv: readonly string[], inputs?: Bytedcl
     return buildOperation(entry, parsed, parsed.words.slice(matched.length), snapshots);
   }
   // A malformed registered legacy operation must never enter actor fallback.
-  const words = legacyCommandWords(args);
-  if (entries.some(entry => paths(entry).some(path => path.every((word, index) => words[index] === word)))) deny();
+  if (hasRegisteredLegacyCommand(args)) deny();
   let help: Parsed | undefined;
   try { help = parseTokens(args, { id: 'help', path: [], aliases: [], effect: 'help', flags: [] }); } catch { /* business path */ }
   if (!help || !BYTEDCLI_OPERATION_GRAMMAR.helpGroups.some(({ path }) => path.length === help.words.length && path.every((word, index) => help.words[index] === word))) {
