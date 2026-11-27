@@ -227,7 +227,6 @@ function configuredSessionDir(file: string): string | undefined {
  *  its own --session-dir separately when a managed sandbox takes precedence. */
 export function piProfileTranscriptDir(env: NodeJS.ProcessEnv, cwd: string, readProjectSettings = true): string | undefined {
   const home = env.HOME || homedir();
-  if (!env.PI_CODING_AGENT_DIR && !env.PI_CODING_AGENT_SESSION_DIR && home === homedir()) return undefined;
   const actualCwd = piCwdVariants(cwd).at(-1)!;
   const absolute = (path: string) => {
     if (path === '~') return home;
@@ -239,6 +238,13 @@ export function piProfileTranscriptDir(env: NodeJS.ProcessEnv, cwd: string, read
   const exact = env.PI_CODING_AGENT_SESSION_DIR
     || (readProjectSettings && configuredSessionDir(join(actualCwd, '.pi', 'settings.json')))
     || configuredSessionDir(join(profile, 'settings.json'));
+  // A stock home with no env override and no settings sessionDir keeps the
+  // pre-profile lookup (cwd buckets + tree-walk safety net): returning the
+  // default bucket here would narrow that lookup to one directory. But a
+  // sessionDir in a project/profile settings.json applies even with no env
+  // override (Pi's startup SettingsManager loads it regardless of HOME), so
+  // the early return must run only after those files were checked.
+  if (!exact && !env.PI_CODING_AGENT_DIR && !env.PI_CODING_AGENT_SESSION_DIR && home === homedir()) return undefined;
   return exact ? absolute(exact) : join(profile, 'sessions', piSessionDirName(actualCwd));
 }
 

@@ -97,6 +97,26 @@ describe('Pi launch profile', () => {
     expect(piProfileTranscriptDir({ ...env, HOME: ROOT }, cwd, false)).toBe(join(ROOT, 'shared'));
   });
 
+  it('honors a project sessionDir with no env override on a stock home', () => {
+    // Pi's startup SettingsManager loads <cwd>/.pi/settings.json regardless of
+    // HOME or PI_* env vars. The early return must not skip that read, or the
+    // bridge waits on the default bucket while Pi files under sessionDir.
+    const cwd = join(ROOT, 'stock-work');
+    mkdirSync(join(cwd, '.pi'), { recursive: true });
+    writeFileSync(join(cwd, '.pi', 'settings.json'), JSON.stringify({ sessionDir: 'project-records' }));
+    const realCwd = realpathSync(cwd);
+    expect(piProfileTranscriptDir({}, cwd)).toBe(join(realCwd, 'project-records'));
+  });
+
+  it('falls back to the default bucket under a redirected HOME with no settings', () => {
+    const cwd = join(ROOT, 'redirected-work');
+    mkdirSync(cwd, { recursive: true });
+    const home = join(ROOT, 'redirected-home');
+    mkdirSync(home, { recursive: true });
+    expect(piProfileTranscriptDir({ HOME: home }, cwd))
+      .toBe(join(home, '.pi', 'agent', 'sessions', piSessionDirName(realpathSync(cwd))));
+  });
+
   it('reattaches using the live pane’s directory across config edits, then replaces it on cold launch', () => {
     const first = join(ROOT, 'first');
     const second = join(ROOT, 'second');
