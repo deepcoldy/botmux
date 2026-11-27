@@ -26,6 +26,10 @@ import {
 } from '../src/core/plugins/card-actions/auth.js';
 import { pluginServiceName } from '../src/core/plugins/supervisor-store.js';
 import * as supervisorClient from '../src/core/plugins/supervisor-client.js';
+import {
+  FLEET_LSTART_UTC_V1_PREFIX,
+  readFleetDurableProcessIdentity,
+} from '../src/utils/process-identity.js';
 import { fenceHomeRootedEnv } from './helpers/fence-home-env.js';
 
 vi.mock('../src/core/plugins/supervisor-client.js', () => ({
@@ -548,5 +552,25 @@ describe('plugin service host env injection, webhooks port/token, and liveness r
       isZombie: () => false,
       readProcessStart: () => 'boot-1',
     })).toEqual({ ok: false, status: 503, error: 'plugin_service_token_unavailable' });
+  });
+
+  it.runIf(process.platform !== 'win32')('uses the versioned fleet identity in the no-supervisor fallback by default', () => {
+    mkdirSync(join(home, '.botmux', 'plugins', 'versioned-fallback'), { recursive: true });
+    const token = getOrCreatePluginCardActionToken('versioned-fallback');
+    const platform = vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin');
+    try {
+      const processStart = readFleetDurableProcessIdentity(process.pid);
+      expect(processStart?.startsWith(FLEET_LSTART_UTC_V1_PREFIX)).toBe(true);
+      const state = {
+        pluginId: 'versioned-fallback', updatedAt: new Date().toISOString(),
+        status: 'online' as const, pid: process.pid, processStart: processStart!, port: 44199,
+      };
+      expect(resolveRunningPluginServiceTarget('versioned-fallback', {
+        readServiceState: () => state,
+        hasSupervisorFiles: () => false,
+        readToken: () => token,
+        // Deliberately no readProcessStart override: production uses this default.
+      })).toEqual({ ok: true, host: '127.0.0.1', port: 44199, token, pid: process.pid, processStart });
+    } finally { platform.mockRestore(); }
   });
 });

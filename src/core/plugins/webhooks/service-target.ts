@@ -11,7 +11,7 @@ import {
   type PluginSupervisorDesired,
 } from '../supervisor-store.js';
 import { pidAlive } from '../../fleet-supervisor.js';
-import { isLinuxZombie, readDurableProcessIdentity } from '../../../utils/process-identity.js';
+import { isLinuxZombie, readFleetDurableProcessIdentity } from '../../../utils/process-identity.js';
 import type { PluginServiceState } from '../types.js';
 
 export interface PluginLoopbackTarget {
@@ -168,7 +168,8 @@ export function resolveRunningPluginServiceTarget(
     }
     const aliveFn = deps.isPidAlive ?? pidAlive;
     const zombieFn = deps.isZombie ?? isLinuxZombie;
-    const startFn = deps.readProcessStart ?? readDurableProcessIdentity;
+    const startFn = deps.readProcessStart
+      ?? ((pid: number) => readFleetDurableProcessIdentity(pid, serviceState.processStart));
     if (
       typeof serviceState.pid !== 'number'
       || !Number.isSafeInteger(serviceState.pid)
