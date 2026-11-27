@@ -15,9 +15,12 @@ import {
 import {
   buildRuntimeMeta,
   buildVersionLine,
+  classifyEmptyDashboardView,
   emptyDashboardMessage,
   isRuntimeState,
+  shouldAutoOpenZeroBotOnboarding,
   shouldKeepLoadedDashboardDuringDegradedState,
+  type EmptyDashboardView,
 } from './runtime-state.js';
 
 interface RunResult {
@@ -67,6 +70,7 @@ const desktopLocaleStorageKey = 'botmux.dashboard.locale';
 const logPollIntervalMs = 1500;
 const navPointerDedupMs = 350;
 const dashboardLocateRetryMs = 5000;
+const zeroBotBootstrapGraceMs = 8000;
 const desktopShellInjectedCss = `
   .sidebar,
   .topbar {
@@ -139,31 +143,42 @@ const messages: Record<DesktopLocale, Record<string, string>> = {
     'summary.configuredBots': '已配置 Bot',
     'runtime.checking': '正在检查 CLI',
     'runtime.waitingBridge': '等待桌面桥接',
-    'runtime.status.not_configured': '需要配置',
+    'runtime.status.not_configured': '等待配置',
+    'runtime.status.onboarding': '等待添加机器人',
     'runtime.status.stopped': '已停止',
     'runtime.status.starting': '启动中',
     'runtime.status.running': '运行中',
     'runtime.status.degraded': '需要处理',
     'runtime.stateUnavailable': '状态不可用',
-    'runtime.stateUnavailableDetail': '无法读取 CLI 状态：{error}',
+    'runtime.stateUnavailableDetail': '无法读取服务状态：{error}',
     'runtime.bridgeUnavailable': '桌面桥接不可用',
-    'runtime.bridgeUnavailableDetail': '重启 Botmux Desktop 以重新连接 IPC。',
+    'runtime.bridgeUnavailableDetail': '重启 Botmux Desktop 以重新连接。',
     'runtimeSource.globalCli': '全局 CLI',
     'runtimeSource.bundled': '内置运行时',
-    'runtimeSource.none': '未连接 CLI',
+    'runtimeSource.none': '未找到运行环境',
     'version.unavailable': '版本信息不可用',
-    'empty.notConfigured': '添加机器人后启动 CLI，即可加载控制台。',
-    'empty.stopped': '启动 CLI 后加载控制台。',
-    'empty.degraded': 'CLI 需要处理后才能加载控制台。',
-    'empty.dashboardMissing': '控制台 URL 暂不可用。',
-    'empty.stateUnavailable': 'CLI 状态不可用。',
+    'empty.starting': '正在启动本地服务…',
+    'empty.bootstrappingTitle': '正在准备首次配置…',
+    'empty.bootstrappingBody': '正在启动本地控制台，稍候将自动打开添加机器人向导，无需打开终端。',
+    'empty.welcomeTitle': '欢迎使用 Botmux',
+    'empty.welcomeBody': '还没有配置机器人。点击下方按钮即可通过飞书扫码自动创建，或手动填入 App ID / Secret 完成配置，无需终端操作。',
+    'empty.configErrorTitle': '配置文件 bots.json 无法读取',
+    'empty.configErrorBody': '为了保护你的原有配置，应用已停止加载且不会覆盖或清空 bots.json。请检查并修复后重试。',
+    'empty.stoppedTitle': '服务已停止',
+    'empty.notConfigured': '点击「开始配置」添加第一个机器人，即可开始使用。',
+    'empty.stopped': '点击「启动」以加载控制台。',
+    'empty.degraded': '服务需要处理后才能加载控制台。',
+    'empty.dashboardMissing': '控制台暂不可用。',
+    'empty.stateUnavailable': '服务状态不可用。',
     'empty.bridgeUnavailable': '桌面桥接不可用。',
     'empty.dashboardUnavailable': '控制台不可用：{error}',
     'empty.dashboardLocateFailed': '控制台不可用（{reason}）：{message}',
-    'empty.startRuntime': '启动 CLI 后加载控制台。',
-    'empty.startFirst': '请先启动 CLI，再打开控制台页面。',
-    'runtime.restartMessage': '正在重启 CLI...',
+    'empty.startRuntime': '正在准备控制台…',
+    'empty.startFirst': '请先启动服务，再打开控制台页面。',
+    'runtime.restartMessage': '正在重启服务…',
     'action.start': '启动',
+    'action.startOnboarding': '开始配置 / 添加第一个机器人',
+    'action.openConfigDir': '打开配置目录',
     'action.stop': '停止',
     'action.restart': '重启',
     'action.takeover': '连接当前 CLI',
@@ -230,30 +245,41 @@ const messages: Record<DesktopLocale, Record<string, string>> = {
     'runtime.checking': 'Checking CLI',
     'runtime.waitingBridge': 'Waiting for desktop bridge',
     'runtime.status.not_configured': 'Setup needed',
+    'runtime.status.onboarding': 'Ready for setup',
     'runtime.status.stopped': 'Stopped',
     'runtime.status.starting': 'Starting',
     'runtime.status.running': 'Running',
     'runtime.status.degraded': 'Needs attention',
     'runtime.stateUnavailable': 'State unavailable',
-    'runtime.stateUnavailableDetail': 'Could not read CLI state: {error}',
+    'runtime.stateUnavailableDetail': 'Could not read service state: {error}',
     'runtime.bridgeUnavailable': 'Desktop bridge unavailable',
-    'runtime.bridgeUnavailableDetail': 'Restart Botmux Desktop to reconnect IPC.',
+    'runtime.bridgeUnavailableDetail': 'Restart Botmux Desktop to reconnect.',
     'runtimeSource.globalCli': 'Global CLI',
     'runtimeSource.bundled': 'Bundled runtime',
-    'runtimeSource.none': 'No CLI connected',
+    'runtimeSource.none': 'Runtime unavailable',
     'version.unavailable': 'Version unavailable',
-    'empty.notConfigured': 'Add a bot, then start the CLI to load the dashboard.',
-    'empty.stopped': 'Start the CLI to load the dashboard.',
-    'empty.degraded': 'CLI needs attention before the dashboard can load.',
-    'empty.dashboardMissing': 'Dashboard URL is not available yet.',
-    'empty.stateUnavailable': 'CLI state is unavailable.',
+    'empty.starting': 'Starting local service...',
+    'empty.bootstrappingTitle': 'Preparing first-time setup...',
+    'empty.bootstrappingBody': 'Starting the local dashboard. The add-bot wizard will open automatically — no terminal needed.',
+    'empty.welcomeTitle': 'Welcome to Botmux',
+    'empty.welcomeBody': 'No bot is configured yet. Click below to create one via Feishu QR scan or enter an existing App ID & Secret — no terminal required.',
+    'empty.configErrorTitle': 'Unable to read bots.json',
+    'empty.configErrorBody': 'To protect your existing configuration, Botmux will not overwrite or clear bots.json. Open the config folder to inspect and fix the file.',
+    'empty.stoppedTitle': 'Service stopped',
+    'empty.notConfigured': 'Click "Get started" to add your first bot.',
+    'empty.stopped': 'Click "Start" to load the dashboard.',
+    'empty.degraded': 'Service needs attention before the dashboard can load.',
+    'empty.dashboardMissing': 'Dashboard is not available yet.',
+    'empty.stateUnavailable': 'Service state is unavailable.',
     'empty.bridgeUnavailable': 'Desktop bridge is unavailable.',
     'empty.dashboardUnavailable': 'Dashboard unavailable: {error}',
     'empty.dashboardLocateFailed': 'Dashboard unavailable ({reason}): {message}',
-    'empty.startRuntime': 'Start the CLI to load the dashboard.',
-    'empty.startFirst': 'Start the CLI before opening a dashboard page.',
-    'runtime.restartMessage': 'Restarting CLI...',
+    'empty.startRuntime': 'Preparing dashboard...',
+    'empty.startFirst': 'Start the service before opening a dashboard page.',
+    'runtime.restartMessage': 'Restarting service...',
     'action.start': 'Start',
+    'action.startOnboarding': 'Get started / Add first bot',
+    'action.openConfigDir': 'Open config folder',
     'action.stop': 'Stop',
     'action.restart': 'Restart',
     'action.takeover': 'Connect current CLI',
@@ -332,6 +358,10 @@ let dashboardGeneration = 0;
 let dashboardRoute: string | null = null;
 let dashboardLocateRetryTimer: number | null = null;
 let desktopShellCssInjectedUrl: string | null = null;
+let zeroBotOnboardingAutoOpened = false;
+let userInitiatedNav = false;
+let zeroBotBootstrapGraceActive = true;
+let zeroBotBootstrapGraceTimer: number | null = null;
 let logTimer: number | null = null;
 let logPollInFlight = false;
 // Each drawer open gets a token; stale log promises must not write after close.
@@ -408,6 +438,14 @@ async function initialize(): Promise<void> {
   }
 
   await initializeLoginToggle(api);
+  zeroBotBootstrapGraceTimer = window.setTimeout(() => {
+    zeroBotBootstrapGraceTimer = null;
+    if (!zeroBotBootstrapGraceActive) return;
+    zeroBotBootstrapGraceActive = false;
+    if (lastState && dashboardFrame.dataset.visible === 'false') {
+      renderEmptyDashboard(lastState);
+    }
+  }, zeroBotBootstrapGraceMs);
   await refreshState();
   api.onStateChanged(state => {
     // Treat push events as untrusted IPC data and fall back to polling if the
@@ -490,12 +528,14 @@ function wireDashboardNavLink(link: HTMLAnchorElement): void {
     // Electron webview focus can swallow the follow-up click after the sidebar
     // visually receives focus, so pointerup gives native navigation a fallback.
     lastPointerNavigation = { route, time: performance.now() };
+    userInitiatedNav = true;
     void openDashboardRoute(route);
   });
   link.addEventListener('click', event => {
     event.preventDefault();
     const route = link.dataset.dashboardRoute ?? '#/';
     if (isRecentPointerNavigation(route)) return;
+    userInitiatedNav = true;
     void openDashboardRoute(route);
   });
 }
@@ -519,7 +559,7 @@ function setLocale(locale: string | undefined): void {
   if (lastState) {
     paintState(lastState);
     if (dashboardFrame.dataset.visible === 'false') {
-      clearDashboard(emptyDashboardMessage(lastState, t));
+      renderEmptyDashboard(lastState);
     }
   }
   syncDashboardLocale();
@@ -561,8 +601,11 @@ async function readRuntimeState(api: BotmuxDesktopApi): Promise<DesktopRuntimeSt
 }
 
 function paintState(state: DesktopRuntimeState): void {
-  runtimeDot.dataset.status = state.status;
-  runtimeStatus.textContent = t(`runtime.status.${state.status}`);
+  const onboardingRunning = state.status === 'running' && state.botCount === 0;
+  runtimeDot.dataset.status = onboardingRunning ? 'not_configured' : state.status;
+  runtimeStatus.textContent = onboardingRunning
+    ? t('runtime.status.onboarding')
+    : t(`runtime.status.${state.status}`);
   setRuntimeMetaText(runtimeNotice ?? state.message ?? buildRuntimeMeta(state, t));
   const versionText = buildVersionLine(state);
   versionLine.textContent = versionText;
@@ -609,10 +652,12 @@ function paintControls(state: DesktopRuntimeState | null): void {
   restartBtn.disabled = disabled || unmanagedRuntime || !status || status === 'not_configured' || status === 'starting';
   takeoverBtn.hidden = true;
   takeoverBtn.disabled = true;
-  createSessionBtn.disabled = bridgeUnavailable || unmanagedRuntime;
+  createSessionBtn.disabled = bridgeUnavailable || unmanagedRuntime || !state || state.botCount === 0;
   addBotBtn.disabled = bridgeUnavailable || unmanagedRuntime;
   logsBtn.disabled = bridgeUnavailable;
   homeBtn.disabled = bridgeUnavailable;
+  const emptyCta = document.getElementById('empty-start-onboarding-btn') as HTMLButtonElement | null;
+  if (emptyCta) emptyCta.disabled = disabled || unmanagedRuntime;
 }
 
 function paintBridgeUnavailable(): void {
@@ -645,10 +690,12 @@ async function syncDashboardForState(state: DesktopRuntimeState): Promise<void> 
   const shouldLoad = Boolean(state.dashboardUrl) || state.status === 'running';
 
   if (!shouldLoad) {
-    clearDashboard(emptyDashboardMessage(state, t));
+    if (state.status !== 'not_configured') endZeroBotBootstrapGrace();
+    clearDashboardWithState(state);
     return;
   }
 
+  endZeroBotBootstrapGrace();
   const token = ++dashboardLoadToken;
   let dashboardUrl = state.dashboardUrl;
   if (!dashboardUrl) {
@@ -670,10 +717,109 @@ async function syncDashboardForState(state: DesktopRuntimeState): Promise<void> 
   if (token !== dashboardLoadToken) return;
   if (dashboardUrl) {
     cancelDashboardLocateRetry();
+    if (shouldAutoOpenZeroBotOnboarding(state, {
+      alreadyOpened: zeroBotOnboardingAutoOpened,
+      userNavigated: userInitiatedNav,
+      hasLoadedDashboard: Boolean(currentDashboardUrl()),
+    })) {
+      zeroBotOnboardingAutoOpened = true;
+      dashboardRoute = '#/?open=bot-onboarding';
+    }
     showDashboard(routeDashboardUrl(dashboardUrl));
   } else {
-    clearDashboard(emptyDashboardMessage(state, t));
+    clearDashboardWithState(state);
   }
+}
+
+function endZeroBotBootstrapGrace(): void {
+  zeroBotBootstrapGraceActive = false;
+  if (zeroBotBootstrapGraceTimer !== null) {
+    window.clearTimeout(zeroBotBootstrapGraceTimer);
+    zeroBotBootstrapGraceTimer = null;
+  }
+}
+
+function clearDashboardWithState(state: DesktopRuntimeState): void {
+  clearDashboard(emptyDashboardMessage(state, t));
+  renderEmptyDashboard(state);
+}
+
+function renderEmptyDashboard(state: DesktopRuntimeState | null, fallbackMessage?: string): void {
+  const view = classifyEmptyDashboardView(state, {
+    bootstrappingZeroBot: zeroBotBootstrapGraceActive && Boolean(state && state.runtimeSource === 'bundled'),
+    fallbackMessage: fallbackMessage ?? (state ? emptyDashboardMessage(state, t) : undefined),
+  });
+  paintEmptyDashboardView(view);
+}
+
+function paintEmptyDashboardView(view: EmptyDashboardView): void {
+  emptyDashboard.replaceChildren();
+  if (view.kind === 'degraded' || view.kind === 'unavailable') {
+    emptyDashboard.textContent = view.message || t('empty.dashboardMissing');
+    return;
+  }
+
+  const card = document.createElement('div');
+  card.className = `empty-card empty-card-${view.kind}`;
+
+  const title = document.createElement('h2');
+  title.className = 'empty-card-title';
+  title.textContent = t(view.titleKey);
+  card.append(title);
+
+  const body = document.createElement('p');
+  body.className = 'empty-card-body';
+  body.textContent = t(view.bodyKey);
+  card.append(body);
+
+  if (view.kind === 'config_error') {
+    if (view.detail) {
+      const detail = document.createElement('code');
+      detail.className = 'empty-card-detail';
+      detail.textContent = view.detail;
+      card.append(detail);
+    }
+    const actions = document.createElement('div');
+    actions.className = 'empty-card-actions';
+    const openBtn = document.createElement('button');
+    openBtn.type = 'button';
+    openBtn.className = 'empty-card-primary';
+    openBtn.textContent = t(view.openFolderKey);
+    openBtn.addEventListener('click', () => {
+      void openPath(t('path.home'), api => api.openBotmuxHome());
+    });
+    actions.append(openBtn);
+    card.append(actions);
+  } else if (view.kind === 'onboarding_welcome') {
+    const actions = document.createElement('div');
+    actions.className = 'empty-card-actions';
+    const cta = document.createElement('button');
+    cta.type = 'button';
+    cta.id = 'empty-start-onboarding-btn';
+    cta.className = 'empty-card-primary';
+    cta.disabled = actionPending;
+    cta.textContent = t(view.ctaKey);
+    cta.addEventListener('click', () => {
+      void openBotOnboarding();
+    });
+    actions.append(cta);
+    card.append(actions);
+  } else if (view.kind === 'stopped') {
+    const actions = document.createElement('div');
+    actions.className = 'empty-card-actions';
+    const cta = document.createElement('button');
+    cta.type = 'button';
+    cta.className = 'empty-card-primary';
+    cta.disabled = actionPending;
+    cta.textContent = t(view.ctaKey);
+    cta.addEventListener('click', () => {
+      void runRuntimeAction(t('action.start'), api => api.start());
+    });
+    actions.append(cta);
+    card.append(actions);
+  }
+
+  emptyDashboard.append(card);
 }
 
 function showDashboard(url: string): void {
@@ -773,8 +919,25 @@ function describeRunResult(label: string, result: RunResult): string | null {
 }
 
 async function openBotOnboarding(): Promise<void> {
+  const api = getApi();
+  if (!api) {
+    paintBridgeUnavailable();
+    return;
+  }
+  if (lastState && lastState.runtimeManaged && (lastState.status === 'not_configured' || lastState.status === 'stopped')) {
+    // Allow 1-click onboarding from a fresh or stopped 0-bot shell: start the
+    // local dashboard runtime first, then open the onboarding modal automatically.
+    // Do NOT latch zeroBotOnboardingAutoOpened before start() succeeds so a failed
+    // attempt does not suppress auto-opening when a later start succeeds.
+    endZeroBotBootstrapGrace();
+    dashboardRoute = '#/?open=bot-onboarding';
+    await runRuntimeAction(t('action.start'), runtimeApi => runtimeApi.start());
+    const refreshedState: DesktopRuntimeState | null = lastState;
+    if (!refreshedState || refreshedState.status !== 'running') return;
+  }
   // The desktop shell hides the dashboard topbar, so pass a one-shot route
   // action that lets the embedded dashboard open its own onboarding modal.
+  zeroBotOnboardingAutoOpened = true;
   await openDashboardRoute('#/?open=bot-onboarding', t('dashboard.openBotOnboarding'));
 }
 
@@ -805,7 +968,7 @@ async function openDashboardRoute(route: string, notice = t('dashboard.openingPa
   }
   if (lastState?.status === 'degraded') {
     setRuntimeNotice(null);
-    clearDashboard(emptyDashboardMessage(lastState, t));
+    clearDashboardWithState(lastState);
     return;
   }
 

@@ -131,19 +131,31 @@ export async function findInvalidFleetCredentials(
 ): Promise<Array<{ appId: string; reason: string }>> {
   const invalid: Array<{ appId: string; reason: string }> = [];
   for (const bot of bots) {
-    if (bot.larkAppId && opts.blockedBotIds?.has(bot.larkAppId)) continue;
-    if (botSkipsFeishuCredentialCheck(bot)) continue;
-    if (!bot.larkAppId || !bot.larkAppSecret) {
-      invalid.push({ appId: bot.larkAppId || '(空 appId)', reason: 'larkAppId/larkAppSecret 缺失' });
+    if (!bot || typeof bot !== 'object' || Array.isArray(bot)) {
+      invalid.push({ appId: '(无效条目)', reason: 'bots.json 条目必须是对象' });
       continue;
     }
-    const verdict = await opts.validate(bot.larkAppId, bot.larkAppSecret, opts.brandOf(bot));
+    const rawAppId = typeof bot.larkAppId === 'string' ? bot.larkAppId : '';
+    const rawAppSecret = typeof bot.larkAppSecret === 'string' ? bot.larkAppSecret : '';
+    if (rawAppId && opts.blockedBotIds?.has(rawAppId)) continue;
+    if (botSkipsFeishuCredentialCheck(bot)) continue;
+    if (!rawAppId.trim() || !rawAppSecret.trim()) {
+      invalid.push({ appId: rawAppId.trim() || '(空 appId)', reason: 'larkAppId/larkAppSecret 缺失' });
+      continue;
+    }
+    if (rawAppId !== rawAppId.trim() || rawAppSecret !== rawAppSecret.trim()) {
+      // bot-registry passes raw strings to the daemon; reject leading/trailing
+      // whitespace instead of validating trimmed values that differ at runtime.
+      invalid.push({ appId: rawAppId.trim(), reason: 'larkAppId/larkAppSecret 包含首尾空白字符' });
+      continue;
+    }
+    const verdict = await opts.validate(rawAppId, rawAppSecret, opts.brandOf(bot));
     if (verdict.ok) continue;
     if (verdict.error === 'invalid_credentials') {
-      invalid.push({ appId: bot.larkAppId, reason: verdict.message });
+      invalid.push({ appId: rawAppId, reason: verdict.message });
       continue;
     }
-    opts.warn?.(`⚠️  [${bot.larkAppId}] 启动前凭证验证未成功（${verdict.error}）: ${verdict.message}`);
+    opts.warn?.(`⚠️  [${rawAppId}] 启动前凭证验证未成功（${verdict.error}）: ${verdict.message}`);
     opts.warn?.('   daemon 仍会启动；启动后 dispatcher 会自行重试。');
   }
   return invalid;

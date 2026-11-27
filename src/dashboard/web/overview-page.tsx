@@ -12,8 +12,11 @@ import {
   loadNameMaps,
   relTime,
   stripMentionPrefix,
+  ui,
 } from './ui.js';
-import { buildBotCards, loadGroupsSnapshot, type BotCard } from './overview.js';
+import { buildBotCards, hasLoadedGroupsSnapshot, loadGroupsSnapshot, type BotCard } from './overview.js';
+import { BOT_ONBOARDING_COMPLETED_EVENT, openBotOnboarding } from './bot-onboarding.js';
+import { store } from './store.js';
 import { requestOpenCreateSession } from './create-session-entry.js';
 import { deriveSessionTaskStatus } from '../../core/session-task-status.js';
 import { DocCommentFailures } from './doc-comment-failures.js';
@@ -350,6 +353,20 @@ function ActiveSortControl({ mode, onModeChange }: { mode: ActiveSortMode; onMod
   );
 }
 
+export function shouldShowZeroBotOnboardingBanner(input: {
+  authed: boolean;
+  groupsLoaded: boolean;
+  bootstrapped: boolean;
+  cardCount: number;
+  configuredBotCount: number | null;
+}): boolean {
+  return input.authed
+    && input.groupsLoaded
+    && input.bootstrapped
+    && input.cardCount === 0
+    && input.configuredBotCount === 0;
+}
+
 function OverviewPage() {
   const tr = useT();
   const teamRef = useRef<HTMLDivElement | null>(null);
@@ -357,12 +374,18 @@ function OverviewPage() {
   const [activeSortMode, setActiveSortMode] = useState<ActiveSortMode>(readActiveSortMode);
   const [collapsedN, setCollapsedN] = useState(TEAM_COLLAPSED_ROWS * TEAM_DESKTOP_COLUMNS);
   const [namesVersion, forceNamesRefresh] = useState(0);
-  const { sessions, schedules, scheduleTimeZone, schedulesAvailable, online } = useStoreSelector(snapshot => ({
+  const [groupsLoaded, setGroupsLoaded] = useState(hasLoadedGroupsSnapshot);
+  const [uiSnapshot, setUiSnapshot] = useState(() => ({
+    authed: ui.authed,
+    configuredBotCount: ui.configuredBotCount,
+  }));
+  const { sessions, schedules, scheduleTimeZone, schedulesAvailable, online, bootstrapped } = useStoreSelector(snapshot => ({
     sessions: [...snapshot.sessions.values()] as SessionRow[],
     schedules: [...snapshot.schedules.values()] as ScheduleRow[],
     scheduleTimeZone: snapshot.scheduleTimeZone,
     schedulesAvailable: snapshot.schedulesAvailable,
     online: snapshot.online,
+    bootstrapped: snapshot.bootstrapped,
   }));
 
   useEffect(() => {
@@ -388,8 +411,40 @@ function OverviewPage() {
   }, []);
 
   useEffect(() => {
-    void loadGroupsSnapshot().then(() => forceNamesRefresh(v => v + 1));
-    void loadNameMaps().then(() => forceNamesRefresh(v => v + 1));
+    let activeEffect = true;
+    const refreshGroups = (force = false) => {
+      void loadGroupsSnapshot(force ? { force: true } : {}).then(() => {
+        if (!activeEffect) return;
+        setGroupsLoaded(hasLoadedGroupsSnapshot());
+        forceNamesRefresh(v => v + 1);
+      });
+    };
+    const refreshConfiguredCount = () => {
+      if (ui.authed) void ui.refreshConfiguredBotCount();
+    };
+    refreshGroups(false);
+    refreshConfiguredCount();
+    void loadNameMaps().then(() => {
+      if (activeEffect) forceNamesRefresh(v => v + 1);
+    });
+    const offUi = ui.on(() => {
+      setUiSnapshot({ authed: ui.authed, configuredBotCount: ui.configuredBotCount });
+    });
+    const offBots = store.onBotsChanged(() => {
+      refreshGroups(true);
+      refreshConfiguredCount();
+    });
+    const onOnboardingCompleted = () => {
+      refreshGroups(true);
+      refreshConfiguredCount();
+    };
+    window.addEventListener(BOT_ONBOARDING_COMPLETED_EVENT, onOnboardingCompleted);
+    return () => {
+      activeEffect = false;
+      offUi();
+      offBots();
+      window.removeEventListener(BOT_ONBOARDING_COMPLETED_EVENT, onOnboardingCompleted);
+    };
   }, []);
 
   const active = useMemo(() => sessions.filter(s => s.status !== 'closed'), [sessions]);
@@ -420,6 +475,13 @@ function OverviewPage() {
   );
   // 无排程数据（无能力 或 确实没有 upcoming）时整块隐藏，不画空占位。
   const showSchedules = schedulesAvailable && upcoming.length > 0;
+  const showZeroBotOnboarding = shouldShowZeroBotOnboardingBanner({
+    authed: uiSnapshot.authed,
+    groupsLoaded,
+    bootstrapped,
+    cardCount: cards.length,
+    configuredBotCount: uiSnapshot.configuredBotCount,
+  });
 
   const toggleTeam = () => {
     setTeamExpanded(v => {
@@ -453,6 +515,20 @@ function OverviewPage() {
           </CreateActionButton>
         </div>
       </div>
+
+      {showZeroBotOnboarding ? (
+        <section className="overview-block overview-onboarding-card" data-zero-bot-onboarding="">
+          <div className="overview-onboarding-copy">
+            <h2>{tr('overview.zeroBotTitle')}</h2>
+            <p>{tr('overview.zeroBotDesc')}</p>
+          </div>
+          <div className="overview-onboarding-actions">
+            <CreateActionButton className="page-primary-action" onClick={() => void openBotOnboarding()}>
+              {tr('overview.zeroBotAction')}
+            </CreateActionButton>
+          </div>
+        </section>
+      ) : null}
 
       <div className="overview-stats">
         <StatChip tone="need" label={tr('overview.attention')} value={attentionAll.length} />
