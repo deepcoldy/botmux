@@ -39,14 +39,26 @@ export const cursorBridgeSpec: StructuredBridgeSpec = {
   adopt: { attach: 'baseline-skip-tail' },
 };
 
-/** The mounted composer's placeholder (empty composer); see readyPattern. */
-const CURSOR_EMPTY_COMPOSER = /→\s+(?:Plan, search, build anything|Add a follow-up)/;
+const CURSOR_PLACEHOLDER = /(?:Plan, search, build anything|Add a follow-up(?: — \/plan to review and build)?)/;
+const CURSOR_ARROW_PLACEHOLDER = new RegExp(`→\\s+${CURSOR_PLACEHOLDER.source}`);
+const CURSOR_LOCAL_PLACEHOLDER_ROW = `^[ \\t]*>[ \\t]+${CURSOR_PLACEHOLDER.source}`;
+const CURSOR_LOCAL_STOP_HINT = String.raw`[ \t]{2,}ctrl\+c to stop`;
+// Preserve the regular Cursor Agent's stream matcher. Agent Local uses `>`,
+// which also appears in quoted output, so require its full composer row.
+const CURSOR_READY_COMPOSER = new RegExp(
+  `${CURSOR_ARROW_PLACEHOLDER.source}|${CURSOR_LOCAL_PLACEHOLDER_ROW}(?:${CURSOR_LOCAL_STOP_HINT})?[ \\t]*\\r?$`,
+  'm',
+);
+const CURSOR_LOCAL_EMPTY_COMPOSER = new RegExp(`${CURSOR_LOCAL_PLACEHOLDER_ROW}[ \\t]*$`);
 
 /** Active-turn composer row: Cursor renders `rightPlaceholder: "ctrl+c to stop"`
- *  on the same row as the `→ ` composer prompt while a turn runs, and clears it
- *  when the turn ends. Requiring both anchors on one row prevents transcript
- *  prose mentioning `ctrl+c to stop` from pinning an idle session busy. */
-export const CURSOR_BUSY_COMPOSER = /^\s*→\s+.*\bctrl\+c to stop\s*$/im;
+ *  on the same row as the composer prompt while a turn runs, and clears it
+ *  when the turn ends. Agent Local shows the hint only in an empty composer.
+ *  Require its placeholder and the padding before the hint on the same row. */
+export const CURSOR_BUSY_COMPOSER = new RegExp(
+  String.raw`^\s*→\s+.*\bctrl\+c to stop\s*$|${CURSOR_LOCAL_PLACEHOLDER_ROW}${CURSOR_LOCAL_STOP_HINT}[ \t]*\r?$`,
+  'im',
+);
 
 /** Cursor's `follow-ups` queue box (`┌─ follow-ups ────┐`), drawn directly
  *  above the composer while one or more submitted follow-ups remain queued. */
@@ -63,17 +75,28 @@ export function cursorScreenHoldsSubmittedInput(screen: string): boolean {
   return CURSOR_BUSY_COMPOSER.test(region) || CURSOR_FOLLOW_UPS_PANEL.test(region);
 }
 
+function cursorComposerRow(screen: string): string | undefined {
+  const lines = screen.split(/\r?\n/);
+  let localRow: string | undefined;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!;
+    // Prefer the regular glyph when both appear. A quoted line can start with >.
+    if (/^\s*→(?:\s|$)/.test(line)) return line;
+    if (localRow === undefined && /^[ \t]*>(?:[ \t]|$)/.test(line)) localRow = line;
+  }
+  return localRow;
+}
+
 /** Cursor holds no pending input at all: no turn is running, no `follow-ups`
  *  panel is drawn, and the bottom composer row shows its empty placeholder. */
 export function cursorScreenShowsNoPendingInput(screen: string): boolean {
   const region = busyProbeRegion(screen);
   if (CURSOR_BUSY_COMPOSER.test(region) || CURSOR_FOLLOW_UPS_PANEL.test(region)) return false;
-  const lines = region.split(/\r?\n/);
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (!/^\s*→(?:\s|$)/.test(lines[i]!)) continue;
-    return CURSOR_EMPTY_COMPOSER.test(lines[i]!);
-  }
-  return false;
+  const composer = cursorComposerRow(region);
+  if (composer === undefined) return false;
+  return composer.trimStart().startsWith('>')
+    ? CURSOR_LOCAL_EMPTY_COMPOSER.test(composer)
+    : CURSOR_ARROW_PLACEHOLDER.test(composer);
 }
 
 /** True when a stopped Cursor turn left a queued follow-up parked: the turn has
@@ -82,9 +105,12 @@ export function cursorScreenShowsNoPendingInput(screen: string): boolean {
  *  queue only when a turn ends naturally; after Ctrl-C the item stays parked. */
 export function cursorStopLeftParkedFollowUp(screen: string): boolean {
   const text = stripAnsiScreenText(screen);
-  return /\benter steer\b/.test(text)
-    && CURSOR_EMPTY_COMPOSER.test(text)
-    && !/ctrl\+c to stop/i.test(text);
+  if (!/\benter steer\b/.test(text) || /ctrl\+c to stop/i.test(text)) return false;
+  const composer = cursorComposerRow(text);
+  if (composer?.trimStart().startsWith('>')) {
+    return CURSOR_FOLLOW_UPS_PANEL.test(text) && CURSOR_LOCAL_EMPTY_COMPOSER.test(composer);
+  }
+  return CURSOR_ARROW_PLACEHOLDER.test(text);
 }
 
 export function createCursorAdapter(pathOverride?: string): CliAdapter {
@@ -267,7 +293,7 @@ export function createCursorAdapter(pathOverride?: string): CliAdapter {
     // permanently suppressed, no idle edge). Matching the post-turn placeholder
     // too keeps every turn's idle edge alive. Neither placeholder appears on the
     // login/startup screens, so the boot-time guard is unchanged.
-    readyPattern: CURSOR_EMPTY_COMPOSER,
+    readyPattern: CURSOR_READY_COMPOSER,
     deferFirstPromptTimeoutUntilReady: true,
     supportsTypeAhead: true,
     pluginDir: CURSOR_PLUGIN_DIR,
