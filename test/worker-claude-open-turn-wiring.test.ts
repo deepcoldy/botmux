@@ -36,9 +36,12 @@ import {
 } from '../src/services/claude-transcript.js';
 import { createTranscriptTerminalSettle, type TranscriptTerminalSettle } from '../src/services/transcript-terminal-settle.js';
 import { SessionController } from '../src/core/session-controller.js';
+import { ActiveTurnAuthority } from '../src/core/active-turn-authority.js';
 import { SessionContractStore } from '../src/services/session-contract-store.js';
 import { TurnTerminalDeduper } from '../src/services/turn-terminal-deduper.js';
 import { WorkerSessionEventScope } from '../src/services/session-event-scope.js';
+import { InputDeliveryEvidenceTracker } from '../src/services/input-delivery-evidence.js';
+import { PtyOutputGeneration } from '../src/utils/runtime-screen-status.js';
 import { loadWorkerFunction, loadWorkerMessageHandler } from './helpers/worker-function-harness.js';
 import { WrittenInputLedger } from '../src/services/prompt-submission-match.js';
 import { fingerprintPromptText } from '../src/services/prompt-context-store.js';
@@ -192,6 +195,138 @@ function createWatchdogWiring(opts: {
     disarm: () => (scope.disarmClaudeOpenTurnWatchdog as () => void)(),
   };
 }
+
+describe('Claude PTY readiness before native submit evidence', () => {
+  const graceMs = 100;
+  const busyCapMs = 200;
+
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  function harness() {
+    const turnId = 'om_pty';
+    const cliGeneration = 1;
+    const queue = new BridgeTurnQueue();
+    queue.mark(turnId, makeFingerprint('ordinary prompt'), Date.now(), 'ordinary prompt');
+    const authority = new ActiveTurnAuthority();
+    const caller = { requestUserOpenId: 'ou_first', requestLarkAppId: 'app_test', senderType: 'user' } as const;
+    authority.reserve({ turnId, caller });
+    authority.markStarted({ turnId, caller });
+    const delivery = new InputDeliveryEvidenceTracker();
+    delivery.start({ turnId, cliGeneration }, Date.now(), 0, 0);
+    const output = new PtyOutputGeneration();
+    const detector = { reset: vi.fn(), fireIdle: vi.fn(), feed: vi.fn(), programStatusHeldBusy: vi.fn(() => false) };
+    const release = vi.fn((_reason: string, exact: { turnId: string; dispatchAttempt?: number }) => authority.releaseExact(exact));
+    const scope: Record<string, unknown> = {
+      CLAUDE_PTY_START_GRACE_MS: graceMs,
+      CLAUDE_PTY_BUSY_START_CAP_MS: busyCapMs,
+      deferredClaudePtyReady: undefined,
+      lastClaudePtyLocalInputAtMs: -Infinity,
+      activeTurnAuthority: authority,
+      bridgeQueue: queue,
+      bridgeJsonlPath: '/test/claude.jsonl',
+      backend: {}, effectiveBackendType: 'pty', cliSpawnGeneration: cliGeneration, cliRestartInProgress: false,
+      cliAdapter: { busyPattern: /esc to interrupt/ },
+      lastInitConfig: { cliId: 'claude-code' },
+      idleDetector: detector, currentBotmuxTurnId: turnId, currentBotmuxDispatchAttempt: undefined,
+      claudeUserPromptSubmittedTurnId: undefined,
+      claudeUserPromptSubmittedDispatchAttempt: undefined,
+      turnTerminalEmitted: () => false,
+      inputDeliveryEvidence: delivery,
+      ptyOutputGeneration: output,
+      webTerminalInputGeneration: 0, cliInterruptGeneration: 0, rawInputWriteGeneration: 0,
+      isPromptReady: false,
+      bridgeIngest: () => {},
+      backendScreenEvidenceIsAuthoritativeForMutation: () => true,
+      captureBackendScreen: () => '❯ ',
+      busyProbeRegion: (screen: string) => screen,
+      releaseActiveTurnAuthority: release,
+    };
+    for (const name of ['hasSubmittedUnstartedClaudeHead', 'ownsDeferredClaudePtyReady',
+      'currentUnstartedDeferredClaudePtyReady', 'revokeDeferredClaudePtyAuthority']) {
+      scope[name] = loadWorkerFunction(name, scope);
+    }
+    return {
+      scope, turnId, authority, detector, output, release, queue,
+      defer: loadWorkerFunction<() => boolean>('deferClaudePtyReadyWhileStarting', scope),
+      supersede: scope.revokeDeferredClaudePtyAuthority as () => void,
+      blocksQueuedInput: () => Boolean((scope.currentUnstartedDeferredClaudePtyReady as () => unknown)()),
+    };
+  }
+
+  it('re-drives a quiet dropped input at the original write deadline even after repeated idle edges', () => {
+    const h = harness();
+    expect(h.defer()).toBe(true);
+    vi.advanceTimersByTime(graceMs - 1);
+    expect(h.defer()).toBe(true);
+    expect(h.release).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(h.authority.identity().turnId).toBeUndefined();
+    expect(h.release).toHaveBeenCalledTimes(1);
+    expect(h.detector.fireIdle).toHaveBeenCalledTimes(1);
+  });
+
+  it('drops the expired owner without replaying an obsolete idle edge after output changes', () => {
+    const h = harness();
+    expect(h.defer()).toBe(true);
+    h.output.observe();
+    h.scope.backendScreenEvidenceIsAuthoritativeForMutation = () => false;
+    vi.advanceTimersByTime(graceMs);
+    expect(h.authority.identity().turnId).toBeUndefined();
+    expect(h.detector.fireIdle).not.toHaveBeenCalled();
+    expect(h.detector.feed).not.toHaveBeenCalled();
+  });
+
+  it('reads a late matching transcript start before releasing the lease', () => {
+    const h = harness();
+    expect(h.defer()).toBe(true);
+    expect(h.blocksQueuedInput()).toBe(true);
+    h.scope.bridgeIngest = () => h.queue.ingest([mkUser('late-start', 'ordinary prompt')]);
+    vi.advanceTimersByTime(graceMs);
+    expect(h.authority.identity().turnId).toBe(h.turnId);
+    expect(h.blocksQueuedInput()).toBe(false);
+    expect(h.detector.fireIdle).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not revoke on the first deadline with positive native busy evidence, but still bounds an unproven start', () => {
+    const h = harness();
+    expect(h.defer()).toBe(true);
+    h.detector.programStatusHeldBusy.mockReturnValue(true);
+    vi.advanceTimersByTime(graceMs);
+    expect(h.authority.identity().turnId).toBe(h.turnId);
+    vi.advanceTimersByTime(busyCapMs - graceMs);
+    expect(h.authority.identity().turnId).toBeUndefined();
+    expect(h.detector.fireIdle).not.toHaveBeenCalled();
+  });
+
+  it('revokes on confirmed local intervention before Claude reports the start, and cannot re-arm', () => {
+    const h = harness();
+    expect(h.defer()).toBe(true);
+    h.supersede();
+    expect(h.authority.identity().turnId).toBeUndefined();
+    expect(h.defer()).toBe(false);
+    vi.advanceTimersByTime(busyCapMs);
+    expect(h.release).toHaveBeenCalledTimes(1);
+    expect(h.detector.fireIdle).not.toHaveBeenCalled();
+  });
+
+  it('ignores the previous lease after a replacement principal takes over', () => {
+    const h = harness();
+    expect(h.defer()).toBe(true);
+    h.authority.clear();
+    const successor = { turnId: 'om_successor', caller: {
+      requestUserOpenId: 'ou_other', requestLarkAppId: 'app_test', senderType: 'user',
+    } as const };
+    h.authority.reserve(successor);
+    h.authority.markStarted(successor);
+    h.scope.currentBotmuxTurnId = 'om_successor';
+    h.supersede();
+    vi.advanceTimersByTime(busyCapMs);
+    expect(h.authority.identity().turnId).toBe('om_successor');
+    expect(h.release).not.toHaveBeenCalled();
+    expect(h.detector.fireIdle).not.toHaveBeenCalled();
+  });
+});
 
 describe('worker Claude open-turn wiring regressions (#3702 adversarial fixes)', () => {
   beforeEach(() => { vi.useFakeTimers(); });
