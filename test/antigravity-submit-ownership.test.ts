@@ -351,6 +351,23 @@ describe('antigravity writeInput — ownership of the submit proof', () => {
     expect(plain(second)).toEqual({ submitted: true, cliSessionId: cid, ownershipProven: true });
   });
 
+  it('keeps the deferred recheck probe alive while its conversation id is unknown', async () => {
+    const cid = randomUUID();
+    const content = 'slow-fresh-recheck';
+    const { adapter, stream, startupLog } = launch();
+    startupLog();
+    const initial = await adapter.writeInput(makePty(() => {}), content);
+    expect(initial).toMatchObject({
+      submitted: false, proveConsumed: expect.any(Function), settleConsumed: expect.any(Function),
+    });
+    appendFileSync(HISTORY, historyLine(content));
+    const confirmed = (initial as any).recheck();
+    expect(plain(confirmed)).toEqual({ submitted: true });
+    stream(cid);
+    userInput(cid, content);
+    expect(probe(confirmed)).toEqual({ cliSessionId: cid });
+  });
+
   it('never proves on an adopted pane without a process-scoped log', async () => {
     const cid = randomUUID();
     const adapter = createAntigravityAdapter('/usr/local/bin/agy');

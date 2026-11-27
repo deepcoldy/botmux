@@ -618,7 +618,7 @@ export interface CliAdapter {
      *  terminal keybinding). Worker surfaces this immediately. */
     failureReason?: string;
     recheck?: () => SubmitRecheckResult | Promise<SubmitRecheckResult>;
-    /** Submitted but consumption not proven yet: a read-only probe the worker
+    /** The input may have landed but consumption is not proven yet: a read-only probe the worker
      *  may poll later (without blocking the write path) for the same proof
      *  `ownershipProven` would have carried. Returns the owned native session
      *  once proven. Never re-sends input. */

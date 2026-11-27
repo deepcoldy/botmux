@@ -118,6 +118,24 @@ function measuredFileSize(path: string): number | undefined {
   try { return statSync(path).size; } catch { return undefined; }
 }
 
+/** `existsSync` collapses EACCES/EIO/replace races into false. When the path
+ * resolver found no transcript, only two confirmed ENOENT results prove that
+ * a known conversation has no log yet; anything else is an unknown baseline. */
+function antigravityTranscriptExistenceUnknown(conversationId: string): boolean {
+  for (const path of [antigravityFullTranscriptPath(conversationId), antigravityTranscriptPath(conversationId)]) {
+    if (!path) continue;
+    try {
+      statSync(path);
+      // The resolver said missing but stat now sees an entry: a race, not proof
+      // that the transcript was created after this submit.
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') return true;
+    }
+  }
+  return false;
+}
+
 /** Build a JSON-escaped prefix marker for substring-matching against
  *  history.jsonl's raw bytes. Three things to keep aligned with agy's
  *  on-disk encoding:
@@ -912,6 +930,7 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       // streamed conversation yet. Any USER_INPUT that later appears there is
       // this submit's.
       const transcriptCreatedAfterSubmit = !initialTranscriptPath
+        && !(initialCid && antigravityTranscriptExistenceUnknown(initialCid))
         && (!!initialCid || (awaitNativeStreamLog && !!sessionLog?.hasLogFile()));
       const preexistingConversations = transcriptCreatedAfterSubmit && !initialCid
         ? snapshotAntigravityConversations(join(homedir(), '.gemini', 'antigravity-cli', 'brain'))
@@ -1037,7 +1056,7 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
         if (proveOwned(proofCid)) return confirmedResult(proofCid, true)!;
         return confirmedResult(cliSessionId, false) ?? true;
       };
-      return { submitted: false, recheck };
+      return { submitted: false, recheck, proveConsumed, settleConsumed };
     },
 
     completionPattern: undefined,

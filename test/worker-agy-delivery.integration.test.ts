@@ -355,6 +355,18 @@ describe('worker delayed activation and interrupted Antigravity delivery', () =>
     expect(worker.input().match(/ACTIVATION_UNIQUE_MARKER/g)).toHaveLength(1);
   }, 60_000);
 
+  it('keeps watching when the activation observer settles on history before USER_INPUT', async () => {
+    const worker = startWorker('delayed', 'antigravity', { ownTranscript: true, transcriptLagMs: 22_000 });
+    // The 20s activation observer sees history, but agy feeds the input at ~31s.
+    await waitFor(() => worker.messages.some(m => m.type === 'queued_activation_submitted'), worker.logs, 40_000);
+    expect(consumedReceipts(worker.messages)).toEqual([]);
+    await waitFor(() => consumedReceipts(worker.messages).length > 0, worker.logs, 20_000);
+    expect(consumedReceipts(worker.messages)).toEqual([expect.objectContaining({
+      type: 'native_input_consumed', turnId: 'om_initial', proofKind: 'antigravity_transcript_user_input',
+      nativeSessionId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+    })]);
+  }, 70_000);
+
   it.each(['antigravity', 'traex'] as const)('%s writes a slow activation once and acknowledges its deferred receipt', async cliId => {
     const worker = startWorker('delayed', cliId);
     await waitFor(() => worker.input().includes('ACTIVATION_UNIQUE_MARKER'), worker.logs, 30_000);
