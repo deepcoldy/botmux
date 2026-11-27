@@ -570,7 +570,7 @@ import {
   type AntigravityAccountStoreOptions,
   type ReconcileAntigravityTokenResult,
 } from './services/antigravity-accounts.js';
-import { hasAntigravitySideQuestionComposer, isAntigravityIdleComposerScreen, isAntigravityInterruptedScreen, isAntigravityReadyComposerScreen, parseAntigravityFooterBackgroundTasks, supportsAntigravityReadyFooterQuota } from './adapters/cli/antigravity.js';
+import { hasAntigravitySideQuestionComposer, isAntigravityIdleComposerScreen, isAntigravityInterruptedScreen, isAntigravityReadyComposerScreen, isAntigravityWorkingScreen, parseAntigravityFooterBackgroundTasks, supportsAntigravityReadyFooterQuota } from './adapters/cli/antigravity.js';
 import {
   antigravityTurnAnsweredInTranscript,
   antigravityTurnFailedWithoutOutput,
@@ -847,6 +847,7 @@ import {
 import { ProgramStatusFramingStream } from './utils/program-status-parser.js';
 import { programStatusRelayLaunch } from './core/program-status-relay-launch.js';
 import {
+  ANTIGRAVITY_PROGRAM_STATUS_BUSY_REFRESH_MAX_MS,
   applyAdapterSpawnEnv,
   effectiveProgramStatusEnv,
   filterAppliedAdapterEnvUnset,
@@ -5041,6 +5042,31 @@ function holdStructuredStartLeasesWhileProgramStatusBusy(): void {
     runnerFramedInput: cliAdapter?.runnerFramedInput === true,
     programStatusHeldBusy: idleDetector?.programStatusHeldBusy() === true,
     queue: codexBridgeQueue,
+  });
+}
+
+/** OSC-less agy still renders its own busy footer. Sample it on the ordinary
+ *  1s Antigravity ticker (before ingest/prune), not on every filesystem event,
+ *  and apply the same bounded lease policy as the OSC busy evidence. */
+function holdStructuredStartLeasesWhileAntigravityViewportBusy(): void {
+  const adapter = cliAdapter;
+  if (!structuredBridgeIs('antigravity') || lastInitConfig?.adoptMode || adapter?.runnerFramedInput) return;
+  if (!backend || !backendScreenEvidenceIsAuthoritativeForMutation() || !adapter?.busyPattern) return;
+  if (!codexBridgeQueue.peek().some(turn => !turn.started && turn.finalText === undefined)) return;
+  let viewportBusy = false;
+  try {
+    const screen = captureBackendScreen(backend);
+    viewportBusy = !!screen && adapter.busyPattern.test(busyProbeRegion(screen));
+  } catch { /* An unavailable viewport adds no lease evidence. */ }
+  if (!viewportBusy) return;
+  refreshStructuredPreStartLeaseFromProgramStatus({
+    cliId: lastInitConfig?.cliId,
+    adoptMode: false,
+    runnerFramedInput: false,
+    programStatusHeldBusy: false,
+    viewportBusy: true,
+    queue: codexBridgeQueue,
+    maxSinceMarkMs: ANTIGRAVITY_PROGRAM_STATUS_BUSY_REFRESH_MAX_MS,
   });
 }
 
@@ -14116,6 +14142,13 @@ let antigravityQuietCandidateKey: string | undefined;
 let antigravityQuietCandidateCompleteOffset: number | undefined;
 let antigravityQuietCandidateFirstSeenAtMs: number | undefined;
 let antigravityObservedWorkingOwner: CodexPendingTurn | undefined;
+let antigravityWorkingScanTail = '';
+let antigravityWorkingScanGeneration = 0;
+/** The interrupted viewport belongs to the owner seen when that episode first
+ *  appeared. Footer/model/text changes do not transfer it; only a proven fresh
+ *  working owner or an authoritative non-interrupted frame starts a new one. */
+let antigravityInterruptedViewport: { owner: CodexPendingTurn | undefined } | undefined;
+const antigravityInterruptedFallbackWatchdog = new StructuredMissingFinalWatchdog();
 /** Last compact→full offset mapping attempt (bound path, offset, full log
  *  size) — a mapping that failed is not re-read every tick until one of them
  *  moves. */
@@ -18883,6 +18916,7 @@ function codexBridgeStartTimer(): void {
           }
         }
         maybeUpgradeAntigravityBridgeToFull();
+        holdStructuredStartLeasesWhileAntigravityViewportBusy();
         codexBridgeIngest();
         maybeFlushAntigravityTrailingFinalOnQuietTick();
         if (isPromptReady) emitReadyCodexTurns();
@@ -20707,6 +20741,44 @@ function maybeUpgradeAntigravityBridgeToFull(): void {
   }
 }
 
+/** Bind working evidence to the queue owner that exists AT THE EVENT, not to
+ *  whichever turn a later viewport tick happens to find. An unstarted head is
+ *  retained by object identity when its USER_INPUT subsequently starts it. */
+function noteAntigravityWorkingOwner(): void {
+  if (!structuredBridgeIs('antigravity')) return;
+  const state = antigravityBridgeState();
+  const turns = codexBridgeQueue.peek();
+  const started = turns.find(turn => turn.started && turn.finalText === undefined
+    && (!state.sourceTurnId || state.sourceTurnId === turn.sourceTurnId));
+  // A finalized-but-undrained predecessor still owns its trailing output. Do
+  // not guess that this output belongs to the next unstarted mark; its bounded
+  // interrupted fallback remains available if no fresh evidence arrives.
+  const mayArmUnstarted = !started && !turns.some(turn => turn.started);
+  const nextOwner = started ?? (mayArmUnstarted
+    ? turns.find(turn => !turn.started && turn.finalText === undefined && !turn.passedBySuccessor)
+    : undefined);
+  if (nextOwner && antigravityObservedWorkingOwner !== nextOwner) {
+    antigravityInterruptedViewport = undefined;
+    antigravityInterruptedFallbackWatchdog.observe(undefined);
+  }
+  antigravityObservedWorkingOwner = nextOwner;
+}
+
+/** The renderer can paint and clear `esc to cancel` between two 1s viewport
+ *  samples. Scan the same raw chunks the renderer receives so a fast turn does
+ *  not lose its only same-owner working evidence when OSC is unavailable. */
+function observeAntigravityWorkingData(data: string): void {
+  if (!structuredBridgeIs('antigravity')) return;
+  if (antigravityWorkingScanGeneration !== cliSpawnGeneration) {
+    antigravityWorkingScanTail = '';
+    antigravityWorkingScanGeneration = cliSpawnGeneration;
+  }
+  antigravityWorkingScanTail = tailChars(antigravityWorkingScanTail + stripAnsiForLog(data), 500);
+  if (!isAntigravityWorkingScreen(antigravityWorkingScanTail)) return;
+  antigravityWorkingScanTail = '';
+  noteAntigravityWorkingOwner();
+}
+
 /**
  * Confirm an Antigravity held (provisional) terminal only after one complete
  * quiet bridge tick AND a viewport that is on the ready marker with no busy
@@ -20725,6 +20797,8 @@ function maybeFlushAntigravityTrailingFinalOnQuietTick(): void {
   if (!structuredBridgeIs('antigravity')) return;
   if (antigravityPendingRebind) {
     antigravityObservedWorkingOwner = undefined;
+    antigravityInterruptedViewport = undefined;
+    antigravityInterruptedFallbackWatchdog.observe(undefined);
     antigravityQuietCandidateKey = undefined;
     antigravityQuietCandidateCompleteOffset = undefined;
     antigravityQuietCandidateFirstSeenAtMs = undefined;
@@ -20741,14 +20815,40 @@ function maybeFlushAntigravityTrailingFinalOnQuietTick(): void {
     catch (err: any) { log(`Antigravity quiet-final viewport capture failed: ${err.message}`); }
   }
   const busy = !!screen && cliAdapter?.busyPattern?.test(busyProbeRegion(screen));
-  if (busy) antigravityObservedWorkingOwner = owner;
-  if (screen && !busy && isAntigravityInterruptedScreen(screen)) {
+  if (busy && owner) noteAntigravityWorkingOwner();
+  const interrupted = !!screen && !busy && isAntigravityInterruptedScreen(screen);
+  if (!interrupted) {
+    antigravityInterruptedFallbackWatchdog.observe(undefined);
+    if (screen) antigravityInterruptedViewport = undefined;
+  }
+  if (interrupted && screen) {
     // A surviving viewport can show the previous turn's interrupt after the
-    // next input was recorded. Only retire a turn we observed working.
-    if (!owner || antigravityObservedWorkingOwner !== owner) return;
+    // next input was recorded. Its first owner alone may use it; working
+    // evidence shortens the wait, never transfers that viewport to a successor.
+    if (!antigravityInterruptedViewport) {
+      antigravityInterruptedViewport = { owner: owner ?? antigravityObservedWorkingOwner };
+      antigravityInterruptedFallbackWatchdog.observe(undefined);
+    }
+    const sameViewportOwner = !!owner && antigravityInterruptedViewport.owner === owner;
+    let maySettle = sameViewportOwner && antigravityObservedWorkingOwner === owner;
+    if (sameViewportOwner && !maySettle && !owner.restoredFromJournal
+      && replyDeliveryMode() === 'send' && !zeroPromptTerminalSync() && !lastInitConfig?.adoptMode) {
+      // Ordinary send mode has no generic missing-final watchdog. Bound this
+      // last-resort ambiguous terminal by exact owner, transcript and PTY
+      // frontiers; any newer bytes restart the wait instead of retiring work.
+      maySettle = antigravityInterruptedFallbackWatchdog.observe(JSON.stringify([
+        owner.turnId, owner.dispatchAttempt, cliSpawnGeneration,
+        codexBridgeRolloutPath, codexBridgeOffset, owner.nativeUserProof?.uuid,
+        owner.transcriptStartTimeMs, ptyOutputGeneration.snapshot(),
+      ]), Date.now());
+    } else if (!maySettle) {
+      antigravityInterruptedFallbackWatchdog.observe(undefined);
+    }
+    if (!owner || !sameViewportOwner || !maySettle) return;
     const { ignoredDaemonTaskIds } = state;
     structuredBridgeDriverState = ignoredDaemonTaskIds ? { ignoredDaemonTaskIds } : {};
     antigravityObservedWorkingOwner = undefined;
+    antigravityInterruptedFallbackWatchdog.observe(undefined);
     codexBridgeQueue.ingest([{
       uuid: `${owner.turnId}:${owner.dispatchAttempt ?? 0}:antigravity_interrupted`,
       timestampMs: Date.now(),
@@ -20761,7 +20861,12 @@ function maybeFlushAntigravityTrailingFinalOnQuietTick(): void {
     emitReadyCodexTurns();
     return;
   }
-  if (antigravityObservedWorkingOwner !== owner) antigravityObservedWorkingOwner = undefined;
+  if (antigravityObservedWorkingOwner !== owner) {
+    const observed = antigravityObservedWorkingOwner;
+    const stillAwaitingTranscriptStart = !owner && observed && !observed.started
+      && observed.finalText === undefined && codexBridgeQueue.peek().includes(observed);
+    if (!stillAwaitingTranscriptStart) antigravityObservedWorkingOwner = undefined;
+  }
   if (!candidate || hasAntigravityPendingTasks(state)) {
     // No candidate, or the transcript itself proves a background task is still
     // outstanding (the TUI shows the ready composer during that wait — do not
@@ -28361,6 +28466,7 @@ function onPtyData(data: string, isLiveStream = true): void {
       }
       const wasAuthoritative = idleDetector?.programStatusActive() ?? false;
       idleDetector?.observeProgramStatus(part.event);
+      if (part.event.state === 'working') noteAntigravityWorkingOwner();
       if (part.event.state === 'working' || part.event.state === 'blocked') {
         holdStructuredStartLeasesWhileProgramStatusBusy();
       }
@@ -28394,6 +28500,7 @@ function handlePtyDataChunk(data: string): void {
   maybeCaptureKiroSessionId(data);
   maybeReportPiInstallChange(data);
   captureWorkflowTranscript(data);
+  observeAntigravityWorkingData(data);
   // Argv first-turn start evidence (Pi): latch the busy marker from the raw
   // PTY stream. The viewport-based defer cannot see a marker that has not
   // rendered yet, and a fast turn can paint and clear its busy line between

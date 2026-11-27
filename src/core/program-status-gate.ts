@@ -213,13 +213,16 @@ export interface ProgramStatusLeaseRefreshInput {
   adoptMode?: boolean;
   runnerFramedInput?: boolean;
   programStatusHeldBusy: boolean;
+  /** Authoritative current viewport shows the CLI's own busy footer. Covers
+   *  old/unknown OSC versions and explicit OSC disablement. */
+  viewportBusy?: boolean;
   queue: Pick<CodexBridgeQueue, 'peek' | 'refreshUnstartedHeadAttributionLease'>;
   nowMs?: number;
   maxSinceMarkMs?: number;
 }
 
 /** Refresh unstarted structured-bridge pre-start attribution leases while
- *  Antigravity's OSC 7501 stream actively reports `working` or `blocked`.
+ *  Antigravity's OSC 7501 stream or authoritative viewport holds busy.
  *  Scoped strictly to owned terminal Antigravity sessions so other CLIs keep
  *  their unchanged 20s `STRUCTURED_SUBMIT_START_GRACE_MS` behaviour.
  *
@@ -234,7 +237,7 @@ export function refreshStructuredPreStartLeaseFromProgramStatus(
   input: ProgramStatusLeaseRefreshInput,
 ): number {
   if (input.cliId !== 'antigravity' || input.adoptMode || input.runnerFramedInput) return 0;
-  if (!input.programStatusHeldBusy) return 0;
+  if (!input.programStatusHeldBusy && !input.viewportBusy) return 0;
   const turns = input.queue.peek();
   if (turns.length === 0) return 0;
   if (turns.some(turn => turn.started && turn.finalText === undefined)) return 0;

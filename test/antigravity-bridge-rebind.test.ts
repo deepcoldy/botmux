@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
-import { createAntigravityAdapter, isAntigravityInterruptedScreen, parseAntigravityFooterBackgroundTasks } from '../src/adapters/cli/antigravity.js';
+import { createAntigravityAdapter, isAntigravityInterruptedScreen, isAntigravityWorkingScreen, parseAntigravityFooterBackgroundTasks } from '../src/adapters/cli/antigravity.js';
 import { bridgeSpecFor } from '../src/adapters/cli/registry.js';
 import {
   antigravityRecoveryBindPath,
@@ -22,6 +22,8 @@ import {
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { busyProbeRegion } from '../src/utils/busy-probe.js';
 import { stripAnsiScreenText } from '../src/utils/idle-detector.js';
+import { StructuredMissingFinalWatchdog } from '../src/services/structured-missing-final.js';
+import { stripAnsiForLog, tailChars } from '../src/utils/crash-log.js';
 
 const SIBLING_ID = '61fc8ef7-1886-40af-9bac-c6ee8f8d172e';
 const REAL_ID = 'a4331552-f261-4f1f-a460-e15e7f2fe0ea';
@@ -32,7 +34,7 @@ function writeAntigravityUserStep(path: string, stepIndex: number, text: string)
     source: 'USER_EXPLICIT',
     type: 'USER_INPUT',
     status: 'DONE',
-    created_at: new Date().toISOString(),
+    created_at: new Date(Date.now()).toISOString(),
     content: `<USER_REQUEST>\n${text}\n</USER_REQUEST>`,
   }) + '\n');
 }
@@ -43,7 +45,7 @@ function writeAntigravityFinalStep(path: string, stepIndex: number, text: string
     source: 'MODEL',
     type: 'PLANNER_RESPONSE',
     status: 'DONE',
-    created_at: new Date().toISOString(),
+    created_at: new Date(Date.now()).toISOString(),
     content: text,
   }) + '\n');
 }
@@ -561,6 +563,7 @@ describe('Antigravity bridge ticker and spawn observer honor the adapter session
       // The quiet-tick flush and the compact→full upgrade are separate,
       // already-tested policies; the rebind decision under test runs before both.
       maybeUpgradeAntigravityBridgeToFull: () => {},
+      holdStructuredStartLeasesWhileAntigravityViewportBusy: () => {},
       maybeFlushAntigravityTrailingFinalOnQuietTick: () => {},
       checkpointStructuredBridgeRecovery: () => {},
       observeStructuredBackgroundTasks: () => {},
@@ -948,6 +951,12 @@ describe('Antigravity bridge ticker and spawn observer honor the adapter session
     expect(isAntigravityInterruptedScreen(interruptedScreen)).toBe(true);
     let screen = 'Working…\nesc to cancel';
     const scope: Record<string, any> = {
+      lastInitConfig: { cliId: 'antigravity', adoptMode: false },
+      replyDeliveryMode: () => 'send',
+      zeroPromptTerminalSync: () => false,
+      cliSpawnGeneration: 1,
+      codexBridgeRolloutPath: path,
+      ptyOutputGeneration: { snapshot: () => 0 },
       structuredBridgeIs: (id: string) => id === 'antigravity',
       structuredBridgeDriverState: initial.state,
       antigravityBridgeState: () => scope.structuredBridgeDriverState,
@@ -957,6 +966,8 @@ describe('Antigravity bridge ticker and spawn observer honor the adapter session
       antigravityQuietCandidateCompleteOffset: undefined,
       antigravityQuietCandidateFirstSeenAtMs: undefined,
       antigravityObservedWorkingOwner: undefined,
+      antigravityInterruptedViewport: undefined,
+      antigravityInterruptedFallbackWatchdog: new StructuredMissingFinalWatchdog(),
       codexBridgeOffset: initial.newOffset,
       codexBridgePendingTail: initial.pendingTail,
       backend: {},
@@ -972,6 +983,7 @@ describe('Antigravity bridge ticker and spawn observer honor the adapter session
       codexBridgeIngest: () => { throw new Error('Interrupted text must not be flushed'); },
       log: () => {},
     };
+    scope.noteAntigravityWorkingOwner = loadWorkerFunction('noteAntigravityWorkingOwner', scope);
     const tick = loadWorkerFunction<() => void>('maybeFlushAntigravityTrailingFinalOnQuietTick', scope);
     tick();
     screen = interruptedScreen;
@@ -992,6 +1004,145 @@ describe('Antigravity bridge ticker and spawn observer honor the adapter session
     tick();
     expect(queue.drainEmittable()).toEqual([]);
     expect(scope.structuredBridgeDriverState.provisionalFinal?.text).toBe('The next answer');
+  });
+
+  function makeInterruptedWorkerRig(phase: string, opts: { deferStart?: boolean } = {}) {
+    const dir = mkdtempSync(join(root, 'interrupt-rig-'));
+    const path = join(dir, 'transcript.jsonl');
+    const queue = new CodexBridgeQueue();
+    queue.mark('om_first', 'First request', Date.now());
+    writeAntigravityUserStep(path, 1, 'First request');
+    if (phase === 'held answer') writeAntigravityFinalStep(path, 2, 'A provisional plan');
+    const initial = drainAntigravityTranscript(path, 0);
+    if (!opts.deferStart) queue.ingest(initial.events);
+    const interruptedScreen = [
+      '● Bash(sleep 30)', '  ⎿  Interrupted · What should Antigravity CLI do instead?',
+      '────────────────────────', '>', '────────────────────────', '? for shortcuts',
+    ].join('\n');
+    let screen = interruptedScreen;
+    const scope: Record<string, any> = {
+      lastInitConfig: { cliId: 'antigravity', adoptMode: false },
+      replyDeliveryMode: () => 'send',
+      zeroPromptTerminalSync: () => false,
+      cliSpawnGeneration: 1,
+      codexBridgeRolloutPath: path,
+      ptyOutputGeneration: { snapshot: () => 0 },
+      structuredBridgeIs: (id: string) => id === 'antigravity',
+      structuredBridgeDriverState: initial.state,
+      antigravityBridgeState: () => scope.structuredBridgeDriverState,
+      hasAntigravityPendingTasks,
+      antigravityPendingRebind: false,
+      antigravityQuietCandidateKey: undefined,
+      antigravityQuietCandidateCompleteOffset: undefined,
+      antigravityQuietCandidateFirstSeenAtMs: undefined,
+      antigravityObservedWorkingOwner: undefined,
+      antigravityWorkingScanTail: '',
+      antigravityWorkingScanGeneration: 0,
+      antigravityInterruptedViewport: undefined,
+      antigravityInterruptedFallbackWatchdog: new StructuredMissingFinalWatchdog(),
+      codexBridgeOffset: initial.newOffset,
+      codexBridgePendingTail: initial.pendingTail,
+      backend: {},
+      backendScreenEvidenceIsAuthoritativeForMutation: () => true,
+      cliAdapter: createAntigravityAdapter(),
+      idleDetector: undefined,
+      shouldDeferAntigravityQuietFinalForProgramStatus: () => false,
+      STALE_PROGRAM_STATUS_QUIET_MS: 1000,
+      captureBackendScreen: () => screen,
+      busyProbeRegion, stripAnsiScreenText, isAntigravityInterruptedScreen, isAntigravityWorkingScreen, parseAntigravityFooterBackgroundTasks,
+      tailChars, stripAnsiForLog,
+      codexBridgeQueue: queue,
+      emitReadyCodexTurns: () => {},
+      codexBridgeIngest: () => { throw new Error('Interrupted text must not be flushed'); },
+      log: () => {},
+    };
+    scope.noteAntigravityWorkingOwner = loadWorkerFunction('noteAntigravityWorkingOwner', scope);
+    return {
+      path, queue, scope, initial, interruptedScreen,
+      start: () => queue.ingest(initial.events),
+      tick: loadWorkerFunction<() => void>('maybeFlushAntigravityTrailingFinalOnQuietTick', scope),
+      observeWorking: loadWorkerFunction<(data: string) => void>('observeAntigravityWorkingData', scope),
+      setScreen: (next: string) => { screen = next; },
+    };
+  }
+
+  it('binds split raw busy chunks to an unstarted owner before a fast Esc', () => {
+    const rig = makeInterruptedWorkerRig('running tool', { deferStart: true });
+    const owner = rig.queue.peek()[0]!;
+    expect(owner.started).toBe(false);
+    rig.observeWorking('console.log("esc to cancel")');
+    expect(rig.scope.antigravityObservedWorkingOwner).toBeUndefined();
+    rig.observeWorking('Working…\nesc to can');
+    rig.observeWorking('cel\r');
+    expect(rig.scope.antigravityObservedWorkingOwner).toBe(owner);
+    rig.setScreen('Working…\nesc to cancel');
+    rig.tick();
+    expect(rig.scope.antigravityObservedWorkingOwner).toBe(owner);
+    rig.setScreen(rig.interruptedScreen);
+    rig.tick();
+
+    // USER_INPUT starts the exact object that the raw stream armed. No viewport
+    // busy tick is needed before the interrupted frame settles that owner.
+    rig.start();
+    expect(owner.started).toBe(true);
+    rig.tick();
+    expect(rig.queue.drainEmittable()).toMatchObject([{
+      turnId: 'om_first', finalText: '', terminalStatus: 'ambiguous',
+      terminalErrorCode: 'antigravity_interrupted',
+    }]);
+  });
+
+  it('does not arm a successor from a finalized predecessor\'s trailing busy output', () => {
+    const rig = makeInterruptedWorkerRig('running tool');
+    rig.queue.ingest([{ uuid: 'a-final', timestampMs: Date.now(), kind: 'assistant_final', text: 'done' }]);
+    rig.queue.mark('om_next', 'Next request', Date.now());
+    const successor = rig.queue.peek()[1]!;
+    expect(successor.started).toBe(false);
+    rig.observeWorking('Working…\nesc to cancel\r');
+    expect(rig.scope.antigravityObservedWorkingOwner).toBeUndefined();
+  });
+
+  it.each(['held answer', 'running tool'])('bounds an unobserved fast Esc without settling a successor from the old viewport: %s', phase => {
+    let now = Date.now();
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const rig = makeInterruptedWorkerRig(phase);
+    rig.tick();
+    expect(rig.queue.drainEmittable()).toEqual([]);
+    now += 19_999;
+    rig.tick();
+    expect(rig.queue.drainEmittable()).toEqual([]);
+    now += 1;
+    rig.tick();
+    expect(rig.queue.drainEmittable()).toMatchObject([{
+      turnId: 'om_first', finalText: '', terminalStatus: 'ambiguous',
+      terminalErrorCode: 'antigravity_interrupted',
+    }]);
+
+    // The old interrupted viewport remains owned by the retired turn. Even a
+    // full timeout cannot transfer it to the next owner, with or without a
+    // newer provisional answer in the transcript.
+    rig.queue.mark('om_next', 'Next request', now);
+    writeAntigravityUserStep(rig.path, 3, 'Next request');
+    writeAntigravityFinalStep(rig.path, 4, 'The next answer');
+    const next = drainAntigravityTranscript(rig.path, rig.scope.codexBridgeOffset, rig.scope.structuredBridgeDriverState);
+    rig.scope.structuredBridgeDriverState = next.state;
+    rig.scope.codexBridgeOffset = next.newOffset;
+    rig.queue.ingest(next.events);
+    expect(rig.queue.peek()[0]?.started, JSON.stringify({ events: next.events, queue: rig.queue.peek() })).toBe(true);
+    const changedFooter = rig.interruptedScreen.replace('? for shortcuts', '? for shortcuts accept-edits · Gemini 3.8 Pro · low');
+    expect(isAntigravityInterruptedScreen(changedFooter)).toBe(true);
+    rig.setScreen(changedFooter);
+    rig.tick();
+    expect(rig.queue.drainEmittable()).toEqual([]);
+    now += 20_000;
+    rig.tick();
+    expect(rig.queue.drainEmittable()).toEqual([]);
+    expect(rig.queue.peek()[0]?.finalText, JSON.stringify({
+      queue: rig.queue.peek(), viewport: rig.scope.antigravityInterruptedViewport,
+      workingOwner: rig.scope.antigravityObservedWorkingOwner,
+    })).toBeUndefined();
+    expect(rig.queue.peek()[0]).toMatchObject({ turnId: 'om_next', started: true });
+    expect(rig.scope.structuredBridgeDriverState.provisionalFinal?.text).toBe('The next answer');
   });
 
   it('ticker stays unbound through the startup window instead of pid-probing a sibling DB, then binds the streamed conversation', async () => {
