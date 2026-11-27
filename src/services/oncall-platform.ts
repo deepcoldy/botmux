@@ -186,6 +186,7 @@ export interface NativeOncallResultQuery {
   region: string;
   preparedAtMs?: number;
   hostedSourceLocation?: string;
+  receipt?: { flowId: string; openChatId: string };
 }
 export interface NativeOncallResult { flowId: string; openChatId: string; handoffAtMs: number }
 export interface NativeOncallResultCandidate<T extends NativeOncallResultQuery = NativeOncallResultQuery> {
@@ -289,8 +290,12 @@ export async function readNativeOncallResultCandidates<T extends NativeOncallRes
   function match(row: any, exactSource = false) {
     const matches = sources.map((source, index) => {
       const expectedSource = exactSources[index];
+      const query = queries[index]!;
+      // Count all platform orders bearing this hosted form marker when a
+      // callback is available. The callback must not hide a second order.
+      const inspectMarkedOrder = query.receipt && query.hostedSourceLocation && source.formId;
       return (!exactSource || !expectedSource || row?.source_location === expectedSource)
-        && source.matches(row?.source_location, row?.source_type);
+        && source.matches(row?.source_location, inspectMarkedOrder ? undefined : row?.source_type);
     });
     if (!matches.some(Boolean)) return;
     if (row.tenant_id !== target.tenantId || row.originator_user !== username || row.stage !== 'launch_oncall'
@@ -383,5 +388,8 @@ export async function readNativeOncallResultCandidates<T extends NativeOncallRes
     progress.save({ key, createdThrough: platformTime(Date.now()), afterId: 0, verifyFlowId: row.id, verifyRounds: 0 });
     return [];
   }
-  return attempts.map(attempt => ({ attempt, result }));
+  return attempts.filter(attempt => nativeSourceMatcher(attempt).matches(row.source_location, row.source_type)
+    || (attempt.hostedSourceLocation === row.source_location && attempt.receipt?.flowId === result.flowId
+      && attempt.receipt.openChatId === openChatId))
+    .map(attempt => ({ attempt, result }));
 }

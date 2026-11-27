@@ -1,5 +1,6 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { runInNewContext } from 'node:vm';
 import { join } from 'node:path';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
@@ -8,7 +9,7 @@ import { config } from '../src/config.js';
 import { localHttpOrigin } from '../src/core/dashboard-url.js';
 import { sendableCardLink } from '../src/im/lark/local-address-context.js';
 import { setHideLocalAddressesResolver } from '../src/im/lark/local-address-switch.js';
-import { hostOncallSidebar, nativeSelectionSourceType } from '../src/services/oncall-sidebar-link.js';
+import { hostOncallSidebar, nativeSelectionSourceType, oncallSidebarSource } from '../src/services/oncall-sidebar-link.js';
 import { handleOncallSidebar } from '../src/dashboard/oncall-sidebar.js';
 import { buildOncallFormCard } from '../src/im/lark/oncall-form-card.js';
 import { OncallFormStore } from '../src/services/oncall-form-store.js';
@@ -46,7 +47,7 @@ async function fixture(oldMarker = false, question = 'private question') {
   appLink.searchParams.set('url', nativePage.href);
   await forms.use(appId, draft.id, owner, async draft => {
     draft.nativeFormLink = appLink.href;
-    draft.nativeSubmission = { attempts: [{ sourceLocation: nativePage.href, username: 'actor', typeId: 2, region: 'cn',
+    draft.nativeSubmission = { attempts: [{ sourceLocation: nativePage.href, hostedSourceLocation: oncallSidebarSource(nativePage), username: 'actor', typeId: 2, region: 'cn',
       policyFingerprint: JSON.stringify(policy), preparedAtMs: Date.now(), forwardMode: 'merge',
       sidebarLink: { href: appLink.href, token, hostedHref: hostOncallSidebar(appLink.href, host, draft, token) } }] };
   });
@@ -135,4 +136,41 @@ it('revokes the issued page after a policy or target change or an existing hando
   writeFileSync(targetFile, JSON.stringify({ [appId]: target }));
   expect(new OncallGroupStore(dataDir).claim(draft.source, owner)).toBe(true);
   expect(visit(page).status).toBe(404);
+});
+
+it('receives completion only from the selected native frame and records it against the issuing card', async () => {
+  vi.stubEnv('ONCALL_SIDEBAR_LOGIN_ORIGINS', 'https://auth.example.test https://login.example.test');
+  const { draft, forms, page, nativePage } = await fixture(false, '');
+  const { status, body, res } = visit(page);
+  expect(status).toBe(200);
+  expect(res.writeHead.mock.calls[0][1]['Content-Security-Policy']).toContain(
+    'frame-src https://oncall.example.test https://auth.example.test https://login.example.test;');
+  const frame = { src: '', contentWindow: { postMessage: vi.fn() } };
+  const listen = vi.fn();
+  const post = vi.fn(async (path: string, options: RequestInit) => {
+    const headers = new Headers(options.headers);
+    const response = { setHeader: vi.fn(), writeHead: vi.fn().mockReturnThis(), end: vi.fn() };
+    expect(await handleOncallSidebar({ method: options.method, headers: Object.fromEntries(headers) } as IncomingMessage,
+      response as unknown as ServerResponse, new URL(path, host), dataDir, () => policy)).toBe(true);
+    const status = response.writeHead.mock.calls[0][0];
+    return { ok: status === 204, status };
+  });
+  const script = body.match(/<script nonce="[^"]+">([\s\S]*?)<\/script>/)![1];
+  runInNewContext(script, { document: { getElementById: () => frame }, window: { addEventListener: listen },
+    location: { pathname: page.pathname }, fetch: post, setTimeout });
+  const form = new URL(frame.src);
+  expect(form.searchParams.get('type')).toBe(nativePage.searchParams.get('type'));
+  expect(form.searchParams.get('query')).toBe('申请人工 Oncall');
+  const handler = listen.mock.calls[0][1];
+  const event = { origin, source: frame.contentWindow, data: {
+    eventName: 'launch-oncall-success', data: { oncallFlowId: 1234, openChatId: 'oc_destination' } } };
+  await handler({ ...event, origin: 'https://login.example.test' });
+  await handler({ ...event, source: {} });
+  expect(post).not.toHaveBeenCalled();
+  await handler({ ...event, data: { eventName: 'getParentUrl' } });
+  expect(frame.contentWindow.postMessage).toHaveBeenCalledWith({ url: origin + '/chat?bm_form=' + form.searchParams.get('bm_form') }, origin);
+  await handler(event);
+  await handler(event);
+  const attempt = await forms.use(appId, draft.id, owner, async current => current.nativeSubmission!.attempts[0]);
+  expect(attempt?.receipt).toEqual({ flowId: '1234', openChatId: 'oc_destination' });
 });

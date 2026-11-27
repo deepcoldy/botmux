@@ -100,7 +100,12 @@ export class OncallFormStore {
   /** An issued capability stays bound to its original selection while the card is active. */
   readNativeSidebarLink(appId: string, id: string, token: string, readPolicy: (appId: string) => OncallGroupPolicy | undefined): string | undefined {
     const draft = this.read<OncallFormDraft>(this.file(appId, id));
-    if (!draft || draft.appId !== appId || draft.id !== id || draft.closed
+    if (!draft || draft.closed) return;
+    return this.activeSidebarAttempt(draft, appId, id, token, readPolicy)?.sidebarLink?.href;
+  }
+  private activeSidebarAttempt(draft: OncallFormDraft, appId: string, id: string, token: string,
+    readPolicy: (appId: string) => OncallGroupPolicy | undefined): OncallNativeSubmissionAttempt | undefined {
+    if (draft.appId !== appId || draft.id !== id || draft.nativeSubmission?.completed
       || Date.now() - draft.createdAtMs >= FORM_LIFETIME_MS) return;
     const attempt = draft.nativeSubmission?.attempts.find(item => item.sidebarLink?.token === token);
     if (!attempt?.sidebarLink) return;
@@ -110,8 +115,21 @@ export class OncallFormStore {
         || JSON.stringify(loadOncallGroupTarget(this.dataDir, appId)) !== draft.targetFingerprint) return;
       const request = new OncallGroupStore(this.dataDir).getRequest(draft.source);
       if (request && request.status !== 'failed') return;
-      return attempt.sidebarLink.href;
+      return attempt;
     } catch { return; }
+  }
+  async recordSidebarReceipt(appId: string, id: string, token: string, receipt: { flowId: string; openChatId: string },
+    readPolicy: (appId: string) => OncallGroupPolicy | undefined): Promise<boolean> {
+    const draft = this.read<OncallFormDraft>(this.file(appId, id));
+    if (!draft || !this.activeSidebarAttempt(draft, appId, id, token, readPolicy)) return false;
+    return this.use(appId, id, draft.ownerOpenId, async current => {
+      const attempt = this.activeSidebarAttempt(current, appId, id, token, readPolicy);
+      if (!attempt?.hostedSourceLocation) return false;
+      // A client hint is replaceable. Only the later platform read can bind
+      // a group, so a malformed or out-of-date hint cannot lock the form.
+      attempt.receipt = receipt;
+      return true;
+    }, { allowClosed: true });
   }
   publishedMessageIds(source: OncallGroupSource): Set<string> {
     let files: string[];

@@ -4422,7 +4422,7 @@ const server = createServer(async (req, res) => {
     }
 
     // The random capability grants access only to its issued native form.
-    if (handleOncallSidebar(req, res, url, config.session.dataDir,
+    if (await handleOncallSidebar(req, res, url, config.session.dataDir,
       appId => loadBotConfigsCached().find(bot => bot.larkAppId === appId)?.oncallGroup)) return;
 
     // Pinned xterm 5.5.0 browser bundle (the #1940 set) for pages rendered at

@@ -138,6 +138,47 @@ describe('native submission completion', () => {
     expect(mocks.merge).toHaveBeenCalledExactlyOnceWith(appId, ['om_q1', 'om_a1', 'om_q2', 'om_a2', 'om_file'], 'oc_destination', expect.any(String));
   });
 
+  it.each(['current', 'stale', 'wrong flow', 'wrong chat', 'two orders', 'missing marker', 'navigation referrer'])('verifies the submitting topic and destination for a reused order (%s)', async channel => {
+    vi.stubEnv('BOTMUX_PUBLIC_URL', 'https://dashboard.example.test');
+    const first = await open();
+    const secondSource = { ...source, sessionId: 'session-b', rootId: 'om_bq', questionId: 'om_bq', messageId: 'om_ba' };
+    const groups = new OncallGroupStore(dir);
+    groups.registerTurn(appId, secondSource.sessionId, secondSource.questionId);
+    groups.recordSource({ ...secondSource, cardJson: JSON.stringify({ schema: '2.0', body: { elements: [] } }) });
+    vi.setSystemTime(started + 60_000);
+    const second = await open(secondSource);
+    submitted(second);
+    const created = new Date(started + 8000).toISOString();
+    const launched = new Date(started + 80_000).toISOString();
+    Object.assign(rows[0], {
+      create_time: created, update_time: launched, create_chat_time: launched, oncall_start_time: launched,
+      source_type: new URL((channel === 'current' ? second : first).nativeSubmission!.attempts[0]!.sourceLocation).searchParams.get('bizFrom'),
+    });
+    const attempt = second.nativeSubmission!.attempts[0]!;
+    if (channel !== 'navigation referrer') rows[0].source_location = attempt.hostedSourceLocation;
+    if (channel === 'missing marker') rows[0].source_location = new URL(attempt.sourceLocation).origin;
+    if (channel === 'two orders') rows.push({ ...rows[0], id: 5678, chat_id: '98765' });
+    expect(await new OncallFormStore(dir).recordSidebarReceipt(appId, second.id, attempt.sidebarLink!.token,
+      { flowId: channel === 'wrong flow' ? '911' : '1234', openChatId: channel === 'wrong chat' ? 'oc_other' : 'oc_destination' }, () => mocks.bot.config.oncallGroup)).toBe(true);
+    mocks.thread.mockResolvedValue({ verifiedThread: true, messages: [
+      { message_id: 'om_bq', create_time: String(started + 55_000) },
+      { message_id: 'om_ba', create_time: String(started + 56_000) },
+    ] });
+    vi.setSystemTime(started + 85_000);
+    await reconcileAndDeliver();
+    vi.setSystemTime(started + 110_000);
+    await reconcileAndDeliver();
+    expect(groups.getRequest(source)).toBeUndefined();
+    if (!['current', 'stale'].includes(channel)) {
+      expect(groups.getRequest(secondSource)).toBeUndefined();
+      expect(mocks.merge).not.toHaveBeenCalled();
+      return;
+    }
+    expect(groups.getRequest(secondSource)).toMatchObject({ status: 'succeeded', openChatId: 'oc_destination' });
+    expect(mocks.update.mock.calls.some(([, id, card]) => id === secondSource.messageId && card.includes('进入人工 Oncall 群'))).toBe(true);
+    expect(mocks.merge).toHaveBeenCalledExactlyOnceWith(appId, ['om_bq', 'om_ba'], 'oc_destination', expect.any(String));
+  });
+
   it.each(['homepage', 'missing', 'malformed', 'conflicting markers', 'conflicting URL channel'])(
     'never forwards either topic when a reused ticket has a stale channel (%s)', async scenario => {
       const a = await open();
