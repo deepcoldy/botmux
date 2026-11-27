@@ -85,6 +85,9 @@ export interface TurnReplyCardRecord extends TurnReplyCardKey {
   disconnected?: boolean;
   /** Capture expiry closed only the display, without proving native failure. */
   displayRetired?: boolean;
+  /** The turn ended by deliberately sending nothing (worker terminal
+   *  outputDisposition `nothing_to_send`), so the card is not a missing answer. */
+  silentTurn?: boolean;
   overflowMessageId?: string;
   usage?: import('../im/lark/md-card.js').CardUsageSnapshot;
   /** The CLI's next-input suggestion shown on a completed turn's card. */
@@ -100,7 +103,7 @@ export type TurnReplyCardEvent =
   | { kind: 'progress'; text: string }
   | { kind: 'final'; text: string; card: string; source: 'explicit' | 'bridge'; feedback?: TurnReplyCardRecord['feedback'] }
   | { kind: 'phase'; phase: 'working' | 'waiting' | 'stopping' }
-  | { kind: 'terminal'; phase: 'completed' | 'failed' | 'cancelled' | 'ambiguous' | 'superseded'; notice?: string; durationMs?: number; completedAtMs?: number; disconnected?: boolean; orphanAskIds?: string[] }
+  | { kind: 'terminal'; phase: 'completed' | 'failed' | 'cancelled' | 'ambiguous' | 'superseded'; notice?: string; durationMs?: number; completedAtMs?: number; disconnected?: boolean; orphanAskIds?: string[]; silent?: boolean }
   | { kind: 'display_retired'; notice?: string; silent?: boolean }
   | { kind: 'refresh' }
   /** Set or clear the next-step row; valid after the terminal edge too. */
@@ -108,6 +111,23 @@ export type TurnReplyCardEvent =
   /** Set or clear the「本轮回顾」panel; valid after the terminal edge too. */
   | { kind: 'recap'; markdown?: string }
   | { kind: 'recover'; beforeMs?: number; orphanAskIds?: string[] };
+
+/** Activity as the card shows it: blank thinking is dropped and a thinking
+ *  item repeating the one right before it is collapsed. The first occurrence
+ *  keeps its id, so a cumulative snapshot re-applied later stays idempotent. */
+export function collapseThinkingActivity(items: readonly ReplyCardActivity[]): ReplyCardActivity[] {
+  const result: ReplyCardActivity[] = [];
+  for (const item of items) {
+    if (item.kind === 'thinking') {
+      const text = item.text.trim();
+      if (!text) continue;
+      const prev = result.at(-1);
+      if (prev?.kind === 'thinking' && prev.text.trim() === text) continue;
+    }
+    result.push(item);
+  }
+  return result;
+}
 
 export function replyCardIsTerminal(record: Pick<TurnReplyCardRecord, 'phase'>): boolean {
   return ['completed', 'failed', 'cancelled', 'ambiguous', 'superseded'].includes(record.phase);
@@ -351,12 +371,13 @@ export class TurnReplyCardStore {
           record.durationMs = event.durationMs;
           record.completedAtMs = event.completedAtMs;
           record.disconnected = event.disconnected;
+          if (event.silent && event.phase === 'completed') record.silentTurn = true;
           if (!displayRetirement && !recovering) delete record.displayRetired;
         }
       } else if (!terminal || allowBackgroundTools) {
         if (event.kind === 'tools') {
           record.tools = event.tools;
-          const incoming = event.activity ?? event.tools.map(tool => ({ kind: 'tool' as const, id: tool.id }));
+          const incoming = collapseThinkingActivity(event.activity ?? event.tools.map(tool => ({ kind: 'tool' as const, id: tool.id })));
           const ids = new Set(record.activity.map(item => `${item.kind}:${item.id}`));
           for (const item of incoming) {
             if (!ids.has(`${item.kind}:${item.id}`)) record.activity.push(item);

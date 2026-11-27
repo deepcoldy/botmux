@@ -942,6 +942,48 @@ describe('one reply card per turn', () => {
     expect(cards.get(start.messageId!)!).toContain('完整答复');
   });
 
+  it('says a nothing-to-send turn needed no reply instead of reporting a missing final answer', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    await store.update(key, { kind: 'terminal', phase: 'completed', silent: true }, io);
+    const saved = store.read(key)!;
+    expect(saved.silentTurn).toBe(true);
+    const zh = buildTurnReplyCard(saved, presentation);
+    expect(zh).toContain('AI 判断无需回复');
+    expect(zh).not.toContain('本轮没有提供最终答复');
+    const en = buildTurnReplyCard(saved, { ...presentation, locale: 'en' });
+    expect(en).toContain('no reply was needed');
+    expect(en).not.toContain('No final answer was provided');
+  });
+
+  it('still reports a missing final answer for a completed turn that was not deliberately silent', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    await store.update(key, { kind: 'terminal', phase: 'completed' }, io);
+    const saved = store.read(key)!;
+    expect(saved.silentTurn).toBeUndefined();
+    expect(buildTurnReplyCard(saved, presentation)).toContain('本轮没有提供最终答复');
+  });
+
+  it('records one thinking item when a snapshot repeats it around a blank entry', async () => {
+    const entries: CotEntry[] = [
+      { kind: 'thinking', text: 'THINK_X' }, { kind: 'thinking', text: '  \n' }, { kind: 'thinking', text: 'THINK_X' },
+      { kind: 'thinking', text: 'THINK_Y' },
+    ];
+    for (let i = 0; i < 2; i++) {
+      await store.update(key, { kind: 'tools', tools: [], activity: publicReplyCardActivity(entries) }, io);
+    }
+    expect(store.read(key)!.activity!.filter(item => item.kind === 'thinking').map(item => (item as any).text))
+      .toEqual(['THINK_X', 'THINK_Y']);
+  });
+
+  it('keeps the same thinking text when a tool call separates the two occurrences', async () => {
+    const entries: CotEntry[] = [
+      { kind: 'thinking', text: 'THINK_X' }, { kind: 'tool_call', id: 't0', name: 'Bash', args: '{}' },
+      { kind: 'thinking', text: 'THINK_X' },
+    ];
+    await store.update(key, { kind: 'tools', tools: publicReplyCardTools(entries, true), activity: publicReplyCardActivity(entries) }, io);
+    expect(store.read(key)!.activity!.map(item => item.kind)).toEqual(['thinking', 'tool', 'thinking']);
+  });
+
   it('serializes independent publishers and fences progress after final delivery', async () => {
     const secondProcess = new TurnReplyCardStore(dir);
     let release!: () => void;
@@ -1173,6 +1215,17 @@ describe('public process and fallback compatibility', () => {
     const card = JSON.parse(buildTurnReplyCard(record, options));
     return card.body.elements.find((element: any) => element.tag === 'collapsible_panel');
   }
+
+  it('does not render blank or repeated thinking from a record persisted before the collapse', () => {
+    const record: TurnReplyCardRecord = { ...key, ...input, version: 1, phase: 'completed', createdAtMs: 1, progress: [], tools: [],
+      activity: [
+        { kind: 'thinking', id: 'thinking:0', text: 'THINK_X' }, { kind: 'thinking', id: 'thinking:1', text: '' },
+        { kind: 'thinking', id: 'thinking:2', text: 'THINK_X' }, { kind: 'thinking', id: 'thinking:3', text: 'THINK_Y' },
+      ] };
+    const card = JSON.parse(buildTurnReplyCard(record, presentation));
+    const panel = card.body.elements.find((element: any) => element.tag === 'collapsible_panel');
+    expect(panel.elements[0].content).toBe('💭 THINK_X\n💭 THINK_Y');
+  });
 
   it('keeps the latest nonempty narration outside the collapsed panel after subsequent tool events', () => {
     const record = processRecord(2, 0);
