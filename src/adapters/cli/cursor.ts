@@ -54,9 +54,10 @@ const CURSOR_LOCAL_EMPTY_COMPOSER = new RegExp(`${CURSOR_LOCAL_PLACEHOLDER_ROW}[
 /** Active-turn composer row: Cursor renders `rightPlaceholder: "ctrl+c to stop"`
  *  on the same row as the composer prompt while a turn runs, and clears it
  *  when the turn ends. Agent Local shows the hint only in an empty composer.
- *  Require its placeholder and the padding before the hint on the same row. */
+ *  Require its placeholder and the padding before the hint on the same row.
+ *  A later composer row takes precedence over a busy row printed in output. */
 export const CURSOR_BUSY_COMPOSER = new RegExp(
-  String.raw`^\s*→\s+.*\bctrl\+c to stop\s*$|${CURSOR_LOCAL_PLACEHOLDER_ROW}${CURSOR_LOCAL_STOP_HINT}[ \t]*\r?$`,
+  String.raw`^\s*→\s+.*\bctrl\+c to stop\s*$|${CURSOR_LOCAL_PLACEHOLDER_ROW}${CURSOR_LOCAL_STOP_HINT}[ \t]*\r?$(?![\s\S]*^[ \t]*[→>](?:[ \t]|$))`,
   'im',
 );
 
@@ -71,7 +72,7 @@ export const CURSOR_FOLLOW_UPS_PANEL = /^\s*┌─ follow-ups ─+┐\s*$/m;
  *  turn's first model step flushes, so unstarted queue heads keep their
  *  pre-start lease while either signal is visible. */
 export function cursorScreenHoldsSubmittedInput(screen: string): boolean {
-  const region = busyProbeRegion(screen);
+  const region = busyProbeRegion(screen, 'cursor');
   return CURSOR_BUSY_COMPOSER.test(region) || CURSOR_FOLLOW_UPS_PANEL.test(region);
 }
 
@@ -80,8 +81,11 @@ function cursorComposerRow(screen: string): string | undefined {
   let localRow: string | undefined;
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i]!;
-    // Prefer the regular glyph when both appear. A quoted line can start with >.
-    if (/^\s*→(?:\s|$)/.test(line)) return line;
+    // A later Local row can be the real composer. If the glyphs disagree,
+    // preserve evidence of a draft rather than declaring the input empty.
+    if (/^\s*→(?:\s|$)/.test(line)) {
+      return CURSOR_ARROW_PLACEHOLDER.test(line) ? localRow ?? line : line;
+    }
     if (localRow === undefined && /^[ \t]*>(?:[ \t]|$)/.test(line)) localRow = line;
   }
   return localRow;
@@ -90,7 +94,7 @@ function cursorComposerRow(screen: string): string | undefined {
 /** Cursor holds no pending input at all: no turn is running, no `follow-ups`
  *  panel is drawn, and the bottom composer row shows its empty placeholder. */
 export function cursorScreenShowsNoPendingInput(screen: string): boolean {
-  const region = busyProbeRegion(screen);
+  const region = busyProbeRegion(screen, 'cursor');
   if (CURSOR_BUSY_COMPOSER.test(region) || CURSOR_FOLLOW_UPS_PANEL.test(region)) return false;
   const composer = cursorComposerRow(region);
   if (composer === undefined) return false;
@@ -110,7 +114,7 @@ export function cursorStopLeftParkedFollowUp(screen: string): boolean {
   if (composer?.trimStart().startsWith('>')) {
     return CURSOR_FOLLOW_UPS_PANEL.test(text) && CURSOR_LOCAL_EMPTY_COMPOSER.test(composer);
   }
-  return CURSOR_ARROW_PLACEHOLDER.test(text);
+  return composer !== undefined && CURSOR_ARROW_PLACEHOLDER.test(composer);
 }
 
 export function createCursorAdapter(pathOverride?: string): CliAdapter {

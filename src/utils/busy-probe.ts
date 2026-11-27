@@ -7,8 +7,14 @@ import { stripAnsiScreenText } from './idle-detector.js';
  *  `^\s*[⏵⏸]…`) never match through that lead-in, so the pre-idle veto
  *  silently never fires. Uses the SAME stripping as the IdleDetector PTY
  *  stream path so both probes see identical text. */
-export function busyProbeRegion(content: string): string {
+export function busyProbeRegion(content: string, cliId?: string): string {
   const lines = stripAnsiScreenText(content).split(/\r?\n/);
   const tailLineCount = Math.max(12, Math.ceil(lines.length / 3));
-  return lines.slice(-tailLineCount).join('\n');
+  let end = lines.length;
+  // Cursor can draw its composer above blank viewport rows, especially in
+  // tmux before the chat fills the pane. Keep the window based on pane height.
+  if (cliId === 'cursor') {
+    while (end > 0 && lines[end - 1]!.trim() === '') end--;
+  }
+  return lines.slice(Math.max(0, end - tailLineCount), end).join('\n');
 }

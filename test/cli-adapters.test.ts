@@ -2186,6 +2186,9 @@ describe('cursor buildArgs', () => {
     expect(adapter.screenShowsNoPendingInput?.(busyAnsi)).toBe(false);
     expect(adapter.screenShowsNoPendingInput?.(idle)).toBe(true);
     expect(adapter.screenShowsNoPendingInput?.(`${idle}\n  > half-typed draft`)).toBe(false);
+    expect(adapter.screenHoldsSubmittedInput?.(`${busy}\r\n${idle}`)).toBe(false);
+    expect(adapter.screenShowsNoPendingInput?.(`${busy}\r\n${idle}`)).toBe(true);
+    expect(adapter.screenHoldsSubmittedInput?.(`${idle}\r\n${busy}`)).toBe(true);
   });
 
   it.each(['→', '>'])('recognizes the Cursor composer while a plan is available for review (%s)', glyph => {
@@ -2193,6 +2196,25 @@ describe('cursor buildArgs', () => {
     expect(adapter.readyPattern?.test(placeholder)).toBe(true);
     expect(adapter.readyPattern?.test(`${placeholder}    ctrl+c to stop`)).toBe(true);
     expect(adapter.screenShowsNoPendingInput?.(placeholder)).toBe(true);
+  });
+
+  it('finds the Agent Local composer and queue above tmux viewport padding', () => {
+    const paddedViewport = (rows: string[]) => [
+      ...Array.from({ length: 19 }, (_, index) => `Earlier output ${index}`),
+      ...rows,
+      '  gateway-model',
+      ...Array<string>(16).fill('\u001b[49m    '),
+    ].join('\r\n');
+    const idle = '  > Add a follow-up';
+    const busy = `${idle}    ctrl+c to stop`;
+    const queued = ['  ┌─ follow-ups ────┐', '  │ Next request    │', '  └────────────────┘', idle];
+
+    expect(adapter.screenHoldsSubmittedInput?.(paddedViewport([busy]))).toBe(true);
+    expect(adapter.screenHoldsSubmittedInput?.(paddedViewport(queued))).toBe(true);
+    expect(adapter.screenShowsNoPendingInput?.(paddedViewport(queued))).toBe(false);
+    expect(adapter.screenShowsNoPendingInput?.(paddedViewport([idle]))).toBe(true);
+    expect(adapter.busyPattern?.test(busyProbeRegion(paddedViewport([busy]), 'cursor'))).toBe(true);
+    expect(adapter.busyPattern?.test(busyProbeRegion(paddedViewport([busy]), 'codex'))).toBe(false);
   });
 
   it('keeps an Agent Local draft starting with the placeholder pending', () => {
@@ -2204,9 +2226,11 @@ describe('cursor buildArgs', () => {
     expect(adapter.screenShowsNoPendingInput?.(`${placeholder}\n${draft}`)).toBe(false);
     expect(adapter.screenShowsNoPendingInput?.('  > quote → Add a follow-up')).toBe(false);
     expect(adapter.screenShowsNoPendingInput?.(`  → existing draft\n${placeholder}`)).toBe(false);
+    expect(adapter.screenShowsNoPendingInput?.('  → Add a follow-up\n  > interrupted draft')).toBe(false);
     expect(cursorStopLeftParkedFollowUp(`${parked}${placeholder}`)).toBe(true);
     expect(cursorStopLeftParkedFollowUp(`Example: enter steer\n${placeholder}`)).toBe(false);
     expect(cursorStopLeftParkedFollowUp(`${parked}${placeholder}\n${draft}`)).toBe(false);
+    expect(cursorStopLeftParkedFollowUp(`  → Add a follow-up\n${parked}${draft}`)).toBe(false);
   });
 
   it('detects active composer busy state and follow-ups queue without matching scrollback prose', () => {
