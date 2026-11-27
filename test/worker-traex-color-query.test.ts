@@ -30,6 +30,7 @@ function harness(cliId = 'traex') {
     backendScreenRevision: 0, lastPtyActivityAtMs: 0, lastPtyOutputAtMs: 0,
     maybeReportDeferredTopicMaterialization: vi.fn(), maybeCaptureKiroSessionId: vi.fn(),
     maybeReportPiInstallChange: vi.fn(), captureWorkflowTranscript: vi.fn(),
+    observeAntigravityWorkingData: vi.fn(),
     spawnArgvNeedsWorkingSeed: false,
     renderer: { write: vi.fn(), rawSnapshot: () => COMPOSER },
     refreshHookReviewInputHold: vi.fn(),
