@@ -74,6 +74,16 @@ async function startCapturingDaemon(): Promise<{
 }> {
   const received = { url: '', body: '' };
   const server = createServer((req, res) => {
+    // Host agents (e.g. moshi-hook on developer machines) probe every freshly
+    // bound loopback port with a bare `GET /`. Botmux's hook signals are all
+    // POST with a JSON body; ignore unrelated probe traffic so it cannot
+    // overwrite the request this test is asserting on.
+    if (req.method !== 'POST') {
+      req.resume();
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"ok":true}');
+      return;
+    }
     received.url = req.url ?? '';
     req.setEncoding('utf8');
     req.on('data', chunk => { received.body += chunk; });
