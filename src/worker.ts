@@ -90,6 +90,13 @@ import { tokenStoreProtection, capabilityOn, larkUserNative } from './services/t
 import { installAidenCodexShim, writeAidenCodexShellConfigs } from './services/aiden-codex-shim.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from './services/credential-bearing-mcp.js';
 import { homedir, tmpdir, userInfo } from 'node:os';
+import {
+  createLocalSessionReadyChannel,
+  startLocalSessionReadyWatcher,
+  SESSION_READY_SIGNAL_FILE_ENV,
+  SESSION_READY_SIGNAL_NONCE_ENV,
+  type LocalSessionReadyChannel,
+} from './utils/session-ready-local-signal.js';
 import { spawnSync } from 'node:child_process';
 import {
   evaluateCredentialOnlyIsolationGate,
@@ -4799,6 +4806,23 @@ let readySignalTimer: ReturnType<typeof setTimeout> | null = null;
 /** How long the ready-gate waits for the SessionStart signal before falling
  *  back. This is insurance against a missing/failed hook — generous but bounded. */
 const READY_SIGNAL_TIMEOUT_MS = 45_000;
+/** Workflow worker only: per-spawn local transport for the SessionStart hook.
+ *  A v3 ephemeral worker has no daemon session record, so the daemon route
+ *  drops its hook's signal (see utils/session-ready-local-signal.ts). */
+let localSessionReadyChannel: LocalSessionReadyChannel | null = null;
+let localSessionReadyWatcher: { stop(): void } | null = null;
+// Workflow workers skip the chat screen renderer. Keep a viewport just for
+// the startup fence when Claude paints its composer before the hook returns.
+let workflowReadyRenderer: TerminalRenderer | null = null;
+const LOCAL_SESSION_READY_POLL_MS = 200;
+function stopLocalSessionReadyChannel(): void {
+  workflowReadyRenderer?.dispose();
+  workflowReadyRenderer = null;
+  localSessionReadyWatcher?.stop();
+  localSessionReadyWatcher = null;
+  localSessionReadyChannel?.dispose();
+  localSessionReadyChannel = null;
+}
 /** Soft fallback for CLIs that never emit an idle/ready signal during startup.
  *  Legacy adapters release queued first input here. Adapters that opt into
  *  deferFirstPromptTimeoutUntilReady wait for the real readyPattern until the
@@ -5765,6 +5789,73 @@ function settleThenFlush(startedAtMs: number, promptReadyAfterSettle: boolean): 
   const wait = Math.min(READY_FLUSH_SETTLE_MS - quietForMs, READY_FLUSH_SETTLE_CAP_MS - (now - startedAtMs));
   readyFlushSettleTimer = setTimeout(() => settleThenFlush(startedAtMs, promptReadyAfterSettle), Math.max(50, wait));
   readyFlushSettleTimer.unref?.();
+}
+
+/** The SessionStart ready signal, whichever transport delivered it: the
+ *  daemon's `session_ready` IPC or the workflow worker's local channel
+ *  (utils/session-ready-local-signal.ts). One handler keeps the post-hook
+ *  prompt fence, late-after-fallback and restart-count semantics identical. */
+function handleSessionReadySignal(msg: { source?: string; requestId?: string }): void {
+  if (msg.source === 'compact') bridgeBlindTurnWatch.noteCompactionFinished();
+  // Claude-family SessionStart hooks run in parallel. This signal proves
+  // the startup selector is behind us, but a slower project hook can still
+  // be running and Claude does not render its real prompt until ALL hooks
+  // finish. Clear selector-era evidence and require a fresh PTY prompt after
+  // the signal. Hermes keeps its authoritative ready-command behavior.
+  log(`SessionStart ready signal received (source=${msg.source ?? '?'})`);
+  sessionStartSignalAtMs ??= Date.now();
+  const waitForPostHookPrompt = shouldWaitForPostSessionStartPromptEvidence({
+    isClaudeFamily: !!cliAdapter?.claudeDataDir,
+    hasReadyPattern: !!cliAdapter?.readyPattern,
+    awaitingFirstPrompt,
+    isPromptReady,
+    alreadyWaiting: awaitingPostSessionStartPromptEvidence,
+  });
+  // 「接受屏幕已有提示符」兜底只对全新会话（source=startup）arm：新建会话在
+  // hook 跑完前就画好提示符、之后不再重绘，fence 必须靠兜底才解。resume/clear/
+  // compact 会在边界后自行重绘一个新 ❯（transcript 重放/重印），fence 靠真证据
+  // ~2s 自解；给它们 arm 反而会让回放中残留的历史 ❯ 满足静默门控、提前接受边界
+  // 前的旧提示符，破坏 resume 本就依赖的 fresh-evidence fence。未识别的 source
+  // 按非 startup 处理（fail-safe 不 arm，退回既有 15s 首提示符超时，无新回归）。
+  const armPostHookFallback = shouldArmPostHookPromptEvidenceFallback({
+    waitingForPostHookPrompt: waitForPostHookPrompt,
+    source: msg.source,
+  });
+  if (waitForPostHookPrompt) {
+    awaitingPostSessionStartPromptEvidence = true;
+    promptReadyDetectedDuringSettle = false;
+    readyPatternSeenDuringHold = false;
+    idleDetector?.resetReadyEvidence();
+    lastPtyOutputAtMs = Date.now();
+    webTerminalInputGenerationAtBoundary = webTerminalInputGeneration;
+    log('SessionStart boundary recorded — waiting for fresh post-hook prompt evidence');
+    if (armPostHookFallback) armPostHookPromptEvidenceFallback();
+  }
+  // 先记下 gate 是否已被 45s fallback 释放：ReadyGate.receive() 是一次性
+  // 语义，fallback 抢先后 releaseReadyGate 会整块跳过迟到的真信号。
+  const lateAfterFallback = readyGate.isArmed && readyGate.isReceived;
+  releaseReadyGate('SessionStart hook', { promptReadyAfterSettle: !waitForPostHookPrompt });
+  // 冷启动超过 READY_SIGNAL_TIMEOUT_MS 的 CLI（Hermes 常态是 2-3 分钟）恰好
+  // 总落在 fallback 之后：fallback 只开闸不投递（非 type-ahead 的
+  // flushPending 是 no-op），真信号依然是权威就绪，这里直接兑现。仅限首轮
+  // （awaitingFirstPrompt）——首条 prompt 交付后 clear/compact 来源的
+  // SessionStart 保持原有 no-op 语义，绝不在会话中途误标就绪。
+  if (lateAfterFallback && awaitingFirstPrompt && !isPromptReady && !waitForPostHookPrompt) {
+    log('Late ready signal after timeout fallback — marking prompt ready now');
+    markPromptReady();
+  }
+  // CLI 启动确证（SessionStart hook 已跑）：复位连续重启计数——resume 目标
+  // 显然存在且加载成功。这和 prompt 侧复位是同一语义，但更早：2026-08-20
+  // 事故里 resume 后的 CLI 已 ready 二十多秒、还没等到 prompt 复位就被共享
+  // server 抖动误杀，第二次重启因此被 tier-2 强制 FRESH 白丢上下文。到过
+  // ready 的 spawn 崩溃不是「resume 目标不存在」问题，下一轮应有全新预算。
+  if (consecutiveInWorkerRestarts > 0) {
+    log(`SessionStart ready — resetting consecutive restart count (was ${consecutiveInWorkerRestarts})`);
+    consecutiveInWorkerRestarts = 0;
+  }
+  if (msg.requestId) {
+    send({ type: 'session_ready_ack', requestId: msg.requestId });
+  }
 }
 
 /** Release the ready-gate and flush anything it held. No-op when the gate was
@@ -23475,7 +23566,7 @@ function screenShowsReadyPattern(): boolean {
   try {
     screen = lastInitConfig?.cliId === 'traex' && typeof readTraexStartupViewportScreen === 'function'
       ? readTraexStartupViewportScreen(false)
-      : (renderer?.rawSnapshot() ?? '');
+      : ((renderer ?? workflowReadyRenderer)?.rawSnapshot() ?? '');
   } catch { return false; }
   return !!screen && pattern.test(screen);
 }
@@ -23514,7 +23605,7 @@ function screenShowsFramedReadyPrompt(): boolean {
   const pattern = cliAdapter?.readyPattern;
   if (!pattern) return false;
   let screen = '';
-  try { screen = renderer?.rawSnapshot({ preserveFormatting: true }) ?? ''; } catch { return false; }
+  try { screen = (renderer ?? workflowReadyRenderer)?.rawSnapshot({ preserveFormatting: true }) ?? ''; } catch { return false; }
   return screenShowsFramedPrompt(screen, pattern);
 }
 
@@ -24272,6 +24363,14 @@ function appendWorkflowPtyLog(data: string): void {
 function captureWorkflowTranscript(data: string): void {
   appendWorkflowPtyLog(data);
   if (!isWorkflowWorker() || workflowFinalOutputSent) return;
+  if (workflowReadyRenderer) {
+    if (isPromptReady) {
+      workflowReadyRenderer.dispose();
+      workflowReadyRenderer = null;
+    } else {
+      workflowReadyRenderer.write(data);
+    }
+  }
   workflowTranscript += data;
   if (workflowTranscript.length > WORKFLOW_TRANSCRIPT_MAX) {
     workflowTranscript = workflowTranscript.slice(-WORKFLOW_TRANSCRIPT_MAX);
@@ -38568,6 +38667,33 @@ async function spawnCliBody(
   // Ask/browser approval require this anchor for both thread and chat sessions.
   childEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
   applySessionOwnerEnv(childEnv, cfg.ownerOpenId);
+  // SessionStart local ready channel (workflow worker, Claude family, no
+  // sandbox / credential boundary: an isolated CLI cannot write the worker's
+  // private directory, so it keeps the daemon route and the gate's fallback).
+  // Always delete first so an inherited value never reaches the CLI; set after
+  // every configurable env so per-bot env cannot replace it (BOTMUX_* is also
+  // reserved in sanitizePerBotEnv).
+  stopLocalSessionReadyChannel();
+  delete childEnv[SESSION_READY_SIGNAL_FILE_ENV];
+  delete childEnv[SESSION_READY_SIGNAL_NONCE_ENV];
+  if (
+    isWorkflowWorker()
+    && cliAdapter.injectsReadyHook === true
+    && !!cliAdapter.claudeDataDir
+    && cfg.adoptMode !== true
+    && !willReattachPersistent
+    && !sandboxRequested
+    && !credentialBoundaryActive
+  ) {
+    try {
+      localSessionReadyChannel = createLocalSessionReadyChannel(tmpdir());
+      if (!renderer) workflowReadyRenderer = new TerminalRenderer(renderCols, renderRows);
+      Object.assign(childEnv, localSessionReadyChannel.env());
+    } catch (err: any) {
+      stopLocalSessionReadyChannel();
+      log(`SessionStart local ready channel unavailable (${err?.code ?? err?.message ?? 'error'}); using the daemon route`);
+    }
+  }
   // This bot's resolved brandLabel template, injected so a SANDBOXED `botmux
   // send` renders the role-name footer without reading bots.json (deny-by-
   // default → EPERM → role footer would silently fall back to the default
@@ -41996,6 +42122,28 @@ async function spawnCliBody(
     }, readySignalTimeoutMs);
     readySignalTimer.unref?.();
   }
+  // Started after the gate is (re)armed so a signal written early is read into
+  // THIS spawn's gate, never the previous one. Bound to this spawn generation.
+  // A superseded spawn (generation moved on) must not start a watcher on the
+  // newer spawn's channel or replace its watcher handle.
+  if (localSessionReadyChannel && cliSpawnGeneration === spawnGeneration) {
+    const channel = localSessionReadyChannel;
+    const watchedBackend = backend;
+    const invalidSeen = new Set<string>();
+    localSessionReadyWatcher = startLocalSessionReadyWatcher({
+      channel,
+      intervalMs: LOCAL_SESSION_READY_POLL_MS,
+      isCurrent: () => cliSpawnGeneration === spawnGeneration && backend === watchedBackend
+        && localSessionReadyChannel === channel,
+      onSignal: source => handleSessionReadySignal({ source }),
+      onInvalid: reason => {
+        if (invalidSeen.has(reason)) return;
+        invalidSeen.add(reason);
+        log(`Ignoring local SessionStart signal (${reason})`);
+      },
+    });
+    log('SessionStart local ready channel armed');
+  }
 
   // A settled signal is a turn boundary. Drain structured transcripts before
   // markPromptReady(): that call may synchronously flush a type-ahead turn and
@@ -43168,6 +43316,7 @@ function killCli(opts: {
   spawnArgvTurnStartBusyScanTail = '';
   structuredRejectedReadyEvidenceGeneration = undefined;
   ptyOutputGeneration.reset();
+  stopLocalSessionReadyChannel();
   // Cancel any pending ready-gate fallback / settle timers; spawnCli re-arms on respawn.
   if (readySignalTimer) { clearTimeout(readySignalTimer); readySignalTimer = null; }
   if (readyFlushSettleTimer) { clearTimeout(readyFlushSettleTimer); readyFlushSettleTimer = null; }
@@ -50753,66 +50902,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
     }
 
     case 'session_ready': {
-      if (msg.source === 'compact') bridgeBlindTurnWatch.noteCompactionFinished();
-      // Claude-family SessionStart hooks run in parallel. This signal proves
-      // the startup selector is behind us, but a slower project hook can still
-      // be running and Claude does not render its real prompt until ALL hooks
-      // finish. Clear selector-era evidence and require a fresh PTY prompt after
-      // the signal. Hermes keeps its authoritative ready-command behavior.
-      log(`SessionStart ready signal received (source=${msg.source ?? '?'})`);
-      sessionStartSignalAtMs ??= Date.now();
-      const waitForPostHookPrompt = shouldWaitForPostSessionStartPromptEvidence({
-        isClaudeFamily: !!cliAdapter?.claudeDataDir,
-        hasReadyPattern: !!cliAdapter?.readyPattern,
-        awaitingFirstPrompt,
-        isPromptReady,
-        alreadyWaiting: awaitingPostSessionStartPromptEvidence,
-      });
-      // 「接受屏幕已有提示符」兜底只对全新会话（source=startup）arm：新建会话在
-      // hook 跑完前就画好提示符、之后不再重绘，fence 必须靠兜底才解。resume/clear/
-      // compact 会在边界后自行重绘一个新 ❯（transcript 重放/重印），fence 靠真证据
-      // ~2s 自解；给它们 arm 反而会让回放中残留的历史 ❯ 满足静默门控、提前接受边界
-      // 前的旧提示符，破坏 resume 本就依赖的 fresh-evidence fence。未识别的 source
-      // 按非 startup 处理（fail-safe 不 arm，退回既有 15s 首提示符超时，无新回归）。
-      const armPostHookFallback = shouldArmPostHookPromptEvidenceFallback({
-        waitingForPostHookPrompt: waitForPostHookPrompt,
-        source: msg.source,
-      });
-      if (waitForPostHookPrompt) {
-        awaitingPostSessionStartPromptEvidence = true;
-        promptReadyDetectedDuringSettle = false;
-        readyPatternSeenDuringHold = false;
-        idleDetector?.resetReadyEvidence();
-        lastPtyOutputAtMs = Date.now();
-        webTerminalInputGenerationAtBoundary = webTerminalInputGeneration;
-        log('SessionStart boundary recorded — waiting for fresh post-hook prompt evidence');
-        if (armPostHookFallback) armPostHookPromptEvidenceFallback();
-      }
-      // 先记下 gate 是否已被 45s fallback 释放：ReadyGate.receive() 是一次性
-      // 语义，fallback 抢先后 releaseReadyGate 会整块跳过迟到的真信号。
-      const lateAfterFallback = readyGate.isArmed && readyGate.isReceived;
-      releaseReadyGate('SessionStart hook', { promptReadyAfterSettle: !waitForPostHookPrompt });
-      // 冷启动超过 READY_SIGNAL_TIMEOUT_MS 的 CLI（Hermes 常态是 2-3 分钟）恰好
-      // 总落在 fallback 之后：fallback 只开闸不投递（非 type-ahead 的
-      // flushPending 是 no-op），真信号依然是权威就绪，这里直接兑现。仅限首轮
-      // （awaitingFirstPrompt）——首条 prompt 交付后 clear/compact 来源的
-      // SessionStart 保持原有 no-op 语义，绝不在会话中途误标就绪。
-      if (lateAfterFallback && awaitingFirstPrompt && !isPromptReady && !waitForPostHookPrompt) {
-        log('Late ready signal after timeout fallback — marking prompt ready now');
-        markPromptReady();
-      }
-      // CLI 启动确证（SessionStart hook 已跑）：复位连续重启计数——resume 目标
-      // 显然存在且加载成功。这和 prompt 侧复位是同一语义，但更早：2026-08-20
-      // 事故里 resume 后的 CLI 已 ready 二十多秒、还没等到 prompt 复位就被共享
-      // server 抖动误杀，第二次重启因此被 tier-2 强制 FRESH 白丢上下文。到过
-      // ready 的 spawn 崩溃不是「resume 目标不存在」问题，下一轮应有全新预算。
-      if (consecutiveInWorkerRestarts > 0) {
-        log(`SessionStart ready — resetting consecutive restart count (was ${consecutiveInWorkerRestarts})`);
-        consecutiveInWorkerRestarts = 0;
-      }
-      if (msg.requestId) {
-        send({ type: 'session_ready_ack', requestId: msg.requestId });
-      }
+      handleSessionReadySignal(msg);
       break;
     }
 
@@ -51768,6 +51858,7 @@ process.on('exit', () => {
     try { backend.kill(); } catch { /* best-effort crash teardown */ }
   }
   stopNativeSessionTitleSync();
+  stopLocalSessionReadyChannel();
   teardownSandboxBestEffort();
   stopCodexRpcEngine();
 });
