@@ -7,6 +7,7 @@ import { FleetSupervisor, pidAlive } from '../src/core/fleet-supervisor.js';
 import { waitFleetOnline } from '../src/core/fleet-runtime.js';
 import { freshProc, type FleetState } from '../src/core/fleet-supervisor-policy.js';
 import { readFleetState, writeFleetState } from '../src/core/fleet-state-store.js';
+import { readFleetDurableProcessIdentity } from '../src/utils/process-identity.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
 
 const fault = vi.hoisted(() => ({ path: '', pid: 0, transition: '', failed: false }));
@@ -134,11 +135,13 @@ describe('fleet orphan retirement with a failed durable write', () => {
         output += data.toString();
         if (output.includes('ready')) break;
       }
+      const currentIdentity = readFleetDurableProcessIdentity(unrelated.pid!);
+      if (!currentIdentity) throw new Error('cannot read unrelated fixture identity');
       writeFleetState(statePath, {
         supervisorPid: 0, supervisorStartedAt: 'prior',
         procs: [{
           ...freshProc('botmux-plugin-recycled', '', unrelated.pid!, 'T'),
-          processStart: 'utc:Thu Jan 01 00:00:00 1970',
+          processStart: `${currentIdentity}:recycled`,
         }],
       });
       Object.assign(fault, { path: statePath, pid: unrelated.pid!, transition: 'retire-drop', failed: false });

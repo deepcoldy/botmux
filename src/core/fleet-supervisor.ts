@@ -19,7 +19,11 @@ import { join } from 'node:path';
 import { openRotatedAppendLog } from '../utils/log-rotate.js';
 import { isStandaloneBinary, resolveEntrySpawn, type BotmuxEntry } from './self-spawn.js';
 import { scrubExternalMemberEnv } from '../utils/child-env.js';
-import { isLinuxZombie, isTimezoneStableProcessIdentity, readDurableProcessIdentity } from '../utils/process-identity.js';
+import {
+  canFleetIdentityProvePidReuse,
+  isLinuxZombie,
+  readFleetDurableProcessIdentity,
+} from '../utils/process-identity.js';
 import { pidNotProvablyGone } from '../utils/process-alive.js';
 import {
   builtinFleetEntryMatches,
@@ -28,6 +32,7 @@ import {
   fleetProcessIdentityRuntime,
   signalAttestedFleetProcess,
   type FleetProcessIdentityRuntime,
+  type FleetProcessInspection,
 } from './fleet-process-identity.js';
 import {
   decideCrashExit,
@@ -131,17 +136,46 @@ export function pidAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
-// 仅当时区稳定的持久化 processStart 与同 PID 当前身份均有效且不等时，才判定原进程已死且 PID 被系统复用；
-// 未带时区稳定格式的旧 lstart 字符串、缺失或不可读身份一律保持 fail-closed
+// 只有时区稳定的身份格式才能证明 PID 复用；legacy macOS lstart 继续 fail-closed。
 function isRecycledPid(
   proc: Pick<FleetProcState, 'pid' | 'processStart'>,
   runtime: FleetProcessIdentityRuntime,
 ): boolean {
-  if (!isTimezoneStableProcessIdentity(proc.processStart) || !Number.isSafeInteger(proc.pid) || proc.pid <= 1) {
-    return false;
-  }
-  const current = runtime.readIdentity(proc.pid);
-  return Boolean(isTimezoneStableProcessIdentity(current) && current !== proc.processStart);
+  if (!proc.processStart || !Number.isSafeInteger(proc.pid) || proc.pid <= 1
+    || !canFleetIdentityProvePidReuse(proc.processStart)) return false;
+  const current = runtime.readIdentity(proc.pid, proc.processStart);
+  return Boolean(current && canFleetIdentityProvePidReuse(current) && current !== proc.processStart);
+}
+
+/** Durable-retention predicate used by start()'s synchronous reconciliation. */
+export function shouldRetainFleetProcAtStart(
+  proc: Pick<FleetProcState, 'pid' | 'processStart' | 'status'>,
+  retention: { namedSpec: boolean; matchingSpec: boolean; ownedOrRetiring: boolean },
+  runtime: FleetProcessIdentityRuntime,
+): boolean {
+  return retention.namedSpec || (proc.pid > 1 && runtime.pidExists(proc.pid)
+    && !isRecycledPid(proc, runtime)
+    && (retention.matchingSpec || proc.status === 'launching' || retention.ownedOrRetiring));
+}
+
+/** Whether start() must turn an unowned live row into a stopped, pid=0 row. */
+export function shouldMarkFleetProcStoppedAtStart(
+  proc: Pick<FleetProcState, 'pid' | 'processStart' | 'status'>,
+  runtime: FleetProcessIdentityRuntime,
+): boolean {
+  return (proc.status === 'online' || (proc.status === 'launching' && proc.pid > 1))
+    && (!runtime.pidExists(proc.pid) || isRecycledPid(proc, runtime));
+}
+
+/** Removed live members remain blocked unless a stable identity proves reuse. */
+export function shouldBlockRemovedStaleProcess(
+  proc: Pick<FleetProcState, 'pid' | 'processStart'>,
+  inspection: FleetProcessInspection,
+  retireOnly: boolean,
+  runtime: FleetProcessIdentityRuntime,
+): boolean {
+  return retireOnly && inspection.status === 'stale' && runtime.pidExists(proc.pid)
+    && !isRecycledPid(proc, runtime);
 }
 
 export class FleetSupervisor {
@@ -256,11 +290,13 @@ export class FleetSupervisor {
     mutateFleetState(this.opts.statePath, (cur) => {
       // Live aliases remain durable while retirement is pending or unverifiable.
       // Sending SIGTERM alone does not prove that a daemon has stopped.
-      cur.procs = cur.procs.filter(p => specByName.has(p.name)
-        || (p.pid > 1 && identityRuntime.pidExists(p.pid) && !isRecycledPid(p, identityRuntime)
-          && (this.specForProc(p) || p.status === 'launching' || this.children.has(p.name) || this.orphanStops.has(p.name))));
+      cur.procs = cur.procs.filter(p => shouldRetainFleetProcAtStart(p, {
+        namedSpec: specByName.has(p.name),
+        matchingSpec: this.specForProc(p) !== undefined,
+        ownedOrRetiring: this.children.has(p.name) || this.orphanStops.has(p.name),
+      }, identityRuntime));
       for (const p of cur.procs) {
-        if (p.status === 'online' && !identityRuntime.pidExists(p.pid)) {
+        if (shouldMarkFleetProcStoppedAtStart(p, identityRuntime)) {
           p.pid = 0;
           p.status = 'stopped';
         } else if (p.pid > 1 && !this.children.has(p.name) && (this.specForProc(p) || this.orphanStops.has(p.name))) {
@@ -315,7 +351,7 @@ export class FleetSupervisor {
         : builtinFleetEntryMatches(spec.entry ?? 'daemon', command),
       runtime, /* removed members must re-prove their built-in command */ retireOnly);
     if (inspection.status === 'unverifiable') throw new Error(`cannot verify unowned ${proc.name} (pid ${proc.pid})`);
-    if (retireOnly && inspection.status === 'stale' && runtime.pidExists(proc.pid) && !isRecycledPid(proc, runtime)) {
+    if (shouldBlockRemovedStaleProcess(proc, inspection, retireOnly, runtime)) {
       throw new Error(`cannot prove removed ${proc.name} (pid ${proc.pid}) is a botmux daemon`);
     }
     if (inspection.status === 'exact') {
@@ -694,10 +730,10 @@ export class FleetSupervisor {
         // "running and current". Only external members have one.
         if (spec.external?.configHash !== undefined) existing.configHash = spec.external.configHash;
         else delete existing.configHash;
-        if (child.pid) existing.processStart = readDurableProcessIdentity(child.pid);
+        if (child.pid) existing.processStart = readFleetDurableProcessIdentity(child.pid);
       } else {
         cur.procs.push({ ...freshProc(spec.name, spec.appId, child.pid ?? 0, now, spec.external?.configHash) });
-        if (child.pid) cur.procs[cur.procs.length - 1].processStart = readDurableProcessIdentity(child.pid);
+        if (child.pid) cur.procs[cur.procs.length - 1].processStart = readFleetDurableProcessIdentity(child.pid);
       }
       return cur;
     }).procs.find((p) => p.name === spec.name)!.generation;

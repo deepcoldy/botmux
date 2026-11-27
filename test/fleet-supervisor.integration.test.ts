@@ -4,9 +4,16 @@ import { spawn, ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { FleetSupervisor, pidAlive, type FleetBotSpec } from '../src/core/fleet-supervisor.js';
+import {
+  FleetSupervisor,
+  pidAlive,
+  shouldMarkFleetProcStoppedAtStart,
+  shouldBlockRemovedStaleProcess,
+  shouldRetainFleetProcAtStart,
+  type FleetBotSpec,
+} from '../src/core/fleet-supervisor.js';
 import { fleetProcessIdentityRuntime } from '../src/core/fleet-process-identity.js';
-import { readDurableProcessIdentity } from '../src/utils/process-identity.js';
+import { readFleetDurableProcessIdentity } from '../src/utils/process-identity.js';
 import { readFleetState, mutateFleetState } from '../src/core/fleet-state-store.js';
 import { resolveTopicIndexSpec, waitFleetOnline } from '../src/core/fleet-runtime.js';
 import { spawnTsScript, tsRunnerPrefix } from './helpers/ts-runner.js';
@@ -86,6 +93,12 @@ async function spawnReadyOrphan(args: string[]): Promise<ChildProcess> {
     child.once('exit', onExit);
   });
   return child;
+}
+
+function differentStableIdentity(pid: number): string {
+  const current = readFleetDurableProcessIdentity(pid);
+  if (!current) throw new Error(`cannot read fixture identity for pid ${pid}`);
+  return `${current}:recycled`;
 }
 
 const bots: FleetBotSpec[] = [
@@ -241,7 +254,7 @@ console.log('daemon pid=' + process.pid);
       supervisorPid: 999_999, supervisorStartedAt: 'prior',
       procs: [{ name: 'botmux-removed', appId: 'cli_a', pid: orphan.pid!, generation: 1,
         status, restarts: 0, lastExitCode: null, startedAt: 'T',
-        processStart: readDurableProcessIdentity(orphan.pid!) }],
+        processStart: readFleetDurableProcessIdentity(orphan.pid!) }],
     }));
     const sup = new FleetSupervisor({ statePath, distDir, daemonEnv: {}, cwd: root, killTimeoutMs: 50, log: () => {} });
     try {
@@ -259,7 +272,7 @@ console.log('daemon pid=' + process.pid);
       supervisorPid: 999_999, supervisorStartedAt: 'prior',
       procs: [{ name: 'botmux-plugin-removed', appId: '', pid: orphan.pid!, generation: 1,
         status, restarts: 0, lastExitCode: null, startedAt: 'T',
-        processStart: readDurableProcessIdentity(orphan.pid!) }],
+        processStart: readFleetDurableProcessIdentity(orphan.pid!) }],
     }));
     const sup = new FleetSupervisor({ statePath, distDir: '', daemonEnv: {}, cwd: root, killTimeoutMs: 50, log: () => {} });
     const signals = vi.spyOn(process, 'kill');
@@ -280,7 +293,7 @@ console.log('daemon pid=' + process.pid);
       supervisorPid: 0, supervisorStartedAt: 'prior',
       procs: [{ name: 'botmux-plugin-recycled', appId: '', pid: unrelated.pid!, generation: 1,
         status, restarts: 0, lastExitCode: null, startedAt: 'T',
-        processStart: 'utc:Thu Jan 01 00:00:00 1970' }],
+        processStart: differentStableIdentity(unrelated.pid!) }],
     }));
     const logs: string[] = [];
     const sup = new FleetSupervisor({ statePath, distDir: '', daemonEnv: {}, cwd: root, killTimeoutMs: 50, log: m => logs.push(m) });
@@ -302,79 +315,156 @@ console.log('daemon pid=' + process.pid);
     } finally { signals.mockRestore(); await sup.stopAll(); }
   });
 
-  it('keeps a live non-daemon row fail-closed when an untagged legacy lstart drifts across timezones', async () => {
+  it('keeps a legacy macOS lstart row fail-closed across timezone rendering changes', async () => {
     const root = tmp(); const statePath = join(root, 'fleet.json');
-    const orphan = await spawnReadyOrphan(['-e', `console.log('daemon pid=' + process.pid); setInterval(() => {}, 1000);`]);
+    const unrelated = await spawnReadyOrphan(['-e', `console.log('daemon pid=' + process.pid); setInterval(() => {}, 1000);`]);
+    const recorded = 'Fri Nov 27 20:00:00 2026';
+    const afterZoneChange = 'Fri Nov 27 12:00:00 2026';
+    const platform = vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin');
+    const runtime = {
+      ...fleetProcessIdentityRuntime,
+      readIdentity: (pid: number, recordedProcessStart?: string) => pid === unrelated.pid
+        ? afterZoneChange
+        : fleetProcessIdentityRuntime.readIdentity(pid, recordedProcessStart),
+    };
     mutateFleetState(statePath, () => ({
       supervisorPid: 0, supervisorStartedAt: 'prior',
-      procs: [{ name: 'botmux-plugin-tz', appId: '', pid: orphan.pid!, generation: 1,
-        status: 'online', restarts: 0, lastExitCode: null, startedAt: 'T',
-        processStart: 'Fri Nov 27 19:32:34 2026' }],
+      procs: [{ name: 'botmux-plugin-legacy-zone', appId: '', pid: unrelated.pid!, generation: 1,
+        status: 'online', restarts: 0, lastExitCode: null, startedAt: 'T', processStart: recorded }],
     }));
-    const sup = new FleetSupervisor({
-      statePath, distDir: '', daemonEnv: {}, cwd: root, killTimeoutMs: 50, log: () => {},
-      processIdentityRuntime: {
-        ...fleetProcessIdentityRuntime,
-        readIdentity: pid => pid === orphan.pid ? 'Sat Nov 28 03:32:34 2026' : fleetProcessIdentityRuntime.readIdentity(pid),
-      },
-    });
+    const sup = new FleetSupervisor({ statePath, distDir: '', daemonEnv: {}, cwd: root, killTimeoutMs: 20,
+      log: () => {}, processIdentityRuntime: runtime });
     const signals = vi.spyOn(process, 'kill');
     try {
       sup.start([]);
-      await delay(100);
-      expect(signals.mock.calls.filter(([pid, signal]) => pid === orphan.pid && signal !== 0)).toEqual([]);
-      expect(pidAlive(orphan.pid!)).toBe(true);
-      expect(readFleetState(statePath)!.procs).toMatchObject([{ name: 'botmux-plugin-tz', status: 'launching', pid: orphan.pid }]);
       await expect(sup.upsertExternal({
-        name: 'botmux-plugin-tz', appId: '', botIndex: -1,
+        name: 'botmux-plugin-legacy-zone', appId: '', botIndex: -1,
         external: { command: process.execPath, args: ['-e', 'setInterval(() => {}, 1000);'] },
-      })).rejects.toThrow(/failed to start/);
-      expect(pidAlive(orphan.pid!)).toBe(true);
-    } finally { signals.mockRestore(); await sup.stopAll(); }
+      })).rejects.toThrow('failed to start');
+      expect(readFleetState(statePath)!.procs).toMatchObject([
+        { name: 'botmux-plugin-legacy-zone', status: 'launching', pid: unrelated.pid, processStart: recorded },
+      ]);
+      expect(pidAlive(unrelated.pid!)).toBe(true);
+      expect(signals.mock.calls.filter(([pid, signal]) => pid === unrelated.pid && signal !== 0)).toEqual([]);
+    } finally {
+      signals.mockRestore();
+      try { await sup.stopAll(); } finally { platform.mockRestore(); }
+    }
   });
 
-  it('allows direct upsertExternal to spawn past a persisted recycled pid without prior start()', async () => {
+  it('pins both synchronous start reconciliation guards independently', () => {
+    const proc = { pid: 61, status: 'online' as const, processStart: 'lstart-utc-v1:before' };
+    const runtime = {
+      readIdentity: () => 'lstart-utc-v1:after',
+      readCommandLine: () => undefined,
+      readPidNamespace: () => undefined,
+      pidExists: () => true,
+    };
+    expect(shouldRetainFleetProcAtStart(proc, {
+      namedSpec: false, matchingSpec: false, ownedOrRetiring: true,
+    }, runtime)).toBe(false);
+    expect(shouldMarkFleetProcStoppedAtStart(proc, runtime)).toBe(true);
+
+    const sameGeneration = { ...runtime, readIdentity: () => proc.processStart };
+    expect(shouldRetainFleetProcAtStart(proc, {
+      namedSpec: false, matchingSpec: false, ownedOrRetiring: true,
+    }, sameGeneration)).toBe(true);
+    expect(shouldMarkFleetProcStoppedAtStart(proc, sameGeneration)).toBe(false);
+  });
+
+  it('pins the removed stale-process retirement guard independently', () => {
+    const proc = { pid: 61, processStart: 'lstart-utc-v1:before' };
+    const recycled = {
+      readIdentity: () => 'lstart-utc-v1:after',
+      readCommandLine: () => undefined,
+      readPidNamespace: () => undefined,
+      pidExists: () => true,
+    };
+    expect(shouldBlockRemovedStaleProcess(proc, { status: 'stale' }, true, recycled)).toBe(false);
+    const sameGeneration = { ...recycled, readIdentity: () => proc.processStart };
+    expect(shouldBlockRemovedStaleProcess(proc, { status: 'stale' }, true, sameGeneration)).toBe(true);
+  });
+
+  it('does not treat a mixed legacy/current identity reading as PID reuse', () => {
+    const platform = vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin');
+    try {
+      const proc = { pid: 61, status: 'online' as const, processStart: 'lstart-utc-v1:before' };
+      const runtime = {
+        readIdentity: () => 'Fri Nov 27 12:00:00 2026',
+        readCommandLine: () => undefined,
+        readPidNamespace: () => undefined,
+        pidExists: () => true,
+      };
+      expect(shouldRetainFleetProcAtStart(proc, {
+        namedSpec: false, matchingSpec: false, ownedOrRetiring: true,
+      }, runtime)).toBe(true);
+      expect(shouldMarkFleetProcStoppedAtStart(proc, runtime)).toBe(false);
+    } finally { platform.mockRestore(); }
+  });
+
+  it('pins the legacy recorded-identity guard independently of the current format', () => {
+    const platform = vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin');
+    try {
+      const proc = { pid: 61, status: 'online' as const, processStart: 'Fri Nov 27 20:00:00 2026' };
+      const runtime = {
+        readIdentity: () => 'lstart-utc-v1:Fri Nov 27 12:00:00 2026',
+        readCommandLine: () => undefined,
+        readPidNamespace: () => undefined,
+        pidExists: () => true,
+      };
+      expect(shouldRetainFleetProcAtStart(proc, {
+        namedSpec: false, matchingSpec: false, ownedOrRetiring: true,
+      }, runtime)).toBe(true);
+      expect(shouldMarkFleetProcStoppedAtStart(proc, runtime)).toBe(false);
+    } finally { platform.mockRestore(); }
+  });
+
+  it('starts over a recycled row left by a failed retirement completion write', async () => {
     const root = tmp(); const statePath = join(root, 'fleet.json');
     const unrelated = await spawnReadyOrphan(['-e', `console.log('daemon pid=' + process.pid); setInterval(() => {}, 1000);`]);
-    mutateFleetState(statePath, () => ({
-      supervisorPid: 0, supervisorStartedAt: 'prior',
-      procs: [{ name: 'botmux-plugin-direct', appId: '', pid: unrelated.pid!, generation: 1,
-        status: 'launching', restarts: 0, lastExitCode: null, startedAt: 'T',
-        processStart: 'utc:Thu Jan 01 00:00:00 1970' }],
-    }));
-    const sup = new FleetSupervisor({ statePath, distDir: '', daemonEnv: {}, cwd: root, killTimeoutMs: 50, log: () => {} });
-    const signals = vi.spyOn(process, 'kill');
+    const sup = new FleetSupervisor({ statePath, distDir: '', daemonEnv: {}, cwd: root, killTimeoutMs: 20, log: () => {} });
     try {
+      sup.start([]);
+      // Model the durable half-write directly: retirement admission is durable,
+      // but its terminal write failed, leaving the old live PID for spawnBot.
+      mutateFleetState(statePath, cur => {
+        cur.procs.push({ name: 'botmux-plugin-half-write', appId: '', pid: unrelated.pid!, generation: 1,
+          status: 'launching', restarts: 0, lastExitCode: null, startedAt: 'T',
+          processStart: differentStableIdentity(unrelated.pid!) });
+        return cur;
+      });
       await sup.upsertExternal({
-        name: 'botmux-plugin-direct', appId: '', botIndex: -1,
+        name: 'botmux-plugin-half-write', appId: '', botIndex: -1,
         external: { command: process.execPath, args: ['-e', 'setInterval(() => {}, 1000);'] },
       });
-      const row = readFleetState(statePath)!.procs.find(p => p.name === 'botmux-plugin-direct');
-      expect(row?.status).toBe('online');
-      expect(row?.pid).toBeGreaterThan(1);
-      expect(row?.pid).not.toBe(unrelated.pid);
-      expect(signals.mock.calls.filter(([pid, signal]) => pid === unrelated.pid && signal !== 0)).toEqual([]);
+      expect(readFleetState(statePath)!.procs).toMatchObject([
+        { name: 'botmux-plugin-half-write', status: 'online' },
+      ]);
+      expect(readFleetState(statePath)!.procs[0].pid).not.toBe(unrelated.pid);
       expect(pidAlive(unrelated.pid!)).toBe(true);
-    } finally { signals.mockRestore(); await sup.stopAll(); }
+    } finally { await sup.stopAll(); }
   });
 
-  it('clears a persisted recycled pid row on stopAll without signaling the unrelated process', async () => {
+  it('does not retain a recycled unowned row across stopAll', async () => {
     const root = tmp(); const statePath = join(root, 'fleet.json');
     const unrelated = await spawnReadyOrphan(['-e', `console.log('daemon pid=' + process.pid); setInterval(() => {}, 1000);`]);
-    mutateFleetState(statePath, () => ({
-      supervisorPid: 0, supervisorStartedAt: 'prior',
-      procs: [{ name: 'botmux-plugin-stopall', appId: '', pid: unrelated.pid!, generation: 1,
-        status: 'launching', restarts: 0, lastExitCode: null, startedAt: 'T',
-        processStart: 'utc:Thu Jan 01 00:00:00 1970' }],
-    }));
-    const sup = new FleetSupervisor({ statePath, distDir: '', daemonEnv: {}, cwd: root, killTimeoutMs: 50, log: () => {} });
+    const sup = new FleetSupervisor({ statePath, distDir: '', daemonEnv: {}, cwd: root, killTimeoutMs: 20, log: () => {} });
     const signals = vi.spyOn(process, 'kill');
     try {
+      sup.start([]);
+      mutateFleetState(statePath, cur => {
+        cur.procs.push({ name: 'botmux-plugin-shutdown', appId: '', pid: unrelated.pid!, generation: 1,
+          status: 'online', restarts: 0, lastExitCode: null, startedAt: 'T',
+          processStart: differentStableIdentity(unrelated.pid!) });
+        return cur;
+      });
       await sup.stopAll();
-      expect(readFleetState(statePath)!.procs).toMatchObject([{ name: 'botmux-plugin-stopall', status: 'stopped', pid: 0 }]);
-      expect(signals.mock.calls.filter(([pid, signal]) => pid === unrelated.pid && signal !== 0)).toEqual([]);
+      expect(readFleetState(statePath)!.procs).toMatchObject([
+        { name: 'botmux-plugin-shutdown', status: 'stopped', pid: 0 },
+      ]);
       expect(pidAlive(unrelated.pid!)).toBe(true);
-    } finally { signals.mockRestore(); }
+      expect(signals.mock.calls.filter(([pid, signal]) => pid === unrelated.pid && signal !== 0)).toEqual([]);
+    } finally { signals.mockRestore(); await sup.stopAll(); }
   });
 
   it('reclaims every live alias after a hard supervisor death and rename', async () => {
@@ -1064,12 +1154,12 @@ ${STAY}`;
     mutateFleetState(statePath, () => ({
       supervisorPid: owner.pid!,
       supervisorStartedAt: 'T-owner',
-      supervisorProcessStart: readDurableProcessIdentity(owner.pid!),
+      supervisorProcessStart: readFleetDurableProcessIdentity(owner.pid!),
       supervisorPidNamespace: fleetProcessIdentityRuntime.readPidNamespace(owner.pid!),
       supervisorCommand: fleetProcessIdentityRuntime.readCommandLine(owner.pid!),
       procs: [{
         name: 'botmux-0', appId: 'cli_a', pid: ownersDaemon.pid!, generation: 1, status: 'online',
-        processStart: readDurableProcessIdentity(ownersDaemon.pid!),
+        processStart: readFleetDurableProcessIdentity(ownersDaemon.pid!),
         restarts: 0, lastExitCode: null, startedAt: 'T',
       }],
     }));
@@ -1135,7 +1225,7 @@ setInterval(() => {}, 1000);
       procs: [{
         name: 'botmux-0', appId: 'cli_a', pid: orphan.pid!, generation: 1, status: 'online',
         restarts: 0, lastExitCode: null, startedAt: 'T',
-        processStart: readDurableProcessIdentity(orphan.pid!),
+        processStart: readFleetDurableProcessIdentity(orphan.pid!),
       }],
     }));
 
@@ -1166,7 +1256,7 @@ setInterval(() => {}, 1000);
       procs: [{
         name: 'botmux-0', appId: 'cli_a', pid: orphan.pid!, generation: 1, status: 'online',
         restarts: 0, lastExitCode: null, startedAt: 'T',
-        processStart: readDurableProcessIdentity(orphan.pid!),
+        processStart: readFleetDurableProcessIdentity(orphan.pid!),
       }],
     }));
 

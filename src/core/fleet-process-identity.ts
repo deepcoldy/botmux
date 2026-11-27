@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, readlinkSync } from 'node:fs';
-import { durableProcessIdentityMatches, readDurableProcessIdentity } from '../utils/process-identity.js';
+import { readFleetDurableProcessIdentity } from '../utils/process-identity.js';
 import { pidNotProvablyGone } from '../utils/process-alive.js';
 import type { FleetState } from './fleet-supervisor-policy.js';
 import type { BotmuxEntry } from './self-spawn.js';
@@ -14,7 +14,7 @@ export interface FleetProcessAttestation {
 }
 
 export interface FleetProcessIdentityRuntime {
-  readIdentity(pid: number): string | undefined;
+  readIdentity(pid: number, recordedProcessStart?: string): string | undefined;
   readCommandLine(pid: number): string | undefined;
   readPidNamespace(pid: number): string | undefined;
   pidExists(pid: number): boolean;
@@ -98,7 +98,7 @@ export function readFleetProcessCommandLine(pid: number): string | undefined {
 }
 
 export const fleetProcessIdentityRuntime: FleetProcessIdentityRuntime = {
-  readIdentity: readDurableProcessIdentity,
+  readIdentity: readFleetDurableProcessIdentity,
   readCommandLine: readFleetProcessCommandLine,
   readPidNamespace(pid): string | undefined {
     if (process.platform !== 'linux') return undefined;
@@ -124,10 +124,8 @@ export function inspectFleetProcess(
   verifyPersistedCommand = true,
 ): FleetProcessInspection {
   if (!Number.isSafeInteger(pid) || pid <= 1) return { status: 'stale' };
-  const first = runtime.readIdentity(pid);
-  if (recordedProcessStart && first && !durableProcessIdentityMatches(pid, recordedProcessStart, first)) {
-    return { status: 'stale' };
-  }
+  const first = runtime.readIdentity(pid, recordedProcessStart);
+  if (recordedProcessStart && first && first !== recordedProcessStart) return { status: 'stale' };
   const pidNamespace = runtime.readPidNamespace(pid);
   if (recordedPidNamespace && pidNamespace && pidNamespace !== recordedPidNamespace) return { status: 'stale' };
   if (!first || (recordedPidNamespace && !pidNamespace)) {
@@ -140,7 +138,7 @@ export function inspectFleetProcess(
     return runtime.pidExists(pid) ? { status: 'unverifiable' } : { status: 'stale' };
   }
   if (commandLine !== undefined && !legacyCommandMatches(commandLine)) return { status: 'stale' };
-  const second = runtime.readIdentity(pid);
+  const second = runtime.readIdentity(pid, first);
   if (!second) return runtime.pidExists(pid) ? { status: 'unverifiable' } : { status: 'stale' };
   return first === second
     ? {
@@ -190,7 +188,7 @@ export function captureFleetProcessIdentity(
   if (!first) return null;
   const pidNamespace = runtime.readPidNamespace(pid);
   const commandLine = runtime.readCommandLine(pid);
-  const second = runtime.readIdentity(pid);
+  const second = runtime.readIdentity(pid, first);
   if (!second || second !== first) return null;
   return {
     pid,
@@ -205,14 +203,14 @@ export function signalAttestedFleetProcess(
   signal: NodeJS.Signals,
   runtime: FleetProcessIdentityRuntime = fleetProcessIdentityRuntime,
 ): boolean {
-  if (runtime.readIdentity(target.pid) !== target.processStart) return false;
+  if (runtime.readIdentity(target.pid, target.processStart) !== target.processStart) return false;
   if (target.pidNamespace && runtime.readPidNamespace(target.pid) !== target.pidNamespace) return false;
   if (target.commandLine !== undefined && runtime.readCommandLine(target.pid) !== target.commandLine) return false;
   // Narrow the remaining PID-reuse window once more after the command read. A
   // true atomic guarantee would require pidfd (not exposed by Node/Bun); this
   // second generation check prevents a replacement during either read from
   // inheriting the signal.
-  if (runtime.readIdentity(target.pid) !== target.processStart) return false;
+  if (runtime.readIdentity(target.pid, target.processStart) !== target.processStart) return false;
   if (target.pidNamespace && runtime.readPidNamespace(target.pid) !== target.pidNamespace) return false;
   try {
     process.kill(target.pid, signal);

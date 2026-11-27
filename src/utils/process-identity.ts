@@ -5,47 +5,49 @@ import { procStatStartTime } from './proc-stat.js';
 
 const LINUX_BOOT_ID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const LINUX_DURABLE_IDENTITY_RE =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:\d+$/i;
-const WINDOWS_DURABLE_IDENTITY_RE = /^\d+$/;
-const POSIX_UTC_DURABLE_PREFIX = 'utc:';
 
-/** True only for durable birth identities whose value cannot drift when host timezone changes. */
-export function isTimezoneStableProcessIdentity(identity: string | undefined): boolean {
-  if (!identity) return false;
-  return identity.startsWith(POSIX_UTC_DURABLE_PREFIX)
-    || LINUX_DURABLE_IDENTITY_RE.test(identity)
-    || WINDOWS_DURABLE_IDENTITY_RE.test(identity);
-}
+/** Fleet-only wire format: `ps lstart` rendered in UTC, not the host's zone. */
+export const FLEET_LSTART_UTC_V1_PREFIX = 'lstart-utc-v1:';
 
-/** Match a live durable identity against a recorded one, preserving rolling-upgrade compatibility
- *  for pre-UTC macOS/POSIX rows that still store an untagged local-timezone `lstart` string. */
-export function durableProcessIdentityMatches(
-  pid: number,
-  recorded: string | undefined,
-  current: string | undefined,
-): boolean {
-  if (!recorded || !current) return false;
-  if (current === recorded) return true;
-  if (process.platform !== 'linux' && process.platform !== 'win32'
-    && current.startsWith(POSIX_UTC_DURABLE_PREFIX)
-    && !isTimezoneStableProcessIdentity(recorded)) {
-    return readProcessStartIdentity(pid) === recorded;
-  }
-  return false;
-}
-
-/** Identity suitable for durable process ownership, including across reboots and timezone changes. */
+/** Identity suitable for durable process ownership, including across reboots. */
 export function readDurableProcessIdentity(pid: number): string | undefined {
-  if (process.platform === 'linux') {
-    const started = readProcessStartIdentity(pid);
-    if (!started) return undefined;
-    const boot = readLinuxBootIdentity();
-    return boot ? `${boot}:${started}` : undefined;
+  const started = readProcessStartIdentity(pid);
+  if (!started) return undefined;
+  if (process.platform !== 'linux') return started;
+  const boot = readLinuxBootIdentity();
+  return boot ? `${boot}:${started}` : undefined;
+}
+
+/**
+ * Fleet state adds a versioned, timezone-stable POSIX format without changing
+ * the other durable lease/session protocols that use the function above.
+ *
+ * A recorded legacy `lstart` must be read with the legacy renderer as well:
+ * otherwise every live macOS fleet member would look stale immediately after
+ * upgrade. Callers doing a fresh write omit `recordedIdentity`.
+ */
+export function readFleetDurableProcessIdentity(
+  pid: number,
+  recordedIdentity?: string,
+): string | undefined {
+  if (process.platform === 'linux' || process.platform === 'win32') {
+    return readDurableProcessIdentity(pid);
   }
-  if (process.platform === 'win32') return readProcessStartIdentity(pid);
-  const started = readPosixProcessStart(pid, 'UTC0');
-  return started ? `${POSIX_UTC_DURABLE_PREFIX}${started}` : undefined;
+  if (recordedIdentity && !recordedIdentity.startsWith(FLEET_LSTART_UTC_V1_PREFIX)) {
+    return readDurableProcessIdentity(pid);
+  }
+  const started = readPosixProcessStartIdentity(pid, 'UTC0');
+  return started ? `${FLEET_LSTART_UTC_V1_PREFIX}${started}` : undefined;
+}
+
+/** Only stable fleet identity formats may prove that a live PID was recycled. */
+export function canFleetIdentityProvePidReuse(
+  identity: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  if (platform === 'linux' || platform === 'win32') return true;
+  return identity.startsWith(FLEET_LSTART_UTC_V1_PREFIX)
+    && identity.length > FLEET_LSTART_UTC_V1_PREFIX.length;
 }
 
 /** A zombie cannot run code or hold service ports, even though kill(0) succeeds. */
@@ -104,10 +106,10 @@ export function readProcessStartIdentity(pid: number): string | undefined {
       return undefined;
     }
   }
-  return readPosixProcessStart(pid);
+  return readPosixProcessStartIdentity(pid);
 }
 
-function readPosixProcessStart(pid: number, tz?: string): string | undefined {
+function readPosixProcessStartIdentity(pid: number, timeZone?: 'UTC0'): string | undefined {
   if (!Number.isSafeInteger(pid) || pid <= 1) return undefined;
   const ps = systemPsBin();
   if (!ps) return undefined;
@@ -119,7 +121,7 @@ function readPosixProcessStart(pid: number, tz?: string): string | undefined {
         encoding: 'utf-8',
         timeout: 2_000,
         stdio: ['ignore', 'pipe', 'ignore'],
-        env: { PATH: '/usr/bin:/bin', LANG: 'C', ...(tz ? { TZ: tz } : {}) },
+        env: { PATH: '/usr/bin:/bin', LANG: 'C', ...(timeZone ? { TZ: timeZone } : {}) },
       },
     ).trim();
     return started || undefined;

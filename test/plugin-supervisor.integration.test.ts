@@ -1,6 +1,6 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -18,6 +18,7 @@ import { readFleetState } from '../src/core/fleet-state-store.js';
 import {
   inspectFleetProcess, inspectSupervisorState, signalAttestedFleetProcess,
 } from '../src/core/fleet-process-identity.js';
+import { readFleetDurableProcessIdentity } from '../src/utils/process-identity.js';
 import { pidAlive } from '../src/core/fleet-supervisor.js';
 import { userSystemdBusEnv } from '../src/core/session-scope.js';
 
@@ -446,7 +447,7 @@ describe('plugin services on the built-in supervisor', () => {
 
   it('recovers and starts a plugin service when its persisted pid was recycled by an unrelated process', async () => {
     fixture('recycled', { auto: true });
-    const unrelated = spawn(process.execPath, ['-e', 'console.log("ready"); setInterval(() => {}, 1000);'], {
+    const unrelated = spawn(process.execPath, ['-e', `console.log('ready'); setInterval(() => {}, 1000);`], {
       stdio: ['ignore', 'pipe', 'ignore'],
     });
     try {
@@ -457,8 +458,11 @@ describe('plugin services on the built-in supervisor', () => {
           output += chunk.toString();
           if (output.includes('ready')) { clearTimeout(timer); resolve(); }
         });
+        unrelated.once('error', error => { clearTimeout(timer); reject(error); });
         unrelated.once('exit', () => { clearTimeout(timer); reject(new Error('unrelated fixture exited before ready')); });
       });
+      const currentIdentity = readFleetDurableProcessIdentity(unrelated.pid!);
+      if (!currentIdentity) throw new Error('cannot read unrelated fixture identity');
       mkdirSync(join(home, '.botmux', 'plugin-supervisor'), { recursive: true });
       writeFileSync(pluginSupervisorStatePath(), JSON.stringify({
         supervisorPid: 0,
@@ -466,13 +470,13 @@ describe('plugin services on the built-in supervisor', () => {
         procs: [{
           name: 'botmux-plugin-recycled',
           appId: '',
-          pid: unrelated.pid!,
+          pid: unrelated.pid,
           generation: 1,
           status: 'online',
           restarts: 0,
           lastExitCode: null,
           startedAt: '2026-01-01T00:00:00.000Z',
-          processStart: 'utc:Thu Jan 01 00:00:00 1970',
+          processStart: `${currentIdentity}:recycled`,
         }],
       }));
       const reports = await startPluginServices(['recycled']);
@@ -482,6 +486,8 @@ describe('plugin services on the built-in supervisor', () => {
       expect(proc('recycled')!.pid).not.toBe(unrelated.pid);
       expect(pidAlive(unrelated.pid!)).toBe(true);
     } finally {
+      // Never persist the test runner's PID: even a failed start leaves teardown
+      // with only this dedicated fixture child, never process.kill(process.pid).
       if (unrelated.exitCode === null && unrelated.signalCode === null) {
         const exited = once(unrelated, 'exit');
         unrelated.kill('SIGKILL');

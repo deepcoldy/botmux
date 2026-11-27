@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
-import { durableProcessIdentityMatches, isLinuxZombie, readDurableProcessIdentity } from '../../utils/process-identity.js';
+import { isLinuxZombie, readFleetDurableProcessIdentity } from '../../utils/process-identity.js';
 import { scrubExternalMemberEnv } from '../../utils/child-env.js';
 import { pidNotProvablyGone } from '../../utils/process-alive.js';
 import { signalAttestedFleetProcess } from '../fleet-process-identity.js';
@@ -62,7 +62,7 @@ export function readPluginProcesses(): PluginProcessInfo[] {
         status: proc.status === 'online' ? 'stopped' : proc.status,
         configHash: proc?.configHash,
       };
-    } else if (!proc.processStart || durableProcessIdentityMatches(proc.pid, proc.processStart, readDurableProcessIdentity(proc.pid))) {
+    } else if (!proc.processStart || readFleetDurableProcessIdentity(proc.pid, proc.processStart) === proc.processStart) {
       info = {
         name: proc.name,
         pid: proc.pid,
@@ -105,7 +105,7 @@ export function readPluginProcesses(): PluginProcessInfo[] {
 function supervisorAlive(): boolean {
   const result = readPluginSupervisorResult();
   return !!result && pidAlive(result.pid) && !!result.processStart
-    && durableProcessIdentityMatches(result.pid, result.processStart, readDurableProcessIdentity(result.pid));
+    && readFleetDurableProcessIdentity(result.pid, result.processStart) === result.processStart;
 }
 
 function supervisorProcessExited(pid: number): boolean {
@@ -114,10 +114,10 @@ function supervisorProcessExited(pid: number): boolean {
 
 function assertSupervisorIdentity(result: PluginSupervisorResult) {
   if (!result.processStart) throw new Error(`plugin_supervisor_identity_unknown:${result.pid}`);
-  const identity = readDurableProcessIdentity(result.pid);
+  const identity = readFleetDurableProcessIdentity(result.pid, result.processStart);
   if (!identity) throw new Error(`plugin_supervisor_identity_unknown:${result.pid}`);
-  if (!durableProcessIdentityMatches(result.pid, result.processStart, identity)) throw new Error(`plugin_supervisor_identity_mismatch:${result.pid}`);
-  return identity;
+  if (identity !== result.processStart) throw new Error(`plugin_supervisor_identity_mismatch:${result.pid}`);
+  return result.processStart;
 }
 
 function assertSupervisorOwner(result: PluginSupervisorResult) {
@@ -125,7 +125,7 @@ function assertSupervisorOwner(result: PluginSupervisorResult) {
   const state = readPluginSupervisorState();
   if (state?.supervisorPid !== result.pid) throw new Error(`plugin_supervisor_identity_mismatch:${result.pid}`);
   if (!state.supervisorProcessStart) throw new Error(`plugin_supervisor_identity_unknown:${result.pid}`);
-  if (!durableProcessIdentityMatches(result.pid, state.supervisorProcessStart, identity)) throw new Error(`plugin_supervisor_identity_mismatch:${result.pid}`);
+  if (state.supervisorProcessStart !== identity) throw new Error(`plugin_supervisor_identity_mismatch:${result.pid}`);
   return identity;
 }
 
@@ -162,10 +162,10 @@ export async function shutdownPluginSupervisor(): Promise<void> {
   const initialExited = supervisorProcessExited(initial.pid);
   if (durableStateComplete()) {
     if (initialExited) return;
-    const currentIdentity = readDurableProcessIdentity(initial.pid);
+    const currentIdentity = readFleetDurableProcessIdentity(initial.pid, initial.processStart);
     // A completed state makes a retained result stale. A live PID is safe to
     // ignore only when its birth proves that it belongs to a different process.
-    if (initial.processStart && currentIdentity && !durableProcessIdentityMatches(initial.pid, initial.processStart, currentIdentity)) return;
+    if (initial.processStart && currentIdentity && currentIdentity !== initial.processStart) return;
   }
   if (initialExited) {
     assertComplete();

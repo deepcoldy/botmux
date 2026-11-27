@@ -5,10 +5,6 @@ import {
   signalAttestedFleetProcess,
   type FleetProcessIdentityRuntime,
 } from '../src/core/fleet-process-identity.js';
-import {
-  isTimezoneStableProcessIdentity,
-  readDurableProcessIdentity,
-} from '../src/utils/process-identity.js';
 
 function runtime(identities: Array<string | undefined>, commands: Array<string | undefined>): FleetProcessIdentityRuntime {
   return {
@@ -141,6 +137,22 @@ describe('fleet process identity', () => {
     expect(kill).toHaveBeenCalledWith(61, 'SIGTERM');
   });
 
+  it('uses a recorded legacy format for both inspection and signal attestation', () => {
+    const legacy = 'Fri Nov 27 19:32:34 2026';
+    const deps: FleetProcessIdentityRuntime = {
+      readIdentity: (_pid, recorded) => recorded === legacy ? legacy : 'lstart-utc-v1:Fri Nov 27 11:32:34 2026',
+      readCommandLine: () => '/opt/botmux __supervisor',
+      readPidNamespace: () => undefined,
+      pidExists: () => true,
+    };
+    expect(inspectFleetProcess(61, legacy, undefined, () => true, deps, false)).toEqual({
+      status: 'exact', attestation: { pid: 61, processStart: legacy },
+    });
+    const kill = vi.spyOn(process, 'kill').mockImplementation((() => true) as typeof process.kill);
+    expect(signalAttestedFleetProcess({ pid: 61, processStart: legacy }, 'SIGTERM', deps)).toBe(true);
+    expect(kill).toHaveBeenCalledWith(61, 'SIGTERM');
+  });
+
   it('propagates permission errors instead of treating a verified process as gone', () => {
     vi.spyOn(process, 'kill').mockImplementation(() => {
       throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' });
@@ -150,29 +162,5 @@ describe('fleet process identity', () => {
       'SIGTERM',
       runtime(['boot-a:123', 'boot-a:123'], ['/opt/botmux __supervisor']),
     )).toThrow(/operation not permitted/);
-  });
-
-  it('distinguishes timezone-stable durable identities from untagged legacy lstart strings', () => {
-    expect(isTimezoneStableProcessIdentity('utc:Fri Nov 27 19:32:34 2026')).toBe(true);
-    expect(isTimezoneStableProcessIdentity('550e8400-e29b-41d4-a716-446655440000:12345')).toBe(true);
-    expect(isTimezoneStableProcessIdentity('638683423540000000')).toBe(true);
-    expect(isTimezoneStableProcessIdentity('Fri Nov 27 19:32:34 2026')).toBe(false);
-    expect(isTimezoneStableProcessIdentity(undefined)).toBe(false);
-  });
-
-  it('produces a timezone-stable durable identity for the current process across TZ changes', () => {
-    const prevTz = process.env.TZ;
-    try {
-      process.env.TZ = 'UTC0';
-      const inUtc = readDurableProcessIdentity(process.pid);
-      process.env.TZ = 'Asia/Shanghai';
-      const inShanghai = readDurableProcessIdentity(process.pid);
-      expect(inUtc).toBeTruthy();
-      expect(inShanghai).toBe(inUtc);
-      expect(isTimezoneStableProcessIdentity(inUtc)).toBe(true);
-    } finally {
-      if (prevTz === undefined) delete process.env.TZ;
-      else process.env.TZ = prevTz;
-    }
   });
 });
