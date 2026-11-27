@@ -19899,6 +19899,17 @@ function codexBridgeNotifyCliSessionId(
         codexBridgeStartTimer();
       }
     }
+    if (structuredBridgeIs('nca')) {
+      // The adapter observed this input in a writer owned by this NCA process.
+      const next = resolveFileBridgePath('nca', { sessionId: cliSessionId, cwd: lastInitConfig?.workingDir });
+      if (next && next !== codexBridgeRolloutPath) {
+        codexBridgeIngest();
+        emitReadyCodexTurns();
+        codexBridgeDetachFile();
+        codexBridgePendingSessionId = undefined;
+        codexBridgeAttach(next, 'fresh-empty');
+      }
+    }
     if (!structuredBridgeIs('antigravity')) return;
   }
   if (structuredBridgeIs('mtr')) {

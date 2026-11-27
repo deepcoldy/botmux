@@ -118,10 +118,22 @@ export function localCliCommandForSession(ds: DaemonSession): LocalCliCommandRes
     return { ok: false, error: 'adapter_error', cliId: cfg.cliId, detail: err instanceof Error ? err.message : String(err) };
   }
 
-  const rawResume = adapter.buildResumeCommand?.({
-    sessionId: ds.session.sessionId,
-    cliSessionId: ds.session.cliSessionId,
-  }) ?? null;
+  let rawResume: string | null;
+  try {
+    rawResume = adapter.buildResumeCommand?.({
+      sessionId: ds.session.sessionId,
+      cliSessionId: ds.session.cliSessionId,
+    }) ?? null;
+  } catch (err) {
+    // Adapter configuration error (e.g. an NCA home resolving to the filesystem
+    // root). Surface it instead of falling through to a silent fresh launch.
+    return {
+      ok: false,
+      error: 'adapter_error',
+      cliId: cfg.cliId,
+      detail: err instanceof Error ? err.message : String(err),
+    };
+  }
 
   if (rawResume) {
     const decorated = cfg.cliLaunchMode

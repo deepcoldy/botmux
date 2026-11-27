@@ -22,6 +22,7 @@ export interface BuildExternalBotmuxCommandInput {
   args: string[];
   baseEnv: NodeJS.ProcessEnv;
   pathEnv?: string;
+  extraEnv?: NodeJS.ProcessEnv;
 }
 
 export interface BuildBundledBotmuxCommandInput {
@@ -33,6 +34,7 @@ export interface BuildBundledBotmuxCommandInput {
   baseEnv: NodeJS.ProcessEnv;
   /** Probed user shell PATH (zsh/bash, profile+rc) — see probeShellPathEnv. */
   pathEnv?: string;
+  extraEnv?: NodeJS.ProcessEnv;
 }
 
 export function buildBotmuxCommand(input: BuildBotmuxCommandInput): BotmuxCommand {
@@ -51,6 +53,7 @@ export function buildBotmuxCommand(input: BuildBotmuxCommandInput): BotmuxComman
 export function buildBundledBotmuxCommand(input: BuildBundledBotmuxCommandInput): BotmuxCommand {
   const env: NodeJS.ProcessEnv = {
     ...input.baseEnv,
+    ...input.extraEnv,
     // Finder-launched apps only carry launchd's minimal PATH. The daemon this
     // command starts must still find per-bot CLIs (claude/codex/traex/... via
     // nvm/fnm/homebrew) and a `node` for their `#!/usr/bin/env node` shebangs,
@@ -61,6 +64,10 @@ export function buildBundledBotmuxCommand(input: BuildBundledBotmuxCommandInput)
     SESSION_DATA_DIR: join(input.botmuxHome, 'data'),
   };
   delete env.ELECTRON_RUN_AS_NODE;
+  // Desktop is a host-level controller, never a managed bot session; strip any
+  // inherited session marker so CLI start/restart does not silently switch to
+  // managed-session env refresh semantics.
+  delete env.BOTMUX_SESSION_ID;
 
   return {
     command: input.nodePath,
@@ -72,12 +79,14 @@ export function buildBundledBotmuxCommand(input: BuildBundledBotmuxCommandInput)
 export function buildExternalBotmuxCommand(input: BuildExternalBotmuxCommandInput): BotmuxCommand {
   const env: NodeJS.ProcessEnv = {
     ...input.baseEnv,
+    ...input.extraEnv,
     // External CLI bins often use /usr/bin/env node; Finder-launched apps have
     // a small PATH, so put the bin's directory first before invoking it.
     PATH: buildExternalPath(input.baseEnv.PATH, input.binPath, input.pathEnv),
     SESSION_DATA_DIR: join(input.botmuxHome, 'data'),
   };
   delete env.ELECTRON_RUN_AS_NODE;
+  delete env.BOTMUX_SESSION_ID;
 
   return input.interpreterPath
     ? { command: input.interpreterPath, args: [input.binPath, ...input.args], env }

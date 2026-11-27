@@ -5533,7 +5533,8 @@ dialog.onboarding-dialog::backdrop {
   line-height: 1.35;
 }
 
-.onboarding-field input[type="text"] {
+.onboarding-field input[type="text"],
+.onboarding-field input[type="password"] {
   box-sizing: border-box;
   width: 100%;
   height: var(--button-height);
@@ -5552,12 +5553,84 @@ dialog.onboarding-dialog::backdrop {
 }
 
 .onboarding-field input[type="text"]:hover:not(:disabled),
-.onboarding-field input[type="text"]:focus {
+.onboarding-field input[type="text"]:focus,
+.onboarding-field input[type="password"]:hover:not(:disabled),
+.onboarding-field input[type="password"]:focus {
   border-color: var(--accent);
   background: color-mix(in srgb, var(--accent) 8%, transparent);
   color: var(--accent-strong);
   outline: none;
   box-shadow: none;
+}
+
+.onboarding-secret-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+}
+
+.onboarding-secret-wrap > input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.onboarding-secret-toggle {
+  flex: 0 0 auto;
+  height: var(--button-height);
+  padding: 0 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-full);
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.onboarding-secret-toggle:hover {
+  border-color: var(--accent);
+  color: var(--accent-strong);
+}
+
+.onboarding-cli-missing-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.overview-onboarding-card {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 20px 24px;
+  border-radius: var(--radius-lg);
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
+  background: color-mix(in srgb, var(--accent) 6%, var(--surface));
+}
+
+.overview-onboarding-copy h2 {
+  margin: 0 0 6px;
+  font-size: 17px;
+  line-height: 1.3;
+}
+
+.overview-onboarding-copy p {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--muted);
+  max-width: 60ch;
+}
+
+.overview-onboarding-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
 
 .onboarding-menu {
@@ -24318,13 +24391,13 @@ dialog.onboarding-dialog .onboarding-field-hint {
   line-height: 1.45;
 }
 
-dialog.onboarding-dialog .onboarding-field > :where(input[type="text"], input[type="email"], .onboarding-menu) {
+dialog.onboarding-dialog .onboarding-field > :where(input[type="text"], input[type="email"], input[type="password"], .onboarding-menu, .onboarding-secret-wrap) {
   width: 100%;
   min-width: 0;
   max-width: none;
 }
 
-dialog.onboarding-dialog .onboarding-field > :where(input[type="text"], input[type="email"]) {
+dialog.onboarding-dialog .onboarding-field :where(input[type="text"], input[type="email"], input[type="password"]) {
   height: var(--button-height);
   min-height: var(--button-height);
   max-height: var(--button-height);
@@ -24339,7 +24412,7 @@ dialog.onboarding-dialog .onboarding-field > :where(input[type="text"], input[ty
   box-shadow: none;
 }
 
-dialog.onboarding-dialog .onboarding-field > :where(input[type="text"], input[type="email"]):not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]) {
+dialog.onboarding-dialog .onboarding-field :where(input[type="text"], input[type="email"], input[type="password"]):not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]) {
   height: var(--button-height);
   min-height: var(--button-height);
   max-height: var(--button-height);
@@ -24354,8 +24427,8 @@ dialog.onboarding-dialog .onboarding-field > :where(input[type="text"], input[ty
   box-shadow: none;
 }
 
-dialog.onboarding-dialog .onboarding-field > :where(input[type="text"], input[type="email"]):hover:not(:disabled),
-dialog.onboarding-dialog .onboarding-field > :where(input[type="text"], input[type="email"]):focus {
+dialog.onboarding-dialog .onboarding-field :where(input[type="text"], input[type="email"], input[type="password"]):hover:not(:disabled),
+dialog.onboarding-dialog .onboarding-field :where(input[type="text"], input[type="email"], input[type="password"]):focus {
   border-color: var(--accent);
   background: color-mix(in srgb, var(--accent) 8%, transparent);
   color: var(--accent-strong);
@@ -24363,8 +24436,8 @@ dialog.onboarding-dialog .onboarding-field > :where(input[type="text"], input[ty
   box-shadow: none;
 }
 
-dialog.onboarding-dialog .onboarding-field > :where(input[type="text"], input[type="email"]):not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]):hover:not(:disabled),
-dialog.onboarding-dialog .onboarding-field > :where(input[type="text"], input[type="email"]):not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]):focus {
+dialog.onboarding-dialog .onboarding-field :where(input[type="text"], input[type="email"], input[type="password"]):not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]):hover:not(:disabled),
+dialog.onboarding-dialog .onboarding-field :where(input[type="text"], input[type="email"], input[type="password"]):not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]):focus {
   border-color: var(--accent);
   background: color-mix(in srgb, var(--accent) 8%, transparent);
   color: var(--accent-strong);

@@ -3,8 +3,8 @@
  *
  * The worker wires `backend.cliPid` (and `cliCwd`) only for adapters that read
  * it: Claude's `~/.claude/sessions/<pid>.json`, grok's per-pid session lookup,
- * TRAE's and Codex's rollout-ownership gate over a shared global history, and
- * the lease owners. Codex is on this list because its paste-mode submit proof
+ * TRAE's and Codex's rollout-ownership gate over a shared global history,
+ * NCA's private host writer lock, and the lease owners. Codex is on this list because its paste-mode submit proof
  * (`ownershipProven`) requires the owned rollout set of THIS pane's process:
  * without the pid the adapter can still confirm `submitted`, but it can never
  * prove ownership, and no early native input consumption receipt is sent.
@@ -15,5 +15,5 @@
  */
 export function cliAdapterBindsOwnershipPid(cliId: string | undefined, claudeDataDir: string | undefined): boolean {
   if (claudeDataDir) return true;
-  return cliId === 'grok' || cliId === 'traex' || cliId === 'reasonix' || cliId === 'antigravity' || cliId === 'codex';
+  return cliId === 'grok' || cliId === 'traex' || cliId === 'reasonix' || cliId === 'antigravity' || cliId === 'codex' || cliId === 'nca';
 }

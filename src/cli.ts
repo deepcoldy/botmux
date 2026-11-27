@@ -106,6 +106,11 @@ import {
   trackBotsJsonSnapshot,
   writeBotsJsonAtomic as writeBotsAtomic,
 } from './setup/bots-store.js';
+import { validateBotConfigEntries } from './setup/bots-config-validation.js';
+import {
+  formatStopIfEmptyCliOutcome,
+  hasOtherActiveDesktopHostLease,
+} from './core/desktop-host-leases.js';
 import { findQuotaFallbackCycles } from './services/quota-fallback.js';
 import { findRetiredCliBots, retiredCliNotice } from './adapters/cli/retired-cli.js';
 import {
@@ -566,8 +571,10 @@ function pm2StartVerifyTimeoutMs(processCount: number): number {
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function ensureConfigDir(): void {
+  // Create ~/.botmux and its child state directories with mode 0o700 so strict
+  // parent/ancestor checks (`(mode & 0o022) === 0`) pass even under umask 0o002.
   for (const dir of [CONFIG_DIR, DATA_DIR, LOG_DIR, HEAPSHOT_DIR]) {
-    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
 }
 
@@ -3408,19 +3415,28 @@ async function cmdStart(): Promise<void> {
   // FIRST STATEMENT, before any await or dependency probe: those run as child
   // processes and would inherit the marker. See consumeAutostartUnitMarker.
   const bootHookStart = consumeAutostartUnitMarker();
-  await (await import('./setup/feedback-storage.js')).configureFeedbackStorage(resolveDataDir());
+  const allowEmpty = !watchdogStart && process.argv.includes('--allow-empty');
   applyCompanionOptions(process.argv.slice(3));
   // `--systemd-service` and the PM2-God ownership gating that used to live here
   // are gone with pm2 itself: the built-in supervisor owns single-owner exclusion
   // via fleet-state (liveness check under the fleet mutation lock, completed by
   // the supervisor's own ownership claim at boot), so there is no God process
   // whose cgroup/generation has to be proven before starting.
-  if (!hasConfig()) {
+  if (!hasConfig() && !allowEmpty) {
     console.error('❌ 未找到配置文件');
     console.error('   请先运行: botmux setup');
     process.exit(1);
   }
+  const initialBots = loadBotsJson();
+  if (allowEmpty) {
+    const validation = validateBotConfigEntries(initialBots);
+    if (!validation.ok) {
+      console.error(`❌ ${validation.message}`);
+      process.exit(1);
+    }
+  }
   ensureConfigDir();
+  await (await import('./setup/feedback-storage.js')).configureFeedbackStorage(resolveDataDir());
   if (watchdogStart) {
     // The periodic path must stay local and cheap while healthy. In particular,
     // do not run dependency installers or one credential request per bot every
@@ -3445,12 +3461,15 @@ async function cmdStart(): Promise<void> {
     // explicit stop and re-arms crash recovery.
     clearWatchdogStopped(CONFIG_DIR);
   }
-  await ensureSystemDependencies();
+  const skipDepsForEmptyOnboarding = allowEmpty && initialBots.length === 0;
+  if (!skipDepsForEmptyOnboarding) {
+    await ensureSystemDependencies();
+  }
 
   const botsForCheck = await preflightConfiguredBotCredentials();
   // The boot hook marks itself so purely presentational waiting can be skipped
   // there (see startConfiguredFleet).
-  await startConfiguredFleet(botsForCheck, { bootHookStart, watchdogStart });
+  await startConfiguredFleet(botsForCheck, { bootHookStart, watchdogStart, allowEmpty });
 }
 
 async function cmdWatchdog(): Promise<void> {
@@ -3491,9 +3510,10 @@ async function preflightConfiguredBotCredentials() {
 
 async function startConfiguredFleet(
   botsForCheck: ReturnType<typeof loadBotsJson>,
-  options: { bootHookStart?: boolean; watchdogStart?: boolean } = {},
+  options: { bootHookStart?: boolean; watchdogStart?: boolean; allowEmpty?: boolean } = {},
 ): Promise<void> {
   let skippedForIntentionalStop = false;
+  let startedEmptyOnboarding = false;
 
   await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
     await withFileLock(BOTS_JSON_FILE, async () => {
@@ -3526,7 +3546,19 @@ async function startConfiguredFleet(
       // "refuse partial live fleet" dance needed; the running supervisor keeps
       // the fleet reconciled itself.
       const { startFleetViaSupervisor } = await import('./core/fleet-runtime.js');
-      const result = startFleetViaSupervisor();
+      const emptyOnboarding = options.allowEmpty === true && lockedBots.length === 0;
+      const sessionRefresh = Boolean(process.env.BOTMUX_SESSION_ID?.trim());
+      const result = startFleetViaSupervisor(emptyOnboarding
+        ? {
+            defaultDashboardHost: '127.0.0.1',
+            // Inside a managed session, explicitly refresh from persisted .env
+            // with NO inherited read-failure fallback so an absent ~/.botmux/.env
+            // falls back to 127.0.0.1 instead of inheriting a foreign session's
+            // BOTMUX_DASHBOARD_HOST=0.0.0.0. Desktop already strips BOTMUX_SESSION_ID.
+            ...(sessionRefresh ? { refreshPersistedEnv: true } : {}),
+          }
+        : {});
+      startedEmptyOnboarding = emptyOnboarding;
       if (result.action === 'already-running') {
         if (process.env.BOTMUX_COMPANION_SECRET_FILE || process.env.BOTMUX_COMPANION_BOT_APP_ID) {
           throw new Error('fleet is already running; use `botmux restart` to apply companion options');
@@ -3536,6 +3568,12 @@ async function startConfiguredFleet(
     }, { maxWaitMs: 5_000 });
   }, { maxWaitMs: 5_000 });
   if (skippedForIntentionalStop) return;
+  if (startedEmptyOnboarding && !options.bootHookStart) {
+    // Wait briefly outside the locks so fleet-state.json has botmux-dashboard
+    // attested online before Desktop queries getState() / locateDashboard().
+    const { resolveDashboardSpec, waitFleetOnline } = await import('./core/fleet-runtime.js');
+    waitFleetOnline([resolveDashboardSpec()], 10_000);
+  }
   await reconcilePluginServicesForCli(undefined, {
     autoOnly: true,
   });
@@ -3581,7 +3619,9 @@ async function startConfiguredFleet(
   // failure and, under the default KillMode=control-group, take the freshly
   // started supervisor down with the unit — so fixing the unit's path would be
   // undone by waiting inside it. Purely presentational: skip it.
-  if (!options.bootHookStart) await printDashboardHintWithRetry();
+  if (!options.bootHookStart) {
+    await printDashboardHintWithRetry(startedEmptyOnboarding ? { budgetMs: 15_000 } : undefined);
+  }
 }
 
 /**
@@ -3630,8 +3670,111 @@ function cleanupLegacyPm2(_op?: 'stop' | 'restart'): boolean {
 }
 
 
+function parseOptionalPositivePidFlag(argv: string[], flag: string): number | undefined {
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    let raw: string | undefined;
+    if (arg === flag) {
+      raw = argv[i + 1];
+    } else if (arg.startsWith(`${flag}=`)) {
+      raw = arg.slice(flag.length + 1);
+    } else {
+      continue;
+    }
+    if (!raw || !/^\d+$/.test(raw)) {
+      throw new Error(`${flag} 需要正整数 PID`);
+    }
+    const parsed = Number(raw);
+    if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+      throw new Error(`${flag} 需要正整数 PID`);
+    }
+    return parsed;
+  }
+  return undefined;
+}
+
 async function cmdStop(): Promise<void> {
-  const includePluginServices = process.argv.includes('--with-plugin');
+  const stopArgs = process.argv.slice(3);
+  const includePluginServices = stopArgs.includes('--with-plugin');
+  const ifEmpty = stopArgs.includes('--if-empty');
+  const expectedSupervisorPid = parseOptionalPositivePidFlag(stopArgs, '--supervisor-pid');
+  const callerHostPid = parseOptionalPositivePidFlag(stopArgs, '--host-pid');
+  if ((expectedSupervisorPid !== undefined || callerHostPid !== undefined) && !ifEmpty) {
+    console.error('--supervisor-pid / --host-pid 必须与 --if-empty 一起使用。');
+    process.exit(2);
+  }
+
+  if (ifEmpty) {
+    // Desktop 0-bot quit cleanup: never create ~/.botmux on an untouched host,
+    // never leave a watchdog-stopped marker, re-verify 0 configured bots AND
+    // check attested Desktop host leases atomically under the exact same lock
+    // order as cmdStart (fleet lock -> bots.json lock).
+    if (!existsSync(CONFIG_DIR)) {
+      console.log(formatStopIfEmptyCliOutcome('skipped:not-running'));
+      console.log('daemon 未在运行。');
+      return;
+    }
+    await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
+      await withFileLock(BOTS_JSON_FILE, async () => {
+        if (existsSync(BOTS_JSON_FILE)) {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(readFileSync(BOTS_JSON_FILE, 'utf-8'));
+          } catch {
+            console.log(formatStopIfEmptyCliOutcome('skipped:invalid-config'));
+            console.log('bots.json 存在且不可解析，跳过 --if-empty 停止。');
+            return;
+          }
+          const validation = validateBotConfigEntries(parsed);
+          if (!validation.ok) {
+            console.log(formatStopIfEmptyCliOutcome('skipped:invalid-config'));
+            console.log('bots.json 存在且结构无效，跳过 --if-empty 停止。');
+            return;
+          }
+          if (validation.count > 0) {
+            console.log(formatStopIfEmptyCliOutcome('skipped:configured'));
+            console.log('已存在配置机器人，跳过 --if-empty 停止。');
+            return;
+          }
+        }
+        if (hasOtherActiveDesktopHostLease(CONFIG_DIR, { excludePid: callerHostPid, pruneStale: true })) {
+          console.log(formatStopIfEmptyCliOutcome('skipped:other-host'));
+          console.log('检测到其他活跃的 Botmux Desktop 实例，跳过 --if-empty 停止。');
+          return;
+        }
+        const { liveSupervisorTarget, stopFleet } = await import('./core/fleet-runtime.js');
+        const target = liveSupervisorTarget();
+        if (!target) {
+          console.log(formatStopIfEmptyCliOutcome('skipped:not-running'));
+          console.log('daemon 未在运行。');
+          return;
+        }
+        if (expectedSupervisorPid !== undefined && target.pid !== expectedSupervisorPid) {
+          console.log(formatStopIfEmptyCliOutcome('skipped:pid-mismatch'));
+          console.log(`supervisor pid (${target.pid}) 与目标 (${expectedSupervisorPid}) 不一致，跳过 --if-empty 停止。`);
+          return;
+        }
+        const result = stopFleet(FLEET_DAEMON_EXIT_WAIT_MS);
+        if (result.action === 'not-running') {
+          cleanupStaleDaemonDescriptors();
+          console.log(formatStopIfEmptyCliOutcome('skipped:not-running'));
+          console.log('daemon 未在运行。');
+          return;
+        }
+        if (result.action === 'timeout') {
+          throw new Error(
+            `[stop] supervisor (pid ${result.supervisorPid}) 未在超时时间内退出；已发送 SIGKILL，`
+            + `请用 \`botmux status\` 复核 fleet 状态。`,
+          );
+        }
+        cleanupStaleDaemonDescriptors();
+        console.log(formatStopIfEmptyCliOutcome('stopped'));
+        console.log(`✅ 0-bot 引导服务已停止 (supervisor pid ${result.supervisorPid})`);
+      }, { maxWaitMs: 5_000 });
+    }, { maxWaitMs: 5_000 });
+    return;
+  }
+
   ensureConfigDir();
   // Persist intent before taking the fleet lock so a concurrently-fired
   // watchdog cannot resurrect the fleet after this stop completes.
@@ -3675,11 +3818,18 @@ async function cmdStop(): Promise<void> {
 }
 
 async function cmdRestart(): Promise<void> {
+  const allowEmpty = process.argv.includes('--allow-empty');
   applyCompanionOptions(process.argv.slice(3));
   const { refreshPersistedEnv, readFailureFallback } = prepareRestartDriverContext();
-  if (!hasConfig()) {
+  if (!hasConfig() && !allowEmpty) {
     console.error('❌ 未找到配置文件');
     console.error('   请先运行: botmux setup');
+    process.exit(1);
+  }
+  const initialBots = loadBotsJson();
+  const initialValidation = validateBotConfigEntries(initialBots);
+  if (!initialValidation.ok) {
+    console.error(`❌ ${initialValidation.message}`);
     process.exit(1);
   }
   ensureConfigDir();
@@ -3690,10 +3840,15 @@ async function cmdRestart(): Promise<void> {
   // `start-bot` time out and fail. The value is a login shell's PATH, so
   // reading it a moment earlier is harmless.
   const restartAutostartLoginPath = autostartHookFileExists() ? resolveLoginShellPath() : undefined;
+  let restartedEmptyOnboarding = false;
   await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
     // Report recovery guidance before any live-fleet mutation. The locked
     // check below repeats against the exact generation used for restart.
     const botsBeforeRestart = loadBotsJson();
+    const preRestartValidation = validateBotConfigEntries(botsBeforeRestart);
+    if (!preRestartValidation.ok) {
+      throw new Error(`[restart] ${preRestartValidation.message}`);
+    }
     preflightQuotaFallbackTopology(botsBeforeRestart, 'restart');
     preflightRetiredClis(botsBeforeRestart, 'restart');
     const includePluginServices = process.argv.includes('--with-plugin');
@@ -3705,13 +3860,22 @@ async function cmdRestart(): Promise<void> {
     } catch { /* intent reporting is best-effort */ }
 
     preflightNodeSanity();
-    await ensureSystemDependencies();
+    const skipDepsForEmptyOnboarding = allowEmpty && botsBeforeRestart.length === 0;
+    if (!skipDepsForEmptyOnboarding) {
+      await ensureSystemDependencies();
+    }
     cleanupLegacyPm2('restart'); // reap any pre-migration pm2 God still holding botmux procs
     if (includePluginServices) await stopPluginServicesForCli(undefined, { autoOnly: true });
     cleanupStaleDaemonDescriptors();
 
     await withFileLock(BOTS_JSON_FILE, async () => {
       const restartBots = loadBotsJson();
+      const lockedValidation = validateBotConfigEntries(restartBots);
+      if (!lockedValidation.ok) {
+        throw new Error(`[restart] ${lockedValidation.message}`);
+      }
+      const emptyOnboarding = allowEmpty && restartBots.length === 0;
+      restartedEmptyOnboarding = emptyOnboarding;
       // Recompute the skip set source against the locked config generation;
       // resolveFleetMembers applies the same projection in the new supervisor.
       preflightQuotaFallbackTopology(restartBots, 'restart', false);
@@ -3733,10 +3897,17 @@ async function cmdRestart(): Promise<void> {
       const { restartFleet, fleetHealthMembers, waitFleetOnline } = await import('./core/fleet-runtime.js');
       let health: ReturnType<typeof waitFleetOnline>;
       try {
+        const sessionOriginRestart = Boolean(process.env.BOTMUX_SESSION_ID?.trim());
+        const effectiveReadFailureFallback = emptyOnboarding && readFailureFallback
+          ? (sessionOriginRestart
+              ? undefined
+              : { ...readFailureFallback, BOTMUX_DASHBOARD_HOST: '' })
+          : readFailureFallback;
         const r = restartFleet({
           timeoutMs: FLEET_DAEMON_EXIT_WAIT_MS,
           refreshPersistedEnv,
-          readFailureFallback,
+          readFailureFallback: effectiveReadFailureFallback,
+          ...(emptyOnboarding ? { defaultDashboardHost: '127.0.0.1' } : {}),
         });
         if (r.stop.action === 'timeout') {
           throw new Error(
@@ -3793,13 +3964,13 @@ async function cmdRestart(): Promise<void> {
   // whole time, and those callers give up after 5s with a lock timeout. The
   // restart itself, its health gate, the plugin reconcile and the autostart sync
   // all stay inside.
-  await printDashboardHintWithRetry();
+  await printDashboardHintWithRetry(restartedEmptyOnboarding ? { budgetMs: 15_000 } : undefined);
 }
 
 
 export type StartBotLiveResult =
   | { ok: true; state: 'started' | 'already-online'; processName: string }
-  | { ok: false; reason: 'not_found' | 'not_ready' | 'fleet_down' | 'timeout' | 'supervisor_error' | 'config_dir_not_writable'; message: string };
+  | { ok: false; reason: 'not_found' | 'not_ready' | 'fleet_down' | 'timeout' | 'supervisor_error' | 'config_dir_not_writable' | 'dependency_missing'; message: string };
 
 export type StopBotLiveResult =
   | { ok: true; state: 'stopped' | 'already-stopped'; processName: string }
@@ -3871,48 +4042,113 @@ async function ensureBotDaemonStopped(
  * The activation-readiness gate (activationPending/starting/committed/
  * deactivating) is orthogonal to how the daemon is launched and is preserved.
  */
+function validateBotActivationGate(appId: string, bot: any): StartBotLiveResult | null {
+  if (bot?.activationPending === true) {
+    return { ok: false, reason: 'not_ready', message: `appId ${appId} is still activation pending` };
+  }
+  const activationStarting = bot?.activationStarting;
+  const activationCommitted = bot?.activationCommitted;
+  const activationDeactivating = bot?.activationDeactivating;
+  if (activationDeactivating !== undefined) {
+    return { ok: false, reason: 'not_ready', message: `appId ${appId} is still deactivating` };
+  }
+  if (activationStarting !== undefined && activationCommitted !== undefined) {
+    return { ok: false, reason: 'not_ready', message: `appId ${appId} has conflicting activation markers` };
+  }
+  const activationMarker = activationStarting ?? activationCommitted;
+  const activationJobId = (
+    activationMarker
+    && typeof activationMarker === 'object'
+    && !Array.isArray(activationMarker)
+    && activationMarker.appId === appId
+    && typeof activationMarker.jobId === 'string'
+    && activationMarker.jobId
+  )
+    ? String(activationMarker.jobId)
+    : undefined;
+  if (activationMarker !== undefined && !activationJobId) {
+    return { ok: false, reason: 'not_ready', message: `appId ${appId} has an invalid activation marker` };
+  }
+  return null;
+}
+
 async function ensureBotDaemonStarted(
   appId: string,
   opts: { quiet?: boolean } = {},
 ): Promise<StartBotLiveResult> {
   ensureConfigDir();
   try {
-    return await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
+    // Phase 1 (under fleet lock): verify writability, target bot readiness, and
+    // live supervisor status before releasing the lock for any dependency install.
+    type Phase1Result =
+      | { done: true; result: StartBotLiveResult }
+      | {
+          done: false;
+          effectiveBackend: string;
+          cliId?: import('./adapters/cli/types.js').CliId;
+          isApiOnly: boolean;
+          isFirstBotTransition: boolean;
+        };
+
+    const phase1: Phase1Result = await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
       cleanupLegacyPm2(); // reap a pre-migration pm2 God if one is still around
+      const bots = loadBotsJson();
+      const index = bots.findIndex(b => b?.larkAppId === appId);
+      if (index < 0) {
+        return { done: true, result: { ok: false, reason: 'not_found', message: `appId ${appId} 不在 bots.json 中` } };
+      }
+      const bot = bots[index];
+      const gateFailure = validateBotActivationGate(appId, bot);
+      if (gateFailure) return { done: true, result: gateFailure };
+
+      const { liveSupervisorTarget, readFleetStatus } = await import('./core/fleet-runtime.js');
+      if (!liveSupervisorTarget()) {
+        return { done: true, result: { ok: false, reason: 'fleet_down', message: 'daemon 未在运行，请先 botmux start' } };
+      }
+      const fleetStatus = readFleetStatus();
+      const existingRow = fleetStatus?.rows.find(row => row.appId === appId && row.status === 'online' && row.alive);
+      if (existingRow) {
+        return { done: true, result: { ok: true, state: 'already-online', processName: existingRow.name } };
+      }
+      const hasOnlineBotDaemon = Boolean(fleetStatus?.rows.some(row => Boolean(row.appId) && row.status === 'online' && row.alive));
+      return {
+        done: false,
+        effectiveBackend: bot?.backendType ?? config.daemon.backendType,
+        cliId: bot?.cliId,
+        isApiOnly: bot?.apiOnly === true,
+        isFirstBotTransition: !hasOnlineBotDaemon,
+      };
+    }, { maxWaitMs: 5_000 });
+
+    if (phase1.done) return phase1.result;
+
+    // Phase 2 (outside fleet lock): run single-bot dependency preflight so a
+    // 0->1 transition after `start --allow-empty` provisions tmux/herdr/fonts
+    // (or fails cleanly with dependency_missing) before spawning the daemon.
+    const { ensureBotStartDependencies } = await import('./setup/index.js');
+    const depCheck = await ensureBotStartDependencies({
+      effectiveBackend: phase1.effectiveBackend,
+      cliId: phase1.cliId,
+      isApiOnly: phase1.isApiOnly,
+      isFirstBotTransition: phase1.isFirstBotTransition,
+      ptyOptIn: (process.env.BACKEND_TYPE ?? '').toLowerCase() === 'pty',
+      quiet: opts.quiet,
+      installTimeoutMs: 90_000,
+      skipFontsDownload: process.env.BOTMUX_FENCED_RUN === '1',
+    });
+    if (!depCheck.ok) {
+      return depCheck;
+    }
+
+    // Phase 3 (re-acquire fleet lock): re-validate bot & spawn via supervisor.
+    return await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
       const bots = loadBotsJson();
       const index = bots.findIndex(b => b?.larkAppId === appId);
       if (index < 0) {
         return { ok: false, reason: 'not_found', message: `appId ${appId} 不在 bots.json 中` };
       }
-      const bot = bots[index];
-      // Activation-readiness gate (managed onboarding) — unchanged by the pm2→
-      // supervisor migration; a not-yet-ready bot must not be launched.
-      if (bot?.activationPending === true) {
-        return { ok: false, reason: 'not_ready', message: `appId ${appId} is still activation pending` };
-      }
-      const activationStarting = bot?.activationStarting;
-      const activationCommitted = bot?.activationCommitted;
-      const activationDeactivating = bot?.activationDeactivating;
-      if (activationDeactivating !== undefined) {
-        return { ok: false, reason: 'not_ready', message: `appId ${appId} is still deactivating` };
-      }
-      if (activationStarting !== undefined && activationCommitted !== undefined) {
-        return { ok: false, reason: 'not_ready', message: `appId ${appId} has conflicting activation markers` };
-      }
-      const activationMarker = activationStarting ?? activationCommitted;
-      const activationJobId = (
-        activationMarker
-        && typeof activationMarker === 'object'
-        && !Array.isArray(activationMarker)
-        && activationMarker.appId === appId
-        && typeof activationMarker.jobId === 'string'
-        && activationMarker.jobId
-      )
-        ? String(activationMarker.jobId)
-        : undefined;
-      if (activationMarker !== undefined && !activationJobId) {
-        return { ok: false, reason: 'not_ready', message: `appId ${appId} has an invalid activation marker` };
-      }
+      const gateFailure = validateBotActivationGate(appId, bots[index]);
+      if (gateFailure) return gateFailure;
 
       const { startBotViaSupervisor } = await import('./core/fleet-runtime.js');
       const r = startBotViaSupervisor(
@@ -3969,7 +4205,7 @@ async function cmdStartBot(argv: string[]): Promise<void> {
   }
   if (r.reason === 'fleet_down') {
     console.error('ℹ️  daemon 未在运行。请用 `botmux start` 启动整个进程组。');
-  } else if (r.reason === 'config_dir_not_writable') {
+  } else if (r.reason === 'config_dir_not_writable' || r.reason === 'dependency_missing') {
     console.error(`❌ ${r.message}`);
   } else {
     console.error(`❌ 拉起失败 (${r.reason}): ${r.message}`);
@@ -4639,8 +4875,9 @@ async function dashboardMemberComingUp(): Promise<boolean | null> {
  * of hanging for the whole budget. A fast boot is unaffected — the loop returns the
  * moment the dashboard answers.
  */
-async function printDashboardHintWithRetry(): Promise<void> {
+async function printDashboardHintWithRetry(opts?: { budgetMs?: number }): Promise<void> {
   const stepMs = 500;
+  const budgetMs = opts?.budgetMs ?? DASHBOARD_READY_WAIT_MS;
   const started = Date.now();
   let last: Awaited<ReturnType<typeof callDashboardEndpoint>> | null = null;
   for (;;) {
@@ -4657,7 +4894,7 @@ async function printDashboardHintWithRetry(): Promise<void> {
     // endpoint，绝不创建/轮换 token。两者都结束本循环，所以只导出一次。导出超时
     // 按剩余预算钳制，重读与轮询同样带 requestTimeoutMs。
     const exportTimeoutMs = dashboardExportTimeoutForBudget(
-      DASHBOARD_READY_WAIT_MS - (Date.now() - started),
+      budgetMs - (Date.now() - started),
     );
     last = await exportAfterDashboardAnswer(
       last,
@@ -4675,8 +4912,10 @@ async function printDashboardHintWithRetry(): Promise<void> {
       for (const line of rest) console.log(`   ${line}`);
       return;
     }
+    const elapsedMs = Date.now() - started;
+    if (elapsedMs >= budgetMs) break;
     const keepWaiting = shouldKeepWaitingForDashboard({
-      elapsedMs: Date.now() - started,
+      elapsedMs,
       failure: last,
       // Only asked when a retry is otherwise possible, so a fast boot never pays
       // for reading the fleet state.
@@ -21810,13 +22049,13 @@ const ROOT_FLEET_MUTATION_COMMANDS = new Set(['start', 'stop', 'restart', 'upgra
 // there — its meaning on stop/restart is "also tear the plugin service down",
 // and start has no tear-down phase.
 const FLEET_KNOWN_FLAGS: Record<string, readonly string[]> = {
-  start: ['--companion-secret-file', '--companion-bot'],
-  stop: ['--with-plugin'],
-  restart: ['--with-plugin', '--companion-secret-file', '--companion-bot'],
+  start: ['--allow-empty', '--companion-secret-file', '--companion-bot'],
+  stop: ['--with-plugin', '--if-empty', '--supervisor-pid', '--host-pid'],
+  restart: ['--with-plugin', '--allow-empty', '--companion-secret-file', '--companion-bot'],
   upgrade: ['--canary', '--beta', '--rc', '--next', '--latest'],
   update: ['--canary', '--beta', '--rc', '--next', '--latest'],
 };
-const FLEET_VALUE_FLAGS = new Set(['--companion-secret-file', '--companion-bot']);
+const FLEET_VALUE_FLAGS = new Set(['--companion-secret-file', '--companion-bot', '--supervisor-pid', '--host-pid']);
 if (ROOT_FLEET_MUTATION_COMMANDS.has(command ?? '')) {
   const fleetArgs = process.argv.slice(3);
   if (fleetArgs.some(arg => arg === '--help' || arg === '-h')) {
@@ -21842,6 +22081,19 @@ if (ROOT_FLEET_MUTATION_COMMANDS.has(command ?? '')) {
     console.error(`未知参数: ${unknownArgs.join(' ')}`);
     console.error(`  \`botmux ${command}\` 只接受: ${['--help', ...knownFleetFlags].join(' ')}。`);
     console.error('  为避免把一个看起来像「只检查」的参数当成「执行」，这里直接中止，不做任何改动。');
+    process.exit(2);
+  }
+  if (
+    command === 'stop'
+    && fleetArgs.some(arg => (
+      arg === '--supervisor-pid'
+      || arg.startsWith('--supervisor-pid=')
+      || arg === '--host-pid'
+      || arg.startsWith('--host-pid=')
+    ))
+    && !fleetArgs.includes('--if-empty')
+  ) {
+    console.error('--supervisor-pid / --host-pid 必须与 --if-empty 一起使用。');
     process.exit(2);
   }
   if ((command === 'upgrade' || command === 'update') && fleetArgs.filter(a => a !== '--help' && a !== '-h').length > 1) {
