@@ -1013,11 +1013,46 @@ describe('one reply card per turn', () => {
     await store.update(key, { kind: 'progress', text: '正在核对' }, io);
     await store.noteExternalFinal(key, input.chatId);
     await store.update(key, { kind: 'terminal', phase: 'completed', silent: true }, io);
-    const saved = store.read(key)!;
-    const bodies = progressElements(saved);
+    const bodies = progressElements(store.read(key)!);
     expect(bodies).toHaveLength(1);
     expect(bodies[0].content).toContain('正在核对');
-    expect(buildTurnReplyCard(saved, presentation)).not.toContain(silentReceipt());
+    expect(buildTurnReplyCard(store.read(key)!, presentation)).not.toContain(silentReceipt());
+  });
+
+  it('does not set a refresh flag when externalFinal is marked before the terminal settles', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    await store.noteExternalFinal(key, input.chatId);
+    // Not terminal/published yet: the upcoming terminal update renders the flag itself.
+    expect(store.read(key)!.publishPending).toBeUndefined();
+    await store.update(key, { kind: 'terminal', phase: 'completed', silent: true }, io);
+    expect(store.read(key)!.publishPending).toBeUndefined();
+  });
+
+  it.each([
+    ['silent', { phase: 'completed' as const, silent: true }, true],
+    ['non-silent', { phase: 'completed' as const }, false],
+  ])('refreshes an already-published terminal card when externalFinal arrives late (%s)', async (_name, terminalEvent, isSilent) => {
+    await store.update(key, { kind: 'start' }, io);
+    await store.update(key, { kind: 'terminal', ...terminalEvent }, io);
+    const published = store.read(key)!;
+    expect(published.messageId).toBeDefined();
+    if (isSilent) expect(published.lastCard).toContain(silentReceipt());
+    const patchesBefore = vi.mocked(io.patch).mock.calls.length;
+
+    // The CLI marks external delivery only after the card has settled.
+    expect(await store.noteExternalFinal(key, input.chatId)).toBe(true);
+    const marked = store.read(key)!;
+    expect(marked.externalFinal).toBe(true);
+    expect(marked.publishPending).toBe(true);
+
+    // The daemon-side publisher's recover/sweep picks up the dirty flag and
+    // re-renders (the CLI process itself has no transport).
+    await new TurnReplyCardStore(dir).update(key, { kind: 'recover' }, io);
+    const recovered = store.read(key)!;
+    expect(vi.mocked(io.patch).mock.calls.length).toBeGreaterThan(patchesBefore);
+    expect(recovered.publishPending).toBeUndefined();
+    expect(recovered.lastCard).not.toContain(silentReceipt());
+    expect(progressElements(recovered)).toHaveLength(0);
   });
 
   it('never marks a user-cancelled turn as deliberately silent', async () => {

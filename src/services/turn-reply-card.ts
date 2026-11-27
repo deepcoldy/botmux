@@ -248,7 +248,15 @@ export class TurnReplyCardStore {
   /** Record that this turn's final was delivered as a separate message in the
    * card's chat. Persistence only: no provider I/O, no card creation. A turn
    * without a reply-card record, a different destination or an answer already
-   * on the card is left untouched. Returns whether the record was marked. */
+   * on the card is left untouched. Returns whether the record was marked.
+   *
+   * When the mark lands AFTER the card has already settled and been published,
+   * the published card still shows the silence/missing-answer body because this
+   * short-lived CLI process has no transport. Flag it publishPending so the
+   * daemon-side publisher's next recover/sweep re-renders and PATCHes the card
+   * (the renderer now treats externalFinal as delivery fact and empties that
+   * body); a mark arriving before the terminal needs no flag, as that terminal
+   * update renders the card with the flag already present. */
   async noteExternalFinal(key: TurnReplyCardKey, chatId: string): Promise<boolean> {
     if (!this.read(key)) return false;
     return withFileLock(this.path(key), async () => {
@@ -256,6 +264,7 @@ export class TurnReplyCardStore {
       if (!record || record.chatId !== chatId || record.finalCard || record.withdrawn) return false;
       if (record.externalFinal) return true;
       record.externalFinal = true;
+      if (record.messageId && replyCardIsTerminal(record)) record.publishPending = true;
       this.write(key, record);
       return true;
     }, { maxWaitMs: 8_000 });

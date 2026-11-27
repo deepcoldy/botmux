@@ -79,6 +79,27 @@ describe('reply-card recovery under partial writes and overlapping writers', () 
   expect(store.read(key)?.silentTurn).toBeUndefined();
   expect(remote).not.toContain('silent_superseded');
  });
+ it('sweep re-renders a settled card when externalFinal is marked after the terminal',async()=>{
+  await store.update(key,{kind:'terminal',phase:'completed',silent:true,durationMs:123},io);
+  const settled=store.read(key)!;
+  expect(settled.messageId).toBeDefined();
+  expect(settled.lastCard).toContain('silent_superseded');
+  const patchesBefore=patches;
+  // CLI marks external delivery after the card has already settled.
+  expect(await store.noteExternalFinal(key,input.chatId)).toBe(true);
+  expect(store.read(key)?.publishPending).toBe(true);
+  // Startup sweep (the only daemon-wide publisher for a settled card) replays it.
+  await sweepInterruptedReplyCards(key.larkAppId);
+  const recovered=store.read(key)!;
+  expect(patches).toBeGreaterThan(patchesBefore);
+  expect(recovered.publishPending).toBeUndefined();
+  expect(recovered.lastCard).not.toContain('silent_superseded');
+  expect(remote).not.toContain('silent_superseded');
+  // A second sweep is a no-op once the dirty flag cleared.
+  const patchesAfter=patches;
+  await sweepInterruptedReplyCards(key.larkAppId);
+  expect(patches).toBe(patchesAfter);
+ });
  it('masks a content-audit-rejected recovery PATCH instead of leaving the card unsettled',async()=>{
   // The final (with an email) is already in the card; the terminal PATCH is left
   // pending, and recovery re-renders the whole card including that final.
