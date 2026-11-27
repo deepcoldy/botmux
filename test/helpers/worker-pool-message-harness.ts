@@ -1,11 +1,16 @@
 import { readFileSync } from 'node:fs';
 import ts from 'typescript';
+import { settleScheduledSessionRun } from '../../src/core/scheduled-send.js';
+import { loadWorkerPoolFunction } from './worker-pool-function-harness.js';
 
 // Execute the pool's actual IPC branches without starting a daemon/fleet.
 export function loadWorkerPoolMessageHandlers(names: string[], scope: Record<string, unknown>, asynchronous = false) {
   if (!('config' in scope)) scope.config = { terminalEffortWriteback: false };
   if (!('collectSessionTurnGarbage' in scope)) scope.collectSessionTurnGarbage = () => {};
   if (!('cb' in scope)) scope.cb = {};
+  if (!('settleScheduledSessionRun' in scope)) scope.settleScheduledSessionRun = settleScheduledSessionRun;
+  if (!('settleScheduledRunBinding' in scope)) scope.settleScheduledRunBinding = loadWorkerPoolFunction('settleScheduledRunBinding', scope);
+  if (!('scheduledRunTriggerForWorker' in scope)) scope.scheduledRunTriggerForWorker = loadWorkerPoolFunction('scheduledRunTriggerForWorker', scope);
   const pool = ts.createSourceFile('worker-pool.ts', readFileSync(new URL('../../src/core/worker-pool.ts', import.meta.url), 'utf8'), ts.ScriptTarget.Latest, true);
   const clauses: string[] = [];
   function visit(node: ts.Node) {

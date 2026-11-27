@@ -5175,6 +5175,19 @@ async function buildScheduledTargetNotice(params: {
  * (#2172). Released, the session stays registered under its recovery card;
  * moving it (or rebuilding the worktree) lets the next fire resume it there.
  */
+function disarmRefusedSilentScheduledTurn(ds: DaemonSession, turnId: string): void {
+  disarmSilentScheduledTurn(ds, turnId);
+  if (ds.session.scheduledRun?.turnId === turnId) ds.session.scheduledRun = undefined;
+  if (ds.session.scheduledRuns) {
+    delete ds.session.scheduledRuns[turnId];
+    if (Object.keys(ds.session.scheduledRuns).length === 0) ds.session.scheduledRuns = undefined;
+  }
+  // recordScheduledSessionRun freezes silence durably. A refused admission has
+  // no external effect, so remove that record too rather than suppressing a
+  // later human turn (or a daemon-restart rehydration) forever.
+  sessionStore.updateSession(ds.session);
+}
+
 async function releaseStartRefusedForMissingDir(ds: DaemonSession, err: unknown): Promise<void> {
   const { MissingWorkingDirError } = await import('./working-dir-recovery.js');
   if (!(err instanceof MissingWorkingDirError)) return;
@@ -5197,6 +5210,7 @@ export async function executeScheduledTask(
     /** Persisted turn id for a deferred retry. Must be reused verbatim so the
      *  retry is the same logical turn and cannot double-deliver a target. */
     turnId?: string;
+    trigger?: 'scheduler' | 'dashboard';
     /** Called immediately before the input is handed to a worker, after the
      *  caller persisted the target's `dispatching` state. Returning `false`
      *  means that durable admission did not land; the fire must stop before any
@@ -5414,7 +5428,7 @@ export async function executeScheduledTask(
         try {
           if (!(await persistDispatch(staged))) {
             if (activeSessions.get(stagedKey) === staged) activeSessions.delete(stagedKey);
-            if (silent) disarmSilentScheduledTurn(staged, scheduledTurnId);
+            if (silent) disarmRefusedSilentScheduledTurn(staged, scheduledTurnId);
             await closeSession(staged.session.sessionId);
             return 'deferred';
           }
@@ -5846,7 +5860,7 @@ export async function executeScheduledTask(
         markSessionActivity(existing);
         if (runtime?.runId) {
           recordScheduledSessionRun(existing.session, { taskId: task.id, runId: runtime.runId, turnId: scheduledTurnId,
-            requesterSubjectId: scheduledTrustedCaller?.requestUserOpenId });
+            requesterSubjectId: scheduledTrustedCaller?.requestUserOpenId, silent, trigger: runtime.trigger });
           sessionStore.updateSession(existing.session);
         }
         ensureSessionWhiteboard(existing);
@@ -5890,7 +5904,7 @@ export async function executeScheduledTask(
             // failure shape would be "worked once, silently identity-less after".
             // A refused durable admission must stop before the IPC send.
             if (!(await persistDispatch(existing))) {
-              if (silent) disarmSilentScheduledTurn(existing, scheduledTurnId);
+              if (silent) disarmRefusedSilentScheduledTurn(existing, scheduledTurnId);
               return 'deferred';
             }
             if (sendWorkerInput(
@@ -5912,7 +5926,7 @@ export async function executeScheduledTask(
         }
         try {
           if (!(await persistDispatch(existing))) {
-            if (silent) disarmSilentScheduledTurn(existing, scheduledTurnId);
+            if (silent) disarmRefusedSilentScheduledTurn(existing, scheduledTurnId);
             return 'deferred';
           }
           forkWorker(existing, input, { resume: existing.hasHistory, turnId: scheduledTurnId });
@@ -5960,7 +5974,7 @@ export async function executeScheduledTask(
     session.larkAppId = larkAppId;
     session.scope = runtimeScope;
     if (runtime?.runId) recordScheduledSessionRun(session, { taskId: task.id, runId: runtime.runId, turnId: scheduledTurnId,
-      requesterSubjectId: scheduledTrustedCaller?.requestUserOpenId });
+      requesterSubjectId: scheduledTrustedCaller?.requestUserOpenId, silent, trigger: runtime.trigger });
     if (scheduledTrustedCaller) {
       // A fresh scheduled session is owned by the authenticated task creator.
       // Persist both ids so an in-turn `botmux schedule add` can create a child
@@ -6065,7 +6079,7 @@ export async function executeScheduledTask(
         // Authorization refused before any external effect: roll back the new
         // placeholder completely so this anchor can be created cleanly later.
         if (activeSessions.get(key) === ds) activeSessions.delete(key);
-        if (silent) disarmSilentScheduledTurn(ds, scheduledTurnId);
+        if (silent) disarmRefusedSilentScheduledTurn(ds, scheduledTurnId);
         await closeSession(session.sessionId);
         return 'deferred';
       }

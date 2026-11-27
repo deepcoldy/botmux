@@ -36497,6 +36497,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     onCodexCapacitySettle: settleCodexCapacityFallback,
     loadScheduledTaskForIdentity: (appId, taskId) =>
       readScheduledTaskFromAuthority(scheduleAuthorityStore, appId, taskId),
+    loadScheduledTaskForInput: (appId, taskId) => {
+      if (!scheduleAuthorityStore) throw new Error('schedule authority unavailable');
+      const record = scheduleAuthorityStore.getRecord(appId, taskId);
+      return record?.state !== 'revoked' ? record?.task : undefined;
+    },
     onTriggerTurnStarted: (ds, title, turnId) => beginNewTurn(ds, title, turnId),
     closeSession(ds: DaemonSession): Promise<boolean> {
       // Route through the dashboard-aware helper so session.exited / session.update
@@ -38991,6 +38996,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                         assertScheduledAuthorityCurrent(current, prepared, { runId: executionContext.runId, turnId });
                       },
                       runId: executionContext.runId,
+                      trigger: executionContext.trigger,
                       turnId: turnIds.get(targetTask.chatId!)!,
                       onBeforeDispatch: (turnId, selectedSession) => {
                         admissionSeen = true;

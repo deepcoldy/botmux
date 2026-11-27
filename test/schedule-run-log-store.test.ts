@@ -15,6 +15,7 @@ import {
   MAX_SCHEDULE_RUN_LOG_ENTRIES,
   MAX_SCHEDULE_RUN_LOG_ERROR_BYTES,
   appendScheduleRunLog,
+  findScheduleRunTrigger,
   markScheduleRunLogFailed,
   queryScheduleRunLogs,
   removeScheduleRunLogs,
@@ -92,6 +93,14 @@ describe('schedule-run-log-store', () => {
       offset: 0,
       hasMore: false,
     });
+  });
+
+  it('recovers exact legacy run trigger evidence without guessing missing history', () => {
+    appendScheduleRunLog(entry('run-scheduler'), APP_ID, dataDir);
+    appendScheduleRunLog(entry('run-dashboard', { trigger: 'dashboard' }), APP_ID, dataDir);
+    expect(findScheduleRunTrigger(TASK_ID, 'run-scheduler', APP_ID, dataDir)).toBe('scheduler');
+    expect(findScheduleRunTrigger(TASK_ID, 'run-dashboard', APP_ID, dataDir)).toBe('dashboard');
+    expect(findScheduleRunTrigger(TASK_ID, 'run-missing', APP_ID, dataDir)).toBeUndefined();
   });
 
   it('retains only the latest 100 entries', () => {

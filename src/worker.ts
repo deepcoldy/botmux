@@ -198,7 +198,7 @@ import {
   type CliRestartCause,
   type InterruptedWork,
 } from './services/restart-interruption.js';
-import { appendUnsentInputs, isUnsentInputReplayable, saveUnsentInputs, settleTakenUnsentInputs, takeUnsentInputs } from './services/unsent-input-journal.js';
+import { appendUnsentInputs, removeTakenUnsentInputs, isUnsentInputReplayable, saveUnsentInputs, settleTakenUnsentInputs, takeUnsentInputs } from './services/unsent-input-journal.js';
 import { UniversalOutputHandoff } from './services/universal-output-handoff.js';
 import { WorkerOutputJournal } from './services/worker-output-journal.js';
 import { WorkerFinalOutputHandoff, canHandoffFinalOutput, FINAL_OUTPUT_HANDOFF_MAX_PENDING } from './services/final-output-handoff.js';
@@ -283,6 +283,7 @@ import {
   mergeQueuedCliInput,
   pendingInputMayFlush,
   promoteInteractiveInputPastSchedules,
+  promoteInteractiveInputPastQuotaSchedules,
   pendingInputAllowsTypeAhead,
   resolveInitialPromptDelivery,
   shouldArmSpawnArgvInitialPromptBusy,
@@ -292,7 +293,9 @@ import {
   shouldStopPendingBatch,
   terminalReleasesDurableTurn,
   type PendingCliInput,
+  automaticScheduledInputTask, coalesceAutomaticScheduledInputs, scheduledRecoveryInputTask, shouldDeferScheduledInitialPrompt,
 } from './utils/pending-input-queue.js';
+import { parseScheduledTurnId } from './core/scheduled-turn-provenance.js';
 import { recordSessionTurnInput, updateSessionTurnNativeAnchor } from './services/session-turns.js';
 import { remoteWorkerShutdownInputBlocker } from './core/remote-worker-shutdown-readiness.js';
 import { sendRemoteRunnerOutboundMessage } from './services/remote-runner-outbound-send.js';
@@ -2280,8 +2283,9 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     publishLocalProcessAttestation(undefined, engine.appServerPid);
     const threadId = wantResume ? await engine.resumeThread(cfg.cliSessionId!) : await engine.startThread();
     assertRpcEngagementCurrent();
-    let outcome: EngageOutcome = wantResume ? 'resumed' : 'accepted';
-    if (!wantResume && cfg.prompt) {
+    const queueScheduledPrompt = !!(cfg.turnId && parseScheduledTurnId(cfg.turnId));
+    let outcome: EngageOutcome = wantResume || queueScheduledPrompt ? 'resumed' : 'accepted';
+    if (!wantResume && cfg.prompt && !queueScheduledPrompt) {
       // Only this fresh first turn is sent from here; a resumed prompt is
       // queued and prepared by flushPending's RPC write edge. Keep cfg.prompt
       // and the deferred catalog untouched: a not-sent/failed engagement falls
@@ -4723,6 +4727,8 @@ let cliSubmissionInFlight: {
   /** Its write began at an idle prompt as the flush's first input, so until
    *  the write settles any prompt on screen is the composer echoing it. */
   composerOwned: boolean;
+  scheduledWritePending?: true;
+  scheduledWriteCancelled?: true;
   readyDeferred?: boolean;
   /** The transcript already showed an open turn when the prompt was hidden. */
   turnOpenWhenDeferred?: boolean;
@@ -12880,6 +12886,92 @@ function scanRestartInterruption(path: string, family: 'claude' | 'structured'):
   );
 }
 
+const scheduledInputReceipts = new Map<string, (decision: import('./core/scheduled-input-admission.js').ScheduledInputAdmission) => void>();
+
+let scheduledAdmissionRetry: {
+  item: PendingCliInput;
+  backend: SessionBackend;
+  generation: number;
+  attempt: number;
+  timer?: ReturnType<typeof setTimeout>;
+} | undefined;
+
+function cancelScheduledAdmissionRetry(item?: PendingCliInput): void {
+  if (!scheduledAdmissionRetry || (item && scheduledAdmissionRetry.item !== item)) return;
+  if (scheduledAdmissionRetry.timer) clearTimeout(scheduledAdmissionRetry.timer);
+  scheduledAdmissionRetry = undefined;
+}
+
+function scheduleScheduledAdmissionRetry(item: PendingCliInput): void {
+  const targetBackend = backend;
+  if (!targetBackend) return;
+  const generation = cliSpawnGeneration;
+  const prior = scheduledAdmissionRetry;
+  const attempt = prior?.item === item && prior.backend === targetBackend && prior.generation === generation
+    ? prior.attempt : 0;
+  cancelScheduledAdmissionRetry();
+  const entry: NonNullable<typeof scheduledAdmissionRetry> = {
+    item, backend: targetBackend, generation, attempt: attempt + 1,
+  };
+  scheduledAdmissionRetry = entry;
+  // Retain is fail-closed, not fail-silent. Back off a transient authority/IPC
+  // outage without letting every ready edge create an unbounded retry loop.
+  const delayMs = Math.min(30_000, 1_000 * 2 ** Math.min(attempt, 5));
+  entry.timer = setTimeout(() => {
+    entry.timer = undefined;
+    if (scheduledAdmissionRetry !== entry) return;
+    if (backend !== targetBackend || cliSpawnGeneration !== generation || cliRestartInProgress) {
+      cancelScheduledAdmissionRetry(item);
+      return;
+    }
+    if (isFlushing) { scheduleScheduledAdmissionRetry(item); return; }
+    if (pendingMessages[0] !== item && pendingAdoptMessages[0] !== item) {
+      cancelScheduledAdmissionRetry(item);
+      return;
+    }
+    void flushPending();
+  }, delayMs);
+  entry.timer.unref?.();
+}
+
+async function requestScheduledInputAdmission(item: PendingCliInput): Promise<import('./core/scheduled-input-admission.js').ScheduledInputAdmission> {
+  if (!item.turnId || !parseScheduledTurnId(item.turnId)) return 'allow';
+  const requestId = randomBytes(16).toString('hex');
+  return new Promise(resolve => {
+    const timer = setTimeout(() => finish('retain'), 5_000);
+    const finish = (decision: import('./core/scheduled-input-admission.js').ScheduledInputAdmission) => {
+      clearTimeout(timer); scheduledInputReceipts.delete(requestId); resolve(decision);
+    };
+    scheduledInputReceipts.set(requestId, finish);
+    send({ type: 'admit_scheduled_input', requestId, turnId: item.turnId! });
+  });
+}
+
+async function runScheduledCliInputWrite<T>(
+  item: PendingCliInput,
+  isCurrent: () => boolean,
+  prepare: () => void,
+  write: () => Promise<T>,
+  onHold: (decision: 'reject' | 'retain') => void,
+  requireQueueOwner = true,
+): Promise<T> {
+  if (item.turnId && parseScheduledTurnId(item.turnId)) {
+    const decision = await requestScheduledInputAdmission(item);
+    const owner = cliSubmissionInFlight;
+    const held = requireQueueOwner && owner?.item === item && owner.scheduledWriteCancelled ? 'reject'
+      : !isCurrent() || (requireQueueOwner && owner?.item !== item) ? 'retain' : decision;
+    if (held !== 'allow') {
+      if (held === 'retain') scheduleScheduledAdmissionRetry(item);
+      else cancelScheduledAdmissionRetry(item);
+      onHold(held);
+      throw new Error(`scheduled_input_${held}`);
+    }
+    cancelScheduledAdmissionRetry(item);
+  }
+  prepare();
+  return write();
+}
+
 const deploymentCancellationReceipts = new Map<string, (ok: boolean) => void>();
 
 /** Web terminal writes bypass daemon input routing. Persist withdrawal before
@@ -14205,8 +14297,46 @@ function saveUnsentInputsForSuccessor(reason: string): void {
   }
 }
 
-/** An input reached the CLI: it becomes the turn a standalone restart note
- *  continues, and a restored predecessor input is no longer outstanding. */
+function discardUnwrittenScheduledInput(item: PendingCliInput): void {
+  if (item.turnId) send({ type: 'turn_input_rejected', turnId: item.turnId,
+    ...(item.dispatchAttempt !== undefined ? { dispatchAttempt: item.dispatchAttempt } : {}),
+    reason: 'execution_reconciliation_required', rejectedBeforeAdmission: true });
+  if (restoredUnsentInputs.delete(item)) {
+    const path = unsentInputJournalPath();
+    if (path && item.turnId) removeTakenUnsentInputs(path, new Set([item.turnId]));
+  }
+}
+
+function coalescePendingScheduledInputs(pending: PendingCliInput[] = pendingMessages): void {
+  const dropped = coalesceAutomaticScheduledInputs(pending);
+  const restored = dropped.filter(item => restoredUnsentInputs.delete(item));
+  const path = unsentInputJournalPath();
+  if (path && restored.length > 0) removeTakenUnsentInputs(path, new Set(restored.flatMap(item => item.turnId ? [item.turnId] : [])));
+  for (const item of dropped) discardUnwrittenScheduledInput(item);
+}
+
+function discardScheduledBacklogForStop(): void {
+  const activeTask = currentBotmuxTurnId ? parseScheduledTurnId(currentBotmuxTurnId) : null;
+  const writing = cliSubmissionInFlight;
+  const writingTask = writing?.scheduledWritePending
+    ? automaticScheduledInputTask(writing.item) ?? scheduledRecoveryInputTask(writing.item) : undefined;
+  const targetTask = activeTask ?? writingTask;
+  // STOP belongs to a human/non-scheduled turn unless a scheduled writer proves
+  // otherwise. Never turn that absence into a wildcard over every queued task.
+  if (!targetTask) return;
+  if (writing && writingTask === targetTask) writing.scheduledWriteCancelled = true;
+  for (const queue of [pendingMessages, pendingAdoptMessages]) {
+    for (let index = queue.length - 1; index >= 0; index--) {
+      const item = queue[index]!;
+      const taskId = automaticScheduledInputTask(item) ?? scheduledRecoveryInputTask(item);
+      if (taskId === targetTask) {
+        queue.splice(index, 1);
+        discardUnwrittenScheduledInput(item);
+      }
+    }
+  }
+}
+
 function noteCliInputWritten(
   item: PendingCliInput,
   antigravityAnchor?: AntigravityTranscriptWriteBoundary,
@@ -14231,7 +14361,16 @@ function takeUnsentInputsFromPredecessor(cfg: Extract<DaemonToWorker, { type: 'i
   try {
     const { inputs, expired, unconfirmed } = takeUnsentInputs(path);
     predecessorUnsentInputsTaken = true;
-    for (const input of inputs) restoredUnsentInputs.add(input);
+    for (const input of inputs) {
+      const hostRun = input.turnId ? cfg.scheduledRuns?.[input.turnId]
+        ?? (cfg.scheduledRun?.turnId === input.turnId ? cfg.scheduledRun : undefined) : undefined;
+      // A journal written by the previous build may already contain a legacy
+      // scheduledRun without trigger/recovery provenance. Replace its binding
+      // with the host's newly authenticated evidence instead of keeping the stale copy.
+      if (hostRun) input.scheduledRun = { ...input.scheduledRun, ...hostRun };
+      restoredUnsentInputs.add(input);
+    }
+    coalescePendingScheduledInputs(inputs);
     if (inputs.length > 0) log(`Re-queued ${inputs.length} input(s) the previous worker never wrote to the CLI`);
     if (unconfirmed.length > 0) {
       log(`${unconfirmed.length} restored input(s) of a worker that died while delivering them; reporting them as unconfirmed`);
@@ -23228,7 +23367,7 @@ function beginCliWriteCycle(): void {
  *  message listener does not await a prior async invocation, so without the
  *  outer AsyncSerialQueue two CoCo/Codex writes can overwrite the same composer
  *  while the first is sleeping before Enter or polling history. */
-type AdoptWriteResult = 'completed' | 'refused-before-write' | 'stale-before-write' | 'stale-after-write';
+type AdoptWriteResult = 'completed' | 'admission-rejected' | 'refused-before-write' | 'stale-before-write' | 'stale-after-write';
 
 async function writeAdoptMessage(
   content: string,
@@ -23240,6 +23379,8 @@ async function writeAdoptMessage(
   trustedController?: TrustedCaller,
   fence?: AdoptWriteFence,
   queueAfterActiveTurn?: true,
+  scheduledRun?: import('./types.js').Session['scheduledRun'],
+  scheduledQueueItem?: PendingCliInput,
 ): Promise<AdoptWriteResult> {
   rememberTurnLinkRefMode(turnId, dispatchAttempt, linkRefMode);
   const executionFence = fence ?? captureAdoptWriteFence();
@@ -23247,32 +23388,63 @@ async function writeAdoptMessage(
     return 'stale-before-write';
   }
   const adoptBackend = executionFence.backend;
+  const adoptInterruptGeneration = cliInterruptGeneration;
+  // Retry/requeue identity must be the original queue object. Rebuilding it here
+  // makes the generation-fenced timer cancel itself when the head is compared by reference.
+  const scheduledItem = scheduledQueueItem ?? { content, turnId, queueAfterActiveTurn, scheduledRun };
+  const isScheduledWrite = !!(turnId && parseScheduledTurnId(turnId));
+  let lateScheduledHold: 'reject' | 'retain' | undefined;
+  const recordScheduledHold = (decision: 'reject' | 'retain') => {
+    lateScheduledHold = cliInterruptGeneration !== adoptInterruptGeneration && automaticScheduledInputTask(scheduledItem) ? 'reject' : decision;
+  };
+  const scheduledWriteIsCurrent = () => adoptWriteFenceIsCurrent(executionFence)
+    && cliInterruptGeneration === adoptInterruptGeneration;
   if (cliAdapter?.postTerminalPromptFence === true
     && (currentInputDeliveryQuarantine()
       || await postTerminalInputIsBlocked(adoptBackend))) {
     return 'stale-before-write';
   }
   if (!adoptWriteFenceIsCurrent(executionFence)) return 'stale-before-write';
-
-  renderer?.markNewTurn();
-  const turnSeq = usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
-  if (currentBotmuxTurnId && currentBotmuxTurnId !== turnId) {
-    markTurnRetired(currentBotmuxTurnId);
+  if (turnId && parseScheduledTurnId(turnId)) {
+    const item = scheduledItem;
+    if (automaticScheduledInputTask(item) && usageLimitTracker.detectedThisTurn(usageLimitTracker.currentTurn())) return 'stale-before-write';
+    const decision = await requestScheduledInputAdmission(item);
+    if (!adoptWriteFenceIsCurrent(executionFence)) return 'stale-before-write';
+    if (decision === 'reject') {
+      cancelScheduledAdmissionRetry(item);
+      discardUnwrittenScheduledInput(item);
+      return 'admission-rejected';
+    }
+    if (decision !== 'allow') {
+      scheduleScheduledAdmissionRetry(item);
+      return 'stale-before-write';
+    }
+    cancelScheduledAdmissionRetry(item);
   }
-  setCaptureIdentity(turnId, dispatchAttempt, trustedCaller?.requestUserOpenId);
-  currentBotmuxLinkRefMode = linkRefMode;
-  currentVcMeetingImTurnOrigin = vcMeetingImTurnOrigin;
-  if (typeof supersedeBackgroundAuthorityHold === 'function') supersedeBackgroundAuthorityHold('superseded_by_message');
-  markActiveTurnStarted({
-    turnId,
-    dispatchAttempt,
-    trustedCaller,
-    trustedController,
-    ...(queueAfterActiveTurn ? { queueAfterActiveTurn: true } : {}),
-  });
-  if (dispatchAttempt !== undefined) durableTurnInFlight = true;
-  writeCliPidMarker();
-  publishSandboxRelayCapability();
+
+  let turnSeq = isScheduledWrite ? usageLimitTracker.currentTurn() : 0;
+  const beginAdoptTurn = (): void => {
+    renderer?.markNewTurn();
+    turnSeq = usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
+    if (currentBotmuxTurnId && currentBotmuxTurnId !== turnId) {
+      markTurnRetired(currentBotmuxTurnId);
+    }
+    setCaptureIdentity(turnId, dispatchAttempt, trustedCaller?.requestUserOpenId);
+    currentBotmuxLinkRefMode = linkRefMode;
+    currentVcMeetingImTurnOrigin = vcMeetingImTurnOrigin;
+    if (typeof supersedeBackgroundAuthorityHold === 'function') supersedeBackgroundAuthorityHold('superseded_by_message');
+    markActiveTurnStarted({
+      turnId,
+      dispatchAttempt,
+      trustedCaller,
+      trustedController,
+      ...(queueAfterActiveTurn ? { queueAfterActiveTurn: true } : {}),
+    });
+    if (dispatchAttempt !== undefined) durableTurnInFlight = true;
+    writeCliPidMarker();
+    publishSandboxRelayCapability();
+  };
+  if (!isScheduledWrite) beginAdoptTurn();
   let adoptStructuredBridgeTurnId: string | undefined;
 
   // Capture the transcript baseline immediately before the literal write, inside
@@ -23284,6 +23456,8 @@ async function writeAdoptMessage(
   let adoptWritePrepared = false;
   const prepareAdoptWrite = (): void => {
     if (adoptWritePrepared) return;
+    // A refused schedule must not acquire credentials, quota or active-turn ownership.
+    if (isScheduledWrite) beginAdoptTurn();
     adoptWritePrepared = true;
     // Same anchor rule as flushPending: the execution window opens at the
     // literal adopt write, inside the submission transaction, so a refused
@@ -23378,10 +23552,12 @@ async function writeAdoptMessage(
         // so the transaction can cancel/poison the WAL. Passing the bare backend
         // would let a refused write look like success and clear the journal —
         // silent input loss (the exact failure the transaction guards against).
-        () => cliAdapter!.writeInput(adapterInputHandle(submissionBackend), content,
-          lastInitConfig?.cliId === 'traex' ? { correlateTranscript: true } : undefined),
+        () => runScheduledCliInputWrite(scheduledItem, scheduledWriteIsCurrent,
+          isScheduledWrite ? prepareAdoptWrite : () => {},
+          () => cliAdapter!.writeInput(adapterInputHandle(submissionBackend), content,
+            lastInitConfig?.cliId === 'traex' ? { correlateTranscript: true } : undefined), recordScheduledHold, false),
         settleVerifiableSubmissionForJournal,
-        prepareAdoptWrite,
+        isScheduledWrite ? undefined : prepareAdoptWrite,
       );
       const result = transaction.result;
       recoveryFailureReason = transaction.recoveryFailureReason;
@@ -23437,6 +23613,10 @@ async function writeAdoptMessage(
         }
       }
     } catch (err: any) {
+      if (lateScheduledHold) {
+        if (lateScheduledHold === 'reject') { discardUnwrittenScheduledInput(scheduledItem); return 'admission-rejected'; }
+        return 'stale-before-write';
+      }
       recoveryFailureReason = err instanceof SubmissionWriteError
         ? err.recoveryFailureReason
         : recoveryFailureReason;
@@ -23469,7 +23649,8 @@ async function writeAdoptMessage(
     try {
       const transaction = await runAmbiguousSubmissionTransaction(
         submissionBackend,
-        async () => {
+        () => runScheduledCliInputWrite(scheduledItem, scheduledWriteIsCurrent,
+          isScheduledWrite ? prepareAdoptWrite : () => {}, async () => {
           // Use adapterInputHandle so a ZMX write refusal (sendText/sendSpecialKeys
           // returning false) throws instead of silently succeeding — the raw path
           // needs the same strict-handle guard as the structured writeInput path.
@@ -23482,9 +23663,9 @@ async function writeAdoptMessage(
             throw new Error('backend changed before adopt raw Enter');
           }
           input.sendSpecialKeys!('Enter');
-        },
+        }, recordScheduledHold, false),
         undefined,
-        prepareAdoptWrite,
+        isScheduledWrite ? undefined : prepareAdoptWrite,
       );
       recoveryFailureReason = transaction.recoveryFailureReason;
       if (!adoptWriteFenceIsCurrent(executionFence)) {
@@ -23497,6 +23678,10 @@ async function writeAdoptMessage(
         );
       }
     } catch (err: any) {
+      if (lateScheduledHold) {
+        if (lateScheduledHold === 'reject') { discardUnwrittenScheduledInput(scheduledItem); return 'admission-rejected'; }
+        return 'stale-before-write';
+      }
       recoveryFailureReason = err instanceof SubmissionWriteError
         ? err.recoveryFailureReason
         : recoveryFailureReason;
@@ -23550,6 +23735,8 @@ async function runAdoptMessageForCapturedGeneration(
       item.trustedController,
       fence,
       item.queueAfterActiveTurn,
+      item.scheduledRun,
+      item,
     ),
   });
   if (queued.status === 'stale-before-write') return 'stale-before-write';
@@ -23566,7 +23753,7 @@ async function admitAdoptMessage(item: PendingCliInput): Promise<void> {
   // A callerless follow-up must not adopt a live continuation's authority when
   // cross-principal isolation is off. Freeze the serial marker onto the durable
   // queue item before any await so the eventual write starts its own turn.
-  if (inputForcesSerialTurn(item, activeTurnAuthority.snapshot()?.caller)
+  if ((!!(item.turnId && parseScheduledTurnId(item.turnId)) || inputForcesSerialTurn(item, activeTurnAuthority.snapshot()?.caller))
     && !item.queueAfterActiveTurn) {
     item = { ...item, queueAfterActiveTurn: true };
   }
@@ -23576,6 +23763,7 @@ async function admitAdoptMessage(item: PendingCliInput): Promise<void> {
   const adoptInputBlocked = !alreadyHeld && sessionInputBlocksDeliveryNow();
   if (alreadyHeld || adoptInputBlocked) {
     pendingAdoptMessages.push(item);
+    coalescePendingScheduledInputs(pendingAdoptMessages);
     if (adoptInputBlocked) holdNativeInputForHardBlock();
     log(item.queueAfterActiveTurn
       ? `Queued serial adopt message until the active turn reaches a real prompt boundary (${item.content.length} chars)`
@@ -23588,6 +23776,7 @@ async function admitAdoptMessage(item: PendingCliInput): Promise<void> {
   }
   await runAdoptMessageForCapturedGeneration(item, () => {
     pendingAdoptMessages.push(item);
+    coalescePendingScheduledInputs(pendingAdoptMessages);
     log(`Re-queued stale adopt message for the replacement CLI generation (${item.content.length} chars)`);
   });
 }
@@ -24329,6 +24518,7 @@ function submitCursorParkedFollowUpAfterStop(target: SessionBackend, lifetime: n
 async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
   if (isCriticalInterruptKey(requestedKey) && activeTranscriptImagePurge?.cancel()) return;
   if (nativeSessionForkPending()) return;
+  if (requestedKey === 'ctrlc') discardScheduledBacklogForStop();
   if (lastInitConfig?.deploymentContinuation && (requestedKey === 'ctrlc' || requestedKey === 'esc')) discardDeploymentContinuation();
   // 中断类键按适配器归一。卡片「⏹ 停止」与 `/stop` 都硬编码发 ctrlc，但 ZCode
   // 单个 Ctrl+C 会退出整个进程（0.16.9 实测）——用户点「停止这一轮」却丢掉会话
@@ -30859,9 +31049,20 @@ function promotePendingHumanInterruption(): boolean {
   // swallow the owner's live interruption behind that wait. This is a queue
   // selection only: retain authority, delivery fences and the scheduled work.
   // Use the principal gate even when experimental isolation is disabled.
-  if (runtimeSupportsTypeAhead && !durableTurnInFlight && !directRpcTurnBlocksTypeAhead()
-    && !isRemoteBackendType(effectiveBackendType) && !isCodexAppCliId(lastInitConfig?.cliId)
-    && activeTurnBlocks(pendingMessages[0] ?? {})) {
+  if (durableTurnInFlight || directRpcTurnBlocksTypeAhead()) return false;
+  const queue = lastInitConfig?.adoptMode && pendingAdoptMessages.length > 0 ? pendingAdoptMessages : pendingMessages;
+  const head = queue[0] ?? {};
+  const quotaBlockedAutomaticHead = isPromptReady && automaticScheduledInputTask(head) !== undefined
+    && usageLimitTracker.detectedThisTurn(usageLimitTracker.currentTurn());
+  if (quotaBlockedAutomaticHead) {
+    // The quota-blocked CLI is idle, so this remains a serial queue selection,
+    // not type-ahead. It applies equally to adopt and idle remote backends; their
+    // busy-transport exclusions must not suppress an in-memory reorder.
+    return promoteInteractiveInputPastQuotaSchedules(queue, input =>
+      !activeTurnAuthority.blocks(turnAuthorityIdentity(input)));
+  }
+  if (runtimeSupportsTypeAhead && !isRemoteBackendType(effectiveBackendType)
+    && !isCodexAppCliId(lastInitConfig?.cliId) && activeTurnBlocks(pendingMessages[0] ?? {})) {
     return promoteInteractiveInputPastSchedules(pendingMessages, input =>
       !activeTurnAuthority.blocks(turnAuthorityIdentity(input)));
   }
@@ -31353,13 +31554,12 @@ async function flushPending(): Promise<void> {
         log(`Re-queued adopt message at queue head for the replacement CLI generation (${item.content.length} chars)`);
       });
       // Its native terminal can make the composer ready while the adapter is
-      // still awaiting history. That idle edge reached this flush under its
-      // mutex; re-drive after finally releases it, so the next queued message
-      // does not depend on another terminal redraw. Only a finished write
-      // re-drives: a pre-write refusal ('refused-before-write') wrote nothing
-      // and leaves peers to the next genuine prompt-ready edge, so this can
-      // never spin without a write.
-      if (outcome === 'completed' && isPromptReady && pendingAdoptMessages.length > 0) {
+      // still awaiting history. A finished write or a known host-admission
+      // rejection consumed the head; either can release the ready queue after
+      // finally releases the mutex. Composer refusals still wait for a genuine
+      // new prompt-ready edge, which prevents a no-write retry spin.
+      if ((outcome === 'completed' || outcome === 'admission-rejected')
+        && isPromptReady && pendingAdoptMessages.length > 0) {
         queueMicrotask(() => { void flushPending(); });
       }
       return;
@@ -31507,6 +31707,37 @@ async function flushPending(): Promise<void> {
       const catalogAdmissionHead = pendingMessages[0];
       if (catalogAdmissionHead?.turnId
         && admitTraexCatalogModelBeforeInput(catalogAdmissionHead.turnId, catalogAdmissionHead.dispatchAttempt)) break;
+      const scheduledHead = pendingMessages[0]!;
+      if (scheduledHead.turnId && parseScheduledTurnId(scheduledHead.turnId)) {
+        if (automaticScheduledInputTask(scheduledHead)
+          && usageLimitTracker.detectedThisTurn(usageLimitTracker.currentTurn())) {
+          keepPromptReadyAfterHold();
+          break;
+        }
+        const gateBackend: SessionBackend = backend;
+        const gateGeneration = cliSpawnGeneration;
+        const gateRevision = promptReadinessRevision;
+        const gateWebGeneration = webTerminalInputGeneration;
+        const decision = await requestScheduledInputAdmission(scheduledHead);
+        if (backend !== gateBackend || cliSpawnGeneration !== gateGeneration || cliRestartInProgress
+          || promptReadinessRevision !== gateRevision || webTerminalInputGeneration !== gateWebGeneration
+          || webTerminalInputWireDirty()) { keepPromptReadyAfterHold(); break; }
+        if (pendingMessages[0] !== scheduledHead) { keepPromptReadyAfterHold(); continue; }
+        if (decision === 'reject') {
+          cancelScheduledAdmissionRetry(scheduledHead);
+          pendingMessages.shift();
+          discardUnwrittenScheduledInput(scheduledHead);
+          keepPromptReadyAfterHold();
+          continue;
+        }
+        if (decision !== 'allow') {
+          scheduleScheduledAdmissionRetry(scheduledHead);
+          keepPromptReadyAfterHold();
+          break;
+        }
+        cancelScheduledAdmissionRetry(scheduledHead);
+        if (activeTurnBlocks(scheduledHead)) { keepPromptReadyAfterHold(); break; }
+      }
       // Explicit FIFO, non-interactive input and a rejected steer remain at
       // the head until the native task closes. A stale ready screen cannot
       // turn them into a second turn/start against the live native id.
@@ -31591,7 +31822,9 @@ async function flushPending(): Promise<void> {
         if (cliRestartInProgress) break;
         continue;
       }
-      cliSubmissionInFlight = { item, generation: cliSpawnGeneration, composerOwned: false };
+      const isScheduledWrite = !!(item.turnId && parseScheduledTurnId(item.turnId));
+      cliSubmissionInFlight = { item, generation: cliSpawnGeneration, composerOwned: false,
+        ...(isScheduledWrite ? { scheduledWritePending: true } : {}) };
       inlineParkedTraexSkillCatalog(item);
       attachDeferredPluginSkillCatalog(item);
       // Apply the credential snapshot that arrived WITH this turn, immediately
@@ -31605,6 +31838,7 @@ async function flushPending(): Promise<void> {
       const writeBackend = backend;
       const writeAdapter = cliAdapter;
       const writeRpcEngine = codexRpcEngine;
+      const writeInterruptGeneration = cliInterruptGeneration;
       const writeContinuationIsCurrent = (): boolean => (
         cliSpawnGeneration === writeGeneration
         && backend === writeBackend
@@ -31619,6 +31853,10 @@ async function flushPending(): Promise<void> {
       let submittedText = item.codexAppInput?.text ?? msg;
       let turnSeq = usageLimitTracker.currentTurn();
       let bridgeTurnId: string | undefined;
+      let lateScheduledHold: 'reject' | 'retain' | undefined;
+      const recordScheduledHold = (decision: 'reject' | 'retain') => { lateScheduledHold = decision; };
+      const scheduledWriteIsCurrent = () => writeContinuationIsCurrent()
+        && cliInterruptGeneration === writeInterruptGeneration && !webTerminalInputWireDirty();
       let normalWritePrepared = false;
       let retiredBeforeSubmit = false;
       let webWireWriteRefused = false;
@@ -31640,6 +31878,7 @@ async function flushPending(): Promise<void> {
           throw new SubmissionWriteError('Web terminal wire is dirty before the native write', 'web_terminal_input_wire_dirty', false);
         }
         normalWritePrepared = true;
+        if (cliSubmissionInFlight?.item === item) cliSubmissionInFlight.scheduledWritePending = undefined;
         if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
         // Drain any unread prior-turn/wake records BEFORE rotating authority to
         // `item` so prior `turn_duration` or launches never mutate or destroy
@@ -32022,16 +32261,16 @@ async function flushPending(): Promise<void> {
               failureReason: 'remote-runner requires an authenticated BotMux turn id',
             };
           } else {
-            prepareNormalWrite();
-            result = await writeBackend.submitTurn({
+            result = await runScheduledCliInputWrite(item, scheduledWriteIsCurrent, prepareNormalWrite,
+              () => writeBackend.submitTurn!({
               sessionOrigin: workerSessionEventScope?.origin(item.turnId, item.dispatchAttempt),
               content: msg,
-              turnId: item.turnId,
+              turnId: item.turnId!,
               ...(item.replyTurnId ? { replyTurnId: item.replyTurnId } : {}),
               ...(item.dispatchAttempt !== undefined ? { dispatchAttempt: item.dispatchAttempt } : {}),
               ...(item.linkRefMode ? { linkRefMode: item.linkRefMode } : {}),
               ...(item.trustedCaller ? { trustedCaller: item.trustedCaller } : {}),
-            });
+            }), recordScheduledHold);
           }
         } else if (writeRpcEngine) {
           if (item.taskContinuation
@@ -32085,7 +32324,8 @@ async function flushPending(): Promise<void> {
           // machinery is bypassed. A throw here falls into the catch below and
           // surfaces as a normal submit-failure notice.
           let rpcNativeTurnId: string | undefined;
-          await runAfterAmbiguousSubmissionWrites(writeBackend, async () => {
+          await runAfterAmbiguousSubmissionWrites(writeBackend, () => runScheduledCliInputWrite(
+            item, scheduledWriteIsCurrent, () => {}, async () => {
             // The mutex wait can outlive native completion or another ACK.
             // Exclude this item's own activation lease, but never start/steer
             // across another owner's unresolved transport or hydration phase.
@@ -32121,7 +32361,7 @@ async function flushPending(): Promise<void> {
               rpcTurnIdentity!,
               { onDispatch: prepareNormalWrite },
             )).nativeTurnId;
-          });
+          }, recordScheduledHold));
           // The await may overlap an engine/pane replacement. Fence the captured
           // generation BEFORE touching the global bridge queue; a stale ack must
           // never activate a mark owned by the replacement generation.
@@ -32170,7 +32410,9 @@ async function flushPending(): Promise<void> {
           submissionBackend = writeBackend;
           const transaction = await runAmbiguousSubmissionTransaction(
             writeBackend,
-            () => writeAdapter.writeStructuredInput!(
+            () => runScheduledCliInputWrite(item, scheduledWriteIsCurrent,
+              isScheduledWrite ? prepareNormalWrite : () => {},
+              () => writeAdapter.writeStructuredInput!(
               adapterInputHandle(writeBackend),
               msg,
               item.codexAppInput!,
@@ -32179,9 +32421,9 @@ async function flushPending(): Promise<void> {
                 ...(item.trustedCaller ? { trustedCaller: item.trustedCaller } : {}),
                 ...(item.codexAppSteerable ? { codexAppSteerable: true } : {}),
               },
-            ),
+            ), recordScheduledHold),
             settleVerifiableSubmissionForJournal,
-            prepareNormalWrite,
+            isScheduledWrite ? undefined : prepareNormalWrite,
           );
           result = transaction.result;
           recoveryFailureReason = transaction.recoveryFailureReason;
@@ -32211,7 +32453,9 @@ async function flushPending(): Promise<void> {
           }
           const transaction = await runAmbiguousSubmissionTransaction(
             writeBackend,
-            () => writeAdapter.writeInput(
+            () => runScheduledCliInputWrite(item, scheduledWriteIsCurrent,
+              isScheduledWrite ? prepareNormalWrite : () => {},
+              () => writeAdapter.writeInput(
               adapterInputHandle(writeBackend),
               msg,
               {
@@ -32252,9 +32496,9 @@ async function flushPending(): Promise<void> {
                 ...(item.codexAppSteerable ? { codexAppSteerable: true } : {}),
                 ...(submitGuard ? { submitGuard } : {}),
               },
-            ),
+            ), recordScheduledHold),
             settleVerifiableSubmissionForJournal,
-            (writeAdapter.writeInputDefersPreparation === true || reattachSteerFence)
+            (isScheduledWrite || writeAdapter.writeInputDefersPreparation === true || reattachSteerFence)
               ? undefined : prepareNormalWrite,
           ).finally(() => { traexQuestionDraftWaiting = false; });
           result = transaction.result;
@@ -32297,6 +32541,13 @@ async function flushPending(): Promise<void> {
           scheduleBusyPatternIdleProbe(`${cliName()} post-submit`);
         }
       } catch (err: any) {
+        if (lateScheduledHold && !normalWritePrepared) {
+          if (lateScheduledHold === 'reject') discardUnwrittenScheduledInput(item);
+          else pendingMessages.unshift(item);
+          keepPromptReadyAfterHold();
+          if (lateScheduledHold === 'reject') continue;
+          break;
+        }
         if (reattachSteerWriteRefused && !normalWritePrepared && writeContinuationIsCurrent()) {
           pendingMessages.unshift(item);
           requeueUnsubmittedQueuedActivation(item);
@@ -33097,6 +33348,7 @@ function sendToPty(
   content: string,
   turnId?: string,
   opts: {
+    scheduledRun?: import('./types.js').Session['scheduledRun'];
     queueAfterActiveTurn?: true;
     codexAppInput?: CodexAppTurnInput;
     dispatchAttempt?: number;
@@ -33129,10 +33381,11 @@ function sendToPty(
   // on the terminal boundary instead of letting adapter type-ahead, queue
   // merging, or isolation-off envelope adoption splice tasks together.
   const queueAfterActiveTurn = inputForcesSerialTurn(
-    opts,
+    { ...opts, ...((turnId && parseScheduledTurnId(turnId)) ? { queueAfterActiveTurn: true as const } : {}) },
     activeTurnAuthority.snapshot()?.caller,
   );
   const next: PendingCliInput = {
+    scheduledRun: opts.scheduledRun,
     content,
     turnId,
     // Tag only while the live pane is actually held by capacity. The
@@ -33170,6 +33423,7 @@ function sendToPty(
     // only the materialization drain below may filter durable submissions.
     turnInputCommitDeferredForMaterialization.add(next);
     pendingMessages.push(next);
+    coalescePendingScheduledInputs();
     log(`Queued message behind async init materialization (${pendingMessages.length} pending)`);
     return true;
   }
@@ -33179,6 +33433,7 @@ function sendToPty(
   // DISPATCHED.
   if (cliRestartInProgress || !backend) {
     freshnessInputQueue.enqueueNormal(next);
+    coalescePendingScheduledInputs();
     log(`Queued message while CLI backend is restarting (${pendingMessages.length} pending)`);
     return true;
   }
@@ -33213,6 +33468,7 @@ function sendToPty(
   } else {
     freshnessInputQueue.enqueueNormal(next);
   }
+  coalescePendingScheduledInputs();
   // A new user message can REPLACE the running turn on CLIs with no usable
   // steer channel (see CliAdapter.preemptsOnNewMessage). Queue first, then
   // interrupt: the interrupt's async completion must never race the enqueue, or
@@ -37625,7 +37881,7 @@ async function spawnCliBody(
     : cfg.deferredScheduleRun && cliAdapter.findInitialPromptArgSubmission
       ? cliAdapter.captureInitialPromptArgSubmission?.() ?? null
       : null;
-  const deferInitialPrompt = traexAutoModelController?.config.trigger === 'quota' || shouldDeferInitialPromptForStartup({
+  const deferInitialPrompt = shouldDeferScheduledInitialPrompt(cfg) || traexAutoModelController?.config.trigger === 'quota' || shouldDeferInitialPromptForStartup({
     hasStartupCommands: spawnHasStartupWork(cfg.startupCommands, cfg.initialNativeRename),
     adoptMode: cfg.adoptMode === true,
     passesInitialPromptViaArgs: cliAdapter.passesInitialPromptViaArgs === true,
@@ -48885,6 +49141,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
           // attribution — queue them BEFORE this fork's new prompt while prepared
           // predecessors stay preloaded in the exact final FIFO above.
           pendingMessages.unshift(...recoveredAcceptedInputs, ...predecessorUnsentInputs.splice(0), {
+            scheduledRun: msg.scheduledRun,
             content: lastSpawnQueuedInitialPrompt ?? msg.prompt,
             ...(lastSpawnQueuedInitialPromptLogicalContent
               ? { logicalContent: lastSpawnQueuedInitialPromptLogicalContent }
@@ -48900,7 +49157,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
             vcMeetingImTurnOrigin: msg.vcMeetingImTurnOrigin,
             trustedCaller: msg.trustedCaller,
             trustedController: msg.trustedController,
-            ...(inputForcesSerialTurn({ trustedCaller: msg.trustedCaller })
+            ...((!!(msg.turnId && parseScheduledTurnId(msg.turnId)) || inputForcesSerialTurn({ trustedCaller: msg.trustedCaller }))
               ? { queueAfterActiveTurn: true as const } : {}),
             codexAppInput: msg.promptCodexAppInput,
             // Thread the root's steer authorization so ordered pre-final steer can
@@ -48917,6 +49174,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
             ...(msg.atMostOnce ? { noReplay: true } : {}),
           });
           initialInputCommitted = true;
+          coalescePendingScheduledInputs();
           initialInputQueued = true;
         } else if (!initialTurnCancelled && isCodexAppCliId(msg.cliId)) {
           pendingMessages.unshift(...recoveredAcceptedInputs);
@@ -49100,8 +49358,11 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
           }
         }
         // No queued opening prompt to keep them behind: they lead the queue.
-        if (predecessorUnsentInputs.length > 0) pendingMessages.unshift(...predecessorUnsentInputs
-          .filter(item => !item.turnId || !cancelledQueuedTurnIds.has(item.turnId)));
+        if (predecessorUnsentInputs.length > 0) {
+          pendingMessages.unshift(...predecessorUnsentInputs
+            .filter(item => !item.turnId || !cancelledQueuedTurnIds.has(item.turnId)));
+          coalescePendingScheduledInputs();
+        }
         // The first turn is now either at queue head or already owned by the
         // argv/RPC startup path. Only now may an early idle edge drain
         // follow-ups that arrived while init was awaiting slow startup work.
@@ -49540,6 +49801,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       }
       if (lastInitConfig?.adoptMode) {
         const item: PendingCliInput = {
+          scheduledRun: msg.scheduledRun,
           content,
           turnId: msg.turnId,
           ...(msg.queueAfterActiveTurn ? { queueAfterActiveTurn: true } : {}),
@@ -49566,6 +49828,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
           // turn whose `botmux send` could sneak its sentAtMs past this
           // turn's markTimeMs and falsely suppress its fallback.
           const inputCommitted = sendToPty(content, msg.turnId, {
+            scheduledRun: msg.scheduledRun,
             ...(effectiveQueueAfterActiveTurn ? { queueAfterActiveTurn: true } : {}),
             codexAppInput,
             dispatchAttempt: msg.dispatchAttempt,
@@ -50676,6 +50939,11 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
 
     case 'absorbed_reply_delivered': {
       noteAbsorbedReplyDelivered(msg.turnId, msg.dispatchAttempt, msg.replyUuid);
+      break;
+    }
+
+    case 'scheduled_input_admitted': {
+      scheduledInputReceipts.get(msg.requestId)?.(msg.decision);
       break;
     }
 

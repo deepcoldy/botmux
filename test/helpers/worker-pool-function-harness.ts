@@ -20,7 +20,8 @@ import { isStructuredNoticeProtocolMessage } from '../../src/services/structured
 import { ProtectedResultStore } from '../../src/services/protected-result-store.js';
 import { hasProtectedSessionMutationOwnership, protectedSessionMutationReasons } from '../../src/core/session-mutation-guard.js';
 import { parseScheduledTurnId } from '../../src/core/scheduled-turn-provenance.js';
-import { scheduledSessionRun } from '../../src/core/scheduled-send.js';
+import { scheduledSessionRun, scheduledSessionRunWithEvidence, settleScheduledSessionRun } from '../../src/core/scheduled-send.js';
+import { findScheduleRunTrigger } from '../../src/services/schedule-run-log-store.js';
 
 /** deliverFinalOutput's protected final gate reads `config.session.dataDir` and
  * constructs ProtectedResultStore. Sliced closures do not load module imports,
@@ -108,6 +109,9 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
   if (key === 'cliModelMayKeepReasoningEffort') return cliModelMayKeepReasoningEffort;
   if (key === 'config') return { terminalEffortWriteback: false, session: { dataDir: getHarnessDataDir() } };
   if (key === 'ProtectedResultStore') return ProtectedResultStore;
+  if (key === 'scheduledSessionRunWithEvidence') return scheduledSessionRunWithEvidence;
+  if (key === 'settleScheduledSessionRun') return settleScheduledSessionRun;
+  if (key === 'findScheduleRunTrigger') return findScheduleRunTrigger;
   if (key === 'pendingOrdinaryImDeliveries') return scope.pendingOrdinaryImDeliveries ??= new Map();
   if (key === 'workerCommittedTurnIds') return scope.workerCommittedTurnIds ??= new WeakMap();
   if (key === 'collectSessionTurnGarbage') return () => {};
@@ -117,7 +121,8 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
     'releaseHeldCotMessage', 'isReplayOfHeldCotTerminal', 'isSynthesizedBackgroundTurnId', 'finalizeOrHoldCotMessage',
     'requiredReplyCotHoldKey', 'settleRequiredReplyBackground', 'settleRequiredReplyCotMessage',
     'failRequiredReplyCotHolds', 'clearWorkerRuntimeProvenance', 'clearDedupReconcileRetryTimer',
-    'hasInstallChangeMutationOwnership', 'hasInstallChangeSuspendGuard'].includes(key)) {
+    'hasInstallChangeMutationOwnership', 'hasInstallChangeSuspendGuard',
+    'scheduledRunForWorker', 'scheduledRunsForWorker', 'scheduledRunTriggerForWorker', 'settleScheduledRunBinding'].includes(key)) {
     return scope[key] ??= loadWorkerPoolFunction(key, scope);
   }
   return (globalThis as any)[key];
