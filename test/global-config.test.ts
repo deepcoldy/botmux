@@ -60,6 +60,22 @@ describe('global dashboard config', () => {
     rmSync(home, { recursive: true, force: true });
   });
 
+  it.each([
+    ['botmux：', 'botmux：'],
+    ['[BotMux] ', '[BotMux] '],
+    ['🧰'.repeat(24), '🧰'.repeat(24)],
+    [' ', undefined],
+    ['bad\nlabel', undefined],
+    ['x'.repeat(25), undefined],
+    ['bad\ud800label', undefined],
+    [true, undefined],
+  ])('reads the global Codex App title prefix without changing separators, row %#', (value, expected) => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ codexAppTitlePrefix: value, lang: 'zh' }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig()).toMatchObject({ lang: 'zh' });
+    expect(readGlobalConfig().codexAppTitlePrefix).toBe(expected);
+  });
+
   it('defaults terminal effort writeback off and preserves unrelated keys when toggled', () => {
     expect(readGlobalConfig().dashboard?.terminalEffortWriteback === true).toBe(false);
     mergeGlobalConfig({ dashboard: { publicReadOnly: false, noVisibleOutputHint: true } });

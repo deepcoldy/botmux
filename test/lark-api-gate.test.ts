@@ -247,6 +247,21 @@ describe('executeWithLarkGate — retry', () => {
     }
   });
 
+  it('lets an operation with an external usage budget cap its own retries', async () => {
+    process.env.BOTMUX_LARK_GATE_RETRY_MAX_ATTEMPTS = '3';
+    vi.useFakeTimers();
+    try {
+      const fn = vi.fn().mockRejectedValue(axiosError(429));
+      const p = executeWithLarkGate('app-token-budget', 'op', fn, { retryMaxAttempts: 1 });
+      const expectation = expect(p).rejects.toThrow('status code 429');
+      await vi.advanceTimersByTimeAsync(20000);
+      await expectation;
+      expect(fn).toHaveBeenCalledTimes(2); // initial request + its sole permitted retry
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('retries a 4xx carrying a transient Lark business code', async () => {
     vi.useFakeTimers();
     try {

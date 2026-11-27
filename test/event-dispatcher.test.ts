@@ -172,7 +172,10 @@ const mockGetChatModeStrict = vi.fn(async () => 'group' as 'group' | 'topic' | '
 const mockGetCachedChatModeStrict = vi.fn(() => 'group' as 'group' | 'topic' | 'p2p' | undefined);
 const mockGetChatInfo = vi.fn(async () => ({ userCount: 1, botCount: 1 }));
 const mockReplyMessage = vi.fn(async () => 'msg-id');
-const mockUpdateMessage = vi.fn(async () => true);
+const mockUpdateMessage = vi.fn(async (_larkAppId: string, _messageId: string, _cardJson: string) => true);
+const mockUpdateInteractiveCardByToken = vi.fn(async (
+  _larkAppId: string, _token: string, _card: Record<string, unknown>,
+) => {});
 const mockListChatMessages = vi.fn(async () => [] as any[]);
 const mockListChatMessagesUntil = vi.fn(async () => [] as any[]);
 const mockListThreadMessages = vi.fn(async () => [] as any[]);
@@ -206,6 +209,7 @@ vi.mock('../src/im/lark/client.js', () => ({
   resolveSiblingBotBySenderOpenId: (...args: any[]) => mockResolveSiblingBot(...args),
   replyMessage: (...args: any[]) => mockReplyMessage(...args),
   updateMessage: (...args: any[]) => mockUpdateMessage(...args),
+  updateInteractiveCardByToken: (...args: any[]) => mockUpdateInteractiveCardByToken(...args),
   getMessageDetail: (...args: any[]) => mockGetMessageDetail(...args),
   resolveUnionIdFromOpenId: (...args: any[]) => mockResolveUnionIdFromOpenId(...args),
   resolveUnionIdFromOpenIdStrict: (...args: any[]) => mockResolveUnionIdFromOpenIdStrict(...args),
@@ -329,6 +333,8 @@ import { __resetPeerCrossRefCacheForTest } from '../src/services/peer-cross-ref-
 import { CLONE_EXCLUDED_KEYS, cloneBotConfig, cloneOwnerEntries } from '../src/setup/bot-config-editor.js';
 import { normalizeManagedOwnerEntries } from '../src/setup/owner-identity.js';
 import { createPluginCardActionGateway } from '../src/core/plugins/card-actions/gateway.js';
+import { buildSessionClosedCard } from '../src/im/lark/card-builder.js';
+import { handleSessionWorktreeCleanupAction } from '../src/im/lark/session-worktree-cleanup-card.js';
 import { InputCaptureTerminalRejection } from '../src/core/plugins/input-capture/runtime.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
 import { _resetMentionDropCountsForTest } from '../src/im/lark/mention-drop-telemetry.js';
@@ -12286,6 +12292,7 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     __resetAnchorQueues();
     __resetEventClaimsForTest();
     mockUpdateMessage.mockClear();
+    mockUpdateInteractiveCardByToken.mockReset().mockResolvedValue(undefined);
     vi.mocked(logger.error).mockClear();
     setupBotState();
     handlers = makeHandlers();
@@ -12365,6 +12372,184 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
       'om_feedback_stale',
       JSON.stringify({ type: 'latest-feedback-card' }),
     );
+  });
+
+  it.each([false, true])('keeps shared Card 1.0 token updates visible to every recipient (preexisting open_ids=%s)', async withExistingOpenIds => {
+    const rawCard: Record<string, any> = {
+      config: { wide_screen_mode: true, update_multi: true }, elements: [],
+    };
+    if (withExistingOpenIds) rawCard.open_ids = ['ou_stale_recipient'];
+    handlers.handleCardAction.mockResolvedValue({ card: { type: 'raw', data: rawCard } });
+
+    const result = await capturedHandlers['card.action.trigger']({
+      event_id: `evt-shared-card-${withExistingOpenIds}`,
+      token: 'c_shared_card', message_id: 'om_shared_card',
+      operator: { open_id: USER_OPEN_ID },
+      action: { value: { action: 'cleanup_session_worktree' } },
+    });
+
+    expect(result).toEqual({});
+    expect(mockUpdateInteractiveCardByToken).not.toHaveBeenCalled();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
+    expect(mockUpdateInteractiveCardByToken).toHaveBeenCalledOnce();
+    expect(mockUpdateInteractiveCardByToken.mock.calls[0][0]).toBe(MY_APP_ID);
+    expect(mockUpdateInteractiveCardByToken.mock.calls[0][1]).toBe('c_shared_card');
+    const update = mockUpdateInteractiveCardByToken.mock.calls[0][2];
+    expect(update.config.update_multi).toBe(true);
+    expect(update).not.toHaveProperty('open_ids');
+  });
+
+  it.each([
+    { label: 'default exclusive', card: { config: { wide_screen_mode: true }, elements: [] } },
+    { label: 'empty recipients', card: { config: { update_multi: false }, open_ids: [], elements: [] } },
+  ])('addresses $label Card 1.0 updates to the operator', async ({ card }) => {
+    handlers.handleCardAction.mockResolvedValue({ card: { type: 'raw', data: card } });
+    const result = await capturedHandlers['card.action.trigger']({
+      event_id: `evt-exclusive-card-${card.config.update_multi}`,
+      token: 'c_exclusive_card', message_id: 'om_exclusive_card',
+      operator: { open_id: USER_OPEN_ID },
+      action: { value: { action: 'faas.confirm' } },
+    });
+    expect(result).toEqual({});
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(mockUpdateInteractiveCardByToken).toHaveBeenCalledWith(
+      MY_APP_ID, 'c_exclusive_card', { ...card, open_ids: [USER_OPEN_ID] },
+    );
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { label: 'Card 2.0', card: { schema: '2.0', config: { update_multi: true }, body: { elements: [] } } },
+    { label: 'template', card: { type: 'template', data: { template_id: 'tpl_confirm' } } },
+  ])('does not add legacy open_ids to $label delayed updates', async ({ label, card }) => {
+    handlers.handleCardAction.mockResolvedValue({ card: { type: 'raw', data: card } });
+    const result = await capturedHandlers['card.action.trigger']({
+      event_id: `evt-nonlegacy-${label}`, token: 'c_nonlegacy', message_id: 'om_nonlegacy',
+      operator: { open_id: USER_OPEN_ID }, action: { value: { action: 'faas.confirm' } },
+    });
+    expect(result).toEqual({});
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(mockUpdateInteractiveCardByToken).toHaveBeenCalledWith(MY_APP_ID, 'c_nonlegacy', card);
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { label: 'missing', card: { config: { wide_screen_mode: true }, elements: [] } },
+    { label: 'explicit', card: { config: { update_multi: false }, open_ids: ['ou_existing'], elements: [] } },
+  ])('handles exclusive Card 1.0 with $label recipients but no operator', async ({ label, card }) => {
+    const afterAck = vi.fn(async () => {});
+    handlers.handleCardAction.mockResolvedValue({ card: { type: 'raw', data: card }, afterAck });
+    const result = await capturedHandlers['card.action.trigger']({
+      event_id: `evt-exclusive-without-operator-${label}`,
+      token: 'c_without_operator', message_id: 'om_without_operator',
+      action: { value: { action: 'faas.confirm' } },
+    });
+    expect(result).toEqual({});
+    await vi.waitFor(() => expect(afterAck).toHaveBeenCalledOnce());
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
+    if (label === 'explicit') {
+      expect(mockUpdateInteractiveCardByToken).toHaveBeenCalledWith(MY_APP_ID, 'c_without_operator', card);
+    } else {
+      // No operator means no valid recipient list. Do not spend the token or
+      // attempt an exclusive update through message.patch; continuation survives.
+      expect(mockUpdateInteractiveCardByToken).not.toHaveBeenCalled();
+    }
+  });
+
+  it('settles an intermediate token update before the cleanup result continuation', async () => {
+    const events: string[] = [];
+    let releaseToken!: () => void;
+    const tokenPending = new Promise<void>(resolve => { releaseToken = resolve; });
+    mockUpdateInteractiveCardByToken.mockImplementation(async () => {
+      events.push('token:running:start');
+      await tokenPending;
+      events.push('token:running:end');
+    });
+    mockUpdateMessage.mockImplementation(async () => {
+      events.push('patch:result');
+      return true;
+    });
+    const session = { sessionId: 'sess_ordered_cleanup', status: 'closed', larkAppId: MY_APP_ID } as any;
+    handlers.handleCardAction.mockImplementation(() => handleSessionWorktreeCleanupAction({
+      larkAppId: MY_APP_ID, operatorOpenId: USER_OPEN_ID,
+      sessionId: session.sessionId, cardMessageId: 'om_ordered_cleanup',
+    }, {
+      canOperate: () => true,
+      getSession: () => session,
+      buildCard: (_session, state) => buildSessionClosedCard(
+        session.sessionId, 'om_ordered_root', 'ordered cleanup', 'claude-code',
+        undefined, undefined, 'zh-CN', undefined, undefined,
+        { note: state.phase === 'running' ? 'running' : 'result', button: state.phase === 'running' },
+      ),
+      cleanup: async () => ({ status: 'removed', dir: '/tmp/fenced-cleanup' }),
+      updateCard: async (messageId, card) => { await mockUpdateMessage(MY_APP_ID, messageId, card); },
+      sendToOperator: async () => { throw new Error('unexpected private fallback'); },
+      locale: 'zh-CN',
+    }));
+
+    vi.useFakeTimers();
+    try {
+      const call = capturedHandlers['card.action.trigger']({
+        event_id: 'evt_ordered_cleanup', token: 'c_ordered_cleanup', message_id: 'om_ordered_cleanup',
+        operator: { open_id: USER_OPEN_ID },
+        action: { value: { action: 'cleanup_session_worktree', session_id: session.sessionId } },
+      });
+      await expect(call).resolves.toEqual({});
+      await vi.advanceTimersByTimeAsync(0);
+      expect(events).toEqual(['token:running:start']);
+
+      releaseToken();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(events).toEqual(['token:running:start', 'token:running:end', 'patch:result']);
+    } finally {
+      releaseToken();
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it('still runs afterAck when the intermediate card update fails', async () => {
+    mockUpdateInteractiveCardByToken.mockRejectedValueOnce(new Error('300030 token expired'));
+    const afterAck = vi.fn(async () => {});
+    handlers.handleCardAction.mockResolvedValue({
+      card: { type: 'raw', data: { schema: '2.0', body: { elements: [] } } },
+      afterAck,
+    });
+    const result = await capturedHandlers['card.action.trigger']({
+      event_id: 'evt_failed_intermediate', token: 'c_failed_intermediate', message_id: 'om_failed_intermediate',
+      operator: { open_id: USER_OPEN_ID }, action: { value: { action: 'faas.confirm' } },
+    });
+    expect(result).toEqual({});
+    await vi.waitFor(() => expect(afterAck).toHaveBeenCalledOnce());
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('300030 token expired'));
+  });
+
+  it('does not misreport a slow toast-plus-card result as toast-only', async () => {
+    let release!: () => void;
+    handlers.handleCardAction.mockReturnValueOnce(new Promise(resolve => {
+      release = () => resolve({
+        toast: { type: 'success', content: 'done' },
+        card: { type: 'raw', data: { schema: '2.0', body: { elements: [] } } },
+      });
+    }) as any);
+    vi.mocked(logger.warn).mockClear();
+    vi.useFakeTimers();
+    try {
+      const call = capturedHandlers['card.action.trigger']({
+        event_id: 'evt_slow_mixed_result', token: 'c_slow_mixed', message_id: 'om_slow_mixed',
+        operator: { open_id: USER_OPEN_ID }, action: { value: { action: 'faas.confirm' } },
+      });
+      await vi.advanceTimersByTimeAsync(2500);
+      await expect(call).resolves.toEqual({ toast: expect.objectContaining({ type: 'info' }) });
+      release();
+      await vi.runAllTimersAsync();
+      expect(mockUpdateInteractiveCardByToken).toHaveBeenCalledOnce();
+      expect(logger.warn).not.toHaveBeenCalledWith(expect.stringContaining('toast-only result'));
+    } finally {
+      release();
+      vi.useRealTimers();
+    }
   });
 
   it('runs a fresh publisher after ACK without returning or patching a captured card', async () => {

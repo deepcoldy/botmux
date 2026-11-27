@@ -23,6 +23,7 @@ import { cleanLiveAdoptTitle } from '../utils/live-title.js';
 import { LSOF_EXEC_OPTIONS } from '../utils/process-open-files.js';
 import { PROCESS_TABLE_MAX_BUFFER } from '../utils/exec-limits.js';
 import { PROC_STAT_STARTTIME_INDEX, procStatFieldsAfterComm } from '../utils/proc-stat.js';
+import { isElectronHelperProcessArgv } from '../utils/electron-process.js';
 import { validateOrcaAdoptTarget, type OrcaAdoptableSession } from './orca-adopt-discovery.js';
 
 // macOS 没有 /proc，所以走 ps/lsof/pgrep 兜底。Linux 仍优先走 /proc 快路径。
@@ -75,6 +76,12 @@ export interface AdoptableSession {
 
 // ─── CLI process name → CliId mapping ────────────────────────────────────────
 
+/** Agent Local's separately distributed executable. Linux TASK_COMM_LEN also
+ *  exposes its 18-byte basename as the 15-byte `cursor-agent-lo`; argv retains
+ *  the full name. Keep both spellings narrow and explicit until upstream's
+ *  verified process shape adds another alias. */
+const CURSOR_AGENT_LOCAL_EXECUTABLES = new Set(['cursor-agent-local', 'cursor-agent-lo']);
+
 const CLI_COMM_MAP: Record<string, CliId> = {
   claude: 'claude-code',
   // Claude Code's npm package runs its native `bin/claude.exe`; that is the comm.
@@ -91,6 +98,8 @@ const CLI_COMM_MAP: Record<string, CliId> = {
   aiden: 'aiden',
   coco: 'coco',
   'cursor-agent': 'cursor',
+  'cursor-agent-local': 'cursor',
+  'cursor-agent-lo': 'cursor',
   // CoCo 的别名 traecli：某些发行版（如 trae）安装的可执行实际叫
   // `traecli`，tmux pane_current_command 仍显示 "coco" 是因为进程标题被
   // 改写过；macOS 下 `ps -o comm=` 拿到的是真实 argv[0]，因此这里需要
@@ -279,6 +288,18 @@ export function processExecutableArgvSlots(
   return isGenericLauncherComm(comm) ? launcherExecutableSlots(argv) : argv.slice(0, 1);
 }
 
+/** Cursor's descendant BFS normally trusts comm only, because a wrapper's
+ *  arbitrary arguments can name its payload. Agent Local may instead run as
+ *  MainThread, so admit its exact executable names only from argv[0] or the
+ *  constrained launcher-script slot — never from later program arguments. */
+function isCursorAgentLocalExecutable(arg: string): boolean {
+  return CURSOR_AGENT_LOCAL_EXECUTABLES.has(executableBasename(arg));
+}
+
+function hasCursorAgentLocalExecutableArgv(comm: string, argv: string[]): boolean {
+  return processExecutableArgvSlots(comm, argv).some(isCursorAgentLocalExecutable);
+}
+
 export function cliIdForComm(
   comm: string,
   filterCliId?: CliId,
@@ -386,13 +407,25 @@ export function cliIdFromCommArgv(
       detected = 'codex';
     }
   } else if (!detected && COMM_ARGV_LAUNCHERS.has(comm)) {
-    for (const arg of argv) {
-      if (arg.startsWith('-')) continue;
-      const id = cliIdForComm(basename(arg), filterCliId);
-      if (id) { detected = id; break; }
+    // MainThread and interpreter names are shared with unrelated programs.
+    // Agent Local therefore requires an explicit Cursor filter AND a
+    // constrained executable argv slot; never accept its name from a later
+    // program argument. Other long-standing launcher identities are unchanged.
+    if (filterCliId === 'cursor' && hasCursorAgentLocalExecutableArgv(comm, argv)) {
+      detected = 'cursor';
+    } else {
+      for (const arg of argv) {
+        if (arg.startsWith('-') || isCursorAgentLocalExecutable(arg)) continue;
+        const id = cliIdForComm(basename(arg), filterCliId);
+        if (id) { detected = id; break; }
+      }
     }
   }
   if (!detected) return undefined;
+  // Every classifier consumer (tmux, Zellij, Herdr and validation) gets the
+  // same Cursor helper boundary. Comm-only BFS and Orca's independent process
+  // table apply the same predicate at their own match points.
+  if (detected === 'cursor' && isElectronHelperProcessArgv(argv)) return undefined;
   if (filterCliId && detected !== filterCliId) return undefined;
   return detected;
 }
@@ -695,10 +728,12 @@ export const CODEX_LEAF_SEARCH_DEPTH = 16;
  * session-id discovery and leaves the JSONL bridge watching a path the real CLI
  * never writes. This walks the launcher's DESCENDANTS to find the actual CLI.
  *
- * Executable matching is by process `comm`, not by searching argv. The launcher's own
- * argv carries the target name as a literal token (`aiden x claude` → "claude"
- * is in argv), so argv-scanning (cliIdFromCommArgv) would misidentify the
- * launcher itself as the CLI. The real CLI process has the binary as its comm
+ * Executable matching is normally by process `comm`, not by searching argv: the
+ * launcher's own argv carries the target name as a literal token
+ * (`aiden x claude` → "claude" is in argv), so unrestricted argv-scanning could
+ * misidentify a wrapper as the CLI. The one narrow exception is Cursor Agent
+ * Local under MainThread, matched only against constrained executable argv
+ * slots. Other real CLI processes have the binary as their comm
  * (`claude`, `codex`, …); the launcher's comm is its own (`node`/`aiden`). Codex
  * additionally excludes noninteractive commands such as `debug models`.
  *
@@ -751,7 +786,12 @@ function findLaunchedCliPidWithUnknownState(
       if (seen.has(pid)) continue;
       seen.add(pid);
       const comm = commOf(pid);
-      if (comm && cliIdForComm(comm, targetCliId, filterExecutable) === targetCliId) {
+      const cursorArgv = targetCliId === 'cursor' && comm ? cmdlineOf(pid) : undefined;
+      const matchesByComm = !!comm && cliIdForComm(comm, targetCliId, filterExecutable) === targetCliId;
+      const matchesCursorLocalArgv = targetCliId === 'cursor' && comm === 'MainThread'
+        && cursorArgv !== undefined && hasCursorAgentLocalExecutableArgv(comm, cursorArgv);
+      if (comm && (matchesByComm || matchesCursorLocalArgv)
+        && !(cursorArgv && isElectronHelperProcessArgv(cursorArgv))) {
         if (targetCliId === 'codex'
           && (isZombie(pid) || isNonInteractiveCodexArgv(cmdlineOf(pid)))) continue;
         if (probes.isUnknownWrapper?.(pid, comm)) {
@@ -1306,8 +1346,8 @@ function resolveAdoptableSessionForPane(
   // ~/.claude/sessions/<pid>.json to the child, not the wrapper), so
   // reading meta off the launcher pid misses it and leaves sessionId
   // undefined → no bridgeJsonlPath → adopted claude's replies never reach
-  // Lark. findLaunchedCliPid does a comm-only BFS from the launcher's
-  // children to find the actual CLI binary. When none exists yet (or this
+  // Lark. findLaunchedCliPid searches the launcher's descendants for the actual
+  // CLI binary, excluding Electron helpers. When none exists yet (or this
   // process legitimately IS the CLI running under a launcher comm, e.g. a
   // node-based CLI with no renamed process title), fall back to match.pid.
   //

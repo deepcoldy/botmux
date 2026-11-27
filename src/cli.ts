@@ -186,6 +186,7 @@ import { defaultStatFile, parseSendInvocation, validateClientSendInvocation, typ
 import { parseDispatchArgs } from './cli/dispatch-args.js';
 import { safeRequirementUrl } from './core/dispatch-task-tree.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
+import { createDispatchModelDetector } from './cli/dispatch-model-probe.js';
 import { isCodexReasoningEffort, type CodexReasoningEffort } from './services/codex-reasoning-effort.js';
 import { resolveDispatchLaunchSpec } from './core/dispatch-launch-spec.js';
 import {
@@ -18431,11 +18432,23 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   let effectiveRuntime: { model: string; reasoningEffort?: CodexReasoningEffort } | undefined;
   if (hasLaunchOverride) {
     const target = botConfigs.find(cfg => cfg.larkAppId === parsedBotApps[0]!.appId)!;
-    const adapter = createCliAdapterSync(target.cliId, target.cliRuntime?.executable ?? target.cliPathOverride);
+    const adapter = createCliAdapterSync(
+      target.cliId,
+      target.cliRuntime?.executable ?? target.cliPathOverride,
+      { configDir: target.cliConfigDir },
+    );
+    // The caller's session is not the target worker's identity baseline. The
+    // shared detector strips that identity and fail-closes when no trusted
+    // target profile/endpoint is available; Claude wrappers never probe native.
+    const detectModels = createDispatchModelDetector({
+      target,
+      callerEnv: process.env,
+      adapter,
+    });
     const resolved = await resolveDispatchLaunchSpec({
       requested: { model: dispatchArgs.model, reasoningEffort: dispatchArgs.reasoningEffort },
       target,
-      detectModels: () => adapter.detectModels?.() ?? Promise.resolve(null),
+      detectModels,
     });
     if (!resolved.ok) { console.error(resolved.error); process.exit(1); }
     requestedLaunch = resolved.requested;

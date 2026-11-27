@@ -55,6 +55,8 @@ export interface DetectModelsOptions {
   readonly runtimeContext?: string;
   /** Bot-specific environment for a capability probe. */
   readonly probeEnv?: NodeJS.ProcessEnv;
+  /** Botmux-owned global/Bot overlay, kept separate from inherited probeEnv. */
+  readonly probeSettingsEnv?: NodeJS.ProcessEnv;
   /** Trusted executable selected from the target Bot's persisted native runtime. */
   readonly runtimeExecutable?: string;
   /** Command resolver injection for deterministic cache-identity tests. */
@@ -152,10 +154,15 @@ async function detectModelCatalogWith(
     ?? ((cliId: CliId, pathOverride?: string) => createCliAdapterSync(cliId, pathOverride));
   try {
     const opt = lookupCliSelection(key);
-    // Only ttadk owns its model list. Other registered wrappers (including
-    // cjadk) retain the underlying adapter's live slug discovery; Aiden Codex
-    // is handled by its dedicated detector below.
+    // Only ttadk owns its model list. Other registered wrappers keep the
+    // underlying adapter's live slug discovery — except the Claude gateways
+    // below; Aiden Codex is handled by its dedicated detector.
     if (!opt || isTtadkWrapper(opt.wrapperCli)) return null;
+    // Claude 网关 wrapper（aiden-x-claude、cjadk-x-claude）的模型集合由网关定义。
+    // 原生 claude-code 探测器没有 Bot 时会退到宿主机的官方账户目录，给出的列表
+    // 与网关无关，因此这类 wrapper 一律回退静态候选（与 ClaudeFamilyVariant 的
+    // 注释一致；cli dispatch 侧有同一条守卫）。
+    if (opt.cliId === 'claude-code' && opt.wrapperCli) return null;
 
     // Pi reads local configuration in the effective environment, including
     // ambient HOME/agent-dir when no Bot-specific probe env was supplied.
@@ -212,7 +219,12 @@ async function detectModelCatalogWith(
               ? await (opts?.aidenCodexDetector ?? detectAidenCodexModels)()
               : adapter?.detectModelCapabilities
                 ? capabilities?.map(model => model.slug) ?? null
-                : await adapter?.detectModels?.({ env: probeEnv }) ?? null;
+                : await adapter?.detectModels?.({
+                    env: probeEnv,
+                    ...(opts?.probeSettingsEnv && Object.keys(opts.probeSettingsEnv).length > 0
+                      ? { settingsEnv: opts.probeSettingsEnv }
+                      : {}),
+                  }) ?? null;
             // 只缓存非空成功结果；失败（null/空数组/异常）不缓存，下次调用重试。
             if (models === null) return null;
             if (models.length === 0) return { models: [] };
