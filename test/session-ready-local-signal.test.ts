@@ -7,7 +7,8 @@
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { spawnSyncTsEvalWithRepoImports } from './helpers/ts-runner.js';
 import {
   acknowledgeLocalSessionReadySignal,
   consumeLocalSessionReadySignal,
@@ -86,6 +87,24 @@ describe('local SessionStart channel — writer and reader', () => {
     expect(writeLocalSessionReadySignal(c.env(), 'resume')).toMatch(/^[0-9a-f]{32}$/);
     expect(consumeLocalSessionReadySignal(c)).toMatchObject({ kind: 'signal', source: 'resume' });
     expect(consumeLocalSessionReadySignal(c)).toEqual({ kind: 'none' });
+  });
+
+  it.runIf(process.platform === 'linux')('preserves the pending signal when the next record exceeds the file size limit', () => {
+    const c = channel();
+    const pending = writeLocalSessionReadySignal(c.env(), 'startup');
+    // Linux short-writes up to the limit, then rejects further writes with EFBIG.
+    // Apply the limit only inside the disposable writer, after its imports have loaded.
+    const writer = spawnSyncTsEvalWithRepoImports(`
+      import { execFileSync } from 'node:child_process';
+      import { writeLocalSessionReadySignal } from './src/utils/session-ready-local-signal.js';
+      process.on('SIGXFSZ', () => {});
+      execFileSync('prlimit', ['--pid', String(process.pid), '--fsize=64:64']);
+      console.log(JSON.stringify(writeLocalSessionReadySignal(process.env, 'resume')));
+    `, { env: { ...process.env, ...c.env() }, encoding: 'utf8' });
+    expect(writer.status, String(writer.stderr)).toBe(0);
+    expect(JSON.parse(String(writer.stdout))).toBeNull();
+    expect(consumeLocalSessionReadySignal(c)).toEqual({ kind: 'signal', id: pending, source: 'startup' });
+    expect(readdirSync(dirname(c.filePath))).toEqual([]);
   });
 
   it('drops an unknown source value but keeps the signal', () => {
@@ -277,6 +296,22 @@ describe('local SessionStart channel — ack ordering', () => {
     const k = clock();
     await expect(waitForLocalSessionReadyAck(c.env(), id, 2_000, { now: k.now, pollMs: 20, sleep: k.sleepWith() })).resolves.toBe(false);
     expect(k.now()).toBe(2_000);
+  });
+
+  it('keeps the ack timeout when the system clock moves backwards', async () => {
+    const c = channel();
+    const id = writeLocalSessionReadySignal(c.env(), 'startup')!;
+    const k = clock();
+    const monotonic = vi.spyOn(performance, 'now').mockImplementation(k.now);
+    const wall = vi.spyOn(Date, 'now').mockImplementation(() => k.now() - (k.sleeps.length ? 600_000 : 0));
+    try {
+      const sleep = k.sleepWith(() => { expect(k.now()).toBeLessThanOrEqual(2_000); });
+      await expect(waitForLocalSessionReadyAck(c.env(), id, 2_000, { sleep })).resolves.toBe(false);
+      expect(k.now()).toBe(2_000);
+    } finally {
+      wall.mockRestore();
+      monotonic.mockRestore();
+    }
   });
 
   it('ignores an ack for another signal, another spawn, or a malformed / symlinked ack', async () => {

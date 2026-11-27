@@ -34,7 +34,7 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import {
   closeSync, constants as fsConstants, fstatSync, lstatSync, mkdtempSync,
-  openSync, readSync, renameSync, rmSync, unlinkSync, writeSync,
+  openSync, readSync, renameSync, rmSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { basename, dirname, isAbsolute, join } from 'node:path';
 
@@ -110,7 +110,7 @@ function atomicWrite(dir: string, name: string, body: string): boolean {
   let fd: number | undefined;
   try {
     fd = openSync(tmp, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | (fsConstants.O_NOFOLLOW ?? 0), 0o600);
-    writeSync(fd, body);
+    writeFileSync(fd, body);
     closeSync(fd);
     fd = undefined;
     renameSync(tmp, join(dir, name));
@@ -238,7 +238,7 @@ export async function waitForLocalSessionReadyAck(
   const ack = join(dirname(filePath), ACK_BASENAME);
   const pollMs = opts.pollMs ?? 20;
   const sleep = opts.sleep ?? (ms => new Promise<void>(r => setTimeout(r, ms)));
-  const now = opts.now ?? Date.now;
+  const now = opts.now ?? (() => performance.now());
   const deadline = now() + timeoutMs;
   for (;;) {
     const read = readRecord(ack);
