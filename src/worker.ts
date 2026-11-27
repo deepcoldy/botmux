@@ -29340,6 +29340,7 @@ function settleRestartAttemptOnReady(
       attemptId: activeRestartAttemptId,
       status: 'succeeded',
       category: 'prompt_ready',
+      reliableTurnTerminal: cliAdapter?.reliableTurnTerminal === true,
       ...(topicEffort ? { topicEffort } : {}),
     });
     // The success receipt is the ONLY edge that closes the restart's status card

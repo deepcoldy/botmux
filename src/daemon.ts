@@ -515,6 +515,7 @@ import { isLocalCliOpenReady } from './services/local-cli-opener.js';
 import { RECEIVED_REACTION_EMOJI_TYPE, SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE } from './core/pending-response.js';
 import { t as tr, localeForBot } from './i18n/index.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
+import { antigravityTransport } from './services/antigravity-transport.js';
 import {
   initWorkerPool,
   setActiveSessionsRegistry,
@@ -588,6 +589,7 @@ import {
   sendFoldBackgroundUpdatesSetting,
   resetUsageLimitForNewTurn,
   scheduleUsageLimitPersistenceRetry,
+  resolveSessionEnvForSession,
 } from './core/worker-pool.js';
 import { notePromptCacheKeepaliveTurnStarted, runPromptCacheKeepaliveSweep, statuslineContextTokens } from './core/prompt-cache-keepalive.js';
 import { invalidateIdleAutoCompactRetryForTurn, isLocalCliCommand, noteIdleAutoCompactTurnStarted, runIdleAutoCompactSweep, type IdleAutoCompactNotice, type IdleAutoCompactRefusalReason } from './core/idle-auto-compact.js';
@@ -3444,8 +3446,7 @@ function resolveVcMeetingReceiverSession(sessionId: string): VcMeetingReceiverSe
   if (!ds) return undefined;
   try {
     const bot = getBot(ds.larkAppId);
-    const cliId = (ds.session.cliId as CliId | undefined) ?? bot.config.cliId;
-    const adapter = createCliAdapterSync(cliId, bot.config.cliPathOverride);
+    const cliId = (ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? bot.config.cliId) as CliId;
     const backendType = resolvePairedSpawnBackendType(
       cliId,
       ds.initConfig?.backendType ?? ds.session.backendType,
@@ -3458,11 +3459,55 @@ function resolveVcMeetingReceiverSession(sessionId: string): VcMeetingReceiverSe
       backendType,
     });
     if (!isolation.ok) return undefined;
+
+    const hasLiveWorker = !!(ds.worker && !ds.worker.killed);
+    const restartTurnTerminal = ds.inPlaceRestartTurnTerminal;
+    const restartTurnTerminalPending = ds.inPlaceRestartTurnTerminalPending;
+    const restartPending = !!(hasLiveWorker
+      && restartTurnTerminalPending
+      && restartTurnTerminalPending.workerGeneration === ds.workerGeneration);
+    const attested = hasLiveWorker
+      && restartTurnTerminal
+      && restartTurnTerminal.workerGeneration === ds.workerGeneration
+      ? restartTurnTerminal.reliableTurnTerminal
+      : undefined;
+    let reliableTurnTerminal = false;
+    // A live restart hides the previous attestation until its correlated
+    // success receipt arrives. Failure/timeout keep the generation-scoped
+    // pending marker, including across parked prompt_ready recovery; a late
+    // receipt cannot clear it. An untouched receipt restores the old readiness
+    // and attestation together. A workerless session instead resolves the same
+    // live env that its next cold fork will use, ignoring stale restart state.
+    if (!(hasLiveWorker && (ds.workerReady === false || restartPending))) {
+      if (attested !== undefined) {
+        reliableTurnTerminal = attested;
+      } else {
+        // Same three-tier precedence as every spawn-time resolver
+        // (session-manager/trigger-session): a legacy session's own frozen
+        // cliPathOverride shadows the live bot default; the bot fallback only
+        // applies when the session still runs the bot's configured CLI.
+        const cliPathOverride = ds.session.cliLaunchSnapshot?.cliPathOverride
+          ?? ds.session.cliPathOverride
+          ?? (cliId === bot.config.cliId ? bot.config.cliPathOverride : undefined);
+        const sessionEnv = hasLiveWorker && ds.initConfig
+          ? ds.initConfig.env
+          : resolveSessionEnvForSession(ds, bot.config, backendType).env;
+        const agyTransport = cliId.toLowerCase() === 'antigravity'
+          ? antigravityTransport(sessionEnv)
+          : undefined;
+        const adapter = createCliAdapterSync(
+          cliId,
+          cliPathOverride,
+          agyTransport ? { antigravityTransport: agyTransport } : undefined,
+        );
+        reliableTurnTerminal = adapter.reliableTurnTerminal === true;
+      }
+    }
     return {
       sessionId: ds.session.sessionId,
       chatId: ds.chatId,
       agentAppId: ds.larkAppId,
-      reliableTurnTerminal: adapter.reliableTurnTerminal === true,
+      reliableTurnTerminal,
     };
   } catch {
     return undefined;
@@ -23238,6 +23283,9 @@ async function handleVcMeetingPush(ctx: VcMeetingPushContext): Promise<void> {
 export const __vcMeetingAgentTest = {
   handlePush: handleVcMeetingPush,
   handleCardAction: handleVcMeetingCardAction,
+  resolveReceiverSession: resolveVcMeetingReceiverSession,
+  registerReceiverMember: (raw: unknown, receiverAppId?: string) =>
+    registerVcMeetingMember(raw, vcMeetingDeliveryReceiverDeps(receiverAppId)),
   receiverSessionSnapshot: (sessionId: string) => {
     const ds = [...activeSessions.values()].find(candidate =>
       candidate.session.sessionId === sessionId);
