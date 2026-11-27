@@ -302,7 +302,12 @@ describe('contentful historical Codex App settlement delivery', () => {
     expect(h.sent).toHaveBeenCalledWith(expect.objectContaining({ requestId: 'persist-old', ok: true }));
     expect(h.ds.session.codexAppDispatchLedger?.map(entry => entry.dispatchId)).toEqual(['dispatch-next']);
     const ledger = new TurnSendLedger(config.session.dataDir);
-    expect(ledger.read({ larkAppId: h.ds.larkAppId, sessionId: h.ref.sessionId, turnId: 'old-turn', dispatchAttempt: 1 })?.final).toBeUndefined();
+    const ledgerKey = { larkAppId: h.ds.larkAppId, sessionId: h.ref.sessionId, turnId: 'old-turn', dispatchAttempt: 1 };
+    // A first-attempt withdrawal proves this call had no external effect: the
+    // journal must not retain an unknown publication that would later fail closed
+    // on replay (the uncertain-retry cases below assert the opposite polarity).
+    expect(ledger.read(ledgerKey)?.final).toBeUndefined();
+    expect(ledger.read(ledgerKey)?.publication).toBeUndefined();
 
     const origin = { ...h.msg.sessionContract, sequence: 2, eventId: `${h.msg.sessionContract.producer.workerId}:2` };
     await h.run({ ...h.msg, sessionContract: origin, sessionOutputOrigin: origin,
