@@ -25,6 +25,7 @@ function loadDispatcherSeams(): {
     'serializeRawCardForPatch',
     'cardActionMessageId',
     'cardActionToken',
+    'cardActionOperatorOpenId',
     'delayedUpdateCardFromRaw',
     'cardActionPatchErrorDetail',
   ];
@@ -87,21 +88,21 @@ describe('card action deferred update routing', () => {
     expect(seams.calls.patch).not.toHaveBeenCalled();
   });
 
-  it('keeps Card 1.0 group cards on message.patch even when token exists', async () => {
+  it('uses token delayed update for shared Card 1.0 without narrowing its audience', async () => {
     const seams = loadDispatcherSeams();
     const card = { config: { update_multi: true }, elements: [] };
     await seams.patchTimedOutCardActionResult('app', click, { deferredCard: { type: 'raw', data: card } });
-    expect(seams.calls.token).not.toHaveBeenCalled();
-    expect(seams.calls.patch).toHaveBeenCalledWith('app', 'om_message', JSON.stringify(card));
+    expect(seams.calls.token).toHaveBeenCalledWith('app', 'callback-token', card);
+    expect(seams.calls.patch).not.toHaveBeenCalled();
   });
 
-  it('falls back to message.patch when token delayed update fails', async () => {
+  it('does not issue a generic message.patch fallback after a token failure', async () => {
     const seams = loadDispatcherSeams();
     seams.calls.token.mockRejectedValueOnce(new Error('token failed'));
-    const card = { schema: '2.0', body: { elements: [] } };
-    await seams.patchTimedOutCardActionResult('app', click, { deferredCard: { type: 'raw', data: card } });
+    const card = { schema: '2.0', config: { update_multi: true }, body: { elements: [] } };
+    await expect(seams.patchTimedOutCardActionResult('app', click, { deferredCard: { type: 'raw', data: card } }))
+      .rejects.toThrow('token failed');
     expect(seams.calls.token).toHaveBeenCalled();
-    expect(seams.calls.patch).toHaveBeenCalledWith('app', 'om_message', JSON.stringify(card));
-    expect(seams.calls.warn).toHaveBeenCalledWith(expect.stringContaining('falling back to message.patch'));
+    expect(seams.calls.patch).not.toHaveBeenCalled();
   });
 });

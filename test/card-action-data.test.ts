@@ -30,20 +30,20 @@ describe('Lark callback payload normalization', () => {
     expect(data.operator?.open_id).toBe('ou_user');
   });
 
+  it('uses flattened action_value when the action exists without a value', () => {
+    const data = normalizeCardActionData({
+      action: { tag: 'button', form_value: { comment: '说明' } },
+      action_value: JSON.stringify(value),
+    });
+    expect(data.action).toMatchObject({ tag: 'button', value, form_value: { comment: '说明' } });
+  });
+
   it('keeps explicit action.value before flattened action_value', () => {
     const data = normalizeCardActionData({
       action: { value },
       action_value: JSON.stringify({ action: 'close' }),
     });
     expect(data.action?.value).toEqual(value);
-  });
-
-  it('uses flattened action_value when action exists without value', () => {
-    const data = normalizeCardActionData({
-      action: { tag: 'button' },
-      action_value: JSON.stringify(value),
-    });
-    expect(data.action).toMatchObject({ tag: 'button', value });
   });
 
   it.each(['broken JSON', 'null', '[]', '42', '"feedback_submit"', [], null, 42].map(raw => [raw]))(

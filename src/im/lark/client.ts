@@ -1588,6 +1588,8 @@ export async function updateInteractiveCardByToken(
   let cardJson = JSON.stringify(card);
   cardJson = prepareLocalAddressContent(cardJson, 'interactive', linkFieldContext(larkAppId));
   const stampedCard = JSON.parse(stampBotmuxCallbackMarkers(cardJson)) as Record<string, unknown>;
+  // A callback token permits at most two delayed updates: one initial request
+  // plus one retry. The generic gate default (three retries) can exhaust it.
   return executeWithLarkGate(larkAppId, 'updateInteractiveCardByToken', async () => {
     const c = getBotClient(larkAppId);
     const res: any = await c.request({
@@ -1596,7 +1598,7 @@ export async function updateInteractiveCardByToken(
       data: { token, card: stampedCard },
     });
     if (res.code !== 0) throw larkApiError('update interactive card by token', res);
-  });
+  }, { retryMaxAttempts: 1 });
 }
 
 export interface CardStreamingSettings {
