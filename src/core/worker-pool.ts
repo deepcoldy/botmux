@@ -301,7 +301,7 @@ import { getSessionUsageSnapshot } from './cost-calculator.js';
 import { repairReplyMarkdown } from '../services/reply-markdown.js';
 import { renderBrandTemplate } from '../im/lark/brand-template.js';
 import { handleCotThinkingUpdate, handleCotThinkingSuperseded, finalizeCotMessage, hasCotMessageForTurn, cotMessageFinishStatus, abortCotMessage, resumeCotMessage, cotEnabled } from '../im/lark/cot-message.js';
-import { retireReplyCardDisplay, settleTurnReplyCardTerminal, replyCardDispatchAttempt, updateReplyCardNativeThinking, replyCardModeFor, replyCardSandboxBlocked, updateTurnReplyCard, queueTurnReplyTools, flushTurnReplyTools, settleTurnReplyCards, supersedeTurnReplyCard } from './turn-reply-card.js';
+import { cardTerminalForHistoricalReply, cardTerminalForRequiredReply, readHistoricalSink, retireReplyCardDisplay, settleTurnReplyCardTerminal, replyCardDispatchAttempt, updateReplyCardNativeThinking, replyCardModeFor, replyCardSandboxBlocked, updateTurnReplyCard, queueTurnReplyTools, flushTurnReplyTools, settleTurnReplyCards, supersedeTurnReplyCard } from './turn-reply-card.js';
 import { captureTerminalReplyContext } from './terminal-reply-context.js';
 import { ReplyCardWithdrawnError, TurnReplyCardStore } from '../services/turn-reply-card.js';
 import { readGroupContextAuthorOrigin } from '../services/group-context-publication.js';
@@ -30676,7 +30676,7 @@ function setupWorkerHandlers(
           terminalReplyCardSend = (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.turnId, { uuid, beforeWrite });
           const replyCardSend = terminalReplyCardSend;
           const waitingForReply = requiresReply && msg.status === 'completed' && !answered() && !emptyRequiredReply;
-          const cardTerminal = emptyRequiredReply && !answered() ? { ...msg, status: 'failed' as const } : msg;
+          const cardTerminal = cardTerminalForRequiredReply(msg, requiresReply, answered);
           const settleCard = waitingForReply
             ? retireReplyCardDisplay(ds, { ...msg, message: tr('worker.required_reply_pending', undefined, localeForBot(ds.larkAppId)) },
               replyCardSend, ownsLifecycleMutation)
@@ -32722,7 +32722,31 @@ function setupWorkerHandlers(
         finalizeCotMessage(ds, msg.turnId, msg.status, msg.dispatchAttempt);
       }
       if (!managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
-        await settleTurnReplyCardTerminal(ds, msg,
+        // Mirror the live handler's fail-closed rule: a required IM reply with
+        // no deliverable output must not be styled as deliberate silence just
+        // because its terminal is replayed from history after a daemon restart.
+        // Capture the narrowed fields here: the closure below cannot keep the
+        // turn_terminal type narrowing on the mutable `msg` binding.
+        const historicalSessionId = msg.sessionId;
+        const historicalDispatchAttempt = msg.dispatchAttempt;
+        // Legacy cards early-return inside settleTurnReplyCardTerminal. Resolve
+        // the mode first so a legacy replay does no pointless sink/ledger reads
+        // (and cannot emit ledger warnings). A mode probe failure must not block
+        // the event: fall through to the evidence path, whose reads are already
+        // exception-contained.
+        let historicalLegacy = false;
+        try {
+          historicalLegacy = replyCardModeFor(ds, turnId) === 'legacy';
+        } catch (error) {
+          logger.warn(`[${t}] historical reply-card terminal: mode probe failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        const historicalCardTerminal = historicalLegacy
+          ? msg
+          : cardTerminalForHistoricalReply(msg, readHistoricalSink(journal, historicalSessionId, turnId), () =>
+            new TurnSendLedger(config.session.dataDir).readFinalForAttempt({
+              larkAppId: ds.larkAppId, sessionId: historicalSessionId, turnId, dispatchAttempt: historicalDispatchAttempt,
+            })?.messageId);
+        await settleTurnReplyCardTerminal(ds, historicalCardTerminal,
           (body, type, uuid, beforeWrite) => scopedReply(body, type, turnId, { uuid, beforeWrite }), ownsDisplay)
           .catch(error => logger.warn(`[${t}] historical reply-card terminal: ${error.message}`));
       }
