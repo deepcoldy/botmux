@@ -147,6 +147,15 @@ export function takeUnsentInputs(
   return { inputs: fresh.map(entry => entry.input), expired, unconfirmed };
 }
 
+/** Remove definitely unwritten, discarded inputs from crash recovery evidence. */
+export function removeTakenUnsentInputs(path: string, turnIds: ReadonlySet<string>): void {
+  const entries = readUnsentInputFile(takenPath(path));
+  if (!entries) return;
+  const remaining = entries.filter(entry => !entry.input.turnId || !turnIds.has(entry.input.turnId));
+  if (remaining.length === 0) rmSync(takenPath(path), { force: true });
+  else writeUnsentInputFile(takenPath(path), remaining);
+}
+
 /** Every taken input reached the CLI (or was handed on again by a save). */
 export function settleTakenUnsentInputs(path: string): void {
   rmSync(takenPath(path), { force: true });

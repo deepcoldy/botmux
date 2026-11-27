@@ -5156,6 +5156,7 @@ export async function executeScheduledTask(
     /** Scheduler run id, kept on a hidden run so a later delivery failure can
      *  amend that run's execution-log record. */
     runId?: string;
+    trigger?: 'scheduler' | 'dashboard';
   },
 ): Promise<void> {
   // Resolve which bot to use — prefer the task's original bot so replies come from
@@ -5648,7 +5649,7 @@ export async function executeScheduledTask(
         markSessionActivity(existing);
         if (runtime?.runId) {
           recordScheduledSessionRun(existing.session, { taskId: task.id, runId: runtime.runId, turnId: scheduledTurnId,
-            requesterSubjectId: scheduledTrustedCaller?.requestUserOpenId });
+            requesterSubjectId: scheduledTrustedCaller?.requestUserOpenId, silent, trigger: runtime.trigger });
           sessionStore.updateSession(existing.session);
         }
         ensureSessionWhiteboard(existing);
@@ -5753,7 +5754,7 @@ export async function executeScheduledTask(
     session.larkAppId = larkAppId;
     session.scope = runtimeScope;
     if (runtime?.runId) recordScheduledSessionRun(session, { taskId: task.id, runId: runtime.runId, turnId: scheduledTurnId,
-      requesterSubjectId: scheduledTrustedCaller?.requestUserOpenId });
+      requesterSubjectId: scheduledTrustedCaller?.requestUserOpenId, silent, trigger: runtime.trigger });
     if (scheduledTrustedCaller) {
       // A fresh scheduled session is owned by the authenticated task creator.
       // Persist both ids so an in-turn `botmux schedule add` can create a child

@@ -327,6 +327,20 @@ describe('retained-topic scheduled send policy', () => {
 });
 
 describe('executeScheduledTask — silent thread fire', () => {
+  it.each(['scheduler', 'dashboard'] as const)('freezes silence and %s origin on fresh and reused runs', async trigger => {
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }),
+      active, refreshCliVersion, undefined, { runId: 'run-silent', trigger });
+    const ds = active.get(sessionKey(ROOT, APP))!;
+    const first = JSON.parse(JSON.stringify(ds.session.scheduledRun));
+    expect(first).toMatchObject({ runId: 'run-silent', silent: true, trigger });
+
+    await executeScheduledTask(baseTask({ rootMessageId: ROOT, scope: 'thread', silent: false }),
+      active, refreshCliVersion, undefined, { runId: 'run-loud', trigger });
+    expect(ds.session.scheduledRun).toMatchObject({ runId: 'run-loud', silent: false, trigger });
+    expect(ds.session.scheduledRuns?.[first.turnId]).toEqual(first);
+  });
+
   it('freezes the fire requester separately from a reused session owner', async () => {
     const active = new Map<string, DaemonSession>();
     const owned = baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true,

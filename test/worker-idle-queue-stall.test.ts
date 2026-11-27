@@ -1,9 +1,12 @@
+import { admitScheduledInput } from '../src/core/scheduled-input-admission.js';
 import { describe, expect, it, vi } from 'vitest';
 import { decideQueuedReadyTransition } from '../src/core/queued-ready-transition.js';
 import { ActiveTurnAuthority } from '../src/core/active-turn-authority.js';
 import { pendingInputAllowsTypeAhead, pendingInputMayFlush, promoteInteractiveInputPastSchedules } from '../src/utils/pending-input-queue.js';
 import { programStatusBlockHoldsTypeAhead } from '../src/core/program-status-gate.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { AsyncSerialQueue } from '../src/utils/async-serial-queue.js';
+import { runAdoptQueuedWriteSequence } from '../src/services/adopt-input-sequence.js';
 
 function harness(cliId = 'codex') {
   const caller = { requestUserOpenId: 'owner', requestLarkAppId: 'app', senderType: 'user' as const };
@@ -321,4 +324,382 @@ describe('adopt refork initial continuation waits for the actual pane', () => {
     expect(h.freshnessInputQueue.takeNormal).toHaveBeenCalledOnce();
     expect(h.pendingMessages).toEqual([]);
   });
+});
+
+describe('scheduled admission at the real worker drain', () => {
+  const turnId = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+  const scheduled = () => ({ turnId, content: 'latest complete envelope', queueAfterActiveTurn: true as const,
+    scheduledRun: { taskId: 'a1b2c3d4', runId: 'run-1', turnId, trigger: 'scheduler' as const } });
+  function ready() {
+    const h = harness(); h.activeTurnAuthority.clear(); h.pendingMessages = [scheduled()];
+    h.send = vi.fn(); h.freshnessInputQueue = { takeNormal: vi.fn(() => { h.pendingMessages.shift(); return undefined; }) };
+    return h;
+  }
+
+  it.each(['done', 'paused', 'revoked', 'superseded'])('never dequeues a queued schedule when host reports %s', async state => {
+    const h = ready(); const task: any = { id: 'a1b2c3d4', lastRunId: 'run-1', enabled: true };
+    if (state === 'done') task.untilDone = { status: 'done' };
+    if (state === 'paused') { task.enabled = false; task.disabledReason = 'manual'; }
+    if (state === 'superseded') task.lastRunId = 'run-2';
+    h.requestScheduledInputAdmission = vi.fn(async () => admitScheduledInput(
+      { scheduledRun: scheduled().scheduledRun } as any, 'app', turnId, () => state === 'revoked' ? undefined : task));
+    await h.flushPending();
+    expect(h.freshnessInputQueue.takeNormal).not.toHaveBeenCalled();
+    expect(h.pendingMessages).toEqual([]);
+    expect(h.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'turn_input_rejected', turnId }));
+  });
+
+  it('rechecks after busy becomes idle and retains ordinary input after a rejected automatic input', async () => {
+    const h = ready(); h.isPromptReady = false;
+    h.requestScheduledInputAdmission = vi.fn(async () => 'reject');
+    await h.flushPending(); expect(h.requestScheduledInputAdmission).not.toHaveBeenCalled();
+    const human = { turnId: 'om_human', content: 'continue ordinary work' };
+    h.pendingMessages.push(human); h.isPromptReady = true;
+    await h.flushPending();
+    expect(h.requestScheduledInputAdmission).toHaveBeenCalledOnce();
+    expect(h.freshnessInputQueue.takeNormal).toHaveBeenCalledOnce();
+    expect(h.pendingMessages).toEqual([]);
+  });
+
+  it('does not dequeue while an asynchronous host decision is pending', async () => {
+    const h = ready(); const task: any = { id: 'a1b2c3d4', lastRunId: 'run-1', enabled: true };
+    let reply!: () => void;
+    h.requestScheduledInputAdmission = () => new Promise(resolve => {
+      reply = () => resolve(admitScheduledInput({ scheduledRun: scheduled().scheduledRun } as any, 'app', turnId, () => task));
+    });
+    const flush = h.flushPending(); await Promise.resolve();
+    expect(h.freshnessInputQueue.takeNormal).not.toHaveBeenCalled();
+    task.enabled = false; task.disabledReason = 'manual'; reply(); await flush;
+    expect(h.freshnessInputQueue.takeNormal).not.toHaveBeenCalled();
+  });
+
+  it.each(['backend', 'generation', 'head', 'web epoch'])('refuses a stale allowed ACK after %s changes during admission', async change => {
+    const h = ready(); const original = h.pendingMessages[0];
+    h.requestScheduledInputAdmission = vi.fn(async () => {
+      if (change === 'backend') h.backend = {};
+      if (change === 'generation') h.cliSpawnGeneration = 2;
+      if (change === 'head' && h.requestScheduledInputAdmission.mock.calls.length === 1) h.pendingMessages[0] = { ...original, content: 'replacement head' };
+      if (change === 'web epoch') h.webTerminalInputGeneration = 1;
+      return change === 'head' && h.requestScheduledInputAdmission.mock.calls.length > 1 ? 'retain' : 'allow';
+    });
+    await h.flushPending();
+    expect(h.freshnessInputQueue.takeNormal).not.toHaveBeenCalled();
+    expect(h.pendingMessages).toHaveLength(1);
+    expect(h.isPromptReady).toBe(true);
+  });
+
+  it('retains the exact head when host authority is unavailable', async () => {
+    const h = ready(); h.requestScheduledInputAdmission = async () => 'retain';
+    const before = [...h.pendingMessages]; await h.flushPending();
+    expect(h.pendingMessages).toEqual(before);
+    expect(h.freshnessInputQueue.takeNormal).not.toHaveBeenCalled();
+    expect(h.isPromptReady).toBe(true);
+  });
+
+  it('retries a retained admission on a generation-fenced timer without an external ready edge', async () => {
+    vi.useFakeTimers();
+    try {
+      const h = ready();
+      h.requestScheduledInputAdmission = vi.fn()
+        .mockResolvedValueOnce('retain').mockResolvedValueOnce('allow');
+      await h.flushPending();
+      expect(h.requestScheduledInputAdmission).toHaveBeenCalledOnce();
+      expect(h.pendingMessages).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(h.requestScheduledInputAdmission).toHaveBeenCalledTimes(2);
+      expect(h.freshnessInputQueue.takeNormal).toHaveBeenCalledOnce();
+      expect(h.pendingMessages).toEqual([]);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('does not drain an automatic backlog while a confirmed quota limit remains active', async () => {
+    const h = ready(); h.usageLimitTracker = { currentTurn: () => 4, detectedThisTurn: () => true };
+    h.requestScheduledInputAdmission = vi.fn(async () => 'allow');
+    for (let n = 0; n < 3; n++) { h.isPromptReady = true; await h.flushPending(); }
+    expect(h.requestScheduledInputAdmission).not.toHaveBeenCalled();
+    expect(h.freshnessInputQueue.takeNormal).not.toHaveBeenCalled();
+    expect(h.pendingMessages).toHaveLength(1);
+    h.pendingMessages[0].scheduledRun.trigger = 'dashboard';
+    await h.flushPending(); expect(h.freshnessInputQueue.takeNormal).toHaveBeenCalledOnce();
+  });
+
+  it.each([true, false])('lets an authorized human past the quota-held automatic head (typeAhead=%s)', async supportsTypeAhead => {
+    const h = ready();
+    const human = { turnId: 'om_human', content: 'urgent question', trustedCaller: {
+      requestUserOpenId: 'owner', requestLarkAppId: 'app', senderType: 'user' as const,
+    } };
+    h.pendingMessages.push(human);
+    h.usageLimitTracker = { currentTurn: () => 4, detectedThisTurn: () => true };
+    h.runtimePtyInputPolicy = () => ({ supportsTypeAhead, allowBackToBackWrites: true });
+    h.requestScheduledInputAdmission = vi.fn(async () => 'allow');
+    await h.flushPending();
+    expect(h.freshnessInputQueue.takeNormal).toHaveBeenCalledOnce();
+    expect(h.pendingMessages.map((x: any) => x.turnId)).toEqual([turnId]);
+    expect(h.requestScheduledInputAdmission).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['ownerless automatic input without a serial marker', 'tmux', false],
+    ['idle remote-runner', 'remote-runner', true],
+  ])('lets an authorized human past a quota-held %s', async (_name, backendType, serial) => {
+    const h = ready();
+    if (!serial) delete h.pendingMessages[0].queueAfterActiveTurn;
+    h.effectiveBackendType = backendType;
+    h.pendingMessages.push({ turnId: 'om_human', content: 'urgent question', trustedCaller: {
+      requestUserOpenId: 'owner', requestLarkAppId: 'app', senderType: 'user' as const,
+    } });
+    h.usageLimitTracker = { currentTurn: () => 4, detectedThisTurn: () => true };
+    h.runtimePtyInputPolicy = () => ({ supportsTypeAhead: false, allowBackToBackWrites: true });
+    await h.flushPending();
+    expect(h.freshnessInputQueue.takeNormal).toHaveBeenCalledOnce();
+    expect(h.pendingMessages.map((x: any) => x.turnId)).toEqual([turnId]);
+  });
+
+  it('STOP clears the associated automatic backlog while ordinary, manual and other-task inputs stay usable', async () => {
+    const h = ready(); h.currentBotmuxTurnId = turnId;
+    const manual = { ...scheduled(), turnId: 'schedule:a1b2c3d4:aaaaaaaa-1234-1234-1234-123456789abc',
+      scheduledRun: { ...scheduled().scheduledRun, turnId: 'schedule:a1b2c3d4:aaaaaaaa-1234-1234-1234-123456789abc', trigger: 'dashboard' } };
+    const other = { ...scheduled(), turnId: 'schedule:bbbbbbbb:12345678-1234-1234-1234-123456789abc',
+      scheduledRun: { ...scheduled().scheduledRun, taskId: 'bbbbbbbb', turnId: 'schedule:bbbbbbbb:12345678-1234-1234-1234-123456789abc' } };
+    const human = { turnId: 'om_human', content: 'ordinary' };
+    const unknownManual = { ...scheduled(), turnId: 'schedule:a1b2c3d4:bbbbbbbb-1234-1234-1234-123456789abc',
+      scheduledRun: { ...scheduled().scheduledRun, turnId: 'schedule:a1b2c3d4:bbbbbbbb-1234-1234-1234-123456789abc', trigger: undefined } };
+    h.pendingMessages.push(human, manual, other, unknownManual);
+    h.effectiveBackendType = 'remote-runner'; // exits after the real stop queue cleanup; never drives a real terminal
+    await loadWorkerFunction<any>('handleTermAction', h)('ctrlc');
+    expect(h.pendingMessages).toEqual([human, manual, other, unknownManual]);
+    h.effectiveBackendType = 'tmux'; h.isPromptReady = true;
+    await h.flushPending(); expect(h.freshnessInputQueue.takeNormal).toHaveBeenCalledOnce();
+    expect(h.pendingMessages).toEqual([manual, other, unknownManual]);
+  });
+
+  it('STOP discards ordinary recovery but preserves an independent dashboard manual run', async () => {
+    const h = ready(); h.currentBotmuxTurnId = turnId;
+    const recoveryTurn = 'schedule:a1b2c3d4:aaaaaaaa-1234-1234-1234-123456789abc';
+    const recovery = { ...scheduled(), turnId: recoveryTurn,
+      scheduledRun: { ...scheduled().scheduledRun, turnId: recoveryTurn, trigger: 'dashboard' as const, recoveryOfTurnId: turnId } };
+    const manualTurn = 'schedule:a1b2c3d4:bbbbbbbb-1234-1234-1234-123456789abc';
+    const manual = { ...scheduled(), turnId: manualTurn,
+      scheduledRun: { ...scheduled().scheduledRun, turnId: manualTurn, trigger: 'dashboard' as const } };
+    h.pendingMessages.push(recovery, manual);
+    h.effectiveBackendType = 'remote-runner';
+    await loadWorkerFunction<any>('handleTermAction', h)('ctrlc');
+    expect(h.pendingMessages).toEqual([manual]);
+  });
+
+  it('STOP during a human turn preserves every scheduled task backlog', async () => {
+    const h = ready(); h.currentBotmuxTurnId = 'om_active_human';
+    const other = { ...scheduled(), turnId: 'schedule:bbbbbbbb:12345678-1234-1234-1234-123456789abc',
+      scheduledRun: { ...scheduled().scheduledRun, taskId: 'bbbbbbbb', turnId: 'schedule:bbbbbbbb:12345678-1234-1234-1234-123456789abc' } };
+    const human = { turnId: 'om_next_human', content: 'ordinary' };
+    h.pendingMessages.push(other, human);
+    const before = [...h.pendingMessages];
+    h.effectiveBackendType = 'remote-runner';
+    await loadWorkerFunction<any>('handleTermAction', h)('ctrlc');
+    expect(h.pendingMessages).toEqual(before);
+    expect(h.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'turn_input_rejected' }));
+  });
+
+  it('times out an authenticated IPC admission without releasing the head', async () => {
+    vi.useFakeTimers();
+    try {
+      const h = ready(); const request = loadWorkerFunction<any>('requestScheduledInputAdmission', h)(h.pendingMessages[0]);
+      expect(h.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'admit_scheduled_input', turnId }));
+      await vi.advanceTimersByTimeAsync(5_000); expect(await request).toBe('retain');
+    } finally { vi.useRealTimers(); }
+  });
+});
+
+
+it('checks host schedule authority before an adopted pane opens or writes the turn', async () => {
+  const turnId = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+  const backend = { write: vi.fn() };
+  const scope = { backend, cliAdapter: {}, rememberTurnLinkRefMode: () => {},
+    captureAdoptWriteFence: () => ({ backend }), adoptWriteFenceIsCurrent: () => true,
+    requestScheduledInputAdmission: vi.fn(async () => 'reject'), send: vi.fn(),
+    renderer: { markNewTurn: vi.fn() },
+  };
+  const result = await loadWorkerFunction<any>('writeAdoptMessage', scope)('scheduled prompt', turnId,
+    undefined, undefined, undefined, undefined, undefined, undefined, true);
+  expect(result).toBe('admission-rejected');
+  expect(backend.write).not.toHaveBeenCalled();
+  expect(scope.renderer.markNewTurn).not.toHaveBeenCalled();
+});
+
+describe('adopt admission rejection queue release', () => {
+  it.each([
+    ['admission-rejected', 2, 0],
+    ['refused-before-write', 1, 1],
+  ])('re-drives ready peers only for %s', async (outcome, expectedCalls, remaining) => {
+    const h = harness(); h.activeTurnAuthority.clear();
+    h.lastInitConfig = { cliId: 'codex', adoptMode: true };
+    const rejected = { turnId: 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc', content: 'scheduled' };
+    const human = { turnId: 'om_adopt_human', content: 'next' };
+    h.pendingMessages = []; h.pendingAdoptMessages = [rejected, human];
+    h.hasPendingInputForFlush = () => h.pendingAdoptMessages.length > 0;
+    h.runAdoptMessageForCapturedGeneration = vi.fn(async () => outcome);
+    await h.flushPending();
+    await Promise.resolve(); await Promise.resolve();
+    expect(h.runAdoptMessageForCapturedGeneration).toHaveBeenCalledTimes(expectedCalls);
+    expect(h.pendingAdoptMessages).toHaveLength(remaining);
+  });
+});
+
+describe('adopt scheduled queue recovery', () => {
+  const adoptTurn = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+  const automatic = () => ({ turnId: adoptTurn, content: 'automatic',
+    scheduledRun: { taskId: 'a1b2c3d4', runId: 'run-1', turnId: adoptTurn, trigger: 'scheduler' as const } });
+
+  it('lets an authorized human past a quota-held automatic adopt head', async () => {
+    const h = harness(); h.activeTurnAuthority.clear();
+    h.lastInitConfig = { cliId: 'codex', adoptMode: true };
+    const tick = automatic(); const human = { turnId: 'om_adopt_human', content: 'urgent', trustedCaller: {
+      requestUserOpenId: 'owner', requestLarkAppId: 'app', senderType: 'user' as const,
+    } };
+    h.pendingMessages = []; h.pendingAdoptMessages = [tick, human];
+    h.hasPendingInputForFlush = () => h.pendingAdoptMessages.length > 0;
+    h.usageLimitTracker = { currentTurn: () => 4, detectedThisTurn: () => true };
+    h.runAdoptMessageForCapturedGeneration = vi.fn(async (item: any, requeue: () => void) => {
+      if (item === human) return 'completed';
+      requeue();
+      return 'stale-before-write';
+    });
+    await h.flushPending(); await Promise.resolve(); await Promise.resolve();
+    expect(h.runAdoptMessageForCapturedGeneration.mock.calls[0][0]).toBe(human);
+    expect(h.pendingAdoptMessages).toEqual([tick]);
+  });
+
+  it('retries a retained adopt admission against the original queue item', async () => {
+    vi.useFakeTimers();
+    try {
+      const h = harness(); h.activeTurnAuthority.clear();
+      const tick = automatic();
+      h.send = vi.fn();
+      h.pendingMessages = []; h.pendingAdoptMessages = [tick];
+      h.lastInitConfig = { cliId: 'codex', adoptMode: true };
+      h.hasPendingInputForFlush = () => h.pendingAdoptMessages.length > 0;
+      h.rememberTurnLinkRefMode = () => {};
+      h.captureAdoptWriteFence = () => ({ backend: h.backend });
+      h.adoptWriteFenceIsCurrent = () => true;
+      h.runAdoptQueuedWriteSequence = runAdoptQueuedWriteSequence;
+      h.adoptWriteQueue = new AsyncSerialQueue();
+      h.writeAdoptMessage = loadWorkerFunction('writeAdoptMessage', h);
+      h.runAdoptMessageForCapturedGeneration = loadWorkerFunction('runAdoptMessageForCapturedGeneration', h);
+      h.requestScheduledInputAdmission = vi.fn()
+        .mockResolvedValueOnce('retain').mockResolvedValueOnce('reject');
+      await h.flushPending();
+      expect(h.pendingAdoptMessages).toEqual([tick]);
+      expect(h.requestScheduledInputAdmission).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(1_000);
+      await Promise.resolve(); await Promise.resolve();
+      expect(h.requestScheduledInputAdmission).toHaveBeenCalledTimes(2);
+      expect(h.pendingAdoptMessages).toEqual([]);
+    } finally { vi.useRealTimers(); }
+  });
+});
+
+describe('schedule admission after terminal write mutex', () => {
+  it.each(['pause', 'unavailable', 'stop', 'generation'])('refuses a write after an earlier ACK when %s intervenes during mutex wait', async state => {
+    const turnId = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+    const item = { turnId, content: 'queued schedule', queueAfterActiveTurn: true as const,
+      scheduledRun: { taskId: 'a1b2c3d4', runId: 'run-1', turnId, trigger: 'scheduler' as const } };
+    const task: any = { id: 'a1b2c3d4', enabled: true, lastRunId: 'run-1' };
+    let release!: () => void; let current = true;
+    const prepare = vi.fn(); const write = vi.fn(async () => ({ submitted: true })); const held: string[] = [];
+    const backend = { captureAmbiguousSubmissionFence: () => 1 };
+    const scope: any = { backend, cliSubmissionInFlight: { item, scheduledWritePending: true },
+      requestScheduledInputAdmission: vi.fn(async () => state === 'unavailable' && !task.enabled ? 'retain'
+        : admitScheduledInput({ scheduledRun: item.scheduledRun } as any, 'app', turnId, () => task)),
+      ambiguousSubmissionWriteTail: new Promise<void>(resolve => { release = resolve; }),
+      webTerminalInputWireDirty: () => false,
+      captureAmbiguousSubmissionFence: () => 1,
+      confirmAmbiguousSubmissionAfterSuccess: () => undefined,
+      cancelAmbiguousSubmissionAfterFailure: vi.fn(() => undefined),
+      AmbiguousSubmissionBlockedError: class extends Error {},
+      rewrapSubmissionFailure: (err: Error, recovery: unknown, started: boolean) => ({ message: err.message, recoveryFailureReason: recovery, submissionStarted: started }),
+      SubmissionWriteError: class extends Error {},
+    };
+    const gate = loadWorkerFunction<any>('runScheduledCliInputWrite', scope);
+    const transaction = loadWorkerFunction<any>('runAmbiguousSubmissionTransaction', scope);
+    expect(await scope.requestScheduledInputAdmission(item)).toBe('allow');
+    const pending = transaction(backend, () => gate(item, () => current, prepare, write, (decision: string) => held.push(decision)));
+    const caught = pending.catch((error: Error) => error);
+    await Promise.resolve(); expect(write).not.toHaveBeenCalled();
+    if (state === 'generation') current = false;
+    else if (state === 'stop') scope.cliSubmissionInFlight.scheduledWriteCancelled = true;
+    else { task.enabled = false; task.disabledReason = 'manual'; }
+    release(); await caught;
+    expect(scope.requestScheduledInputAdmission).toHaveBeenCalledTimes(2);
+    expect(prepare).not.toHaveBeenCalled(); expect(write).not.toHaveBeenCalled();
+    expect(held).toEqual([state === 'unavailable' || state === 'generation' ? 'retain' : 'reject']);
+    expect(scope.cancelAmbiguousSubmissionAfterFailure).toHaveBeenCalledOnce();
+  });
+});
+
+it.each(['structured', 'raw'])('leaves %s adopted authority untouched after a late pause refusal and starts the next resumed schedule normally', async transport => {
+  const taskId = 'a1b2c3d4';
+  const turn = (suffix: string) => `schedule:${taskId}:${suffix}-1234-1234-1234-123456789abc`;
+  const firstTurn = turn('12345678'); const nextTurn = turn('aaaaaaaa');
+  const caller = { requestUserOpenId: 'ou_owner', requestLarkAppId: 'app', senderType: 'user' as const,
+    source: 'schedule_creator' as const, taskId };
+  const task: any = { id: taskId, enabled: true, lastRunId: 'run-1' };
+  let release!: () => void;
+  const authority = new ActiveTurnAuthority();
+  const writeInput = vi.fn(async () => ({ submitted: true }));
+  const backend = { captureAmbiguousSubmissionFence: () => 1, sendText: vi.fn(), sendSpecialKeys: vi.fn() };
+  const calls: any[] = [];
+  const scope: any = {
+    backend, lastInitConfig: { cliId: 'codex', adoptMode: true }, cliAdapter: { writeInput },
+    activeTurnAuthority: authority, crossPrincipalIsolationOn: () => true,
+    rememberTurnLinkRefMode: () => {}, captureAdoptWriteFence: () => ({ backend }), adoptWriteFenceIsCurrent: () => true,
+    requestScheduledInputAdmission: vi.fn(async (item: any) => admitScheduledInput({
+      scheduledRun: { taskId, runId: task.lastRunId, turnId: item.turnId, trigger: 'scheduler' },
+    } as any, 'app', item.turnId, () => task)),
+    renderer: { markNewTurn: vi.fn() }, writeCliPidMarker: vi.fn(), publishSandboxRelayCapability: vi.fn(),
+    markTurnRetired: vi.fn(), supersedeBackgroundAuthorityHold: vi.fn(), markTurnExecutionStart: vi.fn(),
+    beginCliWriteCycle: vi.fn(), adoptComposerConflict: () => undefined, codexBridgeFallbackActive: () => false,
+    isStructuredBridgeAdoptInputCli: () => transport === 'structured', adapterInputHandle: () => backend,
+    settleVerifiableSubmissionForJournal: () => true,
+    redriveRejectedStructuredReady: vi.fn(), send: (msg: any) => calls.push(msg), log: vi.fn(),
+    ambiguousSubmissionWriteTail: new Promise<void>(resolve => { release = resolve; }),
+    webTerminalInputWireDirty: () => false, captureAmbiguousSubmissionFence: () => 1,
+    confirmAmbiguousSubmissionAfterSuccess: () => undefined, cancelAmbiguousSubmissionAfterFailure: () => undefined,
+    AmbiguousSubmissionBlockedError: class extends Error {},
+    rewrapSubmissionFailure: (err: Error, recovery: unknown, started: boolean) => ({ message: err.message, recoveryFailureReason: recovery, submissionStarted: started }),
+    SubmissionWriteError: class extends Error {},
+  };
+  scope.turnAuthorityIdentity = loadWorkerFunction('turnAuthorityIdentity', scope);
+  scope.markActiveTurnStarted = loadWorkerFunction('markActiveTurnStarted', scope);
+  scope.setCaptureIdentity = loadWorkerFunction('setCaptureIdentity', scope);
+  scope.runAmbiguousSubmissionTransaction = loadWorkerFunction('runAmbiguousSubmissionTransaction', scope);
+  const write = loadWorkerFunction<any>('writeAdoptMessage', scope);
+  const pending = write('first scheduled envelope', firstTurn, undefined, undefined, undefined, caller,
+    undefined, undefined, true, { taskId, runId: 'run-1', turnId: firstTurn, trigger: 'scheduler' });
+  await Promise.resolve(); await Promise.resolve();
+  expect(scope.requestScheduledInputAdmission).toHaveBeenCalledOnce();
+  expect(authority.snapshot()).toBeUndefined();
+  expect(scope.currentBotmuxTurnId).toBeUndefined();
+  expect(scope.renderer.markNewTurn).not.toHaveBeenCalled();
+  task.enabled = false; task.disabledReason = 'manual'; release();
+  expect(await pending).toBe('admission-rejected');
+  expect(writeInput).not.toHaveBeenCalled();
+  expect(backend.sendText).not.toHaveBeenCalled(); expect(backend.sendSpecialKeys).not.toHaveBeenCalled();
+  expect(authority.snapshot()).toBeUndefined();
+  expect(scope.currentBotmuxTurnId).toBeUndefined();
+  expect(calls.filter(msg => msg.type === 'capture_identity')).toEqual([]);
+  expect(scope.usageLimitTracker.currentTurn()).toBe(0);
+  expect(scope.writeCliPidMarker).not.toHaveBeenCalled();
+  expect(scope.publishSandboxRelayCapability).not.toHaveBeenCalled();
+
+  task.enabled = true; task.disabledReason = undefined; task.lastRunId = 'run-2';
+  expect(await write('resumed scheduled envelope', nextTurn, undefined, undefined, undefined, caller,
+    undefined, undefined, true, { taskId, runId: 'run-2', turnId: nextTurn, trigger: 'scheduler' })).toBe('completed');
+  if (transport === 'structured') expect(writeInput).toHaveBeenCalledExactlyOnceWith(backend, 'resumed scheduled envelope', undefined);
+  else {
+    expect(backend.sendText).toHaveBeenCalledExactlyOnceWith('resumed scheduled envelope');
+    expect(backend.sendSpecialKeys).toHaveBeenCalledExactlyOnceWith('Enter');
+  }
+  expect(authority.snapshot()).toMatchObject({ turnId: nextTurn, started: true });
+  expect(scope.currentBotmuxTurnId).toBe(nextTurn);
+  expect(scope.usageLimitTracker.currentTurn()).toBe(1);
 });

@@ -23,6 +23,10 @@ import { awaySummaryFocusRefusal } from '../../src/services/away-summary-focus.j
 import { paneReplyDeliveryFromProcessTree } from '../../src/services/pane-reply-delivery.js';
 import { createUsageLimitTracker } from '../../src/utils/usage-limit-tracker.js';
 import { REPLY_DELIVERY_ENV } from '../../src/services/send-completion-hint.js';
+import { automaticScheduledInputTask, coalesceAutomaticScheduledInputs, promoteInteractiveInputPastQuotaSchedules, scheduledRecoveryInputTask } from '../../src/utils/pending-input-queue.js';
+import { parseScheduledTurnId } from '../../src/core/scheduled-turn-provenance.js';
+import { isCriticalInterruptKey } from '../../src/adapters/backend/critical-control-key.js';
+import { removeTakenUnsentInputs } from '../../src/services/unsent-input-journal.js';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { readFileSync, watch as fsWatch } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -254,6 +258,17 @@ function transpiledWorkerFunction(name: string): string {
  * `undefined` for keys this does not own so callers keep their own fallbacks.
  */
 function defaultScopedWorkerState(scope: Record<string, unknown>, key: string | symbol): unknown {
+  if (key === 'automaticScheduledInputTask') return automaticScheduledInputTask;
+  if (key === 'scheduledRecoveryInputTask') return scheduledRecoveryInputTask;
+  if (key === 'promoteInteractiveInputPastQuotaSchedules') return promoteInteractiveInputPastQuotaSchedules;
+  if (key === 'coalesceAutomaticScheduledInputs') return coalesceAutomaticScheduledInputs;
+  if (key === 'parseScheduledTurnId') return parseScheduledTurnId;
+  if (key === 'isCriticalInterruptKey') return isCriticalInterruptKey;
+  if (key === 'removeTakenUnsentInputs') return removeTakenUnsentInputs;
+  if (key === 'pendingAdoptMessages') return (scope.pendingAdoptMessages ??= []);
+  if (key === 'restoredUnsentInputs') return (scope.restoredUnsentInputs ??= new Set());
+  if (key === 'scheduledInputReceipts') return (scope.scheduledInputReceipts ??= new Map());
+  if (['coalescePendingScheduledInputs', 'discardUnwrittenScheduledInput', 'discardScheduledBacklogForStop', 'requestScheduledInputAdmission', 'runScheduledCliInputWrite', 'unsentInputJournalPath', 'cancelScheduledAdmissionRetry', 'scheduleScheduledAdmissionRetry'].includes(String(key))) return loadWorkerFunction(String(key), scope);
   if (key === 'inFlightKeepaliveFingerprints') {
     return (scope.inFlightKeepaliveFingerprints ??= new Map<string, number>());
   }
@@ -417,6 +432,7 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
     // Unrelated submission fixtures do not model the shared native-input hold;
     // focused hard-block suites load the real function with explicit queues.
     if (key === 'holdNativeInputForHardBlock') return () => {};
+    if (key === 'restoreSessionRenameReadiness') return loadWorkerFunction(key, scope);
     // Input-focus guard is inert unless a fixture explicitly models a dialog or
     // draft. This keeps unrelated worker-function tests on their original path.
     if (key === 'sessionInputBlocksDeliveryNow') return () => false;
