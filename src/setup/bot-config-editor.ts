@@ -61,6 +61,7 @@ export const CLI_ID_CHOICES: Record<string, CliId> = {
   '33': 'codem',
   '34': 'zcode',
   '35': 'doubao',
+  '36': 'nca',
 };
 
 const VALID_CLI_IDS: ReadonlySet<string> = new Set(Object.values(CLI_ID_CHOICES));
