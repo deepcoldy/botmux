@@ -60,7 +60,10 @@ export type TopicSpecError =
   /** 这个 CLI 没有显式推理控制。 */
   | { kind: 'effort_unsupported_cli'; cliId?: CliId }
   /** 档位合法但本次要用的模型不支持它。 */
-  | { kind: 'effort_unsupported_model'; effort: CodexReasoningEffort; model?: string };
+  | { kind: 'effort_unsupported_model'; effort: CodexReasoningEffort; model?: string }
+  /** CLI 在 resume 时自行还原会话内档位（Pi 从 transcript 恢复 thinking），绑进
+   *  modelPin 的显式档位重启后无法落实；与 model-pin.ts 的 validateModelPin 同一条护栏。 */
+  | { kind: 'effort_pin_unsupported_cli'; cliId?: CliId };
 
 /** 头部 `/repo wt` 落到 daemon 的创建请求：目录在建好之后才确定，这里只带仓库与分支。 */
 export interface TopicSpecWorktree {
@@ -209,6 +212,12 @@ export async function resolveTopicSpec(header: TopicHeader, ctx: TopicSpecContex
       errors.push({ kind: 'effort_invalid', arg: effortArg });
     } else if (!isConfigurableReasoningCliId(botCfg.cliId)) {
       errors.push({ kind: 'effort_unsupported_cli', ...(botCfg.cliId ? { cliId: botCfg.cliId } : {}) });
+    } else if (botCfg.cliId === 'pi' && spec.model) {
+      // Pi resume 时从会话 transcript 还原 thinking（见 adapters/cli/pi.ts 的 resume 分支），
+      // 绑进 modelPin 的显式档位在恢复后无法落实。validateModelPin 已在 /modelpin、卡片与
+      // 容量回退入口拒绝同一组合，这里补上话题指令头入口。仅 /effort（不绑模型）不受影响：
+      // 它落 session.reasoningEffort，只在全新 spawn 经 --thinking 生效，与 Dashboard 默认档位等价。
+      errors.push({ kind: 'effort_pin_unsupported_cli', ...(botCfg.cliId ? { cliId: botCfg.cliId } : {}) });
     } else if ((botCfg.cliId !== 'traex' || !!spec.model) && !cliModelSupportsReasoningEffort(botCfg.cliId, effectiveModel, effortArg)) {
       errors.push({
         kind: 'effort_unsupported_model',

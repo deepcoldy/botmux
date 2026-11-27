@@ -170,6 +170,23 @@ describe('resolveTopicSpec —— /effort 的拒绝分支', () => {
     expect(errorKinds(await resolve('/t /model gpt-5.2 /effort ultra 干活', { cliId: 'codex' })))
       .toEqual(['effort_unsupported_model']);
   });
+
+  it('Pi 拒绝 /model 与 /effort 组合（pin 档位 resume 后无法落实），但保留 effort-only 与仅 /model', async () => {
+    const PI = { cliId: 'pi' as const };
+    // 与 validateModelPin 同一护栏：组合头会把 effort 绑进 modelPin，而 Pi resume
+    // 从 transcript 还原 thinking，固定值在恢复后不生效。
+    expect(errorKinds(await resolve('/t /model provider/new /effort high 干活', PI)))
+      .toEqual(['effort_pin_unsupported_cli']);
+    // 仅 /effort 落 session.reasoningEffort（全新 spawn 经 --thinking 生效），与 Dashboard 默认档位等价。
+    expect(await resolve('/t /effort high 干活', PI)).toMatchObject({ ok: true, reasoningEffort: 'high' });
+    // 模型固定本身不受影响。
+    expect(await resolve('/t /model provider/new 干活', PI)).toMatchObject({ ok: true, model: 'provider/new' });
+    // 非法档位仍优先报 effort_invalid，不被新分支吞掉。
+    expect(errorKinds(await resolve('/t /model provider/new /effort turbo 干活', PI)))
+      .toEqual(['effort_invalid']);
+    // ultra 不在 Pi 的五档交集里，effort-only 也拒绝。
+    expect(errorKinds(await resolve('/t /effort ultra 干活', PI))).toEqual(['effort_unsupported_model']);
+  });
 });
 
 describe('resolveTopicSpec —— 一次收齐所有错误', () => {

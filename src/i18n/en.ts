@@ -2262,6 +2262,7 @@ export const messages: Record<string, string> = {
   'daemon.topic_header_effort_invalid': '`{arg}` is not a valid reasoning effort (one of: {allowed})',
   'daemon.topic_header_effort_unsupported_cli': 'This CLI ({cli}) has no reasoning-effort control',
   'daemon.topic_header_effort_unsupported_model': 'Model {model} does not support reasoning effort {effort}',
+  'daemon.topic_header_effort_pin_unsupported_cli': 'This CLI ({cli}) restores the in-session thinking level on resume, so `/model` and `/effort` cannot be pinned together; pin the model alone, or use `/effort` by itself for the new-topic default',
   'daemon.fast_unsupported_backend': "⚠️ /fast can't toggle Codex's tier on this session's backend (RPC input mode / Riff runs turns off the terminal, so the keystroke never reaches the executor). The card badge still reflects the tier Codex is actually running.",
   'daemon.antigravity_btw_usage': 'Usage: /btw <question>. The question can contain up to 4,000 characters.',
   'daemon.antigravity_btw_unavailable': '/btw requires an active Antigravity conversation in this chat with a local interactive terminal.',
