@@ -5,12 +5,13 @@
  */
 import { describe, expect, it, vi } from 'vitest';
 import { stripTrailingBridgeSentinelLine } from '../src/services/bridge-fallback-gate.js';
+import { publicReplyCardTools } from '../src/im/lark/turn-reply-card.js';
 import type { CotEntry } from '../src/types.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
 const CAP = 100;
 
-function worker() {
+function worker(realFlush = false) {
   const scope: Record<string, any> = {
     lastInitConfig: {},
     THINKING_ACCUMULATED_CAP: CAP,
@@ -19,6 +20,10 @@ function worker() {
     thinkingEntries: [],
     thinkingTotalChars: 0,
     thinkingCapNoted: false,
+    thinkingEmitTimer: null,
+    thinkingLastEmitMs: 0,
+    sessionId: 'session-cot-cap',
+    clearTimeout: vi.fn(),
     scheduleThinkingEmit: vi.fn(),
     flushThinkingUpdate: vi.fn(),
     send: vi.fn(),
@@ -26,6 +31,12 @@ function worker() {
     stripTrailingBridgeSentinelLine,
   };
   for (const name of ['cotEntryChars', 'cotEntryWithoutSentinel', 'observeCotEntries']) scope[name] = loadWorkerFunction(name, scope);
+  if (realFlush) {
+    // A controllable one-shot timer token: the real flush clears it and sends
+    // synchronously, while observeCotEntries keeps its production scheduling.
+    scope.scheduleThinkingEmit = vi.fn(() => { scope.thinkingEmitTimer = {}; });
+    scope.flushThinkingUpdate = loadWorkerFunction('flushThinkingUpdate', scope);
+  }
   return scope;
 }
 
@@ -112,5 +123,65 @@ describe('worker CoT accumulated cap', () => {
     expect(w.thinkingEntries).toEqual([{ kind: 'text', text: 'a'.repeat(CAP - 1) }, ellipsis]);
     expect(w.thinkingEntries.at(-1)).toEqual(ellipsis);
     expect(w.thinkingTotalChars).toBe(CAP - 1);
+  });
+
+  it('pairs an already displayed tool when its oversized result crosses the cap', () => {
+    const w = worker(true);
+    const text: CotEntry = { kind: 'text', text: 't'.repeat(80) };
+    const call = { kind: 'tool_call', id: 'c1', name: 'Bash', args: '1234567890' } satisfies CotEntry;
+    const completion: CotEntry = { kind: 'tool_result', id: call.id, result: '' };
+    w.observeCotEntries([text, call], { turnId: 'om_result_crosses_cap' });
+    w.flushThinkingUpdate();
+    expect(w.send.mock.lastCall![0].entries).toEqual([text, call]);
+
+    w.observeCotEntries([{ kind: 'tool_result', id: call.id, result: 'r'.repeat(20) }], { turnId: 'om_result_crosses_cap' });
+    expect(w.thinkingEntries).toEqual([text, call, completion, ellipsis]);
+    expect(w.thinkingTotalChars).toBe(94);
+    expect(w.thinkingCapNoted).toBe(true);
+
+    w.flushThinkingUpdate();
+    const update = w.send.mock.lastCall![0];
+    expect(update.entries).toEqual([text, call, completion, ellipsis]);
+    expect(publicReplyCardTools(update.entries, true)).toHaveLength(1);
+    expect(publicReplyCardTools(update.entries, true)[0]).toMatchObject({ id: call.id, completed: true, result: '' });
+  });
+
+  it('keeps a capped ellipsis off the wire until a late result pairs its open tool', () => {
+    const w = worker(true);
+    const call = { kind: 'tool_call', id: 'c1', name: 'Bash', args: '1234567890' } satisfies CotEntry;
+    const head: CotEntry = { kind: 'text', text: 'x'.repeat(CAP - call.name.length - call.args.length) };
+    const completion: CotEntry = { kind: 'tool_result', id: call.id, result: '' };
+    w.observeCotEntries([call], { turnId: 'om_result_after_cap' });
+    w.flushThinkingUpdate();
+    w.observeCotEntries([{ kind: 'text', text: 'x'.repeat(CAP + 20) }], { turnId: 'om_result_after_cap' });
+    expect(w.thinkingEntries).toEqual([call, head, ellipsis]);
+
+    // The tool is still running: neither a synthetic completion nor the
+    // terminal ellipsis may cross the daemon's append-only boundary yet.
+    w.flushThinkingUpdate();
+    let update = w.send.mock.lastCall![0];
+    expect(update.entries).toEqual([call, head]);
+    expect(publicReplyCardTools(update.entries, true)[0].completed).toBeUndefined();
+
+    w.observeCotEntries([{ kind: 'tool_result', id: call.id, result: 'late output' }], { turnId: 'om_result_after_cap' });
+    w.flushThinkingUpdate();
+    update = w.send.mock.lastCall![0];
+    expect(update.entries).toEqual([call, head, completion, ellipsis]);
+    expect(publicReplyCardTools(update.entries, true)[0]).toMatchObject({ id: call.id, completed: true, result: '' });
+  });
+
+  it('settles an unresolved capped tool only at the final flush', () => {
+    const w = worker(true);
+    const call = { kind: 'tool_call', id: 'c1', name: 'Bash', args: '1234567890' } satisfies CotEntry;
+    const head: CotEntry = { kind: 'text', text: 'x'.repeat(CAP - call.name.length - call.args.length) };
+    const completion: CotEntry = { kind: 'tool_result', id: call.id, result: '' };
+    w.observeCotEntries([call, { kind: 'text', text: 'x'.repeat(CAP + 20) }], { turnId: 'om_no_result_terminal' });
+    w.flushThinkingUpdate();
+    expect(w.send.mock.lastCall![0].entries).toEqual([call, head]);
+
+    w.flushThinkingUpdate(true);
+    const update = w.send.mock.lastCall![0];
+    expect(update.entries).toEqual([call, head, completion, ellipsis]);
+    expect(publicReplyCardTools(update.entries, true)[0]).toMatchObject({ id: call.id, completed: true, result: '' });
   });
 });
