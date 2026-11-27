@@ -3,6 +3,7 @@ import type { TriggerUserAuthConfig } from '../../services/trigger-user-auth.js'
 import type { CodexServiceTier } from '../../services/codex-service-tier.js';
 import type { DebugModelCapabilities } from './model-catalog-json.js';
 import type { BackgroundTaskSignals, CodexBridgeEvent } from '../../services/codex-transcript.js';
+import type { BackendType } from '../backend/types.js';
 
 export interface PtyHandle {
   /** `false` means the backend rejected the write before it could confirm
@@ -205,6 +206,24 @@ export interface CliLaunchNotice {
   minVersion: string;
 }
 
+/** Options for {@link CliAdapter.detectModels}. */
+export interface CliModelDetectionOptions {
+  /** Effective process environment after inheritance and configured overlays. */
+  env?: NodeJS.ProcessEnv;
+  /** Botmux-owned global/Bot overlay promoted through Claude's --settings. */
+  settingsEnv?: NodeJS.ProcessEnv;
+  /** Claude only: false forbids falling back to the caller's implicit ~/.claude.
+   *  An explicit configDir remains allowed. Defaults to true for daemon probes. */
+  allowImplicitConfigRoot?: boolean;
+  /** `env` belongs to a separately launched core rather than this process:
+   *  the probe must run in it and inherit nothing from here. Set by the model
+   *  catalog when its caller probes for such a core (the WeCom Dashboard
+   *  configuration for its managed core). Adapters whose established probe
+   *  runs in this process's own environment switch to `env` only when this
+   *  is set; adapters that already use `env` may ignore it. */
+  isolatedEnv?: boolean;
+}
+
 export interface CliAdapter {
   /** Unique identifier */
   readonly id: string;
@@ -256,6 +275,12 @@ export interface CliAdapter {
      *  launch-time title flag may consume it; others should ignore it. */
     nativeSessionTitle?: string;
     botName?: string;
+    /** Resolved per-bot join bootstrap, frozen for this launch so native-title
+     * adapters can distinguish setup instructions from the first real task. */
+    groupJoinPrompt?: string;
+    /** Persisted normalized bootstrap used to recognize replay after its
+     * configured text changes between runner generations. */
+    groupJoinTitleBootstrap?: { digest: string; length: number };
     botOpenId?: string;
     /** This bot's larkAppId. Lets injectsSessionContext adapters (genius) resolve
      *  their per-bot built-in skill injection mode for the system-prompt catalog;
@@ -544,6 +569,14 @@ export interface CliAdapter {
   /** Exact active identity for a CLI which retains retired conversation DB
    * handles (Antigravity after /fork). Prefer over the generic first-FD probe. */
   resolveActiveSessionId?(pty: Pick<PtyHandle, 'cliPid' | 'cliCwd'>): string | undefined;
+
+  /** Atomic identity + provenance when the adapter has both an authoritative
+   * native stream log and weaker process/fd discovery. Cold-resume policy must
+   * fence only the latter without rejecting a later native-log `/new`. */
+  resolveActiveSessionIdObservation?(pty: Pick<PtyHandle, 'cliPid' | 'cliCwd'>): {
+    sessionId: string;
+    source: 'native-log' | 'process-discovery';
+  } | undefined;
 
   /** True when this adapter finds the native session to resume by itself
    *  from the botmux session id (Kimi: its index + wire logs; the
@@ -1112,12 +1145,13 @@ export interface CliAdapter {
    *  `modelChoices`. Contract:
    *  - MUST be fail-soft: return null on any error, timeout, or unparseable
    *    output, never throw (the caller falls back to `modelChoices`);
-   *  - MUST be self-contained: one short-lived subprocess (or pure file read)
-   *    with a tight timeout (≤10s) and a capped output buffer — catalogue
-   *    JSON can be hundreds of KB;
+   *  - MUST be self-contained: one short-lived subprocess, a pure file read, or
+   *    a short-timeout (≤10s) request to an endpoint the CLI itself is already
+   *    configured for, with a tight timeout and a capped output buffer —
+   *    catalogue JSON can be hundreds of KB;
    *  - absent = the CLI cannot enumerate its models; the picker shows
    *    `modelChoices` only. */
-  readonly detectModels?: (options?: { env?: NodeJS.ProcessEnv }) => Promise<readonly string[] | null>;
+  readonly detectModels?: (options?: CliModelDetectionOptions) => Promise<readonly string[] | null>;
 
   /** Optional richer form of {@link detectModels}. Adapters that already parse
    *  a model catalogue should implement this and derive detectModels from it,
@@ -1365,6 +1399,8 @@ export interface StructuredBridgeDrainContext {
   /** Terminal `/adopt`: the drainer must post transcript text verbatim (no
    *  synthesised bare-sentinel). */
   adoptMode: boolean;
+  /** Effective backend used to submit the session's input. */
+  backendType?: BackendType;
   /** `state` returned by the previous drain; undefined right after attach/detach. */
   state: unknown;
   /** Release a provisionally held trailing final (drivers that hold one). */

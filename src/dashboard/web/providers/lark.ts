@@ -1,0 +1,106 @@
+// 飞书 / Lark：Dashboard 的原生平台。没有 `provider` 字段的旧行、`'lark'`、`'feishu'` 都归它。
+// 这里的每一项都是企业微信接入前页面的既有行为，改动会直接改变飞书用户看到的界面。
+import {
+  SESSION_CAPABILITIES,
+  type ProfileAccess,
+  type ProviderCopy,
+  type ProviderDescriptor,
+  type SessionCapabilitySet,
+} from './types.js';
+
+/** 会话行默认全部支持；挂起和中断只有声明了的平台才有。 */
+const LARK_SESSION_DEFAULTS: SessionCapabilitySet = Object.fromEntries(
+  SESSION_CAPABILITIES.map(capability => [capability, capability !== 'suspend' && capability !== 'interrupt']),
+) as SessionCapabilitySet;
+
+/** 五个页签、全部共用区块；运行状态与启停是企业微信网关的概念，飞书没有；飞书也没有平台专属格子。 */
+const LARK_PROFILE_ACCESS: ProfileAccess = {
+  rename: true,
+  console: true,
+  avatar: true,
+  description: true,
+  agent: true,
+  agentExtended: true,
+  workingDirectory: true,
+  workingDirectoryModes: true,
+  worktree: true,
+  autoStart: true,
+  backendExtended: true,
+  role: true,
+  sessions: true,
+  security: true,
+  cards: true,
+  backend: true,
+  advancedOther: true,
+  runtimeStatus: false,
+  lifecycle: false,
+  platformSections: false,
+};
+
+export const LARK_COPY: ProviderCopy = {
+  replyCardModeHelp: 'botDefaults.replyCardModeHelp',
+  replyUnifiedDescription: 'botDefaults.replyCardUnifiedDescription',
+  replySplitDescription: 'botDefaults.replyCardLegacyDescription',
+  autoStreamingTitle: 'botDefaults.autoStreaming',
+  autoStreamingDescription: 'botDefaults.autoStreamingDescription',
+  autoStreamingHelp: 'botDefaults.autoStreamingHelp',
+  goalStatusDescription: 'botDefaults.goalStatusCardDescription',
+  goalStatusHelp: 'botDefaults.goalStatusCardHelp',
+  processDescriptionLegacy: 'botDefaults.cotEnabledDescription',
+  processDescriptionUnified: 'botDefaults.replyCardToolsDescription',
+  processHelpLegacy: 'botDefaults.cotEnabledHelp',
+  processHelpUnified: 'botDefaults.replyCardToolsHelp',
+  toolsDescription: 'botDefaults.replyCardShowToolsDescription',
+  toolsHelpLegacy: 'botDefaults.replyCardShowToolsLegacyHelp',
+  toolsHelpUnified: 'botDefaults.replyCardShowToolsHelp',
+  cardControlsHelp: 'botDefaults.replyCardControlsHelp',
+  footerHelp: 'botDefaults.footerHelp',
+  footerRecipientsTitle: 'botDefaults.replyFooterRecipients',
+  footerModelTitle: 'botDefaults.replyFooterModel',
+  cardActionsDescription: 'botDefaults.replyCardActionsDescription',
+  cardActionsHelp: 'botDefaults.replyCardActionsHelp',
+  quietPresetDescription: 'quietPreset.description',
+  quietPresetSecondEffect: 'quietPreset.silentOn',
+  longTaskReminderHelp: 'botDefaults.longTaskReminderHelp',
+  ownerReminderHelp: 'botDefaults.ownerReminderHelp',
+  ownerReminderEnabledHelp: 'botDefaults.ownerReminderEnabledHelp',
+  ownerReminderPendingRepoState: 'botDefaults.ownerReminderStatePendingRepo',
+  noProgressHelp: 'botDefaults.noProgressNotifyHelp',
+  cliProgressHelp: 'botDefaults.cliProgressNotifyHelp',
+  noProgressResetCodexApp: 'botDefaults.noProgressNotifyReset',
+  noProgressResetCli: 'botDefaults.noProgressNotifyReset',
+  noProgressTimeoutHelpCodexApp: 'botDefaults.noProgressNotifyTimeoutHelp',
+  noProgressTimeoutHelpCli: 'botDefaults.cliProgressNotifyTimeoutHelp',
+  senderTagNote: 'botDefaults.senderTagNote',
+  commandTriggerTitle: 'botDefaults.sectionCommandTrigger',
+  commandTriggerEnabled: 'botDefaults.commandTriggerEnabled',
+  commandTriggerEnabledHelp: 'botDefaults.commandTriggerEnabledHelp',
+  commandTriggerPromptHelp: 'botDefaults.commandTriggerPromptHelp',
+  commandTriggerChatsPlaceholder: 'botDefaults.commandTriggerChatsPlaceholder',
+  commandTriggerSave: 'botDefaults.commandTriggerSave',
+  envMaskedNote: 'sessionEnv.revealOwnerOnly',
+  accessTitle: 'blocked.sectionTitle',
+  regularGroupModeTitle: 'botDefaults.groupRegular',
+  roleHelp: 'botDefaults.roleHelp',
+  roleInjectModeHint: 'roles.injectModeHint',
+};
+
+export const larkProvider: ProviderDescriptor = {
+  id: 'lark',
+  nameKey: 'provider.lark',
+  botKey: row => String(row.larkAppId ?? ''),
+  botKeyPrefix: '',
+  session: { defaults: LARK_SESSION_DEFAULTS, controlledWrites: false },
+  deployment: { groupsNavigation: true, createSession: true },
+  // 不收窄区块、配置项、卡片字段与按钮：飞书页就是这些区块的原始形态。
+  profile: {
+    quietPreset: 'reactions',
+    ownerReminderStates: 'all',
+    modelPins: true,
+    codexConfigInfo: true,
+    feedbackChatOverrides: true,
+    feedbackExtensions: true,
+  },
+  profileAccess: () => LARK_PROFILE_ACCESS,
+  copy: LARK_COPY,
+};

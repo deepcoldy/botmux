@@ -2,7 +2,7 @@
  * argv parsing for the dsh runner, in a side-effect-free module so the parse
  * contract is unit-testable without spawning the runner process.
  */
-import { parseRunnerFlags } from './runner-common.js';
+import { parseRunnerFlags, type RunnerFlag } from './runner-common.js';
 
 // Node's setTimeout delay is a 32-bit signed int of ms; a larger value wraps to
 // ~1ms and warns. Upstream config/IPC/UI already clamp to this bound, but the
@@ -24,29 +24,44 @@ export interface Args {
   /** Opt-in idle watchdog in ms. Absent (the default) means no turn timer is
    *  armed at all — the turn runs until dsh reports idle. */
   turnTimeoutMs?: number;
+  /** Set by the adapter only in a native IM gateway's core (the runner, a CLI
+   *  child, never sees that marker): the preamble describes the channel gateway. */
+  nativeGateway?: boolean;
 }
+
+/** Value-less flag; see {@link Args.nativeGateway}. */
+const NATIVE_GATEWAY_FLAG = '--native-gateway';
+
+const VALUE_FLAGS: Readonly<Record<string, RunnerFlag<Args>>> = {
+  '--session-id': 'sessionId',
+  '--dsh-bin': 'dshBin',
+  '--cwd': 'cwd',
+  '--bot-name': 'botName',
+  '--bot-open-id': 'botOpenId',
+  '--locale': 'locale',
+  '--model': 'model',
+  '--dsh-profile': 'dshProfile',
+  '--bridge-patch': 'bridgePatch',
+  '--turn-timeout-ms': (target, val) => {
+    const n = Number(val);
+    // The watchdog is opt-in. An invalid value is ignored (stays disabled)
+    // rather than arming a negative timer or an overflowing ~1ms one.
+    if (Number.isInteger(n) && n > 0 && n <= MAX_TURN_TIMEOUT_MS) target.turnTimeoutMs = n;
+  },
+};
 
 export function parseArgs(argv: string[]): Args {
   // No turnTimeoutMs in the initial object: the watchdog is opt-in, so the
   // absence of --turn-timeout-ms must parse to undefined (a test pins this).
   const out: Args = { sessionId: '', dshBin: '' };
-  parseRunnerFlags(argv, out, {
-    '--session-id': 'sessionId',
-    '--dsh-bin': 'dshBin',
-    '--cwd': 'cwd',
-    '--bot-name': 'botName',
-    '--bot-open-id': 'botOpenId',
-    '--locale': 'locale',
-    '--model': 'model',
-    '--dsh-profile': 'dshProfile',
-    '--bridge-patch': 'bridgePatch',
-    '--turn-timeout-ms': (target, val) => {
-      const n = Number(val);
-      // The watchdog is opt-in. An invalid value is ignored (stays disabled)
-      // rather than arming a negative timer or an overflowing ~1ms one.
-      if (Number.isInteger(n) && n > 0 && n <= MAX_TURN_TIMEOUT_MS) target.turnTimeoutMs = n;
-    },
-  });
+  parseRunnerFlags(argv, out, VALUE_FLAGS);
+  // parseRunnerFlags skips the value-less flag as unknown. Look for it only where
+  // a flag can stand — the walk consumes a value exactly as parseRunnerFlags does —
+  // so another flag's value (a bot named "--native-gateway") never sets it.
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === NATIVE_GATEWAY_FLAG) out.nativeGateway = true;
+    else if (Object.prototype.hasOwnProperty.call(VALUE_FLAGS, argv[i]!) && argv[i + 1] !== undefined) i++;
+  }
   if (!out.sessionId) throw new Error('--session-id is required');
   if (!out.dshBin) throw new Error('--dsh-bin is required');
   return out;

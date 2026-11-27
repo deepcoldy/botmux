@@ -24,9 +24,10 @@ import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { shellQuote } from '../../core/cli-launch-mode.js';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
+import { detectClaudeModels } from './claude-model-catalog.js';
 import { resolveCommand } from './registry.js';
 import { claudeCompactionHookCommand, claudeStopFailureHookCommand, sessionReadyHookCommand, statuslineHookCommand, userPromptHookCommand } from '../hook-command.js';
-import type { CliAdapter, CliId, PtyHandle } from './types.js';
+import type { CliAdapter, CliId, CliModelDetectionOptions, PtyHandle } from './types.js';
 import { CLAUDE_STRIPPED_INVISIBLE_RE, findJsonlContainingFingerprint, jsonlContainsFingerprint, normaliseForFingerprint } from '../../services/claude-transcript.js';
 import { CLAUDE_REASONING_EFFORTS } from '../../services/codex-reasoning-effort.js';
 import { GOAL_ENV } from '../../workflows/v3/contract.js';
@@ -35,6 +36,7 @@ import { wrapBracketedPaste } from './tui-input.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import { discoverClaudeFamilySessions } from '../../services/resumable-session-discovery.js';
 import { builtinPluginDirForSession } from '../../skills/workflow-node-plugin-dir.js';
+import { builtinSkillsOffered } from '../../skills/injection-mode.js';
 import { ensureLeadOnlyPluginDir } from '../../skills/lead-only-guard.js';
 import { decideStartupSwitchConfirm } from '../../utils/claude-switch-confirm.js';
 
@@ -1007,6 +1009,12 @@ export interface ClaudeFamilyVariant {
    *  aliases; forks whose model set is gateway-defined
    *  pass undefined so setup skips the prompt. */
   readonly modelChoices?: readonly string[];
+  /** Live model catalogue probe for the dashboard / session model picker:
+   *  the endpoint this bot actually points at, then the signed catalogue the
+   *  CLI caches on disk (`<config dir>/cache/model-catalog/published-*.json`).
+   *  Forks whose model set is gateway-defined leave it undefined so the
+   *  static list applies. */
+  readonly detectModels?: (options?: CliModelDetectionOptions) => Promise<readonly string[] | null>;
   /** Auth/login paths kept real+writable in the file sandbox (see CliAdapter.authPaths). */
   readonly authPaths?: readonly string[];
   /** Opt in only after this concrete fork passes the terminal contract. */
@@ -1068,9 +1076,16 @@ export function createClaudeCodeAdapter(pathOverride?: string, configDir?: strin
     stateJsonPath: join(homedir(), '.claude.json'),
     ...(configDir ? claudeConfigProfileVariant(configDir) : {}),
     // alias（fable/opus/sonnet/haiku）由 Claude Code 解析到当前推荐版本
-    // （`claude --help` 确认）；具体 ID 锁版本（5 代全名 + 当前 haiku 版本）。
-    // Claude Code 无枚举接口（--model 只吃 alias/全名），故无 detectModels。
+    // （`claude --help` 确认）；具体 ID 锁版本。候选按「bot 实际指向的端点 →
+    // CLI 缓存的签名目录 → 静态表」取（见 claude-model-catalog.ts）：网关 bot 的
+    // 可选集合只有 /v1/models 知道，官方账户则与 /model 选择器同源。
     modelChoices: CLI_MODEL_CHOICES['claude-code'],
+    detectModels: (options) => detectClaudeModels({
+      env: options?.env,
+      settingsEnv: options?.settingsEnv,
+      allowImplicitConfigRoot: options?.allowImplicitConfigRoot,
+      configDir,
+    }),
   }, pathOverride ?? 'claude');
 }
 
@@ -1164,7 +1179,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       return discoverClaudeFamilySessions(variant.dataDir, limit, exclude);
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, reasoningEffort, disableCliBypass, skillPluginDir, noTransport, triggerUserAuth, larkToolAppId, settingsEnv, settingsFilePath, replyDelivery, solo, leadOnly, promptInjection, promptCacheTtl, hideLocalAddresses }) {
+    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, larkAppId, locale, model, reasoningEffort, disableCliBypass, skillPluginDir, noTransport, triggerUserAuth, larkToolAppId, settingsEnv, settingsFilePath, replyDelivery, solo, leadOnly, promptInjection, promptCacheTtl, hideLocalAddresses }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', resumeSessionId ?? sessionId);
@@ -1290,12 +1305,15 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // Keeps them out of the user's global ~/.claude/skills so a standalone
       // `claude` never surfaces/mis-fires `botmux send` etc.
       if (promptInjection === 'none') return args;
-      args.push('--plugin-dir', builtinPluginDirForSession(CLAUDE_PLUGIN_DIR));
+      // Not in a native gateway's core: its built-ins drive the Feishu transport
+      // that core lacks, and this dir is shared with the Feishu fleet
+      // (builtinSkillsOffered). The bot's own skills below are unaffected.
+      if (builtinSkillsOffered()) args.push('--plugin-dir', builtinPluginDirForSession(CLAUDE_PLUGIN_DIR));
       if (skillPluginDir) args.push('--plugin-dir', skillPluginDir);
       // replyDelivery=transcript：系统提示改口为「最终回复由 botmux 自动转发」。v3 workflow
       // 子会话（GOAL_ENV.V3_MARKER）的收口靠 botmux send，强制保持 send 措辞。
       const effectiveReplyDelivery = process.env[GOAL_ENV.V3_MARKER] === '1' ? 'send' : replyDelivery;
-      args.push('--append-system-prompt', buildBotmuxSystemPromptText({ locale, botName, botOpenId, noTransport, triggerUserAuth, larkToolAppId, replyDelivery: effectiveReplyDelivery, solo, leadOnly: leadOnlyActive, hideLocalAddresses, cliId: 'claude-code' }));
+      args.push('--append-system-prompt', buildBotmuxSystemPromptText({ locale, botName, botOpenId, larkAppId, noTransport, triggerUserAuth, larkToolAppId, replyDelivery: effectiveReplyDelivery, solo, leadOnly: leadOnlyActive, hideLocalAddresses, cliId: 'claude-code' }));
       return args;
     },
 
@@ -1700,6 +1718,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
     // 候选 model 由 variant 决定（Claude 给 Anthropic alias；Seed 走网关交给 setup 跳过）。
     // setup 选 Other 可自由填，比如要回退或试 canary 模型。
     modelChoices: variant.modelChoices,
+    ...(variant.detectModels ? { detectModels: variant.detectModels } : {}),
     // askUserQuestion hook 写各 variant 的 settings.json（matcher='AskUserQuestion' 的
     // PreToolUse），把事件转发到 `botmux hook <id>`。Claude 用全局 ~/.claude/settings.json
     // 是为了 adopt 模式（接管的 claude 会话拿不到进程级 --settings，只读全局那条）；hook

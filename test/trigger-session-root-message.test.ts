@@ -3,12 +3,13 @@
 // touching live botmux data (see the helper).
 import './helpers/require-fenced-data-dir.js';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { validateTriggerRequest, type TriggerRequest } from '../src/services/trigger-types.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { isExternalTriggerTurn, resolveTurnOrigin } from '../src/core/turn-origin.js';
+import { logger } from '../src/utils/logger.js';
 
 const mockGetMessageChatId = vi.fn();
 const mockGetChatMode = vi.fn(async () => 'topic');
@@ -2159,6 +2160,94 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(ds?.pendingCodexAppMessageContext).toContain('<botmux_external_event trusted="false">');
     expect(ds?.pendingCodexAppMessageContext).not.toContain('Inspect the alert.');
     expect(mockRunAutoWorktreeCommit).toHaveBeenCalledWith(expect.objectContaining({ ds }));
+  });
+
+  it('stages an opted-in conversation worktree inside a native gateway core without invoking the Lark transport', async () => {
+    mockGetBot.mockReturnValue({ config: { larkAppId: APP, cliId: 'codex', apiOnly: true,
+      defaultWorkingDir: '/tmp', defaultWorkingDirAutoWorktree: true } });
+    mockBotAutoWorktreeEnabled.mockReturnValue(true);
+    vi.stubEnv('BOTMUX_CORE_ONLY', '1');
+    vi.stubEnv('BOTMUX_NATIVE_GATEWAY_CORE', '1');
+    const warn = vi.spyOn(logger, 'warn');
+    try {
+      const req = request({ chatId: undefined, rootMessageId: undefined });
+      req.options = { asyncReturnSessionId: true };
+      const activeSessions = new Map<string, DaemonSession>();
+      const response = await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+      expect(response).toMatchObject({ ok: true, action: 'queued' });
+      const ds = [...activeSessions.values()][0];
+      expect(ds.pendingRepo).toBe(true);
+      expect(mockForkWorker).not.toHaveBeenCalled();
+      const commit = mockRunAutoWorktreeCommit.mock.calls[0][0];
+      expect(commit).toMatchObject({ ds, baseDir: '/tmp' });
+      // A worktree failure notice has no Lark chat to go to: it lands in the log.
+      await commit.notify('worktree creation failed: disk full');
+      expect(mockSendMessage).not.toHaveBeenCalled();
+      expect(warn.mock.calls.some(([line]) => String(line).includes(ds.session.sessionId)
+        && String(line).includes('worktree creation failed: disk full'))).toBe(true);
+      expect(mockGetAvailableBots).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it.each([
+    ['an apiOnly fleet bot', {}],
+    ['a core-only service without a native gateway', { BOTMUX_CORE_ONLY: '1' }],
+    ['a core-only service handed a bot profile but no native gateway', { BOTMUX_CORE_ONLY: '1', BOTMUX_CORE_BOT_CONFIG: '{}' }],
+  ])('keeps HTTP virtual triggers of %s on the base directory despite auto-worktree', async (_label, env: Record<string, string>) => {
+    mockGetBot.mockReturnValue({ config: { larkAppId: APP, cliId: 'codex', apiOnly: true,
+      defaultWorkingDir: '/tmp', defaultWorkingDirAutoWorktree: true } });
+    mockBotAutoWorktreeEnabled.mockReturnValue(true);
+    for (const [key, value] of Object.entries(env)) vi.stubEnv(key, value);
+    try {
+      const req = request({ chatId: undefined, rootMessageId: undefined });
+      req.options = { asyncReturnSessionId: true };
+      const response = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: new Map() });
+      expect(response).toMatchObject({ ok: true, action: 'queued' });
+      expect(mockRunAutoWorktreeCommit).not.toHaveBeenCalled();
+      expect(mockForkWorker).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('runs a fresh apiOnly HTTP session in a native gateway working directory only when it resolves inside the configured root', async () => {
+    // effectiveDefaultWorkingDir is mocked to /tmp: that is the configured root.
+    mockGetBot.mockReturnValue({ config: { larkAppId: APP, cliId: 'codex', apiOnly: true, workingDir: '/tmp' } });
+    const inside = mkdtempSync('/tmp/native-gateway-wiring-');
+    try {
+      const accepted = request({ chatId: undefined, rootMessageId: undefined });
+      accepted.options = { asyncReturnSessionId: true, connectorWorkingDirectory: inside };
+      const activeSessions = new Map<string, DaemonSession>();
+      expect(await triggerSessionTurn(accepted, { larkAppId: APP, activeSessions })).toMatchObject({ ok: true });
+      expect([...activeSessions.values()][0]!.session.workingDir).toBe(realpathSync(inside));
+
+      const escaped = request({ chatId: undefined, rootMessageId: undefined });
+      escaped.options = { asyncReturnSessionId: true, connectorWorkingDirectory: '/usr' };
+      expect(await triggerSessionTurn(escaped, { larkAppId: APP, activeSessions: new Map() }))
+        .toMatchObject({ ok: false, errorCode: 'bad_request', error: 'connector directory outside configured root' });
+    } finally {
+      rmSync(inside, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses a native gateway working directory for a bot with Lark transport', async () => {
+    const req = request({ chatId: undefined, rootMessageId: undefined });
+    req.options = { asyncReturnSessionId: true, connectorWorkingDirectory: '/tmp' };
+    expect(await triggerSessionTurn(req, { larkAppId: APP, activeSessions: new Map() }))
+      .toMatchObject({ ok: false, errorCode: 'bad_request', error: 'connector directory requires fresh core-only session' });
+    expect(mockForkWorker).not.toHaveBeenCalled();
+  });
+
+  it('keeps ordinary HTTP virtual triggers on their base directory unless the dedicated bot opts in', async () => {
+    mockBotAutoWorktreeEnabled.mockReturnValue(true);
+    const req = request({ chatId: undefined, rootMessageId: undefined });
+    req.options = { asyncReturnSessionId: true };
+    await triggerSessionTurn(req, { larkAppId: APP, activeSessions: new Map() });
+    expect(mockRunAutoWorktreeCommit).not.toHaveBeenCalled();
+    expect(mockForkWorker).toHaveBeenCalledTimes(1);
   });
 
   it('closes the unpublished trigger row when auto-worktree setup persistence fails', async () => {

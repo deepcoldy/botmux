@@ -23,6 +23,7 @@ You can also edit `~/.botmux/config.json` directly. Every item below lists its J
 | Get a DM when the host is overloaded | General → Host overload alert | `hostOverloadAlert` | Off |
 | Run scheduled tasks in a specific timezone | General → Scheduled tasks → Timezone | `scheduleTimeZone` | Follow host |
 | Prefix group names created by `/g` | General → Group Creation | `groupNamePrefix` | None |
+| Prefix automatic session titles in Codex Desktop | [Config file only](#codex-app-title-prefix) | `codexAppTitlePrefix` | None |
 | Hide worktrees in the repo picker | General → Repo Picker | `repoPickerMode` | Repos + worktrees |
 | Put new worktrees on a larger disk | General → Worktrees | `worktreeRoot` | Next to the main repo |
 | Let Claude carry on by itself after a transient model-service failure | General → Auto-continue after provider failures | `providerRecovery` | Off |
@@ -60,6 +61,18 @@ When enabled, botmux checks hourly for a new version and sends a DM only through
 Location: General → Experimental → Automatically upgrade session Codex versions. Experimental, off by default.
 
 When on and a newer Codex is installed on the machine, running Codex sessions switch to the new process **when it is safe and idle**, then resume the same thread without starting an extra turn. Sessions with background work, or whose state can't be confirmed safe, wait. The toggle takes effect immediately.
+
+## Codex App session title prefix {#codex-app-title-prefix}
+
+Botmux names new `codex-app` sessions after the first actual task. To identify them in Codex Desktop, add this top-level field to `~/.botmux/config.json`, keeping your other settings:
+
+```json
+{
+  "codexAppTitlePrefix": "botmux: "
+}
+```
+
+For example, “Debug image uploads” becomes `botmux: Debug image uploads`. Spaces and separators are kept as configured. The prefix is limited to 24 Unicode code points and the full title to 48. Omit the field or leave it empty for no prefix. It applies to automatic titles for new sessions from all `codex-app` bots on this machine. It doesn't change existing titles or sessions, other CLIs, or Feishu group names.
 
 ## Scheduled cleanup of idle sessions
 

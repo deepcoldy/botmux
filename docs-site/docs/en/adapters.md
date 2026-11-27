@@ -141,6 +141,36 @@ Follow each gateway team's published docs for the actual script. MTR is communit
 
 > Debugging a wrapper: find the `Spawning fresh CLI:` line in `botmux logs`, copy the full command and run it by hand in a terminal. That usually shows whether it's permissions, arguments or sign-in.
 
+### Cursor Agent Local with a custom model API
+
+If you have access to Cursor Agent Local, use `cliId: "cursor"` and point `cliPathOverride` at an executable launcher. This example targets a local OpenAI-compatible gateway and was verified with `cursor-agent-local` version `2026.11.22-e9042b2`. It requires the separate Agent Local executable.
+
+```sh
+#!/bin/sh
+set -eu
+export CURSOR_LOCAL_AGENT_BASE_URL="http://127.0.0.1:8080/v1"
+: "${CURSOR_LOCAL_AGENT_API_KEY:?Set a scoped local gateway token in the launcher environment}"
+export CURSOR_LOCAL_AGENT_API_KEY
+export CURSOR_CONFIG_DIR="$HOME/.cursor"
+export CURSOR_DATA_DIR="$HOME/.cursor"
+exec /path/to/cursor-agent-local --authless --disable-auto-update "$@"
+```
+
+Keep upstream provider keys in the gateway. Pass only a scoped local gateway token to the launcher through your service's secret configuration. If a [strict process environment](/en/bots-json#strict-env) filters that environment, allow `CURSOR_LOCAL_AGENT_API_KEY`. The endpoint needs to serve `GET /models` and streaming `POST /chat/completions`. Workspace tools require streaming tool calls.
+
+```json
+{
+  "cliId": "cursor",
+  "cliPathOverride": "/path/to/cursor-local-launcher",
+  "model": "gateway-model",
+  "customModels": ["gateway-model"]
+}
+```
+
+Set `model` to an ID the gateway advertises. Use `customModels` to add gateway IDs to the Feishu picker. The gateway decides which models are accepted.
+
+Botmux reads Cursor transcripts from the daemon user's `~/.cursor`. Run the launcher as the same service account and keep the data directory there. If Linux process protection prevents Botmux from discovering the transcript, the tested build supports `CURSOR_AGENT_ALLOW_PROCESS_INSPECTION=1` in the launcher. This permits same-user process inspection. Enable it only if needed and use a dedicated service account.
+
 ## Codex-compatible distributions
 
 If you run a separately released distribution that is **strictly compatible with Codex**, use `cliId: "codex"` plus `cliRuntime`: `cliId` selects the Codex protocol adapter and `cliRuntime` names the binary that actually runs. It reuses model args, session resume, idle detection and Codex RPC, without being version-checked as official Codex.

@@ -20,6 +20,8 @@ import {
   readSkillOverrideBody,
   replaceState,
   type CustomizationState,
+  type CustomizationScope,
+  DEFAULT_CUSTOMIZATION_SCOPE,
   MAX_SKILL_BODY_BYTES,
   MAX_PROMPT_OVERRIDE_BYTES,
 } from '../services/customization-store.js';
@@ -31,6 +33,9 @@ export const BUNDLE_SCHEMA_VERSION = 1 as const;
 export interface CustomizationBundle {
   schemaVersion: 1;
   kind: typeof BUNDLE_KIND;
+  /** Store a bundle was exported from, when it is not the default (Feishu) one.
+   *  Only the `wecom` value is meaningful; a Feishu export carries no marker. */
+  scope?: 'wecom';
   /** Optional author-supplied name / note (metadata only). */
   name?: string;
   createdAt?: string;
@@ -65,12 +70,16 @@ export interface BundleImportPreview {
 
 /** Build a portable bundle from the current on-disk customization state.
  *  Skill bodies are inlined by reading their .md files. */
-export function exportBundle(opts: { name?: string; createdAt?: string } = {}): CustomizationBundle {
-  const state = readCustomizationState();
+export function exportBundle(
+  opts: { name?: string; createdAt?: string } = {},
+  scope: CustomizationScope = DEFAULT_CUSTOMIZATION_SCOPE,
+): CustomizationBundle {
+  const state = readCustomizationState(scope);
   const bundle: CustomizationBundle = {
     schemaVersion: BUNDLE_SCHEMA_VERSION,
     kind: BUNDLE_KIND,
   };
+  if (scope === 'wecom') bundle.scope = 'wecom';
   if (opts.name) bundle.name = opts.name;
   if (opts.createdAt) bundle.createdAt = opts.createdAt;
 
@@ -85,7 +94,7 @@ export function exportBundle(opts: { name?: string; createdAt?: string } = {}): 
     for (const [name, ov] of Object.entries(state.builtinSkills)) {
       const entry: { body?: string; disabled?: boolean } = {};
       if (ov.body !== undefined) {
-        const body = readSkillOverrideBody(name);
+        const body = readSkillOverrideBody(name, scope);
         if (typeof body === 'string') entry.body = body; // inline the full text
       }
       if (ov.disabled) entry.disabled = true;
@@ -112,6 +121,9 @@ export function parseBundle(rawJson: string): CustomizationBundle {
   if (r.schemaVersion !== BUNDLE_SCHEMA_VERSION) throw new BundleError(`不支持的 schemaVersion（期望 ${BUNDLE_SCHEMA_VERSION}）`);
 
   const out: CustomizationBundle = { schemaVersion: BUNDLE_SCHEMA_VERSION, kind: BUNDLE_KIND };
+  // Kept only for the one meaningful value; any other `scope` is dropped, as
+  // every unknown field always was.
+  if (r.scope === 'wecom') out.scope = 'wecom';
   if (typeof r.name === 'string') out.name = r.name.slice(0, 200);
   if (typeof r.createdAt === 'string') out.createdAt = r.createdAt;
 
@@ -177,8 +189,11 @@ function preview(s: string | undefined, n = 60): string | undefined {
 
 /** Compute the diff a bundle import would produce against current state. Pure —
  *  reads current state but writes nothing. */
-export function previewBundleImport(bundle: CustomizationBundle): BundleImportPreview {
-  const current = readCustomizationState();
+export function previewBundleImport(
+  bundle: CustomizationBundle,
+  scope: CustomizationScope = DEFAULT_CUSTOMIZATION_SCOPE,
+): BundleImportPreview {
+  const current = readCustomizationState(scope);
   const diff: BundleDiffEntry[] = [];
 
   // Prompt overrides
@@ -205,7 +220,7 @@ export function previewBundleImport(bundle: CustomizationBundle): BundleImportPr
       diff.push({ kind: 'skill', id: name, action: 'disable', after: '停用' });
       continue;
     }
-    const existingBody = existing?.body !== undefined ? readSkillOverrideBody(name) : undefined;
+    const existingBody = existing?.body !== undefined ? readSkillOverrideBody(name, scope) : undefined;
     const action = existingBody === undefined ? 'add' : existingBody === ov.body ? 'unchanged' : 'replace';
     diff.push({ kind: 'skill', id: name, action, before: preview(existingBody), after: preview(ov.body) });
   }
@@ -229,7 +244,11 @@ export function previewBundleImport(bundle: CustomizationBundle): BundleImportPr
  * the diff preview honest — what you see is exactly the resulting state. A merge
  * mode can be layered on later if requested.
  */
-export function applyBundle(bundle: CustomizationBundle, label = 'import bundle'): CustomizationState {
+export function applyBundle(
+  bundle: CustomizationBundle,
+  label = 'import bundle',
+  scope: CustomizationScope = DEFAULT_CUSTOMIZATION_SCOPE,
+): CustomizationState {
   const next: CustomizationState = { schemaVersion: 1 };
   if (bundle.promptOverrides) next.promptOverrides = bundle.promptOverrides;
   if (bundle.conditionalLines) next.conditionalLines = bundle.conditionalLines;
@@ -244,7 +263,7 @@ export function applyBundle(bundle: CustomizationBundle, label = 'import bundle'
     }
     if (Object.keys(bs).length) next.builtinSkills = bs;
   }
-  return replaceState(next, skillBodies, label);
+  return replaceState(next, skillBodies, label, scope);
 }
 
 /** Serialize a bundle to pretty JSON (with a trailing newline) for file output. */

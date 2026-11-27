@@ -45,9 +45,9 @@ describe('GET /api/cli-options/models — 400 分支（unknown_selection_key）'
 
 describe('GET /api/cli-options/models — 200 响应 shape', () => {
   it('无 live 探测能力：models=静态候选，source=static，detectedAt 为 epoch millis', async () => {
-    const body = await buildModelChoicesResponse('claude-code', { now: () => 1_700_000_000_000 });
+    const body = await buildModelChoicesResponse('cursor', { now: () => 1_700_000_000_000 });
     expect(body).toEqual({
-      models: expect.arrayContaining(['sonnet']) as unknown as string[],
+      models: expect.arrayContaining(['auto']) as unknown as string[],
       source: 'static',
       detectedAt: 1_700_000_000_000,
     });
@@ -146,6 +146,82 @@ describe('GET /api/cli-options/models — Bot runtime 上下文', () => {
       runtimeExecutable: undefined,
       runtimeContext: undefined,
       probeEnv: undefined,
+      probeSettingsEnv: undefined,
+      configDir: undefined,
+      canProbe: false,
     });
+  });
+
+  it('没有 Bot 时探测宿主默认 CLI', () => {
+    expect(modelCatalogProbeContext('claude-code', undefined, { PATH: '/x' }).canProbe).toBe(true);
+  });
+
+  it('profile bot 带出 cliConfigDir，且参与 runtime 身份', () => {
+    const bot = {
+      larkAppId: 'cli_profile',
+      cliId: 'claude-code',
+      cliConfigDir: '/profiles/claude-api',
+    } as BotConfig;
+    const ctx = modelCatalogProbeContext('claude-code', bot, { PATH: '/x' });
+    expect(ctx.canProbe).toBe(true);
+    expect(ctx.configDir).toBe('/profiles/claude-api');
+    // 不同 profile 是不同账户，缓存身份必须区分（而不是钉住路径拼接格式）。
+    const other = modelCatalogProbeContext('claude-code', {
+      ...bot,
+      cliConfigDir: '/profiles/claude-personal',
+    } as BotConfig, { PATH: '/x' });
+    expect(other.runtimeContext).not.toBe(ctx.runtimeContext);
+  });
+
+  it('未知 wrapper 不探测，也不把 Bot 的 configDir 带出去', () => {
+    const bot = {
+      larkAppId: 'cli_unknown_wrapper',
+      cliId: 'claude-code',
+      wrapperCli: 'ccr claude',
+      cliConfigDir: '/profiles/claude-api',
+    } as BotConfig;
+    const ctx = modelCatalogProbeContext('claude-code', bot, { PATH: '/x' });
+    expect(ctx.canProbe).toBe(false);
+    expect(ctx.configDir).toBeUndefined();
+  });
+
+  it.each([
+    ['oncall sandbox', { sandbox: true }, {}],
+    ['legacy read isolation', { readIsolation: true }, {}],
+    ['credential-source home', { credentialsSourceDir: '/accounts/target' }, {}],
+    ['env-forced sandbox', {}, { BOTMUX_SANDBOX: '1' }],
+  ])('worker 会重定向 Claude 数据根时禁止借用探测根：%s', (_name, shape, baseEnv) => {
+    const bot = {
+      larkAppId: 'cli_redirected',
+      cliId: 'claude-code',
+      ...shape,
+    } as BotConfig;
+    expect(modelCatalogProbeContext('claude-code', bot, baseEnv).canProbe).toBe(false);
+  });
+
+  it('scratch 与其他 CLI 不因 oncall 的 Claude 重定向规则误停探测', () => {
+    expect(modelCatalogProbeContext('claude-code', {
+      larkAppId: 'cli_scratch', cliId: 'claude-code', sandbox: 'scratch',
+    } as BotConfig, {}).canProbe).toBe(true);
+    expect(modelCatalogProbeContext('codex', {
+      larkAppId: 'cli_codex_sandbox', cliId: 'codex', sandbox: true,
+    } as BotConfig, {}).canProbe).toBe(true);
+  });
+
+  it('保留 botmux overlay 与继承 env 的分层', () => {
+    const bot = {
+      larkAppId: 'cli_layered',
+      cliId: 'claude-code',
+      env: { ANTHROPIC_BASE_URL: 'https://from-bot' },
+    } as BotConfig;
+    const ctx = modelCatalogProbeContext('claude-code', bot, {
+      ANTHROPIC_BASE_URL: 'https://inherited',
+      ANTHROPIC_AUTH_TOKEN: 'inherited-token',
+    });
+    expect(ctx.probeEnv).toMatchObject({
+      ANTHROPIC_BASE_URL: 'https://from-bot',
+      ANTHROPIC_AUTH_TOKEN: 'inherited-token',
+    });
+    expect(ctx.probeSettingsEnv).toEqual({ ANTHROPIC_BASE_URL: 'https://from-bot' });
   });
 });

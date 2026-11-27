@@ -57,28 +57,59 @@ scrubDetachedRestartEnvRefresh(process.env);
 
 async function main(): Promise<void> {
   const { FleetSupervisor } = await import('./core/fleet-supervisor.js');
-  const { fleetStatePath, fleetDistDir, fleetLogDir, fleetCommandPath, resolveFleetBots, resolveFleetMembers, resolveFleetDaemonEnv, fleetDaemonNodeArgs } = await import('./core/fleet-runtime.js');
-  const { drainFleetCommands } = await import('./core/fleet-command-queue.js');
+  const {
+    fleetStatePath,
+    fleetDistDir,
+    fleetLogDir,
+    fleetCommandPath,
+    fleetCommandResultsPath,
+    resolveFleetBots,
+    resolveFleetMembers,
+    resolveFleetDaemonEnv,
+    resolveWecomGroup,
+    fleetDaemonNodeArgs,
+  } = await import('./core/fleet-runtime.js');
+  const { drainFleetCommands, recordFleetCommandResult } = await import('./core/fleet-command-queue.js');
   const { logger } = await import('./utils/logger.js');
   const { FLEET_DAEMON_KILL_TIMEOUT_MS } = await import('./core/shutdown-budgets.js');
 
-  // Every supervised member: the bot daemons from bots.json PLUS the dashboard.
-  // The dashboard is always present (mirrors the old pm2 ecosystem, which always
-  // pushed a botmux-dashboard app), so the supervisor stays up to run it even
-  // with zero bots configured — that's exactly the state where an operator opens
-  // the dashboard to add their first bot.
-  const members = resolveFleetMembers();
+  const log = (m: string) => logger.info(`[supervisor] ${m}`);
+  const daemonEnv = resolveFleetDaemonEnv();
+
+  // Every supervised member: the bot daemons from bots.json PLUS the dashboard,
+  // then one member per WeCom connection whose desired state is `running` (none
+  // without WeCom configuration). The dashboard is always present (mirrors the
+  // old pm2 ecosystem, which always pushed a botmux-dashboard app), so the
+  // supervisor stays up to run it even with zero bots configured — that's
+  // exactly the state where an operator opens the dashboard to add their first
+  // bot.
+  const members = resolveFleetMembers({ baseEnv: daemonEnv, log });
   const botCount = resolveFleetBots().length;
+  const wecomCount = members.filter((m) => m.group === 'wecom').length;
 
   const supervisor = new FleetSupervisor({
     statePath: fleetStatePath(),
     distDir: fleetDistDir(),
-    daemonEnv: resolveFleetDaemonEnv(),
+    daemonEnv,
     cwd: configDir,
     daemonNodeArgs: fleetDaemonNodeArgs(),
     logDir: fleetLogDir(),
     killTimeoutMs: FLEET_DAEMON_KILL_TIMEOUT_MS,
-    log: (m) => logger.info(`[supervisor] ${m}`),
+    log,
+    // WeCom connections can be added, started and stopped while the supervisor
+    // runs: start-member / stop-member and the SIGHUP reconcile re-read them.
+    resolveGroup: () => {
+      const resolution = resolveWecomGroup(daemonEnv);
+      for (const note of resolution.notes) log(`wecom: ${note}`);
+      return resolution;
+    },
+    onMemberCommandResult: (result) => {
+      try {
+        recordFleetCommandResult(fleetCommandResultsPath(), result);
+      } catch (err) {
+        logger.warn(`[supervisor] could not record ${result.op} ${result.name}: ${err instanceof Error ? err.message : err}`);
+      }
+    },
   });
 
   let shuttingDown = false;
@@ -92,10 +123,17 @@ async function main(): Promise<void> {
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
   process.on('SIGINT', () => void shutdown('SIGINT'));
 
-  // SIGHUP = "drain the single-bot command queue" (start-bot / stop-bot). The CLI
-  // enqueues a command under the fleet lock then signals us; we own the daemon
-  // children so we perform the spawn/stop. Serialized so overlapping SIGHUPs
-  // (or one arriving mid-drain) can't interleave two drains.
+  // SIGHUP = "drain the single-bot command queue" (start-bot / stop-bot, and
+  // start-member / stop-member for WeCom connections), then reconcile the WeCom
+  // members with their configuration and desired state. The CLI enqueues a
+  // command under the fleet lock then signals us; we own the daemon children so
+  // we perform the spawn/stop. Serialized so overlapping SIGHUPs (or one
+  // arriving mid-drain) can't interleave two drains.
+  //
+  // The queue goes first: a stop-member for a connection just set to `stopped`
+  // is answered by actually stopping it, and the reconcile then removes its row.
+  // Without any WeCom configuration the reconcile resolves no members and holds
+  // none, so it changes nothing.
   let draining = false;
   let drainAgain = false;
   const drain = async () => {
@@ -110,6 +148,7 @@ async function main(): Promise<void> {
           logger.info(`[supervisor] SIGHUP → draining ${commands.length} command(s)`);
           await supervisor.drainCommands(commands);
         }
+        await supervisor.reconcileGroup('wecom');
       } while (drainAgain);
     } finally {
       draining = false;
@@ -125,7 +164,7 @@ async function main(): Promise<void> {
   else if (scope.action === 'failed') logger.warn(`[supervisor] staying in ${scope.unit}: could not create an own systemd scope (${scope.reason})`);
   else if (scope.action === 'unsupported' && process.platform === 'linux') logger.info(`[supervisor] no own systemd scope: ${scope.reason}`);
 
-  logger.info(`[supervisor] starting fleet: ${botCount} bot(s) + dashboard${process.env.BOTMUX_TOPIC_SEARCH === '0' ? '' : ' + topic-index'}`);
+  logger.info(`[supervisor] starting fleet: ${botCount} bot(s) + dashboard${process.env.BOTMUX_TOPIC_SEARCH === '0' ? '' : ' + topic-index'}${wecomCount > 0 ? ` + ${wecomCount} wecom connection(s)` : ''}`);
   if (!supervisor.start(members)) {
     // Another live supervisor already owns the fleet (two `botmux start`s
     // overlapped, e.g. the autostart watchdog and a slow first start). It keeps

@@ -29,6 +29,38 @@ import {
   isSameAntigravityConversation,
 } from './antigravity-transcript.js';
 
+export interface AntigravityDiscoveredSessionIdPolicyInput {
+  /** ID obtained from the live process/native log rather than stored config. */
+  discoveredSessionId: string;
+  effectiveResume: boolean;
+  /** Explicit native conversation requested for this spawn, if any. */
+  resumeSessionId?: string;
+  /** Atomic adapter provenance: native stream records survive later `/new`;
+   *  process/fd evidence can be a transient startup sibling. */
+  discoverySource: 'native-log' | 'process-discovery';
+  /** A surviving persistent pane may have rotated while no worker was attached. */
+  persistentReattach: boolean;
+  adoptMode?: boolean;
+}
+
+/** Whether a process-discovered Antigravity ID may update the current identity.
+ *
+ * Only process/fd discovery during a cold resume with an explicit target uses
+ * stored identity as a fence: agy's startup ListConversations can briefly
+ * expose a sibling DB before the requested conversation is open. An atomic
+ * native-stream observation remains authoritative for a later `/new`.
+ * Persistent reattach and adopt instead must
+ * follow the surviving pane's current native ID, including a `/new` completed
+ * while the worker was down. Fresh launches and resume-without-ID have no
+ * stored native target to enforce. */
+export function shouldAcceptAntigravityDiscoveredSessionId(
+  input: AntigravityDiscoveredSessionIdPolicyInput,
+): boolean {
+  if (input.discoverySource === 'native-log') return true;
+  if (!input.effectiveResume || input.persistentReattach || input.adoptMode || !input.resumeSessionId) return true;
+  return input.discoveredSessionId.toLowerCase() === input.resumeSessionId.toLowerCase();
+}
+
 
 /** What the ticker should do this tick. */
 export type AntigravityTickerAction =

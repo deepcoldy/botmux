@@ -136,6 +136,7 @@ export function createGeniusAdapter(pathOverride?: string): CliAdapter {
         locale,
         botName,
         botOpenId,
+        larkAppId,
         noTransport,
         triggerUserAuth,
         larkToolAppId,

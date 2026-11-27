@@ -1,0 +1,25 @@
+import { afterEach, expect, it } from 'vitest';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
+import { once } from 'node:events';
+import type { ChildProcess } from 'node:child_process';
+import { spawnTsScript } from './helpers/ts-runner.js';
+import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
+import { privateUnifiedSessionRow, seedControlledBridgeTask } from './helpers/wecom-controlled-core.js';
+import { releaseWecomCorePorts, reserveWecomCorePort } from './helpers/wecom-core-port.js';
+import { wecomCoreIdentity } from '../src/dashboard/wecom/sessions.js';
+import { loadOrCreatePersistedToken } from '../src/dashboard/auth.js';
+let root='',child:ChildProcess|undefined;
+afterEach(async()=>{if(child&&child.exitCode===null&&child.signalCode===null){const done=once(child,'close');child.kill('SIGTERM');const timer=setTimeout(()=>child?.kill('SIGKILL'),3000);await done;clearTimeout(timer)}if(root)rmSync(root,{recursive:true,force:true});root='';child=undefined;await releaseWecomCorePorts()});
+it('exposes private WeCom rows only to the real host-admin HTTP session before global pagination and protects actions with CSRF',async()=>{
+ root=mkdtempSync(join(tmpdir(),'wecom-unified-http-'));const home=join(root,'home'),configDir=join(home,'.botmux'),data=join(configDir,'data'),wecom=join(configDir,'wecom'),coreState=join(root,'core');mkdirSync(wecom,{recursive:true});mkdirSync(data,{recursive:true});const bots=join(configDir,'bots.json');writeFileSync(bots,'[]');writeFileSync(join(configDir,'.env'),'');writeFileSync(join(configDir,'.dashboard-secret'),'fixture-host-secret',{mode:0o600});const token=loadOrCreatePersistedToken(join(configDir,'.dashboard-token'));
+ const config={botId:'private-wecom-bot',secretEnv:'FAKE_UNUSED_SECRET',coreUrl:'http://127.0.0.1:19123',allowedUsers:['fixture-user'],stateDir:join(root,'bridge'),managedCore:{cli:'codex',backend:'pty' as const,workingDirectory:root,port:19123,stateDir:coreState,botId:'local_private_core'}};writeFileSync(join(wecom,'config.json'),JSON.stringify(config));await seedControlledBridgeTask({botId:config.botId,stateFile:join(config.stateDir,'state.json'),coreIdentity:wecomCoreIdentity(config),nativeSessionId:'private-native-sid'});seedPersistedSessionRows(coreState,config.managedCore.botId,{'private-native-sid':{...privateUnifiedSessionRow('private-native-sid',config.managedCore.botId),title:'PRIVATE_WECOM_TITLE',status:'closed'}});
+ const desired=await reserveWecomCorePort();
+ child=spawnTsScript(resolve('src/index-dashboard.ts'),[],{cwd:resolve('.'),env:{...process.env,HOME:home,USERPROFILE:home,SESSION_DATA_DIR:data,BOTS_CONFIG:bots,BOTMUX_DASHBOARD_HOST:'127.0.0.1',BOTMUX_DASHBOARD_PORT:String(desired),BOTMUX_DASHBOARD_PUBLIC_READONLY:'true'},stdio:['ignore','pipe','pipe']});let logs='';child.stdout!.on('data',chunk=>logs+=chunk);child.stderr!.on('data',chunk=>logs+=chunk);
+ let base='';const deadline=Date.now()+20000;while(Date.now()<deadline){if(child.exitCode!==null||child.signalCode!==null)throw Error('isolated Dashboard startup failed');try{const port=Number(readFileSync(join(configDir,'.dashboard-port'),'utf8'));if(port){base=`http://127.0.0.1:${port}`;if((await fetch(base+'/api/settings')).ok)break}}catch{}await new Promise(done=>setTimeout(done,30))}expect(base).not.toBe('');
+ const publicBody=await (await fetch(base+'/api/sessions?view=board')).json();expect(JSON.stringify(publicBody)).not.toContain('PRIVATE_WECOM_TITLE');expect(publicBody.sessions).toHaveLength(0);expect(publicBody.closedTotal).toBe(0);
+ const auth={cookie:`botmux_dashboard_token=${token}`};const admin=await fetch(base+'/api/sessions?view=board',{headers:auth});expect(admin.status,logs).toBe(200);const body=await admin.json();expect(body.sessions).toHaveLength(1);expect(body.closedTotal).toBe(1);expect(body.sessions[0]).toMatchObject({provider:'wecom',title:'PRIVATE_WECOM_TITLE',status:'closed'});const id=body.sessions[0].sessionId;
+ expect((await fetch(base+`/api/sessions/${encodeURIComponent(id)}/history`)).status).toBe(401);expect((await fetch(base+`/api/sessions/${encodeURIComponent(id)}/close`,{method:'POST',headers:{...auth,'content-type':'application/json'},body:'{}'})).status).toBe(403);
+ const summary=await (await fetch(base+'/api/dashboard/v1/summary')).text();expect(summary).not.toContain('PRIVATE_WECOM_TITLE');expect(summary).not.toContain('private-native-sid');
+},30000);

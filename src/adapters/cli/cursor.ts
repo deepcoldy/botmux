@@ -8,8 +8,11 @@ import { TMUX_INITIAL_PROMPT_ARG_BUDGET, type CliAdapter, type PtyHandle, type S
 import { busyProbeRegion } from '../../utils/busy-probe.js';
 import { stripAnsiScreenText } from '../../utils/idle-detector.js';
 import { delay } from '../../utils/timing.js';
+import { normaliseTranscriptFingerprintCandidates } from '../../services/claude-transcript.js';
 import { drainCursorTranscript, findCursorTranscriptByChatId, findCursorTranscriptByPid } from '../../services/cursor-transcript.js';
+import type { CodexBridgeEvent } from '../../services/codex-transcript.js';
 import { builtinPluginDirForSession } from '../../skills/workflow-node-plugin-dir.js';
+import { builtinSkillsOffered } from '../../skills/injection-mode.js';
 
 /** PTYs that have already received a writeInput. The first write lands while
  *  cursor-agent's TUI is still doing its startup render, so it needs a longer
@@ -30,7 +33,23 @@ export const CURSOR_PLUGIN_DIR = join(homedir(), '.botmux', 'cursor-plugin');
  *  adopt baselines history by byte offset instead of the timestamp-cutoff
  *  split-live. */
 export const cursorBridgeSpec: StructuredBridgeSpec = {
-  drain: (path, offset) => drainCursorTranscript(path, offset),
+  drain(path, offset, ctx) {
+    const result = drainCursorTranscript(path, offset);
+    if (ctx.backendType !== 'pty' || ctx.adoptMode) return result;
+    let input = (ctx.state as { input?: CodexBridgeEvent['softNewlineInput'] } | undefined)?.input;
+    for (const event of result.events) {
+      if (event.kind === 'user') {
+        const [, candidate] = normaliseTranscriptFingerprintCandidates(event.text);
+        input = candidate === undefined ? undefined : { candidate };
+        if (input) event.softNewlineInput = input;
+      } else if (event.kind === 'assistant_final') {
+        if (input) event.softNewlineInput = input;
+        input = undefined;
+      }
+    }
+    return { ...result, state: { input } };
+  },
+  stateCommit: 'ingest',
   locate: {
     bySessionId: sessionId => findCursorTranscriptByChatId(sessionId),
     byPid: pid => findCursorTranscriptByPid(pid)?.path,
@@ -39,14 +58,27 @@ export const cursorBridgeSpec: StructuredBridgeSpec = {
   adopt: { attach: 'baseline-skip-tail' },
 };
 
-/** The mounted composer's placeholder (empty composer); see readyPattern. */
-const CURSOR_EMPTY_COMPOSER = /→\s+(?:Plan, search, build anything|Add a follow-up)/;
+const CURSOR_PLACEHOLDER = /(?:Plan, search, build anything|Add a follow-up(?: — \/plan to review and build)?)/;
+const CURSOR_ARROW_PLACEHOLDER = new RegExp(`→\\s+${CURSOR_PLACEHOLDER.source}`);
+const CURSOR_LOCAL_PLACEHOLDER_ROW = `^[ \\t]*>[ \\t]+${CURSOR_PLACEHOLDER.source}`;
+const CURSOR_LOCAL_STOP_HINT = String.raw`[ \t]{2,}ctrl\+c to stop`;
+// Preserve the regular Cursor Agent's stream matcher. Agent Local uses `>`,
+// which also appears in quoted output, so require its full composer row.
+const CURSOR_READY_COMPOSER = new RegExp(
+  `${CURSOR_ARROW_PLACEHOLDER.source}|${CURSOR_LOCAL_PLACEHOLDER_ROW}(?:${CURSOR_LOCAL_STOP_HINT})?[ \\t]*\\r?$`,
+  'm',
+);
+const CURSOR_LOCAL_EMPTY_COMPOSER = new RegExp(`${CURSOR_LOCAL_PLACEHOLDER_ROW}[ \\t]*$`);
 
 /** Active-turn composer row: Cursor renders `rightPlaceholder: "ctrl+c to stop"`
- *  on the same row as the `→ ` composer prompt while a turn runs, and clears it
- *  when the turn ends. Requiring both anchors on one row prevents transcript
- *  prose mentioning `ctrl+c to stop` from pinning an idle session busy. */
-export const CURSOR_BUSY_COMPOSER = /^\s*→\s+.*\bctrl\+c to stop\s*$/im;
+ *  on the same row as the composer prompt while a turn runs, and clears it
+ *  when the turn ends. Agent Local shows the hint only in an empty composer.
+ *  Require its placeholder and the padding before the hint on the same row.
+ *  A later composer row takes precedence over a busy row printed in output. */
+export const CURSOR_BUSY_COMPOSER = new RegExp(
+  String.raw`^\s*→\s+.*\bctrl\+c to stop\s*$|${CURSOR_LOCAL_PLACEHOLDER_ROW}${CURSOR_LOCAL_STOP_HINT}[ \t]*\r?$(?![\s\S]*^[ \t]*[→>](?:[ \t]|$))`,
+  'im',
+);
 
 /** Cursor's `follow-ups` queue box (`┌─ follow-ups ────┐`), drawn directly
  *  above the composer while one or more submitted follow-ups remain queued. */
@@ -59,21 +91,35 @@ export const CURSOR_FOLLOW_UPS_PANEL = /^\s*┌─ follow-ups ─+┐\s*$/m;
  *  turn's first model step flushes, so unstarted queue heads keep their
  *  pre-start lease while either signal is visible. */
 export function cursorScreenHoldsSubmittedInput(screen: string): boolean {
-  const region = busyProbeRegion(screen);
+  const region = busyProbeRegion(screen, 'cursor');
   return CURSOR_BUSY_COMPOSER.test(region) || CURSOR_FOLLOW_UPS_PANEL.test(region);
+}
+
+function cursorComposerRow(screen: string): string | undefined {
+  const lines = screen.split(/\r?\n/);
+  let localRow: string | undefined;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!;
+    // A later Local row can be the real composer. If the glyphs disagree,
+    // preserve evidence of a draft rather than declaring the input empty.
+    if (/^\s*→(?:\s|$)/.test(line)) {
+      return CURSOR_ARROW_PLACEHOLDER.test(line) ? localRow ?? line : line;
+    }
+    if (localRow === undefined && /^[ \t]*>(?:[ \t]|$)/.test(line)) localRow = line;
+  }
+  return localRow;
 }
 
 /** Cursor holds no pending input at all: no turn is running, no `follow-ups`
  *  panel is drawn, and the bottom composer row shows its empty placeholder. */
 export function cursorScreenShowsNoPendingInput(screen: string): boolean {
-  const region = busyProbeRegion(screen);
+  const region = busyProbeRegion(screen, 'cursor');
   if (CURSOR_BUSY_COMPOSER.test(region) || CURSOR_FOLLOW_UPS_PANEL.test(region)) return false;
-  const lines = region.split(/\r?\n/);
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (!/^\s*→(?:\s|$)/.test(lines[i]!)) continue;
-    return CURSOR_EMPTY_COMPOSER.test(lines[i]!);
-  }
-  return false;
+  const composer = cursorComposerRow(region);
+  if (composer === undefined) return false;
+  return composer.trimStart().startsWith('>')
+    ? CURSOR_LOCAL_EMPTY_COMPOSER.test(composer)
+    : CURSOR_ARROW_PLACEHOLDER.test(composer);
 }
 
 /** True when a stopped Cursor turn left a queued follow-up parked: the turn has
@@ -82,9 +128,12 @@ export function cursorScreenShowsNoPendingInput(screen: string): boolean {
  *  queue only when a turn ends naturally; after Ctrl-C the item stays parked. */
 export function cursorStopLeftParkedFollowUp(screen: string): boolean {
   const text = stripAnsiScreenText(screen);
-  return /\benter steer\b/.test(text)
-    && CURSOR_EMPTY_COMPOSER.test(text)
-    && !/ctrl\+c to stop/i.test(text);
+  if (!/\benter steer\b/.test(text) || /ctrl\+c to stop/i.test(text)) return false;
+  const composer = cursorComposerRow(text);
+  if (composer?.trimStart().startsWith('>')) {
+    return CURSOR_FOLLOW_UPS_PANEL.test(text) && CURSOR_LOCAL_EMPTY_COMPOSER.test(composer);
+  }
+  return composer !== undefined && CURSOR_ARROW_PLACEHOLDER.test(composer);
 }
 
 export function createCursorAdapter(pathOverride?: string): CliAdapter {
@@ -125,7 +174,8 @@ export function createCursorAdapter(pathOverride?: string): CliAdapter {
         base.push('--model', model.trim());
       }
       if (promptInjection !== 'none') {
-        base.push('--plugin-dir', builtinPluginDirForSession(CURSOR_PLUGIN_DIR));
+        // Shared with the Feishu fleet; not offered in a native gateway's core.
+        if (builtinSkillsOffered()) base.push('--plugin-dir', builtinPluginDirForSession(CURSOR_PLUGIN_DIR));
         if (skillPluginDir) base.push('--plugin-dir', skillPluginDir);
       }
       if (!resume) {
@@ -186,10 +236,9 @@ export function createCursorAdapter(pathOverride?: string): CliAdapter {
       // bytes arriving densely:
       //   - tmux: Ctrl+J, cursor's native soft-newline — renders cleanly and
       //     send-keys spaces the bytes out enough to never fold.
-      //   - raw PTY: a fast write('\n') folds, so send `\` + CR; cursor eats the
-      //     backslash-before-CR as a soft-newline (not part of the submitted
-      //     text) and no LF byte hits the stream, making it fold-immune. Costs a
-      //     cosmetic trailing `\` in the local TUI render only.
+      //   - raw PTY: a fast write('\n') folds, so send `\` + CR. No LF byte
+      //     hits the stream. Some Cursor versions retain the backslash in
+      //     the submitted text; the transcript bridge handles that residue.
       // Submit is always a bare Enter (\r). No on-disk submit verification —
       // cursor's transcript path isn't documented, so the worker relies on
       // idle detection + the bridge fallback timer.
@@ -267,7 +316,7 @@ export function createCursorAdapter(pathOverride?: string): CliAdapter {
     // permanently suppressed, no idle edge). Matching the post-turn placeholder
     // too keeps every turn's idle edge alive. Neither placeholder appears on the
     // login/startup screens, so the boot-time guard is unchanged.
-    readyPattern: CURSOR_EMPTY_COMPOSER,
+    readyPattern: CURSOR_READY_COMPOSER,
     deferFirstPromptTimeoutUntilReady: true,
     supportsTypeAhead: true,
     pluginDir: CURSOR_PLUGIN_DIR,

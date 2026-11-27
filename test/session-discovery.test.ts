@@ -685,6 +685,28 @@ describe('discoverAdoptableSessions', () => {
     expect(results[0]!.cwd).toBe('/workspace/cursor');
   });
 
+  it.each(['nested', 'sibling'])('keeps the Agent Local main process rather than an Electron helper (%s)', layout => {
+    setupMocks({
+      paneLines: 'cursor:0.0 1000\n',
+      commMap: { 1000: 'zsh', 1001: 'MainThread', 1002: 'MainThread' },
+      childMap: layout === 'nested'
+        ? { 1000: [1001], 1001: [1002], 1002: [] }
+        // Put the helper first so an unfiltered first-match scan picks it.
+        : { 1000: [1002, 1001], 1001: [], 1002: [] },
+      cmdlineMap: {
+        1001: ['/opt/cursor-agent-local', '--authless'],
+        1002: ['/opt/cursor-agent-local', '--type=gpu-process'],
+      },
+      cwdMap: { 1001: '/workspace/cursor', 1002: '/workspace/helper' },
+      dimsMap: { 'cursor:0.0': '160 50' },
+    });
+
+    const results = discoverAdoptableSessions('cursor');
+    expect(results).toHaveLength(1);
+    expect(results[0]!.cliPid).toBe(1001);
+    expect(results[0]!.cwd).toBe('/workspace/cursor');
+  });
+
   it('should derive startedAt from process start time for non-Claude CLIs', () => {
     setupMocks({
       paneLines: 'cursor:0.0 1000\n',

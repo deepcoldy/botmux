@@ -10,13 +10,14 @@ import {
   writeBotsJsonAtomic,
 } from '../src/setup/bots-store.js';
 import { parseBotConfigsJson } from '../src/setup/bot-config-editor.js';
+import { offersWecomSetupSource } from '../src/setup/platform-entry.js';
 
 // 非文本断言：AST 抽取并执行真实 CLI setup 函数，只模拟用户菜单与配置提示；
 // 验证跨函数的快照来源和真实磁盘结果，不断言源码文本或函数排列。
 const cliPath = new URL('../src/cli.ts', import.meta.url).pathname;
 const cliSourceText = readFileSync(cliPath, 'utf8');
 const cliSource = ts.createSourceFile(cliPath, cliSourceText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
-const functionNames = ['loadBotsJson', 'writeBotsJsonAtomic', 'writeSingleBotConfig', 'cmdSetup'];
+const functionNames = ['loadBotsJson', 'writeBotsJsonAtomic', 'writeSingleBotConfig', 'isWecomSetupHandoff', 'cmdSetup'];
 const declarations = cliSource.statements.filter((statement): statement is ts.FunctionDeclaration => (
   ts.isFunctionDeclaration(statement) && !!statement.name && functionNames.includes(statement.name.text)
 ));
@@ -41,6 +42,10 @@ describe('interactive setup snapshot provenance', () => {
     const scope: Record<string, any> = {
       BOTS_JSON_FILE: botsPath,
       ENV_FILE: envPath,
+      // cmdSetup is exported, and offers the WeCom entries of the source menu.
+      exports: {},
+      offersWecomSetupSource,
+      WECOM_SETUP_HANDOFF: Symbol('wecom-setup-handoff'),
       existsSync,
       readFileSync,
       renameSync,

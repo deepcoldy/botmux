@@ -128,14 +128,19 @@ export function resolveSessionEnv(input: {
  * by definition; an ambient/per-bot GIT_CONFIG_COUNT or numbered pair can
  * reach git here. Tracked as follow-up after #2203.
  */
-export function botOneShotProbeEnv(base: NodeJS.ProcessEnv, bot: SessionEnvBotInput): { env: NodeJS.ProcessEnv; fingerprint: string } {
+export function botOneShotProbeEnv(base: NodeJS.ProcessEnv, bot: SessionEnvBotInput): {
+  env: NodeJS.ProcessEnv;
+  /** Composed global/Bot overlay promoted to the Claude launcher's --settings. */
+  settingsEnv: NodeJS.ProcessEnv;
+  fingerprint: string;
+} {
   // A one-shot is launched directly, never behind the identity wrappers.
   const resolved = resolveSessionEnv({ bot, backendType: bot.backendType ?? 'pty', facts: { unwrapped: true } });
+  const inherited = buildSessionChildEnv(base, bot.envPolicy, resolved.envUnset);
+  const settingsEnv = botInjectedEnv(resolved.env, bot.envPolicy);
   return {
-    env: {
-      ...buildSessionChildEnv(base, bot.envPolicy, resolved.envUnset),
-      ...botInjectedEnv(resolved.env, bot.envPolicy),
-    },
+    env: { ...inherited, ...settingsEnv },
+    settingsEnv,
     fingerprint: resolved.fingerprint,
   };
 }

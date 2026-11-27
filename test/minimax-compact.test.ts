@@ -15,7 +15,8 @@ import { isCodexAppCliId } from '../src/adapters/cli/types.js';
 import { resolveCodexAppFinalTurnIdentity } from '../src/adapters/cli/codex-app-turn.js';
 import { normalizeFinalUsage } from '../src/services/codex-app-runner-protocol.js';
 import { bridgePostText } from '../src/services/bridge-fallback-gate.js';
-import { runnerFinalOutcome } from '../src/services/runner-final-outcome.js';
+import { runnerFinalOutcome, appRunnerSilenceDisposition } from '../src/services/runner-final-outcome.js';
+import { isNativeGatewayCoreProcess } from '../src/core/runtime-mode.js';
 import { decideQueuedReadyTransition } from '../src/core/queued-ready-transition.js';
 import { claudeSwitchKindForCommand } from '../src/utils/claude-switch-confirm.js';
 import { CodexAppFlushPromptReplay } from '../src/utils/codex-app-turn-liveness.js';
@@ -255,7 +256,7 @@ it('keeps the active business final attributable until queued compact actually s
   Object.assign(worker.scope, {
     currentBotmuxTurnId: 'business-turn', isPromptReady: false,
     activeTurnAuthority: authority, isCodexAppCliId, resolveCodexAppFinalTurnIdentity,
-    normalizeFinalUsage, bridgePostText, runnerFinalOutcome,
+    normalizeFinalUsage, bridgePostText, runnerFinalOutcome, appRunnerSilenceDisposition, isNativeGatewayCoreProcess,
     readSendMarkers: () => [], bridgeGateInputForTurn: () => ({}), notifyExplicitRepliesObserved() {},
     attributableExplicitReplyMarkersForTurnWindow: () => [], shouldSuppressBridgeEmit: () => false,
     replyDeliveryMode: () => 'send', sessionId: 'compact-test', currentBotmuxDispatchAttempt: undefined,

@@ -24,6 +24,11 @@
  *   rollback <snapshotId>                restore a snapshot (non-destructive)
  *   export [--name <n>] [--out <file>]   write a portable bundle
  *   import <file|-> [--yes]              preview a bundle diff; apply with --yes
+ *
+ * Inside a native IM gateway's core service (core/native-gateway-session.ts) —
+ * a WeCom session's shell — every subcommand refuses: that channel's prompts
+ * live in its own store, managed on the Dashboard, and the store this command
+ * would read or write here is one nothing renders from.
  */
 import { readFileSync, writeFileSync } from 'node:fs';
 import type { Locale } from '../../i18n/types.js';
@@ -59,6 +64,12 @@ import {
   serializeBundle,
   BundleError,
 } from '../../skills/customization-bundle.js';
+import { inNativeGatewaySession } from '../native-gateway-session.js';
+import {
+  WECOM_SESSION_CUSTOMIZE_REFUSAL,
+  customizationBundleScopeRejection,
+  feishuStoreKeyRejection,
+} from '../../im/wecom/contract/customization.js';
 
 export interface CustomizeCommandResult {
   code: number;
@@ -81,8 +92,9 @@ function resolveLocale(args: string[]): Locale {
   return 'zh';
 }
 
-export function runCustomizeCommand(args: string[]): CustomizeCommandResult {
+export function runCustomizeCommand(args: string[], env: NodeJS.ProcessEnv = process.env): CustomizeCommandResult {
   const [sub, ...rest] = args;
+  if (inNativeGatewaySession(env)) return err(WECOM_SESSION_CUSTOMIZE_REFUSAL);
   try {
     switch (sub) {
       case undefined:
@@ -185,6 +197,9 @@ function cmdPrompt(args: string[]): CustomizeCommandResult {
     case 'set': {
       const key = rest[0];
       if (!key) return err('用法：botmux customize prompt set <key> <value> [--locale zh|en]（value 省略则从 stdin 读取）', 2);
+      // This command writes the Feishu store; WeCom-only keys never go there.
+      const keyRejection = feishuStoreKeyRejection(key);
+      if (keyRejection) return err(keyRejection, 2);
       // Value = 2nd positional, or stdin when omitted.
       let value = rest[1] && !rest[1].startsWith('--') ? rest[1] : undefined;
       if (value === undefined) value = readStdin();
@@ -207,6 +222,8 @@ function cmdPrompt(args: string[]): CustomizeCommandResult {
 function cmdCondition(args: string[]): CustomizeCommandResult {
   const [key, val] = args;
   if (!key || !val) return err('用法：botmux customize condition <key> <on|off|reset>', 2);
+  const keyRejection = val === 'on' || val === 'off' ? feishuStoreKeyRejection(key) : undefined;
+  if (keyRejection) return err(keyRejection, 2);
   if (val === 'on') setConditionalLine(key, true);
   else if (val === 'off') setConditionalLine(key, false);
   else if (val === 'reset') setConditionalLine(key, null);
@@ -304,6 +321,9 @@ function cmdImport(args: string[]): CustomizeCommandResult {
   let bundle;
   try { bundle = parseBundle(raw); }
   catch (e) { return err(`bundle 校验失败：${e instanceof BundleError ? e.message : String(e)}`, 2); }
+  // This command writes the Feishu store only; a WeCom export is refused here.
+  const scopeRejection = customizationBundleScopeRejection(bundle, 'feishu');
+  if (scopeRejection) return err(`bundle 校验失败：${scopeRejection}`, 2);
 
   const { diff, summary } = previewBundleImport(bundle);
   const diffLines = diff.map((d) => {

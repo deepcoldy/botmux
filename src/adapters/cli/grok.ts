@@ -271,6 +271,7 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
           locale,
           botName,
           botOpenId,
+          larkAppId,
           noTransport,
           triggerUserAuth,
           larkToolAppId,

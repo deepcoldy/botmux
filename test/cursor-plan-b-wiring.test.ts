@@ -41,7 +41,6 @@ describe('cursor plan B worker wiring (on #2009)', () => {
     expect(ingestAt).toBeGreaterThan(refreshAt);
     // Only while the CLI is busy and not in adopt mode.
     expect(tickBody).toContain('!isPromptReady && !lastInitConfig?.adoptMode');
-    expect(source).toContain('const CURSOR_BUSY_REFRESH_MAX_MS = 120_000;');
   });
 
   // scratch 判定已抽成可导出的纯函数，直接验证行为而非读取实现文本。

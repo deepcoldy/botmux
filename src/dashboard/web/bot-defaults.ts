@@ -1,3 +1,4 @@
+import {publishProviderRoster} from './provider-roster.js';
 import { store } from './store.js';
 import type { CliRuntimeConfig as SharedCliRuntimeConfig } from '../../adapters/cli/runtime.js';
 import type { FeedbackPolicyLayer } from '../../services/feedback-policy-resolver.js';
@@ -9,6 +10,10 @@ import type { StreamingCardButtonId } from '../../im/lark/streaming-card-buttons
 import type { TraexAutoModelConfig } from '../../services/traex-auto-model.js';
 import type { TriggerUserAuthCredentialSourceConfig } from '../../services/trigger-user-auth.js';
 import type { ScratchCapability } from '../../adapters/backend/scratch-capability.js';
+import type { ProviderId } from './providers/types.js';
+import { REPLY_FOOTER_KEYS } from '../../services/reply-footer.js';
+import { DEFAULT_LONG_TASK_REMINDER } from '../../services/long-task-reminder-policy.js';
+import { DEFAULT_SESSION_OWNER_REMINDER } from '../../core/session-owner-reminder-config.js';
 
 /** Bot 配置页的分类 tab。放在这个轻量模块里：⌘K 索引（入口包）要按它生成条目，页面本身很重。 */
 export type BotDefaultsTab = 'common' | 'sessions' | 'security' | 'cards' | 'advanced';
@@ -43,11 +48,29 @@ export interface BotDefaultsSection {
   id: string;
   tab: BotDefaultsTab;
   titleKey: string;
+  /**
+   * 只在这个平台的配置页出现的专属区块。缺省是各平台共用的区块（各平台的能力表再按 id 收窄）；
+   * 标了平台的区块只对该平台出现，见 providers/profile.ts 的 botProfileSectionSupported。
+   */
+  provider?: ProviderId;
   /** 和别的区块合放在同一个格子里时，那个格子的 id（落地时先找格子，再按标题找区块）。 */
   tile?: string;
   /** 区块里的配置项标题：⌘K 直达，落地时在区块里按文字定位到那一行。 */
   fieldKeys?: readonly string[];
+  /** 区块的其它叫法（i18n 键），只进 ⌘K 关键词，例如格子的无障碍名称与各分类里的小标题不同时。 */
+  aliasKeys?: readonly string[];
 }
+
+/** 企业微信专属格子的两类区块：本地核心策略、原生平台设置。 */
+export type WecomNativeBlock = 'core' | 'platform';
+
+/** 企业微信专属格子在某个分类里的区块 id（`wecom-<区块>-<分类>`）：登记表和企业微信卡挂格子都按它。 */
+export function wecomNativeSectionId(block: WecomNativeBlock, tab: BotDefaultsTab): string {
+  return `wecom-${block}-${tab}`;
+}
+
+/** 企业微信「对话权限用户可用的命令」的区块 id：它合放在共用的「Slash 命令」格里（登记里的 `tile`）。 */
+export const WECOM_TALK_COMMANDS_SECTION_ID = 'wecom-talk-commands';
 
 export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
   {
@@ -279,6 +302,63 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
   },
   { id: 'owner-reminder', tab: 'advanced', titleKey: 'botDefaults.ownerReminderTitle', fieldKeys: ['botDefaults.ownerReminderEnabled', 'botDefaults.ownerReminderText', 'botDefaults.ownerReminderInterval', 'botDefaults.ownerReminderQuietHours', 'botDefaults.ownerReminderQuietHoursStart', 'botDefaults.ownerReminderQuietHoursEnd'] },
   { id: 'long-task-reminder', tab: 'cards', titleKey: 'botDefaults.longTaskReminderTitle', fieldKeys: ['botDefaults.longTaskReminderEnabled', 'botDefaults.longTaskReminderThreshold', 'botDefaults.longTaskReminderInterval'] },
+
+  // 企业微信专属格子（只在企业微信配置页出现），名字与飞书对应的那一格一致：会话页「/summary 总结范围」、
+  // 安全页「授权与额度」、高级页「额度耗尽交接」，另有卡片页的可操作终端开关（飞书把它放在共用的「卡片」格里，
+  // 企业微信的值存在连接配置里而不是 bots.json，所以单独一格）。对话权限用户可用的命令不单占一格，合放在
+  // 共用的「Slash 命令」格里（WECOM_TALK_COMMANDS_SECTION_ID）。
+  {
+    id: 'wecom-platform-sessions',
+    tab: 'sessions',
+    provider: 'wecom',
+    titleKey: 'botDefaults.wecom.platform.sessionsTitle',
+    aliasKeys: ['botDefaults.wecom.platform.aria'],
+    fieldKeys: [
+      'botDefaults.wecom.platform.summaryLimit', 'botDefaults.wecom.platform.summarySinceHours',
+      'botDefaults.wecom.platform.summaryMemory', 'botDefaults.wecom.platform.summaryMemoryPath',
+    ],
+  },
+  {
+    id: 'wecom-core-security',
+    tab: 'security',
+    provider: 'wecom',
+    titleKey: 'botDefaults.wecom.core.securityTitle',
+    aliasKeys: ['botDefaults.wecom.core.aria'],
+    fieldKeys: [
+      'botDefaults.wecom.core.p2pOpen', 'botDefaults.wecom.core.autoGrantRequestCards',
+      'botDefaults.wecom.core.grantRequestToOwnerDm', 'botDefaults.wecom.core.grantDefaultDuration',
+      'botDefaults.wecom.core.messageQuotaDefaultLimit', 'botDefaults.wecom.core.trustSameOwnerBots',
+      'botDefaults.wecom.core.botToBotSameDir',
+    ],
+  },
+  {
+    id: WECOM_TALK_COMMANDS_SECTION_ID,
+    tab: 'security',
+    provider: 'wecom',
+    titleKey: 'botDefaults.wecom.core.canTalkDaemonCommands',
+    aliasKeys: ['botDefaults.wecom.core.aria'],
+    tile: 'slash-commands',
+  },
+  {
+    id: 'wecom-core-cards',
+    tab: 'cards',
+    provider: 'wecom',
+    titleKey: 'botDefaults.wecom.core.cardsTitle',
+    aliasKeys: ['botDefaults.wecom.core.aria'],
+    fieldKeys: ['botDefaults.wecom.core.writableTerminalLink'],
+  },
+  {
+    id: 'wecom-core-advanced',
+    tab: 'advanced',
+    provider: 'wecom',
+    titleKey: 'botDefaults.wecom.core.advancedTitle',
+    aliasKeys: ['botDefaults.wecom.core.aria'],
+    fieldKeys: [
+      'botDefaults.wecom.core.quotaFallback', 'botDefaults.wecom.core.quotaFallbackPeer',
+      'botDefaults.wecom.core.quotaKinds', 'botDefaults.wecom.core.quotaKindUsage',
+      'botDefaults.wecom.core.quotaKindRate', 'botDefaults.wecom.core.quotaFallbackMessage',
+    ],
+  },
 ];
 
 export function botDefaultsSectionDomId(id: string): string {
@@ -313,8 +393,12 @@ export function codexArchiveSectionVisible(bot: Pick<BotDefaultsRow, 'cliId' | '
   return bot.cliId === 'codex' || bot.cliId === 'codex-app' || typeof bot.archiveCodex === 'boolean';
 }
 
-export function botDefaultsHref(target: { bot?: string; tab?: BotDefaultsTab; section?: string; field?: string } = {}): string {
+export function botDefaultsHref(
+  target: { provider?: ProviderId; bot?: string; tab?: BotDefaultsTab; section?: string; field?: string } = {},
+): string {
   const params = new URLSearchParams();
+  // `provider=wecom`：落到企业微信机器人上（不带 bot 时由配置页选，见 wecomLinkSelection）。
+  if (target.provider) params.set('provider', target.provider);
   if (target.bot) params.set('bot', target.bot);
   if (target.tab) params.set('tab', target.tab);
   if (target.section) params.set('section', target.section);
@@ -395,6 +479,10 @@ export type BotSubstituteMode = {
 };
 
 export type BotDefaultsRow = {
+  provider?: ProviderId;
+  providerBotId?: string;
+  ownerReminderStates?:readonly string[];
+  providerSessionMode?:{p2pMode:'chat';regularGroupReplyMode:'user'|'chat';regularGroupMentionMode:'never'};
   envRevision?: string;
   larkAppId: string;
   botName?: string;
@@ -645,6 +733,9 @@ export type BotDefaultsRow = {
   /** 被动入群时自动把 owner 拉进群。缺省 ON —— 只有显式 false 表示关闭。 */
   autoInviteOwnerOnGroupAdd?: boolean;
   ownerGroupFollow?: import('../../services/owner-group-follow-policy.js').OwnerGroupFollowConfig | null;
+  /** undefined = older daemon cannot report this; modified-only must fail open. */
+  commandTriggersConfigured?: boolean;
+  blockedUsersConfigured?: boolean;
   autoStartOnGroupJoin?: boolean;
   autoStartOnGroupJoinPrompt?: string;
   autoStartOnGroupJoinSeed?: string;
@@ -680,6 +771,123 @@ export type LoadBotsResult = {
   bots: BotDefaultsRow[];
   error: string | null;
 };
+
+function configuredSandboxMode(bot: BotDefaultsRow): 'off' | 'oncall' | 'scratch' {
+  return bot.sandboxMode ?? (bot.sandbox ? 'oncall' : 'off');
+}
+
+export function botEffectiveSummary(bot: BotDefaultsRow, sessionCli = '') {
+  const hasLocalSandbox = bot.cliId !== 'riff' && bot.localSandboxApplies !== false;
+  const sandbox = !hasLocalSandbox ? 'off' : bot.effectiveSandboxMode ?? bot.sandboxEnvForce
+    ?? (bot.readIsolation ? 'oncall' : configuredSandboxMode(bot));
+  const follow = bot.apiOnly ? undefined : bot.ownerGroupFollow;
+  return {
+    cli: displayCliId(bot, sessionCli),
+    model: bot.model?.trim() || null,
+    autoModel: bot.traexAutoModel?.enabled === true && !bot.traexAutoModelBlockedReason,
+    workingDirMode: bot.defaultOncall?.enabled ? 'oncall' as const
+      : bot.defaultWorkingDir?.trim() ? 'default' as const : 'manual' as const,
+    sandbox,
+    followEnabled: follow?.enabled === true,
+    followRuleCount: (follow?.includeRules?.length ?? 0) + (follow?.excludeRules?.length ?? 0),
+  };
+}
+
+/** Compare resolved reminder values semantically; the daemon supplies defaults even when unset. */
+function sessionOwnerReminderModified(value: NonNullable<BotDefaultsRow['sessionOwnerReminder']>): boolean {
+  const defaults = DEFAULT_SESSION_OWNER_REMINDER;
+  const defaultQuietHours = defaults.quietHours;
+  const quietHours = value.quietHours ?? defaultQuietHours;
+  const states = new Set(value.states);
+  return value.enabled !== defaults.enabled
+    || value.intervalMinutes !== defaults.intervalMinutes
+    || value.text !== defaults.text
+    || states.size !== defaults.states.length
+    || defaults.states.some(state => !states.has(state))
+    || quietHours?.enabled !== defaultQuietHours?.enabled
+    || quietHours?.start !== defaultQuietHours?.start
+    || quietHours?.end !== defaultQuietHours?.end;
+}
+
+/** Compare the saved Bot settings with the defaults of the corresponding editors. */
+export function botModifiedSectionIds(bot: BotDefaultsRow): ReadonlySet<string> {
+  const text = (value?: string | null) => Boolean(value?.trim());
+  const fields = (value?: object | null) => Boolean(value && Object.keys(value).length);
+  const follow = bot.ownerGroupFollow;
+  const nonDefault = [
+    ['agent', text(bot.model) || bot.reasoningEffort || bot.serviceTier || bot.modelBackendVariant != null
+      || bot.codexProfile || bot.codexRpcInput != null || bot.wrapperCli || bot.cliLaunchMode || bot.cliRuntime
+      || bot.cliPathOverride || bot.cliConfigDir || bot.dshProfile || bot.dshRuntime === 'tui' || bot.turnTimeoutMs != null
+      || fields(bot.nativeSubagentRuntime) || fields(bot.traexAutoModel) || fields(bot.riff)
+      || (bot.skillInjection != null && bot.skillInjection !== (bot.skillInjectionDefault ?? 'prompt'))],
+    ['working-dir', text(bot.defaultWorkingDir) || text(bot.workingDir) || bot.defaultOncall?.enabled
+      || text(bot.defaultOncall?.workingDir)
+      || bot.defaultWorkingDirAutoWorktree || bot.autoInviteOwnerOnGroupAdd === false
+      || follow?.enabled || follow?.includeRules?.length || follow?.excludeRules?.length || follow?.excludeChatIds?.length
+      || (follow?.pollIntervalSeconds != null && follow.pollIntervalSeconds !== 60)
+      || bot.autoStartOnGroupJoin || bot.autoStartOnNewTopic || bot.autoStartExcludedChats?.length
+      || text(bot.autoStartOnGroupJoinPrompt) || text(bot.autoStartOnGroupJoinSeed)
+      || bot.groupJoinCommandEnabled || text(bot.groupJoinCommand)],
+    ['role', text(bot.teamRole)],
+    ['session-mode', (bot.p2pMode != null && bot.p2pMode !== 'chat') || bot.chatManagerEnabled
+      || bot.chatManagerSharedTopic || bot.groupSecretaryEnabled || bot.docSubscribeDefaultMode === 'all'
+      || (bot.regularGroupReplyMode != null && bot.regularGroupReplyMode !== 'chat-topic')
+      || (bot.regularGroupMentionMode != null && bot.regularGroupMentionMode !== 'always')],
+    ['steward', fields(bot.steward)],
+    ['task-routing', fields(bot.taskRouting)],
+    ['substitute', fields(bot.substituteMode)],
+    ['command-trigger', bot.commandTriggersConfigured !== false],
+    ['cross-bot', bot.botToBotSameDir === false],
+    ['session-cap', bot.maxLiveWorkers != null || bot.idleSuspendMinutes != null],
+    ['codex-archive', bot.archiveCodex != null],
+    ['prompt-cache', fields(bot.promptCache)],
+    ['provider-recovery', fields(bot.providerRecovery)],
+    ['startup-commands', text(bot.startupCommands)],
+    ['summary-trigger', bot.summaryMemory || (text(bot.summaryMemoryPath) && bot.summaryMemoryPath !== 'summary.md')
+      || (bot.summaryRange?.limit != null && bot.summaryRange.limit !== 50)
+      || (bot.summaryRange?.sinceHours != null && bot.summaryRange.sinceHours !== 24)],
+    ['sandbox', configuredSandboxMode(bot) !== 'off' || bot.readIsolation || bot.scratchStorage === 'disk'
+      || bot.scratchTmpfsSizeMb != null || bot.scratchDenyPaths?.length],
+    ['network-policy', fields(bot.sandboxNetworkPolicy)],
+    ['sandbox-paths', bot.sandboxPaths?.readWrite.length || bot.sandboxPaths?.readOnly.length || bot.sandboxPaths?.deny.length],
+    ['codex-auth', bot.codexAuthSync === 'isolated'],
+    ['trigger-user-auth', bot.triggerUserAuth?.enabled],
+    ['lark-tool-binding', bot.larkToolBinding === false || bot.larkUserOwnerFallback === false],
+    ['approval-compat', bot.autoAvoidApproval === false],
+    ['grant', bot.p2pOpen || bot.scheduleCreateByTalkers || bot.restrictGrantCommands || bot.autoGrantRequestCards === false
+      || bot.grantRequestToOwnerDm || bot.trustSameOwnerBots === false || bot.grantDelegateBots?.length
+      || bot.grantDefaultDurationMs != null || bot.messageQuotaDefaultLimit != null],
+    ['blocked-users', bot.blockedUsersConfigured !== false],
+    ['slash-commands', text(bot.canTalkDaemonCommands) || text(bot.customPassthroughCommands) || bot.bareRenamePassthrough],
+    ['card-behavior', bot.replyCardMode === 'unified' || bot.disableStreamingCard || bot.hiddenStreamingCardButtons?.length
+      || bot.streamingCardFoldedLayout === false || bot.pinStreamingCard || bot.silentTurnReactions || bot.goalStatusCard
+      || bot.followUpReply || bot.foldBackgroundUpdates || bot.privateCard || bot.writableTerminalLinkInCard
+      || bot.showReplyTiming || bot.showUsageQuota === false || (bot.usageDisplay != null && bot.usageDisplay !== 'streaming')
+      || bot.replyCardActions || bot.replyCardNextStep || bot.replyCardRecap || bot.cotEnabled === false
+      || bot.replyCardShowTools === false || bot.replyCardNativeCot || REPLY_FOOTER_KEYS.some(key => bot[key] === false)],
+    ['long-task-reminder', bot.longTaskReminder && (bot.longTaskReminder.enabled
+      || bot.longTaskReminder.thresholdMinutes !== DEFAULT_LONG_TASK_REMINDER.thresholdMinutes
+      || bot.longTaskReminder.intervalMinutes !== DEFAULT_LONG_TASK_REMINDER.intervalMinutes)],
+    ['feedback', fields(bot.feedback)],
+    ['oncall', fields(bot.oncallGroup)],
+    ['reply-style', fields(bot.replyStyle)],
+    ['local-address', bot.hideLocalAddresses],
+    ['ask-option-layout', bot.askOptionLayout != null && bot.askOptionLayout !== 'compact'],
+    ['brand', text(bot.brandLabel)],
+    ['backend', bot.backendType || bot.hcHerdrTabs],
+    ['herdr', fields(bot.herdr)],
+    ['codex-app-display', bot.codexAppCleanInput || bot.codexBrowser || bot.codexBrowserAutoApproveOrigins || fields(bot.noProgressNotify)],
+    ['prompt-injection', bot.promptInjection === 'none'],
+    ['reply-delivery', bot.topicUnavailablePolicy === 'stop'
+      || (bot.replyDelivery != null && bot.replyDelivery !== (bot.replyDeliveryDefault ?? 'send'))],
+    ['sender-tag', bot.senderTag === false || bot.senderTagHideEmail],
+    ['quota-fallback', bot.quotaFallbackBot?.enabled],
+    ['quota-fallback-chain', bot.quotaFallbackChain?.enabled],
+    ['runtime-env', text(bot.launchShell) || text(bot.env) || bot.envKeys?.length || bot.envPolicy?.mode === 'strict'],
+    ['owner-reminder', bot.sessionOwnerReminder != null && sessionOwnerReminderModified(bot.sessionOwnerReminder)],
+  ] as const;
+  return new Set(nonDefault.filter(([, modified]) => modified).map(([id]) => id));
+}
 
 export const fallbackCliOptions: CliOption[] = [
   { id: 'claude-code', label: 'Claude' },
@@ -766,6 +974,7 @@ export function liveCodexReasoningEfforts(
 export async function fetchDetectedModels(
   key: string,
   appId?: string,
+  provider?:{provider:'wecom';id:string},
 ): Promise<{
   models: string[];
   source: 'live' | 'static';
@@ -775,7 +984,7 @@ export async function fetchDetectedModels(
   try {
     const query = new URLSearchParams({ key });
     if (appId) query.set('bot', appId);
-    const r = await fetch(`/api/cli-options/models?${query.toString()}`);
+    const r = await fetch(provider ? `/api/wecom/connections/${encodeURIComponent(provider.id)}/cli-options/models?${query}` : `/api/cli-options/models?${query.toString()}`);
     const body = await r.json().catch(() => ({}));
     if (!r.ok || !body || !Array.isArray(body.models)) return null;
     const models = body.models.filter((m: unknown): m is string => typeof m === 'string');
@@ -926,6 +1135,7 @@ export async function fetchBotDefaults(): Promise<LoadBotsResult> {
     if (!body || !Array.isArray(body.bots)) {
       return { bots: [], error: 'unexpected response shape (no `bots` array)' };
     }
+    publishProviderRoster('lark',body.bots.length);
     return { bots: body.bots as BotDefaultsRow[], error: null };
   } catch (e: any) {
     return { bots: [], error: e?.message ?? String(e) };

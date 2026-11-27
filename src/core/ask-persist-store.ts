@@ -158,6 +158,14 @@ export function dispatchUuidForAsk(askKey: string, askId: string): string {
   return humanDecisionDispatchUuidForKey(`${askKey}|${askId}`, 'ask');
 }
 
+/** Whether a stored record carries a native gateway execution. No build writes
+ * one any more (see the restore loop below); the check only recognises records
+ * older builds left. */
+function hasNativeGatewayOrigin(raw: unknown): boolean {
+  if (!raw || typeof raw !== 'object') return false;
+  return (raw as Record<string, unknown>).nativeGatewayOrigin !== undefined;
+}
+
 export interface AskPersistStore {
   /** Absolute directory this store owns. */
   readonly dir: string;
@@ -220,6 +228,15 @@ export function createAskPersistStore(dir: string): AskPersistStore {
         const parsed = raw as unknown as PersistedAsk;
         if (!parsed || parsed.v !== 2 || !parsed.askKey || !parsed.requestId || !Array.isArray(parsed.questions)) {
           if (parsed?.askKey) decisions.remove(parsed.askKey);
+          continue;
+        }
+        // An earlier build persisted native gateway asks with their origin.
+        // Such an ask was bound to one live HTTP turn execution, and neither
+        // that turn nor its worker generation survives a restart: nothing can
+        // ever show or answer it again. Treat it as void and never restore it
+        // as an ordinary (Lark-card) ask.
+        if (hasNativeGatewayOrigin(raw)) {
+          decisions.remove(parsed.askKey);
           continue;
         }
         if ((parsed.timeoutMs === 0 || parsed.deadlineAt === 0)
