@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { BYTEDCLI_EXEC_LIMITS, BYTEDCLI_EXEC_ROUTE, BYTEDCLI_EXEC_SCHEMA,
   decodeBytedcliBase64, parseBytedcliExecRequest, parseBytedcliExecResponse,
   type BytedcliExecInputs } from './bytedcli-exec-protocol.js';
-import { parseBytedcliOperation } from '../core/bytedcli-operation-policy.js';
+import { parseBytedcliOperation, isBytedcliWriteLike } from '../core/bytedcli-operation-policy.js';
 export interface BytedcliExecClientOptions {
   readonly sessionId:string;readonly port:number;readonly requestId?:string;readonly argv:readonly string[];
   readonly stdout:(buffer:Buffer)=>void;readonly stderr:(buffer:Buffer)=>void;
@@ -33,10 +33,15 @@ async function snapshotStdin(stream:NodeJS.ReadableStream,signal:AbortSignal,lim
 }
 async function snapshotInputs(argv:readonly string[],stdin:NodeJS.ReadableStream|undefined,signal:AbortSignal){
   const result=[...argv];const files:{id:string;dataBase64:string}[]=[];let stdinBase64:string|undefined,total=0;
+  // Reviewed legacy --file is a remote diff selector. A snapshot-taking
+  // operation cannot parse without its wire bytes and follows the file path.
+  let remoteFileSelector=false;
+  try{remoteFileSelector=parseBytedcliOperation(argv).execution==='audited-native';}catch{/* snapshot bytes not yet available */}
   for(let index=0;index<result.length;index++){
-    const arg=result[index]!;let path:string|undefined,valueIndex:number|undefined;
-    if(arg==='--body-file'||arg==='-F'){valueIndex=index+1;path=result[valueIndex];}
-    else if(arg.startsWith('--body-file=')){path=arg.slice('--body-file='.length);}
+    const arg=result[index]!;const fileFlag=arg==='--file'||arg.startsWith('--file=')?'--file':'--body-file';let path:string|undefined,valueIndex:number|undefined;
+    if(fileFlag==='--file'&&remoteFileSelector)continue;
+    if(arg==='--body-file'||arg==='-F'||arg==='--file'){valueIndex=index+1;path=result[valueIndex];}
+    else if(arg.startsWith('--body-file=')||arg.startsWith('--file=')){path=arg.slice(arg.indexOf('=')+1);}
     else if(arg.startsWith('-F=')){path=arg.slice(3);}
     else continue;
     if(path===undefined||!path)throw new Error('invalid_request');
@@ -44,8 +49,8 @@ async function snapshotInputs(argv:readonly string[],stdin:NodeJS.ReadableStream
     total+=data.length;const id=path==='-'?'-':`input${files.length}`;
     if(path==='-'){if(stdinBase64!==undefined)throw new Error('invalid_request');stdinBase64=data.toString('base64');}
     else files.push({id,dataBase64:data.toString('base64')});
-    if(valueIndex!==undefined){result[index]='--body-file';result[valueIndex]=id;index++;}
-    else result[index]=`--body-file=${id}`;
+    if(valueIndex!==undefined){result[index]=fileFlag;result[valueIndex]=id;index++;}
+    else result[index]=`${fileFlag}=${id}`;
   }
   const inputs:BytedcliExecInputs|undefined=files.length||stdinBase64!==undefined?{
     ...(files.length?{files}:{}),...(stdinBase64!==undefined?{stdinBase64}:{})}:undefined;
@@ -78,12 +83,13 @@ export async function runBytedcliExecClient(options:BytedcliExecClientOptions):P
     submitted=true;
     const response=parseBytedcliExecResponse(await send(options.port,body,controller.signal));
     if(response.requestId!==requestId||(response.operationId!==operation.id&&response.operationId!=='unparsed'))throw new Error('response_unverified');
+    if(response.operationEffect!==undefined&&response.operationEffect!==operation.effect)throw new Error('response_unverified');
     options.stdout(decodeBytedcliBase64(response.stdoutBase64,BYTEDCLI_EXEC_LIMITS.outputBytes));
     options.stderr(decodeBytedcliBase64(response.stderrBase64,BYTEDCLI_EXEC_LIMITS.outputBytes));
     if(response.errorCode)options.stderr(Buffer.from(`bytedcli: ${response.errorCode} (requestId=${requestId})\n`));
     return response.exitCode;
   }catch{
-    const unknown=submitted&&effect==='write';
+    const unknown=submitted&&isBytedcliWriteLike(effect);
     options.stderr(Buffer.from(`bytedcli: ${unknown?'write_outcome_unknown':'broker_request_failed'} (requestId=${requestId})\n`));
     return unknown?75:77;
   }finally{clearTimeout(timer);options.signal?.removeEventListener('abort',abort);}

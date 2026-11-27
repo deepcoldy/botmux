@@ -3,7 +3,7 @@ import { constants, accessSync, lstatSync, realpathSync, statSync } from 'node:f
 import { dirname, isAbsolute, delimiter, relative, resolve } from 'node:path';
 import { BYTEDCLI_AUDITED_RELEASE, assertBytedcliAuditedRelease } from './bytedcli-operation-policy.js';
 import type { BytedcliExecErrorCode } from '../cli/bytedcli-exec-protocol.js';
-import { snapshotBytedcliRuntimeTrees } from './bytedcli-runtime-integrity.js';
+import { snapshotBytedcliDbCodeCopy, snapshotBytedcliRuntimeTrees, snapshotBytedcliTrustedFiles } from './bytedcli-runtime-integrity.js';
 import { BYTEDCLI_HOST_NETWORK_KEYS } from './bytedcli-host-network.js';
 
 export class BytedcliBrokerError extends Error {
@@ -13,6 +13,24 @@ export interface BytedcliTrustedCli {
   readonly executable: string; readonly path: string; readonly version: string; readonly stillCurrent: () => boolean;
   readonly prefixArgs?: readonly string[];
   readonly protectedPaths?: readonly string[];
+  readonly dbRuntime?: BytedcliTrustedDbRuntime;
+}
+export interface BytedcliTrustedDbRuntime {
+  readonly executable: string; readonly protectedPaths: readonly string[]; readonly stillCurrent: () => boolean;
+}
+/** Preinstalled host code only. This never invokes db-cli or opens its data. */
+export function discoverBytedcliDbRuntime(candidate: string, snapshotRoot?: string): BytedcliTrustedDbRuntime | undefined {
+  try {
+    if (!isAbsolute(candidate) || resolve(candidate) !== candidate) return undefined;
+    const executable = realpathSync(candidate); accessSync(executable, constants.X_OK);
+    const stat = statSync(executable);
+    if (!stat.isFile() || stat.mode & 0o022 || process.getuid && stat.uid !== 0 && stat.uid !== process.getuid()) return undefined;
+    if (stat.nlink !== 1) return snapshotRoot ? snapshotBytedcliDbCodeCopy(candidate, snapshotRoot) : undefined;
+    const snapshot = snapshotBytedcliTrustedFiles([candidate, executable]);
+    return Object.freeze({ executable, protectedPaths: snapshot.protectedPaths, stillCurrent: () => {
+      try { return realpathSync(candidate) === executable && snapshot.stillCurrent(); } catch { return false; }
+    } });
+  } catch { return undefined; }
 }
 export interface BytedcliChildInvocation {
   readonly executable: string; readonly argv: readonly string[]; readonly cwd: string;
@@ -29,6 +47,10 @@ export function bytedcliMinimalEnv(home: string, cwd: string, path: string, netw
   }
   const env: NodeJS.ProcessEnv = { HOME: home, PATH: path, LANG: 'C.UTF-8', TMPDIR: home,
     BYTECLOUD_AUTH_AS: 'user', BYTEDCLI_NO_AUTO_UPGRADE: '1', NO_COLOR: '1',
+    // The DB passthrough has its own installer. An existing non-executable
+    // sentinel blocks its fallback installer; reviewed RDS replaces it only
+    // with a frozen preinstalled binary after preflight.
+    DB_CLI_BINARY: '/dev/null', BYTEDCLI_DB_NO_AUTO_UPDATE: '1',
     GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null',
     GIT_CEILING_DIRECTORIES: cwd, GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_COUNT: '4',
     GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '/dev/null',

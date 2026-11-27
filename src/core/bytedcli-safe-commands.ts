@@ -31,6 +31,7 @@ export async function runBytedcliSafeCommand(
   };
   const response = (data: unknown, controlRequired = false): BytedcliExecResponse => ({
     schema: BYTEDCLI_EXEC_SCHEMA, requestId: request.requestId, operationId: operation.id,
+    operationEffect: operation.effect,
     effectiveIdentity: { kind: operation.effect === 'auth' ? 'actor' : 'none' },
     outcome: controlRequired ? 'rejected' : 'completed', exitCode: controlRequired ? 77 : 0,
     stdoutBase64: Buffer.from(JSON.stringify(data) + '\n').toString('base64'), stderrBase64: '',
@@ -45,7 +46,7 @@ export async function runBytedcliSafeCommand(
     return response({ auditedCliVersion: BYTEDCLI_AUDITED_RELEASE, catalogVersion: BYTEDCLI_OPERATION_CATALOG_VERSION,
       versionScope: 'audited-contract-not-installed-version',
       ...(prefix === 'version' ? {} : { catalog, restrictions: ['cn-only', 'noninteractive', 'explicit-repository',
-        'unknown-commands-and-options-refused', 'personal-auth-control-required', 'fresh-linux-isolation-required'] }) });
+        'unknown-business-actor-isolated-write-like', 'invalid-registered-arguments-refused', 'personal-auth-control-required', 'fresh-linux-isolation-required'] }) });
   }
   if (operation.effect !== 'auth') throw new BytedcliBrokerError('unsupported_operation');
   const actor = authority.actor;

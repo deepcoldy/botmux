@@ -39,7 +39,7 @@ it('UI edits preserve hidden identity options, and enabling depends on ByteCloud
  }finally{await act(async()=>renderer.unmount());}
 });
 it('new and old Dashboard saves, reload, explicit legacy and reset preserve the supported policy contract',async()=>{
- const migrated={...full,bytedcliOperationPolicy:{...full.bytedcliOperationPolicy,schema:'botmux.bytedcli-operation-policy.v2'}};
+ const migrated={...full,bytedcliOperationPolicy:{...full.bytedcliOperationPolicy,schema:'botmux.bytedcli-operation-policy.v2',catalogVersion:'2026-11-27.1'}};
  const root=mkdtempSync(join(tmpdir(),'bytedcli-config-'));roots.push(root);const file=join(root,'bots.json');vi.stubEnv('BOTS_CONFIG',file);
  writeFileSync(file,JSON.stringify([{larkAppId:'cli_mode_config',larkAppSecret:'fake',cliId:'codex',triggerUserAuth:full}]));
  loadBotConfigs().forEach(registerBot);setLarkAppId('cli_mode_config');ipc=await startIpcServer({port:0,host:'127.0.0.1'});

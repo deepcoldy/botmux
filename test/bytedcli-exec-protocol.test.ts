@@ -6,6 +6,15 @@ const response = { schema: 'botmux.bytedcli-exec.v1', requestId: 'request-1', op
   effectiveIdentity: { kind: 'machine' }, outcome: 'completed', stdoutBase64: 'b2sK', stderrBase64: '', exitCode: 0 };
 
 describe('ByteCloud broker wire validation', () => {
+  it('accepts legacy effect omission and projects only valid host effects and identities', () => {
+    expect(protocol.parseBytedcliExecResponse(response)).not.toHaveProperty('operationEffect');
+    expect(protocol.parseBytedcliExecResponse({ ...response, operationEffect: 'read' }).operationEffect).toBe('read');
+    expect(protocol.parseBytedcliExecResponse({ ...response, operationEffect: 'unknown', effectiveIdentity: { kind: 'actor' } }).operationEffect).toBe('unknown');
+    for (const extra of [{ operationEffect: 'arbitrary' }, { operationEffect: 'unknown' }, { operationEffect: 'auth' },
+      { operationEffect: 'read', outcome: 'write_outcome_unknown', errorCode: 'write_outcome_unknown', exitCode: 77 }]) {
+      expect(() => protocol.parseBytedcliExecResponse({ ...response, ...extra })).toThrow();
+    }
+  });
   it.each([[16, 0], [8, 8], [0, 16]])('accepts canonical output at the limit with %i MiB stdout and %i MiB stderr', (stdoutMiB, stderrMiB) => {
     const output = { ...response,
       stdoutBase64: Buffer.alloc(stdoutMiB * 1024 * 1024, 0x61).toString('base64'),

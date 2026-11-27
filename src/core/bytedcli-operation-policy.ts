@@ -2,27 +2,32 @@ import {
   BYTEDCLI_EXEC_LIMITS, decodeBytedcliBase64, parseBytedcliExecInputs, validateBytedcliArgv,
   type BytedcliExecInputs,
 } from '../cli/bytedcli-exec-protocol.js';
+import { matchBytedcliBusinessCommand, matchBytedcliBusinessHelp } from './bytedcli-business-command-catalog.js';
+import { assertBytedcliNoIdentityOverrides, bytedcliFallbackOperationId, parseBytedcliFallbackArgv } from './bytedcli-fallback-operation.js';
 
 import {
   BYTEDCLI_AUDITED_RELEASE, BYTEDCLI_OPERATION_CATALOG_VERSION, BYTEDCLI_OPERATION_GRAMMAR,
   type BytedcliFlagValidator, type BytedcliGrammarFlag, type BytedcliGrammarEntry,
-  type BytedcliOperationEffect, type BytedcliOperationRegion,
+  type BytedcliOperationEffect, type BytedcliOperationRegion, type BytedcliOperationExecution,
 } from './bytedcli-operation-catalog.js';
 export {
   BYTEDCLI_AUDITED_RELEASE, BYTEDCLI_OPERATION_CATALOG_VERSION, BYTEDCLI_OPERATION_CATALOG,
+  isBytedcliWriteLike,
   type BytedcliOperationCatalogEntry, type BytedcliOperationEffect, type BytedcliOperationRegion,
 } from './bytedcli-operation-catalog.js';
 
 export interface BytedcliStagedInput {
   readonly id: string;
-  readonly flag: '--body-file';
+  readonly flag: '--body-file' | '--file';
   readonly argvIndex: number;
   readonly dataBase64: string;
-  readonly encoding: 'utf8';
+  readonly encoding: 'utf8' | 'binary';
 }
 export interface BytedcliOperation {
   readonly id: string;
   readonly effect: BytedcliOperationEffect;
+  readonly execution: BytedcliOperationExecution;
+  readonly requiredRuntime?: 'db-cli';
   readonly argv: readonly string[];
   readonly region: BytedcliOperationRegion;
   readonly resources: Readonly<Record<string, string>>;
@@ -111,9 +116,22 @@ function parseTokens(argv: readonly string[], entry: Entry): Parsed {
 function paths(entry: Entry): readonly (readonly string[])[] {
   return [entry.path, ...entry.aliases];
 }
+function legacyCommandWords(argv: readonly string[]): string[] {
+  const flags = [...common, ...entries.flatMap(entry => entry.flags)]; const words: string[] = [];
+  for (let index = 0; index < argv.length; index++) {
+    const token = argv[index]!;
+    if (token === '--') { words.push(...argv.slice(index + 1)); break; }
+    if (!token.startsWith('-')) { words.push(token); continue; }
+    if (token.includes('=')) continue;
+    const flag = flags.find(flag => flag.name === token || flag.aliases?.includes(token));
+    if (flag?.arity === 'value' || flag?.arity === 'optional-boolean' && boolean(argv[index + 1] ?? '')) index++;
+    else if (!flag && argv[index + 1] && !argv[index + 1]!.startsWith('-')) index++;
+  }
+  return words;
+}
 function result(id: string, effect: BytedcliOperationEffect, argv: string[], resources: Record<string, string>,
-  stagedInputs: BytedcliStagedInput[] = []): BytedcliOperation {
-  return Object.freeze({ id, effect, argv: Object.freeze(argv), region: 'cn', resources: Object.freeze(resources),
+  stagedInputs: BytedcliStagedInput[] = [], execution: BytedcliOperationExecution = effect === 'auth' || effect === 'help' ? 'host-api' : 'audited-native', requiredRuntime?: 'db-cli'): BytedcliOperation {
+  return Object.freeze({ id, effect, execution, ...(requiredRuntime ? { requiredRuntime } : {}), argv: Object.freeze(argv), region: 'cn', resources: Object.freeze(resources),
     stagedInputs: Object.freeze(stagedInputs.map(input => Object.freeze(input))), cliVersion: BYTEDCLI_AUDITED_RELEASE,
     catalogVersion: BYTEDCLI_OPERATION_CATALOG_VERSION, timeoutMs: BYTEDCLI_EXEC_LIMITS.defaultTimeoutMs,
     outputLimitBytes: BYTEDCLI_EXEC_LIMITS.outputBytes, inputLimitBytes: BYTEDCLI_EXEC_LIMITS.inputBytes,
@@ -187,7 +205,48 @@ export function parseBytedcliOperation(argv: readonly string[], inputs?: Bytedcl
     }
     return buildOperation(entry, parsed, parsed.words.slice(matched.length), snapshots);
   }
-  const parsed = parseTokens(args, { id: 'help', path: [], aliases: [], effect: 'help', flags: [] });
+  // A malformed registered legacy operation must never enter actor fallback.
+  const words = legacyCommandWords(args);
+  if (entries.some(entry => paths(entry).some(path => path.every((word, index) => words[index] === word)))) deny();
+  let help: Parsed | undefined;
+  try { help = parseTokens(args, { id: 'help', path: [], aliases: [], effect: 'help', flags: [] }); } catch { /* business path */ }
+  if (!help || !BYTEDCLI_OPERATION_GRAMMAR.helpGroups.some(({ path }) => path.length === help.words.length && path.every((word, index) => help.words[index] === word))) {
+    try {
+      assertBytedcliNoIdentityOverrides(args);
+      const businessHelp = matchBytedcliBusinessHelp(args);
+      if (businessHelp) {
+        if (Object.keys(snapshots).length) deny();
+        return result(`help.${businessHelp.join('.')}`, 'help', [...businessHelp, '--help'], {});
+      }
+      const business = matchBytedcliBusinessCommand(args);
+      if (business) {
+        const staged: BytedcliStagedInput[] = [];
+        for (const flag of business.entry.inputFlags) {
+          const argvIndex = business.argv.indexOf(flag) + 1; const id = business.argv[argvIndex]!;
+          const dataBase64 = id === '-' ? snapshots.stdinBase64 : snapshots.files?.find(file => file.id === id)?.dataBase64;
+          if (!argvIndex || dataBase64 === undefined) deny();
+          decodeBytedcliBase64(dataBase64, BYTEDCLI_EXEC_LIMITS.inputBytes);
+          staged.push({ id: id === '-' ? 'stdin' : id, flag: flag as '--file', argvIndex, dataBase64, encoding: 'binary' });
+        }
+        if (snapshots.stdinBase64 !== undefined && !business.argv.includes('-') || snapshots.files?.some(file => !staged.some(input => input.id === file.id))) deny();
+        return result(business.entry.id, business.entry.effect, business.argv, {}, staged, 'isolated-native', business.entry.requiredRuntime);
+      }
+      const canonical = parseBytedcliFallbackArgv(args);
+      const staged: BytedcliStagedInput[] = [];
+      for (let index = 0; index < canonical.length; index++) {
+        const flag = canonical[index]!;
+        if (flag !== '--file' && flag !== '--body-file') continue;
+        const id = canonical[++index];
+        const dataBase64 = id === '-' ? snapshots.stdinBase64 : snapshots.files?.find(file => file.id === id)?.dataBase64;
+        if (!id || dataBase64 === undefined) deny();
+        decodeBytedcliBase64(dataBase64, BYTEDCLI_EXEC_LIMITS.inputBytes);
+        staged.push({ id: id === '-' ? 'stdin' : id, flag, argvIndex: index, dataBase64, encoding: 'binary' });
+      }
+      if (snapshots.stdinBase64 !== undefined && !canonical.includes('-') || snapshots.files?.some(file => !staged.some(input => input.id === file.id))) deny();
+      return result(bytedcliFallbackOperationId(canonical), 'unknown', canonical, {}, staged, 'isolated-native');
+    } catch { deny(); }
+  }
+  const parsed = help;
   const group = BYTEDCLI_OPERATION_GRAMMAR.helpGroups.find(({ path }) => path.length === parsed.words.length && path.every((word, index) => parsed.words[index] === word));
   if (!group || Object.keys(snapshots).length || [...parsed.values.keys()].some(key => !['--help', '--version', '--json', '--site'].includes(key))) deny();
   if (parsed.values.has('--version') && group.path.length > 0) deny();

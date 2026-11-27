@@ -5,10 +5,29 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { runBytedcliExecClient } from '../src/cli/bytedcli-exec.js';
+import { parseBytedcliOperation } from '../src/core/bytedcli-operation-policy.js';
 let server:Server|undefined;const roots:string[]=[];
 afterEach(async()=>{server?.closeAllConnections();await new Promise<void>(resolve=>server?server.close(()=>resolve()):resolve());server=undefined;for(const dir of roots.splice(0))rmSync(dir,{recursive:true,force:true});});
 async function host(handler:Parameters<typeof createServer>[0]){server=createServer(handler as any);await new Promise<void>(r=>server!.listen(0,'127.0.0.1',r));return (server.address() as any).port;}
 describe('sandbox broker client',()=>{
+  it('preserves reviewed remote --file selectors without reading a local file',async()=>{
+    let received:any;const argv=['codebase','mr','diff','42','--repo','ns/repo','--file','does-not-exist-locally.ts'];
+    const port=await host((req:any,res:any)=>{let text='';req.on('data',(b:Buffer)=>text+=b);req.on('end',()=>{received=JSON.parse(text);res.end(JSON.stringify({schema:'botmux.bytedcli-exec.v1',requestId:received.requestId,operationId:'codebase.mr.diff',operationEffect:'read',effectiveIdentity:{kind:'machine'},outcome:'completed',stdoutBase64:'',stderrBase64:'',exitCode:0}));});});
+    expect(await runBytedcliExecClient({sessionId:'s',port,argv,stdout:()=>{},stderr:()=>{}})).toBe(0);
+    expect(received.argv).toEqual(argv);expect(received.inputs).toBeUndefined();
+  });
+  it('snapshots binary TOS files before host submission and verifies returned effect',async()=>{
+    const dir=mkdtempSync(join(tmpdir(),'bytedcli-client-binary-'));roots.push(dir);const file=join(dir,'input.bin');writeFileSync(file,Buffer.from([0,255,42]));let received:any;
+    const port=await host((req:any,res:any)=>{let text='';req.on('data',(b:Buffer)=>text+=b);req.on('end',()=>{received=JSON.parse(text);writeFileSync(file,'changed');res.end(JSON.stringify({schema:'botmux.bytedcli-exec.v1',requestId:received.requestId,operationId:'tos.upload-object.c4-report',operationEffect:'write',effectiveIdentity:{kind:'machine'},outcome:'completed',stdoutBase64:'b2s=',stderrBase64:'',exitCode:0}));});});
+    let stdout='';const code=await runBytedcliExecClient({sessionId:'s',port,argv:['tos','upload-object','--bucket-id','20001326','--key','c4_config_checker_res/a.bin','--file='+file,'--timeout-ms','30000'],stdout:b=>stdout+=b.toString(),stderr:()=>{}});
+    expect(code).toBe(0);expect(stdout).toBe('ok');expect(JSON.stringify(received)).not.toContain(file);expect(received.inputs.files[0].dataBase64).toBe('AP8q');
+  });
+  it.each(['lost','mismatched-effect'])('unknown treats %s as an uncertain write and never retries',async mode=>{
+    let calls=0;const argv=['new-business','mutate','--force'];const op=parseBytedcliOperation(argv);
+    const port=await host((req:any,res:any)=>{calls++;if(mode==='lost'){req.socket.destroy();return;}let text='';req.on('data',(b:Buffer)=>text+=b);req.on('end',()=>{const request=JSON.parse(text);res.end(JSON.stringify({schema:'botmux.bytedcli-exec.v1',requestId:request.requestId,operationId:op.id,operationEffect:'read',effectiveIdentity:{kind:'actor'},outcome:'completed',stdoutBase64:'c2hvdWxkLW5vdC1lc2NhcGU=',stderrBase64:'',exitCode:0}));});});
+    let stderr='',stdout='';expect(await runBytedcliExecClient({sessionId:'s',port,argv,stdout:b=>stdout+=b.toString(),stderr:b=>stderr+=b.toString()})).toBe(75);
+    expect(calls).toBe(1);expect(stdout).toBe('');expect(stderr).toContain('write_outcome_unknown');
+  });
   it('snapshots body files, preserves stdout/stderr and upstream exit code',async()=>{
     const dir=mkdtempSync(join(tmpdir(),'bytedcli-client-'));roots.push(dir);const file=join(dir,'body.txt');writeFileSync(file,'original\nbody');let received:any;
     const port=await host((req:any,res:any)=>{let text='';req.on('data',(b:Buffer)=>text+=b);req.on('end',()=>{received=JSON.parse(text);writeFileSync(file,'later');res.end(JSON.stringify({schema:'botmux.bytedcli-exec.v1',requestId:received.requestId,operationId:'codebase.mr.create',effectiveIdentity:{kind:'actor'},outcome:'failed',stdoutBase64:'b3V0Cg==',stderrBase64:'ZXJyCg==',exitCode:17,errorCode:'upstream_failed'}));});});

@@ -1,8 +1,11 @@
 import packagedCatalog from './bytedcli-operation-catalog.json' with { type: 'json' };
+import { BYTEDCLI_BUSINESS_COMMAND_CATALOG } from './bytedcli-business-command-catalog.js';
 
 export const BYTEDCLI_AUDITED_RELEASE = '0.199.0' as const;
-export const BYTEDCLI_OPERATION_CATALOG_VERSION = '2026-11-26.1' as const;
-export type BytedcliOperationEffect = 'read' | 'write' | 'auth' | 'help';
+export const BYTEDCLI_OPERATION_CATALOG_VERSION = '2026-11-27.1' as const;
+export type BytedcliOperationEffect = 'read' | 'write' | 'unknown' | 'auth' | 'help';
+export type BytedcliOperationExecution = 'audited-native' | 'isolated-native' | 'host-api';
+export function isBytedcliWriteLike(effect: string): effect is 'write' | 'unknown' { return effect === 'write' || effect === 'unknown'; }
 /** Only CN was reviewed. Never substitute a default partition for a missing lease. */
 export type BytedcliOperationRegion = 'cn';
 
@@ -53,6 +56,10 @@ export interface BytedcliOperationCatalogEntry {
   readonly effect: BytedcliOperationEffect;
   readonly allowedFlags: readonly string[];
   readonly cliVersion: typeof BYTEDCLI_AUDITED_RELEASE;
+  readonly execution: BytedcliOperationExecution;
+  readonly condition?: string;
+  readonly inputFlags?: readonly string[];
+  readonly requiredRuntime?: 'db-cli';
 }
 
 function invalid(): never { throw new Error('Invalid packaged bytedcli operation catalog'); }
@@ -181,7 +188,11 @@ function validateCatalog(raw: unknown): BytedcliOperationGrammar {
 export const BYTEDCLI_OPERATION_GRAMMAR = validateCatalog(packagedCatalog);
 /** Informational support catalog, derived from the parser's validated grammar. */
 export const BYTEDCLI_OPERATION_CATALOG: readonly BytedcliOperationCatalogEntry[] = deepFreeze(
-  BYTEDCLI_OPERATION_GRAMMAR.entries.map(entry => ({ id: entry.id, path: entry.path, aliases: entry.aliases,
+  [...BYTEDCLI_OPERATION_GRAMMAR.entries.map(entry => ({ id: entry.id, path: entry.path, aliases: entry.aliases,
     effect: entry.effect, allowedFlags: [...entry.flags.map(flag => flag.name), '--json', '--site', '--help'],
-    cliVersion: BYTEDCLI_AUDITED_RELEASE })),
+    cliVersion: BYTEDCLI_AUDITED_RELEASE, execution: (entry.effect === 'auth' || entry.effect === 'help' ? 'host-api' : 'audited-native') as BytedcliOperationExecution })),
+  ...BYTEDCLI_BUSINESS_COMMAND_CATALOG.map(entry => ({ id: entry.id, path: entry.path, aliases: entry.aliases,
+    effect: entry.effect, allowedFlags: [...Object.keys(entry.flags), '--json', '--site', '--no-auto-upgrade'],
+    cliVersion: BYTEDCLI_AUDITED_RELEASE, execution: entry.execution, condition: entry.condition, inputFlags: entry.inputFlags,
+    ...(entry.requiredRuntime ? { requiredRuntime: entry.requiredRuntime } : {}) }))],
 );

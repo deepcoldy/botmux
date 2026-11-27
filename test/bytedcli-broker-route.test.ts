@@ -58,6 +58,12 @@ it('hard deadline cancels provider work and marks an in-flight write unknown',as
   await f.entered;const response=await pending;
   expect(await response.json()).toMatchObject({outcome:'write_outcome_unknown',errorCode:'write_outcome_unknown'});expect(f.aborted()).toBe(true);
 });
+it('unknown hard deadline projects unknown effect and actor identity over the real HTTP route',async()=>{
+  const f=fixture({wait:true});ipc=await startIpcServer({port:0,host:'127.0.0.1',authRequired:true,bytedcliBroker:f.broker});
+  const pending=post({...body,argv:['unreviewed','mutate','--force']});await f.entered;
+  expect(await (await pending).json()).toMatchObject({operationEffect:'unknown',effectiveIdentity:{kind:'actor'},outcome:'write_outcome_unknown',errorCode:'write_outcome_unknown'});
+  expect(f.calls()).toBe(1);expect(f.aborted()).toBe(true);
+});
 it('session retirement aborts a request waiting inside the executor',async()=>{
   const f=fixture({wait:true});ipc=await startIpcServer({port:0,host:'127.0.0.1',authRequired:true,bytedcliBroker:f.broker});
   const pending=post(body);await f.entered;await ipc.retireBytedcliSession('s-broker');await pending;expect(f.aborted()).toBe(true);

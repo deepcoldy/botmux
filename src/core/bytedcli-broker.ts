@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { BYTEDCLI_EXEC_LIMITS, BYTEDCLI_EXEC_SCHEMA, BYTEDCLI_EXEC_ERROR_CODES, parseBytedcliExecRequest,
   type BytedcliExecErrorCode, type BytedcliExecResponse, type BytedcliEffectiveIdentity } from '../cli/bytedcli-exec-protocol.js';
-import { parseBytedcliOperation, BytedcliOperationPolicyError } from './bytedcli-operation-policy.js';
+import { parseBytedcliOperation, isBytedcliWriteLike, BytedcliOperationPolicyError } from './bytedcli-operation-policy.js';
 import { resolveLoopbackPeerProcesses } from './current-actor-attestation.js';
 import type { BytedcliAuthorityResult, BytedcliAuthorityRequestContext } from './bytedcli-broker-authority.js';
 import { resolveBytedcliAuthority } from './bytedcli-broker-authority.js';
@@ -97,9 +97,10 @@ export class BytedcliBroker {
     let executorOutcome:BytedcliExecResponse['outcome']|undefined;
     let effectiveIdentity:BytedcliEffectiveIdentity={kind:'none'};
     let requestId='unparsed',operationId='unparsed';
+    let operationEffect: BytedcliOperation['effect'] | undefined;
     const unsafeWrite=()=>submitted&&write&&executorOutcome!=='rejected';
     const failed=(code:BytedcliExecErrorCode):BytedcliExecResponse=>{
-      const rejected=refusal(code,requestId,operationId);
+      const rejected={...refusal(code,requestId,operationId),...(operationEffect?{operationEffect}:{})};
       return unsafeWrite()?{...rejected,effectiveIdentity,outcome:'write_outcome_unknown',errorCode:'write_outcome_unknown'}:rejected;
     };
     const abort=()=>controller.abort();
@@ -111,7 +112,8 @@ export class BytedcliBroker {
       requestId=request.requestId;owner.sessionId=request.sessionId;
       owner.workerGeneration=this.deps.currentWorkerGeneration?.(request.sessionId);
       if(owner.workerGeneration!==undefined&&!this.freezeGeneration(owner,owner.workerGeneration))return answer(res,403,failed('execution_stale'));
-      const operation=parseBytedcliOperation(request.argv,request.inputs);operationId=operation.id;write=operation.effect==='write';
+      const operation=parseBytedcliOperation(request.argv,request.inputs);operationId=operation.id;write=isBytedcliWriteLike(operation.effect);
+      operationEffect=operation.effect;
       const peer=await resolveLoopbackPeerProcesses({remoteAddress:req.socket.remoteAddress,remotePort:req.socket.remotePort,localPort:req.socket.localPort});
       if(controller.signal.aborted)return answer(res,408,failed(deadline?'timeout':'cancelled'));
       if(!peer.ok)return answer(res,403,failed('execution_unverified'));
@@ -141,7 +143,7 @@ export class BytedcliBroker {
       const refused = response.outcome === 'rejected' || response.outcome === 'write_outcome_unknown';
       const after=refused && result.authority.current ? result.authority.current() : await result.authority.recheck();
       if(after||controller.signal.aborted)return answer(res,403,failed(after??(deadline?'timeout':'cancelled')));
-      answer(res,200,response);
+      answer(res,200,{...response,operationEffect:operation.effect});
     }catch(error){
       const code:BytedcliExecErrorCode=error instanceof BytedcliOperationPolicyError?error.code
         :controller.signal.aborted?(deadline?'timeout':'cancelled')
@@ -192,7 +194,7 @@ export function createProductionBytedcliBroker(host:Omit<import('./bytedcli-brok
   const getLeases=()=>personalLeases??=createBytedcliHostCredentialResolver({machineHome:layout.machineHome,machineProfile:layout.machineProfile,privateRoot:layout.privateRoot,trustedCli,networkEnv:layout.networkEnv});
   const getExecutor=()=>pending??=(async()=>{
     const leases=await getLeases();
-    executor=new BytedcliExecutor({privateRoot:layout.privateRoot,trustedCli,leases,audit:new BytedcliBrokerAudit(layout.auditRoot),networkEnv:layout.networkEnv});
+    executor=new BytedcliExecutor({privateRoot:layout.privateRoot,trustedCli,leases,audit:new BytedcliBrokerAudit(layout.auditRoot),networkEnv:layout.networkEnv,dbRuntime:layout.dbRuntime});
     if(closed)await executor.close();return executor;
   })();
   return new BytedcliBroker({operationPolicy,personalLeases:getLeases,currentWorkerGeneration:id=>host.findSession(id)?.workerGeneration,authority:(sessionId,peer,operation,context)=>resolveBytedcliAuthority({...host,operationPolicy,contains:ds=>{

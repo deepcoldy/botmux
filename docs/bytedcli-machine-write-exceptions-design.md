@@ -10,6 +10,8 @@
 
 配置入口仍为宿主固定的私有策略文件与 Bot 的 triggerUserAuth.bytedcliOperationPolicy。省略/null/关闭模式保留/清除合同不变。界面允许写行选择机器，始终显示 write 效果和最终身份。提供可审阅的 MIX/Picko 机器例外 JSON 与 Dashboard 预设；应用动作写完整 Bot 配置，不能绕过宿主明确限制。源码改造期间不修改现网文件或重启 daemon。
 
+已实现的目录版本为 `2026-11-27.1`，精确签名、执行方式、DB 运行时前提和旧目录闭合迁移见 [业务目录合同](bytedcli-business-command-catalog.md)。unknown opaque ID 不进入可配置目录，只能 actor；所有针对该 ID 的规则均拒绝。exec.v1 响应增加可选 `operationEffect`，新宿主填真实效果，客户端核对，保留旧响应省略兼容。
+
 ## 受管执行
 
 机器写入仍先持久化 intent、继续核验当前执行/策略/账号、维护同轮 requestId 派发记录，响应丢失或结果落盘失败仍返回 write_outcome_unknown。有效身份如实记录为 machine，不能在协议或 broker 超时路径中硬编码 actor。默认或未授权 descriptor 不能借机器写配置跳过验证。

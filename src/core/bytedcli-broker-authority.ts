@@ -13,7 +13,7 @@ import { assertScheduledAuthorityCurrent, authorizeScheduledTurn, parseScheduled
   trustedCallerForScheduledTask } from './scheduled-turn-provenance.js';
 import type { ScheduleAuthorityRecord } from '../services/schedule-authority-store.js';
 import type { BytedcliFrozenAuthority } from './bytedcli-executor.js';
-import type { BytedcliOperation } from './bytedcli-operation-policy.js';
+import { isBytedcliWriteLike, type BytedcliOperation } from './bytedcli-operation-policy.js';
 import type { BytedcliExecErrorCode } from '../cli/bytedcli-exec-protocol.js';
 import type { DaemonSession } from './types.js';
 import {effectiveScheduleChatIds} from '../services/schedule-store.js';
@@ -80,7 +80,7 @@ export async function resolveBytedcliAuthority(deps:BytedcliAuthorityDependencie
     const botPolicy = parseBytedcliOperationPolicy(policy?.bytedcliOperationPolicy);
     operationPolicy = Object.freeze({ globalRevision: globalSnapshot.revision,
       ...(globalPolicy ? { globalPolicy } : {}), ...(botPolicy ? { botPolicy } : {}) });
-    if (operation.effect === 'read' || operation.effect === 'write') {
+    if (operation.effect === 'read' || isBytedcliWriteLike(operation.effect)) {
       const selected = resolveBytedcliOperationRule(operation.id, globalPolicy, botPolicy);
       if (!selected.enabled) return fail('operation_disabled');
       executionIdentity = selected.identity;

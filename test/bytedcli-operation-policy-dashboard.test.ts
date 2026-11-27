@@ -140,7 +140,7 @@ it('writes saved by the real HTTP route keep machine effect and migrate valid le
  expect((await put({bytedcliOperationPolicy:config({'codebase.mr.close':'machine'})})).status).toBe(200);
  const machine=(await get()).bytedcliOperationPolicy;
  expect(machine.effectiveEntries.find((row:any)=>row.operationId==='codebase.mr.close')).toMatchObject({effect:'write',identity:'machine',enabled:true});
- const legacy={...config({'codebase.mr.close':'actor','codebase.mr.list':'machine'}),schema:'botmux.bytedcli-operation-policy.v1'};
+ const legacy={...config({'codebase.mr.close':'actor','codebase.mr.list':'machine'}),schema:'botmux.bytedcli-operation-policy.v1',catalogVersion:'2026-11-26.1'};
  expect((await put({bytedcliOperationPolicy:legacy})).status).toBe(200);
  expect(JSON.parse(readFileSync(botsFile,'utf8'))[0].triggerUserAuth.bytedcliOperationPolicy).toEqual(config(legacy.rules));
 });

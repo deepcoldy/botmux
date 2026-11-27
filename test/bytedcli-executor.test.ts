@@ -35,6 +35,53 @@ const machinePolicy = () => Object.freeze({ globalRevision: 'explicit', botPolic
 }) });
 const machineAuthority = (authority: any) => ({ ...authority, actor: undefined, executionIdentity: 'machine', operationPolicy: machinePolicy() });
 describe('bounded host business execution', () => {
+  const unknown = () => parseBytedcliOperation(['new-business', 'mutate', '--force']);
+  const isolated = (options: Record<string, any> = {}) => setup({ ...options, dependencies: { trustedCli: async () => ({
+    executable: '/usr/bin/true', path: '/usr/bin', protectedPaths: ['/usr/bin/true'], version: '0.199.0', stillCurrent: () => true,
+  }), ...options.dependencies } });
+  it('unknown operations use actor, durable intent and isolated dispatch, retain replay and policy-change fences', async () => {
+    const s = isolated(); const request = s.request(unknown(), 'unknown');
+    const first = await s.executor.execute(request);
+    expect(first).toMatchObject({ outcome: 'completed', effectiveIdentity: { kind: 'actor' } });
+    expect(s.providers).toEqual(['actor']); expect(s.dispatches[0].executable).toMatch(/\/bwrap$/);
+    expect(s.audit.map(row => [row.phase, row.effect, row.source])).toEqual([['intent', 'unknown', 'local'], ['result', 'unknown', 'local']]);
+    expect(await s.executor.execute(request)).toEqual(first); expect(s.dispatches).toHaveLength(1);
+    expect(await s.executor.execute({ ...request, authority: { ...s.authority, policyFingerprint: 'changed' } }))
+      .toMatchObject({ outcome: 'write_outcome_unknown', effectiveIdentity: { kind: 'actor' } });
+    expect(s.dispatches).toHaveLength(1);
+  });
+  it.each(['intent', 'result'])('unknown keeps %s persistence failure semantics', async phase => {
+    const s = isolated({ auditFails: phase });
+    expect(await s.executor.execute(s.request(unknown()))).toMatchObject({
+      outcome: phase === 'intent' ? 'rejected' : 'write_outcome_unknown', errorCode: phase === 'intent' ? 'audit_unavailable' : 'write_outcome_unknown',
+    });
+    expect(s.dispatches).toHaveLength(phase === 'intent' ? 0 : 1);
+  });
+  it('unknown requires actor, cannot borrow a machine exception or forge execution mode', async () => {
+    for (const extra of [{ actor: undefined }, { executionIdentity: 'machine' }, machineAuthority(isolated().authority)]) {
+      const s = isolated(); expect((await s.executor.execute(s.request(unknown(), 'unknown', { authority: { ...s.authority, ...extra } }))).errorCode).toBe('actor_required');
+      expect(s.providers).toEqual([]); expect(s.dispatches).toEqual([]);
+    }
+    const s = isolated(); expect((await s.executor.execute(s.request({ ...unknown(), execution: 'audited-native' }))).errorCode).toBe('unsupported_operation');
+    expect(s.dispatches).toEqual([]);
+  });
+  it('unknown shares the per-session write quota until dispatch completes', async () => {
+    let release!: () => void, started!: () => void;
+    const gate = new Promise<void>(resolve => release = resolve), entered = new Promise<void>(resolve => started = resolve);
+    const s = isolated({ run: async () => { started(); await gate; return { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), exitCode: 0 }; } });
+    const first = s.executor.execute(s.request(unknown(), 'first-unknown')); await entered;
+    const controller = new AbortController();
+    const second = s.executor.execute(s.request(write(), 'second-write', { signal: controller.signal }));
+    controller.abort(); expect((await second).errorCode).toBe('cancelled'); expect(s.providers).toEqual(['actor']);
+    release(); expect((await first).outcome).toBe('completed'); expect(s.dispatches).toHaveLength(1);
+  });
+  it('missing preinstalled DB dependency fails before any lease or native discovery', async () => {
+    let discoveries=0;
+    const s=setup({dependencies:{trustedCli:async()=>{discoveries++;throw new Error('must not discover');}}});
+    const op=parseBytedcliOperation(['rds','query-db','ecom_market_pick','SELECT COUNT(*) FROM pick_package','--region','cn']);
+    expect((await s.executor.execute(s.request(op))).errorCode).toBe('executor_unavailable');
+    expect(s.providers).toEqual([]);expect(discoveries).toBe(0);expect(s.dispatches).toEqual([]);
+  });
   it('explicit parsed machine writes use only machine leases and retain intent, result and replay', async () => {
     const s = setup(), authority = machineAuthority(s.authority);
     const request = s.request(write(), 'machine-write', { authority });

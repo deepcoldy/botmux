@@ -2,13 +2,14 @@ import { constants, closeSync, mkdtempSync, mkdirSync, openSync, rmSync, writeFi
 import { join } from 'node:path';
 import { BYTEDCLI_EXEC_SCHEMA, BYTEDCLI_EXEC_LIMITS, BYTEDCLI_EXEC_ERROR_CODES, decodeBytedcliBase64,
   type BytedcliExecResponse, type BytedcliExecErrorCode, type BytedcliEffectiveIdentity } from '../cli/bytedcli-exec-protocol.js';
-import { parseBytedcliOperation, assertBytedcliAuditedRelease, type BytedcliOperation } from './bytedcli-operation-policy.js';
+import { parseBytedcliOperation, assertBytedcliAuditedRelease, isBytedcliWriteLike, type BytedcliOperation } from './bytedcli-operation-policy.js';
 import { ensureBytedcliPrivateDirectory, type BytedcliAuditRecord, type BytedcliAuditSink } from './bytedcli-broker-audit.js';
 import { bytedcliSafeFingerprint, type BytedcliAuthorityRecheck, type BytedcliVerifiedActor,
   type BytedcliCredentialLease, type BytedcliLeaseResolver } from './bytedcli-broker-credentials.js';
 import { BytedcliBrokerError, bytedcliMinimalEnv, runBoundedBytedcliChild,
-  type BytedcliChildRunner, type BytedcliTrustedCli } from './bytedcli-broker-process.js';
+  type BytedcliChildRunner, type BytedcliTrustedCli, type BytedcliTrustedDbRuntime } from './bytedcli-broker-process.js';
 import { maskCredentialShapes } from './stuck-page-catalog.js';
+import { isolateBytedcliInvocation } from './bytedcli-isolated-process.js';
 import { isParsedBytedcliOperationPolicy, resolveBytedcliOperationRule } from './bytedcli-operation-policy-config.js';
 import type { BytedcliFrozenOperationPolicy } from './bytedcli-host-operation-policy.js';
 
@@ -32,6 +33,7 @@ export interface BytedcliExecutorDependencies {
   readonly privateRoot: string; readonly trustedCli: (signal: AbortSignal) => Promise<BytedcliTrustedCli>;
   readonly leases: BytedcliLeaseResolver; readonly audit: BytedcliAuditSink;
   readonly networkEnv?: Readonly<NodeJS.ProcessEnv>; readonly run?: BytedcliChildRunner;
+  readonly dbRuntime?: BytedcliTrustedDbRuntime;
 }
 export function redactBytedcliOutput(buffer: Buffer, activeSecrets: readonly string[]): Buffer {
   let text = buffer.toString('utf8');
@@ -54,7 +56,7 @@ async function joinOwnedWork(work: readonly Promise<unknown>[]): Promise<void> {
   if (failed) throw failed.reason;
 }
 interface Waiter { request: BytedcliExecutionRequest; resolve: (release: () => void) => void; reject: (error: Error) => void; cleanup: () => void }
-interface Entry { digest: string; tuple: string; execution: string; requestId: string; effect: 'read' | 'write'; sessionId: string; workerGeneration:number; promise: Promise<BytedcliExecResponse>; settled: boolean;
+interface Entry { digest: string; tuple: string; execution: string; requestId: string; effect: 'read' | 'write' | 'unknown'; sessionId: string; workerGeneration:number; promise: Promise<BytedcliExecResponse>; settled: boolean;
   outputBytes: number; revalidate?: BytedcliCredentialLease['stillCurrent']; controller?: AbortController;
   identity?: BytedcliEffectiveIdentity; dispatched?: boolean; overflow?: boolean }
 /** Response cancellation and underlying resource settlement are separate.
@@ -87,6 +89,7 @@ function errorCode(error: unknown): BytedcliExecErrorCode {
 function rejectResponse(request: BytedcliExecutionRequest, code: BytedcliExecErrorCode,
   identity: BytedcliEffectiveIdentity = { kind: 'none' }, unknownWrite = false): BytedcliExecResponse {
   return Object.freeze({ schema: BYTEDCLI_EXEC_SCHEMA, requestId: request.requestId, operationId: request.operation.id,
+    operationEffect: request.operation.effect,
     effectiveIdentity: identity, outcome: unknownWrite ? 'write_outcome_unknown' : 'rejected',
     stdoutBase64: '', stderrBase64: '', exitCode: 77, errorCode: unknownWrite ? 'write_outcome_unknown' : code });
 }
@@ -113,12 +116,12 @@ function provesExplicitMachineWrite(request: BytedcliExecutionRequest): boolean 
 function snapshotOperation(operation: BytedcliOperation): BytedcliOperation {
   // Reparse even host descriptors: input bytes and canonical argv must remain
   // bound to one audited schema. Only host-selected lower limits are retained.
-  const inputs = operation.stagedInputs.length ? {
-    ...(operation.argv.includes('-') ? { stdinBase64: operation.stagedInputs[0]!.dataBase64 } : {
-      files: operation.stagedInputs.map(input => ({ id: input.id, dataBase64: input.dataBase64 })) }),
-  } : undefined;
+  const stdin = operation.stagedInputs.find(input => operation.argv[input.argvIndex] === '-');
+  const files = operation.stagedInputs.filter(input => operation.argv[input.argvIndex] !== '-')
+    .map(input => ({ id: input.id, dataBase64: input.dataBase64 }));
+  const inputs = operation.stagedInputs.length ? { ...(stdin ? { stdinBase64: stdin.dataBase64 } : {}), ...(files.length ? { files } : {}) } : undefined;
   const parsed = parseBytedcliOperation(operation.argv, inputs);
-  if (parsed.id !== operation.id || parsed.effect !== operation.effect || parsed.region !== operation.region
+  if (parsed.id !== operation.id || parsed.effect !== operation.effect || parsed.execution !== operation.execution || parsed.requiredRuntime !== operation.requiredRuntime || parsed.region !== operation.region
     || parsed.cliVersion !== operation.cliVersion || parsed.catalogVersion !== operation.catalogVersion
     || JSON.stringify(parsed.argv) !== JSON.stringify(operation.argv)
     || JSON.stringify(parsed.stagedInputs) !== JSON.stringify(operation.stagedInputs)) throw new BytedcliBrokerError('unsupported_operation');
@@ -155,10 +158,10 @@ export class BytedcliExecutor {
       const authority = Object.freeze({ ...raw.authority, ...(raw.authority.actor ? { actor: Object.freeze({ ...raw.authority.actor }) } : {}) });
       request = Object.freeze({ ...raw, operation, authority });
       if (!/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(request.requestId)) throw new BytedcliBrokerError('invalid_request');
-      if (operation.effect !== 'read' && operation.effect !== 'write') throw new BytedcliBrokerError('unsupported_operation');
+      if (operation.effect !== 'read' && !isBytedcliWriteLike(operation.effect)) throw new BytedcliBrokerError('unsupported_operation');
       const identity = executionIdentityOf(request);
       if (!['machine', 'actor'].includes(identity)) throw new BytedcliBrokerError('invalid_request');
-      if ((operation.effect === 'write' && identity === 'machine' && !provesExplicitMachineWrite(request))
+      if ((isBytedcliWriteLike(operation.effect) && identity === 'machine' && !provesExplicitMachineWrite(request))
         || (identity === 'actor' && (!authority.actor || !authority.actor.verifiedEmail))) throw new BytedcliBrokerError('actor_required');
       const deadline = started + operation.timeoutMs;
       const tuple = tupleOf(authority); const key = JSON.stringify([tuple, request.requestId]);
@@ -175,8 +178,8 @@ export class BytedcliExecutor {
       // this execution already dispatched a write. Keep that fence in the same
       // bounded entry set rather than an unbounded secondary history.
       const dispatched = [...this.entries.values()].find(old => old.execution === execution && old.requestId === request.requestId
-        && old.effect === 'write' && old.dispatched);
-      if (dispatched) return rejectResponse(request, 'policy_changed', dispatched.identity ?? { kind: 'actor' }, operation.effect === 'write');
+        && isBytedcliWriteLike(old.effect) && old.dispatched);
+      if (dispatched) return rejectResponse(request, 'policy_changed', dispatched.identity ?? { kind: 'actor' }, isBytedcliWriteLike(operation.effect));
       const overflow = this.entries.size >= 4096;
       if (overflow && ![...this.entries.values()].some(old => this.retirable(old, authority, tuple))) {
         throw new BytedcliBrokerError('busy');
@@ -192,7 +195,7 @@ export class BytedcliExecutor {
   }
   private retirable(entry: Entry, authority: BytedcliFrozenAuthority, tuple: string): boolean {
     return entry.settled && entry.sessionId === authority.sessionId && entry.tuple !== tuple
-      && !(entry.effect === 'write' && entry.dispatched && entry.execution === executionOf(authority));
+      && !(isBytedcliWriteLike(entry.effect) && entry.dispatched && entry.execution === executionOf(authority));
   }
   private async check(request: BytedcliExecutionRequest): Promise<void> {
     if (this.closed) throw new BytedcliBrokerError('executor_unavailable');
@@ -269,7 +272,7 @@ export class BytedcliExecutor {
       return result;
     } catch (error) {
       return rejectResponse(request, timedOut ? 'timeout' : errorCode(error), entry.identity ?? { kind: 'none' },
-        !!entry.dispatched && request.operation.effect === 'write');
+        !!entry.dispatched && isBytedcliWriteLike(request.operation.effect));
     } finally {
       if (counted) this.duplicateWaiters--; clearTimeout(timer);
       try { request.signal?.removeEventListener('abort', abort); }
@@ -278,12 +281,12 @@ export class BytedcliExecutor {
   }
   private fits(request: BytedcliExecutionRequest): boolean {
     const session = this.sessions.get(request.authority.sessionId) ?? { reads: 0, writes: 0 };
-    return this.running < 16 && (request.operation.effect === 'write'
+    return this.running < 16 && (isBytedcliWriteLike(request.operation.effect)
       ? this.writes < 4 && session.writes < 1 : session.reads < 4);
   }
   private reserve(request: BytedcliExecutionRequest): () => void {
     const id = request.authority.sessionId; const session = this.sessions.get(id) ?? { reads: 0, writes: 0 };
-    const write = request.operation.effect === 'write'; this.running++; if (write) { this.writes++; session.writes++; } else session.reads++;
+    const write = isBytedcliWriteLike(request.operation.effect); this.running++; if (write) { this.writes++; session.writes++; } else session.reads++;
     this.sessions.set(id, session); let released = false;
     return () => {
       if (released) return; released = true; this.running--; if (write) { this.writes--; session.writes--; } else session.reads--;
@@ -346,6 +349,8 @@ export class BytedcliExecutor {
       const leaseRequest = { region: request.operation.region, actor: request.authority.actor, recheck: request.authority.recheck,
         signal: controller.signal, sessionId: request.authority.sessionId, botAppId: request.authority.botAppId,
         identityTurnId: request.authority.identityTurnId ?? request.authority.turnId };
+      const dbRuntime = request.operation.requiredRuntime === 'db-cli' ? this.deps.dbRuntime : undefined;
+      if (request.operation.requiredRuntime === 'db-cli' && (!dbRuntime || !dbRuntime.stillCurrent())) throw new BytedcliBrokerError('executor_unavailable');
       const kind = executionIdentityOf(request);
       lease = await bounded(kind === 'machine' ? this.deps.leases.machine(leaseRequest) : this.deps.leases.actor(leaseRequest));
       entry.revalidate = lease.stillCurrent;
@@ -354,7 +359,8 @@ export class BytedcliExecutor {
       entry.identity = identity;
       if (lease.region !== request.operation.region || !lease.jwt || lease.expiresAt <= Date.now()) throw new BytedcliBrokerError('region_auth_required');
       await bounded(this.check(active));
-      const cli = await bounded(this.deps.trustedCli(controller.signal)); assertBytedcliAuditedRelease(cli.version);
+      const trustedCli = await bounded(this.deps.trustedCli(controller.signal)); assertBytedcliAuditedRelease(trustedCli.version);
+      const cli = dbRuntime ? Object.freeze({ ...trustedCli, dbRuntime, stillCurrent: () => trustedCli.stillCurrent() && dbRuntime.stillCurrent() }) : trustedCli;
       ensureBytedcliPrivateDirectory(this.deps.privateRoot); root = mkdtempSync(join(this.deps.privateRoot, 'request-'));
       const home = join(root, 'home'); const cwd = join(root, 'cwd'); mkdirSync(home, { mode: 0o700 }); mkdirSync(cwd, { mode: 0o700 });
       const stage = (name: string, bytes: Buffer) => {
@@ -373,10 +379,10 @@ export class BytedcliExecutor {
         turnId: authority.turnId, workerGeneration: authority.workerGeneration, dispatchAttempt: authority.dispatchAttempt,
         identityTurnId: request.authority.identityTurnId ?? request.authority.turnId,
         policyFingerprint: bytedcliSafeFingerprint(request.authority.policyFingerprint), requestId: request.requestId,
-        operationId: request.operation.id, catalogVersion: request.operation.catalogVersion, effect: request.operation.effect as 'read' | 'write',
+        operationId: request.operation.id, catalogVersion: request.operation.catalogVersion, effect: request.operation.effect as 'read' | 'write' | 'unknown',
         accountFingerprint: lease.accountFingerprint, source: lease.source, resources: request.operation.resources,
         inputDigest: digest, timestamp: new Date().toISOString() };
-      if (request.operation.effect === 'write') {
+      if (isBytedcliWriteLike(request.operation.effect)) {
         try { await bounded(this.deps.audit.append({ ...auditBase, phase: 'intent' })); }
         catch { throw new BytedcliBrokerError('audit_unavailable'); }
       }
@@ -385,18 +391,20 @@ export class BytedcliExecutor {
       const runner = this.deps.run ?? runBoundedBytedcliChild;
       // An injected runner is a trusted host boundary; conservatively assume
       // dispatch on entry. The default runner reports the actual spawn event.
-      if (this.deps.run) { dispatched = true; entry.dispatched = true; }
-      const childWork = runner({ executable: cli.executable, argv: [...(cli.prefixArgs ?? []), ...argv], cwd,
-        env: bytedcliMinimalEnv(home, cwd, cli.path, this.deps.networkEnv), signal: controller.signal,
+      const invocation = { executable: cli.executable, argv: [...(cli.prefixArgs ?? []), ...argv], cwd,
+        env: { ...bytedcliMinimalEnv(home, cwd, cli.path, this.deps.networkEnv), ...(dbRuntime ? { DB_CLI_BINARY: dbRuntime.executable } : {}) }, signal: controller.signal,
         timeoutMs: Math.max(1, request.operation.timeoutMs - (Date.now() - started)), outputLimitBytes: request.operation.outputLimitBytes,
-        onDispatch: () => { dispatched = true; entry.dispatched = true; }, reserveOutput: bytes => {
+        onDispatch: () => { dispatched = true; entry.dispatched = true; }, reserveOutput: (bytes: number) => {
           if (this.outputBytes + bytes > GLOBAL_OUTPUT_LIMIT) return false;
           this.outputBytes += bytes; heldOutput += bytes; return true;
-        } });
+        } };
+      const prepared = request.operation.execution === 'isolated-native' ? isolateBytedcliInvocation(invocation, cli, root) : invocation;
+      if (this.deps.run) { dispatched = true; entry.dispatched = true; }
+      const childWork = runner(prepared);
       let result;
       try { result = await bounded(childWork); }
       catch (error) { if (!this.deps.run) await childWork.catch(() => undefined); throw error; }
-      if (request.operation.effect === 'write' && result.exitCode !== 0) throw new BytedcliBrokerError('upstream_failed');
+      if (isBytedcliWriteLike(request.operation.effect) && result.exitCode !== 0) throw new BytedcliBrokerError('upstream_failed');
       if (result.stdout.length + result.stderr.length > request.operation.outputLimitBytes) throw new BytedcliBrokerError('output_limit');
       if (heldOutput === 0) { // injected runners still obey the global budget
         heldOutput = result.stdout.length + result.stderr.length;
@@ -409,6 +417,7 @@ export class BytedcliExecutor {
       if (stdout.length + stderr.length > request.operation.outputLimitBytes) throw new BytedcliBrokerError('output_limit');
       const response: BytedcliExecResponse = Object.freeze({ schema: BYTEDCLI_EXEC_SCHEMA, requestId: request.requestId,
         operationId: request.operation.id, effectiveIdentity: identity, outcome: result.exitCode === 0 ? 'completed' : 'failed',
+        operationEffect: request.operation.effect,
         stdoutBase64: stdout.toString('base64'), stderrBase64: stderr.toString('base64'), exitCode: Math.max(0, Math.min(255, result.exitCode)),
         ...(result.exitCode !== 0 ? { errorCode: 'upstream_failed' as const } : {}) });
       try { await bounded(this.deps.audit.append({ ...auditBase, phase: 'result', outcome: response.outcome,
@@ -421,7 +430,7 @@ export class BytedcliExecutor {
       return response;
     } catch (error) {
       const code = timeout ? 'timeout' : errorCode(error);
-      const unknown = dispatched && request.operation.effect === 'write';
+      const unknown = dispatched && isBytedcliWriteLike(request.operation.effect);
       const response = rejectResponse(request, code, identity, unknown);
       if (auditBase) {
         try { await bounded(this.deps.audit.append({ ...auditBase, phase: 'result', outcome: response.outcome,

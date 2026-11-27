@@ -8,7 +8,7 @@ export interface BytedcliAuditRecord {
   readonly sessionId: string; readonly turnId: string; readonly identityTurnId: string;
   readonly workerGeneration: number; readonly dispatchAttempt: number; readonly policyFingerprint: string;
   readonly requestId: string; readonly operationId: string; readonly catalogVersion: string;
-  readonly effect: 'read' | 'write'; readonly accountFingerprint: string;
+  readonly effect: 'read' | 'write' | 'unknown'; readonly accountFingerprint: string;
   readonly source: 'machine' | 'local' | 'platform'; readonly resources: Readonly<Record<string, string>>;
   readonly inputDigest: string; readonly timestamp: string;
   readonly outcome?: BytedcliExecOutcome; readonly errorCode?: BytedcliExecErrorCode;
@@ -48,7 +48,7 @@ const keys = ['phase', 'daemonBootId', 'botAppId', 'sessionId', 'turnId', 'ident
 const resourceKeys = new Set(['repo', 'repoId', 'mr', 'mrId', 'spaceId', 'psm', 'head', 'base']);
 function safeRecord(record: BytedcliAuditRecord): string {
   if (!record || Reflect.ownKeys(record).some(key => typeof key !== 'string' || !keys.includes(key))) throw new Error('unsafe_audit_record');
-  if (!['intent', 'result'].includes(record.phase) || !['read', 'write'].includes(record.effect)
+  if (!['intent', 'result'].includes(record.phase) || !['read', 'write', 'unknown'].includes(record.effect)
     || !['machine', 'local', 'platform'].includes(record.source)
     || !/^sha256:[A-Za-z0-9_-]+$/.test(record.accountFingerprint) || !/^sha256:[A-Za-z0-9_-]+$/.test(record.inputDigest)
     || !Number.isSafeInteger(record.workerGeneration) || !Number.isSafeInteger(record.dispatchAttempt)) throw new Error('unsafe_audit_record');

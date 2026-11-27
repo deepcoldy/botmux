@@ -24,6 +24,13 @@ const read=parseBytedcliOperation(['codebase','repo','list']);
 const write=parseBytedcliOperation(['codebase','mr','create','--repo','ns/repo','--head','feature','--base','master','--title','demo']);
 const resolve=(f:ReturnType<typeof setup>,op=read)=>resolveBytedcliAuthority(f.deps,'s-authority',{pid:process.pid,procStart:readProcessStartIdentity(process.pid)!},op);
 describe('frozen peer business authority',()=>{
+  it('unknown requires a verified personal actor and follows authority revocation',async()=>{
+    const unknown=parseBytedcliOperation(['unreviewed','mutate']);
+    const f=setup();const result=await resolve(f,unknown);expect(result.ok).toBe(true);
+    if(result.ok){expect(result.authority).toMatchObject({executionIdentity:'actor',actor:{verifiedEmail:'a@example.com'}});f.change('epoch');expect(await result.authority.recheck()).toBeDefined();}
+    expect(f.identities()).toBeGreaterThan(0);
+    const g=setup();g.ds.managedTurnOrigin.trustedCaller={senderType:'bot'};expect(await resolve(g,unknown)).toMatchObject({ok:false,errorCode:'actor_required'});
+  });
   it('keeps A identity for B arrival and gives reads no actor lookup',async()=>{
     const f=setup();const result=await resolve(f);expect(result.ok).toBe(true);if(!result.ok)return;
     expect(result.authority).toMatchObject({turnId:'arrival-B',identityTurnId:'executing-A',dispatchAttempt:0});

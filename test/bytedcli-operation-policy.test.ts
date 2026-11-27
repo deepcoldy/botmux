@@ -84,8 +84,10 @@ describe('audited bytedcli operations', () => {
     for (const tail of [['--push'], ['--attach', '/tmp/file'], ['--meego', '123'], ['--auto-link-work-items'],
       ['--body-json', '{}'], ['--yes'], ['--unknown']]) expect(() => parse([...create, ...tail])).toThrow();
     for (const argv of [['codebase', 'mr', 'merge', '42', ...repo], ['codebase', 'mr', 'branch', 'create'],
-      ['bits', 'develop', 'create', '--body', '{}'], ['meego', 'workitem', 'list'], ['rpc', 'test'],
-      ['auth', 'get-bytecloud-jwt-token'], ['upgrade'], ['--site', 'i18n', 'codebase', 'repo', 'list'],
+      ['bits', 'develop', 'create', '--body', '{}'], ['meego', 'workitem', 'list'], ['rpc', 'test']]) {
+      expect(parse(argv)).toMatchObject({ effect: 'unknown', execution: 'isolated-native' });
+    }
+    for (const argv of [['auth', 'get-bytecloud-jwt-token'], ['upgrade'], ['--site', 'i18n', 'codebase', 'repo', 'list'],
       ['codebase', 'mr', 'get', 'https://example.com/mr/42', ...repo]]) expect(() => parse(argv)).toThrow();
     expect(() => parse(['codebase', 'mr', 'create', ...repo, '--title', 'Demo'])).toThrow();
     expect(() => parse(['codebase', 'mr', 'update', '42', ...repo])).toThrow();

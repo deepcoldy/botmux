@@ -33,6 +33,14 @@ export function isParsedBytedcliOperationPolicy(policy: unknown): policy is Byte
 }
 const businessOperations = new Map(BYTEDCLI_OPERATION_CATALOG
   .filter(entry => entry.effect === 'read' || entry.effect === 'write').map(entry => [entry.id, entry]));
+// Historical migration authority must not grow when a future catalog appends
+// entries. These are precisely the business IDs/effects reviewed in .26.1.
+const legacyEffects: Readonly<Record<string, 'read' | 'write'>> = Object.freeze({
+  'codebase.repo.get': 'read', 'codebase.repo.list': 'read', 'codebase.mr.get': 'read', 'codebase.mr.list': 'read',
+  'codebase.mr.count': 'read', 'codebase.mr.diff': 'read', 'codebase.mr.files': 'read', 'codebase.mr.status': 'read',
+  'codebase.mr.create': 'write', 'codebase.mr.update': 'write', 'codebase.mr.close': 'write', 'codebase.mr.reopen': 'write',
+  'bits.develop.list': 'read', 'log.search-log-matchers': 'read',
+});
 
 /** Optional Bot config may be absent/null. A present host file must additionally require an object. */
 export function parseBytedcliOperationPolicy(raw: unknown): BytedcliOperationPolicy | undefined {
@@ -41,16 +49,18 @@ export function parseBytedcliOperationPolicy(raw: unknown): BytedcliOperationPol
   const keys = ['schema', 'cliVersion', 'catalogVersion', 'rules'];
   if (Object.keys(rec).length !== keys.length || keys.some(key => !Object.hasOwn(rec, key))
     || ![BYTEDCLI_OPERATION_POLICY_SCHEMA, 'botmux.bytedcli-operation-policy.v1'].includes(rec.schema as string) || rec.cliVersion !== BYTEDCLI_AUDITED_RELEASE
-    || rec.catalogVersion !== BYTEDCLI_OPERATION_CATALOG_VERSION) invalid();
+    || ![BYTEDCLI_OPERATION_CATALOG_VERSION, '2026-11-26.1'].includes(rec.catalogVersion as string)) invalid();
+  if (rec.schema === 'botmux.bytedcli-operation-policy.v1' && rec.catalogVersion !== '2026-11-26.1') invalid();
   const rawRules = record(rec.rules);
   const operationIds = Object.keys(rawRules).sort();
-  if (operationIds.length > 64) invalid();
+  if (operationIds.length > businessOperations.size) invalid();
   const rules: Record<string, BytedcliOperationRule> = {};
   for (const operationId of operationIds) {
     const operation = businessOperations.get(operationId);
     const rule = rawRules[operationId];
-    if (!operation || typeof rule !== 'string' || !['machine', 'actor', 'deny'].includes(rule)
-      || (rec.schema === 'botmux.bytedcli-operation-policy.v1' && operation.effect === 'write' && rule === 'machine')) invalid();
+    if ((rec.catalogVersion === '2026-11-26.1' && !Object.hasOwn(legacyEffects, operationId))
+      || !operation || typeof rule !== 'string' || !['machine', 'actor', 'deny'].includes(rule)
+      || (rec.schema === 'botmux.bytedcli-operation-policy.v1' && legacyEffects[operationId] === 'write' && rule === 'machine')) invalid();
     rules[operationId] = rule as BytedcliOperationRule;
   }
   const policy = Object.freeze({ schema: BYTEDCLI_OPERATION_POLICY_SCHEMA, cliVersion: BYTEDCLI_AUDITED_RELEASE,
@@ -62,7 +72,8 @@ export function parseBytedcliOperationPolicy(raw: unknown): BytedcliOperationPol
 /** Explicit deny > actor > machine. Audited defaults apply only without identity rules. */
 export function resolveBytedcliOperationRule(
   operationId: string, globalPolicy?: BytedcliOperationPolicy, botPolicy?: BytedcliOperationPolicy,
-): { readonly operationId: string; readonly effect: 'read' | 'write'; readonly enabled: boolean; readonly identity: 'machine' | 'actor' } {
+): { readonly operationId: string; readonly effect: 'read' | 'write' | 'unknown'; readonly enabled: boolean; readonly identity: 'machine' | 'actor' } {
+  if (/^unknown\.[a-f0-9]{64}$/.test(operationId)) return Object.freeze({ operationId, effect: 'unknown', enabled: true, identity: 'actor' });
   const operation = businessOperations.get(operationId);
   if (!operation || (operation.effect !== 'read' && operation.effect !== 'write')) invalid();
   const globalRule = globalPolicy?.rules[operationId];

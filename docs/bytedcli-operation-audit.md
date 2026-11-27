@@ -1,12 +1,12 @@
 # ByteCloud broker 命令目录审核
 
-审核基于安装候选 `@bytedance-dev/bytedcli` **0.199.0** 的发布源码，目录版本 `2026-11-26.1`。本目录只支持 `cn` 认证分区；未知 release、命令、参数和区域均拒绝。源码审核只读取文件，并用独立 Commander 实例验证参数 grammar；没有调用业务接口、个人授权或更新 CLI。
+审核基于安装候选 `@bytedance-dev/bytedcli` **0.199.0** 的发布源码，目录版本 `2026-11-27.1`。本目录只支持 `cn` 认证分区；未知 release、已登记命令非法参数和区域均拒绝。未登记业务仅通过隔离的 actor/unknown 路径执行。源码审核只读取文件，并用独立 Commander 实例验证参数 grammar；没有调用业务接口、个人授权或更新 CLI。
 
 ## 目录维护与运行规则
 
 随 Botmux 发布的 `src/core/bytedcli-operation-catalog.json` 是审核数据，包含 release/catalog 版本、规范 ID、命令路径与别名、真实效果和封闭参数 grammar；纯 TypeScript loader 验证并冻结整份目录。新增命令、选项或改变效果必须重新审核实际 handler/service/API 链，更新该文件与行为测试，再发布新版本。宿主规则文件和 Bot 配置不能加载外部目录、登记未审核 ID、改变 read/write 效果或绕过参数重建。
 
-运行规则采用 `botmux.bytedcli-operation-policy.v2`、CLI `0.199.0`、catalog `2026-11-26.1`。宿主固定文件为 `~/.botmux/host-authority/bytedcli-broker/policy/operation-policy.json`；Bot 为 `triggerUserAuth.bytedcliOperationPolicy`。二者使用规范 ID 的 `machine` / `actor` / `deny` 映射，缺项继承。read 默认 machine，write 默认 actor；v2 的显式 `machine` 可选择机器写入例外。任一 deny 禁用，任一明确 actor 优先于 machine；Bot 不能覆盖宿主明确 actor/deny，默认写身份不作为明确宿主限制。合法旧 v1 按旧合同校验后迁移为 v2，v1 machine write 仍拒绝。状态 schema 同样为 v2。所有已登记别名继承同一规范 ID 的规则。auth/help 保留专用适配器与个人控制边界。
+运行规则采用 `botmux.bytedcli-operation-policy.v2`、CLI `0.199.0`、catalog `2026-11-27.1`。宿主固定文件为 `~/.botmux/host-authority/bytedcli-broker/policy/operation-policy.json`；Bot 为 `triggerUserAuth.bytedcliOperationPolicy`。二者使用规范 ID 的 `machine` / `actor` / `deny` 映射，缺项继承。read 默认 machine，write 默认 actor；v2 的显式 `machine` 可选择机器写入例外。任一 deny 禁用，任一明确 actor 优先于 machine；Bot 不能覆盖宿主明确 actor/deny，默认写身份不作为明确宿主限制。合法旧 v1 按旧合同校验后迁移为 v2，v1 machine write 仍拒绝。状态 schema 同样为 v2。所有已登记别名继承同一规范 ID 的规则。auth/help 保留专用适配器与个人控制边界。
 
 [配置示例、私有权限、Dashboard 与失效恢复](bytedcli-read-write-identity.md#逐命令规则与宿主限制)说明全局和 Bot JSON、旧客户端保留与显式清除语义。运行时验证文件及修订，身份查询之前拒绝禁用/无效配置；排队、取票、派发和返回持续绑定修订。actor-read 的真实效果仍为 read，使用读额度/结果审计；业务 write 无论机器或个人身份仍须 durable intent、写入限额与结果落盘；机器写入要求实际 parser 生成且冻结的显式有效策略证明。已派发写入在同一执行中保留 request ID 派发记录，策略变动不会解除重复写入防线；结果未知无自动重试。
 
@@ -21,6 +21,8 @@
 数字为无前导零的十进制整数。资源 ID 范围 `1..Number.MAX_SAFE_INTEGER`，页码 `1..10000`，每页 `1..100`。repo 只接收分段的组织/仓库资源路径或数字 ID，二选一；不接受 URL、宿主目录或隐式当前仓库。MR 只接收明确数字 number 或 `--mr-id`，二选一。branch 只接受有限字符和长度，不接受 `..`、空分段或 `.lock` 后缀。
 
 argv 限制 256 项 / 64 KiB，解码输入总量 2 MiB，HTTP 请求 body 3 MiB，合计输出 16 MiB。目录默认 timeout 60 秒；这些上限是执行器的合同，不代表只调用 parser 就已建立执行隔离。响应只允许预定义安全 error code 和 opaque 账号 fingerprint。parser 不承担通用日志或所有第三方秘密的识别。
+
+新增加的 40 个精确业务签名、unknown 合同及 DB 依赖前提见 [业务目录合同](bytedcli-business-command-catalog.md)。以下为原 JSON grammar 的 18 行。
 
 ## 已开放目录及实际效果
 
@@ -64,7 +66,9 @@ Codebase client 会交换 request-scoped ByteCloud JWT，错误时也可重取�
 
 Auth/help 在宿主独立 adapter 上执行。输出需要先由宿主去除活跃凭据的精确值、认证字段和已知秘密形状；业务输出保留 stdout/stderr/exit status，但原始 auth handler 输出始终禁止。
 
-## 保持拒绝的候选
+## 原始审核未覆盖的候选（历史）
+
+本节记录首期审核限制；2026-11-27.1 已在新目录中补充的精确签名以[业务目录合同](bytedcli-business-command-catalog.md)为准，其余业务使用 unknown/actor 隔离路径，认证与安装控制仍拒绝。
 
 - **BITS develop get**：task-detail service 在明确 pipeline-id 且选中 task 时调用 `initTaskIds`，请求 `/dev/task/workflow/init_ids`。现有 CLI 发布源码只见 GET，不能证明服务器没有持久初始化效果；而不传 pipeline-id 的 handler 又有 undefined/null 诊断 ID 校验问题。因此整项拒绝，不能借 get/help 描述归为读。
 - BITS develop check-mr/inspect-changes/create/update、release get/search/inspect/stages/project-configs：没有完成所有参数与效果链审核，首期不开放。create 涉及模板、跨域 Meego、环境构造和可能多步变更；不是任意已知字段天然安全。

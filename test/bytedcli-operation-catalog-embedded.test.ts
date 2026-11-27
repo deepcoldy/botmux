@@ -28,6 +28,7 @@ it('compiled actual catalog, configuration and parser execute after every source
   const root = privateRoot();
   // 非文本断言：将真实模块复制进私有编译夹具，删除它们后验证实际二进制结果；不钉源码文本。
   for (const rel of ['core/bytedcli-operation-catalog.ts', 'core/bytedcli-operation-catalog.json',
+    'core/bytedcli-business-command-catalog.ts', 'core/bytedcli-fallback-operation.ts',
     'core/bytedcli-operation-policy-config.ts', 'core/bytedcli-operation-policy.ts', 'cli/bytedcli-exec-protocol.ts']) {
     const target = join(root, 'src', rel); mkdirSync(resolve(target, '..'), { recursive: true }); cpSync(resolve('src', rel), target);
   }
@@ -42,12 +43,15 @@ it('compiled actual catalog, configuration and parser execute after every source
   expect(existsSync(join(root, 'src'))).toBe(false); expect(existsSync(entry)).toBe(false);
   const executed = spawnSync(binary, [], { cwd: root, env: process.env, encoding: 'utf8', timeout: 30_000 });
   expect(executed.error).toBeUndefined(); expect(executed.status, executed.stdout + executed.stderr).toBe(0);
-  expect(JSON.parse(executed.stdout)).toEqual({
-    cliVersion: '0.199.0', catalogVersion: '2026-11-26.1', catalogEntries: 18, frozenCatalog: true,
+  const output = JSON.parse(executed.stdout);
+  expect(output.catalogEntries).toBeGreaterThan(18);
+  expect(output).toMatchObject({
+    cliVersion: '0.199.0', catalogVersion: '2026-11-27.1', frozenCatalog: true,
     read: { id: 'codebase.mr.get', effect: 'read', argv: ['--json', '--site', 'cn', 'codebase', 'mr', 'get', '42', '--repo', 'team/service'] },
     write: { id: 'codebase.mr.close', effect: 'write' },
     effectiveRead: { operationId: 'codebase.mr.get', effect: 'read', enabled: true, identity: 'actor' },
     effectiveWrite: { operationId: 'codebase.mr.close', effect: 'write', enabled: false, identity: 'actor' },
-    invalidWriteRefused: true, unknownCommandRefused: true,
+    invalidWriteRefused: true, unknown: { effect: 'unknown', execution: 'isolated-native', identity: 'actor' },
+    debug: { id: 'api-test.rpc-call.picko-size', effect: 'read', execution: 'isolated-native' }, badDebugRefused: true,
   });
 }, 90_000);

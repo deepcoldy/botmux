@@ -5,6 +5,7 @@ import { basename, delimiter, dirname, isAbsolute, join } from 'node:path';
 import { parseBytedcliMachineProfile } from './bytedcli-broker-credentials.js';
 import { snapshotBytedcliRuntimeTrees, snapshotBytedcliTrustedFiles } from './bytedcli-runtime-integrity.js';
 import { bytedcliHostNetworkEnvironment } from './bytedcli-host-network.js';
+import { discoverBytedcliDbRuntime } from './bytedcli-broker-process.js';
 /** Frozen once at host assembly. PATH is daemon startup configuration, never
  * Bot/Agent env, and discover validates canonical install/runtime ownership. */
 export function bytedcliTrustedHostLayout(settings:{readonly machineProfile?:string;readonly protectedRoots?:readonly string[]}={}){
@@ -14,6 +15,10 @@ export function bytedcliTrustedHostLayout(settings:{readonly machineProfile?:str
   const runtimeCandidates=directories.map(dir=>join(dir,'node')).filter(existsSync);
   const runtimeExecutable=runtimeCandidates[0]??'/usr/bin/node';
   const installationRoots=[...new Set(candidates.map(file=>dirname(dirname(file))))];
+  const privateRoot=join(machineHome,'.botmux','host-authority','bytedcli-broker');
+  const dbBinary = process.env.DB_CLI_BINARY ?? join(machineHome, '.local', 'share', 'bytedcli', 'dependency', 'db', 'node_modules', '@bytedance-dev', 'db-cli', 'bin',
+    `db-cli-${process.platform}-${process.arch === 'x64' ? 'amd64' : process.arch}`);
+  const dbRuntime = discoverBytedcliDbRuntime(dbBinary, join(privateRoot, 'db-code'));
   let unavailableReason: string | undefined;
   let networkEnv: Readonly<NodeJS.ProcessEnv> = Object.freeze({});
   try { networkEnv = bytedcliHostNetworkEnvironment(process.env); }
@@ -27,7 +32,6 @@ export function bytedcliTrustedHostLayout(settings:{readonly machineProfile?:str
     try { return [snapshotBytedcliRuntimeTrees(entry, dirname(dirname(entry)), runtimeExecutable)]; }
     catch { runtimeProven = false; unavailableReason ??= 'unproven ByteCloud runtime dependency tree'; return []; }
   });
-  const privateRoot=join(machineHome,'.botmux','host-authority','bytedcli-broker');
   const auditRoot=join(privateRoot,'audit');
   const credentialRoots=[join(machineHome,'.local','share','bytedcli'),join(machineHome,'.botmux','data','bytedcli-home'),
     join(machineHome,'.botmux','data','cli-auth-epoch'),join(machineHome,'.botmux','host-authority'),
@@ -41,7 +45,7 @@ export function bytedcliTrustedHostLayout(settings:{readonly machineProfile?:str
     ...['BYTEDCLI_CONFIG_DIR','BYTEDCLI_HOME','BOTS_CONFIG','SSH_AUTH_SOCK','GIT_CONFIG_GLOBAL','GIT_CONFIG_SYSTEM'].flatMap(key=>process.env[key]&&isAbsolute(process.env[key]!)?[process.env[key]!]:[]),
     ...['AIME_WORKSPACE_PATH','AILY_WORKSPACE_PATH','AILY_WORKSPACE_DIR'].flatMap(key=>process.env[key]&&isAbsolute(process.env[key]!)?[process.env[key]!]:[]),
     ...(settings.protectedRoots??[])];
-  const executableReadOnlyRoots=[...installationRoots,...runtimeTrees.flatMap(tree=>tree.protectedPaths),...certificates.protectedPaths,...directories.filter(dir=>existsSync(join(dir,'bytedcli'))),...directories.map(dir=>join(dir,'bytedcli')).filter(existsSync),
+  const executableReadOnlyRoots=[...installationRoots,...runtimeTrees.flatMap(tree=>tree.protectedPaths),...certificates.protectedPaths,...(dbRuntime?.protectedPaths ?? (isAbsolute(dbBinary) ? [dbBinary] : [])),...directories.filter(dir=>existsSync(join(dir,'bytedcli'))),...directories.map(dir=>join(dir,'bytedcli')).filter(existsSync),
     runtimeExecutable,dirname(runtimeExecutable)];
   const protectedRoots=[...credentialRoots,...executableReadOnlyRoots];
   if(protectedRoots.some(root=>!isAbsolute(root)||root.startsWith('/$bunfs/')))throw new Error('invalid trusted protected root');
@@ -51,7 +55,7 @@ export function bytedcliTrustedHostLayout(settings:{readonly machineProfile?:str
     try{return [root,join(realpathSync(ancestor),...suffix)];}catch{return [root];}
   }))]);
   const aliases=canonicalAliases(protectedRoots);
-  return Object.freeze({machineHome,path,candidates:Object.freeze(candidates),runtimeExecutable,
+  return Object.freeze({machineHome,path,candidates:Object.freeze(candidates),runtimeExecutable,dbRuntime,
     installationRoots:Object.freeze(installationRoots),privateRoot,auditRoot,machineProfile:parseBytedcliMachineProfile(settings.machineProfile),credentialRoots:canonicalAliases(credentialRoots),
     executableReadOnlyRoots:canonicalAliases(executableReadOnlyRoots),protectedRoots:aliases,networkEnv:Object.freeze(networkEnv),
     unavailableReason,

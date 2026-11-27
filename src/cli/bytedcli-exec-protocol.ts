@@ -30,6 +30,7 @@ export const BYTEDCLI_EXEC_ERROR_CODES = [
 ] as const;
 export type BytedcliExecErrorCode = typeof BYTEDCLI_EXEC_ERROR_CODES[number];
 export type BytedcliExecOutcome = 'completed' | 'rejected' | 'failed' | 'write_outcome_unknown';
+export type BytedcliExecOperationEffect = 'read' | 'write' | 'unknown' | 'auth' | 'help';
 export interface BytedcliEffectiveIdentity {
   readonly kind: 'machine' | 'actor' | 'none';
   /** Opaque safe host-produced hash, never an email, grant or provider body. */
@@ -39,6 +40,8 @@ export interface BytedcliExecResponse {
   readonly schema: typeof BYTEDCLI_EXEC_SCHEMA;
   readonly requestId: string;
   readonly operationId: string;
+  /** Host-derived; omitted only by legacy hosts or before operation parsing. */
+  readonly operationEffect?: BytedcliExecOperationEffect;
   readonly effectiveIdentity: BytedcliEffectiveIdentity;
   readonly outcome: BytedcliExecOutcome;
   readonly stdoutBase64: string;
@@ -130,10 +133,13 @@ export function parseBytedcliExecRequest(raw: unknown): BytedcliExecRequest {
 }
 export function parseBytedcliExecResponse(raw: unknown): BytedcliExecResponse {
   const rec = record(decodeJson(raw, 4 * Math.ceil(BYTEDCLI_EXEC_LIMITS.outputBytes / 3) + 4096),
-    ['schema', 'requestId', 'operationId', 'effectiveIdentity', 'outcome', 'stdoutBase64', 'stderrBase64', 'exitCode', 'errorCode'], 'response');
+    ['schema', 'requestId', 'operationId', 'operationEffect', 'effectiveIdentity', 'outcome', 'stdoutBase64', 'stderrBase64', 'exitCode', 'errorCode'], 'response');
   if (rec.schema !== BYTEDCLI_EXEC_SCHEMA) fail('schema');
   const identity = record(rec.effectiveIdentity, ['kind', 'accountFingerprint'], 'effectiveIdentity');
   if (!['machine', 'actor', 'none'].includes(identity.kind as string)) fail('identity kind');
+  if (rec.operationEffect !== undefined && (!['read', 'write', 'unknown', 'auth', 'help'].includes(rec.operationEffect as string)
+    || ['unknown', 'auth'].includes(rec.operationEffect as string) && identity.kind === 'machine'
+    || rec.outcome === 'write_outcome_unknown' && !['write', 'unknown'].includes(rec.operationEffect as string))) fail('operation effect');
   const effectiveIdentity: BytedcliEffectiveIdentity = Object.freeze({ kind: identity.kind as BytedcliEffectiveIdentity['kind'],
     ...(identity.accountFingerprint !== undefined
       ? { accountFingerprint: text(identity.accountFingerprint, 'account fingerprint', /^sha256:[A-Za-z0-9_-]{1,128}$/) } : {}) });
@@ -147,6 +153,7 @@ export function parseBytedcliExecResponse(raw: unknown): BytedcliExecResponse {
   decodeBytedcliBase64(rec.stderrBase64, BYTEDCLI_EXEC_LIMITS.outputBytes - stdout.length, 'stderr');
   return Object.freeze({ schema: BYTEDCLI_EXEC_SCHEMA, requestId: text(rec.requestId, 'requestId', ID),
     operationId: text(rec.operationId, 'operationId', ID), effectiveIdentity,
+    ...(rec.operationEffect !== undefined ? { operationEffect: rec.operationEffect as BytedcliExecOperationEffect } : {}),
     outcome: rec.outcome as BytedcliExecOutcome, stdoutBase64: rec.stdoutBase64 as string,
     stderrBase64: rec.stderrBase64 as string, exitCode: rec.exitCode as number,
     ...(rec.errorCode !== undefined ? { errorCode: rec.errorCode as BytedcliExecErrorCode } : {}) });
