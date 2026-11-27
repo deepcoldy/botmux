@@ -21,8 +21,9 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFil
 import { join, resolve } from 'node:path';
 import { spawnNodeTsScript, spawnSyncTsEvalWithRepoImports } from './helpers/ts-runner.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
+import { waitForWorkerMessage } from './helpers/worker-ipc-waiter.js';
 import { probeHostCredentialIsolationMechanism } from '../src/adapters/backend/sandbox.js';
-import { piSessionDirName } from '../src/services/pi-transcript.js';
+import { piPreviousTranscriptDir, piSessionDirName } from '../src/services/pi-transcript.js';
 import type { DaemonToWorker } from '../src/types.js';
 
 const bwrapRuntime = process.platform === 'linux' && (() => {
@@ -91,7 +92,7 @@ exec sleep 600
   delete env.TMUX;
   delete env.TMUX_PANE;
   return {
-    home, sessions, workDir, report, fakePi,
+    home, dataDir, sessions, workDir, report, fakePi,
     ownDir: join(sessions, 'botmux', SID),
     start(opts: { sandbox: boolean; resume?: boolean; botEnv?: Record<string, string> }) {
       const logs: string[] = [];
@@ -135,6 +136,15 @@ describe('Pi transcript dir under the allowlist file sandbox (real worker)', () 
     expect(existsSync(join(l.ownDir, `probe-${SID}.jsonl`))).toBe(true);
     expect(report.sibling).toBe('HIDDEN');
     expect(report.siblingOwn).toBe('HIDDEN');
+  }, 60_000);
+
+  it.skipIf(!bwrapRuntime)('uses the sandbox directory for both Pi and bridge reattachment with a custom profile', async () => {
+    const l = lab();
+    const logs = l.start({ sandbox: true, botEnv: { PI_CODING_AGENT_DIR: join(l.home, 'bot-profile') } });
+    await waitForWorkerMessage(child!, [], 'ready', logs, 30_000);
+    const report = await readReport(l.report, logs);
+    expect(report.argv).toContain(`--session-dir ${l.ownDir}`);
+    expect(piPreviousTranscriptDir(l.dataDir, SID)).toBe(l.ownDir);
   }, 60_000);
 
   it.skipIf(!bwrapRuntime || process.getuid?.() !== 0)('sandboxed, root worker: the bot\'s own TAR_OPTIONS reaches the CLI extended with --no-same-owner', async () => {
