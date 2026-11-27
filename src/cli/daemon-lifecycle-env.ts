@@ -134,10 +134,16 @@ export type DaemonEnvKey = (typeof DAEMON_ENV_KEYS)[number];
  * indistinguishable from an absent one — except for the terminal and dashboard
  * bind hosts, whose historical defaults are applied here.
  */
+export interface ResolveDaemonEnvOptions {
+  /** Fallback bind host for Dashboard when neither env nor `.env` specifies `BOTMUX_DASHBOARD_HOST`. */
+  defaultDashboardHost?: string;
+}
+
 export function resolveDaemonEnv(
   inheritedEnv: NodeJS.ProcessEnv,
   envFileText?: string,
   refreshPersistedEnv = Boolean(inheritedEnv.BOTMUX_SESSION_ID?.trim()),
+  options?: ResolveDaemonEnvOptions,
 ): Record<DaemonEnvKey, string> {
   const fileEnv = envFileText === undefined ? {} : parse(envFileText);
   const companionKeys = new Set<DaemonEnvKey>([
@@ -175,6 +181,6 @@ export function resolveDaemonEnv(
       ?? fileEnv.BOTMUX_WORKER_HOST;
   resolved.BOTMUX_WORKER_HTTP_HOST = workerHost?.trim() || '0.0.0.0';
   resolved.BOTMUX_WORKER_HOST = '';
-  resolved.BOTMUX_DASHBOARD_HOST ||= '0.0.0.0';
+  resolved.BOTMUX_DASHBOARD_HOST ||= options?.defaultDashboardHost?.trim() || '0.0.0.0';
   return resolved;
 }

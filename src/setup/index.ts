@@ -272,3 +272,111 @@ function reportHerdrIntegrations(r: HerdrIntegrationResult): void {
     );
   }
 }
+
+export interface BotStartDependencyInput {
+  effectiveBackend: string;
+  cliId?: CliId;
+  isApiOnly?: boolean;
+  /** True on 0->1 transition (no bot daemon currently online). */
+  isFirstBotTransition: boolean;
+  ptyOptIn: boolean;
+  quiet?: boolean;
+  installTimeoutMs?: number;
+  /** Skip network font downloads in fenced test runs. */
+  skipFontsDownload?: boolean;
+  platform?: NodeJS.Platform;
+}
+
+export type BotStartDependencyResult =
+  | { ok: true }
+  | { ok: false; reason: 'dependency_missing'; message: string };
+
+export interface BotStartDependencyOverrides {
+  ensureTmux?: typeof ensureTmux;
+  ensureFonts?: typeof ensureFonts;
+  ensureHerdr?: typeof ensureHerdr;
+  ensureHerdrIntegrations?: typeof ensureHerdrIntegrations;
+  checkHcDependency?: typeof checkHcDependency;
+}
+
+/**
+ * Single-bot dependency preflight for `botmux start-bot`.
+ *
+ * Mirrors `ensureSystemDependencies()` for the 0->1 transition after a 0-bot
+ * `--allow-empty` start skipped cold dependency provisioning, without ever
+ * calling `process.exit()` or polluting `--json` stdout.
+ */
+export async function ensureBotStartDependencies(
+  input: BotStartDependencyInput,
+  overrides: BotStartDependencyOverrides = {},
+): Promise<BotStartDependencyResult> {
+  const quiet = input.quiet === true;
+  const installTimeoutMs = input.installTimeoutMs ?? 90_000;
+  const runEnsureTmux = overrides.ensureTmux ?? ensureTmux;
+  const runEnsureFonts = overrides.ensureFonts ?? ensureFonts;
+  const runEnsureHerdr = overrides.ensureHerdr ?? ensureHerdr;
+  const runEnsureHerdrIntegrations = overrides.ensureHerdrIntegrations ?? ensureHerdrIntegrations;
+  const runCheckHc = overrides.checkHcDependency ?? checkHcDependency;
+
+  if (input.effectiveBackend === 'tmux' && !input.ptyOptIn) {
+    try {
+      const tmux = await runEnsureTmux(undefined, {
+        quiet,
+        installTimeoutMs,
+        aptUpdateTimeoutMs: 30_000,
+      });
+      if (shouldHardFailStartupForMissingTmux({
+        tmuxInstalled: tmux.installed,
+        tmuxBinaryPresent: tmux.binaryPresent === true,
+        anyBotWantsTmux: true,
+        ptyOptIn: input.ptyOptIn,
+      })) {
+        const parts = ['tmux 未安装，无法启动默认 tmux 后端的机器人。'];
+        if (tmux.manualCommand) parts.push(`请先安装：${tmux.manualCommand}`);
+        else if (tmux.reason) parts.push(tmux.reason);
+        parts.push('或在应急场景设置 BACKEND_TYPE=pty（或将机器人 backendType 设为 "pty"）。');
+        return {
+          ok: false,
+          reason: 'dependency_missing',
+          message: parts.join(' '),
+        };
+      }
+    } catch {
+      // Internal probe errors degrade gracefully to per-session checks (PR#249).
+    }
+  } else if (input.effectiveBackend === 'hc') {
+    try {
+      const hc = runCheckHc();
+      if (!hc.availability.ok && !hc.binaryPresent) {
+        return {
+          ok: false,
+          reason: 'dependency_missing',
+          message: `herdr-core (hc) 不可用：${hc.availability.reason}。请安装 >= ${HC_MIN_VERSION.join('.')} 到 ${join(hcBotmuxRoot(), 'bin', 'herdr-core')}、PATH 或通过 BOTMUX_HC_BIN 指定路径。`,
+        };
+      }
+    } catch {
+      // Probe exception is non-fatal.
+    }
+  } else if (input.effectiveBackend === 'herdr') {
+    try {
+      const herdr = await runEnsureHerdr({ quiet, installTimeoutMs });
+      if (herdr.installed) {
+        const integrations = await runEnsureHerdrIntegrations([input.cliId ?? 'claude-code']);
+        if (!quiet) reportHerdrIntegrations(integrations);
+      }
+    } catch {
+      // herdr bootstrap is best-effort (matches ensureDependencies).
+    }
+  }
+
+  const platform = input.platform ?? process.platform;
+  if (input.isFirstBotTransition && !input.isApiOnly && platform !== 'darwin' && !input.skipFontsDownload) {
+    try {
+      await runEnsureFonts(undefined, { quiet: true, downloadTimeoutMs: 10_000 });
+    } catch {
+      // Fonts are nice-to-have and never block bot startup.
+    }
+  }
+
+  return { ok: true };
+}

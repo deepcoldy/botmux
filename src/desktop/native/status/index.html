@@ -36,6 +36,7 @@
   <p class="meta" id="meta"></p>
   <div class="notice warn" id="align" hidden></div>
   <div class="notice" id="update" hidden></div>
+  <div class="notice warn" id="launch-error" hidden></div>
   <div class="notice warn" id="dash" hidden></div>
   <div class="actions">
     <button class="primary" id="start" hidden>启动 Botmux</button>
@@ -65,10 +66,15 @@
     const u = (o && o.update) || {};
     $('dot').dataset.s = s.status || '';
     $('title').textContent = labels[s.status] || '正在检查运行时';
+    const onboarding = s.status === 'not_configured' && s.runtimeSource === 'bundled' && s.runtimeManaged === true;
     let meta = s.message || '';
-    if (s.status === 'running') meta = meta || `${s.onlineDaemonCount}/${s.botCount} 个 bot 在线，正在打开控制台…`;
+    if (s.status === 'running') meta = meta || (s.botCount === 0 ? '本地引导控制台已启动，正在打开…' : `${s.onlineDaemonCount}/${s.botCount} 个 bot 在线，正在打开控制台…`);
     if (s.status === 'stopped') meta = meta || 'fleet 未运行。启动后这里会切换为 Botmux 控制台。';
-    if (s.status === 'not_configured') meta = meta || '在终端运行 botmux setup 添加机器人，完成后点击启动。';
+    if (s.status === 'not_configured') {
+      meta = meta || (onboarding
+        ? '点击下方按钮启动本地引导控制台，完成飞书机器人配置，无需先在终端运行 botmux setup。'
+        : '在终端运行 botmux setup 添加机器人，完成后点击启动。');
+    }
     $('meta').textContent = meta;
     $('version').textContent = `App 运行时 ${u.current || '?'}` + (s.runtimeSource === 'global-cli' ? ` · fleet 由 ${s.runtimePath || '外部 CLI'} 运行` : '');
 
@@ -79,15 +85,20 @@
     if (u.available) $('update').textContent = u.inProgress ? `正在更新到 ${u.latest}…`
       : `botmux ${u.latest} 可用（当前 ${u.current}）。` + (u.policy === 'cli-auto' ? `已开启自动更新${u.autoUpdateTime ? `，daemon 将在每天 ${u.autoUpdateTime} 更新` : ''}。` : '');
     if (!u.available && u.restartPending) { $('update').hidden = false; $('update').textContent = '运行时已更新，重启 fleet 后生效。'; }
-    $('dash').hidden = !o.dashboardError;
-    $('dash').textContent = o.dashboardError ? `控制台暂时打不开：${o.dashboardError}` : '';
+    const launchError = o && o.launchError;
+    $('launch-error').hidden = !launchError;
+    $('launch-error').textContent = launchError ? `自动启动失败：${launchError}` : '';
+    $('dash').hidden = !(o && o.dashboardError);
+    $('dash').textContent = (o && o.dashboardError) ? `控制台暂时打不开：${o.dashboardError}` : '';
 
     const running = s.status === 'running' || s.status === 'degraded';
-    $('start').hidden = running || s.status === 'not_configured';
+    const canStart = (s.status === 'stopped' && s.runtimeManaged !== false) || onboarding;
+    $('start').hidden = !canStart;
+    $('start').textContent = onboarding ? '开始配置 / 添加机器人' : '启动 Botmux';
     $('restart').hidden = !running;
     $('takeover').hidden = a.kind !== 'owner-older';
     $('apply-update').hidden = !u.available || u.inProgress;
-    $('retry').hidden = !(s.status === 'running' && o.dashboardError);
+    $('retry').hidden = !(s.status === 'running' && o && o.dashboardError);
     for (const id of ['start', 'restart', 'takeover', 'apply-update']) $(id).disabled = busy;
   }
 
@@ -97,7 +108,9 @@
     $(id).disabled = true;
     try {
       const r = await fn();
-      if (r && typeof r.code === 'number' && r.code !== 0) showLog((r.stderr || r.stdout || '').trim());
+      if (r && typeof r.code === 'number' && r.code !== 0) {
+        showLog((r.stderr && r.stderr.trim()) || (r.stdout && r.stdout.trim()) || `exit code ${r.code}`);
+      }
       if (r && r.ok === false) showLog(r.message || '');
     } catch (e) {
       showLog(String(e && e.message || e));

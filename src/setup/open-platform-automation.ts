@@ -301,6 +301,7 @@ export type OpenPlatformAutomationResult =
         | 'missing_session'
         | 'invalid_session'
         | 'login_failed'
+        | 'aborted'
         | 'qr_expired'
         | 'timeout'
         | 'missing_csrf'
@@ -426,11 +427,12 @@ export interface OpenPlatformAutomationOptions {
   /** Emitted once only after Feishu reports this exact QR as scanned. */
   onQrScanConfirmed?: (info: { confirmedAt: number }) => void | Promise<void>;
   onStatus?: (message: string) => void | Promise<void>;
+  signal?: AbortSignal;
 }
 
 
 export type FeishuWebSessionSource = 'botmux_cache' | 'qr_login' | 'bytedcli_fallback';
-export type FeishuWebSessionFailureReason = 'login_failed' | 'qr_expired' | 'timeout' | 'network' | 'invalid_session';
+export type FeishuWebSessionFailureReason = 'login_failed' | 'aborted' | 'qr_expired' | 'timeout' | 'network' | 'invalid_session';
 
 export type FeishuWebSessionPrepareResult =
   | {
@@ -467,6 +469,7 @@ export interface FeishuWebSessionOptions {
   /** Emitted once only after polling observes Feishu status=2 for this QR. */
   onQrScanConfirmed?: (info: { confirmedAt: number }) => void | Promise<void>;
   onStatus?: (message: string) => void | Promise<void>;
+  signal?: AbortSignal;
 }
 
 export type FeishuOpenPlatformSessionInspectionResult =
@@ -1736,9 +1739,15 @@ export async function prepareFeishuWebSession(
 ): Promise<FeishuWebSessionPrepareResult> {
   const fetcher = options.fetchImpl ?? fetch;
   const sessionFile = options.sessionFilePath ?? botmuxFeishuSessionFilePath();
+  if (options.signal?.aborted) {
+    return { ok: false, reason: 'aborted', message: '用户已取消操作', sessionFile };
+  }
   if (!options.forceQrLogin) {
     const cached = readStoredCookiesFromSessionFile(sessionFile);
     if (cached && cached.length > 0 && await validateFeishuWebSession(cached, fetcher)) {
+      if (options.signal?.aborted) {
+        return { ok: false, reason: 'aborted', message: '用户已取消操作', sessionFile };
+      }
       return {
         ok: true,
         sessionFile,
@@ -1761,6 +1770,9 @@ export async function prepareFeishuWebSession(
   let loginError: unknown;
   try {
     const loggedIn = await loginFeishuWebSession(fetcher, options);
+    if (options.signal?.aborted) {
+      return { ok: false, reason: 'aborted', message: '用户已取消操作', sessionFile };
+    }
     writeStoredCookiesToSessionFile(sessionFile, loggedIn);
     return {
       ok: true,
@@ -1771,6 +1783,14 @@ export async function prepareFeishuWebSession(
     };
   } catch (err) {
     loginError = err;
+    if (options.signal?.aborted || classifyFeishuLoginError(err, options.signal) === 'aborted') {
+      return {
+        ok: false,
+        reason: 'aborted',
+        message: '用户已取消操作',
+        sessionFile,
+      };
+    }
   }
 
   const fallbackSessionFile = options.bytedcliFallbackSessionFilePath ?? bytedcliFeishuSessionFilePath();
@@ -1790,7 +1810,7 @@ export async function prepareFeishuWebSession(
 
   return {
     ok: false,
-    reason: classifyFeishuLoginError(loginError),
+    reason: classifyFeishuLoginError(loginError, options.signal),
     message: safeErrorMessage(loginError),
     sessionFile,
     fallbackSessionFile: options.disableBytedcliFallback || options.forceQrLogin ? undefined : fallbackSessionFile,
@@ -1800,6 +1820,14 @@ export async function prepareFeishuWebSession(
 export async function automateOpenPlatformSetup(
   options: OpenPlatformAutomationOptions,
 ): Promise<OpenPlatformAutomationResult> {
+  if (options.signal?.aborted) {
+    return {
+      ok: false,
+      reason: 'aborted',
+      message: '用户已取消操作',
+      redirectConfigured: false,
+    };
+  }
   const brand = options.brand ?? 'feishu';
   if (brand !== 'feishu') {
     return {
@@ -1822,6 +1850,7 @@ export async function automateOpenPlatformSetup(
     maxWaitMs: options.maxWaitMs,
     onQrCode: options.onQrCode,
     onQrScanConfirmed: options.onQrScanConfirmed,
+    signal: options.signal,
     onStatus: options.onStatus,
   });
   if (!preparedSession.ok) {
@@ -1882,7 +1911,11 @@ export async function automateOpenPlatformSetup(
     };
   }
 
-  const postJson = async (path: string, body?: unknown, options: OpenPlatformPostOptions = {}): Promise<unknown> => {
+  const postJson = async (path: string, body?: unknown, requestOptions: OpenPlatformPostOptions = {}): Promise<unknown> => {
+    const signal = requestOptions.signal && options.signal && requestOptions.signal !== options.signal
+      ? AbortSignal.any([requestOptions.signal, options.signal])
+      : requestOptions.signal ?? options.signal;
+    throwIfAborted(signal);
     const url = `${apiOrigin}${path}`;
     const response = await session.fetchRaw(fetcher, url, {
       method: 'POST',
@@ -1894,7 +1927,7 @@ export async function automateOpenPlatformSetup(
         ...(body === undefined ? {} : { 'content-type': 'application/json' }),
       },
       body: body === undefined ? undefined : JSON.stringify(body),
-      ...(options.signal ? { signal: options.signal } : {}),
+      ...(signal ? { signal } : {}),
     });
     let data: any;
     try {
@@ -2707,8 +2740,8 @@ export interface OpenPlatformApiClient {
    * 与 GET/HEAD 同权享受完整的瞬态错误退避重试，且**预算只在 fetchRaw 这一层**
    * —— 调用方不要再在外面套第二轮 retry，那会与内层相乘（实测 3×3=9 次）。
    */
-  postJsonIdempotent(path: string, body?: unknown): Promise<unknown>;
-  postForm(path: string, body: FormData): Promise<unknown>;
+  postJsonIdempotent(path: string, body?: unknown, options?: OpenPlatformPostOptions): Promise<unknown>;
+  postForm(path: string, body: FormData, options?: OpenPlatformPostOptions): Promise<unknown>;
 }
 
 export type OpenPlatformClientResult =
@@ -2722,9 +2755,10 @@ export type OpenPlatformClientResult =
  */
 export async function createOpenPlatformApiClient(
   cookies: StoredCookie[],
-  opts: { fetchImpl?: typeof fetch } = {},
+  opts: { fetchImpl?: typeof fetch; signal?: AbortSignal } = {},
 ): Promise<OpenPlatformClientResult> {
   const fetcher = opts.fetchImpl ?? fetch;
+  const defaultSignal = opts.signal;
   const session = new MutableCookieJar(cookies);
   let csrfToken: string | null = null;
   let apiOrigin = 'https://open.feishu.cn';
@@ -2750,6 +2784,10 @@ export async function createOpenPlatformApiClient(
   const request = async (
     path: string, body?: BodyInit, contentType?: string, opts: { idempotent?: boolean; signal?: AbortSignal } = {},
   ): Promise<unknown> => {
+    const signal = opts.signal && defaultSignal && opts.signal !== defaultSignal
+      ? AbortSignal.any([opts.signal, defaultSignal])
+      : opts.signal ?? defaultSignal;
+    throwIfAborted(signal);
     const url = `${apiOrigin}${path}`;
     const response = await session.fetchRaw(fetcher, url, {
       method: 'POST',
@@ -2761,8 +2799,8 @@ export async function createOpenPlatformApiClient(
         ...(contentType ? { 'content-type': contentType } : {}),
       },
       body,
-      ...(opts.signal ? { signal: opts.signal } : {}),
-    }, 10, opts);
+      ...(signal ? { signal } : {}),
+    }, 10, { ...opts, ...(signal ? { signal } : {}) });
     let data: any;
     try {
       data = await response.json();
@@ -2780,14 +2818,15 @@ export async function createOpenPlatformApiClient(
 
   const postJson: OpenPlatformPostJson = async (path, body, opts = {}) =>
     request(path, body === undefined ? undefined : JSON.stringify(body), body === undefined ? undefined : 'application/json', opts);
-  const postJsonIdempotent = async (path: string, body?: unknown): Promise<unknown> =>
+  const postJsonIdempotent: OpenPlatformApiClient['postJsonIdempotent'] = async (path, body, options = {}) =>
     request(
       path,
       body === undefined ? undefined : JSON.stringify(body),
       body === undefined ? undefined : 'application/json',
-      { idempotent: true },
+      { ...options, idempotent: true },
     );
-  const postForm = async (path: string, body: FormData): Promise<unknown> => request(path, body);
+  const postForm: OpenPlatformApiClient['postForm'] = async (path, body, options = {}) =>
+    request(path, body, undefined, options);
 
   return { ok: true, client: { apiOrigin, postJson, postJsonIdempotent, postForm }, identity };
 }
@@ -3014,6 +3053,31 @@ function isDefiniteTemplateRejection(err: unknown): boolean {
   return /^HTTP 404\b/.test(err.message);
 }
 
+function withOpenPlatformClientSignal(
+  client: OpenPlatformApiClient,
+  signal: AbortSignal | undefined,
+): OpenPlatformApiClient {
+  if (!signal) return client;
+  // Bind once at the client boundary so helper functions receiving postJson cannot
+  // accidentally drop cancellation. Check before every call: an abort received while
+  // an earlier request was in flight must prevent the next remote side effect.
+  return {
+    ...client,
+    postJson: (path, body, options = {}) => {
+      throwIfAborted(signal);
+      return client.postJson(path, body, { ...options, signal: options.signal ?? signal });
+    },
+    postJsonIdempotent: (path, body, options = {}) => {
+      throwIfAborted(signal);
+      return client.postJsonIdempotent(path, body, { ...options, signal: options.signal ?? signal });
+    },
+    postForm: (path, body, options = {}) => {
+      throwIfAborted(signal);
+      return client.postForm(path, body, { ...options, signal: options.signal ?? signal });
+    },
+  };
+}
+
 /**
  * 用已经登录的开放平台 Web session 创建一个企业自建应用并读取凭证。
  *
@@ -3037,6 +3101,7 @@ export async function createOpenPlatformAppWithClient(
     creatorUserId: string;
     autoAvoidApproval?: boolean;
     approvalMaxProbes?: number;
+    signal?: AbortSignal;
     onStatus?: (message: string) => void | Promise<void>;
   },
 ): Promise<{
@@ -3046,6 +3111,8 @@ export async function createOpenPlatformAppWithClient(
   approvalDisabledRefreshToken?: boolean;
   approvalCompatibility?: ApprovalCompatibilityOutcome;
 }> {
+  client = withOpenPlatformClientSignal(client, options.signal);
+  throwIfAborted(options.signal);
   const name = options.name.trim();
   if (!name) throw new Error('应用名称不能为空');
   if (!options.creatorUserId) throw new Error('创建应用缺少创建者 userId,无法完成上架启用');
@@ -3371,17 +3438,29 @@ export async function probeVcMeetingEventSubscription(
 export async function createFeishuOpenPlatformApp(
   options: CreateFeishuOpenPlatformAppOptions,
 ): Promise<CreateFeishuOpenPlatformAppResult> {
+  if (options.signal?.aborted) {
+    return { ok: false, reason: 'aborted', message: '用户已取消操作' };
+  }
   const prepared = await prepareFeishuWebSession(options);
   if (!prepared.ok) {
     return {
       ok: false,
       reason: prepared.reason,
-      message: `获取 Feishu Web session 失败: ${prepared.message}`,
+      message: prepared.reason === 'aborted' ? prepared.message : `获取 Feishu Web session 失败: ${prepared.message}`,
       sessionFile: prepared.sessionFile,
     };
   }
+  if (options.signal?.aborted) {
+    return { ok: false, reason: 'aborted', message: '用户已取消操作', sessionFile: prepared.sessionFile };
+  }
 
-  const clientResult = await createOpenPlatformApiClient(prepared.cookies, { fetchImpl: options.fetchImpl });
+  const clientResult = await createOpenPlatformApiClient(prepared.cookies, {
+    fetchImpl: options.fetchImpl,
+    signal: options.signal,
+  });
+  if (options.signal?.aborted) {
+    return { ok: false, reason: 'aborted', message: '用户已取消操作', sessionFile: prepared.sessionFile };
+  }
   if (!clientResult.ok) {
     return {
       ok: false,
@@ -3410,7 +3489,9 @@ export async function createFeishuOpenPlatformApp(
   }
 
   try {
+    throwIfAborted(options.signal);
     await options.onSessionReady?.({ source: prepared.source, identity: clientResult.identity });
+    throwIfAborted(options.signal);
     const credentials = await createOpenPlatformAppWithClient(clientResult.client, {
       ...options,
       creatorUserId: clientResult.identity.userId,
@@ -3424,6 +3505,17 @@ export async function createFeishuOpenPlatformApp(
       sessionIdentity: clientResult.identity,
     };
   } catch (err) {
+    if (
+      (err instanceof FeishuWebSessionError && err.reason === 'aborted')
+      || (options.signal?.aborted && !(err instanceof CreatedOpenPlatformAppError))
+    ) {
+      return {
+        ok: false,
+        reason: 'aborted',
+        message: '用户已取消操作',
+        sessionFile: prepared.sessionFile,
+      };
+    }
     const message = safeErrorMessage(err);
     return {
       ok: false,
@@ -3508,14 +3600,17 @@ async function validateFeishuWebSession(cookies: StoredCookie[], fetcher: typeof
 }
 
 async function loginFeishuWebSession(fetcher: typeof fetch, options: FeishuWebSessionOptions): Promise<StoredCookie[]> {
+  throwIfAborted(options.signal);
   const session = new MutableCookieJar([]);
   const redirectUrl = `${ASK_FEISHU_ORIGIN}/`;
   // Implements Feishu Web QR session login directly: initialize
   // `/accounts/qrlogin/init`, poll `/accounts/qrlogin/polling`, follow the
   // returned cross-login URI, then persist the resulting cookie jar privately.
-  const qrInit = await initFeishuQrLogin(session, fetcher, redirectUrl);
+  const qrInit = await initFeishuQrLogin(session, fetcher, redirectUrl, options.signal);
+  throwIfAborted(options.signal);
   const qrPayload = buildFeishuQrPayload(qrInit.token);
   const qrText = await renderTerminalQr(qrPayload);
+  throwIfAborted(options.signal);
   const onQrCode = options.onQrCode ?? defaultPrintFeishuQrCode;
   await onQrCode({ qrText, qrPayload });
 
@@ -3525,24 +3620,28 @@ async function loginFeishuWebSession(fetcher: typeof fetch, options: FeishuWebSe
   let lastStatusMessage = '';
   let scanConfirmationEmitted = false;
   for (;;) {
+    throwIfAborted(options.signal);
     if (Date.now() - start > maxWaitMs) {
       throw new FeishuWebSessionError('等待飞书扫码超时', 'timeout');
     }
 
-    const poll = await pollFeishuQrLogin(session, fetcher, qrInit.flowKey);
+    const poll = await pollFeishuQrLogin(session, fetcher, qrInit.flowKey, options.signal);
+    throwIfAborted(options.signal);
     if (poll.status === 2 && !scanConfirmationEmitted) {
       scanConfirmationEmitted = true;
       await options.onQrScanConfirmed?.({ confirmedAt: Date.now() });
     }
     if (poll.nextStep === 'enter_app') {
       if (poll.crossLoginUri) {
-        await session.fetchRaw(fetcher, poll.crossLoginUri, { method: 'GET' });
+        await session.fetchRaw(fetcher, poll.crossLoginUri, { method: 'GET', ...(options.signal ? { signal: options.signal } : {}) });
       }
-      await session.fetchRaw(fetcher, redirectUrl, { method: 'GET' });
+      await session.fetchRaw(fetcher, redirectUrl, { method: 'GET', ...(options.signal ? { signal: options.signal } : {}) });
+      throwIfAborted(options.signal);
       const cookies = session.toJSON();
       if (!await validateFeishuWebSession(cookies, fetcher)) {
         throw new FeishuWebSessionError('飞书扫码已完成，但没有拿到可复用的 Web session', 'invalid_session');
       }
+      throwIfAborted(options.signal);
       return cookies;
     }
 
@@ -3554,7 +3653,7 @@ async function loginFeishuWebSession(fetcher: typeof fetch, options: FeishuWebSe
     if (poll.status === 5) {
       throw new FeishuWebSessionError('二维码已过期', 'qr_expired');
     }
-    await sleep(pollIntervalMs);
+    await sleep(pollIntervalMs, options.signal);
   }
 }
 
@@ -3562,6 +3661,7 @@ async function initFeishuQrLogin(
   session: MutableCookieJar,
   fetcher: typeof fetch,
   authorizeUrl: string,
+  signal?: AbortSignal,
 ): Promise<{ flowKey: string; token: string }> {
   const endpoint = `${FEISHU_ACCOUNTS_ORIGIN}/accounts/qrlogin/init?_r${10000 + Math.floor(Math.random() * 80000)}=${Date.now()}`;
   const response = await session.fetchRaw(fetcher, endpoint, {
@@ -3576,6 +3676,7 @@ async function initFeishuQrLogin(
       biz_type: null,
       redirect_uri: authorizeUrl,
     }),
+    ...(signal ? { signal } : {}),
   });
   const data = await response.json();
   assertFeishuApiOk(data, 'Feishu QR init failed');
@@ -3593,6 +3694,7 @@ async function pollFeishuQrLogin(
   session: MutableCookieJar,
   fetcher: typeof fetch,
   flowKey: string,
+  signal?: AbortSignal,
 ): Promise<{ nextStep: string | null; status: number | null; crossLoginUri: string | null }> {
   const endpoint = `${FEISHU_ACCOUNTS_ORIGIN}/accounts/qrlogin/polling?_r${10000 + Math.floor(Math.random() * 80000)}=${Date.now()}`;
   const response = await session.fetchRaw(fetcher, endpoint, {
@@ -3605,6 +3707,7 @@ async function pollFeishuQrLogin(
       'content-type': 'application/json',
     },
     body: JSON.stringify({ biz_type: null }),
+    ...(signal ? { signal } : {}),
   });
   const data = await response.json();
   assertFeishuApiOk(data, 'Feishu QR polling failed');
@@ -3919,8 +4022,27 @@ async function renderTerminalQr(payload: string): Promise<string> {
   return await new Promise((resolve) => qrcode.generate(payload, { small: true }, qr => resolve(qr)));
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw new FeishuWebSessionError('用户已取消扫码登录', 'aborted');
+  }
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) {
+    return Promise.reject(new FeishuWebSessionError('用户已取消扫码登录', 'aborted'));
+  }
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new FeishuWebSessionError('用户已取消扫码登录', 'aborted'));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 function assertFeishuApiOk(payload: unknown, message: string): void {
@@ -3935,8 +4057,9 @@ function isFeishuLoginLikeValue(value: string): boolean {
   return normalized.includes('/accounts/') || normalized.includes('/login') || normalized.includes('qrlogin');
 }
 
-function classifyFeishuLoginError(err: unknown): FeishuWebSessionFailureReason {
+function classifyFeishuLoginError(err: unknown, signal?: AbortSignal): FeishuWebSessionFailureReason {
   if (err instanceof FeishuWebSessionError) return err.reason;
+  if (signal?.aborted || (err instanceof Error && err.name === 'AbortError')) return 'aborted';
   const message = err instanceof Error ? err.message : String(err);
   if (/timeout|timed out|超时/i.test(message)) return 'timeout';
   if (/expired|过期/i.test(message)) return 'qr_expired';

@@ -17,6 +17,14 @@ const SHORTCUT = [
 ].join('\n');
 const RESOLVED = SHORTCUT.replace('  ? for shortcuts',
   '  GPT-6-Astra · /tmp/native-control · Context —\n  ☢ Full Access · ? for shortcuts · ← for agents');
+// The cold-resumed TraeX viewport can use half-blocks around the composer.
+const SOLID_RESOLVED = [
+  '▄'.repeat(160),
+  '❯ Implement {feature}',
+  '▀'.repeat(160),
+  '  model · /tmp/native-control · Context 58% left',
+  '  ☢ Full Access (shift+tab to cycle) · ? for shortcuts · ← for agents',
+].join('\n');
 // Real 0.214.1 [tui] status_line=[] + approval_policy=never: no model or
 // permission cells remain, but the native post-initialization content does.
 const INITIALIZED_SINGLE_HINT = [
@@ -102,6 +110,16 @@ describe('native thread readiness is distinct from a provisional input box', () 
     }
   });
 
+  it('distinguishes a half-block rule from a draft or a provisional composer', () => {
+    const halfBlock = '▀'.repeat(160);
+    const draft = SOLID_RESOLVED.replace(halfBlock, `  ${halfBlock}`);
+    const provisional = SOLID_RESOLVED.split('\n').slice(0, 3).concat('  ? for shortcuts').join('\n');
+    expect(ready(SOLID_RESOLVED)).toBe(true);
+    expect(ready(draft, { nativeState: 'idle' })).toBe(false);
+    expect(ready(provisional, { nativeState: 'idle' })).toBe(false);
+    expect(ready(SOLID_RESOLVED, { nativeState: 'idle', blockingOwner: true })).toBe(false);
+  });
+
   it('does not treat other native states or a blocking owner as idle evidence', () => {
     for (const nativeState of ['working', 'blocked', 'error', 'clear'] as const) {
       expect(ready(SHORTCUT, { nativeState })).toBe(false);
@@ -184,7 +202,10 @@ describe('the actual pending-input writer honors native startup evidence', () =>
     expect(h.scope.traexNativeStartupInputPending).toBe(true);
   });
 
-  it('holds through an idle on the provisional composer and delivers once the footer resolves', async () => {
+  it.each([
+    ['line', RESOLVED],
+    ['half-block', SOLID_RESOLVED],
+  ])('holds through a provisional idle and delivers once on the %s composer', async (_layout, screen) => {
     const h = workerFence();
     h.scope.cliAdapter.writeInput = vi.fn(async () => ({ submitted: true }));
     await h.flush();
@@ -192,7 +213,7 @@ describe('the actual pending-input writer honors native startup evidence', () =>
     await h.flush();
     expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
     expect(h.scope.traexNativeStartupInputPending).toBe(true);
-    h.scope.screen = RESOLVED;
+    h.scope.screen = screen;
     await h.flush();
     await h.flush();
     expect(h.scope.log.mock.calls.filter(([line]: [string]) => line.startsWith('writeInput threw:'))).toEqual([]);

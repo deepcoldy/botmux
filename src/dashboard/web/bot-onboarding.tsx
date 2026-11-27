@@ -8,6 +8,7 @@ import { t } from './ui.js';
 import { cliAvailabilityStatus, useCliAvailability } from './cli-availability.js';
 
 export const OPEN_BOT_ONBOARDING_EVENT = 'botmux:open-bot-onboarding';
+export const BOT_ONBOARDING_COMPLETED_EVENT = 'botmux:bot-onboarding-completed';
 
 /** 克隆源 Bot 里会被 cloneBotConfig 带过去、且表单里也有对应项的字段。 */
 export type CloneSourceDefaults = {
@@ -73,7 +74,8 @@ type OnboardingJob = {
   permissionStatusMsg?: string;
   appId?: string;
   appName?: string;
-  registrationMode?: 'web' | 'compat' | 'local';
+  brand?: 'feishu' | 'lark';
+  registrationMode?: 'web' | 'compat' | 'local' | 'manual';
   cliId?: string;
   workingDir?: string;
   addedBotIndex?: number;
@@ -125,7 +127,11 @@ type CliOptionsState = {
 };
 
 type OnboardingFormState = {
-  connection: 'feishu' | 'local';
+  connection: 'feishu' | 'manual' | 'local';
+  brand: 'feishu' | 'lark';
+  appId: string;
+  appSecret: string;
+  owner: string;
   appName: string;
   cliId: string;
   dirMode: 'fixed' | 'card';
@@ -136,7 +142,7 @@ type OnboardingFormState = {
 
 type ViewState =
   | { kind: 'form'; error?: string }
-  | { kind: 'job'; job: OnboardingJob; ownerError?: string };
+  | { kind: 'job'; job: OnboardingJob; ownerError?: string; cancelError?: string };
 
 const DEFAULT_CLI_OPTION: CliOption = { id: 'claude-code', label: 'Claude' };
 const DEFAULT_TTADK_MODEL = 'glm-5.1';
@@ -154,6 +160,10 @@ function defaultCliOptionsState(): CliOptionsState {
 function defaultFormState(): OnboardingFormState {
   return {
     connection: 'feishu',
+    brand: 'feishu',
+    appId: '',
+    appSecret: '',
+    owner: '',
     appName: '',
     cliId: DEFAULT_CLI_OPTION.id,
     dirMode: 'fixed',
@@ -166,11 +176,34 @@ function defaultFormState(): OnboardingFormState {
 export function isOnboardingSubmitDisabled(
   submitting: boolean,
   sessionMode: 'checking' | 'reuse' | 'qr',
-  connection: 'feishu' | 'local' = 'feishu',
+  connection: 'feishu' | 'manual' | 'local' = 'feishu',
 ): boolean {
   if (submitting) return true;
-  if (connection === 'local') return false;
+  if (connection === 'local' || connection === 'manual') return false;
   return sessionMode === 'checking';
+}
+
+/**
+ * Pick an initial AI CLI option for fresh setups:
+ * - Keep `currentCliId` when it is present and available.
+ * - Otherwise auto-select the first detected local CLI executable (`Boolean(option.command)`),
+ *   so users with e.g. Codex installed (without Claude) are not blocked on `claude-code`,
+ *   while API-only entries without a local binary (`mira`/`riff`) are never silently chosen.
+ * - If no local CLI is installed yet, stay on `currentCliId` so the install hint is shown.
+ */
+export function selectDefaultOnboardingCliId(
+  currentCliId: string,
+  options: readonly Pick<CliOption, 'id' | 'available' | 'availabilityStatus' | 'command'>[],
+): string {
+  const isAvailable = (opt: Pick<CliOption, 'available' | 'availabilityStatus'>) => (
+    opt.availabilityStatus === 'available' || opt.available === true
+  );
+  const current = options.find(item => item.id === currentCliId);
+  if (current && isAvailable(current)) return current.id;
+  const detectedLocal = options.find(item => isAvailable(item) && Boolean(item.command));
+  if (detectedLocal) return detectedLocal.id;
+  if (current) return current.id;
+  return options[0]?.id ?? DEFAULT_CLI_OPTION.id;
 }
 
 function caughtErrorText(error: unknown): string {
@@ -206,6 +239,9 @@ export function statusText(job: OnboardingJob): string {
     if (job.registrationMode === 'local') {
       return t('botOnboarding.completedLocal', { name: job.appName ?? t('botOnboarding.botFallback') });
     }
+    if (job.registrationMode === 'manual') {
+      return t('botOnboarding.completedManual', { name: job.appName ?? t('botOnboarding.botFallback') });
+    }
     // 审核中、或复查发现仍是草稿/状态未知时，都不能说「已可使用」。
     if (waitingForEnterpriseReview(job.permission)) {
       return t('botOnboarding.completedReviewPending', { name: job.appName ?? t('botOnboarding.botFallback') });
@@ -216,12 +252,14 @@ export function statusText(job: OnboardingJob): string {
     return t('botOnboarding.completed', { name: job.appName ?? t('botOnboarding.botFallback') });
   }
   if (job.status === 'failed') {
+    if (job.registrationMode === 'manual') return t('botOnboarding.createFailedTitle');
     if (job.appId) return t('botOnboarding.partialFailureTitle');
     if (job.error === 'qr_expired') return t('botOnboarding.qrExpiredTitle');
     if (isSessionFailure(job.error)) return t('botOnboarding.authIncompleteTitle');
     return t('botOnboarding.createFailedTitle');
   }
   if (job.registrationMode === 'local') return t('botOnboarding.startingLocal');
+  if (job.registrationMode === 'manual') return t('botOnboarding.startingManual');
   return t('botOnboarding.starting');
 }
 
@@ -303,10 +341,16 @@ function syncModelForCli(
   return { ...form, cliId, model };
 }
 
-function normalizeFormForOptions(form: OnboardingFormState, cliState: CliOptionsState): OnboardingFormState {
-  const cliId = cliState.options.some(item => item.id === form.cliId)
-    ? form.cliId
-    : cliState.options[0]?.id ?? DEFAULT_CLI_OPTION.id;
+function normalizeFormForOptions(
+  form: OnboardingFormState,
+  cliState: CliOptionsState,
+  autoSelectAvailableCli = false,
+): OnboardingFormState {
+  const cliId = autoSelectAvailableCli
+    ? selectDefaultOnboardingCliId(form.cliId, cliState.options)
+    : cliState.options.some(item => item.id === form.cliId)
+      ? form.cliId
+      : cliState.options[0]?.id ?? DEFAULT_CLI_OPTION.id;
   return syncModelForCli({
     ...form,
   }, cliId, cliState);
@@ -553,33 +597,66 @@ function onboardingOptionLabel<T extends string>(
 }
 
 export function onboardingRetryMode(job: {
-  registrationMode?: 'web' | 'compat' | 'local';
-}): 'web' | 'local' {
-  return job.registrationMode === 'local' ? 'local' : 'web';
+  registrationMode?: 'web' | 'compat' | 'local' | 'manual';
+}): 'web' | 'local' | 'manual' {
+  if (job.registrationMode === 'local') return 'local';
+  if (job.registrationMode === 'manual') return 'manual';
+  return 'web';
 }
 
 function OnboardingJobView(props: {
   view: Extract<ViewState, { kind: 'job' }>;
+  allowManual: boolean;
+  cancelling: boolean;
   ownerInput: string;
   ownerIdInput: string;
   onOwnerInputChange(value: string): void;
   onOwnerIdInputChange(value: string): void;
   onSubmitOwner(job: OnboardingJob, owner: string, ownerId: string): void;
   onRetry(mode: 'web' | 'compat' | 'local'): void;
+  onBackToManualForm(prefill?: { appId?: string; brand?: 'feishu' | 'lark' }): void;
   onClose(): void;
 }): React.JSX.Element {
-  const { job, ownerError } = props.view;
+  const { job, ownerError, cancelError } = props.view;
+  const manualSteps = job.status === 'completed' && job.registrationMode === 'manual'
+    ? (job.remainingSteps ?? [])
+    : [];
   return (
     <>
       <p className={`onboarding-status status-${job.status}`}>{statusText(job)}</p>
       {job.status === 'waiting_for_scan' && job.qrDataUrl ? (
         <QrCard dataUrl={job.qrDataUrl} alt={t('botOnboarding.qrAlt')} link={job.qrUrl} />
       ) : null}
+      {cancelError ? <p className="form-error">{cancelError}</p> : null}
+      {job.status === 'waiting_for_scan' ? (
+        <div className="actions onboarding-actions">
+          <button type="button" disabled={props.cancelling} onClick={props.onClose}>
+            {t('botOnboarding.cancel')}
+          </button>
+          {props.allowManual ? (
+            <button type="button" disabled={props.cancelling} onClick={() => props.onBackToManualForm()}>
+              {t('botOnboarding.switchToManual')}
+            </button>
+          ) : null}
+        </div>
+      ) : null}
       {job.status === 'waiting_for_platform_scan' && job.platformQrDataUrl ? (
         <QrCard dataUrl={job.platformQrDataUrl} alt={t('botOnboarding.platformQrAlt')} />
       ) : null}
       <OnboardingMeta job={job} />
       <PermissionSummary job={job} />
+      {manualSteps.length > 0 ? (
+        <>
+          <p className="hint-warn">{t('botOnboarding.manualStepsHint')}</p>
+          <ol className="onboarding-steps">
+            {manualSteps.map(step => (
+              <li key={`${step.title}:${step.url}`}>
+                <a href={step.url} target="_blank" rel="noopener">{step.title}</a>
+              </li>
+            ))}
+          </ol>
+        </>
+      ) : null}
       {job.status === 'needs_owner' ? (
         <form className="onboarding-form" id="ob-owner-form" onSubmit={event => {
           event.preventDefault();
@@ -621,20 +698,31 @@ function OnboardingJobView(props: {
         </form>
       ) : null}
       {job.status === 'completed' ? (
-        <p className="hint-ok">{job.registrationMode === 'local'
-          ? (job.liveStarted ? t('botOnboarding.liveOkLocal') : t('botOnboarding.restartHintLocal'))
-          : (job.liveStarted ? t('botOnboarding.liveOk') : t('botOnboarding.restartHint'))}</p>
+        job.liveStarted === false ? (
+          <>
+            <p className="hint-warn">
+              {job.registrationMode === 'local' ? t('botOnboarding.restartHintLocal') : t('botOnboarding.restartHint')}
+            </p>
+            {job.liveStartMessage ? <p className="hint-warn">{job.liveStartMessage}</p> : null}
+          </>
+        ) : (
+          <p className="hint-ok">{job.registrationMode === 'local'
+            ? (job.liveStarted ? t('botOnboarding.liveOkLocal') : t('botOnboarding.restartHintLocal'))
+            : (job.liveStarted ? t('botOnboarding.liveOk') : t('botOnboarding.restartHint'))}</p>
+        )
       ) : null}
       {job.status === 'failed' ? (
         <>
           <p className="hint-warn">
-            {job.appId
-              ? t('botOnboarding.partialFailureDescription')
-              : job.error === 'qr_expired'
-                ? t('botOnboarding.qrExpiredDescription')
-                : isSessionFailure(job.error)
-                  ? t('botOnboarding.authIncompleteDescription')
-                  : t('botOnboarding.createFailedDescription')}
+            {job.registrationMode === 'manual'
+              ? (job.message ?? t('botOnboarding.createFailedDescription'))
+              : job.appId
+                ? t('botOnboarding.partialFailureDescription')
+                : job.error === 'qr_expired'
+                  ? t('botOnboarding.qrExpiredDescription')
+                  : isSessionFailure(job.error)
+                    ? t('botOnboarding.authIncompleteDescription')
+                    : t('botOnboarding.createFailedDescription')}
           </p>
           <details className="onboarding-technical">
             <summary>{t('botOnboarding.technicalDetails')}</summary>
@@ -642,13 +730,26 @@ function OnboardingJobView(props: {
           </details>
           <div className="actions onboarding-actions">
             <button type="button" onClick={props.onClose}>{t('botOnboarding.close')}</button>
-            {!job.appId ? (
+            {job.registrationMode === 'manual' ? (
+              <button
+                type="button"
+                className="primary onboarding-submit"
+                onClick={() => props.onBackToManualForm({ appId: job.appId, brand: job.brand })}
+              >
+                {t('botOnboarding.backToForm')}
+              </button>
+            ) : !job.appId ? (
               onboardingRetryMode(job) === 'local' ? (
                 <button type="button" className="primary onboarding-submit" onClick={() => props.onRetry('local')}>
                   {t('botOnboarding.retry')}
                 </button>
               ) : (
                 <>
+                  {props.allowManual ? (
+                    <button type="button" onClick={() => props.onBackToManualForm()}>
+                      {t('botOnboarding.switchToManual')}
+                    </button>
+                  ) : null}
                   <button type="button" onClick={() => props.onRetry('compat')}>{t('botOnboarding.compatibilityMode')}</button>
                   <button type="button" className="primary onboarding-submit" onClick={() => props.onRetry('web')}>
                     {job.error === 'qr_expired'
@@ -659,6 +760,14 @@ function OnboardingJobView(props: {
                   </button>
                 </>
               )
+            ) : props.allowManual ? (
+              <button
+                type="button"
+                className="primary onboarding-submit"
+                onClick={() => props.onBackToManualForm({ appId: job.appId, brand: job.brand })}
+              >
+                {t('botOnboarding.switchToManual')}
+              </button>
             ) : null}
           </div>
         </>
@@ -674,16 +783,27 @@ function OnboardingForm(props: {
   cliState: CliOptionsState;
   form: OnboardingFormState;
   allowLocal: boolean;
+  allowManual: boolean;
+  cliRecheckSeq: number;
   sessionMode: 'checking' | 'reuse' | 'qr';
   error?: string;
   submitting: boolean;
   onFormChange(form: OnboardingFormState): void;
+  onCliChange(cliId: string): void;
+  onRecheckCli(): void;
   onSessionModeChange(mode: 'reuse' | 'qr'): void;
   onSubmit(event: FormEvent<HTMLFormElement>): void;
   onClose(): void;
 }): React.JSX.Element {
+  const [showSecret, setShowSecret] = useState(false);
   const selectedCli = props.cliState.options.find(option => option.id === props.form.cliId);
-  const availabilityStatus = useCliAvailability(props.form.cliId, selectedCli);
+  const availabilityStatus = useCliAvailability(
+    props.form.cliId,
+    selectedCli,
+    undefined,
+    String(props.cliRecheckSeq),
+    props.cliRecheckSeq > 0 ? { refresh: true } : undefined,
+  );
   const modelDisabled = selectedCli?.gateway === 'ttadk' && selectedCli.acceptsModel === false;
   // live 探测当前 CLI 的可用模型（ttadk 网关项保持现状，只用静态建议列表）。
   const [detectedModels, setDetectedModels] = useState<{ models: string[]; source: 'live' | 'static' } | null>(null);
@@ -724,9 +844,16 @@ function OnboardingForm(props: {
   ];
   const connectionOptions: Array<{ value: OnboardingFormState['connection']; label: string }> = [
     { value: 'feishu', label: t('botOnboarding.connectionFeishu') },
+    ...(props.allowManual ? [{ value: 'manual' as const, label: t('botOnboarding.connectionManual') }] : []),
     ...(props.allowLocal ? [{ value: 'local' as const, label: t('botOnboarding.connectionLocal') }] : []),
   ];
+  const brandOptions: Array<{ value: OnboardingFormState['brand']; label: string }> = [
+    { value: 'feishu', label: t('botOnboarding.brandFeishu') },
+    { value: 'lark', label: t('botOnboarding.brandLark') },
+  ];
   const local = props.form.connection === 'local' && props.allowLocal;
+  const manual = props.form.connection === 'manual' && props.allowManual;
+  const effectiveConnection: OnboardingFormState['connection'] = local ? 'local' : manual ? 'manual' : 'feishu';
 
   return (
     <form id="onboarding-form" className="onboarding-form" onSubmit={props.onSubmit}>
@@ -736,16 +863,18 @@ function OnboardingForm(props: {
           id="ob-connection"
           className="onboarding-menu"
           ariaLabel={t('botOnboarding.connectionLabel')}
-          label={onboardingOptionLabel(connectionOptions, local ? 'local' : 'feishu')}
-          value={local ? 'local' : 'feishu'}
+          label={onboardingOptionLabel(connectionOptions, effectiveConnection)}
+          value={effectiveConnection}
           options={connectionOptions}
           onChange={connection => props.onFormChange({ ...props.form, connection })}
         />
         <small className="onboarding-field-hint">{local
           ? t('botOnboarding.connectionLocalHint')
-          : t('botOnboarding.connectionFeishuHint')}</small>
+          : manual
+            ? t('botOnboarding.connectionManualHint')
+            : t('botOnboarding.connectionFeishuHint')}</small>
       </div>
-      {local ? null : <div className="onboarding-session" aria-live="polite">
+      {effectiveConnection === 'feishu' ? <div className="onboarding-session" aria-live="polite">
         {props.sessionMode === 'checking' ? (
           <p>{t('botOnboarding.sessionChecking')}</p>
         ) : props.cliState.webSession.status === 'ready' ? (
@@ -781,7 +910,72 @@ function OnboardingForm(props: {
             <small>{t('botOnboarding.sessionScanRequiredHint')}</small>
           </div>
         )}
-      </div>}
+      </div> : null}
+      {manual ? (
+        <>
+          <div className="onboarding-field">
+            <span>{t('botOnboarding.brandLabel')}</span>
+            <DropdownMenu
+              id="ob-brand"
+              className="onboarding-menu"
+              ariaLabel={t('botOnboarding.brandLabel')}
+              label={onboardingOptionLabel(brandOptions, props.form.brand)}
+              value={props.form.brand}
+              options={brandOptions}
+              onChange={brand => props.onFormChange({ ...props.form, brand })}
+            />
+          </div>
+          <label className="onboarding-field">
+            <span>{t('botOnboarding.manualAppIdLabel')}</span>
+            <input
+              id="ob-app-id"
+              type="text"
+              maxLength={68}
+              value={props.form.appId}
+              placeholder={t('botOnboarding.manualAppIdPlaceholder')}
+              autoComplete="off"
+              spellCheck={false}
+              onChange={event => props.onFormChange({ ...props.form, appId: event.currentTarget.value })}
+            />
+          </label>
+          <label className="onboarding-field">
+            <span>{t('botOnboarding.manualAppSecretLabel')}</span>
+            <div className="onboarding-secret-wrap">
+              <input
+                id="ob-app-secret"
+                type={showSecret ? 'text' : 'password'}
+                maxLength={256}
+                value={props.form.appSecret}
+                placeholder={t('botOnboarding.manualAppSecretPlaceholder')}
+                autoComplete="new-password"
+                spellCheck={false}
+                onChange={event => props.onFormChange({ ...props.form, appSecret: event.currentTarget.value })}
+              />
+              <button
+                type="button"
+                className="onboarding-secret-toggle"
+                onClick={() => setShowSecret(v => !v)}
+              >
+                {showSecret ? t('botOnboarding.manualHideSecret') : t('botOnboarding.manualShowSecret')}
+              </button>
+            </div>
+          </label>
+          <label className="onboarding-field">
+            <span>{t('botOnboarding.manualOwnerLabel')}</span>
+            <input
+              id="ob-manual-owner"
+              type="text"
+              inputMode="email"
+              value={props.form.owner}
+              placeholder={t('botOnboarding.manualOwnerPlaceholder')}
+              autoComplete="off"
+              spellCheck={false}
+              onChange={event => props.onFormChange({ ...props.form, owner: event.currentTarget.value })}
+            />
+            <small className="onboarding-field-hint">{t('botOnboarding.manualOwnerHint')}</small>
+          </label>
+        </>
+      ) : null}
       <label className="onboarding-field">
         <span>{local ? t('botOnboarding.localNameLabel') : t('botOnboarding.appNameLabel')}</span>
         <input
@@ -810,14 +1004,17 @@ function OnboardingForm(props: {
           searchable
           searchPlaceholder={t('common.dropdownSearch')}
           searchEmptyLabel={t('common.dropdownSearchEmpty')}
-          onChange={cliId => {
-            props.onFormChange(syncModelForCli(props.form, cliId, props.cliState));
-          }}
+          onChange={cliId => props.onCliChange(cliId)}
         />
         {availabilityStatus === 'unavailable' ? (
-          <small className="hint-warn">
-            {t('botOnboarding.cliMissingHint', { command: selectedCli?.command ?? props.form.cliId })}
-          </small>
+          <div className="onboarding-cli-missing-row">
+            <small className="hint-warn">
+              {t('botOnboarding.cliMissingHint', { command: selectedCli?.command ?? props.form.cliId })}
+            </small>
+            <button type="button" className="onboarding-session-action" onClick={props.onRecheckCli}>
+              {t('botOnboarding.cliRecheck')}
+            </button>
+          </div>
         ) : <small className="onboarding-field-hint">{props.form.cliId}</small>}
       </div>
       <div className="onboarding-field">
@@ -865,7 +1062,7 @@ function OnboardingForm(props: {
           />
         </div>
       ) : null}
-      {!local ? (
+      {effectiveConnection === 'feishu' ? (
         <label className="onboarding-field onboarding-checkbox">
           <span className="onboarding-checkbox-row">
             <input
@@ -889,15 +1086,21 @@ function OnboardingForm(props: {
           // form never blocks the dashboard event loop on shell rc files. It is
           // a useful warning, not an authoritative gate: submit runs the full
           // shell-aware server check and returns cli_not_found when necessary.
-          disabled={isOnboardingSubmitDisabled(props.submitting, props.sessionMode, local ? 'local' : 'feishu')}
+          disabled={isOnboardingSubmitDisabled(props.submitting, props.sessionMode, effectiveConnection)}
         >
           {props.submitting
-            ? (local ? t('botOnboarding.startingLocal') : t('botOnboarding.starting'))
+            ? (local
+              ? t('botOnboarding.startingLocal')
+              : manual
+                ? t('botOnboarding.startingManual')
+                : t('botOnboarding.starting'))
             : local
               ? t('botOnboarding.createLocal')
-              : props.sessionMode === 'reuse'
-              ? t('botOnboarding.confirmReuse')
-              : t('botOnboarding.startScan')}
+              : manual
+                ? t('botOnboarding.createManual')
+                : props.sessionMode === 'reuse'
+                  ? t('botOnboarding.confirmReuse')
+                  : t('botOnboarding.startScan')}
         </button>
       </div>
     </form>
@@ -907,26 +1110,41 @@ function OnboardingForm(props: {
 export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): React.JSX.Element {
   const dialogRef = useRef<HTMLDialogElement | null>(null);
   const pollTimerRef = useRef<number | null>(null);
+  const pollSeqRef = useRef(0);
+  const pollAbortRef = useRef<AbortController | null>(null);
   const loadSeqRef = useRef(0);
+  const startSeqRef = useRef(0);
+  const cliTouchedRef = useRef(false);
+  const completedNotifiedJobIdRef = useRef<string | null>(null);
+  const cancellingRef = useRef(false);
   const [cliState, setCliState] = useState<CliOptionsState>(() => defaultCliOptionsState());
   const [form, setForm] = useState<OnboardingFormState>(() => defaultFormState());
+  const [cliRecheckSeq, setCliRecheckSeq] = useState(0);
   const [sessionMode, setSessionMode] = useState<'checking' | 'reuse' | 'qr'>('checking');
   const [view, setView] = useState<ViewState>({ kind: 'form' });
+  const viewRef = useRef<ViewState>(view);
+  viewRef.current = view;
   const [submitting, setSubmitting] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
   const [ownerInput, setOwnerInput] = useState('');
   const [ownerIdInput, setOwnerIdInput] = useState('');
 
   const stopPolling = useCallback(() => {
+    pollSeqRef.current += 1;
+    pollAbortRef.current?.abort();
+    pollAbortRef.current = null;
     if (pollTimerRef.current !== null) {
       window.clearInterval(pollTimerRef.current);
       pollTimerRef.current = null;
     }
   }, []);
 
-  const close = useCallback(() => {
+  const finishClose = useCallback(() => {
+    startSeqRef.current += 1;
     stopPolling();
     cloneSourceAppId = undefined;
     cloneSourceDefaults = undefined;
+    setForm(current => (current.appSecret ? { ...current, appSecret: '' } : current));
     props.onClose();
   }, [props, stopPolling]);
 
@@ -937,47 +1155,75 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
       setOwnerInput(job.suggestedOwner ?? '');
       setOwnerIdInput('');
     }
+    if (job.status === 'completed') {
+      setForm(current => (current.appSecret ? { ...current, appSecret: '' } : current));
+      if (job.id && completedNotifiedJobIdRef.current !== job.id) {
+        completedNotifiedJobIdRef.current = job.id;
+        window.dispatchEvent(new CustomEvent(BOT_ONBOARDING_COMPLETED_EVENT, {
+          detail: { appId: job.appId, registrationMode: job.registrationMode },
+        }));
+      }
+    }
     if (shouldStopPolling(job)) stopPolling();
   }, [stopPolling]);
 
-  const pollJob = useCallback(async (id: string) => {
-    const res = await fetch(`/api/bot-onboarding/${encodeURIComponent(id)}`);
+  const pollJob = useCallback(async (id: string, seq: number, signal?: AbortSignal) => {
+    const res = await fetch(`/api/bot-onboarding/${encodeURIComponent(id)}`, signal ? { signal } : undefined);
+    if (pollSeqRef.current !== seq) return;
     const body = await res.json();
+    if (pollSeqRef.current !== seq) return;
     if (!res.ok || !body?.job) throw new Error(body?.error ?? `http_${res.status}`);
     applyJob(body.job as OnboardingJob);
   }, [applyJob]);
 
   const startPolling = useCallback((id: string, registrationMode?: OnboardingJob['registrationMode']) => {
     stopPolling();
+    const seq = pollSeqRef.current;
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    pollAbortRef.current = controller;
     pollTimerRef.current = window.setInterval(() => {
-      void pollJob(id).catch(error => {
+      void pollJob(id, seq, controller?.signal).catch(error => {
+        if (pollSeqRef.current !== seq) return;
         stopPolling();
         setView({ kind: 'job', job: { id, status: 'failed', message: caughtErrorText(error), registrationMode } });
       });
     }, 1200);
   }, [pollJob, stopPolling]);
 
-  const resetToForm = useCallback(() => {
-    stopPolling();
+  const refreshCliOptions = useCallback((autoSelectCli: boolean) => {
     const seq = loadSeqRef.current + 1;
     loadSeqRef.current = seq;
+    void fetchCliOptions().then(next => {
+      if (loadSeqRef.current !== seq) return;
+      setCliState(next);
+      setForm(current => normalizeFormForOptions(
+        current,
+        next,
+        autoSelectCli && !cliTouchedRef.current && !cloneSourceDefaults?.cliId,
+      ));
+      setSessionMode(prev => (prev === 'checking'
+        ? (next.webSession.status === 'ready' ? 'reuse' : 'qr')
+        : prev));
+    });
+  }, []);
+
+  const resetToForm = useCallback(() => {
+    stopPolling();
+    cliTouchedRef.current = false;
+    completedNotifiedJobIdRef.current = null;
     const initialCliState = defaultCliOptionsState();
     setCliState(initialCliState);
     // 克隆模式下用源 Bot 的值开局，让表单显示真正会生效的配置（后端克隆会用
     // 源 Bot 覆盖这几项）；普通新建仍是原来的默认值。
     setForm(applyCloneDefaults(defaultFormState(), cloneSourceDefaults));
+    setCliRecheckSeq(0);
     setSessionMode('checking');
     setView({ kind: 'form' });
     setSubmitting(false);
     setOwnerInput('');
     setOwnerIdInput('');
-    void fetchCliOptions().then(next => {
-      if (loadSeqRef.current !== seq) return;
-      setCliState(next);
-      setForm(current => normalizeFormForOptions(current, next));
-      setSessionMode(next.webSession.status === 'ready' ? 'reuse' : 'qr');
-    });
-  }, [stopPolling]);
+    refreshCliOptions(true);
+  }, [refreshCliOptions, stopPolling]);
 
   useEffect(() => {
     if (props.open) {
@@ -1001,10 +1247,11 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
   useEffect(() => () => stopPolling(), [stopPolling]);
 
   const startOnboarding = useCallback(async (
-    registrationMode: 'web' | 'compat' | 'local',
+    registrationMode: 'web' | 'compat' | 'local' | 'manual',
     sessionModeOverride?: 'reuse' | 'qr',
   ) => {
     stopPolling();
+    const startSeq = ++startSeqRef.current;
     setSubmitting(true);
     setView({ kind: 'job', job: { id: '', status: 'starting', registrationMode } });
     try {
@@ -1024,15 +1271,29 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
           appName: registrationMode === 'compat' ? undefined : form.appName.trim() || undefined,
           registrationMode,
           ...(registrationMode === 'web' ? { sessionMode: effectiveSessionMode, expectedIdentity } : {}),
+          ...(registrationMode === 'manual' ? {
+            brand: form.brand,
+            appId: form.appId.trim(),
+            appSecret: form.appSecret.trim(),
+            owner: form.owner.trim(),
+          } : {}),
           cliId: form.cliId,
           workingDir: form.workingDir.trim(),
           dirMode: form.dirMode,
           model: form.model.trim() || undefined,
-          ...(registrationMode === 'local' ? {} : { cloneSourceAppId, autoAvoidApproval: form.autoAvoidApproval }),
+          ...(registrationMode === 'local' || registrationMode === 'manual'
+            ? {}
+            : { cloneSourceAppId, autoAvoidApproval: form.autoAvoidApproval }),
         }),
       });
       const body = await res.json();
-      if (res.status === 400) {
+      if (startSeqRef.current !== startSeq) {
+        if (res.ok && body?.job?.id) {
+          void fetch(`/api/bot-onboarding/${encodeURIComponent(String(body.job.id))}/cancel`, { method: 'POST' }).catch(() => {});
+        }
+        return;
+      }
+      if (res.status === 400 || res.status === 409) {
         setView({ kind: 'form', error: body?.message ?? body?.error ?? 'invalid_input' });
         return;
       }
@@ -1041,17 +1302,89 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
       applyJob(job);
       if (!shouldStopPolling(job)) startPolling(job.id, job.registrationMode);
     } catch (error) {
+      if (startSeqRef.current !== startSeq) return;
       setView({ kind: 'job', job: { id: '', status: 'failed', message: caughtErrorText(error), registrationMode } });
     } finally {
-      setSubmitting(false);
+      if (startSeqRef.current === startSeq) setSubmitting(false);
     }
   }, [applyJob, cliState.webSession, form, sessionMode, startPolling, stopPolling]);
 
+  const ensureActiveJobCancelled = useCallback(async (): Promise<boolean> => {
+    if (cancellingRef.current) return false;
+    const currentView = viewRef.current;
+    if (currentView.kind !== 'job' || !currentView.job.id || shouldStopPolling(currentView.job)) {
+      stopPolling();
+      return true;
+    }
+    const activeJob = currentView.job;
+    cancellingRef.current = true;
+    setCancelling(true);
+    stopPolling();
+    try {
+      const res = await fetch(`/api/bot-onboarding/${encodeURIComponent(activeJob.id)}/cancel`, {
+        method: 'POST',
+      });
+      const body = await res.json().catch(() => ({}));
+      if (res.ok || res.status === 404) {
+        return true;
+      }
+      if (res.status === 409 && body?.job) {
+        const latestJob = body.job as OnboardingJob;
+        applyJob(latestJob);
+        if (!shouldStopPolling(latestJob)) startPolling(latestJob.id, latestJob.registrationMode);
+        return false;
+      }
+      setView({
+        kind: 'job',
+        job: activeJob,
+        cancelError: body?.message ?? body?.error ?? `http_${res.status}`,
+      });
+      startPolling(activeJob.id, activeJob.registrationMode);
+      return false;
+    } catch (error) {
+      setView({
+        kind: 'job',
+        job: activeJob,
+        cancelError: caughtErrorText(error),
+      });
+      startPolling(activeJob.id, activeJob.registrationMode);
+      return false;
+    } finally {
+      cancellingRef.current = false;
+      setCancelling(false);
+    }
+  }, [applyJob, startPolling, stopPolling]);
+
+  const close = useCallback(() => {
+    void ensureActiveJobCancelled().then(cancelled => {
+      if (cancelled) finishClose();
+    });
+  }, [ensureActiveJobCancelled, finishClose]);
+
   const submitForm = useCallback((event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    const local = form.connection === 'local' && cloneSourceAppId === undefined;
-    void startOnboarding(local ? 'local' : 'web');
+    const isClone = cloneSourceAppId !== undefined;
+    const mode = !isClone && form.connection === 'local'
+      ? 'local'
+      : !isClone && form.connection === 'manual'
+        ? 'manual'
+        : 'web';
+    void startOnboarding(mode);
   }, [form.connection, startOnboarding]);
+
+  const switchToManualForm = useCallback((prefill?: { appId?: string; brand?: 'feishu' | 'lark' }) => {
+    void ensureActiveJobCancelled().then(cancelled => {
+      if (!cancelled) return;
+      startSeqRef.current += 1;
+      setForm(current => ({
+        ...current,
+        connection: 'manual',
+        ...(prefill?.appId ? { appId: prefill.appId } : {}),
+        ...(prefill?.brand ? { brand: prefill.brand } : {}),
+      }));
+      setView({ kind: 'form' });
+    });
+  }, [ensureActiveJobCancelled]);
 
   const retry = useCallback(async (registrationMode: 'web' | 'compat' | 'local') => {
     if (registrationMode === 'compat') {
@@ -1064,6 +1397,17 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
     if (requiresFreshLogin) setSessionMode('qr');
     void startOnboarding(registrationMode, requiresFreshLogin ? 'qr' : undefined);
   }, [startOnboarding, view]);
+
+  const handleCliChange = useCallback((cliId: string) => {
+    cliTouchedRef.current = true;
+    setCliRecheckSeq(0);
+    setForm(current => syncModelForCli(current, cliId, cliState));
+  }, [cliState]);
+
+  const handleRecheckCli = useCallback(() => {
+    setCliRecheckSeq(seq => seq + 1);
+    refreshCliOptions(false);
+  }, [refreshCliOptions]);
 
   const submitOwner = useCallback(async (job: OnboardingJob, ownerRaw: string, ownerIdRaw: string) => {
     const owner = [ownerRaw.trim(), ownerIdRaw.trim()].filter(Boolean).join(',');
@@ -1099,10 +1443,14 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
           cliState={cliState}
           form={form}
           allowLocal={cloneSourceAppId === undefined}
+          allowManual={cloneSourceAppId === undefined}
+          cliRecheckSeq={cliRecheckSeq}
           sessionMode={sessionMode}
           error={view.error}
           submitting={submitting}
           onFormChange={setForm}
+          onCliChange={handleCliChange}
+          onRecheckCli={handleRecheckCli}
           onSessionModeChange={setSessionMode}
           onSubmit={submitForm}
           onClose={close}
@@ -1112,27 +1460,33 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
     return (
       <OnboardingJobView
         view={view}
+        allowManual={cloneSourceAppId === undefined}
+        cancelling={cancelling}
         ownerInput={ownerInput}
         ownerIdInput={ownerIdInput}
         onOwnerInputChange={setOwnerInput}
         onOwnerIdInputChange={setOwnerIdInput}
         onSubmitOwner={submitOwner}
         onRetry={retry}
+        onBackToManualForm={switchToManualForm}
         onClose={close}
       />
     );
-  }, [cliState, close, form, ownerIdInput, ownerInput, props.open, retry, sessionMode, submitForm, submitOwner, submitting, view]);
+  }, [cancelling, cliRecheckSeq, cliState, close, form, handleCliChange, handleRecheckCli, ownerIdInput, ownerInput, props.open, retry, sessionMode, submitForm, submitOwner, submitting, switchToManualForm, view]);
 
-  const canClose = view.kind === 'form' || (view.kind === 'job' && (view.job.status === 'completed' || view.job.status === 'failed'));
+  const canClose = !cancelling && (view.kind === 'form' || (view.kind === 'job' && (view.job.status === 'completed' || view.job.status === 'failed' || view.job.status === 'waiting_for_scan')));
 
   return (
     <dialog
       className="onboarding-dialog"
       ref={dialogRef}
       onCancel={event => {
-        if (!canClose) event.preventDefault();
+        // Always prevent synchronous native dialog dismissal so Escape awaits
+        // POST /api/bot-onboarding/:id/cancel before closing.
+        event.preventDefault();
+        if (canClose) close();
       }}
-      onClose={() => { if (canClose) close(); }}
+      onClose={() => { if (props.open && canClose) close(); }}
       onClick={event => { if (canClose && event.target === event.currentTarget) close(); }}
     >
       <article className="onboarding-card">

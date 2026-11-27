@@ -28,6 +28,12 @@ import { TurnReplyCardStore, replyCardIsTerminal } from '../../services/turn-rep
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { NEXT_STEP_CLICK_NOTICE, NEXT_STEP_PROMPT_FIELD } from './next-step-card.js';
 import { noteReplyCardTurnStarted } from '../../core/reply-card-turn-start.js';
+import {
+  advancePendingStreamingCardTurn,
+  invalidateTurnStreamingCardPostSlot,
+  restoreTurnStreamingCardPostSlotIfUnchanged,
+  snapshotTurnStreamingCardPostSlot,
+} from '../../core/streaming-card-post-slot.js';
 import { resolveHiddenStreamingCardButtons, resolveStreamingCardFoldedLayout } from './streaming-card-buttons.js';
 import { writeSessionModelPin, recordTurnExplicitMention } from '../../core/worker-pool.js';
 import { failedTurnRewindInFlight } from '../../core/failed-turn-rewind.js';
@@ -459,14 +465,31 @@ function captureTurnStateBeforePurgeClick(ds: DaemonSession): () => void {
     lastCliInputTurnId: ds.session.lastCliInputTurnId,
     lastCodexAppInput: ds.session.lastCodexAppInput,
   };
-  const { lastScreenStatus, streamCardPending } = ds;
+  const { lastScreenStatus, streamCardPending, streamCardPendingTurnId } = ds;
+  const savedTurnSlot = snapshotTurnStreamingCardPostSlot(ds);
+  const expectedClickGeneration = (ds.streamCardTurnGeneration ?? 0) + 1;
   return () => {
     Object.assign(ds, live);
     Object.assign(ds.session, persisted);
-    // Worker screen updates own these after the click; only undo the click's marks.
+    // Worker screen updates own these after the click; only undo the click's marks
+    // while no newer turn has superseded this speculative purge click.
     if (ds.lastScreenStatus === 'working') ds.lastScreenStatus = lastScreenStatus;
-    if (ds.streamCardPending) ds.streamCardPending = streamCardPending;
+    if (ds.streamCardPending && (ds.streamCardTurnGeneration ?? 0) === expectedClickGeneration) {
+      ds.streamCardPending = streamCardPending;
+      ds.streamCardPendingTurnId = streamCardPendingTurnId;
+      invalidateTurnStreamingCardPostSlot(ds);
+      if (streamCardPending) {
+        restoreTurnStreamingCardPostSlotIfUnchanged(ds, savedTurnSlot);
+      }
+    }
   };
+}
+
+function isStreamingCardParkedOrPending(ds: DaemonSession): boolean {
+  return Boolean(
+    ds.streamCardPending
+    || (ds.streamCardNonce && ds.parkedStreamCardNonce === ds.streamCardNonce),
+  );
 }
 
 function isLegacySelfHealAction(actionType?: string): boolean {
@@ -1156,6 +1179,7 @@ export async function commitRepoSelection(
         current.streamCardNonce = undefined;
         rehomeReplyTargetState(current);
         current.streamCardPending = undefined;
+        current.streamCardPendingTurnId = undefined;
         current.lastScreenContent = undefined;
         current.lastScreenStatus = undefined;
         activeSessions.set(key, current);
@@ -1704,10 +1728,18 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
   const { activeSessions, lastRepoScan } = deps;
   // turnId is forwarded only when the caller actually has a turn anchor
   // (e.g. the pendingRepo confirmation) — most card actions have none.
-  const sessionReply = (rid: string, content: string, msgType?: string, turnId?: string) =>
-    turnId !== undefined
-      ? deps.sessionReply(rid, content, msgType, larkAppId, turnId)
-      : deps.sessionReply(rid, content, msgType, larkAppId);
+  const sessionReply = (
+    rid: string,
+    content: string,
+    msgType?: string,
+    turnId?: string,
+    opts?: WorkerSessionReplyOptions,
+  ) =>
+    opts !== undefined
+      ? deps.sessionReply(rid, content, msgType, larkAppId, turnId, opts)
+      : turnId !== undefined
+        ? deps.sessionReply(rid, content, msgType, larkAppId, turnId)
+        : deps.sessionReply(rid, content, msgType, larkAppId);
   const action = data?.action;
   const value = action?.value;
   const cardMessageId = data?.context?.open_message_id ?? data?.open_message_id;
@@ -2623,7 +2655,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     // visible cause and no way for the user to revive it.
     rememberLastCliInput(ds, transcript.text, cliInput, turnId);
     ds.lastScreenStatus = 'working';
-    ds.streamCardPending = true;
+    advancePendingStreamingCardTurn(ds);
     ds.currentTurnId = turnId;
     // Like beginNewTurn: the previous turn's「下一步」row and「本轮回顾」panel are retired.
     noteReplyCardTurnStarted(ds, turnId);
@@ -4005,7 +4037,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       const warning = (key: string) => ({
         toast: { type: 'warning', content: t(key, undefined, loc) },
         // A rejected dropdown selection must not keep displaying the unsaved value.
-        ...(ds && ds.streamCardId === cardMessageId ? {
+        ...(ds && ds.streamCardId === cardMessageId && !isStreamingCardParkedOrPending(ds) ? {
           card: { type: 'raw' as const, data: JSON.parse(buildStreamingCardJson(ds, ds.session.suspendedColdResume ? 'idle' : undefined)) },
         } : {}),
       });
@@ -4016,7 +4048,8 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         const current = getSessionByActionValue(activeSessions, rootId, ds.larkAppId, value.session_id, actionType);
         if (current !== ds || value.session_id !== ds.session.sessionId
           || !cardMessageId || cardMessageId !== ds.streamCardId
-          || value.card_nonce !== ds.streamCardNonce) return 'stale' as const;
+          || value.card_nonce !== ds.streamCardNonce
+          || isStreamingCardParkedOrPending(ds)) return 'stale' as const;
         const control = sessionReasoningControl(ds);
         if (!control) return 'unsupported' as const;
         if (control.claude && (!canOperate(ds.larkAppId, ds.chatId, operatorOpenId)
@@ -4366,7 +4399,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
                 const reconciled = await reconcileResumedStreamingCard(
                   resumedDs,
                   staleCardId,
-                  cardJson => sessionReply(rootId, cardJson, 'interactive'),
+                  (cardJson, uuid) => sessionReply(rootId, cardJson, 'interactive', undefined, uuid ? { uuid } : undefined),
                 );
                 if (reconciled.status !== 'committed') return;
                 // Also send the "✅ 会话已恢复…" text follow-up (the original
@@ -4518,7 +4551,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       // IPC or the durable activation tail already owns the exact retry input.
       clearUsageLimitState(ds);
       ds.lastScreenStatus = 'working';
-      ds.streamCardPending = true;
+      advancePendingStreamingCardTurn(ds);
       ds.currentTurnTitle = (ds.lastUserPrompt || ds.currentTurnTitle || ds.session.title || getCliDisplayName(sessionCliId(ds))).substring(0, 50);
       ds.currentImageKey = undefined;
       persistStreamCardState(ds);
@@ -4748,7 +4781,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       noteReplyCardTurnStarted(ds, retryTurnId);
       sessionStore.updateSession(ds.session);
       ds.lastScreenStatus = 'working';
-      ds.streamCardPending = true;
+      advancePendingStreamingCardTurn(ds);
       ds.currentTurnTitle = (failedTurn.userPrompt || ds.currentTurnTitle || ds.session.title
         || getCliDisplayName(sessionCliId(ds))).substring(0, 50);
       ds.currentImageKey = undefined;
@@ -4854,7 +4887,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       noteReplyCardTurnStarted(ds, retryTurnId);
       sessionStore.updateSession(ds.session);
       ds.lastScreenStatus = 'working';
-      ds.streamCardPending = true;
+      advancePendingStreamingCardTurn(ds);
       ds.currentTurnTitle = (failedTurn.userPrompt || ds.currentTurnTitle || ds.session.title
         || getCliDisplayName(sessionCliId(ds))).substring(0, 50);
       ds.currentImageKey = undefined;
@@ -5180,7 +5213,11 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       const clickedNonce: string | undefined = value?.card_nonce;
       const needsPatchContractMigration =
         value?.stream_card_version !== STREAMING_CARD_PATCH_VERSION;
-      const isFrozenClick = clickedNonce && ds.streamCardNonce && clickedNonce !== ds.streamCardNonce;
+      const isFrozenClick = Boolean(
+        clickedNonce
+        && ds.streamCardNonce
+        && (clickedNonce !== ds.streamCardNonce || isStreamingCardParkedOrPending(ds)),
+      );
 
       const requestedDisplayMode: DisplayMode | undefined =
         value?.target_display_mode === 'hidden' || value?.target_display_mode === 'screenshot'
@@ -5426,6 +5463,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       const isCurrentTarget = Boolean(
         ds.streamCardId
         && ds.streamCardId !== CARD_POSTING_SENTINEL
+        && !isStreamingCardParkedOrPending(ds)
         && (!cardMessageId || cardMessageId === ds.streamCardId),
       );
       const { cardJson, unavailable } = buildToggleCard(next, {
@@ -5481,6 +5519,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       }
       if (!ds.streamCardId
         || ds.streamCardId === CARD_POSTING_SENTINEL
+        || isStreamingCardParkedOrPending(ds)
         || cardMessageId !== ds.streamCardId
         || value?.card_nonce !== ds.streamCardNonce) {
         return { toast: { type: 'warning', content: t('card.action.keys_panel_stale', undefined, locKeys) } };
