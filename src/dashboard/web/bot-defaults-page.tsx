@@ -35,7 +35,7 @@ import { CodexProfilePicker } from './codex-profile-picker.js';
 import { afterNextPaint } from './deferred-task.js';
 import { LazyTabPanel } from './lazy-tab-panel.js';
 import { REPLY_FOOTER_KEYS, normalizeReplyFooter } from '../../services/reply-footer.js';
-import { Children, cloneElement, isValidElement, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ComponentProps, type ReactNode } from 'react';
+import { Children, Fragment, cloneElement, isValidElement, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ComponentProps, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { BOT_ONBOARDING_COMPLETED_EVENT, cloneSourceDefaultsFrom, openBotOnboarding } from './bot-onboarding.js';
 import { StreamingCardPinToggle } from './streaming-card-pin-toggle.js';
@@ -413,6 +413,25 @@ function tileSearchText(tile: HTMLElement): string {
   return text.join(' ').replace(/\s+/g, ' ').toLowerCase();
 }
 
+/** Recursively expand Fragment children. BdTabGrid decides per-tile visibility by
+ *  walking its React children, but a capability gate wraps a group of tiles in a
+ *  Fragment; the Fragment element itself carries no tile id and would pass through
+ *  unfiltered, leaving its tiles visible to search/modified-only while visibleCount
+ *  still reported zero (a lying empty state). Flattening keeps the React walk
+ *  consistent with the `:scope > .bd-tile` DOM read, which already sees through
+ *  Fragments because they render no DOM node of their own. */
+function flattenGridChildren(node: ReactNode): ReactNode[] {
+  const out: ReactNode[] = [];
+  Children.forEach(node, child => {
+    if (isValidElement(child) && child.type === Fragment) {
+      out.push(...flattenGridChildren((child.props as { children?: ReactNode }).children));
+    } else {
+      out.push(child);
+    }
+  });
+  return out;
+}
+
 export function BdTabGrid(props: { children: ReactNode; className?: string; filter?: BotDefaultsFilter }) {
   const tr = useT();
   const ref = useRef<HTMLDivElement | null>(null);
@@ -437,7 +456,7 @@ export function BdTabGrid(props: { children: ReactNode; className?: string; filt
 
   let visibleCount = 0;
   const modifiedIds = props.filter?.modifiedIds;
-  const children = props.filter ? Children.map(props.children, child => {
+  const children = props.filter ? Children.map(flattenGridChildren(props.children), child => {
     if (!hasQuery && !modifiedIds) return child;
     if (!isValidElement<{ id?: string; hidden?: boolean }>(child) || !child.props.id) return child;
     const tileId = child.props.id;

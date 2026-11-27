@@ -1,10 +1,10 @@
-import { createElement } from 'react';
+import { Fragment, createElement } from 'react';
 import TestRenderer, { act, type ReactTestRenderer } from 'react-test-renderer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   botDefaultsSectionDomId, botEffectiveSummary, botModifiedSectionIds, type BotDefaultsRow,
 } from '../src/dashboard/web/bot-defaults.js';
-import { BotDefaultsPage } from '../src/dashboard/web/bot-defaults-page.js';
+import { BdTabGrid, BotDefaultsPage } from '../src/dashboard/web/bot-defaults-page.js';
 import { t } from '../src/dashboard/web/ui.js';
 import { DEFAULT_SESSION_OWNER_REMINDER } from '../src/core/session-owner-reminder-config.js';
 import { botDefaultsPayload, sparseOverridesFromRawBotConfig } from '../src/dashboard/bot-payload.js';
@@ -111,6 +111,69 @@ describe('Bot settings summaries', () => {
     });
     expect(empty).not.toContain('command-trigger');
     expect(empty).not.toContain('blocked-users');
+  });
+});
+
+describe('BdTabGrid filter with capability-gated Fragment children', () => {
+  let renderer: ReactTestRenderer;
+  const tile = (id: string) => createElement('section', { className: 'bd-tile', id: botDefaultsSectionDomId(id), key: id }, id);
+  const noopFilter = { query: '', modifiedIds: null as ReadonlySet<string> | null, onClear: () => {} };
+
+  afterEach(() => { renderer?.unmount(); });
+
+  function hidden(id: string): boolean | undefined {
+    return renderer.root.findByProps({ id: botDefaultsSectionDomId(id) }).props.hidden;
+  }
+  function emptyShown(): number {
+    return renderer.root.findAllByProps({ 'data-bd-filter-empty': true }).length;
+  }
+
+  it('applies a text search to tiles nested inside a Fragment', () => {
+    const children = createElement(Fragment, null, tile('owner-reminder'), tile('prompt-injection'));
+    act(() => {
+      renderer = TestRenderer.create(createElement(BdTabGrid, {
+        filter: { ...noopFilter, query: t('botDefaults.ownerReminderTitle') },
+      }, children));
+    });
+    expect(hidden('owner-reminder')).toBe(false);
+    expect(hidden('prompt-injection')).toBe(true);
+    expect(emptyShown()).toBe(0);
+  });
+
+  it('reports the empty state only when every Fragment tile is filtered out', () => {
+    const children = createElement(Fragment, null, tile('owner-reminder'), tile('prompt-injection'));
+    act(() => {
+      renderer = TestRenderer.create(createElement(BdTabGrid, {
+        filter: { ...noopFilter, query: 'zzz-no-such-setting-xyz' },
+      }, children));
+    });
+    expect(hidden('owner-reminder')).toBe(true);
+    expect(hidden('prompt-injection')).toBe(true);
+    expect(emptyShown()).toBe(1);
+  });
+
+  it('applies modified-only to Fragment tiles and keeps direct children in the same walk', () => {
+    const children = [
+      createElement(Fragment, { key: 'g' }, tile('owner-reminder'), tile('prompt-injection')),
+      null,
+      false,
+      tile('backend'),
+    ];
+    act(() => {
+      renderer = TestRenderer.create(createElement(BdTabGrid, {
+        filter: { ...noopFilter, modifiedIds: new Set(['owner-reminder', 'backend']) },
+      }, children));
+    });
+    expect(hidden('owner-reminder')).toBe(false);
+    expect(hidden('prompt-injection')).toBe(true);
+    expect(hidden('backend')).toBe(false);
+    act(() => {
+      renderer.update(createElement(BdTabGrid, {
+        filter: { ...noopFilter, modifiedIds: new Set() },
+      }, children));
+    });
+    expect(hidden('owner-reminder')).toBe(true);
+    expect(hidden('backend')).toBe(true);
   });
 });
 
