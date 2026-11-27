@@ -536,6 +536,18 @@ describe('v3 ephemeral pool', () => {
       expect(factory.lastOpts).toBeUndefined();
     });
 
+    it('fails an unregistered node bot when HOME itself is a dangling symlink', async (ctx) => {
+      const home = join(dir, 'home-link');
+      try { symlinkSync(join(dir, 'moved-home'), home); } catch { ctx.skip(); }
+      // os.homedir() reads USERPROFILE on Windows, HOME elsewhere.
+      vi.stubEnv('HOME', home);
+      vi.stubEnv('USERPROFILE', home);
+      vi.stubEnv('BOTS_CONFIG', '');
+      const failure = await rejectsBeforeSpawn();
+      expect(failure.message).toContain('cli_app');
+      expect(failure.cause).toMatchObject({ reason: 'unreadable' });
+    });
+
     it('fails an unregistered node bot when the default config directory is a regular file', async () => {
       const home = join(dir, 'home');
       mkdirSync(home, { recursive: true });

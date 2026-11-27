@@ -3812,12 +3812,19 @@ function pathEntryExists(path: string): boolean {
 }
 
 /** stat(file) said ENOENT/ENOTDIR: true only when the file entry is absent
- *  and its directory is absent or a real directory. Read faults on the way
+ *  and its nearest existing ancestor is a real directory. Read faults on the way
  *  (EACCES, EIO, …) throw. */
 function defaultConfigProvenAbsent(file: string, statCode: string): boolean {
   if (statCode !== 'ENOENT' || pathEntryExists(file)) return false;
-  const dir = dirname(file);
-  if (!pathEntryExists(dir)) return true;
+  // Walk up to the nearest entry that exists: the file is absent only if that
+  // entry resolves to a real directory (a dangling link anywhere on the way —
+  // ~/.botmux, $HOME, … — makes the registry unreachable, not absent).
+  let dir = dirname(file);
+  while (!pathEntryExists(dir)) {
+    const parent = dirname(dir);
+    if (parent === dir) return true;
+    dir = parent;
+  }
   try { return statSync(dir).isDirectory(); } catch (err: any) {
     if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') return false;
     throw botConfigAccessError(dir, err);
