@@ -332,6 +332,25 @@ describe('antigravity writeInput — ownership of the submit proof', () => {
     expect(probe(result)).toEqual({ cliSessionId: cid });
   });
 
+  it('keeps watching a fresh submit whose conversation id is not streamed yet', async () => {
+    const cid = randomUUID();
+    const { adapter, stream, startupLog } = launch();
+    startupLog();
+    const content = 'history lands before the conversation id';
+    const first = await adapter.writeInput(makePty(() => appendFileSync(HISTORY, historyLine(content))), content);
+    expect(plain(first)).toEqual({ submitted: true });
+    expect(probe(first)).toBeUndefined();
+    stream(cid);
+    userInput(cid, content);
+    expect(probe(first)).toEqual({ cliSessionId: cid });
+    // The first entry is resolved, so an identical follow-up can prove its own record.
+    const second = await adapter.writeInput(makePty(() => {
+      appendFileSync(HISTORY, historyLine(content, cid));
+      userInput(cid, content);
+    }), content);
+    expect(plain(second)).toEqual({ submitted: true, cliSessionId: cid, ownershipProven: true });
+  });
+
   it('never proves on an adopted pane without a process-scoped log', async () => {
     const cid = randomUUID();
     const adapter = createAntigravityAdapter('/usr/local/bin/agy');

@@ -1287,6 +1287,45 @@ export function resolveAntigravityCandidateMinByteOffset(
   return null;
 }
 
+export interface AntigravityUserInputMatch {
+  /** Line start offset in the scanned file. */
+  offset: number;
+  /** agy's step_index, shared by the compact and full transcripts of a conversation. */
+  stepIndex?: number;
+}
+
+/** Incremental scan for USER_INPUT records whose unwrapped payload hashes to
+ *  `textSha256`, from `fromOffset` to the last complete line. Returns the
+ *  matches and the next resume offset (never past a partial trailing line),
+ *  or null when the file cannot be read. */
+export function scanAntigravityUserInputMatches(
+  transcriptPath: string,
+  textSha256: string,
+  fromOffset: number,
+): { matches: AntigravityUserInputMatch[]; nextOffset: number } | null {
+  if (!transcriptPath || !existsSync(transcriptPath)) return null;
+  const matches: AntigravityUserInputMatch[] = [];
+  let failed = false;
+  const cursor = scanJsonlFromOffset(transcriptPath, fromOffset, {
+    onError: () => { failed = true; },
+    onLine: (line, lineStart) => {
+      if (!line.includes('USER_INPUT')) return;
+      let rec: any;
+      try {
+        rec = JSON.parse(line);
+      } catch {
+        return;
+      }
+      if (!isExplicitUserInput(rec)) return;
+      const unwrapped = unwrapAntigravityUserInput(typeof rec.content === 'string' ? rec.content : '');
+      if (hashAntigravitySubmittedText(unwrapped) !== textSha256) return;
+      matches.push({ offset: lineStart, ...(Number.isInteger(rec.step_index) ? { stepIndex: rec.step_index } : {}) });
+    },
+  });
+  if (!cursor || failed) return null;
+  return { matches, nextOffset: cursor.newOffset };
+}
+
 /** transcriptPath 的 [minByteOffset, maxByteOffset) 区间内，正文 SHA-256 命中 textSha256 的 USER_INPUT 行起始偏移（升序）。 */
 export function listAntigravityUserInputMatchOffsets(
   transcriptPath: string,

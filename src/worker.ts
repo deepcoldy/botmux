@@ -28492,6 +28492,8 @@ type VerifiableSubmissionResult = void | {
   cliSessionId?: string;
   ownershipProven?: boolean;
   unprovenCliSessionId?: string;
+  proveConsumed?: () => { cliSessionId?: string } | undefined;
+  settleConsumed?: () => void;
   failureReason?: string;
   recheck?: () => SubmitRecheckResult | Promise<SubmitRecheckResult>;
 };
@@ -28534,6 +28536,13 @@ async function settleVerifiableSubmissionForJournal(
     // keeps the candidate exactly as it does for an in-band one (#2363).
     if (typeof recheck === 'object' && recheck && typeof recheck.unprovenCliSessionId === 'string') {
       result.unprovenCliSessionId = recheck.unprovenCliSessionId;
+    }
+    // An unproven consumption probe (Antigravity) must reach flushPending's
+    // watcher, which also settles it at the turn's end.
+    if (typeof recheck === 'object' && recheck && recheck.ownershipProven !== true
+      && typeof recheck.proveConsumed === 'function') {
+      result.proveConsumed = recheck.proveConsumed;
+      if (typeof recheck.settleConsumed === 'function') result.settleConsumed = recheck.settleConsumed;
     }
     return true;
   } catch (err) {
@@ -47647,9 +47656,9 @@ const DEFERRED_CONSUMPTION_PROOF_MAX_POLL_MS = 5_000;
 
 /** Poll an adapter's read-only consumption probe off the write path, and send
  * the same receipt an immediate `ownershipProven` would have. Stops at the
- * proof, the turn's terminal (settling the probe), a CLI respawn, close, or
- * the window's end; a missed proof only leaves coverage to the existing
- * terminal fallback. */
+ * proof, the turn's terminal (settling the probe), a CLI respawn or close.
+ * Past the window it stops probing but keeps waiting for the terminal to
+ * settle. A missed proof only leaves coverage to the terminal fallback. */
 function watchDeferredConsumptionProof(
   turnId: string | undefined,
   dispatchAttempt: number | undefined,
@@ -47670,7 +47679,15 @@ function watchDeferredConsumptionProof(
     // A finished turn's input either already has its record or was dropped:
     // release it so it cannot take a later identical input's record.
     if (turnTerminalEmitted(turnId, dispatchAttempt)) { try { settle?.(); } catch { /* best effort */ } return; }
-    if (closeRequested || cliSpawnGeneration !== generation || Date.now() > deadline) return;
+    if (closeRequested || cliSpawnGeneration !== generation) return;
+    if (Date.now() > deadline) {
+      // Out of probing budget: no more transcript reads, but keep the cheap
+      // terminal check so the entry is still settled when its turn ends.
+      if (!settle) return;
+      interval = DEFERRED_CONSUMPTION_PROOF_MAX_POLL_MS;
+      schedule();
+      return;
+    }
     let proof: { cliSessionId?: string } | undefined;
     try { proof = prove(); } catch { proof = undefined; }
     if (!proof) { schedule(); return; }

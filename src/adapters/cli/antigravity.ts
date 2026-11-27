@@ -112,6 +112,12 @@ function currentFileSize(path: string): number {
   try { return statSync(path).size; } catch { return 0; }
 }
 
+/** Size of a file known to exist, or undefined when it cannot be measured
+ *  (a proof baseline must not mistake that for an empty file). */
+function measuredFileSize(path: string): number | undefined {
+  try { return statSync(path).size; } catch { return undefined; }
+}
+
 /** Build a JSON-escaped prefix marker for substring-matching against
  *  history.jsonl's raw bytes. Three things to keep aligned with agy's
  *  on-disk encoding:
@@ -898,7 +904,8 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       const marker = historyMarker(content);
       const initialCid = activeSessionId(pty) ?? knownCliSessionId;
       const initialTranscriptPath = initialCid ? resolveAntigravityTranscriptPath(initialCid) : null;
-      const preSize = initialTranscriptPath ? currentFileSize(initialTranscriptPath) : null;
+      const baselineSize = initialTranscriptPath ? measuredFileSize(initialTranscriptPath) : undefined;
+      const preSize = initialTranscriptPath ? baselineSize ?? 0 : null;
       // No transcript exists yet for the conversation this input lands in: a
       // known id whose brain file agy creates lazily (e.g. right after /new),
       // or a fresh launch whose native log is already being written with no
@@ -912,7 +919,7 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       const submitBaseline: AntigravitySubmitBaseline = {
         ...(initialCid ? { conversationId: initialCid } : {}),
         transcriptPath: initialTranscriptPath,
-        transcriptSize: preSize ?? 0,
+        transcriptSize: initialTranscriptPath ? baselineSize : 0,
         transcriptCreatedAfter: transcriptCreatedAfterSubmit,
         ...(preexistingConversations ? { preexistingConversations } : {}),
       };
@@ -931,9 +938,16 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
         knownCliSessionId = proofCid;
         return { cliSessionId: proofCid };
       };
-      const confirmedResult = (cliSessionId: string | undefined, owned: boolean) => (cliSessionId
-        ? { submitted: true as const, cliSessionId, ...(owned ? { ownershipProven: true as const } : { proveConsumed, settleConsumed }) }
-        : undefined);
+      // The probe does not depend on the id being known yet: a fresh launch can
+      // log the Enter before it streams its conversation id, and the entry must
+      // still be watched and, at the turn's end, settled.
+      // Panes without a ledger entry (adopted, no process-scoped log) keep the
+      // legacy shape: no id → no result object.
+      const confirmedResult = (cliSessionId: string | undefined, owned: boolean) => {
+        if (owned && cliSessionId) return { submitted: true as const, cliSessionId, ownershipProven: true as const };
+        if (ledgerEntry) return { submitted: true as const, ...(cliSessionId ? { cliSessionId } : {}), proveConsumed, settleConsumed };
+        return cliSessionId ? { submitted: true as const, cliSessionId } : undefined;
+      };
 
       const trySendEnter = (): boolean => {
         try {

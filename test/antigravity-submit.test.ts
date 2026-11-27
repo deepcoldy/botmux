@@ -254,7 +254,7 @@ describe('antigravity writeInput — single-Enter submit', () => {
       expect(fake.texts).toEqual([]);
       expect(fake.specialKeys).toEqual([]);
       appendHistory(content);
-      expect(result?.recheck?.()).toBe(true);
+      expect(result?.recheck?.()).toEqual({ submitted: true, proveConsumed: expect.any(Function), settleConsumed: expect.any(Function) });
     });
   }
 
@@ -264,7 +264,7 @@ describe('antigravity writeInput — single-Enter submit', () => {
     let calls = 0;
     const fake = makePty();
     fake.pty.submitBracketedPaste = () => { calls++; void delay(800).then(() => appendHistory(content)); return false; };
-    expect(await adapterForVersion('1.5.4').writeInput(fake.pty, content)).toBeUndefined();
+    expect(await adapterForVersion('1.5.4').writeInput(fake.pty, content)).toEqual({ submitted: true, proveConsumed: expect.any(Function), settleConsumed: expect.any(Function) });
     expect(calls).toBe(1);
     expect(fake.specialKeys).toEqual([]);
   });
@@ -535,7 +535,7 @@ describe('antigravity writeInput — single-Enter submit', () => {
       };
 
       const result = await selected.writeInput(fake.pty, '继续？');
-      expect(result).toBeUndefined();
+      expect(result).toEqual({ submitted: true, proveConsumed: expect.any(Function), settleConsumed: expect.any(Function) });
       expect(events).toEqual(['key:Escape', 'paste:继续？']);
     });
 
@@ -561,7 +561,7 @@ describe('antigravity writeInput — single-Enter submit', () => {
       };
 
       const result = await selected.writeInput(fake.pty, '继续');
-      expect(result).toBeUndefined();
+      expect(result).toEqual({ submitted: true, proveConsumed: expect.any(Function), settleConsumed: expect.any(Function) });
       expect(events).toEqual(['paste:继续']);
     });
 
@@ -613,7 +613,7 @@ describe('antigravity writeInput — single-Enter submit', () => {
       };
 
       const result = await selected.writeInput(fake.pty, 'please keep working');
-      expect(result).toBeUndefined();
+      expect(result).toEqual({ submitted: true, proveConsumed: expect.any(Function), settleConsumed: expect.any(Function) });
       expect(events).toEqual(['paste:please keep working']);
     });
 
@@ -639,7 +639,7 @@ describe('antigravity writeInput — single-Enter submit', () => {
       };
 
       const result = await selected.writeInput(fake.pty, '继续？');
-      expect(result).toBeUndefined();
+      expect(result).toEqual({ submitted: true, proveConsumed: expect.any(Function), settleConsumed: expect.any(Function) });
       expect(events).toEqual(['key:Escape', 'paste:继续？']);
     });
   });

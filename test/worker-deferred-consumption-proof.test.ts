@@ -60,8 +60,8 @@ describe('deferred native consumption proof watcher', () => {
     expect(scope.acknowledgeNativeInputConsumed).not.toHaveBeenCalled();
   });
 
-  it('stops without settling on a CLI respawn, close, or the end of its window', () => {
-    for (const stop of ['respawn', 'close', 'window'] as const) {
+  it('stops without settling on a CLI respawn or close', () => {
+    for (const stop of ['respawn', 'close'] as const) {
       const { scope, watch } = harness();
       const prove = vi.fn(() => undefined);
       const settle = vi.fn();
@@ -69,12 +69,39 @@ describe('deferred native consumption proof watcher', () => {
       vi.advanceTimersByTime(600);
       if (stop === 'respawn') scope.cliSpawnGeneration += 1;
       if (stop === 'close') scope.closeRequested = true;
-      vi.advanceTimersByTime(stop === 'window' ? 120_000 : 10_000);
-      const probes = prove.mock.calls.length;
+      vi.advanceTimersByTime(10_000);
+      scope.terminal = true;
       vi.advanceTimersByTime(60_000);
-      expect(prove.mock.calls.length).toBe(probes);
       expect(settle).not.toHaveBeenCalled();
       expect(scope.acknowledgeNativeInputConsumed).not.toHaveBeenCalled();
     }
+  });
+
+  it('stops probing at the end of its window but still settles at the later terminal', () => {
+    const { scope, watch } = harness();
+    const prove = vi.fn(() => undefined);
+    const settle = vi.fn();
+    watch('om_turn', undefined, 'antigravity_transcript_user_input', prove, settle);
+    vi.advanceTimersByTime(120_000);
+    const probes = prove.mock.calls.length;
+    vi.advanceTimersByTime(60_000);
+    expect(prove.mock.calls.length).toBe(probes);
+    expect(settle).not.toHaveBeenCalled();
+    scope.terminal = true;
+    vi.advanceTimersByTime(10_000);
+    expect(settle).toHaveBeenCalledTimes(1);
+    expect(scope.acknowledgeNativeInputConsumed).not.toHaveBeenCalled();
+  });
+
+  it('keeps the consumption probe across the ZMX journal\'s deferred recheck', async () => {
+    const proveConsumed = () => undefined;
+    const settleConsumed = () => {};
+    const scope: Record<string, any> = { SUBMIT_DEFERRED_RECHECK_MS: 1_000, log: vi.fn() };
+    const settleJournal = loadWorkerFunction<(result: any) => Promise<boolean>>('settleVerifiableSubmissionForJournal', scope);
+    const result: any = { submitted: false, recheck: () => ({ submitted: true, cliSessionId: 'cid', proveConsumed, settleConsumed }) };
+    const settled = settleJournal(result);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(await settled).toBe(true);
+    expect(result).toMatchObject({ submitted: true, cliSessionId: 'cid', proveConsumed, settleConsumed });
   });
 });

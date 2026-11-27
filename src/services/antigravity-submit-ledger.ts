@@ -1,8 +1,9 @@
 import { readdirSync } from 'node:fs';
 import {
-  listAntigravityUserInputMatchOffsets,
   resolveAntigravityCandidateMinByteOffset,
   resolveAntigravityTranscriptPath,
+  scanAntigravityUserInputMatches,
+  type AntigravityUserInputMatch,
 } from './antigravity-transcript.js';
 
 /**
@@ -32,8 +33,9 @@ export interface AntigravitySubmitBaseline {
   conversationId?: string;
   /** Transcript resolved for that conversation at write time, if on disk. */
   transcriptPath: string | null;
-  /** Its byte size at write time. */
-  transcriptSize: number;
+  /** Its byte size at write time; undefined when it could not be measured
+   *  (such a baseline never proves: offset 0 would accept older records). */
+  transcriptSize: number | undefined;
   /** No transcript existed yet for the conversation this input lands in, so
    *  everything agy later writes there is post-submit. */
   transcriptCreatedAfter: boolean;
@@ -52,7 +54,7 @@ export function antigravityBaselineMinOffset(
   baseline: AntigravitySubmitBaseline,
 ): number | undefined {
   if (baseline.transcriptPath) {
-    if (conversationId !== baseline.conversationId) return undefined;
+    if (conversationId !== baseline.conversationId || baseline.transcriptSize === undefined) return undefined;
     const mapped = resolveAntigravityCandidateMinByteOffset(
       { minByteOffset: baseline.transcriptSize, sampledTranscriptPath: baseline.transcriptPath }, path);
     return mapped ?? undefined;
@@ -77,7 +79,9 @@ export interface AntigravitySubmitEntry {
   readonly baseline: AntigravitySubmitBaseline;
   /** Write order within this pane. */
   readonly seq: number;
-  claim?: { conversationId: string; path: string; offset: number };
+  claim?: { conversationId: string; key: string };
+  /** Incremental scan state of this entry's own transcript suffix. */
+  scan?: { path: string; nextOffset: number; matches: AntigravityUserInputMatch[] };
   /** Ledger seq at which the worker reported this input's turn finished.
    *  Its record, if any, precedes every submit written after that point. */
   settledAtSeq?: number;
@@ -85,11 +89,18 @@ export interface AntigravitySubmitEntry {
 
 const MAX_TRACKED_ENTRIES = 512;
 
+/** A record's identity across the compact and full transcripts: agy writes
+ *  the same step_index to both. Without one, the byte offset only identifies
+ *  it within that file. */
+function recordKey(path: string, match: AntigravityUserInputMatch): string {
+  return match.stepIndex !== undefined ? `step:${match.stepIndex}` : `at:${path}:${match.offset}`;
+}
+
 export class AntigravitySubmitLedger {
   private entries: AntigravitySubmitEntry[] = [];
   private seq = 0;
-  /** Claimed record offsets per conversation, all on one transcript file. */
-  private claims = new Map<string, { path: string; offsets: Set<number> }>();
+  /** Claimed record identities per conversation (see recordKey). */
+  private claims = new Map<string, Set<string>>();
 
   constructor(private readonly brainDir?: string) {}
 
@@ -114,19 +125,26 @@ export class AntigravitySubmitLedger {
     if (this.ambiguous(entry)) return false;
     const path = resolveAntigravityTranscriptPath(conversationId, this.brainDir ? { brainDir: this.brainDir } : {});
     if (!path) return false;
-    const minOffset = antigravityBaselineMinOffset(conversationId, path, entry.baseline);
-    if (minOffset === undefined) return false;
-    const claimed = this.claims.get(conversationId);
-    if (claimed && claimed.path !== path) return false; // offsets of another file cannot be compared
-    // While the ambiguity rule holds, a claimed record already precedes this
-    // baseline; skipping claimed offsets keeps that true across baseline
-    // remapping (compact → full) too.
-    const offset = listAntigravityUserInputMatchOffsets(path, entry.sha, minOffset)
-      .find(candidate => !claimed?.offsets.has(candidate));
-    if (offset === undefined) return false;
-    if (claimed) claimed.offsets.add(offset);
-    else this.claims.set(conversationId, { path, offsets: new Set([offset]) });
-    entry.claim = { conversationId, path, offset };
+    if (entry.scan?.path !== path) {
+      // First probe, or agy switched compact → full: rescan this file from
+      // the baseline mapped into it.
+      const minOffset = antigravityBaselineMinOffset(conversationId, path, entry.baseline);
+      if (minOffset === undefined) return false;
+      entry.scan = { path, nextOffset: minOffset, matches: [] };
+    }
+    // Only the bytes appended since the last probe are read.
+    const scanned = scanAntigravityUserInputMatches(path, entry.sha, entry.scan.nextOffset);
+    if (!scanned) return false;
+    entry.scan.matches.push(...scanned.matches);
+    entry.scan.nextOffset = scanned.nextOffset;
+    const claimed = this.claims.get(conversationId) ?? new Set<string>();
+    const match = entry.scan.matches.find(candidate => !claimed.has(recordKey(path, candidate)));
+    if (!match) return false;
+    const key = recordKey(path, match);
+    claimed.add(key);
+    this.claims.set(conversationId, claimed);
+    entry.claim = { conversationId, key };
+    entry.scan = undefined;
     return true;
   }
 
@@ -139,7 +157,7 @@ export class AntigravitySubmitLedger {
   }
 
   private prune(): void {
-    // Claimed entries live on only as claimed offsets.
+    // Claimed entries live on only as claimed record keys.
     this.entries = this.entries.filter(entry => !entry.claim);
     if (this.entries.length <= MAX_TRACKED_ENTRIES) return;
     // Over the cap, forget settled entries that no unresolved same-text submit
