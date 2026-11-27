@@ -53,7 +53,7 @@ describe('hot host policy through real authority, credentials and executor', () 
  });
  it('actor-read uses the officially matched personal grant and cannot fall back',async()=>{
   const s=await setup();s.setGlobal({'codebase.mr.list':'actor'});const result=await s.execute();expect(result.outcome).toBe('completed');
-  expect(s.dispatches).toEqual(['person@example.test']);expect(s.identityLookups()).toBe(1);expect(s.audit.every(row=>row.effect==='read'&&row.phase==='result')).toBe(true);
+  expect(s.dispatches).toEqual(['person@example.test']);expect(s.identityLookups()).toBe(1);expect(s.audit).toHaveLength(1);expect(s.audit[0]).toMatchObject({effect:'read',phase:'result'});expect(s.audit.some(row=>row.phase==='intent')).toBe(false);
   s.grant(false);expect((await s.execute(read(),'no-grant')).errorCode).toBe('actor_auth_required');expect(s.dispatches).toHaveLength(1);
   s.grant(true);s.official('wrong@example.test');expect((await s.execute(read(),'wrong-account')).errorCode).toBe('actor_identity_unverified');expect(s.dispatches).toHaveLength(1);expect(s.minted).not.toContain('machine');
  });

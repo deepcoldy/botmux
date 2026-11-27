@@ -167,6 +167,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
   { id: 'trigger-user-auth', tab: 'security', titleKey: 'botDefaults.sectionTriggerUserAuth', fieldKeys: [
     'botDefaults.triggerUserAuthToggle',
     'botDefaults.bytecloudExecution',
+    'botDefaults.bytedcliPolicyTitle',
     'botDefaults.triggerUserAuthSource',
     'botDefaults.triggerUserAuthSourceDefault',
     'botDefaults.triggerUserAuthDelegateOnMention',
@@ -493,6 +494,7 @@ export type BotDefaultsRow = {
     /** A shared mode or separate modes for Feishu and ByteCloud. */
     credentialSource?: TriggerUserAuthCredentialSourceConfig;
     bytecloudExecution?: 'trigger-user' | 'read-machine-write-actor';
+    bytedcliOperationPolicy?: import('../../core/bytedcli-operation-policy-config.js').BytedcliOperationPolicy | null;
     allowOwnerActor?: boolean;
     dispatchOnly?: import('../../services/trigger-user-auth.js').TriggerUserAuthConfig['dispatchOnly'];
     /** `--mention` handoffs to bots on this machine carry this turn's sender.

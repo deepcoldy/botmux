@@ -2,6 +2,14 @@
 
 审核基于安装候选 `@bytedance-dev/bytedcli` **0.199.0** 的发布源码，目录版本 `2026-11-26.1`。本目录只支持 `cn` 认证分区；未知 release、命令、参数和区域均拒绝。源码审核只读取文件，并用独立 Commander 实例验证参数 grammar；没有调用业务接口、个人授权或更新 CLI。
 
+## 目录维护与运行规则
+
+随 Botmux 发布的 `src/core/bytedcli-operation-catalog.json` 是审核数据，包含 release/catalog 版本、规范 ID、命令路径与别名、真实效果和封闭参数 grammar；纯 TypeScript loader 验证并冻结整份目录。新增命令、选项或改变效果必须重新审核实际 handler/service/API 链，更新该文件与行为测试，再发布新版本。宿主规则文件和 Bot 配置不能加载外部目录、登记未审核 ID、改变 read/write 效果或绕过参数重建。
+
+运行规则采用 `botmux.bytedcli-operation-policy.v1`、CLI `0.199.0`、catalog `2026-11-26.1`。宿主固定文件为 `~/.botmux/host-authority/bytedcli-broker/policy/operation-policy.json`；Bot 为 `triggerUserAuth.bytedcliOperationPolicy`。二者使用规范 ID 的 `machine` / `actor` / `deny` 映射，缺项继承。`machine` 仅用于真实读取；写入始终执行人；禁用优先，Bot 只能进一步收紧宿主。所有已登记别名继承同一规范 ID 的规则。auth/help 保留专用适配器与个人控制边界。
+
+[配置示例、私有权限、Dashboard 与失效恢复](bytedcli-read-write-identity.md#逐命令规则与宿主限制)说明全局和 Bot JSON、旧客户端保留与显式清除语义。运行时验证文件及修订，身份查询之前拒绝禁用/无效配置；排队、取票、派发和返回持续绑定修订。actor-read 的真实效果仍为 read，使用读额度/结果审计；业务 write 仍须 durable intent。已派发写入在同一执行中保留 request ID 派发记录，策略变动不会解除重复写入防线；结果未知无自动重试。
+
 ## 参数与输出边界
 
 所有业务调用由 parser 从审核字段重新生成 argv，明确添加 `--site cn`。调用方可提供的通用参数只有 `--json` / `-j`、`--site cn` 和 help；root `--version` / `-V` 只返回安全版本信息。命令里的 `--version <n>` 是 MR 版本号，其类型不同于 root version。其它全局选项全部拒绝。

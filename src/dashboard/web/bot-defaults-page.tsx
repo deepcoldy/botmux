@@ -1,3 +1,5 @@
+import { BYTEDCLI_OPERATION_CATALOG, BYTEDCLI_AUDITED_RELEASE, BYTEDCLI_OPERATION_CATALOG_VERSION } from '../../core/bytedcli-operation-catalog.js';
+import { BYTEDCLI_OPERATION_POLICY_SCHEMA, BYTEDCLI_OPERATION_POLICY_STATUS_SCHEMA, parseBytedcliOperationPolicy, resolveBytedcliOperationRule, type BytedcliOperationPolicyStatus } from '../../core/bytedcli-operation-policy-config.js';
 import { bytecloudBrokerEnabled } from '../../core/identity-policy.js';
 import {
   TASK_ROUTING_COST_TIERS,
@@ -5075,6 +5077,7 @@ export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: P
   const execution = policy?.bytecloudExecution ?? 'trigger-user';
   const strict = bytecloudBrokerEnabled(policy ? { ...policy, tools: policy.tools ?? ['lark-cli', 'bytedcli'] } : undefined);
   const capabilities = policy?.capabilities ?? ['lark-user' as const, 'bytecloud' as const, 'meego' as const];
+  const bytecloudSelected = capabilities.includes('bytecloud');
   const credentialSource = policy?.credentialSource ?? 'auto';
   const sourceOverrides = typeof credentialSource === 'object' ? credentialSource : undefined;
   const defaultSource = credentialSourceOf(policy);
@@ -5095,6 +5098,7 @@ export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: P
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [info, setInfo] = useState<{
+    bytedcliOperationPolicy?: BytedcliOperationPolicyStatus;
     authorizedCount?: number;
     tokenStoreAdvisory?: string;
     mcpAdvisory?: string;
@@ -5103,22 +5107,48 @@ export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: P
     crossPrincipalIsolation?: boolean;
   } | null>(null);
 
-  // Only fetch the advisories when the feature is on: they describe THIS
-  // policy's limits, and showing them for a bot that never enabled it would be
-  // noise about a boundary nobody asked for.
+  const [policyRefresh, setPolicyRefresh] = useState(0);
+  // Dormant strict policies can be edited only after a versioned host summary.
   useEffect(() => {
-    if (!enabled) { setInfo(null); return; }
+    if (!enabled && (execution !== 'read-machine-write-actor' || !bytecloudSelected)) { setInfo(null); return; }
+    setInfo(null);
     let alive = true;
     void (async () => {
       try {
         const res = await sendJson('GET', `/api/bots/${encodeURIComponent(bot.larkAppId)}/trigger-user-auth-status`, undefined);
-        if (alive && res.ok && res.body.ok) setInfo(res.body as any);
-      } catch { /* advisory only — never block the panel on it */ }
+        if (alive) setInfo(res.ok && res.body.ok ? res.body as any : {});
+      } catch { if (alive) setInfo({}); }
     })();
     return () => { alive = false; };
-  }, [bot.larkAppId, enabled]);
+  }, [bot.larkAppId, enabled, execution, bytecloudSelected, policyRefresh]);
 
-  async function save(next: BotDefaultsRow['triggerUserAuth']): Promise<void> {
+  const hostPolicy = info?.bytedcliOperationPolicy;
+  let globalPolicy: ReturnType<typeof parseBytedcliOperationPolicy>;
+  let policyState: 'pending' | 'unavailable' | 'invalid' | 'ready' | 'inactive' = !bytecloudSelected ? 'inactive' : info === null ? 'pending' : 'unavailable';
+  if (bytecloudSelected && hostPolicy?.schema === BYTEDCLI_OPERATION_POLICY_STATUS_SCHEMA && hostPolicy.cliVersion === BYTEDCLI_AUDITED_RELEASE
+    && hostPolicy.catalogVersion === BYTEDCLI_OPERATION_CATALOG_VERSION) {
+    if (hostPolicy.global?.state === 'invalid') policyState = 'invalid';
+    else if (hostPolicy.global?.state === 'default' || hostPolicy.global?.state === 'valid') {
+      try {
+        globalPolicy = parseBytedcliOperationPolicy({ schema: BYTEDCLI_OPERATION_POLICY_SCHEMA, cliVersion: BYTEDCLI_AUDITED_RELEASE,
+          catalogVersion: BYTEDCLI_OPERATION_CATALOG_VERSION, rules: hostPolicy.global.rules });
+        policyState = 'ready';
+      } catch { policyState = 'unavailable'; }
+    }
+  }
+  function saveOperationRule(operationId: string, value: string): void {
+    if (busy || policyState !== 'ready') return;
+    const rules = { ...policy?.bytedcliOperationPolicy?.rules };
+    if (value === '') delete rules[operationId];
+    else rules[operationId] = value as 'machine' | 'actor' | 'deny';
+    try {
+      const parsed = parseBytedcliOperationPolicy({ schema: BYTEDCLI_OPERATION_POLICY_SCHEMA, cliVersion: BYTEDCLI_AUDITED_RELEASE,
+        catalogVersion: BYTEDCLI_OPERATION_CATALOG_VERSION, rules });
+      void save({ ...policyWith({}), enabled, bytedcliOperationPolicy: parsed }, true);
+    } catch { setStatus({ ok: false, text: tr('botDefaults.bytedcliPolicyInvalidRule') }); }
+  }
+
+  async function save(next: BotDefaultsRow['triggerUserAuth'], commandRules = false): Promise<void> {
     const previous = policy;
     patchBot(bot.larkAppId, { triggerUserAuth: next });
     await saveBotField({
@@ -5127,7 +5157,7 @@ export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: P
       }),
       setStatus,
       setBusy,
-      saved: tr('botDefaults.triggerUserAuthSaved'),
+      saved: tr(commandRules ? 'botDefaults.bytedcliPolicySaved' : 'botDefaults.triggerUserAuthSaved'),
       rollback: () => patchBot(bot.larkAppId, { triggerUserAuth: previous }),
     });
   }
@@ -5189,6 +5219,45 @@ export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: P
       {execution === 'read-machine-write-actor' ? <p className="bd-section-note" data-action="trigger-user-auth-bytecloud-restrictions">
         {tr('botDefaults.bytecloudExecutionRestrictions')}
       </p> : null}
+      {execution === 'read-machine-write-actor' ? <div data-action="bytedcli-policy-table">
+        <h4>{tr('botDefaults.bytedcliPolicyTitle')}</h4>
+        <p className="bd-section-note" data-action="bytedcli-policy-state" data-state={policyState}>
+          {tr(`botDefaults.bytedcliPolicyState.${policyState}`)}
+        </p>
+        <p className="bd-section-note">{tr('botDefaults.bytedcliPolicyHelp')}</p>
+        <div style={{ overflowX: 'auto' }}>
+          <table style={{ width: '100%', fontSize: '0.9em', textAlign: 'left', borderCollapse: 'collapse' }}>
+            <thead><tr>{['Command', 'Effect', 'Global', 'Override', 'Effective'].map(column =>
+              <th key={column} style={{ padding: '8px' }}>{tr(`botDefaults.bytedcliPolicy${column}`)}</th>)}</tr></thead>
+            <tbody>{BYTEDCLI_OPERATION_CATALOG.filter(row => row.effect === 'read' || row.effect === 'write').map(row => {
+              const effective = policyState === 'ready' ? resolveBytedcliOperationRule(row.id, globalPolicy, policy?.bytedcliOperationPolicy ?? undefined) : undefined;
+              return <tr key={row.id} style={{ borderTop: '1px solid var(--border)' }}>
+                <td style={{ padding: '8px' }}><code>{row.path.join(' ')}</code></td>
+                <td data-action={`bytedcli-effect-${row.id}`} data-effect={row.effect}>{tr(`botDefaults.bytedcliPolicyEffect.${row.effect}`)}</td>
+                <td>{policyState === 'ready' ? tr(`botDefaults.bytedcliPolicyRule.${globalPolicy?.rules[row.id] ?? 'inherit'}`) : '—'}</td>
+                <td><select data-action={`bytedcli-policy-${row.id}`} value={policy?.bytedcliOperationPolicy?.rules[row.id] ?? ''}
+                  disabled={busy || policyState !== 'ready'} aria-label={`${tr('botDefaults.bytedcliPolicyOverride')}: ${row.path.join(' ')}`}
+                  onChange={event => saveOperationRule(row.id, event.currentTarget.value)}>
+                  <option value="">{tr('botDefaults.bytedcliPolicyRule.inherit')}</option>
+                  {row.effect === 'read' ? <option value="machine">{tr('botDefaults.bytedcliPolicyRule.machine')}</option> : null}
+                  <option value="actor">{tr('botDefaults.bytedcliPolicyRule.actor')}</option>
+                  <option value="deny">{tr('botDefaults.bytedcliPolicyRule.deny')}</option>
+                </select></td>
+                <td data-action={`bytedcli-effective-${row.id}`} data-enabled={effective?.enabled} data-identity={effective?.identity}>
+                  {effective ? tr(`botDefaults.bytedcliPolicyRule.${effective.enabled ? effective.identity : 'deny'}`) : '—'}
+                </td>
+              </tr>;
+            })}</tbody>
+          </table>
+        </div>
+        <div className="actions">
+          <button type="button" disabled={busy || policyState === 'pending' || policyState === 'inactive'} onClick={() => setPolicyRefresh(value => value + 1)}>{tr('botDefaults.bytedcliPolicyRefresh')}</button>
+          <button type="button" data-action="bytedcli-policy-clear" disabled={busy || policyState !== 'ready'}
+            onClick={() => { if (!busy && policyState === 'ready') void save({ ...policyWith({}), enabled, bytedcliOperationPolicy: null }, true); }}>
+            {tr('botDefaults.bytedcliPolicyClear')}
+          </button>
+        </div>
+      </div> : null}
       {enabled ? (
         <>
           <div className="bd-row">

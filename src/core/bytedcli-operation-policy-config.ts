@@ -63,3 +63,36 @@ export function resolveBytedcliOperationRule(
   return Object.freeze({ operationId, effect: operation.effect, enabled: globalRule !== 'deny' && botRule !== 'deny',
     identity: operation.effect === 'write' || globalRule === 'actor' || botRule === 'actor' ? 'actor' : 'machine' });
 }
+
+export const BYTEDCLI_OPERATION_POLICY_STATUS_SCHEMA = 'botmux.bytedcli-operation-policy-status.v1' as const;
+export interface BytedcliOperationPolicyStatus {
+  readonly schema: typeof BYTEDCLI_OPERATION_POLICY_STATUS_SCHEMA;
+  readonly cliVersion: typeof BYTEDCLI_AUDITED_RELEASE;
+  readonly catalogVersion: typeof BYTEDCLI_OPERATION_CATALOG_VERSION;
+  readonly active: boolean;
+  readonly global: {
+    readonly state: 'default' | 'valid' | 'invalid';
+    readonly revision: string;
+    readonly rules?: Readonly<Record<string, BytedcliOperationRule>>;
+    readonly errorCode?: 'operation_policy_invalid';
+  };
+  readonly botRules: Readonly<Record<string, BytedcliOperationRule>>;
+  readonly effectiveEntries: readonly ReturnType<typeof resolveBytedcliOperationRule>[];
+}
+/** Credential-free projection. The host supplies its frozen reader; browser
+ * consumers compose the same audited resolver with their current Bot edits. */
+export function projectBytedcliOperationPolicyStatus(
+  snapshot: { readonly revision: string; readonly policy?: BytedcliOperationPolicy; readonly errorCode?: 'operation_policy_invalid' },
+  botPolicy: BytedcliOperationPolicy | undefined, active: boolean,
+): BytedcliOperationPolicyStatus {
+  const invalid = snapshot.errorCode === 'operation_policy_invalid';
+  return Object.freeze({ schema: BYTEDCLI_OPERATION_POLICY_STATUS_SCHEMA, cliVersion: BYTEDCLI_AUDITED_RELEASE,
+    catalogVersion: BYTEDCLI_OPERATION_CATALOG_VERSION, active,
+    global: Object.freeze(invalid ? { state: 'invalid' as const, revision: snapshot.revision, errorCode: 'operation_policy_invalid' as const }
+      : { state: snapshot.policy ? 'valid' as const : 'default' as const, revision: snapshot.revision, rules: snapshot.policy?.rules ?? Object.freeze({}) }),
+    botRules: botPolicy?.rules ?? Object.freeze({}),
+    effectiveEntries: Object.freeze(invalid ? [] : BYTEDCLI_OPERATION_CATALOG
+      .filter(row => row.effect === 'read' || row.effect === 'write')
+      .map(row => resolveBytedcliOperationRule(row.id, snapshot.policy, botPolicy))),
+  });
+}

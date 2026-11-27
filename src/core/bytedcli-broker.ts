@@ -16,8 +16,11 @@ import { bytedcliContainmentAvailable, markBytedcliStrictSession } from './byted
 import { bytecloudBrokerEnabled } from './identity-policy.js';
 import type { BytedcliOperation } from './bytedcli-operation-policy.js';
 import type { ProcessIdentity } from './current-actor-attestation.js';
-import { createBytedcliHostOperationPolicyReader } from './bytedcli-host-operation-policy.js';
+import { createBytedcliHostOperationPolicyReader, type BytedcliHostOperationPolicySnapshot } from './bytedcli-host-operation-policy.js';
+import { projectBytedcliOperationPolicyStatus } from './bytedcli-operation-policy-config.js';
+import type { TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
 export interface BytedcliBrokerDependencies {
+  readonly operationPolicy?: () => BytedcliHostOperationPolicySnapshot;
   readonly authority: (sessionId:string,peer:ProcessIdentity,operation:BytedcliOperation,context?:BytedcliAuthorityRequestContext) => Promise<BytedcliAuthorityResult>;
   readonly personalLeases?: () => Promise<import('./bytedcli-broker-credentials.js').BytedcliLeaseResolver>;
   readonly currentWorkerGeneration?: (sessionId:string)=>number|undefined;
@@ -65,6 +68,13 @@ export class BytedcliBroker {
   private readonly owners=new Set<BytedcliRequestOwner>();
   private readonly retiring=new Map<string,Promise<void>>();
   constructor(private readonly deps:BytedcliBrokerDependencies){}
+  operationPolicyStatus(policy?: TriggerUserAuthConfig) {
+    // Only selected strict ByteCloud mode previews host rules. Disabling keeps
+    // a dormant admin preview without applying policy to legacy execution.
+    if (!policy || !bytecloudBrokerEnabled({ ...policy, enabled: true })) return undefined;
+    const snapshot = this.deps.operationPolicy?.();
+    return snapshot ? projectBytedcliOperationPolicyStatus(snapshot, policy?.bytedcliOperationPolicy, bytecloudBrokerEnabled(policy)) : undefined;
+  }
   handle(req:IncomingMessage,res:ServerResponse):Promise<void>{
     const owner:BytedcliRequestOwner={controller:new AbortController(),work:Promise.resolve()};
     this.owners.add(owner);
@@ -182,7 +192,7 @@ export function createProductionBytedcliBroker(host:Omit<import('./bytedcli-brok
     executor=new BytedcliExecutor({privateRoot:layout.privateRoot,trustedCli,leases,audit:new BytedcliBrokerAudit(layout.auditRoot),networkEnv:layout.networkEnv});
     if(closed)await executor.close();return executor;
   })();
-  return new BytedcliBroker({personalLeases:getLeases,currentWorkerGeneration:id=>host.findSession(id)?.workerGeneration,authority:(sessionId,peer,operation,context)=>resolveBytedcliAuthority({...host,operationPolicy,contains:ds=>{
+  return new BytedcliBroker({operationPolicy,personalLeases:getLeases,currentWorkerGeneration:id=>host.findSession(id)?.workerGeneration,authority:(sessionId,peer,operation,context)=>resolveBytedcliAuthority({...host,operationPolicy,contains:ds=>{
     if(bytecloudBrokerEnabled(host.policy(ds)))markBytedcliStrictSession(ds);
     if(layout.unavailableReason || !layout.runtimeStillCurrent()) return false;
     return bytedcliContainmentAvailable(ds,layout.protectedRoots);

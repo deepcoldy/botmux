@@ -1,6 +1,6 @@
 # bytedcli 读取用机器身份、写入用执行人身份
 
-这是可选的 ByteCloud 执行模式。已登记的业务读取由宿主共享账号执行，不要求当前执行人先授权；业务写入只使用本次执行所归属的已核验真人账号，缺少授权、账号不匹配或权限不足都会拒绝。多人话题里后来到达的消息不会替换正在执行的一轮身份。
+这是可选的 ByteCloud 执行模式。默认业务读取由宿主共享账号执行，不要求当前执行人先授权。版本化命令规则可以把读取收紧为执行人身份，或禁用业务命令；业务写入只使用本次执行所归属的已核验真人账号，缺少授权、账号不匹配或权限不足都会拒绝。多人话题里后来到达的消息不会替换正在执行的一轮身份。
 
 ## 配置与启用
 
@@ -24,6 +24,58 @@
 
 ![模式编辑器，使用本地假数据](assets/bytedcli-read-write-identity/mode-active.png)
 
+## 逐命令规则与宿主限制
+
+选中严格模式后，Dashboard 显示命令的实际效果、宿主规则、Bot 规则和最终状态。读取可选继承、机器身份、执行人身份或禁用；写入只有继承、执行人身份或禁用。规则保存在 Bot 配置中，只有 `enabled`、ByteCloud 和 `read-machine-write-actor` 同时启用时生效；关闭总开关或切回旧模式保留有效规则。
+
+宿主管理员通过固定文件 `~/.botmux/host-authority/bytedcli-broker/policy/operation-policy.json` 设置全局规则。文件缺失时沿用审核默认；不从 Agent 参数、环境或请求选择路径。目录须为当前宿主用户所有、权限 `0700`，文件为 `0600` 的单链接普通文件，禁止软链、特殊文件及超过 32 KiB 的 UTF-8 JSON。全局文件示例：
+
+```json
+{
+  "schema": "botmux.bytedcli-operation-policy.v1",
+  "cliVersion": "0.199.0",
+  "catalogVersion": "2026-11-26.1",
+  "rules": { "codebase.mr.list": "actor", "codebase.mr.close": "deny" }
+}
+```
+
+Bot 使用同一种版本化对象，例如：
+
+```json
+{
+  "triggerUserAuth": {
+    "enabled": true,
+    "capabilities": ["bytecloud"],
+    "bytecloudExecution": "read-machine-write-actor",
+    "credentialSource": { "bytecloud": "local" },
+    "bytedcliOperationPolicy": {
+      "schema": "botmux.bytedcli-operation-policy.v1",
+      "cliVersion": "0.199.0",
+      "catalogVersion": "2026-11-26.1",
+      "rules": { "codebase.mr.list": "actor", "bits.develop.list": "deny" }
+    }
+  }
+}
+```
+
+规则使用[审核表](bytedcli-operation-audit.md)中的规范 operationId。`codebase pr list` 等别名先归一化为同一个 ID，再应用规则。省略某项表示继承，`machine` 只允许真实读取，`actor` 允许读取或写入，`deny` 禁用调用。按审核默认 → 宿主 → Bot 合成，禁用优先于执行人，执行人优先于机器。Bot 的机器读取不能覆盖宿主的执行人规则，也不能解除宿主禁用。未知 ID、错误版本或字段、写入选机器都会原子拒绝，原配置不变。
+
+现有 PUT `/api/bots/:app/trigger-user-auth` 保存完整对象；旧客户端省略 `bytedcliOperationPolicy` 时保留已存规则，显式 `bytedcliOperationPolicy:null` 清除 Bot 规则并恢复继承。整份 `triggerUserAuth:null` 仍清除全部鉴权配置。源选择、owner、委托、git 等字段随保存保留。
+
+只有已选择严格模式且勾选 ByteCloud 时，状态接口才读取宿主规则；总开关关闭时也可预览并编辑 dormant 规则，明确返回 `active:false`。原模式或未勾选 ByteCloud 的状态查询不初始化宿主策略目录。
+
+命令策略摘要由已有 GET `/api/bots/:app/trigger-user-auth-status` 从实际冻结的宿主 reader 投影，返回版本、全局规则及修订、Bot 规则与最终效果/身份。该摘要不查询个人授权、不开始登录、不返回凭据或原始宿主路径；带 `openId` 的既有个人授权状态查询保留原合同。界面用同一审核 resolver 合成当前 Bot 编辑。宿主无兼容版本化状态时显示不可用并禁止保存命令规则，须更新宿主后刷新；全局配置无效时显示明确错误并拒绝严格调用，仍可关闭模式。点击“刷新宿主规则”获取热更新后的展示状态。
+
+![真实命令策略界面，临时 HOME 与假数据](assets/bytedcli-read-write-identity/command-policies.png)
+
+读取改为执行人身份后，仍按读取额度与结果语义处理，不写业务 intent，不产生写入未知结果；但必须有当前已核验真人的个人授权、正式账号匹配及相应委托/定时任务权限。授权缺失或账号不匹配时拒绝，不退回共享账号。auth/help 不属于业务规则，保留专用个人控制边界；help 同样显示当前有效业务策略，不触发个人授权查询。
+
+## 热更新、失效与恢复
+
+宿主每次读取严格验证固定文件，不使用上次有效配置兜底。建议管理员在同一私有目录先完整写入 `0600` 临时文件，再原子替换目标；半写、非法内容、错误权限或不稳定文件都拒绝本次严格调用。修复为有效对象或移除文件后，新请求重新解析并恢复；删除文件恢复审核默认，但不能恢复旧请求的授权。Bot 或全局修订在排队、取票、派发及返回时重新核验；变化返回 `policy_changed`，已派发写入返回 `write_outcome_unknown` 并抑制旧输出。
+
+同一执行轮的已派发写入 request ID 不因策略修改、修复、删除或缓存清理再次执行，也不重新取票。新的显式执行轮或 worker 代次遵循原退休合同，才能作为新的执行处理。客户端没有自动重试；结果未知时保留 request ID 和审计，先核对上游结果，再由真人决定是否发起新操作。
+
 ## 支持条件
 
 当前只支持 Linux、本地受管 PTY/Tmux、proven 执行身份、真实 allowlist 文件隔离和独立 PID namespace、宿主 loopback，以及新的冷启动进程。模型认证支持 Claude Code 的实际私有凭据副本，或 Codex isolated auth / isolated instance。
@@ -44,12 +96,12 @@ bytedcli 的只读边界包括祖先 `node_modules` 搜索路径、兄弟/提升
 
 | 类型 | 命令 |
 | --- | --- |
-| 机器读取 | `codebase repo get/view/list`；`codebase mr get/view/list/count/diff/files/status` |
+| 默认机器读取 | `codebase repo get/view/list`；`codebase mr get/view/list/count/diff/files/status` |
 | 执行人写入 | `codebase mr create/update/edit/close/reopen` |
-| 机器读取 | `bits develop list`；`log search-log-matchers`（仅 console 输出） |
+| 默认机器读取 | `bits develop list`；`log search-log-matchers`（仅 console 输出） |
 | 宿主安全说明 | 根或上述命令/分组的 `--help`；根 `--version`；下述个人 auth 适配器 |
 
-`bytedcli --help` 返回 JSON 命令目录、别名和允许选项；子命令 help 返回对应子集。目录只列支持范围，参数仍由严格解析器验证，不能把“某选项在列表里”理解为任意组合都支持。help/version 不运行 native CLI、不读取个人授权；version 输出 `auditedCliVersion`，表示 broker 合同版本，不声称当前宿主安装已经通过探测。实际业务调用会检查可信绝对路径上的 CLI 版本和文件完整性。
+`bytedcli --help` 返回 JSON 命令目录、别名和允许选项；子命令 help 返回对应子集。业务条目还包含当前 `enabled` 和 `executionIdentity` 投影。目录列出审核支持范围，参数仍由严格解析器验证，不能把“某选项在列表里”理解为任意组合都支持。help/version 不运行 native CLI、不读取个人授权；version 输出 `auditedCliVersion`，表示 broker 合同版本，不声称当前宿主安装已经通过探测。实际业务调用会检查可信绝对路径上的 CLI 版本和文件完整性。
 
 MR 操作须显式提供仓库，不从 Agent cwd 推断。`--body-file` / `-F` 与 stdin 在 Agent 侧读取快照，最多 2 MiB，只把字节传到宿主请求私有目录。交互式 PTY、watch、任意 JSON/raw 请求、输出文件、附件、任意 BITS 更新/发布/删除以及未列出的日志命令不支持。argv 上限 256 项 / 64 KiB，HTTP body 上限 3 MiB，合计输出上限 16 MiB，执行默认 60 秒、最大 120 秒；同时每会话最多 4 个读 / 1 个写，daemon 最多 16 次执行 / 4 个写。
 

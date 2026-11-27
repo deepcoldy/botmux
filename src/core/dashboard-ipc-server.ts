@@ -14495,6 +14495,7 @@ ipcRoute('GET', '/api/bot-trigger-user-auth-status', requireBoundBot(async (req,
     jsonRes(res, 200, {
       ok: true,
       policy,
+      bytedcliOperationPolicy: requestBytedcliBrokers.get(req)?.operationPolicyStatus(cfg.triggerUserAuth),
       authorizedCount,
       credentialSource: credentialSourceOf(policy),
       credentialSources: {

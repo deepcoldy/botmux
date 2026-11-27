@@ -14,6 +14,7 @@ import { runBytedcliExecClient } from '../src/cli/bytedcli-exec.js';
 import { readProcessStartIdentity } from '../src/utils/process-identity.js';
 import { beginReplyTargetTurn } from '../src/core/reply-target.js';
 import { BYTEDCLI_OPERATION_CATALOG } from '../src/core/bytedcli-operation-policy.js';
+import { parseBytedcliOperationPolicy } from '../src/core/bytedcli-operation-policy-config.js';
 import { createBytedcliHostOperationPolicyReader } from '../src/core/bytedcli-host-operation-policy.js';
 let cleanup: (()=>Promise<void>) | undefined;
 afterEach(async()=>{await cleanup?.();cleanup=undefined;});
@@ -84,7 +85,7 @@ async function setup(options:{failResultAudit?:boolean;denyActorWrites?:readonly
   const exitCode=await runBytedcliExecClient({sessionId:'acceptance',port,requestId:`acceptance-${++sequence}`,argv,stdout:b=>stdout+=b,stderr:b=>stderr+=b,...extra});return {exitCode,stdout,stderr};
  };
  const setGlobal=(rules:Record<string,string>)=>{operationPolicy();const next=join(privateRoot,'policy','next');writeFileSync(next,JSON.stringify({schema:'botmux.bytedcli-operation-policy.v1',cliVersion:'0.199.0',catalogVersion:'2026-11-26.1',rules}),{mode:0o600});renameSync(next,join(privateRoot,'policy','operation-policy.json'));};
- return {client,setGlobal,calls,dispatches,ds,root,auditRoot,mintedAccounts,identityLookups,requests:()=>requestCount,writes:()=>rows(writesFile),attempts:()=>rows(attemptsFile),waitDispatch:()=>{dispatchGate=deferred();return {entered:dispatchEntered.promise,release:dispatchGate.resolve};},lookup:()=>lookup,grant:(v:boolean)=>grant=v,revoke:()=>epoch++,changePolicy:()=>policy={...policy,credentialSource:'platform'},
+ return {client,setGlobal,setBot:(rules:Record<string,string>)=>policy={...policy,bytedcliOperationPolicy:parseBytedcliOperationPolicy({schema:'botmux.bytedcli-operation-policy.v1',cliVersion:'0.199.0',catalogVersion:'2026-11-26.1',rules})},calls,dispatches,ds,root,auditRoot,mintedAccounts,identityLookups,requests:()=>requestCount,writes:()=>rows(writesFile),attempts:()=>rows(attemptsFile),waitDispatch:()=>{dispatchGate=deferred();return {entered:dispatchEntered.promise,release:dispatchGate.resolve};},lookup:()=>lookup,grant:(v:boolean)=>grant=v,revoke:()=>epoch++,changePolicy:()=>policy={...policy,credentialSource:'platform'},
  waitProvider:()=>{providerGate=deferred();return {entered:entered.promise,release:providerGate.resolve};}};
 }
 const read=['codebase','repo','list'];const write=['codebase','mr','close','42','--repo','org/repo'];
@@ -98,7 +99,7 @@ it('HTTP fixed write ID never retries a fake upstream mutation after policy repl
  await f.client(write,{requestId:'fixed-policy-write'});expect(f.writes()).toEqual([{account:'a@example.test'},{account:'a@example.test'}]);
 });
 it('HTTP actor-read authenticates the exact official personal account and deny precedes identity lookup',async()=>{
- const f=await setup();f.setGlobal({'codebase.repo.list':'actor'});const personal=await f.client(read);expect(personal.exitCode).toBe(0);expect(JSON.parse(personal.stdout).account).toBe('a@example.test');
+ const f=await setup();f.setBot({'codebase.repo.list':'machine'});f.setGlobal({'codebase.repo.list':'actor'});const personal=await f.client(read);expect(personal.exitCode).toBe(0);expect(JSON.parse(personal.stdout).account).toBe('a@example.test');
  expect(f.mintedAccounts).toEqual(['a@example.test']);expect(f.writes()).toEqual([]);
  f.grant(false);expect((await f.client(read)).stderr).toContain('actor_auth_required');
  const lookups=f.lookup();f.setGlobal({'codebase.repo.list':'deny'});expect((await f.client(read)).stderr).toContain('operation_disabled');expect(f.lookup()).toBe(lookups);
@@ -194,4 +195,17 @@ it('worker generation replacement during a provider wait rejects the old write a
  expect(f.writes()).toEqual([{account:'a@example.test'}]);
  const records=readCommittedBytedcliAudit(f.auditRoot);
  expect(records.map(record=>[record.workerGeneration,record.phase]).sort()).toEqual([[2,'intent'],[2,'result']]);
+});
+
+it('global policy replacement during personal mint refuses dispatch without machine fallback',async()=>{
+ const f=await setup();f.setBot({'codebase.repo.list':'machine'});f.setGlobal({'codebase.repo.list':'actor'});
+ const gate=f.waitProvider(),pending=f.client(read);await gate.entered;f.setGlobal({'codebase.repo.list':'deny'});gate.release();
+ const result=await pending;expect(result.stderr).toContain('policy_changed');expect(result.stdout).toBe('');
+ expect(f.attempts()).toEqual([]);expect(f.mintedAccounts).toEqual(['a@example.test']);expect(f.writes()).toEqual([]);
+});
+it('global policy replacement after native write suppresses output and retains one upstream attempt',async()=>{
+ const f=await setup(),gate=f.waitDispatch(),pending=f.client(write);await gate.entered;f.setGlobal({'codebase.mr.close':'deny'});gate.release();
+ const result=await pending;expect(result.stderr).toContain('write_outcome_unknown');expect(result.stdout).toBe('');
+ expect(f.attempts()).toEqual([{account:'a@example.test',operation:'write',denied:false}]);expect(f.writes()).toEqual([{account:'a@example.test'}]);
+ const audit=readCommittedBytedcliAudit(f.auditRoot);expect(audit.some(row=>row.phase==='intent')).toBe(true);
 });
