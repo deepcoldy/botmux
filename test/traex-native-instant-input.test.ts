@@ -21,6 +21,7 @@ function harness() {
     invalidatePromptReadinessEvidence: vi.fn(), revokePromptReadiness: vi.fn(),
     idleDetector: { reset: vi.fn() }, log: vi.fn(), send: vi.fn(), cliName: () => 'TraeX',
   };
+  scope.isUserImTurnId = loadWorkerFunction('isUserImTurnId', scope);
   return { scope, target, enabled: loadWorkerFunction('traexNativeInstantInputEnabled', scope),
     preempt: loadWorkerFunction('preemptActiveTurnForNewMessage', scope) };
 }

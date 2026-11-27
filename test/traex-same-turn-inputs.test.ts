@@ -321,6 +321,7 @@ describe('TRAE messages merged into one native turn', () => {
       cancelSubmitFailureChainForTerminal: vi.fn(),
       terminalReleasesDurableTurn,
       releaseActiveTurnAuthority: vi.fn(),
+      activeTurnAuthority: { snapshot: () => undefined },
       releaseTerminatedActiveTurnAuthority: vi.fn(), retireTerminatedQueuedTurn: vi.fn(),
       scheduleConsumedQueuedTurnAdvance: vi.fn(), captureTurnFailureDiagnostics: false,
       universalOutputHandoff: false, checkpointCodexAdoptRecovery: vi.fn(), checkpointStructuredBridgeRecovery: vi.fn(),
