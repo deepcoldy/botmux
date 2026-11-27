@@ -966,6 +966,16 @@ export const CA_BUNDLE_ENV_KEYS = ['SSL_CERT_FILE'] as const;
  * TMPDIR from a shared tmux server. */
 export const SESSION_TEMP_ENV_KEYS = ['TMPDIR', 'TMP', 'TEMP'] as const;
 
+/** Antigravity OSC 7501 knobs. Excluded from BOTMUX_INJECTED_ENV_KEYS so
+ *  scrubTmuxServerGlobalEnv() and PANE_ENV_UNSET_CLAUSE never delete a user's
+ *  own tmux-server or rcfile exports on agy < 1.5.10, ACP, or non-botmux panes.
+ *  Stripped from the tmux client env so botmux never seeds them into a shared
+ *  server global, and forwarded per pane by buildBotmuxEnvAssignments when set. */
+export const ANTIGRAVITY_OSC7501_TRANSPORT_ENV_KEYS = [
+  'AGY_CLI_OSC7501',
+  'AGY_CLI_OSC7501_MESSAGES',
+] as const;
+
 const TMUX_CLIENT_STRIP_KEYS: ReadonlySet<string> = new Set([
   ...BOTMUX_INJECTED_ENV_KEYS,
   ...REDACTED_CHILD_ENV_KEYS,
@@ -983,6 +993,9 @@ const TMUX_CLIENT_STRIP_KEYS: ReadonlySet<string> = new Set([
   // Keep the daemon/session scratch path out of a newly-created shared tmux
   // server. Each botmux pane receives its own values via env(1) instead.
   ...SESSION_TEMP_ENV_KEYS,
+  // Keep botmux's per-pane Antigravity OSC 7501 settings out of a shared tmux
+  // server's global env without scrubbing user-owned server or rcfile values.
+  ...ANTIGRAVITY_OSC7501_TRANSPORT_ENV_KEYS,
 ]);
 
 const TMUX_SERVER_GLOBAL_SCRUB_KEYS: ReadonlySet<string> = new Set([

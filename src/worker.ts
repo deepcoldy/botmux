@@ -857,7 +857,18 @@ import {
 } from './utils/idle-detector.js';
 import { ProgramStatusFramingStream } from './utils/program-status-parser.js';
 import { programStatusRelayLaunch } from './core/program-status-relay-launch.js';
-import { programStatusBlockHoldsTypeAhead, programStatusEnabledForLaunch, startupIdleReportScreenAdmits } from './core/program-status-gate.js';
+import {
+  applyAdapterSpawnEnv,
+  effectiveProgramStatusEnv,
+  filterAppliedAdapterEnvUnset,
+  programStatusBlockHoldsTypeAhead,
+  programStatusDisabledByEnv,
+  programStatusEnabledForLaunch,
+  refreshStructuredPreStartLeaseFromProgramStatus,
+  shouldDeferAntigravityQuietFinalForProgramStatus,
+  shouldFireIdleAfterAntigravityQuietFlush,
+  startupIdleReportScreenAdmits,
+} from './core/program-status-gate.js';
 import { shouldFenceTraexStartupInput, traexStartupInputReady } from './core/traex-startup-input.js';
 import { busyProbeRegion } from './utils/busy-probe.js';
 import { BusyReadyFallbackGate } from './utils/busy-ready-fallback.js';
@@ -871,6 +882,7 @@ import {
   ClaudeTranscriptTurnEnd,
   claudeTranscriptLatestTurnState,
   STALE_PROGRAM_STATUS_CHECK_MS,
+  STALE_PROGRAM_STATUS_QUIET_MS,
   staleProgramStatusVerdict,
 } from './utils/stale-program-status.js';
 import {
@@ -4049,19 +4061,36 @@ const traexNativeViewportEvidence = new TraexNativeViewportEvidenceStore();
 const traexNativeViewportRefresh = new TraexNativeViewportRefreshController();
 
 function shouldEnableProgramStatus(
-  cfg: Pick<Extract<DaemonToWorker, { type: 'init' }>, 'cliId' | 'cliVersion' | 'adoptMode'>,
+  cfg: Pick<Extract<DaemonToWorker, { type: 'init' }>, 'cliId' | 'cliVersion' | 'adoptMode' | 'env' | 'envPolicy' | 'envUnset'>,
   adapter?: CliAdapter | null,
   opts: { quiet?: boolean } = {},
 ): boolean {
-  let declared = adapter?.supportsProgramStatus !== undefined ? adapter : undefined;
+  let declared = adapter ?? undefined;
   if (!declared && cfg.cliId) {
-    try { declared = createCliAdapterSync(cfg.cliId as CliId); } catch { return false; }
+    try {
+      const agyTransport = cfg.cliId === 'antigravity' ? antigravityTransport(cfg.env) : undefined;
+      declared = createCliAdapterSync(cfg.cliId as CliId, undefined, { antigravityTransport: agyTransport });
+    } catch { return false; }
   }
-  const launch = { cliVersion: cfg.cliVersion, adoptMode: cfg.adoptMode === true, remoteViewer: !!remoteWsUrl };
+  const effectiveEnv = effectiveProgramStatusEnv(process.env, {
+    botEnv: cfg.env,
+    envPolicy: cfg.envPolicy,
+    envUnset: cfg.envUnset,
+  });
+  const launch = {
+    cliVersion: cfg.cliVersion,
+    adoptMode: cfg.adoptMode === true,
+    remoteViewer: !!remoteWsUrl,
+    env: effectiveEnv,
+  };
   const enabled = programStatusEnabledForLaunch(declared, launch);
-  if (!enabled && !opts.quiet && declared?.supportsProgramStatus === true && declared.programStatusMinVersion) {
-    const why = launch.adoptMode ? 'adopted pane' : launch.remoteViewer ? 'RPC viewer'
-      : `version ${JSON.stringify(cfg.cliVersion?.split('\n')[0] ?? 'unknown')} < ${declared.programStatusMinVersion}`;
+  if (!enabled && !opts.quiet && declared?.supportsProgramStatus === true) {
+    const why = programStatusDisabledByEnv(declared.id, effectiveEnv) ? 'disabled by env'
+      : launch.adoptMode ? 'adopted pane'
+        : launch.remoteViewer ? 'RPC viewer'
+          : declared.programStatusMinVersion
+            ? `version ${JSON.stringify(cfg.cliVersion?.split('\n')[0] ?? 'unknown')} < ${declared.programStatusMinVersion}`
+            : 'disabled';
     log(`[program-status] ${declared.id} reports not parsed (${why}); idle stays on screen heuristics`);
   }
   return enabled;
@@ -5372,6 +5401,21 @@ function holdStructuredStartLeaseWhileDriverAwaitsInput(): void {
   const next = driverPendingInputTurn();
   if (!next) return;
   codexBridgeQueue.refreshUnstartedHeadAttributionLease(Date.now(), CLI_HELD_INPUT_MAX_MS, turn => turn === next);
+}
+
+/** Antigravity's cold-start first turn can report OSC 7501 `working` / `blocked`
+ *  before `transcript.jsonl` is created and `USER_INPUT` is written (>20s on
+ *  heavy workspaces / slow RPC boot). Keep unstarted pre-start leases refreshed
+ *  while OSC 7501 actively holds busy, bounded by the 120s hard ceiling so a
+ *  truly wedged CLI still expires and recovers. */
+function holdStructuredStartLeasesWhileProgramStatusBusy(): void {
+  refreshStructuredPreStartLeaseFromProgramStatus({
+    cliId: lastInitConfig?.cliId,
+    adoptMode: lastInitConfig?.adoptMode === true,
+    runnerFramedInput: cliAdapter?.runnerFramedInput === true,
+    programStatusHeldBusy: idleDetector?.programStatusHeldBusy() === true,
+    queue: codexBridgeQueue,
+  });
 }
 
 /** The CLI sends input it holds in submit order (screenHoldsSubmittedInput
@@ -13745,7 +13789,10 @@ let thinkingTurnKey: string | undefined;
 let thinkingTurn: { turnId: string; dispatchAttempt?: number } | undefined;
 /** Thinking paragraphs, interim assistant narration and tool calls/results
  *  in transcript order — each becomes its own node in the native CoT message.
- *  Append-only within a turn. */
+ *  Append-only within a turn, except zero-length tool completion markers may
+ *  be inserted before the terminal cap ellipsis. The IPC flush withholds that
+ *  ellipsis while any displayed tool call is open, so the daemon's append-only
+ *  consumer never sees an insertion into an already-sent prefix. */
 let thinkingEntries: CotEntry[] = [];
 let thinkingTotalChars = 0;
 let thinkingCapNoted = false;
@@ -13842,27 +13889,114 @@ function observeCotEntries(entries: readonly CotEntry[], turn: { turnId: string;
   const key = `${turn.turnId}|${turn.dispatchAttempt ?? ''}`;
   if (key !== thinkingTurnKey) {
     // Preserve the previous turn's trailing update before a steer/new turn
-    // replaces the accumulator inside the throttle window.
-    flushThinkingUpdate();
+    // replaces the accumulator inside the throttle window. This is the old
+    // timeline's final flush, so settle any capped tools still awaiting a
+    // result before releasing the terminal ellipsis.
+    flushThinkingUpdate(true);
     thinkingTurnKey = key;
     thinkingTurn = { turnId: turn.turnId, dispatchAttempt: turn.dispatchAttempt };
     thinkingEntries = [];
     thinkingTotalChars = 0;
     thinkingCapNoted = false;
   }
+  // Once the timeline has ended with a「…」node it never reopens for text or
+  // new tool calls. The sole exception is a zero-length completion marker for
+  // an already-displayed tool call: its real result may arrive after the cap,
+  // and pairing it before the ellipsis keeps the tool from spinning forever.
+  if (thinkingCapNoted) {
+    if (completeCotToolResultsAfterCap(kept)) scheduleThinkingEmit();
+    return;
+  }
   if (thinkingTotalChars >= THINKING_ACCUMULATED_CAP) {
-    if (!thinkingCapNoted) {
-      thinkingCapNoted = true;
-      thinkingEntries.push({ kind: 'thinking', text: '…' });
-      scheduleThinkingEmit();
-    }
+    thinkingCapNoted = true;
+    thinkingEntries.push({ kind: 'thinking', text: '…' });
+    completeCotToolResultsAfterCap(kept);
+    scheduleThinkingEmit();
     return;
   }
   for (const entry of kept) {
+    const chars = cotEntryChars(entry);
+    if (thinkingTotalChars + chars > THINKING_ACCUMULATED_CAP) {
+      // The cap holds per entry, not per batch: one long entry or a large batch
+      // must not carry the total past it. Text keeps what still fits; a tool
+      // entry is not cut (its args/result would no longer parse) and is left
+      // out. Either way the timeline ends with the「…」node now, not on the
+      // next batch.
+      const head = cotTextHead(entry, THINKING_ACCUMULATED_CAP - thinkingTotalChars);
+      if (head) {
+        thinkingEntries.push(head);
+        thinkingTotalChars += cotEntryChars(head);
+      }
+      thinkingCapNoted = true;
+      thinkingEntries.push({ kind: 'thinking', text: '…' });
+      break;
+    }
     thinkingEntries.push(entry);
-    thinkingTotalChars += cotEntryChars(entry);
+    thinkingTotalChars += chars;
   }
+  completeCotToolResultsAfterCap(kept);
   scheduleThinkingEmit();
+}
+
+/** The first `budget` characters of a thinking or text entry (never splitting a
+ *  surrogate pair), or null for a tool entry, no budget, or nothing left. */
+function cotTextHead(entry: CotEntry, budget: number): CotEntry | null {
+  if ((entry.kind !== 'thinking' && entry.kind !== 'text') || budget <= 0) return null;
+  let end = Math.min(budget, entry.text.length);
+  const last = entry.text.charCodeAt(end - 1);
+  if (end < entry.text.length && last >= 0xd800 && last <= 0xdbff) end -= 1;
+  return end > 0 ? { kind: entry.kind, text: entry.text.slice(0, end) } : null;
+}
+
+/** Ids of displayed calls without a displayed result. Set preserves call order
+ *  for the terminal fallback; a result removes its id regardless of call order. */
+function cotOpenToolCallIds(entries: readonly CotEntry[]): Set<string> {
+  const open = new Set<string>();
+  for (const entry of entries) {
+    if (entry.kind === 'tool_call') open.add(entry.id);
+    else if (entry.kind === 'tool_result') open.delete(entry.id);
+  }
+  return open;
+}
+
+function cotCapEllipsisIsTerminal(): boolean {
+  // Array.isArray also keeps extracted-function probes with a minimal cap-only
+  // scope inert; the production global is always an array.
+  const last = Array.isArray(thinkingEntries) ? thinkingEntries.at(-1) : undefined;
+  return thinkingCapNoted && last?.kind === 'thinking' && last.text === '…';
+}
+
+/** Preserve pairing for results observed after the cap without reopening the
+ *  text timeline or spending any of the character budget. The empty result is
+ *  already rendered as a compact completion marker by both card paths. Always
+ *  insert immediately before the ellipsis: flushThinkingUpdate keeps that node
+ *  off the wire until every open call is settled, so this remains append-only
+ *  from the daemon's perspective. */
+function completeCotToolResultsAfterCap(entries: readonly CotEntry[]): boolean {
+  if (!cotCapEllipsisIsTerminal()) return false;
+  const open = cotOpenToolCallIds(thinkingEntries);
+  if (open.size === 0) return false;
+  let changed = false;
+  for (const entry of entries) {
+    if (entry.kind !== 'tool_result' || !open.delete(entry.id)) continue;
+    thinkingEntries.splice(thinkingEntries.length - 1, 0, { kind: 'tool_result', id: entry.id, result: '' });
+    changed = true;
+  }
+  return changed;
+}
+
+/** Final-flush fallback for calls whose result never arrived. Prefer a bounded
+ *  UI closure over an eternally spinning tool after the turn has ended. This is
+ *  not execution evidence and does not synthesize a turn/tool terminal: the
+ *  empty result only closes the cosmetic node, including on failed/cancelled
+ *  turns where "done" means no longer running rather than successful output. */
+function settleCappedThinkingTools(): boolean {
+  if (!cotCapEllipsisIsTerminal()) return false;
+  const open = cotOpenToolCallIds(thinkingEntries);
+  if (open.size === 0) return false;
+  thinkingEntries.splice(thinkingEntries.length - 1, 0,
+    ...[...open].map(id => ({ kind: 'tool_result', id, result: '' }) satisfies CotEntry));
+  return true;
 }
 
 /** Opt-in per bot (foldBackgroundUpdates), as this worker process started with it.
@@ -14210,17 +14344,26 @@ function scheduleThinkingEmit(): void {
 
 /** Drain a pending update synchronously before its terminal IPC. A short turn
  * can be read in one batch; emitting after turn_terminal would open a bubble
- * that never receives its completion. */
-function flushThinkingUpdate(): void {
+ * that never receives its completion.
+ *
+ * A capped ellipsis stays internal while any already-displayed tool call is
+ * open; this lets a later empty completion marker join the wire tail BEFORE
+ * the ellipsis instead of invalidating the daemon's append-only sentCount.
+ * A final flush settles such calls first, guaranteeing the ellipsis and every
+ * completion are emitted before the turn's terminal IPC. */
+function flushThinkingUpdate(finalForTurn = false): void {
+  if (finalForTurn && settleCappedThinkingTools()) scheduleThinkingEmit();
   if (!thinkingEmitTimer) return;
   clearTimeout(thinkingEmitTimer);
   thinkingEmitTimer = null;
-  if (!thinkingTurn || thinkingEntries.length === 0) return;
+  const withholdCapEllipsis = cotCapEllipsisIsTerminal() && cotOpenToolCallIds(thinkingEntries).size > 0;
+  const visibleEntries = withholdCapEllipsis ? thinkingEntries.slice(0, -1) : thinkingEntries;
+  if (!thinkingTurn || visibleEntries.length === 0) return;
   thinkingLastEmitMs = Date.now();
   send({
     type: 'thinking_update',
     ...(sessionId ? { sessionId } : {}),
-    entries: thinkingEntries.slice(),
+    entries: visibleEntries.slice(),
     turnId: thinkingTurn.turnId,
     ...(thinkingTurn.dispatchAttempt !== undefined ? { dispatchAttempt: thinkingTurn.dispatchAttempt } : {}),
   });
@@ -14345,7 +14488,7 @@ function observeCodexCotSuperseded(turn: CodexPendingTurn): void {
   // first update/terminal. Never synthesize a durable terminal for this UI.
   // A dynamic reply card can exist before any activity was observed.
   // Still retire that card, without flushing/resetting another turn's CoT.
-  if (ownsThinking) flushThinkingUpdate();
+  if (ownsThinking) flushThinkingUpdate(true);
   send({
     type: 'thinking_superseded', sessionId, turnId: turn.turnId,
     ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
@@ -14361,6 +14504,7 @@ let ompQuietCandidateCompleteOffset: number | undefined;
  *  in `structuredBridgeDriverState`), same shape as OMP's. */
 let antigravityQuietCandidateKey: string | undefined;
 let antigravityQuietCandidateCompleteOffset: number | undefined;
+let antigravityQuietCandidateFirstSeenAtMs: number | undefined;
 /** Last compact→full offset mapping attempt (bound path, offset, full log
  *  size) — a mapping that failed is not re-read every tick until one of them
  *  moves. */
@@ -19874,7 +20018,7 @@ function settleKimiActivityBeforeIdle(): void {
   if (!kimiActivityObserver || !currentBotmuxTurnId) return;
   drainKimiActivityInto({ turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
   if (thinkingTurn?.turnId === currentBotmuxTurnId && thinkingTurn.dispatchAttempt === currentBotmuxDispatchAttempt) {
-    flushThinkingUpdate();
+    flushThinkingUpdate(true);
   }
 }
 
@@ -20713,6 +20857,7 @@ function codexBridgeIngest(opts: {
   flushOmpTrailingFinal?: boolean;
   flushAntigravityTrailingFinal?: boolean;
   retireAntigravityPendingTurns?: boolean;
+  onDrainedEvents?: (events: readonly CodexBridgeEvent[]) => void;
 } = {}): boolean {
   // An authoritative rebind is pending: freeze the possibly-misbound file.
   // This includes quiet flushes, whose waiting narration or sibling answer
@@ -20807,6 +20952,7 @@ function codexBridgeIngest(opts: {
   // After ingest so the latch's delivery re-kick observes the started turn —
   // the flush's own bridge mark must queue behind it, not ahead of it.
   noteSpawnArgvTurnStartTranscriptEvidence(result.events);
+  opts.onDrainedEvents?.(result.events);
   pruneExpiredStructuredHeadsAndEmit('structured ingest');
   // TRAE's structured assistant_final is authoritative. Emit immediately so
   // result delivery never depends on the remote TUI composer being recognized
@@ -20967,6 +21113,7 @@ function maybeFlushAntigravityTrailingFinalOnQuietTick(): void {
   if (antigravityPendingRebind) {
     antigravityQuietCandidateKey = undefined;
     antigravityQuietCandidateCompleteOffset = undefined;
+    antigravityQuietCandidateFirstSeenAtMs = undefined;
     return;
   }
   const candidate = antigravityBridgeState().provisionalFinal;
@@ -20976,23 +21123,38 @@ function maybeFlushAntigravityTrailingFinalOnQuietTick(): void {
     // arm the quiet latch on screen evidence the transcript contradicts).
     antigravityQuietCandidateKey = undefined;
     antigravityQuietCandidateCompleteOffset = undefined;
+    antigravityQuietCandidateFirstSeenAtMs = undefined;
     return;
   }
+  const now = Date.now();
   const key = candidate.uuid;
   if (antigravityQuietCandidateKey !== key
     || antigravityQuietCandidateCompleteOffset !== codexBridgeOffset) {
     antigravityQuietCandidateKey = key;
     antigravityQuietCandidateCompleteOffset = codexBridgeOffset;
+    antigravityQuietCandidateFirstSeenAtMs = now;
     return;
   }
   if (codexBridgePendingTail || !backend
     || !backendScreenEvidenceIsAuthoritativeForMutation()
     || !cliAdapter?.busyPattern || !cliAdapter.readyPattern) return;
+  if (shouldDeferAntigravityQuietFinalForProgramStatus({
+    blocked: !!idleDetector?.programStatusBlock(),
+    heldWorking: idleDetector?.programStatusHeldWorking() === true,
+    programStatusQuietMs: idleDetector?.programStatusQuietMs(now) ?? Number.POSITIVE_INFINITY,
+    candidateAgeMs: antigravityQuietCandidateFirstSeenAtMs !== undefined
+      ? now - antigravityQuietCandidateFirstSeenAtMs
+      : 0,
+    staleQuietMs: STALE_PROGRAM_STATUS_QUIET_MS,
+  })) {
+    return;
+  }
   try {
     const screen = captureBackendScreen(backend);
     if (!screen) return;
     if (cliAdapter.busyPattern.test(busyProbeRegion(screen))) return;
     if (!cliAdapter.readyPattern.test(stripAnsiScreenText(screen))) return;
+    if ((parseAntigravityFooterBackgroundTasks(screen) ?? 0) > 0) return;
   } catch (err: any) {
     log(`Antigravity quiet-final viewport capture failed: ${err.message}`);
     return;
@@ -21000,7 +21162,28 @@ function maybeFlushAntigravityTrailingFinalOnQuietTick(): void {
 
   antigravityQuietCandidateKey = undefined;
   antigravityQuietCandidateCompleteOffset = undefined;
-  codexBridgeIngest({ flushAntigravityTrailingFinal: true });
+  antigravityQuietCandidateFirstSeenAtMs = undefined;
+  let flushedCandidateFinal = false;
+  codexBridgeIngest({
+    flushAntigravityTrailingFinal: true,
+    onDrainedEvents: events => {
+      flushedCandidateFinal = events.some(
+        event => event.kind === 'assistant_final' && event.uuid === key,
+      );
+    },
+  });
+  // Only release a stale OSC `working` hold when this ingest explicitly emitted
+  // the held candidate as `assistant_final` AND left neither pending background
+  // tasks nor an active started turn (a concurrent tool call or follow-up
+  // USER_INPUT can clear `provisionalFinal` without ending the live turn).
+  if (shouldFireIdleAfterAntigravityQuietFlush({
+    flushedCandidateFinal,
+    heldWorking: idleDetector?.programStatusHeldWorking() === true,
+    hasPendingTasks: hasAntigravityPendingTasks(antigravityBridgeState()),
+    hasActiveStartedTurn: codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined),
+  })) {
+    idleDetector?.fireIdle();
+  }
   // A surviving pane can already be idle when a replacement worker attaches.
   // The viewport just confirmed completion, even without a new ready edge.
   if (lastInitConfig?.adoptMode) emitReadyCodexTurns();
@@ -21738,6 +21921,9 @@ function pruneExpiredStructuredHeadsAndEmit(source: string): boolean {
   holdStructuredStartLeasesWhileCliStarting();
   holdStructuredStartLeasesWhileCliHoldsInput();
   holdStructuredStartLeaseWhileDriverAwaitsInput();
+  if (typeof holdStructuredStartLeasesWhileProgramStatusBusy === 'function') {
+    holdStructuredStartLeasesWhileProgramStatusBusy();
+  }
   let fenceCurrentRpcEngine = false;
   const settledByTerminal = new Set<CodexPendingTurn>();
   const displayRetirements: CodexPendingTurn[] = [];
@@ -28612,6 +28798,9 @@ function onPtyData(data: string, isLiveStream = true): void {
       }
       const wasAuthoritative = idleDetector?.programStatusActive() ?? false;
       idleDetector?.observeProgramStatus(part.event);
+      if (part.event.state === 'working' || part.event.state === 'blocked') {
+        holdStructuredStartLeasesWhileProgramStatusBusy();
+      }
       if (part.event.state === 'working' && cliAdapter?.stuckPageFamily === 'kimi') {
         kimiCacheExpiry?.programStatusWorking();
       }
@@ -35882,13 +36071,15 @@ async function spawnCliBody(
     waitedForMissingCli = launchAdapter.waited;
   }
   // Re-verify capability once effectiveCliId (e.g. dsh-tui) and cliPathOverride are resolved into cliAdapter.
-  // A version-gated adapter (codex / traex) is decided per launch either way.
+  // A version-gated adapter (codex / traex / antigravity) is decided per launch either way.
   if (cliAdapter.programStatusMinVersion !== undefined) {
     programStatusStream = shouldEnableProgramStatus(cfg, cliAdapter)
       ? programStatusStream ?? new ProgramStatusFramingStream()
       : null;
-  } else if (cliAdapter.supportsProgramStatus && !programStatusStream) {
-    programStatusStream = new ProgramStatusFramingStream();
+  } else if (cliAdapter.supportsProgramStatus) {
+    if (!programStatusStream) programStatusStream = new ProgramStatusFramingStream();
+  } else {
+    programStatusStream = null;
   }
   traexNativeStartupInputPending = shouldFenceTraexStartupInput({
     cliId: cfg.cliId,
@@ -39034,10 +39225,14 @@ async function spawnCliBody(
   if (injectClaudeSandbox) childEnv.IS_SANDBOX = '1';
   if (claudeResumeTokenThreshold) childEnv.CLAUDE_CODE_RESUME_TOKEN_THRESHOLD = claudeResumeTokenThreshold;
   // Adapter-supplied env: points Claude-family forks at their data root (Seed's
-  // CLAUDE_CONFIG_DIR → `.claude-runtime`). Keys here are also in the tmux
+  // CLAUDE_CONFIG_DIR → `.claude-runtime`) and enables opt-in OSC 7501 where
+  // supported (Kimi / Antigravity >= 1.5.10). Keys here are also in the tmux
   // passthrough whitelist (BOTMUX_INJECTED_ENV_KEYS) so the tmux backend forwards
   // them past the server's global env.
-  if (cliAdapter.spawnEnv) Object.assign(childEnv, cliAdapter.spawnEnv);
+  const appliedAdapterSpawnEnvKeys = applyAdapterSpawnEnv(childEnv, cliAdapter, {
+    programStatusEnabled: programStatusStream !== null,
+    botEnv: perBotInjectEnv,
+  });
   if (Object.keys(piInitialPromptEnv).length > 0) {
     Object.assign(childEnv, piInitialPromptEnv);
   }
@@ -41086,7 +41281,7 @@ async function spawnCliBody(
     const spawnEnvPlan = planChildSpawnEnv({
       baseEnv: childEnv,
       botEnv: perBotInjectKeys.length ? perBotInjectEnv : undefined,
-      envUnset: cfg.envUnset,
+      envUnset: filterAppliedAdapterEnvUnset(cfg.envUnset, appliedAdapterSpawnEnvKeys),
       scope: dshTuiResumeScope({
         resume: effectiveResume,
         cliId: cliAdapter.id,
@@ -47662,7 +47857,7 @@ function emitTurnTerminal(
   }
   if (kimiActivityObserver) drainKimiActivityInto({ turnId, dispatchAttempt });
   if (thinkingTurn?.turnId === turnId && thinkingTurn.dispatchAttempt === dispatchAttempt) {
-    flushThinkingUpdate();
+    flushThinkingUpdate(true);
   }
   const diagnostics = captureTurnFailureDiagnostics && (status === 'failed' || status === 'ambiguous')
     ? turnFailureDiagnostics({ errorDetail, screen: turnFailureScreen() })
