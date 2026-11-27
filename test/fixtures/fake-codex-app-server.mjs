@@ -2,7 +2,7 @@
 
 import { spawn } from 'node:child_process';
 import { appendFileSync, closeSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { join } from 'node:path';
 
 const args = process.argv.slice(2);
 const version = process.env.FAKE_CODEX_VERSION ?? '0.136.0';
@@ -17,11 +17,12 @@ if (args[0] !== 'app-server') {
   process.exit(2);
 }
 
-const isolatedRunnerTitle = process.env.FAKE_CODEX_RUNNER_TEST === '1'
-  && basename(process.cwd()).startsWith('botmux-codex-title-');
-const logPath = isolatedRunnerTitle ? process.env.FAKE_CODEX_TITLE_LOG : process.env.FAKE_CODEX_LOG;
-const pidPath = isolatedRunnerTitle ? undefined : process.env.FAKE_CODEX_PID_PATH;
-const behavior = (isolatedRunnerTitle ? process.env.FAKE_CODEX_TITLE_BEHAVIOR : process.env.FAKE_CODEX_BEHAVIOR) ?? 'success';
+const logPath = process.env.FAKE_CODEX_LOG;
+const pidPath = process.env.FAKE_CODEX_PID_PATH;
+const behavior = process.env.FAKE_CODEX_BEHAVIOR ?? 'success';
+const persistedNamePath = process.env.FAKE_CODEX_PERSISTED_NAME_PATH;
+const firstNameWriteFault = process.env.FAKE_CODEX_FIRST_NAME_WRITE_FAULT;
+const startReleasePath = process.env.FAKE_CODEX_START_RELEASE;
 const previewDelayReads = Number(process.env.FAKE_CODEX_PREVIEW_DELAY_READS ?? '0');
 const threadNotLoadedReads = Number(process.env.FAKE_CODEX_THREAD_NOT_LOADED_READS ?? '0');
 const updatedDelayReads = Number(process.env.FAKE_CODEX_UPDATED_DELAY_READS ?? '0');
@@ -36,13 +37,13 @@ const nameSetDelayMs = Number(process.env.FAKE_CODEX_NAME_SET_DELAY_MS ?? '0');
 const verifyReadDelayMs = Number(process.env.FAKE_CODEX_VERIFY_READ_DELAY_MS ?? '0');
 const updatedBefore = Number(process.env.FAKE_CODEX_UPDATED_BEFORE ?? '100');
 const updatedAfter = Number(process.env.FAKE_CODEX_UPDATED_AFTER ?? '101');
-const finalText = isolatedRunnerTitle ? process.env.FAKE_CODEX_TITLE_FINAL_TEXT : process.env.FAKE_CODEX_FINAL_TEXT;
+const finalText = process.env.FAKE_CODEX_FINAL_TEXT;
 const envLogPath = process.env.FAKE_CODEX_ENV_LOG;
 // 结尾换行表示 PID 已写完整（test/helpers/pid-file.ts 据此判断）：writeFileSync
 // 先建空文件再写入，轮询方在这个窗口读到 ''，Number('') 是 0，而 process.kill(0, 0)
 // 探测的是测试自己的进程组，永远成功，「已回收」就永远等不到。
 if (pidPath) writeFileSync(pidPath, `${process.pid}\n`);
-if (!isolatedRunnerTitle && process.env.FAKE_CODEX_INHERITED_STDIO) {
+if (process.env.FAKE_CODEX_INHERITED_STDIO) {
   // 后代持有 stdio，让父进程 exit 后仍无法触发 close。
   spawn(process.execPath, ['-e', `
     const { appendFileSync } = require('node:fs');
@@ -73,6 +74,7 @@ let inputBuffer = '';
 let turnAttempt = 0;
 let threadReadAttempt = 0;
 let nameSetSeen = false;
+let nameWriteAttempt = 0;
 let currentThreadName = process.env.FAKE_CODEX_INITIAL_TITLE;
 let goalTurn = null;
 let reconciledTurn = null;
@@ -595,7 +597,7 @@ function handle(request) {
       thread: {
         id: request.params.threadId,
         ...(process.env.FAKE_CODEX_THREAD_PATH ? { path: process.env.FAKE_CODEX_THREAD_PATH } : {}),
-        name: (nameSetSeen ? process.env.FAKE_CODEX_EXTERNAL_TITLE : undefined) ?? currentThreadName ?? null,
+        name: currentThreadName ?? null,
         preview: threadReadAttempt > previewDelayReads ? '<botmux_routing> 首条消息预览' : '',
         updatedAt: threadReadAttempt > updatedDelayReads ? updatedAfter : updatedBefore,
       },
@@ -621,8 +623,19 @@ function handle(request) {
   }
   if (request.method === 'thread/name/set') {
     if (behavior === 'hang-name') return;
+    const fault = ++nameWriteAttempt === 1 ? firstNameWriteFault : undefined;
+    if (fault === 'reject') {
+      reject(request.id, -32000, 'temporary write failure');
+      return;
+    }
+    if (fault === 'false-ack') {
+      respond(request.id, {});
+      return;
+    }
     currentThreadName = request.params.name;
     nameSetSeen = true;
+    if (persistedNamePath) writeFileSync(persistedNamePath, currentThreadName);
+    if (fault === 'lose-ack') return;
     if (nameSetDelayMs > 0) setTimeout(() => respond(request.id, {}), nameSetDelayMs);
     else respond(request.id, {});
     return;
@@ -1050,7 +1063,16 @@ function handle(request) {
     });
     // Small delay before the response so the runner observes turn/started (and
     // can steer) strictly before the start response returns.
-    setTimeout(() => respond(request.id, { turn: { id: turnId } }), 120);
+    if (startReleasePath) {
+      const release = setInterval(() => {
+        if (!existsSync(startReleasePath)) return;
+        clearInterval(release);
+        respond(request.id, { turn: { id: turnId } });
+      }, 10);
+      release.unref();
+    } else {
+      setTimeout(() => respond(request.id, { turn: { id: turnId } }), 120);
+    }
     return;
   }
   if (behavior === 'completion-before-response-mismatch') {

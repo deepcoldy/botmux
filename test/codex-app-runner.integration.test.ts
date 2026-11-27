@@ -12,7 +12,6 @@ import {
 } from 'node:fs';
 import { createServer, type Server, type Socket } from 'node:net';
 import { createServer as createHttpServer } from 'node:http';
-import { once } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -503,7 +502,6 @@ function startRunner(
     FAKE_CODEX_LOG: logPath,
     FAKE_CODEX_VERSION: version,
     FAKE_CODEX_BEHAVIOR: behavior,
-    FAKE_CODEX_RUNNER_TEST: '1',
     NODE_ENV: 'test',
     ...options.env,
   };
@@ -688,18 +686,21 @@ afterEach(async () => {
 
 describe('codex-app-runner native thread titles', { timeout: 20_000 }, () => {
   it.each([
-    { scenario: 'clean input and semantic title', expected: ['排查图片上传出现的安全错误码', '排查图片安全错误码'] },
-    { scenario: 'first metadata read precedes persistence', notLoadedReads: '1', expected: ['排查图片上传出现的安全错误码', '排查图片安全错误码'] },
-    { scenario: 'first effective input steers the opening turn', steer: true, expected: ['排查图片上传出现的安全错误码', '排查图片安全错误码'] },
-    { scenario: 'legacy input and invalid summary', legacy: true, summary: 'not a title', expected: ['排查图片上传出现的安全错误码'] },
-    { scenario: 'manual rename during summary', externalTitle: '人工标题', expected: ['排查图片上传出现的安全错误码'] },
-    { scenario: 'existing native title', initialTitle: '已有原生标题', expected: [] },
-    { scenario: 'resumed thread', threadId: 'thread-previous', expected: [] },
-  ])('preserves title ownership for $scenario', async ({ legacy, summary, externalTitle, initialTitle, threadId, notLoadedReads, steer, expected }) => {
+    { scenario: 'structured input wins over the legacy wrapper' },
+    { scenario: 'first metadata read precedes persistence', notLoadedReads: '1' },
+    { scenario: 'first effective input steers before the opening start is acknowledged', steer: true },
+    { scenario: 'legacy input with nested headless routing', headless: true },
+    { scenario: 'first write is rejected then retried', writeFault: 'reject' },
+    { scenario: 'first write persists but loses its acknowledgement', writeFault: 'lose-ack' },
+    { scenario: 'first write is acknowledged without persisting', writeFault: 'false-ack' },
+    { scenario: 'existing manual title becomes readable after preview loading', initialTitle: '人工标题', notLoadedReads: '1' },
+    { scenario: 'resumed thread', threadId: 'thread-previous' },
+  ])('uses the first real task for $scenario', async ({ headless, initialTitle, threadId, notLoadedReads, steer, writeFault }) => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-runner-title-test-'));
     const fakeCodex = join(dir, 'fake-codex');
     const logPath = join(dir, 'requests.jsonl');
-    const titleLog = join(dir, 'titles.jsonl');
+    const releaseStart = join(dir, 'release-start');
+    const persistedName = join(dir, 'persisted-name');
     copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
     chmodSync(fakeCodex, 0o755);
     const control = new ControlCollector(dir);
@@ -707,9 +708,9 @@ describe('codex-app-runner native thread titles', { timeout: 20_000 }, () => {
     const harness = startRunner(fakeCodex, dir, logPath, '0.162.1', steer ? 'steer-started-first' : 'success', control.bootstrap.path, {
       threadId,
       env: {
-        FAKE_CODEX_TITLE_LOG: titleLog,
-        ...(summary ? { FAKE_CODEX_TITLE_FINAL_TEXT: summary } : {}),
-        ...(externalTitle ? { FAKE_CODEX_EXTERNAL_TITLE: externalTitle } : {}),
+        FAKE_CODEX_PERSISTED_NAME_PATH: persistedName,
+        ...(steer ? { FAKE_CODEX_START_RELEASE: releaseStart } : {}),
+        ...(writeFault ? { FAKE_CODEX_FIRST_NAME_WRITE_FAULT: writeFault } : {}),
         ...(initialTitle ? { FAKE_CODEX_INITIAL_TITLE: initialTitle } : {}),
         ...(notLoadedReads ? { FAKE_CODEX_THREAD_NOT_LOADED_READS: notLoadedReads } : {}),
       },
@@ -719,65 +720,40 @@ describe('codex-app-runner native thread titles', { timeout: 20_000 }, () => {
       const sendInput = (raw: string, text?: string, messageId?: string) => harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput(
         raw, text === undefined ? undefined : { text, localImages: [] }, messageId, steer,
       )}\r`);
-      const nameWrites = () => readRequests(logPath).filter(request => request.method === 'thread/name/set');
+      const requestsFor = (method: string) => readRequests(logPath).filter(request => request.method === method);
+      const readName = () => existsSync(persistedName) ? readFileSync(persistedName, 'utf8') : undefined;
       await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
-      expect(nameWrites()).toEqual([]);
-      const bootstrap = '<botmux_formatting>framework-only prompt</botmux_formatting>';
+      const bootstrap = '你是本群的 oncall 协同助手，入群后先阅读群内可见的最近消息';
       sendInput(bootstrap, steer ? bootstrap : undefined, steer ? 'om_title_opening' : undefined);
       await waitFor(harness, () => steer
-        ? control.activities.some(activity => activity.phase === 'running') || readRequests(logPath).some(request => request.method === 'turn/start')
+        ? requestsFor('turn/start').length >= 1
         : control.finals.length >= 1);
-      expect(nameWrites()).toEqual([]);
-      sendInput(`<sender>not title data</sender><user_message>${legacy ? task : 'legacy wrapper text'}</user_message>`,
-        legacy ? undefined : task, steer ? 'om_title_followup' : undefined);
-      await waitFor(harness, () => control.finals.length >= 2);
-      if (steer) expect(readRequests(logPath).filter(request => request.method === 'turn/steer')).toHaveLength(1);
-      if (expected.length) {
-        await waitFor(harness, () => readRequests(titleLog).some(request => request.method === 'thread/unsubscribe'));
-        const titleTurns = readRequests(titleLog).filter(request => request.method === 'turn/start');
-        expect(titleTurns).toHaveLength(1);
-        expect(titleTurns[0]?.params.input[0].text).toContain(JSON.stringify({ source_text: task }));
-        if (externalTitle) {
-          await waitFor(harness, () => readRequests(logPath).filter(request => request.method === 'thread/read').length >= 2);
-        }
-        await waitFor(harness, () => nameWrites().length >= expected.length);
+      expect(requestsFor('thread/name/set')).toEqual([]);
+      const headlessBody = `<botmux_headless_session trusted="true">routing</botmux_headless_session>
+<botmux_task trusted="true">${task}</botmux_task>
+<botmux_http_response_mode trusted="true">response instructions</botmux_http_response_mode>
+Headless request received from the local Botmux CLI.
+<botmux_headless_request>request metadata and duplicated task</botmux_headless_request>`;
+      sendInput(`<sender>not title data</sender><user_message>${headless ? headlessBody : 'legacy wrapper text'}</user_message>`,
+        headless ? undefined : task, steer ? 'om_title_followup' : undefined);
+      if (steer) {
+        await waitFor(harness, () => requestsFor('turn/steer').length === 1 && readName() === task, 5_000);
+        expect(control.finals).toHaveLength(0);
+        writeFileSync(releaseStart, '1');
       }
+      await waitFor(harness, () => control.finals.length >= 2);
       if (!steer) {
-        sendInput('另一个任务不应覆盖标题');
+        if (initialTitle) await waitFor(harness, () => requestsFor('thread/read').length >= 2, 5_000);
+        else if (!threadId) await waitFor(harness, () => readName() === task, 5_000);
+        if (writeFault === 'lose-ack') await waitFor(harness, () => requestsFor('thread/read').length >= 2, 5_000);
+        sendInput('后续任务不应替换首条正文');
         await waitFor(harness, () => control.finals.length >= 3);
       }
-      expect(nameWrites().map(request => request.params.name)).toEqual(expected);
-      if (!expected.length) expect(readRequests(titleLog)).toEqual([]);
-    } finally {
       await stopChild(harness.child);
-      await control.close();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('stops accepting input and control reconnects while a title turn is shutting down', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-runner-title-stop-'));
-    const fakeCodex = join(dir, 'fake-codex');
-    const logPath = join(dir, 'requests.jsonl');
-    const titleLog = join(dir, 'titles.jsonl');
-    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
-    chmodSync(fakeCodex, 0o755);
-    const control = new ControlCollector(dir);
-    await control.listen();
-    const harness = startRunner(fakeCodex, dir, logPath, '0.162.1', 'success', control.bootstrap.path, {
-      env: { FAKE_CODEX_TITLE_LOG: titleLog, FAKE_CODEX_TITLE_BEHAVIOR: 'hang-turn-completion' },
-    });
-    try {
-      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
-      harness.child.stdin.write('排查图片上传报错\r');
-      await waitFor(harness, () => control.finals.length === 1
-        && readRequests(titleLog).some(request => request.method === 'turn/start'));
-      const exited = once(harness.child, 'exit');
-      harness.child.stdin.write('\x03不应提交退出后的任务\r');
-      expect(await exited).toEqual([130, null]);
-      expect(control.authCount).toBe(1);
-      expect(readRequests(logPath).filter(request => request.method === 'turn/start')).toHaveLength(1);
-      expect(readRequests(titleLog).some(request => request.method === 'thread/unsubscribe')).toBe(true);
+      expect(requestsFor('thread/name/set').map(request => request.params.name)).toEqual(
+        initialTitle || threadId ? [] : writeFault && writeFault !== 'lose-ack' ? [task, task] : [task],
+      );
+      expect(control.finals.every(final => !final.errorCode)).toBe(true);
     } finally {
       await stopChild(harness.child);
       await control.close();
