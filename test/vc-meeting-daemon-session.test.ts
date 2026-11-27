@@ -11776,6 +11776,50 @@ describe('VC meeting daemon session lifecycle', () => {
       expect(__vcMeetingAgentTest.resolveReceiverSession(sid)?.reliableTurnTerminal).toBe(false);
     });
 
+    it('fails closed while a live worker is not ready, even without a restart pending', async () => {
+      const agyAppId = 'cli_agy_ready_fence';
+      registerBot({
+        larkAppId: agyAppId,
+        larkAppSecret: 'agent-secret',
+        name: 'Antigravity ACP Ready Fence',
+        cliId: 'antigravity',
+        backendType: 'pty',
+        workingDir: process.cwd(),
+        env: { AGY_BOTMUX_TRANSPORT: 'acp' },
+      });
+      const res = await __vcMeetingAgentTest.registerReceiverMember(
+        memberProjectionRequest(agyAppId, 'oc_agy_ready_fence', 'm_agy_ready_fence'),
+        agyAppId,
+      );
+      expect(res.status).toBe(200);
+      const sid = (res.body as { receiverSessionId: string }).receiverSessionId;
+      const ds = [...__testOnly_activeSessions.values()].find(candidate => candidate.session.sessionId === sid)!;
+
+      // A live worker mid-initial-fork: worker object exists, readiness fence
+      // down, and no restart attempt is in flight. The adapter it will run is
+      // not provably at a prompt yet, so the gate must fail closed rather than
+      // reuse the fork-time snapshot.
+      ds.workerGeneration = 1;
+      ds.session.workerGeneration = 1;
+      ds.session.status = 'active';
+      ds.worker = { killed: false } as any;
+      ds.workerReady = false;
+      ds.initConfig = {
+        type: 'init',
+        sessionId: sid,
+        workingDir: process.cwd(),
+        cliId: 'antigravity',
+        backendType: 'pty',
+        env: { AGY_BOTMUX_TRANSPORT: 'acp' },
+      } as any;
+      expect(ds.inPlaceRestartTurnTerminalPending).toBeUndefined();
+      expect(__vcMeetingAgentTest.resolveReceiverSession(sid)?.reliableTurnTerminal).toBe(false);
+
+      // Process-level ready restores the fence and the snapshot-based view.
+      ds.workerReady = true;
+      expect(__vcMeetingAgentTest.resolveReceiverSession(sid)?.reliableTurnTerminal).toBe(true);
+    });
+
     it('prefers the frozen session cliPathOverride over the live bot-level default', async () => {
       const agyAppId = 'cli_agy_path_frozen';
       registerBot({
