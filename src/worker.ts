@@ -13399,7 +13399,10 @@ let thinkingTurnKey: string | undefined;
 let thinkingTurn: { turnId: string; dispatchAttempt?: number } | undefined;
 /** Thinking paragraphs, interim assistant narration and tool calls/results
  *  in transcript order — each becomes its own node in the native CoT message.
- *  Append-only within a turn. */
+ *  Append-only within a turn, except zero-length tool completion markers may
+ *  be inserted before the terminal cap ellipsis. The IPC flush withholds that
+ *  ellipsis while any displayed tool call is open, so the daemon's append-only
+ *  consumer never sees an insertion into an already-sent prefix. */
 let thinkingEntries: CotEntry[] = [];
 let thinkingTotalChars = 0;
 let thinkingCapNoted = false;
@@ -13496,27 +13499,114 @@ function observeCotEntries(entries: readonly CotEntry[], turn: { turnId: string;
   const key = `${turn.turnId}|${turn.dispatchAttempt ?? ''}`;
   if (key !== thinkingTurnKey) {
     // Preserve the previous turn's trailing update before a steer/new turn
-    // replaces the accumulator inside the throttle window.
-    flushThinkingUpdate();
+    // replaces the accumulator inside the throttle window. This is the old
+    // timeline's final flush, so settle any capped tools still awaiting a
+    // result before releasing the terminal ellipsis.
+    flushThinkingUpdate(true);
     thinkingTurnKey = key;
     thinkingTurn = { turnId: turn.turnId, dispatchAttempt: turn.dispatchAttempt };
     thinkingEntries = [];
     thinkingTotalChars = 0;
     thinkingCapNoted = false;
   }
+  // Once the timeline has ended with a「…」node it never reopens for text or
+  // new tool calls. The sole exception is a zero-length completion marker for
+  // an already-displayed tool call: its real result may arrive after the cap,
+  // and pairing it before the ellipsis keeps the tool from spinning forever.
+  if (thinkingCapNoted) {
+    if (completeCotToolResultsAfterCap(kept)) scheduleThinkingEmit();
+    return;
+  }
   if (thinkingTotalChars >= THINKING_ACCUMULATED_CAP) {
-    if (!thinkingCapNoted) {
-      thinkingCapNoted = true;
-      thinkingEntries.push({ kind: 'thinking', text: '…' });
-      scheduleThinkingEmit();
-    }
+    thinkingCapNoted = true;
+    thinkingEntries.push({ kind: 'thinking', text: '…' });
+    completeCotToolResultsAfterCap(kept);
+    scheduleThinkingEmit();
     return;
   }
   for (const entry of kept) {
+    const chars = cotEntryChars(entry);
+    if (thinkingTotalChars + chars > THINKING_ACCUMULATED_CAP) {
+      // The cap holds per entry, not per batch: one long entry or a large batch
+      // must not carry the total past it. Text keeps what still fits; a tool
+      // entry is not cut (its args/result would no longer parse) and is left
+      // out. Either way the timeline ends with the「…」node now, not on the
+      // next batch.
+      const head = cotTextHead(entry, THINKING_ACCUMULATED_CAP - thinkingTotalChars);
+      if (head) {
+        thinkingEntries.push(head);
+        thinkingTotalChars += cotEntryChars(head);
+      }
+      thinkingCapNoted = true;
+      thinkingEntries.push({ kind: 'thinking', text: '…' });
+      break;
+    }
     thinkingEntries.push(entry);
-    thinkingTotalChars += cotEntryChars(entry);
+    thinkingTotalChars += chars;
   }
+  completeCotToolResultsAfterCap(kept);
   scheduleThinkingEmit();
+}
+
+/** The first `budget` characters of a thinking or text entry (never splitting a
+ *  surrogate pair), or null for a tool entry, no budget, or nothing left. */
+function cotTextHead(entry: CotEntry, budget: number): CotEntry | null {
+  if ((entry.kind !== 'thinking' && entry.kind !== 'text') || budget <= 0) return null;
+  let end = Math.min(budget, entry.text.length);
+  const last = entry.text.charCodeAt(end - 1);
+  if (end < entry.text.length && last >= 0xd800 && last <= 0xdbff) end -= 1;
+  return end > 0 ? { kind: entry.kind, text: entry.text.slice(0, end) } : null;
+}
+
+/** Ids of displayed calls without a displayed result. Set preserves call order
+ *  for the terminal fallback; a result removes its id regardless of call order. */
+function cotOpenToolCallIds(entries: readonly CotEntry[]): Set<string> {
+  const open = new Set<string>();
+  for (const entry of entries) {
+    if (entry.kind === 'tool_call') open.add(entry.id);
+    else if (entry.kind === 'tool_result') open.delete(entry.id);
+  }
+  return open;
+}
+
+function cotCapEllipsisIsTerminal(): boolean {
+  // Array.isArray also keeps extracted-function probes with a minimal cap-only
+  // scope inert; the production global is always an array.
+  const last = Array.isArray(thinkingEntries) ? thinkingEntries.at(-1) : undefined;
+  return thinkingCapNoted && last?.kind === 'thinking' && last.text === '…';
+}
+
+/** Preserve pairing for results observed after the cap without reopening the
+ *  text timeline or spending any of the character budget. The empty result is
+ *  already rendered as a compact completion marker by both card paths. Always
+ *  insert immediately before the ellipsis: flushThinkingUpdate keeps that node
+ *  off the wire until every open call is settled, so this remains append-only
+ *  from the daemon's perspective. */
+function completeCotToolResultsAfterCap(entries: readonly CotEntry[]): boolean {
+  if (!cotCapEllipsisIsTerminal()) return false;
+  const open = cotOpenToolCallIds(thinkingEntries);
+  if (open.size === 0) return false;
+  let changed = false;
+  for (const entry of entries) {
+    if (entry.kind !== 'tool_result' || !open.delete(entry.id)) continue;
+    thinkingEntries.splice(thinkingEntries.length - 1, 0, { kind: 'tool_result', id: entry.id, result: '' });
+    changed = true;
+  }
+  return changed;
+}
+
+/** Final-flush fallback for calls whose result never arrived. Prefer a bounded
+ *  UI closure over an eternally spinning tool after the turn has ended. This is
+ *  not execution evidence and does not synthesize a turn/tool terminal: the
+ *  empty result only closes the cosmetic node, including on failed/cancelled
+ *  turns where "done" means no longer running rather than successful output. */
+function settleCappedThinkingTools(): boolean {
+  if (!cotCapEllipsisIsTerminal()) return false;
+  const open = cotOpenToolCallIds(thinkingEntries);
+  if (open.size === 0) return false;
+  thinkingEntries.splice(thinkingEntries.length - 1, 0,
+    ...[...open].map(id => ({ kind: 'tool_result', id, result: '' }) satisfies CotEntry));
+  return true;
 }
 
 /** Opt-in per bot (foldBackgroundUpdates), as this worker process started with it.
@@ -13864,17 +13954,26 @@ function scheduleThinkingEmit(): void {
 
 /** Drain a pending update synchronously before its terminal IPC. A short turn
  * can be read in one batch; emitting after turn_terminal would open a bubble
- * that never receives its completion. */
-function flushThinkingUpdate(): void {
+ * that never receives its completion.
+ *
+ * A capped ellipsis stays internal while any already-displayed tool call is
+ * open; this lets a later empty completion marker join the wire tail BEFORE
+ * the ellipsis instead of invalidating the daemon's append-only sentCount.
+ * A final flush settles such calls first, guaranteeing the ellipsis and every
+ * completion are emitted before the turn's terminal IPC. */
+function flushThinkingUpdate(finalForTurn = false): void {
+  if (finalForTurn && settleCappedThinkingTools()) scheduleThinkingEmit();
   if (!thinkingEmitTimer) return;
   clearTimeout(thinkingEmitTimer);
   thinkingEmitTimer = null;
-  if (!thinkingTurn || thinkingEntries.length === 0) return;
+  const withholdCapEllipsis = cotCapEllipsisIsTerminal() && cotOpenToolCallIds(thinkingEntries).size > 0;
+  const visibleEntries = withholdCapEllipsis ? thinkingEntries.slice(0, -1) : thinkingEntries;
+  if (!thinkingTurn || visibleEntries.length === 0) return;
   thinkingLastEmitMs = Date.now();
   send({
     type: 'thinking_update',
     ...(sessionId ? { sessionId } : {}),
-    entries: thinkingEntries.slice(),
+    entries: visibleEntries.slice(),
     turnId: thinkingTurn.turnId,
     ...(thinkingTurn.dispatchAttempt !== undefined ? { dispatchAttempt: thinkingTurn.dispatchAttempt } : {}),
   });
@@ -13999,7 +14098,7 @@ function observeCodexCotSuperseded(turn: CodexPendingTurn): void {
   // first update/terminal. Never synthesize a durable terminal for this UI.
   // A dynamic reply card can exist before any activity was observed.
   // Still retire that card, without flushing/resetting another turn's CoT.
-  if (ownsThinking) flushThinkingUpdate();
+  if (ownsThinking) flushThinkingUpdate(true);
   send({
     type: 'thinking_superseded', sessionId, turnId: turn.turnId,
     ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
@@ -19529,7 +19628,7 @@ function settleKimiActivityBeforeIdle(): void {
   if (!kimiActivityObserver || !currentBotmuxTurnId) return;
   drainKimiActivityInto({ turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
   if (thinkingTurn?.turnId === currentBotmuxTurnId && thinkingTurn.dispatchAttempt === currentBotmuxDispatchAttempt) {
-    flushThinkingUpdate();
+    flushThinkingUpdate(true);
   }
 }
 
@@ -46804,7 +46903,7 @@ function emitTurnTerminal(
   }
   if (kimiActivityObserver) drainKimiActivityInto({ turnId, dispatchAttempt });
   if (thinkingTurn?.turnId === turnId && thinkingTurn.dispatchAttempt === dispatchAttempt) {
-    flushThinkingUpdate();
+    flushThinkingUpdate(true);
   }
   const diagnostics = captureTurnFailureDiagnostics && (status === 'failed' || status === 'ambiguous')
     ? turnFailureDiagnostics({ errorDetail, screen: turnFailureScreen() })
