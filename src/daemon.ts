@@ -3447,29 +3447,11 @@ function resolveVcMeetingReceiverSession(sessionId: string): VcMeetingReceiverSe
   try {
     const bot = getBot(ds.larkAppId);
     const cliId = (ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? bot.config.cliId) as CliId;
-    // Same three-tier precedence as every spawn-time resolver
-    // (session-manager/trigger-session): a legacy session's own frozen
-    // cliPathOverride shadows the live bot default; the bot fallback only
-    // applies when the session still runs the bot's configured CLI.
-    const cliPathOverride = ds.session.cliLaunchSnapshot?.cliPathOverride
-      ?? ds.session.cliPathOverride
-      ?? (cliId === bot.config.cliId ? bot.config.cliPathOverride : undefined);
     const backendType = resolvePairedSpawnBackendType(
       cliId,
       ds.initConfig?.backendType ?? ds.session.backendType,
       bot.config.backendType,
       config.daemon.backendType,
-    );
-    const sessionEnv = ds.initConfig
-      ? ds.initConfig.env
-      : resolveSessionEnvForSession(ds, bot.config, backendType).env;
-    const agyTransport = cliId.toLowerCase() === 'antigravity'
-      ? antigravityTransport(sessionEnv)
-      : undefined;
-    const adapter = createCliAdapterSync(
-      cliId,
-      cliPathOverride,
-      agyTransport ? { antigravityTransport: agyTransport } : undefined,
     );
     const isolation = evaluateVcMeetingConsumerIsolation({
       sandbox: ds.session.sandbox,
@@ -3477,11 +3459,55 @@ function resolveVcMeetingReceiverSession(sessionId: string): VcMeetingReceiverSe
       backendType,
     });
     if (!isolation.ok) return undefined;
+
+    const hasLiveWorker = !!(ds.worker && !ds.worker.killed);
+    const restartTurnTerminal = ds.inPlaceRestartTurnTerminal;
+    const restartTurnTerminalPending = ds.inPlaceRestartTurnTerminalPending;
+    const restartPending = !!(hasLiveWorker
+      && restartTurnTerminalPending
+      && restartTurnTerminalPending.workerGeneration === ds.workerGeneration);
+    const attested = hasLiveWorker
+      && restartTurnTerminal
+      && restartTurnTerminal.workerGeneration === ds.workerGeneration
+      ? restartTurnTerminal.reliableTurnTerminal
+      : undefined;
+    let reliableTurnTerminal = false;
+    // A live restart hides the previous attestation until its correlated
+    // success receipt arrives. Failure/timeout keep the generation-scoped
+    // pending marker, including across parked prompt_ready recovery; a late
+    // receipt cannot clear it. An untouched receipt restores the old readiness
+    // and attestation together. A workerless session instead resolves the same
+    // live env that its next cold fork will use, ignoring stale restart state.
+    if (!(hasLiveWorker && (ds.workerReady === false || restartPending))) {
+      if (attested !== undefined) {
+        reliableTurnTerminal = attested;
+      } else {
+        // Same three-tier precedence as every spawn-time resolver
+        // (session-manager/trigger-session): a legacy session's own frozen
+        // cliPathOverride shadows the live bot default; the bot fallback only
+        // applies when the session still runs the bot's configured CLI.
+        const cliPathOverride = ds.session.cliLaunchSnapshot?.cliPathOverride
+          ?? ds.session.cliPathOverride
+          ?? (cliId === bot.config.cliId ? bot.config.cliPathOverride : undefined);
+        const sessionEnv = hasLiveWorker && ds.initConfig
+          ? ds.initConfig.env
+          : resolveSessionEnvForSession(ds, bot.config, backendType).env;
+        const agyTransport = cliId.toLowerCase() === 'antigravity'
+          ? antigravityTransport(sessionEnv)
+          : undefined;
+        const adapter = createCliAdapterSync(
+          cliId,
+          cliPathOverride,
+          agyTransport ? { antigravityTransport: agyTransport } : undefined,
+        );
+        reliableTurnTerminal = adapter.reliableTurnTerminal === true;
+      }
+    }
     return {
       sessionId: ds.session.sessionId,
       chatId: ds.chatId,
       agentAppId: ds.larkAppId,
-      reliableTurnTerminal: adapter.reliableTurnTerminal === true,
+      reliableTurnTerminal,
     };
   } catch {
     return undefined;

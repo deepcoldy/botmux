@@ -98,4 +98,21 @@ describe('worker Antigravity ACP delivery', () => {
     ]);
     expect(worker.calls().filter(call => call.method === 'session/prompt')).toHaveLength(1);
   }, 30_000);
+
+  it('attests the actual ACP adapter capability with the correlated restart receipt', async () => {
+    const worker = start('before restart');
+    await waitFor(worker, () => worker.messages.some(message => message.type === 'final_output' && message.turnId === 'om_initial'));
+    worker.child.send({
+      type: 'restart', attemptId: 'restart-acp-capability', env: { AGY_BOTMUX_TRANSPORT: 'acp' },
+    } satisfies DaemonToWorker);
+    await waitFor(worker, () => worker.messages.some(message =>
+      message.type === 'restart_result'
+      && message.attemptId === 'restart-acp-capability'
+      && message.status === 'succeeded'));
+    expect(worker.messages.find(message => message.type === 'restart_result')).toMatchObject({
+      attemptId: 'restart-acp-capability',
+      status: 'succeeded',
+      reliableTurnTerminal: true,
+    });
+  }, 30_000);
 });

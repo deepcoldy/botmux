@@ -10979,6 +10979,12 @@ export function requestSessionRestart(
         const nextStatuslineLaunchGen = !opts.topicEffort ? randomUUID() : undefined;
         if (opts.topicEffort) topicEffortRestartReadiness.set(ds.session.sessionId, { attemptId, worker: ds.worker, workerGeneration: ds.workerGeneration, workerReady: !!ds.workerReady, cliReady: !!ds.cliReady, requested: opts.topicEffort });
         ds.workerReady = false;
+        // Do not infer the replacement's adapter from either the old init
+        // snapshot or the live bot config. Until this exact attempt succeeds,
+        // VC capability stays unknown even if parked prompt_ready restores the
+        // general workerReady fence. The previous attestation is retained only
+        // so an untouched request can resume it without another spawn.
+        ds.inPlaceRestartTurnTerminalPending = { workerGeneration: ds.workerGeneration, attemptId };
         // In-worker respawn: the next prompt belongs to a NEW CLI generation.
         ds.cliReady = false;
         try {
@@ -27392,7 +27398,23 @@ function setupWorkerHandlers(
         // that must release that fence. Without this assignment the terminal
         // can be prompt-ready/idle while relay and fork remain permanently
         // blocked as `worker_busy`.
+        if (restartSettled && msg.untouched
+          && ds.inPlaceRestartTurnTerminalPending?.attemptId === msg.attemptId
+          && ds.inPlaceRestartTurnTerminalPending.workerGeneration === workerGeneration) {
+          ds.inPlaceRestartTurnTerminalPending = undefined;
+        }
         if (restartSettled && validSettingReceipt && msg.status === 'succeeded') {
+          // The worker reports the adapter that actually reached the prompt.
+          // Bind it to this generation: an in-place respawn keeps it, while a
+          // refork invalidates the report without any rollback/cleanup path.
+          if (ds.inPlaceRestartTurnTerminalPending?.attemptId === msg.attemptId
+            && ds.inPlaceRestartTurnTerminalPending.workerGeneration === workerGeneration) {
+            ds.inPlaceRestartTurnTerminalPending = undefined;
+          }
+          ds.inPlaceRestartTurnTerminal = {
+            workerGeneration,
+            reliableTurnTerminal: msg.reliableTurnTerminal === true,
+          };
           ds.workerReady = true;
           // A correlated ready receipt proves the replacement exists. Do not
           // keep its predecessor's physical-exit status fencing fork/relay.

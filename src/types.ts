@@ -2953,6 +2953,9 @@ export type WorkerToDaemonBase =
   | {
       type: 'restart_result';
       untouched?: true;
+      /** Actual adapter capability at the prompt-ready edge that settles this
+       *  attempt. The daemon must not infer it from the pre-restart init snapshot. */
+      reliableTurnTerminal?: boolean;
       topicEffort?: { model: string; effort: import('./services/codex-reasoning-effort.js').CodexReasoningEffort; variant: 'standard' | 'max' };
       attemptId: string;
       status: 'succeeded' | 'failed' | 'timed_out';

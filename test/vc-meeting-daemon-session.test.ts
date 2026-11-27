@@ -11675,7 +11675,82 @@ describe('VC meeting daemon session lifecycle', () => {
       expect(__vcMeetingAgentTest.resolveReceiverSession(session!.session.sessionId)).toBeUndefined();
     });
 
-    it('honors frozen initConfig env and cliLaunchSnapshot session-env isolation', async () => {
+    it.each([
+      { initial: 'terminal', next: 'acp', initialCapability: false, nextCapability: true },
+      { initial: 'acp', next: 'terminal', initialCapability: true, nextCapability: false },
+    ] as const)('tracks $initial -> $next across live restart and cold refork', async ({
+      initial, next, initialCapability, nextCapability,
+    }) => {
+      const agyAppId = `cli_agent_agy_restart_${initial}_${next}`;
+      registerBot({
+        larkAppId: agyAppId,
+        larkAppSecret: 'agent-secret',
+        name: 'Antigravity ACP Restart',
+        cliId: 'antigravity',
+        backendType: 'pty',
+        workingDir: process.cwd(),
+        env: { AGY_BOTMUX_TRANSPORT: 'acp' },
+      });
+      const res = await __vcMeetingAgentTest.registerReceiverMember(
+        memberProjectionRequest(agyAppId, `oc_agy_restart_${initial}`, `m_agy_restart_${initial}`),
+        agyAppId,
+      );
+      expect(res.status).toBe(200);
+      const sid = (res.body as { receiverSessionId: string }).receiverSessionId;
+      const ds = [...__testOnly_activeSessions.values()].find(candidate => candidate.session.sessionId === sid)!;
+      ds.workerGeneration = 1;
+      ds.session.workerGeneration = 1;
+      ds.initConfig = {
+        type: 'init',
+        sessionId: sid,
+        workingDir: process.cwd(),
+        cliId: 'antigravity',
+        backendType: 'pty',
+        env: { AGY_BOTMUX_TRANSPORT: initial },
+      } as any;
+      ds.worker = { killed: false } as any;
+      ds.workerReady = true;
+      getBot(agyAppId).config.env = { AGY_BOTMUX_TRANSPORT: next };
+
+      // Before restart the live worker still owns the original adapter.
+      expect(__vcMeetingAgentTest.resolveReceiverSession(sid)?.reliableTurnTerminal).toBe(initialCapability);
+
+      // A pending restart makes the current adapter unknown. Even a previous
+      // successful attestation must not reopen the gate before the new receipt.
+      ds.inPlaceRestartTurnTerminal = {
+        workerGeneration: 1,
+        reliableTurnTerminal: initialCapability,
+      };
+      ds.inPlaceRestartTurnTerminalPending = { workerGeneration: 1, attemptId: 'restart-next' };
+      ds.workerReady = false;
+      expect(__vcMeetingAgentTest.resolveReceiverSession(sid)?.reliableTurnTerminal).toBe(false);
+
+      // The correlated successful receipt reports what actually reached the
+      // prompt; worker-pool's receipt wiring is covered in restart-paths tests.
+      ds.inPlaceRestartTurnTerminal = {
+        workerGeneration: 1,
+        reliableTurnTerminal: nextCapability,
+      };
+      ds.inPlaceRestartTurnTerminalPending = undefined;
+      ds.workerReady = true;
+      expect(__vcMeetingAgentTest.resolveReceiverSession(sid)?.reliableTurnTerminal).toBe(nextCapability);
+
+      // A different worker generation cannot consume the previous generation's
+      // receipt or pending marker; it falls back to its own init snapshot.
+      ds.inPlaceRestartTurnTerminalPending = { workerGeneration: 1, attemptId: 'stale-pending' };
+      ds.workerGeneration = 2;
+      ds.session.workerGeneration = 2;
+      expect(__vcMeetingAgentTest.resolveReceiverSession(sid)?.reliableTurnTerminal).toBe(initialCapability);
+
+      // Once the worker is gone, its init snapshot, attestation and pending
+      // marker are stale. The next cold fork resolves the live bot env instead.
+      ds.inPlaceRestartTurnTerminalPending = { workerGeneration: 2, attemptId: 'pending-at-exit' };
+      ds.worker = null;
+      ds.workerReady = false;
+      expect(__vcMeetingAgentTest.resolveReceiverSession(sid)?.reliableTurnTerminal).toBe(nextCapability);
+    });
+
+    it('keeps bot env out of a cold /cli-selected session', async () => {
       const agyAppId = 'cli_agent_agy_session_scope';
       registerBot({
         larkAppId: agyAppId,
@@ -11686,9 +11761,6 @@ describe('VC meeting daemon session lifecycle', () => {
         workingDir: process.cwd(),
         env: { AGY_BOTMUX_TRANSPORT: 'acp' },
       });
-
-      // Live session originally spawned under terminal transport must stay false
-      // even after the bot config switches to ACP.
       const res = await __vcMeetingAgentTest.registerReceiverMember(
         memberProjectionRequest(agyAppId, 'oc_agy_frozen', 'm_agy_frozen'),
         agyAppId,
@@ -11696,18 +11768,7 @@ describe('VC meeting daemon session lifecycle', () => {
       expect(res.status).toBe(200);
       const sid = (res.body as { receiverSessionId: string }).receiverSessionId;
       const ds = [...__testOnly_activeSessions.values()].find(candidate => candidate.session.sessionId === sid)!;
-      ds.initConfig = {
-        type: 'init',
-        sessionId: sid,
-        workingDir: process.cwd(),
-        cliId: 'antigravity',
-        backendType: 'pty',
-        env: {},
-      } as any;
-      expect(__vcMeetingAgentTest.resolveReceiverSession(sid)?.reliableTurnTerminal).toBe(false);
-
-      // Cold session with /cli cliLaunchSnapshot does not receive bot.env in worker-pool.
-      ds.initConfig = undefined;
+      expect(ds.worker).toBeNull();
       ds.session.cliLaunchSnapshot = {
         state: 'pending',
         cliId: 'antigravity',
@@ -11755,6 +11816,87 @@ describe('VC meeting daemon session lifecycle', () => {
       const botCalls = botSpy.mock.calls.filter(call => call[0] === 'antigravity');
       expect(botCalls.at(-1)?.[1]).toBe('/bot-level/agy');
       botSpy.mockRestore();
+    });
+
+    it('keeps parked prompt recovery closed through restart timeout and a late receipt', async () => {
+      const { EventEmitter } = await import('node:events');
+      const workerPool = await import('../src/core/worker-pool.js');
+      const { activeSessionKey } = await import('../src/core/types.js');
+      const appId = 'cli_agy_parked_restart_timeout';
+      registerBot({
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'antigravity',
+        backendType: 'pty',
+        workingDir: process.cwd(),
+        env: { AGY_BOTMUX_TRANSPORT: 'acp' },
+      });
+      const registered = await __vcMeetingAgentTest.registerReceiverMember(
+        memberProjectionRequest(appId, 'oc_parked_restart', 'm_parked_restart'),
+        appId,
+      );
+      expect(registered.status).toBe(200);
+      const sid = (registered.body as { receiverSessionId: string }).receiverSessionId;
+      const ds = [...__testOnly_activeSessions.values()].find(candidate => candidate.session.sessionId === sid)!;
+      const worker = new EventEmitter() as any;
+      Object.assign(worker, {
+        killed: false, connected: true, send: vi.fn(), kill: vi.fn(), pid: 12345,
+        stdout: new EventEmitter(), stderr: new EventEmitter(),
+      });
+      Object.assign(ds, {
+        worker, workerReady: true, cliReady: true, workerGeneration: 1, crashDiagnosticParked: true,
+      });
+      ds.session.workerGeneration = 1;
+      ds.session.suspendedColdResume = true;
+      ds.initConfig = {
+        type: 'init', sessionId: sid, workingDir: process.cwd(), cliId: 'antigravity',
+        backendType: 'pty', env: { AGY_BOTMUX_TRANSPORT: 'acp' },
+      } as any;
+      workerPool.initWorkerPool({
+        sessionReply: vi.fn(async () => 'om_parked_restart'),
+        getSessionWorkingDir: () => process.cwd(),
+        getActiveCount: () => 1,
+        closeSession: vi.fn(),
+      } as any);
+      workerPool.__testOnly_resetRestartCoordinator();
+      workerPool.setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+      workerPool.__testOnly_setupWorkerHandlers(ds, worker, { ready: true, failureNotified: false }, 1);
+      const observer = { source: 'slash' as const, notify: vi.fn() };
+
+      try {
+        const first = workerPool.requestSessionRestart(ds, observer)!;
+        worker.emit('message', {
+          type: 'restart_result', attemptId: first.attemptId, status: 'succeeded', reliableTurnTerminal: true,
+        });
+        expect(__vcMeetingAgentTest.resolveReceiverSession(sid)?.reliableTurnTerminal).toBe(true);
+        getBot(appId).config.env = { AGY_BOTMUX_TRANSPORT: 'terminal' };
+
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+        const second = workerPool.requestSessionRestart(ds, observer)!;
+        const restart = worker.send.mock.calls.map((call: any[]) => call[0])
+          .filter((msg: any) => msg.type === 'restart').at(-1);
+        expect(restart).toMatchObject({
+          attemptId: second.attemptId,
+          env: { AGY_BOTMUX_TRANSPORT: 'terminal' },
+        });
+        expect(__vcMeetingAgentTest.resolveReceiverSession(sid)?.reliableTurnTerminal).toBe(false);
+
+        // Parked recovery restores the general workerReady fence before any
+        // correlated restart receipt, but must not restore the old ACP capability.
+        worker.emit('message', { type: 'prompt_ready' });
+        expect(ds.workerReady).toBe(true);
+        expect(__vcMeetingAgentTest.resolveReceiverSession(sid)?.reliableTurnTerminal).toBe(false);
+
+        vi.advanceTimersByTime(40_001);
+        worker.emit('message', {
+          type: 'restart_result', attemptId: second.attemptId, status: 'succeeded', reliableTurnTerminal: false,
+        });
+        expect(__vcMeetingAgentTest.resolveReceiverSession(sid)?.reliableTurnTerminal).toBe(false);
+        expect(ds.inPlaceRestartTurnTerminalPending?.attemptId).toBe(second.attemptId);
+      } finally {
+        workerPool.setActiveSessionsRegistry(new Map());
+        workerPool.__testOnly_resetRestartCoordinator();
+      }
     });
   });
 });
