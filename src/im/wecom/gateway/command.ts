@@ -57,14 +57,15 @@ import {
 } from '../config/config.js';
 export { parseWecomConfig } from '../config/config.js';
 
-export const WECOM_HELP = `用法: botmux wecom [--config <JSON文件>]
-      botmux wecom start|stop|restart <configId|成员名> [--json]（也可用 --config <JSON文件> 代替 configId）
+export const WECOM_HELP = `用法: botmux wecom start|stop|restart <configId|成员名> [--json]（也可用 --config <JSON文件> 代替 configId）
+      botmux wecom logs <configId|成员名> [--core] [--lines N] [--no-follow]
+      botmux wecom identify [--config <文件>] [--output <新文件>]
 start|stop|restart 交给 fleet：start 记为运行并拉起，stop 记为停止并停下（之后 botmux restart、开机自启不再拉起），restart 停下再拉起。
-先配置机器人：botmux setup --platform wecom 扫码新建；已有机器人运行 botmux setup，在来源菜单「企业微信」里选「手动输入 BotID/Secret」，或用 botmux setup --platform wecom --manual 手工配置。之后直接 botmux wecom。
-默认读取 ~/.botmux/wecom/config.json，并自动启动配置的专用本机 core。
-旧 --config / secretEnv / 外部 coreUrl 模式仍兼容；外部 core 需单独启动。
-身份验证：botmux wecom identify（只验证私聊验证码，结果写私有文件，不改白名单）。
-日志：botmux wecom logs <configId|成员名> [--core] [--lines N] [--no-follow]（网关日志并持续跟随；--core 看它的专用 core，--no-follow 只打印已有内容）。
+日志：网关日志并持续跟随；--core 看它的专用 core，--no-follow 只打印已有内容。
+身份验证：identify 只验证私聊验证码，结果写私有文件，不改白名单。
+添加机器人：在交互终端运行 botmux setup（已有机器人时先选「添加新机器人」），在「飞书应用来源」末尾的「企业微信」分区选「扫码创建新机器人」或「手动输入 BotID/Secret」，或在 Dashboard 的「添加机器人」里添加；完成后由 fleet 运行。
+botmux wecom [--config <JSON文件>] 在前台运行一个网关，fleet 为每个连接执行的就是它：默认读取 ~/.botmux/wecom/config.json，并自动启动配置的专用本机 core。
+旧 secretEnv / 外部 coreUrl 配置仍兼容；外部 core 需单独启动。
 Secret 可从0600本地凭据文件读取，无需每次 export。一个 BotID 仅允许运行一个实例。
 私聊、群内 @ 的文字对话按会话和真实 userid 隔离；群内回复公开。
 网关控制命令: /status、/stop、/restart（下一条消息创建新会话）。
@@ -249,7 +250,7 @@ export async function runWecomCommand(args: string[], deps: WecomCommandDeps = {
       }
     }
     if (!existsSync(configFile)) {
-      console.error('未找到企业微信配置。请先运行 botmux setup --platform wecom。');
+      console.error('未找到企业微信配置。请先运行 botmux setup，在「飞书应用来源」的「企业微信」分区里添加机器人，或在 Dashboard 的「添加机器人」里添加。');
       return exitCode('not_configured');
     }
     let config: WecomConfig;

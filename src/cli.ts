@@ -154,6 +154,7 @@ import {
 import {
   buildBotFromAddFlags,
   editInputFromFlags,
+  isScriptedSetupInvocation,
   maskAppSecret,
   parseCliRuntimeFlag,
   parseSetupCommand,
@@ -3139,13 +3140,10 @@ async function cmdClone(argv: string[]): Promise<void> {
 // ─── Commands ────────────────────────────────────────────────────────────────
 
 export interface SetupWizardOptions {
-  /** 显式的 `--platform feishu|lark`（解析后为 'lark'）；不带 --platform 时缺省。 */
-  platform?: 'lark';
   /**
-   * 交给企微向导并返回其退出码；`mode` 是用户在「飞书应用来源」企业微信分区里选的接入方式。
-   * 默认：`'qr'` 等价 `botmux setup --platform wecom`（不带其它参数），`'manual'` 是同一向导的
-   * 「手动凭据」模式（走 Dashboard 接入任务，不是 `--platform wecom --manual`）。
-   * 生产不传，测试用它替掉真实向导。
+   * 交给企微向导并返回其退出码；`mode` 是用户在「飞书应用来源」企业微信分区里选的接入方式
+   * （`'qr'` 扫码创建，`'manual'` 手动输入 BotID/Secret，两者都走 Dashboard 接入任务）。
+   * 默认是真实的企微向导；生产不传，测试用它替掉真实向导。
    */
   handOffToWecom?: (mode: WecomSetupMode) => Promise<number>;
 }
@@ -3160,13 +3158,13 @@ export async function cmdSetup(options: SetupWizardOptions = {}): Promise<void> 
   const hasBots = existsSync(BOTS_JSON_FILE);
   const hasEnv = existsSync(ENV_FILE);
   // 「飞书应用来源」末尾的企业微信分区：每个入口按自己的语义问 offersWecomSetupSource。
-  const context = { platform: options.platform, stdinIsTTY: process.stdin.isTTY, stdoutIsTTY: process.stdout.isTTY };
+  const context = { stdinIsTTY: process.stdin.isTTY, stdoutIsTTY: process.stdout.isTTY };
   const offerWecom = (entry: SetupSourceEntry) => offersWecomSetupSource(entry, context);
   // 调用点已关掉飞书向导的 readline；界面语言（--lang 或向导里按 L 切换过的）是进程内
   // 当前 locale，企微向导直接沿用。退出码取企微向导的返回值。
   const handOffToWecom = async (handoff: WecomSetupHandoff): Promise<void> => {
     const mode = handoff[WECOM_SETUP_HANDOFF];
-    process.exitCode = await (options.handOffToWecom ?? (selected => cmdWecomQrSetup([], { mode: selected })))(mode);
+    process.exitCode = await (options.handOffToWecom ?? cmdWecomQrSetup)(mode);
   };
 
   console.log(`\n${t('setup.wizard.title')}\n`);
@@ -5230,14 +5228,13 @@ function hostProcessesHidden(): boolean {
 }
 
 /**
- * 企微向导（`setup --platform wecom` 与 setup 来源菜单的企业微信分区共用），返回退出码。
- * `mode` 只由来源菜单给出：`'manual'` 是向导的「手动凭据」模式（Dashboard 接入任务的
- * `mode: 'manual'`），与 `--platform wecom --manual` 的手工配置无关；命令行入口恒为扫码。
+ * 企微向导，只由 setup 来源菜单的企业微信分区进入，返回退出码。`mode` 是菜单里选的接入方式：
+ * `'qr'` 扫码创建，`'manual'` 是向导的「手动凭据」模式（Dashboard 接入任务的 `mode: 'manual'`）。
  */
-async function cmdWecomQrSetup(args: string[], options: { mode?: WecomSetupMode } = {}): Promise<number> {
+async function cmdWecomQrSetup(mode: WecomSetupMode): Promise<number> {
   const { connectWecomSetupDashboard, runWecomQrSetup } = await import('./cli/wecom/setup-wizard.js');
-  return runWecomQrSetup(args, {
-    mode: options.mode,
+  return runWecomQrSetup({
+    mode,
     connect: async () => {
       const { createWecomSetupClient } = await import('./cli/wecom/onboarding-client.js');
       // Credentials must stay on the port that answered the HMAC request,
@@ -9300,8 +9297,6 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
 命令:
   setup       交互式配置（首次使用 / 添加机器人）
               默认使用 botmux 内置 Feishu Web QR 登录尝试自动导入权限/redirect/发布版本；可加 --no-open-platform-auto 跳过
-  setup --platform wecom
-              ${t('setup.platform.help_setup_wecom')}
   clone <机器人名> [--name <新名称>]
               创建新应用并复制该机器人的行为配置；留空名称自动使用 源名称-copy-时间戳
   start       启动 daemon，并启动 mode=auto 的插件 service
@@ -9311,7 +9306,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   logs        查看/跟随 daemon 日志（--lines N, --bot <0-based-index|name|appId>, --no-follow 只打印不跟随）
   sandbox-network-policy check <JSON文件> | set <appId> <JSON文件> | clear <appId>
               配置 Linux 本地 PTY oncall 公网/内网目标 IP 策略，下个新会话生效
-  wecom [--config <JSON文件>]
+  wecom start|stop|restart|logs|identify
               ${t('setup.platform.help_wecom_command')}
   serve --api-only --port <PORT> [--bot <local_slug>]
               启动无飞书凭据的独立本机 core HTTP 执行服务（可供企业微信网关使用）
@@ -24038,21 +24033,13 @@ switch (command) {
   case 'setup': {
     // 带子命令（list/add/configure/edit/remove/help）走脚本化非 TUI 模式；空参数 / 纯
     // flag（如 --no-open-platform-auto / --lang en）保持原交互 TUI，向后兼容。
-    // 显式 `--platform wecom` 直达企微流程；不带 --platform（或 feishu/lark）进飞书流程。
-    // 不带 --platform 时，交互终端里「新增机器人」入口的「飞书应用来源」末尾多一个企业微信
-    // 分区（扫码创建 / 手动输入 BotID/Secret），交给同一企微向导（判定见 offersWecomSetupSource）；
-    // 管道输入与显式 feishu/lark 的菜单与接入企微前完全一致。
-    const { parseSetupEntry, withoutLangArgs } = await import('./setup/platform-entry.js');
-    let entry: import('./setup/platform-entry.js').SetupEntry;
-    try {
-      entry = parseSetupEntry(process.argv.slice(3));
-    } catch (error) {
-      console.error((error as Error).message);
-      process.exitCode = 2;
-      break;
-    }
-    const setupArgs = entry.args;
-    const isScripted = entry.scripted;
+    const setupArgs = process.argv.slice(3);
+    const cleanSetupArgs = setupArgs.filter((a, i) => {
+      if (a === '--lang' || a.startsWith('--lang=')) return false;
+      if (i > 0 && setupArgs[i - 1] === '--lang') return false;
+      return true;
+    });
+    const isScripted = isScriptedSetupInvocation(cleanSetupArgs);
     if (!isScripted) {
       const langFlagIdx = setupArgs.findIndex(a => a === '--lang' || a.startsWith('--lang='));
       if (langFlagIdx !== -1) {
@@ -24065,19 +24052,8 @@ switch (command) {
         }
       }
     }
-    if (entry.platform === 'wecom') {
-      const wecomArgs = withoutLangArgs(setupArgs);
-      if (entry.manual) {
-        const { runWecomSetup } = await import('./cli/wecom/manual-setup.js');
-        process.exitCode = await runWecomSetup(wecomArgs);
-      } else {
-        process.exitCode = await cmdWecomQrSetup(wecomArgs);
-      }
-    } else if (isScripted) {
-      await cmdSetupScripted(setupArgs);
-    } else {
-      await cmdSetup({ platform: entry.platform });
-    }
+    if (isScripted) await cmdSetupScripted(setupArgs);
+    else await cmdSetup();
     break;
   }
   case 'clone': await cmdClone(process.argv.slice(3)); break;

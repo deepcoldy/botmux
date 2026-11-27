@@ -1,9 +1,8 @@
 /**
  * 交互式 `botmux setup` 的「飞书应用来源」末尾的企业微信分区。
  *
- * - 判定（入口语义 × 是否交互终端 × 是否显式指定了 --platform）是纯函数
- *   `offersWecomSetupSource`；只有「再加一个机器人」的入口、且 stdin 与 stdout 都是 TTY
- *   时才出现。
+ * - 判定（入口语义 × 是否交互终端）是纯函数 `offersWecomSetupSource`；只有「再加一个
+ *   机器人」的入口、且 stdin 与 stdout 都是 TTY 时才出现。
  * - `obtainCredentials` 只在调用方显式打开 `offerWecom` 时才多出这个分区：一行不可选的
  *   「企业微信」分隔，再是「扫码创建新机器人」「手动输入 BotID/Secret」。选中其一只是把
  *   「交给企微」连同接入方式交还调用方，不走任何飞书来源、不写盘。不打开时菜单仍是四项。
@@ -108,11 +107,6 @@ describe('offersWecomSetupSource：哪些入口在来源菜单里给出企业微
     for (const entry of ['first-run', 'add-bot', 'env-add-bot', 'reconfigure', 'env-overwrite', 'env-missing-credentials'] as const) {
       expect(offersWecomSetupSource(entry, terminal)).toBe(false);
     }
-  });
-
-  it('显式 --platform feishu|lark（解析为 lark）已选定飞书，不显示', () => {
-    expect(offersWecomSetupSource('first-run', { ...tty, platform: 'lark' })).toBe(false);
-    expect(offersWecomSetupSource('add-bot', { ...tty, platform: 'lark' })).toBe(false);
   });
 });
 

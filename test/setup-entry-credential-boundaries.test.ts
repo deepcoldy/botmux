@@ -4,8 +4,6 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
-import { parseSetupEntry } from '../src/setup/platform-entry.js';
-import { t } from '../src/i18n/index.js';
 import { createWecomSetupClient } from '../src/cli/wecom/onboarding-client.js';
 import { callDashboard } from '../src/cli/dashboard-endpoint.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
@@ -20,17 +18,7 @@ afterEach(() => { vi.useRealTimers(); vi.unstubAllEnvs(); for (const path of roo
 const html = () => new Response(`<meta name="botmux-csrf" content="${csrf}">`, { headers: { 'content-type': 'text/html' } });
 const json = (value: unknown) => new Response(JSON.stringify(value), { headers: { 'content-type': 'application/json' } });
 
-describe('setup entry and local credential boundaries', () => {
-  it.each(['lark', 'feishu'])('preserves original scripted fields when explicit platform is %s', platform => {
-    const args = ['add', '--app-id', 'cli_fixture', '--app-secret', 'private-input', '--lang', 'en'];
-    expect(parseSetupEntry(['--platform', platform, ...args])).toMatchObject({ platform: 'lark', args, scripted: true });
-  });
-  it('recognizes language-only invocation as interactive and old WeCom flags as manual', () => {
-    expect(parseSetupEntry(['--lang=en'])).toMatchObject({ scripted: false });
-    expect(parseSetupEntry(['--platform=wecom', '--config', '/tmp/fake', '--yes'])).toMatchObject({ platform: 'wecom', manual: true });
-    expect(() => parseSetupEntry(['--platform', 'wecom', '--platform=lark'])).toThrow(t('setup.platform.error_duplicate'));
-    expect(() => parseSetupEntry(['--manual'])).toThrow(t('setup.platform.error_manual_requires_wecom'));
-  });
+describe('setup local credential boundaries', () => {
   it('keeps cookie and CSRF on the HMAC dial port despite remote URLs and remote localUrl', async () => {
     const calls: Array<{ url: string; init: any }> = [];
     const client = await createWecomSetupClient({ ok: true, url: `https://remote.invalid/?t=${token}`, localUrl: `http://10.0.0.2:99/?t=${token}` }, 41234, {
@@ -79,15 +67,10 @@ async function cli(args: string[]) {
 }
 
 describe('real setup executable compatibility', () => {
-  // Bare `setup` (and `--lang en`) without a terminal is the Feishu wizard reading
-  // piped answers, exactly as before WeCom: see setup-default-feishu-entry.test.ts.
-  it('refuses unattended WeCom QR onboarding instead of hanging', async () => {
-    const result = await cli(['--platform', 'wecom']); expect(result.signal).toBeNull(); expect(result.status).toBe(2);
-  });
-  it.each([{ prefix: [] }, { prefix: ['--platform=lark'] }, { prefix: ['--platform=feishu'] }])('routes scripted list through original Lark JSON output: $prefix', async ({ prefix }) => {
-    const result = await cli([...prefix, 'list', '--json']); expect(result.signal).toBeNull(); expect(result.status).toBe(0); expect(JSON.parse(result.stdout)).toEqual([]);
-  });
-  it('keeps existing WeCom manual scripted entry separate from QR onboarding', async () => {
-    const result = await cli(['--platform', 'wecom', '--config', '/nonexistent/fixture.json', '--bot-id', 'fixture', '--yes']); expect(result.signal).toBeNull(); expect(result.status).toBe(2); expect(result.stdout).not.toContain('BOTMUX-ID');
+  // Bare `setup` (and `--lang en`, or unrecognised flags such as `--platform wecom`)
+  // without a terminal is the Feishu wizard reading piped answers, exactly as before
+  // WeCom: see setup-default-feishu-entry.test.ts.
+  it('routes scripted list through original Lark JSON output', async () => {
+    const result = await cli(['list', '--json']); expect(result.signal).toBeNull(); expect(result.status).toBe(0); expect(JSON.parse(result.stdout)).toEqual([]);
   });
 });

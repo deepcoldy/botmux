@@ -64,7 +64,7 @@ botmux start
 
 ### 企业微信智能机器人
 
-支持独立企业微信 WebSocket 网关，复用本机 core-only 执行层，提供私聊/群内 @ 文字连续对话，不使用话题。运行 `botmux setup`（已有机器人时先选「添加新机器人」），在「飞书应用来源」末尾的「企业微信」分区选「扫码创建新机器人」（也可直达 `botmux setup --platform wecom`），或对已在企业微信里创建好的机器人选「手动输入 BotID/Secret」；也可在 `botmux dashboard` 的「添加机器人」里点「改为添加企业微信机器人」。再用要授权的企业微信账号私聊发送配对码，完成后自动保存配置并上线。也可用 `botmux setup --platform wecom --manual` 隐藏输入凭据并配置真实 userid，之后 `botmux wecom` 一条命令启动。配置与当前能力边界见 [企业微信接入](docs/wecom.md)。
+支持独立企业微信 WebSocket 网关，复用本机 core-only 执行层，提供私聊/群内 @ 文字连续对话，不使用话题。运行 `botmux setup`（已有机器人时先选「添加新机器人」），在「飞书应用来源」末尾的「企业微信」分区选「扫码创建新机器人」，或对已在企业微信里创建好的机器人选「手动输入 BotID/Secret」；也可在 `botmux dashboard` 的「添加机器人」里点「改为添加企业微信机器人」。再用要授权的企业微信账号私聊发送配对码，完成后自动保存配置并上线。配置与当前能力边界见 [企业微信接入](docs/wecom.md)。
 
 ## 日常能怎么用
 

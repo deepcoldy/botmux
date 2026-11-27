@@ -5,8 +5,8 @@
  * 「仅本地机器人」）+ 一行「企业微信」分隔 + 「扫码创建新机器人」「手动输入 BotID/Secret」。拿到交接结果后：先
  * 关掉飞书向导的 readline，再以所选方式（qr / manual）调一次企微向导（可注入，这里永远是假
  * 的），退出码取它的返回值；不写 bots.json / .env、不迁移不备份、不打印飞书侧的收尾文案。
- * 替换飞书配置的入口（重新配置 / 覆盖 .env / .env 缺凭据兜底）、非交互终端、显式
- * --platform feishu 时来源菜单仍只有四项、没有分隔行。
+ * 替换飞书配置的入口（重新配置 / 覆盖 .env / .env 缺凭据兜底）与非交互终端时来源菜单仍只有
+ * 四项、没有分隔行。
  *
  * pickChoice 打桩：要把 isTTY 撑成 true（显示与否由它决定），真 pickChoice 一看 TTY 就进
  * raw-mode 全屏选择器，vitest 里没法驱动。readline 也换成假的，免得在测试进程的 stdin 上
@@ -290,16 +290,6 @@ describe('其余场合来源菜单仍只有四项', () => {
     const wizard = fakeWecomWizard(0);
 
     await cmdSetup({ handOffToWecom: wizard.handOffToWecom });
-
-    expect(menus).toEqual([{ title: sourceTitle(), labels: sourceLabels().slice(0, SOURCE_COUNT), separators: [] }]);
-    expect(wizard.handOffToWecom).not.toHaveBeenCalled();
-  });
-
-  it('首次配置但显式 --platform feishu|lark', async () => {
-    scriptChoices({ [sourceTitle()]: [null] });
-    const wizard = fakeWecomWizard(0);
-
-    await cmdSetup({ platform: 'lark', handOffToWecom: wizard.handOffToWecom });
 
     expect(menus).toEqual([{ title: sourceTitle(), labels: sourceLabels().slice(0, SOURCE_COUNT), separators: [] }]);
     expect(wizard.handOffToWecom).not.toHaveBeenCalled();

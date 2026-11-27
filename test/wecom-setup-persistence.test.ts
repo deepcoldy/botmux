@@ -1,11 +1,10 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough, Writable } from 'node:stream';
 import { commitWecomConfiguration, loadWecomSecret, parseWecomConfig, readWecomConfigSnapshot, type WecomConfig } from '../src/im/wecom/config/config.js';
-import { WecomBridge } from '../src/im/wecom/gateway/bridge.js';
-import { configureWecom, createWecomPrompter, runWecomSetup } from '../src/cli/wecom/manual-setup.js';
+import { createWecomPrompter } from '../src/cli/wecom/prompter.js';
 import { atomicWriteFileSync } from '../src/utils/atomic-write.js';
 import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
 const roots:string[]=[];
@@ -13,15 +12,7 @@ afterEach(()=>{for(const root of roots.splice(0))rmSync(root,{recursive:true,for
 function fixture(){const root=mkdtempSync(join(tmpdir(),'wecom-setup-persistence-'));roots.push(root);return {root,file:join(root,'config.json')}}
 const config=():WecomConfig=>({botId:'bot',secretEnv:'FAKE_EXISTING_SECRET',coreUrl:'http://127.0.0.1:19123',allowedUsers:['alice']});
 const read=(file:string)=>parseWecomConfig(JSON.parse(readFileSync(file,'utf8')));
-const prompt=(answers:Array<string|null>=[])=>{const output:string[]=[];return {output,ask:async()=>answers.shift()??null,write:(text:string)=>{output.push(text)}}};
-const values=(root:string)=>({botId:'bot',secret:'new-fake-secret',allowedUsers:['bob'],cli:'codex',backend:'pty',workingDirectory:root,port:'19123'});
 describe('WeCom setup configuration and credential persistence',()=>{
- it('leaves old config and credential byte-identical when final confirmation cancels',async()=>{
-  const f=fixture();await commitWecomConfiguration({file:f.file,previous:undefined,config:config(),newSecret:'old-fake-secret'});
-  const before=readWecomConfigSnapshot(f.file),old=read(f.file);const p=prompt(['no']);
-  expect(await configureWecom({file:f.file,prompt:p,values:values(f.root),validateCli:async()=>true})).toBe('cancelled');
-  expect(readWecomConfigSnapshot(f.file)).toBe(before);expect(loadWecomSecret(old)).toBe('old-fake-secret');expect(p.output.join('\n')).not.toContain('new-fake-secret');
- });
  it('removes only the unreferenced new generation when config commit fails',async()=>{
   const f=fixture();await commitWecomConfiguration({file:f.file,previous:undefined,config:config(),newSecret:'old-fake-secret'});
   const previous=readWecomConfigSnapshot(f.file),old=read(f.file);
@@ -53,32 +44,11 @@ describe('WeCom setup configuration and credential persistence',()=>{
   const output=['',''];const ready=children.map((child,index)=>new Promise<void>((resolve,reject)=>{child.stdout!.on('data',chunk=>{output[index]+=chunk;if(output[index].includes('ready'))resolve()});child.on('error',reject)}));
   try{await Promise.all(ready);const exits=children.map(child=>new Promise<void>(resolve=>child.once('exit',()=>resolve())));children.forEach(child=>child.stdin!.write('go'));await Promise.all(exits);expect(output.filter(value=>value.includes('won'))).toHaveLength(1);expect(output.filter(value=>value.includes('lost'))).toHaveLength(1);expect(loadWecomSecret(read(f.file))).toBe('fake-secret')}finally{children.forEach(child=>child.kill())}
  });
- it('non-TTY missing inputs fail without asking, leaking credentials, or writing state',async()=>{
-  const f=fixture(),p=prompt();p.ask=async()=>{throw new Error('must never ask')};
-  expect(await runWecomSetup(['--config',f.file,'--bot-id','bot'],{tty:false,prompt:p})).toBe(2);expect(readWecomConfigSnapshot(f.file)).toBeUndefined();
- });
- it('does not print exception details containing secret bytes',async()=>{
-  const f=fixture(),p=prompt();const source=join(f.root,'input.secret');writeFileSync(source,'marker-secret',{mode:0o600});
-  expect(await runWecomSetup(['--config',f.file,'--secret-file',source,'--bot-id','bot','--allow-user','alice','--cli','codex','--backend','pty','--working-dir',join(f.root,'marker-secret'),'--core-port','19123','--yes'],{tty:false,prompt:p})).toBe(2);
-  expect(p.output.join('\n')).not.toContain('marker-secret');expect(readWecomConfigSnapshot(f.file)).toBeUndefined();
- });
- it('retains legacy secretEnv when an interactive edit keeps its credential',async()=>{
+ it('retains legacy secretEnv when an edit commits without a new secret',async()=>{
   const f=fixture();await commitWecomConfiguration({file:f.file,previous:undefined,config:config()});
-  const p=prompt(['','no']);const v=values(f.root);delete (v as {secret?:string}).secret;
-  expect(await configureWecom({file:f.file,prompt:p,values:v,confirm:true,validateCli:async()=>true})).toBe('saved');
-  expect(read(f.file).secretEnv).toBe('FAKE_EXISTING_SECRET');expect(loadWecomSecret(read(f.file),{FAKE_EXISTING_SECRET:'legacy-fake-secret'})).toBe('legacy-fake-secret');
- });
- it('preserves an external pending turn by default but never imports it into a managed migration',async()=>{
-  const f=fixture(),oldState=join(f.root,'old-bridge');await commitWecomConfiguration({file:f.file,previous:undefined,config:{...config(),stateDir:oldState},newSecret:'old-fake-secret'});
-  const calls:any[]=[];const core={trigger:async(request:any)=>{calls.push(request);return {ok:true,triggerId:'old-trigger',target:{kind:'turn' as const,sessionId:'old-session'}}},result:async()=>({ok:true,state:'running' as const}),interrupt:async()=>{}};
-  const transport={reply:async()=>{},send:async()=>{}};const bridge=(stateDir:string)=>new WecomBridge({botId:'bot',allowedUsers:['alice'],stateFile:join(stateDir,'state.json'),transport,core});
-  const message=(messageId:string)=>({messageId,userId:'alice',conversationId:'alice',chatType:'single' as const,text:'task',replyContext:{requestId:messageId},attachments:[]});
-  const old=bridge(oldState);await old.receive(message('old'));await old.tick();expect(calls).toHaveLength(1);const disk=readFileSync(join(oldState,'state.json'),'utf8');
-  const v={...values(f.root),allowedUsers:['alice']};expect(await configureWecom({file:f.file,prompt:prompt(),values:v,nonInteractive:true,confirm:true,validateCli:async()=>true})).toBe('saved');
-  const retained=read(f.file);expect(retained.managedCore).toBeUndefined();expect(retained.stateDir).toBe(oldState);await bridge(retained.stateDir!).tick();expect(calls).toHaveLength(1);
-  expect(await configureWecom({file:f.file,prompt:prompt(),values:v,nonInteractive:true,confirm:true,manageCore:true,validateCli:async()=>true})).toBe('saved');
-  const migrated=read(f.file);expect(migrated.stateDir).not.toBe(oldState);const fresh=bridge(migrated.stateDir!);await fresh.tick();expect(calls).toHaveLength(1);
-  await fresh.receive(message('new'));await fresh.tick();expect(calls).toHaveLength(2);expect(calls[1].target.sessionId).toBeUndefined();expect(readFileSync(join(oldState,'state.json'),'utf8')).toBe(disk);
+  await commitWecomConfiguration({file:f.file,previous:readWecomConfigSnapshot(f.file),config:{...read(f.file),allowedUsers:['bob']}});
+  expect(read(f.file)).toMatchObject({allowedUsers:['bob'],secretEnv:'FAKE_EXISTING_SECRET'});expect(read(f.file).secretFile).toBeUndefined();expect(existsSync(join(f.root,'credentials'))).toBe(false);
+  expect(loadWecomSecret(read(f.file),{FAKE_EXISTING_SECRET:'legacy-fake-secret'})).toBe('legacy-fake-secret');
  });
  it('never echoes hidden typed bytes and restores terminal raw state on cancellation',async()=>{
   const input=new PassThrough() as unknown as NodeJS.ReadStream;let raw=false;Object.assign(input,{isTTY:true,setRawMode:(value:boolean)=>{raw=value}});

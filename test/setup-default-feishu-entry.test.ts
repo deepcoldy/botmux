@@ -1,9 +1,10 @@
-// `botmux setup` without --platform is the Feishu wizard: piped answers
-// (non-TTY) keep working exactly as before WeCom existed, and a terminal goes
-// straight into the Feishu flow with no platform step in front of it. On a
-// terminal the Feishu app source menu ends with a WeCom section — a separator
-// row, then "scan to create" (the same QR flow as `--platform wecom`) and
-// "enter BotID/Secret"; piped input never sees it.
+// `botmux setup` is the Feishu wizard: piped answers (non-TTY) keep working
+// exactly as before WeCom existed, and a terminal goes straight into the Feishu
+// flow with no platform step in front of it. There is no platform flag: an
+// argument like `--platform wecom` is an unrecognised flag, so setup still opens
+// the Feishu wizard rather than any WeCom flow. On a terminal the Feishu app
+// source menu ends with a WeCom section — a separator row, then "scan to
+// create" and "enter BotID/Secret"; piped input never sees it.
 import * as pty from 'node-pty';
 import { afterEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -60,12 +61,27 @@ function waitForOutput(
   });
 }
 
-describe('botmux setup without --platform (non-TTY, piped input)', () => {
+/** The Feishu app source menu as it was before WeCom: three Feishu sources and the
+ * local-only bot (that one has no i18n key; both locales show this text). */
+function feishuSourceLabels(locale: Locale): string[] {
+  return [
+    shippedText('setup.credentials.one_scan', locale),
+    shippedText('setup.credentials.pick_existing', locale),
+    shippedText('setup.credentials.manual', locale),
+    '仅本地机器人',
+  ];
+}
+const WECOM_SECTION_KEYS = ['setup.platform.source_wecom_section', 'setup.platform.source_wecom_qr', 'setup.platform.source_wecom_manual'];
+
+describe('botmux setup (non-TTY, piped input)', () => {
   it.each([
     { args: [] as string[], locale: 'zh' as Locale },
     { args: ['--lang', 'en'], locale: 'en' as Locale },
+    // Not a platform choice any more: unrecognised flags, so the same Feishu wizard.
+    { args: ['--platform', 'wecom'], locale: 'zh' as Locale },
+    { args: ['--platform=wecom', '--manual'], locale: 'zh' as Locale },
     { args: ['--platform', 'feishu'], locale: 'zh' as Locale },
-  ])('reads piped answers in the Feishu wizard: $args', async ({ args, locale }) => {
+  ])('reads piped answers in the Feishu wizard, whose source menu has no WeCom section: $args', async ({ args, locale }) => {
     const child: ChildProcess = spawnTsScript(CLI, ['setup', ...args], {
       env: freshHostEnv(),
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -77,15 +93,25 @@ describe('botmux setup without --platform (non-TTY, piped input)', () => {
       child.stdout!.setEncoding('utf8');
       child.stdout!.on('data', onData);
       child.once('exit', onExit);
-    }, text => text.includes(promptPrefix));
-    // The first menu waiting for input belongs to the Feishu wizard.
+    }, text => {
+      const at = text.lastIndexOf(promptPrefix);
+      return at !== -1 && text.indexOf(': ', at) !== -1;
+    });
+    // The first menu waiting for input is the Feishu wizard's app source menu
+    // (a fresh host), numbered exactly as before WeCom.
     expect(output).toContain(shippedText('setup.wizard.title', locale));
+    const menu = output.slice(output.indexOf(shippedText('setup.credentials.source_title', locale)));
+    const labels = feishuSourceLabels(locale);
+    labels.forEach((label, index) => expect(menu).toContain(`  ${index + 1}) ${label}`));
+    expect(menu).toContain(shippedText('setup.select.choose_prompt', locale)
+      .replace('{max}', String(labels.length)).replace('{default}', ' [1]'));
+    for (const key of WECOM_SECTION_KEYS) expect(menu).not.toContain(shippedText(key, locale));
   }, 60_000);
 });
 
 // bun's in-process node-pty delivers no onData (see session-picker-responsive);
 // the CLI itself always runs under Node+tsx here.
-describe.runIf(!isBunRuntime())('botmux setup without --platform (TTY)', () => {
+describe.runIf(!isBunRuntime())('botmux setup (TTY)', () => {
   it('opens the Feishu app source menu directly, ending with the WeCom section', async () => {
     const { command, prefixArgs } = nodeTsRunnerPrefix();
     const child = pty.spawn(command, [...prefixArgs, CLI, 'setup'], {

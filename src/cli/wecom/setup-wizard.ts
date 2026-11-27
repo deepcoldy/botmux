@@ -1,6 +1,6 @@
 import qrcode from 'qrcode-terminal';
 import { createInterface } from 'node:readline';
-import { createWecomPrompter, type WecomPrompter } from './manual-setup.js';
+import { createWecomPrompter, type WecomPrompter } from './prompter.js';
 import type { WecomOnboardingSnapshot } from '../../im/wecom/contract/dashboard-dto.js';
 import { isWecomManualBotId, isWecomManualSecret } from '../../im/wecom/contract/manual-credentials.js';
 import { t } from '../../i18n/index.js';
@@ -9,28 +9,6 @@ import { dashboardIsAbsent, executeDashboardWithFirstUseBootstrap } from '../das
 import type { DashboardEndpoint, DashboardResult } from '../dashboard-endpoint.js';
 import { WecomSetupRejectedError, type WecomSetupClient } from './onboarding-client.js';
 
-export const WECOM_QR_SETUP_HELP = `用法: botmux setup --platform wecom
-  扫码创建机器人 → 私聊配对 → 保存配置并自动上线。
-  --name <名称> --cli <CLI> --working-dir <目录> --backend <pty|tmux> --model <模型>
-  --resume <任务ID>  续办同一本机管理员登录下的任务（24小时内）
-  --cancel <任务ID>  取消本地任务，保留已创建的平台机器人
-  --manual          手工配置已有 BotID、Secret、真实 userid；不自动连接
-  原有 --config/--bot-id/--secret-file/--secret-env/--allow-user 等参数继续走手工配置。
-扫码向导需交互终端。Ctrl-C 取消当前本地流程；重新进入可选择续办。`;
-
-function parseOptions(args: string[]) {
-  const flags = new Map<string, string>();
-  for (let i = 0; i < args.length; i += 2) {
-    const flag = args[i];
-    const value = args[i + 1];
-    if (!['--name', '--cli', '--working-dir', '--backend', '--model', '--resume', '--cancel'].includes(flag)
-      || flags.has(flag) || !value || value.startsWith('--')) throw new Error('invalid_setup_options');
-    flags.set(flag, value);
-  }
-  if (flags.has('--resume') && flags.has('--cancel')) throw new Error('invalid_setup_options');
-  if ((flags.has('--resume') || flags.has('--cancel')) && flags.size !== 1) throw new Error('invalid_setup_options');
-  return flags;
-}
 const LABELS: Record<WecomOnboardingSnapshot['status'], string> = {
   starting: '正在准备企业微信扫码授权…',
   waiting_for_scan: '请用企业微信扫描二维码，创建并确认机器人。',
@@ -112,12 +90,11 @@ export async function connectWecomSetupDashboard(deps: {
 }
 
 /**
- * How the wizard gets the new bot's credentials: `qr` scans to create one
- * (`botmux setup --platform wecom`); `manual` takes the BotID / Secret of a bot
- * already created in WeCom and starts the same Dashboard onboarding job the
- * browser's manual form starts (`mode: 'manual'`) — pairing, saving and going
- * online are the same. Unrelated to `--platform wecom --manual`, which only
- * writes a configuration file.
+ * How the wizard gets the new bot's credentials, as picked in the WeCom
+ * section of setup's app source menu: `qr` scans to create one; `manual` takes
+ * the BotID / Secret of a bot already created in WeCom and starts the same
+ * Dashboard onboarding job the browser's manual form starts (`mode: 'manual'`)
+ * — pairing, saving and going online are the same.
  */
 export type WecomSetupMode = 'qr' | 'manual';
 
@@ -202,9 +179,14 @@ const WECOM_START_REFUSALS: ReadonlyMap<string, string> = new Map([
   ['wecom_onboarding_cancelled', '本机 Dashboard 的管理登录已失效，请重新运行 setup。'],
 ]);
 
-export async function runWecomQrSetup(args: string[], options: {
+/**
+ * The terminal WeCom wizard, entered from the WeCom section of `botmux setup`'s
+ * app source menu (it takes no command-line arguments). Unfinished tasks of the
+ * same management login are offered for resuming first.
+ */
+export async function runWecomQrSetup(options: {
   connect: () => Promise<WecomSetupClient>;
-  /** Defaults to `qr`; only the setup source menu passes `manual`. */
+  /** The mode picked in the source menu; defaults to `qr`. */
   mode?: WecomSetupMode;
   tty?: boolean;
   prompt?: WecomPrompter;
@@ -215,19 +197,8 @@ export async function runWecomQrSetup(args: string[], options: {
 }): Promise<number> {
   const prompt = options.prompt ?? createWecomPrompter();
   const mode = options.mode ?? 'qr';
-  if (args.some(arg => ['--help', '-h', 'help'].includes(arg))) {
-    prompt.write(WECOM_QR_SETUP_HELP);
-    return 0;
-  }
-  let flags: Map<string, string>;
-  try {
-    flags = parseOptions(args);
-  } catch {
-    prompt.write(WECOM_QR_SETUP_HELP);
-    return 2;
-  }
   if (!(options.tty ?? Boolean(process.stdin.isTTY && process.stdout.isTTY))) {
-    prompt.write('扫码 setup 需要交互终端；脚本配置请使用 --manual 及凭据文件参数。');
+    prompt.write('企业微信 setup 需要交互终端；也可在 botmux dashboard 的「添加机器人」里添加企业微信机器人。');
     return 2;
   }
   const interrupted = new AbortController();
@@ -278,131 +249,123 @@ export async function runWecomQrSetup(args: string[], options: {
       return EXIT_DASHBOARD_NOT_RUNNING;
     }
     if (interrupted.signal.aborted) return 0;
-    if (flags.has('--cancel')) {
-      job = await client.action(flags.get('--cancel')!, 'cancel');
-      prompt.write(LABELS.cancelled);
-      return 0;
+    const pending = (await client.list()).filter(row => row.status !== 'completed').sort((a, b) => b.updatedAt - a.updatedAt);
+    if (pending.length) {
+      // Most recent task first, so resuming it stays the default; creating a new
+      // bot is the last item and has to be picked on purpose.
+      const picked = await choose({
+        title: '找到同一管理员登录下的未完成任务：选择要续办的任务，或创建新机器人',
+        items: [
+          ...pending.map(row => ({ label: row.id, hint: LABELS[row.status] })),
+          { label: '创建新机器人', hint: '不续办上面的任务' },
+        ],
+        defaultIndex: 0,
+        footer: PICK_FOOTER,
+      });
+      if (picked === null) return 0;
+      job = pending[picked];
     }
-    if (flags.has('--resume')) job = await client.get(flags.get('--resume')!);
-    else {
-      const pending = (await client.list()).filter(row => row.status !== 'completed').sort((a, b) => b.updatedAt - a.updatedAt);
-      if (pending.length) {
-        // Most recent task first, so resuming it stays the default; creating a new
-        // bot is the last item and has to be picked on purpose.
+    if (!job) {
+      // Manual mode: the credentials of a bot already created in WeCom, checked
+      // with the Dashboard's own rules before anything is sent. The Secret is
+      // never echoed and appears nowhere but in the start request below.
+      let manual: { botId: string; secret: string } | undefined;
+      if (mode === 'manual') {
+        prompt.write('接入已在企业微信里创建好的智能机器人（需支持 API 长连接）：请输入它的 BotID 与 Secret，Secret 输入不回显。');
+        manual = {
+          botId: await askValid('BotID', false, isWecomManualBotId, 'BotID 不能为空、不能含空白或控制字符，最长 200 个字符；请重新输入。'),
+          secret: await askValid('Secret（不回显）', true, isWecomManualSecret, 'Secret 不能为空、不能含换行，最长 8192 字节；请重新输入。'),
+        };
+      }
+      const askName = () => ask('机器人名称（可留空）');
+      const askDir = () => ask('项目工作目录', process.cwd());
+      // The selection key goes to the Dashboard as `cliId`, exactly like the
+      // browser form's CLI menu; the Dashboard resolves wrapper / launch-mode variants.
+      const pickCli = async (): Promise<string | null> => {
+        if (interrupted.signal.aborted) throw new Error('cancelled');
+        return picker.chooseCli({ title: t('setup.cli.select_title') });
+      };
+      const pickBackend = async (): Promise<string | null> => {
         const picked = await choose({
-          title: '找到同一管理员登录下的未完成任务：选择要续办的任务，或创建新机器人',
-          items: [
-            ...pending.map(row => ({ label: row.id, hint: LABELS[row.status] })),
-            { label: '创建新机器人', hint: '不续办上面的任务' },
-          ],
+          title: '会话后端',
+          items: [{ label: 'pty', hint: '默认' }, { label: 'tmux' }],
           defaultIndex: 0,
           footer: PICK_FOOTER,
         });
-        if (picked === null) return 0;
-        job = pending[picked];
-      }
-      if (!job) {
-        // Manual mode: the credentials of a bot already created in WeCom, checked
-        // with the Dashboard's own rules before anything is sent. The Secret is
-        // never echoed and appears nowhere but in the start request below.
-        let manual: { botId: string; secret: string } | undefined;
-        if (mode === 'manual') {
-          prompt.write('接入已在企业微信里创建好的智能机器人（需支持 API 长连接）：请输入它的 BotID 与 Secret，Secret 输入不回显。');
-          manual = {
-            botId: await askValid('BotID', false, isWecomManualBotId, 'BotID 不能为空、不能含空白或控制字符，最长 200 个字符；请重新输入。'),
-            secret: await askValid('Secret（不回显）', true, isWecomManualSecret, 'Secret 不能为空、不能含换行，最长 8192 字节；请重新输入。'),
-          };
-        }
-        const askName = () => ask('机器人名称（可留空）');
-        const askDir = () => ask('项目工作目录', process.cwd());
-        // The selection key goes to the Dashboard as `cliId`, exactly like the
-        // browser form's CLI menu; the Dashboard resolves wrapper / launch-mode variants.
-        const pickCli = async (): Promise<string | null> => {
-          if (interrupted.signal.aborted) throw new Error('cancelled');
-          return picker.chooseCli({ title: t('setup.cli.select_title') });
+        return picked === null ? null : picked === 1 ? 'tmux' : 'pty';
+      };
+      let appName = await askName();
+      const pickedCli = await pickCli();
+      if (pickedCli === null) return 0;
+      let cliId = pickedCli;
+      let workingDir = await askDir();
+      const pickedBackend = await pickBackend();
+      if (pickedBackend === null) return 0;
+      let backend = pickedBackend;
+      // A refusal the Dashboard gave before creating anything (WECOM_START_REFUSALS)
+      // asks again only the answer it is about; every other answer — the manual
+      // credentials included — is kept, and the confirmation comes again before
+      // the next start.
+      for (;;) {
+        const input = {
+          appName,
+          cliId,
+          workingDir,
+          backend,
+          ...(manual ? { mode: 'manual', botId: manual.botId, secret: manual.secret } : {}),
         };
-        const pickBackend = async (): Promise<string | null> => {
-          const picked = await choose({
-            title: '会话后端',
-            items: [{ label: 'pty', hint: '默认' }, { label: 'tmux' }],
-            defaultIndex: 0,
-            footer: PICK_FOOTER,
-          });
-          return picked === null ? null : picked === 1 ? 'tmux' : 'pty';
-        };
-        let appName = flags.get('--name') ?? await askName();
-        const pickedCli = flags.get('--cli') ?? await pickCli();
-        if (pickedCli === null) return 0;
-        let cliId = pickedCli;
-        let workingDir = flags.get('--working-dir') ?? await askDir();
-        const pickedBackend = flags.get('--backend') ?? await pickBackend();
-        if (pickedBackend === null) return 0;
-        let backend = pickedBackend;
-        // A refusal the Dashboard gave before creating anything (WECOM_START_REFUSALS)
-        // asks again only the answer it is about, when that answer was asked here
-        // rather than given as a flag; every other answer — the manual credentials
-        // included — is kept, and the confirmation comes again before the next start.
-        for (;;) {
-          const input = {
-            appName,
-            cliId,
-            workingDir,
-            backend,
-            ...(flags.has('--model') ? { model: flags.get('--model') } : {}),
-            ...(manual ? { mode: 'manual', botId: manual.botId, secret: manual.secret } : {}),
-          };
-          // 「取消」 comes first, so a stray Enter never starts anything — the same
-          // as the old prompt, where anything but `yes` cancelled.
-          const confirmed = await choose({
-            title: manual
-              ? '即将用刚填写的 BotID 与 Secret（不显示）接入已有机器人，私聊配对后保存并自动启动'
-              : '即将扫码创建平台机器人，配对后保存并自动启动',
-            items: [
-              { label: '取消', hint: '不创建任何东西，直接退出' },
-              { label: '继续', hint: manual ? '提交凭据并开始私聊配对' : '开始扫码创建' },
-            ],
-            defaultIndex: CONFIRM_CANCEL,
-            footer: PICK_FOOTER,
-          });
-          if (confirmed !== CONFIRM_CONTINUE) return 0;
-          if (interrupted.signal.aborted) return 0;
-          starting = true;
-          try {
-            // Do not abort this HTTP exchange on Ctrl-C: a successful late response
-            // carries the id needed to cancel the already-created local task.
-            job = await client.start(input);
-          } catch (error) {
-            const reason = error instanceof WecomSetupRejectedError ? WECOM_START_REFUSALS.get(error.code) : undefined;
-            // Anything else may have created the task: the unconfirmed-start message below.
-            if (!reason) throw error;
-            starting = false;
-            prompt.write(`未创建任何东西：${reason}`);
-            const code = (error as WecomSetupRejectedError).code;
-            if (code === 'wecom_cli_unavailable' && !flags.has('--cli')) {
-              const next = await pickCli();
-              if (next === null) return 0;
-              cliId = next;
-            } else if ((code === 'wecom_invalid_backend' || code === 'wecom_backend_unavailable') && !flags.has('--backend')) {
-              const next = await pickBackend();
-              if (next === null) return 0;
-              backend = next;
-            } else if (code === 'wecom_working_directory_unavailable' && !flags.has('--working-dir')) {
-              workingDir = await askDir();
-            } else if (code === 'wecom_invalid_display_name' && !flags.has('--name')) {
-              appName = await askName();
-            } else {
-              return 2;
-            }
-            continue;
-          }
+        // 「取消」 comes first, so a stray Enter never starts anything — the same
+        // as the old prompt, where anything but `yes` cancelled.
+        const confirmed = await choose({
+          title: manual
+            ? '即将用刚填写的 BotID 与 Secret（不显示）接入已有机器人，私聊配对后保存并自动启动'
+            : '即将扫码创建平台机器人，配对后保存并自动启动',
+          items: [
+            { label: '取消', hint: '不创建任何东西，直接退出' },
+            { label: '继续', hint: manual ? '提交凭据并开始私聊配对' : '开始扫码创建' },
+          ],
+          defaultIndex: CONFIRM_CANCEL,
+          footer: PICK_FOOTER,
+        });
+        if (confirmed !== CONFIRM_CONTINUE) return 0;
+        if (interrupted.signal.aborted) return 0;
+        starting = true;
+        try {
+          // Do not abort this HTTP exchange on Ctrl-C: a successful late response
+          // carries the id needed to cancel the already-created local task.
+          job = await client.start(input);
+        } catch (error) {
+          const reason = error instanceof WecomSetupRejectedError ? WECOM_START_REFUSALS.get(error.code) : undefined;
+          // Anything else may have created the task: the unconfirmed-start message below.
+          if (!reason) throw error;
           starting = false;
-          break;
+          prompt.write(`未创建任何东西：${reason}`);
+          const code = (error as WecomSetupRejectedError).code;
+          if (code === 'wecom_cli_unavailable') {
+            const next = await pickCli();
+            if (next === null) return 0;
+            cliId = next;
+          } else if (code === 'wecom_invalid_backend' || code === 'wecom_backend_unavailable') {
+            const next = await pickBackend();
+            if (next === null) return 0;
+            backend = next;
+          } else if (code === 'wecom_working_directory_unavailable') {
+            workingDir = await askDir();
+          } else if (code === 'wecom_invalid_display_name') {
+            appName = await askName();
+          } else {
+            return 2;
+          }
+          continue;
         }
-        startedManual = Boolean(manual);
+        starting = false;
+        break;
       }
+      startedManual = Boolean(manual);
     }
+    // The id is how this task is labelled in the unfinished-task selector above.
     prompt.write(`本地任务：${job.id}`);
-    prompt.write(`续办：botmux setup --platform wecom --resume ${job.id}`);
+    prompt.write('续办：重新运行 botmux setup（已有机器人时先选「添加新机器人」），在「飞书应用来源」末尾的「企业微信」分区任选一项，再在未完成任务列表里选这个任务。');
     let displayed = '';
     for (;;) {
       if (interrupted.signal.aborted) {

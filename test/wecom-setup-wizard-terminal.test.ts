@@ -38,7 +38,7 @@ const client = {
   get: async () => job('completed'),
   action: async () => { calls.push('action'); return job('cancelled'); },
 };
-const code = await runWecomQrSetup([], { connect: async () => client as never, sleep: async () => {} });
+const code = await runWecomQrSetup({ connect: async () => client as never, sleep: async () => {} });
 process.stdout.write('\\n${RETURNED} ' + code + ' ' + (calls.join(',') || '-') + ']]\\n');
 // No process.exit: the test checks that the process ends on its own.
 `);

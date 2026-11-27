@@ -155,7 +155,8 @@ function untilAborted<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
  * default): any process may be given it there while the core is stopped. The
  * range also stays clear of botmux's own listeners (Dashboard 7891–7911,
  * daemon IPC 7950+, Feishu terminal proxies 8800+, WeCom core terminal proxies
- * 18800+, the manual-setup default 19123).
+ * 18800+, and 19123, the default port of configurations written by the
+ * former manual terminal setup).
  */
 export const WECOM_CORE_PORT_RANGE = { first: 20000, last: 29999 } as const;
 

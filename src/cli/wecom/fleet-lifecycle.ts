@@ -264,7 +264,7 @@ export function desiredStateUnavailableMessage(path: string, why: string): strin
 }
 
 function connectionListing(connections: readonly WecomConnectionCandidate[]): string {
-  if (connections.length === 0) return '   当前没有登记任何企业微信连接（先运行 `botmux setup --platform wecom`）。';
+  if (connections.length === 0) return '   当前没有登记任何企业微信连接（先运行 `botmux setup`，在「飞书应用来源」的「企业微信」分区里添加，或在 Dashboard 的「添加机器人」里添加）。';
   return ['   已登记的连接：', ...connections.map(c => `     ${c.configId}  ${c.file}`)].join('\n');
 }
 

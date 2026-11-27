@@ -265,7 +265,7 @@ export class WecomDashboardManager {
       canStart: false,
       canStop: false,
       canRestart: false,
-      message: '请在终端重新运行 botmux setup --platform wecom 检查配置。',
+      message: '请在本机检查并修复这个企业微信配置文件（JSON 格式与必填字段），修好后刷新本页。',
     };
   }
 

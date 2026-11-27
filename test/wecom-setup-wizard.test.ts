@@ -65,14 +65,15 @@ function fixture(options: {
   return { client, connect, output, opts, picker, asked, chosen };
 }
 
-const allFlags = ['--name', 'x', '--cli', 'codex', '--working-dir', '/tmp', '--backend', 'pty'];
+/** Every answer a new scan-to-create task needs, up to and including 「继续」. */
+const NEW_BOT = { answers: ['x', '/tmp'], cli: ['codex'], picks: ['pty', CONTINUE] };
 
 describe('终端企微扫码向导', () => {
   it('平台确认后创建一次，展示官方QR、完整私聊挑战与真实完成状态', async () => {
     const f = fixture({ answers: ['name', '/tmp'], cli: ['codex'], picks: ['pty', CONTINUE] });
     vi.mocked(f.client.get).mockResolvedValueOnce(job('waiting_for_scan', { qrUrl: 'https://work.weixin.qq.com/ai/qc/test' }))
       .mockResolvedValueOnce(job('needs_pairing', { pairingCode: 'BOTMUX-ID-0123456789ABCDEF0123456789ABCDEF' })).mockResolvedValueOnce(job('completed'));
-    expect(await runWecomQrSetup([], f.opts)).toBe(0);
+    expect(await runWecomQrSetup(f.opts)).toBe(0);
     expect(f.client.start).toHaveBeenCalledExactlyOnceWith({ appName: 'name', cliId: 'codex', workingDir: '/tmp', backend: 'pty' });
     expect(f.opts.renderQr).toHaveBeenCalledWith('https://work.weixin.qq.com/ai/qc/test');
     expect(f.output.join('\n')).toContain('BOTMUX-ID-0123456789ABCDEF0123456789ABCDEF');
@@ -81,35 +82,35 @@ describe('终端企微扫码向导', () => {
     const f = fixture({ answers: ['r'], picks: [id] });
     vi.mocked(f.client.list).mockResolvedValue([job('failed', { retryable })]);
     vi.mocked(f.client.action).mockResolvedValue(job('completed'));
-    expect(await runWecomQrSetup([], f.opts)).toBe(0);
+    expect(await runWecomQrSetup(f.opts)).toBe(0);
     expect(f.client.action).toHaveBeenCalledWith(id, retryable ? 'retry' : 'refresh');
     expect(f.client.start).not.toHaveBeenCalled();
   });
   it('断网丢失创建响应不自动start重试，不声称没有创建', async () => {
-    const f = fixture({ picks: [CONTINUE] });
+    const f = fixture(NEW_BOT);
     vi.mocked(f.client.start).mockRejectedValue(new Error('secret-in-error'));
-    expect(await runWecomQrSetup(allFlags, f.opts)).toBe(2);
+    expect(await runWecomQrSetup(f.opts)).toBe(2);
     expect(f.client.start).toHaveBeenCalledTimes(1);
     expect(f.output.join('\n')).toContain(WECOM_START_UNCONFIRMED);
     expect(f.output.join('\n')).not.toContain('secret-in-error');
   });
   it('Ctrl-C与晚到start响应交叠时，用返回的任务ID取消', async () => {
-    const f = fixture({ picks: [CONTINUE] }), abort = new AbortController();
+    const f = fixture(NEW_BOT), abort = new AbortController();
     vi.mocked(f.client.start).mockImplementation(async () => { abort.abort(); return job('starting'); });
-    expect(await runWecomQrSetup(allFlags, { ...f.opts, signal: abort.signal })).toBe(0);
+    expect(await runWecomQrSetup({ ...f.opts, signal: abort.signal })).toBe(0);
     expect(f.client.action).toHaveBeenCalledExactlyOnceWith(id, 'cancel');
     expect(f.client.get).not.toHaveBeenCalled();
   });
-  it('确认前取消、非TTY、help均不连接Dashboard', async () => {
+  it('非TTY不连接Dashboard', async () => {
     const f = fixture();
-    expect(await runWecomQrSetup([], { ...f.opts, tty: false })).toBe(2);
-    expect(await runWecomQrSetup(['--help'], f.opts)).toBe(0);
+    expect(await runWecomQrSetup({ ...f.opts, tty: false })).toBe(2);
     expect(f.connect).not.toHaveBeenCalled();
   });
-  it('轮询授权失效后退出，不刷新token重新创建', async () => {
-    const f = fixture();
-    vi.mocked(f.client.get).mockResolvedValueOnce(job('needs_pairing')).mockRejectedValue(new Error('expired'));
-    expect(await runWecomQrSetup(['--resume', id], f.opts)).toBe(2);
+  it('续办的任务轮询时授权失效后退出，不刷新token重新创建', async () => {
+    const f = fixture({ picks: [id] });
+    vi.mocked(f.client.list).mockResolvedValue([job('needs_pairing')]);
+    vi.mocked(f.client.get).mockRejectedValue(new Error('expired'));
+    expect(await runWecomQrSetup(f.opts)).toBe(2);
     expect(f.connect).toHaveBeenCalledTimes(1); expect(f.client.start).not.toHaveBeenCalled();
   });
   it.each([
@@ -117,18 +118,19 @@ describe('终端企微扫码向导', () => {
     ['没填显示名', { appName: '' }],
     ['快照不带显示名', {}],
   ])('完成时说明企业微信里的名称和头像要在企业微信里改（%s）', async (_label, extra: { appName?: string }) => {
-    const f = fixture();
+    const f = fixture({ picks: [id] });
+    vi.mocked(f.client.list).mockResolvedValue([job('needs_pairing')]);
     vi.mocked(f.client.get).mockResolvedValue(job('completed', extra));
-    expect(await runWecomQrSetup(['--resume', id], f.opts)).toBe(0);
+    expect(await runWecomQrSetup(f.opts)).toBe(0);
     const name = extra.appName?.trim();
     expect(f.output).toContain(name
       ? t('setup.wecom.completed_name_note', { name })
       : t('setup.wecom.completed_name_note_unnamed'));
   });
   it.each(['failed', 'cancelled'] as const)('流程%s时不说名称', async status => {
-    const f = fixture({ answers: ['q'] });
-    vi.mocked(f.client.get).mockResolvedValue(job(status, { appName: '口袋克斯' }));
-    expect(await runWecomQrSetup(['--resume', id], f.opts)).toBe(0);
+    const f = fixture({ answers: ['q'], picks: [id] });
+    vi.mocked(f.client.list).mockResolvedValue([job(status, { appName: '口袋克斯' })]);
+    expect(await runWecomQrSetup(f.opts)).toBe(0);
     const notes = [t('setup.wecom.completed_name_note', { name: '口袋克斯' }), t('setup.wecom.completed_name_note_unnamed')];
     expect(f.output.filter(line => notes.includes(line))).toEqual([]);
   });
@@ -138,7 +140,7 @@ describe('企微向导的选择题走与飞书 setup 相同的选择器', () => 
   it('CLI 用飞书同一个级联选择器（同一标题），选中的选择键原样作为 cliId 交给 Dashboard', async () => {
     const f = fixture({ answers: ['', '/srv/repo'], cli: ['aiden-x-claude'], picks: ['tmux', CONTINUE] });
 
-    expect(await runWecomQrSetup([], f.opts)).toBe(0);
+    expect(await runWecomQrSetup(f.opts)).toBe(0);
 
     expect(f.picker.chooseCli).toHaveBeenCalledExactlyOnceWith({ title: t('setup.cli.select_title') });
     // Same shape as the browser form: the key goes as `cliId`; the Dashboard resolves the variant.
@@ -150,7 +152,7 @@ describe('企微向导的选择题走与飞书 setup 相同的选择器', () => 
   it('后端是 pty / tmux 两项、默认 pty；确认的默认项是「取消」', async () => {
     const f = fixture({ answers: ['', '/tmp'], cli: ['codex'], picks: ['pty', CONTINUE] });
 
-    expect(await runWecomQrSetup([], f.opts)).toBe(0);
+    expect(await runWecomQrSetup(f.opts)).toBe(0);
 
     const [backend, confirm] = f.chosen;
     expect(backend.items.map(item => item.label)).toEqual(['pty', 'tmux']);
@@ -161,17 +163,6 @@ describe('企微向导的选择题走与飞书 setup 相同的选择器', () => 
     expect(confirm.items[0].label).toBe(CANCEL);
   });
 
-  it('给了 --cli / --backend 等 flag 的问题不再出现，只剩确认', async () => {
-    const f = fixture({ picks: [CONTINUE] });
-
-    expect(await runWecomQrSetup(['--name', 'n', '--cli', 'claude-code', '--working-dir', '/w', '--backend', 'tmux', '--model', 'm'], f.opts)).toBe(0);
-
-    expect(f.picker.chooseCli).not.toHaveBeenCalled();
-    expect(f.chosen).toHaveLength(1);
-    expect(f.asked).toEqual([]);
-    expect(f.client.start).toHaveBeenCalledExactlyOnceWith({ appName: 'n', cliId: 'claude-code', workingDir: '/w', backend: 'tmux', model: 'm' });
-  });
-
   it.each([
     { name: 'CLI 选择器 Esc', cli: [null], picks: [] },
     { name: '后端选择器 Esc', cli: ['codex'], picks: [null] },
@@ -180,7 +171,7 @@ describe('企微向导的选择题走与飞书 setup 相同的选择器', () => 
   ])('$name：向导以 0 退出，不调 client.start、不取消任何任务', async ({ cli, picks }) => {
     const f = fixture({ answers: ['', '/tmp'], cli, picks });
 
-    expect(await runWecomQrSetup([], f.opts)).toBe(0);
+    expect(await runWecomQrSetup(f.opts)).toBe(0);
 
     expect(f.client.start).not.toHaveBeenCalled();
     expect(f.client.action).not.toHaveBeenCalled();
@@ -192,7 +183,7 @@ describe('企微向导的选择题走与飞书 setup 相同的选择器', () => 
     const f = fixture({ answers: ['', '/tmp'], cli: ['codex'], picks: ['创建新机器人', 'pty', CONTINUE] });
     vi.mocked(f.client.list).mockResolvedValue([older, newer, job('completed', { id: 'wecom-33333333-3333-4333-8333-333333333333' })]);
 
-    expect(await runWecomQrSetup([], f.opts)).toBe(0);
+    expect(await runWecomQrSetup(f.opts)).toBe(0);
 
     const [tasks] = f.chosen;
     // Unfinished tasks newest first, then the one create-new item; the completed task is not offered.
@@ -208,14 +199,14 @@ describe('企微向导的选择题走与飞书 setup 相同的选择器', () => 
     vi.mocked(f.client.list).mockResolvedValue([job('needs_pairing'), other]);
     vi.mocked(f.client.get).mockResolvedValue({ ...other, status: 'completed' });
 
-    expect(await runWecomQrSetup([], f.opts)).toBe(0);
+    expect(await runWecomQrSetup(f.opts)).toBe(0);
     expect(f.client.get).toHaveBeenCalledWith(other.id);
     expect(f.client.start).not.toHaveBeenCalled();
 
     // Everything a new bot would need is scripted, so only the Esc itself can stop it.
     const esc = fixture({ answers: ['', '/tmp'], cli: ['codex'], picks: [null, 'pty', CONTINUE] });
     vi.mocked(esc.client.list).mockResolvedValue([job('needs_pairing')]);
-    expect(await runWecomQrSetup([], esc.opts)).toBe(0);
+    expect(await runWecomQrSetup(esc.opts)).toBe(0);
     expect(esc.client.start).not.toHaveBeenCalled();
     expect(esc.client.get).not.toHaveBeenCalled();
     expect(esc.client.action).not.toHaveBeenCalled();
@@ -230,7 +221,7 @@ describe('企微向导的「手动凭据」模式', () => {
     vi.mocked(f.client.get).mockResolvedValueOnce(job('needs_pairing', { pairingCode: 'BOTMUX-ID-0123456789ABCDEF0123456789ABCDEF' }))
       .mockResolvedValueOnce(job('completed'));
 
-    expect(await runWecomQrSetup([], { ...f.opts, mode: 'manual' })).toBe(0);
+    expect(await runWecomQrSetup({ ...f.opts, mode: 'manual' })).toBe(0);
 
     expect(f.asked.map(entry => entry.hidden === true)).toEqual([false, true, false, false]);
     expect(f.client.start).toHaveBeenCalledExactlyOnceWith({
@@ -254,7 +245,7 @@ describe('企微向导的「手动凭据」模式', () => {
       picks: ['pty', CONTINUE],
     });
 
-    expect(await runWecomQrSetup([], { ...f.opts, mode: 'manual' })).toBe(0);
+    expect(await runWecomQrSetup({ ...f.opts, mode: 'manual' })).toBe(0);
 
     expect(f.asked.slice(0, 7).map(entry => entry.hidden === true)).toEqual([false, false, false, false, true, true, true]);
     expect(f.client.start).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ mode: 'manual', botId: 'bot-ok', secret: SECRET }));
@@ -266,7 +257,7 @@ describe('企微向导的「手动凭据」模式', () => {
   it('凭据输入时 Ctrl-C / EOF 取消：不发请求', async () => {
     const f = fixture({ answers: ['bot-ok', null] });
 
-    expect(await runWecomQrSetup([], { ...f.opts, mode: 'manual' })).toBe(0);
+    expect(await runWecomQrSetup({ ...f.opts, mode: 'manual' })).toBe(0);
     expect(f.client.start).not.toHaveBeenCalled();
   });
 
@@ -274,14 +265,14 @@ describe('企微向导的「手动凭据」模式', () => {
     const f = fixture({ answers: ['bot-ok', SECRET, '', '/tmp'], cli: ['codex'], picks: ['pty', CONTINUE] });
     vi.mocked(f.client.start).mockRejectedValue(new Error(`boom ${SECRET}`));
 
-    expect(await runWecomQrSetup([], { ...f.opts, mode: 'manual' })).toBe(2);
+    expect(await runWecomQrSetup({ ...f.opts, mode: 'manual' })).toBe(2);
     expect(f.output.join('\n')).not.toContain(SECRET);
   });
 
   it('确认前 Esc：不提交凭据', async () => {
     const f = fixture({ answers: ['bot-ok', SECRET, '', '/tmp'], cli: ['codex'], picks: ['pty', null] });
 
-    expect(await runWecomQrSetup([], { ...f.opts, mode: 'manual' })).toBe(0);
+    expect(await runWecomQrSetup({ ...f.opts, mode: 'manual' })).toBe(0);
     expect(f.client.start).not.toHaveBeenCalled();
   });
 
@@ -289,7 +280,7 @@ describe('企微向导的「手动凭据」模式', () => {
     const f = fixture({ picks: [id] });
     vi.mocked(f.client.list).mockResolvedValue([job('needs_pairing')]);
 
-    expect(await runWecomQrSetup([], { ...f.opts, mode: 'manual' })).toBe(0);
+    expect(await runWecomQrSetup({ ...f.opts, mode: 'manual' })).toBe(0);
     expect(f.asked).toEqual([]);
     expect(f.client.start).not.toHaveBeenCalled();
   });
@@ -312,6 +303,11 @@ describe('Dashboard 在创建前拒绝：说明未创建，只重问被拒的那
       second: { appName: 'name', cliId: 'codex', workingDir: '/srv/a', backend: 'pty' }, cliAsks: 1, textAsks: ['机器人名称（可留空）', '项目工作目录'],
     },
     {
+      code: 'wecom_invalid_backend',
+      answers: ['name', '/srv/a'], cli: ['codex'], picks: ['tmux', CONTINUE, 'pty', CONTINUE],
+      second: { appName: 'name', cliId: 'codex', workingDir: '/srv/a', backend: 'pty' }, cliAsks: 1, textAsks: ['机器人名称（可留空）', '项目工作目录'],
+    },
+    {
       code: 'wecom_working_directory_unavailable',
       answers: ['name', '/nope', '/srv/b'], cli: ['codex'], picks: ['pty', CONTINUE, CONTINUE],
       second: { appName: 'name', cliId: 'codex', workingDir: '/srv/b', backend: 'pty' }, cliAsks: 1, textAsks: ['机器人名称（可留空）', '项目工作目录', '项目工作目录'],
@@ -325,7 +321,7 @@ describe('Dashboard 在创建前拒绝：说明未创建，只重问被拒的那
     const f = fixture({ answers, cli, picks });
     vi.mocked(f.client.start).mockRejectedValueOnce(refuse(code));
 
-    expect(await runWecomQrSetup([], f.opts)).toBe(0);
+    expect(await runWecomQrSetup(f.opts)).toBe(0);
 
     expect(f.client.start).toHaveBeenCalledTimes(2);
     expect(startInputs(f)[1]).toEqual(second);
@@ -335,32 +331,11 @@ describe('Dashboard 在创建前拒绝：说明未创建，只重问被拒的那
     expect(f.output).not.toContain(WECOM_START_UNCONFIRMED);
   });
 
-  it.each([
-    { code: 'wecom_cli_unavailable', flag: ['--cli', 'missing-cli'] },
-    { code: 'wecom_backend_unavailable', flag: ['--backend', 'tmux'] },
-    { code: 'wecom_invalid_backend', flag: ['--backend', 'tmux'] },
-    { code: 'wecom_working_directory_unavailable', flag: ['--working-dir', '/nope'] },
-    { code: 'wecom_invalid_display_name', flag: ['--name', 'x'.repeat(65)] },
-  ])('$code 且答案来自 $flag：不重问，退出码 2，只调一次 start', async ({ code, flag }) => {
-    const given = new Map([['--name', 'n'], ['--cli', 'codex'], ['--working-dir', '/w'], ['--backend', 'pty']]);
-    given.set(flag[0], flag[1]);
-    const f = fixture({ picks: [CONTINUE, CONTINUE] });
-    vi.mocked(f.client.start).mockRejectedValueOnce(refuse(code));
-
-    expect(await runWecomQrSetup([...given].flat(), f.opts)).toBe(2);
-
-    expect(f.client.start).toHaveBeenCalledTimes(1);
-    expect(f.picker.chooseCli).not.toHaveBeenCalled();
-    expect(f.asked).toEqual([]);
-    expect(confirms(f)).toHaveLength(1);
-    expect(f.output).not.toContain(WECOM_START_UNCONFIRMED);
-  });
-
   it('确认前一定未创建、但没有对应问题的拒绝（如端口分配失败）：说明后退出码 2，不重问', async () => {
     const f = fixture({ answers: ['', '/tmp'], cli: ['codex'], picks: ['pty', CONTINUE, CONTINUE] });
     vi.mocked(f.client.start).mockRejectedValueOnce(refuse('wecom_core_port_unavailable'));
 
-    expect(await runWecomQrSetup([], f.opts)).toBe(2);
+    expect(await runWecomQrSetup(f.opts)).toBe(2);
     expect(f.client.start).toHaveBeenCalledTimes(1);
     expect(f.output).not.toContain(WECOM_START_UNCONFIRMED);
     expect(f.output).toHaveLength(1);
@@ -372,7 +347,7 @@ describe('Dashboard 在创建前拒绝：说明未创建，只重问被拒的那
       const f = fixture({ answers: ['', '/tmp'], cli: ['codex', 'claude-code'], picks: ['pty', CONTINUE, CONTINUE] });
       vi.mocked(f.client.start).mockRejectedValueOnce(refuse(code));
 
-      expect(await runWecomQrSetup([], f.opts)).toBe(2);
+      expect(await runWecomQrSetup(f.opts)).toBe(2);
       expect(f.client.start).toHaveBeenCalledTimes(1);
       expect(f.picker.chooseCli).toHaveBeenCalledTimes(1);
       expect(f.output).toContain(WECOM_START_UNCONFIRMED);
@@ -386,7 +361,7 @@ describe('Dashboard 在创建前拒绝：说明未创建，只重问被拒的那
     const f = fixture({ answers: ['', '/tmp'], cli, picks });
     vi.mocked(f.client.start).mockRejectedValueOnce(refuse(code));
 
-    expect(await runWecomQrSetup([], f.opts)).toBe(0);
+    expect(await runWecomQrSetup(f.opts)).toBe(0);
     expect(f.client.start).toHaveBeenCalledTimes(1);
   });
 
@@ -394,7 +369,7 @@ describe('Dashboard 在创建前拒绝：说明未创建，只重问被拒的那
     const f = fixture({ answers: ['', '/tmp'], cli: ['codex'], picks: ['tmux', CONTINUE, 'pty', CANCEL] });
     vi.mocked(f.client.start).mockRejectedValueOnce(refuse('wecom_backend_unavailable'));
 
-    expect(await runWecomQrSetup([], f.opts)).toBe(0);
+    expect(await runWecomQrSetup(f.opts)).toBe(0);
     expect(f.client.start).toHaveBeenCalledTimes(1);
   });
 
@@ -403,7 +378,7 @@ describe('Dashboard 在创建前拒绝：说明未创建，只重问被拒的那
     const f = fixture({ answers: ['bot-retry', SECRET, '', '/nope', '/srv/ok'], cli: ['codex'], picks: ['pty', CONTINUE, CONTINUE] });
     vi.mocked(f.client.start).mockRejectedValueOnce(refuse('wecom_working_directory_unavailable'));
 
-    expect(await runWecomQrSetup([], { ...f.opts, mode: 'manual' })).toBe(0);
+    expect(await runWecomQrSetup({ ...f.opts, mode: 'manual' })).toBe(0);
 
     expect(startInputs(f)).toEqual([
       { appName: '', cliId: 'codex', workingDir: '/nope', backend: 'pty', mode: 'manual', botId: 'bot-retry', secret: SECRET },

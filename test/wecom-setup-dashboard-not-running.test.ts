@@ -55,7 +55,7 @@ function hostFixture(options: { hasConfig: boolean; hostProcessesHidden?: boolea
   });
   const output: string[] = [];
   const ask = vi.fn(async () => null);
-  const run = (args: string[] = []) => runWecomQrSetup(args, {
+  const run = () => runWecomQrSetup({
     connect,
     tty: true,
     signal: new AbortController().signal,
@@ -115,11 +115,15 @@ describe('企微扫码 setup 在 Dashboard 没有运行时不代起任何服务'
     const ready: DashboardResult = { ok: true, url: 'http://127.0.0.1:7891/?t=fixture_token_0123456789' };
     const host = hostFixture({ hasConfig: false, responses: [{ ok: false, reason: 'unreachable' }, ready] });
 
-    const exitCode = await host.run(['--cancel', jobId]);
+    // The wizard lists the unfinished tasks (none), then asks its first question;
+    // the scripted Ctrl-C there ends it with 0 before anything is created.
+    const exitCode = await host.run();
 
     expect(host.start).toHaveBeenCalledTimes(1);
     expect(host.createClient).toHaveBeenCalledExactlyOnceWith(ready);
-    expect(host.client.action).toHaveBeenCalledExactlyOnceWith(jobId, 'cancel');
+    expect(host.client.list).toHaveBeenCalledTimes(1);
+    expect(host.ask).toHaveBeenCalledTimes(1);
+    expect(host.client.start).not.toHaveBeenCalled();
     expect(exitCode).toBe(0);
   });
 

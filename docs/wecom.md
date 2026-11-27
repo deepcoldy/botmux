@@ -10,33 +10,22 @@
 
 `botmux setup` 不先询问平台，直接进入原飞书配置向导。创建企业微信机器人时，在交互终端里运行 `botmux setup`（已有机器人配置时先选「添加新机器人」），「飞书应用来源」菜单在三项飞书来源之后有一行「企业微信」分隔（不可选），下面是两种接入方式：
 
-- 「扫码创建新机器人」：用企业微信扫码创建、私聊配对、自动上线，与 `botmux setup --platform wecom` 同一流程。
+- 「扫码创建新机器人」：用企业微信扫码创建、私聊配对、自动上线。
 - 「手动输入 BotID/Secret」：机器人已在企业微信里创建好（需支持 API 长连接）时使用。向导先收 BotID 与 Secret（输入不回显，格式不对会重问），之后同样私聊配对、保存并自动上线，与 Dashboard 向导里的「已有机器人」是同一个接入任务。Secret 只随创建请求发给本机 Dashboard，不显示、不写入日志或续办提示。
 
 两种方式都与 Dashboard 共用接入流程；企微配置独立存储，不写 bots.json / .env，也不修改飞书配置。企业微信分区只在新增机器人的入口出现，「重新配置」「覆盖当前配置」里没有；管道输入（非交互终端）时菜单与以前完全一致，没有这个分区。
 
-从来源菜单进入不需要任何参数。`botmux setup --platform wecom` 仍然可用，是直达扫码创建的写法，可带下文的预填、续办与取消参数；`--platform feishu`（或 `lark`）只走飞书，来源菜单里没有企业微信分区：
-
-```bash
-botmux setup                    # 「飞书应用来源」→「企业微信」分区里任选一种
-botmux setup --platform wecom   # 直达企业微信扫码创建
-botmux setup --platform feishu
-```
+这个分区是终端里接入企业微信的唯一入口：`botmux setup` 没有选择平台的参数，企微向导也不接受命令行参数，所有设置都在向导里回答。
 
 企微终端向导依次收集本地名称、CLI、项目目录及 PTY/tmux 后端：CLI 用与飞书 setup 相同的级联选择器，后端也在选择器里选，名称与目录为文本输入。最后一步确认默认停在「取消」，选「继续」才创建接入任务；在任一选择器里按 Esc 即退出，不创建任何东西。扫码创建时终端显示官方授权二维码及可打开的官方地址，扫码确认后显示随机完整配对码；手动输入凭据时没有二维码，直接显示配对码。用要成为本机器人管理及审批账号的企业微信账号，私聊新机器人发送该完整配对码，不要发到群里。向导只接受这次挑战的真实回调身份，配对后自动保存凭据及权限并启动网关与专用 core；确认连接与 core 就绪后才报告上线。
 
 终端通过既有本机 Dashboard 管理鉴权与 CSRF 调用同一任务接口，不另建身份、二维码或凭据保存流程。若本机还没有任何机器人配置，setup 与 `botmux dashboard` 一样只启动不含机器人的 supervisor 及其 Dashboard；已有配置而 Dashboard 没有运行时，setup 不启动任何进程，提示先运行 `botmux start` 再重试，并以非零状态退出；在 botmux 沙盒内（看不到宿主进程，`botmux start` 会被拒绝）则不论有无配置都不启动，提示到宿主终端启动 botmux 后再回来重试。管理 token 和 CSRF 不打印或传入子进程参数，所有管理请求只走实际发现的本机 loopback 端口。
 
-同一管理登录下的未完成任务会在再次进入时列在选择器里，光标默认停在最近的任务；选最后一项「创建新机器人」才新建。终端显示任务 ID，也可显式续办或取消：
-
-```bash
-botmux setup --platform wecom --resume wecom-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-botmux setup --platform wecom --cancel wecom-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-```
+同一管理登录下的未完成任务会在再次进入时列在选择器里（重新运行 `botmux setup`，在企业微信分区任选一项即可看到），每项以任务 ID 标出，光标默认停在最近的任务；选最后一项「创建新机器人」才新建。创建任务后终端会显示它的任务 ID，便于续办时在列表里对上。续办的任务在轮询时按 Ctrl-C，或任务失败时在提示里输入 `c`，即取消该本地任务；也可在 Dashboard 里取消。
 
 任务有效期与 Dashboard 一致，为 24 小时。Ctrl-C 会请求取消当前本地任务；已创建的平台机器人保留。未取得凭据时，续办刷新二维码；已取得凭据时只重试同一机器人的配对、保存或启动。网络中断或创建响应丢失时不会自动再次创建，重新进入后先选择已有任务；取消未确认时任务可能仍在运行。管理登录轮换后不能读取旧登录任务，也不会自动换身份重建。
 
-扫码流程需要交互终端。`--name`、`--cli`、`--working-dir`、`--backend`、`--model` 可预填本地设置（预填了的问题不再询问），仍需确认扫码。`setup list/add/configure/edit/remove` 保持原飞书脚本语义。已有机器人凭据维护使用 `--platform wecom --manual`；原有 `--config`、`--bot-id`、`--secret-file`、`--secret-env`、`--allow-user` 等手工参数仍兼容，完整非交互示例见下文。
+企微向导需要交互终端（管道输入时来源菜单里没有企业微信分区）；没有交互终端时请在 Dashboard 里添加。`setup list/add/configure/edit/remove` 保持原飞书脚本语义，只管理飞书机器人。
 
 ## 在 Dashboard 扫码创建
 
@@ -59,26 +48,15 @@ botmux setup --platform wecom --cancel wecom-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxx
 | --- | --- | --- |
 | ![扫码创建](screenshots/wecom-onboarding-qr-375.png) | ![私聊配对](screenshots/wecom-onboarding-pairing-375.png) | ![完成](screenshots/wecom-onboarding-completed-375.png) |
 
-## 手工配置与启动
+## 配置与运行
 
-先在企业微信创建支持 API 长连接的智能机器人，取得 BotID 与 Secret。不要把 Secret 发到聊天中；在本机终端运行：
+终端 setup 与 Dashboard 接入保存的连接配置位于 `~/.botmux/wecom/connections/<BotID 的 SHA256>/config.json`（0600）；Secret 单独保存在同目录的 `credentials/<随机代>.secret`（0600，目录0700），不写入配置、日志或命令参数。凭据文件与配置不属于飞书 `bots.json`，也不会当作飞书 owner。已有的默认配置 `~/.botmux/wecom/config.json` 与已登记的自定义配置照常加载运行。
 
-```bash
-botmux setup --platform wecom --manual
-botmux wecom
-```
-
-向导依次收集 BotID、Secret（输入不回显）、允许用户的真实企微 userid、CLI、PTY/tmux 后端、项目目录和专用 core 端口。userid 是通讯录中的账号，不是姓名或飞书 open_id；不能为空或使用 `*`，也不会自动认领第一个发消息的人。CLI 的登录、模型和项目权限由本机管理员准备。
-
-最终输入 `yes` 后才保存；Ctrl-C、EOF 或取消不会改动原配置。重跑同一命令可编辑，Secret 留空保留原凭据，更换 BotID 必须输入新 Secret。保存后哪些改动立即生效、哪些要重启连接，见下文「在 Dashboard 查看与管理」中的「设置何时生效」：允许用户、CLI、后端和工作目录不需要重启；BotID、Secret 和 core 端口要重启连接后才用上。向导不会创建企微机器人，不会连接或发送消息。已有配置也可在 Dashboard 编辑；新增机器人推荐使用上述共用创建向导，终端 setup 的 `--manual` 入口继续支持手工配置与凭据更新。
-
-默认配置为 `~/.botmux/wecom/config.json`（0600）；Secret 单独保存在其 `credentials/<随机代>.secret`（0600，目录0700），不写入配置、日志或命令参数。凭据文件与配置不属于飞书 `bots.json`，也不会当作飞书 owner。可用 `--config /absolute/path/wecom.json` 指定其他配置文件，启动时同样加 `botmux wecom --config /absolute/path/wecom.json`。
-
-`botmux wecom` 前台管理自己启动的专用 core：固定绑定 loopback，必须确认自己子进程的就绪消息才连接企微；端口占用直接失败，不复用或杀掉其他服务。Ctrl-C/SIGTERM、连接被替换或启动失败会清理并等待自己拥有的 core 子进程退出。关闭窗口请优先正常终止，强制 SIGKILL 可能留下子进程；不要删除状态目录来解决端口占用。专用 core 子进程不继承网关 Secret 或飞书会话身份，也不重新加载全局 `.env`。
+接入完成的连接由 botmux 的 fleet 运行，用 `botmux wecom start|stop|restart <configId|成员名>` 或 Dashboard 启停（见下文「在 Dashboard 查看与管理」）。fleet 为每个连接执行的是前台网关命令 `botmux wecom --config <配置文件>`，它管理自己启动的专用 core：固定绑定 loopback，必须确认自己子进程的就绪消息才连接企微；端口占用直接失败，不复用或杀掉其他服务。Ctrl-C/SIGTERM、连接被替换或启动失败会清理并等待自己拥有的 core 子进程退出。关闭窗口请优先正常终止，强制 SIGKILL 可能留下子进程；不要删除状态目录来解决端口占用。专用 core 子进程不继承网关 Secret 或飞书会话身份，也不重新加载全局 `.env`。
 
 ### 在 Dashboard 查看与管理
 
-完成 setup 后，在本机运行 `botmux dashboard` 打开共用的「机器人配置」页。面板自动发现默认配置，以及通过 setup 保存或启动网关时注册的自定义配置；企微与飞书统一出现在机器人列表，并复用资料、分类、字段和保存控件。可编辑本地备注、CLI 与模型、工作目录、会话后端、权限、角色、环境及已支持的会话/消息策略。连接诊断和启动/停止位于「高级」中的运行状态。新增机器人可直接使用共用「添加机器人」向导；修改已保存连接的 Secret 时，在终端重跑 `botmux setup --platform wecom --manual`。
+完成 setup 后，在本机运行 `botmux dashboard` 打开共用的「机器人配置」页。面板自动发现默认配置，以及通过 setup 保存或启动网关时注册的自定义配置；企微与飞书统一出现在机器人列表，并复用资料、分类、字段和保存控件。可编辑本地备注、CLI 与模型、工作目录、会话后端、权限、角色、环境及已支持的会话/消息策略。连接诊断和启动/停止位于「高级」中的运行状态。新增机器人可直接使用共用「添加机器人」向导。修改已保存连接的 BotID 或 Secret 目前没有面板或终端入口。
 
 **设置何时生效**：除换 Agent 外，保存不会打断正在执行的任务；大多数设置也不需要重启连接。
 
@@ -107,7 +85,7 @@ botmux wecom identify --config /absolute/path/wecom.json --output /absolute/path
 
 认证后会显示随机验证码；用要授权的账号直接私聊机器人，只发送完整验证码，不要发到群聊。两分钟内未完成会超时；Ctrl-C 可取消。校验过程不启动 core、不执行任务、不修改白名单，也不会主动发消息。
 
-成功后自动退出并打印私有结果文件位置（权限0600，不覆盖已有文件或symlink），不会在终端打印 userid。文件包含已验证的 userid、时间、配置标识与配置内容摘要。在自己的本机查看该结果，再在 Dashboard「权限与安全」页的「用户权限」里（或运行 `botmux setup --platform wecom --manual`）明确填写该 userid 并保存，然后重新启动刚才停止的网关（fleet 运行的连接用 `botmux wecom start <configId>`）；不要把结果文件或身份内容发到群聊。验证码验证只证明账号来源，授权仍需用户明确确认，不会自动认领第一个发送者。
+成功后自动退出并打印私有结果文件位置（权限0600，不覆盖已有文件或symlink），不会在终端打印 userid。文件包含已验证的 userid、时间、配置标识与配置内容摘要。在自己的本机查看该结果，再在 Dashboard「权限与安全」页的「用户权限」里明确填写该 userid 并保存，然后重新启动刚才停止的网关（fleet 运行的连接用 `botmux wecom start <configId>`）；不要把结果文件或身份内容发到群聊。验证码验证只证明账号来源，授权仍需用户明确确认，不会自动认领第一个发送者。
 
 ### 入站诊断与会话展示
 
@@ -115,24 +93,11 @@ botmux wecom identify --config /absolute/path/wecom.json --output /absolute/path
 
 主 Dashboard 的「会话」页会聚合托管专用 core 中与 bridge 关联的企微会话。可以按机器人查看会话、打开详情与历史，并在在线且状态允许时管理会话或打开受控终端。网关离线时仍可查看已绑定的本地历史，实时控制不可用；旧外部 core 手工模式不加入主列表。新消息未出现会话时，先看收到回调、授权拒绝与接纳任务，再检查专用 core 是否执行；连接成功本身不代表消息已获准执行。网关不会将本机 core 的终端链接发送到企微。
 
-### 脚本配置
-
-非TTY缺参数会立即失败，不会挂住CI。完整脚本示例（Secret 预先存入当前用户拥有的0600普通文件，不能是symlink；命令行不接受明文 Secret）：
-
-```bash
-botmux setup --platform wecom --bot-id YOUR_BOT_ID --secret-file /absolute/path/input.secret \
-  --allow-user REAL_USERID --cli codex --backend pty \
-  --working-dir /absolute/path/project --core-port 19123 --yes
-botmux wecom
-```
-
-`--allow-user` 可重复。`--secret-env VAR_NAME` 可替代输入文件；向导会读取该环境变量并保存为本地凭据代，后续无需再次 export。输入文件在导入后仍由用户管理，向导不会删除来源文件。
-
 ### 保存与迁移语义
 
 凭据使用不可变随机代：先 durable 写凭据，再原子替换配置引用；提交前失败删除未使用新代，旧配置仍可读。若 rename 已完成但后续 flush 失败，会报告保存未确认，并保留配置当前引用的新代，避免产生悬空凭据。旧凭据代保留供并发读取及手动回滚，后续可由管理员确认无引用后清理。并发向导以真实文件锁和原始配置快照比较防止互相覆盖，冲突时重新运行。
 
-旧 `--config` + `secretEnv` + 外部 `coreUrl` 的双进程模式继续兼容。编辑时 Secret 留空会继续使用原环境变量，因此该旧模式仍要求环境变量；重新输入 Secret 或显式 `--secret-env` 才迁移本地凭据。旧外部 core 默认保留、不启动或停止它；需要迁移为自动管理时，在交互中明确确认，或加 `--managed-core`。迁移会创建独立 bridge 状态目录，开启新会话；旧目录、未完成任务与凭据代不自动重放到新 core，仍保留供旧配置恢复。
+旧 `--config` + `secretEnv` + 外部 `coreUrl` 的双进程模式继续兼容，照常加载运行，botmux 不启动或停止外部 core。使用 `secretEnv` 的托管 core 配置在 Dashboard 里编辑时保留原环境变量来源，因此仍要求该环境变量。终端 setup 与 Dashboard 都不提供把 `secretEnv` 改存为本地凭据、或把外部 core 配置迁移为托管 core 的入口；Dashboard 也不编辑外部 core 配置。
 
 托管 bridge 状态绑定专用 core 的持久状态目录和本地 bot 身份。手改这些字段后不能复用旧 bridge 状态，应选独立的新 `stateDir`；网关会拒绝把旧 sessionId/triggerId 带到不同 core。仅改端口而 core 持久目录/身份不变，仍属于同一 core。
 
