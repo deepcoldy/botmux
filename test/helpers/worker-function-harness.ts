@@ -605,6 +605,7 @@ export function loadWorkerMessageHandler(name: string, scope: Record<string, unk
       if (key === 'revokePromptReadiness') return loadWorkerFunction('revokePromptReadiness', scope);
       if (key === 'replayDeferredSessionReady') return loadWorkerFunction('replayDeferredSessionReady', scope);
       if (key === 'restoreMissingFinalNotices') return loadWorkerFunction('restoreMissingFinalNotices', scope);
+      if (typeof key === 'string' && FAILED_TURN_REWIND_FUNCTIONS.includes(key)) return loadWorkerFunction(key, scope);
       if (key === 'resetFoldBackgroundUpdatesStateForInit') return loadWorkerFunction('resetFoldBackgroundUpdatesStateForInit', scope);
       if (key === 'setFoldBackgroundUpdatesLive') return loadWorkerFunction('setFoldBackgroundUpdatesLive', scope);
       return (globalThis as any)[key];
