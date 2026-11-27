@@ -1115,6 +1115,56 @@ describe('one reply card per turn', () => {
     expect(recovered.lastCard).not.toContain(silentReceipt());
   });
 
+  it('preserves a forced same-content republish when externalFinal invalidates its pendingPatch', async () => {
+    // An unresolved Ask means externalFinal does not change the rendered body.
+    await store.update(key, { kind: 'start' }, io);
+    await store.update(key, { kind: 'ask', entry: nativeAsk('force-ask') }, io);
+    // Disconnected terminal publishes the card and establishes lastCard.
+    await store.update(key, { kind: 'terminal', phase: 'ambiguous', disconnected: true }, io);
+    const lastCardBefore = store.read(key)!.lastCard;
+
+    // A forced same-content republish fails: pendingPatch content equals lastCard.
+    const realPatch = vi.mocked(io.patch).getMockImplementation()!;
+    vi.mocked(io.patch).mockImplementation(async () => { throw new Error('provider pre-click restore'); });
+    const forceIo: TurnReplyCardTransport = { ...io, forcePatch: true };
+    await expect(store.update(key, { kind: 'refresh' }, forceIo)).rejects.toThrow('pre-click restore');
+    const stuck = store.read(key)!;
+    expect(stuck.pendingPatch!.content).toBe(stuck.lastCard);
+
+    // Transport recovers with a normal io (no forcePatch); the mark invalidates
+    // the pendingPatch but must keep the forced-republish intent.
+    vi.mocked(io.patch).mockImplementation(realPatch);
+    expect(await store.noteExternalFinal(key, input.chatId)).toBe(true);
+    expect(store.read(key)!.pendingPatch).toBeUndefined();
+    expect(store.read(key)!.forceRepublish).toBe(true);
+
+    // recover renders an identical body but still PATCHes once, then clears all evidence.
+    const patchesBefore = vi.mocked(io.patch).mock.calls.length;
+    await new TurnReplyCardStore(dir).update(key, { kind: 'recover' }, io);
+    const recovered = store.read(key)!;
+    expect(vi.mocked(io.patch).mock.calls.length).toBeGreaterThan(patchesBefore);
+    expect(recovered.lastCard).toBe(lastCardBefore);
+    expect(recovered.forceRepublish).toBeUndefined();
+    expect(recovered.publishPending).toBeUndefined();
+    expect(recovered.pendingPatch).toBeUndefined();
+  });
+
+  it('does not set forceRepublish when the invalidated pendingPatch carried a changed body', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    await store.update(key, { kind: 'terminal', phase: 'completed', silent: true }, io);
+    // Simulate a failed PATCH whose body DIFFERS from lastCard: a normal stale-body
+    // replay (a real state change that never got acknowledged), not a forced
+    // same-content republish.
+    const seeded = store.read(key)!;
+    seeded.pendingPatch = { content: `${seeded.lastCard}#changed`, final: false };
+    writeFileSync(join(store.directory, `${store.id(key)}.json`), JSON.stringify(seeded));
+    expect(await store.noteExternalFinal(key, input.chatId)).toBe(true);
+    const marked = new TurnReplyCardStore(dir).read(key)!;
+    expect(marked.forceRepublish).toBeUndefined();
+    expect(marked.pendingPatch).toBeUndefined();
+    expect(marked.publishPending).toBe(true);
+  });
+
   it('never marks a user-cancelled turn as deliberately silent', async () => {
     await store.update(key, { kind: 'start' }, io);
     await store.update(key, { kind: 'phase', phase: 'stopping' }, io);

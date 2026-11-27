@@ -77,6 +77,11 @@ export interface TurnReplyCardRecord extends TurnReplyCardKey {
   lastCard?: string;
   /** Exact PATCH awaiting provider acknowledgement; replay never creates a card. */
   pendingPatch?: { content: string; final: boolean };
+  /** The published card must be re-PATCHed once even when the rendered body is
+   *  unchanged: a forcePatch attempt (provider ACK can restore the pre-click
+   *  view) failed and its same-content pendingPatch was invalidated by a later
+   *  render revision such as externalFinal. Cleared only after a PATCH lands. */
+  forceRepublish?: boolean;
   /** State changed but its rendered update has not been acknowledged yet. */
   publishPending?: boolean;
   /** Preserve a recovery's final visibility decision across partial writes. */
@@ -266,7 +271,14 @@ export class TurnReplyCardStore {
    * marked has no finalCard (guarded above), hence pendingPatch.final is always
    * false and dropping it cannot affect final-delivery accounting. A failed
    * re-render re-persists a fresh, correct pendingPatch and keeps publishPending,
-   * so the evidence clears only after the new body is actually PATCHed. */
+   * so the evidence clears only after the new body is actually PATCHed.
+   *
+   * A same-content pendingPatch (its content equals lastCard) is different: it
+   * carries a forcePatch republish intent — the provider may have restored the
+   * pre-click view, so that body must be re-PATCHed even though re-rendering
+   * produces identical text (an unresolved Ask makes externalFinal a no-op for
+   * the body). Dropping it would let recover skip the PATCH and clear the
+   * evidence, so preserve the intent as forceRepublish. */
   async noteExternalFinal(key: TurnReplyCardKey, chatId: string): Promise<boolean> {
     if (!this.read(key)) return false;
     return withFileLock(this.path(key), async () => {
@@ -275,6 +287,9 @@ export class TurnReplyCardStore {
       if (record.externalFinal) return true;
       record.externalFinal = true;
       if (record.messageId && replyCardIsTerminal(record)) {
+        if (record.pendingPatch && record.pendingPatch.content === record.lastCard) {
+          record.forceRepublish = true;
+        }
         delete record.pendingPatch;
         record.publishPending = true;
       }
@@ -321,6 +336,7 @@ export class TurnReplyCardStore {
           record.phase = 'completed';
           delete record.pendingPatch;
           delete record.publishPending;
+          delete record.forceRepublish;
           this.write(key, record);
           return { delivered: false, record };
         }
@@ -583,7 +599,7 @@ export class TurnReplyCardStore {
           delete record.pendingCreate;
           this.write(key, record);
         }
-        if (record.lastCard !== card || io.forcePatch) {
+        if (record.lastCard !== card || io.forcePatch || record.forceRepublish) {
           const messageId = record.messageId;
           record.pendingPatch = { content: card, final: !!record.finalCard && !(event.kind === 'terminal' && event.disconnected) };
           this.write(key, record);
@@ -592,6 +608,7 @@ export class TurnReplyCardStore {
         }
         delete record.pendingPatch;
         delete record.publishPending;
+        delete record.forceRepublish;
         delete record.recoveryHideFinal;
         if (record.finalCard && !(event.kind === 'terminal' && event.disconnected)) {
           record.finalDelivered = true;
@@ -638,6 +655,7 @@ export class TurnReplyCardStore {
       }
       delete record.pendingPatch;
       delete record.publishPending;
+      delete record.forceRepublish;
       delete record.recoveryHideFinal;
       record.updatedAtMs = Date.now();
       this.write(key, record);
