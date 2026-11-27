@@ -106,7 +106,7 @@ function validateFlags(raw: unknown, validators: Record<string, unknown>): Byted
   for (const value of raw) {
     const rec = object(value, ['name', 'aliases', 'arity', 'validator', 'repeat'], ['name', 'arity', 'validator']);
     if (typeof rec.name !== 'string' || !option.test(rec.name)
-      || !['value', 'flag', 'optional-boolean'].includes(String(rec.arity))
+      || typeof rec.arity !== 'string' || !['value', 'flag', 'optional-boolean'].includes(rec.arity)
       || typeof rec.validator !== 'string' || !Object.hasOwn(validators, rec.validator)
       || (rec.repeat !== undefined && typeof rec.repeat !== 'boolean')) invalid();
     const aliases = rec.aliases === undefined ? [] : strings(rec.aliases, optionAlias);
@@ -139,7 +139,7 @@ function validateCatalog(raw: unknown): BytedcliOperationGrammar {
     const entry = object(rawEntry, ['id', 'path', 'aliases', 'effect', 'flags', 'positional', 'selector', 'repo', 'required', 'changes', 'defaults'],
       ['id', 'path', 'aliases', 'effect', 'flags']);
     if (typeof entry.id !== 'string' || !/^[a-z][a-z0-9.-]{1,127}$/.test(entry.id) || ids.has(entry.id)
-      || !['read', 'write', 'auth', 'help'].includes(String(entry.effect))) invalid();
+      || typeof entry.effect !== 'string' || !['read', 'write', 'auth', 'help'].includes(entry.effect)) invalid();
     ids.add(entry.id);
     const canonical = strings(entry.path, word);
     if (canonical.join('.') !== entry.id || !Array.isArray(entry.aliases) || entry.aliases.length > 16) invalid();
@@ -147,7 +147,7 @@ function validateCatalog(raw: unknown): BytedcliOperationGrammar {
       const key = path.join('.'); if (paths.has(key)) invalid(); paths.add(key);
     }
     const flags = validateFlags(entry.flags, validators);
-    if (entry.positional !== undefined && !['repo', 'mr'].includes(String(entry.positional))) invalid();
+    if (entry.positional !== undefined && (typeof entry.positional !== 'string' || !['repo', 'mr'].includes(entry.positional))) invalid();
     for (const key of ['repo', 'selector']) if (entry[key] !== undefined && typeof entry[key] !== 'boolean') invalid();
     for (const key of ['required', 'changes']) {
       if (entry[key] !== undefined && strings(entry[key], option).some(name => !flags.some(flag => flag.name === name))) invalid();

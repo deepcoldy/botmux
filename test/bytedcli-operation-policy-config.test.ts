@@ -117,6 +117,25 @@ describe('versioned bytedcli operation policy', () => {
     expect(() => { (flags[0] as { validator: string }).validator = 'json'; }).toThrow();
   });
 
+  it.each([
+    { field: 'effect', valid: 'write' },
+    { field: 'arity', valid: 'value' },
+    { field: 'positional', valid: 'repo' },
+  ])('refuses catalog import when $field is a non-string enum shape', async ({ field, valid }) => {
+    for (const malformed of [[valid], [[valid]], null, true, 42, {}]) {
+      const fixture = JSON.parse(JSON.stringify(BYTEDCLI_OPERATION_GRAMMAR));
+      if (field === 'arity') fixture.entries[0].flags[0].arity = malformed;
+      else fixture.entries[0][field] = malformed;
+      const bundled = await build({ stdin: { contents: `export * from './src/core/bytedcli-operation-catalog.js';`,
+        resolveDir: resolve(import.meta.dirname, '..') }, bundle: true, platform: 'browser', format: 'iife',
+        globalName: 'Catalog', write: false, plugins: [{ name: 'malformed-packaged-catalog', setup(plugin) {
+          plugin.onLoad({ filter: /bytedcli-operation-catalog\.json$/ }, () => ({ contents: JSON.stringify(fixture), loader: 'json' }));
+        } }] });
+      expect(() => runInNewContext(bundled.outputFiles[0].text, {}))
+        .toThrow('Invalid packaged bytedcli operation catalog');
+    }
+  });
+
   it('bundles catalog and policy for the browser and resolves rules without Node globals', async () => {
     const bundled = await build({ stdin: { contents: `
       export * from './src/core/bytedcli-operation-catalog.js';
