@@ -1298,6 +1298,46 @@ describe('Bridge final_output delivery (P2 retry)', () => {
   });
 
   it.each([
+    { cliId: 'claude-code', configuredMode: 'legacy' },
+    { cliId: 'minimax', configuredMode: 'unified' },
+  ] as const)('attaches private Oncall to $cliId legacy final cards (configured=$configuredMode)', async ({ cliId, configuredMode }) => {
+    vi.useRealTimers();
+    const bot = getBot('app_test');
+    bot.config.cliId = cliId;
+    bot.config.replyCardMode = configuredMode;
+    bot.config.oncallGroup = { enabled: true, chatIds: ['oc_source'] };
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.session.cliId = cliId;
+    ds.session.chatId = ds.chatId = 'oc_private_dm';
+    ds.session.chatType = ds.chatType = 'p2p';
+    ds.session.rootMessageId = 'om_private_legacy_root';
+    ds.session.scope = ds.scope = 'thread';
+    ds.currentTurnId = `om_private_${cliId}_turn`;
+    const binding = {
+      appId: ds.larkAppId, groupChatId: 'oc_source', groupMessageId: `om_${cliId}_source`,
+      chatId: ds.chatId, rootMessageId: 'om_private_legacy_root', ownerOpenId: 'ou_owner', createdAtMs: Date.now(),
+    };
+    const { OncallPrivateIntakeStore } = await import('../src/services/oncall-private-intake.js');
+    new OncallPrivateIntakeStore(config.session.dataDir).record(binding);
+    const sessionReply = vi.fn(async () => `om_${cliId}_legacy_answer`);
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, { type: 'final_output', kind: 'bridge', content: 'private answer', lastUuid: `uuid-${cliId}`,
+      turnId: ds.currentTurnId }, 'private-legacy', 0);
+    const { OncallGroupStore } = await import('../src/services/oncall-group-store.js');
+    const groups = new OncallGroupStore(config.session.dataDir);
+    await vi.waitFor(() => {
+      expect(sessionReply).toHaveBeenCalledOnce();
+      expect(sessionReply.mock.calls[0]?.[1]).toContain('oncall_group_create');
+      expect(groups.findSource(ds.larkAppId, `om_${cliId}_legacy_answer`)).toMatchObject({
+        chatId: 'oc_private_dm', questionId: ds.currentTurnId, answer: '',
+        privateIntake: { groupChatId: 'oc_source', ownerOpenId: 'ou_owner', rootMessageId: 'om_private_legacy_root' },
+      });
+    }, { timeout: 5000 });
+  });
+
+  it.each([
     ['claude-code', 'on'], ['claude-code', 'bot-off'], ['claude-code', 'chat-off'],
     ['codex', 'on'], ['codex', 'bot-off'], ['codex', 'chat-off'],
     ['grok', 'on'], ['grok', 'bot-off'], ['grok', 'chat-off'],

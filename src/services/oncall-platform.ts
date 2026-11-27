@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { oncallCreationSource, type OncallGroupCreation, type OncallGroupTarget } from './oncall-group-client.js';
 import { larkHosts, type Brand } from '../im/lark/lark-hosts.js';
-import { isNativeOncallSelectionMarker } from './oncall-sidebar-link.js';
+import { ensureSelectedOncallQuery, isNativeOncallSelectionMarker, nativeSelectionSourceType } from './oncall-sidebar-link.js';
 
 export interface OncallCategory {
   id: number;
@@ -13,6 +13,10 @@ export interface OncallCategory {
   question_type_stage_list?: string[];
 }
 export interface OncallChoices { regions: Record<string, OncallCategory[]> }
+/** The choices API only returns routing keys. Use the display name from Oncall's region list. */
+export function oncallRegionLabel(region: string): string {
+  return region === 'cn_all' ? 'CN/所有区域' : region;
+}
 export interface OncallNativeSelection { region: string; typeId: number; priority: 'P2' | 'P1' | 'P0'; formId?: string }
 export type OncallSelection = OncallCategory & { requiresNativeForm: boolean; workflow?: unknown[] };
 
@@ -157,11 +161,16 @@ export async function createNativeOncallLink(target: OncallGroupTarget, secret: 
   // this already-asked question lets the selected category proceed to its form
   // after tenant initialization resets the initial `directly` step.
   page.searchParams.set('query', trigger);
+  if (selection) ensureSelectedOncallQuery(page);
   // The platform persists only the first 200 characters of source_location.
   // Put the form identity first, before description/context can consume it.
   if (selection?.formId) {
     const params = new URLSearchParams({ bm_form: selection.formId });
-    for (const [key, value] of page.searchParams) if (key !== 'bm_form') params.append(key, value);
+    const sourceType = nativeSelectionSourceType(selection.formId);
+    if (sourceType) params.set('bizFrom', sourceType);
+    for (const [key, value] of page.searchParams) {
+      if (key !== 'bm_form' && !(sourceType && key === 'bizFrom')) params.append(key, value);
+    }
     page.search = params.toString();
   }
   link.searchParams.set('mode', 'sidebar-semi');
@@ -177,6 +186,7 @@ export interface NativeOncallResultQuery {
   region: string;
   preparedAtMs?: number;
   hostedSourceLocation?: string;
+  receipt?: { flowId: string; openChatId: string };
 }
 export interface NativeOncallResult { flowId: string; openChatId: string; handoffAtMs: number }
 export interface NativeOncallResultCandidate<T extends NativeOncallResultQuery = NativeOncallResultQuery> {
@@ -204,18 +214,25 @@ function platformTime(timeMs: number): string {
   return new Date(timeMs + 8 * 60 * 60_000).toISOString().slice(0, 19).replace('T', ' ');
 }
 
-function nativeSourceMatcher(sourceLocation: string) {
-  const source = new URL(sourceLocation);
+function nativeSourceMatcher(query: NativeOncallResultQuery) {
+  const source = new URL(query.sourceLocation);
   const formId = source.searchParams.get('bm_form');
+  const tag = nativeSelectionSourceType(formId);
+  // A reused platform draft can retain the first topic's channel at handoff.
+  // A channel can contradict the marked URL, but cannot establish ownership.
+  const conflictingChannel = (value: unknown) =>
+    typeof value === 'string' && /^botmux_[a-f0-9]{24}$/.test(value) && value !== tag;
   return {
     formId,
-    matches(value: unknown): boolean {
-      if (!formId) return value === sourceLocation;
-      try {
-        const actual = new URL(String(value));
-        return actual.origin === source.origin && actual.pathname === source.pathname
-          && actual.searchParams.getAll('bm_form').length === 1 && actual.searchParams.get('bm_form') === formId;
-      } catch { return false; }
+    matches(value: unknown, channel: unknown): boolean {
+      if (conflictingChannel(channel)) return false;
+      if (!formId) return value === query.sourceLocation;
+      if (typeof value !== 'string') return false;
+      let actual: URL;
+      try { actual = new URL(value); } catch { return false; }
+      return actual.origin === source.origin && actual.pathname === source.pathname
+        && actual.searchParams.getAll('bm_form').length === 1 && actual.searchParams.get('bm_form') === formId
+        && !actual.searchParams.getAll('bizFrom').some(conflictingChannel);
     },
   };
 }
@@ -230,7 +247,7 @@ export async function readNativeOncallResultCandidates<T extends NativeOncallRes
   if (!secret || queries.some(item => !item.username || !item.sourceLocation)) throw new Error('Oncall 提单结果查询配置不完整');
   const username = queries[0]!.username;
   if (queries.some(item => item.username !== username)) throw new Error('同一表单的提单人不一致');
-  const sources = queries.map(item => nativeSourceMatcher(item.sourceLocation));
+  const sources = queries.map(nativeSourceMatcher);
   if (!sources.every(item => item.formId) && queries.length !== 1) throw new Error('同一批原生提单缺少统一关联标识');
   const exactSources = queries.map((item, index) => item.hostedSourceLocation ?? (sources[index]!.formId ? undefined : item.sourceLocation));
   const key = createHash('sha256').update(JSON.stringify([target, queries])).digest('hex');
@@ -273,7 +290,12 @@ export async function readNativeOncallResultCandidates<T extends NativeOncallRes
   function match(row: any, exactSource = false) {
     const matches = sources.map((source, index) => {
       const expectedSource = exactSources[index];
-      return exactSource && expectedSource ? row?.source_location === expectedSource : source.matches(row?.source_location);
+      const query = queries[index]!;
+      // Count all platform orders bearing this hosted form marker when a
+      // callback is available. The callback must not hide a second order.
+      const inspectMarkedOrder = query.receipt && query.hostedSourceLocation && source.formId;
+      return (!exactSource || !expectedSource || row?.source_location === expectedSource)
+        && source.matches(row?.source_location, inspectMarkedOrder ? undefined : row?.source_type);
     });
     if (!matches.some(Boolean)) return;
     if (row.tenant_id !== target.tenantId || row.originator_user !== username || row.stage !== 'launch_oncall'
@@ -366,5 +388,8 @@ export async function readNativeOncallResultCandidates<T extends NativeOncallRes
     progress.save({ key, createdThrough: platformTime(Date.now()), afterId: 0, verifyFlowId: row.id, verifyRounds: 0 });
     return [];
   }
-  return attempts.map(attempt => ({ attempt, result }));
+  return attempts.filter(attempt => nativeSourceMatcher(attempt).matches(row.source_location, row.source_type)
+    || (attempt.hostedSourceLocation === row.source_location && attempt.receipt?.flowId === result.flowId
+      && attempt.receipt.openChatId === openChatId))
+    .map(attempt => ({ attempt, result }));
 }

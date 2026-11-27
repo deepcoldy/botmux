@@ -3,11 +3,11 @@ import { mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLock, withFileLockSync } from '../utils/file-lock.js';
-import { OncallGroupStore, type OncallGroupSource } from './oncall-group-store.js';
+import { oncallSourceEnabled, OncallGroupStore, type OncallGroupSource } from './oncall-group-store.js';
 import { loadOncallGroupTarget } from './oncall-group-client.js';
 import type { NativeOncallResultQuery, NativeOncallScan, OncallChoices } from './oncall-platform.js';
-import { nativeFormPolicyFingerprint, oncallGroupEnabled, type OncallForwardMode, type OncallGroupPolicy } from './oncall-group-policy.js';
-import type { OncallTextField } from './oncall-custom-form.js';
+import { nativeFormPolicyMatches, type OncallForwardMode, type OncallGroupPolicy } from './oncall-group-policy.js';
+import type { OncallCardField } from './oncall-custom-form.js';
 
 const FORM_LIFETIME_MS = 24 * 60 * 60_000;
 
@@ -47,7 +47,9 @@ export interface OncallFormDraft {
   /** Prepared before publication, so custom-form confirmation opens the sidebar directly. */
   nativeFormLink?: string;
   /** Published field definition, scoped to this draft and version. */
-  botmuxFields?: OncallTextField[];
+  botmuxFields?: OncallCardField[];
+  /** Explains why a preferred card form needs the native sidebar. */
+  nativeFormReason?: string;
   /** Every published selection is retained until the card is retired. */
   nativeSubmission?: OncallNativeSubmission;
   oncallUsername?: string;
@@ -98,18 +100,36 @@ export class OncallFormStore {
   /** An issued capability stays bound to its original selection while the card is active. */
   readNativeSidebarLink(appId: string, id: string, token: string, readPolicy: (appId: string) => OncallGroupPolicy | undefined): string | undefined {
     const draft = this.read<OncallFormDraft>(this.file(appId, id));
-    if (!draft || draft.appId !== appId || draft.id !== id || draft.closed
+    if (!draft || draft.closed) return;
+    return this.activeSidebarAttempt(draft, appId, id, token, readPolicy)?.sidebarLink?.href;
+  }
+  private activeSidebarAttempt(draft: OncallFormDraft, appId: string, id: string, token: string,
+    readPolicy: (appId: string) => OncallGroupPolicy | undefined): OncallNativeSubmissionAttempt | undefined {
+    if (draft.appId !== appId || draft.id !== id || draft.nativeSubmission?.completed
       || Date.now() - draft.createdAtMs >= FORM_LIFETIME_MS) return;
     const attempt = draft.nativeSubmission?.attempts.find(item => item.sidebarLink?.token === token);
     if (!attempt?.sidebarLink) return;
     try {
       const policy = readPolicy(appId);
-      if (!oncallGroupEnabled(policy, draft.source.chatId) || nativeFormPolicyFingerprint(policy) !== attempt.policyFingerprint
+      if (!oncallSourceEnabled(policy, draft.source) || !nativeFormPolicyMatches(policy, attempt.policyFingerprint)
         || JSON.stringify(loadOncallGroupTarget(this.dataDir, appId)) !== draft.targetFingerprint) return;
       const request = new OncallGroupStore(this.dataDir).getRequest(draft.source);
       if (request && request.status !== 'failed') return;
-      return attempt.sidebarLink.href;
+      return attempt;
     } catch { return; }
+  }
+  async recordSidebarReceipt(appId: string, id: string, token: string, receipt: { flowId: string; openChatId: string },
+    readPolicy: (appId: string) => OncallGroupPolicy | undefined): Promise<boolean> {
+    const draft = this.read<OncallFormDraft>(this.file(appId, id));
+    if (!draft || !this.activeSidebarAttempt(draft, appId, id, token, readPolicy)) return false;
+    return this.use(appId, id, draft.ownerOpenId, async current => {
+      const attempt = this.activeSidebarAttempt(current, appId, id, token, readPolicy);
+      if (!attempt?.hostedSourceLocation) return false;
+      // A client hint is replaceable. Only the later platform read can bind
+      // a group, so a malformed or out-of-date hint cannot lock the form.
+      attempt.receipt = receipt;
+      return true;
+    }, { allowClosed: true });
   }
   publishedMessageIds(source: OncallGroupSource): Set<string> {
     let files: string[];

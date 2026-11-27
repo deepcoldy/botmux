@@ -1,0 +1,182 @@
+import { createHash } from 'node:crypto';
+import { mkdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { withFileLockSync } from '../utils/file-lock.js';
+
+export interface OncallPrivateIntake {
+  appId: string;
+  groupChatId: string;
+  groupMessageId: string;
+  chatId: string;
+  rootMessageId: string;
+  ownerOpenId: string;
+  createdAtMs: number;
+}
+interface IntakeThread extends OncallPrivateIntake {
+  replyMessageIds?: string[];
+}
+
+interface IntakeDelivery {
+  groupMessageId: string;
+  startedAtMs: number;
+  binding?: OncallPrivateIntake;
+  /** The provider may already have delivered the DM, but its receipt is not safely bound. */
+  uncertain?: boolean;
+  finished?: boolean;
+}
+
+const RECEIPT_WAIT_MS = 60_000;
+
+function key(...parts: string[]): string {
+  return createHash('sha256').update(JSON.stringify(parts)).digest('hex');
+}
+
+export function privateIntakeDeliveryId(appId: string, messageId: string): string {
+  return key('oncall-private-intake', appId, messageId).slice(0, 40);
+}
+
+export class OncallPrivateIntakeStore {
+  constructor(private readonly dataDir: string) {}
+
+  private path(appId: string, chatId: string): string {
+    return join(this.dataDir, 'oncall-private-intake', key(appId, chatId) + '.json');
+  }
+
+  private deliveryPath(appId: string, ownerOpenId: string): string {
+    return this.path(appId, 'owner:' + ownerOpenId);
+  }
+
+  private read<T>(path: string): T[] {
+    try { return JSON.parse(readFileSync(path, 'utf8')) as T[]; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+      throw error;
+    }
+  }
+
+  private update<T, R>(file: string, transform: (rows: T[]) => R): R {
+    mkdirSync(join(this.dataDir, 'oncall-private-intake'), { recursive: true, mode: 0o700 });
+    return withFileLockSync(file, () => {
+      const rows = this.read<T>(file);
+      const before = JSON.stringify(rows);
+      const result = transform(rows);
+      const after = JSON.stringify(rows);
+      if (after !== before) atomicWriteFileSync(file, after, { mode: 0o600, durable: true });
+      return result;
+    });
+  }
+
+  findDelivery(appId: string, ownerOpenId: string | undefined, groupMessageId: string): IntakeDelivery | undefined {
+    if (!ownerOpenId?.startsWith('ou_') || !groupMessageId?.startsWith('om_')) return;
+    return this.read<IntakeDelivery>(this.deliveryPath(appId, ownerOpenId))
+      .find(item => item.groupMessageId === groupMessageId);
+  }
+
+  awaitingReceipt(appId: string, ownerOpenId: string | undefined, messageCreatedAt?: string): boolean {
+    if (!ownerOpenId?.startsWith('ou_')) return false;
+    const now = Date.now();
+    const receivedAt = Number(messageCreatedAt) || now;
+    return this.read<IntakeDelivery>(this.deliveryPath(appId, ownerOpenId)).some(item =>
+      !item.binding && !item.finished && (item.uncertain || now < item.startedAtMs + RECEIPT_WAIT_MS
+        || (receivedAt >= item.startedAtMs && receivedAt < item.startedAtMs + RECEIPT_WAIT_MS)));
+  }
+
+  beginDelivery(appId: string, ownerOpenId: string, groupMessageId: string): OncallPrivateIntake | undefined {
+    return this.update<IntakeDelivery, OncallPrivateIntake | undefined>(this.deliveryPath(appId, ownerOpenId), rows => {
+      const existing = rows.find(item => item.groupMessageId === groupMessageId);
+      if (existing) {
+        if (!existing.finished || !existing.binding) existing.startedAtMs = Date.now();
+        if (!existing.binding) existing.finished = false;
+        return existing.binding;
+      }
+      rows.push({ groupMessageId, startedAtMs: Date.now() });
+    });
+  }
+
+  record(binding: OncallPrivateIntake): OncallPrivateIntake {
+    if (!binding.chatId.startsWith('oc_') || binding.chatId === binding.groupChatId
+      || !binding.groupChatId.startsWith('oc_') || !binding.groupMessageId.startsWith('om_')
+      || !binding.ownerOpenId.startsWith('ou_') || !binding.rootMessageId.startsWith('om_')) {
+      throw new Error('私聊接待缺少可信投递回执');
+    }
+    const verified = this.update<IntakeThread, OncallPrivateIntake>(this.path(binding.appId, binding.chatId), records => {
+      const same = records.find(item => item.rootMessageId === binding.rootMessageId || item.groupMessageId === binding.groupMessageId);
+      if (same) {
+        if (same.groupChatId !== binding.groupChatId || same.groupMessageId !== binding.groupMessageId
+          || same.ownerOpenId !== binding.ownerOpenId) {
+          throw new Error('私聊接待归属已变化');
+        }
+        const { replyMessageIds: _, ...verified } = same;
+        return verified;
+      }
+      records.push(binding);
+      return binding;
+    });
+    this.update<IntakeDelivery, void>(this.deliveryPath(binding.appId, binding.ownerOpenId), rows => {
+      const delivery = rows.find(item => item.groupMessageId === binding.groupMessageId);
+      if (delivery) delivery.binding = verified;
+    });
+    return verified;
+  }
+
+  finishDelivery(delivery: Pick<OncallPrivateIntake, 'appId' | 'ownerOpenId' | 'groupMessageId'>): void {
+    this.update<IntakeDelivery, void>(this.deliveryPath(delivery.appId, delivery.ownerOpenId), rows => {
+      const existing = rows.find(item => item.groupMessageId === delivery.groupMessageId);
+      // A later definite failure cannot disprove an earlier commit-unknown.
+      // Only a trusted provider binding may settle that history; an explicit
+      // reconciliation entrypoint must not silently reuse this ordinary finish.
+      if (existing && (!existing.uncertain || existing.binding)) existing.finished = true;
+    });
+  }
+
+  markDeliveryUncertain(delivery: Pick<OncallPrivateIntake, 'appId' | 'ownerOpenId' | 'groupMessageId'>): void {
+    this.update<IntakeDelivery, void>(this.deliveryPath(delivery.appId, delivery.ownerOpenId), rows => {
+      const existing = rows.find(item => item.groupMessageId === delivery.groupMessageId);
+      if (existing && !existing.binding) existing.uncertain = true;
+    });
+  }
+
+  isStarting(binding: OncallPrivateIntake): boolean {
+    const delivery = this.findDelivery(binding.appId, binding.ownerOpenId, binding.groupMessageId);
+    return !!delivery && !delivery.finished && Date.now() < delivery.startedAtMs + RECEIPT_WAIT_MS;
+  }
+
+  recordReply(binding: OncallPrivateIntake, messageId: string): void {
+    if (!messageId.startsWith('om_') || messageId === binding.rootMessageId) return;
+    this.update<IntakeThread, void>(this.path(binding.appId, binding.chatId), records => {
+      const target = records.find(item => item.rootMessageId === binding.rootMessageId
+        && item.ownerOpenId === binding.ownerOpenId);
+      if (!target) throw new Error('私聊咨询已失去来源绑定');
+      if (!target.replyMessageIds?.includes(messageId)) (target.replyMessageIds ??= []).push(messageId);
+    });
+  }
+
+  find(appId: string, chatId: string, rootMessageId: string | undefined): OncallPrivateIntake | undefined {
+    return rootMessageId ? this.findReply(appId, chatId, [rootMessageId]) ?? undefined : undefined;
+  }
+
+  /** Resolve both reply anchors from the same snapshot. A conflict must stay out of ordinary DM routing. */
+  findReply(appId: string, chatId: string, messageIds: string[], resolveCardRoot?: (id: string) => string | undefined): OncallPrivateIntake | null | undefined {
+    if (!messageIds.length || !chatId.startsWith('oc_')) return;
+    const threads = this.read<IntakeThread>(this.path(appId, chatId))
+      .filter(thread => thread.appId === appId && thread.chatId === chatId);
+    if (!threads.length) return;
+    const findThread = (id: string) => threads.find(item => item.rootMessageId === id || item.replyMessageIds?.includes(id));
+    let match: IntakeThread | undefined;
+    for (const id of new Set(messageIds)) {
+      let thread = findThread(id);
+      if (!thread && resolveCardRoot) {
+        const root = resolveCardRoot(id);
+        if (root) thread = findThread(root);
+      }
+      if (!thread) continue;
+      if (match && match.rootMessageId !== thread.rootMessageId) return null;
+      match = thread;
+    }
+    if (match) {
+      const { replyMessageIds: _, ...binding } = match;
+      return binding;
+    }
+  }
+}

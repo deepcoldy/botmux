@@ -68,11 +68,11 @@ beforeEach(() => {
   vi.stubGlobal('fetch', fetcher);
 });
 afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs(); vi.useRealTimers(); rmSync(dir, { recursive: true, force: true }); });
-async function open() {
-  const result = await handleOncallGroupAction({ operator: { open_id: 'ou_actor' }, context: { open_chat_id: source.chatId, open_message_id: source.messageId },
+async function open(origin = source) {
+  const result = await handleOncallGroupAction({ operator: { open_id: 'ou_actor' }, context: { open_chat_id: origin.chatId, open_message_id: origin.messageId },
     action: { value: { action: 'oncall_group_create' } } } as any, appId);
   expect(result.toast.type).toBe('info');
-  return new OncallFormStore(dir).pendingNativeSubmissions(appId)[0];
+  return new OncallFormStore(dir).pendingNativeSubmissions(appId).find(d => d.source.sessionId === origin.sessionId)!;
 }
 function submitted(d: any) {
   rows = [{ id: 1234, tenant_id: 12, source_location: d.nativeSubmission.attempts[0]!.sourceLocation, originator_user: 'actor',
@@ -106,6 +106,134 @@ async function reconcileAndDeliver() {
 }
 
 describe('native submission completion', () => {
+  it.each(['direct', 'hosted', 'previously-issued'])('updates the issuing card and forwards to the matching group when its marked URL survives (%s)', async entry => {
+    if (entry !== 'direct') vi.stubEnv('BOTMUX_PUBLIC_URL', 'https://dashboard.example.test');
+    const d = await open();
+    submitted(d);
+    const officialPage = new URL(new URL(d.nativeFormLink!).searchParams.get('url')!);
+    const channel = officialPage.searchParams.get('bizFrom');
+    expect(channel).toMatch(/^botmux_[0-9a-f]{24}$/);
+    if (entry === 'previously-issued') {
+      await new OncallFormStore(dir).use(appId, d.id, 'ou_actor', async draft => {
+        const attempt = draft.nativeSubmission!.attempts[0]!;
+        const legacy = new URL(attempt.sourceLocation);
+        legacy.searchParams.delete('bizFrom');
+        attempt.sourceLocation = legacy.href;
+      });
+    }
+    rows[0].source_location = officialPage.href.slice(0, 200);
+    rows[0].source_type = channel;
+    // Same account, category, and launch time, but a different form and chat.
+    rows.push({ ...rows[0], id: 1235, chat_id: '9999', source_location: 'https://oncall.example.test/', source_type: 'botmux_' + 'f'.repeat(24) });
+    mocks.bot.config.oncallGroup.button = { minTurns: 3 };
+    await reconcileAndDeliver();
+    vi.setSystemTime(started + 21_000);
+    await reconcileAndDeliver();
+    expect(new OncallGroupStore(dir).getRequest(source)).toMatchObject({ status: 'succeeded', flowId: '1234',
+      openChatId: 'oc_destination', forwarded: ['om_q1', 'om_a1', 'om_q2', 'om_a2', 'om_file'] });
+    expect(mocks.update.mock.calls.some(([, message, card]) => message === source.messageId && card.includes('进入人工 Oncall 群'))).toBe(true);
+    const conversions = fetcher.mock.calls.filter(([url]) => url.includes('/chat_id_to_open_chat_id'));
+    expect([...new Set(conversions.map(([url]) => new URL(url).searchParams.get('chat_id')))]).toEqual(['1234567890123']);
+    expect(mocks.invite).toHaveBeenCalledWith(appId, 'oc_destination');
+    expect(mocks.merge).toHaveBeenCalledExactlyOnceWith(appId, ['om_q1', 'om_a1', 'om_q2', 'om_a2', 'om_file'], 'oc_destination', expect.any(String));
+  });
+
+  it.each(['current', 'stale', 'wrong flow', 'wrong chat', 'two orders', 'missing marker', 'navigation referrer'])('verifies the submitting topic and destination for a reused order (%s)', async channel => {
+    vi.stubEnv('BOTMUX_PUBLIC_URL', 'https://dashboard.example.test');
+    const first = await open();
+    const secondSource = { ...source, sessionId: 'session-b', rootId: 'om_bq', questionId: 'om_bq', messageId: 'om_ba' };
+    const groups = new OncallGroupStore(dir);
+    groups.registerTurn(appId, secondSource.sessionId, secondSource.questionId);
+    groups.recordSource({ ...secondSource, cardJson: JSON.stringify({ schema: '2.0', body: { elements: [] } }) });
+    vi.setSystemTime(started + 60_000);
+    const second = await open(secondSource);
+    submitted(second);
+    const created = new Date(started + 8000).toISOString();
+    const launched = new Date(started + 80_000).toISOString();
+    Object.assign(rows[0], {
+      create_time: created, update_time: launched, create_chat_time: launched, oncall_start_time: launched,
+      source_type: new URL((channel === 'current' ? second : first).nativeSubmission!.attempts[0]!.sourceLocation).searchParams.get('bizFrom'),
+    });
+    const attempt = second.nativeSubmission!.attempts[0]!;
+    if (channel !== 'navigation referrer') rows[0].source_location = attempt.hostedSourceLocation;
+    if (channel === 'missing marker') rows[0].source_location = new URL(attempt.sourceLocation).origin;
+    if (channel === 'two orders') rows.push({ ...rows[0], id: 5678, chat_id: '98765' });
+    expect(await new OncallFormStore(dir).recordSidebarReceipt(appId, second.id, attempt.sidebarLink!.token,
+      { flowId: channel === 'wrong flow' ? '911' : '1234', openChatId: channel === 'wrong chat' ? 'oc_other' : 'oc_destination' }, () => mocks.bot.config.oncallGroup)).toBe(true);
+    mocks.thread.mockResolvedValue({ verifiedThread: true, messages: [
+      { message_id: 'om_bq', create_time: String(started + 55_000) },
+      { message_id: 'om_ba', create_time: String(started + 56_000) },
+    ] });
+    vi.setSystemTime(started + 85_000);
+    await reconcileAndDeliver();
+    vi.setSystemTime(started + 110_000);
+    await reconcileAndDeliver();
+    expect(groups.getRequest(source)).toBeUndefined();
+    if (!['current', 'stale'].includes(channel)) {
+      expect(groups.getRequest(secondSource)).toBeUndefined();
+      expect(mocks.merge).not.toHaveBeenCalled();
+      return;
+    }
+    expect(groups.getRequest(secondSource)).toMatchObject({ status: 'succeeded', openChatId: 'oc_destination' });
+    expect(mocks.update.mock.calls.some(([, id, card]) => id === secondSource.messageId && card.includes('进入人工 Oncall 群'))).toBe(true);
+    expect(mocks.merge).toHaveBeenCalledExactlyOnceWith(appId, ['om_bq', 'om_ba'], 'oc_destination', expect.any(String));
+  });
+
+  it.each(['homepage', 'missing', 'malformed', 'conflicting markers', 'conflicting URL channel'])(
+    'never forwards either topic when a reused ticket has a stale channel (%s)', async scenario => {
+      const a = await open();
+      const groups = new OncallGroupStore(dir);
+      const other = { ...source, sessionId: 'session-b', rootId: 'om_bq', questionId: 'om_bq', messageId: 'om_ba' };
+      groups.registerTurn(appId, other.sessionId, other.questionId);
+      groups.recordSource({ ...other, cardJson: JSON.stringify({ schema: '2.0', body: { elements: [] } }) });
+      vi.setSystemTime(started + 1000);
+      const b = await open(other);
+      expect(a.id).not.toBe(b.id);
+      submitted(b);
+      const channel = new URL(a.nativeSubmission!.attempts[0]!.sourceLocation).searchParams.get('bizFrom');
+      expect(channel).toMatch(/^botmux_[a-f0-9]{24}$/);
+      const newerPage = new URL(b.nativeSubmission!.attempts[0]!.sourceLocation);
+      rows[0].source_type = channel;
+      if (scenario === 'homepage') rows[0].source_location = newerPage.origin + '/';
+      if (scenario === 'missing') delete rows[0].source_location;
+      if (scenario === 'malformed') rows[0].source_location = 'unparseable';
+      if (scenario === 'conflicting URL channel') {
+        rows[0].source_type = 'lark';
+        newerPage.searchParams.set('bizFrom', channel!);
+        rows[0].source_location = newerPage.href;
+      }
+      await reconcileAndDeliver();
+      vi.setSystemTime(started + 25_000);
+      await reconcileAndDeliver();
+      expect(fetcher.mock.calls.some(([url]) => url.includes('/chat_id_to_open_chat_id'))).toBe(false);
+      expect(groups.getRequest(source)).toBeUndefined();
+      expect(groups.getRequest(other)).toBeUndefined();
+      expect(mocks.update).not.toHaveBeenCalled();
+      expect(mocks.invite).not.toHaveBeenCalled();
+      expect(mocks.merge).not.toHaveBeenCalled();
+    });
+
+  it('leaves an unmarked ticket unbound even when all routing and timing fields match', async () => {
+    const d = await open();
+    submitted(d);
+    rows[0].source_location = 'https://oncall.example.test/';
+    rows[0].source_type = 'lark';
+    await reconcileAndDeliver();
+    expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
+    expect(mocks.update).not.toHaveBeenCalled();
+    expect(mocks.merge).not.toHaveBeenCalled();
+  });
+
+  it('leaves the source untouched when the ticket carries a conflicting form identity', async () => {
+    const d = await open();
+    submitted(d);
+    rows[0].source_type = new URL(d.nativeSubmission.attempts[0]!.sourceLocation).searchParams.get('bizFrom');
+    rows[0].source_location = 'https://oncall.example.test/chat?bm_form=another-draft';
+    await reconcileAndDeliver();
+    expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
+    expect(mocks.merge).not.toHaveBeenCalled();
+  });
+
   it('adopts a group from an earlier platform draft and forwards the conversation through launch time once', async () => {
     const d = await open(); submitted(d);
     const page = new URL(new URL(d.nativeFormLink!).searchParams.get('url')!);
@@ -126,6 +254,18 @@ describe('native submission completion', () => {
     await reconcileAndDeliver(); expect(mocks.merge).toHaveBeenCalledOnce();
     expect(fetcher.mock.calls.filter(([url]) => new URL(url).pathname.endsWith('/chat/'))).toHaveLength(0);
   });
+  it('stops looking for unconfirmed sidebar submissions when the draft expires', async () => {
+    await open();
+    vi.setSystemTime(started + 24 * 60 * 60_000);
+    fetcher.mockClear();
+    await reconcileAndDeliver();
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(new OncallFormStore(dir).pendingNativeSubmissions(appId)).toEqual([]);
+    expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
+    expect(mocks.update).not.toHaveBeenCalled();
+    expect(mocks.merge).not.toHaveBeenCalled();
+  });
+
   it('waits for submission and never treats an open sidebar as a created group', async () => {
     await open(); await reconcileAndDeliver();
     expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined(); expect(mocks.merge).not.toHaveBeenCalled(); expect(mocks.withdraw).not.toHaveBeenCalled();
@@ -282,8 +422,8 @@ describe('platform completion protocol', () => {
     expect(buildDashboardUrls({ host: 'localhost', port: 7891 }).url).toBe('https://sso.example.test/');
     const d = await open();
     const card = JSON.parse(mocks.reply.mock.calls[0]![2]);
-    const button = card.elements.at(-1).actions[0];
-    const hosted = new URL(new URL(button.url).searchParams.get('url')!);
+    const button = card.body.elements.at(-1).columns[0].elements[0];
+    const hosted = new URL(new URL(button.behaviors[0].default_url).searchParams.get('url')!);
     expect(hosted.href).toMatch(/^https:\/\/dashboard\.example\.test\/prefix\/oncall\/sidebar\//);
     submitted(d);
     const expected = d.nativeSubmission.attempts[0]!.hostedSourceLocation;
@@ -380,8 +520,8 @@ describe('platform completion protocol', () => {
     mocks.remote = remote;
     expect(buildDashboardUrls({ host: 'localhost', port: 7891 }).url).toBe(`https://${remote}.example.test/`);
     const d = await open();
-    const button = JSON.parse(mocks.reply.mock.calls[0]![2]).elements.at(-1).actions[0];
-    expect(button.url).toBe(d.nativeFormLink);
+    const button = JSON.parse(mocks.reply.mock.calls[0]![2]).body.elements.at(-1).columns[0].elements[0];
+    expect(button.behaviors[0].default_url).toBe(d.nativeFormLink);
     expect(d.nativeSubmission.attempts[0]!.hostedSourceLocation).toBeUndefined();
   });
 

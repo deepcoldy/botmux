@@ -10,6 +10,6 @@ export function readOncallDeploymentEnv(
   envFile = join(homedir(), '.botmux', '.env'), env: NodeJS.ProcessEnv = process.env,
 ): NodeJS.ProcessEnv {
   const saved = parse(readSecureHostFileSync(envFile) ?? '');
-  return { ...Object.fromEntries(['ONCALL_GROUP_ENDPOINT', 'ONCALL_EMAIL_DOMAIN', 'ONCALL_SERVICE_SECRET']
+  return { ...Object.fromEntries(['ONCALL_GROUP_ENDPOINT', 'ONCALL_EMAIL_DOMAIN', 'ONCALL_SERVICE_SECRET', 'ONCALL_SIDEBAR_LOGIN_ORIGINS']
     .map(key => [key, saved[key] ?? env[key]])), ...readOncallIdentityEnv(saved, env) };
 }

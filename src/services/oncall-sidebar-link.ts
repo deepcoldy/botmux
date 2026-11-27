@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { ONCALL_SIDEBAR_PATH_PREFIX, parseOncallSidebarPath } from '../core/host-capability-link.js';
 
 const SELECTION_MARKER = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\.[0-9a-f]{24}$/;
@@ -6,14 +7,30 @@ export function isNativeOncallSelectionMarker(marker: string | null): boolean {
   return marker !== null && SELECTION_MARKER.test(marker);
 }
 
-/** Match what the hosted page supplies to Oncall, without the question data. */
+// The native SDK copies bizFrom to the ticket's source_type independently of
+// the webview's referrer. Only accept the tag issued for this exact selection.
+export function nativeSelectionSourceType(formId: string | null): string | undefined {
+  if (!formId || !(isNativeOncallSelectionMarker(formId) || /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(formId))) return;
+  return `botmux_${createHash('sha256').update(formId).digest('hex').slice(0, 24)}`;
+}
+
+/** A selected category may require a current question before opening its form.
+ * The user has already requested handoff; no private transcript is needed. */
+export function ensureSelectedOncallQuery(page: URL): void {
+  const params = page.searchParams;
+  if (params.get('directly') === 'true' && params.get('type') && params.get('region') && !params.get('query')?.trim()) {
+    params.set('query', '申请人工 Oncall');
+  }
+}
+
+/** Canonical source used by previously embedded forms. */
 export function oncallSidebarSource(page: URL): string {
   const source = new URL(page.origin + page.pathname);
   source.searchParams.set('bm_form', page.searchParams.get('bm_form')!);
   return source.href;
 }
 
-/** The embedded page must be the same trusted, marked URL used for result lookup. */
+/** The native page must be the same trusted, marked URL used for result lookup. */
 export function oncallSidebarPage(link: string, draftId: string): URL | undefined {
   try {
     const appLink = new URL(link);

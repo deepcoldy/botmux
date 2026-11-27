@@ -1616,7 +1616,18 @@ export function OncallGroupSettings(props: { bot: BotDefaultsRow; patchBot: Patc
       <label htmlFor={groupLabel}><FieldTitle help="仅在选定群聊的回答卡片中展示入口；未选择的群聊不受影响。">适用群聊</FieldTitle></label>
       <SearchableGroupPicker id={groupLabel} label="生效群" groups={options} value={policy.chatIds} multiple disabled={busy || !policy.enabled}
         placeholder="选择生效群" searchPlaceholder="搜索生效群" emptyLabel="暂无匹配群" selectedCountLabel={count => `已选 ${count} 个群`}
-        onChange={value => updateDraft({ ...policy, chatIds: value as string[] })} />
+        onChange={value => {
+          const chatIds = value as string[];
+          updateDraft({ ...policy, chatIds, privateIntakeChatIds: policy.privateIntakeChatIds?.filter(id => chatIds.includes(id)) });
+        }} />
+    </div>
+    <div className="bd-oncall-field">
+      <label htmlFor={`${groupLabel}-private`}><FieldTitle help="这些群收到 @ 后只在私聊处理。私聊失败时群内只显示固定提示。转人工仅提交用户填写的信息。">仅私聊处理的群</FieldTitle></label>
+      <SearchableGroupPicker id={`${groupLabel}-private`} label="仅私聊处理的群" groups={options.filter(chat => policy.chatIds.includes(chat.chatId))}
+        value={policy.privateIntakeChatIds ?? []} multiple disabled={busy || !policy.chatIds.length}
+        placeholder="选择需要保护的群" searchPlaceholder="搜索适用群" emptyLabel="请先选择适用群聊"
+        selectedCountLabel={count => `已选 ${count} 个群`}
+        onChange={value => updateDraft({ ...policy, privateIntakeChatIds: value as string[] })} />
     </div>
     <div className="bd-oncall-field">
       <FieldTitle help="先选分类再建群：用户点击转人工后，在表单中选择或确认问题区域、分类，再提交建群。按预设直接建群：使用下方预设的区域和分类，用户无需填写分类，点击转人工后需再次确认才会建群。">建群方式</FieldTitle>
@@ -1647,11 +1658,11 @@ export function OncallGroupSettings(props: { bot: BotDefaultsRow; patchBot: Patc
         : <>
           {formDisplay === 'private_card' && <small className="bd-section-note">仅支持普通群。话题群请选择群内分类卡。</small>}
           <div className="bd-oncall-field bd-oncall-form-followup">
-            <FieldTitle help="只有所选分类要求补充自定义字段时才生效。复杂字段和 P0 自定义表单会使用 Oncall 侧栏。">自定义字段在哪填</FieldTitle>
+            <FieldTitle help="只有所选分类要求补充自定义字段时才生效。分类卡支持单行、多行文本和静态单选、下拉选项，保留必填校验。图片上传、动态选项、条件联动及 P0 自定义表单使用 Oncall 侧栏，卡片会提示原因。">自定义字段在哪填</FieldTitle>
             <DropdownField dataInput="oncallCustomFormMode" ariaLabel="自定义字段在哪填" disabled={busy} value={policy.customFormMode ?? 'native'}
               options={[
                 { value: 'native', label: '打开侧栏补填', hint: '先在分类卡选分类，再到 Oncall 侧栏补充信息' },
-                { value: 'botmux', label: '留在分类卡填写', hint: '普通文本字段直接显示在分类卡里，可在卡内提交' },
+                { value: 'botmux', label: '优先在分类卡填写', hint: '文本和静态单选可在卡内提交；未支持的表单会提示并转到侧栏' },
               ]}
               onChange={customFormMode => updateDraft({ ...policy, customFormMode })} />
           </div>
