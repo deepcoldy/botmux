@@ -3739,10 +3739,30 @@ function resolveBotConfigPath(): string {
     loadedConfigProvenance = 'loaded';
     return defaultPath;
   }
+  // existsSync() also answers false when the path cannot be inspected at all
+  // (e.g. lost search permission on ~/.botmux). Only a proven-absent file is
+  // "no configuration"; anything else is a fault the caller must see.
+  const absence = defaultBotsConfigAbsence(defaultPath);
+  if (absence) throw absence;
 
   throw new BotConfigNotFoundError(
     'No bot configuration found. Set BOTS_CONFIG or create ~/.botmux/bots.json.\nSee README for config format.'
   );
+}
+
+/** Why existsSync() said no: undefined for ENOENT/ENOTDIR (or a file that
+ *  appeared since), otherwise the access error with its code preserved. */
+function defaultBotsConfigAbsence(defaultPath: string): Error | undefined {
+  try {
+    statSync(defaultPath);
+    return undefined;
+  } catch (err: any) {
+    if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') return undefined;
+    return Object.assign(
+      new Error(`Cannot access bot configuration ${defaultPath}: ${err?.message ?? String(err)}`, { cause: err }),
+      { code: err?.code },
+    );
+  }
 }
 
 /** No bots.json exists at all (BOTS_CONFIG unset, default file absent). Lets a
@@ -3936,16 +3956,20 @@ function parseBotConfigFile(filePath: string): BotConfig[] {
  * {@link loadBotConfigs} 的按原文缓存版：bots.json 内容没变就复用上次的解析结果（几十个 bot
  * 的解析要几十毫秒）。给热路径上只读的调用方用（如同机兄弟 bot 的身份判定），返回值不要改。
  * 读文件失败的语义与 loadBotConfigs 一致。
+ *
+ * `strictRead`：读不出文件时一律抛错，不走读隔离下 EPERM/EACCES → [] 的降级。给必须区分
+ * "确实没有该 bot"与"读不到配置"的调用方用（v3 workflow 节点配置解析）。
  */
 let parsedBotConfigsCache: { path: string; text: string; configs: BotConfig[] } | undefined;
-export function loadBotConfigsCached(): readonly BotConfig[] {
+export function loadBotConfigsCached(options: { strictRead?: boolean } = {}): readonly BotConfig[] {
   const synthetic = maybeSynthesizeCoreOnlyConfig();
   if (synthetic) return synthetic;
   const filePath = resolveBotConfigPath();
   let text: string;
   try {
     text = readFileSync(filePath, 'utf-8');
-  } catch {
+  } catch (err) {
+    if (options.strictRead) throw err;
     return parseBotConfigFile(filePath);
   }
   if (parsedBotConfigsCache?.path === filePath && parsedBotConfigsCache.text === text) {

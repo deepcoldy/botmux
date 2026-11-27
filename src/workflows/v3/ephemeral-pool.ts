@@ -97,7 +97,8 @@ function liveBotConfig(larkAppId: string): BotConfig | undefined {
   try { return getBot(larkAppId).config; } catch { /* not hosted by this daemon */ }
   let configs: readonly BotConfig[];
   try {
-    configs = loadBotConfigsCached();
+    // Strict: under read isolation an EPERM/EACCES must not read as "no bots".
+    configs = loadBotConfigsCached({ strictRead: true });
   } catch (err) {
     if (err instanceof BotConfigNotFoundError) return undefined;
     throw new Error(

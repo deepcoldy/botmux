@@ -3,7 +3,7 @@ import { PassThrough } from 'node:stream';
 import { BoundedLogFile } from '../src/utils/bounded-log-file.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { WorkerSessionEventScope } from '../src/services/session-event-scope.js';
-import { existsSync, mkdtempSync, truncateSync, statSync, rmSync, writeFileSync, mkdirSync, readFileSync, realpathSync, symlinkSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, truncateSync, statSync, rmSync, writeFileSync, mkdirSync, readFileSync, realpathSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -15,7 +15,7 @@ import { GOAL_COMMAND_OBJECTIVE, GOAL_ENV, isBotmuxGoalObjective, V3_NATIVE_GOAL
 import { syntheticSessionUuid, type WorkerHandle, type WorkerProcessFactory, type WorkerSpawnOptions } from '../src/workflows/shared/worker-process.js';
 import { readV3AttemptWorkerFence } from '../src/workflows/v3/worker-fence.js';
 import { botToSnapshot, parseFrozenBotSnapshots } from '../src/workflows/v3/bot-resolve.js';
-import { getBot, registerBot, __testOnly_resetBotRegistry, type BotConfig } from '../src/bot-registry.js';
+import { getBot, loadBotConfigsCached, registerBot, __testOnly_resetBotRegistry, type BotConfig } from '../src/bot-registry.js';
 import { invalidateGlobalConfigCache } from '../src/global-config.js';
 
 // The default factory delegates to self-spawn's spawnWorker, which is the only
@@ -423,6 +423,49 @@ describe('v3 ephemeral pool', () => {
       expect((failure as Error).message).toContain(botsPath);
       expect(spawn).not.toHaveBeenCalled();
       expect(readV3AttemptWorkerFence(req.attemptDir, req)).toBeNull();
+    });
+
+    // Real permission bits; root bypasses them, so the probe would prove nothing there.
+    const permissionsEnforced = typeof process.getuid !== 'function' || process.getuid() !== 0;
+    const rejectsBeforeSpawn = async () => {
+      const spawn = vi.fn((): WorkerHandle => { throw new Error('unexpected spawn'); });
+      const failure = await createEphemeralPool({ factory: { spawn }, workerPath: '/tmp/worker.js',
+        resolveLarkAppSecret: () => 'secret' }).runNode(request()).then(() => undefined, (err: unknown) => err);
+      expect(spawn).not.toHaveBeenCalled();
+      expect(failure).toBeInstanceOf(Error);
+      return failure as Error;
+    };
+
+    it.skipIf(!permissionsEnforced)('fails an unregistered node bot when the default bots.json directory cannot be searched', async () => {
+      const home = join(dir, 'home');
+      const configDir = join(home, '.botmux');
+      mkdirSync(configDir, { recursive: true });
+      writeFileSync(join(configDir, 'bots.json'), JSON.stringify([{ larkAppId: 'cli_app', larkAppSecret: 'test-only',
+        cliId: 'claude-code', env: { MODEL_AUTH: 'node-sentinel' } }]));
+      vi.stubEnv('HOME', home);
+      vi.stubEnv('BOTS_CONFIG', '');
+      chmodSync(configDir, 0o000);
+      try {
+        const failure = await rejectsBeforeSpawn();
+        expect(failure.message).toContain('cli_app');
+        expect(failure.message).toMatch(/EACCES|EPERM/);
+      } finally { chmodSync(configDir, 0o700); }
+    });
+
+    it.skipIf(!permissionsEnforced)('fails an unregistered node bot on an unreadable bots.json even under read isolation', async () => {
+      configureBots([{ larkAppId: 'cli_app', larkAppSecret: 'test-only', cliId: 'claude-code',
+        env: { MODEL_AUTH: 'node-sentinel' } }]);
+      const botsPath = join(dir, 'bots.json');
+      vi.stubEnv('BOTMUX_READ_ISOLATION', '1');
+      chmodSync(botsPath, 0o000);
+      try {
+        // An isolated CLI's ordinary read keeps degrading to "no bots"…
+        expect(loadBotConfigsCached()).toEqual([]);
+        // …but a workflow node must not read that as "this bot has no env".
+        const failure = await rejectsBeforeSpawn();
+        expect(failure.message).toContain('cli_app');
+        expect(failure.message).toContain(botsPath);
+      } finally { chmodSync(botsPath, 0o600); }
     });
 
     it('keeps starting a hosted node bot from the registry while bots.json is invalid', async () => {

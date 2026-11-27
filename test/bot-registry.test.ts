@@ -2837,12 +2837,52 @@ describe('loadBotConfigs when bots.json exists but is unreadable', () => {
     expect(() => mod.loadBotConfigs()).toThrow(/EPERM/);
   });
 
+  it('keeps the isolated empty-list fallback for cached reads, but a strict read surfaces the permission error', () => {
+    process.env.BOTMUX_READ_ISOLATION = '1';
+    expect(mod.loadBotConfigsCached()).toEqual([]);
+    expect(() => mod.loadBotConfigsCached({ strictRead: true })).toThrow(/EPERM/);
+  });
+
   it('still throws for a NON-permission read error even under isolation (only EPERM/EACCES are expected)', () => {
     process.env.BOTMUX_READ_ISOLATION = '1';
     vi.mocked(fs.readFileSync).mockImplementation(() => {
       throw Object.assign(new Error('EIO: i/o error'), { code: 'EIO' });
     });
     expect(() => mod.loadBotConfigs()).toThrow(/EIO/);
+  });
+});
+
+describe('default bots.json that existsSync() cannot see', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+  let fs: typeof import('node:fs');
+  const savedEnv = { ...process.env };
+  const fsError = (code: string) => Object.assign(new Error(`${code}: stat '/h/.botmux/bots.json'`), { code });
+
+  beforeEach(async () => {
+    delete process.env.BOTS_CONFIG;
+    delete process.env.BOTMUX_CORE_ONLY;
+    mod = await freshImport();
+    fs = await import('node:fs');
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+  });
+
+  afterEach(() => {
+    process.env = { ...savedEnv };
+    vi.mocked(fs.statSync).mockImplementation((() => ({ mtimeMs: 0 })) as never);
+  });
+
+  it.each(['ENOENT', 'ENOTDIR'])('reports "no configuration" when the file is proven absent (%s)', (code) => {
+    vi.mocked(fs.statSync).mockImplementation(() => { throw fsError(code); });
+    expect(() => mod.loadBotConfigs()).toThrow(mod.BotConfigNotFoundError);
+  });
+
+  it.each(['EACCES', 'EPERM'])('surfaces %s on the config path instead of "no configuration"', (code) => {
+    vi.mocked(fs.statSync).mockImplementation(() => { throw fsError(code); });
+    let failure: unknown;
+    try { mod.loadBotConfigsCached(); } catch (err) { failure = err; }
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure).not.toBeInstanceOf(mod.BotConfigNotFoundError);
+    expect((failure as Error & { code?: string }).code).toBe(code);
   });
 });
 
