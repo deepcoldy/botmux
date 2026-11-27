@@ -1,6 +1,9 @@
 import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
+import { BoundedLogFile } from '../src/utils/bounded-log-file.js';
+import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { WorkerSessionEventScope } from '../src/services/session-event-scope.js';
-import { existsSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, realpathSync, symlinkSync } from 'node:fs';
+import { existsSync, mkdtempSync, truncateSync, statSync, rmSync, writeFileSync, mkdirSync, readFileSync, realpathSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -53,27 +56,10 @@ beforeEach(() => {
   vi.stubEnv('SESSION_DATA_DIR', config.session.dataDir);
 });
 
-afterEach(async () => {
+afterEach(() => {
   config.session.dataDir = originalDataDir;
   vi.unstubAllEnvs();
-  // The pool deliberately fire-and-forgets its diagnostic log writes
-  // (`void appendLine(...)` in ephemeral-pool.ts — each one mkdir+append into
-  // the attempt dir). A straggler landing after runNode resolves can RECREATE
-  // a directory the recursive delete just emptied, which rmSync's internal
-  // maxRetries never wins: they retry the same rmdir, they do not re-walk.
-  // An outer retry restarts the whole recursive walk from a fresh readdir, and
-  // the writers all finish within milliseconds, so a couple of spaced re-walks
-  // are deterministic where a single walk (however many inner retries) is not.
-  for (let attempt = 0; ; attempt++) {
-    try {
-      rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
-      break;
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (attempt >= 4 || (code !== 'ENOTEMPTY' && code !== 'EBUSY')) throw err;
-      await new Promise(r => setTimeout(r, 100));
-    }
-  }
+  rmSync(dir, { recursive: true, force: true });
 });
 
 // A v3 attempt runs on a SYNTHETIC session id with no persistent row, so
@@ -190,6 +176,69 @@ describe('v3WorkerBackendType', () => {
 });
 
 describe('v3 ephemeral pool', () => {
+  it.each(['stdout', 'stderr'] as const)('fails on a full %s log even after a claimed success', async (stream) => {
+    const worker = Object.assign(new ScriptedWorker(), { stdout: new PassThrough(), stderr: new PassThrough() });
+    const req = request();
+    const path = join(req.attemptDir, stream + '.log');
+    mkdirSync(req.attemptDir, { recursive: true });
+    writeFileSync(path, '');
+    truncateSync(path, 64_000_000);
+    const running = createEphemeralPool({ factory: factoryFor(worker), resolveLarkAppSecret: () => 'secret' }).runNode(req);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'claude_exit', code: 0, signal: null });
+    worker[stream].write('more');
+    worker.emitExit(0);
+    await expect(running).resolves.toMatchObject({ status: 'fail', error: { code: 'WORKFLOW_LOG_LIMIT' } });
+    expect(statSync(path).size).toBe(64_000_000);
+  });
+
+  it('rejects a custom diagnostic path that aliases the worker-owned replay before spawning', async () => {
+    const req = request();
+    mkdirSync(req.attemptDir, { recursive: true });
+    const stdoutPath = join(req.attemptDir, 'custom.log');
+    symlinkSync('pty.log', stdoutPath);
+    const factory = factoryFor(new ScriptedWorker());
+    const pool = createEphemeralPool({ factory, resolveLarkAppSecret: () => 'secret' });
+    await expect(pool.runNode({ ...req, stdoutPath })).rejects.toThrow(/pty.log/);
+    expect(factory.lastOpts).toBeUndefined();
+    expect(readV3AttemptWorkerFence(req.attemptDir, req)?.phase).toBe('closed_no_spawn');
+  });
+
+  it('requests worker close on oversized final output and preserves a user cancellation during shutdown', async () => {
+    const worker = new ScriptedWorker();
+    const ac = new AbortController();
+    const running = createEphemeralPool({ factory: factoryFor(worker), resolveLarkAppSecret: () => 'secret' })
+      .runNode({ ...request(), cancelSignal: ac.signal });
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'final_output', content: 'x'.repeat(16_000_000), lastUuid: 'u', turnId: 't' });
+    const closeRequests = worker.closeRequests;
+    ac.abort('operator');
+    worker.emitExit(0);
+    await expect(running).resolves.toMatchObject({ status: 'cancelled', cancelReason: 'operator' });
+    expect(closeRequests).toBe(1);
+  });
+
+  it('propagates a terminal replay limit received during worker shutdown', async () => {
+    const worker = new ScriptedWorker();
+    const req = request();
+    const running = createEphemeralPool({ factory: factoryFor(worker), resolveLarkAppSecret: () => 'secret' }).runNode(req);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'claude_exit', code: 0, signal: null });
+    const path = join(req.attemptDir, 'pty.log');
+    writeFileSync(path, '');
+    truncateSync(path, 64_000_000);
+    const stamp = loadWorkerFunction('sessionEventMetadata', { workerSessionEventScope: worker.contractScope });
+    const append = loadWorkerFunction('appendWorkflowPtyLog', {
+      isWorkflowWorker: () => true, process: { env: { BOTMUX_WORKFLOW_PTY_LOG_PATH: path } },
+      workflowPtyLogStream: undefined, workflowPtyLogOpenFailed: false, BoundedLogFile, mkdirSync, dirname,
+      send: (event: unknown) => worker.emit('message', stamp(event)),
+    });
+    append('more');
+    worker.emitExit(0);
+    await expect(running).resolves.toMatchObject({ status: 'fail', error: { code: 'WORKFLOW_LOG_LIMIT', message: 'pty.log exceeded the disk limit' } });
+    expect(statSync(path).size).toBe(64_000_000);
+  });
+
   it('does not inherit machine protected env names even when the workflow bot enables no matching plugin', async () => {
     vi.stubEnv('FIXTURE_SECRET', 'machine-secret');
     vi.stubEnv('FIXTURE_TOKEN', 'machine-token');
@@ -1744,7 +1793,7 @@ class ScriptedWorker extends EventEmitter implements WorkerHandle {
   readonly autoReadyAfterInit: boolean;
   closeRequests = 0;
   init: any;
-  private contractScope?: WorkerSessionEventScope;
+  contractScope?: WorkerSessionEventScope;
   readyEmitted = false;
   private initResolve?: () => void;
   private initPromise = new Promise<void>((resolve) => { this.initResolve = resolve; });
