@@ -44,6 +44,7 @@
 import { makeFingerprint, normaliseForFingerprint } from './bridge-turn-queue.js';
 import type { CodexBridgeEvent, CodexCotEntry } from './codex-transcript.js';
 import { createHash } from 'node:crypto';
+import type { TrustedCaller } from '../types.js';
 
 function exactInputHash(text: string): string {
   return createHash('sha256').update(text.replace(/\r\n?/g, '\n'), 'utf8').digest('hex');
@@ -218,13 +219,18 @@ export interface CodexPendingTurn {
   /** Native provider turn id learned from the transcript user event. */
   sourceTurnId?: string;
   sourceMessageId?: string;
+  /** Worker-validated ordinary caller for native instant-input delivery.
+   * The transcript's exact UserMessage is still required for completion. */
+  nativeInstantInputCaller?: TrustedCaller;
   /** A fresh lifecycle observed while this HOL successor still owns the
    * input. It is only a candidate until a terminal or another user arrives;
    * replay reconstructs it from lifecycle records, never from a pending mark. */
   replacementNativeTurnId?: string;
   /** Inputs folded into this native execution by a confirmed same-turn steer.
    * Their send attribution must retire with the single native terminal. */
-  supersededTurns?: Array<Pick<CodexPendingTurn, 'turnId' | 'dispatchAttempt'>>;
+  supersededTurns?: Array<Pick<CodexPendingTurn, 'turnId' | 'dispatchAttempt'
+    | 'sourceSessionId' | 'sourceTurnId' | 'nativeUserProof' | 'exactUserInputMatch'
+    | 'nativeInstantInputCaller' | 'recoveryJsonlPathAtMark' | 'recoveryOffsetAtMark'>>;
   /** This input reached the CLI as a confirmed same-turn steer: Codex pulled
    * it into the execution already running, so the model answers it in the
    * middle of that work (see CodexMidTurnReplyCollector). */
@@ -758,7 +764,7 @@ export class CodexBridgeQueue {
     message: string,
     markTimeMs: number = this.now(),
     dispatchAttempt?: number,
-    recoveryCursorAtMark?: { jsonlPath: string; offsetAtMark: number },
+    recoveryCursorAtMark?: { jsonlPath?: string; offsetAtMark?: number; nativeInstantInputCaller?: TrustedCaller },
     linkRefMode?: 'observe' | 'enabled',
     requireExactInput = false,
     submittedMessage?: string,
@@ -786,6 +792,8 @@ export class CodexBridgeQueue {
       markTimeMs,
       recoveryJsonlPathAtMark: recoveryCursorAtMark?.jsonlPath,
       recoveryOffsetAtMark: recoveryCursorAtMark?.offsetAtMark,
+      ...(recoveryCursorAtMark?.nativeInstantInputCaller
+        ? { nativeInstantInputCaller: Object.freeze({ ...recoveryCursorAtMark.nativeInstantInputCaller }) } : {}),
       unconfirmedAttributionStartedAtMs: markTimeMs,
     });
     this.replayBufferedUnmatched(markTimeMs);
@@ -799,6 +807,7 @@ export class CodexBridgeQueue {
     fingerprint: string;
     inputTextHash?: string;
     wholeInputHash?: string;
+    nativeInstantInputCaller?: TrustedCaller;
     passedBySuccessor?: { replayFloorMs: number };
     markTimeMs: number;
     linkRefMode?: 'observe' | 'enabled';
@@ -808,6 +817,10 @@ export class CodexBridgeQueue {
       sourceTurnId: string;
       sourceSessionId?: string;
       supersededTurnIds: readonly string[];
+      nativeInstantSupersededTurns?: readonly {
+        turnId: string; nativeInstantInputCaller: TrustedCaller;
+        nativeUserProof: { uuid: string; hash: string; timestampMs: number };
+      }[];
     };
   }[]): void {
     const existing = new Set(this.queue.map(turn => turn.turnId));
@@ -825,12 +838,20 @@ export class CodexBridgeQueue {
         contentFingerprint: makeFingerprint(entry.fingerprint), markTimeMs: entry.markTimeMs,
         ...(entry.inputTextHash ? { inputTextHash: entry.inputTextHash } : {}),
         ...(entry.wholeInputHash ? { wholeInputHash: entry.wholeInputHash } : {}),
+        ...(entry.nativeInstantInputCaller
+          ? { nativeInstantInputCaller: Object.freeze({ ...entry.nativeInstantInputCaller }) } : {}),
         recoveryJsonlPathAtMark: entry.jsonlPath,
         recoveryOffsetAtMark: entry.offsetAtMark,
         ...(entry.mergedExecution ? {
           sourceTurnId: entry.mergedExecution.sourceTurnId,
           sourceSessionId: entry.mergedExecution.sourceSessionId,
-          supersededTurns: entry.mergedExecution.supersededTurnIds.map(turnId => ({ turnId })),
+          supersededTurns: entry.mergedExecution.supersededTurnIds.map(turnId => {
+            const member = entry.mergedExecution!.nativeInstantSupersededTurns?.find(member => member.turnId === turnId);
+            return { turnId, ...(member ? { nativeInstantInputCaller: member.nativeInstantInputCaller,
+              nativeUserProof: member.nativeUserProof, exactUserInputMatch: true,
+              sourceSessionId: entry.mergedExecution!.sourceSessionId,
+              sourceTurnId: entry.mergedExecution!.sourceTurnId } : {}) };
+          }),
           // A persisted superseded host is the same same-turn steer evidence
           // that armed the observer before the worker restarted.
           ...(entry.mergedExecution.supersededTurnIds.length > 0 ? { steeredMidTurn: true } : {}),
@@ -1635,7 +1656,15 @@ export class CodexBridgeQueue {
           && ev.sourceSessionId === superseded.sourceSessionId
           && this.sourceSessionsCompatible(superseded.sourceSessionId, ev.sourceSessionId)) {
           next!.supersededTurns = [...(superseded.supersededTurns ?? []),
-            { turnId: superseded.turnId, dispatchAttempt: superseded.dispatchAttempt }];
+            { turnId: superseded.turnId, dispatchAttempt: superseded.dispatchAttempt,
+              ...(superseded.nativeInstantInputCaller ? {
+                nativeInstantInputCaller: superseded.nativeInstantInputCaller,
+                sourceSessionId: superseded.sourceSessionId, sourceTurnId: superseded.sourceTurnId,
+                nativeUserProof: superseded.nativeUserProof, exactUserInputMatch: superseded.exactUserInputMatch,
+                recoveryJsonlPathAtMark: superseded.recoveryJsonlPathAtMark,
+                recoveryOffsetAtMark: superseded.recoveryOffsetAtMark,
+              } : {}),
+            }];
           next!.steeredMidTurn = true;
         }
         const idx = this.queue.indexOf(superseded);

@@ -36,9 +36,17 @@ import { dirname } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { isJsonObject, readJsonFileSoft } from '../utils/json-file.js';
 import { canHandoffFinalOutput, type FinalOutputSnapshot } from './final-output-handoff.js';
+import type { TrustedCaller } from '../types.js';
+import { sameTrustedPrincipal } from '../core/active-turn-authority.js';
 
 export interface BridgeTurnJournalEntry {
   turnId: string;
+  /** Admission identity only; the original full-input hash still has to match
+   * a real user record before this restored member gains native settlement. */
+  nativeInstantInputCaller?: TrustedCaller;
+  /** A native first input was marked before its lazy rollout existed. This
+   * is admission data only and is excluded from ordinary transcript recovery. */
+  nativeInstantPendingProcess?: { pid: number; birth: string };
   /** Exact native user record already attributed before a persistent reattach. */
   nativeUserProof?: { uuid: string; hash: string; timestampMs: number; trajectoryOffset: number };
   /** Only newly admitted turns under the negotiated protocol opt in. */
@@ -93,7 +101,27 @@ export interface BridgeTurnJournalEntry {
     sourceTurnId: string;
     sourceSessionId?: string;
     supersededTurnIds: string[];
+    nativeInstantSupersededTurns?: Array<{
+      turnId: string;
+      nativeInstantInputCaller: TrustedCaller;
+      nativeUserProof: { uuid: string; hash: string; timestampMs: number };
+    }>;
   };
+}
+
+/** Persist no credentials or envelope fields and never turn a scheduled/bot
+ * identity into an ordinary human by stripping its source. */
+export function nativeInstantJournalCaller(value: unknown): TrustedCaller | undefined {
+  if (!isJsonObject(value) || value.senderType !== 'user' || value.source !== undefined
+    || value.taskContinuation !== undefined || value.taskId !== undefined) return;
+  const validId = (id: unknown): id is string => typeof id === 'string' && id.length > 0 && id.length <= 256;
+  if (!validId(value.requestLarkAppId)
+    || (value.requestUserOpenId !== undefined && !validId(value.requestUserOpenId))
+    || (value.requestUserUnionId !== undefined && !validId(value.requestUserUnionId))
+    || (!validId(value.requestUserOpenId) && !validId(value.requestUserUnionId))) return;
+  return Object.freeze({ senderType: 'user', requestLarkAppId: value.requestLarkAppId,
+    ...(value.requestUserOpenId ? { requestUserOpenId: value.requestUserOpenId } : {}),
+    ...(value.requestUserUnionId ? { requestUserUnionId: value.requestUserUnionId } : {}) });
 }
 
 /** Entries older than this are dropped at restore instead of re-marked: a
@@ -210,9 +238,18 @@ export function readBridgeTurnJournal(path: string): BridgeTurnJournalEntry[] {
         || !Number.isFinite(entry.pendingNotice.createdAtMs))) {
         throw new Error('Invalid pending bridge notice journal');
       }
-      const { mergedExecution, claimedAtMs, inputTextHash, wholeInputHash, ...rest } = entry;
+      const { mergedExecution, claimedAtMs, inputTextHash, wholeInputHash, nativeInstantInputCaller, nativeInstantPendingProcess, ...rest } = entry;
+      const nativeCaller = entry.dispatchAttempt === undefined ? nativeInstantJournalCaller(nativeInstantInputCaller) : undefined;
+      const pendingProcess = nativeCaller && entry.turnId.startsWith('om_') && entry.jsonlPath === ''
+        && entry.offsetAtMark === 0 && isJsonObject(nativeInstantPendingProcess)
+        && Number.isSafeInteger(nativeInstantPendingProcess.pid) && nativeInstantPendingProcess.pid > 0
+        && typeof nativeInstantPendingProcess.birth === 'string' && /^[0-9]+$/.test(nativeInstantPendingProcess.birth)
+        && typeof wholeInputHash === 'string' && /^[a-f0-9]{64}$/.test(wholeInputHash)
+        ? { pid: nativeInstantPendingProcess.pid as number, birth: nativeInstantPendingProcess.birth } : undefined;
       const plain = {
         ...rest,
+        ...(nativeCaller ? { nativeInstantInputCaller: nativeCaller } : {}),
+        ...(pendingProcess ? { nativeInstantPendingProcess: pendingProcess } : {}),
         ...(typeof inputTextHash === 'string' && /^[a-f0-9]{64}$/.test(inputTextHash) ? { inputTextHash } : {}),
         ...(typeof wholeInputHash === 'string' && /^[a-f0-9]{64}$/.test(wholeInputHash) ? { wholeInputHash } : {}),
         ...(typeof claimedAtMs === 'number' && Number.isFinite(claimedAtMs) ? { claimedAtMs } : {}),
@@ -225,10 +262,25 @@ export function readBridgeTurnJournal(path: string): BridgeTurnJournalEntry[] {
         || !Array.isArray(mergedExecution.supersededTurnIds)
         || !mergedExecution.supersededTurnIds.length
         || !mergedExecution.supersededTurnIds.every(id => typeof id === 'string' && id.length > 0)) return plain;
+      const nativeInstantSupersededTurns = nativeCaller && mergedExecution.sourceSessionId
+        && Array.isArray(mergedExecution.nativeInstantSupersededTurns)
+        && mergedExecution.nativeInstantSupersededTurns.length <= MAX_JOURNAL_ENTRIES
+        ? mergedExecution.nativeInstantSupersededTurns.flatMap(member => {
+          if (!isJsonObject(member) || !mergedExecution.supersededTurnIds.includes(member.turnId)) return [];
+          const caller = nativeInstantJournalCaller(member.nativeInstantInputCaller);
+          const proof = member.nativeUserProof;
+          if (!caller || !sameTrustedPrincipal(nativeCaller, caller) || !isJsonObject(proof)
+            || typeof proof.uuid !== 'string' || !proof.uuid || proof.uuid.length > 2_048
+            || typeof proof.hash !== 'string' || !/^[a-f0-9]{64}$/.test(proof.hash)
+            || typeof proof.timestampMs !== 'number' || !Number.isFinite(proof.timestampMs) || proof.timestampMs < 0) return [];
+          return [{ turnId: member.turnId as string, nativeInstantInputCaller: caller,
+            nativeUserProof: { uuid: proof.uuid, hash: proof.hash, timestampMs: proof.timestampMs } }];
+        }) : [];
       return { ...plain, mergedExecution: {
         sourceTurnId: mergedExecution.sourceTurnId,
         ...(mergedExecution.sourceSessionId ? { sourceSessionId: mergedExecution.sourceSessionId } : {}),
         supersededTurnIds: [...new Set(mergedExecution.supersededTurnIds)],
+        ...(nativeInstantSupersededTurns.length ? { nativeInstantSupersededTurns } : {}),
       } };
     });
 }
@@ -390,7 +442,7 @@ export function selectRestorableBridgeTurns(
   const maxAgeMs = opts.maxAgeMs ?? BRIDGE_TURN_RESTORE_MAX_AGE_MS;
   const liveCliStartedAtMs = opts.liveCliStartedAtMs;
   return entries
-    .filter(entry => !entry.pendingNotice
+    .filter(entry => !entry.pendingNotice && !entry.nativeInstantPendingProcess && !!entry.jsonlPath
       && entry.jsonlPath === opts.currentJsonlPath
       && nowMs - entry.markTimeMs <= maxAgeMs
       && (liveCliStartedAtMs === undefined

@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 import { traexActiveEmptyComposerReady, traexSessionRenameSurface } from '../src/adapters/cli/traex-footer.js';
 import { pendingInputAllowsTypeAhead, pendingInputMayFlush, inputForcesSerialTurn, shouldStopPendingBatch } from '../src/utils/pending-input-queue.js';
-import { ActiveTurnAuthority } from '../src/core/active-turn-authority.js';
+import { ActiveTurnAuthority, sameTrustedPrincipal } from '../src/core/active-turn-authority.js';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 import { stripAnsiScreenText } from '../src/utils/idle-detector.js';
 import { shouldWriteNow, decideFirstWriteLiveness } from '../src/utils/input-gate.js';
@@ -34,6 +34,7 @@ function reattachHarness() {
     findTraexRolloutByPid: () => ({ cliSessionId: 'owned-native-id' }),
     inputDeliveryObservedCliSessionId: undefined,
     traexActiveEmptyComposerReady, pendingInputAllowsTypeAhead, pendingInputMayFlush, shouldWriteNow, inputForcesSerialTurn,
+    sameTrustedPrincipal,
     durableTurnInFlight: false, initPromptMaterialized: true,
     commandLineWritesPending: 0, cliLifetimeNonce: 2,
     traexNativeStartupInputPending: false, traexFirstInputAdmissionPending: false,
@@ -47,6 +48,7 @@ function reattachHarness() {
     deferTurnInputCommitUntilSubmission: () => false, maybeQueuePostSubmitNativeSessionTitle: () => false,
     sessionRenameInFlight: () => h.scope.sessionRenamePhase !== 'idle',
     traexQuestionBridgeActive: () => false,
+    isWorkflowWorker: () => false,
   });
   h.scope.backend.captureInputState = vi.fn(() => ({ viewport: busy }));
   h.scope.backend.captureViewport = () => busy;
@@ -79,6 +81,53 @@ function reattachHarness() {
 }
 
 describe('plain TRAE busy input after persistent worker reattach', () => {
+  it('writes a flagged fresh native correction through the existing adapter without requiring a first-idle edge', async () => {
+    const h = reattachHarness();
+    h.scope.lastSpawnPersistentReattach = false;
+    h.scope.readCmdline = () => ['/native/traex', '-c', 'features.instant_interrupt=true'];
+    h.scope.readProcessStartIdentity = () => 'birth';
+    await h.flush();
+    expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledOnce();
+    expect(h.scope.pendingMessages).toHaveLength(0);
+    expect(h.scope.isPromptReady).toBe(false);
+    expect(h.scope.awaitingFirstPrompt).toBe(true);
+    expect(h.scope.emitTurnTerminal).not.toHaveBeenCalled();
+  });
+
+  it('uses actual native mode at sendToPty and neither sends Escape nor creates a cancellation hold', async () => {
+    const h = reattachHarness();
+    h.scope.lastSpawnPersistentReattach = false;
+    h.scope.readCmdline = () => ['/native/traex', '-c', 'features.instant_interrupt=true'];
+    h.scope.readProcessStartIdentity = () => 'birth';
+    h.scope.preemptActiveTurnForNewMessage = loadWorkerFunction('preemptActiveTurnForNewMessage', h.scope);
+    h.scope.pendingMessages.length = 0;
+    h.scope.sendToPty(input().content, input().turnId, { trustedCaller: caller });
+    expect(h.scope.flushPending).toHaveBeenCalledOnce();
+    await h.scope.flushPending.mock.results[0].value;
+    expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledOnce();
+    expect(h.scope.traexPreemption).toBeUndefined();
+    expect(h.scope.isPromptReady).toBe(false);
+  });
+
+  it.each([
+    ['FIFO', { queueAfterActiveTurn: true }],
+    ['durable', { dispatchAttempt: 1, durablePrimaryInbox: true }],
+    ['tokened activation', { queuedActivationToken: 'token' }],
+    ['bot', { trustedCaller: { ...caller, senderType: 'bot' } }],
+    ['other principal', { trustedCaller: { ...caller, requestUserOpenId: 'other' } }],
+  ])('retains %s behind the active native turn even when its flag is enabled', async (_label, patch) => {
+    const h = reattachHarness();
+    h.scope.lastSpawnPersistentReattach = false;
+    h.scope.crossPrincipalIsolationOn = () => false;
+    h.scope.readCmdline = () => ['/native/traex', '-c', 'features.instant_interrupt=true'];
+    h.scope.readProcessStartIdentity = () => 'birth';
+    Object.assign(h.scope.pendingMessages[0], patch);
+    await h.flush();
+    expect(h.scope.pendingMessages).toHaveLength(1);
+    expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+    expect(h.scope.emitTurnTerminal).not.toHaveBeenCalled();
+  });
+
   it('flushes a fresh human correction without a new idle event or rename recovery', async () => {
     const h = reattachHarness();
     await h.flush();
@@ -271,6 +320,20 @@ describe('plain TRAE busy input after persistent worker reattach', () => {
     const h = reattachHarness();
     const enter = vi.fn();
     const paste = vi.fn(() => { h.scope.webTerminalInputGeneration++; });
+    Object.assign(h.scope.backend, { write: vi.fn(), pasteText: paste, sendSpecialKeys: enter });
+    h.scope.cliAdapter.writeInput = createTraexAdapter('/bin/true').writeInput;
+    await h.flush();
+    expect(paste).toHaveBeenCalledOnce();
+    expect(enter).not.toHaveBeenCalled();
+  });
+
+  it('keeps the real native-mode adapter from pressing Enter after an explicit interrupt during paste', async () => {
+    const h = reattachHarness();
+    h.scope.readCmdline = () => ['/native/traex', '-c', 'features.instant_interrupt=true'];
+    h.scope.readProcessStartIdentity = () => 'birth';
+    h.scope.cliInterruptGeneration = 0;
+    const enter = vi.fn();
+    const paste = vi.fn(() => { h.scope.cliInterruptGeneration++; });
     Object.assign(h.scope.backend, { write: vi.fn(), pasteText: paste, sendSpecialKeys: enter });
     h.scope.cliAdapter.writeInput = createTraexAdapter('/bin/true').writeInput;
     await h.flush();

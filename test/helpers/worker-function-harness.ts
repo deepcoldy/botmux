@@ -490,6 +490,12 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
       return dependencies.get(key);
     }
     if (key === 'traexQuestionFlowVisible') return traexQuestionFlowVisible;
+    if (typeof key === 'string' && ['nativeInstantInputCaller', 'settleNativeInstantSupersededTurns', 'bindNativeInstantPendingRecovery',
+      'traexNativeInstantInputEnabled', 'traexNativeInstantInputEligible', 'traexNativeInstantComposerReady',
+      'traexPersistentReattachBusyComposerFence', 'traexPersistentReattachSteeringFence'].includes(key)) {
+      if (!dependencies.has(key)) dependencies.set(key, loadWorkerFunction(key, scope));
+      return dependencies.get(key);
+    }
     if (key === 'antigravityBlockingPageTail') return antigravityBlockingPageTail;
     if (key === 'traexStartupInputReady') return traexStartupInputReady;
     if (key === 'traexTerminalInputBlocked') return traexTerminalInputBlocked;

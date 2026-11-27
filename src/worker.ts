@@ -352,7 +352,7 @@ import {
   writeBackgroundTranscriptChain,
   type BackgroundTranscriptSegment,
 } from './services/background-transcript-chain.js';
-import { checkpointCodexAdoptTurns, restoreCodexAdoptTurns } from './services/codex-adopt-recovery.js';
+import { bindNativeInstantPendingTurns, checkpointNativeInstantPendingTurn, checkpointCodexAdoptTurns, restoreCodexAdoptTurns } from './services/codex-adopt-recovery.js';
 import {
   defaultGatewayEntry,
   ensureEffectiveHomeGatewayEntry,
@@ -18909,6 +18909,7 @@ function mtrBridgeIngest(): void {
 
 function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'baseline-existing-skip-tail' | 'fresh-empty' | 'split-live'): void {
   if (nativeSessionForkPending()) return;
+  bindNativeInstantPendingRecovery(rolloutPath);
   structuredBridgeDriverState = undefined;
   ompQuietCandidateKey = undefined;
   ompQuietCandidateCompleteOffset = undefined;
@@ -20346,6 +20347,7 @@ function codexBridgeIngest(opts: {
     return true;
   }
   if (!codexBridgeRolloutPath || !codexBridgeBaselineDone) return false;
+  bindNativeInstantPendingRecovery(codexBridgeRolloutPath);
   // While a newly reported Antigravity conversation is still waiting for its
   // lazily-created brain file (`codexBridgePendingSessionId`), do not let
   // fs.watch or steady-state ticks ingest new unstarted turns from the
@@ -20660,6 +20662,46 @@ function structuredBridgeRecoveryCursorAtMark(): { jsonlPath: string; offsetAtMa
   return { jsonlPath, offsetAtMark: cursor.newOffset };
 }
 
+/** A first User can create the rollout after its pre-paste mark. Bind that
+ * admission journal only at the existing owned-file attach boundary. */
+function bindNativeInstantPendingRecovery(rolloutPath: string): void {
+  if (!traexNativeInstantInputEnabled()) return;
+  const journal = structuredBridgeJournalPath();
+  const pending = journal ? readBridgeTurnJournal(journal).filter(entry => !!entry.nativeInstantPendingProcess) : [];
+  if (!journal || !pending.length) return;
+  const cfg = lastInitConfig, target = backend, adapter = cliAdapter;
+  const generation = cliSpawnGeneration, lifetime = cliLifetimeNonce, interrupt = cliInterruptGeneration;
+  const pid = currentTraexObservedPid();
+  const birth = pid ? readProcessStartIdentity(pid) : undefined;
+  const owned = pid ? findTraexRolloutSetByPid(pid) : undefined;
+  const rollout = pid && owned?.size === 1 ? findTraexRolloutByPid(pid) : undefined;
+  if (!pid || !birth || !rollout || rollout.path !== rolloutPath || !owned?.has(rollout.cliSessionId.toLowerCase())) return;
+  const current = (): boolean => {
+    const currentOwned = findTraexRolloutSetByPid(pid);
+    const selected = currentOwned?.size === 1 ? findTraexRolloutByPid(pid) : undefined;
+    return cfg === lastInitConfig && target === backend && adapter === cliAdapter
+      && generation === cliSpawnGeneration && lifetime === cliLifetimeNonce && interrupt === cliInterruptGeneration
+      && !cliRestartInProgress && currentTraexObservedPid() === pid && readProcessStartIdentity(pid) === birth
+      && traexNativeInstantInputEnabled() && selected?.path === rolloutPath
+      && selected.cliSessionId === rollout.cliSessionId && currentOwned?.has(rollout.cliSessionId.toLowerCase()) === true;
+  };
+  let size: number;
+  try { size = statSync(rolloutPath).size; } catch { return; }
+  if (planBridgeTurnRecovery(pending, size).kind !== 'recover') return;
+  const events = drainTraexRollout(rolloutPath, 0, { probe: true }).events;
+  const bound = bindNativeInstantPendingTurns(journal, rolloutPath, codexBridgeQueue, pid, birth, rollout.cliSessionId, events, Date.now(), current);
+  if (bound) {
+    log(`TRAE native instant pending recovery bound ${bound} root(s) (pid=${pid}, path=${rolloutPath})`);
+    // The first owned attach may precede a deferred User append. A later
+    // correction mark retries this same proof against the already-bound file.
+    const recovery = restoreCodexAdoptTurns(journal, rolloutPath, codexBridgeQueue, events,
+      Math.min(...pending.map(entry => entry.markTimeMs)) - 5_000);
+    codexBridgeQueue.absorb(recovery.history);
+    codexBridgeQueue.ingest(recovery.live);
+    if (recovery.restored) log(`TRAE native instant pending recovery restored ${recovery.restored} root(s)`);
+  }
+}
+
 function codexBridgeMarkPendingTurn(
   messageText: string,
   preferredTurnId?: string,
@@ -20667,8 +20709,49 @@ function codexBridgeMarkPendingTurn(
   markTimeMs: number = Date.now(),
   linkRefMode?: 'observe' | 'enabled',
   submittedMessage?: string,
+  nativeInstantInputCaller?: TrustedCaller,
 ): string | undefined {
   if (!codexBridgeFallbackActive()) return undefined;
+  if (codexBridgeRolloutPath) bindNativeInstantPendingRecovery(codexBridgeRolloutPath);
+  // A fresh native input can arrive before the poller discovers its rollout.
+  // Bind that already-owned file before marking, so a worker death immediately
+  // after Enter still leaves the original hash/caller in the existing journal.
+  const cfg = lastInitConfig;
+  if (preferredTurnId?.startsWith('om_') && dispatchAttempt === undefined
+    && !codexBridgeRolloutPath && traexNativeInstantInputEnabled()) {
+    const markPid = currentTraexObservedPid();
+    const markOwned = markPid ? findTraexRolloutSetByPid(markPid) : undefined;
+    const markRollout = markPid ? findTraexRolloutByPid(markPid) : undefined;
+    log(`TRAE native instant first-mark recovery: caller=${!!nativeInstantInputCaller}, pid=${markPid ?? '?'}, birth=${markPid ? readProcessStartIdentity(markPid) ?? '?' : '?'}, owned=${markOwned?.size ?? '?'}, selected=${markRollout?.path ?? 'none'}, resume=${!!cfg?.resume}, persistent=${lastSpawnPersistentReattach}, queued=${codexBridgeQueue.peek().length}, attempted=${structuredBridgeRecoveryAttempted}, journal=${structuredBridgeJournalPath() ?? 'none'}`);
+  }
+  if (nativeInstantInputCaller && traexNativeInstantInputEnabled() && !codexBridgeRolloutPath
+    && !lastSpawnPersistentReattach && !cfg?.resume && !cfg?.adoptMode
+    && codexBridgeQueue.peek().length === 0) {
+    const target = backend;
+    const adapter = cliAdapter;
+    const generation = cliSpawnGeneration;
+    const lifetime = cliLifetimeNonce;
+    const interrupt = cliInterruptGeneration;
+    const pid = currentTraexObservedPid();
+    const birth = pid ? readProcessStartIdentity(pid) : undefined;
+    const owned = pid ? findTraexRolloutSetByPid(pid) : undefined;
+    const rollout = pid && owned?.size === 1 ? findTraexRolloutByPid(pid) : undefined;
+    if (pid && birth && rollout && owned?.has(rollout.cliSessionId.toLowerCase())) {
+      codexBridgeAttach(rollout.path, 'fresh-empty');
+      const stillOwned = findTraexRolloutSetByPid(pid);
+      const stillRollout = stillOwned?.size === 1 ? findTraexRolloutByPid(pid) : undefined;
+      if (lastInitConfig !== cfg || backend !== target || cliAdapter !== adapter
+        || cliSpawnGeneration !== generation || cliLifetimeNonce !== lifetime
+        || cliInterruptGeneration !== interrupt || cliRestartInProgress
+        || lastSpawnPersistentReattach || cfg?.resume || currentTraexObservedPid() !== pid
+        || readProcessStartIdentity(pid) !== birth || !traexNativeInstantInputEnabled()
+        || codexBridgeRolloutPath !== rollout.path || stillRollout?.path !== rollout.path
+        || stillRollout.cliSessionId !== rollout.cliSessionId
+        || !stillOwned?.has(rollout.cliSessionId.toLowerCase())) {
+        throw new SubmissionWriteError('Native TRAE root identity changed during rollout binding', undefined, false);
+      }
+    }
+  }
   // Doubao has no per-tool timestamp/turn ID. Retire already-written orphan
   // progress before marking a successor, and capture the resulting complete-
   // line cursor rather than the last poll's stale offset. Keep other CLIs'
@@ -20677,17 +20760,27 @@ function codexBridgeMarkPendingTurn(
   const turnId = preferredTurnId ?? `codex-${randomBytes(8).toString('hex')}`;
   structuredTurnsWithSubmitNotice.delete(turnId);
   const recoveryCursorAtMark = structuredBridgeRecoveryCursorAtMark();
+  const pendingPid = nativeInstantInputCaller && !codexBridgeRolloutPath && !lastSpawnPersistentReattach && !cfg?.resume
+    && !cfg?.adoptMode && codexBridgeQueue.peek().length === 0 && traexNativeInstantInputEnabled()
+    ? currentTraexObservedPid() : undefined;
+  const pendingBirth = pendingPid ? readProcessStartIdentity(pendingPid) : undefined;
   const requireExactInput = lastInitConfig?.adoptMode === true && structuredBridgeIs('antigravity');
   codexBridgeQueue.mark(
     turnId,
     messageText,
     markTimeMs,
     dispatchAttempt,
-    recoveryCursorAtMark,
+    nativeInstantInputCaller ? { ...recoveryCursorAtMark, nativeInstantInputCaller } : recoveryCursorAtMark,
     linkRefMode,
     requireExactInput,
     submittedMessage,
   );
+  if (pendingPid && pendingBirth && currentTraexObservedPid() === pendingPid
+    && readProcessStartIdentity(pendingPid) === pendingBirth && traexNativeInstantInputEnabled()) {
+    const journal = structuredBridgeJournalPath();
+    if (!journal) throw new SubmissionWriteError('Native TRAE first input recovery journal is unavailable', undefined, false);
+    checkpointNativeInstantPendingTurn(journal, codexBridgeQueue, turnId, pendingPid, pendingBirth);
+  }
   checkpointCodexAdoptRecovery();
   checkpointStructuredBridgeRecovery();
   return turnId;
@@ -21715,6 +21808,7 @@ function emitReadyCodexTurns(settledQuotaTurns?: CodexPendingTurn[]): void {
   checkpointCodexAdoptRecovery();
   checkpointStructuredBridgeRecovery();
   for (const turn of ready) {
+    settleNativeInstantSupersededTurns(turn);
     releaseInputDeliveryQuarantineForStructuredTerminal(
       turn.turnId,
       turn.dispatchAttempt,
@@ -24765,6 +24859,7 @@ function preemptActiveTurnForNewMessage(
   incoming: Pick<PendingCliInput, 'turnId' | 'dispatchAttempt' | 'durablePrimaryInbox' | 'queueAfterActiveTurn' | 'noReplay' | 'taskContinuation'>,
   targetBackend: SessionBackend,
 ): boolean {
+  if (lastInitConfig?.cliId === 'traex' && traexNativeInstantInputEnabled()) return false;
   if (cliAdapter?.preemptsOnNewMessage !== true) return false;
   if (!isUserImTurnId(incoming.turnId)) return false;
   if (incoming.queueAfterActiveTurn || incoming.noReplay || incoming.taskContinuation) return false;
@@ -30898,16 +30993,113 @@ function hybridRpcInputMaySteer(item: PendingCliInput, expectedTurnId: string): 
     && codexRpcEngine?.canSteerTurn?.(expectedTurnId) === true;
 }
 
+/** Read the model-owning native process, never an init flag or viewer argv.
+ * A surviving pane keeps its old configuration until a real CLI restart. */
+function traexNativeInstantInputEnabled(): boolean {
+  if (lastInitConfig?.cliId !== 'traex' || lastInitConfig.adoptMode || codexRpcEngine
+    || lastInitConfig.existingAppServerEndpoint
+    || !['pty', 'tmux', 'hc'].includes(effectiveBackendType)) return false;
+  const pid = typeof currentTraexObservedPid === 'function' ? currentTraexObservedPid() : undefined;
+  if (!pid) return false;
+  try {
+    const birth = readProcessStartIdentity(pid);
+    if (!birth) return false;
+    const argv = readCmdline(pid, { exact: true });
+    if (argv.includes('--remote') || argv.includes('app-server')) return false;
+    let enabled = false;
+    for (let index = 1; index < argv.length; index++) {
+      const arg = argv[index]!;
+      if (arg === '--') break;
+      const config = arg === '-c' || arg === '--config' ? argv[++index]
+        : arg.startsWith('--config=') ? arg.slice('--config='.length) : undefined;
+      if (config !== undefined) {
+        if (/^features\.instant_interrupt\s*=/.test(config)) {
+          enabled = /^features\.instant_interrupt\s*=\s*true\s*$/.test(config);
+        } else if (/^features\s*=/.test(config)) enabled = false;
+      } else if (arg === '--enable' || arg === '--disable') {
+        // Native CLI flag/config precedence is not argv-order precedence.
+        // This rollout uses only -c; mixed enable/disable overrides are unknown.
+        if (argv[++index]?.split(',').includes('instant_interrupt')) return false;
+      } else if (/^--(?:enable|disable)=/.test(arg)) {
+        if (arg.slice(arg.indexOf('=') + 1).split(',').includes('instant_interrupt')) return false;
+      }
+    }
+    return enabled && currentTraexObservedPid() === pid && readProcessStartIdentity(pid) === birth;
+  } catch { return false; }
+}
+
+/** Bind only ordinary inputs to this native mode; a fresh root has no active
+ * caller yet, while a correction must retain the active principal. */
+function nativeInstantInputCaller(item: PendingCliInput): TrustedCaller | undefined {
+  if (!traexNativeInstantInputEnabled() || item.turnId?.startsWith('om_') !== true
+    || item.dispatchAttempt !== undefined || item.queueAfterActiveTurn || item.durablePrimaryInbox
+    || item.noReplay || item.taskContinuation || item.queuedActivationToken || item.codexAppInput
+    || item.codexAppDispatchId || item.vcMeetingImTurnOrigin || item.traexAutoModelRecovery
+    || item.traexAutoModelContinuation || item.restartNoteOriginalContent
+    || item.trustedCaller?.senderType !== 'user' || item.trustedCaller.source !== undefined
+    || item.trustedCaller.taskContinuation || durableTurnInFlight || isWorkflowWorker()
+    || traexAutoModelRuntimeEligible()) return;
+  const active = activeTurnAuthority.snapshot();
+  if (active && !sameTrustedPrincipal(active.caller, item.trustedCaller)) return;
+  const caller = item.trustedCaller;
+  return { senderType: 'user', requestLarkAppId: caller.requestLarkAppId,
+    requestUserOpenId: caller.requestUserOpenId, requestUserUnionId: caller.requestUserUnionId };
+}
+
+function traexNativeInstantInputEligible(incoming: PendingCliInput): boolean {
+  const active = activeTurnAuthority.snapshot();
+  return lastInitConfig?.cliId === 'traex' && !lastInitConfig.adoptMode && !codexRpcEngine
+    && !traexAutoModelRuntimeEligible() && !isWorkflowWorker()
+    && !lastInitConfig.existingAppServerEndpoint && ['pty', 'tmux', 'hc'].includes(effectiveBackendType)
+    && incoming.turnId?.startsWith('om_') === true && incoming.dispatchAttempt === undefined
+    && !incoming.durablePrimaryInbox && !incoming.noReplay && !incoming.queueAfterActiveTurn
+    && !incoming.taskContinuation && !incoming.traexAutoModelRecovery && !incoming.traexAutoModelContinuation
+    && !incoming.restartNoteOriginalContent && !incoming.queuedActivationToken && !incoming.codexAppInput
+    && !incoming.codexAppDispatchId && !incoming.vcMeetingImTurnOrigin && !durableTurnInFlight
+    && incoming.trustedCaller?.senderType === 'user' && incoming.trustedCaller.source === undefined
+    && !incoming.trustedCaller.taskContinuation && active?.caller?.senderType === 'user'
+    && active.caller.source === undefined && !active.caller.taskContinuation && active.dispatchAttempt === undefined
+    && sameTrustedPrincipal(active.caller, incoming.trustedCaller);
+}
+
+/** Normalize only recorded foreground-shell status cells before checking the
+ * existing empty composer; drafts, permissions and queued pages still fail. */
+function traexNativeInstantComposerReady(screen: string): boolean {
+  const rows = stripAnsiScreenText(screen).trimEnd().split(/\r?\n/);
+  const normalized = rows.filter(row => !/^  └ Tip: Use \/raw to toggle copy-friendly raw scrollback\.$/.test(row))
+    .map(row => row.replace(/ · \d+ shells? running… · \/ps to manage$/, ''));
+  return traexActiveEmptyComposerReady(normalized.join('\n'));
+}
+
+/** Complete accepted members only when their shared native task ends.
+ * UI supersession is earlier than execution completion and emits no terminal. */
+function settleNativeInstantSupersededTurns(turn: CodexPendingTurn): void {
+  const caller = turn.nativeInstantInputCaller;
+  if (!traexNativeInstantInputEnabled() || turn.isLocal || turn.dispatchAttempt !== undefined
+    || !caller || !turn.exactUserInputMatch || !turn.nativeUserProof
+    || !turn.sourceSessionId || !turn.sourceTurnId || turn.finalText === undefined) return;
+  for (const previous of turn.supersededTurns ?? []) {
+    if (previous.dispatchAttempt !== undefined || !previous.turnId.startsWith('om_')
+      || !previous.nativeInstantInputCaller || !sameTrustedPrincipal(caller, previous.nativeInstantInputCaller)
+      || !previous.exactUserInputMatch || !previous.nativeUserProof
+      || previous.sourceSessionId !== turn.sourceSessionId || previous.sourceTurnId !== turn.sourceTurnId
+      || previous.nativeUserProof.timestampMs > turn.nativeUserProof.timestampMs) continue;
+    emitTurnTerminal(previous.turnId, turn.terminalStatus ?? 'completed', turn.terminalErrorCode,
+      previous.dispatchAttempt, undefined, undefined, undefined, turn.terminalErrorSummary);
+  }
+}
+
 /** A busy surviving TUI is initialized without publishing a new idle edge.
  * This is a per-input write lease, never prompt readiness or rename settlement.
  * Re-prove the PID's rollout ownership even when the identity cache is warm. */
 function traexPersistentReattachBusyComposerFence(): {
   backend: SessionBackend; adapter: CliAdapter; generation: number; lifetime: number; webInputGeneration: number;
-  pid: number; nativeSessionId: string;
+  pid: number; nativeSessionId: string; nativeInstant?: true; procStart?: string; interruptGeneration?: number;
 } | undefined {
   const target = backend;
   const adapter = cliAdapter;
-  if (!target || !adapter || target.submitTurn || !lastSpawnPersistentReattach
+  const nativeInstant = traexNativeInstantInputEnabled();
+  if (!target || !adapter || target.submitTurn || (!lastSpawnPersistentReattach && !nativeInstant)
     || lastInitConfig?.cliId !== 'traex' || lastInitConfig.adoptMode
     || lastInitConfig.existingAppServerEndpoint || codexRpcEngine
     || !['pty', 'tmux', 'hc'].includes(effectiveBackendType)
@@ -30920,6 +31112,9 @@ function traexPersistentReattachBusyComposerFence(): {
   const webInputGeneration = webTerminalInputGeneration;
   const pid = currentTraexObservedPid();
   if (!pid) return undefined;
+  const procStart = nativeInstant ? readProcessStartIdentity(pid) : undefined;
+  const interruptGeneration = nativeInstant ? cliInterruptGeneration : undefined;
+  if (nativeInstant && !procStart) return undefined;
   const nativeSessionId = sessionRenameNativeSessionIdNow();
   const owned = findTraexRolloutSetByPid(pid);
   if (!nativeSessionId || !owned
@@ -30927,11 +31122,15 @@ function traexPersistentReattachBusyComposerFence(): {
   let viewport: string;
   try { viewport = (target.captureInputState?.() ?? { viewport: captureBackendScreen(target) }).viewport; }
   catch { return undefined; }
-  if (!traexActiveEmptyComposerReady(viewport) || backend !== target || cliAdapter !== adapter || cliSpawnGeneration !== generation
+  if (!(nativeInstant ? traexNativeInstantComposerReady(viewport) : traexActiveEmptyComposerReady(viewport))
+    || backend !== target || cliAdapter !== adapter || cliSpawnGeneration !== generation
     || cliLifetimeNonce !== lifetime
     || webTerminalInputGeneration !== webInputGeneration || currentTraexObservedPid() !== pid
-    || cliRestartInProgress || webTerminalInputWireDirty()) return undefined;
-  return { backend: target, adapter, generation, lifetime, webInputGeneration, pid, nativeSessionId };
+    || cliRestartInProgress || webTerminalInputWireDirty()
+    || (nativeInstant && (!traexNativeInstantInputEnabled() || readProcessStartIdentity(pid) !== procStart
+      || cliInterruptGeneration !== interruptGeneration))) return undefined;
+  return { backend: target, adapter, generation, lifetime, webInputGeneration, pid, nativeSessionId,
+    ...(nativeInstant ? { nativeInstant: true as const, procStart, interruptGeneration } : {}) };
 }
 
 function traexPersistentReattachSteeringFence(item?: PendingCliInput):
@@ -30944,6 +31143,7 @@ function traexPersistentReattachSteeringFence(item?: PendingCliInput):
       directRpcTurnBlocksTypeAhead() || programStatusBlockedHoldsTypeAhead())
     || activeTurnBlocks(item)) return undefined;
   const physical = traexPersistentReattachBusyComposerFence();
+  if (traexNativeInstantInputEnabled() && !traexNativeInstantInputEligible(item)) return undefined;
   return physical ? { ...physical, item } : undefined;
 }
 
@@ -31043,8 +31243,9 @@ async function flushPending(): Promise<void> {
     if (isFlushing || backend !== target || cliRestartInProgress || webTerminalInputWireDirty()) return;
   }
   if (!hasPendingInputForFlush()) return;  // nothing to flush — keep isPromptReady
-  let reattachSteerFence = lastSpawnPersistentReattach && lastInitConfig?.cliId === 'traex'
+  let reattachSteerFence = (lastSpawnPersistentReattach || traexNativeInstantInputEnabled()) && lastInitConfig?.cliId === 'traex'
     ? traexPersistentReattachSteeringFence(pendingMessages[0]) : undefined;
+  if (!isPromptReady && traexNativeInstantInputEnabled() && !reattachSteerFence) return;
   const reattachSteerFenceIsCurrent = (item: PendingCliInput): boolean => {
     const current = traexPersistentReattachSteeringFence(item);
     return !!reattachSteerFence && !!current && current.item === reattachSteerFence.item
@@ -31052,7 +31253,9 @@ async function flushPending(): Promise<void> {
       && current.generation === reattachSteerFence.generation
       && current.lifetime === reattachSteerFence.lifetime
       && current.webInputGeneration === reattachSteerFence.webInputGeneration
-      && current.pid === reattachSteerFence.pid && current.nativeSessionId === reattachSteerFence.nativeSessionId;
+      && current.pid === reattachSteerFence.pid && current.nativeSessionId === reattachSteerFence.nativeSessionId
+      && current.nativeInstant === reattachSteerFence.nativeInstant && current.procStart === reattachSteerFence.procStart
+      && current.interruptGeneration === reattachSteerFence.interruptGeneration;
   };
   if (recoverSessionRenameAfterPersistentReattach(pendingMessages[0])) return;
   if (resetTraexAutoModelBeforePendingTurn()) return;
@@ -31187,6 +31390,8 @@ async function flushPending(): Promise<void> {
     pendingMessages[0],
     directRpcTurnBlocksTypeAhead() || programStatusBlockedHoldsTypeAhead(),
   ) && !activeTurnBlocks(pendingMessages[0] ?? {});
+  if (!isPromptReady && traexNativeInstantInputEnabled()
+    && !traexNativeInstantInputEligible(pendingMessages[0] ?? { content: '' })) return;
   // Native /rename is an administrative command, not a steer/queued model
   // message. It must wait for a real prompt even on type-ahead CLIs. Normal
   // pending messages can still drain while busy; the rename stays queued.
@@ -31773,6 +31978,7 @@ async function flushPending(): Promise<void> {
         && !(item.codexAppInput && writeAdapter.writeStructuredInput);
       const prepareNormalWrite = (): void => {
         if (normalWritePrepared) return;
+        const instantCaller = nativeInstantInputCaller(item);
         // A backend submission mutex may await after dequeue. Capture again
         // at the literal write edge, before rotating capture or turn authority.
         if (reattachSteerFence && !reattachSteerFenceIsCurrent(item)) {
@@ -32056,6 +32262,7 @@ async function flushPending(): Promise<void> {
             Date.now(),
             item.linkRefMode,
             msg !== logicalMsg ? msg : undefined,
+            instantCaller,
           );
           if (bridgeTurnId) {
             if (msg !== logicalMsg) {
@@ -32387,7 +32594,10 @@ async function flushPending(): Promise<void> {
               && cliSpawnGeneration === writeSteerFence.generation
               && cliLifetimeNonce === writeSteerFence.lifetime
               && webTerminalInputGeneration === writeSteerFence.webInputGeneration
-              && currentTraexObservedPid() === writeSteerFence.pid,
+              && currentTraexObservedPid() === writeSteerFence.pid
+              && (!writeSteerFence.nativeInstant || (traexNativeInstantInputEnabled()
+                && readProcessStartIdentity(writeSteerFence.pid) === writeSteerFence.procStart
+                && cliInterruptGeneration === writeSteerFence.interruptGeneration)),
           } : nativeGuard;
           if (writeAdapter.writeInputDefersPreparation === true && !pendingMessages.includes(item)) {
             // Keep the exact item under the ordinary pending lifecycle until its
@@ -33401,7 +33611,7 @@ function sendToPty(
     next,
     directRpcTurnBlocksTypeAhead() || programStatusBlockedHoldsTypeAhead(),
   ) && !activeTurnBlocks(next);
-  const reattachSteerReady = lastSpawnPersistentReattach && lastInitConfig?.cliId === 'traex'
+  const reattachSteerReady = (lastSpawnPersistentReattach || traexNativeInstantInputEnabled()) && lastInitConfig?.cliId === 'traex'
     && traexPersistentReattachSteeringFence(next) !== undefined;
   const shouldMergeQueued = !traexAutoModelRuntimeEligible()
     && opts.dispatchAttempt === undefined && !durableTurnInFlight
