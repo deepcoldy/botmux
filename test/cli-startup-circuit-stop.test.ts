@@ -340,9 +340,12 @@ describe('startup circuit versus delayed / in-flight restart continuations', () 
     expect(h.scope.spawnCli).toHaveBeenCalledOnce();
     expect(h.scope.cliRestartInProgress).toBe(true);
     h.scope.backend = null; // replacement's second startup failure
+    const rpcEngine = { stopAndWait: vi.fn(() => rpcStop.promise) };
     Object.assign(h.scope, {
       stopScreenshotLoop: vi.fn(),
-      codexRpcEngine: { stopAndWait: vi.fn(() => rpcStop.promise) },
+      codexRpcEngine: rpcEngine,
+      clearRpcEnginePidMarker: vi.fn(),
+      stopStructuredStartGraceRecheck: vi.fn(),
       armRpcStartupDialogDismiss: vi.fn(),
       saveUnsentInputsForSuccessor: vi.fn(),
       sandboxTreeOutlivesWorker: false,
@@ -358,7 +361,7 @@ describe('startup circuit versus delayed / in-flight restart continuations', () 
     );
     const stopped = shutdown('SIGTERM', 0);
     const killCallsBeforeShutdown = h.scope.killCli.mock.calls.length;
-    expect(h.scope.codexRpcEngine.stopAndWait).toHaveBeenCalledOnce();
+    expect(rpcEngine.stopAndWait).toHaveBeenCalledOnce();
     expect(h.scope.process.exit).not.toHaveBeenCalled();
 
     title.resolve();
@@ -649,6 +652,28 @@ describe('pre-ready input receipts', () => {
     expect(h.scope.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'queued_turn_cancel_result', turnId: 'schedule:recovered', status: 'restart_required',
     }));
+  });
+
+  it('answers a rejected stale cancellation instead of leaving the daemon to time out', () => {
+    const binding = { runtime: { runtimeId: 'runtime-current' } };
+    const scope = {
+      workerSessionEventScope: {
+        currentBinding: () => binding,
+        bindingForRuntime: () => binding,
+        run: (_target: unknown, fn: () => void) => fn(),
+      },
+      admitSessionCommand: () => ({ allowed: false, reason: 'stale_runtime_target' }),
+      send: vi.fn(), log: vi.fn(),
+    };
+    const dispatch = loadWorkerFunction('dispatchDaemonMessage', scope);
+    dispatch({
+      type: 'cancel_queued_turn', requestId: 'cancel-stale-runtime', turnId: 'schedule:stale-runtime',
+      sessionCommand: { version: 2, runtime: { runtimeId: 'runtime-old' } },
+    });
+    expect(scope.send).toHaveBeenCalledWith({
+      type: 'queued_turn_cancel_result', requestId: 'cancel-stale-runtime',
+      turnId: 'schedule:stale-runtime', status: 'restart_required',
+    });
   });
 
   it.each([false, true])('settles only the exiting backend lease when a replacement is current (running=%s)', running => {

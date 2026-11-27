@@ -28,6 +28,7 @@ import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
 import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, settleOfflineReconciledQueuedActivation, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, findQuarantinedRoutingConflict, isDisposableCommandScratch, isRelayableRealSession, closeSession, closeSessionForBackgroundCleanup, findActiveBySessionId, identityStorageModelForDaemonSession, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart, recordTurnExplicitMention, resumeTurnNotices } from './worker-pool.js';
+import { hasCleanlyDrainedQueuedActivationTail } from './queued-activation-drain.js';
 import { createCliAdapterSync, resolveCommandReal } from '../adapters/cli/registry.js';
 import { hasRecoverableActivationHead } from './deferred-schedule-settlement.js';
 import { precheckTraexRuntime, traexLaunchUsesSharedRuntimeGate } from '../services/traex-runtime-gate.js';
@@ -3989,9 +3990,14 @@ export async function restoreActiveSessions(
       quarantineUnregisteredRestoreSession(session, 'cli_mismatch_close_failed');
       continue;
     }
-    if (!ds.session.queuedActivationPending
+    const activationTailPromotionFailed = !ds.session.queuedActivationPending
       && (ds.session.queuedActivationTail?.length ?? 0) > 0
-      && !promoteQueuedActivationTail(ds, { send: false })) {
+      && !promoteQueuedActivationTail(ds, { send: false });
+    if (activationTailPromotionFailed && hasCleanlyDrainedQueuedActivationTail(ds)) {
+      ds.quarantinedActivationTailPromotion = undefined;
+      ds.initialStartPending = false;
+      ds.initialStartClaimToken = undefined;
+    } else if (activationTailPromotionFailed) {
       // Promotion here only fails on a transient durable-write error (send:false
       // skips the worker-liveness gate, and the caller already checked a non-empty
       // tail). Throwing would drop to the isolation catch below WITHOUT registering

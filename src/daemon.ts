@@ -846,6 +846,7 @@ import {
   XpiSessionStoreBusyRetryScheduler,
   type XpiSessionStoreBusyRetryEvent,
 } from './core/xpi-session-store-busy-retry.js';
+import { hasCleanlyDrainedQueuedActivationTail } from './core/queued-activation-drain.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
 import {
   buildBotmuxLarkNativeSessionTitle,
@@ -860,6 +861,7 @@ import {
   settleHeldScheduleRunsOnWorkerExit,
   cancelPreReadyScheduledWorkers,
   releaseCancelledActivationWork,
+  retireCancelledActivationWorker,
 } from './core/deferred-schedule-settlement.js';
 import {
   renderMessageListenerPrompt,
@@ -24028,6 +24030,7 @@ function clearInitialStartClaim(ds: DaemonSession, token?: string): boolean {
  * before a store throw is not a contract. */
 function queuedActivationReleaseDue(ds: DaemonSession): boolean {
   return ds.initialStartPending === true
+    || ds.activationCancellationPending === true
     || (ds.session.queuedActivationTail?.length ?? 0) > 0;
 }
 
@@ -24204,12 +24207,31 @@ function releaseQueuedActivationReservationNow(ds: DaemonSession, acknowledgedTo
   }
 
   if ((ds.session.queuedActivationTail?.length ?? 0) === 0) {
+    if (ds.activationCancellationPending === true) {
+      // The in-memory tail may already be empty even though both cancellation
+      // writes failed. Re-run the same write-ahead owner before releasing the
+      // claim; a false return schedules the next bounded release retry.
+      promoteQueuedActivationTail(ds, { send: false });
+    }
+    if (ds.activationCancellationPending === true) return false;
     clearInitialStartBuffers(ds);
     clearInitialStartClaim(ds);
     return true;
   }
+  const cancelledTurnIds = new Set(ds.session.cancelledActivationTurnIds ?? []);
   const head = [...ds.session.queuedActivationTail!]
-    .sort((a, b) => a.order - b.order || a.id.localeCompare(b.id))[0]!;
+    .filter(entry => !cancelledTurnIds.has(entry.turnId))
+    .sort((a, b) => a.order - b.order || a.id.localeCompare(b.id))[0];
+  const workerUnavailable = !ds.worker || ds.worker.killed;
+  if (!head) {
+    // Let the owner of the cancellation write-ahead protocol perform the prune;
+    // only a clean, fully persisted drain releases the reservation.
+    promoteQueuedActivationTail(ds, workerUnavailable ? { send: false } : {});
+    if (!hasCleanlyDrainedQueuedActivationTail(ds)) return false;
+    clearInitialStartBuffers(ds);
+    clearInitialStartClaim(ds);
+    return true;
+  }
   // A head retagged for the replacement runtime is parked, not failed: the old
   // CLI must not accept it, and the reclaim predicate ignores it so retirement
   // proceeds. onInstallChangeReclaimed starts the replacement runtime. Report
@@ -24219,9 +24241,15 @@ function releaseQueuedActivationReservationNow(ds: DaemonSession, acknowledgedTo
     clearInitialStartClaim(ds);
     return true;
   }
-  const workerUnavailable = !ds.worker
-    || ds.worker.killed;
-  if (!promoteQueuedActivationTail(ds, workerUnavailable ? { send: false } : {})) return false;
+  const promoted = promoteQueuedActivationTail(ds, workerUnavailable ? { send: false } : {});
+  if (!promoted) {
+    if (hasCleanlyDrainedQueuedActivationTail(ds)) {
+      clearInitialStartBuffers(ds);
+      clearInitialStartClaim(ds);
+      return true;
+    }
+    return false;
+  }
   try {
     rememberLastCliInput(ds, head.userPrompt, head.cliInput, head.turnId, {
       codexAppInputAccepted: !!head.cliInput.codexAppInput,
@@ -39150,24 +39178,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       retireWorker: async ds => {
         const worker = ds.worker;
         if (!worker) return;
-        killWorker(ds);
         const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
-        if (backendType && isRemoteBackendType(backendType)
-          && ds.worker === worker && worker.exitCode === null && worker.signalCode === null) {
-          return false;
-        }
-        if (worker.exitCode !== null || worker.signalCode !== null) return true;
-        await new Promise<void>(resolve => {
-          const timer = setTimeout(done, 5_000);
-          timer.unref?.();
-          function done(): void {
-            clearTimeout(timer);
-            worker!.off('exit', done);
-            resolve();
-          }
-          worker.once('exit', done);
+        return retireCancelledActivationWorker(worker, {
+          remote: !!backendType && isRemoteBackendType(backendType),
+          onExited: () => {
+            // Do not clear ds.worker or promote the successor until the OS exit
+            // event proves the old worker cannot overlap its replacement.
+            if (ds.worker === worker) retireWorkerProcessOnly(ds, 'scheduled_run_cancelled');
+          },
         });
-        return worker.exitCode !== null || worker.signalCode !== null;
       },
       release: async ds => {
         await releaseCancelledActivationWork(ds, {

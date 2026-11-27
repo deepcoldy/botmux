@@ -106,12 +106,15 @@ import {
   suspendWorker,
   sendWorkerInput,
   promoteQueuedActivationTail,
+  hasCleanlyDrainedQueuedActivationTail,
+  resolveQuarantinedForkPlan,
   reconcileQueuedActivationOnWorkerDetach,
   installReclaimPendingForCurrentGeneration,
   transferQueuedActivationOwnershipToNew,
   hasPendingOrdinaryImInput,
   recordWorkerCliInputBacklog,
 } from '../src/core/worker-pool.js';
+import { releaseCancelledActivationWork } from '../src/core/deferred-schedule-settlement.js';
 import { beginFinalOutputDelivery } from '../src/core/final-output-delivery-drain.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { ExecutableIdentity } from '../src/services/cli-install-identity.js';
@@ -1272,6 +1275,97 @@ describe('activation tail claim cancellation', () => {
     expect(ds.session.queuedActivationTail).toBeUndefined();
     expect(ds.initialStartPending).toBe(false);
     expect(ds.quarantinedActivationTailPromotion).toBeUndefined();
+  });
+
+  it.each(['human follow-up', ''])('releases a cleanly drained quarantine at the fork boundary (%s)', prompt => {
+    const ds = makeDs({ worker: null, initialStartPending: true });
+    ds.session.queuedActivationTail = undefined;
+    ds.quarantinedActivationTailPromotion = true;
+    ds.initialStartClaimToken = 'claim-drained';
+    const plan = resolveQuarantinedForkPlan(ds, prompt, false);
+    expect(plan).toEqual({ fork: true, promptInput: prompt, resumeOrTurnId: false });
+    expect(ds.quarantinedActivationTailPromotion).toBeUndefined();
+    expect(ds.initialStartPending).toBe(false);
+    expect(ds.initialStartClaimToken).toBeUndefined();
+  });
+
+  it('releases only live reservation heads and clears an all-cancelled claim', () => {
+    const mixed = makeDs();
+    mixed.session.queuedActivationTail = [
+      { ...tailFor('om_cancelled'), order: 1 },
+      { ...tailFor('om_live'), order: 2 },
+    ];
+    mixed.session.cancelledActivationTurnIds = ['om_cancelled'];
+    const rememberLastCliInput = vi.fn();
+    const releaseMixed = loadDaemonFunction({
+      promoteQueuedActivationTail, hasCleanlyDrainedQueuedActivationTail,
+      installReclaimPendingForCurrentGeneration,
+      clearInitialStartBuffers: vi.fn(), clearInitialStartClaim: vi.fn(), rememberLastCliInput,
+    }, 'releaseQueuedActivationReservationNow');
+    expect(releaseMixed(mixed)).toBe(true);
+    expect(rememberLastCliInput).toHaveBeenCalledWith(mixed, 'prompt-om_live', expect.anything(), 'om_live', expect.anything());
+    expect(JSON.stringify(rememberLastCliInput.mock.calls)).not.toContain('prompt-om_cancelled');
+
+    const drained = makeDs({ worker: null, initialStartPending: true });
+    drained.session.queuedActivationTail = [tailFor('om_only_cancelled')];
+    drained.session.cancelledActivationTurnIds = ['om_only_cancelled'];
+    drained.initialStartClaimToken = 'claim-only-cancelled';
+    const rememberDrained = vi.fn();
+    const releaseDrained = loadDaemonFunction({
+      promoteQueuedActivationTail, hasCleanlyDrainedQueuedActivationTail,
+      installReclaimPendingForCurrentGeneration,
+      clearInitialStartBuffers: vi.fn(),
+      clearInitialStartClaim: vi.fn(() => {
+        drained.initialStartPending = false;
+        drained.initialStartClaimToken = undefined;
+      }),
+      rememberLastCliInput: rememberDrained,
+    }, 'releaseQueuedActivationReservationNow');
+    expect(releaseDrained(drained)).toBe(true);
+    expect(drained.session.queuedActivationTail).toBeUndefined();
+    expect(drained.initialStartClaimToken).toBeUndefined();
+    expect(rememberDrained).not.toHaveBeenCalled();
+  });
+
+  it('retains and retries a dirty empty-tail cancellation until its write-ahead state persists', async () => {
+    const ds = makeDs({ worker: null, initialStartPending: true });
+    ds.session.queuedActivationTail = undefined;
+    ds.activationCancellationPending = true;
+    ds.initialStartClaimToken = 'claim-dirty-empty-tail';
+    const releaseNow = loadDaemonFunction({
+      promoteQueuedActivationTail,
+      clearInitialStartBuffers: vi.fn(),
+      clearInitialStartClaim: vi.fn(() => {
+        ds.initialStartPending = false;
+        ds.initialStartClaimToken = undefined;
+      }),
+    }, 'releaseQueuedActivationReservationNow');
+    const releaseDue = loadDaemonFunction({}, 'queuedActivationReleaseDue');
+    ds.initialStartPending = false;
+    expect(releaseDue(ds)).toBe(true);
+    ds.initialStartPending = true;
+    const scheduleRetry = vi.fn();
+    const startJournal = vi.fn();
+    const update = vi.mocked(sessionStore.updateSession);
+    update.mockReset().mockImplementation(() => { throw new Error('cancellation still unwritable'); });
+    await releaseCancelledActivationWork(ds, {
+      release: async () => releaseNow(ds), startJournal, scheduleRetry,
+    });
+    expect(scheduleRetry).toHaveBeenCalledOnce();
+    expect(startJournal).not.toHaveBeenCalled();
+    expect(ds.initialStartPending).toBe(true);
+    expect(ds.initialStartClaimToken).toBe('claim-dirty-empty-tail');
+    expect(ds.activationCancellationPending).toBe(true);
+
+    update.mockReset();
+    await releaseCancelledActivationWork(ds, {
+      release: async () => releaseNow(ds), startJournal, scheduleRetry,
+    });
+    expect(ds.activationCancellationPending).toBeUndefined();
+    expect(ds.initialStartPending).toBe(false);
+    expect(ds.initialStartClaimToken).toBeUndefined();
+    expect(scheduleRetry).toHaveBeenCalledOnce();
+    expect(startJournal).not.toHaveBeenCalled();
   });
 });
 

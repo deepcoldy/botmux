@@ -268,6 +268,7 @@ function engageHarness(opts: {
   firstOutcome?: 'accepted' | 'not-sent' | 'ambiguous';
   receipt?: context.TraexNativeContextReceipt;
   startGates?: Array<Promise<void>>;
+  stopAndWaitOutcome?: 'false' | 'throw';
 }) {
   const engines: any[] = [];
   class FakeEngine {
@@ -275,7 +276,10 @@ function engageHarness(opts: {
     wsUrl = 'ws://127.0.0.1:1';
     activeThreadId: string | undefined;
     stop = vi.fn();
-    stopAndWait = vi.fn(async () => true);
+    stopAndWait = vi.fn(async () => {
+      if (opts.stopAndWaitOutcome === 'throw') throw new Error('live descendant');
+      return opts.stopAndWaitOutcome === 'false' ? false : true;
+    });
     sendFirstTurn = vi.fn(async () => ({
       outcome: opts.firstOutcome ?? 'accepted',
       ...(opts.firstOutcome === 'accepted' || !opts.firstOutcome ? { nativeTurnId: 'native-1' } : {}),
@@ -428,6 +432,14 @@ describe('actual worker TraeX RPC engagement', () => {
     expect(h.cfg.prompt).toBe(prompt('A', 'hello'));
     expect(h.base.deferredPluginSkillCatalog).toBe('<botmux_skills_refresh>catalog</botmux_skills_refresh>');
     expect(h.lease.release).toHaveBeenCalledTimes(1);
+    expect(h.engines[0].stopAndWait.mock.invocationCallOrder[0]).toBeLessThan(h.lease.release.mock.invocationCallOrder[0]);
+  });
+
+  it.each(['false', 'throw'] as const)('keeps a not-sent RPC lease when final teardown cannot prove death (%s)', async mode => {
+    const h = engageHarness({ firstOutcome: 'not-sent', receipt: acceptedOld, stopAndWaitOutcome: mode });
+    await expect(h.engage()).resolves.toBe('not-engaged');
+    expect(h.lease.markDeathUnproven).toHaveBeenCalledWith(4242);
+    expect(h.lease.release).not.toHaveBeenCalled();
   });
 
   it('consumes the catalog with an accepted fresh first turn and fingerprints the sent text', async () => {

@@ -487,6 +487,32 @@ describe('Synchronous offline cold-restore settlement (missing pane / local PTY)
     }
   });
 
+  it('treats an all-cancelled tail after offline head settlement as drained, not quarantined', () => {
+    const dataDir = createIsolatedDataDir();
+    const session = makeSession({
+      backendType: 'pty',
+      queuedActivationPending: true,
+      queuedActivationToken: 'tok-cold-cancelled-tail',
+      queuedActivationInput: { content: 'submitted head' },
+      queuedActivationTurnId: 'om_cold_head_cancelled_tail',
+      queuedActivationTail: [{
+        id: 'tail-cancelled', order: 1, userPrompt: 'cancelled successor',
+        cliInput: { content: 'cancelled successor' }, turnId: 'om_cancelled_successor',
+      }],
+      cancelledActivationTurnIds: ['om_cancelled_successor'],
+    });
+    const ds = makeDaemonSession(session, { initialStartPending: true, initialStartClaimToken: 'claim-cold-cancelled' });
+    persistExecutionPhase(dataDir, ds, 'om_cold_head_cancelled_tail', 'succeeded');
+    const outcome = workerPool.settleOfflineReconciledQueuedActivation(ds, {
+      isCodexApp: false, isRemoteBackend: false, backingMode: 'cold_restore',
+    });
+    expect(outcome).toBe('settled_empty');
+    expect(ds.session.queuedActivationTail).toBeUndefined();
+    expect(ds.quarantinedActivationTailPromotion).toBeUndefined();
+    expect(ds.initialStartPending).toBe(false);
+    expect(ds.initialStartClaimToken).toBeUndefined();
+  });
+
   it('promotes queuedActivationTail[0] with resume=true on cold-restore and rolls back cleanly on transient SQLite failures', () => {
     const dataDir = createIsolatedDataDir();
 
@@ -1854,6 +1880,25 @@ describe('Production wiring & adversarial regression probes (P0/P1/P2)', () => {
     expect(rawCmd.runtime).toEqual(rt2);
     expect(admitSessionCommand('raw_input', rawCmd, rt2)).toEqual({ allowed: true });
     expect(dataDir).toBeTruthy();
+  });
+
+  it('does not retrofit an active-operation runtime onto cancel_queued_turn', () => {
+    createIsolatedDataDir();
+    const ds = makeDaemonSession(makeSession({ queuedActivationPending: true, queuedActivationTurnId: 'om_cancel_during_restart' }));
+    const controller = controllerForSession(ds, true)!;
+    const worker = controller.bindWorker(1);
+    controller.reserveBinding('bind-restart-cancel', worker.worker);
+    controller.bindRuntime('bind-restart-cancel', worker.worker, {
+      backend: 'tmux', physicalId: 'pid:7100:boot:1', nativeSessionId: ds.session.sessionId, proof: 'process_start',
+    });
+    const operation = controller.beginControl('restart');
+    const command = controller.command({
+      type: 'cancel_queued_turn', turnId: 'om_cancel_during_restart',
+      attemptId: operation.operation.operationId,
+      sessionCommand: { version: 2 },
+    });
+    expect(command.runtime).toBeUndefined();
+    expect(admitSessionCommand('cancel_queued_turn', command, undefined)).toEqual({ allowed: true });
   });
 
   it('retains a same-worker stopped runtime for restart while keeping it out of replacement input delivery', () => {

@@ -2326,8 +2326,6 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
         // the same turnId and leave a stale, never-consumed queue head (Codex P1).
         log('Codex RPC fresh first turn: frame not dispatched → falling back to paste (safe, single execution)');
         clearRpcEnginePidMarker();
-        try { engine.stop(); } catch { /* best effort */ }
-        await settleTraexRpcLease(rpcLeaseContext);
         return 'not-engaged';
       }
       if (first.outcome === 'accepted') {
@@ -42041,6 +42039,13 @@ async function spawnCliBody(
       setCaptureIdentity(turn.turnId, turn.dispatchAttempt);
       if (turn.dispatchAttempt !== undefined) durableTurnInFlight = true;
       remoteRunnerRecoveredTurnInFlight = true;
+      // Publish the recovery identity before the first await so a cancellation
+      // during host-context restoration fails closed instead of reporting a
+      // merely queued opening.
+      remoteRunnerRecoveredTurnIdentity = {
+        turnId: turn.turnId,
+        ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
+      };
       const restoredLinkRefMode = await restoreLinkRefModeThroughHost({
         turnId: turn.turnId,
         ...(turn.dispatchAttempt !== undefined
@@ -42048,6 +42053,10 @@ async function spawnCliBody(
           : {}),
       });
       if (fatalWorkerErrorPending || backend !== observedBackend) return;
+      if (cancelledQueuedTurnIds.has(turn.turnId)) {
+        log(`Ignored recovered remote turn cancelled during host restore ${turn.turnId.substring(0, 12)}`);
+        return;
+      }
       if (!observedBackend.setRecoveredTurnHostContext?.(
         turn.turnId,
         { ...(restoredLinkRefMode ? { linkRefMode: restoredLinkRefMode } : {}), sessionOrigin: workerSessionEventScope?.origin(turn.turnId, turn.dispatchAttempt) },
@@ -42074,10 +42083,6 @@ async function spawnCliBody(
           ? true
           : undefined,
       );
-      remoteRunnerRecoveredTurnIdentity = {
-        turnId: turn.turnId,
-        ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
-      };
       workerSessionEventScope?.recordSubmission(turn.turnId, turn.dispatchAttempt);
       const recoveredQueue = reconcileRemoteRecoveredTurnQueue(
         pendingMessages,
@@ -42104,6 +42109,10 @@ async function spawnCliBody(
         + `generation=${turn.generation} attempt=${turn.dispatchAttempt ?? '-'}`,
       );
     } catch (error) {
+      if (cancelledQueuedTurnIds.has(turn.turnId)) {
+        log(`Ignored failed host restore for tombstoned remote turn ${turn.turnId.substring(0, 12)}`);
+        return;
+      }
       log(
         `Refused recovered remote turn ${turn.turnId.substring(0, 12)}: `
         + `${error instanceof Error ? error.message : String(error)}`,
@@ -50688,7 +50697,6 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       stopScreenshotLoop();
       stopBridgeWatcher();
       stopCodexBridge();
-      const closeRpcEngine = codexRpcEngine;
       // Local close destroys persistent owned sessions. Remote backends never
       // reach here: the branch above fences them all (request-less remote close
       // is refused; with a requestId it goes through prepare/commit), so
@@ -50702,10 +50710,9 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         try { await Promise.race([closeTeardown, new Promise((r) => setTimeout(r, 22_000))]); }
         catch { /* logged by backend */ }
       }
-      try {
-        await closeRpcEngine?.stopAndWait();
-      } catch (error) {
-        log(`Local close RPC teardown failed: ${String(error)}`);
+      const closeRpcStopped = await stopCodexRpcEngine();
+      if (!closeRpcStopped) {
+        log('Local close RPC teardown could not prove process death');
         process.exit(1);
         return;
       }
@@ -51088,11 +51095,13 @@ function dispatchDaemonMessage(raw: unknown, handle: unknown): unknown {
       log(`Rejected ${msg.type}: ${admission.reason}`);
       const target = msg.sessionCommand?.runtime ? workerSessionEventScope.bindingForRuntime(msg.sessionCommand.runtime) : binding;
       const reject = () => {
+        if (msg.type === 'cancel_queued_turn') send({ type: 'queued_turn_cancel_result', requestId: msg.requestId, turnId: msg.turnId, status: 'restart_required' });
         if (msg.type === 'interrupt_turn') send({ type: 'turn_interrupt_result', requestId: msg.requestId, turnId: msg.turnId, delivered: false, reason: 'stale_turn' });
         if (msg.type === 'codex_app_interrupt') send({ type: 'codex_app_interrupt_result', requestId: msg.requestId, status: 'stale_turn' });
         if (msg.type === 'restart' && msg.attemptId) send({ type: 'restart_result', attemptId: msg.attemptId, status: 'failed', category: 'spawn_failed', untouched: true });
       };
       if (target) workerSessionEventScope.run(target, reject, msg.sessionCommand?.execution, msg.sessionCommand?.operationId);
+      else if (msg.type === 'cancel_queued_turn') reject();
       return;
     }
   }
@@ -51204,7 +51213,7 @@ async function shutdownWorkerForParentExitImpl(reason: string, exitCode = 0): Pr
     process.exit(exitCode);
     return;
   }
-  await codexRpcEngine?.stopAndWait();
+  await stopCodexRpcEngine();
   // A persistent sandboxed pane (oncall / scratch / credential-only) survives
   // this exit (backend.kill() only detaches) and still runs against its
   // per-session tree: the relay outbox is bound into it by inode, and a scratch

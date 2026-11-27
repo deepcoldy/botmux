@@ -277,7 +277,12 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
     expect(messages.some(message => message.type === 'error')).toBe(false);
   });
 
-  it.each(['final', 'failure'] as const)('suppresses a late recovered %s after the opening was tombstoned', async outcome => {
+  it.each([
+    { outcome: 'final', duringHostRestore: false },
+    { outcome: 'failure', duringHostRestore: false },
+    { outcome: 'final', duringHostRestore: true },
+    { outcome: 'restore-error', duringHostRestore: true },
+  ] as const)('suppresses a recovered $outcome after cancellation (during host restore=$duringHostRestore)', async ({ outcome, duringHostRestore }) => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-remote-cancel-recovery-'));
     tempDirs.push(root);
     const turnId = 'schedule:remote-cancel-recovery';
@@ -300,7 +305,7 @@ const readyTimer = setInterval(() => {
   const terminalTimer = setInterval(() => {
     if (!fs.existsSync(${JSON.stringify(releaseTerminalPath)})) return;
     clearInterval(terminalTimer);
-    if (${JSON.stringify(outcome)} === 'final') {
+    if (${JSON.stringify(outcome)} !== 'failure') {
       emit({ type: 'final', turnId: ${JSON.stringify(turnId)}, content: 'RECOVERED_AFTER_CANCEL', state });
     } else {
       emit({ type: 'failure', turnId: ${JSON.stringify(turnId)}, status: 'failed', code: 'cancel_probe_failure', message: 'late failure after cancellation', retryable: false });
@@ -338,6 +343,7 @@ process.stdin.on('end', () => { clearInterval(keepAlive); process.exit(0); });
     }]));
     const messages: WorkerToDaemon[] = [];
     const logs: string[] = [];
+    let pendingLinkRefRequestId: string | undefined;
     const child = spawnTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
@@ -358,7 +364,8 @@ process.stdin.on('end', () => { clearInterval(keepAlive); process.exit(0); });
       const message = raw as WorkerToDaemon;
       messages.push(message);
       if (message.type === 'link_ref_restore_mode') {
-        child.send({ type: 'link_ref_restore_mode_result', requestId: message.requestId, mode: 'enabled' } satisfies DaemonToWorker);
+        if (duringHostRestore) pendingLinkRefRequestId = message.requestId;
+        else child.send({ type: 'link_ref_restore_mode_result', requestId: message.requestId, mode: 'enabled' } satisfies DaemonToWorker);
       }
     });
     child.send({
@@ -373,6 +380,13 @@ process.stdin.on('end', () => { clearInterval(keepAlive); process.exit(0); });
       prompt: 'opening whose submission evidence was lost', turnId, dispatchAttempt: 3,
       queuedActivationToken: 'tok-remote-cancel-recovery', larkAppId: 'app_remote_cancel_recovery', larkAppSecret: 'secret',
     } satisfies DaemonToWorker);
+    if (duringHostRestore) {
+      writeFileSync(releaseReadyPath, 'ready\n');
+      await waitFor(
+        () => pendingLinkRefRequestId !== undefined,
+        () => `recovered host restore did not begin\n${logs.join('')}\n${JSON.stringify(messages)}`,
+      );
+    }
     child.send({ type: 'cancel_queued_turn', requestId: 'cancel-before-recovery', turnId, sessionCommand: { version: 2 } } satisfies DaemonToWorker);
 
     await waitFor(
@@ -382,7 +396,15 @@ process.stdin.on('end', () => { clearInterval(keepAlive); process.exit(0); });
     expect(messages).toContainEqual(expect.objectContaining({
       type: 'queued_turn_cancel_result', requestId: 'cancel-before-recovery', turnId, status: 'restart_required',
     }));
-    writeFileSync(releaseReadyPath, 'ready\n');
+    if (duringHostRestore) {
+      if (outcome === 'restore-error') {
+        child.send({ type: 'link_ref_restore_mode_result', requestId: pendingLinkRefRequestId!, error: 'controlled_restore_failure' } as DaemonToWorker);
+      } else {
+        child.send({ type: 'link_ref_restore_mode_result', requestId: pendingLinkRefRequestId!, mode: 'enabled' } satisfies DaemonToWorker);
+      }
+    } else {
+      writeFileSync(releaseReadyPath, 'ready\n');
+    }
     await waitFor(
       () => messages.some(message => message.type === 'ready'),
       () => `remote worker did not become ready\n${logs.join('')}\n${JSON.stringify(messages)}`,
@@ -394,10 +416,13 @@ process.stdin.on('end', () => { clearInterval(keepAlive); process.exit(0); });
     );
     await new Promise<void>(resolveDelay => setTimeout(resolveDelay, 250));
 
-    expect(messages.filter(message => message.type === 'turn_input_committed' && message.turnId === turnId), JSON.stringify(messages)).toEqual([]);
-    expect(messages.filter(message => message.type === 'queued_activation_submitted'), JSON.stringify(messages)).toEqual([]);
-    expect(messages.filter(message => message.type === 'final_output' && message.turnId === turnId), JSON.stringify(messages)).toEqual([]);
-    expect(messages.filter(message => message.type === 'turn_terminal' && message.turnId === turnId), `${JSON.stringify(messages)}\n${logs.join('')}`).toEqual([]);
+    const cancelResultIndex = messages.findIndex(message => message.type === 'queued_turn_cancel_result'
+      && message.requestId === 'cancel-before-recovery');
+    const afterCancel = messages.slice(cancelResultIndex + 1);
+    expect(afterCancel.filter(message => message.type === 'turn_input_committed' && message.turnId === turnId), JSON.stringify(messages)).toEqual([]);
+    expect(afterCancel.filter(message => message.type === 'queued_activation_submitted'), JSON.stringify(messages)).toEqual([]);
+    expect(afterCancel.filter(message => message.type === 'final_output' && message.turnId === turnId), JSON.stringify(messages)).toEqual([]);
+    expect(afterCancel.filter(message => message.type === 'turn_terminal' && message.turnId === turnId), `${JSON.stringify(messages)}\n${logs.join('')}`).toEqual([]);
     const commands = readFileSync(commandsPath, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
     expect(commands.filter(command => command.type === 'turn')).toEqual([]);
   });

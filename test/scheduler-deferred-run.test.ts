@@ -17,6 +17,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { spawn } from 'node:child_process';
 import { config } from '../src/config.js';
 import type { ScheduleExecutionContext } from '../src/core/scheduler.js';
 import type { ScheduledTask } from '../src/types.js';
@@ -24,7 +25,7 @@ import * as scheduler from '../src/core/scheduler.js';
 import { ScheduleAuthorityStore } from '../src/services/schedule-authority-store.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
 import { queryScheduleRunLogs } from '../src/services/schedule-run-log-store.js';
-import { settleHeldScheduleRunsOnWorkerExit, cancelPreReadyScheduledWorkers, retryCancelledActivationPersistence, releaseCancelledActivationWork } from '../src/core/deferred-schedule-settlement.js';
+import { settleHeldScheduleRunsOnWorkerExit, cancelPreReadyScheduledWorkers, retryCancelledActivationPersistence, releaseCancelledActivationWork, retireCancelledActivationWorker } from '../src/core/deferred-schedule-settlement.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import { untilDoneDeadlineDue } from '../src/services/schedule-until-done.js';
 
@@ -1122,8 +1123,41 @@ describe('deferred scheduled run lifecycle', () => {
     await releaseCancelledActivationWork(ds, {
       release: async () => true, startJournal, scheduleRetry,
     });
-    expect(startJournal).toHaveBeenCalledOnce();
+    // An offline release may have promoted the retained human journal; it still
+    // needs an explicit cold start when no worker remains.
+    expect(startJournal).toHaveBeenCalledTimes(2);
     expect(scheduleRetry).not.toHaveBeenCalled();
+  });
+
+  it('releases a successor only after the real worker process has exited', async () => {
+    const child = spawn('/bin/sh', ['-c', 'trap "exit 0" TERM; while :; do sleep 1; done']);
+    let callbackSawExit = false;
+    const onExited = vi.fn(() => {
+      callbackSawExit = child.exitCode !== null || child.signalCode !== null;
+    });
+    try {
+      await expect(retireCancelledActivationWorker(child, { remote: false, onExited })).resolves.toBe(true);
+      expect(onExited).toHaveBeenCalledOnce();
+      expect(callbackSawExit).toBe(true);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    }
+  });
+
+  it('refuses to signal a live remote worker through the generic retirement path', async () => {
+    const child = spawn('/bin/sh', ['-c', 'sleep 60']);
+    const kill = vi.spyOn(child, 'kill');
+    const onExited = vi.fn();
+    try {
+      await expect(retireCancelledActivationWorker(child, { remote: true, onExited })).resolves.toBe(false);
+      expect(kill).not.toHaveBeenCalled();
+      expect(onExited).not.toHaveBeenCalled();
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGKILL');
+        await new Promise(resolve => child.once('exit', resolve));
+      }
+    }
   });
 
   it('closes a staged scheduled placeholder whose own pendingPrompt is cancelled', async () => {

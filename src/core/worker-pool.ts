@@ -2,6 +2,8 @@ import { ensureClaudeFolderTrust } from './claude-folder-trust.js';
 export { ensureClaudeFolderTrust } from './claude-folder-trust.js';
 import { configuredCliExecutionMode, isWorkerCliExecution, type WorkerCliExecution } from './cli-execution-mode.js';
 import { SharedThreadClient, openSharedThread } from './shared-thread-opening.js';
+import { hasCleanlyDrainedQueuedActivationTail } from './queued-activation-drain.js';
+export { hasCleanlyDrainedQueuedActivationTail } from './queued-activation-drain.js';
 
 import { isLeadOnlySession } from './lead-only.js';
 import { decideAssistantAdmission, decideAssistantLiveInputAdmission } from './assistant-spawn.js';
@@ -14348,8 +14350,14 @@ function reconcileInstallChangeClaim(ds: DaemonSession): InstallClaimVerdict | u
         : promoteQueuedActivationTail(ds, { send: false }))
       : true;
     if (!promoted) {
-      logger.warn(`[${tag(ds)}] Activation tail remains queued after install claim ${verdict}`);
-      return verdict;
+      if (hasCleanlyDrainedQueuedActivationTail(ds)) {
+        ds.quarantinedActivationTailPromotion = undefined;
+        ds.initialStartPending = false;
+        ds.initialStartClaimToken = undefined;
+      } else {
+        logger.warn(`[${tag(ds)}] Activation tail remains queued after install claim ${verdict}`);
+        return verdict;
+      }
     }
     clearPendingSuspendClaim(ds, `install claim ${verdict}`);
   }
@@ -20632,8 +20640,7 @@ export function reconcileQueuedActivationOnWorkerDetach(ds: DaemonSession): void
       );
     }
     if (!promoted) {
-      if ((ds.session.queuedActivationTail?.length ?? 0) === 0
-        && !ds.session.queuedActivationPending) {
+      if (hasCleanlyDrainedQueuedActivationTail(ds)) {
         // An all-cancelled tail was pruned successfully; that is an empty
         // queue, not a promotion failure. Never manufacture a quarantine owner.
         ds.quarantinedActivationTailPromotion = undefined;
@@ -20764,6 +20771,12 @@ export function settleOfflineReconciledQueuedActivation(
       );
     }
     if (!promoted) {
+      if (hasCleanlyDrainedQueuedActivationTail(ds)) {
+        ds.quarantinedActivationTailPromotion = undefined;
+        ds.initialStartPending = false;
+        ds.initialStartClaimToken = undefined;
+        return 'settled_empty';
+      }
       ds.quarantinedActivationTailPromotion = true;
       ds.initialStartPending = true;
       return 'quarantined';
@@ -20942,6 +20955,12 @@ export function resolveQuarantinedForkPlan(
   if (!ds.quarantinedActivationTailPromotion) {
     return { fork: true, promptInput, resumeOrTurnId };
   }
+  if (hasCleanlyDrainedQueuedActivationTail(ds)) {
+    ds.quarantinedActivationTailPromotion = undefined;
+    ds.initialStartPending = false;
+    ds.initialStartClaimToken = undefined;
+    return { fork: true, promptInput, resumeOrTurnId };
+  }
   const content = typeof promptInput === 'string' ? promptInput : promptInput.content;
   if (content.length > 0) {
     logger.warn(
@@ -20960,6 +20979,12 @@ export function resolveQuarantinedForkPlan(
     );
   }
   if (!promotedQuarantined) {
+    if (hasCleanlyDrainedQueuedActivationTail(ds)) {
+      ds.quarantinedActivationTailPromotion = undefined;
+      ds.initialStartPending = false;
+      ds.initialStartClaimToken = undefined;
+      return { fork: true, promptInput, resumeOrTurnId };
+    }
     logger.warn(
       `[${tag(ds)}] Quarantined activation-tail promotion still failing at fork boundary; `
       + `keeping worker:null quarantined owner (no fork) to avoid a live worker beside an unpromoted tail`,

@@ -120,6 +120,19 @@ function clearCancelledActivationJournal(ds: DaemonSession, turnIds: ReadonlySet
   return true;
 }
 
+const CANCELLATION_SNAPSHOT_KEYS = [
+  'cancelledActivationTurnIds',
+  'queuedActivationTail',
+  'queuedActivationPending',
+  'queuedActivationToken',
+  'queuedActivationInput',
+  'queuedActivationTurnId',
+  'queuedActivationDispatchAttempt',
+  'queuedActivationResume',
+  'queuedActivationRawInput',
+  'queuedActivationRawTurnId',
+] as const;
+
 /** Retry the exact in-memory tombstone/tail/journal state before any later
  * promotion. A transient write failure must not become a permanent quarantine. */
 export function retryCancelledActivationPersistence(
@@ -127,11 +140,22 @@ export function retryCancelledActivationPersistence(
   update: (session: DaemonSession['session']) => void = sessionStore.updateSession,
 ): boolean {
   if (!ds.activationCancellationPending) return true;
+  const session = ds.session;
+  const target = session as unknown as Record<string, unknown>;
+  // sessionStore.updateSession restores the durable row into the caller's object
+  // on failure. Preserve the cancellation-owned snapshot across that rollback,
+  // or the next successful retry would promote the resurrected old tail.
+  const snapshot = CANCELLATION_SNAPSHOT_KEYS.flatMap(key => session[key] === undefined
+    ? []
+    : [[key, structuredClone(session[key])] as const]);
   try {
-    update(ds.session);
+    update(session);
     ds.activationCancellationPending = undefined;
     return true;
   } catch {
+    for (const key of CANCELLATION_SNAPSHOT_KEYS) delete target[key];
+    for (const [key, value] of snapshot) target[key] = value;
+    ds.activationCancellationPending = true;
     return false;
   }
 }
@@ -252,6 +276,41 @@ export function hasRecoverableActivationHead(
     && !(session.cancelledActivationTurnIds ?? []).includes(session.queuedActivationTurnId);
 }
 
+/** Terminate a local worker and prove its OS exit before the caller clears the
+ * session slot or releases a successor. Remote workers are never signalled by
+ * this generic path; their provider-specific close protocol owns retirement. */
+export async function retireCancelledActivationWorker(
+  worker: NonNullable<DaemonSession['worker']>,
+  opts: { remote: boolean; onExited: () => void },
+): Promise<boolean> {
+  const exited = () => worker.exitCode !== null || worker.signalCode !== null;
+  if (opts.remote && !exited()) return false;
+  const waitForExit = async (timeoutMs: number) => {
+    if (exited()) return;
+    await new Promise<void>(resolve => {
+      const timer = setTimeout(done, timeoutMs);
+      timer.unref?.();
+      function done(): void {
+        clearTimeout(timer);
+        worker.off('exit', done);
+        resolve();
+      }
+      worker.once('exit', done);
+    });
+  };
+  if (!exited()) {
+    try { worker.kill('SIGTERM'); } catch { /* already gone */ }
+    await waitForExit(5_000);
+  }
+  if (!exited()) {
+    try { worker.kill('SIGKILL'); } catch { /* already gone */ }
+    await waitForExit(1_000);
+  }
+  if (!exited()) return false;
+  opts.onExited();
+  return true;
+}
+
 /** After a proven retirement, an already-promoted human journal must not wait
  * for an unrelated inbound merely because the eager retry claim was cleared. */
 export async function releaseCancelledActivationWork(
@@ -262,12 +321,13 @@ export async function releaseCancelledActivationWork(
     scheduleRetry: () => void;
   },
 ): Promise<void> {
-  if (await deps.release()) return;
+  const released = await deps.release();
   if ((!ds.worker || ds.worker.killed)
     && ds.session.queuedActivationPending && ds.session.queuedActivationInput) {
     deps.startJournal();
     return;
   }
+  if (released) return;
   deps.scheduleRetry();
 }
 
