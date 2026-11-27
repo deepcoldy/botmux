@@ -78,6 +78,15 @@ describe('explicit topic launch choice', () => {
   ] as const)('rejects unsupported explicit writes %j %j', (cfg, input) => {
     expect(validateModelPin(input, cfg)).toBeTruthy();
   });
+  it('distinguishes Pi resume pinning from a model capability rejection', () => {
+    const input = { model: 'provider/new', effort: 'high' };
+    const piError = validateModelPin(input, { cliId: 'pi' });
+    const capabilityError = validateModelPin(input, { cliId: 'cursor' });
+    expect(piError).toBeTruthy();
+    expect(capabilityError).toBeTruthy();
+    // Do not pin prose: the two semantic failures must not share one message.
+    expect(piError).not.toBe(capabilityError);
+  });
   it('accepts model-capable CLIs without a curated model list and a second CLI effort', () => {
     expect(validateModelPin({ model: 'provider/new' }, { cliId: 'pi' })).toBeUndefined();
     expect(validateModelPin({ model: 'sonnet', effort: 'high' }, { cliId: 'claude-code' })).toBeUndefined();
