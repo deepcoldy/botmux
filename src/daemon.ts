@@ -515,6 +515,7 @@ import { isLocalCliOpenReady } from './services/local-cli-opener.js';
 import { RECEIVED_REACTION_EMOJI_TYPE, SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE } from './core/pending-response.js';
 import { t as tr, localeForBot } from './i18n/index.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
+import { antigravityTransport } from './services/antigravity-transport.js';
 import {
   initWorkerPool,
   setActiveSessionsRegistry,
@@ -588,6 +589,7 @@ import {
   sendFoldBackgroundUpdatesSetting,
   resetUsageLimitForNewTurn,
   scheduleUsageLimitPersistenceRetry,
+  resolveSessionEnvForSession,
 } from './core/worker-pool.js';
 import { notePromptCacheKeepaliveTurnStarted, runPromptCacheKeepaliveSweep, statuslineContextTokens } from './core/prompt-cache-keepalive.js';
 import { invalidateIdleAutoCompactRetryForTurn, isLocalCliCommand, noteIdleAutoCompactTurnStarted, runIdleAutoCompactSweep, type IdleAutoCompactNotice, type IdleAutoCompactRefusalReason } from './core/idle-auto-compact.js';
@@ -3444,13 +3446,25 @@ function resolveVcMeetingReceiverSession(sessionId: string): VcMeetingReceiverSe
   if (!ds) return undefined;
   try {
     const bot = getBot(ds.larkAppId);
-    const cliId = (ds.session.cliId as CliId | undefined) ?? bot.config.cliId;
-    const adapter = createCliAdapterSync(cliId, bot.config.cliPathOverride);
+    const cliId = (ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? bot.config.cliId) as CliId;
+    const cliPathOverride = ds.session.cliLaunchSnapshot?.cliPathOverride
+      ?? (cliId === bot.config.cliId ? bot.config.cliPathOverride : undefined);
     const backendType = resolvePairedSpawnBackendType(
       cliId,
       ds.initConfig?.backendType ?? ds.session.backendType,
       bot.config.backendType,
       config.daemon.backendType,
+    );
+    const sessionEnv = ds.initConfig
+      ? ds.initConfig.env
+      : resolveSessionEnvForSession(ds, bot.config, backendType).env;
+    const agyTransport = cliId.toLowerCase() === 'antigravity'
+      ? antigravityTransport(sessionEnv)
+      : undefined;
+    const adapter = createCliAdapterSync(
+      cliId,
+      cliPathOverride,
+      agyTransport ? { antigravityTransport: agyTransport } : undefined,
     );
     const isolation = evaluateVcMeetingConsumerIsolation({
       sandbox: ds.session.sandbox,
@@ -23238,6 +23252,9 @@ async function handleVcMeetingPush(ctx: VcMeetingPushContext): Promise<void> {
 export const __vcMeetingAgentTest = {
   handlePush: handleVcMeetingPush,
   handleCardAction: handleVcMeetingCardAction,
+  resolveReceiverSession: resolveVcMeetingReceiverSession,
+  registerReceiverMember: (raw: unknown, receiverAppId?: string) =>
+    registerVcMeetingMember(raw, vcMeetingDeliveryReceiverDeps(receiverAppId)),
   receiverSessionSnapshot: (sessionId: string) => {
     const ds = [...activeSessions.values()].find(candidate =>
       candidate.session.sessionId === sessionId);

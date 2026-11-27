@@ -11542,4 +11542,176 @@ describe('VC meeting daemon session lifecycle', () => {
     expect(JSON.parse(sentMessages[2].content).text).toContain('会议已结束，监听已停止');
     expect(__vcMeetingAgentTest.hasSession(APP_ID, 'm_final')).toBe(false);
   });
+
+  describe('antigravity transport reliableTurnTerminal receiver gate', () => {
+    function memberProjectionRequest(agentAppId: string, chatId: string, meetingId: string) {
+      return {
+        schemaVersion: 1,
+        meeting: {
+          listenerAppId: APP_ID,
+          meetingId,
+          ownerBootId: 'hub_boot_1',
+          ownerEpoch: 1,
+        },
+        member: {
+          memberId: 'minutes',
+          agentAppId,
+          role: 'minutes',
+          epoch: 1,
+          membershipGeneration: 1,
+          status: 'active',
+          joinedAtIngestSeq: 0,
+          responseMode: 'silent',
+          capabilities: ['meeting.read'],
+          ownedSinks: [],
+          sinkOwnerGeneration: 1,
+        },
+        outputRoute: { chatId },
+      };
+    }
+
+    it('rejects antigravity terminal mode with 422 turn_terminal_unsupported', async () => {
+      const agyAppId = 'cli_agent_agy_terminal';
+      registerBot({
+        larkAppId: agyAppId,
+        larkAppSecret: 'agent-secret',
+        name: 'Antigravity Terminal',
+        cliId: 'antigravity',
+        backendType: 'pty',
+        workingDir: process.cwd(),
+      });
+
+      const res = await __vcMeetingAgentTest.registerReceiverMember(
+        memberProjectionRequest(agyAppId, 'oc_agy_terminal', 'm_agy_terminal'),
+        agyAppId,
+      );
+      expect(res).toMatchObject({
+        status: 422,
+        body: { ok: false, errorCode: 'turn_terminal_unsupported' },
+      });
+
+      const session = [...__testOnly_activeSessions.values()].find(ds => ds.larkAppId === agyAppId);
+      expect(session).toBeDefined();
+      expect(__vcMeetingAgentTest.resolveReceiverSession(session!.session.sessionId)).toMatchObject({
+        agentAppId: agyAppId,
+        reliableTurnTerminal: false,
+      });
+    });
+
+    it('rejects antigravity explicit terminal mode with 422 turn_terminal_unsupported', async () => {
+      const agyAppId = 'cli_agent_agy_terminal_explicit';
+      registerBot({
+        larkAppId: agyAppId,
+        larkAppSecret: 'agent-secret',
+        name: 'Antigravity Explicit Terminal',
+        cliId: 'antigravity',
+        backendType: 'pty',
+        workingDir: process.cwd(),
+        env: { AGY_BOTMUX_TRANSPORT: 'terminal' },
+      });
+
+      const res = await __vcMeetingAgentTest.registerReceiverMember(
+        memberProjectionRequest(agyAppId, 'oc_agy_terminal_explicit', 'm_agy_terminal_explicit'),
+        agyAppId,
+      );
+      expect(res).toMatchObject({
+        status: 422,
+        body: { ok: false, errorCode: 'turn_terminal_unsupported' },
+      });
+    });
+
+    it('accepts antigravity ACP mode as reliableTurnTerminal and registers the receiver session', async () => {
+      const agyAppId = 'cli_agent_agy_acp';
+      registerBot({
+        larkAppId: agyAppId,
+        larkAppSecret: 'agent-secret',
+        name: 'Antigravity ACP',
+        cliId: 'antigravity',
+        backendType: 'pty',
+        workingDir: process.cwd(),
+        env: { AGY_BOTMUX_TRANSPORT: 'acp' },
+      });
+
+      const res = await __vcMeetingAgentTest.registerReceiverMember(
+        memberProjectionRequest(agyAppId, 'oc_agy_acp', 'm_agy_acp'),
+        agyAppId,
+      );
+      expect(res).toMatchObject({
+        status: 200,
+        body: { ok: true },
+      });
+      const receiverSessionId = (res.body as { receiverSessionId: string }).receiverSessionId;
+      expect(__vcMeetingAgentTest.resolveReceiverSession(receiverSessionId)).toMatchObject({
+        sessionId: receiverSessionId,
+        agentAppId: agyAppId,
+        chatId: 'oc_agy_acp',
+        reliableTurnTerminal: true,
+      });
+    });
+
+    it('fails closed when AGY_BOTMUX_TRANSPORT is invalid', async () => {
+      const agyAppId = 'cli_agent_agy_invalid';
+      registerBot({
+        larkAppId: agyAppId,
+        larkAppSecret: 'agent-secret',
+        name: 'Antigravity Invalid',
+        cliId: 'antigravity',
+        backendType: 'pty',
+        workingDir: process.cwd(),
+        env: { AGY_BOTMUX_TRANSPORT: 'invalid' },
+      });
+
+      const res = await __vcMeetingAgentTest.registerReceiverMember(
+        memberProjectionRequest(agyAppId, 'oc_agy_invalid', 'm_agy_invalid'),
+        agyAppId,
+      );
+      expect(res).toMatchObject({
+        status: 503,
+        body: { ok: false, errorCode: 'receiver_session_unavailable' },
+      });
+      const session = [...__testOnly_activeSessions.values()].find(ds => ds.larkAppId === agyAppId);
+      expect(session).toBeDefined();
+      expect(__vcMeetingAgentTest.resolveReceiverSession(session!.session.sessionId)).toBeUndefined();
+    });
+
+    it('honors frozen initConfig env and cliLaunchSnapshot session-env isolation', async () => {
+      const agyAppId = 'cli_agent_agy_session_scope';
+      registerBot({
+        larkAppId: agyAppId,
+        larkAppSecret: 'agent-secret',
+        name: 'Antigravity ACP Scoped',
+        cliId: 'antigravity',
+        backendType: 'pty',
+        workingDir: process.cwd(),
+        env: { AGY_BOTMUX_TRANSPORT: 'acp' },
+      });
+
+      // Live session originally spawned under terminal transport must stay false
+      // even after the bot config switches to ACP.
+      const res = await __vcMeetingAgentTest.registerReceiverMember(
+        memberProjectionRequest(agyAppId, 'oc_agy_frozen', 'm_agy_frozen'),
+        agyAppId,
+      );
+      expect(res.status).toBe(200);
+      const sid = (res.body as { receiverSessionId: string }).receiverSessionId;
+      const ds = [...__testOnly_activeSessions.values()].find(candidate => candidate.session.sessionId === sid)!;
+      ds.initConfig = {
+        type: 'init',
+        sessionId: sid,
+        workingDir: process.cwd(),
+        cliId: 'antigravity',
+        backendType: 'pty',
+        env: {},
+      } as any;
+      expect(__vcMeetingAgentTest.resolveReceiverSession(sid)?.reliableTurnTerminal).toBe(false);
+
+      // Cold session with /cli cliLaunchSnapshot does not receive bot.env in worker-pool.
+      ds.initConfig = undefined;
+      ds.session.cliLaunchSnapshot = {
+        state: 'pending',
+        cliId: 'antigravity',
+      } as any;
+      expect(__vcMeetingAgentTest.resolveReceiverSession(sid)?.reliableTurnTerminal).toBe(false);
+    });
+  });
 });
