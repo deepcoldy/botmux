@@ -1329,6 +1329,20 @@ describe('codex-app buildArgs', () => {
     expect(args).not.toContain('--strict-resume');
   });
 
+  it('passes the frozen join bootstrap and replay fingerprint to the runner', () => {
+    const previous = { digest: 'a'.repeat(64), length: 42 };
+    const args = adapter.buildArgs({
+      sessionId: 'sess-app', resume: false,
+      groupJoinPrompt: '入群后等待真实任务', groupJoinTitleBootstrap: previous,
+    });
+    const promptIndex = args.indexOf('--group-join-prompt');
+    const digestIndex = args.indexOf('--group-join-title-digest');
+    const lengthIndex = args.indexOf('--group-join-title-length');
+    expect(args[promptIndex + 1]).toBe('入群后等待真实任务');
+    expect(args[digestIndex + 1]).toBe(previous.digest);
+    expect(args[lengthIndex + 1]).toBe('42');
+  });
+
   it('disables the runner fallback catalogue when the bare Codex runtime cannot attest the provider', () => {
     const direct = adapter.buildArgs({ sessionId: 'sess-app', resume: false });
     expect(direct).not.toContain('--codex-reasoning-catalog');
