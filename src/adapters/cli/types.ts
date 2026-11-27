@@ -206,6 +206,7 @@ export interface CliLaunchNotice {
   minVersion: string;
 }
 
+/** Options for {@link CliAdapter.detectModels}. */
 export interface CliModelDetectionOptions {
   /** Effective process environment after inheritance and configured overlays. */
   env?: NodeJS.ProcessEnv;
@@ -214,6 +215,13 @@ export interface CliModelDetectionOptions {
   /** Claude only: false forbids falling back to the caller's implicit ~/.claude.
    *  An explicit configDir remains allowed. Defaults to true for daemon probes. */
   allowImplicitConfigRoot?: boolean;
+  /** `env` belongs to a separately launched core rather than this process:
+   *  the probe must run in it and inherit nothing from here. Set by the model
+   *  catalog when its caller probes for such a core (the WeCom Dashboard
+   *  configuration for its managed core). Adapters whose established probe
+   *  runs in this process's own environment switch to `env` only when this
+   *  is set; adapters that already use `env` may ignore it. */
+  isolatedEnv?: boolean;
 }
 
 export interface CliAdapter {

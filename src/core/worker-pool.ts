@@ -1,3 +1,5 @@
+import { NATIVE_GATEWAY_CORE_CREDENTIAL_ENV } from './native-gateway-credential.js';
+import { rememberCoreOnlyGoal, rememberCoreOnlyLimit } from './core-only-progress.js';
 import { ensureClaudeFolderTrust } from './claude-folder-trust.js';
 export { ensureClaudeFolderTrust } from './claude-folder-trust.js';
 import { configuredCliExecutionMode, isWorkerCliExecution, type WorkerCliExecution } from './cli-execution-mode.js';
@@ -128,7 +130,7 @@ import { statSync, lstatSync, readFileSync, readdirSync, mkdirSync, existsSync, 
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { fileURLToPath } from 'node:url';
 import { ensureSkills, ensureAskSkill, ensurePluginSkills, ensureWhiteboardSkill, ensureChatManagerSkill, removeWorkflowSkills, removeGlobalBotmuxSkills } from '../skills/installer.js';
-import { shouldInstallGlobalSkills } from '../skills/injection-mode.js';
+import { builtinSkillsOffered, shouldInstallGlobalSkills } from '../skills/injection-mode.js';
 import { whiteboardEnabled } from '../services/whiteboard-store.js';
 import { cliSupportsNativeUsage, resolveSessionTranscriptPath } from '../services/transcript-resolver.js';
 import { confirmCodexModelLaunch, readCodexModelLaunchReceipt, readCodexModelSettingsCursor, refreshCodexModelSelection, recordCodexModelLaunch, resetCodexModelSelection, supportsCodexModelSelection } from '../services/codex-model-selection.js';
@@ -1361,8 +1363,10 @@ const TRANSFER_FORCE_EXIT_MS = 500;
 // graceful-exit sentinel for the daemon/dashboard cores only (see
 // pm2-graceful-exit.ts): a worker (or the CLI child it forks — redactChildEnv
 // strips it there too) that inherited it would exit 90 instead of 0 on a
-// clean foreground stop, which a supervisor reads as a crash.
-const WORKER_REDACTED_ENV_KEYS = ['GITHUB_TOKEN', 'GH_TOKEN', 'BOTMUX_PM2_GRACEFUL_EXIT_CODE', 'BOTMUX_LINK_REFS_MODE', 'BOTMUX_LINK_REF_TURN_MODE', 'BOTMUX_HOST_RELAY_AUTHORIZED', PROTECTED_HTTP_EGRESS_SOCKET_ENV, PROTECTED_MCP_SECRET_FD_ENV] as const;
+// clean foreground stop, which a supervisor reads as a crash. A native gateway
+// core's credential (core/native-gateway-credential.ts) never reaches a worker
+// either; its entry already removed it from the daemon's own environment.
+const WORKER_REDACTED_ENV_KEYS = ['GITHUB_TOKEN', 'GH_TOKEN', 'BOTMUX_PM2_GRACEFUL_EXIT_CODE', 'BOTMUX_LINK_REFS_MODE', 'BOTMUX_LINK_REF_TURN_MODE', 'BOTMUX_HOST_RELAY_AUTHORIZED', PROTECTED_HTTP_EGRESS_SOCKET_ENV, PROTECTED_MCP_SECRET_FD_ENV, NATIVE_GATEWAY_CORE_CREDENTIAL_ENV] as const;
 
 function workerForkEnv(base: NodeJS.ProcessEnv, protectedEnvKeys: readonly string[] = []): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
@@ -9937,22 +9941,28 @@ export function ensureCliSkills(cliId: CliId, cliPathOverride?: string, opts?: C
   // leak), so they always materialise their plugin dir — the builtin-injection
   // mode does not apply to them. Everything below the branch is the global-dir
   // path (codex/opencode/…) where the mode decides whether we install.
+  // A native gateway's core offers no built-in skills and must neither write nor
+  // prune the skill dirs below — they are shared with the Feishu fleet on this
+  // host (builtinSkillsOffered). Its hooks are installed as everywhere else.
+  const offerSkills = builtinSkillsOffered();
   if (adapter.pluginDir) {
     const pluginSkillsDir = join(adapter.pluginDir, 'skills');
-    // 白板 skill 每次 spawn 重新评估（跟随运行时开关），不进 once-cache。
-    ensureWhiteboardSkill(cliId, pluginSkillsDir, whiteboardEnabled());
-    // 群负责人 skill：plugin-dir 机器共享，任一 bot 开启即落盘；真正 per-bot
-    // 授权在 daemon IPC，关闭开关的 bot 调 set 会被拒。每次 spawn 重新评估。
-    ensureChatManagerSkill(cliId, pluginSkillsDir, getAllBots().some(b => b.config.chatManagerEnabled === true));
-    // Workflow skill 家族不常驻：只在确定要用工作流时由 agent 按需
-    // `botmux skill show`。每次 spawn 清掉旧版本写进插件目录的残留。
-    removeWorkflowSkills(cliId, pluginSkillsDir);
-    // 内置 skill 文件跟随用户自定义（正文覆盖 / 停用），必须每次 spawn 重新落盘
-    // ——与上面白板 / workflow 同样放在 once-cache 之前，否则改了 skill 正文或
-    // 停用某 skill 后，claude 家族（--plugin-dir）的新会话仍读旧文件、要等 daemon
-    // 重启才生效，和自定义页「下一个会话即生效」不符。ensureSkills 幂等（内容相同
-    // 则跳过），每次 spawn 的代价只是几个小文件的读比对。
-    ensurePluginSkills(cliId, adapter.pluginDir);
+    if (offerSkills) {
+      // 白板 skill 每次 spawn 重新评估（跟随运行时开关），不进 once-cache。
+      ensureWhiteboardSkill(cliId, pluginSkillsDir, whiteboardEnabled());
+      // 群负责人 skill：plugin-dir 机器共享，任一 bot 开启即落盘；真正 per-bot
+      // 授权在 daemon IPC，关闭开关的 bot 调 set 会被拒。每次 spawn 重新评估。
+      ensureChatManagerSkill(cliId, pluginSkillsDir, getAllBots().some(b => b.config.chatManagerEnabled === true));
+      // Workflow skill 家族不常驻：只在确定要用工作流时由 agent 按需
+      // `botmux skill show`。每次 spawn 清掉旧版本写进插件目录的残留。
+      removeWorkflowSkills(cliId, pluginSkillsDir);
+      // 内置 skill 文件跟随用户自定义（正文覆盖 / 停用），必须每次 spawn 重新落盘
+      // ——与上面白板 / workflow 同样放在 once-cache 之前，否则改了 skill 正文或
+      // 停用某 skill 后，claude 家族（--plugin-dir）的新会话仍读旧文件、要等 daemon
+      // 重启才生效，和自定义页「下一个会话即生效」不符。ensureSkills 幂等（内容相同
+      // 则跳过），每次 spawn 的代价只是几个小文件的读比对。
+      ensurePluginSkills(cliId, adapter.pluginDir);
+    }
     if (skillsInstalledCliIds.has(installKey)) return;
     // Hook 接管与 botmux-ask 兜底 skill 不随自定义变化 → 每个 daemon 生命周期装一次即可。
     if (adapter.hookInstall) {
@@ -9963,7 +9973,7 @@ export function ensureCliSkills(cliId: CliId, cliPathOverride?: string, opts?: C
       try { adapter.ensureAskHook(); }
       catch (err) { logger.warn(`[hook] ensureAskHook failed for ${cliId}: ${err instanceof Error ? err.message : String(err)}`); }
     }
-    ensureAskSkill(cliId, pluginSkillsDir, !adapter.asksViaHook);
+    if (offerSkills) ensureAskSkill(cliId, pluginSkillsDir, !adapter.asksViaHook);
     skillsInstalledCliIds.add(installKey);
     return;
   }
@@ -9974,26 +9984,28 @@ export function ensureCliSkills(cliId: CliId, cliPathOverride?: string, opts?: C
   // those modes deliver the skills via the session prompt instead (see
   // session-manager buildNewTopicPrompt + skills/injection-mode.ts).
   const skillsDir = adapter.skillsDir;
-  const globalInstall = skillsDir ? shouldInstallGlobalSkills(skillsDir) : false;
-  // 白板 skill + 泄漏清理都**每次 spawn 重新评估**（在 once-cache 之前），保证在
-  // CLI 真正执行前生效——而不仅在 daemon 启动那一次：
-  //  - 白板：跟随运行时开关，仅 global 模式落全局盘。
-  //  - prompt/off 泄漏清理：每个新会话拉起 CLI 前，把共享 skills 目录里的 botmux
-  //    技能清掉。这样「运行时从 global 切到 prompt/off」「旧版本或外部重新写入的
-  //    残留」都会在下一个会话的 CLI 启动前被扫干净，用户手动跑的独立 codex/opencode
-  //    立刻不再看到 botmux 技能，无需等 daemon 重启。只动 `botmux-` 命名空间，
-  //    绝不碰用户自定义 skill。
-  ensureWhiteboardSkill(cliId, skillsDir, globalInstall && whiteboardEnabled());
-  // 群负责人 skill 同理：仅 global 模式落共享盘，且任一 bot 开启才落。
-  ensureChatManagerSkill(cliId, skillsDir, globalInstall && getAllBots().some(b => b.config.chatManagerEnabled === true));
-  // Workflow skill 家族不常驻（global 模式也不落盘），按需 `botmux skill show`；
-  // 清掉旧版本在 global 模式下写进共享目录的残留。
-  removeWorkflowSkills(cliId, skillsDir);
-  if (!globalInstall && skillsDir) removeGlobalBotmuxSkills(skillsDir);
-  // 内置 skill 文件跟随用户自定义（正文覆盖 / 停用），必须每次 spawn 重新落盘
-  // ——同白板 / workflow 放在 once-cache 之前。global 模式落全局盘；幂等（内容相同
-  // 则跳过），停用的 skill 目录会被 ensureSkills 内部清掉，下一个会话即生效。
-  if (globalInstall) ensureSkills(cliId, skillsDir);
+  const globalInstall = offerSkills && skillsDir ? shouldInstallGlobalSkills(skillsDir) : false;
+  if (offerSkills) {
+    // 白板 skill + 泄漏清理都**每次 spawn 重新评估**（在 once-cache 之前），保证在
+    // CLI 真正执行前生效——而不仅在 daemon 启动那一次：
+    //  - 白板：跟随运行时开关，仅 global 模式落全局盘。
+    //  - prompt/off 泄漏清理：每个新会话拉起 CLI 前，把共享 skills 目录里的 botmux
+    //    技能清掉。这样「运行时从 global 切到 prompt/off」「旧版本或外部重新写入的
+    //    残留」都会在下一个会话的 CLI 启动前被扫干净，用户手动跑的独立 codex/opencode
+    //    立刻不再看到 botmux 技能，无需等 daemon 重启。只动 `botmux-` 命名空间，
+    //    绝不碰用户自定义 skill。
+    ensureWhiteboardSkill(cliId, skillsDir, globalInstall && whiteboardEnabled());
+    // 群负责人 skill 同理：仅 global 模式落共享盘，且任一 bot 开启才落。
+    ensureChatManagerSkill(cliId, skillsDir, globalInstall && getAllBots().some(b => b.config.chatManagerEnabled === true));
+    // Workflow skill 家族不常驻（global 模式也不落盘），按需 `botmux skill show`；
+    // 清掉旧版本在 global 模式下写进共享目录的残留。
+    removeWorkflowSkills(cliId, skillsDir);
+    if (!globalInstall && skillsDir) removeGlobalBotmuxSkills(skillsDir);
+    // 内置 skill 文件跟随用户自定义（正文覆盖 / 停用），必须每次 spawn 重新落盘
+    // ——同白板 / workflow 放在 once-cache 之前。global 模式落全局盘；幂等（内容相同
+    // 则跳过），停用的 skill 目录会被 ensureSkills 内部清掉，下一个会话即生效。
+    if (globalInstall) ensureSkills(cliId, skillsDir);
+  }
 
   if (skillsInstalledCliIds.has(installKey)) return;
   // 以下都不随自定义变化 → 每个 daemon 生命周期装一次即可。
@@ -10009,7 +10021,7 @@ export function ensureCliSkills(cliId: CliId, cliPathOverride?: string, opts?: C
   }
   // botmux-ask 兜底 skill 也只在 global 模式落全局盘；prompt 模式它进 catalog，
   // off 模式靠 `botmux ask`（见 help）。
-  ensureAskSkill(cliId, skillsDir, globalInstall && !adapter.asksViaHook);
+  if (offerSkills) ensureAskSkill(cliId, skillsDir, globalInstall && !adapter.asksViaHook);
   skillsInstalledCliIds.add(installKey);
 }
 
@@ -10040,6 +10052,8 @@ const GLOBAL_CURSOR_SKILLS_DIR = '~/.cursor/skills';
  *  leak that would otherwise surface (and mis-fire) in the user's standalone CLI.
  *  Idempotent & best-effort — safe to call repeatedly. */
 export function sweepGlobalBotmuxSkills(): void {
+  // Shared with the Feishu fleet; a native gateway's core leaves them alone.
+  if (!builtinSkillsOffered()) return;
   removeGlobalBotmuxSkills(GLOBAL_CLAUDE_SKILLS_DIR);
   removeGlobalBotmuxSkills(GLOBAL_PI_SKILLS_DIR);
   removeGlobalBotmuxSkills(GLOBAL_OMP_SKILLS_DIR);
@@ -27564,6 +27578,7 @@ function setupWorkerHandlers(
 
       case 'goal_update': {
         if (!ownsWorkerSession()) break;
+        rememberCoreOnlyGoal(ds, msg, ds.workerGeneration);
         const binding = `${ds.larkAppId}:${ds.chatId}:${sessionAnchorId(ds)}:${ds.session.sessionId}`;
         if (msg.goal) {
           const hidden = !goalCardOwns() || ds.session.headless || !!ds.adoptedFrom || !!ds.session.vcMeetingReceiver || isDocNativeSession(ds)
@@ -27870,7 +27885,12 @@ function setupWorkerHandlers(
         if (msg.sessionId && msg.sessionId !== ds.session.sessionId) break;
         // Cache even when the CoT switches are off — `/cot show` uses this to
         // summon the bubble mid-turn with everything accumulated so far.
-        ds.lastThinkingUpdate = { entries: msg.entries, turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt };
+        ds.lastThinkingUpdate = {
+          entries: msg.entries,
+          turnId: msg.turnId,
+          dispatchAttempt: msg.dispatchAttempt,
+          workerGeneration: ds.workerGeneration,
+        };
         const replyMode = replyCardModeFor(ds, msg.turnId);
         if (replyMode !== 'legacy') {
           if (!managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
@@ -27959,6 +27979,7 @@ function setupWorkerHandlers(
           handlePreReadyAntigravityFrame(msg, screenTurnId);
           break;
         }
+        rememberCoreOnlyLimit(ds, msg, screenTurnId, ds.workerGeneration);
         // Project the frame's effective usage-limit state once via the shared
         // daemon SSOT pipeline (consumed filter, turn-scoped reconciliation,
         // atomic persistence, and single trigger edge).

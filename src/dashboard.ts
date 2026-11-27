@@ -1,3 +1,4 @@
+import { WecomDashboard } from './dashboard/wecom/index.js';
 import { selectSessionPage } from './dashboard/session-pagination.js';
 import { createSessionContentSearch } from './dashboard/session-content-search.js';
 import { TopicIndexError } from './services/topic-search/query.js';
@@ -575,6 +576,13 @@ try {
 } catch (error) {
   logger.warn(`[dashboard] Failed to sweep expired plugin results: ${(error as Error).message}`);
 }
+const wecom = new WecomDashboard({
+  secret: SECRET,
+  audit: dashboardControlAudit,
+  resolveActor: dashboardRequestIdentity,
+  isAuthSessionLive: terminalAuthSessionLive,
+  dashboardPort: () => boundDashboardPort,
+});
 const terminalControl = new TerminalControlManager({
   secret: SECRET,
   audit: dashboardControlAudit,
@@ -658,6 +666,7 @@ const controlCsrfTokens = new ControlCsrfTokens();
  */
 function endDashboardAuthSession(authSessionId: string): void {
   terminalControl.releaseByAuthSession(authSessionId);
+  wecom.releaseAuthSession(authSessionId);
   previewInteraction.relockAuthSession(authSessionId);
   authSessionConnections.closeAuthSession(authSessionId);
   controlCsrfTokens.revokeAuthSession(authSessionId);
@@ -1606,6 +1615,19 @@ function dashboardBotNameLookup(configs?: readonly BotConfig[]): (larkAppId: str
     liveName: (appId) => registry.getByAppId(appId)?.botName,
     dataDir: config.session.dataDir,
   });
+}
+
+/**
+ * Whether this host has a Feishu fleet: bots.json lists at least one bot. A
+ * missing registry (a WeCom-only host) counts as no fleet; an unreadable or
+ * malformed one counts as a fleet, so provider fallbacks stay off when unsure.
+ */
+function fleetBotsConfigured(): boolean {
+  try {
+    return loadBotConfigsCached().length > 0;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException | undefined)?.code !== 'ENOENT';
+  }
 }
 
 /** Workflow run view names (online and offline bots alike). */
@@ -4526,6 +4548,7 @@ const server = createServer(async (req, res) => {
     // sessions and countersigned for the worker, which refuses one that arrived
     // any other way. That is why the view-link API hands out a same-origin path
     // instead of the daemon/worker origin — this is the only door.
+    if (await wecom.terminalHttp(req, res, url)) return;
     if (terminalFrontProxy.handleHttp(req, res, url)) return;
 
     if (await pluginWebhookRoutes.handle(req, res, url)) {
@@ -4858,6 +4881,11 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    if (await wecom.handleSessionApi(req, res, url, {
+      hostAdmin: legacyAuthed && requestIdentity?.kind === 'legacy-dashboard',
+      csrfValid: () => Boolean(requestIdentity && enforceControlCsrf(req, res, requestIdentity)),
+      readBody: async () => await readJsonBody(req) as Record<string, unknown>,
+    })) return;
     // Server-authoritative terminal control lease. The API returns only mode
     // and timestamps; its signed read/write grant stays inside the central
     // proxy and is never placed in a URL or response body.
@@ -4934,6 +4962,30 @@ const server = createServer(async (req, res) => {
 
     if (url.pathname.startsWith('/api/feedback/analytics/')) {
       await handleFeedbackAnalyticsApi(req, res, url, { service: (await getFeedbackStorage(config.session.dataDir)).analytics });
+      return;
+    }
+    // WeCom onboarding jobs share the `/api/bot-onboarding/` prefix but live in
+    // their own `wecom-` namespace (`wecom-jobs`, `wecom-<uuid>[/action]`;
+    // Feishu job ids are `bot_*` / `botperm_*`). Only that namespace requires
+    // an identified manager plus the control CSRF token. Feishu onboarding
+    // routes keep the original gate (global auth + sessionWriteOriginAllowed):
+    // SPA tabs opened before an upgrade and the permission-recovery helpers do
+    // not send `x-botmux-csrf`. WeCom `start` is a body-selected platform on
+    // the shared route; its own branch below enforces the same CSRF check.
+    if (wecom.isOnboardingPath(url.pathname)) {
+      if (!authed || !requestIdentity) return jsonRes(res, 403, { error: 'onboarding_management_required' });
+      if (!enforceControlCsrf(req, res, requestIdentity)) return;
+      const handled = await wecom.handleOnboardingApi(req, res, url, {
+        actor: requestIdentity,
+        hostAdmin: legacyAuthed && requestIdentity.kind === 'legacy-dashboard',
+        csrfValid: () => true,
+      });
+      if (handled) return;
+    }
+    if (url.pathname.startsWith('/api/wecom/')) {
+      const hostAdmin = legacyAuthed && requestIdentity?.kind === 'legacy-dashboard';
+      if (hostAdmin && req.method !== 'GET' && !enforceControlCsrf(req, res, requestIdentity!)) return;
+      await wecom.handleConnectionsApi(req, res, url, { hostAdmin, csrfValid: hostAdmin, readBody: async () => await readJsonBody(req) as Record<string, unknown> });
       return;
     }
     if (url.pathname.startsWith('/api/feedback/storage')) {
@@ -5145,34 +5197,39 @@ const server = createServer(async (req, res) => {
       const nameOf = dashboardBotNameLookup();
       groupsMatrixSnapshot.warm();
       const groupPresentation = groupsMatrixSnapshot.peekPresentation();
-      let page: ReturnType<typeof selectSessionPage<ReturnType<typeof aggregator.getSessions>[number]>>;
+      // Private providers enter the list only after host-admin authentication,
+      // before sorting, search and pagination (including totals/cursors).
+      const hostAdmin = legacyAuthed && requestIdentity?.kind === 'legacy-dashboard';
+      // The board tells the host admin whether WeCom connections exist, so the browser only
+      // asks /api/wecom/* when there is something to show. Without connections there are no
+      // WeCom sessions to read and both provider fields are omitted: a Feishu-only deployment
+      // gets exactly the pre-WeCom body.
+      const wecomConnections = hostAdmin ? wecom.connectionCount() : 0;
+      const privateSnapshot = wecomConnections > 0 ? await wecom.sessionSnapshot() : { sessions: [], complete: false };
+      const merged = wecom.mergeSessionSnapshot<Record<string, unknown> & { sessionId: string }>(aggregator.getSessions(), hostAdmin, privateSnapshot);
+      const providerFields = {
+        ...(merged.wecomSessionIds ? { wecomSessionIds: merged.wecomSessionIds } : {}),
+        ...(wecomConnections > 0 ? { wecomConnectionCount: wecomConnections } : {}),
+      };
+      const rows=merged.sessions;
+      let page: ReturnType<typeof selectSessionPage<(typeof rows)[number]>>;
       try {
-        const rows = aggregator.getSessions();
-        page = selectSessionPage(rows, url.searchParams, {
-          // ⌘K / Workbench search also matches the names the browser displays
-          // beside a row: the current bot name and the group name.
-          searchText: row => [
-            row.larkAppId ? nameOf(row.larkAppId) : undefined,
-            typeof row.chatId === 'string' ? groupPresentation.get(row.chatId)?.name : undefined,
-          ],
-        });
+        page = selectSessionPage(rows, url.searchParams, {searchText: row => [
+          typeof row.larkAppId === 'string' ? nameOf(row.larkAppId) : undefined,
+          typeof row.chatId === 'string' ? groupPresentation.get(row.chatId)?.name : undefined,
+        ]});
         if (url.searchParams.get('view') === 'content') {
           page = await sessionContentSearch(url.searchParams.get('q') ?? '', sessionBoardAudience, rows);
         }
-      }
-      catch (error) {
-        return jsonRes(res, 400, { ok: false, error: error instanceof Error ? error.message : 'invalid_session_page' });
-      }
-      const sessions = enrichSessionsWithGroupNames(page.sessions.map(s => {
-        const n = s.larkAppId ? nameOf(s.larkAppId) : undefined;
-        return n && n !== s.botName ? { ...s, botName: n } : s;
-      }), groupPresentation);
-      const browserSessions = projectSessionPreviewsForBrowser(sessions);
-      lazyTopicLinkBackfill.trigger(browserSessions);
-      return jsonRes(res, 200, {
-        ...page,
-        sessions: projectSessionsForAudience(browserSessions, sessionBoardAudience),
-      });
+      } catch (error) { return jsonRes(res, 400, {ok:false,error:error instanceof Error ? error.message : 'invalid_session_page'}); }
+      const larkRows = page.sessions.filter(row=>row.provider!=='wecom') as ReturnType<typeof aggregator.getSessions>;
+      const enriched = enrichSessionsWithGroupNames(larkRows.map(row=>{
+        const name=row.larkAppId?nameOf(row.larkAppId):undefined;return name&&name!==row.botName?{...row,botName:name}:row;
+      }),groupPresentation);
+      const browserLark = projectSessionPreviewsForBrowser(enriched);
+      lazyTopicLinkBackfill.trigger(browserLark);
+      const projected = new Map((projectSessionsForAudience(browserLark,sessionBoardAudience) as Array<Record<string,unknown>&{sessionId:string}>).map(row=>[row.sessionId,row]));
+      return jsonRes(res,200,{...page,...providerFields,sessions:page.sessions.flatMap(row=>row.provider==='wecom'?[row]:projected.has(row.sessionId)?[projected.get(row.sessionId)!]:[])});
     }
 
     // Desktop / operator UI: aggregate pending ask-hooks across daemons.
@@ -6423,7 +6480,13 @@ const server = createServer(async (req, res) => {
     // ─── Customization center (built-in prompt/skill overrides) ──────────────
     // GET is a public read (overview only, no secrets); all mutations are
     // owner-gated (not on PUBLIC_READ_PATHS → decideDashboardAuth 401s guests).
-    if (await handleCustomizationApi(req, res, url)) {
+    // `?scope=wecom` is a WeCom surface: host admin only, writes CSRF-checked —
+    // the same test the `/api/wecom/*` routes apply above. The Feishu scope
+    // never consults it.
+    if (await handleCustomizationApi(req, res, url, {
+      wecomHostAdmin: legacyAuthed && requestIdentity?.kind === 'legacy-dashboard',
+      wecomCsrfValid: () => Boolean(requestIdentity && enforceControlCsrf(req, res, requestIdentity)),
+    })) {
       return;
     }
 
@@ -6546,6 +6609,7 @@ const server = createServer(async (req, res) => {
         // ttadk 模型默认值 + 候选 (单一事实源在 cli-selection), 供前端模型框使用.
         ttadkModelDefault: TTADK_DEFAULT_MODEL,
         ttadkModelSuggestions: TTADK_MODEL_SUGGESTIONS,
+        canCreateWecomBot: legacyAuthed && requestIdentity?.kind === 'legacy-dashboard',
         suggestedAppName: botOnboarding.suggestedAppName(),
         // 未探测时整个字段缺席 (而不是 webSession: undefined)——JSON 里两者都不
         // 出现, 但显式写清意图: 调用方拿不到就该自己带 ?probe=session 再要一次,
@@ -6622,6 +6686,7 @@ const server = createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/bot-onboarding/start') {
       const MAX_ONBOARDING_BODY_BYTES = 64 * 1024;
       let parsed: {
+        platform?: unknown;
         appName?: unknown;
         cloneSourceAppId?: unknown;
         registrationMode?: unknown;
@@ -6654,6 +6719,22 @@ const server = createServer(async (req, res) => {
         parsed = raw ? JSON.parse(raw) : {};
       } catch {
         return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      if (parsed.platform === 'wecom') {
+        if (!legacyAuthed || requestIdentity?.kind !== 'legacy-dashboard') return jsonRes(res, 403, { ok: false, error: 'wecom_host_admin_required' });
+        // Same CSRF requirement as the `wecom-` job routes above; the Feishu
+        // branch of this shared route keeps its original gate.
+        if (!enforceControlCsrf(req, res, requestIdentity)) return;
+        try {
+          const job = await wecom.startOnboarding(parsed as Record<string, unknown>, requestIdentity);
+          return jsonRes(res, 202, { job });
+        } catch (error) {
+          const code = error instanceof Error && /^wecom_[a-z_]+$/.test(error.message) ? error.message : 'wecom_invalid_onboarding';
+          return jsonRes(res, 400, { ok: false, error: code });
+        }
+      }
+      if (parsed.platform !== undefined && parsed.platform !== 'lark' && parsed.platform !== 'feishu') {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_platform' });
       }
       try {
         assertBotsJsonValidOrAbsent(BOTS_JSON_PATH);
@@ -8369,6 +8450,10 @@ const server = createServer(async (req, res) => {
     // 原文查看与 tmux server 改动只给本机 owner（legacyAuthed），见 dashboard/session-env-api.ts。
     if (await handleSessionEnvRoute(req, res, url, {
       canReveal: legacyAuthed,
+      providerMachineHost: {
+        fleetConfigured: fleetBotsConfigured,
+        request: (path, init) => wecom.machineEnvironment(path, init),
+      },
       daemons: () => registry.list(),
       proxyToDaemon,
       readJsonBody: body => readJsonBody(body),
@@ -8827,7 +8912,15 @@ const server = createServer(async (req, res) => {
         const frame = roster.next(online);
         if (frame) stream.write(frame.event, { body: frame.body });
       });
-      res.on('close', () => { off(); offRoster(); clearInterval(hb); stream.dispose(); });
+      // WeCom sessions never travel on this stream. A host admin's stream (the
+      // test /api/sessions merges WeCom rows under) hears only that they changed,
+      // in a frame without data, and reads them from /api/wecom/sessions; every
+      // other stream subscribes to nothing.
+      const offWecomSessions = wecom.watchSessions(
+        legacyAuthed && requestIdentity?.kind === 'legacy-dashboard',
+        event => { stream.write(event, {}); },
+      );
+      res.on('close', () => { off(); offRoster(); offWecomSessions(); clearInterval(hb); stream.dispose(); });
       return;
     }
 
@@ -8881,7 +8974,7 @@ oauthCallbackServer.listen(9768, '127.0.0.1', () => {
 // request line + headers verbatim, then pipe both directions. Mirrors how
 // terminal-proxy.ts bridges to the worker. Non-`/s/*` upgrades are dropped (the
 // dashboard SPA uses SSE, not WebSocket).
-server.on('upgrade', (req: IncomingMessage, clientSocket: Duplex, head: Buffer) => {
+server.on('upgrade', async (req: IncomingMessage, clientSocket: Duplex, head: Buffer) => {
   try {
     const rawUrl = req.url ?? '/';
     // Preview 的 WS 必须第一个判：沙箱化之后它来自不透明来源（`Origin: null`），
@@ -8913,6 +9006,7 @@ server.on('upgrade', (req: IncomingMessage, clientSocket: Duplex, head: Buffer) 
     if (upgradeRoute.route === 'host-terminal') {
       if (hostTerminalManager.handleUpgrade(req, clientSocket, head)) return;
     }
+    if (await wecom.terminalUpgrade(req, clientSocket, head)) return;
     if (terminalFrontProxy.handleUpgrade(req, clientSocket, head)) return;
     clientSocket.destroy();
   } catch {

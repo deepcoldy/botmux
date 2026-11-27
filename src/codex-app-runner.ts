@@ -80,6 +80,9 @@ interface Args {
   titlePrefix?: string;
   botOpenId?: string;
   locale?: string;
+  /** Set by the adapter only in a native IM gateway's core (the runner, a CLI
+   *  child, never sees that marker): instructions describe the channel gateway. */
+  nativeGateway?: boolean;
   model?: string;
   reasoningEffort?: string;
   allowReasoningCatalog: boolean;
@@ -303,6 +306,7 @@ function parseArgs(argv: string[]): Args {
     else if (key === '--title-prefix' && val !== undefined) { out.titlePrefix = normalizeCodexAppTitlePrefix(val); i++; }
     else if (key === '--bot-open-id' && val !== undefined) { out.botOpenId = val; i++; }
     else if (key === '--locale' && val !== undefined) { out.locale = val; i++; }
+    else if (key === '--native-gateway') out.nativeGateway = true;
     else if (key === '--model' && val !== undefined) { out.model = val; i++; }
     else if (key === '--reasoning-effort' && val !== undefined) { out.reasoningEffort = val; i++; }
     else if (key === '--codex-reasoning-catalog' && val !== undefined) {
@@ -340,6 +344,8 @@ function appDeveloperInstructions(args: Args): string {
     `botmux session_id: ${args.sessionId}`,
   ].filter(Boolean).join('\n');
 
+  if (args.nativeGateway) return nativeGatewayDeveloperInstructions(args, identity);
+
   if (zh) {
     return [
       '你正在通过 botmux 接入飞书/Lark，但运行载体是 Codex App 的 app-server 协议，不是 Codex CLI TUI。',
@@ -365,6 +371,41 @@ function appDeveloperInstructions(args: Args): string {
       ? 'When the `botmux_browser` tool is present, use it for Chrome/Edge operations. Do not look for or fall back to node_repl, standalone Playwright, or another browser-control surface.'
       : '',
     larkToolPromptFromEnv('en'),
+    identity ? `<identity>\n${identity}\n</identity>` : '',
+  ].filter(Boolean).join('\n\n');
+}
+
+/**
+ * Developer instructions in a native IM gateway's core. The final message is
+ * posted by the channel gateway into the chat the turn came from; `botmux send`
+ * follows the turn's <botmux_task> (as <botmux_http_response_mode> says); a
+ * synchronous request_user_input becomes a card in that chat, answerable only
+ * within the turn, while an asynchronous one is refused at the core's ask
+ * entry (core/native-gateway-ask-dispatch.ts). No Feishu/Lark context helpers
+ * and no managed lark-cli exist there (an apiOnly bot gets no binding).
+ */
+function nativeGatewayDeveloperInstructions(args: Args, identity: string): string {
+  const browser = !!args.browserFamily;
+  if (args.locale === 'zh') {
+    return [
+      '你通过 botmux 运行，运行载体是 Codex App 的 app-server 协议，不是 Codex CLI TUI。',
+      '你的最终 assistant message 会由通道网关发到当前聊天，聊天里的人会看到它；只输出最终回答。',
+      '不要自己发送消息：只有本轮 `<botmux_task>` 明确给出了发送方式时，才严格按它发送，不使用其它形式的 `botmux send`。',
+      '需要用户选择时，原生 `request_user_input` 会以卡片发到当前聊天并等待作答（也可使用 `botmux ask`）；提问只在本轮内有效，本轮结束即作废。不等答复就继续运行的异步提问在这里不受支持，会被直接拒绝。不要通过卡片索取密码等秘密。',
+      browser
+        ? '当 `botmux_browser` 工具存在时，Chrome/Edge 操作必须使用该工具；不要寻找或回退到 `node_repl`、Playwright 服务或其它浏览器控制面。'
+        : '',
+      identity ? `<identity>\n${identity}\n</identity>` : '',
+    ].filter(Boolean).join('\n\n');
+  }
+  return [
+    'You run through botmux on the Codex App app-server protocol rather than the Codex CLI TUI.',
+    'Your final assistant message is posted by the channel gateway into the current chat, where people will read it; output only the final answer.',
+    'Do not send messages yourself: only when this turn\'s `<botmux_task>` gives you a delivery instruction, use exactly that, and no other form of `botmux send`.',
+    'When you need the user to choose, native request_user_input questions are posted as a card in the current chat and wait for an answer (botmux ask works too); a question is valid only within this turn and is void once the turn ends. Asynchronous questions that continue without waiting for the answer are not supported here and are refused. Do not request secrets through chat cards.',
+    browser
+      ? 'When the `botmux_browser` tool is present, use it for Chrome/Edge operations. Do not look for or fall back to node_repl, standalone Playwright, or another browser-control surface.'
+      : '',
     identity ? `<identity>\n${identity}\n</identity>` : '',
   ].filter(Boolean).join('\n\n');
 }

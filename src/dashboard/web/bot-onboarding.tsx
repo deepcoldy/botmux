@@ -5,10 +5,13 @@ import { cliSearchTerms, fetchDetectedModels, mergeModelCandidates, modelSuggest
 import { ModelPickerField } from './field-controls.js';
 import { confirm } from './confirm-modal.js';
 import { t } from './ui.js';
+import { controlCsrfHeaders } from './control-csrf.js';
+import type { WecomOnboardingSnapshot } from '../../im/wecom/contract/dashboard-dto.js';
 import { cliAvailabilityStatus, useCliAvailability } from './cli-availability.js';
+import type { ProviderId } from './providers/types.js';
 
-export const OPEN_BOT_ONBOARDING_EVENT = 'botmux:open-bot-onboarding';
-export const BOT_ONBOARDING_COMPLETED_EVENT = 'botmux:bot-onboarding-completed';
+import {OPEN_BOT_ONBOARDING_EVENT, BOT_ONBOARDING_COMPLETED_EVENT} from './bot-onboarding-events.js';
+export {OPEN_BOT_ONBOARDING_EVENT, BOT_ONBOARDING_COMPLETED_EVENT};
 
 /** 克隆源 Bot 里会被 cloneBotConfig 带过去、且表单里也有对应项的字段。 */
 export type CloneSourceDefaults = {
@@ -66,6 +69,7 @@ type OnboardingPermission = {
 type RemainingStep = { title: string; url: string };
 
 type OnboardingJob = {
+  platform?: 'lark';
   id: string;
   status: OnboardingStatus;
   qrUrl?: string;
@@ -106,6 +110,8 @@ type CliOption = {
 };
 
 type CliOptionsState = {
+  canCreateWecomBot: boolean;
+  loadFailed?: boolean;
   options: CliOption[];
   ttadkModelDefault: string;
   ttadkModelSuggestions: string[];
@@ -142,13 +148,15 @@ type OnboardingFormState = {
 
 type ViewState =
   | { kind: 'form'; error?: string }
-  | { kind: 'job'; job: OnboardingJob; ownerError?: string; cancelError?: string };
+  | { kind: 'job'; job: OnboardingJob; ownerError?: string; cancelError?: string }
+  | { kind: 'wecom-job'; job: WecomOnboardingSnapshot; actionError?: string };
 
 const DEFAULT_CLI_OPTION: CliOption = { id: 'claude-code', label: 'Claude' };
 const DEFAULT_TTADK_MODEL = 'glm-5.1';
 
 function defaultCliOptionsState(): CliOptionsState {
   return {
+    canCreateWecomBot: false,
     options: [DEFAULT_CLI_OPTION],
     ttadkModelDefault: DEFAULT_TTADK_MODEL,
     ttadkModelSuggestions: [],
@@ -212,6 +220,24 @@ function caughtErrorText(error: unknown): string {
 
 function shouldStopPolling(job: OnboardingJob): boolean {
   return job.status === 'completed' || job.status === 'failed' || job.status === 'needs_owner';
+}
+
+/** 企业微信接入轮询连续失败时的重试间隔：从 2.4s 起逐次翻倍，封顶 30s。 */
+const WECOM_POLL_RETRY_BASE_MS = 2_400;
+const WECOM_POLL_RETRY_MAX_MS = 30_000;
+
+/**
+ * 企业微信接入任务轮询失败后的下一次检查间隔：保留当前任务视图并显示错误，按指数退避继续检查
+ * （飞书的轮询失败照旧停在带「重试 / 兼容模式」的失败视图，见 BotOnboardingDialog 的 startPolling）。
+ */
+function wecomPollRetryDelayMs(consecutiveFailures: number): number {
+  const exponent = Math.max(0, consecutiveFailures - 1);
+  return Math.min(WECOM_POLL_RETRY_MAX_MS, WECOM_POLL_RETRY_BASE_MS * 2 ** exponent);
+}
+
+/** 企业微信接入任务到了终态就不再轮询。 */
+function wecomJobTerminal(job: WecomOnboardingSnapshot): boolean {
+  return ['completed', 'failed', 'cancelled'].includes(job.status);
 }
 
 function isSessionFailure(error?: string): boolean {
@@ -301,6 +327,7 @@ async function fetchCliOptions(): Promise<CliOptionsState> {
           }
         : { status: 'scan_required', ...(typeof body?.webSession?.reason === 'string' ? { reason: body.webSession.reason } : {}) };
       return {
+        canCreateWecomBot: body.canCreateWecomBot === true,
         options: (body.options as any[]).map((o: any) => ({
           ...o,
           // 容错：缺失/非数组 → []；空数组由 cliSearchTerms 回退到 command。
@@ -319,7 +346,7 @@ async function fetchCliOptions(): Promise<CliOptionsState> {
       };
     }
   } catch { /* fall through to default */ }
-  return { ...defaultCliOptionsState(), webSession: { status: 'scan_required' } };
+  return { ...defaultCliOptionsState(), loadFailed: true, webSession: { status: 'scan_required' } };
 }
 
 function syncModelForCli(
@@ -413,6 +440,15 @@ export async function openBotOnboarding(
   cloneSourceAppId = sourceAppId;
   cloneSourceDefaults = sourceAppId ? sourceDefaults : undefined;
   window.dispatchEvent(new Event(OPEN_BOT_ONBOARDING_EVENT));
+}
+
+/** Shared entry for every deployment roster, including no bots and WeCom-only. */
+export function BotOnboardingCreateButton(props: {className?: string; children?: React.ReactNode}): React.JSX.Element {
+  return (
+    <button type="button" className={props.className} onClick={() => void openBotOnboarding()}>
+      {props.children ?? t('nav.createBot')}
+    </button>
+  );
 }
 
 /**
@@ -780,6 +816,15 @@ function OnboardingJobView(props: {
 }
 
 function OnboardingForm(props: {
+  platform: ProviderId;
+  wecomMode: 'qr' | 'manual';
+  backend: 'pty' | 'tmux';
+  botId: string;
+  secret: string;
+  onWecomModeChange(mode: 'qr' | 'manual'): void;
+  onBackendChange(backend: 'pty' | 'tmux'): void;
+  onBotIdChange(value: string): void;
+  onSecretChange(value: string): void;
   cliState: CliOptionsState;
   form: OnboardingFormState;
   allowLocal: boolean;
@@ -851,13 +896,15 @@ function OnboardingForm(props: {
     { value: 'feishu', label: t('botOnboarding.brandFeishu') },
     { value: 'lark', label: t('botOnboarding.brandLark') },
   ];
-  const local = props.form.connection === 'local' && props.allowLocal;
-  const manual = props.form.connection === 'manual' && props.allowManual;
+  // 企业微信流程不用飞书的接入方式：本地 / 手动都按「否」算，下面飞书专属的字段都不出现。
+  const wecom = props.platform === 'wecom';
+  const local = !wecom && props.form.connection === 'local' && props.allowLocal;
+  const manual = !wecom && props.form.connection === 'manual' && props.allowManual;
   const effectiveConnection: OnboardingFormState['connection'] = local ? 'local' : manual ? 'manual' : 'feishu';
 
   return (
     <form id="onboarding-form" className="onboarding-form" onSubmit={props.onSubmit}>
-      <div className="onboarding-field">
+      {!wecom ? <div className="onboarding-field">
         <span>{t('botOnboarding.connectionLabel')}</span>
         <DropdownMenu
           id="ob-connection"
@@ -873,8 +920,8 @@ function OnboardingForm(props: {
           : manual
             ? t('botOnboarding.connectionManualHint')
             : t('botOnboarding.connectionFeishuHint')}</small>
-      </div>
-      {effectiveConnection === 'feishu' ? <div className="onboarding-session" aria-live="polite">
+      </div> : null}
+      {effectiveConnection === 'feishu' ? <div className="onboarding-session" aria-live="polite" hidden={wecom}>
         {props.sessionMode === 'checking' ? (
           <p>{t('botOnboarding.sessionChecking')}</p>
         ) : props.cliState.webSession.status === 'ready' ? (
@@ -977,7 +1024,7 @@ function OnboardingForm(props: {
         </>
       ) : null}
       <label className="onboarding-field">
-        <span>{local ? t('botOnboarding.localNameLabel') : t('botOnboarding.appNameLabel')}</span>
+        <span>{wecom ? t('botOnboarding.wecom.displayNameLabel') : local ? t('botOnboarding.localNameLabel') : t('botOnboarding.appNameLabel')}</span>
         <input
           id="ob-app-name"
           type="text"
@@ -988,7 +1035,9 @@ function OnboardingForm(props: {
           spellCheck={false}
           onChange={event => props.onFormChange({ ...props.form, appName: event.currentTarget.value })}
         />
-        <small className="onboarding-field-hint">{local
+        <small className="onboarding-field-hint">{wecom
+          ? t('botOnboarding.wecom.displayNameHint')
+          : local
           ? t('botOnboarding.localNameHint')
           : t('botOnboarding.appNameHint', { name: props.cliState.suggestedAppName })}</small>
       </label>
@@ -1062,7 +1111,7 @@ function OnboardingForm(props: {
           />
         </div>
       ) : null}
-      {effectiveConnection === 'feishu' ? (
+      {effectiveConnection === 'feishu' && !wecom ? (
         <label className="onboarding-field onboarding-checkbox">
           <span className="onboarding-checkbox-row">
             <input
@@ -1076,6 +1125,47 @@ function OnboardingForm(props: {
           <small className="onboarding-field-hint">{t('botOnboarding.autoAvoidApprovalHint')}</small>
         </label>
       ) : null}
+      {wecom ? (
+        <>
+          <div className="onboarding-field">
+            <span>{t('botOnboarding.wecom.backendLabel')}</span>
+            <DropdownMenu
+              id="ob-backend"
+              ariaLabel={t('botOnboarding.wecom.backendLabel')}
+              className="onboarding-menu"
+              label={props.backend === 'pty' ? 'PTY' : 'tmux'}
+              value={props.backend}
+              options={[{ value: 'pty', label: 'PTY' }, { value: 'tmux', label: 'tmux' }]}
+              onChange={props.onBackendChange}
+            />
+          </div>
+          <fieldset className="onboarding-provider">
+            <legend>{t('botOnboarding.wecom.modeLegend')}</legend>
+            <label>
+              <input type="radio" name="wecom-mode" value="qr" checked={props.wecomMode === 'qr'} onChange={() => props.onWecomModeChange('qr')} />
+              {' '}{t('botOnboarding.wecom.modeQr')}
+            </label>
+            <label>
+              <input type="radio" name="wecom-mode" value="manual" checked={props.wecomMode === 'manual'} onChange={() => props.onWecomModeChange('manual')} />
+              {' '}{t('botOnboarding.wecom.modeManual')}
+            </label>
+          </fieldset>
+          {props.wecomMode === 'manual' ? (
+            <>
+              <label className="onboarding-field">
+                <span>BotID</span>
+                <input id="ob-wecom-bot-id" type="text" required autoComplete="off" spellCheck={false} value={props.botId} onChange={event => props.onBotIdChange(event.currentTarget.value)} />
+              </label>
+              <label className="onboarding-field">
+                <span>Secret</span>
+                <input id="ob-wecom-secret" type="password" required autoComplete="new-password" value={props.secret} onChange={event => props.onSecretChange(event.currentTarget.value)} />
+                <small className="onboarding-field-hint">{t('botOnboarding.wecom.secretHint')}</small>
+              </label>
+            </>
+          ) : null}
+          <p className="onboarding-field-hint">{t('botOnboarding.wecom.formHint')}</p>
+        </>
+      ) : null}
       {props.error ? <p className="form-error">{props.error}</p> : null}
       <div className="actions onboarding-actions">
         <button type="button" id="ob-cancel" disabled={props.submitting} onClick={props.onClose}>{t('botOnboarding.cancel')}</button>
@@ -1086,7 +1176,7 @@ function OnboardingForm(props: {
           // form never blocks the dashboard event loop on shell rc files. It is
           // a useful warning, not an authoritative gate: submit runs the full
           // shell-aware server check and returns cli_not_found when necessary.
-          disabled={isOnboardingSubmitDisabled(props.submitting, props.sessionMode, effectiveConnection)}
+          disabled={isOnboardingSubmitDisabled(props.submitting, wecom ? 'qr' : props.sessionMode, effectiveConnection)}
         >
           {props.submitting
             ? (local
@@ -1094,6 +1184,8 @@ function OnboardingForm(props: {
               : manual
                 ? t('botOnboarding.startingManual')
                 : t('botOnboarding.starting'))
+            : wecom
+              ? (props.wecomMode === 'qr' ? t('botOnboarding.wecom.submitQr') : t('botOnboarding.wecom.submitManual'))
             : local
               ? t('botOnboarding.createLocal')
               : manual
@@ -1107,6 +1199,90 @@ function OnboardingForm(props: {
   );
 }
 
+/**
+ * 企业微信创建完成时的名称说明。扫码创建协议不带名称，向导里填的名字只用作 botmux 的本地显示名，
+ * 企业微信客户端里仍是平台默认名称和头像；没填显示名时换一句不带名字的说法。
+ */
+export function wecomCompletedNameNote(appName: string | undefined): string {
+  const name = appName?.trim();
+  return name
+    ? t('botOnboarding.wecom.completedNameNote', { name })
+    : t('botOnboarding.wecom.completedNameNoteUnnamed');
+}
+
+function WecomOnboardingJobView(props: {
+  job: WecomOnboardingSnapshot; busy: boolean; error?: string;
+  onAction(action: 'refresh' | 'retry'): void; onClose(): void;
+}): React.JSX.Element {
+  const {job} = props;
+  const [copyStatus, setCopyStatus] = useState('');
+  useEffect(() => setCopyStatus(''), [job.pairingCode]);
+  const copyPairingCode = async () => {
+    if (!job.pairingCode) return;
+    try {
+      await navigator.clipboard.writeText(job.pairingCode);
+      setCopyStatus(t('botOnboarding.wecom.pairingCopied'));
+    } catch {
+      setCopyStatus(t('botOnboarding.wecom.pairingCopyFailed'));
+    }
+  };
+  const title = job.status === 'waiting_for_scan' ? t('botOnboarding.wecom.statusWaitingForScan')
+    : job.status === 'needs_pairing' ? t('botOnboarding.wecom.statusNeedsPairing')
+    : job.status === 'completed' ? t('botOnboarding.wecom.statusCompleted')
+    : job.status === 'failed' ? t('botOnboarding.wecom.statusFailed')
+    : job.status === 'cancelled' ? t('botOnboarding.wecom.statusCancelled')
+    : job.status === 'starting_bot' ? t('botOnboarding.wecom.statusStartingBot')
+    : job.status === 'verifying' ? t('botOnboarding.wecom.statusVerifying')
+    : t('botOnboarding.wecom.statusChecking');
+  const failureText = job.error === 'wecom_onboarding_expired' ? t('botOnboarding.wecom.failedExpired')
+    : job.saved ? t('botOnboarding.wecom.failedSaved')
+    : job.externalBotCreated ? t('botOnboarding.wecom.failedCreated')
+    : job.retryable ? t('botOnboarding.wecom.failedRetryable')
+    : t('botOnboarding.wecom.failedQr');
+  const closeLabel = job.status === 'completed' ? t('botOnboarding.wecom.viewBots')
+    : ['failed', 'cancelled'].includes(job.status) ? t('botOnboarding.close')
+    : t('botOnboarding.wecom.cancelJob');
+  const steps = [t('botOnboarding.wecom.stepConnect'), t('botOnboarding.wecom.stepPair'), t('botOnboarding.wecom.stepStart')];
+  const currentStep = job.status === 'needs_pairing' ? 1 : ['starting_bot', 'completed'].includes(job.status) ? 2 : 0;
+  const canRefresh = job.error !== 'wecom_onboarding_expired' && !job.externalBotCreated && !job.saved && (job.status === 'waiting_for_scan' || (['failed','cancelled'].includes(job.status) && !job.retryable));
+  return <div data-wecom-onboarding-status={job.status}>
+    <ol className="onboarding-progress" aria-label={t('botOnboarding.wecom.progressLabel')}>
+      {steps.map((step, index) => <li key={step} aria-current={index === currentStep ? 'step' : undefined}>{step}</li>)}
+    </ol>
+    <p className={`onboarding-status status-${job.status}`} role="status">{title}</p>
+    {job.status === 'waiting_for_scan' && job.qrDataUrl ? <QrCard dataUrl={job.qrDataUrl} alt={t('botOnboarding.wecom.qrAlt')} link={job.qrUrl} /> : null}
+    {job.status === 'waiting_for_scan' ? (
+      <p className="onboarding-field-hint">
+        {t('botOnboarding.wecom.scanHint')}
+        {job.expireAt ? t('botOnboarding.wecom.qrExpiresAt', { time: new Date(job.expireAt).toLocaleTimeString() }) : ''}
+      </p>
+    ) : null}
+    {job.status === 'needs_pairing' ? <div className="onboarding-pairing">
+      <p>{t('botOnboarding.wecom.pairingIntro')}</p>
+      <code className="onboarding-pairing-code">{job.pairingCode}</code>
+      <button type="button" onClick={() => void copyPairingCode()}>{t('botOnboarding.wecom.copyPairingCode')}</button>
+      {copyStatus ? <p role="status" className="onboarding-field-hint">{copyStatus}</p> : null}
+      <p className="onboarding-field-hint">{t('botOnboarding.wecom.pairingHint')}</p>
+    </div> : null}
+    {job.status === 'completed' ? <p className="hint-ok">{t('botOnboarding.wecom.completedHint')}</p> : null}
+    {job.status === 'completed' ? <p className="onboarding-field-hint" data-wecom-name-note>{wecomCompletedNameNote(job.appName)}</p> : null}
+    {job.status === 'failed' ? <>
+      <p className="hint-warn">{failureText}</p>
+      <details className="onboarding-technical">
+        <summary>{t('botOnboarding.wecom.details')}</summary>
+        <code>{job.message ?? job.error ?? t('botOnboarding.wecom.unfinished')}</code>
+      </details>
+    </> : null}
+    {job.externalBotCreated && !['completed','failed','cancelled'].includes(job.status) ? <p className="onboarding-field-hint">{t('botOnboarding.wecom.cancelKeepsBot')}</p> : null}
+    {props.error ? <p className="form-error" role="alert">{props.error}</p> : null}
+    <div className="actions onboarding-actions">
+      <button type="button" onClick={props.onClose}>{closeLabel}</button>
+      {canRefresh ? <button type="button" disabled={props.busy} onClick={() => props.onAction('refresh')}>{t('botOnboarding.wecom.refreshQr')}</button> : null}
+      {['failed','cancelled'].includes(job.status) && job.retryable ? <button type="button" className="primary" disabled={props.busy} onClick={() => props.onAction('retry')}>{t('botOnboarding.wecom.resumeSameBot')}</button> : null}
+    </div>
+  </div>;
+}
+
 export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): React.JSX.Element {
   const dialogRef = useRef<HTMLDialogElement | null>(null);
   const pollTimerRef = useRef<number | null>(null);
@@ -1117,6 +1293,20 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
   const cliTouchedRef = useRef(false);
   const completedNotifiedJobIdRef = useRef<string | null>(null);
   const cancellingRef = useRef(false);
+  // 企业微信流程（旁路入口）自己的轮询计时器、请求代号与忙标记；飞书流程的那几个在上面，互不复用。
+  const wecomPollTimerRef = useRef<number | null>(null);
+  const wecomSeqRef = useRef(0);
+  const activeWecomJobRef = useRef<string | undefined>(undefined);
+  const wecomBusyRef = useRef(false);
+  const wecomAllowedRef = useRef(false);
+  // 企业微信是旁路入口：只有服务端在 cli-options 里声明 canCreateWecomBot 时才露出。
+  const [wecomCreatable, setWecomCreatable] = useState(false);
+  // 打开即飞书流程（与企微接入前一致）；企业微信只能经旁路入口切换进来。
+  const [platform, setPlatform] = useState<ProviderId>('lark');
+  const [wecomMode, setWecomMode] = useState<'qr' | 'manual'>('qr');
+  const [backend, setBackend] = useState<'pty' | 'tmux'>('pty');
+  const [botId, setBotId] = useState('');
+  const [secret, setSecret] = useState('');
   const [cliState, setCliState] = useState<CliOptionsState>(() => defaultCliOptionsState());
   const [form, setForm] = useState<OnboardingFormState>(() => defaultFormState());
   const [cliRecheckSeq, setCliRecheckSeq] = useState(0);
@@ -1139,14 +1329,37 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
     }
   }, []);
 
+  const stopWecomPolling = useCallback(() => {
+    if (wecomPollTimerRef.current !== null) window.clearTimeout(wecomPollTimerRef.current);
+    wecomPollTimerRef.current = null;
+  }, []);
+  const cancelWecomJob = useCallback((id: string) => {
+    void fetch(`/api/bot-onboarding/${encodeURIComponent(id)}/cancel`, {
+      method: 'POST', credentials: 'same-origin', headers: controlCsrfHeaders(),
+    }).catch(() => { /* closing still invalidates local responses */ });
+  }, []);
+  // 放下当前的企业微信接入任务：作废还在路上的响应和下一次轮询，并取消服务端那条还没结束的任务。
+  const releaseWecomJob = useCallback(() => {
+    const id = activeWecomJobRef.current;
+    activeWecomJobRef.current = undefined;
+    wecomSeqRef.current += 1;
+    stopWecomPolling();
+    wecomBusyRef.current = false;
+    setSecret('');
+    if (id) cancelWecomJob(id);
+  }, [cancelWecomJob, stopWecomPolling]);
+
   const finishClose = useCallback(() => {
     startSeqRef.current += 1;
     stopPolling();
+    releaseWecomJob();
     cloneSourceAppId = undefined;
     cloneSourceDefaults = undefined;
     setForm(current => (current.appSecret ? { ...current, appSecret: '' } : current));
+    const closing = viewRef.current;
+    if (closing.kind === 'wecom-job' && closing.job.status === 'completed') window.location.hash = `#/bot-defaults?provider=wecom${closing.job.connectionId ? `&bot=${encodeURIComponent(closing.job.connectionId)}` : ''}`;
     props.onClose();
-  }, [props, stopPolling]);
+  }, [props, stopPolling, releaseWecomJob]);
 
   const applyJob = useCallback((job: OnboardingJob) => {
     setView({ kind: 'job', job });
@@ -1166,6 +1379,12 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
     }
     if (shouldStopPolling(job)) stopPolling();
   }, [stopPolling]);
+
+  const applyWecomJob = useCallback((job: WecomOnboardingSnapshot) => {
+    activeWecomJobRef.current = ['completed', 'cancelled'].includes(job.status) ? undefined : job.id;
+    setView({ kind: 'wecom-job', job });
+    if (job.status === 'completed' && job.connectionId) window.dispatchEvent(new CustomEvent(BOT_ONBOARDING_COMPLETED_EVENT, {detail:{platform:'wecom',connectionId:job.connectionId}}));
+  }, []);
 
   const pollJob = useCallback(async (id: string, seq: number, signal?: AbortSignal) => {
     const res = await fetch(`/api/bot-onboarding/${encodeURIComponent(id)}`, signal ? { signal } : undefined);
@@ -1190,12 +1409,44 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
     }, 1200);
   }, [pollJob, stopPolling]);
 
+  // 企业微信：每代只有一个在途轮询。关闭、切换平台或刷新都会先作废在途请求和下一次计时，再动状态。
+  const startWecomPolling = useCallback((id: string, seq: number) => {
+    stopWecomPolling();
+    let failures = 0;
+    const poll = async () => {
+      if (wecomSeqRef.current !== seq) return;
+      try {
+        const res = await fetch(`/api/bot-onboarding/${encodeURIComponent(id)}`, {credentials: 'same-origin'});
+        const body = await res.json();
+        if (wecomSeqRef.current !== seq) return;
+        if (!res.ok || !body?.job) throw new Error(body?.message ?? body?.error ?? `http_${res.status}`);
+        failures = 0;
+        const job = body.job as WecomOnboardingSnapshot;
+        applyWecomJob(job);
+        if (!wecomJobTerminal(job)) wecomPollTimerRef.current = window.setTimeout(poll, 1200);
+      } catch (error) {
+        if (wecomSeqRef.current !== seq) return;
+        failures += 1;
+        // 平台侧机器人可能已经建好：保留最近一次持久化的 job 和它的恢复操作，把错误显示出来，
+        // 按退避间隔继续检查，而不是假装平台创建本身失败了。
+        setView(current => current.kind === 'wecom-job'
+          ? {...current, actionError: caughtErrorText(error)}
+          : current);
+        wecomPollTimerRef.current = window.setTimeout(poll, wecomPollRetryDelayMs(failures));
+      }
+    };
+    wecomPollTimerRef.current = window.setTimeout(poll, 1200);
+  }, [applyWecomJob, stopWecomPolling]);
+
   const refreshCliOptions = useCallback((autoSelectCli: boolean) => {
     const seq = loadSeqRef.current + 1;
     loadSeqRef.current = seq;
     void fetchCliOptions().then(next => {
       if (loadSeqRef.current !== seq) return;
       setCliState(next);
+      const wecomCreatableNow = !next.loadFailed && next.canCreateWecomBot;
+      wecomAllowedRef.current = wecomCreatableNow;
+      setWecomCreatable(wecomCreatableNow);
       setForm(current => normalizeFormForOptions(
         current,
         next,
@@ -1209,6 +1460,13 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
 
   const resetToForm = useCallback(() => {
     stopPolling();
+    // 每次打开都从干净的飞书表单开局；企业微信入口等 cli-options 回来、按服务端声明再露出。
+    releaseWecomJob();
+    wecomAllowedRef.current = false;
+    setWecomCreatable(false);
+    setPlatform('lark');
+    setWecomMode('qr');
+    setBotId('');
     cliTouchedRef.current = false;
     completedNotifiedJobIdRef.current = null;
     const initialCliState = defaultCliOptionsState();
@@ -1223,7 +1481,7 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
     setOwnerInput('');
     setOwnerIdInput('');
     refreshCliOptions(true);
-  }, [refreshCliOptions, stopPolling]);
+  }, [refreshCliOptions, stopPolling, releaseWecomJob]);
 
   useEffect(() => {
     if (props.open) {
@@ -1231,8 +1489,9 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
       return;
     }
     stopPolling();
+    releaseWecomJob();
     loadSeqRef.current += 1;
-  }, [props.open, resetToForm, stopPolling]);
+  }, [props.open, resetToForm, stopPolling, releaseWecomJob]);
 
   useEffect(() => {
     const dialog = dialogRef.current;
@@ -1245,6 +1504,11 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
   }, [props.open]);
 
   useEffect(() => () => stopPolling(), [stopPolling]);
+  useEffect(() => () => {
+    wecomSeqRef.current += 1;
+    stopWecomPolling();
+    if (activeWecomJobRef.current) cancelWecomJob(activeWecomJobRef.current);
+  }, [stopWecomPolling, cancelWecomJob]);
 
   const startOnboarding = useCallback(async (
     registrationMode: 'web' | 'compat' | 'local' | 'manual',
@@ -1309,6 +1573,43 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
     }
   }, [applyJob, cliState.webSession, form, sessionMode, startPolling, stopPolling]);
 
+  const startWecomOnboarding = useCallback(async () => {
+    if (wecomBusyRef.current) return;
+    wecomBusyRef.current = true;
+    stopWecomPolling();
+    const seq = ++wecomSeqRef.current;
+    setSubmitting(true);
+    try {
+      const requestBody = JSON.stringify({
+        platform: 'wecom',
+        appName: form.appName.trim() || undefined,
+        mode: wecomMode, backend, ...(wecomMode === 'manual' ? {botId: botId.trim(), secret} : {}),
+        cliId: form.cliId, workingDir: form.workingDir.trim(), dirMode: form.dirMode, model: form.model.trim() || undefined,
+      });
+      setSecret('');
+      const res = await fetch('/api/bot-onboarding/start', {
+        method: 'POST', credentials: 'same-origin', headers: {'content-type': 'application/json', ...controlCsrfHeaders()}, body: requestBody,
+      });
+      const body = await res.json();
+      if (wecomSeqRef.current !== seq) {
+        if (body?.job?.platform === 'wecom' && body.job.id) cancelWecomJob(body.job.id);
+        return;
+      }
+      if (!res.ok || !body?.job?.id) {
+        setView({kind: 'form', error: body?.message ?? body?.error ?? `http_${res.status}`});
+        return;
+      }
+      const job = body.job as WecomOnboardingSnapshot;
+      applyWecomJob(job);
+      if (!wecomJobTerminal(job)) startWecomPolling(job.id, seq);
+    } catch (error) {
+      if (wecomSeqRef.current !== seq) return;
+      setView({kind: 'form', error: caughtErrorText(error)});
+    } finally {
+      if (wecomSeqRef.current === seq) {wecomBusyRef.current = false; setSubmitting(false);}
+    }
+  }, [applyWecomJob, backend, botId, cancelWecomJob, form, secret, startWecomPolling, stopWecomPolling, wecomMode]);
+
   const ensureActiveJobCancelled = useCallback(async (): Promise<boolean> => {
     if (cancellingRef.current) return false;
     const currentView = viewRef.current;
@@ -1363,6 +1664,10 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
 
   const submitForm = useCallback((event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (platform === 'wecom') {
+      void startWecomOnboarding();
+      return;
+    }
     const isClone = cloneSourceAppId !== undefined;
     const mode = !isClone && form.connection === 'local'
       ? 'local'
@@ -1370,7 +1675,7 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
         ? 'manual'
         : 'web';
     void startOnboarding(mode);
-  }, [form.connection, startOnboarding]);
+  }, [form.connection, platform, startOnboarding, startWecomOnboarding]);
 
   const switchToManualForm = useCallback((prefill?: { appId?: string; brand?: 'feishu' | 'lark' }) => {
     void ensureActiveJobCancelled().then(cancelled => {
@@ -1409,6 +1714,55 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
     refreshCliOptions(false);
   }, [refreshCliOptions]);
 
+  // 在飞书表单与企业微信流程之间切换：放下当前的企业微信任务，回到所选平台的表单。
+  // 切到企业微信时（recover）先找回本账号还没结束、或可以续接的企业微信任务。
+  const selectPlatform = useCallback((next: ProviderId, recover = true) => {
+    if (next === 'wecom' && !wecomAllowedRef.current) return;
+    releaseWecomJob();
+    setSubmitting(false);
+    setPlatform(next);
+    setView({ kind: 'form' });
+    setBotId('');
+    setWecomMode('qr');
+    if (next !== 'wecom' || !recover) return;
+    const seq = wecomSeqRef.current;
+    void fetch('/api/bot-onboarding/wecom-jobs', {credentials: 'same-origin'})
+      .then(async response => response.ok ? response.json() : undefined)
+      .then(body => {
+        if (seq !== wecomSeqRef.current) return;
+        const job = body?.jobs?.find((item: WecomOnboardingSnapshot) => item.platform === 'wecom' && (item.retryable || !['failed','cancelled','completed'].includes(item.status)));
+        if (!job) return;
+        applyWecomJob(job);
+        if (!wecomJobTerminal(job)) startWecomPolling(job.id, seq);
+      }).catch(() => { /* New creation remains available when no receipt is accessible. */ });
+  }, [applyWecomJob, releaseWecomJob, startWecomPolling]);
+
+  const wecomAction = useCallback(async (action: 'retry' | 'refresh') => {
+    if (wecomBusyRef.current || view.kind !== 'wecom-job') return;
+    wecomBusyRef.current = true;
+    setSubmitting(true);
+    stopWecomPolling();
+    const seq = ++wecomSeqRef.current;
+    const job = view.job;
+    try {
+      const res = await fetch(`/api/bot-onboarding/${encodeURIComponent(job.id)}/${action}`, {
+        method: 'POST', credentials: 'same-origin', headers: controlCsrfHeaders(),
+      });
+      const body = await res.json();
+      if (wecomSeqRef.current !== seq) return;
+      if (!res.ok || !body?.job) throw new Error(body?.message ?? body?.error ?? `http_${res.status}`);
+      applyWecomJob(body.job);
+      if (!wecomJobTerminal(body.job)) startWecomPolling(body.job.id, seq);
+    } catch (error) {
+      if (wecomSeqRef.current === seq) {
+        setView({kind: 'wecom-job', job, actionError: caughtErrorText(error)});
+        if (!wecomJobTerminal(job)) startWecomPolling(job.id, seq);
+      }
+    } finally {
+      if (wecomSeqRef.current === seq) {wecomBusyRef.current = false; setSubmitting(false);}
+    }
+  }, [applyWecomJob, startWecomPolling, stopWecomPolling, view]);
+
   const submitOwner = useCallback(async (job: OnboardingJob, ownerRaw: string, ownerIdRaw: string) => {
     const owner = [ownerRaw.trim(), ownerIdRaw.trim()].filter(Boolean).join(',');
     if (!owner) {
@@ -1440,6 +1794,15 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
     if (view.kind === 'form') {
       return (
         <OnboardingForm
+          platform={platform}
+          wecomMode={wecomMode}
+          backend={backend}
+          botId={botId}
+          secret={secret}
+          onWecomModeChange={mode => { setWecomMode(mode); setSecret(''); }}
+          onBackendChange={setBackend}
+          onBotIdChange={setBotId}
+          onSecretChange={setSecret}
           cliState={cliState}
           form={form}
           allowLocal={cloneSourceAppId === undefined}
@@ -1457,6 +1820,27 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
         />
       );
     }
+    if (view.kind === 'wecom-job') {
+      const finished = ['failed', 'cancelled', 'completed'].includes(view.job.status);
+      const expired = view.job.error === 'wecom_onboarding_expired';
+      return (
+        <>
+          <WecomOnboardingJobView job={view.job} busy={submitting} error={view.actionError} onAction={wecomAction} onClose={close} />
+          {finished ? (
+            <button
+              type="button"
+              disabled={submitting}
+              onClick={() => {
+                selectPlatform('wecom', false);
+                if (expired) setWecomMode('manual');
+              }}
+            >
+              {expired ? t('botOnboarding.wecom.reconnectExisting') : t('botOnboarding.wecom.createAnother')}
+            </button>
+          ) : null}
+        </>
+      );
+    }
     return (
       <OnboardingJobView
         view={view}
@@ -1472,9 +1856,23 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
         onClose={close}
       />
     );
-  }, [cancelling, cliRecheckSeq, cliState, close, form, handleCliChange, handleRecheckCli, ownerIdInput, ownerInput, props.open, retry, sessionMode, submitForm, submitOwner, submitting, switchToManualForm, view]);
+  }, [backend, botId, cancelling, cliRecheckSeq, cliState, close, form, handleCliChange, handleRecheckCli, ownerIdInput, ownerInput, platform, props.open, retry, secret, selectPlatform, sessionMode, submitForm, submitOwner, submitting, switchToManualForm, view, wecomAction, wecomMode]);
 
-  const canClose = !cancelling && (view.kind === 'form' || (view.kind === 'job' && (view.job.status === 'completed' || view.job.status === 'failed' || view.job.status === 'waiting_for_scan')));
+  const canClose = platform !== 'lark' || (!cancelling && (view.kind === 'form' || (view.kind === 'job' && (view.job.status === 'completed' || view.job.status === 'failed' || view.job.status === 'waiting_for_scan'))));
+
+  // 企业微信是旁路入口，不占飞书流程的步骤：飞书表单首屏最下方一条次要链接，只在服务端声明
+  // 可创建企业微信机器人时出现（克隆是飞书概念，克隆模式下不出现）。放在表单之后，打开弹窗时的
+  // 默认焦点仍落在飞书表单上。进入企业微信流程后，同一位置换成切回飞书的链接。
+  let platformSwitch: React.ReactNode = null;
+  if (props.open && platform === 'wecom') {
+    platformSwitch = (
+      <OnboardingPlatformSwitch label={t('botOnboarding.switchToLark')} onClick={() => selectPlatform('lark')} />
+    );
+  } else if (props.open && view.kind === 'form' && wecomCreatable && !cloneSourceAppId) {
+    platformSwitch = (
+      <OnboardingPlatformSwitch label={t('botOnboarding.switchToWecom')} onClick={() => selectPlatform('wecom')} />
+    );
+  }
 
   return (
     <dialog
@@ -1492,10 +1890,21 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
       <article className="onboarding-card">
         <header className="onboarding-header">
           <h3>{t('botOnboarding.title')}</h3>
-          <p>{t('botOnboarding.intro')}</p>
+          <p>{platform === 'wecom' ? t('botOnboarding.wecom.intro') : t('botOnboarding.intro')}</p>
         </header>
         {body}
+        {platformSwitch}
       </article>
     </dialog>
+  );
+}
+
+function OnboardingPlatformSwitch(props: { label: string; onClick(): void }): React.JSX.Element {
+  return (
+    <div className="onboarding-platform-switch">
+      <button type="button" className="onboarding-session-action" data-onboarding-platform-switch="" onClick={props.onClick}>
+        {props.label}
+      </button>
+    </div>
   );
 }

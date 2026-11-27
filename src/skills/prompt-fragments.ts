@@ -71,7 +71,21 @@ export interface PromptFragmentSpec {
    *  every kind — variant/gated fragments are otherwise indistinguishable from
    *  always-on ones in a flat list. */
   gateLabel?: string;
+  /** Only rendered on a non-Feishu channel. Absent = today's behaviour (the
+   *  Feishu-facing catalog). A marked fragment stays out of every existing
+   *  listing — {@link PROMPT_FRAGMENTS}, the customization page, the
+   *  `botmux customize` CLI and fragment lookups — and is only in
+   *  {@link PROMPT_FRAGMENT_CATALOG}. */
+  channel?: PromptFragmentChannel;
+  /** The only locale this copy is ever rendered in; an override for any other
+   *  locale is never read. Absent = rendered in the session's locale (every
+   *  entry of this catalog). Used by channel copy registered outside it. */
+  fixedLocale?: Locale;
 }
+
+/** `native-gateway`: rendered only in a native IM gateway's dedicated core
+ *  (core/runtime-mode.ts isNativeGatewayCoreProcess). */
+export type PromptFragmentChannel = 'native-gateway';
 
 /** Presentation metadata for block ids. A block id may appear in more than one
  *  stage (cross-listed fragments); label/hint stay constant. */
@@ -145,8 +159,10 @@ export const BLOCK_META: Record<string, { label: string; hint?: string }> = {
  * are the real i18n keys resolved by `buildBotmuxSystemPromptText` /
  * `buildBotmuxShellHints` (see src/adapters/cli/shared-hints.ts) and
  * `buildNewTopicBlocks` / `buildFollowUpBlocks` (see src/core/session-manager.ts).
+ * Includes channel-marked fragments; see {@link PROMPT_FRAGMENTS} for the
+ * listing every existing consumer reads.
  */
-export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
+export const PROMPT_FRAGMENT_CATALOG: readonly PromptFragmentSpec[] = [
   // ───────────────────────── stage: 会话开始 (new) ─────────────────────────
 
   // <botmux_routing> — system-prompt path (claude-family / genius / grok)
@@ -221,6 +237,15 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
     gateLabel: '注入与否由系统提示路径那条 XPI「条件行」统一控制；此处文本只作用于 Shell 路径',
   },
   { key: 'ai.shell.mention_gate', block: 'routing_shell', stage: 'new', label: 'Shell：@ 决策（硬性完整版）', kind: 'editable' },
+
+  // Native gateway core only: stands in for the ask entry / ask skill of the
+  // built-in skills that core no longer offers (skills/injection-mode.ts).
+  {
+    key: 'ai.native_gateway.ask_hint', block: 'routing_system', stage: 'new', kind: 'editable',
+    label: '提问提示（原生通道网关会话）',
+    gateLabel: '仅原生 IM 通道网关的专用 core、且 CLI 不经 hook 接管提问时：系统提示 CLI 写进系统提示，其它 CLI 写进首轮 prompt',
+    channel: 'native-gateway',
+  },
 
   // <identity> — per-bot name/open_id + multi-bot routing rules
   { key: 'ai.identity.routing_intro', block: 'identity', stage: 'new', label: '归属规则开场', kind: 'editable' },
@@ -415,6 +440,12 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
     gateLabel: '仅无传输会话（HTTP 虚拟会话 / apiOnly bot）',
   },
   {
+    key: 'ai.followup.reminder_native_gateway', block: 'followup', stage: 'followup', kind: 'editable',
+    label: '续轮提醒（原生通道网关会话）',
+    gateLabel: '仅原生 IM 通道网关的专用 core：代替 no-transport 程序会话那条',
+    channel: 'native-gateway',
+  },
+  {
     key: 'xpi.replay.prompt', block: 'xpi_replay', stage: 'followup', kind: 'placeholder',
     placeholders: ['ownerTask', 'suggestion'],
     label: 'XPI 建议采纳后重跑原任务的提示',
@@ -441,6 +472,11 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
     gateLabel: '仅本轮发送走统一回复卡片、且发送类型为 progress 时',
   },
 ];
+
+/** The fragments of today's catalog: every unmarked entry of
+ *  {@link PROMPT_FRAGMENT_CATALOG}, in order. What the customization page, the
+ *  `botmux customize` CLI and the lookups below enumerate. */
+export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = PROMPT_FRAGMENT_CATALOG.filter((f) => f.channel === undefined);
 
 const FRAGMENT_BY_KEY = new Map(PROMPT_FRAGMENTS.map((f) => [f.key, f]));
 
@@ -474,6 +510,12 @@ export function isConditionalFragment(key: string): boolean {
 export function validateFragmentOverride(key: string, value: string): string | undefined {
   const spec = FRAGMENT_BY_KEY.get(key);
   if (!spec) return undefined; // unknown key: no placeholder contract to enforce
+  return validateOverrideForSpec(spec, value);
+}
+
+/** The placeholder contract of {@link validateFragmentOverride}, for a spec the
+ *  caller already resolved (e.g. from a channel's own fragment set). */
+export function validateOverrideForSpec(spec: PromptFragmentSpec, value: string): string | undefined {
   if (spec.kind === 'placeholder' && spec.placeholders) {
     for (const token of spec.placeholders) {
       if (!value.includes(`{${token}}`)) {
@@ -482,6 +524,37 @@ export function validateFragmentOverride(key: string, value: string): string | u
     }
   }
   return undefined;
+}
+
+// ─── Native gateway channel ──────────────────────────────────────────────────
+
+/**
+ * Unmarked (Feishu) fragments that a native gateway's dedicated core renders
+ * too — the ones with an override in the channel's store that shows up in that
+ * core's sessions. Measured, not assumed: an override marker for every catalog
+ * key was rendered through that core's real prompt paths (all audiences, the
+ * claude-code / codex / codex-app / cursor adapters, zero-injection and hook
+ * envelope modes, the fleet-wide whiteboard / workflow / experimental toggles,
+ * hideLocalAddresses and lang=en); only these keys appeared. Every other
+ * unmarked fragment is collapsed out of a no-transport session there.
+ */
+export const NATIVE_GATEWAY_SHARED_FRAGMENT_KEYS: readonly string[] = [
+  'ai.routing.hidden_context_defense',
+  'ai.whiteboard.block_read',
+  'ai.whiteboard.block_update',
+  'ai.whiteboard.block_rewrite',
+  'ai.whiteboard.block_cas',
+  'ai.whiteboard.block_tail_no_transport',
+];
+
+/**
+ * The catalog fragments a native gateway's dedicated core renders, in catalog
+ * order: every `channel: 'native-gateway'` entry plus the shared keys above.
+ * (The gateway's own per-turn lines are registered by the gateway itself.)
+ */
+export function nativeGatewayCatalogFragments(): PromptFragmentSpec[] {
+  const shared = new Set(NATIVE_GATEWAY_SHARED_FRAGMENT_KEYS);
+  return PROMPT_FRAGMENT_CATALOG.filter((f) => f.channel === 'native-gateway' || (f.channel === undefined && shared.has(f.key)));
 }
 
 /** The shipped (factory) rendered string for a fragment key + locale. Used by

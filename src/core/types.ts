@@ -519,7 +519,9 @@ export interface DaemonSession {
    *  bare force flag could otherwise miss a turn whose thinking already
    *  ended). Cleared on turn_terminal: a bubble created after its turn
    *  settled would never receive RUN_FINISHED and spin forever. */
-  lastThinkingUpdate?: { entries: CotEntry[]; turnId: string; dispatchAttempt?: number };
+  lastThinkingUpdate?: { entries: CotEntry[]; turnId: string; dispatchAttempt?: number; workerGeneration?: number };
+  /** Ephemeral native gateway projection; never promotes an old worker/turn snapshot. */
+  lastNativeGatewayGoal?: { goal: import('../services/native-goal-state.js').NativeGoalState | null; turnId: string; dispatchAttempt?: number; workerGeneration: number };
   /** Bounded per-turn admission times for optional reply timing; not restored or guessed. */
   turnReceivedAtMs?: Map<string, number>;
   /** Native write observations, scoped to the worker generation and exact attempt. */
@@ -981,6 +983,15 @@ export interface DaemonSession {
   directInputEpoch?: number;
   /** Latest timestamp of a direct Web Terminal submission (cancels pending recovery/replay). */
   lastDirectTerminalInputAt?: number;
+  /** Structured usage / rate limit a native gateway may show for one exact turn (rememberCoreOnlyLimit). */
+  nativeGatewayLimit?: {
+    turnId: string;
+    workerGeneration: number;
+    dispatchAttempt?: number;
+    key: string;
+    kind: 'usage' | 'rate';
+    retryAtMs: number;
+  };
   /** A failed persistence must be retried even if the next frame is identical. */
   usageLimitPersistPending?: boolean;
   usageLimitRetryTimer?: NodeJS.Timeout;

@@ -36,6 +36,7 @@ import { wrapBracketedPaste } from './tui-input.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import { discoverClaudeFamilySessions } from '../../services/resumable-session-discovery.js';
 import { builtinPluginDirForSession } from '../../skills/workflow-node-plugin-dir.js';
+import { builtinSkillsOffered } from '../../skills/injection-mode.js';
 import { ensureLeadOnlyPluginDir } from '../../skills/lead-only-guard.js';
 import { decideStartupSwitchConfirm } from '../../utils/claude-switch-confirm.js';
 
@@ -1178,7 +1179,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       return discoverClaudeFamilySessions(variant.dataDir, limit, exclude);
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, reasoningEffort, disableCliBypass, skillPluginDir, noTransport, triggerUserAuth, larkToolAppId, settingsEnv, settingsFilePath, replyDelivery, solo, leadOnly, promptInjection, promptCacheTtl, hideLocalAddresses }) {
+    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, larkAppId, locale, model, reasoningEffort, disableCliBypass, skillPluginDir, noTransport, triggerUserAuth, larkToolAppId, settingsEnv, settingsFilePath, replyDelivery, solo, leadOnly, promptInjection, promptCacheTtl, hideLocalAddresses }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', resumeSessionId ?? sessionId);
@@ -1304,12 +1305,15 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // Keeps them out of the user's global ~/.claude/skills so a standalone
       // `claude` never surfaces/mis-fires `botmux send` etc.
       if (promptInjection === 'none') return args;
-      args.push('--plugin-dir', builtinPluginDirForSession(CLAUDE_PLUGIN_DIR));
+      // Not in a native gateway's core: its built-ins drive the Feishu transport
+      // that core lacks, and this dir is shared with the Feishu fleet
+      // (builtinSkillsOffered). The bot's own skills below are unaffected.
+      if (builtinSkillsOffered()) args.push('--plugin-dir', builtinPluginDirForSession(CLAUDE_PLUGIN_DIR));
       if (skillPluginDir) args.push('--plugin-dir', skillPluginDir);
       // replyDelivery=transcript：系统提示改口为「最终回复由 botmux 自动转发」。v3 workflow
       // 子会话（GOAL_ENV.V3_MARKER）的收口靠 botmux send，强制保持 send 措辞。
       const effectiveReplyDelivery = process.env[GOAL_ENV.V3_MARKER] === '1' ? 'send' : replyDelivery;
-      args.push('--append-system-prompt', buildBotmuxSystemPromptText({ locale, botName, botOpenId, noTransport, triggerUserAuth, larkToolAppId, replyDelivery: effectiveReplyDelivery, solo, leadOnly: leadOnlyActive, hideLocalAddresses, cliId: 'claude-code' }));
+      args.push('--append-system-prompt', buildBotmuxSystemPromptText({ locale, botName, botOpenId, larkAppId, noTransport, triggerUserAuth, larkToolAppId, replyDelivery: effectiveReplyDelivery, solo, leadOnly: leadOnlyActive, hideLocalAddresses, cliId: 'claude-code' }));
       return args;
     },
 

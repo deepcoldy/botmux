@@ -13,15 +13,41 @@
  * BYTE-IDENTICAL GUARANTEE: when customization is disabled, or there are no
  * overrides, every function here returns the shipped default unchanged. Callers
  * that had no override get exactly the pre-feature bytes.
+ *
+ * WHICH STORE: every process reads its default store (services/customization-store
+ * — `<its data dir>/customizations`), exactly as before scopes existed, with one
+ * exception: a native gateway's dedicated core (and its workers) reads only the
+ * store its gateway handed it (core/runtime-mode.ts nativeGatewayCustomizationDir),
+ * and only reads it. Without a valid handed path (missing, blank, relative) such
+ * a core resolves NO overrides — the shipped text — rather than its own state
+ * dir's `customizations`, which nothing manages any more. Decided per lookup
+ * from the environment, never cached (same rule as runtime-mode.ts).
  */
 import type { Locale } from '../i18n/types.js';
 import { setPromptOverrideResolver } from '../i18n/index.js';
 import {
-  customizationEnabled,
-  readCustomizationState,
-  readSkillOverrideBody,
+  customizationsRoot,
+  readCustomizationStateAt,
+  readSkillOverrideBodyAt,
+  type CustomizationState,
 } from '../services/customization-store.js';
+import { isNativeGatewayCoreProcess, nativeGatewayCustomizationDir } from '../core/runtime-mode.js';
 import type { SkillDef } from './definitions.js';
+
+/** Root of the store this process resolves overrides from, or `null` for none (see header). */
+function runtimeStoreRoot(): string | null {
+  if (isNativeGatewayCoreProcess()) return nativeGatewayCustomizationDir(process.env) ?? null;
+  return customizationsRoot();
+}
+
+function runtimeState(root: string): CustomizationState {
+  return readCustomizationStateAt(root);
+}
+
+/** Master switch of the store at `root`: missing = enabled; no store = off. */
+function enabledAt(root: string | null): root is string {
+  return root !== null && runtimeState(root).enabled !== false;
+}
 
 // ─── Prompt key overrides → i18n t() ─────────────────────────────────────────
 
@@ -34,9 +60,10 @@ import type { SkillDef } from './definitions.js';
  */
 export function registerPromptOverrideResolver(): void {
   setPromptOverrideResolver((key: string, locale: Locale): string | undefined => {
+    const root = runtimeStoreRoot();
     // Master off ⇒ no overrides ⇒ shipped bytes.
-    if (!customizationEnabled()) return undefined;
-    const state = readCustomizationState();
+    if (!enabledAt(root)) return undefined;
+    const state = runtimeState(root);
     return state.promptOverrides?.[locale]?.[key];
   });
 }
@@ -50,8 +77,9 @@ export function registerPromptOverrideResolver(): void {
  * so gating behaves exactly as before when uncustomized.
  */
 export function resolveConditionalLine(key: string, shippedDefault: boolean): boolean {
-  if (!customizationEnabled()) return shippedDefault;
-  const forced = readCustomizationState().conditionalLines?.[key];
+  const root = runtimeStoreRoot();
+  if (!enabledAt(root)) return shippedDefault;
+  const forced = runtimeState(root).conditionalLines?.[key];
   return typeof forced === 'boolean' ? forced : shippedDefault;
 }
 
@@ -67,8 +95,9 @@ export function resolveConditionalLine(key: string, shippedDefault: boolean): bo
  * is off or no skill overrides exist, returns a shallow copy equal to `defs`.
  */
 export function effectiveBuiltinSkills(defs: SkillDef[]): SkillDef[] {
-  if (!customizationEnabled()) return defs.slice();
-  const overrides = readCustomizationState().builtinSkills;
+  const root = runtimeStoreRoot();
+  if (!enabledAt(root)) return defs.slice();
+  const overrides = runtimeState(root).builtinSkills;
   if (!overrides || !Object.keys(overrides).length) return defs.slice();
   const out: SkillDef[] = [];
   for (const def of defs) {
@@ -76,7 +105,7 @@ export function effectiveBuiltinSkills(defs: SkillDef[]): SkillDef[] {
     if (!ov) { out.push(def); continue; }
     if (ov.disabled) continue; // drop disabled skills
     if (ov.body !== undefined) {
-      const body = readSkillOverrideBody(def.name);
+      const body = readSkillOverrideBodyAt(root, def.name);
       out.push({ name: def.name, content: typeof body === 'string' ? body : def.content });
     } else {
       out.push(def);
@@ -93,12 +122,13 @@ export function effectiveBuiltinSkills(defs: SkillDef[]): SkillDef[] {
  *   - `shippedContent` otherwise
  */
 export function effectiveBuiltinSkillContent(name: string, shippedContent: string): string | undefined {
-  if (!customizationEnabled()) return shippedContent;
-  const ov = readCustomizationState().builtinSkills?.[name];
+  const root = runtimeStoreRoot();
+  if (!enabledAt(root)) return shippedContent;
+  const ov = runtimeState(root).builtinSkills?.[name];
   if (!ov) return shippedContent;
   if (ov.disabled) return undefined;
   if (ov.body !== undefined) {
-    const body = readSkillOverrideBody(name);
+    const body = readSkillOverrideBodyAt(root, name);
     return typeof body === 'string' ? body : shippedContent;
   }
   return shippedContent;
@@ -110,6 +140,7 @@ export function effectiveBuiltinSkillContent(name: string, shippedContent: strin
  * of botmux's stable session-loader indirection.
  */
 export function isBuiltinSkillBodyOverridden(name: string): boolean {
-  if (!customizationEnabled()) return false;
-  return readCustomizationState().builtinSkills?.[name]?.body !== undefined;
+  const root = runtimeStoreRoot();
+  if (!enabledAt(root)) return false;
+  return runtimeState(root).builtinSkills?.[name]?.body !== undefined;
 }
