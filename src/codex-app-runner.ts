@@ -3,6 +3,7 @@ import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:chil
 import { Buffer } from 'node:buffer';
 import { createConnection, type Socket } from 'node:net';
 import type { KeyObject } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import type { CodexAppTurnInput } from './types.js';
 import {
   buildCodexAppTurnStartParams,
@@ -55,6 +56,9 @@ import { CodexAppCotCollector, prepareCodexAppCotMarker } from './services/codex
 import { bridgeCodexUserInput, postCodexAsk } from './services/codex-user-input.js';
 import { parseCodexAsyncQuestions, parseCodexAsyncUserInput, codexAsyncSteerTargetMatches } from './services/codex-async-user-input.js';
 import { larkToolPromptFromEnv } from './core/lark-tool-binding.js';
+import { normalizeSessionTitle } from './core/session-board.js';
+import { isBootstrapDisplayTitle, sessionTitleInput } from './core/session-title-content.js';
+import { generateCodexAppThreadTitle } from './services/codex-app-threads.js';
 import { readProcessStartIdentity } from './utils/process-identity.js';
 
 type JsonObject = Record<string, any>;
@@ -750,6 +754,9 @@ connectControlSocket();
 
 let client!: AppServerClient;
 let threadId = args.threadId;
+let untitledNewThreadId: string | undefined;
+let threadTitleTask: Promise<void> | undefined;
+let shuttingDown = false;
 const browserBroker = args.browserFamily
   ? new CodexBrowserBroker({
       sessionId: args.sessionId,
@@ -1875,12 +1882,59 @@ async function ensureThread(startupDeadlineAtMs?: number): Promise<string> {
   threadId = startedThreadId;
   currentModel = started.model;
   threadReady = true;
+  untitledNewThreadId = startedThreadId;
   emitMarker('thread', { threadId: startedThreadId });
-  void client.request('thread/name/set', {
-      threadId: startedThreadId,
-      name: `botmux ${args.sessionId.slice(0, 8)}`,
-    }, { timeoutMs: 2_000 }).catch(() => { /* naming is cosmetic */ });
   return startedThreadId;
+}
+
+function queueThreadTitle(targetThreadId: string, accepted: readonly Dispatch[]): void {
+  if (shuttingDown || untitledNewThreadId !== targetThreadId) return;
+  const mentions = args.botName ? [{ name: args.botName }] : undefined;
+  for (const { input } of accepted) {
+    const { text } = sessionTitleInput(input.codexAppInput?.text ?? input.content, mentions);
+    if (!text || isBootstrapDisplayTitle(text)) continue;
+    untitledNewThreadId = undefined;
+    threadTitleTask = writeNewThreadTitle(client, targetThreadId, text, currentModel)
+      .catch(() => {}).finally(() => { threadTitleTask = undefined; });
+    break;
+  }
+}
+
+async function writeNewThreadTitle(server: AppServerClient, targetThreadId: string, text: string, model?: string): Promise<void> {
+  const signal = server.lifetime.signal;
+  const isCurrent = () => client === server && threadId === targetThreadId && !generationFenced && !signal.aborted && !shuttingDown;
+  const chars = Array.from(text);
+  const fallback = chars.length > 48 ? `${chars.slice(0, 47).join('').trimEnd()}…` : text;
+  const params = { threadId: targetThreadId };
+  const rpcOptions = { timeoutMs: 2_000 };
+  const readThread = async (options = rpcOptions) => (
+    await server.request('thread/read', { ...params, includeTurns: false }, options)
+  ).thread;
+  const writeTitle = (name: string) => server.request('thread/name/set', { ...params, name }, rpcOptions);
+  const deadline = Date.now() + 5_000;
+  while (isCurrent()) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return;
+    const metadata = await readThread({ timeoutMs: Math.min(remaining, rpcOptions.timeoutMs) }).catch(error => {
+      const notLoaded = error instanceof AppServerRpcError && error.code === -32600
+        && error.message === `thread/read: thread not loaded: ${targetThreadId}`;
+      if (!notLoaded && !isExplicitMissingThread(error) && !(error instanceof AppServerRequestTimeoutError)) throw error;
+      return undefined;
+    });
+    if (!isCurrent() || metadata?.name) return;
+    if (metadata?.id === targetThreadId && metadata.preview) {
+      await writeTitle(fallback);
+      if (!isCurrent()) return;
+      const title = normalizeSessionTitle(await generateCodexAppThreadTitle({
+        sourceText: text, codexBin: args.codexBin, model, signal,
+      }));
+      if (!isCurrent() || !title || title === fallback) return;
+      const latest = await readThread();
+      if (isCurrent() && latest?.id === targetThreadId && latest.name === fallback) await writeTitle(title);
+      return;
+    }
+    await delay(100, undefined, { signal });
+  }
 }
 
 /** Emit a signed lifecycle marker (steer_attempt / steer_accepted / completion_race
@@ -2182,6 +2236,7 @@ function resumeBufferedGroupCompletion(turn: ActiveTurn): boolean {
  * fences the generation (never falls back to a fresh start that would reorder).
  */
 async function tryAdmitSteer(): Promise<void> {
+  if (shuttingDown) return;
   const turn = activeTurn;
   if (!turn) return;
   const head = queue[0];
@@ -2287,6 +2342,7 @@ async function tryAdmitSteer(): Promise<void> {
   }
   queue.shift();
   turn.accepted!.push(dispatch);
+  queueThreadTitle(built.params.threadId, turn.accepted!);
   publishInterruptTarget();
   turn.steerInFlight = undefined;
   steerAdmitting = false;
@@ -2352,6 +2408,7 @@ function finalizeAcceptedGroup(turn: ActiveTurn): void {
 
 async function runTurn(message: QueuedInput): Promise<void> {
   const tid = await ensureThread();
+  if (shuttingDown) return;
   // Native work can change while ensureThread awaits. A late answer must never
   // turn into a steer of a different Goal/native turn at this boundary.
   if (nativeActiveTurnId !== undefined && !canSteerInputToNativeTurn(message, nativeActiveTurnId)) {
@@ -2538,6 +2595,7 @@ async function runTurn(message: QueuedInput): Promise<void> {
   turn.nativeTurnId = responseNativeId;
   turn.requestAccepted = true;
   turn.startResponsePending = false;
+  if (responseNativeId) queueThreadTitle(tid, turn.accepted);
   // The root request is accepted → its native id is now canonical for the group,
   // so pre-final follow-up steers may bind against it (canSteer). A plain start
   // is proven by its start-response; a Goal-continuation root is proven by the
@@ -2664,7 +2722,7 @@ async function drainQueue(): Promise<void> {
   if (processing) return;
   processing = true;
   try {
-    while (queue.length > 0) {
+    while (!shuttingDown && queue.length > 0) {
       // A fenced generation must not consume any more input: an unknown
       // turn/start|turn/steer outcome left a head whose disposition is unknown,
       // and starting the next queued input would submit against a poisoned FIFO.
@@ -2844,7 +2902,8 @@ function handleInput(data: Buffer): void {
   const text = data.toString('utf8');
   for (const ch of text) {
     if (ch === '\u0003') {
-      process.exit(130);
+      void shutdown(130);
+      return;
     } else if (ch === '\r' || ch === '\n') {
       const line = inputBuffer;
       inputBuffer = '';
@@ -2902,27 +2961,24 @@ async function main(): Promise<void> {
   prompt();
 }
 
-process.on('SIGTERM', async () => {
+async function shutdown(code: number): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  controlFatal = true;
+  process.stdin.off('data', handleInput);
+  process.stdin.pause();
   cancelUserInputRequests();
   cancelAsyncUserInputRequests();
   cancelRunnerIdleSettle();
   if (controlReconnectTimer) clearTimeout(controlReconnectTimer);
   controlSocket?.destroy();
-  await browserBroker?.close().catch(() => {});
   client?.close();
-  process.exit(0);
-});
+  await Promise.all([browserBroker?.close().catch(() => {}), threadTitleTask]);
+  process.exit(code);
+}
 
-process.on('SIGINT', async () => {
-  cancelUserInputRequests();
-  cancelAsyncUserInputRequests();
-  cancelRunnerIdleSettle();
-  if (controlReconnectTimer) clearTimeout(controlReconnectTimer);
-  controlSocket?.destroy();
-  await browserBroker?.close().catch(() => {});
-  client?.close();
-  process.exit(130);
-});
+process.on('SIGTERM', () => { void shutdown(0); });
+process.on('SIGINT', () => { void shutdown(130); });
 
 main().catch(err => {
   if (err instanceof CodexAppActiveWriterError) {

@@ -12,6 +12,7 @@ import {
 } from 'node:fs';
 import { createServer, type Server, type Socket } from 'node:net';
 import { createServer as createHttpServer } from 'node:http';
+import { once } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -502,6 +503,7 @@ function startRunner(
     FAKE_CODEX_LOG: logPath,
     FAKE_CODEX_VERSION: version,
     FAKE_CODEX_BEHAVIOR: behavior,
+    FAKE_CODEX_RUNNER_TEST: '1',
     NODE_ENV: 'test',
     ...options.env,
   };
@@ -682,6 +684,106 @@ afterEach(async () => {
   await Promise.all([...liveChildren].map(stopChild));
   await Promise.all([...liveCollectors].map(collector => collector.close()));
   await Promise.all([...liveLocatorCollectors].map(collector => collector.close()));
+});
+
+describe('codex-app-runner native thread titles', { timeout: 20_000 }, () => {
+  it.each([
+    { scenario: 'clean input and semantic title', expected: ['排查图片上传出现的安全错误码', '排查图片安全错误码'] },
+    { scenario: 'first metadata read precedes persistence', notLoadedReads: '1', expected: ['排查图片上传出现的安全错误码', '排查图片安全错误码'] },
+    { scenario: 'first effective input steers the opening turn', steer: true, expected: ['排查图片上传出现的安全错误码', '排查图片安全错误码'] },
+    { scenario: 'legacy input and invalid summary', legacy: true, summary: 'not a title', expected: ['排查图片上传出现的安全错误码'] },
+    { scenario: 'manual rename during summary', externalTitle: '人工标题', expected: ['排查图片上传出现的安全错误码'] },
+    { scenario: 'existing native title', initialTitle: '已有原生标题', expected: [] },
+    { scenario: 'resumed thread', threadId: 'thread-previous', expected: [] },
+  ])('preserves title ownership for $scenario', async ({ legacy, summary, externalTitle, initialTitle, threadId, notLoadedReads, steer, expected }) => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-runner-title-test-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    const titleLog = join(dir, 'titles.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.162.1', steer ? 'steer-started-first' : 'success', control.bootstrap.path, {
+      threadId,
+      env: {
+        FAKE_CODEX_TITLE_LOG: titleLog,
+        ...(summary ? { FAKE_CODEX_TITLE_FINAL_TEXT: summary } : {}),
+        ...(externalTitle ? { FAKE_CODEX_EXTERNAL_TITLE: externalTitle } : {}),
+        ...(initialTitle ? { FAKE_CODEX_INITIAL_TITLE: initialTitle } : {}),
+        ...(notLoadedReads ? { FAKE_CODEX_THREAD_NOT_LOADED_READS: notLoadedReads } : {}),
+      },
+    });
+    try {
+      const task = '排查图片上传出现的安全错误码';
+      const sendInput = (raw: string, text?: string, messageId?: string) => harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput(
+        raw, text === undefined ? undefined : { text, localImages: [] }, messageId, steer,
+      )}\r`);
+      const nameWrites = () => readRequests(logPath).filter(request => request.method === 'thread/name/set');
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      expect(nameWrites()).toEqual([]);
+      const bootstrap = '<botmux_formatting>framework-only prompt</botmux_formatting>';
+      sendInput(bootstrap, steer ? bootstrap : undefined, steer ? 'om_title_opening' : undefined);
+      await waitFor(harness, () => steer
+        ? control.activities.some(activity => activity.phase === 'running') || readRequests(logPath).some(request => request.method === 'turn/start')
+        : control.finals.length >= 1);
+      expect(nameWrites()).toEqual([]);
+      sendInput(`<sender>not title data</sender><user_message>${legacy ? task : 'legacy wrapper text'}</user_message>`,
+        legacy ? undefined : task, steer ? 'om_title_followup' : undefined);
+      await waitFor(harness, () => control.finals.length >= 2);
+      if (steer) expect(readRequests(logPath).filter(request => request.method === 'turn/steer')).toHaveLength(1);
+      if (expected.length) {
+        await waitFor(harness, () => readRequests(titleLog).some(request => request.method === 'thread/unsubscribe'));
+        const titleTurns = readRequests(titleLog).filter(request => request.method === 'turn/start');
+        expect(titleTurns).toHaveLength(1);
+        expect(titleTurns[0]?.params.input[0].text).toContain(JSON.stringify({ source_text: task }));
+        if (externalTitle) {
+          await waitFor(harness, () => readRequests(logPath).filter(request => request.method === 'thread/read').length >= 2);
+        }
+        await waitFor(harness, () => nameWrites().length >= expected.length);
+      }
+      if (!steer) {
+        sendInput('另一个任务不应覆盖标题');
+        await waitFor(harness, () => control.finals.length >= 3);
+      }
+      expect(nameWrites().map(request => request.params.name)).toEqual(expected);
+      if (!expected.length) expect(readRequests(titleLog)).toEqual([]);
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('stops accepting input and control reconnects while a title turn is shutting down', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-runner-title-stop-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    const titleLog = join(dir, 'titles.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.162.1', 'success', control.bootstrap.path, {
+      env: { FAKE_CODEX_TITLE_LOG: titleLog, FAKE_CODEX_TITLE_BEHAVIOR: 'hang-turn-completion' },
+    });
+    try {
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      harness.child.stdin.write('排查图片上传报错\r');
+      await waitFor(harness, () => control.finals.length === 1
+        && readRequests(titleLog).some(request => request.method === 'turn/start'));
+      const exited = once(harness.child, 'exit');
+      harness.child.stdin.write('\x03不应提交退出后的任务\r');
+      expect(await exited).toEqual([130, null]);
+      expect(control.authCount).toBe(1);
+      expect(readRequests(logPath).filter(request => request.method === 'turn/start')).toHaveLength(1);
+      expect(readRequests(titleLog).some(request => request.method === 'thread/unsubscribe')).toBe(true);
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 // Per-test budget matches the widened waitFor budget: a test performs several
