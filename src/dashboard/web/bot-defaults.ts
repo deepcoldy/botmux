@@ -9,6 +9,9 @@ import type { StreamingCardButtonId } from '../../im/lark/streaming-card-buttons
 import type { TraexAutoModelConfig } from '../../services/traex-auto-model.js';
 import type { TriggerUserAuthCredentialSourceConfig } from '../../services/trigger-user-auth.js';
 import type { ScratchCapability } from '../../adapters/backend/scratch-capability.js';
+import { REPLY_FOOTER_KEYS } from '../../services/reply-footer.js';
+import { DEFAULT_LONG_TASK_REMINDER } from '../../services/long-task-reminder-policy.js';
+import { DEFAULT_SESSION_OWNER_REMINDER } from '../../core/session-owner-reminder-config.js';
 
 /** Bot 配置页的分类 tab。放在这个轻量模块里：⌘K 索引（入口包）要按它生成条目，页面本身很重。 */
 export type BotDefaultsTab = 'common' | 'sessions' | 'security' | 'cards' | 'advanced';
@@ -645,6 +648,9 @@ export type BotDefaultsRow = {
   /** 被动入群时自动把 owner 拉进群。缺省 ON —— 只有显式 false 表示关闭。 */
   autoInviteOwnerOnGroupAdd?: boolean;
   ownerGroupFollow?: import('../../services/owner-group-follow-policy.js').OwnerGroupFollowConfig | null;
+  /** undefined = older daemon cannot report this; modified-only must fail open. */
+  commandTriggersConfigured?: boolean;
+  blockedUsersConfigured?: boolean;
   autoStartOnGroupJoin?: boolean;
   autoStartOnGroupJoinPrompt?: string;
   autoStartOnGroupJoinSeed?: string;
@@ -680,6 +686,123 @@ export type LoadBotsResult = {
   bots: BotDefaultsRow[];
   error: string | null;
 };
+
+function configuredSandboxMode(bot: BotDefaultsRow): 'off' | 'oncall' | 'scratch' {
+  return bot.sandboxMode ?? (bot.sandbox ? 'oncall' : 'off');
+}
+
+export function botEffectiveSummary(bot: BotDefaultsRow, sessionCli = '') {
+  const hasLocalSandbox = bot.cliId !== 'riff' && bot.localSandboxApplies !== false;
+  const sandbox = !hasLocalSandbox ? 'off' : bot.effectiveSandboxMode ?? bot.sandboxEnvForce
+    ?? (bot.readIsolation ? 'oncall' : configuredSandboxMode(bot));
+  const follow = bot.apiOnly ? undefined : bot.ownerGroupFollow;
+  return {
+    cli: displayCliId(bot, sessionCli),
+    model: bot.model?.trim() || null,
+    autoModel: bot.traexAutoModel?.enabled === true && !bot.traexAutoModelBlockedReason,
+    workingDirMode: bot.defaultOncall?.enabled ? 'oncall' as const
+      : bot.defaultWorkingDir?.trim() ? 'default' as const : 'manual' as const,
+    sandbox,
+    followEnabled: follow?.enabled === true,
+    followRuleCount: (follow?.includeRules?.length ?? 0) + (follow?.excludeRules?.length ?? 0),
+  };
+}
+
+/** Compare resolved reminder values semantically; the daemon supplies defaults even when unset. */
+function sessionOwnerReminderModified(value: NonNullable<BotDefaultsRow['sessionOwnerReminder']>): boolean {
+  const defaults = DEFAULT_SESSION_OWNER_REMINDER;
+  const defaultQuietHours = defaults.quietHours;
+  const quietHours = value.quietHours ?? defaultQuietHours;
+  const states = new Set(value.states);
+  return value.enabled !== defaults.enabled
+    || value.intervalMinutes !== defaults.intervalMinutes
+    || value.text !== defaults.text
+    || states.size !== defaults.states.length
+    || defaults.states.some(state => !states.has(state))
+    || quietHours?.enabled !== defaultQuietHours?.enabled
+    || quietHours?.start !== defaultQuietHours?.start
+    || quietHours?.end !== defaultQuietHours?.end;
+}
+
+/** Compare the saved Bot settings with the defaults of the corresponding editors. */
+export function botModifiedSectionIds(bot: BotDefaultsRow): ReadonlySet<string> {
+  const text = (value?: string | null) => Boolean(value?.trim());
+  const fields = (value?: object | null) => Boolean(value && Object.keys(value).length);
+  const follow = bot.ownerGroupFollow;
+  const nonDefault = [
+    ['agent', text(bot.model) || bot.reasoningEffort || bot.serviceTier || bot.modelBackendVariant != null
+      || bot.codexProfile || bot.codexRpcInput != null || bot.wrapperCli || bot.cliLaunchMode || bot.cliRuntime
+      || bot.cliPathOverride || bot.cliConfigDir || bot.dshProfile || bot.dshRuntime === 'tui' || bot.turnTimeoutMs != null
+      || fields(bot.nativeSubagentRuntime) || fields(bot.traexAutoModel) || fields(bot.riff)
+      || (bot.skillInjection != null && bot.skillInjection !== (bot.skillInjectionDefault ?? 'prompt'))],
+    ['working-dir', text(bot.defaultWorkingDir) || text(bot.workingDir) || bot.defaultOncall?.enabled
+      || text(bot.defaultOncall?.workingDir)
+      || bot.defaultWorkingDirAutoWorktree || bot.autoInviteOwnerOnGroupAdd === false
+      || follow?.enabled || follow?.includeRules?.length || follow?.excludeRules?.length || follow?.excludeChatIds?.length
+      || (follow?.pollIntervalSeconds != null && follow.pollIntervalSeconds !== 60)
+      || bot.autoStartOnGroupJoin || bot.autoStartOnNewTopic || bot.autoStartExcludedChats?.length
+      || text(bot.autoStartOnGroupJoinPrompt) || text(bot.autoStartOnGroupJoinSeed)
+      || bot.groupJoinCommandEnabled || text(bot.groupJoinCommand)],
+    ['role', text(bot.teamRole)],
+    ['session-mode', (bot.p2pMode != null && bot.p2pMode !== 'chat') || bot.chatManagerEnabled
+      || bot.chatManagerSharedTopic || bot.groupSecretaryEnabled || bot.docSubscribeDefaultMode === 'all'
+      || (bot.regularGroupReplyMode != null && bot.regularGroupReplyMode !== 'chat-topic')
+      || (bot.regularGroupMentionMode != null && bot.regularGroupMentionMode !== 'always')],
+    ['steward', fields(bot.steward)],
+    ['task-routing', fields(bot.taskRouting)],
+    ['substitute', fields(bot.substituteMode)],
+    ['command-trigger', bot.commandTriggersConfigured !== false],
+    ['cross-bot', bot.botToBotSameDir === false],
+    ['session-cap', bot.maxLiveWorkers != null || bot.idleSuspendMinutes != null],
+    ['codex-archive', bot.archiveCodex != null],
+    ['prompt-cache', fields(bot.promptCache)],
+    ['provider-recovery', fields(bot.providerRecovery)],
+    ['startup-commands', text(bot.startupCommands)],
+    ['summary-trigger', bot.summaryMemory || (text(bot.summaryMemoryPath) && bot.summaryMemoryPath !== 'summary.md')
+      || (bot.summaryRange?.limit != null && bot.summaryRange.limit !== 50)
+      || (bot.summaryRange?.sinceHours != null && bot.summaryRange.sinceHours !== 24)],
+    ['sandbox', configuredSandboxMode(bot) !== 'off' || bot.readIsolation || bot.scratchStorage === 'disk'
+      || bot.scratchTmpfsSizeMb != null || bot.scratchDenyPaths?.length],
+    ['network-policy', fields(bot.sandboxNetworkPolicy)],
+    ['sandbox-paths', bot.sandboxPaths?.readWrite.length || bot.sandboxPaths?.readOnly.length || bot.sandboxPaths?.deny.length],
+    ['codex-auth', bot.codexAuthSync === 'isolated'],
+    ['trigger-user-auth', bot.triggerUserAuth?.enabled],
+    ['lark-tool-binding', bot.larkToolBinding === false || bot.larkUserOwnerFallback === false],
+    ['approval-compat', bot.autoAvoidApproval === false],
+    ['grant', bot.p2pOpen || bot.scheduleCreateByTalkers || bot.restrictGrantCommands || bot.autoGrantRequestCards === false
+      || bot.grantRequestToOwnerDm || bot.trustSameOwnerBots === false || bot.grantDelegateBots?.length
+      || bot.grantDefaultDurationMs != null || bot.messageQuotaDefaultLimit != null],
+    ['blocked-users', bot.blockedUsersConfigured !== false],
+    ['slash-commands', text(bot.canTalkDaemonCommands) || text(bot.customPassthroughCommands) || bot.bareRenamePassthrough],
+    ['card-behavior', bot.replyCardMode === 'unified' || bot.disableStreamingCard || bot.hiddenStreamingCardButtons?.length
+      || bot.streamingCardFoldedLayout === false || bot.pinStreamingCard || bot.silentTurnReactions || bot.goalStatusCard
+      || bot.followUpReply || bot.foldBackgroundUpdates || bot.privateCard || bot.writableTerminalLinkInCard
+      || bot.showReplyTiming || bot.showUsageQuota === false || (bot.usageDisplay != null && bot.usageDisplay !== 'streaming')
+      || bot.replyCardActions || bot.replyCardNextStep || bot.replyCardRecap || bot.cotEnabled === false
+      || bot.replyCardShowTools === false || bot.replyCardNativeCot || REPLY_FOOTER_KEYS.some(key => bot[key] === false)],
+    ['long-task-reminder', bot.longTaskReminder && (bot.longTaskReminder.enabled
+      || bot.longTaskReminder.thresholdMinutes !== DEFAULT_LONG_TASK_REMINDER.thresholdMinutes
+      || bot.longTaskReminder.intervalMinutes !== DEFAULT_LONG_TASK_REMINDER.intervalMinutes)],
+    ['feedback', fields(bot.feedback)],
+    ['oncall', fields(bot.oncallGroup)],
+    ['reply-style', fields(bot.replyStyle)],
+    ['local-address', bot.hideLocalAddresses],
+    ['ask-option-layout', bot.askOptionLayout != null && bot.askOptionLayout !== 'compact'],
+    ['brand', text(bot.brandLabel)],
+    ['backend', bot.backendType || bot.hcHerdrTabs],
+    ['herdr', fields(bot.herdr)],
+    ['codex-app-display', bot.codexAppCleanInput || bot.codexBrowser || bot.codexBrowserAutoApproveOrigins || fields(bot.noProgressNotify)],
+    ['prompt-injection', bot.promptInjection === 'none'],
+    ['reply-delivery', bot.topicUnavailablePolicy === 'stop'
+      || (bot.replyDelivery != null && bot.replyDelivery !== (bot.replyDeliveryDefault ?? 'send'))],
+    ['sender-tag', bot.senderTag === false || bot.senderTagHideEmail],
+    ['quota-fallback', bot.quotaFallbackBot?.enabled],
+    ['quota-fallback-chain', bot.quotaFallbackChain?.enabled],
+    ['runtime-env', text(bot.launchShell) || text(bot.env) || bot.envKeys?.length || bot.envPolicy?.mode === 'strict'],
+    ['owner-reminder', bot.sessionOwnerReminder != null && sessionOwnerReminderModified(bot.sessionOwnerReminder)],
+  ] as const;
+  return new Set(nonDefault.filter(([, modified]) => modified).map(([id]) => id));
+}
 
 export const fallbackCliOptions: CliOption[] = [
   { id: 'claude-code', label: 'Claude' },

@@ -3,7 +3,7 @@ import * as sessionStore from '../services/session-store.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { normalizeSessionTitle } from './session-board.js';
 import { sessionTitleInput, stripLeadingKnownTitleMentions, hasManualSessionTitle, isBootstrapDisplayTitle, type TitleBootstrapFingerprint } from './session-title-content.js';
-import { createHash } from 'node:crypto';
+import { titleBootstrapDigest } from './session-title-digest.js';
 
 export type SessionTitleSource = 'initial' | 'user' | 'agent' | 'cli' | 'dashboard' | 'system';
 
@@ -30,8 +30,6 @@ export function extractBotmuxLarkNativeSessionTitlePrompt(
   if (!content) return undefined;
   return Array.from(content).slice(0, BOTMUX_LARK_TITLE_PROMPT_MAX).join('');
 }
-
-function titleBootstrapDigest(text: string): string { return createHash('sha256').update(text).digest('hex'); }
 
 export function captureTitleBootstrap(raw: unknown, mentions?: readonly { name: string }[]): TitleBootstrapFingerprint {
   const text = sessionTitleInput(raw, mentions).text;

@@ -168,6 +168,7 @@ import {
   setActiveSessionsRegistry,
 } from '../src/core/worker-pool.js';
 import { MessageWithdrawnError } from '../src/im/lark/client.js';
+import { executeWithLarkGate } from '../src/im/lark/api-gate.js';
 import { markRetryAttempt } from '../src/services/failed-turn-retry.js';
 import { holdPurgeClickRollback, PURGE_CONTINUATION_WITHHELD, PURGE_IMAGES_NOT_APPLIED } from '../src/services/image-purge-recovery.js';
 import { emitSessionLifecycleHook } from '../src/services/session-lifecycle-hooks.js';
@@ -249,7 +250,7 @@ function deferred<T>() { let resolve!: (value: T) => void; let reject!: (error: 
 const stores: Array<{ close(): void }> = [];
 beforeEach(() => { vi.useFakeTimers(); vi.clearAllMocks(); });
 afterEach(() => { for (const s of stores.splice(0)) s.close(); setActiveSessionsRegistry(undefined); __testOnly_resetOrdinaryImDeliveries(); vi.useRealTimers(); });
-async function fixture(reply: (...args: any[]) => Promise<string>) {
+async function fixture(reply: (...args: any[]) => Promise<string>, journaled = false) {
   const sessionReply = vi.fn(reply);
   initWorkerPool({ sessionReply, getSessionWorkingDir: () => config.session.dataDir, getActiveCount: () => 1, closeSession: vi.fn() });
   const ds = makeDs(); ds.adoptedFrom = undefined;
@@ -270,6 +271,7 @@ async function fixture(reply: (...args: any[]) => Promise<string>) {
   controller.bindRuntime('current', producer, identity); expect(store.authorizeExecutionObserver(ref, producer, execution)).toBe(true);
   store.apply(ref, { type: 'worker_online', worker: producer }); controller.refresh();
   ds.initConfig = { cliId: 'codex-app', sessionContract: bootstrap } as any;
+  if (journaled) ds.initConfig!.finalOutputHandoff = { version: 2, token: 'fixture-token' };
   ds.session.codexAppDispatchLedger = [
     { dispatchId: 'dispatch-old', turnId: 'old-turn', dispatchAttempt: 1, state: 'prepared', content: 'old', deliverySink: 'lark', codexAppSteerable: true },
     { dispatchId: 'dispatch-next', turnId: 'newer-turn', dispatchAttempt: 2, state: 'prepared', content: 'next', deliverySink: 'lark', codexAppSteerable: true },
@@ -281,10 +283,72 @@ async function fixture(reply: (...args: any[]) => Promise<string>) {
   const msg: any = { type: 'final_output', sessionId: ref.sessionId, turnId: 'old-turn', dispatchAttempt: 1, content: 'retained native answer', lastUuid: 'old-turn',
     sessionContract: origin, sessionOutputOrigin: origin,
     codexAppSettlement: { requestId: 'persist-old', dispatchId: 'dispatch-old', generation: 'generation-original', seq: 7 } };
-  return { ds, controller, ref, current, old, execution, middle, worker, msg, sessionReply, sent,
-    run: (message = msg) => worker.listeners('message')[0](message) as Promise<void> };
+  const run = (message = msg): Promise<void> => {
+    if (journaled) {
+      const { id, fingerprint } = outputSnapshot(ds.larkAppId, message);
+      message = { ...message, handoff: { version: 2, token: 'fixture-token', id, fingerprint } };
+    }
+    return worker.listeners('message')[0](message);
+  };
+  return { ds, controller, ref, current, old, execution, middle, worker, msg, sessionReply, sent, run };
 }
 describe('contentful historical Codex App settlement delivery', () => {
+  it.each([false, true])('settles a withdrawn reply once and delivers the next answer (journaled=%s)', async journaled => {
+    const h = await fixture(async () => 'om_next_answer', journaled);
+    h.sessionReply.mockRejectedValueOnce(new MessageWithdrawnError('om_root'));
+    const first = h.run();
+    await vi.waitFor(() => expect(h.sessionReply).toHaveBeenCalledTimes(1));
+    await first;
+    expect(h.sent).toHaveBeenCalledWith(expect.objectContaining({ requestId: 'persist-old', ok: true }));
+    expect(h.ds.session.codexAppDispatchLedger?.map(entry => entry.dispatchId)).toEqual(['dispatch-next']);
+    const ledger = new TurnSendLedger(config.session.dataDir);
+    const ledgerKey = { larkAppId: h.ds.larkAppId, sessionId: h.ref.sessionId, turnId: 'old-turn', dispatchAttempt: 1 };
+    // A first-attempt withdrawal proves this call had no external effect: the
+    // journal must not retain an unknown publication that would later fail closed
+    // on replay (the uncertain-retry cases below assert the opposite polarity).
+    expect(ledger.read(ledgerKey)?.final).toBeUndefined();
+    expect(ledger.read(ledgerKey)?.publication).toBeUndefined();
+
+    const origin = { ...h.msg.sessionContract, sequence: 2, eventId: `${h.msg.sessionContract.producer.workerId}:2` };
+    await h.run({ ...h.msg, sessionContract: origin, sessionOutputOrigin: origin,
+      codexAppSettlement: { ...h.msg.codexAppSettlement, requestId: 'replay-old' } });
+    expect(h.sessionReply).toHaveBeenCalledTimes(1);
+    expect(h.sent).toHaveBeenCalledWith(expect.objectContaining({ requestId: 'replay-old', ok: true }));
+
+    const nextOrigin = { ...origin, sequence: 3, eventId: `${origin.producer.workerId}:3`, scope: { runtime: h.current, execution: h.middle } };
+    const next = h.run({ ...h.msg, turnId: 'newer-turn', dispatchAttempt: 2, lastUuid: 'newer-turn', content: 'next answer',
+      sessionContract: nextOrigin, sessionOutputOrigin: nextOrigin,
+      codexAppSettlement: { ...h.msg.codexAppSettlement, dispatchId: 'dispatch-next', requestId: 'persist-next', seq: 8 } });
+    await vi.waitFor(() => expect(h.sessionReply).toHaveBeenCalledTimes(2));
+    await next;
+    expect(h.sessionReply).toHaveBeenCalledTimes(2);
+    expect(h.sent).toHaveBeenCalledWith(expect.objectContaining({ requestId: 'persist-next', ok: true }));
+    expect(h.ds.session.codexAppDispatchLedger ?? []).toHaveLength(0);
+  });
+  it.each(['bridge', 'provider'])('preserves the unknown publication after a %s retry encounters withdrawal', async layer => {
+    const transport = vi.fn(async () => { throw new MessageWithdrawnError('om_root'); });
+    transport.mockRejectedValueOnce(Object.assign(new Error('connection reset'), { isAxiosError: true, code: 'ECONNRESET' }));
+    const h = await fixture(layer === 'bridge' ? transport : () => executeWithLarkGate('app_test', 'replyMessage', transport), true);
+    const pending = h.run();
+    await vi.waitFor(() => expect(transport).toHaveBeenCalledTimes(1));
+    await vi.runOnlyPendingTimersAsync();
+    await pending;
+    expect(transport).toHaveBeenCalledTimes(2);
+    expect(h.ds.session.codexAppDispatchLedger).toHaveLength(2);
+    const ledger = new TurnSendLedger(config.session.dataDir);
+    expect(ledger.read({ larkAppId: h.ds.larkAppId, sessionId: h.ref.sessionId, turnId: 'old-turn', dispatchAttempt: 1 })?.publication).toBeDefined();
+  });
+  it('retains a journaled native turn suspended while the withdrawn reply is in flight', async () => {
+    const network = deferred<string>();
+    const h = await fixture(() => network.promise, true);
+    const pending = h.run();
+    await vi.waitFor(() => expect(h.sessionReply).toHaveBeenCalledOnce());
+    h.controller.beginControl('suspend', 'operator-suspend');
+    network.reject(new MessageWithdrawnError('om_root'));
+    await pending;
+    expect(h.ds.session.codexAppDispatchLedger).toHaveLength(2);
+    expect(h.sent).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'codex_app_dispatch_persisted', ok: true }));
+  });
   it('delivers the retained answer through the actual handler and transport before ledger ACK', async () => {
     const network = deferred<string>(); const h = await fixture(() => network.promise);
     const pending = h.run(); await vi.waitFor(() => expect(h.sessionReply).toHaveBeenCalledTimes(1));

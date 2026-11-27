@@ -57,6 +57,15 @@ describe('runtimeIdentityForContract for a re-attached Antigravity CLI', () => {
     expect(s.readIdentity(s.scope.beginRuntime()).nativeSessionId).toBeUndefined();
   });
 
+  it('names a native rotation completed before persistent reattach', () => {
+    const s = antigravityScope({
+      lastSpawnEffectiveResume: true,
+      lastSpawnEffectiveCliSessionId: '0b0e2b4a-0000-4000-8000-000000000001',
+      lastSpawnPersistentReattach: true,
+    });
+    expect(s.readIdentity(s.scope.beginRuntime()).nativeSessionId).toBe(LIVE);
+  });
+
   it('does not claim a conversation while a native fork is moving the CLI to another', () => {
     const s = antigravityScope({ nativeSessionForkPending: () => true });
     expect(s.readIdentity(s.scope.beginRuntime()).nativeSessionId).toBeUndefined();

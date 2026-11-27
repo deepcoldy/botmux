@@ -4,6 +4,7 @@ import {
   type TaskRoutingCostTier,
 } from '../../core/task-routing/model.js';
 import { DEFAULT_OWNER_REMINDER_QUIET_HOURS, normalizeOwnerReminderQuietHours } from '../../core/session-owner-reminder-quiet-hours.js';
+import { DEFAULT_SESSION_OWNER_REMINDER } from '../../core/session-owner-reminder-config.js';
 import type { OncallPresetOptions } from '../../services/oncall-preset-options.js';
 import { normalizePassthroughCommand, parseCustomPassthroughInput } from '../../core/passthrough-commands.js';
 import type { OncallGroupBusinessTarget } from '../../services/oncall-group-client.js';
@@ -20,7 +21,7 @@ import { CodexProfilePicker } from './codex-profile-picker.js';
 import { afterNextPaint } from './deferred-task.js';
 import { LazyTabPanel } from './lazy-tab-panel.js';
 import { REPLY_FOOTER_KEYS, normalizeReplyFooter } from '../../services/reply-footer.js';
-import { useCallback, useEffect, useId, useMemo, useRef, useState, type ComponentProps, type ReactNode } from 'react';
+import { Children, cloneElement, isValidElement, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ComponentProps, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { cloneSourceDefaultsFrom, openBotOnboarding } from './bot-onboarding.js';
 import { StreamingCardPinToggle } from './streaming-card-pin-toggle.js';
@@ -68,6 +69,9 @@ import {
   type SubstituteTargetResolution,
   type BotDefaultsSection,
   type BotDefaultsTab,
+  BOT_DEFAULTS_SECTIONS,
+  botEffectiveSummary,
+  botModifiedSectionIds,
   botDefaultsSectionDomId,
   codexArchiveInapplicableReason,
   codexArchiveSectionVisible,
@@ -380,8 +384,57 @@ export function BotDefaultsTabs(props: {
 const BD_GRID_ROW_PX = 1; // must match grid-auto-rows in style.css
 const BD_GRID_GAP_PX = 14; // must match .bd-tab-grid gap
 
-export function BdTabGrid(props: { children: ReactNode; className?: string }) {
+type BotDefaultsFilter = { query: string; modifiedIds: ReadonlySet<string> | null; onClear(): void };
+
+function tileSearchText(tile: HTMLElement): string {
+  const text: string[] = [];
+  const walker = tile.ownerDocument.createTreeWalker(tile, NodeFilter.SHOW_TEXT);
+  while (walker.nextNode()) {
+    const node = walker.currentNode;
+    const hidden = node.parentElement?.closest('[hidden]');
+    if (hidden && hidden !== tile && tile.contains(hidden)) continue;
+    text.push(node.textContent ?? '');
+  }
+  return text.join(' ').replace(/\s+/g, ' ').toLowerCase();
+}
+
+export function BdTabGrid(props: { children: ReactNode; className?: string; filter?: BotDefaultsFilter }) {
+  const tr = useT();
   const ref = useRef<HTMLDivElement | null>(null);
+  const [searchText, setSearchText] = useState<ReadonlyMap<string, string> | null>(null);
+  const query = props.filter?.query.trim().replace(/\s+/g, ' ').toLowerCase() ?? '';
+  const hasQuery = Boolean(query);
+
+  useLayoutEffect(() => {
+    const grid = ref.current;
+    if (!hasQuery || !grid) return;
+    const read = () => {
+      const text = new Map([...grid.querySelectorAll<HTMLElement>(':scope > .bd-tile[id]')]
+        .map(tile => [tile.id, tileSearchText(tile)]));
+      setSearchText(previous => previous?.size === text.size
+        && [...text].every(([id, value]) => previous.get(id) === value) ? previous : text);
+    };
+    read();
+    const observer = new MutationObserver(read);
+    observer.observe(grid, { childList: true, characterData: true, subtree: true, attributeFilter: ['hidden'] });
+    return () => observer.disconnect();
+  }, [hasQuery]);
+
+  let visibleCount = 0;
+  const modifiedIds = props.filter?.modifiedIds;
+  const children = props.filter ? Children.map(props.children, child => {
+    if (!hasQuery && !modifiedIds) return child;
+    if (!isValidElement<{ id?: string; hidden?: boolean }>(child) || !child.props.id) return child;
+    const tileId = child.props.id;
+    const sections = BOT_DEFAULTS_SECTIONS.filter(section => botDefaultsSectionDomId(section.tile ?? section.id) === tileId);
+    const translated = () => sections.flatMap(section => [section.titleKey, ...(section.fieldKeys ?? [])])
+      .map(key => tr(key)).join(' ').toLowerCase();
+    const hidden = Boolean((modifiedIds && !sections.some(section => modifiedIds.has(section.id)))
+      || (hasQuery && !(searchText?.get(tileId) ?? translated()).includes(query)));
+    if (!hidden) visibleCount += 1;
+    return cloneElement(child, { hidden });
+  }) : props.children;
+  const empty = Boolean((hasQuery || modifiedIds) && !visibleCount);
 
   useEffect(() => {
     const grid = ref.current;
@@ -397,7 +450,7 @@ export function BdTabGrid(props: { children: ReactNode; className?: string }) {
 
     const layout = () => {
       const tiles = Array.from(grid.children).filter(
-        (n): n is HTMLElement => n instanceof HTMLElement,
+        (n): n is HTMLElement => n instanceof HTMLElement && !n.hidden,
       );
       if (!tiles.length) return;
 
@@ -464,11 +517,15 @@ export function BdTabGrid(props: { children: ReactNode; className?: string }) {
     };
   });
 
-  return (
+  return <>
     <div ref={ref} className={props.className ? `bd-tab-grid ${props.className}` : 'bd-tab-grid'}>
-      {props.children}
+      {children}
     </div>
-  );
+    {empty && <div className="bd-filter-empty" data-bd-filter-empty>
+      <p role="status">{tr('botDefaults.filterEmpty')}</p>
+      <button type="button" data-action="bot-defaults-clear-filter" onClick={props.filter?.onClear}>{tr('botDefaults.filterClear')}</button>
+    </div>}
+  </>;
 }
 
 /**
@@ -765,14 +822,16 @@ export function resolveBotDefaultsTarget(
   return { target: row, block: 'center', missing: null };
 }
 
-function focusBotDefaultsTarget(link: BotDefaultsDeepLink, tr: ReturnType<typeof useT>): void {
-  const { target, block, missing } = resolveBotDefaultsTarget(link, document, tr);
+function focusBotDefaultsTarget(link: BotDefaultsDeepLink, tr: ReturnType<typeof useT>, align?: ScrollLogicalPosition): void {
+  const { target, block: resolvedBlock, missing } = resolveBotDefaultsTarget(link, document, tr);
   if (target) {
+    const block = align ?? resolvedBlock;
     // 资料头（含分类栏）在宽屏下是吸顶的：区块从顶部露出时要让开它，否则标题和闪烁框被挡住。
     const chrome = document.querySelector<HTMLElement>('.bot-defaults-page .bd-profile-chrome');
     const sticky = block === 'start' && chrome && getComputedStyle(chrome).position === 'sticky';
     target.style.scrollMarginTop = sticky ? `${chrome.offsetHeight + 12}px` : '';
-    target.scrollIntoView({ behavior: 'smooth', block });
+    const reduced = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    target.scrollIntoView({ behavior: reduced ? 'instant' : 'smooth', block });
     target.classList.remove('palette-target-flash');
     void target.offsetWidth;
     target.classList.add('palette-target-flash');
@@ -810,6 +869,26 @@ export function BotDefaultsPage() {
   // 消费一次后清掉参数。
   const deepLinkRef = useRef<BotDefaultsDeepLink | null>(readBotDefaultsDeepLink());
   const [activeTab, setActiveTab] = useState<BotDefaultsTab>(() => deepLinkRef.current?.tab ?? 'common');
+  const [filterQuery, setFilterQuery] = useState('');
+  const [modifiedOnly, setModifiedOnly] = useState(false);
+  const [summaryTarget, setSummaryTarget] = useState<BotDefaultsDeepLink | null>(null);
+  const clearFilter = () => { setFilterQuery(''); setModifiedOnly(false); };
+  const locateSummary = (id: string, field: string | null = null) => {
+    const section = findBotDefaultsSection(id);
+    if (!section) return;
+    clearFilter();
+    setActiveTab(section.tab);
+    setSummaryTarget({ tab: section.tab, section, field });
+  };
+
+  useEffect(() => {
+    if (!summaryTarget || activeTab !== summaryTarget.tab || typeof window === 'undefined') return;
+    const frame = window.requestAnimationFrame(() => {
+      focusBotDefaultsTarget(summaryTarget, tr, 'start');
+      setSummaryTarget(null);
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [summaryTarget, activeTab, tr]);
 
   const refresh = useCallback(async (clearProfileRoles = false) => {
     if (clearProfileRoles) setProfileRoleVersion(version => version + 1);
@@ -934,7 +1013,13 @@ export function BotDefaultsPage() {
         refreshBot={() => { void refresh(); }}
         brandEnabled={brandEnabled}
         activeTab={activeTab}
-        onTabChange={setActiveTab}
+        onTabChange={tab => { setSummaryTarget(null); setActiveTab(tab); }}
+        onLocate={locateSummary}
+        filterQuery={filterQuery}
+        onFilterQuery={setFilterQuery}
+        modifiedOnly={modifiedOnly}
+        onModifiedOnly={setModifiedOnly}
+        onClearFilter={clearFilter}
         linkedAgent={linkedAgentNames[selectedBot.larkAppId] ?? null}
       />
     );
@@ -1012,6 +1097,7 @@ export function BotDefaultsPage() {
                 bot={bot}
                 selected={bot.larkAppId === selectedAppId}
                 onSelect={() => {
+                  setSummaryTarget(null);
                   setSelectedAppId(bot.larkAppId);
                   if (bot.startupBlocked?.reason === 'quota_fallback_cycle') setActiveTab('advanced');
                 }}
@@ -1080,6 +1166,34 @@ export function OncallChatCounts(props: { bot: Pick<BotDefaultsRow, 'autoboundCh
   );
 }
 
+function BotDefaultsSummary(props: { bot: BotDefaultsRow; cli: string; onLocate(id: string, field?: string): void }) {
+  const tr = useT();
+  const summary = botEffectiveSummary(props.bot, props.cli);
+  const model = summary.autoModel ? tr('botDefaults.summaryAutoModel') : summary.model;
+  const entries = [
+    { id: 'agent', section: 'agent', label: tr('botDefaults.summaryAgent'),
+      value: [summary.cli, model ?? tr('botDefaults.summaryDefault')].filter(Boolean).join(' · '), active: Boolean(model) },
+    { id: 'directory', section: 'working-dir', label: tr('botDefaults.summaryWorkingDir'),
+      value: tr(`botDefaults.summaryDirectory.${summary.workingDirMode}`), active: summary.workingDirMode !== 'manual' },
+    { id: 'sandbox', section: 'sandbox', label: tr('botDefaults.sectionSandbox'),
+      value: summary.sandbox === 'off' ? tr('botDefaults.summaryOff') : summary.sandbox, active: summary.sandbox !== 'off',
+      disabled: props.bot.cliId === 'riff' },
+    { id: 'follow', section: 'working-dir', field: 'botDefaults.ownerGroupFollow', label: tr('botDefaults.summaryFollow'),
+      value: !summary.followEnabled ? tr('botDefaults.summaryOff') : summary.followRuleCount
+        ? tr(summary.followRuleCount === 1 ? 'botDefaults.summaryFollowRule' : 'botDefaults.summaryFollowRules', { count: summary.followRuleCount })
+        : tr('botDefaults.summaryOn'),
+      active: summary.followEnabled },
+  ];
+  return <div className="bd-summary-strip" data-bd-summary-strip role="group" aria-label={tr('botDefaults.summaryLabel')}>
+    {entries.map(entry => <button type="button" key={entry.id} data-bd-summary={entry.id}
+      className={entry.active ? 'is-active' : undefined} title={entry.value} disabled={entry.disabled}
+      onClick={() => props.onLocate(entry.section, entry.field)}>
+      <span className="bd-summary-label">{entry.label}</span>
+      <span className="bd-summary-value"><i aria-hidden="true" /><span>{entry.value}</span></span>
+    </button>)}
+  </div>;
+}
+
 function BotDefaultsCard(props: {
   bot: BotDefaultsRow;
   bots: BotDefaultsRow[];
@@ -1089,12 +1203,24 @@ function BotDefaultsCard(props: {
   brandEnabled: boolean;
   activeTab: BotDefaultsTab;
   onTabChange(tab: BotDefaultsTab): void;
+  onLocate(id: string, field?: string): void;
+  filterQuery: string;
+  onFilterQuery(query: string): void;
+  modifiedOnly: boolean;
+  onModifiedOnly(modified: boolean): void;
+  onClearFilter(): void;
   linkedAgent?: AgentLockInfo | null;
 }) {
   const tr = useT();
   const { bot, cliState, patchBot } = props;
   const name = bot.botName ?? bot.larkAppId;
   const cli = displayCliId(bot, cliIdOf(bot.larkAppId));
+  const modifiedIds = useMemo(() => props.modifiedOnly ? botModifiedSectionIds(bot) : null, [props.modifiedOnly, bot]);
+  const filterForTab = (tab: BotDefaultsTab): BotDefaultsFilter => ({
+    query: tab === props.activeTab ? props.filterQuery : '',
+    modifiedIds: tab === props.activeTab ? modifiedIds : null,
+    onClear: props.onClearFilter,
+  });
 
   const putCardPref = useCallback(async (patch: CardPrefPatch): Promise<JsonResponse> => {
     const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/card-prefs`, patch);
@@ -1145,7 +1271,18 @@ function BotDefaultsCard(props: {
             <BotDescriptionControl bot={bot} />
           </div>
         </header>
+        <BotDefaultsSummary bot={bot} cli={cli} onLocate={props.onLocate} />
         <BotDefaultsTabs active={props.activeTab} onChange={props.onTabChange} />
+        <div className="bd-filter-bar" role="search" aria-label={tr('botDefaults.filterPlaceholder')}>
+          <label className="bd-filter-search">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="6.8" cy="6.8" r="4.2" /><path d="m10 10 3.2 3.2" /></svg>
+            <input type="search" id="bot-defaults-filter" data-input="botDefaultsFilter" aria-label={tr('botDefaults.filterPlaceholder')}
+              placeholder={tr('botDefaults.filterPlaceholder')} value={props.filterQuery}
+              onChange={event => props.onFilterQuery(event.currentTarget.value)} />
+          </label>
+          <button type="button" data-action="bot-defaults-modified-only" aria-pressed={props.modifiedOnly}
+            onClick={() => props.onModifiedOnly(!props.modifiedOnly)}>{tr('botDefaults.filterModifiedOnly')}</button>
+        </div>
       </div>
       {bot.startupBlocked?.reason === 'quota_fallback_cycle' ? (
         <div className="bd-startup-blocked" role="alert" data-startup-blocked>
@@ -1166,7 +1303,7 @@ function BotDefaultsCard(props: {
       ) : null}
       <div className="bd-body bd-tab-panels">
         <LazyTabPanel id="common" active={props.activeTab === 'common'}>
-          <BdTabGrid>
+          <BdTabGrid filter={filterForTab('common')}>
             <section className="bd-tile" id={botDefaultsSectionDomId('agent')}>
               <BotAgentSection bot={bot} sessionFallback={cli} cliState={cliState} patchBot={patchBot} lock={props.linkedAgent} />
             </section>
@@ -1177,12 +1314,12 @@ function BotDefaultsCard(props: {
           </BdTabGrid>
         </LazyTabPanel>
         <LazyTabPanel id="sessions" active={props.activeTab === 'sessions'}>
-          <BdTabGrid>
+          <BdTabGrid filter={filterForTab('sessions')}>
             <section className="bd-tile" id={botDefaultsSectionDomId('session-mode')}><SessionModeSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('steward')}><StewardSection bot={bot} patchBot={patchBot} active={props.activeTab === 'sessions'} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('task-routing')}><TaskRoutingSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('substitute')}><SubstituteModeSection bot={bot} patchBot={patchBot} /></section>
-            <section className="bd-tile" id={botDefaultsSectionDomId('command-trigger')}><CommandTriggerSection bot={bot} /></section>
+            <section className="bd-tile" id={botDefaultsSectionDomId('command-trigger')}><CommandTriggerSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('cross-bot')}>
               <CrossBotSection bot={bot} putCardPref={putCardPref} />
             </section>
@@ -1204,7 +1341,7 @@ function BotDefaultsCard(props: {
           </BdTabGrid>
         </LazyTabPanel>
         <LazyTabPanel id="security" active={props.activeTab === 'security'}>
-          <BdTabGrid>
+          <BdTabGrid filter={filterForTab('security')}>
             {/* riff 在远端沙箱执行、本地无 CLI 进程，文件沙盒对它无意义（worker 侧已旁路）。 */}
             {bot.cliId !== 'riff' ? (
               <section className="bd-tile" id={botDefaultsSectionDomId('sandbox')}><SandboxSection bot={bot} patchBot={patchBot} lock={props.linkedAgent} /><NetworkPolicySection bot={bot} patchBot={patchBot} /></section>
@@ -1221,12 +1358,13 @@ function BotDefaultsCard(props: {
               <section className="bd-tile" id={botDefaultsSectionDomId('approval-compat')}><AutoAvoidApprovalSection bot={bot} patchBot={patchBot} /></section>
             ) : null}
             <section className="bd-tile" id={botDefaultsSectionDomId('grant')}><GrantSection bot={bot} patchBot={patchBot} /></section>
-            <section className="bd-tile" id={botDefaultsSectionDomId('blocked-users')}><BlockedUsersEditor larkAppId={bot.larkAppId} tr={tr} /></section>
+            <section className="bd-tile" id={botDefaultsSectionDomId('blocked-users')}><BlockedUsersEditor larkAppId={bot.larkAppId} tr={tr}
+              onConfiguredChange={blockedUsersConfigured => patchBot(bot.larkAppId, { blockedUsersConfigured })} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('slash-commands')}><SlashCommandPermissionsSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
         </LazyTabPanel>
         <LazyTabPanel id="cards" active={props.activeTab === 'cards'}>
-          <BdTabGrid>
+          <BdTabGrid filter={filterForTab('cards')}>
             <section className="bd-tile bd-tile-wide" id={botDefaultsSectionDomId('card-behavior')}><CardBehaviorSection bot={bot} putCardPref={putCardPref} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('long-task-reminder')}><LongTaskReminderSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile bd-tile-wide" id={botDefaultsSectionDomId('feedback')}><FeedbackSettingsSection bot={bot} patchBot={patchBot} active={props.activeTab === 'cards'} /></section>
@@ -1238,7 +1376,7 @@ function BotDefaultsCard(props: {
           </BdTabGrid>
         </LazyTabPanel>
         <LazyTabPanel id="advanced" active={props.activeTab === 'advanced'}>
-          <BdTabGrid>
+          <BdTabGrid filter={filterForTab('advanced')}>
             {/* 远端 CLI（riff/mojo）：backendType 与 CLI 选择 1:1 绑定 ——
                 reconcileRiffBackendType 在 spawn 层按 isRemoteBackendId(cliId)
                 无条件改写为同名后端，所以这里手动切 pty/tmux 只是一个会被
@@ -2227,15 +2365,8 @@ const OWNER_REMINDER_STATE_OPTIONS = [
   { value: 'limited', labelKey: 'botDefaults.ownerReminderStateLimited' },
 ] as const;
 
-// Offline/error rows can lack the daemon-provided default payload. Keep this
-// browser fallback aligned with DEFAULT_SESSION_OWNER_REMINDER.
-const DEFAULT_OWNER_REMINDER = {
-  enabled: false,
-  intervalMinutes: 30,
-  text: '该会话已等待处理，请继续跟进。',
-  states: OWNER_REMINDER_STATE_OPTIONS.map(option => option.value),
-  quietHours: DEFAULT_OWNER_REMINDER_QUIET_HOURS,
-};
+// Offline/error rows can lack the daemon-provided default payload.
+const DEFAULT_OWNER_REMINDER = DEFAULT_SESSION_OWNER_REMINDER;
 
 function SessionOwnerReminderSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
@@ -3538,6 +3669,13 @@ export function BotAgentSection(props: {
           agentSelectionKey: res.body.selectionKey ?? cliKey,
           readIsolation: res.body.readIsolation === true,
           readIsolationSupported: res.body.readIsolationSupported === true,
+          // Older agent PUT responses omit these: use the summary's legacy/config fallback,
+          // not stale capability values from the previous CLI/backend pairing.
+          localSandboxApplies: typeof res.body.localSandboxApplies === 'boolean' ? res.body.localSandboxApplies : null,
+          sandboxEnvForce: res.body.sandboxEnvForce === 'oncall' || res.body.sandboxEnvForce === 'scratch'
+            ? res.body.sandboxEnvForce : null,
+          effectiveSandboxMode: res.body.effectiveSandboxMode === 'off' || res.body.effectiveSandboxMode === 'oncall'
+            || res.body.effectiveSandboxMode === 'scratch' ? res.body.effectiveSandboxMode : null,
         });
       if (editorSaveEpoch.current !== saveEpoch) {
         if (res.ok && res.body.ok) syncSavedBot();
@@ -5710,6 +5848,7 @@ export function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
       onSaved: body => patchBot(bot.larkAppId, {
         sandbox: body.sandbox === true,
         sandboxMode: (body.mode ?? next) as 'off' | 'oncall' | 'scratch',
+        effectiveSandboxMode: null,
         ...(next === 'scratch' ? { scratchStorage: nextStorage } : {}),
       }),
       rollback: () => setSelected(mode),
@@ -5737,7 +5876,7 @@ export function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
       setBusy,
       saved: tr('botDefaults.sandboxSaved'),
       errorText: res => configErrorText(res, tr),
-      onSaved: () => patchBot(bot.larkAppId, { readIsolation: false }),
+      onSaved: () => patchBot(bot.larkAppId, { readIsolation: false, effectiveSandboxMode: null }),
     });
   }
 
@@ -8477,7 +8616,7 @@ type CommandTriggerRow = { key: number; cmd: string; prompt: string };
  * 冲突判定一律问服务端（/conflicts）：透传命令集随 bot 的实际 CLI 变化，前端自带
  * 一份必然过期。
  */
-function CommandTriggerSection(props: { bot: BotDefaultsRow }) {
+function CommandTriggerSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
   const [enabled, setEnabled] = useState(false);
   const [rows, setRows] = useState<CommandTriggerRow[]>([{ key: 1, cmd: '', prompt: '' }]);
@@ -8555,6 +8694,8 @@ function CommandTriggerSection(props: { bot: BotDefaultsRow }) {
         excludedChats: parseSubstituteChats(excludedChatsText),
       });
       if (res.ok) {
+        const saved = res.body?.config;
+        props.patchBot(larkAppId, { commandTriggersConfigured: saved === undefined ? commands.length > 0 : Boolean(saved?.commands?.length) });
         setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
         void runChecks(commands.map(c => c.cmd));
         return;

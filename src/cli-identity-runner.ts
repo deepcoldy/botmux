@@ -24,17 +24,19 @@ async function main(): Promise<void> {
   const { values } = parseArgs({ args, options: {
     'data-dir': { type: 'string' }, 'session-id': { type: 'string' },
     'app-id': { type: 'string' }, 'ipc-port': { type: 'string' }, tool: { type: 'string' }, region: { type: 'string' },
+    codebase: { type: 'boolean' },
   } });
-  const { tool, region } = values;
+  const { tool, region, codebase } = values;
   if (tool && (IDENTITY_TOOLS as readonly string[]).includes(tool)) requestedTool = tool;
   if (!values['session-id'] || !values['app-id']
     || !(IDENTITY_TOOLS as readonly string[]).includes(tool ?? '')
-    || (region !== undefined && (tool !== 'bytedcli' || !isBytedcliIdentityRegion(region)))) {
+    || (region !== undefined && (tool !== 'bytedcli' || !isBytedcliIdentityRegion(region)))
+    || (codebase && (tool !== 'bytedcli' || region !== undefined))) {
     throw new CurrentExecutionIdentityError('current_execution_route_unavailable', 'invalid_invocation');
   }
   const execution = await resolveCurrentExecutionIdentity({
     ipcPort: Number(values['ipc-port']), sessionId: values['session-id'], larkAppId: values['app-id'],
-    tool: tool!, as: process.env.BOTMUX_AS || undefined, region,
+    tool: tool!, as: process.env.BOTMUX_AS || undefined, region, codebase: codebase || undefined,
   });
   // The daemon proved the caller's lineage and returns the identity env
   // ASSIGNMENTS themselves. Print only the body for the wrapper to eval. The

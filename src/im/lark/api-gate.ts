@@ -347,7 +347,8 @@ function recordFailure(
  * 失败且可重试 → 指数退避（尊重 Retry-After 头）后重试；不可重试或重试耗尽 →
  * 累计失败计数（可能触发熔断）并抛原始错误。
  *
- * 不传 signal 的调用方行为与直接调用 fn 完全一致（除限流/重试引入的延迟外）。
+ * 不传 signal / retryMaxAttempts 的调用方行为与直接调用 fn 完全一致（除限流/重试引入的延迟外）。
+ * retryMaxAttempts 用于有外部使用次数预算的操作按调用覆盖全局重试上限。
  */
 const gatePriorAttemptErrors = new WeakMap<object, readonly unknown[]>();
 
@@ -373,10 +374,11 @@ export async function executeWithLarkGate<T>(
   larkAppId: string,
   op: string,
   fn: () => Promise<T>,
-  options?: { signal?: AbortSignal },
+  options?: { signal?: AbortSignal; retryMaxAttempts?: number },
 ): Promise<T> {
   const cfg = resolveLarkGateConfig();
   const signal = options?.signal;
+  const retryMaxAttempts = options?.retryMaxAttempts ?? cfg.retryMaxAttempts;
   const priorAttemptErrors: unknown[] = [];
   let attempt = 0;
   const throwWithHistory = (err: unknown): never => {
@@ -412,11 +414,11 @@ export async function executeWithLarkGate<T>(
       return result;
     } catch (err) {
       const retryable = isRetryableLarkError(err);
-      if (retryable && attempt < cfg.retryMaxAttempts) {
+      if (retryable && attempt < retryMaxAttempts) {
         priorAttemptErrors.push(err);
         const backoffMs = computeBackoffMs(cfg, attempt, err);
         attempt += 1;
-        logger.warn(`[lark-gate] ${larkAppId} retry ${attempt}/${cfg.retryMaxAttempts} op=${op} backoff=${backoffMs}ms`);
+        logger.warn(`[lark-gate] ${larkAppId} retry ${attempt}/${retryMaxAttempts} op=${op} backoff=${backoffMs}ms`);
         if (signal?.aborted) throwWithHistory(gateAbortError(signal));
         try {
           await sleep(backoffMs, signal);

@@ -397,4 +397,19 @@ describe('identity fetch refusal reasons', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     expect(JSON.parse((fetchImpl.mock.calls[0]![1] as RequestInit).body as string)).toMatchObject({ region });
   });
+
+  it('sends the bytedcli Codebase demand and rejects combining it with a region', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      schema: CURRENT_EXECUTION_IDENTITY_SCHEMA, status: 'verified', larkAppId: 'cli_a',
+      sessionId: 'session-a', tool: 'bytedcli', identityTurnId: 'turn-a', env: "BOTMUX_IDENTITY_MODE='user'",
+    }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    const options = { ipcPort: 12345, sessionId: 'session-a', larkAppId: 'cli_a', tool: 'bytedcli', codebase: true as const, fetchImpl };
+    await resolveCurrentExecutionIdentity(options);
+    expect(JSON.parse((fetchImpl.mock.calls[0]![1] as RequestInit).body as string)).toEqual({
+      sessionId: 'session-a', tool: 'bytedcli', codebase: true,
+    });
+    await expect(resolveCurrentExecutionIdentity({ ...options, region: 'cn' })).rejects.toMatchObject({ reason: 'invalid_invocation' });
+    await expect(resolveCurrentExecutionIdentity({ ...options, tool: 'lark-cli' })).rejects.toMatchObject({ reason: 'invalid_invocation' });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
 });

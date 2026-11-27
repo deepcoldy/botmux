@@ -34,6 +34,9 @@ function runnerScope(): Record<string, any> {
     codexAsyncSteerTargetMatches, steerAdmitting: false,
     // Runner marker sink extracted out of the steer-driver functions under test.
     publishInterruptTarget: vi.fn(),
+    // Title naming is outside the async-answer probe's scope; the sliced
+    // tryAdmitSteer/runTurn closures call it after a native acceptance.
+    queueThreadTitle: vi.fn(),
   };
   scope.codexAsyncSteerTargetMatches = productionFunction('src/services/codex-async-user-input.ts', 'codexAsyncSteerTargetMatches', scope);
   scope.canSteerInputToNativeTurn = productionFunction('src/codex-app-runner.ts', 'canSteerInputToNativeTurn', scope);
@@ -177,6 +180,8 @@ describe('correlated async answer adversarial production probes', () => {
     expect(scope.client.request).toHaveBeenCalledTimes(1); expect(scope.queue).toHaveLength(1);
     await vi.advanceTimersByTimeAsync(20); await first;
     expect(scope.queue).toHaveLength(0); expect(scope.activeTurn.accepted).toHaveLength(2);
+    // The accepted steer is the first effective input, so the native-title hook fires once.
+    expect(scope.queueThreadTitle).toHaveBeenCalledTimes(1);
     expect(scope.client.request.mock.calls[0][1].expectedTurnId).toBe('native-original');
     expect(scope.client.request.mock.calls[0][1].steerTargetTurnId).toBeUndefined();
   });

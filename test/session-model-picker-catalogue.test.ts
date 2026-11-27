@@ -4,6 +4,7 @@ import { sessionModelChoices } from '../src/im/lark/session-model-picker.js';
 
 const detectModelsMock = vi.fn();
 const staticModelChoicesMock = vi.fn();
+let sharedProbeCanRun = true;
 
 vi.mock('../src/services/model-catalog.js', () => ({
   detectModels: (...args: any[]) => detectModelsMock(...args),
@@ -20,7 +21,9 @@ vi.mock('../src/dashboard/model-catalog-request.js', () => ({
     runtimeExecutable: undefined,
     runtimeContext: 'probe-context',
     probeEnv: {},
+    probeSettingsEnv: {},
     fingerprint: 'probe-fingerprint',
+    canProbe: sharedProbeCanRun,
   }),
 }));
 
@@ -28,6 +31,7 @@ const app = 'session-model-catalogue-test';
 let bot: any;
 
 beforeEach(() => {
+  sharedProbeCanRun = true;
   bot = {
     larkAppId: app,
     cliId: 'claude-code',
@@ -66,6 +70,15 @@ it('matching sessions probe their runtime and include configured custom models',
   expect(detectModelsMock).toHaveBeenCalledTimes(1);
   expect(detectModelsMock.mock.calls[0][0]).toBe('claude-code');
   expect(models).toEqual(['gateway/custom', 'configured-model', 'observed-model', 'live-model']);
+});
+
+it('共享上下文判定数据根已重定向时，会话选择器不调用 live 目录', async () => {
+  sharedProbeCanRun = false;
+  const models = await sessionModelChoices(sessionFixture());
+
+  expect(detectModelsMock).not.toHaveBeenCalled();
+  expect(models).not.toContain('live-model');
+  expect(models).toContain('static-model');
 });
 
 it('runtime-deviating launch snapshots neither probe nor inherit bot candidates', async () => {
