@@ -192,6 +192,27 @@ describe('v3 ephemeral pool', () => {
     expect(statSync(path).size).toBe(64_000_000);
   });
 
+  it('counts pending stdout and stderr writes together when they share a log file', async () => {
+    const worker = Object.assign(new ScriptedWorker(), { stdout: new PassThrough(), stderr: new PassThrough() });
+    const req = request();
+    const path = join(req.attemptDir, 'combined.log');
+    mkdirSync(req.attemptDir, { recursive: true });
+    writeFileSync(path, '');
+    truncateSync(path, 64_000_000 - 2);
+    const pool = createEphemeralPool({ factory: factoryFor(worker), resolveLarkAppSecret: () => 'secret' });
+    const running = pool.runNode({ ...req, stdoutPath: path, stderrPath: path });
+    await worker.waitForInit();
+    worker.stdout.write('ab');
+    const closeAfterStdout = worker.closeRequests;
+    worker.stderr.write('cd');
+    const closeAfterStderr = worker.closeRequests;
+    worker.emitExit(0);
+    await expect(running).resolves.toMatchObject({ status: 'fail', error: { code: 'WORKFLOW_LOG_LIMIT' } });
+    expect(closeAfterStdout).toBe(0);
+    expect(closeAfterStderr).toBe(1);
+    expect(statSync(path).size).toBe(64_000_000);
+  });
+
   it('rejects a custom diagnostic path that aliases the worker-owned replay before spawning', async () => {
     const req = request();
     mkdirSync(req.attemptDir, { recursive: true });
@@ -233,7 +254,9 @@ describe('v3 ephemeral pool', () => {
       workflowPtyLogStream: undefined, workflowPtyLogOpenFailed: false, BoundedLogFile, mkdirSync, dirname,
       send: (event: unknown) => worker.emit('message', stamp(event)),
     });
-    append('more');
+    // PTY callbacks carry their runtime binding even while the worker is closing.
+    const scope = worker.contractScope!;
+    scope.run(scope.currentBinding()!, () => append('more'));
     worker.emitExit(0);
     await expect(running).resolves.toMatchObject({ status: 'fail', error: { code: 'WORKFLOW_LOG_LIMIT', message: 'pty.log exceeded the disk limit' } });
     expect(statSync(path).size).toBe(64_000_000);
