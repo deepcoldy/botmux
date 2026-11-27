@@ -3,7 +3,7 @@ import { mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { normalizeOncallGroupTarget, readOncallDeploymentConnection, type OncallGroupTarget } from './oncall-group-client.js';
-import { readOncallBusinessName, readOncallChoices } from './oncall-platform.js';
+import { oncallRegionLabel, readOncallBusinessName, readOncallChoices } from './oncall-platform.js';
 import { readOncallDeploymentEnv } from './oncall-deployment-config.js';
 
 export interface OncallPresetOptions {
@@ -33,7 +33,7 @@ export async function loadOncallPresetOptions(dataDir: string, appId: string, te
   const target = normalizeOncallGroupTarget({ ...readOncallDeploymentConnection(dataDir, appId, deployment), tenantId });
   const [choices, tenantName] = await Promise.all([readOncallChoices(target, secret, '', fetcher), readOncallBusinessName(target, secret, fetcher)]);
   const options: OncallPresetOptions = { tenantId, tenantName, regions: Object.entries(choices.regions).map(([region, categories]) => ({
-    value: region, label: region, categories: categories.filter(category => category.type_action === 'create_chat')
+    value: region, label: oncallRegionLabel(region), categories: categories.filter(category => category.type_action === 'create_chat')
       .map(category => ({ value: String(category.id), label: category.name })),
   })) };
   const current = readOncallDeploymentEnv();

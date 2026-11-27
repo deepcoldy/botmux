@@ -11312,6 +11312,8 @@ import {
 import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from './services/feedback-policy-resolver.js';
 import { normalizeFeedbackPolicy } from './services/feedback-policy.js';
 import { materializeFeedbackPolicyForDelivery } from './services/feedback-reviewer-delivery.js';
+import { oncallPrivateIntakeEnabled } from './services/oncall-group-policy.js';
+import { OncallPrivateIntakeStore } from './services/oncall-private-intake.js';
 import { attachOncallGroupButton, recordOncallGroupDelivery, prepareNativeOncallCard } from './im/lark/oncall-group.js';
 import { OncallGroupStore } from './services/oncall-group-store.js';
 import { attachWorkflowSidebarEntry, workflowNodeSessionEntry } from './im/lark/workflow-sidebar-entry.js';
@@ -13141,6 +13143,15 @@ async function cmdSend(
     }
   }
   if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
+  const privateIntakes = new OncallPrivateIntakeStore(resolveDataDir());
+  const privateOncallIntake = s.chatType === 'p2p' ? privateIntakes.find(s.larkAppId, s.chatId, s.rootMessageId) : undefined;
+  const privateOrigin = originSession?.chatType === 'p2p' && originSession.larkAppId
+    ? privateIntakes.find(originSession.larkAppId, originSession.chatId, originSession.rootMessageId) : undefined;
+  if ((privateOrigin && originSession?.sessionId !== s.sessionId)
+    || (privateOncallIntake && (sendInto || overrideChatId || explicitQuote || sendTopLevel))) {
+    console.error('仅私聊处理的 Oncall 咨询只能在对应的私聊话题里回复。');
+    process.exit(2);
+  }
   const silentListenerSources = [originSession, s].filter(source => source && isSilentMessageListenerSession(source));
   if (silentListenerSources.length > 0) {
     // Check the actual reply destination; --quote/--into derive their chat
@@ -14420,6 +14431,12 @@ async function cmdSend(
   try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
   if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
 
+  if ([originSession, s].some(session => session?.larkAppId && session.chatType !== 'p2p'
+    && oncallPrivateIntakeEnabled(getBot(session.larkAppId).config.oncallGroup, session.chatId))) {
+    console.error('此群已设为仅私聊处理，请通过群消息重新发起私聊咨询。');
+    process.exit(2);
+  }
+
   const { getMessageDetail: getTopicMessageDetail } = await import('./im/lark/client.js');
   const lookupTopic: TopicMessageLookup = (app, id) =>
     getTopicMessageDetail(app, id, { userCardContent: false, timeoutMs: 10000 });
@@ -15063,11 +15080,11 @@ async function cmdSend(
   // Oncall is session-scoped even when the CLI's turn lease has retired.
   // Reuse a proven existing turn for card indexing without changing send authority.
   const oncallTurnId = currentTurnId ?? new OncallGroupStore(resolveDataDir()).latest(appId, sid)?.questionId;
-  const nativeOncallLink = effectiveResponseKind === 'final' && !asVoice && !sendTopLevel && !overrideChatId && !sendInto && !vcMeetingManagedSendOrigin
+  const nativeOncallLink = !privateOncallIntake && effectiveResponseKind === 'final' && !asVoice && !sendTopLevel && !overrideChatId && !sendInto && !vcMeetingManagedSendOrigin
     ? await prepareNativeOncallCard(appId, s.chatId, oncallTurnId ?? '', sid) : undefined;
   const withOncallGroup = (card: string): string => {
     if (effectiveResponseKind !== 'final' || asVoice || sendTopLevel || overrideChatId || sendInto || vcMeetingManagedSendOrigin) return card;
-    const attached = attachOncallGroupButton(card, oncallGroupPolicy, s.chatId, s.chatType, oncallTurnId ? { appId, sessionId: sid, questionId: oncallTurnId, phase: 'final', nativeLink: nativeOncallLink } : undefined);
+    const attached = attachOncallGroupButton(card, oncallGroupPolicy, s.chatId, s.chatType, oncallTurnId ? { appId, sessionId: sid, questionId: oncallTurnId, phase: 'final', nativeLink: nativeOncallLink, privateIntake: privateOncallIntake } : undefined);
     if (attached !== card) oncallGroupCard = JSON.parse(attached);
     return attached;
   };
@@ -16237,7 +16254,7 @@ async function cmdSend(
               showLiveUsage: resolveUsageDisplay(appId) === 'streaming',
               canStop: replyCardPresentation(getBot(appId).config, targetChatId).canStop && getBot(appId).config.codexRpcInput !== true,
             }), oncallGroupPolicy, s.chatId, s.chatType, { appId, sessionId: sid, questionId: record.turnId,
-              phase: record.finalCard ? 'final' : 'first', nativeLink: nativeOncallLink }),
+              phase: record.finalCard ? 'final' : 'first', nativeLink: nativeOncallLink, privateIntake: privateOncallIntake }),
             sendOverflow: async (fullText, uuid) => {
               const path = join(replyStore.directory, `${replyStore.id(replyKey)}-reply.md`);
               writeFileSync(path, fullText, { mode: 0o600 });
@@ -16357,7 +16374,7 @@ async function cmdSend(
     if (oncallGroupCard && messageId) {
       recordOncallGroupDelivery(resolveDataDir(), { appId, chatId: targetChatId, messageId, sessionId: sid, rootId: s.scope === 'chat' ? s.chatId : s.rootMessageId,
         questionId: oncallTurnId ?? messageId,
-        answer: text, card: oncallGroupCard, nativeLink: nativeOncallLink, dispatchAttempt: originDispatchAttempt });
+        answer: privateOncallIntake ? '' : text, card: oncallGroupCard, nativeLink: nativeOncallLink, privateIntake: privateOncallIntake, dispatchAttempt: originDispatchAttempt });
     }
 
     // Turn-completion bookkeeping is INDEPENDENT of the feedback card. A

@@ -1,6 +1,8 @@
 import { attachOncallGroupButton, prepareNativeOncallCard, recordOncallGroupDelivery } from '../im/lark/oncall-group.js';
-import { OncallGroupStore } from '../services/oncall-group-store.js';
+import { oncallSourceEnabled, OncallGroupStore } from '../services/oncall-group-store.js';
 import { join } from 'node:path';
+import { oncallPrivateIntakeEnabled } from '../services/oncall-group-policy.js';
+import { OncallPrivateIntakeStore } from '../services/oncall-private-intake.js';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { config } from '../config.js';
@@ -193,7 +195,8 @@ export async function updateTurnReplyCard(
     if (ds.session !== session || session.status === 'closed' || options.owns?.() === false
       || ds.larkAppId !== key.larkAppId || ds.session.sessionId !== key.sessionId
       || ds.chatId !== chatId || sessionAnchorId(ds) !== anchor
-      || getBot(ds.larkAppId).config.apiOnly || isSilentScheduledTurn(ds, turnId)) {
+      || getBot(ds.larkAppId).config.apiOnly || isSilentScheduledTurn(ds, turnId)
+      || (ds.chatType !== 'p2p' && oncallPrivateIntakeEnabled(getBot(ds.larkAppId).config.oncallGroup, chatId))) {
       throw new Error('Reply-card turn no longer owns delivery');
     }
   };
@@ -202,16 +205,17 @@ export async function updateTurnReplyCard(
   await store.prepare(key, { mode, chatId: ds.chatId, rootId: sessionAnchorId(ds),
     nativeCot: store.read(replyCardKey(ds, turnId))?.nativeCot });
   const cfg = getBot(ds.larkAppId).config;
-  const oncallEnabled = ds.chatType !== 'p2p' && ((cfg.oncallGroup?.enabled === true && cfg.oncallGroup.chatIds.includes(ds.chatId))
+  const privateIntake = ds.chatType === 'p2p' ? new OncallPrivateIntakeStore(config.session.dataDir).find(ds.larkAppId, ds.chatId, anchor) : undefined;
+  const oncallEnabled = (ds.chatType !== 'p2p' || !!privateIntake) && (oncallSourceEnabled(cfg.oncallGroup, { chatId, privateIntake })
     || new OncallGroupStore(config.session.dataDir).getRequest({ appId: ds.larkAppId, sessionId: session.sessionId,
       chatId: ds.chatId, messageId: '', questionId: turnId, answer: '' })?.status === 'succeeded');
   const oncallTurn = oncallEnabled ? new OncallGroupStore(config.session.dataDir).registerTurn(ds.larkAppId, session.sessionId, turnId, { chatId: ds.chatId, rootId: anchor }) : undefined;
-  const nativeOncallLink = oncallEnabled ? await prepareNativeOncallCard(ds.larkAppId, ds.chatId, turnId, session.sessionId) : undefined;
+  const nativeOncallLink = oncallEnabled && !privateIntake ? await prepareNativeOncallCard(ds.larkAppId, ds.chatId, turnId, session.sessionId) : undefined;
   const indexOncall = (messageId: string, body: string) => {
     if (!oncallEnabled || !messageId) return;
     recordOncallGroupDelivery(config.session.dataDir, { appId: ds.larkAppId, chatId: ds.chatId, messageId,
       sessionId: session.sessionId, rootId: sessionAnchorId(ds), questionId: turnId, turnNumber: oncallTurn, dispatchAttempt: key.dispatchAttempt,
-      answer: event.kind === 'final' ? event.text : '', card: JSON.parse(body), nativeLink: nativeOncallLink });
+      answer: privateIntake ? '' : event.kind === 'final' ? event.text : '', card: JSON.parse(body), nativeLink: nativeOncallLink, privateIntake });
   };
   const groupContextAuthorOrigin = event.kind === 'final' ? readGroupContextAuthorOrigin({
     appId: ds.larkAppId, chatId: ds.chatId, sessionId: session.sessionId, turnId,
@@ -263,7 +267,7 @@ export async function updateTurnReplyCard(
       });
       return prepareLocalAddressContent(attachOncallGroupButton(raw, cfg.oncallGroup, ds.chatId, ds.chatType, {
         appId: ds.larkAppId, sessionId: session.sessionId, questionId: turnId,
-        phase: record.finalCard || replyCardIsTerminal(record) ? 'final' : 'first', nativeLink: nativeOncallLink, messageId: record.messageId,
+        phase: record.finalCard || replyCardIsTerminal(record) ? 'final' : 'first', nativeLink: nativeOncallLink, messageId: record.messageId, privateIntake,
       }), 'interactive', localAddressContextForBot(ds.larkAppId, ds.workingDir ?? ds.session.workingDir));
     },
     sendOverflow: async (text: string, uuid: string) => {

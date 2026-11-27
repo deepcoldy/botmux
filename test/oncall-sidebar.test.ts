@@ -49,8 +49,8 @@ async function fixture(oldMarker = false) {
       sidebarLink: { href: appLink.href, token, hostedHref: hostOncallSidebar(appLink.href, host, draft, token) } }] };
   });
   const read = await forms.use(appId, draft.id, owner, async draft => ({ ...draft }));
-  const button = JSON.parse(buildOncallFormCard(read)).elements.at(-1).actions[0];
-  return { forms, draft: read, nativePage, button, page: new URL(new URL(button.url).searchParams.get('url')!) };
+  const button = JSON.parse(buildOncallFormCard(read)).body.elements.at(-1).columns[0].elements[0];
+  return { forms, draft: read, nativePage, button, page: new URL(new URL(button.behaviors[0].default_url).searchParams.get('url')!) };
 }
 
 function visit(url: URL, method = 'GET', currentPolicy = policy) {
@@ -61,7 +61,7 @@ function visit(url: URL, method = 'GET', currentPolicy = policy) {
 
 it('opens the native form in place and answers only its origin and frame with a marked source', async () => {
   const { button, page, nativePage, draft } = await fixture();
-  expect(new URL(button.url).searchParams.get('mode')).toBe('sidebar-semi');
+  expect(new URL(button.behaviors[0].default_url).searchParams.get('mode')).toBe('sidebar-semi');
   expect(page.origin).toBe(host);
   expect(page.href).not.toContain('private');
   const behindProxy = hostOncallSidebar(draft.nativeFormLink!, 'https://dashboard.example.test/botmux', draft, token);

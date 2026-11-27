@@ -282,8 +282,8 @@ describe('platform completion protocol', () => {
     expect(buildDashboardUrls({ host: 'localhost', port: 7891 }).url).toBe('https://sso.example.test/');
     const d = await open();
     const card = JSON.parse(mocks.reply.mock.calls[0]![2]);
-    const button = card.elements.at(-1).actions[0];
-    const hosted = new URL(new URL(button.url).searchParams.get('url')!);
+    const button = card.body.elements.at(-1).columns[0].elements[0];
+    const hosted = new URL(new URL(button.behaviors[0].default_url).searchParams.get('url')!);
     expect(hosted.href).toMatch(/^https:\/\/dashboard\.example\.test\/prefix\/oncall\/sidebar\//);
     submitted(d);
     const expected = d.nativeSubmission.attempts[0]!.hostedSourceLocation;
@@ -380,8 +380,8 @@ describe('platform completion protocol', () => {
     mocks.remote = remote;
     expect(buildDashboardUrls({ host: 'localhost', port: 7891 }).url).toBe(`https://${remote}.example.test/`);
     const d = await open();
-    const button = JSON.parse(mocks.reply.mock.calls[0]![2]).elements.at(-1).actions[0];
-    expect(button.url).toBe(d.nativeFormLink);
+    const button = JSON.parse(mocks.reply.mock.calls[0]![2]).body.elements.at(-1).columns[0].elements[0];
+    expect(button.behaviors[0].default_url).toBe(d.nativeFormLink);
     expect(d.nativeSubmission.attempts[0]!.hostedSourceLocation).toBeUndefined();
   });
 

@@ -590,19 +590,33 @@ export async function forwardMessage(
   chatId: string,
   uuid?: string,
 ): Promise<string> {
+  return (await forwardMessageReceipt(larkAppId, messageId, { type: 'chat_id', id: chatId }, uuid)).messageId;
+}
+
+export async function forwardMessageReceipt(
+  larkAppId: string, messageId: string, receiver: { type: 'open_id' | 'chat_id'; id: string }, uuid?: string,
+  options?: LarkRequestOptions & Pick<OutboundMessageOptions, 'beforeWrite'>,
+): Promise<{
+  messageId: string;
+  chatId?: string;
+  messageType?: string;
+  content?: string;
+  mentions?: Array<{ key: string; name: string; id: string; id_type: string }>;
+}> {
   assertLarkTransport(larkAppId, 'forwardMessage');
   const wireUuid = dedupeUuid(uuid);
   return executeWithLarkGate(larkAppId, 'forwardMessage', async () => {
     await assertMessageWriteAllowed(larkAppId, messageId);
+    await options?.beforeWrite?.();
     const c = getBotClient(larkAppId);
     let res: any;
     try {
-      res = await (c as any).im.v1.message.forward({
-        path: { message_id: messageId },
-        // NOTE: forward takes `uuid` in params (not data) — unlike create/reply.
-        params: { receive_id_type: 'chat_id', uuid: wireUuid },
-        data: { receive_id: chatId },
-      });
+      const params = { receive_id_type: receiver.type, uuid: wireUuid };
+      const data = { receive_id: receiver.id };
+      res = options
+        ? await c.request({ method: 'POST', url: `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}/forward`,
+          params, data, ...larkRequestDeadline(options) })
+        : await c.im.v1.message.forward({ path: { message_id: messageId }, params, data });
     } catch (err: any) {
       if (getLarkErrorCode(err) === LARK_CODE_MESSAGE_WITHDRAWN) {
         throw withdrawnWriteError(larkAppId, messageId);
@@ -617,9 +631,10 @@ export async function forwardMessage(
 
     const forwardedId = res.data?.message_id;
     if (!forwardedId) throw new Error('No message_id in forward response');
-    logger.info(`Forwarded message ${messageId} to chat ${chatId} as ${forwardedId}`);
-    return forwardedId;
-  });
+    logger.info(`Forwarded message ${messageId} to ${receiver.type} as ${forwardedId}`);
+    return { messageId: forwardedId, chatId: res.data.chat_id, messageType: res.data.msg_type,
+      content: res.data.body?.content, mentions: res.data.mentions };
+  }, options?.signal ? { signal: options.signal } : undefined);
 }
 
 export async function addReaction(larkAppId: string, messageId: string, emojiType: string): Promise<string> {
@@ -845,6 +860,18 @@ export async function sendUserMessage(
   requestOptions?: LarkRequestOptions,
   options?: Pick<OutboundMessageOptions, 'beforeWrite'>,
 ): Promise<string> {
+  return (await sendUserMessageReceipt(larkAppId, openId, content, msgType, uuid, requestOptions, options)).messageId;
+}
+
+export async function sendUserMessageReceipt(
+  larkAppId: string,
+  openId: string,
+  content: string,
+  msgType = 'text',
+  uuid?: string,
+  requestOptions?: LarkRequestOptions,
+  options?: Pick<OutboundMessageOptions, 'beforeWrite'>,
+): Promise<{ messageId: string; chatId?: string }> {
   assertLarkTransport(larkAppId, 'sendUserMessage');
   content = prepareLocalAddressContent(content, msgType, linkFieldContext(larkAppId));
   const wireUuid = dedupeUuid(uuid);
@@ -893,7 +920,7 @@ export async function sendUserMessage(
       const messageId = res.data?.message_id;
       if (!messageId) throw new Error('No message_id in response');
       logger.info(`Sent DM ${messageId} to user ${openId}`);
-      return messageId;
+      return { messageId, chatId: res.data?.chat_id };
     },
     requestOptions?.signal ? { signal: requestOptions.signal } : undefined,
   );

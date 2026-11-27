@@ -77,7 +77,7 @@ describe('Oncall card callback', () => {
       expect((await handleOncallGroupAction(data, 'app')).toast.type).toBe('error');
     }
     mocks.bot.config.oncallGroup.enabled = false;
-    expect((await handleOncallGroupAction(event(), 'app')).toast.type).toBe('error');
+    expect((await handleOncallGroupAction(event(), 'app')).toast.type).toBe('info');
     expect(fetcher).not.toHaveBeenCalled();
   });
   it('does not bypass the classified form when an administrator changes the policy during identity resolution', async () => {

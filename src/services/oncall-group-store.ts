@@ -1,4 +1,5 @@
-import type { OncallForwardMode } from './oncall-group-policy.js';
+import { oncallGroupEnabled, oncallPrivateIntakeEnabled, type OncallForwardMode, type OncallGroupPolicy } from './oncall-group-policy.js';
+import type { OncallPrivateIntake } from './oncall-private-intake.js';
 import type { OncallGroupCreation } from './oncall-group-client.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, readdirSync } from 'node:fs';
@@ -19,6 +20,15 @@ export interface OncallGroupSource {
   cardJson?: string;
   nativeLink?: string;
   dispatchAttempt?: number;
+  privateIntake?: OncallPrivateIntake;
+}
+
+export function oncallSourceEnabled(policy: OncallGroupPolicy | undefined, source: Pick<OncallGroupSource, 'chatId' | 'privateIntake'>): boolean {
+  // An already delivered DM keeps its private route when group intake changes.
+  // Revoking the feature or the originating group's authorization still applies.
+  if (source.privateIntake) return source.privateIntake.chatId === source.chatId
+    && oncallGroupEnabled(policy, source.privateIntake.groupChatId);
+  return !oncallPrivateIntakeEnabled(policy, source.chatId) && oncallGroupEnabled(policy, source.chatId);
 }
 
 export interface OncallGroupRequest {
@@ -183,7 +193,7 @@ export class OncallGroupStore {
       }
       return request?.status === 'succeeded'
         && (request.formClosePending
-          || ((!request.inviteLink || request.cardRefreshPending) && !!request.openChatId)
+          || (((!source.privateIntake && !request.inviteLink) || request.cardRefreshPending) && !!request.openChatId)
           || (Date.now() - (request.submittedAtMs ?? 0) < 24 * 60 * 60_000
             && (!!request.cardRefreshPending || oncallForwardingPending(request))));
     }).map(([, source]) => source);

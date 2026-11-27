@@ -13,6 +13,10 @@ export interface OncallCategory {
   question_type_stage_list?: string[];
 }
 export interface OncallChoices { regions: Record<string, OncallCategory[]> }
+/** The choices API only returns routing keys. Use the display name from Oncall's region list. */
+export function oncallRegionLabel(region: string): string {
+  return region === 'cn_all' ? 'CN/所有区域' : region;
+}
 export interface OncallNativeSelection { region: string; typeId: number; priority: 'P2' | 'P1' | 'P0'; formId?: string }
 export type OncallSelection = OncallCategory & { requiresNativeForm: boolean; workflow?: unknown[] };
 
