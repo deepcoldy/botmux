@@ -9131,7 +9131,7 @@ ${SEND_HELP_BODY}
   topic reindex [--rebuild]           同步或重建话题索引
   input-capture register|inspect|revoke|revoke-set --bot <appId> --session <id> ...
   ask buttons --questions-file <file>   多题/文本/数值表单，支持预选；一次提交，返回 answers/inputs JSON
-  ask buttons --answerer <ou_id>       仅指定答题人可提交（不授予业务批准权）
+  ask buttons --answerer <ou_id>       指定答题人；有管理权限的任务主人也可答（不授予业务批准权）
   ask buttons --timeout 0              显式无限等待（需 CLI/daemon 同时支持）；省略仍默认 300 秒
   ask buttons --request-id <id>        显式稳定调用身份，重连同参数不创建第二张卡
   ask control describe|inspect|retire|release --control-file <file>   宿主受管控制，精确绑定原请求/轮/代次

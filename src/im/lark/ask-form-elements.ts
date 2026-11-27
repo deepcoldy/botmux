@@ -29,7 +29,10 @@ export function renderAskFormBody(ask: PendingAsk, locale: Locale, result?: AskR
   const en = locale === 'en';
   const descriptionCap = extras.descriptionCap ?? Infinity;
   const total = ask.questions.length;
-  const who = ask.answererOpenId ? (en ? 'Only the designated respondent may submit' : '仅指定答题人可提交')
+  const ownerMayAnswer = ask.ownerAnswererOpenId && ask.ownerAnswererOpenId !== ask.answererOpenId;
+  const who = ask.answererOpenId ? ownerMayAnswer
+    ? t('card.ask.footer.designated_or_owner', undefined, locale)
+    : (en ? 'Only the designated respondent may submit' : '仅指定答题人可提交')
     : (en ? 'Members allowed to talk to this bot may answer; this does not grant business approval' : '本会话可对话成员可作答；不代表具备业务批准权');
   if (result) {
     const detail = result.kind === 'timedOut' ? (en ? 'Timed out — no approval was given.' : '等待已超时，未获得确认。')

@@ -2692,6 +2692,7 @@ export const messages: Record<string, string> = {
   'card.ask.footer.no_deadline': 'No deadline (until answered or invalidated)',
   'card.ask.footer.talk_members': 'anyone who can talk to me here may answer',
   'card.ask.footer.designated': 'only the designated member may answer',
+  'card.ask.footer.designated_or_owner': 'the designated respondent or the task owner with management access may answer',
   'card.ask.footer.may_answer': ' may answer',
   'card.ask.footer.submitted_by': 'Submitted by {by}',
   'card.ask.note_line': 'Note: {note}',

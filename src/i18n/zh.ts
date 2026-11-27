@@ -2696,6 +2696,7 @@ export const messages: Record<string, string> = {
   'card.ask.footer.no_deadline': '无截止时间（直到回答或失效）',
   'card.ask.footer.talk_members': '本群可对话成员可答',
   'card.ask.footer.designated': '仅指定成员可答',
+  'card.ask.footer.designated_or_owner': '指定答题人或有管理权限的任务主人可答',
   'card.ask.footer.may_answer': ' 可答',
   'card.ask.footer.submitted_by': '由 {by} 提交',
   'card.ask.note_line': '备注：{note}',
