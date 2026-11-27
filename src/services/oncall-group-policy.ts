@@ -3,6 +3,7 @@ export type OncallForwardMode = 'none' | 'individual' | 'merge';
 export interface OncallGroupPolicy {
   enabled: boolean;
   chatIds: string[];
+  privateIntakeChatIds?: string[];
   flowMode?: 'direct' | 'classify';
   formDisplay?: 'native' | 'private_card' | 'thread_card';
   customFormMode?: 'native' | 'botmux';
@@ -14,11 +15,16 @@ export interface OncallGroupPolicy {
 export function normalizeOncallGroupPolicy(value: unknown): OncallGroupPolicy {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('oncallGroup must be an object');
   const input = value as Record<string, unknown>;
-  if (Object.keys(input).some(key => !['enabled', 'chatIds', 'flowMode', 'formDisplay', 'customFormMode', 'forwardMode', 'identitySource', 'button'].includes(key))) throw new Error('Unknown oncallGroup field');
+  if (Object.keys(input).some(key => !['enabled', 'chatIds', 'privateIntakeChatIds', 'flowMode', 'formDisplay', 'customFormMode', 'forwardMode', 'identitySource', 'button'].includes(key))) throw new Error('Unknown oncallGroup field');
   if (input.enabled !== undefined && typeof input.enabled !== 'boolean') throw new Error('enabled must be boolean');
   if (input.chatIds !== undefined && (!Array.isArray(input.chatIds) || input.chatIds.length > 500
     || input.chatIds.some(id => typeof id !== 'string' || !/^oc_[a-zA-Z0-9]+$/.test(id)))) {
     throw new Error('chatIds must contain group chat IDs');
+  }
+  if (input.privateIntakeChatIds !== undefined && (!Array.isArray(input.privateIntakeChatIds)
+    || input.privateIntakeChatIds.length > 500
+    || input.privateIntakeChatIds.some(id => typeof id !== 'string' || !(input.chatIds as unknown[] | undefined)?.includes(id)))) {
+    throw new Error('仅私聊处理群必须属于 Oncall 适用群');
   }
   if (input.flowMode !== undefined && !['direct', 'classify'].includes(input.flowMode as string)) throw new Error('Invalid Oncall flowMode');
   if (input.formDisplay !== undefined && !['native', 'private_card', 'thread_card'].includes(input.formDisplay as string)) throw new Error('Invalid Oncall formDisplay');
@@ -26,6 +32,9 @@ export function normalizeOncallGroupPolicy(value: unknown): OncallGroupPolicy {
   if (input.forwardMode !== undefined && !['none', 'individual', 'merge'].includes(input.forwardMode as string)) throw new Error('Invalid Oncall forwardMode');
   if (input.identitySource !== undefined && !['bot', 'shared'].includes(input.identitySource as string)) throw new Error('Invalid Oncall identitySource');
   const result: OncallGroupPolicy = { enabled: input.enabled === true, chatIds: [...new Set((input.chatIds ?? []) as string[])] };
+  if (Array.isArray(input.privateIntakeChatIds) && input.privateIntakeChatIds.length) {
+    result.privateIntakeChatIds = [...new Set(input.privateIntakeChatIds as string[])];
+  }
   if (input.flowMode !== undefined) result.flowMode = input.flowMode as OncallGroupPolicy['flowMode'];
   if (input.formDisplay !== undefined) result.formDisplay = input.formDisplay as OncallGroupPolicy['formDisplay'];
   if (input.customFormMode !== undefined) result.customFormMode = input.customFormMode as OncallGroupPolicy['customFormMode'];
@@ -51,4 +60,22 @@ export function nativeFormPolicyFingerprint(policy: OncallGroupPolicy | undefine
   if (!policy) return;
   const { customFormMode: _mode, ...handoffPolicy } = policy;
   return JSON.stringify(handoffPolicy);
+}
+
+/** Issued forms keep their submission policy. Button settings and the list of
+ * other authorized groups have no bearing on this source's live access check. */
+export function nativeFormPolicyMatches(policy: OncallGroupPolicy | undefined, issued: string): boolean {
+  if (!policy) return false;
+  try {
+    const previous = JSON.parse(issued) as OncallGroupPolicy;
+    return previous.enabled === policy.enabled && previous.flowMode === policy.flowMode
+      && previous.formDisplay === policy.formDisplay
+      && (previous.identitySource ?? 'bot') === (policy.identitySource ?? 'bot')
+      && (previous.forwardMode ?? 'individual') === (policy.forwardMode ?? 'individual');
+  } catch { return false; }
+}
+
+/** Private delivery is an independent privacy setting. Turning off human Oncall does not expose answers. */
+export function oncallPrivateIntakeEnabled(policy: OncallGroupPolicy | undefined, sourceChatId: string): boolean {
+  return policy?.privateIntakeChatIds?.includes(sourceChatId) === true;
 }

@@ -1,9 +1,8 @@
-import { randomBytes } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { ONCALL_SIDEBAR_PATH_PREFIX, parseOncallSidebarPath } from '../core/host-capability-link.js';
 import { OncallFormStore } from '../services/oncall-form-store.js';
 import type { OncallGroupPolicy } from '../services/oncall-group-policy.js';
-import { oncallSidebarPage, oncallSidebarSource } from '../services/oncall-sidebar-link.js';
+import { ensureSelectedOncallQuery, nativeSelectionSourceType, oncallSidebarPage } from '../services/oncall-sidebar-link.js';
 
 export function handleOncallSidebar(req: IncomingMessage, res: ServerResponse, url: URL, dataDir: string,
   readPolicy: (appId: string) => OncallGroupPolicy | undefined): boolean {
@@ -23,27 +22,11 @@ export function handleOncallSidebar(req: IncomingMessage, res: ServerResponse, u
     return true;
   }
 
-  // Oncall prefers the parent's reply and truncates the source address. Send
-  // only the URL components used by reconciliation, without the question text.
-  const nonce = randomBytes(16).toString('base64');
-  const payload = JSON.stringify({ frameUrl: page.href, origin: page.origin, source: oncallSidebarSource(page) }).replaceAll('<', '\\u003c');
-  res.writeHead(200, {
-    'Content-Type': 'text/html; charset=utf-8',
-    'Content-Security-Policy': `default-src 'none'; base-uri 'none'; frame-src ${page.origin}; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'`,
-  }).end(`<!doctype html><html lang="zh-CN"><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>人工 Oncall</title>
-<style nonce="${nonce}">body{margin:0}iframe{display:block;border:0;width:100%;height:100vh}</style>
-<iframe title="Oncall 原生表单" id="oncall-form" referrerpolicy="no-referrer"></iframe>
-<script nonce="${nonce}">
-const entry = ${payload};
-const frame = document.getElementById('oncall-form');
-window.addEventListener('message', event => {
-  if (event.origin === entry.origin && event.source === frame.contentWindow && event.data?.eventName === 'getParentUrl') {
-    frame.contentWindow.postMessage({ url: entry.source }, entry.origin);
-  }
-});
-frame.src = entry.frameUrl;
-</script></html>`);
+  // Upgrade already published capabilities too. Keep SSO in the top-level
+  // sidebar and preserve all of the platform's original form parameters.
+  const channel = nativeSelectionSourceType(page.searchParams.get('bm_form'));
+  if (channel) page.searchParams.set('bizFrom', channel);
+  ensureSelectedOncallQuery(page);
+  res.writeHead(302, { Location: page.href }).end();
   return true;
 }

@@ -55,6 +55,7 @@ import {
   markReportReplyInput,
   appendReportReplyReference,
 } from './core/report-source-reply.js';
+import { oncallPrivateIntakeEnabled } from './services/oncall-group-policy.js';
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
 import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './core/prompt-injection.js';
 import { plannedOpeningBackendType } from './core/opening-backend.js';
@@ -4617,7 +4618,7 @@ function streamingCardDisabledFor(ds: DaemonSession, turnId?: string): boolean {
   if (ds.streamingCardForced) return false;
   try {
     const cfg = getBot(ds.larkAppId).config;
-    return cfg.disableStreamingCard === true
+    return (ds.chatType !== 'p2p' && oncallPrivateIntakeEnabled(cfg.oncallGroup, ds.chatId)) || cfg.disableStreamingCard === true
       || (!!ds.chatId && !!cfg.noCardChats?.includes(ds.chatId))
       // Substitute (avatar-style) turns hide the streaming card per-turn: the
       // shared chat-scope session serves substitute AND direct @bot turns, so a
@@ -5733,6 +5734,7 @@ async function sessionReply(
   }
   const appId = larkAppId ?? ds?.larkAppId ?? getAllBots()[0]?.config.larkAppId;
   if (!appId) throw new Error('No bot configured');
+  if (ds?.chatType !== 'p2p' && oncallPrivateIntakeEnabled(getBot(appId).config.oncallGroup, ds?.chatId ?? anchor)) return '';
   if (isMessageListenerTaskAnchor(anchor) || (ds && isSilentMessageListenerSession(ds.session))) {
     logger.debug(`[message-listener] suppressed automatic reply for ${anchor.substring(0, 24)}`);
     return '';
@@ -6094,6 +6096,7 @@ export async function enforceMessageQuotaForCliInput(
   chatType?: 'group' | 'p2p',
   botSender?: boolean,
   opts?: {
+    oncallPrivateIntake?: RoutingContext['oncallPrivateIntake'];
     /** 与 bot-locked senderUnionId 同源的飞书 sender app_id；external roster 需要配对。 */
     senderAppId?: string;
     listenerAuthorized?: boolean;
@@ -6252,9 +6255,15 @@ export async function enforceMessageQuotaForCliInput(
   // 否则「团队拉群 + sender 没带 union_id」这条路径会外层放行、这里静默丢弃——比弹卡
   // 更糟：owner 以为授权生效了，消息凭空消失（#332 同款断点的最后一截）。
   // 不传（人的路径）→ 原样走 evaluateTalk，语义不变。
+  const privateIntake = opts?.oncallPrivateIntake;
+  if (privateIntake && (botSender || chatType !== 'p2p' || privateIntake.appId !== larkAppId
+    || privateIntake.chatId !== chatId || privateIntake.rootMessageId !== anchor
+    || privateIntake.ownerOpenId !== senderOpenId
+    || !getBot(larkAppId).config.oncallGroup?.chatIds.includes(privateIntake.groupChatId))) return false;
   const ev = botSender
     ? evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId, opts?.senderAppId)
-    : evaluateTalk(larkAppId, chatId, senderOpenId, senderUnionId, memberUnionId, chatType);
+    : evaluateTalk(larkAppId, privateIntake?.groupChatId ?? chatId, senderOpenId, senderUnionId,
+      memberUnionId, privateIntake ? 'group' : chatType);
   if (!ev.allowed) {
     logger.info(`[quota:${larkAppId}] dropping message ${messageId.substring(0, 12)} from non-allowed sender ${senderOpenId?.substring(0, 12) ?? '?'}`);
     return false;
@@ -28511,6 +28520,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     chatType === 'p2p'
     && getBot(larkAppId).config.p2pMode === 'group'
     && !ctx.sessionGroupBirth
+    && !ctx.oncallPrivateIntake
     && !substituteTrigger
     && scope === 'thread'
     && anchor === messageId
@@ -29059,6 +29069,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     listenerAuthorized: !!messageListener,
     skipCharge: isBareForceTopic || sessionGroupAlreadyCharged,
     alreadyAuthorizedAndCharged: sessionGroupAlreadyCharged,
+    oncallPrivateIntake: ctx.oncallPrivateIntake,
     promptContent: content,
     promptAttachments: resources.map(r => ({ type: r.type, name: r.name })),
   })) {
@@ -29149,7 +29160,8 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     chatId,
     chatType,
     larkAppId,
-    listenerWorkingDir: messageListener?.workingDir,
+    listenerWorkingDir: messageListener?.workingDir ?? (ctx.oncallPrivateIntake
+      ? findOncallChat(larkAppId, ctx.oncallPrivateIntake.groupChatId)?.workingDir : undefined),
     assistantWorkDir: assistantSpawn.kind === 'owner' ? assistantSpawn.workDir : undefined,
   });
   // 指令头里的 `/repo X` 是**用户显式选仓**，与点选仓卡片上的项目按钮同义：钉目录、
@@ -32082,6 +32094,7 @@ async function handleThreadReplyAdmitted(
     isBotSenderType || isForeignBot,
     {
       senderAppId: threadTeamTrustAppId,
+      oncallPrivateIntake: ctx.oncallPrivateIntake,
       promptContent: parsed.content,
       promptAttachments: resources.map(r => ({ type: r.type, name: r.name })),
       ...(ctx.crossChatThreadFollowUp

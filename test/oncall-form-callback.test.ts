@@ -8,18 +8,23 @@ const mocks = vi.hoisted(() => ({
   config: { session: { dataDir: '' } },
   identityRequest: vi.fn(),
   bot: { config: { brand: 'feishu', oncallGroup: {} as any } },
-  invite: vi.fn(), reply: vi.fn(), update: vi.fn(), withdraw: vi.fn(), membership: vi.fn(), mode: vi.fn(), ephemeral: vi.fn(), remove: vi.fn(), sender: vi.fn(), detail: vi.fn(), forward: vi.fn(), merge: vi.fn(), thread: vi.fn(), chat: vi.fn(),
+  userReceipt: vi.fn(), invite: vi.fn(), reply: vi.fn(), update: vi.fn(), withdraw: vi.fn(), membership: vi.fn(), mode: vi.fn(), ephemeral: vi.fn(), remove: vi.fn(), sender: vi.fn(), detail: vi.fn(), forward: vi.fn(), merge: vi.fn(), thread: vi.fn(), chat: vi.fn(),
+  sourceMembers: vi.fn(), evaluateTalk: vi.fn(),
 }));
 vi.mock('../src/im/lark/md-card.js', () => ({ omitReplyCardImages: (card: string) => card }));
 vi.mock('../src/config.js', () => ({ config: mocks.config }));
 vi.mock('../src/bot-registry.js', () => ({ getBot: () => mocks.bot }));
+vi.mock('../src/im/lark/event-dispatcher.js', () => ({ evaluateTalk: mocks.evaluateTalk }));
 vi.mock('../src/im/lark/client.js', () => ({ getChatInviteLink: mocks.invite, getChatModeStrict: mocks.mode, sendEphemeralCard: mocks.ephemeral,
+  sendUserMessageReceipt: mocks.userReceipt,
   deleteEphemeralCard: mocks.remove, deleteMessage: mocks.withdraw, replyMessage: mocks.reply, updateMessage: mocks.update, resolveSender: mocks.sender, getMessageDetail: mocks.detail,
-  forwardMessage: mocks.forward, mergeForwardMessages: mocks.merge, isBotInChat: mocks.membership, listThreadMessagesWithContext: mocks.thread, listChatMessagesUntil: mocks.chat }));
+  forwardMessage: mocks.forward, mergeForwardMessages: mocks.merge, isBotInChat: mocks.membership, listThreadMessagesWithContext: mocks.thread, listChatMessagesUntil: mocks.chat,
+  findCurrentChatUserMembers: mocks.sourceMembers }));
 vi.mock('../src/im/lark/identity-cache.js', () => ({ resolveSender: mocks.sender }));
 import { attachOncallGroupButton, recordOncallGroupDelivery, handleOncallGroupAction, handleOncallFormAction, snapshotOncallConversation, forwardOncallConversation, reconcileOncallReplyCard, retryPendingOncallHandoffs, refreshOncallSessionCard, prepareOncallGroupInvite } from '../src/im/lark/oncall-group.js';
 import { OncallGroupStore, type OncallGroupSource } from '../src/services/oncall-group-store.js';
 import { OncallFormStore } from '../src/services/oncall-form-store.js';
+import { OncallPrivateIntakeStore } from '../src/services/oncall-private-intake.js';
 import { larkApiError } from '../src/im/lark/lark-errors.js';
 import { TopicSendError } from '../src/cli/topic-send-guard.js';
 import { TurnReplyCardStore } from '../src/services/turn-reply-card.js';
@@ -40,12 +45,485 @@ beforeEach(() => {
   mocks.detail.mockResolvedValue({ body: { content: 'question' } }); mocks.ephemeral.mockResolvedValue('om_private');
   mocks.reply.mockResolvedValue('om_public'); mocks.update.mockResolvedValue(undefined); mocks.remove.mockResolvedValue(true); mocks.forward.mockResolvedValue('om_forwarded');
   mocks.withdraw.mockResolvedValue(true);
+  mocks.userReceipt.mockReset().mockResolvedValue({ messageId: 'om_dm_entry', chatId: 'oc_dm' });
+  mocks.sourceMembers.mockReset().mockResolvedValue(new Set(['ou_owner', 'ou_other']));
+  mocks.evaluateTalk.mockReset().mockImplementation((_appId: string, _chatId: string, _openId: string,
+    _senderUnionId: undefined, _memberUnionId: string | undefined, chatType: 'group' | 'p2p') =>
+    chatType === 'group' ? { allowed: true, reason: 'oncall' } : { allowed: false, reason: 'none' });
   writeFileSync(join(dir, 'oncall-group-targets.json'), JSON.stringify({ app: { endpoint: 'https://oncall.example.test/api/inf/v1/chat/', tenantId: 12, typeId: 999, region: 'legacy', emailDomain: 'example.test' } }));
   const store = new OncallGroupStore(dir); store.registerTurn('app', 'session', source.questionId); store.recordSource({ ...source, cardJson: JSON.stringify({ schema: '2.0', body: { elements: [] } }) });
   vi.stubEnv('ONCALL_SERVICE_SECRET', 'secret'); fetcher = vi.fn().mockImplementation(async (url: string) => response(url.includes('/workflow/') ? { tenant_id: 12, type_id: 34, config: '[]' } : { region: { cn: [category] } })); vi.stubGlobal('fetch', fetcher);
 });
 afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs(); vi.useRealTimers(); rmSync(dir, { recursive: true, force: true }); });
 function draft() { return new OncallFormStore(dir).open({ appId: 'app', ownerOpenId: 'ou_owner', source, choices: { regions: { cn: [category] } }, region: 'cn', typeId: 34, priority: 'P2', description: 'question', messageId: 'om_private' }); }
+
+describe('delivered Oncall cards across intake configuration changes', () => {
+  beforeEach(() => {
+    mocks.bot.config.oncallGroup.privateIntakeChatIds = ['oc_source'];
+    mocks.bot.config.oncallGroup.flowMode = 'classify';
+    mocks.bot.config.oncallGroup.forwardMode = 'merge';
+  });
+  const migratedSource = () => new OncallGroupStore(dir).findSource('app', 'om_dm_entry')!;
+  function submitEvent() {
+    const card = JSON.parse(mocks.reply.mock.calls[0]![2]);
+    const form = card.body.elements.find((element: any) => element.tag === 'form');
+    const value = form.elements.at(-1).columns[0].elements[0].behaviors[0].value;
+    const submit = event('oncall_group_form_botmux_submit', { id: value.draftId, version: value.version, messageId: 'om_public' });
+    submit.context.open_chat_id = 'oc_dm';
+    submit.action.form_value = {};
+    return submit;
+  }
+
+  it('continues an old public card in the clicker DM without copying or forwarding the old conversation', async () => {
+    mocks.bot.config.oncallGroup.forwardMode = 'none';
+    expect((await handleOncallGroupAction(event('oncall_group_create'), 'app')).toast.type).toBe('info');
+    expect(mocks.userReceipt).toHaveBeenCalledWith('app', 'ou_owner', expect.any(String), 'interactive', expect.any(String),
+      expect.objectContaining({ timeoutMs: expect.any(Number) }), expect.objectContaining({ beforeWrite: expect.any(Function) }));
+    expect(mocks.reply.mock.calls[0]?.slice(0, 2)).toEqual(['app', 'om_dm_entry']);
+    expect(mocks.ephemeral).not.toHaveBeenCalled();
+    expect(mocks.detail).not.toHaveBeenCalled();
+    const dm = migratedSource();
+    expect(dm).toMatchObject({ chatId: 'oc_dm', answer: '', privateIntake: { ownerOpenId: 'ou_owner', groupChatId: 'oc_source' } });
+    expect(dm.sessionId).not.toBe(source.sessionId);
+    expect(new OncallPrivateIntakeStore(dir).find('app', 'oc_dm', dm.messageId)).toEqual(dm.privateIntake);
+
+    const read = fetcher.getMockImplementation()!;
+    fetcher.mockImplementation((url: string, init?: RequestInit) => init?.method === 'POST'
+      ? Promise.resolve(response({ oncall_flow_id: '123', open_chat_id: 'oc_created' })) : read(url, init));
+    const row = JSON.parse(mocks.reply.mock.calls[0]![2]).body.elements.at(-1);
+    expect(row.columns.map((column: any) => column.elements[0].text.content)).toEqual(['确认发起人工 Oncall', '取消']);
+    const value = row.columns[0].elements[0].behaviors[0].value;
+    const submit = event(value.action, { id: value.draftId, version: value.version, messageId: 'om_public' });
+    submit.context.open_chat_id = 'oc_dm';
+    await (await handleOncallFormAction(submit, 'app')).afterAck();
+    await handleOncallFormAction(submit, 'app');
+    const creates = fetcher.mock.calls.filter(([, init]) => init?.method === 'POST');
+    expect(creates).toHaveLength(1);
+    expect(JSON.parse(creates[0]![1].body).trigger_message).toBe('用户通过私聊发起人工 Oncall');
+    expect(new OncallGroupStore(dir).getRequest(dm)).toMatchObject({ status: 'succeeded', forwardMode: 'none', messageIdsSnapshot: [] });
+    expect(mocks.thread).not.toHaveBeenCalled(); expect(mocks.forward).not.toHaveBeenCalled(); expect(mocks.merge).not.toHaveBeenCalled();
+    expect(mocks.update.mock.calls.some(([, id, card]) => id === dm.messageId && card.includes('oc_created'))).toBe(true);
+    expect(mocks.update.mock.calls.every(([, id]) => id !== source.messageId)).toBe(true);
+
+    // Returning to public intake must not create another group for this clicker.
+    mocks.bot.config.oncallGroup.privateIntakeChatIds = [];
+    await handleOncallGroupAction(event('oncall_group_create'), 'app');
+    expect(mocks.userReceipt).toHaveBeenCalledTimes(1);
+    expect(fetcher.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1);
+    expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
+  });
+
+  it('submits only the configured fields when an old group card opens a private form', async () => {
+    mocks.bot.config.oncallGroup.forwardMode = 'none';
+    mocks.bot.config.oncallGroup.customFormMode = 'botmux';
+    const workflow = [
+      { base: { key: 'details', label: '说明', type: 'textArea' } },
+      { base: { key: 'team', label: '团队', type: 'radio' },
+        custom: { customOptions: [{ value: 'billing', displayName: '账务' }] } },
+    ];
+    fetcher.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (init?.method === 'POST') return response({ oncall_flow_id: '123', open_chat_id: 'oc_created' });
+      return response(url.includes('/workflow/') ? { tenant_id: 12, type_id: 34, config: JSON.stringify(workflow) }
+        : { region: { cn: [category] } });
+    });
+    await handleOncallGroupAction(event('oncall_group_create'), 'app');
+    const submit = submitEvent();
+    const elements = JSON.parse(mocks.reply.mock.calls[0]![2]).body.elements;
+    const form = elements.find((element: any) => element.tag === 'form');
+    expect(JSON.stringify(form)).not.toContain('oncall_private_summary');
+    const choice = form.elements.find((element: any) => element.name === 'oncall_field_1');
+    submit.action.form_value.oncall_field_0 = '第一行\n第二行';
+    submit.action.form_value.oncall_field_1 = choice.options[0].value;
+    const accepted = await handleOncallFormAction(submit, 'app');
+    expect(accepted.toast.type).toBe('info');
+    await accepted.afterAck();
+    const creates = fetcher.mock.calls.filter(([, init]) => init?.method === 'POST');
+    expect(creates).toHaveLength(1);
+    const body = JSON.parse(creates[0]![1].body);
+    expect(body.trigger_message).toBe('用户通过私聊发起人工 Oncall');
+    expect(JSON.parse(body.workflow_config)).toMatchObject({ details: { value: '第一行\n第二行' }, team: { value: 'billing' } });
+    expect(new OncallGroupStore(dir).getRequest(migratedSource())).toMatchObject({ forwardMode: 'none', messageIdsSnapshot: [] });
+    expect(mocks.forward).not.toHaveBeenCalled();
+    expect(mocks.merge).not.toHaveBeenCalled();
+  });
+
+  it('continues a previously visible group entry with direct confirmation in the DM', async () => {
+    mocks.bot.config.oncallGroup.flowMode = 'direct';
+    mocks.bot.config.oncallGroup.button = { minTurns: 3 };
+    await handleOncallGroupAction(event('oncall_group_create'), 'app');
+    const card = JSON.parse(mocks.update.mock.calls.at(-1)![2]);
+    const button = card.body.elements.at(-1).columns.at(-1).elements[0];
+    expect(button.confirm.text.content).toContain('合并为聊天记录');
+    expect(button.behaviors[0].value.action).toBe('oncall_group_create');
+    expect(mocks.reply).not.toHaveBeenCalled();
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it('reuses one persistent DM entry and form for concurrent clicks and later turns in the same session', async () => {
+    const results = await Promise.all([handleOncallGroupAction(event('oncall_group_create'), 'app'), handleOncallGroupAction(event('oncall_group_create'), 'app')]);
+    expect(results.every(result => result.toast.type === 'info')).toBe(true);
+    const store = new OncallGroupStore(dir);
+    const next = { ...source, messageId: 'om_reply_next', questionId: 'om_question_next' };
+    store.registerTurn('app', 'session', next.questionId); store.recordSource(next);
+    const click = event('oncall_group_create'); click.context.open_message_id = next.messageId;
+    await handleOncallGroupAction(click, 'app');
+    expect(mocks.userReceipt).toHaveBeenCalledTimes(1);
+    expect(mocks.reply).toHaveBeenCalledTimes(1);
+    expect(mocks.update).toHaveBeenCalled();
+  });
+
+  it('keeps different clickers in separate handoff sessions', async () => {
+    mocks.userReceipt.mockImplementation(async (_app, owner) => ({ chatId: `oc_dm_${owner}`, messageId: `om_dm_${owner}` }));
+    await handleOncallGroupAction(event('oncall_group_create'), 'app');
+    await handleOncallGroupAction(event('oncall_group_create', undefined, 'ou_other'), 'app');
+    const groups = new OncallGroupStore(dir);
+    const first = groups.findSource('app', 'om_dm_ou_owner')!;
+    const second = groups.findSource('app', 'om_dm_ou_other')!;
+    expect(first.privateIntake?.ownerOpenId).toBe('ou_owner');
+    expect(second.privateIntake?.ownerOpenId).toBe('ou_other');
+    expect(first.sessionId).not.toBe(second.sessionId);
+    expect(mocks.userReceipt).toHaveBeenCalledTimes(2);
+  });
+
+  it('recovers a persisted receipt when source indexing fails without sending another DM', async () => {
+    const record = vi.spyOn(OncallGroupStore.prototype, 'recordSource').mockImplementationOnce(() => { throw new Error('disk interrupted'); });
+    try { expect((await handleOncallGroupAction(event('oncall_group_create'), 'app')).toast.type).toBe('error'); }
+    finally { record.mockRestore(); }
+    expect((await handleOncallGroupAction(event('oncall_group_create'), 'app')).toast.type).toBe('info');
+    expect(mocks.userReceipt).toHaveBeenCalledTimes(1);
+    expect(migratedSource().privateIntake?.chatId).toBe('oc_dm');
+  });
+
+  it.each(['pending', 'unknown', 'succeeded'] as const)('preserves an existing %s request instead of starting a new private request', async status => {
+    const groups = new OncallGroupStore(dir);
+    groups.claim(source, 'ou_owner', { forwardMode: 'none', messageIds: [], cutoffMs: Date.now() });
+    if (status !== 'pending') groups.finish(source, { status, ...(status === 'succeeded' ? { openChatId: 'oc_created' } : {}) }, groups.getRequest(source)!.attemptId);
+    await handleOncallGroupAction(event('oncall_group_create'), 'app');
+    expect(mocks.userReceipt).not.toHaveBeenCalled(); expect(mocks.reply).not.toHaveBeenCalled();
+    expect(groups.getRequest(source)?.status).toBe(status);
+    expect(fetcher.mock.calls.some(([, init]) => init?.method === 'POST')).toBe(false);
+  });
+
+  it.each(['disabled', 'removed', 'wrong_chat'] as const)('does not migrate when %s', async reason => {
+    if (reason === 'disabled') mocks.bot.config.oncallGroup.enabled = false;
+    if (reason === 'removed') mocks.bot.config.oncallGroup.chatIds = [];
+    const click = event('oncall_group_create');
+    if (reason === 'wrong_chat') click.context.open_chat_id = 'oc_other';
+    const result = await handleOncallGroupAction(click, 'app');
+    expect(result.toast.type).toBe(reason === 'wrong_chat' ? 'error' : 'info');
+    expect(mocks.userReceipt).not.toHaveBeenCalled(); expect(mocks.reply).not.toHaveBeenCalled(); expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it.each(['network', 'missing_receipt', 'revoked_before_write'] as const)('does not claim success or create a ticket on %s', async reason => {
+    mocks.userReceipt.mockImplementation(async (...args) => {
+      if (reason === 'network') throw new Error('network unavailable');
+      if (reason === 'revoked_before_write') {
+        mocks.bot.config.oncallGroup.enabled = false;
+        args[6].beforeWrite();
+      }
+      return { messageId: 'om_dm_entry' };
+    });
+    expect((await handleOncallGroupAction(event('oncall_group_create'), 'app')).toast.type).toBe('error');
+    expect(migratedSource()).toBeUndefined(); expect(mocks.reply).not.toHaveBeenCalled(); expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it('retries an uncertain DM with the same provider key inside the deduplication window', async () => {
+    mocks.userReceipt.mockRejectedValueOnce(new Error('timeout'));
+    await handleOncallGroupAction(event('oncall_group_create'), 'app');
+    await handleOncallGroupAction(event('oncall_group_create'), 'app');
+    expect(mocks.userReceipt).toHaveBeenCalledTimes(2);
+    expect(mocks.userReceipt.mock.calls[0]![4]).toBe(mocks.userReceipt.mock.calls[1]![4]);
+    expect(mocks.reply).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not resend an uncertain DM after the provider deduplication window expires', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    mocks.userReceipt.mockRejectedValueOnce(new Error('timeout'));
+    await handleOncallGroupAction(event('oncall_group_create'), 'app');
+    vi.setSystemTime(Date.now() + 56 * 60_000);
+    expect((await handleOncallGroupAction(event('oncall_group_create'), 'app')).toast.type).toBe('error');
+    expect(mocks.userReceipt).toHaveBeenCalledTimes(1); expect(mocks.reply).not.toHaveBeenCalled();
+  });
+
+  it('settles a crash between source publication and receipt completion on the next click', async () => {
+    const finish = vi.spyOn(OncallPrivateIntakeStore.prototype, 'finishDelivery').mockImplementationOnce(() => { throw new Error('interrupted'); });
+    try { expect((await handleOncallGroupAction(event('oncall_group_create'), 'app')).toast.type).toBe('error'); }
+    finally { finish.mockRestore(); }
+    expect((await handleOncallGroupAction(event('oncall_group_create'), 'app')).toast.type).toBe('info');
+    const dm = migratedSource();
+    expect(new OncallPrivateIntakeStore(dir).isStarting(dm.privateIntake!)).toBe(false);
+    expect(mocks.userReceipt).toHaveBeenCalledTimes(1); expect(mocks.reply).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('private Oncall intake', () => {
+  function setupPrivateIntake() {
+    const privateIntake = { appId: 'app', groupChatId: 'oc_source', groupMessageId: 'om_public_question',
+      chatId: 'oc_dm', rootMessageId: 'om_dm_root', ownerOpenId: 'ou_owner', createdAtMs: Date.now() };
+    const dm: OncallGroupSource = { ...source, chatId: privateIntake.chatId, rootId: privateIntake.rootMessageId,
+      sessionId: 'private_session', messageId: 'om_dmanswer', questionId: 'om_dmquestion', privateIntake };
+    const groups = new OncallGroupStore(dir);
+    groups.recordSource({ ...dm, cardJson: JSON.stringify({ schema: '2.0', body: { elements: [] } }) });
+    mocks.bot.config.oncallGroup = { enabled: true, chatIds: ['oc_source'], privateIntakeChatIds: ['oc_source'],
+      flowMode: 'classify', formDisplay: 'native', forwardMode: 'merge' };
+    const act = (name: string, current?: { id: string; version: number; messageId?: string }, owner?: string) => {
+      const click = event(name, current, owner);
+      click.context = { open_chat_id: dm.chatId, open_message_id: current?.messageId ?? dm.messageId };
+      return click;
+    };
+    return { dm, groups, act };
+  }
+
+  it('keeps the entry in the linked DM and accepts an owner-supplied summary from a legacy card', async () => {
+    const { dm, groups, act } = setupPrivateIntake();
+    mocks.bot.config.oncallGroup.forwardMode = 'none';
+    const raw = JSON.stringify({ schema: '2.0', body: { elements: [] } });
+    const policy = mocks.bot.config.oncallGroup;
+    const context = { appId: 'app', sessionId: dm.sessionId, questionId: dm.questionId, phase: 'final' as const };
+    expect(attachOncallGroupButton(raw, policy, 'oc_source', 'group', context)).toBe(raw);
+    expect(attachOncallGroupButton(raw, policy, dm.chatId, 'p2p', context)).toBe(raw);
+    const dmCard = attachOncallGroupButton(raw, policy, dm.chatId, 'p2p', { ...context, privateIntake: dm.privateIntake });
+    expect(dmCard).toContain('oncall_group_create');
+
+    expect((await handleOncallGroupAction(act('oncall_group_create', undefined, 'ou_other'), 'app')).toast.type).toBe('error');
+    const wrongChat = act('oncall_group_create');
+    wrongChat.context.open_chat_id = 'oc_source';
+    expect((await handleOncallGroupAction(wrongChat, 'app')).toast.type).toBe('error');
+    expect((await handleOncallGroupAction(act('oncall_group_create'), 'app')).toast.type).toBe('info');
+    expect(mocks.detail).not.toHaveBeenCalled();
+    expect(mocks.reply.mock.calls[0]?.slice(0, 2)).toEqual(['app', dm.messageId]);
+    const formCard = JSON.parse(mocks.reply.mock.calls[0]![2]);
+    const form = formCard.body.elements.find((element: { tag: string }) => element.tag === 'form');
+    expect(form).toBeUndefined();
+    expect(JSON.stringify(formCard)).not.toContain('oncall_private_summary');
+    const current = formCard.body.elements.at(-1).columns[0].elements[0].behaviors[0].value;
+    // Already delivered summary forms use the old action for this same draft.
+    const submit = act('oncall_group_form_botmux_submit', { id: current.draftId, version: current.version, messageId: 'om_public' });
+    const read = fetcher.getMockImplementation()!;
+    fetcher.mockImplementation((url: string, init?: RequestInit) => init?.method === 'POST'
+      ? Promise.resolve(response({ oncall_flow_id: '123', open_chat_id: 'oc_created' })) : read(url, init));
+    submit.action.form_value = { oncall_private_summary: '请检查支付状态' };
+    await (await handleOncallFormAction(submit, 'app')).afterAck();
+
+    const creates = fetcher.mock.calls.filter(([, init]) => init?.method === 'POST');
+    expect(creates).toHaveLength(1);
+    expect(JSON.parse(creates[0]![1].body)).toMatchObject({ trigger_message: '请检查支付状态' });
+    expect(groups.getRequest(dm)).toMatchObject({ status: 'succeeded', forwardMode: 'none', messageIdsSnapshot: [] });
+    expect(groups.pendingHandoffs('app')).toEqual([]);
+    expect(mocks.thread).not.toHaveBeenCalled();
+    expect(mocks.forward).not.toHaveBeenCalled();
+    expect(mocks.merge).not.toHaveBeenCalled();
+    expect(mocks.invite).toHaveBeenCalledWith('app', 'oc_created');
+    const notices = mocks.reply.mock.calls.filter(([, id]) => id === dm.privateIntake!.groupMessageId);
+    expect(notices).toHaveLength(1);
+    expect(notices[0][2]).not.toContain('请检查支付状态');
+    expect(mocks.update.mock.calls.some(([, id, card]) => id === dm.messageId && card.includes('/client/chat/open?openChatId=oc_created'))).toBe(true);
+  });
+
+  it('uses the preset directly in the DM and creates one ticket without private content', async () => {
+    const { dm, groups, act } = setupPrivateIntake();
+    mocks.bot.config.oncallGroup.forwardMode = 'none';
+    mocks.bot.config.oncallGroup.flowMode = 'direct';
+    fetcher.mockResolvedValue(response({ oncall_flow_id: '123', open_chat_id: 'oc_created' }));
+    for (let i = 0; i < 2; i++) await handleOncallGroupAction(act('oncall_group_create'), 'app');
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(fetcher.mock.calls[0]![1].body)).toMatchObject({
+      type_id: 999, region: 'legacy', trigger_message: '用户通过私聊发起人工 Oncall',
+    });
+    expect(groups.getRequest(dm)).toMatchObject({ status: 'succeeded', forwardMode: 'none', messageIdsSnapshot: [] });
+    expect(mocks.detail).not.toHaveBeenCalled();
+    expect(mocks.reply).toHaveBeenCalledOnce();
+    const [, anchor, raw, type, inThread] = mocks.reply.mock.calls[0];
+    expect([anchor, type, inThread]).toEqual(['om_public_question', 'interactive', true]);
+    const button = JSON.parse(raw).body.elements[1].columns[0].elements[0];
+    expect(button.text.content).toBe('进入人工 Oncall 群');
+    expect(button.behaviors).toEqual([{ type: 'open_url', default_url: await mocks.invite.mock.results[0].value }]);
+    expect(mocks.forward).not.toHaveBeenCalled();
+    expect(mocks.update.mock.calls.at(-1)?.[2]).toContain('oc_created');
+  });
+
+  it.each(['merge', 'individual'] as const)('forwards only the submitted private consultation to its Oncall group (%s)', async mode => {
+    const { dm, groups, act } = setupPrivateIntake();
+    const now = Date.now();
+    mocks.bot.config.oncallGroup.flowMode = 'direct';
+    mocks.bot.config.oncallGroup.forwardMode = mode;
+    groups.registerTurn('app', dm.sessionId!, dm.questionId);
+    groups.registerTurn('app', dm.sessionId!, 'om_quoted');
+    mocks.thread.mockResolvedValue({ verifiedThread: false, messages: [
+      { message_id: dm.questionId, create_time: now - 5000 },
+      { message_id: 'om_file', parent_id: dm.questionId, msg_type: 'file', create_time: now - 4000 },
+      { message_id: 'om_otherdm', create_time: now - 3000 },
+      { message_id: dm.messageId, create_time: now - 1000 },
+      { message_id: 'om_later', parent_id: dm.questionId, create_time: now + 60_000 },
+    ] });
+    mocks.detail.mockResolvedValue({ items: [{ message_id: 'om_quoted', chat_id: dm.chatId, create_time: now - 2000 }] });
+    mocks.merge.mockResolvedValue({ messageId: 'om_merged', invalidMessageIds: [] });
+    fetcher.mockResolvedValue(response({ oncall_flow_id: '123', open_chat_id: 'oc_created' }));
+    await handleOncallGroupAction(act('oncall_group_create'), 'app');
+    const ids = [dm.questionId, 'om_file', 'om_quoted', dm.messageId];
+    expect(groups.getRequest(dm)).toMatchObject({ status: 'succeeded', forwardMode: mode, messageIdsSnapshot: ids, forwarded: ids });
+    if (mode === 'merge') {
+      expect(mocks.merge).toHaveBeenCalledWith('app', ids, 'oc_created', expect.any(String));
+      expect(mocks.forward).not.toHaveBeenCalled();
+    } else {
+      expect(mocks.forward.mock.calls.map(([, id, chat]) => [id, chat])).toEqual(ids.map(id => [id, 'oc_created']));
+      expect(mocks.merge).not.toHaveBeenCalled();
+    }
+    expect(mocks.reply).toHaveBeenCalledOnce();
+    expect(mocks.reply.mock.calls[0].slice(1, 3)).toEqual(['om_public_question', expect.stringContaining('进入人工 Oncall 群')]);
+  });
+
+  it.each(['pending', 'unknown'] as const)('stops querying an unconfirmed %s create after the existing 24-hour window', async status => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const { dm, groups } = setupPrivateIntake();
+    mocks.bot.config.oncallGroup.flowMode = 'direct';
+    const target = { endpoint: 'https://oncall.example.test/api/inf/v1/chat/', tenantId: 12, typeId: 999, region: 'legacy', emailDomain: 'example.test' };
+    groups.claim(dm, 'ou_owner', { cutoffMs: Date.now(), messageIds: [], forwardMode: 'none' },
+      { target, username: 'owner', region: target.region, typeId: target.typeId });
+    const attemptId = groups.getRequest(dm)!.attemptId!;
+    if (status === 'unknown') groups.finish(dm, { status }, attemptId);
+    vi.setSystemTime(Date.now() + 24 * 60 * 60_000);
+    await retryPendingOncallHandoffs('app');
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(mocks.reply).not.toHaveBeenCalled();
+    expect(groups.getRequest(dm)?.status).toBe(status);
+    expect(groups.pendingHandoffs('app')).toEqual([]);
+  });
+
+  it('recovers a pending original-thread invitation a day after native adoption and settles it once', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const { dm, groups } = setupPrivateIntake();
+    groups.adoptNativeGroup(dm, 'ou_owner', { flowId: '123', openChatId: 'oc_created' },
+      { cutoffMs: Date.now(), messageIds: [], forwardMode: 'none' });
+    mocks.reply.mockRejectedValueOnce(new Error('network timeout'));
+    await expect(prepareOncallGroupInvite(dm)).rejects.toThrow('network timeout');
+    expect(groups.getRequest(dm)?.pendingOriginReplyTo).toBe('om_public_question');
+    vi.setSystemTime(Date.now() + 25 * 60 * 60_000);
+    await retryPendingOncallHandoffs('app');
+    await prepareOncallGroupInvite(dm);
+    expect(mocks.reply).toHaveBeenCalledTimes(2);
+    expect(mocks.reply.mock.calls[1][5]).toBe(mocks.reply.mock.calls[0][5]);
+    expect(mocks.invite).toHaveBeenCalledOnce();
+    expect(groups.getRequest(dm)?.pendingOriginReplyTo).toBeUndefined();
+    expect(groups.pendingHandoffs('app')).toEqual([]);
+  });
+
+  it('withholds configured private forwarding and the origin invitation after source access is revoked', async () => {
+    const { dm, groups } = setupPrivateIntake();
+    groups.adoptNativeGroup(dm, 'ou_owner', { flowId: '123', openChatId: 'oc_created' },
+      { cutoffMs: Date.now(), messageIds: [dm.questionId], forwardMode: 'individual' });
+    mocks.sourceMembers.mockResolvedValue(new Set());
+    await expect(prepareOncallGroupInvite(dm)).rejects.toThrow('暂时无法确认咨询权限');
+    await expect(forwardOncallConversation(dm)).rejects.toThrow('暂时无法确认咨询权限');
+    expect(mocks.invite).not.toHaveBeenCalled();
+    expect(mocks.reply).not.toHaveBeenCalled();
+    expect(mocks.forward).not.toHaveBeenCalled();
+    expect(mocks.merge).not.toHaveBeenCalled();
+    expect(groups.getRequest(dm)).toMatchObject({ pendingOriginReplyTo: 'om_public_question', messageIdsSnapshot: [dm.questionId] });
+    expect(groups.getRequest(dm)?.forwarded).toBeUndefined();
+    expect(groups.getRequest(dm)?.forwarding).toBeUndefined();
+  });
+
+  it('opens the selected private category with a handoff query and no private transcript', async () => {
+    const { act } = setupPrivateIntake();
+    const sidebar = new URL('https://oncall.example.test/chat?tenant=12');
+    fetcher.mockImplementation(async (url: string) => {
+      if (url.includes('lark_dialog_url')) return response({
+        lark_dialog_url: `https://applink.feishu.cn/client/web_url/open?url=${encodeURIComponent(sidebar.href)}`,
+      });
+      if (url.includes('/workflow/')) return response({ tenant_id: 12, type_id: 34, config: '[{}]' });
+      return response({ region: { cn: [category] } });
+    });
+    expect((await handleOncallGroupAction(act('oncall_group_create'), 'app')).toast.type).toBe('info');
+    const card = JSON.parse(mocks.reply.mock.calls[0]![2]);
+    const [open, cancel] = card.body.elements.at(-1).columns.map((column: any) => column.elements[0].behaviors[0]);
+    const page = new URL(new URL(open.default_url).searchParams.get('url')!);
+    expect(page.searchParams.get('query')).toBe('申请人工 Oncall');
+    expect(page.searchParams.get('context')).toBe(JSON.stringify({ trigger_message: '' }));
+    const attempts = await new OncallFormStore(dir).use('app', cancel.value.draftId, 'ou_owner',
+      async draft => draft.nativeSubmission?.attempts);
+    expect(attempts).toHaveLength(1);
+    expect(attempts?.[0]?.forwardMode).toBe('merge');
+    expect(mocks.detail).not.toHaveBeenCalled();
+  });
+
+  it('keeps an old DM card usable after returning to public intake while preserving owner isolation', async () => {
+    const { act } = setupPrivateIntake();
+    mocks.bot.config.oncallGroup.privateIntakeChatIds = [];
+    expect((await handleOncallGroupAction(act('oncall_group_create'), 'app')).toast.type).toBe('info');
+    expect(mocks.reply).toHaveBeenCalledTimes(1);
+    expect(mocks.reply.mock.calls[0]?.[1]).toBe('om_dmanswer');
+    expect((await handleOncallGroupAction(act('oncall_group_create', undefined, 'ou_other'), 'app')).toast.type).toBe('error');
+    expect(mocks.reply).toHaveBeenCalledTimes(1);
+    expect(mocks.detail).not.toHaveBeenCalled(); expect(mocks.userReceipt).not.toHaveBeenCalled();
+  });
+
+  it.each(['removed', 'lookup_failed'] as const)('rejects direct private creation when source membership is %s', async reason => {
+    const { act } = setupPrivateIntake();
+    mocks.bot.config.oncallGroup.flowMode = 'direct';
+    mocks.bot.config.oncallGroup.forwardMode = 'none';
+    if (reason === 'removed') mocks.sourceMembers.mockResolvedValue(new Set());
+    else mocks.sourceMembers.mockRejectedValue(new Error('roster unavailable'));
+    const result = await handleOncallGroupAction(act('oncall_group_create'), 'app');
+    expect(result.toast).toMatchObject({ type: 'error', content: '暂时无法确认咨询权限，请联系原群管理员。' });
+    expect(fetcher.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(0);
+  });
+
+  it('rejects a private form submission after source-group membership is revoked', async () => {
+    const { act } = setupPrivateIntake();
+    mocks.bot.config.oncallGroup.forwardMode = 'none';
+    await handleOncallGroupAction(act('oncall_group_create'), 'app');
+    const card = JSON.parse(mocks.reply.mock.calls[0]![2]);
+    const current = card.body.elements.at(-1).columns[0].elements[0].behaviors[0].value;
+    mocks.sourceMembers.mockResolvedValue(new Set());
+    const submit = act('oncall_group_form_botmux_submit', { id: current.draftId, version: current.version, messageId: 'om_public' });
+    submit.action.form_value = {};
+    const result = await handleOncallFormAction(submit, 'app');
+    expect(result.toast).toMatchObject({ type: 'error', content: '暂时无法确认咨询权限，请联系原群管理员。' });
+    expect(fetcher.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(0);
+  });
+
+  it('rechecks source membership immediately before direct creation', async () => {
+    const { act } = setupPrivateIntake();
+    mocks.bot.config.oncallGroup.flowMode = 'direct';
+    mocks.bot.config.oncallGroup.forwardMode = 'none';
+    mocks.sourceMembers.mockResolvedValueOnce(new Set(['ou_owner'])).mockResolvedValueOnce(new Set());
+    const result = await handleOncallGroupAction(act('oncall_group_create'), 'app');
+    expect(result.toast).toMatchObject({ type: 'error', content: '暂时无法确认咨询权限，请联系原群管理员。' });
+    expect(mocks.sourceMembers).toHaveBeenCalledTimes(2);
+    expect(fetcher.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(0);
+  });
+
+  it('rechecks source membership after a private form selection settles', async () => {
+    const { act } = setupPrivateIntake();
+    mocks.bot.config.oncallGroup.forwardMode = 'none';
+    await handleOncallGroupAction(act('oncall_group_create'), 'app');
+    const card = JSON.parse(mocks.reply.mock.calls[0]![2]);
+    const current = card.body.elements.at(-1).columns[0].elements[0].behaviors[0].value;
+    mocks.sourceMembers.mockReset().mockResolvedValueOnce(new Set(['ou_owner'])).mockResolvedValueOnce(new Set());
+    const submit = act('oncall_group_form_botmux_submit', { id: current.draftId, version: current.version, messageId: 'om_public' });
+    submit.action.form_value = {};
+    const result = await handleOncallFormAction(submit, 'app');
+    expect(result.toast).toMatchObject({ type: 'error', content: '暂时无法确认咨询权限，请联系原群管理员。' });
+    expect(mocks.sourceMembers).toHaveBeenCalledTimes(2);
+    expect(fetcher.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(0);
+  });
+
+  it('retires a private classification form when classify mode changes to direct', async () => {
+    const { act } = setupPrivateIntake();
+    mocks.bot.config.oncallGroup.forwardMode = 'none';
+    await handleOncallGroupAction(act('oncall_group_create'), 'app');
+    const card = JSON.parse(mocks.reply.mock.calls[0]![2]);
+    const current = card.body.elements.at(-1).columns[0].elements[0].behaviors[0].value;
+    mocks.bot.config.oncallGroup.flowMode = 'direct';
+    const submit = act('oncall_group_form_botmux_submit', { id: current.draftId, version: current.version, messageId: 'om_public' });
+    submit.action.form_value = {};
+    const result = await handleOncallFormAction(submit, 'app');
+    expect(result.toast).toMatchObject({ type: 'error', content: '转人工配置已变更，请重新打开入口' });
+    expect(fetcher.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(0);
+  });
+
+});
 
 describe('direct Oncall confirmation', () => {
   it('puts a native open_url on the original answer and repairs an old callback without publishing another message', async () => {
@@ -343,8 +821,8 @@ describe('topic classification card and group handoff', () => {
     expect(recovered.afterAck).toBeTypeOf('function');
     expect(mocks.update).not.toHaveBeenCalled();
     await recovered.afterAck();
-    const submit = JSON.parse(mocks.update.mock.calls.at(-1)![2]).elements.at(-1).actions[0];
-    expect(submit.disabled).toBe(false); expect(submit.value.version).toBe(1);
+    const submit = JSON.parse(mocks.update.mock.calls.at(-1)![2]).body.elements.at(-1).columns[0].elements[0];
+    expect(submit.disabled).toBe(false); expect(submit.behaviors[0].value.version).toBe(1);
     await handleOncallGroupAction(event('oncall_group_create'), 'app');
     expect(mocks.reply).toHaveBeenCalledTimes(1); expect(mocks.update).toHaveBeenCalledTimes(2);
   });
@@ -409,15 +887,15 @@ describe('preloaded custom-form confirmation', () => {
     return new OncallFormStore(dir).open({ appId: 'app', ownerOpenId: 'ou_owner', source, choices: { regions: { cn: [category, plain] } },
       region: 'cn', priority: 'P2', description: 'question' });
   }
-  const primary = (raw: string) => JSON.parse(raw).elements.at(-1).actions[0];
+  const primary = (raw: string) => JSON.parse(raw).body.elements.at(-1).columns[0].elements[0];
   const latest = (d: any) => new OncallFormStore(dir).use('app', d.id, 'ou_owner', async d => ({ ...d }));
   it('publishes the confirmation itself as a native sidebar URL, before any submit callback', async () => {
     const d = await openPrepared(); const button = primary(mocks.reply.mock.calls[0][2]);
-    expect(button).toMatchObject({ type: 'primary', disabled: false }); expect(button.value).toBeUndefined();
-    const outer = new URL(button.url); const page = new URL(outer.searchParams.get('url')!);
+    expect(button).toMatchObject({ type: 'primary', disabled: false }); expect(button.behaviors[0].value).toBeUndefined();
+    const outer = new URL(button.behaviors[0].default_url); const page = new URL(outer.searchParams.get('url')!);
     expect(outer.searchParams.get('mode')).toBe('sidebar-semi');
     expect(Object.fromEntries(page.searchParams)).toMatchObject({ type: '34', region: 'cn', level: 'P2', query: 'question' });
-    expect(d.nativeFormLink).toBe(button.url); expect(d.nativeEntry).toBeUndefined();
+    expect(d.nativeFormLink).toBe(button.behaviors[0].default_url); expect(d.nativeEntry).toBeUndefined();
     expect(mocks.reply).toHaveBeenCalledOnce(); expect(mocks.update).not.toHaveBeenCalled();
     expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
     expect(fetcher.mock.calls.every(call => call[1]?.method !== 'POST')).toBe(true);
@@ -427,17 +905,17 @@ describe('preloaded custom-form confirmation', () => {
     const choose = event('oncall_group_form_category', d); choose.action.option = '56';
     await (await handleOncallFormAction(choose, 'app')).afterAck(); d = await latest(d);
     const button = primary(mocks.update.mock.calls.at(-1)![2]);
-    expect(button.url).toBeUndefined(); expect(button.value).toMatchObject({ action: 'oncall_group_form_submit', version: d.version });
+    expect(button.behaviors[0].default_url).toBeUndefined(); expect(button.behaviors[0].value).toMatchObject({ action: 'oncall_group_form_submit', version: d.version });
     expect(d.nativeFormLink).toBeUndefined();
     const restore = event('oncall_group_form_category', d); restore.action.option = '34';
     await (await handleOncallFormAction(restore, 'app')).afterAck();
-    expect(primary(mocks.update.mock.calls.at(-1)![2]).url).toBe((await latest(d)).nativeFormLink);
+    expect(primary(mocks.update.mock.calls.at(-1)![2]).behaviors[0].default_url).toBe((await latest(d)).nativeFormLink);
     expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
   });
   it('updates the preloaded priority before the confirmation is published', async () => {
     const d = await openPrepared(); const choose = event('oncall_group_form_priority', d); choose.action.option = 'P1';
     await (await handleOncallFormAction(choose, 'app')).afterAck();
-    const page = new URL(new URL(primary(mocks.update.mock.calls.at(-1)![2]).url).searchParams.get('url')!);
+    const page = new URL(new URL(primary(mocks.update.mock.calls.at(-1)![2]).behaviors[0].default_url).searchParams.get('url')!);
     expect(page.searchParams.get('level')).toBe('P1'); expect(mocks.reply).toHaveBeenCalledOnce();
   });
 });
@@ -483,7 +961,8 @@ describe('Botmux custom Oncall form', () => {
   function readCard(d: ReturnType<typeof draftForCurrentSource>, updated = false) {
     const publish = d.visibility === 'thread' ? (updated ? mocks.update : mocks.reply) : mocks.ephemeral;
     const card = JSON.parse(publish.mock.calls.at(-1)![d.visibility === 'thread' ? 2 : 3]);
-    return { draft: d, card, form: card.elements.find((element: any) => element.tag === 'form') };
+    const elements = card.body?.elements ?? card.elements;
+    return { draft: d, card: { ...card, elements }, form: elements.find((element: any) => element.tag === 'form') };
   }
   async function select(d: ReturnType<typeof draftForCurrentSource>, field: string, option: string) {
     const change = event(`oncall_group_form_${field}`, d);
@@ -502,17 +981,17 @@ describe('Botmux custom Oncall form', () => {
     expect(shown.card.elements.find((element: any) => element.tag === 'column_set').columns.map((column: any) => column.elements[0].initial_option))
       .toEqual(['cn', '34', 'P2']);
     expect(shown.form.elements.slice(0, -1)).toMatchObject([
-      { tag: 'input', name: 'oncall_field_0', label: { content: '流程节点名称' }, required: true },
-      { tag: 'input', name: 'oncall_field_1', label: { content: '业务线' }, required: false },
+      { tag: 'input', name: 'oncall_field_0', required: true, label: { content: '流程节点名称' } },
+      { tag: 'input', name: 'oncall_field_1', label: { content: '业务线' } },
     ]);
     expect(shown.form.elements.at(-1)).toMatchObject({ tag: 'column_set', flex_mode: 'none' });
     const buttons = formButtons(shown.form);
     expect(buttons).toMatchObject([
-      { action_type: 'form_submit', value: { action: 'oncall_group_form_botmux_submit', version: shown.draft.version } },
-      { action_type: 'request', value: { action: 'oncall_group_form_cancel', version: shown.draft.version } },
+      { form_action_type: 'submit', behaviors: [{ type: 'callback', value: { action: 'oncall_group_form_botmux_submit', version: shown.draft.version } }] },
+      { tag: 'interactive_container', behaviors: [{ type: 'callback', value: { action: 'oncall_group_form_cancel', version: shown.draft.version } }] },
     ]);
     const submit = event('oncall_group_form_botmux_submit', shown.draft);
-    submit.action.value = buttons[0].value;
+    submit.action.value = buttons[0].behaviors[0].value;
     submit.action.form_value = { oncall_field_0: '结账', oncall_field_1: '核算' };
     const respond = fetcher.getMockImplementation()!;
     let finishCreate!: (response: Response) => void;
@@ -694,10 +1173,13 @@ describe('Botmux custom Oncall form', () => {
     expect(creates()).toHaveLength(1);
     expect(new OncallGroupStore(dir).getRequest(source)).toMatchObject({ status: 'succeeded', formClosePending: false });
   });
-  it('cancels from the same button row with required fields left empty', async () => {
+  it('cancels from the same row with required fields left empty', async () => {
     const shown = readCard(await open());
     const cancel = event('oncall_group_form_cancel', shown.draft);
-    cancel.action.value = formButtons(shown.form)[1].value;
+    expect(shown.form.elements.some((element: any) => element.required)).toBe(true);
+    expect(formButtons(shown.form)[1]).not.toHaveProperty('form_action_type');
+    cancel.action.value = formButtons(shown.form)[1].behaviors[0].value;
+    cancel.action.form_value = { oncall_field_0: '', oncall_field_1: '未提交的内容' };
     const result = await handleOncallFormAction(cancel, 'app');
     expect(result.toast.type).toBe('info');
     await result.afterAck();
@@ -714,7 +1196,7 @@ describe('Botmux custom Oncall form', () => {
     expect(mocks.withdraw).not.toHaveBeenCalled();
     const ordinary = await select(shown.draft, 'category', '35');
     expect(ordinary.form).toBeUndefined();
-    expect(ordinary.card.elements.at(-1).actions[0].value.action).toBe('oncall_group_form_submit');
+    expect(ordinary.card.body.elements.at(-1).columns[0].elements[0].behaviors[0].value.action).toBe('oncall_group_form_submit');
     submit.action.form_value = { oncall_field_0: 'stale text' };
     const stale = await handleOncallFormAction(submit, 'app');
     expect(stale.toast.type).toBe('info');
@@ -748,14 +1230,30 @@ describe('Botmux custom Oncall form', () => {
     await changed.afterAck();
     const refreshed = readCard(draftForCurrentSource(), true);
     expect(refreshed.form).toBeUndefined();
-    expect(refreshed.card.elements.at(-1).actions[0].url).toContain('/client/web_url/open');
+    expect(refreshed.card.body.elements.at(-1).columns[0].elements[0].behaviors[0].default_url).toContain('/client/web_url/open');
+    expect(creates()).toHaveLength(0);
+  });
+  it('keeps the same schema on one card when switching between inline and native categories', async () => {
+    const first = await open();
+    const initial = readCard(first);
+    const native = await select(first, 'priority', 'P0');
+    const next = await select(native.draft, 'priority', 'P2');
+    for (const view of [initial, native, next]) {
+      expect(view.card.schema).toBe('2.0');
+      expect(view.card.body.elements.find((el: any) => el.tag === 'column_set').columns[1].elements[0].options)
+        .toHaveLength(2);
+    }
+    expect(native.form).toBeUndefined();
+    expect(JSON.stringify(native.card)).not.toContain('流程节点名称');
+    expect(next.form.name).not.toBe(initial.form.name);
+    expect(mocks.update.mock.calls.every(([, id]) => id === first.messageId)).toBe(true);
     expect(creates()).toHaveLength(0);
   });
   it('switches the same card between linked inputs and native P0 without submitting', async () => {
     const d = await open();
     const native = await select(d, 'priority', 'P0');
     expect(native.form).toBeUndefined();
-    const url = native.card.elements.at(-1).actions[0].url;
+    const url = native.card.body.elements.at(-1).columns[0].elements[0].behaviors[0].default_url;
     const page = new URL(new URL(url).searchParams.get('url')!);
     expect(page.searchParams.get('level')).toBe('P0');
     const botmux = await select(native.draft, 'priority', 'P2');
@@ -768,6 +1266,69 @@ describe('Botmux custom Oncall form', () => {
     const d = await open([{ base: { key: 'owner', type: 'person', label: '负责人' } }]);
     expect(d.nativeFormLink).toContain('/client/web_url/open');
     expect(d.botmuxFields).toBeUndefined();
+    expect(d.nativeFormReason).toBeTruthy();
+  });
+  it('keeps oversized choice forms native without truncating their options', async () => {
+    const workflow = Array.from({ length: 20 }, (_, index) => ({
+      base: { key: `field_${index}`, label: `选项 ${index}`, type: 'select' },
+      custom: { customOptions: Array.from({ length: 100 }, (_, value) => ({ value, displayName: '选项'.repeat(30) })) },
+    }));
+    const d = await open(workflow);
+    expect(d.botmuxFields).toBeUndefined();
+    expect(d.nativeFormReason).toBeTruthy();
+    expect(d.nativeFormLink).toContain('/client/web_url/open');
+    expect(creates()).toHaveLength(0);
+  });
+  it('submits platform required text, multiline and static choices through the same card', async () => {
+    const workflow = [
+      { base: { key: 'reference', label: '参考编号', type: 'input' }, validations: [{ type: 'required' }] },
+      { base: { key: 'scope', label: '影响范围', type: 'textArea' } },
+      { base: { key: 'direction', label: '方向', type: 'radio' },
+        custom: { customOptions: [{ value: 'billing', displayName: '账务' }, { value: 'refund', displayName: '退款' }] },
+        validations: [{ type: 'required' }] },
+      { base: { key: 'priority', label: '业务优先级', type: 'select' },
+        custom: { customOptions: [{ value: 0, displayName: '普通' }] } },
+    ];
+    const shown = readCard(await open(workflow));
+    expect(shown.card.schema).toBe('2.0');
+    expect(shown.draft.nativeFormLink).toBeUndefined();
+    expect(shown.draft.nativeFormReason).toBeUndefined();
+    const submit = event('oncall_group_form_botmux_submit', shown.draft);
+    submit.action.value = formButtons(shown.form)[0].behaviors[0].value;
+    // Native client validation is not a substitute for checking the callback.
+    submit.action.form_value = { oncall_field_0: 'R001' };
+    expect((await handleOncallFormAction(submit, 'app')).toast.type).toBe('error');
+    submit.action.form_value.oncall_field_2 = 'forged-option';
+    expect((await handleOncallFormAction(submit, 'app')).toast.type).toBe('error');
+    expect(creates()).toHaveLength(0);
+    const selects = shown.form.elements.filter((item: any) => item.tag === 'select_static');
+    submit.action.form_value = { oncall_field_0: 'R001', oncall_field_1: 'line 1\nline 2',
+      oncall_field_2: selects[0].options[1].value, oncall_field_3: selects[1].options[0].value };
+    const accepted = await handleOncallFormAction(submit, 'app');
+    expect(accepted.toast.type).toBe('info');
+    await accepted.afterAck();
+    expect(creates()).toHaveLength(1);
+    expect(JSON.parse(JSON.parse(creates()[0][1].body).workflow_config)).toEqual({
+      reference: { name: 'reference', type: 'input', value: 'R001' },
+      scope: { name: 'scope', type: 'textArea', value: 'line 1\nline 2' },
+      direction: { name: 'direction', type: 'radio', value: 'refund' },
+      priority: { name: 'priority', type: 'select', value: 0 },
+    });
+    expect(new OncallGroupStore(dir).getRequest(source)).toMatchObject({ status: 'succeeded', formClosePending: false });
+    expect(mocks.forward).toHaveBeenCalled();
+  });
+  it('refreshes the card rather than submitting an option whose platform meaning changed', async () => {
+    const workflow = [{ base: { key: 'direction', label: '方向', type: 'select' },
+      custom: { customOptions: [{ value: 'billing', displayName: '账务' }] } }];
+    const shown = readCard(await open(workflow));
+    const submit = event('oncall_group_form_botmux_submit', shown.draft);
+    submit.action.form_value = { oncall_field_0: shown.form.elements.find((item: any) => item.tag === 'select_static').options[0].value };
+    workflow[0].custom.customOptions[0].value = 'refund';
+    const result = await handleOncallFormAction(submit, 'app');
+    expect(result.toast.type).toBe('warning');
+    await result.afterAck();
+    expect(draftForCurrentSource().version).toBeGreaterThan(shown.draft.version);
+    expect(creates()).toHaveLength(0);
   });
   it('keeps a category with no custom fields on the ordinary group path', async () => {
     const d = await open([]);

@@ -3,11 +3,11 @@ import { mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLock, withFileLockSync } from '../utils/file-lock.js';
-import { OncallGroupStore, type OncallGroupSource } from './oncall-group-store.js';
+import { oncallSourceEnabled, OncallGroupStore, type OncallGroupSource } from './oncall-group-store.js';
 import { loadOncallGroupTarget } from './oncall-group-client.js';
 import type { NativeOncallResultQuery, NativeOncallScan, OncallChoices } from './oncall-platform.js';
-import { nativeFormPolicyFingerprint, oncallGroupEnabled, type OncallForwardMode, type OncallGroupPolicy } from './oncall-group-policy.js';
-import type { OncallTextField } from './oncall-custom-form.js';
+import { nativeFormPolicyMatches, type OncallForwardMode, type OncallGroupPolicy } from './oncall-group-policy.js';
+import type { OncallCardField } from './oncall-custom-form.js';
 
 const FORM_LIFETIME_MS = 24 * 60 * 60_000;
 
@@ -47,7 +47,9 @@ export interface OncallFormDraft {
   /** Prepared before publication, so custom-form confirmation opens the sidebar directly. */
   nativeFormLink?: string;
   /** Published field definition, scoped to this draft and version. */
-  botmuxFields?: OncallTextField[];
+  botmuxFields?: OncallCardField[];
+  /** Explains why a preferred card form needs the native sidebar. */
+  nativeFormReason?: string;
   /** Every published selection is retained until the card is retired. */
   nativeSubmission?: OncallNativeSubmission;
   oncallUsername?: string;
@@ -104,7 +106,7 @@ export class OncallFormStore {
     if (!attempt?.sidebarLink) return;
     try {
       const policy = readPolicy(appId);
-      if (!oncallGroupEnabled(policy, draft.source.chatId) || nativeFormPolicyFingerprint(policy) !== attempt.policyFingerprint
+      if (!oncallSourceEnabled(policy, draft.source) || !nativeFormPolicyMatches(policy, attempt.policyFingerprint)
         || JSON.stringify(loadOncallGroupTarget(this.dataDir, appId)) !== draft.targetFingerprint) return;
       const request = new OncallGroupStore(this.dataDir).getRequest(draft.source);
       if (request && request.status !== 'failed') return;

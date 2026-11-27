@@ -65,7 +65,7 @@ function nativeWriter(sdk: ReturnType<typeof vi.fn>, name: 'updateMessage' | 'se
 
 const click = () => ({ operator: { open_id: 'ou_owner' }, context: { open_chat_id: source.chatId, open_message_id: source.messageId },
   action: { value: { action: 'oncall_group_create' } } }) as any;
-const confirm = (raw: string) => { const card = JSON.parse(raw); return (card.body?.elements ?? card.elements).at(-1).actions[0]; };
+const confirm = (raw: string) => { const card = JSON.parse(raw); return card.body.elements.at(-1).columns[0].elements[0]; };
 const innerPage = (url: string) => new URL(new URL(url).searchParams.get('url')!);
 function changeTenant() { const path = join(dir, 'oncall-group-targets.json'); const targets = JSON.parse(readFileSync(path, 'utf8'));
   targets.app.tenantId = 99; writeFileSync(path, JSON.stringify(targets)); }
@@ -113,8 +113,8 @@ describe('prepared native confirmation review', () => {
     const second = await handleOncallFormAction(event('oncall_group_form_priority', await current(d), 'P0'), 'app');
     await second.afterAck(); await first.afterAck();
     for (const [, id, raw] of mocks.update.mock.calls) {
-      expect(id).toBe('om_form'); expect(innerPage(confirm(raw).url).searchParams.get('level')).toBe('P0');
-      expect(confirm(raw).value).toBeUndefined();
+      expect(id).toBe('om_form'); expect(innerPage(confirm(raw).behaviors[0].default_url).searchParams.get('level')).toBe('P0');
+      expect(confirm(raw).behaviors[0].value).toBeUndefined();
     }
     expect((await current(d)).priority).toBe('P0'); expect(mocks.reply).not.toHaveBeenCalled();
   });

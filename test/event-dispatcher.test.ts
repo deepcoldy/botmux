@@ -18,6 +18,8 @@ import { createHmac } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { OncallPrivateIntakeStore } from '../src/services/oncall-private-intake.js';
+import { serializeByAnchor } from '../src/utils/anchor-serializer.js';
 import * as Lark from '@larksuiteoapi/node-sdk';
 
 // ─── Mock external modules ──────────────────────────────────────────────────
@@ -35,20 +37,21 @@ const mockWriteFileSync = vi.fn();
 const mockCrossRefStatSync = vi.fn();
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs')>();
-  const isSubstTmp = (path: unknown) => String(path).includes(SUBST_TEST_TMP_PREFIX);
+  const usesRealFiles = (path: unknown) => String(path).includes(SUBST_TEST_TMP_PREFIX)
+    || String(path).includes('/oncall-private-intake/');
   return {
     ...actual,
-    existsSync: (...args: any[]) => isSubstTmp(args[0]) ? actual.existsSync(args[0] as any) : mockExistsSync(...args),
-    readFileSync: (...args: any[]) => isSubstTmp(args[0])
+    existsSync: (...args: any[]) => usesRealFiles(args[0]) ? actual.existsSync(args[0] as any) : mockExistsSync(...args),
+    readFileSync: (...args: any[]) => usesRealFiles(args[0])
       ? actual.readFileSync(args[0] as any, args[1] as any)
       : mockReadFileSync(...args),
     statSync: (path: any, ...args: any[]) => String(path).includes('bot-openids-')
       ? mockCrossRefStatSync(path, ...args)
       : (actual.statSync as any)(path, ...args),
-    writeFileSync: (...args: any[]) => (typeof args[0] === 'number' || isSubstTmp(args[0]))
+    writeFileSync: (...args: any[]) => (typeof args[0] === 'number' || usesRealFiles(args[0]))
       ? (actual.writeFileSync as any)(...args)
       : mockWriteFileSync(...args),
-    mkdirSync: (...args: any[]) => isSubstTmp(args[0])
+    mkdirSync: (...args: any[]) => usesRealFiles(args[0])
       ? (actual.mkdirSync as any)(...args)
       : undefined,
   };
@@ -186,6 +189,9 @@ const mockIsHumanOpenId = vi.fn(async () => false);
 const mockGetUserProfile = vi.fn(async () => null as { name: string } | null);
 // 自助申请卡转投管理员私聊（p2p / 群里无管理员）：发卡、查群成员、取群名。
 const mockSendUserMessage = vi.fn(async () => 'om_dm_card');
+const mockPrivateIntakeReceipt = vi.fn<() => Promise<{ messageId: string; chatId?: string }>>();
+const mockPrivateForward = vi.fn();
+const mockCurrentUserMembers = vi.fn<() => Promise<Set<string>>>();
 const mockListChatMemberOpenIds = vi.fn(async () => [] as string[]);
 const mockGetChatName = vi.fn(async () => null as string | null);
 const mockSignedChatContext = vi.fn();
@@ -216,6 +222,9 @@ vi.mock('../src/im/lark/client.js', () => ({
   listThreadMessages: (...args: any[]) => mockListThreadMessages(...args),
   getUserProfile: (...args: any[]) => mockGetUserProfile(...args),
   sendUserMessage: (...args: any[]) => mockSendUserMessage(...args),
+  forwardMessageReceipt: (...args: unknown[]) => mockPrivateForward(...args),
+  sendUserMessageReceipt: (...args: unknown[]) => mockPrivateIntakeReceipt(...args as []),
+  findCurrentChatUserMembers: (...args: unknown[]) => mockCurrentUserMembers(...args as []),
   listChatMemberOpenIds: (...args: any[]) => mockListChatMemberOpenIds(...args),
   getChatName: (...args: any[]) => mockGetChatName(...args),
 }));
@@ -989,7 +998,9 @@ function setupBotState(opts?: {
   /** 整群 talk 授权（owner 在群里裸 `/grant` 写入的 chat_id 列表）。 */
   allowedChatGroups?: string[];
   allowedUsers?: string[];
+  p2pOpen?: boolean;
   ownerOpenId?: string;
+  oncallGroup?: import('../src/services/oncall-group-policy.js').OncallGroupPolicy;
   /** 原始配置里的 allowedUsers（默认镜像 allowedUsers）。用于构造「配了 owner 但解析为空」的场景。 */
   configAllowedUsers?: string[];
   /** 内存态黑名单（P1c），默认 []。 */
@@ -1035,6 +1046,7 @@ function setupBotState(opts?: {
       // 默认镜像, 单测可用 configAllowedUsers 单独构造「配了但解析为空」的 fail-closed 场景。
       allowedUsers: opts?.configAllowedUsers ?? opts?.allowedUsers,
       ownerOpenId: opts?.ownerOpenId,
+      oncallGroup: opts?.oncallGroup,
       chatGrants: opts?.chatGrants,
       globalGrants: opts?.globalGrants,
       allowedChatGroups: opts?.allowedChatGroups,
@@ -1055,6 +1067,7 @@ function setupBotState(opts?: {
 	      chatManagerEnabled: opts?.chatManagerEnabled,
 	      chatManagerSharedTopic: opts?.chatManagerSharedTopic,
 	      p2pMode: opts?.p2pMode,
+        p2pOpen: opts?.p2pOpen,
 	      summaryRange: opts?.summaryRange,
 	      summaryMemory: opts?.summaryMemory,
 	      summaryMemoryPath: opts?.summaryMemoryPath,
@@ -1230,6 +1243,501 @@ describe('startLarkEventDispatcher — connection wiring', () => {
     client.close();
     expect(capturedHandlers['im.message.receive_v1']).toBeTypeOf('function');
     expect(capturedHandlers['card.action.trigger']).toBeTypeOf('function');
+  });
+});
+
+describe('strict private Oncall group intake', () => {
+  const groupChatId = 'oc_funds_test';
+  const dmChatId = 'oc_funds_dm';
+  let priorDir: string;
+  let dataDir: string;
+  let handlers: ReturnType<typeof makeHandlers>;
+  let runtime: ReturnType<typeof createLarkEventDispatcherRuntime>;
+
+  beforeEach(() => {
+    priorDir = config.session.dataDir;
+    dataDir = mkdtempSync(join(tmpdir(), SUBST_TEST_TMP_PREFIX));
+    config.session.dataDir = dataDir;
+    mockPrivateIntakeReceipt.mockReset();
+    mockPrivateForward.mockReset();
+    mockCurrentUserMembers.mockReset();
+    mockReplyMessage.mockClear();
+    capturedHandlers = {};
+    setupBotState({ allowedUsers: [USER_OPEN_ID, 'ou_other_user'], p2pMode: 'group', oncallGroup: {
+      enabled: true, chatIds: [groupChatId], privateIntakeChatIds: [groupChatId],
+    } });
+    handlers = makeHandlers();
+    runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers);
+    runtime.connect();
+  });
+
+  afterEach(() => {
+    runtime.close();
+    config.session.dataDir = priorDir;
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  const groupAsk = (messageId: string, text: string) => makeUserMessageEvent({
+    senderOpenId: USER_OPEN_ID, chatId: groupChatId, messageId,
+    content: JSON.stringify({ text: `@_bot_a ${text}` }),
+    mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+  });
+  const dmReply = (messageId: string, parentId?: string, senderOpenId = USER_OPEN_ID) => {
+    const data = makeUserMessageEvent({ senderOpenId, chatId: dmChatId, chatType: 'p2p', messageId,
+      content: JSON.stringify({ text: 'follow-up' }) });
+    return { ...data, message: { ...data.message, parent_id: parentId } };
+  };
+  async function deliver(data: unknown) {
+    await capturedHandlers['im.message.receive_v1'](data);
+    await flushEventWork();
+  }
+
+  function processPrimary(data: ReturnType<typeof groupAsk>, options?: { signal?: AbortSignal; attempt?: number }) {
+    const { message_id: messageId, chat_id: chatId } = data.message;
+    const eventId = `im.message.receive_v1:${MY_APP_ID}:${messageId}`;
+    const partitionKey = `lark-message-routing:${MY_APP_ID}:${chatId}`;
+    return runtime.processDurableMessage({
+      eventType: 'lark.im.message.receive_v1', eventId, partitionKey,
+      larkAppId: MY_APP_ID, messageId, data, attempts: options?.attempt ?? 1,
+    }, {
+      claim: {
+        event: { eventId, partitionKey, payload: {}, visibleAt: 1, createdAt: 1 },
+        workerId: 'primary-worker', claimEpoch: options?.attempt ?? 1, claimUntil: 60_000,
+        attempts: options?.attempt ?? 1,
+      },
+      signal: options?.signal ?? new AbortController().signal,
+      queuePostAdmissionOutput: () => undefined,
+    });
+  }
+
+  function textReceipt(messageId: string, text: string) {
+    return { chatId: dmChatId, messageId, messageType: 'text', content: JSON.stringify({ text }) };
+  }
+
+  it('waits for the receipt and first turn when a DM reply arrives during the send', async () => {
+    const receipt = Promise.withResolvers<ReturnType<typeof textReceipt>>();
+    mockPrivateForward.mockReturnValueOnce(receipt.promise);
+    const capture = vi.fn(() => true);
+    handlers.captureHumanInput = capture;
+    const seed = groupAsk('om_funds_racing_seed', 'first');
+    const continued = dmReply('om_funds_racing_follow', 'om_funds_racing_root');
+    await deliver(seed);
+    expect(mockPrivateForward).toHaveBeenCalledOnce();
+    const pendingFollowUp = deliver(continued);
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(capture).not.toHaveBeenCalled();
+    handlers.handleNewTopic.mockImplementationOnce(async () => {
+      handlers.isSessionOwner.mockImplementation(anchor => anchor === 'om_funds_racing_root');
+    });
+    receipt.resolve(textReceipt('om_funds_racing_root', 'first'));
+    await pendingFollowUp;
+    await vi.waitFor(() => expect(handlers.handleThreadReply).toHaveBeenCalledOnce());
+    for (const handler of [handlers.handleNewTopic, handlers.handleThreadReply]) {
+      expect(handler).toHaveBeenCalledExactlyOnceWith(expect.anything(),
+        expect.objectContaining({ chatId: dmChatId, anchor: 'om_funds_racing_root' }));
+    }
+  });
+
+  it('keeps a replay private if the administrator removes the group while the receipt is in flight', async () => {
+    const receipt = Promise.withResolvers<ReturnType<typeof textReceipt>>();
+    mockPrivateForward.mockReturnValueOnce(receipt.promise);
+    const event = groupAsk('om_funds_revoke_pending', 'stay private');
+    const pending = processPrimary(event);
+    const rejected = expect(pending).rejects.toThrow('Private Oncall authorization changed');
+    await vi.waitFor(() => expect(mockPrivateForward).toHaveBeenCalledOnce());
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    receipt.resolve(textReceipt('om_funds_revoke_root', 'stay private'));
+    await rejected;
+    const capture = vi.fn(() => true);
+    handlers.captureHumanInput = capture;
+    await expect(processPrimary(event, { attempt: 2 })).resolves.toMatchObject({ kind: 'ignored' });
+    expect(capture).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(mockReplyMessage).not.toHaveBeenCalled();
+  });
+
+  it('keeps privacy when a queued event is processed after the policy changes', async () => {
+    const event = groupAsk('om_funds_revoke_before_processing', 'stay private');
+    capturedHandlers['im.message.receive_v1'](event);
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    await flushEventWork();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(mockPrivateForward).not.toHaveBeenCalled();
+  });
+
+  it('honors an aborted owner lookup and lets a canonical retry read its existing turn receipt', async () => {
+    runtime.close();
+    const ownerRead = Promise.withResolvers<undefined>();
+    const readPrimarySession = vi.fn().mockReturnValueOnce(ownerRead.promise).mockResolvedValue(undefined);
+    runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers, 'feishu', undefined, { readPrimarySession });
+    const seed = groupAsk('om_funds_claim_seed', 'durable question');
+    const root = 'om_funds_claim_root';
+    const controller = new AbortController();
+    const forwarded = textReceipt(root, 'durable question');
+    mockPrivateForward.mockResolvedValueOnce(forwarded);
+    mockGetMessageDetail.mockResolvedValue({ items: [{ message_id: root, msg_type: 'text', body: { content: forwarded.content } }] });
+    const pending = processPrimary(seed, { signal: controller.signal });
+    const rejected = expect(pending).rejects.toThrow('claim expired');
+    await vi.waitFor(() => expect(readPrimarySession).toHaveBeenCalledOnce());
+    controller.abort(new Error('claim expired'));
+    ownerRead.resolve(undefined);
+    await rejected;
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+
+    const session = {
+      sessionId: 'session-private', chatId: dmChatId, rootMessageId: root, scope: 'thread' as const,
+      title: 'Private', status: 'active' as const, createdAt: new Date().toISOString(), larkAppId: MY_APP_ID,
+    };
+    handlers.resolveDurableSession = () => session;
+    handlers.handleNewTopic.mockImplementationOnce(async (_data, ctx) => {
+      ctx.ingressAdmission.admitted = true;
+      handlers.isSessionOwner.mockReturnValue(true);
+    });
+    handlers.handleThreadReply.mockImplementationOnce(async (_data, ctx) => {
+      ctx.ingressAdmission.admitted = true;
+    });
+    await expect(processPrimary(seed, { attempt: 2 })).resolves.toEqual({ kind: 'admitted', session });
+    await expect(processPrimary(seed, { attempt: 3 })).resolves.toEqual({ kind: 'admitted', session });
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+    expect(handlers.handleThreadReply).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ message: expect.objectContaining({ message_id: root }) }),
+      expect.objectContaining({ durablePrimaryDispatch: expect.objectContaining({ attempt: 3 }) }),
+    );
+    expect(mockPrivateForward).toHaveBeenCalledOnce();
+  });
+
+  it('dispatches two group questions only to their respective DM threads and requires an exact reply', async () => {
+    mockPrivateForward.mockResolvedValueOnce(textReceipt('om_funds_root_a', 'question A'))
+      .mockResolvedValueOnce(textReceipt('om_funds_root_b', 'question B'));
+    await deliver(groupAsk('om_funds_group_a', 'question A'));
+    await deliver(groupAsk('om_funds_group_b', 'question B'));
+    expect(mockPrivateForward.mock.calls.map(call => call.slice(0, 3))).toEqual([
+      [MY_APP_ID, 'om_funds_group_a', { type: 'open_id', id: USER_OPEN_ID }],
+      [MY_APP_ID, 'om_funds_group_b', { type: 'open_id', id: USER_OPEN_ID }],
+    ]);
+    expect(handlers.handleNewTopic).toHaveBeenCalledTimes(2);
+    expect(handlers.handleNewTopic).toHaveBeenNthCalledWith(1,
+      expect.objectContaining({ message: expect.objectContaining({ content: JSON.stringify({ text: 'question A' }) }) }),
+      expect.objectContaining({ chatId: dmChatId, scope: 'thread', anchor: 'om_funds_root_a' }));
+    expect(handlers.handleNewTopic).toHaveBeenNthCalledWith(2, expect.anything(),
+      expect.objectContaining({ chatId: dmChatId, anchor: 'om_funds_root_b' }));
+    expect(mockReplyMessage).not.toHaveBeenCalled();
+
+    handlers.isSessionOwner.mockImplementation(anchor => anchor.startsWith('om_funds_root_'));
+    await deliver(dmReply('om_funds_dm_invalid', 'om_funds_root_b', 'ou_other_user'));
+    await deliver(dmReply('om_funds_dm_unquoted'));
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).toHaveBeenCalledTimes(3);
+    expect(handlers.handleNewTopic).toHaveBeenLastCalledWith(expect.anything(),
+      expect.objectContaining({ chatId: dmChatId, anchor: 'om_funds_dm_unquoted' }));
+    expect(mockReplyMessage).not.toHaveBeenCalled();
+    await deliver(dmReply('om_funds_dm_follow_a', 'om_funds_root_a'));
+    expect(handlers.handleThreadReply).toHaveBeenCalledOnce();
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(expect.anything(),
+      expect.objectContaining({ chatId: dmChatId, anchor: 'om_funds_root_a', scope: 'thread' }));
+  });
+
+  it('keeps pre-admission capture out and grants group-only users access to their identified DM consultation', async () => {
+    setupBotState({ allowedUsers: ['ou_admin'], allowedChatGroups: [groupChatId], oncallGroup: {
+      enabled: true, chatIds: [groupChatId], privateIntakeChatIds: [groupChatId],
+    } });
+    const capture = vi.fn(() => true);
+    handlers.captureHumanInput = capture;
+    mockPrivateForward.mockResolvedValue(textReceipt('om_funds_root_authorized', 'question'));
+    await deliver(groupAsk('om_funds_group_authorized', 'question'));
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+    handlers.isSessionOwner.mockImplementation(anchor => anchor === 'om_funds_root_authorized');
+
+    mockCurrentUserMembers.mockResolvedValueOnce(new Set()).mockResolvedValueOnce(new Set([USER_OPEN_ID]));
+    await deliver(dmReply('om_funds_former_member', 'om_funds_root_authorized'));
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    await deliver(dmReply('om_funds_current_member', 'om_funds_root_authorized'));
+    expect(handlers.handleThreadReply).toHaveBeenCalledOnce();
+    expect(capture).not.toHaveBeenCalled();
+  });
+
+  it('continues the original DM after 24 hours and a switch back to group intake while the group stays authorized', async () => {
+    const root = 'om_funds_long_thread';
+    mockPrivateForward.mockResolvedValueOnce(textReceipt(root, 'starting question'));
+    await deliver(groupAsk('om_funds_long_seed', 'starting question'));
+    handlers.isSessionOwner.mockImplementation(anchor => anchor === root);
+    await deliver(dmReply('om_funds_long_first', root));
+    setupBotState({ allowedUsers: [USER_OPEN_ID], oncallGroup: {
+      enabled: true, chatIds: [groupChatId], privateIntakeChatIds: [],
+    } });
+    const clock = vi.spyOn(Date, 'now');
+    clock.mockReturnValue(Date.now() + 25 * 60 * 60_000);
+    try {
+      await deliver(dmReply('om_funds_long_second', 'om_funds_long_first'));
+      expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+      expect(handlers.handleThreadReply).toHaveBeenCalledTimes(2);
+      expect(handlers.handleThreadReply).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({ anchor: root }));
+      setupBotState({ allowedUsers: [USER_OPEN_ID], oncallGroup: { enabled: true, chatIds: [] } });
+      await deliver(dmReply('om_funds_removed_follow', root));
+      expect(handlers.handleThreadReply).toHaveBeenCalledTimes(2);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it('rejects former source-group members even when the bot allows ordinary DMs', async () => {
+    setupBotState({ allowedUsers: ['ou_admin'], allowedChatGroups: [groupChatId], p2pOpen: true, oncallGroup: {
+      enabled: true, chatIds: [groupChatId], privateIntakeChatIds: [groupChatId],
+    } });
+    const root = 'om_funds_membership_root';
+    mockPrivateForward.mockResolvedValueOnce(textReceipt(root, 'group-authorized question'));
+    await deliver(groupAsk('om_funds_membership_seed', 'group-authorized question'));
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+    handlers.isSessionOwner.mockImplementation(anchor => anchor === root);
+    mockCurrentUserMembers.mockResolvedValueOnce(new Set());
+    await deliver(dmReply('om_funds_retired_user', root));
+    expect(mockCurrentUserMembers).toHaveBeenCalledExactlyOnceWith(MY_APP_ID, groupChatId, [USER_OPEN_ID]);
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('rejects new private intake in clustered primary mode without falling back to group handling', async () => {
+    vi.stubEnv('BOTMUX_COORDINATION_MODE', 'primary');
+    try {
+      await deliver(groupAsk('om_funds_primary_mode', 'keep this out of the group'));
+      expect(mockPrivateForward).not.toHaveBeenCalled();
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+      expect(mockReplyMessage).toHaveBeenCalledOnce();
+      expect(mockReplyMessage.mock.calls[0]?.slice(0, 3)).toEqual(
+        [MY_APP_ID, 'om_funds_primary_mode', '当前部署暂不支持私聊接待，请联系该群管理员。'],
+      );
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it.each([
+    ['link', 'post', { zh_cn: { title: '标题', content: [[{ tag: 'at', user_id: MY_OPEN_ID }], [{ tag: 'a', text: '文档', href: 'https://example.org' }]] } }],
+    ['document', 'file', { file_key: 'group-pdf', file_name: '示例.pdf' }],
+    ['voice', 'audio', { file_key: 'group-audio', duration: 2200 }],
+    ['video', 'media', { file_key: 'group-video', image_key: 'group-cover' }],
+    ['picture', 'image', { image_key: 'group-photo' }],
+    ['video_post', 'post', { title: '', content: [[{ tag: 'at', user_id: MY_OPEN_ID }, { tag: 'media', file_key: 'group-video' }]] }],
+    ['mixed_post', 'post', { title: '', content: [[{ tag: 'text', text: 'A' }, { tag: 'img', image_key: 'group-a' }],
+      [{ tag: 'text', text: 'B' }, { tag: 'img', image_key: 'group-b' }, { tag: 'media', file_key: 'group-video' }]] }],
+  ] as const)('forwards %s intact and passes the complete DM copy to the first turn', async (label, type, body) => {
+    const ask = groupAsk('om_source_' + label, '');
+    const root = 'om_copy_' + label;
+    ask.message.message_type = type;
+    ask.message.content = JSON.stringify(body);
+    const content = ask.message.content.replaceAll('group-', 'private-');
+    const mentions = [{ key: '@_user_1', name: 'BotA', id: MY_OPEN_ID, id_type: 'open_id' }];
+    mockPrivateForward.mockResolvedValueOnce({ messageId: root, chatId: dmChatId, messageType: type, content, mentions });
+    await deliver(ask);
+    expect(mockPrivateForward).toHaveBeenCalledExactlyOnceWith(MY_APP_ID, ask.message.message_id, { type: 'open_id', id: USER_OPEN_ID },
+      expect.any(String), expect.anything());
+    expect(mockPrivateIntakeReceipt).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      message: expect.objectContaining({ message_id: root, message_type: type, content, mentions }),
+    }), expect.objectContaining({ chatId: dmChatId, anchor: root }));
+    expect(mockReplyMessage).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])('forwards an illustrated post only to its author and reads the DM image (receipt body: %s)', async hasBody => {
+    const body = (imageKey: string) => JSON.stringify({ title: '', content: [[
+      { tag: 'at', user_id: MY_OPEN_ID }, { tag: 'text', text: ' hi' }, { tag: 'img', image_key: imageKey },
+    ]] });
+    const seed = groupAsk(`om_group_photo_${hasBody}`, '');
+    seed.message.message_type = 'post';
+    seed.message.content = body('group-image');
+    const privateRoot = `om_dm_photo_${hasBody}`;
+    const copiedContent = body('private-image');
+    mockPrivateForward.mockResolvedValueOnce({ messageId: privateRoot, chatId: dmChatId, messageType: 'post',
+      content: hasBody ? copiedContent : undefined });
+    if (!hasBody) mockGetMessageDetail.mockResolvedValueOnce({ items: [{ message_id: privateRoot, msg_type: 'post', body: { content: copiedContent } }] });
+    await deliver(seed);
+    expect(mockPrivateForward).toHaveBeenCalledExactlyOnceWith(MY_APP_ID, seed.message.message_id, { type: 'open_id', id: USER_OPEN_ID },
+      expect.any(String), expect.objectContaining({ beforeWrite: expect.any(Function) }));
+    expect(mockPrivateIntakeReceipt).not.toHaveBeenCalled();
+    expect(mockReplyMessage).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      message: expect.objectContaining({ message_type: 'post', message_id: privateRoot, content: copiedContent }),
+    }), expect.objectContaining({ chatId: dmChatId, anchor: privateRoot }));
+  });
+
+  it('keeps an unreadable delivered copy private and lets the author continue in that thread', async () => {
+    const root = 'om_unreadable_copy';
+    mockPrivateForward.mockResolvedValueOnce({ messageId: root, chatId: dmChatId });
+    mockGetMessageDetail.mockRejectedValueOnce(new Error('read unavailable'));
+    await deliver(groupAsk('om_unreadable_source', 'private question'));
+    expect(mockPrivateForward).toHaveBeenCalledOnce();
+    expect(mockPrivateIntakeReceipt).not.toHaveBeenCalled();
+    expect(mockReplyMessage).toHaveBeenCalledOnce();
+    expect(mockReplyMessage.mock.calls[0]?.slice(0, 3)).toEqual([MY_APP_ID, root,
+      '消息已转到私聊，但机器人暂时无法读取内容。请回复这条消息继续咨询。']);
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    await deliver(dmReply('om_follow_after_read_error', root));
+    expect(handlers.handleNewTopic).toHaveBeenCalledExactlyOnceWith(expect.anything(), expect.objectContaining({ chatId: dmChatId, anchor: root }));
+  });
+
+  it.each(['text', 'post'])('asks for a question when a %s only mentions the bot', async type => {
+    mockPrivateIntakeReceipt.mockResolvedValueOnce({ chatId: dmChatId, messageId: 'om_private_empty_root' });
+    const ask = groupAsk('om_private_empty_seed_' + type, '');
+    ask.message.message_type = type;
+    if (type === 'post') ask.message.content = JSON.stringify({ content: [[{ tag: 'at', user_id: MY_OPEN_ID }]] });
+    await deliver(ask);
+    expect(mockPrivateForward).not.toHaveBeenCalled();
+    expect(mockPrivateIntakeReceipt.mock.calls[0]?.slice(0, 4)).toEqual(
+      [MY_APP_ID, USER_OPEN_ID, '请回复这条消息，补充你的问题。', 'text']);
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('only sends a fixed acknowledgment if the DM delivery cannot be confirmed', async () => {
+    mockPrivateForward.mockRejectedValueOnce(new Error('forward forbidden'));
+    await deliver(groupAsk('om_funds_failure', 'do not publish this'));
+    expect(mockPrivateIntakeReceipt).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(mockReplyMessage).toHaveBeenCalledOnce();
+    expect(mockReplyMessage.mock.calls[0]?.slice(0, 3)).toEqual([MY_APP_ID, 'om_funds_failure', '暂时无法将这条消息发送到私聊，请联系该群管理员。']);
+  });
+
+  it('does not consume an unrelated parented DM after a private delivery fails', async () => {
+    mockPrivateForward.mockRejectedValueOnce(new Error('forward forbidden'));
+    await deliver(groupAsk('om_funds_failed_unrelated', 'private question'));
+    expect(new OncallPrivateIntakeStore(dataDir).awaitingReceipt(MY_APP_ID, USER_OPEN_ID)).toBe(false);
+    mockReplyMessage.mockClear();
+    const capture = vi.fn(() => true);
+    handlers.captureHumanInput = capture;
+    await deliver(dmReply('om_unrelated_dm_reply', 'om_preexisting_dm_root'));
+    expect(capture).toHaveBeenCalledOnce();
+    expect(mockReplyMessage).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('keeps a landed-but-unconfirmed DM reply out of ordinary capture after a timeout', async () => {
+    mockPrivateForward.mockRejectedValueOnce(new Error('request timeout'));
+    await deliver(groupAsk('om_timeout_private_seed', 'private question'));
+    expect(new OncallPrivateIntakeStore(dataDir).awaitingReceipt(MY_APP_ID, USER_OPEN_ID)).toBe(true);
+    mockReplyMessage.mockClear();
+    const capture = vi.fn(() => true);
+    handlers.captureHumanInput = capture;
+    await deliver(dmReply('om_timeout_dm_reply', 'om_landed_without_receipt'));
+    expect(capture).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(mockReplyMessage).toHaveBeenCalledOnce();
+    expect(mockReplyMessage.mock.calls[0]?.slice(0, 3)).toEqual([MY_APP_ID, 'om_timeout_dm_reply',
+      '私聊投递结果待核对，请稍后重试或联系管理员。']);
+  });
+
+  it('does not erase an earlier timeout when a later retry definitely fails', async () => {
+    mockPrivateForward.mockRejectedValueOnce(new Error('request timeout'))
+      .mockRejectedValueOnce(new Error('forward forbidden'));
+    const seed = groupAsk('om_timeout_then_failed_seed', 'private question');
+    await deliver(seed);
+    await deliver(seed);
+    expect(new OncallPrivateIntakeStore(dataDir).awaitingReceipt(MY_APP_ID, USER_OPEN_ID)).toBe(true);
+    mockReplyMessage.mockClear();
+    const capture = vi.fn(() => true);
+    handlers.captureHumanInput = capture;
+    await deliver(dmReply('om_timeout_then_failed_reply', 'om_landed_without_receipt'));
+    expect(capture).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(mockReplyMessage).toHaveBeenCalledOnce();
+    expect(mockReplyMessage.mock.calls[0]?.slice(0, 3)).toEqual([MY_APP_ID, 'om_timeout_then_failed_reply',
+      '私聊投递结果待核对，请稍后重试或联系管理员。']);
+  });
+
+  it('keeps a missing chat receipt uncertain when the delivered chat cannot be resolved', async () => {
+    mockPrivateForward.mockResolvedValueOnce({ messageId: 'om_landed_without_chat' });
+    mockGetMessageDetail.mockResolvedValueOnce({ items: [] });
+    await deliver(groupAsk('om_missing_chat_seed', 'private question'));
+    expect(new OncallPrivateIntakeStore(dataDir).awaitingReceipt(MY_APP_ID, USER_OPEN_ID)).toBe(true);
+    mockReplyMessage.mockClear();
+    const capture = vi.fn(() => true);
+    handlers.captureHumanInput = capture;
+    await deliver(dmReply('om_missing_chat_reply', 'om_landed_without_chat'));
+    expect(capture).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(mockReplyMessage).toHaveBeenCalledOnce();
+    expect(mockReplyMessage.mock.calls[0]?.slice(0, 3)).toEqual([MY_APP_ID, 'om_missing_chat_reply',
+      '私聊投递结果待核对，请稍后重试或联系管理员。']);
+  });
+
+  it('recovers a private binding from a delivered message when the receipt lacks chatId', async () => {
+    const root = 'om_recovered_private_chat';
+    mockPrivateForward.mockResolvedValueOnce({ messageId: root, messageType: 'text', content: JSON.stringify({ text: 'private question' }) });
+    mockGetMessageDetail.mockResolvedValueOnce({ items: [{ message_id: root, chat_id: dmChatId }] });
+    await deliver(groupAsk('om_recover_chat_seed', 'private question'));
+    expect(handlers.handleNewTopic).toHaveBeenCalledExactlyOnceWith(expect.anything(),
+      expect.objectContaining({ chatId: dmChatId, anchor: root }));
+    expect(new OncallPrivateIntakeStore(dataDir).awaitingReceipt(MY_APP_ID, USER_OPEN_ID)).toBe(false);
+  });
+
+  it('defers an unrelated DM to ordinary capture after an in-flight receipt settles', async () => {
+    const receipt = Promise.withResolvers<ReturnType<typeof textReceipt>>();
+    mockPrivateForward.mockReturnValueOnce(receipt.promise);
+    const capture = vi.fn(() => true);
+    handlers.captureHumanInput = capture;
+    await deliver(groupAsk('om_funds_in_flight_unrelated', 'private question'));
+    const unrelated = dmReply('om_in_flight_unrelated_reply', 'om_preexisting_dm_root');
+    const pendingUnrelated = deliver(unrelated);
+    expect(capture).not.toHaveBeenCalled();
+    receipt.resolve(textReceipt('om_in_flight_private_root', 'private question'));
+    await pendingUnrelated;
+    expect(capture).toHaveBeenCalledExactlyOnceWith(unrelated);
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(mockReplyMessage).not.toHaveBeenCalled();
+  });
+
+  it('keeps durable primary capture out while a receipt is commit-unknown', async () => {
+    const store = new OncallPrivateIntakeStore(dataDir);
+    store.beginDelivery(MY_APP_ID, USER_OPEN_ID, 'om_primary_unknown_group');
+    store.markDeliveryUncertain({ appId: MY_APP_ID, ownerOpenId: USER_OPEN_ID, groupMessageId: 'om_primary_unknown_group' });
+    const capture = vi.fn(() => true);
+    handlers.captureHumanInput = capture;
+    await expect(processPrimary(dmReply('om_primary_unknown_reply', 'om_primary_unrelated_root')))
+      .resolves.toMatchObject({ kind: 'retry' });
+    expect(capture).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('captures an ordinary DM after a durable primary delivery settles without binding', async () => {
+    const store = new OncallPrivateIntakeStore(dataDir);
+    const delivery = { appId: MY_APP_ID, ownerOpenId: USER_OPEN_ID, groupMessageId: 'om_primary_settled_group' };
+    store.beginDelivery(delivery.appId, delivery.ownerOpenId, delivery.groupMessageId);
+    const receiptSpy = vi.spyOn(OncallPrivateIntakeStore.prototype, 'awaitingReceipt');
+    const gate = Promise.withResolvers<void>();
+    const lane = `oncall-private-intake:${MY_APP_ID}:${USER_OPEN_ID}`;
+    const laneTask = serializeByAnchor(lane, () => gate.promise, 0);
+    const capture = vi.fn(() => true);
+    handlers.captureHumanInput = capture;
+    const data = dmReply('om_primary_receipt_miss', 'om_primary_unrelated_root');
+    try {
+      const processed = processPrimary(data);
+      await vi.waitFor(() => expect(receiptSpy.mock.calls.length).toBeGreaterThanOrEqual(2));
+      store.finishDelivery(delivery);
+      gate.resolve();
+      await laneTask;
+      await expect(processed).resolves.toMatchObject({ kind: 'ignored' });
+      expect(capture).toHaveBeenCalledExactlyOnceWith(data);
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+      expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    } finally {
+      gate.resolve();
+      receiptSpy.mockRestore();
+    }
+  });
+
+  it.each(['/help', '/t separate topic'])('explains unsupported %s instead of silently completing it', async command => {
+    const kind = command === '/help' ? 'help' : 'topic';
+    mockPrivateForward.mockResolvedValueOnce(textReceipt(`om_private_${kind}_root`, command));
+    await deliver(groupAsk(`om_private_${kind}_source`, command));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(mockReplyMessage).toHaveBeenCalledOnce();
+    expect(mockReplyMessage.mock.calls[0]?.slice(0, 3)).toEqual([MY_APP_ID, `om_private_${kind}_root`,
+      '私聊接待暂不支持斜杠命令或话题指令，请直接描述问题。']);
   });
 });
 
