@@ -22990,10 +22990,10 @@ async function reconcilePluginServicesForCli(
 
 async function stopPluginServicesForCli(
   pluginIds?: string[],
-  options: { autoOnly?: boolean } = {},
+  options: { autoOnly?: boolean; shutdownSupervisor?: boolean } = {},
 ): Promise<import('./core/plugins/service-manager.js').PluginServiceReport[]> {
   const { stopPluginServices } = await import('./core/plugins/service-manager.js');
-  const reports = await stopPluginServices(pluginIds, { autoOnly: options.autoOnly });
+  const reports = await stopPluginServices(pluginIds, options);
   if (reports.length > 0) {
     console.log('\n插件 host service:');
     console.log(formatPluginServiceReports(reports));
@@ -23525,7 +23525,7 @@ async function cmdPlugin(args: string[]): Promise<void> {
       return;
     }
     if (action === 'stop') {
-      await stopPluginServicesForCli(pluginIds);
+      await stopPluginServicesForCli(pluginIds, { shutdownSupervisor: rawId === '--all' });
       return;
     }
     if (action === 'restart') {

@@ -3562,6 +3562,8 @@ async function configuredBotDefaultsRecoveryRows(
         }, {
           displayName: bot.displayName ?? null,
           larkBotName: persistedNames.get(bot.larkAppId) ?? null,
+          commandTriggersConfigured: Boolean(bot.commandTriggers?.commands.length),
+          blockedUsersConfigured: Boolean(bot.blockedUsers?.length),
           // 离线行也要带上磁盘里的保存值（如竖放排版、默认关的 larkToolBinding），
           // 否则 daemon 不在线时 Dashboard 会把已保存的非默认态显示回默认态。
           ...sparseOverridesFromRawBotConfig(rawEntry),

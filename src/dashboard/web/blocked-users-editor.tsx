@@ -12,6 +12,7 @@ type Tr = (key: string, values?: Record<string, string | number>) => string;
 export function BlockedUsersEditor(props: {
   larkAppId: string;
   tr: Tr;
+  onConfiguredChange?(configured: boolean): void;
 }) {
   const { larkAppId, tr } = props;
   const [entries, setEntries] = useState<string[] | null>(null);
@@ -61,7 +62,9 @@ export function BlockedUsersEditor(props: {
         { entries: next },
       );
       if (res.ok) {
-        setEntries(Array.isArray(res.body.raw) ? res.body.raw : next);
+        const saved = Array.isArray(res.body.raw) ? res.body.raw : next;
+        setEntries(saved);
+        props.onConfiguredChange?.(saved.length > 0);
         toast(tr('blocked.saved'), { kind: 'success' });
       } else if (res.status === 409 || res.body?.error === 'cannot_block_admin') {
         toast(tr('blocked.conflict'), { kind: 'warning' });
