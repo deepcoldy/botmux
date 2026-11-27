@@ -40939,7 +40939,7 @@ async function spawnCliBody(
     // the preceding generation used a plain PTY.
     try {
       piBridgeSessionDir = piPersistentTranscriptDir(
-        config.session.dataDir, cfg.sessionId, piBridgeSessionDir, actuallyReattachedPersistent,
+        config.session.dataDir, cfg.sessionId, piBridgeSessionDir, actuallyReattachedPersistent, scratchRequested,
       );
     } catch (err) {
       // The CLI already started. This worker can still follow its launch

@@ -19,7 +19,9 @@ import {
   drainPiTranscript,
   findPiTranscriptBySessionId,
   piBotmuxSessionDirIn,
+  piBotmuxSessionTranscript,
   piPersistentTranscriptDir,
+  piPreviousTranscriptDir,
   piProfileTranscriptDir,
   piSessionDirName,
   resetPiPendingTurnState,
@@ -212,6 +214,67 @@ describe('Pi transcript layout follows the session across a sandbox switch', () 
     expect(adoptPiTranscriptIntoBotmuxDir(SID, cwd, SESSIONS, join(ROOT, 'new-profile'), bucket)).toEqual({ status: 'copied', from: native, to: copied });
     expect(readFileSync(copied, 'utf8')).toBe(contents);
     expect(findPiTranscriptBySessionId(SID, cwd, SESSIONS, bucket)).toBe(copied);
+  });
+
+  it('off → scratch → oncall keeps the project sessionDir available for history adoption', () => {
+    const cwd = join(ROOT, 'scratch-work');
+    const home = join(ROOT, 'scratch-home');
+    mkdirSync(join(cwd, '.pi'), { recursive: true });
+    mkdirSync(home, { recursive: true });
+    writeFileSync(join(cwd, '.pi', 'settings.json'), JSON.stringify({ sessionDir: 'project-records' }));
+    const env = { HOME: home };
+    const launchDir = piProfileTranscriptDir(env, cwd)!;
+    mkdirSync(launchDir, { recursive: true });
+    const file = `2026-10-01T00-00-00-000Z_${SID}.jsonl`;
+    const contents = JSON.stringify(header(cwd)) + '\n';
+    writeFileSync(join(launchDir, file), contents);
+    const dataDir = join(ROOT, 'scratch-data');
+
+    // The unsandboxed generation records its real host launch directory.
+    expect(piPersistentTranscriptDir(dataDir, SID, launchDir, false)).toBe(launchDir);
+    // Warm scratch keeps its established reattach lookup; cold scratch does not
+    // interpret its missing host profile as a request to clear the record.
+    expect(piPersistentTranscriptDir(dataDir, SID, undefined, true, true)).toBe(launchDir);
+    expect(piPersistentTranscriptDir(dataDir, SID, undefined, false, true)).toBeUndefined();
+    expect(piPreviousTranscriptDir(dataDir, SID)).toBe(launchDir);
+
+    // Oncall deliberately does not read project settings. It must recover the
+    // old directory from the record and copy that history into the own dir.
+    const sandboxProfileDir = piProfileTranscriptDir(env, cwd, false);
+    const adopted = adoptPiTranscriptIntoBotmuxDir(
+      SID, cwd, SESSIONS, sandboxProfileDir, piPreviousTranscriptDir(dataDir, SID),
+    );
+    expect(adopted).toEqual({ status: 'copied', from: join(launchDir, file), to: join(ownDir(), file) });
+    expect(readFileSync(join(ownDir(), file), 'utf8')).toBe(contents);
+  });
+
+  it('accepts valid transcript symlinks in custom and own dirs, but not dangling links', () => {
+    const cwd = join(ROOT, 'symlink-work');
+    const targetDir = join(ROOT, 'symlink-targets');
+    const customDir = join(ROOT, 'custom-symlinks');
+    mkdirSync(cwd, { recursive: true });
+    mkdirSync(targetDir, { recursive: true });
+    mkdirSync(customDir, { recursive: true });
+    const file = `2026-10-01T00-00-00-000Z_${SID}.jsonl`;
+    const target = join(targetDir, 'target.jsonl');
+    writeFileSync(target, JSON.stringify(header(cwd)) + '\n');
+    const customLink = join(customDir, file);
+    symlinkSync(target, customLink);
+
+    // Pi follows this link during exact-id resume; the custom-dir bridge must
+    // find the same file instead of discarding it at the Dirent filter.
+    expect(findPiTranscriptBySessionId(SID, cwd, SESSIONS, customDir)).toBe(customLink);
+
+    mkdirSync(ownDir(), { recursive: true });
+    const ownLink = join(ownDir(), file);
+    symlinkSync(target, ownLink);
+    expect(piBotmuxSessionTranscript(SID, SESSIONS, [cwd, realpathSync(cwd)])).toBe(ownLink);
+    // The no-cwd probe still opens a symlink and validates its session header.
+    expect(piBotmuxSessionTranscript(SID, SESSIONS)).toBe(ownLink);
+
+    rmSync(target);
+    expect(piBotmuxSessionTranscript(SID, SESSIONS)).toBeUndefined();
+    expect(piBotmuxSessionTranscript(SID, SESSIONS, [cwd, realpathSync(cwd)])).toBeUndefined();
   });
 
   it('on → off: the own dir keeps winning over a stale or missing cwd-bucket file', () => {

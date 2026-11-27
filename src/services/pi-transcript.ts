@@ -258,11 +258,16 @@ export function piPreviousTranscriptDir(dataDir: string, sessionId: string): str
 
 /** Reattaching a worker leaves the live Pi process and its original profile
  *  in place. Only custom launches need a record. A missing record retains
- *  the default lookup used before profile-aware workers. */
+ *  the default lookup used before profile-aware workers. A cold scratch launch
+ *  has no host profile directory by construction; its undefined must not erase
+ *  the earlier launch's record needed by a later oncall resume. */
 export function piPersistentTranscriptDir(
-  dataDir: string, sessionId: string, dir: string | undefined, reattach: boolean,
+  dataDir: string, sessionId: string, dir: string | undefined, reattach: boolean, scratch = false,
 ): string | undefined {
   if (!SESSION_UUID_RE.test(sessionId)) return dir;
+  // A warm scratch reattach only reads below, preserving its existing lookup.
+  // A cold scratch generation must leave the previous host launch record alone.
+  if (scratch && !reattach) return dir;
   if (reattach) return piPreviousTranscriptDir(dataDir, sessionId);
   const file = join(dataDir, 'sessions', sessionId + '.pi-transcript-dir');
   if (!dir) {
@@ -473,17 +478,29 @@ export function piBotmuxSessionTranscript(
 
 function piTranscriptInDir(dir: string, sessionId: string, cwds: readonly string[]): string | undefined {
   let names: string[];
-  try { names = readdirSync(dir, { withFileTypes: true }).filter(e => e.isFile()).map(e => e.name); } catch { return undefined; }
+  const symlinks = new Set<string>();
+  try {
+    names = readdirSync(dir, { withFileTypes: true })
+      .filter(e => e.isFile() || e.isSymbolicLink())
+      .map(e => {
+        if (e.isSymbolicLink()) symlinks.add(e.name);
+        return e.name;
+      });
+  } catch { return undefined; }
   const name = names
     .filter(n => n.endsWith(`_${sessionId}.jsonl`))
     .sort()
     .reverse()
     .find(n => {
-      if (cwds.length === 0) return true;
+      // Keep the historical cheap any-regular-file probe when no cwd is known.
+      // A symlink must instead prove that its target is a readable session, so
+      // a dangling link cannot make a session look managed by the own-dir layout.
+      if (cwds.length === 0 && !symlinks.has(n)) return true;
+      const headerCwd = piTranscriptHeaderCwd(join(dir, n));
+      if (headerCwd === undefined) return false;
       // Strict, as Pi is when it looks a session up inside --session-dir: a
       // file without a cwd header is one Pi would skip, so the bridge must too.
-      const headerCwd = piTranscriptHeaderCwd(join(dir, n));
-      return headerCwd !== undefined && cwds.includes(resolve(headerCwd));
+      return cwds.length === 0 || cwds.includes(resolve(headerCwd));
     });
   return name ? join(dir, name) : undefined;
 }
