@@ -4,12 +4,16 @@ import { dirname, join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLockSync } from '../utils/file-lock.js';
 
+const MISSING_SCANS_TO_FORGET = 2;
+
 export interface FollowEntry {
   status: 'pending' | 'inviting' | 'joined' | 'approval' | 'failed' | 'removed';
   attempts: number;
   retryAt?: number;
   attemptId?: string;
   startedAt?: number;
+  /** Scan-inferred removals can be corrected by later membership evidence. */
+  removalSource?: 'snapshot';
 }
 export interface OwnerGroupFollowState {
   version: 1;
@@ -19,6 +23,10 @@ export interface OwnerGroupFollowState {
   revision: number;
   initialized: boolean;
   knownChatIds: string[];
+  /** Consecutive complete snapshots missing a baseline chat; absent in older v1 journals. */
+  missingChatScans?: Record<string, number>;
+  /** Consecutive membership snapshots missing a joined bot; absent in older v1 journals. */
+  missingBotChatScans?: Record<string, number>;
   entries: Record<string, FollowEntry>;
   authNoticeAt?: number;
 }
@@ -39,9 +47,11 @@ export class OwnerGroupFollowStore {
         || typeof state.active !== 'boolean' || typeof state.initialized !== 'boolean'
         || !Number.isSafeInteger(state.revision) || state.revision < 0
         || !Array.isArray(state.knownChatIds) || state.knownChatIds.some(id => !validChatId(id))
+        || !validMissingScans(state.missingChatScans) || !validMissingScans(state.missingBotChatScans)
         || !state.entries || typeof state.entries !== 'object' || Array.isArray(state.entries)
         || Object.entries(state.entries).some(([id, entry]) => !validChatId(id) || !entry
           || !['pending', 'inviting', 'joined', 'approval', 'failed', 'removed'].includes(entry.status)
+          || (entry.removalSource !== undefined && (entry.status !== 'removed' || entry.removalSource !== 'snapshot'))
           || !Number.isInteger(entry.attempts) || entry.attempts < 0)) {
       throw new Error('invalid owner group follow journal');
     }
@@ -67,6 +77,8 @@ export class OwnerGroupFollowStore {
         version: 1, scope, active: enabled, epoch: randomUUID(), revision: previous?.revision ?? 0,
         initialized: keepBaseline ? previous.initialized : false,
         knownChatIds: keepBaseline ? previous.knownChatIds : [],
+        ...(keepBaseline && previous.missingChatScans ? { missingChatScans: previous.missingChatScans } : {}),
+        ...(keepBaseline && previous.missingBotChatScans ? { missingBotChatScans: previous.missingBotChatScans } : {}),
         entries: sameOwner ? Object.fromEntries(Object.entries(previous.entries)
           .filter(([, entry]) => keepBaseline || entry.status === 'removed' || entry.status === 'joined')) : {},
         ...(keepBaseline && previous.authNoticeAt !== undefined ? { authNoticeAt: previous.authNoticeAt } : {}),
@@ -91,17 +103,54 @@ export class OwnerGroupFollowStore {
       // Its newer state wins; an old absence must not manufacture a removal.
       if (snapshotRevision !== undefined && state.revision !== snapshotRevision) return false;
       const known = new Set(state.knownChatIds);
+      const current = new Set(chats);
+      const previousMissing = state.missingChatScans ?? {};
+      const missing = new Map<string, number>();
+      const botMissing = new Map(Object.entries(state.missingBotChatScans ?? {}));
+      // Positive bot membership is authoritative even when the owner listing
+      // omits the chat: it breaks consecutive absence and corrects only
+      // scan-inferred removals, never event or legacy tombstones.
+      for (const chatId of botChats) {
+        botMissing.delete(chatId);
+        const entry = state.entries[chatId];
+        if (entry?.status === 'removed' && entry.removalSource === 'snapshot') {
+          state.entries[chatId] = { status: 'joined', attempts: entry.attempts };
+        }
+      }
+      const retainedMissing: string[] = [];
+      for (const chatId of known) {
+        if (current.has(chatId)) continue;
+        const count = (previousMissing[chatId] ?? 0) + 1;
+        if (count >= MISSING_SCANS_TO_FORGET) {
+          botMissing.delete(chatId);
+          continue;
+        }
+        missing.set(chatId, count);
+        retainedMissing.push(chatId);
+      }
       for (const chatId of chats) {
         const entry = state.entries[chatId];
-        if (entry?.status === 'removed') continue;
+        // Event removals and legacy removed entries are permanent tombstones.
+        if (entry?.status === 'removed' && entry.removalSource !== 'snapshot') {
+          botMissing.delete(chatId);
+          continue;
+        }
         if (botChats.has(chatId)) {
+          botMissing.delete(chatId);
           state.entries[chatId] = { status: 'joined', attempts: entry?.attempts ?? 0 };
           continue;
         }
         if (entry?.status === 'joined') {
-          state.entries[chatId] = { ...entry, status: 'removed' };
+          const count = (botMissing.get(chatId) ?? 0) + 1;
+          if (count >= MISSING_SCANS_TO_FORGET) {
+            state.entries[chatId] = { ...entry, status: 'removed', removalSource: 'snapshot' };
+            botMissing.delete(chatId);
+          } else {
+            botMissing.set(chatId, count);
+          }
           continue;
         }
+        botMissing.delete(chatId);
         if (ineligible.has(chatId)) {
           if (entry?.status === 'pending' || entry?.status === 'inviting') delete state.entries[chatId];
           continue;
@@ -110,8 +159,12 @@ export class OwnerGroupFollowStore {
           state.entries[chatId] = { status: 'pending', attempts: 0 };
         }
       }
-      // Only a complete successful listing may become a baseline.
-      state.knownChatIds = [...chats];
+      // Only a complete successful listing reaches this point, but even one
+      // can transiently omit an existing chat. Forget it only after consecutive
+      // snapshots confirm absence; intervening presence resets its count.
+      state.knownChatIds = [...chats, ...retainedMissing];
+      state.missingChatScans = Object.fromEntries(missing);
+      state.missingBotChatScans = Object.fromEntries(botMissing);
       state.initialized = true;
       revision = state.revision + 1;
     });
@@ -154,9 +207,15 @@ export class OwnerGroupFollowStore {
       const state = this.read();
       if (!state?.active) return;
       state.entries[chatId] = { status: 'removed', attempts: state.entries[chatId]?.attempts ?? 0 };
+      delete state.missingBotChatScans?.[chatId];
       this.write(state);
     });
   }
+}
+
+function validMissingScans(value: unknown): boolean {
+  return value === undefined || (value !== null && typeof value === 'object' && !Array.isArray(value)
+    && Object.entries(value).every(([id, count]) => validChatId(id) && Number.isSafeInteger(count) && count >= 1));
 }
 
 function validChatId(id: unknown): id is string { return typeof id === 'string' && /^oc_[A-Za-z0-9_-]+$/.test(id); }
