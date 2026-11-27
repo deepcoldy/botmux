@@ -1579,6 +1579,26 @@ export async function updateMessage(
   });
 }
 
+export async function updateInteractiveCardByToken(
+  larkAppId: string,
+  token: string,
+  card: Record<string, unknown>,
+): Promise<void> {
+  assertLarkTransport(larkAppId, 'updateInteractiveCardByToken');
+  let cardJson = JSON.stringify(card);
+  cardJson = prepareLocalAddressContent(cardJson, 'interactive', linkFieldContext(larkAppId));
+  const stampedCard = JSON.parse(stampBotmuxCallbackMarkers(cardJson)) as Record<string, unknown>;
+  return executeWithLarkGate(larkAppId, 'updateInteractiveCardByToken', async () => {
+    const c = getBotClient(larkAppId);
+    const res: any = await c.request({
+      method: 'POST',
+      url: '/open-apis/interactive/v1/card/update',
+      data: { token, card: stampedCard },
+    });
+    if (res.code !== 0) throw larkApiError('update interactive card by token', res);
+  });
+}
+
 export interface CardStreamingSettings {
   /** Original message from the persisted stream lease; required by stop policy. */
   messageId?: string;

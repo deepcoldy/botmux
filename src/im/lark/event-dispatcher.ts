@@ -14,7 +14,7 @@ import { startLarkConnection, type LarkConnection } from './transport/connection
 import { getBot, getAllBots, getBotOpenId, findOncallChat, getOwnerOpenId, loadBotConfigs, loadBotConfigsCached, vcMeetingAgentConfigActive, type BotConfig, type BotState, type SubstituteModeConfig } from '../../bot-registry.js';
 import { botHasConfiguredAllowlist } from '../../core/bot-allowlist.js';
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
-import { getChatInfo, getChatMode, getChatModeStrict, getCachedChatMode, getChatName, getUserProfile, getMessageDetail, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, resolveUnionIdFromOpenId, resolveUnionIdFromOpenIdStrict, replyMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
+import { getChatInfo, getChatMode, getChatModeStrict, getCachedChatMode, getChatName, getUserProfile, getMessageDetail, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, resolveUnionIdFromOpenId, resolveUnionIdFromOpenIdStrict, replyMessage, sendUserMessage, isHumanOpenId, updateInteractiveCardByToken, updateMessage } from './client.js';
 import * as larkClient from './client.js';
 import type { SubtopicMentionlessHandoff } from '../../services/subtopic-mentionless-handoff.js';
 import { listChats, type ChatBrief } from '../../services/groups-store.js';
@@ -1565,7 +1565,7 @@ const CARD_ACTION_TIMEOUT = Symbol('card-action-timeout');
 const cardActionInFlight = new Set<string>();
 
 function cardActionMessageId(data: any): string | undefined {
-  return data?.context?.open_message_id ?? data?.open_message_id;
+  return data?.context?.open_message_id ?? data?.open_message_id ?? data?.message_id;
 }
 
 const PRIMARY_UNSAFE_SESSION_LIFECYCLE_ACTIONS = new Set([
@@ -1640,7 +1640,13 @@ function shapeCardActionResult(result: any): any {
   // The handler may return:
   //   - an already-shaped Lark response ({toast} and/or {card}) -> pass through;
   //   - a raw card body (e.g. toggle_stream) -> wrap as an in-place card patch.
-  if (result && (result.toast || result.card || result.deferredCard || result.afterAck)) return result;
+  if (result && (result.toast || result.card || result.deferredCard || result.afterAck)) {
+    if (result.card && !result.deferredCard) {
+      const { card, ...rest } = result;
+      return { ...rest, deferredCard: card };
+    }
+    return result;
+  }
   if (result) return { card: { type: 'raw', data: result } };
   // The Lark WS SDK only serializes callback `data` for truthy results. An
   // empty object therefore means "ACK with no UI update", while undefined
@@ -1653,11 +1659,53 @@ function serializeRawCardForPatch(cardData: any): string | undefined {
   return typeof cardData === 'string' ? cardData : JSON.stringify(cardData);
 }
 
+function cardActionToken(data: any): string | undefined {
+  const token = data?.token ?? data?.event?.token;
+  return typeof token === 'string' && token.trim() ? token.trim() : undefined;
+}
+
+function cardActionOperatorOpenId(data: any): string | undefined {
+  const openId = data?.operator?.open_id ?? data?.operator_id ?? data?.event?.operator?.open_id;
+  return typeof openId === 'string' && openId.trim() ? openId.trim() : undefined;
+}
+
+function normalizeDelayedUpdateCard(raw: any, operatorOpenId?: string): Record<string, unknown> | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const card = (raw as any).card && typeof (raw as any).card === 'object' && !Array.isArray((raw as any).card)
+    ? (raw as any).card
+    : raw;
+  if (!card || typeof card !== 'object' || Array.isArray(card)) return undefined;
+
+  // interactive/v1/card/update targets the callback token, not the message id.
+  // For legacy Card 1.0 bodies Feishu requires card.open_ids to be non-empty
+  // (otherwise code 300090 "openid empty"). Template/CardKit updates do not
+  // need it, but adding it to plain 1.0 raw cards is the safest delayed-update
+  // default and matches lark-cli's card.action.trigger reference.
+  if (
+    operatorOpenId
+    && !(card as any).schema
+    && (card as any).type !== 'template'
+    && !Array.isArray((card as any).open_ids)
+  ) {
+    return { ...(card as Record<string, unknown>), open_ids: [operatorOpenId] };
+  }
+  return card as Record<string, unknown>;
+}
+
 async function patchTimedOutCardActionResult(larkAppId: string, data: any, shapedResult: any): Promise<void> {
   const messageId = cardActionMessageId(data);
   const card = shapedResult?.card ?? shapedResult?.deferredCard;
-  if (!messageId || !card) return;
+  if (!card) return;
   const raw = card.type === 'raw' ? card.data : card;
+  const token = cardActionToken(data);
+  if (token) {
+    const delayedCard = normalizeDelayedUpdateCard(raw, cardActionOperatorOpenId(data));
+    if (delayedCard) {
+      await updateInteractiveCardByToken(larkAppId, token, delayedCard);
+      return;
+    }
+  }
+  if (!messageId) return;
   const body = serializeRawCardForPatch(raw);
   if (!body) return;
   await updateMessage(larkAppId, messageId, body);
@@ -1695,7 +1743,16 @@ async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: E
       if (result.deferredCard) {
         setTimeout(() => {
           void patchTimedOutCardActionResult(larkAppId, data, result)
-            .catch(err => logger.warn(`Failed to patch deferred card action result: ${err}`));
+            .catch(err => {
+              const shape = extractLarkErrorShape(err);
+              const responseData = (err as any)?.response?.data;
+              logger.warn(
+                `Failed to patch deferred card action result: ${shape.message}`
+                + `${shape.httpStatus !== undefined ? ` httpStatus=${shape.httpStatus}` : ''}`
+                + `${shape.larkCode !== undefined ? ` larkCode=${shape.larkCode}` : ''}`
+                + `${responseData ? ` response=${JSON.stringify(responseData).slice(0, 1000)}` : ''}`,
+              );
+            });
         }, 0);
       }
       if (typeof result.afterAck === 'function') {

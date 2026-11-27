@@ -18,6 +18,26 @@ describe('Lark callback payload normalization', () => {
     expect(data.action?.value).toEqual(value);
   });
 
+  it('parses flattened card.action.trigger action_value into action.value', () => {
+    const data = normalizeCardActionData({
+      type: 'card.action.trigger',
+      action_tag: 'button',
+      action_value: JSON.stringify(value),
+      operator: { open_id: 'ou_user' },
+      message_id: 'om_message',
+    });
+    expect(data.action?.value).toEqual(value);
+    expect(data.operator?.open_id).toBe('ou_user');
+  });
+
+  it('keeps explicit action.value before flattened action_value', () => {
+    const data = normalizeCardActionData({
+      action: { value },
+      action_value: JSON.stringify({ action: 'close' }),
+    });
+    expect(data.action?.value).toEqual(value);
+  });
+
   it.each(['broken JSON', 'null', '[]', '42', '"feedback_submit"', [], null, 42].map(raw => [raw]))(
     'does not promote an invalid explicit value into a callback action: %j', raw => {
       const data = normalizeCardActionData({ action: {
