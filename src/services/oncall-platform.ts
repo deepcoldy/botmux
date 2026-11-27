@@ -217,19 +217,21 @@ function nativeSourceMatcher(query: NativeOncallResultQuery) {
   const source = new URL(query.sourceLocation);
   const formId = source.searchParams.get('bm_form');
   const tag = nativeSelectionSourceType(formId);
-  // Old capabilities now redirect with this same tag; their stored URL predates it.
-  const issuedChannel = query.hostedSourceLocation || source.searchParams.get('bizFrom') === tag ? tag : undefined;
+  // A reused platform draft can retain the first topic's channel at handoff.
+  // A channel can contradict the marked URL, but cannot establish ownership.
+  const conflictingChannel = (value: unknown) =>
+    typeof value === 'string' && /^botmux_[a-f0-9]{24}$/.test(value) && value !== tag;
   return {
     formId,
     matches(value: unknown, channel: unknown): boolean {
+      if (conflictingChannel(channel)) return false;
       if (!formId) return value === query.sourceLocation;
-      const channelMatches = !!issuedChannel && channel === issuedChannel;
-      if (typeof channel === 'string' && /^botmux_[a-f0-9]{24}$/.test(channel) && !channelMatches) return false;
+      if (typeof value !== 'string') return false;
       let actual: URL;
-      try { actual = new URL(String(value)); } catch { return channelMatches; }
-      if (!actual.searchParams.has('bm_form')) return channelMatches;
+      try { actual = new URL(value); } catch { return false; }
       return actual.origin === source.origin && actual.pathname === source.pathname
-        && actual.searchParams.getAll('bm_form').length === 1 && actual.searchParams.get('bm_form') === formId;
+        && actual.searchParams.getAll('bm_form').length === 1 && actual.searchParams.get('bm_form') === formId
+        && !actual.searchParams.getAll('bizFrom').some(conflictingChannel);
     },
   };
 }
