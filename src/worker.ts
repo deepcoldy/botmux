@@ -167,7 +167,14 @@ import { classifyRawDispatchFailure, rewrapSubmissionFailure } from './core/raw-
 import { publishCliSessionIdToDaemon } from './core/cli-session-id-publisher.js';
 import { ActiveTurnAuthority, type TurnAuthorityIdentity } from './core/active-turn-authority.js';
 import { isValidMarkerIdentityTurnId } from './core/turn-id-shape.js';
-import { markerBelongsToLiveProcess, readProcessStartIdentity } from './core/session-marker.js';
+import {
+  advanceAncestorSessionTurn,
+  markerBelongsToLiveProcess,
+  parseAbsorbedHostBinding,
+  parseSettledAbsorbedTurns,
+  readProcessStartIdentity,
+  type SettledAbsorbedTurn,
+} from './core/session-marker.js';
 import { hostAuthorityPaths } from './services/project-authority-paths.js';
 import { CodexAppEngineRootWaitCancelled, parseCodexAppEngineIdentityClaim, verifyCodexAppEngineIdentity, type CodexAppEngineIdentity } from './services/codex-app-engine-identity.js';
 import { cliSurvivesWorkerExit, handsCliPidMarkerToSuccessor } from './core/cli-pid-marker-handoff.js';
@@ -198,7 +205,7 @@ import {
   type CliRestartCause,
   type InterruptedWork,
 } from './services/restart-interruption.js';
-import { appendUnsentInputs, isUnsentInputReplayable, saveUnsentInputs, settleTakenUnsentInputs, takeUnsentInputs } from './services/unsent-input-journal.js';
+import { appendUnsentInputs, removeTakenUnsentInputs, isUnsentInputReplayable, saveUnsentInputs, settleTakenUnsentInputs, takeUnsentInputs } from './services/unsent-input-journal.js';
 import { UniversalOutputHandoff } from './services/universal-output-handoff.js';
 import { WorkerOutputJournal } from './services/worker-output-journal.js';
 import { WorkerFinalOutputHandoff, canHandoffFinalOutput, FINAL_OUTPUT_HANDOFF_MAX_PENDING } from './services/final-output-handoff.js';
@@ -283,6 +290,7 @@ import {
   mergeQueuedCliInput,
   pendingInputMayFlush,
   promoteInteractiveInputPastSchedules,
+  promoteInteractiveInputPastQuotaSchedules,
   pendingInputAllowsTypeAhead,
   resolveInitialPromptDelivery,
   shouldArmSpawnArgvInitialPromptBusy,
@@ -292,7 +300,9 @@ import {
   shouldStopPendingBatch,
   terminalReleasesDurableTurn,
   type PendingCliInput,
+  automaticScheduledInputTask, coalesceAutomaticScheduledInputs, scheduledRecoveryInputTask, shouldDeferScheduledInitialPrompt,
 } from './utils/pending-input-queue.js';
+import { parseScheduledTurnId } from './core/scheduled-turn-provenance.js';
 import { recordSessionTurnInput, updateSessionTurnNativeAnchor } from './services/session-turns.js';
 import { remoteWorkerShutdownInputBlocker } from './core/remote-worker-shutdown-readiness.js';
 import { sendRemoteRunnerOutboundMessage } from './services/remote-runner-outbound-send.js';
@@ -2082,8 +2092,9 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     publishLocalProcessAttestation(undefined, engine.appServerPid);
     const threadId = wantResume ? await engine.resumeThread(cfg.cliSessionId!) : await engine.startThread();
     assertRpcEngagementCurrent();
-    let outcome: EngageOutcome = wantResume ? 'resumed' : 'accepted';
-    if (!wantResume && cfg.prompt) {
+    const queueScheduledPrompt = !!(cfg.turnId && parseScheduledTurnId(cfg.turnId));
+    let outcome: EngageOutcome = wantResume || queueScheduledPrompt ? 'resumed' : 'accepted';
+    if (!wantResume && cfg.prompt && !queueScheduledPrompt) {
       // Only this fresh first turn is sent from here; a resumed prompt is
       // queued and prepared by flushPending's RPC write edge. Keep cfg.prompt
       // and the deferred catalog untouched: a not-sent/failed engagement falls
@@ -4106,7 +4117,15 @@ function zeroPromptTerminalSync(): boolean {
  *  marked input. Fingerprint-prefix / truncation binds attribute replies but
  *  do not prove envelope consumption, so they stay on the terminal fallback. */
 function notifyNativeTranscriptConsumedLarkTurn(
-  turn: { turnId: string; userUuid?: string; isLocal?: boolean; isScheduled?: boolean },
+  turn: {
+    turnId: string;
+    userUuid?: string;
+    dispatchAttempt?: number;
+    isLocal?: boolean;
+    isScheduled?: boolean;
+    absorbedIntoTurnId?: string;
+    absorbedIntoDispatchAttempt?: number;
+  },
   evidence: { fullContentMatch: boolean; sourceJsonlPath?: string },
 ): void {
   if (!evidence.fullContentMatch || turn.isLocal || turn.isScheduled) return;
@@ -4116,7 +4135,24 @@ function notifyNativeTranscriptConsumedLarkTurn(
     ? base.slice(0, -'.jsonl'.length)
     : undefined;
   const resolvedSessionId = nativeSessionId ?? lastInitConfig?.cliSessionId;
-  if (turn.userUuid) {
+  const absorbedHost = turn.absorbedIntoTurnId && turn.absorbedIntoTurnId !== turn.turnId
+    ? {
+      hostTurnId: turn.absorbedIntoTurnId,
+      ...(turn.absorbedIntoDispatchAttempt !== undefined
+        ? { hostDispatchAttempt: turn.absorbedIntoDispatchAttempt }
+        : {}),
+    }
+    : undefined;
+  if (absorbedHost) {
+    acknowledgeNativeInputConsumed(
+      turn.turnId,
+      'claude_transcript_user_record',
+      resolvedSessionId,
+      turn.userUuid,
+      turn.dispatchAttempt,
+      absorbedHost,
+    );
+  } else if (turn.userUuid) {
     acknowledgeNativeInputConsumed(turn.turnId, 'claude_transcript_user_record', resolvedSessionId, turn.userUuid);
   } else {
     acknowledgeNativeInputConsumed(turn.turnId, 'claude_transcript_user_record', resolvedSessionId);
@@ -4349,6 +4385,8 @@ let cliSubmissionInFlight: {
   /** Its write began at an idle prompt as the flush's first input, so until
    *  the write settles any prompt on screen is the composer echoing it. */
   composerOwned: boolean;
+  scheduledWritePending?: true;
+  scheduledWriteCancelled?: true;
   readyDeferred?: boolean;
   /** The transcript already showed an open turn when the prompt was hidden. */
   turnOpenWhenDeferred?: boolean;
@@ -5958,12 +5996,61 @@ class SubmissionWriteError extends Error {
     /** The catalog changed before any byte was written; requeue and rotate
      * instead of classifying this proven pre-write refusal as ambiguous. */
     readonly traexCatalogAdmissionRequired = false,
+    /** A final-driven queue transition did not complete. The input never
+     *  reached the CLI; restore the exact head and retry after the sender's
+     *  cross-process transition has had another chance to finish. */
+    readonly retainPendingInput = false,
   ) {
     super(message);
     this.name = 'SubmissionWriteError';
   }
 }
 
+let finalTransitionRetryDelayMs = 100;
+let finalTransitionRetryAttempts = 0;
+let finalTransitionRetryTimer: ReturnType<typeof setTimeout> | undefined;
+let finalTransitionRetryItem: PendingCliInput | undefined;
+let finalTransitionRetryGeneration: number | undefined;
+const FINAL_TRANSITION_RETRY_MAX_DELAY_MS = 5_000;
+function resetFinalTransitionRetryBackoff(): void {
+  if (finalTransitionRetryTimer) clearTimeout(finalTransitionRetryTimer);
+  finalTransitionRetryTimer = undefined;
+  finalTransitionRetryItem = undefined;
+  finalTransitionRetryGeneration = undefined;
+  finalTransitionRetryDelayMs = 100;
+  finalTransitionRetryAttempts = 0;
+}
+function scheduleFinalTransitionRetry(item: PendingCliInput, isCurrent: () => boolean, generation: number): void {
+  // External flush triggers may repeatedly hit the same unresolved edge. Only
+  // the fired timer advances the backoff; one episode never creates parallel
+  // retry chains. A replacement item/generation is a new episode.
+  if (finalTransitionRetryTimer
+    && finalTransitionRetryItem === item
+    && finalTransitionRetryGeneration === generation) return;
+  if (finalTransitionRetryTimer) resetFinalTransitionRetryBackoff();
+  finalTransitionRetryAttempts++;
+  const delay = finalTransitionRetryDelayMs;
+  finalTransitionRetryDelayMs = Math.min(delay * 2, FINAL_TRANSITION_RETRY_MAX_DELAY_MS);
+  if (finalTransitionRetryAttempts === 3) {
+    send({
+      type: 'user_notify',
+      turnId: item.turnId,
+      message: t('worker.final_transition_retrying'),
+    });
+  }
+  const retry = setTimeout(() => {
+    if (finalTransitionRetryTimer === retry) {
+      finalTransitionRetryTimer = undefined;
+      finalTransitionRetryItem = undefined;
+      finalTransitionRetryGeneration = undefined;
+    }
+    if (isCurrent() && pendingMessages[0] === item) void flushPending();
+  }, delay);
+  finalTransitionRetryTimer = retry;
+  finalTransitionRetryItem = item;
+  finalTransitionRetryGeneration = generation;
+  retry.unref?.();
+}
 async function sendRawCommandLineWithRecoveryFence(
   be: NonNullable<typeof backend>,
   content: string,
@@ -7672,6 +7759,11 @@ function setCaptureIdentity(
   forceAnnouncement = false,
 ): void {
   const changed = turnId !== currentBotmuxTurnId || dispatchAttempt !== currentBotmuxDispatchAttempt;
+  if (changed) {
+    currentPromotedFromTurnId = currentBotmuxTurnId;
+    currentPromotedFromDispatchAttempt = currentBotmuxDispatchAttempt;
+    currentPromotedAbsorbedTurn = false;
+  }
   if (changed && lastInitConfig?.cliId === 'minimax') minimaxFinalReceiver.reset();
   currentBotmuxTurnId = turnId;
   currentBotmuxDispatchAttempt = dispatchAttempt;
@@ -7694,6 +7786,9 @@ function setCaptureIdentity(
 }
 let currentVcMeetingImTurnOrigin: VcMeetingImTurnOrigin | undefined;
 let currentTurnSteerPromoted = false;
+let currentPromotedAbsorbedTurn = false;
+let currentPromotedFromTurnId: string | undefined;
+let currentPromotedFromDispatchAttempt: number | undefined;
 interface AntigravityReconcileHint {
   textSha256: string;
   sampledTranscriptPath?: string;
@@ -7703,6 +7798,8 @@ interface AntigravityReconcileHint {
 interface QueuedTypeAheadTurnRecord {
   turnId: string;
   inputConsumed?: true;
+  absorbedIntoTurnId?: string;
+  absorbedIntoDispatchAttempt?: number;
   identityTurnId?: string;
   dispatchAttempt?: number;
   linkRefMode?: 'observe' | 'enabled';
@@ -7713,6 +7810,119 @@ interface QueuedTypeAheadTurnRecord {
   antigravityReconcileHint?: AntigravityReconcileHint;
 }
 let queuedTypeAheadTurns: QueuedTypeAheadTurnRecord[] = [];
+/** Absorbed type-ahead turns already settled alongside their host turn's
+ *  explicit `final` on disk. These are durable requeue tombstones AND reply
+ *  addressing evidence: keep them through terminals and worker restarts so
+ *  replay/auxiliary delivery remains valid, while `writeCliPidMarker` never
+ *  resurrects them as queued work and `retireTerminatedQueuedTurn` still records
+ *  `foldedTypeAheadTurn` on `status === 'completed'`. */
+const settledAbsorbedTurnsByKey = new Map<string, SettledAbsorbedTurn>();
+function settledAbsorbedKey(turnId: string, dispatchAttempt?: number): string {
+  return `${turnId}\0${dispatchAttempt ?? ''}`;
+}
+function rememberSettledAbsorbedTurn(entry: SettledAbsorbedTurn): void {
+  if (typeof settledAbsorbedTurnsByKey === 'undefined') return;
+  const key = settledAbsorbedKey(entry.turnId, entry.dispatchAttempt);
+  settledAbsorbedTurnsByKey.delete(key);
+  settledAbsorbedTurnsByKey.set(key, entry);
+  // Never evict a live tombstone: the next marker write would resurrect its
+  // absorbed queue entry. emitTurnTerminal/retireTerminatedQueuedTurn remove
+  // entries when their exact turn closes, which is the safe lifecycle bound.
+}
+function syncSettledAbsorbedTurnsFromParsed(parsed: unknown): void {
+  if (typeof parseSettledAbsorbedTurns !== 'function') return;
+  const parsedObj = parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : null;
+  const entries = parseSettledAbsorbedTurns(parsedObj?.settledAbsorbedTurns);
+  if (!entries || entries.length === 0) return;
+  const parsedTurnId = typeof parsedObj?.turnId === 'string' && parsedObj.turnId ? parsedObj.turnId : undefined;
+  const parsedDispatchAttempt = typeof parsedObj?.dispatchAttempt === 'number' ? parsedObj.dispatchAttempt : undefined;
+  const parsedQueuedTurns = Array.isArray(parsedObj?.queuedTurns) ? parsedObj.queuedTurns : [];
+  for (const entry of entries) {
+    if (entry.turnId === currentBotmuxTurnId && entry.dispatchAttempt === currentBotmuxDispatchAttempt) continue;
+    if (entry.turnId === parsedTurnId && entry.dispatchAttempt === parsedDispatchAttempt) continue;
+    // Terminal turns are historical reply evidence as well as queue tombstones.
+    // Keep loading them after restart: retirement prevents requeueing, but replay
+    // and auxiliary sends still need the absorbed turn's original destination.
+    if (typeof settledAbsorbedTurnsByKey !== 'undefined') {
+      rememberSettledAbsorbedTurn(entry);
+    }
+    const hasLiveSibling = entry.turnId === currentBotmuxTurnId
+      || entry.turnId === parsedTurnId
+      || queuedTypeAheadTurns.some(
+        q => q.turnId === entry.turnId && q.dispatchAttempt !== entry.dispatchAttempt,
+      )
+      || parsedQueuedTurns.some((q: any) =>
+        q?.turnId === entry.turnId
+        && (typeof q.dispatchAttempt === 'number' ? q.dispatchAttempt : undefined) !== entry.dispatchAttempt);
+    // Attempt-agnostic tombstones in `retiredTurnIds` would also reject a live
+    // durable retry (`dispatchAttempt + 1`). `settledAbsorbedTurnsByKey` keys by
+    // exact `(turnId, dispatchAttempt)` and blocks resurrection in
+    // `markerQueuedTurnStillLive` without clobbering sibling durable attempts.
+    const canTombstone = !hasLiveSibling && entry.dispatchAttempt === undefined;
+    if (typeof dropQueuedTurnRecord === 'function') {
+      dropQueuedTurnRecord(entry.turnId, entry.dispatchAttempt, { tombstone: canTombstone });
+    } else {
+      queuedTypeAheadTurns = queuedTypeAheadTurns.filter(
+        q => q.turnId !== entry.turnId
+          || (q.dispatchAttempt !== undefined && q.dispatchAttempt !== entry.dispatchAttempt),
+      );
+    }
+    if (canTombstone && typeof markTurnRetired === 'function') {
+      markTurnRetired(entry.turnId);
+    }
+  }
+}
+function retireSkippedQueuedPrefix(skippedCount: number): void {
+  if (skippedCount <= 0) return;
+  const skipped = queuedTypeAheadTurns.slice(0, skippedCount);
+  const surviving = queuedTypeAheadTurns.slice(skippedCount);
+  for (const record of skipped) {
+    const hasLiveSibling = surviving.some(q => q.turnId === record.turnId);
+    if (!hasLiveSibling && typeof send === 'function') {
+      send({ type: 'type_ahead_turn_dropped', turnId: record.turnId });
+    }
+    if (!hasLiveSibling && typeof markTurnRetired === 'function') {
+      markTurnRetired(record.turnId);
+    }
+  }
+}
+function mergeMarkerQueuedTurnIntoMemory(qt: any): void {
+  if (!qt?.turnId || qt.turnId === currentBotmuxTurnId) return;
+  const dispatchAttempt = typeof qt.dispatchAttempt === 'number' ? qt.dispatchAttempt : undefined;
+  const absorbed = typeof parseAbsorbedHostBinding === 'function'
+    ? parseAbsorbedHostBinding(qt, qt.turnId)
+    : undefined;
+  const existing = queuedTypeAheadTurns.find(
+    t => t.turnId === qt.turnId && t.dispatchAttempt === dispatchAttempt,
+  );
+  if (existing) {
+    if (qt.inputConsumed === true) existing.inputConsumed = true;
+    if (absorbed && !existing.absorbedIntoTurnId) {
+      existing.absorbedIntoTurnId = absorbed.absorbedIntoTurnId;
+      if (absorbed.absorbedIntoDispatchAttempt !== undefined) {
+        existing.absorbedIntoDispatchAttempt = absorbed.absorbedIntoDispatchAttempt;
+      }
+    }
+    return;
+  }
+  if (!markerQueuedTurnStillLive(qt) || queuedTypeAheadTurns.some(t => t.turnId === qt.turnId)) return;
+  queuedTypeAheadTurns.push({
+    turnId: qt.turnId,
+    ...(qt.inputConsumed === true ? { inputConsumed: true as const } : {}),
+    ...(absorbed ?? {}),
+    ...(markerIdentityTurnId(qt.identityTurnId) ? { identityTurnId: markerIdentityTurnId(qt.identityTurnId)! } : {}),
+    ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+    ...(qt.linkRefMode === 'observe' || qt.linkRefMode === 'enabled'
+      ? { linkRefMode: qt.linkRefMode }
+      : {}),
+    ...(qt.trustedCaller && typeof qt.trustedCaller === 'object' ? { trustedCaller: qt.trustedCaller } : {}),
+    ...(qt.trustedController && typeof qt.trustedController === 'object' ? { trustedController: qt.trustedController } : {}),
+    ...(typeof qt.callerOpenId === 'string' && qt.callerOpenId ? { turnCallerOpenId: qt.callerOpenId } : {}),
+    ...(qt.antigravityReconcileHint && typeof qt.antigravityReconcileHint.textSha256 === 'string'
+      ? { antigravityReconcileHint: qt.antigravityReconcileHint }
+      : {}),
+  });
+}
 /** Newest type-ahead turn retired at its terminal while folded into the turn
  *  owning the screen (see retireTerminatedQueuedTurn). */
 let foldedTypeAheadTurn: FoldedTypeAheadTurn | undefined;
@@ -9273,12 +9483,25 @@ function authorizeManagedSend(
     dispatchAttempt: capability.dispatchAttempt,
     currentImTurnOrigin: imOrigin,
   });
+  const relayReplyMessageId = capability.turnId === currentBotmuxTurnId && !requiresCodexAppLedger && !imOrigin
+    ? (queuedTypeAheadTurns.filter(t =>
+        t.inputConsumed === true
+        && (t.absorbedIntoTurnId === undefined
+          || (t.absorbedIntoTurnId === currentBotmuxTurnId
+            && t.absorbedIntoDispatchAttempt === currentBotmuxDispatchAttempt)))
+        .at(-1)?.turnId
+      ?? (typeof settledAbsorbedTurnsByKey !== 'undefined'
+        ? [...settledAbsorbedTurnsByKey.values()]
+            .filter(entry => entry.hostTurnId === currentBotmuxTurnId
+              && entry.hostDispatchAttempt === currentBotmuxDispatchAttempt)
+            .at(-1)?.turnId
+        : undefined))
+    : undefined;
   return decision.ok
     ? {
         ok: true,
         origin: {
-          ...(capability.turnId === currentBotmuxTurnId && !requiresCodexAppLedger && !imOrigin
-            ? { replyMessageId: queuedTypeAheadTurns.filter(t => t.inputConsumed).at(-1)?.turnId } : {}),
+          ...(relayReplyMessageId ? { replyMessageId: relayReplyMessageId } : {}),
           ...(capability.turnId ? { turnId: capability.turnId } : {}),
           ...(capability.dispatchAttempt !== undefined
             ? { dispatchAttempt: capability.dispatchAttempt }
@@ -9480,6 +9703,7 @@ function writeCliPidMarker(): void {
           try {
             const raw = readFileSync(markerPath, 'utf-8');
             const parsed = JSON.parse(raw);
+            syncSettledAbsorbedTurnsFromParsed(parsed);
             if (parsed && typeof parsed.turnId === 'string' && parsed.turnId && (parsed.turnId !== currentBotmuxTurnId || ((typeof backend === 'undefined' || !backend || ('isReattach' in backend && backend.isReattach === true)) && (activeTurnAuthority.snapshot() ? !activeAuthorityMatchesMarker(parsed) : !activeTurnAuthority.matchesLastRelease(parsed))))) {
               const markerSettled = typeof workerSessionEventScope?.isExecutionSettled === 'function'
                 && workerSessionEventScope.isExecutionSettled(
@@ -9497,6 +9721,7 @@ function writeCliPidMarker(): void {
                 if (idx >= 0) {
                   const prevTurnId = currentBotmuxTurnId;
                   markTurnRetired(prevTurnId);
+                  retireSkippedQueuedPrefix(idx);
                   const advancedRecord = queuedTypeAheadTurns[idx]!;
                   setCaptureIdentity(
                     parsed.turnId,
@@ -9535,24 +9760,18 @@ function writeCliPidMarker(): void {
             }
             if (parsed && Array.isArray(parsed.queuedTurns)) {
               for (const qt of parsed.queuedTurns) {
-                if (qt?.turnId && qt.turnId !== currentBotmuxTurnId && markerQueuedTurnStillLive(qt) && !queuedTypeAheadTurns.some(t => t.turnId === qt.turnId)) {
-                  queuedTypeAheadTurns.push({
-                    turnId: qt.turnId,
-                ...(qt.inputConsumed === true ? { inputConsumed: true as const } : {}),
-                    ...(markerIdentityTurnId(qt.identityTurnId) ? { identityTurnId: markerIdentityTurnId(qt.identityTurnId)! } : {}),
-                    ...(typeof qt.dispatchAttempt === 'number' ? { dispatchAttempt: qt.dispatchAttempt } : {}),
-                    ...(qt.linkRefMode === 'observe' || qt.linkRefMode === 'enabled'
-                      ? { linkRefMode: qt.linkRefMode }
-                      : {}),
-                    ...(qt.trustedCaller && typeof qt.trustedCaller === 'object' ? { trustedCaller: qt.trustedCaller } : {}),
-                    ...(qt.trustedController && typeof qt.trustedController === 'object' ? { trustedController: qt.trustedController } : {}),
-                    ...(typeof qt.callerOpenId === 'string' && qt.callerOpenId ? { turnCallerOpenId: qt.callerOpenId } : {}),
-                    ...(qt.antigravityReconcileHint && typeof qt.antigravityReconcileHint.textSha256 === 'string'
-                      ? { antigravityReconcileHint: qt.antigravityReconcileHint }
-                      : {}),
-                  });
-                }
+                mergeMarkerQueuedTurnIntoMemory(qt);
               }
+            }
+            if (parsed && parsed.turnId === currentBotmuxTurnId
+              && parsed.promotedAbsorbedTurn === true
+              && typeof parsed.promotedFromTurnId === 'string'
+              && isValidMarkerIdentityTurnId(parsed.promotedFromTurnId)) {
+              currentPromotedAbsorbedTurn = true;
+              currentPromotedFromTurnId = parsed.promotedFromTurnId;
+              currentPromotedFromDispatchAttempt = typeof parsed.promotedFromDispatchAttempt === 'number'
+                ? parsed.promotedFromDispatchAttempt
+                : undefined;
             }
           } catch {
             // best-effort
@@ -9579,6 +9798,14 @@ function writeCliPidMarker(): void {
           return {
             turnId: t.turnId,
             ...(t.inputConsumed === true ? { inputConsumed: true as const } : {}),
+            ...(t.inputConsumed === true && t.absorbedIntoTurnId
+              ? {
+                absorbedIntoTurnId: t.absorbedIntoTurnId,
+                ...(t.absorbedIntoDispatchAttempt !== undefined
+                  ? { absorbedIntoDispatchAttempt: t.absorbedIntoDispatchAttempt }
+                  : {}),
+              }
+              : {}),
             ...(markerIdentityTurnId(t.identityTurnId) ? { identityTurnId: markerIdentityTurnId(t.identityTurnId)! } : {}),
             ...(t.dispatchAttempt !== undefined ? { dispatchAttempt: t.dispatchAttempt } : {}),
             ...(t.linkRefMode ? { linkRefMode: t.linkRefMode } : {}),
@@ -9588,6 +9815,11 @@ function writeCliPidMarker(): void {
             ...(reconcileHint ? { antigravityReconcileHint: reconcileHint } : {}),
           };
         });
+        const currentHostSettled = typeof settledAbsorbedTurnsByKey !== 'undefined' && currentBotmuxTurnId
+          ? [...settledAbsorbedTurnsByKey.values()].filter(entry =>
+            entry.hostTurnId === currentBotmuxTurnId
+            && entry.hostDispatchAttempt === currentBotmuxDispatchAttempt)
+          : [];
         const queuedTurnId = queuedTurns[0]?.turnId;
         const authority = activeTurnAuthority.snapshot();
         const effectiveCaller = authority?.caller;
@@ -9610,8 +9842,15 @@ function writeCliPidMarker(): void {
           ...(activeReconcileHint ? { antigravityReconcileHint: activeReconcileHint } : {}),
           ...(queuedTurnId ? { queuedTurnId } : {}),
           ...(queuedTurns.length > 0 ? { queuedTurns } : {}),
+          ...(currentHostSettled.length > 0 ? { settledAbsorbedTurns: currentHostSettled } : {}),
           ...(procStart ? { procStart } : {}),
           ...(currentTurnSteerPromoted ? { steerPromotedTurn: true } : {}),
+          ...(currentTurnSteerPromoted && currentPromotedAbsorbedTurn && currentPromotedFromTurnId ? {
+            promotedAbsorbedTurn: true as const,
+            promotedFromTurnId: currentPromotedFromTurnId,
+            ...(currentPromotedFromDispatchAttempt !== undefined
+              ? { promotedFromDispatchAttempt: currentPromotedFromDispatchAttempt } : {}),
+          } : {}),
           ...(markerTurnNonResurrectable ? { backgroundHeld: true as const } : {}),
           ...(sandboxRelayCapability && sandboxRelayCapability.turnId === currentBotmuxTurnId
             && sandboxRelayCapability.dispatchAttempt === currentBotmuxDispatchAttempt
@@ -9642,6 +9881,7 @@ function restoreQueuedTurnsFromMarkerDisk(markerPath: string): void {
     withPidMarkerLock(markerPath, () => {
       const raw = readFileSync(markerPath, 'utf-8');
       const parsed = JSON.parse(raw);
+      syncSettledAbsorbedTurnsFromParsed(parsed);
       if (parsed && typeof parsed.turnId === 'string' && parsed.turnId && (parsed.turnId !== currentBotmuxTurnId || ((typeof backend === 'undefined' || !backend || ('isReattach' in backend && backend.isReattach === true)) && (activeTurnAuthority.snapshot() ? !activeAuthorityMatchesMarker(parsed) : !activeTurnAuthority.matchesLastRelease(parsed))))) {
         const markerSettled = typeof workerSessionEventScope?.isExecutionSettled === 'function'
           && workerSessionEventScope.isExecutionSettled(
@@ -9672,20 +9912,7 @@ function restoreQueuedTurnsFromMarkerDisk(markerPath: string): void {
       }
       if (parsed && Array.isArray(parsed.queuedTurns) && parsed.queuedTurns.length > 0) {
         for (const t of parsed.queuedTurns) {
-          if (t && typeof t.turnId === 'string' && t.turnId !== currentBotmuxTurnId && markerQueuedTurnStillLive(t) && !queuedTypeAheadTurns.some(q => q.turnId === t.turnId)) {
-            queuedTypeAheadTurns.push({
-              turnId: t.turnId,
-              ...(t.inputConsumed === true ? { inputConsumed: true as const } : {}),
-              ...(markerIdentityTurnId(t.identityTurnId) ? { identityTurnId: markerIdentityTurnId(t.identityTurnId)! } : {}),
-              ...(typeof t.dispatchAttempt === 'number' ? { dispatchAttempt: t.dispatchAttempt } : {}),
-              ...(t.linkRefMode === 'observe' || t.linkRefMode === 'enabled'
-                ? { linkRefMode: t.linkRefMode }
-                : {}),
-              ...(t.trustedCaller && typeof t.trustedCaller === 'object' ? { trustedCaller: t.trustedCaller } : {}),
-              ...(t.trustedController && typeof t.trustedController === 'object' ? { trustedController: t.trustedController } : {}),
-              ...(typeof t.callerOpenId === 'string' && t.callerOpenId ? { turnCallerOpenId: t.callerOpenId } : {}),
-            });
-          }
+          mergeMarkerQueuedTurnIntoMemory(t);
         }
       } else if (parsed && typeof parsed.queuedTurnId === 'string' && parsed.queuedTurnId) {
         if (parsed.queuedTurnId !== currentBotmuxTurnId && markerQueuedTurnStillLive({ turnId: parsed.queuedTurnId }) && !queuedTypeAheadTurns.some(q => q.turnId === parsed.queuedTurnId)) {
@@ -9767,6 +9994,7 @@ function syncQueuedTurnsFromMarkerDisk(): boolean {
       withPidMarkerLock(markerPath, () => {
         const raw = readFileSync(markerPath, 'utf-8');
         const parsed = JSON.parse(raw);
+        syncSettledAbsorbedTurnsFromParsed(parsed);
         if (parsed && typeof parsed.turnId === 'string' && parsed.turnId && (parsed.turnId !== currentBotmuxTurnId || ((typeof backend === 'undefined' || !backend || ('isReattach' in backend && backend.isReattach === true)) && (activeTurnAuthority.snapshot() ? !activeAuthorityMatchesMarker(parsed) : !activeTurnAuthority.matchesLastRelease(parsed))))) {
           const markerSettled = typeof workerSessionEventScope?.isExecutionSettled === 'function'
             && workerSessionEventScope.isExecutionSettled(
@@ -9783,6 +10011,7 @@ function syncQueuedTurnsFromMarkerDisk(): boolean {
             if (idx >= 0) {
               const prevTurnId = currentBotmuxTurnId;
               markTurnRetired(prevTurnId);
+              retireSkippedQueuedPrefix(idx);
               const advancedRecord = queuedTypeAheadTurns[idx]!;
               setCaptureIdentity(
                 parsed.turnId,
@@ -9816,20 +10045,7 @@ function syncQueuedTurnsFromMarkerDisk(): boolean {
         }
         if (parsed && Array.isArray(parsed.queuedTurns)) {
           for (const qt of parsed.queuedTurns) {
-            if (qt?.turnId && qt.turnId !== currentBotmuxTurnId && markerQueuedTurnStillLive(qt) && !queuedTypeAheadTurns.some(t => t.turnId === qt.turnId)) {
-              queuedTypeAheadTurns.push({
-                turnId: qt.turnId,
-                ...(qt.inputConsumed === true ? { inputConsumed: true as const } : {}),
-                ...(markerIdentityTurnId(qt.identityTurnId) ? { identityTurnId: markerIdentityTurnId(qt.identityTurnId)! } : {}),
-                ...(qt.linkRefMode === 'observe' || qt.linkRefMode === 'enabled'
-                  ? { linkRefMode: qt.linkRefMode }
-                  : {}),
-                ...(typeof qt.dispatchAttempt === 'number' ? { dispatchAttempt: qt.dispatchAttempt } : {}),
-                ...(qt.trustedCaller && typeof qt.trustedCaller === 'object' ? { trustedCaller: qt.trustedCaller } : {}),
-                ...(qt.trustedController && typeof qt.trustedController === 'object' ? { trustedController: qt.trustedController } : {}),
-                ...(typeof qt.callerOpenId === 'string' && qt.callerOpenId ? { turnCallerOpenId: qt.callerOpenId } : {}),
-              });
-            }
+            mergeMarkerQueuedTurnIntoMemory(qt);
           }
         }
       });
@@ -9842,21 +10058,76 @@ function syncQueuedTurnsFromMarkerDisk(): boolean {
 }
 
 function advanceQueuedTypeAheadTurn(reason: string): boolean {
-  if (syncQueuedTurnsFromMarkerDisk()) return true;
-  while (queuedTypeAheadTurns[0]
-    && turnTerminalEmitted(queuedTypeAheadTurns[0].turnId, queuedTypeAheadTurns[0].dispatchAttempt)) {
-    const finished = queuedTypeAheadTurns[0];
-    dropQueuedTurnRecord(finished.turnId, finished.dispatchAttempt);
-    log(`Skipped type-ahead turn ${finished.turnId.slice(0, 12)} whose terminal already went out (${reason})`);
+  // A published final is not itself settlement evidence. Resolve it through
+  // the immutable ledger (or legacy no-settlement transition) before the
+  // terminal-fold cleanup below may remove any absorbed follow-up.
+  if (currentTurnHasFinalEvidence()) {
+    advanceQueuedTypeAheadTurnAfterFinal();
+    return true;
   }
-  if (queuedTypeAheadTurns.length === 0) return false;
+  if (syncQueuedTurnsFromMarkerDisk()) return true;
+  let droppedAny = false;
+  while (queuedTypeAheadTurns[0]) {
+    const head = queuedTypeAheadTurns[0];
+    if (turnTerminalEmitted(head.turnId, head.dispatchAttempt)) {
+      dropQueuedTurnRecord(head.turnId, head.dispatchAttempt);
+      droppedAny = true;
+      log(`Skipped type-ahead turn ${head.turnId.slice(0, 12)} whose terminal already went out (${reason})`);
+      continue;
+    }
+    const alreadySettled = typeof settledAbsorbedTurnsByKey !== 'undefined'
+      && settledAbsorbedTurnsByKey.has(`${head.turnId}\0${head.dispatchAttempt ?? ''}`);
+    const absorbedIntoCurrentHost = head.inputConsumed === true
+      && !!currentBotmuxTurnId
+      && head.absorbedIntoTurnId === currentBotmuxTurnId
+      && head.absorbedIntoDispatchAttempt === currentBotmuxDispatchAttempt;
+    const absorbedIntoFinishedHost = absorbedIntoCurrentHost
+      && !!currentBotmuxTurnId
+      && turnTerminalEmitted(currentBotmuxTurnId, currentBotmuxDispatchAttempt);
+    if (alreadySettled || absorbedIntoFinishedHost) {
+      if (absorbedIntoFinishedHost && typeof rememberSettledAbsorbedTurn === 'function' && currentBotmuxTurnId) {
+        rememberSettledAbsorbedTurn({
+          turnId: head.turnId,
+          ...(head.dispatchAttempt !== undefined ? { dispatchAttempt: head.dispatchAttempt } : {}),
+          hostTurnId: currentBotmuxTurnId,
+          ...(currentBotmuxDispatchAttempt !== undefined ? { hostDispatchAttempt: currentBotmuxDispatchAttempt } : {}),
+        });
+      }
+      const canTombstone = head.dispatchAttempt === undefined;
+      dropQueuedTurnRecord(head.turnId, head.dispatchAttempt, { tombstone: canTombstone });
+      droppedAny = true;
+      log(`Skipped type-ahead turn ${head.turnId.slice(0, 12)} already absorbed into host turn (${reason})`);
+      continue;
+    }
+    break;
+  }
+  if (queuedTypeAheadTurns.length === 0) {
+    if (droppedAny) writeCliPidMarker();
+    return false;
+  }
+  // An input absorbed mid-turn into the STILL-OPEN host turn belongs to that
+  // host, never a standalone successor turn: do not promote it on prompt_ready
+  // or queued_input_consumed while the host stays active on disk.
+  const head = queuedTypeAheadTurns[0]!;
+  if (head.inputConsumed === true
+    && !!currentBotmuxTurnId
+    && head.absorbedIntoTurnId === currentBotmuxTurnId
+    && head.absorbedIntoDispatchAttempt === currentBotmuxDispatchAttempt
+    && (reason === 'queued_input_consumed' || reason.startsWith('prompt_ready'))) {
+    if (droppedAny) writeCliPidMarker();
+    return false;
+  }
   const next = queuedTypeAheadTurns.shift()!;
   const prevTurnId = currentBotmuxTurnId;
+  const prevDispatchAttempt = currentBotmuxDispatchAttempt;
   markTurnRetired(prevTurnId);
   setCaptureIdentity(next.turnId, next.dispatchAttempt, next.turnCallerOpenId);
   currentBotmuxLinkRefMode = next.linkRefMode;
   currentVcMeetingImTurnOrigin = next.vcMeetingImTurnOrigin;
   currentTurnSteerPromoted = true;
+  currentPromotedAbsorbedTurn = next.inputConsumed === true
+    && next.absorbedIntoTurnId === prevTurnId
+    && next.absorbedIntoDispatchAttempt === prevDispatchAttempt;
   rememberQueuedTurnAdvanceForPendingReady(prevTurnId);
   markActiveTurnStarted(next);
   writeCliPidMarker();
@@ -9864,6 +10135,64 @@ function advanceQueuedTypeAheadTurn(reason: string): boolean {
   cancelAntigravityFoldedReconcilePending();
   log(`Advanced active turn (${reason}): ${prevTurnId?.slice(0, 12)} -> ${currentBotmuxTurnId?.slice(0, 12)} (remaining queued: ${queuedTypeAheadTurns.length})`);
   return true;
+}
+
+type FinalDeliverySettlementAuthorization =
+  | { kind: 'ledger'; turnIds: ReadonlySet<string> }
+  | { kind: 'legacy' }
+  | { kind: 'unknown' };
+
+/** Distinguish an immutable final decision from a legacy marker and from an
+ * actually unreadable/incomplete ledger. Unknown state authorizes neither a
+ * settlement nor a promotion: the incoming write must retain its queue head. */
+function finalDeliverySettlementAuthorization(hostTurnId: string): FinalDeliverySettlementAuthorization {
+  const dataDir = process.env.SESSION_DATA_DIR;
+  const larkAppId = lastInitConfig?.larkAppId;
+  if (!dataDir || !sessionId || !larkAppId) return { kind: 'unknown' };
+  try {
+    const record = new TurnSendLedger(dataDir).read({
+      larkAppId, sessionId, turnId: hostTurnId,
+      ...(currentBotmuxDispatchAttempt !== undefined ? { dispatchAttempt: currentBotmuxDispatchAttempt } : {}),
+    });
+    if (!record) return { kind: 'legacy' };
+    if (record.dispatchAttempt !== currentBotmuxDispatchAttempt || !record.final) return { kind: 'unknown' };
+    return { kind: 'ledger', turnIds: new Set(record.final.settledAbsorbedTurnIds ?? []) };
+  } catch (error: any) {
+    log(`Could not read absorbed-turn settlement authorization: ${error?.message ?? error}`);
+    return { kind: 'unknown' };
+  }
+}
+
+/** A bridge final marker is published inside advanceAncestorSessionTurn's PID
+ * marker lock. Seeing it here means the sender either completed that transition
+ * or died trying; both are resolved through the same core transition, with the
+ * immutable TurnSendLedger final as the only settlement authorization. */
+function advanceQueuedTypeAheadTurnAfterFinal(): void {
+  const hostTurnId = currentBotmuxTurnId;
+  const markerPath = cliPidMarker;
+  const dataDir = process.env.SESSION_DATA_DIR;
+  const markerPid = Number(basename(markerPath ?? ''));
+  if (!hostTurnId || !markerPath || !dataDir || !Number.isSafeInteger(markerPid) || markerPid <= 0) return;
+  const authorization = finalDeliverySettlementAuthorization(hostTurnId);
+  if (authorization.kind === 'unknown') return;
+  // A crashed sender may have removed the PID file after committing its ledger.
+  // Rebuild only from this worker's still-live in-memory queue, then let the
+  // normal locked transition settle or promote according to the final decision.
+  if (!existsSync(markerPath)) writeCliPidMarker();
+  if (!existsSync(markerPath)) return;
+  const authorized = authorization.kind === 'ledger' ? authorization.turnIds : new Set<string>();
+  try {
+    advanceAncestorSessionTurn(dataDir, markerPid, hostTurnId, {
+      consumedDispatchAttempt: currentBotmuxDispatchAttempt,
+      canSettleAbsorbed: turn => authorized.has(turn.turnId),
+    });
+  } catch (error: any) {
+    // Do not use the generic queue advance as a fallback: its terminal-fold
+    // cleanup is valid for other reasons, but cannot distinguish these three
+    // authorization states. prepareNormalWrite's invariant retains the input.
+    log(`Final-driven queue transition failed closed: ${error?.message ?? error}`);
+  }
+  syncQueuedTurnsFromMarkerDisk();
 }
 
 interface AntigravityFoldedReconcileResult {
@@ -12490,6 +12819,92 @@ function scanRestartInterruption(path: string, family: 'claude' | 'structured'):
   );
 }
 
+const scheduledInputReceipts = new Map<string, (decision: import('./core/scheduled-input-admission.js').ScheduledInputAdmission) => void>();
+
+let scheduledAdmissionRetry: {
+  item: PendingCliInput;
+  backend: SessionBackend;
+  generation: number;
+  attempt: number;
+  timer?: ReturnType<typeof setTimeout>;
+} | undefined;
+
+function cancelScheduledAdmissionRetry(item?: PendingCliInput): void {
+  if (!scheduledAdmissionRetry || (item && scheduledAdmissionRetry.item !== item)) return;
+  if (scheduledAdmissionRetry.timer) clearTimeout(scheduledAdmissionRetry.timer);
+  scheduledAdmissionRetry = undefined;
+}
+
+function scheduleScheduledAdmissionRetry(item: PendingCliInput): void {
+  const targetBackend = backend;
+  if (!targetBackend) return;
+  const generation = cliSpawnGeneration;
+  const prior = scheduledAdmissionRetry;
+  const attempt = prior?.item === item && prior.backend === targetBackend && prior.generation === generation
+    ? prior.attempt : 0;
+  cancelScheduledAdmissionRetry();
+  const entry: NonNullable<typeof scheduledAdmissionRetry> = {
+    item, backend: targetBackend, generation, attempt: attempt + 1,
+  };
+  scheduledAdmissionRetry = entry;
+  // Retain is fail-closed, not fail-silent. Back off a transient authority/IPC
+  // outage without letting every ready edge create an unbounded retry loop.
+  const delayMs = Math.min(30_000, 1_000 * 2 ** Math.min(attempt, 5));
+  entry.timer = setTimeout(() => {
+    entry.timer = undefined;
+    if (scheduledAdmissionRetry !== entry) return;
+    if (backend !== targetBackend || cliSpawnGeneration !== generation || cliRestartInProgress) {
+      cancelScheduledAdmissionRetry(item);
+      return;
+    }
+    if (isFlushing) { scheduleScheduledAdmissionRetry(item); return; }
+    if (pendingMessages[0] !== item && pendingAdoptMessages[0] !== item) {
+      cancelScheduledAdmissionRetry(item);
+      return;
+    }
+    void flushPending();
+  }, delayMs);
+  entry.timer.unref?.();
+}
+
+async function requestScheduledInputAdmission(item: PendingCliInput): Promise<import('./core/scheduled-input-admission.js').ScheduledInputAdmission> {
+  if (!item.turnId || !parseScheduledTurnId(item.turnId)) return 'allow';
+  const requestId = randomBytes(16).toString('hex');
+  return new Promise(resolve => {
+    const timer = setTimeout(() => finish('retain'), 5_000);
+    const finish = (decision: import('./core/scheduled-input-admission.js').ScheduledInputAdmission) => {
+      clearTimeout(timer); scheduledInputReceipts.delete(requestId); resolve(decision);
+    };
+    scheduledInputReceipts.set(requestId, finish);
+    send({ type: 'admit_scheduled_input', requestId, turnId: item.turnId! });
+  });
+}
+
+async function runScheduledCliInputWrite<T>(
+  item: PendingCliInput,
+  isCurrent: () => boolean,
+  prepare: () => void,
+  write: () => Promise<T>,
+  onHold: (decision: 'reject' | 'retain') => void,
+  requireQueueOwner = true,
+): Promise<T> {
+  if (item.turnId && parseScheduledTurnId(item.turnId)) {
+    const decision = await requestScheduledInputAdmission(item);
+    const owner = cliSubmissionInFlight;
+    const held = requireQueueOwner && owner?.item === item && owner.scheduledWriteCancelled ? 'reject'
+      : !isCurrent() || (requireQueueOwner && owner?.item !== item) ? 'retain' : decision;
+    if (held !== 'allow') {
+      if (held === 'retain') scheduleScheduledAdmissionRetry(item);
+      else cancelScheduledAdmissionRetry(item);
+      onHold(held);
+      throw new Error(`scheduled_input_${held}`);
+    }
+    cancelScheduledAdmissionRetry(item);
+  }
+  prepare();
+  return write();
+}
+
 const deploymentCancellationReceipts = new Map<string, (ok: boolean) => void>();
 
 /** Web terminal writes bypass daemon input routing. Persist withdrawal before
@@ -13815,8 +14230,46 @@ function saveUnsentInputsForSuccessor(reason: string): void {
   }
 }
 
-/** An input reached the CLI: it becomes the turn a standalone restart note
- *  continues, and a restored predecessor input is no longer outstanding. */
+function discardUnwrittenScheduledInput(item: PendingCliInput): void {
+  if (item.turnId) send({ type: 'turn_input_rejected', turnId: item.turnId,
+    ...(item.dispatchAttempt !== undefined ? { dispatchAttempt: item.dispatchAttempt } : {}),
+    reason: 'execution_reconciliation_required', rejectedBeforeAdmission: true });
+  if (restoredUnsentInputs.delete(item)) {
+    const path = unsentInputJournalPath();
+    if (path && item.turnId) removeTakenUnsentInputs(path, new Set([item.turnId]));
+  }
+}
+
+function coalescePendingScheduledInputs(pending: PendingCliInput[] = pendingMessages): void {
+  const dropped = coalesceAutomaticScheduledInputs(pending);
+  const restored = dropped.filter(item => restoredUnsentInputs.delete(item));
+  const path = unsentInputJournalPath();
+  if (path && restored.length > 0) removeTakenUnsentInputs(path, new Set(restored.flatMap(item => item.turnId ? [item.turnId] : [])));
+  for (const item of dropped) discardUnwrittenScheduledInput(item);
+}
+
+function discardScheduledBacklogForStop(): void {
+  const activeTask = currentBotmuxTurnId ? parseScheduledTurnId(currentBotmuxTurnId) : null;
+  const writing = cliSubmissionInFlight;
+  const writingTask = writing?.scheduledWritePending
+    ? automaticScheduledInputTask(writing.item) ?? scheduledRecoveryInputTask(writing.item) : undefined;
+  const targetTask = activeTask ?? writingTask;
+  // STOP belongs to a human/non-scheduled turn unless a scheduled writer proves
+  // otherwise. Never turn that absence into a wildcard over every queued task.
+  if (!targetTask) return;
+  if (writing && writingTask === targetTask) writing.scheduledWriteCancelled = true;
+  for (const queue of [pendingMessages, pendingAdoptMessages]) {
+    for (let index = queue.length - 1; index >= 0; index--) {
+      const item = queue[index]!;
+      const taskId = automaticScheduledInputTask(item) ?? scheduledRecoveryInputTask(item);
+      if (taskId === targetTask) {
+        queue.splice(index, 1);
+        discardUnwrittenScheduledInput(item);
+      }
+    }
+  }
+}
+
 function noteCliInputWritten(
   item: PendingCliInput,
   antigravityAnchor?: AntigravityTranscriptWriteBoundary,
@@ -13841,7 +14294,16 @@ function takeUnsentInputsFromPredecessor(cfg: Extract<DaemonToWorker, { type: 'i
   try {
     const { inputs, expired, unconfirmed } = takeUnsentInputs(path);
     predecessorUnsentInputsTaken = true;
-    for (const input of inputs) restoredUnsentInputs.add(input);
+    for (const input of inputs) {
+      const hostRun = input.turnId ? cfg.scheduledRuns?.[input.turnId]
+        ?? (cfg.scheduledRun?.turnId === input.turnId ? cfg.scheduledRun : undefined) : undefined;
+      // A journal written by the previous build may already contain a legacy
+      // scheduledRun without trigger/recovery provenance. Replace its binding
+      // with the host's newly authenticated evidence instead of keeping the stale copy.
+      if (hostRun) input.scheduledRun = { ...input.scheduledRun, ...hostRun };
+      restoredUnsentInputs.add(input);
+    }
+    coalescePendingScheduledInputs(inputs);
     if (inputs.length > 0) log(`Re-queued ${inputs.length} input(s) the previous worker never wrote to the CLI`);
     if (unconfirmed.length > 0) {
       log(`${unconfirmed.length} restored input(s) of a worker that died while delivering them; reporting them as unconfirmed`);
@@ -14143,6 +14605,34 @@ function attributableExplicitReplyMarkersForTurnWindow(
   const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;
   return markers.filter(marker => marker.sentAtMs >= lower && marker.sentAtMs < upper
     && marker.turnId === turnId);
+}
+
+function currentTurnHasFinalMarker(): boolean {
+  return !!currentBotmuxTurnId && readSendMarkers().some(marker =>
+    marker.turnId === currentBotmuxTurnId
+    && marker.responseKind === 'final'
+    && marker.dispatchAttempt === currentBotmuxDispatchAttempt);
+}
+
+function currentTurnHasFinalEvidence(): boolean {
+  if (currentTurnHasFinalMarker()) return true;
+  if (!currentBotmuxTurnId) return false;
+  const dataDir = process.env.SESSION_DATA_DIR;
+  const larkAppId = lastInitConfig?.larkAppId;
+  if (!dataDir || !sessionId || !larkAppId) return false;
+  try {
+    const record = new TurnSendLedger(dataDir).read({
+      larkAppId, sessionId, turnId: currentBotmuxTurnId,
+      ...(currentBotmuxDispatchAttempt !== undefined
+        ? { dispatchAttempt: currentBotmuxDispatchAttempt }
+        : {}),
+    });
+    return !!record?.final && record.dispatchAttempt === currentBotmuxDispatchAttempt;
+  } catch {
+    // An unreadable existing record cannot authorize native terminal-fold
+    // cleanup either. The final-driven transition will remain fail-closed.
+    return true;
+  }
 }
 
 function notifyExplicitRepliesObserved(
@@ -16947,12 +17437,18 @@ function emitReadyTurns(opts: EmitReadyTurnsOptions = {}): void {
   // Retire the journal entries of turns the queue dropped head-of-line. These
   // never reach `ready`, so this must run BEFORE the empty-`ready` early return
   // below — a drop very often coincides with a tick that emits nothing.
+  let droppedAbsorbedFromQueue = false;
   for (const dropped of bridgeQueue.takeDroppedNeedingJournalClear()) {
     journalBridgeTurnClear(dropped.turnId, dropped.dispatchAttempt);
     if (dropped.contentFingerprint) bridgeFingerprintScanLastMs.delete(dropped.contentFingerprint);
+    if (dropped.absorbedIntoTurnId && typeof dropQueuedTurnRecord === 'function'
+      && dropQueuedTurnRecord(dropped.turnId, dropped.dispatchAttempt, { tombstone: dropped.dispatchAttempt === undefined })) {
+      droppedAbsorbedFromQueue = true;
+    }
     log(`Bridge journal cleared for head-of-line dropped turn ${dropped.turnId.substring(0, 8)} `
       + `— it produced no assistant text and a newer turn started`);
   }
+  if (droppedAbsorbedFromQueue && typeof writeCliPidMarker === 'function') writeCliPidMarker();
   const release = opts.releaseHeldTerminals ? { releaseHeldTerminals: true } : {};
   // Adopt sessions never arm the open-turn watchdog and keep headless/fold
   // attribution; tell the queue not to mint a Scenario 3 recovery anchor.
@@ -17387,7 +17883,14 @@ function emitReadyTurns(opts: EmitReadyTurnsOptions = {}): void {
     const turn = ready[i];
     if (unsubmitted.has(turn.turnId) || workerFinalOutputHandoff?.hasTurn(turn.turnId)) continue;
     if (universalOutputHandoff || handoffTurnIds.has(turn.turnId)) journalBridgeTurnClear(turn.turnId, turn.dispatchAttempt);
-    if (turn.rateLimited) continue;
+    if (turn.rateLimited) {
+      if (turn.absorbedIntoTurnId && typeof dropQueuedTurnRecord === 'function'
+        && dropQueuedTurnRecord(turn.turnId, turn.dispatchAttempt, { tombstone: turn.dispatchAttempt === undefined })
+        && typeof writeCliPidMarker === 'function') {
+        writeCliPidMarker();
+      }
+      continue;
+    }
     if (suppressedMonitorWakes.has(turn)) {
       // Flush any buffered CoT entries attributed to the launching turn's
       // anchor, and skip `emitTurnTerminal` so the daemon does not release
@@ -22838,7 +23341,7 @@ function beginCliWriteCycle(): void {
  *  message listener does not await a prior async invocation, so without the
  *  outer AsyncSerialQueue two CoCo/Codex writes can overwrite the same composer
  *  while the first is sleeping before Enter or polling history. */
-type AdoptWriteResult = 'completed' | 'refused-before-write' | 'stale-before-write' | 'stale-after-write';
+type AdoptWriteResult = 'completed' | 'admission-rejected' | 'refused-before-write' | 'stale-before-write' | 'stale-after-write';
 
 async function writeAdoptMessage(
   content: string,
@@ -22850,6 +23353,8 @@ async function writeAdoptMessage(
   trustedController?: TrustedCaller,
   fence?: AdoptWriteFence,
   queueAfterActiveTurn?: true,
+  scheduledRun?: import('./types.js').Session['scheduledRun'],
+  scheduledQueueItem?: PendingCliInput,
 ): Promise<AdoptWriteResult> {
   rememberTurnLinkRefMode(turnId, dispatchAttempt, linkRefMode);
   const executionFence = fence ?? captureAdoptWriteFence();
@@ -22857,32 +23362,63 @@ async function writeAdoptMessage(
     return 'stale-before-write';
   }
   const adoptBackend = executionFence.backend;
+  const adoptInterruptGeneration = cliInterruptGeneration;
+  // Retry/requeue identity must be the original queue object. Rebuilding it here
+  // makes the generation-fenced timer cancel itself when the head is compared by reference.
+  const scheduledItem = scheduledQueueItem ?? { content, turnId, queueAfterActiveTurn, scheduledRun };
+  const isScheduledWrite = !!(turnId && parseScheduledTurnId(turnId));
+  let lateScheduledHold: 'reject' | 'retain' | undefined;
+  const recordScheduledHold = (decision: 'reject' | 'retain') => {
+    lateScheduledHold = cliInterruptGeneration !== adoptInterruptGeneration && automaticScheduledInputTask(scheduledItem) ? 'reject' : decision;
+  };
+  const scheduledWriteIsCurrent = () => adoptWriteFenceIsCurrent(executionFence)
+    && cliInterruptGeneration === adoptInterruptGeneration;
   if (cliAdapter?.postTerminalPromptFence === true
     && (currentInputDeliveryQuarantine()
       || await postTerminalInputIsBlocked(adoptBackend))) {
     return 'stale-before-write';
   }
   if (!adoptWriteFenceIsCurrent(executionFence)) return 'stale-before-write';
-
-  renderer?.markNewTurn();
-  const turnSeq = usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
-  if (currentBotmuxTurnId && currentBotmuxTurnId !== turnId) {
-    markTurnRetired(currentBotmuxTurnId);
+  if (turnId && parseScheduledTurnId(turnId)) {
+    const item = scheduledItem;
+    if (automaticScheduledInputTask(item) && usageLimitTracker.detectedThisTurn(usageLimitTracker.currentTurn())) return 'stale-before-write';
+    const decision = await requestScheduledInputAdmission(item);
+    if (!adoptWriteFenceIsCurrent(executionFence)) return 'stale-before-write';
+    if (decision === 'reject') {
+      cancelScheduledAdmissionRetry(item);
+      discardUnwrittenScheduledInput(item);
+      return 'admission-rejected';
+    }
+    if (decision !== 'allow') {
+      scheduleScheduledAdmissionRetry(item);
+      return 'stale-before-write';
+    }
+    cancelScheduledAdmissionRetry(item);
   }
-  setCaptureIdentity(turnId, dispatchAttempt, trustedCaller?.requestUserOpenId);
-  currentBotmuxLinkRefMode = linkRefMode;
-  currentVcMeetingImTurnOrigin = vcMeetingImTurnOrigin;
-  if (typeof supersedeBackgroundAuthorityHold === 'function') supersedeBackgroundAuthorityHold('superseded_by_message');
-  markActiveTurnStarted({
-    turnId,
-    dispatchAttempt,
-    trustedCaller,
-    trustedController,
-    ...(queueAfterActiveTurn ? { queueAfterActiveTurn: true } : {}),
-  });
-  if (dispatchAttempt !== undefined) durableTurnInFlight = true;
-  writeCliPidMarker();
-  publishSandboxRelayCapability();
+
+  let turnSeq = isScheduledWrite ? usageLimitTracker.currentTurn() : 0;
+  const beginAdoptTurn = (): void => {
+    renderer?.markNewTurn();
+    turnSeq = usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
+    if (currentBotmuxTurnId && currentBotmuxTurnId !== turnId) {
+      markTurnRetired(currentBotmuxTurnId);
+    }
+    setCaptureIdentity(turnId, dispatchAttempt, trustedCaller?.requestUserOpenId);
+    currentBotmuxLinkRefMode = linkRefMode;
+    currentVcMeetingImTurnOrigin = vcMeetingImTurnOrigin;
+    if (typeof supersedeBackgroundAuthorityHold === 'function') supersedeBackgroundAuthorityHold('superseded_by_message');
+    markActiveTurnStarted({
+      turnId,
+      dispatchAttempt,
+      trustedCaller,
+      trustedController,
+      ...(queueAfterActiveTurn ? { queueAfterActiveTurn: true } : {}),
+    });
+    if (dispatchAttempt !== undefined) durableTurnInFlight = true;
+    writeCliPidMarker();
+    publishSandboxRelayCapability();
+  };
+  if (!isScheduledWrite) beginAdoptTurn();
   let adoptStructuredBridgeTurnId: string | undefined;
 
   // Capture the transcript baseline immediately before the literal write, inside
@@ -22894,6 +23430,8 @@ async function writeAdoptMessage(
   let adoptWritePrepared = false;
   const prepareAdoptWrite = (): void => {
     if (adoptWritePrepared) return;
+    // A refused schedule must not acquire credentials, quota or active-turn ownership.
+    if (isScheduledWrite) beginAdoptTurn();
     adoptWritePrepared = true;
     // Same anchor rule as flushPending: the execution window opens at the
     // literal adopt write, inside the submission transaction, so a refused
@@ -22988,10 +23526,12 @@ async function writeAdoptMessage(
         // so the transaction can cancel/poison the WAL. Passing the bare backend
         // would let a refused write look like success and clear the journal —
         // silent input loss (the exact failure the transaction guards against).
-        () => cliAdapter!.writeInput(adapterInputHandle(submissionBackend), content,
-          lastInitConfig?.cliId === 'traex' ? { correlateTranscript: true } : undefined),
+        () => runScheduledCliInputWrite(scheduledItem, scheduledWriteIsCurrent,
+          isScheduledWrite ? prepareAdoptWrite : () => {},
+          () => cliAdapter!.writeInput(adapterInputHandle(submissionBackend), content,
+            lastInitConfig?.cliId === 'traex' ? { correlateTranscript: true } : undefined), recordScheduledHold, false),
         settleVerifiableSubmissionForJournal,
-        prepareAdoptWrite,
+        isScheduledWrite ? undefined : prepareAdoptWrite,
       );
       const result = transaction.result;
       recoveryFailureReason = transaction.recoveryFailureReason;
@@ -23047,6 +23587,10 @@ async function writeAdoptMessage(
         }
       }
     } catch (err: any) {
+      if (lateScheduledHold) {
+        if (lateScheduledHold === 'reject') { discardUnwrittenScheduledInput(scheduledItem); return 'admission-rejected'; }
+        return 'stale-before-write';
+      }
       recoveryFailureReason = err instanceof SubmissionWriteError
         ? err.recoveryFailureReason
         : recoveryFailureReason;
@@ -23079,7 +23623,8 @@ async function writeAdoptMessage(
     try {
       const transaction = await runAmbiguousSubmissionTransaction(
         submissionBackend,
-        async () => {
+        () => runScheduledCliInputWrite(scheduledItem, scheduledWriteIsCurrent,
+          isScheduledWrite ? prepareAdoptWrite : () => {}, async () => {
           // Use adapterInputHandle so a ZMX write refusal (sendText/sendSpecialKeys
           // returning false) throws instead of silently succeeding — the raw path
           // needs the same strict-handle guard as the structured writeInput path.
@@ -23092,9 +23637,9 @@ async function writeAdoptMessage(
             throw new Error('backend changed before adopt raw Enter');
           }
           input.sendSpecialKeys!('Enter');
-        },
+        }, recordScheduledHold, false),
         undefined,
-        prepareAdoptWrite,
+        isScheduledWrite ? undefined : prepareAdoptWrite,
       );
       recoveryFailureReason = transaction.recoveryFailureReason;
       if (!adoptWriteFenceIsCurrent(executionFence)) {
@@ -23107,6 +23652,10 @@ async function writeAdoptMessage(
         );
       }
     } catch (err: any) {
+      if (lateScheduledHold) {
+        if (lateScheduledHold === 'reject') { discardUnwrittenScheduledInput(scheduledItem); return 'admission-rejected'; }
+        return 'stale-before-write';
+      }
       recoveryFailureReason = err instanceof SubmissionWriteError
         ? err.recoveryFailureReason
         : recoveryFailureReason;
@@ -23160,6 +23709,8 @@ async function runAdoptMessageForCapturedGeneration(
       item.trustedController,
       fence,
       item.queueAfterActiveTurn,
+      item.scheduledRun,
+      item,
     ),
   });
   if (queued.status === 'stale-before-write') return 'stale-before-write';
@@ -23176,7 +23727,7 @@ async function admitAdoptMessage(item: PendingCliInput): Promise<void> {
   // A callerless follow-up must not adopt a live continuation's authority when
   // cross-principal isolation is off. Freeze the serial marker onto the durable
   // queue item before any await so the eventual write starts its own turn.
-  if (inputForcesSerialTurn(item, activeTurnAuthority.snapshot()?.caller)
+  if ((!!(item.turnId && parseScheduledTurnId(item.turnId)) || inputForcesSerialTurn(item, activeTurnAuthority.snapshot()?.caller))
     && !item.queueAfterActiveTurn) {
     item = { ...item, queueAfterActiveTurn: true };
   }
@@ -23186,6 +23737,7 @@ async function admitAdoptMessage(item: PendingCliInput): Promise<void> {
   const adoptInputBlocked = !alreadyHeld && sessionInputBlocksDeliveryNow();
   if (alreadyHeld || adoptInputBlocked) {
     pendingAdoptMessages.push(item);
+    coalescePendingScheduledInputs(pendingAdoptMessages);
     if (adoptInputBlocked) holdNativeInputForHardBlock();
     log(item.queueAfterActiveTurn
       ? `Queued serial adopt message until the active turn reaches a real prompt boundary (${item.content.length} chars)`
@@ -23198,6 +23750,7 @@ async function admitAdoptMessage(item: PendingCliInput): Promise<void> {
   }
   await runAdoptMessageForCapturedGeneration(item, () => {
     pendingAdoptMessages.push(item);
+    coalescePendingScheduledInputs(pendingAdoptMessages);
     log(`Re-queued stale adopt message for the replacement CLI generation (${item.content.length} chars)`);
   });
 }
@@ -23939,6 +24492,7 @@ function submitCursorParkedFollowUpAfterStop(target: SessionBackend, lifetime: n
 async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
   if (isCriticalInterruptKey(requestedKey) && activeTranscriptImagePurge?.cancel()) return;
   if (nativeSessionForkPending()) return;
+  if (requestedKey === 'ctrlc') discardScheduledBacklogForStop();
   if (lastInitConfig?.deploymentContinuation && (requestedKey === 'ctrlc' || requestedKey === 'esc')) discardDeploymentContinuation();
   // 中断类键按适配器归一。卡片「⏹ 停止」与 `/stop` 都硬编码发 ctrlc，但 ZCode
   // 单个 Ctrl+C 会退出整个进程（0.16.9 实测）——用户点「停止这一轮」却丢掉会话
@@ -28643,7 +29197,11 @@ function markPromptReady(): void {
   const readyContinuesTurn = (spawnArgvInitialPromptBusy
       || ((backgroundTaskTracker.pendingTurnAgents() > 0 || antigravityPendingTasks) && !spawnArgvNeedsWorkingSeed))
     && !!renderer
-    && queuedTypeAheadTurns.length === 0
+    && !queuedTypeAheadTurns.some(q =>
+      !(q.inputConsumed === true
+        && !!currentBotmuxTurnId
+        && q.absorbedIntoTurnId === currentBotmuxTurnId
+        && q.absorbedIntoDispatchAttempt === currentBotmuxDispatchAttempt))
     && pendingMessages.length === 0
     && pendingRawInputs.length === 0
     && pendingSessionRename === null
@@ -30398,9 +30956,20 @@ function promotePendingHumanInterruption(): boolean {
   // swallow the owner's live interruption behind that wait. This is a queue
   // selection only: retain authority, delivery fences and the scheduled work.
   // Use the principal gate even when experimental isolation is disabled.
-  if (runtimeSupportsTypeAhead && !durableTurnInFlight && !directRpcTurnBlocksTypeAhead()
-    && !isRemoteBackendType(effectiveBackendType) && !isCodexAppCliId(lastInitConfig?.cliId)
-    && activeTurnBlocks(pendingMessages[0] ?? {})) {
+  if (durableTurnInFlight || directRpcTurnBlocksTypeAhead()) return false;
+  const queue = lastInitConfig?.adoptMode && pendingAdoptMessages.length > 0 ? pendingAdoptMessages : pendingMessages;
+  const head = queue[0] ?? {};
+  const quotaBlockedAutomaticHead = isPromptReady && automaticScheduledInputTask(head) !== undefined
+    && usageLimitTracker.detectedThisTurn(usageLimitTracker.currentTurn());
+  if (quotaBlockedAutomaticHead) {
+    // The quota-blocked CLI is idle, so this remains a serial queue selection,
+    // not type-ahead. It applies equally to adopt and idle remote backends; their
+    // busy-transport exclusions must not suppress an in-memory reorder.
+    return promoteInteractiveInputPastQuotaSchedules(queue, input =>
+      !activeTurnAuthority.blocks(turnAuthorityIdentity(input)));
+  }
+  if (runtimeSupportsTypeAhead && !isRemoteBackendType(effectiveBackendType)
+    && !isCodexAppCliId(lastInitConfig?.cliId) && activeTurnBlocks(pendingMessages[0] ?? {})) {
     return promoteInteractiveInputPastSchedules(pendingMessages, input =>
       !activeTurnAuthority.blocks(turnAuthorityIdentity(input)));
   }
@@ -30892,13 +31461,12 @@ async function flushPending(): Promise<void> {
         log(`Re-queued adopt message at queue head for the replacement CLI generation (${item.content.length} chars)`);
       });
       // Its native terminal can make the composer ready while the adapter is
-      // still awaiting history. That idle edge reached this flush under its
-      // mutex; re-drive after finally releases it, so the next queued message
-      // does not depend on another terminal redraw. Only a finished write
-      // re-drives: a pre-write refusal ('refused-before-write') wrote nothing
-      // and leaves peers to the next genuine prompt-ready edge, so this can
-      // never spin without a write.
-      if (outcome === 'completed' && isPromptReady && pendingAdoptMessages.length > 0) {
+      // still awaiting history. A finished write or a known host-admission
+      // rejection consumed the head; either can release the ready queue after
+      // finally releases the mutex. Composer refusals still wait for a genuine
+      // new prompt-ready edge, which prevents a no-write retry spin.
+      if ((outcome === 'completed' || outcome === 'admission-rejected')
+        && isPromptReady && pendingAdoptMessages.length > 0) {
         queueMicrotask(() => { void flushPending(); });
       }
       return;
@@ -31046,6 +31614,37 @@ async function flushPending(): Promise<void> {
       const catalogAdmissionHead = pendingMessages[0];
       if (catalogAdmissionHead?.turnId
         && admitTraexCatalogModelBeforeInput(catalogAdmissionHead.turnId, catalogAdmissionHead.dispatchAttempt)) break;
+      const scheduledHead = pendingMessages[0]!;
+      if (scheduledHead.turnId && parseScheduledTurnId(scheduledHead.turnId)) {
+        if (automaticScheduledInputTask(scheduledHead)
+          && usageLimitTracker.detectedThisTurn(usageLimitTracker.currentTurn())) {
+          keepPromptReadyAfterHold();
+          break;
+        }
+        const gateBackend: SessionBackend = backend;
+        const gateGeneration = cliSpawnGeneration;
+        const gateRevision = promptReadinessRevision;
+        const gateWebGeneration = webTerminalInputGeneration;
+        const decision = await requestScheduledInputAdmission(scheduledHead);
+        if (backend !== gateBackend || cliSpawnGeneration !== gateGeneration || cliRestartInProgress
+          || promptReadinessRevision !== gateRevision || webTerminalInputGeneration !== gateWebGeneration
+          || webTerminalInputWireDirty()) { keepPromptReadyAfterHold(); break; }
+        if (pendingMessages[0] !== scheduledHead) { keepPromptReadyAfterHold(); continue; }
+        if (decision === 'reject') {
+          cancelScheduledAdmissionRetry(scheduledHead);
+          pendingMessages.shift();
+          discardUnwrittenScheduledInput(scheduledHead);
+          keepPromptReadyAfterHold();
+          continue;
+        }
+        if (decision !== 'allow') {
+          scheduleScheduledAdmissionRetry(scheduledHead);
+          keepPromptReadyAfterHold();
+          break;
+        }
+        cancelScheduledAdmissionRetry(scheduledHead);
+        if (activeTurnBlocks(scheduledHead)) { keepPromptReadyAfterHold(); break; }
+      }
       // Explicit FIFO, non-interactive input and a rejected steer remain at
       // the head until the native task closes. A stale ready screen cannot
       // turn them into a second turn/start against the live native id.
@@ -31130,7 +31729,9 @@ async function flushPending(): Promise<void> {
         if (cliRestartInProgress) break;
         continue;
       }
-      cliSubmissionInFlight = { item, generation: cliSpawnGeneration, composerOwned: false };
+      const isScheduledWrite = !!(item.turnId && parseScheduledTurnId(item.turnId));
+      cliSubmissionInFlight = { item, generation: cliSpawnGeneration, composerOwned: false,
+        ...(isScheduledWrite ? { scheduledWritePending: true } : {}) };
       inlineParkedTraexSkillCatalog(item);
       attachDeferredPluginSkillCatalog(item);
       // Apply the credential snapshot that arrived WITH this turn, immediately
@@ -31144,6 +31745,7 @@ async function flushPending(): Promise<void> {
       const writeBackend = backend;
       const writeAdapter = cliAdapter;
       const writeRpcEngine = codexRpcEngine;
+      const writeInterruptGeneration = cliInterruptGeneration;
       const writeContinuationIsCurrent = (): boolean => (
         cliSpawnGeneration === writeGeneration
         && backend === writeBackend
@@ -31158,6 +31760,10 @@ async function flushPending(): Promise<void> {
       let submittedText = item.codexAppInput?.text ?? msg;
       let turnSeq = usageLimitTracker.currentTurn();
       let bridgeTurnId: string | undefined;
+      let lateScheduledHold: 'reject' | 'retain' | undefined;
+      const recordScheduledHold = (decision: 'reject' | 'retain') => { lateScheduledHold = decision; };
+      const scheduledWriteIsCurrent = () => writeContinuationIsCurrent()
+        && cliInterruptGeneration === writeInterruptGeneration && !webTerminalInputWireDirty();
       let normalWritePrepared = false;
       let retiredBeforeSubmit = false;
       let webWireWriteRefused = false;
@@ -31179,6 +31785,7 @@ async function flushPending(): Promise<void> {
           throw new SubmissionWriteError('Web terminal wire is dirty before the native write', 'web_terminal_input_wire_dirty', false);
         }
         normalWritePrepared = true;
+        if (cliSubmissionInFlight?.item === item) cliSubmissionInFlight.scheduledWritePending = undefined;
         if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
         // Drain any unread prior-turn/wake records BEFORE rotating authority to
         // `item` so prior `turn_duration` or launches never mutate or destroy
@@ -31199,15 +31806,22 @@ async function flushPending(): Promise<void> {
         }
         syncQueuedTurnsFromMarkerDisk();
 
-        let currentTurnFinalDelivered = Boolean(
-          currentBotmuxTurnId
-            && readSendMarkers().some(m => m.turnId === currentBotmuxTurnId && m.responseKind === 'final')
-        );
+        let currentTurnFinalDelivered = currentTurnHasFinalEvidence();
         if (currentTurnFinalDelivered && queuedTypeAheadTurns.length > 0) {
-          advanceQueuedTypeAheadTurn('final_delivered');
-          currentTurnFinalDelivered = Boolean(
-            currentBotmuxTurnId
-              && readSendMarkers().some(m => m.turnId === currentBotmuxTurnId && m.responseKind === 'final')
+          advanceQueuedTypeAheadTurnAfterFinal();
+          currentTurnFinalDelivered = currentTurnHasFinalEvidence();
+        }
+
+        if (currentTurnFinalDelivered && queuedTypeAheadTurns.some(q =>
+          q.inputConsumed === true
+          && q.absorbedIntoTurnId === currentBotmuxTurnId
+          && q.absorbedIntoDispatchAttempt === currentBotmuxDispatchAttempt)) {
+          // Never rotate an incoming item over an absorbed turn whose final
+          // settlement is unresolved. In particular, the markNewTurn branch
+          // below must not become an independent final-delivered bypass.
+          throw new SubmissionWriteError(
+            'Absorbed-turn final transition is still unresolved',
+            undefined, false, false, false, true,
           );
         }
 
@@ -31215,12 +31829,17 @@ async function flushPending(): Promise<void> {
           && ((typeof retiredTurnIds !== 'undefined' && retiredTurnIds.has(currentBotmuxTurnId))
             || (typeof turnTerminalEmitted === 'function'
               && turnTerminalEmitted(currentBotmuxTurnId, currentBotmuxDispatchAttempt)));
+        const hasUnabsorbedQueuedTurn = queuedTypeAheadTurns.some(q =>
+          !(q.inputConsumed === true
+            && !!currentBotmuxTurnId
+            && q.absorbedIntoTurnId === currentBotmuxTurnId
+            && q.absorbedIntoDispatchAttempt === currentBotmuxDispatchAttempt));
         const isTypeAhead = !!currentBotmuxTurnId
           && !currentTurnFinalDelivered
           && !!item.turnId
           && item.turnId !== currentBotmuxTurnId
           && (itemsWrittenInThisFlush > 0
-            || queuedTypeAheadTurns.length > 0
+            || hasUnabsorbedQueuedTurn
             || (!promptReadyAtFlushStart && !currentTurnAlreadyTerminated));
         if (lastInitConfig?.cliId === 'traex') {
           lastTraexPromptCheckpoint = undefined;
@@ -31310,8 +31929,35 @@ async function flushPending(): Promise<void> {
           }
         } else {
           renderer?.markNewTurn();
-          if (currentBotmuxTurnId && currentBotmuxTurnId !== item.turnId) {
-            markTurnRetired(currentBotmuxTurnId);
+          const prevActiveTurnId = currentBotmuxTurnId;
+          const prevActiveDispatchAttempt = currentBotmuxDispatchAttempt;
+          if (prevActiveTurnId && prevActiveTurnId !== item.turnId) {
+            markTurnRetired(prevActiveTurnId);
+            // A final alone is NOT proof that this entry may be retired here:
+            // advanceQueuedTypeAheadTurnAfterFinal above has already applied the
+            // sender's destination-gated decision. This inline cleanup is only
+            // for terminal-fold cleanup or a settlement already synced from disk.
+            const absorbedIntoPrev = queuedTypeAheadTurns.filter(q =>
+              q.inputConsumed === true
+              && q.absorbedIntoTurnId === prevActiveTurnId
+              && q.absorbedIntoDispatchAttempt === prevActiveDispatchAttempt
+              && (turnTerminalEmitted(prevActiveTurnId, prevActiveDispatchAttempt)
+                || settledAbsorbedTurnsByKey.has(settledAbsorbedKey(q.turnId, q.dispatchAttempt))));
+            for (const absorbed of absorbedIntoPrev) {
+              if (typeof rememberSettledAbsorbedTurn === 'function') {
+                rememberSettledAbsorbedTurn({
+                  turnId: absorbed.turnId,
+                  ...(absorbed.dispatchAttempt !== undefined ? { dispatchAttempt: absorbed.dispatchAttempt } : {}),
+                  hostTurnId: prevActiveTurnId,
+                  ...(prevActiveDispatchAttempt !== undefined ? { hostDispatchAttempt: prevActiveDispatchAttempt } : {}),
+                });
+              }
+              if (typeof dropQueuedTurnRecord === 'function') {
+                dropQueuedTurnRecord(absorbed.turnId, absorbed.dispatchAttempt, { tombstone: absorbed.dispatchAttempt === undefined });
+              } else {
+                queuedTypeAheadTurns = queuedTypeAheadTurns.filter(q => q !== absorbed);
+              }
+            }
           }
           setCaptureIdentity(
             item.turnId,
@@ -31456,6 +32102,7 @@ async function flushPending(): Promise<void> {
         markTurnExecutionStart(item.turnId, item.dispatchAttempt, {
           evidenceAlreadyStarted: !!preAssignedEvidenceTurnId,
         });
+        resetFinalTransitionRetryBackoff();
         if (isCodexAppCliId(lastInitConfig?.cliId)) {
           log(
             `Writing Codex App input to PTY (flush): `
@@ -31561,16 +32208,16 @@ async function flushPending(): Promise<void> {
               failureReason: 'remote-runner requires an authenticated BotMux turn id',
             };
           } else {
-            prepareNormalWrite();
-            result = await writeBackend.submitTurn({
+            result = await runScheduledCliInputWrite(item, scheduledWriteIsCurrent, prepareNormalWrite,
+              () => writeBackend.submitTurn!({
               sessionOrigin: workerSessionEventScope?.origin(item.turnId, item.dispatchAttempt),
               content: msg,
-              turnId: item.turnId,
+              turnId: item.turnId!,
               ...(item.replyTurnId ? { replyTurnId: item.replyTurnId } : {}),
               ...(item.dispatchAttempt !== undefined ? { dispatchAttempt: item.dispatchAttempt } : {}),
               ...(item.linkRefMode ? { linkRefMode: item.linkRefMode } : {}),
               ...(item.trustedCaller ? { trustedCaller: item.trustedCaller } : {}),
-            });
+            }), recordScheduledHold);
           }
         } else if (writeRpcEngine) {
           if (item.taskContinuation
@@ -31624,7 +32271,8 @@ async function flushPending(): Promise<void> {
           // machinery is bypassed. A throw here falls into the catch below and
           // surfaces as a normal submit-failure notice.
           let rpcNativeTurnId: string | undefined;
-          await runAfterAmbiguousSubmissionWrites(writeBackend, async () => {
+          await runAfterAmbiguousSubmissionWrites(writeBackend, () => runScheduledCliInputWrite(
+            item, scheduledWriteIsCurrent, () => {}, async () => {
             // The mutex wait can outlive native completion or another ACK.
             // Exclude this item's own activation lease, but never start/steer
             // across another owner's unresolved transport or hydration phase.
@@ -31660,7 +32308,7 @@ async function flushPending(): Promise<void> {
               rpcTurnIdentity!,
               { onDispatch: prepareNormalWrite },
             )).nativeTurnId;
-          });
+          }, recordScheduledHold));
           // The await may overlap an engine/pane replacement. Fence the captured
           // generation BEFORE touching the global bridge queue; a stale ack must
           // never activate a mark owned by the replacement generation.
@@ -31709,7 +32357,9 @@ async function flushPending(): Promise<void> {
           submissionBackend = writeBackend;
           const transaction = await runAmbiguousSubmissionTransaction(
             writeBackend,
-            () => writeAdapter.writeStructuredInput!(
+            () => runScheduledCliInputWrite(item, scheduledWriteIsCurrent,
+              isScheduledWrite ? prepareNormalWrite : () => {},
+              () => writeAdapter.writeStructuredInput!(
               adapterInputHandle(writeBackend),
               msg,
               item.codexAppInput!,
@@ -31718,9 +32368,9 @@ async function flushPending(): Promise<void> {
                 ...(item.trustedCaller ? { trustedCaller: item.trustedCaller } : {}),
                 ...(item.codexAppSteerable ? { codexAppSteerable: true } : {}),
               },
-            ),
+            ), recordScheduledHold),
             settleVerifiableSubmissionForJournal,
-            prepareNormalWrite,
+            isScheduledWrite ? undefined : prepareNormalWrite,
           );
           result = transaction.result;
           recoveryFailureReason = transaction.recoveryFailureReason;
@@ -31750,7 +32400,9 @@ async function flushPending(): Promise<void> {
           }
           const transaction = await runAmbiguousSubmissionTransaction(
             writeBackend,
-            () => writeAdapter.writeInput(
+            () => runScheduledCliInputWrite(item, scheduledWriteIsCurrent,
+              isScheduledWrite ? prepareNormalWrite : () => {},
+              () => writeAdapter.writeInput(
               adapterInputHandle(writeBackend),
               msg,
               {
@@ -31791,9 +32443,9 @@ async function flushPending(): Promise<void> {
                 ...(item.codexAppSteerable ? { codexAppSteerable: true } : {}),
                 ...(submitGuard ? { submitGuard } : {}),
               },
-            ),
+            ), recordScheduledHold),
             settleVerifiableSubmissionForJournal,
-            (writeAdapter.writeInputDefersPreparation === true || reattachSteerFence)
+            (isScheduledWrite || writeAdapter.writeInputDefersPreparation === true || reattachSteerFence)
               ? undefined : prepareNormalWrite,
           ).finally(() => { traexQuestionDraftWaiting = false; });
           result = transaction.result;
@@ -31836,6 +32488,13 @@ async function flushPending(): Promise<void> {
           scheduleBusyPatternIdleProbe(`${cliName()} post-submit`);
         }
       } catch (err: any) {
+        if (lateScheduledHold && !normalWritePrepared) {
+          if (lateScheduledHold === 'reject') discardUnwrittenScheduledInput(item);
+          else pendingMessages.unshift(item);
+          keepPromptReadyAfterHold();
+          if (lateScheduledHold === 'reject') continue;
+          break;
+        }
         if (reattachSteerWriteRefused && !normalWritePrepared && writeContinuationIsCurrent()) {
           pendingMessages.unshift(item);
           requeueUnsubmittedQueuedActivation(item);
@@ -31851,6 +32510,15 @@ async function flushPending(): Promise<void> {
           requeueUnsubmittedQueuedActivation(item);
           keepPromptReadyAfterHold();
           log('Retained definitely-unwritten input behind the dirty Web terminal wire');
+          break;
+        }
+        if (err instanceof SubmissionWriteError && err.retainPendingInput && writeContinuationIsCurrent()) {
+          if (!pendingMessages.includes(item)) pendingMessages.unshift(item);
+          requeueUnsubmittedQueuedActivation(item);
+          keepPromptReadyAfterHold();
+          if (writeContinuationIsCurrent() && pendingMessages[0] === item) {
+            scheduleFinalTransitionRetry(item, writeContinuationIsCurrent, writeGeneration);
+          }
           break;
         }
         if (err instanceof SubmissionWriteError && err.traexCatalogAdmissionRequired) {
@@ -32636,6 +33304,7 @@ function sendToPty(
   content: string,
   turnId?: string,
   opts: {
+    scheduledRun?: import('./types.js').Session['scheduledRun'];
     queueAfterActiveTurn?: true;
     codexAppInput?: CodexAppTurnInput;
     dispatchAttempt?: number;
@@ -32668,10 +33337,11 @@ function sendToPty(
   // on the terminal boundary instead of letting adapter type-ahead, queue
   // merging, or isolation-off envelope adoption splice tasks together.
   const queueAfterActiveTurn = inputForcesSerialTurn(
-    opts,
+    { ...opts, ...((turnId && parseScheduledTurnId(turnId)) ? { queueAfterActiveTurn: true as const } : {}) },
     activeTurnAuthority.snapshot()?.caller,
   );
   const next: PendingCliInput = {
+    scheduledRun: opts.scheduledRun,
     content,
     turnId,
     // Tag only while the live pane is actually held by capacity. The
@@ -32705,6 +33375,7 @@ function sendToPty(
   };
   if (!initPromptMaterialized) {
     pendingMessages.push(next);
+    coalescePendingScheduledInputs();
     log(`Queued message behind async init materialization (${pendingMessages.length} pending)`);
     return true;
   }
@@ -32714,6 +33385,7 @@ function sendToPty(
   // DISPATCHED.
   if (cliRestartInProgress || !backend) {
     freshnessInputQueue.enqueueNormal(next);
+    coalescePendingScheduledInputs();
     log(`Queued message while CLI backend is restarting (${pendingMessages.length} pending)`);
     return true;
   }
@@ -32748,6 +33420,7 @@ function sendToPty(
   } else {
     freshnessInputQueue.enqueueNormal(next);
   }
+  coalescePendingScheduledInputs();
   // A new user message can REPLACE the running turn on CLIs with no usable
   // steer channel (see CliAdapter.preemptsOnNewMessage). Queue first, then
   // interrupt: the interrupt's async completion must never race the enqueue, or
@@ -36748,7 +37421,7 @@ async function spawnCliBody(
     : cfg.deferredScheduleRun && cliAdapter.findInitialPromptArgSubmission
       ? cliAdapter.captureInitialPromptArgSubmission?.() ?? null
       : null;
-  const deferInitialPrompt = traexAutoModelController?.config.trigger === 'quota' || shouldDeferInitialPromptForStartup({
+  const deferInitialPrompt = shouldDeferScheduledInitialPrompt(cfg) || traexAutoModelController?.config.trigger === 'quota' || shouldDeferInitialPromptForStartup({
     hasStartupCommands: spawnHasStartupWork(cfg.startupCommands, cfg.initialNativeRename),
     adoptMode: cfg.adoptMode === true,
     passesInitialPromptViaArgs: cliAdapter.passesInitialPromptViaArgs === true,
@@ -41537,6 +42210,7 @@ async function spawnCliBody(
     setCaptureIdentity(undefined, undefined);
     currentBotmuxLinkRefMode = undefined;
     queuedTypeAheadTurns = [];
+    if (typeof settledAbsorbedTurnsByKey !== 'undefined') settledAbsorbedTurnsByKey.clear();
     foldedTypeAheadTurn = undefined;
     queuedTurnAdvanceConsumedForPrompt = undefined;
     retiredTurnIds.clear();
@@ -42022,6 +42696,7 @@ function killCli(opts: {
   setCaptureIdentity(undefined, undefined);
   currentBotmuxLinkRefMode = undefined;
   queuedTypeAheadTurns = [];
+  if (typeof settledAbsorbedTurnsByKey !== 'undefined') settledAbsorbedTurnsByKey.clear();
   foldedTypeAheadTurn = undefined;
   queuedTurnAdvanceConsumedForPrompt = undefined;
   retiredTurnIds.clear();
@@ -45747,12 +46422,26 @@ function releaseTerminatedActiveTurnAuthority(): void {
  *  turn that never sees another terminal. Drop the record once its terminal is
  *  out; the tombstone keeps the PID-marker sync from re-adding it. */
 function retireTerminatedQueuedTurn(turnId: string, dispatchAttempt?: number, status?: TurnTerminalStatus): void {
-  if (turnId === currentBotmuxTurnId) return;
-  if (dropQueuedTurnRecord(turnId, dispatchAttempt)) {
+  if (turnId === currentBotmuxTurnId && dispatchAttempt === currentBotmuxDispatchAttempt) return;
+  const settledKey = `${turnId}\0${dispatchAttempt ?? ''}`;
+  const settled = typeof settledAbsorbedTurnsByKey !== 'undefined'
+    ? settledAbsorbedTurnsByKey.get(settledKey)
+    : undefined;
+  // Keep the settled entry even after host/B terminals and worker restarts. It
+  // is both a requeue tombstone and durable reply-addressing evidence; only the
+  // PID marker file's own lifecycle may discard it.
+  const dropped = dropQueuedTurnRecord(turnId, dispatchAttempt);
+  if (dropped || settled) {
     // A completed fold answers the next prompt suggestion, which still shows
     // under the turn owning the screen; a failed write folded nothing.
-    if (status === 'completed') foldedTypeAheadTurn = { turnId, dispatchAttempt, into: currentBotmuxTurnId };
-    writeCliPidMarker();
+    if (status === 'completed'
+      && turnId !== currentBotmuxTurnId
+      && (!settled
+        || (settled.hostTurnId === currentBotmuxTurnId
+          && settled.hostDispatchAttempt === currentBotmuxDispatchAttempt))) {
+      foldedTypeAheadTurn = { turnId, dispatchAttempt, into: currentBotmuxTurnId };
+    }
+    if (typeof writeCliPidMarker === 'function') writeCliPidMarker();
   }
 }
 
@@ -45770,10 +46459,12 @@ function dropQueuedTurnRecord(
     || (queued.dispatchAttempt !== undefined && queued.dispatchAttempt !== dispatchAttempt));
   if (queuedTypeAheadTurns.length === before) return false;
   // A retry of the same turn under another attempt is still live work. Its
-  // sidecar is keyed by turnId, so only the last queued sibling may retire it.
-  const hasLiveSibling = queuedTypeAheadTurns.some(queued => queued.turnId === turnId);
-  if (!hasLiveSibling) send({ type: 'type_ahead_turn_dropped', turnId });
-  if (opts.tombstone !== false && !hasLiveSibling) markTurnRetired(turnId);
+  // sidecar is keyed by turnId, so only the last queued/current sibling may
+  // retire it. A late terminal for attempt N must not kill active attempt N+1.
+  const hasLiveSibling = queuedTypeAheadTurns.some(queued => queued.turnId === turnId)
+    || (currentBotmuxTurnId === turnId && currentBotmuxDispatchAttempt !== dispatchAttempt);
+  if (!hasLiveSibling && typeof send === 'function') send({ type: 'type_ahead_turn_dropped', turnId });
+  if (opts.tombstone !== false && !hasLiveSibling && typeof markTurnRetired === 'function') markTurnRetired(turnId);
   return true;
 }
 
@@ -45802,6 +46493,8 @@ function markerQueuedTurnStillLive(qt: { turnId?: unknown; dispatchAttempt?: unk
   if (typeof qt?.turnId !== 'string' || !qt.turnId) return false;
   if (retiredTurnIds.has(qt.turnId)) return false;
   const dispatchAttempt = typeof qt.dispatchAttempt === 'number' ? qt.dispatchAttempt : undefined;
+  if (typeof settledAbsorbedTurnsByKey !== 'undefined'
+    && settledAbsorbedTurnsByKey.has(`${qt.turnId}\0${dispatchAttempt ?? ''}`)) return false;
   if (turnTerminalEmitted(qt.turnId, dispatchAttempt)) return false;
   if (dispatchAttempt !== undefined && sessionId) {
     const genericStatus = emittedTurnTerminals.statusOf(sessionId, qt.turnId, undefined);
@@ -45995,6 +46688,9 @@ function emitTurnTerminal(
   const hasOtherQueuedTypeAhead = typeof queuedTypeAheadTurns !== 'undefined'
     && Array.isArray(queuedTypeAheadTurns) && queuedTypeAheadTurns.some(q =>
     q.turnId !== turnId
+    && !(q.inputConsumed === true
+      && q.absorbedIntoTurnId === turnId
+      && q.absorbedIntoDispatchAttempt === dispatchAttempt)
     && (typeof turnTerminalEmitted === 'function' ? !turnTerminalEmitted(q.turnId, q.dispatchAttempt) : true));
   const authorityHeldForBackground = typeof backgroundAuthorityHold !== 'undefined'
     && backgroundAuthorityHold.onForegroundTurnTerminal(
@@ -46065,9 +46761,14 @@ function emitTurnTerminal(
   // Publish authority retirement only after terminal acceptance. A stale
   // terminal from a superseded same-principal steer still cannot clear the
   // newer turn's authority, while an IPC failure leaves the exact turn held.
-  if (!releaseActiveTurnAuthority('turn_terminal', { turnId, dispatchAttempt })) {
+  const releasedAuthority = releaseActiveTurnAuthority('turn_terminal', { turnId, dispatchAttempt });
+  if (!releasedAuthority) {
     releaseTerminatedActiveTurnAuthority();
-  } else {
+  }
+  if (releasedAuthority
+    || (!activeTurnAuthority.snapshot()
+      && turnId === currentBotmuxTurnId
+      && dispatchAttempt === currentBotmuxDispatchAttempt)) {
     scheduleConsumedQueuedTurnAdvance();
   }
   retireTerminatedQueuedTurn(turnId, dispatchAttempt, status);
@@ -46245,10 +46946,29 @@ function acknowledgeTurnInputReceived(turnId?: string): void {
  * never because writeInput returned: CoCo and Antigravity's queue mode accept a
  * busy-time Enter but park it until the running turn ends, so a write-time mark
  * would send the running turn's own answer to the still-unread message. */
-function markReplyInputConsumed(turnId: string | undefined): void {
-  const queued = queuedTypeAheadTurns.find(turn => turn.turnId === turnId);
-  if (!queued || queued.inputConsumed) return;
+function markReplyInputConsumed(
+  turnId: string | undefined,
+  dispatchAttempt?: number,
+  absorbedHost?: { hostTurnId: string; hostDispatchAttempt?: number },
+): void {
+  const queued = queuedTypeAheadTurns.find(turn =>
+    turn.turnId === turnId && (dispatchAttempt === undefined || turn.dispatchAttempt === dispatchAttempt));
+  if (!queued) return;
+  const validHostId = absorbedHost?.hostTurnId
+    && (typeof isValidMarkerIdentityTurnId !== 'function' || isValidMarkerIdentityTurnId(absorbedHost.hostTurnId))
+    && absorbedHost.hostTurnId !== queued.turnId
+    ? absorbedHost.hostTurnId
+    : undefined;
+  const validHostAttempt = validHostId ? absorbedHost?.hostDispatchAttempt : undefined;
+  const absorptionChanged = !!validHostId
+    && (queued.absorbedIntoTurnId !== validHostId || queued.absorbedIntoDispatchAttempt !== validHostAttempt);
+  if (queued.inputConsumed && !absorptionChanged) return;
   queued.inputConsumed = true;
+  if (validHostId) {
+    queued.absorbedIntoTurnId = validHostId;
+    if (validHostAttempt !== undefined) queued.absorbedIntoDispatchAttempt = validHostAttempt;
+    else delete queued.absorbedIntoDispatchAttempt;
+  }
   writeCliPidMarker();
   scheduleConsumedQueuedTurnAdvance();
 }
@@ -46263,7 +46983,12 @@ function scheduleConsumedQueuedTurnAdvance(): void {
   queueMicrotask(() => {
     if (activeTurnAuthority.snapshot()) return;
     if (currentBotmuxTurnId && !turnTerminalEmitted(currentBotmuxTurnId, currentBotmuxDispatchAttempt)) return;
-    const next = queuedTypeAheadTurns.find(queued => !turnTerminalEmitted(queued.turnId, queued.dispatchAttempt));
+    const next = queuedTypeAheadTurns.find(queued =>
+      !turnTerminalEmitted(queued.turnId, queued.dispatchAttempt)
+      && !(queued.inputConsumed === true
+        && !!currentBotmuxTurnId
+        && queued.absorbedIntoTurnId === currentBotmuxTurnId
+        && queued.absorbedIntoDispatchAttempt === currentBotmuxDispatchAttempt));
     if (next?.inputConsumed) advanceQueuedTypeAheadTurn('queued_input_consumed');
   });
 }
@@ -46313,6 +47038,7 @@ function acknowledgeNativeInputConsumed(
   nativeSessionId?: string,
   nativeTurnId?: string,
   dispatchAttempt?: number,
+  absorbedHost?: { hostTurnId: string; hostDispatchAttempt?: number },
 ): void {
   if (!turnId) return;
   if (process.env.SESSION_DATA_DIR && sessionId && (nativeSessionId || nativeTurnId)) {
@@ -46323,7 +47049,11 @@ function acknowledgeNativeInputConsumed(
     }
   }
   startupNativeInputSeen = true;
-  markReplyInputConsumed(turnId);
+  if (dispatchAttempt !== undefined || absorbedHost) {
+    markReplyInputConsumed(turnId, dispatchAttempt, absorbedHost);
+  } else {
+    markReplyInputConsumed(turnId);
+  }
   // The CLI has the input in its own history: a crash no longer re-delivers
   // it to a resumed CLI (see InflightInputTracker.onTurnStarted).
   inflightInputs.onTurnStarted(turnId);
@@ -46617,7 +47347,13 @@ function startFailedTurnRewind(
         : pendingMessages.length > 0 || pendingRawInputs.length > 0 ? 'input queued'
           : tuiPromptBlocking ? 'a TUI prompt is open'
             : sessionRenameInFlight() ? 'renaming the session'
-              : durableTurnInFlight || queuedTypeAheadTurns.length > 0 || activeTurnAuthority.snapshot()?.turnId
+              : durableTurnInFlight
+                || queuedTypeAheadTurns.some(q =>
+                  !(q.inputConsumed === true
+                    && !!currentBotmuxTurnId
+                    && q.absorbedIntoTurnId === currentBotmuxTurnId
+                    && q.absorbedIntoDispatchAttempt === currentBotmuxDispatchAttempt))
+                || activeTurnAuthority.snapshot()?.turnId
                 ? 'a turn is running' : undefined,
     directive,
     inspect: path => traexCheckpoint
@@ -47905,6 +48641,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
           // attribution — queue them BEFORE this fork's new prompt while prepared
           // predecessors stay preloaded in the exact final FIFO above.
           pendingMessages.unshift(...recoveredAcceptedInputs, ...predecessorUnsentInputs.splice(0), {
+            scheduledRun: msg.scheduledRun,
             content: lastSpawnQueuedInitialPrompt ?? msg.prompt,
             ...(lastSpawnQueuedInitialPromptLogicalContent
               ? { logicalContent: lastSpawnQueuedInitialPromptLogicalContent }
@@ -47920,7 +48657,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
             vcMeetingImTurnOrigin: msg.vcMeetingImTurnOrigin,
             trustedCaller: msg.trustedCaller,
             trustedController: msg.trustedController,
-            ...(inputForcesSerialTurn({ trustedCaller: msg.trustedCaller })
+            ...((!!(msg.turnId && parseScheduledTurnId(msg.turnId)) || inputForcesSerialTurn({ trustedCaller: msg.trustedCaller }))
               ? { queueAfterActiveTurn: true as const } : {}),
             codexAppInput: msg.promptCodexAppInput,
             // Thread the root's steer authorization so ordered pre-final steer can
@@ -47937,6 +48674,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
             ...(msg.atMostOnce ? { noReplay: true } : {}),
           });
           initialInputCommitted = true;
+          coalescePendingScheduledInputs();
           initialInputQueued = true;
         } else if (isCodexAppCliId(msg.cliId)) {
           pendingMessages.unshift(...recoveredAcceptedInputs);
@@ -48120,7 +48858,10 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
           }
         }
         // No queued opening prompt to keep them behind: they lead the queue.
-        if (predecessorUnsentInputs.length > 0) pendingMessages.unshift(...predecessorUnsentInputs);
+        if (predecessorUnsentInputs.length > 0) {
+          pendingMessages.unshift(...predecessorUnsentInputs);
+          coalescePendingScheduledInputs();
+        }
         // The first turn is now either at queue head or already owned by the
         // argv/RPC startup path. Only now may an early idle edge drain
         // follow-ups that arrived while init was awaiting slow startup work.
@@ -48550,6 +49291,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       }
       if (lastInitConfig?.adoptMode) {
         const item: PendingCliInput = {
+          scheduledRun: msg.scheduledRun,
           content,
           turnId: msg.turnId,
           ...(msg.queueAfterActiveTurn ? { queueAfterActiveTurn: true } : {}),
@@ -48576,6 +49318,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
           // turn whose `botmux send` could sneak its sentAtMs past this
           // turn's markTimeMs and falsely suppress its fallback.
           const inputCommitted = sendToPty(content, msg.turnId, {
+            scheduledRun: msg.scheduledRun,
             ...(effectiveQueueAfterActiveTurn ? { queueAfterActiveTurn: true } : {}),
             codexAppInput,
             dispatchAttempt: msg.dispatchAttempt,
@@ -49685,6 +50428,11 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
 
     case 'absorbed_reply_delivered': {
       noteAbsorbedReplyDelivered(msg.turnId, msg.dispatchAttempt, msg.replyUuid);
+      break;
+    }
+
+    case 'scheduled_input_admitted': {
+      scheduledInputReceipts.get(msg.requestId)?.(msg.decision);
       break;
     }
 

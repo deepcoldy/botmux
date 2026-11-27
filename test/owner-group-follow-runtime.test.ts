@@ -59,6 +59,13 @@ describe('owner follow runtime API boundaries', () => {
     expect(mocks.token.mock.calls.every(call => call[3] === 'ou_owner' && call[0] === 'cli_runtime_probe')).toBe(true);
     expect(store().read()?.entries.oc_new.status).toBe('joined');
   });
+  it('does not invite when a successful chat listing transiently omits an existing group', async () => {
+    owners = ['oc_old', 'oc_stable']; await start();
+    owners = ['oc_stable']; await scan();
+    owners = ['oc_old', 'oc_stable']; await scan();
+    expect(vi.mocked(fetch).mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(0);
+    expect(store().read()?.entries.oc_old).toBeUndefined();
+  });
   it('invites by name or description from the existing list request and filters closed or unrelated alarms', async () => {
     mocks.config.ownerGroupFollow = {
       enabled: true,

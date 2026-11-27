@@ -1245,7 +1245,9 @@ import {
   parseScheduledTurnId,
   trustedCallerForScheduledTask,
 } from './scheduled-turn-provenance.js';
-import { scheduledSessionRun } from './scheduled-send.js';
+import { admitScheduledInput } from './scheduled-input-admission.js';
+import { scheduledSessionRun, scheduledSessionRunWithEvidence, settleScheduledSessionRun } from './scheduled-send.js';
+import { findScheduleRunTrigger } from '../services/schedule-run-log-store.js';
 import { inheritActiveTurnFinalSuppression, isTriggerFinalSuppressed } from './trigger-final-suppression.js';
 import { writeDeferredTopicBinding } from './deferred-topic-binding.js';
 import {
@@ -1553,6 +1555,7 @@ export interface WorkerPoolCallbacks {
    *  scheduled turn runs as. Never backed by schedules.json (agent-writable
    *  inside a sandbox). Absent or undefined → the turn carries no identity. */
   loadScheduledTaskForIdentity?: (larkAppId: string, taskId: string) => ScheduledTask | undefined;
+  loadScheduledTaskForInput?: (larkAppId: string, taskId: string) => ScheduledTask | undefined;
   /** Connector-owned live card for a handoff whose exact input has started. */
   onTriggerTurnStarted?: (ds: DaemonSession, title: string, turnId: string) => void;
   /** Direct Web Terminal submission observed on this session (human intervention). */
@@ -19378,6 +19381,40 @@ function noteAdmittedTurnSilentScheduleState(
   }
 }
 
+function scheduledRunTriggerForWorker(ds: DaemonSession, taskId: string, runId: string): 'scheduler' | 'dashboard' | undefined {
+  return findScheduleRunTrigger(taskId, runId, ds.larkAppId, config.session.dataDir);
+}
+
+function scheduledRunForWorker(ds: DaemonSession, turnId: string | undefined): Session['scheduledRun'] {
+  try {
+    return scheduledSessionRunWithEvidence(ds.session, turnId,
+      (taskId, runId) => scheduledRunTriggerForWorker(ds, taskId, runId));
+  } catch {
+    // The admission IPC re-reads this evidence and retains on errors. Dispatching
+    // the init/message itself must not fail just because legacy history is unreadable.
+    return scheduledSessionRun(ds.session, turnId);
+  }
+}
+
+function scheduledRunsForWorker(ds: DaemonSession): Session['scheduledRuns'] {
+  const turnIds = new Set(Object.keys(ds.session.scheduledRuns ?? {}));
+  if (ds.session.scheduledRun) turnIds.add(ds.session.scheduledRun.turnId);
+  if (turnIds.size === 0) return undefined;
+  return Object.fromEntries([...turnIds].flatMap(turnId => {
+    const run = scheduledRunForWorker(ds, turnId);
+    return run ? [[turnId, run]] : [];
+  }));
+}
+
+function settleScheduledRunBinding(ds: DaemonSession, turnId: string, dispatchAttempt?: number): void {
+  const highWater = ds.turnDispatchAttemptHighWater;
+  if (dispatchAttempt !== undefined && highWater?.turnId === turnId
+    && dispatchAttempt < highWater.dispatchAttempt) return;
+  if (!settleScheduledSessionRun(ds.session, turnId)) return;
+  try { sessionStore.updateSession(ds.session); }
+  catch (error) { logger.warn(`[${tag(ds)}] Failed to persist scheduled run binding settlement: ${String(error)}`); }
+}
+
 /** Finish ordinary-turn recovery bookkeeping only after a fresh Lark turn has
  * crossed its real admission boundary (durable activation tail or worker
  * input). The user turn is already accepted at this point, so persistence
@@ -19935,6 +19972,7 @@ export function sendWorkerInput(
   // while preserving PR #597's accepted-dispatch ledger + reply-context wiring.
   const message: Extract<DaemonToWorker, { type: 'message' }> = {
     type: 'message',
+    scheduledRun: scheduledRunForWorker(ds, effectiveTurnId),
     content: normalized.content,
     ...(failedTurnRewind ? { failedTurnRewind } : {}),
     // A parked (crash-loop stopped) worker respawns the CLI from INSIDE the
@@ -23432,6 +23470,8 @@ function forkWorkerPrepared(
   }
   ds.protectedLoopbackProxyAttestation = protectedLoopbackProxyAttestation;
   initializeWorkerIpcBootstrap(worker);
+  initMsg.scheduledRun = scheduledRunForWorker(ds, initMsg.turnId);
+  initMsg.scheduledRuns = scheduledRunsForWorker(ds);
   rememberScheduledTurnCaller(ds, initAttributionTurnId, initTrustedCaller);
   {
     const initCallerOpenId = turnCallerOpenIdFor(ds, initMsg.turnId);
@@ -26040,6 +26080,7 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored turn_input_rejected from stale worker generation`);
           break;
         }
+        settleScheduledRunBinding(ds, msg.turnId, msg.dispatchAttempt);
         // A pre-admission rejection never ran: release the accepted-input guard
         // for the exact admission attempt it names. Without an attempt it can
         // only prove the un-attempted execution; a later re-accepted attempt
@@ -26084,6 +26125,19 @@ function setupWorkerHandlers(
         // a later terminal GC once no live structure names it (and always on
         // teardown); a small retention lag beats a fail-closed 77 window.
         collectSessionTurnGarbage(ds);
+        break;
+      }
+      case 'admit_scheduled_input': {
+        let decision: import('./scheduled-input-admission.js').ScheduledInputAdmission = 'retain';
+        if (ds.worker === worker && ds.workerGeneration === workerGeneration
+          && ds.session.workerGeneration === workerGeneration) {
+          try {
+            decision = admitScheduledInput(ds.session, ds.larkAppId, msg.turnId, callbacks?.loadScheduledTaskForInput,
+              (taskId, runId) => scheduledRunTriggerForWorker(ds, taskId, runId));
+          }
+          catch (error) { logger.warn(`[${t}] Scheduled input admission unavailable: ${String(error)}`); }
+        }
+        worker.send({ type: 'scheduled_input_admitted', requestId: msg.requestId, decision } satisfies DaemonToWorker);
         break;
       }
       case 'cancel_deployment_continuation': {
@@ -30400,6 +30454,7 @@ function setupWorkerHandlers(
         const obsoleteTerminalAttempt = msg.dispatchAttempt !== undefined
           && terminalHighWater?.turnId === msg.turnId
           && msg.dispatchAttempt < terminalHighWater.dispatchAttempt;
+        if (!obsoleteTerminalAttempt) settleScheduledRunBinding(ds, msg.turnId, msg.dispatchAttempt);
         if ((!ds.currentTurnId || ds.currentTurnId === msg.turnId)
           && (!terminalHighWater || terminalHighWater.turnId !== msg.turnId
             || msg.dispatchAttempt === undefined
@@ -32316,7 +32371,7 @@ function setupWorkerHandlers(
     // Catalog maintenance precedes native spawn, so it cannot require an
     // executor binding. The private child channel, current worker generation,
     // account/config fingerprint and locked policy CAS authorize it instead.
-    if (msg.type === 'traex_model_pool_prune') return handleLegacyWorkerMessage(msg);
+    if (msg.type === 'traex_model_pool_prune' || msg.type === 'admit_scheduled_input') return handleLegacyWorkerMessage(msg);
     // V1 recovery authenticates its frozen offer/token in the existing host
     // store. It cannot acquire executor control from a new worker envelope.
     if (msg.type === 'final_output_offer') return handleLegacyWorkerMessage(msg);
@@ -35466,6 +35521,8 @@ export function forkAdoptWorker(
     const initCallerOpenId = turnCallerOpenIdFor(ds, 'turnId' in initMsg ? initMsg.turnId : undefined);
     if (initCallerOpenId) initMsg = { ...initMsg, turnCallerOpenId: initCallerOpenId };
   }
+  initMsg.scheduledRun = scheduledRunForWorker(ds, initMsg.turnId);
+  initMsg.scheduledRuns = scheduledRunsForWorker(ds);
   // IPC handlers capture the contract at registration time, before the child
   // requests its first runtime reservation (including restored adopt sessions).
   ds.initConfig = initMsg;
