@@ -168,3 +168,31 @@ it('applies selected MIX machine preset, preserves full settings and global floo
   expect(p.control('bytedcli-effective-codebase.mr.create').props['data-identity']).toBe('actor');
  }finally{await p.close();}
 });
+
+it('same-path RPC rules have distinct visible and accessible identities and save only the named rule', async()=>{
+ const ids=['api-test.rpc-call.picko-troubleshoot-ticket','api-test.rpc-call.picko-size-ticket'];
+ const initial=parseTriggerUserAuthConfig({...full,allowSpeakerSwitch:false,bytedcliOperationPolicy:config({...full.bytedcliOperationPolicy!.rules,[ids[0]!]: 'actor',[ids[1]!]: 'actor'})})!;
+ const p=await panel(initial,summary(initial,{[ids[0]!]: 'actor'}));
+ const text=(node:any):string=>typeof node==='string'?node:(node.children??[]).map(text).join(' ');
+ try {
+  const controls=ids.map(id=>{
+   const named=p.renderer.root.findAllByType('select').filter(select=>String(select.props['aria-label']??'').includes(id));
+   expect(named).toHaveLength(1);
+   return named[0]!;
+  });
+  expect(controls[0]!.props['aria-label']).not.toBe(controls[1]!.props['aria-label']);
+  for(const [index,control] of controls.entries()){
+   const row=control.parent!.parent!;
+   expect(row.findAllByType('code').map(code=>text(code))).toContain(ids[index]);
+   expect(text(row)).toContain(index===0?'ecom.market.udc_dump/PickoTroubleShoot/manual_check':'ecom.market.udc_dump/Debug/picko_size');
+   expect(text(row)).toContain('permission ticket required (write)');
+   const description=p.renderer.root.findByProps({id:control.props['aria-describedby']});
+   expect(text(description)).toContain(index===0?'manual_check':'picko_size');
+  }
+  await act(async()=>controls[1]!.props.onChange({currentTarget:{value:'machine'}}));
+  expect(p.requests.at(-1).bytedcliOperationPolicy.rules).toEqual({...initial.bytedcliOperationPolicy!.rules,[ids[1]!]: 'machine'});
+  expect(parseTriggerUserAuthConfig(p.requests.at(-1))).toEqual({...initial,bytedcliOperationPolicy:config({...initial.bytedcliOperationPolicy!.rules,[ids[1]!]: 'machine'})});
+  expect(controls[0]!.props.value).toBe('actor');
+  expect(controls[1]!.props.value).toBe('machine');
+ }finally{await p.close();}
+});

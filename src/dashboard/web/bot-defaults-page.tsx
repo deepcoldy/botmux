@@ -5072,6 +5072,7 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
  */
 export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
+  const policyTableId = useId();
   const { bot, patchBot } = props;
   const policy = bot.triggerUserAuth ?? null;
   const enabled = policy?.enabled === true;
@@ -5232,12 +5233,18 @@ export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: P
               <th key={column} style={{ padding: '8px' }}>{tr(`botDefaults.bytedcliPolicy${column}`)}</th>)}</tr></thead>
             <tbody>{BYTEDCLI_OPERATION_CATALOG.filter(row => row.effect === 'read' || row.effect === 'write').map(row => {
               const effective = policyState === 'ready' ? resolveBytedcliOperationRule(row.id, globalPolicy, policy?.bytedcliOperationPolicy ?? undefined) : undefined;
+              const conditionId = `${policyTableId}-${row.id}-condition`;
               return <tr key={row.id} style={{ borderTop: '1px solid var(--border)' }}>
-                <td style={{ padding: '8px' }}><code>{row.path.join(' ')}</code></td>
+                <td style={{ padding: '8px', width: '48%', whiteSpace: 'normal', overflowWrap: 'anywhere' }}>
+                  <code style={{ display: 'block', whiteSpace: 'normal' }}>{row.id}</code>
+                  <span style={{ display: 'block', marginTop: '4px' }}>{row.path.join(' ')}</span>
+                  {row.condition ? <small id={conditionId} style={{ display: 'block', marginTop: '4px', lineHeight: 1.5 }}>{row.condition}</small> : null}
+                </td>
                 <td data-action={`bytedcli-effect-${row.id}`} data-effect={row.effect}>{tr(`botDefaults.bytedcliPolicyEffect.${row.effect}`)}</td>
                 <td>{policyState === 'ready' ? tr(`botDefaults.bytedcliPolicyRule.${globalPolicy?.rules[row.id] ?? 'inherit'}`) : '—'}</td>
                 <td><select data-action={`bytedcli-policy-${row.id}`} value={policy?.bytedcliOperationPolicy?.rules[row.id] ?? ''}
-                  disabled={busy || policyState !== 'ready'} aria-label={`${tr('botDefaults.bytedcliPolicyOverride')}: ${row.path.join(' ')}`}
+                  disabled={busy || policyState !== 'ready'} aria-label={`${tr('botDefaults.bytedcliPolicyOverride')}: ${row.id}`}
+                  aria-describedby={row.condition ? conditionId : undefined}
                   onChange={event => saveOperationRule(row.id, event.currentTarget.value)}>
                   <option value="">{tr('botDefaults.bytedcliPolicyRule.inherit')}</option>
                   <option value="machine">{tr('botDefaults.bytedcliPolicyRule.machine')}</option>

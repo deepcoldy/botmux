@@ -18,6 +18,8 @@ import {
   TRIGGER_USER_AUTH_TOOLS,
   tokenStoreProtection, credentialSourceOf, delegatesOnMention, dispatchOnlyToolsForTurn } from '../src/services/trigger-user-auth.js';
 import { createDashboardTranslator } from '../src/dashboard/web/i18n.js';
+import { BYTEDCLI_AUDITED_RELEASE, BYTEDCLI_OPERATION_CATALOG_VERSION } from '../src/core/bytedcli-operation-catalog.js';
+import { BYTEDCLI_OPERATION_POLICY_SCHEMA } from '../src/core/bytedcli-operation-policy-config.js';
 
 describe('parseTriggerUserAuthConfig', () => {
   it('preserves valid dormant operation rules in disabled and legacy capability modes', () => {
@@ -26,7 +28,10 @@ describe('parseTriggerUserAuthConfig', () => {
     for (const settings of [{ enabled: false }, { enabled: true, bytecloudExecution: 'trigger-user' },
       { enabled: true, capabilities: ['lark-user'] }, { enabled: true, tools: ['bytedcli'] }]) {
       const config = parseTriggerUserAuthConfig({ ...settings, bytedcliOperationPolicy });
-      expect(config).toHaveProperty('bytedcliOperationPolicy', { ...bytedcliOperationPolicy, schema: 'botmux.bytedcli-operation-policy.v2' });
+      expect(config).toHaveProperty('bytedcliOperationPolicy', {
+        schema: BYTEDCLI_OPERATION_POLICY_SCHEMA, cliVersion: BYTEDCLI_AUDITED_RELEASE,
+        catalogVersion: BYTEDCLI_OPERATION_CATALOG_VERSION, rules: bytedcliOperationPolicy.rules,
+      });
       expect(parseTriggerUserAuthConfig(JSON.parse(JSON.stringify(config)))).toEqual(config);
       expect(parseTriggerUserAuthConfig({ ...config, bytedcliOperationPolicy: null }))
         .not.toHaveProperty('bytedcliOperationPolicy');

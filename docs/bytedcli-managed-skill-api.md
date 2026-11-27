@@ -8,7 +8,7 @@
 
 [完整 JSON](examples/bytedcli-mix-machine-policy.json) 与 Dashboard「应用 MIX 精确机器预设」来自同一纯模块。选定 Picko、release-owner、MIX troubleshooting、C4 的精确签名设为 machine；其他所有已登记业务 read/write 显式 actor，因此已有宿主 machine 也不会把未选写操作提升成机器身份。unknown 仍 actor，不能配置 opaque ID。此场景默认覆盖后，用户仍可单独调整已登记操作的机器例外；宿主明确 actor/deny 始终优先。通用模式本身仍是 read machine / write actor。
 
-Skill 名称仅作来源归档，不能声明权限；同一规范命令被多个 Skill 使用时共享一条规则。Dashboard 在应用前列出全部机器写入例外，并完整保存其他 Bot 配置。截图由真实组件在 Chromium 使用假数据渲染，保留五条代表行，实际保存与宿主上限均已验证；未修改 live 配置。
+Skill 名称仅作来源归档，不能声明权限；同一规范命令被多个 Skill 使用时共享一条规则。Dashboard 在应用前列出全部机器写入例外，并完整保存其他 Bot 配置。截图由真实组件在 Chromium 使用假数据渲染，保留七条代表行（含两个同路径 RPC 的唯一规范 ID 和匹配条件），实际保存与宿主上限均已验证；未修改 live 配置。
 
 ![真实组件假数据验证](assets/bytedcli-read-write-identity/mix-skill-machine-preset.png)
 

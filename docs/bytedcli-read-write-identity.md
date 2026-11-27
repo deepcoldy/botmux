@@ -68,7 +68,7 @@ Bot 使用同一种版本化对象，例如：
 
 命令策略摘要由已有 GET `/api/bots/:app/trigger-user-auth-status` 从实际冻结的宿主 reader 投影，返回版本、全局规则及修订、Bot 规则与最终效果/身份。该摘要不查询个人授权、不开始登录、不返回凭据或原始宿主路径；带 `openId` 的既有个人授权状态查询保留原合同。界面用同一审核 resolver 合成当前 Bot 编辑。宿主无兼容版本化状态时显示不可用并禁止保存命令规则，须更新宿主后刷新；全局配置无效时显示明确错误并拒绝严格调用，仍可关闭模式。点击“刷新宿主规则”获取热更新后的展示状态。
 
-![v2 机器写入例外与宿主 actor 限制，真实 Chromium、临时 HOME 和假数据](assets/bytedcli-read-write-identity/machine-write-exceptions.png)
+![规范 ID 与 RPC 匹配条件、机器写入例外和宿主 actor 限制；真实 Chromium 与假数据](assets/bytedcli-read-write-identity/mix-skill-machine-preset.png)
 
 读取改为执行人身份后，仍按读取额度与结果语义处理，不写业务 intent，不产生写入未知结果；但必须有当前已核验真人的个人授权、正式账号匹配及相应委托/定时任务权限。授权缺失或账号不匹配时拒绝，不退回共享账号。auth/help 不属于业务规则，保留专用个人控制边界；help 同样显示当前有效业务策略，不触发个人授权查询。
 
@@ -90,11 +90,13 @@ bytedcli 的只读边界包括祖先 `node_modules` 搜索路径、兄弟/提升
 
 网络只继承宿主冻结的 `HTTP_PROXY`、`HTTPS_PROXY`、`NO_PROXY` 及对应小写变量。审核版本的原生传输不支持 `ALL_PROXY`/`all_proxy`；配置这些变量会明确标记严格宿主不可用，须改成所支持的 HTTP(S) 代理后重建，不能静默忽略路由。`NODE_EXTRA_CA_CERTS`、`SSL_CERT_FILE`、`SSL_CERT_DIR` 的规范路径、软链目标及祖先同样受保护并核验；无法证明的证书布局拒绝严格执行。以上限制不改变其他 CLI 或旧身份模式的网络合同。
 
-严格包装器不导出 ByteCloud token；独立 `codebase` / `bitscli` / `bits-cli`、git askpass 和 `BOTMUX_AS` 拒绝。独立 Meego、Lark 和旧模式保留原有合同；严格 bytedcli 中未登记的 Meego 子命令仍拒绝。
+严格包装器不导出 ByteCloud token；独立 `codebase` / `bitscli` / `bits-cli`、git askpass 和 `BOTMUX_AS` 拒绝。独立 Meego、Lark 和旧模式保留原有合同；严格 bytedcli 中未登记的 Meego 等业务命令可进入下述 unknown/actor 隔离路径，仍须通过身份、参数和执行边界检查。
 
 ## 当前命令目录
 
-只支持审计过的 bytedcli **0.199.0** 与 **CN**。未知版本、命令、选项、区域或参数组合全部拒绝。下表是实现范围，不是候选清单：
+只支持审计过的 bytedcli **0.199.0** 与 **CN**。未知版本或区域拒绝；已登记操作的非法选项、参数组合也拒绝，不能回退来绕过其合同。认证、安装、插件等控制命令不会作为未知业务执行，个人 auth 仅允许下节的专用适配器。
+
+未登记业务使用 `unknown` 效果和触发者身份，在独立文件系统/PID 隔离内执行，并遵守写入级别的 intent 审计、配额、结果未知与重放限制；不能配置为机器身份，也不能注入凭据或身份覆盖。下表是早期已审计目录的子集；新增精确签名见[业务目录合同](bytedcli-business-command-catalog.md)和[受管 Skill 合同](bytedcli-managed-skill-api.md)，未列在此表不等于一律拒绝：
 
 | 类型 | 命令 |
 | --- | --- |
@@ -105,7 +107,7 @@ bytedcli 的只读边界包括祖先 `node_modules` 搜索路径、兄弟/提升
 
 `bytedcli --help` 返回 JSON 命令目录、别名和允许选项；子命令 help 返回对应子集。业务条目还包含当前 `enabled` 和 `executionIdentity` 投影。目录列出审核支持范围，参数仍由严格解析器验证，不能把“某选项在列表里”理解为任意组合都支持。help/version 不运行 native CLI、不读取个人授权；version 输出 `auditedCliVersion`，表示 broker 合同版本，不声称当前宿主安装已经通过探测。实际业务调用会检查可信绝对路径上的 CLI 版本和文件完整性。
 
-MR 操作须显式提供仓库，不从 Agent cwd 推断。`--body-file` / `-F` 与 stdin 在 Agent 侧读取快照，最多 2 MiB，只把字节传到宿主请求私有目录。交互式 PTY、watch、任意 JSON/raw 请求、输出文件、附件、任意 BITS 更新/发布/删除以及未列出的日志命令不支持。argv 上限 256 项 / 64 KiB，HTTP body 上限 3 MiB，合计输出上限 16 MiB，执行默认 60 秒、最大 120 秒；同时每会话最多 4 个读 / 1 个写，daemon 最多 16 次执行 / 4 个写。
+已登记 MR 操作须显式提供仓库，不从 Agent cwd 推断。`--body-file` / `-F` 与 stdin 在 Agent 侧读取快照，最多 2 MiB，只把字节传到宿主请求私有目录。已登记操作的 JSON/body、附件和文件参数只接受各自审核的形态；不能扩展为任意目标或请求。BITS 更新/发布/删除、日志等业务先匹配当前精确目录，未登记的业务按上述 unknown/actor 路径处理，而非因缺席旧表直接拒绝。执行不提供交互式 PTY，长运行调用同样受限。argv 上限 256 项 / 64 KiB，HTTP body 上限 3 MiB，合计输出上限 16 MiB，执行默认 60 秒、最大 120 秒；同时每会话最多 4 个读 / 1 个写，daemon 最多 16 次执行 / 4 个写。
 
 ## 个人授权命令
 
