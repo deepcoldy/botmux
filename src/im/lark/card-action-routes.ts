@@ -283,6 +283,8 @@ export const SENSITIVE_CARD_ACTIONS: ReadonlyMap<string, SensitiveCardActionMeta
   ['worktree_toggle_mode', NO_META],
   ['retry_last_task', NO_META],
   ['retry_turn', NO_META],
+  ['edit_failed_prompt', NO_META],
+  ['retry_edited_prompt', NO_META],
   // 清理小图并续跑——会注入续跑输入并重载 CLI，等同 restart 级敏感动作。
   ['purge_images_continue', NO_META],
   ['get_write_link', { denyToastKey: 'card.action.write_link_no_permission' }],

@@ -1,3 +1,6 @@
+import { PurgeContinuationLease } from '../../src/services/image-purge-recovery.js';
+import { captureTraexPromptCheckpoint, inspectTraexFailedPrompt, withTraexFailedPrompt } from '../../src/services/traex-prompt-checkpoint.js';
+import { traeSessionsRoot } from '../../src/services/traex-paths.js';
 /**
  * Execute ONE real function or named callback of src/worker.ts against an injected
  * module scope, without importing the worker (its module body installs process
@@ -22,6 +25,7 @@ import { createUsageLimitTracker } from '../../src/utils/usage-limit-tracker.js'
 import { REPLY_DELIVERY_ENV } from '../../src/services/send-completion-hint.js';
 import { automaticScheduledInputTask, coalesceAutomaticScheduledInputs, promoteInteractiveInputPastQuotaSchedules, scheduledRecoveryInputTask } from '../../src/utils/pending-input-queue.js';
 import { parseScheduledTurnId } from '../../src/core/scheduled-turn-provenance.js';
+import { isCriticalInterruptKey } from '../../src/adapters/backend/critical-control-key.js';
 import { removeTakenUnsentInputs } from '../../src/services/unsent-input-journal.js';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { readFileSync, watch as fsWatch } from 'node:fs';
@@ -126,6 +130,7 @@ const FAILED_TURN_REWIND_FUNCTIONS = [
   'waitForRetiringCliQuiescence', 'putBackFailedTurnCut', 'dropStoppedRewindMessage',
   'putBackStoppedRewindCutBeforeWrites', 'restartToPutBackCut', 'settleFailedTurnRewindOffQueue',
   'handOverFailedTurnRewind', 'failedTurnTranscriptScope',
+  'settleSupersededCheckpointRewind',
 ];
 
 /** TraeX question-page wiring the hold / idle paths call into (see
@@ -257,6 +262,7 @@ function defaultScopedWorkerState(scope: Record<string, unknown>, key: string | 
   if (key === 'promoteInteractiveInputPastQuotaSchedules') return promoteInteractiveInputPastQuotaSchedules;
   if (key === 'coalesceAutomaticScheduledInputs') return coalesceAutomaticScheduledInputs;
   if (key === 'parseScheduledTurnId') return parseScheduledTurnId;
+  if (key === 'isCriticalInterruptKey') return isCriticalInterruptKey;
   if (key === 'removeTakenUnsentInputs') return removeTakenUnsentInputs;
   if (key === 'pendingAdoptMessages') return (scope.pendingAdoptMessages ??= []);
   if (key === 'restoredUnsentInputs') return (scope.restoredUnsentInputs ??= new Set());
@@ -461,6 +467,11 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
     if (key === 'rewindableErrorCode') return rewindableErrorCode;
     if (key === 'transcriptTurnFailedWithoutOutput') return transcriptTurnFailedWithoutOutput;
     if (key === 'pruneRewindBackupsBeside') return pruneRewindBackupsBeside;
+    if (key === 'PurgeContinuationLease') return PurgeContinuationLease;
+    if (key === 'captureTraexPromptCheckpoint') return captureTraexPromptCheckpoint;
+    if (key === 'inspectTraexFailedPrompt') return inspectTraexFailedPrompt;
+    if (key === 'withTraexFailedPrompt') return withTraexFailedPrompt;
+    if (key === 'traeSessionsRoot') return traeSessionsRoot;
     if (key === 'rewindBackupDirForSession') return rewindBackupDirForSession;
     if (key === 'registerRewindBackup') return registerRewindBackup;
     if (key === 'readTraexCatalogWithRetry') return readTraexCatalogWithRetry;
