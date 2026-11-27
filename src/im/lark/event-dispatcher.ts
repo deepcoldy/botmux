@@ -110,6 +110,8 @@ import { isSubstituteEnabledForChat } from '../../services/substitute-chat-toggl
 import { oncallPrivateIntakeEnabled } from '../../services/oncall-group-policy.js';
 import { OncallPrivateIntakeStore, privateIntakeDeliveryId, type OncallPrivateIntake } from '../../services/oncall-private-intake.js';
 import { OncallGroupStore } from '../../services/oncall-group-store.js';
+import { evaluatePrivateOncallAccess } from '../../services/oncall-private-access.js';
+import { classifyStreamingCardPostError } from '../../core/streaming-card-post-slot.js';
 import { isP2pForceTopicRoot, recordP2pForceTopicRoot } from '../../services/p2p-force-topic-store.js';
 import { extractListenerMessageText, evaluateMessageListenerWithDocumentTitles, resolveListenerSenderIdentity, buildListenerBotAppIdToOpenId, collectListenerBotAppIds, type MessageListenerMatch } from '../../services/message-listener.js';
 import {
@@ -5178,18 +5180,23 @@ function findPrivateOncallReply(appId: string, message: {
 }
 
 /** Sensitive ingress must reach the private routing gate before any plugin captures it. */
-function hasPrivateOncallIngress(appId: string, data: any): boolean {
+function privateOncallIngressKind(appId: string, data: any): 'group' | 'bound' | 'pending' | undefined {
   const message = data?.message ?? data?.event?.message;
   const chatId = message?.chat_id;
-  if (typeof chatId !== 'string' || !chatId) return false;
+  if (typeof chatId !== 'string' || !chatId) return;
   const owner = (data?.sender ?? data?.event?.sender)?.sender_id?.open_id;
   const store = new OncallPrivateIntakeStore(config.session.dataDir);
   if (message.chat_type !== 'p2p') {
     return data?.__oncallPrivateGroupIngress === true || oncallPrivateIntakeEnabled(getBot(appId).config.oncallGroup, chatId)
-      || !!store.findDelivery(appId, owner, message.message_id);
+      || !!store.findDelivery(appId, owner, message.message_id) ? 'group' : undefined;
   }
-  if (!message.root_id && !message.parent_id) return false;
-  return findPrivateOncallReply(appId, message) !== undefined || store.awaitingReceipt(appId, owner, message.create_time);
+  if (!message.root_id && !message.parent_id) return;
+  if (findPrivateOncallReply(appId, message) !== undefined) return 'bound';
+  return store.awaitingReceipt(appId, owner, message.create_time) ? 'pending' : undefined;
+}
+
+function hasPrivateOncallIngress(appId: string, data: any): boolean {
+  return privateOncallIngressKind(appId, data) !== undefined;
 }
 
 /** Only a bare address gets the prompt. Unknown or non-text nodes belong to the user. */
@@ -6260,7 +6267,8 @@ export function createLarkEventDispatcherRuntime(
             // Persist the privacy decision before the provider can show the DM to the user.
             let binding = intakeStore.beginDelivery(larkAppId, user, messageId);
             if (!binding) {
-              let receipt;
+              let receipt: Awaited<ReturnType<typeof forwardMessageReceipt>>;
+              let uncertainReceipt = false;
               try {
                 const uuid = privateIntakeDeliveryId(larkAppId, messageId);
                 const deadline = { timeoutMs: 15_000, signal: primary?.context.signal };
@@ -6272,8 +6280,30 @@ export function createLarkEventDispatcherRuntime(
                   receipt = await sendUserMessageReceipt(larkAppId, user, '请回复这条消息，补充你的问题。',
                     'text', uuid, deadline, { beforeWrite: beforeIntakeWrite });
                 }
-                if (!receipt.chatId || receipt.chatId === chatId) throw new Error('Missing private chat receipt');
-              } catch {
+                if (!receipt.chatId && receipt.messageId) {
+                  const delivered = await getMessageDetail(larkAppId, receipt.messageId, {
+                    timeoutMs: 15_000, signal: primary?.context.signal, userCardContent: false,
+                  }).catch(() => undefined);
+                  const resolvedChatId = delivered?.items?.find((item: { message_id: string; chat_id?: string }) =>
+                    item.message_id === receipt.messageId)?.chat_id;
+                  if (resolvedChatId && resolvedChatId !== chatId) receipt.chatId = resolvedChatId;
+                }
+                if (!receipt.chatId || receipt.chatId === chatId) {
+                  // A provider success without a usable private chat receipt is
+                  // commit-unknown, never a definite miss. It may already be visible.
+                  intakeStore.markDeliveryUncertain({ appId: larkAppId, ownerOpenId: user, groupMessageId: messageId });
+                  uncertainReceipt = true;
+                  throw new Error('Missing private chat receipt');
+                }
+              } catch (error) {
+                // A definite failure must not leave an owner-wide receipt window
+                // swallowing unrelated DM threads. Keep commit-unknown attempts
+                // pending: their provider identity may still become available.
+                if (uncertainReceipt || classifyStreamingCardPostError(error).mayHaveCommitted) {
+                  intakeStore.markDeliveryUncertain({ appId: larkAppId, ownerOpenId: user, groupMessageId: messageId });
+                } else {
+                  intakeStore.finishDelivery({ appId: larkAppId, ownerOpenId: user, groupMessageId: messageId });
+                }
                 beforeIntakeWrite();
                 await replyMessage(larkAppId, messageId, '暂时无法将这条消息发送到私聊，请联系该群管理员。', 'text', true,
                   privateIntakeDeliveryId(larkAppId, messageId + '-notice'), undefined, { beforeWrite: beforeIntakeWrite }).catch(() => {});
@@ -6286,7 +6316,11 @@ export function createLarkEventDispatcherRuntime(
             }
             beforeIntakeWrite();
             const { rootMessageId: privateRoot, chatId: dmChatId } = binding;
-            if (!mentionOnly && !(question && (question.startsWith('/') || isTopicHeader(parseTopicHeader(question))))) {
+            const unsupportedCommand = question && (question.startsWith('/') || isTopicHeader(parseTopicHeader(question)));
+            if (!mentionOnly && unsupportedCommand) {
+              await replyMessage(larkAppId, privateRoot, '私聊接待暂不支持斜杠命令或话题指令，请直接描述问题。', 'text', false,
+                privateIntakeDeliveryId(larkAppId, messageId + '-command-notice'), undefined, { beforeWrite: beforeIntakeWrite });
+            } else if (!mentionOnly) {
               // Use the delivered copy: attachment keys and mention placeholders are scoped to that message.
               let copy;
               try {
@@ -6328,12 +6362,27 @@ export function createLarkEventDispatcherRuntime(
             && getBot(larkAppId).config.oncallGroup?.chatIds.includes(confirmed.groupChatId)) {
             return { kind: 'retry', reason: 'private Oncall is starting the consultation' };
           }
-          if (confirmed === undefined && intakeStore.awaitingReceipt(larkAppId, intakeOwner, message.create_time)) {
-            if (primary && intakeStore.awaitingReceipt(larkAppId, intakeOwner)) {
-              return { kind: 'retry', reason: 'private Oncall is confirming the DM receipt' };
+          if (confirmed === undefined) {
+            if (intakeStore.awaitingReceipt(larkAppId, intakeOwner, message.create_time)) {
+              if (primary) return { kind: 'retry', reason: 'private Oncall receipt outcome is uncertain' };
+              await replyMessage(larkAppId, messageId, '私聊投递结果待核对，请稍后重试或联系管理员。', 'text', false,
+                privateIntakeDeliveryId(larkAppId, messageId + '-receipt-unknown')).catch(() => {});
+              return;
             }
-            await replyMessage(larkAppId, messageId, '请等私聊接待完成后，再回复对应的咨询消息。', 'text', false).catch(() => {});
-            return;
+            // Once the receipt lane settles without an unresolved delivery, no
+            // exact binding means this is an ordinary DM: offer it to host capture.
+            let captured = false;
+            try {
+              captured = handlers.captureHumanInput?.(data) === true;
+            } catch (error) {
+              if (!primary || !isInputCaptureTerminalRejection(error)) throw error;
+              captured = true;
+            }
+            if (captured) {
+              markMessageTriggered(larkAppId, messageId);
+              return primary ? { kind: 'ignored', reason: 'ordinary DM captured after private receipt miss' } : undefined;
+            }
+            // No capture claimed it; continue through the ordinary DM gates below.
           }
         }
       }
@@ -6821,17 +6870,21 @@ export function createLarkEventDispatcherRuntime(
       if (privateOncallReply === null) return;
       if (privateOncallReply) {
         const group = privateOncallReply.groupChatId;
-        const groupTalk = evaluateTalk(larkAppId, group, senderOpenId, undefined, humanSenderUnionId, 'group');
-        if (senderType !== 'user' || senderOpenId !== privateOncallReply.ownerOpenId
-          || !getBot(larkAppId).config.oncallGroup?.chatIds.includes(group) || !groupTalk.allowed) return;
-        const needsMembership = !isAllowed || groupTalk.reason === 'allowedChatGroup'
-          || groupTalk.reason === 'oncall' || groupTalk.reason === 'chatGrant';
-        if (needsMembership) {
-          const members = await findCurrentChatUserMembers(larkAppId, group, [senderOpenId]).catch(() => new Set<string>());
-          if (!members.has(senderOpenId)) {
+        if (senderType !== 'user' || !senderOpenId) return;
+        const access = await evaluatePrivateOncallAccess(
+          { appId: larkAppId, chatId, privateIntake: privateOncallReply },
+          { openId: senderOpenId, unionId: humanSenderUnionId },
+          {
+            policy: getBot(larkAppId).config.oncallGroup,
+            evaluateTalk,
+            findCurrentChatUserMembers,
+          },
+        );
+        if (!access.allowed) {
+          if (access.reason === 'membership') {
             await replyMessage(larkAppId, messageId, '暂时无法确认咨询权限，请联系原群管理员。', 'text', false).catch(() => {});
-            return;
           }
+          return;
         }
         return await dispatchPrivateConsultation(data, privateOncallReply, primary, () => {
           if (!canTalk(larkAppId, group, senderOpenId, undefined, humanSenderUnionId, 'group')) {
@@ -8505,17 +8558,29 @@ export function createLarkEventDispatcherRuntime(
     // botmux 不消费表情事件，注册显式 no-op 把这条噪声静默掉。
     'im.message.reaction.created_v1': () => {},
     'im.message.reaction.deleted_v1': () => {},
-    'im.message.receive_v1': (rawData: any) => {
+    'im.message.receive_v1': function receiveMessage(rawData: any, privateReceiptSettled = false): any {
       // Redact at the earliest synchronous boundary, before pre-ACK capture or
       // the durable Inbox can persist an alternate raw representation.
-      let data = redactProtectedLarkEvent(rawData, config.session.dataDir);
+      let data = privateReceiptSettled ? rawData : redactProtectedLarkEvent(rawData, config.session.dataDir);
       // The SDK acknowledges when this callback returns. Capture before the
       // ordinary ACK-safe async scheduler, or a crash could lose accepted input.
       // Durable primary is the exception: its callback must first persist the
       // redacted event in Inbox. The claimed consumer performs capture below,
       // so a crash before ACK cannot lose accepted input and a crash after ACK
       // cannot bypass the provider-neutral retry/fencing path.
-      const privateIngress = hasPrivateOncallIngress(larkAppId, data);
+      const privateIngressKind = privateOncallIngressKind(larkAppId, data);
+      const privateIngress = privateIngressKind !== undefined;
+      if (!privateReceiptSettled && !runtimeOptions.enqueuePrimary
+        && privateIngressKind === 'pending' && data?.sender?.sender_type === 'user') {
+        const owner = data.sender.sender_id?.open_id;
+        if (owner?.startsWith('ou_')) {
+          // Do not claim or capture an ambiguous DM before the provider identity
+          // is known. Waiting before ACK lets a crash safely redeliver the event;
+          // the settled receipt then decides between private and ordinary capture.
+          return serializeByAnchor(privateIntakeDeliveryLane(larkAppId, owner), async () => {}, 0)
+            .then(() => receiveMessage(data, true));
+        }
+      }
       if (privateIngress && data?.message?.chat_type !== 'p2p') data = { ...data, __oncallPrivateGroupIngress: true };
       if (!runtimeOptions.enqueuePrimary && !privateIngress && handlers.captureHumanInput?.(data)) {
         if (data?.message?.message_id) markMessageTriggered(larkAppId, data.message.message_id);

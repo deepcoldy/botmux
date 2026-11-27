@@ -8,9 +8,10 @@ import { logger } from '../../utils/logger.js';
 import { OncallGroupStore, oncallSourceEnabled, oncallForwardingPending, pendingOncallMessageIds, type OncallGroupSource } from '../../services/oncall-group-store.js';
 import { nativeFormPolicyFingerprint, oncallGroupEnabled, oncallPrivateIntakeEnabled, type OncallGroupPolicy, type OncallForwardMode } from '../../services/oncall-group-policy.js';
 import { OncallPrivateIntakeStore, privateIntakeDeliveryId } from '../../services/oncall-private-intake.js';
+import { evaluatePrivateOncallAccess } from '../../services/oncall-private-access.js';
 import { coordinationModeIsPrimary } from '../../services/durable-coordination-runtime.js';
 import { createOncallGroup, loadOncallGroupTarget, OncallGroupApiError, ONCALL_GROUP_CREATE_TIMEOUT_MS } from '../../services/oncall-group-client.js';
-import { getMessageDetail, replyMessage } from './client.js';
+import { findCurrentChatUserMembers, getMessageDetail, replyMessage } from './client.js';
 import { createNativeOncallLink, readNativeOncallResultCandidates, readOncallChoices, readOncallGroupResult, readOncallWorkflow, validateOncallSelection } from '../../services/oncall-platform.js';
 import { botmuxOncallFields, serializeBotmuxOncallForm } from '../../services/oncall-custom-form.js';
 import { OncallFormStore, type OncallFormDraft, type OncallNativeSubmissionAttempt } from '../../services/oncall-form-store.js';
@@ -144,6 +145,10 @@ export async function handleOncallGroupAction(data: CardActionData, appId: strin
     || data.operator?.open_id !== source.privateIntake.ownerOpenId)) {
     return oncallError(new Error('仅原提问人可操作这条私聊 Oncall'));
   }
+  if (source?.privateIntake) {
+    try { await assertPrivateOncallCardAccess(source, data.operator!); }
+    catch (error) { return oncallError(error); }
+  }
   if (data.action?.value?.action === 'oncall_group_join') {
     if (!source || (data.context?.open_chat_id && data.context.open_chat_id !== source.chatId)
       || !data.operator?.open_id?.startsWith('ou_') || store.getRequest(source)?.status !== 'succeeded') {
@@ -259,6 +264,7 @@ export async function handleOncallGroupAction(data: CardActionData, appId: strin
         || JSON.stringify(getBot(appId).config.oncallGroup) !== policySnapshot
         || JSON.stringify(loadOncallGroupTarget(config.session.dataDir, appId)) !== JSON.stringify(target)) throw new Error('配置已变更，请重新发起');
       const snapshot = source.sessionId ? await snapshotOncallConversation(source) : undefined;
+      if (source.privateIntake) await assertPrivateOncallCardAccess(source, data.operator);
       if (!oncallSourceEnabled(getBot(appId).config.oncallGroup, source)
         || JSON.stringify(getBot(appId).config.oncallGroup) !== policySnapshot
         || JSON.stringify(loadOncallGroupTarget(config.session.dataDir, appId)) !== JSON.stringify(target)) throw new Error('配置已变更，请重新发起');
@@ -295,6 +301,24 @@ export async function handleOncallGroupAction(data: CardActionData, appId: strin
 function privateOncallSessionId(source: OncallGroupSource, ownerOpenId: string): string {
   return 'oncall-private-' + createHash('sha256')
     .update(JSON.stringify([source.appId, source.chatId, source.sessionId ?? source.questionId, ownerOpenId])).digest('hex');
+}
+
+async function assertPrivateOncallCardAccess(
+  source: OncallGroupSource,
+  operator: NonNullable<CardActionData['operator']>,
+): Promise<void> {
+  if (!source.privateIntake) return;
+  const openId = operator.open_id;
+  if (!openId) throw new Error('暂时无法确认咨询权限，请联系原群管理员。');
+  // Keep one-shot card rendering independent of the event runtime. Card actions
+  // run after daemon initialization, and the module cache makes rechecks cheap.
+  const { evaluateTalk } = await import('./event-dispatcher.js');
+  const access = await evaluatePrivateOncallAccess(
+    { appId: source.appId, chatId: source.chatId, privateIntake: source.privateIntake },
+    { openId, unionId: operator.union_id },
+    { policy: getBot(source.appId).config.oncallGroup, evaluateTalk, findCurrentChatUserMembers },
+  );
+  if (!access.allowed) throw new Error('暂时无法确认咨询权限，请联系原群管理员。');
 }
 
 /** A delivered public card remains a valid entry after switching to private
@@ -345,6 +369,7 @@ async function continueOncallInPrivate(source: OncallGroupSource, operator: NonN
     new OncallPrivateIntakeStore(config.session.dataDir).finishDelivery(current.privateIntake!);
     beforeWrite();
     const request = groups.getRequest(current);
+    if (current.privateIntake) await assertPrivateOncallCardAccess(current, operator);
     if (getBot(source.appId).config.oncallGroup?.flowMode !== 'classify' || (request && request.status !== 'failed')) {
       await refreshOncallSessionCard(current);
     } else await openOncallForm(current, operator);
@@ -434,6 +459,7 @@ async function openOncallForm(source: OncallGroupSource, operator: NonNullable<C
     if (!current.nativeEntry && !current.botmuxFields) await prepareOncallFormSelection(current, username);
     if (JSON.stringify(getBot(source.appId).config.oncallGroup) !== policySnapshot) throw new Error('转人工配置已变更，请重新打开');
     assertOncallFormCurrent(current);
+    await assertPrivateOncallCardAccess(current.source, operator);
     if (current.messageId) {
       if (visibility === 'thread' || current.nativeEntry) await writeOncallFormDraft(current, persist);
       return;
@@ -533,9 +559,10 @@ async function prepareOncallFormSelection(draft: OncallFormDraft, username = dra
 }
 
 function classifiedCardPolicy(policy: OncallGroupPolicy | undefined, draft: OncallFormDraft): boolean {
-  return oncallSourceEnabled(policy, draft.source) && (draft.source.privateIntake
-    ? draft.visibility === 'thread' && draft.ownerOpenId === draft.source.privateIntake.ownerOpenId
-    : policy?.flowMode === 'classify' && policy.formDisplay === (draft.visibility === 'thread' ? 'thread_card' : 'private_card'));
+  return oncallSourceEnabled(policy, draft.source) && policy?.flowMode === 'classify'
+    && (draft.source.privateIntake
+      ? draft.visibility === 'thread' && draft.ownerOpenId === draft.source.privateIntake.ownerOpenId
+      : policy.formDisplay === (draft.visibility === 'thread' ? 'thread_card' : 'private_card'));
 }
 
 async function closeOncallForm(draft: OncallFormDraft, outcome: 'created' | 'failed' | 'cancelled', owns: () => boolean = () => true): Promise<void> {
@@ -682,6 +709,7 @@ export async function handleOncallFormAction(data: CardActionData, appId: string
         return { toast: { type: 'info', content: draft.nativeEntry || draft.nativeFormLink ? '已收起本次入口，平台工单不受影响' : '已取消，尚未提交工单' },
           ...(draft.visibility === 'thread' ? { afterAck: () => refreshOncallFormCard(appId, draft.id, owner) } : {}) };
       }
+      await assertPrivateOncallCardAccess(source, data.operator!);
       if (value.version !== draft.version) {
         if ((draft.visibility === 'thread' || draft.botmuxFields) && Number.isSafeInteger(value.version)
           && value.version < draft.version && draft.messageId) {
@@ -786,6 +814,7 @@ export async function handleOncallFormAction(data: CardActionData, appId: string
         }
         const withdrawAfterAck = botmuxSubmit || !!source.privateIntake;
         const snapshot = await snapshotOncallConversation(source);
+        await assertPrivateOncallCardAccess(source, data.operator!);
         if (JSON.stringify(getBot(appId).config.oncallGroup) !== currentPolicySnapshot
           || JSON.stringify(loadOncallGroupTarget(config.session.dataDir, appId)) !== JSON.stringify(target)) throw new Error('配置已变更，请重新打开表单');
         if (!store.claim(source, owner, snapshot, { target, username, region: draft.region, typeId: draft.typeId, formId: draft.id })) {
@@ -912,6 +941,7 @@ export async function prepareOncallGroupInvite(source: OncallGroupSource, before
   await withFileLock(join(config.session.dataDir, 'oncall-groups', `invite-${groups.handoffKey(source)}`), async () => {
     const request = groups.getRequest(source);
     if (request?.status !== 'succeeded' || !request.openChatId || (source.privateIntake && !request.pendingOriginReplyTo)) return;
+    if (source.privateIntake) await assertPrivateOncallCardAccess(source, { open_id: source.privateIntake.ownerOpenId });
     beforeWrite?.();
     const { getChatInviteLink } = await import('./client.js');
     const inviteLink = request.inviteLink ?? await getChatInviteLink(source.appId, request.openChatId);
@@ -922,6 +952,7 @@ export async function prepareOncallGroupInvite(source: OncallGroupSource, before
       { tag: 'column_set', columns: [buildOncallGroupColumn({ href: inviteLink, status: '进入人工 Oncall 群', joinGroup: true })] },
     ] } });
     try {
+      if (source.privateIntake) await assertPrivateOncallCardAccess(source, { open_id: source.privateIntake.ownerOpenId });
       beforeWrite?.();
       await replyMessage(source.appId, request.pendingOriginReplyTo, card, 'interactive', true,
         privateIntakeDeliveryId(source.appId, `origin-join:${request.openChatId}:${request.pendingOriginReplyTo}`),
@@ -1089,6 +1120,7 @@ export async function forwardOncallConversation(source: OncallGroupSource, owns:
     let request = store.getRequest(source);
     if (!mayForward()) return;
     if (request?.status !== 'succeeded' || !request.openChatId || request.forwardMode === 'none' || request.handoffError === 'restricted_merge') return;
+    if (source.privateIntake) await assertPrivateOncallCardAccess(source, { open_id: source.privateIntake.ownerOpenId });
     const targetChatId = request.openChatId;
     if (request.conversationScopePending) {
       // Repair the short-lived per-question format without losing receipts or
@@ -1124,6 +1156,7 @@ export async function forwardOncallConversation(source: OncallGroupSource, owns:
         store.finish(source, { ...request, forwardingBlocked: true }, request.attemptId);
         break;
       }
+      if (source.privateIntake) await assertPrivateOncallCardAccess(source, { open_id: source.privateIntake.ownerOpenId });
       request = { ...request, forwarding: request.forwarding ?? { messageId: batch[0], messageIds: batch, startedAtMs: Date.now() } };
       store.finish(source, request, request.attemptId);
       // Preserve the existing individual UUID across upgrades and retries.
@@ -1291,6 +1324,7 @@ export async function reconcileNativeOncallSubmissions(appId: string, owns: () =
           });
           assertCurrent(chosen.attempt);
           const { flowId, openChatId } = chosen.result;
+          await assertPrivateOncallCardAccess(draft.source, { open_id: draft.ownerOpenId });
           if (!groups.adoptNativeGroup(draft.source, draft.ownerOpenId, { flowId, openChatId }, snapshot)) return;
           const attemptId = groups.getRequest(draft.source)?.attemptId;
           logger.info(`[oncall-group] Native group matched attempt=${attemptId} sinceHandoffMs=${Date.now() - chosen.result.handoffAtMs} lookupMs=${lookupMs} snapshotMs=${Math.round(performance.now() - lookupStarted) - lookupMs}`);

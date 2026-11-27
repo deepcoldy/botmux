@@ -18,6 +18,8 @@ import { createHmac } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { OncallPrivateIntakeStore } from '../src/services/oncall-private-intake.js';
+import { serializeByAnchor } from '../src/utils/anchor-serializer.js';
 import * as Lark from '@larksuiteoapi/node-sdk';
 
 // ─── Mock external modules ──────────────────────────────────────────────────
@@ -1321,13 +1323,14 @@ describe('strict private Oncall group intake', () => {
     const continued = dmReply('om_funds_racing_follow', 'om_funds_racing_root');
     await deliver(seed);
     expect(mockPrivateForward).toHaveBeenCalledOnce();
-    await deliver(continued);
+    const pendingFollowUp = deliver(continued);
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
     expect(capture).not.toHaveBeenCalled();
     handlers.handleNewTopic.mockImplementationOnce(async () => {
       handlers.isSessionOwner.mockImplementation(anchor => anchor === 'om_funds_racing_root');
     });
     receipt.resolve(textReceipt('om_funds_racing_root', 'first'));
+    await pendingFollowUp;
     await vi.waitFor(() => expect(handlers.handleThreadReply).toHaveBeenCalledOnce());
     for (const handler of [handlers.handleNewTopic, handlers.handleThreadReply]) {
       expect(handler).toHaveBeenCalledExactlyOnceWith(expect.anything(),
@@ -1592,6 +1595,149 @@ describe('strict private Oncall group intake', () => {
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
     expect(mockReplyMessage).toHaveBeenCalledOnce();
     expect(mockReplyMessage.mock.calls[0]?.slice(0, 3)).toEqual([MY_APP_ID, 'om_funds_failure', '暂时无法将这条消息发送到私聊，请联系该群管理员。']);
+  });
+
+  it('does not consume an unrelated parented DM after a private delivery fails', async () => {
+    mockPrivateForward.mockRejectedValueOnce(new Error('forward forbidden'));
+    await deliver(groupAsk('om_funds_failed_unrelated', 'private question'));
+    expect(new OncallPrivateIntakeStore(dataDir).awaitingReceipt(MY_APP_ID, USER_OPEN_ID)).toBe(false);
+    mockReplyMessage.mockClear();
+    const capture = vi.fn(() => true);
+    handlers.captureHumanInput = capture;
+    await deliver(dmReply('om_unrelated_dm_reply', 'om_preexisting_dm_root'));
+    expect(capture).toHaveBeenCalledOnce();
+    expect(mockReplyMessage).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('keeps a landed-but-unconfirmed DM reply out of ordinary capture after a timeout', async () => {
+    mockPrivateForward.mockRejectedValueOnce(new Error('request timeout'));
+    await deliver(groupAsk('om_timeout_private_seed', 'private question'));
+    expect(new OncallPrivateIntakeStore(dataDir).awaitingReceipt(MY_APP_ID, USER_OPEN_ID)).toBe(true);
+    mockReplyMessage.mockClear();
+    const capture = vi.fn(() => true);
+    handlers.captureHumanInput = capture;
+    await deliver(dmReply('om_timeout_dm_reply', 'om_landed_without_receipt'));
+    expect(capture).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(mockReplyMessage).toHaveBeenCalledOnce();
+    expect(mockReplyMessage.mock.calls[0]?.slice(0, 3)).toEqual([MY_APP_ID, 'om_timeout_dm_reply',
+      '私聊投递结果待核对，请稍后重试或联系管理员。']);
+  });
+
+  it('does not erase an earlier timeout when a later retry definitely fails', async () => {
+    mockPrivateForward.mockRejectedValueOnce(new Error('request timeout'))
+      .mockRejectedValueOnce(new Error('forward forbidden'));
+    const seed = groupAsk('om_timeout_then_failed_seed', 'private question');
+    await deliver(seed);
+    await deliver(seed);
+    expect(new OncallPrivateIntakeStore(dataDir).awaitingReceipt(MY_APP_ID, USER_OPEN_ID)).toBe(true);
+    mockReplyMessage.mockClear();
+    const capture = vi.fn(() => true);
+    handlers.captureHumanInput = capture;
+    await deliver(dmReply('om_timeout_then_failed_reply', 'om_landed_without_receipt'));
+    expect(capture).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(mockReplyMessage).toHaveBeenCalledOnce();
+    expect(mockReplyMessage.mock.calls[0]?.slice(0, 3)).toEqual([MY_APP_ID, 'om_timeout_then_failed_reply',
+      '私聊投递结果待核对，请稍后重试或联系管理员。']);
+  });
+
+  it('keeps a missing chat receipt uncertain when the delivered chat cannot be resolved', async () => {
+    mockPrivateForward.mockResolvedValueOnce({ messageId: 'om_landed_without_chat' });
+    mockGetMessageDetail.mockResolvedValueOnce({ items: [] });
+    await deliver(groupAsk('om_missing_chat_seed', 'private question'));
+    expect(new OncallPrivateIntakeStore(dataDir).awaitingReceipt(MY_APP_ID, USER_OPEN_ID)).toBe(true);
+    mockReplyMessage.mockClear();
+    const capture = vi.fn(() => true);
+    handlers.captureHumanInput = capture;
+    await deliver(dmReply('om_missing_chat_reply', 'om_landed_without_chat'));
+    expect(capture).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(mockReplyMessage).toHaveBeenCalledOnce();
+    expect(mockReplyMessage.mock.calls[0]?.slice(0, 3)).toEqual([MY_APP_ID, 'om_missing_chat_reply',
+      '私聊投递结果待核对，请稍后重试或联系管理员。']);
+  });
+
+  it('recovers a private binding from a delivered message when the receipt lacks chatId', async () => {
+    const root = 'om_recovered_private_chat';
+    mockPrivateForward.mockResolvedValueOnce({ messageId: root, messageType: 'text', content: JSON.stringify({ text: 'private question' }) });
+    mockGetMessageDetail.mockResolvedValueOnce({ items: [{ message_id: root, chat_id: dmChatId }] });
+    await deliver(groupAsk('om_recover_chat_seed', 'private question'));
+    expect(handlers.handleNewTopic).toHaveBeenCalledExactlyOnceWith(expect.anything(),
+      expect.objectContaining({ chatId: dmChatId, anchor: root }));
+    expect(new OncallPrivateIntakeStore(dataDir).awaitingReceipt(MY_APP_ID, USER_OPEN_ID)).toBe(false);
+  });
+
+  it('defers an unrelated DM to ordinary capture after an in-flight receipt settles', async () => {
+    const receipt = Promise.withResolvers<ReturnType<typeof textReceipt>>();
+    mockPrivateForward.mockReturnValueOnce(receipt.promise);
+    const capture = vi.fn(() => true);
+    handlers.captureHumanInput = capture;
+    await deliver(groupAsk('om_funds_in_flight_unrelated', 'private question'));
+    const unrelated = dmReply('om_in_flight_unrelated_reply', 'om_preexisting_dm_root');
+    const pendingUnrelated = deliver(unrelated);
+    expect(capture).not.toHaveBeenCalled();
+    receipt.resolve(textReceipt('om_in_flight_private_root', 'private question'));
+    await pendingUnrelated;
+    expect(capture).toHaveBeenCalledExactlyOnceWith(unrelated);
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(mockReplyMessage).not.toHaveBeenCalled();
+  });
+
+  it('keeps durable primary capture out while a receipt is commit-unknown', async () => {
+    const store = new OncallPrivateIntakeStore(dataDir);
+    store.beginDelivery(MY_APP_ID, USER_OPEN_ID, 'om_primary_unknown_group');
+    store.markDeliveryUncertain({ appId: MY_APP_ID, ownerOpenId: USER_OPEN_ID, groupMessageId: 'om_primary_unknown_group' });
+    const capture = vi.fn(() => true);
+    handlers.captureHumanInput = capture;
+    await expect(processPrimary(dmReply('om_primary_unknown_reply', 'om_primary_unrelated_root')))
+      .resolves.toMatchObject({ kind: 'retry' });
+    expect(capture).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('captures an ordinary DM after a durable primary delivery settles without binding', async () => {
+    const store = new OncallPrivateIntakeStore(dataDir);
+    const delivery = { appId: MY_APP_ID, ownerOpenId: USER_OPEN_ID, groupMessageId: 'om_primary_settled_group' };
+    store.beginDelivery(delivery.appId, delivery.ownerOpenId, delivery.groupMessageId);
+    const receiptSpy = vi.spyOn(OncallPrivateIntakeStore.prototype, 'awaitingReceipt');
+    const gate = Promise.withResolvers<void>();
+    const lane = `oncall-private-intake:${MY_APP_ID}:${USER_OPEN_ID}`;
+    const laneTask = serializeByAnchor(lane, () => gate.promise, 0);
+    const capture = vi.fn(() => true);
+    handlers.captureHumanInput = capture;
+    const data = dmReply('om_primary_receipt_miss', 'om_primary_unrelated_root');
+    try {
+      const processed = processPrimary(data);
+      await vi.waitFor(() => expect(receiptSpy.mock.calls.length).toBeGreaterThanOrEqual(2));
+      store.finishDelivery(delivery);
+      gate.resolve();
+      await laneTask;
+      await expect(processed).resolves.toMatchObject({ kind: 'ignored' });
+      expect(capture).toHaveBeenCalledExactlyOnceWith(data);
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+      expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    } finally {
+      gate.resolve();
+      receiptSpy.mockRestore();
+    }
+  });
+
+  it.each(['/help', '/t separate topic'])('explains unsupported %s instead of silently completing it', async command => {
+    const kind = command === '/help' ? 'help' : 'topic';
+    mockPrivateForward.mockResolvedValueOnce(textReceipt(`om_private_${kind}_root`, command));
+    await deliver(groupAsk(`om_private_${kind}_source`, command));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(mockReplyMessage).toHaveBeenCalledOnce();
+    expect(mockReplyMessage.mock.calls[0]?.slice(0, 3)).toEqual([MY_APP_ID, `om_private_${kind}_root`,
+      '私聊接待暂不支持斜杠命令或话题指令，请直接描述问题。']);
   });
 });
 

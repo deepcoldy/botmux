@@ -375,6 +375,7 @@ import { removeSessionMcpGatewayDir } from './plugins/mcp/socket-dir.js';
 import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from '../services/feedback-policy-resolver.js';
 import { materializeFeedbackPolicyForDelivery } from '../services/feedback-reviewer-delivery.js';
 import { attachOncallGroupButton, recordOncallGroupDelivery, prepareNativeOncallCard } from '../im/lark/oncall-group.js';
+import { OncallPrivateIntakeStore } from '../services/oncall-private-intake.js';
 import { attachWorkflowSidebarEntry, workflowNodeSessionEntry } from '../im/lark/workflow-sidebar-entry.js';
 import { resolveWorkflowEntryLink } from './workflow-entry-link.js';
 import { beginFinalOutputDelivery, onFinalOutputDeliverySettled, waitForTurnFinalOutputDeliveryDrain } from './final-output-delivery-drain.js';
@@ -34399,10 +34400,13 @@ function deliverFinalOutput(
           content: tr('card.turn_failed.field_error', { errorCode: `\`${msg.turnFailureCode}\`` }, localeForBot(ds.larkAppId)) });
         cardJson = JSON.stringify(failedCard);
       }
+      const privateIntake = !managedReceiver && ds.chatType === 'p2p'
+        ? new OncallPrivateIntakeStore(config.session.dataDir).find(ds.larkAppId, ds.chatId, sessionAnchorId(ds))
+        : undefined;
       const nativeLink = !managedReceiver ? await prepareNativeOncallCard(ds.larkAppId, ds.chatId, msg.replyTurnId ?? msg.turnId, ds.session.sessionId) : undefined;
       if (!managedReceiver) {
         cardJson = attachOncallGroupButton(cardJson, getBot(ds.larkAppId).config.oncallGroup, ds.chatId, ds.chatType, {
-          appId: ds.larkAppId, sessionId: ds.session.sessionId, questionId: msg.replyTurnId ?? msg.turnId, phase: 'final', nativeLink,
+          appId: ds.larkAppId, sessionId: ds.session.sessionId, questionId: msg.replyTurnId ?? msg.turnId, phase: 'final', nativeLink, privateIntake,
         });
       }
       // §11 / §5.5: a node session's replies carry the run's「工作流 ›」entry
@@ -34670,7 +34674,8 @@ function deliverFinalOutput(
         recordOncallGroupDelivery(config.session.dataDir, {
           appId: ds.larkAppId, chatId: ds.chatId, messageId, sessionId: ds.session.sessionId, rootId: sessionAnchorId(ds),
           questionId: msg.replyTurnId ?? msg.turnId,
-          answer: explicit?.finalText ?? safeAssistantText, card: JSON.parse(explicit?.finalCard ?? cardJson), nativeLink,
+          answer: privateIntake ? '' : explicit?.finalText ?? safeAssistantText,
+          card: JSON.parse(explicit?.finalCard ?? cardJson), nativeLink, privateIntake,
         });
       }
       if (msg.turnId.startsWith('mlrp_turn_')) {

@@ -9,14 +9,17 @@ const mocks = vi.hoisted(() => ({
   identityRequest: vi.fn(),
   bot: { config: { brand: 'feishu', oncallGroup: {} as any } },
   userReceipt: vi.fn(), invite: vi.fn(), reply: vi.fn(), update: vi.fn(), withdraw: vi.fn(), membership: vi.fn(), mode: vi.fn(), ephemeral: vi.fn(), remove: vi.fn(), sender: vi.fn(), detail: vi.fn(), forward: vi.fn(), merge: vi.fn(), thread: vi.fn(), chat: vi.fn(),
+  sourceMembers: vi.fn(), evaluateTalk: vi.fn(),
 }));
 vi.mock('../src/im/lark/md-card.js', () => ({ omitReplyCardImages: (card: string) => card }));
 vi.mock('../src/config.js', () => ({ config: mocks.config }));
 vi.mock('../src/bot-registry.js', () => ({ getBot: () => mocks.bot }));
+vi.mock('../src/im/lark/event-dispatcher.js', () => ({ evaluateTalk: mocks.evaluateTalk }));
 vi.mock('../src/im/lark/client.js', () => ({ getChatInviteLink: mocks.invite, getChatModeStrict: mocks.mode, sendEphemeralCard: mocks.ephemeral,
   sendUserMessageReceipt: mocks.userReceipt,
   deleteEphemeralCard: mocks.remove, deleteMessage: mocks.withdraw, replyMessage: mocks.reply, updateMessage: mocks.update, resolveSender: mocks.sender, getMessageDetail: mocks.detail,
-  forwardMessage: mocks.forward, mergeForwardMessages: mocks.merge, isBotInChat: mocks.membership, listThreadMessagesWithContext: mocks.thread, listChatMessagesUntil: mocks.chat }));
+  forwardMessage: mocks.forward, mergeForwardMessages: mocks.merge, isBotInChat: mocks.membership, listThreadMessagesWithContext: mocks.thread, listChatMessagesUntil: mocks.chat,
+  findCurrentChatUserMembers: mocks.sourceMembers }));
 vi.mock('../src/im/lark/identity-cache.js', () => ({ resolveSender: mocks.sender }));
 import { attachOncallGroupButton, recordOncallGroupDelivery, handleOncallGroupAction, handleOncallFormAction, snapshotOncallConversation, forwardOncallConversation, reconcileOncallReplyCard, retryPendingOncallHandoffs, refreshOncallSessionCard, prepareOncallGroupInvite } from '../src/im/lark/oncall-group.js';
 import { OncallGroupStore, type OncallGroupSource } from '../src/services/oncall-group-store.js';
@@ -43,6 +46,10 @@ beforeEach(() => {
   mocks.reply.mockResolvedValue('om_public'); mocks.update.mockResolvedValue(undefined); mocks.remove.mockResolvedValue(true); mocks.forward.mockResolvedValue('om_forwarded');
   mocks.withdraw.mockResolvedValue(true);
   mocks.userReceipt.mockReset().mockResolvedValue({ messageId: 'om_dm_entry', chatId: 'oc_dm' });
+  mocks.sourceMembers.mockReset().mockResolvedValue(new Set(['ou_owner', 'ou_other']));
+  mocks.evaluateTalk.mockReset().mockImplementation((_appId: string, _chatId: string, _openId: string,
+    _senderUnionId: undefined, _memberUnionId: string | undefined, chatType: 'group' | 'p2p') =>
+    chatType === 'group' ? { allowed: true, reason: 'oncall' } : { allowed: false, reason: 'none' });
   writeFileSync(join(dir, 'oncall-group-targets.json'), JSON.stringify({ app: { endpoint: 'https://oncall.example.test/api/inf/v1/chat/', tenantId: 12, typeId: 999, region: 'legacy', emailDomain: 'example.test' } }));
   const store = new OncallGroupStore(dir); store.registerTurn('app', 'session', source.questionId); store.recordSource({ ...source, cardJson: JSON.stringify({ schema: '2.0', body: { elements: [] } }) });
   vi.stubEnv('ONCALL_SERVICE_SECRET', 'secret'); fetcher = vi.fn().mockImplementation(async (url: string) => response(url.includes('/workflow/') ? { tenant_id: 12, type_id: 34, config: '[]' } : { region: { cn: [category] } })); vi.stubGlobal('fetch', fetcher);
@@ -401,6 +408,22 @@ describe('private Oncall intake', () => {
     expect(groups.pendingHandoffs('app')).toEqual([]);
   });
 
+  it('withholds configured private forwarding and the origin invitation after source access is revoked', async () => {
+    const { dm, groups } = setupPrivateIntake();
+    groups.adoptNativeGroup(dm, 'ou_owner', { flowId: '123', openChatId: 'oc_created' },
+      { cutoffMs: Date.now(), messageIds: [dm.questionId], forwardMode: 'individual' });
+    mocks.sourceMembers.mockResolvedValue(new Set());
+    await expect(prepareOncallGroupInvite(dm)).rejects.toThrow('暂时无法确认咨询权限');
+    await expect(forwardOncallConversation(dm)).rejects.toThrow('暂时无法确认咨询权限');
+    expect(mocks.invite).not.toHaveBeenCalled();
+    expect(mocks.reply).not.toHaveBeenCalled();
+    expect(mocks.forward).not.toHaveBeenCalled();
+    expect(mocks.merge).not.toHaveBeenCalled();
+    expect(groups.getRequest(dm)).toMatchObject({ pendingOriginReplyTo: 'om_public_question', messageIdsSnapshot: [dm.questionId] });
+    expect(groups.getRequest(dm)?.forwarded).toBeUndefined();
+    expect(groups.getRequest(dm)?.forwarding).toBeUndefined();
+  });
+
   it('opens a blank native form and saves the configured handoff for complex private categories', async () => {
     const { act } = setupPrivateIntake();
     const sidebar = new URL('https://oncall.example.test/chat?tenant=12');
@@ -433,6 +456,71 @@ describe('private Oncall intake', () => {
     expect((await handleOncallGroupAction(act('oncall_group_create', undefined, 'ou_other'), 'app')).toast.type).toBe('error');
     expect(mocks.reply).toHaveBeenCalledTimes(1);
     expect(mocks.detail).not.toHaveBeenCalled(); expect(mocks.userReceipt).not.toHaveBeenCalled();
+  });
+
+  it.each(['removed', 'lookup_failed'] as const)('rejects direct private creation when source membership is %s', async reason => {
+    const { act } = setupPrivateIntake();
+    mocks.bot.config.oncallGroup.flowMode = 'direct';
+    mocks.bot.config.oncallGroup.forwardMode = 'none';
+    if (reason === 'removed') mocks.sourceMembers.mockResolvedValue(new Set());
+    else mocks.sourceMembers.mockRejectedValue(new Error('roster unavailable'));
+    const result = await handleOncallGroupAction(act('oncall_group_create'), 'app');
+    expect(result.toast).toMatchObject({ type: 'error', content: '暂时无法确认咨询权限，请联系原群管理员。' });
+    expect(fetcher.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(0);
+  });
+
+  it('rejects a private form submission after source-group membership is revoked', async () => {
+    const { act } = setupPrivateIntake();
+    mocks.bot.config.oncallGroup.forwardMode = 'none';
+    await handleOncallGroupAction(act('oncall_group_create'), 'app');
+    const card = JSON.parse(mocks.reply.mock.calls[0]![2]);
+    const current = card.body.elements.at(-1).columns[0].elements[0].behaviors[0].value;
+    mocks.sourceMembers.mockResolvedValue(new Set());
+    const submit = act('oncall_group_form_botmux_submit', { id: current.draftId, version: current.version, messageId: 'om_public' });
+    submit.action.form_value = {};
+    const result = await handleOncallFormAction(submit, 'app');
+    expect(result.toast).toMatchObject({ type: 'error', content: '暂时无法确认咨询权限，请联系原群管理员。' });
+    expect(fetcher.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(0);
+  });
+
+  it('rechecks source membership immediately before direct creation', async () => {
+    const { act } = setupPrivateIntake();
+    mocks.bot.config.oncallGroup.flowMode = 'direct';
+    mocks.bot.config.oncallGroup.forwardMode = 'none';
+    mocks.sourceMembers.mockResolvedValueOnce(new Set(['ou_owner'])).mockResolvedValueOnce(new Set());
+    const result = await handleOncallGroupAction(act('oncall_group_create'), 'app');
+    expect(result.toast).toMatchObject({ type: 'error', content: '暂时无法确认咨询权限，请联系原群管理员。' });
+    expect(mocks.sourceMembers).toHaveBeenCalledTimes(2);
+    expect(fetcher.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(0);
+  });
+
+  it('rechecks source membership after a private form selection settles', async () => {
+    const { act } = setupPrivateIntake();
+    mocks.bot.config.oncallGroup.forwardMode = 'none';
+    await handleOncallGroupAction(act('oncall_group_create'), 'app');
+    const card = JSON.parse(mocks.reply.mock.calls[0]![2]);
+    const current = card.body.elements.at(-1).columns[0].elements[0].behaviors[0].value;
+    mocks.sourceMembers.mockReset().mockResolvedValueOnce(new Set(['ou_owner'])).mockResolvedValueOnce(new Set());
+    const submit = act('oncall_group_form_botmux_submit', { id: current.draftId, version: current.version, messageId: 'om_public' });
+    submit.action.form_value = {};
+    const result = await handleOncallFormAction(submit, 'app');
+    expect(result.toast).toMatchObject({ type: 'error', content: '暂时无法确认咨询权限，请联系原群管理员。' });
+    expect(mocks.sourceMembers).toHaveBeenCalledTimes(2);
+    expect(fetcher.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(0);
+  });
+
+  it('retires a private classification form when classify mode changes to direct', async () => {
+    const { act } = setupPrivateIntake();
+    mocks.bot.config.oncallGroup.forwardMode = 'none';
+    await handleOncallGroupAction(act('oncall_group_create'), 'app');
+    const card = JSON.parse(mocks.reply.mock.calls[0]![2]);
+    const current = card.body.elements.at(-1).columns[0].elements[0].behaviors[0].value;
+    mocks.bot.config.oncallGroup.flowMode = 'direct';
+    const submit = act('oncall_group_form_botmux_submit', { id: current.draftId, version: current.version, messageId: 'om_public' });
+    submit.action.form_value = {};
+    const result = await handleOncallFormAction(submit, 'app');
+    expect(result.toast).toMatchObject({ type: 'error', content: '转人工配置已变更，请重新打开入口' });
+    expect(fetcher.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(0);
   });
 
 });

@@ -21,6 +21,8 @@ interface IntakeDelivery {
   groupMessageId: string;
   startedAtMs: number;
   binding?: OncallPrivateIntake;
+  /** The provider may already have delivered the DM, but its receipt is not safely bound. */
+  uncertain?: boolean;
   finished?: boolean;
 }
 
@@ -76,7 +78,7 @@ export class OncallPrivateIntakeStore {
     const now = Date.now();
     const receivedAt = Number(messageCreatedAt) || now;
     return this.read<IntakeDelivery>(this.deliveryPath(appId, ownerOpenId)).some(item =>
-      !item.binding && (now < item.startedAtMs + RECEIPT_WAIT_MS
+      !item.binding && !item.finished && (item.uncertain || now < item.startedAtMs + RECEIPT_WAIT_MS
         || (receivedAt >= item.startedAtMs && receivedAt < item.startedAtMs + RECEIPT_WAIT_MS)));
   }
 
@@ -84,7 +86,8 @@ export class OncallPrivateIntakeStore {
     return this.update<IntakeDelivery, OncallPrivateIntake | undefined>(this.deliveryPath(appId, ownerOpenId), rows => {
       const existing = rows.find(item => item.groupMessageId === groupMessageId);
       if (existing) {
-        if (!existing.finished) existing.startedAtMs = Date.now();
+        if (!existing.finished || !existing.binding) existing.startedAtMs = Date.now();
+        if (!existing.binding) existing.finished = false;
         return existing.binding;
       }
       rows.push({ groupMessageId, startedAtMs: Date.now() });
@@ -117,10 +120,20 @@ export class OncallPrivateIntakeStore {
     return verified;
   }
 
-  finishDelivery(binding: OncallPrivateIntake): void {
-    this.update<IntakeDelivery, void>(this.deliveryPath(binding.appId, binding.ownerOpenId), rows => {
-      const delivery = rows.find(item => item.groupMessageId === binding.groupMessageId);
-      if (delivery?.binding) delivery.finished = true;
+  finishDelivery(delivery: Pick<OncallPrivateIntake, 'appId' | 'ownerOpenId' | 'groupMessageId'>): void {
+    this.update<IntakeDelivery, void>(this.deliveryPath(delivery.appId, delivery.ownerOpenId), rows => {
+      const existing = rows.find(item => item.groupMessageId === delivery.groupMessageId);
+      // A later definite failure cannot disprove an earlier commit-unknown.
+      // Only a trusted provider binding may settle that history; an explicit
+      // reconciliation entrypoint must not silently reuse this ordinary finish.
+      if (existing && (!existing.uncertain || existing.binding)) existing.finished = true;
+    });
+  }
+
+  markDeliveryUncertain(delivery: Pick<OncallPrivateIntake, 'appId' | 'ownerOpenId' | 'groupMessageId'>): void {
+    this.update<IntakeDelivery, void>(this.deliveryPath(delivery.appId, delivery.ownerOpenId), rows => {
+      const existing = rows.find(item => item.groupMessageId === delivery.groupMessageId);
+      if (existing && !existing.binding) existing.uncertain = true;
     });
   }
 
