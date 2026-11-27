@@ -99,12 +99,15 @@ export function programStatusEnabledForLaunch(
   return cliVersionAtLeast(launch.cliVersion, min);
 }
 
-/** Apply `adapter.spawnEnv` onto `childEnv` and return the keys written.
+/** Apply `adapter.spawnEnv` onto `childEnv` and return the keys the caller
+ *  should protect from a downstream `envUnset` removal.
  *  For Antigravity's OSC 7501 vars, skip injection when OSC 7501 is disabled
  *  for this launch (old/unknown version, adopt, or explicit `off`) and preserve
  *  any explicit value already set in `botEnv` (even empty, which `injectEnv`
- *  would apply after `childEnv`) or any non-empty value already in `childEnv`.
- *  All other adapters keep direct `Object.assign` semantics unchanged. */
+ *  would apply after `childEnv`) or any non-empty value already in `childEnv`;
+ *  the returned keys are exactly the OSC 7501 defaults injected this call.
+ *  All other adapters keep direct `Object.assign` semantics and return no keys,
+ *  so their spawnEnv defaults remain subject to the configured `envUnset`. */
 export function applyAdapterSpawnEnv(
   childEnv: NodeJS.ProcessEnv,
   adapter: Pick<CliAdapter, 'id' | 'spawnEnv'>,
@@ -116,7 +119,13 @@ export function applyAdapterSpawnEnv(
   if (!adapter.spawnEnv) return [];
   if (adapter.id !== 'antigravity') {
     Object.assign(childEnv, adapter.spawnEnv);
-    return Object.keys(adapter.spawnEnv);
+    // Return no applied keys: the envUnset filter below exists solely to protect
+    // Antigravity's OSC 7501 defaults (injected only when the protocol is on).
+    // Other adapters' spawnEnv defaults must stay removable by a configured
+    // `envUnset` on pty / strict / herdr, exactly as the pre-OSC-7501 direct
+    // Object.assign wiring behaved. Returning these keys would silently exempt
+    // them from the user's removal list (a cross-CLI config regression).
+    return [];
   }
   const applied: string[] = [];
   for (const [key, value] of Object.entries(adapter.spawnEnv)) {
@@ -167,6 +176,36 @@ export function shouldDeferAntigravityQuietFinalForProgramStatus(
   if (!input.heldWorking) return false;
   return input.programStatusQuietMs < input.staleQuietMs
     || input.candidateAgeMs < input.staleQuietMs;
+}
+
+export interface AntigravityQuietFlushIdleInput {
+  /** This ingest explicitly emitted the held candidate's `assistant_final`. */
+  flushedCandidateFinal: boolean;
+  /** OSC 7501 still holds a (non-blocked) `working` record. */
+  heldWorking: boolean;
+  /** A background command / subagent the turn is waiting on remains open. */
+  hasPendingTasks: boolean;
+  /** A started turn with no terminal yet is still live in the bridge queue. */
+  hasActiveStartedTurn: boolean;
+}
+
+/** Decide whether a quiet-tick trailing-final flush may release a stale OSC
+ *  7501 `working` hold via `fireIdle()`. All four facts are gathered by the
+ *  worker from the real drainer events and bridge queue; extracting the boolean
+ *  keeps the decision testable without the worker's closure.
+ *
+ *  `flushedCandidateFinal` is the load-bearing guard: between arming the quiet
+ *  candidate and this tick a concurrent tool call or follow-up USER_INPUT can
+ *  clear `provisionalFinal`, so the ingest may emit no matching `assistant_final`
+ *  (or a `turn_aborted` with a different uuid). Releasing the hold then would
+ *  end a still-active turn. A newly started successor turn likewise vetoes. */
+export function shouldFireIdleAfterAntigravityQuietFlush(
+  input: AntigravityQuietFlushIdleInput,
+): boolean {
+  return input.flushedCandidateFinal
+    && input.heldWorking
+    && !input.hasPendingTasks
+    && !input.hasActiveStartedTurn;
 }
 
 export interface ProgramStatusLeaseRefreshInput {

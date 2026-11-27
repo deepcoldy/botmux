@@ -848,6 +848,7 @@ import {
   programStatusEnabledForLaunch,
   refreshStructuredPreStartLeaseFromProgramStatus,
   shouldDeferAntigravityQuietFinalForProgramStatus,
+  shouldFireIdleAfterAntigravityQuietFlush,
   startupIdleReportScreenAdmits,
 } from './core/program-status-gate.js';
 import { shouldFenceTraexStartupInput, traexStartupInputReady } from './core/traex-startup-input.js';
@@ -20322,13 +20323,13 @@ function maybeFlushAntigravityTrailingFinalOnQuietTick(): void {
   // the held candidate as `assistant_final` AND left neither pending background
   // tasks nor an active started turn (a concurrent tool call or follow-up
   // USER_INPUT can clear `provisionalFinal` without ending the live turn).
-  if (
-    flushedCandidateFinal
-    && idleDetector?.programStatusHeldWorking()
-    && !hasAntigravityPendingTasks(antigravityBridgeState())
-    && !codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined)
-  ) {
-    idleDetector.fireIdle();
+  if (shouldFireIdleAfterAntigravityQuietFlush({
+    flushedCandidateFinal,
+    heldWorking: idleDetector?.programStatusHeldWorking() === true,
+    hasPendingTasks: hasAntigravityPendingTasks(antigravityBridgeState()),
+    hasActiveStartedTurn: codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined),
+  })) {
+    idleDetector?.fireIdle();
   }
   // A surviving pane can already be idle when a replacement worker attaches.
   // The viewport just confirmed completion, even without a new ready edge.

@@ -7,6 +7,10 @@ import { createAntigravityAcpAdapter } from '../src/adapters/cli/antigravity-acp
 import { buildBotmuxEnvAssignments } from '../src/adapters/backend/tmux-backend.js';
 import { ptyChildEnv } from '../src/adapters/backend/pty-backend.js';
 import { strictPaneEnvArgs } from '../src/adapters/backend/strict-env.js';
+import { buildHerdrFinalCommand } from '../src/adapters/backend/herdr-backend.js';
+import { createKimiAdapter } from '../src/adapters/cli/kimi.js';
+import { createEbsdAdapter } from '../src/adapters/cli/ebsd.js';
+import { createDoubaoAdapter } from '../src/adapters/cli/doubao.js';
 import {
   ANTIGRAVITY_OSC7501_ENV_KEY,
   ANTIGRAVITY_OSC7501_MESSAGES_ENV_KEY,
@@ -19,6 +23,7 @@ import {
   programStatusEnabledForLaunch,
   refreshStructuredPreStartLeaseFromProgramStatus,
   shouldDeferAntigravityQuietFinalForProgramStatus,
+  shouldFireIdleAfterAntigravityQuietFlush,
 } from '../src/core/program-status-gate.js';
 import {
   BOTMUX_INJECTED_ENV_KEYS,
@@ -595,5 +600,135 @@ describe('OSC 7501 busy-driven bounded pre-start lease refresh (Antigravity)', (
       })).toBe(0);
       expect(queue.peek()[1]!.submitConfirmedAtMs).toBe(2_000);
     }
+  });
+});
+
+describe('Non-Antigravity spawnEnv stays removable by envUnset (cross-CLI regression guard)', () => {
+  // These adapters predate OSC 7501. Their spawnEnv defaults were always
+  // subject to a configured `envUnset`; applyAdapterSpawnEnv must not report
+  // them as adapter-injected keys that filterAppliedAdapterEnvUnset would
+  // exempt from removal.
+  const NON_AGY = [
+    { name: 'kimi', make: () => createKimiAdapter('/bin/kimi'), key: 'PI_PROGRAM_STATUS' },
+    { name: 'ebsd', make: () => createEbsdAdapter('/bin/ebsd'), key: 'EBSD_NO_UPDATE_CHECK' },
+    { name: 'doubao', make: () => createDoubaoAdapter('/bin/doubao'), key: 'DOUBAO_CLI_NO_UPDATE_CHECK' },
+  ] as const;
+
+  for (const c of NON_AGY) {
+    it(`${c.name}: reports no protected keys and envUnset still removes its spawnEnv default on pty, strict, and herdr`, () => {
+      const adapter = c.make();
+      const childEnv: NodeJS.ProcessEnv = { PATH: '/usr/bin' };
+      const applied = applyAdapterSpawnEnv(childEnv, adapter, { programStatusEnabled: false });
+      // The default is still written into childEnv (Object.assign semantics) ...
+      expect(childEnv[c.key]).toBe('1');
+      // ... but no key is protected from the user's envUnset.
+      expect(applied).toEqual([]);
+
+      const unset = [c.key];
+      const filteredUnset = filterAppliedAdapterEnvUnset(unset, applied);
+      expect(filteredUnset).toEqual([c.key]);
+
+      // PTY: applySessionEnvUnset deletes the default.
+      const ptyEnv = ptyChildEnv({ env: childEnv as Record<string, string>, unsetEnv: filteredUnset });
+      expect(ptyEnv[c.key]).toBeUndefined();
+
+      // strict: the key is absent from the `env -i` assignments.
+      const strictArgs = strictPaneEnvArgs({
+        cwd: '/tmp', cols: 120, rows: 40,
+        env: childEnv as Record<string, string>, unsetEnv: filteredUnset,
+      });
+      expect(strictArgs.some(a => a === `${c.key}=1`)).toBe(false);
+
+      // herdr: the final exec still carries the `-u KEY` removal.
+      const herdrCmd = buildHerdrFinalCommand('/bin/x', [], { unsetEnv: filteredUnset });
+      expect(herdrCmd).toContain('-u');
+      expect(herdrCmd).toContain(c.key);
+    });
+
+    it(`${c.name}: keeps the spawnEnv default when envUnset does not name it`, () => {
+      const adapter = c.make();
+      const childEnv: NodeJS.ProcessEnv = { PATH: '/usr/bin' };
+      applyAdapterSpawnEnv(childEnv, adapter, { programStatusEnabled: false });
+      const ptyEnv = ptyChildEnv({ env: childEnv as Record<string, string> });
+      expect(ptyEnv[c.key]).toBe('1');
+    });
+  }
+
+  it('antigravity injected OSC 7501 keys are still protected from envUnset while other CLIs are not', () => {
+    const adapter = createAntigravityAdapter('/bin/agy');
+    const childEnv: NodeJS.ProcessEnv = { PATH: '/usr/bin' };
+    const applied = applyAdapterSpawnEnv(childEnv, adapter, { programStatusEnabled: true });
+    expect(applied).toEqual([ANTIGRAVITY_OSC7501_ENV_KEY, ANTIGRAVITY_OSC7501_MESSAGES_ENV_KEY]);
+    // A user envUnset targeting the inherited host opt-out must not delete the
+    // adapter-injected on/brief defaults.
+    expect(filterAppliedAdapterEnvUnset([ANTIGRAVITY_OSC7501_ENV_KEY, 'OTHER_VAR'], applied))
+      .toEqual(['OTHER_VAR']);
+  });
+});
+
+describe('Antigravity quiet-flush fireIdle decision (flushedCandidateFinal guard)', () => {
+  const flushBase = {
+    flushedCandidateFinal: true,
+    heldWorking: true,
+    hasPendingTasks: false,
+    hasActiveStartedTurn: false,
+  };
+
+  it('fires idle only when the held candidate was actually flushed and the turn has no other live work', () => {
+    // Normal quiet flush: this ingest emitted the candidate's assistant_final.
+    expect(shouldFireIdleAfterAntigravityQuietFlush(flushBase)).toBe(true);
+  });
+
+  it('does NOT fire idle when the candidate was cleared and this ingest emitted no matching final', () => {
+    // A concurrent tool call / follow-up USER_INPUT cleared provisionalFinal;
+    // onDrainedEvents saw no assistant_final with the candidate's uuid.
+    expect(shouldFireIdleAfterAntigravityQuietFlush({
+      ...flushBase,
+      flushedCandidateFinal: false,
+    })).toBe(false);
+  });
+
+  it('does NOT fire idle when a successor USER_INPUT already started another turn', () => {
+    expect(shouldFireIdleAfterAntigravityQuietFlush({
+      ...flushBase,
+      hasActiveStartedTurn: true,
+    })).toBe(false);
+  });
+
+  it('does NOT fire idle while a background task / subagent remains outstanding', () => {
+    expect(shouldFireIdleAfterAntigravityQuietFlush({
+      ...flushBase,
+      hasPendingTasks: true,
+    })).toBe(false);
+  });
+
+  it('does NOT fire idle when OSC no longer holds working (nothing stale to release)', () => {
+    expect(shouldFireIdleAfterAntigravityQuietFlush({
+      ...flushBase,
+      heldWorking: false,
+    })).toBe(false);
+  });
+
+  it('real bridge queue: an unfinished started turn vetoes the idle release even after the candidate flushed', () => {
+    let now = 0;
+    const queue = new CodexBridgeQueue(() => now);
+    queue.mark('om_live', 'live turn', 0);
+    // A user record starts the turn; no assistant_final yet -> active started turn.
+    queue.ingest([{ kind: 'user', text: 'live turn', uuid: 'u1', timestampMs: 1_000 }]);
+    const hasActiveStartedTurn = queue.peek().some(turn => turn.started && turn.finalText === undefined);
+    expect(hasActiveStartedTurn).toBe(true);
+    expect(shouldFireIdleAfterAntigravityQuietFlush({
+      ...flushBase,
+      hasActiveStartedTurn,
+    })).toBe(false);
+
+    // Once its final lands, the same facts allow the release.
+    queue.ingest([{ kind: 'assistant_final', text: 'done', uuid: 'a1', timestampMs: 2_000 }]);
+    const stillActive = queue.peek().some(turn => turn.started && turn.finalText === undefined);
+    expect(stillActive).toBe(false);
+    expect(shouldFireIdleAfterAntigravityQuietFlush({
+      ...flushBase,
+      hasActiveStartedTurn: stillActive,
+    })).toBe(true);
   });
 });
