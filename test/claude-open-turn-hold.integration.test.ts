@@ -44,10 +44,14 @@ const zeroUsage = { input_tokens: 0, output_tokens: 0, cache_creation_input_toke
 async function startScriptedWorker(opts: {
   script: ScheduledRow[];
   workerEnv?: Record<string, string>;
+  delayUserRecord?: boolean;
 }) {
   root = mkdtempSync(join(tmpdir(), 'botmux-claude-open-turn-'));
   const workDir = join(root, 'work');
   const dataDir = join(root, 'data');
+  const delayedSubmission = opts.delayUserRecord
+    ? { showPrompt: join(root, 'show-prompt'), acceptInput: join(root, 'accept-input') }
+    : undefined;
   mkdirSync(workDir, { recursive: true });
   mkdirSync(dataDir, { recursive: true });
   const cliSessionId = `deadbeef-1234-4678-9abc-${randomUUID().replace(/-/g, '').slice(0, 12)}`;
@@ -67,7 +71,17 @@ async function startScriptedWorker(opts: {
 import('node:fs').then(fs => {
 const T = ${JSON.stringify(transcript)};
 const SCRIPT = ${JSON.stringify(opts.script)};
+const DELAYED_SUBMISSION = ${JSON.stringify(delayedSubmission)};
 const put = row => fs.appendFileSync(T, JSON.stringify({ timestamp: new Date().toISOString(), ...row }) + '\\n');
+const showPrompt = () => process.stdout.write('\\r\\n❯ \\r\\n  ⏵⏵ bypass permissions on (shift+tab to cycle)\\r\\n');
+const afterGate = (gate, action) => {
+  const timer = setInterval(() => {
+    if (!fs.existsSync(gate)) return;
+    clearInterval(timer);
+    action();
+  }, 25);
+};
+if (DELAYED_SUBMISSION) process.stdin.setRawMode(true);
 // Render composer without "esc to interrupt" (matches custom statusLine suppression).
 process.stdout.write('❯ \\r\\n  ⏵⏵ bypass permissions on (shift+tab to cycle)\\r\\n');
 let typed = '';
@@ -77,14 +91,23 @@ process.stdin.on('data', chunk => {
   if (typed.includes('\\x1b[200~') && !typed.includes('\\x1b[201~')) return;
   const prompt = typed.replace(/\\x1b\\[20[01]~/g, '').trim();
   typed = '';
-  put({ type: 'user', uuid: 'u1', parentUuid: 'd0', message: { role: 'user', content: prompt } });
-  // Redraw idle-looking composer immediately (no busy marker) so screen quiescence fires at +2s.
-  process.stdout.write('\\r\\n❯ \\r\\n  ⏵⏵ bypass permissions on (shift+tab to cycle)\\r\\n');
-  for (const step of SCRIPT) {
-    setTimeout(() => {
-      if (step.row) put(step.row);
-      if (step.stdout) process.stdout.write(step.stdout);
-    }, step.delayMs);
+  const acceptInput = () => {
+    put({ type: 'user', uuid: 'u1', parentUuid: 'd0', message: { role: 'user', content: prompt } });
+    for (const step of SCRIPT) {
+      setTimeout(() => {
+        if (step.row) put(step.row);
+        if (step.stdout) process.stdout.write(step.stdout);
+      }, step.delayMs);
+    }
+  };
+  if (DELAYED_SUBMISSION) {
+    if (!prompt) return; // Retries send bare Enter while the original input is pending.
+    afterGate(DELAYED_SUBMISSION.showPrompt, showPrompt);
+    afterGate(DELAYED_SUBMISSION.acceptInput, acceptInput);
+  } else {
+    acceptInput();
+    // Redraw the idle-looking composer immediately so screen quiescence fires at +2s.
+    showPrompt();
   }
 });
 });
@@ -131,10 +154,63 @@ process.stdin.on('data', chunk => {
   } satisfies DaemonToWorker);
 
   await waitUntil(() => messages.some(m => m.type === 'prompt_ready'), logs);
-  return { sid, dataDir, transcript, messages, logs };
+  return { sid, dataDir, transcript, messages, logs, delayedSubmission };
 }
 
 describe('Claude Code open-turn hold, authority retention, and Scenario 3 recovery (#3702)', () => {
+  it('retains the managed origin when the PTY looks idle before Claude accepts the prompt', async () => {
+    const finalAnswer = 'Late submission final answer.';
+    const w = await startScriptedWorker({
+      delayUserRecord: true,
+      script: [
+        { delayMs: 100, row: { type: 'api-request', id: 'req_slow_submit', querySource: 'repl_main_thread' } },
+        {
+          delayMs: 300,
+          row: {
+            type: 'assistant', uuid: 'a_slow_submit', parentUuid: 'u1',
+            message: { id: 'm1', role: 'assistant', model: 'claude-test', stop_reason: 'end_turn', usage: zeroUsage, content: [{ type: 'text', text: finalAnswer }] },
+          },
+        },
+        { delayMs: 500, row: { type: 'system', subtype: 'turn_duration', uuid: 'd1', parentUuid: 'a_slow_submit', durationMs: 500 } },
+      ],
+    });
+    const turnId = 'om_slow_pty_submit';
+    const trustedCaller = { requestUserOpenId: 'ou_tester', requestLarkAppId: 'app_test', senderType: 'user' } as const;
+    const from = w.messages.length;
+    const logFrom = w.logs.length;
+    child!.send({
+      type: 'message', turnId, trustedCaller,
+      content: 'Check delayed PTY submission ' + 'z'.repeat(14_000),
+    } satisfies DaemonToWorker);
+
+    // Exercise the idle detector after the adapter's write fence has settled,
+    // while the fake CLI still withholds both its submit hook and user row.
+    await waitUntil(() => w.logs.slice(logFrom).join('').includes('submit not confirmed after retries'), w.logs);
+    writeFileSync(w.delayedSubmission!.showPrompt, '');
+    await waitUntil(() => w.logs.slice(logFrom).join('').includes('Deferring prompt-ready while Claude PTY submission is unconfirmed')
+      || w.messages.slice(from).some(m => m.type === 'managed_turn_origin_revoked' && m.turnId === turnId), w.logs);
+    writeFileSync(w.delayedSubmission!.acceptInput, '');
+
+    await waitUntil(
+      () => w.messages.slice(from).some(m => m.type === 'turn_terminal' && m.turnId === turnId)
+        && w.messages.slice(from).some(m => m.type === 'managed_turn_origin_revoked' && m.turnId === turnId)
+        && w.messages.slice(from).some(m => m.type === 'prompt_ready'),
+      w.logs,
+    );
+    const events = w.messages.slice(from);
+    const origin = events.find((m): m is Extract<WorkerToDaemon, { type: 'managed_turn_origin' }> =>
+      m.type === 'managed_turn_origin' && m.turnId === turnId);
+    expect(origin).toMatchObject({ trustedCaller, capability: expect.any(String) });
+    const final = events.findIndex(m => m.type === 'final_output' && m.turnId === turnId && m.content === finalAnswer);
+    const terminal = events.findIndex(m => m.type === 'turn_terminal' && m.turnId === turnId && m.status === 'completed');
+    const revoke = events.findIndex(m => m.type === 'managed_turn_origin_revoked' && m.turnId === turnId);
+    expect(final).toBeGreaterThan(-1);
+    expect(terminal).toBeGreaterThan(final);
+    expect(revoke, 'the exact origin must survive until the terminal is emitted').toBeGreaterThan(terminal);
+    expect(events[revoke]).toMatchObject({ capability: origin?.capability });
+    expect(events.findIndex(m => m.type === 'prompt_ready')).toBeGreaterThan(terminal);
+  }, SOURCE_WORKER_LOAD_TIMEOUT_MS + 45_000);
+
   it('Scenario 1: holds open IM turn & active turn authority across false screen-idle while waiting for API TTFT', async () => {
     const w = await startScriptedWorker({
       script: [
