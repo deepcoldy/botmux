@@ -86,8 +86,15 @@ function stubFetch(wecomConfig?: Record<string, unknown>): void {
 }
 
 const renderers: TestRenderer.ReactTestRenderer[] = [];
-afterEach(async () => {
+/**
+ * 卸载本用例渲染过的卡片。还原语言、provider 名单这类全局 store 之前要先调：store 一变就会通知仍挂载的
+ * 订阅组件，在 act 之外触发整树重渲染。
+ */
+async function unmountRendered(): Promise<void> {
   for (const renderer of renderers.splice(0)) await act(async () => renderer.unmount());
+}
+afterEach(async () => {
+  await unmountRendered();
   vi.unstubAllGlobals();
 });
 
@@ -213,6 +220,7 @@ describe.each(deployments)('$name deployment: ⌘K Bot config index and the conf
         expect([...renderedTiles].filter(id => knownTiles.has(id) && !reachable(id)), `${platform}: on the page but not listed in ⌘K`).toEqual([]);
       }
     } finally {
+      await unmountRendered();
       ui.authed = previous;
       publishProviderRoster('lark', 1);
       publishProviderRoster('wecom', 0);
@@ -247,6 +255,7 @@ describe.each(deployments)('$name deployment: ⌘K Bot config index and the conf
         .map(item => item.title.slice(item.titleContext));
       expect(misnamed, '⌘K titles that the page does not show').toEqual([]);
     } finally {
+      await unmountRendered();
       ui.authed = previous.authed;
       ui.setLocale(previous.locale);
       publishProviderRoster('lark', 1);
@@ -384,6 +393,7 @@ async function withLocale(locale: 'zh' | 'en', run: () => Promise<void>): Promis
   try {
     await run();
   } finally {
+    await unmountRendered();
     ui.authed = previous.authed;
     ui.setLocale(previous.locale);
     publishProviderRoster('lark', 1);
