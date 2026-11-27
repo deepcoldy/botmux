@@ -28,6 +28,7 @@
  * here: the CLI itself declares it.
  */
 import type { SandboxMode } from '../adapters/cli/sandbox-mode.js';
+import { parseBytedcliOperationPolicy, type BytedcliOperationPolicy } from '../core/bytedcli-operation-policy-config.js';
 
 /** Tools whose credentials botmux can inject per person. */
 export const TRIGGER_USER_AUTH_TOOLS = ['lark-cli', 'bytedcli'] as const;
@@ -90,6 +91,9 @@ export interface TriggerUserAuthConfig {
   /** Absent retains the legacy whole-capability actor identity. The broker
    * mode is effective only while ByteCloud and this policy are enabled. */
   bytecloudExecution?: BytecloudExecutionMode;
+  /** Valid operation rules remain stored while disabled or in legacy modes.
+   * Only the enabled ByteCloud broker applies them. Explicit null clears. */
+  bytedcliOperationPolicy?: BytedcliOperationPolicy;
   /** The legacy `fallback` value as stored. Never acted on; it only keeps the
    *  background-job policy key of an unedited config what it was. */
   legacyFallback?: 'bot-identity' | 'none';
@@ -264,6 +268,7 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
 
   const credentialSource = parseCredentialSource(rec.credentialSource);
   const bytecloudExecution = parseBytecloudExecution(rec.bytecloudExecution);
+  const bytedcliOperationPolicy = parseBytedcliOperationPolicy(rec.bytedcliOperationPolicy);
 
   if (rec.delegateOnMention !== undefined && rec.delegateOnMention !== null
     && typeof rec.delegateOnMention !== 'boolean') {
@@ -321,6 +326,7 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
     ...(capabilities ? { capabilities } : {}),
     credentialSource,
     ...(bytecloudExecution !== undefined ? { bytecloudExecution } : {}),
+    ...(bytedcliOperationPolicy !== undefined ? { bytedcliOperationPolicy } : {}),
     ...(rec.fallback === 'none' || rec.fallback === 'bot-identity' ? { legacyFallback: rec.fallback } : {}),
     // Equal to the default → not stored.
     ...(rec.delegateOnMention === false ? { delegateOnMention: false } : {}),

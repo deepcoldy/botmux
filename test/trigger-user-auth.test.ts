@@ -20,6 +20,25 @@ import {
 import { createDashboardTranslator } from '../src/dashboard/web/i18n.js';
 
 describe('parseTriggerUserAuthConfig', () => {
+  it('preserves valid dormant operation rules in disabled and legacy capability modes', () => {
+    const bytedcliOperationPolicy = { schema: 'botmux.bytedcli-operation-policy.v1', cliVersion: '0.199.0',
+      catalogVersion: '2026-11-26.1', rules: { 'codebase.mr.list': 'actor' } };
+    for (const settings of [{ enabled: false }, { enabled: true, bytecloudExecution: 'trigger-user' },
+      { enabled: true, capabilities: ['lark-user'] }, { enabled: true, tools: ['bytedcli'] }]) {
+      const config = parseTriggerUserAuthConfig({ ...settings, bytedcliOperationPolicy });
+      expect(config).toHaveProperty('bytedcliOperationPolicy', bytedcliOperationPolicy);
+      expect(parseTriggerUserAuthConfig(JSON.parse(JSON.stringify(config)))).toEqual(config);
+      expect(parseTriggerUserAuthConfig({ ...config, bytedcliOperationPolicy: null }))
+        .not.toHaveProperty('bytedcliOperationPolicy');
+    }
+  });
+
+  it('rejects malformed operation policy while disabled instead of storing unsafe rules', () => {
+    const bytedcliOperationPolicy = { schema: 'botmux.bytedcli-operation-policy.v1', cliVersion: '0.199.0',
+      catalogVersion: '2026-11-26.1', rules: { 'codebase.mr.close': 'machine' } };
+    expect(() => parseTriggerUserAuthConfig({ enabled: false, bytedcliOperationPolicy })).toThrow();
+  });
+
   it('roundtrips the broker mode and preserves per-capability actor sources while disabled', () => {
     const raw = { enabled: false, capabilities: ['bytecloud'],
       credentialSource: { 'lark-user': 'local', bytecloud: 'platform' },

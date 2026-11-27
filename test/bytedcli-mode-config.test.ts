@@ -15,6 +15,7 @@ let ipc: IpcServerHandle | undefined;
 const roots: string[] = [];
 afterEach(async () => { await ipc?.close(); ipc=undefined; vi.unstubAllEnvs(); vi.unstubAllGlobals(); invalidateGlobalConfigCache(); for(const root of roots.splice(0))rmSync(root,{recursive:true,force:true}); });
 const full = { enabled:true, capabilities:['bytecloud','lark-user','meego'], bytecloudExecution:'read-machine-write-actor',
+ bytedcliOperationPolicy:{schema:'botmux.bytedcli-operation-policy.v1',cliVersion:'0.199.0',catalogVersion:'2026-11-26.1',rules:{'codebase.mr.list':'actor','codebase.mr.close':'deny'}},
  credentialSource:{default:'auto','lark-user':'platform',bytecloud:'local'}, delegateOnMention:false, allowSpeakerSwitch:true,
  allowOwnerActor:true, dispatchOnly:{tools:['bytedcli'],targetAppIds:['cli_target'],chatIds:['oc_target']},
  gitHost:'code.example.test',gitTokenExchangeUrl:'https://code.example.test/exchange',gitCommitIdentity:true };
@@ -49,6 +50,8 @@ it('new and old Dashboard saves, reload, explicit legacy and reset preserve the 
  const unchanged=stored();expect((await put({bytecloudExecution:'machine'})).status).toBe(400);expect(stored()).toEqual(unchanged);
  expect((await put({enabled:false})).status).toBe(200);expect(stored()).toMatchObject({...full,enabled:false});expect(bytecloudBrokerEnabled(loadBotConfigs()[0]!.triggerUserAuth)).toBe(false);
  expect((await put({enabled:true,bytecloudExecution:'trigger-user'})).status).toBe(200);expect(stored()).toMatchObject({...full,bytecloudExecution:'trigger-user'});
+ expect((await put({bytedcliOperationPolicy:null})).status).toBe(200);expect(stored()).not.toHaveProperty('bytedcliOperationPolicy');
+ expect(stored()).toMatchObject({credentialSource:full.credentialSource,dispatchOnly:full.dispatchOnly});
  expect((await put(null)).status).toBe(200);expect(stored()).toBeUndefined();
 });
 it('machine profile roundtrips independently and rejects invalid profile rather than choosing the default identity',()=>{
