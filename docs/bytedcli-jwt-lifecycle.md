@@ -1,6 +1,6 @@
 # 按人 ByteCloud JWT 的区域与续期
 
-开启 trigger-user-auth 后，daemon 从触发人的独立 HOME 获取默认及区域 JWT；签票材料来自宿主按人登录目录，而包装器执行命令时使用会话 scratch 内的按人空 HOME；两者不共享 SDK 登录。包装器按 bytedcli 0.191 的读法认站点并选择对应区域。支持 `--site value` / `--site=value` 与等价写法 `--cloud-site`（最后一个生效），显式参数优先于 `BYTEDCLI_CLOUD_SITE`，但空的 `--site` 视为未给、由环境变量决定；取值两端的空白（含 JS `trim()` 会去掉的 Unicode 空白）被去掉后再大小写不敏感匹配。`i18n`/`i18n-bd` 选择 i18nbd，`i18n-tt`/EU 规范站点选择 i18n，US 规范站点选择 tx，`cn` 及其别名选择 CN JWT。默认票本身属于 CN 时，Botmux 直接复用它。区域材料不以内部变量名传给子进程；claim 不符的签票结果被丢弃。
+开启 trigger-user-auth 后，daemon 从触发人的独立 HOME 获取默认及区域 JWT；签票材料来自宿主按人登录目录，而包装器执行命令时使用会话 scratch 内的按人空 HOME；两者不共享 SDK 登录。包装器按 bytedcli 0.203 的读法认站点并选择对应区域。支持 `--site value` / `--site=value` 与等价写法 `--cloud-site`（最后一个生效），显式参数优先于 `BYTEDCLI_CLOUD_SITE`，但空的 `--site` 视为未给、由环境变量决定；取值两端的空白（含 JS `trim()` 会去掉的 Unicode 空白）被去掉后再大小写不敏感匹配。`i18n`/`i18n-bd` 选择 i18nbd，`i18n-tt`/EU 规范站点选择 i18n，US 规范站点选择 tx，`cn` 及其别名选择 CN JWT。默认票本身属于 CN 时，Botmux 直接复用它。区域材料不以内部变量名传给子进程；claim 不符的签票结果被丢弃。
 
 **全局站点**所在区域没有材料时，包装器**拒绝执行**（退出码 77），stderr 写明站点、所属分区和 `[reason=regional_jwt_missing]`，不会拿默认 JWT 去请求该分区：分区服务对它只会回 401（使用者看到的是「用户未登录」），或者 bytedcli 因 region claim 不符跳过它、再去会话 scratch 内没有登录的按人 HOME 找，同样失败，而且掩盖了真正缺的是哪个分区的票。拒绝文案按区域材料的来源给出原因：本机签票没签到（bytedcli 的登录按站点分开，本机按人授权只登录默认站点）、平台没签出（海外站点需在平台凭据页单独授权）、或绑定的平台尚不签发分区票（需升级平台）。未指定站点且会话环境也无站点时使用默认 JWT。`boe` 沿用默认票。不会把该分区 ByteCloud JWT 发出去的调用也照常执行、不因缺票被拒：帮助与版本输出（`--help` 任意位置、命令前的 `-h` / `--version` / `-V`、没有命令）、`codebase`（用 Codebase JWT）、`meego`（用本人的 Meego 登录）——否则会话级设了海外 `BYTEDCLI_CLOUD_SITE` 时，缺票的人连这些命令都用不了。命令按 bytedcli 的 `getFirstCommandArgIndex` 找（跳过带值的根选项）；认不出的一律按需要分区票处理。
 
@@ -14,7 +14,7 @@
 
 在 `proven` 模型的直接按人轮次中，包装器把需要 ByteCloud JWT 的海外命令的全局分区带给 daemon。平台已签出默认票但缺该分区时，daemon 可以用原 grant 的 union_id 仅请求该分区。同轮同分区的并发请求合并，失败按分区限次和冷却；某分区达到上限后发布 `retry_exhausted` 终态，不影响其它分区剩余的补票机会。无人轮次（外部触发、workflow event、scheduled fire 及注册后台任务）不开放同轮补票。补票只写回仍然有效的执行和身份快照，并保留默认票和其它票。平台可选返回 `cloudJwtRegionStates`。明确未授权或需重新授权时提示用户处理授权，待签发或瞬时失败时提示重试。
 
-同一模型下，命令所需的平台 JWT 已过期时，daemon 按原平台绑定、同一人和同一轮次重取。默认 ByteCloud 调用、复用默认票的 CN 调用和 `bitscli` 共用默认票。独立签发的 CN 及海外票只向平台请求相应分区。独立 `codebase` 和 `bytedcli codebase` 重取 Codebase 票，`bitscli` 也检查随默认票发布的 Codebase 票。`botmux auth request --provider bytedcli` 检查默认票，等可用票写回后报告本轮可用。同一张票的并发请求共享一次取票，写回保留本轮的其它票。平台返回旧票或暂时不可用时，该命令可等冷却后在本轮重试。
+同一模型下，命令所需的平台 JWT 已过期时，daemon 按原平台绑定、同一人和同一轮次重取。每张票同时受自身 `exp` 和签发它的 grant `expiresAt` 约束，没有可解析 `exp` 也不能超过 grant 的截止时刻；单票续期只推进该票的 grant 截止时刻，不延长同轮其它票。默认 ByteCloud 调用、复用默认票的 CN 调用和 `bitscli` 共用默认票。独立签发的 CN 及海外票只向平台请求相应分区。独立 `codebase` 和 `bytedcli codebase` 重取 Codebase 票，`bitscli` 也检查随默认票发布的 Codebase 票。`botmux auth request --provider bytedcli` 检查默认票，等可用票写回后报告本轮可用。同一张票的并发请求共享一次取票，写回保留本轮的其它票。平台返回旧票或暂时不可用时，该命令可等冷却后在本轮重试。
 
 兼容：分区变量必须由请求声明后才能下发——旧版 daemon 的 grant 白名单遇到任何未知变量会把整张 grant 判为无效，等于让该人失去 bytedcli 授权。旧版平台只读自己认识的请求字段，照旧只回默认票；如果回执、分区状态和分区票均缺失，daemon 把缺票原因写成「绑定的平台尚不签发分区票」。平台签发的材料不进入本地续期器（见下）。
 

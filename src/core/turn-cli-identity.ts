@@ -543,6 +543,7 @@ type PlatformGrantAuthority = Pick<Extract<PlatformIdentityResolution, { state: 
 type ProvenPlatformGrant = PlatformGrantAuthority & { expiresAt: number };
 
 type PlatformBytedcliCredential = BytedcliIdentityRegion | 'codebase';
+const PLATFORM_BYTEDCLI_CREDENTIALS = ['default', 'codebase', 'cn', ...BYTEDCLI_OVERSEAS_REGIONS] as const;
 type PlatformGrantFailure = 'unavailable' | 'not_authorized' | 'consent_missing' | 'denied'
   | 'regional_authorization_required' | 'codebase_authorization_required';
 
@@ -557,6 +558,9 @@ interface PlatformBytedcliPublication extends PlatformGrantContext, PlatformGran
   identity: BytedCliIdentity;
   snapshot: ProvenIdentitySnapshot;
   authEpoch: number;
+  /** The platform's deadline for each credential. Renewing one slot must not
+   *  extend any other slot merely because their responses shared a grant. */
+  grantExpiries: Map<PlatformBytedcliCredential, number>;
   attempts: Map<BytedcliOverseasRegion, RegionalGrantAttempt>;
   renewals: Map<PlatformBytedcliCredential, PlatformGrantRenewal>;
   baseGrantInFlight?: Promise<PlatformIdentityResolution>;
@@ -592,7 +596,9 @@ function writeProvenPlatformIdentity(
   const snapshot = recallProvenIdentitySnapshot(sessionDataDir, sessionId, turnId, 'bytedcli')!;
   platformBytedcliPublications.set(snapshot, {
     ...context, snapshot, identity: shaped, unionId: grant.unionId, bindingKey: grant.bindingKey,
-    authEpoch: readCliAuthEpoch(senderOpenId), attempts: new Map(), renewals: new Map(),
+    authEpoch: readCliAuthEpoch(senderOpenId),
+    grantExpiries: new Map(PLATFORM_BYTEDCLI_CREDENTIALS.map(credential => [credential, grant.expiresAt] as const)),
+    attempts: new Map(), renewals: new Map(),
   });
 }
 
@@ -624,13 +630,18 @@ function platformPublicationStillAllowed(entry: PlatformBytedcliPublication, arg
     && allowsPersonalIdentityForTurn(turnId, policy);
 }
 
-function replacePlatformBytedcliPublication(entry: PlatformBytedcliPublication, identity: BytedCliIdentity): void {
+function replacePlatformBytedcliPublication(
+  entry: PlatformBytedcliPublication,
+  identity: BytedCliIdentity,
+  renewed?: { credential: PlatformBytedcliCredential; expiresAt: number },
+): void {
   const { sessionDataDir, sessionId, turnId } = entry;
   writeSessionIdentity(sessionDataDir, sessionId, identity, 'proven');
   const replacement = recallProvenIdentitySnapshot(sessionDataDir, sessionId, turnId, 'bytedcli')!;
   platformBytedcliPublications.delete(entry.snapshot);
   entry.snapshot = replacement;
   entry.identity = identity;
+  if (renewed) entry.grantExpiries.set(renewed.credential, renewed.expiresAt);
   platformBytedcliPublications.set(replacement, entry);
 }
 
@@ -647,11 +658,31 @@ function jwtExpiry(jwt: string | undefined): number | undefined {
   return typeof exp === 'number' && Number.isFinite(exp * 1_000) ? exp * 1_000 : undefined;
 }
 
+function platformBytedcliJwt(identity: BytedCliIdentity, credential: PlatformBytedcliCredential): string | undefined {
+  return credential === 'default' ? identity.cloudJwt
+    : credential === 'codebase' ? identity.codeJwt : identity.regionalCloudJwts?.[credential];
+}
+
+/** A credential is bounded by both its own JWT and the grant that delivered it.
+ *  An absent optional credential has nothing to expire; a present JWT without
+ *  `exp` remains bounded by the grant instead of becoming valid forever. */
+function platformBytedcliCredentialExpiry(
+  entry: PlatformBytedcliPublication, credential: PlatformBytedcliCredential,
+): number | undefined {
+  const jwt = platformBytedcliJwt(entry.identity, credential);
+  if (!jwt) return undefined;
+  return Math.min(jwtExpiry(jwt) ?? Number.POSITIVE_INFINITY, entry.grantExpiries.get(credential) ?? 0);
+}
+
 /** Bits receives both credentials, so one can expire while the other renews. */
 export function hasExpiredPlatformBitscliCredential(args: Pick<RefreshPlatformGrantArgs, 'sessionDataDir' | 'sessionId' | 'turnId'>): boolean {
-  const identity = publishedPlatformBytedcli(args)?.identity;
+  const entry = publishedPlatformBytedcli(args);
+  if (!entry) return false;
   const now = Date.now();
-  return [identity?.cloudJwt, identity?.codeJwt].some(jwt => (jwtExpiry(jwt) ?? Infinity) <= now);
+  return (['default', 'codebase'] as const).some(credential => {
+    const expiresAt = platformBytedcliCredentialExpiry(entry, credential);
+    return expiresAt !== undefined && expiresAt <= now;
+  });
 }
 
 function requestBytedcliRenewalGrant(entry: PlatformBytedcliPublication, region: BytedcliGrantRegion | undefined, force: boolean) {
@@ -682,10 +713,8 @@ export async function refreshExpiredPlatformBytedcli(
   }
   const stillAllowed = () => args.speakerOpenId === entry.senderOpenId && platformPublicationStillAllowed(entry, args);
   if (!publicationValid(stillAllowed)) return 'superseded';
-  const readJwt = (identity: BytedCliIdentity) => credential === 'default' ? identity.cloudJwt
-    : credential === 'codebase' ? identity.codeJwt : identity.regionalCloudJwts?.[credential];
-  const jwt = readJwt(entry.identity);
-  const expiresAt = jwtExpiry(jwt);
+  const jwt = platformBytedcliJwt(entry.identity, credential);
+  const expiresAt = platformBytedcliCredentialExpiry(entry, credential);
   if (expiresAt === undefined || expiresAt > Date.now()) return 'ready';
 
   const originalRegion = jwt ? jwtClaims(jwt)?.region : undefined;
@@ -720,7 +749,7 @@ export async function refreshExpiredPlatformBytedcli(
           return;
         }
         if (grant.bindingKey !== entry.bindingKey || grant.identity.tool !== 'bytedcli') return;
-        const nextJwt = readJwt(grant.identity);
+        const nextJwt = platformBytedcliJwt(grant.identity, credential);
         const regionState = regional && grant.identity.regionalCloudJwtStates?.[regional];
         if (!nextJwt && (regionState === 'not_authorized' || regionState === 'reauth_required')) {
           active.failure = 'regional_authorization_required';
@@ -728,15 +757,16 @@ export async function refreshExpiredPlatformBytedcli(
         }
         if (!nextJwt || !/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(nextJwt)
           || (typeof originalRegion === 'string' && jwtClaims(nextJwt)?.region !== originalRegion)) return;
-        const nextExpiry = jwtExpiry(nextJwt);
+        const nextExpiry = Math.min(jwtExpiry(nextJwt) ?? Number.POSITIVE_INFINITY, grant.expiresAt);
         const now = Date.now();
-        if (nextExpiry === undefined || nextExpiry <= Math.max(now, expiresAt) || grant.expiresAt <= now) return;
+        if (nextExpiry <= Math.max(now, expiresAt)) return;
         const identity = entry.identity;
         replacePlatformBytedcliPublication(entry, regional ? {
           ...identity,
           regionalCloudJwts: { ...identity.regionalCloudJwts, [regional]: nextJwt },
           regionalCloudJwtStates: { ...identity.regionalCloudJwtStates, [regional]: 'minted' },
-        } : credential === 'codebase' ? { ...identity, codeJwt: nextJwt } : { ...identity, cloudJwt: nextJwt });
+        } : credential === 'codebase' ? { ...identity, codeJwt: nextJwt } : { ...identity, cloudJwt: nextJwt },
+        { credential, expiresAt: grant.expiresAt });
       })().catch(() => {
         logger.warn(`[trigger-user-auth] could not renew the turn's ${credential} JWT`);
       }).finally(() => {
@@ -748,7 +778,7 @@ export async function refreshExpiredPlatformBytedcli(
     const joinedForced = joinedAttempt ? active.inFlightForced : false;
     await waitForPlatformGrant(joinedAttempt, waitMs);
     if (!publicationValid(stillAllowed)) return 'superseded';
-    const updatedExpiry = jwtExpiry(readJwt(entry.identity));
+    const updatedExpiry = platformBytedcliCredentialExpiry(entry, credential);
     if (updatedExpiry !== undefined && updatedExpiry > Date.now()) return 'ready';
     // A ready-authorized caller that joined an older ordinary attempt gets one
     // forced attempt of its own after that stale refusal. Callers that joined
@@ -778,7 +808,10 @@ export async function retryMissingRegionalGrant(args: RefreshPlatformGrantArgs &
     entry.attempts.set(region, attempt);
   }
   const active = attempt;
-  const commit = (identity: BytedCliIdentity) => replacePlatformBytedcliPublication(entry, identity);
+  const commit = (
+    identity: BytedCliIdentity,
+    renewed?: { credential: PlatformBytedcliCredential; expiresAt: number },
+  ) => replacePlatformBytedcliPublication(entry, identity, renewed);
   const commitExhausted = () => {
     if (active.count < REGIONAL_GRANT_MAX_ATTEMPTS || entry.identity.regionalCloudJwts?.[region]) return;
     const state = entry.identity.regionalCloudJwtStates?.[region];
@@ -821,7 +854,7 @@ export async function retryMissingRegionalGrant(args: RefreshPlatformGrantArgs &
         ...(jwt ? { regionalCloudJwts: { ...entry.identity.regionalCloudJwts, [region]: jwt } } : {}),
         regionalCloudJwtStates: { ...entry.identity.regionalCloudJwtStates, [region]: nextState },
       };
-      commit(merged);
+      commit(merged, jwt ? { credential: region, expiresAt: grant.expiresAt } : undefined);
     })().catch(() => {
       logger.warn(`[trigger-user-auth] bytedcli regional grant retry failed for partition ${region}`);
     }).finally(() => {

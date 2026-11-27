@@ -770,9 +770,9 @@ const BYTEDCLI_REGIONAL_MISSING_HINTS: Record<BytedcliRegionalJwtSource, string>
 const BYTEDCLI_REGIONAL_MISSING_DEFAULT_HINT = '请确认发起人有该分区的权限后，发一条新消息再试。';
 
 /** bytedcli's root options that take a value (`ROOT_OPTIONS_WITH_VALUE` in its
- *  root-argv, 0.191), so the command after them can be found. */
+ *  root-argv, 0.203), so the command after them can be found. */
 const BYTEDCLI_ROOT_OPTIONS_WITH_VALUE = [
-  '--jq', '--site', '--cloud-site', '--auth-site', '--as', '--ai-auth-subject', '--ai-auth-app-key',
+  '--jq', '--site', '--network-profile', '--cloud-site', '--auth-site', '--as', '--ai-auth-subject', '--ai-auth-app-key',
   '--bytecloud-user-jwt-file', '--profile', '--vregion', '--vdc', '--socks5-proxy', '--http-proxy',
   '--http-print', '--http-header', '--http-trace-file', '--http-body-limit', '--http-timeout-ms',
   '--http-retry-count', '--http-retry-base-delay-ms', '--http-retry-max-delay-ms',
@@ -805,6 +805,7 @@ const BYTEDCLI_REGION_FREE_FN: readonly string[] = [
   '    case "$__botmux_rf_a" in',
   '      -h|--version|-V) return 0 ;;',
   `      ${BYTEDCLI_ROOT_OPTIONS_WITH_VALUE.join('|')}) __botmux_rf_skip=1 ;;`,
+  '      --*=*) ;;',
   '      -*) ;;',
   '      *) __botmux_rf_cmd=$__botmux_rf_a ;;',
   '    esac',
@@ -1459,8 +1460,8 @@ const BYTEDCLI_SCAN_FN: readonly string[] = [
   '        --) __botmux_sc_end=1; continue ;;',
   `        ${[...BYTEDCLI_ROOT_OPTIONS_WITH_VALUE, '--tenant', '--session-id'].join('|')}) __botmux_sc_skip=1; continue ;;`,
   '        -h|--help|-V|--version) [ -n "$__botmux_sc_optprev" ] || __botmux_sc_help=1; continue ;;',
-  '        -d|--debug|-j|--json|--nomask|--yes|--color|--no-color|--tls1.2|--http-debug|--no-auto-upgrade|--all-help) continue ;;',
-  '        -[dhjV][dhjV]*) case "$__botmux_sc_a" in *[hV]*) [ -n "$__botmux_sc_optprev" ] || __botmux_sc_help=1 ;; esac; continue ;;',
+  '        -d|--debug|-j|--json|-json|-v|--verbose|--nomask|--yes|--color|--no-color|--tls1.2|--http-debug|--no-auto-upgrade|--all-help) continue ;;',
+  '        -[dhjvV][dhjvV]*) case "$__botmux_sc_a" in *[hV]*) [ -n "$__botmux_sc_optprev" ] || __botmux_sc_help=1 ;; esac; continue ;;',
   // `--session[=…]` / `--session-method[=…]` make `auth login` the browser-session login, not the ByteCloud one (`--session-id` is another option).
   '        --session-method) __botmux_sc_websess=1; __botmux_sc_skip=1; continue ;;',
   '        --session|--session=*|--session-method=*) __botmux_sc_websess=1; continue ;;',

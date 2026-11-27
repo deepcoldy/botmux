@@ -411,8 +411,18 @@ it('requests the Codebase ticket for nested commands while leaving help and Meeg
   storageModel = 'proven';
   await publishFor('platform', ALICE);
   const site = { BYTEDCLI_CLOUD_SITE: 'EU-TTP' };
-  expect(bytedcliWithEnv(site, '--profile', 'value', 'codebase', 'mr', 'list').status).toBe(0);
-  expect(resolverArgs()).toBe('bytedcli --codebase');
+  for (const args of [
+    ['--profile', 'value', 'codebase', 'mr', 'list'],
+    ['--network-profile', 'office', 'codebase', 'mr', 'list'],
+    ['--network-profile=office', 'codebase', 'mr', 'list'],
+    ['--verbose', 'codebase', 'mr', 'list'],
+    ['-v', 'codebase', 'mr', 'list'],
+    ['-json', 'codebase', 'mr', 'list'],
+    ['-jv', 'codebase', 'mr', 'list'],
+  ]) {
+    expect(bytedcliWithEnv(site, ...args).status).toBe(0);
+    expect(resolverArgs()).toBe('bytedcli --codebase');
+  }
   for (const args of [
     ['aa', 'query', '--help'], ['meego', 'workitem', 'list'], ['codebase'], ['codebase', 'help'],
     ['codebase', 'mr', '--help'], ['codebase', 'mr', '-h'], ['codebase', 'mr', '--all-help'], ['--version', 'codebase', 'mr'],
