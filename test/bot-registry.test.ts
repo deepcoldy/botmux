@@ -43,11 +43,17 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 // Mock node:fs so loadBotConfigs doesn't touch real disk.
 vi.mock('node:fs', async (importOriginal) => {
   const orig = await importOriginal<typeof import('node:fs')>();
+  const existsSync = vi.fn((_path: unknown) => false);
   return {
     ...orig,
-    existsSync: vi.fn(() => false),
+    existsSync,
     readFileSync: vi.fn(() => ''),
-    statSync: vi.fn(() => ({ mtimeMs: 0 })),
+    // The loader decides the default bots.json path with statSync(); keep it in
+    // step with whatever existsSync() a test scripts (absent → ENOENT).
+    statSync: vi.fn((path: unknown) => {
+      if (!existsSync(path)) throw Object.assign(new Error(`ENOENT: no such file or directory, stat '${String(path)}'`), { code: 'ENOENT' });
+      return { mtimeMs: 0 };
+    }),
   };
 });
 
@@ -2248,6 +2254,7 @@ describe('loadBotConfigs', () => {
 
   it('should throw when no config source is available', () => {
     fsMock.existsSync.mockReturnValue(false);
+    fsMock.statSync.mockImplementation(() => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); });
     expect(() => mod.loadBotConfigs()).toThrow('No bot configuration found');
   });
 
@@ -2852,7 +2859,7 @@ describe('loadBotConfigs when bots.json exists but is unreadable', () => {
   });
 });
 
-describe('default bots.json that existsSync() cannot see', () => {
+describe('default bots.json path is decided by statSync()', () => {
   let mod: Awaited<ReturnType<typeof freshImport>>;
   let fs: typeof import('node:fs');
   const savedEnv = { ...process.env };
@@ -2863,12 +2870,14 @@ describe('default bots.json that existsSync() cannot see', () => {
     delete process.env.BOTMUX_CORE_ONLY;
     mod = await freshImport();
     fs = await import('node:fs');
+    // existsSync() answers false for absent AND uninspectable paths alike.
     vi.mocked(fs.existsSync).mockReturnValue(false);
   });
 
   afterEach(() => {
     process.env = { ...savedEnv };
-    vi.mocked(fs.statSync).mockImplementation((() => ({ mtimeMs: 0 })) as never);
+    vi.mocked(fs.statSync).mockReset();
+    vi.mocked(fs.readFileSync).mockReturnValue('' as never);
   });
 
   it.each(['ENOENT', 'ENOTDIR'])('reports "no configuration" when the file is proven absent (%s)', (code) => {
@@ -2880,9 +2889,56 @@ describe('default bots.json that existsSync() cannot see', () => {
     vi.mocked(fs.statSync).mockImplementation(() => { throw fsError(code); });
     let failure: unknown;
     try { mod.loadBotConfigsCached(); } catch (err) { failure = err; }
-    expect(failure).toBeInstanceOf(Error);
-    expect(failure).not.toBeInstanceOf(mod.BotConfigNotFoundError);
-    expect((failure as Error & { code?: string }).code).toBe(code);
+    expect(failure).toBeInstanceOf(mod.BotConfigLoadError);
+    expect(failure).toMatchObject({ reason: 'permission_denied', code });
+  });
+
+  it('loads a file that a stat proves present even though existsSync() said no', () => {
+    vi.mocked(fs.statSync).mockImplementation((() => ({ mtimeMs: 0 })) as never);
+    vi.mocked(fs.readFileSync).mockReturnValue(JSON.stringify([
+      { larkAppId: 'cli_present', larkAppSecret: 'x', cliId: 'claude-code' },
+    ]) as never);
+    expect(mod.loadBotConfigs().map(bot => bot.larkAppId)).toEqual(['cli_present']);
+  });
+});
+
+describe('strict cached read never quotes bots.json content', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+  let fs: typeof import('node:fs');
+  const savedEnv = { ...process.env };
+  const secret = 'sk-live-SENTINEL-4f9c';
+
+  beforeEach(async () => {
+    delete process.env.BOTS_CONFIG;
+    delete process.env.BOTMUX_CORE_ONLY;
+    mod = await freshImport();
+    fs = await import('node:fs');
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+  });
+
+  afterEach(() => {
+    process.env = { ...savedEnv };
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    vi.mocked(fs.readFileSync).mockReturnValue('' as never);
+  });
+
+  it.each([
+    ['invalid_config', JSON.stringify([
+      { larkAppId: 'cli_app', larkAppSecret: 'x', cliId: 'claude-code' },
+      { larkAppId: 'cli_other', larkAppSecret: 'x', cliId: 'claude-code', sandboxWithholdBotSecret: secret },
+    ])],
+    ['invalid_json', `[{"larkAppId": "cli_other", "larkAppSecret": "${secret}"`],
+  ] as const)('classifies %s without the raw validator text', (reason, text) => {
+    vi.mocked(fs.readFileSync).mockReturnValue(text as never);
+    // The ordinary loader keeps its detailed message for local operators…
+    expect(() => mod.loadBotConfigsCached()).toThrow();
+    let failure: unknown;
+    try { mod.loadBotConfigsCached({ strictRead: true }); } catch (err) { failure = err; }
+    // …the strict one is safe to persist.
+    expect(failure).toBeInstanceOf(mod.BotConfigLoadError);
+    expect(failure).toMatchObject({ reason });
+    expect((failure as Error).message).not.toContain(secret);
+    expect((failure as Error).message).toContain('bots.json');
   });
 });
 

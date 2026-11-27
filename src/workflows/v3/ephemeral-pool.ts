@@ -15,7 +15,7 @@ import { SessionContractStore } from '../../services/session-contract-store.js';
 import { sessionContractsEnabled } from '../../services/session-contract.js';
 import type { DaemonSession } from '../../core/types.js';
 import { resolveSessionEnv, type SessionEnvBotInput } from '../../core/session-env-resolve.js';
-import { BotConfigNotFoundError, effectiveDefaultWorkingDir, getBot, loadBotConfigsCached, type BotConfig } from '../../bot-registry.js';
+import { BotConfigLoadError, BotConfigNotFoundError, effectiveDefaultWorkingDir, getBot, loadBotConfigsCached, type BotConfig } from '../../bot-registry.js';
 import { lstatSync, readlinkSync, realpathSync, statSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { BoundedLogFile } from '../../utils/bounded-log-file.js';
@@ -101,10 +101,11 @@ function liveBotConfig(larkAppId: string): BotConfig | undefined {
     configs = loadBotConfigsCached({ strictRead: true });
   } catch (err) {
     if (err instanceof BotConfigNotFoundError) return undefined;
-    throw new Error(
-      `v3 workflow cannot read live bot config for ${larkAppId}: ${err instanceof Error ? err.message : String(err)}`,
-      { cause: err },
-    );
+    // This message is persisted as the node failure. Strict loads only throw
+    // BotConfigLoadError, whose message never quotes bots.json content (any
+    // bot's validator text may carry raw values); keep the rest on `cause`.
+    const reason = err instanceof BotConfigLoadError ? err.message : 'bots.json unreadable';
+    throw new Error(`v3 workflow cannot read live bot config for ${larkAppId}: ${reason}`, { cause: err });
   }
   return configs.find(b => b.larkAppId === larkAppId);
 }

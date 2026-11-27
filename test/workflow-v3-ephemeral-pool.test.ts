@@ -468,6 +468,21 @@ describe('v3 ephemeral pool', () => {
       } finally { chmodSync(botsPath, 0o600); }
     });
 
+    it('never copies another bot entry\'s raw values into the persisted node failure', async () => {
+      const secret = 'sk-live-SENTINEL-4f9c';
+      const botsPath = join(dir, 'bots.json');
+      vi.stubEnv('BOTS_CONFIG', botsPath);
+      // The node's own entry is fine; a sibling has a secret pasted into a boolean field.
+      writeFileSync(botsPath, JSON.stringify([
+        { larkAppId: 'cli_app', larkAppSecret: 'test-only', cliId: 'claude-code' },
+        { larkAppId: 'cli_other', larkAppSecret: 'test-only', cliId: 'claude-code', sandboxWithholdBotSecret: secret },
+      ]));
+      const failure = await rejectsBeforeSpawn();
+      expect(failure.message).not.toContain(secret);
+      expect(failure.message).toContain('cli_app');
+      expect(failure.message).toContain(botsPath);
+    });
+
     it('keeps starting a hosted node bot from the registry while bots.json is invalid', async () => {
       const bot: BotConfig = { larkAppId: 'cli_app', larkAppSecret: 'test-only', cliId: 'claude-code',
         apiOnly: true, env: { MODEL_AUTH: 'registered-sentinel' } };

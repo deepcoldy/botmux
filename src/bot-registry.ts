@@ -3733,36 +3733,23 @@ function resolveBotConfigPath(): string {
   }
 
   // 2. <config dir>/bots.json (i.e. os.homedir()/.botmux/bots.json)
+  // One stat decides it: existsSync() also answers false when the path cannot
+  // be inspected (e.g. lost search permission on ~/.botmux), and only a
+  // proven-absent file is "no configuration".
   const defaultPath = resolveBotsConfigFile();
-  if (existsSync(defaultPath)) {
-    loadedConfigPath = defaultPath;
-    loadedConfigProvenance = 'loaded';
-    return defaultPath;
-  }
-  // existsSync() also answers false when the path cannot be inspected at all
-  // (e.g. lost search permission on ~/.botmux). Only a proven-absent file is
-  // "no configuration"; anything else is a fault the caller must see.
-  const absence = defaultBotsConfigAbsence(defaultPath);
-  if (absence) throw absence;
-
-  throw new BotConfigNotFoundError(
-    'No bot configuration found. Set BOTS_CONFIG or create ~/.botmux/bots.json.\nSee README for config format.'
-  );
-}
-
-/** Why existsSync() said no: undefined for ENOENT/ENOTDIR (or a file that
- *  appeared since), otherwise the access error with its code preserved. */
-function defaultBotsConfigAbsence(defaultPath: string): Error | undefined {
   try {
     statSync(defaultPath);
-    return undefined;
   } catch (err: any) {
-    if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') return undefined;
-    return Object.assign(
-      new Error(`Cannot access bot configuration ${defaultPath}: ${err?.message ?? String(err)}`, { cause: err }),
-      { code: err?.code },
-    );
+    if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') {
+      throw new BotConfigNotFoundError(
+        'No bot configuration found. Set BOTS_CONFIG or create ~/.botmux/bots.json.\nSee README for config format.'
+      );
+    }
+    throw botConfigAccessError(defaultPath, err);
   }
+  loadedConfigPath = defaultPath;
+  loadedConfigProvenance = 'loaded';
+  return defaultPath;
 }
 
 /** No bots.json exists at all (BOTS_CONFIG unset, default file absent). Lets a
@@ -3770,6 +3757,42 @@ function defaultBotsConfigAbsence(defaultPath: string): Error | undefined {
  *  parse; a pinned-but-missing BOTS_CONFIG is a fault and stays a plain Error. */
 export class BotConfigNotFoundError extends Error {
   override name = 'BotConfigNotFoundError';
+}
+
+export type BotConfigLoadFailure = 'permission_denied' | 'unreadable' | 'invalid_json' | 'invalid_config';
+
+/**
+ * bots.json could not be loaded. The message carries only the failure category,
+ * an fs error code and the file path — never validator text, which can quote
+ * raw values (including secrets) from ANY bot's entry. The original error stays
+ * on `cause` for local debugging; do not persist or send it.
+ */
+export class BotConfigLoadError extends Error {
+  override name = 'BotConfigLoadError';
+  constructor(
+    readonly reason: BotConfigLoadFailure,
+    readonly path: string | undefined,
+    readonly code: string | undefined,
+    cause: unknown,
+  ) {
+    const category = {
+      permission_denied: 'permission denied',
+      unreadable: 'unreadable',
+      invalid_json: 'invalid JSON',
+      invalid_config: 'invalid bot configuration',
+    }[reason];
+    super(`bots.json ${category}${code ? ` (${code})` : ''}${path ? ` (file: ${path})` : ''}`, { cause });
+  }
+}
+
+function fsErrorCode(err: unknown): string | undefined {
+  const code = (err as { code?: unknown } | null)?.code;
+  return typeof code === 'string' && /^E[A-Z0-9]+$/.test(code) ? code : undefined;
+}
+
+function botConfigAccessError(path: string, err: unknown): BotConfigLoadError {
+  const code = fsErrorCode(err);
+  return new BotConfigLoadError(code === 'EACCES' || code === 'EPERM' ? 'permission_denied' : 'unreadable', path, code, err);
 }
 
 const warnedRetiredCliApps = new Set<string>();
@@ -3957,19 +3980,36 @@ function parseBotConfigFile(filePath: string): BotConfig[] {
  * 的解析要几十毫秒）。给热路径上只读的调用方用（如同机兄弟 bot 的身份判定），返回值不要改。
  * 读文件失败的语义与 loadBotConfigs 一致。
  *
- * `strictRead`：读不出文件时一律抛错，不走读隔离下 EPERM/EACCES → [] 的降级。给必须区分
- * "确实没有该 bot"与"读不到配置"的调用方用（v3 workflow 节点配置解析）。
+ * `strictRead`：读不出文件时一律抛错，不走读隔离下 EPERM/EACCES → [] 的降级；除"根本没有配置"
+ * （BotConfigNotFoundError）外，所有失败都收敛为只含类别/错误码/路径的 {@link BotConfigLoadError}，
+ * 不带校验器原文。给必须区分"确实没有该 bot"与"读不到配置"、且会把错误落盘的调用方用
+ * （v3 workflow 节点配置解析）。
  */
 let parsedBotConfigsCache: { path: string; text: string; configs: BotConfig[] } | undefined;
 export function loadBotConfigsCached(options: { strictRead?: boolean } = {}): readonly BotConfig[] {
-  const synthetic = maybeSynthesizeCoreOnlyConfig();
+  const strict = options.strictRead === true;
+  let synthetic: BotConfig[] | null;
+  try {
+    synthetic = maybeSynthesizeCoreOnlyConfig();
+  } catch (err) {
+    if (strict) throw new BotConfigLoadError('invalid_config', undefined, undefined, err);
+    throw err;
+  }
   if (synthetic) return synthetic;
-  const filePath = resolveBotConfigPath();
+  let filePath: string;
+  try {
+    filePath = resolveBotConfigPath();
+  } catch (err) {
+    if (!strict || err instanceof BotConfigNotFoundError || err instanceof BotConfigLoadError) throw err;
+    // A pinned BOTS_CONFIG that is gone (its message is constant text + path).
+    throw new BotConfigLoadError('unreadable',
+      process.env.BOTS_CONFIG ? resolve(process.env.BOTS_CONFIG) : undefined, fsErrorCode(err), err);
+  }
   let text: string;
   try {
     text = readFileSync(filePath, 'utf-8');
   } catch (err) {
-    if (options.strictRead) throw err;
+    if (strict) throw botConfigAccessError(filePath, err);
     return parseBotConfigFile(filePath);
   }
   if (parsedBotConfigsCache?.path === filePath && parsedBotConfigsCache.text === text) {
@@ -3979,6 +4019,11 @@ export function loadBotConfigsCached(options: { strictRead?: boolean } = {}): re
   try {
     configs = parseBotConfigsFromText(text);
   } catch (err: any) {
+    if (strict) {
+      let syntax = false;
+      try { JSON.parse(text); } catch { syntax = true; }
+      throw new BotConfigLoadError(syntax ? 'invalid_json' : 'invalid_config', filePath, undefined, err);
+    }
     throw new Error(`${err?.message ?? err} (file: ${filePath})`);
   }
   parsedBotConfigsCache = { path: filePath, text, configs };
