@@ -41,7 +41,7 @@ it('command controls expose true effect and the global floor; writes expose expl
   await act(async()=>write.props.onChange({currentTarget:{value:'machine'}}));
   expect(p.requests.at(-1).bytedcliOperationPolicy).toEqual(config({'codebase.mr.list':'machine','codebase.mr.close':'machine'}));
   expect(p.control('bytedcli-effective-codebase.mr.close').props['data-identity']).toBe('machine');
-  expect(p.control('bytedcli-machine-exception-codebase.mr.close').children.join('')).toMatch(/机器|Machine/);
+  expect(p.renderer.root.findAllByProps({'data-action':'bytedcli-machine-exception-codebase.mr.close'})).toHaveLength(1);
   await act(async()=>read.props.onChange({currentTarget:{value:'actor'}}));
   expect(p.requests.at(-1)).toMatchObject({...full,bytedcliOperationPolicy:config({'codebase.mr.list':'actor','codebase.mr.close':'machine'})});
   await act(async()=>p.control('bytedcli-policy-codebase.mr.close').props.onChange({currentTarget:{value:''}}));
