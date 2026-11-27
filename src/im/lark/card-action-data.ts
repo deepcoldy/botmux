@@ -22,9 +22,17 @@ export function normalizeCardActionData(input: unknown): CardActionData {
   const wrapped = input.action === undefined && isRecord(input.event) && isRecord(input.event.action);
   const event = wrapped ? input.event as Record<string, unknown> : input;
   const action = isRecord(event.action) ? event.action : undefined;
-  if (!action) return event as CardActionData;
+  const flatActionValue = parseValue(event.action_value);
+  if (!action) {
+    if (!flatActionValue) return event as CardActionData;
+    return {
+      ...event,
+      action: { value: flatActionValue },
+    } as CardActionData;
+  }
 
   let rawValue = action.value;
+  if (rawValue === undefined) rawValue = event.action_value;
   if (rawValue === undefined && Array.isArray(action.behaviors)) {
     rawValue = action.behaviors.find(behavior => isRecord(behavior) && behavior.type === 'callback')?.value;
   }
