@@ -266,6 +266,7 @@ describe('installed Skills library', () => {
 
 describe('dashboard native discovery dialog plugin-cache warning', () => {
   afterEach(() => {
+    vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
 
@@ -277,11 +278,28 @@ describe('dashboard native discovery dialog plugin-cache warning', () => {
     const cacheSkillPath = '/Users/me/.claude/plugins/cache/claude-plugins-official/superpowers/7.0.0/skills/writing-skills';
     const stableSkillPath = '/Users/me/.claude/skills/deploy';
     const postPayloads: any[] = [];
+    const jobPolls: string[] = [];
     const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
       const u = String(url);
       if (u === '/api/skills/install-local-links' && init?.method === 'POST') {
-        postPayloads.push(JSON.parse(String(init.body ?? '{}')));
+        const payload = JSON.parse(String(init.body ?? '{}'));
+        postPayloads.push(payload);
+        if (payload.mode === 'copy') {
+          return {
+            ok: true,
+            status: 202,
+            json: async () => ({ ok: true, job: { id: 'copy-job', type: 'install', status: 'running', createdAt: 'now', updatedAt: 'now' } }),
+          };
+        }
         return { ok: true, status: 200, json: async () => ({ ok: true, installed: [] }) };
+      }
+      if (u === '/api/skills/jobs/copy-job') {
+        jobPolls.push('copy-job');
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ ok: true, job: { id: 'copy-job', type: 'install', status: 'succeeded', createdAt: 'now', updatedAt: 'now', skills: [] } }),
+        };
       }
       if (u.startsWith('/api/skills')) {
         return {
@@ -338,6 +356,7 @@ describe('dashboard native discovery dialog plugin-cache warning', () => {
     await flush();
 
     expect(postPayloads[0]).toEqual({ sources: [cacheSkillPath], mode: 'copy' });
+    expect(jobPolls).toEqual(['copy-job']);
 
     // Reopen and switch to the stable ~/.claude/skills group: no cache warning, submits link mode without `mode`.
     await act(async () => {
@@ -359,6 +378,106 @@ describe('dashboard native discovery dialog plugin-cache warning', () => {
     await flush();
 
     expect(postPayloads[1]).toEqual({ sources: [stableSkillPath] });
+  });
+
+  it('does not let an older copy job close a reopened dialog or clear its new selection', async () => {
+    const cacheSkillPath = '/Users/me/.claude/plugins/cache/claude-plugins-official/superpowers/7.0.0/skills/writing-skills';
+    const stableSkillPath = '/Users/me/.claude/skills/deploy';
+    let completeJob = false;
+    let successfulPolls = 0;
+    vi.stubGlobal('window', {
+      innerWidth: 1200,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      setTimeout: (callback: TimerHandler, timeout?: number, ...args: any[]) => (
+        globalThis.setTimeout(callback, Math.min(timeout ?? 0, 10), ...args)
+      ),
+      clearTimeout: (id: any) => globalThis.clearTimeout(id),
+    });
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      if (u === '/api/skills/install-local-links' && init?.method === 'POST') {
+        return {
+          ok: true,
+          status: 202,
+          json: async () => ({ ok: true, job: { id: 'slow-copy-job', type: 'install', status: 'running', createdAt: 'now', updatedAt: 'now' } }),
+        };
+      }
+      if (u === '/api/skills/jobs/slow-copy-job') {
+        const succeeded = completeJob;
+        if (succeeded) successfulPolls++;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            ok: true,
+            job: {
+              id: 'slow-copy-job', type: 'install', status: succeeded ? 'succeeded' : 'running',
+              createdAt: 'now', updatedAt: 'now', ...(succeeded ? { skills: [] } : {}),
+            },
+          }),
+        };
+      }
+      if (u.startsWith('/api/skills')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            skills: [],
+            nativeSkillGroups: [
+              {
+                cliId: 'claude-code',
+                rootDir: '/Users/me/.claude/plugins/cache/claude-plugins-official/superpowers/7.0.0/skills',
+                label: 'superpowers (plugin)',
+                skills: [{ name: 'writing-skills', rootDir: cacheSkillPath }],
+              },
+              {
+                cliId: 'claude-code', rootDir: '/Users/me/.claude/skills',
+                skills: [{ name: 'deploy', rootDir: stableSkillPath }],
+              },
+            ],
+            trustProjectSkills: 'off',
+            delivery: 'auto',
+          }),
+        };
+      }
+      if (u.startsWith('/api/bots')) return { ok: true, status: 200, json: async () => ({ bots: [] }) };
+      if (u.startsWith('/api/skill-packs')) return { ok: true, status: 200, json: async () => ({ packs: [] }) };
+      return { ok: false, status: 404, json: async () => ({ error: 'not_found' }) };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => { renderer = TestRenderer.create(React.createElement(SkillsPage)); });
+    await flush();
+    const root = renderer.root;
+    await act(async () => { root.findByProps({ 'data-action': 'open-native-skill-discovery' }).props.onClick(); });
+    const cacheCheckbox = root.findAllByProps({ 'data-discovered-skill': true })
+      .find(node => node.props.value === cacheSkillPath)!;
+    await act(async () => { cacheCheckbox.props.onChange({ currentTarget: { checked: true } }); });
+    await act(async () => { root.findByProps({ 'data-action': 'register-discovered-skills' }).props.onClick(); });
+    await flush();
+
+    // Close and reopen while A is still running, then select B in the new session.
+    await act(async () => { root.findByProps({ 'data-action': 'close-discovery' }).props.onClick(); });
+    await act(async () => { root.findByProps({ 'data-action': 'open-native-skill-discovery' }).props.onClick(); });
+    const stableTab = root.findAllByProps({ role: 'tab' })
+      .find(node => String(node.props['data-discovery-tab'] ?? '').includes('/Users/me/.claude/skills'))!;
+    await act(async () => { stableTab.props.onClick(); });
+    const stableCheckbox = root.findAllByProps({ 'data-discovered-skill': true })
+      .find(node => node.props.value === stableSkillPath)!;
+    await act(async () => { stableCheckbox.props.onChange({ currentTarget: { checked: true } }); });
+    expect(stableCheckbox.props.checked).toBe(true);
+    expect(root.findByProps({ id: 'skills-discovery-dialog' }).props.open).toBe(true);
+
+    completeJob = true;
+    await act(async () => {
+      await vi.waitFor(() => expect(successfulPolls).toBe(1), { timeout: 2000, interval: 10 });
+    });
+    await flush();
+
+    expect(root.findByProps({ id: 'skills-discovery-dialog' }).props.open).toBe(true);
+    expect(stableCheckbox.props.checked).toBe(true);
   });
 });
 

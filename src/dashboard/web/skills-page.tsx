@@ -944,6 +944,7 @@ export function SkillsPage() {
   const [activeDiscoveryKey, setActiveDiscoveryKey] = useState<string | null>(null);
   const [selectedDiscovered, setSelectedDiscovered] = useState<Set<string>>(() => new Set());
   const [discoveryCopyMode, setDiscoveryCopyMode] = useState<'auto' | 'copy' | 'link'>('auto');
+  const discoveryGenerationRef = useRef(0);
 
   const [globalBusy, setGlobalBusy] = useState<'project' | 'delivery' | null>(null);
   const [skillBusy, setSkillBusy] = useState<string | null>(null);
@@ -1043,11 +1044,10 @@ export function SkillsPage() {
       if (current.status === 'failed') {
         throw new Error(current.error ?? 'job_failed');
       }
-      await delay(800);
-      if (!mountedRef.current) return null;
       const body = await requestJson(`/api/skills/jobs/${encodeURIComponent(current.id)}`, { method: 'GET' });
       if (!mountedRef.current) return null;
       current = body.job as SkillJob;
+      if (current.status === 'running') await delay(800);
     }
   }
 
@@ -1244,26 +1244,43 @@ export function SkillsPage() {
     if (mountedRef.current) setActiveTab('packs');
   }
 
+  function openNativeDiscovery(): void {
+    discoveryGenerationRef.current += 1;
+    setDiscoveryOpen(true);
+  }
+
+  function closeNativeDiscovery(): void {
+    discoveryGenerationRef.current += 1;
+    setDiscoveryOpen(false);
+    setDiscoveryCopyMode('auto');
+  }
+
   async function registerDiscoveredSkills(): Promise<void> {
     const selected = [...selectedDiscovered].filter(Boolean);
     if (selected.length === 0) {
       setInstallStatus({ text: tr('skills.discoverNothingSelected'), ok: false });
       return;
     }
+    const submissionGeneration = discoveryGenerationRef.current;
     setDiscoveryBusy(true);
     try {
       setInstallStatus({ text: tr('skills.discoverRegisteringBatch', { total: selected.length }), ok: true });
       const payload = effectiveDiscoveryCopy
         ? { sources: selected, mode: 'copy' as const }
         : { sources: selected };
-      await requestJson('/api/skills/install-local-links', {
+      const body = await requestJson('/api/skills/install-local-links', {
         method: 'POST',
         body: JSON.stringify(payload),
       });
       if (!mountedRef.current) return;
-      setDiscoveryOpen(false);
-      setDiscoveryCopyMode('auto');
-      setSelectedDiscovered(new Set());
+      if (effectiveDiscoveryCopy) {
+        const completed = await waitForSkillJob(body.job as SkillJob, setInstallStatus, false);
+        if (!completed || !mountedRef.current) return;
+      }
+      if (discoveryGenerationRef.current === submissionGeneration) {
+        closeNativeDiscovery();
+        setSelectedDiscovered(new Set());
+      }
       await refresh();
       if (mountedRef.current) setInstallStatus({ text: tr('skills.saved'), ok: true });
     } catch (err: any) {
@@ -1629,7 +1646,7 @@ export function SkillsPage() {
               onConfirmInstallSelection={confirmInstallSelection}
               onCloseInstallSelection={() => setInstallSelectionOpen(false)}
               onInstall={installSkill}
-              onOpenNativeDiscovery={() => setDiscoveryOpen(true)}
+              onOpenNativeDiscovery={openNativeDiscovery}
               onCreatePack={createPackFromInstalledSkills}
               InstallPanel={SkillsInstallPanel}
               InstalledLibrary={InstalledSkillsLibrary}
@@ -1705,7 +1722,7 @@ export function SkillsPage() {
             className="skills-discovery-dialog"
             id="skills-discovery-dialog"
             open={discoveryOpen}
-            onClose={() => { setDiscoveryOpen(false); setDiscoveryCopyMode('auto'); }}
+            onClose={closeNativeDiscovery}
           >
             <article>
               <header>
@@ -1717,7 +1734,7 @@ export function SkillsPage() {
                   data-action="close-discovery"
                   aria-label={tr('skills.discoverClose')}
                   title={tr('skills.discoverClose')}
-                  onClick={() => { setDiscoveryOpen(false); setDiscoveryCopyMode('auto'); }}
+                  onClick={closeNativeDiscovery}
                 />
               </header>
               <div className="skills-discovery-body">

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import * as fs from 'node:fs';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -11,11 +12,13 @@ import { runSkillsAdminCommand } from '../src/core/skills/cli-admin-command.js';
 import { runSkillSessionCommand } from '../src/core/skills/cli-session-command.js';
 import { prepareSkillDelivery } from '../src/core/skills/delivery.js';
 import { readSessionSkillManifest, writeSessionSkillManifest } from '../src/core/skills/manifest-store.js';
+import { __testOnly_setSkillMaterializationCopy } from '../src/core/skills/materialization-copy.js';
 import { prepareSessionSkillPrompt } from '../src/core/skills/session-runtime.js';
 import { prepareSkillRootDelivery } from '../src/core/skills/skill-root-delivery.js';
 import {
   classifyMaterializationCopyError,
   formatSkillMaterializationError,
+  formatUnavailableSkillsUserWarning,
   inspectSkillSourceHealth,
 } from '../src/core/skills/source-health.js';
 import type { SessionSkillManifest } from '../src/core/skills/types.js';
@@ -43,6 +46,8 @@ describe('missing local-link skill resilience (#3966)', () => {
   });
 
   afterEach(() => {
+    __testOnly_setSkillMaterializationCopy(undefined);
+    vi.restoreAllMocks();
     vi.unstubAllEnvs();
     rmSync(home, { recursive: true, force: true });
   });
@@ -443,6 +448,96 @@ describe('missing local-link skill resilience (#3966)', () => {
     expect(res.stderr).toContain('vanished-later');
     expect(res.stderr).toContain(linkedDir);
     expect(res.stderr).toContain('botmux skills install');
+  });
+
+  it('revises manifest and catalogs when native delivery hits a post-preflight source EACCES', () => {
+    const brokenDir = join(cacheRoot, 'delivery-broken');
+    const goodDir = join(storeSrc, 'delivery-good');
+    write(join(brokenDir, 'SKILL.md'), '---\nname: delivery-broken\ndescription: Broken during copy\n---\n# Broken');
+    write(join(brokenDir, 'locked', 'secret.md'), 'secret');
+    write(join(goodDir, 'SKILL.md'), '---\nname: delivery-good\ndescription: Good\n---\n# Good');
+    installLocalSkill(brokenDir, { link: true });
+    installLocalSkill(goodDir, { link: false });
+
+    __testOnly_setSkillMaterializationCopy((source, destination) => {
+      if (source === brokenDir) {
+        throw Object.assign(new Error('injected nested source EACCES'), {
+          code: 'EACCES',
+          path: join(brokenDir, 'locked'),
+        });
+      }
+      fs.cpSync(source, destination, { recursive: true });
+    });
+    const base = {
+      bot: { larkAppId: 'app-claude', skills: { include: ['skill:delivery-broken', 'skill:delivery-good'] as const } },
+      global: { plugins: [] },
+      dataDir,
+      cliId: 'claude-code' as const,
+      adapter: createCliAdapterSync('claude-code'),
+      workingDir: join(home, 'repo'),
+      locale: 'en' as const,
+    };
+
+    const cold = prepareCliPluginGeneration({
+      ...base,
+      sessionId: 'delivery-eacces-cold',
+      prompt: 'cold task',
+      replacesPriorGeneration: false,
+    });
+    expect(cold.fatal).toBeFalsy();
+    expect(cold.unavailableSkills?.map(item => [item.name, item.reason])).toEqual([
+      ['delivery-broken', 'unreadable_source'],
+    ]);
+    expect(cold.prompt).toContain('botmux skill show delivery-good');
+    expect(cold.prompt).not.toContain('delivery-broken');
+    expect(cold.skillPluginDir).toBeDefined();
+    expect(existsSync(join(cold.skillPluginDir!, 'skills', 'delivery-good', 'SKILL.md'))).toBe(true);
+    expect(existsSync(join(cold.skillPluginDir!, 'skills', 'delivery-broken'))).toBe(false);
+    const coldManifest = readSessionSkillManifest('delivery-eacces-cold');
+    expect(coldManifest?.prioritySkills.map(skill => skill.name)).toEqual(['delivery-good']);
+    expect(coldManifest?.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'skill_source_missing', skillName: 'delivery-broken' }),
+    ]));
+    expect(cold.skillReadonlyRoots?.every(root => root.startsWith(dataDir))).toBe(true);
+
+    const resumed = prepareCliPluginGeneration({
+      ...base,
+      sessionId: 'delivery-eacces-resume',
+      prompt: 'resume task',
+      replacesPriorGeneration: true,
+      previousSkillCatalogFingerprint: 'stale-fingerprint',
+    });
+    expect(resumed.prompt).toContain('<botmux_skills_refresh>');
+    expect(resumed.prompt).toContain('botmux skill show delivery-good');
+    expect(resumed.prompt).not.toContain('delivery-broken');
+    expect(readSessionSkillManifest('delivery-eacces-resume')?.prioritySkills.map(skill => skill.name)).toEqual(['delivery-good']);
+
+    const onlyBroken = prepareCliPluginGeneration({
+      ...base,
+      bot: { larkAppId: 'app-claude', skills: { include: ['skill:delivery-broken'] } },
+      sessionId: 'delivery-eacces-only-broken',
+      prompt: 'keep prompt',
+      replacesPriorGeneration: false,
+    });
+    expect(onlyBroken.prompt).toBe('keep prompt');
+    expect(onlyBroken.skillPluginDir).toBeUndefined();
+    expect(onlyBroken.skillReadonlyRoots).toBeUndefined();
+    expect(readSessionSkillManifest('delivery-eacces-only-broken')).toBeNull();
+    expect(existsSync(join(dataDir, 'runtime-skills', 'delivery-eacces-only-broken'))).toBe(false);
+    expect(onlyBroken.userWarnings).toHaveLength(1);
+  });
+
+  it('gives source-specific repair guidance instead of registry-only commands for plugin and project sources', () => {
+    const base = { sourcePath: '/missing/source', rootDir: '/missing/source', reason: 'missing_root' as const };
+    const plugin = formatUnavailableSkillsUserWarning([{ ...base, name: 'plugin-skill', sourceType: 'plugin' }], 'en');
+    const project = formatUnavailableSkillsUserWarning([{ ...base, name: 'project-skill', sourceType: 'project' }], 'en');
+    const registry = formatUnavailableSkillsUserWarning([{ ...base, name: 'git-skill', sourceType: 'git' }], 'en');
+
+    expect(plugin).toContain('plugin-provided');
+    expect(plugin).toContain('cannot repair');
+    expect(project).toContain('working tree');
+    expect(registry).toContain('botmux skills update <name>');
+    expect(registry).toContain('botmux skills doctor');
   });
 
   it('warns on CLI --link into versioned plugin cache and supports batch copy registration into the managed store', () => {

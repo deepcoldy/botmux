@@ -1,6 +1,7 @@
-import { cpSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { config } from '../../config.js';
+import { copySkillDirectoryForDelivery } from './materialization-copy.js';
 import {
   buildUnavailableSkillEntry,
   classifyMaterializationCopyError,
@@ -37,7 +38,7 @@ export function prepareSkillRootDelivery(manifest: SessionSkillManifest): SkillR
     }
     const targetDir = join(skillDir, skill.name);
     try {
-      cpSync(skill.rootDir, targetDir, { recursive: true });
+      copySkillDirectoryForDelivery(skill.rootDir, targetDir);
       deliveredSkills.push(skill.name);
     } catch (err) {
       try { rmSync(targetDir, { recursive: true, force: true }); } catch { /* best effort */ }

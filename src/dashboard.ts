@@ -345,9 +345,10 @@ import { createDashboardExecutableResolver, resolveDashboardRuntimeUpdateTargets
 import type { ConnectorDefinition } from './services/connector-store.js';
 import {
   buildSkillInstallAuditSummary,
-  installLocalSkillCopies,
+  installLocalSkillCopiesAsync,
   installLocalSkillLinks,
   readSkillRegistry,
+  recoverLocalSkillCopyTransactions,
   removeInstalledSkill,
   removeInstalledSkills,
   sweepStoreTrash,
@@ -6322,10 +6323,14 @@ const server = createServer(async (req, res) => {
       if (sources.length === 0) return jsonRes(res, 400, { ok: false, error: 'sources_required' });
       if (sources.length > MAX_LOCAL_LINK_SOURCES) return jsonRes(res, 400, { ok: false, error: 'too_many_sources' });
       const mode = parseInstallLocalLinksMode(parsed);
+      if (mode === 'copy') {
+        // Recursive copies use fs/promises inside the job; the HTTP request and
+        // Dashboard event loop stay responsive while the frontend polls it.
+        const job = startSkillJob('install', () => installLocalSkillCopiesAsync(sources));
+        return jsonRes(res, 202, { ok: true, job: publicSkillJob(job) });
+      }
       try {
-        const skills = mode === 'copy'
-          ? installLocalSkillCopies(sources)
-          : installLocalSkillLinks(sources);
+        const skills = installLocalSkillLinks(sources);
         // Frontend re-fetches /api/skills (refresh()) after success, so we keep
         // the response lean — no need to spread a full dashboardSkillsPayload()
         // (which would re-run the native-skill discovery scan a second time).
@@ -9078,8 +9083,13 @@ listenWithProbe({
     logger.warn(`[terminal-route] advertised port ${terminalRoutePort} differs from the listening port ${port}; `
       + 'peer replicas will fail to reach terminals here — set BOTMUX_TERMINAL_ROUTE_PORT explicitly');
   }
-  // Reclaim any `.trash-*` skill trees left by an interrupted background unlink
-  // (crash/restart mid-delete). Best-effort and fire-and-forget.
+  // Resolve durable local-copy transactions first. Their `.copy-backup-*`
+  // trees are not ordinary trash and must never be swept before recovery.
+  try { recoverLocalSkillCopyTransactions(); } catch (err) {
+    logger.error(`[skills] Local-copy transaction recovery failed; it will retry before the next registry write: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  // Reclaim only ordinary `.trash-*` skill trees left by completed transactions
+  // or interrupted background unlink. Best-effort and fire-and-forget.
   sweepStoreTrash();
   startPlatformTunnelIfBound();
   // Scheduled auto-cleanup of idle sessions (config-gated, default OFF). Runs in

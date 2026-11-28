@@ -1,7 +1,8 @@
-import { cpSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { config } from '../../config.js';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
+import { copySkillDirectoryForDelivery } from './materialization-copy.js';
 import {
   buildUnavailableSkillEntry,
   classifyMaterializationCopyError,
@@ -46,7 +47,7 @@ export function prepareClaudeSkillPlugin(manifest: SessionSkillManifest): Claude
     }
     const targetDir = join(skillsDir, skill.name);
     try {
-      cpSync(skill.rootDir, targetDir, { recursive: true });
+      copySkillDirectoryForDelivery(skill.rootDir, targetDir);
       deliveredSkills.push(skill.name);
     } catch (err) {
       try { rmSync(targetDir, { recursive: true, force: true }); } catch { /* best effort */ }

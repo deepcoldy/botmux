@@ -1,6 +1,6 @@
-import { withManagedDirectories } from './managed-directory-retention.js';
-import { closeSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, rmSync, statSync } from 'node:fs';
-import { rm as rmAsync } from 'node:fs/promises';
+import { withManagedDirectories, withManagedDirectoriesAsync } from './managed-directory-retention.js';
+import { chmodSync, closeSync, copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, rmSync, statSync } from 'node:fs';
+import { chmod as chmodAsync, copyFile as copyFileAsync, mkdir as mkdirAsync, readdir as readdirAsync, realpath as realpathAsync, rm as rmAsync, stat as statAsync } from 'node:fs/promises';
 import { execFile, execFileSync, spawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
@@ -8,14 +8,20 @@ import { promisify } from 'node:util';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLock, withFileLockSync } from '../utils/file-lock.js';
 import { logger } from '../utils/logger.js';
+import { readDurableProcessIdentity } from '../utils/process-identity.js';
 import { githubGitAuthEnv } from '../core/github-auth.js';
-import { loadSkillPackage } from '../core/skills/package.js';
+import { isPathWithin, isValidSkillName, loadSkillPackage } from '../core/skills/package.js';
 import { skillRegistryPath, skillSourcesDir, skillStoreDir } from '../core/skills/registry-paths.js';
 import type { SkillPackage, SkillSource } from '../core/skills/types.js';
 import { assertAllowedGitProtocol, assertNoGitUrlCredentials, assertSafeGitRef, assertSafeGitSkillPath, formatAgentbuddyIdentifier, githubToGitUrl, redactGitUrlCredentials } from '../core/skills/sources.js';
 import type { AgentbuddySource } from '../core/skills/sources.js';
 
 const DEFAULT_GIT_TIMEOUT_MS = 60_000;
+const STORE_TRASH_PREFIX = '.trash-';
+const LOCAL_COPY_STAGING_PREFIX = '.copy-staging-';
+const LOCAL_COPY_BACKUP_PREFIX = '.copy-backup-';
+const LOCAL_COPY_JOURNAL_PREFIX = '.copy-transaction-';
+const LOCAL_COPY_STAGING_OWNER_FILE = 'owner.json';
 const execFileAsync = promisify(execFile);
 const gitSourceLocks = new Map<string, Promise<void>>();
 
@@ -166,30 +172,18 @@ export function buildSkillInstallAuditSummary(pkg: SkillPackage): SkillInstallAu
 }
 
 export function installLocalSkill(dir: string, opts: { link: boolean }): SkillPackage {
-  return withManagedDirectories(resolve(dir), () => installLocalSkillWithReservation(dir, opts));
-}
-
-function installLocalSkillWithReservation(dir: string, opts: { link: boolean }): SkillPackage {
-  const sourceDir = resolve(dir);
-  const provisional = loadSkillPackage(sourceDir, {
-    source: opts.link ? { type: 'local-link', path: sourceDir } : { type: 'local-copy', originalPath: sourceDir },
+  if (!opts.link) return installLocalSkillCopies([dir])[0]!;
+  return withManagedDirectories(resolve(dir), () => {
+    const sourceDir = resolve(dir);
+    const pkg = loadSkillPackage(sourceDir, { source: { type: 'local-link', path: sourceDir } });
+    return withSkillRegistryLockSync(() => {
+      const now = new Date().toISOString();
+      const registry = readSkillRegistry();
+      registry.skills[pkg.name] = { ...pkg, installedAt: now, updatedAt: now };
+      writeSkillRegistry(registry);
+      return registry.skills[pkg.name];
+    });
   });
-  const rootDir = opts.link ? sourceDir : join(skillStoreDir(), provisional.name);
-  if (!opts.link) {
-    assertNoCopyOverlap(sourceDir, rootDir);
-    rmSync(rootDir, { recursive: true, force: true });
-    mkdirSync(dirname(rootDir), { recursive: true });
-    cpSync(sourceDir, rootDir, { recursive: true });
-  }
-  const pkg = loadSkillPackage(rootDir, {
-    source: opts.link ? { type: 'local-link', path: sourceDir } : { type: 'local-copy', originalPath: sourceDir },
-    id: provisional.id,
-  });
-  const now = new Date().toISOString();
-  const registry = readSkillRegistry();
-  registry.skills[pkg.name] = { ...pkg, installedAt: now, updatedAt: now };
-  writeSkillRegistry(registry);
-  return registry.skills[pkg.name];
 }
 
 export function installLocalSkillLinks(dirs: readonly string[]): SkillPackage[] {
@@ -213,55 +207,535 @@ export function installLocalSkillLinks(dirs: readonly string[]): SkillPackage[] 
     }
     byName.set(pkg.name, pkg);
   }
-  const now = new Date().toISOString();
-  const registry = readSkillRegistry();
-  const installed: SkillPackage[] = [];
-  for (const pkg of byName.values()) {
-    registry.skills[pkg.name] = { ...pkg, installedAt: now, updatedAt: now };
-    installed.push(registry.skills[pkg.name]);
+  return withSkillRegistryLockSync(() => {
+    const now = new Date().toISOString();
+    const registry = readSkillRegistry();
+    const installed: SkillPackage[] = [];
+    for (const pkg of byName.values()) {
+      registry.skills[pkg.name] = { ...pkg, installedAt: now, updatedAt: now };
+      installed.push(registry.skills[pkg.name]);
+    }
+    writeSkillRegistry(registry);
+    return installed;
+  });
+}
+
+type LocalSkillCopyOps = {
+  copySync: (sourceDir: string, targetDir: string) => void;
+  copyAsync: (sourceDir: string, targetDir: string) => Promise<void>;
+  renameSync: (from: string, to: string) => void;
+  beforeRegistryWrite: () => void;
+};
+
+const REAL_LOCAL_SKILL_COPY_OPS: LocalSkillCopyOps = {
+  copySync: copyLocalSkillTreeSync,
+  copyAsync: copyLocalSkillTreeAsync,
+  renameSync,
+  beforeRegistryWrite: () => undefined,
+};
+let localSkillCopyTestOps: Partial<LocalSkillCopyOps> | undefined;
+
+/** Test seam for deterministic copy / commit failures without depending on the
+ *  CI user's filesystem privileges. Production always uses the real operations. */
+export function __testOnly_setLocalSkillCopyOps(ops: Partial<LocalSkillCopyOps> | undefined): void {
+  localSkillCopyTestOps = ops;
+}
+
+function currentLocalSkillCopyOps(): LocalSkillCopyOps {
+  return { ...REAL_LOCAL_SKILL_COPY_OPS, ...localSkillCopyTestOps };
+}
+
+interface PreparedLocalSkillCopy {
+  name: string;
+  id: string;
+  /** Canonical directory actually copied (a root symlink is deliberately followed). */
+  sourceDir: string;
+  /** Original spelling retained in source.originalPath so update follows a root link. */
+  originalPath: string;
+  targetDir: string;
+  stagedDir: string;
+}
+
+interface StagedLocalSkillCopy extends PreparedLocalSkillCopy {
+  pkg: SkillPackage;
+}
+
+function localCopyError(sourceDir: string, err: unknown): Error {
+  return new Error(`local_copy_failed:${sourceDir}:${err instanceof Error ? err.message : String(err)}`, { cause: err });
+}
+
+function prepareLocalSkillCopies(uniqueDirs: readonly string[]): { items: PreparedLocalSkillCopy[]; stagingRoot: string } {
+  const storeRoot = skillStoreDir();
+  mkdirSync(storeRoot, { recursive: true });
+  const canonicalStoreRoot = realpathSync(storeRoot);
+  const byName = new Map<string, Omit<PreparedLocalSkillCopy, 'stagedDir'>>();
+  for (const originalPath of uniqueDirs) {
+    try {
+      // loadSkillPackage canonicalizes the root. Copying that directory rather
+      // than the root symlink itself keeps the managed copy independent of the
+      // link target while source.originalPath still tracks future updates.
+      const provisional = loadSkillPackage(originalPath, { source: { type: 'local-copy', originalPath } });
+      const targetDir = join(canonicalStoreRoot, provisional.name);
+      assertNoCopyOverlap(provisional.rootDir, targetDir);
+      byName.set(provisional.name, {
+        name: provisional.name,
+        id: provisional.id,
+        sourceDir: provisional.rootDir,
+        originalPath,
+        targetDir,
+      });
+    } catch (err) {
+      throw localCopyError(originalPath, err);
+    }
   }
+  const stagingRoot = mkdtempSync(join(canonicalStoreRoot, LOCAL_COPY_STAGING_PREFIX));
+  atomicWriteFileSync(join(stagingRoot, LOCAL_COPY_STAGING_OWNER_FILE), JSON.stringify({
+    pid: process.pid,
+    identity: readDurableProcessIdentity(process.pid),
+  }) + '\n', { mode: 0o600 });
+  return {
+    stagingRoot,
+    items: [...byName.values()].map(item => ({ ...item, stagedDir: join(stagingRoot, item.name) })),
+  };
+}
+
+function resolveLocalCopySymlinkSync(rootDir: string, linkPath: string): string {
+  const rel = relative(rootDir, linkPath) || '.';
+  let target: string;
+  try {
+    target = realpathSync(linkPath);
+  } catch (err) {
+    throw new Error(`local_skill_symlink_unresolvable:${rel}`, { cause: err });
+  }
+  if (!isPathWithin(rootDir, target)) throw new Error(`local_skill_symlink_outside_source:${rel}`);
+  return target;
+}
+
+async function resolveLocalCopySymlinkAsync(rootDir: string, linkPath: string): Promise<string> {
+  const rel = relative(rootDir, linkPath) || '.';
+  let target: string;
+  try {
+    target = await realpathAsync(linkPath);
+  } catch (err) {
+    throw new Error(`local_skill_symlink_unresolvable:${rel}`, { cause: err });
+  }
+  if (!isPathWithin(rootDir, target)) throw new Error(`local_skill_symlink_outside_source:${rel}`);
+  return target;
+}
+
+/** Materialize links explicitly instead of relying on cpSync's symlink spelling:
+ *  the published copy must never retain a path back into a versioned source.
+ *  Every link is resolved inside the canonical Skill root, and the active real
+ *  directory stack rejects both direct and multi-directory cycles. */
+function copyLocalSkillTreeSync(rootDir: string, targetRoot: string): void {
+  const active = new Set<string>();
+  const copyDirectory = (sourceDir: string, targetDir: string): void => {
+    const canonicalDir = realpathSync(sourceDir);
+    if (active.has(canonicalDir)) throw new Error(`local_skill_symlink_cycle:${relative(rootDir, canonicalDir) || '.'}`);
+    active.add(canonicalDir);
+    try {
+      const directoryStat = statSync(canonicalDir);
+      mkdirSync(targetDir, { recursive: true });
+      for (const entry of readdirSync(canonicalDir, { withFileTypes: true })) {
+        const entryPath = join(canonicalDir, entry.name);
+        const sourcePath = entry.isSymbolicLink()
+          ? resolveLocalCopySymlinkSync(rootDir, entryPath)
+          : entryPath;
+        const sourceStat = statSync(sourcePath);
+        const targetPath = join(targetDir, entry.name);
+        if (sourceStat.isDirectory()) {
+          copyDirectory(sourcePath, targetPath);
+        } else if (sourceStat.isFile()) {
+          copyFileSync(sourcePath, targetPath);
+          chmodSync(targetPath, sourceStat.mode);
+        } else {
+          throw new Error(`local_skill_unsupported_special_file:${relative(rootDir, entryPath)}`);
+        }
+      }
+      // Apply source directory modes only after children are written, so a
+      // read-only source directory cannot make its staged destination unwritable.
+      chmodSync(targetDir, directoryStat.mode);
+    } finally {
+      active.delete(canonicalDir);
+    }
+  };
+  copyDirectory(rootDir, targetRoot);
+}
+
+async function copyLocalSkillTreeAsync(rootDir: string, targetRoot: string): Promise<void> {
+  const active = new Set<string>();
+  const copyDirectory = async (sourceDir: string, targetDir: string): Promise<void> => {
+    const canonicalDir = await realpathAsync(sourceDir);
+    if (active.has(canonicalDir)) throw new Error(`local_skill_symlink_cycle:${relative(rootDir, canonicalDir) || '.'}`);
+    active.add(canonicalDir);
+    try {
+      const directoryStat = await statAsync(canonicalDir);
+      await mkdirAsync(targetDir, { recursive: true });
+      for (const entry of await readdirAsync(canonicalDir, { withFileTypes: true })) {
+        const entryPath = join(canonicalDir, entry.name);
+        const sourcePath = entry.isSymbolicLink()
+          ? await resolveLocalCopySymlinkAsync(rootDir, entryPath)
+          : entryPath;
+        const sourceStat = await statAsync(sourcePath);
+        const targetPath = join(targetDir, entry.name);
+        if (sourceStat.isDirectory()) {
+          await copyDirectory(sourcePath, targetPath);
+        } else if (sourceStat.isFile()) {
+          await copyFileAsync(sourcePath, targetPath);
+          await chmodAsync(targetPath, sourceStat.mode);
+        } else {
+          throw new Error(`local_skill_unsupported_special_file:${relative(rootDir, entryPath)}`);
+        }
+      }
+      await chmodAsync(targetDir, directoryStat.mode);
+    } finally {
+      active.delete(canonicalDir);
+    }
+  };
+  await copyDirectory(rootDir, targetRoot);
+}
+
+function stageLocalSkillCopiesSync(items: readonly PreparedLocalSkillCopy[], ops: LocalSkillCopyOps): StagedLocalSkillCopy[] {
+  return items.map(item => {
+    try {
+      ops.copySync(item.sourceDir, item.stagedDir);
+      const pkg = loadSkillPackage(item.stagedDir, {
+        source: { type: 'local-copy', originalPath: item.originalPath },
+        id: item.id,
+      });
+      if (pkg.name !== item.name) throw new Error(`local_skill_identity_changed:${item.name}->${pkg.name}`);
+      return { ...item, pkg };
+    } catch (err) {
+      throw localCopyError(item.originalPath, err);
+    }
+  });
+}
+
+async function stageLocalSkillCopiesAsync(items: readonly PreparedLocalSkillCopy[], ops: LocalSkillCopyOps): Promise<StagedLocalSkillCopy[]> {
+  const staged: StagedLocalSkillCopy[] = [];
+  // Deliberately sequential: hundreds of large copies must not saturate the
+  // fs threadpool / disk, while each await still leaves the event loop free.
+  for (const item of items) {
+    try {
+      await ops.copyAsync(item.sourceDir, item.stagedDir);
+      const pkg = loadSkillPackage(item.stagedDir, {
+        source: { type: 'local-copy', originalPath: item.originalPath },
+        id: item.id,
+      });
+      if (pkg.name !== item.name) throw new Error(`local_skill_identity_changed:${item.name}->${pkg.name}`);
+      staged.push({ ...item, pkg });
+    } catch (err) {
+      throw localCopyError(item.originalPath, err);
+    }
+  }
+  return staged;
+}
+
+function lexicalPathExists(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch (err: any) {
+    if (err?.code === 'ENOENT') return false;
+    throw err;
+  }
+}
+
+interface LocalCopyJournalItem {
+  name: string;
+  stagedDir: string;
+  targetDir: string;
+  backupDir: string;
+  trashDir: string;
+  hadTarget: boolean;
+}
+
+interface LocalCopyJournal {
+  schemaVersion: 1;
+  id: string;
+  stagingRoot: string;
+  items: LocalCopyJournalItem[];
+  installed: SkillPackage[];
+}
+
+function localCopyJournalPath(storeRoot: string, id: string): string {
+  return join(storeRoot, `${LOCAL_COPY_JOURNAL_PREFIX}${id}.json`);
+}
+
+function cleanupLocalCopyTrash(paths: readonly string[]): void {
+  for (const path of paths) {
+    void rmAsync(path, { recursive: true, force: true }).catch(err => {
+      logger.warn(`[skills] Local-copy trash cleanup failed for ${basename(path)}; startup sweep will retry: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  }
+}
+
+function finalizeLocalCopyJournal(journalPath: string, journal: LocalCopyJournal, ops: LocalSkillCopyOps): string[] {
+  const trashDirs: string[] = [];
+  for (const item of journal.items) {
+    if (lexicalPathExists(item.backupDir)) ops.renameSync(item.backupDir, item.trashDir);
+    if (lexicalPathExists(item.trashDir)) trashDirs.push(item.trashDir);
+  }
+  rmSync(journalPath, { force: true });
+  return trashDirs;
+}
+
+function assertLocalCopyJournal(journal: LocalCopyJournal, journalPath: string, storeRoot: string): void {
+  const valid = journal.schemaVersion === 1
+    && /^[a-f0-9]{16}$/.test(journal.id)
+    && localCopyJournalPath(storeRoot, journal.id) === journalPath
+    && dirname(journal.stagingRoot) === storeRoot
+    && basename(journal.stagingRoot).startsWith(LOCAL_COPY_STAGING_PREFIX)
+    && Array.isArray(journal.items)
+    && Array.isArray(journal.installed)
+    && journal.items.length === journal.installed.length;
+  if (!valid) throw new Error(`local_copy_recovery_invalid_journal:${journalPath}`);
+  journal.items.forEach((item, index) => {
+    const validItem = isValidSkillName(item.name)
+      && journal.installed[index]?.name === item.name
+      && item.stagedDir === join(journal.stagingRoot, item.name)
+      && item.targetDir === join(storeRoot, item.name)
+      && item.backupDir === join(storeRoot, `${LOCAL_COPY_BACKUP_PREFIX}${journal.id}-${index}`)
+      && item.trashDir === join(storeRoot, `${STORE_TRASH_PREFIX}${journal.id}-${index}`)
+      && typeof item.hadTarget === 'boolean';
+    if (!validItem) throw new Error(`local_copy_recovery_invalid_journal:${journalPath}`);
+  });
+}
+
+function recoverLocalCopyJournal(journalPath: string, storeRoot: string): void {
+  const journal = JSON.parse(readFileSync(journalPath, 'utf-8')) as LocalCopyJournal;
+  assertLocalCopyJournal(journal, journalPath, storeRoot);
+  const ops = REAL_LOCAL_SKILL_COPY_OPS;
+  // Each rename is idempotent against the filesystem state left by a hard
+  // exit. A staged tree still present means the new generation was not fully
+  // installed; an absent staged tree means it is already at targetDir.
+  for (const item of journal.items) {
+    const stagedExists = lexicalPathExists(item.stagedDir);
+    const targetExists = lexicalPathExists(item.targetDir);
+    const backupExists = lexicalPathExists(item.backupDir);
+    const trashExists = lexicalPathExists(item.trashDir);
+    if (stagedExists) {
+      if (targetExists) {
+        if (trashExists) throw new Error(`local_copy_recovery_conflict:${item.name}`);
+        if (backupExists) {
+          // A failed rollback can leave BOTH the old target and its backup.
+          // The backup preserves the old generation, so this duplicate target
+          // is safe to replace with the staged new generation.
+          rmSync(item.targetDir, { recursive: true, force: true });
+        } else if (item.hadTarget) {
+          // Exit during rollback after the old target was restored but before
+          // the journal was removed: move that old target aside once more.
+          ops.renameSync(item.targetDir, item.backupDir);
+        } else {
+          throw new Error(`local_copy_recovery_conflict:${item.name}`);
+        }
+      }
+      ops.renameSync(item.stagedDir, item.targetDir);
+    } else if (!targetExists) {
+      // Never delete the only old backup or guess at a partial new generation.
+      throw new Error(`local_copy_recovery_missing_new_tree:${item.name}`);
+    }
+  }
+  const registry = readSkillRegistry();
+  for (const pkg of journal.installed) registry.skills[pkg.name] = pkg;
   writeSkillRegistry(registry);
+  const trashDirs = finalizeLocalCopyJournal(journalPath, journal, ops);
+  rmSync(journal.stagingRoot, { recursive: true, force: true });
+  cleanupLocalCopyTrash(trashDirs);
+}
+
+function localCopyStagingOwnerAlive(stagingRoot: string): boolean {
+  let owner: { pid?: unknown; identity?: unknown };
+  try {
+    owner = JSON.parse(readFileSync(join(stagingRoot, LOCAL_COPY_STAGING_OWNER_FILE), 'utf-8'));
+  } catch {
+    return true; // Unknown ownership is never proof that deletion is safe.
+  }
+  if (!Number.isSafeInteger(owner.pid) || (owner.pid as number) <= 1) return true;
+  const pid = owner.pid as number;
+  try { process.kill(pid, 0); } catch (err: any) {
+    if (err?.code === 'ESRCH') return false;
+    return true;
+  }
+  const identity = readDurableProcessIdentity(pid);
+  return !identity || typeof owner.identity !== 'string' || identity === owner.identity;
+}
+
+function reclaimDeadLocalCopyStagingLocked(storeRoot: string): void {
+  for (const entry of readdirSync(storeRoot, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !entry.name.startsWith(LOCAL_COPY_STAGING_PREFIX)) continue;
+    const stagingRoot = join(storeRoot, entry.name);
+    if (!localCopyStagingOwnerAlive(stagingRoot)) {
+      rmSync(stagingRoot, { recursive: true, force: true });
+    }
+  }
+}
+
+function recoverLocalCopyJournalsLocked(): void {
+  const storeRoot = skillStoreDir();
+  if (!lexicalPathExists(storeRoot)) return;
+  const canonicalStoreRoot = realpathSync(storeRoot);
+  const journals = readdirSync(canonicalStoreRoot)
+    .filter(name => name.startsWith(LOCAL_COPY_JOURNAL_PREFIX) && name.endsWith('.json'))
+    .sort();
+  for (const name of journals) recoverLocalCopyJournal(join(canonicalStoreRoot, name), canonicalStoreRoot);
+  reclaimDeadLocalCopyStagingLocked(canonicalStoreRoot);
+}
+
+function skillRegistryOperationLockTarget(): string {
+  const dir = dirname(skillRegistryPath());
+  mkdirSync(dir, { recursive: true });
+  return join(dir, 'registry-operation');
+}
+
+function withSkillRegistryLockSync<T>(operation: () => T): T {
+  if (skillRegistryAsyncLockDepth > 0) throw new Error('skill_registry_busy');
+  return withFileLockSync(skillRegistryOperationLockTarget(), () => {
+    recoverLocalCopyJournalsLocked();
+    return operation();
+  }, { maxWaitMs: 60_000 });
+}
+
+let skillRegistryAsyncLockDepth = 0;
+
+async function withSkillRegistryLockAsync<T>(operation: () => Promise<T>): Promise<T> {
+  skillRegistryAsyncLockDepth++;
+  try {
+    return await withFileLock(skillRegistryOperationLockTarget(), async () => {
+      recoverLocalCopyJournalsLocked();
+      return operation();
+    }, { maxWaitMs: 60_000 });
+  } finally {
+    skillRegistryAsyncLockDepth--;
+  }
+}
+
+/** Resolve interrupted local-copy transactions before the startup trash sweep
+ *  or any other registry writer can remove / overwrite their only old backup. */
+export function recoverLocalSkillCopyTransactions(): void {
+  withSkillRegistryLockSync(() => undefined);
+}
+
+class LocalCopyRollbackFailedError extends AggregateError {}
+
+function commitLocalSkillCopies(items: readonly StagedLocalSkillCopy[], ops: LocalSkillCopyOps): SkillPackage[] {
+  if (items.length === 0) return [];
+  const stagingRoot = dirname(items[0]!.stagedDir);
+  const storeRoot = dirname(stagingRoot);
+  const id = randomBytes(8).toString('hex');
+  const journalPath = localCopyJournalPath(storeRoot, id);
+  const now = new Date().toISOString();
+  const installed = items.map(item => ({
+    ...item.pkg,
+    rootDir: item.targetDir,
+    installedAt: now,
+    updatedAt: now,
+  }));
+  const journal: LocalCopyJournal = {
+    schemaVersion: 1,
+    id,
+    stagingRoot,
+    installed,
+    items: items.map((item, index) => ({
+      name: item.name,
+      stagedDir: item.stagedDir,
+      targetDir: item.targetDir,
+      backupDir: join(storeRoot, `${LOCAL_COPY_BACKUP_PREFIX}${id}-${index}`),
+      trashDir: join(storeRoot, `${STORE_TRASH_PREFIX}${id}-${index}`),
+      hadTarget: lexicalPathExists(item.targetDir),
+    })),
+  };
+  // Durable commit intent precedes the first target rename. Recovery merges
+  // only this transaction's packages, preserving unrelated registry entries.
+  atomicWriteFileSync(journalPath, JSON.stringify(journal, null, 2) + '\n', { mode: 0o600 });
+  const backups: LocalCopyJournalItem[] = [];
+  const committed: LocalCopyJournalItem[] = [];
+  try {
+    for (const item of journal.items) {
+      if (!item.hadTarget) continue;
+      ops.renameSync(item.targetDir, item.backupDir);
+      backups.push(item);
+    }
+    for (const item of journal.items) {
+      ops.renameSync(item.stagedDir, item.targetDir);
+      committed.push(item);
+    }
+    const registry = readSkillRegistry();
+    for (const pkg of installed) registry.skills[pkg.name] = pkg;
+    ops.beforeRegistryWrite();
+    writeSkillRegistry(registry);
+  } catch (err) {
+    const rollbackErrors: unknown[] = [];
+    for (const item of [...committed].reverse()) {
+      try { ops.renameSync(item.targetDir, item.stagedDir); } catch (rollbackErr) { rollbackErrors.push(rollbackErr); }
+    }
+    for (const item of [...backups].reverse()) {
+      try { ops.renameSync(item.backupDir, item.targetDir); } catch (rollbackErr) { rollbackErrors.push(rollbackErr); }
+    }
+    if (rollbackErrors.length === 0) {
+      try { rmSync(journalPath, { force: true }); } catch (rollbackErr) { rollbackErrors.push(rollbackErr); }
+    }
+    if (rollbackErrors.length > 0) throw new LocalCopyRollbackFailedError([err, ...rollbackErrors], 'local_copy_rollback_failed');
+    throw err;
+  }
+  let trashDirs: string[];
+  try {
+    trashDirs = finalizeLocalCopyJournal(journalPath, journal, ops);
+  } catch (err) {
+    // Registry and new trees are already committed. The durable journal keeps
+    // the remaining cleanup recoverable; do not roll back a published generation.
+    logger.warn(`[skills] Local-copy journal finalization awaits recovery for ${id}: ${err instanceof Error ? err.message : String(err)}`);
+    return installed;
+  }
+  cleanupLocalCopyTrash(trashDirs);
   return installed;
+}
+
+function cleanupLocalCopyStaging(stagingRoot: string): void {
+  try { rmSync(stagingRoot, { recursive: true, force: true }); } catch (err) {
+    logger.warn(`[skills] Local-copy staging cleanup failed for ${basename(stagingRoot)}: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 export function installLocalSkillCopies(dirs: readonly string[]): SkillPackage[] {
   const uniqueDirs = [...new Set(dirs.map((dir) => resolve(dir)))];
   return withManagedDirectories(uniqueDirs, () => {
-    // Validate and collapse by skill NAME (last-wins) before touching the store
-    // or registry, mirroring installLocalSkillLinks.
-    const byName = new Map<string, { sourceDir: string; id: string }>();
-    for (const sourceDir of uniqueDirs) {
-      let provisional: SkillPackage;
-      try {
-        provisional = loadSkillPackage(sourceDir, { source: { type: 'local-copy', originalPath: sourceDir } });
-        const targetDir = join(skillStoreDir(), provisional.name);
-        assertNoCopyOverlap(sourceDir, targetDir);
-      } catch (err: any) {
-        throw new Error(`local_copy_failed:${sourceDir}:${err?.message ?? String(err)}`);
-      }
-      byName.set(provisional.name, { sourceDir, id: provisional.id });
+    if (uniqueDirs.length === 0) return [];
+    const { items, stagingRoot } = prepareLocalSkillCopies(uniqueDirs);
+    const ops = currentLocalSkillCopyOps();
+    let preserveStagingForRecovery = false;
+    try {
+      const staged = stageLocalSkillCopiesSync(items, ops);
+      return withSkillRegistryLockSync(() => commitLocalSkillCopies(staged, ops));
+    } catch (err) {
+      if (err instanceof LocalCopyRollbackFailedError) preserveStagingForRecovery = true;
+      throw err;
+    } finally {
+      if (!preserveStagingForRecovery) cleanupLocalCopyStaging(stagingRoot);
     }
-    const now = new Date().toISOString();
-    const registry = readSkillRegistry();
-    const installed: SkillPackage[] = [];
-    for (const [name, item] of byName.entries()) {
-      const rootDir = join(skillStoreDir(), name);
-      try {
-        rmSync(rootDir, { recursive: true, force: true });
-        mkdirSync(dirname(rootDir), { recursive: true });
-        cpSync(item.sourceDir, rootDir, { recursive: true });
-        const pkg = loadSkillPackage(rootDir, {
-          source: { type: 'local-copy', originalPath: item.sourceDir },
-          id: item.id,
-        });
-        registry.skills[pkg.name] = { ...pkg, installedAt: now, updatedAt: now };
-        installed.push(registry.skills[pkg.name]);
-      } catch (err: any) {
-        throw new Error(`local_copy_failed:${item.sourceDir}:${err?.message ?? String(err)}`);
+  });
+}
+
+export async function installLocalSkillCopiesAsync(dirs: readonly string[]): Promise<SkillPackage[]> {
+  const uniqueDirs = [...new Set(dirs.map((dir) => resolve(dir)))];
+  return withManagedDirectoriesAsync(uniqueDirs, async () => {
+    if (uniqueDirs.length === 0) return [];
+    const { items, stagingRoot } = prepareLocalSkillCopies(uniqueDirs);
+    const ops = currentLocalSkillCopyOps();
+    let preserveStagingForRecovery = false;
+    try {
+      const staged = await stageLocalSkillCopiesAsync(items, ops);
+      return await withSkillRegistryLockAsync(async () => commitLocalSkillCopies(staged, ops));
+    } catch (err) {
+      if (err instanceof LocalCopyRollbackFailedError) preserveStagingForRecovery = true;
+      throw err;
+    } finally {
+      if (!preserveStagingForRecovery) {
+        try { await rmAsync(stagingRoot, { recursive: true, force: true }); } catch (err) {
+          logger.warn(`[skills] Local-copy staging cleanup failed for ${basename(stagingRoot)}: ${err instanceof Error ? err.message : String(err)}`);
+        }
       }
     }
-    writeSkillRegistry(registry);
-    return installed;
   });
 }
 
@@ -449,10 +923,11 @@ export function installLocalSkillsFromSource(
     fullDepth: opts.fullDepth,
     fallbackToFullDepth: !opts.fullDepth,
   });
-  return selectDiscoveredSkills(discovery.skills, opts).map(candidate => {
-    const skillDir = candidate.path === '.' ? sourceDir : join(sourceDir, candidate.path);
-    return installLocalSkill(skillDir, { link: opts.link });
-  });
+  const selectedDirs = selectDiscoveredSkills(discovery.skills, opts).map(candidate =>
+    candidate.path === '.' ? sourceDir : join(sourceDir, candidate.path));
+  return opts.link
+    ? installLocalSkillLinks(selectedDirs)
+    : installLocalSkillCopies(selectedDirs);
 }
 
 function gitSkillDir(sourceDir: string, path: string): string {
@@ -919,9 +1394,9 @@ function installGitSkillLocked(opts: {
   sourceOverride?: SkillSource;
 }): SkillPackage {
   const checkout = checkoutGitSource(opts.url, opts.ref);
-  return persistInstalledGitSkills([
+  return withSkillRegistryLockSync(() => persistInstalledGitSkills([
     copyGitSkillFromCheckout({ ...opts, ...checkout }),
-  ])[0];
+  ]))[0];
 }
 
 function copyGitSkillFromCheckout(opts: {
@@ -973,9 +1448,10 @@ async function installGitSkillAsyncLocked(opts: {
   sourceOverride?: SkillSource;
 }): Promise<SkillPackage> {
   const checkout = await checkoutGitSourceAsync(opts.url, opts.ref);
-  return persistInstalledGitSkills([
+  const installed = await withSkillRegistryLockAsync(async () => persistInstalledGitSkills([
     copyGitSkillFromCheckout({ ...opts, ...checkout }),
-  ])[0];
+  ]));
+  return installed[0]!;
 }
 
 function sourceOverrideForCandidate(source: SkillSource | undefined, candidate: DiscoveredSkillCandidate): SkillSource | undefined {
@@ -997,12 +1473,12 @@ export function installGitSkillsFromSource(opts: {
       fallbackToFullDepth: !opts.fullDepth,
     });
     const selected = selectDiscoveredSkills(discovery.skills, opts);
-    return persistInstalledGitSkills(selected.map(candidate => copyGitSkillFromCheckout({
+    return withSkillRegistryLockSync(() => persistInstalledGitSkills(selected.map(candidate => copyGitSkillFromCheckout({
       ...checkout,
       url: opts.url,
       path: candidate.path,
       sourceOverride: sourceOverrideForCandidate(opts.sourceOverride, candidate),
-    })));
+    }))));
   });
 }
 
@@ -1018,12 +1494,12 @@ export async function installGitSkillsFromSourceAsync(opts: {
       fallbackToFullDepth: !opts.fullDepth,
     });
     const selected = selectDiscoveredSkills(discovery.skills, opts);
-    return persistInstalledGitSkills(selected.map(candidate => copyGitSkillFromCheckout({
+    return withSkillRegistryLockAsync(async () => persistInstalledGitSkills(selected.map(candidate => copyGitSkillFromCheckout({
       ...checkout,
       url: opts.url,
       path: candidate.path,
       sourceOverride: sourceOverrideForCandidate(opts.sourceOverride, candidate),
-    })));
+    }))));
   });
 }
 
@@ -1315,7 +1791,7 @@ export function installAgentbuddySkill(opts: AgentbuddySource, requireSkillName?
       runAgentbuddyCli(agentbuddyInstallArgs(opts), staging, 'agentbuddy_command_failed');
       const verifyTelemetryStripped = !agentbuddyKeepTelemetry();
       if (verifyTelemetryStripped) clearAgentbuddyTelemetry(staging);
-      return registerAgentbuddyStaging(opts, identifier, staging, { requireSkillName, verifyTelemetryStripped });
+      return withSkillRegistryLockSync(() => registerAgentbuddyStaging(opts, identifier, staging, { requireSkillName, verifyTelemetryStripped }));
     } finally {
       rmSync(staging, { recursive: true, force: true });
     }
@@ -1335,7 +1811,7 @@ export async function installAgentbuddySkillAsync(opts: AgentbuddySource, requir
       await runAgentbuddyCliAsync(agentbuddyInstallArgs(opts), staging, 'agentbuddy_command_failed');
       const verifyTelemetryStripped = !agentbuddyKeepTelemetry();
       if (verifyTelemetryStripped) await runAgentbuddyCliAsync(['clear-embedded-telemetry', staging], staging, 'agentbuddy_clear_telemetry_failed');
-      return registerAgentbuddyStaging(opts, identifier, staging, { requireSkillName, verifyTelemetryStripped });
+      return await withSkillRegistryLockAsync(async () => registerAgentbuddyStaging(opts, identifier, staging, { requireSkillName, verifyTelemetryStripped }));
     } finally {
       rmSync(staging, { recursive: true, force: true });
     }
@@ -1359,7 +1835,6 @@ export function removeInstalledSkill(name: string): { ok: true } | { ok: false; 
  *  truth, keyed by name → rootDir), so a `.trash-*` sibling is inert; it only
  *  needs a name that can never collide with a real skill name (skill names
  *  cannot begin with a dot). */
-const STORE_TRASH_PREFIX = '.trash-';
 
 /** Remove a store-managed skill tree WITHOUT blocking the caller (and, on the
  *  dashboard, its whole event loop) on a large synchronous `rmSync`.
@@ -1445,6 +1920,12 @@ export function sweepStoreTrash(): void {
 }
 
 export function removeInstalledSkills(names: readonly string[]):
+  | { ok: true; removed: string[] }
+  | { ok: false; reason: string; missing?: string[] } {
+  return withSkillRegistryLockSync(() => removeInstalledSkillsLocked(names));
+}
+
+function removeInstalledSkillsLocked(names: readonly string[]):
   | { ok: true; removed: string[] }
   | { ok: false; reason: string; missing?: string[] } {
   const uniqueNames = [...new Set(names.map(name => name.trim()).filter(Boolean))];

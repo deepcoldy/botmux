@@ -147,6 +147,15 @@ export function repairGuidanceForSkill(entry: Pick<UnavailableSkillEntry, 'name'
   if (entry.sourceType === 'local-link') {
     return `Reinstall in copy mode (\`botmux skills install <path>\` without \`--link\`), or remove/detach it (\`botmux skills remove ${entry.name}\` / \`/skills detach ${entry.name}\`); run \`botmux skills doctor\` to list all broken links.`;
   }
+  if (entry.sourceType === 'plugin') {
+    return `Repair or update the plugin that provides "${entry.name}", then restart the session; \`botmux skills update\` only manages registry-installed Skills.`;
+  }
+  if (entry.sourceType === 'project') {
+    return `Restore the project Skill directory and SKILL.md in the working tree, then restart the session.`;
+  }
+  if (entry.sourceType === 'bundled' || entry.sourceType === 'user' || entry.sourceType === 'admin') {
+    return `Repair or reinstall the package/source directory that provides "${entry.name}", then restart the session.`;
+  }
   return `Reinstall or update with \`botmux skills update ${entry.name}\` (or \`botmux skills install <source>\`), or run \`botmux skills doctor\` to inspect broken entries.`;
 }
 
@@ -229,6 +238,32 @@ export function mergeUnavailableSkills(
   return [...byName.values()];
 }
 
+function userRepairGuidanceForSource(sourceType: SkillSource['type'], locale: 'zh' | 'en'): string {
+  if (sourceType === 'local-link') {
+    return locale === 'en'
+      ? 'For local-link entries (especially `.claude/plugins/cache/...`): reinstall in copy mode with `botmux skills install <new-path>` (without `--link`), or remove/detach unused entries (`botmux skills remove <name>` / `/skills detach <name>`). Run `botmux skills doctor` to inspect all broken links.'
+      : '对于 local-link 项（尤其是 `.claude/plugins/cache/...`）：请改用复制模式重新安装 `botmux skills install <新路径>`（不要加 `--link`），或清理不再需要的引用（`botmux skills remove <name>` / `/skills detach <name>`）；运行 `botmux skills doctor` 可查看全部失效项。';
+  }
+  if (sourceType === 'plugin') {
+    return locale === 'en'
+      ? 'For plugin-provided Skills: repair or update the providing plugin, then restart the session. Registry-only `botmux skills update` / `doctor` cannot repair these entries.'
+      : '对于插件提供的 Skill：请修复或更新对应插件后重启会话；仅面向注册表的 `botmux skills update` / `doctor` 无法修复这些条目。';
+  }
+  if (sourceType === 'project') {
+    return locale === 'en'
+      ? 'For project Skills: restore the Skill directory and SKILL.md in the working tree, then restart the session.'
+      : '对于项目 Skill：请在工作目录中恢复对应 Skill 目录及 SKILL.md，然后重启会话。';
+  }
+  if (sourceType === 'bundled' || sourceType === 'user' || sourceType === 'admin') {
+    return locale === 'en'
+      ? 'For bundled/external Skills: repair or reinstall the package or source directory shown above, then restart the session.'
+      : '对于 bundled/外部 Skill：请修复或重新安装上方显示的软件包或源目录，然后重启会话。';
+  }
+  return locale === 'en'
+    ? 'For registry-installed Skills: reinstall or update with `botmux skills update <name>` / `botmux skills install <source>`, or run `botmux skills doctor` to inspect broken entries.'
+    : '对于已注册到 Botmux 管理库的 Skill：请运行 `botmux skills update <name>` 或 `botmux skills install <source>` 重新安装；也可运行 `botmux skills doctor` 检查失效项。';
+}
+
 const MAX_DETAILED_WARNING_ITEMS = 10;
 
 /**
@@ -241,7 +276,7 @@ export function formatUnavailableSkillsUserWarning(
 ): string | null {
   if (entries.length === 0) return null;
 
-  const hasLocalLink = entries.some(entry => entry.sourceType === 'local-link');
+  const repairGuidance = [...new Set(entries.map(entry => userRepairGuidanceForSource(entry.sourceType, locale)))];
   const detailed = entries.slice(0, MAX_DETAILED_WARNING_ITEMS);
   const remaining = entries.slice(MAX_DETAILED_WARNING_ITEMS);
 
@@ -253,15 +288,7 @@ export function formatUnavailableSkillsUserWarning(
     if (remaining.length > 0) {
       lines.push(`- …and ${remaining.length} more: ${remaining.map(entry => entry.name).join(', ')}`);
     }
-    if (hasLocalLink) {
-      lines.push(
-        'How to fix: if these local-link entries pointed into a versioned plugin cache (such as `.claude/plugins/cache/...`), reinstall them in copy mode with `botmux skills install <new-path>` (without `--link`), or remove/detach unused entries (`botmux skills remove <name>` / `/skills detach <name>`). Run `botmux skills doctor` to inspect all broken links.',
-      );
-    } else {
-      lines.push(
-        'How to fix: reinstall or update with `botmux skills update <name>` / `botmux skills install <source>`, or run `botmux skills doctor` to inspect all broken entries.',
-      );
-    }
+    lines.push(...repairGuidance);
     return lines.join('\n');
   }
 
@@ -272,14 +299,6 @@ export function formatUnavailableSkillsUserWarning(
   if (remaining.length > 0) {
     lines.push(`- 另有 ${remaining.length} 个失效项：${remaining.map(entry => entry.name).join('、')}`);
   }
-  if (hasLocalLink) {
-    lines.push(
-      '修复方式：若链接指向插件版本缓存目录（如 `.claude/plugins/cache/...`），请改用复制模式重新安装 `botmux skills install <新路径>`（不要加 `--link`），或清理不再需要的引用（`botmux skills remove <name>` / `/skills detach <name>`）；运行 `botmux skills doctor` 可查看全部失效项。',
-    );
-  } else {
-    lines.push(
-      '修复方式：请运行 `botmux skills update <name>` 或 `botmux skills install <source>` 重新安装；运行 `botmux skills doctor` 可查看全部失效项。',
-    );
-  }
+  lines.push(...repairGuidance);
   return lines.join('\n');
 }
