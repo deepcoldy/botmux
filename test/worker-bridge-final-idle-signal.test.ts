@@ -129,7 +129,7 @@ describe('TRAE native turn completion → transcript terminal evidence', () => {
       noteSpawnArgvTurnStartTranscriptEvidence() {},
       pruneExpiredStructuredHeadsAndEmit() {},
       emitReadyCodexTurns: emit,
-      idleDetector: { fireIdle: vi.fn(), noteTranscriptTerminal: noteTerminal, noteTranscriptTurnStarted: noteStarted },
+      idleDetector: { fireIdle: vi.fn(), noteTranscriptTerminal: noteTerminal, noteTranscriptTurnStarted: noteStarted, programStatusHeldWorking: () => false },
       cliSpawnGeneration: 1,
       cliRestartInProgress: false,
     };
