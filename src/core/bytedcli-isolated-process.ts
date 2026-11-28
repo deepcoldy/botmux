@@ -1,6 +1,7 @@
 import { existsSync, lstatSync, realpathSync, statSync } from 'node:fs';
 import { dirname, isAbsolute, relative, resolve } from 'node:path';
 import { systemBwrapPath } from './system-bwrap.js';
+import { bytedcliNodeBuiltinSupportRoot } from './bytedcli-runtime-integrity.js';
 import { BytedcliBrokerError, type BytedcliChildInvocation, type BytedcliTrustedCli } from './bytedcli-broker-process.js';
 
 const libraries = ['/lib/x86_64-linux-gnu', '/usr/lib/x86_64-linux-gnu', '/lib/aarch64-linux-gnu', '/usr/lib/aarch64-linux-gnu', '/lib64', '/usr/lib64'];
@@ -40,6 +41,8 @@ export function isolateBytedcliInvocation(invocation: BytedcliChildInvocation, c
   // The discovery descriptor also protects dirname(runtime), but mounting an
   // entire bin directory is unnecessary. Bind only the executable itself.
   for (const path of cli.protectedPaths ?? []) if (path !== dirname(cli.executable)) bind(path);
+  const builtinSupport = bytedcliNodeBuiltinSupportRoot(cli.executable);
+  if (builtinSupport) bind(builtinSupport, true);
   bind(cli.executable);
   if (cli.dbRuntime) {
     if (!cli.dbRuntime.stillCurrent()) fail();

@@ -3987,7 +3987,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
       getActiveCount: () => 1,
       closeSession: vi.fn(),
       onWorkerGenerationRetired: async (_session, { workerGeneration }) => {
-        events.push(`retire:${workerGeneration}`);
+        events.push(`retire:${workerGeneration}@${ds.workerGeneration}`);
       },
     });
     const ds = makeDs();
@@ -4003,9 +4003,50 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     if (!live) { ds.worker = null; ds.workerReady = false; }
 
     forkWorker(ds, '', true);
+    const duplicateAdmission = vi.fn();
+    forkWorker(ds, 'second-replacement', true, { onAdmission: duplicateAdmission });
+    expect(duplicateAdmission).toHaveBeenCalledWith('rejected');
     expect(forkMock).toHaveBeenCalledTimes(1);
     await vi.waitFor(() => expect(forkMock).toHaveBeenCalledTimes(2));
-    expect(events).toEqual(['fork', 'retire:1', 'fork']);
+    expect(events).toEqual(['fork', 'retire:1@2', 'fork']);
+  });
+
+  it('does not overwrite a pending retirement when the old worker exits', async () => {
+    let release!: () => void;
+    const cleanup = new Promise<void>(resolve => { release = resolve; });
+    const retired: number[] = [];
+    const firstAdmission = vi.fn(), retryAdmission = vi.fn();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onWorkerGenerationRetired: async (_session, { workerGeneration }) => {
+        retired.push(workerGeneration);
+        if (workerGeneration === 1) await cleanup;
+      },
+    });
+    const ds = makeDs(); ds.session.sessionId = 'sid-strict-retirement-exit';
+    setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+    forkWorker(ds, 'hello', false);
+    const oldWorker = forkMock.mock.results.at(-1)!.value;
+    oldWorker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+    await Promise.resolve();
+    Object.assign(ds.session, { bytecloudBrokerStrict: true, bytecloudBrokerColdStart: true });
+    ds.initConfig = { ...ds.initConfig, bytedcliContainment: {} } as any;
+
+    forkWorker(ds, 'first-replacement', true, { onAdmission: firstAdmission });
+    await Promise.resolve();
+    expect(firstAdmission).toHaveBeenCalledWith('deferred');
+    expect(retired).toEqual([1]);
+    oldWorker.emit('exit', 0, null);
+    release();
+    await vi.waitFor(() => expect(firstAdmission).toHaveBeenCalledWith('rejected'));
+    expect(forkMock).toHaveBeenCalledTimes(1);
+
+    forkWorker(ds, 'explicit-retry', true, { onAdmission: retryAdmission });
+    await vi.waitFor(() => expect(forkMock).toHaveBeenCalledTimes(2));
+    expect(retired).toEqual([1, ds.workerGeneration - 1]);
   });
 
   it('stays silent when suspendWorker retires the worker after the turn committed', async () => {

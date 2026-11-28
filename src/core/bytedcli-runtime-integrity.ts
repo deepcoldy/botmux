@@ -6,11 +6,18 @@ import { ensureBytedcliPrivateDirectory } from './bytedcli-broker-audit.js';
 /** Node searches ancestor node_modules and follows package symlinks. Freeze
  * those complete trees, including their canonical targets, before any CLI
  * probe can run. Bounded traversal rejects an unprovable installation. */
+export function bytedcliNodeBuiltinSupportRoot(runtimeExecutable?: string): string | undefined {
+  if (!runtimeExecutable) return undefined;
+  const root = join(dirname(dirname(realpathSync(runtimeExecutable))), 'share', 'nodejs');
+  return existsSync(root) ? root : undefined;
+}
+
 export function snapshotBytedcliRuntimeTrees(entrypoint: string, installationRoot: string, runtimeExecutable?: string): {
   readonly protectedPaths: readonly string[]; readonly stillCurrent: () => boolean;
 } {
   const fallback = runtimeExecutable ? [join(dirname(dirname(realpathSync(runtimeExecutable))), 'lib', 'node')] : [];
-  return snapshotTrees([installationRoot, ...fallback], entrypoint);
+  const builtinSupport = bytedcliNodeBuiltinSupportRoot(runtimeExecutable);
+  return snapshotTrees([installationRoot, ...fallback, ...(builtinSupport ? [builtinSupport] : [])], entrypoint);
 }
 export function snapshotBytedcliTrustedFiles(paths: readonly string[]): {
   readonly protectedPaths: readonly string[]; readonly stillCurrent: () => boolean;
