@@ -28,6 +28,7 @@ import { classifyStuckPage, shouldHoldInputForHookReview, shouldHoldInputForStuc
 import { t } from '../src/i18n/index.js';
 import { TerminalRenderer } from '../src/utils/terminal-renderer.js';
 import { traexQuestionFlowVisible } from '../src/utils/traex-question-page.js';
+import { IdleDetector } from '../src/utils/idle-detector.js';
 
 const fixture = (name: string) => readFileSync(new URL(`./fixtures/traex-question/${name}`, import.meta.url), 'utf8');
 const QUESTION = fixture('traex-0.214.1-single-160x50.txt');
@@ -471,6 +472,63 @@ describe('the submit guard handed to a TraeX write', () => {
       replace(h.scope);
       expect(guard.current()).toBe(false);
     }
+  });
+
+  it('reconciles a settled PTY composer inside the pasted-draft submit guard', async () => {
+    const renderer = new TerminalRenderer(160, 50);
+    await renderer.writeAndFlush(COMPOSER.replace(/\n/g, '\r\n'));
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    const detector = new IdleDetector(createCliAdapterSync('traex'));
+    try {
+      detector.fireIdle();
+      detector.reset({ inputCycle: true });
+      detector.observeProgramStatus({ state: 'working' });
+      detector.observeProgramStatus({ state: 'blocked', id: 'ask', kind: 'question' });
+      detector.noteTranscriptTerminal();
+      vi.advanceTimersByTime(3_000);
+      const h = harness('traex', { init: { backendType: 'pty' } });
+      h.scope.backend = {};
+      h.scope.renderer = renderer;
+      h.scope.idleDetector = detector;
+      h.scope.captureBackendScreen = loadWorkerFunction('captureBackendScreen', h.scope);
+      h.scope.traexQuestionCapture = loadWorkerFunction('traexQuestionCapture', h.scope);
+      const guard = h.fn('traexQuestionSubmitGuard')({ turnId: 'om_draft', dispatchAttempt: 2 });
+
+      const admission = guard.blocked('draft');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(await admission).toBeUndefined();
+      expect(detector.programStatusBlock()).toBeNull();
+      expect(h.scope.traexQuestionDraftWaiting).toBe(false);
+    } finally {
+      detector.dispose();
+      renderer.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not admit a draft when the CLI generation changes during the guard capture', async () => {
+    const renderer = new TerminalRenderer(160, 50);
+    try {
+      const h = harness('traex', { init: { backendType: 'pty' }, block: { kind: 'question' } });
+      h.scope.backend = {};
+      h.scope.renderer = renderer;
+      h.scope.captureBackendScreen = loadWorkerFunction('captureBackendScreen', h.scope);
+      h.scope.traexQuestionCapture = loadWorkerFunction('traexQuestionCapture', h.scope);
+      const release = vi.fn(() => true);
+      h.scope.idleDetector.releaseStaleQuestionStatus = release;
+      await renderer.writeAndFlush(COMPOSER.replace(/\n/g, '\r\n'));
+      const flush = renderer.writeAndFlush.bind(renderer);
+      renderer.writeAndFlush = async data => {
+        await flush(data);
+        h.scope.cliSpawnGeneration++;
+      };
+      const guard = h.fn('traexQuestionSubmitGuard')({ turnId: 'om_draft', dispatchAttempt: 2 });
+
+      expect(await guard.blocked('draft')).toBeUndefined();
+      expect(guard.current()).toBe(false);
+      expect(release).not.toHaveBeenCalled();
+    } finally { renderer.dispose(); }
   });
 
   it('marks the pasted draft as waiting while the page is up, tells its sender once, and lets go on another CLI', async () => {

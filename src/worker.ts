@@ -26229,9 +26229,18 @@ function traexQuestionSubmitGuard(item: Pick<PendingCliInput, 'turnId' | 'dispat
         return undefined;
       }
       let blocked = traexQuestionBlockReported();
-      if (!blocked) {
+      const needsSettledPtyCapture = !!backend && !backend.captureViewportAsync
+        && !backend.captureViewport && !backend.captureCurrentScreen && !!renderer;
+      if (!blocked || needsSettledPtyCapture) {
         const screen = await traexQuestionCapture();
-        blocked = !!screen && traexQuestionFlowVisible(screen);
+        if (!current()) {
+          traexQuestionDraftWaiting = false;
+          return undefined;
+        }
+        // A stale PTY block still needs the settled capture: the synchronous
+        // probe deliberately cannot release it. Recompute both signals after
+        // the await so a newly reported/drawn question continues to hold.
+        blocked = traexQuestionBlockReported() || (!!screen && traexQuestionFlowVisible(screen));
       }
       if (phase === 'draft') traexQuestionDraftWaiting = !!blocked;
       if (!blocked) return undefined;
