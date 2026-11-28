@@ -16,6 +16,7 @@ export interface FileBridgePathOpts {
   sessionId?: string;
   cwd?: string;
   pid?: number;
+  nativeSessionDir?: string;
 }
 
 /** Resolve a transcript/events path for a file-backed structured-bridge CLI. */
@@ -28,7 +29,7 @@ export function resolveFileBridgePath(
   const { sessionId, cwd, pid } = opts;
 
   if (sessionId) {
-    const bySid = spec.locate.bySessionId(sessionId, cwd);
+    const bySid = spec.locate.bySessionId(sessionId, cwd, opts.nativeSessionDir);
     if (bySid) return bySid;
   }
   if (pid != null && Number.isInteger(pid) && pid > 0) {
