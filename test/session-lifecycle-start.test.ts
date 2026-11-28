@@ -4049,6 +4049,31 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     expect(retired).toEqual([1, ds.workerGeneration - 1]);
   });
 
+  it('settles the original replacement when runtime identity changes during cleanup', async () => {
+    let release!: () => void;
+    const cleanup = new Promise<void>(resolve => { release = resolve; });
+    const admission = vi.fn();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'), getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1, closeSession: vi.fn(),
+      onWorkerGenerationRetired: async () => cleanup,
+    });
+    const ds = makeDs(); ds.session.sessionId = 'sid-strict-retirement-takeover';
+    setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+    forkWorker(ds, 'hello', false);
+    const oldWorker = forkMock.mock.results.at(-1)!.value;
+    oldWorker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+    await Promise.resolve();
+    Object.assign(ds.session, { bytecloudBrokerStrict: true, bytecloudBrokerColdStart: true });
+    ds.initConfig = { ...ds.initConfig, bytedcliContainment: {} } as any;
+    forkWorker(ds, 'original-replacement', true, { onAdmission: admission });
+    await Promise.resolve();
+    setActiveSessionsRegistry(new Map());
+    release();
+    await vi.waitFor(() => expect(admission).toHaveBeenCalledWith('rejected'));
+    expect(forkMock).toHaveBeenCalledTimes(1);
+  });
+
   it('stays silent when suspendWorker retires the worker after the turn committed', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({

@@ -41,8 +41,15 @@ vi.mock('../src/bot-registry.js', async (importOriginal) => {
   };
 });
 
+const forkMock = vi.hoisted(() => vi.fn());
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  return { ...actual, fork: (...args: unknown[]) => forkMock(...args) };
+});
+
 import {
   forkWorker,
+  initWorkerPool,
   isSessionTransferring,
   setActiveSessionsRegistry,
   transferSession,
@@ -50,6 +57,7 @@ import {
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { ForkResumeOrTurnId } from '../src/core/worker-pool.js';
+import { __testOnly_resetBytedcliWorkerRetirement } from '../src/core/bytedcli-worker-retirement.js';
 
 function makeTransferringSession(sessionId: string): DaemonSession {
   return {
@@ -121,5 +129,52 @@ describe('transfer-gate atMostOnce forwarding (codex #818 P1-5)', () => {
     expect(message).toBeTruthy();
     expect(message.content).toContain('keyed follow-up');
     expect(message.atMostOnce).toBeUndefined();
+  });
+
+  it('drains buffered transfer exactly once after the strict retirement settles', async () => {
+    __testOnly_resetBytedcliWorkerRetirement();
+    const ds = makeTransferringSession('session-transfer-gate-retirement');
+    Object.assign(ds.session, { bytecloudBrokerStrict: true, bytecloudBrokerColdStart: true, workerGeneration: 1 });
+    ds.workerGeneration = 1;
+    ds.initConfig = { bytedcliContainment: {} } as any;
+    let releaseCleanup!: () => void;
+    const cleanup = new Promise<void>(resolve => { releaseCleanup = resolve; });
+    const retired: number[] = [];
+    initWorkerPool({
+      sessionReply: mocks.replyMessage,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onWorkerGenerationRetired: async (_session, { workerGeneration }) => {
+        retired.push(workerGeneration);
+        if (workerGeneration === 1) await cleanup;
+      },
+    });
+    const replacementSend = vi.fn();
+    const replacement = Object.assign(new EventEmitter(), {
+      killed: false, connected: true, exitCode: null, signalCode: null,
+      send: replacementSend, kill: vi.fn(), pid: 54321,
+    }) as any;
+    forkMock.mockImplementation(() => replacement);
+    setActiveSessionsRegistry(new Map([[sessionKey('om_source', ds.larkAppId), ds]]));
+    let releaseDetach!: (completed: boolean) => void;
+    const detach = vi.fn(() => new Promise<boolean>(resolve => { releaseDetach = resolve; }));
+    const moving = transferSession(ds.session.sessionId, 'oc_target', 'om_target', 'group', 'chat',
+      { detachWorkerImpl: detach, forkWorkerImpl: forkWorker as any });
+    await vi.waitFor(() => expect(detach).toHaveBeenCalledOnce());
+    expect(isSessionTransferring(ds)).toBe(true);
+    const admission = vi.fn();
+    forkWorker(ds, 'buffered-retirement-input', true, { onAdmission: admission });
+    await vi.waitFor(() => expect(retired).toEqual([1]));
+    expect(forkMock).not.toHaveBeenCalled();
+    releaseDetach(true);
+    releaseCleanup();
+    await expect(moving).resolves.toEqual({ ok: true });
+    expect(forkMock).toHaveBeenCalledTimes(1);
+    expect(retired).toEqual([1]);
+    expect(admission).toHaveBeenLastCalledWith('accepted');
+    expect(replacementSend.mock.calls.map(call => call[0]).some(message =>
+      message?.prompt === 'buffered-retirement-input' || message?.content === 'buffered-retirement-input')).toBe(true);
+    setActiveSessionsRegistry(undefined);
   });
 });

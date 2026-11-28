@@ -16633,6 +16633,7 @@ type TransferInputGate = {
   /** Preserve the caller's test/production fork seam for delayed recovery. */
   forkWorkerImpl?: typeof forkWorker;
   flushing: boolean;
+  replacementPending?: boolean;
   settledCallbacks: Set<() => void>;
 };
 
@@ -17499,11 +17500,31 @@ function forkTransferReplacement(
   ds: DaemonSession,
   forkWorkerImpl: typeof forkWorker,
 ): void {
+  const gate = transferInputGates.get(ds);
+  let deferred = false;
   transferReplacementForkBypass.add(ds);
   try {
-    forkWorkerImpl(ds, '', true);
+    forkWorkerImpl(ds, '', true, {
+      onAdmission: admission => {
+        if (admission === 'deferred') {
+          deferred = true;
+          if (gate) gate.replacementPending = true;
+          return;
+        }
+        transferReplacementForkBypass.delete(ds);
+        if (gate) gate.replacementPending = false;
+        if (admission === 'accepted' && gate && transferInputGates.get(ds) === gate) {
+          queueMicrotask(() => {
+            if (transferInputGates.get(ds) === gate) releaseTransferInputGate(ds, gate, forkWorkerImpl);
+          });
+        } else if (gate) gate.needsWorker = true;
+      },
+    });
   } finally {
-    transferReplacementForkBypass.delete(ds);
+    if (!deferred) {
+      transferReplacementForkBypass.delete(ds);
+      if (gate) gate.replacementPending = false;
+    }
   }
 }
 
@@ -18032,7 +18053,7 @@ function releaseTransferInputGate(
   gate.released = true;
   gate.forkWorkerImpl = forkWorkerImpl;
   const flush = (): void => {
-    if (transferInputGates.get(ds) !== gate) return;
+    if (transferInputGates.get(ds) !== gate || gate.replacementPending) return;
     if (gate.flushing) return;
     gate.flushing = true;
     try {
@@ -21848,6 +21869,8 @@ export function forkWorker(
         continue: () => {
           if (findActiveBySessionId(ds.session.sessionId) === ds) {
             forkWorker(ds, promptInput, resumeOrTurnId, { ...opts, bytedcliPreparedWorkerGeneration: preparedWorkerGeneration });
+          } else {
+            opts.onAdmission?.('rejected');
           }
         },
         fail: error => {
