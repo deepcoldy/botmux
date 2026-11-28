@@ -7983,7 +7983,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
   // Daemon/card readiness can lag behind a committed ordinary input. MiniMax
   // queues native turns, so changing capture ownership while it is busy would
   // discard that ordinary turn's final. Keep ownership until the real prompt.
-  if (lastInitConfig?.cliId === 'minimax' && msg.content.trim() === '/compact'
+  if ((lastInitConfig?.cliId === 'minimax' || lastInitConfig?.cliId === 'atomcode') && msg.content.trim() === '/compact'
     && (!isPromptReady || commandLineWritesPending > 0)) {
     pendingRawInputs.push(msg);
     return;
@@ -8103,7 +8103,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
       // been cancelled cleanly: one that could not be is left to ZMX recovery
       // (the notice below says so), and reannouncing ready would invite the
       // very input that backend now refuses.
-      const untouchedCompact = lastInitConfig?.cliId === 'minimax'
+      const untouchedCompact = (lastInitConfig?.cliId === 'minimax' || lastInitConfig?.cliId === 'atomcode')
         && msg.content.trim() === '/compact'
         && err instanceof SubmissionWriteError && !err.submissionStarted
         && !recoveryFailureReason
@@ -51690,7 +51690,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         || injectionFlushing || shouldDeferUserFlush(pendingInjections)
         || bareShellCheckInProgress || bareShellLaunchBlocked
         || startupInputGateHolds
-        || (lastInitConfig?.cliId === 'minimax' && msg.content.trim() === '/compact'
+        || ((lastInitConfig?.cliId === 'minimax' || lastInitConfig?.cliId === 'atomcode') && msg.content.trim() === '/compact'
           && isFlushing)
         || hookReviewInputHold || traexQuestionDraftWaiting || codexModelMigrationHoldsRawInput()) {
         freshnessInputQueue.enqueueRaw(msg);

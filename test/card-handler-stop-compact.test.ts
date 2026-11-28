@@ -398,6 +398,20 @@ describe('compact_session card action', () => {
     expect(deliver).toHaveBeenCalledTimes(1);
   });
 
+  it('fences AtomCode compact clicks and issues a compact turnId', async () => {
+    const ds = makeDs({ cliReady: true, sessionOverrides: { cliId: 'atomcode' } });
+    const deliver = vi.fn((_ds: DaemonSession, _cmd: string, opts: { turnId?: string; onDelivered(): void }) => {
+      opts.onDelivered();
+      return true;
+    });
+    const deps = depsWith(ds, deliver);
+    expect((await handleCardAction(actionData('compact_session'), deps, LARK_APP_ID)).toast.type).toBe('success');
+    expect(ds.cliReady).toBe(false);
+    expect(deliver.mock.calls[0]?.[2]?.turnId).toMatch(/^compact-/);
+    expect((await handleCardAction(actionData('compact_session'), deps, LARK_APP_ID)).toast.type).toBe('warning');
+    expect(deliver).toHaveBeenCalledTimes(1);
+  });
+
   it('leaves MiniMax ready when delivery throws before acceptance', async () => {
     const ds = makeDs({ cliReady: true, sessionOverrides: { cliId: 'minimax' } });
     const deliver = vi.fn(() => { throw new Error('not enqueued'); });
