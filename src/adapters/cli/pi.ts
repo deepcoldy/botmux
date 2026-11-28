@@ -10,6 +10,7 @@ import { preparePiInitialPromptArg } from './pi-initial-prompt.js';
 import { PI_TURN_BOUNDARY_EXTENSION_SOURCE } from './pi-turn-boundary-extension-data.js';
 import { resolvePiModel } from './pi-model.js';
 import { discoverPiLocalModels } from './pi-local-models.js';
+import { PI_REASONING_EFFORTS } from '../../services/codex-reasoning-effort.js';
 import type { CliAdapter, PtyHandle, StructuredBridgeSpec } from './types.js';
 import { GOAL_ENV } from '../../workflows/v3/contract.js';
 import { clearBotmuxPromptEnv } from '../../skills/zero-injection.js';
@@ -26,6 +27,11 @@ import { builtinSkillsOffered, nativeGatewayAskHintBlock } from '../../skills/in
  *  for both the adapter's `pluginDir` field and the spawn-time flag. */
 export const PI_PLUGIN_DIR = join(homedir(), '.botmux', 'pi-skills');
 export const PI_BUILTIN_SKILLS_DIR = join(PI_PLUGIN_DIR, 'skills');
+
+/** See claude-code.ts: the shared reasoningEffort type is wider than what this
+ *  CLI accepts, and the accepted set cannot drift between config, Dashboard
+ *  save and this argv filter. */
+const piThinkingLevels = new Set<string>(PI_REASONING_EFFORTS);
 
 /** Absolute path to the turn-boundary extension handed to Pi via `--extension`,
  *  or `undefined` when no readable copy exists on disk.
@@ -122,6 +128,9 @@ export function buildPiArgs(opts: {
   initialPrompt?: string;
   nativeSessionTitle?: string;
   model?: string;
+  /** BotMux reasoning level mapped to Pi's `--thinking`. Pre-filtered to
+   *  PI_REASONING_EFFORTS by buildArgs; anything else must not reach argv. */
+  thinking?: string;
   turnBoundaryExtension: string | undefined;
   builtinSkillsDir?: string;
   skillPluginDir?: string;
@@ -142,6 +151,9 @@ export function buildPiArgs(opts: {
   // should stamp the Botmux title.
   if (!opts.resume && opts.nativeSessionTitle?.trim()) args.push('--name', opts.nativeSessionTitle.trim());
   if (opts.model?.trim()) args.push('--model', opts.model.trim());
+  // Pi restores the session's own thinking level from its transcript. Passing
+  // the Bot default on resume would override a change made inside that session.
+  if (!opts.resume && opts.thinking) args.push('--thinking', opts.thinking);
   if (opts.builtinSkillsDir) args.push('--skill', opts.builtinSkillsDir);
   if (opts.skillPluginDir) args.push('--skill', opts.skillPluginDir);
   // Pi's interactive mode processes positional initial messages after TUI
@@ -345,6 +357,7 @@ export function createPiAdapter(
       initialPrompt,
       nativeSessionTitle,
       model,
+      reasoningEffort,
       botName,
       botOpenId,
       larkAppId,
@@ -407,6 +420,16 @@ export function createPiAdapter(
       // same env pi sees, so an agent-dir overlay / HOME redirect is honored.
       const resolvedModel = resolvePiModelForSpawn(model, { ...process.env, ...env });
 
+      // Same defense as the claude adapter's `--effort` filter: the saved
+      // config only ever carries a level the service layer vouched for, but a
+      // hand-edited bots.json must not leak a level Pi rejects onto argv.
+      const thinking = reasoningEffort && piThinkingLevels.has(reasoningEffort) ? reasoningEffort : undefined;
+      // Pi may create a new conversation even on a requested resume. The
+      // extension sees the actual session it opened, including custom stores.
+      if (env && resume && thinking && !extraArgs?.includes('--thinking')) {
+        env.BOTMUX_PI_RESUME_FALLBACK_THINKING = thinking;
+      }
+
       return buildPiArgs({
         sessionId,
         resume,
@@ -418,6 +441,7 @@ export function createPiAdapter(
         initialPrompt,
         nativeSessionTitle,
         model: resolvedModel,
+        thinking,
         turnBoundaryExtension: turnBoundaryExt,
         builtinSkillsDir: promptInjection === 'none' || !builtinSkillsOffered() ? undefined : join(builtinPluginDirForSession(PI_PLUGIN_DIR), 'skills'),
         skillPluginDir: promptInjection === 'none' ? undefined : skillPluginDir,

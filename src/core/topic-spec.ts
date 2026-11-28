@@ -60,7 +60,10 @@ export type TopicSpecError =
   /** 这个 CLI 没有显式推理控制。 */
   | { kind: 'effort_unsupported_cli'; cliId?: CliId }
   /** 档位合法但本次要用的模型不支持它。 */
-  | { kind: 'effort_unsupported_model'; effort: CodexReasoningEffort; model?: string };
+  | { kind: 'effort_unsupported_model'; effort: CodexReasoningEffort; model?: string }
+  /** CLI 在 resume 时自行还原会话内档位（Pi 从 transcript 恢复 thinking），绑进
+   *  modelPin 的显式档位重启后无法落实；与 model-pin.ts 的 validateModelPin 同一条护栏。 */
+  | { kind: 'effort_pin_unsupported_cli'; cliId?: CliId };
 
 /** 头部 `/repo wt` 落到 daemon 的创建请求：目录在建好之后才确定，这里只带仓库与分支。 */
 export interface TopicSpecWorktree {
@@ -215,6 +218,9 @@ export async function resolveTopicSpec(header: TopicHeader, ctx: TopicSpecContex
         effort: effortArg,
         ...(effectiveModel ? { model: effectiveModel } : {}),
       });
+    } else if (botCfg.cliId === 'pi' && spec.model) {
+      // 仅 /effort 是新会话的默认值。绑进 modelPin 的档位无法在 Pi 恢复时落实。
+      errors.push({ kind: 'effort_pin_unsupported_cli', cliId: botCfg.cliId });
     } else {
       spec.reasoningEffort = effortArg;
     }

@@ -84,6 +84,7 @@ for a in "$@"; do
 done
 {
   echo "argv:$*"
+  echo "resumeFallbackThinking:\${BOTMUX_PI_RESUME_FALLBACK_THINKING-}"
   echo "tar:$TAR_OPTIONS"
   if cat '${sibling}' >/dev/null 2>&1; then echo "sibling:READ"; else echo "sibling:HIDDEN"; fi
   if cat '${siblingOwn}' >/dev/null 2>&1; then echo "siblingOwn:READ"; else echo "siblingOwn:HIDDEN"; fi
@@ -101,7 +102,7 @@ exec sleep 600
   return {
     home, dataDir, sessions, workDir, report, fakePi,
     ownDir: join(sessions, 'botmux', SID),
-    start(opts: { sandbox: boolean | 'scratch'; resume?: boolean; botEnv?: Record<string, string> }) {
+    start(opts: { sandbox: boolean | 'scratch'; resume?: boolean; reasoningEffort?: 'high' | 'xhigh'; botEnv?: Record<string, string> }) {
       scratchUsed ||= opts.sandbox === 'scratch';
       const logs: string[] = [];
       child = spawnNodeTsScript(resolve('src/worker.ts'), [], { env, stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
@@ -113,6 +114,7 @@ exec sleep 600
         apiOnly: true, larkAppId: 'app_pi', larkAppSecret: '', ownerOpenId: 'ou_owner',
         loadedBotsConfigPath: bots, loadedBotsConfigProvenance: 'loaded', promptInjection: 'none',
         ...(opts.resume ? { resume: true, cliSessionId: SID } : {}),
+        ...(opts.reasoningEffort ? { reasoningEffort: opts.reasoningEffort } : {}),
         ...(opts.botEnv ? { env: opts.botEnv } : {}),
         ...(opts.sandbox ? {
           sandbox: opts.sandbox === 'scratch' ? 'scratch' as const : 'oncall' as const,
@@ -191,6 +193,19 @@ describe('Pi transcript dir under the allowlist file sandbox (real worker)', () 
     expect(readdirSync(l.ownDir)).toContain(name);
     expect(readFileSync(join(l.ownDir, name), 'utf8')).toContain(`"id":"${SID}"`);
   }, 60_000);
+
+  const verifyResumeFallback = async (sandbox: boolean) => {
+    const l = lab();
+    const logs = l.start({ sandbox, resume: true, reasoningEffort: 'xhigh' });
+    const report = await readReport(l.report, logs);
+    // No --thinking on resume: the extension applies this value only if Pi
+    // actually opened a replacement transcript. This assertion covers the real
+    // worker's env promotion rather than merely calling the adapter directly.
+    expect(report.argv).not.toContain('--thinking');
+    expect(report.resumeFallbackThinking).toBe('xhigh');
+  };
+  it('unsandboxed cold resume carries saved thinking to the session-start fallback', () => verifyResumeFallback(false), 60_000);
+  it.skipIf(!bwrapRuntime)('sandboxed cold resume carries saved thinking to the session-start fallback', () => verifyResumeFallback(true), 60_000);
 
   it('unsandboxed: a session that never ran sandboxed keeps Pi\'s native layout', async () => {
     const l = lab();

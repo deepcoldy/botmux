@@ -658,6 +658,8 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   'BOTMUX_REPLY_STYLE',
   // Pi deferred long-first-prompt extension reads one exact per-session file.
   'BOTMUX_PI_INITIAL_PROMPT_FILE',
+  // The Pi extension consumes this default only when a resume opens a new conversation.
+  'BOTMUX_PI_RESUME_FALLBACK_THINKING',
   // Pi system-prompt extension appends Botmux rules after CLI native discovery.
   'BOTMUX_APPEND_SYSTEM_PROMPT',
   'BOTMUX_APPEND_SYSTEM_PROMPT_FILE',
@@ -835,8 +837,9 @@ export const SESSION_TURN_MARKER_ENV_KEYS = [
   // Spawn-time normalized reply style; unset/scrub at every session boundary to
   // avoid cross-bot guide/card drift through a shared persistent backend.
   'BOTMUX_REPLY_STYLE',
-  // One-shot per-session artifacts/paths.
+  // One-shot per-session artifacts and launch values.
   'BOTMUX_PI_INITIAL_PROMPT_FILE',
+  'BOTMUX_PI_RESUME_FALLBACK_THINKING',
   'BOTMUX_CODEX_APP_CONTROL_BOOTSTRAP',
   // Ready-gate hook command, sessionReadyHookCommand() per session.
   'BOTMUX_READY_COMMAND',

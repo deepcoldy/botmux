@@ -68,6 +68,10 @@ export function topicSpecErrorText(errors: readonly TopicSpecError[], locale: Lo
           effort: error.effort,
           model: error.model ?? '(CLI 默认)',
         }, locale);
+      case 'effort_pin_unsupported_cli':
+        return t('daemon.topic_header_effort_pin_unsupported_cli', {
+          cli: error.cliId ?? '?',
+        }, locale);
     }
   }), locale);
 }

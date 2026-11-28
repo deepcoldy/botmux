@@ -2280,6 +2280,7 @@ export const messages: Record<string, string> = {
   'daemon.topic_header_effort_invalid': '`{arg}` 不是合法的推理档位（可选：{allowed}）',
   'daemon.topic_header_effort_unsupported_cli': '当前 CLI（{cli}）没有推理档位开关',
   'daemon.topic_header_effort_unsupported_model': '模型 {model} 不支持推理档位 {effort}',
+  'daemon.topic_header_effort_pin_unsupported_cli': '当前 CLI（{cli}）恢复会话时会沿用会话内的思考档位，`/model` 与 `/effort` 不能一起固定；请只固定模型，或单独用 `/effort` 设置新话题的默认档位',
   'daemon.fast_unsupported_backend': '⚠️ 这个会话的后端下 /fast 切不了 Codex 档位（RPC 输入模式 / Riff 的对话不走终端，按键到不了执行端）。卡片徽标仍会如实反映 Codex 实际运行的档位。',
   'daemon.antigravity_btw_usage': '用法：/btw <问题>，问题最多 4000 个字符。',
   'daemon.antigravity_btw_unavailable': '/btw 需要当前聊天中已启动、使用本机交互终端的 Antigravity 会话。',

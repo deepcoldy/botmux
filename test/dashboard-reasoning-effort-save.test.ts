@@ -176,3 +176,42 @@ describe('Dashboard reasoning effort save and reload', () => {
     expect(stored()).not.toHaveProperty('reasoningEffort');
   });
 });
+
+describe('Dashboard reasoning effort for Pi', () => {
+  it('offers the five Pi levels and saves one even without an explicit model', async () => {
+    // Pi 未显式配置模型（跟 CLI 默认）也必须能选思考档位：档位经 `--thinking`
+    // 独立于 `--model` 生效。
+    await setup('pi', '');
+    const picker = effortPicker();
+    expect(picker.props.value).toBe('');
+    expect(picker.props.options.map((option: { value: string }) => option.value))
+      .toEqual(['', 'low', 'medium', 'high', 'xhigh', 'max']);
+    act(() => picker.props.onChange('xhigh'));
+    await save();
+    expect(stored()).toMatchObject({ cliId: 'pi', reasoningEffort: 'xhigh' });
+    expect(loadBotConfigs()[0]!.reasoningEffort).toBe('xhigh');
+    await renderStored();
+    expect(effortPicker().props.value).toBe('xhigh');
+  });
+
+  it('persists an explicit clear back to the Pi native default', async () => {
+    await setup('pi', '', 'high');
+    await renderStored();
+    expect(effortPicker().props.value).toBe('high');
+    act(() => effortPicker().props.onChange(''));
+    await save();
+    expect(stored()).not.toHaveProperty('reasoningEffort');
+    expect(loadBotConfigs()[0]!.reasoningEffort).toBeUndefined();
+    await renderStored();
+    expect(effortPicker().props.value).toBe('');
+  });
+
+  it('drops a hand-edited ultra at config load and keeps it out of a re-save', async () => {
+    // `ultra` 不在 Pi 与 BotMux 的档位交集里：配置加载必须丢弃，不得进 Pi 启动。
+    await setup('pi', 'grok-4.6', 'ultra');
+    expect(loadBotConfigs()[0]!.reasoningEffort).toBeUndefined();
+    expect(effortPicker().props.value).toBe('');
+    await save();
+    expect(stored()).not.toHaveProperty('reasoningEffort');
+  });
+});

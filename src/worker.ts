@@ -38756,6 +38756,10 @@ async function spawnCliBody(
   if (perBotInjectEnv.BOTMUX_APPEND_SYSTEM_PROMPT) {
     childEnv.BOTMUX_APPEND_SYSTEM_PROMPT = perBotInjectEnv.BOTMUX_APPEND_SYSTEM_PROMPT;
   }
+  // Pi's adapter sets this after per-bot env sanitization. Promote it to
+  // worker-owned env so pane wrappers carry it past their own sanitization.
+  const piResumeThinking = perBotInjectEnv.BOTMUX_PI_RESUME_FALLBACK_THINKING;
+  if (piResumeThinking) childEnv.BOTMUX_PI_RESUME_FALLBACK_THINKING = piResumeThinking;
   // Pin the EXACT bots.json this daemon loaded so the child's `botmux send`
   // reads the SAME registry. Required when the daemon runs under a non-default
   // HOME (`HOME=~/alt botmux start`): the child inherits BOTMUX_* but not HOME,
