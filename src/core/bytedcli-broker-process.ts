@@ -5,6 +5,7 @@ import { BYTEDCLI_AUDITED_RELEASE, assertBytedcliAuditedRelease } from './bytedc
 import type { BytedcliExecErrorCode } from '../cli/bytedcli-exec-protocol.js';
 import { snapshotBytedcliDbCodeCopy, snapshotBytedcliRuntimeTrees, snapshotBytedcliTrustedFiles } from './bytedcli-runtime-integrity.js';
 import { BYTEDCLI_HOST_NETWORK_KEYS } from './bytedcli-host-network.js';
+import type { BytedcliTrustedPythonRuntime } from './bytedcli-python-runtime.js';
 
 export class BytedcliBrokerError extends Error {
   constructor(readonly code: BytedcliExecErrorCode) { super(code); this.name = 'BytedcliBrokerError'; }
@@ -14,6 +15,7 @@ export interface BytedcliTrustedCli {
   readonly prefixArgs?: readonly string[];
   readonly protectedPaths?: readonly string[];
   readonly dbRuntime?: BytedcliTrustedDbRuntime;
+  readonly pythonRuntime?: BytedcliTrustedPythonRuntime;
 }
 export interface BytedcliTrustedDbRuntime {
   readonly executable: string; readonly protectedPaths: readonly string[]; readonly stillCurrent: () => boolean;

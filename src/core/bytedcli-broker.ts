@@ -205,7 +205,7 @@ export function createProductionBytedcliBroker(host:Omit<import('./bytedcli-brok
       catch { return async () => { throw new BytedcliBrokerError('executor_unavailable'); }; }
     })();
     const mcpApi = createSkillMcpRunner(layout.mcpRuntime,layout.networkEnv);
-    executor=new BytedcliExecutor({privateRoot:layout.privateRoot,trustedCli,leases:{machine:r=>leases.machine(r),actor:r=>leases.actor(r),realm:createBytedcliGdprLeaseResolver(layout.gdprMachineFile)},hostApi: input => input.descriptor.id === 'skill-api.oncall.knowledge.search' ? mcpApi(input) : httpApi(input),audit:new BytedcliBrokerAudit(layout.auditRoot),networkEnv:layout.networkEnv,dbRuntime:layout.dbRuntime});
+    executor=new BytedcliExecutor({privateRoot:layout.privateRoot,trustedCli,leases:{machine:r=>leases.machine(r),actor:r=>leases.actor(r),realm:createBytedcliGdprLeaseResolver(layout.gdprMachineFile)},hostApi: input => input.descriptor.id === 'skill-api.oncall.knowledge.search' ? mcpApi(input) : httpApi(input),audit:new BytedcliBrokerAudit(layout.auditRoot),networkEnv:layout.networkEnv,dbRuntime:layout.dbRuntime,pythonRuntime:layout.pythonRuntime});
     if(closed)await executor.close();return executor;
   })();
   return new BytedcliBroker({findSession:host.findSession,operationPolicy,personalLeases:getLeases,currentWorkerGeneration:id=>host.findSession(id)?.workerGeneration,authority:(sessionId,peer,operation,context)=>resolveBytedcliAuthority({...host,operationPolicy,contains:ds=>{

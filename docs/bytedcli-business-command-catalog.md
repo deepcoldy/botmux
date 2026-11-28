@@ -24,6 +24,11 @@ CLI 审核版本为 `0.199.0`，目录为 `2026-11-27.2`。原 JSON grammar 保�
 | `libra.layer.get`、`libra.experiment.list/get-batch` | read；明确 layer/app/flight，列表至多 100 行。 |
 | `tos.upload-object.c4-report` | write；bucket 20001326，key 以 c4_config_checker_res/ 开头，timeout 30000，仅 Agent 二进制文件快照。 |
 | `bits.release.search`、`bits.pipeline`、`bits.pipelines.vars` | read；明确 workspace/pipeline 与有限分页、run-seq。 |
+| `bits.release.get` | read；仅一个 ticket-id，或固定 CN 发布单详情 URL；可选 raw；不接受 stage、其他 origin 或操作人覆盖。 |
+| `duty.plan.get` | read；仅 name，固定 CN Duty 接口；操作人从所选 ByteCloud 身份获取，禁止 host/action-user 覆盖。 |
+| `mindai.chart.auth.status` | read；固定原生客户端网关，允许 HTTP timeout 1–30000ms；禁止自定义配置、provider 或 URL。 |
+| `mindai.chart.create/execute/update` | write；创建任务、创建并监听、续问任务（可同时上传一张图片）。execute 必须明确 timeout 1–60000ms；update 仅一个经过快照的 png/jpg/jpeg/webp/heic/heif 附件；可选官方样式和有限参数。 |
+| `mindai.chart.watch` | read；明确 task-id 和 timeout 1–60000ms；until 仅 svg；不接受无限监听或宿主配置。 |
 | `bits.develop.get` | read；仅 dev-id 与 space-id；不接受 pipeline-id、URL、stage/task，保持 initTaskIds 分支不可达。 |
 | `bits.pipelines.run` | write；明确 pipeline-id、对象 vars 和 `--yes`。 |
 | `bits.anywhere.share.get` | read；固定 Bits share URL，仅 appId、_proxy_share_item_id、env。 |
@@ -40,6 +45,8 @@ RPC、HTTP、Redis、TCC、TOS 等混合入口根据精确目标/scene 区分其
 RDS 还需要预装 DB 二进制。宿主启动时冻结 `DB_CLI_BINARY`，或固定 dependency/db 安装中的平台二进制，不读取/挂载整个 bytedcli data。包管理器硬链接文件会经过稳定源校验后复制到 `host-authority/bytedcli-broker/db-code/db-cli-<sha256>`，使用私有临时文件、fsync 和不覆盖的原子发布；副本必须 nlink=1/mode500，既有副本核对内容哈希、类型、所有权与权限。发布后清理前中断时，只有全部额外硬链接都能证明是同一私有目录内本协议 `.pending-UUID` 的完成发布才可清理恢复，目录外或未知链接拒绝且不删除。源、别名、祖先及副本均重新校验，隔离进程仅挂执行副本。普通可信文件接口仍拒绝硬链接。半写或篡改的最终副本拒绝执行，不自动修复。
 
 缺失或改动在 lease/CLI 发现前拒绝；执行使用固定 `DB_CLI_BINARY` 与 `BYTEDCLI_DB_NO_AUTO_UPDATE=1`。其他操作将 DB override 指向已存在的不可执行 `/dev/null`，阻止 DB passthrough 的首次自动安装。此代码不安装、更新或调用真实 DB。
+
+原生 MindAI 使用 bytedcli 安装中已冻结的 Python 客户端。Linux 启动时仅发现 `/usr/bin/python3` 指向的 root 所有 Python 3.11+ 与匹配标准库，冻结代码、别名和祖先，隔离时只读挂载这些路径；不挂载宿主 Python 用户包和 MindAI 登录配置，不安装依赖。缺失或变化只阻止需要 Python 的操作，其他 CLI 不受影响。固定 Python 可执行文件，禁止用户 site 包和 bytecode 写入；ByteCloud JWT 仍由原生 CLI 通过私有管道传入 Python。图片由 Agent 侧读取并快照，wire ID 只保留受限扩展名，宿主在本次请求内重建文件，不读取 Agent 提交的宿主路径。任务状态及 SVG 临时结果在请求 HOME 中，执行结束清理；使用 task-id、last-event-id 和 include-svg 获取结果。
 
 旧目录 `2026-11-26.1` 仅按冻结的历史 ID/effect 表迁移。v1 只接受该历史版本，仍拒绝 machine write；v2 接受当前目录或历史目录内原有规则，不接受任意版本。parser-issued policy 的 WeakSet 证明与冻结 authority 的机器写入守卫保留。
 

@@ -9,7 +9,7 @@ export interface BytedcliBusinessCommand {
   readonly flags: Fields; readonly required: readonly string[]; readonly positional: readonly Check[];
   readonly matches?: (tokens: Tokens) => boolean; readonly validate?: (tokens: Tokens) => boolean;
   readonly condition: string; readonly inputFlags: readonly string[];
-  readonly requiredRuntime?: 'db-cli';
+  readonly requiredRuntime?: 'db-cli' | 'python3';
 }
 const text: Check = value => value.length > 0 && value.length <= 16_384 && !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value);
 const name: Check = value => /^[A-Za-z0-9][A-Za-z0-9_./:-]{0,255}$/.test(value) && !value.includes('..');
@@ -241,6 +241,31 @@ add('tos.upload-object.c4-report', 'tos upload-object', 'write', { '--bucket-id'
   ['--bucket-id', '--key', '--file', '--timeout-ms'], [], { matches: tokens => Number(get(tokens, '--bucket-id')) === 20001326 && get(tokens, '--key').startsWith('c4_config_checker_res/'),
     condition: 'bucket 20001326; c4_config_checker_res/; Agent file snapshot only', inputFlags: ['--file'] });
 add('bits.release.search', 'bits release search', 'read', { '--workspace-id': id, '--name': text, '--status': one('running', 'finished', 'cancel', 'all'), '--page': count(1000), '--page-size': count(100), '--about-me': true, '--raw': true }, ['--workspace-id']);
+const releaseUrl: Check = value => {
+  try { const url = new URL(value); return url.origin === 'https://bits.bytedance.net' && !url.username && !url.password && !url.search && !url.hash
+    && /^\/devops\/[1-9]\d{0,19}\/release\/releaseTicket\/detail\/[1-9]\d{0,19}$/.test(url.pathname); } catch { return false; }
+};
+add('bits.release.get', 'bits release get', 'read', { '--ticket-id': id, '--url': releaseUrl, '--raw': true }, [], [], {
+  validate: t => t.values.has('--ticket-id') !== t.values.has('--url'),
+  condition: 'one ticket-id or fixed CN release detail URL; no stage, origin or operator overrides',
+});
+add('duty.plan.get', 'duty plan get', 'read', { '--name': value => /^[A-Za-z0-9._-]{1,128}$/.test(value) && !value.includes('..') }, ['--name'], [], {
+  condition: 'one plan name; fixed CN Duty endpoint; action user from selected identity; no host/user overrides',
+});
+const mindaiTask: Check = value => /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(value) && !value.includes('..');
+const mindaiHttp: Fields = { '--http-timeout-ms': count(30000) };
+const mindaiStyle: Fields = { '--image-style-name': one('飞书经典', '瑞士信息', '孟菲斯', '专利图纸', '技术蓝图', '低饱和', '新粗野', '浅色糖果', '浮世绘', '简洁科技', '乐高积木', '深色终端', '黑白粉绿', '柠檬绿') };
+const mindaiWatch: Fields = { '--timeout-ms': count(60000), '--last-event-id': mindaiTask, '--read-timeout-ms': count(30000),
+  '--until': one('svg'), '--waiting-interval-ms': value => value === '0' || count(60000)(value), '--include-svg': true, '--no-summary': true };
+const python = { requiredRuntime: 'python3' as const };
+add('mindai.chart.auth.status', 'mindai chart auth status', 'read', mindaiHttp, [], [], python);
+add('mindai.chart.create', 'mindai chart create', 'write', { ...mindaiHttp, ...mindaiStyle, '--prompt': text, '--business-path': text }, ['--prompt'], [], python);
+add('mindai.chart.execute', 'mindai chart execute', 'write', { ...mindaiHttp, ...mindaiStyle, ...mindaiWatch, '--prompt': text, '--business-path': text }, ['--prompt', '--timeout-ms'], [], python);
+add('mindai.chart.update', 'mindai chart update', 'write', { ...mindaiHttp, ...mindaiStyle, '--task-id': mindaiTask, '--prompt': text,
+  '--attachment': value => /^input\d+-(?:png|jpg|jpeg|webp|heic|heif)$/.test(value) }, ['--task-id', '--prompt'], [], {
+  ...python, inputFlags: ['--attachment'], condition: 'fixed MindAI gateway; selected lease; one optional Agent image snapshot; no host config or auth overrides; upload+resume is write',
+});
+add('mindai.chart.watch', 'mindai chart watch', 'read', { ...mindaiWatch, '--task-id': mindaiTask }, ['--task-id', '--timeout-ms'], [], python);
 add('bits.pipeline', 'bits pipeline', 'read', { '--run-seq': id, '--show-ignored': true }, [], [id]);
 add('bits.develop.get', 'bits develop get', 'read', { '--dev-id': id, '--space-id': id }, ['--dev-id', '--space-id'], [], {
   condition: 'explicit dev-id/space-id only; no pipeline-id, URL, stage or task, so initTaskIds is unreachable',

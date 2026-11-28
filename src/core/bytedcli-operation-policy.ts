@@ -19,7 +19,7 @@ export {
 
 export interface BytedcliStagedInput {
   readonly id: string;
-  readonly flag: '--body-file' | '--file';
+  readonly flag: '--body-file' | '--file' | '--attachment';
   readonly argvIndex: number;
   readonly dataBase64: string;
   readonly encoding: 'utf8' | 'binary';
@@ -28,7 +28,7 @@ export interface BytedcliOperation {
   readonly id: string;
   readonly effect: BytedcliOperationEffect;
   readonly execution: BytedcliOperationExecution;
-  readonly requiredRuntime?: 'db-cli';
+  readonly requiredRuntime?: 'db-cli' | 'python3';
   readonly argv: readonly string[];
   readonly region: BytedcliOperationRegion;
   readonly resources: Readonly<Record<string, string>>;
@@ -155,7 +155,7 @@ function hasRegisteredLegacyCommand(argv: readonly string[]): boolean {
   }));
 }
 function result(id: string, effect: BytedcliOperationEffect, argv: string[], resources: Record<string, string>,
-  stagedInputs: BytedcliStagedInput[] = [], execution: BytedcliOperationExecution = effect === 'auth' || effect === 'help' ? 'host-api' : 'audited-native', requiredRuntime?: 'db-cli'): BytedcliOperation {
+  stagedInputs: BytedcliStagedInput[] = [], execution: BytedcliOperationExecution = effect === 'auth' || effect === 'help' ? 'host-api' : 'audited-native', requiredRuntime?: 'db-cli' | 'python3'): BytedcliOperation {
   return Object.freeze({ id, effect, execution, ...(requiredRuntime ? { requiredRuntime } : {}), argv: Object.freeze(argv), region: 'cn', resources: Object.freeze(resources),
     stagedInputs: Object.freeze(stagedInputs.map(input => Object.freeze(input))), cliVersion: BYTEDCLI_AUDITED_RELEASE,
     catalogVersion: BYTEDCLI_OPERATION_CATALOG_VERSION, timeoutMs: BYTEDCLI_EXEC_LIMITS.defaultTimeoutMs,
@@ -241,7 +241,6 @@ export function parseBytedcliOperation(argv: readonly string[], inputs?: Bytedcl
   try { help = parseTokens(args, { id: 'help', path: [], aliases: [], effect: 'help', flags: [] }); } catch { /* business path */ }
   if (!help || !BYTEDCLI_OPERATION_GRAMMAR.helpGroups.some(({ path }) => path.length === help.words.length && path.every((word, index) => help.words[index] === word))) {
     try {
-      assertBytedcliNoIdentityOverrides(args);
       const businessHelp = matchBytedcliBusinessHelp(args);
       if (businessHelp) {
         if (Object.keys(snapshots).length) deny();
@@ -249,13 +248,15 @@ export function parseBytedcliOperation(argv: readonly string[], inputs?: Bytedcl
       }
       const business = matchBytedcliBusinessCommand(args);
       if (business) {
+        assertBytedcliNoIdentityOverrides(args, business.entry.requiredRuntime === 'python3' ? ['--http-timeout-ms'] : []);
         const staged: BytedcliStagedInput[] = [];
         for (const flag of business.entry.inputFlags) {
+          if (!business.argv.includes(flag)) continue;
           const argvIndex = business.argv.indexOf(flag) + 1; const id = business.argv[argvIndex]!;
           const dataBase64 = id === '-' ? snapshots.stdinBase64 : snapshots.files?.find(file => file.id === id)?.dataBase64;
           if (!argvIndex || dataBase64 === undefined) deny();
           decodeBytedcliBase64(dataBase64, BYTEDCLI_EXEC_LIMITS.inputBytes);
-          staged.push({ id: id === '-' ? 'stdin' : id, flag: flag as '--file', argvIndex, dataBase64, encoding: 'binary' });
+          staged.push({ id: id === '-' ? 'stdin' : id, flag: flag as '--file' | '--attachment', argvIndex, dataBase64, encoding: 'binary' });
         }
         if (snapshots.stdinBase64 !== undefined && !business.argv.includes('-') || snapshots.files?.some(file => !staged.some(input => input.id === file.id))) deny();
         return result(business.entry.id, business.entry.effect, business.argv, {}, staged, 'isolated-native', business.entry.requiredRuntime);

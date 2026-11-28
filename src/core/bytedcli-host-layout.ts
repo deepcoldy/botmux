@@ -7,6 +7,7 @@ import { parseBytedcliMachineProfile } from './bytedcli-broker-credentials.js';
 import { snapshotBytedcliRuntimeTrees, snapshotBytedcliTrustedFiles } from './bytedcli-runtime-integrity.js';
 import { bytedcliHostNetworkEnvironment } from './bytedcli-host-network.js';
 import { discoverBytedcliDbRuntime } from './bytedcli-broker-process.js';
+import { discoverBytedcliPythonRuntime } from './bytedcli-python-runtime.js';
 import { pluginsHome, pluginRegistryPath } from './plugins/paths.js';
 /** Frozen once at host assembly. PATH is daemon startup configuration, never
  * Bot/Agent env, and discover validates canonical install/runtime ownership. */
@@ -25,6 +26,7 @@ export function bytedcliTrustedHostLayout(settings:BytedcliBrokerConfig & {reado
   const dbBinary = process.env.DB_CLI_BINARY ?? join(machineHome, '.local', 'share', 'bytedcli', 'dependency', 'db', 'node_modules', '@bytedance-dev', 'db-cli', 'bin',
     `db-cli-${process.platform}-${process.arch === 'x64' ? 'amd64' : process.arch}`);
   const dbRuntime = discoverBytedcliDbRuntime(dbBinary, join(privateRoot, 'db-code'));
+  const pythonRuntime = discoverBytedcliPythonRuntime();
   // Explicit host selection is exclusive. A missing/changed dedicated install
   // cannot silently fall back to a different global CLI or dependency tree.
   let unavailableReason: string | undefined = configuredEntry && !candidates.length ? 'configured ByteCloud CLI unavailable' : undefined;
@@ -61,7 +63,7 @@ export function bytedcliTrustedHostLayout(settings:BytedcliBrokerConfig & {reado
     ...['BYTEDCLI_CONFIG_DIR','BYTEDCLI_HOME','BOTS_CONFIG','SSH_AUTH_SOCK','GIT_CONFIG_GLOBAL','GIT_CONFIG_SYSTEM'].flatMap(key=>process.env[key]&&isAbsolute(process.env[key]!)?[process.env[key]!]:[]),
     ...['AIME_WORKSPACE_PATH','AILY_WORKSPACE_PATH','AILY_WORKSPACE_DIR'].flatMap(key=>process.env[key]&&isAbsolute(process.env[key]!)?[process.env[key]!]:[]),
     ...(settings.protectedRoots??[])];
-  const executableReadOnlyRoots=[...(mcpRuntime?.protectedPaths ?? []),...installationRoots,...runtimeTrees.flatMap(tree=>tree.protectedPaths),...certificates.protectedPaths,...(dbRuntime?.protectedPaths ?? (isAbsolute(dbBinary) ? [dbBinary] : [])),...directories.filter(dir=>existsSync(join(dir,'bytedcli'))),...directories.map(dir=>join(dir,'bytedcli')).filter(existsSync),
+  const executableReadOnlyRoots=[...(pythonRuntime?.protectedPaths ?? []),...(mcpRuntime?.protectedPaths ?? []),...installationRoots,...runtimeTrees.flatMap(tree=>tree.protectedPaths),...certificates.protectedPaths,...(dbRuntime?.protectedPaths ?? (isAbsolute(dbBinary) ? [dbBinary] : [])),...directories.filter(dir=>existsSync(join(dir,'bytedcli'))),...directories.map(dir=>join(dir,'bytedcli')).filter(existsSync),
     runtimeExecutable,dirname(runtimeExecutable)];
   executableReadOnlyRoots.push(...(entrySnapshot?.protectedPaths ?? []));
   const protectedRoots=[...credentialRoots,...executableReadOnlyRoots];
@@ -72,7 +74,7 @@ export function bytedcliTrustedHostLayout(settings:BytedcliBrokerConfig & {reado
     try{return [root,join(realpathSync(ancestor),...suffix)];}catch{return [root];}
   }))]);
   const aliases=canonicalAliases(protectedRoots);
-  return Object.freeze({machineHome,path,gdprMachineFile,candidates:Object.freeze(candidates),runtimeExecutable,dbRuntime,mcpRuntime,
+  return Object.freeze({machineHome,path,gdprMachineFile,candidates:Object.freeze(candidates),runtimeExecutable,dbRuntime,pythonRuntime,mcpRuntime,
     installationRoots:Object.freeze(installationRoots),privateRoot,auditRoot,machineProfile:parseBytedcliMachineProfile(settings.machineProfile),credentialRoots:canonicalAliases(credentialRoots),
     executableReadOnlyRoots:canonicalAliases(executableReadOnlyRoots),protectedRoots:aliases,networkEnv:Object.freeze(networkEnv),
     unavailableReason,
