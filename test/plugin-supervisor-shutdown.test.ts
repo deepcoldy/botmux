@@ -9,6 +9,7 @@ const runtime = vi.hoisted(() => ({ identity: vi.fn(), zombie: vi.fn(), signal: 
 vi.mock('../src/utils/process-identity.js', async importOriginal => ({
   ...await importOriginal<typeof import('../src/utils/process-identity.js')>(),
   readDurableProcessIdentity: runtime.identity,
+  readFleetDurableProcessIdentity: runtime.identity,
   isLinuxZombie: runtime.zombie,
 }));
 vi.mock('../src/core/fleet-process-identity.js', async importOriginal => ({

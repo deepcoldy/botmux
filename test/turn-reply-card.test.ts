@@ -15,6 +15,7 @@ import { shouldSuppressBridgeEmit } from '../src/services/bridge-fallback-gate.j
 import { extractCardContent } from '../src/im/lark/message-parser.js';
 import { extractCotEntries } from '../src/services/claude-transcript.js';
 import { projectGroupContextCard } from '../src/im/lark/group-context-card.js';
+import { t } from '../src/i18n/index.js';
 
 const key = { larkAppId: 'app_test', sessionId: 'session', turnId: 'om_turn' };
 const input = { mode: 'unified' as const, chatId: 'oc_chat', rootId: 'om_root' };
@@ -84,6 +85,25 @@ describe('one reply card per turn', () => {
     chatId: input.chatId, rootMessageId: input.rootId, createdAt: 1, deadlineAt: 60001, settled: false,
     questions: [{ prompt: 'Continue?', options: [{ key: 'yes', label: 'Yes' }, { key: 'no', label: 'No' }], multiSelect: false }],
   } }) as ReplyCardAsk;
+
+  // The store keeps the canonical un-collapsed activity; display collapsing is
+  // a render-time behaviour, so assertions about duplicate/blank thinking read
+  // the process panel the user actually sees.
+  const processPanelContent = (record: TurnReplyCardRecord = store.read(key)!) => {
+    const card = JSON.parse(buildTurnReplyCard(record, presentation));
+    return card.body.elements.find((element: any) => element.tag === 'collapsible_panel').elements[0].content as string;
+  };
+
+  // Assert branch selection through the i18n key and card structure rather
+  // than pinning user-facing wording.
+  const silentReceipt = (locale: 'zh' | 'en' = 'zh') =>
+    t('worker.turn_terminal_receipt.silent_superseded', undefined, locale);
+  const cardElements = (record: TurnReplyCardRecord, locale: 'zh' | 'en' = 'zh') =>
+    JSON.parse(buildTurnReplyCard(record, locale === 'zh' ? presentation : { ...presentation, locale })).body.elements as any[];
+  const statusElement = (record: TurnReplyCardRecord, locale: 'zh' | 'en' = 'zh') =>
+    cardElements(record, locale).find((element: any) => element.element_id === 'botmux_turn_status');
+  const progressElements = (record: TurnReplyCardRecord, locale: 'zh' | 'en' = 'zh') =>
+    cardElements(record, locale).filter((element: any) => String(element.element_id ?? '').startsWith('botmux_turn_progress'));
 
   it('keeps native CoT progress off the answer surface and publishes one final after reopening', async () => {
     const nativeKey = await nativeTurn('om_native_quiet');
@@ -942,6 +962,344 @@ describe('one reply card per turn', () => {
     expect(cards.get(start.messageId!)!).toContain('完整答复');
   });
 
+  it('selects the deliberate-silence receipt branch for a nothing-to-send turn', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    await store.update(key, { kind: 'terminal', phase: 'completed', silent: true }, io);
+    const saved = store.read(key)!;
+    expect(saved.silentTurn).toBe(true);
+    // Branch selection is pinned through the i18n key, not the wording.
+    expect(progressElements(saved, 'zh')[0].content).toContain(silentReceipt('zh'));
+    expect(progressElements(saved, 'en')[0].content).toContain(silentReceipt('en'));
+    expect(statusElement(saved)).toBeDefined();
+  });
+
+  it('selects the generic missing-answer branch for a completed turn that was not deliberately silent', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    await store.update(key, { kind: 'terminal', phase: 'completed' }, io);
+    const saved = store.read(key)!;
+    expect(saved.silentTurn).toBeUndefined();
+    const bodies = progressElements(saved);
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0].content.trim().length).toBeGreaterThan(0);
+    expect(buildTurnReplyCard(saved, presentation)).not.toContain(silentReceipt());
+  });
+
+  it('renders no reply-status body when the final was delivered as a separate message, even with a silent terminal', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    // `botmux send` already delivered the answer externally (cli noteExternalFinal).
+    expect(await store.noteExternalFinal(key, input.chatId)).toBe(true);
+    // The worker still classifies the bare sentinel turn as nothing_to_send.
+    await store.update(key, { kind: 'terminal', phase: 'completed', silent: true }, io);
+    const saved = store.read(key)!;
+    expect(saved.externalFinal).toBe(true);
+    expect(saved.silentTurn).toBe(true);
+    // Delivery fact overrides the silence inference: no receipt, no missing-answer warning.
+    expect(buildTurnReplyCard(saved, presentation)).not.toContain(silentReceipt());
+    expect(progressElements(saved)).toHaveLength(0);
+    expect(statusElement(saved)).toBeDefined();
+  });
+
+  it('renders no missing-answer warning for an externally delivered turn without a silence marker', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    await store.noteExternalFinal(key, input.chatId);
+    await store.update(key, { kind: 'terminal', phase: 'completed' }, io);
+    const saved = store.read(key)!;
+    expect(progressElements(saved)).toHaveLength(0);
+    expect(buildTurnReplyCard(saved, presentation)).not.toContain(silentReceipt());
+  });
+
+  it('still shows live progress text on an externally delivered turn when progress exists', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    await store.update(key, { kind: 'progress', text: '正在核对' }, io);
+    await store.noteExternalFinal(key, input.chatId);
+    await store.update(key, { kind: 'terminal', phase: 'completed', silent: true }, io);
+    const bodies = progressElements(store.read(key)!);
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0].content).toContain('正在核对');
+    expect(buildTurnReplyCard(store.read(key)!, presentation)).not.toContain(silentReceipt());
+  });
+
+  it('does not set a refresh flag when externalFinal is marked before the terminal settles', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    await store.noteExternalFinal(key, input.chatId);
+    // Not terminal/published yet: the upcoming terminal update renders the flag itself.
+    expect(store.read(key)!.publishPending).toBeUndefined();
+    await store.update(key, { kind: 'terminal', phase: 'completed', silent: true }, io);
+    expect(store.read(key)!.publishPending).toBeUndefined();
+  });
+
+  it.each([
+    ['silent', { phase: 'completed' as const, silent: true }, true],
+    ['non-silent', { phase: 'completed' as const }, false],
+  ])('refreshes an already-published terminal card when externalFinal arrives late (%s)', async (_name, terminalEvent, isSilent) => {
+    await store.update(key, { kind: 'start' }, io);
+    await store.update(key, { kind: 'terminal', ...terminalEvent }, io);
+    const published = store.read(key)!;
+    expect(published.messageId).toBeDefined();
+    if (isSilent) expect(published.lastCard).toContain(silentReceipt());
+    const patchesBefore = vi.mocked(io.patch).mock.calls.length;
+
+    // The CLI marks external delivery only after the card has settled.
+    expect(await store.noteExternalFinal(key, input.chatId)).toBe(true);
+    const marked = store.read(key)!;
+    expect(marked.externalFinal).toBe(true);
+    expect(marked.publishPending).toBe(true);
+
+    // The daemon-side publisher's recover/sweep picks up the dirty flag and
+    // re-renders (the CLI process itself has no transport).
+    await new TurnReplyCardStore(dir).update(key, { kind: 'recover' }, io);
+    const recovered = store.read(key)!;
+    expect(vi.mocked(io.patch).mock.calls.length).toBeGreaterThan(patchesBefore);
+    expect(recovered.publishPending).toBeUndefined();
+    expect(recovered.lastCard).not.toContain(silentReceipt());
+    expect(progressElements(recovered)).toHaveLength(0);
+  });
+
+  it('re-renders instead of replaying a stale pendingPatch when externalFinal invalidates it', async () => {
+    // The terminal PATCH fails, leaving a pendingPatch that carries the wrong body.
+    const realPatch = vi.mocked(io.patch).getMockImplementation()!;
+    vi.mocked(io.patch).mockImplementation(async () => { throw new Error('PATCH unavailable'); });
+    await store.update(key, { kind: 'start' }, io);
+    await expect(store.update(key, { kind: 'terminal', phase: 'completed', silent: true }, io)).rejects.toThrow('PATCH unavailable');
+    const stuck = store.read(key)!;
+    expect(stuck.pendingPatch).toBeDefined();
+    expect(stuck.pendingPatch!.content).toContain(silentReceipt());
+
+    // Transport recovers; the external-final mark is a render revision.
+    vi.mocked(io.patch).mockImplementation(realPatch);
+    expect(await store.noteExternalFinal(key, input.chatId)).toBe(true);
+    const marked = store.read(key)!;
+    expect(marked.externalFinal).toBe(true);
+    expect(marked.pendingPatch).toBeUndefined();
+    expect(marked.publishPending).toBe(true);
+
+    // recover must re-render from the latest record, not replay the stale body.
+    const patchesBefore = vi.mocked(io.patch).mock.calls.length;
+    await new TurnReplyCardStore(dir).update(key, { kind: 'recover' }, io);
+    const recovered = store.read(key)!;
+    expect(vi.mocked(io.patch).mock.calls.length).toBeGreaterThan(patchesBefore);
+    expect(recovered.pendingPatch).toBeUndefined();
+    expect(recovered.publishPending).toBeUndefined();
+    expect(recovered.lastCard).not.toContain(silentReceipt());
+    expect(progressElements(recovered)).toHaveLength(0);
+
+    // A second recover is now a genuine no-op.
+    const patchesAfter = vi.mocked(io.patch).mock.calls.length;
+    await new TurnReplyCardStore(dir).update(key, { kind: 'recover' }, io);
+    expect(vi.mocked(io.patch).mock.calls.length).toBe(patchesAfter);
+  });
+
+  it('keeps the refresh evidence when the re-render PATCH after a late mark also fails', async () => {
+    const realPatch = vi.mocked(io.patch).getMockImplementation()!;
+    vi.mocked(io.patch).mockImplementation(async () => { throw new Error('PATCH unavailable'); });
+    await store.update(key, { kind: 'start' }, io);
+    await expect(store.update(key, { kind: 'terminal', phase: 'completed', silent: true }, io)).rejects.toThrow('PATCH unavailable');
+    vi.mocked(io.patch).mockImplementation(realPatch);
+    await store.noteExternalFinal(key, input.chatId);
+
+    // recover re-renders, but this PATCH fails too: evidence must survive.
+    vi.mocked(io.patch).mockImplementation(async () => { throw new Error('still down'); });
+    await expect(new TurnReplyCardStore(dir).update(key, { kind: 'recover' }, io)).rejects.toThrow('still down');
+    const failed = store.read(key)!;
+    expect(failed.publishPending).toBe(true);
+    // The persisted pendingPatch now carries the CORRECT (external-final) body.
+    expect(failed.pendingPatch).toBeDefined();
+    expect(failed.pendingPatch!.content).not.toContain(silentReceipt());
+
+    // Next recover replays that correct body and clears the evidence on success.
+    vi.mocked(io.patch).mockImplementation(realPatch);
+    await new TurnReplyCardStore(dir).update(key, { kind: 'recover' }, io);
+    const recovered = store.read(key)!;
+    expect(recovered.publishPending).toBeUndefined();
+    expect(recovered.pendingPatch).toBeUndefined();
+    expect(recovered.lastCard).not.toContain(silentReceipt());
+  });
+
+  it('preserves a forced same-content republish when externalFinal invalidates its pendingPatch', async () => {
+    // An unresolved Ask means externalFinal does not change the rendered body.
+    await store.update(key, { kind: 'start' }, io);
+    await store.update(key, { kind: 'ask', entry: nativeAsk('force-ask') }, io);
+    // Disconnected terminal publishes the card and establishes lastCard.
+    await store.update(key, { kind: 'terminal', phase: 'ambiguous', disconnected: true }, io);
+    const lastCardBefore = store.read(key)!.lastCard;
+
+    // A forced same-content republish fails: pendingPatch content equals lastCard.
+    const realPatch = vi.mocked(io.patch).getMockImplementation()!;
+    vi.mocked(io.patch).mockImplementation(async () => { throw new Error('provider pre-click restore'); });
+    const forceIo: TurnReplyCardTransport = { ...io, forcePatch: true };
+    await expect(store.update(key, { kind: 'refresh' }, forceIo)).rejects.toThrow('pre-click restore');
+    const stuck = store.read(key)!;
+    expect(stuck.pendingPatch!.content).toBe(stuck.lastCard);
+
+    // Transport recovers with a normal io (no forcePatch); the mark invalidates
+    // the pendingPatch but must keep the forced-republish intent.
+    vi.mocked(io.patch).mockImplementation(realPatch);
+    expect(await store.noteExternalFinal(key, input.chatId)).toBe(true);
+    expect(store.read(key)!.pendingPatch).toBeUndefined();
+    expect(store.read(key)!.forceRepublish).toBe(true);
+
+    // recover renders an identical body but still PATCHes once, then clears all evidence.
+    const patchesBefore = vi.mocked(io.patch).mock.calls.length;
+    await new TurnReplyCardStore(dir).update(key, { kind: 'recover' }, io);
+    const recovered = store.read(key)!;
+    expect(vi.mocked(io.patch).mock.calls.length).toBeGreaterThan(patchesBefore);
+    expect(recovered.lastCard).toBe(lastCardBefore);
+    expect(recovered.forceRepublish).toBeUndefined();
+    expect(recovered.publishPending).toBeUndefined();
+    expect(recovered.pendingPatch).toBeUndefined();
+  });
+
+  it('does not set forceRepublish when the invalidated pendingPatch carried a changed body', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    await store.update(key, { kind: 'terminal', phase: 'completed', silent: true }, io);
+    // Simulate a failed PATCH whose body DIFFERS from lastCard: a normal stale-body
+    // replay (a real state change that never got acknowledged), not a forced
+    // same-content republish.
+    const seeded = store.read(key)!;
+    seeded.pendingPatch = { content: `${seeded.lastCard}#changed`, final: false };
+    writeFileSync(join(store.directory, `${store.id(key)}.json`), JSON.stringify(seeded));
+    expect(await store.noteExternalFinal(key, input.chatId)).toBe(true);
+    const marked = new TurnReplyCardStore(dir).read(key)!;
+    expect(marked.forceRepublish).toBeUndefined();
+    expect(marked.pendingPatch).toBeUndefined();
+    expect(marked.publishPending).toBe(true);
+  });
+
+  it('never marks a user-cancelled turn as deliberately silent', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    await store.update(key, { kind: 'phase', phase: 'stopping' }, io);
+    await store.update(key, { kind: 'terminal', phase: 'completed', silent: true }, io);
+    const saved = store.read(key)!;
+    expect(saved.phase).toBe('cancelled');
+    expect(saved.silentTurn).toBeUndefined();
+    // The cancelled phase still renders a status row, but never the silence branch.
+    expect(statusElement(saved)).toBeDefined();
+    expect(buildTurnReplyCard(saved, presentation)).not.toContain(silentReceipt());
+  });
+
+  it('reconciles a persisted silent completed turn to failed when later evidence proves a required reply was missing', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    await store.update(key, { kind: 'terminal', phase: 'completed', silent: true }, io);
+    expect(store.read(key)!.silentTurn).toBe(true);
+    // Historical replay (after restart) carries the fail-closed failed terminal.
+    await store.update(key, { kind: 'terminal', phase: 'failed', silent: true }, io);
+    const saved = store.read(key)!;
+    expect(saved.phase).toBe('failed');
+    expect(saved.silentTurn).toBeUndefined();
+    // A failed status row is rendered, but the deliberate-silence branch is gone.
+    expect(statusElement(saved)).toBeDefined();
+    expect(buildTurnReplyCard(saved, presentation)).not.toContain(silentReceipt());
+  });
+
+  it('does not reconcile a silent completed turn once a final answer has been delivered', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    await store.update(key, { kind: 'terminal', phase: 'completed', silent: true }, io);
+    await store.update(key, { kind: 'final', text: '迟到的答复', source: 'explicit', card: finalEvent('迟到的答复').card }, io);
+    const before = JSON.stringify(store.read(key)!.phase) + JSON.stringify(store.read(key)!.silentTurn);
+    await store.update(key, { kind: 'terminal', phase: 'failed', silent: true }, io);
+    const saved = store.read(key)!;
+    expect(JSON.stringify(saved.phase) + JSON.stringify(saved.silentTurn)).toBe(before);
+    expect(saved.phase).toBe('completed');
+  });
+
+  it('leaves the ordinary idempotent gate intact for non-silent terminal corrections', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    await store.update(key, { kind: 'terminal', phase: 'completed' }, io);
+    await store.update(key, { kind: 'terminal', phase: 'failed' }, io);
+    // Only the narrow completed+silent → failed reconciliation is open.
+    expect(store.read(key)!.phase).toBe('completed');
+    expect(store.read(key)!.silentTurn).toBeUndefined();
+  });
+
+  it('drops the silence marker when a retired silent card later settles as failed', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    await store.update(key, { kind: 'terminal', phase: 'completed', silent: true }, io);
+    // Simulate a record whose display was retired before the failed evidence came.
+    const retired = store.read(key)!;
+    retired.displayRetired = true;
+    writeFileSync(join(store.directory, `${store.id(key)}.json`), JSON.stringify(retired));
+    await new TurnReplyCardStore(dir).update(key, { kind: 'terminal', phase: 'failed', silent: true }, io);
+    const saved = new TurnReplyCardStore(dir).read(key)!;
+    expect(saved.phase).toBe('failed');
+    expect(saved.silentTurn).toBeUndefined();
+    expect(buildTurnReplyCard(saved, presentation)).not.toContain(silentReceipt());
+  });
+
+  it('keeps blank thinking out of the canonical record and shows a repeated paragraph once per stage', async () => {
+    const entries: CotEntry[] = [
+      { kind: 'thinking', text: 'THINK_X' }, { kind: 'thinking', text: '  \n' }, { kind: 'thinking', text: 'THINK_X' },
+      { kind: 'thinking', text: 'THINK_Y' },
+    ];
+    const snapshot = publicReplyCardActivity(entries);
+    await store.update(key, { kind: 'tools', tools: [], activity: snapshot }, io);
+    // Blank thinking never enters the canonical record; repeats stay stored for
+    // idempotent replay but collapse to one visible paragraph at render time.
+    expect(store.read(key)!.activity!.filter(item => item.kind === 'thinking').map(item => (item as any).text))
+      .toEqual(['THINK_X', 'THINK_X', 'THINK_Y']);
+    expect(processPanelContent().split('\n').filter(line => line.startsWith('💭')))
+      .toEqual(['💭 THINK_X', '💭 THINK_Y']);
+    // Replaying the exact same snapshot must not change the stored sequence.
+    const beforeReplay = JSON.stringify(store.read(key)!.activity);
+    await store.update(key, { kind: 'tools', tools: [], activity: snapshot }, io);
+    expect(JSON.stringify(store.read(key)!.activity)).toBe(beforeReplay);
+    expect(processPanelContent().split('\n').filter(line => line.startsWith('💭')))
+      .toEqual(['💭 THINK_X', '💭 THINK_Y']);
+  });
+
+  it('keeps the same thinking text when a tool call separates the two occurrences', async () => {
+    const entries: CotEntry[] = [
+      { kind: 'thinking', text: 'THINK_X' }, { kind: 'tool_call', id: 't0', name: 'Bash', args: '{}' },
+      { kind: 'thinking', text: 'THINK_X' },
+    ];
+    await store.update(key, { kind: 'tools', tools: publicReplyCardTools(entries, true), activity: publicReplyCardActivity(entries) }, io);
+    expect(store.read(key)!.activity!.map(item => item.kind)).toEqual(['thinking', 'tool', 'thinking']);
+  });
+
+  it.each(['progress', 'ask'] as const)(
+    'keeps a re-emitted thinking paragraph when a store-only %s stage delimits the two snapshots', async stage => {
+      await store.update(key, { kind: 'tools', tools: [], activity: publicReplyCardActivity([
+        { kind: 'thinking', text: 'THINK_X' },
+      ]) }, io);
+      if (stage === 'progress') await store.update(key, { kind: 'progress', text: '阶段分隔' }, io);
+      else await store.update(key, { kind: 'ask', entry: nativeAsk('stage-ask') }, io);
+      // The cumulative snapshot carries the paragraph at two source positions;
+      // the store-only delimiter is absent from this snapshot.
+      await store.update(key, { kind: 'tools', tools: [], activity: publicReplyCardActivity([
+        { kind: 'thinking', text: 'THINK_X' }, { kind: 'text', text: 'THINK_X' },
+      ]) }, io);
+      expect(store.read(key)!.activity!.map(item => item.kind)).toEqual(['thinking', stage, 'thinking']);
+      // The two stages each show the paragraph once in the rendered panel.
+      expect(processPanelContent().split('\n').filter(line => line === '💭 THINK_X')).toHaveLength(2);
+    });
+
+  it.each(['progress', 'ask'] as const)(
+    'does not resurrect collapsed thinking when the identical snapshot is replayed after a store-only %s', async stage => {
+      const snapshot = publicReplyCardActivity([
+        { kind: 'thinking', text: 'THINK_X' }, { kind: 'thinking', text: 'THINK_X' },
+      ]);
+      await store.update(key, { kind: 'tools', tools: [], activity: snapshot }, io);
+      if (stage === 'progress') await store.update(key, { kind: 'progress', text: '阶段分隔' }, io);
+      else await store.update(key, { kind: 'ask', entry: nativeAsk('replay-ask') }, io);
+      const beforeReplay = JSON.stringify(store.read(key)!.activity);
+      await store.update(key, { kind: 'tools', tools: [], activity: snapshot }, io);
+      expect(JSON.stringify(store.read(key)!.activity)).toBe(beforeReplay);
+      // Only the first stage's paragraph is visible; the replay adds nothing.
+      expect(processPanelContent().split('\n').filter(line => line === '💭 THINK_X')).toHaveLength(1);
+    });
+
+  it('merges adjacent thinking entries whose text differs only in whitespace at render time', async () => {
+    const entries: CotEntry[] = [
+      { kind: 'thinking', text: '同一段\n思考' }, { kind: 'thinking', text: ' 同一段  思考 ' },
+    ];
+    await store.update(key, { kind: 'tools', tools: [], activity: publicReplyCardActivity(entries) }, io);
+    // The canonical record preserves both source positions and original text.
+    const thinking = store.read(key)!.activity!.filter(item => item.kind === 'thinking');
+    expect(thinking).toHaveLength(2);
+    expect(thinking[0]).toMatchObject({ id: 'thinking:0', text: '同一段\n思考' });
+    // The rendered panel shows the paragraph once, using the first occurrence.
+    expect(processPanelContent()).toBe('💭 同一段\n思考');
+  });
+
   it('serializes independent publishers and fences progress after final delivery', async () => {
     const secondProcess = new TurnReplyCardStore(dir);
     let release!: () => void;
@@ -1173,6 +1531,17 @@ describe('public process and fallback compatibility', () => {
     const card = JSON.parse(buildTurnReplyCard(record, options));
     return card.body.elements.find((element: any) => element.tag === 'collapsible_panel');
   }
+
+  it('does not render blank or repeated thinking from a record persisted before the collapse', () => {
+    const record: TurnReplyCardRecord = { ...key, ...input, version: 1, phase: 'completed', createdAtMs: 1, progress: [], tools: [],
+      activity: [
+        { kind: 'thinking', id: 'thinking:0', text: 'THINK_X' }, { kind: 'thinking', id: 'thinking:1', text: '' },
+        { kind: 'thinking', id: 'thinking:2', text: 'THINK_X' }, { kind: 'thinking', id: 'thinking:3', text: 'THINK_Y' },
+      ] };
+    const card = JSON.parse(buildTurnReplyCard(record, presentation));
+    const panel = card.body.elements.find((element: any) => element.tag === 'collapsible_panel');
+    expect(panel.elements[0].content).toBe('💭 THINK_X\n💭 THINK_Y');
+  });
 
   it('keeps the latest nonempty narration outside the collapsed panel after subsequent tool events', () => {
     const record = processRecord(2, 0);

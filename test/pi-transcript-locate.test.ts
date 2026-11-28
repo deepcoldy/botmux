@@ -11,7 +11,7 @@
  * file Pi never wrote again, and every final of those sessions was lost.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
@@ -19,6 +19,10 @@ import {
   drainPiTranscript,
   findPiTranscriptBySessionId,
   piBotmuxSessionDirIn,
+  piBotmuxSessionTranscript,
+  piPersistentTranscriptDir,
+  piPreviousTranscriptDir,
+  piProfileTranscriptDir,
   piSessionDirName,
   resetPiPendingTurnState,
 } from '../src/services/pi-transcript.js';
@@ -75,6 +79,56 @@ describe('piSessionDirName mirrors Pi getDefaultSessionDirPath', () => {
     ['/root/iserver/', '--root-iserver--'],
   ])('%s → %s', (cwd, dir) => {
     expect(piSessionDirName(cwd)).toBe(dir);
+  });
+});
+
+describe('Pi launch profile', () => {
+  it('uses the exact directory selected by the environment or Pi settings before the native cwd bucket', () => {
+    const cwd = join(ROOT, 'work');
+    mkdirSync(join(cwd, '.pi'), { recursive: true });
+    const realCwd = realpathSync(cwd);
+    const profile = join(realCwd, 'profile');
+    mkdirSync(profile);
+    const env = { PI_CODING_AGENT_DIR: 'profile' };
+    expect(piProfileTranscriptDir(env, cwd)).toBe(join(profile, 'sessions', piSessionDirName(realCwd)));
+    writeFileSync(join(profile, 'settings.json'), JSON.stringify({ sessionDir: '~/shared' }));
+    expect(piProfileTranscriptDir({ ...env, HOME: ROOT }, cwd)).toBe(join(ROOT, 'shared'));
+    writeFileSync(join(cwd, '.pi', 'settings.json'), JSON.stringify({ sessionDir: 'project-records' }));
+    expect(piProfileTranscriptDir(env, cwd)).toBe(join(realCwd, 'project-records'));
+    expect(piProfileTranscriptDir({ ...env, PI_CODING_AGENT_SESSION_DIR: 'env-records' }, cwd)).toBe(join(realCwd, 'env-records'));
+    expect(piProfileTranscriptDir({ ...env, HOME: ROOT }, cwd, false)).toBe(join(ROOT, 'shared'));
+  });
+
+  it('honors a project sessionDir with no env override on a stock home', () => {
+    // Pi's startup SettingsManager loads <cwd>/.pi/settings.json regardless of
+    // HOME or PI_* env vars. The early return must not skip that read, or the
+    // bridge waits on the default bucket while Pi files under sessionDir.
+    const cwd = join(ROOT, 'stock-work');
+    mkdirSync(join(cwd, '.pi'), { recursive: true });
+    writeFileSync(join(cwd, '.pi', 'settings.json'), JSON.stringify({ sessionDir: 'project-records' }));
+    const realCwd = realpathSync(cwd);
+    expect(piProfileTranscriptDir({}, cwd)).toBe(join(realCwd, 'project-records'));
+  });
+
+  it('falls back to the default bucket under a redirected HOME with no settings', () => {
+    const cwd = join(ROOT, 'redirected-work');
+    mkdirSync(cwd, { recursive: true });
+    const home = join(ROOT, 'redirected-home');
+    mkdirSync(home, { recursive: true });
+    expect(piProfileTranscriptDir({ HOME: home }, cwd))
+      .toBe(join(home, '.pi', 'agent', 'sessions', piSessionDirName(realpathSync(cwd))));
+  });
+
+  it('reattaches using the live pane’s directory across config edits, then replaces it on cold launch', () => {
+    const first = join(ROOT, 'first');
+    const second = join(ROOT, 'second');
+    expect(piPersistentTranscriptDir(ROOT, SID, first, true)).toBeUndefined();
+    expect(piPersistentTranscriptDir(ROOT, SID, first, false)).toBe(first);
+    expect(piPersistentTranscriptDir(ROOT, SID, second, true)).toBe(first);
+    expect(piPersistentTranscriptDir(ROOT, SID, second, false)).toBe(second);
+    expect(piPersistentTranscriptDir(ROOT, SID, undefined, true)).toBe(second);
+    expect(piPersistentTranscriptDir(ROOT, SID, undefined, false)).toBeUndefined();
+    expect(piPersistentTranscriptDir(ROOT, SID, first, true)).toBeUndefined();
   });
 });
 
@@ -142,6 +196,85 @@ describe('Pi transcript layout follows the session across a sandbox switch', () 
     expect(findPiTranscriptBySessionId(SID, cwd, SESSIONS)).toBe(adopted.status === 'copied' ? adopted.to : '');
     // A second sandboxed restart leaves the own copy alone.
     expect(adoptPiTranscriptIntoBotmuxDir(SID, cwd, SESSIONS)).toEqual({ status: 'skipped', reason: 'already-own' });
+  });
+
+  it('copies only this profile’s native history into the managed sandbox directory', () => {
+    const cwd = join(ROOT, 'wt');
+    const file = `2026-10-01T00-00-00-000Z_${SID}.jsonl`;
+    writeSession(piSessionDirName(cwd), file, [header(cwd)]);
+    const profileRoot = join(ROOT, 'private-profile', 'sessions');
+    const bucket = join(profileRoot, piSessionDirName(cwd));
+    expect(findPiTranscriptBySessionId(SID, cwd, SESSIONS, bucket)).toBeUndefined();
+    mkdirSync(bucket, { recursive: true });
+    const native = join(bucket, file);
+    const contents = [header(cwd), { type: 'session_info', name: 'profile history' }].map(row => JSON.stringify(row)).join('\n');
+    writeFileSync(native, contents);
+    expect(findPiTranscriptBySessionId(SID, cwd, SESSIONS, bucket)).toBe(native);
+    const copied = join(ownDir(), file);
+    expect(adoptPiTranscriptIntoBotmuxDir(SID, cwd, SESSIONS, join(ROOT, 'new-profile'), bucket)).toEqual({ status: 'copied', from: native, to: copied });
+    expect(readFileSync(copied, 'utf8')).toBe(contents);
+    expect(findPiTranscriptBySessionId(SID, cwd, SESSIONS, bucket)).toBe(copied);
+  });
+
+  it('off → scratch → oncall keeps the project sessionDir available for history adoption', () => {
+    const cwd = join(ROOT, 'scratch-work');
+    const home = join(ROOT, 'scratch-home');
+    mkdirSync(join(cwd, '.pi'), { recursive: true });
+    mkdirSync(home, { recursive: true });
+    writeFileSync(join(cwd, '.pi', 'settings.json'), JSON.stringify({ sessionDir: 'project-records' }));
+    const env = { HOME: home };
+    const launchDir = piProfileTranscriptDir(env, cwd)!;
+    mkdirSync(launchDir, { recursive: true });
+    const file = `2026-10-01T00-00-00-000Z_${SID}.jsonl`;
+    const contents = JSON.stringify(header(cwd)) + '\n';
+    writeFileSync(join(launchDir, file), contents);
+    const dataDir = join(ROOT, 'scratch-data');
+
+    // The unsandboxed generation records its real host launch directory.
+    expect(piPersistentTranscriptDir(dataDir, SID, launchDir, false)).toBe(launchDir);
+    // Warm scratch keeps its established reattach lookup; cold scratch does not
+    // interpret its missing host profile as a request to clear the record.
+    expect(piPersistentTranscriptDir(dataDir, SID, undefined, true, true)).toBe(launchDir);
+    expect(piPersistentTranscriptDir(dataDir, SID, undefined, false, true)).toBeUndefined();
+    expect(piPreviousTranscriptDir(dataDir, SID)).toBe(launchDir);
+
+    // Oncall deliberately does not read project settings. It must recover the
+    // old directory from the record and copy that history into the own dir.
+    const sandboxProfileDir = piProfileTranscriptDir(env, cwd, false);
+    const adopted = adoptPiTranscriptIntoBotmuxDir(
+      SID, cwd, SESSIONS, sandboxProfileDir, piPreviousTranscriptDir(dataDir, SID),
+    );
+    expect(adopted).toEqual({ status: 'copied', from: join(launchDir, file), to: join(ownDir(), file) });
+    expect(readFileSync(join(ownDir(), file), 'utf8')).toBe(contents);
+  });
+
+  it('accepts valid transcript symlinks in custom and own dirs, but not dangling links', () => {
+    const cwd = join(ROOT, 'symlink-work');
+    const targetDir = join(ROOT, 'symlink-targets');
+    const customDir = join(ROOT, 'custom-symlinks');
+    mkdirSync(cwd, { recursive: true });
+    mkdirSync(targetDir, { recursive: true });
+    mkdirSync(customDir, { recursive: true });
+    const file = `2026-10-01T00-00-00-000Z_${SID}.jsonl`;
+    const target = join(targetDir, 'target.jsonl');
+    writeFileSync(target, JSON.stringify(header(cwd)) + '\n');
+    const customLink = join(customDir, file);
+    symlinkSync(target, customLink);
+
+    // Pi follows this link during exact-id resume; the custom-dir bridge must
+    // find the same file instead of discarding it at the Dirent filter.
+    expect(findPiTranscriptBySessionId(SID, cwd, SESSIONS, customDir)).toBe(customLink);
+
+    mkdirSync(ownDir(), { recursive: true });
+    const ownLink = join(ownDir(), file);
+    symlinkSync(target, ownLink);
+    expect(piBotmuxSessionTranscript(SID, SESSIONS, [cwd, realpathSync(cwd)])).toBe(ownLink);
+    // The no-cwd probe still opens a symlink and validates its session header.
+    expect(piBotmuxSessionTranscript(SID, SESSIONS)).toBe(ownLink);
+
+    rmSync(target);
+    expect(piBotmuxSessionTranscript(SID, SESSIONS)).toBeUndefined();
+    expect(piBotmuxSessionTranscript(SID, SESSIONS, [cwd, realpathSync(cwd)])).toBeUndefined();
   });
 
   it('on → off: the own dir keeps winning over a stale or missing cwd-bucket file', () => {

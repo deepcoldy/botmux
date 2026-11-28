@@ -137,6 +137,22 @@ describe('fleet process identity', () => {
     expect(kill).toHaveBeenCalledWith(61, 'SIGTERM');
   });
 
+  it('uses a recorded legacy format for both inspection and signal attestation', () => {
+    const legacy = 'Fri Nov 27 19:32:34 2026';
+    const deps: FleetProcessIdentityRuntime = {
+      readIdentity: (_pid, recorded) => recorded === legacy ? legacy : 'lstart-utc-v1:Fri Nov 27 11:32:34 2026',
+      readCommandLine: () => '/opt/botmux __supervisor',
+      readPidNamespace: () => undefined,
+      pidExists: () => true,
+    };
+    expect(inspectFleetProcess(61, legacy, undefined, () => true, deps, false)).toEqual({
+      status: 'exact', attestation: { pid: 61, processStart: legacy },
+    });
+    const kill = vi.spyOn(process, 'kill').mockImplementation((() => true) as typeof process.kill);
+    expect(signalAttestedFleetProcess({ pid: 61, processStart: legacy }, 'SIGTERM', deps)).toBe(true);
+    expect(kill).toHaveBeenCalledWith(61, 'SIGTERM');
+  });
+
   it('propagates permission errors instead of treating a verified process as gone', () => {
     vi.spyOn(process, 'kill').mockImplementation(() => {
       throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' });

@@ -666,6 +666,11 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // session-scoped, capability-gated routes (v3 workflow relay, vc-agent).
   // A port marker, not a credential — every route authenticates independently.
   'BOTMUX_DAEMON_IPC_PORT',
+  // Workflow worker's per-spawn SessionStart channel (utils/session-ready-
+  // local-signal.ts). Forwarded only into the owning pane; scrubbed from the
+  // shared terminal server so a co-tenant pane never sees another spawn's path.
+  'BOTMUX_SESSION_READY_SIGNAL_FILE',
+  'BOTMUX_SESSION_READY_SIGNAL_NONCE',
   // Deployment-wide coordination mode. In primary mode the in-session CLI
   // must route botmux send through the owning daemon instead of calling the
   // provider directly. This is classification only; IPC auth remains required.
@@ -808,6 +813,9 @@ export const SESSION_TURN_MARKER_ENV_KEYS = [
   // Owning daemon's per-boot IPC port; the daemon self-sets the real value at
   // boot (daemon.ts), so an inherited copy is always a stale foreign port.
   'BOTMUX_DAEMON_IPC_PORT',
+  // A new process boundary must never reuse another workflow launch's hook channel.
+  'BOTMUX_SESSION_READY_SIGNAL_FILE',
+  'BOTMUX_SESSION_READY_SIGNAL_NONCE',
   // Per-session read-isolation / apiOnly / sandbox verdicts (worker-owned).
   'BOTMUX_READ_ISOLATION',
   'BOTMUX_READ_ISOLATED',
