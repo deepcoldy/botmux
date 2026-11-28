@@ -11,7 +11,7 @@ Botmux 提供的短期 bot token。
 
 ## 没有发起人的回合：用 bot 主人的授权（`larkUserOwnerFallback`）
 
-`--as user` 默认用本轮发起人自己的授权。脚本、Webhook、平台派发、没有创建人的定时任务这类回合**没有真人发起**，以前在这里一律被拒（`No current requesting user`）。`larkUserOwnerFallback`（默认开启）让这类回合改用 **bot 主人**对本 bot 应用的授权；主人按现有规则认定（`ownerOpenId` 显式配置且仍在管理员名单里优先，否则是名单里第一个 `ou_`）。`--as bot` 不受影响。
+`--as user` 默认用本轮发起人自己的授权。脚本、Webhook、平台派发、没有创建人的定时任务这类回合**没有真人发起**，以前在这里一律被拒（`No current requesting user`）。`larkUserOwnerFallback`（默认开启）让这类回合改用 **bot 主人**对本 bot 应用的授权；主人按现有规则认定（`ownerOpenId` / `ownerUnionId` 显式配置且仍在管理员名单里优先，否则是名单里第一个 `ou_`）。`--as bot` 不受影响。
 
 | 回合 | 开关开启（默认） | 开关关闭 |
 |---|---|---|
