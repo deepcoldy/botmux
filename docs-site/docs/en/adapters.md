@@ -157,7 +157,7 @@ export CURSOR_DATA_DIR="$HOME/.cursor"
 exec /path/to/cursor-agent-local --authless --disable-auto-update "$@"
 ```
 
-Keep upstream provider keys in the gateway. Pass only a scoped local gateway token to the launcher through your service's secret configuration. If a [strict process environment](/en/bots-json#strict-env) filters that environment, allow `CURSOR_LOCAL_AGENT_API_KEY`. The endpoint needs to serve `GET /models` and streaming `POST /chat/completions`. Workspace tools require streaming tool calls.
+Keep upstream provider keys in the gateway. Pass only a scoped local gateway token to the launcher through your service's secret configuration. If a [strict process environment](/en/bots-json#strict-env) filters that environment, allow `CURSOR_LOCAL_AGENT_API_KEY`. For Chat Completions, the gateway must serve `GET /v1/models` and streaming `POST /v1/chat/completions`. Workspace tools require streaming tool calls.
 
 ```json
 {
@@ -169,6 +169,14 @@ Keep upstream provider keys in the gateway. Pass only a scoped local gateway tok
 ```
 
 Set `model` to an ID the gateway advertises. Use `customModels` to add gateway IDs to the Feishu picker. The gateway decides which models are accepted.
+
+**Image attachments.** Botmux passes the local file path to Cursor. With Agent Local `2026.11.22-e9042b2` using Chat Completions, a successful `Read` of a PNG can appear in the next request as the text-only tool result `Read image file: <path>`. If that path is the only representation of the attachment, the request gives even a vision-capable model no pixels to read.
+
+To check your setup, attach a PNG with a random test code visible only in the image to the first message of a new session. Ask the bot to use `Read` and transcribe the code. If you inspect Chat Completions traffic, check the request immediately after `Read` for an `image_url` part carrying that image.
+
+If your gateway receives only the path, you can attach the image directly in Cursor from an existing tmux session. In the Cursor composer, type your request followed by a space, paste the quoted absolute path to a PNG on the machine running Cursor (for example, `"/path/to/screenshot.png"`), then press Enter. With the tested build, this sends an `image_url` in the user message. If you only have access to Feishu, paste the relevant text or describe the visual details there.
+
+If your gateway and model support images in Anthropic Messages tool results, the tested build can also send PNG data over that protocol. Use a base URL ending in `/v1` and serve streaming `POST /v1/messages`. In `GET /v1/models`, advertise `api_types: ["anthropic_messages"]` for the model set in `bots.json`. Agent Local sends the configured gateway token as a bearer token for model discovery and in `x-api-key` for Messages. In a new session, repeat the test with a different code and check for an `image` block in `tool_result.content`.
 
 Botmux reads Cursor transcripts from the daemon user's `~/.cursor`. Run the launcher as the same service account and keep the data directory there. If Linux process protection prevents Botmux from discovering the transcript, the tested build supports `CURSOR_AGENT_ALLOW_PROCESS_INSPECTION=1` in the launcher. This permits same-user process inspection. Enable it only if needed and use a dedicated service account.
 
