@@ -149,6 +149,34 @@ for await (const line of createInterface({ input: process.stdin })) {
       send({ id: 'unk-1', method: 'client/unsupported', params: { sessionId } });
       continue;
     }
+    if (promptText === 'big-ascii-8m') {
+      // One chunk whose decoded text is exactly at the content cap: the wire
+      // frame is larger than the text due to the JSON-RPC envelope.
+      update({ sessionUpdate: 'agent_message_chunk', messageId: 'm-big', content: { type: 'text', text: 'a'.repeat(8_000_000) } });
+      send({ id: promptId, result: { stopReason: 'end_turn' } });
+      continue;
+    }
+    if (promptText === 'big-quotes-4m') {
+      // 4 M raw characters, each escaped to two wire bytes by JSON.stringify:
+      // decoded content stays at 4 MB while the frame approaches 8 MB.
+      update({ sessionUpdate: 'agent_message_chunk', messageId: 'm-big', content: { type: 'text', text: '"'.repeat(4_000_000) } });
+      send({ id: promptId, result: { stopReason: 'end_turn' } });
+      continue;
+    }
+    if (promptText === 'over-content') {
+      // Two chunks under one messageId accumulating past the 8 MB decoded cap.
+      update({ sessionUpdate: 'agent_message_chunk', messageId: 'm-big', content: { type: 'text', text: 'a'.repeat(8_000_000) } });
+      update({ sessionUpdate: 'agent_message_chunk', messageId: 'm-big', content: { type: 'text', text: 'b' } });
+      send({ id: promptId, result: { stopReason: 'end_turn' } });
+      continue;
+    }
+    if (promptText === 'oversized-frame') {
+      // Decoded text alone is past the content cap, and escaping pushes the wire
+      // frame past the 16 MiB line cap; the reader must reject the frame itself.
+      update({ sessionUpdate: 'agent_message_chunk', messageId: 'm-big', content: { type: 'text', text: '"'.repeat(8_400_000) } });
+      send({ id: promptId, result: { stopReason: 'end_turn' } });
+      continue;
+    }
     const mode = control.configOptions.find(o => o.id === 'mode').currentValue;
     const model = control.configOptions.find(o => o.id === 'model').currentValue;
     const effort = control.configOptions.find(o => o.id === 'reasoning_effort').currentValue;

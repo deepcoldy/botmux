@@ -4,7 +4,13 @@ import { applySessionOwnerEnv } from '../utils/child-env.js';
 type Json = Record<string, any>;
 
 export const ATOMCODE_FINAL_MAX_BYTES = 8_000_000;
-const MAX_FRAME_BYTES = 8_000_000;
+// Per-line NDJSON cap, measured on the WIRE bytes of one JSON-RPC message.
+// The decoded-content cap above counts raw text; a wire line additionally
+// carries the JSON-RPC envelope and string escaping (quotes/backslashes/newlines
+// double in size), so an 8 MB reply near the content cap needs headroom here.
+// Sized for the worst common case: 8 MB of characters that each escape to two
+// bytes, plus the envelope. The decoded cap still bounds retained content.
+const MAX_FRAME_BYTES = 16 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 30_000;
 const CLOSE_REQUEST_TIMEOUT_MS = 3_000;
 const GRACEFUL_EXIT_TIMEOUT_MS = 1_500;

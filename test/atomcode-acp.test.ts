@@ -187,4 +187,48 @@ describe('runAtomcodeAcp', () => {
     }, new AbortController().signal);
     expect(result.content).toBe('unsupported:-32601');
   });
+
+  it('accepts a decoded 8 MB reply whose NDJSON frame exceeds 8 MB via envelope and escaping', async () => {
+    const f = createFixture();
+    const ascii = await runAtomcodeAcp({
+      executable: f.bin,
+      cwd: f.root,
+      env: f.env,
+      content: 'big-ascii-8m',
+      permission: 'full',
+      onUserInput: async () => ({}),
+    }, new AbortController().signal);
+    expect(Buffer.byteLength(ascii.content)).toBe(8_000_000);
+
+    const quoted = await runAtomcodeAcp({
+      executable: f.bin,
+      cwd: f.root,
+      env: f.env,
+      content: 'big-quotes-4m',
+      permission: 'full',
+      onUserInput: async () => ({}),
+    }, new AbortController().signal);
+    expect(quoted.content).toBe('"'.repeat(4_000_000));
+  });
+
+  it('still rejects decoded content past the 8 MB cap and wire frames past the line cap', async () => {
+    const f = createFixture();
+    await expect(runAtomcodeAcp({
+      executable: f.bin,
+      cwd: f.root,
+      env: f.env,
+      content: 'over-content',
+      permission: 'full',
+      onUserInput: async () => ({}),
+    }, new AbortController().signal)).rejects.toThrow(/atomcode_acp_content_limit/);
+
+    await expect(runAtomcodeAcp({
+      executable: f.bin,
+      cwd: f.root,
+      env: f.env,
+      content: 'oversized-frame',
+      permission: 'full',
+      onUserInput: async () => ({}),
+    }, new AbortController().signal)).rejects.toThrow(/atomcode_acp_frame_limit/);
+  });
 });
