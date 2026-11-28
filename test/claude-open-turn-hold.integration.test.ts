@@ -158,6 +158,81 @@ process.stdin.on('data', chunk => {
 }
 
 describe('Claude Code open-turn hold, authority retention, and Scenario 3 recovery (#3702)', () => {
+  it('retains the request origin and final reply across a peer queued-command report', async () => {
+    const finalAnswer = 'Final answer after the internal report.';
+    const w = await startScriptedWorker({
+      script: [
+        { delayMs: 100, row: { type: 'api-request', id: 'req_peer', querySource: 'repl_main_thread' } },
+        {
+          delayMs: 200,
+          row: {
+            type: 'assistant', uuid: 'peer_tool', parentUuid: 'u1',
+            message: {
+              role: 'assistant', model: 'claude-test', stop_reason: 'tool_use', usage: zeroUsage,
+              content: [{ type: 'tool_use', id: 'peer_read', name: 'Read', input: {} }],
+            },
+          },
+        },
+        {
+          delayMs: 400,
+          row: {
+            type: 'user', uuid: 'peer_result', parentUuid: 'peer_tool',
+            message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'peer_read', content: 'Read complete' }] },
+          },
+        },
+        {
+          delayMs: 600,
+          row: {
+            type: 'attachment', uuid: 'peer_report', parentUuid: 'peer_result',
+            attachment: {
+              type: 'queued_command', commandMode: 'prompt', isMeta: true,
+              origin: { kind: 'peer', from: 'worker', senderTaskId: 'agent-1' },
+              prompt: '<agent-message from="worker">Partial result</agent-message>',
+            },
+          },
+        },
+        {
+          delayMs: 6_000,
+          row: {
+            type: 'assistant', uuid: 'peer_final', parentUuid: 'peer_report',
+            message: {
+              role: 'assistant', model: 'claude-test', stop_reason: 'end_turn', usage: zeroUsage,
+              content: [{ type: 'text', text: finalAnswer }],
+            },
+          },
+        },
+        { delayMs: 6_200, row: { type: 'system', subtype: 'turn_duration', uuid: 'peer_duration', parentUuid: 'peer_final', durationMs: 6_200 } },
+      ],
+    });
+    const turnId = 'om_peer_request';
+    const trustedCaller = { requestUserOpenId: 'ou_tester', requestLarkAppId: 'app_test', senderType: 'user' } as const;
+    const from = w.messages.length;
+    child!.send({
+      type: 'message', turnId, content: 'Inspect peer progress',
+      trustedCaller,
+    } satisfies DaemonToWorker);
+
+    await new Promise(done => setTimeout(done, 4_000));
+    const mid = w.messages.slice(from);
+    expect(mid.filter(m => m.type === 'turn_terminal' && m.turnId === turnId)).toEqual([]);
+    expect(mid.filter(m => m.type === 'managed_turn_origin_revoked' && m.turnId === turnId)).toEqual([]);
+    await waitUntil(() => w.messages.slice(from).some(m => m.type === 'turn_terminal' && m.turnId === turnId)
+      && w.messages.slice(from).some(m => m.type === 'prompt_ready'), w.logs);
+    const events = w.messages.slice(from);
+    const origin = events.find((m): m is Extract<WorkerToDaemon, { type: 'managed_turn_origin' }> =>
+      m.type === 'managed_turn_origin' && m.turnId === turnId);
+    const capability = origin?.capability;
+    expect(origin).toMatchObject({ trustedCaller, capability: expect.any(String) });
+    const finalIndex = events.findIndex(m => m.type === 'final_output' && m.turnId === turnId && m.content === finalAnswer);
+    const terminalIndex = events.findIndex(m => m.type === 'turn_terminal' && m.turnId === turnId && m.status === 'completed');
+    const revokeIndex = events.findIndex(m => m.type === 'managed_turn_origin_revoked'
+      && m.turnId === turnId && m.capability === capability);
+    expect(finalIndex).toBeGreaterThan(-1);
+    expect(terminalIndex).toBeGreaterThan(finalIndex);
+    expect(revokeIndex).toBeGreaterThan(terminalIndex);
+    expect(events.filter(m => m.type === 'turn_terminal' && m.turnId === turnId)).toHaveLength(1);
+  }, SOURCE_WORKER_LOAD_TIMEOUT_MS + 45_000);
+
   it('retains the managed origin when the PTY looks idle before Claude accepts the prompt', async () => {
     const finalAnswer = 'Late submission final answer.';
     const w = await startScriptedWorker({
