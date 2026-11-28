@@ -1224,6 +1224,7 @@ export interface DaemonSession {
    *  disabled after restart): identity publication is withheld on both models
    *  until a live worker reports again. */
   reportedIdentityModel?: {
+    attestedLoopback?: boolean;
     cliExecution?: import('./cli-execution-mode.js').WorkerCliExecution;
     model: import('./lark-tool-binding.js').IdentityStorageModel;
     sandboxEngaged: boolean;

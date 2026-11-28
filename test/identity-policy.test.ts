@@ -9,7 +9,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { policyFromConfig, resolveIdentity } from '../src/core/identity-policy.js';
+import { bytecloudBrokerEnabled, policyFromConfig, resolveIdentity } from '../src/core/identity-policy.js';
 import { backgroundCredentialPolicyKey } from '../src/core/background-execution-policy.js';
 import { t } from '../src/i18n/index.js';
 import { computeInputHash } from '../src/utils/canonical-input-hash.js';
@@ -22,6 +22,17 @@ import {
 } from '../src/services/trigger-user-auth.js';
 
 describe('policyFromConfig', () => {
+  it('activates the broker only for enabled ByteCloud, including legacy bytedcli tools', () => {
+    const enabled = (raw: unknown) => bytecloudBrokerEnabled(parseTriggerUserAuthConfig(raw));
+    const mode = { bytecloudExecution: 'read-machine-write-actor' };
+    expect(enabled({ enabled: true, capabilities: ['bytecloud'], ...mode })).toBe(true);
+    expect(enabled({ enabled: true, tools: ['bytedcli'], ...mode })).toBe(true);
+    expect(enabled({ enabled: false, capabilities: ['bytecloud'], ...mode })).toBe(false);
+    expect(enabled({ enabled: true, capabilities: ['meego'], ...mode })).toBe(false);
+    expect(enabled({ enabled: true, capabilities: ['lark-user'], ...mode })).toBe(false);
+    expect(enabled({ enabled: true, tools: ['bytedcli'] })).toBe(false);
+    expect(enabled(null)).toBe(false);
+  });
   it('maps legacy tools: lark-cli -> lark-user, bytedcli -> bytecloud + meego', () => {
     expect([...policyFromConfig({ enabled: true, tools: ['lark-cli'] }).capabilities]).toEqual(['lark-user']);
     expect([...policyFromConfig({ enabled: true, tools: ['bytedcli'] }).capabilities].sort()).toEqual(['bytecloud', 'meego']);

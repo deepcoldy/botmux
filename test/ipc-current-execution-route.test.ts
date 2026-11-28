@@ -1,3 +1,4 @@
+import { createProtectedLoopbackProxyAttestation, PROTECTED_LOOPBACK_ATTESTATION_HEADER } from '../src/core/protected-loopback-attestation.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { __testOnly_resetTriggerTurns, rememberTriggerTurn } from '../src/core/turn-origin.js';
 import { startIpcServer, setIpcAuthSecret, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
@@ -1403,4 +1404,28 @@ describe('POST /api/current-execution', () => {
     ]) expect((await postIdentity(body)).status).toBe(400);
     expect(lookup).not.toHaveBeenCalled();
   });
+});
+
+it.skipIf(process.platform !== 'linux')('proves execution through a signed relay and rejects a stale turn and forged process', async () => {
+ const ds=session();ds.protectedLoopbackProxyAttestation={secret:'ab'.repeat(32),workerGeneration:7};
+ vi.spyOn(workerPool,'findActiveBySessionId').mockImplementation(id=>id==='s-execution'?ds:undefined);
+ vi.spyOn(await import('../src/bot-registry.js'),'getBot').mockReturnValue({config:{larkAppId:'cli_execution',backendType:'pty'}} as any);
+ ipc=await startIpcServer({port:0,host:'127.0.0.1',authRequired:true});
+ const value={sessionId:'s-execution'};const raw=JSON.stringify(value);
+ const signed=(pid=process.pid)=>createProtectedLoopbackProxyAttestation('ab'.repeat(32),{sessionId:'s-execution',serviceId:'current-execution',workerGeneration:7,turnId:'trigger-current',dispatchAttempt:3,peer:{pid,procStart:readProcessStartIdentity(process.pid)!},method:'POST',path:'/api/current-execution',headers:{'content-type':'application/json'},body:Buffer.from(raw)});
+ const call=(token:string)=>fetch(`http://127.0.0.1:${ipc!.port}/api/current-execution`,{method:'POST',headers:{'content-type':'application/json',[PROTECTED_LOOPBACK_ATTESTATION_HEADER]:token},body:raw});
+ expect((await (await call(signed())).json()).status).toBe('verified');
+ expect((await (await call(signed(999999))).json()).status).toBe('blocked');
+ const old=signed();ds.managedTurnOrigin.turnId='new-turn';
+ expect((await (await call(old)).json()).status).toBe('blocked');
+});
+it.skipIf(process.platform !== 'linux')('proves only validated local headless execution without inventing a human actor', async () => {
+ const ds=session();const id='hl_11111111-1111-4111-8111-111111111111';
+ ds.chatId='headless_'+id;ds.session.headless={id,source:'cli',createdAt:new Date().toISOString()};
+ vi.spyOn(workerPool,'findActiveBySessionId').mockImplementation(id=>id==='s-execution'?ds:undefined);
+ vi.spyOn(await import('../src/bot-registry.js'),'getBot').mockReturnValue({config:{larkAppId:'cli_execution',backendType:'pty'}} as any);
+ ipc=await startIpcServer({port:0,host:'127.0.0.1',authRequired:true});
+ expect((await (await request({sessionId:'s-execution'})).json()).status).toBe('verified');
+ ds.session.headless.source='forged';
+ expect((await (await request({sessionId:'s-execution'})).json()).status).toBe('blocked');
 });

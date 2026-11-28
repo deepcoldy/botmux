@@ -1,3 +1,5 @@
+import { parseBytedcliMachineProfile } from './core/bytedcli-broker-credentials.js';
+import { parseHostReadOnlyMcpTools } from './core/plugins/mcp/read-only-policy.js';
 import { normalizeVcMeetingListenerPolicy, type VcMeetingListenerPolicy } from './services/vc-meeting-listener-policy.js';
 /**
  * Global botmux configuration stored at `~/.botmux/config.json`.
@@ -15,7 +17,7 @@ import { normalizeVcMeetingListenerPolicy, type VcMeetingListenerPolicy } from '
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import type { ProjectScanOptions } from './services/project-scanner.js';
-import { join, dirname, isAbsolute } from 'node:path';
+import { join, dirname, isAbsolute, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { isLocale, type Locale } from './i18n/types.js';
 import type { VoiceConfig } from './services/voice/types.js';
@@ -310,7 +312,31 @@ export const SCHEDULE_CHILD_ONE_SHOT_MAX_DELAY_MINUTES = 7 * 24 * 60;
 export const SCHEDULE_CHILD_ONE_SHOT_DEFAULT_MAX_TASKS_PER_TURN = 1;
 export const SCHEDULE_CHILD_ONE_SHOT_MAX_TASKS_PER_TURN = 16;
 
+/** Invalid host identity selection must never silently become the default account. */
+export interface BytedcliBrokerConfig {
+  machineProfile?: string;
+  cliEntrypoint?: string;
+  /** Audited, fixed-purpose machine reads. No wildcards; new grants need a cold worker. */
+  hostReadOnlyMcpTools?: import('./core/plugins/mcp/read-only-policy.js').HostReadOnlyMcpTools;
+}
+export function parseBytedcliBrokerConfig(raw: unknown): BytedcliBrokerConfig | undefined {
+  if (raw === undefined) return undefined;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw) || Object.keys(raw).some(key => !['machineProfile', 'cliEntrypoint', 'hostReadOnlyMcpTools'].includes(key))) {
+    throw new Error('invalid bytedcliBroker config');
+  }
+  const machineProfile = parseBytedcliMachineProfile((raw as { machineProfile?: unknown }).machineProfile);
+  const cliEntrypoint = (raw as { cliEntrypoint?: unknown }).cliEntrypoint;
+  if (cliEntrypoint !== undefined && (typeof cliEntrypoint !== 'string' || !isAbsolute(cliEntrypoint)
+    || resolve(cliEntrypoint) !== cliEntrypoint || cliEntrypoint === '/' || cliEntrypoint.startsWith('/$bunfs/')
+    || /[\u0000-\u001f\u007f]/.test(cliEntrypoint))) throw new Error('invalid bytedcliBroker CLI entrypoint');
+  const hostReadOnlyMcpTools = parseHostReadOnlyMcpTools((raw as BytedcliBrokerConfig).hostReadOnlyMcpTools);
+  return { ...(machineProfile ? { machineProfile } : {}), ...(cliEntrypoint !== undefined ? { cliEntrypoint: cliEntrypoint as string } : {}),
+    ...(hostReadOnlyMcpTools === undefined ? {} : { hostReadOnlyMcpTools }) };
+}
+
 export interface GlobalConfig {
+  /** Host only. Credential/runtime selection freezes per daemon; MCP grants freeze per cold worker. */
+  bytedcliBroker?: BytedcliBrokerConfig;
   lang?: Locale;
   codexAppTitlePrefix?: string;
   /** Machine-wide LinkRef rollout setting. Missing keeps legacy behavior. */
@@ -1109,14 +1135,16 @@ export function configuredProtectedMcpEnvKeys(): string[] {
 
 /** Typed view of the global config. Validates `lang` so a malformed file
  *  can't propagate a bad value into the i18n module. */
-export function readGlobalConfig(): GlobalConfig {
+export function readGlobalConfig(opts: { fresh?: boolean } = {}): GlobalConfig {
   const path = globalConfigPath();
-  if (readCache && readCache.path === path && Date.now() - readCache.at < READ_CACHE_TTL_MS) {
+  if (!opts.fresh && readCache && readCache.path === path && Date.now() - readCache.at < READ_CACHE_TTL_MS) {
     return readCache.value;
   }
   const raw = readRawConfig();
   lastConfiguredProtectedMcpEnvKeys = protectedMcpConfiguredEnvKeys(raw.protectedMcpCapabilities);
   const out: GlobalConfig = {};
+  const bytedcliBroker = parseBytedcliBrokerConfig(raw.bytedcliBroker);
+  if (bytedcliBroker) out.bytedcliBroker = bytedcliBroker;
   if (isLocale(raw.lang)) out.lang = raw.lang;
   const codexAppTitlePrefix = normalizeCodexAppTitlePrefix(raw.codexAppTitlePrefix);
   if (codexAppTitlePrefix) out.codexAppTitlePrefix = codexAppTitlePrefix;
@@ -1472,6 +1500,7 @@ export function repoPickerScanOptions(): ProjectScanOptions {
  *  a known key from the file. */
 export function mergeGlobalConfig(patch: Partial<Record<keyof GlobalConfig, GlobalConfig[keyof GlobalConfig] | null>>): void {
   assertDurableConfigMutationAllowed('global');
+  if (patch.bytedcliBroker != null) parseBytedcliBrokerConfig(patch.bytedcliBroker);
   const path = globalConfigPath();
   const dir = dirname(path);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });

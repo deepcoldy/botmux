@@ -245,7 +245,13 @@ async function main() {
     const resolveProcessPeer = plan.localServiceBridges?.some(bridge => bridge.attestProcessPeer)
       ? namespacePeerResolver()
       : undefined;
-    for (const bridgePlan of plan.localServiceBridges ?? []) {
+    const bridgeGroups = new Map<number, NonNullable<typeof plan.localServiceBridges>>();
+    for (const bridge of plan.localServiceBridges ?? []) {
+      const group = bridgeGroups.get(bridge.listenPort) ?? [];
+      group.push(bridge);
+      bridgeGroups.set(bridge.listenPort, group);
+    }
+    for (const bridgePlan of bridgeGroups.values()) {
       localServiceBridges.push(resolveProcessPeer
         ? await startProtectedLocalServiceLoopbackBridge(bridgePlan, resolveProcessPeer)
         : await startProtectedLocalServiceLoopbackBridge(bridgePlan));

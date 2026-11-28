@@ -833,3 +833,16 @@ describe('findActiveSessionIdByCliSessionId (doubao sbox reverse lookup)', () =>
     expect(findActiveSessionIdByCliSessionId({ cliId: 'doubao', cliSessionId: '  ', dataDir: tempDir })).toBeUndefined();
   });
 });
+
+
+it('persists a monotonic ByteCloud strict fence across stale metadata and store reopen', () => {
+  const session = createSession('oc_strict', 'om_strict', 'strict');
+  const stale = { ...session };
+  session.bytecloudBrokerStrict = true;
+  session.bytecloudBrokerColdStart = true;
+  updateSession(session);
+  updateSession(stale);
+  init('test-app');
+  expect(getSessionFresh(session.sessionId)?.bytecloudBrokerStrict).toBe(true);
+  expect(getSessionFresh(session.sessionId)?.bytecloudBrokerColdStart).toBe(true);
+});

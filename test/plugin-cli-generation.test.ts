@@ -207,6 +207,28 @@ describe('CLI plugin generation', () => {
       sessionMcpRuntimeManifestPath('same-session', dataDir),
     ]);
   });
+  it('strict ByteCloud generations keep plugin skills while excluding host MCP downstreams', () => {
+    const source = join(home, 'strict-plugin');
+    write(join(source, 'package.json'), JSON.stringify({ name:'@botmux-ai/plugin-strict-demo', version:'0.1.0', keywords:['botmux-plugin'], botmux:{schemaVersion:1,id:'strict-demo'} }));
+    write(join(source, 'dist', 'skills', 'support', 'SKILL.md'), '---\nname: support\ndescription: Support skill\n---\n# Support');
+    write(join(source, 'dist', 'mcp', 'index.json'), JSON.stringify({transport:'stdio',command:['./mcp/server.mjs']}));
+    write(join(source, 'dist', 'mcp', 'server.mjs'), 'process.exit(0);\n');
+    installLocalPlugin(source);
+    const opts={sessionId:'strict',bot:{larkAppId:'app',plugins:['strict-demo']},global:{plugins:[]},dataDir,
+      cliId:'codex' as const,adapter:{id:'codex'} as CliAdapter,workingDir:home,prompt:'inspect',replacesPriorGeneration:false};
+    prepareCliPluginGeneration(opts);
+    expect(readSessionMcpRuntimeManifest('strict',dataDir)?.entries).toHaveLength(1);
+    const strict=prepareCliPluginGeneration({...opts,hostMcpEnabled:false,replacesPriorGeneration:true});
+    expect(strict.pluginManifest.pluginIds).toEqual(['strict-demo']);
+    expect(strict.fatal).not.toBe(true);
+    expect(readSessionSkillManifest('strict')?.prioritySkills.map(skill=>skill.name)).toEqual(['support']);
+    expect(readSessionMcpRuntimeManifest('strict',dataDir)).toMatchObject({pluginIds:['strict-demo'],entries:[]});
+    const manifest=readSessionMcpRuntimeManifest('strict',dataDir)!;
+    expect(sessionMcpRuntimeHostOnlyPaths(manifest,dataDir)).toContain(pluginMcpPrivatePath('strict-demo'));
+    prepareCliPluginGeneration({...opts,replacesPriorGeneration:true});
+    expect(readSessionMcpRuntimeManifest('strict',dataDir)?.entries).toHaveLength(1);
+  });
+
   it('hands the sandbox only this session\'s snapshot of exactly the enabled skills', () => {
     // Two installed skills; the bot enables one. Under sandbox=true the worker
     // feeds skillReadonlyRoots into fs-policy's sessionOwnedReadonlyRoots: it

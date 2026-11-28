@@ -49,6 +49,40 @@ const ctx = (o: Partial<FsPolicyContext> = {}): FsPolicyContext => ({
   ...o,
 });
 
+describe('ByteCloud protected ceilings', () => {
+  it.each(['/Users/u/install', '/Users/u/install/src'])('keeps install secret masks when strict cwd is %s', workingDir => {
+    const root = '/Users/u/install';
+    const options = ctx({ workingDir, botmuxInstallRoot: root,
+      botmuxInstallRootMaskPaths: [root + '/src/private'],
+      userPaths: { readWrite: [root + '/src/private/deeper'] },
+      mandatoryReadOnlyPaths: [root + '/src/private/deeper/token'],
+    });
+    const strict = buildFsPolicy({ ...options, protectedReadOnlyPaths: [root] });
+    expect(accessForPath(strict.rules, root + '/src/private/deeper/token').access).toBe('deny');
+    expect(accessForPath(buildFsPolicy(options).rules, root + '/src/private/deeper/token').access).toBe('readOnly');
+  });
+
+  it('seals credentials and caps trusted runtime writes under every deeper grant', () => {
+    const root = '/Users/u/.local/share/bytedcli';
+    const runtime = '/Users/u/runtime';
+    const p = buildFsPolicy(ctx({
+      workingDir: '/Users/u',
+      protectedDenyPaths: [root], protectedReadOnlyPaths: [runtime],
+      authPaths: [root + '/auth', runtime + '/auth'],
+      mandatoryReadOnlyPaths: [root + '/mandatory'],
+      serviceCredentialReadOnlyPaths: [root + '/service'],
+      userPaths: { readOnly: [root + '/read'], readWrite: [root + '/future/profile', runtime + '/bin', '/Users/u/project'] },
+    }));
+    for (const path of ['auth', 'mandatory', 'service', 'read', 'future/profile/token']) {
+      expect(accessForPath(p.rules, root + '/' + path).access).toBe('deny');
+    }
+    expect(accessForPath(p.rules, runtime + '/bin/node').access).toBe('readOnly');
+    expect(accessForPath(p.rules, runtime + '/auth').access).toBe('readOnly');
+    expect(accessForPath(p.rules, '/Users/u').access).toBe('readOnly');
+    expect(accessForPath(p.rules, '/Users/u/project').access).toBe('readWrite');
+  });
+});
+
 describe('normalizeFsPath', () => {
   it('normalizes and rejects unusable paths', () => {
     expect(normalizeFsPath('/a/b/')).toBe('/a/b');
@@ -2023,6 +2057,18 @@ describe('buildFsPolicy — trigger-user CLI identity', () => {
     expect(accessForPath(p.rules, `${dataDir}/user-token-other.json`).access).toBe('deny');
     expect(accessForPath(p.rules, '/Users/u/.lark-cli-bots/cli_self/config.json').access).toBe('deny');
     expect(p.rules.some(r => r.path === `${dataDir}/cli-identity`)).toBe(false);
+  });
+  it('allows headless broker command files while denying old credentials and sibling identities', () => {
+    const p = buildFsPolicy(ctx({ sessionId: 'sess-mine', larkTransportEnabled: false, larkToolIdentityEnabled: true, bytedcliBrokerEnabled: true }));
+    const identity = `${dataDir}/cli-identity/sess-mine.bin`;
+    for (const command of ['bytedcli','codebase','bitscli','bits-cli']) {
+      expect(accessForPath(p.rules, `${identity}/${command}`).access).toBe('readOnly');
+      expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-other.bin/${command}`).access).toBe('deny');
+    }
+    for (const file of ['bytedcli.env','codebase.env','bitscli.env','turn']) {
+      expect(accessForPath(p.rules, `${identity}/.data/${file}`).access).toBe('deny');
+    }
+    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.bin`).access).toBe('deny');
   });
 });
 

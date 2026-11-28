@@ -273,6 +273,17 @@ function renderedBotConfigLabelKeys(sources: string): Set<string> {
     }
   }
   add([...sources.matchAll(/<span>\{tr\('([^']+)'\)\}<\/span>\s*<DropdownField\b/g)].map(m => m[1]!));
+  // Radio cards are real controls rather than <label> rows. Index only the
+  // visible option name; the short explanatory text is not a separate setting.
+  for (const button of openingTags(sources, 'button')) {
+    if (!/\brole=["']radio["']/.test(button.body)) continue;
+    const body = sources.slice(button.start);
+    for (const tag of openingTags(body, 'span')) {
+      if (!/\bbd-mode-opt-name\b/.test(tag.body)) continue;
+      const children = elementChildren(body.slice(tag.start), 'span')[0];
+      if (children !== undefined) add([...children.matchAll(/\btr\('([^']+)'\)/g)].map(match => match[1]!));
+    }
+  }
   if (openingTags(sources, 'ToggleRow').some(tag => /\btitle=\{/.test(tag.body) && tag.body.includes('tr(`botDefaults.${key}`)'))) add(REPLY_FOOTER_KEYS.map(key => `botDefaults.${key}`));
   if (sources.includes('tr(`botDefaults.streamingButton.${id}`)')) {
     add(STREAMING_CARD_BUTTON_IDS.map(id => `botDefaults.streamingButton.${id}`));
@@ -544,7 +555,7 @@ describe('⌘K index coverage', () => {
     const rendered = renderedBotConfigLabelKeys(readBotConfigSources());
     const followLabels = renderedOwnerGroupFollowLabels();
     for (const section of BOT_DEFAULTS_SECTIONS) {
-      for (const key of [section.titleKey, ...(section.fieldKeys ?? [])]) {
+      for (const key of [section.titleKey, ...(section.fieldKeys ?? []), ...(section.legacyFieldKeys ?? [])]) {
         expect(zh(key), key).not.toBe(key);
         expect(en(key), key).not.toBe(key);
       }
@@ -554,6 +565,11 @@ describe('⌘K index coverage', () => {
       for (const key of section.fieldKeys ?? []) {
         const renderedInFollowEditor = key.startsWith('botDefaults.ownerGroupFollow') && followLabels.has(t(key));
         expect(rendered.has(key) || renderedInFollowEditor, key).toBe(true);
+      }
+      for (const key of section.legacyFieldKeys ?? []) {
+        // A legacy link is intentionally not a visible field. If the UI starts
+        // rendering that label again it must move back to fieldKeys.
+        expect(rendered.has(key), `${key} is visible again and must be a fieldKey`).toBe(false);
       }
     }
   });
@@ -591,13 +607,18 @@ describe('⌘K index coverage', () => {
     ]);
   });
 
+  it('reads visible radio option names without indexing their explanatory text', () => {
+    const fixture = '<button role="radio"><span className="bd-mode-opt-name">{selected ? tr(\'botDefaults.fixtureVariant\') : tr(\'botDefaults.fixtureConditional\')}</span><span className="bd-mode-opt-short">{tr(\'botDefaults.fixtureHiddenHelp\')}</span></button>';
+    expect([...renderedBotConfigLabelKeys(fixture)].sort()).toEqual(['botDefaults.fixtureConditional', 'botDefaults.fixtureVariant']);
+  });
+
   // 源码结构护栏(K4)：配置项标签写在各区块组件内部，组件依赖整套 bot 数据渲染不出来，只能读文本反查；
   // 守的是「区块组件里新增了可见配置项或选项组标签，却忘记在 BOT_DEFAULTS_SECTIONS.fieldKeys 登记」——
   // 漏登记会导致新配置项在 ⌘K 里搜不到、也不能深链定位。
   it('every rendered Bot config label is indexed in BOT_DEFAULTS_SECTIONS fieldKeys or titleKey', () => {
     // 只校验全部区块的并集，不校验键登在了哪个区块：登错区块这里仍是绿的，深链会落到错的 tile 而找不到那一行。
     // 按区块渲染范围逐块校验另行跟进。
-    const indexedKeys = new Set(BOT_DEFAULTS_SECTIONS.flatMap(section => [section.titleKey, ...(section.fieldKeys ?? [])]));
+    const indexedKeys = new Set(BOT_DEFAULTS_SECTIONS.flatMap(section => [section.titleKey, ...(section.fieldKeys ?? []), ...(section.legacyFieldKeys ?? [])]));
     const rendered = [...renderedBotConfigLabelKeys(readBotConfigSources())]
       .filter(key => BOT_CONFIG_KEY_NAMESPACES.some(prefix => key.startsWith(prefix)));
     const unindexed = rendered.filter(key => !indexedKeys.has(key) && !NOT_CONFIG_LABELS.has(key) && !PROVIDER_LABEL_VARIANTS.has(key));

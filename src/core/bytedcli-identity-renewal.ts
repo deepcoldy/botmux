@@ -1,3 +1,4 @@
+import { bytecloudExportBlocked } from './bytedcli-strict-session.js';
 /**
  * Mid-turn renewal of locally minted bytedcli identities.
  *
@@ -68,7 +69,7 @@ export function trackBytedcliIdentityRenewal(entry: RenewalEntry): void {
   // Registered jobs have their own per-invocation authority/lease checks. The
   // ordinary-turn timer must never renew their cache or derive its HOME after
   // the job has been retired in the authority store.
-  if (entry.identity.turnId.startsWith('background:')) return;
+  if (entry.identity.turnId.startsWith('background:') || bytecloudExportBlocked(entry.sessionDataDir, entry.sessionId)) return;
   entries.set(entryKey(entry.sessionDataDir, entry.sessionId, entry.identity.turnId), {
     ...entry,
     identity: { ...entry.identity },
@@ -90,7 +91,7 @@ function stillPublished(entry: RenewalEntry): boolean {
 }
 
 function publicationValid(entry: RenewalEntry): boolean {
-  try { return entry.validateBeforeWrite?.() !== false; } catch { return false; }
+  try { return !bytecloudExportBlocked(entry.sessionDataDir, entry.sessionId) && entry.validateBeforeWrite?.() !== false; } catch { return false; }
 }
 
 const inFlight = new Set<string>();

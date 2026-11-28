@@ -8,6 +8,7 @@ import { sessionPluginManifestPath } from '../session-manifest.js';
 import type { PluginMcpServer } from '../types.js';
 import { isPluginMcpServer, readPluginMcpDescriptor } from './private-store.js';
 import { normalizeProtectedHttpEgressPolicy } from '../../protected-http-egress.js';
+import { approvedReadOnlyTools, assertHostReadOnlyMcpRuntimeTree, parseHostReadOnlyMcpTools, type HostReadOnlyMcpTools } from './read-only-policy.js';
 import {
   ABSOLUTE_MAX_MCP_GATEWAY_TOOL_TIMEOUT_MS,
   effectiveMcpGatewayMaxToolTimeoutMs,
@@ -19,6 +20,7 @@ export interface SessionMcpRuntimeEntry {
   pluginDir: string;
   server: PluginMcpServer;
   toolTimeoutMs?: number;
+  readOnlyTools?: string[];
 }
 
 export interface SessionMcpRuntimeManifest {
@@ -60,6 +62,10 @@ export function readSessionMcpRuntimeManifest(
         && typeof value.pluginDir === 'string'
         && isAbsolute(value.pluginDir)
         && isPluginMcpServer(value.server)
+        && (value.readOnlyTools === undefined || (Array.isArray(value.readOnlyTools)
+          && value.readOnlyTools.length > 0
+          && new Set(value.readOnlyTools).size === value.readOnlyTools.length
+          && value.readOnlyTools.every(tool => typeof tool === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(tool))))
         && (value.toolTimeoutMs === undefined
           || (Number.isInteger(value.toolTimeoutMs)
             && value.toolTimeoutMs > 0
@@ -75,6 +81,8 @@ export function refreshSessionMcpRuntimeManifest(opts: {
   sessionId: string;
   pluginIds: readonly string[];
   pluginRuntime?: Record<string, PluginMcpRuntimeOptions>;
+  hostMcpEnabled?: boolean;
+  hostReadOnlyMcpTools?: HostReadOnlyMcpTools;
   maxToolTimeoutMs?: number;
   dataDir?: string;
   now?: () => string;
@@ -83,10 +91,18 @@ export function refreshSessionMcpRuntimeManifest(opts: {
   const pluginIds = [...opts.pluginIds];
   const entries: SessionMcpRuntimeEntry[] = [];
   const maxToolTimeoutMs = effectiveMcpGatewayMaxToolTimeoutMs(opts.maxToolTimeoutMs);
+  const readOnly = opts.hostMcpEnabled === false;
+  const grants = readOnly ? parseHostReadOnlyMcpTools(opts.hostReadOnlyMcpTools) : undefined;
   for (const pluginId of pluginIds) {
+    const readOnlyTools = approvedReadOnlyTools(grants, pluginId);
+    if (readOnly && !readOnlyTools.length) continue;
     const contribution = registry.plugins[pluginId]?.contributions?.mcp;
     if (!contribution) continue;
     const server = readPluginMcpDescriptor(pluginId, contribution);
+    if (readOnly && (server.transport !== 'stdio' || server.protectedCapability || server.protectedEgressPolicy)) {
+      throw new Error(`host read-only MCP requires an unprotected local stdio server:${pluginId}`);
+    }
+    if (readOnly) assertHostReadOnlyMcpRuntimeTree(pluginId, pluginRuntimeDir(pluginId));
     const runtime = opts.pluginRuntime?.[pluginId];
     if (runtime?.toolTimeoutMs !== undefined && runtime.toolTimeoutMs > maxToolTimeoutMs) {
       throw new Error(`plugin_mcp_tool_timeout_exceeds_max:${pluginId}:${runtime.toolTimeoutMs}:${maxToolTimeoutMs}`);
@@ -107,6 +123,7 @@ export function refreshSessionMcpRuntimeManifest(opts: {
       pluginId,
       pluginDir: pluginRuntimeDir(pluginId),
       server: sessionServer,
+      ...(readOnly ? { readOnlyTools: [...readOnlyTools] } : {}),
       ...(runtime?.toolTimeoutMs === undefined ? {} : { toolTimeoutMs: runtime.toolTimeoutMs }),
     });
   }
@@ -134,6 +151,11 @@ export function sessionMcpRuntimeHostOnlyPaths(
     ...manifest.entries.flatMap(entry => [
       pluginMcpPrivatePath(entry.pluginId),
       join(entry.pluginDir, 'mcp', 'index.json'),
+    ]),
+    // Disabled downstreams still carry private descriptors on the host.
+    ...manifest.pluginIds.flatMap(pluginId => [
+      pluginMcpPrivatePath(pluginId),
+      join(pluginRuntimeDir(pluginId), 'mcp', 'index.json'),
     ]),
   ])];
 }

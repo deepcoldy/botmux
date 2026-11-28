@@ -367,7 +367,7 @@ function botDefaultsSectionItemsFor(provider: ProviderId, options: { additional?
       primary: { label: t('palette.actionGoto'), href: href(section) },
     });
     const seen = new Set([sectionTitle]);
-    for (const field of section.fieldKeys ?? []) {
+    for (const field of [...section.fieldKeys ?? [], ...section.legacyFieldKeys ?? []]) {
       if (!botProfileFieldSupported(caps, section.id, field)) continue;
       const fieldTitleKey = labelKey(field);
       const fieldTitle = t(fieldTitleKey);

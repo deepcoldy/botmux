@@ -84,6 +84,7 @@ import {
 } from '../../protected-mcp-capabilities.js';
 import { ProtectedSecretClientTransport } from './protected-secret-transport.js';
 import { PROTECTED_HTTP_EGRESS_SOCKET_ENV } from '../../protected-http-egress-host.js';
+import { approvedReadOnlyTools, assertHostReadOnlyMcpRuntime, assertHostReadOnlyMcpRuntimeTree, readOnlyMcpTurnKey, type HostReadOnlyMcpTools } from './read-only-policy.js';
 
 const GATEWAY_VERSION = '1.0.0';
 const DOWNSTREAM_INITIALIZE_TIMEOUT_MS = 10_000;
@@ -107,6 +108,7 @@ interface GatewayDescriptor {
   server: PluginMcpServer;
   pluginDir: string;
   toolTimeoutMs?: number;
+  readOnlyTools?: readonly string[];
 }
 
 interface GatewayConnection extends GatewayDescriptor {
@@ -140,6 +142,11 @@ export interface GatewayTrustedTurnIdentity {
 }
 
 export type GatewayTrustedTurnIdentityProvider = () => GatewayTrustedTurnIdentity | undefined;
+export interface GatewayReadOnlyPolicy {
+  tools: HostReadOnlyMcpTools;
+  /** Host-only live permission check. Both dispatch and result release must pass. */
+  authorize: (pluginId: string, toolName: string, identity: GatewayTrustedTurnIdentity) => boolean;
+}
 export type GatewayTrustedResultDeliveryHandler = (input: {
   pluginId: string;
   identity: GatewayTrustedTurnIdentity;
@@ -256,6 +263,7 @@ function snapshotGatewayDescriptors(snapshot: SessionMcpRuntimeManifest): Gatewa
     pluginId: entry.pluginId,
     server: entry.server,
     pluginDir: entry.pluginDir,
+    ...(entry.readOnlyTools ? { readOnlyTools: entry.readOnlyTools } : {}),
     ...(entry.toolTimeoutMs === undefined ? {} : { toolTimeoutMs: entry.toolTimeoutMs }),
   }));
 }
@@ -263,13 +271,22 @@ function snapshotGatewayDescriptors(snapshot: SessionMcpRuntimeManifest): Gatewa
 function resolveGatewayRuntime(
   requestedPluginIds: string[] | undefined,
   env: NodeJS.ProcessEnv,
+  readOnly?: GatewayReadOnlyPolicy,
 ): { pluginIds: string[]; descriptors: GatewayDescriptor[] } {
+  if (readOnly) {
+    if (requestedPluginIds) throw new Error('host read-only MCP requires a session snapshot');
+    const snapshot = env.BOTMUX_SESSION_ID ? readSessionMcpRuntimeManifest(env.BOTMUX_SESSION_ID, gatewayDataDir(env)) : null;
+    assertHostReadOnlyMcpRuntime(snapshot, readOnly.tools);
+    for (const entry of snapshot!.entries) assertHostReadOnlyMcpRuntimeTree(entry.pluginId, entry.pluginDir);
+    return { pluginIds: snapshot!.pluginIds, descriptors: snapshotGatewayDescriptors(snapshot!) };
+  }
   if (!requestedPluginIds) {
     const sessionId = env.BOTMUX_SESSION_ID?.trim();
     const snapshot = sessionId
       ? readSessionMcpRuntimeManifest(sessionId, gatewayDataDir(env))
       : null;
     if (snapshot) {
+      if (snapshot.entries.some(entry => entry.readOnlyTools)) throw new Error('host read-only MCP snapshot requires a restricted gateway');
       return {
         pluginIds: snapshot.pluginIds,
         descriptors: snapshotGatewayDescriptors(snapshot),
@@ -366,6 +383,7 @@ export class PluginMcpGateway {
   private readonly requestProtectedSecretChannel?: (capabilityId: string) => Promise<Duplex>;
   private readonly protectedMcpPolicy?: ProtectedMcpWorkerPolicy;
   private readonly protectedEgressSocketPath?: string;
+  private readonly readOnly?: GatewayReadOnlyPolicy;
   private readonly pluginIds: string[];
   private readonly descriptors: GatewayDescriptor[];
   private readonly diagnostics: McpGatewayDiagnostic[] = [];
@@ -390,24 +408,26 @@ export class PluginMcpGateway {
       requestProtectedSecretChannel?: (capabilityId: string) => Promise<Duplex>;
       protectedMcpPolicy?: ProtectedMcpWorkerPolicy;
       protectedEgressSocketPath?: string;
+      readOnly?: GatewayReadOnlyPolicy;
     } = {},
   ) {
     this.env = env;
+    this.readOnly = opts.readOnly;
     this.trustedTurnIdentity = opts.trustedTurnIdentity;
-    this.trustedResultDelivery = opts.trustedResultDelivery;
-    this.trustedResultStatus = opts.trustedResultStatus;
+    this.trustedResultDelivery = opts.readOnly ? undefined : opts.trustedResultDelivery;
+    this.trustedResultStatus = opts.readOnly ? undefined : opts.trustedResultStatus;
     this.protectedResultDeliveryAvailable = opts.protectedResultDeliveryAvailable;
     this.linkRefRegistration = opts.linkRefRegistration;
-    this.requestProtectedSecretChannel = opts.requestProtectedSecretChannel;
-    this.protectedMcpPolicy = opts.protectedMcpPolicy;
-    this.protectedEgressSocketPath = opts.protectedEgressSocketPath;
-    const runtime = resolveGatewayRuntime(pluginIds, env);
+    this.requestProtectedSecretChannel = opts.readOnly ? undefined : opts.requestProtectedSecretChannel;
+    this.protectedMcpPolicy = opts.readOnly ? undefined : opts.protectedMcpPolicy;
+    this.protectedEgressSocketPath = opts.readOnly ? undefined : opts.protectedEgressSocketPath;
+    const runtime = resolveGatewayRuntime(pluginIds, env, opts.readOnly);
     this.pluginIds = runtime.pluginIds;
     this.descriptors = runtime.descriptors;
     this.server = new Server(
       { name: 'botmux', version: GATEWAY_VERSION },
       {
-        capabilities: {
+        capabilities: opts.readOnly ? { tools: { listChanged: true } } : {
           tools: { listChanged: true },
           resources: { subscribe: true, listChanged: true },
           prompts: { listChanged: true },
@@ -545,39 +565,41 @@ export class PluginMcpGateway {
       const client = new Client(
         { name: `botmux/${descriptor.key}`, version: GATEWAY_VERSION },
         {
-          capabilities: clientCapabilities,
+          capabilities: this.readOnly ? {} : clientCapabilities,
           listChanged: {
             tools: { onChanged: async () => { this.toolRoutes.clear(); await this.server.sendToolListChanged(); } },
-            prompts: { onChanged: async () => { this.promptRoutes.clear(); await this.server.sendPromptListChanged(); } },
+            ...(this.readOnly ? {} : { prompts: { onChanged: async () => { this.promptRoutes.clear(); await this.server.sendPromptListChanged(); } },
             resources: {
               onChanged: async () => {
                 this.resourceRoutes.clear();
                 this.resourceTemplateRoutes = [];
                 await this.server.sendResourceListChanged();
               },
-            },
+            } }),
           },
         },
       );
-      this.registerReverseHandlers(client, clientCapabilities);
-      client.setNotificationHandler(LoggingMessageNotificationSchema, notification => this.server.sendLoggingMessage(notification.params));
-      client.setNotificationHandler(ResourceUpdatedNotificationSchema, async (notification) => {
-        const mapped = this.mapDownstreamUri(descriptor.key, notification.params.uri);
-        await this.server.sendResourceUpdated({ ...notification.params, uri: mapped });
-      });
-      client.setNotificationHandler(ToolListChangedNotificationSchema, async () => {
-        this.toolRoutes.clear();
-        await this.server.sendToolListChanged();
-      });
-      client.setNotificationHandler(PromptListChangedNotificationSchema, async () => {
-        this.promptRoutes.clear();
-        await this.server.sendPromptListChanged();
-      });
-      client.setNotificationHandler(ResourceListChangedNotificationSchema, async () => {
-        this.resourceRoutes.clear();
-        this.resourceTemplateRoutes = [];
-        await this.server.sendResourceListChanged();
-      });
+      if (!this.readOnly) {
+        this.registerReverseHandlers(client, clientCapabilities);
+        client.setNotificationHandler(LoggingMessageNotificationSchema, notification => this.server.sendLoggingMessage(notification.params));
+        client.setNotificationHandler(ResourceUpdatedNotificationSchema, async (notification) => {
+          const mapped = this.mapDownstreamUri(descriptor.key, notification.params.uri);
+          await this.server.sendResourceUpdated({ ...notification.params, uri: mapped });
+        });
+        client.setNotificationHandler(ToolListChangedNotificationSchema, async () => {
+          this.toolRoutes.clear();
+          await this.server.sendToolListChanged();
+        });
+        client.setNotificationHandler(PromptListChangedNotificationSchema, async () => {
+          this.promptRoutes.clear();
+          await this.server.sendPromptListChanged();
+        });
+        client.setNotificationHandler(ResourceListChangedNotificationSchema, async () => {
+          this.resourceRoutes.clear();
+          this.resourceTemplateRoutes = [];
+          await this.server.sendResourceListChanged();
+        });
+      }
       await client.connect(transport, { timeout: DOWNSTREAM_INITIALIZE_TIMEOUT_MS });
       const connection: GatewayConnection = {
         ...descriptor,
@@ -629,7 +651,7 @@ export class PluginMcpGateway {
       signal: extra.signal,
       resetTimeoutOnProgress: true,
       ...pluginMcpToolTimeoutOptions(timeout),
-      ...(token === undefined ? {} : {
+      ...(token === undefined || this.readOnly ? {} : {
         onprogress: (progress: { progress: number; total?: number; message?: string }) => {
           void this.server.notification({ method: 'notifications/progress', params: { progressToken: token, ...progress } });
         },
@@ -786,7 +808,8 @@ export class PluginMcpGateway {
     for (const connection of this.capable('tools')) {
       try {
         const tools = await allPages<any>(cursor => connection.client.listTools(cursor ? { cursor } : {}) as any, 'tools');
-        entries.push(...tools.map(tool => ({ connection, tool })));
+        entries.push(...tools.filter(tool => !this.readOnly || (connection.readOnlyTools?.includes(tool.name)
+          && approvedReadOnlyTools(this.readOnly.tools, connection.pluginId).includes(tool.name))).map(tool => ({ connection, tool })));
         const diagnostic = this.diagnostics.find(item => item.status === 'connected' && item.pluginId === connection.pluginId && item.serverName === connection.server.name);
         if (diagnostic) diagnostic.tools = tools.length;
       } catch (err) {
@@ -909,6 +932,19 @@ export class PluginMcpGateway {
       : undefined;
   }
 
+  private assertReadOnlyCall(route: NamedRoute, identity: GatewayTrustedTurnIdentity | undefined, expectedTurn?: string): string | undefined {
+    if (!this.readOnly) return undefined;
+    const turn = readOnlyMcpTurnKey(identity);
+    const current = readOnlyMcpTurnKey(this.trustedTurnIdentity?.());
+    if (!turn || current !== turn || (expectedTurn !== undefined && expectedTurn !== turn)
+      || !route.connection.readOnlyTools?.includes(route.originalName)
+      || !approvedReadOnlyTools(this.readOnly.tools, route.connection.pluginId).includes(route.originalName)
+      || !this.readOnly.authorize(route.connection.pluginId, route.originalName, identity!)) {
+      throw new Error('host read-only MCP requires a current authorized execution turn');
+    }
+    return turn;
+  }
+
   private registerHandlers(): void {
     this.server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: await this.refreshTools() }));
     this.server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
@@ -946,6 +982,7 @@ export class PluginMcpGateway {
       if (this.toolRoutes.size === 0) await this.refreshTools();
       const route = this.toolRoutes.get(request.params.name);
       if (!route) throw methodUnsupported(`tools/call:${request.params.name}`);
+      const readTurn = this.assertReadOnlyCall(route, identity);
       const original = identity?.sessionOrigin;
       if (original) {
         const latest = this.trustedTurnIdentity?.()?.sessionOrigin;
@@ -956,7 +993,7 @@ export class PluginMcpGateway {
       }
       const result = await this.toolCallIdentity.run({ identity }, () => route.connection.client.callTool(
         this.withTrustedTurnMeta(
-          { ...request.params, name: route.originalName },
+          { ...request.params, ...(this.readOnly ? { _meta: undefined } : {}), name: route.originalName },
           identity,
           route.connection,
         ),
@@ -966,6 +1003,10 @@ export class PluginMcpGateway {
       const deliveryValue = isRecord(result._meta)
         ? result._meta[BOTMUX_HOST_DELIVERY_META_KEY]
         : undefined;
+      if (this.readOnly) {
+        this.assertReadOnlyCall(route, identity, readTurn);
+        if (deliveryValue !== undefined) throw new Error('host read-only MCP forbids host delivery');
+      }
       if (deliveryValue === undefined) {
         const registration = await this.registerLinkRefs({
           pluginId: route.connection.pluginId,
@@ -973,6 +1014,7 @@ export class PluginMcpGateway {
           sourceId: `tool:${route.originalName}`,
           value: result,
         });
+        if (this.readOnly) this.assertReadOnlyCall(route, identity, readTurn);
         return identity?.linkRefMode === 'enabled' && registration?.companion
           ? appendToolLinkRefCompanion(result, registration.companion)
           : result;
@@ -1033,6 +1075,7 @@ export class PluginMcpGateway {
       });
     });
 
+    if (this.readOnly) return;
     this.server.setRequestHandler(ListPromptsRequestSchema, async () => ({ prompts: await this.refreshPrompts() }));
     this.server.setRequestHandler(GetPromptRequestSchema, async (request, extra) => {
       if (this.promptRoutes.size === 0) await this.refreshPrompts();

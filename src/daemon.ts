@@ -1,3 +1,4 @@
+import { freezeBytedcliHostLayout } from './core/bytedcli-host-layout.js';
 import { resolveAskDeliveryRoute } from './core/native-gateway-ask-dispatch.js';
 import { wireAskCardDelivery } from './core/native-gateway-ask-control.js';
 import { isCoreOnlyProcess, isNativeGatewayCoreProcess } from './core/runtime-mode.js';
@@ -5242,6 +5243,7 @@ async function prepareScheduledTurnCliIdentity(ds: DaemonSession, turnId: string
     noteScheduledIdentityRestored(ds, task, turnId, identity);
   } else noteScheduledIdentityGap(ds, task, turnId, identity);
   const outcomes = await publishTurnCliIdentity({
+    currentPolicy: () => getBot(ds.larkAppId).config.triggerUserAuth,
     botConfig: getBot(ds.larkAppId).config,
     sessionDataDir: config.session.dataDir,
     sessionId: ds.session.sessionId,
@@ -5415,6 +5417,7 @@ async function prepareDelegatedScheduledTurnIdentity(
     noteScheduledIdentityRestored(ds, authorized.task, turnId, identity);
     const publicationSnapshot = scheduledPublicationSnapshot();
     await publishTurnCliIdentity({
+      currentPolicy: () => getBot(ds.larkAppId).config.triggerUserAuth,
       botConfig: getBot(ds.larkAppId).config,
       sessionDataDir: config.session.dataDir,
       sessionId: ds.session.sessionId,
@@ -5433,6 +5436,7 @@ async function prepareDelegatedScheduledTurnIdentity(
   } else {
     const publicationSnapshot = scheduledPublicationSnapshot();
     await publishTurnCliIdentity({
+      currentPolicy: () => getBot(ds.larkAppId).config.triggerUserAuth,
       botConfig: getBot(ds.larkAppId).config,
       sessionDataDir: config.session.dataDir,
       sessionId: ds.session.sessionId,
@@ -5574,6 +5578,7 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
     delegatedIdentity = { ...delegatedIdentity, tools: [], denialReason: 'task_turn_isolation_required' };
   }
   const outcomes = await publishTurnCliIdentity({
+    currentPolicy: () => getBot(ds.larkAppId).config.triggerUserAuth,
     botConfig,
     sessionDataDir: config.session.dataDir,
     sessionId: ds.session.sessionId,
@@ -8311,6 +8316,7 @@ async function withdrawWorkflowHandoffIdentity(ds: DaemonSession, turnId: string
   // (its attempt not yet closed), yet its delegation is done.
   const { recheck: _recheck, targetOpenId: _target, ...rest } = remembered;
   await publishTurnCliIdentity({
+    currentPolicy: () => getBot(ds.larkAppId).config.triggerUserAuth,
     botConfig: getBot(ds.larkAppId).config,
     sessionDataDir: config.session.dataDir,
     sessionId: ds.session.sessionId,
@@ -36574,6 +36580,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   };
   const memoryAdmissionOwnerAlerts = new WorkerAdmissionOwnerAlerts(ownerAlertDependencies);
   const workerOwnerDiagnostics = new WorkerOwnerDiagnostics(ownerAlertDependencies);
+  let bytedcliRetireSession: ((sessionId: string, workerGeneration?: number) => Promise<void>) | undefined;
   initWorkerPool({
     onOwnerDiagnostic: (ds, diagnostic) =>
       workerOwnerDiagnostics.report(ds.larkAppId, ds.session.sessionId, diagnostic),
@@ -37014,12 +37021,16 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         startReplacementRuntimeAfterReclaim(ds, true);
       }
     },
+    async onWorkerGenerationRetired(session, context) {
+      await bytedcliRetireSession?.(session.sessionId, context.workerGeneration);
+    },
     onSessionRetired(ds) {
       void cancelQueuedForks(ds, 'source_changed').catch(error =>
         logger.warn(`[${tag(ds)}] queued /fork cancellation failed: ${String(error)}`));
     },
     async onSessionClosed(session, context) {
       autoCompactCoordinator.cancel(session.sessionId);
+      await bytedcliRetireSession?.(session.sessionId, context.workerGeneration);
       await finalizeClosedXpiSharedCwdMember(session, context);
     },
     onReceiverResetReady(_ds, context) {
@@ -37353,6 +37364,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   if (coreOnly) armCoreOnlyReadinessGate();
   setCrossPrincipalInterruptionDisableHandler(() => cancelAllCrossPrincipalInterruptionsForFeatureDisable());
   const ipcHandle = await startIpcServer({
+    bytedcliHostLayout: freezeBytedcliHostLayout(),
     port: ipcPort,
     host: '127.0.0.1',
     authRequired: true,
@@ -37363,6 +37375,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // never silently drift to another (client would dial a dead port).
     ...(coreOnly ? { maxProbe: 0 } : {}),
   });
+  bytedcliRetireSession = ipcHandle.retireBytedcliSession;
   // startIpcServer probes upward on EADDRINUSE (e.g. a second botmux instance on
   // this host already holds ipcBasePort+idx), so the bound port may differ from
   // the requested one. Republish the ACTUAL port into the descriptor before it
@@ -40098,7 +40111,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // writer cannot slip a commit under a write-back that is still coming.
     claimOccupancy();
     removeDaemonDescriptor(cfg.larkAppId, desc.bootInstanceId);
-    ipcHandle.close().catch(() => { /* swallow */ });
+    await ipcHandle.close().catch(() => { logger.warn('[bytedcli-broker] IPC close failed after cancellation'); });
     if (terminalProxy) terminalProxy.close().catch(() => { /* swallow */ });
 
     // Producer-closed fence. We must not close the turn-terminal queue admission

@@ -1,3 +1,7 @@
+import type { AvailableBytedcliOperationPreset, PluginBytedcliOperationPresetsSnapshot } from '../../core/plugins/bytedcli-operation-presets-protocol.js';
+import { BYTEDCLI_OPERATION_CATALOG, BYTEDCLI_AUDITED_RELEASE, BYTEDCLI_OPERATION_CATALOG_VERSION } from '../../core/bytedcli-operation-catalog.js';
+import { BYTEDCLI_OPERATION_POLICY_SCHEMA, BYTEDCLI_OPERATION_POLICY_STATUS_SCHEMA, parseBytedcliOperationPolicy, resolveBytedcliOperationRule, type BytedcliOperationPolicyStatus } from '../../core/bytedcli-operation-policy-config.js';
+import { bytecloudBrokerEnabled } from '../../core/identity-policy.js';
 import { BotProfileRequestContext } from './wecom-bot-config.js';
 import { WecomBotDefaultsCard } from './wecom-bot-defaults-card.js';
 import { botCliDisplayOptions, BotAgentSettings, BotProfileLayout, BotRosterRow, BotProfileIdentityFields, BotCliField, BotModelField, BotSettingActions, BotSettingSection } from './bot-profile-ui.js';
@@ -46,6 +50,7 @@ import { resolvePromptCachePolicy, type PromptCacheConfig } from '../../services
 import { ProviderRecoveryEditor } from './provider-recovery-editor.js';
 import type { ProviderRecoveryConfig } from '../../services/provider-recovery-policy.js';
 import {
+  capabilitiesOf,
   credentialSourceOf,
   type TriggerUserAuthCredentialSource,
   type TriggerUserAuthCredentialSourceCapability,
@@ -5470,12 +5475,22 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
  * server bypasses the wrapper entirely — an operator who is not told either of
  * those would believe the boundary is complete.
  */
+const CLI_IDENTITY_MODES = ['machine', 'actor', 'mixed'] as const;
+const BYTEDCLI_POLICY_FILTERS = ['all', 'actor', 'machine'] as const;
+
 export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
+  const policyTableId = useId();
   const { bot, patchBot } = props;
   const policy = bot.triggerUserAuth ?? null;
   const enabled = policy?.enabled === true;
-  const capabilities = policy?.capabilities ?? ['lark-user' as const, 'bytecloud' as const, 'meego' as const];
+  const strict = bytecloudBrokerEnabled(policy ? { ...policy, tools: policy.tools ?? ['lark-cli', 'bytedcli'] } : undefined);
+  const mode = !enabled ? 'machine' : strict ? 'mixed' : 'actor';
+  const legacyScope = policy != null && (policy.legacyCapabilities === true || policy.capabilities === undefined);
+  // Read dormant scopes too, including legacy single-tool configurations.
+  const capabilities = [...capabilitiesOf({ ...policy, enabled: true, tools: policy?.tools ?? ['lark-cli', 'bytedcli'] })];
+  const execution = strict ? 'read-machine-write-actor' : 'trigger-user';
+  const identityModeRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const credentialSource = policy?.credentialSource ?? 'auto';
   const sourceOverrides = typeof credentialSource === 'object' ? credentialSource : undefined;
   const defaultSource = credentialSourceOf(policy);
@@ -5496,6 +5511,8 @@ export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: P
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [info, setInfo] = useState<{
+    bytedcliOperationPolicy?: BytedcliOperationPolicyStatus;
+    bytedcliOperationPresets?: PluginBytedcliOperationPresetsSnapshot;
     authorizedCount?: number;
     tokenStoreAdvisory?: string;
     mcpAdvisory?: string;
@@ -5504,44 +5521,98 @@ export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: P
     crossPrincipalIsolation?: boolean;
   } | null>(null);
 
-  // Only fetch the advisories when the feature is on: they describe THIS
-  // policy's limits, and showing them for a bot that never enabled it would be
-  // noise about a boundary nobody asked for.
+  const [policyRefresh, setPolicyRefresh] = useState(0);
+  const [operationFilter, setOperationFilter] = useState<typeof BYTEDCLI_POLICY_FILTERS[number]>('all');
+  const operationFilterRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  useEffect(() => { setOperationFilter('all'); }, [bot.larkAppId]);
+  const operationRows = BYTEDCLI_OPERATION_CATALOG.filter(row => row.effect === 'read' || row.effect === 'write');
+  const filteredOperations = operationRows.filter(row => operationFilter === 'all'
+    || policy?.bytedcliOperationPolicy?.rules[row.id] === operationFilter);
+  function selectOperationFilter(index: number): void {
+    const nextIndex = (index + BYTEDCLI_POLICY_FILTERS.length) % BYTEDCLI_POLICY_FILTERS.length;
+    setOperationFilter(BYTEDCLI_POLICY_FILTERS[nextIndex]!);
+    operationFilterRefs.current[nextIndex]?.focus();
+  }
+  // Machine mode does not fetch personal auth or dormant command previews.
   useEffect(() => {
     if (!enabled) { setInfo(null); return; }
+    setInfo(null);
     let alive = true;
     void (async () => {
       try {
         const res = await sendJson('GET', `/api/bots/${encodeURIComponent(bot.larkAppId)}/trigger-user-auth-status`, undefined);
-        if (alive && res.ok && res.body.ok) setInfo(res.body as any);
-      } catch { /* advisory only — never block the panel on it */ }
+        if (alive) setInfo(res.ok && res.body.ok ? res.body as any : {});
+      } catch { if (alive) setInfo({}); }
     })();
     return () => { alive = false; };
-  }, [bot.larkAppId, enabled]);
+  }, [bot.larkAppId, enabled, strict, policyRefresh]);
 
-  async function save(next: BotDefaultsRow['triggerUserAuth']): Promise<void> {
+  const hostPolicy = info?.bytedcliOperationPolicy;
+  let globalPolicy: ReturnType<typeof parseBytedcliOperationPolicy>;
+  let policyState: 'pending' | 'unavailable' | 'invalid' | 'ready' = info === null ? 'pending' : 'unavailable';
+  if (strict && hostPolicy?.schema === BYTEDCLI_OPERATION_POLICY_STATUS_SCHEMA && hostPolicy.cliVersion === BYTEDCLI_AUDITED_RELEASE
+    && hostPolicy.catalogVersion === BYTEDCLI_OPERATION_CATALOG_VERSION) {
+    if (hostPolicy.global?.state === 'invalid') policyState = 'invalid';
+    else if (hostPolicy.global?.state === 'default' || hostPolicy.global?.state === 'valid') {
+      try {
+        globalPolicy = parseBytedcliOperationPolicy({ schema: BYTEDCLI_OPERATION_POLICY_SCHEMA, cliVersion: BYTEDCLI_AUDITED_RELEASE,
+          catalogVersion: BYTEDCLI_OPERATION_CATALOG_VERSION, rules: hostPolicy.global.rules });
+        policyState = 'ready';
+      } catch { policyState = 'unavailable'; }
+    }
+  }
+  function saveOperationRule(operationId: string, value: string): void {
+    if (busy || !strict || policyState !== 'ready') return;
+    const rules = { ...policy?.bytedcliOperationPolicy?.rules };
+    if (value === '') delete rules[operationId];
+    else rules[operationId] = value as 'machine' | 'actor' | 'deny';
+    try {
+      const parsed = parseBytedcliOperationPolicy({ schema: BYTEDCLI_OPERATION_POLICY_SCHEMA, cliVersion: BYTEDCLI_AUDITED_RELEASE,
+        catalogVersion: BYTEDCLI_OPERATION_CATALOG_VERSION, rules });
+      void save({ ...policyWith({}), enabled, bytedcliOperationPolicy: parsed }, true);
+    } catch { setStatus({ ok: false, text: tr('botDefaults.bytedcliPolicyInvalidRule') }); }
+  }
+
+  async function save(next: BotDefaultsRow['triggerUserAuth'], commandRules = false): Promise<void> {
     const previous = policy;
     patchBot(bot.larkAppId, { triggerUserAuth: next });
-    await saveBotField({
+    const saved = await saveBotField({
       request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/trigger-user-auth`, {
         triggerUserAuth: next,
       }),
       setStatus,
       setBusy,
-      saved: tr('botDefaults.triggerUserAuthSaved'),
+      saved: tr(commandRules ? 'botDefaults.bytedcliPolicySaved' : 'botDefaults.triggerUserAuthSaved'),
       rollback: () => patchBot(bot.larkAppId, { triggerUserAuth: previous }),
     });
+    // A GET triggered by the optimistic patch may have read the pre-save policy.
+    if (saved) setPolicyRefresh(value => value + 1);
   }
 
-  function policyWith(next: { capabilities?: typeof capabilities; credentialSource?: typeof credentialSource; delegateOnMention?: boolean; allowSpeakerSwitch?: boolean; gitCommitIdentity?: boolean }) {
+  async function applyOperationPreset(preset: AvailableBytedcliOperationPreset): Promise<void> {
+    if (busy || !strict || policyState !== 'ready') return;
+    const applied = await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/trigger-user-auth`, {
+        bytedcliOperationPreset: { pluginId: preset.pluginId, presetId: preset.id, revision: preset.revision },
+      }),
+      onSaved: body => patchBot(bot.larkAppId, { triggerUserAuth: body.triggerUserAuth }),
+      setStatus, setBusy, saved: tr('botDefaults.bytedcliPolicySaved'),
+    });
+    if (!applied) setPolicyRefresh(value => value + 1);
+  }
+
+  function policyWith(next: { capabilities?: typeof capabilities; credentialSource?: typeof credentialSource; delegateOnMention?: boolean; allowSpeakerSwitch?: boolean; gitCommitIdentity?: boolean; bytecloudExecution?: typeof execution }) {
+    const { legacyCapabilities: _legacy, ...preserved } = policy ?? {};
     return {
+      ...preserved,
       enabled: true,
-      capabilities: next.capabilities ?? capabilities,
+      bytecloudExecution: next.bytecloudExecution ?? execution,
+      capabilities: next.capabilities ?? (legacyScope ? undefined : capabilities),
       credentialSource: next.credentialSource ?? credentialSource,
       delegateOnMention: next.delegateOnMention ?? delegateOnMention,
       allowSpeakerSwitch: next.allowSpeakerSwitch ?? allowSpeakerSwitch,
       gitCommitIdentity: next.gitCommitIdentity ?? gitCommitIdentity,
-      ...(policy?.legacyCapabilities && !next.capabilities ? { legacyCapabilities: true } : {}),
+      ...(legacyScope && !next.capabilities ? { legacyCapabilities: true } : {}),
     };
   }
 
@@ -5549,7 +5620,23 @@ export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: P
     void save(policyWith(next));
   }
 
+  function selectIdentityMode(next: typeof CLI_IDENTITY_MODES[number]): void {
+    if (busy || next === mode) return;
+    if (next === 'machine') void save({ ...policy, enabled: false, ...(legacyScope ? { capabilities: undefined } : {}) });
+    else if (next === 'actor') saveWith({ bytecloudExecution: 'trigger-user' });
+    else saveWith({ bytecloudExecution: 'read-machine-write-actor',
+      ...(capabilities.includes('bytecloud') ? {} : { capabilities: [...capabilities, 'bytecloud' as const] }) });
+  }
+
+  function navigateIdentityModes(index: number): void {
+    if (busy) return;
+    const nextIndex = (index + CLI_IDENTITY_MODES.length) % CLI_IDENTITY_MODES.length;
+    identityModeRefs.current[nextIndex]?.focus();
+    selectIdentityMode(CLI_IDENTITY_MODES[nextIndex]!);
+  }
+
   function toggleCapability(capability: typeof capabilities[number], on: boolean): void {
+    if (busy || (strict && capability === 'bytecloud')) return;
     saveWith({ capabilities: on ? [...new Set([...capabilities, capability])] : capabilities.filter(c => c !== capability) });
   }
 
@@ -5563,14 +5650,35 @@ export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: P
   return (
     <section className="bd-section">
       <h3 className="bd-section-title">{tr('botDefaults.sectionTriggerUserAuth')}</h3>
-      <ToggleRow
-        checked={enabled}
-        disabled={busy}
-        dataAction="toggle-trigger-user-auth"
-        title={tr('botDefaults.triggerUserAuthToggle')}
-        help={tr('botDefaults.triggerUserAuthHelp')}
-        onChange={checked => void save(checked ? policyWith({}) : null)}
-      />
+      <div className="bd-mode-opts-wrap">
+        <FieldTitle>{tr('botDefaults.cliIdentityMode')}</FieldTitle>
+        <div className="bd-mode-opt-grid bd-cli-identity-modes" role="radiogroup"
+          aria-label={tr('botDefaults.cliIdentityMode')} aria-describedby={`${policyTableId}-mode-help`}>
+          {CLI_IDENTITY_MODES.map((option, index) => (
+            <button key={option} type="button" role="radio" data-action={`cli-identity-mode-${option}`}
+              className={`bd-mode-opt${mode === option ? ' is-selected' : ''}`}
+              aria-checked={mode === option} tabIndex={mode === option ? 0 : -1} aria-disabled={busy}
+              ref={node => { identityModeRefs.current[index] = node; }}
+              onClick={() => selectIdentityMode(option)} onKeyDown={event => {
+                if (event.key === 'ArrowRight' || event.key === 'ArrowDown') { event.preventDefault(); navigateIdentityModes(index + 1); }
+                else if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') { event.preventDefault(); navigateIdentityModes(index - 1); }
+                else if (event.key === 'Home') { event.preventDefault(); navigateIdentityModes(0); }
+                else if (event.key === 'End') { event.preventDefault(); navigateIdentityModes(CLI_IDENTITY_MODES.length - 1); }
+              }}>
+              <span className="bd-mode-opt-radio" aria-hidden="true" />
+              <span className="bd-mode-opt-text">
+                <span className="bd-mode-opt-name">{option === 'machine' ? tr('botDefaults.cliIdentityMode.machine')
+                  : option === 'actor' ? tr('botDefaults.cliIdentityMode.actor') : tr('botDefaults.cliIdentityMode.mixed')}</span>
+                <span className="bd-mode-opt-short">{tr(`botDefaults.cliIdentityModeShort.${option}`)}</span>
+              </span>
+            </button>
+          ))}
+        </div>
+      </div>
+      <p id={`${policyTableId}-mode-help`} className="bd-section-note" data-action="cli-identity-mode-help">
+        {tr(`botDefaults.cliIdentityModeHelp.${mode}`)}
+      </p>
+      <p className="bd-section-note">{tr('botDefaults.cliIdentityModeSessionHelp')}</p>
       {enabled ? (
         <>
           <div className="bd-row">
@@ -5581,14 +5689,14 @@ export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: P
                   type="checkbox"
                   data-action={`trigger-user-auth-capability-${capability}`}
                   checked={capabilities.includes(capability)}
-                  disabled={busy}
+                  disabled={busy || (strict && capability === 'bytecloud')}
                   onChange={event => toggleCapability(capability, event.currentTarget.checked)}
                 />
-                <span>{tr(`botDefaults.triggerUserAuthCapability.${capability}`)}</span>
+                <span>{tr(strict && capability === 'bytecloud' ? 'botDefaults.bytecloudBrokerCapability' : `botDefaults.triggerUserAuthCapability.${capability}`)}</span>
               </label>
             ))}
           </div>
-          {capabilities.includes('lark-user') || policy?.legacyCapabilities ? null : (
+          {capabilities.includes('lark-user') || legacyScope ? null : (
             <p className="bd-section-note" data-action="trigger-user-auth-lark-user-native-note">{tr('botDefaults.triggerUserAuthLarkUserNativeNote')}</p>
           )}
           <div className="bd-row">
@@ -5626,7 +5734,7 @@ export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: P
               {sourceCapabilities.map(capability => (
                 <div key={capability} className="bd-row">
                   <label>
-                    <span>{tr(`botDefaults.triggerUserAuthCapability.${capability}`)}</span>
+                    <span>{tr(strict && capability === 'bytecloud' ? 'botDefaults.bytecloudBrokerCapability' : `botDefaults.triggerUserAuthCapability.${capability}`)}</span>
                     <select
                       data-action={`trigger-user-auth-source-${capability}`}
                       value={sourceOverrides[capability] ?? ''}
@@ -5641,7 +5749,7 @@ export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: P
               ))}
             </>
           ) : null}
-          <p className="bd-section-note">{tr('botDefaults.triggerUserAuthSourceHelp')}</p>
+          <p className="bd-section-note">{tr(strict ? 'botDefaults.bytecloudBrokerSourceHelp' : 'botDefaults.triggerUserAuthSourceHelp')}</p>
           {platformCapable && info?.platformBound === false ? (
             <p className="bd-section-note" data-trigger-user-auth-platform="unbound">
               ⚠️ {tr(platformOnly
@@ -5655,6 +5763,92 @@ export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: P
               <a href={info.platformCredentialsUrl} target="_blank" rel="noreferrer">{info.platformCredentialsUrl}</a>
             </p>
           ) : null}
+        </>
+      ) : null}
+      {strict ? <div data-action="bytedcli-policy-table">
+        <h4 className="bd-subsection-title">{tr('botDefaults.bytedcliPolicyTitle')}</h4>
+        <p className="bd-section-note" data-action="trigger-user-auth-bytecloud-restrictions">{tr('botDefaults.bytecloudExecutionRestrictions')}</p>
+        <p className="bd-section-note" data-action="bytedcli-policy-state" data-state={policyState}>
+          {tr(`botDefaults.bytedcliPolicyState.${policyState}`)}
+        </p>
+        <p className="bd-section-note">{tr('botDefaults.bytedcliPolicyHelp')}</p>
+        <div className="segmented" role="tablist" aria-label={tr('botDefaults.bytedcliPolicyOverride')}
+          style={{ flexWrap: 'wrap', maxWidth: '100%', marginBottom: '8px' }}>
+          {BYTEDCLI_POLICY_FILTERS.map((filter, index) => (
+            <button key={filter} type="button" role="tab" id={`${policyTableId}-filter-${filter}`}
+              ref={node => { operationFilterRefs.current[index] = node; }}
+              className={operationFilter === filter ? 'active' : ''}
+              data-action={`bytedcli-policy-filter-${filter}`} aria-selected={operationFilter === filter}
+              aria-controls={`${policyTableId}-commands`} tabIndex={operationFilter === filter ? 0 : -1}
+              onClick={() => setOperationFilter(filter)} onKeyDown={event => {
+                if (event.key === 'ArrowRight') { event.preventDefault(); selectOperationFilter(index + 1); }
+                else if (event.key === 'ArrowLeft') { event.preventDefault(); selectOperationFilter(index - 1); }
+                else if (event.key === 'Home') { event.preventDefault(); selectOperationFilter(0); }
+                else if (event.key === 'End') { event.preventDefault(); selectOperationFilter(BYTEDCLI_POLICY_FILTERS.length - 1); }
+              }}>
+              {tr(`botDefaults.bytedcliPolicyFilter.${filter}`)} ({filter === 'all' ? operationRows.length
+                : operationRows.filter(row => policy?.bytedcliOperationPolicy?.rules[row.id] === filter).length})
+            </button>
+          ))}
+        </div>
+        <div role="tabpanel" id={`${policyTableId}-commands`} aria-labelledby={`${policyTableId}-filter-${operationFilter}`}
+          style={{ overflowX: 'auto' }}>
+          <table style={{ width: '100%', minWidth: '720px', fontSize: '0.9em', textAlign: 'left', borderCollapse: 'collapse' }}>
+            <thead><tr>{['Command', 'Effect', 'Global', 'Override', 'Effective'].map(column =>
+              <th key={column} style={{ padding: '8px' }}>{tr(`botDefaults.bytedcliPolicy${column}`)}</th>)}</tr></thead>
+            <tbody>{filteredOperations.map(row => {
+              const effective = policyState === 'ready' ? resolveBytedcliOperationRule(row.id, globalPolicy, policy?.bytedcliOperationPolicy ?? undefined) : undefined;
+              const conditionId = `${policyTableId}-${row.id}-condition`;
+              return <tr key={row.id} style={{ borderTop: '1px solid var(--border)' }}>
+                <td style={{ padding: '8px', width: '48%', whiteSpace: 'normal', overflowWrap: 'anywhere' }}>
+                  <code style={{ display: 'block', whiteSpace: 'normal' }}>{row.id}</code>
+                  <span style={{ display: 'block', marginTop: '4px' }}>{row.path.join(' ')}</span>
+                  {row.condition ? <small id={conditionId} style={{ display: 'block', marginTop: '4px', lineHeight: 1.5 }}>{row.condition}</small> : null}
+                </td>
+                <td data-action={`bytedcli-effect-${row.id}`} data-effect={row.effect}>{tr(`botDefaults.bytedcliPolicyEffect.${row.effect}`)}</td>
+                <td>{policyState === 'ready' ? tr(`botDefaults.bytedcliPolicyRule.${globalPolicy?.rules[row.id] ?? 'inherit'}`) : '—'}</td>
+                <td><select data-action={`bytedcli-policy-${row.id}`} value={policy?.bytedcliOperationPolicy?.rules[row.id] ?? ''}
+                  disabled={busy || policyState !== 'ready'} aria-label={`${tr('botDefaults.bytedcliPolicyOverride')}: ${row.id}`}
+                  aria-describedby={row.condition ? conditionId : undefined}
+                  onChange={event => saveOperationRule(row.id, event.currentTarget.value)}>
+                  <option value="">{tr('botDefaults.bytedcliPolicyRule.inherit')}</option>
+                  <option value="machine">{tr('botDefaults.bytedcliPolicyRule.machine')}</option>
+                  <option value="actor">{tr('botDefaults.bytedcliPolicyRule.actor')}</option>
+                  <option value="deny">{tr('botDefaults.bytedcliPolicyRule.deny')}</option>
+                </select></td>
+                <td data-action={`bytedcli-effective-${row.id}`} data-enabled={effective?.enabled} data-identity={effective?.identity}>
+                  {effective ? tr(`botDefaults.bytedcliPolicyRule.${effective.enabled ? effective.identity : 'deny'}`) : '—'}
+                  {row.effect === 'write' && effective?.enabled && effective.identity === 'machine' ?
+                    <small data-action={`bytedcli-machine-exception-${row.id}`} style={{ display: 'block' }}>{tr('botDefaults.bytedcliPolicyMachineException')}</small> : null}
+                </td>
+              </tr>;
+            })}
+              {filteredOperations.length === 0 ? <tr><td colSpan={5} data-action="bytedcli-policy-empty"
+                style={{ padding: '16px 8px', color: 'var(--muted)' }}>{tr('botDefaults.bytedcliPolicyFilterEmpty')}</td></tr> : null}
+            </tbody>
+          </table>
+        </div>
+        <div className="actions">
+          <button type="button" disabled={busy || policyState === 'pending'} onClick={() => setPolicyRefresh(value => value + 1)}>{tr('botDefaults.bytedcliPolicyRefresh')}</button>
+          <button type="button" data-action="bytedcli-policy-clear" disabled={busy || policyState !== 'ready'}
+            onClick={() => { if (!busy && strict && policyState === 'ready') void save({ ...policyWith({}), enabled, bytedcliOperationPolicy: null }, true); }}>
+            {tr('botDefaults.bytedcliPolicyClear')}
+          </button>
+        </div>
+        {info?.bytedcliOperationPresets?.issues.length ? <p data-action="bytedcli-policy-preset-issues">{tr('botDefaults.bytedcliPolicyPresetIssues')}</p> : null}
+        {info?.bytedcliOperationPresets?.presets.map(preset => (
+          <div className="bd-row" key={`${preset.pluginId}/${preset.id}`} data-action="bytedcli-policy-plugin-preset-row">
+            <span><code>{preset.pluginId}@{preset.pluginVersion}</code> {preset.description}</span>
+            <button type="button" data-action="bytedcli-policy-plugin-preset" data-plugin-id={preset.pluginId} data-preset-id={preset.id}
+              disabled={busy || policyState !== 'ready'} onClick={() => { void applyOperationPreset(preset); }}>
+              {tr('botDefaults.bytedcliPolicyApplyPreset', { title: preset.title })}
+            </button>
+            {preset.machineWriteExceptions.length ? <small data-action="bytedcli-policy-preset-writes">{tr('botDefaults.bytedcliPolicyPresetWrites')}: {preset.machineWriteExceptions.join(', ')}</small> : null}
+          </div>
+        ))}
+      </div> : null}
+      {enabled ? (
+        <>
           <ToggleRow
             checked={delegateOnMention}
             disabled={busy}
@@ -5665,7 +5859,7 @@ export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: P
           />
           <ToggleRow
             checked={allowSpeakerSwitch}
-            disabled={busy || (info?.crossPrincipalIsolation === true && !allowSpeakerSwitch)}
+            disabled={busy || strict || (info?.crossPrincipalIsolation === true && !allowSpeakerSwitch)}
             dataAction="toggle-trigger-user-auth-allow-speaker-switch"
             title={tr('botDefaults.triggerUserAuthAllowSpeakerSwitch')}
             help={tr('botDefaults.triggerUserAuthAllowSpeakerSwitchHelp')}
@@ -5682,8 +5876,8 @@ export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: P
             help={tr('botDefaults.triggerUserAuthGitCommitIdentityHelp')}
             onChange={checked => saveWith({ gitCommitIdentity: checked })}
           />
-          <p className="bd-section-note">{tr('botDefaults.triggerUserAuthCapabilityNote')}</p>
-          {capabilities.includes('bytecloud') ? (
+          <p className="bd-section-note">{tr(strict ? 'botDefaults.bytecloudBrokerAuthNote' : 'botDefaults.triggerUserAuthCapabilityNote')}</p>
+          {capabilities.includes('bytecloud') && !strict ? (
             <p className="bd-section-note">{tr('botDefaults.triggerUserAuthBytedcliNote')}</p>
           ) : null}
           {typeof info?.authorizedCount === 'number' ? (

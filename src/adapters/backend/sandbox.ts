@@ -1165,6 +1165,41 @@ function createMaskMount(leaf: string, kind: 'dir' | 'file', sink: MaskMountEntr
   }
 }
 
+/** A missing credential path must not require writes into a host system
+ * directory. Project its nearest existing parent into a private tmpfs, with
+ * existing children bound read-only. Missing children are then namespace-only
+ * mountpoints; future host files cannot appear through this directory view. */
+function strictMissingMaskProjections(policy: FsPolicy, maskMounts: readonly { path: string }[]): {
+  policy: FsPolicy;
+  directories: Map<string, { name: string; symlinkTarget?: string }[]>;
+  namespaceMasks: Set<string>;
+} {
+  const directories = new Map<string, { name: string; symlinkTarget?: string }[]>();
+  const namespaceMasks = new Set<string>();
+  const rules = [...policy.rules];
+  for (const mask of maskMounts) {
+    if (!policy.protectedDenyPaths?.some(root => root === mask.path || root.startsWith(mask.path + '/') || mask.path.startsWith(root + '/'))) continue;
+    try { lstatSync(mask.path); continue; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    let parent = dirname(mask.path);
+    while (!existsSync(parent) && dirname(parent) !== parent) parent = dirname(parent);
+    if (!statSync(parent).isDirectory() || accessForPath(policy.rules, parent).access !== 'readOnly') {
+      throw new Error('missing strict mask requires an exposed read-only parent');
+    }
+    if (!directories.has(parent)) {
+      const children = readdirSync(parent, { withFileTypes: true }).map(entry => ({
+        name: entry.name,
+        ...(entry.isSymbolicLink() ? { symlinkTarget: readlinkSync(join(parent, entry.name)) } : {}),
+      }));
+      directories.set(parent, children);
+      if (!rules.some(rule => rule.path === parent)) rules.push({ path: parent, access: 'readOnly', source: 'mandatory' });
+    }
+    namespaceMasks.add(mask.path);
+  }
+  rules.sort((a, b) => a.path.split('/').length - b.path.split('/').length || a.path.localeCompare(b.path));
+  return { policy: { ...policy, rules }, directories, namespaceMasks };
+}
+
 // Test-only surface for the deny-mask lifecycle (trust-boundary regression
 // coverage: manifest tamper defense, dev+ino identity, multi-level cleanup,
 // partial-create rollback).
@@ -1219,6 +1254,8 @@ export function sandboxTarOptions(inherited: string | undefined, uid: number | u
 }
 
 export function prepareDirectSandbox(opts: {
+  /** Broker credentials live on the host: PID namespace degradation is forbidden. */
+  bytedcliBroker?: boolean;
   networkPolicy?: SandboxNetworkPolicy;
   sessionId: string;
   dataDir: string;
@@ -1271,9 +1308,21 @@ export function prepareDirectSandbox(opts: {
   childTarOptions?: string;
 }): DirectSandboxSpawn | null {
   if (process.platform !== 'linux') return null;
+  if (opts.bytedcliBroker) {
+    for (const path of opts.policy.protectedDenyPaths ?? []) {
+      try {
+        if (lstatSync(path).isSymbolicLink()) throw new Error('ByteCloud broker refuses a symlink at a protected credential root');
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+    }
+  }
+  // The outer network runner owns model/local-service bridges and connects to
+  // the host guard before entering bwrap. With host MCP disabled, task processes
+  // need no guard socket mount. If one is mounted, it must still match.
   if (opts.protectedHttpBridge && (!opts.networkPolicy
-    || !opts.protectedEgressSocketPath
-    || resolve(opts.protectedHttpBridge.socketPath) !== resolve(opts.protectedEgressSocketPath))) {
+    || (opts.protectedEgressSocketPath
+      && resolve(opts.protectedHttpBridge.socketPath) !== resolve(opts.protectedEgressSocketPath)))) {
     throw new Error('protected HTTP loopback bridge requires the matching guarded network sandbox');
   }
   if (opts.localServiceBridges?.length && !opts.networkPolicy) {
@@ -1354,6 +1403,22 @@ export function prepareDirectSandbox(opts: {
   const usrmergePaths = new Set(symlinks.map(link => link.path));
   for (const link of relocated.symlinks) if (!usrmergePaths.has(link.path)) symlinks.push(link);
   const policy: FsPolicy = { ...opts.policy, rules: relocated.rules };
+  if (opts.bytedcliBroker) {
+    policy.rules = policy.rules.filter(rule => {
+      if (rule.access !== 'readOnly' || !opts.policy.protectedReadOnlyPaths?.includes(rule.path)) return true;
+      try {
+        if (!lstatSync(rule.path).isSymbolicLink()) return true;
+        const parent = policy.rules.filter(other => other.path !== rule.path
+          && (rule.path.startsWith(other.path + '/') || other.path === '/'))
+          .sort((a, b) => b.path.length - a.path.length)[0];
+        if (parent?.access !== 'readOnly') throw new Error('ByteCloud executable alias has no read-only parent');
+        return false;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        return true;
+      }
+    });
+  }
   const filePaths = new Set<string>();
   for (const r of policy.rules) {
     if (r.access !== 'deny') continue;
@@ -1365,16 +1430,30 @@ export function prepareDirectSandbox(opts: {
     } catch { /* absent → dir-shaped mask */ }
   }
 
-  const compiled = compileToBwrap(policy, {
+  const compileOptions = {
     symlinks,
     emptyDir,
     emptiesDir: empties,
     filePaths,
     chdir: opts.chdir,
     skipPidNamespace: coreOnlyPidNamespaceDegrade({
-      credentialBearingHostChannel: !!opts.mcpGatewaySocketPath || !!opts.localServiceBridges?.length,
+      credentialBearingHostChannel: opts.bytedcliBroker === true || !!opts.mcpGatewaySocketPath || !!opts.localServiceBridges?.length,
     }),
-  });
+  };
+  let compiled = compileToBwrap(policy, compileOptions);
+  let namespaceMasks = new Set<string>();
+  if (opts.bytedcliBroker) {
+    try {
+      const projection = strictMissingMaskProjections(policy, compiled.maskMounts);
+      namespaceMasks = projection.namespaceMasks;
+      if (projection.directories.size) compiled = compileToBwrap(projection.policy, {
+        ...compileOptions, directoryProjections: projection.directories,
+      });
+    } catch (error) {
+      rollbackSandboxSetup(sessionRoot, []);
+      throw error;
+    }
+  }
   if (minimaxAlias) {
     // After tmpfs setup and before any host binds. Parent directories are
     // empty namespace scaffolding; the alias grants no additional host path.
@@ -1403,6 +1482,9 @@ export function prepareDirectSandbox(opts: {
   // path. Pre-creating a DIRECTORY for a not-yet-existing deny also blocks the
   // host from later creating a same-named FILE there — fail-closed, an accepted
   // compat cost of never leaking a denied path.
+  // Strict missing credential masks instead live under a private directory
+  // projection: bwrap creates those targets only in the namespace, so they are
+  // excluded from host creation and the host cleanup manifest.
   //
   // FAIL CLOSED: if creating a mountpoint OR persisting the manifest fails, roll
   // back everything and abort the spawn — starting the session anyway would
@@ -1411,6 +1493,7 @@ export function prepareDirectSandbox(opts: {
   const createdMasks: MaskMountEntry[] = [];
   try {
     for (const m of compiled.maskMounts) {
+      if (namespaceMasks.has(m.path)) continue;
       // createMaskMount pushes each level into createdMasks IMMEDIATELY, so a
       // mid-chain throw still leaves the partial ancestors visible for rollback.
       createMaskMount(m.path, m.kind, createdMasks);

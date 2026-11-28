@@ -291,31 +291,41 @@ export async function startProtectedHttpEgressLoopbackBridge(
 }
 
 export async function startProtectedLocalServiceLoopbackBridge(
-  plan: ProtectedLocalServiceLoopbackPlan,
+  input: ProtectedLocalServiceLoopbackPlan | readonly ProtectedLocalServiceLoopbackPlan[],
   resolveProcessPeer: ProtectedLocalServicePeerResolver = async peer => peer,
 ): Promise<ProtectedHttpEgressLoopbackBridge> {
-  if (!/^[a-z0-9][a-z0-9._-]{0,127}$/.test(plan.serviceId)
-    || !Number.isSafeInteger(plan.listenPort) || plan.listenPort < 0 || plan.listenPort > 65535
-    || !/^[!#$%&'*+\-.^_`|~0-9A-Z]+$/.test(plan.method)
-    || plan.method !== plan.method.toUpperCase()
-    || normalizeProtectedHttpPath(plan.path) !== plan.path
-    || plan.path.includes('?')
-    || (plan.attestProcessPeer !== undefined && plan.attestProcessPeer !== true)) {
-    throw new Error('protected_local_service_loopback_plan_invalid');
-  }
-  const forwardHeaders: string[] = [];
-  const seen = new Set<string>();
-  for (const header of plan.forwardHeaders) {
-    if (header !== header.toLowerCase() || !/^[!#$%&'*+\-.^_`|~0-9a-z]+$/.test(header)
-      || ROUTING_HEADERS.has(header) || header === 'host' || header === 'content-length'
-      || seen.has(header)) {
+  const plans = Array.isArray(input) ? input : [input as ProtectedLocalServiceLoopbackPlan];
+  if (!plans.length) throw new Error('protected_local_service_loopback_plan_invalid');
+  const routes = new Set<string>();
+  const normalizedPlans = plans.map(plan => {
+    if (plan.socketPath !== plans[0].socketPath || plan.listenPort !== plans[0].listenPort) throw new Error('protected_local_service_loopback_plan_invalid');
+    const route = JSON.stringify([plan.method, plan.path]);
+    if (routes.has(route)) throw new Error('protected_local_service_loopback_plan_invalid');
+    routes.add(route);
+    if (!/^[a-z0-9][a-z0-9._-]{0,127}$/.test(plan.serviceId)
+      || !Number.isSafeInteger(plan.listenPort) || plan.listenPort < 0 || plan.listenPort > 65535
+      || !/^[!#$%&'*+\-.^_`|~0-9A-Z]+$/.test(plan.method)
+      || plan.method !== plan.method.toUpperCase()
+      || normalizeProtectedHttpPath(plan.path) !== plan.path
+      || plan.path.includes('?')
+      || (plan.attestProcessPeer !== undefined && plan.attestProcessPeer !== true)) {
       throw new Error('protected_local_service_loopback_plan_invalid');
     }
-    seen.add(header);
-    forwardHeaders.push(header);
-  }
-  const normalizedPlan = { ...plan, forwardHeaders };
-  const authToken = readFileSync(protectedHttpEgressAuthTokenPath(plan.socketPath), 'utf8').trim();
+    const forwardHeaders: string[] = [];
+    const seen = new Set<string>();
+    for (const header of plan.forwardHeaders) {
+      if (header !== header.toLowerCase() || !/^[!#$%&'*+\-.^_`|~0-9a-z]+$/.test(header)
+        || ROUTING_HEADERS.has(header) || header === 'host' || header === 'content-length'
+        || seen.has(header)) {
+        throw new Error('protected_local_service_loopback_plan_invalid');
+      }
+      seen.add(header);
+      forwardHeaders.push(header);
+    }
+    return { ...plan, forwardHeaders };
+  });
+  const firstPlan = normalizedPlans[0];
+  const authToken = readFileSync(protectedHttpEgressAuthTokenPath(firstPlan.socketPath), 'utf8').trim();
   if (!authToken || authToken.length > 4096 || /[\r\n]/.test(authToken)) {
     throw new Error('protected_http_loopback_auth_invalid');
   }
@@ -328,7 +338,8 @@ export async function startProtectedLocalServiceLoopbackBridge(
         bridgeForbidden(outgoing);
         return;
       }
-      if ((incoming.method ?? '').toUpperCase() !== normalizedPlan.method || path !== normalizedPlan.path) {
+      const normalizedPlan = normalizedPlans.find(plan => (incoming.method ?? '').toUpperCase() === plan.method && path === plan.path);
+      if (!normalizedPlan) {
         incoming.resume();
         bridgeForbidden(outgoing);
         return;
@@ -383,7 +394,7 @@ export async function startProtectedLocalServiceLoopbackBridge(
     };
     server.once('error', onError);
     server.once('listening', onListening);
-    server.listen(normalizedPlan.listenPort, '127.0.0.1');
+    server.listen(firstPlan.listenPort, '127.0.0.1');
   });
   const address = server.address() as AddressInfo | null;
   if (!address || typeof address === 'string') {

@@ -1,3 +1,5 @@
+import { freezeBytedcliHostLayout } from './bytedcli-host-layout.js';
+import { bytecloudExportBlocked } from './bytedcli-strict-session.js';
 import { nativeGatewayAskSnapshots, nativeGatewayAskDecision, type NativeGatewayAskOrigin } from './native-gateway-ask-control.js';
 import {
   EXPECTED_CORE_BOOT_HEADER,
@@ -64,7 +66,7 @@ import { lookupTurnResultRequest } from './turn-result-routes.js';
 import { normalizeCalendarBinding, normalizeCalendarDayType, listWorkCalendars, previewTaskCalendar } from '../services/work-calendar.js';
 import { resolveWorkspace } from './workspace-metadata.js';
 // src/core/dashboard-ipc-server.ts
-import { canOperate } from '../im/lark/event-dispatcher.js';
+import { canOperate, canTalk } from '../im/lark/event-dispatcher.js';
 import { resolveRunAs } from './run-as.js';
 import {
   DASHBOARD_SCHEDULE_CREATOR_HEADER,
@@ -675,10 +677,12 @@ import {
   getBotName,
   type SessionRow,
 } from './dashboard-rows.js';
-import { getBotBrand, getBot, getBotClient, getBotOpenId, getOwnerOpenId, loadBotConfigs, findOncallChat, listOncallChats, effectiveDefaultWorkingDir, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, normalizeDshProfile, LarkTransportDisabledError, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
+import { getBotBrand, getBot, getBotClient, getBotOpenId, getOwnerOpenId, getLoadedConfigProvenance, loadBotConfigs, findOncallChat, listOncallChats, effectiveDefaultWorkingDir, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, normalizeDshProfile, LarkTransportDisabledError, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
 import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, isUsableOpenId, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES, requestUserAuthorization, type UserAuthorizationPollResult } from '../utils/user-token.js';
 import { describeMissingUserScopes, type AppVersionReviewLookup } from '../utils/lark-app-version.js';
 import { queryTriggerUserAuthStatus } from '../services/trigger-user-auth-status.js';
+import { readPluginBytedcliOperationPresets } from './plugins/bytedcli-operation-presets.js';
+import { applyPluginBytedcliOperationPreset } from '../services/bytedcli-operation-preset-store.js';
 import { revokeTriggerUserAuth } from '../services/revoke-trigger-user-auth.js';
 import { tokenStoreProtection, triggerUserAuthApplies, larkUserNative, credentialSourceOf, capabilityOn, capabilitiesOf, IDENTITY_ROUTE_TOOLS, type IdentityRouteTool, type TriggerUserAuthConfig, type TriggerUserAuthTool } from '../services/trigger-user-auth.js';
 import { platformCredentialsUrl } from '../platform/credential-grant-client.js';
@@ -723,7 +727,12 @@ import { sessionAuthRequests } from './session-auth-requests.js';
 import { chooseTurnSpeaker, governedSpeakers } from './turn-speakers.js';
 import { resolveUserToken } from '../utils/user-token.js';
 import { currentLarkToolDelegation, getLarkToolDelegation } from './lark-tool-delegation.js';
-import { capabilityOfTool } from './identity-policy.js';
+import { capabilityOfTool, bytecloudBrokerEnabled } from './identity-policy.js';
+import { BYTEDCLI_EXEC_ROUTE } from '../cli/bytedcli-exec-protocol.js';
+import { resolveProtectedExecutionPeer } from './bytedcli-protected-loopback.js';
+import { createProductionBytedcliBroker, type BytedcliBroker, type BytedcliHostLayout } from './bytedcli-broker.js';
+import { bytedcliSessionWasStrict, markBytedcliStrictSession } from './bytedcli-broker-containment.js';
+import { resolveVerifiedUserIdentityByUnionId } from '../im/lark/identity-cache.js';
 import { activePlatformCredentialBindingKey, reasonTag, platformAuthorizeUrl } from './platform-credential-source.js';
 import { platformLarkAuthorization, refreshPlatformLarkGrant } from './platform-lark-identity-renewal.js';
 import { askPlatformToAuthorize, type PlatformAuthorizationRequestResult } from './platform-authorization-request.js';
@@ -812,6 +821,7 @@ type HeadlessReasoningEffort = NonNullable<HeadlessSessionRecord['reasoningEffor
 export interface IpcServerHandle {
   port: number;
   close: () => Promise<void>;
+  retireBytedcliSession: (sessionId: string, workerGeneration?: number) => Promise<void>;
 }
 
 export type Handler = (
@@ -1498,6 +1508,7 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
   // capability because those are writable by an unconfined same-UID Agent.
   if (method === 'POST' && pathname === CURRENT_ACTOR_ROUTE) return true;
   if (method === 'POST' && pathname === CURRENT_EXECUTION_ROUTE) return true;
+  if (method === 'POST' && pathname === BYTEDCLI_EXEC_ROUTE) return true;
   // Same lineage proof as current-execution; the reply carries identity env
   // CONTENT, so it is admitted only through this exact route.
   if (method === 'POST' && pathname === CURRENT_EXECUTION_IDENTITY_ROUTE) return true;
@@ -1824,12 +1835,34 @@ ipcRoute('POST', MANAGED_ORIGIN_ATTEST_ROUTE, async (req, res) => {
   }
 });
 
+const requestBytedcliBrokers = new WeakMap<IncomingMessage, BytedcliBroker>();
+ipcRoute('POST', BYTEDCLI_EXEC_ROUTE, (req, res) => requestBytedcliBrokers.get(req)!.handle(req, res));
+
+/** Sticky host session fence: disabling the live policy cannot reopen a
+ * ByteCloud export to a process launched under strict policy. */
+function strictBytecloudExportRefused(sessionId: string, appId?: string): boolean {
+  const ds = findActiveBySessionId(sessionId);
+  const row = ds?.session ?? sessionStore.getOwnedSession(sessionId);
+  if (ds && bytedcliSessionWasStrict(ds) || row?.bytecloudBrokerStrict || bytecloudExportBlocked(config.session.dataDir, sessionId)) return true;
+  try {
+    const policy = getBot(ds?.larkAppId ?? appId ?? row?.larkAppId ?? '').config.triggerUserAuth;
+    if (!bytecloudBrokerEnabled(policy)) return false;
+    if (ds) markBytedcliStrictSession(ds);
+    try {
+      bytecloudExportBlocked(config.session.dataDir, sessionId, policy);
+      if (ds) sessionStore.updateSession(ds.session);
+    } catch { /* Refuse even if durable storage is unavailable. */ }
+    return true;
+  } catch { return false; }
+}
+
 // Like current-actor, even a host-signed request must prove the live socket peer.
 // This route does not resolve a human identity or grant an action permission.
 ipcRoute('POST', CURRENT_EXECUTION_ROUTE, async (req, res) => {
   const blocked = { schema: CURRENT_EXECUTION_SCHEMA, status: 'blocked', error: 'current_execution_unverified' };
   let body: unknown;
-  try { body = await readBoundedJsonBody(req, 1024, 1000); }
+  let rawBody: Buffer;
+  try { const parsed = await readBoundedJsonBodyWithRaw(req, 1024, 1000); body = parsed.body; rawBody = parsed.raw; }
   catch (error) {
     if (error instanceof IpcBodyTooLargeError || error instanceof IpcBodyTimeoutError) {
       closeUntrustedRequestAfterResponse(req, res);
@@ -1842,10 +1875,8 @@ ipcRoute('POST', CURRENT_EXECUTION_ROUTE, async (req, res) => {
   // Opt-in, so a CLI with the original strict key check never sees new keys.
   const fields = (body as Record<string, unknown>).fields;
   const includeOrigin = Array.isArray(fields) && fields.includes(CURRENT_EXECUTION_ORIGIN_FIELD);
-  const peer = await resolveLoopbackPeerProcesses({
-    remoteAddress: req.socket.remoteAddress, remotePort: req.socket.remotePort, localPort: req.socket.localPort,
-  });
-  if (!peer.ok) return jsonRes(res, 403, blocked);
+  const peer = await resolveProtectedExecutionPeer(req, rawBody, sessionId, 'current-execution', findActiveBySessionId);
+  if (!peer.ok || peer.current?.() === false) return jsonRes(res, 403, blocked);
   const document = resolveDaemonCurrentExecution(
     { sessionId, peer: peer.peer, findSession: findActiveBySessionId },
     { includeOrigin, includeCli: Array.isArray(fields) && fields.includes(CURRENT_EXECUTION_CLI_FIELD),
@@ -1926,7 +1957,8 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
   });
   const grantDeadline = Date.now() + GRANT_WAIT_CAP_MS;
   let body: unknown;
-  try { body = await readBoundedJsonBody(req, 1024, 1000); }
+  let rawBody: Buffer;
+  try { const parsed = await readBoundedJsonBodyWithRaw(req, 1024, 1000); body = parsed.body; rawBody = parsed.raw; }
   catch (error) {
     if (error instanceof IpcBodyTooLargeError || error instanceof IpcBodyTimeoutError) {
       closeUntrustedRequestAfterResponse(req, res);
@@ -1951,11 +1983,11 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
     return jsonRes(res, 400, blocked('invalid_request'));
   }
   const requestedAs = record?.as as string | undefined;
-  const peer = await resolveLoopbackPeerProcesses({
-    remoteAddress: req.socket.remoteAddress, remotePort: req.socket.remotePort, localPort: req.socket.localPort,
-  });
-  if (!peer.ok) {
-    logIdentityRouteRefusal(sessionId, tool, 'peer_unresolved', peer.reason);
+  const strictExport = () => tool !== 'lark-cli' && strictBytecloudExportRefused(sessionId);
+  if (strictExport()) return jsonRes(res, 403, blocked('broker_export_disabled'));
+  const peer = await resolveProtectedExecutionPeer(req, rawBody, sessionId, 'current-execution-identity', findActiveBySessionId);
+  if (!peer.ok || peer.current?.() === false) {
+    logIdentityRouteRefusal(sessionId, tool, 'peer_unresolved', peer.ok ? 'relay_stale' : peer.reason);
     return jsonRes(res, 403, blocked('peer_unresolved'));
   }
   let proofRefusal: string | undefined;
@@ -2020,6 +2052,7 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
     const originCapability = ds.managedTurnOrigin?.capability;
     const callerOpenId = ds.managedTurnOrigin?.callerOpenId;
     const executionStillCurrent = () => {
+      if (strictExport()) return false;
       const origin = ds.managedTurnOrigin;
       if (findActiveBySessionId(sessionId) !== ds || ds.worker !== worker || !worker
         || worker.killed || worker.connected === false || ds.workerGeneration !== document.workerGeneration
@@ -2043,6 +2076,7 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
       // treats a throwing reader as a refusal to publish.
       currentPolicy,
     });
+    if (strictExport()) return jsonRes(res, 403, blocked('broker_export_disabled'));
     let env = recallProvenIdentityContent(config.session.dataDir, sessionId, speakerTurnId, tool);
     if (!env) {
       // The turn's identity may still be on its way (a new session's opening
@@ -2099,6 +2133,7 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
           message: `${hint}\n${reasonTag(consent ? 'platform_consent_missing' : 'platform_not_authorized')}` });
       }
     }
+    if (strictExport() || !executionStillCurrent()) return jsonRes(res, 403, blocked('broker_export_disabled'));
     if (env) {
       return jsonRes(res, 200, {
         schema: CURRENT_EXECUTION_IDENTITY_SCHEMA, status: 'verified',
@@ -2109,6 +2144,7 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
     const detachedFromLive = requestedAs !== undefined ? null : await resolveDetachedScheduledExecutionIdentity({
       sessionDataDir: config.session.dataDir, sessionId, tool, peer: peer.peer,
     });
+    if (strictExport()) return jsonRes(res, 403, blocked('broker_export_disabled'));
     if (detachedFromLive) {
       return jsonRes(res, 200, {
         schema: CURRENT_EXECUTION_IDENTITY_SCHEMA, status: 'verified',
@@ -2127,6 +2163,7 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
   const detached = await resolveDetachedScheduledExecutionIdentity({
     sessionDataDir: config.session.dataDir, sessionId, tool, peer: peer.peer,
   });
+  if (strictExport()) return jsonRes(res, 403, blocked('broker_export_disabled'));
   if (detached) {
     return jsonRes(res, 200, {
       schema: CURRENT_EXECUTION_IDENTITY_SCHEMA, status: 'verified',
@@ -2175,8 +2212,10 @@ for (const route of [BACKGROUND_REGISTRATION_ROUTE, BACKGROUND_REVOKE_ROUTE]) {
 
 ipcRoute('POST', CURRENT_ACTOR_ROUTE, async (req, res) => {
   let body: { sessionId?: unknown; expectedScheduledTurnId?: unknown };
+  let rawBody: Buffer;
   try {
-    body = await readBoundedJsonBody(req, 1_024, 1_000);
+    const parsed = await readBoundedJsonBodyWithRaw<typeof body>(req, 1_024, 1_000);
+    body = parsed.body; rawBody = parsed.raw;
   } catch (err) {
     if (err instanceof IpcBodyTooLargeError || err instanceof IpcBodyTimeoutError) {
       closeUntrustedRequestAfterResponse(req, res);
@@ -2194,12 +2233,8 @@ ipcRoute('POST', CURRENT_ACTOR_ROUTE, async (req, res) => {
     && body.expectedScheduledTurnId.length <= 256
     ? body.expectedScheduledTurnId
     : undefined;
-  const peer = await resolveLoopbackPeerProcesses({
-    remoteAddress: req.socket.remoteAddress,
-    remotePort: req.socket.remotePort,
-    localPort: req.socket.localPort,
-  });
-  if (!sessionId || !peer.ok) {
+  const peer = await resolveProtectedExecutionPeer(req, rawBody, sessionId, 'current-actor', findActiveBySessionId);
+  if (!sessionId || !peer.ok || peer.current?.() === false) {
     return jsonRes(res, 403, {
       schema: 'botmux.current-actor.v2',
       status: 'blocked',
@@ -14664,9 +14699,18 @@ const TRIGGER_USER_AUTH_UI_EDITABLE_KEYS = new Set(['enabled', 'tools', 'legacyF
 // In that case preserve the saved source and delegation choice through the merge.
 
 ipcRoute('PUT', '/api/bot-trigger-user-auth', requireBoundBot(async (req, res) => {
-  let body: { triggerUserAuth?: unknown };
-  try { body = await readJsonBody<{ triggerUserAuth?: unknown }>(req); }
+  let body: { triggerUserAuth?: unknown; bytedcliOperationPreset?: unknown };
+  try { body = await readJsonBody<typeof body>(req); }
   catch { return jsonRes(res, 400, { error: 'invalid_json' }); }
+  if (body && Object.hasOwn(body, 'bytedcliOperationPreset')) {
+    if (Object.hasOwn(body, 'triggerUserAuth')) return jsonRes(res, 400, { ok: false, error: 'ambiguous_bytedcli_operation_preset' });
+    try {
+      const result = await applyPluginBytedcliOperationPreset(cachedLarkAppId, body.bytedcliOperationPreset);
+      if (result.ok) return jsonRes(res, 200, result);
+      const conflict = ['bytedcli_operation_preset_unavailable', 'bytedcli_operation_preset_changed'].includes(result.reason);
+      return jsonRes(res, conflict ? 409 : 400, { ok: false, error: result.reason });
+    } catch { return jsonRes(res, 500, { ok: false, error: 'bytedcli_operation_preset_apply_failed' }); }
+  }
   const spec = findConfigField('triggerUserAuth');
   if (!spec) return jsonRes(res, 500, { ok: false, error: 'field_unavailable' });
 
@@ -14824,9 +14868,19 @@ ipcRoute('GET', '/api/bot-trigger-user-auth-status', requireBoundBot(async (req,
     const user = openId
       ? await queryTriggerUserAuthStatus({ appId: cfg.larkAppId, brand, openId })
       : undefined;
+    // Plugin management can update bindings from another process. Use the
+    // committed membership without replacing the worker's other live settings.
+    let currentBindings: Pick<BotConfig, 'plugins'> = { plugins: [] };
+    if (getLoadedConfigProvenance() !== 'synthetic') {
+      const rawBots = await readRawConfig(requireConfigPath());
+      const botIndex = findEntryIndex(rawBots, cfg.larkAppId);
+      if (botIndex >= 0) currentBindings = { plugins: rawBots[botIndex].plugins };
+    }
     jsonRes(res, 200, {
       ok: true,
       policy,
+      bytedcliOperationPolicy: requestBytedcliBrokers.get(req)?.operationPolicyStatus(cfg.triggerUserAuth),
+      bytedcliOperationPresets: readPluginBytedcliOperationPresets(currentBindings),
       authorizedCount,
       credentialSource: credentialSourceOf(policy),
       credentialSources: {
@@ -15700,6 +15754,10 @@ export function startIpcServer(opts: {
    * deliberate secret repair cannot strand a daemon on a stale cached key.
    * Tests that omit this option retain the lightweight in-process server. */
   authRequired?: boolean;
+  /** Trusted embedding seam: never selected by request body or Agent env. */
+  bytedcliBroker?: BytedcliBroker;
+  /** Share the daemon-frozen layout with Task4 worker isolation. */
+  bytedcliHostLayout?: BytedcliHostLayout;
   /** Daemon restore barrier.  The socket/health route may come up early so its
    * descriptor is discoverable, but every state-bearing route waits until all
    * durable session owners have been registered. */
@@ -15730,7 +15788,15 @@ export function startIpcServer(opts: {
     },
   });
   let boundPort = opts.port;
+  const bytedcliBroker = opts.bytedcliBroker ?? createProductionBytedcliBroker({
+    daemonBootId: getDaemonBootId(), dataDir: config.session.dataDir, findSession: findActiveBySessionId,
+    policy: ds => getBot(ds.larkAppId).config.triggerUserAuth,
+    canTalk: (ds, openId, unionId) => canTalk(ds.larkAppId, ds.chatId, openId, undefined, unionId, ds.chatType),
+    identity: resolveVerifiedUserIdentity, unionIdentity: resolveVerifiedUserIdentityByUnionId,
+    schedule: (app, taskId) => scheduler.getScheduleAuthorityRecord(taskId, app),
+  }, opts.bytedcliHostLayout ? freezeBytedcliHostLayout(opts.bytedcliHostLayout) : undefined);
   const server: Server = createServer(async (req, res) => {
+    requestBytedcliBrokers.set(req, bytedcliBroker);
     try {
       const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
       const method = req.method ?? 'GET';
@@ -15843,17 +15909,17 @@ export function startIpcServer(opts: {
     // global fetch on a keep-alive connection, it stays open until the runtime
     // reclaims it about 6 s later, and close() waits all that time (node:http
     // clients, which every production loopback caller uses, do not leave it).
-    // Tests awaiting close() paid for that; the daemon's teardown does not await
-    // close() and exits explicitly, so shutdown itself was never held up.
-    // Closing every connection before the listener makes close() resolve at
-    // once. It also resets requests still in flight at that moment while their
-    // handlers run on — teardown callers already have to cope with that, since
-    // the daemon can exit mid-request. listen-with-probe's release path tears
-    // sockets down for the same reason.
-    close: () => new Promise<void>(r => {
+    // Daemon teardown awaits this close. Close connections before stopping the
+    // listener to avoid keep-alive delays, then cancel and join broker-owned
+    // provider/child cleanup even when an HTTP response has already finished.
+    // In-flight clients can see a reset while that owned cleanup settles.
+    retireBytedcliSession: (sessionId, generation) => bytedcliBroker.retireSession(sessionId, generation),
+    close: async () => {
       server.closeAllConnections?.();
-      server.close(() => r());
-    }),
+      const stopped = new Promise<void>(resolve => server.close(() => resolve()));
+      await bytedcliBroker.close();
+      await stopped;
+    },
   };
   });
 }

@@ -242,3 +242,18 @@ describe('bytedcli identity renewal', () => {
     expect(trackedBytedcliRenewalCount()).toBe(0);
   });
 });
+
+
+it('never exports an in-flight renewal after the strict fence is persisted', async () => {
+  const { persistBytedcliStrictSession } = await import('../src/core/bytedcli-strict-session.js');
+  publish(60, 60);
+  let release!: (value: any) => void;
+  renew.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+  const pending = renewExpiringBytedcliIdentities();
+  while (!release) await Promise.resolve();
+  persistBytedcliStrictSession(dir, SESSION);
+  release({ cloudJwt: 'late', codeJwt: 'late-code' });
+  expect(await pending).toBe(0);
+  expect(recallProvenIdentityContent(dir, SESSION, TURN, 'bytedcli')).toBeUndefined();
+  expect(trackedBytedcliRenewalCount()).toBe(0);
+});

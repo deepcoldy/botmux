@@ -10,10 +10,11 @@
  *
  * A trigger-user call uses the credentials of the current message's sender, or
  * the call is refused with an authorization entry. There is no downgrade to a
- * bot or machine identity, and falling back to *another person's* login is
+ * bot or machine identity for writes, and falling back to *another person's* login is
  * never allowed — not even the owner's. That is what the feature exists to
- * remove, so there is deliberately no config value that asks for it (the old
- * `fallback` field is parsed and ignored).
+ * remove (the old `fallback` field is parsed and ignored). The opt-in ByteCloud
+ * broker mode separately allows catalogued reads with host credentials while
+ * preserving that actor-only rule for writes.
  *
  * Why no owner exception: the moment one exists, "whose permissions ran this?"
  * loses its single answer, and every credential lookup grows a branch. Those
@@ -27,6 +28,7 @@
  * here: the CLI itself declares it.
  */
 import type { SandboxMode } from '../adapters/cli/sandbox-mode.js';
+import { parseBytedcliOperationPolicy, type BytedcliOperationPolicy } from '../core/bytedcli-operation-policy-config.js';
 
 /** Tools whose credentials botmux can inject per person. */
 export const TRIGGER_USER_AUTH_TOOLS = ['lark-cli', 'bytedcli'] as const;
@@ -59,6 +61,9 @@ export type TriggerUserAuthCredentialSourceConfig =
   | TriggerUserAuthCredentialSource
   | Partial<Record<'default' | TriggerUserAuthCredentialSourceCapability, TriggerUserAuthCredentialSource>>;
 
+export const BYTECLOUD_EXECUTION_MODES = ['trigger-user', 'read-machine-write-actor'] as const;
+export type BytecloudExecutionMode = typeof BYTECLOUD_EXECUTION_MODES[number];
+
 /**
  * Per-bot capability switches. Each is either native (off: the CLI runs with
  * this machine's own login, untouched) or trigger-user (on: the message
@@ -83,6 +88,12 @@ export interface TriggerUserAuthConfig {
    *  it; it is optional on the type only so hand-built configs (tests, legacy
    *  callers) keep compiling — read it through {@link credentialSourceOf}. */
   credentialSource?: TriggerUserAuthCredentialSourceConfig;
+  /** Absent retains the legacy whole-capability actor identity. The broker
+   * mode is effective only while ByteCloud and this policy are enabled. */
+  bytecloudExecution?: BytecloudExecutionMode;
+  /** Valid operation rules remain stored while disabled or in legacy modes.
+   * Only the enabled ByteCloud broker applies them. Explicit null clears. */
+  bytedcliOperationPolicy?: BytedcliOperationPolicy;
   /** The legacy `fallback` value as stored. Never acted on; it only keeps the
    *  background-job policy key of an unedited config what it was. */
   legacyFallback?: 'bot-identity' | 'none';
@@ -256,6 +267,8 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
   }
 
   const credentialSource = parseCredentialSource(rec.credentialSource);
+  const bytecloudExecution = parseBytecloudExecution(rec.bytecloudExecution);
+  const bytedcliOperationPolicy = parseBytedcliOperationPolicy(rec.bytedcliOperationPolicy);
 
   if (rec.delegateOnMention !== undefined && rec.delegateOnMention !== null
     && typeof rec.delegateOnMention !== 'boolean') {
@@ -280,34 +293,31 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
   );
 
   let dispatchOnly: TriggerUserAuthConfig['dispatchOnly'];
-  // dispatchOnly only takes effect while the policy is enabled, so a disabled
-  // policy accepts and drops the field instead of validating it. Flipping
-  // `enabled` to false by hand is a natural kill switch; rejecting the load
-  // here would make that one bot's edit fail the whole bots.json and take
-  // every other bot in the file down on the next daemon start. Re-enabling
-  // re-runs this parser, so a malformed scope is still refused before it can
-  // ever govern a dispatch.
-  if (rec.dispatchOnly !== undefined && enabled) {
-    if (typeof rec.dispatchOnly !== 'object' || rec.dispatchOnly === null
-      || Array.isArray(rec.dispatchOnly)) {
-      throw new TriggerUserAuthConfigError('triggerUserAuth.dispatchOnly requires an object');
-    }
-    const entry = rec.dispatchOnly as Record<string, unknown>;
-    const identifiers = (key: 'targetAppIds' | 'chatIds', pattern: RegExp): string[] => {
-      const value = entry[key];
-      if (!Array.isArray(value) || value.length === 0 || value.some(id => typeof id !== 'string' || !pattern.test(id))) {
-        throw new TriggerUserAuthConfigError(`triggerUserAuth.dispatchOnly.${key} must contain valid IDs`);
+  // Disabled policies keep valid scopes for a reversible UI toggle. A malformed
+  // dormant scope still cannot prevent an emergency disable; enabling validates it.
+  if (rec.dispatchOnly !== undefined) {
+    try {
+      if (typeof rec.dispatchOnly !== 'object' || rec.dispatchOnly === null
+        || Array.isArray(rec.dispatchOnly)) {
+        throw new TriggerUserAuthConfigError('triggerUserAuth.dispatchOnly requires an object');
       }
-      return [...new Set(value as string[])];
-    };
-    if (!Array.isArray(entry.tools) || entry.tools.length === 0 || entry.tools.some(tool => !isTool(tool))) {
-      throw new TriggerUserAuthConfigError('triggerUserAuth.dispatchOnly.tools must contain supported tools');
-    }
-    dispatchOnly = {
-      tools: [...new Set(entry.tools as TriggerUserAuthTool[])],
-      targetAppIds: identifiers('targetAppIds', /^cli_[A-Za-z0-9_-]{1,128}$/),
-      chatIds: identifiers('chatIds', /^oc_[A-Za-z0-9_-]{1,128}$/),
-    };
+      const entry = rec.dispatchOnly as Record<string, unknown>;
+      const identifiers = (key: 'targetAppIds' | 'chatIds', pattern: RegExp): string[] => {
+        const value = entry[key];
+        if (!Array.isArray(value) || value.length === 0 || value.some(id => typeof id !== 'string' || !pattern.test(id))) {
+          throw new TriggerUserAuthConfigError(`triggerUserAuth.dispatchOnly.${key} must contain valid IDs`);
+        }
+        return [...new Set(value as string[])];
+      };
+      if (!Array.isArray(entry.tools) || entry.tools.length === 0 || entry.tools.some(tool => !isTool(tool))) {
+        throw new TriggerUserAuthConfigError('triggerUserAuth.dispatchOnly.tools must contain supported tools');
+      }
+      dispatchOnly = {
+        tools: [...new Set(entry.tools as TriggerUserAuthTool[])],
+        targetAppIds: identifiers('targetAppIds', /^cli_[A-Za-z0-9_-]{1,128}$/),
+        chatIds: identifiers('chatIds', /^oc_[A-Za-z0-9_-]{1,128}$/),
+      };
+    } catch (error) { if (enabled) throw error; }
   }
 
   return {
@@ -315,6 +325,8 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
     tools,
     ...(capabilities ? { capabilities } : {}),
     credentialSource,
+    ...(bytecloudExecution !== undefined ? { bytecloudExecution } : {}),
+    ...(bytedcliOperationPolicy !== undefined ? { bytedcliOperationPolicy } : {}),
     ...(rec.fallback === 'none' || rec.fallback === 'bot-identity' ? { legacyFallback: rec.fallback } : {}),
     // Equal to the default → not stored.
     ...(rec.delegateOnMention === false ? { delegateOnMention: false } : {}),
@@ -325,6 +337,14 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
     ...(gitHost ? { gitHost } : {}),
     ...(gitTokenExchangeUrl ? { gitTokenExchangeUrl } : {}),
   };
+}
+
+function parseBytecloudExecution(value: unknown): BytecloudExecutionMode | undefined {
+  if (value === undefined) return undefined;
+  if (!(BYTECLOUD_EXECUTION_MODES as readonly unknown[]).includes(value)) {
+    throw new TriggerUserAuthConfigError('triggerUserAuth.bytecloudExecution must be trigger-user | read-machine-write-actor');
+  }
+  return value as BytecloudExecutionMode;
 }
 
 /** Restrict dispatch-only credentials to a direct human or an already verified

@@ -1,3 +1,8 @@
+import { canonicalPathNearest } from './cli-identity.js';
+import { freezeBytedcliHostLayout } from './bytedcli-host-layout.js';
+import { bytecloudExportBlocked, persistBytedcliStrictSession, bytedcliStrictMarkerRoot } from './bytedcli-strict-session.js';
+import { markBytedcliStrictSession, acceptBytedcliWorkerContainment } from './bytedcli-broker-containment.js';
+import { bytedcliWorkerRetirementPending, deferBytedcliWorkerRetirement } from './bytedcli-worker-retirement.js';
 import { NATIVE_GATEWAY_CORE_CREDENTIAL_ENV } from './native-gateway-credential.js';
 import { rememberCoreOnlyGoal, rememberCoreOnlyLimit } from './core-only-progress.js';
 import { ensureClaudeFolderTrust } from './claude-folder-trust.js';
@@ -126,7 +131,7 @@ import { sandboxBoolValue, normalizeScratchStorage, frozenSessionSandboxMode, se
  * Extracted from daemon.ts for modularity.
  */
 import { execSync, type ChildProcess } from 'node:child_process';
-import { join, dirname, basename } from 'node:path';
+import { join, dirname, basename, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { installCursorUsageHook } from '../services/cursor-usage-hook.js';
 import { statSync, lstatSync, readFileSync, readdirSync, mkdirSync, existsSync, realpathSync, unlinkSync } from 'node:fs';
@@ -1683,6 +1688,12 @@ export interface WorkerPoolCallbacks {
    * marked closed. Its in-memory queued work must be retired before any same-key
    * replacement can become ready. Notifications remain the callback's job. */
   onSessionRetired?: (ds: DaemonSession) => void;
+  /** A strict replacement must finish retiring this exact old broker generation
+   * before its deferred successor may spawn. */
+  onWorkerGenerationRetired?: (
+    session: Session,
+    context: { workerGeneration: number },
+  ) => void | Promise<void>;
   /** Runs only after closeSession has durably closed the row and the exact
    * worker-exit fence has proved that generation can no longer write. Narrow
    * XPI shared-cwd coordinator migration is performed here, never by a hot
@@ -2254,13 +2265,16 @@ export function recordWorkerIdentityDecision(
   ds: DaemonSession,
   worker: ChildProcess,
   workerGeneration: number,
-  report: { model: IdentityStorageModel; sandboxEngaged: boolean; loopbackShared: boolean; cliExecution?: WorkerCliExecution },
+  report: { model: IdentityStorageModel; sandboxEngaged: boolean; loopbackShared: boolean; attestedLoopback?: boolean; cliExecution?: WorkerCliExecution },
 ): { model: IdentityStorageModel; flipped: boolean } {
   let conflict: string | undefined;
   if (report.model !== 'single' && report.model !== 'proven') {
     conflict = `malformed identity model report: ${String(report.model)}`;
   } else if (typeof report.sandboxEngaged !== 'boolean' || typeof report.loopbackShared !== 'boolean') {
     conflict = 'malformed identity decision report: spawn facts are not booleans';
+  } else if (report.attestedLoopback === true && (!ds.initConfig?.bytedcliContainment || !ds.initConfig.protectedHttpEgressPolicy
+    || ds.protectedLoopbackProxyAttestation?.workerGeneration !== workerGeneration)) {
+    conflict = 'worker reported an attested relay without a frozen protected execution contract';
   } else if (report.model === 'proven' && !provenStructurallyPossible(ds)) {
     conflict = 'worker reported the proven identity model for a session that structurally cannot run proven';
   }
@@ -2274,6 +2288,7 @@ export function recordWorkerIdentityDecision(
     model,
     sandboxEngaged: report.sandboxEngaged === true,
     loopbackShared: report.loopbackShared === true,
+    attestedLoopback: report.attestedLoopback === true,
     workerPid: worker.pid ?? -1,
     workerGeneration,
     reportedAt: Date.now(),
@@ -16618,6 +16633,7 @@ type TransferInputGate = {
   /** Preserve the caller's test/production fork seam for delayed recovery. */
   forkWorkerImpl?: typeof forkWorker;
   flushing: boolean;
+  replacementPending?: boolean;
   settledCallbacks: Set<() => void>;
 };
 
@@ -17484,11 +17500,31 @@ function forkTransferReplacement(
   ds: DaemonSession,
   forkWorkerImpl: typeof forkWorker,
 ): void {
+  const gate = transferInputGates.get(ds);
+  let deferred = false;
   transferReplacementForkBypass.add(ds);
   try {
-    forkWorkerImpl(ds, '', true);
+    forkWorkerImpl(ds, '', true, {
+      onAdmission: admission => {
+        if (admission === 'deferred') {
+          deferred = true;
+          if (gate) gate.replacementPending = true;
+          return;
+        }
+        transferReplacementForkBypass.delete(ds);
+        if (gate) gate.replacementPending = false;
+        if (admission === 'accepted' && gate && transferInputGates.get(ds) === gate) {
+          queueMicrotask(() => {
+            if (transferInputGates.get(ds) === gate) releaseTransferInputGate(ds, gate, forkWorkerImpl);
+          });
+        } else if (gate) gate.needsWorker = true;
+      },
+    });
   } finally {
-    transferReplacementForkBypass.delete(ds);
+    if (!deferred) {
+      transferReplacementForkBypass.delete(ds);
+      if (gate) gate.replacementPending = false;
+    }
   }
 }
 
@@ -18017,7 +18053,7 @@ function releaseTransferInputGate(
   gate.released = true;
   gate.forkWorkerImpl = forkWorkerImpl;
   const flush = (): void => {
-    if (transferInputGates.get(ds) !== gate) return;
+    if (transferInputGates.get(ds) !== gate || gate.replacementPending) return;
     if (gate.flushing) return;
     gate.flushing = true;
     try {
@@ -21345,6 +21381,9 @@ export type ForkWorkerOptions = {
    * its backend exits before publishing the rebuilt backend state. */
   onRemoteBackendStartupExit?: () => boolean | Promise<boolean>;
   deferDuringDeviceIsolation?: boolean;
+  /** Internal: a strict replacement already reserved this successor generation
+   * before retiring the old broker generation. Never set from callers. */
+  bytedcliPreparedWorkerGeneration?: number;
   /**
    * Restore re-attach to a backing session probed alive: its CLI is already
    * running and will not be respawned, so a deleted working directory does not
@@ -21785,6 +21824,11 @@ export function forkWorker(
     opts.onAdmission?.('rejected');
     return false;
   }
+  if (opts.bytedcliPreparedWorkerGeneration !== undefined
+    && opts.bytedcliPreparedWorkerGeneration !== ds.workerGeneration) {
+    opts.onAdmission?.('rejected');
+    return true;
+  }
   // Preserve the original first external fork boundary before asynchronous DNS
   // freezing. Device activation must be able to defer a spawn without reading
   // live Bot/plugin configuration or starting any resolver work. The prepared
@@ -21797,7 +21841,7 @@ export function forkWorker(
   }
   if (deferWorkerSpawnDuringDeviceIsolation(ds.session.sessionId, () => {
     if (findActiveBySessionId(ds.session.sessionId) === ds) {
-      forkWorker(ds, promptInput, resumeOrTurnId, { memoryNoticeAudience: opts.memoryNoticeAudience });
+      forkWorker(ds, promptInput, resumeOrTurnId, opts);
     }
   })) {
     logger.info(`[${tag(ds)}] worker spawn deferred during device credential activation`);
@@ -21806,6 +21850,55 @@ export function forkWorker(
   }
 
   const bot = getBot(ds.larkAppId);
+  const previousGeneration = ds.workerGeneration;
+  const strictReplacement = ds.session.bytecloudBrokerStrict === true || ds.initConfig?.bytedcliContainment !== undefined;
+  if (opts.bytedcliPreparedWorkerGeneration === undefined && strictReplacement && previousGeneration) {
+    if (bytedcliWorkerRetirementPending(ds.session.sessionId)) {
+      logger.info(`[${tag(ds)}] worker spawn refused while an earlier broker retirement is pending`);
+      opts.onAdmission?.('rejected');
+      return true;
+    }
+    const onWorkerGenerationRetired = requireCallbacks().onWorkerGenerationRetired;
+    if (onWorkerGenerationRetired) {
+      const preparedWorkerGeneration = reserveWorkerGeneration(ds);
+      if (deferBytedcliWorkerRetirement({
+        sessionId: ds.session.sessionId,
+        workerGeneration: previousGeneration,
+        strict: true,
+        retire: () => onWorkerGenerationRetired(ds.session, { workerGeneration: previousGeneration }),
+        continue: () => {
+          if (findActiveBySessionId(ds.session.sessionId) === ds) {
+            forkWorker(ds, promptInput, resumeOrTurnId, { ...opts, bytedcliPreparedWorkerGeneration: preparedWorkerGeneration });
+          } else {
+            opts.onAdmission?.('rejected');
+          }
+        },
+        fail: error => {
+          const reason = `ByteCloud broker generation retirement failed: ${error instanceof Error ? error.message : String(error)}`;
+          logger.error(`[${tag(ds)}] ${reason}`);
+          const { turnId, dispatchAttempt } = protectedHttpEgressForkTurn(resumeOrTurnId);
+          publishWorkerStartupDiagnostic(ds, sessionCliDisplayName(ds, bot.config), reason, turnId, dispatchAttempt, opts);
+          opts.onAdmission?.('rejected');
+        },
+      })) {
+        opts.onAdmission?.('deferred');
+        return true;
+      }
+    }
+  }
+  if (ds.session.bytecloudBrokerStrict || bytecloudExportBlocked(config.session.dataDir, ds.session.sessionId, bot.config.triggerUserAuth)) {
+    persistBytedcliStrictSession(config.session.dataDir, ds.session.sessionId);
+    markBytedcliStrictSession(ds);
+    if (!ds.session.bytecloudBrokerColdStart && (ds.session.workerGeneration || ds.session.cliSessionId || ds.session.adoptedFrom)) {
+      sessionStore.updateSession(ds.session);
+      throw new Error('ByteCloud strict mode cannot reuse a previously credential-exposed session; create a new session');
+    }
+    ds.session.bytecloudBrokerColdStart = true;
+    sessionStore.updateSession(ds.session);
+    if (ds.worker && !ds.worker.killed && !ds.initConfig?.bytedcliContainment) {
+      throw new Error('ByteCloud strict mode refuses a previously credential-exposed worker; close it and start a fresh session');
+    }
+  }
   let pending = pendingProtectedHttpEgressForks.get(ds.session.sessionId);
   if (pending?.abortCleanupPending) {
     const cleanupRetried = pending.retryAbortCleanup?.() === true;
@@ -22240,7 +22333,7 @@ function forkWorkerPrepared(
     if (findActiveBySessionId(ds.session.sessionId) === ds) {
       // Deliberately do not replay opts.deploymentContinuation: a deferred
       // device-isolation spawn cannot carry an earlier claim into a new owner.
-      forkWorker(ds, promptInput, resumeOrTurnId, { memoryNoticeAudience: opts.memoryNoticeAudience });
+      forkWorker(ds, promptInput, resumeOrTurnId, opts);
     }
   })) {
     logger.info(`[${tag(ds)}] worker spawn deferred during device credential activation`);
@@ -22947,7 +23040,18 @@ function forkWorkerPrepared(
   // Reserve and durably publish the replacement lifetime before killing an
   // existing worker. A failed reservation leaves the old worker untouched;
   // a successful reservation immediately invalidates any late old-worker ACK.
-  const workerGeneration = reserveWorkerGeneration(ds);
+  // Strict retirement already reserved this generation before its async cleanup.
+  const workerGeneration = opts.bytedcliPreparedWorkerGeneration ?? reserveWorkerGeneration(ds);
+  const bytedcliLayout = ds.session.bytecloudBrokerStrict ? freezeBytedcliHostLayout() : undefined;
+  const bytedcliContainment = bytedcliLayout ? {
+    workerGeneration,
+    hostReadOnlyMcpTools: readGlobalConfig().bytedcliBroker?.hostReadOnlyMcpTools ?? {},
+    credentialRoots: [...bytedcliLayout.credentialRoots, bytedcliStrictMarkerRoot(config.session.dataDir),
+      ...(getLoadedConfigPath() ? [getLoadedConfigPath()!] : [])],
+    executableReadOnlyRoots: [...new Set([...bytedcliLayout.executableReadOnlyRoots, process.execPath, dirname(process.execPath),
+      ...(isStandaloneBinary() ? [] : [resolve(__dirname, '../..'), resolve(__dirname, '../../node_modules')])]
+      .flatMap(path => [path, canonicalPathNearest(path)]))],
+  } : undefined;
   const protectedLoopbackProxyAttestation = protectedHttpEgressPolicy
     ? { secret: randomBytes(32).toString('hex'), workerGeneration }
     : undefined;
@@ -23457,6 +23561,7 @@ function forkWorkerPrepared(
     // Trigger-user CLI auth: the worker needs the policy to know which tools to
     // wrap at spawn. Absent → the worker installs nothing and PATH is untouched.
     ...(botCfg.triggerUserAuth ? { triggerUserAuth: botCfg.triggerUserAuth } : {}),
+    ...(bytedcliContainment ? { bytedcliContainment } : {}),
     larkToolBinding: botCfg.larkToolBinding !== false,
     // Startup commands run on every fresh spawn (incl. resume) so session-only
     // settings like `/effort ultracode` are re-established. Adopt sessions are
@@ -26756,6 +26861,12 @@ function setupWorkerHandlers(
           break;
         }
         acknowledgeSessionReady(msg.requestId);
+        break;
+      }
+      case 'bytedcli_containment': {
+        if (!acceptBytedcliWorkerContainment(ds, worker, workerGeneration, msg.report)) {
+          logger.warn(`[${t}] Refused stale or unverified ByteCloud containment report`);
+        }
         break;
       }
       case 'local_process_attestation': {
@@ -32335,6 +32446,7 @@ function setupWorkerHandlers(
           model: msg.model,
           sandboxEngaged: msg.sandboxEngaged,
           loopbackShared: msg.loopbackShared,
+          attestedLoopback: msg.attestedLoopback,
           cliExecution: msg.cliExecution,
         });
         await cb.onIdentityDecision?.(ds, {
@@ -35897,6 +36009,7 @@ export function forkAdoptWorker(
     onIpcDispatchAttempted?: () => void;
   },
 ): 'accepted' | 'rejected' {
+  if (ds.session.bytecloudBrokerStrict || bytecloudExportBlocked(config.session.dataDir, ds.session.sessionId, getBot(ds.larkAppId).config.triggerUserAuth)) return 'rejected';
   if (ds.session.cliInstanceBinding) throw new Error('External adoption cannot carry a Codex instance binding');
   if (isSessionTransferring(ds)) {
     logger.warn(`[${tag(ds)}] Adopt worker fork refused during routing transfer`);

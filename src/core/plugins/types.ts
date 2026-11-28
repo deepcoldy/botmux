@@ -1,4 +1,5 @@
 import type { ProtectedHttpEgressPolicy } from '../protected-http-egress.js';
+import type { PluginBytedcliOperationPresetsContribution } from './bytedcli-operation-presets-protocol.js';
 
 export type PluginRuntime = 'cli' | 'service';
 export type PluginServiceMode = 'manual' | 'auto';
@@ -109,6 +110,7 @@ export interface PluginWebhooksContribution {
 }
 
 export interface PluginContributions {
+  bytedcliOperationPresets?: PluginBytedcliOperationPresetsContribution;
   skills?: PluginSkillEntry[];
   dashboard?: PluginDashboardEntry[];
   mcp?: PluginMcpContribution;

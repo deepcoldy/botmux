@@ -38,6 +38,9 @@ export interface FsRule {
 }
 
 export interface FsPolicy {
+  /** Strict protected roots retained for kernel launch validation. */
+  protectedDenyPaths?: readonly string[];
+  protectedReadOnlyPaths?: readonly string[];
   /** Deduped rules sorted shallow→deep (emission order = precedence order). */
   rules: FsRule[];
   /** Keep network egress (bwrap-only knob; Seatbelt does not confine net here). */
@@ -172,6 +175,10 @@ export interface FsPolicyContext {
   /** Host-only authority roots. Every allow path at or below one of these is
    *  suppressed before longest-prefix merging, then the root is denied. */
   hostOnlyDenyPaths?: readonly string[];
+  /** Strict credential ceilings: no descendant allow from ANY source survives. */
+  protectedDenyPaths?: readonly string[];
+  /** Trusted executable ceilings: descendants can never acquire write access. */
+  protectedReadOnlyPaths?: readonly string[];
   mandatoryDenyRegexes?: readonly string[];
   mandatoryReadOnlyPaths?: readonly string[];
   net?: boolean;
@@ -193,6 +200,8 @@ export interface FsPolicyContext {
   /** Worker-verified managed tool binding. Grants only this session's read-only
    * wrapper/binding subtree; never the bot keystore or chat transport. */
   larkToolIdentityEnabled?: boolean;
+  /** Host-proven cold ByteCLI broker: command code only, even without IM transport. */
+  bytedcliBrokerEnabled?: boolean;
   /** The SECOND botmux root to deny (transport sessions: as the botmux-root
    *  ceiling; no-transport: as an authority root), when the
    *  daemon runs with a custom SESSION_DATA_DIR so `configuredBotmuxHome`
@@ -710,14 +719,27 @@ export function computeNoTransportAuthorityRoots(input: {
  */
 export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   const candidates: FsRule[] = [];
+  // A strict trusted installation cannot be developed in-place. Its non-code
+  // secrets stay host-only even when cwd lies inside it; deeper grants cannot
+  // inherit the legacy checkout-development exception below.
+  const strictInstallRoot = ctx.botmuxInstallRoot && normalizeFsPath(ctx.botmuxInstallRoot);
+  const strictInstallMasks = strictInstallRoot && (ctx.protectedReadOnlyPaths ?? []).some(root => {
+    const normalized = normalizeFsPath(root);
+    return normalized !== null && coversPath(normalized, strictInstallRoot);
+  }) ? (ctx.botmuxInstallRootMaskPaths ?? []).filter(path => {
+    const normalized = normalizeFsPath(path);
+    return normalized !== null && normalized !== strictInstallRoot && coversPath(strictInstallRoot, normalized);
+  }) : [];
   const defaultHomeNorm = ctx.defaultBotmuxHome ? normalizeFsPath(ctx.defaultBotmuxHome) : null;
   const hostOnlyDataDirs = [...new Set([
     normalizeFsPath(ctx.sessionDataDir),
     ...(defaultHomeNorm ? [defaultHomeNorm === '/' ? '/data' : `${defaultHomeNorm}/data`] : []),
   ].filter((p): p is string => p !== null))];
   const hostOnlyRoots = [...new Set([
-    ...hostOnlyDataDirs.flatMap(dir => [`${dir}/link-refs`, `${dir}/session-turns`]),
+    ...hostOnlyDataDirs.flatMap(dir => [`${dir}/link-refs`, `${dir}/session-turns`, `${dir}/bytedcli-strict`]),
     ...(ctx.hostOnlyDenyPaths ?? []),
+    ...(ctx.protectedDenyPaths ?? []),
+    ...strictInstallMasks,
   ]
     .map(normalizeFsPath)
     .filter((p): p is string => p !== null))];
@@ -1025,6 +1047,12 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     push([`${identity}/lark-cli`, `${identity}/shell`,
       `${identity}/.data/lark-tool-binding.json`, `${identity}/.data/lark-config`], 'readOnly', 'internal');
   }
+  if (ctx.sessionId && !larkTransport && ctx.bytedcliBrokerEnabled === true) {
+    const identity = `${ctx.sessionDataDir}/cli-identity/${ctx.sessionId}.bin`;
+    // These frozen wrappers carry routing hints only. Grant individual files:
+    // a legacy identity directory may still contain private user env files.
+    push(['bytedcli','codebase','bitscli','bits-cli'].map(command => `${identity}/${command}`), 'readOnly', 'internal');
+  }
   // Own per-bot lark-cli config (agent-facing lark-cli identity). Withheld from
   // a no-transport turn — it IS this bot's Feishu credential surface.
   if (larkTransport) push([`${ctx.homeDir}/.lark-cli-bots/${ctx.currentAppId}`], 'readWrite', 'internal');
@@ -1308,9 +1336,23 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
 
   // Deepest-prefix grants inside a withheld keystore must not survive at all:
   // otherwise a sibling/token/future-file grant would beat the mandatory parent.
-  const rules = mergeFsRules(candidates).filter(rule =>
+  const readonlyCeilings = (ctx.protectedReadOnlyPaths ?? []).map(path => {
+    const normalized = normalizeFsPath(path);
+    if (!normalized) throw new Error('invalid protected read-only root');
+    return normalized;
+  });
+  if ((ctx.protectedDenyPaths ?? []).some(path => !normalizeFsPath(path))) throw new Error('invalid protected credential root');
+  // A RW ancestor can rename a directory containing a protected mount and
+  // replace the host pathname used by a future worker/credential lookup.
+  // Cap that ancestor too; explicit unrelated sibling grants remain writable.
+  const protectedAncestors = [...readonlyCeilings, ...(ctx.protectedDenyPaths ?? []).map(path => normalizeFsPath(path)!)];
+  push(readonlyCeilings, 'readOnly', 'mandatory');
+  const rules = mergeFsRules(candidates.map(rule => rule.access === 'readWrite'
+    && (readonlyCeilings.some(root => coversPath(root, rule.path))
+      || protectedAncestors.some(root => coversPath(rule.path, root)))
+    ? { ...rule, access: 'readOnly' as const } : rule)).filter(rule =>
     rule.access === 'deny'
-    || ![...withheldLarkStores].some(root => coversPath(root, rule.path)));
+    || ![...withheldLarkStores, ...hostOnlyRoots].some(root => coversPath(root, rule.path)));
 
   // Post-merge self-check for the loaded bots-config (codex P1). Being inside a
   // frozen authority root is necessary but NOT sufficient: this is a white-in-black
@@ -1345,6 +1387,8 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
 
   return {
     rules,
+    protectedDenyPaths: ctx.protectedDenyPaths,
+    protectedReadOnlyPaths: ctx.protectedReadOnlyPaths,
     net: ctx.net !== false,
     ...(ctx.withholdSendCredential ? { hideHostProcessInfo: true } : {}),
     ...(ctx.withholdSendCredential
@@ -1594,6 +1638,10 @@ export function relocateSymlinkedBaselineRules(
 }
 
 export interface CompileBwrapOpts {
+  /** Private directory views for missing strict masks. The worker enumerates
+   * existing children, without reading file contents; no host mountpoint is
+   * needed for a missing descendant. Only read-only rules may project. */
+  directoryProjections?: ReadonlyMap<string, readonly { name: string; symlinkTarget?: string }[]>;
   /** Top-level symlinks to replicate inside the tmpfs root (usrmerge /bin →
    *  usr/bin etc.). Resolved by the worker (impure readlink). */
   symlinks?: readonly { path: string; target: string }[];
@@ -1642,7 +1690,9 @@ export interface BwrapCompilation {
    *  which is exactly what closes the "host/other process creates the secret
    *  mid-session" TOCTOU. Mountpoints the worker itself had to create (didn't
    *  pre-exist) are removed at teardown IFF still empty (never a recursive rm —
-   *  content written by the host/a concurrent process is preserved). */
+   *  content written by the host/a concurrent process is preserved). Strict
+   *  directory projections instead materialize missing targets only in the
+   *  namespace; the worker excludes those from host creation/cleanup. */
   maskMounts: { path: string; kind: 'dir' | 'file' }[];
 }
 
@@ -1734,7 +1784,19 @@ export function compileToBwrap(policy: FsPolicy, opts: CompileBwrapOpts): BwrapC
       }
       continue;
     }
-    a.push(r.access === 'readWrite' ? '--bind' : '--ro-bind', r.path, r.path);
+    const projection = opts.directoryProjections?.get(r.path);
+    if (projection) {
+      if (r.access !== 'readOnly') throw new Error('private deny projection requires a read-only parent');
+      a.push('--tmpfs', r.path);
+      for (const child of projection) {
+        const path = `${r.path === '/' ? '' : r.path}/${child.name}`;
+        if (child.symlinkTarget !== undefined) a.push('--symlink', child.symlinkTarget, path);
+        else a.push('--ro-bind', path, path);
+      }
+      remountRo.push(r.path);
+    } else {
+      a.push(r.access === 'readWrite' ? '--bind' : '--ro-bind', r.path, r.path);
+    }
     exposed.push(r.path);
   }
   // Re-seal white-in-black deny masks read-only AFTER their nested carve-out

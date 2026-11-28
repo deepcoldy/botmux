@@ -261,6 +261,11 @@ export class WorkerSessionEventScope {
     const state = execution ? this.admissionStates.get(execution.executionId) : undefined;
     return !!state && ['succeeded', 'failed', 'cancelled'].includes(state.phase);
   }
+  isExecutionActive(turnId: string, dispatchAttempt?: number): boolean {
+    const execution = this.executionForTurn(turnId, dispatchAttempt);
+    const state = execution ? this.admissionStates.get(execution.executionId) : undefined;
+    return !!state && ['submitting', 'accepted', 'running'].includes(state.phase);
+  }
   bindingForRuntime(runtime: RuntimeRef): RuntimeEventBinding | undefined {
     return [...this.bindings.values()].find(binding => binding.runtime?.runtimeId === runtime.runtimeId && binding.runtime.epoch === runtime.epoch);
   }

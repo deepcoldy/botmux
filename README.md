@@ -77,6 +77,7 @@ botmux start
 
 ## 更多能力与文档
 
+- **ByteCloud 读写身份分离**：已审计读取默认用机器账号，写入和未登记业务命令默认用当前执行人的个人授权；支持通过配置指定机器身份例外，适用于受支持的 Linux 隔离会话。详见[使用说明](docs/bytedcli-read-write-identity.md)。
 - **完整新手路径**：[文档首页](https://deepcoldy.github.io/botmux/) · [快速上手](https://deepcoldy.github.io/botmux/quickstart) · [常见问题](https://deepcoldy.github.io/botmux/faq)
 - **更多协作方式**：[多话题并行](https://deepcoldy.github.io/botmux/multi-topic) · [角色与团队](https://deepcoldy.github.io/botmux/roles) · [多人独立会话](https://deepcoldy.github.io/botmux/global-settings#xpi) · [语音总结](https://deepcoldy.github.io/botmux/voice)
 - **支持的 AI 工具**：已适配包括本地 NCA、AtomCode 在内的 30+ CLI / Agent。[查看完整列表与配置](https://deepcoldy.github.io/botmux/adapters)。

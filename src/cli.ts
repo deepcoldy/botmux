@@ -22860,6 +22860,9 @@ if (__entrySubcommand) {
     await import('./lark-tool-runner.js');
     process.exit(process.exitCode ?? 0);
   }
+  else if (__entrySubcommand === 'bytedcli-exec-runner') {
+    process.exit(await (await import('./cli/bytedcli-exec.js')).runBytedcliExecEntry(process.argv.slice(3)));
+  }
   else if (__entrySubcommand === 'cli-identity-runner') {
     await import('./cli-identity-runner.js');
     process.exit(process.exitCode ?? 0);

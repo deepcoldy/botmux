@@ -1,3 +1,6 @@
+import { loopbackFetchImpl } from '../src/core/loopback-fetch.js';
+import { bytedcliLoopbackServices } from '../src/core/bytedcli-protected-loopback.js';
+import { larkToolLoopbackService } from '../src/core/lark-tool-binding.js';
 import { afterEach, describe, expect, it } from 'vitest';
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer as createHttpServer, request as httpRequest } from 'node:http';
@@ -531,4 +534,34 @@ describe('protected HTTP loopback bridge', () => {
       attestProcessPeer: true,
     }]);
   });
+});
+
+it('routes Lark, ByteCloud and identity APIs on one private loopback listener without opening other paths', async () => {
+ const root=tempRoot();const services=[larkToolLoopbackService('session-a',17950),...bytedcliLoopbackServices(17950)];
+ const observed:string[]=[];
+ const host=await startSessionProtectedHttpEgressHost({sessionId:'session-a',dataDir:root,sharedRead:true,policy,policyDigest:protectedHttpEgressPolicyDigest(policy),frozenAddresses:[['192.0.2.10']],loopbackServices:services,
+ forwardLoopbackService:async(service,request)=>{observed.push(service.id);return {status:200,headers:{'content-type':'application/json'},body:Buffer.from(JSON.stringify({service:service.id,path:request.path}))};}});
+ cleanups.push(()=>host.close());
+ const plans=host.loopbackServices.map(service=>({socketPath:host.socketPath,serviceId:service.id,listenPort:0,method:service.method,path:service.path,forwardHeaders:service.forwardHeaders,attestProcessPeer:service.attestProcessPeer}));
+ const bridge=await startProtectedLocalServiceLoopbackBridge(plans);cleanups.push(()=>bridge.close());
+ for(const service of services){
+  const response=await loopbackFetchImpl(bridge.origin+service.path,{method:'POST',headers:{'content-type':'application/json',...(service.forwardHeaders.includes('x-botmux-lark-session')?{'x-botmux-lark-session':'fixture'}:{})},body:'{}'});
+  expect(response.status).toBe(200);expect(await response.json()).toEqual({service:service.id,path:service.path});
+ }
+ for(const path of ['/api/config','/api/bytedcli-exec?other=1','/api/current-execution/extra']){
+  expect((await loopbackFetchImpl(bridge.origin+path,{method:'POST',body:'{}'})).status).toBe(403);
+ }
+ expect(observed).toEqual(services.map(service=>service.id));
+ await expect(startProtectedLocalServiceLoopbackBridge([...plans,plans[0]!])).rejects.toThrow();
+});
+
+it('keeps the larger encoded ByteCloud response cap confined to its exact loopback service', async () => {
+ const {Readable}=await import('node:stream');const root=tempRoot();const size=16*1024*1024+512;
+ const services=bytedcliLoopbackServices(17950).filter(service=>['bytedcli-exec','current-execution'].includes(service.id));
+ const host=await startSessionProtectedHttpEgressHost({sessionId:'session-a',dataDir:root,sharedRead:true,policy,policyDigest:protectedHttpEgressPolicyDigest(policy),frozenAddresses:[['192.0.2.10']],loopbackServices:services,
+ forwardLoopbackService:async()=>({status:200,headers:{},body:Readable.from([Buffer.alloc(size,120)])})});cleanups.push(()=>host.close());
+ const bridge=await startProtectedLocalServiceLoopbackBridge(host.loopbackServices.map(service=>({socketPath:host.socketPath,serviceId:service.id,listenPort:0,method:service.method,path:service.path,forwardHeaders:service.forwardHeaders,attestProcessPeer:service.attestProcessPeer})));cleanups.push(()=>bridge.close());
+ const call=(path:string)=>loopbackFetchImpl(bridge.origin+path,{method:'POST',headers:{'content-type':'application/json'},body:'{}'});
+ const accepted=await call('/api/bytedcli-exec');expect((await accepted.arrayBuffer()).byteLength).toBe(size);
+ const denied=await call('/api/current-execution');expect(denied.status).toBe(502);expect((await denied.arrayBuffer()).byteLength).toBeLessThan(1024);
 });

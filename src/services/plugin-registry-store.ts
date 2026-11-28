@@ -241,6 +241,32 @@ export function readPluginRegistry(): PluginRegistryFile {
   }
 }
 
+export interface PluginBytedcliPresetRegistry {
+  plugins: Record<string, {
+    id: unknown;
+    version: unknown;
+    manifest?: { id: unknown };
+    contributions?: { bytedcliOperationPresets?: unknown };
+  }>;
+}
+
+/** Read only declarative preset metadata. This never runs MCP migrations or
+ * returns private descriptors; an unrelated invalid MCP record must not block
+ * discovery or the existing manual policy controls. Registry swaps are atomic;
+ * preset application additionally holds the plugin lifecycle lock. */
+export function readPluginBytedcliPresetRegistry(): PluginBytedcliPresetRegistry {
+  const plugins: PluginBytedcliPresetRegistry['plugins'] = {};
+  for (const [id, record] of Object.entries(parsePluginRegistry().plugins)) {
+    plugins[id] = {
+      id: record.id,
+      version: record.version,
+      manifest: { id: record.manifest?.id },
+      contributions: { bytedcliOperationPresets: record.contributions?.bytedcliOperationPresets },
+    };
+  }
+  return { plugins };
+}
+
 export function writePluginRegistry(registry: PluginRegistryFile): void {
   withFileLockSync(registryLockTarget(), () => writePluginRegistryUnlocked(registry), { maxWaitMs: 30_000 });
 }

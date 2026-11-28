@@ -1,0 +1,11 @@
+{
+  "skill": "picko-es-tag-distribution",
+  "source": "source repository not found; installed input version hashes",
+  "files": [
+    {
+      "path": "SKILL.md",
+      "inputSha256": "7cbc998e2cbc47d26380a9fc878d1c07e2593405bbbda7f591bb95582c63f6c0",
+      "outputSha256": "8b9674385f615d18e096538151eb5481484333c007be05b15724e177c3f20d4f"
+    }
+  ]
+}

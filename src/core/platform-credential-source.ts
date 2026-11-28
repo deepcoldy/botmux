@@ -48,6 +48,8 @@ export type ResolvePlatformIdentityArgs = {
   sessionId: string;
   turnId?: string;
   cloudJwtRegions?: CredentialGrantRequest['cloudJwtRegions'];
+  /** Request-owned broker cancellation, forwarded through contact and grant. */
+  signal?: AbortSignal;
 } & (
   /** The turn's own sender, scoped to this bot's app; its union_id is looked up. */
   | { openId: string; unionId?: undefined }
@@ -59,8 +61,8 @@ export type ResolvePlatformIdentityArgs = {
 
 interface Deps {
   readBinding: () => { platformUrl: string; machineToken: string; machineId: string } | null;
-  resolveUnionId: (larkAppId: string, openId: string) => Promise<string | null>;
-  requestGrant: (req: CredentialGrantRequest, opts: { binding: { platformUrl: string; machineToken: string; machineId: string } }) => Promise<CredentialGrantResult>;
+  resolveUnionId: (larkAppId: string, openId: string, signal?: AbortSignal) => Promise<string | null>;
+  requestGrant: (req: CredentialGrantRequest, opts: { binding: { platformUrl: string; machineToken: string; machineId: string }; signal?: AbortSignal }) => Promise<CredentialGrantResult>;
   now: () => number;
 }
 
@@ -80,7 +82,8 @@ const realDeps: Deps = {
   },
   // Resolved at call time, not module load: tests that stub the lark client
   // module with a fixed export set must still be able to import this file.
-  resolveUnionId: (larkAppId, openId) => resolveUnionIdFromOpenId(larkAppId, openId),
+  resolveUnionId: (larkAppId, openId, signal) => signal
+    ? resolveUnionIdFromOpenId(larkAppId, openId, signal) : resolveUnionIdFromOpenId(larkAppId, openId),
   requestGrant: (req, opts) => requestCredentialGrant(req, opts),
   now: () => Date.now(),
 };
@@ -160,7 +163,8 @@ export function noteSenderUnionId(larkAppId: string, openId: unknown, unionId: u
 const unionIdLookups = new Map<string, Promise<string | null>>();
 export const UNION_ID_SHARE_MS = 5_000;
 
-export async function platformUnionIdFor(larkAppId: string, openId: string): Promise<string | null> {
+export async function platformUnionIdFor(larkAppId: string, openId: string, signal?: AbortSignal): Promise<string | null> {
+  if (signal?.aborted) return null;
   const key = `${larkAppId}|${openId}`;
   const hit = unionIdCache.get(key);
   if (hit && deps.now() - hit.at < UNION_ID_TTL_MS) {
@@ -169,6 +173,9 @@ export async function platformUnionIdFor(larkAppId: string, openId: string): Pro
     unionIdCache.set(key, hit);
     return hit.unionId;
   }
+  // A broker's cancellation must not affect legacy/shared lookups or another
+  // request's signal. Only request-owned contact calls take this path.
+  if (signal) return lookupUnionId(larkAppId, openId, key, depsGeneration, signal);
   const inFlight = unionIdLookups.get(key);
   if (inFlight) return inFlight;
   const lookup = lookupUnionId(larkAppId, openId, key, depsGeneration);
@@ -182,9 +189,10 @@ export async function platformUnionIdFor(larkAppId: string, openId: string): Pro
   }
 }
 
-async function lookupUnionId(larkAppId: string, openId: string, key: string, generation: number): Promise<string | null> {
+async function lookupUnionId(larkAppId: string, openId: string, key: string, generation: number, signal?: AbortSignal): Promise<string | null> {
   let unionId: string | null = null;
-  try { unionId = await deps.resolveUnionId(larkAppId, openId); } catch { unionId = null; }
+  try { unionId = signal ? await deps.resolveUnionId(larkAppId, openId, signal) : await deps.resolveUnionId(larkAppId, openId); } catch { unionId = null; }
+  if (signal?.aborted) return null;
   if (unionId && UNION_ID_RE.test(unionId)) {
     if (generation === depsGeneration) rememberUnionId(key, unionId);
     return unionId;
@@ -258,12 +266,14 @@ export function platformAuthorizeUrl(): string | null {
  * Resolve this turn's identity from the platform. Never throws.
  */
 export async function resolvePlatformIdentity(args: ResolvePlatformIdentityArgs): Promise<PlatformIdentityResolution> {
+  if (args.signal?.aborted) return { state: 'unavailable', detail: 'credential request cancelled' };
   const binding = deps.readBinding();
   if (!binding) return { state: 'unbound' };
 
   const unionId = args.unionId !== undefined
     ? (UNION_ID_RE.test(args.unionId) && !args.unionId.startsWith('ou_') ? args.unionId : null)
-    : await platformUnionIdFor(args.botConfig.larkAppId, args.openId);
+    : await platformUnionIdFor(args.botConfig.larkAppId, args.openId, args.signal);
+  if (args.signal?.aborted) return { state: 'unavailable', detail: 'credential request cancelled' };
   if (!unionId) {
     logger.warn(`[trigger-user-auth] platform grant skipped for ${args.tool}: could not resolve union_id for sender`);
     return { state: 'unavailable', detail: 'sender union_id unresolved' };
@@ -276,7 +286,8 @@ export async function resolvePlatformIdentity(args: ResolvePlatformIdentityArgs)
     sessionId: args.sessionId,
     ...(args.turnId ? { turnId: args.turnId } : {}),
     ...(args.cloudJwtRegions ? { cloudJwtRegions: args.cloudJwtRegions } : {}),
-  }, { binding });
+  }, { binding, ...(args.signal ? { signal: args.signal } : {}) });
+  if (args.signal?.aborted) return { state: 'unavailable', detail: 'credential request cancelled' };
 
   if (result.ok) {
     const identity = toIdentity(args.tool, result.value, deps.now());

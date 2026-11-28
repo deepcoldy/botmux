@@ -115,7 +115,7 @@ async function readLoginState(openId: string): Promise<LoginObservation> {
     throw new BytedcliAuthUnavailableError('provider not ready');
   }
   const expiresAt = providerExpiry(data, sdk);
-  const fingerprint = data.authenticated ? loginFingerprint(data, sdk) : undefined;
+  const fingerprint = data.authenticated ? bytedcliLoginFingerprint(data, sdk) : undefined;
   return {
     authenticated: data.authenticated,
     ...(expiresAt ? { expiresAt } : {}),
@@ -125,7 +125,7 @@ async function readLoginState(openId: string): Promise<LoginObservation> {
 
 /** See {@link LoginObservation.fingerprint}. Only identity and expiry fields
  *  are read; credential fields in the same payload are ignored. */
-function loginFingerprint(
+export function bytedcliLoginFingerprint(
   data: Record<string, unknown>,
   sdk: Record<string, unknown> | undefined,
 ): string | undefined {
@@ -697,10 +697,11 @@ const authEpochs = new Map<string, number>();
 // Epoch invalidation must not release the HOME's operation lock while an old
 // provider child can still write its SDK cache.
 const credentialWork = new Map<string, Promise<unknown>>();
-function serializedCredentialWork<T>(openId: string, run: () => Promise<T>): Promise<T> {
+export function serializedCredentialWork<T>(openId: string, run: () => Promise<T>): Promise<T> {
   const previous = credentialWork.get(openId);
   const work = (async () => { await previous?.catch(() => null); return await run(); })();
   credentialWork.set(openId, work);
+  void work.finally(() => { if (credentialWork.get(openId) === work) credentialWork.delete(openId); }).catch(() => undefined);
   return work;
 }
 

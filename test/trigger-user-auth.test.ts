@@ -18,8 +18,53 @@ import {
   TRIGGER_USER_AUTH_TOOLS,
   tokenStoreProtection, credentialSourceOf, delegatesOnMention, dispatchOnlyToolsForTurn } from '../src/services/trigger-user-auth.js';
 import { createDashboardTranslator } from '../src/dashboard/web/i18n.js';
+import { BYTEDCLI_AUDITED_RELEASE, BYTEDCLI_OPERATION_CATALOG_VERSION } from '../src/core/bytedcli-operation-catalog.js';
+import { BYTEDCLI_OPERATION_POLICY_SCHEMA } from '../src/core/bytedcli-operation-policy-config.js';
 
 describe('parseTriggerUserAuthConfig', () => {
+  it('preserves valid dormant operation rules in disabled and legacy capability modes', () => {
+    const bytedcliOperationPolicy = { schema: 'botmux.bytedcli-operation-policy.v1', cliVersion: '0.199.0',
+      catalogVersion: '2026-11-26.1', rules: { 'codebase.mr.list': 'actor' } };
+    for (const settings of [{ enabled: false }, { enabled: true, bytecloudExecution: 'trigger-user' },
+      { enabled: true, capabilities: ['lark-user'] }, { enabled: true, tools: ['bytedcli'] }]) {
+      const config = parseTriggerUserAuthConfig({ ...settings, bytedcliOperationPolicy });
+      expect(config).toHaveProperty('bytedcliOperationPolicy', {
+        schema: BYTEDCLI_OPERATION_POLICY_SCHEMA, cliVersion: BYTEDCLI_AUDITED_RELEASE,
+        catalogVersion: BYTEDCLI_OPERATION_CATALOG_VERSION, rules: bytedcliOperationPolicy.rules,
+      });
+      expect(parseTriggerUserAuthConfig(JSON.parse(JSON.stringify(config)))).toEqual(config);
+      expect(parseTriggerUserAuthConfig({ ...config, bytedcliOperationPolicy: null }))
+        .not.toHaveProperty('bytedcliOperationPolicy');
+    }
+  });
+
+  it('rejects malformed operation policy while disabled instead of storing unsafe rules', () => {
+    const bytedcliOperationPolicy = { schema: 'botmux.bytedcli-operation-policy.v1', cliVersion: '0.199.0',
+      catalogVersion: '2026-11-26.1', rules: { 'codebase.mr.close': 'machine' } };
+    expect(() => parseTriggerUserAuthConfig({ enabled: false, bytedcliOperationPolicy })).toThrow();
+  });
+
+  it('roundtrips the broker mode and preserves per-capability actor sources while disabled', () => {
+    const raw = { enabled: false, capabilities: ['bytecloud'],
+      credentialSource: { 'lark-user': 'local', bytecloud: 'platform' },
+      bytecloudExecution: 'read-machine-write-actor', allowOwnerActor: true };
+    const config = parseTriggerUserAuthConfig(raw);
+    expect(config).toMatchObject(raw);
+    expect(parseTriggerUserAuthConfig(JSON.parse(JSON.stringify(config)))).toEqual(config);
+    expect(credentialSourceOf(config, 'bytecloud')).toBe('platform');
+  });
+
+  it('rejects an invalid execution enum even when the policy is dormant', () => {
+    for (const bytecloudExecution of ['machine', '', null, true, {}]) {
+      expect(() => parseTriggerUserAuthConfig({ enabled: false, bytecloudExecution })).toThrow(/bytecloudExecution/);
+    }
+  });
+
+  it('preserves explicit legacy execution without adding a mode to absent legacy config', () => {
+    expect(parseTriggerUserAuthConfig({ enabled: true, bytecloudExecution: 'trigger-user' }))
+      .toHaveProperty('bytecloudExecution', 'trigger-user');
+    expect(parseTriggerUserAuthConfig({ enabled: true })).not.toHaveProperty('bytecloudExecution');
+  });
   it('treats an absent field as "not configured at all"', () => {
     expect(parseTriggerUserAuthConfig(undefined)).toBeNull();
     expect(parseTriggerUserAuthConfig(null)).toBeNull();
@@ -103,12 +148,12 @@ describe('parseTriggerUserAuthConfig', () => {
     expect(() => parseTriggerUserAuthConfig({ enabled: true, dispatchOnly: 'nope' })).toThrow(/object/);
   });
 
-  it('accepts and ignores dispatch-only scopes while the policy is disabled', () => {
+  it('retains valid dormant dispatch scopes without activating them', () => {
     const valid = { tools: ['bytedcli'], targetAppIds: ['cli_target'], chatIds: ['oc_group'] };
     // A natural manual kill switch: turning `enabled` off must not invalidate
     // the whole bots.json load, even if the dormant scope is malformed.
     const disabled = parseTriggerUserAuthConfig({ enabled: false, tools: [], dispatchOnly: valid });
-    expect(disabled).not.toHaveProperty('dispatchOnly');
+    expect(disabled?.dispatchOnly).toEqual(valid);
     expect(disabled?.enabled).toBe(false);
     const malformed = parseTriggerUserAuthConfig({ enabled: false, dispatchOnly: { tools: ['nope'] } });
     expect(malformed).not.toHaveProperty('dispatchOnly');

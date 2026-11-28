@@ -71,6 +71,7 @@ import { TerminalEffortChoiceTracker } from '../../src/services/terminal-effort-
 import { attributableSupersededFinalMarkers, finalBridgeSendMarkerCoversOwnThread, isBridgeNothingToSendFinal, isFinalBridgeSendMarker, stripTrailingBridgeSentinelLine } from '../../src/services/bridge-fallback-gate.js';
 import { resolveAbsorbedTurnCoverage } from '../../src/core/turn-absorption.js';
 import { compatibleAuthorityPrincipal } from '../../src/core/active-turn-authority.js';
+import { bytecloudBrokerEnabled } from '../../src/core/identity-policy.js';
 import { TurnSendLedger } from '../../src/services/turn-send-ledger.js';
 import { isStructuredNoticeProtocolMessage } from '../../src/services/structured-notice-protocol.js';
 import { rewindableErrorCode, transcriptTurnFailedWithoutOutput } from '../../src/core/failed-turn-rewind.js';
@@ -297,6 +298,7 @@ function defaultScopedWorkerState(scope: Record<string, unknown>, key: string | 
   if (key === 'absorbedMarkerWrittenAtMsByKey') return (scope.absorbedMarkerWrittenAtMsByKey ??= new Map());
   if (key === 'resolveAbsorbedTurnCoverage') return resolveAbsorbedTurnCoverage;
   if (key === 'compatibleAuthorityPrincipal') return compatibleAuthorityPrincipal;
+  if (key === 'bytecloudBrokerEnabled') return bytecloudBrokerEnabled;
   if (key === 'attributableSupersededFinalMarkers') return attributableSupersededFinalMarkers;
   // Queue/terminal fixtures that do not model bridge delivery have no final
   // evidence. Focused marker suites inject the real reader explicitly.

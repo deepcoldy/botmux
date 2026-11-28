@@ -1,5 +1,6 @@
 import {
   capabilitiesOf,
+  capabilityOn,
   credentialSourceOf,
   type TriggerUserAuthCapability,
   type TriggerUserAuthConfig,
@@ -7,6 +8,14 @@ import {
   type TriggerUserAuthCredentialSourceCapability,
   type IdentityRouteTool,
 } from '../services/trigger-user-auth.js';
+
+/** Selection only: actual containment and authority are checked at admission
+ * and at every execution. A dormant enum never changes legacy behavior. */
+export function bytecloudBrokerEnabled(
+  config: Pick<TriggerUserAuthConfig, 'enabled' | 'tools' | 'capabilities' | 'bytecloudExecution'> | null | undefined,
+): boolean {
+  return config?.bytecloudExecution === 'read-machine-write-actor' && capabilityOn(config, 'bytecloud');
+}
 
 export interface IdentityPolicy {
   /** Capabilities that run as the message sender; empty while the policy is off. */

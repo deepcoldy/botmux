@@ -10,6 +10,7 @@ import {
   type GatewayTrustedResultDeliveryHandler,
   type GatewayTrustedResultStatusHandler,
   type GatewayTrustedTurnIdentityProvider,
+  type GatewayReadOnlyPolicy,
 } from './gateway.js';
 import { acceptMcpGatewayHandshake, mcpGatewayAuthTokenPath } from './socket-auth.js';
 import { ensurePrivateGatewayDir, sessionMcpGatewaySocketDir } from './socket-dir.js';
@@ -71,6 +72,7 @@ export async function startSessionMcpGatewayHost(opts: {
   requestProtectedSecretChannel?: (capabilityId: string) => Promise<Duplex>;
   protectedMcpPolicy?: ProtectedMcpWorkerPolicy;
   protectedEgressSocketPath?: string;
+  readOnly?: GatewayReadOnlyPolicy;
   onError?: (error: Error) => void;
 }): Promise<SessionMcpGatewayHost> {
   const socketDir = sessionMcpGatewaySocketDir(opts.sessionId, opts.dataDir);
@@ -110,6 +112,7 @@ export async function startSessionMcpGatewayHost(opts: {
         requestProtectedSecretChannel: opts.requestProtectedSecretChannel,
         protectedMcpPolicy: opts.protectedMcpPolicy,
         protectedEgressSocketPath: opts.protectedEgressSocketPath,
+        readOnly: opts.readOnly,
       });
       let gatewayClose: Promise<void> | undefined;
       const closeGateway = (): Promise<void> => {

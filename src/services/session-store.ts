@@ -2191,6 +2191,8 @@ function persistRow(session: Session, modelPinWrite = false, sharedThreadOpening
   const existing = ownStore.selectRow.get(session.sessionId) as { row: string } | undefined;
   if (existing) {
     const durable = JSON.parse(existing.row) as Session;
+    if (durable.bytecloudBrokerStrict) session = { ...session, bytecloudBrokerStrict: true };
+    if (durable.bytecloudBrokerColdStart) session = { ...session, bytecloudBrokerColdStart: true };
     // Late metadata must not rewind creation or erase a received identity.
     const opening = durable.sharedThreadOpening;
     if (opening?.phase && !sharedThreadOpeningWrite) {
@@ -4065,7 +4067,7 @@ const PRINCIPAL_LANE_RUNTIME_KEYS = [
   'backendType', 'mojoIdentity', 'mojoIdentityHostDefault',
   'sandbox', 'sandboxPaths', 'sandboxHidePaths',
   'sandboxReadonlyPaths', 'sandboxNetwork', 'sandboxNetworkPolicy', 'sandboxWithholdBotSecret', 'protectedResults',
-  'protectedHttpEgressPolicy',
+  'protectedHttpEgressPolicy', 'bytecloudBrokerStrict', 'bytecloudBrokerColdStart',
 ] as const satisfies readonly (keyof Session)[];
 
 function copyPrincipalLaneRuntimeConfig(source: Session, target: Session): void {

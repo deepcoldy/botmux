@@ -1,4 +1,9 @@
 #!/usr/bin/env node
+import { bytedcliLoopbackServices } from './core/bytedcli-protected-loopback.js';
+import { assertBytedcliLaunchSupported, createBytedcliContainmentReport } from './core/bytedcli-linux-containment.js';
+import { approvedReadOnlyTools, assertHostReadOnlyMcpRuntime, isCurrentReadOnlyMcpExecution } from './core/plugins/mcp/read-only-policy.js';
+import { bytecloudBrokerEnabled } from './core/identity-policy.js';
+import { scrubBytedcliBrokerEnv } from './utils/child-env.js';
 import { isCliStartupFailure } from './core/cli-startup-failure.js';
 import { fingerprintPromptText, removePromptContextForTurn, rekeyPromptContextWithFallback } from './services/prompt-context-store.js';
 import { readLatestNativeGoal, readNativeGoalForRollout } from './services/native-goal-state.js';
@@ -2065,6 +2070,7 @@ async function codexLaunchReasoningEffort(
 }
 
 async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): Promise<EngageOutcome> {
+  if (cfg.bytedcliContainment && cfg.codexRpcInput) throw new Error('ByteCloud broker refuses host-side RPC model execution');
   followBotTraeHome(cfg);
   if (cfg.cliInstanceBinding && cfg.cliInstanceBinding.source !== 'legacy') {
     refuseUnverifiableInstanceBinding(cfg);
@@ -2712,7 +2718,7 @@ function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigi
   // Keep its frozen runtime, without claiming execution acceptance.
   // The native conversation ID is also learned before the first input runs;
   // its turnId is display context, not proof that this attempt was accepted.
-  if (msg.type === 'claude_exit' || msg.type === 'local_process_attestation' || msg.type === 'cli_session_id') delete context.scope.execution;
+  if (msg.type === 'claude_exit' || msg.type === 'local_process_attestation' || msg.type === 'bytedcli_containment' || msg.type === 'cli_session_id') delete context.scope.execution;
   // Queue observations belong to this worker process, not to a turn or a
   // runtime: they span turns (including admissions not yet bound to the
   // runtime) and runtimes too. Whatever callback publishes one, it reports the
@@ -3395,6 +3401,8 @@ function refreshCliPluginGeneration(
     prompt: cfg.prompt,
     turnId: cfg.turnId,
     replacesPriorGeneration: cfg.resume === true,
+    hostMcpEnabled: !cfg.bytedcliContainment,
+    hostReadOnlyMcpTools: cfg.bytedcliContainment?.hostReadOnlyMcpTools,
     promptInjection: cfg.promptInjection,
     compactCatalog: cfg.cliId === 'traex'
       && codexRpcEligible(cfg, { sandboxForced: sandboxEnabled() }),
@@ -3404,6 +3412,7 @@ function refreshCliPluginGeneration(
       ? deliveredPluginSkillCatalogFingerprint : undefined,
   });
   for (const diagnostic of generation.diagnostics) log(`Plugin generation: ${diagnostic}`);
+  if (cfg.bytedcliContainment) log('ByteCloud mixed mode: only host-approved read-only MCP tools enabled; plugin Skills retained');
   if (generation.fatal) {
     const reason = generation.diagnostics.join(', ') || 'unknown';
     // Init errors are now user-visible through one structured `error` IPC.
@@ -3469,7 +3478,7 @@ async function prepareCliPluginGenerationAndGateway(
     if ((cfg.backendType ?? config.daemon.backendType) === 'tmux') {
       assertManagedTmuxInstanceIdentity(cfg);
     }
-    if (adapter.mcpGateway) {
+    if (adapter.mcpGateway && (!cfg.bytedcliContainment || Object.keys(cfg.bytedcliContainment.hostReadOnlyMcpTools ?? {}).length)) {
       const gateway = adapter.mcpGateway;
       const instanceConfig = join(cfg.cliInstanceBinding.codexHome, 'config.toml');
       const report = withFileLockSync(instanceConfig, () => ensureGatewayEntry({
@@ -3480,6 +3489,7 @@ async function prepareCliPluginGenerationAndGateway(
   }
   refreshCliPluginGeneration(cfg, adapter, preserveUnchangedCatalog);
   const manifest = readSessionMcpRuntimeManifest(cfg.sessionId, config.session.dataDir);
+  if (cfg.bytedcliContainment && manifest?.entries.length) assertHostReadOnlyMcpRuntime(manifest, cfg.bytedcliContainment.hostReadOnlyMcpTools);
   stopSessionMcpGatewayHost();
   if (cfg.protectedHttpEgressPolicy) {
     try {
@@ -3488,7 +3498,8 @@ async function prepareCliPluginGenerationAndGateway(
         cfg,
         process.env.SESSION_DATA_DIR ?? config.session.dataDir,
         isWorkflowWorker(),
-      ) ? [larkToolLoopbackService(cfg.sessionId, daemonIpcPort)] : [];
+      ) ? [larkToolLoopbackService(cfg.sessionId, daemonIpcPort),
+        ...(cfg.bytedcliContainment ? bytedcliLoopbackServices(daemonIpcPort) : [])] : [];
       sessionProtectedHttpEgressHost = await startSessionProtectedHttpEgressHost({
         sessionId: cfg.sessionId,
         dataDir: config.session.dataDir,
@@ -3546,10 +3557,25 @@ async function prepareCliPluginGenerationAndGateway(
  *  wired here so BOTH the fresh/resumed host and the re-served reattach host
  *  inject the per-turn host-signed caller — the reattach path must not lose it. */
 async function startAndRecordSessionMcpGatewayHost(sessionId: string): Promise<void> {
+  const strictConfig = lastInitConfig?.bytedcliContainment;
+  if (strictConfig) assertHostReadOnlyMcpRuntime(readSessionMcpRuntimeManifest(sessionId, config.session.dataDir), strictConfig.hostReadOnlyMcpTools);
   sessionMcpGatewayHost = await startSessionMcpGatewayHost({
     sessionId,
     dataDir: config.session.dataDir,
     trustedTurnIdentity: currentGatewayTrustedTurnIdentity,
+    ...(strictConfig ? { readOnly: {
+      tools: strictConfig.hostReadOnlyMcpTools ?? {},
+      authorize: (pluginId: string, toolName: string, identity: GatewayTrustedTurnIdentity): boolean => {
+        try {
+          const cfg = lastInitConfig;
+          if (!cfg || !isCurrentReadOnlyMcpExecution(identity, workerSessionEventScope)) return false;
+          const global = readGlobalConfig({ fresh: true });
+          const bot = loadBotConfigs().find(candidate => candidate.larkAppId === cfg.larkAppId);
+          return !!bot && resolveEffectivePluginIds(bot, global).includes(pluginId)
+            && approvedReadOnlyTools(global.bytedcliBroker?.hostReadOnlyMcpTools, pluginId).includes(toolName);
+        } catch { return false; }
+      },
+    } } : {}),
     trustedResultDelivery: deliverPluginResultThroughHost,
     ...(lastInitConfig?.protectedResults === true ? {
       protectedResultDeliveryAvailable: () => protectedResultProfileAvailable({
@@ -12548,6 +12574,7 @@ const antigravityQuotaState = createAntigravityQuotaStateMachine();
 let antigravityNativeQuotaLog: AntigravityNativeQuotaLog | undefined;
 let activeTransientRateLimit: { scope: string; state: CliUsageLimitState } | undefined;
 let lastUsageLimitCaptureTurn: { turnId: string; dispatchAttempt?: number } | undefined;
+let bytedcliColdSandboxGeneration: number | undefined;
 let localAttestedCliProcess: { cliPid: number; cliProcStart: string; cliSpawnGeneration: number } | undefined;
 let rawInputWriteGeneration = 0;
 let lastWrittenCliInputWebSubmitGen = 0;
@@ -36824,6 +36851,7 @@ async function spawnCliBody(
   });
   if (proxyError) throw new Error(proxyError + FROZEN_NETWORK_POLICY_HINT);
   const spawnGeneration = ++cliSpawnGeneration;
+  bytedcliColdSandboxGeneration = undefined;
   localProtectedMcpContainmentActiveCapabilityIds = [];
   const spawnStartedAtMs = Date.now();
   startupNativeInputSeen = false;
@@ -37818,6 +37846,9 @@ async function spawnCliBody(
   // Shared with the auto-worktree fail-closed gate (services/default-worktree.ts)
   // via resolveLocalSandboxMode, so "which local sandbox does this spawn get"
   // is decided by ONE function on both sides and can never drift again.
+  if (bytecloudBrokerEnabled(cfg.triggerUserAuth) && !cfg.bytedcliContainment) {
+    throw new Error('ByteCloud broker requires a daemon-owned cold generation contract');
+  }
   const sandboxMode = resolveLocalSandboxMode({
     backendType: effectiveBackendType,
     mojoConfig: effectiveBackendType === 'mojo'
@@ -37827,6 +37858,15 @@ async function spawnCliBody(
     readIsolation: cfg.readIsolation === true,
     envValue: process.env.BOTMUX_SANDBOX,
   });
+  if (cfg.bytedcliContainment) {
+    assertBytedcliLaunchSupported({ platform: process.platform, backendType: effectiveBackendType,
+      cliId: cfg.cliId, sandbox: sandboxMode, adopt: cfg.adoptMode, wrapperCli: cfg.wrapperCli,
+      rpc: cfg.codexRpcInput, externalAppServer: cfg.existingAppServerEndpoint, launchMode: cfg.cliLaunchMode,
+      sharedAuthentication: cfg.cliId === 'codex'
+        ? cfg.codexAuthSync !== 'isolated' && cfg.cliInstanceBinding?.authMode !== 'isolated'
+        : !cfg.credentialsSourceDir });
+    cfg.envPolicy = { mode: 'strict' };
+  }
   if (riffRemoteBackend && sandboxMode !== 'off') {
     log(`Sandbox flag set (${sandboxMode}) but backend is ${effectiveBackendType} (remote sandbox, no local process) — local sandbox bypassed`);
   }
@@ -38186,6 +38226,13 @@ async function spawnCliBody(
     throw new Error(`[credentials-source] refusing to start bot ${cfg.larkAppId}: ${credentialSourcePlan.reason}`);
   }
   const credentialSourceDir = credentialSourcePlan.kind === 'copy' ? credentialSourcePlan.sourceDir : undefined;
+  if (cfg.bytedcliContainment && credentialSourceDir) {
+    const source = canonicalPathNearest(credentialSourceDir);
+    if (cfg.bytedcliContainment.credentialRoots.some(root => {
+      const protectedRoot = canonicalPathNearest(root);
+      return source === protectedRoot || source.startsWith(protectedRoot + '/') || protectedRoot.startsWith(source + '/');
+    })) throw new Error('Model credential source overlaps a protected ByteCloud root');
+  }
   const credentialSourceFiles = credentialSourcePlan.kind === 'copy'
     ? (() => {
         try {
@@ -38319,7 +38366,7 @@ async function spawnCliBody(
           configPath: join(claudeDataDir!, 'settings.json'),
         };
       }
-      if (adapter.mcpGateway) {
+      if (adapter.mcpGateway && (!cfg.bytedcliContainment || Object.keys(cfg.bytedcliContainment.hostReadOnlyMcpTools ?? {}).length)) {
         const isolatedConfigPath = isClaudeFam
           ? join(claudeDataDir!, '.claude.json')
           : join(botHome, 'codex', 'config.toml');
@@ -38696,6 +38743,9 @@ async function spawnCliBody(
     );
   }
   let willReattachPersistent = selectedBackend.isReattach === true;
+  if (cfg.bytedcliContainment && willReattachPersistent) {
+    throw new Error('ByteCloud broker refuses warm reattachment; a cold managed process is required');
+  }
   if (cliAdapter.mcpGateway && mcpRuntimeManifest?.entries.length && persistentSessionName && effectiveBackendType !== 'pty') {
     const persistentTarget = selectedBackend.persistentBackendTarget;
     // ZMX ownership is label/PID-sensitive, so only its inconclusive probe
@@ -39782,6 +39832,7 @@ async function spawnCliBody(
   let perBotSettingsFilePath: string | undefined;
   if (cliAdapter.claudeDataDir && cfg.env && process.env.SESSION_DATA_DIR) {
     const sanitized = botInjectedEnv(cfg.env, cfg.envPolicy, cfg.protectedMcpPolicy);
+    if (cfg.bytedcliContainment) scrubBytedcliBrokerEnv(sanitized);
     if (Object.keys(sanitized).length > 0) {
       perBotSettingsEnv = sanitized;
       const settingsDir = willRedirectCliData && claudeDataDir
@@ -39796,6 +39847,7 @@ async function spawnCliBody(
     }
   }
   const perBotInjectEnv = botInjectedEnv(cfg.env, cfg.envPolicy, cfg.protectedMcpPolicy);
+  if (cfg.bytedcliContainment) scrubBytedcliBrokerEnv(perBotInjectEnv);
   const boundLark = !!process.env.SESSION_DATA_DIR && usesLarkToolBinding(cfg, process.env.SESSION_DATA_DIR, isWorkflowWorker());
   if (!boundLark && process.env.SESSION_DATA_DIR) {
     cleanupLarkToolBinding(process.env.SESSION_DATA_DIR, cfg.sessionId);
@@ -39891,7 +39943,7 @@ async function spawnCliBody(
   };
   if (cfg.chatType) identityShellEnv.BOTMUX_CHAT_TYPE = cfg.chatType;
   if (cfg.rootMessageId?.startsWith('om_') || isMessageListenerTaskAnchor(cfg.rootMessageId)) identityShellEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
-  if ((cfg.triggerUserAuth?.enabled || boundLark) && process.env.SESSION_DATA_DIR) {
+  if ((cfg.triggerUserAuth?.enabled || cfg.bytedcliContainment || boundLark) && process.env.SESSION_DATA_DIR) {
     const dir = sessionIdentityBinDir(identityDataDir!, cfg.sessionId);
     identityShellEnv.SESSION_DATA_DIR = identityDataDir!;
     identityShellEnv.BOTMUX_IDENTITY_BIN = dir;
@@ -39902,7 +39954,7 @@ async function spawnCliBody(
     // governed — that is the exact condition under which installGitAskpass
     // writes the file, and pointing GIT_ASKPASS at a missing path would break
     // git prompts rather than fall back.
-    if (capabilityOn(cfg.triggerUserAuth, 'bytecloud')) {
+    if (cfg.bytedcliContainment || capabilityOn(cfg.triggerUserAuth, 'bytecloud')) {
       identityShellEnv.GIT_ASKPASS = join(dir, GIT_ASKPASS_BASENAME);
     }
   }
@@ -40163,15 +40215,29 @@ async function spawnCliBody(
   // never derives sandbox/network facts itself.
   const childIdentityBinding = !!process.env.SESSION_DATA_DIR
     && usesLarkToolBinding({ ...cfg, larkToolBinding: true }, process.env.SESSION_DATA_DIR, isWorkflowWorker());
+  const attestedLoopback = !!cfg.bytedcliContainment && !!sessionProtectedHttpEgressHost
+    && cfg.protectedLoopbackProxyAttestation?.workerGeneration === cfg.bytedcliContainment.workerGeneration
+    && childIdentityBinding && boundLark
+    && bytedcliLoopbackServices(parseDaemonIpcPort(process.env.BOTMUX_DAEMON_IPC_PORT) ?? 0).every(expected =>
+      sessionProtectedHttpEgressHost!.loopbackServices.some(service => service.id === expected.id
+        && service.method === expected.method && service.path === expected.path
+        && service.listenPort === expected.listenPort && service.attestProcessPeer === true));
   const childIdentityModel = resolveIdentityStorageModel({
+    attestedLoopback,
     platform: process.platform,
     binding: childIdentityBinding,
     sandboxEngaged: spawnNetworkShape.sandboxEngaged,
     loopbackShared: spawnNetworkShape.loopbackShared,
   });
+  if (cfg.bytedcliContainment) assertBytedcliLaunchSupported({ platform: process.platform,
+    backendType: effectiveBackendType, cliId: cfg.cliId, sandbox: sandboxMode,
+    hostMcpRuntime: mcpRuntimeManifest, hostMcpEntries: mcpRuntimeManifest?.entries.length,
+    hostReadOnlyMcpTools: cfg.bytedcliContainment.hostReadOnlyMcpTools,
+    identityModel: childIdentityModel, loopbackShared: spawnNetworkShape.loopbackShared, attestedLoopback });
   if (process.env.SESSION_DATA_DIR) {
     send({
       type: 'session_identity_decision',
+      attestedLoopback,
       sessionId: cfg.sessionId,
       model: childIdentityModel,
       cliExecution: workerCliExecutionReport(cfg, boundLark),
@@ -40190,7 +40256,7 @@ async function spawnCliBody(
     childIdentityModel === 'proven'
       ? { appId: cfg.larkAppId, ipcPort: parseDaemonIpcPort(process.env.BOTMUX_DAEMON_IPC_PORT) }
       : undefined,
-    { canonicalPaths: sandboxRequested, loopbackShared: spawnNetworkShape.loopbackShared });
+    { canonicalPaths: sandboxRequested, loopbackShared: spawnNetworkShape.loopbackShared, attestedLoopback });
   if (boundLark) prepareLarkToolEnv({ env: childEnv, effectivePath: perBotInjectEnv.PATH ?? childEnv.PATH, dataDir: process.env.SESSION_DATA_DIR!,
     sessionId: cfg.sessionId, appId: cfg.larkAppId, brand: cfg.brand, canonicalPaths: sandboxRequested, userNative: larkUserNative(cfg.triggerUserAuth) });
   if (cfg.triggerUserAuth?.enabled && process.env.SESSION_DATA_DIR) {
@@ -41193,6 +41259,7 @@ async function spawnCliBody(
       // grant can't re-expose them, and independently withholds the role-library grant.
       larkTransportEnabled,
       larkToolIdentityEnabled: boundLark,
+      bytedcliBrokerEnabled: !!cfg.bytedcliContainment,
       // ALWAYS freeze BOTH botmux authority roots for a no-transport turn: the
       // configured one (`botmuxHome` above = dirname(dataDir)) AND the canonical
       // default `~/.botmux`. A custom SESSION_DATA_DIR moves the data dir, but the
@@ -41305,6 +41372,8 @@ async function spawnCliBody(
       serviceCredentialReadOnlyPaths,
       mandatoryDenyPaths,
       hostOnlyDenyPaths,
+      protectedDenyPaths: cfg.bytedcliContainment?.credentialRoots.flatMap(path => [path, canonicalPathNearest(path)]),
+      protectedReadOnlyPaths: cfg.bytedcliContainment?.executableReadOnlyRoots.flatMap(path => [path, canonicalPathNearest(path)]),
       mandatoryDenyRegexes,
       mandatoryReadOnlyPaths,
       net: spawnNetworkShape.netEnabled,
@@ -41457,6 +41526,7 @@ async function spawnCliBody(
       if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } sandboxStopWatcher = null; }
       if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } sandboxCleanup = null; }
       const sbx = prepareDirectSandbox({
+        bytedcliBroker: !!cfg.bytedcliContainment,
         networkPolicy: effectiveSandboxNetworkPolicy,
         sessionId: cfg.sessionId,
         dataDir,
@@ -41495,6 +41565,7 @@ async function spawnCliBody(
         log(msg);
         throw new Error(msg);
       }
+      if (cfg.bytedcliContainment) bytedcliColdSandboxGeneration = spawnGeneration;
       spawnBin = sbx.bin;
       spawnArgs = sbx.args;
       Object.assign(childEnv, sbx.env);
@@ -42472,6 +42543,10 @@ async function spawnCliBody(
     // shell after its rcfile. `willReattachPersistent` is part of the scope
     // because the backends may downgrade a predicted reattach to a REAL spawn
     // after effectiveResume was already computed (zellij frozen reattach).
+    if (cfg.bytedcliContainment) {
+      scrubBytedcliBrokerEnv(childEnv, true);
+      scrubBytedcliBrokerEnv(perBotInjectEnv);
+    }
     const spawnEnvPlan = planChildSpawnEnv({
       baseEnv: childEnv,
       botEnv: perBotInjectKeys.length ? perBotInjectEnv : undefined,
@@ -50337,6 +50412,13 @@ function publishLocalProcessAttestation(
     ...(enginePid ? { enginePid } : {}),
     ...(engineProcStart ? { engineProcStart } : {}),
   });
+  const strictContract = lastInitConfig?.bytedcliContainment;
+  if (strictContract && cliPid && cliProcStart) {
+    const report = createBytedcliContainmentReport({ sessionId: lastInitConfig!.sessionId,
+      contract: strictContract, cliPid, cliProcStart, cliSpawnGeneration,
+      coldSandboxGeneration: bytedcliColdSandboxGeneration });
+    if (report) send({ type: 'bytedcli_containment', report });
+  }
   // IPC preserves order: the daemon records this exact CLI pid/generation
   // before it snapshots the current turn's pre-existing descendants. This is
   // required for the opening turn, whose origin is first published before the
@@ -50673,6 +50755,12 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       break;
     }
     case 'init': {
+      if (msg.bytedcliContainment || bytecloudBrokerEnabled(msg.triggerUserAuth)) {
+        if (!msg.bytedcliContainment) throw new Error('ByteCloud broker requires a host cold-generation contract');
+        assertBytedcliLaunchSupported({ platform: process.platform, backendType: msg.backendType,
+          cliId: msg.cliId, sandbox: 'oncall', adopt: msg.adoptMode, wrapperCli: msg.wrapperCli,
+          rpc: msg.codexRpcInput, externalAppServer: msg.existingAppServerEndpoint, launchMode: msg.cliLaunchMode });
+      }
       const initStartedAtMs = Date.now();
       const ordinaryImTurnId = !msg.adoptMode
         && msg.dispatchAttempt === undefined

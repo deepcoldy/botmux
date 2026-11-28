@@ -1,0 +1,768 @@
+{
+  "schema": "botmux.bytedcli-operation-catalog.v1",
+  "cliVersion": "0.199.0",
+  "catalogVersion": "2026-11-27.2",
+  "validators": {
+    "numeric-id": {
+      "kind": "integer",
+      "min": 1,
+      "max": 9007199254740991
+    },
+    "repo-path": {
+      "kind": "pattern",
+      "source": "^[A-Za-z0-9_-]+(?:\\/[A-Za-z0-9_.-]+)+$"
+    },
+    "json": {
+      "kind": "choice",
+      "values": [
+        "true"
+      ]
+    },
+    "site": {
+      "kind": "choice",
+      "values": [
+        "cn"
+      ]
+    },
+    "query": {
+      "kind": "bounded",
+      "maxBytes": 1024
+    },
+    "page": {
+      "kind": "integer",
+      "min": 1,
+      "max": 10000
+    },
+    "page-size": {
+      "kind": "integer",
+      "min": 1,
+      "max": 100
+    },
+    "statuses": {
+      "kind": "split",
+      "separator": ",",
+      "validator": {
+        "kind": "choice",
+        "values": [
+          "created",
+          "archived"
+        ]
+      }
+    },
+    "sort-by": {
+      "kind": "choice",
+      "values": [
+        "LastActivityAt",
+        "Path"
+      ]
+    },
+    "sort-order": {
+      "kind": "choice",
+      "values": [
+        "Asc",
+        "Desc"
+      ]
+    },
+    "head": {
+      "kind": "branch",
+      "maxBytes": 255
+    },
+    "author": {
+      "kind": "bounded",
+      "maxBytes": 128
+    },
+    "commit": {
+      "kind": "pattern",
+      "source": "^[a-fA-F0-9]{7,40}$"
+    },
+    "draft": {
+      "kind": "choice",
+      "values": [
+        "true",
+        "false"
+      ]
+    },
+    "review-status": {
+      "kind": "choice",
+      "values": [
+        "unreviewed",
+        "approved",
+        "rejected"
+      ]
+    },
+    "state": {
+      "kind": "choice",
+      "values": [
+        "open",
+        "merged",
+        "closed",
+        "all"
+      ]
+    },
+    "sort-by-value": {
+      "kind": "choice",
+      "values": [
+        "CreatedAt",
+        "UpdatedAt"
+      ]
+    },
+    "file": {
+      "kind": "relative-resource",
+      "maxBytes": 1024
+    },
+    "context": {
+      "kind": "integer",
+      "min": 0,
+      "max": 100
+    },
+    "max-patch-bytes": {
+      "kind": "integer",
+      "min": 1,
+      "max": 1048576
+    },
+    "body": {
+      "kind": "bounded",
+      "maxBytes": 32768
+    },
+    "body-file": {
+      "kind": "pattern",
+      "source": "^(?:-|[A-Za-z0-9][A-Za-z0-9_-]{0,63})$"
+    },
+    "merge-method": {
+      "kind": "choice",
+      "values": [
+        "merge_commit",
+        "rebase_merge"
+      ]
+    },
+    "merge-commit-message": {
+      "kind": "bounded",
+      "maxBytes": 4096
+    },
+    "reviewer-ids": {
+      "kind": "any",
+      "validators": [
+        {
+          "kind": "integer",
+          "min": 1,
+          "max": 9007199254740991
+        },
+        {
+          "kind": "pattern",
+          "source": "^[A-Za-z0-9_.-]{1,128}$"
+        }
+      ]
+    },
+    "about-user": {
+      "kind": "pattern",
+      "source": "^[A-Za-z0-9_.-]{1,128}$"
+    },
+    "sort": {
+      "kind": "choice",
+      "values": [
+        "created-at-asc",
+        "created-at-desc"
+      ]
+    },
+    "state-value": {
+      "kind": "choice",
+      "values": [
+        "initial",
+        "opened",
+        "closed",
+        "finished"
+      ]
+    },
+    "psm": {
+      "kind": "pattern",
+      "source": "^[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+){2,}$"
+    },
+    "vregion": {
+      "kind": "choice",
+      "values": [
+        "China-North",
+        "China-North6"
+      ]
+    },
+    "output": {
+      "kind": "choice",
+      "values": [
+        "console"
+      ]
+    }
+  },
+  "commonFlags": [
+    {"name":"--no-auto-upgrade","arity":"flag","validator":"json"},
+    {"name":"--json","aliases":["-j"],"arity":"flag","validator":"json"},
+    {"name":"--site","arity":"value","validator":"site"},
+    {"name":"--help","aliases":["-h"],"arity":"flag","validator":"json"},
+    {"name":"--version","aliases":["-V"],"arity":"flag","validator":"json"}
+  ],
+  "entries": [
+    {
+      "id": "codebase.repo.get",
+      "path": [
+        "codebase",
+        "repo",
+        "get"
+      ],
+      "aliases": [
+        [
+          "codebase",
+          "repo",
+          "view"
+        ]
+      ],
+      "effect": "read",
+      "flags": [
+        {"name":"--repo","aliases":["-R","--repo-name"],"arity":"value","validator":"repo-path"},
+        {"name":"--repo-id","arity":"value","validator":"numeric-id"},
+        {"name":"--languages","arity":"flag","validator":"json"}
+      ],
+      "positional": "repo",
+      "repo": true
+    },
+    {
+      "id": "codebase.repo.list",
+      "path": [
+        "codebase",
+        "repo",
+        "list"
+      ],
+      "effect": "read",
+      "flags": [
+        {"name":"--query","arity":"value","validator":"query"},
+        {"name":"--page","aliases":["--page-number"],"arity":"value","validator":"page"},
+        {"name":"--page-size","arity":"value","validator":"page-size"},
+        {"name":"--namespace-id","arity":"value","validator":"numeric-id"},
+        {"name":"--statuses","arity":"value","validator":"statuses"},
+        {"name":"--sort-by","arity":"value","validator":"sort-by"},
+        {"name":"--sort-order","arity":"value","validator":"sort-order"},
+        {"name":"--has-wiki","arity":"flag","validator":"json"}
+      ],
+      "aliases": []
+    },
+    {
+      "id": "codebase.mr.get",
+      "path": [
+        "codebase",
+        "mr",
+        "get"
+      ],
+      "aliases": [
+        [
+          "codebase",
+          "mr",
+          "view"
+        ],
+        [
+          "codebase",
+          "pr",
+          "get"
+        ],
+        [
+          "codebase",
+          "pr",
+          "view"
+        ]
+      ],
+      "effect": "read",
+      "flags": [
+        {"name":"--repo","aliases":["-R","--repo-name"],"arity":"value","validator":"repo-path"},
+        {"name":"--repo-id","arity":"value","validator":"numeric-id"},
+        {"name":"--mr-id","arity":"value","validator":"numeric-id"},
+        {"name":"--mr","arity":"value","validator":"numeric-id"},
+        {"name":"--version","arity":"value","validator":"page"}
+      ],
+      "positional": "mr",
+      "selector": true,
+      "repo": true
+    },
+    {
+      "id": "codebase.mr.list",
+      "path": [
+        "codebase",
+        "mr",
+        "list"
+      ],
+      "effect": "read",
+      "repo": true,
+      "flags": [
+        {"name":"--repo","aliases":["-R","--repo-name"],"arity":"value","validator":"repo-path"},
+        {"name":"--repo-id","arity":"value","validator":"numeric-id"},
+        {"name":"--head","aliases":["-H","--source-branch"],"arity":"value","validator":"head"},
+        {"name":"--base","aliases":["-B","--target-branch"],"arity":"value","validator":"head"},
+        {"name":"--author","arity":"value","validator":"author"},
+        {"name":"--reviewer","arity":"value","validator":"author"},
+        {"name":"--title","arity":"value","validator":"query"},
+        {"name":"--milestone-id","repeat":true,"arity":"value","validator":"numeric-id"},
+        {"name":"--commit","arity":"value","validator":"commit"},
+        {"name":"--draft","arity":"value","validator":"draft"},
+        {"name":"--wip","arity":"value","validator":"draft"},
+        {"name":"--review-status","arity":"value","validator":"review-status"},
+        {"name":"--page","aliases":["--page-num"],"arity":"value","validator":"page"},
+        {"name":"--page-size","aliases":["-L","--limit"],"arity":"value","validator":"page-size"},
+        {"name":"--state","aliases":["-s","--status"],"arity":"value","validator":"state"},
+        {"name":"--attention","arity":"value","validator":"author"},
+        {"name":"--label","repeat":true,"arity":"value","validator":"author"},
+        {"name":"--sort-by","arity":"value","validator":"sort-by-value"},
+        {"name":"--sort-order","arity":"value","validator":"sort-order"}
+      ],
+      "aliases": [
+        [
+          "codebase",
+          "pr",
+          "list"
+        ]
+      ]
+    },
+    {
+      "id": "codebase.mr.count",
+      "path": [
+        "codebase",
+        "mr",
+        "count"
+      ],
+      "effect": "read",
+      "repo": true,
+      "flags": [
+        {"name":"--repo","aliases":["-R","--repo-name"],"arity":"value","validator":"repo-path"},
+        {"name":"--repo-id","arity":"value","validator":"numeric-id"},
+        {"name":"--head","aliases":["-H","--source-branch"],"arity":"value","validator":"head"},
+        {"name":"--base","aliases":["-B","--target-branch"],"arity":"value","validator":"head"},
+        {"name":"--author","arity":"value","validator":"author"},
+        {"name":"--reviewer","arity":"value","validator":"author"},
+        {"name":"--title","arity":"value","validator":"query"},
+        {"name":"--milestone-id","repeat":true,"arity":"value","validator":"numeric-id"},
+        {"name":"--commit","arity":"value","validator":"commit"},
+        {"name":"--draft","arity":"value","validator":"draft"},
+        {"name":"--wip","arity":"value","validator":"draft"},
+        {"name":"--review-status","arity":"value","validator":"review-status"}
+      ],
+      "aliases": [
+        [
+          "codebase",
+          "pr",
+          "count"
+        ]
+      ]
+    },
+    {
+      "id": "codebase.mr.diff",
+      "path": [
+        "codebase",
+        "mr",
+        "diff"
+      ],
+      "effect": "read",
+      "repo": true,
+      "selector": true,
+      "positional": "mr",
+      "flags": [
+        {"name":"--repo","aliases":["-R","--repo-name"],"arity":"value","validator":"repo-path"},
+        {"name":"--repo-id","arity":"value","validator":"numeric-id"},
+        {"name":"--mr-id","arity":"value","validator":"numeric-id"},
+        {"name":"--mr","arity":"value","validator":"numeric-id"},
+        {"name":"--version","arity":"value","validator":"page"},
+        {"name":"--file","repeat":true,"arity":"value","validator":"file"},
+        {"name":"--context","arity":"value","validator":"context"},
+        {"name":"--max-patch-bytes","arity":"value","validator":"max-patch-bytes"},
+        {"name":"--ignore-whitespace","arity":"flag","validator":"json"}
+      ],
+      "aliases": [
+        [
+          "codebase",
+          "pr",
+          "diff"
+        ]
+      ]
+    },
+    {
+      "id": "codebase.mr.files",
+      "path": [
+        "codebase",
+        "mr",
+        "files"
+      ],
+      "effect": "read",
+      "repo": true,
+      "selector": true,
+      "positional": "mr",
+      "flags": [
+        {"name":"--repo","aliases":["-R","--repo-name"],"arity":"value","validator":"repo-path"},
+        {"name":"--repo-id","arity":"value","validator":"numeric-id"},
+        {"name":"--mr-id","arity":"value","validator":"numeric-id"},
+        {"name":"--mr","arity":"value","validator":"numeric-id"},
+        {"name":"--version","arity":"value","validator":"page"}
+      ],
+      "aliases": [
+        [
+          "codebase",
+          "pr",
+          "files"
+        ]
+      ]
+    },
+    {
+      "id": "codebase.mr.status",
+      "path": [
+        "codebase",
+        "mr",
+        "status"
+      ],
+      "effect": "read",
+      "repo": true,
+      "selector": true,
+      "positional": "mr",
+      "flags": [
+        {"name":"--repo","aliases":["-R","--repo-name"],"arity":"value","validator":"repo-path"},
+        {"name":"--repo-id","arity":"value","validator":"numeric-id"},
+        {"name":"--mr-id","arity":"value","validator":"numeric-id"},
+        {"name":"--mr","arity":"value","validator":"numeric-id"},
+        {"name":"--page-size","arity":"value","validator":"page-size"}
+      ],
+      "aliases": [
+        [
+          "codebase",
+          "pr",
+          "status"
+        ]
+      ]
+    },
+    {
+      "id": "codebase.mr.create",
+      "path": [
+        "codebase",
+        "mr",
+        "create"
+      ],
+      "effect": "write",
+      "repo": true,
+      "required": [
+        "--head",
+        "--base",
+        "--title"
+      ],
+      "flags": [
+        {"name":"--repo","aliases":["-R","--repo-name"],"arity":"value","validator":"repo-path"},
+        {"name":"--repo-id","arity":"value","validator":"numeric-id"},
+        {"name":"--head","aliases":["--source"],"arity":"value","validator":"head"},
+        {"name":"--base","aliases":["--target"],"arity":"value","validator":"head"},
+        {"name":"--title","arity":"value","validator":"query"},
+        {"name":"--body","aliases":["--description"],"arity":"value","validator":"body"},
+        {"name":"--body-file","aliases":["-F"],"arity":"value","validator":"body-file"},
+        {"name":"--merge-method","arity":"value","validator":"merge-method"},
+        {"name":"--draft","arity":"flag","validator":"json"},
+        {"name":"--squash-commits","arity":"flag","validator":"json"},
+        {"name":"--remove-source-branch","arity":"optional-boolean","validator":"draft"},
+        {"name":"--merge-commit-message","arity":"value","validator":"merge-commit-message"},
+        {"name":"--squash-commit-message","arity":"value","validator":"merge-commit-message"},
+        {"name":"--reviewer-ids","repeat":true,"arity":"value","validator":"reviewer-ids"},
+        {"name":"--no-auto-invite-reviewers","arity":"flag","validator":"json"}
+      ],
+      "aliases": [
+        [
+          "codebase",
+          "pr",
+          "create"
+        ]
+      ]
+    },
+    {
+      "id": "codebase.mr.update",
+      "path": [
+        "codebase",
+        "mr",
+        "update"
+      ],
+      "aliases": [
+        [
+          "codebase",
+          "mr",
+          "edit"
+        ],
+        [
+          "codebase",
+          "pr",
+          "update"
+        ],
+        [
+          "codebase",
+          "pr",
+          "edit"
+        ]
+      ],
+      "effect": "write",
+      "repo": true,
+      "selector": true,
+      "positional": "mr",
+      "changes": [
+        "--title",
+        "--body",
+        "--body-file",
+        "--base",
+        "--draft",
+        "--ready"
+      ],
+      "flags": [
+        {"name":"--repo","aliases":["-R","--repo-name"],"arity":"value","validator":"repo-path"},
+        {"name":"--repo-id","arity":"value","validator":"numeric-id"},
+        {"name":"--mr-id","arity":"value","validator":"numeric-id"},
+        {"name":"--mr","aliases":["--number"],"arity":"value","validator":"numeric-id"},
+        {"name":"--title","arity":"value","validator":"query"},
+        {"name":"--body","aliases":["--description"],"arity":"value","validator":"body"},
+        {"name":"--body-file","aliases":["-F"],"arity":"value","validator":"body-file"},
+        {"name":"--base","aliases":["--target"],"arity":"value","validator":"head"},
+        {"name":"--draft","arity":"flag","validator":"json"},
+        {"name":"--ready","arity":"flag","validator":"json"}
+      ]
+    },
+    {
+      "id": "codebase.mr.close",
+      "path": [
+        "codebase",
+        "mr",
+        "close"
+      ],
+      "effect": "write",
+      "repo": true,
+      "selector": true,
+      "positional": "mr",
+      "flags": [
+        {"name":"--repo","aliases":["-R","--repo-name"],"arity":"value","validator":"repo-path"},
+        {"name":"--repo-id","arity":"value","validator":"numeric-id"},
+        {"name":"--mr-id","arity":"value","validator":"numeric-id"},
+        {"name":"--mr","arity":"value","validator":"numeric-id"}
+      ],
+      "aliases": [
+        [
+          "codebase",
+          "pr",
+          "close"
+        ]
+      ]
+    },
+    {
+      "id": "codebase.mr.reopen",
+      "path": [
+        "codebase",
+        "mr",
+        "reopen"
+      ],
+      "effect": "write",
+      "repo": true,
+      "selector": true,
+      "positional": "mr",
+      "flags": [
+        {"name":"--repo","aliases":["-R","--repo-name"],"arity":"value","validator":"repo-path"},
+        {"name":"--repo-id","arity":"value","validator":"numeric-id"},
+        {"name":"--mr-id","arity":"value","validator":"numeric-id"},
+        {"name":"--mr","arity":"value","validator":"numeric-id"}
+      ],
+      "aliases": [
+        [
+          "codebase",
+          "pr",
+          "reopen"
+        ]
+      ]
+    },
+    {
+      "id": "bits.develop.list",
+      "path": [
+        "bits",
+        "develop",
+        "list"
+      ],
+      "effect": "read",
+      "required": [
+        "--space-id"
+      ],
+      "flags": [
+        {"name":"--space-id","arity":"value","validator":"numeric-id"},
+        {"name":"--page","arity":"value","validator":"page"},
+        {"name":"--page-size","arity":"value","validator":"page-size"},
+        {"name":"--title","arity":"value","validator":"query"},
+        {"name":"--about-user","arity":"value","validator":"about-user"},
+        {"name":"--sort","arity":"value","validator":"sort"},
+        {"name":"--state","repeat":true,"arity":"value","validator":"state-value"}
+      ],
+      "aliases": []
+    },
+    {
+      "id": "log.search-log-matchers",
+      "path": [
+        "log",
+        "search-log-matchers"
+      ],
+      "effect": "read",
+      "required": [
+        "--psm"
+      ],
+      "flags": [
+        {"name":"--psm","arity":"value","validator":"psm"},
+        {"name":"--id","arity":"value","validator":"numeric-id"},
+        {"name":"--vregion","arity":"value","validator":"vregion"},
+        {"name":"--output","arity":"value","validator":"output"}
+      ],
+      "aliases": [],
+      "defaults": [
+        {"flag":"--output","value":"console"}
+      ]
+    },
+    {
+      "id": "auth.status",
+      "path": [
+        "auth",
+        "status"
+      ],
+      "effect": "auth",
+      "flags": [],
+      "aliases": []
+    },
+    {
+      "id": "auth.userinfo",
+      "path": [
+        "auth",
+        "userinfo"
+      ],
+      "effect": "auth",
+      "flags": [],
+      "aliases": []
+    },
+    {
+      "id": "auth.login",
+      "path": [
+        "auth",
+        "login"
+      ],
+      "effect": "auth",
+      "flags": [],
+      "aliases": []
+    },
+    {
+      "id": "auth.logout",
+      "path": [
+        "auth",
+        "logout"
+      ],
+      "effect": "auth",
+      "flags": [],
+      "aliases": []
+    }
+  ],
+  "positionalValidators": {
+    "repo": "repo-path",
+    "mr": "numeric-id"
+  },
+  "resourceSelectors": {
+    "repo": [
+      "--repo",
+      "--repo-id"
+    ],
+    "mr": [
+      "--mr",
+      "--mr-id"
+    ]
+  },
+  "resources": [
+    {"flag":"--repo","name":"repo"},
+    {"flag":"--repo-id","name":"repoId"},
+    {"flag":"--mr","name":"mr"},
+    {"flag":"--mr-id","name":"mrId"},
+    {"flag":"--dev-id","name":"devId"},
+    {"flag":"--space-id","name":"spaceId"},
+    {"flag":"--pipeline-id","name":"pipelineId"},
+    {"flag":"--psm","name":"psm"},
+    {"flag":"--head","name":"head"},
+    {"flag":"--base","name":"base"}
+  ],
+  "exclusiveFlags": [
+    [
+      "--body",
+      "--body-file"
+    ],
+    [
+      "--draft",
+      "--ready"
+    ]
+  ],
+  "helpGroups": [
+    {
+      "path": [],
+      "canonicalPath": []
+    },
+    {
+      "path": [
+        "codebase"
+      ],
+      "canonicalPath": [
+        "codebase"
+      ]
+    },
+    {
+      "path": [
+        "codebase",
+        "repo"
+      ],
+      "canonicalPath": [
+        "codebase",
+        "repo"
+      ]
+    },
+    {
+      "path": [
+        "codebase",
+        "mr"
+      ],
+      "canonicalPath": [
+        "codebase",
+        "mr"
+      ]
+    },
+    {
+      "path": [
+        "codebase",
+        "pr"
+      ],
+      "canonicalPath": [
+        "codebase",
+        "mr"
+      ]
+    },
+    {
+      "path": [
+        "bits"
+      ],
+      "canonicalPath": [
+        "bits"
+      ]
+    },
+    {
+      "path": [
+        "bits",
+        "develop"
+      ],
+      "canonicalPath": [
+        "bits",
+        "develop"
+      ]
+    },
+    {
+      "path": [
+        "log"
+      ],
+      "canonicalPath": [
+        "log"
+      ]
+    },
+    {
+      "path": [
+        "auth"
+      ],
+      "canonicalPath": [
+        "auth"
+      ]
+    }
+  ]
+}
