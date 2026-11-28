@@ -72,6 +72,7 @@ export function createAtomcodeAdapter(pathOverride?: string): CliAdapter {
     resumeRequiresCliSessionId: true,
     buildResumeCommand({ cliSessionId }) {
       if (!cliSessionId) return null;
+      // ACP wire IDs carry an `acp-` prefix; interactive `atomcode resume` expects the bare native ID.
       const nativeId = cliSessionId.replace(/^acp-/, '');
       return `atomcode resume '${nativeId.replace(/'/g, "'\\''")}'`;
     },

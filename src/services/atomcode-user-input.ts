@@ -73,6 +73,7 @@ export function parseAtomcodeForm(params: unknown): { message: string; fields: F
     throw unsupported();
   }
 
+  // Reject schema keywords we cannot validate (e.g. pattern/minLength) rather than returning values that violate them.
   const allowedPropKeys = new Set(['type', 'title', 'description', 'enum', 'oneOf', 'items', 'default', 'uniqueItems']);
   const allowedItemKeys = new Set(['type', 'enum', 'anyOf']);
 
@@ -138,6 +139,7 @@ export async function bridgeAtomcodeForm(
       return candidate;
     };
     const skip = !field.required && !field.multi ? unique('跳过此项（可选）') : undefined;
+    // The Ask card broker requires >= 2 options per choice question.
     const cancel = labels.length < 2 ? unique('取消本次提问') : undefined;
     return { field, skip, cancel, labels };
   });
@@ -167,6 +169,7 @@ export async function bridgeAtomcodeForm(
     }
   }
 
+  // Ask free-text fields individually: the Ask broker captures one free-text reply per card, not per field.
   for (const field of fields.filter(f => !f.options)) {
     if (!field.required) {
       const choice = await ask(context, {

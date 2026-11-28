@@ -7,6 +7,7 @@ function resolveHome(env: NodeJS.ProcessEnv): string {
   return env.HOME?.trim() || homedir();
 }
 
+// Treat blank ATOMCODE_HOME as unset (mirrors atomcode-config distribution.rs so empty env never resolves to cwd).
 export function atomcodeDataDir(env: NodeJS.ProcessEnv = process.env): string {
   const configured = env.ATOMCODE_HOME?.trim();
   if (configured) {

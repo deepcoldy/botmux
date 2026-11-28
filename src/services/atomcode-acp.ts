@@ -67,6 +67,8 @@ export async function runAtomcodeAcp(
   signal.throwIfAborted();
   const env = { ...opts.env };
   applySessionOwnerEnv(env, opts.env.BOTMUX_OWNER_OPEN_ID);
+  // Global flags precede `acp`; --model is intentionally applied via session/set_config_option
+  // below so logical model IDs switch both owning account and wire model.
   const cliArgs = [
     '--no-telemetry',
     ...(opts.permission === 'full' ? ['--dangerously-skip-permissions'] : []),
@@ -196,6 +198,7 @@ export async function runAtomcodeAcp(
           throw new Error('atomcode_acp_message_invalid');
         }
         const id = typeof update.messageId === 'string' ? update.messageId : undefined;
+        // AtomCode advances messageId after each LLM round/Usage; reset so pre-tool prose stays out of the final reply.
         if ((id && id !== messageId) || (!id && nextMessage)) {
           content = '';
           contentBytes = 0;
@@ -243,6 +246,7 @@ export async function runAtomcodeAcp(
       fail(error instanceof Error ? error : new Error('atomcode_acp_protocol_invalid'));
     }
   });
+  // Drain stderr without retaining it so verbose tool diagnostics cannot exhaust memory or block the pipe.
   child.stderr.resume();
   child.stdin.on('error', () => fail(new Error('atomcode_acp_transport_closed')));
   child.on('error', () => fail(new Error('atomcode_acp_spawn_failed')));
@@ -336,6 +340,7 @@ export async function runAtomcodeAcp(
     lifetime.abort();
     rejectPending(new Error('atomcode_acp_closed'));
     if (success) {
+      // Allow shutdown_sessions() to commit state and drop the disk lease before SIGTERM.
       try { child.stdin.end(); } catch { /* ignore */ }
       let graceTimer: ReturnType<typeof setTimeout> | undefined;
       await Promise.race([

@@ -60,6 +60,7 @@ const queue: Array<{ content: string; turnId?: string; dispatchAttempt?: number 
 const prompt = () => output.line('›');
 let displayLineStart = true;
 
+// Prefix every displayed line and strip control bytes so model text can neither clear readyPattern nor forge OSC frames.
 function displayText(text: string): void {
   for (const piece of text.replace(/\r/g, '').split(/(\n)/)) {
     if (!piece) continue;
@@ -96,6 +97,7 @@ async function drain(): Promise<void> {
           effort: values.get('--effort'),
           permission: permission as 'full' | 'smart',
           onSession(sessionId) {
+            // Publish immediately so a mid-turn runner crash still preserves this session for resume.
             if (nativeSessionId === sessionId) return;
             nativeSessionId = sessionId;
             output.marker('thread', { threadId: sessionId });
