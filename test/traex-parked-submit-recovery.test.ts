@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createTraexAdapter } from '../src/adapters/cli/traex.js';
+import { createTraexAdapter, traexScreenShowsNoPendingInput } from '../src/adapters/cli/traex.js';
+import { createQueuedActivationReceiptObserver } from '../src/services/queued-activation-receipts.js';
 import { traexComposerHoldsInput, traexRestoredComposerReady } from '../src/adapters/cli/traex-footer.js';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import { InputDeliveryEvidenceTracker } from '../src/services/input-delivery-evidence.js';
@@ -12,6 +13,7 @@ import { claudeComposerHoldsInput, decideSessionStartGatedSubmitWarning, diagnos
 import { screenMayShowCredential } from '../src/core/cli-startup-blocker.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { classifyStuckPage } from '../src/utils/stuck-detector.js';
+import { TerminalRenderer } from '../src/utils/terminal-renderer.js';
 
 const content = '查询大盘状态';
 const composer = (body: string) => `Earlier conversation\n─────────────────────────\n❯ ${body}\n  GPT-6-Astra xhigh · Context 99% left\n  ? for shortcuts`;
@@ -58,6 +60,7 @@ function fixture(options: { acceptsRescue?: boolean; screen?: string; dispatchAt
     cliRestartInProgress: false, lastInitConfig: { cliId: 'traex' },
     webTerminalInputGeneration: 1, cliInterruptGeneration: 0, cliLifetimeNonce: 'lifetime',
     inputDeliveryQuarantine: null, inputDeliveryEvidence: evidence, codexBridgeQueue: queue,
+    createQueuedActivationReceiptObserver,
     submitFailureChains: chain, combineSubmitCurrentFences, settleDeferredSubmitConfirmation,
     usageLimitTracker: { currentTurn: () => 1, detectedThisTurn: () => false },
     submitActivityEvidenceSince: () => 'pty-output', readyGate: { isArmed: false },
@@ -89,7 +92,7 @@ function fixture(options: { acceptsRescue?: boolean; screen?: string; dispatchAt
   scope.traexQuestionCapture = loadWorkerFunction('traexQuestionCapture', scope);
   scope.submitUnconfirmedNotice = loadWorkerFunction('submitUnconfirmedNotice', scope);
   const arm = loadWorkerFunction('armInputDeliveryQuarantine', scope);
-  const quarantine = arm(backend, { turnId: 'delivery', dispatchAttempt: options.dispatchAttempt }, content);
+  const quarantine = arm(backend, { turnId: 'delivery', dispatchAttempt: options.dispatchAttempt }, content, recheck);
   const schedule = loadWorkerFunction('scheduleSubmitFailureNotify', scope);
   const onConfirmed = () => scope.releaseInputDeliveryQuarantine(quarantine, 'receipt', { redriveTerminal: true });
   const start = () => schedule(content, recheck, 'rollout', 'delivery', undefined, 1,
@@ -100,6 +103,132 @@ function fixture(options: { acceptsRescue?: boolean; screen?: string; dispatchAt
     warnings: () => scope.send.mock.calls.filter(([message]: any[]) => message.type === 'user_notify'),
   };
 }
+
+describe('unconfirmed input that left the TRAE composer', () => {
+  // xterm-headless parses writes on async internal tasks. In bun:test's single
+  // process those tasks interleave with the fixture's fake timers and perturb
+  // the later fake-timer cases in this file; the render-fidelity assertion stays
+  // fully covered under vitest's Node workers, so run it Node-only.
+  it.skipIf(!!process.versions.bun)('keeps native queued input through the real PTY renderer without collapsing its structural indentation', async () => {
+    const renderer = new TerminalRenderer(160, 50);
+    try {
+      const pending = `✦ Running… (1m • esc to interrupt)\nSend after tool call · esc to interrupt and send · ↑ to edit\n❯ original input\n${Array(25).fill('  continued native input').join('\n')}\n─────────────────────────\n❯ Use /skills to list available skills\n  GPT-6-Astra xhigh · Context 99% left\n  ? for shortcuts`;
+      await renderer.writeAndFlush(pending.replace(/\n/g, '\r\n'));
+      const h = fixture({ acceptsRescue: false });
+      h.scope.captureBackendScreen = loadWorkerFunction('captureBackendScreen', { renderer });
+      expect(traexScreenShowsNoPendingInput(h.scope.captureBackendScreen({}, { preserveFormatting: true }))).toBe(false);
+      h.start();
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(h.scope.inputDeliveryQuarantine).not.toBeNull();
+      expect(h.backend.write).not.toHaveBeenCalled();
+      expect(h.backend.sendSpecialKeys).not.toHaveBeenCalled();
+    } finally { renderer.dispose(); }
+  });
+
+  it('accepts only an initialized empty composer, preserving drafts, work and native queued input', () => {
+    const empty = composer('Use /skills to list available skills');
+    expect(traexScreenShowsNoPendingInput(empty)).toBe(true);
+    expect(traexScreenShowsNoPendingInput(empty.replace('99% left', '—'))).toBe(true);
+    expect(traexScreenShowsNoPendingInput(composer(content))).toBe(false);
+    expect(traexScreenShowsNoPendingInput('❯\n? for shortcuts')).toBe(false);
+    expect(traexScreenShowsNoPendingInput(`✦ 正在运行… (2m • esc to interrupt)\n${empty}`)).toBe(false);
+    const pending = `Send after tool call · esc to interrupt and send · ↑ to edit\n❯ original draft\n${Array(25).fill('  continued draft').join('\n')}\n${empty.replace('Earlier conversation\n', '')}`;
+    expect(traexScreenShowsNoPendingInput(pending)).toBe(false);
+    for (const name of ['traex-0.214.1-single-160x50.txt', 'traex-0.214.1-submit-confirm-160x50.txt']) {
+      expect(traexScreenShowsNoPendingInput(readFileSync(`test/fixtures/traex-question/${name}`, 'utf8'))).toBe(false);
+    }
+  });
+
+  // Same xterm/fake-timer interleaving as the real-PTY case above; the narrow
+  // renderer assertion is covered under vitest's Node workers.
+  it.skipIf(!!process.versions.bun)('keeps a wrapped native pending-input panel through the real narrow PTY renderer', async () => {
+    const empty = '❯ Use /skills to list available skills\n  m · Context 99% left\n  ? for shortcuts';
+    expect(traexScreenShowsNoPendingInput(empty)).toBe(true);
+    const pending = `Send after tool call · esc to interrupt and send · ↑ to edit\n❯ original input\n${Array(25).fill('  continued native input').join('\n')}\n${empty}`;
+    const renderer = new TerminalRenderer(40, 50);
+    try {
+      await renderer.writeAndFlush(pending.replace(/\n/g, '\r\n'));
+      const screen = renderer.rawSnapshot({ preserveFormatting: true });
+      expect(screen).toContain('Send after tool call');
+      expect(traexScreenShowsNoPendingInput(screen)).toBe(false);
+    } finally { renderer.dispose(); }
+  });
+
+  it('does not mistake natural-language lines for a wrapped pending-input header', () => {
+    const empty = '❯ Use /skills to list available skills\n  m · Context 99% left\n  ? for shortcuts';
+    for (const row of ['and send it to the reviewer', 'Send after you finish']) {
+      expect(traexScreenShowsNoPendingInput(`${row}\n${empty}`)).toBe(true);
+    }
+  });
+
+  it.each([
+    ['truncated model/cwd row', [
+      '──────────────────────────────────────────────────────────',
+      '❯ Ask TRAE CLI to do anything',
+      '──────────────────────────────────────────────────────────',
+      '  GPT-6.1-Sol · /tmp/repo/very-long-directory-name-component-0123456789/very-long-directory-name-compo…',
+      '  ? for shortcuts',
+    ].join('\n')],
+    ['initialized hint-only footer', [
+      '  █ ◆ ◆ █  TRAE CLI (v0.214.1)',
+      '  Tip: status_line=[] keeps this initialized composer on the native hint footer',
+      '──────────────────────────────────────────────────────────',
+      '❯ Ask TRAE CLI to do anything',
+      '──────────────────────────────────────────────────────────',
+      '  ? for shortcuts',
+    ].join('\n')],
+  ])('accepts the strictly initialized empty composer: %s', (_name, screen) => {
+    expect(traexRestoredComposerReady(screen, { requireThreadReady: true })).toBe(true);
+    expect(traexScreenShowsNoPendingInput(screen)).toBe(true);
+  });
+
+  it('still rejects a provisional shortcut-only composer without initialized content', () => {
+    const screen = [
+      '  █ ◆ ◆ █  TRAE CLI (v0.214.1)',
+      '  /tmp/traex0214/work',
+      '──────────────────────────────────────────────────────────',
+      '❯ Ask TRAE CLI to do anything',
+      '──────────────────────────────────────────────────────────',
+      '  ? for shortcuts',
+    ].join('\n');
+    expect(traexRestoredComposerReady(screen)).toBe(true);
+    expect(traexRestoredComposerReady(screen, { requireThreadReady: true })).toBe(false);
+    expect(traexScreenShowsNoPendingInput(screen)).toBe(false);
+  });
+
+  it('releases an ordinary submit after two empty screens without resending the original', async () => {
+    const h = fixture({ acceptsRescue: false, screen: composer('Use /skills to list available skills') });
+    h.start();
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(h.scope.inputDeliveryQuarantine).not.toBeNull();
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(h.scope.inputDeliveryQuarantine).not.toBeNull();
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(h.scope.inputDeliveryQuarantine).toBeNull();
+    expect(h.chain.size()).toBe(0);
+    expect(h.backend.write).not.toHaveBeenCalled();
+    expect(h.backend.sendSpecialKeys).not.toHaveBeenCalled();
+    expect(h.scope.flushPending).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(h.chain.size()).toBe(0);
+    expect(h.warnings()).toHaveLength(1);
+  });
+
+  it('resets the empty-screen count if a draft reappears between polls', async () => {
+    const h = fixture({ acceptsRescue: false, screen: composer('Use /skills to list available skills') });
+    h.start();
+    await vi.advanceTimersByTimeAsync(20_000);
+    h.setScreen(composer(`[Pasted Content ${Array.from(content).length} chars]`));
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(h.scope.inputDeliveryQuarantine).not.toBeNull();
+    h.setScreen(composer('Use /skills to list available skills'));
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(h.scope.inputDeliveryQuarantine).not.toBeNull();
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(h.scope.inputDeliveryQuarantine).toBeNull();
+    expect(h.backend.write).not.toHaveBeenCalled();
+  });
+});
 
 describe('TRAE parked draft recovery', () => {
   it.each([content, `[Pasted Content ${Array.from(content).length} chars]`])(
