@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
@@ -191,14 +191,14 @@ describe('atomcode-runner', () => {
     expect(final).toMatchObject({ errorCode: 'turn_budget_exhausted', turnId: 'turn-budget' });
   });
 
-  it('waits out a retiring runner slow session/close across PTY SIGHUP restart without failing preserved input', async () => {
+  it('waits through the previous runner close timeout and forced lease release across a PTY restart', async () => {
     const shared = fixture();
     const leaseFile = join(shared.root, 'session.lease');
     const oldRunner = startRunner([], false, {
       existingFixture: shared,
       extraEnv: {
         ATOMCODE_ACP_LEASE_FILE: leaseFile,
-        ATOMCODE_ACP_CLOSE_DELAY_MS: '2000',
+        ATOMCODE_ACP_CLOSE_DELAY_MS: '6500',
       },
     });
     await waitFor(() => /^›$/m.test(oldRunner.h.stdout));
@@ -206,6 +206,13 @@ describe('atomcode-runner', () => {
     oldRunner.send('warm-turn-1', 'turn-1');
     await waitFor(() => markers(oldRunner.h.stdout).some(m => m.kind === 'final' && m.payload.turnId === 'turn-1'));
 
+    // The fake lease is a path, not a kernel fd: reconcile it only after the old
+    // runner has completed its real close timeout and process-group reaping.
+    const oldReaped = oldRunner.h.closed.then(exit => {
+      try { unlinkSync(leaseFile); } catch { /* already released */ }
+      writeFileSync(shared.log, JSON.stringify({ event: 'lease_reaped', at: Date.now() }) + '\n', { flag: 'a' });
+      return exit;
+    });
     // Mimic worker PTY in-place restart: SIGHUP old runner, then spawn replacement
     // 500ms later with the same nativeSessionId and immediately deliver preserved input.
     oldRunner.h.child.kill('SIGHUP');
@@ -220,7 +227,7 @@ describe('atomcode-runner', () => {
     newRunner.send('preserved-after-sighup', 'turn-2');
 
     await waitFor(() => markers(newRunner.h.stdout).some(m => m.kind === 'final' && m.payload.turnId === 'turn-2'));
-    const oldExit = await oldRunner.h.closed;
+    const oldExit = await oldReaped;
     expect(oldExit.code).toBe(0);
 
     const turn2Final = markers(newRunner.h.stdout).find(m => m.kind === 'final' && m.payload.turnId === 'turn-2')?.payload;
@@ -232,12 +239,15 @@ describe('atomcode-runner', () => {
 
     const calls = readCalls(shared.log);
     const busyIdx = calls.findIndex(e => e.event === 'resume_lease_busy');
-    const closeDoneIdx = calls.findIndex(e => e.event === 'close_done');
+    const releaseIdx = calls.findIndex(e => e.event === 'lease_reaped');
     expect(busyIdx).toBeGreaterThan(-1);
-    expect(closeDoneIdx).toBeGreaterThan(busyIdx);
+    expect(releaseIdx, JSON.stringify(calls)).toBeGreaterThan(busyIdx);
+    // The 6.5s fake close exceeds the 6s request bound; the fake path lock is
+    // reconciled only after forced process-group teardown, not a close response.
+    expect(calls.some(e => e.event === 'close_done')).toBe(false);
     // Exactly 2 ACP spawns total (old + replacement); retries happened on the live replacement ACP process.
     expect(calls.filter(e => Array.isArray(e.args))).toHaveLength(2);
-  });
+  }, 20_000);
 
   it('handles broken stdout (EPIPE) + SIGHUP mid-stream cleanly and still closes the ACP session lease', async () => {
     const shared = fixture();

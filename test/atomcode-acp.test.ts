@@ -659,11 +659,11 @@ describe('AtomcodeAcpSession persistent lifecycle', () => {
   });
 
   it('retries session/resume on the same ACP process until a busy lease releases, fails fast on non-lease errors, and honors abort', async () => {
-    // 1. Exclusive lease held at resume time and released 450ms later -> retries on 1 spawn and succeeds.
+    // 1. Exclusive lease held across several fixed-interval retries, then released -> one spawn and success.
     const fBusy = createFixture();
     const leaseFile = join(fBusy.root, 'session.lease');
     writeFileSync(leaseFile, 'held');
-    const releaseTimer = setTimeout(() => { try { unlinkSync(leaseFile); } catch { /* ignore */ } }, 450);
+    const releaseTimer = setTimeout(() => { try { unlinkSync(leaseFile); } catch { /* ignore */ } }, 1_600);
     const sBusy = new AtomcodeAcpSession({
       executable: fBusy.bin,
       cwd: fBusy.root,
@@ -689,6 +689,13 @@ describe('AtomcodeAcpSession persistent lifecycle', () => {
     expect(busyEntries.filter(e => Array.isArray(e.args))).toHaveLength(1);
     expect(busyEntries.some(e => e.event === 'resume_lease_busy')).toBe(true);
     expect(busyEntries.filter(e => e.message?.method === 'session/resume').length).toBeGreaterThanOrEqual(2);
+    const resumeTimes = busyEntries
+      .filter(e => e.message?.method === 'session/resume')
+      .map(e => e.at);
+    expect(resumeTimes.length).toBeGreaterThanOrEqual(4);
+    for (let i = 1; i < resumeTimes.length; i++) {
+      expect(resumeTimes[i] - resumeTimes[i - 1]).toBeGreaterThanOrEqual(400);
+    }
 
     // 2. Non-lease RPC errors (e.g. unknown session) must fail immediately without retrying.
     const fUnknown = createFixture({ ATOMCODE_ACP_SCENARIO: 'unknown-session' });
@@ -703,6 +710,20 @@ describe('AtomcodeAcpSession persistent lifecycle', () => {
     }, new AbortController().signal)).rejects.toThrow(/unknown session/);
     expect(fUnknown.readLog().filter(e => e.message?.method === 'session/resume')).toHaveLength(1);
 
+    const fWrongCode = createFixture({ ATOMCODE_ACP_RESUME_CONFLICT_CODE: '-32000' });
+    const wrongCodeLease = join(fWrongCode.root, 'wrong-code.lease');
+    writeFileSync(wrongCodeLease, 'held');
+    await expect(runSingleTurn({
+      executable: fWrongCode.bin,
+      cwd: fWrongCode.root,
+      env: { ...fWrongCode.env, ATOMCODE_ACP_LEASE_FILE: wrongCodeLease },
+      nativeSessionId: 'acp-wrong-code',
+      content: 'hello',
+      permission: 'full',
+      onUserInput: async () => ({}),
+    }, new AbortController().signal)).rejects.toThrow(/session is active in another atomcode process/);
+    expect(fWrongCode.readLog().filter(e => e.message?.method === 'session/resume')).toHaveLength(1);
+
     // 3. Caller abort during lease retry backoff unblocks immediately instead of waiting out the full budget.
     const fAbort = createFixture();
     const stuckLease = join(fAbort.root, 'stuck.lease');
@@ -716,15 +737,15 @@ describe('AtomcodeAcpSession persistent lifecycle', () => {
       idleTimeoutMs: 30_000,
     });
     const controller = new AbortController();
-    const t0 = Date.now();
     const abortTurn = sAbort.runTurn({
       content: 'should-abort',
       onUserInput: async () => ({}),
     }, controller.signal);
     await waitFor(() => fAbort.readLog().some(e => e.event === 'resume_lease_busy'));
+    const abortedAt = Date.now();
     controller.abort();
     await expect(abortTurn).rejects.toThrow(/aborted/);
-    expect(Date.now() - t0).toBeLessThan(2_000);
+    expect(Date.now() - abortedAt).toBeLessThan(300);
     await sAbort.close(false);
 
     // 4. Subprocess crash during lease-wait backoff must surface atomcode_acp_process_exited (not aborted).
@@ -739,6 +760,46 @@ describe('AtomcodeAcpSession persistent lifecycle', () => {
       onUserInput: async () => ({}),
     }, new AbortController().signal)).rejects.toThrow(/atomcode_acp_process_exited/);
   });
+
+  it('applies the same lease wait to the session/load fallback', async () => {
+    const f = createFixture({ ATOMCODE_ACP_SCENARIO: 'load' });
+    const leaseFile = join(f.root, 'load.lease');
+    writeFileSync(leaseFile, 'held');
+    const releaseTimer = setTimeout(() => { try { unlinkSync(leaseFile); } catch { /* ignore */ } }, 1_100);
+    try {
+      const result = await runSingleTurn({
+        executable: f.bin,
+        cwd: f.root,
+        env: { ...f.env, ATOMCODE_ACP_LEASE_FILE: leaseFile },
+        nativeSessionId: 'acp-load-lease',
+        content: 'hello',
+        permission: 'full',
+        onUserInput: async () => ({}),
+      }, new AbortController().signal);
+      expect(result.content).toContain('echo:hello');
+    } finally {
+      clearTimeout(releaseTimer);
+    }
+    const entries = f.readLog();
+    expect(entries.filter(e => e.message?.method === 'session/load').length).toBeGreaterThanOrEqual(2);
+    expect(entries.some(e => e.message?.method === 'session/resume')).toBe(false);
+  });
+
+  it('fails the original lease conflict after the bounded wait when another process never releases', async () => {
+    const f = createFixture();
+    const leaseFile = join(f.root, 'permanent.lease');
+    writeFileSync(leaseFile, 'held-by-another-process');
+    await expect(runSingleTurn({
+      executable: f.bin,
+      cwd: f.root,
+      env: { ...f.env, ATOMCODE_ACP_LEASE_FILE: leaseFile },
+      nativeSessionId: 'acp-permanent-lease',
+      content: 'hello',
+      permission: 'full',
+      onUserInput: async () => ({}),
+    }, new AbortController().signal)).rejects.toThrow(/session is active in another atomcode process/);
+    expect(f.readLog().filter(e => e.message?.method === 'session/resume').length).toBeGreaterThan(1);
+  }, 20_000);
 
   it('unparks pending permission RPC on abort and lets close(true) cancel cooperatively without duplicate session/cancel', async () => {
     // 1. Aborting during session/request_permission replies with cancelled outcome so AtomCode unparks promptly.

@@ -2,7 +2,7 @@ import { appendFileSync, closeSync, openSync, unlinkSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 
-const log = value => process.env.ATOMCODE_TEST_LOG && appendFileSync(process.env.ATOMCODE_TEST_LOG, JSON.stringify(value) + '\n');
+const log = value => process.env.ATOMCODE_TEST_LOG && appendFileSync(process.env.ATOMCODE_TEST_LOG, JSON.stringify({ at: Date.now(), ...value }) + '\n');
 log({ pid: process.pid, ppid: process.ppid, args: process.argv.slice(2), owner: process.env.BOTMUX_OWNER_OPEN_ID, home: process.env.ATOMCODE_HOME });
 
 const leaseFile = process.env.ATOMCODE_ACP_LEASE_FILE;
@@ -32,6 +32,7 @@ const send = value => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...v
 const NUL = String.fromCharCode(0);
 const skipPerms = process.argv.includes('--dangerously-skip-permissions');
 const scenario = process.env.ATOMCODE_ACP_SCENARIO;
+const resumeLeaseConflictCode = Number(process.env.ATOMCODE_ACP_RESUME_CONFLICT_CODE ?? '-32602');
 const control = {
   configOptions: [
     {
@@ -132,7 +133,7 @@ for await (const line of createInterface({ input: process.stdin })) {
       send({
         id,
         error: {
-          code: -32602,
+          code: resumeLeaseConflictCode,
           message: 'Invalid params',
           data: 'session is active in another atomcode process; close it before resuming',
         },
@@ -304,7 +305,7 @@ for await (const line of createInterface({ input: process.stdin })) {
       log({ event: 'interaction_cancelled', id, result: message.result });
       const idToCancel = promptId;
       promptId = undefined;
-      if (idToCancel !== undefined) send({ id: idToCancel, result: { stopReason: 'cancelled' } });
+      if (idToCancel !== undefined) setTimeout(() => send({ id: idToCancel, result: { stopReason: 'cancelled' } }), 0);
     } else {
       complete(`form:${JSON.stringify(message.result)}`);
     }
@@ -313,7 +314,7 @@ for await (const line of createInterface({ input: process.stdin })) {
       log({ event: 'interaction_cancelled', id, result: message.result });
       const idToCancel = promptId;
       promptId = undefined;
-      if (idToCancel !== undefined) send({ id: idToCancel, result: { stopReason: 'cancelled' } });
+      if (idToCancel !== undefined) setTimeout(() => send({ id: idToCancel, result: { stopReason: 'cancelled' } }), 0);
     } else {
       complete(`perm:${JSON.stringify(message.result)}`);
     }

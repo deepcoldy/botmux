@@ -27,10 +27,12 @@ const GRACEFUL_EXIT_TIMEOUT_MS = 1_500;
 // (CLOSE_REQUEST_TIMEOUT_MS + GRACEFUL_EXIT_TIMEOUT_MS + SIGKILL escalation)
 // when worker PTY restart respawns after 500ms, while still failing closed if
 // another process holds the session indefinitely.
-const RESUME_LEASE_WAIT_MS = 9_000;
-const RESUME_LEASE_RETRY_INITIAL_MS = 100;
-const RESUME_LEASE_RETRY_STEP_MS = 50;
-const RESUME_LEASE_RETRY_MAX_MS = 250;
+const RESUME_LEASE_WAIT_MS = 10_000;
+const RESUME_LEASE_RETRY_INTERVAL_MS = 500;
+// Confirmed on the official AtomCode 5.2.9 Linux binary and its v5.2.9
+// acp/dispatch.rs map_resume_start_error(): session/resume and session/load
+// share this SessionInUse mapping. Do not broaden this to other invalid-params.
+const RESUME_LEASE_CONFLICT_DATA = 'session is active in another atomcode process; close it before resuming';
 // Idle drain window (and hard cap) after OS process 'exit' before destroying stdio
 // pipes and failing pending RPCs. Resetting on active stdout chunks avoids cutting off
 // near-cap frames whose JSON.parse exceeds 50ms, while still bounding detached grandchildren.
@@ -148,17 +150,21 @@ interface OpenConnectionOptions {
 }
 
 class AtomcodeAcpRpcError extends Error {
-  constructor(detail: string) {
+  constructor(
+    detail: string,
+    readonly code?: number,
+    readonly data?: unknown,
+  ) {
     super(`atomcode ACP: ${detail}`);
   }
 }
 
-/** Detect AtomCode's exclusive session-lease conflict on session/resume|load
- *  (e.g. `session is active in another atomcode process; close it before resuming`)
- *  without retrying permanent failures such as unknown session or cwd mismatch. */
+/** Retry only the exact SessionInUse wire error emitted by AtomCode 5.2.9;
+ * unknown sessions, cwd mismatches, auth failures, and other RPC errors stay fail-fast. */
 function isResumeLeaseBusyError(error: unknown): boolean {
-  if (!(error instanceof AtomcodeAcpRpcError)) return false;
-  return /session is active in another atomcode process|session.{0,24}in use|lease.{0,24}(?:busy|held|locked)/i.test(error.message);
+  return error instanceof AtomcodeAcpRpcError
+    && error.code === -32602
+    && error.data === RESUME_LEASE_CONFLICT_DATA;
 }
 
 function sleepWithAbort(ms: number, signal: AbortSignal): Promise<void> {
@@ -637,7 +643,6 @@ class AtomcodeAcpConnection {
   ): Promise<Json> {
     const deadline = Date.now() + RESUME_LEASE_WAIT_MS;
     const waitSignal = AbortSignal.any([signal, this.lifetime.signal]);
-    let delayMs = RESUME_LEASE_RETRY_INITIAL_MS;
     while (true) {
       try {
         return await this.request(method, params);
@@ -647,13 +652,12 @@ class AtomcodeAcpConnection {
           throw error;
         }
         try {
-          await sleepWithAbort(Math.min(delayMs, remaining), waitSignal);
+          await sleepWithAbort(Math.min(RESUME_LEASE_RETRY_INTERVAL_MS, remaining), waitSignal);
         } catch (waitError) {
           // Surface subprocess crash reason instead of misreporting it as caller abort.
           if (!signal.aborted && this.failure) throw this.failure;
           throw waitError;
         }
-        delayMs = Math.min(delayMs + RESUME_LEASE_RETRY_STEP_MS, RESUME_LEASE_RETRY_MAX_MS);
       }
     }
   }
@@ -813,7 +817,11 @@ class AtomcodeAcpConnection {
         : typeof message.error.message === 'string'
           ? message.error.message
           : 'request failed';
-      entry.reject(new AtomcodeAcpRpcError(detail));
+      entry.reject(new AtomcodeAcpRpcError(
+        detail,
+        typeof message.error.code === 'number' ? message.error.code : undefined,
+        message.error.data,
+      ));
     } else if (isObject(message.result)) {
       entry.resolve(message.result);
     } else {
