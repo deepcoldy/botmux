@@ -935,6 +935,17 @@ function assembleSegments(prepared: readonly PreparedSegment[]): string {
   return out.join('\n');
 }
 
+function trimBlankLines(text: string): string {
+  const lines = text.split('\n');
+  let start = 0;
+  let end = lines.length;
+  while (start < end && !lines[start]!.trim()) start += 1;
+  while (end > start && !lines[end - 1]!.trim()) end -= 1;
+  // String.trim() would turn a first-segment indented code block into prose by
+  // deleting its four-space prefix. Remove boundary blank lines only.
+  return lines.slice(start, end).join('\n');
+}
+
 function clampReplyText(text: string): string {
   if (text.length <= MAX_REPLY_TEXT_CHARS) return text;
   let cut = MAX_REPLY_TEXT_CHARS - 1;
@@ -949,7 +960,7 @@ export function extractInteractiveCardReplyText(card: unknown): string | undefin
   try {
     const bounded = boundedCopy(card, 0, { nodes: 0, chars: 0 });
     if (!isRecord(bounded) || bounded.type === 'template') return undefined;
-    const text = assembleSegments(collectCardSegments(bounded)).trim();
+    const text = trimBlankLines(assembleSegments(collectCardSegments(bounded)));
     if (!text || isPlaceholderOnlyText(text)) return undefined;
     return clampReplyText(text);
   } catch {

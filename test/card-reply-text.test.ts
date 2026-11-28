@@ -515,6 +515,16 @@ describe('extractInteractiveCardReplyText', () => {
     );
     expect(indentedHtml).toContain('<p>after cleaned<br>\nline2</p>');
 
+    const startsIndented = "    <font color='red'>start</font><br>line";
+    const firstBlock = extractInteractiveCardReplyText({
+      schema: '2.0',
+      body: { elements: [{ tag: 'markdown', content: startsIndented }] },
+    });
+    expect(firstBlock).toBe(startsIndented);
+    expect(md.render(firstBlock!)).toBe(
+      "<pre><code>&lt;font color='red'&gt;start&lt;/font&gt;&lt;br&gt;line\n</code></pre>\n",
+    );
+
     // Tab-indented code block is protected; 4-space paragraph continuation without blank line is NOT code.
     const tabAndContinuation = extractInteractiveCardReplyText({
       schema: '2.0',
