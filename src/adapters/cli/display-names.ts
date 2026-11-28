@@ -42,6 +42,7 @@ export const CLI_DISPLAY_NAMES: Readonly<Record<CliId, string>> = {
   'zcode': 'ZCode',
   'doubao': 'Doubao',
   nca: 'NCA',
+  atomcode: 'AtomCode',
 };
 
 /** Display name for a possibly-unknown id (persisted / runtime-supplied). */

@@ -5,6 +5,7 @@ import type { DaemonSession } from './types.js';
 import { resolveSessionLaunchModel } from './session-model.js';
 import { getBot } from '../bot-registry.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
+import { withResumeCommandEnv } from '../adapters/cli/resume-command-env.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { buildWrappedLaunch, decorateResumeForWrapper, parseWrapperCli } from '../setup/cli-selection.js';
 import { buildForgeTraexLaunch, decorateResumeForCliLaunchMode, type CliLaunchMode } from './cli-launch-mode.js';
@@ -34,6 +35,7 @@ interface EffectiveCliConfig {
   wrapperCli?: string;
   cliLaunchMode?: CliLaunchMode;
   model?: string;
+  env?: Record<string, string>;
 }
 
 function shellQuote(value: string): string {
@@ -54,7 +56,7 @@ function onPath(bin: string): boolean {
 }
 
 function effectiveCliConfig(ds: DaemonSession): EffectiveCliConfig {
-  let botCfg: { cliId?: CliId; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode; model?: string } | undefined;
+  let botCfg: { cliId?: CliId; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode; model?: string; env?: Record<string, string> } | undefined;
   try { botCfg = getBot(ds.larkAppId).config; } catch { /* tests / deregistered bot */ }
   return {
     cliId: (ds.session.cliId ?? ds.initConfig?.cliId ?? botCfg?.cliId ?? 'claude-code') as CliId,
@@ -65,6 +67,7 @@ function effectiveCliConfig(ds: DaemonSession): EffectiveCliConfig {
     // actually spawned with (initConfig), then what botmux would launch next
     // (live bot config — see resolveSessionLaunchModel).
     model: ds.initConfig?.model ?? resolveSessionLaunchModel(ds, botCfg),
+    env: ds.initConfig?.env ?? botCfg?.env,
   };
 }
 
@@ -75,6 +78,7 @@ function isCodexFamily(cliId: string): boolean {
 function defaultLocalExecutable(cliId: CliId, adapterResolvedBin: string, cliPathOverride?: string): string | null {
   if (cliPathOverride?.trim()) return cliPathOverride.trim();
   if (cliId === 'codex-app') return 'codex';
+  if (cliId === 'atomcode') return 'atomcode';
   if (cliId === 'mira' || cliId === 'dsh') return null;
   if (cliId === 'mir') return 'mircli';
   return adapterResolvedBin;
@@ -119,11 +123,13 @@ export function localCliCommandForSession(ds: DaemonSession): LocalCliCommandRes
   }
 
   let rawResume: string | null;
+  let resumeEnv: Readonly<Record<string, string>> | undefined;
   try {
     rawResume = adapter.buildResumeCommand?.({
       sessionId: ds.session.sessionId,
       cliSessionId: ds.session.cliSessionId,
     }) ?? null;
+    resumeEnv = adapter.buildResumeCommandEnv?.({ env: cfg.env });
   } catch (err) {
     // Adapter configuration error (e.g. an NCA home resolving to the filesystem
     // root). Surface it instead of falling through to a silent fresh launch.
@@ -135,6 +141,8 @@ export function localCliCommandForSession(ds: DaemonSession): LocalCliCommandRes
     };
   }
 
+  const finalizeCommand = (command: string) => `${cd} && ${withResumeCommandEnv(`exec ${command}`, resumeEnv)}`;
+
   if (rawResume) {
     const decorated = cfg.cliLaunchMode
       ? decorateResumeForCliLaunchMode(rawResume, cfg.cliLaunchMode)
@@ -143,20 +151,20 @@ export function localCliCommandForSession(ds: DaemonSession): LocalCliCommandRes
       if (!onPath('forge')) {
         return { ok: false, error: 'cli_unavailable', cliId: cfg.cliId, executable: 'forge' };
       }
-      return { ok: true, mode: 'resume', executable: 'forge', command: `${cd} && exec ${decorated}` };
+      return { ok: true, mode: 'resume', executable: 'forge', command: finalizeCommand(decorated) };
     }
     if (cfg.wrapperCli?.trim()) {
       const executable = parseWrapperCli(cfg.wrapperCli)[0];
       if (!executable || !onPath(executable)) {
         return { ok: false, error: 'cli_unavailable', cliId: cfg.cliId, executable };
       }
-      return { ok: true, mode: 'resume', executable, command: `${cd} && exec ${decorated}` };
+      return { ok: true, mode: 'resume', executable, command: finalizeCommand(decorated) };
     }
     const executable = defaultLocalExecutable(cfg.cliId, adapter.resolvedBin, cfg.cliPathOverride);
     if (!executable || !onPath(executable)) {
       return { ok: false, error: 'cli_unavailable', cliId: cfg.cliId, executable: executable ?? cfg.cliId };
     }
-    return { ok: true, mode: 'resume', executable, command: `${cd} && exec ${replaceFirstToken(rawResume, executable)}` };
+    return { ok: true, mode: 'resume', executable, command: finalizeCommand(replaceFirstToken(rawResume, executable)) };
   }
 
   if (cfg.cliLaunchMode === 'forge-traex') {
@@ -164,7 +172,7 @@ export function localCliCommandForSession(ds: DaemonSession): LocalCliCommandRes
     if (!onPath(executable)) {
       return { ok: false, error: 'cli_unavailable', cliId: cfg.cliId, executable };
     }
-    return { ok: true, mode: 'launch', executable, command: `${cd} && exec ${command}` };
+    return { ok: true, mode: 'launch', executable, command: finalizeCommand(command) };
   }
 
   if (cfg.wrapperCli?.trim()) {
@@ -172,7 +180,7 @@ export function localCliCommandForSession(ds: DaemonSession): LocalCliCommandRes
     if (!executable || !onPath(executable)) {
       return { ok: false, error: 'cli_unavailable', cliId: cfg.cliId, executable };
     }
-    return { ok: true, mode: 'launch', executable, command: `${cd} && exec ${command}` };
+    return { ok: true, mode: 'launch', executable, command: finalizeCommand(command) };
   }
 
   const executable = defaultLocalExecutable(cfg.cliId, adapter.resolvedBin, cfg.cliPathOverride);
@@ -182,7 +190,7 @@ export function localCliCommandForSession(ds: DaemonSession): LocalCliCommandRes
   if (!onPath(executable)) {
     return { ok: false, error: 'cli_unavailable', cliId: cfg.cliId, executable };
   }
-  return { ok: true, mode: 'launch', executable, command: `${cd} && exec ${shellQuote(executable)}` };
+  return { ok: true, mode: 'launch', executable, command: finalizeCommand(shellQuote(executable)) };
 }
 
 function spawnDetached(command: string, args: string[]): { ok: true } | { ok: false; error: string } {

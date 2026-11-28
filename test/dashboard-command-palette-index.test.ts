@@ -645,6 +645,7 @@ describe('⌘K reaches the Bot config page, its categories and each bot', () => 
     it.each([
       { cliId: 'dsh', field: 'botDefaults.agentTurnTimeout' },
       { cliId: 'minimax', field: 'botDefaults.minimaxTurnBudget' },
+      { cliId: 'atomcode', field: 'botDefaults.minimaxTurnBudget' },
     ])(`finds the rendered $cliId budget field and preserves its deep link (${locale} UI)`, async ({ cliId, field }) => {
       vi.stubGlobal('window', { localStorage: { getItem: () => null, setItem: () => {} } });
       vi.stubGlobal('document', { documentElement: {}, addEventListener: () => {}, removeEventListener: () => {} });

@@ -7985,7 +7985,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
   // Daemon/card readiness can lag behind a committed ordinary input. MiniMax
   // queues native turns, so changing capture ownership while it is busy would
   // discard that ordinary turn's final. Keep ownership until the real prompt.
-  if (lastInitConfig?.cliId === 'minimax' && msg.content.trim() === '/compact'
+  if ((lastInitConfig?.cliId === 'minimax' || lastInitConfig?.cliId === 'atomcode') && msg.content.trim() === '/compact'
     && (!isPromptReady || commandLineWritesPending > 0)) {
     pendingRawInputs.push(msg);
     return;
@@ -8105,7 +8105,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
       // been cancelled cleanly: one that could not be is left to ZMX recovery
       // (the notice below says so), and reannouncing ready would invite the
       // very input that backend now refuses.
-      const untouchedCompact = lastInitConfig?.cliId === 'minimax'
+      const untouchedCompact = (lastInitConfig?.cliId === 'minimax' || lastInitConfig?.cliId === 'atomcode')
         && msg.content.trim() === '/compact'
         && err instanceof SubmissionWriteError && !err.submissionStarted
         && !recoveryFailureReason
@@ -8325,7 +8325,7 @@ function setCaptureIdentity(
     currentPromotedFromDispatchAttempt = currentBotmuxDispatchAttempt;
     currentPromotedAbsorbedTurn = false;
   }
-  if (changed && lastInitConfig?.cliId === 'minimax') minimaxFinalReceiver.reset();
+  if (changed && (lastInitConfig?.cliId === 'minimax' || lastInitConfig?.cliId === 'atomcode')) minimaxFinalReceiver.reset();
   currentBotmuxTurnId = turnId;
   currentBotmuxDispatchAttempt = dispatchAttempt;
   currentBotmuxCallerOpenId = callerOpenId;
@@ -28073,6 +28073,7 @@ const appRunnerControlDecoder = new RunnerControlDecoder();
 const minimaxFinalReceiver = new MinimaxFinalReceiver(
   payload => { void handleTrustedCodexAppMarker('final', payload); },
   message => log(`${cliName()} ${message}`),
+  () => cliName(),
 );
 let kiroSessionIdCaptureArmed = false;
 let kiroSessionIdCaptureBuffer = '';
@@ -29003,7 +29004,7 @@ function handleAppRunnerOscMarker(body: string): void {
     }
     return;
   }
-  if (lastInitConfig?.cliId === 'minimax' && minimaxFinalReceiver.accept(kind,
+  if ((lastInitConfig?.cliId === 'minimax' || lastInitConfig?.cliId === 'atomcode') && minimaxFinalReceiver.accept(kind,
       payload && typeof payload === 'object' ? payload : undefined,
       { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt })) return;
   if (!payload || typeof payload !== 'object') return;
@@ -44175,7 +44176,7 @@ async function spawnCliBody(
       log(`Ignored stale backend exit (code: ${code}, signal: ${signal})`);
       return;
     }
-    if (lastInitConfig?.cliId === 'minimax') minimaxFinalReceiver.reset();
+    if (lastInitConfig?.cliId === 'minimax' || lastInitConfig?.cliId === 'atomcode') minimaxFinalReceiver.reset();
     lastCliExitServerReplaced = exitMarksServerReplaced({
       intentionalRestart,
       backendReportsServerReplaced: observedBackend.exitedBecauseServerReplaced?.() === true,
@@ -44778,7 +44779,7 @@ function killCli(opts: {
    * record of the turn it is executing) for the worker that reattaches it. */
   preserveCliPidMarker?: boolean;
 } = {}): void {
-  if (lastInitConfig?.cliId === 'minimax') minimaxFinalReceiver.reset();
+  if (lastInitConfig?.cliId === 'minimax' || lastInitConfig?.cliId === 'atomcode') minimaxFinalReceiver.reset();
   resetAntigravityNativeQuotaLog();
   activeTransientRateLimit = undefined;
   lastUsageLimitCaptureTurn = undefined;
@@ -52044,7 +52045,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         || injectionFlushing || shouldDeferUserFlush(pendingInjections)
         || bareShellCheckInProgress || bareShellLaunchBlocked
         || startupInputGateHolds
-        || (lastInitConfig?.cliId === 'minimax' && msg.content.trim() === '/compact'
+        || ((lastInitConfig?.cliId === 'minimax' || lastInitConfig?.cliId === 'atomcode') && msg.content.trim() === '/compact'
           && isFlushing)
         || hookReviewInputHold || traexQuestionDraftWaiting || codexModelMigrationHoldsRawInput()) {
         freshnessInputQueue.enqueueRaw(msg);

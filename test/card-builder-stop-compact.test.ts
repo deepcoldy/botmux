@@ -157,6 +157,11 @@ describe('buildStreamingCard: compact button (compact_session)', () => {
     expect(button).toBeTruthy();
     expect(button.value).toMatchObject({ session_id: SID, root_id: ROOT, cli_id: 'minimax' });
   });
+  it.each(['idle', 'working'])('renders the AtomCode compact button while %s without requiring usage metrics', status => {
+    const button = findButton(headerActions(build({ cliId: 'atomcode', status })), 'compact_session');
+    expect(button).toBeTruthy();
+    expect(button.value).toMatchObject({ session_id: SID, root_id: ROOT, cli_id: 'atomcode' });
+  });
   // 判据是「这个 CLI 有没有能收 /compact 的输入通道」，**不是**「有没有上下文百分比」。
   // 旧实现拿 percentUsed 当闸门，而只有 codex（native model_context_window）和 pi
   // （读 ~/.pi/agent/models.json）算得出百分比；Claude Code 的 transcript 里没有任何

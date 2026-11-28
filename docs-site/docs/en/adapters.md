@@ -55,6 +55,7 @@ The table lists the built-in adapters. "Default command" is the executable botmu
 | `zcode` | ZCode | `zcode` | local process | ✅ |
 | `doubao` | Doubao CLI (see [Doubao guide](https://github.com/deepcoldy/botmux/blob/master/docs/doubao.en.md)) | `doubao` | local process | ✅ |
 | `nca` | NCA | `nca` | local process | ✅ |
+| `atomcode` | AtomCode (via long-lived `atomcode acp` runner) | `atomcode` | local process | ✅ |
 | `pi` | Pi | `pi` | local process | ✅ |
 | `oh-my-pi` | Oh My Pi (Pi fork) | `omp` | local process | ✅ |
 | `aiden` | Aiden (native agent) | `aiden` | local process | |
@@ -283,7 +284,7 @@ Remote Runner connects any remote agent platform over a JSONL protocol. botmux s
 
 ### Using the newly added CLIs {#new-clis}
 
-Grok Build, Reasonix, OpenCode 2, DeepSeek Harness (dsh / dsh-tui), MiniMax Code (mcode), MiMoCode, CodeM, ZCode, Doubao and NCA are all built-in adapters with no extra switch. Turning one on works like switching to any other CLI (see [Switching a bot's CLI](#switching-a-bots-cli) above): install the command and log in under the daemon's system user, then set the bot's `cliId` to the value below.
+Grok Build, Reasonix, OpenCode 2, DeepSeek Harness (dsh / dsh-tui), MiniMax Code (mcode), MiMoCode, CodeM, ZCode, Doubao, NCA and AtomCode are all built-in adapters with no extra switch. Turning one on works like switching to any other CLI (see [Switching a bot's CLI](#switching-a-bots-cli) above): install the command and log in under the daemon's system user, then set the bot's `cliId` to the value below.
 
 | CLI | `cliId` | Default command |
 |---|---|---|
@@ -297,6 +298,7 @@ Grok Build, Reasonix, OpenCode 2, DeepSeek Harness (dsh / dsh-tui), MiniMax Code
 | ZCode | `zcode` | `zcode` |
 | Doubao | `doubao` | `doubao` |
 | NCA | `nca` | `nca` |
+| AtomCode | `atomcode` | `atomcode` |
 
 **Forge × TraeX**: to start TraeX through Forge, pick **Forge x TraeX** in the CLI menu of `botmux setup` or the Dashboard, or write `"cliId": "traex", "cliLaunchMode": "forge-traex"` in `bots.json`. botmux then launches `forge run --agent traex --agent-args ...`, so `forge` must be on PATH. This launch mode only works with `cliId: "traex"` and can't be combined with `wrapperCli`, `cliRuntime`, `cliPathOverride`, the file sandbox or `readIsolation`; such configs are rejected.
 
@@ -411,6 +413,15 @@ or disable it for the botmux process only:
 ```bash
 MIRCLI_AUTO_START_MIRAMCP=0 botmux start
 ```
+
+### AtomCode
+
+Install and configure the local `atomcode` CLI under the account running the BotMux daemon (for example via `atomcode login` or `~/.atomcode/config.toml`). Then choose AtomCode in Setup (option `37`) or set `cliId: "atomcode"`.
+
+- **Protocol and resume**: BotMux drives `atomcode --no-telemetry acp` through the long-lived `atomcode-runner`, persists the native ACP session ID after `session/new`, and restores subsequent turns via `session/resume`. Local terminal handoff runs `atomcode resume <id>`.
+- **Models and reasoning effort**: Model choices are detected dynamically from `[models.*]` and `[providers.*]` in `~/.atomcode/config.toml` (or `$ATOMCODE_HOME/config.toml`). Reasoning effort supports AtomCode ACP's `high` and `max` tiers (leave unset for AtomCode's default).
+- **Permissions and interactive forms**: When `disableCliBypass: true`, ACP `session/request_permission` and `elicitation/create` requests bridge to interactive Lark cards, and any configured turn execution budget pauses while waiting for a human answer.
+- **Compaction and workflows**: Supports the Lark card `/compact` button and `workflows/v3` execution nodes.
 
 ### NCA
 

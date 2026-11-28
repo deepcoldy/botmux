@@ -9,7 +9,7 @@ import {
 describe('cliHasNoRawPassthroughSurface', () => {
   it('refuses exactly the structured, runner and service CLIs plus Riff across the whole registry', () => {
     expect(ALL_CLI_IDS.filter(id => cliHasNoRawPassthroughSurface(id)).sort())
-      .toEqual(['codex-app', 'dsh', 'ebsd', 'minimax', 'mir', 'mira', 'riff']);
+      .toEqual(['atomcode', 'codex-app', 'dsh', 'ebsd', 'minimax', 'mir', 'mira', 'riff']);
   });
 });
 

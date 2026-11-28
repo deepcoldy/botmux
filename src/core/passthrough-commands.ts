@@ -97,7 +97,7 @@ export const SLASH_COMMAND_SHAPE = /^\/[a-z0-9][a-z0-9:_-]*$/;
  * left 11 PTY quick-action buttons that silently did nothing. Any gate deciding
  * "can this CLI receive typed input" must call the predicate below, never
  * hand-write a member of this set. */
-const NO_RAW_PASSTHROUGH_CLI_IDS: ReadonlySet<string> = new Set(['codex-app', 'mira', 'mir', 'dsh', 'ebsd', 'minimax', 'riff']);
+const NO_RAW_PASSTHROUGH_CLI_IDS: ReadonlySet<string> = new Set(['codex-app', 'mira', 'mir', 'dsh', 'ebsd', 'minimax', 'atomcode', 'riff']);
 
 /**
  * True for a CLI with no raw-passthrough surface (see
@@ -129,13 +129,13 @@ export function cliHasNoRawPassthroughSurface(
   return NO_RAW_PASSTHROUGH_CLI_IDS.has(cliId);
 }
 
-/** Card compaction can also use MiniMax's framed ACP input. This narrow
- * capability does not enable arbitrary raw TUI commands for its runner. */
+/** Card compaction can also use MiniMax/AtomCode's framed ACP input. This narrow
+ * capability does not enable arbitrary raw TUI commands for their runners. */
 export function cliSupportsCompactAction(
   cliId: string | undefined,
   opts?: { dshRuntime?: 'official' | 'tui' },
 ): boolean {
-  return cliId === 'minimax' || !cliHasNoRawPassthroughSurface(cliId, opts);
+  return cliId === 'minimax' || cliId === 'atomcode' || !cliHasNoRawPassthroughSurface(cliId, opts);
 }
 
 /**

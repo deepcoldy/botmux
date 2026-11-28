@@ -81,6 +81,8 @@ describe('native skill discovery reaches every CLI that ships skills', () => {
       // Doubao CLI discovers user skills under ~/Doubao/skills.
       doubao: 'global',
       nca: 'none',
+      // AtomCode discovers user skills under ~/.atomcode/skills.
+      atomcode: 'global',
     };
     // Two-way key equality. `Record<CliId, …>` looks like tsc enforces
     // exhaustiveness, but this file lives in test/ and tsconfig only includes
