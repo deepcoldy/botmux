@@ -15,8 +15,8 @@ import { getTurnResultRuntime } from './core/turn-result-runtime.js';
 import { parseSandboxNetworkPolicy } from './core/sandbox-network-policy.js';
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { normalizeCodexInstancePool, registerCodexInstanceBot, clearCodexInstanceBots, validateCodexInstanceRoster } from './services/codex-instance-pool.js';
-import { readFileSync, existsSync, statSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { readFileSync, existsSync, lstatSync, statSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
 import { underReadIsolation } from './adapters/cli/read-isolation.js';
 import { retiredCli, retiredCliNotice } from './adapters/cli/retired-cli.js';
 import {
@@ -3787,7 +3787,16 @@ function resolveBotConfigPath(): string {
   const botsConfigPath = process.env.BOTS_CONFIG;
   if (botsConfigPath) {
     const resolved = resolve(botsConfigPath);
-    if (!existsSync(resolved)) {
+    let pinnedMissing: string | undefined;
+    try {
+      statSync(resolved);
+    } catch (err: any) {
+      // A parent that cannot be searched is a permission fault, not "gone";
+      // either way the pinned registry stays authoritative (no fallback).
+      if (err?.code !== 'ENOENT' && err?.code !== 'ENOTDIR') throw botConfigAccessError(resolved, err);
+      pinnedMissing = err.code;
+    }
+    if (pinnedMissing) {
       // FAIL CLOSED, and deliberately so. For a daemon-spawned CLI child this
       // path is the registry the daemon actually parsed (pinned by spawnCli), so
       // "it is gone now" must NOT degrade into "resolve my own HOME's default
@@ -3795,12 +3804,13 @@ function resolveBotConfigPath(): string {
       // DIFFERENT fleet's registry, and quietly switching authority would run
       // this bot against another fleet's secret and routing. Losing the file is
       // an operator-visible fault; changing registries behind their back is worse.
-      throw new Error(
+      // Keep the errno (ENOENT vs ENOTDIR) so a strict reader can say which.
+      throw Object.assign(new Error(
         `BOTS_CONFIG file not found: ${resolved}`
         + ` — refusing to fall back to a different registry.`
         + ` (For a botmux-spawned CLI this is the exact bots.json the daemon loaded;`
         + ` if it was moved or unmounted, restore it or restart the daemon.)`,
-      );
+      ), { code: pinnedMissing });
     }
     loadedConfigPath = resolved;
     loadedConfigProvenance = 'loaded';
@@ -3808,16 +3818,102 @@ function resolveBotConfigPath(): string {
   }
 
   // 2. <config dir>/bots.json (i.e. os.homedir()/.botmux/bots.json)
+  // One stat decides it: existsSync() also answers false when the path cannot
+  // be inspected (e.g. lost search permission on ~/.botmux), and only a
+  // proven-absent file is "no configuration".
   const defaultPath = resolveBotsConfigFile();
-  if (existsSync(defaultPath)) {
-    loadedConfigPath = defaultPath;
-    loadedConfigProvenance = 'loaded';
-    return defaultPath;
+  try {
+    statSync(defaultPath);
+  } catch (err: any) {
+    if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') {
+      // Only a truly absent file under an absent-or-real config directory is
+      // "no configuration". ENOTDIR (the config dir is a file, or a link to
+      // one), a bots.json link whose target moved, and a config dir that is a
+      // dangling link are all broken configurations.
+      if (!defaultConfigProvenAbsent(defaultPath, err.code)) {
+        throw new BotConfigLoadError('unreadable', defaultPath, err.code, err);
+      }
+      throw new BotConfigNotFoundError(
+        'No bot configuration found. Set BOTS_CONFIG or create ~/.botmux/bots.json.\nSee README for config format.'
+      );
+    }
+    throw botConfigAccessError(defaultPath, err);
   }
+  loadedConfigPath = defaultPath;
+  loadedConfigProvenance = 'loaded';
+  return defaultPath;
+}
 
-  throw new Error(
-    'No bot configuration found. Set BOTS_CONFIG or create ~/.botmux/bots.json.\nSee README for config format.'
-  );
+/** No bots.json exists at all (BOTS_CONFIG unset, default file absent). Lets a
+ *  caller tell "nothing is configured" apart from a file it failed to read or
+ *  parse; a pinned-but-missing BOTS_CONFIG is a fault and stays a plain Error. */
+export class BotConfigNotFoundError extends Error {
+  override name = 'BotConfigNotFoundError';
+}
+
+export type BotConfigLoadFailure = 'permission_denied' | 'unreadable' | 'invalid_json' | 'invalid_config';
+
+/**
+ * bots.json could not be loaded. The message carries only the failure category,
+ * an fs error code and the file path — never validator text, which can quote
+ * raw values (including secrets) from ANY bot's entry. The original error stays
+ * on `cause` for local debugging; do not persist or send it.
+ */
+export class BotConfigLoadError extends Error {
+  override name = 'BotConfigLoadError';
+  constructor(
+    readonly reason: BotConfigLoadFailure,
+    readonly path: string | undefined,
+    readonly code: string | undefined,
+    cause: unknown,
+  ) {
+    const category = {
+      permission_denied: 'permission denied',
+      unreadable: 'unreadable',
+      invalid_json: 'invalid JSON',
+      invalid_config: 'invalid bot configuration',
+    }[reason];
+    super(`bots.json ${category}${code ? ` (${code})` : ''}${path ? ` (file: ${path})` : ''}`, { cause });
+  }
+}
+
+/** The directory entry itself exists (lstat: a dangling symlink counts). Only
+ *  ENOENT/ENOTDIR mean absent; any other lstat failure is a read fault. */
+function pathEntryExists(path: string): boolean {
+  try { lstatSync(path); return true; } catch (err: any) {
+    if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') return false;
+    throw botConfigAccessError(path, err);
+  }
+}
+
+/** stat(file) said ENOENT/ENOTDIR: true only when the file entry is absent
+ *  and its nearest existing ancestor is a real directory. Read faults on the way
+ *  (EACCES, EIO, …) throw. */
+function defaultConfigProvenAbsent(file: string, statCode: string): boolean {
+  if (statCode !== 'ENOENT' || pathEntryExists(file)) return false;
+  // Walk up to the nearest entry that exists: the file is absent only if that
+  // entry resolves to a real directory (a dangling link anywhere on the way —
+  // ~/.botmux, $HOME, … — makes the registry unreachable, not absent).
+  let dir = dirname(file);
+  while (!pathEntryExists(dir)) {
+    const parent = dirname(dir);
+    if (parent === dir) return true;
+    dir = parent;
+  }
+  try { return statSync(dir).isDirectory(); } catch (err: any) {
+    if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') return false;
+    throw botConfigAccessError(dir, err);
+  }
+}
+
+function fsErrorCode(err: unknown): string | undefined {
+  const code = (err as { code?: unknown } | null)?.code;
+  return typeof code === 'string' && /^E[A-Z0-9]+$/.test(code) ? code : undefined;
+}
+
+function botConfigAccessError(path: string, err: unknown): BotConfigLoadError {
+  const code = fsErrorCode(err);
+  return new BotConfigLoadError(code === 'EACCES' || code === 'EPERM' ? 'permission_denied' : 'unreadable', path, code, err);
 }
 
 const warnedRetiredCliApps = new Set<string>();
@@ -4004,16 +4100,37 @@ function parseBotConfigFile(filePath: string): BotConfig[] {
  * {@link loadBotConfigs} 的按原文缓存版：bots.json 内容没变就复用上次的解析结果（几十个 bot
  * 的解析要几十毫秒）。给热路径上只读的调用方用（如同机兄弟 bot 的身份判定），返回值不要改。
  * 读文件失败的语义与 loadBotConfigs 一致。
+ *
+ * `strictRead`：读不出文件时一律抛错，不走读隔离下 EPERM/EACCES → [] 的降级；除"根本没有配置"
+ * （BotConfigNotFoundError）外，所有失败都收敛为只含类别/错误码/路径的 {@link BotConfigLoadError}，
+ * 不带校验器原文。给必须区分"确实没有该 bot"与"读不到配置"、且会把错误落盘的调用方用
+ * （v3 workflow 节点配置解析）。
  */
 let parsedBotConfigsCache: { path: string; text: string; configs: BotConfig[] } | undefined;
-export function loadBotConfigsCached(): readonly BotConfig[] {
-  const synthetic = maybeSynthesizeCoreOnlyConfig();
+export function loadBotConfigsCached(options: { strictRead?: boolean } = {}): readonly BotConfig[] {
+  const strict = options.strictRead === true;
+  let synthetic: BotConfig[] | null;
+  try {
+    synthetic = maybeSynthesizeCoreOnlyConfig();
+  } catch (err) {
+    if (strict) throw new BotConfigLoadError('invalid_config', undefined, undefined, err);
+    throw err;
+  }
   if (synthetic) return synthetic;
-  const filePath = resolveBotConfigPath();
+  let filePath: string;
+  try {
+    filePath = resolveBotConfigPath();
+  } catch (err) {
+    if (!strict || err instanceof BotConfigNotFoundError || err instanceof BotConfigLoadError) throw err;
+    // A pinned BOTS_CONFIG that is gone (its message is constant text + path).
+    throw new BotConfigLoadError('unreadable',
+      process.env.BOTS_CONFIG ? resolve(process.env.BOTS_CONFIG) : undefined, fsErrorCode(err), err);
+  }
   let text: string;
   try {
     text = readFileSync(filePath, 'utf-8');
-  } catch {
+  } catch (err) {
+    if (strict) throw botConfigAccessError(filePath, err);
     return parseBotConfigFile(filePath);
   }
   if (parsedBotConfigsCache?.path === filePath && parsedBotConfigsCache.text === text) {
@@ -4023,6 +4140,11 @@ export function loadBotConfigsCached(): readonly BotConfig[] {
   try {
     configs = parseBotConfigsFromText(text);
   } catch (err: any) {
+    if (strict) {
+      let syntax = false;
+      try { JSON.parse(text); } catch { syntax = true; }
+      throw new BotConfigLoadError(syntax ? 'invalid_json' : 'invalid_config', filePath, undefined, err);
+    }
     throw new Error(`${err?.message ?? err} (file: ${filePath})`);
   }
   parsedBotConfigsCache = { path: filePath, text, configs };

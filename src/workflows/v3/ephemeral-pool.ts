@@ -15,7 +15,7 @@ import { SessionContractStore } from '../../services/session-contract-store.js';
 import { sessionContractsEnabled } from '../../services/session-contract.js';
 import type { DaemonSession } from '../../core/types.js';
 import { resolveSessionEnv, type SessionEnvBotInput } from '../../core/session-env-resolve.js';
-import { effectiveDefaultWorkingDir, getBot, loadBotConfigsCached, type BotConfig } from '../../bot-registry.js';
+import { BotConfigLoadError, BotConfigNotFoundError, effectiveDefaultWorkingDir, getBot, loadBotConfigsCached, type BotConfig } from '../../bot-registry.js';
 import { lstatSync, readlinkSync, realpathSync, statSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { BoundedLogFile } from '../../utils/bounded-log-file.js';
@@ -89,10 +89,35 @@ export interface EphemeralPoolDeps {
 
 /** Live config of a node's bot. A daemon registers only its own bot, and
  *  standalone runs register none, while workflow nodes may use any configured
- *  bot: fall back to live bots.json. */
-function liveBotConfig(larkAppId: string): BotConfig | undefined {
+ *  bot: fall back to live bots.json. An unreadable or invalid bots.json always
+ *  throws, so callers never mistake a broken file for a bot without env or
+ *  assistant mode.
+ *
+ *  `required`: the node bot came from the run's own bots.json snapshot (the
+ *  default daemon-run / architect path), so "not configured now" means it was
+ *  removed after the run started — with the secret still pinned in memory.
+ *  Fail instead of yielding undefined, or the node would pass the assistant
+ *  check and start without its env overlay. */
+function liveBotConfig(larkAppId: string, required = false): BotConfig | undefined {
   try { return getBot(larkAppId).config; } catch { /* not hosted by this daemon */ }
-  try { return loadBotConfigsCached().find(b => b.larkAppId === larkAppId); } catch { return undefined; }
+  let configs: readonly BotConfig[];
+  try {
+    // Strict: under read isolation an EPERM/EACCES must not read as "no bots".
+    configs = loadBotConfigsCached({ strictRead: true });
+  } catch (err) {
+    if (err instanceof BotConfigNotFoundError) {
+      if (required) throw new Error(`v3 workflow cannot find live bot config for ${larkAppId}: no bots.json is configured`, { cause: err });
+      return undefined;
+    }
+    // This message is persisted as the node failure. Strict loads only throw
+    // BotConfigLoadError, whose message never quotes bots.json content (any
+    // bot's validator text may carry raw values); keep the rest on `cause`.
+    const reason = err instanceof BotConfigLoadError ? err.message : 'bots.json unreadable';
+    throw new Error(`v3 workflow cannot read live bot config for ${larkAppId}: ${reason}`, { cause: err });
+  }
+  const bot = configs.find(b => b.larkAppId === larkAppId);
+  if (!bot && required) throw new Error(`v3 workflow cannot find live bot config for ${larkAppId}: the bot is no longer in bots.json`);
+  return bot;
 }
 
 /** A run may override its cwd or replay an old profile. Only seed the live
@@ -117,21 +142,36 @@ async function prepareNodeFolderTrust(
   if (configured) await prepareWorkflowClaudeTrust(canonical, adapter.claudeStateJsonPath, signal);
 }
 
-/** Throws when the live bot runs personal-assistant mode (see runNodeImpl). */
-export function assertNotAssistantModeBot(larkAppId: string): void {
-  // A bot absent from both sources has no secret to launch with either, so
-  // that case is left to the credential resolver.
-  const assistant = liveBotConfig(larkAppId)?.assistantMode === true;
-  if (assistant) throw new Error(`v3 workflow does not support personal-assistant mode; bot ${larkAppId} has assistantMode=true`);
+/** Throws when the live bot runs personal-assistant mode (see runNodeImpl).
+ *  With `requireConfigured` (the default pool path) a bot missing from the live
+ *  config also throws: fail closed rather than read it as non-assistant. */
+export function assertNotAssistantModeBot(larkAppId: string, requireConfigured = false): void {
+  // Otherwise a bot absent from both sources is left to the credential resolver.
+  rejectAssistantModeBot(larkAppId, liveBotConfig(larkAppId, requireConfigured));
 }
 
-/** Session env overlay for a workflow worker, from the live bot config. */
-function v3WorkerSessionEnv(
+function rejectAssistantModeBot(larkAppId: string, live: BotConfig | undefined): void {
+  if (live?.assistantMode === true) throw new Error(`v3 workflow does not support personal-assistant mode; bot ${larkAppId} has assistantMode=true`);
+}
+
+/** The launch-time verdict for a node bot from ONE live config read: presence
+ *  (default path), assistant mode, and the session env overlay handed to the
+ *  worker. An explicit resolver still owns the env lookup outright, including
+ *  when it throws. */
+function v3NodeLaunchConfig(
   larkAppId: string,
   resolveBot: EphemeralPoolDeps['resolveBot'],
 ): { env?: Record<string, string>; envUnset?: string[] } {
+  // A bots.json read failure, or a default-path node bot removed from it
+  // mid-run, fails this node instead of starting it without its env overlay.
+  const live = liveBotConfig(larkAppId, !resolveBot);
+  rejectAssistantModeBot(larkAppId, live);
   let bot: SessionEnvBotInput | undefined;
-  try { bot = (resolveBot ?? liveBotConfig)(larkAppId); } catch { bot = undefined; }
+  if (resolveBot) {
+    try { bot = resolveBot(larkAppId); } catch { bot = undefined; }
+  } else {
+    bot = live;
+  }
   if (!bot) return {};
   // Workflow workers never install the identity wrappers (usesLarkToolBinding).
   const resolved = resolveSessionEnv({ bot, backendType: v3WorkerBackendType(), facts: { unwrapped: true } });
@@ -203,8 +243,14 @@ async function runNodeWithLogs(
   // snapshot: a run paused before the mode was enabled resumes from its stored
   // snapshot, and a workflow worker has no per-owner session (it would get the
   // bot-wide BOT_HOME). Refuse before any side effect.
-  assertNotAssistantModeBot(req.botSnapshot.larkAppId);
+  // An attempt already cancelled on arrival takes the cancel path below
+  // (fence closed as pre_aborted, status cancelled) without reading bots.json:
+  // a config fault must not turn a cancellation into a node failure.
   const cancelSignal = req.attemptLease?.signal ?? req.cancelSignal;
+  const cancelledOnArrival = cancelSignal?.aborted === true;
+  // Fast rejection before any side effect. The authoritative read (assistant
+  // mode, presence and the env the worker gets) repeats right before spawn.
+  if (!cancelledOnArrival) assertNotAssistantModeBot(req.botSnapshot.larkAppId, !deps.resolveBot);
   const manifestPath = req.env[GOAL_ENV.MANIFEST_PATH] ?? join(req.attemptDir, 'manifest.json');
   const ptyLogPath = join(req.attemptDir, 'pty.log');
   if (!req.workerFence) await mkdir(req.attemptDir, { recursive: true });
@@ -286,6 +332,17 @@ async function runNodeWithLogs(
   if (logLimit.signal.aborted) {
     closeV3ArmedFenceWithoutSpawn(req.attemptDir, armedFence, 'setup_failed');
     return { status: 'fail', manifestPath };
+  }
+  // The secret and folder-trust waits above may have outlived the live config
+  // read at entry. Re-read it once after the last await and launch with
+  // exactly that verdict; there is no await between here and spawn, so a
+  // cancellation observed above still wins.
+  let workerSessionEnv: ReturnType<typeof v3NodeLaunchConfig>;
+  try {
+    workerSessionEnv = v3NodeLaunchConfig(req.botSnapshot.larkAppId, deps.resolveBot);
+  } catch (err) {
+    closeV3ArmedFenceWithoutSpawn(req.attemptDir, armedFence, 'setup_failed');
+    throw err;
   }
   // Where the worker writes this attempt's skill manifest + snapshot (its own
   // SESSION_DATA_DIR, i.e. config.session.dataDir unless req.env overrides it).
@@ -379,7 +436,6 @@ async function runNodeWithLogs(
   // permission isolation (BOTMUX_OWNER_OPEN_ID is daemon-authenticated at run
   // birth — a CLI child cannot forge it).  Standalone/dev runs keep synthetic
   // values and get no owner env at all.
-  const workerSessionEnv = v3WorkerSessionEnv(req.botSnapshot.larkAppId, deps.resolveBot);
   for (const key of protectedEnvKeys) {
     if (workerSessionEnv.env) delete workerSessionEnv.env[key];
   }

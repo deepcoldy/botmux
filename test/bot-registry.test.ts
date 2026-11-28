@@ -7,6 +7,7 @@
 // the data-dir fence instead of touching live botmux data (see the helper).
 import './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { resolve as resolvePath } from 'node:path';
 
 // ─── Mocks ────────────────────────────────────────────────────────────────
 
@@ -43,11 +44,21 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 // Mock node:fs so loadBotConfigs doesn't touch real disk.
 vi.mock('node:fs', async (importOriginal) => {
   const orig = await importOriginal<typeof import('node:fs')>();
+  const existsSync = vi.fn((_path: unknown) => false);
   return {
     ...orig,
-    existsSync: vi.fn(() => false),
+    existsSync,
     readFileSync: vi.fn(() => ''),
-    statSync: vi.fn(() => ({ mtimeMs: 0 })),
+    // The loader decides the default bots.json path with statSync(); keep it in
+    // step with whatever existsSync() a test scripts (absent → ENOENT).
+    statSync: vi.fn((path: unknown) => {
+      if (!existsSync(path)) throw Object.assign(new Error(`ENOENT: no such file or directory, stat '${String(path)}'`), { code: 'ENOENT' });
+      return { mtimeMs: 0 };
+    }),
+    // Only consulted after stat said ENOENT/ENOTDIR (dangling-symlink check).
+    lstatSync: vi.fn((path: unknown) => {
+      throw Object.assign(new Error(`ENOENT: no such file or directory, lstat '${String(path)}'`), { code: 'ENOENT' });
+    }),
   };
 });
 
@@ -2137,10 +2148,10 @@ describe('findOncallChatForAnyBot', () => {
   it('refreshes the sibling oncall cache when bots.json mtime changes', () => {
     process.env.BOTS_CONFIG = '/tmp/bots.json';
     fsMock.existsSync.mockReturnValue(true);
-    fsMock.statSync
-      .mockReturnValueOnce({ mtimeMs: 1 })
-      .mockReturnValueOnce({ mtimeMs: 2 })
-      .mockReturnValueOnce({ mtimeMs: 2 });
+    // Path resolution stats bots.json too, so drive the file's mtime as state
+    // rather than as a per-call sequence.
+    let mtimeMs = 1;
+    fsMock.statSync.mockImplementation(() => ({ mtimeMs }));
     fsMock.readFileSync.mockReturnValueOnce(JSON.stringify([{ larkAppId: 'app_a', larkAppSecret: 'sa' }]));
 
     const configs = mod.loadBotConfigs();
@@ -2151,6 +2162,7 @@ describe('findOncallChatForAnyBot', () => {
     expect(mod.findOncallChatForAnyBot('oc_new')).toBeUndefined();
 
     // A later mtime causes the cache to refresh and pick up sibling bindings.
+    mtimeMs = 2;
     fsMock.readFileSync.mockReturnValueOnce(JSON.stringify([
       { larkAppId: 'app_a', larkAppSecret: 'sa' },
       { larkAppId: 'app_b', larkAppSecret: 'sb', oncallChats: [{ chatId: 'oc_new', workingDir: '/repo' }] },
@@ -2265,12 +2277,14 @@ describe('loadBotConfigs', () => {
 
   it('should throw when no config source is available', () => {
     fsMock.existsSync.mockReturnValue(false);
+    fsMock.statSync.mockImplementation(() => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); });
     expect(() => mod.loadBotConfigs()).toThrow('No bot configuration found');
   });
 
   it('should throw when BOTS_CONFIG env points to a missing file', () => {
     process.env.BOTS_CONFIG = '/tmp/nowhere/bots.json';
     fsMock.existsSync.mockReturnValue(false);
+    fsMock.statSync.mockImplementation(() => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); });
     expect(() => mod.loadBotConfigs()).toThrow('BOTS_CONFIG file not found');
   });
 
@@ -2854,12 +2868,148 @@ describe('loadBotConfigs when bots.json exists but is unreadable', () => {
     expect(() => mod.loadBotConfigs()).toThrow(/EPERM/);
   });
 
+  it('keeps the isolated empty-list fallback for cached reads, but a strict read surfaces the permission error', () => {
+    process.env.BOTMUX_READ_ISOLATION = '1';
+    expect(mod.loadBotConfigsCached()).toEqual([]);
+    expect(() => mod.loadBotConfigsCached({ strictRead: true })).toThrow(/EPERM/);
+  });
+
   it('still throws for a NON-permission read error even under isolation (only EPERM/EACCES are expected)', () => {
     process.env.BOTMUX_READ_ISOLATION = '1';
     vi.mocked(fs.readFileSync).mockImplementation(() => {
       throw Object.assign(new Error('EIO: i/o error'), { code: 'EIO' });
     });
     expect(() => mod.loadBotConfigs()).toThrow(/EIO/);
+  });
+});
+
+// resolve() as the loader does: drive letter and backslashes on Windows.
+const PINNED_BOTS_CONFIG = resolvePath('pinned', 'bots.json');
+
+describe('default bots.json path is decided by statSync()', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+  let fs: typeof import('node:fs');
+  const savedEnv = { ...process.env };
+  const fsError = (code: string) => Object.assign(new Error(`${code}: stat '/h/.botmux/bots.json'`), { code });
+
+  beforeEach(async () => {
+    delete process.env.BOTS_CONFIG;
+    delete process.env.BOTMUX_CORE_ONLY;
+    mod = await freshImport();
+    fs = await import('node:fs');
+    // existsSync() answers false for absent AND uninspectable paths alike.
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+  });
+
+  afterEach(() => {
+    process.env = { ...savedEnv };
+    vi.mocked(fs.statSync).mockReset();
+    vi.mocked(fs.readFileSync).mockReturnValue('' as never);
+  });
+
+  it('reports "no configuration" when the file is proven absent (ENOENT)', () => {
+    vi.mocked(fs.statSync).mockImplementation(() => { throw fsError('ENOENT'); });
+    expect(() => mod.loadBotConfigs()).toThrow(mod.BotConfigNotFoundError);
+  });
+
+  it('reports ENOTDIR (the config directory is not a directory) as unreadable, not "no configuration"', () => {
+    vi.mocked(fs.statSync).mockImplementation(() => { throw fsError('ENOTDIR'); });
+    let failure: unknown;
+    try { mod.loadBotConfigsCached({ strictRead: true }); } catch (err) { failure = err; }
+    expect(failure).toBeInstanceOf(mod.BotConfigLoadError);
+    expect(failure).toMatchObject({ reason: 'unreadable', code: 'ENOTDIR' });
+  });
+
+  it.each(['EACCES', 'EPERM'])('surfaces %s on the config path instead of "no configuration"', (code) => {
+    vi.mocked(fs.statSync).mockImplementation(() => { throw fsError(code); });
+    let failure: unknown;
+    try { mod.loadBotConfigsCached(); } catch (err) { failure = err; }
+    expect(failure).toBeInstanceOf(mod.BotConfigLoadError);
+    expect(failure).toMatchObject({ reason: 'permission_denied', code });
+  });
+
+  it.each(['EACCES', 'EPERM'])('reports %s on a pinned BOTS_CONFIG as a permission fault without falling back', (code) => {
+    process.env.BOTS_CONFIG = PINNED_BOTS_CONFIG;
+    vi.mocked(fs.statSync).mockImplementation((path: unknown) => {
+      if (String(path) === PINNED_BOTS_CONFIG) throw fsError(code);
+      return { mtimeMs: 0 } as never;
+    });
+    vi.mocked(fs.readFileSync).mockReturnValue(JSON.stringify([
+      { larkAppId: 'cli_default_registry', larkAppSecret: 'x', cliId: 'claude-code' },
+    ]) as never);
+    for (const load of [() => mod.loadBotConfigs(), () => mod.loadBotConfigsCached({ strictRead: true })]) {
+      let failure: unknown;
+      try { load(); } catch (err) { failure = err; }
+      expect(failure).toBeInstanceOf(mod.BotConfigLoadError);
+      expect(failure).toMatchObject({ reason: 'permission_denied', code, path: PINNED_BOTS_CONFIG });
+    }
+  });
+
+  it.each(['EACCES', 'EIO'])('treats a %s from the follow-up lstat as a read fault, not as "no configuration"', (code) => {
+    vi.mocked(fs.statSync).mockImplementation(() => { throw fsError('ENOENT'); });
+    vi.mocked(fs.lstatSync).mockImplementationOnce(() => { throw fsError(code); });
+    let failure: unknown;
+    try { mod.loadBotConfigsCached({ strictRead: true }); } catch (err) { failure = err; }
+    expect(failure).toBeInstanceOf(mod.BotConfigLoadError);
+    expect(failure).toMatchObject({ code, reason: code === 'EACCES' ? 'permission_denied' : 'unreadable' });
+  });
+
+  it.each(['ENOENT', 'ENOTDIR'])('keeps the errno of a pinned BOTS_CONFIG that is gone (%s) for a strict reader', (code) => {
+    process.env.BOTS_CONFIG = PINNED_BOTS_CONFIG;
+    vi.mocked(fs.statSync).mockImplementation(() => { throw fsError(code); });
+    expect(() => mod.loadBotConfigs()).toThrow(/BOTS_CONFIG file not found/);
+    let failure: unknown;
+    try { mod.loadBotConfigsCached({ strictRead: true }); } catch (err) { failure = err; }
+    expect(failure).toBeInstanceOf(mod.BotConfigLoadError);
+    expect(failure).toMatchObject({ reason: 'unreadable', code, path: PINNED_BOTS_CONFIG });
+  });
+
+  it('loads a file that a stat proves present even though existsSync() said no', () => {
+    vi.mocked(fs.statSync).mockImplementation((() => ({ mtimeMs: 0 })) as never);
+    vi.mocked(fs.readFileSync).mockReturnValue(JSON.stringify([
+      { larkAppId: 'cli_present', larkAppSecret: 'x', cliId: 'claude-code' },
+    ]) as never);
+    expect(mod.loadBotConfigs().map(bot => bot.larkAppId)).toEqual(['cli_present']);
+  });
+});
+
+describe('strict cached read never quotes bots.json content', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+  let fs: typeof import('node:fs');
+  const savedEnv = { ...process.env };
+  const secret = 'sk-live-SENTINEL-4f9c';
+
+  beforeEach(async () => {
+    delete process.env.BOTS_CONFIG;
+    delete process.env.BOTMUX_CORE_ONLY;
+    mod = await freshImport();
+    fs = await import('node:fs');
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+  });
+
+  afterEach(() => {
+    process.env = { ...savedEnv };
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    vi.mocked(fs.readFileSync).mockReturnValue('' as never);
+  });
+
+  it.each([
+    ['invalid_config', JSON.stringify([
+      { larkAppId: 'cli_app', larkAppSecret: 'x', cliId: 'claude-code' },
+      { larkAppId: 'cli_other', larkAppSecret: 'x', cliId: 'claude-code', sandboxWithholdBotSecret: secret },
+    ])],
+    ['invalid_json', `[{"larkAppId": "cli_other", "larkAppSecret": "${secret}"`],
+  ] as const)('classifies %s without the raw validator text', (reason, text) => {
+    vi.mocked(fs.readFileSync).mockReturnValue(text as never);
+    // The ordinary loader keeps its detailed message for local operators…
+    expect(() => mod.loadBotConfigsCached()).toThrow();
+    let failure: unknown;
+    try { mod.loadBotConfigsCached({ strictRead: true }); } catch (err) { failure = err; }
+    // …the strict one is safe to persist.
+    expect(failure).toBeInstanceOf(mod.BotConfigLoadError);
+    expect(failure).toMatchObject({ reason });
+    expect((failure as Error).message).not.toContain(secret);
+    expect((failure as Error).message).toContain('bots.json');
   });
 });
 
