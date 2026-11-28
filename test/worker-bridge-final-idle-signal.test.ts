@@ -88,3 +88,62 @@ describe('structured bridge final → idle signal', () => {
     expect(run.fireIdle).not.toHaveBeenCalled();
   });
 });
+
+describe('TRAE native turn completion → transcript terminal evidence', () => {
+  const nativeEvent = (kind: 'user' | 'assistant_final', turn: string, timestampMs: number) => ({
+    kind, uuid: `${turn}:${kind}:${timestampMs}`, sourceTurnId: turn,
+    sourceSessionId: 'session', timestampMs, text: '',
+  });
+
+  function traexIngest(peek: () => Array<{ started: boolean; finalText: string | undefined }>) {
+    const noteTerminal = vi.fn();
+    const noteStarted = vi.fn();
+    let drain: Array<ReturnType<typeof nativeEvent>> = [];
+    const scope: Record<string, unknown> = {
+      rpcTranscriptIngestBlockedByAwaitingActivation: () => false,
+      rpcTurnsAwaitingActivation: new Map(),
+      structuredBridgeIs: (id: string) => id === 'traex',
+      codexBridgeRolloutPath: '/sessions/rollout.jsonl',
+      codexBridgeBaselineDone: true,
+      codexBridgePendingSessionId: undefined,
+      structuredBridgeIngestPath: () => ({ events: drain, newOffset: 64, pendingTail: '' }),
+      codexBridgeOffset: 0,
+      codexBridgePendingTail: '',
+      bridgeSpecFor: () => undefined,
+      lastInitConfig: { cliId: 'traex' },
+      publishActiveRuntime() {},
+      publishedActiveRuntime: {},
+      lastStructuredBridgeActivityAtMs: 0,
+      backend: {},
+      OrcaBackend: class {},
+      codexBridgeQueue: { ingest() {}, peek },
+      observeStructuredBackgroundTasks() {},
+      cliAdapter: { postTerminalPromptFence: false },
+      noteSpawnArgvTurnStartTranscriptEvidence() {},
+      pruneExpiredStructuredHeadsAndEmit() {},
+      emitReadyCodexTurns() {},
+      idleDetector: { fireIdle: vi.fn(), noteTranscriptTerminal: noteTerminal, noteTranscriptTurnStarted: noteStarted },
+      cliSpawnGeneration: 1,
+      cliRestartInProgress: false,
+    };
+    scope.deferFinalIdleSignal = loadWorkerFunction('deferFinalIdleSignal', scope);
+    const ingest = loadWorkerFunction<(opts?: { signalIdle?: boolean }) => void>('codexBridgeIngest', scope);
+    return {
+      feed(events: Array<ReturnType<typeof nativeEvent>>) { drain = events; ingest({ signalIdle: false }); },
+      noteTerminal, noteStarted,
+    };
+  }
+
+  it('withholds transcript terminal while a queued turn is still open, then records it once the queue drains', () => {
+    const openTurn = { started: true, finalText: undefined as string | undefined };
+    let queued: Array<{ started: boolean; finalText: string | undefined }> = [openTurn];
+    const run = traexIngest(() => queued);
+    run.feed([nativeEvent('user', 'turn-1', 1), nativeEvent('assistant_final', 'turn-1', 2)]);
+    expect(run.noteStarted).toHaveBeenCalledTimes(1);
+    expect(run.noteTerminal).not.toHaveBeenCalled();
+
+    queued = [];
+    run.feed([nativeEvent('user', 'turn-2', 3), nativeEvent('assistant_final', 'turn-2', 4)]);
+    expect(run.noteTerminal).toHaveBeenCalledTimes(1);
+  });
+});
