@@ -1,4 +1,4 @@
-import { MIX_SKILL_MACHINE_PRESET, MIX_MACHINE_WRITE_EXCEPTIONS } from '../../core/bytedcli-skill-machine-preset.js';
+import type { AvailableBytedcliOperationPreset, PluginBytedcliOperationPresetsSnapshot } from '../../core/plugins/bytedcli-operation-presets-protocol.js';
 import { BYTEDCLI_OPERATION_CATALOG, BYTEDCLI_AUDITED_RELEASE, BYTEDCLI_OPERATION_CATALOG_VERSION } from '../../core/bytedcli-operation-catalog.js';
 import { BYTEDCLI_OPERATION_POLICY_SCHEMA, BYTEDCLI_OPERATION_POLICY_STATUS_SCHEMA, parseBytedcliOperationPolicy, resolveBytedcliOperationRule, type BytedcliOperationPolicyStatus } from '../../core/bytedcli-operation-policy-config.js';
 import { bytecloudBrokerEnabled } from '../../core/identity-policy.js';
@@ -5101,6 +5101,7 @@ export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: P
   const [status, setStatus] = useState<StatusMessage>(null);
   const [info, setInfo] = useState<{
     bytedcliOperationPolicy?: BytedcliOperationPolicyStatus;
+    bytedcliOperationPresets?: PluginBytedcliOperationPresetsSnapshot;
     authorizedCount?: number;
     tokenStoreAdvisory?: string;
     mcpAdvisory?: string;
@@ -5162,6 +5163,18 @@ export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: P
       saved: tr(commandRules ? 'botDefaults.bytedcliPolicySaved' : 'botDefaults.triggerUserAuthSaved'),
       rollback: () => patchBot(bot.larkAppId, { triggerUserAuth: previous }),
     });
+  }
+
+  async function applyOperationPreset(preset: AvailableBytedcliOperationPreset): Promise<void> {
+    if (busy || policyState !== 'ready') return;
+    const applied = await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/trigger-user-auth`, {
+        bytedcliOperationPreset: { pluginId: preset.pluginId, presetId: preset.id, revision: preset.revision },
+      }),
+      onSaved: body => patchBot(bot.larkAppId, { triggerUserAuth: body.triggerUserAuth }),
+      setStatus, setBusy, saved: tr('botDefaults.bytedcliPolicySaved'),
+    });
+    if (!applied) setPolicyRefresh(value => value + 1);
   }
 
   function policyWith(next: { capabilities?: typeof capabilities; credentialSource?: typeof credentialSource; delegateOnMention?: boolean; allowSpeakerSwitch?: boolean; gitCommitIdentity?: boolean; bytecloudExecution?: typeof execution }) {
@@ -5262,16 +5275,22 @@ export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: P
         </div>
         <div className="actions">
           <button type="button" disabled={busy || policyState === 'pending' || policyState === 'inactive'} onClick={() => setPolicyRefresh(value => value + 1)}>{tr('botDefaults.bytedcliPolicyRefresh')}</button>
-          <button type="button" data-action="bytedcli-policy-mix-preset" disabled={busy || policyState !== 'ready'}
-            onClick={() => { if (!busy && policyState === 'ready') void save({ ...policyWith({}), enabled, bytedcliOperationPolicy: MIX_SKILL_MACHINE_PRESET }, true); }}>
-            {tr('botDefaults.bytedcliPolicyMixPreset')}
-          </button>
-          <small data-action="bytedcli-policy-mix-writes">{tr('botDefaults.bytedcliPolicyMixWrites')}: {MIX_MACHINE_WRITE_EXCEPTIONS.join(', ')}</small>
           <button type="button" data-action="bytedcli-policy-clear" disabled={busy || policyState !== 'ready'}
             onClick={() => { if (!busy && policyState === 'ready') void save({ ...policyWith({}), enabled, bytedcliOperationPolicy: null }, true); }}>
             {tr('botDefaults.bytedcliPolicyClear')}
           </button>
         </div>
+        {info?.bytedcliOperationPresets?.issues.length ? <p data-action="bytedcli-policy-preset-issues">{tr('botDefaults.bytedcliPolicyPresetIssues')}</p> : null}
+        {info?.bytedcliOperationPresets?.presets.map(preset => (
+          <div className="bd-row" key={`${preset.pluginId}/${preset.id}`} data-action="bytedcli-policy-plugin-preset-row">
+            <span><code>{preset.pluginId}@{preset.pluginVersion}</code> {preset.description}</span>
+            <button type="button" data-action="bytedcli-policy-plugin-preset" data-plugin-id={preset.pluginId} data-preset-id={preset.id}
+              disabled={busy || policyState !== 'ready'} onClick={() => { void applyOperationPreset(preset); }}>
+              {tr('botDefaults.bytedcliPolicyApplyPreset', { title: preset.title })}
+            </button>
+            {preset.machineWriteExceptions.length ? <small data-action="bytedcli-policy-preset-writes">{tr('botDefaults.bytedcliPolicyPresetWrites')}: {preset.machineWriteExceptions.join(', ')}</small> : null}
+          </div>
+        ))}
       </div> : null}
       {enabled ? (
         <>

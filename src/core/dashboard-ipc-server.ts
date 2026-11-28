@@ -657,10 +657,12 @@ import {
   getBotName,
   type SessionRow,
 } from './dashboard-rows.js';
-import { getBotBrand, getBot, getBotClient, getBotOpenId, getOwnerOpenId, loadBotConfigs, findOncallChat, listOncallChats, effectiveDefaultWorkingDir, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, normalizeDshProfile, LarkTransportDisabledError, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
+import { getBotBrand, getBot, getBotClient, getBotOpenId, getOwnerOpenId, getLoadedConfigProvenance, loadBotConfigs, findOncallChat, listOncallChats, effectiveDefaultWorkingDir, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, normalizeDshProfile, LarkTransportDisabledError, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
 import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, isUsableOpenId, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES, requestUserAuthorization, type UserAuthorizationPollResult } from '../utils/user-token.js';
 import { describeMissingUserScopes, type AppVersionReviewLookup } from '../utils/lark-app-version.js';
 import { queryTriggerUserAuthStatus } from '../services/trigger-user-auth-status.js';
+import { readPluginBytedcliOperationPresets } from './plugins/bytedcli-operation-presets.js';
+import { applyPluginBytedcliOperationPreset } from '../services/bytedcli-operation-preset-store.js';
 import { revokeTriggerUserAuth } from '../services/revoke-trigger-user-auth.js';
 import { tokenStoreProtection, triggerUserAuthApplies, larkUserNative, credentialSourceOf, capabilityOn, capabilitiesOf, IDENTITY_ROUTE_TOOLS, type IdentityRouteTool, type TriggerUserAuthConfig, type TriggerUserAuthTool } from '../services/trigger-user-auth.js';
 import { platformCredentialsUrl } from '../platform/credential-grant-client.js';
@@ -14342,9 +14344,18 @@ const TRIGGER_USER_AUTH_UI_EDITABLE_KEYS = new Set(['enabled', 'tools', 'legacyF
 // In that case preserve the saved source and delegation choice through the merge.
 
 ipcRoute('PUT', '/api/bot-trigger-user-auth', requireBoundBot(async (req, res) => {
-  let body: { triggerUserAuth?: unknown };
-  try { body = await readJsonBody<{ triggerUserAuth?: unknown }>(req); }
+  let body: { triggerUserAuth?: unknown; bytedcliOperationPreset?: unknown };
+  try { body = await readJsonBody<typeof body>(req); }
   catch { return jsonRes(res, 400, { error: 'invalid_json' }); }
+  if (body && Object.hasOwn(body, 'bytedcliOperationPreset')) {
+    if (Object.hasOwn(body, 'triggerUserAuth')) return jsonRes(res, 400, { ok: false, error: 'ambiguous_bytedcli_operation_preset' });
+    try {
+      const result = await applyPluginBytedcliOperationPreset(cachedLarkAppId, body.bytedcliOperationPreset);
+      if (result.ok) return jsonRes(res, 200, result);
+      const conflict = ['bytedcli_operation_preset_unavailable', 'bytedcli_operation_preset_changed'].includes(result.reason);
+      return jsonRes(res, conflict ? 409 : 400, { ok: false, error: result.reason });
+    } catch { return jsonRes(res, 500, { ok: false, error: 'bytedcli_operation_preset_apply_failed' }); }
+  }
   const spec = findConfigField('triggerUserAuth');
   if (!spec) return jsonRes(res, 500, { ok: false, error: 'field_unavailable' });
 
@@ -14492,10 +14503,19 @@ ipcRoute('GET', '/api/bot-trigger-user-auth-status', requireBoundBot(async (req,
     const user = openId
       ? await queryTriggerUserAuthStatus({ appId: cfg.larkAppId, brand, openId })
       : undefined;
+    // Plugin management can update bindings from another process. Use the
+    // committed membership without replacing the worker's other live settings.
+    let currentBindings: Pick<BotConfig, 'plugins'> = { plugins: [] };
+    if (getLoadedConfigProvenance() !== 'synthetic') {
+      const rawBots = await readRawConfig(requireConfigPath());
+      const botIndex = findEntryIndex(rawBots, cfg.larkAppId);
+      if (botIndex >= 0) currentBindings = { plugins: rawBots[botIndex].plugins };
+    }
     jsonRes(res, 200, {
       ok: true,
       policy,
       bytedcliOperationPolicy: requestBytedcliBrokers.get(req)?.operationPolicyStatus(cfg.triggerUserAuth),
+      bytedcliOperationPresets: readPluginBytedcliOperationPresets(currentBindings),
       authorizedCount,
       credentialSource: credentialSourceOf(policy),
       credentialSources: {

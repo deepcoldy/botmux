@@ -3,11 +3,10 @@ import { closeSync, constants, fstatSync, lstatSync, openSync, readSync, realpat
 import { isAbsolute, join, relative } from 'node:path';
 import { BYTEDCLI_OPERATION_CATALOG } from '../bytedcli-operation-catalog.js';
 import type { BotConfig } from '../../bot-registry.js';
-import { readGlobalConfig, type GlobalConfig } from '../../global-config.js';
-import { readPluginRegistry } from '../../services/plugin-registry-store.js';
+import { invalidateGlobalConfigCache, readGlobalConfig, type GlobalConfig } from '../../global-config.js';
+import { readPluginBytedcliPresetRegistry, type PluginBytedcliPresetRegistry } from '../../services/plugin-registry-store.js';
 import { resolveEffectivePluginIds } from './effective.js';
 import { isValidPluginId } from './ids.js';
-import type { PluginRegistryFile } from './types.js';
 import {
   parsePluginBytedcliOperationPresets, PLUGIN_BYTEDCLI_PRESETS_MAX_BYTES,
   type AvailableBytedcliOperationPreset, type PluginBytedcliOperationPresetsContribution,
@@ -39,8 +38,14 @@ export function scanPluginBytedcliOperationPresets(runtimeDir: string): PluginBy
 }
 
 /** Presets are suggestions from the effective installed plugins, never authority. */
+function readFreshGlobalBindings(): Pick<GlobalConfig, 'plugins'> {
+  // Lifecycle mutations may have committed in another daemon/CLI process.
+  invalidateGlobalConfigCache();
+  return readGlobalConfig();
+}
+
 export function readPluginBytedcliOperationPresets(
-  bot: Pick<BotConfig, 'plugins'>, global: Pick<GlobalConfig, 'plugins'> = readGlobalConfig(), registry: PluginRegistryFile = readPluginRegistry(),
+  bot: Pick<BotConfig, 'plugins'>, global: Pick<GlobalConfig, 'plugins'> = readFreshGlobalBindings(), registry: PluginBytedcliPresetRegistry = readPluginBytedcliPresetRegistry(),
 ): PluginBytedcliOperationPresetsSnapshot {
   const presets: AvailableBytedcliOperationPreset[] = [];
   const issues: Array<PluginBytedcliOperationPresetsSnapshot['issues'][number]> = [];
@@ -51,7 +56,7 @@ export function readPluginBytedcliOperationPresets(
     const raw = installed.contributions?.bytedcliOperationPresets;
     if (raw === undefined) continue;
     try {
-      if (installed.id !== pluginId || installed.manifest.id !== pluginId || typeof installed.version !== 'string'
+      if (installed.id !== pluginId || installed.manifest?.id !== pluginId || typeof installed.version !== 'string'
         || !/^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.+-]+)?$/.test(installed.version) || installed.version.length > 128) throw new Error('invalid');
       const contribution = parsePluginBytedcliOperationPresets(raw);
       if (presets.length + contribution.presets.length > 64) { issue('too_many_presets'); continue; }

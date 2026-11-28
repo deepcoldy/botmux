@@ -47,11 +47,11 @@ it('migrates only frozen previous v2 IDs, never newly added host API authority',
 });
 
 it('exact preset proves host machine write; global actor floor refuses the same claim', async () => {
- const {MIX_SKILL_MACHINE_PRESET}=await import('../src/core/bytedcli-skill-machine-preset.js');
  const {parseBytedcliOperationPolicy}=await import('../src/core/bytedcli-operation-policy-config.js');
- const s=setup();s.request.authority={...s.request.authority,executionIdentity:'machine',operationPolicy:Object.freeze({globalRevision:'fixture',botPolicy:MIX_SKILL_MACHINE_PRESET})};
+ const preset=parseBytedcliOperationPolicy({schema:'botmux.bytedcli-operation-policy.v2',cliVersion:'0.199.0',catalogVersion:'2026-11-27.2',rules:{'skill-api.bits.release.owner.update':'machine'}})!;
+ const s=setup();s.request.authority={...s.request.authority,executionIdentity:'machine',operationPolicy:Object.freeze({globalRevision:'fixture',botPolicy:preset})};
  expect(await s.executor.execute(s.request)).toMatchObject({outcome:'completed',effectiveIdentity:{kind:'machine'}});
- const t=setup();t.request.authority={...s.request.authority,operationPolicy:Object.freeze({globalRevision:'floor',botPolicy:MIX_SKILL_MACHINE_PRESET,globalPolicy:parseBytedcliOperationPolicy({...MIX_SKILL_MACHINE_PRESET,rules:{'skill-api.bits.release.owner.update':'actor'}})})};
+ const t=setup();t.request.authority={...s.request.authority,operationPolicy:Object.freeze({globalRevision:'floor',botPolicy:preset,globalPolicy:parseBytedcliOperationPolicy({...preset,rules:{'skill-api.bits.release.owner.update':'actor'}})})};
  expect(await t.executor.execute(t.request)).toMatchObject({outcome:'rejected'});expect(t.calls).toHaveLength(0);
 });
 it('staged MindAI API reaches the same executor as immutable parsed bytes',async()=>{

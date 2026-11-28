@@ -13,6 +13,10 @@ import { createBytedcliHostOperationPolicyReader } from '../src/core/bytedcli-ho
 import { bytedcliTrustedHostLayout } from '../src/core/bytedcli-host-layout.js';
 import { startIpcServer, setLarkAppId, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import { __testOnly_resetBotRegistry, getBot, loadBotConfigs, registerBot } from '../src/bot-registry.js';
+import { readPluginRegistry, removeInstalledPlugin, upsertInstalledPlugin } from '../src/services/plugin-registry-store.js';
+import { parsePluginBytedcliOperationPresets, readPluginBytedcliOperationPresets } from '../src/core/plugins/bytedcli-operation-presets.js';
+import { globalConfigPath, invalidateGlobalConfigCache, readGlobalConfig } from '../src/global-config.js';
+import { pluginRegistryPath } from '../src/core/plugins/paths.js';
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 const config = (rules: Record<string, string>) => ({ schema: BYTEDCLI_OPERATION_POLICY_SCHEMA, cliVersion: BYTEDCLI_AUDITED_RELEASE, catalogVersion: BYTEDCLI_OPERATION_CATALOG_VERSION, rules });
 const full = parseTriggerUserAuthConfig({ enabled: true, capabilities: ['bytecloud','lark-user','meego'], bytecloudExecution: 'read-machine-write-actor',
@@ -23,9 +27,20 @@ function summary(bot=full, rules:Record<string,string>={'codebase.mr.list':'acto
   return projectBytedcliOperationPolicyStatus({ revision:'fake-revision', policy:global }, bot.bytedcliOperationPolicy, bot.enabled);
 }
 afterEach(()=>{vi.unstubAllGlobals();});
-async function panel(initial:any, status:any) {
+async function panel(initial:any, status:any, presets:any={presets:[],issues:[]}, failure=false) {
   const requests:any[]=[];
-  vi.stubGlobal('fetch',async(_url:any,init:any)=>{if(init?.method==='PUT'){const raw=JSON.parse(init.body).triggerUserAuth;requests.push(raw);parseTriggerUserAuthConfig(raw);}return {ok:true,json:async()=>({ok:true,bytedcliOperationPolicy:status})};});
+  vi.stubGlobal('fetch',async(_url:any,init:any)=>{
+    if(init?.method==='PUT'){
+      const body=JSON.parse(init.body),raw=body.triggerUserAuth;requests.push(raw??body);
+      if(raw)parseTriggerUserAuthConfig(raw);
+      if(body.bytedcliOperationPreset){
+        if(failure)return {ok:false,json:async()=>({ok:false,error:'bytedcli_operation_preset_changed'})};
+        const selected=presets.presets.find((row:any)=>row.pluginId===body.bytedcliOperationPreset.pluginId&&row.id===body.bytedcliOperationPreset.presetId);
+        return {ok:true,json:async()=>({ok:true,triggerUserAuth:{...initial,bytedcliOperationPolicy:selected.policy}})};
+      }
+    }
+    return {ok:true,json:async()=>({ok:true,bytedcliOperationPolicy:status,bytedcliOperationPresets:presets})};
+  });
   function Harness(){const [bot,setBot]=React.useState<any>({larkAppId:'cli_dashboard_policy',triggerUserAuth:initial});return React.createElement(TriggerUserAuthSection,{bot,patchBot:(_id,patch)=>setBot((old:any)=>({...old,...patch}))});}
   let renderer!:TestRenderer.ReactTestRenderer;await act(async()=>{renderer=TestRenderer.create(React.createElement(Harness));});
   const control=(action:string)=>renderer.root.findByProps({'data-action':action});
@@ -152,21 +167,85 @@ it('global actor floors remain visible when a write row saves machine',async()=>
   expect(p.renderer.root.findAllByProps({'data-action':'bytedcli-machine-exception-codebase.mr.close'})).toHaveLength(0);
  }finally{await p.close();}
 });
-it('applies selected MIX machine preset, preserves full settings and global floors', async()=>{
- const p=await panel(full,summary(full,{'skill-api.bits.release.owner.update':'actor','tos.upload-object.c4-report':'deny','codebase.mr.create':'machine'}));
- try {
-  const button=p.renderer.root.findAllByProps({'data-action':'bytedcli-policy-mix-preset'});
-  expect(button).toHaveLength(1);
-  await act(async()=>button[0]!.props.onClick());
-  const saved=p.requests.at(-1);expect(saved).toMatchObject({credentialSource:full.credentialSource,dispatchOnly:full.dispatchOnly});
-  expect(saved.bytedcliOperationPolicy.rules['skill-api.bits.release.owner.update']).toBe('machine');
-  expect(saved.bytedcliOperationPolicy.rules['codebase.mr.create']).toBe('actor');
-  expect(saved.bytedcliOperationPolicy.rules['bits.pipelines.run']).toBe('actor');
-  expect(saved.bytedcliOperationPolicy.rules['skill-api.argos.duties.get']).toBe('actor');
-  expect(p.control('bytedcli-effective-skill-api.bits.release.owner.update').props['data-identity']).toBe('actor');
-  expect(p.control('bytedcli-effective-tos.upload-object.c4-report').props['data-enabled']).toBe(false);
-  expect(p.control('bytedcli-effective-codebase.mr.create').props['data-identity']).toBe('actor');
+const supportDeclaration=()=>parsePluginBytedcliOperationPresets({schema:'botmux.bytedcli-operation-presets.v1',presets:[{id:'support',title:'Shared support',description:'Reviewed shared commands',policy:config({'codebase.mr.close':'machine','codebase.mr.list':'actor'})}]});
+function installSupportPreset(){
+ const now=new Date().toISOString();upsertInstalledPlugin({id:'support',packageName:'botmux-plugin-support',version:'1.0.0',source:{type:'local',spec:root},manifest:{schemaVersion:1,id:'support'},contributions:{bytedcliOperationPresets:supportDeclaration()},installedAt:now,updatedAt:now});
+ return readPluginBytedcliOperationPresets({plugins:['support']},{});
+}
+it('renders external plugin presets, applies only a source reference and keeps global floors visible',async()=>{
+ const presets=installSupportPreset(),row=presets.presets[0]!;
+ const p=await panel(full,summary(full,{'codebase.mr.close':'actor'}),presets);
+ try{
+  const buttons=p.renderer.root.findAllByProps({'data-action':'bytedcli-policy-plugin-preset'});expect(buttons).toHaveLength(1);
+  await act(async()=>buttons[0]!.props.onClick());
+  expect(p.requests).toEqual([{bytedcliOperationPreset:{pluginId:'support',presetId:'support',revision:row.revision}}]);
+  expect(p.control('bytedcli-policy-codebase.mr.close').props.value).toBe('machine');
+  expect(p.control('bytedcli-effective-codebase.mr.close').props['data-identity']).toBe('actor');
+  expect(p.control('bytedcli-policy-codebase.mr.list').props.value).toBe('actor');
+ }finally{await p.close();removeInstalledPlugin('support');}
+});
+it('has no built-in business preset when no enabled plugin contributes one',async()=>{
+ const p=await panel(full,summary());try{
+  expect(p.renderer.root.findAllByProps({'data-action':'bytedcli-policy-plugin-preset'})).toHaveLength(0);
+  expect(p.renderer.root.findAllByProps({'data-action':'bytedcli-policy-mix-preset'})).toHaveLength(0);
  }finally{await p.close();}
+});
+it('a stale preset application keeps the current rules and does not retry the write',async()=>{
+ const presets=installSupportPreset(),p=await panel(full,summary(),presets,true);
+ try{
+  await act(async()=>p.control('bytedcli-policy-plugin-preset').props.onClick());
+  expect(p.requests).toHaveLength(1);expect(p.control('bytedcli-policy-codebase.mr.close').props.value).toBe('deny');
+ }finally{await p.close();removeInstalledPlugin('support');}
+});
+it('HTTP applies an installed bound preset from the latest disk settings and rejects stale or removed sources',async()=>{
+ const cfg=getBot('cli_dashboard_policy').config,original=cfg.triggerUserAuth,originalPlugins=cfg.plugins;
+ const before=readFileSync(botsFile,'utf8');installSupportPreset();cfg.plugins=['support'];
+ try{
+  const disk=JSON.parse(before);disk[0].plugins=['support'];disk[0].triggerUserAuth={...full,allowSpeakerSwitch:true};writeFileSync(botsFile,JSON.stringify(disk));
+  const status=await get();expect(status.bytedcliOperationPresets.presets).toHaveLength(1);const row=status.bytedcliOperationPresets.presets[0];
+  const ref={pluginId:row.pluginId,presetId:row.id,revision:row.revision};
+  const apply=(body:any)=>fetch(`http://127.0.0.1:${ipc.port}/api/bot-trigger-user-auth`,{method:'PUT',body:JSON.stringify(body)});
+  const response=await apply({bytedcliOperationPreset:ref});expect(response.status).toBe(200);
+  const saved=(await response.json()).triggerUserAuth;expect(saved).toMatchObject({credentialSource:full.credentialSource,capabilities:full.capabilities,dispatchOnly:full.dispatchOnly,allowSpeakerSwitch:true});
+  expect(saved.bytedcliOperationPolicy).toEqual(config({'codebase.mr.close':'machine','codebase.mr.list':'actor'}));
+  const persisted=readFileSync(botsFile,'utf8');
+  expect((await apply({bytedcliOperationPreset:{...ref,revision:'sha256:'+'a'.repeat(43)}})).status).toBe(409);
+  expect((await apply({bytedcliOperationPreset:ref,triggerUserAuth:full})).status).toBe(400);
+  const record=readPluginRegistry().plugins.support!;upsertInstalledPlugin({...record,version:'1.0.1'});
+  expect((await apply({bytedcliOperationPreset:ref})).status).toBe(409);
+  removeInstalledPlugin('support');expect((await apply({bytedcliOperationPreset:ref})).status).toBe(409);
+  expect(readFileSync(botsFile,'utf8')).toBe(persisted);
+ }finally{writeFileSync(botsFile,before);cfg.triggerUserAuth=original;cfg.plugins=originalPlugins;removeInstalledPlugin('support');}
+});
+it('HTTP discovery and application use fresh global and bot bindings after another process disables a plugin',async()=>{
+ const cfg=getBot('cli_dashboard_policy').config,originalAuth=cfg.triggerUserAuth,originalPlugins=cfg.plugins;
+ const before=readFileSync(botsFile,'utf8'),globalPath=globalConfigPath(),previousGlobal=existsSync(globalPath)?readFileSync(globalPath,'utf8'):undefined;
+ installSupportPreset();
+ try{
+  const disk=JSON.parse(before);disk[0].plugins=[];disk[0].triggerUserAuth=full;writeFileSync(botsFile,JSON.stringify(disk));cfg.triggerUserAuth=full;cfg.plugins=['support'];
+  writeFileSync(globalPath,JSON.stringify({plugins:['support']}));invalidateGlobalConfigCache();expect(readGlobalConfig().plugins).toEqual(['support']);
+  const row=(await get()).bytedcliOperationPresets.presets[0],ref={pluginId:row.pluginId,presetId:row.id,revision:row.revision};
+  writeFileSync(globalPath,JSON.stringify({plugins:[]}));
+  const response=await fetch(`http://127.0.0.1:${ipc.port}/api/bot-trigger-user-auth`,{method:'PUT',body:JSON.stringify({bytedcliOperationPreset:ref})});
+  expect(response.status).toBe(409);expect((await get()).bytedcliOperationPresets.presets).toEqual([]);
+  expect(JSON.parse(readFileSync(botsFile,'utf8'))[0].triggerUserAuth.bytedcliOperationPolicy).toEqual(full.bytedcliOperationPolicy);
+ }finally{
+  writeFileSync(botsFile,before);cfg.triggerUserAuth=originalAuth;cfg.plugins=originalPlugins;removeInstalledPlugin('support');
+  if(previousGlobal===undefined)rmSync(globalPath,{force:true});else writeFileSync(globalPath,previousGlobal);invalidateGlobalConfigCache();
+ }
+});
+it('HTTP keeps manual policy status and healthy presets available when unrelated MCP metadata is corrupt',async()=>{
+ const cfg=getBot('cli_dashboard_policy').config,originalAuth=cfg.triggerUserAuth;
+ const before=readFileSync(botsFile,'utf8');installSupportPreset();const registryFile=pluginRegistryPath(),registryBytes=readFileSync(registryFile,'utf8');
+ try{
+  const disk=JSON.parse(before);disk[0].plugins=['support'];disk[0].triggerUserAuth=full;writeFileSync(botsFile,JSON.stringify(disk));cfg.triggerUserAuth=full;
+  const registry=JSON.parse(registryBytes);registry.plugins.broken={...registry.plugins.support,id:'broken',manifest:{schemaVersion:1,id:'broken'},contributions:{mcp:{token:'private-mcp-secret'}}};
+  writeFileSync(registryFile,JSON.stringify(registry));
+  const response=await fetch(`http://127.0.0.1:${ipc.port}/api/bot-trigger-user-auth-status`);expect(response.status).toBe(200);
+  const status=await response.json();expect(status.bytedcliOperationPolicy.schema).toBe('botmux.bytedcli-operation-policy-status.v2');
+  expect(status.bytedcliOperationPresets.presets.map((row:any)=>row.pluginId)).toEqual(['support']);expect(JSON.stringify(status)).not.toContain('private-mcp-secret');
+  expect((await put({bytedcliOperationPolicy:config({'codebase.mr.list':'actor'})})).status).toBe(200);
+ }finally{writeFileSync(registryFile,registryBytes);removeInstalledPlugin('support');writeFileSync(botsFile,before);cfg.triggerUserAuth=originalAuth;}
 });
 
 it('same-path RPC rules have distinct visible and accessible identities and save only the named rule', async()=>{
@@ -195,4 +274,16 @@ it('same-path RPC rules have distinct visible and accessible identities and save
   expect(controls[0]!.props.value).toBe('actor');
   expect(controls[1]!.props.value).toBe('machine');
  }finally{await p.close();}
+});
+it('core-only synthetic bots retain manual status without requiring a bots.json file',async()=>{
+ const previous={BOTMUX_CORE_ONLY:process.env.BOTMUX_CORE_ONLY,BOTMUX_API_ONLY_BOT:process.env.BOTMUX_API_ONLY_BOT,BOTS_CONFIG:process.env.BOTS_CONFIG};
+ try{
+  process.env.BOTMUX_CORE_ONLY='1';process.env.BOTMUX_API_ONLY_BOT='local_riff';delete process.env.BOTS_CONFIG;
+  __testOnly_resetBotRegistry();loadBotConfigs().forEach(registerBot);setLarkAppId('local_riff');
+  const response=await fetch(`http://127.0.0.1:${ipc.port}/api/bot-trigger-user-auth-status`);expect(response.status).toBe(200);
+  expect(await response.json()).toMatchObject({ok:true,bytedcliOperationPresets:{presets:[]}});
+ }finally{
+  for(const [key,value] of Object.entries(previous))if(value===undefined)delete process.env[key];else process.env[key]=value;
+  __testOnly_resetBotRegistry();loadBotConfigs().forEach(registerBot);setLarkAppId('cli_dashboard_policy');
+ }
 });

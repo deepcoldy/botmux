@@ -6,14 +6,17 @@ import { installLocalPlugin } from '../src/core/plugins/install.js';
 import { readPluginRegistry } from '../src/services/plugin-registry-store.js';
 import { scanPluginContributions } from '../src/core/plugins/convention-scanner.js';
 import { parsePluginBytedcliOperationPresets, readPluginBytedcliOperationPresets, selectPluginBytedcliOperationPreset } from '../src/core/plugins/bytedcli-operation-presets.js';
+import { globalConfigPath, invalidateGlobalConfigCache, readGlobalConfig } from '../src/global-config.js';
+import { pluginRegistryPath } from '../src/core/plugins/paths.js';
 const roots: string[] = [];
-afterEach(() => { vi.unstubAllEnvs(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+afterEach(() => { invalidateGlobalConfigCache(); vi.unstubAllEnvs(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 const policy = (rules: Record<string, string> = { 'codebase.mr.close': 'machine', 'codebase.mr.list': 'actor' }) => ({
   schema: 'botmux.bytedcli-operation-policy.v2', cliVersion: '0.199.0', catalogVersion: '2026-11-27.2', rules,
 });
 const declaration = (presets: unknown[] = [{ id: 'support', title: 'Support policy', description: 'Reviewed command identities', policy: policy() }]) => ({ schema: 'botmux.bytedcli-operation-presets.v1', presets });
 function fixture() {
   const home = mkdtempSync(join(tmpdir(), 'plugin-command-presets-')); roots.push(home); vi.stubEnv('HOME', home);
+  vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', join(home, '.botmux', 'config.json'));
   const source = join(home, 'source'), runtime = join(source, 'dist'); mkdirSync(join(runtime, 'bytedcli'), { recursive: true });
   writeFileSync(join(source, 'package.json'), JSON.stringify({ name: 'botmux-plugin-support', version: '1.0.0', keywords: ['botmux-plugin'], botmux: { id: 'support' } }));
   const file = join(runtime, 'bytedcli', 'operation-presets.json'); writeFileSync(file, JSON.stringify(declaration()));
@@ -90,4 +93,23 @@ it('bounds the combined discovery response without partially publishing a plugin
   for (let i = 0; i < 65; i++) { const id = 'plugin-' + i; registry.plugins[id] = { ...original, id, manifest: { schemaVersion: 1, id } }; }
   const snapshot = readPluginBytedcliOperationPresets({ plugins: Array.from({ length: 65 }, (_, i) => 'plugin-' + i) }, {}, registry);
   expect(snapshot.presets).toHaveLength(64); expect(snapshot.issues).toEqual([{ pluginId: 'plugin-64', code: 'too_many_presets' }]);
+});
+it('observes a plugin disabled by another process even after global configuration was cached', () => {
+  const s = fixture(); installLocalPlugin(s.source);
+  writeFileSync(globalConfigPath(), JSON.stringify({ plugins: ['support'] })); invalidateGlobalConfigCache();
+  expect(readGlobalConfig().plugins).toEqual(['support']);
+  writeFileSync(globalConfigPath(), JSON.stringify({ plugins: [] }));
+  expect(readPluginBytedcliOperationPresets({}).presets).toEqual([]);
+});
+it('isolates an unrelated broken MCP record without migrating or exposing its credentials', () => {
+  const s = fixture(); installLocalPlugin(s.source);
+  const registry = readPluginRegistry(), original = registry.plugins.support!;
+  registry.plugins.broken = { ...original, id: 'broken', manifest: { schemaVersion: 1, id: 'broken' },
+    contributions: { mcp: { token: 'private-mcp-secret', command: '/private/executable' } as any } };
+  const bytes = JSON.stringify(registry); writeFileSync(pluginRegistryPath(), bytes);
+  const result = readPluginBytedcliOperationPresets({ plugins: ['support'] }, {});
+  expect(result.presets.map(row => row.pluginId)).toEqual(['support']); expect(result.issues).toEqual([]);
+  expect(JSON.stringify(result)).not.toContain('private-mcp-secret');
+  expect(JSON.stringify(result)).not.toContain('/private/executable');
+  expect(readFileSync(pluginRegistryPath(), 'utf8')).toBe(bytes);
 });
