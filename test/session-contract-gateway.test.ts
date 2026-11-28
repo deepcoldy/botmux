@@ -502,6 +502,44 @@ describe('contract gateway and real worker boundaries', () => {
     expect(daemon.worker).toBeNull();
   });
 
+  it('emits install-change reclamation after the asynchronous primary suspend completes', async () => {
+    const fixtureState = fixture();
+    const daemon = fixtureState.ds;
+    daemon.worker = { killed: false, send: vi.fn(), kill: vi.fn() } as any;
+    daemon.initConfig = { backendType: 'tmux' } as any;
+    daemon.session.queuedActivationTail = [{ turnId: 'om_replacement', ownerRuntime: 'new' } as any];
+    fixtureState.store.apply(fixtureState.ref, { type: 'worker_online', worker: fixtureState.worker });
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    vi.spyOn(fixtureState.controller, 'flushPrimary').mockImplementation(() => gate);
+    const reclaimed = vi.fn();
+    const scope: any = {
+      primarySuspendInFlight: new WeakMap(), primarySuspendApplying: new WeakSet(), sameRuntime,
+      controllerForSession: () => fixtureState.controller, sessionContractPrimary: () => true,
+      callbacks: { onInstallChangeReclaimed: reclaimed },
+      CLI_INSTALL_CHANGED_SUSPEND: 'cli_install_changed',
+      hasProtectedSessionMutationOwnership: () => false, isSessionTransferring: () => false,
+      isSuspendableBackendType: () => true, trackLifecycleRetirement: vi.fn(), clearLifecycleRetirement: vi.fn(),
+      suspendBackingVerifier: () => true,
+      logger: { warn: vi.fn(), info: vi.fn() }, tag: () => 'test',
+      restartCoordinator: { cancelSession: vi.fn() }, armWorkerKillBackstop: vi.fn(),
+      clearAcceptedInputTurns: vi.fn(), invalidateStuckWarning: vi.fn(), invalidateTuiPrompt: vi.fn(),
+      clearIdleAutoCompactStretch: vi.fn(), takeSessionPreviewTarget: () => undefined,
+      sessionStore: { updateSessionPid: vi.fn(), updateSession: vi.fn() },
+      dashboardEventBus: { publish: vi.fn() }, clearPendingSuspendClaim: vi.fn(),
+    };
+    scope.managedSuspendAttemptId = loadWorkerPoolFunction('managedSuspendAttemptId', scope);
+    scope.suspendWorker = loadWorkerPoolFunction('suspendWorker', scope);
+    const suspend = loadWorkerPoolFunction('suspendWorkerAsync', scope);
+    const completion = suspend(daemon, 'cli_install_changed');
+    expect(reclaimed).not.toHaveBeenCalled();
+    release();
+    await expect(completion).resolves.toBe(true);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(reclaimed).toHaveBeenCalledOnce();
+    expect(reclaimed).toHaveBeenCalledWith(daemon);
+  });
+
   it('settles a claimed managed suspend without effects when accepted input arrives during primary flush', async () => {
     const fixtureState = fixture();
     const daemon = fixtureState.ds;
@@ -1732,7 +1770,7 @@ describe('contract gateway and real worker boundaries', () => {
       credentialIsolated: false, cliPid: 111, cliProcStart: 'start1' }), execution);
     const worker: any = { send: vi.fn() }; s.ds.worker = worker; s.ds.workerGeneration = 1;
     const handlerScope: any = { sessionController: s.controller, contractWorker: s.worker, ds: s.ds, worker,
-      workerGeneration: 1,
+      workerGeneration: s.ds.workerGeneration,
       logger: { debug: vi.fn(), warn: vi.fn() }, t: 'test', botCfg: {}, sessionCliId: () => 'claude-code' };
     handlerScope.handleLegacyWorkerMessage = loadWorkerPoolClosure<(message: any) => Promise<void>>('handleLegacyWorkerMessage', handlerScope);
     const handler = loadWorkerPoolClosure<(message: any) => Promise<void>>('handleWorkerMessage', handlerScope);

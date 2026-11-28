@@ -227,6 +227,7 @@ describe('sendToPty serial admission', () => {
       activeTurnAuthority,
       traexAutoModelRuntimeEligible: () => false,
       traexAutoModelController: undefined,
+      deferTurnInputCommitUntilSubmission: () => false,
       pendingMessages,
       // Stop immediately after the item is materialized; the queue envelope is
       // the behavior under test, not a real backend write.

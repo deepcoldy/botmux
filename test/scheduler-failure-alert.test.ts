@@ -101,7 +101,7 @@ describe('failure alert delivery on previously-silent paths', () => {
     scheduler.stopScheduler();
 
     expect(mocks.markRun).toHaveBeenCalledWith(
-      task.id, false, 'schedule run interrupted by daemon restart', undefined, interrupted.lastRunId,
+      task.id, false, 'schedule run interrupted by daemon restart', undefined, interrupted.lastRunId, {},
     );
     expect(alert).toHaveBeenCalledTimes(1);
     expect(alert).toHaveBeenCalledWith(expect.objectContaining({ id: task.id }), 3, 'previous boom');
@@ -134,7 +134,7 @@ describe('failure alert delivery on previously-silent paths', () => {
     scheduler.stopScheduler();
 
     expect(mocks.markRun).toHaveBeenCalledWith(
-      task.id, false, 'scheduler execute callback is not initialised', undefined, expect.any(String),
+      task.id, false, 'scheduler execute callback is not initialised', undefined, expect.any(String), {},
     );
     expect(alert).toHaveBeenCalledTimes(1);
     expect(alert).toHaveBeenCalledWith(

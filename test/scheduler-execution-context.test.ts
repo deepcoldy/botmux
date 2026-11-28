@@ -242,6 +242,7 @@ describe('scheduler execution context', () => {
       'schedule run interrupted by daemon restart',
       undefined,
       interrupted.lastRunId,
+      {},
     );
   });
 

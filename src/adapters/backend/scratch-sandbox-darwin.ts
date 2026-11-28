@@ -209,6 +209,8 @@ function sealedAncestors(writable: readonly string[], roots: readonly string[]):
 export function buildMacScratchProfile(input: {
   /** Scratch trees granted read+write (clone trees, session tmp/outbox/shim). */
   writable: readonly string[];
+  /** Exact read-only snapshot trees opened after authority seals. */
+  readOnlyPaths?: readonly string[];
   /** Secret/authority roots sealed READ+write before the scratch re-open. */
   authorityRootDenies?: readonly string[];
   /** Final file/subtree denies (read+write for secrets; write-only callers
@@ -258,8 +260,11 @@ export function buildMacScratchProfile(input: {
   // a `file-read*` seal on ~/.botmux makes that walk fail with EPERM before it
   // ever reaches the re-opened session tree (Codex: "failed to canonicalize
   // CODEX_HOME … Operation not permitted").
-  for (const dir of sealedAncestors(input.writable ?? [], input.authorityRootDenies ?? [])) {
+  for (const dir of sealedAncestors([...(input.writable ?? []), ...(input.readOnlyPaths ?? [])], input.authorityRootDenies ?? [])) {
     lines.push(`(allow file-read-metadata (literal "${escSb(dir)}"))`);
+  }
+  for (const dir of input.readOnlyPaths ?? []) {
+    lines.push(`(allow file-read* (subpath "${escSb(dir)}"))`);
   }
   if (input.mcpSocket) {
     lines.push(`(allow file-write* (literal "${escSb(input.mcpSocket)}"))`);
@@ -275,6 +280,9 @@ export function buildMacScratchProfile(input: {
     if (typeof raw !== 'string' || !raw || !isAbsolute(raw)) continue;
     lines.push(`(deny file-write* (subpath "${escSb(raw)}"))`);
   }
+  for (const dir of input.readOnlyPaths ?? []) {
+    lines.push(`(deny file-write* (subpath "${escSb(dir)}"))`);
+  }
   if (!input.net) lines.push('(deny network*)');
   return lines;
 }
@@ -288,6 +296,8 @@ export interface PrepareMacScratchOpts {
   cliArgs: string[];
   /** Credential/secret REAL host paths (read+write denied in the child). */
   denyPaths?: readonly string[];
+  /** Exact read-only snapshot trees allowed to execute inside the sandbox. */
+  readOnlyPaths?: readonly string[];
   mcpGatewaySocketPath?: string;
   net?: boolean;
 }
@@ -584,11 +594,13 @@ export function prepareMacScratchSandboxDetailed(opts: PrepareMacScratchOpts): M
   const macLarkDenies = macLarkKeystoreDenies(homeReal);
 
   const profilePath = join(sessionRoot, 'scratch.sb');
+  const readOnlyPaths = (opts.readOnlyPaths ?? []).map(canonical);
   const lines = buildMacScratchProfile({
     net: opts.net !== false,
     authorityRootDenies: [...authorityRoots].sort((a, b) => b.length - a.length),
     writable: [homeCloneRoot, workCloneRoot, tmp, outbox, shimBin],
     hostWritable,
+    readOnlyPaths,
     fileDenyPaths: [...new Set([...callerFileDenies, ...macLarkDenies])],
     fileWriteDenyPaths: [...degradedWriteDeny, claudeMcpCache]
       .filter(p => !authorityRoots.has(p)),

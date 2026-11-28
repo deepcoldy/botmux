@@ -883,6 +883,35 @@ describe('spawnDashboardSession — backlog (待办池) parks without starting t
     expect(active.get(sessionKey('oc_healthy_2', APP))?.session.sessionId).toBe(healthy.sessionId);
   });
 
+  it('restores an all-cancelled pruned tail as drained instead of quarantining the owner', async () => {
+    const drained: Session = {
+      sessionId: 'drained-cancelled-tail', chatId: CHAT, rootMessageId: CHAT, scope: 'chat', larkAppId: APP,
+      title: 'cancelled tail', status: 'active', createdAt: new Date('2026-01-01T00:00:00Z').toISOString(),
+      cliId: 'claude-code',
+      queuedActivationTail: [{
+        id: 'tail-cancelled-restore', order: 1, userPrompt: 'CANCELLED_RESTORE',
+        cliInput: { content: 'CANCELLED_RESTORE' }, turnId: 'cancelled-restore-turn',
+      }],
+      cancelledActivationTurnIds: ['cancelled-restore-turn'],
+    };
+    store.set(drained.sessionId, drained);
+    const { promoteQueuedActivationTail } = await import('../src/core/worker-pool.js');
+    vi.mocked(promoteQueuedActivationTail).mockImplementationOnce((ds: any) => {
+      // The real prune has already persisted the empty result. Exercise the
+      // restore decision, not the prune implementation mocked in this file.
+      ds.session.queuedActivationTail = undefined;
+      ds.initialStartPending = false;
+      return false;
+    });
+    const active = new Map<string, DaemonSession>();
+    await restoreActiveSessions(active);
+    const registered = active.get(sessionKey(CHAT, APP));
+    expect(registered?.session.sessionId).toBe(drained.sessionId);
+    expect(registered?.quarantinedActivationTailPromotion).toBeUndefined();
+    expect(registered?.initialStartPending).toBe(false);
+    expect(registered?.initialStartClaimToken).toBeUndefined();
+  });
+
   it('rolls back a failed terminal-empty cleanup and continues restoring later rows', async () => {
     const failed: Session = {
       sessionId: 'failed-terminal-cleanup', chatId: CHAT, rootMessageId: CHAT, scope: 'chat', larkAppId: APP,

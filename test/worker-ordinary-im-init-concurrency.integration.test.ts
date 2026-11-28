@@ -278,6 +278,111 @@ setInterval(() => {}, 1_000);
     }));
   }, 15_000);
 
+  it('cancels a queued turn during async init without executing it and still accepts later human input', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-cancel-init-'));
+    tempDirs.add(root);
+    const dataDir = join(root, 'session');
+    mkdirSync(dataDir, { recursive: true });
+    const inputLog = join(root, 'stdin.log');
+    const fakePi = join(root, 'fake-pi');
+    writeFakeCli(fakePi, `#!/usr/bin/env node
+const fs = require('node:fs');
+setTimeout(() => process.stdout.write('Ready\\n'), 1_500);
+process.stdin.on('data', chunk => fs.appendFileSync(${JSON.stringify(inputLog)}, chunk.toString()));
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(fakePi, 0o755);
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const sessionId = `sid-worker-cancel-init-${runId}`;
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env, HOME: root, SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: sessionId, LARK_APP_ID: 'app_test', LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.on('message', raw => {
+      messages.push(raw as WorkerToDaemon);
+      logs.push(`[ipc] ${JSON.stringify(raw)}\n`);
+    });
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+    child.send({
+      type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_root',
+      workingDir: dataDir, cliId: 'pi', cliPathOverride: fakePi, backendType: 'pty',
+      prompt: '', larkAppId: 'app_test', larkAppSecret: 'secret',
+    } satisfies DaemonToWorker);
+    child.send({
+      type: 'message', content: 'CANCELLED_OPENING_MARKER', turnId: 'schedule:cancelled-opening',
+    } satisfies DaemonToWorker);
+    child.send({
+      type: 'cancel_queued_turn', requestId: 'cancel-opening', turnId: 'schedule:cancelled-opening',
+    } satisfies DaemonToWorker);
+
+    await waitFor(() => messages.some(message => message.type === 'queued_turn_cancel_result'
+      && message.turnId === 'schedule:cancelled-opening' && message.status === 'queued_removed'), logs);
+    await waitFor(() => messages.some(message => message.type === 'ready'), logs);
+    expect(messages).not.toContainEqual(expect.objectContaining({
+      type: 'turn_input_committed', turnId: 'schedule:cancelled-opening',
+    }));
+    expect(existsSync(inputLog) && readFileSync(inputLog, 'utf8').includes('CANCELLED_OPENING_MARKER')).toBe(false);
+
+    child.send({ type: 'message', content: 'HUMAN_AFTER_CANCEL_MARKER', turnId: 'om_human_after_cancel' } satisfies DaemonToWorker);
+    await waitFor(() => existsSync(inputLog) && readFileSync(inputLog, 'utf8').includes('HUMAN_AFTER_CANCEL_MARKER'), logs);
+  }, 20_000);
+
+  it('keeps a durable primary inbox turn uncommitted after init materialization until submission proof', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-durable-init-'));
+    tempDirs.add(root);
+    const dataDir = join(root, 'session');
+    mkdirSync(dataDir, { recursive: true });
+    const fakePi = join(root, 'fake-pi');
+    writeFakeCli(fakePi, `#!/usr/bin/env node
+setTimeout(() => process.stdout.write('Ready\\n'), 500);
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(fakePi, 0o755);
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const sessionId = `sid-worker-durable-init-${runId}`;
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env, HOME: root, SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: sessionId, LARK_APP_ID: 'app_test', LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.on('message', raw => {
+      messages.push(raw as WorkerToDaemon);
+      logs.push(`[ipc] ${JSON.stringify(raw)}\n`);
+    });
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+
+    child.send({
+      type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_root',
+      workingDir: dataDir, cliId: 'pi', cliPathOverride: fakePi, backendType: 'pty',
+      prompt: '', larkAppId: 'app_test', larkAppSecret: 'secret',
+    } satisfies DaemonToWorker);
+    child.send({
+      type: 'message', content: 'durable follow-up during init', turnId: 'om_durable_followup',
+      dispatchAttempt: 1, durablePrimaryInbox: true,
+    } satisfies DaemonToWorker);
+
+    // The ready IPC is emitted after the materialization ACK drain. A durable
+    // turn must still wait for the adapter's actual submitted=true result.
+    await waitFor(() => messages.some(message => message.type === 'ready'), logs);
+    expect(messages).not.toContainEqual(expect.objectContaining({
+      type: 'turn_input_committed', turnId: 'om_durable_followup',
+    }));
+  }, 15_000);
+
   it('reports a message as not yet taken by the CLI ahead of its commit, until it is written', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-input-backlog-'));
     tempDirs.add(root);
