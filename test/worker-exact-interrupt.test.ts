@@ -1,3 +1,4 @@
+import { shouldInterruptRemovedModel } from '../src/core/model-removal-interrupt.js';
 import { readFileSync } from 'node:fs';
 import { createContext, runInContext } from 'node:vm';
 import { transpileModule, ModuleKind, ScriptTarget } from 'typescript';
@@ -12,7 +13,7 @@ import { WorkerSessionEventScope } from '../src/services/session-event-scope.js'
 // whole worker would start its IPC/runtime; a copy of the handler would miss
 // regressions in the ACK ordering we need to exercise here.
 const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
-const start = source.indexOf('async function handleExactTurnInterrupt(');
+const start = source.indexOf('let lastModelRemovalInterrupt:');
 const end = source.indexOf('/** Key name → ANSI escape sequence', start);
 if (start < 0 || end < start) throw new Error('Exact interrupt handler not found');
 const handler = transpileModule(source.slice(start, end), {
@@ -31,6 +32,9 @@ function harness(delivered = true, interruptKey?: 'ctrlc' | 'esc', cliId = 'code
   const submitCursorParkedFollowUpAfterStop = vi.fn();
   const context = createContext({
     activeTranscriptImagePurge: undefined,
+    shouldInterruptRemovedModel, publishedActiveRuntime: { model: 'astra' }, publishedActiveRuntimeSeeded: false,
+    statuslineLaunchGenAtSpawn: { generation: 1, token: 'launch-1' }, cliSpawnGeneration: 1, cliInterruptGeneration: 0,
+    turnTerminalEmitted: vi.fn(() => false),
     workerSessionEventScope: undefined,
     currentBotmuxTurnId: 'stop', currentBotmuxDispatchAttempt: undefined, backend: {}, lastInitConfig: { cliId }, effectiveBackendType: 'pty', isCodexAppCliId,
     codexCliEffortOperation: undefined, cliLifetimeNonce: 1,
@@ -50,8 +54,14 @@ function harness(delivered = true, interruptKey?: 'ctrlc' | 'esc', cliId = 'code
   context.settleStoppedTraexRecovery = loadWorkerFunction('settleStoppedTraexRecovery', context);
   runInContext(handler, context);
   const interrupt = () => runInContext("handleExactTurnInterrupt('request', 'stop')", context) as Promise<void>;
+  const interruptRemoved = (models = ['5.6']) => runInContext(
+    "handleExactTurnInterrupt('request', 'stop', removal)", Object.assign(context, {
+      removal: { model: 'astra', launchGeneration: 'launch-1',
+        observation: { availableModels: models, fetchedAtMs: Date.now() } },
+    }),
+  ) as Promise<void>;
   const replay = () => { inflightInputs.onCliExit(); return inflightInputs.takeCarryOver().map(item => item.turnId); };
-  return { context, pendingMessages, send, control, controlKey, retireDoubaoBridgeTurnOnInterrupt, submitCursorParkedFollowUpAfterStop, interrupt, replay, inflightInputs };
+  return { context, pendingMessages, send, control, controlKey, retireDoubaoBridgeTurnOnInterrupt, submitCursorParkedFollowUpAfterStop, interrupt, interruptRemoved, replay, inflightInputs };
 }
 
 describe('worker exact interrupt acknowledgement and crash replay', () => {
@@ -175,5 +185,35 @@ describe('worker exact interrupt for Cursor', () => {
     const h = harness(true, 'ctrlc', 'codex');
     await h.interrupt();
     expect(h.submitCursorParkedFollowUpAfterStop).not.toHaveBeenCalled();
+  });
+});
+
+describe('catalog-driven exact worker interrupt', () => {
+  it('interrupts once and preserves unrelated input, including after a duplicate request', async () => {
+    const h = harness();
+    await h.interruptRemoved();
+    await h.interruptRemoved();
+    expect(h.control).toHaveBeenCalledOnce();
+    expect(h.send).toHaveBeenNthCalledWith(1, expect.objectContaining({ delivered: true }));
+    expect(h.send).toHaveBeenNthCalledWith(2, expect.objectContaining({ delivered: false }));
+    expect(h.replay()).toEqual(['next']);
+  });
+
+  it('leaves the CLI alone if its model is still available', async () => {
+    const h = harness();
+    await h.interruptRemoved(['astra', '5.6']);
+    expect(h.control).not.toHaveBeenCalled();
+    expect(h.replay()).toEqual(['stop', 'next']);
+  });
+
+  it('rechecks model and generation immediately before the transport write', async () => {
+    const h = harness();
+    h.context.runAfterAmbiguousSubmissionWrites = async (_backend, action) => {
+      h.context.statuslineLaunchGenAtSpawn.token = 'launch-2';
+      return action();
+    };
+    await h.interruptRemoved();
+    expect(h.control).not.toHaveBeenCalled();
+    expect(h.replay()).toEqual(['stop', 'next']);
   });
 });

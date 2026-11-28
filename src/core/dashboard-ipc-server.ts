@@ -1,3 +1,4 @@
+import { modelRemovalObservation, shouldInterruptRemovedModel, type ModelRemovalTarget } from './model-removal-interrupt.js';
 import { nativeGatewayAskSnapshots, nativeGatewayAskDecision, type NativeGatewayAskOrigin } from './native-gateway-ask-control.js';
 import {
   EXPECTED_CORE_BOOT_HEADER,
@@ -3283,6 +3284,58 @@ ipcRoute('POST', '/api/sessions/:sessionId/close', async (req, res, params) => {
     const r = await closeCurrentGeneration();
     const archiveError = r.ok ? await cleanupArchive() : undefined;
     jsonRes(res, r.ok ? 200 : 502, { ...r, ...(archiveError ? { archiveError } : {}) });
+  });
+});
+
+// Intentionally not proxied through the public Dashboard or the core-only
+// unauthenticated async-trigger allowlist.
+const MODEL_REMOVAL_ROUTE = '/api/sessions/:sessionId/model-removal-interrupt';
+function liveModelRemovalTarget(ds: DaemonSession): ModelRemovalTarget | undefined {
+  const { session, activeInteractiveTurn } = ds;
+  const caller = activeInteractiveTurn?.caller;
+  if (session.creationSource !== 'ordinary-feishu' || session.status === 'closed'
+      || !larkTransportEnabled(ds) || !caller || caller.senderType !== 'user' || caller.source
+      || ds.adoptedFrom || ds.initConfig?.adoptMode || ds.initConfig?.existingAppServerEndpoint
+      || ds.initConfig?.codexRpcInput || ds.initConfig?.workflowNodeSession
+      || isRemoteBackendSession(ds) || isSessionTransferring(ds) || isSessionRestartInFlight(ds)
+      || session.codexModelSelection?.override || session.groupDefaultModels?.codex
+      || session.spawnModelOverride || ds.spawnModelOverride
+      || (ds.initConfig?.cliId ?? session.cliId) !== 'codex'
+      || !ds.worker || ds.worker.killed || ds.statuslineActiveModelStale || ds.activeModelFromSeed
+      || !ds.activeModel || !ds.statuslineLaunchGen) return;
+  return { turnId: activeInteractiveTurn!.turnId, model: ds.activeModel, launchGeneration: ds.statuslineLaunchGen };
+}
+
+ipcRoute('GET', MODEL_REMOVAL_ROUTE, (req, res, params) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  const ds = findActiveBySessionId(params.sessionId);
+  if (!ds || ds.larkAppId !== cachedLarkAppId) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  return jsonRes(res, 200, { ok: true, target: liveModelRemovalTarget(ds) ?? null });
+});
+
+ipcRoute('POST', MODEL_REMOVAL_ROUTE, async (req, res, params) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  const ds = findActiveBySessionId(params.sessionId);
+  if (!ds || ds.larkAppId !== cachedLarkAppId) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  let body: { turnId: string; model: string; launchGeneration: string; catalog?: unknown };
+  try { body = await readJsonBody(req, 128 * 1024); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (!body || typeof body !== 'object') return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  return withBotTurnMutation(ds.larkAppId, async () => {
+    if (req.aborted || res.destroyed) return;
+    const now = Date.now();
+    const catalog = modelRemovalObservation(body.catalog, now);
+    if (!catalog) return jsonRes(res, 400, { ok: false, error: 'invalid_catalog' });
+    const target = findActiveBySessionId(params.sessionId) === ds ? liveModelRemovalTarget(ds) : undefined;
+    if (!shouldInterruptRemovedModel(body, target, catalog, now)) {
+      return jsonRes(res, 409, { ok: false, error: 'model_removal_target_changed_or_available' });
+    }
+    const result = await interruptExactWorkerTurn(ds, body.turnId, 10_000, {
+      model: body.model, launchGeneration: body.launchGeneration, observation: catalog,
+    });
+    // Delivery is not proof that the CLI has exited or reached a native terminal.
+    return jsonRes(res, result.ok ? 202 : result.reason === 'stale_turn' ? 409 : 503,
+      result.ok ? { ok: true, state: 'interrupt_delivered' } : { ok: false, error: result.reason });
   });
 });
 
