@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { workerSubmitHarness } from './helpers/worker-submit-harness.js';
-import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { loadWorkerFunction, loadWorkerMessageHandler } from './helpers/worker-function-harness.js';
 import { ActiveTurnAuthority } from '../src/core/active-turn-authority.js';
 
 type Admission = 'allow' | 'retain' | 'reject';
@@ -40,7 +40,10 @@ function scheduledHarness(decisions: Array<Admission | (() => Promise<Admission>
     _backend: unknown,
     _message: string,
     opts: { beforeSubmit?: () => boolean },
-  ) => ({ submitted: deferred ? opts.beforeSubmit?.() !== false : true }));
+  ) => (deferred && opts.beforeSubmit?.() === false
+    // The Codex adapter's own answer to a beforeSubmit veto.
+    ? { submitted: false, submissionDisposition: 'untouched', failureReason: 'vetoed before submission' }
+    : { submitted: true }));
   const rejections = (turnId: string) => h.scope.send.mock.calls
     .filter(([message]: [any]) => message.type === 'turn_input_rejected' && message.turnId === turnId).length;
   const fireRetry = async () => {
@@ -333,6 +336,189 @@ describe('deferred scheduled input retired while its write-edge admission is pen
     expect(preparedFor(h.scope, runA.turnId)).toEqual(PREPARED_ONCE);
     expect(authority.snapshot()).toMatchObject({ turnId: runA.turnId, started: true });
     expect(h.scope.cliGenerationTurnWrites).toBe(1);
+    expect(h.scope.pendingMessages).toEqual([]);
+  });
+});
+
+/** Park the next adapter writeInput in its own (Codex transcript/terminal)
+ * precheck, before it reaches beforeSubmit; `parked` resolves exactly then. */
+function parkPrecheck(scope: Record<string, any>) {
+  let release!: () => void;
+  let markParked!: () => void;
+  const parked = new Promise<void>(resolve => { markParked = resolve; });
+  const precheck = new Promise<void>(resolve => { release = resolve; });
+  const submit = scope.cliAdapter.writeInput.getMockImplementation()!;
+  scope.cliAdapter.writeInput.mockImplementationOnce(async (...args: any[]) => {
+    markParked();
+    await precheck;
+    return submit(...args);
+  });
+  return { parked, release };
+}
+
+/** The real interrupt_turn IPC case. The exact-turn key delivery itself only
+ * concerns the running turn, never the queue, so it is stubbed. */
+async function interruptCli(scope: Record<string, any>) {
+  scope.handleExactTurnInterrupt = vi.fn(async () => {});
+  await loadWorkerMessageHandler('interrupt_turn', scope)({ type: 'interrupt_turn', requestId: 'r', turnId: 'running' });
+}
+
+/** The real term_action IPC case for /stop's ctrlc; of handleTermAction only
+ * its queue step (the scheduled-backlog STOP) runs, not the key delivery. */
+async function stopCli(scope: Record<string, any>) {
+  const stop = loadWorkerFunction<() => void>('discardScheduledBacklogForStop', scope);
+  scope.handleTermAction = vi.fn(async (key: string) => { if (key === 'ctrlc') stop(); });
+  await loadWorkerMessageHandler('term_action', scope)({ type: 'term_action', key: 'ctrlc' });
+}
+
+describe('deferred scheduled input interrupted during the adapter precheck', () => {
+  function interruptibleHarness(decisions: Admission[]) {
+    const harness = scheduledHarness(decisions, true);
+    harness.h.scope.cliInterruptGeneration = 0;
+    // An untouched Codex refusal hard-blocks native input; an interrupt hold must not.
+    harness.h.scope.holdNativeInputForHardBlock = vi.fn();
+    const authority = useRealTurnAuthority(harness.h.scope);
+    return { ...harness, authority };
+  }
+
+  it('is held unprepared in the queue, then written exactly once on the next ready edge', async () => {
+    const { h, item: runA, rejections, authority } = interruptibleHarness(['allow', 'allow', 'allow', 'allow']);
+    const { parked, release } = parkPrecheck(h.scope);
+    const flushA = h.flush();
+    await parked;
+    await interruptCli(h.scope);
+    expect(h.scope.cliInterruptGeneration).toBe(1);
+    release();
+    await flushA;
+
+    // The precheck reached beforeSubmit and was vetoed: nothing committed.
+    expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledTimes(1);
+    expect(preparedFor(h.scope, runA.turnId)).toEqual(NOT_PREPARED);
+    expect(authority.snapshot()).toBeUndefined();
+    expect(h.scope.cliGenerationTurnWrites).toBe(0);
+    expect(h.scope.pendingMessages).toEqual([runA]);
+    expect(rejections(runA.turnId)).toBe(0);
+    expect(h.scope.holdNativeInputForHardBlock).not.toHaveBeenCalled();
+
+    // The next ready edge captures the post-interrupt generation and writes it.
+    await h.flush();
+    expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledTimes(2);
+    expect(preparedFor(h.scope, runA.turnId)).toEqual(PREPARED_ONCE);
+    expect(authority.snapshot()).toMatchObject({ turnId: runA.turnId, started: true });
+    expect(h.scope.cliGenerationTurnWrites).toBe(1);
+    expect(h.scope.pendingMessages).toEqual([]);
+    expect(rejections(runA.turnId)).toBe(0);
+  });
+
+  it('a retained hold arms the admission retry, which writes it once', async () => {
+    const { h, item: runA, fireRetry } = interruptibleHarness(['allow', 'allow', 'allow', 'allow']);
+    const { parked, release } = parkPrecheck(h.scope);
+    const flushA = h.flush();
+    await parked;
+    await interruptCli(h.scope);
+    release();
+    await flushA;
+    expect(h.scope.pendingMessages).toEqual([runA]);
+
+    await fireRetry();
+    expect(preparedFor(h.scope, runA.turnId)).toEqual(PREPARED_ONCE);
+    expect(h.scope.pendingMessages).toEqual([]);
+    await h.flush();
+    expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledTimes(2);
+  });
+
+  it('a write marked cancelled is rejected exactly once and never written', async () => {
+    const { h, item: runA, rejections } = interruptibleHarness(['allow', 'allow', 'allow', 'allow']);
+    const { parked, release } = parkPrecheck(h.scope);
+    const flushA = h.flush();
+    await parked;
+    await interruptCli(h.scope);
+    h.scope.cliSubmissionInFlight.scheduledWriteCancelled = true;
+    release();
+    await flushA;
+
+    expect(preparedFor(h.scope, runA.turnId)).toEqual(NOT_PREPARED);
+    expect(rejections(runA.turnId)).toBe(1);
+    expect(h.scope.pendingMessages).toEqual([]);
+    await h.flush();
+    expect(rejections(runA.turnId)).toBe(1);
+    expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledTimes(1);
+    expect(preparedFor(h.scope, runA.turnId)).toEqual(NOT_PREPARED);
+  });
+
+  it.each(['coalesce', 'STOP'] as const)('interrupt + %s in the same window: the retired run settles once and the queue moves on', async retire => {
+    const { h, item: runA, rejections, authority } = interruptibleHarness(['allow', 'allow', 'allow', 'allow']);
+    const { parked, release } = parkPrecheck(h.scope);
+    const flushA = h.flush();
+    await parked;
+    const turnB = scheduledTurnId('b');
+    if (retire === 'coalesce') {
+      await interruptCli(h.scope);
+      h.scope.pendingMessages.push({
+        content: 'run B', turnId: turnB, queueAfterActiveTurn: true,
+        scheduledRun: { taskId: 'a1b2c3d4', runId: 'run-2', turnId: turnB, trigger: 'scheduler' },
+      });
+      loadWorkerFunction<() => void>('coalescePendingScheduledInputs', h.scope)();
+    } else {
+      await stopCli(h.scope);
+    }
+    expect(h.scope.cliInterruptGeneration).toBe(1);
+    expect(rejections(runA.turnId)).toBe(1);
+    release();
+    await flushA;
+
+    expect(preparedFor(h.scope, runA.turnId)).toEqual(NOT_PREPARED);
+    expect(rejections(runA.turnId)).toBe(1);
+    expect(h.scope.pendingMessages).toEqual([]);
+    if (retire === 'coalesce') {
+      // Same flush, fresh generation: B is written, not held by A's interrupt.
+      expect(preparedFor(h.scope, turnB)).toEqual(PREPARED_ONCE);
+      expect(authority.snapshot()).toMatchObject({ turnId: turnB, started: true });
+      expect(h.scope.cliGenerationTurnWrites).toBe(1);
+      expect(rejections(turnB)).toBe(0);
+    } else {
+      expect(authority.snapshot()).toBeUndefined();
+      expect(h.scope.cliGenerationTurnWrites).toBe(0);
+    }
+    await h.flush();
+    expect(rejections(runA.turnId)).toBe(1);
+    expect(preparedFor(h.scope, runA.turnId)).toEqual(NOT_PREPARED);
+  });
+
+  it('a Web wire dirtied during the precheck holds it once, unprepared, until the next clean ready edge', async () => {
+    const { h, item: runA, rejections } = interruptibleHarness(['allow', 'allow', 'allow', 'allow']);
+    const { parked, release } = parkPrecheck(h.scope);
+    const flushA = h.flush();
+    await parked;
+    h.scope.webTerminalDirtyTarget = {
+      backend: h.scope.backend, lifetime: h.scope.cliLifetimeNonce, generation: h.scope.cliSpawnGeneration,
+    };
+    release();
+    await flushA;
+    expect(preparedFor(h.scope, runA.turnId)).toEqual(NOT_PREPARED);
+    expect(h.scope.pendingMessages).toEqual([runA]);
+    expect(rejections(runA.turnId)).toBe(0);
+    expect(h.scope.holdNativeInputForHardBlock).not.toHaveBeenCalled();
+
+    h.scope.webTerminalDirtyTarget = undefined;
+    await h.flush();
+    expect(preparedFor(h.scope, runA.turnId)).toEqual(PREPARED_ONCE);
+    expect(h.scope.pendingMessages).toEqual([]);
+  });
+
+  it('a non-scheduled input is still written when the interrupt lands in its precheck', async () => {
+    const { h, item, authority } = interruptibleHarness([]);
+    Object.assign(item, { turnId: 'human-turn', scheduledRun: undefined, queueAfterActiveTurn: undefined });
+    const { parked, release } = parkPrecheck(h.scope);
+    const flushA = h.flush();
+    await parked;
+    await interruptCli(h.scope);
+    release();
+    await flushA;
+
+    expect(h.scope.requestScheduledInputAdmission).not.toHaveBeenCalled();
+    expect(preparedFor(h.scope, 'human-turn')).toEqual(PREPARED_ONCE);
+    expect(authority.snapshot()).toMatchObject({ turnId: 'human-turn', started: true });
     expect(h.scope.pendingMessages).toEqual([]);
   });
 });
