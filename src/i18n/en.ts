@@ -1986,6 +1986,7 @@ export const messages: Record<string, string> = {
   'worker.turn_terminal_receipt.completed_superseded': '✓ Turn ended',
   'worker.turn_terminal_receipt.silent_superseded': '✓ Turn ended (AI determined no reply was needed)',
   'worker.empty_final_failed': '⚠️ {cliName} failed this turn: {reason}\nThe complete error remains available in the web terminal and daemon logs. Resolve the issue, then resend the message.',
+  'worker.empty_final_failed_model_unavailable': '⚠️ The selected model is unavailable. This turn did not complete. Send “retry” or “continue” in this thread. If this turn attempted any updates, commits, or publishing, verify their outcome before retrying.',
   'worker.empty_final_failed_invalid_request': '⚠️ The {cliName} request was rejected: {reason}\nCheck the CLI, model gateway, and tool schema configuration, then resend the message.',
   'worker.empty_final_failed_auth': '⚠️ {cliName} authentication failed: {reason}\nCheck the CLI login and model-service credentials, then resend the message.',
   'worker.empty_final_failed_connection': '⚠️ {cliName} could not connect to the model service: {reason}\nCheck the network and model-service status, then resend the message.',

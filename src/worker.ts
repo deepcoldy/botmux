@@ -503,7 +503,7 @@ import {
   setCodexAppThreadName,
 } from './services/codex-app-threads.js';
 import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
-import { CODEX_CAPACITY_ERROR_CODE, CODEX_AUTH_ERROR_CODE, CODEX_PAYLOAD_TOO_LARGE_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, readCodexLiveSessionId, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexGenerationSessionIdFromRolloutPath, isCodexRateLimitEvent, codexSessionsRootFromRolloutPath, scanCodexThreadSettings, readLatestCodexRuntime, codexRolloutHasAsyncQuestionReply, findPendingCodexAsyncQuestion, selectNewCodexAsyncQuestions, type CodexAsyncQuestionRecord, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
+import { CODEX_CAPACITY_ERROR_CODE, CODEX_AUTH_ERROR_CODE, CODEX_PAYLOAD_TOO_LARGE_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_MODEL_UNAVAILABLE_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, readCodexLiveSessionId, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexGenerationSessionIdFromRolloutPath, isCodexRateLimitEvent, codexSessionsRootFromRolloutPath, scanCodexThreadSettings, readLatestCodexRuntime, codexRolloutHasAsyncQuestionReply, findPendingCodexAsyncQuestion, selectNewCodexAsyncQuestions, type CodexAsyncQuestionRecord, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
 import { parseCodexAsyncQuestions } from './services/codex-async-user-input.js';
 import { codexConsumedRolloutEvents, codexEventsWithStableIds } from './services/codex-rollout-replay.js';
 import { PI_CREDENTIAL_ERROR_CODE, adoptPiTranscriptIntoBotmuxDir, piPersistentTranscriptDir, piPreviousTranscriptDir, piProfileTranscriptDir, piSessionUsesBotmuxDir } from './services/pi-transcript.js';
@@ -14408,6 +14408,9 @@ function emptyCompletedBridgeFallbackContent(): string {
 }
 
 function failedBridgeFailureText(errorCode?: string, summary?: string): string {
+  if (errorCode === CODEX_MODEL_UNAVAILABLE_ERROR_CODE) {
+    return t('worker.empty_final_failed_model_unavailable');
+  }
   const reason = summary || t('worker.failed_reason_unavailable');
   const key = errorCode === TRAEX_TOOL_IMAGE_UPLOAD_ERROR_CODE
     ? 'worker.empty_final_failed_tool_image_upload'

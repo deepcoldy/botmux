@@ -1355,6 +1355,67 @@ describe('drainCodexRollout', () => {
     expect(failed.terminalErrorSummary).toContain('input[0].tools[0].description');
   });
 
+  it.each(['model_not_found', 'model_not_available', 'model_unavailable'])(
+    'distinguishes a structured %s rejection from a generic bad request',
+    (code) => {
+      writeFileSync(path, ev({
+        type: 'event_msg',
+        payload: {
+          type: 'task_complete',
+          turn_id: 'model-rejection',
+          error: { message: JSON.stringify({
+            error: { code, type: 'invalid_request_error', message: 'Selected model is not available' },
+          }) },
+        },
+      }));
+      const terminal = drainCodexRollout(path, 0).events.find(e => e.kind === 'assistant_final');
+      expect(terminal).toMatchObject({
+        sourceTurnId: 'model-rejection',
+        terminalStatus: 'failed',
+        terminalErrorCode: 'codex_model_unavailable',
+      });
+      expect(terminal?.terminalLimitKind).toBeUndefined();
+    },
+  );
+
+  it.each([
+    [{ code: 'invalid_request_error', message: 'tool returned model_not_found' }, 'codex_invalid_request'],
+    [{ code: 'rate_limit_exceeded', message: '429' }, 'codex_rate_limited'],
+    [{ code: 'service_unavailable', message: '503 Service Unavailable' }, 'codex_upstream_error'],
+  ])('does not turn unrelated errors into a model rejection', (error, expected) => {
+    writeFileSync(path, ev({
+      type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: 'other-failure', error },
+    }));
+    expect(drainCodexRollout(path, 0).events.find(e => e.kind === 'assistant_final'))
+      .toMatchObject({ terminalStatus: 'failed', terminalErrorCode: expected });
+  });
+
+  it('keeps a model rejection on its own turn without consuming a later reply', () => {
+    const start = Date.parse('2026-04-29T07:00:00Z');
+    const q = new CodexBridgeQueue(() => start);
+    q.mark('old-lark-turn', 'original task', start);
+    q.mark('next-lark-turn', 'new request', start + 1000);
+    writeFileSync(path, ev(userResponseItem('original task')) + ev({
+      timestamp: '2026-04-29T07:00:01Z', type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: 'old-native-turn', error: {
+        code: 'model_not_found', type: 'invalid_request_error',
+      } },
+    }) + ev(userResponseItem('new request', '2026-04-29T07:00:02Z'))
+      + ev(assistantFinalResponseItem('new result', '2026-04-29T07:00:03Z')));
+    q.ingest(drainCodexRollout(path, 0).events);
+    const [oldTurn, nextTurn] = q.drainEmittable();
+    expect(oldTurn).toMatchObject({ turnId: 'old-lark-turn',
+      terminalStatus: 'failed', terminalErrorCode: 'codex_model_unavailable' });
+    const progress: BridgeSendMarker = { turnId: 'old-lark-turn',
+      responseKind: 'progress', messageId: 'om_progress', sentAtMs: start + 500 };
+    const kind = structuredFallbackKind(oldTurn, nextTurn.markTimeMs, [progress], false, true);
+    expect(kind).toBe('failed');
+    expect(shouldSuppressStructuredFallback(kind, oldTurn, nextTurn.markTimeMs,
+      [progress], false, 'send', true)).toBe(false);
+    expect(nextTurn).toMatchObject({ turnId: 'next-lark-turn', finalText: 'new result' });
+  });
+
   it('redacts credentials and active syntax from bounded auth summaries', () => {
     writeFileSync(path, ev({
       timestamp: '2026-08-08T02:50:18.520Z',
