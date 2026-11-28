@@ -799,9 +799,9 @@ function PluginCard(props: {
   const { plugin, expanded, onExpandedChange } = props;
   const title = plugin.displayName || plugin.id;
   const description = plugin.description || props.marketEntry?.description;
-  const official = props.marketEntry
-    ? isOfficialMarketPlugin(props.marketEntry)
-    : plugin.packageName.startsWith('@botmux-ai/');
+  const official = props.marketEntry?.id === plugin.id
+    && props.marketEntry.package === plugin.packageName
+    && isOfficialMarketPlugin(props.marketEntry);
   const depIds = plugin.dependencies ?? [];
   const enabledGlobal = pluginEnabledInScope(plugin, 'global', props.pendingToggles);
   const enabledBotCount = props.bots.filter(bot => pluginEnabledInScope(plugin, bot.id, props.pendingToggles)).length;
@@ -1075,9 +1075,10 @@ export function PluginManagementPage(): React.JSX.Element {
     setExpandedPluginId(id);
   };
   const planEntry = plan ? catalog?.items.find(entry => entry.id === plan.id) : undefined;
-  const planOfficial = plan
-    ? (planEntry ? isOfficialMarketPlugin(planEntry) : plan.packageName.startsWith('@botmux-ai/'))
-    : false;
+  const planOfficial = !!plan && !!planEntry
+    && planEntry.id === plan.id
+    && planEntry.package === plan.packageName
+    && isOfficialMarketPlugin(planEntry);
   const selectedExisting = selected ? payload.plugins.find(item => item.id === selected.id) : undefined;
   return (
     <section className="page plugin-management-page plugin-market-page" data-native-plugin-center>
@@ -1268,7 +1269,7 @@ export function PluginManagementPage(): React.JSX.Element {
               const displayName = installedRecord?.displayName || fallbackName;
               setNotice({
                 message: `已安装 ${displayName} (v${installedVersion})，默认未启用，可前往插件卡片启用或配置。`,
-                pluginId: installedId,
+                pluginId: installedRecord?.id,
                 dashboardRoute: installedRecord?.dashboard?.[0]?.route,
               });
             })}>{operation || '信任并安装'}</button>

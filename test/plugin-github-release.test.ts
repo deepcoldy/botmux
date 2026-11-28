@@ -384,6 +384,29 @@ describe('github release download security boundary', () => {
     expect(existsSync(dest)).toBe(false);
   });
 
+  it('cleans the response and timeout when opening the destination fails', async () => {
+    const stream = streamFromChunks(['payload']);
+    let responseSignal: AbortSignal | undefined;
+    await expect(downloadGithubReleaseAssetToFile(
+      'https://github.com/a/b/releases/download/v1/p.tgz',
+      join(home, 'missing-parent', 'archive.tgz'),
+      {
+        archiveTimeoutMs: 500,
+        resolveToken: async () => null,
+        transport: async (_url, _headers, signal) => {
+          responseSignal = signal;
+          return { kind: 'response', statusCode: 200, headers: {}, stream };
+        },
+      },
+    )).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(stream.destroyed).toBe(true);
+    expect(responseSignal?.aborted).toBe(false);
+
+    // The request timer must have been cleared rather than aborting later.
+    await new Promise(resolve => setTimeout(resolve, 600));
+    expect(responseSignal?.aborted).toBe(false);
+  });
+
   it('enforces request timeout abort cleanly', async () => {
     await expect(fetchGithubReleaseBytes('https://api.github.com/repos/a/b/releases/latest', {
       timeoutMs: 30,
@@ -808,9 +831,34 @@ describe('github release installation & lifecycle integration', () => {
     })).toBe('gho_from_cli');
     expect(ghSpy).toHaveBeenCalledTimes(1);
 
+    resetGithubReleaseTokenCache();
     expect(await resolveOptionalGithubApiToken({
       readEnvHeaders: () => ({}),
       readGhToken: async () => { throw new Error('gh not installed'); },
     })).toBeNull();
+  });
+
+  it('retries gh auth after an unauthenticated miss while caching successful tokens', async () => {
+    let now = 1_000;
+    let reads = 0;
+    const readGhToken = vi.fn(async () => {
+      reads++;
+      if (reads === 1) return null;
+      return reads === 2 ? 'gho_after_login' : 'gho_after_ttl';
+    });
+    const resolve = () => resolveOptionalGithubApiToken({
+      now: () => now,
+      readEnvHeaders: () => ({}),
+      readGhToken,
+    });
+
+    expect(await resolve()).toBeNull();
+    expect(await resolve()).toBe('gho_after_login');
+    expect(await resolve()).toBe('gho_after_login');
+    expect(readGhToken).toHaveBeenCalledTimes(2);
+
+    now += 86_400_001;
+    expect(await resolve()).toBe('gho_after_ttl');
+    expect(readGhToken).toHaveBeenCalledTimes(3);
   });
 });

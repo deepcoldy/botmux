@@ -284,4 +284,119 @@ describe('PluginManagementPage official market & one-click install experience', 
     await act(async () => { sourceSelect.props.onChange({ currentTarget: { value: 'npm' } }); });
     expect(renderer!.root.findAll(node => node.props['data-plugin-card']).map(n => n.props['data-plugin-card'])).toEqual(['docs-helper']);
   });
+
+  it('requires an exact catalog match for installed official badges', async () => {
+    (globalThis as any).location.hash = '#/plugins';
+    const installedPlugins: any[] = [
+      {
+        id: 'github', packageName: '@evil/different-package', version: '1.0.0', displayName: 'Local GitHub',
+        source: { type: 'local', spec: '/tmp/local-github' }, stateHash: 'e'.repeat(64), enabledGlobal: false, enabledByBot: {},
+      },
+      {
+        id: 'self-declared', packageName: '@botmux-ai/fake', version: '1.0.0', displayName: 'Self Declared',
+        source: { type: 'local', spec: '/tmp/self-declared' }, stateHash: 'f'.repeat(64), enabledGlobal: false, enabledByBot: {},
+      },
+    ];
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL) => {
+      const url = String(input);
+      if (url === '/api/plugins') {
+        return new Response(JSON.stringify({ plugins: installedPlugins, globalPlugins: [], bots: [], gatewayAdapters: [] }));
+      }
+      if (url === '/api/plugins/market') {
+        return new Response(JSON.stringify({ items: [officialGithubEntry], stale: false, available: true }));
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }));
+
+    await act(async () => { renderer = TestRenderer.create(React.createElement(PluginManagementPage)); });
+    await flush();
+    expect(renderer!.root.findAll(node => node.props['data-official-badge'] === 'github')).toHaveLength(0);
+    expect(renderer!.root.findAll(node => node.props['data-official-badge'] === 'self-declared')).toHaveLength(0);
+
+    // The catalog itself remains the trust anchor for its own entries.
+    const marketTab = renderer!.root.find(node => node.props['data-plugin-view'] === 'market');
+    await act(async () => { marketTab.props.onClick(); });
+    expect(renderer!.root.findAll(node => node.props['data-official-badge'] === 'github')).toHaveLength(1);
+  });
+
+  it('does not infer plan ownership from the package prefix after the catalog entry disappears', async () => {
+    const plan: PluginInstallPlan = {
+      nonce: 'nonce-plan-ownership', id: 'github', packageName: '@botmux-ai/plugin-github', version: '0.1.0',
+      integrity: sampleIntegrity, sourceType: 'github-release',
+      downloadUrl: 'https://github.com/botmux-ai/botmux-plugin-github/releases/download/v0.1.0/botmux-plugin-github-0.1.0.tgz',
+      releaseRepo: 'botmux-ai/botmux-plugin-github', releaseTag: 'v0.1.0', releaseAsset: 'botmux-plugin-github-0.1.0.tgz',
+      expiresAt: Date.now() + 300_000, expectedState: null, expectedRevision: 'a'.repeat(64),
+    };
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL) => {
+      const url = String(input);
+      if (url === '/api/plugins') {
+        return new Response(JSON.stringify({ plugins: [], globalPlugins: [], bots: [], gatewayAdapters: [] }));
+      }
+      if (url === '/api/plugins/market') {
+        return new Response(JSON.stringify({ items: [officialGithubEntry], stale: false, available: true }));
+      }
+      if (url === '/api/plugins/market/prepare') return new Response(JSON.stringify({ plan }));
+      if (url === '/api/plugins/market/refresh') {
+        return new Response(JSON.stringify({ items: [], stale: false, available: true }));
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }));
+
+    await act(async () => { renderer = TestRenderer.create(React.createElement(PluginManagementPage)); });
+    await flush();
+    const install = renderer!.root.find(node => node.props['data-market-install'] === 'github');
+    await act(async () => { install.props.onClick(); });
+    await flush();
+    const refresh = renderer!.root.find(node => node.props['data-plugin-refresh']);
+    await act(async () => { refresh.props.onClick(); });
+    await flush();
+
+    const confirmDialog = renderer!.root.find(node => node.type === 'dialog' && node.props['aria-label'] === '确认安装');
+    expect(confirmDialog.findAll(node => node.props.className === 'plugin-official-badge')).toHaveLength(0);
+    expect(textOf(confirmDialog)).toContain('社区目录收录不代表安全认证');
+    expect(textOf(confirmDialog)).not.toContain('Botmux 官方插件');
+  });
+
+  it('omits post-install quick actions when the refreshed plugin record is unavailable', async () => {
+    let installed = false;
+    const plan: PluginInstallPlan = {
+      nonce: 'nonce-refresh-failure', id: 'github', packageName: '@botmux-ai/plugin-github', version: '0.1.0',
+      integrity: sampleIntegrity, sourceType: 'github-release',
+      downloadUrl: 'https://github.com/botmux-ai/botmux-plugin-github/releases/download/v0.1.0/botmux-plugin-github-0.1.0.tgz',
+      releaseRepo: 'botmux-ai/botmux-plugin-github', releaseTag: 'v0.1.0', releaseAsset: 'botmux-plugin-github-0.1.0.tgz',
+      expiresAt: Date.now() + 300_000, expectedState: null, expectedRevision: 'b'.repeat(64),
+    };
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL) => {
+      const url = String(input);
+      if (url === '/api/plugins') {
+        return installed
+          ? new Response(JSON.stringify({ error: 'refresh failed' }), { status: 500 })
+          : new Response(JSON.stringify({ plugins: [], globalPlugins: [], bots: [], gatewayAdapters: [] }));
+      }
+      if (url === '/api/plugins/market') {
+        return new Response(JSON.stringify({ items: [officialGithubEntry], stale: false, available: true }));
+      }
+      if (url === '/api/plugins/market/prepare') return new Response(JSON.stringify({ plan }));
+      if (url === '/api/plugins/market/install') {
+        installed = true;
+        return new Response(JSON.stringify({ ok: true, result: { id: 'github', version: '0.1.0' } }));
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }));
+
+    await act(async () => { renderer = TestRenderer.create(React.createElement(PluginManagementPage)); });
+    await flush();
+    const install = renderer!.root.find(node => node.props['data-market-install'] === 'github');
+    await act(async () => { install.props.onClick(); });
+    await flush();
+    const confirm = renderer!.root.find(node => node.props['data-market-confirm-install']);
+    await act(async () => { confirm.props.onClick(); });
+    await flush();
+
+    expect(installed).toBe(true);
+    const notice = renderer!.root.find(node => node.props['data-plugin-notice']);
+    expect(textOf(notice)).toContain('已安装 GitHub (v0.1.0)');
+    expect(notice.findAll(node => node.props['data-plugin-notice-open'])).toHaveLength(0);
+    expect(notice.findAll(node => node.props['data-plugin-notice-settings'])).toHaveLength(0);
+  });
 });

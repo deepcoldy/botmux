@@ -280,14 +280,12 @@ export async function resolveOptionalGithubApiToken(options?: {
     if (token) return token;
   }
   const now = options?.now ?? Date.now;
-  if (options?.readGhToken) {
-    return (await options.readGhToken().catch(() => null))?.trim() || null;
-  }
+  const readGhToken = options?.readGhToken ?? readGhAuthTokenAsync;
   if (!cachedGhToken || now() - cachedGhToken.at > GH_TOKEN_CACHE_TTL_MS) {
-    const token = await readGhAuthTokenAsync().catch(() => null);
-    cachedGhToken = { token, at: now() };
+    const token = (await readGhToken().catch(() => null))?.trim() || null;
+    cachedGhToken = token ? { token, at: now() } : undefined;
   }
-  return cachedGhToken.token;
+  return cachedGhToken?.token ?? null;
 }
 
 function defaultGithubHopTransport(
@@ -540,11 +538,12 @@ export async function downloadGithubReleaseAssetToFile(
 
   const sha512 = createHash('sha512');
   const sha256 = createHash('sha256');
-  const handle = await open(destPath, 'w', 0o600);
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
   let total = 0;
   let failed = false;
 
   try {
+    handle = await open(destPath, 'w', 0o600);
     for await (const part of stream) {
       if (signal.aborted) {
         throw signal.reason instanceof GithubReleaseError
@@ -594,8 +593,8 @@ export async function downloadGithubReleaseAssetToFile(
     throw error;
   } finally {
     cleanup();
-    await handle.close().catch(() => {});
-    if (failed) {
+    if (handle) await handle.close().catch(() => {});
+    if (failed && handle) {
       try { rmSync(destPath, { force: true }); } catch { /* ignore */ }
     }
   }
