@@ -24,6 +24,14 @@ const rpcMembership = (body: unknown = rpcMembershipBody, withTicket = false) =>
   ...(withTicket ? ['--create-permission-ticket', '--permission-role', 'brn::iam:::role:ms.interface_tester_func.cn',
     '--permission-reason', '核验商品当前圈选包入包记录'] : [])];
 
+const packageInfoBody = { pick_ids: ['7687598683224637723'], page_size: 1, page_num: 1,
+  no_need_entity_num: true, need_draft: false, biz_code: 1000 };
+const packageInfo = (body: unknown = packageInfoBody, withTicket = false) => ['--json', 'api-test', 'rpc-call',
+  'ecom.market.udc_picko_service', 'GetPicko', '--idl-source', 'bam', '--idl-version', '1.0.159',
+  '--idc', 'lf', '--env', 'prod', '--cluster', 'default', '--zone', 'CN', '--body', JSON.stringify(body),
+  ...(withTicket ? ['--create-permission-ticket', '--permission-role', 'brn::iam:::role:ms.interface_tester_func.cn',
+    '--permission-reason', '核查圈选包的状态及有效期'] : [])];
+
 export const businessCases: [string, 'read' | 'write', string[]][] = [
   ['tcc.config.get.picko-rules', 'read', ['tcc', 'config', 'get', 'ecom.market.udc_dump', 'rule_list_config_PRODUCT_new', '--dir', '/dump_v2', '--region', 'CN', '--env', 'prod']],
   ['rds.db.query', 'read', ['rds', 'query-db', 'ecom_market_pick', 'SELECT COUNT(*) AS cnt FROM pick_package WHERE status = 1;', '-r', 'cn']],
@@ -38,6 +46,8 @@ export const businessCases: [string, 'read' | 'write', string[]][] = [
   ['api-test.rpc-call.picko-user-email', 'read', rpc('ecom.market.udc_picko_service', 'Debug', { debug_scene: 'get_lark_email_by_user_id', record_id: '123' })],
   ['api-test.rpc-call.picko-membership', 'read', rpcMembership()],
   ['api-test.rpc-call.picko-membership-ticket', 'write', rpcMembership(rpcMembershipBody, true)],
+  ['api-test.rpc-call.picko-package-info', 'read', packageInfo()],
+  ['api-test.rpc-call.picko-package-info-ticket', 'write', packageInfo(packageInfoBody, true)],
   ['api-test.rpc-call.assign-info', 'read', rpc('ecom.search.assign_manager', 'GetAssignInfo', { assign_id: 123 })],
   ['api-test.http-call.picko-tag-enum', 'read', ['api-test', 'http-call', 'ecom.market.udc_picko', '--http-path', '/ecom/market/udc/picko/api/list_tag_enum_values', '--http-method', 'POST', '--env', 'prod', '--idc', 'lf', '--cluster', 'default', '--zone', 'CN', '--body', '{"tag_id":"123"}']],
   ['api-test.http-call.picko-membership', 'read', membership()],
@@ -219,6 +229,63 @@ describe('selected business signatures', () => {
       const rawBody = JSON.stringify({ ...rpcMembershipBody,
         conditions: { ...rpcMembershipBody.conditions, [field]: ['NUMERIC_ID'] } }).replace('"NUMERIC_ID"', value);
       expect(() => parse(rpcMembership(rpcMembershipBody, withTicket).map(v => v.startsWith('{') ? rawBody : v))).toThrow();
+    }
+  });
+  it('restricts GetPicko to one package with the reviewed metadata query body', () => {
+    for (const body of [
+      { ...packageInfoBody, pick_ids: [] },
+      { ...packageInfoBody, pick_ids: ['123', '456'] },
+      { ...packageInfoBody, pick_ids: ['0'] },
+      { ...packageInfoBody, pick_ids: ['9223372036854775808'] },
+      { ...packageInfoBody, pick_ids: '123' },
+      { ...packageInfoBody, page_size: 2 },
+      { ...packageInfoBody, page_num: 2 },
+      { ...packageInfoBody, no_need_entity_num: false },
+      { ...packageInfoBody, need_draft: true },
+      { ...packageInfoBody, biz_code: 3000 },
+      { ...packageInfoBody, rules: {} },
+      { ...packageInfoBody, conditions: { entity_ids: ['123'] } },
+      Object.fromEntries(Object.entries(packageInfoBody).filter(([key]) => key !== 'need_draft')),
+    ]) for (const withTicket of [false, true]) expect(() => parse(packageInfo(body, withTicket))).toThrow();
+    for (const argv of [
+      packageInfo().map(value => value === 'bam' ? 'branch' : value),
+      packageInfo().map(value => value === 'prod' ? 'ppe' : value),
+      [...packageInfo(), '--http-header', 'X-Auth: bad'],
+      [...packageInfo(), '--permission-reason', '额外票据参数'],
+      [...packageInfo(), '--create-permission-ticket'],
+      packageInfo(packageInfoBody, true).filter(value => value !== '--permission-reason' && value !== '核查圈选包的状态及有效期'),
+    ]) expect(() => parse(argv)).toThrow();
+  });
+  it('normalizes GetPicko int64 IDs without rounding and rejects malformed numeric tokens', () => {
+    for (const withTicket of [false, true]) for (const value of ['123', '9007199254740993', '7687598683224637723', '9223372036854775807']) {
+      const body = { ...packageInfoBody, pick_ids: [value] };
+      const op = parse(packageInfo(body, withTicket));
+      expect(op.argv[op.argv.indexOf('--body') + 1]).toContain(`"pick_ids":[${value}]`);
+      expect(parse(op.argv)).toEqual(op);
+      const numericBody = JSON.stringify(body).replace(`"${value}"`, value);
+      expect(parse(packageInfo(body, withTicket).map(arg => arg.startsWith('{') ? numericBody : arg))).toEqual(op);
+    }
+    for (const withTicket of [false, true]) for (const value of [
+      '1.0000000000000001', '0.99999999999999999', '9007199254740990.5', '7687598683224637723e0',
+      '1e0', '-1', '0123', '9223372036854775808',
+    ]) {
+      const raw = JSON.stringify(packageInfoBody).replace('"7687598683224637723"', value);
+      expect(() => parse(packageInfo(packageInfoBody, withTicket).map(arg => arg.startsWith('{') ? raw : arg))).toThrow();
+    }
+  });
+  it('applies GetPicko machine exceptions while preserving host actor and deny overrides', () => {
+    const rules = { 'api-test.rpc-call.picko-package-info': 'machine', 'api-test.rpc-call.picko-package-info-ticket': 'machine' };
+    const policy = (values: Record<string, string>) => parseBytedcliOperationPolicy({
+      schema: 'botmux.bytedcli-operation-policy.v2', cliVersion: '0.199.0', catalogVersion: '2026-11-27.2', rules: values,
+    });
+    for (const withTicket of [false, true]) {
+      const op = parse(packageInfo(packageInfoBody, withTicket));
+      expect(resolveBytedcliOperationRule(op.id, undefined, policy(rules))).toMatchObject({ identity: 'machine', enabled: true });
+      expect(resolveBytedcliOperationRule(op.id, policy({ [op.id]: 'actor' }), policy(rules)).identity).toBe('actor');
+      expect(resolveBytedcliOperationRule(op.id, policy({ [op.id]: 'deny' }), policy(rules)).enabled).toBe(false);
+      const unrelated = parse(packageInfo(packageInfoBody, withTicket).map(value => value === 'GetPicko' ? 'UpdatePicko' : value));
+      expect(unrelated.effect).toBe('unknown');
+      expect(resolveBytedcliOperationRule(unrelated.id, undefined, policy(rules)).identity).toBe('actor');
     }
   });
   it.each(['SELECT 1; DELETE FROM pick_package', 'SELECT 1 INTO OUTFILE "/tmp/x"', 'SELECT load_file("/etc/passwd")',
