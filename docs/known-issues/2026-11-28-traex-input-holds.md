@@ -14,7 +14,7 @@ TRAE 的异步问题可以在主轮次结束后保留 `blocked kind=question` �
 
 - 当前所有已观察到的 TRAE 原生 open turn 都已结束，没有仍在执行的前驱或后继轮次；跨 drain 的 `turn_bind` 与逆序 final 也必须完成归属和收口。
 - 完成证据和最近程序状态报告都已经过静默窗口。
-- 新鲜、权威的当前终端屏幕显示已初始化的空输入框，没有实际提问页、忙碌标记或待执行输入面板。question 回收只使用 backend 原生的同步 capture；异步解析的 PTY renderer fallback 不能作为释放依据。
+- 新鲜、权威的当前终端屏幕显示已初始化的空输入框，没有实际提问页、忙碌标记或待执行输入面板。同步热路径只用 backend 原生的同步 capture；PTY 则在 `writeAndFlush` 后的异步 capture 中回收，并复验 backend、lifetime、generation 与 hold revision，未 settle 的 renderer fallback 不能作为释放依据。
 - 所有剩余 blocked 记录都是 question；permission、approval、未知阻塞、活跃子任务与被淘汰的未知 busy 记录仍保留保护。
 
 完成证据来自结构化桥接器。普通 `fireIdle()`、屏幕静默和输入提交超时都不提供这项证明。新的原生 user、新输入周期以及任何新的 working / blocked 报告都会使旧完成证据失效。
@@ -46,7 +46,7 @@ TRAE 适配器提供 `screenShowsNoPendingInput`，供已有的精确回执观�
 - `test/traex-turn-completion.test.ts`：id-less user 的跨 drain `turn_bind`、raw line 去重，以及三个 type-ahead turn 按 2 → 3 → 1 完成后才产生一次完成证据。
 - `test/worker-bridge-final-idle-signal.test.ts`：真实 queue 的逆序 final 接线，最后一个 open turn 终结后直接记录完成，空 drain 不依赖额外新 turn。
 - `test/stale-program-status.test.ts`：完成证据、静默窗口、新输入和并发 permission / approval 保护。
-- `test/traex-question-hold-wiring.test.ts`：新鲜屏幕与缓存帧不同、真实提问页保留阻塞、正常 composer 释放旧状态；异步 PTY renderer fallback 不参与释放。
+- `test/traex-question-hold-wiring.test.ts`：新鲜屏幕与缓存帧不同、真实提问页保留阻塞、正常 composer 释放旧状态；PTY 未 settle 的 renderer 不同步释放，flush 后仍是提问页也不释放，只有空 composer 的异步 capture 才回收，并覆盖 await 中五类身份变化。
 - `test/traex-parked-submit-recovery.test.ts`：两次空屏恢复、草稿在中途重现、原输入不会重放、40 列真实 xterm 折行面板、严格初始化 footer 变体与 provisional shortcut-only 拒绝。
 - `test/worker-quarantine-late-receipt.test.ts`：晚到回执、代次变化与恢复边界。
 - `test/session-store-sqlite.test.ts`：纯合约库、注册机器人缺表与有效遗留会话库的区别。

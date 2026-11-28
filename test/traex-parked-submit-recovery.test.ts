@@ -148,6 +148,13 @@ describe('unconfirmed input that left the TRAE composer', () => {
     } finally { renderer.dispose(); }
   });
 
+  it('does not mistake natural-language lines for a wrapped pending-input header', () => {
+    const empty = '❯ Use /skills to list available skills\n  m · Context 99% left\n  ? for shortcuts';
+    for (const row of ['and send it to the reviewer', 'Send after you finish']) {
+      expect(traexScreenShowsNoPendingInput(`${row}\n${empty}`)).toBe(true);
+    }
+  });
+
   it.each([
     ['truncated model/cwd row', [
       '──────────────────────────────────────────────────────────',

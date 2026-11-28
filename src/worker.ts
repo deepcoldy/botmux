@@ -26161,8 +26161,11 @@ function traexQuestionHoldsIdle(source: string, be: SessionBackend | null | unde
 async function traexQuestionCapture(): Promise<string | undefined> {
   const be = backend;
   const lifetime = cliLifetimeNonce;
+  const generation = cliSpawnGeneration;
+  const holdRevision = hookReviewInputHoldRevision;
   if (!be || cliRestartInProgress) return undefined;
   let screen: string | undefined;
+  let settledPtyRenderer = false;
   try {
     if (be.captureViewportAsync) screen = await be.captureViewportAsync();
     else if (be.captureViewport || be.captureCurrentScreen) screen = captureBackendScreen(be);
@@ -26171,11 +26174,20 @@ async function traexQuestionCapture(): Promise<string | undefined> {
       await target.writeAndFlush('');
       if (renderer !== target) return undefined;
       screen = target.rawSnapshot({ preserveFormatting: true });
+      settledPtyRenderer = true;
     }
   } catch {
     return undefined;
   }
   if (backend !== be || cliLifetimeNonce !== lifetime || cliRestartInProgress) return undefined;
+  if (settledPtyRenderer && generation === cliSpawnGeneration && holdRevision === hookReviewInputHoldRevision
+    && screen?.trim() && traexQuestionBridgeActive() && cliAdapter?.screenShowsNoPendingInput?.(screen)
+    && idleDetector?.releaseStaleQuestionStatus?.()) {
+    // The synchronous hot path stays fail-closed. Only this settled PTY capture
+    // may reconcile, with backend/lifetime/generation/hold fences revalidated
+    // and the detector independently rechecking terminal + OSC quiescence.
+    log('Released stale TRAE question status after transcript completion and a settled PTY idle composer');
+  }
   return screen?.trim() ? screen : undefined;
 }
 

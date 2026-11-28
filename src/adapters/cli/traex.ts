@@ -317,7 +317,7 @@ export function traexScreenShowsNoPendingInput(screen: string): boolean {
     const row = rows[index]!;
     // Narrow panes wrap the native panel header. Recognizable fragments must
     // fail closed; an unrelated row merely ends the panel-owned region.
-    if (/^(?:Send after\b|and send\b)|\besc to interrupt and send\b|↑ to edit[ \t]*$/.test(row)) return false;
+    if (/^(?:Send after(?:[ \t]+tool(?:[ \t]|$)|[ \t]*$)|and send(?:[ \t]*$|[ \t]+[·•↑]))|\besc to interrupt and send\b|↑ to edit[ \t]*$/.test(row)) return false;
     if (/^[›❯](?:[ \t]|$)/.test(row)) continue;
     if (!/^[ \t]*$|^[ \t]*─+[ \t]*$|^ {2}\S/.test(row)) break;
   }

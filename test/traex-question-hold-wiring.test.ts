@@ -217,27 +217,62 @@ describe('holding input off the question page', () => {
     expect(released).toBe(true);
   });
 
-  it('never reconciles a PTY question from the asynchronous renderer fallback', async () => {
+  it('settles the PTY renderer asynchronously before reconciling a stale question', async () => {
     const renderer = new TerminalRenderer(160, 50);
     try {
       const h = harness('traex', { init: { backendType: 'pty' }, block: { kind: 'question' } });
       h.scope.backend = {};
       h.scope.renderer = renderer;
       h.scope.captureBackendScreen = loadWorkerFunction('captureBackendScreen', h.scope);
+      h.scope.traexQuestionCapture = loadWorkerFunction('traexQuestionCapture', h.scope);
       const release = vi.fn(() => true);
       h.scope.idleDetector.releaseStaleQuestionStatus = release;
       await renderer.writeAndFlush(COMPOSER.replace(/\n/g, '\r\n'));
       renderer.write(QUESTION.replace(/\n/g, '\r\n'));
 
+      // The synchronous hot path cannot trust the pre-flush composer.
       expect(h.fn('traexQuestionBlockReported')()).toBe(true);
       expect(release).not.toHaveBeenCalled();
 
       await renderer.writeAndFlush('');
-      expect(traexQuestionFlowVisible(renderer.rawSnapshot({ preserveFormatting: true }))).toBe(true);
-      expect(h.fn('traexQuestionBlockReported')()).toBe(true);
+      const question = await h.scope.traexQuestionCapture();
+      expect(question && traexQuestionFlowVisible(question)).toBe(true);
       expect(release).not.toHaveBeenCalled();
+
+      await renderer.writeAndFlush(COMPOSER.replace(/\n/g, '\r\n'));
+      const composer = await h.scope.traexQuestionCapture();
+      expect(composer && !traexQuestionFlowVisible(composer)).toBe(true);
+      expect(release).toHaveBeenCalledTimes(1);
     } finally { renderer.dispose(); }
   });
+
+  it.each(['backend', 'generation', 'lifetime', 'hold-revision', 'restart'] as const)(
+    'does not release the settled PTY question when %s changes during the renderer flush',
+    async change => {
+      const renderer = new TerminalRenderer(160, 50);
+      try {
+        const h = harness('traex', { init: { backendType: 'pty' }, block: { kind: 'question' } });
+        h.scope.backend = {};
+        h.scope.renderer = renderer;
+        h.scope.captureBackendScreen = loadWorkerFunction('captureBackendScreen', h.scope);
+        h.scope.traexQuestionCapture = loadWorkerFunction('traexQuestionCapture', h.scope);
+        const release = vi.fn(() => true);
+        h.scope.idleDetector.releaseStaleQuestionStatus = release;
+        await renderer.writeAndFlush(COMPOSER.replace(/\n/g, '\r\n'));
+        const flush = renderer.writeAndFlush.bind(renderer);
+        renderer.writeAndFlush = async data => {
+          await flush(data);
+          if (change === 'backend') h.scope.backend = {};
+          if (change === 'generation') h.scope.cliSpawnGeneration++;
+          if (change === 'lifetime') h.scope.cliLifetimeNonce = 'replacement';
+          if (change === 'hold-revision') h.scope.hookReviewInputHoldRevision++;
+          if (change === 'restart') h.scope.cliRestartInProgress = true;
+        };
+        await h.scope.traexQuestionCapture();
+        expect(release).not.toHaveBeenCalled();
+      } finally { renderer.dispose(); }
+    },
+  );
 
   it('tells the held message to answer on the card, once, for the held turn', () => {
     const h = harness('traex', { screen: QUESTION });
