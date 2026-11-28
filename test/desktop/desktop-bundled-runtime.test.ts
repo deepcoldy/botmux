@@ -92,6 +92,13 @@ describe('bundled desktop runtime', () => {
     for (const p of mustNotMatch) expect(matchesArchGlob(p, pattern!), `should NOT match ${p}`).toBe(false);
   });
 
+  it('includes the Unicode 11 addon in the production dependencies for CLI startup', () => {
+    const manifest = JSON.parse(readFileSync(resolve(import.meta.dirname, '../../package.json'), 'utf8'));
+
+    // Desktop installs production dependencies only. The headless terminal imports this addon at startup.
+    expect(manifest.dependencies).toHaveProperty('@xterm/addon-unicode11');
+  });
+
   it('stages both native canvas architectures via bun install arch flags', () => {
     const script = readFileSync(resolve(import.meta.dirname, '../../scripts/prepare-desktop-runtime.mjs'), 'utf8');
 
