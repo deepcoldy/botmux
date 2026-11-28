@@ -882,6 +882,10 @@ import {
   startupIdleReportScreenAdmits,
 } from './core/program-status-gate.js';
 import { shouldFenceTraexStartupInput, traexStartupInputReady } from './core/traex-startup-input.js';
+import {
+  TraexNativeContinuationTracker,
+  type TraexNativeContinuationObservation,
+} from './core/traex-native-continuation.js';
 import { busyProbeRegion } from './utils/busy-probe.js';
 import { BusyReadyFallbackGate } from './utils/busy-ready-fallback.js';
 import {
@@ -5452,6 +5456,37 @@ function holdStructuredStartLeasesWhileProgramStatusBusy(): void {
   });
 }
 
+/** Tracks active TRAE native continuations (such as subagent wakeups after a
+ *  prior turn's terminal with no new Botmux input) so post-terminal composer
+ *  guards do not hold ordinary follow-ups through the whole continuation. */
+const traexNativeContinuation = new TraexNativeContinuationTracker();
+
+function traexNativeContinuationActive(): boolean {
+  if (lastInitConfig?.adoptMode) return false;
+  if (lastInitConfig?.cliId !== undefined && lastInitConfig.cliId !== 'traex') return false;
+  return traexNativeContinuation.isActive(idleDetector?.programStatusHeldWorking() === true);
+}
+
+/** A confirmed Lark follow-up submitted during a long TRAE native continuation
+ *  may stay parked in TRAE's queue until the continuation finishes (potentially
+ *  minutes later). Keep its confirmed pre-start lease alive while the
+ *  continuation is demonstrably running; transcript-proven continuations stay
+ *  alive until their own terminal, while program-status-only evidence stays
+ *  bounded by the same 120s ceiling as Antigravity. */
+function holdStructuredStartLeasesWhileTraexNativeContinuation(): void {
+  if (typeof structuredBridgeIs !== 'function' || !structuredBridgeIs('traex') || lastInitConfig?.adoptMode) return;
+  const hasTranscript = traexNativeContinuation.hasTranscriptContinuation();
+  const hasProgramStatus = !hasTranscript && traexNativeContinuationActive();
+  if (!hasTranscript && !hasProgramStatus) return;
+  codexBridgeQueue.refreshUnstartedHeadAttributionLease(
+    Date.now(),
+    hasTranscript ? undefined : ANTIGRAVITY_PROGRAM_STATUS_BUSY_REFRESH_MAX_MS,
+    turn => turn.submitConfirmedAtMs !== undefined
+      && !turn.passedBySuccessor
+      && !turn.restoredFromJournal,
+  );
+}
+
 /** OSC-less agy still renders its own busy footer. Sample it on the ordinary
  *  1s Antigravity ticker (before ingest/prune), not on every filesystem event,
  *  and apply the same bounded lease policy as the OSC busy evidence. */
@@ -9462,9 +9497,16 @@ function resetTraexAutoModelBeforePendingTurn(): boolean {
   // Hold for the real idle/composer edge regardless of pool position; the edge
   // re-drives this flush, which then switches model if configured and writes
   // the message as its own turn.
+  //
+  // A TRAE native subagent continuation wakes the CLI after the prior turn's
+  // terminal with no Botmux user input (so activeTurnAuthority and
+  // queuedTypeAheadTurns are both empty). When positive native-continuation
+  // evidence proves the CLI is actively running that continuation, fall through
+  // to normal busy type-ahead handling instead of holding until it finishes.
   if (!isPromptReady
     && !activeTurnAuthority.snapshot()
-    && queuedTypeAheadTurns.length === 0) return true;
+    && queuedTypeAheadTurns.length === 0
+    && !traexNativeContinuationActive()) return true;
   if (!isPromptReady) return traexAutoModelInputHold();
   if (admitTraexCatalogModelBeforeInput(head.turnId, head.dispatchAttempt)) return true;
   if (controller.config.trigger === 'quota') return selectTraexQuotaModelBeforeTurn(head);
@@ -21568,6 +21610,55 @@ function codexBridgeIngest(opts: {
     backend.appendWebHistory(renderOrcaTranscriptHistory(result.events));
   }
   codexBridgeQueue.ingest(result.events);
+  let traexNativeContinuationObservation: TraexNativeContinuationObservation | undefined;
+  if (structuredBridgeIs('traex') && !lastInitConfig?.adoptMode) {
+    const traex = result as TraexDrainResult;
+    if (traex.nativeTurnLifecycle?.length) {
+      const ownedNativeTurnIds = new Set<string>();
+      let hasOpenBotmuxTurn = false;
+      for (const turn of codexBridgeQueue.peek()) {
+        if (turn.sourceTurnId) ownedNativeTurnIds.add(turn.sourceTurnId);
+        if (turn.replacementNativeTurnId) ownedNativeTurnIds.add(turn.replacementNativeTurnId);
+        if (turn.finalText === undefined) hasOpenBotmuxTurn = true;
+      }
+      traexNativeContinuationObservation = traexNativeContinuation.observeTranscriptLifecycle(
+        traex.nativeTurnLifecycle,
+        {
+          ownedNativeTurnIds,
+          hasOpenBotmuxTurn,
+          botmuxWriteInFlight: (typeof isFlushing === 'boolean' && isFlushing)
+            || (typeof cliSubmissionInFlight !== 'undefined' && cliSubmissionInFlight !== null),
+        },
+        idleDetector?.programStatusHeldWorking() === true,
+      );
+      if (traexNativeContinuationObservation.closedTranscriptContinuation) {
+        // Handoff boundary: a confirmed follow-up parked behind a native
+        // continuation gets a fresh pre-start lease now that the continuation
+        // has closed (mirrors refreshNextPreStartLease for Botmux-owned turns).
+        codexBridgeQueue.refreshUnstartedHeadAttributionLease(
+          Date.now(),
+          undefined,
+          turn => turn.submitConfirmedAtMs !== undefined
+            && !turn.passedBySuccessor
+            && !turn.restoredFromJournal,
+        );
+      }
+      if (traexNativeContinuationObservation.becameActive && isPromptReady) {
+        revokePromptReadiness();
+        idleDetector?.reset();
+        if (typeof publishScreenStatus === 'function') publishScreenStatus('working', { force: true });
+      }
+      // Every transcript continuation has closed while OSC still holds working:
+      // arm the bounded stale-OSC recovery in case the terminal OSC report was
+      // lost (OSC 7501 has no heartbeat). The check only releases on multi-signal
+      // agreement after the quiet window, never on the terminal alone.
+      if (idleDetector?.programStatusHeldWorking() === true
+        && traexNativeContinuationActive()
+        && !traexNativeContinuation.hasTranscriptContinuation()) {
+        scheduleStaleProgramStatusCheck();
+      }
+    }
+  }
   if (structuredBridgeIs('codex')) {
     observeCodexTuiAsyncQuestions(result.events);
     maybeRestoreCodexTuiAsyncQuestion();
@@ -21578,11 +21669,21 @@ function codexBridgeIngest(opts: {
   // that terminal rather than leave the old owner collecting the next answer.
   if (structuredBridgeIs('doubao') && !hasAssistantFinal) checkpointStructuredBridgeRecovery();
   observeStructuredBackgroundTasks(result);
+  // Wide activity evidence: a continuation proven by EITHER rollout lifecycle
+  // edges OR a still-held OSC 7501 working latch (an OSC-only sibling whose
+  // task_started has not flushed yet). Fence retirement and idle suppression
+  // must honor both, or a sibling's assistant_final would drop the surviving
+  // continuation's working state and publish a false idle.
+  const traexNativeContinuationOpen = structuredBridgeIs('traex')
+    && !lastInitConfig?.adoptMode
+    && traexNativeContinuationActive();
   if (cliAdapter?.postTerminalPromptFence === true) {
     const turns = codexBridgeQueue.peek();
-    if (turns.some(turn => turn.started && turn.finalText === undefined)) {
-      // A queued, fingerprint-matched successor has actually started. Busy
-      // output now belongs to live work, not the preceding completed turn.
+    if (turns.some(turn => turn.started && turn.finalText === undefined)
+      || traexNativeContinuationOpen) {
+      // A queued, fingerprint-matched successor or TRAE native continuation
+      // has actually started. Busy output now belongs to live work, not the
+      // preceding completed turn.
       postTerminalInputFence = null;
     } else if (turns.some(turn => turn.started && turn.finalText !== undefined)) {
       armPostTerminalInputFence();
@@ -21618,11 +21719,13 @@ function codexBridgeIngest(opts: {
   // about to wake the planner for another round.
   if (opts.signalIdle !== false
     && !structuredBridgeIs('antigravity')
-    && hasAssistantFinal) {
+    && hasAssistantFinal
+    && !traexNativeContinuationOpen) {
     idleDetector?.fireIdle();
   } else if (opts.signalIdle === false
     && !structuredBridgeIs('antigravity')
-    && hasAssistantFinal) {
+    && hasAssistantFinal
+    && !traexNativeContinuationOpen) {
     // A caller that must not raise the idle edge inside its own critical
     // section (a flush's post-terminal fence check, an interrupt drain) can
     // still be the drain that consumes the turn's final. The watcher/poller
@@ -21631,6 +21734,12 @@ function codexBridgeIngest(opts: {
     // else to re-drive it once the composer sits still (a queued follow-up
     // stays stranded). Deliver it after the caller unwinds, to the same CLI.
     deferFinalIdleSignal();
+  }
+  if (traexNativeContinuationObservation?.becameActive
+    && typeof pendingMessages !== 'undefined' && pendingMessages.length > 0
+    && !(typeof cliRestartInProgress === 'boolean' && cliRestartInProgress)
+    && typeof flushPending === 'function') {
+    queueMicrotask(() => { void flushPending(); });
   }
   return true;
 }
@@ -22647,6 +22756,7 @@ function retireStructuredTurnAttribution(turns: readonly Pick<CodexPendingTurn, 
     currentTurnSteerPromoted = false;
     pendingStructuredCaptureRetirement = undefined;
   }
+  traexNativeContinuation.noteBotmuxTurnRetired();
   // Tombstones precede the read/merge/write so stale disk entries cannot
   // resurrect retired inputs during this write.
   writeCliPidMarker();
@@ -22663,6 +22773,9 @@ function pruneExpiredStructuredHeadsAndEmit(source: string): boolean {
   holdStructuredStartLeaseWhileDriverAwaitsInput();
   if (typeof holdStructuredStartLeasesWhileProgramStatusBusy === 'function') {
     holdStructuredStartLeasesWhileProgramStatusBusy();
+  }
+  if (typeof holdStructuredStartLeasesWhileTraexNativeContinuation === 'function') {
+    holdStructuredStartLeasesWhileTraexNativeContinuation();
   }
   let fenceCurrentRpcEngine = false;
   const settledByTerminal = new Set<CodexPendingTurn>();
@@ -22833,7 +22946,9 @@ function emitReadyCodexTurns(settledQuotaTurns?: CodexPendingTurn[]): void {
   }
   if (!universalOutputHandoff) { checkpointCodexAdoptRecovery(); checkpointStructuredBridgeRecovery(); }
   if (ready.length === 0) return;
-  if (!codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined)) {
+  if (!codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined)
+    && !(typeof structuredBridgeIs === 'function' && structuredBridgeIs('traex')
+      && !lastInitConfig?.adoptMode && traexNativeContinuation.hasTranscriptContinuation())) {
     armPostTerminalInputFence();
   }
   // Turns suppressed as GENUINE SILENCE (model terminated with a bare
@@ -23149,6 +23264,7 @@ function stopCodexBridge(): void {
   grokBridgePidProbeLastMs = 0;
   traexBridgePidProbeLastMs = 0;
   traexFileSourceLogKey = undefined;
+  traexNativeContinuation.reset();
 }
 
 /** When a rotation moves bridgeJsonlPath away from `oldPath`, queue turns
@@ -29692,8 +29808,23 @@ function onPtyData(data: string, isLiveStream = true): void {
         spawnArgvTurnStartEvidenceSeen = true;
         spawnArgvTurnStartBusyScanTail = '';
       }
+      const wasPromptReady = isPromptReady;
       const wasAuthoritative = idleDetector?.programStatusActive() ?? false;
       idleDetector?.observeProgramStatus(part.event);
+      if (lastInitConfig?.cliId === 'traex' && !lastInitConfig.adoptMode) {
+        const nativeContinuation = traexNativeContinuation.observeProgramStatus({
+          state: part.event.state,
+          wasPromptReady,
+          programStatusHeldWorking: idleDetector?.programStatusHeldWorking() === true,
+          hasBotmuxTurnOwner: !!activeTurnAuthority.snapshot() || queuedTypeAheadTurns.length > 0,
+          botmuxOperationInFlight: awaitingFirstPrompt || cliRestartInProgress || isFlushing
+            || cliSubmissionInFlight !== null || commandLineWritesPending > 0
+            || injectionFlushing || sessionRenameInFlight(),
+        });
+        if (nativeContinuation.becameActive && pendingMessages.length > 0 && !cliRestartInProgress) {
+          queueMicrotask(() => { void flushPending(); });
+        }
+      }
       if (part.event.state === 'working') noteAntigravityWorkingOwner();
       if (part.event.state === 'working' || part.event.state === 'blocked') {
         holdStructuredStartLeasesWhileProgramStatusBusy();
@@ -30783,6 +30914,7 @@ function markPromptReady(source?: IdleEvidenceSource): void {
   // idle throughout. Before any flush below: a submit's reset() disarms it.
   idleDetector?.adoptPromptReady();
   isPromptReady = true;
+  traexNativeContinuation.notePromptReady();
   // A published ready edge ends any busy-marker deferral episode it outlived.
   busyReadyDeferral.clear('prompt-ready');
   cancelTurnTerminalReadyRecovery();
@@ -33448,12 +33580,16 @@ async function flushPending(): Promise<void> {
             );
           }
         }
+        const isNativeContinuationTypeAhead = !isTypeAhead
+          && !promptReadyAtFlushStart
+          && itemsWrittenInThisFlush === 0
+          && traexNativeContinuationActive();
         if (item.turnId && item.dispatchAttempt === undefined) {
           // A live correction belongs to the running model, even when idle
           // turns opt into reselection. Once multiple native inputs coexist,
           // exact resume no longer proves which correction has been consumed;
           // suppress capacity restarts until a fresh independent input.
-          if (isTypeAhead && !item.traexAutoModelRecovery) {
+          if ((isTypeAhead || isNativeContinuationTypeAhead) && !item.traexAutoModelRecovery) {
             traexAutoModelTurnReplayForbidden = true;
           } else {
             if (!item.traexAutoModelRecovery) {
@@ -35829,7 +35965,9 @@ function postTerminalPromptFenceHolds(
   if ((evidenceSource !== 'external' && !currentPostTerminalInputFence())
     || cliAdapter?.postTerminalPromptFence !== true
     || !backendScreenEvidenceIsAuthoritativeForMutation()) return false;
-  if (codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined)) {
+  if (codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined)
+    || (typeof structuredBridgeIs === 'function' && structuredBridgeIs('traex')
+      && !lastInitConfig?.adoptMode && traexNativeContinuation.hasTranscriptContinuation())) {
     postTerminalInputFence = null;
     // The predecessor's idle edge must not publish readiness for this active
     // successor. Input remains allowed because no post-terminal fence is held.
@@ -35957,11 +36095,38 @@ function checkStaleProgramStatus(): void {
   const detector = idleDetector;
   const be = backend;
   if (!detector || !be) return;
+  // TRAE has no Claude-style transcript turn-end feed. Its stale-OSC anchor is
+  // the tracker's OSC-only window: every native continuation has closed in the
+  // rollout while an OSC 7501 working hold is still present (lost terminal report).
+  const isTraexNative = lastInitConfig?.cliId === 'traex' && !lastInitConfig?.adoptMode;
+  // Revalidate the bound rollout BEFORE trusting the cached OSC-only state: a
+  // task_started already flushed to disk but not yet drained proves a live
+  // continuation and must veto the release. The drain feeds the tracker, which
+  // reopens a transcript continuation and clears its OSC-only anchor, so the
+  // verdict below returns 'stop'. Synchronous: structuredBridgeIngestPath reads
+  // the file inline, and fireIdle stays suppressed while the tracker is active.
+  if (isTraexNative && detector.programStatusHeldWorking()) {
+    try {
+      codexBridgeIngest();
+    } catch (err: any) {
+      // Fail closed: an unreadable rollout means the cached OSC-only state was
+      // not revalidated — a durable fresh task_started could be sitting on disk
+      // unseen. Never treat an unknown revalidation result as release permission;
+      // reschedule and let a later successful drain make the call.
+      log(`TRAE stale-OSC revalidate drain failed, deferring release: ${err.message}`);
+      scheduleStaleProgramStatusCheck();
+      return;
+    }
+  }
   const now = Date.now();
+  const heldWorking = detector.programStatusHeldWorking();
+  const transcriptEndedForMs = isTraexNative
+    ? traexNativeContinuation.programStatusOnlyForMs(now, heldWorking)
+    : claudeTranscriptTurnEnd.endedForMs(now);
   const evidence = {
-    heldWorking: detector.programStatusHeldWorking(),
+    heldWorking,
     programStatusQuietMs: detector.programStatusQuietMs(now),
-    transcriptEndedForMs: claudeTranscriptTurnEnd.endedForMs(now),
+    transcriptEndedForMs,
     backgroundTasksRunning: backgroundTaskTracker.pending(now)
       + (typeof backgroundAuthorityHold !== 'undefined' && backgroundAuthorityHold.isBackgroundHeld() ? 1 : 0),
   };
@@ -35972,6 +36137,9 @@ function checkStaleProgramStatus(): void {
     return;
   }
   if (!detector.releaseStaleProgramStatus()) return;
+  // The release marks idle on the detector; retire the TRAE OSC-only marker so
+  // the worker does not keep suppressing idle behind a now-released hold.
+  if (isTraexNative) traexNativeContinuation.notePromptReady();
   log(`[program-status] working held ${Math.round(evidence.programStatusQuietMs / 1000)}s with no report while the `
     + `transcript closed the turn ${Math.round(evidence.transcriptEndedForMs! / 1000)}s ago and the screen is at the prompt `
     + '— treating the lost terminal report as idle');
@@ -44419,6 +44587,7 @@ async function spawnCliBody(
     if (typeof legacyAgentAckPairer !== 'undefined') legacyAgentAckPairer.reset();
     if (typeof clearBackgroundHoldTimer === 'function') clearBackgroundHoldTimer();
     activeTurnAuthority.clear();
+    traexNativeContinuation.reset();
     if (!intentionalRestart && activeRestartAttemptId) {
       send({
         type: 'restart_result',
@@ -44914,6 +45083,7 @@ function killCli(opts: {
   if (typeof legacyAgentAckPairer !== 'undefined') legacyAgentAckPairer.reset();
   if (typeof clearBackgroundHoldTimer === 'function') clearBackgroundHoldTimer();
   activeTurnAuthority.clear();
+  traexNativeContinuation.reset();
   currentVcMeetingImTurnOrigin = undefined;
   submittedCodexAppReplyTurnIds.clear();
   pendingCodexAppSteerAckIds.clear();
