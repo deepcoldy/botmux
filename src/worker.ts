@@ -3096,6 +3096,7 @@ function refreshCliPluginGeneration(
     workingDir: cfg.workingDir,
     prompt: cfg.prompt,
     replacesPriorGeneration: cfg.resume === true,
+    hostMcpEnabled: !cfg.bytedcliContainment,
     promptInjection: cfg.promptInjection,
     compactCatalog: cfg.cliId === 'traex'
       && codexRpcEligible(cfg, { sandboxForced: sandboxEnabled() }),
@@ -3105,6 +3106,7 @@ function refreshCliPluginGeneration(
       ? deliveredPluginSkillCatalogFingerprint : undefined,
   });
   for (const diagnostic of generation.diagnostics) log(`Plugin generation: ${diagnostic}`);
+  if (cfg.bytedcliContainment) log('ByteCloud mixed mode: host MCP downstreams disabled; plugin Skills retained');
   if (generation.fatal) {
     const reason = generation.diagnostics.join(', ') || 'unknown';
     // Init errors are now user-visible through one structured `error` IPC.
@@ -3170,7 +3172,7 @@ async function prepareCliPluginGenerationAndGateway(
     if ((cfg.backendType ?? config.daemon.backendType) === 'tmux') {
       assertManagedTmuxInstanceIdentity(cfg);
     }
-    if (adapter.mcpGateway) {
+    if (adapter.mcpGateway && !cfg.bytedcliContainment) {
       const gateway = adapter.mcpGateway;
       const instanceConfig = join(cfg.cliInstanceBinding.codexHome, 'config.toml');
       const report = withFileLockSync(instanceConfig, () => ensureGatewayEntry({
@@ -34591,7 +34593,7 @@ async function spawnCliBody(
           configPath: join(claudeDataDir!, 'settings.json'),
         };
       }
-      if (adapter.mcpGateway) {
+      if (adapter.mcpGateway && !cfg.bytedcliContainment) {
         const isolatedConfigPath = isClaudeFam
           ? join(claudeDataDir!, '.claude.json')
           : join(botHome, 'codex', 'config.toml');

@@ -48,6 +48,8 @@ export function prepareCliPluginGeneration(opts: {
   prompt: string;
   replacesPriorGeneration: boolean;
   promptInjection?: 'default' | 'none';
+  /** Strict ByteCloud sessions retain skills but cannot serve host MCP downstreams. */
+  hostMcpEnabled?: boolean;
   compactCatalog?: boolean;
   deferCatalogToContextManager?: boolean;
   /** Only the host's admitted Auto resume passes its last delivered catalog. */
@@ -65,6 +67,7 @@ export function prepareCliPluginGeneration(opts: {
     sessionId: opts.sessionId,
     pluginIds: pluginManifest.pluginIds,
     pluginRuntime: opts.bot.pluginRuntime,
+    hostMcpEnabled: opts.hostMcpEnabled,
     maxToolTimeoutMs: opts.global?.mcpGatewayMaxToolTimeoutMs,
     dataDir: opts.dataDir,
     now: opts.now,

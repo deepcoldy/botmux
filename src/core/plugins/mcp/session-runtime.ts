@@ -75,6 +75,7 @@ export function refreshSessionMcpRuntimeManifest(opts: {
   sessionId: string;
   pluginIds: readonly string[];
   pluginRuntime?: Record<string, PluginMcpRuntimeOptions>;
+  hostMcpEnabled?: boolean;
   maxToolTimeoutMs?: number;
   dataDir?: string;
   now?: () => string;
@@ -83,7 +84,7 @@ export function refreshSessionMcpRuntimeManifest(opts: {
   const pluginIds = [...opts.pluginIds];
   const entries: SessionMcpRuntimeEntry[] = [];
   const maxToolTimeoutMs = effectiveMcpGatewayMaxToolTimeoutMs(opts.maxToolTimeoutMs);
-  for (const pluginId of pluginIds) {
+  for (const pluginId of opts.hostMcpEnabled === false ? [] : pluginIds) {
     const contribution = registry.plugins[pluginId]?.contributions?.mcp;
     if (!contribution) continue;
     const server = readPluginMcpDescriptor(pluginId, contribution);
@@ -134,6 +135,11 @@ export function sessionMcpRuntimeHostOnlyPaths(
     ...manifest.entries.flatMap(entry => [
       pluginMcpPrivatePath(entry.pluginId),
       join(entry.pluginDir, 'mcp', 'index.json'),
+    ]),
+    // Disabled downstreams still carry private descriptors on the host.
+    ...manifest.pluginIds.flatMap(pluginId => [
+      pluginMcpPrivatePath(pluginId),
+      join(pluginRuntimeDir(pluginId), 'mcp', 'index.json'),
     ]),
   ])];
 }
