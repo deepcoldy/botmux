@@ -22970,6 +22970,7 @@ function forkWorkerPrepared(
   const bytedcliLayout = ds.session.bytecloudBrokerStrict ? freezeBytedcliHostLayout() : undefined;
   const bytedcliContainment = bytedcliLayout ? {
     workerGeneration,
+    hostReadOnlyMcpTools: readGlobalConfig().bytedcliBroker?.hostReadOnlyMcpTools ?? {},
     credentialRoots: [...bytedcliLayout.credentialRoots, bytedcliStrictMarkerRoot(config.session.dataDir),
       ...(getLoadedConfigPath() ? [getLoadedConfigPath()!] : [])],
     executableReadOnlyRoots: [...new Set([...bytedcliLayout.executableReadOnlyRoots, process.execPath, dirname(process.execPath),

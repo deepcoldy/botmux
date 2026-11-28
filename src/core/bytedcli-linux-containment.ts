@@ -2,6 +2,7 @@ import { readFileSync, readlinkSync, statSync, realpathSync, existsSync } from '
 import { dirname, basename, join } from 'node:path';
 import { readProcessStartIdentity } from './session-marker.js';
 import type { BytedcliContainmentReport, BytedcliWorkerContainment } from './bytedcli-broker-containment.js';
+import { assertHostReadOnlyMcpRuntime } from './plugins/mcp/read-only-policy.js';
 
 const covers = (root: string, path: string) => path === root || path.startsWith(root + '/');
 function canonical(path: string): string {
@@ -71,13 +72,16 @@ export function assertBytedcliLaunchSupported(input: {
   platform: string; backendType: string; cliId: string; sandbox: string;
   adopt?: boolean; reattach?: boolean; wrapperCli?: string; sharedAuthentication?: boolean;
   loopbackShared?: boolean; attestedLoopback?: boolean; identityModel?: string; hostMcpEntries?: number; rpc?: boolean; externalAppServer?: string; launchMode?: string;
+  hostMcpRuntime?: import('./plugins/mcp/session-runtime.js').SessionMcpRuntimeManifest | null;
+  hostReadOnlyMcpTools?: import('./plugins/mcp/read-only-policy.js').HostReadOnlyMcpTools;
 }): void {
+  if (input.hostMcpRuntime?.entries.length) assertHostReadOnlyMcpRuntime(input.hostMcpRuntime, input.hostReadOnlyMcpTools);
   if (input.platform !== 'linux' || !['pty', 'tmux'].includes(input.backendType)
     || !['claude-code', 'codex'].includes(input.cliId) || input.sandbox !== 'oncall'
     || input.adopt || input.reattach || input.wrapperCli || input.sharedAuthentication || input.rpc || input.externalAppServer || input.launchMode
     || (input.loopbackShared === false && input.attestedLoopback !== true) || input.identityModel && input.identityModel !== 'proven'
-    || (input.hostMcpEntries ?? 0) > 0) {
-    throw new Error('ByteCloud broker requires a cold Linux PTY/Tmux allowlist launch with private model authentication, proven identity and host loopback; host MCP downstreams are unsupported');
+    || (input.hostMcpEntries ?? 0) > (input.hostMcpRuntime?.entries.length ?? 0)) {
+    throw new Error('ByteCloud broker requires a cold Linux PTY/Tmux allowlist launch with private model authentication, proven identity and host loopback; host MCP requires an explicit read-only tool allowlist');
   }
 }
 

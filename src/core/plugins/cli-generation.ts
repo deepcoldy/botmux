@@ -50,8 +50,9 @@ export function prepareCliPluginGeneration(opts: {
   turnId?: string;
   replacesPriorGeneration: boolean;
   promptInjection?: 'default' | 'none';
-  /** Strict ByteCloud sessions retain skills but cannot serve host MCP downstreams. */
+  /** Strict ByteCloud sessions retain skills; host MCP requires audited read-only tool grants. */
   hostMcpEnabled?: boolean;
+  hostReadOnlyMcpTools?: import('./mcp/read-only-policy.js').HostReadOnlyMcpTools;
   compactCatalog?: boolean;
   deferCatalogToContextManager?: boolean;
   /** Only the host's admitted Auto resume passes its last delivered catalog. */
@@ -70,6 +71,7 @@ export function prepareCliPluginGeneration(opts: {
     pluginIds: pluginManifest.pluginIds,
     pluginRuntime: opts.bot.pluginRuntime,
     hostMcpEnabled: opts.hostMcpEnabled,
+    hostReadOnlyMcpTools: opts.hostReadOnlyMcpTools,
     maxToolTimeoutMs: opts.global?.mcpGatewayMaxToolTimeoutMs,
     dataDir: opts.dataDir,
     now: opts.now,

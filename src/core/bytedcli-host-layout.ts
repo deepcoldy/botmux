@@ -7,6 +7,7 @@ import { parseBytedcliMachineProfile } from './bytedcli-broker-credentials.js';
 import { snapshotBytedcliRuntimeTrees, snapshotBytedcliTrustedFiles } from './bytedcli-runtime-integrity.js';
 import { bytedcliHostNetworkEnvironment } from './bytedcli-host-network.js';
 import { discoverBytedcliDbRuntime } from './bytedcli-broker-process.js';
+import { pluginsHome, pluginRegistryPath } from './plugins/paths.js';
 /** Frozen once at host assembly. PATH is daemon startup configuration, never
  * Bot/Agent env, and discover validates canonical install/runtime ownership. */
 export function bytedcliTrustedHostLayout(settings:BytedcliBrokerConfig & {readonly protectedRoots?:readonly string[]}={}){
@@ -48,7 +49,7 @@ export function bytedcliTrustedHostLayout(settings:BytedcliBrokerConfig & {reado
   const auditRoot=join(privateRoot,'audit');
   const gdprMachineFile = process.env.BOTMUX_BYTEDCLI_GDPR_MACHINE_FILE || undefined;
   if (gdprMachineFile && !isAbsolute(gdprMachineFile)) throw new Error('invalid GDPR machine file');
-  const credentialRoots=[...(gdprMachineFile ? [gdprMachineFile] : []),join(machineHome,'.local','share','bytedcli'),join(machineHome,'.botmux','data','bytedcli-home'),
+  const credentialRoots=[pluginsHome(),pluginRegistryPath(),...(gdprMachineFile ? [gdprMachineFile] : []),join(machineHome,'.local','share','bytedcli'),join(machineHome,'.botmux','data','bytedcli-home'),
     join(machineHome,'.botmux','data','cli-auth-epoch'),join(machineHome,'.botmux','host-authority'),
     join(machineHome,'.botmux','device-auth'),join(machineHome,'.botmux','platform.json'),join(machineHome,'.git-credentials'),join(machineHome,'.gitconfig'),join(machineHome,'.netrc'),join(machineHome,'.ssh'),
     join(machineHome,'.botmux','data','meego-home'),join(machineHome,'.meegle'),

@@ -105,7 +105,7 @@ Bot 使用同一种版本化对象，例如：
 
 当前只支持 Linux、本地受管 PTY/Tmux、proven 执行身份、真实 allowlist 文件隔离和独立 PID namespace、宿主 loopback 或受管且验签的精确 loopback 代理，以及新的冷启动进程。模型认证支持 Claude Code 的实际私有凭据副本，或 Codex isolated auth / isolated instance。
 
-混合模式与插件的 protected HTTP egress 可同时使用：沙箱继续隔离宿主网络，ByteCloud、当前执行与 Git 身份查询仅经精确接口代理；daemon 验证当前 worker/回合签名后仍核验原始进程谱系，不导出 ByteCloud 凭据。混合模式保留插件 Skill，但不注入或启动宿主 MCP 下游；这些下游的私有配置仍保持隔离。依赖宿主 MCP 的功能在此模式下不可用，可使用已登记的受管 `bytedcli skill-api` 命令。Codex 必须在 Dashboard → 权限与安全 → Codex 登录凭证中选择「本 bot 独立登录态」，并在该 Bot 的 CODEX_HOME 中准备认证；已有独立认证文件可继续使用，不复制全局登录态。若独立 Codex config.toml 还配置了宿主 MCP，将对应 `mcp_servers.<name>.enabled` 设为 `false`。remote、macOS、scratch/single、adopt/warm attach、wrapperCli、shell 启动、host Codex RPC / external app server、Seed/Relay/Pi 等其他模型组合会拒绝；界面显示“已启用策略”并不证明会话通过隔离检查。
+混合模式与插件的 protected HTTP egress 可同时使用：沙箱继续隔离宿主网络，ByteCloud、当前执行与 Git 身份查询仅经精确接口代理；daemon 验证当前 worker/回合签名后仍核验原始进程谱系，不导出 ByteCloud 凭据。混合模式保留插件 Skill。宿主 MCP 默认禁用；管理员可以按下节的精确工具名单开放经审核的机器只读查询。插件私有配置与登录态仍不进入沙箱。其他功能可使用已登记的受管 `bytedcli skill-api` 命令。Codex 必须在 Dashboard → 权限与安全 → Codex 登录凭证中选择「本 bot 独立登录态」，并在该 Bot 的 CODEX_HOME 中准备认证；已有独立认证文件可继续使用，不复制全局登录态。若独立 Codex config.toml 还配置了宿主 MCP，将对应 `mcp_servers.<name>.enabled` 设为 `false`。remote、macOS、scratch/single、adopt/warm attach、wrapperCli、shell 启动、host Codex RPC / external app server、Seed/Relay/Pi 等其他模型组合会拒绝；界面显示“已启用策略”并不证明会话通过隔离检查。
 
 宿主 bytedcli 和 Botmux 安装树在严格会话内只读，全部 SDK profiles、个人凭据、epoch 与 broker/audit 根不可读写。不能在运行该宿主的安装树里原地开发；其他项目使用独立项目授权。凭据根本身是 leaf symlink 的组合不支持。缺失受保护文件的父目录使用冷启动时的私有目录视图，之后新增的宿主兄弟文件要等新一代才能看到。
 
@@ -114,6 +114,26 @@ bytedcli 的只读边界包括祖先 `node_modules` 搜索路径、兄弟/提升
 网络只继承宿主冻结的 `HTTP_PROXY`、`HTTPS_PROXY`、`NO_PROXY` 及对应小写变量。审核版本的原生传输不支持 `ALL_PROXY`/`all_proxy`；配置这些变量会明确标记严格宿主不可用，须改成所支持的 HTTP(S) 代理后重建，不能静默忽略路由。`NODE_EXTRA_CA_CERTS`、`SSL_CERT_FILE`、`SSL_CERT_DIR` 的规范路径、软链目标及祖先同样受保护并核验；无法证明的证书布局拒绝严格执行。以上限制不改变其他 CLI 或旧身份模式的网络合同。
 
 严格包装器不导出 ByteCloud token；独立 `codebase` / `bitscli` / `bits-cli`、git askpass 和 `BOTMUX_AS` 拒绝。独立 Meego、Lark 和旧模式保留原有合同；严格 bytedcli 中未登记的 Meego 等业务命令可进入下述 unknown/actor 隔离路径，仍须通过身份、参数和执行边界检查。
+
+## 混合模式的机器只读 MCP
+
+需要使用保存机器登录态的只读插件时，在宿主 `~/.botmux/config.json` 的 `bytedcliBroker.hostReadOnlyMcpTools` 中配置 `{ "插件 ID": ["原始工具名"] }`。下面是结构示例，具体业务名单由宿主运维配置维护，Botmux 不内置业务预设：
+
+```json
+{
+  "bytedcliBroker": {
+    "hostReadOnlyMcpTools": {
+      "example-reader": ["example_list_records", "example_get_record"]
+    }
+  }
+}
+```
+
+只允许精确名称，不支持通配符、空工具名单、重复工具或自动相信 MCP 的 `readOnlyHint`。名单中的插件还必须在 Bot 上启用。新增授权需要重启 daemon 并冷启动会话；移除授权或禁用插件后，既有工具调用在请求和结果释放时重新检查，拒绝已撤销的查询。与 `machineProfile`、`cliEntrypoint` 合并配置，保留已有值。
+
+管理员必须先审核工具的完整行为：它应当使用固定机器身份、固定只读接口和严格参数校验，不能接受任意 URL、请求头、SQL 写入或通用命令，也不能把写接口以“查询”命名放入名单。本能力只支持普通本地 stdio MCP，拒绝 protected capability / protected egress 插件和远程 MCP。
+
+Gateway 只导出被批准的工具，并保持插件配置、Cookie、token 和浏览器 profile 对沙箱不可读、不可写。资源、提示词、反向 sampling/elicitation/roots、宿主结果投递及下游日志/progress 转发不开放。读取只绑定宿主当前执行轮次；定时任务不需要虚构真人触发者，上一轮的延迟结果不能释放到下一轮。此授权与 ByteCLI 命令身份规则相互独立，不改变未登记 ByteCLI 命令使用触发者的规则。
 
 ## 当前命令目录
 

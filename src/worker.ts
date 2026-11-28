@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { bytedcliLoopbackServices } from './core/bytedcli-protected-loopback.js';
 import { assertBytedcliLaunchSupported, createBytedcliContainmentReport } from './core/bytedcli-linux-containment.js';
+import { approvedReadOnlyTools, assertHostReadOnlyMcpRuntime, isCurrentReadOnlyMcpExecution } from './core/plugins/mcp/read-only-policy.js';
 import { bytecloudBrokerEnabled } from './core/identity-policy.js';
 import { scrubBytedcliBrokerEnv } from './utils/child-env.js';
 import { isCliStartupFailure } from './core/cli-startup-failure.js';
@@ -3395,6 +3396,7 @@ function refreshCliPluginGeneration(
     turnId: cfg.turnId,
     replacesPriorGeneration: cfg.resume === true,
     hostMcpEnabled: !cfg.bytedcliContainment,
+    hostReadOnlyMcpTools: cfg.bytedcliContainment?.hostReadOnlyMcpTools,
     promptInjection: cfg.promptInjection,
     compactCatalog: cfg.cliId === 'traex'
       && codexRpcEligible(cfg, { sandboxForced: sandboxEnabled() }),
@@ -3404,7 +3406,7 @@ function refreshCliPluginGeneration(
       ? deliveredPluginSkillCatalogFingerprint : undefined,
   });
   for (const diagnostic of generation.diagnostics) log(`Plugin generation: ${diagnostic}`);
-  if (cfg.bytedcliContainment) log('ByteCloud mixed mode: host MCP downstreams disabled; plugin Skills retained');
+  if (cfg.bytedcliContainment) log('ByteCloud mixed mode: only host-approved read-only MCP tools enabled; plugin Skills retained');
   if (generation.fatal) {
     const reason = generation.diagnostics.join(', ') || 'unknown';
     // Init errors are now user-visible through one structured `error` IPC.
@@ -3470,7 +3472,7 @@ async function prepareCliPluginGenerationAndGateway(
     if ((cfg.backendType ?? config.daemon.backendType) === 'tmux') {
       assertManagedTmuxInstanceIdentity(cfg);
     }
-    if (adapter.mcpGateway && !cfg.bytedcliContainment) {
+    if (adapter.mcpGateway && (!cfg.bytedcliContainment || Object.keys(cfg.bytedcliContainment.hostReadOnlyMcpTools ?? {}).length)) {
       const gateway = adapter.mcpGateway;
       const instanceConfig = join(cfg.cliInstanceBinding.codexHome, 'config.toml');
       const report = withFileLockSync(instanceConfig, () => ensureGatewayEntry({
@@ -3481,9 +3483,7 @@ async function prepareCliPluginGenerationAndGateway(
   }
   refreshCliPluginGeneration(cfg, adapter, preserveUnchangedCatalog);
   const manifest = readSessionMcpRuntimeManifest(cfg.sessionId, config.session.dataDir);
-  if (cfg.bytedcliContainment && manifest?.entries.length) {
-    throw new Error('ByteCloud broker refuses host MCP downstreams outside the Agent sandbox');
-  }
+  if (cfg.bytedcliContainment && manifest?.entries.length) assertHostReadOnlyMcpRuntime(manifest, cfg.bytedcliContainment.hostReadOnlyMcpTools);
   stopSessionMcpGatewayHost();
   if (cfg.protectedHttpEgressPolicy) {
     try {
@@ -3551,11 +3551,25 @@ async function prepareCliPluginGenerationAndGateway(
  *  wired here so BOTH the fresh/resumed host and the re-served reattach host
  *  inject the per-turn host-signed caller — the reattach path must not lose it. */
 async function startAndRecordSessionMcpGatewayHost(sessionId: string): Promise<void> {
-  if (lastInitConfig?.bytedcliContainment) throw new Error('ByteCloud broker forbids host MCP downstreams');
+  const strictConfig = lastInitConfig?.bytedcliContainment;
+  if (strictConfig) assertHostReadOnlyMcpRuntime(readSessionMcpRuntimeManifest(sessionId, config.session.dataDir), strictConfig.hostReadOnlyMcpTools);
   sessionMcpGatewayHost = await startSessionMcpGatewayHost({
     sessionId,
     dataDir: config.session.dataDir,
     trustedTurnIdentity: currentGatewayTrustedTurnIdentity,
+    ...(strictConfig ? { readOnly: {
+      tools: strictConfig.hostReadOnlyMcpTools ?? {},
+      authorize: (pluginId: string, toolName: string, identity: GatewayTrustedTurnIdentity): boolean => {
+        try {
+          const cfg = lastInitConfig;
+          if (!cfg || !isCurrentReadOnlyMcpExecution(identity, workerSessionEventScope)) return false;
+          const global = readGlobalConfig({ fresh: true });
+          const bot = loadBotConfigs().find(candidate => candidate.larkAppId === cfg.larkAppId);
+          return !!bot && resolveEffectivePluginIds(bot, global).includes(pluginId)
+            && approvedReadOnlyTools(global.bytedcliBroker?.hostReadOnlyMcpTools, pluginId).includes(toolName);
+        } catch { return false; }
+      },
+    } } : {}),
     trustedResultDelivery: deliverPluginResultThroughHost,
     ...(lastInitConfig?.protectedResults === true ? {
       protectedResultDeliveryAvailable: () => protectedResultProfileAvailable({
@@ -37874,7 +37888,7 @@ async function spawnCliBody(
           configPath: join(claudeDataDir!, 'settings.json'),
         };
       }
-      if (adapter.mcpGateway && !cfg.bytedcliContainment) {
+      if (adapter.mcpGateway && (!cfg.bytedcliContainment || Object.keys(cfg.bytedcliContainment.hostReadOnlyMcpTools ?? {}).length)) {
         const isolatedConfigPath = isClaudeFam
           ? join(claudeDataDir!, '.claude.json')
           : join(botHome, 'codex', 'config.toml');
@@ -39739,6 +39753,8 @@ async function spawnCliBody(
   });
   if (cfg.bytedcliContainment) assertBytedcliLaunchSupported({ platform: process.platform,
     backendType: effectiveBackendType, cliId: cfg.cliId, sandbox: sandboxMode,
+    hostMcpRuntime: mcpRuntimeManifest, hostMcpEntries: mcpRuntimeManifest?.entries.length,
+    hostReadOnlyMcpTools: cfg.bytedcliContainment.hostReadOnlyMcpTools,
     identityModel: childIdentityModel, loopbackShared: spawnNetworkShape.loopbackShared, attestedLoopback });
   if (process.env.SESSION_DATA_DIR) {
     send({

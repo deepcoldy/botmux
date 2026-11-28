@@ -1,4 +1,5 @@
 import { parseBytedcliMachineProfile } from './core/bytedcli-broker-credentials.js';
+import { parseHostReadOnlyMcpTools } from './core/plugins/mcp/read-only-policy.js';
 import { normalizeVcMeetingListenerPolicy, type VcMeetingListenerPolicy } from './services/vc-meeting-listener-policy.js';
 /**
  * Global botmux configuration stored at `~/.botmux/config.json`.
@@ -312,10 +313,15 @@ export const SCHEDULE_CHILD_ONE_SHOT_DEFAULT_MAX_TASKS_PER_TURN = 1;
 export const SCHEDULE_CHILD_ONE_SHOT_MAX_TASKS_PER_TURN = 16;
 
 /** Invalid host identity selection must never silently become the default account. */
-export interface BytedcliBrokerConfig { machineProfile?: string; cliEntrypoint?: string }
+export interface BytedcliBrokerConfig {
+  machineProfile?: string;
+  cliEntrypoint?: string;
+  /** Audited, fixed-purpose machine reads. No wildcards; new grants need a cold worker. */
+  hostReadOnlyMcpTools?: import('./core/plugins/mcp/read-only-policy.js').HostReadOnlyMcpTools;
+}
 export function parseBytedcliBrokerConfig(raw: unknown): BytedcliBrokerConfig | undefined {
   if (raw === undefined) return undefined;
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw) || Object.keys(raw).some(key => !['machineProfile', 'cliEntrypoint'].includes(key))) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw) || Object.keys(raw).some(key => !['machineProfile', 'cliEntrypoint', 'hostReadOnlyMcpTools'].includes(key))) {
     throw new Error('invalid bytedcliBroker config');
   }
   const machineProfile = parseBytedcliMachineProfile((raw as { machineProfile?: unknown }).machineProfile);
@@ -323,11 +329,13 @@ export function parseBytedcliBrokerConfig(raw: unknown): BytedcliBrokerConfig | 
   if (cliEntrypoint !== undefined && (typeof cliEntrypoint !== 'string' || !isAbsolute(cliEntrypoint)
     || resolve(cliEntrypoint) !== cliEntrypoint || cliEntrypoint === '/' || cliEntrypoint.startsWith('/$bunfs/')
     || /[\u0000-\u001f\u007f]/.test(cliEntrypoint))) throw new Error('invalid bytedcliBroker CLI entrypoint');
-  return { ...(machineProfile ? { machineProfile } : {}), ...(cliEntrypoint !== undefined ? { cliEntrypoint: cliEntrypoint as string } : {}) };
+  const hostReadOnlyMcpTools = parseHostReadOnlyMcpTools((raw as BytedcliBrokerConfig).hostReadOnlyMcpTools);
+  return { ...(machineProfile ? { machineProfile } : {}), ...(cliEntrypoint !== undefined ? { cliEntrypoint: cliEntrypoint as string } : {}),
+    ...(hostReadOnlyMcpTools === undefined ? {} : { hostReadOnlyMcpTools }) };
 }
 
 export interface GlobalConfig {
-  /** Host only; frozen before the first worker/broker. Change requires a new daemon generation. */
+  /** Host only. Credential/runtime selection freezes per daemon; MCP grants freeze per cold worker. */
   bytedcliBroker?: BytedcliBrokerConfig;
   lang?: Locale;
   codexAppTitlePrefix?: string;
@@ -1127,9 +1135,9 @@ export function configuredProtectedMcpEnvKeys(): string[] {
 
 /** Typed view of the global config. Validates `lang` so a malformed file
  *  can't propagate a bad value into the i18n module. */
-export function readGlobalConfig(): GlobalConfig {
+export function readGlobalConfig(opts: { fresh?: boolean } = {}): GlobalConfig {
   const path = globalConfigPath();
-  if (readCache && readCache.path === path && Date.now() - readCache.at < READ_CACHE_TTL_MS) {
+  if (!opts.fresh && readCache && readCache.path === path && Date.now() - readCache.at < READ_CACHE_TTL_MS) {
     return readCache.value;
   }
   const raw = readRawConfig();

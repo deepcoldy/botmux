@@ -8,6 +8,7 @@ export interface BytedcliWorkerContainment {
   readonly workerGeneration: number;
   readonly credentialRoots: readonly string[];
   readonly executableReadOnlyRoots: readonly string[];
+  readonly hostReadOnlyMcpTools?: import('./plugins/mcp/read-only-policy.js').HostReadOnlyMcpTools;
 }
 export interface BytedcliContainmentReport {
   readonly protocol: 'botmux.bytedcli-containment.v1';
