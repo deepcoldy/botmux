@@ -21,19 +21,25 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFil
 import { join, resolve } from 'node:path';
 import { spawnNodeTsScript, spawnSyncTsEvalWithRepoImports } from './helpers/ts-runner.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
+import { scratchMountRuntimeAvailable } from './helpers/scratch-mount-probe.js';
+import { waitForWorkerMessage } from './helpers/worker-ipc-waiter.js';
 import { probeHostCredentialIsolationMechanism } from '../src/adapters/backend/sandbox.js';
-import { piSessionDirName } from '../src/services/pi-transcript.js';
+import { teardownScratchSession } from '../src/adapters/backend/scratch-sandbox.js';
+import { piPersistentTranscriptDir, piPreviousTranscriptDir, piSessionDirName } from '../src/services/pi-transcript.js';
 import type { DaemonToWorker } from '../src/types.js';
 
 const bwrapRuntime = process.platform === 'linux' && (() => {
   const probe = probeHostCredentialIsolationMechanism();
   return probe.supported && probe.mechanism === 'bwrap';
 })();
+const scratchStorage: 'tmpfs' | 'disk' = process.getuid?.() === 0 ? 'tmpfs' : 'disk';
+const scratchRuntime = bwrapRuntime && scratchMountRuntimeAvailable(scratchStorage);
 
 const SID = '7d1f3c2a-5b6e-4f80-9a1b-2c3d4e5f6a7b';
 
 let child: ChildProcess | undefined;
 let root: string | undefined;
+let scratchUsed = false;
 afterEach(async () => {
   if (child && child.exitCode === null && child.signalCode === null) {
     const stopped = new Promise<void>(done => child!.once('exit', () => done()));
@@ -41,6 +47,8 @@ afterEach(async () => {
     await Promise.race([stopped, new Promise<void>(done => setTimeout(done, 5_000))]);
   }
   child = undefined;
+  if (root && scratchUsed) teardownScratchSession(SID, join(root, '.botmux', 'data'));
+  scratchUsed = false;
   if (root) rmSandboxScratch(root);
   root = undefined;
 });
@@ -92,9 +100,10 @@ exec sleep 600
   delete env.TMUX;
   delete env.TMUX_PANE;
   return {
-    home, sessions, workDir, report, fakePi,
+    home, dataDir, sessions, workDir, report, fakePi,
     ownDir: join(sessions, 'botmux', SID),
-    start(opts: { sandbox: boolean; resume?: boolean; reasoningEffort?: 'high' | 'xhigh'; botEnv?: Record<string, string> }) {
+    start(opts: { sandbox: boolean | 'scratch'; resume?: boolean; reasoningEffort?: 'high' | 'xhigh'; botEnv?: Record<string, string> }) {
+      scratchUsed ||= opts.sandbox === 'scratch';
       const logs: string[] = [];
       child = spawnNodeTsScript(resolve('src/worker.ts'), [], { env, stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
       child.stdout?.on('data', chunk => logs.push(String(chunk)));
@@ -107,7 +116,10 @@ exec sleep 600
         ...(opts.resume ? { resume: true, cliSessionId: SID } : {}),
         ...(opts.reasoningEffort ? { reasoningEffort: opts.reasoningEffort } : {}),
         ...(opts.botEnv ? { env: opts.botEnv } : {}),
-        ...(opts.sandbox ? { sandbox: 'oncall' } : {}),
+        ...(opts.sandbox ? {
+          sandbox: opts.sandbox === 'scratch' ? 'scratch' as const : 'oncall' as const,
+          ...(opts.sandbox === 'scratch' ? { scratchStorage } : {}),
+        } : {}),
       } satisfies DaemonToWorker);
       return logs;
     },
@@ -137,6 +149,29 @@ describe('Pi transcript dir under the allowlist file sandbox (real worker)', () 
     expect(existsSync(join(l.ownDir, `probe-${SID}.jsonl`))).toBe(true);
     expect(report.sibling).toBe('HIDDEN');
     expect(report.siblingOwn).toBe('HIDDEN');
+  }, 60_000);
+
+  it.skipIf(!bwrapRuntime)('uses the sandbox directory for both Pi and bridge reattachment with a custom profile', async () => {
+    const l = lab();
+    const logs = l.start({ sandbox: true, botEnv: { PI_CODING_AGENT_DIR: join(l.home, 'bot-profile') } });
+    await waitForWorkerMessage(child!, [], 'ready', logs, 30_000);
+    const report = await readReport(l.report, logs);
+    expect(report.argv).toContain(`--session-dir ${l.ownDir}`);
+    expect(piPreviousTranscriptDir(l.dataDir, SID)).toBe(l.ownDir);
+  }, 60_000);
+
+  it.skipIf(!scratchRuntime)('cold scratch preserves the previous host transcript directory record', async () => {
+    const l = lab();
+    const previousDir = join(l.workDir, 'project-records');
+    mkdirSync(join(l.workDir, '.pi'), { recursive: true });
+    writeFileSync(join(l.workDir, '.pi', 'settings.json'), JSON.stringify({ sessionDir: previousDir }));
+    piPersistentTranscriptDir(l.dataDir, SID, previousDir, false);
+
+    const logs = l.start({ sandbox: 'scratch' });
+    await waitForWorkerMessage(child!, [], 'ready', logs, 30_000);
+    // The scratch launch has no host profile directory. Its undefined bridge
+    // directory must not erase what a later oncall resume needs for adoption.
+    expect(piPreviousTranscriptDir(l.dataDir, SID)).toBe(previousDir);
   }, 60_000);
 
   it.skipIf(!bwrapRuntime || process.getuid?.() !== 0)('sandboxed, root worker: the bot\'s own TAR_OPTIONS reaches the CLI extended with --no-same-owner', async () => {

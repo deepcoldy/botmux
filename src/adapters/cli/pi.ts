@@ -326,7 +326,7 @@ export function readPiInstallVersion(bin: string): string | undefined {
 export const piBridgeSpec: StructuredBridgeSpec = {
   drain: (path, offset) => drainPiTranscript(path, offset),
   locate: {
-    bySessionId: (sessionId, cwd) => findPiTranscriptBySessionId(sessionId, cwd),
+    bySessionId: (sessionId, cwd, nativeDir) => findPiTranscriptBySessionId(sessionId, cwd, undefined, nativeDir),
     byPid: pid => findPiTranscriptByPid(pid)?.path,
   },
   spawn: { sessionId: 'cli-or-adapter', baseline: 'resume-aware' },

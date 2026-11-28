@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { FleetSupervisor, pidAlive } from './core/fleet-supervisor.js';
 import { withFileLock } from './utils/file-lock.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
-import { isLinuxZombie, readDurableProcessIdentity } from './utils/process-identity.js';
+import { isLinuxZombie, readFleetDurableProcessIdentity } from './utils/process-identity.js';
 import { scrubExternalMemberEnv } from './utils/child-env.js';
 import { installStdioEpipeGuard } from './utils/stdio-epipe-guard.js';
 import { moveSupervisorIntoFleetScope } from './core/fleet-scope.js';
@@ -48,10 +48,10 @@ async function reapOrphans(): Promise<void> {
   for (const proc of readPluginSupervisorState()?.procs ?? []) {
     const alive = () => pidAlive(proc.pid) && !isLinuxZombie(proc.pid);
     if (!alive()) continue;
-    const identity = readDurableProcessIdentity(proc.pid);
+    const identity = readFleetDurableProcessIdentity(proc.pid, proc.processStart);
     if (!proc.processStart || !identity) throw new Error(`plugin_supervisor_orphan_identity_unknown:${proc.name}:${proc.pid}`);
     if (identity !== proc.processStart) continue; // stale row, never signal a recycled PID
-    const same = () => readDurableProcessIdentity(proc.pid) === proc.processStart;
+    const same = () => readFleetDurableProcessIdentity(proc.pid, proc.processStart) === proc.processStart;
     try { process.kill(proc.pid, 'SIGTERM'); } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
     }
@@ -93,7 +93,7 @@ async function main(): Promise<void> {
     const watches = new Map<string, { fingerprint: string; changedAt?: number }>();
     let revision = '';
     const acknowledge = (value: string, error?: string) => atomicWriteFileSync(pluginSupervisorResultPath(), JSON.stringify({
-      revision: value, pid: process.pid, processStart: readDurableProcessIdentity(process.pid), ...(error ? { error } : {}),
+      revision: value, pid: process.pid, processStart: readFleetDurableProcessIdentity(process.pid), ...(error ? { error } : {}),
     }), { mode: 0o600, followTargetSymlink: false });
     acknowledge('');
     try {
