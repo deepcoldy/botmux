@@ -26,6 +26,8 @@ import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
 import type { CliId } from '../src/adapters/cli/types.js';
 import { classifyStuckPage, shouldHoldInputForHookReview, shouldHoldInputForStuckPage } from '../src/utils/stuck-detector.js';
 import { t } from '../src/i18n/index.js';
+import { TerminalRenderer } from '../src/utils/terminal-renderer.js';
+import { traexQuestionFlowVisible } from '../src/utils/traex-question-page.js';
 
 const fixture = (name: string) => readFileSync(new URL(`./fixtures/traex-question/${name}`, import.meta.url), 'utf8');
 const QUESTION = fixture('traex-0.214.1-single-160x50.txt');
@@ -213,6 +215,28 @@ describe('holding input off the question page', () => {
     h.scope.screen = COMPOSER;
     expect(h.fn('traexQuestionHoldBlocks')(COMPOSER)).toBe(false);
     expect(released).toBe(true);
+  });
+
+  it('never reconciles a PTY question from the asynchronous renderer fallback', async () => {
+    const renderer = new TerminalRenderer(160, 50);
+    try {
+      const h = harness('traex', { init: { backendType: 'pty' }, block: { kind: 'question' } });
+      h.scope.backend = {};
+      h.scope.renderer = renderer;
+      h.scope.captureBackendScreen = loadWorkerFunction('captureBackendScreen', h.scope);
+      const release = vi.fn(() => true);
+      h.scope.idleDetector.releaseStaleQuestionStatus = release;
+      await renderer.writeAndFlush(COMPOSER.replace(/\n/g, '\r\n'));
+      renderer.write(QUESTION.replace(/\n/g, '\r\n'));
+
+      expect(h.fn('traexQuestionBlockReported')()).toBe(true);
+      expect(release).not.toHaveBeenCalled();
+
+      await renderer.writeAndFlush('');
+      expect(traexQuestionFlowVisible(renderer.rawSnapshot({ preserveFormatting: true }))).toBe(true);
+      expect(h.fn('traexQuestionBlockReported')()).toBe(true);
+      expect(release).not.toHaveBeenCalled();
+    } finally { renderer.dispose(); }
   });
 
   it('tells the held message to answer on the card, once, for the held turn', () => {

@@ -2,8 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { TraexTurnCompletionTracker } from '../src/services/traex-turn-completion.js';
 import type { CodexBridgeEvent } from '../src/services/codex-transcript.js';
 
-const event = (kind: 'user' | 'assistant_final', turn: string, timestampMs: number, uuid = `${kind}:${turn}`): CodexBridgeEvent => ({
-  kind, uuid, sourceTurnId: turn, sourceSessionId: 'session', timestampMs, text: '',
+const event = (kind: 'user' | 'assistant_final' | 'turn_bind', turn: string | undefined, timestampMs: number, uuid = `${kind}:${turn}`): CodexBridgeEvent => ({
+  kind, uuid, ...(turn ? { sourceTurnId: turn } : {}), sourceSessionId: 'session', timestampMs, text: '',
 });
 
 describe('latest TRAE native turn completion', () => {
@@ -55,5 +55,34 @@ describe('latest TRAE native turn completion', () => {
     const tracker = new TraexTurnCompletionTracker();
     expect(tracker.observe([event('user', 'first', 1), event('assistant_final', 'first', 2), event('user', 'next', 3)], 1))
       .toEqual({ started: true, completed: false });
+  });
+
+  it('binds an id-less native user before accepting its final, even when bind and final share a raw line', () => {
+    const tracker = new TraexTurnCompletionTracker();
+    expect(tracker.observe([event('user', undefined, 1, 'legacy-user')], 1))
+      .toEqual({ started: true, completed: false });
+    const bind = { ...event('turn_bind', 'native-turn', 2, 'native-turn:bind'), rawId: 'terminal-line' };
+    const final = { ...event('assistant_final', 'native-turn', 2, 'native-turn:final'), rawId: 'terminal-line' };
+    expect(tracker.observe([bind, final], 1)).toEqual({ started: false, completed: true });
+    expect(tracker.observe([], 1)).toEqual({ started: false, completed: false });
+  });
+
+  it('completes reversed type-ahead finals only when the last open native turn closes', () => {
+    const tracker = new TraexTurnCompletionTracker();
+    tracker.observe([
+      event('user', undefined, 1, 'legacy-first'),
+      event('user', 'second', 2),
+      event('user', 'third', 3),
+    ], 1);
+    expect(tracker.observe([event('assistant_final', 'second', 4)], 1))
+      .toEqual({ started: false, completed: false });
+    expect(tracker.observe([event('assistant_final', 'third', 5)], 1))
+      .toEqual({ started: false, completed: false });
+    const bind = { ...event('turn_bind', 'first', 6, 'first:bind'), rawId: 'first-terminal-line' };
+    const firstFinal = { ...event('assistant_final', 'first', 6, 'first:final'), rawId: 'first-terminal-line' };
+    expect(tracker.observe([bind, firstFinal], 1)).toEqual({ started: false, completed: true });
+    expect(tracker.observe([], 1)).toEqual({ started: false, completed: false });
+    expect(tracker.observe([event('assistant_final', 'second', 7, 'replayed-second-final')], 1))
+      .toEqual({ started: false, completed: false });
   });
 });

@@ -307,15 +307,17 @@ const TRAEX_ACTIVE_BUSY_PATTERN = new RegExp(
  * flow and the native send-after-tool-call panel before clearing quarantine. */
 export function traexScreenShowsNoPendingInput(screen: string): boolean {
   const clean = stripAnsiScreenText(screen);
-  if (!traexRestoredComposerReady(clean) || traexQuestionFlowVisible(clean) || traexPendingAsyncQuestionVisible(clean)
+  if (!traexRestoredComposerReady(clean, { requireThreadReady: true })
+    || traexQuestionFlowVisible(clean) || traexPendingAsyncQuestionVisible(clean)
     || TRAEX_ACTIVE_BUSY_PATTERN.test(traexCurrentActivityRows(clean).join('\n'))) return false;
   const rows = clean.trimEnd().split(/\r?\n/);
   let composer = rows.length - 1;
   while (composer >= 0 && !/^[›❯](?:[ \t]|$)/.test(rows[composer]!)) composer--;
-  if (!rows.slice(composer + 1).some(row => /\bContext (?:\d+% (?:left|used)|[—–-])(?:[ \t]|$)/.test(row))) return false;
   for (let index = composer - 1; index >= 0; index--) {
     const row = rows[index]!;
-    if (/^Send after tool call[ \t]+[·•][ \t]+esc to interrupt and send[ \t]+[·•][ \t]+↑ to edit[ \t]*$/.test(row)) return false;
+    // Narrow panes wrap the native panel header. Recognizable fragments must
+    // fail closed; an unrelated row merely ends the panel-owned region.
+    if (/^(?:Send after\b|and send\b)|\besc to interrupt and send\b|↑ to edit[ \t]*$/.test(row)) return false;
     if (/^[›❯](?:[ \t]|$)/.test(row)) continue;
     if (!/^[ \t]*$|^[ \t]*─+[ \t]*$|^ {2}\S/.test(row)) break;
   }

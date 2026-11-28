@@ -10,6 +10,7 @@
  */
 import { describe, expect, it, vi } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 
 function bridge(events: Array<{ kind: string }>) {
   const fireIdle = vi.fn();
@@ -90,12 +91,15 @@ describe('structured bridge final → idle signal', () => {
 });
 
 describe('TRAE native turn completion → transcript terminal evidence', () => {
-  const nativeEvent = (kind: 'user' | 'assistant_final', turn: string, timestampMs: number) => ({
+  const nativeEvent = (kind: 'user' | 'assistant_final', turn: string, timestampMs: number, text = '') => ({
     kind, uuid: `${turn}:${kind}:${timestampMs}`, sourceTurnId: turn,
-    sourceSessionId: 'session', timestampMs, text: '',
+    sourceSessionId: 'session', timestampMs, text,
   });
 
-  function traexIngest(peek: () => Array<{ started: boolean; finalText: string | undefined }>) {
+  function traexIngest(queue: {
+    peek: () => ReadonlyArray<{ started: boolean; finalText: string | undefined }>;
+    ingest?: CodexBridgeQueue['ingest'];
+  }, emit: () => void = () => {}) {
     const noteTerminal = vi.fn();
     const noteStarted = vi.fn();
     let drain: Array<ReturnType<typeof nativeEvent>> = [];
@@ -116,12 +120,15 @@ describe('TRAE native turn completion → transcript terminal evidence', () => {
       lastStructuredBridgeActivityAtMs: 0,
       backend: {},
       OrcaBackend: class {},
-      codexBridgeQueue: { ingest() {}, peek },
+      codexBridgeQueue: {
+        ingest(events: Parameters<CodexBridgeQueue['ingest']>[0]) { queue.ingest?.(events); },
+        peek: () => queue.peek(),
+      },
       observeStructuredBackgroundTasks() {},
       cliAdapter: { postTerminalPromptFence: false },
       noteSpawnArgvTurnStartTranscriptEvidence() {},
       pruneExpiredStructuredHeadsAndEmit() {},
-      emitReadyCodexTurns() {},
+      emitReadyCodexTurns: emit,
       idleDetector: { fireIdle: vi.fn(), noteTranscriptTerminal: noteTerminal, noteTranscriptTurnStarted: noteStarted },
       cliSpawnGeneration: 1,
       cliRestartInProgress: false,
@@ -134,16 +141,29 @@ describe('TRAE native turn completion → transcript terminal evidence', () => {
     };
   }
 
-  it('withholds transcript terminal while a queued turn is still open, then records it once the queue drains', () => {
-    const openTurn = { started: true, finalText: undefined as string | undefined };
-    let queued: Array<{ started: boolean; finalText: string | undefined }> = [openTurn];
-    const run = traexIngest(() => queued);
-    run.feed([nativeEvent('user', 'turn-1', 1), nativeEvent('assistant_final', 'turn-1', 2)]);
-    expect(run.noteStarted).toHaveBeenCalledTimes(1);
+  it('records reversed finals when the last open queued turn settles, without another native turn', () => {
+    const queue = new CodexBridgeQueue(() => 0);
+    queue.mark('d1', 'first', 0);
+    queue.mark('d2', 'second', 0);
+    queue.mark('d3', 'third', 0);
+    const run = traexIngest(queue, () => { queue.drainEmittable(); });
+    run.feed([
+      nativeEvent('user', 'turn-1', 1, 'first'),
+      nativeEvent('user', 'turn-2', 2, 'second'),
+      nativeEvent('user', 'turn-3', 3, 'third'),
+    ]);
+    run.feed([nativeEvent('assistant_final', 'turn-2', 4, 'answer-2')]);
+    run.feed([nativeEvent('assistant_final', 'turn-3', 5, 'answer-3')]);
     expect(run.noteTerminal).not.toHaveBeenCalled();
+    expect(queue.peek().map(turn => [turn.turnId, turn.finalText !== undefined])).toEqual([
+      ['d1', false], ['d2', true], ['d3', true],
+    ]);
 
-    queued = [];
-    run.feed([nativeEvent('user', 'turn-2', 3), nativeEvent('assistant_final', 'turn-2', 4)]);
+    run.feed([nativeEvent('assistant_final', 'turn-1', 6, 'answer-1')]);
+    expect(queue.peek()).toEqual([]);
+    expect(run.noteTerminal).toHaveBeenCalledTimes(1);
+
+    run.feed([]);
     expect(run.noteTerminal).toHaveBeenCalledTimes(1);
   });
 });

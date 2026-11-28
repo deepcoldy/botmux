@@ -26061,10 +26061,12 @@ function traexQuestionBridgeActive(): boolean {
  *  input until the page itself is on screen to be read. */
 function traexQuestionBlockReported(): boolean {
   if (idleDetector?.programStatusBlock()?.kind !== 'question') return false;
-  if (traexQuestionBridgeActive() && backend && cliAdapter?.screenShowsNoPendingInput) {
+  if (traexQuestionBridgeActive() && backend && cliAdapter?.screenShowsNoPendingInput
+    && (backend.captureViewport || backend.captureCurrentScreen)) {
     try {
-      // Cached composer frames can precede the question's render. Only the
-      // current pane plus this cycle's exact terminal may retire its signal.
+      // Cached composer frames can precede the question's render. Only a
+      // backend-native current capture may retire its signal: PTY's renderer
+      // fallback parses asynchronously and this synchronous path cannot settle it.
       const screen = captureBackendScreen(backend, { preserveFormatting: true });
       if (cliAdapter.screenShowsNoPendingInput(screen)
         && idleDetector.releaseStaleQuestionStatus?.()) {

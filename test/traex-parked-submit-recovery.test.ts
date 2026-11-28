@@ -135,6 +135,54 @@ describe('unconfirmed input that left the TRAE composer', () => {
     }
   });
 
+  it('keeps a wrapped native pending-input panel through the real narrow PTY renderer', async () => {
+    const empty = '❯ Use /skills to list available skills\n  m · Context 99% left\n  ? for shortcuts';
+    expect(traexScreenShowsNoPendingInput(empty)).toBe(true);
+    const pending = `Send after tool call · esc to interrupt and send · ↑ to edit\n❯ original input\n${Array(25).fill('  continued native input').join('\n')}\n${empty}`;
+    const renderer = new TerminalRenderer(40, 50);
+    try {
+      await renderer.writeAndFlush(pending.replace(/\n/g, '\r\n'));
+      const screen = renderer.rawSnapshot({ preserveFormatting: true });
+      expect(screen).toContain('Send after tool call');
+      expect(traexScreenShowsNoPendingInput(screen)).toBe(false);
+    } finally { renderer.dispose(); }
+  });
+
+  it.each([
+    ['truncated model/cwd row', [
+      '──────────────────────────────────────────────────────────',
+      '❯ Ask TRAE CLI to do anything',
+      '──────────────────────────────────────────────────────────',
+      '  GPT-6.1-Sol · /tmp/repo/very-long-directory-name-component-0123456789/very-long-directory-name-compo…',
+      '  ? for shortcuts',
+    ].join('\n')],
+    ['initialized hint-only footer', [
+      '  █ ◆ ◆ █  TRAE CLI (v0.214.1)',
+      '  Tip: status_line=[] keeps this initialized composer on the native hint footer',
+      '──────────────────────────────────────────────────────────',
+      '❯ Ask TRAE CLI to do anything',
+      '──────────────────────────────────────────────────────────',
+      '  ? for shortcuts',
+    ].join('\n')],
+  ])('accepts the strictly initialized empty composer: %s', (_name, screen) => {
+    expect(traexRestoredComposerReady(screen, { requireThreadReady: true })).toBe(true);
+    expect(traexScreenShowsNoPendingInput(screen)).toBe(true);
+  });
+
+  it('still rejects a provisional shortcut-only composer without initialized content', () => {
+    const screen = [
+      '  █ ◆ ◆ █  TRAE CLI (v0.214.1)',
+      '  /tmp/traex0214/work',
+      '──────────────────────────────────────────────────────────',
+      '❯ Ask TRAE CLI to do anything',
+      '──────────────────────────────────────────────────────────',
+      '  ? for shortcuts',
+    ].join('\n');
+    expect(traexRestoredComposerReady(screen)).toBe(true);
+    expect(traexRestoredComposerReady(screen, { requireThreadReady: true })).toBe(false);
+    expect(traexScreenShowsNoPendingInput(screen)).toBe(false);
+  });
+
   it('releases an ordinary submit after two empty screens without resending the original', async () => {
     const h = fixture({ acceptsRescue: false, screen: composer('Use /skills to list available skills') });
     h.start();
