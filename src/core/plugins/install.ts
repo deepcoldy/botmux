@@ -26,10 +26,34 @@ import type { PluginMcpServer } from './types.js';
 import { createHash } from 'node:crypto';
 import { assertPluginMutationGuard, type PluginMutationGuard } from './mutation-guard.js';
 import { prepareInstalledPlugin } from './prerequisites.js';
+import {
+  computeSha256Hex,
+  computeSha512Integrity,
+  downloadGithubReleaseAssetToFile,
+  GithubReleaseError,
+  isGithubReleaseSpec,
+  parseGithubReleaseSpec,
+  resolveGithubReleaseAsset,
+  SRI_SHA512_RE,
+  type GithubReleaseClientOptions,
+} from './github-release.js';
+import { extractPluginTgz } from './tar-archive.js';
 
 export interface InstallPluginOptions {
-  source?: 'auto' | 'npm' | 'local';
+  source?: 'auto' | 'npm' | 'local' | 'github-release';
   link?: boolean;
+  guard?: PluginMutationGuard;
+  assetPattern?: string;
+  githubRelease?: GithubReleaseClientOptions;
+}
+
+export interface InstallGithubReleaseArchiveOptions {
+  repo: string;
+  tag: string;
+  asset: string;
+  integrity: string;
+  expectedSha256?: string;
+  expectedVersion?: string;
   guard?: PluginMutationGuard;
 }
 
@@ -211,7 +235,7 @@ function cleanupRetiredPluginHomes(pluginId: string, stagedDir: string, sourceDi
         // Linked runtimes can depend on intermediate symlinks, not only their realpath.
         if (record.source.link) return;
         sourcePaths.push(record.source.spec, join(record.source.spec, 'dist'));
-      } else if (record.source?.type !== 'npm') return;
+      } else if (record.source?.type !== 'npm' && record.source?.type !== 'github-release') return;
     }
     const sources = sourcePaths.map(path => realpathSync(path));
     for (const entry of candidates) {
@@ -324,8 +348,139 @@ export function installNpmPlugin(spec: string, opts: InstallPluginOptions = {}):
   }
 }
 
-export function installPlugin(spec: string, opts: InstallPluginOptions = {}): InstallPluginResult {
+export function installGithubReleaseArchive(
+  archivePath: string,
+  opts: InstallGithubReleaseArchiveOptions,
+): InstallPluginResult {
+  if (!SRI_SHA512_RE.test(opts.integrity)) {
+    throw new Error('plugin_confirmed_integrity_invalid');
+  }
+  if (opts.guard) {
+    if (!opts.guard.integrity || opts.guard.integrity !== opts.integrity) {
+      throw new Error('plugin_confirmed_archive_mismatch');
+    }
+    if (
+      opts.guard.source
+      && (
+        opts.guard.source.repo !== opts.repo
+        || opts.guard.source.tag !== opts.tag
+        || opts.guard.source.asset !== opts.asset
+      )
+    ) {
+      throw new Error('plugin_confirmed_source_mismatch');
+    }
+  }
+
+  const bytes = readFileSync(archivePath);
+  if (computeSha512Integrity(bytes) !== opts.integrity) {
+    throw new Error('plugin_confirmed_archive_mismatch');
+  }
+  if (opts.expectedSha256 && computeSha256Hex(bytes) !== opts.expectedSha256.toLowerCase()) {
+    throw new Error('plugin_confirmed_archive_sha256_mismatch');
+  }
+
+  mkdirSync(pluginsHome(), { recursive: true });
+  const tmpRoot = join(pluginsHome(), `.install-gh-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+  rmSync(tmpRoot, { recursive: true, force: true });
+  mkdirSync(tmpRoot, { recursive: true });
+  try {
+    const tmpPackageDir = extractPluginTgz(bytes, tmpRoot);
+    const pkg = readPackageManifest(tmpPackageDir);
+    if (
+      opts.guard
+      && (pkg.botmux.id !== opts.guard.id || pkg.name !== opts.guard.packageName || pkg.version !== opts.guard.version)
+    ) {
+      throw new Error('plugin_confirmed_manifest_mismatch');
+    }
+    if (opts.expectedVersion && pkg.version !== opts.expectedVersion) {
+      throw new GithubReleaseError(
+        'manifest_mismatch',
+        `plugin_github_release_version_mismatch:${pkg.version}!==${opts.expectedVersion}`,
+      );
+    }
+    const tmpRuntimeDir = requireRuntimeDir(tmpPackageDir);
+    const stagedRecord = makeRecord(pkg, {
+      type: 'github-release',
+      repo: opts.repo,
+      tag: opts.tag,
+      asset: opts.asset,
+      integrity: opts.integrity,
+    }, tmpRuntimeDir);
+    stagedRecord.record.integrity = opts.integrity;
+    const stagedDir = stageRuntime(pkg.botmux.id, tmpRuntimeDir, false);
+    try {
+      return withPluginServiceLockSync(() => {
+        const cleanupAllowed = isPluginRegistryCompleteForCleanup();
+        if (opts.guard) assertPluginMutationGuard(opts.guard, readPluginRegistry().plugins[opts.guard.id], stagedRecord.record);
+        assertExistingPluginServiceStopped(pkg.botmux.id);
+        if (cleanupAllowed) cleanupRetiredPluginHomes(pkg.botmux.id, stagedDir);
+        if (opts.guard) assertPluginMutationGuard(opts.guard, readPluginRegistry().plugins[opts.guard.id], stagedRecord.record);
+        ensurePluginStateFiles(pkg.botmux.id);
+        return commitPluginInstall(stagedRecord, stagedDir);
+      });
+    } finally {
+      rmSync(stagedDir, { recursive: true, force: true });
+    }
+  } finally {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  }
+}
+
+export async function installGithubReleasePlugin(
+  spec: string,
+  opts: InstallPluginOptions = {},
+): Promise<InstallPluginResult> {
+  if (opts.link) throw new Error('plugin_github_release_link_not_supported');
+  const parsed = parseGithubReleaseSpec(spec);
+  const resolved = await resolveGithubReleaseAsset(
+    { repo: parsed.repo, tag: parsed.tag, assetPattern: opts.assetPattern },
+    opts.githubRelease,
+  );
+  mkdirSync(pluginsHome(), { recursive: true });
+  const tmpDownloadDir = join(
+    pluginsHome(),
+    `.download-gh-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+  );
+  rmSync(tmpDownloadDir, { recursive: true, force: true });
+  mkdirSync(tmpDownloadDir, { recursive: true });
+  try {
+    const archivePath = join(tmpDownloadDir, resolved.asset);
+    await downloadGithubReleaseAssetToFile(resolved.downloadUrl, archivePath, {
+      ...opts.githubRelease,
+      expectedIntegrity: resolved.integrity,
+      expectedSha256: resolved.expectedSha256,
+    });
+    return installGithubReleaseArchive(archivePath, {
+      repo: resolved.repo,
+      tag: resolved.tag,
+      asset: resolved.asset,
+      integrity: resolved.integrity,
+      expectedSha256: resolved.expectedSha256,
+      expectedVersion: resolved.version,
+      guard: opts.guard,
+    });
+  } finally {
+    rmSync(tmpDownloadDir, { recursive: true, force: true });
+  }
+}
+
+export async function installPlugin(spec: string, opts: InstallPluginOptions = {}): Promise<InstallPluginResult> {
+  if (opts.guard?.source?.type === 'github-release') {
+    if (!spec.startsWith('file:')) throw new Error('plugin_confirmed_archive_required');
+    if (!opts.guard.integrity) throw new Error('plugin_confirmed_integrity_required');
+    return installGithubReleaseArchive(spec.slice(5), {
+      repo: opts.guard.source.repo,
+      tag: opts.guard.source.tag,
+      asset: opts.guard.source.asset,
+      integrity: opts.guard.integrity,
+      expectedVersion: opts.guard.version,
+      guard: opts.guard,
+    });
+  }
   const source = opts.source ?? 'auto';
+  if (source === 'github-release' || (source === 'auto' && isGithubReleaseSpec(spec))) {
+    return installGithubReleasePlugin(spec, opts);
+  }
   if (source === 'local' || (source === 'auto' && isLocalSpec(spec))) return installLocalPlugin(spec, opts);
   return installNpmPlugin(spec, opts);
 }

@@ -11,6 +11,18 @@ import { parsePluginPackageManifest } from '../core/plugins/manifest.js';
 import { assertPluginServiceStopped } from '../core/plugins/service-manager.js';
 import { getInstalledPlugin } from '../services/plugin-registry-store.js';
 import { pluginRecordHash, pluginRegistryRevision, type PluginMutationGuard } from '../core/plugins/mutation-guard.js';
+import {
+  assertAllowedGithubReleaseUrl,
+  computeSha256Hex,
+  downloadGithubReleaseAssetToFile,
+  GITHUB_REPO_RE,
+  GithubReleaseError,
+  resolveGithubReleaseAsset,
+  SHA256_HEX_RE,
+  SRI_SHA512_RE,
+  type GithubReleaseClientOptions,
+} from '../core/plugins/github-release.js';
+import { readPackageManifestFromTgz } from '../core/plugins/tar-archive.js';
 
 const CATALOG_URL = 'https://raw.githubusercontent.com/botmux-ai/plugin-market/main/index.json';
 const REGISTRY = '--registry=https://registry.npmjs.org/';
@@ -18,19 +30,44 @@ const packageName = z.string().max(214).regex(/^(?:@[a-z0-9._-]+\/)?[a-z0-9][a-z
 const pluginId = z.string().regex(/^[a-z][a-z0-9._-]{0,63}$/);
 const version = z.string().regex(/^\d+\.\d+\.\d+(?:-[a-z0-9.-]+)?(?:\+[a-z0-9.-]+)?$/i);
 const httpsUrl = z.string().url().refine(value => new URL(value).protocol === 'https:');
+const githubRepo = z.string().regex(GITHUB_REPO_RE).refine(value => {
+  const repo = value.split('/')[1];
+  return repo !== '.' && repo !== '..';
+});
+const assetPattern = z.string().min(1).max(128)
+  .regex(/^[A-Za-z0-9._@*?+-]+$/)
+  .refine(value => !value.includes('..'));
+const distributionSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('npm') }),
+  z.object({
+    type: z.literal('github-release'),
+    repo: githubRepo,
+    assetPattern: assetPattern.optional(),
+  }),
+]);
 const entrySchema = z.object({
   id: pluginId, package: packageName, displayName: z.string().min(1).max(120),
   description: z.string().max(1000), repo: httpsUrl, docs: httpsUrl.optional(),
   categories: z.array(z.string().regex(/^[a-z][a-z0-9-]{0,31}$/)).max(12),
   compatibility: z.object({ botmux: z.string().max(100) }),
+  official: z.boolean().optional(),
+  distribution: distributionSchema.optional(),
 });
+export type PluginMarketDistribution = z.infer<typeof distributionSchema>;
 export type PluginMarketEntry = z.infer<typeof entrySchema>;
+export type PluginInstallSourceType = 'npm' | 'github-release';
 export interface PluginInstallPlan {
   nonce: string;
   id: string;
   packageName: string;
   version: string;
   integrity: string;
+  sourceType?: PluginInstallSourceType;
+  downloadUrl?: string;
+  releaseRepo?: string;
+  releaseTag?: string;
+  releaseAsset?: string;
+  expectedSha256?: string;
   expiresAt: number;
   expectedState: string | null;
   expectedRevision: string;
@@ -38,9 +75,19 @@ export interface PluginInstallPlan {
 }
 interface PendingPlan extends PluginInstallPlan { principal: string }
 export interface MarketInstalledPlugin { id: string; packageName: string; version: string }
+export interface GithubReleasePlanMetadata {
+  version: string;
+  integrity: string;
+  downloadUrl: string;
+  releaseTag: string;
+  releaseRepo: string;
+  releaseAsset: string;
+  expectedSha256?: string;
+}
 export interface PluginMarketDependencies {
   fetchCatalog(): Promise<unknown>;
   metadata(packageName: string): Promise<{ version: string; integrity: string }>;
+  resolveGithubRelease?(target: { repo: string; assetPattern?: string }): Promise<GithubReleasePlanMetadata>;
   installed(id: string): MarketInstalledPlugin | undefined;
   assertStopped(id: string): void;
   isEnabled(id: string): boolean;
@@ -107,15 +154,60 @@ export function createPluginMarket(deps: PluginMarketDependencies) {
     const expectedState = pluginRecordHash(deps.installed(entry.id));
     const expectedRevision = deps.revision();
     if (deps.installed(entry.id)) stopped(entry.id);
-    const metadata = await deps.metadata(entry.package);
-    if (!version.safeParse(metadata.version).success || !/^sha512-[A-Za-z0-9+/]{86}==$/.test(metadata.integrity)) {
-      throw new PluginMarketError(502, '无法核验软件包版本或完整性');
+
+    let planFields: Omit<PendingPlan, 'nonce' | 'id' | 'packageName' | 'expiresAt' | 'principal' | 'expectedState' | 'expectedRevision'>;
+    if (entry.distribution?.type === 'github-release') {
+      if (!deps.resolveGithubRelease) {
+        throw new PluginMarketError(502, '当前市场不支持 GitHub Release 安装源');
+      }
+      const release = await deps.resolveGithubRelease({
+        repo: entry.distribution.repo,
+        assetPattern: entry.distribution.assetPattern,
+      });
+      if (
+        !version.safeParse(release.version).success
+        || !SRI_SHA512_RE.test(release.integrity)
+        || release.releaseRepo !== entry.distribution.repo
+        || typeof release.releaseTag !== 'string' || !release.releaseTag.trim()
+        || typeof release.releaseAsset !== 'string'
+        || basename(release.releaseAsset) !== release.releaseAsset
+        || !release.releaseAsset.endsWith('.tgz')
+        || (release.expectedSha256 !== undefined && !SHA256_HEX_RE.test(release.expectedSha256))
+      ) {
+        throw new PluginMarketError(502, '无法核验 GitHub Release 版本或完整性');
+      }
+      let safeDownloadUrl: string;
+      try {
+        safeDownloadUrl = assertAllowedGithubReleaseUrl(release.downloadUrl).toString();
+      } catch {
+        throw new PluginMarketError(502, 'GitHub Release 下载地址不在允许的安全白名单内，已拒绝');
+      }
+      planFields = {
+        version: release.version,
+        integrity: release.integrity,
+        sourceType: 'github-release',
+        downloadUrl: safeDownloadUrl,
+        releaseRepo: release.releaseRepo,
+        releaseTag: release.releaseTag,
+        releaseAsset: release.releaseAsset,
+        ...(release.expectedSha256 ? { expectedSha256: release.expectedSha256.toLowerCase() } : {}),
+      };
+    } else {
+      const metadata = await deps.metadata(entry.package);
+      if (!version.safeParse(metadata.version).success || !SRI_SHA512_RE.test(metadata.integrity)) {
+        throw new PluginMarketError(502, '无法核验软件包版本或完整性');
+      }
+      planFields = {
+        version: metadata.version,
+        integrity: metadata.integrity,
+        sourceType: 'npm',
+      };
     }
     prune();
     if (plans.size >= 100) throw new PluginMarketError(429, '待确认的安装过多，请稍后重试');
     const plan: PendingPlan = {
       nonce: randomUUID(), id: entry.id, packageName: entry.package,
-      version: metadata.version, integrity: metadata.integrity,
+      ...planFields,
       expiresAt: deps.now() + 300_000, principal,
       expectedState, expectedRevision,
     };
@@ -188,12 +280,54 @@ async function runCli(args: string[]) {
 export function verifyPluginArchive(bytes: Uint8Array, manifest: unknown, plan: PluginInstallPlan): void {
   const integrity = `sha512-${createHash('sha512').update(bytes).digest('base64')}`;
   if (integrity !== plan.integrity) throw new PluginMarketError(409, '软件包完整性与确认版本不一致，已取消安装');
+  if (plan.expectedSha256 && computeSha256Hex(bytes) !== plan.expectedSha256.toLowerCase()) {
+    throw new PluginMarketError(409, '软件包完整性与确认版本不一致，已取消安装');
+  }
   const pkg = parsePluginPackageManifest(manifest);
   if (pkg.name !== plan.packageName || pkg.version !== plan.version || pkg.botmux.id !== plan.id) {
     throw new PluginMarketError(409, '软件包声明与目录不一致，已取消安装');
   }
 }
-export function createHostPluginMarket(isEnabled: (id: string) => boolean) {
+
+function mapGithubReleaseMarketError(error: unknown): PluginMarketError {
+  if (error instanceof PluginMarketError) return error;
+  if (!(error instanceof GithubReleaseError)) {
+    return new PluginMarketError(502, '无法从 GitHub Release 获取插件元数据或安装包');
+  }
+  switch (error.code) {
+    case 'rate_limited':
+      return new PluginMarketError(429, 'GitHub API 请求频率受限，可配置 GITHUB_TOKEN 或登录 gh auth 后重试');
+    case 'disallowed_url':
+    case 'invalid_redirect':
+    case 'too_many_redirects':
+      return new PluginMarketError(502, 'GitHub Release 下载地址不在允许的安全白名单内，已拒绝');
+    case 'asset_too_large':
+      return new PluginMarketError(502, 'GitHub Release 插件包体积超出 50 MiB 上限，已拒绝');
+    case 'integrity_asset_not_found':
+    case 'invalid_integrity_file':
+      return new PluginMarketError(502, 'GitHub Release 缺少有效的完整性校验文件 (.tgz.sha512)，已拒绝安装');
+    case 'integrity_mismatch':
+    case 'sha256_mismatch':
+      return new PluginMarketError(409, '软件包完整性与确认版本不一致，已取消安装');
+    case 'manifest_mismatch':
+      return new PluginMarketError(409, '软件包声明与目录不一致，已取消安装');
+    case 'timeout':
+      return new PluginMarketError(504, '连接 GitHub Release 超时，请检查网络或代理设置后重试');
+    case 'http_error':
+      if (error.statusCode === 404) return new PluginMarketError(404, 'GitHub Release 中未找到此插件的正式发布版本');
+      return new PluginMarketError(502, '无法从 GitHub Release 获取插件元数据或安装包');
+    default:
+      return new PluginMarketError(502, 'GitHub Release 缺少可核验的正式插件包');
+  }
+}
+
+export interface HostPluginMarketOptions {
+  githubRelease?: GithubReleaseClientOptions;
+  runCli?: (args: string[]) => Promise<void>;
+}
+
+export function createHostPluginMarket(isEnabled: (id: string) => boolean, options: HostPluginMarketOptions = {}) {
+  const execCli = options.runCli ?? runCli;
   return createPluginMarket({
     now: Date.now, revision: pluginRegistryRevision, installed: getInstalledPlugin, isEnabled,
     assertStopped: id => assertPluginServiceStopped(id, 'update'),
@@ -209,9 +343,82 @@ export function createHostPluginMarket(isEnabled: (id: string) => boolean) {
       const value = JSON.parse(stdout);
       return { version: value.version, integrity: value['dist.integrity'] };
     },
+    async resolveGithubRelease(target) {
+      try {
+        const resolved = await resolveGithubReleaseAsset(
+          { repo: target.repo, assetPattern: target.assetPattern },
+          options.githubRelease,
+        );
+        if (!resolved.version) {
+          throw new PluginMarketError(502, '无法从 GitHub Release 核验语义化版本号');
+        }
+        return {
+          version: resolved.version,
+          integrity: resolved.integrity,
+          downloadUrl: resolved.downloadUrl,
+          releaseTag: resolved.tag,
+          releaseRepo: resolved.repo,
+          releaseAsset: resolved.asset,
+          ...(resolved.expectedSha256 ? { expectedSha256: resolved.expectedSha256 } : {}),
+        };
+      } catch (error) {
+        throw mapGithubReleaseMarketError(error);
+      }
+    },
     async install(plan) {
       const dir = await mkdtemp(join(tmpdir(), 'botmux-market-'));
       try {
+        if (plan.sourceType === 'github-release') {
+          if (!plan.downloadUrl || !plan.releaseRepo || !plan.releaseTag || !plan.releaseAsset) {
+            throw new PluginMarketError(409, '安装计划缺少有效的 GitHub Release 下载信息');
+          }
+          let safeDownloadUrl: string;
+          try {
+            safeDownloadUrl = assertAllowedGithubReleaseUrl(plan.downloadUrl).toString();
+          } catch (error) {
+            throw mapGithubReleaseMarketError(error);
+          }
+          const filename = basename(plan.releaseAsset);
+          if (filename !== plan.releaseAsset || !filename.endsWith('.tgz')) {
+            throw new PluginMarketError(502, '下载的软件包格式无效');
+          }
+          const archive = join(dir, filename);
+          try {
+            await downloadGithubReleaseAssetToFile(safeDownloadUrl, archive, {
+              ...options.githubRelease,
+              expectedIntegrity: plan.integrity,
+              expectedSha256: plan.expectedSha256,
+            });
+          } catch (error) {
+            throw mapGithubReleaseMarketError(error);
+          }
+          const bytes = await readFile(archive);
+          if (`sha512-${createHash('sha512').update(bytes).digest('base64')}` !== plan.integrity) {
+            throw new PluginMarketError(409, '软件包完整性与确认版本不一致，已取消安装');
+          }
+          let manifest: unknown;
+          try {
+            manifest = readPackageManifestFromTgz(bytes);
+          } catch {
+            throw new PluginMarketError(409, '软件包声明无效，已取消安装');
+          }
+          verifyPluginArchive(bytes, manifest, plan);
+          const current = getInstalledPlugin(plan.id);
+          if (current && current.packageName !== plan.packageName) throw new PluginMarketError(409, '已安装软件包发生变化，已取消安装');
+          const guard: PluginMutationGuard = {
+            id: plan.id, packageName: plan.packageName, version: plan.version,
+            expectedState: plan.expectedState, integrity: plan.integrity, authorityDigest: plan.authorityDigest,
+            expectedRevision: plan.expectedRevision,
+            source: {
+              type: 'github-release',
+              repo: plan.releaseRepo,
+              tag: plan.releaseTag,
+              asset: plan.releaseAsset,
+            },
+          };
+          await execCli(['plugin', 'install-verified', `file:${archive}`, '--guard-json', JSON.stringify(guard)]);
+          return;
+        }
         const { stdout } = await run('npm', [
           'pack', `${plan.packageName}@${plan.version}`, '--ignore-scripts', '--json', '--pack-destination', dir, REGISTRY,
         ]);
@@ -233,9 +440,9 @@ export function createHostPluginMarket(isEnabled: (id: string) => boolean) {
           expectedState: plan.expectedState, integrity: plan.integrity, authorityDigest: plan.authorityDigest,
           expectedRevision: plan.expectedRevision,
         };
-        await runCli(['plugin', 'install-verified', `file:${archive}`, '--guard-json', JSON.stringify(guard)]);
+        await execCli(['plugin', 'install-verified', `file:${archive}`, '--guard-json', JSON.stringify(guard)]);
       } finally { await rm(dir, { recursive: true, force: true }); }
     },
-    async uninstall(guard) { await runCli(['plugin', 'uninstall-verified', guard.id, '--guard-json', JSON.stringify(guard)]); },
+    async uninstall(guard) { await execCli(['plugin', 'uninstall-verified', guard.id, '--guard-json', JSON.stringify(guard)]); },
   });
 }

@@ -81,7 +81,15 @@ interface ManagedPlugin {
   id: string;
   packageName: string;
   version: string;
-  source?: { type?: string; spec?: string };
+  source?: {
+    type?: 'npm' | 'local' | 'github-release' | string;
+    spec?: string;
+    link?: boolean;
+    repo?: string;
+    tag?: string;
+    asset?: string;
+    integrity?: string;
+  };
   stateHash?: string;
   displayName?: string;
   description?: string;
@@ -124,6 +132,12 @@ interface PluginManagementPayload {
 interface PluginFeedback {
   title: string;
   message: string;
+}
+
+interface PluginNotice {
+  message: string;
+  pluginId?: string;
+  dashboardRoute?: string;
 }
 
 type PluginServiceAction = 'start' | 'stop' | 'restart';
@@ -303,8 +317,43 @@ function serviceLabel(report?: PluginServiceReport): string {
   return report.status || report.action;
 }
 
-function installedLocally(plugin: ManagedPlugin): boolean {
-  return plugin.source?.type === 'local' || plugin.source?.spec?.startsWith('file:') === true;
+export type InstalledPluginSourceKind = 'local' | 'npm' | 'github-release';
+
+export function classifyInstalledPluginSource(plugin: Pick<ManagedPlugin, 'source'>): InstalledPluginSourceKind {
+  if (plugin.source?.type === 'github-release') return 'github-release';
+  if (plugin.source?.type === 'local' || plugin.source?.spec?.startsWith('file:') === true) return 'local';
+  return 'npm';
+}
+
+export function installedPluginSourceLabel(plugin: Pick<ManagedPlugin, 'source'>): string {
+  const kind = classifyInstalledPluginSource(plugin);
+  if (kind === 'local') return '本地安装';
+  if (kind === 'github-release') {
+    if (plugin.source?.repo && plugin.source?.tag) {
+      return `GitHub Release (${plugin.source.repo}@${plugin.source.tag})`;
+    }
+    return 'GitHub Release';
+  }
+  return 'npm 安装';
+}
+
+export function isOfficialMarketPlugin(entry: Pick<PluginMarketEntry, 'official' | 'package'>): boolean {
+  return entry.official === true || entry.package.startsWith('@botmux-ai/');
+}
+
+export function marketEntrySourceLabel(entry: Pick<PluginMarketEntry, 'distribution'>): string {
+  return entry.distribution?.type === 'github-release' ? 'GitHub Release' : 'npm';
+}
+
+export function installPlanSourceLabel(
+  plan: Pick<PluginInstallPlan, 'sourceType' | 'releaseRepo' | 'releaseTag'>,
+): string {
+  if (plan.sourceType === 'github-release') {
+    if (plan.releaseRepo && plan.releaseTag) return `GitHub Release (${plan.releaseRepo}@${plan.releaseTag})`;
+    if (plan.releaseTag) return `GitHub Release (${plan.releaseTag})`;
+    return 'GitHub Release';
+  }
+  return 'npm';
 }
 
 function serviceDisplayLabel(report?: PluginServiceReport): string {
@@ -738,6 +787,8 @@ function PluginCard(props: {
   pendingToggles: PendingToggles;
   pendingPin?: boolean;
   busy: boolean;
+  expanded: boolean;
+  onExpandedChange(expanded: boolean): void;
   onToggle(scope: string, enabled: boolean): void;
   onPin(pinned: boolean): void;
   onServiceAction(action: PluginServiceAction): void;
@@ -745,10 +796,12 @@ function PluginCard(props: {
   onPrepare(): void;
   onUninstall(): void;
 }): React.JSX.Element {
-  const { plugin } = props;
-  const [expanded, setExpanded] = useState(false);
+  const { plugin, expanded, onExpandedChange } = props;
   const title = plugin.displayName || plugin.id;
   const description = plugin.description || props.marketEntry?.description;
+  const official = props.marketEntry
+    ? isOfficialMarketPlugin(props.marketEntry)
+    : plugin.packageName.startsWith('@botmux-ai/');
   const depIds = plugin.dependencies ?? [];
   const enabledGlobal = pluginEnabledInScope(plugin, 'global', props.pendingToggles);
   const enabledBotCount = props.bots.filter(bot => pluginEnabledInScope(plugin, bot.id, props.pendingToggles)).length;
@@ -763,6 +816,7 @@ function PluginCard(props: {
         <div className="plugin-title-block">
           <div className="plugin-title-row">
             <h2>{title}</h2>
+            {official ? <span className="plugin-official-badge" data-official-badge={plugin.id}>官方</span> : null}
             <span className={`plugin-status ${enabledAnywhere ? 'plugin-status-ok' : 'plugin-status-idle'}`}>
               {enabledGlobal ? '全局已启用' : enabledBotCount > 0 ? `${enabledBotCount} 个 Bot 已启用` : '未启用'}
             </span>
@@ -773,12 +827,15 @@ function PluginCard(props: {
       {description ? <p className="plugin-store-description">{description}</p> : null}
       <footer className="plugin-store-footer">
         <span className="plugin-muted">v{plugin.version}</span>
-        <button type="button" className="btn-link" data-plugin-expand={plugin.id} onClick={() => setExpanded(true)}>管理</button>
+        <button type="button" className="btn-link" data-plugin-expand={plugin.id} onClick={() => onExpandedChange(true)}>管理</button>
       </footer>
-      <ModalDialog open={expanded} onClose={() => setExpanded(false)} className="plugin-store-dialog" aria-label={title}>
+      <ModalDialog open={expanded} onClose={() => onExpandedChange(false)} className="plugin-store-dialog" aria-label={title}>
         <header className="plugin-store-dialog-head">
-          <div><h2>{title}</h2></div>
-          <button type="button" className="btn-link plugin-store-close" aria-label="关闭" title="关闭" onClick={() => setExpanded(false)}>×</button>
+          <div className="plugin-store-dialog-title-row">
+            <h2>{title}</h2>
+            {official ? <span className="plugin-official-badge">官方</span> : null}
+          </div>
+          <button type="button" className="btn-link plugin-store-close" aria-label="关闭" title="关闭" onClick={() => onExpandedChange(false)}>×</button>
         </header>
         <div className="plugin-card-expanded" id={detailsId}>
           {expanded ? <PluginManagementSurface plugin={plugin} management={{
@@ -811,7 +868,7 @@ function PluginCard(props: {
                 { label: '插件 ID', content: <InlineCode>{plugin.id}</InlineCode> },
                 { label: '软件包', content: <InlineCode>{plugin.packageName}</InlineCode> },
                 { label: '版本', content: plugin.version },
-                { label: '来源', content: installedLocally(plugin) ? '本地安装' : 'npm 安装' },
+                { label: '来源', content: installedPluginSourceLabel(plugin) },
                 ...(depIds.length ? [{ label: '依赖', content: depIds.join(', ') }] : []),
               ]} />
             </div>
@@ -838,8 +895,8 @@ function PluginCard(props: {
           </details>
           </>}</PluginManagementSurface> : null}
           <footer className="plugin-store-dialog-foot">
-            {props.marketEntry?.package === plugin.packageName ? <button type="button" className="btn-link" disabled={props.busy} onClick={() => { setExpanded(false); props.onPrepare(); }}>检查更新</button> : null}
-            <button type="button" className="btn-link plugin-store-danger" disabled={props.busy} onClick={() => { setExpanded(false); props.onUninstall(); }}>卸载插件</button>
+            {props.marketEntry?.package === plugin.packageName ? <button type="button" className="btn-link" disabled={props.busy} onClick={() => { onExpandedChange(false); props.onPrepare(); }}>检查更新</button> : null}
+            <button type="button" className="btn-link plugin-store-danger" disabled={props.busy} onClick={() => { onExpandedChange(false); props.onUninstall(); }}>卸载插件</button>
           </footer>
         </div>
       </ModalDialog>
@@ -861,7 +918,7 @@ function updateSet<T>(source: ReadonlySet<T>, value: T, present: boolean): Set<T
   return next;
 }
 
-function PluginManagementPage(): React.JSX.Element {
+export function PluginManagementPage(): React.JSX.Element {
   const [payload, setPayload] = useState<PluginManagementPayload | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -869,9 +926,12 @@ function PluginManagementPage(): React.JSX.Element {
   const [pendingToggles, setPendingToggles] = useState<Map<string, boolean>>(() => new Map());
   const [pendingPins, setPendingPins] = useState<Map<string, boolean>>(() => new Map());
   const [feedback, setFeedback] = useState<PluginFeedback | null>(null);
-  const [view, setView] = useState<'installed' | 'discover'>(() => location.hash.includes('view=discover') ? 'discover' : 'installed');
+  const [view, setView] = useState<'installed' | 'discover'>(() => {
+    const hash = globalThis.location?.hash ?? '';
+    return hash.includes('view=discover') || hash.includes('view=market') ? 'discover' : 'installed';
+  });
   const [query, setQuery] = useState('');
-  const [source, setSource] = useState('all');
+  const [source, setSource] = useState<'all' | InstalledPluginSourceKind>('all');
   const [catalog, setCatalog] = useState<{ items: PluginMarketEntry[]; stale: boolean; available: boolean } | null>(null);
   const [catalogError, setCatalogError] = useState('');
   const [catalogLoading, setCatalogLoading] = useState(false);
@@ -879,9 +939,9 @@ function PluginManagementPage(): React.JSX.Element {
   const [plan, setPlan] = useState<PluginInstallPlan | null>(null);
   const [remove, setRemove] = useState<ManagedPlugin | null>(null);
   const [operation, setOperation] = useState('');
-  const [notice, setNotice] = useState('');
+  const [notice, setNotice] = useState<PluginNotice | null>(null);
   const operationRef = useRef(false);
-  const [focusedPlugin, setFocusedPlugin] = useState<string | null>(null);
+  const [expandedPluginId, setExpandedPluginId] = useState<string | null>(null);
 
   const marketRequest = useCallback(async (action: string, body: unknown) => {
     const csrf = readControlCsrfToken() ?? '';
@@ -907,13 +967,16 @@ function PluginManagementPage(): React.JSX.Element {
     finally { setCatalogLoading(false); }
   }, [marketRequest]);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (): Promise<PluginManagementPayload | null> => {
     setRefreshing(true);
     setError(null);
     try {
-      setPayload(await fetchPluginManagement());
+      const next = await fetchPluginManagement();
+      setPayload(next);
+      return next;
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+      return null;
     } finally {
       setRefreshing(false);
     }
@@ -922,16 +985,16 @@ function PluginManagementPage(): React.JSX.Element {
   useEffect(() => { void load(); }, [load]);
   useEffect(() => { void loadCatalog(); }, [loadCatalog]);
   useEffect(() => {
-    if (!focusedPlugin || !payload) return;
-    const element = document.querySelector<HTMLElement>(`[data-plugin-expand="${CSS.escape(focusedPlugin)}"]`);
-    if (element) { element.click(); element.focus(); setFocusedPlugin(null); }
-  }, [focusedPlugin, payload, query, source, view]);
+    if (!expandedPluginId || view !== 'installed' || typeof document === 'undefined' || typeof CSS === 'undefined') return;
+    const card = document.querySelector<HTMLElement>(`[data-plugin-card="${CSS.escape(expandedPluginId)}"]`);
+    card?.scrollIntoView?.({ block: 'nearest' });
+  }, [expandedPluginId, view]);
 
   const perform = useCallback(async (label: string, action: () => Promise<void>) => {
     if (operationRef.current) return;
     operationRef.current = true;
     setOperation(label);
-    setNotice('');
+    setNotice(null);
     try { await action(); }
     catch (err) { setFeedback({ title: '插件操作未完成', message: err instanceof Error ? err.message : '请刷新已安装列表核对结果' }); }
     finally { operationRef.current = false; setOperation(''); }
@@ -970,7 +1033,7 @@ function PluginManagementPage(): React.JSX.Element {
     try {
       const next = await putPluginPin(pluginId, pinned);
       setPayload(next);
-      window.dispatchEvent(new Event(PLUGIN_PINS_CHANGED_EVENT));
+      globalThis.window?.dispatchEvent?.(new Event(PLUGIN_PINS_CHANGED_EVENT));
     } catch (err) {
       setFeedback({ title: '无法更新侧栏固定', message: err instanceof Error ? err.message : String(err) });
     } finally {
@@ -1001,10 +1064,21 @@ function PluginManagementPage(): React.JSX.Element {
   const matches = (...values: Array<string | undefined>) => values.join(' ').toLocaleLowerCase().includes(search);
   const installed = payload.plugins.filter(plugin => (
     matches(plugin.id, plugin.displayName, plugin.packageName, plugin.description, plugin.audience)
-    && (source === 'all' || (source === 'local' ? installedLocally(plugin) : !installedLocally(plugin)))
+    && (source === 'all' || classifyInstalledPluginSource(plugin) === source)
   ));
   const discovered = (catalog?.items ?? []).filter(entry => matches(entry.id, entry.displayName, entry.description, entry.package));
-  const openInstalled = (id: string) => { setSelected(null); setView('installed'); setQuery(''); setSource('all'); setFocusedPlugin(id); };
+  const openInstalled = (id: string) => {
+    setSelected(null);
+    setView('installed');
+    setQuery('');
+    setSource('all');
+    setExpandedPluginId(id);
+  };
+  const planEntry = plan ? catalog?.items.find(entry => entry.id === plan.id) : undefined;
+  const planOfficial = plan
+    ? (planEntry ? isOfficialMarketPlugin(planEntry) : plan.packageName.startsWith('@botmux-ai/'))
+    : false;
+  const selectedExisting = selected ? payload.plugins.find(item => item.id === selected.id) : undefined;
   return (
     <section className="page plugin-management-page plugin-market-page" data-native-plugin-center>
       <div className="page-heading">
@@ -1018,16 +1092,44 @@ function PluginManagementPage(): React.JSX.Element {
       </div>
       <div className="plugin-store-toolbar">
         <div className="plugin-store-tabs" role="tablist" aria-label="插件视图">
-          <button type="button" role="tab" aria-selected={view === 'installed'} className={view === 'installed' ? 'is-active' : ''} onClick={() => setView('installed')}>已安装 <span>{payload.plugins.length}</span></button>
-          <button type="button" role="tab" aria-selected={view === 'discover'} className={view === 'discover' ? 'is-active' : ''} onClick={() => setView('discover')}>发现</button>
+          <button type="button" role="tab" data-plugin-view="installed" aria-selected={view === 'installed'} className={view === 'installed' ? 'is-active' : ''} onClick={() => setView('installed')}>已安装 <span>{payload.plugins.length}</span></button>
+          <button type="button" role="tab" data-plugin-view="market" aria-selected={view === 'discover'} className={view === 'discover' ? 'is-active' : ''} onClick={() => setView('discover')}>插件市场{catalog?.items.length ? <span>{catalog.items.length}</span> : null}</button>
         </div>
         <input type="search" aria-label="搜索插件" placeholder="搜索插件" value={query} onChange={event => setQuery(event.currentTarget.value)} />
-        {view === 'installed' ? <select aria-label="安装来源" value={source} onChange={event => setSource(event.currentTarget.value)}>
-          <option value="all">全部来源</option><option value="local">本地安装</option><option value="npm">npm 安装</option>
+        {view === 'installed' ? <select aria-label="安装来源" value={source} onChange={event => setSource(event.currentTarget.value as 'all' | InstalledPluginSourceKind)}>
+          <option value="all">全部来源</option>
+          <option value="local">本地安装</option>
+          <option value="npm">npm 安装</option>
+          <option value="github-release">GitHub Release</option>
         </select> : <a className="plugin-link" href="https://github.com/botmux-ai/plugin-market" target="_blank" rel="noreferrer">插件目录</a>}
       </div>
       {error ? <div className="plugin-warning" role="alert">{error}</div> : null}
-      {notice || operation ? <div className="plugin-store-notice" role="status">{operation || notice}</div> : null}
+      {operation || notice ? (
+        <div className="plugin-store-notice" role="status" data-plugin-notice>
+          <span>{operation || notice?.message}</span>
+          {!operation && notice?.pluginId ? (
+            <div className="plugin-store-notice-actions">
+              <button
+                type="button"
+                className="btn-link primary"
+                data-plugin-notice-open={notice.pluginId}
+                onClick={() => openInstalled(notice.pluginId!)}
+              >
+                前往启用 / 管理
+              </button>
+              {notice.dashboardRoute ? (
+                <a
+                  className="btn-link"
+                  data-plugin-notice-settings={notice.pluginId}
+                  href={notice.dashboardRoute}
+                >
+                  打开配置
+                </a>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
       {view === 'installed' ? (
         <div className="plugin-store-grid">
           {installed.map(plugin => (
@@ -1038,6 +1140,8 @@ function PluginManagementPage(): React.JSX.Element {
               pendingToggles={pendingToggles}
               pendingPin={pendingPins.get(plugin.id)}
               busy={busyPluginIds.has(plugin.id) || !!operation}
+              expanded={expandedPluginId === plugin.id}
+              onExpandedChange={open => setExpandedPluginId(open ? plugin.id : null)}
               onToggle={(scope, enabled) => void handleToggle(plugin.id, scope, enabled)}
               onPin={pinned => void handlePin(plugin.id, pinned)}
               onServiceAction={action => void handleServiceAction(plugin.id, action)}
@@ -1053,15 +1157,33 @@ function PluginManagementPage(): React.JSX.Element {
         <div className="plugin-store-grid">
           {discovered.map(entry => {
             const existing = payload.plugins.find(item => item.id === entry.id);
+            const official = isOfficialMarketPlugin(entry);
             return <article className="bd-card plugin-store-card" key={entry.id} data-market-plugin={entry.id}>
               <header className="plugin-card-head"><div className="plugin-title-block">
-                <div className="plugin-title-row"><h2>{entry.displayName}</h2>{existing ? <span className="plugin-status plugin-status-ok">已安装</span> : null}</div>
+                <div className="plugin-title-row">
+                  <h2>{entry.displayName}</h2>
+                  {official ? <span className="plugin-official-badge" data-official-badge={entry.id}>官方</span> : null}
+                  {existing ? <span className="plugin-status plugin-status-ok">已安装</span> : null}
+                </div>
                 <p className="plugin-store-package">{entry.package}</p>
               </div></header>
               <p className="plugin-store-description">{entry.description}</p>
               <div className="plugin-store-tags"><Tags values={entry.categories} /></div>
-              <footer className="plugin-store-footer"><span className="plugin-muted">目录收录</span>
-                <button type="button" className="btn-link" disabled={!!operation} onClick={() => setSelected(entry)}>查看详情</button>
+              <footer className="plugin-store-footer">
+                <span className="plugin-muted" data-market-source={entry.id}>{marketEntrySourceLabel(entry)}</span>
+                <div className="plugin-store-card-actions">
+                  <button type="button" className="btn-link" data-market-detail={entry.id} disabled={!!operation} onClick={() => setSelected(entry)}>详情</button>
+                  {existing ? (
+                    <>
+                      <button type="button" className="btn-link" data-market-manage={entry.id} disabled={!!operation} onClick={() => openInstalled(entry.id)}>管理</button>
+                      {existing.packageName === entry.package ? (
+                        <button type="button" className="btn-link" data-market-update={entry.id} disabled={!!operation} onClick={() => prepare(entry)}>检查更新</button>
+                      ) : null}
+                    </>
+                  ) : (
+                    <button type="button" className="btn-link primary" data-market-install={entry.id} disabled={!!operation} onClick={() => prepare(entry)}>安装</button>
+                  )}
+                </div>
               </footer>
             </article>;
           })}
@@ -1071,30 +1193,84 @@ function PluginManagementPage(): React.JSX.Element {
       </>}
       <ModalDialog open={!!selected} onClose={() => setSelected(null)} className="plugin-store-dialog" aria-label={selected?.displayName || '插件详情'}>
         {selected ? <>
-          <header className="plugin-store-dialog-head"><div><h2>{selected.displayName}</h2><p className="plugin-muted">{selected.package}</p></div>
-            <button type="button" className="btn-link plugin-store-close" aria-label="关闭" onClick={() => setSelected(null)}>×</button></header>
+          <header className="plugin-store-dialog-head">
+            <div>
+              <div className="plugin-store-dialog-title-row">
+                <h2>{selected.displayName}</h2>
+                {isOfficialMarketPlugin(selected) ? <span className="plugin-official-badge">官方</span> : null}
+              </div>
+              <p className="plugin-muted">{selected.package}</p>
+            </div>
+            <button type="button" className="btn-link plugin-store-close" aria-label="关闭" onClick={() => setSelected(null)}>×</button>
+          </header>
           <div className="plugin-store-dialog-body">
             <p>{selected.description}</p><Tags values={selected.categories} />
-            <InfoRows rows={[{ label: '兼容声明', content: selected.compatibility.botmux }, { label: '来源', content: '社区插件目录（非安全认证）' }]} />
+            <InfoRows rows={[
+              { label: '兼容声明', content: selected.compatibility.botmux },
+              {
+                label: '分发来源',
+                content: selected.distribution?.type === 'github-release'
+                  ? <>GitHub Release（<InlineCode>{selected.distribution.repo}</InlineCode>）</>
+                  : 'npm',
+              },
+              {
+                label: '目录归属',
+                content: isOfficialMarketPlugin(selected) ? 'Botmux 官方插件' : '社区插件目录（非安全认证）',
+              },
+            ]} />
             <div className="plugin-action-links"><a className="btn-link" href={selected.docs || selected.repo} target="_blank" rel="noreferrer">开发文档</a><a className="btn-link" href={selected.repo} target="_blank" rel="noreferrer">源代码</a></div>
           </div>
           <footer className="plugin-store-dialog-foot">
-            {payload.plugins.some(item => item.id === selected.id) ? <button type="button" className="btn-link primary" onClick={() => openInstalled(selected.id)}>管理已安装插件</button> : <button type="button" className="btn-link primary" disabled={!!operation} onClick={() => prepare(selected)}>{operation || '安装插件'}</button>}
+            {selectedExisting ? (
+              <>
+                {selectedExisting.packageName === selected.package ? (
+                  <button type="button" className="btn-link" disabled={!!operation} onClick={() => prepare(selected)}>检查更新</button>
+                ) : null}
+                <button type="button" className="btn-link primary" onClick={() => openInstalled(selected.id)}>管理已安装插件</button>
+              </>
+            ) : (
+              <button type="button" className="btn-link primary" disabled={!!operation} onClick={() => prepare(selected)}>{operation || '安装插件'}</button>
+            )}
           </footer>
         </> : null}
       </ModalDialog>
       <ModalDialog open={!!plan} onRequestClose={() => { if (!operation) setPlan(null); }} onClose={() => { if (!operation) setPlan(null); }} backdropClose={false} className="plugin-store-dialog" aria-label="确认安装">
         {plan ? <>
-          <header className="plugin-store-dialog-head"><h2>确认安装</h2></header>
+          <header className="plugin-store-dialog-head">
+            <div className="plugin-store-dialog-title-row">
+              <h2>确认安装</h2>
+              {planOfficial ? <span className="plugin-official-badge">官方</span> : null}
+            </div>
+          </header>
           <div className="plugin-store-dialog-body">
-            <InfoRows rows={[{ label: '软件包', content: plan.packageName }, { label: '固定版本', content: plan.version }, { label: 'SHA-512', content: <code className="plugin-store-integrity">{plan.integrity}</code> }]} />
-            <div className="plugin-warning">插件启用后以本机用户权限运行，可访问本机资源。目录收录不代表安全认证。安装完成后不会自动启用。</div>
+            <InfoRows rows={[
+              { label: '软件包', content: plan.packageName },
+              { label: '固定版本', content: plan.version },
+              { label: '安装来源', content: installPlanSourceLabel(plan) },
+              { label: 'SHA-512', content: <code className="plugin-store-integrity">{plan.integrity}</code> },
+            ]} />
+            <div className="plugin-warning">
+              {planOfficial
+                ? 'Botmux 官方插件。插件启用后以本机用户权限运行，可访问本机资源。安装完成后不会自动启用，请在插件管理中按需启用。'
+                : '插件启用后以本机用户权限运行，可访问本机资源。社区目录收录不代表安全认证。安装完成后不会自动启用。'}
+            </div>
           </div>
           <footer className="plugin-store-dialog-foot">
             <button type="button" className="btn-link" disabled={!!operation} onClick={() => setPlan(null)}>取消</button>
-            <button type="button" className="btn-link primary" disabled={!!operation} onClick={() => void perform('正在安装…', async () => {
+            <button type="button" className="btn-link primary" data-market-confirm-install disabled={!!operation} onClick={() => void perform('正在安装…', async () => {
               await marketRequest('install', { nonce: plan.nonce, confirm: true });
-              const id = plan.id; setPlan(null); await load(); openInstalled(id); setNotice('安装完成');
+              const installedId = plan.id;
+              const installedVersion = plan.version;
+              const fallbackName = planEntry?.displayName || installedId;
+              setPlan(null);
+              const refreshed = await load();
+              const installedRecord = refreshed?.plugins.find(item => item.id === installedId);
+              const displayName = installedRecord?.displayName || fallbackName;
+              setNotice({
+                message: `已安装 ${displayName} (v${installedVersion})，默认未启用，可前往插件卡片启用或配置。`,
+                pluginId: installedId,
+                dashboardRoute: installedRecord?.dashboard?.[0]?.route,
+              });
             })}>{operation || '信任并安装'}</button>
           </footer>
         </> : null}
@@ -1107,7 +1283,7 @@ function PluginManagementPage(): React.JSX.Element {
             <button type="button" className="btn-link" disabled={!!operation} onClick={() => setRemove(null)}>取消</button>
             <button type="button" className="btn-link plugin-store-danger" disabled={!!operation} onClick={() => void perform('正在卸载…', async () => {
               await marketRequest('uninstall', { id: remove.id, packageName: remove.packageName, version: remove.version, expectedState: remove.stateHash, confirm: true });
-              setRemove(null); await load(); window.dispatchEvent(new Event(PLUGIN_PINS_CHANGED_EVENT)); setNotice('已卸载插件');
+              setRemove(null); await load(); globalThis.window?.dispatchEvent?.(new Event(PLUGIN_PINS_CHANGED_EVENT)); setNotice({ message: '已卸载插件' });
             })}>{operation || '确认卸载'}</button>
           </footer>
         </> : null}

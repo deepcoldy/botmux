@@ -62,21 +62,29 @@ export function proxyForUrl(rawUrl: string, proxy: string | undefined): string |
   return bypass ? undefined : proxy;
 }
 
+export type ReleaseHopResult =
+  | { kind: 'redirect'; statusCode: number; location: string }
+  | { kind: 'response'; statusCode: number; headers: IncomingMessage['headers']; stream: IncomingMessage };
+
 /**
- * GET a URL and resolve with the 200 response stream, following redirects and
- * optionally tunnelling through an HTTP proxy.
+ * Perform a single HTTP/HTTPS GET hop (without following redirects), supporting
+ * HTTP proxy CONNECT tunnelling, NO_PROXY exclusions, and AbortSignal.
  *
- * @param userAgent sent as `user-agent`; callers pass their own tag so server-side
- *                  logs can tell which feature issued the download.
+ * On 3xx responses with a Location header, the current hop's socket is torn down
+ * immediately so a subsequent hop over a CONNECT proxy can establish a fresh
+ * TLS handshake cleanly.
  */
-export function getReleaseStream(
+export function requestReleaseHop(
   rawUrl: string,
   proxy: string | undefined,
   userAgent: string,
-  redirectsLeft = 5,
   options: { signal?: AbortSignal; headers?: Record<string, string>; respectNoProxy?: boolean } = {},
-): Promise<IncomingMessage> {
+): Promise<ReleaseHopResult> {
   return new Promise((resolve, reject) => {
+    if (options.signal?.aborted) {
+      reject(options.signal.reason ?? new Error('release request aborted'));
+      return;
+    }
     let target: URL;
     try { target = new URL(rawUrl); } catch { reject(new Error(`URL 非法: ${rawUrl}`)); return; }
     const isHttps = target.protocol === 'https:';
@@ -87,12 +95,10 @@ export function getReleaseStream(
         // Tear down this hop's connection before following the redirect (see header).
         res.destroy();
         res.socket?.destroy();
-        if (redirectsLeft <= 0) { reject(new Error('重定向次数过多')); return; }
-        resolve(getReleaseStream(new URL(res.headers.location, rawUrl).toString(), proxy, userAgent, redirectsLeft - 1, options));
+        resolve({ kind: 'redirect', statusCode: sc, location: res.headers.location });
         return;
       }
-      if (sc !== 200) { res.resume(); reject(new Error(`HTTP ${sc}`)); return; }
-      resolve(res);
+      resolve({ kind: 'response', statusCode: sc, headers: res.headers, stream: res });
     };
 
     // Re-evaluate exclusions on every redirect target. Keep the original proxy
@@ -165,4 +171,30 @@ export function getReleaseStream(
     greq.on('error', reject);
     greq.end();
   });
+}
+
+/**
+ * GET a URL and resolve with the 200 response stream, following redirects and
+ * optionally tunnelling through an HTTP proxy.
+ *
+ * @param userAgent sent as `user-agent`; callers pass their own tag so server-side
+ *                  logs can tell which feature issued the download.
+ */
+export async function getReleaseStream(
+  rawUrl: string,
+  proxy: string | undefined,
+  userAgent: string,
+  redirectsLeft = 5,
+  options: { signal?: AbortSignal; headers?: Record<string, string>; respectNoProxy?: boolean } = {},
+): Promise<IncomingMessage> {
+  const hop = await requestReleaseHop(rawUrl, proxy, userAgent, options);
+  if (hop.kind === 'redirect') {
+    if (redirectsLeft <= 0) throw new Error('重定向次数过多');
+    return getReleaseStream(new URL(hop.location, rawUrl).toString(), proxy, userAgent, redirectsLeft - 1, options);
+  }
+  if (hop.statusCode !== 200) {
+    hop.stream.resume();
+    throw new Error(`HTTP ${hop.statusCode}`);
+  }
+  return hop.stream;
 }

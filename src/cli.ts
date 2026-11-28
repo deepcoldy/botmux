@@ -9404,7 +9404,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   plugin              管理 botmux 插件
        plugin init <id>
                        基于官方模板创建 botmux 插件仓库
-       plugin install <npm-package|local-dir>
+       plugin install <npm-package|local-dir|github:owner/repo[@tag]>
                        安装并校验 botmux 插件；不执行插件代码、不启动 service
        plugin enable <id>
                        启用插件给指定 bot 或全局默认；不影响 host service
@@ -23556,7 +23556,7 @@ function printPluginUsage(): void {
   console.log(`用法:
   botmux plugin list
   botmux plugin init <plugin-id|botmux-plugin-id|@botmux-ai/plugin-id>
-  botmux plugin install <npm-package|local-dir> [--link]
+  botmux plugin install <npm-package|local-dir|github:owner/repo[@tag]> [--link]
   botmux plugin uninstall <plugin-id> [--force]
   botmux plugin enable <plugin-id> [--bot <name|index|all>]
   botmux plugin disable <plugin-id> [--bot <name|index|all>]
@@ -23614,7 +23614,7 @@ async function cmdPlugin(args: string[]): Promise<void> {
     const resolvedSpec = resolveOfficialPluginPackageSpec(spec);
     let result;
     try {
-      result = installPlugin(resolvedSpec, { link: args.includes('--link'), guard: parsePluginMutationGuard(findArgValue(args, '--guard-json')) });
+      result = await installPlugin(resolvedSpec, { link: args.includes('--link'), guard: parsePluginMutationGuard(findArgValue(args, '--guard-json')) });
     } catch (err) {
       if (printPluginServiceRunningError(err)) {
         process.exitCode = 1;
