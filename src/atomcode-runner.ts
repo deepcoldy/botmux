@@ -59,6 +59,8 @@ const nativeEnv: NodeJS.ProcessEnv = {
   ...(values.has('--data-dir') ? { ATOMCODE_HOME: values.get('--data-dir') } : {}),
 };
 
+// Reuse one session-scoped ACP process across consecutive turns and release its
+// native .lease lock automatically after idleTimeoutMs of inactivity.
 let nativeSessionId = values.get('--native-session-id');
 const session = new AtomcodeAcpSession({
   executable,
@@ -108,6 +110,9 @@ function finalizeShutdown(): void {
   void session.close(true).finally(() => process.exit(0));
 }
 
+/** Process queued framed turns sequentially on the persistent ACP session.
+ *  Back-to-back queued turns reuse the warm process without triggering idle
+ *  release; each turn gets an isolated MinimaxTurnBudget paused during human input. */
 async function drain(): Promise<void> {
   if (processing || closing) return;
   processing = true;
@@ -215,6 +220,8 @@ function receiveLine(line: string): void {
   }
 }
 
+/** Initiate runner shutdown: drop queued turns, abort any active turn, and
+ *  gracefully close the idle ACP connection once drain() unwinds. */
 function close(): void {
   closing = true;
   queue.length = 0;
@@ -224,6 +231,8 @@ function close(): void {
 
 process.on('SIGTERM', close);
 process.on('SIGHUP', close);
+// SIGINT while busy cancels only the active turn (keeping the runner alive for
+// follow-up messages); SIGINT while idle exits cleanly after releasing .lease.
 process.on('SIGINT', () => {
   if (active) active.abort();
   else close();

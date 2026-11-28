@@ -101,6 +101,9 @@ interface PendingRpc {
   timer?: ReturnType<typeof setTimeout>;
 }
 
+/** Per-turn state allocated fresh on every `prompt()` call so message buffers,
+ *  in-flight human interactions, and cancellation signals never leak across
+ *  consecutive turns sharing one persistent ACP connection. */
 interface ActiveTurnState {
   turnLifetime: AbortController;
   inputSignal: AbortSignal;
@@ -129,6 +132,8 @@ interface OpenConnectionOptions {
   onDisconnected?: () => void;
 }
 
+/** Race a wait against caller abort without cancelling the underlying promise,
+ *  so an in-flight teardown still finishes releasing its OS `.lease` lock. */
 function awaitWithAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
   if (signal.aborted) return Promise.reject(new Error('atomcode_acp_aborted'));
   return new Promise<T>((resolve, reject) => {
@@ -212,6 +217,10 @@ class AtomcodeAcpConnection {
     });
   }
 
+  /** Spawn an owned `atomcode acp` process, complete the v1 handshake, bind
+   *  or resume the native session, and apply mode/model/effort config options.
+   *  Detaches the caller's abort listener once open so Turn 1's signal never
+   *  stays pinned to a long-lived connection; any failure reaps the child. */
   static async open(
     opts: OpenConnectionOptions,
     signal: AbortSignal,
@@ -295,6 +304,10 @@ class AtomcodeAcpConnection {
       && !this.activeTurn;
   }
 
+  /** Execute a single `session/prompt` turn on this live connection. Leaves
+   *  the connection warm on `end_turn`; any error, abort, or non-`end_turn`
+   *  stop reason tears down the entire process group so neither wire framing
+   *  nor child tool processes can poison subsequent turns. */
   async prompt(turn: AtomcodeAcpTurnOptions, signal: AbortSignal): Promise<AtomcodeAcpResult> {
     signal.throwIfAborted();
     if (!this.isReusable()) {
@@ -381,6 +394,10 @@ class AtomcodeAcpConnection {
     }
   }
 
+  /** Idempotently tear down this connection. When `graceful` is true and no
+   *  turn is active, sends `session/close` + stdin EOF to let AtomCode commit
+   *  state and drop its `.lease` cleanly; a subsequent `close(false)` escalates
+   *  any in-flight graceful close or post-EOF wait immediately. */
   close(graceful: boolean): Promise<void> {
     this.closingRequested = true;
     // Never wait on idle session/close while a prompt or human-input round-trip is active;
@@ -515,6 +532,8 @@ class AtomcodeAcpConnection {
     }
     if (typeof message.method === 'string') {
       if (Object.hasOwn(message, 'id')) {
+        // Server-initiated requests (permissions/forms) are only valid during an active
+        // turn; unsolicited requests while idle fail closed and tear down the connection.
         const turn = this.activeTurn;
         if (!turn || turn.closed) {
           throw new Error('atomcode_acp_question_session_mismatch');
@@ -566,6 +585,7 @@ class AtomcodeAcpConnection {
       const turn = this.activeTurn;
       const params = message.params;
       if (!isObject(params) || params.sessionId !== this.sessionId || !isObject(params.update)) {
+        // Ignore pre-prompt replay or trailing updates while idle; reject session mismatches mid-turn.
         if (!turn) return;
         throw new Error('atomcode_acp_update_session_mismatch');
       }
@@ -647,6 +667,10 @@ export class AtomcodeAcpSession {
     return !!this.connection?.isReusable();
   }
 
+  /** Run one turn on the warm connection, or open/resume a new one after any
+   *  in-flight teardown finishes releasing its `.lease`. On success, arms the
+   *  idle release timer (or closes immediately when `idleTimeoutMs === 0`); on
+   *  any failure, force-tears down the connection while keeping `sessionId`. */
   async runTurn(turn: AtomcodeAcpTurnOptions, signal: AbortSignal): Promise<AtomcodeAcpResult> {
     if (this.disposed) throw new Error('atomcode_acp_closed');
     if (this.busy) throw new Error('atomcode_acp_busy');
@@ -740,6 +764,9 @@ export class AtomcodeAcpSession {
     }
   }
 
+  /** Permanently dispose this session: aborts any in-flight `open()` or active
+   *  turn, escalates in-flight idle closes when `graceful` is false, and awaits
+   *  full process exit so the native `.lease` is released before resolving. */
   async close(graceful = true): Promise<void> {
     this.disposed = true;
     this.clearIdleTimer();
@@ -781,6 +808,9 @@ export class AtomcodeAcpSession {
     return chained;
   }
 
+  /** Schedule graceful release of an idle ACP child so its `.lease` does not
+   *  block standalone `atomcode resume`. Unref'd so the timer itself cannot
+   *  pin process exit if no child or stdin stream remains alive. */
   private armIdleTimer(): void {
     this.clearIdleTimer();
     if (this.disposed || this.busy || !this.connection || this.idleTimeoutMs <= 0) return;
