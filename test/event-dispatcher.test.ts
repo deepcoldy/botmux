@@ -275,10 +275,24 @@ let capturedHandlers: Record<string, Function> = {};
 let capturedWsClientOptions: Record<string, any> | undefined;
 let capturedWsClient: { start: ReturnType<typeof vi.fn>; getConnectionStatus: ReturnType<typeof vi.fn> };
 
-vi.mock('@larksuiteoapi/node-sdk', () => {
+let useRealSdkForTimeProbe = false;
+let capturedTimeProbeDispatcher: { invoke(data: unknown): Promise<unknown> } | undefined;
+
+vi.mock('@larksuiteoapi/node-sdk', async (importOriginal) => {
+  const actual = await importOriginal<typeof Lark>();
   class MockEventDispatcher {
+    private sdk?: Lark.EventDispatcher;
+    invoke?: (data: unknown) => Promise<unknown>;
+    constructor() {
+      if (useRealSdkForTimeProbe) {
+        this.sdk = new actual.EventDispatcher({});
+        this.invoke = this.sdk.invoke.bind(this.sdk);
+        capturedTimeProbeDispatcher = this as { invoke(data: unknown): Promise<unknown> };
+      }
+    }
     register(handlers: Record<string, Function>) {
       capturedHandlers = handlers;
+      this.sdk?.register(handlers as any);
       return this;
     }
   }
@@ -18572,6 +18586,60 @@ describe('in-chat @ membership check is only paid when its answer matters (comma
     await flushEventWork();
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+});
+
+describe('host-selected card callback time observation', () => {
+  beforeEach(() => {
+    mockGetBot.mockReturnValue({ config: { larkAppId: MY_APP_ID } });
+    __resetEventClaimsForTest();
+    useRealSdkForTimeProbe = false;
+  });
+  afterEach(() => { useRealSdkForTimeProbe = false; });
+  it('observes native time at the registered callback without changing its ACK', async () => {
+    const samples: unknown[] = [];
+    const handlers = makeHandlers();
+    handlers.handleCardAction.mockResolvedValue({ toast: { type: 'success', content: 'accepted' } });
+    const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers, 'feishu', undefined, {
+      cardActionTimeProbe: { messageId: 'om_offline_probe', emit: (sample: unknown) => samples.push(sample) },
+    } as any);
+    const event = {
+      event_id: 'offline_probe_event', create_time: '1700000000123',
+      context: { open_message_id: 'om_offline_probe' },
+      operator: { open_id: 'ou_offline' },
+      action: { value: { action: 'ask_select', option_key: 'probe' } },
+    };
+    try {
+      const ack = await capturedHandlers['card.action.trigger'](event);
+      expect(ack).toEqual({ toast: { type: 'success', content: 'accepted' } });
+      expect(samples).toHaveLength(1);
+      expect(samples[0]).toMatchObject({ stage: 'card-action-trigger', fields: expect.arrayContaining([
+        { path: 'create_time', type: 'string', status: 'numeric', raw: '1700000000123' },
+      ]) });
+    } finally { runtime.close(); }
+  });
+  it('pairs the actual locked SDK input with its flattened callback using an anonymous event key', async () => {
+    useRealSdkForTimeProbe = true;
+    const samples: any[] = [];
+    const handlers = makeHandlers();
+    handlers.handleCardAction.mockResolvedValue({ toast: { type: 'success', content: 'accepted' } });
+    const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers, 'feishu', undefined, {
+      cardActionTimeProbe: { messageId: 'om_offline_probe', emit: (sample: unknown) => samples.push(sample) },
+    } as any);
+    const input = {
+      schema: '2.0', header: { event_type: 'card.action.trigger', event_id: 'offline_sdk_event', create_time: '1700000000123' },
+      event: { context: { open_message_id: 'om_offline_probe' }, operator: { open_id: 'ou_offline' },
+        action: { value: { action: 'ask_select', option_key: 'probe' } } },
+    };
+    try {
+      const ack = await capturedTimeProbeDispatcher!.invoke(input);
+      expect(ack).toEqual({ toast: { type: 'success', content: 'accepted' } });
+      expect(samples.map(sample => sample.stage)).toEqual(['sdk-invoke', 'card-action-trigger']);
+      expect(samples[0].correlationKey).toBe(samples[1].correlationKey);
+      expect(samples[0].correlationKey).not.toContain('offline_sdk_event');
+      expect(samples[0].fields).toContainEqual({ path: 'header.create_time', raw: '1700000000123', type: 'string', status: 'numeric' });
+      expect(samples[1].fields).toContainEqual({ path: 'create_time', raw: '1700000000123', type: 'string', status: 'numeric' });
+    } finally { runtime.close(); }
   });
 });
 
