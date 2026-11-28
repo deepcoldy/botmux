@@ -49,6 +49,86 @@ function toolResult(uuid: string): TranscriptEvent {
     message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tool-1', content: 'ok' }] as any },
   };
 }
+
+describe('BridgeTurnQueue peer reports', () => {
+  const prompt = 'Inspect the current request';
+  const peer = (uuid: string): TranscriptEvent => ({
+    type: 'attachment',
+    uuid,
+    attachment: {
+      type: 'queued_command',
+      commandMode: 'prompt',
+      prompt: '<agent-message from="worker">Partial result</agent-message>',
+      ...{ isMeta: true, origin: { kind: 'peer', from: 'worker', senderTaskId: 'agent-1' } },
+    },
+  });
+  const start = () => {
+    const queue = new BridgeTurnQueue();
+    queue.mark('om_original', makeFingerprint(prompt), Date.now(), prompt);
+    queue.ingest([user('request-user', prompt), assistantToolUse('request-tool')]);
+    return queue;
+  };
+
+  it('keeps the original request open while its tool awaits a result', () => {
+    const queue = start();
+    const original = queue.peek()[0];
+    queue.ingest([peer('peer-1')]);
+    expect(queue.openLiveNonLocalTurn()).toBe(original);
+    expect(original.terminalObserved).not.toBe(true);
+    expect(queue.peek()).toEqual([original]);
+    expect(queue.getOpenTurnEvidence(original).unmatchedToolUseCount).toBe(1);
+    expect(queue.drainEmittable({ explicitTerminalOnly: true })).toEqual([]);
+  });
+
+  it('keeps the original request open while it awaits the post-tool assistant', () => {
+    const queue = start();
+    const original = queue.peek()[0];
+    queue.ingest([toolResult('result'), peer('peer-after-result')]);
+    expect(queue.openLiveNonLocalTurn()).toBe(original);
+    expect(original.terminalObserved).not.toBe(true);
+    expect(queue.getOpenTurnEvidence(original).awaitingPostToolAssistant).toBe(true);
+    expect(queue.drainEmittable({ explicitTerminalOnly: true })).toEqual([]);
+  });
+
+  it('attributes the eventual answer to the original request after repeated peer reports', () => {
+    const queue = start();
+    const report = peer('peer-1');
+    queue.ingest([report, peer('peer-2'), report, toolResult('result')]);
+    expect(queue.drainEmittable({ explicitTerminalOnly: true })).toEqual([]);
+    const final = assistant('request-final', 'The request is complete');
+    final.message!.stop_reason = 'end_turn';
+    queue.ingest([final, { type: 'system', subtype: 'turn_duration', uuid: 'request-duration' }]);
+    const emitted = queue.drainEmittable({ explicitTerminalOnly: true });
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0].turnId).toBe('om_original');
+    expect(emitted[0].assistantUuids).toEqual(['request-final']);
+    expect(emitted[0].isLocal).not.toBe(true);
+  });
+
+  it('still starts a separately submitted human follow-up after a peer report', () => {
+    const queue = start();
+    const original = queue.peek()[0];
+    queue.ingest([peer('peer-1')]);
+    const followUp = 'Also inspect the next request';
+    queue.mark('om_follow_up', makeFingerprint(followUp), Date.now(), followUp);
+    queue.ingest([{
+      type: 'attachment', uuid: 'human-follow-up',
+      attachment: {
+        type: 'queued_command', commandMode: 'prompt', prompt: followUp,
+        ...{ origin: { kind: 'human' }, isMeta: true },
+      },
+    }]);
+    expect(original.terminalObserved).toBe(true);
+    expect(queue.peek().find(turn => turn.turnId === 'om_follow_up')).toMatchObject({ started: true });
+  });
+
+  it('continues to honor an explicit user interruption after an internal report', () => {
+    const queue = start();
+    const original = queue.peek()[0];
+    queue.ingest([peer('peer-1'), user('interruption', '[Request interrupted by user]')]);
+    expect(original.terminalOutcome).toMatchObject({ status: 'cancelled', errorCode: 'user_interrupted' });
+  });
+});
 /** Claude Code built-in CronCreate fire record: isMeta user event with
  *  turnOrigin:"scheduled", exactly as written to the transcript. */
 function scheduledFire(uuid: string, opts: { fireId?: string; content?: string; taskId?: string } = {}): TranscriptEvent {

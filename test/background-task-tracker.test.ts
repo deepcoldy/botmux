@@ -86,6 +86,58 @@ function assistant(uuid: string, text: string, stopReason: string): TranscriptEv
   } as TranscriptEvent;
 }
 
+describe('BackgroundTaskTracker peer progress', () => {
+  const peerReport = (uuid: string): TranscriptEvent => ({
+    type: 'attachment',
+    uuid,
+    attachment: {
+      type: 'queued_command', commandMode: 'prompt',
+      prompt: '<agent-message from="worker">Partial result</agent-message>',
+      ...{ origin: { kind: 'peer', from: 'worker', senderTaskId: 'agent-1' }, isMeta: true },
+    },
+  });
+
+  it('keeps the running agents attached to the same human prompt across peer reports', () => {
+    const tracker = new BackgroundTaskTracker();
+    tracker.observe({ type: 'user', uuid: 'u1', message: { role: 'user', content: 'Inspect this request' } });
+    tracker.observe(assistantAgent('dispatch', 'tu-1'));
+    tracker.observe(launchAck('ack', 'tu-1', 'agent-1'));
+    tracker.observe(peerReport('peer-1'));
+    tracker.observe(peerReport('peer-2'));
+    expect(tracker.pending()).toBe(1);
+    expect(tracker.pendingTurnAgents()).toBe(1);
+    expect(tracker.backgroundWait()).toBe(0);
+  });
+
+  it('shows background waiting only after the main turn actually ends', () => {
+    const tracker = new BackgroundTaskTracker();
+    tracker.observe(assistantAgent('dispatch', 'tu-1'));
+    tracker.observe(launchAck('ack', 'tu-1', 'agent-1'));
+    tracker.observe(peerReport('peer-1'));
+    expect(tracker.pendingTurnAgents()).toBe(1);
+    tracker.observe(assistant('final', 'Main result', 'end_turn'));
+    tracker.observe({ type: 'system', subtype: 'turn_duration' });
+    expect(tracker.backgroundWait()).toBe(1);
+    tracker.observe(attachmentTaskNotification('completed', 'agent-1', 'tu-1'));
+    expect(tracker.pending()).toBe(0);
+    expect(tracker.backgroundWait()).toBe(0);
+  });
+
+  it('still advances the prompt boundary for a real human input without deleting previous tasks', () => {
+    const tracker = new BackgroundTaskTracker();
+    tracker.observe(assistantAgent('dispatch', 'tu-1'));
+    tracker.observe(launchAck('ack', 'tu-1', 'agent-1'));
+    tracker.observe(peerReport('peer-1'));
+    expect(tracker.pendingTurnAgents()).toBe(1);
+    tracker.observe({
+      type: 'attachment', uuid: 'human-follow-up',
+      attachment: { type: 'queued_command', commandMode: 'prompt', prompt: 'Next request', ...{ origin: { kind: 'human' }, isMeta: true } },
+    });
+    expect(tracker.pending()).toBe(1);
+    expect(tracker.pendingTurnAgents()).toBe(0);
+  });
+});
+
 describe('background task detection primitives', () => {
   it('detects Agent and Task dispatch tool_use ids, ignores other tools', () => {
     expect(backgroundTaskDispatchToolUseIds(assistantAgent('a', 'tu-1'))).toEqual(['tu-1']);

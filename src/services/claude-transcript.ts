@@ -108,6 +108,8 @@ export interface TranscriptEvent {
     type?: string;
     prompt?: unknown;
     commandMode?: string;
+    /** A peer Agent report is internal context, not a newly submitted prompt. */
+    origin?: { kind?: string };
   };
   /** Present on `type:"system"` model-switch records (see
    *  {@link parseClaudeModelFallbackEvent}). `scope:"local"` marks a sub-agent /
@@ -2265,6 +2267,11 @@ function isSubmittedQueuedCommand(ev: TranscriptEvent | null | undefined): ev is
   if (ev.type !== 'attachment') return false;
   if (ev.attachment?.type !== 'queued_command') return false;
   if (ev.attachment.commandMode === 'task-notification') return false;
+  // Peer reports use commandMode:'prompt' too, but must not end the current
+  // human turn or reset its background-agent prompt sequence. Inspect the
+  // structured origin rather than isMeta or text: real human submissions can
+  // also carry isMeta, or contain a literal <agent-message> example.
+  if (ev.attachment.origin?.kind === 'peer') return false;
   if ((ev as any).isSidechain === true) return false;
   const text = normaliseForFingerprint(extractTurnStartText(ev));
   if (text.length === 0) return false;

@@ -25,6 +25,9 @@ import {
   extractAssistantTurns,
   extractLastAssistantTurn,
   isMeaningfulUserEvent,
+  isMeaningfulQueuedCommand,
+  isMidTurnAbsorbedQueuedCommand,
+  isIntraTurnAttachmentEvent,
   isScheduledTurnStartEvent,
   cronCreateToolUseIds,
   cronCreateAcks,
@@ -43,6 +46,68 @@ import {
   AbsorbedReplyCollector,
   type TranscriptEvent,
 } from '../src/services/claude-transcript.js';
+
+describe('queued command provenance', () => {
+  const queued = (metadata: Record<string, unknown> = {}, prompt = 'Continue the request'): TranscriptEvent => ({
+    type: 'attachment',
+    uuid: 'queued-provenance',
+    attachment: { type: 'queued_command', commandMode: 'prompt', prompt, ...metadata },
+  });
+
+  it.each([
+    ['with nested metadata', { origin: { kind: 'peer' }, isMeta: true }],
+    ['without the optional metadata flag', { origin: { kind: 'peer' } }],
+    ['with a false metadata flag', { origin: { kind: 'peer' }, isMeta: false }],
+    ['with additional sender fields', { origin: { kind: 'peer', from: 'worker', senderTaskId: 'agent-1' }, isMeta: true }],
+  ])('keeps a peer report %s inside the current turn', (_name, metadata) => {
+    const event = queued(metadata, '<agent-message from="worker">Partial result</agent-message>');
+    expect(isMeaningfulQueuedCommand(event)).toBe(false);
+    expect(isMidTurnAbsorbedQueuedCommand(event)).toBe(false);
+    expect(isIntraTurnAttachmentEvent(event)).toBe(true);
+  });
+
+  it('recognizes peer provenance without relying on an XML wrapper', () => {
+    const event = queued({ origin: { kind: 'peer' } }, 'Partial result without markup');
+    expect(isMeaningfulQueuedCommand(event)).toBe(false);
+    expect(isIntraTurnAttachmentEvent(event)).toBe(true);
+  });
+
+  it('does not treat a peer report rendered as a reminder as an absorbed human input', () => {
+    const event = { ...queued({ origin: { kind: 'peer' }, isMeta: true }), renderedRole: 'system' };
+    expect(isMeaningfulQueuedCommand(event)).toBe(false);
+    expect(isMidTurnAbsorbedQueuedCommand(event)).toBe(false);
+    expect(isIntraTurnAttachmentEvent(event)).toBe(true);
+  });
+
+  it.each([
+    ['legacy input without provenance', {}],
+    ['human input with metadata', { origin: { kind: 'human' }, isMeta: true }],
+    ['human input without metadata', { origin: { kind: 'human' } }],
+  ])('continues to recognize %s as a submitted prompt', (_name, metadata) => {
+    const event = queued(metadata, '<agent-message from="worker">User-supplied literal text</agent-message>');
+    expect(isMeaningfulQueuedCommand(event)).toBe(true);
+    expect(isMidTurnAbsorbedQueuedCommand(event)).toBe(false);
+    expect(isIntraTurnAttachmentEvent(event)).toBe(false);
+  });
+
+  it('preserves the existing mid-turn rendering of a real human input', () => {
+    const event = { ...queued({ origin: { kind: 'human' }, isMeta: true }), renderedRole: 'system' };
+    expect(isMeaningfulQueuedCommand(event)).toBe(false);
+    expect(isMidTurnAbsorbedQueuedCommand(event)).toBe(true);
+    expect(isIntraTurnAttachmentEvent(event)).toBe(true);
+  });
+
+  it.each([
+    ['task notification', queued({ commandMode: 'task-notification' })],
+    ['empty prompt', queued({}, '')],
+    ['sidechain prompt', { ...queued(), isSidechain: true }],
+    ['non-queued attachment', { type: 'attachment', attachment: { type: 'edited_text_file', prompt: 'changed' } }],
+  ])('does not start a turn for a %s', (_name, event) => {
+    expect(isMeaningfulQueuedCommand(event)).toBe(false);
+    expect(isMidTurnAbsorbedQueuedCommand(event)).toBe(false);
+    expect(isIntraTurnAttachmentEvent(event)).toBe((_name !== 'sidechain prompt'));
+  });
+});
 
 let dir: string;
 let path: string;
