@@ -63,6 +63,9 @@ export class TraexNativeContinuationTracker {
   private readonly activeTranscriptTurns = new Map<string, string | undefined>();
   /** Post-idle OSC 7501 `working` latch (never armed from a `!wasPromptReady` post-terminal window). */
   private programStatusNativeWorking = false;
+  /** When the tracker entered the OSC-only state (transcript closed, OSC working still held);
+   *  the anchor for a bounded stale-OSC recovery when the terminal OSC report is lost. */
+  private programStatusOnlySinceMs: number | undefined;
 
   observeTranscriptLifecycle(
     events: readonly TraexNativeTurnLifecycleEvent[],
@@ -117,6 +120,7 @@ export class TraexNativeContinuationTracker {
     }
 
     const nowActive = this.isActive(programStatusHeldWorking);
+    this.reconcileProgramStatusOnlyAnchor(programStatusHeldWorking);
     return {
       becameActive: !wasActive && nowActive,
       closedTranscriptContinuation,
@@ -129,12 +133,14 @@ export class TraexNativeContinuationTracker {
     const wasActive = this.isActive(input.programStatusHeldWorking);
     if (input.state !== 'working' || !input.programStatusHeldWorking) {
       this.programStatusNativeWorking = false;
+      this.reconcileProgramStatusOnlyAnchor(input.programStatusHeldWorking);
       return { becameActive: false, closedTranscriptContinuation: false };
     }
     if (input.wasPromptReady && !input.hasBotmuxTurnOwner && !input.botmuxOperationInFlight) {
       this.programStatusNativeWorking = true;
     }
     const nowActive = this.isActive(input.programStatusHeldWorking);
+    this.reconcileProgramStatusOnlyAnchor(input.programStatusHeldWorking);
     return {
       becameActive: !wasActive && nowActive,
       closedTranscriptContinuation: false,
@@ -144,6 +150,34 @@ export class TraexNativeContinuationTracker {
   /** Whether live rollout records prove an open TRAE native continuation turn. */
   hasTranscriptContinuation(): boolean {
     return this.activeTranscriptTurns.size > 0;
+  }
+
+  /** Maintain the OSC-only anchor: set on entry to "transcript closed while an
+   *  OSC working latch is still held", cleared the moment a transcript turn
+   *  reopens or the OSC latch/working hold drops. */
+  private reconcileProgramStatusOnlyAnchor(programStatusHeldWorking: boolean): void {
+    const oscOnly = this.activeTranscriptTurns.size === 0
+      && this.programStatusNativeWorking
+      && programStatusHeldWorking;
+    if (oscOnly) {
+      this.programStatusOnlySinceMs ??= Date.now();
+    } else {
+      this.programStatusOnlySinceMs = undefined;
+    }
+  }
+
+  /** How long the tracker has spent in the OSC-only state (every transcript
+   *  continuation closed, but the OSC 7501 working hold is still present).
+   *  `undefined` while a transcript continuation is open or no OSC latch/hold
+   *  remains. Bounds the stale-OSC recovery for a lost terminal report. */
+  programStatusOnlyForMs(now: number = Date.now(), programStatusHeldWorking = false): number | undefined {
+    if (this.programStatusOnlySinceMs === undefined) return undefined;
+    if (this.activeTranscriptTurns.size > 0
+      || !this.programStatusNativeWorking
+      || !programStatusHeldWorking) {
+      return undefined;
+    }
+    return now - this.programStatusOnlySinceMs;
   }
 
   /** Whether positive transcript or post-idle OSC 7501 evidence proves TRAE is
@@ -157,17 +191,20 @@ export class TraexNativeContinuationTracker {
    *  exact transcript continuation that already started after its terminal. */
   noteBotmuxTurnRetired(): void {
     this.programStatusNativeWorking = false;
+    this.programStatusOnlySinceMs = undefined;
   }
 
   /** Confirmed idle prompt retires every open native continuation marker. */
   notePromptReady(): void {
     this.activeTranscriptTurns.clear();
     this.programStatusNativeWorking = false;
+    this.programStatusOnlySinceMs = undefined;
   }
 
   /** Full teardown / respawn / bridge detach reset. */
   reset(): void {
     this.activeTranscriptTurns.clear();
     this.programStatusNativeWorking = false;
+    this.programStatusOnlySinceMs = undefined;
   }
 }

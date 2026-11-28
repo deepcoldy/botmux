@@ -21430,6 +21430,15 @@ function codexBridgeIngest(opts: {
         idleDetector?.reset();
         if (typeof publishScreenStatus === 'function') publishScreenStatus('working', { force: true });
       }
+      // Every transcript continuation has closed while OSC still holds working:
+      // arm the bounded stale-OSC recovery in case the terminal OSC report was
+      // lost (OSC 7501 has no heartbeat). The check only releases on multi-signal
+      // agreement after the quiet window, never on the terminal alone.
+      if (idleDetector?.programStatusHeldWorking() === true
+        && traexNativeContinuationActive()
+        && !traexNativeContinuation.hasTranscriptContinuation()) {
+        scheduleStaleProgramStatusCheck();
+      }
     }
   }
   if (structuredBridgeIs('codex')) {
@@ -35777,10 +35786,18 @@ function checkStaleProgramStatus(): void {
   const be = backend;
   if (!detector || !be) return;
   const now = Date.now();
+  const heldWorking = detector.programStatusHeldWorking();
+  // TRAE has no Claude-style transcript turn-end feed. Its stale-OSC anchor is
+  // the tracker's OSC-only window: every native continuation has closed in the
+  // rollout while an OSC 7501 working hold is still present (lost terminal report).
+  const isTraexNative = lastInitConfig?.cliId === 'traex' && !lastInitConfig?.adoptMode;
+  const transcriptEndedForMs = isTraexNative
+    ? traexNativeContinuation.programStatusOnlyForMs(now, heldWorking)
+    : claudeTranscriptTurnEnd.endedForMs(now);
   const evidence = {
-    heldWorking: detector.programStatusHeldWorking(),
+    heldWorking,
     programStatusQuietMs: detector.programStatusQuietMs(now),
-    transcriptEndedForMs: claudeTranscriptTurnEnd.endedForMs(now),
+    transcriptEndedForMs,
     backgroundTasksRunning: backgroundTaskTracker.pending(now)
       + (typeof backgroundAuthorityHold !== 'undefined' && backgroundAuthorityHold.isBackgroundHeld() ? 1 : 0),
   };
@@ -35791,6 +35808,9 @@ function checkStaleProgramStatus(): void {
     return;
   }
   if (!detector.releaseStaleProgramStatus()) return;
+  // The release marks idle on the detector; retire the TRAE OSC-only marker so
+  // the worker does not keep suppressing idle behind a now-released hold.
+  if (isTraexNative) traexNativeContinuation.notePromptReady();
   log(`[program-status] working held ${Math.round(evidence.programStatusQuietMs / 1000)}s with no report while the `
     + `transcript closed the turn ${Math.round(evidence.transcriptEndedForMs! / 1000)}s ago and the screen is at the prompt `
     + '— treating the lost terminal report as idle');

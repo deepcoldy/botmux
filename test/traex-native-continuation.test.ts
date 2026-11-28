@@ -23,6 +23,10 @@ import {
 import { IdleDetector } from '../src/utils/idle-detector.js';
 import { ProgramStatusFramingStream } from '../src/utils/program-status-parser.js';
 import { programStatusBlockHoldsTypeAhead } from '../src/core/program-status-gate.js';
+import {
+  STALE_PROGRAM_STATUS_QUIET_MS,
+  staleProgramStatusVerdict,
+} from '../src/utils/stale-program-status.js';
 import { pendingInputAllowsTypeAhead } from '../src/utils/pending-input-queue.js';
 import { beginRuntimeWriteCycle } from '../src/utils/runtime-screen-status.js';
 import { inspectPostTerminalComposer } from '../src/utils/pty-input-policy.js';
@@ -304,6 +308,54 @@ describe('TraexNativeContinuationTracker & drainTraexRollout', () => {
     });
     expect(tracker.isActive(false)).toBe(false);
   });
+
+  it('tracks the OSC-only window with a bounded timestamp anchor for stale recovery', () => {
+    vi.useFakeTimers();
+    const base = Date.parse('2026-11-28T00:00:00.000Z');
+    vi.setSystemTime(base);
+    const tracker = new TraexNativeContinuationTracker();
+
+    // OSC-first wake: map empty, latch armed -> OSC-only anchor starts now.
+    tracker.observeProgramStatus({
+      state: 'working', wasPromptReady: true, programStatusHeldWorking: true,
+      hasBotmuxTurnOwner: false, botmuxOperationInFlight: false,
+    });
+    expect(tracker.programStatusOnlyForMs(base, true)).toBe(0);
+
+    // A transcript turn opening leaves the OSC-only state.
+    vi.setSystemTime(base + 5_000);
+    tracker.observeTranscriptLifecycle(
+      [{ kind: 'started', turnId: 'B', rootTurnId: 'root' }], {}, true,
+    );
+    expect(tracker.programStatusOnlyForMs(Date.now(), true)).toBeUndefined();
+
+    // The turn closes while OSC still holds working: the anchor re-arms at close.
+    vi.setSystemTime(base + 30_000);
+    tracker.observeTranscriptLifecycle([{ kind: 'ended', turnId: 'B' }], {}, true);
+    expect(tracker.programStatusOnlyForMs(Date.now(), true)).toBe(0);
+    vi.setSystemTime(base + 30_000 + 65_000);
+    expect(tracker.programStatusOnlyForMs(Date.now(), true)).toBe(65_000);
+
+    // Lost working hold (or OSC terminal) drops the anchor even without an event.
+    expect(tracker.programStatusOnlyForMs(Date.now(), false)).toBeUndefined();
+
+    // An explicit non-working OSC report clears the latch and anchor; a later
+    // working re-wake then re-arms the anchor at that moment.
+    vi.setSystemTime(base + 100_000);
+    tracker.observeProgramStatus({
+      state: 'idle', wasPromptReady: false, programStatusHeldWorking: false,
+      hasBotmuxTurnOwner: false, botmuxOperationInFlight: false,
+    });
+    expect(tracker.programStatusOnlyForMs(Date.now(), false)).toBeUndefined();
+    tracker.observeProgramStatus({
+      state: 'working', wasPromptReady: true, programStatusHeldWorking: true,
+      hasBotmuxTurnOwner: false, botmuxOperationInFlight: false,
+    });
+    expect(tracker.programStatusOnlyForMs(Date.now(), true)).toBe(0);
+    vi.setSystemTime(base + 100_000 + 70_000);
+    expect(tracker.programStatusOnlyForMs(Date.now(), true)).toBe(70_000);
+    vi.useRealTimers();
+  });
 });
 
 describe('Worker resetTraexAutoModelBeforePendingTurn & flushPending during TRAE native continuation', () => {
@@ -465,6 +517,7 @@ describe('Worker resetTraexAutoModelBeforePendingTurn & flushPending during TRAE
       noteSpawnArgvTurnStartTranscriptEvidence: vi.fn(),
       emitReadyCodexTurns: vi.fn(),
       deferFinalIdleSignal: vi.fn(),
+      scheduleStaleProgramStatusCheck: vi.fn(),
       armPostTerminalInputFence: () => {
         scope.postTerminalInputFence = { backend: scope.backend, generation: scope.cliSpawnGeneration };
         scope.isPromptReady = false;
@@ -956,5 +1009,64 @@ describe('Worker resetTraexAutoModelBeforePendingTurn & flushPending during TRAE
     await h.flush();
     expect(scope.cliAdapter.writeInput).toHaveBeenCalledOnce();
     expect(scope.pendingMessages.map((m: any) => m.turnId)).toEqual(['om_bob']);
+  });
+
+  it('recovers a lost OSC terminal via the bounded stale check, but not while busy or inside the quiet window', () => {
+    vi.useFakeTimers();
+    const base = Date.parse('2026-11-28T00:00:00.000Z');
+    vi.setSystemTime(base);
+
+    const buildStuck = () => {
+      const h = buildWorkerHarness({ reselectPerTurn: false });
+      const { scope, rolloutPath, detector } = h;
+      let viewportIdle = true;
+      Object.assign(scope, {
+        backgroundTaskTracker: { pending: () => 0 },
+        staleProgramStatusVerdict,
+        viewportShowsIdlePrompt: () => viewportIdle,
+      });
+      scope.checkStaleProgramStatus = loadWorkerFunction('checkStaleProgramStatus', scope);
+
+      // OSC working wakes a continuation, then its rollout opens and closes
+      // without any OSC done/idle ever arriving (the lost terminal report).
+      scope.onPtyData('\x1b]7501;state=working:app=traecli\x1b\\');
+      appendFileSync(
+        rolloutPath,
+        traexTaskStarted('native-B', 'native-root', new Date(base).toISOString())
+          + traexTaskComplete('native-B', 'B done', new Date(base + 1_000).toISOString()),
+      );
+      scope.codexBridgeIngest();
+      expect(detector.programStatusHeldWorking()).toBe(true);
+      expect(scope.traexNativeContinuation.hasTranscriptContinuation()).toBe(false);
+      expect(scope.traexNativeContinuationActive()).toBe(true);
+      // Reaching the OSC-only state with working held arms the bounded stale check.
+      expect(scope.scheduleStaleProgramStatusCheck).toHaveBeenCalled();
+      return { h, scope, detector, setViewportIdle: (v: boolean) => { viewportIdle = v; } };
+    };
+
+    // 1. Inside the quiet window: the verdict waits, nothing is released.
+    const early = buildStuck();
+    vi.setSystemTime(base + STALE_PROGRAM_STATUS_QUIET_MS - 1_000);
+    early.scope.checkStaleProgramStatus();
+    expect(early.detector.programStatusHeldWorking()).toBe(true);
+    expect(early.scope.traexNativeContinuationActive()).toBe(true);
+
+    // 2. Past the window but the screen still looks busy: keep holding, reschedule.
+    vi.setSystemTime(base + STALE_PROGRAM_STATUS_QUIET_MS + 5_000);
+    early.setViewportIdle(false);
+    early.scope.checkStaleProgramStatus();
+    expect(early.detector.programStatusHeldWorking()).toBe(true);
+    expect(early.scope.traexNativeContinuationActive()).toBe(true);
+    expect(early.scope.scheduleStaleProgramStatusCheck).toHaveBeenCalled();
+
+    // 3. Window elapsed and the authoritative viewport shows the idle prompt:
+    //    the lost terminal report is treated as idle and the tracker retires.
+    early.setViewportIdle(true);
+    early.scope.checkStaleProgramStatus();
+    expect(early.detector.programStatusHeldWorking()).toBe(false);
+    expect(early.detector.isIdleNow()).toBe(true);
+    expect(early.scope.traexNativeContinuationActive()).toBe(false);
+    expect(early.scope.traexNativeContinuation.programStatusOnlyForMs(Date.now(), false)).toBeUndefined();
+    vi.useRealTimers();
   });
 });
