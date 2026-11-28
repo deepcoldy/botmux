@@ -13518,11 +13518,50 @@ function scheduledCliInputWriteHold(
   return !isCurrent() || (requireQueueOwner && owner?.item !== item) ? 'retain' : undefined;
 }
 
+/** The scheduled write this CLI's flushPending had begun when it was held
+ *  (retained) back into the queue. Until it is retired or any other input takes
+ *  the CLI, STOP owns it as it owned that in-flight writer. */
+type HeldScheduledWrite = {
+  item: PendingCliInput;
+  backend: SessionBackend;
+  generation: number;
+  turnId: string | undefined;
+  webSubmitGeneration: number;
+  rawInputGeneration: number;
+};
+let heldScheduledWrite: HeldScheduledWrite | undefined;
+
+/** A held write temporarily displaced while a literal command-line write (a
+ *  non-keepalive injection) is in flight. It is restored when that write is
+ *  proven not to have reached the CLI; `stopRequested` latches a STOP that
+ *  arrived during the window so the restored write is retired on settlement. */
+let suspendedHeldWrite: { held: HeldScheduledWrite; stopRequested: boolean } | undefined;
+
+/** A literal write proven not to have reached the CLI (framed runner's
+ *  `untouched`, or any submissionStarted=false refusal) gives the held write
+ *  back its STOP ownership. If STOP arrived while the write was in flight, run
+ *  the normal STOP retirement, with all its validity checks, immediately. */
+function restoreSuspendedHeldWrite(): void {
+  const suspended = suspendedHeldWrite;
+  suspendedHeldWrite = undefined;
+  if (!suspended) return;
+  heldScheduledWrite = suspended.held;
+  if (suspended.stopRequested) discardScheduledBacklogForStop();
+}
+
 function settleScheduledCliInputHold(
   item: PendingCliInput,
   held: 'reject' | 'retain',
   onHold: (decision: 'reject' | 'retain') => void,
 ): void {
+  const owner = cliSubmissionInFlight;
+  if (held === 'retain' && backend && owner?.item === item && owner.scheduledWritePending
+    && owner.generation === cliSpawnGeneration) {
+    heldScheduledWrite = {
+      item, backend, generation: cliSpawnGeneration, turnId: currentBotmuxTurnId,
+      webSubmitGeneration: webTerminalSubmitGeneration, rawInputGeneration: rawInputWriteGeneration,
+    };
+  }
   if (held === 'retain') scheduleScheduledAdmissionRetry(item);
   else cancelScheduledAdmissionRetry(item);
   onHold(held);
@@ -14977,6 +15016,7 @@ function saveUnsentInputsForSuccessor(reason: string): void {
 }
 
 function discardUnwrittenScheduledInput(item: PendingCliInput): void {
+  if (heldScheduledWrite?.item === item) heldScheduledWrite = undefined;
   if (item.turnId) send({ type: 'turn_input_rejected', turnId: item.turnId,
     ...(item.dispatchAttempt !== undefined ? { dispatchAttempt: item.dispatchAttempt } : {}),
     reason: 'execution_reconciliation_required', rejectedBeforeAdmission: true });
@@ -14995,11 +15035,24 @@ function coalescePendingScheduledInputs(pending: PendingCliInput[] = pendingMess
 }
 
 function discardScheduledBacklogForStop(): void {
+  // A literal injection may have suspended the held write at its write edge and
+  // still be in flight. Latch the stop intent; when that write settles as
+  // proven-unwritten the held slot is restored and retired below.
+  if (suspendedHeldWrite) suspendedHeldWrite.stopRequested = true;
   const activeTask = currentBotmuxTurnId ? parseScheduledTurnId(currentBotmuxTurnId) : null;
   const writing = cliSubmissionInFlight;
   const writingTask = writing?.scheduledWritePending
     ? automaticScheduledInputTask(writing.item) ?? scheduledRecoveryInputTask(writing.item) : undefined;
-  const targetTask = activeTask ?? writingTask;
+  // A write this CLI held back into the queue is still that writer between
+  // edges, unless another input has since taken (or is taking) the CLI.
+  const held = activeTask || writingTask ? undefined : heldScheduledWrite;
+  const heldTask = held && held.backend === backend && held.generation === cliSpawnGeneration
+    && pendingMessages.includes(held.item) && (!writing || writing.item === held.item)
+    && (currentBotmuxTurnId === undefined || currentBotmuxTurnId === held.turnId)
+    && webTerminalSubmitGeneration === held.webSubmitGeneration
+    && rawInputWriteGeneration === held.rawInputGeneration
+    ? automaticScheduledInputTask(held.item) ?? scheduledRecoveryInputTask(held.item) : undefined;
+  const targetTask = activeTask ?? writingTask ?? heldTask;
   // STOP belongs to a human/non-scheduled turn unless a scheduled writer proves
   // otherwise. Never turn that absence into a wildcard over every queued task.
   if (!targetTask) return;
@@ -15010,6 +15063,7 @@ function discardScheduledBacklogForStop(): void {
       const taskId = automaticScheduledInputTask(item) ?? scheduledRecoveryInputTask(item);
       if (taskId === targetTask) {
         queue.splice(index, 1);
+        cancelScheduledAdmissionRetry(item);
         discardUnwrittenScheduledInput(item);
       }
     }
@@ -15020,6 +15074,8 @@ function noteCliInputWritten(
   item: PendingCliInput,
   antigravityAnchor?: AntigravityTranscriptWriteBoundary,
 ): void {
+  // This input now owns the CLI: a held scheduled write is no longer its writer.
+  heldScheduledWrite = undefined;
   lastWrittenCliInput = item;
   lastWrittenCliInputWebSubmitGen = webTerminalSubmitGeneration;
   lastWrittenCliInputRawGen = rawInputWriteGeneration;
@@ -26562,6 +26618,18 @@ async function flushPendingInjections(): Promise<void> {
             'Web terminal wire is dirty before injection', 'web_terminal_input_wire_dirty', false,
           );
 
+          // A non-keepalive injection is a fresh operator input taking the CLI
+          // at this literal write edge: suspend the held writer rather than drop
+          // it outright, so a write later proven not to have reached the CLI can
+          // give back its STOP ownership. Suspending here, before the physical
+          // write, also means a STOP arriving while the injection is in flight
+          // cannot retire the held write (it latches stopRequested instead).
+          // Keep-alive is bot-generated and never touches the held writer.
+          if (item.kind !== 'keepalive' && heldScheduledWrite) {
+            suspendedHeldWrite = { held: heldScheduledWrite, stopRequested: false };
+            heldScheduledWrite = undefined;
+          }
+
           // Record the keep-alive by its actual command fingerprint so the later
           // UserPromptSubmit hook can be matched by content regardless of HTTP
           // arrival ordering. A non-keepalive injection does NOT touch existing
@@ -26578,12 +26646,24 @@ async function flushPendingInjections(): Promise<void> {
           }
         });
         await awaitPtyQuiescence(STARTUP_CMD_QUIET_MS, STARTUP_CMD_CAP_MS);
+        // The injection really landed: the held write stays without STOP ownership.
+        suspendedHeldWrite = undefined;
         log(`Injected command: ${cmd}`);
       } catch (e: any) {
-        if (e instanceof SubmissionWriteError && !e.submissionStarted
-          && webTerminalInputWireDirty()) {
+        const provenUnwritten = e instanceof SubmissionWriteError && !e.submissionStarted;
+        if (provenUnwritten && webTerminalInputWireDirty()) {
           pendingInjections.unshift(item);
+          restoreSuspendedHeldWrite();
           return;
+        }
+        if (provenUnwritten) {
+          // A framed runner's untouched / pre-write refusal proves no byte reached
+          // the CLI: restore the held writer (and retire it now if STOP latched).
+          restoreSuspendedHeldWrite();
+        } else {
+          // Ambiguous (a frame may have buffered) or an ordinary failure leaves
+          // the CLI state uncertain: the held write stays without STOP ownership.
+          suspendedHeldWrite = undefined;
         }
         log(`Inject command failed (${cmd}): ${e?.message ?? e}`);
       }
@@ -27652,6 +27732,10 @@ async function handleAntigravitySideQuestion(
       if (!current() || heldStuckPage(screen) || !hasAntigravitySideQuestionComposer(screen) || !firstWriteMayProceed()) {
         throw new SubmissionWriteError('Antigravity /btw requires an empty native composer', undefined, false);
       }
+      // The side question is a fresh operator input opening its own native
+      // conversation: any scheduled write held back in the queue is no longer
+      // the writer a later STOP should retire.
+      heldScheduledWrite = undefined;
     });
     // The terminal command launches a different native conversation. A
     // receipt and matching input are required before any output can cross
@@ -33207,6 +33291,9 @@ async function flushPending(): Promise<void> {
         if (await postTerminalInputIsBlocked(target)
           || backend !== target || generation !== cliSpawnGeneration
           || cliRestartInProgress || webTerminalInputWireDirty()) break;
+        // A lifecycle path (STOP, coalesce, cancel) may have emptied the queue
+        // during that await.
+        if (pendingMessages.length === 0) break;
       }
       if (activeTurnBlocks(pendingMessages[0]!)) {
         if (typeof backgroundAuthorityHold !== 'undefined' && backgroundAuthorityHold.isIdleWaiting()) {
