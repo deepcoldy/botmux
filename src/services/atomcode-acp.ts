@@ -31,10 +31,12 @@ const RESUME_LEASE_WAIT_MS = 9_000;
 const RESUME_LEASE_RETRY_INITIAL_MS = 100;
 const RESUME_LEASE_RETRY_STEP_MS = 50;
 const RESUME_LEASE_RETRY_MAX_MS = 250;
-// Brief drain window after OS process 'exit' before destroying stdio pipes and
-// failing pending RPCs, so a detached grandchild holding stdout/stderr open
-// cannot stall active turns or teardownPromise indefinitely.
+// Idle drain window (and hard cap) after OS process 'exit' before destroying stdio
+// pipes and failing pending RPCs. Resetting on active stdout chunks avoids cutting off
+// near-cap frames whose JSON.parse exceeds 50ms, while still bounding detached grandchildren.
 const EXIT_STDIO_DRAIN_MS = 50;
+const EXIT_STDIO_DRAIN_MAX_MS = 500;
+const PROCESS_GROUP_REAP_TIMEOUT_MS = 500;
 const DEFAULT_ATOMCODE_IDLE_RELEASE_MS = 120_000;
 
 export type AtomcodeUserInputHandler = (
@@ -125,7 +127,9 @@ interface ActiveTurnState {
   contentBytes: number;
   messageId?: string;
   nextMessage: boolean;
-  incoming: Set<number | string>;
+  incoming: Map<number | string, 'elicitation/create' | 'session/request_permission'>;
+  turnSettled: Promise<void>;
+  resolveTurnSettled: () => void;
   onUpdate?: (update: Json) => void;
   onUserInput: AtomcodeUserInputHandler;
   onInteractionPending?: (waiting: boolean) => void;
@@ -213,6 +217,7 @@ class AtomcodeAcpConnection {
   private wireClosed = false;
   private failure?: Error;
   private exitDrainTimer?: ReturnType<typeof setTimeout>;
+  private exitDrainDeadline?: number;
   private hardKill?: ReturnType<typeof setTimeout>;
   private cancelGraceWait?: () => void;
   private activeTurn?: ActiveTurnState;
@@ -242,8 +247,21 @@ class AtomcodeAcpConnection {
     const finalizeExitFailure = () => {
       clearTimeout(this.exitDrainTimer);
       this.exitDrainTimer = undefined;
+      this.exitDrainDeadline = undefined;
       this.destroyStreams();
       if (!this.wireClosed) this.fail(new Error('atomcode_acp_process_exited'));
+    };
+
+    const scheduleExitDrain = () => {
+      clearTimeout(this.exitDrainTimer);
+      this.exitDrainDeadline ??= Date.now() + EXIT_STDIO_DRAIN_MAX_MS;
+      const remaining = this.exitDrainDeadline - Date.now();
+      if (remaining <= 0) {
+        finalizeExitFailure();
+        return;
+      }
+      this.exitDrainTimer = setTimeout(finalizeExitFailure, Math.min(EXIT_STDIO_DRAIN_MS, remaining));
+      this.exitDrainTimer.unref?.();
     };
 
     const readFrames = createAtomcodeFrameReader(line => {
@@ -256,7 +274,15 @@ class AtomcodeAcpConnection {
         readFrames(chunk);
       } catch (error) {
         this.fail(error instanceof Error ? error : new Error('atomcode_acp_protocol_invalid'));
+        return;
       }
+      if (this.childExited && this.exitDrainTimer && !this.wireClosed && !this.failure) {
+        scheduleExitDrain();
+      }
+    });
+    // Settle immediately on stdout EOF after exit even if a detached grandchild still holds stderr open.
+    this.child.stdout.once('end', () => {
+      if (this.childExited) finalizeExitFailure();
     });
     // Drain stderr without retaining it so verbose tool diagnostics cannot exhaust memory or block the pipe.
     this.child.stderr.resume();
@@ -270,7 +296,7 @@ class AtomcodeAcpConnection {
     });
     // Track OS process exit separately from stdio 'close': a detached grandchild
     // that inherited stdout/stderr can prevent 'close' from ever firing after the
-    // ACP process itself has exited. Give in-flight RPCs only a brief bounded drain
+    // ACP process itself has exited. Give in-flight RPCs only a bounded idle drain
     // window for buffered stdout frames before destroying pipes and failing RPCs.
     this.child.once('exit', () => {
       markExited();
@@ -284,8 +310,7 @@ class AtomcodeAcpConnection {
         || this.child.stdout.destroyed) {
         finalizeExitFailure();
       } else {
-        this.exitDrainTimer = setTimeout(finalizeExitFailure, EXIT_STDIO_DRAIN_MS);
-        this.exitDrainTimer.unref?.();
+        scheduleExitDrain();
       }
     });
     this.child.once('close', () => {
@@ -397,6 +422,8 @@ class AtomcodeAcpConnection {
 
     const turnLifetime = new AbortController();
     const inputSignal = AbortSignal.any([signal, turnLifetime.signal, this.lifetime.signal]);
+    let resolveTurnSettled!: () => void;
+    const turnSettled = new Promise<void>(resolve => { resolveTurnSettled = resolve; });
     const state: ActiveTurnState = {
       turnLifetime,
       inputSignal,
@@ -407,7 +434,9 @@ class AtomcodeAcpConnection {
       contentBytes: 0,
       messageId: undefined,
       nextMessage: false,
-      incoming: new Set<number | string>(),
+      incoming: new Map<number | string, 'elicitation/create' | 'session/request_permission'>(),
+      turnSettled,
+      resolveTurnSettled,
       onUpdate: turn.onUpdate,
       onUserInput: turn.onUserInput,
       onInteractionPending: turn.onInteractionPending,
@@ -421,6 +450,15 @@ class AtomcodeAcpConnection {
       turnLifetime.abort(new Error('atomcode_acp_aborted'));
       if (this.sessionId && this.activeTurn === state && !this.failure && !this.wireClosed) {
         try {
+          // Unpark any server-initiated permission/form RPC before session/cancel so
+          // AtomCode's inline turn loop does not stay blocked until CANCEL_GRACE_TIMEOUT_MS.
+          for (const [reqId, reqMethod] of state.incoming) {
+            const cancelResult = reqMethod === 'session/request_permission'
+              ? { outcome: { outcome: 'cancelled' } }
+              : { action: 'cancel' };
+            this.child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: reqId, result: cancelResult })}\n`);
+          }
+          state.incoming.clear();
           this.child.stdin.write(`${JSON.stringify({
             jsonrpc: '2.0',
             method: 'session/cancel',
@@ -468,6 +506,9 @@ class AtomcodeAcpConnection {
         state.onInteractionPending?.(false);
       }
       if (this.activeTurn === state) this.activeTurn = undefined;
+      // Resolve turnSettled BEFORE awaiting close(false) so a concurrent close(true)
+      // waiting on cooperative cancel cannot deadlock with this finally block.
+      state.resolveTurnSettled();
       if (!succeeded) {
         turnLifetime.abort(new Error('atomcode_acp_closed'));
         await this.close(false);
@@ -477,15 +518,19 @@ class AtomcodeAcpConnection {
 
   /** Idempotently tear down this connection. When `graceful` is true and no
    *  turn is active, sends `session/close` + stdin EOF to let AtomCode commit
-   *  state and drop its `.lease` cleanly; a subsequent `close(false)` escalates
-   *  any in-flight graceful close or post-EOF wait immediately. */
+   *  state and drop its `.lease` cleanly; when `graceful` is true during an
+   *  already-aborted active turn, lets cooperative `session/cancel` settle first;
+   *  a `close(false)` call escalates any in-flight close or cancel wait immediately. */
   close(graceful: boolean): Promise<void> {
     this.closingRequested = true;
+    // Wait for cooperative cancel when close(true) follows lifecycle.abort() on an active turn,
+    // so AtomCode can drop its setsid() bash children instead of being SIGKILL'd at 1ms.
+    const cooperativeCancel = graceful && this.activeTurn?.aborted ? this.activeTurn.turnSettled : undefined;
     // Never wait on idle session/close while a prompt or human-input round-trip is active;
     // cancel immediately so blocked onUserInput handlers unblock without stalling.
     const effectiveGraceful = graceful && !this.activeTurn;
-    if (!effectiveGraceful) {
-      if (this.activeTurn && this.sessionId && !this.failure && !this.wireClosed) {
+    if (!effectiveGraceful && !cooperativeCancel) {
+      if (this.activeTurn && !this.activeTurn.aborted && this.sessionId && !this.failure && !this.wireClosed) {
         try {
           this.child.stdin.write(`${JSON.stringify({
             jsonrpc: '2.0',
@@ -494,7 +539,7 @@ class AtomcodeAcpConnection {
           })}\n`);
         } catch { /* process teardown follows */ }
       }
-      // Escalate an in-flight graceful close or post-EOF grace wait immediately.
+      // Escalate an in-flight graceful close, cooperative cancel, or post-EOF grace wait immediately.
       this.cancelGraceWait?.();
       if (!this.wireClosed) {
         this.fail(new Error('atomcode_acp_closed'));
@@ -504,12 +549,15 @@ class AtomcodeAcpConnection {
       }
     }
     if (this.closedPromise) return this.closedPromise;
-    this.closedPromise = this.performClose(effectiveGraceful);
+    this.closedPromise = this.performClose(effectiveGraceful, cooperativeCancel);
     return this.closedPromise;
   }
 
-  private async performClose(graceful: boolean): Promise<void> {
+  private async performClose(graceful: boolean, waitForCancel?: Promise<void>): Promise<void> {
     try {
+      if (waitForCancel) {
+        await waitForCancel;
+      }
       // Close the live session before EOF so AtomCode releases the native session
       // lease immediately before any subsequent local resume or reconnect.
       if (graceful && !this.failure && !this.childExited && this.canClose && this.sessionId && !this.activeTurn) {
@@ -522,13 +570,15 @@ class AtomcodeAcpConnection {
       this.rejectPending(new Error('atomcode_acp_closed'));
       if (allowGracefulExit && !this.childExited) {
         // Allow shutdown_sessions() to commit state and drop the disk lease before SIGTERM.
+        // If session/close was unavailable, EOF itself triggers AtomCode's 5s stop_and_wait.
+        const eofGraceMs = this.canClose ? GRACEFUL_EXIT_TIMEOUT_MS : CLOSE_REQUEST_TIMEOUT_MS;
         try { this.child.stdin.end(); } catch { /* ignore */ }
         let graceTimer: ReturnType<typeof setTimeout> | undefined;
         await Promise.race([
           this.exited,
           new Promise<void>(resolve => {
             this.cancelGraceWait = resolve;
-            graceTimer = setTimeout(resolve, GRACEFUL_EXIT_TIMEOUT_MS);
+            graceTimer = setTimeout(resolve, eofGraceMs);
           }),
         ]);
         this.cancelGraceWait = undefined;
@@ -539,17 +589,35 @@ class AtomcodeAcpConnection {
         this.hardKill ??= setTimeout(() => this.kill('SIGKILL'), 1000);
       }
       await this.exited;
-      // The group leader can exit while a tool descendant ignores SIGTERM;
-      // reap any remaining process-group members before returning.
+      // The OWNER_GUARD group leader can exit immediately on SIGTERM while atomcode
+      // or a tool descendant is still dying; SIGKILL the group and wait briefly for
+      // kernel reaping (ESRCH) so its OS .lease fd is closed before returning.
       this.killGroup('SIGKILL');
+      await this.waitForProcessGroupGone();
     } finally {
       this.wireClosed = true;
       this.cancelGraceWait = undefined;
       clearTimeout(this.exitDrainTimer);
       this.exitDrainTimer = undefined;
+      this.exitDrainDeadline = undefined;
       clearTimeout(this.hardKill);
       this.hardKill = undefined;
       this.destroyStreams();
+    }
+  }
+
+  private async waitForProcessGroupGone(): Promise<void> {
+    const pid = this.child.pid;
+    if (!pid) return;
+    const deadline = Date.now() + PROCESS_GROUP_REAP_TIMEOUT_MS;
+    while (true) {
+      try {
+        process.kill(-pid, 0);
+      } catch {
+        return;
+      }
+      if (Date.now() >= deadline) return;
+      await new Promise(resolve => setTimeout(resolve, 10));
     }
   }
 
@@ -578,7 +646,13 @@ class AtomcodeAcpConnection {
         if (!isResumeLeaseBusyError(error) || remaining <= 0 || waitSignal.aborted) {
           throw error;
         }
-        await sleepWithAbort(Math.min(delayMs, remaining), waitSignal);
+        try {
+          await sleepWithAbort(Math.min(delayMs, remaining), waitSignal);
+        } catch (waitError) {
+          // Surface subprocess crash reason instead of misreporting it as caller abort.
+          if (!signal.aborted && this.failure) throw this.failure;
+          throw waitError;
+        }
         delayMs = Math.min(delayMs + RESUME_LEASE_RETRY_STEP_MS, RESUME_LEASE_RETRY_MAX_MS);
       }
     }
@@ -666,12 +740,12 @@ class AtomcodeAcpConnection {
           return;
         }
         if (turn.incoming.size >= 8) throw new Error('atomcode_acp_too_many_questions');
-        turn.incoming.add(id);
+        const method = message.method;
+        turn.incoming.set(id, method);
         if (turn.incoming.size === 1) {
           turn.interactionPending = true;
           turn.onInteractionPending?.(true);
         }
-        const method = message.method;
         void Promise.resolve()
           .then(() => turn.onUserInput(method, params, turn.inputSignal))
           .then(result => {

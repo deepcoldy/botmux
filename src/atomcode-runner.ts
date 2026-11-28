@@ -6,6 +6,7 @@ import { MinimaxTurnBudget, parseMinimaxTurnTimeout } from './services/minimax-t
 import { writeMinimaxFinal } from './services/minimax-final-control.js';
 import { AtomcodeAcpSession, parseAtomcodeIdleTimeout } from './services/atomcode-acp.js';
 import { bridgeAtomcodeForm, bridgeAtomcodePermission } from './services/atomcode-user-input.js';
+import { isIgnorableStreamError } from './utils/stdio-epipe-guard.js';
 
 const FRAME_PREFIX = '::botmux-atomcode:';
 const output = new RunnerControlWriter();
@@ -75,7 +76,7 @@ const session = new AtomcodeAcpSession({
     // Publish immediately so a mid-turn runner crash still preserves this session for resume.
     if (nativeSessionId === sessionId) return;
     nativeSessionId = sessionId;
-    output.marker('thread', { threadId: sessionId });
+    if (!closing) output.marker('thread', { threadId: sessionId });
   },
 });
 
@@ -145,6 +146,7 @@ async function drain(): Promise<void> {
               : bridgeAtomcodePermission(context, params, signal);
           },
           onUpdate(update) {
+            if (closing) return;
             if (update.sessionUpdate === 'agent_message_chunk' && typeof update.content?.text === 'string') {
               displayText(update.content.text);
             } else if (update.sessionUpdate === 'tool_call') {
@@ -191,8 +193,10 @@ async function drain(): Promise<void> {
         budget.dispose();
         active = undefined;
       }
-      finishDisplay();
-      if (!closing) prompt();
+      if (!closing) {
+        finishDisplay();
+        prompt();
+      }
     }
   } finally {
     processing = false;
@@ -227,6 +231,18 @@ function close(): void {
   queue.length = 0;
   active?.abort();
   if (!processing) finalizeShutdown();
+}
+
+// Swallow broken-pipe / closed-PTY writes (EPIPE/EIO) and enter graceful shutdown
+// so a mid-stream PTY teardown never crashes the runner before session.close() releases .lease.
+for (const stream of [process.stdout, process.stderr]) {
+  stream.on('error', (err: NodeJS.ErrnoException) => {
+    if (isIgnorableStreamError(err) || err.code === 'EIO') {
+      close();
+      return;
+    }
+    throw err;
+  });
 }
 
 process.on('SIGTERM', close);

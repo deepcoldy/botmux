@@ -78,8 +78,10 @@ let promptId;
 let promptText;
 const update = u => send({ method: 'session/update', params: { sessionId, update: u } });
 const complete = (text, stopReason = 'end_turn', messageId = 'm-final') => {
+  const id = promptId;
+  promptId = undefined;
   update({ sessionUpdate: 'agent_message_chunk', messageId, content: { type: 'text', text } });
-  send({ id: promptId, result: { stopReason } });
+  if (id !== undefined) send({ id, result: { stopReason } });
 };
 
 for await (const line of createInterface({ input: process.stdin })) {
@@ -110,6 +112,19 @@ for await (const line of createInterface({ input: process.stdin })) {
   } else if (method === 'session/resume' || method === 'session/load') {
     if (scenario === 'unknown-session') {
       send({ id, error: { code: -32602, message: 'Invalid params', data: `unknown session \`${params.sessionId}\`` } });
+      continue;
+    }
+    if (scenario === 'crash-during-lease-wait') {
+      log({ event: 'resume_lease_busy', pid: process.pid, sessionId: params.sessionId });
+      send({
+        id,
+        error: {
+          code: -32602,
+          message: 'Invalid params',
+          data: 'session is active in another atomcode process; close it before resuming',
+        },
+      });
+      setTimeout(() => process.exit(8), 25);
       continue;
     }
     if (!acquireLease()) {
@@ -145,11 +160,27 @@ for await (const line of createInterface({ input: process.stdin })) {
     send({ id, result: {} });
   } else if (method === 'session/cancel') {
     log({ event: 'cancel_received', pid: process.pid });
-    if (promptId !== undefined) send({ id: promptId, result: { stopReason: 'cancelled' } });
+    const cancelDelay = Number(process.env.ATOMCODE_ACP_CANCEL_DELAY_MS ?? '0');
+    const idToCancel = promptId;
+    promptId = undefined;
+    if (idToCancel !== undefined) {
+      if (cancelDelay > 0) {
+        setTimeout(() => send({ id: idToCancel, result: { stopReason: 'cancelled' } }), cancelDelay);
+      } else {
+        send({ id: idToCancel, result: { stopReason: 'cancelled' } });
+      }
+    }
   } else if (method === 'session/prompt') {
     promptId = id;
     promptText = params.prompt[0].text;
     if (promptText === 'hang') continue;
+    if (promptText === 'stream-then-slow-cancel') {
+      update({ sessionUpdate: 'agent_message_chunk', messageId: 'm-stream', content: { type: 'text', text: 'chunk1' } });
+      setTimeout(() => {
+        update({ sessionUpdate: 'agent_message_chunk', messageId: 'm-stream', content: { type: 'text', text: 'chunk2' } });
+      }, 30);
+      continue;
+    }
     if (promptText === 'crash') process.exit(4);
     if (promptText === 'detached-grandchild-crash' || promptText === 'detached-grandchild-hang') {
       const sleeper = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 15000)'], {
@@ -269,9 +300,23 @@ for await (const line of createInterface({ input: process.stdin })) {
     const effort = control.configOptions.find(o => o.id === 'reasoning_effort').currentValue;
     complete(`echo:${promptText}|mode=${mode}|model=${model}|effort=${effort}`);
   } else if (id === 'form-1') {
-    complete(`form:${JSON.stringify(message.result)}`);
+    if (message.result?.action === 'cancel') {
+      log({ event: 'interaction_cancelled', id, result: message.result });
+      const idToCancel = promptId;
+      promptId = undefined;
+      if (idToCancel !== undefined) send({ id: idToCancel, result: { stopReason: 'cancelled' } });
+    } else {
+      complete(`form:${JSON.stringify(message.result)}`);
+    }
   } else if (id === 'perm-1') {
-    complete(`perm:${JSON.stringify(message.result)}`);
+    if (message.result?.outcome?.outcome === 'cancelled') {
+      log({ event: 'interaction_cancelled', id, result: message.result });
+      const idToCancel = promptId;
+      promptId = undefined;
+      if (idToCancel !== undefined) send({ id: idToCancel, result: { stopReason: 'cancelled' } });
+    } else {
+      complete(`perm:${JSON.stringify(message.result)}`);
+    }
   } else if (id === 'unk-1') {
     complete(`unsupported:${message.error?.code}`);
   }

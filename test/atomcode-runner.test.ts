@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
@@ -237,5 +237,30 @@ describe('atomcode-runner', () => {
     expect(closeDoneIdx).toBeGreaterThan(busyIdx);
     // Exactly 2 ACP spawns total (old + replacement); retries happened on the live replacement ACP process.
     expect(calls.filter(e => Array.isArray(e.args))).toHaveLength(2);
+  });
+
+  it('handles broken stdout (EPIPE) + SIGHUP mid-stream cleanly and still closes the ACP session lease', async () => {
+    const shared = fixture();
+    const leaseFile = join(shared.root, 'session.lease');
+    const r = startRunner([], false, {
+      existingFixture: shared,
+      extraEnv: {
+        ATOMCODE_ACP_LEASE_FILE: leaseFile,
+        ATOMCODE_ACP_CANCEL_DELAY_MS: '150',
+      },
+    });
+    await waitFor(() => /^›$/m.test(r.h.stdout));
+
+    r.send('stream-then-slow-cancel', 'turn-epipe');
+    await waitFor(() => r.h.stdout.includes('chunk1'));
+
+    // Tear down stdout reader (simulating PTY/pipe close) and send SIGHUP mid-stream:
+    // runner must not crash with uncaught EPIPE before releasing the session lease.
+    r.h.child.stdout.destroy();
+    r.h.child.kill('SIGHUP');
+    const exit = await r.h.closed;
+    expect(exit.code).toBe(0);
+    expect(r.h.stderr).not.toContain('EPIPE');
+    expect(existsSync(leaseFile)).toBe(false);
   });
 });

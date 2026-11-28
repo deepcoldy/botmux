@@ -623,6 +623,8 @@ describe('AtomcodeAcpSession persistent lifecycle', () => {
     expect(Date.now() - tAsk).toBeLessThan(1_500);
     expect(inputAborted).toBe(true);
     expect(waiting).toBe(false);
+    expect(fAsk.readLog().some(e => e.event === 'interaction_cancelled' && e.id === 'form-1')).toBe(true);
+    expect(fAsk.readLog().filter(e => e.event === 'cancel_received')).toHaveLength(1);
     releaseLateInput();
 
     // 4. Negative idleTimeoutMs is rejected fail-closed.
@@ -724,6 +726,68 @@ describe('AtomcodeAcpSession persistent lifecycle', () => {
     await expect(abortTurn).rejects.toThrow(/aborted/);
     expect(Date.now() - t0).toBeLessThan(2_000);
     await sAbort.close(false);
+
+    // 4. Subprocess crash during lease-wait backoff must surface atomcode_acp_process_exited (not aborted).
+    const fCrashWait = createFixture({ ATOMCODE_ACP_SCENARIO: 'crash-during-lease-wait' });
+    await expect(runSingleTurn({
+      executable: fCrashWait.bin,
+      cwd: fCrashWait.root,
+      env: fCrashWait.env,
+      nativeSessionId: 'acp-fixture-session-1',
+      content: 'hello',
+      permission: 'full',
+      onUserInput: async () => ({}),
+    }, new AbortController().signal)).rejects.toThrow(/atomcode_acp_process_exited/);
+  });
+
+  it('unparks pending permission RPC on abort and lets close(true) cancel cooperatively without duplicate session/cancel', async () => {
+    // 1. Aborting during session/request_permission replies with cancelled outcome so AtomCode unparks promptly.
+    const fPerm = createFixture();
+    const sPerm = new AtomcodeAcpSession({
+      executable: fPerm.bin,
+      cwd: fPerm.root,
+      env: fPerm.env,
+      permission: 'smart',
+      idleTimeoutMs: 30_000,
+    });
+    let permWaiting = false;
+    const permController = new AbortController();
+    const permTurn = sPerm.runTurn({
+      content: 'ask-permission',
+      onInteractionPending: w => { permWaiting = w; },
+      onUserInput: async (_method, _params, signal) => {
+        await new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true }));
+        return { outcome: { outcome: 'cancelled' } };
+      },
+    }, permController.signal);
+    await waitFor(() => permWaiting);
+    const tPerm = Date.now();
+    permController.abort();
+    await expect(permTurn).rejects.toThrow(/aborted/);
+    expect(Date.now() - tPerm).toBeLessThan(1_000);
+    expect(fPerm.readLog().some(e => e.event === 'interaction_cancelled' && e.id === 'perm-1')).toBe(true);
+    await sPerm.close();
+
+    // 2. close(true) during an active turn sends session/cancel once and waits cooperatively instead of SIGKILLing at 1ms.
+    const fGrace = createFixture({ ATOMCODE_ACP_CANCEL_DELAY_MS: '150' });
+    const sGrace = new AtomcodeAcpSession({
+      executable: fGrace.bin,
+      cwd: fGrace.root,
+      env: fGrace.env,
+      permission: 'full',
+      idleTimeoutMs: 30_000,
+    });
+    const hangTurn = sGrace.runTurn({
+      content: 'hang',
+      onUserInput: async () => ({}),
+    }, new AbortController().signal);
+    await waitFor(() => fGrace.readLog().some(e => e.message?.method === 'session/prompt'));
+    const tGrace = Date.now();
+    await sGrace.close(true);
+    await expect(hangTurn).rejects.toThrow(/aborted|closed/);
+    expect(Date.now() - tGrace).toBeGreaterThanOrEqual(120);
+    expect(Date.now() - tGrace).toBeLessThan(1_500);
+    expect(fGrace.readLog().filter(e => e.event === 'cancel_received')).toHaveLength(1);
   });
 
   it('settles active turns and teardown promptly on OS exit even when a detached grandchild inherits stdio', async () => {
