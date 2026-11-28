@@ -158,6 +158,28 @@ describe('localCliCommandForSession', () => {
     });
   });
 
+  it('pins only the custom AtomCode home after rewriting the local executable', () => {
+    const result = localCliCommandForSession(session({
+      session: {
+        ...session().session,
+        cliId: 'atomcode',
+        cliPathOverride: '/bin/echo',
+        cliSessionId: 'acp-custom-home',
+      },
+      initConfig: {
+        env: { ATOMCODE_HOME: "/srv/atomcode bot's", SECRET_TOKEN: 'do-not-leak' },
+      } as DaemonSession['initConfig'],
+    }));
+    const assignment = String.raw`ATOMCODE_HOME='/srv/atomcode bot'\''s'`;
+    expect(result).toEqual({
+      ok: true,
+      mode: 'resume',
+      executable: '/bin/echo',
+      command: `cd '/tmp/project with space' && ${assignment} exec '/bin/echo' resume 'custom-home'`,
+    });
+    expect(result.ok && result.command).not.toContain('do-not-leak');
+  });
+
   it('falls back to launching atomcode binary when no cliSessionId exists yet', () => {
     const result = localCliCommandForSession(session({
       session: {

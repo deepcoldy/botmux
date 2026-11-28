@@ -76,6 +76,13 @@ export function createAtomcodeAdapter(pathOverride?: string): CliAdapter {
       const nativeId = cliSessionId.replace(/^acp-/, '');
       return `atomcode resume '${nativeId.replace(/'/g, "'\\''")}'`;
     },
+    buildResumeCommandEnv({ env }) {
+      const nativeEnv = { ...process.env, ...env };
+      // Pin only an explicitly configured home. The default remains portable, and
+      // unrelated per-bot values (which may contain credentials) never enter the command.
+      if (!nativeEnv.ATOMCODE_HOME?.trim()) return undefined;
+      return { ATOMCODE_HOME: atomcodeDataDir(nativeEnv) };
+    },
     writeInput(pty, content, context) {
       return writeRunnerInput(
         pty,

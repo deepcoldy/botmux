@@ -17,6 +17,7 @@ function makeTempDir(): string {
 }
 
 afterEach(() => {
+  vi.unstubAllEnvs();
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -98,6 +99,16 @@ describe('AtomCode CLI adapter', () => {
       .toBe("atomcode resume 'abc-123'");
     expect(adapter.buildResumeCommand?.({ sessionId: 's1', cliSessionId: 'raw-456' }))
       .toBe("atomcode resume 'raw-456'");
+  });
+
+  it('exports only the resolved custom data home for local resume', () => {
+    const adapter = createAtomcodeAdapter('/bin/true');
+    expect(adapter.buildResumeCommandEnv?.({
+      env: { HOME: '/tmp/home', ATOMCODE_HOME: '~/custom', SECRET_TOKEN: 'do-not-export' },
+    })).toEqual({ ATOMCODE_HOME: '/tmp/home/custom' });
+
+    vi.stubEnv('ATOMCODE_HOME', undefined);
+    expect(adapter.buildResumeCommandEnv?.({ env: { SECRET_TOKEN: 'do-not-export' } })).toBeUndefined();
   });
 
   it('encodes ::botmux-atomcode: framed messages and detects models from config.toml', async () => {
