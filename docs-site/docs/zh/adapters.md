@@ -157,7 +157,7 @@ export CURSOR_DATA_DIR="$HOME/.cursor"
 exec /path/to/cursor-agent-local --authless --disable-auto-update "$@"
 ```
 
-将上游模型密钥保存在网关内。通过服务的密钥配置给启动脚本传入限权的本地网关令牌。如果机器人使用[严格环境变量模式](/zh/bots-json#strict-env)过滤该环境，在允许列表加入 `CURSOR_LOCAL_AGENT_API_KEY`。网关需提供 `GET /models` 和流式 `POST /chat/completions`。使用工作区工具时，网关还需支持流式工具调用。
+将上游模型密钥保存在网关内。通过服务的密钥配置给启动脚本传入限权的本地网关令牌。如果机器人使用[严格环境变量模式](/zh/bots-json#strict-env)过滤该环境，在允许列表加入 `CURSOR_LOCAL_AGENT_API_KEY`。使用 Chat Completions 时，网关需提供 `GET /v1/models` 和流式 `POST /v1/chat/completions`。使用工作区工具时，网关还需支持流式工具调用。
 
 ```json
 {
@@ -169,6 +169,14 @@ exec /path/to/cursor-agent-local --authless --disable-auto-update "$@"
 ```
 
 `model` 填写网关公布的模型 ID。`customModels` 可以把网关模型加入飞书选择器。网关负责校验允许使用的模型。
+
+**图片附件。** Botmux 将本地文件路径传给 Cursor。Agent Local `2026.11.22-e9042b2` 使用 Chat Completions 时，`Read` 成功读取 PNG 后，下一次请求中的工具结果可能是纯文本 `Read image file: <path>`。如果请求仅以路径表示这张附件，即使模型支持视觉，也收不到附件的像素。
+
+可以在新会话的首条消息附上一张只在画面中写有随机测试码的 PNG，请机器人使用 `Read` 逐字转录。如果查看 Chat Completions 流量，请检查紧跟 `Read` 的那条请求是否含有承载这张图片的 `image_url`。
+
+如果网关只收到附件路径，可以在已有的 tmux 会话中直接给 Cursor 附上图片。在 Cursor 输入框键入问题和一个空格，再粘贴 Cursor 所在机器上带引号的 PNG 绝对路径（例如 `"/path/to/screenshot.png"`），然后按回车。实测版本会在用户消息中发送 `image_url`。如果只能使用飞书，可在消息中贴出相关文字或描述需要分析的画面细节。
+
+如果网关和模型支持 Anthropic Messages 的工具结果携带图片，实测版本也可以通过该协议发送 PNG 数据。将网关基地址设为以 `/v1` 结尾，并提供流式 `POST /v1/messages`。在 `GET /v1/models` 中为 `bots.json` 配置的模型公布 `api_types: ["anthropic_messages"]`。Agent Local 发现模型时使用 bearer token，请求 Messages 时把同一网关令牌放在 `x-api-key` 中。换一个测试码在新会话中复测，并检查 `tool_result.content` 中是否有 `image` 数据块。
 
 Botmux 从守护进程用户的 `~/.cursor` 读取会话记录。启动脚本使用同一服务账号，并将数据目录设到这里。如果 Linux 进程保护导致 Botmux 无法发现会话记录，已验证的版本支持在启动脚本中设置 `CURSOR_AGENT_ALLOW_PROCESS_INSPECTION=1`。这会允许同一用户下的进程检查，仅在需要时启用，并使用专用服务账号。
 
