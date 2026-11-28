@@ -98,6 +98,46 @@ const settle = async () => {
   await new Promise(resolve => setTimeout(resolve, 60));
 };
 
+// The terminal handler notes the next-step/recap card inside an async
+// `.then(settleCard)` chain. A fixed `settle()` timer does not guarantee that
+// chain has run on a loaded runner, so these poll the persisted card instead of
+// racing the timer. They still drain the module's own promise chain each round.
+async function waitForNextStepText(
+  ds: DaemonSession,
+  store: TurnReplyCardStore,
+  turnId: string,
+  expected: string,
+  timeoutMs = 2_000,
+): Promise<string | undefined> {
+  const deadline = Date.now() + timeoutMs;
+  let text: string | undefined;
+  while (Date.now() < deadline) {
+    await nextStepIdle(ds);
+    text = store.read(replyCardKey(ds, turnId))?.nextStep?.text;
+    if (text === expected) return text;
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  return text;
+}
+
+async function waitForRecapMarkdown(
+  ds: DaemonSession,
+  store: TurnReplyCardStore,
+  turnId: string,
+  expectedPart: string,
+  timeoutMs = 2_000,
+): Promise<string | undefined> {
+  const deadline = Date.now() + timeoutMs;
+  let markdown: string | undefined;
+  while (Date.now() < deadline) {
+    await recapIdle(ds);
+    markdown = store.read(replyCardKey(ds, turnId))?.recap?.markdown;
+    if (markdown?.includes(expectedPart)) return markdown;
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  return markdown;
+}
+
 function makeSession(overrides: Partial<DaemonSession> = {}): DaemonSession {
   return {
     larkAppId: 'app_3908',
@@ -1016,14 +1056,13 @@ describe('daemon unified reply-card, next-step, recap, and outcome coordination 
     // Next-step card was NOT ignored, and prompt_suggestion stamped with M3 lands on M1's card!
     expect(nextStepInfos.some(line => line.includes('ignored'))).toBe(false);
     noteNextStepSuggestion(ds, 'om_m3', '顺便跑一下回归测试', nextStepIo);
-    await nextStepIdle(ds);
-    expect(store.read(replyCardKey(ds, 'om_m1'))?.nextStep?.text).toBe('顺便跑一下回归测试');
+    expect(await waitForNextStepText(ds, store, 'om_m1', '顺便跑一下回归测试')).toBe('顺便跑一下回归测试');
 
     // Recap requested under M3 and CLI recap stamped with M3 lands on M1's card!
     expect(awayRequests).toEqual(['om_m3']);
     noteCliRecap(ds, 'om_m3', '已合并处理三条消息并输出答复。', turnRecapIo);
-    await recapIdle(ds);
-    expect(store.read(replyCardKey(ds, 'om_m1'))?.recap?.markdown).toContain('已合并处理三条消息并输出答复');
+    expect(await waitForRecapMarkdown(ds, store, 'om_m1', '已合并处理三条消息并输出答复'))
+      .toContain('已合并处理三条消息并输出答复');
 
     // All three messages classified delivered with DONE reactions, and session.lastTurn keeps delivered + M1 summary!
     expect(finishedReactions).toEqual(expect.arrayContaining([
@@ -1161,8 +1200,7 @@ describe('daemon unified reply-card, next-step, recap, and outcome coordination 
     expect(store.read(replyCardKey(ds, 'om_m2'))?.displayRetired).toBeUndefined();
 
     noteNextStepSuggestion(ds, 'om_m2', '基于 M2 继续', nextStepIo);
-    await nextStepIdle(ds);
-    expect(store.read(replyCardKey(ds, 'om_m2'))?.nextStep?.text).toBe('基于 M2 继续');
+    expect(await waitForNextStepText(ds, store, 'om_m2', '基于 M2 继续')).toBe('基于 M2 继续');
     expect(store.read(replyCardKey(ds, 'om_m1'))?.nextStep).toBeUndefined();
   });
 
