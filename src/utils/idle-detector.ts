@@ -24,7 +24,7 @@ export interface ProgramStatusBlock {
  */
 export const PROGRAM_STATUS_FALLBACK_MS = 15_000;
 
-const PROGRAM_STATUS_RECORD_CAP = 64;
+export const PROGRAM_STATUS_RECORD_CAP = 64;
 const PROGRAM_STATUS_EVICTED_BUSY_CAP = 256;
 const PROGRAM_STATUS_STATES = new Set<ProgramStatusEvent['state']>([
   'idle', 'working', 'done', 'blocked', 'error', 'clear',
@@ -135,6 +135,9 @@ export class IdleDetector {
   private programStatusErrorMsg: string | undefined;
   /** Wall clock of the last accepted OSC 7501 report (0 = none yet). */
   private programStatusLastAtMs = 0;
+  /** Exact transcript completion in the current input cycle. Screen idle is
+   * not sufficient to retire a native question that has not drawn yet. */
+  private transcriptTerminalObservedAtMs: number | undefined;
   /** CliAdapter.programStatusSubmitAwaitsBusy. */
   private readonly submitAwaitsBusy: boolean;
   /** Deadline set by reset() when submitAwaitsBusy (0 = not waiting). Until a
@@ -374,7 +377,10 @@ export class IdleDetector {
    *  reach the CLI (or a flush is about to try one); it also ends the startup
    *  phase of `programStatusFollowsInputCycle`. */
   reset(opts: { inputCycle?: boolean } = {}): void {
-    if (opts.inputCycle) this.inputCycleStarted = true;
+    if (opts.inputCycle) {
+      this.inputCycleStarted = true;
+      this.transcriptTerminalObservedAtMs = undefined;
+    }
     const keepAuthority = this.programStatusAuthority;
     this.isIdle = false;
     this.busyTransitionArmed = false;
@@ -501,6 +507,9 @@ export class IdleDetector {
       }
     }
     this.programStatusLastAtMs = Date.now();
+    if (event.state === 'working' || event.state === 'blocked') {
+      this.transcriptTerminalObservedAtMs = undefined;
+    }
 
     if (event.state === 'clear') {
       if (event.id === undefined) {
@@ -601,6 +610,37 @@ export class IdleDetector {
   /** Latest blocked record, for a later wait-card. Never logged here. */
   programStatusBlock(): ProgramStatusBlock | null {
     return this.programStatusBlockInfo;
+  }
+
+  /** The structured bridge closed the latest native turn in this input cycle.
+   * Ordinary screen/pre-start ready signals do not provide this evidence. */
+  noteTranscriptTerminal(): void {
+    if (this.yieldsToTranscriptTerminal) this.transcriptTerminalObservedAtMs ??= Date.now();
+  }
+
+  noteTranscriptTurnStarted(): void {
+    this.transcriptTerminalObservedAtMs = undefined;
+  }
+
+  /** Called only after a fresh authoritative screen proves the idle composer.
+   * A completed async question may retain a blocked child record. Retire only
+   * question records after both the transcript and OSC have settled; preserve
+   * permission gates, active children and unknown evicted busy records. */
+  releaseStaleQuestionStatus(): boolean {
+    if (!this.yieldsToTranscriptTerminal || this.isStartupPending()
+      || this.transcriptTerminalObservedAtMs === undefined
+      || Date.now() - this.transcriptTerminalObservedAtMs < QUIESCENCE_MS
+      || this.programStatusQuietMs() < QUIESCENCE_MS
+      || this.programStatusBlockInfo?.kind !== 'question'
+      || this.evictedBusyIds.size > 0) return false;
+    for (const [id, record] of this.programStatusRecords) {
+      if (record.state === 'blocked' && record.kind !== 'question') return false;
+      if (id !== '' && record.state === 'working') return false;
+    }
+    this.dropProgramStatusState();
+    this.markStartupComplete();
+    this.markIdle('external');
+    return true;
   }
 
   programStatusError(): string | undefined {

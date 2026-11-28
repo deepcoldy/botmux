@@ -55,6 +55,31 @@ describe('group context platform integration', () => {
     expect(getGroupContextMessage('cli_b', 'oc_room', 'om_unproven')?.conversationScope).toBeUndefined();
   });
 
+  it('never backfills or replays a TRAE callback from REST history', async () => {
+    const now = Date.now();
+    const secret = 'REST_HISTORY_TRAE_CALLBACK_SECRET';
+    const callback = { message_id: 'om_trae_callback', chat_id: 'oc_room', create_time: String(now - 100),
+      msg_type: 'text', sender: { id: 'ou_admin', sender_type: 'user' },
+      body: { content: JSON.stringify({ text: `/dashboard trae-login complete req-1 http://127.0.0.1:1234/authorize?token=${secret}` }) } };
+    expect(ingestGroupContextEvent('cli_b', { sender: { sender_type: 'user', sender_id: { open_id: 'ou_admin' } }, message: {
+      message_id: callback.message_id, chat_id: callback.chat_id, chat_type: 'group', create_time: callback.create_time,
+      message_type: 'text', content: callback.body.content,
+    } })).toBe('skipped_sensitive');
+
+    network.history.mockResolvedValue([callback, { message_id: 'om_history_positive', chat_id: 'oc_room',
+      create_time: String(now - 90), msg_type: 'text', sender: { id: 'ou_user', sender_type: 'user' },
+      body: { content: JSON.stringify({ text: 'HISTORY_POSITIVE_CONTROL' }) } }]);
+    const first = await prepareGroupContextForTurn({ appId: 'cli_b', chatId: 'oc_room', turnId: 'om_now', createTime: now, query: 'continue' });
+    expect(first?.body).toContain('HISTORY_POSITIVE_CONTROL');
+    expect(JSON.stringify(first)).not.toContain(secret);
+    expect(getGroupContextMessage('cli_b', 'oc_room', callback.message_id)).toBeUndefined();
+
+    network.history.mockResolvedValue([]);
+    const next = await prepareGroupContextForTurn({ appId: 'cli_b', chatId: 'oc_room', turnId: 'om_next', createTime: now + 10, query: 'continue' });
+    expect(JSON.stringify(next)).not.toContain(secret);
+    expect(JSON.stringify(getGroupContextMessage('cli_b', 'oc_room', callback.message_id) ?? null)).not.toContain(secret);
+  });
+
   it('uses native thread-container proof when API rows omit all topic identifiers', async () => {
     const now = Date.now();
     network.history.mockResolvedValue([]);

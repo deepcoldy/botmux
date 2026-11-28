@@ -3,6 +3,7 @@ import { isCallbackUrl } from '../../utils/user-token.js';
 import { parseTopicHeader } from '../../core/topic-header.js';
 import type { InputCaptureRuntime } from '../../core/plugins/input-capture/runtime.js';
 import type { CaptureAttachment } from '../../core/plugins/input-capture/attachments.js';
+import { isTraeLoginCallbackEvent } from '../../services/trae-login-message.js';
 
 /** Synchronous pre-ACK path. Only exact raw message anchors enter the journal;
  * command / callback routing stays with the existing dispatcher. Attachments
@@ -12,7 +13,7 @@ export function captureInboundText(data: any, runtime: InputCaptureRuntime,
   p2pReplyFoldsToChat: (chatId: string, rootId: string) => boolean = () => false): boolean {
   // The marker is non-sensitive and survives Inbox persistence. Check it before
   // even parsing: an already-redacted copy is just as ineligible as the raw event.
-  if (data?.__protectedResultRedacted === true) return false;
+  if (data?.__protectedResultRedacted === true || isTraeLoginCallbackEvent(data)) return false;
   const message = data?.message;
   if (data?.sender?.sender_type !== 'user' || !message || !['text', 'post', 'image', 'file', 'audio', 'media', 'merge_forward'].includes(message.message_type)
     || (message.root_id && !/^om_[A-Za-z0-9_-]+$/.test(message.root_id))

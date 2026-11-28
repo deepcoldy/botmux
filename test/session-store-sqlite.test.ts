@@ -36,6 +36,7 @@ vi.mock('../src/services/frozen-card-store.js', () => ({
 }));
 
 import { chatSessionAnsweredRootAtTopLevel } from '../src/core/reply-target.js';
+import { SessionContractStore } from '../src/services/session-contract-store.js';
 import {
   __testOnly_setSqliteUnavailable,
   assertSqliteSupported,
@@ -551,6 +552,49 @@ describe('SQLite capability gate', () => {
 
 describe('listActiveSessionIdsAcrossStores', () => {
   const noKnownBots = () => new Set<string>();
+
+  function contractOnlyStore(appId: string): void {
+    new SessionContractStore(tempDir, appId).close();
+  }
+
+  it('ignores an unregistered contract-only database while protecting valid abandoned sessions', () => {
+    contractOnlyStore('old-contract-probe');
+    seedPersistedSessionRows(tempDir, 'removed-bot', { old: row('old') });
+    seedPersistedSessionRows(tempDir, 'appB', { current: row('current') });
+    expect([...listActiveSessionIdsAcrossStores(tempDir, { knownAppIds: () => new Set(['appB']) })].sort())
+      .toEqual(['current', 'old']);
+  });
+
+  it('still fails closed when a configured bot has only contract tables', () => {
+    contractOnlyStore('appA');
+    expect(() => listActiveSessionIdsAcrossStores(tempDir, { knownAppIds: () => new Set(['appA']) })).toThrow();
+  });
+
+  it('recognizes a complete legacy contract store without the later expression index', () => {
+    contractOnlyStore('legacy-contract-probe');
+    const db = new DatabaseSync(join(tempDir, 'session-stores', 'legacy-contract-probe', 'sessions.db'));
+    db.exec('DROP INDEX contract_execution_turns');
+    db.close();
+    expect([...listActiveSessionIdsAcrossStores(tempDir, { knownAppIds: noKnownBots })]).toEqual([]);
+  });
+
+  it('does not hide a user backup table whose name resembles a SQLite internal object', () => {
+    contractOnlyStore('contract-probe');
+    const db = new DatabaseSync(join(tempDir, 'session-stores', 'contract-probe', 'sessions.db'));
+    db.exec('CREATE TABLE sqliteX_backup (session_id TEXT)');
+    db.close();
+    expect(() => listActiveSessionIdsAcrossStores(tempDir, { knownAppIds: noKnownBots })).toThrow();
+  });
+
+  it('does not mistake a half-finished session-table migration for a contract-only store', () => {
+    seedPersistedSessionRows(tempDir, 'removed-bot', { active: row('active') });
+    contractOnlyStore('removed-bot');
+    const db = new DatabaseSync(join(tempDir, 'session-stores', 'removed-bot', 'sessions.db'));
+    db.exec('ALTER TABLE sessions RENAME TO sessions_backup');
+    expect(db.prepare('SELECT count(*) AS n FROM sessions_backup').get()).toMatchObject({ n: 1 });
+    db.close();
+    expect(() => listActiveSessionIdsAcrossStores(tempDir, { knownAppIds: noKnownBots })).toThrow();
+  });
 
   it('unions the active rows of every bot store and leaves closed rows out', () => {
     seedPersistedSessionRows(tempDir, 'appA', {

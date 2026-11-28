@@ -61,6 +61,7 @@ import { contractTerminalStatus, executionObserverSupported } from '../../src/se
 import * as runtimeReservation from '../../src/services/runtime-reservation.js';
 import { isRemoteBackendType } from '../../src/core/persistent-backend.js';
 import { traexQuestionFlowVisible } from '../../src/utils/traex-question-page.js';
+import { TraexTurnCompletionTracker } from '../../src/services/traex-turn-completion.js';
 import { antigravityBlockingPageTail } from '../../src/utils/antigravity-blocking-page.js';
 import { isNativeReasoningEffort } from '../../src/services/native-reasoning-observation.js';
 import { readNativeReasoningFooter } from '../../src/utils/native-reasoning-footer.js';
@@ -272,7 +273,7 @@ function defaultScopedWorkerState(scope: Record<string, unknown>, key: string | 
   if (key === 'pendingAdoptMessages') return (scope.pendingAdoptMessages ??= []);
   if (key === 'restoredUnsentInputs') return (scope.restoredUnsentInputs ??= new Set());
   if (key === 'scheduledInputReceipts') return (scope.scheduledInputReceipts ??= new Map());
-  if (['coalescePendingScheduledInputs', 'discardUnwrittenScheduledInput', 'discardScheduledBacklogForStop', 'requestScheduledInputAdmission', 'runScheduledCliInputWrite', 'unsentInputJournalPath', 'cancelScheduledAdmissionRetry', 'scheduleScheduledAdmissionRetry'].includes(String(key))) return loadWorkerFunction(String(key), scope);
+  if (['coalescePendingScheduledInputs', 'discardUnwrittenScheduledInput', 'discardScheduledBacklogForStop', 'requestScheduledInputAdmission', 'runScheduledCliInputWrite', 'unsentInputJournalPath', 'cancelScheduledAdmissionRetry', 'scheduleScheduledAdmissionRetry', 'scheduledCliInputWriteHold', 'settleScheduledCliInputHold'].includes(String(key))) return loadWorkerFunction(String(key), scope);
   if (key === 'inFlightKeepaliveFingerprints') {
     return (scope.inFlightKeepaliveFingerprints ??= new Map<string, number>());
   }
@@ -320,6 +321,10 @@ function defaultScopedWorkerState(scope: Record<string, unknown>, key: string | 
   }
   if (key === 'traexFirstPromptReadinessPoller') {
     return (scope.traexFirstPromptReadinessPoller ??= new TraexFirstPromptReadinessPoller());
+  }
+  // Module-level native-turn completion tracker used by codexBridgeIngest.
+  if (key === 'traexTurnCompletion') {
+    return (scope.traexTurnCompletion ??= new TraexTurnCompletionTracker());
   }
   if (key === 'traexNativeViewportEvidence') {
     return (scope.traexNativeViewportEvidence ??= new TraexNativeViewportEvidenceStore());

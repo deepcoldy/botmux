@@ -37,7 +37,7 @@ export type BotmuxEntry =
   // process.execPath and the runner is argv[0]). They need the same treatment for
   // the same reason — see RUNNER_ENTRIES below.
   | 'codex-app-runner' | 'dsh-runner' | 'mira-runner' | 'mir-runner'
-  | 'minimax-runner' | 'atomcode-runner' | 'antigravity-runner' | 'lark-tool-runner' | 'cli-identity-runner';
+  | 'minimax-runner' | 'atomcode-runner' | 'antigravity-runner' | 'lark-tool-runner' | 'cli-identity-runner' | 'trae-login-runner';
 
 /** Hidden CLI subcommand that runs a given entry inline (see cli.ts dispatch). */
 const ENTRY_SUBCOMMAND: Record<BotmuxEntry, string> = {
@@ -63,6 +63,7 @@ const ENTRY_SUBCOMMAND: Record<BotmuxEntry, string> = {
   'antigravity-runner': '__antigravity-runner',
   'lark-tool-runner': '__lark-tool-runner',
   'cli-identity-runner': '__cli-identity-runner',
+  'trae-login-runner': '__trae-login-runner',
 };
 
 /** dist/<entry>.js filename for the Node path. */
@@ -89,6 +90,7 @@ const ENTRY_SCRIPT: Record<BotmuxEntry, string> = {
   'antigravity-runner': 'antigravity-runner.js',
   'lark-tool-runner': 'lark-tool-runner.js',
   'cli-identity-runner': 'cli-identity-runner.js',
+  'trae-login-runner': 'trae-login-runner.js',
 };
 
 /**

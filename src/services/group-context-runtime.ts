@@ -19,6 +19,7 @@ import { groupContextRecallGap } from './group-context-health.js';
 import { isGroupContextNoise, isUnavailableGroupContextCard, sanitizeGroupContextText, groupContextRepresentationsMatch, sameGroupContextPlatformVersion, sameGroupContextMentions } from './group-context-content.js';
 import { groupContextCardObservationTime } from './group-context-card-observation.js';
 import { normalizeGroupContextEvent } from './group-context-ingest.js';
+import { isTraeLoginCallbackEvent } from './trae-login-message.js';
 
 const syncBoundaries = new Map<string, { startedAt: number; olderGap: boolean }>();
 const scopeKey = (appId: string, chatId: string) => JSON.stringify([config.session.dataDir, appId, chatId]);
@@ -54,6 +55,13 @@ function renderRecord(record: GroupContextMessageRecord): GroupContextRenderMess
 function normalizeHistoryMessage(appId: string, chatId: string, message: any, historyStartedAt: number,
   context: HistoryObservationContext): ObservedMessage | undefined {
   if (!message?.message_id || (message.chat_id && message.chat_id !== chatId)) return undefined;
+  // Chat history, thread fallback and publication all pass through here. Apply
+  // the same credential boundary as live ingest before any REST body is stored.
+  if (isTraeLoginCallbackEvent({ message: {
+    ...message,
+    message_type: message.msg_type ?? message.message_type,
+    content: message.body?.content ?? message.content,
+  } })) return undefined;
   const isBot = message.sender?.sender_type === 'app' || message.sender?.sender_type === 'bot';
   const deleted = message.deleted === true || message.is_recalled === true;
   const projection = !deleted && isBot && message.msg_type === 'interactive'

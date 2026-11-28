@@ -19,6 +19,7 @@ import { GROUP_CONTEXT_CARD_CONTENT_VERSION } from '../im/lark/group-context-car
 import { projectObservedGroupContextCard } from './group-context-card-source.js';
 import { logger } from '../utils/logger.js';
 import { isGroupContextNoise, isUnavailableGroupContextCard, sanitizeGroupContextText } from './group-context-content.js';
+import { isTraeLoginCallbackEvent } from './trae-login-message.js';
 import { groupContextCardObservationTime } from './group-context-card-observation.js';
 import {
   upsertGroupContextMessage,
@@ -42,6 +43,7 @@ export type GroupContextIngestOutcome =
   | 'skipped_p2p'
   | 'skipped_invalid'
   | 'skipped_noise'
+  | 'skipped_sensitive'
   | 'stored'
   | 'duplicate'
   | 'error';
@@ -170,6 +172,10 @@ export function normalizeGroupContextEvent(larkAppId: string, data: any): GroupC
 /** receive_v1 / updated_v1：旁听写入。永不抛出。 */
 export function ingestGroupContextEvent(larkAppId: string, data: any): GroupContextIngestOutcome {
   try {
+    // Callback URLs carry login credentials. This sink is shared by receive,
+    // edit and recovery callers, so exclude the control input before parsing or
+    // persistence rather than relying on the later p2p command rejection.
+    if (isTraeLoginCallbackEvent(data)) return 'skipped_sensitive';
     const message = data?.message;
     if (!message || typeof message !== 'object') return 'skipped_invalid';
     if (message.chat_type === 'p2p') return 'skipped_p2p';
