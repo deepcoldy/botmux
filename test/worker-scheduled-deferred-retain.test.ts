@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { workerSubmitHarness } from './helpers/worker-submit-harness.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { ActiveTurnAuthority } from '../src/core/active-turn-authority.js';
 
 type Admission = 'allow' | 'retain' | 'reject';
 
@@ -176,5 +177,162 @@ describe('deferred scheduled input retired by coalesce while its write-edge admi
     expect(rejections(runA.turnId)).toBe(1);
     expect(h.scope.pendingMessages).toEqual([]);
     expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+  });
+});
+
+/** Replace the harness's turn-authority stubs with the worker's real ones, so
+ * a started-but-unwritten turn would really block the next queued input. */
+function useRealTurnAuthority(scope: Record<string, any>) {
+  const authority = new ActiveTurnAuthority();
+  Object.assign(scope, {
+    activeTurnAuthority: authority,
+    crossPrincipalIsolationOn: () => false,
+    baselineAntigravityFooterTasksForActiveTurn: vi.fn(),
+    currentBotmuxTurnId: undefined, currentBotmuxDispatchAttempt: undefined,
+    captureIdentityAnnounced: false, captureRevision: 0, workerSessionEventScope: undefined,
+  });
+  for (const name of ['turnAuthorityIdentity', 'adoptActiveTurnWhenIsolationOff', 'activeTurnBlocks']) {
+    scope[name] = loadWorkerFunction(name, scope);
+  }
+  scope.markActiveTurnStarted = vi.fn(loadWorkerFunction('markActiveTurnStarted', scope));
+  scope.setCaptureIdentity = vi.fn(loadWorkerFunction('setCaptureIdentity', scope));
+  return authority;
+}
+
+/** Every preparation side effect that would claim `turnId` as written. */
+function preparedFor(scope: Record<string, any>, turnId: string) {
+  const byItem = (calls: any[][]) => calls.filter(([item]) => item?.turnId === turnId).length;
+  return {
+    captureIdentity: scope.setCaptureIdentity.mock.calls.filter(([id]: [string]) => id === turnId).length,
+    activeTurnStarted: byItem(scope.markActiveTurnStarted.mock.calls),
+    inflight: byItem(scope.inflightInputs.onWrite.mock.calls),
+    written: byItem(scope.noteCliInputWritten.mock.calls),
+  };
+}
+const NOT_PREPARED = { captureIdentity: 0, activeTurnStarted: 0, inflight: 0, written: 0 };
+const PREPARED_ONCE = { captureIdentity: 1, activeTurnStarted: 1, inflight: 1, written: 1 };
+
+describe('deferred scheduled input retired while its write-edge admission is pending, then allowed late', () => {
+  it('coalesce: the retired run is never prepared, and the newer run is written in the same flush', async () => {
+    const edgeA = deferredAdmission();
+    const { h, item: runA, rejections } = scheduledHarness(['allow', edgeA.answer, 'allow', 'allow'], true);
+    const authority = useRealTurnAuthority(h.scope);
+    const flushA = h.flush();
+    await edgeA.asked;
+    expect(h.scope.pendingMessages).toEqual([runA]);
+
+    const turnB = scheduledTurnId('b');
+    const runB = {
+      content: 'run B', turnId: turnB, queueAfterActiveTurn: true,
+      scheduledRun: { taskId: 'a1b2c3d4', runId: 'run-2', turnId: turnB, trigger: 'scheduler' },
+    };
+    h.scope.pendingMessages.push(runB);
+    loadWorkerFunction<() => void>('coalescePendingScheduledInputs', h.scope)();
+    expect(h.scope.pendingMessages).toEqual([runB]);
+    expect(rejections(runA.turnId)).toBe(1);
+
+    edgeA.settle('allow');
+    await flushA;
+    // A left no capture identity, started authority, in-flight or written mark.
+    expect(preparedFor(h.scope, runA.turnId)).toEqual(NOT_PREPARED);
+    expect(rejections(runA.turnId)).toBe(1);
+    expect(h.scope.pendingMessages).not.toContain(runA);
+    // The very same flush moved on: B owns the authority and is the only write.
+    const written = h.scope.cliAdapter.writeInput.mock.calls.map(([, message]: [unknown, string]) => message);
+    expect(written).toEqual(['run B']);
+    expect(preparedFor(h.scope, turnB)).toEqual(PREPARED_ONCE);
+    expect(authority.snapshot()).toMatchObject({ turnId: turnB, started: true });
+    expect(h.scope.cliGenerationTurnWrites).toBe(1);
+    expect(rejections(turnB)).toBe(0);
+    expect(h.scope.pendingMessages).toEqual([]);
+  });
+
+  it('STOP: the retired run is never prepared and is rejected exactly once', async () => {
+    const edgeA = deferredAdmission();
+    const { h, item: runA, rejections } = scheduledHarness(['allow', edgeA.answer], true);
+    const authority = useRealTurnAuthority(h.scope);
+    const flushA = h.flush();
+    await edgeA.asked;
+    loadWorkerFunction<() => void>('discardScheduledBacklogForStop', h.scope)();
+    expect(h.scope.pendingMessages).toEqual([]);
+    expect(rejections(runA.turnId)).toBe(1);
+
+    edgeA.settle('allow');
+    await flushA;
+    expect(preparedFor(h.scope, runA.turnId)).toEqual(NOT_PREPARED);
+    expect(authority.snapshot()).toBeUndefined();
+    expect(h.scope.cliGenerationTurnWrites).toBe(0);
+    expect(rejections(runA.turnId)).toBe(1);
+    expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+    expect(h.scope.pendingMessages).toEqual([]);
+  });
+
+  it.each(['coalesce', 'STOP'] as const)('%s during the adapter precheck: the retired run is never prepared and the queue moves on', async retire => {
+    const { h, item: runA, rejections } = scheduledHarness(['allow', 'allow', 'allow', 'allow'], true);
+    const authority = useRealTurnAuthority(h.scope);
+    // Codex awaits its own transcript/terminal precheck before beforeSubmit.
+    let releasePrecheck!: () => void;
+    let markParked!: () => void;
+    const parked = new Promise<void>(resolve => { markParked = resolve; });
+    const precheck = new Promise<void>(resolve => { releasePrecheck = resolve; });
+    const submit = h.scope.cliAdapter.writeInput.getMockImplementation()!;
+    h.scope.cliAdapter.writeInput.mockImplementationOnce(async (...args: any[]) => {
+      markParked();
+      await precheck;
+      return submit(...args);
+    });
+    const flushA = h.flush();
+    await parked;
+    expect(h.scope.pendingMessages).toEqual([runA]);
+
+    const turnB = scheduledTurnId('b');
+    const runB = {
+      content: 'run B', turnId: turnB, queueAfterActiveTurn: true,
+      scheduledRun: { taskId: 'a1b2c3d4', runId: 'run-2', turnId: turnB, trigger: 'scheduler' },
+    };
+    if (retire === 'coalesce') {
+      h.scope.pendingMessages.push(runB);
+      loadWorkerFunction<() => void>('coalescePendingScheduledInputs', h.scope)();
+      expect(h.scope.pendingMessages).toEqual([runB]);
+    } else {
+      loadWorkerFunction<() => void>('discardScheduledBacklogForStop', h.scope)();
+      expect(h.scope.pendingMessages).toEqual([]);
+    }
+    expect(rejections(runA.turnId)).toBe(1);
+    // Still parked: nothing of A may have been committed yet.
+    expect(preparedFor(h.scope, runA.turnId)).toEqual(NOT_PREPARED);
+
+    releasePrecheck();
+    await flushA;
+    expect(preparedFor(h.scope, runA.turnId)).toEqual(NOT_PREPARED);
+    expect(rejections(runA.turnId)).toBe(1);
+    expect(h.scope.pendingMessages).toEqual([]);
+    if (retire === 'coalesce') {
+      // Same flush, no extra ready edge: B owns the authority and is written.
+      expect(preparedFor(h.scope, turnB)).toEqual(PREPARED_ONCE);
+      expect(authority.snapshot()).toMatchObject({ turnId: turnB, started: true });
+      expect(h.scope.cliGenerationTurnWrites).toBe(1);
+      expect(rejections(turnB)).toBe(0);
+    } else {
+      expect(authority.snapshot()).toBeUndefined();
+      expect(h.scope.cliGenerationTurnWrites).toBe(0);
+    }
+  });
+
+  it('an admitted deferred run that keeps its queue ownership is prepared once, at beforeSubmit', async () => {
+    const { h, item: runA } = scheduledHarness(['allow', 'allow'], true);
+    const authority = useRealTurnAuthority(h.scope);
+    const submit = h.scope.cliAdapter.writeInput.getMockImplementation()!;
+    let preparedBeforeSubmit: unknown;
+    h.scope.cliAdapter.writeInput.mockImplementationOnce(async (...args: any[]) => {
+      preparedBeforeSubmit = preparedFor(h.scope, runA.turnId);
+      return submit(...args);
+    });
+    await h.flush();
+    expect(preparedBeforeSubmit).toEqual(NOT_PREPARED);
+    expect(preparedFor(h.scope, runA.turnId)).toEqual(PREPARED_ONCE);
+    expect(authority.snapshot()).toMatchObject({ turnId: runA.turnId, started: true });
+    expect(h.scope.cliGenerationTurnWrites).toBe(1);
+    expect(h.scope.pendingMessages).toEqual([]);
   });
 });

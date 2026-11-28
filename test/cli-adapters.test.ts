@@ -34,7 +34,6 @@ import { busyProbeRegion } from '../src/utils/busy-probe.js';
 import { shouldWriteNow } from '../src/utils/input-gate.js';
 import { isTypeAheadBlockedByBypass, resolvePtyInputPolicy } from '../src/utils/pty-input-policy.js';
 import { TERMINAL_CANCEL_COOLDOWN_MS } from '../src/adapters/backend/critical-control-key.js';
-import { buildBotmuxEnvAssignments } from '../src/adapters/backend/tmux-backend.js';
 import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';
 import { createAidenAdapter } from '../src/adapters/cli/aiden.js';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
@@ -261,13 +260,18 @@ describe('zero injection with structured final reply adapters', () => {
   }
 });
 
+// The .mjs is embedded verbatim for the real Pi process; importing the typed
+// twin alone cannot catch a behavior change in just one of the two copies.
+const piTurnBoundaryImplementations = [
+  ['typed twin (.ts)', async () => registerBotmuxTurnBoundaryExtension],
+  ['runtime source (.mjs)', async (): Promise<typeof registerBotmuxTurnBoundaryExtension> =>
+    (await import('../src/adapters/cli/pi-turn-boundary-extension.mjs' as string)).default],
+] as const;
+
 // Input submitted while Pi is busy is written to the session only when Pi
 // dequeues it; the extension records the acceptance at submit time instead.
 describe('pi turn-boundary extension: queued input marker', () => {
-  for (const [name, load] of [
-    ['typed twin', async () => (await import('../src/adapters/cli/pi-turn-boundary-extension.js')).default],
-    ['runtime source', async () => (await import('../src/adapters/cli/pi-turn-boundary-extension.mjs' as string)).default],
-  ] as const) {
+  for (const [name, load] of piTurnBoundaryImplementations) {
     it(`${name}: marks input Pi will queue, and nothing for idle input`, async () => {
       const register = await load();
       const handlers: Record<string, (event?: any) => any> = {};
@@ -2579,36 +2583,50 @@ describe('pi buildArgs', () => {
     expect(args[args.indexOf('--session-id') + 1]).toBe('sess-pi');
   });
 
-  it.each(['missing', 'present', 'removed after load'] as const)('handles Pi resume when the transcript is %s', (transcriptState) => {
-    const dir = mkdtempSync(join(tmpdir(), 'pi-resume-thinking-'));
-    const env: NodeJS.ProcessEnv = {};
-    try {
-      const sessionId = randomUUID();
-      const transcript = join(dir, `session_${sessionId}.jsonl`);
-      if (transcriptState === 'present') writeFileSync(transcript, JSON.stringify({ type: 'session', id: sessionId, cwd: dir }) + '\n');
-      // A predicted reattach can become a cold spawn if its pane disappears.
-      expect(adapter.buildArgs({ sessionId, resume: true, reattach: true, reasoningEffort: 'high', env })).not.toContain('--thinking');
+  describe.each(piTurnBoundaryImplementations)('resume fallback: %s', (_name, load) => {
+    it.each([
+      ['missing', 'startup', true],
+      ['present', 'startup', false],
+      ['removed after load', 'startup', false],
+      ['missing', 'not provided', true], // Older Pi without a reason field.
+      // Deliver the marker to each non-startup event directly: firing it only
+      // after startup would test env consumption, not the reason guard.
+      ['missing', 'new', false],
+      ['missing', 'resume', false],
+      ['missing', 'fork', false],
+      ['missing', 'reload', false],
+    ] as const)('handles a %s transcript (reason=%s)', async (transcriptState, reason, appliesFallback) => {
+      const register = await load();
+      const dir = mkdtempSync(join(tmpdir(), 'pi-resume-thinking-'));
+      const env: NodeJS.ProcessEnv = {};
+      const key = 'BOTMUX_PI_RESUME_FALLBACK_THINKING';
+      try {
+        const sessionId = randomUUID();
+        const transcript = join(dir, `session_${sessionId}.jsonl`);
+        if (transcriptState === 'present') writeFileSync(transcript, JSON.stringify({ type: 'session', id: sessionId, cwd: dir }) + '\n');
+        // A predicted reattach can become a cold spawn if its pane disappears.
+        expect(adapter.buildArgs({ sessionId, resume: true, reattach: true, reasoningEffort: 'high', env })).not.toContain('--thinking');
+        expect(env[key]).toBe('high');
 
-      const setThinkingLevel = vi.fn();
-      const ctx = { sessionManager: {
-        getSessionFile: () => transcript,
-        getEntries: () => transcriptState === 'removed after load' ? [{ type: 'message' }] : [],
-      } };
-      let start: ((event: { reason: string }, context: typeof ctx) => void) | undefined;
-      registerBotmuxTurnBoundaryExtension({
-        on: (name, handler) => { if (name === 'session_start') start = handler as typeof start; },
-        appendEntry: vi.fn(), setThinkingLevel,
-      });
-      const assignments = buildBotmuxEnvAssignments(env);
-      const marker = assignments.find(value => value.startsWith('BOTMUX_PI_RESUME_FALLBACK_THINKING='));
-      vi.stubEnv('BOTMUX_PI_RESUME_FALLBACK_THINKING', marker?.split('=')[1]);
-      start!({ reason: 'startup' }, ctx);
-      start!({ reason: 'new' }, ctx);
-      expect(setThinkingLevel.mock.calls).toEqual(transcriptState === 'missing' ? [['high']] : []);
-    } finally {
-      vi.unstubAllEnvs();
-      rmSync(dir, { recursive: true, force: true });
-    }
+        const setThinkingLevel = vi.fn();
+        const ctx = { sessionManager: {
+          getSessionFile: () => transcript,
+          getEntries: () => transcriptState === 'removed after load' ? [{ type: 'message' }] : [],
+        } };
+        let start: ((event: { reason?: string }, context: typeof ctx) => void) | undefined;
+        register({
+          on: (name, handler) => { if (name === 'session_start') start = handler as typeof start; },
+          appendEntry: vi.fn(), setThinkingLevel,
+        });
+        vi.stubEnv(key, env[key]);
+        start!(reason === 'not provided' ? {} : { reason }, ctx);
+        expect(setThinkingLevel.mock.calls).toEqual(appliesFallback ? [['high']] : []);
+        expect(process.env[key]).toBeUndefined();
+      } finally {
+        vi.unstubAllEnvs();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
   });
 
   it('never puts a level Pi rejects (ultra) on Pi argv and adds no override when unset', () => {

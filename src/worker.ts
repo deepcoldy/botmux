@@ -173,7 +173,7 @@ import {
 import { rawCommandWriteOptionsFor } from './core/raw-command-write-options.js';
 import { classifyRawDispatchFailure, rewrapSubmissionFailure } from './core/raw-dispatch-failure.js';
 import { publishCliSessionIdToDaemon } from './core/cli-session-id-publisher.js';
-import { ActiveTurnAuthority, type TurnAuthorityIdentity } from './core/active-turn-authority.js';
+import { ActiveTurnAuthority, compatibleAuthorityPrincipal, type TurnAuthorityIdentity } from './core/active-turn-authority.js';
 import { isValidMarkerIdentityTurnId } from './core/turn-id-shape.js';
 import {
   advanceAncestorSessionTurn,
@@ -231,7 +231,8 @@ import {
   type ClaudeOpenTurnObservation,
   type ClaudeOpenTurnEvaluateAction,
 } from './services/claude-open-turn-watchdog.js';
-import { attributableBridgeReplyMarkers, bridgeGateInputForTurn, bridgePostText, composeFailedBridgeFallbackContent, finalBridgeSendMarkerCoversOwnThread, hasTrailingBridgeSentinelLine, isBridgeNothingToSendFinal, isFinalBridgeSendMarker, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
+import { attributableBridgeReplyMarkers, attributableSupersededFinalMarkers, bridgeGateInputForTurn, bridgePostText, composeFailedBridgeFallbackContent, finalBridgeSendMarkerCoversOwnThread, hasTrailingBridgeSentinelLine, isBridgeNothingToSendFinal, isFinalBridgeSendMarker, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
+import { resolveAbsorbedTurnCoverage, type AbsorbedTurnCoverage } from './core/turn-absorption.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
 import {
   decideFirstWriteLiveness,
@@ -8376,6 +8377,24 @@ let queuedTypeAheadTurns: QueuedTypeAheadTurnRecord[] = [];
  *  resurrects them as queued work and `retireTerminatedQueuedTurn` still records
  *  `foldedTypeAheadTurn` on `status === 'completed'`. */
 const settledAbsorbedTurnsByKey = new Map<string, SettledAbsorbedTurn>();
+/** Earliest wall-clock ms at which `absorbedIntoTurnId` reached the PID marker
+ *  for a queued type-ahead turn. Distinguishes an explicit #3880 gate refusal
+ *  (marker already carried the binding before `botmux send`) from poll lag or
+ *  non-fullContentMatch absorption (marker lacked the binding at send time). */
+const absorbedMarkerWrittenAtMsByKey = new Map<string, number>();
+function noteAbsorbedMarkerWritten(turnId: string, dispatchAttempt: number | undefined, atMs: number): void {
+  if (typeof absorbedMarkerWrittenAtMsByKey === 'undefined') return;
+  const key = settledAbsorbedKey(turnId, dispatchAttempt);
+  const existing = absorbedMarkerWrittenAtMsByKey.get(key);
+  if (existing === undefined || atMs < existing) {
+    absorbedMarkerWrittenAtMsByKey.set(key, atMs);
+  }
+  while (absorbedMarkerWrittenAtMsByKey.size > 256) {
+    const oldest = absorbedMarkerWrittenAtMsByKey.keys().next().value;
+    if (oldest === undefined) break;
+    absorbedMarkerWrittenAtMsByKey.delete(oldest);
+  }
+}
 function settledAbsorbedKey(turnId: string, dispatchAttempt?: number): string {
   return `${turnId}\0${dispatchAttempt ?? ''}`;
 }
@@ -8461,10 +8480,14 @@ function mergeMarkerQueuedTurnIntoMemory(qt: any): void {
       if (absorbed.absorbedIntoDispatchAttempt !== undefined) {
         existing.absorbedIntoDispatchAttempt = absorbed.absorbedIntoDispatchAttempt;
       }
+      if (typeof noteAbsorbedMarkerWritten === 'function') noteAbsorbedMarkerWritten(qt.turnId, dispatchAttempt, 0);
     }
     return;
   }
   if (!markerQueuedTurnStillLive(qt) || queuedTypeAheadTurns.some(t => t.turnId === qt.turnId)) return;
+  if (absorbed && typeof noteAbsorbedMarkerWritten === 'function') {
+    noteAbsorbedMarkerWritten(qt.turnId, dispatchAttempt, 0);
+  }
   queuedTypeAheadTurns.push({
     turnId: qt.turnId,
     ...(qt.inputConsumed === true ? { inputConsumed: true as const } : {}),
@@ -18314,6 +18337,8 @@ function emitReadyTurns(opts: EmitReadyTurnsOptions = {}): void {
   const emittedFinalOutputTurns = new Set<(typeof ready)[number]>();
   // Turns whose final_output was durably offered to V1 handoff in loop 1.
   const handoffOfferedTurns = new Set<(typeof ready)[number]>();
+  // Latest explicit final bridge-send marker attributed to each turn in loop 1.
+  const explicitFinalMarkerByTurn = new Map<(typeof ready)[number], BridgeSendMarker>();
   let emitIndex = 0;
   try {
   for (let i = 0; i < ready.length; i++) {
@@ -18403,9 +18428,11 @@ function emitReadyTurns(opts: EmitReadyTurnsOptions = {}): void {
     const explicitReplyMarkers = attributableExplicitReplyMarkersForTurnWindow(
       sendDedupTurnId, carrierGateInput, nextBoundaryMs, markers, adoptMode,
     );
-    if (explicitReplyMarkers.some(isFinalBridgeSendMarker)) {
+    const explicitFinalMarker = [...explicitReplyMarkers].reverse().find(isFinalBridgeSendMarker);
+    if (explicitFinalMarker) {
       observedOutputTurns.add(turn);
       finalMarkerTurns.add(turn);
+      explicitFinalMarkerByTurn.set(turn, explicitFinalMarker);
     }
     notifyExplicitRepliesObserved(
       sendDedupTurnId,
@@ -18669,6 +18696,139 @@ function emitReadyTurns(opts: EmitReadyTurnsOptions = {}): void {
   // after the model used `botmux send`. Completion is not optional. Emit it
   // only after all corresponding final_output IPC messages have been queued so
   // the daemon observes a stable per-turn ordering.
+  const readHostLedgerFinalForAbsorption = (
+    hostTurnId: string,
+    hostDispatchAttempt: number | undefined,
+  ):
+    | { kind: 'ledger'; settledTurnIds: ReadonlySet<string>; sentAtMs?: number; deliveryKind?: string; settlementIneligible?: boolean }
+    | { kind: 'legacy' }
+    | { kind: 'unknown' } => {
+    const dataDir = process.env.SESSION_DATA_DIR;
+    const larkAppId = lastInitConfig?.larkAppId;
+    if (!dataDir || !sessionId || !larkAppId) return { kind: 'legacy' };
+    try {
+      const record = new TurnSendLedger(dataDir).read({
+        larkAppId,
+        sessionId,
+        turnId: hostTurnId,
+        ...(hostDispatchAttempt !== undefined ? { dispatchAttempt: hostDispatchAttempt } : {}),
+      });
+      if (!record) return { kind: 'legacy' };
+      if (record.dispatchAttempt !== hostDispatchAttempt || !record.final) return { kind: 'unknown' };
+      return {
+        kind: 'ledger',
+        settledTurnIds: new Set(record.final.settledAbsorbedTurnIds ?? []),
+        sentAtMs: record.final.sentAtMs ?? record.final.deliveredAtMs,
+        deliveryKind: record.final.marker?.deliveryKind,
+        settlementIneligible: record.final.absorbedSettlementIneligible === true,
+      };
+    } catch {
+      return { kind: 'unknown' };
+    }
+  };
+  const absorbedCoverageByTurn = new Map<(typeof ready)[number], AbsorbedTurnCoverage>();
+  if (typeof resolveAbsorbedTurnCoverage === 'function') {
+    const activeSnap = typeof activeTurnAuthority !== 'undefined'
+      ? activeTurnAuthority.snapshot()
+      : undefined;
+    const xpiOn = typeof crossPrincipalIsolationOn === 'function' && crossPrincipalIsolationOn();
+    for (const candidate of ready) {
+      if (!candidate.absorbedIntoTurnId || candidate.absorbedIntoTurnId === candidate.turnId) continue;
+      const host = ready.find(item =>
+        item.turnId === candidate.absorbedIntoTurnId
+        && item.dispatchAttempt === candidate.absorbedIntoDispatchAttempt);
+      const hostLedger = readHostLedgerFinalForAbsorption(
+        candidate.absorbedIntoTurnId,
+        candidate.absorbedIntoDispatchAttempt,
+      );
+      const hostMarker = host ? explicitFinalMarkerByTurn.get(host) : undefined;
+      const hostHasExplicitFinal = (!!host && finalMarkerTurns.has(host))
+        || hostLedger.kind === 'ledger'
+        || hostLedger.kind === 'unknown';
+      const settledKey = typeof settledAbsorbedKey === 'function'
+        ? settledAbsorbedKey(candidate.turnId, candidate.dispatchAttempt)
+        : `${candidate.turnId}\0${candidate.dispatchAttempt ?? ''}`;
+      const settledEntry = typeof settledAbsorbedTurnsByKey !== 'undefined'
+        ? settledAbsorbedTurnsByKey.get(settledKey)
+        : undefined;
+      const settledByMarker = !!settledEntry
+        && settledEntry.hostTurnId === candidate.absorbedIntoTurnId
+        && settledEntry.hostDispatchAttempt === candidate.absorbedIntoDispatchAttempt;
+      // When a durable TurnSendLedger final exists, it is the sole settlement
+      // authority — an un-gated in-memory marker entry must never override an
+      // explicit #3880 ledger refusal.
+      const settledByHostFinal = hostLedger.kind === 'ledger'
+        ? hostLedger.settledTurnIds.has(candidate.turnId)
+        : hostLedger.kind === 'legacy' && settledByMarker;
+      const queuedRecord = typeof queuedTypeAheadTurns !== 'undefined'
+        ? queuedTypeAheadTurns.find(q =>
+          q.turnId === candidate.turnId && q.dispatchAttempt === candidate.dispatchAttempt)
+        : undefined;
+      const hostCaller = activeSnap
+        && activeSnap.turnId === candidate.absorbedIntoTurnId
+        && activeSnap.dispatchAttempt === candidate.absorbedIntoDispatchAttempt
+        ? activeSnap.caller
+        : undefined;
+      // Under XPI, fail closed unless #3880's ledger already proved compatible
+      // principals or both host and member callers are positively verified here.
+      const crossPrincipalMismatch = xpiOn && !settledByHostFinal
+        && (!hostCaller
+          || !queuedRecord?.trustedCaller
+          || typeof compatibleAuthorityPrincipal !== 'function'
+          || !compatibleAuthorityPrincipal(hostCaller, queuedRecord.trustedCaller));
+      const hasOwnFinal = finalMarkerTurns.has(candidate)
+        || emittedFinalOutputTurns.has(candidate)
+        || handoffOfferedTurns.has(candidate)
+        || (adoptMode && candidate.absorbedReplySent === true);
+      const coverage = resolveAbsorbedTurnCoverage({
+        turnId: candidate.turnId,
+        turnDispatchAttempt: candidate.dispatchAttempt,
+        turnMarkTimeMs: candidate.markTimeMs,
+        hostTurnId: candidate.absorbedIntoTurnId,
+        hostDispatchAttempt: candidate.absorbedIntoDispatchAttempt,
+        hostIsLocal: host?.isLocal === true,
+        hasOwnFinal,
+        hostHasExplicitFinal,
+        settledByHostFinal,
+        ledgerKind: hostLedger.kind,
+        hostFinalSentAtMs: (hostLedger.kind === 'ledger' ? hostLedger.sentAtMs : undefined)
+          ?? hostMarker?.sentAtMs,
+        hostFinalDeliveryKind: (hostLedger.kind === 'ledger' ? hostLedger.deliveryKind : undefined)
+          ?? hostMarker?.deliveryKind,
+        hostFinalSettlementIneligible: hostLedger.kind === 'ledger'
+          && hostLedger.settlementIneligible === true,
+        absorbedMarkerWrittenAtMs: typeof absorbedMarkerWrittenAtMsByKey !== 'undefined'
+          ? absorbedMarkerWrittenAtMsByKey.get(settledKey)
+          : undefined,
+        crossPrincipalMismatch,
+      });
+      if (coverage) absorbedCoverageByTurn.set(candidate, coverage);
+    }
+  }
+  const workerIsChatScope = !!lastInitConfig?.chatId
+    && lastInitConfig.rootMessageId === lastInitConfig.chatId;
+  const mergedTurnMetaFor = (turn: (typeof ready)[number]) => {
+    const coveredMembers = turn.absorbedTurns
+      ?.filter(member => {
+        const cov = absorbedCoverageByTurn.get(member);
+        return cov !== undefined && !(cov === 'pre_send_unmarked' && workerIsChatScope);
+      })
+      .map(member => member.turnId)
+      .filter(id => !!id && id !== turn.turnId);
+    const hasAbsorbedHost = !!turn.absorbedIntoTurnId && turn.absorbedIntoTurnId !== turn.turnId;
+    const coverage = absorbedCoverageByTurn.get(turn);
+    if (!coveredMembers?.length && !hasAbsorbedHost) return undefined;
+    return {
+      ...(coveredMembers?.length ? { absorbedTurnIds: coveredMembers } : {}),
+      ...(hasAbsorbedHost ? {
+        absorbedIntoTurnId: turn.absorbedIntoTurnId,
+        ...(turn.absorbedIntoDispatchAttempt !== undefined
+          ? { absorbedIntoDispatchAttempt: turn.absorbedIntoDispatchAttempt }
+          : {}),
+        ...(coverage ? { absorbedCoverage: coverage } : {}),
+      } : {}),
+    };
+  };
   let terminalIndex = 0;
   try {
   for (let i = 0; i < ready.length; i++) {
@@ -18780,18 +18940,36 @@ function emitReadyTurns(opts: EmitReadyTurnsOptions = {}): void {
           ? { lastSuccessAtMs: turn.terminalProviderLastSuccessAtMs } : {}),
       };
       try {
-        emitTurnTerminal(
-          turn.turnId,
-          outcome.status,
-          outcome.errorCode,
-          turn.dispatchAttempt,
-          nothingToSendTurns.has(turn) ? 'nothing_to_send' : undefined,
-          outcome.retryable,
-          undefined,
-          turn.terminalErrorDetail,
-          undefined,
-          Object.keys(providerTiming).length > 0 ? providerTiming : undefined,
-        );
+        const mergedTurnMeta = mergedTurnMetaFor(turn);
+        if (mergedTurnMeta) {
+          emitTurnTerminal(
+            turn.turnId,
+            outcome.status,
+            outcome.errorCode,
+            turn.dispatchAttempt,
+            nothingToSendTurns.has(turn) ? 'nothing_to_send' : undefined,
+            outcome.retryable,
+            undefined,
+            turn.terminalErrorDetail,
+            undefined,
+            Object.keys(providerTiming).length > 0 ? providerTiming : undefined,
+            undefined,
+            mergedTurnMeta,
+          );
+        } else {
+          emitTurnTerminal(
+            turn.turnId,
+            outcome.status,
+            outcome.errorCode,
+            turn.dispatchAttempt,
+            nothingToSendTurns.has(turn) ? 'nothing_to_send' : undefined,
+            outcome.retryable,
+            undefined,
+            turn.terminalErrorDetail,
+            undefined,
+            Object.keys(providerTiming).length > 0 ? providerTiming : undefined,
+          );
+        }
       } catch (error) {
         // Only this bridge loop restores the queue, so only here is the claim
         // rolled back for a same-turn retry. Direct commit-unknown terminal
@@ -18853,14 +19031,32 @@ function emitReadyTurns(opts: EmitReadyTurnsOptions = {}): void {
       flushThinkingUpdate();
     }
     try {
-      emitTurnTerminal(
-        turn.turnId,
-        outcome?.status ?? 'completed',
-        undefined,
-        turn.dispatchAttempt,
-        outputDisposition,
-        undefined,
-      );
+      const mergedTurnMeta = mergedTurnMetaFor(turn);
+      if (mergedTurnMeta) {
+        emitTurnTerminal(
+          turn.turnId,
+          outcome?.status ?? 'completed',
+          undefined,
+          turn.dispatchAttempt,
+          outputDisposition,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          mergedTurnMeta,
+        );
+      } else {
+        emitTurnTerminal(
+          turn.turnId,
+          outcome?.status ?? 'completed',
+          undefined,
+          turn.dispatchAttempt,
+          outputDisposition,
+          undefined,
+        );
+      }
     } catch (error) {
       emittedTurnTerminals.release(sessionId!, turn.turnId, turn.dispatchAttempt, 'completed');
       throw error;
@@ -22638,6 +22834,7 @@ function emitReadyCodexTurns(settledQuotaTurns?: CodexPendingTurn[]): void {
   const nextPendingMarkTimeMs = remaining.length > 0 && remaining[0].started
     ? remaining[0].markTimeMs
     : undefined;
+  const supersededFinalDeliveredTurns = new Set<(typeof ready)[number]>();
   let emitIndex = 0;
   try {
   for (let i = 0; i < ready.length; i++) {
@@ -22721,11 +22918,21 @@ function emitReadyCodexTurns(settledQuotaTurns?: CodexPendingTurn[]): void {
     if (turnOutcome === 'answered' && traexModelAccessSwitchNotice) {
       notifyTraexModelAccessSwitchActivity(turn.turnId, false, true, true);
     }
+    const ownExplicitMarkers = attributableExplicitReplyMarkersForTurnWindow(
+      turn.turnId, gateInput, nextBoundaryMs, markers, adoptMode,
+    );
+    const supersededFinalMarkers = !adoptMode
+      && (!turn.terminalStatus || turn.terminalStatus === 'completed')
+      && !ownExplicitMarkers.some(isFinalBridgeSendMarker)
+      && typeof attributableSupersededFinalMarkers === 'function'
+      ? attributableSupersededFinalMarkers(gateInput, nextBoundaryMs, markers)
+      : [];
+    if (supersededFinalMarkers.length > 0) supersededFinalDeliveredTurns.add(turn);
     notifyExplicitRepliesObserved(
       turn.turnId,
-      attributableExplicitReplyMarkersForTurnWindow(
-        turn.turnId, gateInput, nextBoundaryMs, markers, adoptMode,
-      ),
+      supersededFinalMarkers.length > 0
+        ? [...ownExplicitMarkers, ...supersededFinalMarkers]
+        : ownExplicitMarkers,
     );
     if (!content || shouldSuppressStructuredFallback(fallbackKind, gateInput, nextBoundaryMs, markers, adoptMode, replyDeliveryMode(), deliveredFinalFailureNoticeSuppressed())) {
       usageLimitTracker.noteTurnCompleted(turnOutcome);
@@ -22826,15 +23033,37 @@ function emitReadyCodexTurns(settledQuotaTurns?: CodexPendingTurn[]): void {
       );
       continue;
     }
-    emitTurnTerminal(
-      turn.turnId,
-      turn.terminalStatus ?? 'completed',
-      turn.terminalErrorCode,
-      turn.dispatchAttempt,
-      nothingToSendTurns.has(turn) ? 'nothing_to_send'
-        : !turn.isLocal && !turn.finalText?.trim() && frozenImReplyTurn(turn.turnId) ? 'empty_answer'
-        : undefined,
-    );
+    const outputDisposition = nothingToSendTurns.has(turn) ? 'nothing_to_send'
+      : !turn.isLocal && !turn.finalText?.trim() && frozenImReplyTurn(turn.turnId) ? 'empty_answer'
+      : undefined;
+    const supersededFinalMeta = supersededFinalDeliveredTurns.has(turn)
+      && (!turn.terminalStatus || turn.terminalStatus === 'completed')
+      ? { supersededFinalDelivered: true as const }
+      : undefined;
+    if (supersededFinalMeta) {
+      emitTurnTerminal(
+        turn.turnId,
+        turn.terminalStatus ?? 'completed',
+        turn.terminalErrorCode,
+        turn.dispatchAttempt,
+        outputDisposition,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        supersededFinalMeta,
+      );
+    } else {
+      emitTurnTerminal(
+        turn.turnId,
+        turn.terminalStatus ?? 'completed',
+        turn.terminalErrorCode,
+        turn.dispatchAttempt,
+        outputDisposition,
+      );
+    }
   }
   retireStructuredTurnAttribution(ready.flatMap(turn => [...(turn.supersededTurns ?? []), turn]));
 }
@@ -33048,6 +33277,9 @@ async function flushPending(): Promise<void> {
       // Deferred preparation parks this exact item in pendingMessages until
       // beforeSubmit: the queue, not this write, owns it until then.
       let deferredQueueOwned = false;
+      // Set when a queue-owned item is found retired right after its write-edge
+      // admission returned allow, before the adapter or any preparation ran.
+      let retiredAfterAdmission = false;
       let retiredBeforeSubmit = false;
       let webWireWriteRefused = false;
       let reattachSteerWriteRefused = false;
@@ -33685,7 +33917,21 @@ async function flushPending(): Promise<void> {
           const transaction = await runAmbiguousSubmissionTransaction(
             writeBackend,
             () => runScheduledCliInputWrite(item, scheduledWriteIsCurrent,
-              isScheduledWrite ? prepareNormalWrite : () => {},
+              isScheduledWrite ? () => {
+                // The queue owns a deferred item until beforeSubmit, and a
+                // lifecycle path (coalesce, durable expiry, ...) may retire and
+                // settle it during the admission await. Settle that before the
+                // adapter is even invoked.
+                if (deferredQueueOwned && !pendingMessages.includes(item)) {
+                  retiredAfterAdmission = true;
+                  throw new Error('scheduled_input_retired');
+                }
+                // Queue-owned items prepare only in beforeSubmit, after its
+                // ownership check: the adapter's own precheck can still await,
+                // and a veto there cannot undo the capture identity, started
+                // active turn or written marks preparation commits.
+                if (!deferredQueueOwned) prepareNormalWrite();
+              } : () => {},
               () => writeAdapter.writeInput(
               adapterInputHandle(writeBackend),
               msg,
@@ -33772,7 +34018,7 @@ async function flushPending(): Promise<void> {
           scheduleBusyPatternIdleProbe(`${cliName()} post-submit`);
         }
       } catch (err: any) {
-        if (lateScheduledHold && !normalWritePrepared) {
+        if ((lateScheduledHold || retiredAfterAdmission) && !normalWritePrepared) {
           const queuedIndex = pendingMessages.indexOf(item);
           // A queue-owned item that left the queue during the admission await
           // was retired and already settled by a lifecycle path (coalesce,
@@ -44085,6 +44331,7 @@ async function spawnCliBody(
     currentBotmuxLinkRefMode = undefined;
     queuedTypeAheadTurns = [];
     if (typeof settledAbsorbedTurnsByKey !== 'undefined') settledAbsorbedTurnsByKey.clear();
+    if (typeof absorbedMarkerWrittenAtMsByKey !== 'undefined') absorbedMarkerWrittenAtMsByKey.clear();
     foldedTypeAheadTurn = undefined;
     queuedTurnAdvanceConsumedForPrompt = undefined;
     retiredTurnIds.clear();
@@ -44579,6 +44826,7 @@ function killCli(opts: {
   currentBotmuxLinkRefMode = undefined;
   queuedTypeAheadTurns = [];
   if (typeof settledAbsorbedTurnsByKey !== 'undefined') settledAbsorbedTurnsByKey.clear();
+  if (typeof absorbedMarkerWrittenAtMsByKey !== 'undefined') absorbedMarkerWrittenAtMsByKey.clear();
   foldedTypeAheadTurn = undefined;
   queuedTurnAdvanceConsumedForPrompt = undefined;
   retiredTurnIds.clear();
@@ -48538,6 +48786,14 @@ function emitTurnTerminal(
   providerTiming?: { retryAtMs?: number; lastSuccessAtMs?: number },
   /** `safe_composer_required` only: why the unattended write was refused. */
   composerRefusal?: PromptCacheKeepaliveRefusal,
+  /** Merged/absorbed execution membership & coverage facts for the daemon. */
+  mergedTurnMeta?: {
+    absorbedTurnIds?: string[];
+    absorbedIntoTurnId?: string;
+    absorbedIntoDispatchAttempt?: number;
+    absorbedCoverage?: AbsorbedTurnCoverage;
+    supersededFinalDelivered?: true;
+  },
 ): void {
   if (!sessionId || !turnId) return;
   if (workerSessionEventScope && !workerSessionEventScope.ownsExecutionEvent(turnId, dispatchAttempt)) return;
@@ -48637,6 +48893,15 @@ function emitTurnTerminal(
     ...(backgroundTasks > 0 ? { backgroundTasks } : {}),
     ...(authorityHeldForBackground ? { authorityHeldForBackground: true as const } : {}),
     ...(composerRefusal && errorCode === 'safe_composer_required' ? { composerRefusal } : {}),
+    ...(mergedTurnMeta?.absorbedTurnIds?.length ? { absorbedTurnIds: mergedTurnMeta.absorbedTurnIds } : {}),
+    ...(mergedTurnMeta?.absorbedIntoTurnId ? {
+      absorbedIntoTurnId: mergedTurnMeta.absorbedIntoTurnId,
+      ...(mergedTurnMeta.absorbedIntoDispatchAttempt !== undefined
+        ? { absorbedIntoDispatchAttempt: mergedTurnMeta.absorbedIntoDispatchAttempt }
+        : {}),
+      ...(mergedTurnMeta.absorbedCoverage ? { absorbedCoverage: mergedTurnMeta.absorbedCoverage } : {}),
+    } : {}),
+    ...(mergedTurnMeta?.supersededFinalDelivered ? { supersededFinalDelivered: true as const } : {}),
   };
   const scope = workerSessionEventScope;
   if (continuationFailure && scope) {
@@ -48857,7 +49122,11 @@ function markReplyInputConsumed(
     if (validHostAttempt !== undefined) queued.absorbedIntoDispatchAttempt = validHostAttempt;
     else delete queued.absorbedIntoDispatchAttempt;
   }
+  const markerWriteStartMs = Date.now();
   writeCliPidMarker();
+  if (validHostId && typeof noteAbsorbedMarkerWritten === 'function') {
+    noteAbsorbedMarkerWritten(queued.turnId, queued.dispatchAttempt, markerWriteStartMs);
+  }
   scheduleConsumedQueuedTurnAdvance();
 }
 
@@ -48963,6 +49232,12 @@ function acknowledgeNativeInputConsumed(
       ? { ordinaryInteractive: true as const } : {}),
     ...(nativeSessionId ? { nativeSessionId } : {}),
     ...(nativeTurnId ? { nativeTurnId } : {}),
+    ...(absorbedHost?.hostTurnId && absorbedHost.hostTurnId !== turnId ? {
+      absorbedIntoTurnId: absorbedHost.hostTurnId,
+      ...(absorbedHost.hostDispatchAttempt !== undefined
+        ? { absorbedIntoDispatchAttempt: absorbedHost.hostDispatchAttempt }
+        : {}),
+    } : {}),
   });
   if (agyReceiptKey) {
     acknowledgedAntigravityConsumption.add(agyReceiptKey);

@@ -97,6 +97,43 @@ describe('owner actor at the dashboard edge', () => {
       expect(result.proxyToDaemon).not.toHaveBeenCalled();
     }
   });
+
+  it('forwards actorUnionId to the route older daemons do not have', async () => {
+    const body = { ...ownerRequest(), actorUnionId: 'on_fixture_owner' };
+    const result = await post(body, null, token);
+    expect(result).toMatchObject({ status: 200, body: { ok: true, actor: 'owner' } });
+    expect(result.proxyToDaemon).toHaveBeenCalledWith('fixture-bot', '/api/trigger/owner-union', expect.objectContaining({
+      body: JSON.stringify(body),
+    }));
+  });
+
+  it('rejects actorUnionId from other identities, with or without actor', async () => {
+    const { actor: _actor, ...withoutActor } = ownerRequest();
+    for (const body of [{ ...ownerRequest(), actorUnionId: 'on_fixture_owner' }, { ...withoutActor, actorUnionId: 'on_fixture_owner' }]) {
+      for (const [identity, presented] of [
+        [null, 'fixture-read-token'],
+        [{ ...platform, kind: 'feishu-h5' as const }, token],
+        [{ ...platform, kind: 'platform-dashboard' as const }, token],
+      ] as const) {
+        const result = await post(body, identity, presented);
+        expect(result).toMatchObject({ status: 403, body: { errorCode: 'actor_not_allowed' } });
+        expect(result.proxyToDaemon).not.toHaveBeenCalled();
+      }
+    }
+  });
+
+  it('returns 400 for actorUnionId without the owner actor or not shaped as a union_id', async () => {
+    const { actor: _actor, ...withoutActor } = ownerRequest();
+    for (const body of [
+      { ...withoutActor, actorUnionId: 'on_fixture_owner' },
+      ...['ou_fixture_owner', 'owner@example.com', 'on_', 'on_two words', '', 42, null, ['on_fixture_owner']]
+        .map(actorUnionId => ({ ...ownerRequest(), actorUnionId })),
+    ]) {
+      const result = await post(body, null, token);
+      expect(result).toMatchObject({ status: 400, body: { errorCode: 'bad_request' } });
+      expect(result.proxyToDaemon).not.toHaveBeenCalled();
+    }
+  });
 });
 
 function runAsRequest(): Record<string, any> {
@@ -732,6 +769,20 @@ describe('dispatchTriggerRequest', () => {
     const res = await dispatchTriggerRequest(body, { proxyToDaemon });
     expect(res.status).toBe(200);
     expect(proxyToDaemon).toHaveBeenCalledWith(body.target.botId, '/api/trigger/host', expect.objectContaining({ method: 'POST' }));
+  });
+
+  it('routes owner actorUnionId with workingDir through the owner-union endpoint', async () => {
+    const body = { ...ownerRequest(), actorUnionId: 'on_fixture_owner', options: { workingDir: '/repo' } } as TriggerRequest;
+    const proxyToDaemon = vi.fn(async () => Response.json({ ok: true }));
+    await dispatchTriggerRequest(body, { proxyToDaemon });
+    expect(proxyToDaemon).toHaveBeenCalledWith(body.target.botId, '/api/trigger/owner-union', expect.objectContaining({ method: 'POST' }));
+  });
+
+  it('maps an old daemon’s missing owner-union route to daemon_upgrade_required', async () => {
+    const proxyToDaemon = vi.fn(async () => Response.json({ error: 'not_found', path: '/api/trigger/owner-union' }, { status: 404 }));
+    const res = await dispatchTriggerRequest({ ...ownerRequest(), actorUnionId: 'on_fixture_owner' } as TriggerRequest, { proxyToDaemon });
+    expect(res.status).toBe(503);
+    expect(res.body).toMatchObject({ ok: false, errorCode: 'daemon_upgrade_required' });
   });
 
   it('maps an old daemon’s missing host-field route to daemon_upgrade_required', async () => {

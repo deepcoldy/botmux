@@ -497,6 +497,7 @@ export const CLONE_IDENTITY_KEYS = [
   'brand',
   'allowedUsers',
   'ownerOpenId',
+  'ownerUnionId',
 ] as const;
 
 const CLONE_LAUNCH_MODE_KEYS = [

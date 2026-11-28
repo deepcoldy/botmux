@@ -14009,6 +14009,23 @@ describe('core-only public routes + readiness barrier (behavioral)', () => {
       });
       expect(signed.status).toBe(403);
       expect(await signed.json()).toMatchObject({ errorCode: 'owner_unresolved' });
+      const unionBody = JSON.stringify({ ...JSON.parse(actorBody), actorUnionId: 'on_fixture_owner' });
+      const unsignedUnion = await fetch(`${base}/api/trigger/owner-union`, { method: 'POST', headers: actorHeaders, body: unionBody });
+      expect(unsignedUnion.status).toBe(401);
+      const signedUnion = (body: string) => fetch(`${base}/api/trigger/owner-union`, {
+        method: 'POST',
+        headers: { ...actorHeaders, ...trustedHostHeaders('POST', '/api/trigger/owner-union', handle!.port) },
+        body,
+      });
+      const withoutUnion = await signedUnion(actorBody);
+      expect(withoutUnion.status).toBe(403);
+      expect(await withoutUnion.json()).toMatchObject({ errorCode: 'actor_not_allowed' });
+      const withUnion = await signedUnion(unionBody);
+      expect(withUnion.status).toBe(403);
+      expect(await withUnion.json()).toMatchObject({ errorCode: 'owner_unresolved' });
+      const publicUnion = await fetch(`${base}/api/trigger`, { method: 'POST', headers: actorHeaders, body: unionBody });
+      expect(publicUnion.status).toBe(403);
+      expect(await publicUnion.json()).toMatchObject({ errorCode: 'actor_not_allowed' });
     } finally {
       workerPool.setActiveSessionsRegistry(previousSessions ?? new Map());
     }
@@ -14701,6 +14718,48 @@ describe('POST /api/sessions/:sessionId/reply-card-ready', () => {
         expect(ready.json).toEqual({ ok: true, nativeThinkingVisible: visible });
       }
       expect(prepareSpy).toHaveBeenLastCalledWith(ds, 'om_order', 1);
+    } finally { findSpy.mockRestore(); prepareSpy.mockRestore(); }
+  });
+
+  it('allows the merged host turn when currentTurnId advanced to an absorbed follow-up, and rejects already-terminated turns even with stale captureIdentity', async () => {
+    const cards = await import('../src/core/turn-reply-card.js');
+    const { recordTurnAbsorption } = await import('../src/core/turn-absorption.js');
+    const appId = 'cli_native_merged';
+    const ds = {
+      larkAppId: appId,
+      currentTurnId: 'om_m3',
+      workerGeneration: 1,
+      replyCardRunningTurnId: 'om_m1',
+      captureIdentity: { turnId: 'om_m1', workerGeneration: 1, revision: 1 },
+      session: { sessionId: 'native-merged', status: 'active' },
+    } as any;
+    recordTurnAbsorption(ds, 'om_m2', 'om_m1');
+    recordTurnAbsorption(ds, 'om_m3', 'om_m1');
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    const prepareSpy = vi.spyOn(cards, 'prepareReplyCardNativeThinking').mockResolvedValue(true);
+    try {
+      setLarkAppId(appId); setIpcAuthSecret(TEST_IPC_SECRET);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const path = '/api/sessions/native-merged/reply-card-ready';
+      const body = JSON.stringify({ expectedTurnId: 'om_m1' });
+      const query = () => requestJson(handle!.port, path, {
+        method: 'POST',
+        body,
+        headers: { ...trustedHostHeaders('POST', path, handle!.port), 'content-type': 'application/json' },
+      });
+
+      const mergedOk = await query();
+      expect(mergedOk.status).toBe(200);
+      expect(mergedOk.json).toEqual({ ok: true, nativeThinkingVisible: true });
+
+      // Once M1 terminates and independent turn M4 starts, stale captureIdentity still
+      // pointing to M1 must NOT authorize a late reply-card-ready for M1.
+      ds.replyCardRunningTurnId = undefined;
+      ds.terminalIdentityTurnIds = new Set(['om_m1']);
+      ds.currentTurnId = 'om_m4';
+      const independentRejected = await query();
+      expect(independentRejected.status).toBe(409);
+      expect(independentRejected.json).toMatchObject({ ok: false, error: 'reply_turn_changed' });
     } finally { findSpy.mockRestore(); prepareSpy.mockRestore(); }
   });
 });

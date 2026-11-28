@@ -2,7 +2,7 @@ import { afterEach, describe, it, expect } from 'vitest';
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { spawnSyncTsScript } from './helpers/ts-runner.js';
 import {
   tmuxKeyToBytes,
@@ -122,6 +122,28 @@ describe('buildLayoutString', () => {
     expect(kdl).toContain('"claude"');
     expect(kdl).toContain('"--resume"');
     expect(kdl).toContain('"abc"');
+  });
+
+  it.each([
+    ['configured', 'xhigh'],
+    ['unconfigured', undefined],
+  ] as const)('gives the launched Pi pane only its worker-owned fallback (%s)', (_case, fallback) => {
+    const key = 'BOTMUX_PI_RESUME_FALLBACK_THINKING';
+    const layout = buildLayoutString('/bin/sh', ['-c', `printf '%s' "\${${key}-unset}"`], {
+      cwd: tmpdir(), cols: 80, rows: 24, launchShell: '/bin/sh',
+      env: { [key]: fallback }, injectEnv: { [key]: 'medium' },
+    });
+    // Execute the generated pane command without requiring a zellij server.
+    // kdlString emits a subset of JSON string literals for the command/argv.
+    const command = layout.match(/\bpane command=("(?:[^"\\]|\\.)*")/u)?.[1];
+    const args = layout.match(/^\s*args (.*)$/m)?.[1]?.match(/"(?:[^"\\]|\\.)*"/gu);
+    expect(command).toBeDefined();
+    expect(args?.length).toBeGreaterThan(0);
+    const result = spawnSync(JSON.parse(command!), args!.map(arg => JSON.parse(arg)), {
+      env: { PATH: '/usr/bin:/bin', [key]: 'low' }, encoding: 'utf8', timeout: 5_000,
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toBe(fallback ?? 'unset');
   });
 
   it('keeps POSIX layout argv sentinel and wrapper syntax when launch shell is sh', () => {

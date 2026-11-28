@@ -2886,7 +2886,7 @@ export type WorkerToDaemonBase =
    * turn acknowledgement. Neither IPC arrival, queue ownership nor a generic
    * adapter `submitted` flag qualifies. The daemon covers shared group
    * background at this boundary; terminal completion stays the fallback. */
-  | { type: 'native_input_consumed'; ordinaryInteractive?: true; turnId: string; dispatchAttempt?: number; proofKind: 'codex_history_match' | 'codex_rpc_turn_start' | 'codex_rpc_turn_steer' | 'claude_transcript_user_record' | 'antigravity_transcript_user_input'; nativeSessionId?: string; nativeTurnId?: string }
+  | { type: 'native_input_consumed'; ordinaryInteractive?: true; turnId: string; dispatchAttempt?: number; proofKind: 'codex_history_match' | 'codex_rpc_turn_start' | 'codex_rpc_turn_steer' | 'claude_transcript_user_record' | 'antigravity_transcript_user_input'; nativeSessionId?: string; nativeTurnId?: string; absorbedIntoTurnId?: string; absorbedIntoDispatchAttempt?: number }
   | { type: 'traex_native_context_receipt'; receipt: import('./core/traex-native-context.js').TraexNativeContextReceipt }
   /** The CLI's UserPromptSubmit hook submitted a prompt that is, or starts
    * with, the text this worker wrote for this turn. Read before the model
@@ -3460,6 +3460,19 @@ export type WorkerToDaemonBase =
        *  services/failed-turn-rewind.ts). */
       directFailure?: true;
       traexPromptCheckpoint?: import("./services/traex-prompt-checkpoint.js").TraexPromptCheckpoint;
+      /** Covered mid-turn absorbed member turn IDs folded into this host turn's
+       *  single execution (Claude `attachment(queued_command)`). Lets the daemon
+       *  register merged-turn membership before member terminals arrive. */
+      absorbedTurnIds?: string[];
+      /** Set on a turn folded mid-turn into an already-running host turn. */
+      absorbedIntoTurnId?: string;
+      absorbedIntoDispatchAttempt?: number;
+      /** Deterministic worker classification of whether this absorbed member was
+       *  covered by its host turn's execution/final, or must stay standalone. */
+      absorbedCoverage?: import('./core/turn-absorption.js').AbsorbedTurnCoverage;
+      /** Set on a structured-bridge turn (Codex/TraeX) whose final was already
+       *  delivered under a proven superseded predecessor turn. */
+      supersededFinalDelivered?: true;
     }
   | {
       /** Outcome of a message's {@link FailedTurnRewindDirective}, sent before
