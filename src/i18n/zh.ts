@@ -2325,7 +2325,6 @@ export const messages: Record<string, string> = {
     '• `settings`   — 全局设置（仅管理员）\n' +
     '• `link`       — 管理首页链接（私信；等价裸 `/dash`；链接形式随远程访问/反代配置变化）\n' +
     '• `trae-login` — TRAE 企业登录（私聊授权、回调、status/cancel）\n' +
-    '• `trae-login` — TRAE 企业登录（私聊授权与回调，status/cancel）\n' +
     '• `help`       — 本帮助\n\n' +
     '不带子命令时默认 `overview`。整个命令组仅 Bot 管理员（allowedUsers）可用。',
   'card.dashboard.help.unknown_module': '⚠️ 未知模块 `{module}`，请使用下列之一：',

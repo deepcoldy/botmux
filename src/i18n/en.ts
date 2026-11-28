@@ -2321,7 +2321,6 @@ export const messages: Record<string, string> = {
     '• `settings`   — global settings (admins only)\n' +
     '• `link`       — admin home link via DM (alias: bare `/dash`; link form follows the remote-access/proxy configuration)\n' +
     '• `trae-login` — TRAE enterprise login (private link, callback, status/cancel)\n' +
-    '• `trae-login` — TRAE enterprise login (private authorization, status/cancel)\n' +
     '• `help`       — this help\n\n' +
     'Without a subcommand, defaults to `overview`. The entire group is restricted to bot admins (allowedUsers).',
   'card.dashboard.help.unknown_module': '⚠️ Unknown module `{module}`. Pick one of:',

@@ -1268,6 +1268,48 @@ describe('Lark event dispatcher — durable primary processor', () => {
     queuePostAdmissionControl: queuePostAdmissionControl ?? (() => undefined),
   });
 
+  it('never persists a native TRAE login callback to the durable primary inbox', async () => {
+    capturedHandlers = {};
+    __resetAnchorQueues();
+    __resetEventClaimsForTest();
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    const enqueuePrimary = vi.fn(async () => ({ kind: 'inserted' as const }));
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      makeHandlers(),
+      'feishu',
+      undefined,
+      { enqueuePrimary },
+    );
+    runtime.connect();
+    try {
+      // Positive control: an ordinary user message is still durably enqueued.
+      const normal = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '@BotA ordinary message' }),
+        messageId: 'om_trae_primary_normal',
+      });
+      await capturedHandlers['im.message.receive_v1'](normal);
+      expect(enqueuePrimary).toHaveBeenCalledOnce();
+
+      // The login callback carries a credential. It must bypass durable
+      // persistence entirely while still taking the live control route.
+      const callback = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        chatType: 'p2p',
+        content: JSON.stringify({ text: '/dashboard trae-login complete req-1 http://127.0.0.1:9/authorize?token=PRIMARY_INBOX_SECRET' }),
+        messageId: 'om_trae_primary_callback',
+      });
+      await capturedHandlers['im.message.receive_v1'](callback);
+      expect(enqueuePrimary).toHaveBeenCalledOnce();
+      expect(JSON.stringify(enqueuePrimary.mock.calls)).not.toContain('PRIMARY_INBOX_SECRET');
+      await flushEventWork();
+    } finally {
+      runtime.close();
+    }
+  });
+
   it('persists recalled-message events before applying the local tombstone', async () => {
     setGroupContextSettingsResolver(() => ({ enabled: true, maxContextChars: 4000 }));
     try {
@@ -4410,6 +4452,37 @@ describe('im.message.receive_v1 — durable inbox shadow ACK boundary', () => {
     expect(handlers.handleThreadReply).toHaveBeenCalledOnce();
     resolveEnqueue({ kind: 'inserted' });
     await flushEventWork();
+  });
+
+  it('never shadows a native TRAE login callback but keeps processing it live', async () => {
+    capturedHandlers = {};
+    __resetAnchorQueues();
+    __resetEventClaimsForTest();
+    setupBotState();
+    const handlers = makeHandlers();
+    const enqueueInbox = vi.fn(async () => ({ kind: 'inserted' as const }));
+    startLarkEventDispatcher(
+      MY_APP_ID,
+      'secret',
+      handlers,
+      'feishu',
+      { enqueueInbox } as any,
+    );
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      chatType: 'p2p',
+      content: JSON.stringify({ text: '/dashboard trae-login complete req-1 http://127.0.0.1:9/authorize?token=SHADOW_INBOX_SECRET' }),
+      messageId: 'om_trae_shadow_callback',
+    });
+
+    const returned = capturedHandlers['im.message.receive_v1'](event);
+    expect(returned).toBeUndefined();
+    await flushEventWork();
+    // The credential-bearing control input must never reach the shadow Inbox,
+    // even though ordinary messages on this route are enqueued (see the test
+    // above). Removing the dispatcher gate makes this assertion fail.
+    expect(enqueueInbox).not.toHaveBeenCalled();
+    expect(JSON.stringify(enqueueInbox.mock.calls)).not.toContain('SHADOW_INBOX_SECRET');
   });
 });
 
