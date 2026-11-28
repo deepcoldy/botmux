@@ -25,7 +25,7 @@
 import { createHash } from 'node:crypto';
 import type { DaemonSession } from './types.js';
 import { nextCardSequence, withCardWriteLock } from './card-element-writes.js';
-import { sameMergedTurnGroup } from './turn-absorption.js';
+import { sameMergedTurnGroup } from './turn-absorption-state.js';
 import { renderRecapMarkdown } from '../services/turn-recap.js';
 import {
   buildRecapElement,

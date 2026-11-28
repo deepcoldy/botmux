@@ -21,7 +21,7 @@ import {
   type TurnOutcome,
 } from './session-task-status.js';
 import { emitSessionTaskEvent } from './session-task-events.js';
-import { sameMergedTurnGroup } from './turn-absorption.js';
+import { sameMergedTurnGroup } from './turn-absorption-state.js';
 import type { DaemonSession } from './types.js';
 
 /** 等本轮 daemon 兜底最终回复投递完成的上限，覆盖现有 0/5/15 秒重试序列。 */

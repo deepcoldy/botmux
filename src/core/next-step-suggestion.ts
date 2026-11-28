@@ -19,7 +19,7 @@
 import { createHash } from 'node:crypto';
 import type { DaemonSession } from './types.js';
 import { serializeCardWrite } from './card-element-writes.js';
-import { sameMergedTurnGroup } from './turn-absorption.js';
+import { sameMergedTurnGroup } from './turn-absorption-state.js';
 import {
   buildNextStepElement,
   nextStepPlacement,
