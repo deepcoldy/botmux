@@ -1316,9 +1316,12 @@ export function prepareDirectSandbox(opts: {
       }
     }
   }
+  // The outer network runner owns model/local-service bridges and connects to
+  // the host guard before entering bwrap. With host MCP disabled, task processes
+  // need no guard socket mount. If one is mounted, it must still match.
   if (opts.protectedHttpBridge && (!opts.networkPolicy
-    || !opts.protectedEgressSocketPath
-    || resolve(opts.protectedHttpBridge.socketPath) !== resolve(opts.protectedEgressSocketPath))) {
+    || (opts.protectedEgressSocketPath
+      && resolve(opts.protectedHttpBridge.socketPath) !== resolve(opts.protectedEgressSocketPath)))) {
     throw new Error('protected HTTP loopback bridge requires the matching guarded network sandbox');
   }
   if (opts.localServiceBridges?.length && !opts.networkPolicy) {

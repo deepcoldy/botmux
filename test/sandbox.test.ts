@@ -53,6 +53,25 @@ describe('prepareDirectSandbox platform gate', () => {
 describe('prepareDirectSandbox protected egress socket mount', () => {
   usePlanOnlyBwrap();
 
+  it('rejects a model bridge without network isolation or with a mismatched guard socket', () => {
+    if (process.platform !== 'linux') return;
+    const common = {
+      sessionId: 'invalid-model-bridge', dataDir: '/unused',
+      policy: { rules: [], net: true, writeRegexes: [] },
+      chdir: '/unused', home: '/unused', cliBin: '/bin/true', cliArgs: [],
+      protectedHttpBridge: {
+        socketPath: '/guard/e.sock', policyId: 'fixture.write.v1', targetIndex: 0,
+        placeholderOrigin: 'http://127.0.0.1:0',
+      },
+    };
+    expect(() => prepareDirectSandbox(common)).toThrow();
+    expect(() => prepareDirectSandbox({
+      ...common,
+      networkPolicy: { version: 1, public: { mode: 'allow' }, private: { mode: 'allow' } },
+      protectedEgressSocketPath: '/other/e.sock',
+    })).toThrow();
+  });
+
   async function listen(path: string): Promise<Server> {
     const server = createServer();
     server.listen(path);
@@ -150,7 +169,7 @@ describe('prepareDirectSandbox protected egress socket mount', () => {
     }
   });
 
-  it('carries a route-scoped local-service bridge in the network runner without mounting an MCP socket', async () => {
+  it('routes model and local-service bridges without exposing host sockets when MCP is disabled', async () => {
     if (process.platform !== 'linux') return;
     const root = mkdtempSync(join(tmpdir(), 'sbx-local-service-bridge-'));
     const socketDir = join(root, 'sockets');
@@ -171,7 +190,11 @@ describe('prepareDirectSandbox protected egress socket mount', () => {
         chdir: root,
         home: root,
         cliBin: '/bin/true',
-        cliArgs: [],
+        cliArgs: ['-c', 'model_providers.fixture.base_url="http://127.0.0.1:0/relay"'],
+        protectedHttpBridge: {
+          socketPath: egressPath, policyId: 'fixture.write.v1', targetIndex: 0,
+          placeholderOrigin: 'http://127.0.0.1:0',
+        },
         localServiceBridges: [{
           socketPath: egressPath,
           serviceId: 'lark-tool-identity',
@@ -185,6 +208,16 @@ describe('prepareDirectSandbox protected egress socket mount', () => {
       expect(plan).not.toBeNull();
       const encoded = plan!.args.at(-1)!;
       const launch = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));
+      expect(launch.protectedHttpBridge).toEqual({
+        socketPath: egressPath, policyId: 'fixture.write.v1', targetIndex: 0,
+        placeholderOrigin: 'http://127.0.0.1:0',
+      });
+      expect(materializeProtectedHttpLoopbackArgs(
+        launch.args, 'http://127.0.0.1:0', 'http://127.0.0.1:43123', launch.protectedHttpBridgeArgsOffset,
+      ).slice(launch.protectedHttpBridgeArgsOffset)).toEqual([
+        '-c', 'model_providers.fixture.base_url="http://127.0.0.1:43123/relay"',
+      ]);
+      expect(launch.args).not.toContain(socketDir);
       expect(launch.localServiceBridges).toEqual([{
         socketPath: egressPath,
         serviceId: 'lark-tool-identity',
