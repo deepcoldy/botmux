@@ -371,6 +371,32 @@ async function stopCli(scope: Record<string, any>) {
   await loadWorkerMessageHandler('term_action', scope)({ type: 'term_action', key: 'ctrlc' });
 }
 
+const liveIdleDetector = {
+  isStartupPending: () => false, programStatusHeldWorking: () => false, programStatusHeldBusy: () => false,
+  adoptPromptReady: vi.fn(), reset: vi.fn(), dispose: vi.fn(),
+};
+
+/** The real killCli({ preservePending: true }). Its teardown of process
+ * services the harness does not model (watchers, sandbox, RPC, timers) runs
+ * against inert stand-ins; the worker state the queue and generation live in
+ * is the harness's own. */
+function killCliPreservingQueue(scope: Record<string, any>) {
+  const inert: any = new Proxy(function inertService() {}, {
+    get: (_target, key) => (key === Symbol.toPrimitive ? () => 0 : inert),
+    apply: () => inert,
+  });
+  const services = new Set(['codexAppTurnLiveness', 'codexAppReadyAuthority', 'idleDetector']);
+  const teardownScope = new Proxy(scope, {
+    // Language globals (undefined, Date, ...) stay real.
+    has: (target, key) => typeof key === 'string' && (key in target || !(key in globalThis)),
+    get: (target, key) => (typeof key !== 'string' ? (target as any)[key]
+      : key in target && !services.has(key) ? target[key] : inert),
+  });
+  loadWorkerFunction<(opts: { preservePending: boolean }) => void>('killCli', teardownScope)({ preservePending: true });
+  // No stand-in leaked into the worker state the next flush reads.
+  expect(Object.values(scope)).not.toContain(inert);
+}
+
 describe('deferred scheduled input interrupted during the adapter precheck', () => {
   function interruptibleHarness(decisions: Admission[]) {
     const harness = scheduledHarness(decisions, true);
@@ -485,14 +511,19 @@ describe('deferred scheduled input interrupted during the adapter precheck', () 
     expect(preparedFor(h.scope, runA.turnId)).toEqual(NOT_PREPARED);
   });
 
-  it('a Web wire dirtied during the precheck holds it once, unprepared, until the next clean ready edge', async () => {
-    const { h, item: runA, rejections } = interruptibleHarness(['allow', 'allow', 'allow', 'allow']);
+  it('a Web wire dirtied during the precheck holds it until the CLI is rebuilt, then it is written once', async () => {
+    const { h, item: runA, rejections, fireRetry } = interruptibleHarness(['allow', 'allow', 'allow', 'allow']);
+    h.scope.cliLifetimeNonce = 'dirty-runtime';
+    const dirtyBackend = h.scope.backend;
+    dirtyBackend.kill = vi.fn();
     const { parked, release } = parkPrecheck(h.scope);
     const flushA = h.flush();
     await parked;
-    h.scope.webTerminalDirtyTarget = {
-      backend: h.scope.backend, lifetime: h.scope.cliLifetimeNonce, generation: h.scope.cliSpawnGeneration,
-    };
+    // The real partial-paste path pins the dirty mark to this exact CLI.
+    loadWorkerFunction<(ws: unknown, target: unknown) => void>('markWebTerminalInputWireUncertain', h.scope)(
+      { close: vi.fn() },
+      { backend: h.scope.backend, lifetime: h.scope.cliLifetimeNonce, generation: h.scope.cliSpawnGeneration },
+    );
     release();
     await flushA;
     expect(preparedFor(h.scope, runA.turnId)).toEqual(NOT_PREPARED);
@@ -500,10 +531,28 @@ describe('deferred scheduled input interrupted during the adapter precheck', () 
     expect(rejections(runA.turnId)).toBe(0);
     expect(h.scope.holdNativeInputForHardBlock).not.toHaveBeenCalled();
 
-    h.scope.webTerminalDirtyTarget = undefined;
+    // The retry fires against the same, still dirty CLI: nothing is written.
+    await fireRetry();
+    expect(h.scope.pendingMessages[0]).toBe(runA);
+    expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledTimes(1);
+    expect(preparedFor(h.scope, runA.turnId)).toEqual(NOT_PREPARED);
+
+    // Only rebuilding the CLI lifts the mark: the real queue-preserving
+    // killCli ends this generation, then the replacement CLI comes up.
+    killCliPreservingQueue(h.scope);
+    expect(dirtyBackend.kill).toHaveBeenCalledTimes(1);
+    expect(h.scope.cliSpawnGeneration).toBe(8);
+    expect(h.scope.pendingMessages).toEqual([runA]);
+    Object.assign(h.scope, {
+      backend: {}, cliLifetimeNonce: 'replacement-runtime', isPromptReady: true, idleDetector: liveIdleDetector,
+    });
     await h.flush();
     expect(preparedFor(h.scope, runA.turnId)).toEqual(PREPARED_ONCE);
     expect(h.scope.pendingMessages).toEqual([]);
+    await h.flush();
+    expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledTimes(2);
+    expect(preparedFor(h.scope, runA.turnId)).toEqual(PREPARED_ONCE);
+    expect(rejections(runA.turnId)).toBe(0);
   });
 
   it('a non-scheduled input is still written when the interrupt lands in its precheck', async () => {
