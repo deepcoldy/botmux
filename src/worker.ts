@@ -18550,20 +18550,36 @@ function emitReadyTurns(opts: EmitReadyTurnsOptions = {}): void {
           ? { lastSuccessAtMs: turn.terminalProviderLastSuccessAtMs } : {}),
       };
       try {
-        emitTurnTerminal(
-          turn.turnId,
-          outcome.status,
-          outcome.errorCode,
-          turn.dispatchAttempt,
-          nothingToSendTurns.has(turn) ? 'nothing_to_send' : undefined,
-          outcome.retryable,
-          undefined,
-          turn.terminalErrorDetail,
-          undefined,
-          Object.keys(providerTiming).length > 0 ? providerTiming : undefined,
-          undefined,
-          mergedTurnMetaFor(turn),
-        );
+        const mergedTurnMeta = mergedTurnMetaFor(turn);
+        if (mergedTurnMeta) {
+          emitTurnTerminal(
+            turn.turnId,
+            outcome.status,
+            outcome.errorCode,
+            turn.dispatchAttempt,
+            nothingToSendTurns.has(turn) ? 'nothing_to_send' : undefined,
+            outcome.retryable,
+            undefined,
+            turn.terminalErrorDetail,
+            undefined,
+            Object.keys(providerTiming).length > 0 ? providerTiming : undefined,
+            undefined,
+            mergedTurnMeta,
+          );
+        } else {
+          emitTurnTerminal(
+            turn.turnId,
+            outcome.status,
+            outcome.errorCode,
+            turn.dispatchAttempt,
+            nothingToSendTurns.has(turn) ? 'nothing_to_send' : undefined,
+            outcome.retryable,
+            undefined,
+            turn.terminalErrorDetail,
+            undefined,
+            Object.keys(providerTiming).length > 0 ? providerTiming : undefined,
+          );
+        }
       } catch (error) {
         // Only this bridge loop restores the queue, so only here is the claim
         // rolled back for a same-turn retry. Direct commit-unknown terminal
@@ -18625,20 +18641,32 @@ function emitReadyTurns(opts: EmitReadyTurnsOptions = {}): void {
       flushThinkingUpdate();
     }
     try {
-      emitTurnTerminal(
-        turn.turnId,
-        outcome?.status ?? 'completed',
-        undefined,
-        turn.dispatchAttempt,
-        outputDisposition,
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        mergedTurnMetaFor(turn),
-      );
+      const mergedTurnMeta = mergedTurnMetaFor(turn);
+      if (mergedTurnMeta) {
+        emitTurnTerminal(
+          turn.turnId,
+          outcome?.status ?? 'completed',
+          undefined,
+          turn.dispatchAttempt,
+          outputDisposition,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          mergedTurnMeta,
+        );
+      } else {
+        emitTurnTerminal(
+          turn.turnId,
+          outcome?.status ?? 'completed',
+          undefined,
+          turn.dispatchAttempt,
+          outputDisposition,
+          undefined,
+        );
+      }
     } catch (error) {
       emittedTurnTerminals.release(sessionId!, turn.turnId, turn.dispatchAttempt, 'completed');
       throw error;
@@ -22615,24 +22643,37 @@ function emitReadyCodexTurns(settledQuotaTurns?: CodexPendingTurn[]): void {
       );
       continue;
     }
-    emitTurnTerminal(
-      turn.turnId,
-      turn.terminalStatus ?? 'completed',
-      turn.terminalErrorCode,
-      turn.dispatchAttempt,
-      nothingToSendTurns.has(turn) ? 'nothing_to_send'
-        : !turn.isLocal && !turn.finalText?.trim() && frozenImReplyTurn(turn.turnId) ? 'empty_answer'
-        : undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      supersededFinalDeliveredTurns.has(turn) && (!turn.terminalStatus || turn.terminalStatus === 'completed')
-        ? { supersededFinalDelivered: true }
-        : undefined,
-    );
+    const outputDisposition = nothingToSendTurns.has(turn) ? 'nothing_to_send'
+      : !turn.isLocal && !turn.finalText?.trim() && frozenImReplyTurn(turn.turnId) ? 'empty_answer'
+      : undefined;
+    const supersededFinalMeta = supersededFinalDeliveredTurns.has(turn)
+      && (!turn.terminalStatus || turn.terminalStatus === 'completed')
+      ? { supersededFinalDelivered: true as const }
+      : undefined;
+    if (supersededFinalMeta) {
+      emitTurnTerminal(
+        turn.turnId,
+        turn.terminalStatus ?? 'completed',
+        turn.terminalErrorCode,
+        turn.dispatchAttempt,
+        outputDisposition,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        supersededFinalMeta,
+      );
+    } else {
+      emitTurnTerminal(
+        turn.turnId,
+        turn.terminalStatus ?? 'completed',
+        turn.terminalErrorCode,
+        turn.dispatchAttempt,
+        outputDisposition,
+      );
+    }
   }
   retireStructuredTurnAttribution(ready.flatMap(turn => [...(turn.supersededTurns ?? []), turn]));
 }
