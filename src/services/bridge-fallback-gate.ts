@@ -629,6 +629,24 @@ function supersededFinalMarkerExplainsCompletionNarration(
   return marker.sentAtMs >= turn.markTimeMs && marker.sentAtMs < upper;
 }
 
+/** Explicit final send markers from a proven superseded predecessor that
+ *  already delivered this completed merged turn's final answer into its own
+ *  conversation (Codex/TraeX steer). Non-completed turns, detoured sends, and
+ *  terminal-independent reports are rejected fail-closed. */
+export function attributableSupersededFinalMarkers(
+  turn: BridgeGateInput,
+  nextBoundaryMs: number | undefined,
+  markers: readonly BridgeSendMarker[],
+): BridgeSendMarker[] {
+  if (!turn.turnId || !turn.supersededTurns?.length) return [];
+  if (turn.terminalStatus !== undefined && turn.terminalStatus !== 'completed') return [];
+  return markers.filter(marker =>
+    marker.terminalIndependent !== true
+    && markerCoversOwnThread(turn, marker)
+    && (markerMatchesSupersededFinal(turn, marker)
+      || supersededFinalMarkerExplainsCompletionNarration(turn, nextBoundaryMs, marker)));
+}
+
 /** Whether this delivery can replace the non-empty answer expected here.
  *
  * A cross-chat delivery or a dispatch report still explains an EMPTY terminal,

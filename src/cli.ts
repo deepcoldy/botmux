@@ -14889,6 +14889,10 @@ async function cmdSend(
           ...(marker ? { marker } : {}),
           beforeDispatch: persistOffBeforeProvider,
           resolveSettledAbsorbedTurnIds: resolveSettledAbsorbedTurnIdsForLedger,
+          absorbedSettlementIneligible: explicitReplyTo !== undefined
+            || sendTopLevel || !!overrideChatId || !!sendInto || explicitQuote !== undefined
+            || !!vcMeetingManagedSendOrigin || isOriginDocCommentTurn || isSlashSend
+            || !!scheduleRemoveSelfTaskId || !!scheduledOriginRun,
           ...(scheduledSendAttempt ? { noSideEffect: (error: unknown) =>
             !scheduledProviderEffectStarted && knownPreProviderRejections.has(error) } : {}),
         })

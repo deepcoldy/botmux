@@ -25,6 +25,7 @@
 import { createHash } from 'node:crypto';
 import type { DaemonSession } from './types.js';
 import { nextCardSequence, withCardWriteLock } from './card-element-writes.js';
+import { sameMergedTurnGroup } from './turn-absorption-state.js';
 import { renderRecapMarkdown } from '../services/turn-recap.js';
 import {
   buildRecapElement,
@@ -72,6 +73,7 @@ interface Shown {
 interface State {
   turnId?: string;
   card?: RecapCard;
+  cardTurnId?: string;
   cli?: { turnId: string; text: string };
   /** The turn the worker was last asked to let the CLI recap. */
   awaySummaryRequested?: string;
@@ -109,6 +111,7 @@ export function noteRecapTurnStarted(ds: DaemonSession, turnId: string): void {
   if (state.turnId === turnId) return;
   state.turnId = turnId;
   state.card = undefined;
+  state.cardTurnId = undefined;
   if (state.cli?.turnId !== turnId) state.cli = undefined;
   // The previous card keeps its panel; it is simply no longer this turn's.
   state.shown = undefined;
@@ -119,17 +122,24 @@ export function noteRecapTurnStarted(ds: DaemonSession, turnId: string): void {
 export function noteRecapCard(ds: DaemonSession, turnId: string, card: RecapCard, io: RecapIo): void {
   const state = stateFor(ds);
   const latest = latestTurn(ds, state);
-  if (latest !== undefined && latest !== turnId) {
+  if (latest !== undefined && !sameMergedTurnGroup(ds, latest, turnId)) {
     io.info?.(`[recap] ${ds.session.sessionId.slice(0, 8)}: card of ${turnId.slice(0, 16)} ignored: the session's latest turn is ${latest.slice(0, 16)}`);
     return;
   }
-  state.turnId = turnId;
+  if (latest !== undefined && state.cardTurnId === latest && turnId !== latest) {
+    io.info?.(`[recap] ${ds.session.sessionId.slice(0, 8)}: card of ${turnId.slice(0, 16)} ignored: ${latest.slice(0, 16)} already owns the latest card`);
+    return;
+  }
+  const effectiveTurnId = latest ?? turnId;
+  state.turnId = effectiveTurnId;
+  state.cardTurnId = turnId;
   state.card = card;
-  if (state.awaySummaryRequested !== turnId && state.cli?.turnId !== turnId
+  if (state.awaySummaryRequested !== effectiveTurnId
+    && !(state.cli && sameMergedTurnGroup(ds, state.cli.turnId, effectiveTurnId))
     && io.enabled(ds) && io.awaySummaryWanted(ds)) {
-    state.awaySummaryRequested = turnId;
-    io.requestAwaySummary(ds, turnId);
-    io.info?.(`[recap] ${ds.session.sessionId.slice(0, 8)}: asked the worker to let the CLI recap ${turnId.slice(0, 16)}`);
+    state.awaySummaryRequested = effectiveTurnId;
+    io.requestAwaySummary(ds, effectiveTurnId);
+    io.info?.(`[recap] ${ds.session.sessionId.slice(0, 8)}: asked the worker to let the CLI recap ${effectiveTurnId.slice(0, 16)}`);
   }
   reconcile(ds, io);
 }
@@ -139,11 +149,12 @@ export function noteCliRecap(ds: DaemonSession, turnId: string | undefined, text
   if (!turnId || !trimmed) return;
   const state = stateFor(ds);
   const latest = latestTurn(ds, state);
-  if (latest !== undefined && latest !== turnId) return;
-  if (state.cli?.turnId === turnId && state.cli.text === trimmed) return;
-  state.turnId = turnId;
-  state.cli = { turnId, text: trimmed };
-  io.info?.(`[recap] ${ds.session.sessionId.slice(0, 8)}: CLI recap for ${turnId.slice(0, 16)} (${trimmed.length} chars)${state.card ? '' : '; its card has not settled yet'}`);
+  if (latest !== undefined && !sameMergedTurnGroup(ds, latest, turnId)) return;
+  const effectiveTurnId = latest ?? turnId;
+  if (state.cli && sameMergedTurnGroup(ds, state.cli.turnId, effectiveTurnId) && state.cli.text === trimmed) return;
+  state.turnId = effectiveTurnId;
+  state.cli = { turnId: effectiveTurnId, text: trimmed };
+  io.info?.(`[recap] ${ds.session.sessionId.slice(0, 8)}: CLI recap for ${effectiveTurnId.slice(0, 16)} (${trimmed.length} chars)${state.card ? '' : '; its card has not settled yet'}`);
   reconcile(ds, io);
 }
 
@@ -161,10 +172,14 @@ function reconcile(ds: DaemonSession, io: RecapIo): void {
 
 async function apply(ds: DaemonSession, state: State, io: RecapIo): Promise<void> {
   const turnId = state.turnId;
-  const card = state.card;
+  const card = state.card && (!state.cardTurnId || sameMergedTurnGroup(ds, state.cardTurnId, turnId))
+    ? state.card
+    : undefined;
   if (!card || turnId === undefined || !io.enabled(ds)) return;
   // No panel until the CLI has recapped this turn.
-  const markdown = renderRecapMarkdown(state.cli?.turnId === turnId ? state.cli.text : undefined);
+  const markdown = renderRecapMarkdown(
+    state.cli && sameMergedTurnGroup(ds, state.cli.turnId, turnId) ? state.cli.text : undefined,
+  );
   if (!markdown) return;
   const previous = state.shown && state.shown.turnId === turnId && sameCard(state.shown.card, card) ? state.shown : undefined;
   if (previous?.confirmed && previous.markdown === markdown) return;
