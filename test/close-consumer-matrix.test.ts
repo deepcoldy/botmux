@@ -179,7 +179,7 @@ const CONSUMERS: Record<string, Rule> = {
     category: 'background',
     why: 'Scheduled-run teardown; a refusal leaves the row active and is logged by '
       + 'closeSession itself. No user surface at schedule time.',
-    count: 2,
+    count: 4,
   },
   'core/session-manager.ts::deliverOwnerBatchTurn::closeSession': {
     category: 'background',
@@ -282,6 +282,12 @@ const CONSUMERS: Record<string, Rule> = {
     category: 'background',
     why: 'Authenticated dispatch-launch cancel has no direct UI surface; the '
       + 'background wrapper logs any refusal or residual remote session.',
+  },
+  'daemon.ts::startDaemon::closeSessionForBackgroundCleanup': {
+    category: 'background',
+    why: 'Operator cancellation closes only disposable scheduled-only pre-ready '
+      + 'sessions; retained human sessions use exact queue cancellation and resume. '
+      + 'The background wrapper logs refusal and residual.',
   },
   'daemon.ts::failCloseIdempotentTurnIfConvergenceWriteFailed::runIdempotencyFailClose': {
     category: 'background',

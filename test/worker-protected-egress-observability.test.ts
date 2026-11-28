@@ -6,6 +6,7 @@ import { request } from 'node:http';
 import { runInNewContext } from 'node:vm';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { buildSessionChildEnv } from '../src/core/env-policy.js';
+import { applyTraexRuntimeOwnershipEnv } from '../src/services/traex-runtime-gate.js';
 import { protectedHttpEgressPolicyDigest } from '../src/core/protected-http-egress.js';
 import { protectedHttpEgressAuthTokenPath, startSessionProtectedHttpEgressHost,
   type SessionProtectedHttpEgressHost } from '../src/core/protected-http-egress-host.js';
@@ -26,6 +27,12 @@ describe('worker protected egress observability', () => {
         BOTMUX_PROTECTED_EGRESS_PROTOCOL: 'stale-protocol', BOTMUX_PROTECTED_EGRESS_REQUIRED: '1', MIX_AUTH_TOKEN: 'local-business-fixture' } },
       cfg: {}, buildSessionChildEnv, PROTECTED_HTTP_EGRESS_SOCKET_ENV: 'BOTMUX_PROTECTED_EGRESS_SOCKET',
       PROTECTED_HTTP_EGRESS_PROTOCOL_ENV: 'BOTMUX_PROTECTED_EGRESS_PROTOCOL',
+      // The production worker pairs the CLI with the helper from the same
+      // frozen release; this fixture exercises the egress cleanup only, so the
+      // local stays unset and must be provided explicitly to the sandbox.
+      traexLaunchHelperPath: undefined,
+      traexSpawnLeaseContext: undefined,
+      applyTraexRuntimeOwnershipEnv,
     });
     expect(env.MIX_AUTH_TOKEN).toBe('local-business-fixture');
     for (const key of ['BOTMUX_PROTECTED_EGRESS_SOCKET', 'BOTMUX_PROTECTED_EGRESS_PROTOCOL', 'BOTMUX_PROTECTED_EGRESS_REQUIRED']) {

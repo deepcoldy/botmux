@@ -9423,7 +9423,7 @@ export interface ScheduleRow {
   createdAt: string;
   lastRunAt?: string;
   nextRunAt?: string;
-  lastStatus?: 'running' | 'ok' | 'error' | 'skipped';
+  lastStatus?: 'running' | 'ok' | 'error' | 'skipped' | 'deferred';
   lastError?: string;
   repeat?: { times: number | null; completed: number };
   /** until-done state, run ledger and owner notification settings. They feed

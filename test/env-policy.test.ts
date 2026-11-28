@@ -101,6 +101,20 @@ describe('per-bot environment policy', () => {
     for (const [name, env] of Object.entries({ worker, child, pane })) expect(env.BOTMUX_FENCED_RUN, name).toBe('1');
     expect('BOTMUX_FENCED_RUN' in buildSessionChildEnv(buildBotWorkerEnv(host, strict), strict)).toBe(false);
   });
+  it('retains the frozen TraeX snapshot, helper and ownership identity under strict policy', () => {
+    const runtime = {
+      BOTMUX_TRAEX_SNAPSHOT_DIR: '/snapshots/combo-a',
+      TRAEX_CODE_MODE_HOST_PATH: '/snapshots/combo-a/traex-code-mode-host',
+      BOTMUX_TRAEX_OCCUPANT_ID: 'occupant-a',
+      BOTMUX_TRAEX_DOMAIN_KEY: 'domain-a',
+    };
+    const worker = buildBotWorkerEnv({ ...host, ...runtime }, strict);
+    const child = buildSessionChildEnv(worker, strict);
+    for (const [key, value] of Object.entries(runtime)) {
+      expect(worker[key], `worker ${key}`).toBe(value);
+      expect(child[key], `child ${key}`).toBe(value);
+    }
+  });
   it.each([
     { mode: 'strict' as const, socketRoot: '/test/private-tmux' },
     { mode: 'strict' as const, socketRoot: undefined },

@@ -626,6 +626,7 @@ describe('schedule CLI prompt updates', () => {
 });
 
 const STACK_FRAME = /^\s+at /m;
+const rootIgnoresWritePermissionBits = process.geteuid?.() === 0;
 
 describe('schedule CLI in an assistant-mode sandbox', () => {
   /** Assistant mode denies the confined CLI the per-bot session store; the
@@ -666,7 +667,7 @@ describe('schedule CLI in an assistant-mode sandbox', () => {
     expect(request.task).toMatchObject({ chatId: 'oc_chat', rootMessageId: 'om_root', executionPosition: 'topic' });
   });
 
-  it('reports an unreadable task store instead of listing no tasks', async () => {
+  it.skipIf(rootIgnoresWritePermissionBits)('reports an unreadable task store instead of listing no tasks', async () => {
     const f = fixture(); const observed: Array<Record<string, unknown>> = [];
     await assistantSession(f, observed);
     writeFileSync(f.path, JSON.stringify({ [f.task.id]: { ...f.task, enabled: true } }));

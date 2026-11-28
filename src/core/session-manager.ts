@@ -28,7 +28,13 @@ import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
 import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, settleOfflineReconciledQueuedActivation, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, findQuarantinedRoutingConflict, isDisposableCommandScratch, isRelayableRealSession, closeSession, closeSessionForBackgroundCleanup, findActiveBySessionId, identityStorageModelForDaemonSession, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart, recordTurnExplicitMention, resumeTurnNotices } from './worker-pool.js';
-import { createCliAdapterSync } from '../adapters/cli/registry.js';
+import { hasCleanlyDrainedQueuedActivationTail } from './queued-activation-drain.js';
+import { createCliAdapterSync, resolveCommandReal } from '../adapters/cli/registry.js';
+import { hasRecoverableActivationHead } from './deferred-schedule-settlement.js';
+import { precheckTraexRuntime, traexLaunchUsesSharedRuntimeGate } from '../services/traex-runtime-gate.js';
+import { releaseDirForExecutable } from '../services/traex-runtime-snapshot.js';
+import { resolveTraexChildHome } from '../services/traex-paths.js';
+import { botInjectedEnv } from './env-policy.js';
 import { isCodexAppCliId, type CliAdapter } from '../adapters/cli/types.js';
 import { readPersistedExecutionContract } from './session-controller.js';
 import { isDurableArgvCliId, isExecutionPhaseConfirmedBeyondSubmitting, resolveQueuedActivationEffectiveTurn } from '../services/queued-activation-reconcile.js';
@@ -64,6 +70,7 @@ import {
   probePersistentBackendTargets,
   persistentBackendTargetKey,
   killPersistentBackendTarget,
+  isRemoteBackendType,
   type PersistentBackendType,
 } from './persistent-backend.js';
 import type { PersistentBackendTarget } from '../adapters/backend/types.js';
@@ -3872,6 +3879,32 @@ export async function restoreActiveSessions(
       // patch a streaming card. Cleared on the first real CLI input.
       suppressRecoveryCard: true,
     };
+    const cancelledHeadTurnId = session.queuedActivationTurnId;
+    if (session.queuedActivationPending && cancelledHeadTurnId
+      && (session.cancelledActivationTurnIds ?? []).includes(cancelledHeadTurnId)) {
+      // Apply cancellation tombstones BEFORE any recovery callback can select
+      // this head. Then promote the next eligible tail through the normal owner.
+      session.queuedActivationPending = undefined;
+      session.queuedActivationToken = undefined;
+      session.queuedActivationInput = undefined;
+      session.queuedActivationRawInput = undefined;
+      session.queuedActivationRawTurnId = undefined;
+      session.queuedActivationTurnId = undefined;
+      session.queuedActivationDispatchAttempt = undefined;
+      session.queuedActivationResume = undefined;
+      session.queuedPrompt = undefined;
+      session.queuedCodexAppText = undefined;
+      session.queuedCodexAppMessageContext = undefined;
+      if (session.pendingRepoSetup?.turnId === cancelledHeadTurnId) session.pendingRepoSetup = undefined;
+      if (!ds.pendingRawTurnId || ds.pendingRawTurnId === cancelledHeadTurnId) {
+        ds.pendingRawInput = undefined;
+        ds.pendingRawTurnId = undefined;
+      }
+      ds.pendingPrompt = undefined;
+      ds.initialStartPending = false;
+      sessionStore.updateSession(session);
+      if ((session.queuedActivationTail?.length ?? 0) > 0) promoteQueuedActivationTail(ds, { send: false });
+    }
     if (session.deferredScheduleRun) {
       const binding = readDeferredTopicBinding(config.session.dataDir, session.sessionId);
       if (!binding) {
@@ -3976,9 +4009,14 @@ export async function restoreActiveSessions(
       quarantineUnregisteredRestoreSession(session, 'cli_mismatch_close_failed');
       continue;
     }
-    if (!ds.session.queuedActivationPending
+    const activationTailPromotionFailed = !ds.session.queuedActivationPending
       && (ds.session.queuedActivationTail?.length ?? 0) > 0
-      && !promoteQueuedActivationTail(ds, { send: false })) {
+      && !promoteQueuedActivationTail(ds, { send: false });
+    if (activationTailPromotionFailed && hasCleanlyDrainedQueuedActivationTail(ds)) {
+      ds.quarantinedActivationTailPromotion = undefined;
+      ds.initialStartPending = false;
+      ds.initialStartClaimToken = undefined;
+    } else if (activationTailPromotionFailed) {
       // Promotion here only fails on a transient durable-write error (send:false
       // skips the worker-liveness gate, and the caller already checked a non-empty
       // tail). Throwing would drop to the isolation catch below WITHOUT registering
@@ -4302,7 +4340,7 @@ export async function restoreActiveSessions(
       // is pending), which a quarantined owner is not (its promotion failed, so
       // queuedActivationPending stayed false) — the guard rewrites the fork args
       // in that case instead.
-      const recoverExactNonCodex = ds.session.queuedActivationPending
+      const recoverExactNonCodex = hasRecoverableActivationHead(ds.session)
         && ds.session.cliId !== 'codex-app'
         && ds.session.queuedActivationInput;
       const prompt = recoverExactNonCodex || '';
@@ -5156,6 +5194,19 @@ async function buildScheduledTargetNotice(params: {
  * (#2172). Released, the session stays registered under its recovery card;
  * moving it (or rebuilding the worktree) lets the next fire resume it there.
  */
+function disarmRefusedSilentScheduledTurn(ds: DaemonSession, turnId: string): void {
+  disarmSilentScheduledTurn(ds, turnId);
+  if (ds.session.scheduledRun?.turnId === turnId) ds.session.scheduledRun = undefined;
+  if (ds.session.scheduledRuns) {
+    delete ds.session.scheduledRuns[turnId];
+    if (Object.keys(ds.session.scheduledRuns).length === 0) ds.session.scheduledRuns = undefined;
+  }
+  // recordScheduledSessionRun freezes silence durably. A refused admission has
+  // no external effect, so remove that record too rather than suppressing a
+  // later human turn (or a daemon-restart rehydration) forever.
+  sessionStore.updateSession(ds.session);
+}
+
 async function releaseStartRefusedForMissingDir(ds: DaemonSession, err: unknown): Promise<void> {
   const { MissingWorkingDirError } = await import('./working-dir-recovery.js');
   if (!(err instanceof MissingWorkingDirError)) return;
@@ -5175,9 +5226,22 @@ export async function executeScheduledTask(
     /** Scheduler run id, kept on a hidden run so a later delivery failure can
      *  amend that run's execution-log record. */
     runId?: string;
+    /** Persisted turn id for a deferred retry. Must be reused verbatim so the
+     *  retry is the same logical turn and cannot double-deliver a target. */
+    turnId?: string;
     trigger?: 'scheduler' | 'dashboard';
+    /** Called immediately before the input is handed to a worker, after the
+     *  caller persisted the target's `dispatching` state. Returning `false`
+     *  means that durable admission did not land; the fire must stop before any
+     *  fork/send and report `deferred` instead of a false success. */
+    onBeforeDispatch?: (
+      turnId: string,
+      /** The EXACT session this target's input is being handed to. The daemon
+       *  must classify/accept by this identity, never by a guessed anchor. */
+      selectedSession?: DaemonSession,
+    ) => boolean | void | Promise<boolean | void>;
   },
-): Promise<void> {
+): Promise<'dispatched' | 'deferred' | void> {
   // Resolve which bot to use — prefer the task's original bot so replies come from
   // the same account the user set up the schedule with.
   const allBots = getAllBots();
@@ -5185,7 +5249,7 @@ export async function executeScheduledTask(
     // Expected at startup before bot configs finish loading; scheduler will
     // re-fire on the next cron tick. Not actionable.
     logger.debug('No bots configured, skipping scheduled task');
-    return;
+    return 'dispatched';
   }
   const bot = task.larkAppId
     ? allBots.find(b => b.config.larkAppId === task.larkAppId)
@@ -5273,9 +5337,21 @@ export async function executeScheduledTask(
   };
   await assertScheduledTargetCurrent(true);
 
+  // Managed TRAE runtime handoff: do not create an anchor, banner or session
+  // for a run that cannot start yet. The worker gate stays the authority
+  // immediately before exec; this read-only pre-check only parks the run early
+  // with its exact turn identity intact so the retry can deliver it exactly
+  // once. `unknown` proceeds — the worker holds the input itself. Runs on the
+  // FINAL landing point so it inspects the same session the dispatch selects.
+  const runtimeBlocker = scheduledTraexRuntimeBlocker(bot, task, larkAppId, activeSessions);
+  if (runtimeBlocker) {
+    logger.info(`[scheduler] Task "${task.name}" (${task.id}) deferred: ${runtimeBlocker}`);
+    return 'deferred';
+  }
+
   // Every fire gets a stable identity before it enters a worker queue. Besides
   // silent-output suppression, this identifies the exact shared-topic reply target.
-  const scheduledTurnId = `schedule:${task.id}:${randomUUID()}`;
+  const scheduledTurnId = runtime?.turnId ?? `schedule:${task.id}:${randomUUID()}`;
   // 成员/路由查询之后、任何可见通知之前的轻量暂停/撤销 fence；完整身份检查仍在实际投递前执行。
   await runtime?.assertExecutionCurrent?.(task, scheduledTurnId);
 
@@ -5289,6 +5365,141 @@ export async function executeScheduledTask(
   // Lark root is materialized only by the first successful `botmux send`.
   const silent = task.silent === true;
 
+  let dispatchPersisted = false;
+  /** A refused durable admission (the scheduler could not persist `dispatching`)
+   *  must stop this fire before any fork/send. */
+  /** Persist the target's `dispatching` state once, immediately before the
+   *  first real dispatch attempt. A later fallback within the same turn reuses
+   *  the same turn id and needs no second write. Returns false when the write
+   *  did not land; every fork/send path must then abort. */
+  const persistDispatch = async (selectedSession?: DaemonSession): Promise<boolean> => {
+    if (dispatchPersisted) return true;
+    const taskBeforeAdmission = (() => {
+      if (!runtime?.runId || !runtime.onBeforeDispatch) return undefined;
+      const current = getRuntimeTask(task.id, larkAppId);
+      // Direct callers may exercise dispatch without a scheduler claim. Once a
+      // claim exists, however, its exact identity is the cancellation fence.
+      return current?.lastRunId !== undefined ? current : undefined;
+    })();
+    const admitted = await runtime?.onBeforeDispatch?.(scheduledTurnId, selectedSession);
+    if (admitted === false) {
+      logger.warn(
+        `[scheduler] Task "${task.name}" (${task.id}) dispatch refused: `
+        + 'durable admission did not persist',
+      );
+      return false;
+    }
+    if (runtime?.runId && runtime.onBeforeDispatch) {
+      const current = getRuntimeTask(task.id, larkAppId);
+      const manualAdmission = current?.manualRunAuthorization?.runId === runtime.runId
+        || current?.manualRunRequested === true;
+      const runChanged = !!taskBeforeAdmission && (
+        !current
+        || current.lastRunId !== runtime.runId
+        || (current.lastStatus !== 'running' && current.lastStatus !== 'deferred')
+        || (!!current.untilDone && current.untilDone.status !== 'open')
+        || (!current.enabled && !manualAdmission)
+      );
+      const selectedIsLive = !selectedSession
+        || ([...activeSessions.values()].includes(selectedSession) && selectedSession.session.status !== 'closed');
+      if (runChanged || !selectedIsLive) {
+        logger.warn(
+          `[scheduler] Task "${task.name}" (${task.id}) dispatch refused after admission wait: `
+          + 'run or selected session changed before fork/send',
+        );
+        return false;
+      }
+    }
+    dispatchPersisted = true;
+    return true;
+  };
+  // ── Idempotent continuation of a staged fresh run ─────────────────────────
+  // A previous attempt created and registered this run's fresh session (and,
+  // for a loud new-topic fire, its banner/anchor) but was refused before any
+  // fork/send. Reuse that exact session instead of posting a second banner or
+  // creating a second session. Only the SAME run/turn may bypass the staged
+  // placeholder; every other `initialStartPending` owner keeps its protection.
+  if (runtime?.runId) {
+    const stagedEntry = [...activeSessions.entries()].find(([, candidate]) =>
+      candidate.initialStartPending === true
+      && candidate.session.scheduledRun?.runId === runtime.runId
+      && candidate.session.scheduledRun?.turnId === scheduledTurnId,
+    );
+    if (stagedEntry) {
+      const [stagedKey, staged] = stagedEntry;
+      // Serialize with any concurrent creator/restore of the same anchor.
+      return withActiveSessionKeyLock(activeSessions, stagedKey, async () => {
+        if (activeSessions.get(stagedKey) !== staged) {
+          throw new Error(
+            `scheduled staged session ${staged.session.sessionId} lost its active registration`,
+          );
+        }
+        try {
+          await runtime.prepareTurnIdentity?.(staged, scheduledTurnId);
+        } catch (err) {
+          // The authority was revoked between attempts; this staged session
+          // never accepted input, so retire it rather than leaving a stuck
+          // placeholder.
+          if (activeSessions.get(stagedKey) === staged) activeSessions.delete(stagedKey);
+          sessionStore.closeSession(staged.session.sessionId);
+          throw err;
+        }
+        try {
+          if (!(await persistDispatch(staged))) {
+            if (activeSessions.get(stagedKey) === staged) activeSessions.delete(stagedKey);
+            if (silent) disarmRefusedSilentScheduledTurn(staged, scheduledTurnId);
+            await closeSession(staged.session.sessionId);
+            return 'deferred';
+          }
+          // Re-send the ORIGINAL structured payload. A restart loses the
+          // in-memory copy, so rebuild it from the frozen task identity instead
+          // of degrading to the stored text (which drops trustedCaller).
+          const rebuildStagedInput = () => {
+            const trusted = trustedCallerForScheduledTask(task, larkAppId);
+            const effective = additionalPrompt === undefined
+              ? task.prompt
+              : `${task.prompt}\n\n${additionalPrompt}`;
+            const fire = silent
+              ? `${buildSilentScheduleHint(task.name, localeForBot(larkAppId))}\n\n${effective}`
+              : effective;
+            return buildNewTopicCliInput(
+              fire,
+              staged.session.sessionId,
+              staged.session.cliLaunchSnapshot?.cliId ?? staged.session.cliId ?? bot.config.cliId,
+              staged.session.cliLaunchSnapshot?.cliPathOverride
+                ?? staged.session.cliPathOverride
+                ?? bot.config.cliPathOverride,
+              undefined, undefined, undefined, undefined,
+              { name: bot.botName, openId: bot.botOpenId },
+              localeForBot(larkAppId),
+              undefined,
+              {
+                larkAppId,
+                chatId: task.chatId,
+                whiteboardId: staged.session.whiteboardId,
+                trustedCaller: trusted,
+                promptInjection: sessionPromptInjection(staged),
+                larkToolResume: false,
+              },
+            );
+          };
+          const stagedPrompt = staged.scheduledStagedInput ?? rebuildStagedInput();
+          refreshCliVersion(bot.config);
+          forkWorker(staged, stagedPrompt, scheduledTurnId);
+        } catch (err) {
+          if (silent) disarmSilentScheduledTurn(staged, scheduledTurnId);
+          throw err;
+        }
+        staged.initialStartPending = false;
+        staged.pendingPrompt = undefined;
+        logger.info(
+          `[scheduler] Task "${task.name}" (${task.id}) resumed staged session `
+          + `${staged.session.sessionId} after refused admission`,
+        );
+        return 'dispatched';
+      });
+    }
+  }
   const scheduledTrustedCaller = trustedCallerForScheduledTask(task, larkAppId);
   const rawTopicTitle = task.topicTitle?.trim();
   const createsOwnTopic = executionPosition === 'new-topic' || executionPosition === 'task';
@@ -5710,6 +5921,11 @@ export async function executeScheduledTask(
             // this is the steady-state path for a recurring task (first fire
             // creates the session, every later fire injects into it), so the
             // failure shape would be "worked once, silently identity-less after".
+            // A refused durable admission must stop before the IPC send.
+            if (!(await persistDispatch(existing))) {
+              if (silent) disarmRefusedSilentScheduledTurn(existing, scheduledTurnId);
+              return 'deferred';
+            }
             if (sendWorkerInput(
               existing,
               input,
@@ -5717,7 +5933,7 @@ export async function executeScheduledTask(
               scheduledTrustedCaller ? { trustedCaller: scheduledTrustedCaller } : {},
             )) {
               logger.info(`[scheduler] Task "${task.name}" injected into live session ${existing.session.sessionId}${silent ? ' (silent)' : ''}`);
-              return;
+              return 'dispatched';
             }
           } catch (err: any) {
             logger.warn(`[scheduler] Live injection threw (${err.message}); cold-resuming registered session`);
@@ -5728,13 +5944,17 @@ export async function executeScheduledTask(
           throw new Error(`scheduled continuation lost active session ${existing.session.sessionId}`);
         }
         try {
+          if (!(await persistDispatch(existing))) {
+            if (silent) disarmRefusedSilentScheduledTurn(existing, scheduledTurnId);
+            return 'deferred';
+          }
           forkWorker(existing, input, { resume: existing.hasHistory, turnId: scheduledTurnId });
         } catch (err) {
           if (silent) disarmSilentScheduledTurn(existing, scheduledTurnId);
           throw err;
         }
         logger.info(`[scheduler] Task "${task.name}" cold-resumed session ${existing.session.sessionId}${silent ? ' (silent)' : ''}`);
-        return;
+        return 'dispatched';
       }
 
       // Not a resumable conversation. A daemon-command scratch has no CLI
@@ -5867,9 +6087,21 @@ export async function executeScheduledTask(
       // below receives no resume flag.
       larkToolResume: false,
     });
+    // Keep the EXACT structured payload (content + trustedCaller/linkRefs) so a
+    // refused durable admission can resume the same run/turn without losing the
+    // admitted requester provenance.
+    ds.scheduledStagedInput = prompt;
     rememberLastCliInput(ds, task.prompt, prompt, scheduledTurnId);
     if (silent) armSilentScheduledTurn(ds, scheduledTurnId);
     try {
+      if (!(await persistDispatch(ds))) {
+        // Authorization refused before any external effect: roll back the new
+        // placeholder completely so this anchor can be created cleanly later.
+        if (activeSessions.get(key) === ds) activeSessions.delete(key);
+        if (silent) disarmRefusedSilentScheduledTurn(ds, scheduledTurnId);
+        await closeSession(session.sessionId);
+        return 'deferred';
+      }
       forkWorker(ds, prompt, scheduledTurnId);
     } catch (err) {
       if (silent) disarmSilentScheduledTurn(ds, scheduledTurnId);
@@ -5879,8 +6111,90 @@ export async function executeScheduledTask(
     ds.initialStartPending = false;
     ds.pendingPrompt = undefined;
 
-    logger.info(`[scheduler] Task "${task.name}" spawned (session: ${session.sessionId}, scope: ${runtimeScope}, anchor: ${anchor}, continuation: ${isContinuation}${silent ? ', silent' : ''})`);
+    logger.info(`[scheduler] Task "${task.name}" (${task.id}) spawned (session: ${session.sessionId}, scope: ${runtimeScope}, anchor: ${anchor}, continuation: ${isContinuation}${silent ? ', silent' : ''})`);
+    return 'dispatched';
   });
+}
+
+/**
+ * Daemon-side cheap pre-check for the managed TRAE runtime handoff.
+ *
+ * The worker gate immediately before exec remains the authority; this only
+ * avoids creating a session/anchor/banner for a run that is certain to wait.
+ * `unknown` (registry unreadable/corrupt) ALSO defers: a run whose admission
+ * cannot be proven must not be settled as dispatched. The caller keeps the
+ * original run/turn/prompt and retries once the domain is readable.
+ */
+function scheduledTraexRuntimeBlocker(
+  bot: {
+    config: Pick<
+      BotConfig,
+      'cliId' | 'cliPathOverride' | 'wrapperCli' | 'cliLaunchMode' | 'sandbox' | 'backendType' | 'env' | 'envUnset' | 'envPolicy'
+    >;
+  },
+  task: ScheduledTask,
+  larkAppId: string,
+  activeSessions: Map<string, DaemonSession>,
+): string | undefined {
+  // Only a RETAINED topic has a provable target before routing: its exact
+  // anchor is task.rootMessageId. New-topic / rootless task / chat top-level
+  // choose their session later; their target proof comes from the actual
+  // dispatch (onBeforeDispatch selectedSession), never from a guessed anchor.
+  if (resolveScheduledTaskExecutionPosition(task) !== 'topic' || !task.rootMessageId) {
+    return undefined;
+  }
+  const selected = activeSessions.get(sessionKey(task.rootMessageId, larkAppId));
+  const targetCliId = selected?.session.cliLaunchSnapshot?.cliId
+    ?? selected?.session.cliId
+    ?? bot.config.cliId;
+  if (targetCliId !== 'traex') return undefined;
+  // Injecting into a live worker does not start another runtime. If that worker
+  // later has to re-exec, its own final gate remains authoritative.
+  if (selected?.worker && !selected.worker.killed && selected.workerReady === true) return undefined;
+  const launchSnapshot = selected?.session.cliLaunchSnapshot;
+  const wrapperCli = launchSnapshot
+    ? launchSnapshot.wrapperCli
+    : selected?.session.wrapperCli ?? bot.config.wrapperCli;
+  const cliLaunchMode = launchSnapshot
+    ? launchSnapshot.cliLaunchMode
+    : selected?.session.cliLaunchMode ?? bot.config.cliLaunchMode;
+  // The worker does not acquire a shared-domain lease for these launch modes;
+  // the scheduler must not invent a blocker the actual dispatch will ignore.
+  if (!traexLaunchUsesSharedRuntimeGate({ wrapperCli, cliLaunchMode })) return undefined;
+  const sandbox = selected?.initConfig?.sandbox ?? selected?.session.sandbox ?? bot.config.sandbox;
+  const backendType = selected?.initConfig?.backendType ?? selected?.session.backendType
+    ?? bot.config.backendType ?? config.daemon.backendType;
+  // Scratch owns a session-private cache and remote backends do not exec in
+  // this daemon's local registry domain, exactly as in the worker gate.
+  if (sandbox === 'scratch' || isRemoteBackendType(backendType)) return undefined;
+  try {
+    const configuredPath = launchSnapshot
+      ? launchSnapshot.cliPathOverride
+      : selected?.session.cliPathOverride ?? bot.config.cliPathOverride;
+    const executablePath = resolveCommandReal(configuredPath?.trim() || 'traex');
+    // Pre-check the SAME cache domain the CLI child will write. Using the
+    // daemon's ambient TRAE_HOME here would read a different domain whenever
+    // the bot has its own env.TRAE_HOME / envUnset, and could report
+    // `dispatched` while the worker actually waits in the target domain.
+    const traeHome = resolveTraexChildHome({
+      baseEnv: process.env,
+      envPolicy: bot.config.envPolicy,
+      envUnset: bot.config.envUnset,
+      perBotEnv: botInjectedEnv(bot.config.env, bot.config.envPolicy),
+    });
+    const check = precheckTraexRuntime({
+      traeHome,
+      releaseDir: releaseDirForExecutable(executablePath),
+      executablePath,
+    });
+    if (check.state === 'blocked') return check.detail;
+    if (check.state === 'unknown') return `runtime registry unavailable: ${check.detail}`;
+    return undefined;
+  } catch {
+    // A missing/unresolvable binary is the worker's error to report; it must
+    // not turn into an endless deferral here.
+    return undefined;
+  }
 }
 
 // ─── 决策看板：owner 提交的一批决定 → 管家群会话的一个回合 ─────────────────────

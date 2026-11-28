@@ -58,6 +58,11 @@ export class InflightInputTracker {
     return this.unacked.length > 0;
   }
 
+  /** The exact turn has crossed a write boundary in this CLI generation. */
+  hasLiveTurn(turnId: string): boolean {
+    return [...this.unacked, ...this.started].some(item => item.turnId === turnId);
+  }
+
   /** An input just went onto the CLI's PTY. */
   onWrite(item: InflightItem): void {
     this.unacked.push(item);

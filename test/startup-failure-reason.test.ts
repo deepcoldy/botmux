@@ -88,4 +88,19 @@ describe('worker fatal error report', () => {
     expect(seen).toEqual(['bwrap: No permissions to create new namespace']);
     expect(sent).toEqual([{ type: 'error', message: 'bwrap: No permissions to create new namespace', turnId: 'turn-ns', sandboxNamespace: 'user' }]);
   });
+
+  it.each([true, false])('settles leases only after owned process teardown succeeds (%s)', async stopped => {
+    const events: string[] = [];
+    const scope: Record<string, unknown> = {
+      fatalWorkerErrorPending: false, pendingLaunchConvergence: undefined, activeRestartAttemptId: undefined,
+      currentBotmuxTurnId: 'turn-order', currentBotmuxDispatchAttempt: undefined,
+      sendAndFlush: async () => {}, log: () => {}, chatSafeFatalErrorMessage,
+      sandboxNamespaceDiagnosis: () => undefined,
+      stopOwnedProcessesForTraexSettlement: async () => { events.push('stop'); return stopped; },
+      settleTraexLeasesForShutdown: async () => { events.push('settle'); },
+      process: { exit: vi.fn() },
+    };
+    await loadWorkerFunction<(e: unknown) => Promise<void>>('sendFatalWorkerErrorAndExit', scope)(new Error('controlled'));
+    expect(events).toEqual(stopped ? ['stop', 'settle'] : ['stop']);
+  });
 });

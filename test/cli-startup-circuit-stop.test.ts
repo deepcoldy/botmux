@@ -18,6 +18,8 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import ts from 'typescript';
 import { isStructuredBridgeLifecycleBlockingCli } from '../src/services/structured-bridge-clis.js';
+import { isOrdinaryImTurnId } from '../src/core/ordinary-im-turn.js';
+import { InputTurnDeduper } from '../src/core/input-turn-dedupe.js';
 import { dropNoReplayPendingInputsOnBackendExit, handoffQueuedDurableInputsOnBackendExit, terminalReleasesDurableTurn } from '../src/utils/pending-input-queue.js';
 import { loadWorkerFunction, loadWorkerMessageHandler } from './helpers/worker-function-harness.js';
 
@@ -76,8 +78,25 @@ function harness(cliId = 'pi', backendType = 'pty') {
     turnFailedWithoutOutput: () => false, recoverDeferredPromptReadyAtTurnTerminal: vi.fn(),
     log: vi.fn(), send: vi.fn((terminal: Terminal) => terminals.push(terminal)),
     parkCrashDiagnosticTerminal: vi.fn(),
+    applyWorkerLaunchModel: vi.fn(), respawnConfigPatchFromMessage: vi.fn(() => ({})),
+    applyRespawnConfigPatch: vi.fn(), isOrdinaryImTurnId,
+    activeTurnBlocks: () => false,
+    activeTurnAuthority: { snapshot: () => undefined, beginTurn: vi.fn() },
+    usageLimitTracker: { beginTurn: () => 0 },
+    currentUsageLimitSnapshot: () => ({}),
+    rememberTurnLinkRefMode: vi.fn(),
+    traexRuntimeLeaseContext: undefined, traexSpawnLeaseContext: undefined,
+    traexLeaseSettlements: new Set(),
+    turnInputCommitDeferredForMaterialization: new WeakSet(),
+    pendingTraexSpawnAbandon: undefined, stopTraexLeaseHeartbeat: vi.fn(),
+    settleTraexLeasesForShutdown: vi.fn(async () => {}),
   };
   scope.killCli = vi.fn(() => { scope.backend = null; scope.isPromptReady = false; });
+  scope.ordinaryImTurnDedupe = new InputTurnDeduper(256);
+  scope.acknowledgeTurnInputReceived = vi.fn();
+  scope.receiveOrdinaryImTurn = loadWorkerFunction('receiveOrdinaryImTurn', scope);
+  scope.acknowledgeTurnInputCommitted = loadWorkerFunction('acknowledgeTurnInputCommitted', scope);
+  scope.sendToPty = loadWorkerFunction('sendToPty', scope);
   scope.spawnCli = vi.fn(async () => { scope.backend = { destroySession: vi.fn() }; });
   scope.emitTurnTerminal = loadWorkerFunction('emitTurnTerminal', scope);
   scope.stopStartupFailedInputs = loadWorkerFunction('stopStartupFailedInputs', scope);
@@ -321,9 +340,12 @@ describe('startup circuit versus delayed / in-flight restart continuations', () 
     expect(h.scope.spawnCli).toHaveBeenCalledOnce();
     expect(h.scope.cliRestartInProgress).toBe(true);
     h.scope.backend = null; // replacement's second startup failure
+    const rpcEngine = { stopAndWait: vi.fn(() => rpcStop.promise) };
     Object.assign(h.scope, {
       stopScreenshotLoop: vi.fn(),
-      codexRpcEngine: { stopAndWait: vi.fn(() => rpcStop.promise) },
+      codexRpcEngine: rpcEngine,
+      clearRpcEnginePidMarker: vi.fn(),
+      stopStructuredStartGraceRecheck: vi.fn(),
       armRpcStartupDialogDismiss: vi.fn(),
       saveUnsentInputsForSuccessor: vi.fn(),
       sandboxTreeOutlivesWorker: false,
@@ -339,7 +361,7 @@ describe('startup circuit versus delayed / in-flight restart continuations', () 
     );
     const stopped = shutdown('SIGTERM', 0);
     const killCallsBeforeShutdown = h.scope.killCli.mock.calls.length;
-    expect(h.scope.codexRpcEngine.stopAndWait).toHaveBeenCalledOnce();
+    expect(rpcEngine.stopAndWait).toHaveBeenCalledOnce();
     expect(h.scope.process.exit).not.toHaveBeenCalled();
 
     title.resolve();
@@ -510,5 +532,171 @@ describe('native startup evidence and real backend exit classification', () => {
     h.transcript([{ kind: proof }]);
     await vi.advanceTimersByTimeAsync(40_000);
     expect(h.classification()).toBe(false);
+  });
+});
+
+describe('pre-ready input receipts', () => {
+  it('does not acknowledge a queued message as committed before init materializes', async () => {
+    const h = harness('traex');
+    h.scope.initPromptMaterialized = false;
+    await loadWorkerMessageHandler('message', h.scope)({
+      type: 'message', content: 'pre-ready', turnId: 'om_pre_ready',
+    });
+    expect(h.scope.pendingMessages).toHaveLength(1);
+    expect(h.scope.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'turn_input_committed', turnId: 'om_pre_ready',
+    }));
+  });
+
+  it('retains a native RPC follow-up for the materialization ACK drain even before the engine exists', async () => {
+    const h = harness('codex');
+    h.scope.initPromptMaterialized = false;
+    h.scope.deferTurnInputCommitUntilSubmission = () => true;
+    await loadWorkerMessageHandler('message', h.scope)({
+      type: 'message', content: 'RPC follow-up', turnId: 'om_rpc_followup',
+    });
+    expect(h.scope.pendingMessages).toHaveLength(1);
+    expect(h.scope.turnInputCommitDeferredForMaterialization.has(h.scope.pendingMessages[0])).toBe(true);
+  });
+
+  it('cancels an exact pre-ready opening without replay and preserves human queued work', async () => {
+    const h = harness('traex');
+    h.scope.initPromptMaterialized = false;
+    h.scope.lastInitConfig.turnId = 'schedule:cancelled';
+    h.scope.cliAdapter = { passesInitialPromptViaArgs: false };
+    h.scope.currentBotmuxTurnId = 'schedule:cancelled';
+    h.scope.backend = null;
+    h.scope.pendingMessages.push(item('schedule:cancelled'), item('om_human'));
+    const cancel = loadWorkerFunction('handleQueuedTurnCancel', h.scope);
+    cancel('cancel-request', 'schedule:cancelled');
+
+    expect(h.scope.pendingMessages.map((entry: InflightItem) => entry.turnId)).toEqual(['om_human']);
+    expect(h.scope.send).toHaveBeenCalledWith({
+      type: 'queued_turn_cancel_result', requestId: 'cancel-request',
+      turnId: 'schedule:cancelled', status: 'queued_removed',
+    });
+    const before = h.scope.pendingMessages.length;
+    expect(h.scope.sendToPty('must not reinsert', 'schedule:cancelled')).toBe(true);
+    expect(h.scope.pendingMessages).toHaveLength(before);
+    expect(h.scope.pendingMessages[0].turnId).toBe('om_human');
+  });
+
+  it('reports restart_required instead of claiming a written turn was only queued', () => {
+    const h = harness('traex');
+    h.scope.initPromptMaterialized = true;
+    h.scope.currentBotmuxTurnId = 'schedule:written';
+    h.scope.backend = {};
+    h.scope.inflightInputs.onWrite(item('schedule:written'));
+    const cancel = loadWorkerFunction('handleQueuedTurnCancel', h.scope);
+    cancel('cancel-written', 'schedule:written');
+    expect(h.scope.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'queued_turn_cancel_result', turnId: 'schedule:written', status: 'restart_required',
+    }));
+  });
+
+  it('never claims an argv-baked opening was removed from a pre-ready queue', () => {
+    const h = harness('pi');
+    h.scope.initPromptMaterialized = false;
+    h.scope.lastInitConfig.turnId = 'schedule:argv';
+    h.scope.cliAdapter = { passesInitialPromptViaArgs: true };
+    h.scope.backend = null;
+    const cancel = loadWorkerFunction('handleQueuedTurnCancel', h.scope);
+    cancel('cancel-argv', 'schedule:argv');
+    expect(h.scope.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'queued_turn_cancel_result', turnId: 'schedule:argv', status: 'restart_required',
+    }));
+  });
+
+  it('never reports an RPC turn with submission ownership as queued_removed', () => {
+    const h = harness('traex');
+    h.scope.initPromptMaterialized = false;
+    h.scope.lastInitConfig.turnId = 'schedule:rpc';
+    h.scope.backend = null;
+    h.scope.cliAdapter = { passesInitialPromptViaArgs: false };
+    h.scope.rpcTurnsAwaitingActivation = new Map([['schedule:rpc\0', {}]]);
+    const cancel = loadWorkerFunction('handleQueuedTurnCancel', h.scope);
+    cancel('cancel-rpc', 'schedule:rpc');
+    expect(h.scope.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'queued_turn_cancel_result', turnId: 'schedule:rpc', status: 'restart_required',
+    }));
+  });
+
+  it('never treats a fresh RPC-eligible opening as an ordinary queued removal', () => {
+    const h = harness('traex');
+    h.scope.initPromptMaterialized = false;
+    h.scope.lastInitConfig.turnId = 'schedule:fresh-rpc';
+    h.scope.cliAdapter = { passesInitialPromptViaArgs: false };
+    h.scope.codexRpcEligible = () => true;
+    const cancel = loadWorkerFunction('handleQueuedTurnCancel', h.scope);
+    cancel('cancel-fresh-rpc', 'schedule:fresh-rpc');
+    expect(h.scope.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'queued_turn_cancel_result', turnId: 'schedule:fresh-rpc', status: 'restart_required',
+    }));
+  });
+
+  it.each(['reconcile', 'remote'])('never claims a %s recovered opening was only queued', proof => {
+    const h = harness('traex');
+    h.scope.initPromptMaterialized = false;
+    h.scope.lastInitConfig.turnId = 'schedule:recovered';
+    h.scope.cliAdapter = { passesInitialPromptViaArgs: false };
+    h.scope.backend = null;
+    if (proof === 'reconcile') {
+      h.scope.lastInitConfig.reconcileQueuedActivation = {
+        turnId: 'schedule:recovered', phase: 'succeeded',
+      };
+    } else {
+      h.scope.remoteRunnerRecoveredTurnIdentity = { turnId: 'schedule:recovered' };
+    }
+    const cancel = loadWorkerFunction('handleQueuedTurnCancel', h.scope);
+    cancel('cancel-recovered', 'schedule:recovered');
+    expect(h.scope.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'queued_turn_cancel_result', turnId: 'schedule:recovered', status: 'restart_required',
+    }));
+  });
+
+  it('answers a rejected stale cancellation instead of leaving the daemon to time out', () => {
+    const binding = { runtime: { runtimeId: 'runtime-current' } };
+    const scope = {
+      workerSessionEventScope: {
+        currentBinding: () => binding,
+        bindingForRuntime: () => binding,
+        run: (_target: unknown, fn: () => void) => fn(),
+      },
+      admitSessionCommand: () => ({ allowed: false, reason: 'stale_runtime_target' }),
+      send: vi.fn(), log: vi.fn(),
+    };
+    const dispatch = loadWorkerFunction('dispatchDaemonMessage', scope);
+    dispatch({
+      type: 'cancel_queued_turn', requestId: 'cancel-stale-runtime', turnId: 'schedule:stale-runtime',
+      sessionCommand: { version: 2, runtime: { runtimeId: 'runtime-old' } },
+    });
+    expect(scope.send).toHaveBeenCalledWith({
+      type: 'queued_turn_cancel_result', requestId: 'cancel-stale-runtime',
+      turnId: 'schedule:stale-runtime', status: 'restart_required',
+    });
+  });
+
+  it.each([false, true])('settles only the exiting backend lease when a replacement is current (running=%s)', running => {
+    const h = exitHarness('traex');
+    const oldLease = { release: vi.fn(async () => {}), abandon: vi.fn(async () => {}) };
+    const newLease = { release: vi.fn(async () => {}), abandon: vi.fn(async () => {}) };
+    const oldContext = { lease: oldLease, running, settled: false, heartbeat: undefined, abandon: vi.fn() };
+    const newContext = { lease: newLease, running: false, settled: false, heartbeat: undefined, abandon: vi.fn() };
+    h.scope.traexSpawnLeaseContext = oldContext;
+    h.scope.traexRuntimeLeaseContext = newContext;
+    h.scope.pendingTraexSpawnAbandon = newContext.abandon;
+    h.scope.settleTraexSpawnLease = loadWorkerFunction('settleTraexSpawnLease', h.scope);
+    const replacement = { name: 'replacement' };
+    h.scope.observedBackend = { name: 'old' };
+    h.scope.backend = replacement;
+
+    h.onExit(0);
+    expect(oldLease.release).toHaveBeenCalledTimes(running ? 1 : 0);
+    expect(oldLease.abandon).toHaveBeenCalledTimes(running ? 0 : 1);
+    expect(newLease.release).not.toHaveBeenCalled();
+    expect(newLease.abandon).not.toHaveBeenCalled();
+    expect(h.scope.traexRuntimeLeaseContext).toBe(newContext);
+    expect(h.scope.pendingTraexSpawnAbandon).toBe(newContext.abandon);
+    expect(h.scope.backend).toBe(replacement);
   });
 });

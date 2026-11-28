@@ -10,11 +10,12 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import {
-  chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync,
+  chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import ts from 'typescript';
 
 const { emitHookEventMock } = vi.hoisted(() => ({ emitHookEventMock: vi.fn() }));
 
@@ -102,10 +103,18 @@ import {
   __testOnly_resetOrdinaryImDeliveries,
   requestInstallChangeSuspend,
   sweepTraexInstallChanges,
+  suspendWorker,
   sendWorkerInput,
+  promoteQueuedActivationTail,
+  hasCleanlyDrainedQueuedActivationTail,
+  resolveQuarantinedForkPlan,
+  reconcileQueuedActivationOnWorkerDetach,
+  installReclaimPendingForCurrentGeneration,
+  transferQueuedActivationOwnershipToNew,
   hasPendingOrdinaryImInput,
   recordWorkerCliInputBacklog,
 } from '../src/core/worker-pool.js';
+import { releaseCancelledActivationWork, retryCancelledActivationPersistence, clearTombstonedActivationHeadForRelease, hasRecoverableActivationHead } from '../src/core/deferred-schedule-settlement.js';
 import { beginFinalOutputDelivery } from '../src/core/final-output-delivery-drain.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { ExecutableIdentity } from '../src/services/cli-install-identity.js';
@@ -114,6 +123,8 @@ import { observeTraexInstall, __testOnly_resetTraexInstallWatch } from '../src/s
 import { isTraexProcess } from '../src/core/traex-leaf-pid.js';
 import { readProcessStartIdentity } from '../src/utils/process-identity.js';
 import { standaloneSleep } from './helpers/standalone-sleep.js';
+import { materializeTraexSnapshot } from '../src/services/traex-runtime-snapshot.js';
+import * as sessionStore from '../src/services/session-store.js';
 
 const dirs: string[] = [];
 const children: ChildProcess[] = [];
@@ -248,6 +259,100 @@ describe('canSafelyReclaimWorkerForInstallChange', () => {
     ds.pendingSuspendReason = 'cli_install_changed';
     mutate(ds);
     expect(__testOnly_canSafelyReclaimWorkerForInstallChange(ds)).toBe(false);
+  });
+  it('reclaims with a replacement-owned tail and hands it to the replacement callback', async () => {
+    const reclaimed = vi.fn();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_notice'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onInstallChangeReclaimed: reclaimed,
+    } as any);
+    const ds = makeDs({
+      pendingSuspendReason: 'cli_install_changed',
+      pendingSuspendGeneration: 7,
+    });
+    ds.session.queuedActivationTail = [{ turnId: 'om_new_tail', ownerRuntime: 'new' } as any];
+    expect(__testOnly_canSafelyReclaimWorkerForInstallChange(ds)).toBe(true);
+
+    const worker = ds.worker as any;
+    __testOnly_runPendingSuspendIfSettled(ds);
+    await Promise.resolve();
+    expect(worker.send).toHaveBeenCalledWith({ type: 'suspend' });
+    expect(reclaimed).toHaveBeenCalledWith(ds);
+    expect(ds.session.queuedActivationTail?.[0]?.ownerRuntime).toBe('new');
+
+    const oldOwned = makeDs({ pendingSuspendReason: 'cli_install_changed', pendingSuspendGeneration: 7 });
+    oldOwned.session.queuedActivationTail = [{ turnId: 'om_old_tail', ownerRuntime: 'old' } as any];
+    expect(__testOnly_canSafelyReclaimWorkerForInstallChange(oldOwned)).toBe(false);
+    expect(suspendWorker(oldOwned, 'cli_install_changed')).toBe(false);
+  });
+
+  it('transfers tail ownership atomically and restores it on persistence failure', () => {
+    const ds = makeDs();
+    ds.session.queuedActivationTail = [
+      { turnId: 'om_old', ownerRuntime: 'old' } as any,
+      { turnId: 'om_new', ownerRuntime: 'new' } as any,
+    ];
+    expect(transferQueuedActivationOwnershipToNew(ds)).toBe(true);
+    expect(ds.session.queuedActivationTail?.every(entry => entry.ownerRuntime === 'new')).toBe(true);
+
+    const failing = makeDs();
+    failing.session.queuedActivationTail = [{ turnId: 'om_old', ownerRuntime: 'old' } as any];
+    vi.mocked(sessionStore.updateSession).mockImplementationOnce(() => { throw new Error('controlled ownership write failure'); });
+    expect(transferQueuedActivationOwnershipToNew(failing)).toBe(false);
+    expect(failing.session.queuedActivationTail?.[0]?.ownerRuntime).toBe('old');
+  });
+
+  it('retires a PTY worker for install change and invokes the replacement callback', async () => {
+    const reclaimed = vi.fn();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_notice'), getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1, closeSession: vi.fn(), onInstallChangeReclaimed: reclaimed,
+    } as any);
+    const ds = makeDs({
+      initConfig: { backendType: 'pty', cliId: 'traex' },
+      pendingSuspendReason: 'cli_install_changed', pendingSuspendGeneration: 7,
+    });
+    ds.session.queuedActivationTail = [{ turnId: 'om_pty_tail', ownerRuntime: 'new' } as any];
+    const worker = ds.worker as any;
+    __testOnly_runPendingSuspendIfSettled(ds);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(reclaimed).toHaveBeenCalledWith(ds);
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'close' }));
+  });
+
+  it('dedupes runtime-deferred notices and suppresses them for silent scheduled turns', async () => {
+    const ds = makeDs();
+    const replies: unknown[][] = [];
+    initWorkerPool({
+      sessionReply: vi.fn(async (...args: unknown[]) => { replies.push(args); return 'om_notice'; }),
+      getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn(),
+    } as any);
+    const worker = ds.worker as any;
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const message = { type: 'traex_runtime_deferred', detail: 'blocked A', blockers: [] };
+    worker.emit('message', message);
+    worker.emit('message', message);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(replies).toHaveLength(1);
+
+    ds.silentScheduledTurns = new Map([['om_silent', Date.now()]]);
+    worker.emit('message', { type: 'traex_runtime_deferred', turnId: 'om_silent', detail: 'blocked B', blockers: [] });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(replies).toHaveLength(1);
+
+    ds.session.vcMeetingReceiver = {} as any;
+    worker.emit('message', { type: 'traex_runtime_deferred', turnId: 'om_vc', dispatchAttempt: 2,
+      detail: 'blocked durable VC', blockers: [] });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(replies).toHaveLength(1);
+    // A plain human turn on the same receiver remains visible without an
+    // attempt/meeting origin; only the durable attempted turn is suppressed.
+    worker.emit('message', { type: 'traex_runtime_deferred', turnId: 'om_plain', detail: 'blocked plain VC', blockers: [] });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(replies).toHaveLength(2);
   });
 });
 
@@ -685,6 +790,169 @@ describe('independent review regressions', () => {
 });
 
 describe('launch provenance', () => {
+  async function snapshotUpgrade() {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-traex-snapshot-reclaim-'));
+    dirs.push(root);
+    const releaseA = join(root, 'release-a');
+    const releaseB = join(root, 'release-b');
+    for (const [dir, value] of [[releaseA, 'a'], [releaseB, 'b']] as const) {
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'traex'), `traex-${value}`);
+      writeFileSync(join(dir, 'traex-code-mode-host'), `helper-${value}`);
+      writeFileSync(join(dir, 'trae-installation.json'), JSON.stringify({ version: value }));
+    }
+    const entry = join(root, 'current-traex');
+    const select = (target: string) => {
+      try { unlinkSync(entry); } catch { /* first publication */ }
+      symlinkSync(target, entry);
+    };
+    select(join(releaseA, 'traex'));
+    const snapshot = await materializeTraexSnapshot({
+      releaseDir: releaseA,
+      executablePath: join(releaseA, 'traex'),
+      snapshotsRoot: join(root, 'snapshots'),
+    });
+    const installAtSpawn = resolveInstallIdentity(entry)!;
+    const launchTargetIdentity = resolveInstallIdentity(snapshot.traexPath)!;
+    select(join(releaseB, 'traex'));
+    const sourceBackup = join(root, 'release-a-original');
+    const upgradeSource = () => {
+      renameSync(releaseA, sourceBackup);
+      renameSync(releaseB, releaseA);
+    };
+    const revertSource = () => {
+      renameSync(releaseA, releaseB);
+      renameSync(sourceBackup, releaseA);
+    };
+    return {
+      entry,
+      select,
+      upgradeSource,
+      revertSource,
+      releaseA,
+      snapshotPath: snapshot.traexPath,
+      sourceSignature: snapshot.manifest.sourceSignature!,
+      running: launchTargetIdentity,
+      launchTargetIdentity,
+      installAtSpawn,
+      install: resolveInstallIdentity(entry)!,
+    };
+  }
+
+  function snapshotClaim(
+    fixture: Awaited<ReturnType<typeof snapshotUpgrade>>,
+  ): NonNullable<DaemonSession['pendingSuspendInstallClaim']> {
+    return {
+      entry: fixture.entry,
+      running: fixture.running,
+      installAtSpawn: fixture.installAtSpawn,
+      launchTargetIdentity: fixture.launchTargetIdentity,
+      workerGeneration: 7,
+      cliSpawnGeneration: 1,
+    };
+  }
+
+  function snapshotAttestation(fixture: Awaited<ReturnType<typeof snapshotUpgrade>>) {
+    return {
+      backendType: 'tmux' as const,
+      credentialIsolated: false,
+      cliExe: fixture.running,
+      cliInstallEntry: fixture.entry,
+      cliInstallAtSpawn: fixture.installAtSpawn,
+      cliLaunchTargetIdentity: fixture.launchTargetIdentity,
+      cliSpawnGeneration: 1,
+    };
+  }
+
+  function legacySnapshotAttestation(fixture: Awaited<ReturnType<typeof snapshotUpgrade>>) {
+    return {
+      backendType: 'tmux' as const,
+      credentialIsolated: false,
+      cliExe: fixture.running,
+      cliInstallEntry: fixture.snapshotPath,
+      cliInstallAtSpawn: fixture.running,
+      cliSpawnGeneration: 1,
+    };
+  }
+
+  it('queues a real snapshot runtime for reclaim when the source install changes', async () => {
+    const fixture = await snapshotUpgrade();
+    expect(fixture.running.ino).not.toBe(fixture.installAtSpawn.ino);
+    const ds = makeDs({
+      lastScreenStatus: 'working',
+      localProcessAttestation: snapshotAttestation(fixture),
+    });
+    expect(observeTraexInstall(ds, 'traex')).toMatchObject({ state: 'stale' });
+    expect(sweepTraexInstallChanges([ds], { cliId: 'traex' })).toBe(1);
+    expect(ds.pendingSuspendInstallClaim?.launchTargetIdentity).toEqual(fixture.launchTargetIdentity);
+  });
+
+  it('revalidates and reclaims a queued snapshot claim against its launch target', async () => {
+    const fixture = await snapshotUpgrade();
+    const ds = makeDs({
+      lastScreenStatus: 'idle',
+      localProcessAttestation: snapshotAttestation(fixture),
+      pendingSuspendReason: 'cli_install_changed',
+      pendingSuspendGeneration: 7,
+      pendingSuspendInstallClaim: snapshotClaim(fixture),
+    });
+    const worker = ds.worker as any;
+    __testOnly_runPendingSuspendIfSettled(ds);
+    expect(worker.send).toHaveBeenCalledWith({ type: 'suspend' });
+  });
+
+  it('cancels a snapshot claim when the source entry reverts before idle', async () => {
+    const fixture = await snapshotUpgrade();
+    const ds = makeDs({
+      lastScreenStatus: 'working',
+      localProcessAttestation: snapshotAttestation(fixture),
+      pendingSuspendReason: 'cli_install_changed',
+      pendingSuspendGeneration: 7,
+      pendingSuspendInstallClaim: snapshotClaim(fixture),
+    });
+    fixture.select(join(fixture.releaseA, 'traex'));
+    ds.lastScreenStatus = 'idle';
+    __testOnly_runPendingSuspendIfSettled(ds);
+    expect((ds.worker as any).send).not.toHaveBeenCalledWith({ type: 'suspend' });
+    expect(ds.pendingSuspendReason).toBeUndefined();
+  });
+
+  it('reclaims a legacy snapshot attestation after the source release changes', async () => {
+    const fixture = await snapshotUpgrade();
+    fixture.upgradeSource();
+    const ds = makeDs({
+      lastScreenStatus: 'working',
+      localProcessAttestation: legacySnapshotAttestation(fixture),
+    });
+    const worker = ds.worker as any;
+    expect(observeTraexInstall(ds, 'traex')).toMatchObject({ state: 'stale' });
+    expect(sweepTraexInstallChanges([ds], { cliId: 'traex' })).toBe(1);
+    expect(ds.pendingSuspendInstallClaim).toMatchObject({
+      sourceReleaseDir: fixture.releaseA,
+      sourceSignature: fixture.sourceSignature,
+    });
+
+    ds.lastScreenStatus = 'idle';
+    __testOnly_runPendingSuspendIfSettled(ds);
+    expect(worker.send).toHaveBeenCalledWith({ type: 'suspend' });
+  });
+
+  it('cancels a legacy snapshot claim only when the source signature really reverts', async () => {
+    const fixture = await snapshotUpgrade();
+    fixture.upgradeSource();
+    const ds = makeDs({
+      lastScreenStatus: 'working',
+      localProcessAttestation: legacySnapshotAttestation(fixture),
+    });
+    const worker = ds.worker as any;
+    expect(sweepTraexInstallChanges([ds], { cliId: 'traex' })).toBe(1);
+    fixture.revertSource();
+    ds.lastScreenStatus = 'idle';
+    __testOnly_runPendingSuspendIfSettled(ds);
+    expect(worker.send).not.toHaveBeenCalledWith({ type: 'suspend' });
+    expect(ds.pendingSuspendReason).toBeUndefined();
+  });
+
   it('never queues a claim for a running image the entry did not name at spawn', () => {
     const { entry, identity } = tempEntry('wrapper-script');
     const real = { ...identity, ino: `${Number(identity.ino) + 1}`, source: 'linux-proc-exe' as const };
@@ -733,6 +1001,464 @@ describe('launch provenance', () => {
     await new Promise(resolve => setTimeout(resolve, 0));
     expect(ds.localProcessAttestation?.cliInstallAtSpawn).toEqual(identity);
     expect(observeTraexInstall(ds, 'traex').state).toBe('current');
+  });
+});
+
+function loadDaemonFunction(scope: Record<string, unknown>, name = 'startReplacementRuntimeAfterReclaim'): any {
+  const source = ts.createSourceFile('daemon.ts', readFileSync('src/daemon.ts', 'utf8'), ts.ScriptTarget.Latest, true);
+  const declaration = source.statements.find(node => ts.isFunctionDeclaration(node)
+    && node.name?.text === name);
+  if (!declaration) throw new Error(`missing production daemon function ${name}`);
+  const code = ts.transpileModule(declaration.getText(source), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022 },
+  }).outputText;
+  return new Function('scope', `with (scope) { ${code}; return ${name}; }`)(scope);
+}
+
+describe('activation tail claim cancellation', () => {
+  function tailFor(turnId: string) {
+    return {
+      id: `tail-${turnId}`, order: 1, userPrompt: `prompt-${turnId}`,
+      cliInput: { content: `prompt-${turnId}` }, turnId, ownerRuntime: 'new' as const,
+    };
+  }
+
+  function cancelledClaim(entry: string, identity: ExecutableIdentity) {
+    return {
+      entry, running: identity, installAtSpawn: identity,
+      workerGeneration: 7, cliSpawnGeneration: 1,
+    };
+  }
+
+  it('restores replacement-owned entries and promotes the oldest after an install revert', () => {
+    const { entry, identity } = tempEntry('selected-old-release');
+    const ds = makeDs({
+      lastScreenStatus: 'idle',
+      localProcessAttestation: {
+        backendType: 'tmux', credentialIsolated: false,
+        cliExe: identity, cliInstallEntry: entry, cliSpawnGeneration: 1,
+      },
+      pendingSuspendReason: 'cli_install_changed',
+      pendingSuspendGeneration: 7,
+      pendingSuspendInstallClaim: cancelledClaim(entry, identity),
+    });
+    ds.session.queuedActivationTail = [tailFor('om_reverted_tail')];
+    const worker = ds.worker as any;
+    __testOnly_runPendingSuspendIfSettled(ds);
+
+    expect(ds.pendingSuspendReason).toBeUndefined();
+    expect(ds.session.queuedActivationPending).toBe(true);
+    expect(ds.session.queuedActivationInput?.content).toBe('prompt-om_reverted_tail');
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'message', turnId: 'om_reverted_tail',
+    }));
+  });
+
+  it('keeps a cancelled claim retryable when the promotion write fails after ownership restoration', () => {
+    const { entry, identity } = tempEntry('selected-old-release');
+    const ds = makeDs({
+      lastScreenStatus: 'idle',
+      localProcessAttestation: {
+        backendType: 'tmux', credentialIsolated: false,
+        cliExe: identity, cliInstallEntry: entry, cliSpawnGeneration: 1,
+      },
+      pendingSuspendReason: 'cli_install_changed',
+      pendingSuspendGeneration: 7,
+      pendingSuspendInstallClaim: cancelledClaim(entry, identity),
+    });
+    ds.session.queuedActivationTail = [tailFor('om_retry_tail')];
+    const update = vi.mocked(sessionStore.updateSession);
+    update.mockImplementationOnce(() => {});
+    update.mockImplementationOnce(() => { throw new Error('controlled promotion write failure'); });
+    __testOnly_runPendingSuspendIfSettled(ds);
+
+    expect(ds.pendingSuspendReason).toBe('cli_install_changed');
+    expect(ds.initialStartPending).toBeFalsy();
+    expect(ds.session.queuedActivationPending).toBeFalsy();
+    expect(ds.session.queuedActivationTail).toHaveLength(1);
+    expect(ds.session.queuedActivationTail?.[0]?.ownerRuntime).toBeUndefined();
+
+    update.mockImplementation(() => {});
+    __testOnly_runPendingSuspendIfSettled(ds);
+    expect(ds.pendingSuspendReason).toBeUndefined();
+    expect(ds.session.queuedActivationPending).toBe(true);
+    expect((ds.worker as any).send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'message', turnId: 'om_retry_tail',
+    }));
+  });
+
+  it('promotes a transferred tail for cold recovery after the old worker exits', () => {
+    const { entry, identity } = tempEntry('selected-old-release');
+    const ds = makeDs({
+      lastScreenStatus: 'idle',
+      localProcessAttestation: {
+        backendType: 'tmux', credentialIsolated: false,
+        cliExe: identity, cliInstallEntry: entry, cliSpawnGeneration: 1,
+      },
+      pendingSuspendReason: 'cli_install_changed',
+      pendingSuspendGeneration: 7,
+      pendingSuspendInstallClaim: cancelledClaim(entry, identity),
+    });
+    ds.session.queuedActivationTail = [tailFor('om_crash_tail')];
+    const worker = ds.worker as any;
+    __testOnly_setupWorkerHandlers(ds, worker);
+    worker.emit('exit', 1, null);
+
+    expect(ds.worker).toBeNull();
+    expect(ds.initialStartPending).toBeFalsy();
+    expect(ds.session.queuedActivationPending).toBe(true);
+    expect(ds.session.queuedActivationInput?.content).toBe('prompt-om_crash_tail');
+  });
+
+  it('starts the promoted replacement journal without waiting for another inbound', async () => {
+    const { entry, identity } = tempEntry('selected-old-release');
+    const ds = makeDs({
+      lastScreenStatus: 'idle',
+      localProcessAttestation: {
+        backendType: 'tmux', credentialIsolated: false,
+        cliExe: identity, cliInstallEntry: entry, cliSpawnGeneration: 1,
+      },
+      pendingSuspendReason: 'cli_install_changed',
+      pendingSuspendGeneration: 7,
+      pendingSuspendInstallClaim: cancelledClaim(entry, identity),
+    });
+    ds.session.queuedActivationTail = [tailFor('om_accepted_tail')];
+    const forkWorker = vi.fn(() => {
+      ds.worker = makeFakeWorker();
+      return true;
+    });
+    const start = loadDaemonFunction({
+      traexReplacementStartInFlight: new Set<string>(),
+      findActiveBySessionId: () => ds,
+      randomUUID: () => 'replacement-claim',
+      runSessionTurn: async (_id: string, action: () => Promise<void>) => action(),
+      promoteQueuedActivationTail,
+      hasRecoverableActivationHead,
+      isCodexAppCliId: () => false,
+      getBot: () => ({ config: { cliId: 'traex' } }),
+      forkWorker,
+      clearInitialStartClaim: vi.fn(),
+      logger: { warn: vi.fn() },
+      tag: () => 'traex-test',
+    });
+    const exits: boolean[] = [];
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_notice'),
+      getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn(),
+      onWorkerExit: (current: DaemonSession, context: { currentWorker: boolean; replacementActivationPending: boolean }) => {
+        exits.push(context.replacementActivationPending);
+        if (context.currentWorker && context.replacementActivationPending) start(current, true);
+      },
+    } as any);
+    const worker = ds.worker as any;
+    __testOnly_setupWorkerHandlers(ds, worker);
+    worker.emit('exit', 1, null);
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(exits).toEqual([true]);
+    expect(forkWorker).toHaveBeenCalledTimes(1);
+    expect(forkWorker.mock.calls[0][1]).toMatchObject({ content: 'prompt-om_accepted_tail' });
+    expect(ds.worker).not.toBeNull();
+    expect(ds.session.queuedActivationPending).toBe(true);
+  });
+
+  it('keeps a failed replacement promotion quarantined instead of clearing FIFO ownership', async () => {
+    const ds = makeDs({ worker: null, initialStartPending: false });
+    ds.session.queuedActivationTail = [tailFor('om_quarantine_tail')];
+    const forkWorker = vi.fn();
+    const start = loadDaemonFunction({
+      traexReplacementStartInFlight: new Set<string>(),
+      findActiveBySessionId: () => ds,
+      randomUUID: () => 'replacement-claim',
+      runSessionTurn: async (_id: string, action: () => Promise<void>) => action(),
+      promoteQueuedActivationTail: () => false,
+      isCodexAppCliId: () => false,
+      getBot: () => ({ config: { cliId: 'traex' } }),
+      forkWorker,
+      clearInitialStartClaim: vi.fn(),
+      logger: { warn: vi.fn() },
+      tag: () => 'traex-test',
+    });
+    start(ds);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(ds.quarantinedActivationTailPromotion).toBe(true);
+    expect(ds.initialStartPending).toBe(true);
+    expect(ds.session.queuedActivationTail).toHaveLength(1);
+  });
+
+  it.each(['tombstoned', 'dirty'] as const)('refuses to start a %s promoted journal', async mode => {
+    const ds = makeDs({ worker: null, initialStartPending: true });
+    Object.assign(ds.session, {
+      queuedActivationPending: true,
+      queuedActivationToken: `tok-${mode}-journal`,
+      queuedActivationInput: { content: `${mode}-journal` },
+      queuedActivationTurnId: 'schedule:replacement-journal',
+      cancelledActivationTurnIds: mode === 'tombstoned' ? ['schedule:replacement-journal'] : [],
+    });
+    ds.activationCancellationPending = mode === 'dirty' ? true : undefined;
+    const forkWorker = vi.fn();
+    const start = loadDaemonFunction({
+      traexReplacementStartInFlight: new Set<string>(),
+      findActiveBySessionId: () => ds,
+      randomUUID: () => `claim-${mode}-journal`,
+      runSessionTurn: async (_id: string, action: () => Promise<void>) => action(),
+      promoteQueuedActivationTail,
+      hasRecoverableActivationHead,
+      isCodexAppCliId: () => false,
+      getBot: () => ({ config: { cliId: 'traex' } }),
+      forkWorker,
+      clearInitialStartClaim: vi.fn(),
+      logger: { warn: vi.fn() },
+      tag: () => 'traex-test',
+    });
+    start(ds, true);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(ds.initialStartClaimToken).toBeUndefined();
+  });
+
+  it('rechecks promoted-journal recoverability after the turn-queue wait', async () => {
+    const ds = makeDs({ worker: null, initialStartPending: true });
+    Object.assign(ds.session, {
+      queuedActivationPending: true,
+      queuedActivationToken: 'tok-async-recheck',
+      queuedActivationInput: { content: 'live until the queue wait' },
+      queuedActivationTurnId: 'schedule:async-recheck',
+      cancelledActivationTurnIds: [],
+    });
+    let openTurnQueue!: () => void;
+    const turnQueueGate = new Promise<void>(resolve => { openTurnQueue = resolve; });
+    const forkWorker = vi.fn();
+    const start = loadDaemonFunction({
+      traexReplacementStartInFlight: new Set<string>(),
+      findActiveBySessionId: () => ds,
+      randomUUID: () => 'claim-async-recheck',
+      runSessionTurn: async (_id: string, action: () => Promise<void>) => { await turnQueueGate; await action(); },
+      promoteQueuedActivationTail,
+      hasRecoverableActivationHead,
+      isCodexAppCliId: () => false,
+      getBot: () => ({ config: { cliId: 'traex' } }),
+      forkWorker,
+      clearInitialStartClaim: vi.fn(),
+      logger: { warn: vi.fn() },
+      tag: () => 'traex-test',
+    });
+    start(ds, true);
+    ds.session.cancelledActivationTurnIds = ['schedule:async-recheck'];
+    openTurnQueue();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('starts a replacement when a late-built replacement tail lands after the old worker is gone', async () => {
+    const ds = makeDs({ worker: null, initialStartPending: false });
+    ds.session.queuedActivationTail = [tailFor('om_late_build_tail')];
+    const forkWorker = vi.fn(() => {
+      ds.worker = makeFakeWorker();
+      return true;
+    });
+    const start = loadDaemonFunction({
+      traexReplacementStartInFlight: new Set<string>(),
+      findActiveBySessionId: () => ds,
+      randomUUID: () => 'replacement-claim',
+      runSessionTurn: async (_id: string, action: () => Promise<void>) => action(),
+      promoteQueuedActivationTail,
+      hasRecoverableActivationHead,
+      isCodexAppCliId: () => false,
+      getBot: () => ({ config: { cliId: 'traex' } }),
+      forkWorker,
+      clearInitialStartClaim: vi.fn(),
+      logger: { warn: vi.fn() },
+      tag: () => 'traex-test',
+    });
+    const release = loadDaemonFunction({
+      startReplacementRuntimeAfterReclaim: start,
+      promoteQueuedActivationTail,
+      installReclaimPendingForCurrentGeneration,
+      clearInitialStartBuffers: vi.fn(),
+      clearInitialStartClaim: vi.fn(() => { ds.initialStartPending = false; }),
+      rememberLastCliInput: vi.fn(),
+    }, 'releaseQueuedActivationReservationNow');
+    expect(release(ds)).toBe(true);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(forkWorker).toHaveBeenCalledTimes(1);
+    expect(ds.worker).not.toBeNull();
+    expect(ds.session.queuedActivationPending).toBe(true);
+  });
+
+  it('never promotes a cancelled turn, including while its tombstone is unwritable', () => {
+    const ds = makeDs();
+    ds.session.queuedActivationTail = [
+      { ...tailFor('om_cancelled'), order: 1 },
+      { ...tailFor('om_allowed'), order: 2 },
+    ];
+    ds.session.cancelledActivationTurnIds = ['om_cancelled'];
+    expect(promoteQueuedActivationTail(ds)).toBe(true);
+    expect((ds.worker as any).send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'message', turnId: 'om_allowed',
+    }));
+    expect((ds.worker as any).send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'message', turnId: 'om_cancelled',
+    }));
+
+    const blocked = makeDs();
+    blocked.session.queuedActivationTail = [tailFor('om_still_cancelled')];
+    blocked.session.cancelledActivationTurnIds = ['om_still_cancelled'];
+    blocked.activationCancellationPending = true;
+    vi.mocked(sessionStore.updateSession).mockImplementationOnce(() => { throw new Error('controlled retry failure'); });
+    expect(promoteQueuedActivationTail(blocked)).toBe(false);
+    expect(blocked.activationCancellationPending).toBe(true);
+    expect((blocked.worker as any).send).not.toHaveBeenCalled();
+
+    blocked.session.queuedActivationTail = [tailFor('om_still_cancelled'), tailFor('om_after_retry')];
+    expect(promoteQueuedActivationTail(blocked)).toBe(true);
+    expect(blocked.activationCancellationPending).toBeUndefined();
+    expect((blocked.worker as any).send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'message', turnId: 'om_after_retry',
+    }));
+  });
+
+  it('clears an all-cancelled tail without quarantining it as a failed promotion', () => {
+    const ds = makeDs();
+    ds.session.queuedActivationTail = [tailFor('om_cancelled')];
+    ds.session.cancelledActivationTurnIds = ['om_cancelled'];
+    ds.initialStartPending = true;
+    ds.quarantinedActivationTailPromotion = true;
+    expect(promoteQueuedActivationTail(ds)).toBe(false);
+    expect(ds.session.queuedActivationTail).toBeUndefined();
+    expect(ds.initialStartPending).toBe(false);
+    expect(ds.quarantinedActivationTailPromotion).toBeUndefined();
+    expect((ds.worker as any).send).not.toHaveBeenCalled();
+  });
+
+  it('does not quarantine an all-cancelled tail during worker detach reconciliation', () => {
+    const ds = makeDs();
+    ds.session.queuedActivationTail = [tailFor('om_cancelled')];
+    ds.session.cancelledActivationTurnIds = ['om_cancelled'];
+    ds.initialStartPending = true;
+    reconcileQueuedActivationOnWorkerDetach(ds);
+    expect(ds.session.queuedActivationTail).toBeUndefined();
+    expect(ds.initialStartPending).toBe(false);
+    expect(ds.quarantinedActivationTailPromotion).toBeUndefined();
+  });
+
+  it.each(['human follow-up', ''])('releases a cleanly drained quarantine at the fork boundary (%s)', prompt => {
+    const ds = makeDs({ worker: null, initialStartPending: true });
+    ds.session.queuedActivationTail = undefined;
+    ds.quarantinedActivationTailPromotion = true;
+    ds.initialStartClaimToken = 'claim-drained';
+    const plan = resolveQuarantinedForkPlan(ds, prompt, false);
+    expect(plan).toEqual({ fork: true, promptInput: prompt, resumeOrTurnId: false });
+    expect(ds.quarantinedActivationTailPromotion).toBeUndefined();
+    expect(ds.initialStartPending).toBe(false);
+    expect(ds.initialStartClaimToken).toBeUndefined();
+  });
+
+  it('releases only live reservation heads and clears an all-cancelled claim', () => {
+    const mixed = makeDs();
+    mixed.session.queuedActivationTail = [
+      { ...tailFor('om_cancelled'), order: 1 },
+      { ...tailFor('om_live'), order: 2 },
+    ];
+    mixed.session.cancelledActivationTurnIds = ['om_cancelled'];
+    const rememberLastCliInput = vi.fn();
+    const releaseMixed = loadDaemonFunction({
+      promoteQueuedActivationTail, hasCleanlyDrainedQueuedActivationTail,
+      installReclaimPendingForCurrentGeneration,
+      clearInitialStartBuffers: vi.fn(), clearInitialStartClaim: vi.fn(), rememberLastCliInput,
+    }, 'releaseQueuedActivationReservationNow');
+    expect(releaseMixed(mixed)).toBe(true);
+    expect(rememberLastCliInput).toHaveBeenCalledWith(mixed, 'prompt-om_live', expect.anything(), 'om_live', expect.anything());
+    expect(JSON.stringify(rememberLastCliInput.mock.calls)).not.toContain('prompt-om_cancelled');
+
+    const drained = makeDs({ worker: null, initialStartPending: true });
+    drained.session.queuedActivationTail = [tailFor('om_only_cancelled')];
+    drained.session.cancelledActivationTurnIds = ['om_only_cancelled'];
+    drained.initialStartClaimToken = 'claim-only-cancelled';
+    const rememberDrained = vi.fn();
+    const releaseDrained = loadDaemonFunction({
+      promoteQueuedActivationTail, hasCleanlyDrainedQueuedActivationTail,
+      installReclaimPendingForCurrentGeneration,
+      clearInitialStartBuffers: vi.fn(),
+      clearInitialStartClaim: vi.fn(() => {
+        drained.initialStartPending = false;
+        drained.initialStartClaimToken = undefined;
+      }),
+      rememberLastCliInput: rememberDrained,
+    }, 'releaseQueuedActivationReservationNow');
+    expect(releaseDrained(drained)).toBe(true);
+    expect(drained.session.queuedActivationTail).toBeUndefined();
+    expect(drained.initialStartClaimToken).toBeUndefined();
+    expect(rememberDrained).not.toHaveBeenCalled();
+  });
+
+  it('retains and retries a dirty empty-tail cancellation until its write-ahead state persists', async () => {
+    const ds = makeDs({ worker: null, initialStartPending: true });
+    ds.session.queuedActivationTail = undefined;
+    ds.activationCancellationPending = true;
+    ds.initialStartClaimToken = 'claim-dirty-empty-tail';
+    const releaseNow = loadDaemonFunction({
+      retryCancelledActivationPersistence, clearTombstonedActivationHeadForRelease,
+      promoteQueuedActivationTail,
+      clearInitialStartBuffers: vi.fn(),
+      clearInitialStartClaim: vi.fn(() => {
+        ds.initialStartPending = false;
+        ds.initialStartClaimToken = undefined;
+      }),
+    }, 'releaseQueuedActivationReservationNow');
+    const releaseDue = loadDaemonFunction({}, 'queuedActivationReleaseDue');
+    ds.initialStartPending = false;
+    expect(releaseDue(ds)).toBe(true);
+    ds.initialStartPending = true;
+    const scheduleRetry = vi.fn();
+    const startJournal = vi.fn();
+    const update = vi.mocked(sessionStore.updateSession);
+    update.mockReset().mockImplementation(() => { throw new Error('cancellation still unwritable'); });
+    await releaseCancelledActivationWork(ds, {
+      release: async () => releaseNow(ds), startJournal, scheduleRetry,
+    });
+    expect(scheduleRetry).toHaveBeenCalledOnce();
+    expect(startJournal).not.toHaveBeenCalled();
+    expect(ds.initialStartPending).toBe(true);
+    expect(ds.initialStartClaimToken).toBe('claim-dirty-empty-tail');
+    expect(ds.activationCancellationPending).toBe(true);
+
+    update.mockReset();
+    await releaseCancelledActivationWork(ds, {
+      release: async () => releaseNow(ds), startJournal, scheduleRetry,
+    });
+    expect(ds.activationCancellationPending).toBeUndefined();
+    expect(ds.initialStartPending).toBe(false);
+    expect(ds.initialStartClaimToken).toBeUndefined();
+    expect(scheduleRetry).toHaveBeenCalledOnce();
+    expect(startJournal).not.toHaveBeenCalled();
+  });
+
+  it('clears a tombstoned pending head, promotes the human tail, and clears stale quarantine', () => {
+    const ds = makeDs({ worker: null, initialStartPending: true });
+    Object.assign(ds.session, {
+      queuedActivationPending: true,
+      queuedActivationToken: 'tok-tombstoned-release',
+      queuedActivationInput: { content: 'CANCELLED_PENDING_RELEASE' },
+      queuedActivationTurnId: 'schedule:tombstoned-release',
+      queuedActivationTail: [tailFor('om_human_pending_release')],
+      cancelledActivationTurnIds: ['schedule:tombstoned-release'],
+    });
+    ds.quarantinedActivationTailPromotion = true;
+    const rememberLastCliInput = vi.fn();
+    const releaseNow = loadDaemonFunction({
+      retryCancelledActivationPersistence, clearTombstonedActivationHeadForRelease,
+      startReplacementRuntimeAfterReclaim: vi.fn(),
+      promoteQueuedActivationTail, hasCleanlyDrainedQueuedActivationTail,
+      installReclaimPendingForCurrentGeneration,
+      clearInitialStartBuffers: vi.fn(), clearInitialStartClaim: vi.fn(), rememberLastCliInput,
+    }, 'releaseQueuedActivationReservationNow');
+    expect(releaseNow(ds)).toBe(true);
+    expect(ds.session.queuedActivationPending).toBe(true);
+    expect(ds.session.queuedActivationTurnId).toBe('om_human_pending_release');
+    expect(ds.quarantinedActivationTailPromotion).toBeUndefined();
+    expect(rememberLastCliInput).toHaveBeenCalledWith(ds, 'prompt-om_human_pending_release', expect.anything(), 'om_human_pending_release', expect.anything());
   });
 });
 
