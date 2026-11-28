@@ -691,7 +691,7 @@ export function readSessionTurns(dataDir: string, sessionId: string, since: numb
   return {
     ok: true,
     schema: 'botmux.session-turns.v1',
-    capabilities: ['ownerActor'],
+    capabilities: ['ownerActor', 'ownerUnionId'],
     next: String(turns.at(-1)?.seq ?? since),
     turns,
   } as const;

@@ -413,6 +413,7 @@ For the full permission model see [Permissions](/en/permissions).
 |------|------|
 | `allowedUsers` | Admin list: can run admin commands and press card buttons. Prefer full email, phone number or `on_xxx`. An `ou_xxx` is only valid for the app that issued it, so don't copy it from another bot. If `allowedChatGroups` is set, you need at least one admin |
 | `ownerOpenId` | Explicit primary admin `ou_xxx`. Only counts while it is still in `allowedUsers`; defaults to the first person in `allowedUsers` |
+| `ownerUnionId` | Explicit primary admin by `on_xxx`, which can be copied between one person's bots. Only counts while the same `on_xxx` is listed in `allowedUsers` and resolves; together with `ownerOpenId`, both must name the same person, otherwise no primary admin is set explicitly |
 | `allowedChatGroups` | Groups (`oc_xxx`) where anyone can talk to the bot. Admin actions still require `allowedUsers` |
 | `p2pOpen` | `true` lets anyone within the Feishu app's availability scope DM the bot (talk only). Groups are unaffected |
 | `oncallChats` | Oncall bindings: `[{ "chatId": "oc_xxx", "workingDir": "~/projects/foo" }]`. See [Oncall](/en/oncall) |

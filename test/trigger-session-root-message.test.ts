@@ -16,7 +16,9 @@ const mockGetChatMode = vi.fn(async () => 'topic');
 const mockSendMessage = vi.fn(async () => 'om_new_topic');
 const mockReplyMessage = vi.fn(async () => 'om_reply');
 const mockDeleteMessage = vi.fn(async () => true);
+const mockResolveUnionIdStrict = vi.fn();
 vi.mock('../src/im/lark/client.js', () => ({
+  resolveUnionIdFromOpenIdStrict: (...args: any[]) => mockResolveUnionIdStrict(...args),
   getMessageChatId: (...args: any[]) => mockGetMessageChatId(...args),
   getChatMode: (...args: any[]) => mockGetChatMode(...args),
   sendMessage: (...args: any[]) => mockSendMessage(...args),
@@ -268,9 +270,12 @@ describe('triggerSessionTurn rootMessageId target', () => {
     };
   }
 
-  it.each([undefined, 'ou_removed'])('refuses to fall back to the first allowed user for configured owner %s', async ownerOpenId => {
+  it.each([
+    ['a configured owner who left the allowlist', { allowedUsers: ['ou_other'], ownerOpenId: 'ou_removed' }],
+    ['several people and no configured owner', { allowedUsers: ['ou_other', 'ou_fixture_owner'] }],
+  ])('refuses to fall back to the first allowed user for %s', async (_case, entry) => {
     registerBot(parseBotConfigsFromText(JSON.stringify([{
-      larkAppId: APP, larkAppSecret: 'fixture', cliId: 'codex', allowedUsers: ['ou_other'], ownerOpenId,
+      larkAppId: APP, larkAppSecret: 'fixture', cliId: 'codex', ...entry,
     }]))[0]!);
     const ds = existingDs();
     const result = await triggerSessionTurn(ownerRequest(), {
@@ -278,6 +283,103 @@ describe('triggerSessionTurn rootMessageId target', () => {
     });
     expect(result).toMatchObject({ ok: false, errorCode: 'owner_unresolved' });
     expect(mockForkWorker).not.toHaveBeenCalled();
+  });
+
+  describe('owner identified by union_id', () => {
+    const OWNER = 'ou_fixture_owner';
+    const OWNER_UNION = 'on_fixture_owner';
+    const OTHER_UNION = 'on_fixture_other';
+
+    /** Registers the bot with `resolution` as its resolved allowlist (raw entry → open_id). */
+    function ownerBot(entry: Record<string, unknown>, resolution: Record<string, string>) {
+      const bot = registerBot(parseBotConfigsFromText(JSON.stringify([{
+        larkAppId: APP, larkAppSecret: 'fixture', workingDir: '/tmp', cliId: 'claude-code', ...entry,
+      }]))[0]!);
+      bot.rawAllowedUserResolution = new Map(Object.entries(resolution));
+      bot.resolvedAllowedUsers = [...new Set(Object.values(resolution))];
+      mockGetBot.mockReturnValue(undefined);
+      vi.mocked(resolveSender).mockResolvedValue({ openId: OWNER, type: 'user' });
+      return bot;
+    }
+
+    async function send(actorUnionId?: string) {
+      const worker = { send: vi.fn() };
+      const ds = existingDs({ worker: worker as any });
+      const req = ownerRequest();
+      if (actorUnionId !== undefined) req.actorUnionId = actorUnionId;
+      const result = await triggerSessionTurn(req, {
+        larkAppId: APP, activeSessions: new Map([[sessionKey(ROOT, APP), ds]]),
+      });
+      return { result, sent: worker.send.mock.calls.map(c => c[0] as PendingCliInput) };
+    }
+
+    it.each([undefined, OWNER_UNION])('a one-person allowlist makes that person the owner (actorUnionId %s)', async actorUnionId => {
+      ownerBot({ allowedUsers: [OWNER_UNION] }, { [OWNER_UNION]: OWNER });
+      const { result, sent } = await send(actorUnionId);
+      expect(result).toMatchObject({ ok: true, actor: 'owner' });
+      expect(sent).toHaveLength(1);
+      expect(sent[0]!.turnCallerOpenId).toBe(OWNER);
+      expect(mockResolveUnionIdStrict).not.toHaveBeenCalled();
+    });
+
+    it('refuses another person\'s union_id for a one-person allowlist', async () => {
+      ownerBot({ allowedUsers: [OWNER_UNION] }, { [OWNER_UNION]: OWNER });
+      mockResolveUnionIdStrict.mockResolvedValue({ status: 'resolved', unionId: OWNER_UNION });
+      const { result, sent } = await send(OTHER_UNION);
+      expect(result).toMatchObject({ ok: false, errorCode: 'owner_mismatch' });
+      expect(sent).toEqual([]);
+    });
+
+    it('refuses an allowed person who is not the configured owner', async () => {
+      ownerBot({ allowedUsers: [OWNER_UNION, OTHER_UNION], ownerOpenId: OWNER },
+        { [OWNER_UNION]: OWNER, [OTHER_UNION]: 'ou_fixture_other' });
+      const refused = await send(OTHER_UNION);
+      expect(refused.result).toMatchObject({ ok: false, errorCode: 'owner_mismatch' });
+      expect(refused.sent).toEqual([]);
+      const accepted = await send(OWNER_UNION);
+      expect(accepted.result).toMatchObject({ ok: true, actor: 'owner' });
+      expect(accepted.sent[0]!.turnCallerOpenId).toBe(OWNER);
+    });
+
+    it('accepts the person a configured ownerUnionId names among several', async () => {
+      ownerBot({ allowedUsers: [OTHER_UNION, OWNER_UNION], ownerUnionId: OWNER_UNION },
+        { [OTHER_UNION]: 'ou_fixture_other', [OWNER_UNION]: OWNER });
+      const { result, sent } = await send(OWNER_UNION);
+      expect(result).toMatchObject({ ok: true, actor: 'owner' });
+      expect(sent[0]!.turnCallerOpenId).toBe(OWNER);
+    });
+
+    it('does not let the caller\'s own union_id pick an owner among several people', async () => {
+      ownerBot({ allowedUsers: [OWNER_UNION, OTHER_UNION] }, { [OWNER_UNION]: OWNER, [OTHER_UNION]: 'ou_fixture_other' });
+      const { result, sent } = await send(OWNER_UNION);
+      expect(result).toMatchObject({ ok: false, errorCode: 'owner_unresolved' });
+      expect(sent).toEqual([]);
+    });
+
+    it.each([
+      [{ status: 'resolved', unionId: OWNER_UNION }, { ok: true, actor: 'owner' }],
+      [{ status: 'resolved', unionId: OTHER_UNION }, { ok: false, errorCode: 'owner_mismatch' }],
+      [{ status: 'unavailable' }, { ok: false, errorCode: 'owner_unresolved' }],
+      [{ status: 'retryable', error: 'timeout' }, { ok: false, errorCode: 'owner_unresolved' }],
+    ])('looks up the union_id of an owner listed by email (%o)', async (lookup, expected) => {
+      ownerBot({ allowedUsers: ['owner@example.com'] }, { 'owner@example.com': OWNER });
+      mockResolveUnionIdStrict.mockResolvedValue(lookup);
+      const { result, sent } = await send(OWNER_UNION);
+      expect(mockResolveUnionIdStrict).toHaveBeenCalledWith(APP, OWNER);
+      expect(result).toMatchObject(expected);
+      expect(sent).toHaveLength(expected.ok ? 1 : 0);
+    });
+
+    it('rejects the owner if the allowlist changes during the union_id lookup', async () => {
+      const bot = ownerBot({ allowedUsers: ['owner@example.com'] }, { 'owner@example.com': OWNER });
+      mockResolveUnionIdStrict.mockImplementation(async () => {
+        bot.resolvedAllowedUsers = ['ou_fixture_other'];
+        return { status: 'resolved', unionId: OWNER_UNION };
+      });
+      const { result, sent } = await send(OWNER_UNION);
+      expect(result).toMatchObject({ ok: false, errorCode: 'owner_unresolved' });
+      expect(sent).toEqual([]);
+    });
   });
 
   it('rejects the owner if allowlist access is revoked during contact resolution', async () => {
