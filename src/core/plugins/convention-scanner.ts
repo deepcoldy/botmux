@@ -26,6 +26,7 @@ import {
   PROTECTED_MCP_SECRET_FD_ENV,
 } from '../protected-mcp-capabilities.js';
 import { normalizeProtectedHttpEgressPolicy } from '../protected-http-egress.js';
+import { scanPluginBytedcliOperationPresets } from './bytedcli-operation-presets.js';
 
 function isFile(path: string): boolean {
   try {
@@ -356,6 +357,7 @@ const scanWebhooks = (
 };
 
 export function scanPluginContributions(runtimeDir: string, manifest: BotmuxPluginManifest): ScannedPluginContributions | undefined {
+  const bytedcliOperationPresets = scanPluginBytedcliOperationPresets(runtimeDir);
   const skills = scanSkills(runtimeDir, manifest.id);
   const mcp = scanMcp(runtimeDir, manifest.id);
   const dashboard = scanDashboard(runtimeDir, manifest.id);
@@ -375,6 +377,7 @@ export function scanPluginContributions(runtimeDir: string, manifest: BotmuxPlug
     throw new Error('plugin_prerequisites_entry_not_found');
   }
   const contributions: ScannedPluginContributions = {
+    ...(bytedcliOperationPresets ? { bytedcliOperationPresets } : {}),
     ...(skills ? { skills } : {}),
     ...(mcp ? { mcp } : {}),
     ...(dashboard ? { dashboard } : {}),
