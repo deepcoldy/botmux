@@ -50,6 +50,11 @@ export function isolateBytedcliInvocation(invocation: BytedcliChildInvocation, c
     // executable is needed inside the request namespace.
     bind(cli.dbRuntime.executable);
   }
+  if (cli.pythonRuntime) {
+    if (!cli.pythonRuntime.stillCurrent()) fail();
+    for (const path of cli.pythonRuntime.protectedPaths) bind(path, true);
+    bind(cli.pythonRuntime.executable, true);
+  }
   if (cli.prefixArgs?.[0] && ![...bound].some(root => contains(root, cli.prefixArgs![0]!))) fail();
   for (const key of ['NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE', 'SSL_CERT_DIR']) {
     const path = invocation.env[key]; if (path) { if (!existsSync(path)) fail(); bind(path); }

@@ -38,15 +38,17 @@ async function snapshotInputs(argv:readonly string[],stdin:NodeJS.ReadableStream
   let remoteFileSelector=false;
   try{remoteFileSelector=parseBytedcliOperation(argv).execution==='audited-native';}catch{/* snapshot bytes not yet available */}
   for(let index=0;index<result.length;index++){
-    const arg=result[index]!;const fileFlag=arg==='--file'||arg.startsWith('--file=')?'--file':'--body-file';let path:string|undefined,valueIndex:number|undefined;
+    const arg=result[index]!;const fileFlag=arg==='--attachment'||arg.startsWith('--attachment=')?'--attachment':arg==='--file'||arg.startsWith('--file=')?'--file':'--body-file';let path:string|undefined,valueIndex:number|undefined;
     if(fileFlag==='--file'&&remoteFileSelector)continue;
-    if(arg==='--body-file'||arg==='-F'||arg==='--file'){valueIndex=index+1;path=result[valueIndex];}
-    else if(arg.startsWith('--body-file=')||arg.startsWith('--file=')){path=arg.slice(arg.indexOf('=')+1);}
+    if(arg==='--body-file'||arg==='-F'||arg==='--file'||arg==='--attachment'){valueIndex=index+1;path=result[valueIndex];}
+    else if(arg.startsWith('--body-file=')||arg.startsWith('--file=')||arg.startsWith('--attachment=')){path=arg.slice(arg.indexOf('=')+1);}
     else if(arg.startsWith('-F=')){path=arg.slice(3);}
     else continue;
     if(path===undefined||!path)throw new Error('invalid_request');
+    const imageExtension=fileFlag==='--attachment'?/\.(png|jpg|jpeg|webp|heic|heif)$/i.exec(path)?.[1]?.toLowerCase():undefined;
+    if(fileFlag==='--attachment'&&!imageExtension)throw new Error('invalid_request');
     const data=path==='-'?await snapshotStdin(stdin??process.stdin,signal,BYTEDCLI_EXEC_LIMITS.inputBytes-total):snapshotFile(path,BYTEDCLI_EXEC_LIMITS.inputBytes-total);
-    total+=data.length;const id=path==='-'?'-':`input${files.length}`;
+    total+=data.length;const id=path==='-'?'-':`input${files.length}${imageExtension?'-'+imageExtension:''}`;
     if(path==='-'){if(stdinBase64!==undefined)throw new Error('invalid_request');stdinBase64=data.toString('base64');}
     else files.push({id,dataBase64:data.toString('base64')});
     if(valueIndex!==undefined){result[index]=fileFlag;result[valueIndex]=id;index++;}

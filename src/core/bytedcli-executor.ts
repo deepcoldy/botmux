@@ -1,5 +1,6 @@
 import { matchSkillApi } from './bytedcli-skill-api.js';
 import type { BytedcliHostApiRunner } from './bytedcli-skill-api-transport.js';
+import type { BytedcliTrustedPythonRuntime } from './bytedcli-python-runtime.js';
 import { constants, closeSync, mkdtempSync, mkdirSync, openSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { BYTEDCLI_EXEC_SCHEMA, BYTEDCLI_EXEC_LIMITS, BYTEDCLI_EXEC_ERROR_CODES, decodeBytedcliBase64,
@@ -36,6 +37,7 @@ export interface BytedcliExecutorDependencies {
   readonly leases: BytedcliLeaseResolver; readonly audit: BytedcliAuditSink;
   readonly networkEnv?: Readonly<NodeJS.ProcessEnv>; readonly run?: BytedcliChildRunner;
   readonly dbRuntime?: BytedcliTrustedDbRuntime;
+  readonly pythonRuntime?: BytedcliTrustedPythonRuntime;
   readonly hostApi?: BytedcliHostApiRunner;
 }
 export function redactBytedcliOutput(buffer: Buffer, activeSecrets: readonly string[]): Buffer {
@@ -354,6 +356,8 @@ export class BytedcliExecutor {
         identityTurnId: request.authority.identityTurnId ?? request.authority.turnId };
       const dbRuntime = request.operation.requiredRuntime === 'db-cli' ? this.deps.dbRuntime : undefined;
       if (request.operation.requiredRuntime === 'db-cli' && (!dbRuntime || !dbRuntime.stillCurrent())) throw new BytedcliBrokerError('executor_unavailable');
+      const pythonRuntime = request.operation.requiredRuntime === 'python3' ? this.deps.pythonRuntime : undefined;
+      if (request.operation.requiredRuntime === 'python3' && (!pythonRuntime || !pythonRuntime.stillCurrent())) throw new BytedcliBrokerError('executor_unavailable');
       const api = request.operation.execution === 'host-api' ? matchSkillApi(request.operation.argv, request.operation.stagedInputs.length ? {files:request.operation.stagedInputs.filter(i=>i.id!=='stdin').map(i=>({id:i.id,dataBase64:i.dataBase64})), ...(request.operation.stagedInputs.find(i=>i.id==='stdin') ? {stdinBase64:request.operation.stagedInputs.find(i=>i.id==='stdin')!.dataBase64} : {})} : undefined)?.descriptor : undefined;
       if (request.operation.execution === 'host-api' && (!api || !this.deps.hostApi)) throw new BytedcliBrokerError('executor_unavailable');
       const kind = executionIdentityOf(request);
@@ -370,7 +374,8 @@ export class BytedcliExecutor {
       await bounded(this.check(active));
       const trustedCli = api ? undefined : await bounded(this.deps.trustedCli(controller.signal));
       if (trustedCli) assertBytedcliAuditedRelease(trustedCli.version);
-      const cli = dbRuntime ? Object.freeze({ ...trustedCli, dbRuntime, stillCurrent: () => trustedCli!.stillCurrent() && dbRuntime.stillCurrent() }) : trustedCli;
+      const cli = dbRuntime || pythonRuntime ? Object.freeze({ ...trustedCli, dbRuntime, pythonRuntime,
+        stillCurrent: () => trustedCli!.stillCurrent() && (!dbRuntime || dbRuntime.stillCurrent()) && (!pythonRuntime || pythonRuntime.stillCurrent()) }) : trustedCli;
       ensureBytedcliPrivateDirectory(this.deps.privateRoot); root = mkdtempSync(join(this.deps.privateRoot, 'request-'));
       const home = join(root, 'home'); const cwd = join(root, 'cwd'); mkdirSync(home, { mode: 0o700 }); mkdirSync(cwd, { mode: 0o700 });
       const stage = (name: string, bytes: Buffer) => {
@@ -381,7 +386,9 @@ export class BytedcliExecutor {
       for (let index = 0; index < request.operation.stagedInputs.length; index++) {
         const input = request.operation.stagedInputs[index]!;
         const bytes = decodeBytedcliBase64(input.dataBase64, request.operation.inputLimitBytes - inputBytes); inputBytes += bytes.length;
-        argv[input.argvIndex] = stage(`input-${index}`, bytes);
+        // The extension is selected from the closed wire ID, never a host path.
+        const extension = input.flag === '--attachment' ? '.' + input.id.slice(input.id.lastIndexOf('-') + 1) : '';
+        argv[input.argvIndex] = stage(`input-${index}${extension}`, bytes);
       }
       if (!api) { const jwtPath = stage('request.jwt', Buffer.from(lease.jwt)); argv.unshift('--bytecloud-user-jwt-file', jwtPath); }
       const authority = request.authority;
@@ -409,7 +416,8 @@ export class BytedcliExecutor {
           outputLimitBytes: request.operation.outputLimitBytes, onDispatch, reserveOutput });
       } else {
         const invocation = { executable: cli!.executable!, argv: [...(cli!.prefixArgs ?? []), ...argv], cwd,
-          env: { ...bytedcliMinimalEnv(home, cwd, cli!.path!, this.deps.networkEnv), ...(dbRuntime ? { DB_CLI_BINARY: dbRuntime.executable } : {}) }, signal: controller.signal,
+          env: { ...bytedcliMinimalEnv(home, cwd, cli!.path!, this.deps.networkEnv), ...(dbRuntime ? { DB_CLI_BINARY: dbRuntime.executable } : {}),
+            ...(pythonRuntime ? { BYTEDCLI_MINDAI_PYTHON: pythonRuntime.executable, PYTHONNOUSERSITE: '1', PYTHONDONTWRITEBYTECODE: '1' } : {}) }, signal: controller.signal,
           timeoutMs: Math.max(1, request.operation.timeoutMs - (Date.now() - started)), outputLimitBytes: request.operation.outputLimitBytes,
           onDispatch, reserveOutput };
         const prepared = request.operation.execution === 'isolated-native' ? isolateBytedcliInvocation(invocation, cli! as BytedcliTrustedCli, root) : invocation;

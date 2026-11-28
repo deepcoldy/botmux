@@ -10,6 +10,15 @@ let server:Server|undefined;const roots:string[]=[];
 afterEach(async()=>{server?.closeAllConnections();await new Promise<void>(resolve=>server?server.close(()=>resolve()):resolve());server=undefined;for(const dir of roots.splice(0))rmSync(dir,{recursive:true,force:true});});
 async function host(handler:Parameters<typeof createServer>[0]){server=createServer(handler as any);await new Promise<void>(r=>server!.listen(0,'127.0.0.1',r));return (server.address() as any).port;}
 describe('sandbox broker client',()=>{
+  it.each([false,true])('snapshots a MindAI image with its media extension and omits the host path (equals=%s)',async equals=>{
+    const dir=mkdtempSync(join(tmpdir(),'bytedcli-mindai-client-'));roots.push(dir);const file=join(dir,'reference.PNG');writeFileSync(file,Buffer.from([0,255,42]));let received:any;
+    const port=await host((req:any,res:any)=>{let text='';req.on('data',(b:Buffer)=>text+=b);req.on('end',()=>{received=JSON.parse(text);writeFileSync(file,'later');res.end(JSON.stringify({schema:'botmux.bytedcli-exec.v1',requestId:received.requestId,operationId:'mindai.chart.update',operationEffect:'write',effectiveIdentity:{kind:'machine'},outcome:'completed',stdoutBase64:'',stderrBase64:'',exitCode:0}));});});
+    const argv=['mindai','chart','update','--task-id','task-1','--prompt','draw',...(equals?['--attachment='+file]:['--attachment',file])];
+    expect(await runBytedcliExecClient({sessionId:'s',port,argv,stdout:()=>{},stderr:()=>{}})).toBe(0);
+    expect(JSON.stringify(received)).not.toContain(file);
+    expect(received.inputs.files).toEqual([{id:'input0-png',dataBase64:'AP8q'}]);
+    expect(parseBytedcliOperation(received.argv,received.inputs)).toMatchObject({id:'mindai.chart.update',effect:'write'});
+  });
   it.each([{argv:['--no-auto-upgrade','--version'],id:'help.version'}, {argv:['--no-auto-upgrade','--help'],id:'help.root'},
     {argv:['codebase','--no-auto-upgrade','--help'],id:'help.codebase'}])('keeps safe help flags compatible with upgrade disabled: $argv',({argv,id})=>{
     expect(parseBytedcliOperation(argv)).toMatchObject({id,effect:'help'});

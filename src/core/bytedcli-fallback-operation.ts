@@ -9,11 +9,11 @@ const controlWords = new Set(['auth', 'profile', 'profiles', 'self', 'plugin', '
   'install', 'uninstall', 'completion', 'completions', 'mcp', 'skill', 'skills', 'credential', 'credentials', 'login', 'logout']);
 const forbiddenFlags = /^(?:--(?:as|profile|auth-site|bytecloud-user-jwt-file|jwt-file|token|ak|sk|vdc|network-profile|ai-auth-.+|socks5-proxy|http-proxy|http-header|http-debug|http-print|http-trace-file|http-body-limit|http-timeout-ms|http-retry-.+|jq|nomask|no-redact|debug|tls1\.2|color|no-color|version|all-help|help)|-d|-V|-h)$/;
 const credentialFlag = /^--(?:.*-)?(?:access-token|refresh-token|id-token|user-token|token-file|jwt|jwt-file|authorization|cookie|password|secret|client-secret|credential|credentials|identity|profile)(?:-.*)?$/;
-export function assertBytedcliNoIdentityOverrides(argv: readonly string[]): void {
+export function assertBytedcliNoIdentityOverrides(argv: readonly string[], reviewedFlags: readonly string[] = []): void {
   for (const arg of argv) {
     const flag = arg.split('=', 1)[0]!;
     // -d is command-local TCC dir, handled by its closed parser; never fallback.
-    if (credentialFlag.test(flag) || forbiddenFlags.test(flag) && flag !== '-d' && flag !== '--help') throw new Error('unsupported_operation');
+    if (credentialFlag.test(flag) || forbiddenFlags.test(flag) && flag !== '-d' && flag !== '--help' && !reviewedFlags.includes(flag)) throw new Error('unsupported_operation');
   }
 }
 export function parseBytedcliFallbackArgv(argv: readonly string[]): string[] {
