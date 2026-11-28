@@ -34853,7 +34853,7 @@ function deliverFinalOutput(
         : msg.userText;
       // Ordinary MiniMax IM finals may be up to 8 MB. Avoid parsing a whole
       // Markdown document into a card that can never fit the provider budget.
-      const canSendReplyFile = effectiveCliId === 'minimax' && !managedReceiver && !imOrigin
+      const canSendReplyFile = (effectiveCliId === 'minimax' || effectiveCliId === 'atomcode') && !managedReceiver && !imOrigin
         && !msg.turnFailed && (!msg.kind || msg.kind === 'bridge');
       sendReplyFile = canSendReplyFile && Buffer.byteLength(safeAssistantText) > TURN_REPLY_CARD_MAX_BYTES;
       const renderedAssistantText = sendReplyFile ? 'reply.md' : await prepareLocalReplyImages(ds, safeAssistantText, imageFallback, isStillOwned);

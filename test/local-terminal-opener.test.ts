@@ -140,6 +140,40 @@ describe('localCliCommandForSession', () => {
       vi.unstubAllEnvs();
     }
   });
+
+  it('resumes an AtomCode session via native atomcode resume command without acp- prefix', () => {
+    const result = localCliCommandForSession(session({
+      session: {
+        ...session().session,
+        cliId: 'atomcode',
+        cliPathOverride: '/bin/echo',
+        cliSessionId: 'acp-01a2182c-5933-72f2-8087-38b0469d1e05',
+      },
+    }));
+    expect(result).toEqual({
+      ok: true,
+      mode: 'resume',
+      executable: '/bin/echo',
+      command: "cd '/tmp/project with space' && exec '/bin/echo' resume '01a2182c-5933-72f2-8087-38b0469d1e05'",
+    });
+  });
+
+  it('falls back to launching atomcode binary when no cliSessionId exists yet', () => {
+    const result = localCliCommandForSession(session({
+      session: {
+        ...session().session,
+        cliId: 'atomcode',
+        cliPathOverride: '/bin/echo',
+        cliSessionId: undefined,
+      },
+    }));
+    expect(result).toEqual({
+      ok: true,
+      mode: 'launch',
+      executable: '/bin/echo',
+      command: "cd '/tmp/project with space' && exec '/bin/echo'",
+    });
+  });
 });
 
 describe('terminalLaunchArgs', () => {
