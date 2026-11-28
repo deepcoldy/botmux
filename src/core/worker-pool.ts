@@ -2,7 +2,7 @@ import { canonicalPathNearest } from './cli-identity.js';
 import { freezeBytedcliHostLayout } from './bytedcli-host-layout.js';
 import { bytecloudExportBlocked, persistBytedcliStrictSession, bytedcliStrictMarkerRoot } from './bytedcli-strict-session.js';
 import { markBytedcliStrictSession, acceptBytedcliWorkerContainment } from './bytedcli-broker-containment.js';
-import { deferBytedcliWorkerRetirement } from './bytedcli-worker-retirement.js';
+import { bytedcliWorkerRetirementPending, deferBytedcliWorkerRetirement } from './bytedcli-worker-retirement.js';
 import { NATIVE_GATEWAY_CORE_CREDENTIAL_ENV } from './native-gateway-credential.js';
 import { rememberCoreOnlyGoal, rememberCoreOnlyLimit } from './core-only-progress.js';
 import { ensureClaudeFolderTrust } from './claude-folder-trust.js';
@@ -21360,6 +21360,9 @@ export type ForkWorkerOptions = {
    * its backend exits before publishing the rebuilt backend state. */
   onRemoteBackendStartupExit?: () => boolean | Promise<boolean>;
   deferDuringDeviceIsolation?: boolean;
+  /** Internal: a strict replacement already reserved this successor generation
+   * before retiring the old broker generation. Never set from callers. */
+  bytedcliPreparedWorkerGeneration?: number;
   /**
    * Restore re-attach to a backing session probed alive: its CLI is already
    * running and will not be respawned, so a deleted working directory does not
@@ -21800,6 +21803,11 @@ export function forkWorker(
     opts.onAdmission?.('rejected');
     return false;
   }
+  if (opts.bytedcliPreparedWorkerGeneration !== undefined
+    && opts.bytedcliPreparedWorkerGeneration !== ds.workerGeneration) {
+    opts.onAdmission?.('rejected');
+    return true;
+  }
   // Preserve the original first external fork boundary before asynchronous DNS
   // freezing. Device activation must be able to defer a spawn without reading
   // live Bot/plugin configuration or starting any resolver work. The prepared
@@ -21812,7 +21820,7 @@ export function forkWorker(
   }
   if (deferWorkerSpawnDuringDeviceIsolation(ds.session.sessionId, () => {
     if (findActiveBySessionId(ds.session.sessionId) === ds) {
-      forkWorker(ds, promptInput, resumeOrTurnId, { memoryNoticeAudience: opts.memoryNoticeAudience });
+      forkWorker(ds, promptInput, resumeOrTurnId, opts);
     }
   })) {
     logger.info(`[${tag(ds)}] worker spawn deferred during device credential activation`);
@@ -21822,27 +21830,38 @@ export function forkWorker(
 
   const bot = getBot(ds.larkAppId);
   const previousGeneration = ds.workerGeneration;
-  const onWorkerGenerationRetired = requireCallbacks().onWorkerGenerationRetired;
-  if (deferBytedcliWorkerRetirement({
-    sessionId: ds.session.sessionId,
-    workerGeneration: previousGeneration,
-    strict: ds.session.bytecloudBrokerStrict === true || ds.initConfig?.bytedcliContainment !== undefined,
-    retire: onWorkerGenerationRetired && previousGeneration !== undefined
-      ? () => onWorkerGenerationRetired(ds.session, { workerGeneration: previousGeneration })
-      : undefined,
-    continue: () => {
-      if (findActiveBySessionId(ds.session.sessionId) === ds) forkWorker(ds, promptInput, resumeOrTurnId, opts);
-    },
-    fail: error => {
-      const reason = `ByteCloud broker generation retirement failed: ${error instanceof Error ? error.message : String(error)}`;
-      logger.error(`[${tag(ds)}] ${reason}`);
-      const { turnId, dispatchAttempt } = protectedHttpEgressForkTurn(resumeOrTurnId);
-      publishWorkerStartupDiagnostic(ds, sessionCliDisplayName(ds, bot.config), reason, turnId, dispatchAttempt, opts);
+  const strictReplacement = ds.session.bytecloudBrokerStrict === true || ds.initConfig?.bytedcliContainment !== undefined;
+  if (opts.bytedcliPreparedWorkerGeneration === undefined && strictReplacement && previousGeneration) {
+    if (bytedcliWorkerRetirementPending(ds.session.sessionId)) {
+      logger.info(`[${tag(ds)}] worker spawn refused while an earlier broker retirement is pending`);
       opts.onAdmission?.('rejected');
-    },
-  })) {
-    opts.onAdmission?.('deferred');
-    return true;
+      return true;
+    }
+    const onWorkerGenerationRetired = requireCallbacks().onWorkerGenerationRetired;
+    if (onWorkerGenerationRetired) {
+      const preparedWorkerGeneration = reserveWorkerGeneration(ds);
+      if (deferBytedcliWorkerRetirement({
+        sessionId: ds.session.sessionId,
+        workerGeneration: previousGeneration,
+        strict: true,
+        retire: () => onWorkerGenerationRetired(ds.session, { workerGeneration: previousGeneration }),
+        continue: () => {
+          if (findActiveBySessionId(ds.session.sessionId) === ds) {
+            forkWorker(ds, promptInput, resumeOrTurnId, { ...opts, bytedcliPreparedWorkerGeneration: preparedWorkerGeneration });
+          }
+        },
+        fail: error => {
+          const reason = `ByteCloud broker generation retirement failed: ${error instanceof Error ? error.message : String(error)}`;
+          logger.error(`[${tag(ds)}] ${reason}`);
+          const { turnId, dispatchAttempt } = protectedHttpEgressForkTurn(resumeOrTurnId);
+          publishWorkerStartupDiagnostic(ds, sessionCliDisplayName(ds, bot.config), reason, turnId, dispatchAttempt, opts);
+          opts.onAdmission?.('rejected');
+        },
+      })) {
+        opts.onAdmission?.('deferred');
+        return true;
+      }
+    }
   }
   if (ds.session.bytecloudBrokerStrict || bytecloudExportBlocked(config.session.dataDir, ds.session.sessionId, bot.config.triggerUserAuth)) {
     persistBytedcliStrictSession(config.session.dataDir, ds.session.sessionId);
@@ -22291,7 +22310,7 @@ function forkWorkerPrepared(
     if (findActiveBySessionId(ds.session.sessionId) === ds) {
       // Deliberately do not replay opts.deploymentContinuation: a deferred
       // device-isolation spawn cannot carry an earlier claim into a new owner.
-      forkWorker(ds, promptInput, resumeOrTurnId, { memoryNoticeAudience: opts.memoryNoticeAudience });
+      forkWorker(ds, promptInput, resumeOrTurnId, opts);
     }
   })) {
     logger.info(`[${tag(ds)}] worker spawn deferred during device credential activation`);
@@ -22998,7 +23017,8 @@ function forkWorkerPrepared(
   // Reserve and durably publish the replacement lifetime before killing an
   // existing worker. A failed reservation leaves the old worker untouched;
   // a successful reservation immediately invalidates any late old-worker ACK.
-  const workerGeneration = reserveWorkerGeneration(ds);
+  // Strict retirement already reserved this generation before its async cleanup.
+  const workerGeneration = opts.bytedcliPreparedWorkerGeneration ?? reserveWorkerGeneration(ds);
   const bytedcliLayout = ds.session.bytecloudBrokerStrict ? freezeBytedcliHostLayout() : undefined;
   const bytedcliContainment = bytedcliLayout ? {
     workerGeneration,

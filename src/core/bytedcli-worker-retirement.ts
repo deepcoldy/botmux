@@ -1,15 +1,18 @@
 interface PendingBytedcliWorkerRetirement {
   readonly generation: number;
   readonly continuation: () => void;
-  completed: boolean;
 }
 
 const retirements = new Map<string, PendingBytedcliWorkerRetirement>();
 
-/** Serialize a strict replacement behind cleanup of the exact previous broker
- * generation. Like device-isolation, only the first spawn is replayed; later
- * inputs stay in the session's normal pending-input machinery instead of
- * repeatedly killing the successor. */
+export function bytedcliWorkerRetirementPending(sessionId: string): boolean {
+  return retirements.has(sessionId);
+}
+
+/** Start one cleanup for a strict replacement. Callers reserve the successor
+ * generation BEFORE invoking this helper, so the old authority can never become
+ * admissible again after cleanup. A concurrent request is rejected by `fail`,
+ * never allowed to overwrite the pending cleanup. */
 export function deferBytedcliWorkerRetirement(input: {
   readonly sessionId: string;
   readonly workerGeneration?: number;
@@ -19,17 +22,15 @@ export function deferBytedcliWorkerRetirement(input: {
   readonly fail: (error: unknown) => void;
 }): boolean {
   if (!input.strict || !input.workerGeneration || !input.retire) return false;
-  const current = retirements.get(input.sessionId);
-  if (current?.generation === input.workerGeneration) {
-    if (!current.completed) return true;
-    retirements.delete(input.sessionId);
-    return false;
+  if (retirements.has(input.sessionId)) {
+    input.fail(new Error('ByteCloud broker retirement is already pending'));
+    return true;
   }
-  const gate: PendingBytedcliWorkerRetirement = { generation: input.workerGeneration, continuation: input.continue, completed: false };
+  const gate: PendingBytedcliWorkerRetirement = { generation: input.workerGeneration, continuation: input.continue };
   retirements.set(input.sessionId, gate);
   void Promise.resolve().then(input.retire).then(() => {
     if (retirements.get(input.sessionId) !== gate) return;
-    gate.completed = true;
+    retirements.delete(input.sessionId);
     try { gate.continuation(); } catch (error) { input.fail(error); }
   }, error => {
     if (retirements.get(input.sessionId) !== gate) return;
