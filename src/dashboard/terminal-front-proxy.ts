@@ -65,6 +65,9 @@ export interface TerminalFrontProxyOptions {
    * means logout/expiry already revoked it — the request is refused even
    * though the worker's stateless check would still accept the signature. */
   isAuthSessionLive?(authSessionId: string): boolean;
+  /** Native channel ACLs live in another process; recheck after the upstream
+   * handshake before exposing any response bytes. Omitted for legacy actors. */
+  revalidateAuthSession?(authSessionId: string): Promise<boolean>;
   /** P1-5: countersign an accepted view capability for the loopback hop. Only
    * emitted after liveness passed, so the header IS the statement "the
    * component holding the revocation state let this one through". Without it
@@ -316,8 +319,13 @@ export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
     req: IncomingMessage,
     res: ServerResponse,
     open: (onResponse: (up: IncomingMessage) => void) => ReturnType<typeof requestLiteralLoopback>,
+    authSessionId?: string,
   ): void => {
     const upstream = open(up => {
+      void (async () => {
+      if (authSessionId && options.revalidateAuthSession && !await options.revalidateAuthSession(authSessionId)) {
+        upstream.destroy(); up.destroy(); plainError(res, 403, 'authentication ended'); return;
+      }
       upstream.setTimeout(0);
       res.writeHead(up.statusCode ?? 502, up.headers);
       // P1-2：浏览器提前断开时把上游一起收掉。`up.pipe(res)` 在 dest 关闭时只做
@@ -326,6 +334,7 @@ export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
       // `ClientRequest.destroy()` 可重入；响应已自然写完的情况不必多此一举。
       res.on('close', () => { if (!res.writableEnded) upstream.destroy(); });
       up.pipe(res);
+      })().catch(() => { upstream.destroy(); up.destroy(); if (!res.headersSent) plainError(res, 403, 'authentication ended'); else res.end(); });
     });
     upstream.setTimeout(TERMINAL_UPSTREAM_RESPONSE_TIMEOUT_MS, () => upstream.destroy());
     upstream.on('error', () => {
@@ -354,7 +363,7 @@ export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
         { host: '127.0.0.1', port: plan.port },
         localOptions,
         onResponse,
-      ));
+      ), bridgeAuthSession(prepared));
       return true;
     }
     // Hold the body while the shared route store is consulted.
@@ -366,13 +375,13 @@ export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
           method: req.method,
           path: req.url,
           headers: terminalRemoteHeaders(req.headers),
-        }, onResponse));
+        }, onResponse), bridgeAuthSession(prepared));
       } else if (plan.fallbackPort) {
         pipeHttp(req, res, onResponse => requestLiteralLoopback(
           { host: '127.0.0.1', port: plan.fallbackPort! },
           localOptions,
           onResponse,
-        ));
+        ), bridgeAuthSession(prepared));
       } else {
         plainError(res, 404, 'session terminal not available');
         return;
@@ -417,6 +426,7 @@ export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
       upstreamRequest = upstream;
       upstream.setTimeout(TERMINAL_UPSTREAM_RESPONSE_TIMEOUT_MS, () => upstream.destroy());
       upstream.on('upgrade', (upRes, upstreamSocket, upstreamHead) => {
+      void (async () => {
       responded = true;
       bridgedSocket = upstreamSocket;
       upstream.setTimeout(0);
@@ -440,6 +450,9 @@ export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
       // now: we register first and the sweep closes us, or the sweep already
       // ran and this check refuses. There is no third order that leaks.
       const authSessionId = bridgeAuthSession(prepared);
+      if (authSessionId && options.revalidateAuthSession && !await options.revalidateAuthSession(authSessionId)) {
+        upstreamSocket.destroy(); socketError(clientSocket, 403, 'authentication ended'); return;
+      }
       if (authSessionId !== undefined && options.isAuthSessionLive?.(authSessionId) === false) {
         // Nothing is relayed: no 101, no registration, and the upstream socket
         // dies so the worker does not keep a half-open bridge either.
@@ -515,6 +528,7 @@ export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
       upstreamSocket.on('error', cleanup);
       upstreamSocket.on('close', () => { releaseOnDisconnect(); clientSocket.destroy(); });
       clientSocket.on('close', () => { releaseOnDisconnect(); upstreamSocket.destroy(); });
+      })().catch(() => { upstreamSocket.destroy(); socketError(clientSocket, 403, 'authentication ended'); });
       });
       upstream.on('response', upRes => {
       responded = true;

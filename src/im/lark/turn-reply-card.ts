@@ -1,8 +1,9 @@
 import type { BotConfig } from '../../bot-registry.js';
 import type { CotEntry } from '../../types.js';
+import { t } from '../../i18n/index.js';
 import { subjectFromArgsString } from '../../services/cot-subject.js';
 import {
-  replyCardIsTerminal, type ReplyCardTool, type TurnReplyCardRecord, type ReplyCardActivity,
+  collapseThinkingActivity, replyCardIsTerminal, type ReplyCardTool, type TurnReplyCardRecord, type ReplyCardActivity,
 } from '../../services/turn-reply-card.js';
 import { buildTurnReplyAskElements, turnReplyAskSummary } from './turn-reply-ask-elements.js';
 import { ASK_CARD_COLORS, ASK_CARD_ELEMENT_LIMIT, countCardElements } from './ask-card-look.js';
@@ -222,12 +223,20 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
     // can turn escaped fences into real ones and thereby hand back image syntax
     // that was inert when we scanned. Run the same normalization first so the
     // strip sees exactly the text the renderer will parse.
+    // A final delivered as a separate message (externalFinal) is delivery
+    // fact that overrides the worker's silence inference: with no progress
+    // text to show, render no body warning at all — neither the "no reply
+    // needed" receipt nor the "missing final answer" warning is honest once an
+    // answer is already visible in the chat.
+    const externallyDelivered = record.externalFinal === true;
     const content = record.displayRetired && record.progress.length === 0
       // Silent display retirement after external delivery/an earlier notice has
       // no warning body to add. Do not synthesise the generic "no final" prose.
       ? ''
       : latest
         ? stripCardMarkdownImages(prepareCardMarkdown(bounded(latest, 6000), presentation.workingDir, 'disabled'))
+        : terminal && externallyDelivered ? ''
+        : terminal && record.silentTurn ? t('worker.turn_terminal_receipt.silent_superseded', undefined, en ? 'en' : 'zh')
         : terminal ? (en ? 'No final answer was provided. See the turn record below.' : '本轮没有提供最终答复，可查看下方过程记录。')
           : (en ? 'Working on your request…' : '正在处理你的请求…');
     card.body.elements.push(...buildCardBodyElements(content, presentation.workingDir, 'disabled')
@@ -251,10 +260,13 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
       ).join('\n')) });
     }
   }
-  const activity: ReplyCardActivity[] = record.activity ?? [
+  // The stored activity is canonical and un-collapsed; blank filtering and
+  // per-stage thinking dedupe are display-only and also cover records written
+  // by older versions that already hold blank or repeated thinking.
+  const activity: ReplyCardActivity[] = collapseThinkingActivity(record.activity ?? [
     ...record.progress.map((text, i) => ({ kind: 'progress' as const, id: String(i), text })),
     ...record.tools.map(tool => ({ kind: 'tool' as const, id: tool.id })),
-  ];
+  ]);
   for (const item of activity) {
     if (item.kind === 'progress') {
       if (terminal || record.finalCard || record.progress.length > 1 || pendingAsks.length) process.push({ kind: 'text', content: `💬 ${narrationText(item.text)}` });

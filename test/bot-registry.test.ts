@@ -1841,11 +1841,28 @@ describe('loadBotConfigs — core-only synthesis (BOTMUX_CORE_ONLY=1)', () => {
     expect(cfg.backendType).toBe('pty');
   });
 
-  it('rejects an invalid core-only backend instead of falling back to tmux', () => {
+  it('applies every backend a native gateway may select for its core', async () => {
+    // The WeCom managed core validates its backend against CORE_ONLY_BACKENDS
+    // and passes the choice through BOTMUX_CORE_BACKEND.
+    const { CORE_ONLY_BACKENDS } = await import('../src/core/core-only-bot-profile.js');
     fsMock.existsSync.mockReturnValue(false);
     process.env.BOTMUX_CORE_ONLY = '1';
-    process.env.BOTMUX_CORE_BACKEND = 'zellij';
-    expect(() => mod.loadBotConfigs()).toThrow('BOTMUX_CORE_BACKEND must be tmux or pty');
+    for (const backend of CORE_ONLY_BACKENDS) {
+      process.env.BOTMUX_CORE_BACKEND = backend;
+      const [cfg] = mod.loadBotConfigs();
+      expect(cfg.backendType).toBe(backend);
+    }
+  });
+
+  it('rejects an invalid core-only backend instead of falling back to tmux', async () => {
+    const { CORE_ONLY_BACKENDS } = await import('../src/core/core-only-bot-profile.js');
+    fsMock.existsSync.mockReturnValue(false);
+    process.env.BOTMUX_CORE_ONLY = '1';
+    const nearMisses = CORE_ONLY_BACKENDS.flatMap(backend => [backend.toUpperCase(), ` ${backend}`]);
+    for (const backend of ['unknown', ...nearMisses]) {
+      process.env.BOTMUX_CORE_BACKEND = backend;
+      expect(() => mod.loadBotConfigs(), backend).toThrow(/BOTMUX_CORE_BACKEND/);
+    }
   });
 
   it('rejects a non-local_ synthetic id (identity must be a synthetic local slug)', () => {

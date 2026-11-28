@@ -1,4 +1,5 @@
 // Dashboard SPA entry: React chrome + lazy route host + SSE bootstrap.
+import { deploymentSupports, providerNavigationItems, useProviderRoster } from './provider-roster.js';
 import type React from 'react';
 import { createPortal } from 'react-dom';
 import { createRoot } from 'react-dom/client';
@@ -29,7 +30,8 @@ import {
 } from './route-lifecycle.js';
 import { maybeReloadBrowserForStaleRouteChunk } from './stale-chunk-reload.js';
 import { buildBotCards, loadGroupsSnapshot } from './overview.js';
-import { BOT_ONBOARDING_COMPLETED_EVENT, BotOnboardingDialog, OPEN_BOT_ONBOARDING_EVENT, openBotOnboarding } from './bot-onboarding.js';
+import { BOT_ONBOARDING_COMPLETED_EVENT, BotOnboardingCreateButton, BotOnboardingDialog, OPEN_BOT_ONBOARDING_EVENT, openBotOnboarding } from './bot-onboarding.js';
+import { startWecomRosterSync, type WecomRosterSync } from './wecom-roster-sync.js';
 import { requestOpenCreateSession } from './create-session-entry.js';
 import { InfoTip } from './dashboard-components.js';
 import { PLUGIN_PINS_CHANGED_EVENT } from './plugin-events.js';
@@ -168,6 +170,8 @@ let authStateKnown = false;
 /** 上一次探 /api/settings 的时间；登录态未知时唤起面板会再探，但至少间隔 AUTH_REPROBE_MS。 */
 let lastAuthProbeAt = 0;
 const AUTH_REPROBE_MS = 10_000;
+/** 企业微信名册同步；每次探明登录态之后告诉它一声（身份降级时清掉企业微信行）。 */
+let wecomRoster: WecomRosterSync | null = null;
 let publicReadOnly = false;
 let activeHash = location.hash || '#/';
 let ownerAvatar: OwnerAvatar | null = null;
@@ -214,7 +218,7 @@ function isActiveNav(item: NavItem, hash: string): boolean {
 
 function sidebarNavItems(): NavItem[] {
   const clientShell = readDashboardClientShell();
-  const builtInItems = NAV_ITEMS.filter(item => {
+  const builtInItems = providerNavigationItems(NAV_ITEMS).filter(item => {
     if (clientShell && item.id === 'workflows') return false;
     // 网页终端在 Desktop/Mobile 客户端壳里归原生会话面管（见 dashboardShellAllowsWebTerminal）。
     if (item.id === 'terminal') return !clientShell && ui.hostTerminal;
@@ -1408,6 +1412,9 @@ function TopbarVersionControl(props: {
 }
 
 function DashboardShell(): React.JSX.Element {
+  const providerRoster = useProviderRoster();
+  // 「创建会话」是飞书专属流程：已确认只有企业微信时侧栏和 ⌘K 都不放它。
+  const createSessionSupported = deploymentSupports('createSession', providerRoster);
   const statusSummary = dashboardStatusSummary();
   const [workspaceStore] = useState(() => createWorkspacePersonalizationStore());
   const [workspace, setWorkspace] = useState(workspaceStore.read);
@@ -1534,9 +1541,10 @@ function DashboardShell(): React.JSX.Element {
     pages: palette.open ? paletteNavPages() : [],
     manageDataReady: authStateKnown && isAuthed,
     setLocale,
+    larkCreateSupported: createSessionSupported,
     openCreateSession: requestOpenCreateSession,
     openCreateBot: openCreateBotFromPalette,
-  }), [palette.open, ui.locale, isAuthed, authStateKnown, pinnedPluginNavItems, pluginPageNavItems, ui.hostTerminal, decisionBoardNavVisible]);
+  }), [palette.open, ui.locale, isAuthed, authStateKnown, pinnedPluginNavItems, pluginPageNavItems, ui.hostTerminal, decisionBoardNavVisible, createSessionSupported]);
   if (workbenchSurface) {
     return (
       <>
@@ -1646,14 +1654,14 @@ function DashboardShell(): React.JSX.Element {
           <aside className="sidebar">
             {isAuthed ? (
               <div className="sidebar-create-actions">
-                <button type="button" className="sidebar-create-btn" onClick={() => requestOpenCreateSession()}>
+                {createSessionSupported ? <button type="button" className="sidebar-create-btn" onClick={() => requestOpenCreateSession()}>
                   {icon(<><path d="M2 3.5h12v7H6l-3 3v-3H2z" /><path d="M8 4.9v4.2M5.9 7h4.2" /></>)}
                   <span className="sidebar-nav-label">{t('nav.createSession')}</span>
-                </button>
-                <button type="button" className="sidebar-create-btn" onClick={() => void openBotOnboarding()}>
+                </button> : null}
+                <BotOnboardingCreateButton className="sidebar-create-btn">
                   {icon(<><rect x="2.5" y="6" width="11" height="7.5" rx="2" /><circle cx="5.8" cy="9.75" r="1" /><circle cx="10.2" cy="9.75" r="1" /><path d="M8 6V3.8M6.3 1.9h3.4" /></>)}
                   <span className="sidebar-nav-label">{t('nav.createBot')}</span>
-                </button>
+                </BotOnboardingCreateButton>
               </div>
             ) : null}
             <div className="sidebar-workspace-bar" data-workspace-mode={workspace.mode}>
@@ -1895,6 +1903,7 @@ async function loadAuthState(): Promise<void> {
       showAuthExpiredOverlay(loginUrl);
     }
   } catch { /* keep defaults */ }
+  wecomRoster?.onAuthStateLoaded();
   await capabilitiesProbe;
 }
 
@@ -2154,6 +2163,9 @@ void (async () => {
     applyLocale: applyShellLocaleFromHash,
     route: () => { void route(); },
   }));
+  // 企业微信名册跟着看板快照走：快照说有企业微信连接才拉企业微信名单（见 wecom-roster-sync.ts）。
+  const roster = startWecomRosterSync({ canRead: () => ui.authed, onUpdate: renderShell });
+  wecomRoster = roster;
   // Mount the selected page immediately. Its shell/skeleton and independent
   // Bot configuration reads must not wait for global session/schedule data.
   await runDashboardStartup({
@@ -2165,6 +2177,10 @@ void (async () => {
       // 401，别发这一跳。注意能力判断只影响「发不发请求」，会话快照的容错不
       // 依赖它对不对。
       canReadSchedules: () => ui.authed || ui.publicReadOnly,
+      // 企业微信会话只对本机管理身份可见：服务端有变化时只给这种身份的 /events 推提示帧，
+      // 收到才读一次（见 store.ts 的 readProviderSessions）；纯飞书部署收不到提示，不发这条请求。
+      canReadProviderSessions: () => ui.authed,
+      onSessionSnapshot: roster.onSessionSnapshot,
     }),
     afterNextPaint,
     optional: () => {

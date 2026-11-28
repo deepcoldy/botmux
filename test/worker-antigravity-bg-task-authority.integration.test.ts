@@ -230,8 +230,8 @@ setInterval(() => {}, 1_000);
     child.stdout?.on('data', chunk => logs.push(chunk.toString()));
     child.stderr?.on('data', chunk => logs.push(chunk.toString()));
 
-    // Default replyDelivery=send mode (promptInjection omitted -> 'default', adoptMode omitted -> false):
-    // structured bridge is INACTIVE for Antigravity in this mode.
+    // Default replyDelivery=send with ordinary prompt injection. The terminal
+    // transcript supplies the answer if the model did not send it explicitly.
     child.send({
       type: 'init',
       sessionId,
@@ -292,13 +292,16 @@ setInterval(() => {}, 1_000);
     writeFileSync(finishGate, 'done');
 
     await waitFor(
-      () => logs.join('').includes(`Released active turn authority ${turnId.slice(0, 12)} (prompt_ready)`),
+      () => logs.join('').includes(`Released active turn authority ${turnId.slice(0, 12)} (turn_terminal)`),
       logs,
     );
     await waitFor(
-      () => messages.slice(messageStartIndex).some(m => m.type === 'screen_update' && m.status === 'idle'),
+      () => messages.slice(messageStartIndex).some(m => m.type === 'screen_update' && m.status === 'idle')
+        && messages.slice(messageStartIndex).some(m => m.type === 'final_output' && m.turnId === turnId),
       logs,
     );
+    expect(messages.slice(messageStartIndex).filter(m => m.type === 'final_output' && m.turnId === turnId))
+      .toMatchObject([{ content: 'BOE 与 PPE 升级均已成功。' }]);
 
     // A second live turn exercises the mixed-batch collision in the same real
     // worker. The ordinary sibling remains RUNNING: no authority release,
@@ -335,7 +338,7 @@ setInterval(() => {}, 1_000);
     // final planner response projects idle.
     writeFileSync(mixedFinishGate, 'done');
     await waitFor(
-      () => logs.join('').slice(mixedLogStart).includes(`Released active turn authority ${mixedTurnId.slice(0, 12)} (prompt_ready)`),
+      () => logs.join('').slice(mixedLogStart).includes(`Released active turn authority ${mixedTurnId.slice(0, 12)} (turn_terminal)`),
       logs,
     );
     await waitFor(

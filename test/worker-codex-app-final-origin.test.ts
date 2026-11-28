@@ -11,7 +11,8 @@ import { TurnExecutionClock } from '../src/services/turn-execution-clock.js';
 import { TurnTerminalDeduper } from '../src/services/turn-terminal-deduper.js';
 import { CodexAppTurnDispatchQueue } from '../src/utils/codex-app-turn-dispatch.js';
 import { CodexAppTurnLiveness, CodexAppReadyAuthority, applyTrustedCodexAppStateMarker } from '../src/utils/codex-app-turn-liveness.js';
-import { runnerFinalOutcome } from '../src/services/runner-final-outcome.js';
+import { runnerFinalOutcome, appRunnerSilenceDisposition } from '../src/services/runner-final-outcome.js';
+import { isNativeGatewayCoreProcess } from '../src/core/runtime-mode.js';
 import { normalizeFinalUsage } from '../src/services/codex-app-runner-protocol.js';
 import { bridgePostText } from '../src/services/bridge-fallback-gate.js';
 import { committedCodexAppSequence } from '../src/utils/codex-app-dispatch-ledger.js';
@@ -60,7 +61,7 @@ function harness(reattached: boolean | 'native-recovery' = false, ordinary = fal
   const socket: any = { destroyed: false, write: vi.fn(), destroy: vi.fn(() => { socket.destroyed = true; }) };
   const env: any = { workerSessionEventScope: scope, sessionId: ref.sessionId, lastInitConfig: { cliId: 'codex-app', sessionId: ref.sessionId },
     codexAppTurnDispatchQueue: queue, codexAppCompletionAwaitingFinal: true, codexAppTurnLiveness: new CodexAppTurnLiveness(),
-    isCodexAppCliId, runnerFinalOutcome, normalizeFinalUsage, bridgePostText, randomBytes,
+    isCodexAppCliId, runnerFinalOutcome, appRunnerSilenceDisposition, isNativeGatewayCoreProcess, normalizeFinalUsage, bridgePostText, randomBytes,
     codexAppGenerationCommits: [], codexAppRecoveredDispatches: [], turnExecutionClock: new TurnExecutionClock(),
     codexAppPendingDaemonAcks: new Map(), CODEX_APP_DAEMON_PERSIST_TIMEOUT_MS: 30_000,
     closeRequested: false, frozenTurnLinkRefMode: () => undefined, isWorkflowWorker: () => false,

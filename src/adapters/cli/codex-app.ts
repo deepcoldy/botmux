@@ -6,6 +6,8 @@ import type { CliAdapter, PtyHandle } from './types.js';
 import { writeRunnerInput } from './runner-input.js';
 import { runnerArgv0 } from '../../core/self-spawn.js';
 import { resolveRunnerPath } from './runner-path.js';
+import { runnerIdentityArgs } from './shared-hints.js';
+import { isNativeGatewayCoreProcess } from '../../core/runtime-mode.js';
 import { readGlobalConfig } from '../../global-config.js';
 
 function pushOpt(args: string[], key: string, value: string | undefined): void {
@@ -56,7 +58,7 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
       return [(cachedCodexBin ??= resolveCommandReal(rawCodexBin))];
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, quietResume, workingDir, botName, groupJoinPrompt, groupJoinTitleBootstrap, botOpenId, locale, model, reasoningEffort, allowCodexReasoningCatalog, serviceTier, codexBrowser }) {
+    buildArgs({ sessionId, resume, resumeSessionId, quietResume, workingDir, botName, groupJoinPrompt, groupJoinTitleBootstrap, botOpenId, larkAppId, locale, model, reasoningEffort, allowCodexReasoningCatalog, serviceTier, codexBrowser }) {
       const args = [
         runnerArgv0('codex-app-runner', resolveRunnerPath('codex-app-runner.js', { testOverrideEnv: 'BOTMUX_TEST_CODEX_APP_RUNNER_PATH' })),
         '--session-id', sessionId,
@@ -67,8 +69,11 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
       if (resume && resumeSessionId) args.push('--thread-id', resumeSessionId);
       if (quietResume) args.push('--strict-resume');
       pushOpt(args, '--cwd', workingDir);
-      pushOpt(args, '--bot-name', botName);
-      pushOpt(args, '--bot-open-id', botOpenId);
+      // The runner renders these into the app's <identity> (runnerIdentityArgs).
+      args.push(...runnerIdentityArgs(botName, botOpenId, larkAppId));
+      // The runner is a CLI child and never sees the native gateway marker: tell
+      // it, so its instructions describe the channel gateway instead of Lark.
+      if (isNativeGatewayCoreProcess()) args.push('--native-gateway');
       pushOpt(args, '--locale', locale);
       pushOpt(args, '--group-join-prompt', groupJoinPrompt);
       pushOpt(args, '--group-join-title-digest', groupJoinTitleBootstrap?.digest);

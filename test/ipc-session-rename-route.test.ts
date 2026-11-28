@@ -82,18 +82,19 @@ function activeFor(
   } as any;
 }
 
-async function startAuthServer(): Promise<void> {
+async function startAuthServer(opts: { coreOnly?: boolean } = {}): Promise<void> {
   setIpcAuthSecret(SECRET);
-  handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+  handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true, coreOnlyPublicRoutes: opts.coreOnly === true });
 }
 
 function postRename(
   sessionId: string,
   body: Record<string, unknown>,
-  opts: { trustedHost?: boolean } = {},
+  opts: { trustedHost?: boolean; coreBoot?: string } = {},
 ): Promise<Response> {
   const path = `/api/sessions/${encodeURIComponent(sessionId)}/rename`;
   const headers: Record<string, string> = { 'content-type': 'application/json' };
+  if(opts.coreBoot)headers['x-botmux-expected-core-boot']=opts.coreBoot;
   if (opts.trustedHost) {
     const auth = daemonIpcAuthHeaders({ secret: SECRET, port: handle!.port, method: 'POST', path, headers });
     auth.forEach((value, key) => { headers[key] = value; });
@@ -106,6 +107,19 @@ function postRename(
 }
 
 describe('POST /api/sessions/:sessionId/rename — narrow capability aperture', () => {
+  it('keeps WeCom source-bound rename local while preserving ordinary core-only native sync', async () => {
+    const [a]=setupStore(),active=activeFor(a,CAP_A,{initConfig:{cliId:'codex',cliPathOverride:'/bin/codex',backendType:'tmux'}});
+    findSpy=vi.spyOn(workerPool,'findActiveBySessionId').mockReturnValue(active);
+    vi.stubEnv('BOTMUX_CORE_ONLY','1');
+    try {
+      await startAuthServer({ coreOnly: true });
+      const bound=await postRename(a.sessionId,{title:'local metadata',source:'dashboard'},{trustedHost:true,coreBoot:workerPool.getDaemonBootId()});
+      expect(bound.status).toBe(200);expect((await bound.json()).agentSync).toBe('not_running');expect(active.worker.send).not.toHaveBeenCalled();
+      const ordinary=await postRename(a.sessionId,{title:'ordinary core rename',source:'dashboard'},{trustedHost:true});
+      expect(ordinary.status).toBe(200);expect((await ordinary.json()).agentSync).toBe('requested');expect(active.worker.send).toHaveBeenCalledWith({type:'rename_session',title:'ordinary core rename'});
+    } finally {vi.unstubAllEnvs();}
+  });
+
   it('admits the current-turn capability of the URL session through the sandbox aperture', async () => {
     const [a] = setupStore();
     findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(

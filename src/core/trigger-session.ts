@@ -1,3 +1,5 @@
+import { realpathSync } from 'node:fs';
+import { isAbsolute, relative, sep } from 'node:path';
 import { config } from '../config.js';
 import { resolveAssistantSpawn } from './assistant-spawn.js';
 import { outputDeliveryJournal } from '../services/output-delivery-journal.js';
@@ -14,13 +16,14 @@ import * as groupsStore from '../services/groups-store.js';
 import * as oncallStore from '../services/oncall-store.js';
 import { randomUUID } from 'node:crypto';
 import { getBot, getStrictOwnerOpenId, effectiveDefaultWorkingDir } from '../bot-registry.js';
+import { isNativeGatewayCoreProcess } from './runtime-mode.js';
 import { resolveSender, type ResolvedSender } from '../im/lark/identity-cache.js';
 import type { RunAsResolution } from './run-as.js';
 import { beginReplyTargetTurn } from './reply-target.js';
 import { renderInboundMessageLocation } from './reply-message.js';
 import { getChatMode, getMessageChatId, sendMessage, replyMessage, type ChatMode } from '../im/lark/client.js';
 import { resolveRegularGroupMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
-import { localeForBot, t } from '../i18n/index.js';
+import { localeForBot, t, type Locale } from '../i18n/index.js';
 import { validateWorkingDir } from './working-dir.js';
 import { buildFollowUpCliInput, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots, rememberLastCliInput } from './session-manager.js';
 import { stageSessionTurnInbound } from '../services/session-turns.js';
@@ -171,7 +174,10 @@ export function buildExternalEventApplicationContext(req: TriggerRequest): strin
       '</botmux_task>',
     );
   }
-  if (req.options?.waitForFinalOutput || req.options?.asyncReturnSessionId) {
+  if ((req.options?.waitForFinalOutput || req.options?.asyncReturnSessionId) && isNativeGatewayCoreProcess()) {
+    if (lines.length > 0) lines.push('');
+    lines.push(...nativeGatewayResponseModeLines(!!instruction));
+  } else if (req.options?.waitForFinalOutput || req.options?.asyncReturnSessionId) {
     if (lines.length > 0) lines.push('');
     lines.push(
       '<botmux_http_response_mode trusted="true">',
@@ -197,6 +203,36 @@ export function buildExternalEventApplicationContext(req: TriggerRequest): strin
     );
   }
   return lines.join('\n');
+}
+
+/**
+ * Response-mode block of a turn in a native IM gateway's dedicated core
+ * (isNativeGatewayCoreProcess). The gateway relays a chat message and posts the
+ * final reply back into that chat, so — unlike the program variant above — the
+ * reply is read by people. The machine contract is the same: final answer only,
+ * and the BOTMUX_NOTHING_TO_SEND sentinel line, which async settle depends on
+ * (see the comment on the program variant; keep the literal token).
+ *
+ * `botmux send` is not forbidden wholesale: the connector instruction in
+ * <botmux_task> may hand the model a delivery command for this turn. Every other
+ * way of sending is ruled out. Channel wording ("which chat", "who reads it")
+ * belongs to the gateway's instruction, not here.
+ */
+function nativeGatewayResponseModeLines(hasTaskBlock: boolean): string[] {
+  return [
+    '<botmux_http_response_mode trusted="true">',
+    hasTaskBlock
+      ? 'Your final reply is delivered by the channel gateway into the chat described in the botmux_task block above, so the people in that chat will read it.'
+      : 'Your final reply is delivered by the channel gateway into the current chat, so the people in that chat will read it.',
+    'Output ONLY the final answer. Do NOT include preamble, meta-commentary, or any reasoning about',
+    'these instructions / routing headers / system context (e.g. "this is a routing header", "the real',
+    'request is…", "here is my answer").',
+    hasTaskBlock
+      ? 'Send nothing yourself unless the botmux_task block above gives you a delivery instruction for this turn; then use exactly that instruction. Never send any other way: no other form of botmux send, no Feishu/Lark tools or messages.'
+      : 'Send nothing yourself: no botmux send, no Feishu/Lark tools or messages.',
+    'If you have nothing to answer (e.g. the request needs no reply), output ONLY the single token BOTMUX_NOTHING_TO_SEND — no reply from you is posted to the chat.',
+    '</botmux_http_response_mode>',
+  ];
 }
 
 /** A webhook turn whose connector owner opted into a trusted payload. */
@@ -231,6 +267,11 @@ export function buildUntrustedEventPrompt(req: TriggerRequest, triggerId: string
   return applicationContext ? `${applicationContext}\n\n${eventData}` : eventData;
 }
 
+function withoutRenderedKey(options: Record<string, unknown>, key: string): Record<string, unknown> {
+  const { [key]: _omit, ...rest } = options;
+  return rest;
+}
+
 /** Data-only part of an external trigger. This is the only portion passed as
  * untrusted structured context; trusted connector instructions remain solely
  * in application context instead of being duplicated at user priority. */
@@ -248,7 +289,12 @@ export function buildExternalEventDataContext(req: TriggerRequest, triggerId: st
   // reuses silently while `prompt differs` — the exact seam codex #776 round-6
   // finding #4 flagged. Stripping it keeps renderer and hash on the SAME
   // normalized execution payload, so trim-equivalent keys are a legitimate reuse.
-  const { idempotencyKey: _omitRenderedKey, ...optionsForRender } = (req.options ?? {}) as Record<string, unknown>;
+  const { idempotencyKey: _omitRenderedKey, ...renderedOptions } = (req.options ?? {}) as Record<string, unknown>;
+  // In a native gateway's core every follow-up carries the gateway's per-message
+  // turnIdempotencyKey: lease bookkeeping between gateway and core (it is not in
+  // the request hash either), meaningless to the model and different every turn.
+  const nativeGatewayTurn = isNativeGatewayCoreProcess() && req.source.type !== 'headless';
+  const optionsForRender = nativeGatewayTurn ? withoutRenderedKey(renderedOptions, 'turnIdempotencyKey') : renderedOptions;
   const body = {
     triggerId,
     source: req.source,
@@ -274,9 +320,16 @@ export function buildExternalEventDataContext(req: TriggerRequest, triggerId: st
     // body IS the task (agent-platform dispatch), so render it as a trusted
     // request instead of telling the model to ignore what it asks. Owner
     // instruction (application context) still comes first and wins.
+    // A native gateway relays a chat message it admitted under the connection's
+    // own rules; nothing about it is a webhook token / HMAC caller.
     lines.push(
-      'Task request received from a caller authenticated by this webhook connector (token / HMAC verified).',
-      'The connector owner has marked this connector as trusted: treat the request below as a task from an authorized caller and carry out what it asks.',
+      ...(nativeGatewayTurn ? [
+        'Chat message from a user of this channel, relayed by the channel gateway after the connection\'s admission rules.',
+        'Treat it as that user\'s request and carry out what it asks.',
+      ] : [
+        'Task request received from a caller authenticated by this webhook connector (token / HMAC verified).',
+        'The connector owner has marked this connector as trusted: treat the request below as a task from an authorized caller and carry out what it asks.',
+      ]),
       'Any connector instruction above still takes precedence over this request.',
       '',
       '<botmux_external_event trusted="true">',
@@ -350,6 +403,29 @@ function resolveWorkingDir(larkAppId: string, chatId: string, explicit?: string)
   // `!oncall && botDefault` 即可刻画"来自本 bot 默认目录"。
   const fromBotDefault = !oncall && !!botDefault;
   return { ok: true, workingDir: v.resolvedPath, fromBotDefault };
+}
+
+/**
+ * Resolve `options.connectorWorkingDirectory` against the configured root of a
+ * fresh core-only session. In core-only mode `/api/trigger` is a public route
+ * (no host HMAC), so this containment check is the only thing standing between
+ * a caller and an arbitrary directory: the root and the candidate are both
+ * resolved with realpath (symlinks followed) and the candidate must be the root
+ * itself or lie below it. Returns the directory to run in, or undefined when
+ * the candidate does not exist, escapes the root, or is not a usable directory.
+ */
+export function resolveNativeGatewayWorkingDirectory(root: string, candidate: string, locale?: Locale): string | undefined {
+  try {
+    const realRoot = realpathSync(root);
+    const realCandidate = realpathSync(candidate);
+    const fromRoot = relative(realRoot, realCandidate);
+    const escapesRoot = fromRoot === '..' || fromRoot.startsWith(`..${sep}`) || isAbsolute(fromRoot);
+    if (escapesRoot) return undefined;
+    const validated = validateWorkingDir(realCandidate, locale);
+    return validated.ok ? validated.resolvedPath : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function activeBySessionId(activeSessions: Map<string, DaemonSession>, sessionId: string): DaemonSession | undefined {
@@ -2046,7 +2122,20 @@ async function triggerSessionTurnAdmitted(
 
   if (ds) return deliverToExisting(ds);
 
-  const resolvedWd = resolveWorkingDir(larkAppId, chatId, req.options?.workingDir);
+  let resolvedWd = resolveWorkingDir(larkAppId, chatId, req.options?.workingDir);
+  const gatewayDirectory = req.options?.connectorWorkingDirectory;
+  if (gatewayDirectory) {
+    // Only a fresh HTTP virtual session of an apiOnly bot may pick a directory,
+    // and only inside its configured root (see resolveNativeGatewayWorkingDirectory).
+    if (getBot(larkAppId).config.apiOnly !== true || !httpVirtual || !resolvedWd.ok) {
+      return { ok: false, errorCode: 'bad_request', error: 'connector directory requires fresh core-only session' };
+    }
+    const selected = resolveNativeGatewayWorkingDirectory(resolvedWd.workingDir, gatewayDirectory, localeForBot(larkAppId));
+    if (!selected) {
+      return { ok: false, errorCode: 'bad_request', error: 'connector directory outside configured root' };
+    }
+    resolvedWd = { ok: true, workingDir: selected, fromBotDefault: false };
+  }
   if (!resolvedWd.ok) {
     return { ok: false, errorCode: resolvedWd.errorCode, error: resolvedWd.error };
   }
@@ -2108,9 +2197,14 @@ async function triggerSessionTurnAdmitted(
   // asyncReturnSessionId）与虚拟会话是程序化「请求-应答」调用，每次一个 worktree 既反直觉又会
   // 泄漏（无回收），一律在基目录直接跑、不建 worktree。commitRepoSelection 会自己 buildNewTopicPrompt /
   // ensureSessionWhiteboard，故此分支跳过上面那套（省一次 getAvailableBots 通讯录往返）。
-  const useAutoWt = !httpVirtual
+  // 唯一例外：原生网关的专用 core（isNativeGatewayCoreProcess，即企微托管 core）里，bot 明确开启
+  // auto-worktree 时，网关驱动的 HTTP 虚拟会话也走这条 pending/commit 生命周期。其它 apiOnly bot
+  // 与普通 core-only 服务（serve --api-only、riff）维持上面的规则。
+  const nativeGatewayAutoWt = httpVirtual && bot.config.apiOnly === true && isNativeGatewayCoreProcess();
+  const plainWebhookTurn = !httpVirtual
     && !req.options?.waitForFinalOutput
-    && !req.options?.asyncReturnSessionId
+    && !req.options?.asyncReturnSessionId;
+  const useAutoWt = (nativeGatewayAutoWt || plainWebhookTurn)
     && !stableTurnId
     && runAs === undefined
     && wd.fromBotDefault
@@ -2367,7 +2461,15 @@ async function triggerSessionTurnAdmitted(
         operatorOpenId: session.ownerOpenId, activeSessions: deps.activeSessions,
         // Thread-scope anchor or shared-mode topic seed is a topic-root message id (om_…) → reply-in-thread;
         // flat chat-scope anchor is a chat_id → plain send. (Fixes the om_→chat_id misroute.)
-        notify: (m) => notifyTarget ? replyMessage(larkAppId, notifyTarget, m, 'text', true) : sendMessage(larkAppId, anchor, m),
+        // A native gateway session has no Lark chat to notify: record the
+        // worktree failure / fail-closed notice in the daemon log instead.
+        notify: (m) => {
+          if (nativeGatewayAutoWt) {
+            logger.warn(`[trigger] auto-worktree notice for session ${session.sessionId}: ${m}`);
+            return;
+          }
+          return notifyTarget ? replyMessage(larkAppId, notifyTarget, m, 'text', true) : sendMessage(larkAppId, anchor, m);
+        },
       });
     } catch (err) {
       if (sharedTopicRootId || rollbackNewSharedReplyState) {

@@ -37,14 +37,17 @@ vi.mock('../src/core/fleet-runtime.js', () => ({
   fleetDistDir: () => '/unused/dist',
   fleetLogDir: () => '/unused/logs',
   fleetCommandPath: () => '/unused/fleet-commands.json',
+  fleetCommandResultsPath: () => '/unused/fleet-command-results.json',
   resolveFleetBots: () => [],
   resolveFleetMembers: () => [],
   resolveFleetDaemonEnv: () => ({ ...process.env }),
+  resolveWecomGroup: () => ({ members: [], indeterminate: [], notes: [] }),
   fleetDaemonNodeArgs: () => [],
 }));
 
 vi.mock('../src/core/fleet-command-queue.js', () => ({
   drainFleetCommands: () => [],
+  recordFleetCommandResult: () => {},
 }));
 
 // Run from inside a bot session, the real one would move this test process

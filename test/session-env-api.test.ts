@@ -108,6 +108,67 @@ describe('views', () => {
   });
 });
 
+describe('machine-wide views without a fleet daemon', () => {
+  function providerHost(fleetConfigured: boolean, answer: () => Response | Promise<Response>) {
+    const requests: Array<{ path: string; init: RequestInit }> = [];
+    return {
+      requests,
+      host: {
+        fleetConfigured: () => fleetConfigured,
+        request: vi.fn(async (path: string, init: RequestInit) => { requests.push({ path, init }); return answer(); }),
+      },
+    };
+  }
+  const providerView = () => new Response(JSON.stringify({ ok: true, scope: 'global', rows: [{ key: 'FROM_PROVIDER' }] }),
+    { headers: { 'content-type': 'application/json' } });
+
+  it('keeps every fleet diagnostic when the fleet is configured: offline stays a 503 and nothing is delegated', async () => {
+    const provider = providerHost(true, providerView);
+    const d = deps({ canReveal: true, daemons: () => [], providerMachineHost: provider.host });
+
+    expect((await call(d, 'GET', '/api/session-env')).res).toMatchObject({ status: 503, body: { error: 'daemon_offline' } });
+    expect((await call(d, 'GET', '/api/session-env/reveal?key=A')).res).toMatchObject({ status: 503, body: { error: 'daemon_offline' } });
+    expect((await call(d, 'POST', '/api/session-env/tmux/remove')).res).toMatchObject({ status: 503, body: { error: 'daemon_offline' } });
+    expect(provider.requests).toHaveLength(0);
+  });
+
+  it('keeps a failing fleet daemon’s own status instead of the provider answer', async () => {
+    const provider = providerHost(false, providerView);
+    const failing = deps({
+      providerMachineHost: provider.host,
+      proxyToDaemon: vi.fn(async () => { throw new Error('connection refused'); }),
+    });
+    expect((await call(failing, 'GET', '/api/session-env')).res).toMatchObject({ status: 502, body: { error: 'bad_upstream' } });
+
+    const older = deps({
+      providerMachineHost: provider.host,
+      proxyToDaemon: vi.fn(async () => new Response(JSON.stringify({ error: 'not_found' }), { status: 404 })),
+    });
+    expect((await call(older, 'GET', '/api/session-env')).res).toMatchObject({ status: 404, body: { error: 'not_found' } });
+    expect(provider.requests).toHaveLength(0);
+  });
+
+  it('lets the provider core serve a host with no fleet configured', async () => {
+    const provider = providerHost(false, providerView);
+    const d = deps({ canReveal: true, daemons: () => [], providerMachineHost: provider.host });
+
+    const view = await call(d, 'GET', '/api/session-env');
+    expect(view.res).toMatchObject({ status: 200, body: { scope: 'global', rows: [{ key: 'FROM_PROVIDER' }], canReveal: true } });
+    await call(d, 'GET', '/api/session-env/reveal?key=A');
+    expect(provider.requests.map(r => r.path)).toEqual(['/api/session-env-global', '/api/session-env-global/reveal?key=A']);
+  });
+
+  it('reports an unavailable provider core exactly like no core at all', async () => {
+    const provider = providerHost(false, () => new Response(JSON.stringify({ ok: false, error: 'wecom_down' }), { status: 500 }));
+    const d = deps({ canReveal: true, daemons: () => [], providerMachineHost: provider.host });
+
+    expect((await call(d, 'GET', '/api/session-env')).res).toMatchObject({ status: 503, body: { ok: false, error: 'daemon_offline' } });
+    expect((await call(d, 'GET', '/api/session-env/reveal?key=A')).res).toMatchObject({ status: 503, body: { ok: false, error: 'daemon_offline' } });
+    expect((await call(d, 'POST', '/api/session-env/tmux/remove')).res).toMatchObject({ status: 503, body: { ok: false, error: 'daemon_offline' } });
+    expect(provider.requests).toHaveLength(3);
+  });
+});
+
 describe('global writes', () => {
   it('validates ops before touching config.json', async () => {
     const d = deps({ readJsonBody: vi.fn(async () => ({ ops: [{ op: 'unset', key: 'BOTMUX_SESSION_ID' }] })) });

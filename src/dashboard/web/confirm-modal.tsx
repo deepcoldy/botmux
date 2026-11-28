@@ -21,6 +21,8 @@ export interface ConfirmOptions {
   cancelLabel?: string;
   /** 强确认：输入文本与此值完全一致后确认按钮才可点击 */
   requireText?: string;
+  /** 撤回：signal 中止时这个弹窗从队列移除（展示中的随即关闭），按「取消」resolve false */
+  signal?: AbortSignal;
 }
 
 export interface PromptOptions {
@@ -52,9 +54,20 @@ function emit(): void {
 
 export function confirm(options: ConfirmOptions): Promise<boolean> {
   return new Promise<boolean>(resolve => {
-    queue = [...queue, { kind: 'confirm', options, resolve }];
+    if (options.signal?.aborted) { resolve(false); return; }
+    const item: PendingItem = { kind: 'confirm', options, resolve };
+    queue = [...queue, item];
+    options.signal?.addEventListener('abort', () => withdraw(item), { once: true });
     emit();
   });
+}
+
+function withdraw(item: PendingItem): void {
+  if (!queue.includes(item)) return;
+  queue = queue.filter(pending => pending !== item);
+  emit();
+  if (item.kind === 'prompt') item.resolve(null);
+  else item.resolve(false);
 }
 
 /**

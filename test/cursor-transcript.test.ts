@@ -4,6 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { cursorBridgeSpec } from '../src/adapters/cli/cursor.js';
 import {
   baselineCursorTranscript,
   drainCursorTranscript,
@@ -11,7 +12,7 @@ import {
   findCursorTranscriptByChatId,
 } from '../src/services/cursor-transcript.js';
 import { baselineJsonlCursor } from '../src/services/jsonl-cursor.js';
-import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
+import { CodexBridgeQueue, CURSOR_BUSY_REFRESH_MAX_MS, STRUCTURED_SUBMIT_START_GRACE_MS } from '../src/services/codex-bridge-queue.js';
 import { spawnSyncTsEvalWithRepoImports } from './helpers/ts-runner.js';
 
 let dir: string;
@@ -537,8 +538,21 @@ describe('baselineCursorTranscript', () => {
 });
 
 describe('cursor bridge attribution across footer rewrites (drain + CodexBridgeQueue)', () => {
+  const rawPtyContext = { adoptMode: false, state: undefined, backendType: 'pty' } as const;
+
   function emittedFinals(q: CodexBridgeQueue): string[] {
     return q.drainEmittable().map(t => `${t.turnId}:${t.finalText}`);
+  }
+
+  function ingestRawPty(q: CodexBridgeQueue): () => void {
+    let offset = 0;
+    let state: unknown;
+    return () => {
+      const result = cursorBridgeSpec.drain(path, offset, { ...rawPtyContext, state });
+      offset = result.newOffset;
+      state = result.state;
+      q.ingest(result.events);
+    };
   }
 
   it('zero-prompt fresh spawn: every turn starts and closes, not just the first', () => {
@@ -557,6 +571,195 @@ describe('cursor bridge attribution across footer rewrites (drain + CodexBridgeQ
       q.ingest(r.events);
       expect(emittedFinals(q)).toEqual([`${turnId}:${final}`]);
     }
+  });
+
+  it.each([
+    { lineEnding: 'LF', newline: '\n' },
+    { lineEnding: 'CRLF', newline: '\r\n' },
+  ])('attributes fresh raw-PTY input with soft-newline residue before $lineEnding', ({ newline }) => {
+    const q = new CodexBridgeQueue();
+    const starts: Array<[string, boolean | undefined]> = [];
+    q.setTurnStartObserver((turn, evidence) => starts.push([turn.turnId, evidence?.exactUserInputMatch]));
+
+    const routing = ['<botmux_routing>', 'Use the example project.', '</botmux_routing>', 'Summarize the README.'];
+    const command = ['Command:', 'printf example \\', '  more'];
+    const runtimeFooter = '<runtime_context>Use the current workspace.</runtime_context>';
+    const turns = [
+      { id: 'first', logical: routing, recorded: [`${routing[0]}\\`, routing[1], `${routing[2]}\\`, routing[3]] },
+      {
+        id: 'follow-up',
+        logical: command,
+        submitted: [...command, runtimeFooter],
+        recorded: [`${command[0]}\\`, `${command[1]}\\`, command[2], runtimeFooter],
+      },
+      { id: 'literal', logical: command, recorded: command },
+    ];
+    let offset = 0;
+    for (const { id, logical, submitted, recorded } of turns) {
+      const transcript = recorded.join(newline);
+      const final = `answer to ${id}`;
+      q.mark(id, logical.join('\n'), undefined, undefined, undefined, undefined, false, submitted?.join('\n'));
+      writeCursorTurn(path, turnBody(transcript, final));
+      const result = cursorBridgeSpec.drain(path, offset, rawPtyContext);
+      offset = result.newOffset;
+      expect(result.events[0]).toMatchObject({ kind: 'user', text: transcript });
+      q.ingest(result.events);
+      expect(emittedFinals(q)).toEqual([`${id}:${final}`]);
+    }
+    expect(starts).toEqual([['first', false], ['follow-up', false], ['literal', true]]);
+  });
+
+  it('does not attribute a raw-PTY record that only shares the pending prompt prefix after removing residue', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('pending', '<task>\nRead the example project and summarize the README.');
+    writeCursorTurn(path, turnBody('<task>\\\nRead the example project and summarize the changelog.', 'other answer'));
+    q.ingest(cursorBridgeSpec.drain(path, 0, rawPtyContext).events);
+    expect(q.peek()).toEqual([expect.objectContaining({ turnId: 'pending', started: false })]);
+    expect(emittedFinals(q)).toEqual([]);
+  });
+
+  it('does not replay an ambiguous raw-PTY record onto a later literal input after the head is dropped', () => {
+    const q = new CodexBridgeQueue();
+    const literal = '<task>\\\nRead the example project.';
+    q.mark('clean', '<task>\nRead the example project.');
+    q.mark('literal', literal);
+    let offset = 0;
+    let state: unknown;
+    const ingest = () => {
+      const result = cursorBridgeSpec.drain(path, offset, { ...rawPtyContext, state });
+      offset = result.newOffset;
+      state = result.state;
+      q.ingest(result.events);
+    };
+    writeFileSync(path, line(cursorUser(literal)));
+    ingest();
+    expect(q.peek().find(turn => turn.turnId === 'clean')).toMatchObject({ started: false });
+
+    expect(q.dropPendingTurn('clean')).toMatchObject({ turnId: 'clean' });
+    expect(q.peek()).toEqual([expect.objectContaining({ turnId: 'literal', started: false })]);
+
+    appendFileSync(path, line(assistantFinal('ambiguous answer')));
+    ingest();
+    appendFileSync(path, line(cursorUser(literal)));
+    ingest();
+    expect(q.peek()).toEqual([expect.objectContaining({ turnId: 'literal', started: true })]);
+    q.mark('new', 'Another unrelated question.');
+    expect(emittedFinals(q)).toEqual([]);
+
+    appendFileSync(path, line(assistantFinal('literal answer')));
+    ingest();
+    expect(emittedFinals(q)).toEqual(['literal:literal answer']);
+  });
+
+  it('does not bind a late raw-PTY record for a cancelled literal input to the clean successor', () => {
+    let now = Date.now();
+    const q = new CodexBridgeQueue(() => now);
+    const literal = '<task>\\\nRead the example project.';
+    const clean = '<task>\nRead the example project.';
+    q.mark('cancelled', literal);
+    q.mark('successor', clean);
+    expect(q.dropPendingTurn('cancelled')).toMatchObject({ turnId: 'cancelled' });
+    now += STRUCTURED_SUBMIT_START_GRACE_MS + 1;
+    q.refreshUnstartedHeadAttributionLease(now, CURSOR_BUSY_REFRESH_MAX_MS);
+    expect(q.pruneExpiredPreStartHeads()).toEqual([]);
+
+    writeCursorTurn(path, turnBody(literal, 'cancelled answer'));
+    const first = cursorBridgeSpec.drain(path, 0, rawPtyContext);
+    q.ingest(first.events);
+    expect(q.peek()).toEqual([expect.objectContaining({ turnId: 'successor', started: false })]);
+    expect(emittedFinals(q)).toEqual([]);
+
+    writeCursorTurn(path, turnBody(clean, 'successor answer'));
+    q.ingest(cursorBridgeSpec.drain(path, first.newOffset, rawPtyContext).events);
+    expect(emittedFinals(q)).toEqual(['successor:successor answer']);
+  });
+
+  it('does not reassign a buffered literal turn after its drop evidence expires', () => {
+    let now = Date.now();
+    const startedAt = now;
+    const q = new CodexBridgeQueue(() => now);
+    const ingest = ingestRawPty(q);
+    const literal = '<task>\\\nRead the example project.';
+    const clean = '<task>\nRead the example project.';
+    q.mark('unrelated', 'A completely unrelated head prompt.');
+    q.mark('cancelled', literal);
+    q.mark('successor', clean);
+    expect(q.dropPendingTurn('cancelled')).toMatchObject({ turnId: 'cancelled' });
+
+    now = startedAt + 1_000;
+    writeCursorTurn(path, turnBody(literal, 'buffered literal answer'));
+    ingest();
+    expect(emittedFinals(q)).toEqual([]);
+    expect(q.peek().map(turn => turn.turnId)).toEqual(['unrelated', 'successor']);
+
+    for (let elapsed = 20_000; elapsed <= CURSOR_BUSY_REFRESH_MAX_MS; elapsed += 20_000) {
+      now = startedAt + elapsed;
+      q.refreshUnstartedHeadAttributionLease(now, CURSOR_BUSY_REFRESH_MAX_MS);
+    }
+    now = startedAt + CURSOR_BUSY_REFRESH_MAX_MS + STRUCTURED_SUBMIT_START_GRACE_MS + 1;
+    const dropped = q.pruneExpiredPreStartHeads(now);
+    expect(emittedFinals(q)).toEqual([]);
+    expect(dropped.map(turn => turn.turnId)).toEqual(['unrelated', 'successor']);
+    expect(dropped.every(turn => !turn.started && turn.finalText === undefined)).toBe(true);
+    expect(q.peek()).toEqual([]);
+  });
+
+  it('does not reassign a buffered literal turn after its drop evidence is evicted', () => {
+    let now = Date.now();
+    const q = new CodexBridgeQueue(() => now);
+    const ingest = ingestRawPty(q);
+    const literal = '<task>\\\nRead the example project.';
+    const clean = '<task>\nRead the example project.';
+    q.mark('unrelated', 'A completely unrelated head prompt.');
+    q.mark('cancelled', literal);
+    q.mark('successor', clean);
+    for (let i = 0; i < 20; i++) q.mark(`other-${i}`, `Other pending prompt ${i}.`);
+    expect(q.dropPendingTurn('cancelled')).toMatchObject({ turnId: 'cancelled' });
+
+    now += 1_000;
+    writeCursorTurn(path, turnBody(literal, 'buffered literal answer'));
+    ingest();
+    expect(emittedFinals(q)).toEqual([]);
+    for (let i = 0; i < 20; i++) {
+      expect(q.dropPendingTurn(`other-${i}`)).toMatchObject({ turnId: `other-${i}` });
+      expect(emittedFinals(q)).toEqual([]);
+    }
+    expect(q.dropPendingTurn('unrelated')).toMatchObject({ turnId: 'unrelated' });
+    expect(emittedFinals(q)).toEqual([]);
+    expect(q.peek()).toEqual([expect.objectContaining({ turnId: 'successor', started: false })]);
+
+    writeCursorTurn(path, turnBody(clean, 'clean successor answer'));
+    ingest();
+    expect(emittedFinals(q)).toEqual(['successor:clean successor answer']);
+  });
+
+  it('allows a raw-exact literal retry after observing its cancelled predecessor conflict', () => {
+    const q = new CodexBridgeQueue();
+    const ingest = ingestRawPty(q);
+    const literal = '<task>\\\nRead the example project.';
+    q.mark('unrelated', 'A completely unrelated head prompt.');
+    q.mark('cancelled', literal);
+    expect(q.dropPendingTurn('cancelled')).toMatchObject({ turnId: 'cancelled' });
+    q.mark('retry', literal);
+
+    writeCursorTurn(path, turnBody(literal, 'literal retry answer'));
+    ingest();
+    expect(emittedFinals(q)).toEqual([]);
+    expect(q.dropPendingTurn('unrelated')).toMatchObject({ turnId: 'unrelated' });
+    expect(emittedFinals(q)).toEqual(['retry:literal retry answer']);
+  });
+
+  it.each([
+    { mode: 'tmux', adoptMode: false, state: undefined, backendType: 'tmux' },
+    { mode: 'adopted PTY', adoptMode: true, state: undefined, backendType: 'pty' },
+  ] as const)('keeps trailing backslashes significant in $mode input attribution', (context) => {
+    const q = new CodexBridgeQueue();
+    q.setLocalTurns(context.adoptMode);
+    q.mark('pending', '<task>\nRead the example project.');
+    writeCursorTurn(path, turnBody('<task>\\\nRead the example project.', 'local answer'));
+    q.ingest(cursorBridgeSpec.drain(path, 0, context).events);
+    expect(q.drainEmittable().map(turn => turn.isLocal)).toEqual(context.adoptMode ? [true] : []);
+    expect(q.peek()).toEqual([expect.objectContaining({ turnId: 'pending', started: false })]);
   });
 
   it('adopt baseline: history is not replayed and the first live turn is attributed', () => {

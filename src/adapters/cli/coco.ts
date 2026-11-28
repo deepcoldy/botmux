@@ -12,7 +12,7 @@ import { traexHistoryMatchDelta } from '../../services/traex-transcript.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import { installCocoAskPlugin } from '../coco-ask-plugin.js';
 import { traeMigrationDoneMarkers } from './traex.js';
-import type { CliAdapter, PtyHandle, StructuredBridgeSpec } from './types.js';
+import type { CliAdapter, CliModelDetectionOptions, PtyHandle, StructuredBridgeSpec } from './types.js';
 
 /** Legacy global submit log — CoCo / traecli <0.201.5 appends one JSON line
  *  here on every successful user submit across all sessions (mode:"user").
@@ -360,8 +360,12 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
     // 仅 dashboard 在用户选中 coco 时按需调用，不在 daemon/worker 启动路径上；
     // 任何异常（spawn 失败/超时/输出非法）一律 fail-soft 返回 null，picker
     // 回退到上面的 modelChoices。
-    async detectModels(): Promise<readonly string[] | null> {
-      return detectModelsViaExec(this.resolvedBin, ['debug', 'models'], parseDebugModelsJson);
+    // 命令始终按 login shell 解析（resolvedBin）。子进程环境默认沿用本进程；
+    // 只有调用方声明 isolatedEnv（为另行启动的 core 探测，如企微托管 core）
+    // 时才改用传入的 env，不让本进程的环境（含网关凭据）进探测子进程。
+    async detectModels(options?: CliModelDetectionOptions): Promise<readonly string[] | null> {
+      const env = options?.isolatedEnv ? options.env : undefined;
+      return detectModelsViaExec(this.resolvedBin, ['debug', 'models'], parseDebugModelsJson, env);
     },
   };
 }

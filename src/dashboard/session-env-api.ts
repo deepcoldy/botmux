@@ -21,6 +21,19 @@ import { parseEnvOps, type EnvOp } from '../core/session-env.js';
 export interface SessionEnvApiDeps {
   /** Local owner: may read raw values and edit tmux server env tables. */
   canReveal: boolean;
+  /**
+   * A provider-owned core on this host (the WeCom managed core) that can serve
+   * the machine-wide views when the host has no Feishu fleet at all. It is
+   * consulted only while no fleet daemon is online AND `fleetConfigured()` is
+   * false: a configured fleet that is stopped or failing keeps exactly its own
+   * diagnostics (503 / 502 / an older daemon's 404), and the provider core never
+   * reveals values or edits tmux server env on the fleet's behalf. Any answer
+   * other than 2xx is reported as `daemon_offline`, the same as without it.
+   */
+  providerMachineHost?: {
+    fleetConfigured(): boolean;
+    request(path: string, init: RequestInit): Promise<Response>;
+  };
   /** Online daemons (any one serves the machine-wide views). */
   daemons(): Array<{ larkAppId: string; botName: string; botIndex: number }>;
   proxyToDaemon(larkAppId: string, daemonPath: string, init: RequestInit): Promise<Response>;
@@ -55,6 +68,36 @@ function orderedDaemons(deps: SessionEnvApiDeps): Array<{ larkAppId: string; bot
   return [...deps.daemons()].sort((a, b) => a.botIndex - b.botIndex);
 }
 
+/** The provider core may answer only on a host with no fleet daemon online and
+ *  no fleet bot configured (see SessionEnvApiDeps.providerMachineHost). */
+function fleetlessProviderHost(deps: SessionEnvApiDeps): SessionEnvApiDeps['providerMachineHost'] {
+  const host = deps.providerMachineHost;
+  if (!host || orderedDaemons(deps).length > 0 || host.fleetConfigured()) return undefined;
+  return host;
+}
+
+/** A provider core's successful answer, or undefined (unavailable, non-2xx, or
+ *  not JSON) so the caller reports the ordinary offline diagnostic. */
+async function providerMachineAnswer(
+  deps: SessionEnvApiDeps,
+  path: string,
+  init: RequestInit,
+): Promise<{ status: number; text: string; contentType: string | null } | undefined> {
+  const host = fleetlessProviderHost(deps);
+  if (!host) return undefined;
+  try {
+    const upstream = await host.request(path, init);
+    if (!upstream.ok) return undefined;
+    return {
+      status: upstream.status,
+      text: await upstream.text(),
+      contentType: upstream.headers.get('content-type'),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
 /** The machine-wide view from the first daemon that serves it (an older
  *  daemon in a mixed-version fleet may not have the route yet). */
 async function machineView(path: string, deps: SessionEnvApiDeps): Promise<{ status: number; body: Record<string, unknown> }> {
@@ -69,7 +112,29 @@ async function machineView(path: string, deps: SessionEnvApiDeps): Promise<{ sta
       last = { status: 502, body: { ok: false, error: 'bad_upstream' } };
     }
   }
+  const provided = await providerMachineAnswer(deps, path, { method: 'GET' });
+  if (provided) {
+    try {
+      return { status: provided.status, body: JSON.parse(provided.text) as Record<string, unknown> };
+    } catch {
+      /* not a view: keep the offline diagnostic */
+    }
+  }
   return last;
+}
+
+/** No fleet daemon is online: let a fleetless host's provider core answer,
+ *  otherwise the original 503. */
+async function answerWithoutFleetDaemon(
+  res: ServerResponse,
+  deps: SessionEnvApiDeps,
+  path: string,
+  init: RequestInit,
+): Promise<void> {
+  const provided = await providerMachineAnswer(deps, path, init);
+  if (!provided) return deps.jsonRes(res, 503, { ok: false, error: 'daemon_offline' });
+  res.writeHead(provided.status, { 'content-type': provided.contentType ?? 'application/json' });
+  res.end(provided.text);
 }
 
 async function globalView(res: ServerResponse, deps: SessionEnvApiDeps): Promise<void> {
@@ -135,8 +200,12 @@ export async function handleSessionEnvRoute(
   if (url.pathname === '/api/session-env/reveal' && method === 'GET') {
     if (!deps.canReveal) { ownerOnly(); return true; }
     const primary = primaryDaemon(deps);
-    if (!primary) { deps.jsonRes(res, 503, { ok: false, error: 'daemon_offline' }); return true; }
-    await relay(res, await deps.proxyToDaemon(primary.larkAppId, `/api/session-env-global/reveal${url.search}`, { method: 'GET' }), deps);
+    const revealPath = `/api/session-env-global/reveal${url.search}`;
+    if (!primary) {
+      await answerWithoutFleetDaemon(res, deps, revealPath, { method: 'GET' });
+      return true;
+    }
+    await relay(res, await deps.proxyToDaemon(primary.larkAppId, revealPath, { method: 'GET' }), deps);
     return true;
   }
 
@@ -146,12 +215,16 @@ export async function handleSessionEnvRoute(
     try { body = await deps.readJsonBody(req); }
     catch { deps.jsonRes(res, 400, { ok: false, error: 'bad_json' }); return true; }
     const primary = primaryDaemon(deps);
-    if (!primary) { deps.jsonRes(res, 503, { ok: false, error: 'daemon_offline' }); return true; }
-    await relay(res, await deps.proxyToDaemon(primary.larkAppId, '/api/session-env-tmux/remove', {
+    const removeInit: RequestInit = {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body ?? {}),
-    }), deps);
+    };
+    if (!primary) {
+      await answerWithoutFleetDaemon(res, deps, '/api/session-env-tmux/remove', removeInit);
+      return true;
+    }
+    await relay(res, await deps.proxyToDaemon(primary.larkAppId, '/api/session-env-tmux/remove', removeInit), deps);
     return true;
   }
 

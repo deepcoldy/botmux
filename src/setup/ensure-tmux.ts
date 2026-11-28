@@ -28,6 +28,8 @@ import { detectPlatform, type PackageManager, type PlatformInfo } from './detect
 import { resolveTmuxSocketRoot, tmuxSocketPathIn } from '../adapters/backend/tmux-socket-root.js';
 import { managedTmuxBinDir, managedTmuxBinDirIfInstalled } from './tmux-managed-path.js';
 import {
+  CORE_ONLY_FROZEN_LOOPBACK_ENV,
+  inheritedFromCoreOnlyService,
   isBotmuxManagedTmuxEnvKey,
   isBotmuxManagedTmuxServerGlobalEnvKey,
   scrubTraeGitAttributionEnv,
@@ -394,6 +396,14 @@ export function tmuxEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv
   // Trae-started Botmux from seeding the broken attribution hook into every
   // later pane while preserving unrelated user Git config slots.
   scrubTraeGitAttributionEnv(cleaned, () => {});
+  // Likewise a core-only service's frozen loopback terminal host: on a shared
+  // server every later session, a Feishu one included, would inherit it. Only
+  // that exact value and only from such a service — a host a user exported keeps
+  // seeding the server as before.
+  const frozenHost = CORE_ONLY_FROZEN_LOOPBACK_ENV.WEB_EXTERNAL_HOST;
+  if (inheritedFromCoreOnlyService(env) && cleaned.WEB_EXTERNAL_HOST === frozenHost) {
+    delete cleaned.WEB_EXTERNAL_HOST;
+  }
   const rest: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(cleaned)) {
     // TMUX/TMUX_PANE would re-target a dead parent server; botmux-managed keys

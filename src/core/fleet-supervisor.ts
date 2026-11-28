@@ -19,7 +19,11 @@ import { join } from 'node:path';
 import { openRotatedAppendLog } from '../utils/log-rotate.js';
 import { isStandaloneBinary, resolveEntrySpawn, type BotmuxEntry } from './self-spawn.js';
 import { scrubExternalMemberEnv } from '../utils/child-env.js';
-import { isLinuxZombie, readDurableProcessIdentity } from '../utils/process-identity.js';
+import {
+  canFleetIdentityProvePidReuse,
+  isLinuxZombie,
+  readFleetDurableProcessIdentity,
+} from '../utils/process-identity.js';
 import { pidNotProvablyGone } from '../utils/process-alive.js';
 import {
   builtinFleetEntryMatches,
@@ -28,20 +32,71 @@ import {
   fleetProcessIdentityRuntime,
   signalAttestedFleetProcess,
   type FleetProcessIdentityRuntime,
+  type FleetProcessInspection,
 } from './fleet-process-identity.js';
 import {
   decideCrashExit,
+  decideExternalPolicyExit,
   freshProc,
   planStart,
   DEFAULT_RESTART_POLICY,
   FLEET_GRACEFUL_EXIT_CODE,
+  type ExternalRestartPolicy,
   type FleetProcState,
   type RestartPolicy,
   type ChildExit,
 } from './fleet-supervisor-policy.js';
 import { mutateFleetState, readFleetState } from './fleet-state-store.js';
-import type { FleetCommand } from './fleet-command-queue.js';
+import {
+  isFleetMemberCommandOp,
+  type FleetCommand,
+  type FleetCommandResult,
+  type FleetMemberCommandOp,
+} from './fleet-command-queue.js';
 import { FLEET_DAEMON_KILL_TIMEOUT_MS } from './shutdown-budgets.js';
+
+/**
+ * A set of members resolved from a source that can change while the supervisor
+ * runs (today: the WeCom connections and their desired state). Only group
+ * members are addressable by `start-member` / `stop-member`, and only they are
+ * added or removed by {@link FleetSupervisor.reconcileGroup}.
+ */
+export type FleetMemberGroup = 'wecom';
+
+export const FLEET_MEMBER_GROUPS: readonly FleetMemberGroup[] = ['wecom'];
+
+/**
+ * The recorded intent behind one group member (today: a WeCom connection's
+ * desired-state record), as of the resolution that carries it.
+ */
+export interface FleetMemberIntent {
+  desired: 'running' | 'stopped';
+  /** When it was recorded (epoch ms, the writer's wall clock). */
+  recordedAt: number;
+  /** Recorded by the member's own process (a stop it decided on itself), not by a person. */
+  automatic: boolean;
+}
+
+/** One fresh resolution of a group. */
+export interface FleetGroupResolution {
+  /** Members that should exist now (every spec carries `group` and `external`). */
+  members: readonly FleetBotSpec[];
+  /** Names whose source could not be read this time: neither started nor
+   *  removed by a reconcile, and still addressable by stop-member. */
+  indeterminate: readonly string[];
+  /** The recorded intent per member name, for a group that records one. A
+   *  start-member / stop-member is checked against it: an opposite intent
+   *  recorded after the command was enqueued wins (`superseded`). Absent → no
+   *  such check. */
+  intents?: ReadonlyMap<string, FleetMemberIntent>;
+  /** Members whose own process reports that it is shutting down: name → that
+   *  process's pid. start-member does not call such a member "already online". */
+  shuttingDown?: ReadonlyMap<string, number>;
+}
+
+export type FleetGroupReconcileResult =
+  | { status: 'skipped'; reason: string }
+  | { status: 'reconciled'; started: string[]; removed: string[]; updated: string[]; failed: string[] };
 
 export interface FleetBotSpec {
   /** botmux-<index> process name (or 'botmux-dashboard' for the dashboard). */
@@ -100,7 +155,12 @@ export interface FleetBotSpec {
     configHash?: string;
     autorestart?: boolean;
     killTimeoutMs?: number;
+    /** Opt-in per-member restart policy (see ExternalRestartPolicy). Absent →
+     *  the supervisor-wide policy, exactly as for every other member. */
+    restartPolicy?: ExternalRestartPolicy;
   };
+  /** Set on members of a re-resolvable group (see FleetMemberGroup). */
+  group?: FleetMemberGroup;
 }
 
 export interface FleetSupervisorOptions {
@@ -123,12 +183,63 @@ export interface FleetSupervisorOptions {
   log?: (msg: string) => void;
   /** Injected for process-identity edge-case tests. */
   processIdentityRuntime?: FleetProcessIdentityRuntime;
+  /** Fresh resolution of a member group, read on every start-member /
+   *  stop-member and group reconcile. May throw when the group's source cannot
+   *  be read; the operation is then refused and nothing is changed. Absent →
+   *  every member op is refused as unknown_member. */
+  resolveGroup?: (group: FleetMemberGroup) => FleetGroupResolution;
+  /** Receives the outcome of every start-member / stop-member. */
+  onMemberCommandResult?: (result: FleetCommandResult) => void;
+  /** Clock for an ExternalRestartPolicy's stable-run measurement (tests). */
+  now?: () => number;
 }
 
 /** True if a pid is alive (kill -0). pid<=1 is never a real supervised child. */
 export function pidAlive(pid: number): boolean {
   if (!Number.isSafeInteger(pid) || pid <= 1) return false;
   try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+// 只有时区稳定的身份格式才能证明 PID 复用；legacy macOS lstart 继续 fail-closed。
+function isRecycledPid(
+  proc: Pick<FleetProcState, 'pid' | 'processStart'>,
+  runtime: FleetProcessIdentityRuntime,
+): boolean {
+  if (!proc.processStart || !Number.isSafeInteger(proc.pid) || proc.pid <= 1
+    || !canFleetIdentityProvePidReuse(proc.processStart)) return false;
+  const current = runtime.readIdentity(proc.pid, proc.processStart);
+  return Boolean(current && canFleetIdentityProvePidReuse(current) && current !== proc.processStart);
+}
+
+/** Durable-retention predicate used by start()'s synchronous reconciliation. */
+export function shouldRetainFleetProcAtStart(
+  proc: Pick<FleetProcState, 'pid' | 'processStart' | 'status'>,
+  retention: { namedSpec: boolean; matchingSpec: boolean; ownedOrRetiring: boolean },
+  runtime: FleetProcessIdentityRuntime,
+): boolean {
+  return retention.namedSpec || (proc.pid > 1 && runtime.pidExists(proc.pid)
+    && !isRecycledPid(proc, runtime)
+    && (retention.matchingSpec || proc.status === 'launching' || retention.ownedOrRetiring));
+}
+
+/** Whether start() must turn an unowned live row into a stopped, pid=0 row. */
+export function shouldMarkFleetProcStoppedAtStart(
+  proc: Pick<FleetProcState, 'pid' | 'processStart' | 'status'>,
+  runtime: FleetProcessIdentityRuntime,
+): boolean {
+  return (proc.status === 'online' || (proc.status === 'launching' && proc.pid > 1))
+    && (!runtime.pidExists(proc.pid) || isRecycledPid(proc, runtime));
+}
+
+/** Removed live members remain blocked unless a stable identity proves reuse. */
+export function shouldBlockRemovedStaleProcess(
+  proc: Pick<FleetProcState, 'pid' | 'processStart'>,
+  inspection: FleetProcessInspection,
+  retireOnly: boolean,
+  runtime: FleetProcessIdentityRuntime,
+): boolean {
+  return retireOnly && inspection.status === 'stale' && runtime.pidExists(proc.pid)
+    && !isRecycledPid(proc, runtime);
 }
 
 export class FleetSupervisor {
@@ -146,15 +257,24 @@ export class FleetSupervisor {
   /** Bot specs known to this supervisor (from the last start() reconcile), so a
    *  queued start-bot/stop-bot can resolve a name→spec without re-reading config. */
   private readonly knownSpecs = new Map<string, FleetBotSpec>();
+  /** When the live generation of a member with an ExternalRestartPolicy was
+   *  spawned (this.now()), to tell a stable run from a crash loop on exit. */
+  private readonly policySpawnedAt = new Map<string, number>();
+  /** When this supervisor first ran start() (this.now()), just before it claimed
+   *  the fleet. A member op enqueued before then was meant for an earlier
+   *  supervisor and is never carried out by this one. */
+  private startedAtMs: number | undefined;
   private stopping = false;
   private readonly policy: RestartPolicy;
   private readonly killTimeoutMs: number;
   private readonly log: (msg: string) => void;
+  private readonly now: () => number;
 
   constructor(private readonly opts: FleetSupervisorOptions) {
     this.policy = opts.policy ?? DEFAULT_RESTART_POLICY;
     this.killTimeoutMs = opts.killTimeoutMs ?? FLEET_DAEMON_KILL_TIMEOUT_MS;
     this.log = opts.log ?? ((m) => console.error(`[fleet-supervisor] ${m}`));
+    this.now = opts.now ?? Date.now;
   }
 
   /** Process names can change after setup/clone. Keep an active daemon's name
@@ -181,6 +301,10 @@ export class FleetSupervisor {
    *  live, identity-verified supervisor: that one owns the fleet. */
   start(bots: readonly FleetBotSpec[]): boolean {
     const identityRuntime = this.opts.processIdentityRuntime ?? fleetProcessIdentityRuntime;
+    // Taken before the claim below: a CLI can only address this supervisor
+    // after reading that claim, so every member op meant for it is enqueued
+    // later than this.
+    this.startedAtMs ??= this.now();
     const owner = this.claimFleetOwnership(identityRuntime);
     if (owner !== undefined) {
       this.log(`fleet is owned by live supervisor pid ${owner}; not starting a second one`);
@@ -243,11 +367,13 @@ export class FleetSupervisor {
     mutateFleetState(this.opts.statePath, (cur) => {
       // Live aliases remain durable while retirement is pending or unverifiable.
       // Sending SIGTERM alone does not prove that a daemon has stopped.
-      cur.procs = cur.procs.filter(p => specByName.has(p.name)
-        || (p.pid > 1 && identityRuntime.pidExists(p.pid)
-          && (this.specForProc(p) || p.status === 'launching' || this.children.has(p.name) || this.orphanStops.has(p.name))));
+      cur.procs = cur.procs.filter(p => shouldRetainFleetProcAtStart(p, {
+        namedSpec: specByName.has(p.name),
+        matchingSpec: this.specForProc(p) !== undefined,
+        ownedOrRetiring: this.children.has(p.name) || this.orphanStops.has(p.name),
+      }, identityRuntime));
       for (const p of cur.procs) {
-        if (p.status === 'online' && !identityRuntime.pidExists(p.pid)) {
+        if (shouldMarkFleetProcStoppedAtStart(p, identityRuntime)) {
           p.pid = 0;
           p.status = 'stopped';
         } else if (p.pid > 1 && !this.children.has(p.name) && (this.specForProc(p) || this.orphanStops.has(p.name))) {
@@ -302,7 +428,7 @@ export class FleetSupervisor {
         : builtinFleetEntryMatches(spec.entry ?? 'daemon', command),
       runtime, /* removed members must re-prove their built-in command */ retireOnly);
     if (inspection.status === 'unverifiable') throw new Error(`cannot verify unowned ${proc.name} (pid ${proc.pid})`);
-    if (retireOnly && inspection.status === 'stale' && runtime.pidExists(proc.pid)) {
+    if (shouldBlockRemovedStaleProcess(proc, inspection, retireOnly, runtime)) {
       throw new Error(`cannot prove removed ${proc.name} (pid ${proc.pid}) is a botmux daemon`);
     }
     if (inspection.status === 'exact') {
@@ -482,9 +608,25 @@ export class FleetSupervisor {
 
   /** Drain + execute queued single-bot commands (SIGHUP handler). Each command is
    *  resolved to a spec (queue carries name/appId/botIndex, so no config re-read
-   *  is required) and applied via startOneBot/stopOneBot. */
+   *  is required) and applied via startOneBot/stopOneBot.
+   *
+   *  A member op (start-member / stop-member) takes a different route — see
+   *  applyMemberCommand — and its outcome goes to onMemberCommandResult. One
+   *  enqueued before this supervisor started (left behind by a supervisor that
+   *  died before draining it) is dropped with a log line and no outcome: its
+   *  caller has given up on it, and carrying it out now could undo an intent
+   *  recorded since. The start-bot / stop-bot handling below is unchanged by it. */
   async drainCommands(commands: readonly FleetCommand[]): Promise<void> {
     for (const cmd of commands) {
+      if (isFleetMemberCommandOp(cmd.op)) {
+        if (!this.enqueuedSinceStart(cmd)) {
+          this.log(`${cmd.op} ${cmd.name}: dropped, enqueued (${cmd.at || 'at an unknown time'}) before this supervisor started`);
+          continue;
+        }
+        const result = await this.applyMemberCommand({ ...cmd, op: cmd.op });
+        this.opts.onMemberCommandResult?.(result);
+        continue;
+      }
       // PREFER THE KNOWN SPEC over the command payload. The queue carries only
       // (name, appId, botIndex) — enough to respawn a bot daemon, but it cannot
       // describe an EXTERNAL member, whose command/args/cwd/env live in the spec.
@@ -521,6 +663,196 @@ export class FleetSupervisor {
     }
   }
 
+  /**
+   * Was this member op enqueued after this supervisor started? Strictly after:
+   * a command stamped in the very millisecond the start was taken is treated as
+   * older. Both times come from the host's wall clock (the CLI's `at`, this
+   * process's `now`). An `at` that cannot be read is never "after".
+   */
+  private enqueuedSinceStart(cmd: FleetCommand): boolean {
+    const enqueuedAt = Date.parse(cmd.at);
+    return this.startedAtMs !== undefined && Number.isFinite(enqueuedAt) && enqueuedAt > this.startedAtMs;
+  }
+
+  /**
+   * Carry out one start-member / stop-member.
+   *
+   * The group is resolved afresh for every command and the spec comes from that
+   * resolution only. The queue payload is never used to build a spec: it holds
+   * a name and nothing a command line could be derived from, and the fallback
+   * drainCommands applies to an unknown start-bot name (a daemon spec built from
+   * the payload) must not exist here — an unknown member name is refused.
+   *
+   * stop-member also accepts a group member this supervisor still holds but
+   * the fresh resolution no longer lists (its connection was just set to
+   * stopped or deleted), so stopping it cannot race the group reconcile.
+   *
+   * The newest intent wins: a stop-member is refused (`superseded`) when the
+   * resolution's intent for the member is `running` and was recorded at or
+   * after the command was enqueued, and a start-member likewise when it is a
+   * person's `stopped`. A tie counts as "after": the writers that set an intent
+   * and enqueue serialize on the fleet mutation lock, so a later command's
+   * intent is never older than an earlier command. A start-member for a member
+   * whose process is shutting itself down is refused as `member_stopping`
+   * rather than answered "already online".
+   */
+  private async applyMemberCommand(
+    cmd: FleetCommand & { op: FleetMemberCommandOp },
+  ): Promise<FleetCommandResult> {
+    const at = new Date(this.now()).toISOString();
+    const refuse = (
+      reason: Extract<FleetCommandResult, { ok: false }>['reason'],
+      message: string,
+    ): FleetCommandResult => {
+      this.log(`${cmd.op} ${cmd.name}: refused (${reason}) ${message}`);
+      return { id: cmd.id, op: cmd.op, name: cmd.name, ok: false, reason, message, at };
+    };
+    const done = (state: Extract<FleetCommandResult, { ok: true }>['state']): FleetCommandResult => {
+      this.log(`${cmd.op} ${cmd.name}: ${state}`);
+      return { id: cmd.id, op: cmd.op, name: cmd.name, ok: true, state, at };
+    };
+    if (this.stopping) return refuse('supervisor_stopping', 'the supervisor is shutting down');
+    if (!this.opts.resolveGroup) return refuse('unknown_member', 'no member group is configured');
+
+    let resolved: FleetBotSpec | undefined;
+    let indeterminate = false;
+    let intent: FleetMemberIntent | undefined;
+    let shuttingDownPid: number | undefined;
+    for (const group of FLEET_MEMBER_GROUPS) {
+      let resolution: FleetGroupResolution;
+      try {
+        resolution = this.opts.resolveGroup(group);
+      } catch (err) {
+        return refuse('resolve_failed', err instanceof Error ? err.message : String(err));
+      }
+      intent ??= resolution.intents?.get(cmd.name);
+      shuttingDownPid ??= resolution.shuttingDown?.get(cmd.name);
+      const spec = resolution.members.find(m => m.name === cmd.name && m.group === group && m.external);
+      if (spec) {
+        resolved = spec;
+        break;
+      }
+      if (resolution.indeterminate.includes(cmd.name)) {
+        indeterminate = true;
+        break;
+      }
+    }
+    // The intent, when it was recorded at or after this command was enqueued.
+    const enqueuedAt = Date.parse(cmd.at);
+    const newerIntent = intent !== undefined && intent.recordedAt >= enqueuedAt ? intent : undefined;
+
+    if (cmd.op === 'start-member') {
+      if (newerIntent?.desired === 'stopped' && !newerIntent.automatic) {
+        return refuse('superseded', 'a stop was recorded for this member after the command was enqueued');
+      }
+      if (!resolved) {
+        return refuse('unknown_member', indeterminate
+          ? 'the member\'s configuration cannot be read right now'
+          : 'not a member that is configured to run');
+      }
+      const proc = readFleetState(this.opts.statePath)?.procs.find(p => p.name === resolved.name);
+      const live = this.children.get(resolved.name);
+      const alreadyOnline = !!proc && proc.status === 'online' && pidAlive(proc.pid) && live !== undefined;
+      if (alreadyOnline && live.pid !== undefined && shuttingDownPid === live.pid) {
+        return refuse('member_stopping', `its process (pid ${live.pid}) is shutting down; nothing was started`);
+      }
+      this.startOneBot(resolved);
+      if (alreadyOnline) return done('already-online');
+      const child = this.children.get(resolved.name);
+      const ready = child ? this.spawnReady.get(child) : undefined;
+      if (!child || !ready) return refuse('spawn_failed', 'no child was spawned');
+      try {
+        await ready;
+      } catch (err) {
+        return refuse('spawn_failed', err instanceof Error ? err.message : String(err));
+      }
+      return done('started');
+    }
+
+    const known = this.knownSpecs.get(cmd.name);
+    const heldMember = known?.group !== undefined && FLEET_MEMBER_GROUPS.includes(known.group);
+    if (!resolved && !indeterminate && !heldMember) {
+      return refuse('unknown_member', 'not a member of any group');
+    }
+    if (newerIntent?.desired === 'running') {
+      return refuse('superseded', 'running was recorded for this member after the command was enqueued');
+    }
+    // A member the resolution lists but this supervisor never started is
+    // remembered first, so the group reconcile that follows this drain sees it
+    // as known (and stopped) instead of starting it as new.
+    if (resolved && !known) this.knownSpecs.set(resolved.name, resolved);
+    const wasRunning = this.children.has(cmd.name) || this.restartTimers.has(cmd.name);
+    try {
+      await this.stopOneBot(cmd.name);
+    } catch (err) {
+      return refuse('stop_failed', err instanceof Error ? err.message : String(err));
+    }
+    return done(wasRunning ? 'stopped' : 'already-stopped');
+  }
+
+  /**
+   * Bring one member group in line with a fresh resolution (SIGHUP, after the
+   * command queue was drained):
+   *  - a group member this supervisor holds that the resolution no longer lists
+   *    (and does not mark indeterminate) is stopped and removed, row included;
+   *  - a listed member this supervisor has never held is started;
+   *  - a listed member it already holds is NOT started or restarted, whatever
+   *    its state: one stopped through stop-member stays stopped, one parked
+   *    'errored' stays parked. Its spec is refreshed so its next start (crash
+   *    restart under an ExternalRestartPolicy, or start-member) uses it.
+   * A resolution that throws changes nothing: an unreadable source must never be
+   * read as "every member is gone".
+   */
+  async reconcileGroup(group: FleetMemberGroup): Promise<FleetGroupReconcileResult> {
+    if (this.stopping) return { status: 'skipped', reason: 'supervisor is shutting down' };
+    if (!this.opts.resolveGroup) return { status: 'skipped', reason: 'no resolver' };
+    let resolution: FleetGroupResolution;
+    try {
+      resolution = this.opts.resolveGroup(group);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      this.log(`reconcile ${group}: source unreadable, leaving every member as it is (${reason})`);
+      return { status: 'skipped', reason };
+    }
+    const wanted = new Map(resolution.members
+      .filter(m => m.group === group && m.external)
+      .map(m => [m.name, m] as const));
+    const indeterminate = new Set(resolution.indeterminate);
+    const started: string[] = [];
+    const removed: string[] = [];
+    const updated: string[] = [];
+    const failed: string[] = [];
+
+    const held = [...this.knownSpecs.values()].filter(spec => spec.group === group);
+    for (const spec of held) {
+      if (wanted.has(spec.name) || indeterminate.has(spec.name)) continue;
+      if (this.stopping) break;
+      try {
+        await this.removeExternal(spec.name);
+        removed.push(spec.name);
+        this.log(`reconcile ${group}: removed ${spec.name}`);
+      } catch (err) {
+        failed.push(spec.name);
+        this.log(`reconcile ${group}: could not remove ${spec.name}: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+    for (const [name, spec] of wanted) {
+      if (this.stopping) break;
+      const known = this.knownSpecs.get(name);
+      if (!known) {
+        this.startOneBot(spec);
+        started.push(name);
+        this.log(`reconcile ${group}: started ${name}`);
+        continue;
+      }
+      if (JSON.stringify(known) !== JSON.stringify(spec)) {
+        this.knownSpecs.set(name, spec);
+        updated.push(name);
+      }
+    }
+    return { status: 'reconciled', started, removed, updated, failed };
+  }
+
   private spawnBot(spec: FleetBotSpec, isRestart: boolean): void {
     if (this.stopping) return;
     // A full reconcile may remove/reassign this member while retirement waits.
@@ -529,7 +861,7 @@ export class FleetSupervisor {
     const unowned = (readFleetState(this.opts.statePath)?.procs ?? []).filter(p =>
       (p.name === spec.name
         || (!spec.external && (spec.entry ?? 'daemon') === 'daemon' && spec.appId && p.appId === spec.appId))
-      && p.pid > 1 && runtime.pidExists(p.pid) && !this.children.has(p.name));
+      && p.pid > 1 && runtime.pidExists(p.pid) && !isRecycledPid(p, runtime) && !this.children.has(p.name));
     if (unowned.length > 0) {
       if (unowned.some(p => this.orphanStops.has(p.name))) {
         // The same cancellable start slot covers recovery and crash backoff.
@@ -681,16 +1013,17 @@ export class FleetSupervisor {
         // "running and current". Only external members have one.
         if (spec.external?.configHash !== undefined) existing.configHash = spec.external.configHash;
         else delete existing.configHash;
-        if (child.pid) existing.processStart = readDurableProcessIdentity(child.pid);
+        if (child.pid) existing.processStart = readFleetDurableProcessIdentity(child.pid);
       } else {
         cur.procs.push({ ...freshProc(spec.name, spec.appId, child.pid ?? 0, now, spec.external?.configHash) });
-        if (child.pid) cur.procs[cur.procs.length - 1].processStart = readDurableProcessIdentity(child.pid);
+        if (child.pid) cur.procs[cur.procs.length - 1].processStart = readFleetDurableProcessIdentity(child.pid);
       }
       return cur;
     }).procs.find((p) => p.name === spec.name)!.generation;
 
     this.children.set(spec.name, child);
     this.liveGeneration.set(spec.name, generation);
+    if (spec.external?.restartPolicy) this.policySpawnedAt.set(spec.name, this.now());
     this.log(`${isRestart ? 'restarted' : 'started'} ${spec.name} (pid ${child.pid}, gen ${generation})`);
 
     child.on('exit', (code, signal) => this.onChildExit(spec, generation, { code, signal }));
@@ -722,6 +1055,12 @@ export class FleetSupervisor {
     const current = readFleetState(this.opts.statePath)?.procs.find((p) => p.name === spec.name);
     if (spec.external?.autorestart === false) {
       this.markStopped(spec.name, exit, 'stopped');
+      return;
+    }
+    // A member that brought its own restart policy is decided by it; every
+    // other member continues below on the supervisor-wide policy, unchanged.
+    if (spec.external?.restartPolicy) {
+      this.onPolicyMemberExit(spec, spec.external.restartPolicy, exit, current?.restarts ?? 0);
       return;
     }
     // The 90 sentinel is honoured ONLY for stops this supervisor itself
@@ -764,6 +1103,53 @@ export class FleetSupervisor {
     this.restartTimers.set(spec.name, timer);
   }
 
+  /**
+   * Unsolicited exit of a member with an ExternalRestartPolicy (operator and
+   * fleet stops were handled before this point, exactly as for every member).
+   * A no-restart exit code parks the member 'errored'; anything else restarts
+   * it after an exponential backoff (not the supervisor-wide cooldown). A generation
+   * that stayed up for stableRunMs starts a new streak.
+   *
+   * The respawn uses the spec this supervisor holds at that moment — a group
+   * reconcile may have refreshed it since this generation was spawned.
+   */
+  private onPolicyMemberExit(
+    spec: FleetBotSpec,
+    policy: ExternalRestartPolicy,
+    exit: ChildExit,
+    restarts: number,
+  ): void {
+    const spawnedAt = this.policySpawnedAt.get(spec.name);
+    const ranMs = spawnedAt === undefined ? 0 : this.now() - spawnedAt;
+    const decision = decideExternalPolicyExit({ restarts, ranMs }, exit, policy);
+    if (decision.action === 'park') {
+      this.log(`${spec.name} exited with no-restart code ${exit.code}; parking errored`);
+      this.markStopped(spec.name, exit, 'errored');
+      return;
+    }
+    mutateFleetState(this.opts.statePath, (cur) => {
+      const p = cur.procs.find((x) => x.name === spec.name);
+      if (p) {
+        p.restarts = decision.nextRestarts;
+        p.status = 'launching';
+        p.pid = 0;
+        p.lastExitCode = exit.code;
+      }
+      return cur;
+    });
+    this.log(
+      `${spec.name} exited (code=${exit.code} signal=${exit.signal}); `
+      + `restart ${decision.nextRestarts} in ${decision.delayMs}ms`,
+    );
+    // Ref'd for the same reason as the supervisor-wide restart timer: it may be
+    // the only handle keeping the supervisor's event loop alive.
+    const timer = setTimeout(() => {
+      this.restartTimers.delete(spec.name);
+      this.spawnBot(this.knownSpecs.get(spec.name) ?? spec, true);
+    }, decision.delayMs);
+    this.restartTimers.set(spec.name, timer);
+  }
+
   private markStopped(name: string, exit: ChildExit, status: 'stopped' | 'errored'): void {
     mutateFleetState(this.opts.statePath, (cur) => {
       const p = cur.procs.find((x) => x.name === name);
@@ -788,13 +1174,14 @@ export class FleetSupervisor {
     // Reflect the stop in the durable record. onChildExit ignored these exits
     // (stopping=true), so without this the state file would keep the now-dead
     // pids as 'online'. Clear supervisorPid too: this supervisor is exiting.
+    const identityRuntime = this.opts.processIdentityRuntime ?? fleetProcessIdentityRuntime;
     mutateFleetState(this.opts.statePath, (cur) => {
       for (const p of cur.procs) {
         // Unverifiable or failed orphan retirement must survive shutdown for the
         // next supervisor/operator; do not turn a live PID into a stopped row.
         // pid=0 is a pending retry, not an orphan; kill(0, 0) probes our group.
         if (p.pid > 1 && !pending.some(([name]) => name === p.name)
-          && (this.opts.processIdentityRuntime ?? fleetProcessIdentityRuntime).pidExists(p.pid)) continue;
+          && identityRuntime.pidExists(p.pid) && !isRecycledPid(p, identityRuntime)) continue;
         if (p.status === 'online' || p.status === 'launching') { p.status = 'stopped'; p.pid = 0; }
       }
       cur.supervisorPid = 0;

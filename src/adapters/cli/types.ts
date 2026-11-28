@@ -3,6 +3,7 @@ import type { TriggerUserAuthConfig } from '../../services/trigger-user-auth.js'
 import type { CodexServiceTier } from '../../services/codex-service-tier.js';
 import type { DebugModelCapabilities } from './model-catalog-json.js';
 import type { BackgroundTaskSignals, CodexBridgeEvent } from '../../services/codex-transcript.js';
+import type { BackendType } from '../backend/types.js';
 
 export interface PtyHandle {
   /** `false` means the backend rejected the write before it could confirm
@@ -205,6 +206,7 @@ export interface CliLaunchNotice {
   minVersion: string;
 }
 
+/** Options for {@link CliAdapter.detectModels}. */
 export interface CliModelDetectionOptions {
   /** Effective process environment after inheritance and configured overlays. */
   env?: NodeJS.ProcessEnv;
@@ -213,6 +215,13 @@ export interface CliModelDetectionOptions {
   /** Claude only: false forbids falling back to the caller's implicit ~/.claude.
    *  An explicit configDir remains allowed. Defaults to true for daemon probes. */
   allowImplicitConfigRoot?: boolean;
+  /** `env` belongs to a separately launched core rather than this process:
+   *  the probe must run in it and inherit nothing from here. Set by the model
+   *  catalog when its caller probes for such a core (the WeCom Dashboard
+   *  configuration for its managed core). Adapters whose established probe
+   *  runs in this process's own environment switch to `env` only when this
+   *  is set; adapters that already use `env` may ignore it. */
+  isolatedEnv?: boolean;
 }
 
 export interface CliAdapter {
@@ -1390,13 +1399,14 @@ export interface StructuredBridgeDrainContext {
   /** Terminal `/adopt`: the drainer must post transcript text verbatim (no
    *  synthesised bare-sentinel). */
   adoptMode: boolean;
+  /** Effective backend used to submit the session's input. */
+  backendType?: BackendType;
   /** `state` returned by the previous drain; undefined right after attach/detach. */
   state: unknown;
   /** Release a provisionally held trailing final (drivers that hold one). */
   flushTrailingFinal?: boolean;
-  /** Retire a whole conversation: later explicit inputs abandon earlier pending
-   *  turns instead of confirming their waiting narration (Antigravity only). */
-  retirePendingTurns?: boolean;
+  /** Candidate observed by a quiet viewport probe (Antigravity only). */
+  expectedTrailingFinal?: { uuid: string; offset: number };
   /** Number of turns the ATTRIBUTION QUEUE currently holds as started with no
    *  terminal yet, measured by the worker immediately before the drain.
    *  Drivers whose user and final records live in SEPARATE files (doubao:
@@ -1453,7 +1463,7 @@ export interface StructuredBridgeSpec {
   readonly stateCommit?: 'drain' | 'ingest';
   /** Transcript discovery. Lookups by session id are tried before pid. */
   readonly locate: {
-    bySessionId(sessionId: string, cwd?: string): string | undefined;
+    bySessionId(sessionId: string, cwd?: string, nativeSessionDir?: string): string | undefined;
     /** Absent for drivers addressed only by id (oh-my-pi, ebsd). */
     byPid?(pid: number): string | undefined;
   };

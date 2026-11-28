@@ -1,3 +1,5 @@
+import { CORE_ONLY_BACKENDS, validateCoreOnlyBotProfile } from './core/core-only-bot-profile.js';
+import { coreOnlyBotProfileJson, isCoreOnlyEnv } from './core/runtime-mode.js';
 import { normalizeCustomModels } from './core/model-value-pattern.js';
 import { normalizeOwnerGroupFollowConfig, type OwnerGroupFollowConfig } from './services/owner-group-follow-policy.js';
 import { validateSessionGroupCollaborationConfig, type SessionGroupCollaborationConfig } from './services/collab-group-config.js';
@@ -2984,22 +2986,7 @@ export function registerBot(cfg: BotConfig): BotState {
     getTurnResultRuntime()?.clearBot(cfg.larkAppId);
   }
   registerCodexInstanceBot(cfg);
-  const parsedStatus = parsedNativeSubagentRuntimeStatus.get(cfg);
-  const normalizedRuntime = cfg.cliId === 'traex'
-    ? normalizeNativeSubagentRuntimePolicy(cfg.nativeSubagentRuntime)
-    : { ok: true as const, value: undefined };
-  const nativeSubagentRuntimeState: NativeSubagentRuntimeConfigState =
-    parsedStatus === 'invalid' && cfg.nativeSubagentRuntime === undefined
-      ? { status: 'invalid' }
-      : !normalizedRuntime.ok
-        ? { status: 'invalid' }
-        : normalizedRuntime.value
-          ? { status: 'valid', policy: normalizedRuntime.value }
-          : { status: 'absent' };
-  parsedNativeSubagentRuntimeStatus.set(cfg, nativeSubagentRuntimeState.status);
-  cfg.nativeSubagentRuntime = nativeSubagentRuntimeState.status === 'valid'
-    ? nativeSubagentRuntimeState.policy
-    : undefined;
+  const nativeSubagentRuntimeState = settleNativeSubagentRuntimeState(cfg);
   // apiOnly (core-only) bots have NO Feishu credential (empty appSecret). The Lark
   // SDK Client ctor throws "appSecret or clientAssertionProvider is required" on an
   // empty secret, so constructing it would fatal the whole daemon at boot — the
@@ -3045,6 +3032,65 @@ export function registerBot(cfg: BotConfig): BotState {
   }
   bots.set(cfg.larkAppId, state);
   return state;
+}
+
+/** The registry's view of `cfg.nativeSubagentRuntime`: normalizes the field in
+ * place and records the parser outcome (registerBot and
+ * replaceCoreOnlyBotConfig share it). */
+function settleNativeSubagentRuntimeState(cfg: BotConfig): NativeSubagentRuntimeConfigState {
+  const parsedStatus = parsedNativeSubagentRuntimeStatus.get(cfg);
+  const normalizedRuntime = cfg.cliId === 'traex'
+    ? normalizeNativeSubagentRuntimePolicy(cfg.nativeSubagentRuntime)
+    : { ok: true as const, value: undefined };
+  const nativeSubagentRuntimeState: NativeSubagentRuntimeConfigState =
+    parsedStatus === 'invalid' && cfg.nativeSubagentRuntime === undefined
+      ? { status: 'invalid' }
+      : !normalizedRuntime.ok
+        ? { status: 'invalid' }
+        : normalizedRuntime.value
+          ? { status: 'valid', policy: normalizedRuntime.value }
+          : { status: 'absent' };
+  parsedNativeSubagentRuntimeStatus.set(cfg, nativeSubagentRuntimeState.status);
+  cfg.nativeSubagentRuntime = nativeSubagentRuntimeState.status === 'valid'
+    ? nativeSubagentRuntimeState.policy
+    : undefined;
+  return nativeSubagentRuntimeState;
+}
+
+/**
+ * Replace the settings of a registered synthetic core-only bot with `next` (a
+ * config {@link synthesizeCoreOnlyBotConfig} produced), the way a core started
+ * on `next` would register it. The config object keeps its identity — every
+ * holder of `getBot(id).config` (daemon closures, the codex instance roster)
+ * sees the new values — like the in-memory side of applyConfigField: values
+ * are assigned, keys `next` lacks are deleted. Sessions already running keep
+ * what they froze at launch; new ones read the new values.
+ *
+ * Identity never changes here: `next` must be the same apiOnly bot. Everything
+ * that can throw runs before the first write, so a rejected `next` leaves the
+ * registry exactly as it was.
+ */
+export function replaceCoreOnlyBotConfig(larkAppId: string, next: BotConfig): void {
+  const bot = getBot(larkAppId);
+  if (next.larkAppId !== larkAppId || next.apiOnly !== true || bot.config.apiOnly !== true) {
+    throw new Error('core-only bot config replacement must keep the same apiOnly bot');
+  }
+  normalizeCodexInstancePool(next.codexInstancePool, next);
+  const target = bot.config as unknown as Record<string, unknown>;
+  const source = next as unknown as Record<string, unknown>;
+  const parsedStatus = parsedNativeSubagentRuntimeStatus.get(next);
+  for (const key of Object.keys(target)) {
+    if (!Object.hasOwn(source, key)) delete target[key];
+  }
+  Object.assign(target, source);
+  if (parsedStatus) parsedNativeSubagentRuntimeStatus.set(bot.config, parsedStatus);
+  else parsedNativeSubagentRuntimeStatus.delete(bot.config);
+  // The rest of what registerBot derives from a config: apiOnly keeps the Lark
+  // clients null and turn results cleared; allowedUsers is not a core profile
+  // setting, so the resolved lists stay as they are.
+  getTurnResultRuntime()?.clearBot(larkAppId);
+  registerCodexInstanceBot(bot.config);
+  bot.nativeSubagentRuntimeState = settleNativeSubagentRuntimeState(bot.config);
 }
 
 /** Publish the persisted native-subagent policy and its diagnostic metadata as
@@ -3668,29 +3714,47 @@ export function loadBotConfigs(): BotConfig[] {
  * path (even though the file is absent/ignored) so the no-transport fs-policy sees
  * the config as living INSIDE the default botmux authority root — never an external
  * path or a carve-out, which would trip buildFsPolicy's fail-closed checks.
+ *
+ * `env` is the environment synthesized from: the process's own, except when a
+ * native gateway core validates a candidate profile before committing it
+ * (core/native-gateway-core-profile.ts), which hands a copy carrying the
+ * candidate values.
  */
-function maybeSynthesizeCoreOnlyConfig(): BotConfig[] | null {
-  if (process.env.BOTMUX_CORE_ONLY !== '1') return null;
+function maybeSynthesizeCoreOnlyConfig(env: NodeJS.ProcessEnv = process.env): BotConfig[] | null {
+  if (!isCoreOnlyEnv(env)) return null;
 
-  const larkAppId = process.env.BOTMUX_API_ONLY_BOT || 'local_riff';
+  const larkAppId = env.BOTMUX_API_ONLY_BOT || 'local_riff';
   if (!/^local_[A-Za-z0-9._-]+$/.test(larkAppId)) {
     throw new Error(
       `Core-only BOTMUX_API_ONLY_BOT must match local_<slug> (letters/digits/._-), got: ${larkAppId}`,
     );
   }
-  const cliId = process.env.BOTMUX_CORE_CLI || 'codex-app';
-  const entry: Record<string, unknown> = { larkAppId, apiOnly: true, cliId };
-  if (process.env.BOTMUX_CORE_WORKING_DIR) entry.workingDir = process.env.BOTMUX_CORE_WORKING_DIR;
-  // Core-only keeps tmux as the default. PTY is an explicit opt-in for embedded
-  // hosts that cannot establish a reliable tmux server; it is intentionally
-  // limited to this synthetic apiOnly Bot and never changes fleet defaults.
-  const coreBackend = process.env.BOTMUX_CORE_BACKEND;
-  if (coreBackend !== undefined && coreBackend !== 'tmux' && coreBackend !== 'pty') {
-    throw new Error(`Core-only BOTMUX_CORE_BACKEND must be tmux or pty, got: ${coreBackend}`);
+  const cliId = env.BOTMUX_CORE_CLI || 'codex-app';
+  // Host-supplied transport-neutral profile (the native gateway's managed core
+  // passes it; any core-only host may). Identity fields below are applied after
+  // it, so the profile can never override larkAppId / apiOnly / cliId.
+  const profileJson = coreOnlyBotProfileJson(env);
+  const profile = profileJson ? validateCoreOnlyBotProfile(JSON.parse(profileJson)) : {};
+  const entry: Record<string, unknown> = {
+    ...profile,
+    larkAppId,
+    apiOnly: true,
+    cliId,
+    ...(profile.customPassthroughCommands ? { tuiSlashAllow: profile.customPassthroughCommands } : {}),
+  };
+  if (env.BOTMUX_CORE_WORKING_DIR) entry.workingDir = env.BOTMUX_CORE_WORKING_DIR;
+  // Core-only keeps tmux as the default. A host may select any backend in
+  // CORE_ONLY_BACKENDS (the WeCom managed core offers that same list in its
+  // configuration and passes the choice here); anything else fails instead of
+  // falling back. The choice is limited to this synthetic apiOnly Bot and never
+  // changes fleet defaults.
+  const coreBackend = env.BOTMUX_CORE_BACKEND;
+  if (coreBackend !== undefined && !(CORE_ONLY_BACKENDS as readonly string[]).includes(coreBackend)) {
+    throw new Error(`Core-only BOTMUX_CORE_BACKEND must be a supported session backend, got: ${coreBackend}`);
   }
   if (coreBackend) entry.backendType = coreBackend;
-  if (process.env.BOTMUX_CORE_MODEL) entry.model = process.env.BOTMUX_CORE_MODEL;
-  if (process.env.BOTMUX_CORE_CODEX_AUTH_SYNC === 'isolated') entry.codexAuthSync = 'isolated';
+  if (env.BOTMUX_CORE_MODEL) entry.model = env.BOTMUX_CORE_MODEL;
+  if (env.BOTMUX_CORE_CODEX_AUTH_SYNC === 'isolated') entry.codexAuthSync = 'isolated';
   // Route through the normal parser so the synthesized entry gets identical
   // validation + normalization as a file-loaded one (apiOnly secret exemption,
   // cliId check, defaults). Pin loadedConfigPath to the default in-root path.
@@ -3702,6 +3766,17 @@ function maybeSynthesizeCoreOnlyConfig(): BotConfig[] | null {
   // the fs-policy still gets the in-root path it needs.
   loadedConfigProvenance = 'synthetic';
   return configs;
+}
+
+/**
+ * The single synthetic bot a core-only service started on `env` would run —
+ * the same synthesis as {@link loadBotConfigs}, for a candidate environment.
+ * Throws when `env` is not a core-only one or its settings are invalid.
+ */
+export function synthesizeCoreOnlyBotConfig(env: NodeJS.ProcessEnv): BotConfig {
+  const configs = maybeSynthesizeCoreOnlyConfig(env);
+  if (!configs || configs.length !== 1) throw new Error('not a core-only environment');
+  return configs[0]!;
 }
 
 function resolveBotConfigPath(): string {

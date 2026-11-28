@@ -4,7 +4,11 @@ import { mkdirSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { askKeyFor } from './ask-persist-store.js';
-import type { AskResult, CreateAskInput } from './ask-types.js';
+import {
+  nativeGatewayExecutionEndedResult,
+  type AskResult,
+  type CreateAskInput,
+} from './ask-types.js';
 
 export interface ExplicitAskReceipt {
   version: 1;
@@ -47,9 +51,23 @@ function orderedJson(value: unknown): unknown {
 }
 
 function sameExplicitInvocation(left: CreateAskInput, right: CreateAskInput): boolean {
-  const { replyCardTarget: leftTarget, backendSurvivesRestart: leftBackend, ...leftIdentity } = left;
-  const { replyCardTarget: rightTarget, backendSurvivesRestart: rightBackend, ...rightIdentity } = right;
+  const { replyCardTarget: leftTarget, backendSurvivesRestart: leftBackend, nativeGatewayOrigin: leftOrigin, ...leftIdentity } = left;
+  const { replyCardTarget: rightTarget, backendSurvivesRestart: rightBackend, nativeGatewayOrigin: rightOrigin, ...rightIdentity } = right;
+  // Which execution a native gateway ask was asked in is not part of the CLI
+  // invocation: the same call may reconnect while a later execution is live,
+  // and must then get its own receipt's result, not an identity conflict.
+  if ((leftOrigin === undefined) !== (rightOrigin === undefined)) return false;
   return JSON.stringify(orderedJson(leftIdentity)) === JSON.stringify(orderedJson(rightIdentity));
+}
+
+/** A receipt of a native gateway ask (native gateway core). That ask lived only as
+ * long as the exact HTTP turn execution that asked; a native gateway core runs
+ * no turn the gateway did not start. So such a receipt is never re-sent and
+ * never turned into a recovery turn: once no wait for it runs in this process,
+ * it records the broker's held result or, failing that, is closed as ended
+ * (see settleUnheldNativeGatewayReceipt). */
+function isNativeGatewayReceipt(receipt: ExplicitAskReceipt): boolean {
+  return receipt.input.nativeGatewayOrigin !== undefined;
 }
 
 export async function waitForExplicitAskResult(
@@ -72,7 +90,9 @@ export async function waitForExplicitAskResult(
 
 /** Explicit asks have a daemon-owned claimant, independent of the waiting CLI.
  * Keep terminal receipts until acknowledged or durably dispatched to the SAME
- * session. A stable turn key makes a lost dispatch response safe to retry. */
+ * session. A stable turn key makes a lost dispatch response safe to retry.
+ * Native gateway receipts are the exception: never re-sent, never dispatched (see
+ * isNativeGatewayReceipt). */
 export function createExplicitAskContinuation(deps: {
   dir: string;
   appId: string;
@@ -114,15 +134,34 @@ export function createExplicitAskContinuation(deps: {
     .update(askKeyFor(input.larkAppId, input.sessionId, 'host_explicit', input.requestId!)).digest('hex');
   const pathFor = (key: string) => join(deps.dir, `${key}.json`);
   const read = (key: string): ExplicitAskReceipt | undefined => {
-    try { return JSON.parse(readFileSync(pathFor(key), 'utf8')); }
+    let receipt: ExplicitAskReceipt | undefined;
+    try { receipt = JSON.parse(readFileSync(pathFor(key), 'utf8')); }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
       return undefined;
     }
+    return receipt;
   };
   const write = (key: string, receipt: ExplicitAskReceipt) => {
     mkdirSync(deps.dir, { recursive: true, mode: 0o700 });
     atomicWriteFileSync(pathFor(key), JSON.stringify(receipt), { mode: 0o600, durable: true });
+  };
+  /** Settle a native gateway receipt that has no result and no running wait in this
+   * process. A terminal result the broker still holds for the same call (its
+   * receipt write failed earlier) is the real outcome and is recorded as is.
+   * Otherwise the ask is gone with its execution (the daemon restarted), and
+   * the receipt is closed with the result the daemon gives a waiter that
+   * reconnects after its turn ended. Never re-sent, never recovered. */
+  const settleUnheldNativeGatewayReceipt = (key: string, receipt: ExplicitAskReceipt): AskResult => {
+    const held = deps.snapshot?.(receipt.input)?.result;
+    if (held) {
+      write(key, withCard({ ...receipt, result: held, settledAt: now() }));
+      deps.releaseHandoff?.(receipt.input);
+      return held;
+    }
+    const result = nativeGatewayExecutionEndedResult();
+    write(key, { ...receipt, result, settledAt: now() });
+    return result;
   };
   function describe(control: Omit<ExplicitAskControl, 'origin'>): ExplicitAskReceipt {
     const key = keyFor(control);
@@ -197,6 +236,9 @@ export function createExplicitAskContinuation(deps: {
       }
       return joined;
     }
+    if (original && isNativeGatewayReceipt(original)) {
+      return Promise.resolve(settleUnheldNativeGatewayReceipt(key, original));
+    }
     if (original && deps.hasHandoff && !deps.hasHandoff(input)) {
       const result = handoffMissing();
       write(key, { ...original, result, settledAt: now() });
@@ -242,10 +284,18 @@ export function createExplicitAskContinuation(deps: {
           // A durable result makes the broker handoff redundant; this also
           // finishes a release interrupted after the receipt write.
           if (receipt.result) deps.releaseHandoff?.(receipt.input);
-          if (receipt.acknowledged || receipt.delivered || receipt.retirement && receipt.result?.kind === 'invalidated') {
+          // A settled native gateway receipt is final: kept only to answer a late
+          // reconnect of the same call, never recovered into a new turn.
+          const nativeGatewaySettled = isNativeGatewayReceipt(receipt) && receipt.result !== undefined;
+          if (receipt.acknowledged || receipt.delivered || receipt.retirement && receipt.result?.kind === 'invalidated'
+            || nativeGatewaySettled) {
             // A retirement recorded on an old settled decision restarts retention.
             const retainedSince = Math.max(receipt.settledAt ?? 0, receipt.retirement?.requestedAt ?? 0);
             if (now() - retainedSince >= CONSUMED_RECEIPT_RETENTION_MS) rmSync(pathFor(key), { force: true });
+            continue;
+          }
+          if (!receipt.result && isNativeGatewayReceipt(receipt) && !running.has(key)) {
+            settleUnheldNativeGatewayReceipt(key, receipt);
             continue;
           }
           if (!receipt.result) {
@@ -305,7 +355,17 @@ export function createExplicitAskContinuation(deps: {
     } catch (error) { deps.onError(error); }
     finally { sweeping = false; }
   }
-  return { wait, acknowledge, sweep, describe, inspect, retire };
+  /** The terminal result already recorded for this exact invocation, if any,
+   * whichever execution is live now (the execution a native gateway ask was asked in
+   * is not part of the invocation). Never registers or re-sends anything. */
+  function recordedResult(input: CreateAskInput & { requestId: string }): AskResult | undefined {
+    const receipt = read(keyFor(input));
+    if (!receipt?.result) return undefined;
+    const { nativeGatewayOrigin: _recordedOrigin, ...recorded } = receipt.input;
+    const { nativeGatewayOrigin: _claimedOrigin, ...claimed } = input;
+    return sameExplicitInvocation(recorded, claimed) ? receipt.result : undefined;
+  }
+  return { wait, acknowledge, sweep, describe, inspect, retire, recordedResult };
 }
 
 /** Whether the live session still owns an explicit Ask's routing binding. The

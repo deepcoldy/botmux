@@ -1,3 +1,5 @@
+import { deploymentSupports, useProviderRoster } from './provider-roster.js';
+import { providerBotKey } from './providers/registry.js';
 import type React from 'react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
@@ -14,7 +16,7 @@ import {
   stripMentionPrefix,
   ui,
 } from './ui.js';
-import { buildBotCards, hasLoadedGroupsSnapshot, loadGroupsSnapshot, type BotCard } from './overview.js';
+import { buildBotCards, hasLoadedGroupsSnapshot, loadGroupsSnapshot, loadWecomConnectionsSnapshot, type BotCard } from './overview.js';
 import { BOT_ONBOARDING_COMPLETED_EVENT, openBotOnboarding } from './bot-onboarding.js';
 import { store } from './store.js';
 import { requestOpenCreateSession } from './create-session-entry.js';
@@ -367,7 +369,12 @@ export function shouldShowZeroBotOnboardingBanner(input: {
     && input.configuredBotCount === 0;
 }
 
-function OverviewPage() {
+/** 有企业微信连接时，总览刷新企业微信卡片连接状态的间隔（连接状态不走 `/events`）。 */
+const WECOM_CONNECTIONS_REFRESH_MS = 5_000;
+
+export function OverviewPage() {
+  const roster = useProviderRoster();
+  const { hasWecomBots } = roster;
   const tr = useT();
   const teamRef = useRef<HTMLDivElement | null>(null);
   const [teamExpanded, setTeamExpanded] = useState(readTeamExpanded);
@@ -447,6 +454,21 @@ function OverviewPage() {
     };
   }, []);
 
+  // 只在确实有企业微信连接时轮询那份很小的连接名单；飞书名称快照（数百 KB）不跟着重拉，
+  // 纯飞书部署的总览不多发任何请求。
+  useEffect(() => {
+    if (!hasWecomBots) return;
+    // 名册刚变成「有企业微信」时名单可能是别处拉的，先拉一次并重算卡片，之后有变化才重渲染。
+    void loadWecomConnectionsSnapshot().then(() => forceNamesRefresh(v => v + 1));
+    const timer = setInterval(() => {
+      if (typeof document !== 'undefined' && document.hidden) return;
+      void loadWecomConnectionsSnapshot().then(changed => {
+        if (changed) forceNamesRefresh(v => v + 1);
+      });
+    }, WECOM_CONNECTIONS_REFRESH_MS);
+    return () => clearInterval(timer);
+  }, [hasWecomBots]);
+
   const active = useMemo(() => sessions.filter(s => s.status !== 'closed'), [sessions]);
   const cards = useMemo(() => buildBotCards(sessions), [sessions, namesVersion]);
   const visibleCards = teamExpanded ? cards : cards.slice(0, collapsedN);
@@ -509,10 +531,13 @@ function OverviewPage() {
           </p>
         </div>
         <div className="page-heading-actions">
+          {hasWecomBots ? <a className="btn-link" href="#/bot-defaults">{tr('nav.botDefaults')}</a> : null}
           <a className="btn-link" href="#/monitoring">{tr('nav.monitoring')}</a>
-          <CreateActionButton className="page-primary-action" onClick={() => requestOpenCreateSession()}>
-            {tr('nav.createSession')}
-          </CreateActionButton>
+          {deploymentSupports('createSession', roster) ? (
+            <CreateActionButton className="page-primary-action" onClick={() => requestOpenCreateSession()}>
+              {tr('nav.createSession')}
+            </CreateActionButton>
+          ) : null}
         </div>
       </div>
 
@@ -596,7 +621,7 @@ function OverviewPage() {
               </HeaderControls>
             </SectionHeader>
             <div className="team-grid" id="team-grid" ref={teamRef}>
-              {visibleCards.length ? visibleCards.map(card => <MateCard key={card.larkAppId ?? card.botName} card={card} />) : <div className="empty">{tr('overview.noSessions')}</div>}
+              {visibleCards.length ? visibleCards.map(card => <MateCard key={providerBotKey(card) || card.botName} card={card} />) : <div className="empty">{tr('overview.noSessions')}</div>}
             </div>
             {cards.length > collapsedN ? (
               <button type="button" className="team-toggle" id="team-toggle" onClick={toggleTeam}>

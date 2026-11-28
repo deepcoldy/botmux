@@ -21,6 +21,8 @@ vi.mock('../src/utils/process-identity.js', async (importOriginal) => {
     isLinuxZombie: (pid: number) => zombiePids.has(pid) || actual.isLinuxZombie(pid),
     readDurableProcessIdentity: (pid: number) =>
       identityOverride.value === null ? actual.readDurableProcessIdentity(pid) : identityOverride.value,
+    readFleetDurableProcessIdentity: (pid: number) =>
+      identityOverride.value === null ? actual.readFleetDurableProcessIdentity(pid) : identityOverride.value,
   };
 });
 

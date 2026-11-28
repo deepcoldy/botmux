@@ -10,6 +10,7 @@ import { realpathSync } from 'node:fs';
 import { delimiter, isAbsolute, join } from 'node:path';
 import { homedir } from 'node:os';
 import { isStandaloneBinary } from './self-spawn.js';
+import { isCoreOnlyEnv } from './runtime-mode.js';
 
 const BOTMUX_WRAPPER_BASENAME = 'botmux';
 const NATIVE_SUBAGENT_RUNTIME_HOOK_WRAPPER_BASENAME = 'botmux-native-subagent-runtime-hook';
@@ -46,7 +47,7 @@ export function resolveBotmuxWrapperBinDir(env: NodeJS.ProcessEnv = process.env)
   const explicit = env.BOTMUX_WRAPPER_BIN?.trim();
   if (explicit && isAbsolute(explicit)) {
     binDir = explicit;
-  } else if (env.BOTMUX_CORE_ONLY === '1' && env.SESSION_DATA_DIR) {
+  } else if (isCoreOnlyEnv(env) && env.SESSION_DATA_DIR) {
     binDir = join(env.SESSION_DATA_DIR, 'bin');
   } else {
     binDir = join(env.HOME ?? env.USERPROFILE ?? homedir(), '.botmux', 'bin');

@@ -81,6 +81,9 @@ import {
   resolveCurrentTurnProvenance,
 } from './core/current-turn-provenance.js';
 import { ENTRY_SUBCOMMANDS, entryForSubcommand, resolveEntrySpawn } from './core/self-spawn.js';
+import { hasParsableWecomConfig } from './im/wecom/config/fleet-config-presence.js';
+import { isWecomFleetMemberName } from './im/wecom/config/fleet-member-name.js';
+import { hasLegacyDashboardJobs } from './cli/wecom/legacy-dashboard-jobs.js';
 import { isHttpVirtualSession, type TurnTerminalCarrierKind } from './core/types.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, buildDispatchCompletionBrief, buildProjectDispatchSyncAction, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, foldableChatSessionAppIds, offTopicSubBotTopic, resolveProseBotMentions, resolveReportPlacement, resolveReportRecipientForSession, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
@@ -160,6 +163,8 @@ import {
   type SetupCommand,
 } from './setup/setup-args.js';
 import { buildLocalBotRecord, findInvalidFleetCredentials, isLocalBotId, reallocateLocalBotId } from './setup/local-bot.js';
+import { offersWecomSetupSource, type SetupSourceEntry } from './setup/platform-entry.js';
+import type { WecomSetupMode } from './cli/wecom/setup-wizard.js';
 import {
   detectUnusableOwnerEntries,
   normalizeManagedOwnerEntries,
@@ -286,7 +291,6 @@ import {
   dashboardComingUpFromState,
   dashboardExportTimeoutForBudget,
   dashboardFailureIsTerminal,
-  executeDashboardCliCommand,
   exportAfterDashboardAnswer,
   formatDashboardFallbackFailure,
   formatDashboardSuccessLines,
@@ -753,8 +757,12 @@ async function cmdServe(args: string[]): Promise<void> {
   });
 }
 
+/** A host counts as configured with bots.json, ~/.botmux/.env, or a registered
+ *  WeCom configuration that parses (a WeCom-only host has neither file). The
+ *  WeCom probe runs only when both files are absent, so a Feishu host's answer
+ *  is unchanged. */
 function hasConfig(): boolean {
-  return existsSync(BOTS_JSON_FILE) || existsSync(ENV_FILE);
+  return existsSync(BOTS_JSON_FILE) || existsSync(ENV_FILE) || hasParsableWecomConfig();
 }
 
 function ask(rl: ReturnType<typeof createInterface>, question: string): Promise<string> {
@@ -1315,7 +1323,19 @@ async function pickExistingAppCredentials(
 }
 
 /**
+ * 「飞书应用来源」末尾的企业微信分区，只在 offerWecom 时存在：四项来源（含「仅本地机器人」）之后是
+ * 一行分隔（不可选），再往后依次是这两种接入方式。
+ */
+const WECOM_SOURCE_FIRST_INDEX = 5;
+const WECOM_SOURCE_MODES: ReadonlyArray<WecomSetupMode> = ['qr', 'manual'];
+
+/**
  * 拿应用凭证：扫码创建新应用 / 选择已有应用 / 手动输入，三选一。
+ *
+ * `offerWecom`（默认关）由调用方按 {@link offersWecomSetupSource} 打开：菜单末尾多一个
+ * 「企业微信」分区（分隔行 + 扫码创建新机器人 / 手动输入 BotID/Secret），选中其一即返回
+ * `{ ok: false, reason: 'wecom', mode }`，不碰任何飞书配置，由调用方关掉 readline 后交给
+ * 企微向导的对应模式。不打开时菜单、返回值与输出都和以前一样。
  *
  * 导航语义（TTY）：子界面 Esc / 主动放弃一律**返回「飞书应用来源」菜单**，
  * 只有在来源菜单本身 Esc（或扫码时 Ctrl-C）才取消整个 setup；技术性失败
@@ -1333,7 +1353,7 @@ async function pickExistingAppCredentials(
  */
 export async function obtainCredentials(
   rl: ReturnType<typeof createInterface>,
-  options: { isFirstStep?: boolean; autoAvoidApproval?: boolean } = {},
+  options: { isFirstStep?: boolean; autoAvoidApproval?: boolean; offerWecom?: boolean } = {},
 ): Promise<
   | {
       ok: true;
@@ -1357,6 +1377,8 @@ export async function obtainCredentials(
       approvalInitialApprovers?: string[];
     }
   | { ok: false; reason: 'cancelled' }
+  /** 只在 offerWecom 时出现：用户选了企业微信分区里的一种接入方式。 */
+  | { ok: false; reason: 'wecom'; mode: WecomSetupMode }
 > {
   const interactive = process.stdin.isTTY && process.stdout.isTTY;
   console.log(`\n${t('setup.credentials.header')}\n`);
@@ -1368,11 +1390,20 @@ export async function obtainCredentials(
         { label: t('setup.credentials.pick_existing'), hint: t('setup.credentials.pick_existing_hint') },
         { label: t('setup.credentials.manual'), hint: t('setup.credentials.manual_hint') },
         { label: '仅本地机器人', hint: '不扫码、不创建飞书应用，也不需要 App ID / Secret' },
+        ...(options.offerWecom
+          ? [
+              { label: t('setup.platform.source_wecom_section'), separator: true },
+              { label: t('setup.platform.source_wecom_qr'), hint: t('setup.platform.source_wecom_qr_hint') },
+              { label: t('setup.platform.source_wecom_manual'), hint: t('setup.platform.source_wecom_manual_hint') },
+            ]
+          : []),
       ],
       defaultIndex: 0,
       footer: t('setup.menu.footer_cancel'),
     }), { allowLangToggle: options.isFirstStep });
     if (method === null) return { ok: false, reason: 'cancelled' };
+    const wecomMode = options.offerWecom ? WECOM_SOURCE_MODES[method - WECOM_SOURCE_FIRST_INDEX] : undefined;
+    if (wecomMode) return { ok: false, reason: 'wecom', mode: wecomMode };
 
     if (method === 0) {
       const suggestedName = resolveSetupAppName(undefined, loadBotsJson().length);
@@ -1573,6 +1604,22 @@ async function promptRequiredOwner(rl: ReturnType<typeof createInterface>): Prom
 }
 
 /**
+ * promptBotConfig / writeSingleBotConfig 的「改走企业微信」结果：用户在「飞书应用来源」的
+ * 企业微信分区选了一种接入方式（只在 offerWecom 时可能），值是企微向导的模式。调用方关掉
+ * 自己的 readline 后交给企微向导：不写 bots.json / .env、不迁移不备份、不打印飞书侧的收尾文案。
+ */
+const WECOM_SETUP_HANDOFF = Symbol('wecom-setup-handoff');
+interface WecomSetupHandoff { readonly [WECOM_SETUP_HANDOFF]: WecomSetupMode }
+
+function wecomSetupHandoff(mode: WecomSetupMode): WecomSetupHandoff {
+  return { [WECOM_SETUP_HANDOFF]: mode };
+}
+
+function isWecomSetupHandoff(value: unknown): value is WecomSetupHandoff {
+  return typeof value === 'object' && value !== null && WECOM_SETUP_HANDOFF in value;
+}
+
+/**
  * 收集一个机器人完整配置 (凭证 + CLI/工作目录/allowedUsers).
  *
  * 顺序: 拿凭证 → tenant_access_token 验证 → 通过才返回 bot 对象. 验证失败
@@ -1580,10 +1627,10 @@ async function promptRequiredOwner(rl: ReturnType<typeof createInterface>): Prom
  */
 async function promptBotConfig(
   rl: ReturnType<typeof createInterface>,
-  options: { isFirstStep?: boolean; autoAvoidApproval?: boolean } = {},
-): Promise<Record<string, any> | null> {
+  options: { isFirstStep?: boolean; autoAvoidApproval?: boolean; offerWecom?: boolean } = {},
+): Promise<Record<string, any> | null | WecomSetupHandoff> {
   const creds = await obtainCredentials(rl, options);
-  if (!creds.ok) return null;
+  if (!creds.ok) return creds.reason === 'wecom' ? wecomSetupHandoff(creds.mode) : null;
   const localBot = creds.local === true;
 
   // 凭证立刻验证. 通不过不写 bots.json. 本地机器人没有飞书凭证，不走这条。
@@ -2012,15 +2059,17 @@ function parseDotEnvToBotConfig(): Record<string, any> {
  * Codex review 边界 #2: 中途失败一律不留半截 JSON.
  * `botsSnapshot` 必须由 cmdSetup 在首个菜单前捕获；helper 内重读会把菜单等待
  * 期间发生的外部更新误认成自己的基线，随后整文件覆盖它们。
+ * 选了企业微信分区里的接入方式时同样不写盘，关掉 readline 后返回 {@link WecomSetupHandoff}。
  */
 async function writeSingleBotConfig(
   botsSnapshot: readonly any[],
-  options: { isFirstStep?: boolean; autoAvoidApproval?: boolean } = {},
-): Promise<boolean> {
+  options: { isFirstStep?: boolean; autoAvoidApproval?: boolean; offerWecom?: boolean } = {},
+): Promise<boolean | WecomSetupHandoff> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   const bot = await promptBotConfig(rl, options);
   rl.close();
 
+  if (isWecomSetupHandoff(bot)) return bot;
   if (!bot) return false;
 
   writeBotsJsonAtomic([bot], botsSnapshot);
@@ -2186,6 +2235,7 @@ export async function cmdSetupScripted(
 
   if (cmd.action === 'help') {
     console.log(SETUP_CLI_USAGE);
+    console.log(`\n${t('setup.platform.usage_hint')}`);
     return;
   }
 
@@ -3090,7 +3140,17 @@ async function cmdClone(argv: string[]): Promise<void> {
 
 // ─── Commands ────────────────────────────────────────────────────────────────
 
-async function cmdSetup(): Promise<void> {
+export interface SetupWizardOptions {
+  /**
+   * 交给企微向导并返回其退出码；`mode` 是用户在「飞书应用来源」企业微信分区里选的接入方式
+   * （`'qr'` 扫码创建，`'manual'` 手动输入 BotID/Secret，两者都走 Dashboard 接入任务）。
+   * 默认是真实的企微向导；生产不传，测试用它替掉真实向导。
+   */
+  handOffToWecom?: (mode: WecomSetupMode) => Promise<number>;
+}
+
+/** export 只为单测取值缝（企微交接与各入口的写盘边界）；生产只有 `case 'setup'` 调用。 */
+export async function cmdSetup(options: SetupWizardOptions = {}): Promise<void> {
   ensureConfigDir();
 
   // Capture before any interactive prompt. Every eventual whole-file write is
@@ -3098,6 +3158,15 @@ async function cmdSetup(): Promise<void> {
   const initialBots = loadBotsJson();
   const hasBots = existsSync(BOTS_JSON_FILE);
   const hasEnv = existsSync(ENV_FILE);
+  // 「飞书应用来源」末尾的企业微信分区：每个入口按自己的语义问 offersWecomSetupSource。
+  const context = { stdinIsTTY: process.stdin.isTTY, stdoutIsTTY: process.stdout.isTTY };
+  const offerWecom = (entry: SetupSourceEntry) => offersWecomSetupSource(entry, context);
+  // 调用点已关掉飞书向导的 readline；界面语言（--lang 或向导里按 L 切换过的）是进程内
+  // 当前 locale，企微向导直接沿用。退出码取企微向导的返回值。
+  const handOffToWecom = async (handoff: WecomSetupHandoff): Promise<void> => {
+    const mode = handoff[WECOM_SETUP_HANDOFF];
+    process.exitCode = await (options.handOffToWecom ?? cmdWecomQrSetup)(mode);
+  };
 
   console.log(`\n${t('setup.wizard.title')}\n`);
   console.log(t('setup.wizard.config_dir', { dir: CONFIG_DIR }));
@@ -3135,8 +3204,9 @@ async function cmdSetup(): Promise<void> {
 
       if (action === 3) {
         console.log(`\n── ${t('setup.menu.reconfigure')} ──\n`);
-        const newBot = await promptBotConfig(rl);
+        const newBot = await promptBotConfig(rl, { offerWecom: offerWecom('reconfigure') });
         rl.close();
+        if (isWecomSetupHandoff(newBot)) return handOffToWecom(newBot);
         if (!newBot) {
           console.log(`\n${t('setup.common.aborted_keep_config')}`);
           return;
@@ -3260,8 +3330,9 @@ async function cmdSetup(): Promise<void> {
       }
 
       console.log(`\n── ${t('setup.menu.add_bot')} ──\n`);
-      let newBot = await promptBotConfig(rl);
+      let newBot = await promptBotConfig(rl, { offerWecom: offerWecom('add-bot') });
       rl.close();
+      if (isWecomSetupHandoff(newBot)) return handOffToWecom(newBot);
       if (!newBot) {
         console.log(`\n${t('setup.common.aborted_bots_json_untouched')}`);
         return;
@@ -3302,7 +3373,8 @@ async function cmdSetup(): Promise<void> {
 
     if (action === 1) {
       rl.close();
-      const ok = await writeSingleBotConfig(initialBots, { isFirstStep: false });
+      const ok = await writeSingleBotConfig(initialBots, { isFirstStep: false, offerWecom: offerWecom('env-overwrite') });
+      if (isWecomSetupHandoff(ok)) return handOffToWecom(ok);
       if (ok) {
         renameSync(ENV_FILE, ENV_FILE + '.bak');
         console.log(`   ${t('setup.common.backup_saved', { path: ENV_FILE + '.bak' })}`);
@@ -3315,13 +3387,15 @@ async function cmdSetup(): Promise<void> {
     if (!existingBot.larkAppId || !existingBot.larkAppSecret) {
       console.log('\n⚠️  当前 .env 缺少 LARK_APP_ID 或 LARK_APP_SECRET，请先完成基础配置');
       rl.close();
-      await writeSingleBotConfig(initialBots, { isFirstStep: false });
+      const filled = await writeSingleBotConfig(initialBots, { isFirstStep: false, offerWecom: offerWecom('env-missing-credentials') });
+      if (isWecomSetupHandoff(filled)) return handOffToWecom(filled);
       return;
     }
     console.log(`\n当前机器人: ${existingBot.larkAppId} (${existingBot.cliId ?? 'claude-code'})`);
     console.log(`\n── ${t('setup.menu.add_bot')} ──\n`);
-    let newBot = await promptBotConfig(rl);
+    let newBot = await promptBotConfig(rl, { offerWecom: offerWecom('env-add-bot') });
     rl.close();
+    if (isWecomSetupHandoff(newBot)) return handOffToWecom(newBot);
     if (!newBot) {
       console.log(`\n${t('setup.common.aborted_env_untouched')}`);
       return;
@@ -3343,7 +3417,8 @@ async function cmdSetup(): Promise<void> {
 
   } else {
     // --- Fresh install ---
-    await writeSingleBotConfig(initialBots, { isFirstStep: true });
+    const written = await writeSingleBotConfig(initialBots, { isFirstStep: true, offerWecom: offerWecom('first-run') });
+    if (isWecomSetupHandoff(written)) await handOffToWecom(written);
   }
 }
 
@@ -3527,6 +3602,7 @@ async function startConfiguredFleet(
   options: { bootHookStart?: boolean; watchdogStart?: boolean; allowEmpty?: boolean } = {},
 ): Promise<void> {
   let skippedForIntentionalStop = false;
+  let startedSupervisor = false;
   let startedEmptyOnboarding = false;
 
   await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
@@ -3559,7 +3635,9 @@ async function startConfiguredFleet(
       // live supervisor already owns the fleet is a safe no-op — no pm2-style
       // "refuse partial live fleet" dance needed; the running supervisor keeps
       // the fleet reconciled itself.
-      const { startFleetViaSupervisor } = await import('./core/fleet-runtime.js');
+      await migrateLegacyWecomGateways({ onlyWithoutLiveSupervisor: true });
+      await releaseWecomCredentialEnvStops({ onlyWithoutLiveSupervisor: true });
+      const { startFleetViaSupervisor, wecomFleetMemberNames } = await import('./core/fleet-runtime.js');
       const emptyOnboarding = options.allowEmpty === true && lockedBots.length === 0;
       const sessionRefresh = Boolean(process.env.BOTMUX_SESSION_ID?.trim());
       const result = startFleetViaSupervisor(emptyOnboarding
@@ -3577,7 +3655,13 @@ async function startConfiguredFleet(
         if (process.env.BOTMUX_COMPANION_SECRET_FILE || process.env.BOTMUX_COMPANION_BOT_APP_ID) {
           throw new Error('fleet is already running; use `botmux restart` to apply companion options');
         }
-        console.log(`\n✅ fleet 已在运行 (supervisor pid ${result.supervisorPid}, ${result.botCount} 个机器人)`);
+        // WeCom connections are named only where there are some: a Feishu-only
+        // host prints exactly what it always has.
+        const wecomCount = wecomFleetMemberNames().length;
+        const wecomPart = wecomCount > 0 ? `, ${wecomCount} 个企业微信连接` : '';
+        console.log(`\n✅ fleet 已在运行 (supervisor pid ${result.supervisorPid}, ${result.botCount} 个机器人${wecomPart})`);
+      } else {
+        startedSupervisor = true;
       }
     }, { maxWaitMs: 5_000 });
   }, { maxWaitMs: 5_000 });
@@ -3633,9 +3717,84 @@ async function startConfiguredFleet(
   // failure and, under the default KillMode=control-group, take the freshly
   // started supervisor down with the unit — so fixing the unit's path would be
   // undone by waiting inside it. Purely presentational: skip it.
+  // The WeCom report waits too (bounded), and is just as presentational: not
+  // under the boot hook, nor on a watchdog tick, nobody reads it there.
+  if (startedSupervisor && !options.bootHookStart && !options.watchdogStart) await reportWecomMembersAfterFleetStart();
   if (!options.bootHookStart) {
     await printDashboardHintWithRetry(startedEmptyOnboarding ? { budgetMs: 15_000 } : undefined);
   }
+}
+
+/**
+ * Upgrade migration of WeCom gateways an older Dashboard started itself (see
+ * cli/wecom/legacy-gateway-migration.ts). Runs right before a NEW supervisor is
+ * spawned, under the fleet mutation lock. A host where no older Dashboard ever
+ * started a WeCom gateway pays one existence check. Never throws: a failed
+ * migration is a warning line, and the Feishu fleet starts regardless.
+ *
+ * `onlyWithoutLiveSupervisor`: `botmux start` leaves a running fleet alone, so it
+ * migrates only when it is about to start a supervisor.
+ */
+async function migrateLegacyWecomGateways(options: { onlyWithoutLiveSupervisor: boolean }): Promise<void> {
+  if (!hasLegacyDashboardJobs()) return;
+  try {
+    if (options.onlyWithoutLiveSupervisor) {
+      const { liveSupervisorPid } = await import('./core/fleet-runtime.js');
+      if (liveSupervisorPid() !== undefined) return;
+    }
+    const migration = await import('./cli/wecom/legacy-gateway-migration.js');
+    await migration.migrateLegacyDashboardGateways(migration.productionLegacyMigrationDeps({
+      warn: line => console.warn(line),
+      info: line => console.log(line),
+    }));
+  } catch (err) {
+    console.warn(`⚠️  旧版 Dashboard 企业微信网关的迁移出错，已跳过（${err instanceof Error ? err.message : String(err)}）；下一次 start / restart 会再试。`);
+  }
+}
+
+/**
+ * WeCom connections that stopped themselves because the fleet's environment
+ * lacked their credential variable (cli/wecom/credential-env-release.ts): right
+ * before a NEW supervisor is started from this environment, those whose
+ * variable this environment has are recorded `running` again; the others are
+ * named in a warning line. A host without a WeCom desired-state file pays one
+ * existence check. Never throws: the Feishu fleet starts regardless.
+ */
+async function releaseWecomCredentialEnvStops(options: { onlyWithoutLiveSupervisor: boolean }): Promise<void> {
+  try {
+    const release = await import('./cli/wecom/credential-env-release.js');
+    const deps = release.productionCredentialEnvReleaseDeps(process.env);
+    if (!deps.desiredStateExists()) return;
+    if (options.onlyWithoutLiveSupervisor) {
+      const { liveSupervisorPid } = await import('./core/fleet-runtime.js');
+      if (liveSupervisorPid() !== undefined) return;
+    }
+    const lines = release.credentialEnvReleaseLines(release.releaseCredentialEnvStops(deps));
+    for (const line of lines.info) console.log(line);
+    for (const line of lines.warn) console.warn(line);
+  } catch (err) {
+    console.warn(`⚠️  未能检查企业微信连接的凭据环境变量（${err instanceof Error ? err.message : String(err)}），已跳过。`);
+  }
+}
+
+/**
+ * After `botmux start` / `restart` brought a fleet up: how its WeCom members did
+ * (cli/wecom/fleet-member-report.ts). Outside the health gate by design — never
+ * changes the exit code — and silent on a host with no WeCom member to run.
+ */
+async function reportWecomMembersAfterFleetStart(): Promise<void> {
+  const { fleetLogDir, waitFleetOnline, wecomFleetMemberNames } = await import('./core/fleet-runtime.js');
+  const names = wecomFleetMemberNames();
+  if (names.length === 0) return;
+  const { reportWecomFleetMembers } = await import('./cli/wecom/fleet-member-report.js');
+  await reportWecomFleetMembers({
+    memberNames: () => names,
+    pendingAfter: (expected, timeoutMs) => waitFleetOnline(expected, timeoutMs).pending,
+    sleep: ms => new Promise(done => setTimeout(done, ms)),
+    logDir: fleetLogDir(),
+    log: line => console.log(line),
+    warn: line => console.warn(line),
+  });
 }
 
 /**
@@ -3906,6 +4065,13 @@ async function cmdRestart(): Promise<void> {
         restartIntentPrepared = true;
       } catch { /* breadcrumb is best-effort */ }
 
+      // WeCom gateways an older Dashboard started are handed to the fleet first,
+      // while the Feishu fleet is still serving: only the WeCom connections are
+      // down for the migration, and the new supervisor's members never meet a
+      // previous gateway still holding the bot's lock.
+      await migrateLegacyWecomGateways({ onlyWithoutLiveSupervisor: false });
+      await releaseWecomCredentialEnvStops({ onlyWithoutLiveSupervisor: false });
+
       // Stop the live supervisor (graceful, then killed if it overruns) and
       // start a fresh one, which re-reads bots.json and (re)spawns every bot.
       const { restartFleet, fleetHealthMembers, waitFleetOnline } = await import('./core/fleet-runtime.js');
@@ -3971,6 +4137,9 @@ async function cmdRestart(): Promise<void> {
     }
     console.log('✅ daemon 已重启');
   }, { maxWaitMs: 5_000 });
+  // WeCom members, after the health gate above and outside the lock (it waits,
+  // and reads nothing the lock protects). Silent without WeCom members.
+  await reportWecomMembersAfterFleetStart();
   // OUTSIDE THE FLEET MUTATION LOCK, deliberately. This poll waits up to
   // DASHBOARD_READY_WAIT_MS (90s) and reads nothing the lock protects — it only
   // asks the dashboard for a link. Holding the lock across it would block every
@@ -4255,6 +4424,48 @@ async function cmdStopBot(argv: string[]): Promise<void> {
   process.exit(1);
 }
 
+/** `botmux wecom <sub>` values handled by cmdWecomLifecycle. `identify` and
+ *  `logs` go to their own modules under cli/wecom/ (see `case 'wecom'`), which
+ *  load none of the gateway; every other form of `botmux wecom` is the gateway. */
+const WECOM_LIFECYCLE_SUBCOMMANDS = new Set(['start', 'stop', 'restart']);
+
+/**
+ * `botmux wecom start|stop|restart <configId>|--config <file> [--json]` — change
+ * one WeCom connection of the fleet (see cli/wecom/fleet-lifecycle.ts). Same
+ * sandbox gate and fleet mutation lock as start-bot / stop-bot; the lock is
+ * held only while the command records intent and hands an op to the
+ * supervisor, never while it waits for the answer, so a Feishu `botmux
+ * restart` / `stop` / `start-bot` (5 s lock wait) is not held up by it.
+ */
+async function cmdWecomLifecycle(args: string[]): Promise<void> {
+  const lifecycle = await import('./cli/wecom/fleet-lifecycle.js');
+  const parsed = lifecycle.parseWecomLifecycleArgs(args);
+  if (!parsed.ok) {
+    if (parsed.help) {
+      console.log(parsed.message);
+      return;
+    }
+    if (parsed.json) {
+      console.log(JSON.stringify({ ok: false, reason: 'usage', configId: null, member: null, message: parsed.message }));
+    } else {
+      console.error(parsed.message);
+    }
+    process.exitCode = 2;
+    return;
+  }
+  const { request } = parsed;
+  await runFleetMutationCommand(`wecom ${request.op}`, async () => {
+    ensureConfigDir();
+    const runtime = await import('./cli/wecom/fleet-lifecycle-runtime.js');
+    const deps = runtime.productionWecomLifecycleDeps(
+      (fn, maxWaitMs) => withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, fn, { maxWaitMs }),
+      { json: request.json },
+    );
+    const result = await lifecycle.runWecomLifecycle(request, deps);
+    process.exitCode = lifecycle.printWecomLifecycleResult(result, request.json);
+  });
+}
+
 /** Print the post-add "next step" line for interactive setup: auto-start the new
  *  bot's own daemon when the fleet is up (no fleet-wide restart), else fall back
  *  to the botmux start / restart hint. */
@@ -4532,9 +4743,20 @@ async function cmdStatus(): Promise<void> {
   }
   const online = listOnlineDaemons();
   const descriptorByApp = new Map(online.map(d => [d.larkAppId, d]));
+  // WeCom member rows (gateways) take their version from the gateway's own
+  // runtime record, and a note below when one is down. Read only when the
+  // table has a WeCom row; a Feishu-only status reads nothing more.
+  const hasWecomRows = status.rows.some(r => isWecomFleetMemberName(r.name));
+  let wecomVersions: ReadonlyMap<string, string> | undefined;
+  if (hasWecomRows) {
+    const { productionWecomMemberVersionDeps, wecomMemberVersions } = await import('./cli/wecom/status-version.js');
+    wecomVersions = wecomMemberVersions(status.rows, productionWecomMemberVersionDeps());
+  }
   const nameW = Math.max(4, ...status.rows.map(r => r.name.length));
+  // The Feishu daemons' versions; the restart hint below counts only these.
   const verCells = status.rows.map(r => descriptorByApp.get(r.appId)?.botmuxVersion ?? '-');
-  const verW = Math.max(7, ...verCells.map(v => v.length));
+  const shownVerCells = status.rows.map((r, i) => wecomVersions?.get(r.name) ?? verCells[i]!);
+  const verW = Math.max(7, ...shownVerCells.map(v => v.length));
   const header = `  ${'NAME'.padEnd(nameW)}  ${'PID'.padStart(7)}  ${'STATUS'.padEnd(9)}  ${'↺'.padStart(4)}  ${'EXIT'.padEnd(4)}  ${'VERSION'.padEnd(verW)}  LARK WS`;
   console.log(header);
   for (const [i, r] of status.rows.entries()) {
@@ -4544,7 +4766,12 @@ async function cmdStatus(): Promise<void> {
     const pidCol = r.pid > 0 ? String(r.pid) : '-';
     const exitCol = r.lastExitCode === null ? '-' : String(r.lastExitCode);
     const ws = r.appId ? formatLarkConnectionStatus(r, descriptorByApp.get(r.appId)) : '—';
-    console.log(`  ${r.name.padEnd(nameW)}  ${pidCol.padStart(7)}  ${shown.padEnd(9)}  ${String(r.restarts).padStart(4)}  ${exitCol.padEnd(4)}  ${verCells[i]!.padEnd(verW)}  ${ws}`);
+    console.log(`  ${r.name.padEnd(nameW)}  ${pidCol.padStart(7)}  ${shown.padEnd(9)}  ${String(r.restarts).padStart(4)}  ${exitCol.padEnd(4)}  ${shownVerCells[i]!.padEnd(verW)}  ${ws}`);
+  }
+  // Why a WeCom connection is down when its gateway stopped it itself.
+  if (hasWecomRows) {
+    const { productionWecomStatusNoteDeps, wecomStatusNotes } = await import('./cli/wecom/status-notes.js');
+    for (const note of wecomStatusNotes(status.rows, productionWecomStatusNoteDeps())) console.log(note);
   }
   const restartHint = formatRunningDaemonsRestartSummary(verCells.map(v => v === '-' ? undefined : v), resolveCurrentVersion());
   if (restartHint) console.log(restartHint);
@@ -4801,7 +5028,7 @@ function cmdUpgradeLocalDev(): void {
  */
 async function callDashboardEndpoint(
   path: DashboardEndpoint,
-  opts: { rescanWhenUnreachable?: boolean; requestTimeoutMs?: number } = {},
+  opts: { rescanWhenUnreachable?: boolean; requestTimeoutMs?: number; onDashboardPort?: (port: number) => void } = {},
 ): Promise<DashboardResult> {
   return callDashboard({
     configDir: CONFIG_DIR,
@@ -4810,6 +5037,7 @@ async function callDashboardEndpoint(
     path,
     rescanWhenUnreachable: opts.rescanWhenUnreachable,
     requestTimeoutMs: opts.requestTimeoutMs,
+    onDashboardPort: opts.onDashboardPort,
   });
 }
 
@@ -4950,6 +5178,85 @@ async function printDashboardHintWithRetry(opts?: { budgetMs?: number }): Promis
   }
 }
 
+/**
+ * First use: start the normal supervisor so an unconfigured host can reach a
+ * Dashboard and set up its first bot. Same lock order as cmdStart (fleet
+ * mutation → bots.json). Never starts a configured fleet as a side effect of
+ * setup: hasConfig() is re-checked under both locks, so the fresh supervisor
+ * has exactly one member, the Dashboard, with no bots.
+ *
+ * Callers go through executeDashboardWithFirstUseBootstrap, which applies the
+ * same host-processes-hidden sandbox gate as `start` / `__watchdog` first.
+ */
+async function startFirstUseDashboard(): Promise<void> {
+  ensureConfigDir();
+  await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
+    await withFileLock(BOTS_JSON_FILE, async () => {
+      if (hasConfig()) return;
+      preflightNodeSanity();
+      await migrateLegacyWecomGateways({ onlyWithoutLiveSupervisor: true });
+      const { startFleetViaSupervisor } = await import('./core/fleet-runtime.js');
+      // No bot yet: same loopback default as the zero-bot `start --allow-empty`.
+      startFleetViaSupervisor({ defaultDashboardHost: '127.0.0.1' });
+    }, { maxWaitMs: 5_000 });
+  }, { maxWaitMs: 5_000 });
+}
+
+/**
+ * `botmux dashboard` found no Dashboard on a host configured for WeCom only
+ * (a parsable WeCom configuration, neither bots.json nor .env) with no fleet
+ * running. Such a host counts as configured, so the first-use bootstrap does not
+ * start anything for it (that is `botmux start`'s job, as on a Feishu host), and
+ * the generic advice — "the dashboard is still starting" — would be wrong: there
+ * is nothing starting. Feishu hosts never get here (first condition).
+ */
+async function wecomOnlyHostWithoutFleet(result: Extract<DashboardResult, { ok: false }>): Promise<boolean> {
+  if (existsSync(BOTS_JSON_FILE) || existsSync(ENV_FILE)) return false;
+  const { dashboardIsAbsent } = await import('./cli/dashboard-bootstrap.js');
+  if (!dashboardIsAbsent(result) || !hasParsableWecomConfig()) return false;
+  try {
+    const { liveSupervisorPid } = await import('./core/fleet-runtime.js');
+    return liveSupervisorPid() === undefined;
+  } catch {
+    return false;
+  }
+}
+
+/** The sandbox verdict `start` (runFleetMutationCommand) and `__watchdog`
+ * already refuse on; setup's Dashboard bootstrap reuses it unchanged. */
+function hostProcessesHidden(): boolean {
+  return detectSandboxContext().hostProcessesHidden;
+}
+
+/**
+ * 企微向导，只由 setup 来源菜单的企业微信分区进入，返回退出码。`mode` 是菜单里选的接入方式：
+ * `'qr'` 扫码创建，`'manual'` 是向导的「手动凭据」模式（Dashboard 接入任务的 `mode: 'manual'`）。
+ */
+async function cmdWecomQrSetup(mode: WecomSetupMode): Promise<number> {
+  const { connectWecomSetupDashboard, runWecomQrSetup } = await import('./cli/wecom/setup-wizard.js');
+  return runWecomQrSetup({
+    mode,
+    connect: async () => {
+      const { createWecomSetupClient } = await import('./cli/wecom/onboarding-client.js');
+      // Credentials must stay on the port that answered the HMAC request,
+      // never on a host/port taken from a response URL.
+      let port = 0;
+      const callEndpoint = (path: DashboardEndpoint, opts?: { rescanWhenUnreachable?: boolean }) => callDashboardEndpoint(path, {
+        ...opts,
+        requestTimeoutMs: 2000,
+        onDashboardPort: value => { port = value; },
+      });
+      return connectWecomSetupDashboard({
+        callEndpoint,
+        hasConfig,
+        hostProcessesHidden,
+        start: () => startFirstUseDashboard(),
+        createClient: result => createWecomSetupClient(result, port),
+      });
+    },
+  });
+}
+
 /** Get or create the current dashboard URL, or explicitly rotate it. Bare
  * `dashboard` is the non-rotating get-or-create form; help and invalid
  * subcommands never call either credential endpoint. */
@@ -4962,10 +5269,16 @@ async function cmdDashboard(args: string[]): Promise<void> {
   // The Devbox export runs INSIDE the wrapper too, after the first endpoint call
   // has proven which port the live dashboard owns (see
   // executeDashboardCommandWithExportRefresh).
-  const execution = await executeDashboardCliCommand(
+  const { executeDashboardWithFirstUseBootstrap } = await import('./cli/dashboard-bootstrap.js');
+  const execution = await executeDashboardWithFirstUseBootstrap(
     args,
     callDashboardEndpoint,
     () => ensureDevboxDashboardExportForCurrentPort(),
+    {
+      hasConfig,
+      hostProcessesHidden,
+      start: () => startFirstUseDashboard(),
+    },
   );
   if (execution.kind === 'help') {
     console.log(DASHBOARD_COMMAND_USAGE);
@@ -4987,6 +5300,11 @@ async function cmdDashboard(args: string[]): Promise<void> {
       console.log(line);
     }
     return;
+  }
+  if (await wecomOnlyHostWithoutFleet(r)) {
+    console.error('本机只配置了企业微信，fleet 没有在运行，Dashboard 也就没有启动。'
+      + '先执行 `botmux start`（拉起 Dashboard 和记为运行的企业微信连接），再运行 `botmux dashboard`。');
+    process.exit(1);
   }
   const portFile = join(CONFIG_DIR, '.dashboard-port');
   const recordedPort = (existsSync(portFile) ? readFileSync(portFile, 'utf8').trim() : '')
@@ -8989,6 +9307,10 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   logs        查看/跟随 daemon 日志（--lines N, --bot <0-based-index|name|appId>, --no-follow 只打印不跟随）
   sandbox-network-policy check <JSON文件> | set <appId> <JSON文件> | clear <appId>
               配置 Linux 本地 PTY oncall 公网/内网目标 IP 策略，下个新会话生效
+  wecom start|stop|restart|logs|identify
+              ${t('setup.platform.help_wecom_command')}
+  serve --api-only --port <PORT> [--bot <local_slug>]
+              启动无飞书凭据的独立本机 core HTTP 执行服务（可供企业微信网关使用）
   model-proxy serve --config <path>
               启动有鉴权的本机模型协议入口（Chat Completions 子集）
   env-policy get|set <JSON>|unset [--bot <name|appId>]
@@ -21191,6 +21513,18 @@ async function cmdSessionReady(): Promise<void> {
     if (p && typeof p.session_id === 'string') nativeSessionId = p.session_id;
   } catch { /* 非 JSON / 空 → 不带 source */ }
 
+  // v3 workflow worker 没有 daemon 会话记录，daemon 路由会静默丢弃信号；worker
+  // 为本次 spawn 注入了本地通道时直接交给它（见 utils/session-ready-local-signal.ts）。
+  // 通道不可用（env 缺失/目录不私有/写失败）时退回原 daemon 路由。
+  // 与 daemon 路由同构：等 worker 跑完 handler 的 ack（上限 2s，超时 fail-open），
+  // 保证 Claude 在 hook 退出后才画出的提示符落在 SessionStart 边界之后。
+  const { writeLocalSessionReadySignal, waitForLocalSessionReadyAck } = await import('./utils/session-ready-local-signal.js');
+  const localSignalId = writeLocalSessionReadySignal(process.env, source);
+  if (localSignalId) {
+    await waitForLocalSessionReadyAck(process.env, localSignalId, 2_000);
+    process.exit(0);
+  }
+
   await postSessionScopedSignal('/api/session-ready', { source, nativeSessionId });
   process.exit(0);
 }
@@ -23756,6 +24090,25 @@ switch (command) {
   case 'start':   await runFleetMutationCommand('start', cmdStart); break;
   case '__watchdog': await cmdWatchdog(); break;
   case 'serve':   await cmdServe(process.argv.slice(3)); break;
+  case 'wecom': {
+    if (WECOM_LIFECYCLE_SUBCOMMANDS.has(process.argv[3] ?? '')) {
+      await cmdWecomLifecycle(process.argv.slice(3));
+      break;
+    }
+    if (process.argv[3] === 'identify') {
+      const { runWecomIdentifyCommand } = await import('./cli/wecom/identify.js');
+      process.exitCode = await runWecomIdentifyCommand(process.argv.slice(4));
+      break;
+    }
+    if (process.argv[3] === 'logs') {
+      const { runWecomLogsCommand } = await import('./cli/wecom/logs.js');
+      process.exitCode = await runWecomLogsCommand(process.argv.slice(4));
+      break;
+    }
+    const { runWecomCommand } = await import('./im/wecom/gateway/command.js');
+    process.exitCode = await runWecomCommand(process.argv.slice(3));
+    break;
+  }
   case 'start-bot': await runFleetMutationCommand('start-bot', () => cmdStartBot(process.argv.slice(3))); break;
   case 'stop-bot': await runFleetMutationCommand('stop-bot', () => cmdStopBot(process.argv.slice(3))); break;
   case 'stop':    await runFleetMutationCommand('stop', cmdStop); break;

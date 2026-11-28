@@ -62,6 +62,10 @@ botmux start
 
 > **Mac 用户**：[GitHub Releases](https://github.com/deepcoldy/botmux/releases) 提供已签名、公证的 Botmux Desktop DMG。当前版本首次使用仍需先按上面第 1、2 步完成一次命令行初始化；已有配置可直接打开 App。详见 [macOS 桌面版](https://deepcoldy.github.io/botmux/desktop)。
 
+### 企业微信智能机器人
+
+支持独立企业微信 WebSocket 网关，复用本机 core-only 执行层，提供私聊/群内 @ 文字连续对话，不使用话题。运行 `botmux setup`（已有机器人时先选「添加新机器人」），在「飞书应用来源」末尾的「企业微信」分区选「扫码创建新机器人」，或对已在企业微信里创建好的机器人选「手动输入 BotID/Secret」；也可在 `botmux dashboard` 的「添加机器人」里点「改为添加企业微信机器人」。再用要授权的企业微信账号私聊发送配对码，完成后自动保存配置并上线。配置与当前能力边界见 [企业微信接入](docs/wecom.md)。
+
 ## 日常能怎么用
 
 - **写代码、修问题** — 「@机器人 帮我修复这个报错，并补上测试。」进度和结果都在飞书里看，详见[实时卡片](https://deepcoldy.github.io/botmux/cards)。

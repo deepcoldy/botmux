@@ -5,23 +5,24 @@ import { useT } from './react-hooks.js';
 import { afterNextPaint } from './deferred-task.js';
 
 export function CodexProfilePicker(props: {
+  providerConnectionId?:string;
   appId: string; contextKey: unknown; value: string; disabled?: boolean; launchChanged?: boolean;
   onChange(value: string): void;
 }) {
   const tr = useT();
   const [refresh, setRefresh] = useState(0);
-  const key = useMemo(() => ({ appId: props.appId, context: props.contextKey, refresh }), [props.appId, props.contextKey, refresh]);
+  const key = useMemo(() => ({ appId: props.appId, providerConnectionId:props.providerConnectionId, context: props.contextKey, refresh }), [props.appId,props.providerConnectionId, props.contextKey, refresh]);
   const [loaded, setLoaded] = useState<{ key: typeof key; catalog: CodexProfileCatalog }>();
   const catalog = loaded?.key === key ? loaded.catalog : undefined;
   useEffect(() => {
     let stale = false;
     const abort = new AbortController();
     const cancel = afterNextPaint(() => {
-      void fetch(`/api/bots/${encodeURIComponent(props.appId)}/codex-profiles`, { signal: abort.signal })
+      void fetch(props.providerConnectionId ? `/api/wecom/connections/${encodeURIComponent(props.providerConnectionId)}/codex-profiles` : `/api/bots/${encodeURIComponent(props.appId)}/codex-profiles`, { signal: abort.signal })
       .then(async response => {
         if (!response.ok) throw new Error('scan_failed');
         const body = await response.json();
-        if (body.larkAppId !== props.appId || !Array.isArray(body.candidates)) throw new Error('scan_failed');
+        if ((props.providerConnectionId ? body.connectionId !== props.providerConnectionId : body.larkAppId !== props.appId) || !Array.isArray(body.candidates)) throw new Error('scan_failed');
         if (!stale) setLoaded({ key, catalog: body });
       }).catch(() => {
         if (!stale) setLoaded({ key, catalog: { status: 'scan_failed', candidates: [], error: 'scan_failed' } });
