@@ -13463,6 +13463,29 @@ async function requestScheduledInputAdmission(item: PendingCliInput): Promise<im
   });
 }
 
+/** Why a scheduled write must not proceed at this edge, or undefined: a write
+ * marked cancelled is rejected; a stale one, or one whose item no longer owns
+ * the in-flight slot, is retained for the next ready edge. */
+function scheduledCliInputWriteHold(
+  item: PendingCliInput,
+  isCurrent: () => boolean,
+  requireQueueOwner = true,
+): 'reject' | 'retain' | undefined {
+  const owner = cliSubmissionInFlight;
+  if (requireQueueOwner && owner?.item === item && owner.scheduledWriteCancelled) return 'reject';
+  return !isCurrent() || (requireQueueOwner && owner?.item !== item) ? 'retain' : undefined;
+}
+
+function settleScheduledCliInputHold(
+  item: PendingCliInput,
+  held: 'reject' | 'retain',
+  onHold: (decision: 'reject' | 'retain') => void,
+): void {
+  if (held === 'retain') scheduleScheduledAdmissionRetry(item);
+  else cancelScheduledAdmissionRetry(item);
+  onHold(held);
+}
+
 async function runScheduledCliInputWrite<T>(
   item: PendingCliInput,
   isCurrent: () => boolean,
@@ -13473,13 +13496,9 @@ async function runScheduledCliInputWrite<T>(
 ): Promise<T> {
   if (item.turnId && parseScheduledTurnId(item.turnId)) {
     const decision = await requestScheduledInputAdmission(item);
-    const owner = cliSubmissionInFlight;
-    const held = requireQueueOwner && owner?.item === item && owner.scheduledWriteCancelled ? 'reject'
-      : !isCurrent() || (requireQueueOwner && owner?.item !== item) ? 'retain' : decision;
+    const held = scheduledCliInputWriteHold(item, isCurrent, requireQueueOwner) ?? decision;
     if (held !== 'allow') {
-      if (held === 'retain') scheduleScheduledAdmissionRetry(item);
-      else cancelScheduledAdmissionRetry(item);
-      onHold(held);
+      settleScheduledCliInputHold(item, held, onHold);
       throw new Error(`scheduled_input_${held}`);
     }
     cancelScheduledAdmissionRetry(item);
@@ -33999,6 +34018,14 @@ async function flushPending(): Promise<void> {
                     retiredBeforeSubmit = true;
                     return false;
                   }
+                  // The precheck continues the scheduled write its edge
+                  // admitted. An interrupt (or a dirty Web wire) since that
+                  // edge holds it the same way, still queue-owned and unprepared.
+                  const held = isScheduledWrite ? scheduledCliInputWriteHold(item, scheduledWriteIsCurrent) : undefined;
+                  if (held) {
+                    settleScheduledCliInputHold(item, held, recordScheduledHold);
+                    return false;
+                  }
                   // The precheck may also have waited through a prompt-ready
                   // edge. Re-open the write cycle immediately before actual paste
                   // so composerOwned/readiness cannot describe that stale window.
@@ -34025,6 +34052,8 @@ async function flushPending(): Promise<void> {
             (isScheduledWrite || writeAdapter.writeInputDefersPreparation === true || reattachSteerFence)
               ? undefined : prepareNormalWrite,
           ).finally(() => { traexQuestionDraftWaiting = false; });
+          // beforeSubmit held it: settle exactly like a held write edge.
+          if (lateScheduledHold) throw new Error(`scheduled_input_${lateScheduledHold}`);
           result = transaction.result;
           recoveryFailureReason = transaction.recoveryFailureReason;
         }

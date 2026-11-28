@@ -273,7 +273,7 @@ function defaultScopedWorkerState(scope: Record<string, unknown>, key: string | 
   if (key === 'pendingAdoptMessages') return (scope.pendingAdoptMessages ??= []);
   if (key === 'restoredUnsentInputs') return (scope.restoredUnsentInputs ??= new Set());
   if (key === 'scheduledInputReceipts') return (scope.scheduledInputReceipts ??= new Map());
-  if (['coalescePendingScheduledInputs', 'discardUnwrittenScheduledInput', 'discardScheduledBacklogForStop', 'requestScheduledInputAdmission', 'runScheduledCliInputWrite', 'unsentInputJournalPath', 'cancelScheduledAdmissionRetry', 'scheduleScheduledAdmissionRetry'].includes(String(key))) return loadWorkerFunction(String(key), scope);
+  if (['coalescePendingScheduledInputs', 'discardUnwrittenScheduledInput', 'discardScheduledBacklogForStop', 'requestScheduledInputAdmission', 'runScheduledCliInputWrite', 'unsentInputJournalPath', 'cancelScheduledAdmissionRetry', 'scheduleScheduledAdmissionRetry', 'scheduledCliInputWriteHold', 'settleScheduledCliInputHold'].includes(String(key))) return loadWorkerFunction(String(key), scope);
   if (key === 'inFlightKeepaliveFingerprints') {
     return (scope.inFlightKeepaliveFingerprints ??= new Map<string, number>());
   }
