@@ -30,6 +30,8 @@ import {
 } from '../../services/traex-transcript.js';
 import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay } from '../../utils/timing.js';
+import { stripAnsiScreenText } from '../../utils/idle-detector.js';
+import { traexPendingAsyncQuestionVisible, traexQuestionFlowVisible } from '../../utils/traex-question-page.js';
 import {
   traexModelPickerPage,
   traexRestoredComposerReady,
@@ -299,6 +301,26 @@ const TRAEX_ACTIVE_BUSY_PATTERN = new RegExp(
   ].join('|'),
   'i',
 );
+
+/** An empty composer does not prove that native queued input disappeared.
+ * Require the initialized footer and reject current activity, a question
+ * flow and the native send-after-tool-call panel before clearing quarantine. */
+export function traexScreenShowsNoPendingInput(screen: string): boolean {
+  const clean = stripAnsiScreenText(screen);
+  if (!traexRestoredComposerReady(clean) || traexQuestionFlowVisible(clean) || traexPendingAsyncQuestionVisible(clean)
+    || TRAEX_ACTIVE_BUSY_PATTERN.test(traexCurrentActivityRows(clean).join('\n'))) return false;
+  const rows = clean.trimEnd().split(/\r?\n/);
+  let composer = rows.length - 1;
+  while (composer >= 0 && !/^[›❯](?:[ \t]|$)/.test(rows[composer]!)) composer--;
+  if (!rows.slice(composer + 1).some(row => /\bContext (?:\d+% (?:left|used)|[—–-])(?:[ \t]|$)/.test(row))) return false;
+  for (let index = composer - 1; index >= 0; index--) {
+    const row = rows[index]!;
+    if (/^Send after tool call[ \t]+[·•][ \t]+esc to interrupt and send[ \t]+[·•][ \t]+↑ to edit[ \t]*$/.test(row)) return false;
+    if (/^[›❯](?:[ \t]|$)/.test(row)) continue;
+    if (!/^[ \t]*$|^[ \t]*─+[ \t]*$|^ {2}\S/.test(row)) break;
+  }
+  return true;
+}
 
 /**
  * Pre-idle static-busy latch for the capacity-queue screen (ZMX gap).
@@ -763,6 +785,7 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     // A missing history receipt is ambiguous: block successors in this backend
     // generation and never replay the unconfirmed message automatically.
     quarantineUnconfirmedSubmits: true,
+    screenShowsNoPendingInput: traexScreenShowsNoPendingInput,
     // OSC 7501 (`ESC]7501;state=…:app=traecli ESC\`), sent unprompted on any
     // TTY incl. tmux (no `7501;?` probe). 0.214.1 is the first release that
     // reports; 0.213.1 sends none. Recorded on 0.214.1, tmux and PTY:

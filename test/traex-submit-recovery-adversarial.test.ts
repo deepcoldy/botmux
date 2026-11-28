@@ -4,8 +4,8 @@ import { traexComposerHoldsInput } from '../src/adapters/cli/traex-footer.js';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import { InputDeliveryEvidenceTracker } from '../src/services/input-delivery-evidence.js';
 import { createSubmitFailureChainController } from '../src/services/submit-failure-chain.js';
-import { combineSubmitCurrentFences, settleDeferredSubmitConfirmation } from '../src/services/submit-confirmation.js';
 import { createQueuedActivationReceiptObserver } from '../src/services/queued-activation-receipts.js';
+import { combineSubmitCurrentFences, settleDeferredSubmitConfirmation } from '../src/services/submit-confirmation.js';
 import { buildSubmitMessagePreview } from '../src/services/submit-notification.js';
 import { claudeComposerHoldsInput, decideSessionStartGatedSubmitWarning, diagnoseBackendSubmitFailure,
   diagnoseSubmitFailure, shouldWaitThroughBusyTurn } from '../src/services/submit-failure-diagnosis.js';
@@ -52,8 +52,8 @@ function fixture(options: { acceptsRescue?: boolean; screen?: string; dispatchAt
     cliRestartInProgress: false, lastInitConfig: { cliId: 'traex' },
     webTerminalInputGeneration: 1, cliInterruptGeneration: 0, cliLifetimeNonce: 'lifetime',
     inputDeliveryQuarantine: null, inputDeliveryEvidence: evidence, codexBridgeQueue: queue,
-    submitFailureChains: chain, combineSubmitCurrentFences, settleDeferredSubmitConfirmation,
     createQueuedActivationReceiptObserver,
+    submitFailureChains: chain, combineSubmitCurrentFences, settleDeferredSubmitConfirmation,
     usageLimitTracker: { currentTurn: () => 1, detectedThisTurn: () => false },
     submitActivityEvidenceSince: () => 'pty-output', readyGate: { isArmed: false },
     SUBMIT_DEFERRED_RECHECK_MS: 20_000, SUBMIT_DEFERRED_RECHECK_MAX_ATTEMPTS: 2,
@@ -84,7 +84,7 @@ function fixture(options: { acceptsRescue?: boolean; screen?: string; dispatchAt
   scope.traexQuestionCapture = loadWorkerFunction('traexQuestionCapture', scope);
   scope.submitUnconfirmedNotice = loadWorkerFunction('submitUnconfirmedNotice', scope);
   const arm = loadWorkerFunction('armInputDeliveryQuarantine', scope);
-  const quarantine = arm(backend, { turnId: 'delivery', dispatchAttempt: options.dispatchAttempt }, content);
+  const quarantine = arm(backend, { turnId: 'delivery', dispatchAttempt: options.dispatchAttempt }, content, recheck);
   const schedule = loadWorkerFunction('scheduleSubmitFailureNotify', scope);
   const onConfirmed = () => scope.releaseInputDeliveryQuarantine(quarantine, 'receipt', { redriveTerminal: true });
   const start = () => schedule(content, recheck, 'rollout', 'delivery', undefined, 1,

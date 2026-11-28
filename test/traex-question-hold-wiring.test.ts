@@ -202,6 +202,19 @@ describe('holding input off the question page', () => {
     expect(harness('traex', { block: { kind: 'question' }, remoteWsUrl: 'ws://x' }).fn('hookReviewHoldBlocks')(COMPOSER)).toBe(false);
   });
 
+  it('reconciles a completed stale question only on the fresh idle composer, never on a visible page', () => {
+    const h = harness('traex', { screen: COMPOSER, block: { kind: 'question' } });
+    let released = false;
+    h.scope.idleDetector.programStatusBlock = () => released ? null : { kind: 'question' };
+    h.scope.idleDetector.releaseStaleQuestionStatus = () => { released = true; return true; };
+    h.scope.screen = QUESTION;
+    expect(h.fn('traexQuestionHoldBlocks')(COMPOSER)).toBe(true);
+    expect(released).toBe(false);
+    h.scope.screen = COMPOSER;
+    expect(h.fn('traexQuestionHoldBlocks')(COMPOSER)).toBe(false);
+    expect(released).toBe(true);
+  });
+
   it('tells the held message to answer on the card, once, for the held turn', () => {
     const h = harness('traex', { screen: QUESTION });
     h.fn('refreshHookReviewInputHold')(QUESTION);

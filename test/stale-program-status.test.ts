@@ -12,7 +12,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { IdleDetector } from '../src/utils/idle-detector.js';
+import { IdleDetector, PROGRAM_STATUS_RECORD_CAP } from '../src/utils/idle-detector.js';
 import {
   ClaudeTranscriptTurnEnd,
   claudeTranscriptLatestTurnState,
@@ -116,6 +116,84 @@ describe('IdleDetector.releaseStaleProgramStatus', () => {
     detector.observeProgramStatus({ state: 'working', progress: 50 });
     expect(detector.programStatusQuietMs()).toBe(0);
     detector.dispose();
+  });
+});
+
+describe('completed-turn question status recovery', () => {
+  beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(1_000); });
+  afterEach(() => { vi.useRealTimers(); });
+  const detector = () => new IdleDetector({ ...makeCli(), programStatusYieldsToTranscriptTerminal: true });
+
+  it('keeps a newly reported question, then releases its stale status after transcript completion and silence', () => {
+    const d = detector();
+    d.observeProgramStatus({ state: 'working' });
+    d.observeProgramStatus({ state: 'blocked', id: 'ask', kind: 'question' });
+    vi.advanceTimersByTime(5_000);
+    expect(d.releaseStaleQuestionStatus()).toBe(false);
+    d.noteTranscriptTerminal();
+    d.fireIdle();
+    expect(d.releaseStaleQuestionStatus()).toBe(false);
+    vi.advanceTimersByTime(2_000);
+    expect(d.releaseStaleQuestionStatus()).toBe(true);
+    expect(d.programStatusBlock()).toBeNull();
+    expect(d.programStatusActive()).toBe(false);
+    d.dispose();
+  });
+
+  it.each(['permission', 'approval', undefined] as const)('preserves a concurrent %s block', kind => {
+    const d = detector();
+    d.observeProgramStatus({ state: 'working' });
+    d.observeProgramStatus({ state: 'blocked', id: 'gate', kind });
+    d.observeProgramStatus({ state: 'blocked', id: 'ask', kind: 'question' });
+    d.noteTranscriptTerminal();
+    d.fireIdle();
+    vi.advanceTimersByTime(5_000);
+    expect(d.releaseStaleQuestionStatus()).toBe(false);
+    d.dispose();
+  });
+
+  it('preserves an active child even when the main transcript has ended', () => {
+    const d = detector();
+    d.observeProgramStatus({ state: 'working' });
+    d.observeProgramStatus({ state: 'working', id: 'background' });
+    d.observeProgramStatus({ state: 'blocked', id: 'ask', kind: 'question' });
+    d.noteTranscriptTerminal();
+    vi.advanceTimersByTime(5_000);
+    expect(d.releaseStaleQuestionStatus()).toBe(false);
+    d.dispose();
+  });
+
+  it('retains unknown busy children after status-table overflow', () => {
+    const d = detector();
+    d.observeProgramStatus({ state: 'working' });
+    const count = PROGRAM_STATUS_RECORD_CAP * 4;
+    for (let i = 0; i < count; i++) d.observeProgramStatus({ state: 'working', id: `background-${i}` });
+    // Retire only the newest children that still fit beside the root record;
+    // older evicted children have never reported a terminal.
+    for (let i = count - PROGRAM_STATUS_RECORD_CAP + 1; i < count; i++) d.observeProgramStatus({ state: 'done', id: `background-${i}` });
+    d.observeProgramStatus({ state: 'blocked', id: 'ask', kind: 'question' });
+    d.noteTranscriptTerminal();
+    vi.advanceTimersByTime(5_000);
+    expect(d.releaseStaleQuestionStatus()).toBe(false);
+    d.dispose();
+  });
+
+  it.each(['input', 'working', 'child-working', 'question', 'transcript'] as const)('does not reuse an old completion after a new %s cycle', change => {
+    const d = detector();
+    d.observeProgramStatus({ state: 'working' });
+    d.observeProgramStatus({ state: 'blocked', id: 'ask', kind: 'question' });
+    d.noteTranscriptTerminal();
+    d.fireIdle();
+    if (change === 'input') d.reset({ inputCycle: true });
+    else if (change === 'transcript') d.noteTranscriptTurnStarted();
+    else if (change === 'child-working') {
+      d.observeProgramStatus({ state: 'working', id: 'child' });
+      d.observeProgramStatus({ state: 'blocked', id: 'child', kind: 'question' });
+    } else if (change === 'question') d.observeProgramStatus({ state: 'blocked', kind: 'question' });
+    else d.observeProgramStatus({ state: 'working' });
+    vi.advanceTimersByTime(5_000);
+    expect(d.releaseStaleQuestionStatus()).toBe(false);
+    d.dispose();
   });
 });
 

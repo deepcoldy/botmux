@@ -1,6 +1,6 @@
 import { guardSessionDirectoryWrites, reserveManagedDirectories } from './managed-directory-retention.js';
 import { resolveCodexProfileHome } from './codex-profiles.js';
-import { sessionContractStore } from './session-contract-store.js';
+import { isContractOnlyDatabase, sessionContractStore } from './session-contract-store.js';
 import { sessionContractsEnabled, type ControlKind } from './session-contract.js';
 import { readFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync, copyFileSync, realpathSync } from 'node:fs';
 import { join, dirname, basename, resolve, relative, isAbsolute } from 'node:path';
@@ -6220,6 +6220,16 @@ export function listActiveSessionIdsAcrossStores(
   for (const ref of refs) {
     const db = openDbForRead(ref.path);
     try {
+      const tables = new Set((db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[])
+        .map(table => table.name));
+      if (!tables.has('sessions') && isContractOnlyDatabase(db)) {
+        const known = (opts.knownAppIds ?? (() => knownBotAppIds({ dataDir, strict: true })))();
+        // Contract-store probes can leave their namespace under session-stores.
+        // Only an unregistered, positively recognized non-session store is
+        // absent from the inventory. A configured bot's missing table still
+        // fails closed, as do corrupt or unknown database formats.
+        if (!known.has(ref.appId)) continue;
+      }
       const rows = db.prepare("SELECT session_id FROM sessions WHERE status = 'active'").all() as { session_id: string }[];
       for (const r of rows) ids.add(r.session_id);
     } finally {

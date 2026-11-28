@@ -540,6 +540,7 @@ import { pinWorkerTraeHome } from './services/traex-paths.js';
 import { drainTraexRollout, traexResumeTargetLeftInDefaultHome, resolveTraexResumeSessionId, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, traexSessionIdFromRolloutPath, traexProcessFileSource, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
 import { bridgeCodexUserInput, postCodexAsk } from './services/codex-user-input.js';
 import { TraexQuestionBridge } from './core/traex-question-bridge.js';
+import { TraexTurnCompletionTracker } from './services/traex-turn-completion.js';
 import type { AskQuestion, AskResult } from './core/ask-types.js';
 import { traexQuestionFlowVisible, traexPendingAsyncQuestionCount, traexPendingAsyncQuestionVisible, parseTraexQuestionPage, traexQuestionSignature, traexQuestionState, type TraexQuestionPage } from './utils/traex-question-page.js';
 import { antigravityBlockingPageTail } from './utils/antigravity-blocking-page.js';
@@ -20881,6 +20882,8 @@ function maybeFollowCodexRolloutRotation(fresh = false): void {
   codexBridgeAttach(next, 'fresh-empty');
 }
 
+const traexTurnCompletion = new TraexTurnCompletionTracker();
+
 function codexBridgeIngest(opts: {
   signalIdle?: boolean;
   hydrationOwnerKey?: string;
@@ -20984,7 +20987,13 @@ function codexBridgeIngest(opts: {
   // the flush's own bridge mark must queue behind it, not ahead of it.
   noteSpawnArgvTurnStartTranscriptEvidence(result.events);
   opts.onDrainedEvents?.(result.events);
+  const traexLifecycle = structuredBridgeIs('traex') ? traexTurnCompletion.observe(result.events, cliSpawnGeneration) : undefined;
+  if (traexLifecycle?.started) idleDetector?.noteTranscriptTurnStarted();
   pruneExpiredStructuredHeadsAndEmit('structured ingest');
+  if (traexLifecycle?.completed
+    && !codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined)) {
+    idleDetector?.noteTranscriptTerminal();
+  }
   // TRAE's structured assistant_final is authoritative. Emit immediately so
   // result delivery never depends on the remote TUI composer being recognized
   // as ready after ANSI/CUP redraws.
@@ -26051,7 +26060,20 @@ function traexQuestionBridgeActive(): boolean {
  *  arrives in the same burst as the page, ahead of the renderer: it holds
  *  input until the page itself is on screen to be read. */
 function traexQuestionBlockReported(): boolean {
-  return idleDetector?.programStatusBlock()?.kind === 'question';
+  if (idleDetector?.programStatusBlock()?.kind !== 'question') return false;
+  if (traexQuestionBridgeActive() && backend && cliAdapter?.screenShowsNoPendingInput) {
+    try {
+      // Cached composer frames can precede the question's render. Only the
+      // current pane plus this cycle's exact terminal may retire its signal.
+      const screen = captureBackendScreen(backend, { preserveFormatting: true });
+      if (cliAdapter.screenShowsNoPendingInput(screen)
+        && idleDetector.releaseStaleQuestionStatus?.()) {
+        log('Released stale TRAE question status after transcript completion and a fresh idle composer');
+        return false;
+      }
+    } catch { /* unavailable capture keeps the question hold */ }
+  }
+  return true;
 }
 
 /** Input must stay off the question flow (see hookReviewHoldBlocks): typed
@@ -28589,11 +28611,12 @@ function armInputDeliveryQuarantine(
     quarantine.cancelReceipt = () => receipts.clear();
     // Consecutive polls on which the CLI showed no pending input at all.
     let noPendingInputPolls = 0;
+    const receiptIsCurrent = () => inputDeliveryQuarantine === quarantine
+      && backend === target && cliSpawnGeneration === quarantine.generation
+      && !cliRestartInProgress
+      && (!nativeSessionId || inputDeliveryObservedCliSessionId === nativeSessionId);
     receipts.watch('quarantined-input', {
-      isCurrent: () => inputDeliveryQuarantine === quarantine
-        && backend === target && cliSpawnGeneration === quarantine.generation
-        && !cliRestartInProgress
-        && (!nativeSessionId || inputDeliveryObservedCliSessionId === nativeSessionId),
+      isCurrent: receiptIsCurrent,
       recheck: async () => {
         // While attribution is live, its existing confirmation/terminal path
         // owns recovery. In particular, do not race its awaited recheck.
@@ -28601,6 +28624,7 @@ function armInputDeliveryQuarantine(
           && (codexBridgeQueue.hasPendingTurn(quarantine.turnId, quarantine.dispatchAttempt)
             || codexBridgeQueue.hasTerminalTurn(quarantine.turnId, quarantine.dispatchAttempt))) return false;
         const result = recheck ? await recheck() : false;
+        if (!receiptIsCurrent()) return false;
         const expectedSessionId = nativeSessionId ?? inputDeliveryObservedCliSessionId;
         if (typeof result === 'object' && result && result.ownershipProven === true
           && !!result.cliSessionId
@@ -28609,7 +28633,8 @@ function armInputDeliveryQuarantine(
         // warning), this observer is the only release: a draft cleared or
         // replaced by hand never produces a receipt.
         const screen = cliAdapter?.screenShowsNoPendingInput && backendScreenEvidenceIsAuthoritativeForMutation()
-          ? captureBackendScreen(target) : '';
+          ? captureBackendScreen(target, { preserveFormatting: lastInitConfig?.cliId === 'traex' }) : '';
+        if (!receiptIsCurrent()) return false;
         if (screen && cliAdapter!.screenShowsNoPendingInput!(screen)) {
           if (++noPendingInputPolls >= 2) {
             log(`${cliName()} no longer holds the quarantined input (empty idle composer on two receipt polls) — releasing`);
@@ -30859,7 +30884,7 @@ function scheduleSubmitFailureNotify(
     if (effectiveBackendType !== 'zmx') {
       try {
         submitDiagnosisScreen = backend
-          ? captureBackendScreen(backend)
+          ? captureBackendScreen(backend, { preserveFormatting: lastInitConfig?.cliId === 'traex' })
           : (lastAnalyzerSnapshot || renderer?.rawSnapshot() || '');
       } catch { submitDiagnosisScreen = ''; }
     }
@@ -34999,8 +35024,11 @@ function seedBackendScreen(source: string, be: Pick<SessionBackend, 'captureCurr
   }
 }
 
-function captureBackendScreen(be: Pick<SessionBackend, 'captureCurrentScreen' | 'captureViewport'>): string {
-  return be.captureViewport?.() ?? be.captureCurrentScreen?.() ?? renderer?.rawSnapshot() ?? '';
+function captureBackendScreen(
+  be: Pick<SessionBackend, 'captureCurrentScreen' | 'captureViewport'>,
+  opts: { preserveFormatting?: boolean } = {},
+): string {
+  return be.captureViewport?.() ?? be.captureCurrentScreen?.() ?? renderer?.rawSnapshot(opts) ?? '';
 }
 
 function canCaptureBusyPatternScreen(be: Pick<SessionBackend, 'captureCurrentScreen' | 'captureViewport'>): boolean {

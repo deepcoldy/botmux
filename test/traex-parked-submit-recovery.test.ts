@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createTraexAdapter } from '../src/adapters/cli/traex.js';
+import { createTraexAdapter, traexScreenShowsNoPendingInput } from '../src/adapters/cli/traex.js';
+import { createQueuedActivationReceiptObserver } from '../src/services/queued-activation-receipts.js';
 import { traexComposerHoldsInput, traexRestoredComposerReady } from '../src/adapters/cli/traex-footer.js';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import { InputDeliveryEvidenceTracker } from '../src/services/input-delivery-evidence.js';
@@ -12,6 +13,7 @@ import { claudeComposerHoldsInput, decideSessionStartGatedSubmitWarning, diagnos
 import { screenMayShowCredential } from '../src/core/cli-startup-blocker.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { classifyStuckPage } from '../src/utils/stuck-detector.js';
+import { TerminalRenderer } from '../src/utils/terminal-renderer.js';
 
 const content = '查询大盘状态';
 const composer = (body: string) => `Earlier conversation\n─────────────────────────\n❯ ${body}\n  GPT-6-Astra xhigh · Context 99% left\n  ? for shortcuts`;
@@ -58,6 +60,7 @@ function fixture(options: { acceptsRescue?: boolean; screen?: string; dispatchAt
     cliRestartInProgress: false, lastInitConfig: { cliId: 'traex' },
     webTerminalInputGeneration: 1, cliInterruptGeneration: 0, cliLifetimeNonce: 'lifetime',
     inputDeliveryQuarantine: null, inputDeliveryEvidence: evidence, codexBridgeQueue: queue,
+    createQueuedActivationReceiptObserver,
     submitFailureChains: chain, combineSubmitCurrentFences, settleDeferredSubmitConfirmation,
     usageLimitTracker: { currentTurn: () => 1, detectedThisTurn: () => false },
     submitActivityEvidenceSince: () => 'pty-output', readyGate: { isArmed: false },
@@ -89,7 +92,7 @@ function fixture(options: { acceptsRescue?: boolean; screen?: string; dispatchAt
   scope.traexQuestionCapture = loadWorkerFunction('traexQuestionCapture', scope);
   scope.submitUnconfirmedNotice = loadWorkerFunction('submitUnconfirmedNotice', scope);
   const arm = loadWorkerFunction('armInputDeliveryQuarantine', scope);
-  const quarantine = arm(backend, { turnId: 'delivery', dispatchAttempt: options.dispatchAttempt }, content);
+  const quarantine = arm(backend, { turnId: 'delivery', dispatchAttempt: options.dispatchAttempt }, content, recheck);
   const schedule = loadWorkerFunction('scheduleSubmitFailureNotify', scope);
   const onConfirmed = () => scope.releaseInputDeliveryQuarantine(quarantine, 'receipt', { redriveTerminal: true });
   const start = () => schedule(content, recheck, 'rollout', 'delivery', undefined, 1,
@@ -100,6 +103,71 @@ function fixture(options: { acceptsRescue?: boolean; screen?: string; dispatchAt
     warnings: () => scope.send.mock.calls.filter(([message]: any[]) => message.type === 'user_notify'),
   };
 }
+
+describe('unconfirmed input that left the TRAE composer', () => {
+  it('keeps native queued input through the real PTY renderer without collapsing its structural indentation', async () => {
+    const renderer = new TerminalRenderer(160, 50);
+    try {
+      const pending = `✦ Running… (1m • esc to interrupt)\nSend after tool call · esc to interrupt and send · ↑ to edit\n❯ original input\n${Array(25).fill('  continued native input').join('\n')}\n─────────────────────────\n❯ Use /skills to list available skills\n  GPT-6-Astra xhigh · Context 99% left\n  ? for shortcuts`;
+      await renderer.writeAndFlush(pending.replace(/\n/g, '\r\n'));
+      const h = fixture({ acceptsRescue: false });
+      h.scope.captureBackendScreen = loadWorkerFunction('captureBackendScreen', { renderer });
+      expect(traexScreenShowsNoPendingInput(h.scope.captureBackendScreen({}, { preserveFormatting: true }))).toBe(false);
+      h.start();
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(h.scope.inputDeliveryQuarantine).not.toBeNull();
+      expect(h.backend.write).not.toHaveBeenCalled();
+      expect(h.backend.sendSpecialKeys).not.toHaveBeenCalled();
+    } finally { renderer.dispose(); }
+  });
+
+  it('accepts only an initialized empty composer, preserving drafts, work and native queued input', () => {
+    const empty = composer('Use /skills to list available skills');
+    expect(traexScreenShowsNoPendingInput(empty)).toBe(true);
+    expect(traexScreenShowsNoPendingInput(empty.replace('99% left', '—'))).toBe(true);
+    expect(traexScreenShowsNoPendingInput(composer(content))).toBe(false);
+    expect(traexScreenShowsNoPendingInput('❯\n? for shortcuts')).toBe(false);
+    expect(traexScreenShowsNoPendingInput(`✦ 正在运行… (2m • esc to interrupt)\n${empty}`)).toBe(false);
+    const pending = `Send after tool call · esc to interrupt and send · ↑ to edit\n❯ original draft\n${Array(25).fill('  continued draft').join('\n')}\n${empty.replace('Earlier conversation\n', '')}`;
+    expect(traexScreenShowsNoPendingInput(pending)).toBe(false);
+    for (const name of ['traex-0.214.1-single-160x50.txt', 'traex-0.214.1-submit-confirm-160x50.txt']) {
+      expect(traexScreenShowsNoPendingInput(readFileSync(`test/fixtures/traex-question/${name}`, 'utf8'))).toBe(false);
+    }
+  });
+
+  it('releases an ordinary submit after two empty screens without resending the original', async () => {
+    const h = fixture({ acceptsRescue: false, screen: composer('Use /skills to list available skills') });
+    h.start();
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(h.scope.inputDeliveryQuarantine).not.toBeNull();
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(h.scope.inputDeliveryQuarantine).not.toBeNull();
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(h.scope.inputDeliveryQuarantine).toBeNull();
+    expect(h.chain.size()).toBe(0);
+    expect(h.backend.write).not.toHaveBeenCalled();
+    expect(h.backend.sendSpecialKeys).not.toHaveBeenCalled();
+    expect(h.scope.flushPending).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(h.chain.size()).toBe(0);
+    expect(h.warnings()).toHaveLength(1);
+  });
+
+  it('resets the empty-screen count if a draft reappears between polls', async () => {
+    const h = fixture({ acceptsRescue: false, screen: composer('Use /skills to list available skills') });
+    h.start();
+    await vi.advanceTimersByTimeAsync(20_000);
+    h.setScreen(composer(`[Pasted Content ${Array.from(content).length} chars]`));
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(h.scope.inputDeliveryQuarantine).not.toBeNull();
+    h.setScreen(composer('Use /skills to list available skills'));
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(h.scope.inputDeliveryQuarantine).not.toBeNull();
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(h.scope.inputDeliveryQuarantine).toBeNull();
+    expect(h.backend.write).not.toHaveBeenCalled();
+  });
+});
 
 describe('TRAE parked draft recovery', () => {
   it.each([content, `[Pasted Content ${Array.from(content).length} chars]`])(
