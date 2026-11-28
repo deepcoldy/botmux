@@ -11,9 +11,10 @@ import type { CliAdapter } from './types.js';
 
 export { atomcodeDataDir } from '../../services/atomcode-models.js';
 
-/** Long-lived framed runner driving native `atomcode acp` per turn. Native ACP
- *  session IDs are persisted through the runner control channel and restored
- *  via `session/resume`. */
+/** Long-lived framed runner reusing a session-scoped native `atomcode acp`
+ *  process across turns with automatic idle lease release. Native ACP session
+ *  IDs are persisted through the runner control channel and restored via
+ *  `session/resume` after idle release or crash/restart. */
 export function createAtomcodeAdapter(pathOverride?: string): CliAdapter {
   const rawBin = pathOverride ?? 'atomcode';
   let cachedBin: string | undefined;

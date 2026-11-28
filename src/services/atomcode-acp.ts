@@ -15,26 +15,57 @@ export const ATOMCODE_FINAL_MAX_BYTES = 8_000_000;
 const MAX_JSON_STRING_ESCAPE_RATIO = 6;
 const MAX_FRAME_BYTES = ATOMCODE_FINAL_MAX_BYTES * MAX_JSON_STRING_ESCAPE_RATIO + 4096;
 const REQUEST_TIMEOUT_MS = 30_000;
-const CLOSE_REQUEST_TIMEOUT_MS = 3_000;
+// Slightly above AtomCode's own 5s stop_and_wait bound so graceful session/close
+// is not truncated before the runtime commits state and drops its .lease lock.
+const CLOSE_REQUEST_TIMEOUT_MS = 6_000;
+// Brief cooperative window after `session/cancel` so AtomCode can drop its
+// `setsid()` bash tool children before we SIGTERM the ACP process group.
+const CANCEL_GRACE_TIMEOUT_MS = 1_500;
 const GRACEFUL_EXIT_TIMEOUT_MS = 1_500;
+// Bounded cross-process lease-contention retry window on session/resume|load.
+// Covers an overlapping retiring runner's graceful teardown ceiling
+// (CLOSE_REQUEST_TIMEOUT_MS + GRACEFUL_EXIT_TIMEOUT_MS + SIGKILL escalation)
+// when worker PTY restart respawns after 500ms, while still failing closed if
+// another process holds the session indefinitely.
+const RESUME_LEASE_WAIT_MS = 10_000;
+const RESUME_LEASE_RETRY_INTERVAL_MS = 500;
+// Confirmed on the official AtomCode 5.2.9 Linux binary and its v5.2.9
+// acp/dispatch.rs map_resume_start_error(): session/resume and session/load
+// share this SessionInUse mapping. Do not broaden this to other invalid-params.
+const RESUME_LEASE_CONFLICT_DATA = 'session is active in another atomcode process; close it before resuming';
+// Idle drain window (and hard cap) after OS process 'exit' before destroying stdio
+// pipes and failing pending RPCs. Resetting on active stdout chunks avoids cutting off
+// near-cap frames whose JSON.parse exceeds 50ms, while still bounding detached grandchildren.
+const EXIT_STDIO_DRAIN_MS = 50;
+const EXIT_STDIO_DRAIN_MAX_MS = 500;
+const PROCESS_GROUP_REAP_TIMEOUT_MS = 500;
+const DEFAULT_ATOMCODE_IDLE_RELEASE_MS = 120_000;
 
-export interface AtomcodeAcpOptions {
+export type AtomcodeUserInputHandler = (
+  method: 'elicitation/create' | 'session/request_permission',
+  params: Json,
+  signal: AbortSignal,
+) => Promise<unknown>;
+
+export interface AtomcodeAcpTurnOptions {
+  content: string;
+  onUpdate?: (update: Json) => void;
+  onUserInput: AtomcodeUserInputHandler;
+  onInteractionPending?: (waiting: boolean) => void;
+}
+
+export interface AtomcodeAcpSessionOptions {
   executable: string;
   cwd: string;
   env: NodeJS.ProcessEnv;
-  content: string;
   nativeSessionId?: string;
   model?: string;
   effort?: string;
   permission: 'full' | 'smart';
+  /** Release an idle ACP child and its session lease after this many ms.
+   *  Defaults to 120_000ms; 0 closes after every turn. */
+  idleTimeoutMs?: number;
   onSession?: (sessionId: string) => void;
-  onUpdate?: (update: Json) => void;
-  onUserInput: (
-    method: 'elicitation/create' | 'session/request_permission',
-    params: Json,
-    signal: AbortSignal,
-  ) => Promise<unknown>;
-  onInteractionPending?: (waiting: boolean) => void;
 }
 
 export interface AtomcodeAcpResult {
@@ -44,6 +75,18 @@ export interface AtomcodeAcpResult {
 
 const isObject = (value: unknown): value is Json =>
   !!value && typeof value === 'object' && !Array.isArray(value);
+
+/** Parse an optional --idle-timeout-ms value: 0 disables reuse, positive ints
+ *  set the idle lease-release window in ms. */
+export function parseAtomcodeIdleTimeout(raw: string | undefined): number {
+  if (raw === undefined) return DEFAULT_ATOMCODE_IDLE_RELEASE_MS;
+  if (!/^\d+$/.test(raw)) throw new Error('invalid_atomcode_idle_timeout');
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed < 0 || parsed > 2_147_483_647) {
+    throw new Error('invalid_atomcode_idle_timeout');
+  }
+  return parsed;
+}
 
 /** Split NDJSON lines by byte delimiter so multi-byte UTF-8 characters can span reads. */
 export function createAtomcodeFrameReader(onLine: (line: string) => void | boolean) {
@@ -66,141 +109,680 @@ export function createAtomcodeFrameReader(onLine: (line: string) => void | boole
   };
 }
 
-/** Wire client for AtomCode's ACP v1 NDJSON stdio server. One owned process per
- *  Botmux turn; session/resume continues persisted native sessions, and clean
- *  session/close + stdin EOF releases the native session lease before exit. */
-export async function runAtomcodeAcp(
-  opts: AtomcodeAcpOptions,
-  signal: AbortSignal,
-): Promise<AtomcodeAcpResult> {
-  signal.throwIfAborted();
-  const env = { ...opts.env };
-  applySessionOwnerEnv(env, opts.env.BOTMUX_OWNER_OPEN_ID);
-  // Global flags precede `acp`; --model is intentionally applied via session/set_config_option
-  // below so logical model IDs switch both owning account and wire model.
-  const cliArgs = [
-    '--no-telemetry',
-    ...(opts.permission === 'full' ? ['--dangerously-skip-permissions'] : []),
-    'acp',
-  ];
-  const child = spawnOwnedModelProcess(opts.executable, cliArgs, { cwd: opts.cwd, env });
-  const lifetime = new AbortController();
-  const inputSignal = AbortSignal.any([signal, lifetime.signal]);
-  let sessionId: string | undefined;
-  let prompting = false;
-  let success = false;
-  let closing = false;
-  let failure: Error | undefined;
-  let nextId = 1;
-  let content = '';
-  let contentBytes = 0;
-  let messageId: string | undefined;
-  let nextMessage = false;
-  let hardKill: ReturnType<typeof setTimeout> | undefined;
-  const pending = new Map<
-    number,
-    {
-      method: string;
-      resolve: (value: Json) => void;
-      reject: (error: Error) => void;
-      timer?: ReturnType<typeof setTimeout>;
-    }
-  >();
-  const incoming = new Set<number | string>();
-  let childExited = false;
-  const exited = new Promise<void>(resolve => {
-    child.once('close', () => {
-      childExited = true;
+interface PendingRpc {
+  method: string;
+  resolve: (value: Json) => void;
+  reject: (error: Error) => void;
+  timer?: ReturnType<typeof setTimeout>;
+}
+
+/** Per-turn state allocated fresh on every `prompt()` call so message buffers,
+ *  in-flight human interactions, and cancellation signals never leak across
+ *  consecutive turns sharing one persistent ACP connection. */
+interface ActiveTurnState {
+  turnLifetime: AbortController;
+  inputSignal: AbortSignal;
+  aborted: boolean;
+  closed: boolean;
+  interactionPending: boolean;
+  content: string;
+  contentBytes: number;
+  messageId?: string;
+  nextMessage: boolean;
+  incoming: Map<number | string, 'elicitation/create' | 'session/request_permission'>;
+  turnSettled: Promise<void>;
+  resolveTurnSettled: () => void;
+  onUpdate?: (update: Json) => void;
+  onUserInput: AtomcodeUserInputHandler;
+  onInteractionPending?: (waiting: boolean) => void;
+}
+
+interface OpenConnectionOptions {
+  executable: string;
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  nativeSessionId?: string;
+  model?: string;
+  effort?: string;
+  permission: 'full' | 'smart';
+  onSession?: (sessionId: string) => void;
+  onDisconnected?: () => void;
+}
+
+class AtomcodeAcpRpcError extends Error {
+  constructor(
+    detail: string,
+    readonly code?: number,
+    readonly data?: unknown,
+  ) {
+    super(`atomcode ACP: ${detail}`);
+  }
+}
+
+/** Retry only the exact SessionInUse wire error emitted by AtomCode 5.2.9;
+ * unknown sessions, cwd mismatches, auth failures, and other RPC errors stay fail-fast. */
+function isResumeLeaseBusyError(error: unknown): boolean {
+  return error instanceof AtomcodeAcpRpcError
+    && error.code === -32602
+    && error.data === RESUME_LEASE_CONFLICT_DATA;
+}
+
+function sleepWithAbort(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.reject(new Error('atomcode_acp_aborted'));
+  return new Promise<void>((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new Error('atomcode_acp_aborted'));
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
       resolve();
-    });
+    }, ms);
+    signal.addEventListener('abort', onAbort, { once: true });
   });
-  const kill = (sig: NodeJS.Signals) => {
-    if (!child.pid || childExited) return;
-    try { process.kill(-child.pid, sig); } catch { child.kill(sig); }
-  };
-  const rejectPending = (error: Error) => {
-    for (const p of pending.values()) {
+}
+
+/** Race a wait against caller abort without cancelling the underlying promise,
+ *  so an in-flight teardown still finishes releasing its OS `.lease` lock. */
+function awaitWithAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(new Error('atomcode_acp_aborted'));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(new Error('atomcode_acp_aborted'));
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      value => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      error => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+/** Single owned `atomcode acp` subprocess holding one initialized, configured
+ *  ACP session. Reusable across consecutive turns while healthy; torn down
+ *  cleanly via `session/close` + stdin EOF on idle release or forcefully reaped
+ *  as a process group on any abort or protocol failure. */
+class AtomcodeAcpConnection {
+  private readonly child: ReturnType<typeof spawnOwnedModelProcess>;
+  private readonly lifetime = new AbortController();
+  private readonly pending = new Map<number, PendingRpc>();
+  private readonly exited: Promise<void>;
+  private readonly onDisconnected?: () => void;
+
+  private sessionId = '';
+  private canClose = false;
+  private nextId = 1;
+  private childExited = false;
+  // Separate close intent from wire shutdown: closingRequested blocks new turn
+  // reuse immediately while wireClosed stays false until session/close receives its reply.
+  private closingRequested = false;
+  private wireClosed = false;
+  private failure?: Error;
+  private exitDrainTimer?: ReturnType<typeof setTimeout>;
+  private exitDrainDeadline?: number;
+  private hardKill?: ReturnType<typeof setTimeout>;
+  private cancelGraceWait?: () => void;
+  private activeTurn?: ActiveTurnState;
+  private closedPromise?: Promise<void>;
+
+  private constructor(opts: OpenConnectionOptions) {
+    const env = { ...opts.env };
+    applySessionOwnerEnv(env, opts.env.BOTMUX_OWNER_OPEN_ID);
+    // Global flags precede `acp`; --model is intentionally applied via session/set_config_option
+    // below so logical model IDs switch both owning account and wire model.
+    const cliArgs = [
+      '--no-telemetry',
+      ...(opts.permission === 'full' ? ['--dangerously-skip-permissions'] : []),
+      'acp',
+    ];
+    this.child = spawnOwnedModelProcess(opts.executable, cliArgs, { cwd: opts.cwd, env });
+    this.onDisconnected = opts.onDisconnected;
+    let markExited!: () => void;
+    this.exited = new Promise<void>(resolve => {
+      markExited = () => {
+        if (this.childExited) return;
+        this.childExited = true;
+        resolve();
+      };
+    });
+
+    const finalizeExitFailure = () => {
+      clearTimeout(this.exitDrainTimer);
+      this.exitDrainTimer = undefined;
+      this.exitDrainDeadline = undefined;
+      this.destroyStreams();
+      if (!this.wireClosed) this.fail(new Error('atomcode_acp_process_exited'));
+    };
+
+    const scheduleExitDrain = () => {
+      clearTimeout(this.exitDrainTimer);
+      this.exitDrainDeadline ??= Date.now() + EXIT_STDIO_DRAIN_MAX_MS;
+      const remaining = this.exitDrainDeadline - Date.now();
+      if (remaining <= 0) {
+        finalizeExitFailure();
+        return;
+      }
+      this.exitDrainTimer = setTimeout(finalizeExitFailure, Math.min(EXIT_STDIO_DRAIN_MS, remaining));
+      this.exitDrainTimer.unref?.();
+    };
+
+    const readFrames = createAtomcodeFrameReader(line => {
+      this.handleMessage(JSON.parse(line));
+      return !this.failure && !this.wireClosed;
+    });
+    this.child.stdout.on('data', (chunk: Buffer) => {
+      if (this.failure || this.wireClosed) return;
+      try {
+        readFrames(chunk);
+      } catch (error) {
+        this.fail(error instanceof Error ? error : new Error('atomcode_acp_protocol_invalid'));
+        return;
+      }
+      if (this.childExited && this.exitDrainTimer && !this.wireClosed && !this.failure) {
+        scheduleExitDrain();
+      }
+    });
+    // Settle immediately on stdout EOF after exit even if a detached grandchild still holds stderr open.
+    this.child.stdout.once('end', () => {
+      if (this.childExited) finalizeExitFailure();
+    });
+    // Drain stderr without retaining it so verbose tool diagnostics cannot exhaust memory or block the pipe.
+    this.child.stderr.resume();
+    this.child.stdin.on('error', () => this.fail(new Error('atomcode_acp_transport_closed')));
+    this.child.stdout.on('error', () => { /* ignore errors after bounded pipe destroy */ });
+    this.child.stderr.on('error', () => { /* ignore errors after bounded pipe destroy */ });
+    this.child.on('error', () => {
+      markExited();
+      this.destroyStreams();
+      this.fail(new Error('atomcode_acp_spawn_failed'));
+    });
+    // Track OS process exit separately from stdio 'close': a detached grandchild
+    // that inherited stdout/stderr can prevent 'close' from ever firing after the
+    // ACP process itself has exited. Give in-flight RPCs only a bounded idle drain
+    // window for buffered stdout frames before destroying pipes and failing RPCs.
+    this.child.once('exit', () => {
+      markExited();
+      try { this.child.stdin.destroy(); } catch { /* ignore */ }
+      if (this.wireClosed) {
+        this.destroyStreams();
+        return;
+      }
+      if ((this.pending.size === 0 && !this.activeTurn)
+        || this.child.stdout.readableEnded
+        || this.child.stdout.destroyed) {
+        finalizeExitFailure();
+      } else {
+        scheduleExitDrain();
+      }
+    });
+    this.child.once('close', () => {
+      markExited();
+      finalizeExitFailure();
+    });
+  }
+
+  /** Spawn an owned `atomcode acp` process, complete the v1 handshake, bind
+   *  or resume the native session, and apply mode/model/effort config options.
+   *  Detaches the caller's abort listener once open so Turn 1's signal never
+   *  stays pinned to a long-lived connection; any failure reaps the child. */
+  static async open(
+    opts: OpenConnectionOptions,
+    signal: AbortSignal,
+  ): Promise<AtomcodeAcpConnection> {
+    signal.throwIfAborted();
+    const conn = new AtomcodeAcpConnection(opts);
+    const onOpenAbort = () => conn.fail(new Error('atomcode_acp_aborted'));
+    signal.addEventListener('abort', onOpenAbort, { once: true });
+    try {
+      if (signal.aborted) onOpenAbort();
+      const init = await conn.request('initialize', {
+        protocolVersion: 1,
+        clientInfo: { name: 'botmux', version: '1' },
+        clientCapabilities: { elicitation: { form: {} } },
+      });
+      if (init.protocolVersion !== 1) throw new Error('atomcode_acp_version_unsupported');
+      conn.canClose = isObject(init.agentCapabilities?.sessionCapabilities?.close);
+
+      let control: Json;
+      if (opts.nativeSessionId) {
+        conn.sessionId = opts.nativeSessionId;
+        const canResume = isObject(init.agentCapabilities?.sessionCapabilities?.resume);
+        const canLoad = init.agentCapabilities?.loadSession === true;
+        if (!canResume && !canLoad) throw new Error('atomcode_acp_resume_unsupported');
+        const method = canResume ? 'session/resume' : 'session/load';
+        control = await conn.resumeWithLeaseWait(method, {
+          sessionId: conn.sessionId,
+          cwd: opts.cwd,
+          mcpServers: [],
+        }, signal);
+        if (control.sessionId !== undefined && control.sessionId !== conn.sessionId) {
+          throw new Error('atomcode_acp_resume_mismatch');
+        }
+      } else {
+        control = await conn.request('session/new', { cwd: opts.cwd, mcpServers: [] });
+        if (typeof control.sessionId !== 'string' || !control.sessionId) {
+          throw new Error('atomcode_acp_session_invalid');
+        }
+        conn.sessionId = control.sessionId;
+      }
+      opts.onSession?.(conn.sessionId);
+
+      const configure = async (configId: string, value: string) => {
+        const option = Array.isArray(control.configOptions)
+          ? control.configOptions.find((entry: Json) => entry.id === configId)
+          : undefined;
+        if (!option || !Array.isArray(option.options) || !option.options.some((entry: Json) => entry.value === value)) {
+          throw new Error(`atomcode ACP 不支持配置 ${configId}=${value}`);
+        }
+        if (option.currentValue !== value) {
+          control = await conn.request('session/set_config_option', {
+            sessionId: conn.sessionId,
+            configId,
+            value,
+          });
+        }
+      };
+
+      const desiredMode = opts.permission === 'full' ? 'bypass' : 'build';
+      await configure('mode', desiredMode);
+      if (opts.model?.trim()) {
+        await configure('model', opts.model.trim());
+      }
+      if (opts.effort?.trim()) {
+        await configure('reasoning_effort', opts.effort.trim());
+      }
+      return conn;
+    } catch (error) {
+      await conn.close(false);
+      throw error;
+    } finally {
+      signal.removeEventListener('abort', onOpenAbort);
+    }
+  }
+
+  isReusable(): boolean {
+    return !this.failure
+      && !this.closingRequested
+      && !this.wireClosed
+      && !this.childExited
+      && !this.activeTurn
+      && this.child.exitCode === null
+      && this.child.signalCode === null
+      && !this.child.stdin.destroyed
+      && !this.child.stdin.writableEnded;
+  }
+
+  /** Execute a single `session/prompt` turn on this live connection. Leaves
+   *  the connection warm on `end_turn`; any error, abort, or non-`end_turn`
+   *  stop reason tears down the entire process group so neither wire framing
+   *  nor child tool processes can poison subsequent turns. */
+  async prompt(turn: AtomcodeAcpTurnOptions, signal: AbortSignal): Promise<AtomcodeAcpResult> {
+    signal.throwIfAborted();
+    if (!this.isReusable()) {
+      throw this.failure ?? new Error('atomcode_acp_closed');
+    }
+
+    const turnLifetime = new AbortController();
+    const inputSignal = AbortSignal.any([signal, turnLifetime.signal, this.lifetime.signal]);
+    let resolveTurnSettled!: () => void;
+    const turnSettled = new Promise<void>(resolve => { resolveTurnSettled = resolve; });
+    const state: ActiveTurnState = {
+      turnLifetime,
+      inputSignal,
+      aborted: false,
+      closed: false,
+      interactionPending: false,
+      content: '',
+      contentBytes: 0,
+      messageId: undefined,
+      nextMessage: false,
+      incoming: new Map<number | string, 'elicitation/create' | 'session/request_permission'>(),
+      turnSettled,
+      resolveTurnSettled,
+      onUpdate: turn.onUpdate,
+      onUserInput: turn.onUserInput,
+      onInteractionPending: turn.onInteractionPending,
+    };
+    this.activeTurn = state;
+
+    let cancelTimer: ReturnType<typeof setTimeout> | undefined;
+    const onTurnAbort = () => {
+      if (state.aborted) return;
+      state.aborted = true;
+      turnLifetime.abort(new Error('atomcode_acp_aborted'));
+      if (this.sessionId && this.activeTurn === state && !this.failure && !this.wireClosed) {
+        try {
+          // Unpark any server-initiated permission/form RPC before session/cancel so
+          // AtomCode's inline turn loop does not stay blocked until CANCEL_GRACE_TIMEOUT_MS.
+          for (const [reqId, reqMethod] of state.incoming) {
+            const cancelResult = reqMethod === 'session/request_permission'
+              ? { outcome: { outcome: 'cancelled' } }
+              : { action: 'cancel' };
+            this.child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: reqId, result: cancelResult })}\n`);
+          }
+          state.incoming.clear();
+          this.child.stdin.write(`${JSON.stringify({
+            jsonrpc: '2.0',
+            method: 'session/cancel',
+            params: { sessionId: this.sessionId },
+          })}\n`);
+          // Allow AtomCode to process `session/cancel` and drop `setsid()` bash
+          // children before escalating to SIGTERM on the ACP process group.
+          cancelTimer = setTimeout(() => this.fail(new Error('atomcode_acp_aborted')), CANCEL_GRACE_TIMEOUT_MS);
+          cancelTimer.unref?.();
+          return;
+        } catch { /* fall through to immediate teardown */ }
+      }
+      this.fail(new Error('atomcode_acp_aborted'));
+    };
+    signal.addEventListener('abort', onTurnAbort, { once: true });
+
+    let succeeded = false;
+    try {
+      if (signal.aborted) onTurnAbort();
+      const result = await this.request(
+        'session/prompt',
+        { sessionId: this.sessionId, prompt: [{ type: 'text', text: turn.content }] },
+        false,
+      );
+      if (state.aborted || signal.aborted) {
+        throw new Error('atomcode_acp_aborted');
+      }
+      if (state.incoming.size || this.failure || state.inputSignal.aborted) {
+        throw this.failure ?? new Error('atomcode_acp_question_incomplete');
+      }
+      if (result.stopReason !== 'end_turn') {
+        throw new Error(`atomcode ACP 执行未完成：${result.stopReason ?? 'unknown'}`);
+      }
+      succeeded = true;
+      return { sessionId: this.sessionId, content: state.content };
+    } finally {
+      clearTimeout(cancelTimer);
+      signal.removeEventListener('abort', onTurnAbort);
+      // Mark the turn closed and flush interaction-pending synchronously so a
+      // late-settling onUserInput from this turn cannot flip the next turn's budget state.
+      state.closed = true;
+      state.incoming.clear();
+      if (state.interactionPending) {
+        state.interactionPending = false;
+        state.onInteractionPending?.(false);
+      }
+      if (this.activeTurn === state) this.activeTurn = undefined;
+      // Resolve turnSettled BEFORE awaiting close(false) so a concurrent close(true)
+      // waiting on cooperative cancel cannot deadlock with this finally block.
+      state.resolveTurnSettled();
+      if (!succeeded) {
+        turnLifetime.abort(new Error('atomcode_acp_closed'));
+        await this.close(false);
+      }
+    }
+  }
+
+  /** Idempotently tear down this connection. When `graceful` is true and no
+   *  turn is active, sends `session/close` + stdin EOF to let AtomCode commit
+   *  state and drop its `.lease` cleanly; when `graceful` is true during an
+   *  already-aborted active turn, lets cooperative `session/cancel` settle first;
+   *  a `close(false)` call escalates any in-flight close or cancel wait immediately. */
+  close(graceful: boolean): Promise<void> {
+    this.closingRequested = true;
+    // Wait for cooperative cancel when close(true) follows lifecycle.abort() on an active turn,
+    // so AtomCode can drop its setsid() bash children instead of being SIGKILL'd at 1ms.
+    const cooperativeCancel = graceful && this.activeTurn?.aborted ? this.activeTurn.turnSettled : undefined;
+    // Never wait on idle session/close while a prompt or human-input round-trip is active;
+    // cancel immediately so blocked onUserInput handlers unblock without stalling.
+    const effectiveGraceful = graceful && !this.activeTurn;
+    if (!effectiveGraceful && !cooperativeCancel) {
+      if (this.activeTurn && !this.activeTurn.aborted && this.sessionId && !this.failure && !this.wireClosed) {
+        try {
+          this.child.stdin.write(`${JSON.stringify({
+            jsonrpc: '2.0',
+            method: 'session/cancel',
+            params: { sessionId: this.sessionId },
+          })}\n`);
+        } catch { /* process teardown follows */ }
+      }
+      // Escalate an in-flight graceful close, cooperative cancel, or post-EOF grace wait immediately.
+      this.cancelGraceWait?.();
+      if (!this.wireClosed) {
+        this.fail(new Error('atomcode_acp_closed'));
+      } else if (!this.childExited) {
+        this.kill('SIGTERM');
+        this.hardKill ??= setTimeout(() => this.kill('SIGKILL'), 1000);
+      }
+    }
+    if (this.closedPromise) return this.closedPromise;
+    this.closedPromise = this.performClose(effectiveGraceful, cooperativeCancel);
+    return this.closedPromise;
+  }
+
+  private async performClose(graceful: boolean, waitForCancel?: Promise<void>): Promise<void> {
+    try {
+      if (waitForCancel) {
+        await waitForCancel;
+      }
+      // Close the live session before EOF so AtomCode releases the native session
+      // lease immediately before any subsequent local resume or reconnect.
+      if (graceful && !this.failure && !this.childExited && this.canClose && this.sessionId && !this.activeTurn) {
+        await this.request('session/close', { sessionId: this.sessionId }, CLOSE_REQUEST_TIMEOUT_MS)
+          .catch(() => {});
+      }
+      const allowGracefulExit = graceful && !this.failure;
+      this.wireClosed = true;
+      this.lifetime.abort();
+      this.rejectPending(new Error('atomcode_acp_closed'));
+      if (allowGracefulExit && !this.childExited) {
+        // Allow shutdown_sessions() to commit state and drop the disk lease before SIGTERM.
+        // If session/close was unavailable, EOF itself triggers AtomCode's 5s stop_and_wait.
+        const eofGraceMs = this.canClose ? GRACEFUL_EXIT_TIMEOUT_MS : CLOSE_REQUEST_TIMEOUT_MS;
+        try { this.child.stdin.end(); } catch { /* ignore */ }
+        let graceTimer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([
+          this.exited,
+          new Promise<void>(resolve => {
+            this.cancelGraceWait = resolve;
+            graceTimer = setTimeout(resolve, eofGraceMs);
+          }),
+        ]);
+        this.cancelGraceWait = undefined;
+        clearTimeout(graceTimer);
+      }
+      if (!this.childExited) {
+        this.kill('SIGTERM');
+        this.hardKill ??= setTimeout(() => this.kill('SIGKILL'), 1000);
+      }
+      await this.exited;
+      // The OWNER_GUARD group leader can exit immediately on SIGTERM while atomcode
+      // or a tool descendant is still dying; SIGKILL the group and wait briefly for
+      // kernel reaping (ESRCH) so its OS .lease fd is closed before returning.
+      this.killGroup('SIGKILL');
+      await this.waitForProcessGroupGone();
+    } finally {
+      this.wireClosed = true;
+      this.cancelGraceWait = undefined;
+      clearTimeout(this.exitDrainTimer);
+      this.exitDrainTimer = undefined;
+      this.exitDrainDeadline = undefined;
+      clearTimeout(this.hardKill);
+      this.hardKill = undefined;
+      this.destroyStreams();
+    }
+  }
+
+  private async waitForProcessGroupGone(): Promise<void> {
+    const pid = this.child.pid;
+    if (!pid) return;
+    const deadline = Date.now() + PROCESS_GROUP_REAP_TIMEOUT_MS;
+    while (true) {
+      try {
+        process.kill(-pid, 0);
+      } catch {
+        return;
+      }
+      if (Date.now() >= deadline) return;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+  }
+
+  private destroyStreams(): void {
+    try { this.child.stdin.destroy(); } catch { /* ignore */ }
+    try { this.child.stdout.destroy(); } catch { /* ignore */ }
+    try { this.child.stderr.destroy(); } catch { /* ignore */ }
+  }
+
+  /** Retry `session/resume` or `session/load` on the same initialized ACP
+   *  connection while another retiring runner releases the exclusive `.lease`.
+   *  Bounded by `RESUME_LEASE_WAIT_MS` and abortable via caller signal or child exit. */
+  private async resumeWithLeaseWait(
+    method: 'session/resume' | 'session/load',
+    params: Json,
+    signal: AbortSignal,
+  ): Promise<Json> {
+    const deadline = Date.now() + RESUME_LEASE_WAIT_MS;
+    const waitSignal = AbortSignal.any([signal, this.lifetime.signal]);
+    while (true) {
+      try {
+        return await this.request(method, params);
+      } catch (error) {
+        const remaining = deadline - Date.now();
+        if (!isResumeLeaseBusyError(error) || remaining <= 0 || waitSignal.aborted) {
+          throw error;
+        }
+        try {
+          await sleepWithAbort(Math.min(RESUME_LEASE_RETRY_INTERVAL_MS, remaining), waitSignal);
+        } catch (waitError) {
+          // Surface subprocess crash reason instead of misreporting it as caller abort.
+          if (!signal.aborted && this.failure) throw this.failure;
+          throw waitError;
+        }
+      }
+    }
+  }
+
+  private killGroup(sig: NodeJS.Signals): void {
+    if (!this.child.pid) return;
+    try { process.kill(-this.child.pid, sig); } catch { /* group already gone */ }
+  }
+
+  private kill(sig: NodeJS.Signals): void {
+    if (!this.child.pid || this.childExited) return;
+    try { process.kill(-this.child.pid, sig); } catch { this.child.kill(sig); }
+  }
+
+  private rejectPending(error: Error): void {
+    for (const p of this.pending.values()) {
       clearTimeout(p.timer);
       p.reject(error);
     }
-    pending.clear();
-  };
-  const fail = (error: Error) => {
-    if (closing) return;
-    failure ??= error;
-    lifetime.abort(error);
-    rejectPending(failure);
-    kill('SIGTERM');
-    hardKill ??= setTimeout(() => kill('SIGKILL'), 1000);
-  };
-  const write = (message: Json) => {
-    if (failure || closing || inputSignal.aborted) {
-      throw failure ?? new Error('atomcode_acp_closed');
+    this.pending.clear();
+  }
+
+  private fail(error: Error): void {
+    if (this.wireClosed) return;
+    const first = !this.failure;
+    this.failure ??= error;
+    this.lifetime.abort(error);
+    this.rejectPending(this.failure);
+    if (!this.childExited) {
+      this.kill('SIGTERM');
+      this.hardKill ??= setTimeout(() => this.kill('SIGKILL'), 1000);
     }
-    child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', ...message })}\n`);
-  };
-  const request = (
+    if (first) this.onDisconnected?.();
+  }
+
+  private write(message: Json): void {
+    if (this.failure || this.wireClosed || this.lifetime.signal.aborted) {
+      throw this.failure ?? new Error('atomcode_acp_closed');
+    }
+    this.child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', ...message })}\n`);
+  }
+
+  private request(
     method: string,
     params: Json,
     timeoutMs: number | false = REQUEST_TIMEOUT_MS,
-  ): Promise<Json> =>
-    new Promise((resolve, reject) => {
-      const id = nextId++;
+  ): Promise<Json> {
+    return new Promise((resolve, reject) => {
+      const id = this.nextId++;
       const timer = timeoutMs === false
         ? undefined
-        : setTimeout(() => fail(new Error(`atomcode ACP ${method} 超时`)), timeoutMs);
-      pending.set(id, { method, resolve, reject, timer });
+        : setTimeout(() => this.fail(new Error(`atomcode ACP ${method} 超时`)), timeoutMs);
+      this.pending.set(id, { method, resolve, reject, timer });
       try {
-        write({ id, method, params });
+        this.write({ id, method, params });
       } catch (error) {
-        fail(error instanceof Error ? error : new Error('atomcode_acp_write_failed'));
+        this.fail(error instanceof Error ? error : new Error('atomcode_acp_write_failed'));
       }
     });
+  }
 
-  const handle = (message: unknown) => {
+  private handleMessage(message: unknown): void {
     if (!isObject(message) || message.jsonrpc !== '2.0') {
       throw new Error('atomcode_acp_protocol_invalid');
     }
     if (typeof message.method === 'string') {
       if (Object.hasOwn(message, 'id')) {
-        if ((typeof message.id !== 'string' && typeof message.id !== 'number') || incoming.has(message.id)) {
+        // Server-initiated requests (permissions/forms) are only valid during an active
+        // turn; unsolicited requests while idle fail closed and tear down the connection.
+        const turn = this.activeTurn;
+        if (!turn || turn.closed) {
+          throw new Error('atomcode_acp_question_session_mismatch');
+        }
+        if ((typeof message.id !== 'string' && typeof message.id !== 'number') || turn.incoming.has(message.id)) {
           throw new Error('atomcode_acp_request_invalid');
         }
         const id = message.id;
         const params = message.params;
-        if (!prompting || !sessionId || !isObject(params) || params.sessionId !== sessionId) {
+        if (!this.sessionId || !isObject(params) || params.sessionId !== this.sessionId) {
           throw new Error('atomcode_acp_question_session_mismatch');
         }
         if (message.method !== 'elicitation/create' && message.method !== 'session/request_permission') {
-          write({ id, error: { code: -32601, message: 'Client method not supported' } });
+          this.write({ id, error: { code: -32601, message: 'Client method not supported' } });
           return;
         }
-        if (incoming.size >= 8) throw new Error('atomcode_acp_too_many_questions');
-        incoming.add(id);
-        if (incoming.size === 1) opts.onInteractionPending?.(true);
+        if (turn.incoming.size >= 8) throw new Error('atomcode_acp_too_many_questions');
         const method = message.method;
+        turn.incoming.set(id, method);
+        if (turn.incoming.size === 1) {
+          turn.interactionPending = true;
+          turn.onInteractionPending?.(true);
+        }
         void Promise.resolve()
-          .then(() => opts.onUserInput(method, params, inputSignal))
+          .then(() => turn.onUserInput(method, params, turn.inputSignal))
           .then(result => {
-            if (inputSignal.aborted || failure || closing || !prompting) return;
-            write({ id, result });
+            if (turn.closed || turn.inputSignal.aborted || this.failure || this.wireClosed || this.activeTurn !== turn) return;
+            this.write({ id, result });
           }, error => {
-            fail(error instanceof Error ? error : new Error('atomcode_acp_user_input_failed'));
+            if (turn.closed || turn.aborted) return;
+            this.fail(error instanceof Error ? error : new Error('atomcode_acp_user_input_failed'));
           })
           .finally(() => {
-            incoming.delete(id);
-            if (!incoming.size) opts.onInteractionPending?.(false);
+            if (turn.closed) return;
+            turn.incoming.delete(id);
+            if (!turn.incoming.size && turn.interactionPending) {
+              turn.interactionPending = false;
+              turn.onInteractionPending?.(false);
+            }
           })
-          .catch(error => fail(error instanceof Error ? error : new Error('atomcode_acp_user_input_failed')));
+          .catch(error => {
+            if (!turn.closed && !turn.aborted) {
+              this.fail(error instanceof Error ? error : new Error('atomcode_acp_user_input_failed'));
+            }
+          });
         return;
       }
       if (message.method !== 'session/update') return;
+      const turn = this.activeTurn;
       const params = message.params;
-      if (!isObject(params) || params.sessionId !== sessionId || !isObject(params.update)) {
-        if (!prompting) return;
+      if (!isObject(params) || params.sessionId !== this.sessionId || !isObject(params.update)) {
+        // Ignore pre-prompt replay or trailing updates while idle; reject session mismatches mid-turn.
+        if (!turn) return;
         throw new Error('atomcode_acp_update_session_mismatch');
       }
-      if (!prompting) return;
+      if (!turn || turn.closed) return;
       const update = params.update;
       if (update.sessionUpdate === 'agent_message_chunk') {
         if (update.content?.type !== 'text' || typeof update.content.text !== 'string') {
@@ -208,26 +790,26 @@ export async function runAtomcodeAcp(
         }
         const id = typeof update.messageId === 'string' ? update.messageId : undefined;
         // AtomCode advances messageId after each LLM round/Usage; reset so pre-tool prose stays out of the final reply.
-        if ((id && id !== messageId) || (!id && nextMessage)) {
-          content = '';
-          contentBytes = 0;
+        if ((id && id !== turn.messageId) || (!id && turn.nextMessage)) {
+          turn.content = '';
+          turn.contentBytes = 0;
         }
-        messageId = id;
-        nextMessage = false;
-        contentBytes += Buffer.byteLength(update.content.text);
-        if (contentBytes > ATOMCODE_FINAL_MAX_BYTES) throw new Error('atomcode_acp_content_limit');
-        content += update.content.text;
+        turn.messageId = id;
+        turn.nextMessage = false;
+        turn.contentBytes += Buffer.byteLength(update.content.text);
+        if (turn.contentBytes > ATOMCODE_FINAL_MAX_BYTES) throw new Error('atomcode_acp_content_limit');
+        turn.content += update.content.text;
       } else if (update.sessionUpdate === 'tool_call') {
-        nextMessage = true;
+        turn.nextMessage = true;
       }
-      opts.onUpdate?.(update);
+      turn.onUpdate?.(update);
       return;
     }
-    if (typeof message.id !== 'number' || !pending.has(message.id)) {
+    if (typeof message.id !== 'number' || !this.pending.has(message.id)) {
       throw new Error('atomcode_acp_response_unknown');
     }
-    const entry = pending.get(message.id)!;
-    pending.delete(message.id);
+    const entry = this.pending.get(message.id)!;
+    this.pending.delete(message.id);
     clearTimeout(entry.timer);
     if (isObject(message.error)) {
       const detail = typeof message.error.data === 'string' && message.error.data
@@ -235,136 +817,203 @@ export async function runAtomcodeAcp(
         : typeof message.error.message === 'string'
           ? message.error.message
           : 'request failed';
-      entry.reject(new Error(`atomcode ACP: ${detail}`));
+      entry.reject(new AtomcodeAcpRpcError(
+        detail,
+        typeof message.error.code === 'number' ? message.error.code : undefined,
+        message.error.data,
+      ));
     } else if (isObject(message.result)) {
       entry.resolve(message.result);
     } else {
       entry.reject(new Error('atomcode_acp_result_invalid'));
     }
-  };
+  }
+}
 
-  const readFrames = createAtomcodeFrameReader(line => {
-    handle(JSON.parse(line));
-    return !failure && !closing;
-  });
-  child.stdout.on('data', (chunk: Buffer) => {
-    if (failure || closing) return;
+/** Session-scoped persistent ACP manager. Keeps one `atomcode acp` process warm
+ *  across consecutive turns (avoiding per-turn cold spawn/resume/MCP setup and
+ *  preserving in-session permission grants and background `/compact`), while
+ *  releasing the process and its `.lease` lock after an idle window so local
+ *  `atomcode resume` stays unblocked. */
+export class AtomcodeAcpSession {
+  private readonly idleTimeoutMs: number;
+  private readonly lifecycle = new AbortController();
+  private readonly closingConnections = new Set<AtomcodeAcpConnection>();
+  private nativeSessionId?: string;
+  private connection?: AtomcodeAcpConnection;
+  private openingPromise?: Promise<void>;
+  private teardownPromise?: Promise<void>;
+  private idleTimer?: ReturnType<typeof setTimeout>;
+  private busy = false;
+  private disposed = false;
+
+  constructor(private readonly opts: AtomcodeAcpSessionOptions) {
+    this.nativeSessionId = opts.nativeSessionId;
+    const rawIdle = opts.idleTimeoutMs ?? DEFAULT_ATOMCODE_IDLE_RELEASE_MS;
+    if (!Number.isSafeInteger(rawIdle) || rawIdle < 0 || rawIdle > 2_147_483_647) {
+      throw new Error('invalid_atomcode_idle_timeout');
+    }
+    this.idleTimeoutMs = rawIdle;
+  }
+
+  /** Run one turn on the warm connection, or open/resume a new one after any
+   *  in-flight teardown finishes releasing its `.lease`. On success, arms the
+   *  idle release timer (or closes immediately when `idleTimeoutMs === 0`); on
+   *  any failure, force-tears down the connection while keeping `sessionId`. */
+  async runTurn(turn: AtomcodeAcpTurnOptions, signal: AbortSignal): Promise<AtomcodeAcpResult> {
+    if (this.disposed) throw new Error('atomcode_acp_closed');
+    if (this.busy) throw new Error('atomcode_acp_busy');
+    signal.throwIfAborted();
+    this.busy = true;
+    this.clearIdleTimer();
+
+    const turnSignal = AbortSignal.any([signal, this.lifecycle.signal]);
+    let conn: AtomcodeAcpConnection | undefined;
+    let armIdle = false;
     try {
-      readFrames(chunk);
+      // Wait for any in-flight teardown (such as an idle lease release) so the
+      // retiring child drops its OS .lease lock before session/resume starts.
+      if (this.teardownPromise) {
+        await awaitWithAbort(this.teardownPromise, turnSignal);
+      }
+      turnSignal.throwIfAborted();
+      if (this.disposed) throw new Error('atomcode_acp_closed');
+
+      const existing = this.connection;
+      if (existing && existing.isReusable()) {
+        conn = existing;
+      } else {
+        if (existing) {
+          await awaitWithAbort(this.detachAndClose(existing, false), turnSignal);
+        }
+        turnSignal.throwIfAborted();
+        if (this.disposed) throw new Error('atomcode_acp_closed');
+
+        // Track in-flight open() so close() aborts and awaits it; re-check disposed
+        // afterwards so a session closed mid-handshake never dispatches session/prompt.
+        let opened: AtomcodeAcpConnection | undefined;
+        let finishOpen!: () => void;
+        const opening = new Promise<void>(resolve => { finishOpen = resolve; });
+        this.openingPromise = opening;
+        try {
+          opened = await AtomcodeAcpConnection.open({
+            executable: this.opts.executable,
+            cwd: this.opts.cwd,
+            env: this.opts.env,
+            nativeSessionId: this.nativeSessionId,
+            model: this.opts.model,
+            effort: this.opts.effort,
+            permission: this.opts.permission,
+            onSession: sessionId => {
+              this.nativeSessionId = sessionId;
+              this.opts.onSession?.(sessionId);
+            },
+            onDisconnected: () => {
+              if (opened && this.connection === opened) {
+                // Track background exit cleanup so the next turn awaits lease release.
+                void this.detachAndClose(opened, false);
+              }
+            },
+          }, turnSignal);
+          if (this.disposed) {
+            await this.detachAndClose(opened, false);
+            throw new Error('atomcode_acp_closed');
+          }
+          conn = opened;
+          this.connection = opened;
+        } finally {
+          if (this.openingPromise === opening) this.openingPromise = undefined;
+          finishOpen();
+        }
+      }
+
+      const result = await conn.prompt(turn, turnSignal);
+      if (this.idleTimeoutMs === 0 || this.disposed) {
+        const closingConn = conn;
+        const escalate = () => { void closingConn.close(false); };
+        turnSignal.addEventListener('abort', escalate, { once: true });
+        try {
+          await this.detachAndClose(closingConn, !turnSignal.aborted);
+        } finally {
+          turnSignal.removeEventListener('abort', escalate);
+        }
+      } else {
+        armIdle = true;
+      }
+      return result;
     } catch (error) {
-      fail(error instanceof Error ? error : new Error('atomcode_acp_protocol_invalid'));
+      if (conn) {
+        await this.detachAndClose(conn, false);
+      }
+      throw error;
+    } finally {
+      // Clear busy before arming the idle timer so armIdleTimer() observes the idle state.
+      this.busy = false;
+      if (armIdle) this.armIdleTimer();
     }
-  });
-  // Drain stderr without retaining it so verbose tool diagnostics cannot exhaust memory or block the pipe.
-  child.stderr.resume();
-  child.stdin.on('error', () => fail(new Error('atomcode_acp_transport_closed')));
-  child.on('error', () => fail(new Error('atomcode_acp_spawn_failed')));
-  child.once('close', () => {
-    if (!closing) fail(new Error('atomcode_acp_process_exited'));
-  });
+  }
 
-  const abort = () => {
-    if (sessionId && prompting && !failure && !closing) {
-      try {
-        child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'session/cancel', params: { sessionId } })}\n`);
-      } catch { /* process teardown follows */ }
+  /** Permanently dispose this session: aborts any in-flight `open()` or active
+   *  turn, escalates in-flight idle closes when `graceful` is false, and awaits
+   *  full process exit so the native `.lease` is released before resolving. */
+  async close(graceful = true): Promise<void> {
+    this.disposed = true;
+    this.clearIdleTimer();
+    this.lifecycle.abort(new Error('atomcode_acp_closed'));
+    if (this.openingPromise) {
+      await this.openingPromise.catch(() => {});
     }
-    fail(new Error('atomcode_acp_aborted'));
-  };
-  signal.addEventListener('abort', abort, { once: true });
+    const conn = this.connection;
+    if (conn) {
+      await this.detachAndClose(conn, graceful);
+    }
+    if (!graceful) {
+      for (const closing of this.closingConnections) {
+        void closing.close(false);
+      }
+    }
+    if (this.teardownPromise) {
+      await this.teardownPromise.catch(() => {});
+    }
+  }
 
-  try {
-    if (signal.aborted) abort();
-    const init = await request('initialize', {
-      protocolVersion: 1,
-      clientInfo: { name: 'botmux', version: '1' },
-      clientCapabilities: { elicitation: { form: {} } },
+  private detachAndClose(conn: AtomcodeAcpConnection, graceful: boolean): Promise<void> {
+    if (this.connection === conn) {
+      this.connection = undefined;
+    }
+    this.clearIdleTimer();
+    // Retain closing references so close(false) can escalate an in-flight idle
+    // session/close immediately; chain teardowns so the next turn awaits full OS .lease release.
+    this.closingConnections.add(conn);
+    const p = conn.close(graceful)
+      .catch(() => {})
+      .finally(() => { this.closingConnections.delete(conn); });
+    const prev = this.teardownPromise;
+    const chained = prev ? prev.catch(() => {}).then(() => p) : p;
+    this.teardownPromise = chained;
+    void chained.finally(() => {
+      if (this.teardownPromise === chained) this.teardownPromise = undefined;
     });
-    if (init.protocolVersion !== 1) throw new Error('atomcode_acp_version_unsupported');
+    return chained;
+  }
 
-    let control: Json;
-    if (opts.nativeSessionId) {
-      sessionId = opts.nativeSessionId;
-      const canResume = isObject(init.agentCapabilities?.sessionCapabilities?.resume);
-      const canLoad = init.agentCapabilities?.loadSession === true;
-      if (!canResume && !canLoad) throw new Error('atomcode_acp_resume_unsupported');
-      const method = canResume ? 'session/resume' : 'session/load';
-      control = await request(method, { sessionId, cwd: opts.cwd, mcpServers: [] });
-      if (control.sessionId !== undefined && control.sessionId !== sessionId) {
-        throw new Error('atomcode_acp_resume_mismatch');
-      }
-    } else {
-      control = await request('session/new', { cwd: opts.cwd, mcpServers: [] });
-      if (typeof control.sessionId !== 'string' || !control.sessionId) {
-        throw new Error('atomcode_acp_session_invalid');
-      }
-      sessionId = control.sessionId;
-    }
-    opts.onSession?.(sessionId!);
+  /** Schedule graceful release of an idle ACP child so its `.lease` does not
+   *  block standalone `atomcode resume`. Unref'd so the timer itself cannot
+   *  pin process exit if no child or stdin stream remains alive. */
+  private armIdleTimer(): void {
+    this.clearIdleTimer();
+    if (this.disposed || this.busy || !this.connection || this.idleTimeoutMs <= 0) return;
+    this.idleTimer = setTimeout(() => {
+      this.idleTimer = undefined;
+      if (this.busy || !this.connection) return;
+      void this.detachAndClose(this.connection, true);
+    }, this.idleTimeoutMs);
+    this.idleTimer.unref?.();
+  }
 
-    const configure = async (configId: string, value: string) => {
-      const option = Array.isArray(control.configOptions)
-        ? control.configOptions.find((entry: Json) => entry.id === configId)
-        : undefined;
-      if (!option || !Array.isArray(option.options) || !option.options.some((entry: Json) => entry.value === value)) {
-        throw new Error(`atomcode ACP 不支持配置 ${configId}=${value}`);
-      }
-      if (option.currentValue !== value) {
-        control = await request('session/set_config_option', { sessionId, configId, value });
-      }
-    };
-
-    const desiredMode = opts.permission === 'full' ? 'bypass' : 'build';
-    await configure('mode', desiredMode);
-    if (opts.model?.trim()) {
-      await configure('model', opts.model.trim());
-    }
-    if (opts.effort?.trim()) {
-      await configure('reasoning_effort', opts.effort.trim());
-    }
-
-    prompting = true;
-    const result = await request(
-      'session/prompt',
-      { sessionId, prompt: [{ type: 'text', text: opts.content }] },
-      false,
-    );
-    if (incoming.size || failure || inputSignal.aborted) {
-      throw failure ?? new Error('atomcode_acp_question_incomplete');
-    }
-    if (result.stopReason !== 'end_turn') {
-      throw new Error(`atomcode ACP 执行未完成：${result.stopReason ?? 'unknown'}`);
-    }
-    prompting = false;
-    success = true;
-    // Close the live session before EOF so AtomCode releases the native session
-    // lease immediately before the next turn's session/resume.
-    if (isObject(init.agentCapabilities?.sessionCapabilities?.close)) {
-      await request('session/close', { sessionId }, CLOSE_REQUEST_TIMEOUT_MS).catch(() => {});
-    }
-    return { sessionId: sessionId!, content };
-  } finally {
-    signal.removeEventListener('abort', abort);
-    closing = true;
-    lifetime.abort();
-    rejectPending(new Error('atomcode_acp_closed'));
-    if (success) {
-      // Allow shutdown_sessions() to commit state and drop the disk lease before SIGTERM.
-      try { child.stdin.end(); } catch { /* ignore */ }
-      let graceTimer: ReturnType<typeof setTimeout> | undefined;
-      await Promise.race([
-        exited,
-        new Promise<void>(resolve => {
-          graceTimer = setTimeout(resolve, GRACEFUL_EXIT_TIMEOUT_MS);
-        }),
-      ]);
-      clearTimeout(graceTimer);
-    }
-    if (!childExited) {
-      kill('SIGTERM');
-      hardKill ??= setTimeout(() => kill('SIGKILL'), 1000);
-    }
-    await exited;
-    clearTimeout(hardKill);
+  private clearIdleTimer(): void {
+    if (!this.idleTimer) return;
+    clearTimeout(this.idleTimer);
+    this.idleTimer = undefined;
   }
 }
