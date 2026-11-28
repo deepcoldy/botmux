@@ -26479,6 +26479,15 @@ async function flushPendingInjections(): Promise<void> {
             'Web terminal wire is dirty before injection', 'web_terminal_input_wire_dirty', false,
           );
 
+          // A non-keepalive injection is a fresh operator input taking the CLI
+          // at this literal write edge: a scheduled write held back into the
+          // queue is no longer the writer STOP may retire. Invalidate it here,
+          // before the physical write, rather than after awaitPtyQuiescence so a
+          // STOP arriving while the injection is in flight cannot retire it
+          // either. Keep-alive is bot-generated and must not invalidate the
+          // held writer.
+          if (item.kind !== 'keepalive') heldScheduledWrite = undefined;
+
           // Record the keep-alive by its actual command fingerprint so the later
           // UserPromptSubmit hook can be matched by content regardless of HTTP
           // arrival ordering. A non-keepalive injection does NOT touch existing
@@ -27569,6 +27578,10 @@ async function handleAntigravitySideQuestion(
       if (!current() || heldStuckPage(screen) || !hasAntigravitySideQuestionComposer(screen) || !firstWriteMayProceed()) {
         throw new SubmissionWriteError('Antigravity /btw requires an empty native composer', undefined, false);
       }
+      // The side question is a fresh operator input opening its own native
+      // conversation: any scheduled write held back in the queue is no longer
+      // the writer a later STOP should retire.
+      heldScheduledWrite = undefined;
     });
     // The terminal command launches a different native conversation. A
     // receipt and matching input are required before any output can cross

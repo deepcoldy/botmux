@@ -833,3 +833,103 @@ describe('STOP after a held scheduled write armed its retry, before the retry fi
     expect(rejections(runA.turnId)).toBe(0);
   });
 });
+
+describe('STOP after another input channel took the CLI while the scheduled write was held', () => {
+  /** Wire the REAL flushPendingInjections against a stubbed physical command
+   *  writer; the stub still runs the before-write callback exactly at the write
+   *  edge, where the held slot must be invalidated. */
+  function armInjectionFlush(scope: Record<string, any>) {
+    const rawWrites: string[] = [];
+    Object.assign(scope, {
+      injectionFlushing: false,
+      commandLineWritesPending: 0,
+      bareShellLaunchBlocked: false,
+      canStartInjectionFlush: () => true,
+      awaitPtyQuiescence: vi.fn(async () => {}),
+      fingerprintPromptText: (cmd: string) => cmd,
+    });
+    scope.idleDetector.reset = vi.fn();
+    scope.sendRawCommandLineWithRecoveryFence = vi.fn(async (
+      _backend: unknown, cmd: string, beforeWrite?: () => void,
+    ) => { beforeWrite?.(); rawWrites.push(cmd); });
+    return rawWrites;
+  }
+
+  it('a non-keepalive slash injection after the hold takes the CLI: STOP leaves the held write queued', async () => {
+    const { h, item: runA, rejections } = scheduledHarness(['allow', 'retain'], true);
+    h.scope.cliInterruptGeneration = 0;
+    const rawWrites = armInjectionFlush(h.scope);
+    await h.flush();
+    expect(h.scope.pendingMessages).toEqual([runA]);
+
+    h.scope.pendingInjections.push({ command: '/compact', barrier: false });
+    await loadWorkerFunction<() => Promise<void>>('flushPendingInjections', h.scope)();
+    expect(rawWrites).toEqual(['/compact']);
+
+    await stopCli(h.scope);
+    expect(h.scope.pendingMessages).toEqual([runA]);
+    expect(rejections(runA.turnId)).toBe(0);
+  });
+
+  it('a keepalive injection is bot-generated and does not take the CLI: STOP still retires the held write', async () => {
+    const { h, item: runA, rejections } = scheduledHarness(['allow', 'retain'], true);
+    h.scope.cliInterruptGeneration = 0;
+    const rawWrites = armInjectionFlush(h.scope);
+    await h.flush();
+    expect(h.scope.pendingMessages).toEqual([runA]);
+
+    h.scope.pendingInjections.push({ command: '/compact', barrier: false, kind: 'keepalive' });
+    await loadWorkerFunction<() => Promise<void>>('flushPendingInjections', h.scope)();
+    expect(rawWrites).toEqual(['/compact']);
+
+    await stopCli(h.scope);
+    expect(h.scope.pendingMessages).toEqual([]);
+    expect(rejections(runA.turnId)).toBe(1);
+  });
+
+  it('an Antigravity /btw side question after the hold opens its own conversation: STOP leaves the held write queued', async () => {
+    const { h, item: runA, rejections } = scheduledHarness(['allow', 'retain'], true);
+    h.scope.cliInterruptGeneration = 0;
+    await h.flush();
+    expect(h.scope.pendingMessages).toEqual([runA]);
+
+    const rawWrites: string[] = [];
+    Object.assign(h.scope, {
+      lastInitConfig: { cliId: 'antigravity' },
+      cliLifetimeNonce: 'life-1',
+      inputDeliveryObservedCliSessionId: 'native-1',
+      effectiveBackendType: 'pty',
+      isRemoteBackendType: () => false,
+      nativeSessionForkPending: () => false,
+      antigravitySideQuestionPending: false,
+      rawInputRestartGate: false,
+      startupCommandsInProgress: false,
+      startupCommandAckHold: false,
+      hasRunStartupCommands: true,
+      firstWriteLivenessConfirmed: true,
+      hasPendingInputForFlush: () => h.scope.pendingMessages.length > 0,
+      AntigravitySessionLog: class { read() { return { currentId: 'native-1', sideQuestion: undefined }; } },
+      btwOverlayScreen: () => ({}),
+      heldStuckPage: () => false,
+      hasAntigravitySideQuestionComposer: () => true,
+      firstWriteMayProceed: () => true,
+      // Expire the answer poll immediately: this case only asserts the write edge.
+      BTW_ANSWER_WINDOW_MS: -1,
+      readAntigravitySideAnswer: () => undefined,
+      delay: vi.fn(async () => {}),
+    });
+    h.scope.cliAdapter.runnerFramedInput = false;
+    h.scope.sendRawCommandLineWithRecoveryFence = vi.fn(async (
+      _backend: unknown, cmd: string, beforeWrite?: () => void,
+    ) => { beforeWrite?.(); rawWrites.push(cmd); });
+
+    await loadWorkerFunction<(msg: unknown) => Promise<void>>('handleAntigravitySideQuestion', h.scope)({
+      type: 'antigravity_btw', messageId: 'm1', question: 'side question?', nativeSessionId: 'native-1',
+    });
+    expect(rawWrites).toEqual(['/btw side question?']);
+
+    await stopCli(h.scope);
+    expect(h.scope.pendingMessages).toEqual([runA]);
+    expect(rejections(runA.turnId)).toBe(0);
+  });
+});
