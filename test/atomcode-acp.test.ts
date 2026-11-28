@@ -209,6 +209,18 @@ describe('runAtomcodeAcp', () => {
       onUserInput: async () => ({}),
     }, new AbortController().signal);
     expect(quoted.content).toBe('"'.repeat(4_000_000));
+
+    // Six-byte control-char escaping: only 2.8 MB decoded but ~16.8 MB on the
+    // wire. Must stay within the frame cap derived from the 6x content ratio.
+    const nul = await runAtomcodeAcp({
+      executable: f.bin,
+      cwd: f.root,
+      env: f.env,
+      content: 'big-nul-2m8',
+      permission: 'full',
+      onUserInput: async () => ({}),
+    }, new AbortController().signal);
+    expect(Buffer.byteLength(nul.content)).toBe(2_800_000);
   });
 
   it('still rejects decoded content past the 8 MB cap and wire frames past the line cap', async () => {

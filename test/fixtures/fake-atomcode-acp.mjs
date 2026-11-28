@@ -5,6 +5,7 @@ const log = value => process.env.ATOMCODE_TEST_LOG && appendFileSync(process.env
 log({ pid: process.pid, args: process.argv.slice(2), owner: process.env.BOTMUX_OWNER_OPEN_ID, home: process.env.ATOMCODE_HOME });
 
 const send = value => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...value }) + '\n');
+const NUL = String.fromCharCode(0);
 const skipPerms = process.argv.includes('--dangerously-skip-permissions');
 const scenario = process.env.ATOMCODE_ACP_SCENARIO;
 const control = {
@@ -163,6 +164,14 @@ for await (const line of createInterface({ input: process.stdin })) {
       send({ id: promptId, result: { stopReason: 'end_turn' } });
       continue;
     }
+    if (promptText === 'big-nul-2m8') {
+      // 2.8 M control chars: only 2.8 MB decoded (well under the content cap),
+      // but each NUL serializes to a six-byte \u0000 escape (~16.8 MB wire).
+      // Must pass: the frame cap is derived from the 6x content-cap ratio.
+      update({ sessionUpdate: 'agent_message_chunk', messageId: 'm-big', content: { type: 'text', text: NUL.repeat(2_800_000) } });
+      send({ id: promptId, result: { stopReason: 'end_turn' } });
+      continue;
+    }
     if (promptText === 'over-content') {
       // Two chunks under one messageId accumulating past the 8 MB decoded cap.
       update({ sessionUpdate: 'agent_message_chunk', messageId: 'm-big', content: { type: 'text', text: 'a'.repeat(8_000_000) } });
@@ -171,9 +180,10 @@ for await (const line of createInterface({ input: process.stdin })) {
       continue;
     }
     if (promptText === 'oversized-frame') {
-      // Decoded text alone is past the content cap, and escaping pushes the wire
-      // frame past the 16 MiB line cap; the reader must reject the frame itself.
-      update({ sessionUpdate: 'agent_message_chunk', messageId: 'm-big', content: { type: 'text', text: '"'.repeat(8_400_000) } });
+      // 8.1 M NUL chars: decoded text is past the content cap and the six-byte
+      // escaping pushes the wire frame (~48.6 MB) past the derived line cap;
+      // the reader must reject the frame itself before content accumulation.
+      update({ sessionUpdate: 'agent_message_chunk', messageId: 'm-big', content: { type: 'text', text: NUL.repeat(8_100_000) } });
       send({ id: promptId, result: { stopReason: 'end_turn' } });
       continue;
     }

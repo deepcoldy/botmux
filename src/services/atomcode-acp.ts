@@ -4,13 +4,16 @@ import { applySessionOwnerEnv } from '../utils/child-env.js';
 type Json = Record<string, any>;
 
 export const ATOMCODE_FINAL_MAX_BYTES = 8_000_000;
-// Per-line NDJSON cap, measured on the WIRE bytes of one JSON-RPC message.
-// The decoded-content cap above counts raw text; a wire line additionally
-// carries the JSON-RPC envelope and string escaping (quotes/backslashes/newlines
-// double in size), so an 8 MB reply near the content cap needs headroom here.
-// Sized for the worst common case: 8 MB of characters that each escape to two
-// bytes, plus the envelope. The decoded cap still bounds retained content.
-const MAX_FRAME_BYTES = 16 * 1024 * 1024;
+// Per-line NDJSON cap measured on the WIRE bytes of one JSON-RPC message. The
+// decoded-content cap above counts raw UTF-8 text, but a wire line also carries
+// the JSON-RPC envelope and string escaping. The worst expansion is a control
+// character (U+0000–U+001F): one UTF-8 byte of text serializes to a six-byte
+// `\u0000` escape, so derive the line cap from the content cap at that
+// ratio plus envelope slack. This guarantees any reply within the decoded cap
+// passes the frame reader regardless of escaping, while the frame cap stays a
+// backstop against a runaway single line; the decoded cap still bounds retained content.
+const MAX_JSON_STRING_ESCAPE_RATIO = 6;
+const MAX_FRAME_BYTES = ATOMCODE_FINAL_MAX_BYTES * MAX_JSON_STRING_ESCAPE_RATIO + 4096;
 const REQUEST_TIMEOUT_MS = 30_000;
 const CLOSE_REQUEST_TIMEOUT_MS = 3_000;
 const GRACEFUL_EXIT_TIMEOUT_MS = 1_500;
