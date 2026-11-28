@@ -34987,9 +34987,9 @@ function deliverFinalOutput(
           && !hasProtectedSessionMutationOwnership(ds) && !hasQueuedActivationAdmissionGate(ds) && !isSharedAdoptSession(ds)
           && !isRemoteBackendSession(ds) && !ds.adoptedFrom && !ds.initConfig?.adoptMode,
       });
-      if (effectiveCliId === 'minimax' && msg.turnFailed
+      if ((effectiveCliId === 'minimax' || effectiveCliId === 'atomcode') && msg.turnFailed
           && ['turn_budget_exhausted', 'execution_failed'].includes(msg.turnFailureCode ?? '')) {
-        // MiniMax uses the legacy reply-card path. Keep the machine-readable
+        // MiniMax/AtomCode use the legacy reply-card path. Keep the machine-readable
         // reason visible on that actual carrier, even when the native message
         // is generic; the ordered terminal independently owns settlement.
         // This bounded, allowlisted code row fits within fitBuiltCard's
