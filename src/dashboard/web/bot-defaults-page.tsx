@@ -5070,6 +5070,8 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
  * server bypasses the wrapper entirely — an operator who is not told either of
  * those would believe the boundary is complete.
  */
+const BYTEDCLI_POLICY_FILTERS = ['all', 'actor', 'machine'] as const;
+
 export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
   const policyTableId = useId();
@@ -5111,6 +5113,17 @@ export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: P
   } | null>(null);
 
   const [policyRefresh, setPolicyRefresh] = useState(0);
+  const [operationFilter, setOperationFilter] = useState<typeof BYTEDCLI_POLICY_FILTERS[number]>('all');
+  const operationFilterRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  useEffect(() => { setOperationFilter('all'); }, [bot.larkAppId]);
+  const operationRows = BYTEDCLI_OPERATION_CATALOG.filter(row => row.effect === 'read' || row.effect === 'write');
+  const filteredOperations = operationRows.filter(row => operationFilter === 'all'
+    || policy?.bytedcliOperationPolicy?.rules[row.id] === operationFilter);
+  function selectOperationFilter(index: number): void {
+    const nextIndex = (index + BYTEDCLI_POLICY_FILTERS.length) % BYTEDCLI_POLICY_FILTERS.length;
+    setOperationFilter(BYTEDCLI_POLICY_FILTERS[nextIndex]!);
+    operationFilterRefs.current[nextIndex]?.focus();
+  }
   // Dormant strict policies can be edited only after a versioned host summary.
   useEffect(() => {
     if (!enabled && (execution !== 'read-machine-write-actor' || !bytecloudSelected)) { setInfo(null); return; }
@@ -5240,11 +5253,31 @@ export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: P
           {tr(`botDefaults.bytedcliPolicyState.${policyState}`)}
         </p>
         <p className="bd-section-note">{tr('botDefaults.bytedcliPolicyHelp')}</p>
-        <div style={{ overflowX: 'auto' }}>
-          <table style={{ width: '100%', fontSize: '0.9em', textAlign: 'left', borderCollapse: 'collapse' }}>
+        <div className="segmented" role="tablist" aria-label={tr('botDefaults.bytedcliPolicyOverride')}
+          style={{ flexWrap: 'wrap', maxWidth: '100%', marginBottom: '8px' }}>
+          {BYTEDCLI_POLICY_FILTERS.map((filter, index) => (
+            <button key={filter} type="button" role="tab" id={`${policyTableId}-filter-${filter}`}
+              ref={node => { operationFilterRefs.current[index] = node; }}
+              className={operationFilter === filter ? 'active' : ''}
+              data-action={`bytedcli-policy-filter-${filter}`} aria-selected={operationFilter === filter}
+              aria-controls={`${policyTableId}-commands`} tabIndex={operationFilter === filter ? 0 : -1}
+              onClick={() => setOperationFilter(filter)} onKeyDown={event => {
+                if (event.key === 'ArrowRight') { event.preventDefault(); selectOperationFilter(index + 1); }
+                else if (event.key === 'ArrowLeft') { event.preventDefault(); selectOperationFilter(index - 1); }
+                else if (event.key === 'Home') { event.preventDefault(); selectOperationFilter(0); }
+                else if (event.key === 'End') { event.preventDefault(); selectOperationFilter(BYTEDCLI_POLICY_FILTERS.length - 1); }
+              }}>
+              {tr(`botDefaults.bytedcliPolicyFilter.${filter}`)} ({filter === 'all' ? operationRows.length
+                : operationRows.filter(row => policy?.bytedcliOperationPolicy?.rules[row.id] === filter).length})
+            </button>
+          ))}
+        </div>
+        <div role="tabpanel" id={`${policyTableId}-commands`} aria-labelledby={`${policyTableId}-filter-${operationFilter}`}
+          style={{ overflowX: 'auto' }}>
+          <table style={{ width: '100%', minWidth: '720px', fontSize: '0.9em', textAlign: 'left', borderCollapse: 'collapse' }}>
             <thead><tr>{['Command', 'Effect', 'Global', 'Override', 'Effective'].map(column =>
               <th key={column} style={{ padding: '8px' }}>{tr(`botDefaults.bytedcliPolicy${column}`)}</th>)}</tr></thead>
-            <tbody>{BYTEDCLI_OPERATION_CATALOG.filter(row => row.effect === 'read' || row.effect === 'write').map(row => {
+            <tbody>{filteredOperations.map(row => {
               const effective = policyState === 'ready' ? resolveBytedcliOperationRule(row.id, globalPolicy, policy?.bytedcliOperationPolicy ?? undefined) : undefined;
               const conditionId = `${policyTableId}-${row.id}-condition`;
               return <tr key={row.id} style={{ borderTop: '1px solid var(--border)' }}>
@@ -5270,7 +5303,10 @@ export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: P
                     <small data-action={`bytedcli-machine-exception-${row.id}`} style={{ display: 'block' }}>{tr('botDefaults.bytedcliPolicyMachineException')}</small> : null}
                 </td>
               </tr>;
-            })}</tbody>
+            })}
+              {filteredOperations.length === 0 ? <tr><td colSpan={5} data-action="bytedcli-policy-empty"
+                style={{ padding: '16px 8px', color: 'var(--muted)' }}>{tr('botDefaults.bytedcliPolicyFilterEmpty')}</td></tr> : null}
+            </tbody>
           </table>
         </div>
         <div className="actions">

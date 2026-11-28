@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { TriggerUserAuthSection } from '../src/dashboard/web/bot-defaults-page.js';
 import { parseTriggerUserAuthConfig } from '../src/services/trigger-user-auth.js';
-import { BYTEDCLI_AUDITED_RELEASE, BYTEDCLI_OPERATION_CATALOG_VERSION } from '../src/core/bytedcli-operation-catalog.js';
+import { BYTEDCLI_AUDITED_RELEASE, BYTEDCLI_OPERATION_CATALOG_VERSION, BYTEDCLI_OPERATION_CATALOG } from '../src/core/bytedcli-operation-catalog.js';
 import { BYTEDCLI_OPERATION_POLICY_SCHEMA, parseBytedcliOperationPolicy, projectBytedcliOperationPolicyStatus } from '../src/core/bytedcli-operation-policy-config.js';
 import { BytedcliBroker } from '../src/core/bytedcli-broker.js';
 import { createBytedcliHostOperationPolicyReader } from '../src/core/bytedcli-host-operation-policy.js';
@@ -64,6 +64,34 @@ it('command controls expose true effect and the global floor; writes expose expl
   await act(async()=>p.control('trigger-user-auth-source-default').props.onChange({currentTarget:{value:'platform'}}));
   expect(p.requests.at(-1).bytedcliOperationPolicy.rules).toEqual({'codebase.mr.list':'actor'});
   await act(async()=>p.control('bytedcli-policy-clear').props.onClick());expect(p.requests.at(-1).bytedcliOperationPolicy).toBeNull();
+ }finally{await p.close();}
+});
+it('identity tabs filter explicit Bot rules and filtered edits preserve hidden rules',async()=>{
+ const initial={...full,bytedcliOperationPolicy:config({...full.bytedcliOperationPolicy!.rules,'codebase.mr.files':'actor'})};
+ const p=await panel(initial,summary(initial));
+ const visible=()=>p.renderer.root.findAllByType('select')
+  .map(select=>String(select.props['data-action']??'')).filter(action=>action.startsWith('bytedcli-policy-'))
+  .map(action=>action.slice('bytedcli-policy-'.length));
+ const text=(node:any):string=>typeof node==='string'?node:(node.children??[]).map(text).join('');
+ try{
+  const all=p.control('bytedcli-policy-filter-all');expect(all.props['aria-selected']).toBe(true);
+  const total=BYTEDCLI_OPERATION_CATALOG.filter(row=>row.effect==='read'||row.effect==='write').length;
+  expect(visible()).toHaveLength(total);expect(text(all)).toContain(`(${total})`);
+  await act(async()=>p.control('bytedcli-policy-filter-machine').props.onClick());
+  expect(visible()).toEqual(['codebase.mr.list']);expect(text(p.control('bytedcli-policy-filter-machine'))).toContain('(1)');
+  expect(p.control('bytedcli-effective-codebase.mr.list').props['data-identity']).toBe('actor');
+  await act(async()=>p.control('bytedcli-policy-filter-actor').props.onClick());
+  expect(visible()).toEqual(['codebase.mr.files']);expect(p.requests).toEqual([]);
+  await act(async()=>p.control('bytedcli-policy-codebase.mr.files').props.onChange({currentTarget:{value:'machine'}}));
+  expect(p.requests).toHaveLength(1);
+  expect(p.requests[0].bytedcliOperationPolicy).toEqual(config({...initial.bytedcliOperationPolicy.rules,'codebase.mr.files':'machine'}));
+  expect(visible()).toEqual([]);expect(p.control('bytedcli-policy-empty')).toBeDefined();
+  expect(text(p.control('bytedcli-policy-filter-actor'))).toContain('(0)');
+  await act(async()=>p.control('bytedcli-policy-filter-machine').props.onClick());
+  expect(visible().sort()).toEqual(['codebase.mr.files','codebase.mr.list']);
+  expect(text(p.control('bytedcli-policy-filter-machine'))).toContain('(2)');
+  await act(async()=>p.control('bytedcli-policy-filter-all').props.onClick());
+  expect(visible()).toHaveLength(total);expect(visible()).toContain('codebase.mr.close');expect(visible()).toContain('codebase.repo.list');
  }finally{await p.close();}
 });
 it('dormant command rules remain editable and disabling preserves every hidden option',async()=>{
