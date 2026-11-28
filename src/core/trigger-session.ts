@@ -15,7 +15,7 @@ import * as idempotencyStore from '../services/idempotency-store.js';
 import * as groupsStore from '../services/groups-store.js';
 import * as oncallStore from '../services/oncall-store.js';
 import { randomUUID } from 'node:crypto';
-import { getBot, getStrictOwnerOpenId, ownerUnionIdVerdict, effectiveDefaultWorkingDir } from '../bot-registry.js';
+import { getBot, getStrictOwnerOpenId, ownerUnionIdVerdict, effectiveDefaultWorkingDir, LarkTransportDisabledError } from '../bot-registry.js';
 import { isNativeGatewayCoreProcess } from './runtime-mode.js';
 import { resolveSender, type ResolvedSender } from '../im/lark/identity-cache.js';
 import type { RunAsResolution } from './run-as.js';
@@ -989,7 +989,17 @@ async function refuseOtherUnionId(
   const verdict = ownerUnionIdVerdict(larkAppId, ownerOpenId, actorUnionId);
   if (verdict === 'match') return undefined;
   if (verdict === 'mismatch') return mismatch;
-  const lookup = await resolveUnionIdFromOpenIdStrict(larkAppId, ownerOpenId);
+  let lookup: Awaited<ReturnType<typeof resolveUnionIdFromOpenIdStrict>>;
+  try {
+    lookup = await resolveUnionIdFromOpenIdStrict(larkAppId, ownerOpenId);
+  } catch (error) {
+    if (!(error instanceof LarkTransportDisabledError)
+      && (!(error instanceof Error) || error.name !== 'LarkTransportDisabledError')) throw error;
+    return {
+      ok: false, errorCode: 'owner_unresolved',
+      error: 'core-only bot cannot verify actorUnionId without Feishu transport',
+    };
+  }
   if (lookup.status === 'resolved') return lookup.unionId === actorUnionId ? undefined : mismatch;
   return {
     ok: false, errorCode: 'owner_unresolved',

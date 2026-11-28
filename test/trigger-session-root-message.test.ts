@@ -167,7 +167,7 @@ vi.mock('../src/im/lark/card-handler.js', () => ({
 }));
 
 import { buildExternalEventTopicMessage, triggerSessionTurn } from '../src/core/trigger-session.js';
-import { parseBotConfigsFromText, registerBot, __testOnly_resetBotRegistry } from '../src/bot-registry.js';
+import { parseBotConfigsFromText, registerBot, __testOnly_resetBotRegistry, LarkTransportDisabledError } from '../src/bot-registry.js';
 import { sessionKey } from '../src/core/types.js';
 import { admitQueuedActivationTail, withActiveSessionKeyLock, __testOnly_sessionAgentConfig } from '../src/core/worker-pool.js';
 import { frozenReplyContextForTurn, resolveSessionReplyTarget } from '../src/core/reply-target.js';
@@ -379,6 +379,34 @@ describe('triggerSessionTurn rootMessageId target', () => {
       const { result, sent } = await send(OWNER_UNION);
       expect(result).toMatchObject({ ok: false, errorCode: 'owner_unresolved' });
       expect(sent).toEqual([]);
+    });
+
+    it.each(['typed error', 'cross-module error name'])(
+      'returns owner_unresolved when a core-only bot cannot query union_id (%s)', async errorKind => {
+        ownerBot({ allowedUsers: [OWNER], apiOnly: true }, { [OWNER]: OWNER });
+        const failure = errorKind === 'typed error'
+          ? new LarkTransportDisabledError(APP, 'getBotClient')
+          : Object.assign(new Error('transport disabled in another module copy'), {
+            name: 'LarkTransportDisabledError',
+          });
+        mockResolveUnionIdStrict.mockRejectedValue(failure);
+        const { result, sent } = await send(OWNER_UNION);
+        expect(result).toMatchObject({ ok: false, errorCode: 'owner_unresolved' });
+        expect(sent).toEqual([]);
+      },
+    );
+
+    it('rethrows unexpected union_id lookup failures for a core-only bot', async () => {
+      ownerBot({ allowedUsers: [OWNER], apiOnly: true }, { [OWNER]: OWNER });
+      const failure = new Error('unexpected lookup failure');
+      mockResolveUnionIdStrict.mockRejectedValue(failure);
+      const worker = { send: vi.fn() };
+      const ds = existingDs({ worker: worker as any });
+      const req = { ...ownerRequest(), actorUnionId: OWNER_UNION };
+      await expect(triggerSessionTurn(req, {
+        larkAppId: APP, activeSessions: new Map([[sessionKey(ROOT, APP), ds]]),
+      })).rejects.toBe(failure);
+      expect(worker.send).not.toHaveBeenCalled();
     });
   });
 
