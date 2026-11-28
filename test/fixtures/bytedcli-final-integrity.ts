@@ -27,13 +27,17 @@ try {
   fs.symlinkSync(dep,join(root,'install/node_modules/review-helper'));
   fs.writeFileSync(certificate,'original-fake-cert');
   fs.writeFileSync(entry,`import run from 'review-helper';if(process.argv.includes('--version'))console.log('0.199.0');else run();`);
-  fs.symlinkSync(entry,join(bin,'bytedcli'));
+  if(mode==='dedicated-installation'){
+    const global=join(root,'global/node_modules/other-tool');fs.mkdirSync(global,{recursive:true});
+    const tool=join(global,'tool.exe');fs.writeFileSync(tool,'unrelated global tool');fs.linkSync(tool,join(root,'external-hardlink'));
+    fs.symlinkSync(tool,join(bin,'bytedcli'));
+  }else fs.symlinkSync(entry,join(bin,'bytedcli'));
   fs.symlinkSync(node,join(bin,'node'));
   const savedPath=process.env.PATH,savedCert=process.env.NODE_EXTRA_CA_CERTS;
   process.env.PATH=[bin,'/usr/bin','/bin'].join(':');
   if(mode==='certificate')process.env.NODE_EXTRA_CA_CERTS=certificate;
   else delete process.env.NODE_EXTRA_CA_CERTS;
-  const layout=bytedcliTrustedHostLayout();
+  const layout=bytedcliTrustedHostLayout(mode==='dedicated-installation'?{cliEntrypoint:entry}:{});
   process.env.PATH=savedPath;if(savedCert===undefined)delete process.env.NODE_EXTRA_CA_CERTS;else process.env.NODE_EXTRA_CA_CERTS=savedCert;
   const cli=await discoverBytedcliTrustedCli({...layout,probeHome:join(root,'probe-home'),probeCwd:join(root,'probe-cwd'),signal:new AbortController().signal});
   const policy=buildFsPolicy({platform:'linux',homeDir:root,botmuxHome:join(root,'.botmux'),sessionDataDir:join(root,'data'),workingDir:workspace,botHome:join(root,'.botmux/bots/app'),sessionId:'s',currentAppId:'app',redirectedCliData:true,
@@ -55,7 +59,7 @@ try {
     child.stdin!.write('go\n');await waitFor('MUTATED');
     assert.equal(cli.stillCurrent(),true);
     const acceptedAfterMutation=!!observeBytedcliLinuxContainment(cliPid,contract);assert(acceptedAfterMutation);
-    if(mode==='installation-dependency'){
+    if(mode!=='certificate'){
       const fakeJwt='FAKE_REVIEW_TOKEN_ONLY';
       const authority:any={daemonBootId:'boot',botAppId:'app',sessionId:'s',turnId:'A',identityTurnId:'A',workerGeneration:1,dispatchAttempt:0,policyFingerprint:'policy',actor:{verifiedEmail:'a@example.test',credentialOpenId:'ou_A',source:'local'},recheck:async()=>undefined};
       const executor=new BytedcliExecutor({privateRoot:join(root,'private'),audit:new BytedcliBrokerAudit(join(root,'audit')),trustedCli:async()=>cli,

@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { parseBytedcliOperation as parse } from '../src/core/bytedcli-operation-policy.js';
 import { parseBytedcliOperationPolicy, resolveBytedcliOperationRule } from '../src/core/bytedcli-operation-policy-config.js';
 describe('unknown business operations', () => {
-  it.each(['--yes','--no-auto-upgrade','--debug','-d','--nomask','--color','--no-color','--tls1.2','--http-debug','--all-help','--unrecognized'])('never falls back after an interleaved unapproved boolean %s on a registered path',flag=>{
+  it.each(['--yes','--debug','-d','--nomask','--color','--no-color','--tls1.2','--http-debug','--all-help','--unrecognized'])('never falls back after an interleaved unapproved boolean %s on a registered path',flag=>{
     for(const group of ['mr','pr'])for(const index of [0,1,2,3]){
       const argv=['codebase',group,'close','1','-R','org/repo'];argv.splice(index,0,flag);
       expect(()=>parse(argv),JSON.stringify(argv)).toThrow();
@@ -10,7 +10,7 @@ describe('unknown business operations', () => {
   });
   it('keeps valid global and resource aliases bound to the denied registered operation',()=>{
     const policy=parseBytedcliOperationPolicy({schema:'botmux.bytedcli-operation-policy.v2',cliVersion:'0.199.0',catalogVersion:'2026-11-27.1',rules:{'codebase.mr.close':'deny'}});
-    for(const argv of [['codebase','-j','pr','close','1','-R','org/repo'],['--site','cn','codebase','mr','--repo-name=org/repo','close','1']]){
+    for(const argv of [['--no-auto-upgrade','codebase','-j','pr','close','1','-R','org/repo'],['--site','cn','codebase','mr','--no-auto-upgrade','--repo-name=org/repo','close','1']]){
       const operation=parse(argv);expect(operation.id).toBe('codebase.mr.close');expect(resolveBytedcliOperationRule(operation.id,policy).enabled).toBe(false);
     }
   });

@@ -277,7 +277,7 @@ export function parseBytedcliOperation(argv: readonly string[], inputs?: Bytedcl
   }
   const parsed = help;
   const group = BYTEDCLI_OPERATION_GRAMMAR.helpGroups.find(({ path }) => path.length === parsed.words.length && path.every((word, index) => parsed.words[index] === word));
-  if (!group || Object.keys(snapshots).length || [...parsed.values.keys()].some(key => !['--help', '--version', '--json', '--site'].includes(key))) deny();
+  if (!group || Object.keys(snapshots).length || [...parsed.values.keys()].some(key => !['--help', '--version', '--json', '--site', '--no-auto-upgrade'].includes(key))) deny();
   if (parsed.values.has('--version') && group.path.length > 0) deny();
   const canonicalGroup = group.canonicalPath;
   return result(parsed.values.has('--version') ? 'help.version' : `help.${canonicalGroup.join('.') || 'root'}`,

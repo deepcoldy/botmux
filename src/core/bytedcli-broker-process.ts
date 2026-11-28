@@ -157,6 +157,7 @@ export async function discoverBytedcliTrustedCli(options: {
     const run = options.run ?? runBoundedBytedcliChild;
     const invocation = { executable: runtime, cwd: options.probeCwd, env: bytedcliMinimalEnv(options.probeHome, options.probeCwd, path),
       signal: options.signal, timeoutMs: 5000, outputLimitBytes: 4096 };
+    if (!stillCurrent()) throw new BytedcliBrokerError('executor_unavailable');
     const runtimeResult = await run({ ...invocation, argv: ['-p', 'JSON.stringify({node:process.release.name,major:Number(process.versions.node.split(".")[0]),bun:!!process.versions.bun,globalPaths:require("node:module").globalPaths})'] });
     let runtimeInfo: { node?: string; major?: number; bun?: boolean; globalPaths?: unknown };
     try { runtimeInfo = JSON.parse(runtimeResult.stdout.toString()); } catch { throw new BytedcliBrokerError('executor_unavailable'); }
@@ -168,6 +169,9 @@ export async function discoverBytedcliTrustedCli(options: {
         }))) {
       throw new BytedcliBrokerError('executor_unavailable');
     }
+    // The Node probe above is asynchronous. Revalidate its frozen code inputs
+    // before invoking the CLI, rather than only after running changed code.
+    if (!stillCurrent()) throw new BytedcliBrokerError('executor_unavailable');
     const result = await run({ ...invocation, argv: [entrypoint, '--version'] });
     if (result.exitCode !== 0 || !stillCurrent()) throw new BytedcliBrokerError('executor_unavailable');
     assertBytedcliAuditedRelease(result.stdout.toString().trim());

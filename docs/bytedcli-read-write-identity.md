@@ -32,6 +32,14 @@
 
 省略 `machineProfile` 使用宿主 SDK 默认 profile。指定值只能是 1–64 个字母、数字、下划线或连字符，首字符必须是字母或数字；不是路径。非法选择会拒绝，不能悄悄换成默认账号。首次建立 broker/worker 时冻结同一份宿主布局；修改 profile 需要新的 daemon 代次。Bot env、Agent argv 和请求体不能选择 profile、HOME、账号或可执行文件。
 
+全局 Node 安装可能包含其他工具的硬链接，严格运行树校验会拒绝整棵共享依赖树。此时可在独立目录预装审核版本 ByteCLI，并通过同一机器级配置指定入口：
+
+```json
+{"bytedcliBroker":{"cliEntrypoint":"/absolute/dedicated/node_modules/@bytedance-dev/bytedcli/dist/bytedcli.js"}}
+```
+
+`cliEntrypoint` 接受规范绝对路径，省略时继续从 daemon 启动 PATH 发现 ByteCLI；配置后只使用该入口，安装缺失、版本不符或校验失败时拒绝执行，不回退全局安装。可与 `machineProfile` 同时配置。专用目录仍会校验全部 Node 祖先搜索树、符号链接目标与硬链接，执行前再次检查；安装应先完成再切换配置。修改后重启 daemon 并创建新的冷启动会话，不能仅修改 Bot env。此配置只选择宿主程序代码，不改变命令的机器/触发者身份规则。
+
 启用前结束旧会话，并新建冷启动会话。曾经看过凭据的进程不能靠改开关变安全。严格会话的凭据封闭标记持久保留；回退时先拒绝新调用、结束严格会话，再由管理员明确恢复旧模式并新建会话。保留审计和个人授权数据；不能自动重跑结果未知的写入。
 
 ![CLI 三模式编辑器，使用本地假数据](assets/bytedcli-read-write-identity/execution-modes-1280.png)

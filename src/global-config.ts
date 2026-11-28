@@ -16,7 +16,7 @@ import { normalizeVcMeetingListenerPolicy, type VcMeetingListenerPolicy } from '
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import type { ProjectScanOptions } from './services/project-scanner.js';
-import { join, dirname, isAbsolute } from 'node:path';
+import { join, dirname, isAbsolute, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { isLocale, type Locale } from './i18n/types.js';
 import type { VoiceConfig } from './services/voice/types.js';
@@ -312,18 +312,23 @@ export const SCHEDULE_CHILD_ONE_SHOT_DEFAULT_MAX_TASKS_PER_TURN = 1;
 export const SCHEDULE_CHILD_ONE_SHOT_MAX_TASKS_PER_TURN = 16;
 
 /** Invalid host identity selection must never silently become the default account. */
-export function parseBytedcliBrokerConfig(raw: unknown): { machineProfile?: string } | undefined {
+export interface BytedcliBrokerConfig { machineProfile?: string; cliEntrypoint?: string }
+export function parseBytedcliBrokerConfig(raw: unknown): BytedcliBrokerConfig | undefined {
   if (raw === undefined) return undefined;
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw) || Object.keys(raw).some(key => key !== 'machineProfile')) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw) || Object.keys(raw).some(key => !['machineProfile', 'cliEntrypoint'].includes(key))) {
     throw new Error('invalid bytedcliBroker config');
   }
   const machineProfile = parseBytedcliMachineProfile((raw as { machineProfile?: unknown }).machineProfile);
-  return machineProfile ? { machineProfile } : {};
+  const cliEntrypoint = (raw as { cliEntrypoint?: unknown }).cliEntrypoint;
+  if (cliEntrypoint !== undefined && (typeof cliEntrypoint !== 'string' || !isAbsolute(cliEntrypoint)
+    || resolve(cliEntrypoint) !== cliEntrypoint || cliEntrypoint === '/' || cliEntrypoint.startsWith('/$bunfs/')
+    || /[\u0000-\u001f\u007f]/.test(cliEntrypoint))) throw new Error('invalid bytedcliBroker CLI entrypoint');
+  return { ...(machineProfile ? { machineProfile } : {}), ...(cliEntrypoint !== undefined ? { cliEntrypoint: cliEntrypoint as string } : {}) };
 }
 
 export interface GlobalConfig {
   /** Host only; frozen before the first worker/broker. Change requires a new daemon generation. */
-  bytedcliBroker?: { machineProfile?: string };
+  bytedcliBroker?: BytedcliBrokerConfig;
   lang?: Locale;
   codexAppTitlePrefix?: string;
   /** Machine-wide LinkRef rollout setting. Missing keeps legacy behavior. */

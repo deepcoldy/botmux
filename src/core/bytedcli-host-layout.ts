@@ -1,5 +1,5 @@
 import { discoverSkillMcpRuntime } from './bytedcli-skill-mcp.js';
-import { readGlobalConfig } from '../global-config.js';
+import { readGlobalConfig, parseBytedcliBrokerConfig, type BytedcliBrokerConfig } from '../global-config.js';
 import { existsSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, delimiter, dirname, isAbsolute, join } from 'node:path';
@@ -9,11 +9,14 @@ import { bytedcliHostNetworkEnvironment } from './bytedcli-host-network.js';
 import { discoverBytedcliDbRuntime } from './bytedcli-broker-process.js';
 /** Frozen once at host assembly. PATH is daemon startup configuration, never
  * Bot/Agent env, and discover validates canonical install/runtime ownership. */
-export function bytedcliTrustedHostLayout(settings:{readonly machineProfile?:string;readonly protectedRoots?:readonly string[]}={}){
+export function bytedcliTrustedHostLayout(settings:BytedcliBrokerConfig & {readonly protectedRoots?:readonly string[]}={}){
   // Resolve the operator's home alias before enforcing physical authority paths.
   const machineHome=realpathSync(homedir()),path=process.env.PATH??'/usr/local/bin:/usr/bin:/bin';
   const directories=path.split(delimiter).filter(isAbsolute);
-  const candidates=directories.map(dir=>join(dir,'bytedcli')).filter(existsSync).flatMap(file=>{try{return [realpathSync(file)];}catch{return [];}});
+  const config=parseBytedcliBrokerConfig({machineProfile:settings.machineProfile,cliEntrypoint:settings.cliEntrypoint})!;
+  const configuredEntry=config.cliEntrypoint;
+  const candidatePaths=configuredEntry?[configuredEntry]:directories.map(dir=>join(dir,'bytedcli')).filter(existsSync);
+  const candidates=[...new Set(candidatePaths.flatMap(file=>{try{return [realpathSync(file)];}catch{return [];}}))];
   const runtimeCandidates=directories.map(dir=>join(dir,'node')).filter(existsSync);
   const runtimeExecutable=runtimeCandidates[0]??'/usr/bin/node';
   const installationRoots=[...new Set(candidates.map(file=>dirname(dirname(file))))];
@@ -21,7 +24,14 @@ export function bytedcliTrustedHostLayout(settings:{readonly machineProfile?:str
   const dbBinary = process.env.DB_CLI_BINARY ?? join(machineHome, '.local', 'share', 'bytedcli', 'dependency', 'db', 'node_modules', '@bytedance-dev', 'db-cli', 'bin',
     `db-cli-${process.platform}-${process.arch === 'x64' ? 'amd64' : process.arch}`);
   const dbRuntime = discoverBytedcliDbRuntime(dbBinary, join(privateRoot, 'db-code'));
-  let unavailableReason: string | undefined;
+  // Explicit host selection is exclusive. A missing/changed dedicated install
+  // cannot silently fall back to a different global CLI or dependency tree.
+  let unavailableReason: string | undefined = configuredEntry && !candidates.length ? 'configured ByteCloud CLI unavailable' : undefined;
+  let entrySnapshot: ReturnType<typeof snapshotBytedcliTrustedFiles> | undefined;
+  if(configuredEntry){
+    try { entrySnapshot=snapshotBytedcliTrustedFiles([configuredEntry]); }
+    catch { unavailableReason ??= 'unproven configured ByteCloud CLI'; }
+  }
   let networkEnv: Readonly<NodeJS.ProcessEnv> = Object.freeze({});
   try { networkEnv = bytedcliHostNetworkEnvironment(process.env); }
   catch (error) { unavailableReason = (error as Error).message; }
@@ -52,6 +62,7 @@ export function bytedcliTrustedHostLayout(settings:{readonly machineProfile?:str
     ...(settings.protectedRoots??[])];
   const executableReadOnlyRoots=[...(mcpRuntime?.protectedPaths ?? []),...installationRoots,...runtimeTrees.flatMap(tree=>tree.protectedPaths),...certificates.protectedPaths,...(dbRuntime?.protectedPaths ?? (isAbsolute(dbBinary) ? [dbBinary] : [])),...directories.filter(dir=>existsSync(join(dir,'bytedcli'))),...directories.map(dir=>join(dir,'bytedcli')).filter(existsSync),
     runtimeExecutable,dirname(runtimeExecutable)];
+  executableReadOnlyRoots.push(...(entrySnapshot?.protectedPaths ?? []));
   const protectedRoots=[...credentialRoots,...executableReadOnlyRoots];
   if(protectedRoots.some(root=>!isAbsolute(root)||root.startsWith('/$bunfs/')))throw new Error('invalid trusted protected root');
   const canonicalAliases=(paths:readonly string[])=>Object.freeze([...new Set(paths.flatMap(root=>{
@@ -64,7 +75,8 @@ export function bytedcliTrustedHostLayout(settings:{readonly machineProfile?:str
     installationRoots:Object.freeze(installationRoots),privateRoot,auditRoot,machineProfile:parseBytedcliMachineProfile(settings.machineProfile),credentialRoots:canonicalAliases(credentialRoots),
     executableReadOnlyRoots:canonicalAliases(executableReadOnlyRoots),protectedRoots:aliases,networkEnv:Object.freeze(networkEnv),
     unavailableReason,
-    runtimeStillCurrent:()=>!unavailableReason && runtimeProven && runtimeTrees.every(tree=>tree.stillCurrent()) && certificates.stillCurrent()});
+    runtimeStillCurrent:()=>!unavailableReason && runtimeProven && runtimeTrees.every(tree=>tree.stillCurrent()) && certificates.stillCurrent()
+      && (!entrySnapshot || entrySnapshot.stillCurrent())});
 }
 export type BytedcliHostLayout=ReturnType<typeof bytedcliTrustedHostLayout>;
 

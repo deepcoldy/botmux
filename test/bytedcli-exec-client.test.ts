@@ -10,6 +10,15 @@ let server:Server|undefined;const roots:string[]=[];
 afterEach(async()=>{server?.closeAllConnections();await new Promise<void>(resolve=>server?server.close(()=>resolve()):resolve());server=undefined;for(const dir of roots.splice(0))rmSync(dir,{recursive:true,force:true});});
 async function host(handler:Parameters<typeof createServer>[0]){server=createServer(handler as any);await new Promise<void>(r=>server!.listen(0,'127.0.0.1',r));return (server.address() as any).port;}
 describe('sandbox broker client',()=>{
+  it.each([{argv:['--no-auto-upgrade','--version'],id:'help.version'}, {argv:['--no-auto-upgrade','--help'],id:'help.root'},
+    {argv:['codebase','--no-auto-upgrade','--help'],id:'help.codebase'}])('keeps safe help flags compatible with upgrade disabled: $argv',({argv,id})=>{
+    expect(parseBytedcliOperation(argv)).toMatchObject({id,effect:'help'});
+  });
+  it.each([{argv:['--no-auto-upgrade','--json','auth','status']},{argv:['auth','status','--no-auto-upgrade','--json']}])('submits reviewed auth status with upgrade disabled: $argv',async ({argv})=>{
+    let calls=0,received:any;const port=await host((req:any,res:any)=>{let body='';req.on('data',(b:Buffer)=>body+=b);req.on('end',()=>{calls++;received=JSON.parse(body);res.end(JSON.stringify({schema:'botmux.bytedcli-exec.v1',requestId:received.requestId,operationId:'auth.status',operationEffect:'auth',effectiveIdentity:{kind:'none'},outcome:'rejected',stdoutBase64:'',stderrBase64:'',exitCode:77,errorCode:'actor_required'}));});});
+    let stderr='';expect(await runBytedcliExecClient({sessionId:'s',port,argv,stdout:()=>{},stderr:b=>stderr+=b})).toBe(77);
+    expect(calls).toBe(1);expect(received.argv).toEqual(argv);expect(stderr).toContain('actor_required');
+  });
   it('preserves reviewed remote --file selectors without reading a local file',async()=>{
     let received:any;const argv=['codebase','mr','diff','42','--repo','ns/repo','--file','does-not-exist-locally.ts'];
     const port=await host((req:any,res:any)=>{let text='';req.on('data',(b:Buffer)=>text+=b);req.on('end',()=>{received=JSON.parse(text);res.end(JSON.stringify({schema:'botmux.bytedcli-exec.v1',requestId:received.requestId,operationId:'codebase.mr.diff',operationEffect:'read',effectiveIdentity:{kind:'machine'},outcome:'completed',stdoutBase64:'',stderrBase64:'',exitCode:0}));});});

@@ -54,4 +54,17 @@ describe('private bounded CLI processes', () => {
       } })).rejects.toMatchObject({ code: 'executor_unavailable' });
     expect(cliRan).toBe(false);
   });
+  it('rechecks the frozen entry after the runtime probe completes before invoking CLI code', async () => {
+    const root = setup(); const entry = join(root, 'bytedcli.mjs'); writeFileSync(entry, 'console.log("0.199.0")');
+    const node = realpathSync(resolveNodeExecutable()!); let cliRan = false;
+    await expect(discoverBytedcliTrustedCli({ candidates: [entry], installationRoots: [root], runtimeExecutable: node,
+      path: '/usr/bin:/bin', probeHome: root, probeCwd: root, signal: new AbortController().signal,
+      run: async invocation => {
+        if (invocation.argv[0] === entry) { cliRan = true; return { stdout: Buffer.from('0.199.0'), stderr: Buffer.alloc(0), exitCode: 0 }; }
+        const result = await runBoundedBytedcliChild(invocation);
+        writeFileSync(entry, 'console.log("changed during runtime probe")');
+        return result;
+      } })).rejects.toMatchObject({ code: 'executor_unavailable' });
+    expect(cliRan).toBe(false);
+  });
 });

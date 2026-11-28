@@ -192,6 +192,7 @@
     }
   },
   "commonFlags": [
+    {"name":"--no-auto-upgrade","arity":"flag","validator":"json"},
     {"name":"--json","aliases":["-j"],"arity":"flag","validator":"json"},
     {"name":"--site","arity":"value","validator":"site"},
     {"name":"--help","aliases":["-h"],"arity":"flag","validator":"json"},

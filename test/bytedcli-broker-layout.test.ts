@@ -7,8 +7,40 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {bytedcliTrustedHostLayout} from '../src/core/bytedcli-broker.js';
 import {createBytedcliHostOperationPolicyReader} from '../src/core/bytedcli-host-operation-policy.js';
+import {parseBytedcliBrokerConfig} from '../src/global-config.js';
 const roots:string[]=[];
 afterEach(()=>{vi.unstubAllEnvs();for(const root of roots.splice(0))rmSync(root,{recursive:true,force:true});});
+it('uses a configured dedicated CLI without admitting unrelated global hardlinks',()=>{
+ const root=mkdtempSync(join(tmpdir(),'broker-dedicated-'));roots.push(root);vi.stubEnv('HOME',root);
+ const global=join(root,'global/node_modules/@bytedance-dev/bytedcli/dist'),dedicated=join(root,'dedicated/node_modules/@bytedance-dev/bytedcli/dist'),bin=join(root,'bin');
+ for(const dir of [global,dedicated,bin])mkdirSync(dir,{recursive:true});
+ const entry=join(dedicated,'bytedcli.js');writeFileSync(entry,'reviewed code');
+ writeFileSync(join(global,'bytedcli.js'),'global code');symlinkSync(join(global,'bytedcli.js'),join(bin,'bytedcli'));
+ const unrelated=join(root,'global/node_modules/other-tool');mkdirSync(unrelated);writeFileSync(join(unrelated,'tool.exe'),'other tool');linkSync(join(unrelated,'tool.exe'),join(root,'external-alias'));
+ vi.stubEnv('PATH',bin);
+ expect(bytedcliTrustedHostLayout().runtimeStillCurrent()).toBe(false);
+ const config=parseBytedcliBrokerConfig({cliEntrypoint:entry});
+ const layout=bytedcliTrustedHostLayout(config);
+ expect(layout.candidates).toEqual([entry]);expect(layout.runtimeStillCurrent()).toBe(true);
+ writeFileSync(join(unrelated,'tool.exe'),'unrelated change');expect(layout.runtimeStillCurrent()).toBe(true);
+ writeFileSync(entry,'changed reviewed code');expect(layout.runtimeStillCurrent()).toBe(false);
+});
+it.each(['missing','hardlink','search-root-created','alias-replaced'])('never falls back after configured CLI %s',mode=>{
+ const root=mkdtempSync(join(tmpdir(),'broker-dedicated-invalid-'));roots.push(root);vi.stubEnv('HOME',root);vi.stubEnv('PATH',root);
+ const dist=join(root,'install/node_modules/@bytedance-dev/bytedcli/dist');mkdirSync(dist,{recursive:true});
+ const entry=join(dist,'bytedcli.js'),alias=join(root,'cli-alias');writeFileSync(entry,'reviewed');symlinkSync(entry,alias);
+ if(mode==='missing')rmSync(entry);
+ if(mode==='hardlink')linkSync(entry,join(root,'external-alias'));
+ const config=parseBytedcliBrokerConfig({cliEntrypoint:alias});const layout=bytedcliTrustedHostLayout(config);
+ if(mode==='missing'||mode==='hardlink'){expect(layout.runtimeStillCurrent()).toBe(false);return;}
+ expect(layout.executableReadOnlyRoots).toContain(alias);expect(layout.runtimeStillCurrent()).toBe(true);
+ if(mode==='search-root-created')mkdirSync(join(root,'install/node_modules/@bytedance-dev/bytedcli/dist/node_modules'));
+ else {rmSync(alias);const next=join(root,'replacement.js');writeFileSync(next,'replacement');symlinkSync(next,alias);}
+ expect(layout.runtimeStillCurrent()).toBe(false);
+});
+it.each(['relative/cli.js','/tmp/../cli.js','/$bunfs/root/cli.js','/','/tmp/cli\0.js',false])('rejects invalid host CLI selection %s',cliEntrypoint=>{
+ expect(()=>parseBytedcliBrokerConfig({cliEntrypoint})).toThrow();
+});
 it.each(['home','home-parent'])('loads host operation policy when the operator uses a symlinked %s',kind=>{
  const root=mkdtempSync(join(tmpdir(),'broker-home-alias-'));roots.push(root);
  const actual=join(root,'actual'),alias=join(root,'alias');mkdirSync(actual,{mode:0o700});
