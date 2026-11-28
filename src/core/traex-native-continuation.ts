@@ -103,10 +103,16 @@ export class TraexNativeContinuationTracker {
             closedTranscriptContinuation = true;
           }
         }
-        // Any OSC 7501 `working` observed prior to a durable rollout terminal
-        // belongs to the just-ended turn (even when `fireIdle()` is deferred via
-        // `signalIdle: false`), never to a subsequent post-terminal window.
-        this.programStatusNativeWorking = false;
+        // OSC 7501 `working` is process-wide evidence with no turn id, so a
+        // rollout terminal for THIS turn cannot prove the working state belongs
+        // to it: an OSC-only sibling continuation (whose `task_started` has not
+        // flushed yet) may still be running under that same working hold. Clear
+        // the latch only once the detector no longer holds working; while it
+        // does, the latch stays armed until an explicit non-working OSC report,
+        // prompt-ready, turn retirement, or reset resolves it.
+        if (!programStatusHeldWorking) {
+          this.programStatusNativeWorking = false;
+        }
       }
     }
 

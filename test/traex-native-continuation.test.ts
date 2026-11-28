@@ -230,9 +230,79 @@ describe('TraexNativeContinuationTracker & drainTraexRollout', () => {
     // If IdleDetector no longer holds working (e.g. blocked or done), immediately inactive.
     expect(tracker.isActive(false)).toBe(false);
 
-    // A rollout terminal clears the OSC latch even before deferred fireIdle() drops IdleDetector working.
+    // A rollout terminal carries no turn id on the OSC working state, so it
+    // cannot prove the working hold belongs to the ending turn: an OSC-only
+    // sibling continuation may still run under that same hold. The latch stays
+    // armed while the detector still holds working.
     tracker.observeTranscriptLifecycle([{ kind: 'ended', turnId: 'native-t2' }], {}, true);
-    expect(tracker.isActive(true)).toBe(false);
+    expect(tracker.isActive(true)).toBe(true);
+
+    // Once the detector drops the working hold, the same terminal retires the
+    // now-inert latch instead of leaving it stranded.
+    tracker.observeTranscriptLifecycle([{ kind: 'ended', turnId: 'native-t3' }], {}, false);
+    expect(tracker.isActive(false)).toBe(false);
+
+    // Re-arm, then prove the OSC state machine itself owns teardown: an explicit
+    // non-working report clears the latch even while a rollout terminal never names it.
+    const reWake = tracker.observeProgramStatus({
+      state: 'working',
+      wasPromptReady: true,
+      programStatusHeldWorking: true,
+      hasBotmuxTurnOwner: false,
+      botmuxOperationInFlight: false,
+    });
+    expect(reWake.becameActive).toBe(true);
+    const goIdle = tracker.observeProgramStatus({
+      state: 'idle',
+      wasPromptReady: false,
+      programStatusHeldWorking: false,
+      hasBotmuxTurnOwner: false,
+      botmuxOperationInFlight: false,
+    });
+    expect(goIdle.becameActive).toBe(false);
+    expect(tracker.isActive(false)).toBe(false);
+  });
+
+  it('keeps an OSC-first continuation active when a transcript-only sibling closes first under the same working hold', () => {
+    const tracker = new TraexNativeContinuationTracker();
+
+    // Continuation B wakes via OSC 7501 working before any rollout edge lands.
+    const bWake = tracker.observeProgramStatus({
+      state: 'working',
+      wasPromptReady: true,
+      programStatusHeldWorking: true,
+      hasBotmuxTurnOwner: false,
+      botmuxOperationInFlight: false,
+    });
+    expect(bWake.becameActive).toBe(true);
+    expect(tracker.hasTranscriptContinuation()).toBe(false);
+
+    // Sibling A's nested task_started flushes later while B keeps running.
+    tracker.observeTranscriptLifecycle([
+      { kind: 'started', turnId: 'native-A', rootTurnId: 'native-root' },
+    ], {}, true);
+    expect(tracker.hasTranscriptContinuation()).toBe(true);
+
+    // A completes first; B still runs and the detector still holds working.
+    const closeA = tracker.observeTranscriptLifecycle(
+      [{ kind: 'ended', turnId: 'native-A' }],
+      {},
+      true,
+    );
+    expect(closeA.closedTranscriptContinuation).toBe(true);
+    expect(tracker.hasTranscriptContinuation()).toBe(false);
+    // B's OSC evidence must survive A's terminal — no cross-continuation clear.
+    expect(tracker.isActive(true)).toBe(true);
+
+    // B's own non-working OSC report is what finally retires the latch.
+    tracker.observeProgramStatus({
+      state: 'idle',
+      wasPromptReady: false,
+      programStatusHeldWorking: false,
+      hasBotmuxTurnOwner: false,
+      botmuxOperationInFlight: false,
+    });
+    expect(tracker.isActive(false)).toBe(false);
   });
 });
 
@@ -514,6 +584,12 @@ describe('Worker resetTraexAutoModelBeforePendingTurn & flushPending during TRAE
     );
     scope.codexBridgeIngest();
     expect(scope.traexNativeContinuation.hasTranscriptContinuation()).toBe(false);
+    // The rollout terminal alone must not clear the OSC working latch: while
+    // the detector still holds working, an OSC-only sibling could be running.
+    expect(scope.traexNativeContinuationActive()).toBe(true);
+    // TRAE reports the non-working state once its OSC working actually ends;
+    // that OSC edge owns the latch teardown.
+    scope.onPtyData('\x1b]7501;state=done:app=traecli\x1b\\');
     expect(scope.traexNativeContinuationActive()).toBe(false);
     expect(queue.drainEmittable()).toEqual([
       expect.objectContaining({
@@ -608,6 +684,9 @@ describe('Worker resetTraexAutoModelBeforePendingTurn & flushPending during TRAE
     vi.setSystemTime(t4EndMs);
     appendFileSync(rolloutPath, traexTaskComplete('native-t4', 'done', new Date(t4EndMs).toISOString()));
     scope.codexBridgeIngest();
+    // OSC working ends with the last continuation; without this edge the
+    // bounded (120s) program-status lease would keep refreshing om_lost.
+    scope.onPtyData('\x1b]7501;state=done:app=traecli\x1b\\');
     vi.setSystemTime(t4EndMs + STRUCTURED_SUBMIT_START_GRACE_MS + 1_000);
     expect(scope.pruneExpiredStructuredHeadsAndEmit('post-continuation-expiry')).toBe(true);
     expect(queue.peek()).toEqual([]);
@@ -674,6 +753,37 @@ describe('Worker resetTraexAutoModelBeforePendingTurn & flushPending during TRAE
     // The assistant_final must not fireIdle() into a wrong ready edge while t2
     // is demonstrably still running on transcript evidence alone.
     expect(detector.isIdleNow()).toBe(false);
+  });
+
+  it('does not publish idle when an OSC-first continuation outlives a transcript sibling that closes first', () => {
+    const h = buildWorkerHarness({ reselectPerTurn: false });
+    const { scope, rolloutPath, detector } = h;
+
+    // Continuation B wakes via OSC 7501 working while its rollout has not flushed.
+    scope.onPtyData('\x1b]7501;state=working:app=traecli\x1b\\');
+    expect(detector.programStatusHeldWorking()).toBe(true);
+    expect(scope.traexNativeContinuationActive()).toBe(true);
+    expect(scope.traexNativeContinuation.hasTranscriptContinuation()).toBe(false);
+
+    // Sibling A's nested task_started lands, then A completes with an
+    // assistant_final while B still runs under the same OSC working hold.
+    appendFileSync(
+      rolloutPath,
+      traexTaskStarted('native-A', 'native-root', '2026-11-28T00:01:00.000Z')
+        + traexTaskComplete('native-A', 'sibling synthesis', '2026-11-28T00:02:00.000Z'),
+    );
+    scope.codexBridgeIngest();
+
+    // A's terminal must neither clear B's OSC latch nor fireIdle() into a false
+    // ready edge: B is demonstrably still working.
+    expect(scope.traexNativeContinuation.hasTranscriptContinuation()).toBe(false);
+    expect(scope.traexNativeContinuationActive()).toBe(true);
+    expect(detector.programStatusHeldWorking()).toBe(true);
+    expect(detector.isIdleNow()).toBe(false);
+
+    // B's own OSC terminal releases the latch and admits idle normally.
+    scope.onPtyData('\x1b]7501;state=done:app=traecli\x1b\\');
+    expect(scope.traexNativeContinuationActive()).toBe(false);
   });
 
   it('retires an armed post-terminal fence from the external-idle path while a transcript continuation stays open', () => {

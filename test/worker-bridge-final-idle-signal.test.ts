@@ -38,7 +38,7 @@ function bridge(events: Array<{ kind: string }>) {
     noteSpawnArgvTurnStartTranscriptEvidence() {},
     pruneExpiredStructuredHeadsAndEmit() {},
     emitReadyCodexTurns() {},
-    idleDetector: { fireIdle },
+    idleDetector: { fireIdle, programStatusHeldWorking: () => false },
     cliSpawnGeneration: 1,
     cliRestartInProgress: false,
   };

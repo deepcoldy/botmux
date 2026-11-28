@@ -21442,13 +21442,18 @@ function codexBridgeIngest(opts: {
   // that terminal rather than leave the old owner collecting the next answer.
   if (structuredBridgeIs('doubao') && !hasAssistantFinal) checkpointStructuredBridgeRecovery();
   observeStructuredBackgroundTasks(result);
-  const traexTranscriptContinuationOpen = structuredBridgeIs('traex')
+  // Wide activity evidence: a continuation proven by EITHER rollout lifecycle
+  // edges OR a still-held OSC 7501 working latch (an OSC-only sibling whose
+  // task_started has not flushed yet). Fence retirement and idle suppression
+  // must honor both, or a sibling's assistant_final would drop the surviving
+  // continuation's working state and publish a false idle.
+  const traexNativeContinuationOpen = structuredBridgeIs('traex')
     && !lastInitConfig?.adoptMode
-    && traexNativeContinuation.hasTranscriptContinuation();
+    && traexNativeContinuationActive();
   if (cliAdapter?.postTerminalPromptFence === true) {
     const turns = codexBridgeQueue.peek();
     if (turns.some(turn => turn.started && turn.finalText === undefined)
-      || traexTranscriptContinuationOpen) {
+      || traexNativeContinuationOpen) {
       // A queued, fingerprint-matched successor or TRAE native continuation
       // has actually started. Busy output now belongs to live work, not the
       // preceding completed turn.
@@ -21482,12 +21487,12 @@ function codexBridgeIngest(opts: {
   if (opts.signalIdle !== false
     && !structuredBridgeIs('antigravity')
     && hasAssistantFinal
-    && !traexTranscriptContinuationOpen) {
+    && !traexNativeContinuationOpen) {
     idleDetector?.fireIdle();
   } else if (opts.signalIdle === false
     && !structuredBridgeIs('antigravity')
     && hasAssistantFinal
-    && !traexTranscriptContinuationOpen) {
+    && !traexNativeContinuationOpen) {
     // A caller that must not raise the idle edge inside its own critical
     // section (a flush's post-terminal fence check, an interrupt drain) can
     // still be the drain that consumes the turn's final. The watcher/poller
