@@ -14009,6 +14009,23 @@ describe('core-only public routes + readiness barrier (behavioral)', () => {
       });
       expect(signed.status).toBe(403);
       expect(await signed.json()).toMatchObject({ errorCode: 'owner_unresolved' });
+      const unionBody = JSON.stringify({ ...JSON.parse(actorBody), actorUnionId: 'on_fixture_owner' });
+      const unsignedUnion = await fetch(`${base}/api/trigger/owner-union`, { method: 'POST', headers: actorHeaders, body: unionBody });
+      expect(unsignedUnion.status).toBe(401);
+      const signedUnion = (body: string) => fetch(`${base}/api/trigger/owner-union`, {
+        method: 'POST',
+        headers: { ...actorHeaders, ...trustedHostHeaders('POST', '/api/trigger/owner-union', handle!.port) },
+        body,
+      });
+      const withoutUnion = await signedUnion(actorBody);
+      expect(withoutUnion.status).toBe(403);
+      expect(await withoutUnion.json()).toMatchObject({ errorCode: 'actor_not_allowed' });
+      const withUnion = await signedUnion(unionBody);
+      expect(withUnion.status).toBe(403);
+      expect(await withUnion.json()).toMatchObject({ errorCode: 'owner_unresolved' });
+      const publicUnion = await fetch(`${base}/api/trigger`, { method: 'POST', headers: actorHeaders, body: unionBody });
+      expect(publicUnion.status).toBe(403);
+      expect(await publicUnion.json()).toMatchObject({ errorCode: 'actor_not_allowed' });
     } finally {
       workerPool.setActiveSessionsRegistry(previousSessions ?? new Map());
     }

@@ -14406,9 +14406,14 @@ async function cmdSend(
   // host-private prepared Markdown copy, so use the same precedence as the
   // eventual card renderer rather than trusting the raw source alone.
   let expectedLinkRenderedContent = extractCardText(content);
+  // Readable card text for the structured turn reply (`replies[].text`),
+  // taken from the authored card before mention footers are appended.
+  let customCardReplyText: string | undefined;
   if (customCard) {
     const { extractCardContent } = await import('./im/lark/message-parser.js');
     expectedLinkRenderedContent = extractCardContent(JSON.stringify(customCard));
+    const { extractInteractiveCardReplyText } = await import('./im/lark/card-reply-text.js');
+    customCardReplyText = extractInteractiveCardReplyText(customCard);
   }
   if (!customCard && preparedText !== undefined) expectedLinkRenderedContent = preparedText;
   // Requested mentions, not resolved ones: a mention that resolves to nobody
@@ -15052,9 +15057,11 @@ async function cmdSend(
       const replayPureVideo = !customCard && !asChoice && shouldSendAsPureVideo(primaryShape);
       const replayStructuredText = asVoice || isOriginDocCommentTurn
         ? content
-        : (!customCard && !fileOnlyPrimaryRequested && !replayPureVideo
-            ? (preparedText ?? extractCardText(content))
-            : undefined);
+        : customCard
+          ? customCardReplyText
+          : (!fileOnlyPrimaryRequested && !replayPureVideo
+              ? (preparedText ?? extractCardText(content))
+              : undefined);
       const companionIds = !asVoice && !isOriginDocCommentTurn && !fileOnlyPrimaryRequested
         ? await collectDeliveredCompanionAttachmentIds(existingTurnPrimary.messageId, followThreadTargetChatId)
         : [];
@@ -16741,6 +16748,9 @@ async function cmdSend(
           videoCount: videoAttachments.length,
           mentionCount: mentions.length,
         });
+    const structuredReplyText = customCard
+      ? customCardReplyText
+      : (!pureFileSend && !pureVideoSend && text ? text : undefined);
     if ((pureFileSend || pureVideoSend) && replyLayout) {
       console.error(`botmux send: --layout 不作用于纯${pureFileSend ? '文件' : '视频'}消息，本次已忽略`);
       replyLayout = undefined;
@@ -17119,7 +17129,7 @@ async function cmdSend(
             {
               messageId,
               at: turnPrimaryReplayedSentAtMs,
-              ...(!customCard && !pureFileSend && !pureVideoSend && text ? { text } : {}),
+              ...(structuredReplyText ? { text: structuredReplyText } : {}),
             },
             ...companionIds.map(id => ({ messageId: id, at: turnPrimaryReplayedSentAtMs! })),
           ],
@@ -17337,7 +17347,7 @@ async function cmdSend(
       await recordStructuredSendReceipts(markerSessionId, markerTurnId, [{
         messageId,
         at: sentAtMs,
-        ...(!customCard && !pureFileSend && !pureVideoSend && text ? { text } : {}),
+        ...(structuredReplyText ? { text: structuredReplyText } : {}),
       }]);
     }
     await removeScheduleSelfAfterFinal();

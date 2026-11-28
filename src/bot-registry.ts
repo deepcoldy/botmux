@@ -44,6 +44,7 @@ import {
   type CliLaunchMode,
 } from './core/cli-launch-mode.js';
 import { logger } from './utils/logger.js';
+import { LARK_UNION_ID_PATTERN } from './services/trigger-types.js';
 import { isLocalBotId } from './setup/local-bot.js';
 import {
   normalizeApprovalDeferredScopes,
@@ -2053,6 +2054,14 @@ export interface BotConfig {
    * identity, simply have none and fall back to the resolved allowlist.
    */
   ownerOpenId?: string;
+  /**
+   * Owner's tenant-stable `union_id` (`on_…`), an explicit owner declaration
+   * that can be copied between this owner's bots. It is never resolved by
+   * itself: it names an owner only while the same `on_` entry is in
+   * `allowedUsers` and resolves into the current allowlist. Together with
+   * `ownerOpenId`, both must name the same person.
+   */
+  ownerUnionId?: string;
   /** 首次成功上线后私聊 owner 一次的欢迎语；已发送记录在 dataDir，见 services/welcome-message.ts。 */
   welcomeMessage?: string;
   allowedChatGroups?: string[];
@@ -3207,21 +3216,68 @@ export function getConfiguredOwnerOpenId(larkAppId: string): string | undefined 
 }
 
 /**
- * Current permission owner: explicit ownerOpenId keeps priority only while it
+ * The explicitly declared owner (`ownerOpenId` / `ownerUnionId`) as this app's
+ * open_id. `declared` without `openId` means a declaration exists but names
+ * nobody in the resolved allowlist, or the two fields name different people.
+ */
+function explicitOwner(bot: BotState): { declared: boolean; openId?: string } {
+  const byOpenId = getConfiguredOwnerOpenId(bot.config.larkAppId);
+  const unionId = bot.config.ownerUnionId;
+  if (!byOpenId && !unionId) return { declared: false };
+  const byUnionId = unionId ? bot.rawAllowedUserResolution.get(unionId) : undefined;
+  if (unionId && !byUnionId) return { declared: true };
+  if (byOpenId && byUnionId && byOpenId !== byUnionId) return { declared: true };
+  const openId = byOpenId ?? byUnionId!;
+  return bot.resolvedAllowedUsers.includes(openId) ? { declared: true, openId } : { declared: true };
+}
+
+/**
+ * Current permission owner: an explicit owner keeps priority only while it
  * is still in the resolved allowlist. Once removed or unresolved, ownership
  * follows the first resolved ou_ entry, matching legacy allowlist semantics.
  */
 export function getOwnerOpenId(larkAppId: string): string | undefined {
   const bot = bots.get(larkAppId);
   if (!bot) return undefined;
-  return getStrictOwnerOpenId(larkAppId) ?? bot.resolvedAllowedUsers.find(u => u.startsWith('ou_'));
+  return explicitOwner(bot).openId ?? bot.resolvedAllowedUsers.find(u => u.startsWith('ou_'));
 }
 
+/**
+ * The owner a host administrator may act as. Unlike {@link getOwnerOpenId} it
+ * never guesses among several people: an explicit owner must be in the
+ * resolved allowlist; without one, the owner is the allowlist's only person,
+ * and only when every configured entry resolved to that same person (an
+ * entry that failed to resolve may be someone else).
+ */
 export function getStrictOwnerOpenId(larkAppId: string): string | undefined {
-  const configuredOwner = getConfiguredOwnerOpenId(larkAppId);
-  if (configuredOwner && bots.get(larkAppId)?.resolvedAllowedUsers.includes(configuredOwner)) {
-    return configuredOwner;
-  }
+  const bot = bots.get(larkAppId);
+  if (!bot) return undefined;
+  const explicit = explicitOwner(bot);
+  if (explicit.declared) return explicit.openId;
+  const people = new Set(bot.resolvedAllowedUsers.filter(u => u.startsWith('ou_')));
+  if (people.size !== 1) return undefined;
+  const [only] = people;
+  const entries = bot.config.allowedUsers ?? [];
+  const allResolved = entries.length > 0
+    && entries.every(e => (bot.rawAllowedUserResolution.get(e) ?? (e.startsWith('ou_') ? e : undefined)) === only);
+  return allResolved ? only : undefined;
+}
+
+/**
+ * Whether `unionId` names `ownerOpenId` ({@link getStrictOwnerOpenId}) as far
+ * as this bot's configuration can tell: an `on_` allowlist entry or an
+ * explicit `ownerUnionId` answers directly. `lookup` means only the owner's
+ * own union_id, fetched with this app's credentials, can decide.
+ */
+export function ownerUnionIdVerdict(
+  larkAppId: string, ownerOpenId: string, unionId: string,
+): 'match' | 'mismatch' | 'lookup' {
+  const bot = bots.get(larkAppId);
+  if (!bot) return 'mismatch';
+  const listed = bot.rawAllowedUserResolution.get(unionId);
+  if (listed !== undefined) return listed === ownerOpenId ? 'match' : 'mismatch';
+  // A declared ownerUnionId that named the owner is itself in the map above.
+  return bot.config.ownerUnionId ? 'mismatch' : 'lookup';
 }
 
 /** Per-bot 最终回复投递方式的**显式**配置值；未配置 / 未注册的 bot 返回 undefined，
@@ -4943,6 +4999,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // value that itself needs resolving.
       ownerOpenId: typeof entry.ownerOpenId === 'string' && entry.ownerOpenId.startsWith('ou_')
         ? entry.ownerOpenId
+        : undefined,
+      ownerUnionId: typeof entry.ownerUnionId === 'string' && LARK_UNION_ID_PATTERN.test(entry.ownerUnionId)
+        ? entry.ownerUnionId
         : undefined,
       welcomeMessage: typeof entry.welcomeMessage === 'string' && entry.welcomeMessage.trim()
         ? entry.welcomeMessage.trim()

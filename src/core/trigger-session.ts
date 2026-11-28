@@ -15,13 +15,13 @@ import * as idempotencyStore from '../services/idempotency-store.js';
 import * as groupsStore from '../services/groups-store.js';
 import * as oncallStore from '../services/oncall-store.js';
 import { randomUUID } from 'node:crypto';
-import { getBot, getStrictOwnerOpenId, effectiveDefaultWorkingDir } from '../bot-registry.js';
+import { getBot, getStrictOwnerOpenId, ownerUnionIdVerdict, effectiveDefaultWorkingDir, LarkTransportDisabledError } from '../bot-registry.js';
 import { isNativeGatewayCoreProcess } from './runtime-mode.js';
 import { resolveSender, type ResolvedSender } from '../im/lark/identity-cache.js';
 import type { RunAsResolution } from './run-as.js';
 import { beginReplyTargetTurn } from './reply-target.js';
 import { renderInboundMessageLocation } from './reply-message.js';
-import { getChatMode, getMessageChatId, sendMessage, replyMessage, type ChatMode } from '../im/lark/client.js';
+import { getChatMode, getMessageChatId, sendMessage, replyMessage, resolveUnionIdFromOpenIdStrict, type ChatMode } from '../im/lark/client.js';
 import { resolveRegularGroupMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import { localeForBot, t, type Locale } from '../i18n/index.js';
 import { validateWorkingDir } from './working-dir.js';
@@ -981,6 +981,34 @@ function stageTriggerReadModel(ds: DaemonSession, req: TriggerRequest, turnId: s
   }
 }
 
+/** An owner-actor request naming a person other than the bot's owner is refused. */
+async function refuseOtherUnionId(
+  larkAppId: string, ownerOpenId: string, actorUnionId: string,
+): Promise<TriggerResponse | undefined> {
+  const mismatch: TriggerResponse = { ok: false, errorCode: 'owner_mismatch', error: 'actorUnionId does not name this bot\'s owner' };
+  const verdict = ownerUnionIdVerdict(larkAppId, ownerOpenId, actorUnionId);
+  if (verdict === 'match') return undefined;
+  if (verdict === 'mismatch') return mismatch;
+  let lookup: Awaited<ReturnType<typeof resolveUnionIdFromOpenIdStrict>>;
+  try {
+    lookup = await resolveUnionIdFromOpenIdStrict(larkAppId, ownerOpenId);
+  } catch (error) {
+    if (!(error instanceof LarkTransportDisabledError)
+      && (!(error instanceof Error) || error.name !== 'LarkTransportDisabledError')) throw error;
+    return {
+      ok: false, errorCode: 'owner_unresolved',
+      error: 'core-only bot cannot verify actorUnionId without Feishu transport',
+    };
+  }
+  if (lookup.status === 'resolved') return lookup.unionId === actorUnionId ? undefined : mismatch;
+  return {
+    ok: false, errorCode: 'owner_unresolved',
+    error: lookup.status === 'retryable'
+      ? 'could not look up the bot owner\'s union_id; retry later'
+      : 'the bot owner\'s union_id is not visible to this app; list the owner by union_id in allowedUsers',
+  };
+}
+
 async function triggerSessionTurnAdmitted(
   req: TriggerRequest,
   deps: TriggerSessionDeps,
@@ -1107,8 +1135,12 @@ async function triggerSessionTurnAdmitted(
   };
   const larkAppId = deps.larkAppId;
   const ownerOpenId = ownerActor ? getStrictOwnerOpenId(larkAppId) : undefined;
-  const ownerUnresolved = (): TriggerResponse => ({ ok: false, errorCode: 'owner_unresolved', error: 'configured bot owner is not in the resolved allowlist' });
+  const ownerUnresolved = (): TriggerResponse => ({ ok: false, errorCode: 'owner_unresolved', error: 'bot owner is not configured in, or is no longer in, the resolved allowlist' });
   if (ownerActor && !ownerOpenId) return ownerUnresolved();
+  if (ownerOpenId && req.actorUnionId !== undefined) {
+    const refused = await refuseOtherUnionId(larkAppId, ownerOpenId, req.actorUnionId);
+    if (refused) return refused;
+  }
   if (req.target.botId && req.target.botId !== larkAppId) {
     return { ok: false, errorCode: 'bot_not_found', error: 'request routed to the wrong daemon' };
   }
@@ -1287,6 +1319,7 @@ async function triggerSessionTurnAdmitted(
     ? computeInputHash({
         seam: 'turn',
         ...(req.actor ? { actor: req.actor } : {}),
+        ...(req.actorUnionId !== undefined ? { actorUnionId: req.actorUnionId } : {}),
         ...(req.runAs !== undefined ? { runAs: req.runAs } : {}),
         sessionId: req.target.sessionId ?? null,
         instruction: req.instruction ?? null,
