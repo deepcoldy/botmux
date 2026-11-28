@@ -3151,6 +3151,7 @@ export type WorkerToDaemonBase =
    *  model switch (e.g. BOTMUX_SANDBOX changed before a restart) converges. */
   | {
       type: 'session_identity_decision';
+      attestedLoopback?: boolean;
       sessionId: string;
       model: IdentityStorageModel;
       cliExecution?: import('./core/cli-execution-mode.js').WorkerCliExecution;

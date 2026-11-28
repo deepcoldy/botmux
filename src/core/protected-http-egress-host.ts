@@ -88,9 +88,13 @@ export interface ProtectedLoopbackService {
    *  {@link UPSTREAM_TIMEOUT_MS}). A route that holds its answer while it
    *  waits on slow work (a platform credential grant) declares a longer one. */
   upstreamTimeoutMs?: number;
+  /** Per-service encoded response cap; ordinary egress retains its own limit. */
+  responseLimitBytes?: number;
 }
 
 export interface ProtectedLoopbackForwardRequest {
+  /** Lifetime of the original namespace client, including host shutdown. */
+  signal?: AbortSignal;
   method: string;
   path: string;
   headers: Record<string, string>;
@@ -170,19 +174,22 @@ function normalizedMethod(raw: string | undefined): string {
 
 function normalizeLoopbackServices(raw: readonly ProtectedLoopbackService[] | undefined): ProtectedLoopbackService[] {
   const ids = new Set<string>();
-  const listenPorts = new Set<number>();
+  const routes = new Set<string>();
   return (raw ?? []).map(service => {
     if (!/^[a-z0-9][a-z0-9._-]{0,127}$/.test(service.id)
       || !Number.isSafeInteger(service.listenPort) || service.listenPort < 1 || service.listenPort > 65535
       || !Number.isSafeInteger(service.upstreamPort) || service.upstreamPort < 1 || service.upstreamPort > 65535
-      || ids.has(service.id) || listenPorts.has(service.listenPort)) {
+      || ids.has(service.id)) {
       throw new Error('invalid_protected_loopback_service');
     }
     ids.add(service.id);
-    listenPorts.add(service.listenPort);
     const method = normalizedMethod(service.method);
     const path = normalizeProtectedHttpPath(service.path);
     if (path.includes('?')) throw new Error('invalid_protected_loopback_service');
+    const route = JSON.stringify([service.listenPort, method, path]);
+    if (routes.has(route)) throw new Error('invalid_protected_loopback_service');
+    routes.add(route);
+    if (service.responseLimitBytes !== undefined && (!Number.isSafeInteger(service.responseLimitBytes) || service.responseLimitBytes <= 0 || service.responseLimitBytes > 32 * 1024 * 1024)) throw new Error('invalid_protected_loopback_service');
     const forwardHeaders: string[] = [];
     const seenHeaders = new Set<string>();
     for (const rawHeader of service.forwardHeaders) {
@@ -540,6 +547,7 @@ function defaultLoopbackForwarder(
       headers,
       agent: false,
       timeout: service.upstreamTimeoutMs ?? UPSTREAM_TIMEOUT_MS,
+      signal: request.signal,
     }, response => resolve({
       status: response.statusCode ?? 502,
       headers: response.headers,
@@ -551,13 +559,13 @@ function defaultLoopbackForwarder(
   });
 }
 
-async function streamCappedResponseBody(source: Readable, response: ServerResponse): Promise<void> {
+async function streamCappedResponseBody(source: Readable, response: ServerResponse, limit = MAX_PROTECTED_HTTP_BODY_BYTES): Promise<void> {
   let length = 0;
   try {
     for await (const raw of source) {
       const chunk = Buffer.isBuffer(raw) ? Buffer.from(raw) : Buffer.from(raw);
       length += chunk.length;
-      if (length > MAX_PROTECTED_HTTP_BODY_BYTES) {
+      if (length > limit) {
         chunk.fill(0);
         throw new BodyLimitError('response_body_too_large');
       }
@@ -632,6 +640,7 @@ export async function startSessionProtectedHttpEgressHost(
     ?? ((service, request) => defaultLoopbackForwarder(opts.loopbackProxyAttestation, service, request));
   const sockets = new Set<Socket>();
   const sensitiveBuffers = new Set<Buffer>();
+  const loopbackRequests = new Set<AbortController>();
   let closing: Promise<void> | undefined;
   let ownedSocket: { dev: number; ino: number } | undefined;
 
@@ -708,9 +717,15 @@ export async function startSessionProtectedHttpEgressHost(
           sensitiveBuffers.add(body);
           if (body.length > 0) headers['content-length'] = String(body.length);
           let pendingUpstreamBody: Buffer | undefined;
+          const controller = new AbortController();
+          loopbackRequests.add(controller);
+          const abort = () => controller.abort();
+          const clientClosed = () => { if (!response.writableFinished) abort(); };
+          request.once('aborted', abort);
+          response.once('close', clientClosed);
           try {
             const upstream = await forwardLoopbackService(service, {
-              method, path, headers, body,
+              method, path, headers, body, signal: controller.signal,
               ...(loopbackRequest.peer ? { peer: loopbackRequest.peer } : {}),
             });
             if (!Number.isInteger(upstream.status) || upstream.status < 100 || upstream.status > 599) {
@@ -722,7 +737,7 @@ export async function startSessionProtectedHttpEgressHost(
             if (Buffer.isBuffer(upstream.body)) {
               pendingUpstreamBody = upstream.body;
               sensitiveBuffers.add(upstream.body);
-              if (upstream.body.length > MAX_PROTECTED_HTTP_BODY_BYTES) {
+              if (upstream.body.length > (service.responseLimitBytes ?? MAX_PROTECTED_HTTP_BODY_BYTES)) {
                 sendJson(response, 502, 'botmux_protected_loopback_response_too_large');
                 upstream.body.fill(0);
                 sensitiveBuffers.delete(upstream.body);
@@ -741,7 +756,7 @@ export async function startSessionProtectedHttpEgressHost(
               }
             } else {
               response.writeHead(upstream.status, sanitizedResponseHeaders(upstream.headers));
-              await streamCappedResponseBody(upstream.body, response);
+              await streamCappedResponseBody(upstream.body, response, service.responseLimitBytes);
             }
           } catch (error) {
             pendingUpstreamBody?.fill(0);
@@ -750,6 +765,9 @@ export async function startSessionProtectedHttpEgressHost(
             else if (!response.writableEnded) response.destroy();
             reportError(error);
           } finally {
+            loopbackRequests.delete(controller);
+            request.off('aborted', abort);
+            response.off('close', clientClosed);
             body.fill(0);
             sensitiveBuffers.delete(body);
           }
@@ -931,6 +949,8 @@ export async function startSessionProtectedHttpEgressHost(
     close(): Promise<void> {
       closing ??= (async () => {
         cleanupPaths();
+        for (const controller of loopbackRequests) controller.abort();
+        loopbackRequests.clear();
         for (const socket of sockets) socket.destroy();
         for (const buffer of sensitiveBuffers) buffer.fill(0);
         sensitiveBuffers.clear();

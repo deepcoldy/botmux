@@ -2518,6 +2518,8 @@ export function applyTurnGitConfigEnv(
 }
 
 export interface TriggerUserCliEnvOptions {
+  /** Actual live protected relay; never taken from Bot configuration. */
+  attestedLoopback?: boolean;
   /** The session runs in a fresh bwrap root that only mounts CANONICAL paths.
    *  A symlinked home / data root (`/home/u` -> `/data00/home/u`) has no alias
    *  there, so every path written into the session env or a generated script
@@ -2626,14 +2628,14 @@ export function prepareTriggerUserCliEnv(
 ): Array<[string, string]> {
   const strictBroker = !!sessionDataDir && bytecloudExportBlocked(sessionDataDir, sessionId, policy);
   if (strictBroker) {
-    if (process.platform !== 'linux' || model !== 'proven' || !execution?.ipcPort || options?.loopbackShared === false) {
+    if (process.platform !== 'linux' || model !== 'proven' || !execution?.ipcPort || (options?.loopbackShared === false && options.attestedLoopback !== true)) {
       throw new Error('ByteCloud broker requires Linux proven identity and host loopback');
     }
     // A disabled live mode never relaxes a previously strict session.
     policy = { ...policy, enabled: true, tools: [...new Set([...(policy?.enabled ? policy.tools : []), 'bytedcli' as const])] };
     clearStrictBytecloudArtifacts(sessionDataDir!, sessionId);
   }
-  if (policy?.enabled && policy.gitCommitIdentity && options?.loopbackShared === false) {
+  if (policy?.enabled && policy.gitCommitIdentity && options?.loopbackShared === false && options.attestedLoopback !== true) {
     throw new Error('triggerUserAuth.gitCommitIdentity 需要会话内可访问 daemon loopback；'
       + '当前沙盒通过 --unshare-net 或 slirp 隔离了 loopback，无法核验当前回合触发人。'
       + '请关闭 gitCommitIdentity，或调整沙盒网络后重启会话');

@@ -5,7 +5,8 @@ import { basename, dirname, join } from 'node:path';
 import { CURRENT_ACTOR_SCHEMA, normalizeActorEmail, type CurrentActorDocument } from '../cli/current-actor.js';
 import { resolveVerifiedUserIdentity } from '../im/lark/identity-cache.js';
 import { collectSessionLineagePids } from './preview-port-owner.js';
-import { larkTransportEnabled, type DaemonSession } from './types.js';
+import type { DaemonSession } from './types.js';
+import { larkToolIdentityEnabled } from './lark-tool-binding.js';
 import type { CliExecutionMode } from './cli-execution-mode.js';
 import { parseScheduledTurnId } from './scheduled-turn-provenance.js';
 import {
@@ -419,7 +420,7 @@ export function attestCurrentExecutionLoopbackPeer(
   const refuse = (reason: string): null => { input.onRefusal?.(reason); return null; };
   if (!ds) return refuse('no session');
   if (ds.session.status !== 'active') return refuse('session not active');
-  if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: ds.initConfig?.apiOnly })) return refuse('lark transport disabled');
+  if (!larkToolIdentityEnabled({ chatId: ds.chatId, apiOnly: ds.initConfig?.apiOnly, headless: ds.session.headless })) return refuse('lark tool identity disabled');
   if (!turnId || generation === undefined) return refuse('no live turn');
   if (!workerPid || !workerProcStart || ds.worker?.killed === true) return refuse('worker not live');
   if (attestation?.workerGeneration !== generation) {

@@ -2209,13 +2209,16 @@ export function recordWorkerIdentityDecision(
   ds: DaemonSession,
   worker: ChildProcess,
   workerGeneration: number,
-  report: { model: IdentityStorageModel; sandboxEngaged: boolean; loopbackShared: boolean; cliExecution?: WorkerCliExecution },
+  report: { model: IdentityStorageModel; sandboxEngaged: boolean; loopbackShared: boolean; attestedLoopback?: boolean; cliExecution?: WorkerCliExecution },
 ): { model: IdentityStorageModel; flipped: boolean } {
   let conflict: string | undefined;
   if (report.model !== 'single' && report.model !== 'proven') {
     conflict = `malformed identity model report: ${String(report.model)}`;
   } else if (typeof report.sandboxEngaged !== 'boolean' || typeof report.loopbackShared !== 'boolean') {
     conflict = 'malformed identity decision report: spawn facts are not booleans';
+  } else if (report.attestedLoopback === true && (!ds.initConfig?.bytedcliContainment || !ds.initConfig.protectedHttpEgressPolicy
+    || ds.protectedLoopbackProxyAttestation?.workerGeneration !== workerGeneration)) {
+    conflict = 'worker reported an attested relay without a frozen protected execution contract';
   } else if (report.model === 'proven' && !provenStructurallyPossible(ds)) {
     conflict = 'worker reported the proven identity model for a session that structurally cannot run proven';
   }
@@ -2229,6 +2232,7 @@ export function recordWorkerIdentityDecision(
     model,
     sandboxEngaged: report.sandboxEngaged === true,
     loopbackShared: report.loopbackShared === true,
+    attestedLoopback: report.attestedLoopback === true,
     workerPid: worker.pid ?? -1,
     workerGeneration,
     reportedAt: Date.now(),
@@ -30973,6 +30977,7 @@ function setupWorkerHandlers(
           model: msg.model,
           sandboxEngaged: msg.sandboxEngaged,
           loopbackShared: msg.loopbackShared,
+          attestedLoopback: msg.attestedLoopback,
           cliExecution: msg.cliExecution,
         });
         await cb.onIdentityDecision?.(ds, {

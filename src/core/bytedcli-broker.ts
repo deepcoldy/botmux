@@ -8,7 +8,8 @@ import { join } from 'node:path';
 import { BYTEDCLI_EXEC_LIMITS, BYTEDCLI_EXEC_SCHEMA, BYTEDCLI_EXEC_ERROR_CODES, parseBytedcliExecRequest,
   type BytedcliExecErrorCode, type BytedcliExecResponse, type BytedcliEffectiveIdentity } from '../cli/bytedcli-exec-protocol.js';
 import { parseBytedcliOperation, isBytedcliWriteLike, BytedcliOperationPolicyError } from './bytedcli-operation-policy.js';
-import { resolveLoopbackPeerProcesses } from './current-actor-attestation.js';
+import { resolveProtectedExecutionPeer } from './bytedcli-protected-loopback.js';
+import type { DaemonSession } from './types.js';
 import type { BytedcliAuthorityResult, BytedcliAuthorityRequestContext } from './bytedcli-broker-authority.js';
 import { resolveBytedcliAuthority } from './bytedcli-broker-authority.js';
 import { BytedcliExecutor, type BytedcliExecutionRequest } from './bytedcli-executor.js';
@@ -23,6 +24,7 @@ import { createBytedcliHostOperationPolicyReader, type BytedcliHostOperationPoli
 import { projectBytedcliOperationPolicyStatus } from './bytedcli-operation-policy-config.js';
 import type { TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
 export interface BytedcliBrokerDependencies {
+  readonly findSession?: (id: string) => DaemonSession | undefined;
   readonly operationPolicy?: () => BytedcliHostOperationPolicySnapshot;
   readonly authority: (sessionId:string,peer:ProcessIdentity,operation:BytedcliOperation,context?:BytedcliAuthorityRequestContext) => Promise<BytedcliAuthorityResult>;
   readonly personalLeases?: () => Promise<import('./bytedcli-broker-credentials.js').BytedcliLeaseResolver>;
@@ -111,15 +113,16 @@ export class BytedcliBroker {
     req.once('aborted',abort);res.once('close',responseClosed);
     const timer=setTimeout(()=>{deadline=true;abort();answer(res,408,failed('timeout'));},Math.min(180_000,this.deps.deadlineMs??180_000));
     try {
-      const request=parseBytedcliExecRequest(await readBody(req,controller.signal,Math.min(1000,this.deps.bodyTimeoutMs??1000)));
+      const rawBody=await readBody(req,controller.signal,Math.min(1000,this.deps.bodyTimeoutMs??1000));
+      const request=parseBytedcliExecRequest(rawBody);
       requestId=request.requestId;owner.sessionId=request.sessionId;
       owner.workerGeneration=this.deps.currentWorkerGeneration?.(request.sessionId);
       if(owner.workerGeneration!==undefined&&!this.freezeGeneration(owner,owner.workerGeneration))return answer(res,403,failed('execution_stale'));
       const operation=parseBytedcliOperation(request.argv,request.inputs);operationId=operation.id;write=isBytedcliWriteLike(operation.effect);
       operationEffect=operation.effect;
-      const peer=await resolveLoopbackPeerProcesses({remoteAddress:req.socket.remoteAddress,remotePort:req.socket.remotePort,localPort:req.socket.localPort});
+      const peer=await resolveProtectedExecutionPeer(req,rawBody,request.sessionId,'bytedcli-exec',this.deps.findSession ?? (() => undefined));
       if(controller.signal.aborted)return answer(res,408,failed(deadline?'timeout':'cancelled'));
-      if(!peer.ok)return answer(res,403,failed('execution_unverified'));
+      if(!peer.ok || peer.current?.() === false)return answer(res,403,failed('execution_unverified'));
       // freezeGeneration runs synchronously from host proof, before identity
       // queries, so retirement owns these provider waits as well as execution.
       const result=await this.deps.authority(request.sessionId,peer.peer,operation,{signal:controller.signal,
@@ -205,7 +208,7 @@ export function createProductionBytedcliBroker(host:Omit<import('./bytedcli-brok
     executor=new BytedcliExecutor({privateRoot:layout.privateRoot,trustedCli,leases:{machine:r=>leases.machine(r),actor:r=>leases.actor(r),realm:createBytedcliGdprLeaseResolver(layout.gdprMachineFile)},hostApi: input => input.descriptor.id === 'skill-api.oncall.knowledge.search' ? mcpApi(input) : httpApi(input),audit:new BytedcliBrokerAudit(layout.auditRoot),networkEnv:layout.networkEnv,dbRuntime:layout.dbRuntime});
     if(closed)await executor.close();return executor;
   })();
-  return new BytedcliBroker({operationPolicy,personalLeases:getLeases,currentWorkerGeneration:id=>host.findSession(id)?.workerGeneration,authority:(sessionId,peer,operation,context)=>resolveBytedcliAuthority({...host,operationPolicy,contains:ds=>{
+  return new BytedcliBroker({findSession:host.findSession,operationPolicy,personalLeases:getLeases,currentWorkerGeneration:id=>host.findSession(id)?.workerGeneration,authority:(sessionId,peer,operation,context)=>resolveBytedcliAuthority({...host,operationPolicy,contains:ds=>{
     if(bytecloudBrokerEnabled(host.policy(ds)))markBytedcliStrictSession(ds);
     if(layout.unavailableReason || !layout.runtimeStillCurrent()) return false;
     return bytedcliContainmentAvailable(ds,layout.protectedRoots);

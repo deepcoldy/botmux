@@ -143,6 +143,8 @@ export function usesLarkToolBinding(config: LarkToolBindingFacts & {
 export type IdentityStorageModel = 'single' | 'proven';
 
 export function resolveIdentityStorageModel(input: {
+  /** A live protected relay verifies the original process on each exact route. */
+  attestedLoopback?: boolean;
   platform: NodeJS.Platform;
   binding: boolean;
   /** Whether a local sandbox actually wraps the spawn (worker spawn fact). */
@@ -152,7 +154,7 @@ export function resolveIdentityStorageModel(input: {
   loopbackShared: boolean;
 }): IdentityStorageModel {
   if (input.platform !== 'linux' || !input.binding) return 'single';
-  if (input.sandboxEngaged && !input.loopbackShared) return 'single';
+  if (input.sandboxEngaged && !input.loopbackShared && input.attestedLoopback !== true) return 'single';
   return 'proven';
 }
 

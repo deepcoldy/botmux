@@ -247,8 +247,8 @@ describe.skipIf(!enabled)('protected provider loopback in a real network namespa
     }]);
   });
 
-  it('forwards the isolated lark identity route when Bun owns the network runner and bwrap nests the task PID namespace', async () => {
-    const path = '/api/sessions/session-a/lark-tool-identity';
+  it.each(['lark-tool-identity', 'bytedcli-exec'])('forwards isolated %s on a shared port through the nested task PID namespace', async serviceId => {
+    const path = serviceId === 'bytedcli-exec' ? '/api/bytedcli-exec' : '/api/sessions/session-a/lark-tool-identity';
     const secret = 'cd'.repeat(32);
     const daemonRequests: Array<{
       method?: string;
@@ -265,7 +265,7 @@ describe.skipIf(!enabled)('protected provider loopback in a real network namespa
         const body = Buffer.concat(chunks);
         const attestation = request.headers['x-botmux-loopback-attestation'] as string | undefined;
         const peer = attestation ? verifyProtectedLoopbackProxyAttestation(secret, attestation, {
-          sessionId: 'session-a', serviceId: 'lark-tool-identity', workerGeneration: 7,
+          sessionId: 'session-a', serviceId, workerGeneration: 7,
           turnId: 'turn-fixture', method: 'POST', path,
           headers: {
             'content-type': 'application/json',
@@ -291,7 +291,7 @@ describe.skipIf(!enabled)('protected provider loopback in a real network namespa
     });
     const daemonAddress = daemon.address();
     if (!daemonAddress || typeof daemonAddress === 'string') throw new Error('fixture daemon did not bind TCP');
-    const socketDir = join(root, 'full-chain');
+    const socketDir = join(root, 'full-chain-' + serviceId);
     mkdirSync(socketDir, { mode: 0o700 });
     const { normalizeProtectedHttpEgressPolicy, protectedHttpEgressPolicyDigest } = await import('../dist/core/protected-http-egress.js');
     const { startSessionProtectedHttpEgressHost } = await import('../dist/core/protected-http-egress-host.js');
@@ -309,15 +309,11 @@ describe.skipIf(!enabled)('protected provider loopback in a real network namespa
       policy: fixturePolicy,
       policyDigest: protectedHttpEgressPolicyDigest(fixturePolicy),
       forward: async () => ({ status: 502, headers: {}, body: Buffer.alloc(0) }),
-      loopbackServices: [{
-        id: 'lark-tool-identity',
-        listenPort: daemonAddress.port,
-        upstreamPort: daemonAddress.port,
-        method: 'POST',
-        path,
-        forwardHeaders: ['content-type', 'x-botmux-lark-session'],
-        attestProcessPeer: true,
-      }],
+      loopbackServices: ['lark-tool-identity', 'bytedcli-exec'].map(id => ({
+        id, listenPort: daemonAddress.port, upstreamPort: daemonAddress.port, method: 'POST',
+        path: id === 'bytedcli-exec' ? '/api/bytedcli-exec' : '/api/sessions/session-a/lark-tool-identity',
+        forwardHeaders: ['content-type', 'x-botmux-lark-session'], attestProcessPeer: true,
+      })),
       loopbackProxyAttestation: {
         secret,
         workerGeneration: 7,

@@ -709,6 +709,7 @@ import { resolveUserToken } from '../utils/user-token.js';
 import { currentLarkToolDelegation, getLarkToolDelegation } from './lark-tool-delegation.js';
 import { capabilityOfTool, bytecloudBrokerEnabled } from './identity-policy.js';
 import { BYTEDCLI_EXEC_ROUTE } from '../cli/bytedcli-exec-protocol.js';
+import { resolveProtectedExecutionPeer } from './bytedcli-protected-loopback.js';
 import { createProductionBytedcliBroker, type BytedcliBroker, type BytedcliHostLayout } from './bytedcli-broker.js';
 import { bytedcliSessionWasStrict, markBytedcliStrictSession } from './bytedcli-broker-containment.js';
 import { resolveVerifiedUserIdentityByUnionId } from '../im/lark/identity-cache.js';
@@ -1774,7 +1775,8 @@ function strictBytecloudExportRefused(sessionId: string, appId?: string): boolea
 ipcRoute('POST', CURRENT_EXECUTION_ROUTE, async (req, res) => {
   const blocked = { schema: CURRENT_EXECUTION_SCHEMA, status: 'blocked', error: 'current_execution_unverified' };
   let body: unknown;
-  try { body = await readBoundedJsonBody(req, 1024, 1000); }
+  let rawBody: Buffer;
+  try { const parsed = await readBoundedJsonBodyWithRaw(req, 1024, 1000); body = parsed.body; rawBody = parsed.raw; }
   catch (error) {
     if (error instanceof IpcBodyTooLargeError || error instanceof IpcBodyTimeoutError) {
       closeUntrustedRequestAfterResponse(req, res);
@@ -1787,10 +1789,8 @@ ipcRoute('POST', CURRENT_EXECUTION_ROUTE, async (req, res) => {
   // Opt-in, so a CLI with the original strict key check never sees new keys.
   const fields = (body as Record<string, unknown>).fields;
   const includeOrigin = Array.isArray(fields) && fields.includes(CURRENT_EXECUTION_ORIGIN_FIELD);
-  const peer = await resolveLoopbackPeerProcesses({
-    remoteAddress: req.socket.remoteAddress, remotePort: req.socket.remotePort, localPort: req.socket.localPort,
-  });
-  if (!peer.ok) return jsonRes(res, 403, blocked);
+  const peer = await resolveProtectedExecutionPeer(req, rawBody, sessionId, 'current-execution', findActiveBySessionId);
+  if (!peer.ok || peer.current?.() === false) return jsonRes(res, 403, blocked);
   const document = resolveDaemonCurrentExecution(
     { sessionId, peer: peer.peer, findSession: findActiveBySessionId },
     { includeOrigin, includeCli: Array.isArray(fields) && fields.includes(CURRENT_EXECUTION_CLI_FIELD),
@@ -1871,7 +1871,8 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
   });
   const grantDeadline = Date.now() + GRANT_WAIT_CAP_MS;
   let body: unknown;
-  try { body = await readBoundedJsonBody(req, 1024, 1000); }
+  let rawBody: Buffer;
+  try { const parsed = await readBoundedJsonBodyWithRaw(req, 1024, 1000); body = parsed.body; rawBody = parsed.raw; }
   catch (error) {
     if (error instanceof IpcBodyTooLargeError || error instanceof IpcBodyTimeoutError) {
       closeUntrustedRequestAfterResponse(req, res);
@@ -1896,11 +1897,9 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
   const requestedAs = record?.as as string | undefined;
   const strictExport = () => tool !== 'lark-cli' && strictBytecloudExportRefused(sessionId);
   if (strictExport()) return jsonRes(res, 403, blocked('broker_export_disabled'));
-  const peer = await resolveLoopbackPeerProcesses({
-    remoteAddress: req.socket.remoteAddress, remotePort: req.socket.remotePort, localPort: req.socket.localPort,
-  });
-  if (!peer.ok) {
-    logIdentityRouteRefusal(sessionId, tool, 'peer_unresolved', peer.reason);
+  const peer = await resolveProtectedExecutionPeer(req, rawBody, sessionId, 'current-execution-identity', findActiveBySessionId);
+  if (!peer.ok || peer.current?.() === false) {
+    logIdentityRouteRefusal(sessionId, tool, 'peer_unresolved', peer.ok ? 'relay_stale' : peer.reason);
     return jsonRes(res, 403, blocked('peer_unresolved'));
   }
   let proofRefusal: string | undefined;
@@ -2099,8 +2098,10 @@ for (const route of [BACKGROUND_REGISTRATION_ROUTE, BACKGROUND_REVOKE_ROUTE]) {
 
 ipcRoute('POST', CURRENT_ACTOR_ROUTE, async (req, res) => {
   let body: { sessionId?: unknown; expectedScheduledTurnId?: unknown };
+  let rawBody: Buffer;
   try {
-    body = await readBoundedJsonBody(req, 1_024, 1_000);
+    const parsed = await readBoundedJsonBodyWithRaw<typeof body>(req, 1_024, 1_000);
+    body = parsed.body; rawBody = parsed.raw;
   } catch (err) {
     if (err instanceof IpcBodyTooLargeError || err instanceof IpcBodyTimeoutError) {
       closeUntrustedRequestAfterResponse(req, res);
@@ -2118,12 +2119,8 @@ ipcRoute('POST', CURRENT_ACTOR_ROUTE, async (req, res) => {
     && body.expectedScheduledTurnId.length <= 256
     ? body.expectedScheduledTurnId
     : undefined;
-  const peer = await resolveLoopbackPeerProcesses({
-    remoteAddress: req.socket.remoteAddress,
-    remotePort: req.socket.remotePort,
-    localPort: req.socket.localPort,
-  });
-  if (!sessionId || !peer.ok) {
+  const peer = await resolveProtectedExecutionPeer(req, rawBody, sessionId, 'current-actor', findActiveBySessionId);
+  if (!sessionId || !peer.ok || peer.current?.() === false) {
     return jsonRes(res, 403, {
       schema: 'botmux.current-actor.v2',
       status: 'blocked',

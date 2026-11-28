@@ -70,12 +70,12 @@ export function observeBytedcliLinuxContainment(cliPid: number, contract: Bytedc
 export function assertBytedcliLaunchSupported(input: {
   platform: string; backendType: string; cliId: string; sandbox: string;
   adopt?: boolean; reattach?: boolean; wrapperCli?: string; sharedAuthentication?: boolean;
-  loopbackShared?: boolean; identityModel?: string; hostMcpEntries?: number; rpc?: boolean; externalAppServer?: string; launchMode?: string;
+  loopbackShared?: boolean; attestedLoopback?: boolean; identityModel?: string; hostMcpEntries?: number; rpc?: boolean; externalAppServer?: string; launchMode?: string;
 }): void {
   if (input.platform !== 'linux' || !['pty', 'tmux'].includes(input.backendType)
     || !['claude-code', 'codex'].includes(input.cliId) || input.sandbox !== 'oncall'
     || input.adopt || input.reattach || input.wrapperCli || input.sharedAuthentication || input.rpc || input.externalAppServer || input.launchMode
-    || input.loopbackShared === false || input.identityModel && input.identityModel !== 'proven'
+    || (input.loopbackShared === false && input.attestedLoopback !== true) || input.identityModel && input.identityModel !== 'proven'
     || (input.hostMcpEntries ?? 0) > 0) {
     throw new Error('ByteCloud broker requires a cold Linux PTY/Tmux allowlist launch with private model authentication, proven identity and host loopback; host MCP downstreams are unsupported');
   }

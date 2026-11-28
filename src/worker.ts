@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { bytedcliLoopbackServices } from './core/bytedcli-protected-loopback.js';
 import { assertBytedcliLaunchSupported, createBytedcliContainmentReport } from './core/bytedcli-linux-containment.js';
 import { bytecloudBrokerEnabled } from './core/identity-policy.js';
 import { scrubBytedcliBrokerEnv } from './utils/child-env.js';
@@ -3194,7 +3195,8 @@ async function prepareCliPluginGenerationAndGateway(
         cfg,
         process.env.SESSION_DATA_DIR ?? config.session.dataDir,
         isWorkflowWorker(),
-      ) ? [larkToolLoopbackService(cfg.sessionId, daemonIpcPort)] : [];
+      ) ? [larkToolLoopbackService(cfg.sessionId, daemonIpcPort),
+        ...(cfg.bytedcliContainment ? bytedcliLoopbackServices(daemonIpcPort) : [])] : [];
       sessionProtectedHttpEgressHost = await startSessionProtectedHttpEgressHost({
         sessionId: cfg.sessionId,
         dataDir: config.session.dataDir,
@@ -36104,7 +36106,15 @@ async function spawnCliBody(
   // never derives sandbox/network facts itself.
   const childIdentityBinding = !!process.env.SESSION_DATA_DIR
     && usesLarkToolBinding({ ...cfg, larkToolBinding: true }, process.env.SESSION_DATA_DIR, isWorkflowWorker());
+  const attestedLoopback = !!cfg.bytedcliContainment && !!sessionProtectedHttpEgressHost
+    && cfg.protectedLoopbackProxyAttestation?.workerGeneration === cfg.bytedcliContainment.workerGeneration
+    && childIdentityBinding && boundLark
+    && bytedcliLoopbackServices(parseDaemonIpcPort(process.env.BOTMUX_DAEMON_IPC_PORT) ?? 0).every(expected =>
+      sessionProtectedHttpEgressHost!.loopbackServices.some(service => service.id === expected.id
+        && service.method === expected.method && service.path === expected.path
+        && service.listenPort === expected.listenPort && service.attestProcessPeer === true));
   const childIdentityModel = resolveIdentityStorageModel({
+    attestedLoopback,
     platform: process.platform,
     binding: childIdentityBinding,
     sandboxEngaged: spawnNetworkShape.sandboxEngaged,
@@ -36112,10 +36122,11 @@ async function spawnCliBody(
   });
   if (cfg.bytedcliContainment) assertBytedcliLaunchSupported({ platform: process.platform,
     backendType: effectiveBackendType, cliId: cfg.cliId, sandbox: sandboxMode,
-    identityModel: childIdentityModel, loopbackShared: spawnNetworkShape.loopbackShared });
+    identityModel: childIdentityModel, loopbackShared: spawnNetworkShape.loopbackShared, attestedLoopback });
   if (process.env.SESSION_DATA_DIR) {
     send({
       type: 'session_identity_decision',
+      attestedLoopback,
       sessionId: cfg.sessionId,
       model: childIdentityModel,
       cliExecution: workerCliExecutionReport(cfg, boundLark),
@@ -36134,7 +36145,7 @@ async function spawnCliBody(
     childIdentityModel === 'proven'
       ? { appId: cfg.larkAppId, ipcPort: parseDaemonIpcPort(process.env.BOTMUX_DAEMON_IPC_PORT) }
       : undefined,
-    { canonicalPaths: sandboxRequested, loopbackShared: spawnNetworkShape.loopbackShared });
+    { canonicalPaths: sandboxRequested, loopbackShared: spawnNetworkShape.loopbackShared, attestedLoopback });
   if (boundLark) prepareLarkToolEnv({ env: childEnv, effectivePath: perBotInjectEnv.PATH ?? childEnv.PATH, dataDir: process.env.SESSION_DATA_DIR!,
     sessionId: cfg.sessionId, appId: cfg.larkAppId, brand: cfg.brand, canonicalPaths: sandboxRequested, userNative: larkUserNative(cfg.triggerUserAuth) });
   if (cfg.triggerUserAuth?.enabled && process.env.SESSION_DATA_DIR) {

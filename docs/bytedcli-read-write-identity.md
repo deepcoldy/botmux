@@ -93,9 +93,9 @@ Bot 使用同一种版本化对象，例如：
 
 ## 支持条件
 
-当前只支持 Linux、本地受管 PTY/Tmux、proven 执行身份、真实 allowlist 文件隔离和独立 PID namespace、宿主 loopback，以及新的冷启动进程。模型认证支持 Claude Code 的实际私有凭据副本，或 Codex isolated auth / isolated instance。
+当前只支持 Linux、本地受管 PTY/Tmux、proven 执行身份、真实 allowlist 文件隔离和独立 PID namespace、宿主 loopback 或受管且验签的精确 loopback 代理，以及新的冷启动进程。模型认证支持 Claude Code 的实际私有凭据副本，或 Codex isolated auth / isolated instance。
 
-混合模式保留插件 Skill，但不注入或启动宿主 MCP 下游；这些下游的私有配置仍保持隔离。依赖宿主 MCP 的功能在此模式下不可用，可使用已登记的受管 `bytedcli skill-api` 命令。Codex 必须在 Dashboard → 权限与安全 → Codex 登录凭证中选择「本 bot 独立登录态」，并在该 Bot 的 CODEX_HOME 中准备认证；已有独立认证文件可继续使用，不复制全局登录态。若独立 Codex config.toml 还配置了宿主 MCP，将对应 `mcp_servers.<name>.enabled` 设为 `false`。remote、macOS、scratch/single、adopt/warm attach、wrapperCli、shell 启动、host Codex RPC / external app server、Seed/Relay/Pi 等其他模型组合会拒绝；界面显示“已启用策略”并不证明会话通过隔离检查。
+混合模式与插件的 protected HTTP egress 可同时使用：沙箱继续隔离宿主网络，ByteCloud、当前执行与 Git 身份查询仅经精确接口代理；daemon 验证当前 worker/回合签名后仍核验原始进程谱系，不导出 ByteCloud 凭据。混合模式保留插件 Skill，但不注入或启动宿主 MCP 下游；这些下游的私有配置仍保持隔离。依赖宿主 MCP 的功能在此模式下不可用，可使用已登记的受管 `bytedcli skill-api` 命令。Codex 必须在 Dashboard → 权限与安全 → Codex 登录凭证中选择「本 bot 独立登录态」，并在该 Bot 的 CODEX_HOME 中准备认证；已有独立认证文件可继续使用，不复制全局登录态。若独立 Codex config.toml 还配置了宿主 MCP，将对应 `mcp_servers.<name>.enabled` 设为 `false`。remote、macOS、scratch/single、adopt/warm attach、wrapperCli、shell 启动、host Codex RPC / external app server、Seed/Relay/Pi 等其他模型组合会拒绝；界面显示“已启用策略”并不证明会话通过隔离检查。
 
 宿主 bytedcli 和 Botmux 安装树在严格会话内只读，全部 SDK profiles、个人凭据、epoch 与 broker/audit 根不可读写。不能在运行该宿主的安装树里原地开发；其他项目使用独立项目授权。凭据根本身是 leaf symlink 的组合不支持。缺失受保护文件的父目录使用冷启动时的私有目录视图，之后新增的宿主兄弟文件要等新一代才能看到。
 

@@ -1,3 +1,12 @@
+import { loopbackFetchImpl } from '../src/core/loopback-fetch.js';
+import { startSessionProtectedHttpEgressHost } from '../src/core/protected-http-egress-host.js';
+import { startProtectedLocalServiceLoopbackBridge } from '../src/core/protected-http-egress-loopback.js';
+import { normalizeProtectedHttpEgressPolicy, protectedHttpEgressPolicyDigest } from '../src/core/protected-http-egress.js';
+import { bytedcliLoopbackServices } from '../src/core/bytedcli-protected-loopback.js';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createProtectedLoopbackProxyAttestation, PROTECTED_LOOPBACK_ATTESTATION_HEADER } from '../src/core/protected-loopback-attestation.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { startIpcServer, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import { BytedcliBroker } from '../src/core/bytedcli-broker.js';
@@ -8,8 +17,8 @@ let ipc: IpcServerHandle | undefined;
 import {readProcessStartIdentity} from '../src/utils/process-identity.js';
 afterEach(async () => { await ipc?.close(); ipc = undefined;vi.restoreAllMocks(); });
 const body = { schema: BYTEDCLI_EXEC_SCHEMA, sessionId: 's-broker', requestId: 'r-1', argv: ['codebase','repo','list','--json'] };
-async function post(value: unknown) {
-  return fetch(`http://127.0.0.1:${ipc!.port}/api/bytedcli-exec`, { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(value) });
+async function post(value: unknown, extraHeaders: Record<string,string> = {}) {
+  return fetch(`http://127.0.0.1:${ipc!.port}/api/bytedcli-exec`, { method:'POST', headers:{'content-type':'application/json', ...extraHeaders}, body:JSON.stringify(value) });
 }
 describe('credential-free broker HTTP boundary', () => {
   it('gives a safe broker refusal through the narrow outer-auth aperture', async () => {
@@ -26,11 +35,12 @@ describe('credential-free broker HTTP boundary', () => {
   });
 });
 
-function fixture(options:{blocked?:boolean;wait?:boolean;maxPreauth?:number;machine?:boolean}={}) {
+function fixture(options:{blocked?:boolean;wait?:boolean;maxPreauth?:number;machine?:boolean; relay?:boolean; deadlineMs?:number}={}) {
   let calls=0,aborted=false;let started!:()=>void;const entered=new Promise<void>(r=>started=r);
   const authority:any={daemonBootId:'boot',botAppId:'cli_broker',sessionId:'s-broker',turnId:'turn-A',identityTurnId:'A',workerGeneration:1,dispatchAttempt:0,policyFingerprint:'frozen',
     executionIdentity:options.machine?'machine':'actor',actor:{verifiedEmail:'a@example.com',credentialOpenId:'ou_A',source:'local'},recheck:async()=>options.blocked?'policy_changed':undefined};
-  const broker=new BytedcliBroker({deadlineMs:1000,maxPreauth:options.maxPreauth,authority:async(sid,peer)=>sid==='s-broker'&&peer.pid===process.pid?{ok:true,authority}:{ok:false,errorCode:'execution_unverified'},
+  const relaySession:any={workerGeneration:1,worker:{pid:123,killed:false},protectedLoopbackProxyAttestation:{secret:'ab'.repeat(32),workerGeneration:1},managedTurnOrigin:{turnId:'turn-A'}};
+  const broker=new BytedcliBroker({findSession:id=>options.relay&&id==='s-broker'?relaySession:undefined,deadlineMs:options.deadlineMs??1000,maxPreauth:options.maxPreauth,authority:async(sid,peer)=>sid==='s-broker'&&peer.pid===(options.relay?321:process.pid)?{ok:true,authority}:{ok:false,errorCode:'execution_unverified'},
     executor:{execute:async request=>{
       calls++;started();if(options.wait)await new Promise<void>(resolve=>{request.signal!.addEventListener('abort',()=>{aborted=true;resolve();},{once:true});});
       return {schema:BYTEDCLI_EXEC_SCHEMA,requestId:request.requestId,operationId:request.operation.id,effectiveIdentity:{kind:options.machine?'machine':'actor',accountFingerprint:'sha256:broker-account'},outcome:'completed',stdoutBase64:'b2sK',stderrBase64:'',exitCode:0};
@@ -160,4 +170,33 @@ it('broker post-result revocation preserves machine write identity and account f
  const broker=new BytedcliBroker({authority:async()=>({ok:true,authority}),executor:{execute:async r=>{finished=true;return {schema:BYTEDCLI_EXEC_SCHEMA,requestId:r.requestId,operationId:r.operation.id,effectiveIdentity:{kind:'machine',accountFingerprint:'sha256:actual-machine'},outcome:'completed',stdoutBase64:'cHJpdmF0ZQ==',stderrBase64:'',exitCode:0};},retireSession:async()=>{},close:async()=>{}}});
  ipc=await startIpcServer({port:0,host:'127.0.0.1',authRequired:true,bytedcliBroker:broker});
  expect(await (await post({...body,argv:['codebase','mr','close','1','--repo','ns/repo']})).json()).toMatchObject({outcome:'write_outcome_unknown',effectiveIdentity:{kind:'machine',accountFingerprint:'sha256:actual-machine'},stdoutBase64:''});
+});
+
+it('serves the broker through an exact signed relay peer and refuses changed request bytes', async () => {
+ const f=fixture({relay:true,machine:true});
+ ipc=await startIpcServer({port:0,host:'127.0.0.1',authRequired:true,bytedcliBroker:f.broker});
+ const token=createProtectedLoopbackProxyAttestation('ab'.repeat(32),{sessionId:'s-broker',serviceId:'bytedcli-exec',workerGeneration:1,turnId:'turn-A',peer:{pid:321,procStart:'123456'},method:'POST',path:'/api/bytedcli-exec',headers:{'content-type':'application/json'},body:Buffer.from(JSON.stringify(body))});
+ const headers={[PROTECTED_LOOPBACK_ATTESTATION_HEADER]:token};
+ expect(await (await post(body,headers)).json()).toMatchObject({outcome:'completed',effectiveIdentity:{kind:'machine'}});
+ expect(await (await post({...body,requestId:'changed'},headers)).json()).toMatchObject({errorCode:'execution_unverified'});
+ expect(f.calls()).toBe(1);
+});
+
+it.each(['client','host'])('propagates %s closure through the protected relay to an in-flight broker write',async closeKind=>{
+ const f=fixture({wait:true,relay:true,deadlineMs:5000});
+ ipc=await startIpcServer({port:0,host:'127.0.0.1',authRequired:true,bytedcliBroker:f.broker});
+ const root=mkdtempSync(join(tmpdir(),'broker-relay-cancel-'));
+ const policy=normalizeProtectedHttpEgressPolicy({id:'fixture.cancel.v1',targets:[{scheme:'https',host:'fixture.example',port:443,denyRoutes:[{methods:['POST'],path:'/write'}]}]})!;
+ const host=await startSessionProtectedHttpEgressHost({sessionId:'s-broker',dataDir:root,policy,policyDigest:protectedHttpEgressPolicyDigest(policy),frozenAddresses:[['192.0.2.10']],loopbackServices:bytedcliLoopbackServices(ipc.port).filter(service=>service.id==='bytedcli-exec'),loopbackProxyAttestation:{secret:'ab'.repeat(32),workerGeneration:1,sessionId:'s-broker',currentTurn:()=>({turnId:'turn-A'})}});
+ const bridge=await startProtectedLocalServiceLoopbackBridge({socketPath:host.socketPath,serviceId:'bytedcli-exec',listenPort:0,method:'POST',path:'/api/bytedcli-exec',forwardHeaders:['content-type'],attestProcessPeer:true},async()=>({pid:321,procStart:'123456'}));
+ try{
+  const controller=new AbortController();
+  const pending=loopbackFetchImpl(bridge.origin+'/api/bytedcli-exec',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({...body,argv:['codebase','mr','create','--repo','ns/repo','--head','x','--base','master','--title','fixture']}),signal:controller.signal}).then(()=>true,()=>false);
+  await f.entered;
+  if(closeKind==='client')controller.abort();else await host.close();
+  await pending;
+  const until=Date.now()+500;
+  while(!f.aborted()&&Date.now()<until)await new Promise(resolve=>setTimeout(resolve,5));
+  expect(f.aborted()).toBe(true);
+ }finally{await bridge.close();await host.close();rmSync(root,{recursive:true,force:true});}
 });

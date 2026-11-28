@@ -426,6 +426,7 @@ describe('session protected HTTP egress host', () => {
         attestProcessPeer: true,
       },
       incoming: {
+        signal: expect.any(AbortSignal),
         method: 'POST',
         path: '/api/sessions/session-a/lark-tool-identity',
         headers: {
