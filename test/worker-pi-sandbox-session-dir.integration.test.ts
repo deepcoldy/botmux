@@ -23,6 +23,7 @@ import { spawnNodeTsScript, spawnSyncTsEvalWithRepoImports } from './helpers/ts-
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 import { scratchMountRuntimeAvailable } from './helpers/scratch-mount-probe.js';
 import { waitForWorkerMessage } from './helpers/worker-ipc-waiter.js';
+import { killProcessTree } from './helpers/process-tree.js';
 import { probeHostCredentialIsolationMechanism } from '../src/adapters/backend/sandbox.js';
 import { teardownScratchSession } from '../src/adapters/backend/scratch-sandbox.js';
 import { piPersistentTranscriptDir, piPreviousTranscriptDir, piSessionDirName } from '../src/services/pi-transcript.js';
@@ -43,11 +44,7 @@ let root: string | undefined;
 let scratchUsed = false;
 let stopTmux: (() => void) | undefined;
 afterEach(async () => {
-  if (child && child.exitCode === null && child.signalCode === null) {
-    const stopped = new Promise<void>(done => child!.once('exit', () => done()));
-    child.kill('SIGKILL');
-    await Promise.race([stopped, new Promise<void>(done => setTimeout(done, 5_000))]);
-  }
+  if (child) await killProcessTree(child);
   child = undefined;
   stopTmux?.();
   stopTmux = undefined;
