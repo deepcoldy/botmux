@@ -424,6 +424,7 @@ botmux 用 app-server 协议运行 Codex 时，拿不到 Codex App 内置的 Chr
 |------|------|
 | `allowedUsers` | 管理员名单，能执行管理命令、点卡片按钮。推荐写完整邮箱、手机号或 `on_xxx`；`ou_xxx` 只对签发它的那个应用有效，不能从别的 bot 复制过来。配了 `allowedChatGroups` 时至少要有一个管理员 |
 | `ownerOpenId` | 显式指定主管理员 `ou_xxx`。只有它仍在 `allowedUsers` 里时才算数；不填时取 `allowedUsers` 里第一个人 |
+| `ownerUnionId` | 用 `on_xxx` 显式指定主管理员，可在同一人的多个 bot 间复制。这个 `on_xxx` 必须同时写在 `allowedUsers` 里并解析成功才算数；与 `ownerOpenId` 同时填写时两者必须是同一个人，否则视为未指定主管理员 |
 | `allowedChatGroups` | 可对话的群（`oc_xxx`）。群里任何人都能和 bot 对话，管理操作仍只认 `allowedUsers` |
 | `p2pOpen` | `true` 时飞书应用可用范围内的任何人都能私聊 bot（只能对话）。群聊不受影响 |
 | `oncallChats` | oncall 绑定：`[{ "chatId": "oc_xxx", "workingDir": "~/projects/foo" }]`。见 [oncall](/oncall) |

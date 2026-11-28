@@ -49,6 +49,23 @@ import { userSystemdBusEnv } from '../src/core/session-scope.js';
 
 type ShellKindUnderTest = 'bash' | 'zsh' | 'sh' | 'fish';
 
+describe('TraeX runtime and helper environment', () => {
+  it('forwards the current helper, snapshot root and ownership identity to the pane', () => {
+    const out = buildBotmuxEnvAssignments({
+      TRAEX_CODE_MODE_HOST_PATH: '/snapshots/combo-a/traex-code-mode-host',
+      BOTMUX_TRAEX_SNAPSHOT_DIR: '/snapshots',
+      BOTMUX_TRAEX_OCCUPANT_ID: 'occupant-a',
+      BOTMUX_TRAEX_DOMAIN_KEY: 'domain-a',
+    });
+    expect(out).toEqual(expect.arrayContaining([
+      'TRAEX_CODE_MODE_HOST_PATH=/snapshots/combo-a/traex-code-mode-host',
+      'BOTMUX_TRAEX_SNAPSHOT_DIR=/snapshots',
+      'BOTMUX_TRAEX_OCCUPANT_ID=occupant-a',
+      'BOTMUX_TRAEX_DOMAIN_KEY=domain-a',
+    ]));
+  });
+});
+
 describe('host session scope reaches the pane', () => {
   it.each(['thread', 'chat', undefined])('passes host scope %s and rejects inherited or configured replacements', (scope) => {
     const dir = mkdtempSync(join(tmpdir(), 'session-scope-pane-'));

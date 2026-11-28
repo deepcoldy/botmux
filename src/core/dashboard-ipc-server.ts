@@ -9423,7 +9423,7 @@ export interface ScheduleRow {
   createdAt: string;
   lastRunAt?: string;
   nextRunAt?: string;
-  lastStatus?: 'running' | 'ok' | 'error' | 'skipped';
+  lastStatus?: 'running' | 'ok' | 'error' | 'skipped' | 'deferred';
   lastError?: string;
   repeat?: { times: number | null; completed: number };
   /** until-done state, run ledger and owner notification settings. They feed
@@ -10382,9 +10382,11 @@ ipcRoute('DELETE', '/api/schedules/:id', requireBoundBot((_req, res, p) => {
   }
 }, NOT_BOUND_BODY.okFalse));
 
-async function handleTriggerIpc(req: IncomingMessage, res: ServerResponse, endpoint: 'ordinary' | 'owner' | 'host'): Promise<void> {
+async function handleTriggerIpc(req: IncomingMessage, res: ServerResponse, endpoint: 'ordinary' | 'owner' | 'host' | 'owner-union'): Promise<void> {
   const ownerActorEndpoint = endpoint === 'owner';
-  const hostFieldsEndpoint = endpoint === 'host';
+  // owner-union carries `actorUnionId`, plus any host field the request also needs.
+  const ownerUnionEndpoint = endpoint === 'owner-union';
+  const hostFieldsEndpoint = endpoint === 'host' || ownerUnionEndpoint;
   if ((ownerActorEndpoint || hostFieldsEndpoint) && !isTrustedHostIpcRequest(req)) {
     return jsonRes(res, 403, { ok: false, errorCode: 'actor_not_allowed' });
   }
@@ -10399,6 +10401,11 @@ async function handleTriggerIpc(req: IncomingMessage, res: ServerResponse, endpo
   const valid = validateTriggerRequest(body);
   if (!valid.ok) return jsonRes(res, valid.status, valid.body);
   if (!hostFieldsEndpoint && ownerActorEndpoint !== (valid.request.actor === 'owner')) {
+    return jsonRes(res, 403, { ok: false, errorCode: 'actor_not_allowed' });
+  }
+  // The Dashboard sends `actorUnionId` here so an older daemon, which would
+  // ignore the field and act as the owner anyway, answers 404 instead.
+  if (ownerUnionEndpoint && valid.request.actorUnionId === undefined) {
     return jsonRes(res, 403, { ok: false, errorCode: 'actor_not_allowed' });
   }
   // Host-only fields live on a distinct route so mixed-version fleets fail
@@ -10453,7 +10460,7 @@ async function handleTriggerIpc(req: IncomingMessage, res: ServerResponse, endpo
         ? 409
       : (ownerActorEndpoint || (hostFieldsEndpoint && valid.request.actor === 'owner')) && result.errorCode === 'session_not_runnable'
         ? 409
-      : result.errorCode === 'bot_not_in_chat' || result.errorCode === 'owner_unresolved'
+      : result.errorCode === 'bot_not_in_chat' || result.errorCode === 'owner_unresolved' || result.errorCode === 'owner_mismatch'
         || result.errorCode === 'run_as_not_allowed' || result.errorCode === 'run_as_unresolved'
         ? 403
         : result.errorCode === 'session_not_found'
@@ -10473,6 +10480,7 @@ const unboundTriggerResponse = { ok: false, errorCode: 'bot_not_found', error: '
 ipcRoute('POST', '/api/trigger', requireBoundBot((req, res) => handleTriggerIpc(req, res, 'ordinary'), unboundTriggerResponse));
 ipcRoute('POST', '/api/trigger/owner', requireBoundBot((req, res) => handleTriggerIpc(req, res, 'owner'), unboundTriggerResponse));
 ipcRoute('POST', '/api/trigger/host', requireBoundBot((req, res) => handleTriggerIpc(req, res, 'host'), unboundTriggerResponse));
+ipcRoute('POST', '/api/trigger/owner-union', requireBoundBot((req, res) => handleTriggerIpc(req, res, 'owner-union'), unboundTriggerResponse));
 
 // ─── Exact chat grants (talk-only) ─────────────────────────────────────────
 

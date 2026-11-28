@@ -18,7 +18,9 @@ import { cotMessageFinishStatus } from '../../src/im/lark/cot-message.js';
 import { resetStartingCardHealth } from '../../src/core/starting-card-health.js';
 import { isStructuredNoticeProtocolMessage } from '../../src/services/structured-notice-protocol.js';
 import { ProtectedResultStore } from '../../src/services/protected-result-store.js';
-import { scheduledSessionRunWithEvidence, settleScheduledSessionRun } from '../../src/core/scheduled-send.js';
+import { hasProtectedSessionMutationOwnership, protectedSessionMutationReasons } from '../../src/core/session-mutation-guard.js';
+import { parseScheduledTurnId } from '../../src/core/scheduled-turn-provenance.js';
+import { scheduledSessionRun, scheduledSessionRunWithEvidence, settleScheduledSessionRun } from '../../src/core/scheduled-send.js';
 import { findScheduleRunTrigger } from '../../src/services/schedule-run-log-store.js';
 
 /** deliverFinalOutput's protected final gate reads `config.session.dataDir` and
@@ -69,13 +71,18 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
     return scope[key] ??= WORKER_POOL_WEAK_CONTAINERS[key]();
   }
   if (key === 'randomUUID') return randomUUID;
+  if (key === 'traexRuntimeDeferredNotice') return scope[key] ??= new Map();
   if (key === 'getDaemonBootId') return scope[key] ??= () => 'worker-pool-test-boot';
   if (key === 'controllerForSession') return controllerForSession;
   if (key === 'activeSessionKey') return activeSessionKey;
+  if (key === 'parseScheduledTurnId') return parseScheduledTurnId;
+  if (key === 'scheduledSessionRun') return scheduledSessionRun;
   if (key === 'runtimeStartRefusal') return runtimeStartRefusal;
   if (key === 'cotMessageFinishStatus') return cotMessageFinishStatus;
   if (key === 'hasCotMessageForTurn') return () => false;
   if (key === 'resetStartingCardHealth') return resetStartingCardHealth;
+  if (key === 'hasProtectedSessionMutationOwnership') return hasProtectedSessionMutationOwnership;
+  if (key === 'protectedSessionMutationReasons') return protectedSessionMutationReasons;
   if (key === 'isStructuredNoticeProtocolMessage') return isStructuredNoticeProtocolMessage;
   if (key === 'cancelAntigravityRotationReplay') return cancelAntigravityRotationReplay;
   if (key === 'clearInFlightAntigravityRotation') return clearInFlightAntigravityRotation;
@@ -114,6 +121,7 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
     'releaseHeldCotMessage', 'isReplayOfHeldCotTerminal', 'isSynthesizedBackgroundTurnId', 'finalizeOrHoldCotMessage',
     'requiredReplyCotHoldKey', 'settleRequiredReplyBackground', 'settleRequiredReplyCotMessage',
     'failRequiredReplyCotHolds', 'clearWorkerRuntimeProvenance', 'clearDedupReconcileRetryTimer',
+    'hasInstallChangeMutationOwnership', 'hasInstallChangeSuspendGuard',
     'scheduledRunForWorker', 'scheduledRunsForWorker', 'scheduledRunTriggerForWorker', 'settleScheduledRunBinding'].includes(key)) {
     return scope[key] ??= loadWorkerPoolFunction(key, scope);
   }

@@ -3,6 +3,8 @@ import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 import { traexRestoredComposerReady } from '../src/adapters/cli/traex-footer.js';
 import { shouldFenceTraexStartupInput } from '../src/core/traex-startup-input.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 function launchMode(options: {
   requestedResume?: boolean;
@@ -72,5 +74,18 @@ describe('resolved TraeX startup launch mode', () => {
     const { scope } = launchMode({ actualResume: false, ...extra });
     expect(scope.traexNativeStartupInputPending).toBe(false);
     expect(scope.traexFirstInputAdmissionPending).toBe(false);
+  });
+
+  // 源码结构护栏(K3)：合并曾删掉 spawn 前的首轮输入闸初始化，导致 TRAE 首条输入可能丢失；此处只守初始化顺序，不断言实现文本块全文。
+  it('keeps the early startup input fence initialized before backend launch setup', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const spawn = source.indexOf('async function spawnCliBody');
+    const capability = source.indexOf('cliAdapter.supportsProgramStatus', spawn);
+    const initialization = source.indexOf('traexNativeStartupInputPending = shouldFenceTraexStartupInput({', capability);
+    const launchSetup = source.indexOf('const cardActionCapabilities', capability);
+    expect(spawn).toBeGreaterThanOrEqual(0);
+    expect(capability).toBeGreaterThan(spawn);
+    expect(initialization).toBeGreaterThan(capability);
+    expect(launchSetup).toBeGreaterThan(initialization);
   });
 });

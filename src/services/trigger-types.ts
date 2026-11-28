@@ -22,8 +22,15 @@ export type LegacyWorkflowRetirementReason =
  *  for the trigger API and `botmux schedule add --run-as`. */
 export const RUN_AS_PATTERN = /^(ou_[A-Za-z0-9_-]{1,160}|[^\s@]{1,128}@[^\s@]{1,128})$/;
 
+/** A tenant-stable Lark `union_id`: `actorUnionId` and the bot's `ownerUnionId`. */
+export const LARK_UNION_ID_PATTERN = /^on_[A-Za-z0-9_-]{1,128}$/;
+
 export interface TriggerRequest {
   actor?: 'owner';
+  /** With `actor: "owner"` only: the caller's tenant-stable `union_id`. The
+   *  turn is accepted only when it names this bot's owner, so a client acting
+   *  for one person cannot post as the owner of a bot that belongs to another. */
+  actorUnionId?: string;
   /** Run this one turn under a named person (open_id or email): the bot's tools
    *  (bytedcli / lark-cli / Meego / Bits) act as that person. Same trust
    *  boundary as `botmux schedule add --run-as`: only the local Dashboard
@@ -165,6 +172,7 @@ export type TriggerErrorCode =
   | 'run_as_not_allowed'
   | 'run_as_unresolved'
   | 'owner_unresolved'
+  | 'owner_mismatch'
   | 'bot_not_found'
   | 'bot_not_in_chat'
   | 'daemon_offline'
@@ -287,10 +295,11 @@ export function hasTriggerActor(raw: unknown): boolean {
   return isRecord(raw) && Object.hasOwn(raw, 'actor');
 }
 
-/** A request that claims a caller identity (`actor` or `runAs`); only the local
- *  Dashboard administrator token may send one. */
+/** A request that claims a caller identity (`actor`, `actorUnionId` or
+ *  `runAs`); only the local Dashboard administrator token may send one. */
 export function hasTriggerIdentityClaim(raw: unknown): boolean {
-  return hasTriggerActor(raw) || (isRecord(raw) && Object.hasOwn(raw, 'runAs'));
+  return hasTriggerActor(raw)
+    || (isRecord(raw) && (Object.hasOwn(raw, 'actorUnionId') || Object.hasOwn(raw, 'runAs')));
 }
 
 export function validateTriggerRequest(raw: unknown): { ok: true; request: TriggerRequest } | { ok: false; status: number; body: TriggerResponse } {
@@ -312,6 +321,10 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
       || typeof raw.instruction !== 'string' || !raw.instruction.trim()) {
       return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'owner actor requires a turn target with botId, sessionId, and a non-empty instruction' } };
     }
+  }
+  if (Object.hasOwn(raw, 'actorUnionId')
+    && (raw.actor !== 'owner' || typeof raw.actorUnionId !== 'string' || !LARK_UNION_ID_PATTERN.test(raw.actorUnionId))) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'actorUnionId requires actor owner and must be a union_id (on_…)' } };
   }
   if (Object.hasOwn(raw, 'runAs')) {
     if (typeof raw.runAs !== 'string' || !RUN_AS_PATTERN.test(raw.runAs)) {

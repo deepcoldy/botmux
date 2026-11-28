@@ -165,3 +165,37 @@ export async function withExclusiveFileLock<T>(
     ? { acquired: false, reason: 'error', detail: lastError }
     : { acquired: false, reason: 'unavailable' };
 }
+
+/**
+ * Async critical section: unlike `withExclusiveFileLock`, `fn` may await. The
+ * helper keeps stdin open (and therefore the flock) until `fn` settles, so an
+ * async copy/write inside the section is genuinely protected. Never wrap a
+ * promise in the synchronous variant and assume the lock still applies — that
+ * was a real review finding.
+ */
+export async function withExclusiveFileLockAsync<T>(
+  lockPath: string,
+  timeoutMs: number,
+  fn: () => Promise<T>,
+): Promise<FileLockResult<T>> {
+  const timeoutSec = (Math.max(0, timeoutMs) / 1000).toFixed(3);
+  let lastError: string | undefined;
+  for (const candidate of lockHelperCandidates(lockPath, timeoutSec)) {
+    const outcome = await acquireWith(candidate.cmd, candidate.args, timeoutMs);
+    if (outcome.kind === 'missing') continue;
+    if (outcome.kind === 'timeout') return { acquired: false, reason: 'timeout' };
+    if (outcome.kind === 'unresponsive') return { acquired: false, reason: 'error', detail: `lock helper ${candidate.cmd} did not respond` };
+    if (outcome.kind === 'error') {
+      lastError = outcome.detail;
+      continue;
+    }
+    try {
+      return { acquired: true, value: await fn() };
+    } finally {
+      await release(outcome.child);
+    }
+  }
+  return lastError
+    ? { acquired: false, reason: 'error', detail: lastError }
+    : { acquired: false, reason: 'unavailable' };
+}

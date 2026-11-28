@@ -298,6 +298,14 @@ export function settleUntilDoneSkip(task: ScheduledTask, runId: string | undefin
   };
 }
 
+/** Release only the closing-run claim owned by an operator-cancelled run.
+ * Manual pause must keep the task open and resumable, unlike a calendar skip. */
+export function releaseUntilDoneFinalRun(task: ScheduledTask, runId: string | undefined): ScheduledTask {
+  if (!isUntilDoneFinalRun(task, runId)) return task;
+  const { finalRunId: _final, finalRetryAt: _retry, ...rest } = task.untilDone!;
+  return { ...task, untilDone: rest };
+}
+
 /** Claim-time marker for the deadline closing run. */
 export function markUntilDoneFinalRun(task: ScheduledTask, runId: string): ScheduledTask {
   if (task.untilDone?.status !== 'open') return task;

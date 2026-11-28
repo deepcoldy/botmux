@@ -121,6 +121,12 @@ export async function fixture(enabled: boolean, loadData: false | 'busy' | 'orde
   const fake = join(root, 'fake-traex');
   writeFileSync(fake, `#!${nodeTsRunnerPrefix().command}
 const fs = require('node:fs');
+// The managed TRAE handoff materialises a snapshot copy of this launcher and
+// probes its hook-trust support with \`--version\` before the real spawn. Answer
+// that probe like a CLI so it is never recorded as a model launch.
+if (process.argv.includes('--version') || process.argv.includes('-V')) {
+  process.stdout.write('traex 0.212.1\\n'); process.exit(0);
+}
 if (process.argv[2] === 'debug') {
   fs.appendFileSync(${JSON.stringify(rpcRequests)}, JSON.stringify({ method: 'debug/models' }) + '\\n');
   process.stdout.write(JSON.stringify({ models: [] })); process.exit(0);
@@ -139,11 +145,14 @@ if (process.argv[2] === 'app-server') {
       if (request.method === 'model/list' && ${JSON.stringify(preflight?.probe)} === 'failure') process.exit(1);
       if (request.method === 'model/list') {
         // This helper is already running and can still return a valid catalog.
-        // Remove only the future launch target BEFORE writing the response:
-        // the reader may terminate its helper as soon as that response arrives.
+        // Remove every future launch target BEFORE writing the response. The
+        // helper itself may be a snapshot copy, so deleting only __filename
+        // leaves both the source launcher and the TUI snapshot available and
+        // no longer exercises the failed-respawn path.
         if (fs.existsSync(${JSON.stringify(removeCliAfterCatalog)})) {
           fs.unlinkSync(${JSON.stringify(removeCliAfterCatalog)});
-          fs.unlinkSync(__filename);
+          fs.rmSync(${JSON.stringify(fake)}, { force: true });
+          fs.rmSync(${JSON.stringify(join(root, '.botmux', 'traex-snapshots'))}, { recursive: true, force: true });
         }
         process.stdout.write(JSON.stringify({ id: request.id, result: {
         data: fs.existsSync(${JSON.stringify(launches)}) && ${JSON.stringify(preflight?.catalogAfterStart)} !== undefined

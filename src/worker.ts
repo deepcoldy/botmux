@@ -535,8 +535,19 @@ import {
 } from './services/cli-install-identity.js';
 import { captureTraexPromptCheckpoint, inspectTraexFailedPrompt, withTraexFailedPrompt, type TraexPromptCheckpoint } from './services/traex-prompt-checkpoint.js';
 import { purgeTraexToolImages, resolveTraexImagePurgeTarget, TRAEX_TOOL_IMAGE_UPLOAD_ERROR_CODE } from './services/traex-tool-image-recovery.js';
-import { traeSessionsRoot } from './services/traex-paths.js';
-import { pinWorkerTraeHome } from './services/traex-paths.js';
+import { pinWorkerTraeHome, resolveTraexChildHome, traeSessionsRoot } from './services/traex-paths.js';
+import {
+  acquireTraexRuntimeLease,
+  acquireTraexRuntimePeerLease,
+  acquireTraexRuntimeOccupancy,
+  applyTraexRuntimeOwnershipEnv,
+  captureTraexRunningContentIdentity,
+  daemonBirthIdentity,
+  traexLaunchUsesSharedRuntimeGate,
+  type TraexRuntimeBlocker,
+  type TraexRuntimeLease,
+} from './services/traex-runtime-gate.js';
+import { releaseDirForExecutable } from './services/traex-runtime-snapshot.js';
 import { drainTraexRollout, traexResumeTargetLeftInDefaultHome, resolveTraexResumeSessionId, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, traexSessionIdFromRolloutPath, traexProcessFileSource, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
 import { bridgeCodexUserInput, postCodexAsk } from './services/codex-user-input.js';
 import { TraexQuestionBridge } from './core/traex-question-bridge.js';
@@ -645,7 +656,7 @@ import {
   clamp,
   resolveRenderDimensions,
 } from './utils/render-dimensions.js';
-import { bridgeSpecFor, createCliAdapterSync, locateOnPath, resolveCommandReal, resolveEffectiveCliId } from './adapters/cli/registry.js';
+import { bridgeSpecFor, createCliAdapterSync, locateOnPath, resolveCommandEntry, resolveCommandReal, resolveEffectiveCliId } from './adapters/cli/registry.js';
 import { parsePiInstallUpdatedNotice, readPiInstallVersion } from './adapters/cli/pi.js';
 import { cursorStopLeftParkedFollowUp } from './adapters/cli/cursor.js';
 import { cliAdapterBindsOwnershipPid } from './adapters/cli/ownership-pid.js';
@@ -1359,12 +1370,90 @@ function notifyRpcTeardownBeforeActivation(
   });
 }
 
-function stopCodexRpcEngine(): void {
+let traexRpcLeaseContext: TraexSpawnLeaseContext | undefined;
+let pendingRpcEngagement: {
+  engine?: CodexRpcEngine;
+  lease?: TraexSpawnLeaseContext;
+  cancelled: boolean;
+} | undefined;
+function settleTraexRpcLease(context = traexRpcLeaseContext): Promise<void> {
+  if (!context) return Promise.resolve();
+  return settleTraexSpawnLease(context).then(() => {
+    if (traexRpcLeaseContext === context) traexRpcLeaseContext = undefined;
+  }).catch(err => {
+    log(`[traex-runtime] RPC lease settlement failed: ${err instanceof Error ? err.message : String(err)}`);
+  });
+}
+
+async function settleTraexLeasesForShutdown(): Promise<void> {
+  stopTraexLeaseHeartbeat();
+  const settlements = new Set(traexLeaseSettlements);
+  const abandon = pendingTraexSpawnAbandon;
+  if (abandon) settlements.add(abandon());
+  else if (traexRuntimeLeaseContext) settlements.add(settleTraexSpawnLease(traexRuntimeLeaseContext));
+  if (traexRpcLeaseContext) settlements.add(settleTraexRpcLease());
+  if (settlements.size === 0) return;
+  const timeout = new Promise<void>(resolve => {
+    const timer = setTimeout(resolve, 3_000);
+    timer.unref?.();
+  });
+  await Promise.race([
+    Promise.allSettled(settlements).then(() => undefined),
+    timeout,
+  ]);
+}
+
+/** Stop owned processes BEFORE their registry leases can be settled. False
+ * means death could not be proven; callers must leave the occupant for prune. */
+async function stopOwnedProcessesForTraexSettlement(opts: { destroyBackend?: boolean } = {}): Promise<boolean> {
+  closeRequested = true;
+  const rpcTeardown = stopCodexRpcEngine();
+  const victim = opts.destroyBackend === false ? undefined : backend;
+  const cliPid = victim?.getChildPid?.();
+  let backendStopped = true;
+  try {
+    const result: unknown = isRemoteBackendType(effectiveBackendType)
+      ? victim?.kill()
+      : (victim?.destroySession ?? victim?.kill)?.call(victim);
+    if (result && typeof (result as Promise<void>).then === 'function') {
+      const timeout = new Promise<false>(resolve => {
+        const timer = setTimeout(() => resolve(false), 5_000);
+        timer.unref?.();
+      });
+      backendStopped = await Promise.race([Promise.resolve(result).then(() => true as const), timeout]);
+    }
+  } catch {
+    backendStopped = false;
+  }
+  if (cliPid && pidNotProvablyGone(cliPid)) {
+    const deadline = Date.now() + 3_000;
+    while (pidNotProvablyGone(cliPid) && Date.now() < deadline) {
+      await new Promise<void>(resolve => {
+        const timer = setTimeout(resolve, 50);
+        timer.unref?.();
+      });
+    }
+    if (pidNotProvablyGone(cliPid)) backendStopped = false;
+  }
+  const rpcStopped = await rpcTeardown;
+  return backendStopped && rpcStopped;
+}
+
+function stopCodexRpcEngine(): Promise<boolean> {
   // Invalidate even when the engine has not yet been published: engageCodexRpc
   // may be awaiting a local engine/thread/probe while another IPC handler starts
   // a restart. That stale continuation must never republish the stopped engine.
   rpcEngagementFence.invalidate();
+  const pending = pendingRpcEngagement;
+  if (pending) {
+    pending.cancelled = true;
+    try { pending.engine?.stop(); } catch { /* best effort */ }
+  }
   const engine = codexRpcEngine;
+  const publishedLease = traexRpcLeaseContext;
+  // teardown now exclusively owns settlement. A concurrent shutdown may only
+  // await it, never race a second release against stopAndWait/deathUnproven.
+  traexRpcLeaseContext = undefined;
   taskContinuationRpcGeneration = undefined;
   const ownedRpcTurns = new Set([
     ...rpcTurnsAwaitingActivation.keys(),
@@ -1381,6 +1470,35 @@ function stopCodexRpcEngine(): void {
   // Keep the engine identity installed until those synchronous callbacks have
   // retired their matching rpcActive entries.
   try { engine?.stop(); } catch { /* best effort */ }
+  const teardown = (async () => {
+    const engines = [...new Set([engine, pending?.engine].filter((value): value is CodexRpcEngine => !!value))];
+    let processesStopped = true;
+    for (const owned of engines) {
+      try {
+        if (typeof owned.stopAndWait === 'function') {
+          const stopped = await owned.stopAndWait();
+          if (stopped === false && owned.appServerPid) {
+            const lease = owned === engine ? publishedLease : pending?.engine === owned ? pending.lease : undefined;
+            if (lease) await lease.lease.markDeathUnproven(owned.appServerPid);
+            processesStopped = false;
+          }
+        }
+      }
+      catch (error) {
+        const lease = owned === engine ? publishedLease : pending?.engine === owned ? pending.lease : undefined;
+        if (lease && owned.appServerPid) await lease.lease.markDeathUnproven(owned.appServerPid);
+        processesStopped = false;
+        log(`RPC app-server teardown could not prove process death: ${String(error)}`);
+      }
+    }
+    if (!processesStopped) return false;
+    for (const lease of new Set([publishedLease, pending?.lease])) {
+      if (lease) await settleTraexRpcLease(lease);
+    }
+    return true;
+  })();
+  traexLeaseSettlements.add(teardown);
+  void teardown.then(() => traexLeaseSettlements.delete(teardown), () => traexLeaseSettlements.delete(teardown));
   // A native terminal can arrive synchronously from engine.stop() while its
   // turn/start continuation is still awaiting activation. handleRpcTurnTerminal
   // buffers that exact terminal; settle it now, before teardown clears the
@@ -1479,6 +1597,7 @@ function stopCodexRpcEngine(): void {
   deferredFreshRpcTurn = undefined;
   stopStructuredStartGraceRecheck();
   structuredRejectedReadyEvidenceGeneration = undefined;
+  return teardown;
 }
 
 /** Resolve the persistent pane name + liveness for a backend type, mirroring
@@ -1950,11 +2069,21 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
   const wantResume = cfg.resume === true && !!cfg.cliSessionId;
   stopCodexRpcEngine();
   const engagementLease = rpcEngagementFence.begin();
+  const engagement = { cancelled: false } as {
+    engine?: CodexRpcEngine;
+    lease?: TraexSpawnLeaseContext;
+    cancelled: boolean;
+  };
+  pendingRpcEngagement = engagement;
+  let published = false;
+  let rpcLeaseAttachment: Promise<void> | undefined;
   let engine: CodexRpcEngine | undefined;
+  let rpcLeaseContext: TraexSpawnLeaseContext | undefined;
   let enginePidMarker: string | null = null;
   let freshDeliveryOwned = false;
   const assertRpcEngagementCurrent = (): void => {
-    if (!rpcEngagementFence.isCurrent(engagementLease)) {
+    if (cfg.turnId && cancelledQueuedTurnIds.has(cfg.turnId)) throw new CliSpawnSupersededError();
+    if (closeRequested || engagement.cancelled || !rpcEngagementFence.isCurrent(engagementLease)) {
       throw new CliSpawnSupersededError();
     }
     if (!rpcEngagementFence.isLive(engagementLease)) {
@@ -1969,6 +2098,57 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     const engineCliGeneration = cliSpawnGeneration + 1;
     const resolvedCliBin = createCliAdapterSync(cfg.cliId as CliId, cfg.cliPathOverride).resolvedBin;
     let cliBin = resolvedCliBin;
+    if (cfg.cliId === 'traex' && traexLaunchUsesSharedRuntimeGate(cfg)) {
+      const fixedPath = typeof cfg.cliPathOverride === 'string' && cfg.cliPathOverride.trim().length > 0;
+      const configuredEntry = fixedPath ? resolveCommandEntry(cfg.cliPathOverride!.trim()) : resolveCommandEntry('traex');
+      const resolvedEntry = resolveCommandReal(configuredEntry);
+      const gate = await acquireTraexRuntimeLease({
+        workerPid: process.pid,
+        workerStart: readProcessStartIdentity(process.pid),
+        ...daemonBirthIdentity(),
+        traeHome: resolveTraexChildHome({
+          baseEnv: process.env,
+          envPolicy: cfg.envPolicy,
+          envUnset: cfg.envUnset,
+          perBotEnv: botInjectedEnv(cfg.env, cfg.envPolicy, cfg.protectedMcpPolicy),
+        }),
+        releaseDir: releaseDirForExecutable(resolvedEntry),
+        entryPath: configuredEntry,
+        fixedPath,
+        ...(fixedPath ? { fixedExecutablePath: resolvedEntry } : {}),
+        materialize: true,
+        coordinate: true,
+        waitMs: Number.POSITIVE_INFINITY,
+        pollMs: 500,
+        abort: () => closeRequested || engagement.cancelled || !rpcEngagementFence.isCurrent(engagementLease)
+          ? 'spawn-superseded' : undefined,
+        onBlocked: (blockers, detail) => {
+          send({
+            type: 'traex_runtime_deferred',
+            blockers: blockers.map(blocker => ({
+              occupantId: blocker.occupantId, comboKey: blocker.comboKey, phase: blocker.phase,
+              ...(blocker.fixedPath ? { fixedPath: true } : {}),
+              ...(blocker.pid !== undefined ? { pid: blocker.pid } : {}),
+            })),
+            detail,
+            ...(cfg.turnId ? { turnId: cfg.turnId } : {}),
+            ...(cfg.dispatchAttempt !== undefined ? { dispatchAttempt: cfg.dispatchAttempt } : {}),
+          });
+        },
+      });
+      if (gate.kind === 'aborted') throw new CliSpawnSupersededError();
+      if (gate.kind !== 'granted') {
+        const detail = gate.kind === 'blocked' ? gate.detail : `${gate.reason}${gate.detail ? `: ${gate.detail}` : ''}`;
+        throw new Error(`TRAE runtime gate refused the RPC start: ${detail}`);
+      }
+      rpcLeaseContext = createTraexSpawnLeaseContext(gate.lease);
+      engagement.lease = rpcLeaseContext;
+      rpcLeaseContext.configuredEntry = configuredEntry;
+      rpcLeaseContext.sourceInstallIdentity = gate.lease.snapshot.sourceInstallIdentity
+        ?? resolveInstallIdentity(configuredEntry);
+      assertRpcEngagementCurrent();
+      cliBin = gate.lease.snapshot.traexPath;
+    }
     if (cfg.cliId === 'codex') {
       try { cliBin = realpathSync(resolvedCliBin); } catch { /* launch may resolve through engineEnv.PATH */ }
     }
@@ -2000,6 +2180,9 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     // injects into the TUI — else a 3rd-party-provider bot's app-server silently
     // falls back to the default provider. Re-sanitized (crossed IPC).
     Object.assign(engineEnv, botInjectedEnv(cfg.env, cfg.envPolicy, cfg.protectedMcpPolicy));
+    if (rpcLeaseContext?.lease.snapshot.helperPath) engineEnv.TRAEX_CODE_MODE_HOST_PATH = rpcLeaseContext.lease.snapshot.helperPath;
+    else delete engineEnv.TRAEX_CODE_MODE_HOST_PATH;
+    applyTraexRuntimeOwnershipEnv(engineEnv, rpcLeaseContext?.lease);
     if (cfg.promptInjection === 'none') clearBotmuxPromptEnv(engineEnv);
     applyCodexInstanceEnv(engineEnv, cfg.cliInstanceBinding);
     // Session identity is host-owned. Pin it after the config-controlled merge,
@@ -2063,6 +2246,18 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
       appServerConfig: cfg.cliId === 'traex'
         ? [traexNativeSubagentHookConfig(nativeSubagentRuntimeHookCommand())]
         : undefined,
+      onAppServerSpawn: (pid) => {
+        const context = rpcLeaseContext;
+        if (!context || context.settled) return;
+        context.running = true;
+        startTraexSpawnLeaseHeartbeat(context);
+        const attachment = context.lease.markRunning(pid, readProcessStartIdentity(pid)).catch(err => {
+          log(`[traex-runtime] failed to record RPC app-server identity: ${err instanceof Error ? err.message : String(err)}`);
+          throw err;
+        });
+        rpcLeaseAttachment = attachment;
+        void attachment.catch(() => { /* surfaced by the engagement await below */ });
+      },
       onRequestUserInput: (params, signal, identity) => bridgeCodexUserInput({
         sessionId: cfg.sessionId, larkAppId: cfg.larkAppId, chatId: cfg.chatId,
         rootMessageId: cfg.rootMessageId, originTurnId: identity?.turnId,
@@ -2098,7 +2293,10 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
         }
       },
     });
+    engagement.engine = engine;
     await engine.start();
+    assertRpcEngagementCurrent();
+    if (rpcLeaseAttachment) await rpcLeaseAttachment;
     assertRpcEngagementCurrent();
     // Shell tools run under the app-server process tree, not the viewer TUI.
     // Mark its pid before the first turn so `botmux send` resolves the current
@@ -2164,7 +2362,6 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
         // the same turnId and leave a stale, never-consumed queue head (Codex P1).
         log('Codex RPC fresh first turn: frame not dispatched → falling back to paste (safe, single execution)');
         clearRpcEnginePidMarker();
-        try { engine.stop(); } catch { /* best effort */ }
         return 'not-engaged';
       }
       if (first.outcome === 'accepted') {
@@ -2273,6 +2470,9 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
       outcome = first.outcome; // accepted | ambiguous — both stay engaged, prompt never re-queued
     }
     codexRpcEngine = engine;
+    traexRpcLeaseContext = rpcLeaseContext;
+    published = true;
+    if (pendingRpcEngagement === engagement) pendingRpcEngagement = undefined;
     taskContinuationRpcGeneration = randomBytes(16).toString('hex');
     send({
       type: 'task_continuation_rpc_status',
@@ -2289,6 +2489,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     log(`Codex RPC input engaged (${outcome}${wantResume ? '/resume' : '/fresh'}): app-server ${engine.wsUrl} thread ${threadId}`);
     return outcome;
   } catch (err: any) {
+    if (err instanceof Error && err.message.startsWith('TRAE runtime gate refused the RPC start:')) throw err;
     if (err instanceof CliSpawnSupersededError
       || !rpcEngagementFence.isCurrent(engagementLease)) {
       log('Codex RPC engagement was superseded; stopping only its local app-server and preserving the replacement generation');
@@ -2323,6 +2524,25 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     // failure; otherwise paste fallback could inherit a stale fail-closed mark.
     stopCodexRpcEngine();
     return 'not-engaged';
+  } finally {
+    if (!published) {
+      let processesStopped = true;
+      try {
+        if (engine && typeof engine.stopAndWait === 'function') {
+          const stopped = await engine.stopAndWait();
+          if (stopped === false && engine.appServerPid) {
+            if (rpcLeaseContext) await rpcLeaseContext.lease.markDeathUnproven(engine.appServerPid);
+            processesStopped = false;
+          }
+        }
+      } catch (error) {
+        if (rpcLeaseContext && engine?.appServerPid) await rpcLeaseContext.lease.markDeathUnproven(engine.appServerPid);
+        processesStopped = false;
+        log(`RPC engagement teardown could not prove process death: ${String(error)}`);
+      }
+      if (processesStopped) await settleTraexRpcLease(rpcLeaseContext);
+    }
+    if (pendingRpcEngagement === engagement) pendingRpcEngagement = undefined;
   }
 }
 
@@ -2666,15 +2886,27 @@ function refreshActiveRuntimeContract(): void {
   void publishRuntimeContract(active);
 }
 let cliSpawnGeneration = 0;
+/** The operator-configured TRAE entry (never the snapshot) of the current
+ *  spawn. Kept apart from the actual exec target so the install watcher can
+ *  tell "the configured install changed" from "we exec a frozen copy". */
+let traexConfiguredEntryAtSpawn: { generation: number; entry: string; identity: ExecutableIdentity | undefined } | undefined;
+/** The frozen object the current spawn actually execs. `identity` is captured
+ *  right after materialisation, before exec, so a later source change cannot
+ *  silently relabel it. */
+let traexLaunchTargetAtSpawn: {
+  generation: number;
+  path: string;
+  identity: ExecutableIdentity | undefined;
+  comboKey: string;
+  snapshotDir?: string;
+  helperPath?: string;
+} | undefined;
 /** Number of normal turn writes started in the current CLI generation.
  *  Standalone botmux-send activation proof (without transcript/recheck
  *  corroboration) is only accepted on the opening write (count === 1), where
  *  no active prior turn or background subagent can inherit the rotated PID
  *  marker and falsely confirm an unsubmitted successor. */
 let cliGenerationTurnWrites = 0;
-/** What the TRAE install entry resolved to right before the spawn of
- *  `generation`. Published only while that spawn is still the current one. */
-let traexInstallAtSpawn: { generation: number; identity: ExecutableIdentity | undefined } | undefined;
 /** Pending statusline generation token provided by daemon `init` / `restart`
  *  for the next non-reattach CLI spawn (consumed once so later self-respawns
  *  mint a fresh UUID). */
@@ -3895,6 +4127,148 @@ let lastCliExitSignal: string | null = null;
  *  of per-WS attach-session PTYs. Set in spawnCli's adopt branch. */
 let isPipeMode = false;
 let effectiveBackendType: BackendType = 'pty';
+
+/** Abandons a `starting` TRAE runtime reservation when this spawn dies before
+ *  the CLI is proven running (superseded generation, spawn failure, worker
+ *  shutdown). Cleared as soon as the CLI pid is recorded, so a normal exit
+ *  releases instead of abandoning. Without this a pre-exec death would leave a
+ *  permanent `starting` occupancy that no liveness proof can clear. */
+interface TraexSpawnLeaseContext {
+  readonly lease: TraexRuntimeLease;
+  running: boolean;
+  settled: boolean;
+  cliPid?: number;
+  /** Exact detach operation shared by inner/outer exits and shutdown. */
+  settlement?: Promise<void>;
+  settlementRetry?: ReturnType<typeof setTimeout>;
+  configuredEntry?: string;
+  sourceInstallIdentity?: ExecutableIdentity;
+  heartbeat: ReturnType<typeof setInterval> | undefined;
+  readonly abandon: () => Promise<void>;
+}
+let pendingTraexSpawnAbandon: (() => Promise<void>) | undefined;
+let traexRuntimeLeaseContext: TraexSpawnLeaseContext | undefined;
+function stopTraexLeaseHeartbeat(context = traexRuntimeLeaseContext): void {
+  if (context?.heartbeat !== undefined) {
+    clearInterval(context.heartbeat);
+    context.heartbeat = undefined;
+  }
+}
+const traexLeaseSettlements = new Set<Promise<unknown>>();
+function settleTraexSpawnLease(context: TraexSpawnLeaseContext, abandonAfterDeathProof = false): Promise<void> {
+  if (context.settled) return context.settlement ?? Promise.resolve();
+  if (context.settlement) return context.settlement;
+  const operation = (async () => {
+    if (abandonAfterDeathProof) await context.lease.abandon();
+    else await (context.running ? context.lease.release() : context.lease.abandon());
+    context.settled = true;
+    if (context.settlementRetry) clearTimeout(context.settlementRetry);
+    context.settlementRetry = undefined;
+    stopTraexLeaseHeartbeat(context);
+    if (traexRuntimeLeaseContext === context) {
+      traexRuntimeLeaseContext = undefined;
+      if (pendingTraexSpawnAbandon === context.abandon) pendingTraexSpawnAbandon = undefined;
+    }
+  })();
+  context.settlement = operation;
+  traexLeaseSettlements.add(operation);
+  void operation.then(
+    () => { traexLeaseSettlements.delete(operation); },
+    () => {
+      traexLeaseSettlements.delete(operation);
+      if (context.settlement === operation) context.settlement = undefined;
+      if (!context.settled && context.settlementRetry === undefined) {
+        context.settlementRetry = setTimeout(() => {
+          context.settlementRetry = undefined;
+          if (!context.settled) void settleTraexSpawnLease(context);
+        }, 5_000);
+        context.settlementRetry.unref?.();
+      }
+    },
+  );
+  return operation;
+}
+function startTraexSpawnLeaseHeartbeat(context: TraexSpawnLeaseContext): void {
+  if (context.heartbeat !== undefined || context.settled) return;
+  context.heartbeat = setInterval(() => {
+    if (context.settled) return;
+    void context.lease.heartbeat().catch((err) => {
+      log(`[traex-runtime] heartbeat failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  }, 20_000);
+  context.heartbeat.unref?.();
+}
+function resolveTraexRpcViewerLease(
+  cfg: { existingAppServerEndpoint?: unknown },
+  engine: unknown,
+  context: TraexSpawnLeaseContext | undefined,
+): TraexSpawnLeaseContext | undefined {
+  // Owned RPC engagements have no existingAppServerEndpoint; that field belongs
+  // to external Codex attachment. The engaged local app-server is the proof that
+  // this viewer must share its already-frozen runtime lease.
+  if (!context || context.settled) return undefined;
+  if (cfg.existingAppServerEndpoint === undefined && !engine) return undefined;
+  return context;
+}
+async function prepareTraexRpcViewerLease(
+  context: TraexSpawnLeaseContext,
+  abort?: () => string | undefined,
+): Promise<{
+  context: TraexSpawnLeaseContext;
+  cliPathOverride: string;
+  configuredEntry: { entry: string; identity: ExecutableIdentity | undefined };
+  launchTarget: {
+    path: string;
+    identity: ExecutableIdentity | undefined;
+    comboKey: string;
+    snapshotDir?: string;
+    helperPath?: string;
+  };
+  helperPath?: string;
+}> {
+  const gate = await acquireTraexRuntimePeerLease(context.lease, {
+    workerPid: process.pid,
+    workerStart: readProcessStartIdentity(process.pid),
+    ...daemonBirthIdentity(),
+    waitMs: Number.POSITIVE_INFINITY,
+    abort,
+  });
+  if (gate.kind === 'aborted') throw new CliSpawnSupersededError();
+  if (gate.kind !== 'granted') throw new Error(`TRAE runtime gate refused the RPC viewer: ${gate.kind === 'blocked' ? gate.detail : gate.reason}`);
+  const peer = createTraexSpawnLeaseContext(gate.lease);
+  peer.configuredEntry = context.configuredEntry;
+  peer.sourceInstallIdentity = context.sourceInstallIdentity;
+  return {
+    context: peer,
+    cliPathOverride: context.lease.snapshot.traexPath,
+    configuredEntry: {
+      entry: context.configuredEntry ?? context.lease.snapshot.traexPath,
+      identity: context.sourceInstallIdentity,
+    },
+    launchTarget: {
+      path: context.lease.snapshot.traexPath,
+      identity: resolveInstallIdentity(context.lease.snapshot.traexPath),
+      comboKey: context.lease.snapshot.comboKey,
+      ...(context.lease.snapshot.snapshot ? { snapshotDir: context.lease.snapshot.dir } : {}),
+      ...(context.lease.snapshot.helperPath ? { helperPath: context.lease.snapshot.helperPath } : {}),
+    },
+    helperPath: context.lease.snapshot.helperPath,
+  };
+}
+function createTraexSpawnLeaseContext(lease: TraexRuntimeLease): TraexSpawnLeaseContext {
+  const context: TraexSpawnLeaseContext = {
+    lease,
+    running: false,
+    settled: false,
+    heartbeat: undefined,
+    abandon: () => {
+      // Once exec has been attested, only the verified exit path may release.
+      if (context.running) return Promise.resolve();
+      return settleTraexSpawnLease(context);
+    },
+  };
+  return context;
+}
 
 /**
  * Whether a screen snapshot can safely drive state changes or synthetic input.
@@ -6814,6 +7188,22 @@ const pendingMessages = freshnessInputQueue.normal;
 /** Async init must materialize its opening input before follow-ups may flush
  * or shutdown may fence the worker generation. */
 let initPromptMaterialized = false;
+/** Inputs whose daemon commit receipt was deliberately held while the opening
+ * prompt was not materialized. Object identity keeps the later ACK on the exact
+ * queued turn/attempt; cancelled or never-submitted items never receive it. */
+const turnInputCommitDeferredForMaterialization = new WeakSet<PendingCliInput>();
+/** Exact unsubmitted turns cancelled during async init. The bounded tombstones
+ *  close the race where init later reinserts its opening after cancellation. */
+const cancelledQueuedTurnIds = new Set<string>();
+function noteCancelledQueuedTurn(turnId: string): void {
+  cancelledQueuedTurnIds.delete(turnId);
+  cancelledQueuedTurnIds.add(turnId);
+  while (cancelledQueuedTurnIds.size > 256) {
+    const oldest = cancelledQueuedTurnIds.keys().next().value;
+    if (oldest === undefined) break;
+    cancelledQueuedTurnIds.delete(oldest);
+  }
+}
 /** Ordinary Lark IM turns may be retransmitted by the daemon when the exact
  * receipt ACK times out. Fence those retries before any renderer / adapter side
  * effects so one Lark message can enter the CLI input queue at most once per
@@ -25340,6 +25730,78 @@ async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
   scheduleOneShotAfterAction();
 }
 
+function rpcTurnMayHaveBeenSubmitted(turnId: string): boolean {
+  if (deferredFreshRpcTurn?.identity.turnId === turnId) return true;
+  const ownerPrefix = `${turnId}\0`;
+  return [
+    rpcTurnsAwaitingActivation,
+    rpcActiveOwners,
+    rpcLifecycleFailClosedOwners,
+    rpcTerminalHydrationOwners,
+    settlingRpcTerminalOwners,
+    pendingRpcTurnTerminals,
+  ].some(owners => [...owners.keys()].some(key => key.startsWith(ownerPrefix)));
+}
+
+/** Remove an exact unsubmitted turn without requiring an active CLI runtime.
+ * A cancellation before init materialization is also remembered so the opening
+ * cannot be inserted later by the remainder of that async init. */
+function handleQueuedTurnCancel(requestId: string, turnId: string): void {
+  noteCancelledQueuedTurn(turnId);
+  let removed = 0;
+  for (let index = pendingMessages.length - 1; index >= 0; index--) {
+    const item = pendingMessages[index]!;
+    if (item.turnId !== turnId) continue;
+    pendingMessages.splice(index, 1);
+    turnInputCommitDeferredForMaterialization.delete(item);
+    if (item.queuedActivationToken) queuedActivationReceipts.cancel(item.queuedActivationToken);
+    removed += 1;
+  }
+  for (let index = pendingRawInputs.length - 1; index >= 0; index--) {
+    const item = pendingRawInputs[index]!;
+    if (item.turnId !== turnId) continue;
+    pendingRawInputs.splice(index, 1);
+    if (item.queuedActivationToken) queuedActivationReceipts.cancel(item.queuedActivationToken);
+    removed += 1;
+  }
+  const openingPending = !initPromptMaterialized
+    && (lastInitConfig?.turnId === turnId || currentBotmuxTurnId === turnId);
+  let openingMayBeArgvBaked = false;
+  if (lastInitConfig?.turnId === turnId) {
+    try {
+      openingMayBeArgvBaked = (cliAdapter ?? createCliAdapterSync(
+        lastInitConfig.cliId as CliId,
+        lastInitConfig.cliPathOverride,
+      )).passesInitialPromptViaArgs === true;
+    } catch {
+      openingMayBeArgvBaked = true;
+    }
+  }
+  const freshRpcOpening = lastInitConfig?.turnId === turnId
+    && codexRpcEligible(lastInitConfig, { sandboxForced: sandboxEnabled() });
+  const recoveredOpening = lastInitConfig?.reconcileQueuedActivation?.turnId === turnId
+    || remoteRunnerRecoveredTurnIdentity?.turnId === turnId;
+  const remoteRecoveryOpening = !initPromptMaterialized
+    && lastInitConfig?.turnId === turnId
+    && (lastInitConfig.backendType === 'remote-runner' || effectiveBackendType === 'remote-runner');
+  const alreadyWritten = inflightInputs.hasLiveTurn(turnId)
+    || (currentBotmuxTurnId === turnId && !!backend
+      && (initPromptMaterialized || openingMayBeArgvBaked))
+    || openingMayBeArgvBaked
+    || freshRpcOpening
+    || recoveredOpening
+    || remoteRecoveryOpening
+    || rpcTurnMayHaveBeenSubmitted(turnId);
+  const status = alreadyWritten
+    ? 'restart_required' as const
+    : removed > 0 || openingPending
+      ? 'queued_removed' as const
+      : 'not_found' as const;
+  if (status === 'queued_removed') inflightInputs.retireTurn(turnId);
+  send({ type: 'queued_turn_cancel_result', requestId, turnId, status });
+  if (removed > 0 && isPromptReady) void flushPending();
+}
+
 /** Deliver Ctrl+C only when the daemon's requested turn is still the worker's
  *  active turn. This is deliberately separate from card `term_action`: a stale
  *  HTTP request must never interrupt a newer turn that reused this CLI process. */
@@ -32582,6 +33044,12 @@ async function flushPending(): Promise<void> {
       const scheduledWriteIsCurrent = () => writeContinuationIsCurrent()
         && cliInterruptGeneration === writeInterruptGeneration && !webTerminalInputWireDirty();
       let normalWritePrepared = false;
+      // Deferred preparation parks this exact item in pendingMessages until
+      // beforeSubmit: the queue, not this write, owns it until then.
+      let deferredQueueOwned = false;
+      // Set when a queue-owned item is found retired right after its write-edge
+      // admission returned allow, before the adapter or any preparation ran.
+      let retiredAfterAdmission = false;
       let retiredBeforeSubmit = false;
       let webWireWriteRefused = false;
       let reattachSteerWriteRefused = false;
@@ -33215,10 +33683,25 @@ async function flushPending(): Promise<void> {
             // ownership and resurrecting it later.
             pendingMessages.unshift(item);
           }
+          deferredQueueOwned = writeAdapter.writeInputDefersPreparation === true;
           const transaction = await runAmbiguousSubmissionTransaction(
             writeBackend,
             () => runScheduledCliInputWrite(item, scheduledWriteIsCurrent,
-              isScheduledWrite ? prepareNormalWrite : () => {},
+              isScheduledWrite ? () => {
+                // The queue owns a deferred item until beforeSubmit, and a
+                // lifecycle path (coalesce, durable expiry, ...) may retire and
+                // settle it during the admission await. Settle that before the
+                // adapter is even invoked.
+                if (deferredQueueOwned && !pendingMessages.includes(item)) {
+                  retiredAfterAdmission = true;
+                  throw new Error('scheduled_input_retired');
+                }
+                // Queue-owned items prepare only in beforeSubmit, after its
+                // ownership check: the adapter's own precheck can still await,
+                // and a veto there cannot undo the capture identity, started
+                // active turn or written marks preparation commits.
+                if (!deferredQueueOwned) prepareNormalWrite();
+              } : () => {},
               () => writeAdapter.writeInput(
               adapterInputHandle(writeBackend),
               msg,
@@ -33305,13 +33788,23 @@ async function flushPending(): Promise<void> {
           scheduleBusyPatternIdleProbe(`${cliName()} post-submit`);
         }
       } catch (err: any) {
-        if (lateScheduledHold && !normalWritePrepared) {
-          if (lateScheduledHold === 'reject') discardUnwrittenScheduledInput(item);
-          // Deferred-preparation adapters (Codex) keep the item queued until
-          // beforeSubmit, so a write-edge retain finds it still in place.
-          else if (!pendingMessages.includes(item)) pendingMessages.unshift(item);
+        if ((lateScheduledHold || retiredAfterAdmission) && !normalWritePrepared) {
+          const queuedIndex = pendingMessages.indexOf(item);
+          // A queue-owned item that left the queue during the admission await
+          // was retired and already settled by a lifecycle path (coalesce,
+          // STOP): never revive it and never reject it a second time.
+          const retired = deferredQueueOwned && queuedIndex < 0;
+          if (retired) {
+            cancelScheduledAdmissionRetry(item);
+          } else if (lateScheduledHold === 'reject') {
+            if (deferredQueueOwned) pendingMessages.splice(queuedIndex, 1);
+            discardUnwrittenScheduledInput(item);
+          } else if (queuedIndex < 0) {
+            // Retain: restore what this write dequeued; queue-owned stays put.
+            pendingMessages.unshift(item);
+          }
           keepPromptReadyAfterHold();
-          if (lateScheduledHold === 'reject') continue;
+          if (lateScheduledHold === 'reject' || (retired && writeContinuationIsCurrent())) continue;
           break;
         }
         if (reattachSteerWriteRefused && !normalWritePrepared && writeContinuationIsCurrent()) {
@@ -34204,7 +34697,11 @@ function sendToPty(
       : {}),
     ...(opts.turnCallerOpenId ? { turnCallerOpenId: opts.turnCallerOpenId } : {}),
   };
+  if (next.turnId && cancelledQueuedTurnIds.has(next.turnId)) return true;
   if (!initPromptMaterialized) {
+    // codexRpcEngine is still undecided here. Always retain the exact item;
+    // only the materialization drain below may filter durable submissions.
+    turnInputCommitDeferredForMaterialization.add(next);
     pendingMessages.push(next);
     coalescePendingScheduledInputs();
     log(`Queued message behind async init materialization (${pendingMessages.length} pending)`);
@@ -35603,10 +36100,26 @@ async function spawnCli(
     /** Linux scratch only: re-prepare around the existing COW view that killCli
      *  kept (preserveSandboxForRespawn) instead of retiring it. */
     reuseExistingScratchTree?: boolean;
+    /** Per-spawn ownership channel. A superseded spawn's catch must never read
+     *  the module-global callback installed by a newer generation. */
+    traexSpawnAbandonRef?: { current?: () => Promise<void> };
   } = {},
 ): Promise<void> {
   if (closeRequested) throw new CliSpawnSupersededError();
-  if (!workerSessionEventScope) return spawnCliBody(cfg, opts);
+  const traexSpawnAbandonRef: { current?: () => Promise<void> } = {};
+  const bodyOpts = { ...opts, traexSpawnAbandonRef };
+  if (!workerSessionEventScope) {
+    try {
+      return await spawnCliBody(cfg, bodyOpts);
+    } catch (error) {
+      const abandon = traexSpawnAbandonRef.current;
+      if (abandon) {
+        try { await abandon(); }
+        catch (err) { log(`[traex-runtime] lease abandonment failed after spawn error: ${err instanceof Error ? err.message : String(err)}`); }
+      }
+      throw error;
+    }
+  }
   const firstBinding = !workerSessionEventScope.currentBinding();
   if (cfg.prompt && !workerSessionEventScope.canSubmit(cfg.turnId, cfg.dispatchAttempt, cfg.sessionCommand?.execution)) {
     const submissionGate = workerSessionEventScope.inspectSubmissionGate?.(
@@ -35681,9 +36194,14 @@ async function spawnCli(
       // Every reserved runtime needs its own snapshot: a failed predecessor
       // may have lost its deferred announcement when its binding was aborted.
       setCaptureIdentity(currentBotmuxTurnId, currentBotmuxDispatchAttempt, currentBotmuxCallerOpenId, true);
-      await spawnCliBody(cfg, opts);
+      await spawnCliBody(cfg, bodyOpts);
     }
     catch (error) {
+      const abandon = traexSpawnAbandonRef.current;
+      if (abandon) {
+        try { await abandon(); }
+        catch (err) { log(`[traex-runtime] lease abandonment failed after spawn error: ${err instanceof Error ? err.message : String(err)}`); }
+      }
       // A replacement that never published an identity releases its
       // reservation; otherwise it would mask the surviving runtime's exit.
       if (!binding.identity) {
@@ -35694,6 +36212,70 @@ async function spawnCli(
     }
     await publishRuntimeContract(binding);
   }, execution);
+}
+
+async function registerAdoptedTraexRuntime(
+  cfg: Extract<DaemonToWorker, { type: 'init' }>,
+  adoptBackendPid?: number | null,
+): Promise<TraexSpawnLeaseContext | undefined> {
+  if (cfg.adoptMode !== true || cfg.cliId !== 'traex' || !traexLaunchUsesSharedRuntimeGate(cfg)) return undefined;
+  const fixedPath = typeof cfg.cliPathOverride === 'string' && cfg.cliPathOverride.trim().length > 0;
+  const configuredEntry = fixedPath ? resolveCommandEntry(cfg.cliPathOverride!.trim()) : resolveCommandEntry('traex');
+  const resolvedEntry = resolveCommandReal(configuredEntry);
+  const candidatePid = cfg.adoptCliPid && isTraexProcess(cfg.adoptCliPid)
+    ? cfg.adoptCliPid : adoptBackendPid;
+  const cliPid = candidatePid && isTraexProcess(candidatePid) ? candidatePid : undefined;
+  const cliStart = cliPid ? readProcessStartIdentity(cliPid) : undefined;
+  const gate = await acquireTraexRuntimeOccupancy({
+    traeHome: resolveTraexChildHome({
+      baseEnv: process.env,
+      envPolicy: cfg.envPolicy,
+      envUnset: cfg.envUnset,
+      perBotEnv: botInjectedEnv(cfg.env, cfg.envPolicy, cfg.protectedMcpPolicy),
+    }),
+    releaseDir: releaseDirForExecutable(resolvedEntry),
+    ...(cliPid ? { cliPid } : {}),
+    ...(cliStart ? { cliStart } : {}),
+    workerPid: process.pid,
+    workerStart: readProcessStartIdentity(process.pid),
+    ...daemonBirthIdentity(),
+    fixedPath,
+    existingRuntime: true,
+    coordinate: true,
+  });
+  if (gate.kind !== 'granted') {
+    throw new Error(`TRAE adopted runtime occupancy refused: ${gate.kind === 'blocked' ? gate.detail : gate.reason}`);
+  }
+  const context = createTraexSpawnLeaseContext(gate.lease);
+  context.running = true;
+  if (cliPid) context.cliPid = cliPid;
+  traexRuntimeLeaseContext = context;
+  startTraexSpawnLeaseHeartbeat(context);
+  if (cliPid) {
+    const running = readRunningExeIdentity(cliPid, cliStart);
+    void (running ? captureTraexRunningContentIdentity(running) : Promise.resolve(undefined))
+      .then(identity => context.settled ? undefined : context.lease.markRunning(cliPid, cliStart, identity))
+      .catch(error => log(`[traex-runtime] adopted runtime identity backfill failed: ${String(error)}`));
+  }
+  return context;
+}
+
+function settleAdoptedTraexRuntime(
+  context: TraexSpawnLeaseContext | undefined,
+  observer: SessionBackend | null,
+): void {
+  if (!context) return;
+  // A pipe-pane/Zellij exit is useful only when the backend can independently
+  // prove the adopted pane is gone. Orca's stopped flag and Herdr's attach
+  // disconnect do not prove CLI death and therefore cannot release occupancy.
+  if ((effectiveBackendType === 'tmux' || effectiveBackendType === 'zellij')
+    && isObserveBackend(observer) && !observer.isPaneAlive()) {
+    // A recorded PID always requires kernel death proof, even when pane_alive
+    // is false. Only a PID-less pane may use its death proof to abandon.
+    void settleTraexSpawnLease(context, context.cliPid === undefined);
+    return;
+  }
+  log('[traex-runtime] adopted runtime death is unproven; occupancy retained');
 }
 
 async function spawnCliBody(
@@ -35956,12 +36538,14 @@ async function spawnCliBody(
       env: process.env as Record<string, string>,
     });
 
+    const adoptedTraexRuntime = await registerAdoptedTraexRuntime(cfg, backend?.getChildPid?.());
     setupAdoptTranscriptBridges(cfg);
     setupAdoptInputAdapter(cfg);
     setupAdoptIdleDetection(cfg, 'orca');
     backend.onData(bindSessionRuntimeCallback(onPtyData, true));
     backend.onExit(bindSessionBackendExit((code, signal) => {
       log(`Adopted Orca terminal ended (code: ${code}, signal: ${signal})`);
+      if (adoptedTraexRuntime) settleAdoptedTraexRuntime(adoptedTraexRuntime, backend);
       backend = null;
       revokePromptReadiness();
       stopBridgeWatcher();
@@ -36004,6 +36588,7 @@ async function spawnCliBody(
       env: process.env as Record<string, string>,
     });
 
+    const adoptedTraexRuntime = await registerAdoptedTraexRuntime(cfg, backend?.getChildPid?.());
     wireHerdrWebTerminalRelays(herdrBe);
     herdrBe.onPaneGridChange(() => {
       observedPaneGridRevision++;
@@ -36026,6 +36611,7 @@ async function spawnCliBody(
     }));
     backend.onExit(bindSessionBackendExit((code, signal) => {
       log(`Adopted herdr stream ended (code: ${code}, signal: ${signal})`);
+      if (adoptedTraexRuntime) settleAdoptedTraexRuntime(adoptedTraexRuntime, backend);
       backend = null;
       revokePromptReadiness();
       stopBridgeWatcher();
@@ -36069,6 +36655,7 @@ async function spawnCliBody(
       env: process.env as Record<string, string>,
     });
 
+    const adoptedTraexRuntime = await registerAdoptedTraexRuntime(cfg, backend?.getChildPid?.());
     // Seed the shared scrollback with the pane's current screen so any
     // already-connected (or future) WS clients render meaningful content
     // immediately, instead of waiting for the next observe tick.
@@ -36090,6 +36677,7 @@ async function spawnCliBody(
     }));
     backend.onExit(bindSessionBackendExit((code, signal) => {
       log(`Adopted pipe-pane stream ended (code: ${code}, signal: ${signal})`);
+      if (adoptedTraexRuntime) settleAdoptedTraexRuntime(adoptedTraexRuntime, backend);
       backend = null;
       revokePromptReadiness();
       stopBridgeWatcher();
@@ -37847,6 +38435,327 @@ async function spawnCliBody(
     writeCredentialSourceStamp(config.session.dataDir, cfg.sessionId, credentialSourceDir);
   }
 
+  // ── TRAE shared-cache runtime gate ────────────────────────────────────────
+  // Every managed TRAE spawn that can write <TRAE_HOME>/skills/.system must be
+  // admitted by the cross-process registry keyed on the PHYSICAL skills dir.
+  // This is the single exec choke point, so it covers a daemon fork and an
+  // in-worker `restartCliProcess` alike. An incompatible old runtime keeps the
+  // domain until its CLI is proven gone; this worker keeps its input and waits
+  // instead of retargeting it. A non-fixed launch execs a verified private
+  // snapshot, so a later install switch cannot make this runtime load content
+  // it never registered.
+  let traexLaunchHelperPath: string | undefined;
+  // Captured by this spawn's backend exit callback. The module-level current
+  // pointer may already name a replacement when an old backend finally exits.
+  let traexSpawnLeaseContext: TraexSpawnLeaseContext | undefined;
+  let localTraexSpawnAbandon: (() => Promise<void>) | undefined;
+  const setLocalTraexSpawnAbandon = (abandon: () => Promise<void>): void => {
+    localTraexSpawnAbandon = abandon;
+    if (opts.traexSpawnAbandonRef) opts.traexSpawnAbandonRef.current = abandon;
+    pendingTraexSpawnAbandon = abandon;
+  };
+  const clearLocalTraexSpawnAbandon = (): void => {
+    if (pendingTraexSpawnAbandon === localTraexSpawnAbandon) pendingTraexSpawnAbandon = undefined;
+    localTraexSpawnAbandon = undefined;
+    if (opts.traexSpawnAbandonRef) opts.traexSpawnAbandonRef.current = undefined;
+  };
+  // Record the actual exec'd CLI against the reservation. Called with the
+  // backend child pid right after spawn and again whenever a launcher/sandbox
+  // leaf resolves, so the registry names the process that really writes the
+  // shared cache rather than a wrapper that may exit earlier.
+  const traexContentKeyInFlight = new Set<number>();
+  /**
+   * Content identity of the process actually running at `pid`.
+   *
+   * A record registered without proof (adopt/reattach) can still be identified
+   * after the fact: `/proc/<pid>/exe` names the kernel's own object, a BotMux
+   * snapshot records its `comboKey` and source signature in the manifest, and
+   * otherwise the running executable (plus its release siblings) is hashed.
+   * Any failure stays unknown — the caller then keeps the fail-closed record.
+   */
+  const captureRunningContentKey = async (
+    pid: number,
+    cliStart?: string,
+  ): Promise<{ comboKey: string; installSignature?: string } | undefined> => {
+    const running = readRunningExeIdentity(pid, cliStart);
+    if (!running) return undefined;
+    try {
+      return await captureTraexRunningContentIdentity(running);
+    } catch (err) {
+      log(`[traex-runtime] could not capture content identity for pid ${pid}: ${err instanceof Error ? err.message : String(err)}`);
+      return undefined;
+    }
+  };
+  const attachTraexLeaseCli = (pid: number): void => {
+    const context = traexSpawnLeaseContext;
+    if (!context || context.settled) return;
+    context.cliPid = pid;
+    const lease = context.lease;
+    const cliStart = readProcessStartIdentity(pid);
+    // Prove the leaf really runs the frozen object this lease registered. A
+    // path that was swapped after materialisation would otherwise be recorded
+    // under the old content identity. `isTraexProcess` keeps a launcher pid
+    // (bwrap/forge/relay) from being judged as the CLI; the leaf re-attach
+    // below verifies the real one. When the identity cannot be read at all we
+    // fail closed and downgrade the occupant to unknown instead of trusting
+    // the reservation.
+    let proven = true;
+    if (process.platform === 'linux' && !lease.occupancyOnly && lease.snapshot.snapshot && isTraexProcess(pid)) {
+      const running = readRunningExeIdentity(pid, cliStart ?? undefined);
+      const expected = resolveInstallIdentity(lease.snapshot.traexPath);
+      proven = sameExecutableObject(running, expected);
+      if (!proven) {
+        log(
+          `[traex-runtime] pid ${pid} is not running the registered snapshot `
+          + `${lease.snapshot.traexPath}; marking the occupant unknown`,
+        );
+      }
+    }
+    // A record with no content identity (adopt/reattach) is backfilled once
+    // the real TRAE process is known. This stops a reconnected daemon from
+    // pinning the domain to unknown and restores its scheduling signature.
+    const backfill = proven && lease.snapshot.comboKey === '' && isTraexProcess(pid);
+    if (backfill && !traexContentKeyInFlight.has(pid)) {
+      traexContentKeyInFlight.add(pid);
+      void captureRunningContentKey(pid, cliStart ?? undefined)
+        .then(identity => lease.markRunning(pid, cliStart ?? undefined, identity))
+        .catch((err) => {
+          log(`[traex-runtime] failed to record CLI identity ${pid}: ${err instanceof Error ? err.message : String(err)}`);
+        })
+        .finally(() => traexContentKeyInFlight.delete(pid));
+    } else {
+      void (proven
+        ? lease.markRunning(pid, cliStart ?? undefined)
+        : lease.markUnknown(pid, cliStart ?? undefined)).catch((err) => {
+        log(`[traex-runtime] failed to record CLI identity ${pid}: ${err instanceof Error ? err.message : String(err)}`);
+      });
+    }
+    if (context.running) return;
+    context.running = true;
+    // From here the worker is not a "pre-exec" owner: an exit must release
+    // (verified) rather than abandon the reservation. Do not clear a newer
+    // generation's pending callback if this attachment completed late.
+    if (traexRuntimeLeaseContext === context && pendingTraexSpawnAbandon === localTraexSpawnAbandon) {
+      clearLocalTraexSpawnAbandon();
+    }
+    startTraexSpawnLeaseHeartbeat(context);
+  };
+  const traexRuntimeRelevant = effectiveCliId === 'traex' && !isRemoteBackendType(effectiveBackendType);
+  // Runtimes this worker does not exec itself: an adopted pane, a persistent
+  // reattach, or an already-running app-server. They are ALREADY alive, so they
+  // may be registered beside an occupant as unknown — but never authorize a
+  // parallel start, and are never killed or retargeted.
+  const traexExistingRuntime = traexRuntimeRelevant && (
+    cfg.adoptMode === true
+    || willReattachPersistent
+    || cfg.existingAppServerEndpoint !== undefined
+  );
+  // Wrapper/forge launches intentionally keep their pre-handoff behaviour.
+  // Their content cannot be proven before exec, so registering an unknown
+  // occupant would serialise all same-domain sessions without providing the
+  // version-safety guarantee this gate gives direct managed launches.
+  const traexGateExcluded = traexRuntimeRelevant && !traexLaunchUsesSharedRuntimeGate(cfg);
+  if (traexGateExcluded) {
+    log('[traex-runtime] wrapperCli/forge-traex launch excluded from the shared-cache gate');
+  }
+  const sharedRpcViewerLease = traexRuntimeRelevant
+    ? resolveTraexRpcViewerLease(cfg, codexRpcEngine, traexRpcLeaseContext)
+    : undefined;
+  if (sharedRpcViewerLease) {
+    // The app-server already admitted a frozen runtime. The --remote viewer is
+    // a second ATTACHMENT to that same reservation, never a new start against
+    // the mutable install entry (which may already name an incompatible B).
+    const viewer = await prepareTraexRpcViewerLease(sharedRpcViewerLease, () => {
+      if (closeRequested) return 'worker-closing';
+      if (spawnGeneration !== cliSpawnGeneration) return 'spawn-superseded';
+      return undefined;
+    });
+    if (closeRequested || spawnGeneration !== cliSpawnGeneration) {
+      await viewer.context.abandon();
+      throw new CliSpawnSupersededError();
+    }
+    traexSpawnLeaseContext = viewer.context;
+    traexRuntimeLeaseContext = viewer.context;
+    setLocalTraexSpawnAbandon(viewer.context.abandon);
+    cfg = { ...cfg, cliPathOverride: viewer.cliPathOverride };
+    cliAdapter = createAdapter();
+    traexConfiguredEntryAtSpawn = {
+      generation: cliSpawnGeneration,
+      ...viewer.configuredEntry,
+    };
+    traexLaunchTargetAtSpawn = {
+      generation: cliSpawnGeneration,
+      ...viewer.launchTarget,
+    };
+    traexLaunchHelperPath = viewer.helperPath;
+    log('[traex-runtime] viewer shares the RPC app-server snapshot and lease');
+  } else if (traexRuntimeRelevant && !traexGateExcluded) {
+    const fixedPath = typeof cfg.cliPathOverride === 'string' && cfg.cliPathOverride.trim().length > 0;
+    // Two different facts:
+    //   - configuredEntry: the UPDATABLE operator/PATH entry. It must keep its
+    //     last alias so the install watcher can observe `current -> B` later.
+    //   - resolvedEntry: the physical leaf now, used for the release layout,
+    //     snapshot materialisation and exec.
+    const configuredEntry = fixedPath
+      ? resolveCommandEntry(cfg.cliPathOverride!.trim())
+      : resolveCommandEntry('traex');
+    const resolvedEntry = resolveCommandReal(configuredEntry);
+    if (!isAbsolute(resolvedEntry) || !existsSync(resolvedEntry)) {
+      // Nothing can exec; let the existing launch preflight report the missing
+      // CLI instead of reserving a slot for a binary that does not exist.
+      log(`[traex-runtime] skipping gate: unresolved install entry ${resolvedEntry}`);
+    } else {
+      const workerStart = readProcessStartIdentity(process.pid);
+      const daemon = daemonBirthIdentity();
+      // The shared cache is decided by the FINAL child env, not the worker's
+      // ambient TRAE_HOME. `envUnset` can remove TRAE_HOME (the CLI then falls
+      // back to $HOME/.trae) and a per-bot `env.TRAE_HOME` reaches only the
+      // child. The gate must reserve exactly the domain the CLI will write.
+      const gateTraeHome = resolveTraexChildHome({
+        baseEnv: process.env,
+        envPolicy: cfg.envPolicy,
+        envUnset: cfg.envUnset,
+        perBotEnv: botInjectedEnv(cfg.env, cfg.envPolicy, cfg.protectedMcpPolicy),
+        mojoEnv: effectiveBackendType === 'mojo'
+          ? (riffBackendConfig as EffectiveMojoConfig | undefined)?.env
+          : undefined,
+      });
+      const common = {
+        traeHome: gateTraeHome,
+        releaseDir: releaseDirForExecutable(resolvedEntry),
+        workerPid: process.pid,
+        ...(workerStart ? { workerStart } : {}),
+        daemonPid: daemon.daemonPid,
+        ...(daemon.daemonStart ? { daemonStart: daemon.daemonStart } : {}),
+      };
+      const onBlocked = (blockers: TraexRuntimeBlocker[], detail: string): void => {
+        log(`[traex-runtime] waiting for an incompatible TRAE runtime: ${detail}`);
+        send({
+          type: 'traex_runtime_deferred',
+          blockers: blockers.map((blocker) => ({
+            occupantId: blocker.occupantId,
+            comboKey: blocker.comboKey,
+            phase: blocker.phase,
+            ...(blocker.fixedPath ? { fixedPath: true } : {}),
+            ...(blocker.pid !== undefined ? { pid: blocker.pid } : {}),
+          })),
+          detail,
+          ...(currentBotmuxTurnId ? { turnId: currentBotmuxTurnId } : {}),
+          ...(currentBotmuxDispatchAttempt !== undefined ? { dispatchAttempt: currentBotmuxDispatchAttempt } : {}),
+        });
+      };
+      const gateAbort = (): string | undefined => {
+        if (closeRequested) return 'worker-closing';
+        if (spawnGeneration !== cliSpawnGeneration) return 'spawn-superseded';
+        return undefined;
+      };
+      // An already-alive runtime may already have a proven TRAE pid. Recording
+      // it at registration (instead of only after the first attach) gives the
+      // registry a real process to prune and lets it inherit a known content
+      // identity. A launcher pid is never used: only the TRAE leaf writes the
+      // shared cache.
+      const knownExistingPid = traexExistingRuntime
+        ? (cfg.adoptMode === true ? cfg.adoptCliPid : backend?.getChildPid?.() ?? undefined)
+        : undefined;
+      const knownExistingStart = knownExistingPid !== undefined && isTraexProcess(knownExistingPid)
+        ? readProcessStartIdentity(knownExistingPid)
+        : undefined;
+      const knownExisting = knownExistingPid !== undefined && isTraexProcess(knownExistingPid)
+        ? { cliPid: knownExistingPid, ...(knownExistingStart ? { cliStart: knownExistingStart } : {}) }
+        : undefined;
+      const gate = traexExistingRuntime
+        // Already alive: register as unknown beside an occupant, never authorize
+        // a parallel start.
+        ? await acquireTraexRuntimeOccupancy({
+            ...common,
+            ...(knownExisting ?? {}),
+            fixedPath,
+            existingRuntime: true,
+            coordinate: !scratchRequested,
+            abort: gateAbort,
+          })
+        : await acquireTraexRuntimeLease({
+            ...common,
+            // Re-resolved on every wait iteration so A→B→C is observed rather
+            // than frozen to the release that was current when we arrived.
+            entryPath: configuredEntry,
+            fixedPath,
+            ...(fixedPath ? { fixedExecutablePath: resolvedEntry } : {}),
+            // Always exec a frozen copy — including pinned and sandboxed
+            // launches. A pinned config stays untouched; only the runtime
+            // object is frozen so a switch between materialisation and exec
+            // cannot make this process load content it never registered.
+            materialize: true,
+            // Scratch is a session-private COW home: no cross-process domain.
+            coordinate: !scratchRequested,
+            waitMs: Number.POSITIVE_INFINITY,
+            pollMs: 500,
+            abort: gateAbort,
+            onBlocked,
+          });
+      if (gate.kind === 'aborted') throw new CliSpawnSupersededError();
+      if (gate.kind === 'granted' && (closeRequested || spawnGeneration !== cliSpawnGeneration)) {
+        // killCli may have won between the gate's final read and this await's
+        // continuation, before pendingTraexSpawnAbandon could be installed.
+        await gate.lease.abandon();
+        throw new CliSpawnSupersededError();
+      }
+      if (gate.kind === 'blocked') {
+        throw new Error(`TRAE runtime gate stayed blocked: ${gate.detail}`);
+      }
+      if (gate.kind === 'error') {
+        throw new Error(`TRAE runtime gate refused the start (${gate.reason})${gate.detail ? `: ${gate.detail}` : ''}`);
+      }
+      traexSpawnLeaseContext = createTraexSpawnLeaseContext(gate.lease);
+      traexRuntimeLeaseContext = traexSpawnLeaseContext;
+      setLocalTraexSpawnAbandon(traexSpawnLeaseContext.abandon);
+      if (!gate.lease.occupancyOnly) {
+        // Configured entry (the mutable path the operator/bot selected) and
+        // the frozen object this generation will exec are DIFFERENT facts:
+        // the install watcher compares the former across time, while the
+        // attestation proves the latter is what the process runs.
+        traexConfiguredEntryAtSpawn = {
+          generation: cliSpawnGeneration,
+          entry: configuredEntry,
+          // The source observation captured together with the frozen content.
+          // Re-statting the mutable entry here would let an A→B switch between
+          // the lease and attestation label the running A snapshot as "B".
+          identity: gate.lease.snapshot.sourceInstallIdentity ?? resolveInstallIdentity(configuredEntry),
+        };
+        traexLaunchTargetAtSpawn = {
+          generation: cliSpawnGeneration,
+          path: gate.lease.snapshot.traexPath,
+          identity: resolveInstallIdentity(gate.lease.snapshot.traexPath),
+          comboKey: gate.lease.snapshot.comboKey,
+          ...(gate.lease.snapshot.snapshot ? { snapshotDir: gate.lease.snapshot.dir } : {}),
+          ...(gate.lease.snapshot.helperPath ? { helperPath: gate.lease.snapshot.helperPath } : {}),
+        };
+        traexLaunchHelperPath = gate.lease.snapshot.helperPath;
+      } else {
+        // Adopt/reattach: the configured entry is still the thing the install
+        // watcher should follow, but there is no frozen launch target to prove.
+        traexConfiguredEntryAtSpawn = {
+          generation: cliSpawnGeneration,
+          entry: configuredEntry,
+          identity: resolveInstallIdentity(configuredEntry),
+        };
+        traexLaunchTargetAtSpawn = undefined;
+        traexLaunchHelperPath = undefined;
+      }
+      if (gate.lease.snapshot.snapshot) {
+        // Exec the verified private copy instead of the mutable install entry.
+        // For a pinned runtime the operator's config is not rewritten; only
+        // this process's launch object is overridden.
+        cfg = { ...cfg, cliPathOverride: gate.lease.snapshot.traexPath };
+        cliAdapter = createAdapter();
+      }
+      log(
+        `[traex-runtime] admitted content ${gate.lease.snapshot.comboKey.slice(0, 12) || 'unknown'} `
+        + `(${gate.lease.occupancyOnly ? 'occupancy-only' : gate.lease.snapshot.snapshot ? (fixedPath ? 'pinned-snapshot' : 'snapshot') : 'direct'})`,
+      );
+    }
+  }
+
   // The worker establishes trust before any runner output can be parsed. A
   // fresh runner gets a new capability; a persistent reattach reloads the
   // capability created by that same runner generation.
@@ -38724,6 +39633,12 @@ async function spawnCliBody(
   // namespaced BOTMUX_LARK_APP_ID injected below; the worker keeps its own
   // bare creds (forkWorker) for lark-upload. See utils/child-env.ts.
   const childEnv = buildSessionChildEnv(process.env, cfg.envPolicy, cfg.envUnset, cfg.protectedMcpPolicy);
+  // Pair the CLI with the helper from the SAME frozen release. Without this
+  // the CLI may lazily locate a helper next to the mutable install entry,
+  // which can already be the next version.
+  if (traexLaunchHelperPath) childEnv.TRAEX_CODE_MODE_HOST_PATH = traexLaunchHelperPath;
+  else delete childEnv.TRAEX_CODE_MODE_HOST_PATH;
+  applyTraexRuntimeOwnershipEnv(childEnv, traexSpawnLeaseContext?.lease);
   delete childEnv[PROTECTED_HTTP_EGRESS_SOCKET_ENV];
   delete childEnv[PROTECTED_HTTP_EGRESS_PROTOCOL_ENV];
   // Older callers interpret this retired flag as a required socket contract.
@@ -40273,6 +41188,7 @@ async function spawnCliBody(
         cliBin: sandboxWrapperLaunch?.bin ?? cliAdapter.resolvedBin,
         cliArgs: sandboxWrapperLaunch?.args ?? args,
         denyPaths: scratchDeny,
+        readOnlyPaths: traexSpawnLeaseContext?.lease.snapshot.snapshot ? [traexSpawnLeaseContext.lease.snapshot.dir] : [],
         mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath,
         net: spawnNetworkShape.netEnabled,
       });
@@ -41138,6 +42054,12 @@ async function spawnCliBody(
     }
     const spawnBackend = backend;
     const spawnCliBin = cliAdapter.resolvedBin;
+    if (spawnGeneration !== cliSpawnGeneration) {
+      // The reservation belongs to a superseded generation; drop it before it
+      // can exec anything, then let the caller treat this as a normal abort.
+      await localTraexSpawnAbandon?.();
+      throw new CliSpawnSupersededError();
+    }
     let spawnedAntigravityAccountReport: { accountId: string } | undefined;
     let antigravitySpawnStoreOptions: AntigravityAccountStoreOptions | undefined;
     if (cfg.cliId === 'antigravity' && !cfg.adoptMode && !isRemoteBackendType(effectiveBackendType)) {
@@ -41174,8 +42096,16 @@ async function spawnCliBody(
       publish: send,
       spawn: () => {
         const backend = spawnBackend;
-        if (cfg.cliId === 'traex') {
-          traexInstallAtSpawn = { generation: cliSpawnGeneration, identity: resolveInstallIdentity(spawnCliBin) };
+        if (cfg.cliId === 'traex' && traexGateExcluded) {
+          // Preserve the pre-handoff install observation for wrapper/forge:
+          // they skip only the shared-domain lease, not #3252's install watch.
+          traexConfiguredEntryAtSpawn = {
+            generation: cliSpawnGeneration,
+            entry: spawnCliBin,
+            identity: resolveInstallIdentity(spawnCliBin),
+          };
+          traexLaunchTargetAtSpawn = undefined;
+          traexLaunchHelperPath = undefined;
         }
         if (credentialOnlyBwrap && !sandboxRequested && !!cfg.wrapperCli?.trim() && !!claudeDataDir) {
           // The running CLI must be compared with the install object that was
@@ -41252,6 +42182,12 @@ async function spawnCliBody(
       }
     }
   } catch (err) {
+    // A failed launch either never exec'd (drop the reservation) or already
+    // produced a backend child (keep it, and let the verified exit path release
+    // it). Never abandon a pid that may be writing the shared cache.
+    const spawnedPid = backend?.getChildPid?.();
+    if (spawnedPid) attachTraexLeaseCli(spawnedPid);
+    else await localTraexSpawnAbandon?.();
     cleanupCodexAppControlBootstrap();
     programStatusRelayPlanCleanup?.();
     if (!willReattachPersistent && sandboxTreeOutlivesPane) {
@@ -41469,6 +42405,10 @@ async function spawnCliBody(
   // can verify they were spawned inside a botmux session by walking the
   // process tree and looking for a matching pid file in this directory.
   const cliPid = backend.getChildPid?.();
+  // The gate reservation became a real runtime the moment the backend child
+  // exists; attach it before any other post-spawn bookkeeping so a crash in
+  // between still leaves a `running` record (never a silent `starting` leak).
+  if (cliPid) attachTraexLeaseCli(cliPid);
   // A re-attached pane keeps the prompt it was launched with; follow it rather
   // than this init's delivery (a daemon upgrade or config edit since then).
   if (actuallyReattachedPersistent && !cfg.adoptMode) {
@@ -41545,6 +42485,9 @@ async function spawnCliBody(
       if (typeof refreshActiveRuntimeContract === 'function') refreshActiveRuntimeContract();
       return false;
     }
+    // Keep the shared-cache reservation pointing at the process that actually
+    // runs TRAE, not a launcher layer that may exit before the CLI does.
+    if (cfg.cliId === 'traex') attachTraexLeaseCli(realPid);
     return published;
   };
   const readStablePanePid = (): number | null | undefined => {
@@ -41986,6 +42929,7 @@ async function spawnCliBody(
         bridgeCliPid = realPid;
         if (typeof refreshActiveRuntimeContract === 'function') refreshActiveRuntimeContract();
         publishLocalProcessAttestation(realPid);
+        attachTraexLeaseCli(realPid);
       },
       schedule: (fn, ms) => { setTimeout(fn, ms); },
     });
@@ -42093,6 +43037,9 @@ async function spawnCliBody(
       if (latePidExpired()) return;
       if (pid) {
         publishLocalProcessAttestation(pid);
+        // Backends that fork their pane asynchronously only expose the CLI pid
+        // here; the gate reservation must not stay `starting` once it exists.
+        if (cfg.cliId === 'traex') attachTraexLeaseCli(pid);
         if (process.env.SESSION_DATA_DIR && !cliPidMarker) {
           try {
             const markersDir = join(process.env.SESSION_DATA_DIR, '.botmux-cli-pids');
@@ -42715,6 +43662,10 @@ async function spawnCliBody(
   }, args => ({ turnId: args[0].turnId, origin: args[1]?.sessionOrigin })));
   backend.onTurnRecovered?.(bindSessionExecutionEvent(async (turn) => {
     if (fatalWorkerErrorPending || backend !== observedBackend) return;
+    if (cancelledQueuedTurnIds.has(turn.turnId)) {
+      log(`Ignored tombstoned recovered remote turn ${turn.turnId.substring(0, 12)}`);
+      return;
+    }
     try {
       if (currentBotmuxTurnId && currentBotmuxTurnId !== turn.turnId) {
         const canAdoptOverUnstartedInit = typeof shouldAdoptPidMarkerWithoutRetiringCurrent === 'function'
@@ -42739,6 +43690,13 @@ async function spawnCliBody(
       setCaptureIdentity(turn.turnId, turn.dispatchAttempt);
       if (turn.dispatchAttempt !== undefined) durableTurnInFlight = true;
       remoteRunnerRecoveredTurnInFlight = true;
+      // Publish the recovery identity before the first await so a cancellation
+      // during host-context restoration fails closed instead of reporting a
+      // merely queued opening.
+      remoteRunnerRecoveredTurnIdentity = {
+        turnId: turn.turnId,
+        ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
+      };
       const restoredLinkRefMode = await restoreLinkRefModeThroughHost({
         turnId: turn.turnId,
         ...(turn.dispatchAttempt !== undefined
@@ -42746,6 +43704,10 @@ async function spawnCliBody(
           : {}),
       });
       if (fatalWorkerErrorPending || backend !== observedBackend) return;
+      if (cancelledQueuedTurnIds.has(turn.turnId)) {
+        log(`Ignored recovered remote turn cancelled during host restore ${turn.turnId.substring(0, 12)}`);
+        return;
+      }
       if (!observedBackend.setRecoveredTurnHostContext?.(
         turn.turnId,
         { ...(restoredLinkRefMode ? { linkRefMode: restoredLinkRefMode } : {}), sessionOrigin: workerSessionEventScope?.origin(turn.turnId, turn.dispatchAttempt) },
@@ -42772,10 +43734,6 @@ async function spawnCliBody(
           ? true
           : undefined,
       );
-      remoteRunnerRecoveredTurnIdentity = {
-        turnId: turn.turnId,
-        ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
-      };
       workerSessionEventScope?.recordSubmission(turn.turnId, turn.dispatchAttempt);
       const recoveredQueue = reconcileRemoteRecoveredTurnQueue(
         pendingMessages,
@@ -42802,6 +43760,10 @@ async function spawnCliBody(
         + `generation=${turn.generation} attempt=${turn.dispatchAttempt ?? '-'}`,
       );
     } catch (error) {
+      if (cancelledQueuedTurnIds.has(turn.turnId)) {
+        log(`Ignored failed host restore for tombstoned remote turn ${turn.turnId.substring(0, 12)}`);
+        return;
+      }
       log(
         `Refused recovered remote turn ${turn.turnId.substring(0, 12)}: `
         + `${error instanceof Error ? error.message : String(error)}`,
@@ -42883,6 +43845,17 @@ async function spawnCliBody(
     restoreHerdrWebBindings();
   }
   backend.onExit(bindSessionBackendExit((code, signal) => {
+    // Settle this spawn's TRAE domain reservation before any other exit logic:
+    // a running CLI is released only once its pid is proven gone; a lease that
+    // never reached markRunning is abandoned (no CLI was ever exec'd).
+    // Settle ONLY this spawn's captured reservation. A delayed exit may run
+    // after a replacement has installed its own module-current context.
+    const exitLeaseContext = traexSpawnLeaseContext;
+    if (exitLeaseContext) {
+      void settleTraexSpawnLease(exitLeaseContext).catch((err) => {
+        log(`[traex-runtime] lease settlement failed: ${err instanceof Error ? err.message : String(err)}`);
+      });
+    }
     const intentionalRestart = intentionalRestartBackend === observedBackend;
     if (intentionalRestart) intentionalRestartBackend = null;
     // destroySession()/kill() may report exit after the 500ms replacement spawn
@@ -43506,6 +44479,13 @@ function killCli(opts: {
   // remaining cleanup is synchronous today, but generation ownership must not
   // depend on that implementation detail.
   cliSpawnGeneration++;
+  // A TRAE start that reserved the shared-cache domain but has not exec'd yet
+  // must not leave a permanent `starting` occupancy behind.
+  stopTraexLeaseHeartbeat();
+  const abandon = pendingTraexSpawnAbandon;
+  if (abandon) void abandon().catch(err => {
+    log(`[traex-runtime] lease abandonment failed: ${err instanceof Error ? err.message : String(err)}`);
+  });
   cliGenerationTurnWrites = 0;
   submitFailureChains?.clear?.();
   inputDeliveryEvidence?.clear?.();
@@ -43879,6 +44859,11 @@ async function restartCliProcess(
           `restart teardown not proven: ${teardownVerdict.reason ?? 'unknown'}`,
         ));
         return;
+      }
+      const abandon = pendingTraexSpawnAbandon;
+      if (abandon) {
+        try { await abandon(); }
+        catch (err) { log(`[traex-runtime] lease abandonment failed before restart: ${err instanceof Error ? err.message : String(err)}`); }
       }
       stopOwnedSessionScope('restart');
       killCli({
@@ -48799,15 +49784,25 @@ function publishLocalProcessAttestation(
   const cliExe = lastInitConfig?.cliId === 'traex' && cliPid && isTraexProcess(cliPid)
     ? readRunningExeIdentity(cliPid, cliProcStart)
     : undefined;
-  // The install entry this worker's adapter resolved at spawn. The daemon
-  // re-resolves it later to detect a replacement under the running process;
-  // this worker never re-runs a version probe for it.
+  // The configured install entry this worker was launched from. After the
+  // runtime gate rewrites `cliPathOverride` to a frozen snapshot, the adapter's
+  // `resolvedBin` names that snapshot — which is NOT the mutable install the
+  // daemon must watch. Prefer the gate-recorded configured entry for the
+  // current spawn; fall back to the adapter only when no gate ran (unresolved
+  // entry, where the launch fails and no reclaim can be authorized anyway).
+  const configuredAtSpawn = traexConfiguredEntryAtSpawn?.generation === cliSpawnGeneration
+    ? traexConfiguredEntryAtSpawn
+    : undefined;
   const cliInstallEntry = lastInitConfig?.cliId === 'traex'
-    ? cliAdapter?.resolvedBin
+    ? (configuredAtSpawn?.entry ?? cliAdapter?.resolvedBin)
     : undefined;
   // An earlier spawn's observation says nothing about the current process.
-  const cliInstallAtSpawn = cliInstallEntry && traexInstallAtSpawn?.generation === cliSpawnGeneration
-    ? traexInstallAtSpawn.identity
+  const cliInstallAtSpawn = cliInstallEntry ? configuredAtSpawn?.identity : undefined;
+  // The exact object this generation exec'd (frozen copy / pinned path). The
+  // daemon compares the leaf's kernel-reported image against this, so a source
+  // switch after materialisation can never be relabelled as "the same version".
+  const launchTarget = traexLaunchTargetAtSpawn?.generation === cliSpawnGeneration
+    ? traexLaunchTargetAtSpawn
     : undefined;
   const statuslineLaunchGen = statuslineLaunchGenAtSpawn?.generation === cliSpawnGeneration
     ? statuslineLaunchGenAtSpawn?.token
@@ -48821,6 +49816,12 @@ function publishLocalProcessAttestation(
     ...(cliExe ? { cliExe } : {}),
     ...(cliInstallEntry ? { cliInstallEntry } : {}),
     ...(cliInstallAtSpawn ? { cliInstallAtSpawn } : {}),
+    ...(launchTarget ? {
+      cliLaunchTarget: launchTarget.path,
+      ...(launchTarget.identity ? { cliLaunchTargetIdentity: launchTarget.identity } : {}),
+      cliLaunchComboKey: launchTarget.comboKey,
+      ...(launchTarget.snapshotDir ? { cliSnapshotDir: launchTarget.snapshotDir } : {}),
+    } : {}),
     cliSpawnGeneration,
     ...(statuslineLaunchGen ? { statuslineLaunchGen } : {}),
     ...(opts.statuslineReattach ? { statuslineReattach: true } : {}),
@@ -48943,6 +49944,7 @@ async function sendFatalWorkerErrorAndExit(
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
   });
   log('Fatal worker error delivered; exiting process');
+  if (await stopOwnedProcessesForTraexSettlement()) await settleTraexLeasesForShutdown();
   if (opts.hardExit) {
     // A fail-closed Codex App generation must produce a real OS-level worker
     // exit so the daemon can arm its worker-generation receipt fence. On some
@@ -49541,7 +50543,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         //  - RPC RESUME: queuePrompt=true → queue for post-ready flush (bridge
         //    marked at flush time, P0-1).
         const recoveredAcceptedEntries = codexAppRecoveredDispatches
-          .filter(entry => entry.state === 'accepted');
+          .filter(entry => entry.state === 'accepted' && !cancelledQueuedTurnIds.has(entry.turnId));
         const recoveredAcceptedInputs = recoveredAcceptedEntries
           .map(entry => ({
             content: entry.content,
@@ -49565,16 +50567,25 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         const initialNativeSessionTitle = msg.nativeSessionTitle;
         const initialNativeSessionTitlePrompt = msg.nativeSessionTitlePrompt;
         // Received before this init's own prompt, so they go ahead of it.
-        const predecessorUnsentInputs = takeUnsentInputsFromPredecessor(msg).filter(entry => !(
-          msg.reconcileQueuedActivation
-          && entry.turnId === msg.reconcileQueuedActivation.turnId
-          && entry.dispatchAttempt === msg.reconcileQueuedActivation.dispatchAttempt
+        const predecessorUnsentInputs = takeUnsentInputsFromPredecessor(msg).filter(entry => (
+          (!entry.turnId || !cancelledQueuedTurnIds.has(entry.turnId))
+          && !(msg.reconcileQueuedActivation
+            && entry.turnId === msg.reconcileQueuedActivation.turnId
+            && entry.dispatchAttempt === msg.reconcileQueuedActivation.dispatchAttempt)
         ));
         let initialInputCommitted = false;
         let initialInputQueued = false;
+        const initialTurnCancelled = [msg.turnId, msg.reconcileQueuedActivation?.turnId]
+          .some(turnId => !!turnId && cancelledQueuedTurnIds.has(turnId));
+        if (initialTurnCancelled && isCodexAppCliId(msg.cliId)) {
+          // The cancelled opening may be discarded, but unrelated accepted
+          // predecessors retain their exact turn identities and FIFO order.
+          pendingMessages.unshift(...recoveredAcceptedInputs);
+        }
         let reconciledInitActivationToken: string | undefined;
         const remoteRunnerRecoveredInitTurn = Boolean(
-          remoteRunnerRecoveredTurnIdentity
+          !initialTurnCancelled
+          && remoteRunnerRecoveredTurnIdentity
           && msg.turnId
           && remoteRunnerRecoveredTurnIdentity.turnId === msg.turnId
           && remoteRunnerRecoveredTurnIdentity.dispatchAttempt === msg.dispatchAttempt,
@@ -49584,7 +50595,8 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
           initialInputCommitted = true;
           reconciledInitActivationToken = msg.queuedActivationToken;
         } else if (
-          lastSpawnPersistentReattach
+          !initialTurnCancelled
+          && lastSpawnPersistentReattach
           && !msg.resume
           && msg.prompt
           && !codexRpcEngine
@@ -49644,7 +50656,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
           || (activeTurnAuthority.snapshot()?.started === true
             && activeTurnAuthority.snapshot()?.turnId !== msg.turnId)
         );
-        if (!remoteRunnerRecoveredInitTurn && !durableArgvReattachSettled && shouldQueueInitialPrompt({
+        if (!initialTurnCancelled && !remoteRunnerRecoveredInitTurn && !durableArgvReattachSettled && shouldQueueInitialPrompt({
           hasPrompt: !!msg.prompt,
           rpcEngineActive: !!codexRpcEngine,
           queuePrompt: rpcDecision.queuePrompt,
@@ -49694,9 +50706,9 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
           initialInputCommitted = true;
           coalescePendingScheduledInputs();
           initialInputQueued = true;
-        } else if (isCodexAppCliId(msg.cliId)) {
+        } else if (!initialTurnCancelled && isCodexAppCliId(msg.cliId)) {
           pendingMessages.unshift(...recoveredAcceptedInputs);
-        } else if (!remoteRunnerRecoveredInitTurn && !durableArgvReattachSettled && msg.prompt) {
+        } else if (!initialTurnCancelled && !remoteRunnerRecoveredInitTurn && !durableArgvReattachSettled && msg.prompt) {
           // A successful spawn with a non-queued prompt means the adapter baked
           // it into argv or the RPC engine already accepted it. Cold-start argv
           // execution start is published via pendingTurnExecutionStart once the
@@ -49877,7 +50889,8 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         }
         // No queued opening prompt to keep them behind: they lead the queue.
         if (predecessorUnsentInputs.length > 0) {
-          pendingMessages.unshift(...predecessorUnsentInputs);
+          pendingMessages.unshift(...predecessorUnsentInputs
+            .filter(item => !item.turnId || !cancelledQueuedTurnIds.has(item.turnId)));
           coalescePendingScheduledInputs();
         }
         // The first turn is now either at queue head or already owned by the
@@ -49903,6 +50916,12 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
           );
         }
         initPromptMaterialized = true;
+        for (const item of pendingMessages) {
+          if (turnInputCommitDeferredForMaterialization.delete(item)
+            && !deferTurnInputCommitUntilSubmission(item.dispatchAttempt, item.durablePrimaryInbox)) {
+            acknowledgeTurnInputCommitted(item.turnId, item.dispatchAttempt, item.durablePrimaryInbox);
+          }
+        }
 
         // A backend may become prompt-ready before spawnCli() returns. The
         // initial prompt is queued only afterwards, so the earlier
@@ -49932,7 +50951,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
           ? msg.queuedActivationToken
           : (reconciledInitActivationToken ?? (typeof spawnCliReconciledActivationToken === 'string' ? spawnCliReconciledActivationToken : undefined));
         spawnCliReconciledActivationToken = undefined;
-        if (msg.reconcileQueuedActivation?.evidenceRequired && msg.queuedActivationToken) {
+        if (!initialTurnCancelled && msg.reconcileQueuedActivation?.evidenceRequired && msg.queuedActivationToken) {
           const item: PendingCliInput = {
             content: msg.reconcileQueuedActivation.submittedText ?? '',
             turnId: msg.reconcileQueuedActivation.turnId,
@@ -49943,7 +50962,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
             ...(msg.nativeSessionTitle ? { nativeSessionTitle: msg.nativeSessionTitle } : {}),
           };
           observeUnconfirmedQueuedActivation(item);
-        } else if (postInitReconcileToken) {
+        } else if (!initialTurnCancelled && postInitReconcileToken) {
           acknowledgeQueuedActivationToken(postInitReconcileToken, msg.sessionId);
         }
       } catch (err: any) {
@@ -50089,7 +51108,10 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         // spawn as superseded), so it must not stay behind queueing input.
         const closeUnderWay = closeRequested;
         if (!closeUnderWay) retiredRuntimeBackend = backend;
-        closeRequested = true; stopBridgeWatcher(); stopScreenshotLoop(); killCli();
+        closeRequested = true;
+        const processesStopped = await stopOwnedProcessesForTraexSettlement({ destroyBackend: false });
+        stopBridgeWatcher(); stopScreenshotLoop(); killCli();
+        if (processesStopped) await settleTraexLeasesForShutdown();
         if (!closeUnderWay) armRetiredRuntimeExit(msg.bindingId);
       } else if (continuation) void flushPending();
       // The host decided which restored executions this binding may observe;
@@ -50363,7 +51385,8 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
             // could not be queued leaves the original continuation eligible.
             if (!msg.purgeUndersizedImages && !msg.purgeToolImages
               && msg.turnId !== activeTranscriptImagePurge?.turnId) activeTranscriptImagePurge?.cancel();
-            if (!deferTurnInputCommitUntilSubmission(
+            const commitDeferred = !initPromptMaterialized;
+            if (!commitDeferred && !deferTurnInputCommitUntilSubmission(
               msg.dispatchAttempt,
               msg.durablePrimaryInbox,
             )) {
@@ -51410,6 +52433,11 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       break;
     }
 
+    case 'cancel_queued_turn': {
+      handleQueuedTurnCancel(msg.requestId, msg.turnId);
+      break;
+    }
+
     case 'interrupt_turn': {
       cliInterruptGeneration++;
       if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
@@ -51558,7 +52586,6 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       stopScreenshotLoop();
       stopBridgeWatcher();
       stopCodexBridge();
-      const closeRpcEngine = codexRpcEngine;
       // Local close destroys persistent owned sessions. Remote backends never
       // reach here: the branch above fences them all (request-less remote close
       // is refused; with a requestId it goes through prepare/commit), so
@@ -51572,10 +52599,9 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         try { await Promise.race([closeTeardown, new Promise((r) => setTimeout(r, 22_000))]); }
         catch { /* logged by backend */ }
       }
-      try {
-        await closeRpcEngine?.stopAndWait();
-      } catch (error) {
-        log(`Local close RPC teardown failed: ${String(error)}`);
+      const closeRpcStopped = await stopCodexRpcEngine();
+      if (!closeRpcStopped) {
+        log('Local close RPC teardown could not prove process death');
         process.exit(1);
         return;
       }
@@ -51592,6 +52618,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       // interrupted turn can be restored), but a real close tears down the
       // session — purge both so a future re-use of the same sessionId starts
       // clean.
+      await settleTraexLeasesForShutdown();
       clearSendMarkers();
       clearBridgeTurnJournalFile();
       cleanup();
@@ -51614,6 +52641,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       // asking for this detach, so no in-flight turn is cut here. Relaxing that
       // gate would need preserveCliPidMarker here too.
       killCli({ preserveSandbox: true });
+      await settleTraexLeasesForShutdown();
       cleanup();
       await flushTransferDetachAck(msg.requestId);
       // NOTE: process.exit(0) can wedge in node-pty's native teardown when a
@@ -51864,14 +52892,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       // that rebuilds context from the on-disk transcript (same path the daemon
       // uses to recover sessions after a reboot kills the tmux server).
       revokeManagedTurnOriginForRestart();
-      try {
-        // mojo：suspend 语义是「休眠待续」——绝不能 cancel 远端会话（血缘已持久化，
-        // 恢复时 follow-up 续上）；只断流 detach。mojo 本来就没有常驻本地进程，
-        // destroySession 想省的那份 CLI 内存并不存在。
-        // riff 已在本 case 开头被直接拒绝（需 prepare/commit），所以这里只剩 mojo。
-        if (isRemoteBackendType(effectiveBackendType)) backend?.kill();
-        else (backend?.destroySession ?? backend?.kill)?.call(backend);
-      } catch { /* best-effort */ }
+      const processesStopped = await stopOwnedProcessesForTraexSettlement();
       stopOwnedSessionScope('suspend');
       backend = null;
       if (typeof traexStartupWebRecheck !== 'undefined' && traexStartupWebRecheck) { clearTimeout(traexStartupWebRecheck); traexStartupWebRecheck = undefined; }
@@ -51890,6 +52911,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } sandboxStopWatcher = null; }
       sandboxCleanup = null;           // drop the ref WITHOUT calling it (keep the tree)
       sandboxTeardownDone = true;      // make the process.on('exit') hook a no-op
+      if (processesStopped) await settleTraexLeasesForShutdown();
       cleanup();
       process.exit(0);
     }
@@ -51963,11 +52985,13 @@ function dispatchDaemonMessage(raw: unknown, handle: unknown): unknown {
       log(`Rejected ${msg.type}: ${admission.reason}`);
       const target = msg.sessionCommand?.runtime ? workerSessionEventScope.bindingForRuntime(msg.sessionCommand.runtime) : binding;
       const reject = () => {
+        if (msg.type === 'cancel_queued_turn') send({ type: 'queued_turn_cancel_result', requestId: msg.requestId, turnId: msg.turnId, status: 'restart_required' });
         if (msg.type === 'interrupt_turn') send({ type: 'turn_interrupt_result', requestId: msg.requestId, turnId: msg.turnId, delivered: false, reason: 'stale_turn' });
         if (msg.type === 'codex_app_interrupt') send({ type: 'codex_app_interrupt_result', requestId: msg.requestId, status: 'stale_turn' });
         if (msg.type === 'restart' && msg.attemptId) send({ type: 'restart_result', attemptId: msg.attemptId, status: 'failed', category: 'spawn_failed', untouched: true });
       };
       if (target) workerSessionEventScope.run(target, reject, msg.sessionCommand?.execution, msg.sessionCommand?.operationId);
+      else if (msg.type === 'cancel_queued_turn') reject();
       return;
     }
   }
@@ -52071,11 +53095,13 @@ async function shutdownWorkerForParentExitImpl(reason: string, exitCode = 0): Pr
       log(`Preserving the sandbox relay outbox for the surviving remote TUI during ${reason}`);
       sandboxCleanup = null;
     }
+    await settleTraexLeasesForShutdown();
     cleanup();
     process.exit(exitCode);
     return;
   }
-  await codexRpcEngine?.stopAndWait();
+  const rpcEngineWasEngaged = !!codexRpcEngine;
+  await stopCodexRpcEngine();
   // A persistent sandboxed pane (oncall / scratch / credential-only) survives
   // this exit (backend.kill() only detaches) and still runs against its
   // per-session tree: the relay outbox is bound into it by inode, and a scratch
@@ -52097,12 +53123,13 @@ async function shutdownWorkerForParentExitImpl(reason: string, exitCode = 0): Pr
     cliRunning: backend !== null,
     adoptMode: !!lastInitConfig?.adoptMode,
     codexApp: isCodexAppCliId(lastInitConfig?.cliId),
-    rpcEngineEngaged: !!codexRpcEngine,
+    rpcEngineEngaged: rpcEngineWasEngaged,
   });
   if (preserveCliPidMarker && currentBotmuxTurnId) {
     log(`Leaving executing turn ${currentBotmuxTurnId.slice(0, 12)} in the CLI PID marker for the successor worker (${reason})`);
   }
   killCli({ preserveSandbox, preserveCliPidMarker });
+  await settleTraexLeasesForShutdown();
   cleanup();
   process.exit(exitCode);
 }

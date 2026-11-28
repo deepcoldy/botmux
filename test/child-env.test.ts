@@ -641,6 +641,9 @@ describe('scrubSessionTurnMarkerEnv()', () => {
       BOTMUX_SEND_RELAY: '/tmp/relay',
       BOTMUX_MCP_GATEWAY_SOCKET: '/tmp/mcp.sock',
       BOTMUX_DAEMON_IPC_PORT: '7951',
+      // A daemon restarted from a CLI shell must not pass the old Bot's
+      // one-shot default to a different Pi session with no saved level.
+      BOTMUX_PI_RESUME_FALLBACK_THINKING: 'xhigh',
       BOTMUX_OWNER_OPEN_ID: 'ou_x',
       IS_SANDBOX: '1',
       CLAUDE_CONFIG_DIR: '/leak/claude',

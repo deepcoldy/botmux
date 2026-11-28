@@ -21,6 +21,7 @@ import {
   type TraexLeafProbes,
 } from '../src/core/traex-leaf-pid.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { isObserveBackend } from '../src/adapters/backend/types.js';
 
 const ROOT = 100;
 const LEAF = 200;
@@ -168,6 +169,9 @@ function makeWorkerFixture(options: {
         },
       }),
     publishLocalProcessAttestation: vi.fn((_pid: number) => true),
+    // The PR's shared-cache lease is attached from the same ownership rewiring
+    // this harness slices; the real closure lives outside the sliced boundary.
+    attachTraexLeaseCli: vi.fn((_pid: number) => {}),
     observeCursorCliSessionId: vi.fn(),
     observeAntigravityCliSessionId: vi.fn(),
     observeZcodeCliSessionId: vi.fn(),
@@ -477,5 +481,321 @@ describe('TRAE launcher adversarial lifecycle probes', () => {
     expect(fixture.scope.publishLocalProcessAttestation.mock.calls.every(
       ([pid]: [number]) => pid === ROOT,
     )).toBe(true);
+  });
+});
+
+describe('TraeX lease lifecycle', () => {
+  function leaseHarness(lease: any) {
+    const scope: Record<string, any> = {
+      traexRuntimeLeaseContext: undefined,
+      traexSpawnLeaseContext: undefined,
+      traexLeaseSettlements: new Set(),
+      pendingTraexSpawnAbandon: undefined,
+      log: vi.fn(),
+    };
+    scope.stopTraexLeaseHeartbeat = loadWorkerFunction('stopTraexLeaseHeartbeat', scope);
+    scope.startTraexSpawnLeaseHeartbeat = loadWorkerFunction('startTraexSpawnLeaseHeartbeat', scope);
+    scope.settleTraexSpawnLease = loadWorkerFunction('settleTraexSpawnLease', scope);
+    const create = loadWorkerFunction<(lease: any) => any>('createTraexSpawnLeaseContext', scope);
+    const context = create(lease);
+    scope.traexRuntimeLeaseContext = context;
+    scope.traexSpawnLeaseContext = context;
+    scope.pendingTraexSpawnAbandon = context.abandon;
+    return { scope, context };
+  }
+
+  it('does not destroy a persistent backend when retirement only detaches it', async () => {
+    const destroySession = vi.fn();
+    const kill = vi.fn();
+    const scope: Record<string, any> = {
+      backend: { destroySession, kill, getChildPid: () => null },
+      effectiveBackendType: 'tmux',
+      stopCodexRpcEngine: vi.fn(async () => true),
+    };
+    const stop = loadWorkerFunction<(opts?: { destroyBackend?: boolean }) => Promise<boolean>>('stopOwnedProcessesForTraexSettlement', scope);
+    await expect(stop({ destroyBackend: false })).resolves.toBe(true);
+    expect(destroySession).not.toHaveBeenCalled();
+    expect(kill).not.toHaveBeenCalled();
+  });
+
+  it('does not let a superseded spawn catch abandon the newer generation lease', async () => {
+    const oldAbandon = vi.fn(async () => {});
+    const newAbandon = vi.fn(async () => {});
+    const scope: Record<string, any> = {
+      closeRequested: false,
+      workerSessionEventScope: undefined,
+      pendingTraexSpawnAbandon: undefined,
+      log: vi.fn(),
+    };
+    scope.spawnCliBody = vi.fn(async (_cfg: any, opts: any) => {
+      // The old body owns oldAbandon. Before its rejection reaches the outer
+      // catch, a replacement installs newAbandon in the module-global slot.
+      if (opts.traexSpawnAbandonRef) opts.traexSpawnAbandonRef.current = oldAbandon;
+      scope.pendingTraexSpawnAbandon = newAbandon;
+      throw new Error('old generation failed');
+    });
+    const spawn = loadWorkerFunction<(cfg: any) => Promise<void>>('spawnCli', scope);
+    await expect(spawn({})).rejects.toThrow('old generation failed');
+    expect(oldAbandon).toHaveBeenCalledTimes(1);
+    expect(newAbandon).not.toHaveBeenCalled();
+  });
+
+  it('abandons a pre-exec lease exactly once', async () => {
+    const abandon = vi.fn(async () => {});
+    const { scope, context } = leaseHarness({ abandon, release: vi.fn(async () => {}) });
+    await Promise.all([context.abandon(), context.abandon()]);
+    expect(abandon).toHaveBeenCalledTimes(1);
+    expect(scope.traexRuntimeLeaseContext).toBeUndefined();
+    expect(scope.pendingTraexSpawnAbandon).toBeUndefined();
+  });
+
+  it('keeps a failed release retryable instead of marking the context settled', async () => {
+    const release = vi.fn()
+      .mockRejectedValueOnce(new Error('writer still alive'))
+      .mockResolvedValueOnce(undefined);
+    const { scope, context } = leaseHarness({ release, abandon: vi.fn(async () => {}) });
+    context.running = true;
+    await expect(scope.settleTraexSpawnLease(context)).rejects.toThrow('writer still alive');
+    expect(context.settled).toBe(false);
+    expect(scope.traexRuntimeLeaseContext).toBe(context);
+    await scope.settleTraexSpawnLease(context);
+    expect(context.settled).toBe(true);
+    expect(release).toHaveBeenCalledTimes(2);
+  });
+
+  it('acquires an independent RPC viewer peer from the same frozen snapshot', async () => {
+    const appLease = {
+      snapshot: { snapshot: true, traexPath: '/snapshots/combo-a/traex', dir: '/snapshots/combo-a', comboKey: 'combo-a', helperPath: '/snapshots/combo-a/helper' },
+      release: vi.fn(async () => {}), abandon: vi.fn(async () => {}),
+    };
+    const viewerLease = {
+      snapshot: appLease.snapshot,
+      release: vi.fn(async () => {}), abandon: vi.fn(async () => {}),
+    };
+    const scope: Record<string, any> = {
+      traexRuntimeLeaseContext: undefined,
+      traexLeaseSettlements: new Set(),
+      pendingTraexSpawnAbandon: undefined,
+      resolveInstallIdentity: () => ({}),
+      readProcessStartIdentity: () => 'worker-birth',
+      daemonBirthIdentity: () => ({ daemonPid: process.pid }),
+      acquireTraexRuntimePeerLease: vi.fn(async () => ({ kind: 'granted', lease: viewerLease })),
+      log: vi.fn(),
+    };
+    scope.stopTraexLeaseHeartbeat = loadWorkerFunction('stopTraexLeaseHeartbeat', scope);
+    scope.settleTraexSpawnLease = loadWorkerFunction('settleTraexSpawnLease', scope);
+    const create = loadWorkerFunction<(lease: any) => any>('createTraexSpawnLeaseContext', scope);
+    scope.createTraexSpawnLeaseContext = create;
+    const prepare = loadWorkerFunction<(context: any) => Promise<any>>('prepareTraexRpcViewerLease', scope);
+    const app = create(appLease);
+    app.running = true;
+    app.configuredEntry = '/releases/a/traex';
+    const viewer = await prepare(app);
+    expect(viewer.context).not.toBe(app);
+    expect(viewer.context.lease).toBe(viewerLease);
+    expect(viewer.cliPathOverride).toBe('/snapshots/combo-a/traex');
+    expect(viewer.configuredEntry.entry).toBe('/releases/a/traex');
+    expect(viewer.launchTarget.snapshotDir).toBe('/snapshots/combo-a');
+
+    viewer.context.running = true;
+    await scope.settleTraexSpawnLease(viewer.context);
+    expect(viewerLease.release).toHaveBeenCalledTimes(1);
+    expect(appLease.release).not.toHaveBeenCalled();
+    await scope.settleTraexSpawnLease(app);
+    expect(appLease.release).toHaveBeenCalledTimes(1);
+  });
+
+  it('selects the app-server parent lease for an owned RPC viewer', async () => {
+    const lease = {
+      snapshot: { snapshot: true, traexPath: '/snapshots/combo-a/traex', dir: '/snapshots/combo-a', comboKey: 'combo-a' },
+      release: vi.fn(async () => {}), abandon: vi.fn(async () => {}),
+    };
+    const scope: Record<string, any> = { traexRuntimeLeaseContext: undefined, pendingTraexSpawnAbandon: undefined, traexLeaseSettlements: new Set(), log: vi.fn() };
+    const create = loadWorkerFunction<(lease: any) => any>('createTraexSpawnLeaseContext', scope);
+    const resolve = loadWorkerFunction<(cfg: any, engine: any, context: any) => any>('resolveTraexRpcViewerLease', scope);
+    const context = create(lease);
+    context.running = true;
+    expect(resolve({ existingAppServerEndpoint: undefined }, {}, context)).toBe(context);
+    expect(resolve({ existingAppServerEndpoint: undefined }, undefined, context)).toBeUndefined();
+  });
+
+  it('registers an adopted TraeX runtime as existing occupancy without pre-exec abandonment', async () => {
+    const lease = {
+      snapshot: { snapshot: false, comboKey: '', traexPath: '/adopted/traex' },
+      release: vi.fn(async () => {}), abandon: vi.fn(async () => {}), markRunning: vi.fn(async () => {}),
+    };
+    const scope: Record<string, any> = {
+      traexLaunchUsesSharedRuntimeGate: (cfg: any) => !cfg.wrapperCli && cfg.cliLaunchMode !== 'forge-traex',
+      resolveCommandEntry: (path: string) => path, resolveCommandReal: (path: string) => path,
+      releaseDirForExecutable: (path: string) => `${path}/..`,
+      resolveTraexChildHome: () => '/home/trae', botInjectedEnv: () => ({}),
+      isTraexProcess: () => true, readProcessStartIdentity: (pid: number) => `birth-${pid}`,
+      readRunningExeIdentity: () => undefined,
+      daemonBirthIdentity: () => ({ daemonPid: 123 }),
+      acquireTraexRuntimeOccupancy: vi.fn(async () => ({ kind: 'granted', lease })),
+      startTraexSpawnLeaseHeartbeat: vi.fn(), traexRuntimeLeaseContext: undefined,
+      pendingTraexSpawnAbandon: undefined, log: vi.fn(),
+    };
+    const create = loadWorkerFunction<(lease: any) => any>('createTraexSpawnLeaseContext', scope);
+    scope.createTraexSpawnLeaseContext = create;
+    const register = loadWorkerFunction<(cfg: any) => Promise<any>>('registerAdoptedTraexRuntime', scope);
+    const cfg = {
+      adoptMode: true, cliId: 'traex', cliPathOverride: '/adopted/traex', adoptCliPid: 456,
+      envPolicy: undefined, envUnset: undefined, env: undefined, protectedMcpPolicy: undefined,
+    };
+    const context = await register(cfg, 999);
+    expect(context.running).toBe(true);
+    expect(scope.traexRuntimeLeaseContext).toBe(context);
+    expect(scope.pendingTraexSpawnAbandon).toBeUndefined();
+    expect(scope.startTraexSpawnLeaseHeartbeat).toHaveBeenCalledWith(context);
+    expect(scope.acquireTraexRuntimeOccupancy).toHaveBeenCalledWith(expect.objectContaining({
+      existingRuntime: true, cliPid: 456, cliStart: 'birth-456', fixedPath: true,
+    }));
+    await expect(register({ ...cfg, wrapperCli: '/wrapper' })).resolves.toBeUndefined();
+    expect(scope.acquireTraexRuntimeOccupancy).toHaveBeenCalledTimes(1);
+  });
+
+  it('releases PID-less adopted occupancy only when the adopted pane is proven gone', async () => {
+    const { scope, context } = leaseHarness({
+      release: vi.fn(async () => {}), abandon: vi.fn(async () => {}),
+    });
+    context.running = true;
+    scope.effectiveBackendType = 'tmux';
+    scope.isObserveBackend = isObserveBackend;
+    const settle = loadWorkerFunction<(context: any, backend: any) => void>('settleAdoptedTraexRuntime', scope);
+    const observer = {
+      captureCurrentScreen: () => '', captureViewport: () => '', getPaneSize: () => null,
+      isPaneAlive: () => false,
+    };
+    settle(context, observer);
+    await Promise.resolve();
+    expect(context.lease.abandon).toHaveBeenCalledTimes(1);
+    expect(context.settled).toBe(true);
+
+    const tracked = leaseHarness({
+      release: vi.fn(async () => {}), abandon: vi.fn(async () => {}),
+    });
+    tracked.context.cliPid = 999;
+    tracked.context.running = true;
+    tracked.scope.effectiveBackendType = 'tmux';
+    tracked.scope.isObserveBackend = isObserveBackend;
+    const settleTracked = loadWorkerFunction<(context: any, backend: any) => void>('settleAdoptedTraexRuntime', tracked.scope);
+    settleTracked(tracked.context, observer);
+    await Promise.resolve();
+    expect(tracked.context.lease.release).toHaveBeenCalledTimes(1);
+    expect(tracked.context.lease.abandon).not.toHaveBeenCalled();
+
+    const alive = leaseHarness({
+      release: vi.fn(async () => {}), abandon: vi.fn(async () => {}),
+    });
+    alive.scope.effectiveBackendType = 'tmux';
+    alive.scope.isObserveBackend = isObserveBackend;
+    const keepAlive = loadWorkerFunction<(context: any, backend: any) => void>('settleAdoptedTraexRuntime', alive.scope);
+    keepAlive(alive.context, { ...observer, isPaneAlive: () => true });
+    expect(alive.context.lease.abandon).not.toHaveBeenCalled();
+    expect(alive.context.settled).toBe(false);
+
+    const orca = leaseHarness({
+      release: vi.fn(async () => {}), abandon: vi.fn(async () => {}),
+    });
+    orca.scope.effectiveBackendType = 'orca';
+    orca.scope.isObserveBackend = isObserveBackend;
+    const keepOrca = loadWorkerFunction<(context: any, backend: any) => void>('settleAdoptedTraexRuntime', orca.scope);
+    keepOrca(orca.context, observer);
+    expect(orca.context.lease.abandon).not.toHaveBeenCalled();
+    expect(orca.context.settled).toBe(false);
+  });
+
+  it('waits for an already-started RPC release during shutdown', async () => {
+    let finish!: () => void;
+    const lease = { release: vi.fn(() => new Promise<void>(resolve => { finish = resolve; })), abandon: vi.fn(async () => {}) };
+    const scope: Record<string, any> = {
+      traexRuntimeLeaseContext: undefined, traexRpcLeaseContext: undefined,
+      traexLeaseSettlements: new Set(),
+      pendingTraexSpawnAbandon: undefined, log: vi.fn(),
+    };
+    scope.stopTraexLeaseHeartbeat = loadWorkerFunction('stopTraexLeaseHeartbeat', scope);
+    scope.settleTraexSpawnLease = loadWorkerFunction('settleTraexSpawnLease', scope);
+    scope.settleTraexRpcLease = loadWorkerFunction('settleTraexRpcLease', scope);
+    const create = loadWorkerFunction<(lease: any) => any>('createTraexSpawnLeaseContext', scope);
+    const context = create(lease);
+    context.running = true;
+    scope.traexRuntimeLeaseContext = context;
+    scope.traexRpcLeaseContext = context;
+    void scope.settleTraexSpawnLease(context);
+    const shutdown = loadWorkerFunction<() => Promise<void>>('settleTraexLeasesForShutdown', scope);
+    let finished = false;
+    const pending = shutdown().then(() => { finished = true; });
+    await Promise.resolve();
+    expect(finished).toBe(false);
+    finish();
+    await pending;
+    expect(finished).toBe(true);
+    expect(lease.release).toHaveBeenCalledTimes(1);
+  });
+
+  it('settles both spawn and RPC leases on shutdown', async () => {
+    const spawnLease = { release: vi.fn(async () => {}), abandon: vi.fn(async () => {}) };
+    const rpcLease = { release: vi.fn(async () => {}), abandon: vi.fn(async () => {}) };
+    const scope: Record<string, any> = {
+      traexRuntimeLeaseContext: undefined,
+      traexRpcLeaseContext: undefined,
+      traexLeaseSettlements: new Set(),
+      pendingTraexSpawnAbandon: undefined,
+      log: vi.fn(),
+    };
+    scope.stopTraexLeaseHeartbeat = loadWorkerFunction('stopTraexLeaseHeartbeat', scope);
+    scope.settleTraexSpawnLease = loadWorkerFunction('settleTraexSpawnLease', scope);
+    scope.settleTraexRpcLease = loadWorkerFunction('settleTraexRpcLease', scope);
+    const create = loadWorkerFunction<(lease: any) => any>('createTraexSpawnLeaseContext', scope);
+    const spawn = create(spawnLease);
+    const rpc = create(rpcLease);
+    spawn.running = true;
+    rpc.running = true;
+    scope.traexRuntimeLeaseContext = spawn;
+    scope.traexRpcLeaseContext = rpc;
+    const shutdown = loadWorkerFunction<() => Promise<void>>('settleTraexLeasesForShutdown', scope);
+    await shutdown();
+    expect(spawnLease.release).toHaveBeenCalledTimes(1);
+    expect(rpcLease.release).toHaveBeenCalledTimes(1);
+    expect(spawnLease.abandon).not.toHaveBeenCalled();
+    expect(rpcLease.abandon).not.toHaveBeenCalled();
+  });
+
+  it('preserves snapshot identity on non-Linux and fails closed on Linux mismatch', async () => {
+    const lease = {
+      occupancyOnly: false,
+      snapshot: { snapshot: true, traexPath: '/snap/traex', comboKey: '', dir: '/snap' },
+      markRunning: vi.fn(async () => {}),
+      markUnknown: vi.fn(async () => {}),
+      heartbeat: vi.fn(async () => {}),
+      release: vi.fn(async () => {}),
+      abandon: vi.fn(async () => {}),
+    };
+    const { scope, context } = leaseHarness(lease);
+    Object.assign(scope, {
+      traexContentKeyInFlight: new Set<number>(),
+      readRunningExeIdentity: () => undefined,
+      isTraexProcess: () => true,
+      readProcessStartIdentity: () => undefined,
+      resolveInstallIdentity: () => ({}),
+      sameExecutableObject: () => false,
+      captureTraexRunningContentIdentity: async () => ({ comboKey: 'combo', installSignature: 'sig' }),
+      captureRunningContentKey: async () => ({ comboKey: 'combo', installSignature: 'sig' }),
+      log: vi.fn(),
+      process: { platform: 'darwin' },
+    });
+    const attach = loadWorkerFunction<(pid: number) => void>('attachTraexLeaseCli', scope);
+    attach(123);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(lease.markRunning).toHaveBeenCalledWith(123, undefined, { comboKey: 'combo', installSignature: 'sig' });
+    expect(lease.markUnknown).not.toHaveBeenCalled();
+    scope.stopTraexLeaseHeartbeat();
+
+    scope.process = { platform: 'linux' };
+    context.running = false;
+    attach(124);
+    expect(lease.markUnknown).toHaveBeenCalledWith(124, undefined);
+    scope.stopTraexLeaseHeartbeat();
   });
 });

@@ -68,7 +68,7 @@ import { readCanonicalBotActorOwnerBindings } from './core/bot-actor-owner-bindi
 import { releaseExplicitAskHandoff, hasExplicitAskHandoff, hydrateLegacyExplicitAskCardRoot, invalidateExplicitAsk, setExplicitAskSessionChecker, retireExplicitAsk, explicitAskSnapshot } from './core/ask-broker.js';
 import { createExplicitAskContinuation, explicitAskRecoveryRequest, explicitAskOriginIsLive, explicitAskRetirementBound, explicitAskSessionBound } from './core/explicit-ask-continuation.js';
 import { createManagedAskControl, parseManagedAskControl } from './core/managed-ask-control.js';
-import { canSafelyReclaimWorkerForInstallChange, suspendWorkerAsync } from './core/worker-pool.js';
+import { canSafelyReclaimWorkerForInstallChange, suspendWorkerAsync, cancelQueuedWorkerTurn } from './core/worker-pool.js';
 import { execFileSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, readdirSync, existsSync, mkdirSync, unlinkSync, realpathSync } from 'node:fs';
@@ -262,6 +262,7 @@ import { ensureSchedulePreconditionRoot } from './services/schedule-precondition
 import {
   executeScheduledTaskWithPrecondition,
   type ScheduledTaskPreconditionObservation,
+  type ScheduledTaskPreconditionOutcome,
 } from './services/schedule-precondition-gate.js';
 import { SchedulePreconditionError } from './services/schedule-precondition-runner.js';
 import {
@@ -530,6 +531,7 @@ import {
   promoteQueuedActivationTail,
   admitQueuedActivationTail,
   reserveQueuedActivationTailAdmission,
+  installReclaimPendingForCurrentGeneration,
   type QueuedActivationTailReservation,
   type WorkerForkAdmission,
   codexAppCleanInputAcceptedForSession,
@@ -851,6 +853,7 @@ import {
   XpiSessionStoreBusyRetryScheduler,
   type XpiSessionStoreBusyRetryEvent,
 } from './core/xpi-session-store-busy-retry.js';
+import { hasCleanlyDrainedQueuedActivationTail } from './core/queued-activation-drain.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
 import {
   buildBotmuxLarkNativeSessionTitle,
@@ -862,6 +865,13 @@ import {
   reportUndeliveredScheduleRun,
   SCHEDULE_PROMPT_UNDELIVERED_ERROR_CODE,
   settleDeferredScheduleRun,
+  settleHeldScheduleRunsOnWorkerExit,
+  cancelPreReadyScheduledWorkers,
+  releaseCancelledActivationWork,
+  retireCancelledActivationWorker,
+  hasRecoverableActivationHead,
+  retryCancelledActivationPersistence,
+  clearTombstonedActivationHeadForRelease,
 } from './core/deferred-schedule-settlement.js';
 import {
   renderMessageListenerPrompt,
@@ -24154,6 +24164,7 @@ function clearInitialStartClaim(ds: DaemonSession, token?: string): boolean {
  * before a store throw is not a contract. */
 function queuedActivationReleaseDue(ds: DaemonSession): boolean {
   return ds.initialStartPending === true
+    || ds.activationCancellationPending === true
     || (ds.session.queuedActivationTail?.length ?? 0) > 0;
 }
 
@@ -24241,6 +24252,11 @@ function releaseQueuedActivationReservationNow(ds: DaemonSession, acknowledgedTo
   // A prior callback retry may observe the successor already promoted. That is
   // success for the acknowledged predecessor; never append/send the same tail
   // head a second time while its fresh token owns the journal.
+  if (ds.activationCancellationPending && !retryCancelledActivationPersistence(ds)) return false;
+  if (ds.session.queuedActivationPending
+    && ds.session.queuedActivationTurnId
+    && (ds.session.cancelledActivationTurnIds ?? []).includes(ds.session.queuedActivationTurnId)
+    && !clearTombstonedActivationHeadForRelease(ds)) return false;
   if (ds.session.queuedActivationPending) {
     return acknowledgedToken !== undefined
       && ds.session.queuedActivationToken !== acknowledgedToken;
@@ -24330,15 +24346,49 @@ function releaseQueuedActivationReservationNow(ds: DaemonSession, acknowledgedTo
   }
 
   if ((ds.session.queuedActivationTail?.length ?? 0) === 0) {
+    if (ds.activationCancellationPending === true) {
+      // The in-memory tail may already be empty even though both cancellation
+      // writes failed. Re-run the same write-ahead owner before releasing the
+      // claim; a false return schedules the next bounded release retry.
+      promoteQueuedActivationTail(ds, { send: false });
+    }
+    if (ds.activationCancellationPending === true) return false;
     clearInitialStartBuffers(ds);
     clearInitialStartClaim(ds);
     return true;
   }
+  const cancelledTurnIds = new Set(ds.session.cancelledActivationTurnIds ?? []);
   const head = [...ds.session.queuedActivationTail!]
-    .sort((a, b) => a.order - b.order || a.id.localeCompare(b.id))[0]!;
-  const workerUnavailable = !ds.worker
-    || ds.worker.killed;
-  if (!promoteQueuedActivationTail(ds, workerUnavailable ? { send: false } : {})) return false;
+    .filter(entry => !cancelledTurnIds.has(entry.turnId))
+    .sort((a, b) => a.order - b.order || a.id.localeCompare(b.id))[0];
+  const workerUnavailable = !ds.worker || ds.worker.killed;
+  if (!head) {
+    // Let the owner of the cancellation write-ahead protocol perform the prune;
+    // only a clean, fully persisted drain releases the reservation.
+    promoteQueuedActivationTail(ds, workerUnavailable ? { send: false } : {});
+    if (!hasCleanlyDrainedQueuedActivationTail(ds)) return false;
+    clearInitialStartBuffers(ds);
+    clearInitialStartClaim(ds);
+    return true;
+  }
+  // A head retagged for the replacement runtime is parked, not failed: the old
+  // CLI must not accept it, and the reclaim predicate ignores it so retirement
+  // proceeds. onInstallChangeReclaimed starts the replacement runtime. Report
+  // success here so the 100ms release retry loop does not spin forever.
+  if (head.ownerRuntime === 'new' && installReclaimPendingForCurrentGeneration(ds)) {
+    clearInitialStartBuffers(ds);
+    clearInitialStartClaim(ds);
+    return true;
+  }
+  const promoted = promoteQueuedActivationTail(ds, workerUnavailable ? { send: false } : {});
+  if (!promoted) {
+    if (hasCleanlyDrainedQueuedActivationTail(ds)) {
+      clearInitialStartBuffers(ds);
+      clearInitialStartClaim(ds);
+      return true;
+    }
+    return false;
+  }
   try {
     rememberLastCliInput(ds, head.userPrompt, head.cliInput, head.turnId, {
       codexAppInputAccepted: !!head.cliInput.codexAppInput,
@@ -24355,6 +24405,7 @@ function releaseQueuedActivationReservationNow(ds: DaemonSession, acknowledgedTo
     // the late exact head in the durable journal, but release the runtime claim
     // so the next inbound turn can refork that head before accepting N+2.
     clearInitialStartClaim(ds);
+    if (head.ownerRuntime === 'new') startReplacementRuntimeAfterReclaim(ds, true);
   }
   return true;
 }
@@ -24370,6 +24421,100 @@ function onQueuedActivationSubmitted(ds: DaemonSession, activationToken?: string
 }
 
 export const __testOnly_onQueuedActivationSubmitted = onQueuedActivationSubmitted;
+
+/** Sessions whose replacement runtime is being auto-started after an
+ * install-change reclaim. One in-flight start per session. */
+const traexReplacementStartInFlight = new Set<string>();
+
+/**
+ * Start the replacement TRAE runtime after an install-change reclaim retired the
+ * old CLI — but ONLY when input was parked for it while the old process drained.
+ * A quiet reclaim leaves the session dormant: the next inbound message
+ * cold-starts it with resume, exactly as before.
+ *
+ * The parked head is promoted with `send:false` first so the durable activation
+ * journal is the single owner of the input, then the exact promoted payload is
+ * forked — the same recovery contract as the quarantined activation-tail path.
+ * The claim token is stamped synchronously, before any await, so a concurrent
+ * inbound sees `initialStartPending` and buffers behind this opening instead of
+ * forking a second worker. Running on the session turn queue keeps the promote
+ * and fork atomic with respect to other session commands.
+ */
+function startReplacementRuntimeAfterReclaim(ds: DaemonSession, promotedJournalRecovery = false): void {
+  const sessionId = ds.session.sessionId;
+  if (traexReplacementStartInFlight.has(sessionId)) return;
+  if (findActiveBySessionId(sessionId) !== ds) return;
+  if (ds.worker && !ds.worker.killed) return;
+  if (ds.initialStartClaimToken !== undefined) return;
+  const hasParked = (ds.session.queuedActivationTail ?? [])
+    .some(entry => entry.ownerRuntime === 'new');
+  const hasPromotedJournal = promotedJournalRecovery && ds.session.queuedActivationPending === true
+    && ds.session.queuedActivationInput !== undefined
+    && !ds.activationCancellationPending
+    && hasRecoverableActivationHead(ds.session);
+  // Worker-exit promotion sets initialStartPending without a claim token. It is
+  // the journal we are explicitly recovering, not a competing start.
+  if (ds.initialStartPending && !hasPromotedJournal) return;
+  if (!hasParked && !hasPromotedJournal) return;
+
+  const token = randomUUID();
+  ds.initialStartPending = true;
+  ds.initialStartClaimToken = token;
+  traexReplacementStartInFlight.add(sessionId);
+  void runSessionTurn(sessionId, async () => {
+    let started = false;
+    try {
+      if (findActiveBySessionId(sessionId) !== ds) return;
+      if (ds.worker && !ds.worker.killed) return;
+      if (ds.initialStartClaimToken !== token) return;
+      const needsPromotion = (ds.session.queuedActivationTail ?? []).some(entry => entry.ownerRuntime === 'new');
+      if (!needsPromotion && !(promotedJournalRecovery && ds.session.queuedActivationPending)) return;
+      if (needsPromotion && !promoteQueuedActivationTail(ds, { send: false })) {
+        if ((!ds.worker || ds.worker.killed) && (ds.session.queuedActivationTail?.length ?? 0) > 0) {
+          // Preserve FIFO ownership for the central quarantine recovery path;
+          // the next inbound must not bypass the retained tail.
+          ds.quarantinedActivationTailPromotion = true;
+        }
+        logger.warn(`[${tag(ds)}] Replacement runtime start deferred: activation head promotion failed`);
+        return;
+      }
+      if (ds.activationCancellationPending || !hasRecoverableActivationHead(ds.session)
+        || !ds.session.queuedActivationInput) return;
+      const recoverThroughCodexLedger = isCodexAppCliId(
+        ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId,
+      );
+      const accepted = forkWorker(
+        ds,
+        recoverThroughCodexLedger ? '' : (ds.session.queuedActivationInput ?? ''),
+        {
+          resume: ds.session.queuedActivationResume ?? ds.hasHistory,
+          turnId: ds.session.queuedActivationTurnId,
+          dispatchAttempt: ds.session.queuedActivationDispatchAttempt,
+          ...(ds.session.queuedActivationInput?.trustedCaller
+            ? { trustedCaller: ds.session.queuedActivationInput.trustedCaller }
+            : {}),
+        },
+      );
+      started = accepted && !!ds.worker && !ds.worker.killed;
+      if (!started) {
+        logger.warn(`[${tag(ds)}] Replacement runtime start rejected; parked activation kept for recovery`);
+      }
+    } catch (err) {
+      logger.warn(
+        `[${tag(ds)}] Replacement runtime start failed; parked activation kept for recovery: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      traexReplacementStartInFlight.delete(sessionId);
+      // A started fork keeps the claim until its adapter ACK releases it via
+      // onQueuedActivationSubmitted. Every failure path releases the gate so the
+      // next inbound/scheduler trigger can retry the parked head.
+      if (!started && ds.initialStartClaimToken === token && !ds.quarantinedActivationTailPromotion) {
+        clearInitialStartClaim(ds, token);
+      }
+    }
+  });
+}
 
 function setActiveInteractiveTurn(
   ds: DaemonSession,
@@ -32468,10 +32613,18 @@ async function handleThreadReplyAdmitted(
     crossChatFollowUp: !!ctx.crossChatThreadFollowUp,
   });
 
+  // A TRAE install-change reclaim in flight means the live worker is the CLI
+  // being retired. Any input arriving now belongs to the replacement runtime:
+  // handing it to the old CLI would run it on a binary that is about to be
+  // reclaimed. Park it in the activation tail tagged `new` and treat the
+  // session like an opening whose worker is not ready yet, so the reclaim can
+  // drain and the replacement runtime takes the queued work.
+  const traexHandoffHolding = !!ds && installReclaimPendingForCurrentGeneration(ds);
   const liveTakeoverReady = !!ds?.worker && !ds.worker.killed
+    && !traexHandoffHolding
     && !hasQueuedActivationAdmissionGate(ds)
     && ds.initialStartClaimToken === undefined;
-  const initialStartPending = ds?.initialStartPending === true
+  const initialStartPending = (ds?.initialStartPending === true || traexHandoffHolding)
     && !ownsInitialStartClaim()
     && !liveTakeoverReady;
   if (ds && initialStartPending && !ds.pendingRepo) {
@@ -36511,6 +36664,16 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       noteFailedTurnRecoveryInput(ds.larkAppId, anchor, `web-terminal:${at}`);
     },
     onQueuedActivationSubmitted,
+    // An install-change reclaim provably retired the old CLI. If input was
+    // parked for the replacement runtime while it drained, start it now and
+    // hand over the parked FIFO head; otherwise stay dormant for the next
+    // inbound/scheduler trigger.
+    onInstallChangeReclaimed(ds) {
+      // PTY detach may already have promoted the sole replacement tail into
+      // its durable journal before this callback runs. Accept that journal as
+      // well as a still-parked tail; neither shape needs another inbound.
+      startReplacementRuntimeAfterReclaim(ds, true);
+    },
     // 决策看板批次回合的投递终态失败（收据超时 / worker 拒绝入队）：不往管家群贴失败
     // 卡片，只把批次退回 failed，owner 在 Dashboard 批次行看到原因并重投（同一 turnId）。
     onBoardTurnDeliveryFailed(ds, context) {
@@ -36791,6 +36954,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     },
     onWorkerExit(ds, context) {
       ds.messageListenerCompletedTurnId = undefined;
+      // A scheduled turn held behind the TRAE runtime handoff can never be
+      // accepted once its worker is gone. Settle that parked run now instead of
+      // waiting for the handoff timeout; the same single-exit helper is used by
+      // the ambiguous and timeout paths.
+      settleHeldScheduleRunsOnWorkerExit(ds.session, ds.larkAppId, {
+        getDeferredRun: (taskId, appId) => scheduler.getRuntimeTask(taskId, appId)?.deferredRun,
+        settle: scheduler.settleParkedRunOnce,
+      }, { currentWorker: context.currentWorker, transferredTurnIds: context.replacementActivationTurnIds });
       // A Node worker exit (including the SIGKILL backstop) proves this exact
       // generation can no longer write. Unlike onCliExit, this is safe for
       // persistent-pane backends and therefore owns crash-path release.
@@ -36836,6 +37007,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           `[vc-delivery] worker exit marked ${result.ambiguousDeliveryKeys.length} receipt(s) ambiguous `
           + `session=${context.sessionId.slice(0, 8)} generation=${context.workerGeneration}`,
         );
+      }
+      if (context.currentWorker && context.replacementActivationPending) {
+        // The pool already promoted the transferred tail into the durable
+        // journal. Start its successor now instead of waiting for another IM.
+        startReplacementRuntimeAfterReclaim(ds, true);
       }
     },
     onSessionRetired(ds) {
@@ -38824,78 +39000,355 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     };
 
     try {
-      const outcome = await executeScheduledTaskWithPrecondition(
-        task,
-        effectiveAppId,
-        async (additionalPrompt) => {
-          const targetChatIds = scheduleStore.effectiveScheduleChatIds(task);
-          // Until-done runs carry their own run context (attempt, deadline, how
-          // to mark done) so the task prompt only states what to wait for.
-          const untilDonePrompt = buildUntilDoneRunPrompt(
-            task,
-            executionContext.runId,
-            iso => new Date(iso).toLocaleString('zh-CN', { timeZone: scheduleTimeZone() }),
-          );
-          const runPrompt = [additionalPrompt, untilDonePrompt].filter(Boolean).join('\n\n') || undefined;
-          const assertExecutionCurrent = async (targetTask: typeof task, turnId: string) => {
-            // Re-read after preconditions/admission waits. A human can
-            // pause, revoke or edit while those awaits are outstanding.
-            const current = scheduleAuthorityStore?.getRecord(effectiveAppId, targetTask.id);
-            if (!current || (current.state !== 'active'
-              && !(current.state === 'paused'
-                && scheduler.admitManualRunTurn(targetTask.id, executionContext.runId, turnId, effectiveAppId)))) {
-              throw new Error('schedule authority changed before turn admission');
-            }
-            assertScheduledAuthorityCurrent(authority, current, { runId: executionContext.runId });
-            return current;
-          };
+      // A parked run is retried with the SAME run id: targets recorded as
+      // `dispatched` are never replayed, `ambiguous` targets refuse automatic
+      // replay, and `waiting` targets keep their persisted turn id.
+      const parked = (() => {
+        const deferred = scheduler.getRuntimeTask(task.id, effectiveAppId)?.deferredRun;
+        return deferred && deferred.runId === executionContext.runId ? deferred : undefined;
+      })();
+      const runTargets = async (additionalPrompt?: string): Promise<'dispatched' | 'deferred'> => {
+        const targetChatIds = scheduleStore.effectiveScheduleChatIds(task);
+        // Until-done runs carry their own run context (attempt, deadline, how
+        // to mark done) so the task prompt only states what to wait for.
+        const untilDonePrompt = buildUntilDoneRunPrompt(
+          task,
+          executionContext.runId,
+          iso => new Date(iso).toLocaleString('zh-CN', { timeZone: scheduleTimeZone() }),
+        );
+        const runPrompt = [additionalPrompt, untilDonePrompt].filter(Boolean).join('\n\n') || undefined;
+
+        const assertExecutionCurrent = async (targetTask: typeof task, turnId: string) => {
+          // Re-read after preconditions/admission waits. A human can
+          // pause, revoke or edit while those awaits are outstanding.
+          const current = scheduleAuthorityStore?.getRecord(effectiveAppId, targetTask.id);
+          if (!current || (current.state !== 'active'
+            && !(current.state === 'paused'
+              && scheduler.admitManualRunTurn(targetTask.id, executionContext.runId, turnId, effectiveAppId)))) {
+            throw new Error('schedule authority changed before turn admission');
+          }
+          assertScheduledAuthorityCurrent(authority, current, { runId: executionContext.runId });
+          return current;
+        };
+        const turnIds = new Map<string, string>();
+        // Non-TRAE targets never create a deferred run on their own. If this
+        // same occurrence parks behind a TRAE target, their exact accepted turns
+        // must join that park's ledger or the mixed run can never fully settle.
+        const acceptedNonTraeTurns = new Map<string, string>();
+        const pending: string[] = [];
+        const heldTarget = (chatId: string, turnId: string | undefined): boolean =>
+          parked?.targets[chatId] === 'held'
+          || (turnId !== undefined && parked?.heldTargets?.[chatId] === turnId);
+        for (const chatId of targetChatIds) {
+          const state = parked?.targets[chatId];
+          if (state === 'ambiguous') {
+            // The turn may or may not have reached the worker before the
+            // restart; replaying it could double-send. Settle the run ONCE
+            // (single run-log error, single alert, next occurrence armed) and
+            // stop retrying — a per-tick throw here would never settle it.
+            scheduler.settleParkedRunOnce(
+              task.id,
+              executionContext.runId,
+              `scheduled target ${chatId} may or may not have received the turn before a restart; `
+              + 'refusing to replay it automatically',
+              effectiveAppId,
+            );
+            return 'deferred';
+          }
+          const turnId = parked?.targetTurnIds?.[chatId] ?? `schedule:${task.id}:${randomUUID()}`;
+          turnIds.set(chatId, turnId);
+          if (state === 'dispatched') continue;
+          // A worker already owns this exact turn and is waiting in its start
+          // gate. Do NOT re-dispatch it; keep the run parked until acceptance.
+          if (heldTarget(chatId, turnId)) continue;
+          pending.push(chatId);
+        }
+        let results: ScheduleRunTargetResult[] = targetChatIds
+          .filter(chatId => !pending.includes(chatId))
+          .map(chatId => ({
+            chatId,
+            outcome: heldTarget(chatId, turnIds.get(chatId)) ? 'deferred' as const : 'model_dispatched' as const,
+          }));
+        let targetExecutionError: unknown;
+        if (pending.length > 0) {
           try {
-            const results = await executeScheduledTaskForTargets(
+            results = results.concat(await executeScheduledTaskForTargets(
               task,
-              targetChatIds,
+              pending,
               targetTask => withBotTurnAdmission(
                 effectiveAppId,
-                () => executeScheduledTask(
-                  targetTask,
-                  activeSessions,
-                  refreshCliVersion,
-                  runPrompt,
-                  {
-                    assertExecutionCurrent: async (targetTask, turnId) => { await assertExecutionCurrent(targetTask, turnId); },
-                    prepareTurnIdentity: async (session, turnId) => {
-                      const current = await assertExecutionCurrent(task, turnId);
-                      await prepareTurnCliIdentity(session, turnId);
-                      const prepared = scheduleAuthorityStore?.getRecord(effectiveAppId, task.id);
-                      assertScheduledAuthorityCurrent(current, prepared, { runId: executionContext.runId, turnId });
+                () => {
+                  // The EXACT session the dispatch path hands this target's
+                  // input to, captured synchronously at the admission seam.
+                  // Classification must use this identity: the target may be a
+                  // freshly created new-topic session that no anchor scan can
+                  // see yet, and an unrelated older session under the same chat
+                  // must never decide the outcome.
+                  let dispatchedSession: DaemonSession | undefined;
+                  // Whether the admission seam ran at all. No admission means
+                  // nothing was handed to any worker (e.g. no bot configured
+                  // yet), so the run must stay re-dispatchable rather than be
+                  // recorded as a held turn that no worker will ever accept.
+                  let admissionSeen = false;
+                  return executeScheduledTask(
+                    targetTask,
+                    activeSessions,
+                    refreshCliVersion,
+                    runPrompt,
+                    {
+                      assertExecutionCurrent: async (targetTask, turnId) => { await assertExecutionCurrent(targetTask, turnId); },
+                      prepareTurnIdentity: async (session, turnId) => {
+                        const current = await assertExecutionCurrent(task, turnId);
+                        await prepareTurnCliIdentity(session, turnId);
+                        const prepared = scheduleAuthorityStore?.getRecord(effectiveAppId, task.id);
+                        assertScheduledAuthorityCurrent(current, prepared, { runId: executionContext.runId, turnId });
+                      },
+                      runId: executionContext.runId,
+                      trigger: executionContext.trigger,
+                      turnId: turnIds.get(targetTask.chatId!)!,
+                      onBeforeDispatch: (turnId, selectedSession) => {
+                        admissionSeen = true;
+                        dispatchedSession = selectedSession;
+                        const selectedBotCliId = selectedSession
+                          ? getAllBots().find(b => b.config.larkAppId === selectedSession.larkAppId)?.config.cliId
+                          : undefined;
+                        const targetCliId = selectedSession
+                          ? (selectedSession.session.cliLaunchSnapshot?.cliId
+                            ?? selectedSession.session.cliId
+                            ?? selectedBotCliId)
+                          : undefined;
+                        // Only a real TRAE dispatch participates in the handoff
+                        // ledger. Other CLIs' ordinary dispatch errors must never
+                        // be converted into a 30-minute TRAE retry storm.
+                        if (targetCliId !== 'traex') return true;
+                        // Persist `dispatching` before the input can reach a
+                        // worker: a crash after this point is never auto-replayed.
+                        // Return the durable result — `executeScheduledTask` must
+                        // stop before any fork/send when the write did not land.
+                        return scheduler.markDeferredTargetDispatching(
+                          task.id, executionContext.runId, targetTask.chatId!, turnId, effectiveAppId,
+                          { additionalPrompt, precondition: precondition.precondition === 'disabled' || precondition.precondition === 'passed'
+                            ? precondition.precondition
+                            : 'none',
+                            acceptedTargets: Object.fromEntries(acceptedNonTraeTurns),
+                            targetTurnIds: Object.fromEntries(acceptedNonTraeTurns),
+                          },
+                        );
+                      },
                     },
-                    runId: executionContext.runId,
-                    trigger: executionContext.trigger,
-                  },
-                ),
+                  ).then(dispatched => {
+                    if (dispatched !== 'deferred') {
+                      const targetTurnId = turnIds.get(targetTask.chatId!)!;
+                      // No admission seam ran, so no worker owns this turn:
+                      // leave it waiting for the next tick instead of holding
+                      // a nonexistent owner forever.
+                      if (!admissionSeen) return 'deferred' as const;
+                      // Fork return is NOT an acceptance fact. Classify by the
+                      // ACTUAL dispatched session runtime, not the bot default
+                      // and not a guessed anchor: a retained session can freeze
+                      // TRAE while the bot defaults to another CLI, and a fresh
+                      // new-topic session may not be discoverable yet. Managed
+                      // TRAE queues the input in a worker that may still wait in
+                      // its start gate, so the target stays held until the
+                      // worker reports the exact turn accepted. Without proof of
+                      // a non-TRAE target we fail closed (deferred).
+                      // A fresh session has no frozen CLI until its first
+                      // spawn; it launches with the owning bot's configured
+                      // default. Resolve that same default for the selected
+                      // session's app, never the daemon's own config.
+                      const selectedBotCliId = dispatchedSession
+                        ? getAllBots().find(b => b.config.larkAppId === dispatchedSession!.larkAppId)?.config.cliId
+                        : undefined;
+                      const targetCliId = dispatchedSession
+                        ? (dispatchedSession.session.cliLaunchSnapshot?.cliId
+                          ?? dispatchedSession.session.cliId
+                          ?? selectedBotCliId)
+                        : undefined;
+                      if (targetCliId === undefined || targetCliId === 'traex') {
+                        scheduler.markDeferredTargetHeld(
+                          task.id, executionContext.runId, targetTask.chatId!, targetTurnId, effectiveAppId,
+                        );
+                        return 'deferred' as const;
+                      }
+                      acceptedNonTraeTurns.set(targetTask.chatId!, targetTurnId);
+                      scheduler.markDeferredTargetAccepted(
+                        task.id, executionContext.runId, targetTask.chatId!, targetTurnId, effectiveAppId,
+                      );
+                    }
+                    return dispatched;
+                  });
+                },
               ),
-            );
+            ));
             if (targetChatIds.length > 1) targetResults = results;
           } catch (error) {
-            if (error instanceof ScheduleTargetExecutionError) {
-              targetResults = error.targetResults;
+            targetExecutionError = error;
+            const failedChatIds = error instanceof ScheduleTargetExecutionError
+              ? error.targetResults.filter(result => result.outcome === 'error').map(result => result.chatId)
+              : pending.length === 1 ? [pending[0]!] : [];
+            // Runtime handoff waits are expressed as `deferred`, never thrown
+            // errors. Any target that actually throws is a terminal dispatch
+            // failure for this logical run, including TRAE launch failures.
+            if (failedChatIds.length === 0) {
+              if (error instanceof ScheduleTargetExecutionError) targetResults = error.targetResults;
+              throw error;
             }
-            throw error;
+            const merged = new Map(results.map(result => [result.chatId, result]));
+            if (error instanceof ScheduleTargetExecutionError) {
+              for (const result of error.targetResults) merged.set(result.chatId, result);
+            } else if (pending.length === 1) {
+              merged.set(pending[0]!, {
+                chatId: pending[0]!, outcome: 'error',
+                error: error instanceof Error ? error.message : String(error),
+              });
+            }
+            // Targets not reached before the failure never executed; retain
+            // them as deferred facts in the single terminal run-log row.
+            for (const chatId of targetChatIds) {
+              if (!merged.has(chatId)) merged.set(chatId, { chatId, outcome: 'deferred' });
+            }
+            results = targetChatIds.map(chatId => merged.get(chatId)!);
+            if (targetChatIds.length > 1) targetResults = results;
           }
-        },
-        undefined,
-        observation => { precondition = observation; },
-      );
-      appendExecutionLog(outcome === 'executed' ? 'model_dispatched' : 'precondition_skipped');
+        }
+        // The `parked` snapshot above was captured before the awaits. Re-read
+        // CURRENT ownership so an acceptance that landed while awaiting cannot
+        // be overwritten by the stale snapshot (and accepted turns are never
+        // re-sent on the retry).
+        const currentDeferred = scheduler.getRuntimeTask(task.id, effectiveAppId)?.deferredRun;
+        const acceptedNow = (chatId: string): boolean => {
+          const turnId = turnIds.get(chatId);
+          if (turnId !== undefined && acceptedNonTraeTurns.get(chatId) === turnId) return true;
+          const accepted = currentDeferred?.acceptedTargets?.[chatId];
+          return accepted !== undefined && accepted === turnIds.get(chatId);
+        };
+        const heldNow = (chatId: string): boolean =>
+          currentDeferred?.heldTargets?.[chatId] === turnIds.get(chatId)
+          || currentDeferred?.targets[chatId] === 'held';
+        results = results.map(result => acceptedNow(result.chatId)
+          ? { ...result, outcome: 'model_dispatched' as const }
+          : result);
+        if (targetExecutionError !== undefined) {
+          const details = resolveScheduleRunLogErrorDetails(precondition.precondition, targetExecutionError);
+          const reason = details.error
+            ?? (targetExecutionError instanceof Error ? targetExecutionError.message : String(targetExecutionError));
+          if (currentDeferred?.runId === executionContext.runId) {
+            const settled = scheduler.settleParkedRunOnce(
+              task.id,
+              executionContext.runId,
+              reason,
+              effectiveAppId,
+              {
+                trigger: executionContext.trigger,
+                errorCode: details.errorCode ?? 'schedule_target_failed',
+                targetResults: results,
+              },
+            );
+            if (settled) return 'deferred';
+          }
+          throw targetExecutionError;
+        }
+        const deferredResults = results.filter(result => result.outcome === 'deferred');
+        if (deferredResults.length === 0) return 'dispatched';
+        // Keep the claimed run parked. Targets already dispatched stay recorded
+        // so the retry can only deliver the ones still waiting.
+        const parkedTargets: Record<string, 'waiting' | 'dispatched' | 'held'> = {};
+        const persistedTurnIds: Record<string, string> = {};
+        for (const chatId of targetChatIds) {
+          const result = results.find(entry => entry.chatId === chatId);
+          const turnId = turnIds.get(chatId);
+          if (acceptedNow(chatId)) {
+            parkedTargets[chatId] = 'dispatched';
+          } else if (result?.outcome === 'deferred') {
+            parkedTargets[chatId] = heldNow(chatId) ? 'held' : 'waiting';
+          } else {
+            parkedTargets[chatId] = 'dispatched';
+          }
+          if (turnId) persistedTurnIds[chatId] = turnId;
+        }
+        scheduler.parkDeferredRun(task.id, executionContext, {
+          runId: executionContext.runId,
+          detail: `managed TRAE runtime handoff: waiting for ${deferredResults.length} target(s)`,
+          ...(additionalPrompt ? { additionalPrompt } : {}),
+          precondition: precondition.precondition === 'disabled' || precondition.precondition === 'passed'
+            ? precondition.precondition
+            : 'none',
+          targets: parkedTargets,
+          acceptedTargets: Object.fromEntries(acceptedNonTraeTurns),
+          ...(parked?.heldTargets ? { heldTargets: parked.heldTargets } : {}),
+          targetTurnIds: persistedTurnIds,
+        });
+        return 'deferred';
+      };
+      let outcome: ScheduledTaskPreconditionOutcome;
+      if (parked) {
+        // The Bash precondition already ran for this logical run; reuse its
+        // observation instead of re-running it (and re-generating its prompt).
+        precondition = {
+          precondition: parked.precondition ?? 'none',
+          additionalPrompt: !!parked.additionalPrompt,
+        };
+        outcome = (await runTargets(parked.additionalPrompt)) === 'deferred' ? 'deferred' : 'executed';
+      } else {
+        outcome = await executeScheduledTaskWithPrecondition(
+          task,
+          effectiveAppId,
+          runTargets,
+          undefined,
+          observation => { precondition = observation; },
+        );
+      }
+      if (outcome !== 'deferred') {
+        appendExecutionLog(outcome === 'executed' ? 'model_dispatched' : 'precondition_skipped');
+      }
       return outcome;
     } catch (error) {
-      appendExecutionLog(
-        'error',
-        resolveScheduleRunLogErrorDetails(precondition.precondition, error),
-      );
+      const current = scheduler.getRuntimeTask(task.id, effectiveAppId);
+      const terminal = current?.lastRunId === executionContext.runId
+        && (current.lastStatus === 'ok' || current.lastStatus === 'error' || current.lastStatus === 'skipped');
+      const willRepark = current?.deferredRun
+        && scheduler.deferredRunHasUnsettledTargets(current.deferredRun);
+      // A re-park or a terminal settlement from another edge owns the next
+      // retry/outcome. Do not append a second terminal error log for this one.
+      if (current && current.lastRunId === executionContext.runId
+        && current.lastStatus !== 'deferred' && !terminal && !willRepark) {
+        appendExecutionLog(
+          'error',
+          resolveScheduleRunLogErrorDetails(precondition.precondition, error),
+        );
+      }
       throw error;
     }
   });
   scheduler.setOwnerFilter(cfg.larkAppId, idx === 0);
+  scheduler.setParkedRunCancellationHandler((task, runId) => {
+    cancelPreReadyScheduledWorkers(activeSessions.values(), runId, async ds => {
+      await closeSessionForBackgroundCleanup(ds.session.sessionId, 'scheduled run cancelled');
+    }, {
+      acceptedTurnIds: new Set(Object.values(task.deferredRun?.acceptedTargets ?? {})),
+      cancelTurn: async (ds, turnId) => cancelQueuedWorkerTurn(ds, turnId),
+      retireWorker: async ds => {
+        const worker = ds.worker;
+        if (!worker) return;
+        const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
+        return retireCancelledActivationWorker(worker, {
+          remote: !!backendType && isRemoteBackendType(backendType),
+          onExited: () => {
+            // Do not clear ds.worker or promote the successor until the OS exit
+            // event proves the old worker cannot overlap its replacement.
+            if (ds.worker === worker) retireWorkerProcessOnly(ds, 'scheduled_run_cancelled');
+          },
+        });
+      },
+      release: async ds => {
+        await releaseCancelledActivationWork(ds, {
+          release: () => releaseQueuedActivationReservation(ds),
+          startJournal: () => startReplacementRuntimeAfterReclaim(ds, true),
+          scheduleRetry: () => scheduleQueuedActivationTailReleaseRetry(ds),
+        });
+      },
+    });
+  });
   scheduler.setScheduleFailureAlert((task, consecutiveFailures, lastError) => {
     // 周期任务连续失败达到阈值：私信一个可操作的管理员一次，避免像协作人
     // 日更那样静默失败十余天无人知。无可用管理员则只留 error 日志。

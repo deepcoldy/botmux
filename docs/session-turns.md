@@ -40,8 +40,26 @@ the following JSON body.
 }
 ```
 
-The server resolves the explicitly configured `ownerOpenId` against the bot's
-current allowlist. It returns `owner_unresolved` if that owner is unavailable.
+The server resolves the bot owner against the bot's current allowlist:
+
+- An explicit `ownerOpenId` or `ownerUnionId` in `bots.json` names the owner
+  while it is still in the resolved allowlist. `ownerUnionId` must also be an
+  `allowedUsers` entry. When both are set, they must name the same person.
+- Without an explicit owner, an allowlist whose entries all resolve to one
+  person makes that person the owner.
+- Otherwise the request returns 403 `owner_unresolved`. With several people
+  and no explicit owner, the server does not pick one.
+
+Check `capabilities` for `ownerUnionId` before adding the optional top-level
+`actorUnionId` (the caller's `on_…` union_id). With it, the request succeeds
+only when that person is the resolved owner, and returns 403
+`owner_mismatch` for anyone else. When the owner is not listed by union_id,
+the bot looks up the owner's union_id. If that lookup fails, the request
+returns `owner_unresolved`. `actorUnionId` without `"actor": "owner"`, or
+not shaped as a union_id, returns HTTP 400. Versions without the capability
+ignore `actorUnionId` and act as the owner anyway, so probe first. A current
+Dashboard in front of an older bot returns 503 `daemon_upgrade_required`
+instead.
 The instruction enters the existing session as a follow-up. Successful
 responses echo `"actor": "owner"`, and the session records the input as
 `via: "owner_actor"`. Topic presentation follows the existing policy.
