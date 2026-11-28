@@ -34,7 +34,8 @@ const jsonInt64Id = (value: unknown) => jsonId(value) && BigInt(value as string)
 /** The RPC transport needs JSON integer tokens for Thrift i64 fields. Preserve
  * their decimal text before JSON.parse can round it; ordinary fields and quoted
  * strings still go through strict JSON parsing and the closed signature below. */
-function parsePickoMembershipRpcBody(raw: string): Record<string, unknown> | undefined {
+type PickoInt64RpcKind = 'membership' | 'package-info';
+function parsePickoInt64RpcBody(raw: string, kind: PickoInt64RpcKind): Record<string, unknown> | undefined {
   if (raw.length > 65_536) return undefined;
   let lossless = '';
   for (let i = 0; i < raw.length;) {
@@ -55,21 +56,24 @@ function parsePickoMembershipRpcBody(raw: string): Record<string, unknown> | und
     } else lossless += raw[i++];
   }
   const body = jsonObject(lossless);
-  const conditions = body?.conditions;
-  if (conditions && typeof conditions === 'object' && !Array.isArray(conditions)) {
-    const fields = conditions as Record<string, unknown>;
-    for (const key of ['entity_ids', 'picko_ids']) {
+  const target = kind === 'membership' ? body?.conditions : body;
+  if (target && typeof target === 'object' && !Array.isArray(target)) {
+    const fields = target as Record<string, unknown>;
+    for (const key of kind === 'membership' ? ['entity_ids', 'picko_ids'] : ['pick_ids']) {
       const ids = fields[key];
       if (Array.isArray(ids)) fields[key] = ids.map(value => typeof value === 'number' && Number.isSafeInteger(value) ? String(value) : value);
     }
   }
   return body;
 }
-/** Called only after the complete Search signature has validated both IDs. */
-function serializePickoMembershipRpcBody(body: Record<string, unknown>): string {
+/** Called only after the complete reviewed RPC signature has validated its IDs. */
+function serializePickoInt64RpcBody(body: Record<string, unknown>, kind: PickoInt64RpcKind): string {
   const conditions = body.conditions as { entity_ids: string[]; picko_ids: string[] };
-  const rawIds = `{"entity_ids":[${conditions.entity_ids[0]}],"picko_ids":[${conditions.picko_ids[0]}]}`;
-  return '{' + Object.entries(body).map(([key, value]) => `${JSON.stringify(key)}:${key === 'conditions' ? rawIds : JSON.stringify(value)}`).join(',') + '}';
+  const rawIds = kind === 'membership'
+    ? `{"entity_ids":[${conditions.entity_ids[0]}],"picko_ids":[${conditions.picko_ids[0]}]}`
+    : `[${(body.pick_ids as string[])[0]}]`;
+  const idKey = kind === 'membership' ? 'conditions' : 'pick_ids';
+  return '{' + Object.entries(body).map(([key, value]) => `${JSON.stringify(key)}:${key === idKey ? rawIds : JSON.stringify(value)}`).join(',') + '}';
 }
 
 /** The audited Skill escapes JSON double quotes inside SQL single-quoted
@@ -167,6 +171,14 @@ rpc('picko-membership', 'ecom.market.udc_picko_service', 'Search', undefined, un
   data_priority: value => value === 0,
   code_list: value => Array.isArray(value) && value.length > 0 && value.length <= 5 && new Set(value).size === value.length
     && value.every(field => ['pick_id', 'entity_id', 'record_id', 'entity_status', 'entity_end_time'].includes(field)),
+}, 'read', 'bam');
+rpc('picko-package-info', 'ecom.market.udc_picko_service', 'GetPicko', undefined, undefined, {
+  pick_ids: ids => Array.isArray(ids) && ids.length === 1 && jsonInt64Id(ids[0]),
+  page_size: value => value === 1,
+  page_num: value => value === 1,
+  no_need_entity_num: value => value === true,
+  need_draft: value => value === false,
+  biz_code: value => value === 1000,
 }, 'read', 'bam');
 rpc('assign-info', 'ecom.search.assign_manager', 'GetAssignInfo', undefined, undefined, { assign_id: jsonNumber }, 'read');
 add('api-test.http-call.picko-tag-enum', 'api-test http-call', 'read', { ...route, '--http-path': one('/ecom/market/udc/picko/api/list_tag_enum_values'), '--http-method': one('POST'), '--body': object },
@@ -296,10 +308,12 @@ export function matchBytedcliBusinessCommand(argv: readonly string[]): { readonl
   if (!selected) return undefined;
   const { entry, path } = selected;
   const fail = () => { throw new Error('unsupported_operation'); };
-  let membershipBody: Record<string, unknown> | undefined;
-  if (entry.id === 'api-test.rpc-call.picko-membership' || entry.id === 'api-test.rpc-call.picko-membership-ticket') {
-    membershipBody = parsePickoMembershipRpcBody(get(tokens, '--body')) ?? fail();
-    tokens = { words: tokens.words, values: new Map(tokens.values).set('--body', JSON.stringify(membershipBody)) };
+  const rpcKind = entry.id === 'api-test.rpc-call.picko-membership' || entry.id === 'api-test.rpc-call.picko-membership-ticket' ? 'membership'
+    : entry.id === 'api-test.rpc-call.picko-package-info' || entry.id === 'api-test.rpc-call.picko-package-info-ticket' ? 'package-info' : undefined;
+  let rpcBody: Record<string, unknown> | undefined;
+  if (rpcKind) {
+    rpcBody = parsePickoInt64RpcBody(get(tokens, '--body'), rpcKind) ?? fail();
+    tokens = { words: tokens.words, values: new Map(tokens.values).set('--body', JSON.stringify(rpcBody)) };
   }
   if ([...tokens.values.keys()].some(key => !Object.hasOwn(entry.flags, key) && !['--json', '--site', '--no-auto-upgrade'].includes(key))
     || tokens.values.has('--site') && get(tokens, '--site') !== 'cn') fail();
@@ -310,7 +324,7 @@ export function matchBytedcliBusinessCommand(argv: readonly string[]): { readonl
   const result = [...(tokens.values.has('--json') ? ['--json'] : []), '--site', 'cn', ...entry.path, ...positionals];
   for (const [flag, check] of Object.entries(entry.flags)) {
     if (!tokens.values.has(flag)) continue;
-    const value = flag === '--body' && membershipBody ? serializePickoMembershipRpcBody(membershipBody) : get(tokens, flag);
+    const value = flag === '--body' && rpcBody && rpcKind ? serializePickoInt64RpcBody(rpcBody, rpcKind) : get(tokens, flag);
     if (check === true) result.push(flag);
     else { if (!check(value)) fail(); result.push(value.startsWith('-') && value !== '-' ? `${flag}=${value}` : flag); if (!value.startsWith('-') || value === '-') result.push(value); }
   }
