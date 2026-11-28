@@ -7,6 +7,13 @@ const rpc = (psm: string, method: string, body: object, ticket = false) => ['api
   '--idc', 'lf', '--env', 'prod', '--cluster', 'default', '--zone', 'CN', '--body', JSON.stringify(body),
   ...(ticket ? ['--create-permission-ticket', '--permission-role', 'brn::iam:::role:ms.interface_tester_func.cn', '--permission-reason', '诊断'] : [])];
 
+const membershipBody = { picko_id: '7712353870590296346', page_size: 10, page_num: 1,
+  filter: { entity_id: '3820007272755626127' } };
+const membership = (body: unknown = membershipBody) => ['--no-auto-upgrade', '--json', 'api-test', 'http-call',
+  'ecom.market.udc_picko', '--http-path', '/ecom/market/udc/picko/admin/search_from_picko',
+  '--http-method', 'POST', '--env', 'prod', '--idc', 'lf', '--cluster', 'default', '--zone', 'CN',
+  '--body', JSON.stringify(body)];
+
 export const businessCases: [string, 'read' | 'write', string[]][] = [
   ['tcc.config.get.picko-rules', 'read', ['tcc', 'config', 'get', 'ecom.market.udc_dump', 'rule_list_config_PRODUCT_new', '--dir', '/dump_v2', '--region', 'CN', '--env', 'prod']],
   ['rds.db.query', 'read', ['rds', 'query-db', 'ecom_market_pick', 'SELECT COUNT(*) AS cnt FROM pick_package WHERE status = 1;', '-r', 'cn']],
@@ -21,6 +28,7 @@ export const businessCases: [string, 'read' | 'write', string[]][] = [
   ['api-test.rpc-call.picko-user-email', 'read', rpc('ecom.market.udc_picko_service', 'Debug', { debug_scene: 'get_lark_email_by_user_id', record_id: '123' })],
   ['api-test.rpc-call.assign-info', 'read', rpc('ecom.search.assign_manager', 'GetAssignInfo', { assign_id: 123 })],
   ['api-test.http-call.picko-tag-enum', 'read', ['api-test', 'http-call', 'ecom.market.udc_picko', '--http-path', '/ecom/market/udc/picko/api/list_tag_enum_values', '--http-method', 'POST', '--env', 'prod', '--idc', 'lf', '--cluster', 'default', '--zone', 'CN', '--body', '{"tag_id":"123"}']],
+  ['api-test.http-call.picko-membership', 'read', membership()],
   ['tce.service.get', 'read', ['tce', 'service', 'get', '--psm', 'ecom.market.udc_dump']],
   ['tce.service.search', 'read', ['tce', 'service', 'search', '-k', 'udc_dump']],
   ['scm.repo.search', 'read', ['scm', 'repo', 'search', 'market/udc_dump']],
@@ -72,6 +80,47 @@ describe('selected business signatures', () => {
       ['iam', 'permission', 'apply', '--permission', 'argos.streamlog.view', '--psm', 'ecom.market.udc_dump', '--check-only', '--yes'],
       ['bits', 'pipelines', 'run', '--pipeline-id', '123', '--vars', '{}'],
     ]) expect(() => parse(argv)).toThrow();
+  });
+  it('requires a single valid entity filter and bounded pages for Picko membership reads', () => {
+    for (const body of [
+      { ...membershipBody, picko_id: '0' },
+      { ...membershipBody, picko_id: '9223372036854775808' },
+      { ...membershipBody, picko_id: 123 },
+      { ...membershipBody, entity_type: 1 },
+      { ...membershipBody, page_size: 0 },
+      { ...membershipBody, page_size: 101 },
+      { ...membershipBody, page_size: '10' },
+      { ...membershipBody, page_num: 0 },
+      { ...membershipBody, page_num: 1001 },
+      { ...membershipBody, page_num: 1.5 },
+      { ...membershipBody, filter: null },
+      { ...membershipBody, filter: [] },
+      { ...membershipBody, filter: {} },
+      { ...membershipBody, filter: { entity_id: '' } },
+      { ...membershipBody, filter: { entity_id: '9223372036854775808' } },
+      { ...membershipBody, filter: { entity_id: '123', entity_name: '商品' } },
+    ]) expect(() => parse(membership(body))).toThrow();
+    expect(parse(membership({ ...membershipBody, page_size: 100, page_num: 1000,
+      filter: { entity_id: '9223372036854775807' } }))).toMatchObject({ id: 'api-test.http-call.picko-membership', effect: 'read' });
+    for (const argv of [
+      membership().map(v => v === 'POST' ? 'GET' : v),
+      membership().map(v => v === 'prod' ? 'ppe' : v),
+      [...membership(), '--http-header', 'X-Auth: bad'],
+      [...membership(), '--create-permission-ticket'],
+    ]) expect(() => parse(argv)).toThrow();
+  });
+  it('applies exact membership identity rules and keeps unrelated HTTP calls on actor fallback', () => {
+    const policy = (identity: 'machine' | 'actor' | 'deny') => parseBytedcliOperationPolicy({
+      schema: 'botmux.bytedcli-operation-policy.v2', cliVersion: '0.199.0', catalogVersion: '2026-11-27.2',
+      rules: { 'api-test.http-call.picko-membership': identity },
+    });
+    const op = parse(membership());
+    expect(resolveBytedcliOperationRule(op.id, undefined, policy('machine'))).toMatchObject({ identity: 'machine', enabled: true });
+    expect(resolveBytedcliOperationRule(op.id, policy('actor'), policy('machine')).identity).toBe('actor');
+    expect(resolveBytedcliOperationRule(op.id, policy('deny'), policy('machine')).enabled).toBe(false);
+    const other = parse(membership().map(v => v.endsWith('/search_from_picko') ? '/unregistered_query' : v));
+    expect(other.effect).toBe('unknown');
+    expect(resolveBytedcliOperationRule(other.id, undefined, policy('machine')).identity).toBe('actor');
   });
   it.each(['SELECT 1; DELETE FROM pick_package', 'SELECT 1 INTO OUTFILE "/tmp/x"', 'SELECT load_file("/etc/passwd")',
     'SELECT malicious_function()', 'SELECT `malicious_function`()', 'SELECT "malicious_function"()', 'SELECT unreviewed.COUNT()', 'SELECT unreviewed . IFNULL (1, 0)',

@@ -1,6 +1,6 @@
 # bytedcli 精确业务目录与隔离执行
 
-CLI 审核版本为 `0.199.0`，目录为 `2026-11-27.2`。原 JSON grammar 保留 18 行，新纯模块 `src/core/bytedcli-business-command-catalog.ts` 增加 40 个精确签名。合并后的目录供 parser、Dashboard、help 和策略状态使用；每行包含真实 effect、允许参数、匹配条件、输入快照及执行方式。运行配置不能添加目录条目或改变 effect。
+CLI 审核版本为 `0.199.0`，目录为 `2026-11-27.2`。原 JSON grammar 保留 18 行，纯模块 `src/core/bytedcli-business-command-catalog.ts` 登记精确业务签名。合并后的目录供 parser、Dashboard、help 和策略状态使用；每行包含真实 effect、允许参数、匹配条件、输入快照及执行方式。运行配置不能添加目录条目或改变 effect。
 
 | 签名 | 效果与限制 |
 | --- | --- |
@@ -10,6 +10,7 @@ CLI 审核版本为 `0.199.0`，目录为 `2026-11-27.2`。原 JSON grammar 保�
 | `api-test.rpc-call.assign-info` | read；`ecom.search.assign_manager/GetAssignInfo`，仅数字 assign_id。 |
 | 上述 RPC 的 `-ticket` 后缀 | write；必须完整携带 create-permission-ticket、固定接口测试角色及 reason；不带后缀的行禁止票据参数。所有 RPC 固定 lf/prod/default/CN，BAM 来源除邮箱查询外固定 bam。 |
 | `api-test.http-call.picko-tag-enum` | read；固定 PSM、POST `/ecom/market/udc/picko/api/list_tag_enum_values`，仅 tag_id。 |
+| `api-test.http-call.picko-membership` | read；固定 `ecom.market.udc_picko`、POST `/ecom/market/udc/picko/admin/search_from_picko`，lf/prod/default/CN；body 仅字符串 picko_id、page_size（1–100）、page_num（1–1000）及只含字符串 entity_id 的 filter，ID 为正 int64。查询指定商品的包内记录。 |
 | `tcc.config.get.picko-rules` | read；`ecom.market.udc_dump` 的 `/dump_v2/rule_list_config_PRODUCT_new`，CN/prod。 |
 | `rds.db.query`（别名 query-db） | read；仅 ecom_market_pick/ecom_search、region cn、单条受限 SELECT。函数白名单，禁止变量、写关键字、锁、注释、未知/引用/库名限定函数及多语句。仅将单引号字面量中的 `\"` 规范为双引号后转发。 |
 | `cache.execute-command.picko-hget` | read；服务 15479，HGET `ecom_activity_product_<id> <assign_id>`。 |

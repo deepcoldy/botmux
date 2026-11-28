@@ -29,6 +29,7 @@ const exactObject = (raw: string, fields: Record<string, (v: unknown) => boolean
 };
 const jsonId = (value: unknown) => typeof value === 'string' && id(value);
 const jsonNumber = (value: unknown) => typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+const jsonInt64Id = (value: unknown) => jsonId(value) && BigInt(value as string) <= 9223372036854775807n;
 
 /** The audited Skill escapes JSON double quotes inside SQL single-quoted
  * strings. Remove only that redundant escape; all other backslashes fail. */
@@ -115,6 +116,17 @@ add('api-test.http-call.picko-tag-enum', 'api-test http-call', 'read', { ...rout
     matches: tokens => tokens.words[2] === 'ecom.market.udc_picko' && get(tokens, '--http-path') === '/ecom/market/udc/picko/api/list_tag_enum_values',
     validate: tokens => exactObject(get(tokens, '--body'), { tag_id: value => jsonId(value) || jsonNumber(value) }),
     condition: 'ecom.market.udc_picko; POST list_tag_enum_values; only tag_id; lf/prod/default/CN',
+  });
+add('api-test.http-call.picko-membership', 'api-test http-call', 'read', { ...route, '--http-path': one('/ecom/market/udc/picko/admin/search_from_picko'), '--http-method': one('POST'), '--body': object },
+  [...routeRequired, '--http-path', '--http-method', '--body'], [one('ecom.market.udc_picko')], {
+    matches: tokens => tokens.words[2] === 'ecom.market.udc_picko' && get(tokens, '--http-path') === '/ecom/market/udc/picko/admin/search_from_picko',
+    validate: tokens => exactObject(get(tokens, '--body'), {
+      picko_id: jsonInt64Id,
+      page_size: value => jsonNumber(value) && (value as number) <= 100,
+      page_num: value => jsonNumber(value) && (value as number) <= 1000,
+      filter: value => exactObject(JSON.stringify(value), { entity_id: jsonInt64Id }),
+    }),
+    condition: 'ecom.market.udc_picko; POST search_from_picko; picko_id and one entity_id filter; positive int64 IDs; pages <= 1000, size <= 100; lf/prod/default/CN',
   });
 add('tcc.config.get.picko-rules', 'tcc config get', 'read', { '--dir': one('/dump_v2'), '--region': one('CN'), '--env': one('prod') },
   ['--dir', '--region', '--env'], [one('ecom.market.udc_dump'), one('rule_list_config_PRODUCT_new')], {
