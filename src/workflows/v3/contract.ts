@@ -173,6 +173,7 @@ export const V3_SUPPORTED_CLIS: readonly CliId[] = [
   'traex',
   'relay',
   'minimax',
+  'atomcode',
 ];
 
 export function isV3SupportedCli(cliId: CliId): boolean {

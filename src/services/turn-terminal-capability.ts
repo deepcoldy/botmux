@@ -16,8 +16,8 @@ export interface TurnTerminalCapabilityOptions {
   readonly scratch?: boolean;
 }
 
-/** Mira/Mir/headless dsh/MiniMax emit runner control records through terminal OSC. */
-export const APP_RUNNER_OSC_CLI_IDS: ReadonlySet<string> = new Set(['mira', 'mir', 'dsh', 'minimax']);
+/** Mira/Mir/headless dsh/MiniMax/AtomCode emit runner control records through terminal OSC. */
+export const APP_RUNNER_OSC_CLI_IDS: ReadonlySet<string> = new Set(['mira', 'mir', 'dsh', 'minimax', 'atomcode']);
 
 /** Exact worker OSC-decoder gate. Codex App is deliberately absent: its trusted
  * control records arrive over a signed Unix socket, not terminal output. */

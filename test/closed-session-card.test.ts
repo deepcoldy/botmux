@@ -159,6 +159,23 @@ describe('buildClosedSessionCard — frozen runtime resume identity', () => {
     expect(content).not.toContain('new-model');
   });
 
+  it('pins the custom AtomCode data home on the closed-card resume command', () => {
+    const ds = makeSession();
+    ds.session.cliId = 'atomcode';
+    ds.session.cliRuntime = undefined;
+    ds.session.cliPathOverride = undefined;
+    ds.session.cliSessionId = 'acp-atomcode-native';
+    ds.initConfig = {
+      cliId: 'atomcode',
+      env: { ATOMCODE_HOME: '/srv/atomcode-bot', SECRET_TOKEN: 'do-not-leak' },
+    } as DaemonSession['initConfig'];
+
+    const content = markdown(buildClosedSessionCard(ds, 'en'));
+
+    expect(content).toContain("ATOMCODE_HOME='/srv/atomcode-bot' atomcode resume 'atomcode-native'");
+    expect(content).not.toContain('do-not-leak');
+  });
+
   it('prints Forge x TraeX resume command for a frozen Forge launch session', () => {
     const ds = makeSession();
     ds.session.cliId = 'traex';

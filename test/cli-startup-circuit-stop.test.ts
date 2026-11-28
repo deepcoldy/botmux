@@ -20,6 +20,7 @@ import ts from 'typescript';
 import { isStructuredBridgeLifecycleBlockingCli } from '../src/services/structured-bridge-clis.js';
 import { isOrdinaryImTurnId } from '../src/core/ordinary-im-turn.js';
 import { InputTurnDeduper } from '../src/core/input-turn-dedupe.js';
+import { TraexNativeContinuationTracker } from '../src/core/traex-native-continuation.js';
 import { dropNoReplayPendingInputsOnBackendExit, handoffQueuedDurableInputsOnBackendExit, terminalReleasesDurableTurn } from '../src/utils/pending-input-queue.js';
 import { loadWorkerFunction, loadWorkerMessageHandler } from './helpers/worker-function-harness.js';
 
@@ -432,6 +433,9 @@ function exitHarness(cliId = 'pi') {
     recentTerminalLogTail: () => '', postRejectedArgumentHint: vi.fn(), canParkCrashDiagnostic: () => false,
     revokePromptReadiness: () => { h.scope.isPromptReady = false; },
     setCaptureIdentity: vi.fn(), retiredTurnIds: new Set(), activeTurnAuthority: { clear: vi.fn() },
+    // The locally-built exit-callback proxy (loadBackendExit) resolves only
+    // explicit scope keys; spawnCliBody's exit path now resets the tracker.
+    traexNativeContinuation: new TraexNativeContinuationTracker(),
     freshnessInputQueue: { onReplacementFailed: vi.fn() }, sandboxNamespaceDiagnosis: () => undefined,
     structuredBridgeIs: (id: string) => id === cliId, flushQueuedInputAfterTurnStartEvidence: vi.fn(),
     markReplyInputConsumed: vi.fn(),
