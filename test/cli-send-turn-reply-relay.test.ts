@@ -683,6 +683,92 @@ describe('real botmux send -> host Daemon IPC / local SQLite end-to-end', () => 
     expect(replies[0]).toMatchObject({ messageId: 'om_sent_1', responseKind: 'final', text: '直写验证' });
   }, 35_000);
 
+  it('records readable --card-file final card text through Daemon IPC, scrubbed', async () => {
+    const h = await createHarness({
+      sessionId: 'sess_card_file',
+      turnId: 'om_turn_card_file',
+      squatSessionTurns: true,
+    });
+    const cardPath = join(h.root, 'cart-cashback-card.json');
+    writeFileSync(cardPath, JSON.stringify({
+      schema: '2.0',
+      header: {
+        title: { tag: 'plain_text', content: '购物车返现' },
+        subtitle: { tag: 'plain_text', content: '已完成核算' },
+      },
+      body: { elements: [
+        { tag: 'markdown', content: "共返现 <font color='green'>**$4.70**</font>，凭据 Bearer abcDEF123456.secret" },
+        {
+          tag: 'table',
+          columns: [{ name: 'sku', display_name: 'SKU' }, { name: 'cb', display_name: '返现' }],
+          rows: [{ sku: 'A-1', cb: '$1.20' }],
+        },
+        {
+          tag: 'collapsible_panel',
+          header: { title: { tag: 'markdown', content: '计算明细' } },
+          elements: [{ tag: 'markdown', content: '满减后再按 5% 计算' }],
+        },
+      ] },
+    }));
+
+    const res = await runFixtureAsync(
+      ['send', '--card-file', cardPath, '--response-kind', 'final', '--no-mention'],
+      h.env(),
+    );
+    expect(res.code, res.stderr).toBe(0);
+    expect(res.stderr).not.toContain('could not record structured reply');
+
+    const replies = readSessionTurns(h.hostDataDir, 'sess_card_file', 0, 50).turns[0]?.replies ?? [];
+    expect(replies).toHaveLength(1);
+    expect(replies[0]).toMatchObject({ messageId: 'om_sent_1', responseKind: 'final' });
+    expect(replies[0]!.text).toBe([
+      '[卡片: 购物车返现]',
+      '已完成核算',
+      '共返现 **$4.70**，凭据 <redacted>',
+      '',
+      '| SKU | 返现 |\n| --- | --- |\n| A-1 | $1.20 |',
+      '',
+      '计算明细',
+      '满减后再按 5% 计算',
+    ].join('\n'));
+  }, 35_000);
+
+  it('records readable --card-json progress card text directly, and omits text for a card with none', async () => {
+    const h = await createHarness({
+      sessionId: 'sess_card_json',
+      turnId: 'om_turn_card_json',
+      squatSessionTurns: false,
+    });
+
+    const res = await runFixtureAsync(['send', '--no-mention', '--response-kind', 'progress', '--card-json', JSON.stringify({
+      header: { title: { tag: 'plain_text', content: '进度' } },
+      elements: [
+        { tag: 'div', text: { tag: 'lark_md', content: '已处理 2/3' } },
+        { tag: 'note', elements: [{ tag: 'plain_text', content: '预计 1 分钟' }] },
+      ],
+    })], h.env());
+    expect(res.code, res.stderr).toBe(0);
+    const empty = await runFixtureAsync(['send', '--no-mention', '--response-kind', 'progress', '--card-json', JSON.stringify({
+      schema: '2.0',
+      body: { elements: [{ tag: 'hr' }] },
+    })], h.env());
+    expect(empty.code, empty.stderr).toBe(0);
+    expect(empty.stderr).not.toContain('could not record structured reply');
+
+    const replies = readSessionTurns(h.hostDataDir, 'sess_card_json', 0, 50).turns[0]?.replies ?? [];
+    expect(replies).toHaveLength(2);
+    expect(replies[0]).toMatchObject({
+      messageId: 'om_sent_1',
+      responseKind: 'progress',
+      text: '[卡片: 进度]\n已处理 2/3\n预计 1 分钟',
+    });
+    // Each fixture process restarts its message-id counter; the second send is
+    // a distinct event because its `at` differs.
+    expect(replies[1]).toMatchObject({ messageId: 'om_sent_1', responseKind: 'progress' });
+    expect(replies[1]!.at).toBeGreaterThan(replies[0]!.at);
+    expect('text' in replies[1]!).toBe(false);
+  }, 35_000);
+
   it('heals a missing structured receipt on TurnSendLedger final replay with exact sentAtMs and zero duplicates', async () => {
     // Run 1: daemon IPC unavailable -> Lark delivers & TurnSendLedger persists final with exact sentAtMs,
     // while structured receipt cannot reach host turns.sqlite yet.
