@@ -22,7 +22,7 @@ const CLOSE_REQUEST_TIMEOUT_MS = 6_000;
 // `setsid()` bash tool children before we SIGTERM the ACP process group.
 const CANCEL_GRACE_TIMEOUT_MS = 1_500;
 const GRACEFUL_EXIT_TIMEOUT_MS = 1_500;
-export const DEFAULT_ATOMCODE_IDLE_RELEASE_MS = 120_000;
+const DEFAULT_ATOMCODE_IDLE_RELEASE_MS = 120_000;
 
 export type AtomcodeUserInputHandler = (
   method: 'elicitation/create' | 'session/request_permission',
@@ -46,12 +46,10 @@ export interface AtomcodeAcpSessionOptions {
   effort?: string;
   permission: 'full' | 'smart';
   /** Release an idle ACP child and its session lease after this many ms.
-   *  Defaults to DEFAULT_ATOMCODE_IDLE_RELEASE_MS; 0 closes after every turn. */
+   *  Defaults to 120_000ms; 0 closes after every turn. */
   idleTimeoutMs?: number;
   onSession?: (sessionId: string) => void;
 }
-
-export interface AtomcodeAcpOptions extends AtomcodeAcpSessionOptions, AtomcodeAcpTurnOptions {}
 
 export interface AtomcodeAcpResult {
   sessionId: string;
@@ -212,6 +210,11 @@ class AtomcodeAcpConnection {
     this.child.stderr.resume();
     this.child.stdin.on('error', () => this.fail(new Error('atomcode_acp_transport_closed')));
     this.child.on('error', () => this.fail(new Error('atomcode_acp_spawn_failed')));
+    // While idle, detach immediately on 'exit' rather than waiting for stdio 'close'
+    // (which can lag a tick or stall if a grandchild still holds a pipe open).
+    this.child.once('exit', () => {
+      if (!this.activeTurn && !this.wireClosed) this.fail(new Error('atomcode_acp_process_exited'));
+    });
     this.child.once('close', () => {
       if (!this.wireClosed) this.fail(new Error('atomcode_acp_process_exited'));
     });
@@ -301,7 +304,11 @@ class AtomcodeAcpConnection {
       && !this.closingRequested
       && !this.wireClosed
       && !this.childExited
-      && !this.activeTurn;
+      && !this.activeTurn
+      && this.child.exitCode === null
+      && this.child.signalCode === null
+      && !this.child.stdin.destroyed
+      && !this.child.stdin.writableEnded;
   }
 
   /** Execute a single `session/prompt` turn on this live connection. Leaves
@@ -659,14 +666,6 @@ export class AtomcodeAcpSession {
     this.idleTimeoutMs = rawIdle;
   }
 
-  get sessionId(): string | undefined {
-    return this.nativeSessionId;
-  }
-
-  isConnected(): boolean {
-    return !!this.connection?.isReusable();
-  }
-
   /** Run one turn on the warm connection, or open/resume a new one after any
    *  in-flight teardown finishes releasing its `.lease`. On success, arms the
    *  idle release timer (or closes immediately when `idleTimeoutMs === 0`); on
@@ -826,34 +825,5 @@ export class AtomcodeAcpSession {
     if (!this.idleTimer) return;
     clearTimeout(this.idleTimer);
     this.idleTimer = undefined;
-  }
-}
-
-/** One-shot wire client for AtomCode's ACP v1 NDJSON stdio server. Runs one
- *  turn and immediately releases the native session lease on exit. */
-export async function runAtomcodeAcp(
-  opts: AtomcodeAcpOptions,
-  signal: AbortSignal,
-): Promise<AtomcodeAcpResult> {
-  const session = new AtomcodeAcpSession({
-    executable: opts.executable,
-    cwd: opts.cwd,
-    env: opts.env,
-    nativeSessionId: opts.nativeSessionId,
-    model: opts.model,
-    effort: opts.effort,
-    permission: opts.permission,
-    idleTimeoutMs: 0,
-    onSession: opts.onSession,
-  });
-  try {
-    return await session.runTurn({
-      content: opts.content,
-      onUpdate: opts.onUpdate,
-      onUserInput: opts.onUserInput,
-      onInteractionPending: opts.onInteractionPending,
-    }, signal);
-  } finally {
-    await session.close(false);
   }
 }

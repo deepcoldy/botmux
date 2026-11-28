@@ -4,9 +4,10 @@ import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   AtomcodeAcpSession,
+  type AtomcodeAcpSessionOptions,
+  type AtomcodeAcpTurnOptions,
   createAtomcodeFrameReader,
   parseAtomcodeIdleTimeout,
-  runAtomcodeAcp,
 } from '../src/services/atomcode-acp.js';
 
 const fixtureScript = resolve('test/fixtures/fake-atomcode-acp.mjs');
@@ -32,6 +33,53 @@ function createFixture(extraEnv: Record<string, string> = {}) {
       }
     },
   };
+}
+
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isSpawnGone(spawnEntry: { pid: number; ppid?: number } | undefined): boolean {
+  if (!spawnEntry?.pid) return false;
+  if (isPidAlive(spawnEntry.pid)) return false;
+  // spawnOwnedModelProcess wraps the native CLI in an OWNER_GUARD shell (ppid);
+  // wait until that wrapper exits too so the OS child process has actually closed.
+  if (spawnEntry.ppid && spawnEntry.ppid !== process.pid && isPidAlive(spawnEntry.ppid)) {
+    return false;
+  }
+  return true;
+}
+
+async function runSingleTurn(
+  opts: AtomcodeAcpSessionOptions & AtomcodeAcpTurnOptions,
+  signal: AbortSignal,
+) {
+  const session = new AtomcodeAcpSession({
+    executable: opts.executable,
+    cwd: opts.cwd,
+    env: opts.env,
+    nativeSessionId: opts.nativeSessionId,
+    model: opts.model,
+    effort: opts.effort,
+    permission: opts.permission,
+    idleTimeoutMs: 0,
+    onSession: opts.onSession,
+  });
+  try {
+    return await session.runTurn({
+      content: opts.content,
+      onUpdate: opts.onUpdate,
+      onUserInput: opts.onUserInput,
+      onInteractionPending: opts.onInteractionPending,
+    }, signal);
+  } finally {
+    await session.close(false);
+  }
 }
 
 async function waitFor(check: () => boolean, timeoutMs = 5_000): Promise<void> {
@@ -70,11 +118,11 @@ describe('parseAtomcodeIdleTimeout', () => {
   });
 });
 
-describe('runAtomcodeAcp', () => {
+describe('AtomcodeAcpSession single-turn mode', () => {
   it('starts a new session, applies model/effort/mode options, and closes cleanly', async () => {
     const f = createFixture();
     const sessions: string[] = [];
-    const result = await runAtomcodeAcp({
+    const result = await runSingleTurn({
       executable: f.bin,
       cwd: f.root,
       env: f.env,
@@ -98,7 +146,7 @@ describe('runAtomcodeAcp', () => {
 
   it('resumes an existing session and ignores pre-prompt replay updates', async () => {
     const f = createFixture();
-    const result = await runAtomcodeAcp({
+    const result = await runSingleTurn({
       executable: f.bin,
       cwd: f.root,
       env: f.env,
@@ -118,7 +166,7 @@ describe('runAtomcodeAcp', () => {
   it('retains only the final assistant message block across tool calls and messageId changes', async () => {
     const f = createFixture();
     const updates: string[] = [];
-    const result = await runAtomcodeAcp({
+    const result = await runSingleTurn({
       executable: f.bin,
       cwd: f.root,
       env: f.env,
@@ -135,7 +183,7 @@ describe('runAtomcodeAcp', () => {
   it('bridges elicitation/create and session/request_permission while toggling onInteractionPending', async () => {
     const f = createFixture();
     const pendingTransitions: boolean[] = [];
-    const formResult = await runAtomcodeAcp({
+    const formResult = await runSingleTurn({
       executable: f.bin,
       cwd: f.root,
       env: f.env,
@@ -150,7 +198,7 @@ describe('runAtomcodeAcp', () => {
     expect(formResult.content).toBe('form:{"action":"accept","content":{"answer":"B"}}');
     expect(pendingTransitions).toEqual([true, false]);
 
-    const permResult = await runAtomcodeAcp({
+    const permResult = await runSingleTurn({
       executable: f.bin,
       cwd: f.root,
       env: f.env,
@@ -166,7 +214,7 @@ describe('runAtomcodeAcp', () => {
 
   it('fails closed on unavailable model, unsupported protocol version, refusal, and abort', async () => {
     const f = createFixture();
-    await expect(runAtomcodeAcp({
+    await expect(runSingleTurn({
       executable: f.bin,
       cwd: f.root,
       env: f.env,
@@ -177,7 +225,7 @@ describe('runAtomcodeAcp', () => {
     }, new AbortController().signal)).rejects.toThrow(/不支持配置 model=missing-model/);
 
     const fVer = createFixture({ ATOMCODE_ACP_SCENARIO: 'version' });
-    await expect(runAtomcodeAcp({
+    await expect(runSingleTurn({
       executable: fVer.bin,
       cwd: fVer.root,
       env: fVer.env,
@@ -186,7 +234,7 @@ describe('runAtomcodeAcp', () => {
       onUserInput: async () => ({}),
     }, new AbortController().signal)).rejects.toThrow(/atomcode_acp_version_unsupported/);
 
-    await expect(runAtomcodeAcp({
+    await expect(runSingleTurn({
       executable: f.bin,
       cwd: f.root,
       env: f.env,
@@ -197,7 +245,7 @@ describe('runAtomcodeAcp', () => {
 
     const controller = new AbortController();
     setTimeout(() => controller.abort(), 80);
-    await expect(runAtomcodeAcp({
+    await expect(runSingleTurn({
       executable: f.bin,
       cwd: f.root,
       env: f.env,
@@ -209,7 +257,7 @@ describe('runAtomcodeAcp', () => {
 
   it('replies -32601 to unsupported client methods without breaking the turn', async () => {
     const f = createFixture();
-    const result = await runAtomcodeAcp({
+    const result = await runSingleTurn({
       executable: f.bin,
       cwd: f.root,
       env: f.env,
@@ -222,7 +270,7 @@ describe('runAtomcodeAcp', () => {
 
   it('accepts a decoded 8 MB reply whose NDJSON frame exceeds 8 MB via envelope and escaping', async () => {
     const f = createFixture();
-    const ascii = await runAtomcodeAcp({
+    const ascii = await runSingleTurn({
       executable: f.bin,
       cwd: f.root,
       env: f.env,
@@ -232,7 +280,7 @@ describe('runAtomcodeAcp', () => {
     }, new AbortController().signal);
     expect(Buffer.byteLength(ascii.content)).toBe(8_000_000);
 
-    const quoted = await runAtomcodeAcp({
+    const quoted = await runSingleTurn({
       executable: f.bin,
       cwd: f.root,
       env: f.env,
@@ -244,7 +292,7 @@ describe('runAtomcodeAcp', () => {
 
     // Six-byte control-char escaping: only 2.8 MB decoded but ~16.8 MB on the
     // wire. Must stay within the frame cap derived from the 6x content ratio.
-    const nul = await runAtomcodeAcp({
+    const nul = await runSingleTurn({
       executable: f.bin,
       cwd: f.root,
       env: f.env,
@@ -257,7 +305,7 @@ describe('runAtomcodeAcp', () => {
 
   it('still rejects decoded content past the 8 MB cap and wire frames past the line cap', async () => {
     const f = createFixture();
-    await expect(runAtomcodeAcp({
+    await expect(runSingleTurn({
       executable: f.bin,
       cwd: f.root,
       env: f.env,
@@ -266,7 +314,7 @@ describe('runAtomcodeAcp', () => {
       onUserInput: async () => ({}),
     }, new AbortController().signal)).rejects.toThrow(/atomcode_acp_content_limit/);
 
-    await expect(runAtomcodeAcp({
+    await expect(runSingleTurn({
       executable: f.bin,
       cwd: f.root,
       env: f.env,
@@ -277,7 +325,7 @@ describe('runAtomcodeAcp', () => {
   });
 });
 
-describe('AtomcodeAcpSession', () => {
+describe('AtomcodeAcpSession persistent lifecycle', () => {
   it('reuses one warm ACP process across consecutive turns including interactive prompts without state leakage', async () => {
     const f = createFixture();
     const sessions: string[] = [];
@@ -292,13 +340,15 @@ describe('AtomcodeAcpSession', () => {
       onSession: sid => sessions.push(sid),
     });
 
+    let firstSpawn: { pid: number; ppid?: number } | undefined;
     try {
       const r1 = await session.runTurn({
         content: 'multi-round',
         onUserInput: async () => ({}),
       }, new AbortController().signal);
       expect(r1).toEqual({ sessionId: 'acp-fixture-session-1', content: 'final answer' });
-      expect(session.isConnected()).toBe(true);
+      firstSpawn = f.readLog().find(e => Array.isArray(e.args));
+      expect(isPidAlive(firstSpawn!.pid)).toBe(true);
 
       const pendingTransitions: boolean[] = [];
       const r2 = await session.runTurn({
@@ -319,7 +369,7 @@ describe('AtomcodeAcpSession', () => {
       await session.close();
     }
 
-    expect(session.isConnected()).toBe(false);
+    expect(isSpawnGone(firstSpawn)).toBe(true);
     const entries = f.readLog();
     const spawns = entries.filter(e => Array.isArray(e.args));
     expect(spawns).toHaveLength(1);
@@ -346,8 +396,9 @@ describe('AtomcodeAcpSession', () => {
         onUserInput: async () => ({}),
       }, new AbortController().signal);
       expect(r1.sessionId).toBe('acp-fixture-session-1');
+      const firstSpawn = f.readLog().find(e => Array.isArray(e.args));
 
-      await waitFor(() => f.readLog().some(e => e.event === 'close_done') && !session.isConnected());
+      await waitFor(() => f.readLog().some(e => e.event === 'close_done') && isSpawnGone(firstSpawn));
 
       const r2 = await session.runTurn({
         content: 'after-idle',
@@ -427,20 +478,20 @@ describe('AtomcodeAcpSession', () => {
         content: 'crash',
         onUserInput: async () => ({}),
       }, new AbortController().signal)).rejects.toThrow(/atomcode_acp_process_exited/);
-      expect(session.isConnected()).toBe(false);
-      expect(session.sessionId).toBe('acp-fixture-session-1');
 
       const rAfterCrash = await session.runTurn({
         content: 'after-crash',
         onUserInput: async () => ({}),
       }, new AbortController().signal);
-      expect(rAfterCrash.content).toContain('echo:after-crash');
+      expect(rAfterCrash).toEqual({
+        sessionId: 'acp-fixture-session-1',
+        content: 'echo:after-crash|mode=bypass|model=demo-default|effort=off',
+      });
 
       await expect(session.runTurn({
         content: 'invalid-json',
         onUserInput: async () => ({}),
       }, new AbortController().signal)).rejects.toThrow();
-      expect(session.isConnected()).toBe(false);
 
       const rAfterBadJson = await session.runTurn({
         content: 'after-bad-json',
@@ -454,7 +505,6 @@ describe('AtomcodeAcpSession', () => {
         content: 'hang',
         onUserInput: async () => ({}),
       }, abortController.signal)).rejects.toThrow(/aborted/);
-      expect(session.isConnected()).toBe(false);
 
       const rAfterAbort = await session.runTurn({
         content: 'after-abort',
@@ -488,8 +538,9 @@ describe('AtomcodeAcpSession', () => {
           onUserInput: async () => ({}),
         }, new AbortController().signal);
         expect(r1.sessionId).toBe('acp-fixture-session-1');
+        const firstSpawn = f.readLog().find(e => Array.isArray(e.args));
 
-        await waitFor(() => !session.isConnected());
+        await waitFor(() => isSpawnGone(firstSpawn));
 
         const r2 = await session.runTurn({
           content: `recovered-${trigger}`,

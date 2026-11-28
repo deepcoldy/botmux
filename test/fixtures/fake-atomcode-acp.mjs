@@ -2,7 +2,7 @@ import { appendFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 
 const log = value => process.env.ATOMCODE_TEST_LOG && appendFileSync(process.env.ATOMCODE_TEST_LOG, JSON.stringify(value) + '\n');
-log({ pid: process.pid, args: process.argv.slice(2), owner: process.env.BOTMUX_OWNER_OPEN_ID, home: process.env.ATOMCODE_HOME });
+log({ pid: process.pid, ppid: process.ppid, args: process.argv.slice(2), owner: process.env.BOTMUX_OWNER_OPEN_ID, home: process.env.ATOMCODE_HOME });
 
 const send = value => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...value }) + '\n');
 const NUL = String.fromCharCode(0);
