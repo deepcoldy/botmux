@@ -55,6 +55,7 @@ macOS 上用 Codex / Codex App 时，如果 PATH 里找不到 `codex`，botmux �
 | `zcode` | ZCode | `zcode` | 本地进程 | ✅ |
 | `doubao` | Doubao CLI（见 [Doubao 使用指南](https://github.com/deepcoldy/botmux/blob/master/docs/doubao.md)） | `doubao` | 本地进程 | ✅ |
 | `nca` | NCA | `nca` | 本地进程 | ✅ |
+| `atomcode` | AtomCode（通过 `atomcode acp` 常驻 runner 接入） | `atomcode` | 本地进程 | ✅ |
 | `pi` | Pi | `pi` | 本地进程 | ✅ |
 | `oh-my-pi` | Oh My Pi（Pi 的分支） | `omp` | 本地进程 | ✅ |
 | `aiden` | Aiden（原生 agent） | `aiden` | 本地进程 | |
@@ -283,7 +284,7 @@ Remote Runner 通过 JSONL 协议接任意远端 Agent 平台。botmux 起一个
 
 ### 新接入的 CLI 怎么用 {#new-clis}
 
-Grok Build、Reasonix、OpenCode 2、DeepSeek Harness（dsh / dsh-tui）、MiniMax Code（mcode）、MiMoCode、CodeM、ZCode、Doubao、NCA 都是内置适配器，不用额外开关。启用步骤和换别的 CLI 一样（见上文[怎么给机器人换 CLI](#怎么给机器人换-cli)）：先在 daemon 的系统用户下装好对应命令并登录，然后把 Bot 的 `cliId` 设成下表的值。
+Grok Build、Reasonix、OpenCode 2、DeepSeek Harness（dsh / dsh-tui）、MiniMax Code（mcode）、MiMoCode、CodeM、ZCode、Doubao、NCA、AtomCode 都是内置适配器，不用额外开关。启用步骤和换别的 CLI 一样（见上文[怎么给机器人换 CLI](#怎么给机器人换-cli)）：先在 daemon 的系统用户下装好对应命令并登录，然后把 Bot 的 `cliId` 设成下表的值。
 
 | CLI | `cliId` | 默认命令 |
 |---|---|---|
@@ -297,6 +298,7 @@ Grok Build、Reasonix、OpenCode 2、DeepSeek Harness（dsh / dsh-tui）、MiniM
 | ZCode | `zcode` | `zcode` |
 | Doubao | `doubao` | `doubao` |
 | NCA | `nca` | `nca` |
+| AtomCode | `atomcode` | `atomcode` |
 
 **Forge × TraeX**：想经 Forge 启动 TraeX，在 `botmux setup` 或 Dashboard 的 CLI 菜单里选「Forge x TraeX」，或在 `bots.json` 写 `"cliId": "traex", "cliLaunchMode": "forge-traex"`。botmux 会改用 `forge run --agent traex --agent-args ...` 启动，所以 `forge` 要在 PATH 上。这种启动方式只能配 `cliId: "traex"`，而且不能和 `wrapperCli`、`cliRuntime`、`cliPathOverride`、文件沙盒或 `readIsolation` 一起用，否则配置会被拒绝。
 
@@ -411,6 +413,15 @@ mircli mcp status
 ```bash
 MIRCLI_AUTO_START_MIRAMCP=0 botmux start
 ```
+
+### AtomCode
+
+先用运行 BotMux daemon 的同一账号安装并登录本地 `atomcode`（例如 `atomcode login` 或在 `~/.atomcode/config.toml` 配置模型），再在 Setup 选择 AtomCode（序号 `37`）或设置 `cliId: "atomcode"`。
+
+- **协议与会话续期**：BotMux 通过常驻 `atomcode-runner` 驱动原生 `atomcode --no-telemetry acp`，首轮 `session/new` 后保存原生会话 ID，后续轮次自动 `session/resume`；本地终端恢复使用 `atomcode resume <id>`。
+- **模型与思考强度**：自动从 `~/.atomcode/config.toml`（或 `ATOMCODE_HOME/config.toml`）探测 `[models.*]` / `[providers.*]` 逻辑模型；思考强度支持 ACP 的 `high` / `max`（留空则沿用 AtomCode 默认）。
+- **权限审批与表单提问**：关闭自动放行（`disableCliBypass: true`）时，工具审批（`session/request_permission`）与结构化提问（`elicitation/create`）自动桥接至飞书交互卡片；真人等待期间单轮总预算暂停计时。
+- **卡片压缩与工作流**：支持飞书卡片 `/compact` 上下文压缩按钮，并已接入 `workflows/v3` 节点执行。
 
 ### NCA
 
