@@ -345,6 +345,7 @@ import { createDashboardExecutableResolver, resolveDashboardRuntimeUpdateTargets
 import type { ConnectorDefinition } from './services/connector-store.js';
 import {
   buildSkillInstallAuditSummary,
+  installLocalSkillCopies,
   installLocalSkillLinks,
   readSkillRegistry,
   removeInstalledSkill,
@@ -395,7 +396,7 @@ import {
 import type { BotSkillPolicy, SkillPack, SkillPackage, SkillSelector } from './core/skills/types.js';
 import { discoverNativeCliSkillGroups } from './core/skills/discovery.js';
 import { analyzeSkillReferences, packsContainingSkill, type SkillReferenceBot, type SkillReferenceSummary } from './core/skills/references.js';
-import { discoverDashboardSkills, installDashboardSkill, parseDashboardSkillInstallRequest, parseInstallLocalLinksSources, MAX_LOCAL_LINK_SOURCES } from './dashboard/skill-install-request.js';
+import { discoverDashboardSkills, installDashboardSkill, parseDashboardSkillInstallRequest, parseInstallLocalLinksMode, parseInstallLocalLinksSources, MAX_LOCAL_LINK_SOURCES } from './dashboard/skill-install-request.js';
 import { botDefaultsPayload, botSummaryPayload, brandMapByAppId, mergeBotOncallFields, sparseOverridesFromRawBotConfig, withConfiguredCliId, type ConfiguredBotAgentFields } from './dashboard/bot-payload.js';
 import {
   handleVcMeetingConsumerProfilesGet,
@@ -6320,8 +6321,11 @@ const server = createServer(async (req, res) => {
       const sources = parseInstallLocalLinksSources(parsed);
       if (sources.length === 0) return jsonRes(res, 400, { ok: false, error: 'sources_required' });
       if (sources.length > MAX_LOCAL_LINK_SOURCES) return jsonRes(res, 400, { ok: false, error: 'too_many_sources' });
+      const mode = parseInstallLocalLinksMode(parsed);
       try {
-        const skills = installLocalSkillLinks(sources);
+        const skills = mode === 'copy'
+          ? installLocalSkillCopies(sources)
+          : installLocalSkillLinks(sources);
         // Frontend re-fetches /api/skills (refresh()) after success, so we keep
         // the response lean — no need to spread a full dashboardSkillsPayload()
         // (which would re-run the native-skill discovery scan a second time).

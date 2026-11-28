@@ -224,6 +224,47 @@ export function installLocalSkillLinks(dirs: readonly string[]): SkillPackage[] 
   return installed;
 }
 
+export function installLocalSkillCopies(dirs: readonly string[]): SkillPackage[] {
+  const uniqueDirs = [...new Set(dirs.map((dir) => resolve(dir)))];
+  return withManagedDirectories(uniqueDirs, () => {
+    // Validate and collapse by skill NAME (last-wins) before touching the store
+    // or registry, mirroring installLocalSkillLinks.
+    const byName = new Map<string, { sourceDir: string; id: string }>();
+    for (const sourceDir of uniqueDirs) {
+      let provisional: SkillPackage;
+      try {
+        provisional = loadSkillPackage(sourceDir, { source: { type: 'local-copy', originalPath: sourceDir } });
+        const targetDir = join(skillStoreDir(), provisional.name);
+        assertNoCopyOverlap(sourceDir, targetDir);
+      } catch (err: any) {
+        throw new Error(`local_copy_failed:${sourceDir}:${err?.message ?? String(err)}`);
+      }
+      byName.set(provisional.name, { sourceDir, id: provisional.id });
+    }
+    const now = new Date().toISOString();
+    const registry = readSkillRegistry();
+    const installed: SkillPackage[] = [];
+    for (const [name, item] of byName.entries()) {
+      const rootDir = join(skillStoreDir(), name);
+      try {
+        rmSync(rootDir, { recursive: true, force: true });
+        mkdirSync(dirname(rootDir), { recursive: true });
+        cpSync(item.sourceDir, rootDir, { recursive: true });
+        const pkg = loadSkillPackage(rootDir, {
+          source: { type: 'local-copy', originalPath: item.sourceDir },
+          id: item.id,
+        });
+        registry.skills[pkg.name] = { ...pkg, installedAt: now, updatedAt: now };
+        installed.push(registry.skills[pkg.name]);
+      } catch (err: any) {
+        throw new Error(`local_copy_failed:${item.sourceDir}:${err?.message ?? String(err)}`);
+      }
+    }
+    writeSkillRegistry(registry);
+    return installed;
+  });
+}
+
 function sourceId(url: string): string {
   return createHash('sha256').update(url).digest('hex').slice(0, 16);
 }

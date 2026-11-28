@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { MAX_LOCAL_LINK_SOURCES, discoverDashboardSkills, parseDashboardSkillInstallRequest, parseInstallLocalLinksSources, shouldAutoLinkLocalSkillPath } from '../src/dashboard/skill-install-request.js';
+import { MAX_LOCAL_LINK_SOURCES, discoverDashboardSkills, parseDashboardSkillInstallRequest, parseInstallLocalLinksMode, parseInstallLocalLinksSources, shouldAutoLinkLocalSkillPath } from '../src/dashboard/skill-install-request.js';
 
 describe('dashboard skill install request parsing', () => {
   it('rejects lightweight install errors before starting a job', () => {
@@ -102,18 +102,39 @@ describe('dashboard skill install request parsing', () => {
     expect(MAX_LOCAL_LINK_SOURCES).toBeGreaterThan(0);
   });
 
-  it('auto-links native local skill library paths without a dashboard toggle', () => {
+  it('auto-links native local skill library paths without a dashboard toggle, except versioned plugin caches', () => {
     expect(shouldAutoLinkLocalSkillPath('/Users/me/.codex/skills/deploy')).toBe(true);
     expect(shouldAutoLinkLocalSkillPath('/Users/me/.claude/skills/deploy')).toBe(true);
     expect(shouldAutoLinkLocalSkillPath('/repo/.agents/skills/deploy')).toBe(true);
     expect(shouldAutoLinkLocalSkillPath('/repo/custom-skills/deploy')).toBe(false);
+    // Versioned plugin caches (e.g. ~/.claude/plugins/cache/.../7.0.0/skills/...)
+    // must default to copy mode so plugin upgrades do not break the link.
+    expect(shouldAutoLinkLocalSkillPath('/Users/me/.claude/plugins/cache/claude-plugins-official/superpowers/7.0.0/skills/writing-skills')).toBe(false);
     expect(parseDashboardSkillInstallRequest({ source: '/Users/me/.codex/skills/deploy' })).toMatchObject({
       kind: 'local',
       link: true,
+    });
+    expect(parseDashboardSkillInstallRequest({ source: '/Users/me/.codex/skills/deploy', link: false })).toMatchObject({
+      kind: 'local',
+      link: false,
+    });
+    expect(parseDashboardSkillInstallRequest({
+      source: '/Users/me/.claude/plugins/cache/claude-plugins-official/superpowers/7.0.0/skills/writing-skills',
+    })).toMatchObject({
+      kind: 'local',
+      link: false,
     });
     expect(parseDashboardSkillInstallRequest({ source: '/repo/custom-skills/deploy' })).toMatchObject({
       kind: 'local',
       link: false,
     });
+  });
+
+  it('parses optional batch install mode with backward-compatible link default', () => {
+    expect(parseInstallLocalLinksMode({ sources: ['/a'] })).toBe('link');
+    expect(parseInstallLocalLinksMode({ sources: ['/a'], mode: 'link' })).toBe('link');
+    expect(parseInstallLocalLinksMode({ sources: ['/a'], mode: 'copy' })).toBe('copy');
+    expect(parseInstallLocalLinksMode({ sources: ['/a'], copy: true })).toBe('copy');
+    expect(parseInstallLocalLinksMode(null)).toBe('link');
   });
 });
