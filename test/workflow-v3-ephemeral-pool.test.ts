@@ -691,6 +691,23 @@ describe('v3 ephemeral pool', () => {
       }
     });
 
+    it('fails before spawn when assistantMode turns on while its secret is being resolved', async () => {
+      configureBots([nodeBot]);
+      const spawn = vi.fn((): WorkerHandle => { throw new Error('unexpected spawn'); });
+      const req = request();
+      const failure = await createEphemeralPool({ factory: { spawn }, workerPath: '/tmp/worker.js',
+        resolveLarkAppSecret: async () => {
+          // The entry assistant check passed; the flag flips on during the wait,
+          // so only the authoritative pre-spawn re-read can refuse it.
+          configureBots([{ ...nodeBot, assistantMode: true }]);
+          return 'secret';
+        } }).runNode(req).then(() => undefined, (err: unknown) => err);
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).toContain('assistant');
+      expect(spawn).not.toHaveBeenCalled();
+      expect(readV3AttemptWorkerFence(req.attemptDir, req)).toMatchObject({ phase: 'closed_no_spawn', reason: 'setup_failed' });
+    });
+
     it('still returns cancelled when the attempt is cancelled during the wait in which its bot left bots.json', async () => {
       configureBots([nodeBot]);
       const factory = factoryFor(new ScriptedWorker());
