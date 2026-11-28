@@ -105,7 +105,11 @@ function fixture(options: { acceptsRescue?: boolean; screen?: string; dispatchAt
 }
 
 describe('unconfirmed input that left the TRAE composer', () => {
-  it('keeps native queued input through the real PTY renderer without collapsing its structural indentation', async () => {
+  // xterm-headless parses writes on async internal tasks. In bun:test's single
+  // process those tasks interleave with the fixture's fake timers and perturb
+  // the later fake-timer cases in this file; the render-fidelity assertion stays
+  // fully covered under vitest's Node workers, so run it Node-only.
+  it.skipIf(!!process.versions.bun)('keeps native queued input through the real PTY renderer without collapsing its structural indentation', async () => {
     const renderer = new TerminalRenderer(160, 50);
     try {
       const pending = `✦ Running… (1m • esc to interrupt)\nSend after tool call · esc to interrupt and send · ↑ to edit\n❯ original input\n${Array(25).fill('  continued native input').join('\n')}\n─────────────────────────\n❯ Use /skills to list available skills\n  GPT-6-Astra xhigh · Context 99% left\n  ? for shortcuts`;
@@ -135,7 +139,9 @@ describe('unconfirmed input that left the TRAE composer', () => {
     }
   });
 
-  it('keeps a wrapped native pending-input panel through the real narrow PTY renderer', async () => {
+  // Same xterm/fake-timer interleaving as the real-PTY case above; the narrow
+  // renderer assertion is covered under vitest's Node workers.
+  it.skipIf(!!process.versions.bun)('keeps a wrapped native pending-input panel through the real narrow PTY renderer', async () => {
     const empty = '❯ Use /skills to list available skills\n  m · Context 99% left\n  ? for shortcuts';
     expect(traexScreenShowsNoPendingInput(empty)).toBe(true);
     const pending = `Send after tool call · esc to interrupt and send · ↑ to edit\n❯ original input\n${Array(25).fill('  continued native input').join('\n')}\n${empty}`;
