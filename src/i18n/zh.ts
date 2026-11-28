@@ -1984,6 +1984,7 @@ export const messages: Record<string, string> = {
   'worker.turn_terminal_receipt.completed_superseded': '✓ 本轮已结束',
   'worker.turn_terminal_receipt.silent_superseded': '✓ 本轮已结束（AI 判断无需回复）',
   'worker.empty_final_failed': '⚠️ {cliName} 本轮执行失败：{reason}\n完整错误已保留在 Web 终端和 daemon 日志中；排除问题后请重发消息。',
+  'worker.empty_final_failed_model_unavailable': '⚠️ 当前模型不可用，本轮未完成。请在原话题发送「重试」或「继续」；如本轮已尝试写入、提交或发布，请先核对结果，不要直接重复操作。',
   'worker.empty_final_failed_invalid_request': '⚠️ {cliName} 请求被拒绝：{reason}\n请检查 CLI、模型网关和工具 schema 配置，修复后重发消息。',
   'worker.empty_final_failed_auth': '⚠️ {cliName} 认证失败：{reason}\n请检查 CLI 登录状态和模型服务凭证，修复后重发消息。',
   'worker.empty_final_failed_connection': '⚠️ {cliName} 连接模型服务失败：{reason}\n请检查网络与模型服务状态，恢复后重发消息。',

@@ -2478,7 +2478,10 @@ type DaemonToWorkerBase =
   | { type: 'term_action'; key: TermActionKey }
   /** Exact turn-level interruption. The worker verifies `turnId` against its
    * own active turn before injecting Ctrl+C and acknowledges the result. */
-  | { type: 'interrupt_turn'; requestId: string; turnId: string }
+  | { type: 'interrupt_turn'; requestId: string; turnId: string; modelRemoval?: {
+      model: string; launchGeneration: string;
+      observation: import('./core/model-removal-interrupt.js').ModelRemovalObservation;
+    } }
   | { type: 'refresh_screen' }
   // Claude-family SessionStart 信号：CLI hook 经 `botmux session-ready` 调到
   // daemon。requestId 让 daemon 等到 worker 已清掉启动选择器留下的旧 prompt

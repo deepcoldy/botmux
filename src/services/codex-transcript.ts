@@ -545,6 +545,7 @@ export function codexCotEntriesFromResponseItem(p: any): CodexCotEntry[] {
 export const CODEX_RATE_LIMIT_ERROR_CODE = 'codex_rate_limited';
 export const CODEX_AUTH_ERROR_CODE = 'codex_auth_failed';
 export const CODEX_INVALID_REQUEST_ERROR_CODE = 'codex_invalid_request';
+export const CODEX_MODEL_UNAVAILABLE_ERROR_CODE = 'codex_model_unavailable';
 export const CODEX_CONNECTION_ERROR_CODE = 'codex_connection_failed';
 /** Model gateway / upstream service failure (5xx, gRPC stream cancel, …):
  *  the request reached the model service but the SERVER side failed. Distinct
@@ -788,6 +789,16 @@ export function codexTaskFailureCode(error: unknown): string {
  *  so TRAE / pi keep their taxonomy (TraeX continuation would otherwise start
  *  retrying an exhausted quota as a transient rate limit). */
 export function codexRolloutFailureCode(error: unknown): string {
+  // Only an exact, structured provider code is evidence of model rejection.
+  // Do not classify a transient 503, an arbitrary message, or a tool's output
+  // as a withdrawn model. Keep the shared TraeX classifier unchanged.
+  const leaf = codexFailureLeaf(error);
+  if (leaf && typeof leaf === 'object') {
+    const code = (leaf as Record<string, unknown>).code;
+    if (typeof code === 'string' && /^(model_not_found|model_not_available|model_unavailable)$/.test(code)) {
+      return CODEX_MODEL_UNAVAILABLE_ERROR_CODE;
+    }
+  }
   if (isCodexUsageLimitError(error)) return CODEX_RATE_LIMIT_ERROR_CODE;
   if (isCodexCapacityError(error)) return CODEX_CAPACITY_ERROR_CODE;
   return codexTaskFailureCode(error);

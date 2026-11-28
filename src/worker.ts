@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { isModelRemovalAbort, shouldInterruptRemovedModel, type ModelRemovalInterruptReceipt } from './core/model-removal-interrupt.js';
 import { isCliStartupFailure } from './core/cli-startup-failure.js';
 import { fingerprintPromptText, removePromptContextForTurn, rekeyPromptContextWithFallback } from './services/prompt-context-store.js';
 import { readLatestNativeGoal, readNativeGoalForRollout } from './services/native-goal-state.js';
@@ -503,7 +504,7 @@ import {
   setCodexAppThreadName,
 } from './services/codex-app-threads.js';
 import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
-import { CODEX_CAPACITY_ERROR_CODE, CODEX_AUTH_ERROR_CODE, CODEX_PAYLOAD_TOO_LARGE_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, readCodexLiveSessionId, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexGenerationSessionIdFromRolloutPath, isCodexRateLimitEvent, codexSessionsRootFromRolloutPath, scanCodexThreadSettings, readLatestCodexRuntime, codexRolloutHasAsyncQuestionReply, findPendingCodexAsyncQuestion, selectNewCodexAsyncQuestions, type CodexAsyncQuestionRecord, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
+import { CODEX_CAPACITY_ERROR_CODE, CODEX_AUTH_ERROR_CODE, CODEX_PAYLOAD_TOO_LARGE_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_MODEL_UNAVAILABLE_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, readCodexLiveSessionId, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexGenerationSessionIdFromRolloutPath, isCodexRateLimitEvent, codexSessionsRootFromRolloutPath, scanCodexThreadSettings, readLatestCodexRuntime, codexRolloutHasAsyncQuestionReply, findPendingCodexAsyncQuestion, selectNewCodexAsyncQuestions, type CodexAsyncQuestionRecord, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
 import { parseCodexAsyncQuestions } from './services/codex-async-user-input.js';
 import { codexConsumedRolloutEvents, codexEventsWithStableIds } from './services/codex-rollout-replay.js';
 import { PI_CREDENTIAL_ERROR_CODE, adoptPiTranscriptIntoBotmuxDir, piPersistentTranscriptDir, piPreviousTranscriptDir, piProfileTranscriptDir, piSessionUsesBotmuxDir } from './services/pi-transcript.js';
@@ -14408,6 +14409,9 @@ function emptyCompletedBridgeFallbackContent(): string {
 }
 
 function failedBridgeFailureText(errorCode?: string, summary?: string): string {
+  if (errorCode === CODEX_MODEL_UNAVAILABLE_ERROR_CODE) {
+    return t('worker.empty_final_failed_model_unavailable');
+  }
   const reason = summary || t('worker.failed_reason_unavailable');
   const key = errorCode === TRAEX_TOOL_IMAGE_UPLOAD_ERROR_CODE
     ? 'worker.empty_final_failed_tool_image_upload'
@@ -22265,13 +22269,17 @@ function emitReadyCodexTurns(settledQuotaTurns?: CodexPendingTurn[]): void {
       : {};
     const sourceHermesSessionId = structuredBridgeIs('hermes') ? turn.sourceSessionId : undefined;
     const nextBoundaryMs = (i + 1 < ready.length ? ready[i + 1].markTimeMs : nextPendingMarkTimeMs);
+    // A confirmed native abort still has uncertain effects; change only the
+    // reply text, never the native terminal's ambiguity or replay eligibility.
+    const removalAbort = isModelRemovalAbort(lastModelRemovalInterrupt, turn, cliSpawnGeneration);
+    const noticeCode = removalAbort ? CODEX_MODEL_UNAVAILABLE_ERROR_CODE : turn.terminalErrorCode;
     const gateInput = bridgeGateInputForTurn(sessionId, turn, {
       markTimeMs: turn.markTimeMs,
       isLocal: turn.isLocal,
       forwardLocalFinal: zeroPromptTerminalSync(),
       finalText: turn.finalText,
-      terminalStatus: turn.terminalStatus,
-      terminalErrorCode: turn.terminalErrorCode,
+      terminalStatus: removalAbort ? 'failed' : turn.terminalStatus,
+      terminalErrorCode: noticeCode,
     }, lastInitConfig?.chatId, lastInitConfig?.rootMessageId);
     // The rate-limit skip is narrowed to CLIs with a dedicated structured
     // rate-limit chain (Codex): TRAE 429 has no such chain, so skipping the
@@ -22305,7 +22313,7 @@ function emitReadyCodexTurns(settledQuotaTurns?: CodexPendingTurn[]): void {
     }
     const content = fallbackKind === 'failed'
       ? composeFailedBridgeFallbackContent(
-          failedBridgeFailureText(turn.terminalErrorCode, turn.terminalErrorSummary),
+          failedBridgeFailureText(noticeCode, turn.terminalErrorSummary),
           gateInput,
           nextBoundaryMs,
           markers,
@@ -22404,8 +22412,8 @@ function emitReadyCodexTurns(settledQuotaTurns?: CodexPendingTurn[]): void {
       // silently in bot-to-bot sessions.
       ...(fallbackKind === 'failed' ? {
         turnFailed: true,
-        turnFailureCode: turn.terminalErrorCode || 'worker_turn_failed',
-        turnFailureNotice: failedBridgeFailureText(turn.terminalErrorCode, turn.terminalErrorSummary),
+        turnFailureCode: noticeCode || 'worker_turn_failed',
+        turnFailureNotice: failedBridgeFailureText(noticeCode, turn.terminalErrorSummary),
       } : {}),
       ...(fallbackKind === 'empty_completed' ? { emptyCompletedNotice: true } : {}),
     });
@@ -25343,8 +25351,13 @@ async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
 /** Deliver Ctrl+C only when the daemon's requested turn is still the worker's
  *  active turn. This is deliberately separate from card `term_action`: a stale
  *  HTTP request must never interrupt a newer turn that reused this CLI process. */
-async function handleExactTurnInterrupt(requestId: string, turnId: string): Promise<void> {
-  if (activeTranscriptImagePurge?.turnId === turnId
+let lastModelRemovalInterrupt: ModelRemovalInterruptReceipt | undefined;
+
+async function handleExactTurnInterrupt(
+  requestId: string, turnId: string,
+  removal?: Extract<DaemonToWorker, { type: 'interrupt_turn' }>['modelRemoval'],
+): Promise<void> {
+  if (!removal && activeTranscriptImagePurge?.turnId === turnId
     && (!workerSessionEventScope || hasCurrentSessionRuntime()) && activeTranscriptImagePurge.cancel()) {
     send({ type: 'turn_interrupt_result', requestId, turnId, delivered: true });
     return;
@@ -25352,7 +25365,16 @@ async function handleExactTurnInterrupt(requestId: string, turnId: string): Prom
   const expectedExecution = workerSessionEventScope?.capture()?.execution;
   const isCurrentExact = () => turnId === currentBotmuxTurnId
     && (!expectedExecution || expectedExecution.dispatchAttempt === currentBotmuxDispatchAttempt)
-    && (!workerSessionEventScope || hasCurrentSessionRuntime());
+    && (!workerSessionEventScope || hasCurrentSessionRuntime())
+    && (!removal || shouldInterruptRemovedModel({ turnId, ...removal },
+      !publishedActiveRuntimeSeeded && publishedActiveRuntime.model
+        && statuslineLaunchGenAtSpawn?.generation === cliSpawnGeneration
+        && !lastInitConfig?.adoptMode && !lastInitConfig?.existingAppServerEndpoint
+        && lastInitConfig?.cliId === 'codex'
+        && !activeTranscriptImagePurge
+        && !turnTerminalEmitted(turnId, currentBotmuxDispatchAttempt)
+        ? { turnId, model: publishedActiveRuntime.model, launchGeneration: statuslineLaunchGenAtSpawn.token }
+        : undefined, removal.observation, Date.now()));
   if (!isCurrentExact()) {
     send({ type: 'turn_interrupt_result', requestId, turnId, delivered: false, reason: 'stale_turn' });
     return;
@@ -25392,12 +25414,24 @@ async function handleExactTurnInterrupt(requestId: string, turnId: string): Prom
   // Adapters whose CLI treats Ctrl+C as "exit" and Escape as "interrupt",
   // instead of the usual opposite. See CliAdapter.interruptKey.
   const interruptKey: CriticalInterruptKey = cliAdapter?.interruptKey === 'esc' ? 'esc' : 'ctrlc';
+  let duplicateRemoval = false;
   let delivered = false;
   try {
     delivered = await runAfterAmbiguousSubmissionWrites(targetBackend, async () => {
       if (backend !== targetBackend || !isCurrentExact()) return false;
       return sendCriticalControlKey(interruptKey, () => {
         if (backend !== targetBackend || !isCurrentExact()) return true;
+        if (removal) {
+          if (lastModelRemovalInterrupt?.turnId === turnId
+            && lastModelRemovalInterrupt.generation === cliSpawnGeneration) {
+            duplicateRemoval = true;
+            return true;
+          }
+          // Record before the transport write: a lost ACK must not inject a
+          // second keypress that could quit an already idle CLI.
+          lastModelRemovalInterrupt = { turnId, dispatchAttempt: currentBotmuxDispatchAttempt, generation: cliSpawnGeneration };
+          cliInterruptGeneration++;
+        }
         return sendTermActionOnce(targetBackend, interruptKey);
       });
     });
@@ -25408,6 +25442,7 @@ async function handleExactTurnInterrupt(requestId: string, turnId: string): Prom
     send({ type: 'turn_interrupt_result', requestId, turnId, delivered: false, reason: 'stale_turn' });
     return;
   }
+  if (duplicateRemoval) delivered = false;
   if (traexQuotaPending?.failedTurn) settleStoppedTraexRecovery(turnId);
   if (delivered) {
     if (typeof revokeDeferredClaudePtyAuthority === 'function') revokeDeferredClaudePtyAuthority();
@@ -51411,9 +51446,11 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
     }
 
     case 'interrupt_turn': {
-      cliInterruptGeneration++;
-      if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
-      await handleExactTurnInterrupt(msg.requestId, msg.turnId);
+      if (!msg.modelRemoval) {
+        cliInterruptGeneration++;
+        if (typeof traexNativeViewportEvidence !== 'undefined') traexNativeViewportEvidence.clear();
+      }
+      await handleExactTurnInterrupt(msg.requestId, msg.turnId, msg.modelRemoval);
       break;
     }
 

@@ -17798,6 +17798,7 @@ export function interruptExactWorkerTurn(
   ds: DaemonSession,
   turnId: string,
   timeoutMs = 10_000,
+  modelRemoval?: Extract<DaemonToWorker, { type: 'interrupt_turn' }>['modelRemoval'],
 ): Promise<ExactTurnInterruptResult> {
   const worker = ds.worker;
   if (!worker || worker.killed) return Promise.resolve({ ok: false, reason: 'no_worker' });
@@ -17847,6 +17848,7 @@ export function interruptExactWorkerTurn(
     worker.on('message', onMessage);
     worker.once('exit', onExit);
     const queued = afterWorkerIpcBootstrap(worker, () => worker.send({ type: 'interrupt_turn', requestId, turnId,
+      ...(modelRemoval ? { modelRemoval } : {}),
       ...(controller && execution ? { sessionCommand: { version: 2 as const, runtime: execution.runtime, execution: execution.ref, operationId } } : {}) } satisfies DaemonToWorker));
     if (!queued) finish({ ok: false, reason: 'no_worker' });
   });
