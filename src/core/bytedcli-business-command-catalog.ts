@@ -31,6 +31,47 @@ const jsonId = (value: unknown) => typeof value === 'string' && id(value);
 const jsonNumber = (value: unknown) => typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
 const jsonInt64Id = (value: unknown) => jsonId(value) && BigInt(value as string) <= 9223372036854775807n;
 
+/** The RPC transport needs JSON integer tokens for Thrift i64 fields. Preserve
+ * their decimal text before JSON.parse can round it; ordinary fields and quoted
+ * strings still go through strict JSON parsing and the closed signature below. */
+function parsePickoMembershipRpcBody(raw: string): Record<string, unknown> | undefined {
+  if (raw.length > 65_536) return undefined;
+  let lossless = '';
+  for (let i = 0; i < raw.length;) {
+    if (raw[i] === '"') {
+      let end = i + 1;
+      while (end < raw.length) {
+        if (raw[end] === '\\') end += 2;
+        else if (raw[end++] === '"') break;
+      }
+      lossless += raw.slice(i, end); i = end;
+    } else if (raw[i] === '-' || /[0-9]/.test(raw[i]!)) {
+      const token = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/.exec(raw.slice(i))?.[0];
+      if (!token) return undefined;
+      // Fractional/exponential tokens must stay visible to the ID validator:
+      // even a non-integer such as 1.0000000000000001 can round to integer 1.
+      lossless += /[.eE]/.test(token) || /^[1-9]\d{15,}$/.test(token) ? JSON.stringify(token) : token;
+      i += token.length;
+    } else lossless += raw[i++];
+  }
+  const body = jsonObject(lossless);
+  const conditions = body?.conditions;
+  if (conditions && typeof conditions === 'object' && !Array.isArray(conditions)) {
+    const fields = conditions as Record<string, unknown>;
+    for (const key of ['entity_ids', 'picko_ids']) {
+      const ids = fields[key];
+      if (Array.isArray(ids)) fields[key] = ids.map(value => typeof value === 'number' && Number.isSafeInteger(value) ? String(value) : value);
+    }
+  }
+  return body;
+}
+/** Called only after the complete Search signature has validated both IDs. */
+function serializePickoMembershipRpcBody(body: Record<string, unknown>): string {
+  const conditions = body.conditions as { entity_ids: string[]; picko_ids: string[] };
+  const rawIds = `{"entity_ids":[${conditions.entity_ids[0]}],"picko_ids":[${conditions.picko_ids[0]}]}`;
+  return '{' + Object.entries(body).map(([key, value]) => `${JSON.stringify(key)}:${key === 'conditions' ? rawIds : JSON.stringify(value)}`).join(',') + '}';
+}
+
 /** The audited Skill escapes JSON double quotes inside SQL single-quoted
  * strings. Remove only that redundant escape; all other backslashes fail. */
 function normalizeSql(sql: string): string | undefined {
@@ -91,7 +132,8 @@ const ticket: Fields = { '--create-permission-ticket': true, '--permission-role'
 const rpcFlags: Fields = { ...route, '--idl-source': one('bam', 'branch'), '--idl-version': name,
   '--body': object, '--request-timeout': one('60000'), '--connect-timeout': one('60000'), ...ticket };
 function rpc(suffix: string, psm: string, method: string, sceneKey: string | undefined, scene: string | undefined,
-  fields: Record<string, (v: unknown) => boolean>, effect: 'read' | 'write') {
+  fields: Record<string, (v: unknown) => boolean>, effect: 'read' | 'write',
+  idlSource: 'bam' | 'branch' = psm.endsWith('udc_picko_service') ? 'branch' : 'bam') {
   for (const withTicket of [false, true]) {
     add(`api-test.rpc-call.${suffix}${withTicket ? '-ticket' : ''}`, 'api-test rpc-call', withTicket ? 'write' : effect,
       rpcFlags, [...routeRequired, '--idl-source', '--idl-version', '--body', ...(withTicket ? Object.keys(ticket) : [])], [one(psm), one(method)], {
@@ -99,7 +141,7 @@ function rpc(suffix: string, psm: string, method: string, sceneKey: string | und
           && (!sceneKey || !bodyOf(tokens) || bodyOf(tokens)?.[sceneKey] === undefined || bodyOf(tokens)?.[sceneKey] === scene)
           && tokens.values.has('--create-permission-ticket') === withTicket,
         validate: tokens => exactObject(get(tokens, '--body'), { ...fields, ...(sceneKey ? { [sceneKey]: value => value === scene } : {}) })
-          && (psm.endsWith('udc_picko_service') ? get(tokens, '--idl-source') === 'branch' && get(tokens, '--idl-version') === 'master' : get(tokens, '--idl-source') === 'bam')
+          && get(tokens, '--idl-source') === idlSource && (idlSource !== 'branch' || get(tokens, '--idl-version') === 'master')
           && (withTicket || !tokens.values.has('--permission-role') && !tokens.values.has('--permission-reason')),
         condition: `${psm}/${method}${scene ? `/${scene}` : ''}; closed JSON; lf/prod/default/CN; permission ticket ${withTicket ? 'required (write)' : 'forbidden'}`,
       });
@@ -110,6 +152,22 @@ rpc('picko-size', 'ecom.market.udc_dump', 'Debug', 'debug_scene', 'picko_size', 
 rpc('picko-is-online', 'ecom.market.udc_dump', 'Debug', 'debug_scene', 'picko_is_online', { picko_id: jsonId }, 'read');
 rpc('picko-export-pids', 'ecom.market.udc_dump', 'Debug', 'debug_scene', 'export_pids', { flush_id: jsonNumber }, 'read');
 rpc('picko-user-email', 'ecom.market.udc_picko_service', 'Debug', 'debug_scene', 'get_lark_email_by_user_id', { record_id: jsonId }, 'read');
+rpc('picko-membership', 'ecom.market.udc_picko_service', 'Search', undefined, undefined, {
+  biz_code: value => value === 1000,
+  entity_type: value => value === 3,
+  search_type: value => value === 0,
+  conditions: value => exactObject(JSON.stringify(value), {
+    entity_ids: ids => Array.isArray(ids) && ids.length === 1 && jsonInt64Id(ids[0]),
+    picko_ids: ids => Array.isArray(ids) && ids.length === 1 && jsonInt64Id(ids[0]),
+  }),
+  time_filter_type: value => value === 0,
+  page_type: value => value === 0,
+  page_size: value => jsonNumber(value) && (value as number) <= 100,
+  page_num: value => jsonNumber(value) && (value as number) <= 1000,
+  data_priority: value => value === 0,
+  code_list: value => Array.isArray(value) && value.length > 0 && value.length <= 5 && new Set(value).size === value.length
+    && value.every(field => ['pick_id', 'entity_id', 'record_id', 'entity_status', 'entity_end_time'].includes(field)),
+}, 'read', 'bam');
 rpc('assign-info', 'ecom.search.assign_manager', 'GetAssignInfo', undefined, undefined, { assign_id: jsonNumber }, 'read');
 add('api-test.http-call.picko-tag-enum', 'api-test http-call', 'read', { ...route, '--http-path': one('/ecom/market/udc/picko/api/list_tag_enum_values'), '--http-method': one('POST'), '--body': object },
   [...routeRequired, '--http-path', '--http-method', '--body'], [one('ecom.market.udc_picko')], {
@@ -231,13 +289,18 @@ export function tokenizeBytedcliBusiness(argv: readonly string[]): Tokens {
   return { words, values };
 }
 export function matchBytedcliBusinessCommand(argv: readonly string[]): { readonly entry: BytedcliBusinessCommand; readonly argv: string[] } | undefined {
-  const tokens = tokenizeBytedcliBusiness(argv);
+  let tokens = tokenizeBytedcliBusiness(argv);
   const candidates = rows.flatMap(entry => [entry.path, ...entry.aliases].filter(path => path.every((word, i) => tokens.words[i] === word))
     .map(path => ({ entry, path })));
   const selected = candidates.find(({ entry }) => !entry.matches || entry.matches(tokens));
   if (!selected) return undefined;
   const { entry, path } = selected;
   const fail = () => { throw new Error('unsupported_operation'); };
+  let membershipBody: Record<string, unknown> | undefined;
+  if (entry.id === 'api-test.rpc-call.picko-membership' || entry.id === 'api-test.rpc-call.picko-membership-ticket') {
+    membershipBody = parsePickoMembershipRpcBody(get(tokens, '--body')) ?? fail();
+    tokens = { words: tokens.words, values: new Map(tokens.values).set('--body', JSON.stringify(membershipBody)) };
+  }
   if ([...tokens.values.keys()].some(key => !Object.hasOwn(entry.flags, key) && !['--json', '--site', '--no-auto-upgrade'].includes(key))
     || tokens.values.has('--site') && get(tokens, '--site') !== 'cn') fail();
   const positionals = tokens.words.slice(path.length);
@@ -247,7 +310,7 @@ export function matchBytedcliBusinessCommand(argv: readonly string[]): { readonl
   const result = [...(tokens.values.has('--json') ? ['--json'] : []), '--site', 'cn', ...entry.path, ...positionals];
   for (const [flag, check] of Object.entries(entry.flags)) {
     if (!tokens.values.has(flag)) continue;
-    const value = get(tokens, flag);
+    const value = flag === '--body' && membershipBody ? serializePickoMembershipRpcBody(membershipBody) : get(tokens, flag);
     if (check === true) result.push(flag);
     else { if (!check(value)) fail(); result.push(value.startsWith('-') && value !== '-' ? `${flag}=${value}` : flag); if (!value.startsWith('-') || value === '-') result.push(value); }
   }

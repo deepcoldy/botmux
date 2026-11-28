@@ -7,8 +7,9 @@ CLI 审核版本为 `0.199.0`，目录为 `2026-11-27.2`。原 JSON grammar 保�
 | `api-test.rpc-call.picko-troubleshoot` | write；`ecom.market.udc_dump/PickoTroubleShoot`，JSON 仅 `scene:manual_check`、字符串 picko_id/entity_id。服务端可能自动 flush。 |
 | `api-test.rpc-call.picko-size`、`picko-is-online`、`picko-export-pids` | read；同 PSM 的 Debug，分别限制 scene 和 picko_id 或数字 flush_id。 |
 | `api-test.rpc-call.picko-user-email` | read；`ecom.market.udc_picko_service/Debug`，branch/master，仅邮箱查询 scene 与 record_id。 |
+| `api-test.rpc-call.picko-membership` | read；`ecom.market.udc_picko_service/Search`，BAM IDL；biz_code=1000、entity_type=3、search_type=0、time_filter_type/page_type/data_priority=0；conditions 仅单个正 int64 entity_id/picko_id，支持十进制字符串或 JSON 整数并无损转发为 Thrift 所需的 JSON 整数；page_size 1–100、page_num 1–1000；code_list 仅 pick_id/entity_id/record_id/entity_status/entity_end_time 的非空不重复子集。 |
 | `api-test.rpc-call.assign-info` | read；`ecom.search.assign_manager/GetAssignInfo`，仅数字 assign_id。 |
-| 上述 RPC 的 `-ticket` 后缀 | write；必须完整携带 create-permission-ticket、固定接口测试角色及 reason；不带后缀的行禁止票据参数。所有 RPC 固定 lf/prod/default/CN，BAM 来源除邮箱查询外固定 bam。 |
+| 上述 RPC 的 `-ticket` 后缀 | write；必须完整携带 create-permission-ticket、固定接口测试角色及 reason；不带后缀的行禁止票据参数。所有 RPC 固定 lf/prod/default/CN，IDL 来源除邮箱查询外固定 bam。 |
 | `api-test.http-call.picko-tag-enum` | read；固定 PSM、POST `/ecom/market/udc/picko/api/list_tag_enum_values`，仅 tag_id。 |
 | `api-test.http-call.picko-membership` | read；固定 `ecom.market.udc_picko`、POST `/ecom/market/udc/picko/admin/search_from_picko`，lf/prod/default/CN；body 仅字符串 picko_id、page_size（1–100）、page_num（1–1000）及只含字符串 entity_id 的 filter，ID 为正 int64。查询指定商品的包内记录。 |
 | `tcc.config.get.picko-rules` | read；`ecom.market.udc_dump` 的 `/dump_v2/rule_list_config_PRODUCT_new`，CN/prod。 |

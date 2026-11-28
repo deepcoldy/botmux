@@ -14,6 +14,16 @@ const membership = (body: unknown = membershipBody) => ['--no-auto-upgrade', '--
   '--http-method', 'POST', '--env', 'prod', '--idc', 'lf', '--cluster', 'default', '--zone', 'CN',
   '--body', JSON.stringify(body)];
 
+const rpcMembershipBody = { biz_code: 1000, entity_type: 3, search_type: 0,
+  conditions: { entity_ids: ['3833561139371966875'], picko_ids: ['7694953474899624202'] },
+  time_filter_type: 0, page_type: 0, page_size: 5, page_num: 1, data_priority: 0,
+  code_list: ['pick_id', 'entity_id', 'record_id', 'entity_status', 'entity_end_time'] };
+const rpcMembership = (body: unknown = rpcMembershipBody, withTicket = false) => ['--json', 'api-test', 'rpc-call',
+  'ecom.market.udc_picko_service', 'Search', '--idl-source', 'bam', '--idl-version', '1.0.159',
+  '--idc', 'lf', '--env', 'prod', '--cluster', 'default', '--zone', 'CN', '--body', JSON.stringify(body),
+  ...(withTicket ? ['--create-permission-ticket', '--permission-role', 'brn::iam:::role:ms.interface_tester_func.cn',
+    '--permission-reason', '核验商品当前圈选包入包记录'] : [])];
+
 export const businessCases: [string, 'read' | 'write', string[]][] = [
   ['tcc.config.get.picko-rules', 'read', ['tcc', 'config', 'get', 'ecom.market.udc_dump', 'rule_list_config_PRODUCT_new', '--dir', '/dump_v2', '--region', 'CN', '--env', 'prod']],
   ['rds.db.query', 'read', ['rds', 'query-db', 'ecom_market_pick', 'SELECT COUNT(*) AS cnt FROM pick_package WHERE status = 1;', '-r', 'cn']],
@@ -26,6 +36,8 @@ export const businessCases: [string, 'read' | 'write', string[]][] = [
   ['api-test.rpc-call.picko-is-online', 'read', rpc('ecom.market.udc_dump', 'Debug', { debug_scene: 'picko_is_online', picko_id: '123' })],
   ['api-test.rpc-call.picko-export-pids', 'read', rpc('ecom.market.udc_dump', 'Debug', { debug_scene: 'export_pids', flush_id: 123 })],
   ['api-test.rpc-call.picko-user-email', 'read', rpc('ecom.market.udc_picko_service', 'Debug', { debug_scene: 'get_lark_email_by_user_id', record_id: '123' })],
+  ['api-test.rpc-call.picko-membership', 'read', rpcMembership()],
+  ['api-test.rpc-call.picko-membership-ticket', 'write', rpcMembership(rpcMembershipBody, true)],
   ['api-test.rpc-call.assign-info', 'read', rpc('ecom.search.assign_manager', 'GetAssignInfo', { assign_id: 123 })],
   ['api-test.http-call.picko-tag-enum', 'read', ['api-test', 'http-call', 'ecom.market.udc_picko', '--http-path', '/ecom/market/udc/picko/api/list_tag_enum_values', '--http-method', 'POST', '--env', 'prod', '--idc', 'lf', '--cluster', 'default', '--zone', 'CN', '--body', '{"tag_id":"123"}']],
   ['api-test.http-call.picko-membership', 'read', membership()],
@@ -121,6 +133,93 @@ describe('selected business signatures', () => {
     const other = parse(membership().map(v => v.endsWith('/search_from_picko') ? '/unregistered_query' : v));
     expect(other.effect).toBe('unknown');
     expect(resolveBytedcliOperationRule(other.id, undefined, policy('machine')).identity).toBe('actor');
+  });
+  it('limits membership Search to one product and package with closed conditions and projection', () => {
+    for (const body of [
+      { ...rpcMembershipBody, biz_code: 3000 },
+      { ...rpcMembershipBody, entity_type: 1 },
+      { ...rpcMembershipBody, search_type: 1 },
+      { ...rpcMembershipBody, time_filter_type: 1 },
+      { ...rpcMembershipBody, page_type: 1 },
+      { ...rpcMembershipBody, data_priority: 1 },
+      { ...rpcMembershipBody, page_size: 0 },
+      { ...rpcMembershipBody, page_size: 101 },
+      { ...rpcMembershipBody, page_num: 0 },
+      { ...rpcMembershipBody, page_num: 1001 },
+      { ...rpcMembershipBody, page_num: 1.5 },
+      { ...rpcMembershipBody, rules: {} },
+      { ...rpcMembershipBody, searchScene: 'shop_instant_discount' },
+      { ...rpcMembershipBody, conditions: null },
+      { ...rpcMembershipBody, conditions: { entity_ids: ['123'] } },
+      { ...rpcMembershipBody, conditions: { ...rpcMembershipBody.conditions, picko_ids: [] } },
+      { ...rpcMembershipBody, conditions: { ...rpcMembershipBody.conditions, picko_ids: ['123', '456'] } },
+      { ...rpcMembershipBody, conditions: { ...rpcMembershipBody.conditions, entity_ids: ['123', '456'] } },
+      { ...rpcMembershipBody, conditions: { ...rpcMembershipBody.conditions, entity_ids: ['9223372036854775808'] } },
+      { ...rpcMembershipBody, conditions: { ...rpcMembershipBody.conditions, picko_ids: ['0'] } },
+      { ...rpcMembershipBody, conditions: { ...rpcMembershipBody.conditions, record_ids: ['123'] } },
+      { ...rpcMembershipBody, code_list: [] },
+      { ...rpcMembershipBody, code_list: ['shop_id'] },
+      { ...rpcMembershipBody, code_list: ['entity_id', 'entity_id'] },
+    ]) for (const withTicket of [false, true]) expect(() => parse(rpcMembership(body, withTicket))).toThrow();
+    expect(parse(rpcMembership({ ...rpcMembershipBody, page_size: 100, page_num: 1000,
+      code_list: ['pick_id'], conditions: { entity_ids: ['9223372036854775807'], picko_ids: ['123'] } })))
+      .toMatchObject({ id: 'api-test.rpc-call.picko-membership', effect: 'read' });
+    for (const argv of [
+      rpcMembership().map(v => v === 'bam' ? 'branch' : v),
+      rpcMembership().map(v => v === 'prod' ? 'ppe' : v),
+      [...rpcMembership(), '--http-header', 'X-Auth: bad'],
+      [...rpcMembership(), '--permission-reason', '额外票据参数'],
+      [...rpcMembership(), '--create-permission-ticket'],
+    ]) expect(() => parse(argv)).toThrow();
+  });
+  it('uses explicit machine exceptions for Search permission tickets while honoring actor and deny', () => {
+    const rules = { 'api-test.rpc-call.picko-membership': 'machine', 'api-test.rpc-call.picko-membership-ticket': 'machine' };
+    const policy = (values: Record<string, string>) => parseBytedcliOperationPolicy({
+      schema: 'botmux.bytedcli-operation-policy.v2', cliVersion: '0.199.0', catalogVersion: '2026-11-27.2', rules: values,
+    });
+    for (const withTicket of [false, true]) {
+      const op = parse(rpcMembership(rpcMembershipBody, withTicket));
+      expect(resolveBytedcliOperationRule(op.id, undefined, policy(rules))).toMatchObject({ identity: 'machine', enabled: true });
+      expect(resolveBytedcliOperationRule(op.id, policy({ [op.id]: 'actor' }), policy(rules)).identity).toBe('actor');
+      expect(resolveBytedcliOperationRule(op.id, policy({ [op.id]: 'deny' }), policy(rules)).enabled).toBe(false);
+      const unrelated = parse(rpcMembership(rpcMembershipBody, withTicket).map(v => v === 'Search' ? 'UnregisteredMethod' : v));
+      expect(unrelated.effect).toBe('unknown');
+      expect(resolveBytedcliOperationRule(unrelated.id, undefined, policy(rules)).identity).toBe('actor');
+    }
+  });
+  it('forwards Thrift i64 membership IDs as exact JSON integers without rounding or quoting', () => {
+    for (const withTicket of [false, true]) {
+      const op = parse(rpcMembership(rpcMembershipBody, withTicket));
+      const body = op.argv[op.argv.indexOf('--body') + 1]!;
+      expect(body).toContain('"entity_ids":[3833561139371966875]');
+      expect(body).toContain('"picko_ids":[7694953474899624202]');
+      expect(parse(op.argv)).toEqual(op);
+      const numericBody = JSON.stringify(rpcMembershipBody).replace('"3833561139371966875"', '3833561139371966875')
+        .replace('"7694953474899624202"', '7694953474899624202');
+      expect(parse(rpcMembership(rpcMembershipBody, withTicket).map(v => v.startsWith('{') ? numericBody : v))).toEqual(op);
+    }
+    for (const value of ['9007199254740992', '9007199254740993', '9223372036854775807']) {
+      const rawBody = JSON.stringify(rpcMembershipBody).replace('"3833561139371966875"', value);
+      const op = parse(rpcMembership().map(v => v.startsWith('{') ? rawBody : v));
+      expect(op.argv[op.argv.indexOf('--body') + 1]).toContain(`"entity_ids":[${value}]`);
+      expect(parse(op.argv)).toEqual(op);
+    }
+    const small = parse(rpcMembership({ ...rpcMembershipBody,
+      conditions: { entity_ids: [123], picko_ids: [456] } }));
+    expect(small.argv[small.argv.indexOf('--body') + 1]).toContain('"entity_ids":[123]');
+    for (const value of ['9223372036854775808', '3833561139371966875e0', '-1', '0123']) {
+      const rawBody = JSON.stringify(rpcMembershipBody).replace('"3833561139371966875"', value);
+      expect(() => parse(rpcMembership().map(v => v.startsWith('{') ? rawBody : v))).toThrow();
+    }
+  });
+  it('rejects fractional or exponential ID tokens before JSON numeric rounding', () => {
+    for (const field of ['entity_ids', 'picko_ids']) for (const value of [
+      '1234567890123456.1', '9007199254740990.5', '1.0000000000000001', '0.99999999999999999', '1e0',
+    ]) for (const withTicket of [false, true]) {
+      const rawBody = JSON.stringify({ ...rpcMembershipBody,
+        conditions: { ...rpcMembershipBody.conditions, [field]: ['NUMERIC_ID'] } }).replace('"NUMERIC_ID"', value);
+      expect(() => parse(rpcMembership(rpcMembershipBody, withTicket).map(v => v.startsWith('{') ? rawBody : v))).toThrow();
+    }
   });
   it.each(['SELECT 1; DELETE FROM pick_package', 'SELECT 1 INTO OUTFILE "/tmp/x"', 'SELECT load_file("/etc/passwd")',
     'SELECT malicious_function()', 'SELECT `malicious_function`()', 'SELECT "malicious_function"()', 'SELECT unreviewed.COUNT()', 'SELECT unreviewed . IFNULL (1, 0)',
