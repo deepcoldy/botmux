@@ -68,6 +68,22 @@ const contractSchema = `
       CREATE TABLE IF NOT EXISTS runtime_bindings(session_key TEXT NOT NULL,binding_id TEXT NOT NULL,runtime_id TEXT NOT NULL,worker_id TEXT NOT NULL,generation INTEGER NOT NULL,PRIMARY KEY(session_key,binding_id));
       CREATE TABLE IF NOT EXISTS runtime_producers(session_key TEXT NOT NULL,runtime_id TEXT NOT NULL,worker_id TEXT NOT NULL,generation INTEGER NOT NULL,PRIMARY KEY(session_key,runtime_id,worker_id,generation));`;
 
+/** Positive format recognition for abandoned contract-only probe databases.
+ * Compare with the real creation schema so partial session migrations, extra
+ * backup tables, missing columns and unknown formats cannot be ignored. */
+export function isContractOnlyDatabase(db: DatabaseSyncLike): boolean {
+  const normalize = (sql: string) => sql.replace(/\bIF\s+NOT\s+EXISTS\b/gi, '').replace(/\s+/g, '').replace(/;$/, '');
+  const expected = new Map([...contractSchema.matchAll(/CREATE (?:TABLE|INDEX) IF NOT EXISTS ([a-z_]+)[^;]+;/g)]
+    .map(match => [match[1]!, normalize(match[0])]));
+  const objects = db.prepare("SELECT name, sql FROM sqlite_master WHERE name NOT GLOB 'sqlite_*'").all() as { name: string; sql: string | null }[];
+  const names = new Set(objects.map(object => object.name));
+  // Older complete contract stores predate this expression index. Its absence
+  // affects lookup speed, not the store format; all tables/columns and the
+  // other index must still match, and no additional user object is allowed.
+  return [...expected.keys()].every(name => name === 'contract_execution_turns' || names.has(name))
+    && objects.every(object => object.sql !== null && expected.get(object.name) === normalize(object.sql));
+}
+
 /** One transaction commits identity/state facts and the compatible read model.
  * Historic entities remain separate from the current runtime selection. */
 export class SessionContractStore {

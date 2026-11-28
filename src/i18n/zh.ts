@@ -2298,6 +2298,18 @@ export const messages: Record<string, string> = {
   'daemon.worktree_building_wait': '正在创建 worktree（含 git fetch，可能需要几秒），您的消息已暂存，创建完成后会自动一并发送。',
 
   // ─── /dashboard command group (PR3 C1) ─────────────────────────────────
+  "trae_login.usage": "用法：/dashboard trae-login；status 查看结果；cancel 取消。回调仅在本机器人私聊提交：/dashboard trae-login complete <请求ID> <完整回调URL>。",
+  "trae_login.private_only": "请仅在本机器人私聊提交回调地址；回调包含登录凭据，群聊不会处理。",
+  "trae_login.failed": "TRAE 登录未完成。请用 /dashboard trae-login status 查看结果；需要重新开始时先 cancel，再发 /dashboard trae-login。",
+  "trae_login.unsupported": "当前入口支持 Linux 宿主的原生 TRAE CLI（需 flock/setpriv）。远程后端、wrapper、Forge、文件沙箱或设备凭证隔离的登录目录另行管理，请使用对应环境的登录入口。",
+  "trae_login.cancelled": "本次 TRAE 登录已取消或过期。需要时重新发送 /dashboard trae-login。",
+  "trae_login.verifying": "回调已交给 TRAE CLI 验证。发送 /dashboard trae-login status 查看实际结果；显示成功后恢复原话题并重发消息。",
+  "trae_login.missing": "没有属于你的 TRAE 登录请求。发送 /dashboard trae-login 开始。",
+  "trae_login.starting": "TRAE CLI 正在启动登录。稍后发送 /dashboard trae-login status 查看结果。",
+  "trae_login.succeeded": "TRAE CLI 已完成本次登录。回到原话题恢复会话并重发消息；旧进程仍报认证错误时需重新启动该会话。",
+  "trae_login.challenge": "TRAE CLI 企业登录（10 分钟内有效，将更新本机器人使用的 TRAE 登录目录；共享该目录的会话也使用这份账号）：\n{url}\n\n1. 打开链接，由本人完成登录。\n2. 浏览器最后跳转到 127.0.0.1 时，复制地址栏里的完整 URL；远程设备无法打开该页面是正常情况。\n3. 仅在本机器人私聊发送：\n/dashboard trae-login complete {id} <完整回调URL>\n4. 发 /dashboard trae-login status 确认成功，再恢复原话题。\n\n取消：/dashboard trae-login cancel。",
+  "trae_login.delivery_failed": "无法私发登录链接，本次请求已取消。请先打开本机器人的私聊，再发送 /dashboard trae-login。",
+  "trae_login.sent": "TRAE 登录链接和操作步骤已私发给你。",
   'card.dashboard.owner_only': '🔒 `/dashboard` 命令组仅 Bot 管理员（allowedUsers）可用。',
   'card.dashboard.overview.not_implemented_yet': '🚧 `/dashboard overview` 总览卡片尚未实现，将在后续 PR 中上线。',
   'card.dashboard.sessions.not_implemented_yet': '🚧 `/dashboard sessions` 会话卡片尚未实现，将在后续 PR 中上线。',
@@ -2313,6 +2325,7 @@ export const messages: Record<string, string> = {
     '• `schedules`  — 定时任务\n' +
     '• `settings`   — 全局设置（仅管理员）\n' +
     '• `link`       — 管理首页链接（私信；等价裸 `/dash`；链接形式随远程访问/反代配置变化）\n' +
+    '• `trae-login` — TRAE 企业登录（私聊授权、回调、status/cancel）\n' +
     '• `help`       — 本帮助\n\n' +
     '不带子命令时默认 `overview`。整个命令组仅 Bot 管理员（allowedUsers）可用。',
   'card.dashboard.help.unknown_module': '⚠️ 未知模块 `{module}`，请使用下列之一：',

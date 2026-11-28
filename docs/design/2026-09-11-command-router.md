@@ -236,6 +236,7 @@ type SessionPhase =
 | `/queue <消息>` | 未注册，作为普通模型输入，可引导当前轮 | existingOnly、多行 daemon 命令；Codex App 活会话冻结为 serial FIFO，新轮次执行；其它 CLI / 无活 worker 明确拒绝 | 不改变普通消息引导；不创建会话；仍走命令授权；附件暂不支持 |  #1880（接纳前刷新按人身份；等待期间单槽可被新消息覆盖） |
 | `/modelpin <model> [effort]` / `/modelpin --follow-bot` | 未注册，整条作为未知命令转发 | existingOnly daemon 命令；设置/清除显式话题模型固定，按 canOperate 授权；不建会话；原生 `/model` 透传保留 | 提供可见、可解除的持久模型选择，避免继承默认值被误冻结 | topic-model-pin |
 | `/models` | 未注册，整条作为未知命令转发 | sessionless daemon 命令；顶层选择机器人默认模型与思考强度（新会话生效，复用 config_set 管理员门及配置锁内模型/CLI前置条件）；话题内选择当前会话模型；托管本地 TraeX 可保存模型绑定的思考强度并显式重载应用（精确 native ID，不消耗崩溃重启预算）；不创建新会话 | 让飞书原生命令面板提供模型切换入口，保留 `/model` 透传语义 | 本次变更 |
+| `/dashboard trae-login complete …` | URL 含占位符或换行时按讨论文本转给模型 | 始终保留在 sessionless 管理员控制路径，由子模块校验完整参数；私聊回调不写入可重放消息正文 | 防止格式错误使登录凭据进入模型或持久 Inbox；普通解释性正文保留原路由 | 本次变更 |
 | `/rewind [n\|n confirm]` | 未注册，整条当未知命令转发给 CLI | existingOnly daemon 命令；Claude Code 会话列出检查点、按轮次截断 CLI 原生 transcript 后重启；其它 CLI / 远端后端明确拒绝 | 用户级上下文回退（读到污染内容后可丢弃该轮）；执行前自动备份 transcript；不创建会话 | 本次变更 |
 | `/idlecompact [on\|off\|分钟]` | 未注册，整条当未知命令转发给 CLI | existingOnly daemon 命令；开关本会话的闲置自动压缩（闲置 N 分钟后自动 `/compact`）或查看状态；不支持的 CLI / 后端明确拒绝 | 与流式卡片「⏲️ 闲置自动压缩」按钮同一设置；不创建会话 | 本次变更 |
 | Codex App 会话内 `/effort <档位>` | 无 raw 透传面，作为普通模型输入 | schema 按 `cliId: codex-app` 登记为只用于已有会话的 daemon 命令，通过原生设置接口更新；其它 CLI 仍透传 | 调整后续轮次推理强度；更新当前轮需显式启用实验特性 `step_model_switching`（默认关闭）；不创建模型轮次，CLI 专属命令不进入全局 daemon 集合 | #1817 |

@@ -12,6 +12,8 @@ import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import { InflightInputTracker } from '../src/core/inflight-input-tracker.js';
 import { InputTurnDeduper } from '../src/core/input-turn-dedupe.js';
 import { isOrdinaryImTurnId } from '../src/core/ordinary-im-turn.js';
+import { createTraexAdapter, traexScreenShowsNoPendingInput } from '../src/adapters/cli/traex.js';
+import { IdleDetector } from '../src/utils/idle-detector.js';
 
 const fixture = (name: string) => readFileSync(new URL(`./fixtures/traex-question/${name}`, import.meta.url), 'utf8');
 const CHOICE = fixture('traex-0.216.0-async-choice.txt');
@@ -73,6 +75,47 @@ describe('recorded TRAE 0.216 asynchronous question layouts', () => {
 
 beforeEach(() => vi.useFakeTimers());
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks(); });
+
+it('keeps completed-turn folded questions available to the real native question bridge', async () => {
+  const detector = new IdleDetector(createTraexAdapter());
+  let screen = PENDING;
+  const scope: Record<string, any> = {
+    cliAdapter: createTraexAdapter(), lastInitConfig: { cliId: 'traex', backendType: 'tmux', resume: false },
+    idleDetector: detector, cliSpawnGeneration: 1, cliLifetimeNonce: 1, cliRestartInProgress: false,
+    cliOutlivesWorker: false, lastSpawnEffectiveResume: false,
+    backendScreenEvidenceIsAuthoritativeForMutation: () => true, nativeSessionForkPending: () => false,
+    traexPendingAsyncQuestionVisible,
+    runAfterAmbiguousSubmissionWrites: async (_: unknown, fn: () => unknown) => fn(),
+    readinessTrackedInput: (x: unknown) => x, adapterInputHandle: (x: unknown) => x,
+    invalidatePromptReadinessEvidence: vi.fn(), log: vi.fn(),
+  };
+  scope.backend = { captureViewport: () => screen, sendSpecialKeys: vi.fn(() => { screen = CHOICE; return true; }) };
+  for (const name of ['captureBackendScreen', 'traexQuestionBridgeActive', 'traexQuestionBlockReported',
+    'traexQuestionMayOpenPending', 'traexQuestionCapture', 'traexQuestionOpenPending']) {
+    scope[name] = loadWorkerFunction(name, scope);
+  }
+  const ask = vi.fn(() => new Promise<AskResult>(() => {}));
+  const bridge = new TraexQuestionBridge({
+    now: () => Date.now(), setTimer: (fn, ms) => setTimeout(fn, ms), clearTimer: h => clearTimeout(h as ReturnType<typeof setTimeout>),
+    enabled: scope.traexQuestionBridgeActive, lifetime: () => scope.cliLifetimeNonce,
+    capture: scope.traexQuestionCapture, mayOpenPending: scope.traexQuestionMayOpenPending,
+    openPending: scope.traexQuestionOpenPending, ask, writeKey: vi.fn(async () => true),
+    paste: vi.fn(async () => true), notify: vi.fn(), log: vi.fn(),
+  });
+  try {
+    detector.fireIdle(); detector.reset({ inputCycle: true });
+    detector.observeProgramStatus({ state: 'working' });
+    detector.observeProgramStatus({ state: 'blocked', id: 'ask', kind: 'question' });
+    detector.noteTranscriptTerminal(); detector.fireIdle();
+    await vi.advanceTimersByTimeAsync(2_100);
+    expect(traexScreenShowsNoPendingInput(PENDING)).toBe(false);
+    expect(scope.traexQuestionBlockReported()).toBe(true);
+    bridge.kick();
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(scope.backend.sendSpecialKeys).toHaveBeenCalledWith('M-Up');
+    expect(ask).toHaveBeenCalledTimes(1);
+  } finally { bridge.dispose(); detector.dispose(); }
+});
 
 /** Native 0.216 widgets: Other is inline text, arrows select, Enter sends only
  * the current question and clears pending questions, C-u only clears text. */
