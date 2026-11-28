@@ -1168,4 +1168,98 @@ describe('Worker resetTraexAutoModelBeforePendingTurn & flushPending during TRAE
     expect(scope.traexNativeContinuationActive()).toBe(false);
     vi.useRealTimers();
   });
+
+  it('fails closed: a revalidate drain error before observing a fresh start must not authorize release', () => {
+    vi.useFakeTimers();
+    const base = Date.parse('2026-11-28T00:00:00.000Z');
+    vi.setSystemTime(base);
+
+    const h = buildWorkerHarness({ reselectPerTurn: false });
+    const { scope, rolloutPath, detector } = h;
+    Object.assign(scope, {
+      backgroundTaskTracker: { pending: () => 0 },
+      staleProgramStatusVerdict,
+      viewportShowsIdlePrompt: () => true,
+    });
+    scope.checkStaleProgramStatus = loadWorkerFunction('checkStaleProgramStatus', scope);
+
+    // B opens/closes, OSC terminal lost -> OSC-only stuck state.
+    scope.onPtyData('\x1b]7501;state=working:app=traecli\x1b\\');
+    appendFileSync(
+      rolloutPath,
+      traexTaskStarted('native-B', 'native-root', new Date(base).toISOString())
+        + traexTaskComplete('native-B', 'B done', new Date(base + 1_000).toISOString()),
+    );
+    scope.codexBridgeIngest();
+    expect(scope.traexNativeContinuationActive()).toBe(true);
+
+    // A durable fresh start is already on disk, but the revalidate drain now
+    // fails (transient EIO) BEFORE the tracker can observe it.
+    vi.setSystemTime(base + STALE_PROGRAM_STATUS_QUIET_MS + 5_000);
+    appendFileSync(
+      rolloutPath,
+      traexTaskStarted('native-A', 'native-root', new Date(base + STALE_PROGRAM_STATUS_QUIET_MS + 4_000).toISOString()),
+    );
+    const originalDrain = scope.structuredBridgeIngestPath as (...args: unknown[]) => unknown;
+    scope.structuredBridgeIngestPath = () => { throw new Error('rollout read EIO'); };
+
+    // The unknown revalidation result must NOT be treated as release permission:
+    // keep holding working and reschedule another attempt.
+    scope.checkStaleProgramStatus();
+    expect(detector.programStatusHeldWorking()).toBe(true);
+    expect(detector.isIdleNow()).toBe(false);
+    expect(scope.traexNativeContinuationActive()).toBe(true);
+    expect(scope.scheduleStaleProgramStatusCheck).toHaveBeenCalled();
+
+    // Once the drain recovers, the next check observes A and still vetoes.
+    scope.structuredBridgeIngestPath = originalDrain;
+    scope.checkStaleProgramStatus();
+    expect(detector.programStatusHeldWorking()).toBe(true);
+    expect(detector.isIdleNow()).toBe(false);
+    expect(scope.traexNativeContinuation.hasTranscriptContinuation()).toBe(true);
+    vi.useRealTimers();
+  });
+
+  it('stays safe when the revalidate drain fails after a fresh start was already observed', () => {
+    vi.useFakeTimers();
+    const base = Date.parse('2026-11-28T00:00:00.000Z');
+    vi.setSystemTime(base);
+
+    const h = buildWorkerHarness({ reselectPerTurn: false });
+    const { scope, rolloutPath, detector } = h;
+    Object.assign(scope, {
+      backgroundTaskTracker: { pending: () => 0 },
+      staleProgramStatusVerdict,
+      viewportShowsIdlePrompt: () => true,
+    });
+    scope.checkStaleProgramStatus = loadWorkerFunction('checkStaleProgramStatus', scope);
+
+    scope.onPtyData('\x1b]7501;state=working:app=traecli\x1b\\');
+    appendFileSync(
+      rolloutPath,
+      traexTaskStarted('native-B', 'native-root', new Date(base).toISOString())
+        + traexTaskComplete('native-B', 'B done', new Date(base + 1_000).toISOString()),
+    );
+    scope.codexBridgeIngest();
+
+    // A's fresh start is drained successfully first, so the tracker already
+    // holds an open transcript continuation.
+    vi.setSystemTime(base + STALE_PROGRAM_STATUS_QUIET_MS + 5_000);
+    appendFileSync(
+      rolloutPath,
+      traexTaskStarted('native-A', 'native-root', new Date(base + STALE_PROGRAM_STATUS_QUIET_MS + 4_000).toISOString()),
+    );
+    scope.codexBridgeIngest();
+    expect(scope.traexNativeContinuation.hasTranscriptContinuation()).toBe(true);
+
+    // A later drain (inside the stale check) then errors. The already-observed
+    // continuation alone must keep the release vetoed.
+    scope.structuredBridgeIngestPath = () => { throw new Error('rollout read EIO'); };
+    scope.checkStaleProgramStatus();
+    expect(detector.programStatusHeldWorking()).toBe(true);
+    expect(detector.isIdleNow()).toBe(false);
+    expect(scope.traexNativeContinuation.hasTranscriptContinuation()).toBe(true);
+    expect(scope.traexNativeContinuationActive()).toBe(true);
+    vi.useRealTimers();
+  });
 });

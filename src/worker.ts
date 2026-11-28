@@ -35796,8 +35796,16 @@ function checkStaleProgramStatus(): void {
   // verdict below returns 'stop'. Synchronous: structuredBridgeIngestPath reads
   // the file inline, and fireIdle stays suppressed while the tracker is active.
   if (isTraexNative && detector.programStatusHeldWorking()) {
-    try { codexBridgeIngest(); } catch (err: any) {
-      log(`TRAE stale-OSC revalidate drain failed: ${err.message}`);
+    try {
+      codexBridgeIngest();
+    } catch (err: any) {
+      // Fail closed: an unreadable rollout means the cached OSC-only state was
+      // not revalidated — a durable fresh task_started could be sitting on disk
+      // unseen. Never treat an unknown revalidation result as release permission;
+      // reschedule and let a later successful drain make the call.
+      log(`TRAE stale-OSC revalidate drain failed, deferring release: ${err.message}`);
+      scheduleStaleProgramStatusCheck();
+      return;
     }
   }
   const now = Date.now();
