@@ -41,6 +41,7 @@
 | `/sessions` | 列出当前机器人在本群的活跃话题会话，可直接回到原话题（旧会话安全降级为定位通知） |
 | `/dashboard [模块]` | 在飞书里打开 Dashboard 控制卡片。模块：`overview`（跨 bot 总览，默认）、`sessions`（会话）、`groups`（群组）、`schedules`（定时任务）、`settings`（全局设置）、`link`（管理首页链接，同 `/dash`）、`help`。除 `link` 外，卡片都私信给你，话题里只回一句确认。仅 `allowedUsers` 可用。网页端的多会话视图见[驾驶舱](/workbench) |
 | `/dash` | 等价于 `/dashboard link`：私密返回当前 Dashboard 管理首页完整链接（本机直连时形如 `http://<主机>:<端口>/?t=<token>#/`；开启远程访问或配置反代时改用对应地址；普通群仅你可见的临时卡，话题群/话题回复/单聊走私聊；仅 allowedUsers；`/dash` 与 `/dashboard link` 在群里免 @ 也能用；不创建会话或 worktree；token 轮换后重发即得新链接） |
+| `/dashboard trae-login [status\|cancel]` | 管理员通过私聊完成 Linux 宿主的原生 TRAE CLI 企业登录（需 flock/setpriv）；授权后仅在本机器人私聊发送 `/dashboard trae-login complete <请求ID> <完整回调URL>`，再用 status 核验。无需模型或活跃会话，10 分钟超时；不先退出已有账号。远程、wrapper、Forge、沙箱和设备隔离环境不支持。共享 TRAE_HOME 的会话使用同一登录账号。 |
 | `@机器人 /project enable\|status\|roles\|disable` | 在当前普通群启用、查看、配置 Agent 角色或退出项目群模式（仅 owner/allowedUsers；不占用会话槽位） |
 | `@机器人 /context-sharing on\|off\|status` | 开启、关闭或查看当前群的后台上下文共享（默认关闭；仅 owner/allowedUsers；不创建会话或启动额外模型回合） |
 | `/insight` | owner 专用：在当前会话即时回一张「本会话洞察摘要」卡片（聚合指标 + 规则建议；动作 span 明细 / 逐轮对账 / 对话回放在 Dashboard「洞察」页看） |

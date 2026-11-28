@@ -38,7 +38,8 @@ export type BotmuxEntry =
   // process.execPath and the runner is argv[0]). They need the same treatment for
   // the same reason — see RUNNER_ENTRIES below.
   | 'codex-app-runner' | 'dsh-runner' | 'mira-runner' | 'mir-runner'
-  | 'minimax-runner' | 'antigravity-runner' | 'lark-tool-runner' | 'cli-identity-runner' | 'bytedcli-exec-runner';
+  | 'minimax-runner' | 'antigravity-runner' | 'lark-tool-runner' | 'cli-identity-runner'
+  | 'bytedcli-exec-runner' | 'trae-login-runner';
 
 /** Hidden CLI subcommand that runs a given entry inline (see cli.ts dispatch). */
 const ENTRY_SUBCOMMAND: Record<BotmuxEntry, string> = {
@@ -64,6 +65,7 @@ const ENTRY_SUBCOMMAND: Record<BotmuxEntry, string> = {
   'lark-tool-runner': '__lark-tool-runner',
   'cli-identity-runner': '__cli-identity-runner',
   'bytedcli-exec-runner': '__bytedcli-exec-runner',
+  'trae-login-runner': '__trae-login-runner',
 };
 
 /** dist/<entry>.js filename for the Node path. */
@@ -90,6 +92,7 @@ const ENTRY_SCRIPT: Record<BotmuxEntry, string> = {
   'lark-tool-runner': 'lark-tool-runner.js',
   'cli-identity-runner': 'cli-identity-runner.js',
   'bytedcli-exec-runner': 'bytedcli-exec-runner.js',
+  'trae-login-runner': 'trae-login-runner.js',
 };
 
 /**
@@ -111,7 +114,7 @@ const ENTRY_SCRIPT: Record<BotmuxEntry, string> = {
  */
 export const RUNNER_ENTRIES: readonly BotmuxEntry[] = [
   'codex-app-runner', 'dsh-runner', 'mira-runner', 'mir-runner', 'minimax-runner',
-  'antigravity-runner', 'lark-tool-runner', 'cli-identity-runner', 'bytedcli-exec-runner',
+  'antigravity-runner', 'lark-tool-runner', 'cli-identity-runner',
 ] as const;
 
 /**

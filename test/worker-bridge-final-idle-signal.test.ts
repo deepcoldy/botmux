@@ -10,6 +10,7 @@
  */
 import { describe, expect, it, vi } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 
 function bridge(events: Array<{ kind: string }>) {
   const fireIdle = vi.fn();
@@ -86,5 +87,83 @@ describe('structured bridge final → idle signal', () => {
     run.ingest();
     await nextTick();
     expect(run.fireIdle).not.toHaveBeenCalled();
+  });
+});
+
+describe('TRAE native turn completion → transcript terminal evidence', () => {
+  const nativeEvent = (kind: 'user' | 'assistant_final', turn: string, timestampMs: number, text = '') => ({
+    kind, uuid: `${turn}:${kind}:${timestampMs}`, sourceTurnId: turn,
+    sourceSessionId: 'session', timestampMs, text,
+  });
+
+  function traexIngest(queue: {
+    peek: () => ReadonlyArray<{ started: boolean; finalText: string | undefined }>;
+    ingest?: CodexBridgeQueue['ingest'];
+  }, emit: () => void = () => {}) {
+    const noteTerminal = vi.fn();
+    const noteStarted = vi.fn();
+    let drain: Array<ReturnType<typeof nativeEvent>> = [];
+    const scope: Record<string, unknown> = {
+      rpcTranscriptIngestBlockedByAwaitingActivation: () => false,
+      rpcTurnsAwaitingActivation: new Map(),
+      structuredBridgeIs: (id: string) => id === 'traex',
+      codexBridgeRolloutPath: '/sessions/rollout.jsonl',
+      codexBridgeBaselineDone: true,
+      codexBridgePendingSessionId: undefined,
+      structuredBridgeIngestPath: () => ({ events: drain, newOffset: 64, pendingTail: '' }),
+      codexBridgeOffset: 0,
+      codexBridgePendingTail: '',
+      bridgeSpecFor: () => undefined,
+      lastInitConfig: { cliId: 'traex' },
+      publishActiveRuntime() {},
+      publishedActiveRuntime: {},
+      lastStructuredBridgeActivityAtMs: 0,
+      backend: {},
+      OrcaBackend: class {},
+      codexBridgeQueue: {
+        ingest(events: Parameters<CodexBridgeQueue['ingest']>[0]) { queue.ingest?.(events); },
+        peek: () => queue.peek(),
+      },
+      observeStructuredBackgroundTasks() {},
+      cliAdapter: { postTerminalPromptFence: false },
+      noteSpawnArgvTurnStartTranscriptEvidence() {},
+      pruneExpiredStructuredHeadsAndEmit() {},
+      emitReadyCodexTurns: emit,
+      idleDetector: { fireIdle: vi.fn(), noteTranscriptTerminal: noteTerminal, noteTranscriptTurnStarted: noteStarted },
+      cliSpawnGeneration: 1,
+      cliRestartInProgress: false,
+    };
+    scope.deferFinalIdleSignal = loadWorkerFunction('deferFinalIdleSignal', scope);
+    const ingest = loadWorkerFunction<(opts?: { signalIdle?: boolean }) => void>('codexBridgeIngest', scope);
+    return {
+      feed(events: Array<ReturnType<typeof nativeEvent>>) { drain = events; ingest({ signalIdle: false }); },
+      noteTerminal, noteStarted,
+    };
+  }
+
+  it('records reversed finals when the last open queued turn settles, without another native turn', () => {
+    const queue = new CodexBridgeQueue(() => 0);
+    queue.mark('d1', 'first', 0);
+    queue.mark('d2', 'second', 0);
+    queue.mark('d3', 'third', 0);
+    const run = traexIngest(queue, () => { queue.drainEmittable(); });
+    run.feed([
+      nativeEvent('user', 'turn-1', 1, 'first'),
+      nativeEvent('user', 'turn-2', 2, 'second'),
+      nativeEvent('user', 'turn-3', 3, 'third'),
+    ]);
+    run.feed([nativeEvent('assistant_final', 'turn-2', 4, 'answer-2')]);
+    run.feed([nativeEvent('assistant_final', 'turn-3', 5, 'answer-3')]);
+    expect(run.noteTerminal).not.toHaveBeenCalled();
+    expect(queue.peek().map(turn => [turn.turnId, turn.finalText !== undefined])).toEqual([
+      ['d1', false], ['d2', true], ['d3', true],
+    ]);
+
+    run.feed([nativeEvent('assistant_final', 'turn-1', 6, 'answer-1')]);
+    expect(queue.peek()).toEqual([]);
+    expect(run.noteTerminal).toHaveBeenCalledTimes(1);
+
+    run.feed([]);
+    expect(run.noteTerminal).toHaveBeenCalledTimes(1);
   });
 });

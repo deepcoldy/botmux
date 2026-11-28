@@ -14889,6 +14889,10 @@ async function cmdSend(
           ...(marker ? { marker } : {}),
           beforeDispatch: persistOffBeforeProvider,
           resolveSettledAbsorbedTurnIds: resolveSettledAbsorbedTurnIdsForLedger,
+          absorbedSettlementIneligible: explicitReplyTo !== undefined
+            || sendTopLevel || !!overrideChatId || !!sendInto || explicitQuote !== undefined
+            || !!vcMeetingManagedSendOrigin || isOriginDocCommentTurn || isSlashSend
+            || !!scheduleRemoveSelfTaskId || !!scheduledOriginRun,
           ...(scheduledSendAttempt ? { noSideEffect: (error: unknown) =>
             !scheduledProviderEffectStarted && knownPreProviderRejections.has(error) } : {}),
         })
@@ -22860,6 +22864,10 @@ if (__entrySubcommand) {
   }
   else if (__entrySubcommand === 'cli-identity-runner') {
     await import('./cli-identity-runner.js');
+    process.exit(process.exitCode ?? 0);
+  }
+  else if (__entrySubcommand === 'trae-login-runner') {
+    await import('./trae-login-runner.js');
     process.exit(process.exitCode ?? 0);
   }
   // The entry module now drives the process (top-level main() keeps the event

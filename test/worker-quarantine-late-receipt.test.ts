@@ -58,6 +58,32 @@ async function warnAndDrop(h: ReturnType<typeof harness>) {
 }
 
 describe('quarantine receipt outlives bounded warning and bridge attribution', () => {
+  it.each(['backend', 'generation', 'restart', 'replacement', 'native-session'] as const)(
+    'does not release on empty screens when %s changes during an awaited missing receipt', async change => {
+      const h = harness();
+      await warnAndDrop(h);
+      h.scope.backendScreenEvidenceIsAuthoritativeForMutation = () => true;
+      h.scope.cliAdapter.screenShowsNoPendingInput = () => true;
+      await vi.advanceTimersByTimeAsync(20_000);
+      let resolve!: (result: SubmitRecheckResult) => void;
+      h.recheck.mockImplementation(() => new Promise(done => { resolve = done; }));
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(resolve).toBeTypeOf('function');
+      const original = h.scope.inputDeliveryQuarantine;
+      if (change === 'backend') h.scope.backend = {};
+      if (change === 'generation') h.scope.cliSpawnGeneration++;
+      if (change === 'restart') h.scope.cliRestartInProgress = true;
+      if (change === 'replacement') h.scope.inputDeliveryQuarantine = { ...original, dispatchAttempt: 2 };
+      if (change === 'native-session') h.scope.inputDeliveryObservedCliSessionId = 'new-session';
+      const current = h.scope.inputDeliveryQuarantine;
+      resolve(false);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(h.scope.inputDeliveryQuarantine).toBe(current);
+      expect(h.scope.armPostTerminalInputFence).not.toHaveBeenCalled();
+      expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledTimes(1);
+    },
+  );
+
   it('releases a no-recheck Doubao exception after two empty screens and redrives the successor', async () => {
     const h = harness();
     const empty = `────────────────────────────────────────\n❯  Ask Doubao to do anything\n────────────────────────────────────────`;

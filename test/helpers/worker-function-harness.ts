@@ -61,13 +61,16 @@ import { contractTerminalStatus, executionObserverSupported } from '../../src/se
 import * as runtimeReservation from '../../src/services/runtime-reservation.js';
 import { isRemoteBackendType } from '../../src/core/persistent-backend.js';
 import { traexQuestionFlowVisible } from '../../src/utils/traex-question-page.js';
+import { TraexTurnCompletionTracker } from '../../src/services/traex-turn-completion.js';
 import { antigravityBlockingPageTail } from '../../src/utils/antigravity-blocking-page.js';
 import { isNativeReasoningEffort } from '../../src/services/native-reasoning-observation.js';
 import { readNativeReasoningFooter } from '../../src/utils/native-reasoning-footer.js';
 import { readGrokRuntimeObservation } from '../../src/services/grok-runtime-observer.js';
 import { ClaudeEffortObserver } from '../../src/services/claude-effort-observer.js';
 import { TerminalEffortChoiceTracker } from '../../src/services/terminal-effort-choice.js';
-import { finalBridgeSendMarkerCoversOwnThread, isBridgeNothingToSendFinal, isFinalBridgeSendMarker, stripTrailingBridgeSentinelLine } from '../../src/services/bridge-fallback-gate.js';
+import { attributableSupersededFinalMarkers, finalBridgeSendMarkerCoversOwnThread, isBridgeNothingToSendFinal, isFinalBridgeSendMarker, stripTrailingBridgeSentinelLine } from '../../src/services/bridge-fallback-gate.js';
+import { resolveAbsorbedTurnCoverage } from '../../src/core/turn-absorption.js';
+import { compatibleAuthorityPrincipal } from '../../src/core/active-turn-authority.js';
 import { TurnSendLedger } from '../../src/services/turn-send-ledger.js';
 import { isStructuredNoticeProtocolMessage } from '../../src/services/structured-notice-protocol.js';
 import { rewindableErrorCode, transcriptTurnFailedWithoutOutput } from '../../src/core/failed-turn-rewind.js';
@@ -270,7 +273,7 @@ function defaultScopedWorkerState(scope: Record<string, unknown>, key: string | 
   if (key === 'pendingAdoptMessages') return (scope.pendingAdoptMessages ??= []);
   if (key === 'restoredUnsentInputs') return (scope.restoredUnsentInputs ??= new Set());
   if (key === 'scheduledInputReceipts') return (scope.scheduledInputReceipts ??= new Map());
-  if (['coalescePendingScheduledInputs', 'discardUnwrittenScheduledInput', 'discardScheduledBacklogForStop', 'requestScheduledInputAdmission', 'runScheduledCliInputWrite', 'unsentInputJournalPath', 'cancelScheduledAdmissionRetry', 'scheduleScheduledAdmissionRetry'].includes(String(key))) return loadWorkerFunction(String(key), scope);
+  if (['coalescePendingScheduledInputs', 'discardUnwrittenScheduledInput', 'discardScheduledBacklogForStop', 'requestScheduledInputAdmission', 'runScheduledCliInputWrite', 'unsentInputJournalPath', 'cancelScheduledAdmissionRetry', 'scheduleScheduledAdmissionRetry', 'scheduledCliInputWriteHold', 'settleScheduledCliInputHold'].includes(String(key))) return loadWorkerFunction(String(key), scope);
   if (key === 'inFlightKeepaliveFingerprints') {
     return (scope.inFlightKeepaliveFingerprints ??= new Map<string, number>());
   }
@@ -289,6 +292,10 @@ function defaultScopedWorkerState(scope: Record<string, unknown>, key: string | 
   }
   if (key === 'deferredSessionReady') return (scope.deferredSessionReady ??= []);
   if (key === 'settledAbsorbedTurnsByKey') return (scope.settledAbsorbedTurnsByKey ??= new Map());
+  if (key === 'absorbedMarkerWrittenAtMsByKey') return (scope.absorbedMarkerWrittenAtMsByKey ??= new Map());
+  if (key === 'resolveAbsorbedTurnCoverage') return resolveAbsorbedTurnCoverage;
+  if (key === 'compatibleAuthorityPrincipal') return compatibleAuthorityPrincipal;
+  if (key === 'attributableSupersededFinalMarkers') return attributableSupersededFinalMarkers;
   // Queue/terminal fixtures that do not model bridge delivery have no final
   // evidence. Focused marker suites inject the real reader explicitly.
   if (key === 'readSendMarkers') return (scope.readSendMarkers ??= () => []);
@@ -314,6 +321,10 @@ function defaultScopedWorkerState(scope: Record<string, unknown>, key: string | 
   }
   if (key === 'traexFirstPromptReadinessPoller') {
     return (scope.traexFirstPromptReadinessPoller ??= new TraexFirstPromptReadinessPoller());
+  }
+  // Module-level native-turn completion tracker used by codexBridgeIngest.
+  if (key === 'traexTurnCompletion') {
+    return (scope.traexTurnCompletion ??= new TraexTurnCompletionTracker());
   }
   if (key === 'traexNativeViewportEvidence') {
     return (scope.traexNativeViewportEvidence ??= new TraexNativeViewportEvidenceStore());
