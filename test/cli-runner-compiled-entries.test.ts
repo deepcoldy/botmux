@@ -48,6 +48,7 @@ import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { createDshAdapter } from '../src/adapters/cli/dsh.js';
 import { createMiraAdapter } from '../src/adapters/cli/mira.js';
 import { createMinimaxAdapter } from '../src/adapters/cli/minimax.js';
+import { createAtomcodeAdapter } from '../src/adapters/cli/atomcode.js';
 import { createAntigravityAcpAdapter } from '../src/adapters/cli/antigravity-acp.js';
 import { createMirAdapter } from '../src/adapters/cli/mir.js';
 
@@ -63,6 +64,7 @@ const ADAPTERS: ReadonlyArray<{ id: string; entry: BotmuxEntry; make: () => { bu
   { id: 'dsh', entry: 'dsh-runner', make: () => createDshAdapter() as never },
   { id: 'mira', entry: 'mira-runner', make: () => createMiraAdapter() as never },
   { id: 'minimax', entry: 'minimax-runner', make: () => createMinimaxAdapter('/bin/true') as never },
+  { id: 'atomcode', entry: 'atomcode-runner', make: () => createAtomcodeAdapter('/bin/true') as never },
   { id: 'antigravity-acp', entry: 'antigravity-runner', make: () => createAntigravityAcpAdapter('/bin/true') as never },
   { id: 'mir', entry: 'mir-runner', make: () => createMirAdapter() as never },
 ];
