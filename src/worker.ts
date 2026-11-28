@@ -25777,11 +25777,18 @@ async function handleTuiTextInput(keys: string[], text: string): Promise<boolean
   const targetBackend = backend;
   const targetAdapter = cliAdapter;
   const lifetime = cliLifetimeNonce;
+  // Adapter confirmation can outlive this prompt. Its proof belongs to the
+  // turn and CLI generation that started the write, never their successors.
+  const inputTurnId = currentBotmuxTurnId;
+  const inputDispatchAttempt = currentBotmuxDispatchAttempt;
+  const inputGeneration = cliSpawnGeneration;
   if (codexCliEffortOperation) await cancelCodexCliEffort();
-  if (backend !== targetBackend || cliAdapter !== targetAdapter || cliLifetimeNonce !== lifetime) return false;
+  if (backend !== targetBackend || cliAdapter !== targetAdapter || cliLifetimeNonce !== lifetime
+    || cliSpawnGeneration !== inputGeneration) return false;
   const navKeyCount = keys[keys.length - 1] === 'Enter' ? keys.length - 1 : keys.length;
 
   log(`TUI text input: writing "${text.substring(0, 80)}" to PTY (after ${navKeyCount} nav keys)`);
+  let submittedInputResult: Awaited<ReturnType<CliAdapter['writeInput']>> | undefined;
   try {
     const transaction = await runAmbiguousSubmissionTransaction(
       targetBackend,
@@ -25790,9 +25797,11 @@ async function handleTuiTextInput(keys: string[], text: string): Promise<boolean
         keys,
         text,
         keyToAnsi: KEY_TO_ANSI,
-        isCurrent: () => backend === targetBackend && cliAdapter === targetAdapter && !nativeSessionForkPending(),
+        isCurrent: () => backend === targetBackend && cliAdapter === targetAdapter
+          && cliSpawnGeneration === inputGeneration && !nativeSessionForkPending(),
         writeInput: async (target, content) => {
           const result = await targetAdapter.writeInput(target, content);
+          submittedInputResult = result;
           if (targetBackend.captureAmbiguousSubmissionFence) {
             await settleVerifiableSubmissionForJournal(result);
           }
@@ -25809,8 +25818,57 @@ async function handleTuiTextInput(keys: string[], text: string): Promise<boolean
       );
     }
     if (!transaction.result) {
+      // An unconfirmed agy write may still produce USER_INPUT. This path has no
+      // scheduleSubmitFailureNotify owner, so retain its proof until terminal;
+      // if the backend was replaced, settle the detached old generation now.
+      if (typeof submittedInputResult?.proveConsumed === 'function') {
+        if (backend !== targetBackend || cliAdapter !== targetAdapter || cliLifetimeNonce !== lifetime
+          || cliSpawnGeneration !== inputGeneration || nativeSessionForkPending()) {
+          submittedInputResult.settleConsumed?.();
+        } else {
+          const deferredKind = typeof ownedSubmitConsumptionProofKind === 'function'
+            ? ownedSubmitConsumptionProofKind() : undefined;
+          if (deferredKind && typeof watchDeferredConsumptionProof === 'function') {
+            watchDeferredConsumptionProof(
+              inputTurnId,
+              inputDispatchAttempt,
+              deferredKind,
+              submittedInputResult.proveConsumed,
+              submittedInputResult.settleConsumed,
+            );
+          } else {
+            submittedInputResult.settleConsumed?.();
+          }
+        }
+      }
       logError('TUI text input was rejected, unconfirmed, or crossed a backend replacement');
       return false;
+    }
+    // This picker path bypasses flushPending, but Antigravity still registers a
+    // submit-ledger entry. Observe its proof here as well; otherwise every TUI
+    // answer would leave an unresolved entry that blocks later identical text.
+    const tuiProofKind = submittedInputResult?.submitted === true
+      && (submittedInputResult.ownershipProven === true
+        || typeof submittedInputResult.proveConsumed === 'function')
+      && typeof ownedSubmitConsumptionProofKind === 'function'
+      ? ownedSubmitConsumptionProofKind() : undefined;
+    if (tuiProofKind && submittedInputResult?.ownershipProven === true) {
+      acknowledgeNativeInputConsumed(
+        inputTurnId,
+        tuiProofKind,
+        submittedInputResult.cliSessionId ?? lastInitConfig?.cliSessionId,
+        undefined,
+        inputDispatchAttempt,
+      );
+    } else if (tuiProofKind && typeof submittedInputResult?.proveConsumed === 'function'
+      && typeof watchDeferredConsumptionProof === 'function') {
+      watchDeferredConsumptionProof(
+        inputTurnId,
+        inputDispatchAttempt,
+        tuiProofKind,
+        submittedInputResult.proveConsumed,
+        submittedInputResult.settleConsumed,
+      );
     }
   } catch (err: any) {
     logError(`TUI text input write failed: ${err?.message ?? err}`);
@@ -28734,6 +28792,8 @@ type VerifiableSubmissionResult = void | {
   cliSessionId?: string;
   ownershipProven?: boolean;
   unprovenCliSessionId?: string;
+  proveConsumed?: () => { cliSessionId?: string } | undefined;
+  settleConsumed?: () => void;
   failureReason?: string;
   recheck?: () => SubmitRecheckResult | Promise<SubmitRecheckResult>;
 };
@@ -28776,6 +28836,13 @@ async function settleVerifiableSubmissionForJournal(
     // keeps the candidate exactly as it does for an in-band one (#2363).
     if (typeof recheck === 'object' && recheck && typeof recheck.unprovenCliSessionId === 'string') {
       result.unprovenCliSessionId = recheck.unprovenCliSessionId;
+    }
+    // An unproven consumption probe (Antigravity) must reach flushPending's
+    // watcher, which also settles it at the turn's end.
+    if (typeof recheck === 'object' && recheck && recheck.ownershipProven !== true
+      && typeof recheck.proveConsumed === 'function') {
+      result.proveConsumed = recheck.proveConsumed;
+      if (typeof recheck.settleConsumed === 'function') result.settleConsumed = recheck.settleConsumed;
     }
     return true;
   } catch (err) {
@@ -30688,9 +30755,14 @@ function scheduleSubmitFailureNotify(
         }
         // A late exact history match is the same owned-log evidence as an
         // immediate one; other CLIs' rechecks stay on the terminal fallback.
-        if (settlement.ownershipProven === true && codexHistoryMatchProvesConsumption()) {
-          acknowledgeNativeInputConsumed(turnIdentity?.turnId, 'codex_history_match',
+        const deferredProofKind = settlement.ownershipProven === true || settlement.proveConsumed
+          ? ownedSubmitConsumptionProofKind() : undefined;
+        if (deferredProofKind && settlement.ownershipProven === true) {
+          acknowledgeNativeInputConsumed(turnIdentity?.turnId, deferredProofKind,
             cliSessionId ?? lastInitConfig?.cliSessionId, undefined, turnIdentity?.dispatchAttempt);
+        } else if (deferredProofKind && settlement.proveConsumed) {
+          watchDeferredConsumptionProof(turnIdentity?.turnId, turnIdentity?.dispatchAttempt, deferredProofKind,
+            settlement.proveConsumed, settlement.settleConsumed);
         }
         onConfirmed?.(cliSessionId, settlement.unprovenCliSessionId);
         log(`Deferred recheck found submit in ${transcriptLabel} — suppressing warning. preview="${preview}"`);
@@ -33652,9 +33724,15 @@ async function flushPending(): Promise<void> {
       // same native conversation that the match was attributed to.
       // `submitted` keeps its meaning (an exact same-text line appeared); only a
       // POSITIVELY owned line proves this pane consumed the input.
-      if (result?.submitted === true && result.ownershipProven === true && codexHistoryMatchProvesConsumption()) {
-        acknowledgeNativeInputConsumed(item.turnId, 'codex_history_match',
+      const immediateProofKind = result
+        && (result.ownershipProven === true || typeof result.proveConsumed === 'function')
+        ? ownedSubmitConsumptionProofKind() : undefined;
+      if (immediateProofKind && result?.ownershipProven === true) {
+        acknowledgeNativeInputConsumed(item.turnId, immediateProofKind,
           result.cliSessionId ?? lastInitConfig?.cliSessionId, undefined, item.dispatchAttempt);
+      } else if (immediateProofKind && typeof result?.proveConsumed === 'function') {
+        watchDeferredConsumptionProof(item.turnId, item.dispatchAttempt, immediateProofKind,
+          result.proveConsumed, result.settleConsumed);
       }
       if (lastInitConfig?.cliId === 'codex' && result?.submitted !== false) {
         const threadId = result?.cliSessionId
@@ -33877,12 +33955,13 @@ async function flushPending(): Promise<void> {
                       dispatchAttempt: item.dispatchAttempt,
                     });
                   }
-                  if (proof.ownershipProven === true
-                    && typeof codexHistoryMatchProvesConsumption === 'function'
-                    && codexHistoryMatchProvesConsumption()) {
+                  const activationProofKind = proof.ownershipProven === true
+                    && typeof ownedSubmitConsumptionProofKind === 'function'
+                    ? ownedSubmitConsumptionProofKind() : undefined;
+                  if (activationProofKind) {
                     acknowledgeNativeInputConsumed?.(
                       item.turnId,
-                      'codex_history_match',
+                      activationProofKind,
                       proof.cliSessionId ?? lastInitConfig?.cliSessionId,
                       undefined,
                       item.dispatchAttempt,
@@ -47845,8 +47924,9 @@ function initializeWorkerSessionContract(msg: Extract<DaemonToWorker, { type: 'i
 
 /** Native acceptance proof for shared group background coverage. Emitted only
  * from boundaries where the CLI itself evidenced this exact input: Codex's
- * exact owned history line, a Codex RPC turn/start acknowledgement, or a
- * Claude transcript user record whose full normalised content matched. Never
+ * exact owned history line, a Codex RPC turn/start acknowledgement, a
+ * Claude transcript user record whose full normalised content matched, or an
+ * Antigravity USER_INPUT in the pane's own conversation transcript. Never
  * from IPC arrival, queue ownership or a generic adapter `submitted` flag. */
 function recordStructuredInput(
   turnId: string | undefined,
@@ -47872,6 +47952,10 @@ function recordStructuredInput(
   }
 }
 
+/** Immediate, deferred and activation paths may all observe the same agy proof.
+ * Keep one receipt per CLI generation and exact turn attempt. */
+const acknowledgedAntigravityConsumption = new Set<string>();
+
 function acknowledgeNativeInputConsumed(
   turnId: string | undefined,
   proofKind: Extract<WorkerToDaemon, { type: 'native_input_consumed' }>['proofKind'],
@@ -47881,6 +47965,11 @@ function acknowledgeNativeInputConsumed(
   absorbedHost?: { hostTurnId: string; hostDispatchAttempt?: number },
 ): void {
   if (!turnId) return;
+  let agyReceiptKey: string | undefined;
+  if (proofKind === 'antigravity_transcript_user_input') {
+    agyReceiptKey = `${cliSpawnGeneration}\0${turnId}\0${dispatchAttempt ?? ''}`;
+    if (acknowledgedAntigravityConsumption.has(agyReceiptKey)) return;
+  }
   if (process.env.SESSION_DATA_DIR && sessionId && (nativeSessionId || nativeTurnId)) {
     try {
       updateSessionTurnNativeAnchor(process.env.SESSION_DATA_DIR, sessionId, turnId, nativeSessionId, nativeTurnId);
@@ -47906,6 +47995,13 @@ function acknowledgeNativeInputConsumed(
     ...(nativeSessionId ? { nativeSessionId } : {}),
     ...(nativeTurnId ? { nativeTurnId } : {}),
   });
+  if (agyReceiptKey) {
+    acknowledgedAntigravityConsumption.add(agyReceiptKey);
+    if (acknowledgedAntigravityConsumption.size > 1_024) {
+      const oldest = acknowledgedAntigravityConsumption.keys().next().value;
+      if (oldest !== undefined) acknowledgedAntigravityConsumption.delete(oldest);
+    }
+  }
 }
 
 /** Compaction may have dropped the turn that carried the fixed context. The
@@ -47937,6 +48033,88 @@ function publishTraexNativeContextReceipt(
  * text in the owned history.jsonl. RPC and adopted panes have other owners. */
 function codexHistoryMatchProvesConsumption(): boolean {
   return lastInitConfig?.cliId === 'codex' && !lastInitConfig.adoptMode && !codexRpcEngine;
+}
+
+/** Proof kind an adapter submit result with `ownershipProven: true` carries:
+ * Codex's exact owned history line, or Antigravity's USER_INPUT record in the
+ * pane's own (process-log-resolved) conversation transcript. Adopted panes and
+ * CLIs whose `ownershipProven` means something weaker yield no proof. */
+function ownedSubmitConsumptionProofKind():
+  | 'codex_history_match' | 'antigravity_transcript_user_input' | undefined {
+  if (codexHistoryMatchProvesConsumption()) return 'codex_history_match';
+  if (lastInitConfig?.cliId === 'antigravity' && !lastInitConfig.adoptMode) return 'antigravity_transcript_user_input';
+  return undefined;
+}
+
+/** How long a submitted-but-unproven input keeps being probed for native
+ * consumption. A queued type-ahead input is only fed to the model when the
+ * running turn ends, which may take minutes. */
+const DEFERRED_CONSUMPTION_PROOF_WINDOW_MS = 15 * 60_000;
+const DEFERRED_CONSUMPTION_PROOF_MIN_POLL_MS = 500;
+const DEFERRED_CONSUMPTION_PROOF_MAX_POLL_MS = 5_000;
+/** One adapter probe owns one ledger entry. Ordinary and activation/deferred
+ * rechecks may expose the same closure; never run duplicate watchers for it. */
+const deferredConsumptionProofProbes = new WeakSet<() => { cliSessionId?: string } | undefined>();
+
+/** Poll an adapter's read-only consumption probe off the write path, and send
+ * the same receipt an immediate `ownershipProven` would have. Stops at the
+ * proof, the turn's terminal (settling the probe), a CLI respawn or close.
+ * Past the window it stops probing but keeps waiting for the terminal to
+ * settle. Entries without a turn id stay fail-closed; detached generations
+ * are settled because their adapter can no longer accept new submits. */
+function watchDeferredConsumptionProof(
+  turnId: string | undefined,
+  dispatchAttempt: number | undefined,
+  proofKind: NonNullable<ReturnType<typeof ownedSubmitConsumptionProofKind>>,
+  prove: () => { cliSessionId?: string } | undefined,
+  settle?: () => void,
+): void {
+  const settleAndStop = () => { try { settle?.(); } catch { /* best effort */ } };
+  if (deferredConsumptionProofProbes.has(prove)) return;
+  deferredConsumptionProofProbes.add(prove);
+  // Without a turn identity there is no safe terminal edge for settling: a
+  // late USER_INPUT may still belong to this write, so keep it fail-closed.
+  if (!turnId) return;
+  const generation = cliSpawnGeneration;
+  const deadline = Date.now() + scaleMs(DEFERRED_CONSUMPTION_PROOF_WINDOW_MS);
+  let interval = DEFERRED_CONSUMPTION_PROOF_MIN_POLL_MS;
+  const schedule = () => {
+    const timer = setTimeout(tick, scaleMs(interval));
+    timer.unref?.();
+    interval = Math.min(interval * 2, DEFERRED_CONSUMPTION_PROOF_MAX_POLL_MS);
+  };
+  const tick = () => {
+    // A finished turn's input either already has its record or was dropped:
+    // release it so it cannot take a later identical input's record.
+    if (turnTerminalEmitted(turnId, dispatchAttempt)) { settleAndStop(); return; }
+    if (closeRequested || cliSpawnGeneration !== generation) { settleAndStop(); return; }
+    if (Date.now() > deadline) {
+      // Out of probing budget: no more transcript reads, but keep the cheap
+      // terminal check so the entry is still settled when its turn ends.
+      if (!settle) return;
+      interval = DEFERRED_CONSUMPTION_PROOF_MAX_POLL_MS;
+      schedule();
+      return;
+    }
+    let proof: { cliSessionId?: string } | undefined;
+    try { proof = prove(); } catch { proof = undefined; }
+    if (!proof) { schedule(); return; }
+    // A fresh submit can reveal its native id only through this late probe.
+    // Bind it before the receipt so a later close/resume uses the same agy
+    // conversation rather than silently starting fresh.
+    if (proof.cliSessionId && proof.cliSessionId !== lastInitConfig?.cliSessionId
+      && lastInitConfig?.cliId === 'antigravity'
+      && !cliAdapter?.runnerFramedInput
+      && typeof applyAuthoritativeAntigravitySessionId === 'function') {
+      const preserveLiveTurn = typeof shouldPreserveAntigravitySubmittedTurn === 'function'
+        && shouldPreserveAntigravitySubmittedTurn(turnId);
+      applyAuthoritativeAntigravitySessionId(proof.cliSessionId,
+        preserveLiveTurn ? { preserveLiveTurn: true } : {});
+    }
+    acknowledgeNativeInputConsumed(turnId, proofKind,
+      proof.cliSessionId ?? lastInitConfig?.cliSessionId, undefined, dispatchAttempt);
+  };
+  schedule();
 }
 
 function receiveOrdinaryImTurn(turnId: string): 'new' | 'inflight' | 'committed' {

@@ -34,7 +34,8 @@ describe('Codex effort menu input ownership', () => {
       const state: Record<string, any> = {
         activeTranscriptImagePurge: undefined,
         lastInitConfig: null,
-        backend: {}, cliAdapter: {}, cliLifetimeNonce: 1,
+        backend: {}, cliAdapter: {}, cliLifetimeNonce: 1, cliSpawnGeneration: 1,
+        currentBotmuxTurnId: undefined, currentBotmuxDispatchAttempt: undefined,
         codexCliEffortOperation: {}, cancelCodexCliEffort: vi.fn(() => cancelled),
         effectiveBackendType: 'pty', isRemoteBackendType: () => false,
         isCriticalInterruptKey, traexQuotaPending: undefined, traexAutoModelController: null,

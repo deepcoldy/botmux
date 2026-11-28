@@ -75,6 +75,9 @@ export type SubmitRecheckResult = boolean | {
    *  (see the Codex adapter). A candidate, never a binding: callers may use it
    *  only after independently proving the observed CLI process owns it. */
   unprovenCliSessionId?: string;
+  /** See the writeInput result's `proveConsumed` / `settleConsumed`. */
+  proveConsumed?: () => { cliSessionId?: string } | undefined;
+  settleConsumed?: () => void;
 };
 
 /** See {@link CliAdapter.sessionRenameSurface}. */
@@ -623,6 +626,14 @@ export interface CliAdapter {
      *  terminal keybinding). Worker surfaces this immediately. */
     failureReason?: string;
     recheck?: () => SubmitRecheckResult | Promise<SubmitRecheckResult>;
+    /** The input may have landed but consumption is not proven yet: a read-only probe the worker
+     *  may poll later (without blocking the write path) for the same proof
+     *  `ownershipProven` would have carried. Returns the owned native session
+     *  once proven. Never re-sends input. */
+    proveConsumed?: () => { cliSessionId?: string } | undefined;
+    /** The probed input's turn reached its terminal unproven: release it so
+     *  it can no longer claim a record. */
+    settleConsumed?: () => void;
   }>;
 
   /** Press the composer's SUBMIT key once for a draft already parked in the

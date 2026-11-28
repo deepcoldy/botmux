@@ -1287,19 +1287,58 @@ export function resolveAntigravityCandidateMinByteOffset(
   return null;
 }
 
-/** 统计 transcriptPath 的 [minByteOffset, maxByteOffset) 区间内，正文 SHA-256 命中 textSha256 的 USER_INPUT 次数。 */
-export function countAntigravityUserInputMatches(
+export interface AntigravityUserInputMatch {
+  /** Line start offset in the scanned file. */
+  offset: number;
+  /** agy's step_index, shared by the compact and full transcripts of a conversation. */
+  stepIndex?: number;
+}
+
+/** Incremental scan for USER_INPUT records whose unwrapped payload hashes to
+ *  `textSha256`, from `fromOffset` to the last complete line. Returns the
+ *  matches and the next resume offset (never past a partial trailing line),
+ *  or null when the file cannot be read. */
+export function scanAntigravityUserInputMatches(
+  transcriptPath: string,
+  textSha256: string,
+  fromOffset: number,
+): { matches: AntigravityUserInputMatch[]; nextOffset: number } | null {
+  if (!transcriptPath || !existsSync(transcriptPath)) return null;
+  const matches: AntigravityUserInputMatch[] = [];
+  let failed = false;
+  const cursor = scanJsonlFromOffset(transcriptPath, fromOffset, {
+    onError: () => { failed = true; },
+    onLine: (line, lineStart) => {
+      if (!line.includes('USER_INPUT')) return;
+      let rec: any;
+      try {
+        rec = JSON.parse(line);
+      } catch {
+        return;
+      }
+      if (!isExplicitUserInput(rec)) return;
+      const unwrapped = unwrapAntigravityUserInput(typeof rec.content === 'string' ? rec.content : '');
+      if (hashAntigravitySubmittedText(unwrapped) !== textSha256) return;
+      matches.push({ offset: lineStart, ...(Number.isInteger(rec.step_index) ? { stepIndex: rec.step_index } : {}) });
+    },
+  });
+  if (!cursor || failed) return null;
+  return { matches, nextOffset: cursor.newOffset };
+}
+
+/** transcriptPath 的 [minByteOffset, maxByteOffset) 区间内，正文 SHA-256 命中 textSha256 的 USER_INPUT 行起始偏移（升序）。 */
+export function listAntigravityUserInputMatchOffsets(
   transcriptPath: string,
   textSha256: string,
   minByteOffset = 0,
   maxByteOffset?: number,
-): number {
-  if (!transcriptPath || !existsSync(transcriptPath)) return 0;
-  if (maxByteOffset !== undefined && maxByteOffset <= minByteOffset) return 0;
-  let count = 0;
+): number[] {
+  if (!transcriptPath || !existsSync(transcriptPath)) return [];
+  if (maxByteOffset !== undefined && maxByteOffset <= minByteOffset) return [];
+  const offsets: number[] = [];
   scanJsonlFromOffset(transcriptPath, minByteOffset, {
     ...(maxByteOffset !== undefined ? { endOffset: maxByteOffset } : {}),
-    onLine: line => {
+    onLine: (line, lineStart) => {
       if (!line.trim()) return;
       let rec: any;
       try {
@@ -1309,10 +1348,20 @@ export function countAntigravityUserInputMatches(
       }
       if (!isExplicitUserInput(rec)) return;
       const unwrapped = unwrapAntigravityUserInput(typeof rec.content === 'string' ? rec.content : '');
-      if (hashAntigravitySubmittedText(unwrapped) === textSha256) count += 1;
+      if (hashAntigravitySubmittedText(unwrapped) === textSha256) offsets.push(lineStart);
     },
   });
-  return count;
+  return offsets;
+}
+
+/** 统计 transcriptPath 的 [minByteOffset, maxByteOffset) 区间内，正文 SHA-256 命中 textSha256 的 USER_INPUT 次数。 */
+export function countAntigravityUserInputMatches(
+  transcriptPath: string,
+  textSha256: string,
+  minByteOffset = 0,
+  maxByteOffset?: number,
+): number {
+  return listAntigravityUserInputMatchOffsets(transcriptPath, textSha256, minByteOffset, maxByteOffset).length;
 }
 
 const COMPLETED_TURN_INITIAL_TAIL_BYTES = 256 * 1024;

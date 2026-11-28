@@ -254,7 +254,7 @@ describe('antigravity writeInput — single-Enter submit', () => {
       expect(fake.texts).toEqual([]);
       expect(fake.specialKeys).toEqual([]);
       appendHistory(content);
-      expect(result?.recheck?.()).toBe(true);
+      expect(result?.recheck?.()).toEqual({ submitted: true, proveConsumed: expect.any(Function), settleConsumed: expect.any(Function) });
     });
   }
 
@@ -264,7 +264,7 @@ describe('antigravity writeInput — single-Enter submit', () => {
     let calls = 0;
     const fake = makePty();
     fake.pty.submitBracketedPaste = () => { calls++; void delay(800).then(() => appendHistory(content)); return false; };
-    expect(await adapterForVersion('1.5.4').writeInput(fake.pty, content)).toBeUndefined();
+    expect(await adapterForVersion('1.5.4').writeInput(fake.pty, content)).toEqual({ submitted: true, proveConsumed: expect.any(Function), settleConsumed: expect.any(Function) });
     expect(calls).toBe(1);
     expect(fake.specialKeys).toEqual([]);
   });
@@ -390,7 +390,7 @@ describe('antigravity writeInput — single-Enter submit', () => {
       resetHistory();
       const convId = 'aaaaaaaa-0000-4000-8000-000000000001';
       const { selected, fake } = freshLaunch('agy-grace-fresh-finished', convId);
-      expect(await selected.writeInput(fake.pty, 'quick question')).toEqual({ submitted: true, cliSessionId: convId });
+      expect(await selected.writeInput(fake.pty, 'quick question')).toEqual({ submitted: true, cliSessionId: convId, proveConsumed: expect.any(Function), settleConsumed: expect.any(Function) });
 
       // Before agy creates the transcript, the grace still holds the turn busy.
       expect(selected.isSessionBusy!({ cliSessionId: convId, getCurrentScreen: () => idleScreen })).toBe(true);
@@ -410,7 +410,7 @@ describe('antigravity writeInput — single-Enter submit', () => {
       writeFileSync(nativeLogOf('agy-grace-new'), `Streaming conversation ${oldId}\nStreaming conversation ${newId}\n`);
       const fake = makePty();
       fake.pty.submitBracketedPaste = text => { appendHistory(text); return true; };
-      expect(await selected.writeInput(fake.pty, 'first turn after new')).toEqual({ submitted: true, cliSessionId: newId });
+      expect(await selected.writeInput(fake.pty, 'first turn after new')).toEqual({ submitted: true, cliSessionId: newId, proveConsumed: expect.any(Function), settleConsumed: expect.any(Function) });
       writeFileSync(transcriptOf(newId), finishedTurn);
       expect(selected.isSessionBusy!({ cliSessionId: newId, getCurrentScreen: () => idleScreen })).toBe(false);
     });
@@ -535,7 +535,7 @@ describe('antigravity writeInput — single-Enter submit', () => {
       };
 
       const result = await selected.writeInput(fake.pty, '继续？');
-      expect(result).toBeUndefined();
+      expect(result).toEqual({ submitted: true, proveConsumed: expect.any(Function), settleConsumed: expect.any(Function) });
       expect(events).toEqual(['key:Escape', 'paste:继续？']);
     });
 
@@ -561,7 +561,7 @@ describe('antigravity writeInput — single-Enter submit', () => {
       };
 
       const result = await selected.writeInput(fake.pty, '继续');
-      expect(result).toBeUndefined();
+      expect(result).toEqual({ submitted: true, proveConsumed: expect.any(Function), settleConsumed: expect.any(Function) });
       expect(events).toEqual(['paste:继续']);
     });
 
@@ -613,7 +613,7 @@ describe('antigravity writeInput — single-Enter submit', () => {
       };
 
       const result = await selected.writeInput(fake.pty, 'please keep working');
-      expect(result).toBeUndefined();
+      expect(result).toEqual({ submitted: true, proveConsumed: expect.any(Function), settleConsumed: expect.any(Function) });
       expect(events).toEqual(['paste:please keep working']);
     });
 
@@ -639,7 +639,7 @@ describe('antigravity writeInput — single-Enter submit', () => {
       };
 
       const result = await selected.writeInput(fake.pty, '继续？');
-      expect(result).toBeUndefined();
+      expect(result).toEqual({ submitted: true, proveConsumed: expect.any(Function), settleConsumed: expect.any(Function) });
       expect(events).toEqual(['key:Escape', 'paste:继续？']);
     });
   });
