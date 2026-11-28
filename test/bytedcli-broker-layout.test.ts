@@ -6,8 +6,21 @@ import {createHash,randomUUID} from 'node:crypto';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {bytedcliTrustedHostLayout} from '../src/core/bytedcli-broker.js';
+import {createBytedcliHostOperationPolicyReader} from '../src/core/bytedcli-host-operation-policy.js';
 const roots:string[]=[];
 afterEach(()=>{vi.unstubAllEnvs();for(const root of roots.splice(0))rmSync(root,{recursive:true,force:true});});
+it.each(['home','home-parent'])('loads host operation policy when the operator uses a symlinked %s',kind=>{
+ const root=mkdtempSync(join(tmpdir(),'broker-home-alias-'));roots.push(root);
+ const actual=join(root,'actual'),alias=join(root,'alias');mkdirSync(actual,{mode:0o700});
+ const machineHome=kind==='home'?actual:join(actual,'operator');
+ if(kind==='home-parent')mkdirSync(machineHome,{mode:0o700});
+ symlinkSync(actual,alias);vi.stubEnv('HOME',kind==='home'?alias:join(alias,'operator'));vi.stubEnv('PATH',root);
+ const layout=bytedcliTrustedHostLayout();
+ const snapshot=createBytedcliHostOperationPolicyReader(layout.privateRoot)();
+ expect(snapshot.errorCode).toBeUndefined();
+ expect(layout.machineHome).toBe(machineHome);
+ expect(layout.privateRoot).toBe(join(machineHome,'.botmux','host-authority','bytedcli-broker'));
+});
 it.each(['ALL_PROXY','all_proxy'])('explicitly refuses unsupported %s host routing during frozen layout assembly',key=>{
  vi.stubEnv(key,'http://127.0.0.1:9');const layout=bytedcliTrustedHostLayout();
  expect(layout.unavailableReason).toBe('unsupported ByteCloud host proxy: '+key);expect(layout.runtimeStillCurrent()).toBe(false);

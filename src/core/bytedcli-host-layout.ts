@@ -10,7 +10,8 @@ import { discoverBytedcliDbRuntime } from './bytedcli-broker-process.js';
 /** Frozen once at host assembly. PATH is daemon startup configuration, never
  * Bot/Agent env, and discover validates canonical install/runtime ownership. */
 export function bytedcliTrustedHostLayout(settings:{readonly machineProfile?:string;readonly protectedRoots?:readonly string[]}={}){
-  const machineHome=homedir(),path=process.env.PATH??'/usr/local/bin:/usr/bin:/bin';
+  // Resolve the operator's home alias before enforcing physical authority paths.
+  const machineHome=realpathSync(homedir()),path=process.env.PATH??'/usr/local/bin:/usr/bin:/bin';
   const directories=path.split(delimiter).filter(isAbsolute);
   const candidates=directories.map(dir=>join(dir,'bytedcli')).filter(existsSync).flatMap(file=>{try{return [realpathSync(file)];}catch{return [];}});
   const runtimeCandidates=directories.map(dir=>join(dir,'node')).filter(existsSync);
