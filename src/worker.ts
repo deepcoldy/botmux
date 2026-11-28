@@ -32582,6 +32582,9 @@ async function flushPending(): Promise<void> {
       const scheduledWriteIsCurrent = () => writeContinuationIsCurrent()
         && cliInterruptGeneration === writeInterruptGeneration && !webTerminalInputWireDirty();
       let normalWritePrepared = false;
+      // Deferred preparation parks this exact item in pendingMessages until
+      // beforeSubmit: the queue, not this write, owns it until then.
+      let deferredQueueOwned = false;
       let retiredBeforeSubmit = false;
       let webWireWriteRefused = false;
       let reattachSteerWriteRefused = false;
@@ -33215,6 +33218,7 @@ async function flushPending(): Promise<void> {
             // ownership and resurrecting it later.
             pendingMessages.unshift(item);
           }
+          deferredQueueOwned = writeAdapter.writeInputDefersPreparation === true;
           const transaction = await runAmbiguousSubmissionTransaction(
             writeBackend,
             () => runScheduledCliInputWrite(item, scheduledWriteIsCurrent,
@@ -33306,12 +33310,22 @@ async function flushPending(): Promise<void> {
         }
       } catch (err: any) {
         if (lateScheduledHold && !normalWritePrepared) {
-          if (lateScheduledHold === 'reject') discardUnwrittenScheduledInput(item);
-          // Deferred-preparation adapters (Codex) keep the item queued until
-          // beforeSubmit, so a write-edge retain finds it still in place.
-          else if (!pendingMessages.includes(item)) pendingMessages.unshift(item);
+          const queuedIndex = pendingMessages.indexOf(item);
+          // A queue-owned item that left the queue during the admission await
+          // was retired and already settled by a lifecycle path (coalesce,
+          // STOP): never revive it and never reject it a second time.
+          const retired = deferredQueueOwned && queuedIndex < 0;
+          if (retired) {
+            cancelScheduledAdmissionRetry(item);
+          } else if (lateScheduledHold === 'reject') {
+            if (deferredQueueOwned) pendingMessages.splice(queuedIndex, 1);
+            discardUnwrittenScheduledInput(item);
+          } else if (queuedIndex < 0) {
+            // Retain: restore what this write dequeued; queue-owned stays put.
+            pendingMessages.unshift(item);
+          }
           keepPromptReadyAfterHold();
-          if (lateScheduledHold === 'reject') continue;
+          if (lateScheduledHold === 'reject' || (retired && writeContinuationIsCurrent())) continue;
           break;
         }
         if (reattachSteerWriteRefused && !normalWritePrepared && writeContinuationIsCurrent()) {
