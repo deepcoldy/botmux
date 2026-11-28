@@ -35,6 +35,7 @@ import { stripBotMentions, stripLeadingMentions, mentionOpenId, mentionAppId, ex
 import { reportMentionDrop, type MentionDropReason } from './mention-drop-telemetry.js';
 import { matchesSubstituteKeywords } from '../../services/substitute-keywords.js';
 import { emitHookEvent, runGroupJoinCommand } from '../../services/hook-runner.js';
+import { isTraeLoginCallbackEvent } from '../../services/trae-login-message.js';
 import { commandPrecedesMentions, isCommandTargetOnly } from './mention-targets.js';
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
 import { isTeamBot, recordTeamBot } from '../../services/team-bots-store.js';
@@ -4327,6 +4328,9 @@ async function recoverDurablePrimaryIngressOnce(input: {
         chat.chatId,
         recoveryChatType(chat),
       );
+      // A callback belongs to one in-memory native login. Recovery cannot
+      // recreate that request and must not persist/replay its credentials.
+      if (isTraeLoginCallbackEvent(data)) continue;
       data.__durableRecovery = { source: 'lark-history' };
       await input.enqueue({
         eventId: `im.message.receive_v1:${input.larkAppId}:${messageId}`,
@@ -8365,7 +8369,7 @@ export function createLarkEventDispatcherRuntime(
         : () => claimEventOnce(eventKey);
       const rawMessage = data?.message;
       const ingressAnchor = rawMessageIngressAnchor(larkAppId, rawMessage);
-      if (runtimeOptions.enqueuePrimary) {
+      if (runtimeOptions.enqueuePrimary && !isTraeLoginCallbackEvent(data)) {
         return enqueuePrimaryInArrivalOrder(() => ({
           eventId: eventKey,
           partitionKey: ingressAnchor,
@@ -8383,7 +8387,7 @@ export function createLarkEventDispatcherRuntime(
           // SDK ACK path. It runs beside the existing SQLite route and cannot
           // suppress or delay that route on failure. `primary` remains blocked
           // until a durable claim loop owns processing instead of this mirror.
-          if (durableInboxShadow) {
+          if (durableInboxShadow && !isTraeLoginCallbackEvent(data)) {
             void enqueueDurableLarkMessage(durableInboxShadow, {
               larkAppId,
               eventId: eventKey,
@@ -8448,7 +8452,7 @@ export function createLarkEventDispatcherRuntime(
     'im.message.updated_v1': async (data: any) => {
       const eventMessage = data?.message ?? data?.event?.message;
       const eventKey = `im.message.updated_v1:${larkAppId}:${eventIdForKey(data) ?? eventMessage?.message_id ?? unkeyableEventKey()}`;
-      if (runtimeOptions.enqueuePrimary) {
+      if (runtimeOptions.enqueuePrimary && !isTraeLoginCallbackEvent(data)) {
         // updated_v1 frequently omits chat_id.  Resolve it before durable
         // enqueue so an edit cannot escape to __chatless__ and overtake the
         // recovered receive row in the real chat partition.  Lookup failure

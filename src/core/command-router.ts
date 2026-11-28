@@ -60,6 +60,12 @@ export function parseSlashCommandInvocation(
   const [cmdRaw] = firstLine.split(/\s+/);
   const cmd = cmdRaw?.toLowerCase();
   if (!cmd) return null;
+  // Callback control input can contain malformed URLs/angle brackets or
+  // pasted newlines. Keep it on the administrator path for validation; it
+  // must never become a model prompt merely because the syntax is invalid.
+  if (cmd === '/dashboard' && /^\/dashboard\s+trae-login\s+complete\b/i.test(trimmed)) {
+    return { cmd, content: trimmed };
+  }
 
   // Explicit payload commands keep their entire body, including examples.
   const spec = commandSpec(cmd);

@@ -1,4 +1,5 @@
 import type { LarkMessage, LarkMention } from '../../types.js';
+import { isTraeLoginCallbackEvent } from '../../services/trae-login-message.js';
 import { getMessageDetail } from './client.js';
 import { logger } from '../../utils/logger.js';
 import { getAllBots, effectiveBotDisplayName } from '../../bot-registry.js';
@@ -561,7 +562,7 @@ export function parseEventMessage(
   // content can be many KB and may include attachment metadata that's
   // noisy or sensitive — truncate to ~500 chars so DEBUG logs stay scannable.
   if (message.message_type !== 'text' && logger.isDebug()) {
-    const raw = message.content ?? '';
+    const raw = isTraeLoginCallbackEvent(data) ? '[TRAE login callback redacted]' : message.content ?? '';
     const trimmed = raw.length > 500 ? raw.slice(0, 500) + `…(+${raw.length - 500}b)` : raw;
     logger.debug(`[parser] type=${message.message_type} content=${trimmed} keys=${Object.keys(message).join(',')}`);
   }

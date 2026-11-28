@@ -2293,6 +2293,18 @@ export const messages: Record<string, string> = {
   'daemon.worktree_building_wait': 'Creating a worktree (includes a git fetch, may take a few seconds) — your message is queued and will be sent together once it is ready.',
 
   // ─── /dashboard command group (PR3 C1) ─────────────────────────────────
+  "trae_login.usage": "Use /dashboard trae-login to start, status to check, or cancel to stop. Submit callbacks only in this bot's DM: /dashboard trae-login complete <requestID> <fullCallbackURL>.",
+  "trae_login.private_only": "Submit the callback URL only in this bot's DM. It contains login credentials and is never processed in a group.",
+  "trae_login.failed": "TRAE login did not complete. Check /dashboard trae-login status; to restart, cancel first and then send /dashboard trae-login.",
+  "trae_login.unsupported": "This entry supports native TRAE CLI on Linux hosts with flock/setpriv. Remote backends, wrappers, Forge, file sandboxes and device credential isolation use separate login domains; use their own login entry.",
+  "trae_login.cancelled": "This TRAE login was cancelled or expired. Send /dashboard trae-login to start again.",
+  "trae_login.verifying": "The callback was submitted to TRAE CLI for verification. Use /dashboard trae-login status to check the result, then resume the original topic after success.",
+  "trae_login.missing": "No TRAE login request belongs to you. Send /dashboard trae-login to start.",
+  "trae_login.starting": "TRAE CLI is starting login. Check /dashboard trae-login status shortly.",
+  "trae_login.succeeded": "TRAE CLI completed this login. Resume the original topic and retry. Restart that session if its old process still reports an authentication error.",
+  "trae_login.challenge": "TRAE CLI enterprise login (valid for 10 minutes; updates the login directory used by this bot and sessions sharing that directory):\n{url}\n\n1. Open the link and sign in yourself.\n2. When the browser reaches 127.0.0.1, copy the full URL from the address bar; that page may be unreachable on a remote device.\n3. Send only in this bot's DM:\n/dashboard trae-login complete {id} <fullCallbackURL>\n4. Send /dashboard trae-login status to confirm success, then resume the original topic.\n\nCancel: /dashboard trae-login cancel.",
+  "trae_login.delivery_failed": "The private login link could not be delivered and the request was cancelled. Open this bot's DM and send /dashboard trae-login.",
+  "trae_login.sent": "The TRAE login link and steps were sent to your DM.",
   'card.dashboard.owner_only': '🔒 The `/dashboard` command group is restricted to bot admins (allowedUsers).',
   'card.dashboard.overview.not_implemented_yet': '🚧 `/dashboard overview` is not implemented yet; coming in a follow-up PR.',
   'card.dashboard.sessions.not_implemented_yet': '🚧 `/dashboard sessions` is not implemented yet; coming in a follow-up PR.',
@@ -2308,6 +2320,8 @@ export const messages: Record<string, string> = {
     '• `schedules`  — scheduled tasks\n' +
     '• `settings`   — global settings (admins only)\n' +
     '• `link`       — admin home link via DM (alias: bare `/dash`; link form follows the remote-access/proxy configuration)\n' +
+    '• `trae-login` — TRAE enterprise login (private link, callback, status/cancel)\n' +
+    '• `trae-login` — TRAE enterprise login (private authorization, status/cancel)\n' +
     '• `help`       — this help\n\n' +
     'Without a subcommand, defaults to `overview`. The entire group is restricted to bot admins (allowedUsers).',
   'card.dashboard.help.unknown_module': '⚠️ Unknown module `{module}`. Pick one of:',

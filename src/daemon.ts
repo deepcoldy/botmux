@@ -20,6 +20,7 @@ import { registerSessionContractPrimary } from './core/session-contract-primary.
 import { controllerForSession } from './core/session-controller.js';
 import { captureCodexAsyncAskOrigin } from './core/codex-async-ask-origin.js';
 import { sessionContractStore } from './services/session-contract-store.js';
+import { redactTraeLoginCommand, traeLoginManager } from './services/trae-login.js';
 import { recordDeploymentContinuation, cancelDeploymentContinuation } from './services/deployment-continuation.js';
 import { deploymentContinuationAuthority } from './core/deployment-continuation-authority.js';
 import { shareVcMeetingSummary } from './services/vc-meeting-summary-share.js';
@@ -29001,7 +29002,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     parsed.content = listenerPrompt;
     cmdContent = listenerPrompt;
   }
-  logger.info(`New session: "${content.substring(0, 60)}" (scope=${scope}, anchor=${anchor.substring(0, 12)}, resources: ${resources.length}, active: ${getActiveCount()}, messageId: ${messageId}, chatId: ${chatId})`);
+  logger.info(`New session: "${redactTraeLoginCommand(content, stripLeadingMentions(parsed.content, parsed.mentions)).substring(0, 60)}" (scope=${scope}, anchor=${anchor.substring(0, 12)}, resources: ${resources.length}, active: ${getActiveCount()}, messageId: ${messageId}, chatId: ${chatId})`);
   emitHookEvent('topic.new', {
     larkAppId,
     chatId,
@@ -29012,7 +29013,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     senderOpenId,
     senderType: parsed.senderType,
     msgType: parsed.msgType,
-    content,
+    content: redactTraeLoginCommand(content, stripLeadingMentions(parsed.content, parsed.mentions)),
   });
 
   // Workflow 保留动词必须先于即兴 grill，避免 `run/save/cancel/list/show`
@@ -31568,7 +31569,7 @@ async function handleThreadReplyAdmitted(
       senderType: parsed.senderType,
       msgType: parsed.msgType,
       sessionId: existingHookSession?.session.sessionId,
-      content: parsed.content,
+      content: redactTraeLoginCommand(parsed.content, stripLeadingMentions(parsed.content, parsed.mentions)),
     });
     if (isForeignBot) {
       logger.info(
@@ -31963,7 +31964,7 @@ async function handleThreadReplyAdmitted(
     }
   }
 
-  logger.info(`Reply in ${scope}-scope session ${anchor.substring(0, 12)}: ${content.substring(0, 100)} (resources: ${resources.length})`);
+  logger.info(`Reply in ${scope}-scope session ${anchor.substring(0, 12)}: ${redactTraeLoginCommand(content, stripLeadingMentions(parsed.content, parsed.mentions)).substring(0, 100)} (resources: ${resources.length})`);
 
   // Design §15.4: a run approved with --working-dir runs its node in that
   // directory only if it exists and — unless the initiator may operate this
@@ -39435,6 +39436,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     idleSpinStopped = true;
     if (idleSpinTimer) clearTimeout(idleSpinTimer);
     const shutdownDeadlineMs = Date.now() + DAEMON_SHUTDOWN_MAX_MS;
+    await traeLoginManager.shutdown();
     const mutationResult = await tryWithBotTurnMutation(
       cfg.larkAppId,
       BOT_TURN_MUTATION_SHUTDOWN_ACQUIRE_TIMEOUT_MS,
