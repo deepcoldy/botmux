@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import MarkdownIt from 'markdown-it';
 import { afterEach, describe, expect, it } from 'vitest';
 import { extractInteractiveCardReplyText } from '../src/im/lark/card-reply-text.js';
 import {
@@ -404,6 +405,169 @@ describe('extractInteractiveCardReplyText', () => {
     });
     expect(charBudgetText).toBeDefined();
     expect(afterCharsReads).toBe(0);
+  });
+
+  it('prevents plain_text fence markers (single-line and multi-line) from swallowing subsequent elements in GFM', () => {
+    const md = new MarkdownIt({ html: false, linkify: true, breaks: true });
+
+    const bareFence = extractInteractiveCardReplyText({
+      schema: '2.0',
+      body: {
+        elements: [
+          { tag: 'plain_text', content: '```' },
+          { tag: 'markdown', content: 'after' },
+        ],
+      },
+    })!;
+    expect(bareFence).toBe('\\`\\`\\`\nafter');
+    const bareHtml = md.render(bareFence);
+    expect(bareHtml).not.toContain('<pre>');
+    expect(bareHtml).toContain('```');
+    expect(bareHtml).toContain('after');
+
+    const multilineDiv = extractInteractiveCardReplyText({
+      schema: '2.0',
+      body: {
+        elements: [
+          { tag: 'div', text: { tag: 'plain_text', content: "header\n~~~html\nUse <font color='red'> literally<br>now" } },
+          { tag: 'markdown', content: "after <font color='green'>ok</font><br>next" },
+        ],
+      },
+    })!;
+    const divHtml = md.render(multilineDiv);
+    expect(divHtml).not.toContain('<pre>');
+    expect(divHtml).toContain('~~~html');
+    expect(divHtml).toContain("&lt;font color='red'&gt; literally&lt;br&gt;now");
+    expect(divHtml).toContain('after ok<br>\nnext');
+  });
+
+  it('preserves fence and table metadata from markdown children inside note elements', () => {
+    const md = new MarkdownIt({ html: false, linkify: true, breaks: true });
+
+    const noteUnclosedFence = extractInteractiveCardReplyText({
+      elements: [
+        { tag: 'note', elements: [{ tag: 'lark_md', content: '```\ninside' }] },
+        { tag: 'markdown', content: "after <font color='red'>ok</font><br>next" },
+      ],
+    })!;
+    expect(noteUnclosedFence).toBe('```\ninside\n```\nafter ok\nnext');
+    const fenceHtml = md.render(noteUnclosedFence);
+    expect(fenceHtml).toContain('<pre><code>inside\n</code></pre>');
+    expect(fenceHtml).toContain('<p>after ok<br>\nnext</p>');
+
+    const noteTable = extractInteractiveCardReplyText({
+      elements: [
+        { tag: 'markdown', content: '表格前段落' },
+        { tag: 'note', elements: [{ tag: 'lark_md', content: 'a | b\n--- | ---\n1<br>2 | 3' }] },
+        { tag: 'markdown', content: '表格后段落' },
+      ],
+    })!;
+    expect(noteTable).toBe([
+      '表格前段落',
+      '',
+      'a | b',
+      '--- | ---',
+      '1 / 2 | 3',
+      '',
+      '表格后段落',
+    ].join('\n'));
+    const tableHtml = md.render(noteTable);
+    expect(tableHtml).toContain('<table>');
+    expect(tableHtml).toContain('<td>1 / 2</td>');
+    expect(tableHtml).toContain('<p>表格后段落</p>');
+  });
+
+  it('protects CommonMark indented code blocks (4 spaces or tab) while keeping paragraph continuations normalized', () => {
+    const md = new MarkdownIt({ html: false, linkify: true, breaks: true });
+
+    const indented = extractInteractiveCardReplyText({
+      schema: '2.0',
+      body: {
+        elements: [
+          {
+            tag: 'markdown',
+            content: [
+              'paragraph',
+              '',
+              "    <font color='red'>literal</font><br>value",
+              '',
+              "    <text_tag>still code</text_tag>",
+              '',
+              "after <font color='green'>cleaned</font><br>line2",
+            ].join('\n'),
+          },
+        ],
+      },
+    })!;
+    expect(indented).toBe([
+      'paragraph',
+      '',
+      "    <font color='red'>literal</font><br>value",
+      '',
+      '    <text_tag>still code</text_tag>',
+      '',
+      'after cleaned',
+      'line2',
+    ].join('\n'));
+    const indentedHtml = md.render(indented);
+    expect(indentedHtml).toContain(
+      "<pre><code>&lt;font color='red'&gt;literal&lt;/font&gt;&lt;br&gt;value\n\n&lt;text_tag&gt;still code&lt;/text_tag&gt;\n</code></pre>",
+    );
+    expect(indentedHtml).toContain('<p>after cleaned<br>\nline2</p>');
+
+    // Tab-indented code block is protected; 4-space paragraph continuation without blank line is NOT code.
+    const tabAndContinuation = extractInteractiveCardReplyText({
+      schema: '2.0',
+      body: {
+        elements: [
+          {
+            tag: 'markdown',
+            content: [
+              'paragraph',
+              "    <font color='red'>not code</font><br>cont",
+              '',
+              "\t<font color='blue'>tab code</font><br>stay",
+            ].join('\n'),
+          },
+        ],
+      },
+    })!;
+    expect(tabAndContinuation).toBe([
+      'paragraph',
+      '    not code',
+      'cont',
+      '',
+      "\t<font color='blue'>tab code</font><br>stay",
+    ].join('\n'));
+    const tabHtml = md.render(tabAndContinuation);
+    expect(tabHtml).toContain('<p>paragraph<br>\nnot code<br>\ncont</p>');
+    expect(tabHtml).toContain("<pre><code>&lt;font color='blue'&gt;tab code&lt;/font&gt;&lt;br&gt;stay\n</code></pre>");
+  });
+
+  it('ignores backslash-escaped backticks as inline-code delimiters while still allowing backslashes inside real code spans', () => {
+    const md = new MarkdownIt({ html: false, linkify: true, breaks: true });
+
+    const escaped = extractInteractiveCardReplyText({
+      schema: '2.0',
+      body: {
+        elements: [
+          { tag: 'markdown', content: "\\`<font color='red'>x</font>\\`" },
+          { tag: 'markdown', content: "\\\\`<font color='red'>code</font>`" },
+          { tag: 'markdown', content: "`foo\\` <font color='green'>outside</font><br>next" },
+        ],
+      },
+    })!;
+    expect(escaped).toBe([
+      '\\`x\\`',
+      "\\\\`<font color='red'>code</font>`",
+      '`foo\\` outside',
+      'next',
+    ].join('\n'));
+    const html = md.render(escaped);
+    expect(html).toContain('`x`');
+    expect(html).not.toContain("&lt;font color='red'&gt;x");
+    expect(html).toContain("<code>&lt;font color='red'&gt;code&lt;/font&gt;</code>");
+    expect(html).toContain('<code>foo\\</code> outside<br>\nnext');
   });
 });
 
