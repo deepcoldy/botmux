@@ -123,6 +123,24 @@ describe('BackgroundTaskTracker peer progress', () => {
     expect(tracker.backgroundWait()).toBe(0);
   });
 
+  it('opens the main turn for a peer wake without advancing the human prompt boundary', () => {
+    const tracker = new BackgroundTaskTracker();
+    tracker.observe({ type: 'user', uuid: 'u1', message: { role: 'user', content: 'Inspect this request' } });
+    tracker.observe(assistantAgent('dispatch', 'tu-1'));
+    tracker.observe(launchAck('ack', 'tu-1', 'agent-1'));
+    tracker.observe(assistant('final', 'Main result', 'end_turn'));
+    tracker.observe({ type: 'system', subtype: 'turn_duration' });
+    expect(tracker.backgroundWait()).toBe(1);
+
+    tracker.observe(peerReport('peer-wake'));
+    expect(tracker.backgroundWait()).toBe(0);
+    expect(tracker.pendingTurnAgents()).toBe(1);
+
+    tracker.observe(assistant('peer-final', 'Handled the internal report', 'end_turn'));
+    expect(tracker.backgroundWait()).toBe(1);
+    expect(tracker.pendingTurnAgents()).toBe(1);
+  });
+
   it('still advances the prompt boundary for a real human input without deleting previous tasks', () => {
     const tracker = new BackgroundTaskTracker();
     tracker.observe(assistantAgent('dispatch', 'tu-1'));

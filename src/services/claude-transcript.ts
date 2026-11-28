@@ -1232,7 +1232,7 @@ export class BackgroundTaskTracker {
       this.mainTurnOpen = false;
       return;
     }
-    if (isClaudeMainTurnStart(ev)) this.mainTurnOpen = true;
+    if (isClaudeMainTurnStart(ev) || isPeerQueuedCommand(ev)) this.mainTurnOpen = true;
     else if (isClaudeTurnTerminalEvent(ev)) this.mainTurnOpen = false;
     else if (hasTranscriptRole(ev, 'assistant')) this.mainTurnOpen = true;
     if (isMeaningfulUserEvent(ev) || isMeaningfulQueuedCommand(ev)) {
@@ -1458,6 +1458,14 @@ export class ClaudeModelRequestClock {
       // Upkeep folded into a running turn does not take that turn over.
       this.upkeepTurn = upkeep && (!this.turnOpen || this.upkeepTurn);
       this.turnOpen = true;
+      return;
+    }
+    if (isPeerQueuedCommand(ev)) {
+      // Peer input can fold into an upkeep turn or wake the main thread after
+      // an idle edge. Either way its model work is real activity; only the
+      // human prompt sequence and Lark attribution stay unchanged.
+      this.turnOpen = true;
+      this.upkeepTurn = false;
       return;
     }
     if (isMidTurnAbsorbedQueuedCommand(ev)) {
@@ -1845,7 +1853,7 @@ export class AbsorbedReplyCollector {
     // the model's answer to it. Read only uuid records, as the bridge queue
     // does, or that copy passes for the next user prompt.
     if (!ev.uuid) return false;
-    if (isClaudeTurnDurationEvent(ev) || isMeaningfulUserEvent(ev) || isClaudeUserInterruptEvent(ev) || isMidTurnAbsorbedQueuedCommand(ev)) {
+    if (isClaudeTurnDurationEvent(ev) || isMeaningfulUserEvent(ev) || isClaudeUserInterruptEvent(ev) || isFoldedQueuedCommandBoundary(ev)) {
       return (this.complete = true);
     }
     if (!hasTranscriptRole(ev, 'assistant') || !ev.uuid) return false;
@@ -2262,21 +2270,41 @@ export function isMidTurnAbsorbedQueuedCommand(ev: TranscriptEvent | null | unde
   return isSubmittedQueuedCommand(ev) && isMidTurnAbsorbedRendering(ev);
 }
 
-function isSubmittedQueuedCommand(ev: TranscriptEvent | null | undefined): ev is TranscriptEvent {
+/** A queued-command payload after the shared safety filters, irrespective of
+ *  who submitted it. Provenance-specific consumers layer their own policy on
+ *  top instead of conflating turn admission with reply/activity boundaries. */
+function isQueuedCommandRecord(ev: TranscriptEvent | null | undefined): ev is TranscriptEvent {
   if (!ev || typeof ev !== 'object') return false;
   if (ev.type !== 'attachment') return false;
   if (ev.attachment?.type !== 'queued_command') return false;
   if (ev.attachment.commandMode === 'task-notification') return false;
-  // Peer reports use commandMode:'prompt' too, but must not end the current
-  // human turn or reset its background-agent prompt sequence. Inspect the
-  // structured origin rather than isMeta or text: real human submissions can
-  // also carry isMeta, or contain a literal <agent-message> example.
-  if (ev.attachment.origin?.kind === 'peer') return false;
   if ((ev as any).isSidechain === true) return false;
   const text = normaliseForFingerprint(extractTurnStartText(ev));
   if (text.length === 0) return false;
   if (SYNTHETIC_USER_PREFIXES.some(p => text.startsWith(p))) return false;
   return true;
+}
+
+/** Peer input is real main-thread model work, but not a human prompt boundary. */
+function isPeerQueuedCommand(ev: TranscriptEvent | null | undefined): boolean {
+  return isQueuedCommandRecord(ev) && ev.attachment?.origin?.kind === 'peer';
+}
+
+function isSubmittedQueuedCommand(ev: TranscriptEvent | null | undefined): ev is TranscriptEvent {
+  if (!isQueuedCommandRecord(ev)) return false;
+  // Peer reports use commandMode:'prompt' too, but must not end the current
+  // human turn or reset its background-agent prompt sequence. Inspect the
+  // structured origin rather than isMeta or text: real human submissions can
+  // also carry isMeta, or contain a literal <agent-message> example.
+  return ev.attachment?.origin?.kind !== 'peer';
+}
+
+/** Any folded queued command ends the preceding folded input's reply run.
+ *  This deliberately includes peer reports: their answers belong to that peer
+ *  input, not to an earlier human fold, but peer still must not become an
+ *  absorbed Lark turn via isMidTurnAbsorbedQueuedCommand. */
+function isFoldedQueuedCommandBoundary(ev: TranscriptEvent | null | undefined): boolean {
+  return isQueuedCommandRecord(ev) && isMidTurnAbsorbedRendering(ev);
 }
 
 function isMidTurnAbsorbedRendering(ev: TranscriptEvent): boolean {

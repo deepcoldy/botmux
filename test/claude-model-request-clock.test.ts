@@ -208,6 +208,30 @@ describe('ClaudeModelRequestClock', () => {
     expect(busy.lastActivityAt()).toBe(ms('13:00:50'));
   });
 
+  it.each([
+    ['plain', undefined],
+    ['reminder', 'system'],
+  ] as const)('peer %s input turns an upkeep turn into real activity', (_shape, renderedRole) => {
+    const clock = clockOf([
+      byPerson('10:50:00'), request('10:50:01'), served('10:50:30'), turnEnd('10:50:31'),
+      byPerson('11:00:00', KEEPALIVE), request('11:00:01'), midTurn('11:00:20'),
+    ]);
+    expect(clock.lastActivityAt()).toBe(ms('10:50:30'));
+    clock.observe({
+      type: 'attachment', uuid: `peer-${_shape}`, timestamp: at('11:00:30'),
+      ...(renderedRole !== undefined ? { renderedRole } : {}),
+      attachment: {
+        type: 'queued_command', commandMode: 'prompt',
+        prompt: '<agent-message from="worker">Partial result</agent-message>',
+        origin: { kind: 'peer', senderTaskId: 'agent-1' }, isMeta: true,
+      },
+    } as TranscriptEvent);
+    clock.observe(request('11:00:31'));
+    clock.observe(served('11:01:00'));
+    expect(clock.lastServedAt()).toBe(ms('11:00:31'));
+    expect(clock.lastActivityAt()).toBe(ms('11:01:00'));
+  });
+
   it('rebinding to another native session drops the old timestamps and accepts its older history', () => {
     const clock = new ClaudeModelRequestClock();
     expect(clock.bind('session-a')).toBe(true);

@@ -2467,6 +2467,26 @@ describe('absorbedInputReplyText', () => {
     expect(absorbedInputReplyText(events, 'qC')).toEqual({ text: 'CI is green.', lastUuid: 'aC', uuids: ['aC'], source: 'text' });
   });
 
+  it('stops a human fold at a later peer reminder instead of taking the peer answer', () => {
+    const reminder = (uuid: string, kind: 'human' | 'peer', prompt: string): TranscriptEvent => ({
+      type: 'attachment', uuid, renderedRole: 'system',
+      attachment: {
+        type: 'queued_command', prompt, commandMode: 'prompt',
+        origin: { kind }, isMeta: true,
+      },
+    } as TranscriptEvent);
+    const events = [
+      reminder('human-fold', 'human', 'is CI green?'),
+      reminder('peer-fold', 'peer', 'acknowledge the worker'),
+      text('peer-answer', 'Acknowledged'),
+      duration,
+    ];
+    expect(absorbedInputReplyText(events, 'human-fold')).toBeUndefined();
+    // The reply boundary must not turn the internal peer into an absorbed
+    // human turn; only the collector's attribution window changes.
+    expect(isMidTurnAbsorbedQueuedCommand(events[1])).toBe(false);
+  });
+
   it('reads past the request copy Claude Code writes before the answer', () => {
     // Shape of a live 2.1.323 transcript: two messages folded together, then
     // a uuid-less copy of the request's user content, then the answer.
@@ -2507,6 +2527,20 @@ describe('AbsorbedReplyCollector (live feed)', () => {
     expect(c.feed(ev('a3', { type: 'tool_use', id: 't2', name: 'Bash', input: {} }))).toBe(true);
     expect(c.feed(ev('a4', { type: 'text', text: 'later narration' }))).toBe(true);
     expect(c.reply()).toEqual({ text: 'it is gpt-6-astra', lastUuid: 'a2', uuids: ['a2'], source: 'thinking' });
+  });
+
+  it('stops at a peer reminder and ignores the peer answer in the previous fold', () => {
+    const c = new AbsorbedReplyCollector();
+    const peer = {
+      type: 'attachment', uuid: 'peer-fold', renderedRole: 'system',
+      attachment: {
+        type: 'queued_command', commandMode: 'prompt', prompt: 'acknowledge the worker',
+        origin: { kind: 'peer' }, isMeta: true,
+      },
+    } as TranscriptEvent;
+    expect(c.feed(peer)).toBe(true);
+    expect(c.feed(ev('peer-answer', { type: 'text', text: 'Acknowledged' }))).toBe(true);
+    expect(c.reply()).toBeUndefined();
   });
 });
 
