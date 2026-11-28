@@ -348,6 +348,16 @@ export function initPlugin(rawName: string, options: PluginInitOptions = {}): Pl
 export function resolveOfficialPluginPackageSpec(value: string): string {
   const trimmed = value.trim();
   if (!trimmed) return trimmed;
-  if (trimmed.startsWith('@') || trimmed.startsWith('.') || trimmed.startsWith('~') || isAbsolute(trimmed) || existsSync(resolve(trimmed))) return trimmed;
+  if (
+    trimmed.startsWith('github:')
+    || trimmed.startsWith('file:')
+    || trimmed.startsWith('@')
+    || trimmed.startsWith('.')
+    || trimmed.startsWith('~')
+    || isAbsolute(trimmed)
+    || existsSync(resolve(trimmed))
+  ) {
+    return trimmed;
+  }
   return isValidPluginId(trimmed) ? `${OFFICIAL_PLUGIN_PACKAGE_PREFIX}${trimmed}` : trimmed;
 }

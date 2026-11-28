@@ -148,17 +148,27 @@ export interface PluginPackageManifest {
   botmux: BotmuxPluginManifest;
 }
 
+export type InstalledPluginSource =
+  | {
+      type: 'npm' | 'local';
+      spec: string;
+      link?: boolean;
+    }
+  | {
+      type: 'github-release';
+      repo: string;
+      tag: string;
+      asset: string;
+      integrity: string;
+    };
+
 export interface InstalledPluginRecord {
   id: string;
   packageName: string;
   version: string;
   description?: string;
   integrity?: string;
-  source: {
-    type: 'npm' | 'local';
-    spec: string;
-    link?: boolean;
-  };
+  source: InstalledPluginSource;
   manifest: BotmuxPluginManifest;
   contributions?: PluginContributions;
   installedAt: string;

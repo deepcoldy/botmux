@@ -3,6 +3,18 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { botmuxHome, pluginRegistryPath } from './paths.js';
+const githubReleaseGuardSourceSchema = z.object({
+  type: z.literal('github-release'),
+  repo: z.string().regex(/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/[A-Za-z0-9._-]{1,100}$/)
+    .refine(value => {
+      const repo = value.split('/')[1];
+      return repo !== '.' && repo !== '..';
+    }),
+  tag: z.string().min(1).max(200).regex(/^[A-Za-z0-9@._/+~-]+$/)
+    .refine(value => !value.includes('..') && !value.includes('//') && !value.startsWith('/') && !value.endsWith('/')),
+  asset: z.string().min(1).max(255)
+    .refine(value => !value.includes('/') && !value.includes('\\') && value !== '.' && value !== '..' && value.endsWith('.tgz')),
+});
 const schema = z.object({
   id: z.string().regex(/^[a-z][a-z0-9._-]{0,63}$/),
   packageName: z.string().min(1),
@@ -11,6 +23,7 @@ const schema = z.object({
   expectedRevision: z.string().regex(/^[a-f0-9]{64}$/).optional(),
   integrity: z.string().optional(),
   authorityDigest: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  source: githubReleaseGuardSourceSchema.optional(),
 });
 export type PluginMutationGuard = z.infer<typeof schema>;
 export function parsePluginMutationGuard(raw: string | undefined): PluginMutationGuard | undefined {

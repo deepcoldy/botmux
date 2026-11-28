@@ -149,5 +149,118 @@ describe('native plugin market', () => {
     expect(() => verifyPluginArchive(bytes, { ...manifest, name: '@other/name' }, plan)).toThrow();
     expect(() => verifyPluginArchive(bytes, { ...manifest, version: '2.0.0' }, plan)).toThrow();
     expect(() => verifyPluginArchive(bytes, { ...manifest, botmux: { ...manifest.botmux, id: 'other' } }, plan)).toThrow();
+    const expectedSha256 = createHash('sha256').update(bytes).digest('hex');
+    expect(() => verifyPluginArchive(bytes, manifest, { ...plan, expectedSha256 })).not.toThrow();
+    expect(() => verifyPluginArchive(bytes, manifest, { ...plan, expectedSha256: '0'.repeat(64) })).toThrow();
+  });
+
+  it('supports official flag and npm / github-release distribution in schemaVersion 1 catalog while rejecting malformed distributions', () => {
+    const ghEntry = {
+      id: 'github',
+      package: '@botmux-ai/plugin-github',
+      displayName: 'GitHub',
+      description: 'Official GitHub integration',
+      repo: 'https://github.com/botmux-ai/botmux-plugin-github',
+      categories: ['vcs'],
+      compatibility: { botmux: '>=3.56.0' },
+      official: true,
+      distribution: {
+        type: 'github-release' as const,
+        repo: 'botmux-ai/botmux-plugin-github',
+        assetPattern: 'botmux-plugin-github-*.tgz',
+      },
+    };
+    const npmEntry = { ...entry, distribution: { type: 'npm' as const } };
+    expect(normalizePluginMarket({ schemaVersion: 1, plugins: [entry, npmEntry.id === entry.id ? { ...npmEntry, id: 'sample-npm' } : npmEntry, ghEntry] }))
+      .toHaveLength(3);
+
+    for (const badDistribution of [
+      { type: 'http', url: 'https://example.com/a.tgz' },
+      { type: 'github-release', repo: '../evil/repo' },
+      { type: 'github-release', repo: 'https://github.com/a/b' },
+      { type: 'github-release', repo: 'botmux-ai/botmux-plugin-github', assetPattern: '../escape.tgz' },
+    ]) {
+      expect(() => normalizePluginMarket({
+        schemaVersion: 1,
+        plugins: [{ ...ghEntry, distribution: badDistribution }],
+      })).toThrow();
+    }
+  });
+
+  it('locks github-release downloadUrl, tag, asset and sha512 in PendingPlan and installs via locked plan without re-resolving', async () => {
+    const ghEntry = {
+      id: 'github',
+      package: '@botmux-ai/plugin-github',
+      displayName: 'GitHub',
+      description: 'Official GitHub integration',
+      repo: 'https://github.com/botmux-ai/botmux-plugin-github',
+      categories: ['vcs'],
+      compatibility: { botmux: '>=3.56.0' },
+      official: true,
+      distribution: {
+        type: 'github-release' as const,
+        repo: 'botmux-ai/botmux-plugin-github',
+        assetPattern: 'botmux-plugin-github-*.tgz',
+      },
+    };
+    const downloadUrl = 'https://github.com/botmux-ai/botmux-plugin-github/releases/download/v0.1.0/botmux-plugin-github-0.1.0.tgz';
+    const resolveGithubRelease = vi.fn(async () => ({
+      version: '0.1.0',
+      integrity,
+      downloadUrl,
+      releaseTag: 'v0.1.0',
+      releaseRepo: 'botmux-ai/botmux-plugin-github',
+      releaseAsset: 'botmux-plugin-github-0.1.0.tgz',
+    }));
+    const f = fixture({
+      fetchCatalog: vi.fn(async () => ({ schemaVersion: 1, plugins: [entry, ghEntry] })),
+      resolveGithubRelease,
+    });
+
+    // npm entry still uses npm metadata and stamps sourceType: 'npm'.
+    const npmPlan = await f.market.prepare('sample', 'owner-A');
+    expect(npmPlan.sourceType).toBe('npm');
+    expect(f.deps.metadata).toHaveBeenCalledWith(entry.package);
+
+    // github-release entry uses resolveGithubRelease and locks exact downloadUrl + tag + integrity.
+    const ghPlan = await f.market.prepare('github', 'owner-A');
+    expect(resolveGithubRelease).toHaveBeenCalledTimes(1);
+    expect(resolveGithubRelease).toHaveBeenCalledWith({
+      repo: 'botmux-ai/botmux-plugin-github',
+      assetPattern: 'botmux-plugin-github-*.tgz',
+    });
+    expect(ghPlan).toMatchObject({
+      id: 'github',
+      packageName: '@botmux-ai/plugin-github',
+      version: '0.1.0',
+      integrity,
+      sourceType: 'github-release',
+      downloadUrl,
+      releaseRepo: 'botmux-ai/botmux-plugin-github',
+      releaseTag: 'v0.1.0',
+      releaseAsset: 'botmux-plugin-github-0.1.0.tgz',
+    });
+    expect(ghPlan).not.toHaveProperty('principal');
+
+    // Confirming installs strictly from the locked plan without calling resolveGithubRelease again.
+    expect(await f.market.install(ghPlan.nonce, true, 'owner-A')).toEqual({ id: 'github', version: '0.1.0' });
+    expect(resolveGithubRelease).toHaveBeenCalledTimes(1);
+    expect(f.deps.install).toHaveBeenCalledWith(expect.objectContaining({
+      sourceType: 'github-release',
+      downloadUrl,
+      releaseTag: 'v0.1.0',
+      integrity,
+    }));
+
+    // Disallowed downloadUrl returned by resolver must fail closed during prepare().
+    resolveGithubRelease.mockResolvedValueOnce({
+      version: '0.1.1',
+      integrity,
+      downloadUrl: 'https://evil.example.com/botmux-plugin-github-0.1.1.tgz',
+      releaseTag: 'v0.1.1',
+      releaseRepo: 'botmux-ai/botmux-plugin-github',
+      releaseAsset: 'botmux-plugin-github-0.1.1.tgz',
+    });
+    await expect(f.market.prepare('github', 'owner-A')).rejects.toMatchObject({ status: 502 });
   });
 });

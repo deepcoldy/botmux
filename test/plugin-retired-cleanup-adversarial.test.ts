@@ -6,7 +6,9 @@ import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { installLocalPlugin, installNpmPlugin } from '../src/core/plugins/install.js';
+import { installGithubReleaseArchive, installLocalPlugin, installNpmPlugin } from '../src/core/plugins/install.js';
+import { computeSha512Integrity } from '../src/core/plugins/github-release.js';
+import { buildPluginTgz } from './helpers/plugin-tar-fixture.js';
 import * as paths from '../src/core/plugins/paths.js';
 import * as registry from '../src/services/plugin-registry-store.js';
 import { pluginRegistryRevision, type PluginMutationGuard } from '../src/core/plugins/mutation-guard.js';
@@ -467,6 +469,59 @@ describe('retired cleanup: independent adversarial verification', () => {
       registered: registry.getInstalledPlugin('sample') !== undefined,
       runtimePresent: fs.existsSync(paths.pluginRuntimeDir('sample')),
     }, 'the npm path must not commit after cleanup outlives the confirmation').toEqual({
+      error: 'plugin_authority_revoked', registered: false, runtimePresent: false,
+    });
+  });
+
+  it('LONG-CLEANUP-REVOCATION-GITHUB: the github-release path rechecks authority after slow cleanup too', () => {
+    const recovery = retired();
+    registry.writePluginRegistry({ schemaVersion: 1, plugins: {} });
+    fs.writeFileSync(tokenFile(), 'original');
+    const tgz = buildPluginTgz(
+      {
+        name: '@adversarial/sample',
+        version: '1.0.0',
+        keywords: ['botmux-plugin'],
+        botmux: { schemaVersion: 1, id: 'sample' },
+      },
+      { marker: 'github-release' },
+    );
+    const tgzPath = join(home, 'sample-1.0.0.tgz');
+    fs.writeFileSync(tgzPath, tgz);
+    const integrity = computeSha512Integrity(tgz);
+    const confirmed: PluginMutationGuard = {
+      ...guard('original'),
+      integrity,
+      source: { type: 'github-release', repo: 'botmux-ai/sample', tag: 'v1.0.0', asset: 'sample-1.0.0.tgz' },
+    };
+    const realRm = fs.rmSync;
+    let rotated = false;
+    vi.spyOn(fs, 'rmSync').mockImplementation((path, options) => {
+      if (String(path) === recovery && !rotated) {
+        fs.writeFileSync(tokenFile(), 'rotated-during-slow-cleanup');
+        rotated = true;
+      }
+      return realRm(path, options);
+    });
+    let error: unknown;
+    try {
+      installGithubReleaseArchive(tgzPath, {
+        repo: 'botmux-ai/sample',
+        tag: 'v1.0.0',
+        asset: 'sample-1.0.0.tgz',
+        integrity,
+        expectedVersion: '1.0.0',
+        guard: confirmed,
+      });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(rotated).toBe(true);
+    expect({
+      error: error instanceof Error ? error.message : error,
+      registered: registry.getInstalledPlugin('sample') !== undefined,
+      runtimePresent: fs.existsSync(paths.pluginRuntimeDir('sample')),
+    }, 'the github-release path must not commit after cleanup outlives the confirmation').toEqual({
       error: 'plugin_authority_revoked', registered: false, runtimePresent: false,
     });
   });
