@@ -68,7 +68,6 @@ Bot 使用同一种版本化对象，例如：
 
 命令策略摘要由已有 GET `/api/bots/:app/trigger-user-auth-status` 从实际冻结的宿主 reader 投影，返回版本、全局规则及修订、Bot 规则与最终效果/身份。该摘要不查询个人授权、不开始登录、不返回凭据或原始宿主路径；带 `openId` 的既有个人授权状态查询保留原合同。界面用同一审核 resolver 合成当前 Bot 编辑。宿主无兼容版本化状态时显示不可用并禁止保存命令规则，须更新宿主后刷新；全局配置无效时显示明确错误并拒绝严格调用，仍可关闭模式。点击“刷新宿主规则”获取热更新后的展示状态。
 
-![规范 ID 与 RPC 匹配条件、机器写入例外和宿主 actor 限制；真实 Chromium 与假数据](assets/bytedcli-read-write-identity/mix-skill-machine-preset.png)
 
 读取改为执行人身份后，仍按读取额度与结果语义处理，不写业务 intent，不产生写入未知结果；但必须有当前已核验真人的个人授权、正式账号匹配及相应委托/定时任务权限。授权缺失或账号不匹配时拒绝，不退回共享账号。auth/help 不属于业务规则，保留专用个人控制边界；help 同样显示当前有效业务策略，不触发个人授权查询。
 
@@ -136,4 +135,4 @@ HTTP 响应超时与资源清理分别计时。首个执行器授权复查开始
 
 新增精确业务签名、未知命令 actor 隔离、历史目录迁移与 DB 二进制前提见 [业务目录合同](bytedcli-business-command-catalog.md)。
 
-受管最终 API、场景完整预设与源码安装边界见 [受管 Skill 合同](bytedcli-managed-skill-api.md)。
+受管最终 API 与源码安装边界见 [受管 Skill 合同](bytedcli-managed-skill-api.md)；外部业务模板配置见 [插件 ByteCLI 权限预设](plugin-bytedcli-operation-presets.md)。

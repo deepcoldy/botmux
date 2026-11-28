@@ -78,4 +78,4 @@ Auth/help 在宿主独立 adapter 上执行。输出需要先由宿主去除活�
 
 扩展目录必须重新审核 release 的实际 handler/service/API 链和参数组合，并验证独立宿主执行边界。
 
-受管最终 API、场景完整预设与源码安装边界见 [受管 Skill 合同](bytedcli-managed-skill-api.md)。
+受管最终 API 与源码安装边界见 [受管 Skill 合同](bytedcli-managed-skill-api.md)；外部业务模板配置见 [插件 ByteCLI 权限预设](plugin-bytedcli-operation-presets.md)。
