@@ -165,6 +165,11 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
   { id: 'codex-auth', tab: 'security', titleKey: 'botDefaults.sectionCodexAuth', fieldKeys: ['botDefaults.codexAuthSyncLabel'] },
   { id: 'sandbox-paths', tab: 'security', titleKey: 'botDefaults.sectionSandboxPaths' },
   { id: 'trigger-user-auth', tab: 'security', titleKey: 'botDefaults.sectionTriggerUserAuth', fieldKeys: [
+    'botDefaults.cliIdentityMode',
+    'botDefaults.cliIdentityMode.machine',
+    'botDefaults.cliIdentityMode.actor',
+    'botDefaults.cliIdentityMode.mixed',
+    // Keep legacy field links pointing at this section.
     'botDefaults.triggerUserAuthToggle',
     'botDefaults.bytecloudExecution',
     'botDefaults.bytedcliPolicyTitle',

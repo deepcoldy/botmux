@@ -5,7 +5,8 @@ import { existsSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSyn
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { TriggerUserAuthSection } from '../src/dashboard/web/bot-defaults-page.js';
-import { parseTriggerUserAuthConfig } from '../src/services/trigger-user-auth.js';
+import { botDefaultsPayload } from '../src/dashboard/bot-payload.js';
+import { capabilitiesOf, larkUserNative, parseTriggerUserAuthConfig } from '../src/services/trigger-user-auth.js';
 import { BYTEDCLI_AUDITED_RELEASE, BYTEDCLI_OPERATION_CATALOG_VERSION, BYTEDCLI_OPERATION_CATALOG } from '../src/core/bytedcli-operation-catalog.js';
 import { BYTEDCLI_OPERATION_POLICY_SCHEMA, parseBytedcliOperationPolicy, projectBytedcliOperationPolicyStatus } from '../src/core/bytedcli-operation-policy-config.js';
 import { BytedcliBroker } from '../src/core/bytedcli-broker.js';
@@ -27,24 +28,28 @@ function summary(bot=full, rules:Record<string,string>={'codebase.mr.list':'acto
   return projectBytedcliOperationPolicyStatus({ revision:'fake-revision', policy:global }, bot.bytedcliOperationPolicy, bot.enabled);
 }
 afterEach(()=>{vi.unstubAllGlobals();});
-async function panel(initial:any, status:any, presets:any={presets:[],issues:[]}, failure=false) {
-  const requests:any[]=[];
+async function panel(initial:any, status:any, presets:any={presets:[],issues:[]}, failure=false, commitGate?:Promise<void>) {
+  let server=initial;
+  const requests:any[]=[], reads:string[]=[];
   vi.stubGlobal('fetch',async(_url:any,init:any)=>{
     if(init?.method==='PUT'){
       const body=JSON.parse(init.body),raw=body.triggerUserAuth;requests.push(raw??body);
       if(raw)parseTriggerUserAuthConfig(raw);
+      if(raw && failure)return {ok:false,json:async()=>({ok:false,error:"save_failed"})};
+      if(raw){await commitGate;server=raw;}
       if(body.bytedcliOperationPreset){
         if(failure)return {ok:false,json:async()=>({ok:false,error:'bytedcli_operation_preset_changed'})};
         const selected=presets.presets.find((row:any)=>row.pluginId===body.bytedcliOperationPreset.pluginId&&row.id===body.bytedcliOperationPreset.presetId);
         return {ok:true,json:async()=>({ok:true,triggerUserAuth:{...initial,bytedcliOperationPolicy:selected.policy}})};
       }
     }
-    return {ok:true,json:async()=>({ok:true,bytedcliOperationPolicy:status,bytedcliOperationPresets:presets})};
+    if(init?.method!=='PUT')reads.push(String(_url));
+    return {ok:true,json:async()=>({ok:true,bytedcliOperationPolicy:typeof status==='function'?status(server):status,bytedcliOperationPresets:presets})};
   });
   function Harness(){const [bot,setBot]=React.useState<any>({larkAppId:'cli_dashboard_policy',triggerUserAuth:initial});return React.createElement(TriggerUserAuthSection,{bot,patchBot:(_id,patch)=>setBot((old:any)=>({...old,...patch}))});}
   let renderer!:TestRenderer.ReactTestRenderer;await act(async()=>{renderer=TestRenderer.create(React.createElement(Harness));});
   const control=(action:string)=>renderer.root.findByProps({'data-action':action});
-  return {requests,renderer,control,close:async()=>{await act(async()=>renderer.unmount());}};
+  return {requests,reads,renderer,control,close:async()=>{await act(async()=>renderer.unmount());}};
 }
 it('command controls expose true effect and the global floor; writes expose explicit machine exceptions',async()=>{
  const p=await panel(full,summary());try{
@@ -94,22 +99,95 @@ it('identity tabs filter explicit Bot rules and filtered edits preserve hidden r
   expect(visible()).toHaveLength(total);expect(visible()).toContain('codebase.mr.close');expect(visible()).toContain('codebase.repo.list');
  }finally{await p.close();}
 });
-it('dormant command rules remain editable and disabling preserves every hidden option',async()=>{
- const p=await panel({...full,enabled:false},summary({...full,enabled:false}));try{
-  await act(async()=>p.control('bytedcli-policy-codebase.mr.list').props.onChange({currentTarget:{value:'deny'}}));
-  expect(p.requests.at(-1)).toMatchObject({...full,enabled:false,bytedcliOperationPolicy:config({'codebase.mr.list':'deny','codebase.mr.close':'deny'})});
-  await act(async()=>p.control('toggle-trigger-user-auth').props.onChange({currentTarget:{checked:true}}));
-  await act(async()=>p.control('toggle-trigger-user-auth').props.onChange({currentTarget:{checked:false}}));
-  expect(p.requests.at(-1)).toMatchObject({enabled:false,dispatchOnly:full.dispatchOnly,allowOwnerActor:true,bytedcliOperationPolicy:config({'codebase.mr.list':'deny','codebase.mr.close':'deny'})});
+it.each([
+ {label:'missing policy',initial:undefined,mode:'machine'},
+ {label:'disabled policy with saved mixed rules',initial:{...full,enabled:false},mode:'machine'},
+ {label:'missing enabled with mixed rules',initial:{...full,enabled:undefined},mode:'machine'},
+ {label:'legacy sender policy',initial:{enabled:true,tools:['bytedcli']},mode:'actor'},
+ {label:'explicit sender policy with saved rules',initial:{...full,bytecloudExecution:'trigger-user'},mode:'actor'},
+ {label:'mixed enum without ByteCloud',initial:{...full,capabilities:['lark-user']},mode:'actor'},
+])('renders the effective $mode mode without saving or exposing dormant rules ($label)',async({initial,mode})=>{
+ const p=await panel(initial,summary());try{
+  expect(p.control(`cli-identity-mode-${mode}`).props['aria-checked']).toBe(true);
+  expect(p.renderer.root.findAllByProps({'data-action':'bytedcli-policy-table'})).toHaveLength(0);
+  expect(p.renderer.root.findAllByProps({'data-action':'bytedcli-policy-plugin-preset'})).toHaveLength(0);
+  expect(p.requests).toEqual([]);if(mode==='machine')expect(p.reads).toEqual([]);
+  if(initial?.tools && !initial?.capabilities)expect(p.renderer.root.findAllByProps({'data-action':'trigger-user-auth-lark-user-native-note'})).toHaveLength(0);
  }finally{await p.close();}
 });
-it('unselected ByteCloud keeps command preview inactive and selecting it loads the host floor',async()=>{
- const p=await panel({...full,capabilities:['lark-user']},summary());try{
-  expect(p.control('bytedcli-policy-state').props['data-state']).toBe('inactive');
-  expect(p.control('bytedcli-policy-codebase.mr.list').props.disabled).toBe(true);
-  await act(async()=>p.control('trigger-user-auth-capability-bytecloud').props.onChange({currentTarget:{checked:true}}));
+it('switching between three modes preserves command rules and hidden identity settings',async()=>{
+ const p=await panel(full,summary());try{
+  expect(p.control('cli-identity-mode-mixed').props['aria-checked']).toBe(true);
+  await act(async()=>p.control('cli-identity-mode-machine').props.onClick());
+  expect(p.requests.at(-1)).toEqual({...full,enabled:false});
+  expect(p.renderer.root.findAllByProps({'data-action':'bytedcli-policy-table'})).toHaveLength(0);
+  await act(async()=>p.control('cli-identity-mode-actor').props.onClick());
+  expect(p.requests.at(-1)).toMatchObject({...full,bytecloudExecution:'trigger-user'});
+  expect(p.renderer.root.findAllByProps({'data-action':'bytedcli-policy-table'})).toHaveLength(0);
+  await act(async()=>p.control('cli-identity-mode-mixed').props.onClick());
+  expect(p.requests.at(-1)).toMatchObject(full);
   expect(p.control('bytedcli-policy-state').props['data-state']).toBe('ready');
+  expect(p.control('bytedcli-policy-codebase.mr.list').props.value).toBe('machine');
+ }finally{await p.close();}
+});
+it('choosing mixed mode adds required ByteCloud without changing other capabilities',async()=>{
+ const p=await panel({...full,capabilities:['lark-user']},summary());try{
+  await act(async()=>p.control('cli-identity-mode-mixed').props.onClick());
+  expect(p.requests.at(-1)).toMatchObject({...full,capabilities:['lark-user','bytecloud']});
+  expect(p.control('bytedcli-policy-state').props['data-state']).toBe('ready');
+  expect(p.control('trigger-user-auth-capability-bytecloud').props.disabled).toBe(true);
+  await act(async()=>p.control('trigger-user-auth-capability-bytecloud').props.onChange({currentTarget:{checked:false}}));
+  expect(p.requests).toHaveLength(1);
+ }finally{await p.close();}
+});
+it('editing sender capabilities cannot silently reactivate an old mixed enum',async()=>{
+ const p=await panel({...full,capabilities:['lark-user']},summary());try{
+  await act(async()=>p.control('trigger-user-auth-capability-bytecloud').props.onChange({currentTarget:{checked:true}}));
+  expect(p.requests.at(-1)).toMatchObject({enabled:true,bytecloudExecution:'trigger-user',capabilities:['lark-user','bytecloud'],bytedcliOperationPolicy:full.bytedcliOperationPolicy});
+  expect(p.control('cli-identity-mode-actor').props['aria-checked']).toBe(true);
+  expect(p.renderer.root.findAllByProps({'data-action':'bytedcli-policy-table'})).toHaveLength(0);
+ }finally{await p.close();}
+});
+it.each([
+ {tools:['lark-cli'],capabilities:['lark-user'],mixedCapabilities:['lark-user','bytecloud'],mixedNative:false},
+ {tools:['bytedcli'],capabilities:['bytecloud','meego'],mixedCapabilities:['bytecloud','meego'],mixedNative:false},
+ {tools:[],capabilities:[],mixedCapabilities:['bytecloud'],mixedNative:true},
+])('legacy tools $tools keep scope and Lark behavior until ByteCloud is explicitly added',async({tools,capabilities,mixedCapabilities,mixedNative})=>{
+ const initial=botDefaultsPayload({larkAppId:'cli_dashboard_policy'} as any,{triggerUserAuth:{...full,capabilities:undefined,tools,bytecloudExecution:'trigger-user'}} as any).triggerUserAuth;
+ const p=await panel(initial,summary());try{
+  for(const cap of ['lark-user','bytecloud','meego'])expect(p.control(`trigger-user-auth-capability-${cap}`).props.checked).toBe(capabilities.includes(cap));
+  await act(async()=>p.control('trigger-user-auth-source-default').props.onChange({currentTarget:{value:'platform'}}));
+  expect([...capabilitiesOf(parseTriggerUserAuthConfig(p.requests.at(-1)))]).toEqual(capabilities);
+  expect(larkUserNative(parseTriggerUserAuthConfig(p.requests.at(-1)))).toBe(false);
+  await act(async()=>p.control('cli-identity-mode-machine').props.onClick());
+  await act(async()=>p.control('cli-identity-mode-actor').props.onClick());
+  expect([...capabilitiesOf(parseTriggerUserAuthConfig(p.requests.at(-1)))]).toEqual(capabilities);
+  expect(larkUserNative(parseTriggerUserAuthConfig(p.requests.at(-1)))).toBe(false);
+  expect(p.requests.at(-1).bytedcliOperationPolicy).toEqual(full.bytedcliOperationPolicy);
+  await act(async()=>p.control('cli-identity-mode-mixed').props.onClick());
+  expect([...capabilitiesOf(parseTriggerUserAuthConfig(p.requests.at(-1)))]).toEqual(mixedCapabilities);
+  expect(larkUserNative(parseTriggerUserAuthConfig(p.requests.at(-1)))).toBe(mixedNative);
+ }finally{await p.close();}
+});
+it('mixed mode refreshes host rules after the policy save has committed',async()=>{
+ let commit!:()=>void;const gate=new Promise<void>(resolve=>{commit=resolve;});
+ const p=await panel({...full,bytecloudExecution:'trigger-user'},(saved:any)=>saved.bytecloudExecution==='read-machine-write-actor'?summary(saved):undefined,undefined,false,gate);
+ try{
+  await act(async()=>p.control('cli-identity-mode-mixed').props.onClick());
+  expect(p.control('cli-identity-mode-mixed').props['aria-checked']).toBe(true);
+  expect(p.control('bytedcli-policy-codebase.mr.list').props.disabled).toBe(true);
+  await act(async()=>commit());
+  expect(p.control('bytedcli-policy-state').props['data-state']).toBe('ready');
+  expect(p.control('bytedcli-policy-codebase.mr.list').props.disabled).toBe(false);
   expect(p.control('bytedcli-effective-codebase.mr.list').props['data-identity']).toBe('actor');
+ }finally{commit();await p.close();}
+});
+it('failed mode changes roll back to machine with all saved rules hidden',async()=>{
+ const p=await panel({...full,enabled:false},summary(),undefined,true);try{
+  await act(async()=>p.control('cli-identity-mode-mixed').props.onClick());
+  expect(p.control('cli-identity-mode-machine').props['aria-checked']).toBe(true);
+  expect(p.renderer.root.findAllByProps({'data-action':'bytedcli-policy-table'})).toHaveLength(0);
+  expect(p.requests.at(-1)).toMatchObject(full);
  }finally{await p.close();}
 });
 it.each([{label:'old daemon',status:undefined},{label:'v1 daemon',status:{...summary(),schema:'botmux.bytedcli-operation-policy-status.v1'}},{label:'unknown catalog',status:{...summary(),catalogVersion:'old'}},{label:'invalid global',status:{...summary(),global:{state:'invalid',revision:'invalid',errorCode:'operation_policy_invalid'}}}])('unavailable or invalid host state blocks rule saves but permits emergency disable ($label)',async ({status})=>{
@@ -117,8 +195,9 @@ it.each([{label:'old daemon',status:undefined},{label:'v1 daemon',status:{...sum
   const select=p.control('bytedcli-policy-codebase.mr.list');expect(select.props.disabled).toBe(true);
   await act(async()=>select.props.onChange({currentTarget:{value:'deny'}}));expect(p.requests).toEqual([]);
   await act(async()=>p.control('bytedcli-policy-clear').props.onClick());expect(p.requests).toEqual([]);
-  await act(async()=>p.control('toggle-trigger-user-auth').props.onChange({currentTarget:{checked:false}}));expect(p.requests.at(-1).enabled).toBe(false);
-  expect(p.control('bytedcli-policy-state').props['data-state']).toBe(status?.global?.state==='invalid'?'invalid':'unavailable');
+  await act(async()=>p.control('cli-identity-mode-machine').props.onClick());expect(p.requests.at(-1).enabled).toBe(false);
+  expect(p.control('cli-identity-mode-machine').props['aria-checked']).toBe(true);
+  expect(p.renderer.root.findAllByProps({'data-action':'bytedcli-policy-table'})).toHaveLength(0);
  }finally{await p.close();}
 });
 let ipc:IpcServerHandle, root:string, botsFile:string, policyFile:string;

@@ -19,7 +19,7 @@ const full = { enabled:true, capabilities:['bytecloud','lark-user','meego'], byt
  credentialSource:{default:'auto','lark-user':'platform',bytecloud:'local'}, delegateOnMention:false, allowSpeakerSwitch:true,
  allowOwnerActor:true, dispatchOnly:{tools:['bytedcli'],targetAppIds:['cli_target'],chatIds:['oc_target']},
  gitHost:'code.example.test',gitTokenExchangeUrl:'https://code.example.test/exchange',gitCommitIdentity:true };
-it('UI edits preserve hidden identity options, and enabling depends on ByteCloud selection',async()=>{
+it('UI source edits and machine fallback preserve hidden identity options',async()=>{
  const requests:any[]=[];
  vi.stubGlobal('fetch',async(_url:any,init:any)=>{if(init?.method==='PUT')requests.push(JSON.parse(init.body).triggerUserAuth);return {ok:true,json:async()=>({ok:true})};});
  function Harness(){const [bot,setBot]=React.useState<any>({larkAppId:'cli_mode',triggerUserAuth:full});return React.createElement(TriggerUserAuthSection,{bot,patchBot:(_id,patch)=>setBot((old:any)=>({...old,...patch}))});}
@@ -29,12 +29,9 @@ it('UI edits preserve hidden identity options, and enabling depends on ByteCloud
  const control=(name:string)=>renderer.root.findByProps({'data-action':name});
  await act(async()=>control('trigger-user-auth-source-default').props.onChange({currentTarget:{value:'local'}}));
  expect(requests.at(-1)).toMatchObject({...full,credentialSource:{...full.credentialSource,default:'local'}});
- expect(control('trigger-user-auth-bytecloud-execution').props.value).toBe('read-machine-write-actor');
- expect(control('trigger-user-auth-bytecloud-state').props['data-active']).toBe(true);
- await act(async()=>control('trigger-user-auth-capability-bytecloud').props.onChange({currentTarget:{checked:false}}));
- expect(control('trigger-user-auth-bytecloud-state').props['data-active']).toBe(false);
- expect(requests.at(-1).bytecloudExecution).toBe(full.bytecloudExecution);
- await act(async()=>control('toggle-trigger-user-auth').props.onChange({currentTarget:{checked:false}}));
+ expect(control('cli-identity-mode-mixed').props['aria-checked']).toBe(true);
+ expect(control('trigger-user-auth-capability-bytecloud').props.disabled).toBe(true);
+ await act(async()=>control('cli-identity-mode-machine').props.onClick());
  expect(requests.at(-1)).toMatchObject({enabled:false,bytecloudExecution:full.bytecloudExecution,dispatchOnly:full.dispatchOnly});
  }finally{await act(async()=>renderer.unmount());}
 });

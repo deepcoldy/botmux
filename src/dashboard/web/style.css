@@ -23329,6 +23329,16 @@ dialog select[multiple]:hover:not(:disabled) {
   gap: 8px;
 }
 
+.bot-defaults-page .bd-cli-identity-modes {
+  --bd-wide-cols: 3;
+}
+
+/* Keep the radio focused while saving, with interaction guarded in the handler. */
+.bot-defaults-page .bd-cli-identity-modes .bd-mode-opt[aria-disabled="true"] {
+  opacity: .55;
+  cursor: progress;
+}
+
 @container bd-mode-opts (max-width: 620px) {
   .bot-defaults-page .bd-mode-opt-grid {
     grid-template-columns: repeat(var(--bd-narrow-cols), minmax(0, 1fr));

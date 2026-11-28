@@ -4,13 +4,25 @@
 
 ## 配置与启用
 
-在 Dashboard → Bot 配置 → 权限与安全 → 按触发人身份调用 CLI 中，开启总开关、勾选 ByteCloud，再选择“默认机器读取、触发者写入，允许显式例外”。等价的 Bot 配置为：
+在 Dashboard → Bot 配置 → 权限与安全 → **CLI 执行身份** 中，三个模式并列展示：
+
+| 模式 | 行为 | 配置映射 |
+| --- | --- | --- |
+| 机器身份 | 沿用本机登录态和现有应用绑定 | `triggerUserAuth` 缺失，或 `enabled` 不为 `true` |
+| 触发者身份 | 勾选的能力使用触发者本人授权；未勾选的能力沿用原身份 | `enabled:true`，且未启用 ByteCloud 混合模式 |
+| 混合模式 | bytedcli 按命令规则选择身份；其他勾选能力仍使用触发者 | `enabled:true` + ByteCloud + `bytecloudExecution:"read-machine-write-actor"` |
+
+选择混合模式会自动勾选必需的 ByteCloud，保留其他能力范围。只有该模式显示命令列表、身份过滤 Tab 和外部插件预设；预设需要手动应用。选择触发者身份会写入 `bytecloudExecution:"trigger-user"`；选择机器身份只关闭 `enabled`。切回其他模式保留已存命令规则，规则不生效。
+
+旧配置无需迁移：缺省或关闭的配置仍用机器身份；已启用、执行枚举缺省或为 `trigger-user` 的配置仍按原触发者模式运行。存有混合枚举但未启用 ByteCloud 的配置也保持原行为，不会因打开页面自动开启混合模式。在触发者模式编辑能力也不会意外开启混合模式。旧 `tools` 单工具或空范围继续按原范围处理。同范围切换模式或修改来源保留旧飞书身份行为；若明确选择混合模式而原范围没有 ByteCloud，将显式加入 ByteCloud，Meego 不会跟随自动开启。此时采用能力列表的身份语义：未勾选飞书用户身份时，`lark-cli --as user` 使用本机登录。
+
+混合模式的等价 Bot 配置为：
 
 ```json
 {"triggerUserAuth":{"enabled":true,"capabilities":["bytecloud"],"credentialSource":{"bytecloud":"local"},"bytecloudExecution":"read-machine-write-actor"}}
 ```
 
-`credentialSource.bytecloud` 仍是**个人授权来源**：`local` 是执行人自己的本机私有登录；`platform` 只从中心平台取该人的 grant；`auto` 在已绑定宿主使用平台，未绑定时使用本机个人登录。它不选择共享读账号，也不会在个人授权缺失时退回机器身份。Lark、Meego、owner、委托、git 等原有配置字段仍可往返保存。关闭开关保留有效设置；显式清除整份 `triggerUserAuth` 才删除配置。省略执行模式或设为 `trigger-user` 保持原模式。
+`credentialSource.bytecloud` 仍是**个人授权来源**：`local` 是执行人自己的本机私有登录；`platform` 只从中心平台取该人的 grant；`auto` 在已绑定宿主使用平台，未绑定时使用本机个人登录。它不选择共享读账号，也不会在个人授权缺失时退回机器身份。Lark、Meego、owner、委托、git 等原有配置字段仍可往返保存。切回机器身份保留有效设置；显式清除整份 `triggerUserAuth` 才删除配置。省略执行模式或设为 `trigger-user` 保持原模式。
 
 共享读 profile 是机器级配置，放在宿主 `~/.botmux/config.json`：
 
@@ -22,11 +34,13 @@
 
 启用前结束旧会话，并新建冷启动会话。曾经看过凭据的进程不能靠改开关变安全。严格会话的凭据封闭标记持久保留；回退时先拒绝新调用、结束严格会话，再由管理员明确恢复旧模式并新建会话。保留审计和个人授权数据；不能自动重跑结果未知的写入。
 
-![模式编辑器，使用本地假数据](assets/bytedcli-read-write-identity/mode-active.png)
+![CLI 三模式编辑器，使用本地假数据](assets/bytedcli-read-write-identity/execution-modes-1280.png)
+
+[手机布局示例](assets/bytedcli-read-write-identity/execution-modes-390.png)
 
 ## 逐命令规则与宿主限制
 
-选中严格模式后，Dashboard 显示命令的实际效果、宿主规则、Bot 规则和最终状态。读取和写入均可选继承、机器身份、执行人身份或禁用。写入默认触发者；最终身份为机器时，界面显示“机器写入例外”，实际效果仍显示写入。规则保存在 Bot 配置中，只有 `enabled`、ByteCloud 和 `read-machine-write-actor` 同时启用时生效；关闭总开关或切回旧模式保留有效规则。
+使用混合模式时，Dashboard 显示命令的实际效果、宿主规则、Bot 规则和最终状态。读取和写入均可选继承、机器身份、执行人身份或禁用。写入默认触发者；最终身份为机器时，界面显示“机器写入例外”，实际效果仍显示写入。规则保存在 Bot 配置中，只有 `enabled`、ByteCloud 和 `read-machine-write-actor` 同时启用时生效；切回机器或触发者身份保留有效规则。
 
 宿主管理员通过固定文件 `~/.botmux/host-authority/bytedcli-broker/policy/operation-policy.json` 设置全局规则。文件缺失时沿用审核默认；不从 Agent 参数、环境或请求选择路径。目录须为当前宿主用户所有、权限 `0700`，文件为 `0600` 的单链接普通文件，禁止软链、特殊文件及超过 32 KiB 的 UTF-8 JSON。全局文件示例：
 
@@ -34,7 +48,7 @@
 {
   "schema": "botmux.bytedcli-operation-policy.v2",
   "cliVersion": "0.199.0",
-  "catalogVersion": "2026-11-26.1",
+  "catalogVersion": "2026-11-27.2",
   "rules": { "codebase.mr.list": "actor", "codebase.mr.close": "deny" }
 }
 ```
@@ -51,7 +65,7 @@ Bot 使用同一种版本化对象，例如：
     "bytedcliOperationPolicy": {
       "schema": "botmux.bytedcli-operation-policy.v2",
       "cliVersion": "0.199.0",
-      "catalogVersion": "2026-11-26.1",
+      "catalogVersion": "2026-11-27.2",
       "rules": { "codebase.mr.list": "actor", "codebase.mr.reopen": "machine", "bits.develop.list": "deny" }
     }
   }
@@ -64,7 +78,7 @@ Bot 使用同一种版本化对象，例如：
 
 现有 PUT `/api/bots/:app/trigger-user-auth` 保存完整对象；旧客户端省略 `bytedcliOperationPolicy` 时保留已存规则，显式 `bytedcliOperationPolicy:null` 清除 Bot 规则并恢复继承。整份 `triggerUserAuth:null` 仍清除全部鉴权配置。源选择、owner、委托、git 等字段随保存保留。
 
-只有已选择严格模式且勾选 ByteCloud 时，状态接口才读取宿主规则；总开关关闭时也可预览并编辑 dormant 规则，明确返回 `active:false`。原模式或未勾选 ByteCloud 的状态查询不初始化宿主策略目录。
+只有已选择严格模式且勾选 ByteCloud 时，状态接口才读取宿主规则；状态接口仍兼容已保存但关闭的严格配置，可返回 `active:false` 的摘要；Dashboard 在机器或触发者模式隐藏命令列表，不请求关闭状态的摘要。原模式或未勾选 ByteCloud 的状态查询不初始化宿主策略目录。
 
 命令策略摘要由已有 GET `/api/bots/:app/trigger-user-auth-status` 从实际冻结的宿主 reader 投影，返回版本、全局规则及修订、Bot 规则与最终效果/身份。该摘要不查询个人授权、不开始登录、不返回凭据或原始宿主路径；带 `openId` 的既有个人授权状态查询保留原合同。界面用同一审核 resolver 合成当前 Bot 编辑。宿主无兼容版本化状态时显示不可用并禁止保存命令规则，须更新宿主后刷新；全局配置无效时显示明确错误并拒绝严格调用，仍可关闭模式。点击“刷新宿主规则”获取热更新后的展示状态。
 
