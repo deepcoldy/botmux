@@ -33047,6 +33047,9 @@ async function flushPending(): Promise<void> {
       // Deferred preparation parks this exact item in pendingMessages until
       // beforeSubmit: the queue, not this write, owns it until then.
       let deferredQueueOwned = false;
+      // Set when a queue-owned item is found retired right after its write-edge
+      // admission returned allow, before the adapter or any preparation ran.
+      let retiredAfterAdmission = false;
       let retiredBeforeSubmit = false;
       let webWireWriteRefused = false;
       let reattachSteerWriteRefused = false;
@@ -33684,7 +33687,21 @@ async function flushPending(): Promise<void> {
           const transaction = await runAmbiguousSubmissionTransaction(
             writeBackend,
             () => runScheduledCliInputWrite(item, scheduledWriteIsCurrent,
-              isScheduledWrite ? prepareNormalWrite : () => {},
+              isScheduledWrite ? () => {
+                // The queue owns a deferred item until beforeSubmit, and a
+                // lifecycle path (coalesce, durable expiry, ...) may retire and
+                // settle it during the admission await. Settle that before the
+                // adapter is even invoked.
+                if (deferredQueueOwned && !pendingMessages.includes(item)) {
+                  retiredAfterAdmission = true;
+                  throw new Error('scheduled_input_retired');
+                }
+                // Queue-owned items prepare only in beforeSubmit, after its
+                // ownership check: the adapter's own precheck can still await,
+                // and a veto there cannot undo the capture identity, started
+                // active turn or written marks preparation commits.
+                if (!deferredQueueOwned) prepareNormalWrite();
+              } : () => {},
               () => writeAdapter.writeInput(
               adapterInputHandle(writeBackend),
               msg,
@@ -33771,7 +33788,7 @@ async function flushPending(): Promise<void> {
           scheduleBusyPatternIdleProbe(`${cliName()} post-submit`);
         }
       } catch (err: any) {
-        if (lateScheduledHold && !normalWritePrepared) {
+        if ((lateScheduledHold || retiredAfterAdmission) && !normalWritePrepared) {
           const queuedIndex = pendingMessages.indexOf(item);
           // A queue-owned item that left the queue during the admission await
           // was retired and already settled by a lifecycle path (coalesce,
