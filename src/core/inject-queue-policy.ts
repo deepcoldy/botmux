@@ -94,5 +94,5 @@ export function minimaxCompactQueueSuppressesPromptReady(
   cliId: string | undefined,
   pendingRawInputs: readonly { content: string }[],
 ): boolean {
-  return cliId === 'minimax' && pendingRawInputs.some(input => input.content.trim() === '/compact');
+  return (cliId === 'minimax' || cliId === 'atomcode') && pendingRawInputs.some(input => input.content.trim() === '/compact');
 }

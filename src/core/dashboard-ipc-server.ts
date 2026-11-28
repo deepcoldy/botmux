@@ -13420,7 +13420,7 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
   // Per-bot dsh / MiniMax runner timeout (`--turn-timeout-ms`). The
   // field is optional in the body, so distinguish absent (preserve) from
   // present-but-empty (clear → watchdog disabled) like reasoningEffort does.
-  const supportsTurnTimeout = selected.cliId === 'dsh' || selected.cliId === 'minimax';
+  const supportsTurnTimeout = selected.cliId === 'dsh' || selected.cliId === 'minimax' || selected.cliId === 'atomcode';
   const turnTimeoutFieldPresent = Object.prototype.hasOwnProperty.call(body, 'turnTimeoutMs');
   let nextTurnTimeoutMs: number | undefined;
   if (turnTimeoutFieldPresent && body.turnTimeoutMs !== null && body.turnTimeoutMs !== '') {

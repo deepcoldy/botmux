@@ -81,6 +81,7 @@ import { beginJsonlDrain, iterateJsonlLines } from './jsonl-cursor.js';
 import { traeHome, traeSessionsRoot, traeStateDbPath } from './traex-paths.js';
 import { traexHistoryInputMatches, traexSkillInputAliases, stripTraexInputCorrelation } from './traex-skill-input.js';
 import { probeProcessOpenFiles, type ProcessOpenFilesDenial } from '../utils/process-open-files.js';
+import type { TraexNativeTurnLifecycleEvent } from '../core/traex-native-continuation.js';
 
 export { splitCodexEventsByCutoff as splitTraexEventsByCutoff };
 export { extractLastCodexTurn as extractLastTraexTurn };
@@ -117,6 +118,11 @@ export interface TraexDrainResult extends CodexDrainResult {
   latestModel?: string;
   /** Latest executor-reported reasoning effort observed in complete records. */
   latestReasoningEffort?: string;
+  /** Ordered native `task_started` / `task_complete` / `turn_aborted` edges
+   *  observed in this drain, including nested subagent continuations whose
+   *  `root_turn_id` differs from `turn_id` (kept off `events` so they never
+   *  claim a Lark turn in `CodexBridgeQueue`). */
+  nativeTurnLifecycle?: TraexNativeTurnLifecycleEvent[];
 }
 
 export interface TraexDrainOptions {
@@ -1011,6 +1017,7 @@ export function drainTraexRollout(
   const sourceSessionId = traexSessionIdFromRolloutPath(path);
 
   const events: CodexBridgeEvent[] = [];
+  const nativeTurnLifecycle: TraexNativeTurnLifecycleEvent[] = [];
   let latestGoal: NativeGoalState | null | undefined;
   const collectCot = !probe || opts?.includeHistoryCot === true;
   const priorCot = probe ? undefined : traexCotProgress.get(path);
@@ -1080,12 +1087,23 @@ export function drainTraexRollout(
     // UserMessage display completion (observed gaps of 90-117s). Surface the
     // native lifecycle edge so the queue holds a provisional claim instead of
     // expiring the short pre-start lease while TraeX is running the turn.
-    // Nested turns (root_turn_id differs) never start a Lark turn.
+    // Nested turns (root_turn_id differs) never start a Lark turn, so keep them
+    // off `events` while recording them on `nativeTurnLifecycle` so the worker
+    // can distinguish native subagent continuations from post-terminal idle.
     if (obj.type === 'event_msg'
       && payload.type === 'task_started'
-      && sourceTurnId
-      && (payload.root_turn_id === undefined || payload.root_turn_id === sourceTurnId)) {
-      events.push({ ...base, kind: 'turn_started', text: '', sourceTurnId });
+      && sourceTurnId) {
+      const rootTurnId = typeof payload.root_turn_id === 'string' && payload.root_turn_id.length > 0
+        ? payload.root_turn_id
+        : undefined;
+      nativeTurnLifecycle.push({
+        kind: 'started',
+        turnId: sourceTurnId,
+        ...(rootTurnId ? { rootTurnId } : {}),
+      });
+      if (payload.root_turn_id === undefined || payload.root_turn_id === sourceTurnId) {
+        events.push({ ...base, kind: 'turn_started', text: '', sourceTurnId });
+      }
       continue;
     }
     // New TraeX rollouts persist genuine user input only in history_mutation.
@@ -1289,6 +1307,7 @@ export function drainTraexRollout(
       && payload.type === 'task_complete'
       && typeof payload.turn_id === 'string'
       && payload.turn_id.length > 0) {
+      nativeTurnLifecycle.push({ kind: 'ended', turnId: payload.turn_id });
       const terminalMirror = takeTraexUserMirrorAtTerminal(
         pendingUserMirrors,
         payload.turn_id,
@@ -1368,6 +1387,7 @@ export function drainTraexRollout(
       && payload.type === 'turn_aborted'
       && typeof payload.turn_id === 'string'
       && payload.turn_id.length > 0) {
+      nativeTurnLifecycle.push({ kind: 'ended', turnId: payload.turn_id });
       const terminalMirror = takeTraexUserMirrorAtTerminal(
         pendingUserMirrors,
         payload.turn_id,
@@ -1417,6 +1437,7 @@ export function drainTraexRollout(
     ...(latestModel ? { latestModel } : {}),
     ...(latestReasoningEffort ? { latestReasoningEffort } : {}),
     ...(latestGoal !== undefined ? { latestGoal } : {}),
+    ...(nativeTurnLifecycle.length > 0 ? { nativeTurnLifecycle } : {}),
   };
 }
 

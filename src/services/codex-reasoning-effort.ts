@@ -32,6 +32,8 @@ export const CLAUDE_REASONING_EFFORTS = CLAUDE_ALL_REASONING_EFFORTS;
 /** MCode's thinkingEffort option advertises these levels for M3.1-Flash.
  * `default` means no BotMux override; `ultra` is not an advertised level. */
 const MINIMAX_REASONING_EFFORTS: readonly CodexReasoningEffort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
+/** AtomCode's ACP reasoning_effort select accepts off (unset), high, and max. */
+export const ATOMCODE_REASONING_EFFORTS: readonly CodexReasoningEffort[] = ['high', 'max'];
 
 /** Only Haiku is withheld: it takes no effort parameter at all, yet the adapter
  *  lists it in `modelChoices` (both `haiku` and the pinned `claude-haiku-4-5-…`),
@@ -122,7 +124,7 @@ export function isBackendVariantCliId(cliId: string | undefined): boolean {
 
 export function isConfigurableReasoningCliId(cliId: string | undefined): boolean {
   return isCodexReasoningCliId(cliId) || cliId === 'grok' || isBackendVariantCliId(cliId)
-    || cliId === 'claude-code' || cliId === 'kimi' || cliId === 'minimax' || cliId === 'doubao'
+    || cliId === 'claude-code' || cliId === 'kimi' || cliId === 'minimax' || cliId === 'atomcode' || cliId === 'doubao'
     // ZCode's per-model levels are declared in its own provider catalog and can
     // differ per model (grok-4.6 tops out at xhigh, GLM/Opus go to max, MiMo is
     // a switch). The launch path resolves the closest supported level, so the
@@ -325,6 +327,7 @@ export function reasoningEffortsForCliModel(
   catalog?: ReasoningCatalog | null,
 ): readonly CodexReasoningEffort[] {
   if (cliId === 'antigravity') return ANTIGRAVITY_REASONING_EFFORTS;
+  if (cliId === 'atomcode') return ATOMCODE_REASONING_EFFORTS;
   if (cliId === 'doubao') return DOUBAO_REASONING_EFFORTS;
   if (cliId === 'pi') return PI_REASONING_EFFORTS;
   if (cliId === 'grok') return grokReasoningEffortsForModel(model);

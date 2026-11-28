@@ -1,5 +1,6 @@
 import { getBot } from '../bot-registry.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
+import { withResumeCommandEnv } from '../adapters/cli/resume-command-env.js';
 import { resolveCliRuntime, runtimePathOverride } from '../adapters/cli/runtime.js';
 import { decorateResumeForWrapper } from '../setup/cli-selection.js';
 import { decorateResumeForCliLaunchMode } from './cli-launch-mode.js';
@@ -90,13 +91,16 @@ export function buildClosedSessionCard(
       // ttadk 网关：resume 命令必须带 `-m <model> --skip-check`（模型取 bot.model），
       // 否则用户复制粘贴这条命令会卡在 ttadk 的交互式选模型菜单（CoCo 不带 -m）。
       if (!raw) return null;
-      return frozenLaunchMode
+      const decorated = frozenLaunchMode
         ? decorateResumeForCliLaunchMode(raw, frozenLaunchMode)
         : frozenWrapper
           ? decorateResumeForWrapper(raw, frozenWrapper, { ttadkModel: frozenModel })
           : frozenPath
           ? replaceResumeExecutable(raw, frozenPath)
           : raw;
+      return withResumeCommandEnv(decorated, adapter.buildResumeCommandEnv?.({
+        env: live?.initConfig?.env ?? botCfg.env,
+      }));
     } catch { return null; }
   })();
   return buildSessionClosedCard(

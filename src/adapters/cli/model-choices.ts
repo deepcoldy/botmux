@@ -97,6 +97,7 @@ export const CLI_MODEL_CHOICES: Readonly<Record<CliId, readonly string[] | undef
   ],
   'remote-runner': undefined,
   nca: undefined,
+  atomcode: undefined,
   'codem': undefined,
   // Personal providers are discovered on demand; never perform I/O here.
   zcode: undefined,

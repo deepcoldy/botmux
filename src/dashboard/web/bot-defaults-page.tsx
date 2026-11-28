@@ -4179,7 +4179,7 @@ export function BotAgentSection(props: {
   const isCodexSelection = selectedCliId === 'codex' || selectedCliId === 'codex-app';
   const isReasoningSelection = cliSupportsReasoningEffort(cliKey);
   const isDsh = selectedCliId === 'dsh';
-  const supportsTurnTimeout = isDsh || selectedCliId === 'minimax';
+  const supportsTurnTimeout = isDsh || selectedCliId === 'minimax' || selectedCliId === 'atomcode';
   const reasoningEffortOptions = useMemo(
     () => {
       const capability = isTraex ? detectedModels?.modelCapabilities?.find(entry => entry.slug.toLowerCase() === model.toLowerCase()) : undefined;

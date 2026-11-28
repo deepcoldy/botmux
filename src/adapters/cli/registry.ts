@@ -44,6 +44,7 @@ import { createRemoteRunnerAdapter } from './remote-runner.js';
 import { createZcodeAdapter } from './zcode.js';
 import { createDoubaoAdapter, doubaoBridgeSpec } from './doubao.js';
 import { createNcaAdapter, ncaBridgeSpec } from './nca.js';
+import { createAtomcodeAdapter } from './atomcode.js';
 import { retiredCli, retiredCliNotice } from './retired-cli.js';
 
 /**
@@ -105,6 +106,8 @@ const RAW_CLI_EXECUTABLES: Readonly<Record<CliId, string | undefined>> = {
   // npm launcher (`scripts/run.cjs`) that execs the native runtime.
   doubao: 'doubao',
   nca: 'nca',
+  // AtomCode — native ACP over stdio, wrapped by atomcode-runner.
+  atomcode: 'atomcode',
 };
 
 /**
@@ -175,6 +178,7 @@ const CLI_SHORT_ALIASES: Readonly<Record<CliId, readonly string[]>> = {
   zcode: [],
   doubao: [],
   nca: [],
+  atomcode: [],
 };
 
 /** Every non-id name of each CLI: its program name, then its short aliases. */
@@ -492,6 +496,7 @@ export function createCliAdapterSync(id: CliId, pathOverride?: string, opts?: Cl
     case 'zcode': return createZcodeAdapter(pathOverride);
     case 'doubao': return createDoubaoAdapter(pathOverride);
     case 'nca': return createNcaAdapter(pathOverride);
+    case 'atomcode': return createAtomcodeAdapter(pathOverride);
     default:
       // A session persisted on a removed CLI (e.g. switched with `/cli gemini`)
       // fails with the migration notice, not a bare "unknown adapter".

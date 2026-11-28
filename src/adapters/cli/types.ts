@@ -549,6 +549,16 @@ export interface CliAdapter {
     cliSessionId?: string;
   }): string | null;
 
+  /** Non-secret environment required by the local/copy-paste resume command.
+   * Callers apply it AFTER executable/wrapper decoration, so the string returned
+   * by buildResumeCommand keeps its existing grammar. `env` is the same per-bot
+   * overlay supplied to buildArgs, not a request to serialize the whole process
+   * environment. Implementations must allowlist individual location variables
+   * (never credentials/tokens) and return only those needed for resume. */
+  buildResumeCommandEnv?(opts: {
+    env?: NodeJS.ProcessEnv;
+  }): Readonly<Record<string, string>> | undefined;
+
   /** True when this adapter's `buildArgs` can only resume a PRECISE
    *  `resumeSessionId` — a resume without one silently starts a FRESH session
    *  (no `--continue` / "latest" fallback, which would risk loading a SIBLING
@@ -1511,7 +1521,7 @@ export interface StructuredBridgeSpec {
   };
 }
 
-export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'genius' | 'opencode' | 'opencode2' | 'mimocode' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'ebsd' | 'kimi' | 'grok' | 'kiro-cli' | 'riff' | 'reasonix' | 'dsh' | 'dsh-tui' | 'mojo' | 'minimax' | 'remote-runner' | 'codem' | 'zcode' | 'doubao' | 'nca';
+export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'genius' | 'opencode' | 'opencode2' | 'mimocode' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'ebsd' | 'kimi' | 'grok' | 'kiro-cli' | 'riff' | 'reasonix' | 'dsh' | 'dsh-tui' | 'mojo' | 'minimax' | 'remote-runner' | 'codem' | 'zcode' | 'doubao' | 'nca' | 'atomcode';
 
 /**
  * "这个 CLI 是不是 Codex App" 的唯一字面量出口（CliId 级判定）。

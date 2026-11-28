@@ -39,7 +39,7 @@ function bridge(events: Array<{ kind: string }>) {
     noteSpawnArgvTurnStartTranscriptEvidence() {},
     pruneExpiredStructuredHeadsAndEmit() {},
     emitReadyCodexTurns() {},
-    idleDetector: { fireIdle },
+    idleDetector: { fireIdle, programStatusHeldWorking: () => false },
     cliSpawnGeneration: 1,
     cliRestartInProgress: false,
   };
@@ -129,7 +129,7 @@ describe('TRAE native turn completion → transcript terminal evidence', () => {
       noteSpawnArgvTurnStartTranscriptEvidence() {},
       pruneExpiredStructuredHeadsAndEmit() {},
       emitReadyCodexTurns: emit,
-      idleDetector: { fireIdle: vi.fn(), noteTranscriptTerminal: noteTerminal, noteTranscriptTurnStarted: noteStarted },
+      idleDetector: { fireIdle: vi.fn(), noteTranscriptTerminal: noteTerminal, noteTranscriptTurnStarted: noteStarted, programStatusHeldWorking: () => false },
       cliSpawnGeneration: 1,
       cliRestartInProgress: false,
     };

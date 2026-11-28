@@ -5731,12 +5731,13 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       // the model as an ordinary user message. Refuse here too, so the button path can
       // never reopen a channel the router deliberately closed.
       const compactCliId = sessionCliId(ds);
+      const isAcpCompact = compactCliId === 'minimax' || compactCliId === 'atomcode';
       if (!cliSupportsCompactAction(compactCliId, { dshRuntime: getBot(ds.larkAppId).config.dshRuntime })) {
         return { toast: { type: 'warning', content: t('card.action.compact_unsupported', undefined, locDs) } };
       }
       // ACP compaction is a separate turn, not interactive steering. Wait for
       // the business turn and any queued input before rotating reply ownership.
-      if (compactCliId === 'minimax' && (!ds.cliReady || !sessionAcceptsDirectCommand(ds))) {
+      if (isAcpCompact && (!ds.cliReady || !sessionAcceptsDirectCommand(ds))) {
         return { toast: { type: 'warning', content: t('card.action.compact_busy', undefined, locDs) } };
       }
       if (!deps.deliverPassthroughCommand) {
@@ -5747,7 +5748,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         delivered = true;
         // Fence at IPC acceptance, before subsequent card persistence can
         // throw. A second click must not replay an already submitted command.
-        if (compactCliId === 'minimax') ds.cliReady = false;
+        if (isAcpCompact) ds.cliReady = false;
       };
       try {
         const accepted = deps.deliverPassthroughCommand(ds, '/compact', {
@@ -5755,7 +5756,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           senderOpenId: operatorOpenId,
           senderIsBot: false,
           messageId: cardMessageId ?? `compact-${Date.now()}`,
-          ...(compactCliId === 'minimax' ? { turnId: `compact-${randomUUID()}` } : {}),
+          ...(isAcpCompact ? { turnId: `compact-${randomUUID()}` } : {}),
           // A chat-scope card's root_id is the chat id, not a message: passing it
           // on would freeze an unreplyable thread target for this turn.
           replyRootId: ds.scope === 'chat' ? undefined : rootId,

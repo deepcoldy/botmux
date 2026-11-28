@@ -20,6 +20,7 @@ export class MinimaxFinalReceiver {
   constructor(
     private readonly deliver: (payload: Payload) => void,
     private readonly logMismatch?: (message: string) => void,
+    private readonly cliLabel: () => string = () => 'MiniMax Code',
   ) {}
 
   private clearPending(): void {
@@ -38,7 +39,7 @@ export class MinimaxFinalReceiver {
 
   interrupt(): void {
     if (this.pending) this.finish(this.pending.owner, {
-      errorCode: 'execution_failed', content: 'MiniMax Code 最终回答传输不完整。',
+      errorCode: 'execution_failed', content: `${this.cliLabel()} 最终回答传输不完整。`,
     });
   }
 
@@ -73,7 +74,7 @@ export class MinimaxFinalReceiver {
     } else if (!this.pending) {
       // End carries the turn as well so a missing start cannot strand it.
       if (kind === 'final-end' && current.turnId && payload.turnId === current.turnId) {
-        this.finish(current, { errorCode: 'execution_failed', content: 'MiniMax Code 最终回答缺少起始帧。' });
+        this.finish(current, { errorCode: 'execution_failed', content: `${this.cliLabel()} 最终回答缺少起始帧。` });
       }
       return true;
     } else if (payload.id !== this.pending.id) {

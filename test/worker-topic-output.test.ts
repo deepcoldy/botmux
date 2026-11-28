@@ -148,14 +148,16 @@ describe('worker final-output topic transport', () => {
   });
 
   it.each([
-    ['turn_budget_exhausted', false], ['execution_failed', false],
-    ['turn_budget_exhausted', true], ['execution_failed', true],
+    ['minimax', 'turn_budget_exhausted', false], ['minimax', 'execution_failed', false],
+    ['minimax', 'turn_budget_exhausted', true], ['minimax', 'execution_failed', true],
+    ['atomcode', 'turn_budget_exhausted', false], ['atomcode', 'execution_failed', false],
   ] as const)(
-    'renders MiniMax %s on the actual reply card and retains it in the result (snapshot: %s)', async (errorCode, snapshot) => {
-      registerBot({ larkAppId: APP, larkAppSecret: 'test-secret', cliId: snapshot ? 'codex' : 'minimax',
+    'renders %s %s on the actual reply card and retains it in the result (snapshot: %s)', async (runnerCli, errorCode, snapshot) => {
+      const liveCliId = snapshot ? 'codex' : runnerCli;
+      registerBot({ larkAppId: APP, larkAppSecret: 'test-secret', cliId: liveCliId,
         turnResults: { enabled: true }, replyCardMode: 'legacy' });
-      ds.session.cliId = snapshot ? 'codex' : 'minimax';
-      if (snapshot) ds.session.cliLaunchSnapshot = { cliId: 'minimax' } as any;
+      ds.session.cliId = liveCliId;
+      if (snapshot) ds.session.cliLaunchSnapshot = { cliId: runnerCli } as any;
       observeTurnResultTerminal(ds, { type: 'turn_terminal', sessionId: ds.session.sessionId,
         turnId: 'om_turn_old', status: 'failed', errorCode }, 1);
       await new Promise<void>(resolve => deliverFinalOutput(ds, {

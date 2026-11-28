@@ -114,7 +114,7 @@ describe('createCliAdapterSync factory', () => {
     if (isRemoteCliId(id) && id !== 'remote-runner') expect(adapter.resolvedBin).toBe('');
     // dsh joins the bundled-Node-runner group (upstream #858): its resolvedBin is
     // the node binary, not the pinned path.
-    else if (id === 'codex-app' || id === 'mira' || id === 'mir' || id === 'dsh' || id === 'minimax') expect(adapter.resolvedBin).toBe(process.execPath);
+    else if (id === 'codex-app' || id === 'mira' || id === 'mir' || id === 'dsh' || id === 'minimax' || id === 'atomcode') expect(adapter.resolvedBin).toBe(process.execPath);
     else expect(adapter.resolvedBin).toBe(`/opt/${id}`);
   });
 });
