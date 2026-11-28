@@ -1,7 +1,7 @@
 import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { displayCliId, type BotDefaultsRow } from '../src/dashboard/web/bot-defaults.js';
+import { botEffectiveSummary, displayCliId, type BotDefaultsRow } from '../src/dashboard/web/bot-defaults.js';
 import { normalizeOwnerGroupFollowConfig } from '../src/services/owner-group-follow-policy.js';
 import {
   BotAgentSection,
@@ -13,7 +13,13 @@ import {
   TriggerUserAuthSection,
   type BotDefaultsTab,
 } from '../src/dashboard/web/bot-defaults-page.js';
-import { isOnboardingSubmitDisabled, onboardingRetryMode } from '../src/dashboard/web/bot-onboarding.js';
+import {
+  isOnboardingSubmitDisabled,
+  onboardingRetryMode,
+  selectDefaultOnboardingCliId,
+} from '../src/dashboard/web/bot-onboarding.js';
+import { shouldShowZeroBotOnboardingBanner } from '../src/dashboard/web/overview-page.js';
+import { ui } from '../src/dashboard/web/ui.js';
 import { DropdownMenu } from '../src/dashboard/web/dashboard-components.js';
 import { filterDropdownOptions } from '../src/dashboard/web/dropdown-shared.js';
 import { CLI_ALIASES, rawCliExecutable } from '../src/adapters/cli/registry.js';
@@ -1553,6 +1559,42 @@ describe('Codex-compatible runtime editor', () => {
     }
   });
 
+  it('syncs authoritative sandbox fields into the effective summary after an agent save', async () => {
+    const previousFetch = globalThis.fetch;
+    (globalThis as any).fetch = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        ok: true,
+        cliId: 'codex', cliRuntime: null, cliPathOverride: null, wrapperCli: null,
+        model: '', selectionKey: 'codex', closedMismatchedSessions: 0,
+        localSandboxApplies: true, effectiveSandboxMode: 'scratch', sandboxEnvForce: 'scratch',
+      }),
+    } as any));
+    const original: BotDefaultsRow = {
+      larkAppId: 'cli_runtime', cliId: 'codex', model: '', sandboxMode: 'oncall',
+      localSandboxApplies: false, effectiveSandboxMode: 'off', sandboxEnvForce: 'oncall',
+    };
+    expect(botEffectiveSummary(original).sandbox).toBe('off');
+    try {
+      const { root, renderer, patchBot } = renderAgent(original);
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(patchBot).toHaveBeenCalled();
+      const patch = patchBot.mock.calls.at(-1)![1] as Partial<BotDefaultsRow>;
+      expect(patch).toMatchObject({
+        localSandboxApplies: true, effectiveSandboxMode: 'scratch', sandboxEnvForce: 'scratch',
+      });
+      expect(botEffectiveSummary({ ...original, ...patch }).sandbox).toBe('scratch');
+      act(() => renderer.unmount());
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
   async function saveAgentWithSweep(body: Record<string, unknown>) {
     const previousFetch = globalThis.fetch;
     (globalThis as any).fetch = vi.fn(async () => ({
@@ -2024,8 +2066,97 @@ describe('bot onboarding Agent availability warning', () => {
 
   it('keeps a failed local job on the local retry path', () => {
     expect(onboardingRetryMode({ registrationMode: 'local' })).toBe('local');
+    expect(onboardingRetryMode({ registrationMode: 'manual' })).toBe('manual');
     expect(onboardingRetryMode({ registrationMode: 'web' })).toBe('web');
     expect(onboardingRetryMode({ registrationMode: 'compat' })).toBe('web');
+    expect(isOnboardingSubmitDisabled(false, 'checking', 'manual')).toBe(false);
+    expect(isOnboardingSubmitDisabled(true, 'qr', 'manual')).toBe(true);
+  });
+
+  it('auto-selects an installed local CLI when claude-code is missing without silently picking API-only mira/riff', () => {
+    expect(selectDefaultOnboardingCliId('claude-code', [
+      { id: 'claude-code', availabilityStatus: 'available', command: 'claude' },
+      { id: 'codex', availabilityStatus: 'available', command: 'codex' },
+    ])).toBe('claude-code');
+
+    expect(selectDefaultOnboardingCliId('claude-code', [
+      { id: 'claude-code', availabilityStatus: 'unavailable', command: 'claude' },
+      { id: 'mira', availabilityStatus: 'available' },
+      { id: 'riff', availabilityStatus: 'available' },
+      { id: 'codex', availabilityStatus: 'available', command: 'codex' },
+    ])).toBe('codex');
+
+    expect(selectDefaultOnboardingCliId('claude-code', [
+      { id: 'claude-code', availabilityStatus: 'unavailable', command: 'claude' },
+      { id: 'mira', availabilityStatus: 'available' },
+      { id: 'riff', availabilityStatus: 'available' },
+    ])).toBe('claude-code');
+  });
+
+  it('shows OverviewPage 0-bot onboarding banner only when confirmed authed, bootstrapped, and 0 configured bots', () => {
+    expect(shouldShowZeroBotOnboardingBanner({
+      authed: true,
+      groupsLoaded: true,
+      bootstrapped: true,
+      cardCount: 0,
+      configuredBotCount: 0,
+    })).toBe(true);
+    expect(shouldShowZeroBotOnboardingBanner({
+      authed: true,
+      groupsLoaded: true,
+      bootstrapped: true,
+      cardCount: 0,
+      configuredBotCount: null,
+    })).toBe(false);
+    expect(shouldShowZeroBotOnboardingBanner({
+      authed: true,
+      groupsLoaded: true,
+      bootstrapped: true,
+      cardCount: 0,
+      configuredBotCount: 1,
+    })).toBe(false);
+    expect(shouldShowZeroBotOnboardingBanner({
+      authed: false,
+      groupsLoaded: true,
+      bootstrapped: true,
+      cardCount: 0,
+      configuredBotCount: 0,
+    })).toBe(false);
+  });
+
+  it('queues a follow-up refreshConfiguredBotCount fetch when invalidated mid-flight so stale 0 cannot overwrite 1', async () => {
+    ui.authed = true;
+    ui.setConfiguredBotCount(0);
+    let resolveFirst!: (res: Response) => void;
+    let markFirstEntered!: () => void;
+    const firstEntered = new Promise<void>(resolve => { markFirstEntered = resolve; });
+    let calls = 0;
+    const mockFetch = vi.fn((_url: string | URL | Request) => {
+      calls += 1;
+      if (calls === 1) {
+        return new Promise<Response>(resolve => {
+          resolveFirst = resolve;
+          markFirstEntered();
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        json: async () => ({ authed: true, configuredBotCount: 1 }),
+      } as Response);
+    }) as unknown as typeof fetch;
+
+    const first = ui.refreshConfiguredBotCount(mockFetch);
+    await firstEntered;
+    // Onboarding completes while first /api/settings fetch is still pending.
+    const second = ui.refreshConfiguredBotCount(mockFetch);
+    resolveFirst({
+      ok: true,
+      json: async () => ({ authed: true, configuredBotCount: 0 }),
+    } as Response);
+    await Promise.all([first, second]);
+
+    expect(calls).toBe(2);
+    expect(ui.configuredBotCount).toBe(1);
   });
 });
 
@@ -2242,10 +2373,14 @@ describe('riff CLI switch persistence (PR #467 P1)', () => {
     // （DropdownField 是自定义组件：按组件 prop dataInput 定位并调用其 onChange）
     act(() => { root.findByProps({ dataInput: 'agentCliId' }).props.onChange('riff'); });
     expect(root.findAllByProps({ 'data-action': 'save-agent' })).toHaveLength(0);
-    // Agent 配置已下线：面板不得再渲染 riff-agent 输入框
-    expect(root.findAllByProps({ 'data-input': 'riff-agent' })).toHaveLength(0);
+    // Riff Agent 下拉默认 codex，支持切换到 claude；切到 claude 后模型建议列表同步切换。
+    expect(root.findByProps({ dataInput: 'riff-agent' }).props.value).toBe('codex');
+    act(() => { root.findByProps({ dataInput: 'riff-agent' }).props.onChange('claude'); });
+    const datalistOptions = root.findByType('datalist').findAllByType('option').map(o => o.props.value);
+    expect(datalistOptions).toContain('gemini-4-neon');
+    expect(datalistOptions).toContain('glm-5.3');
     // 运行环境选择 CN、思考等级选择 xhigh → 保存的 PUT /riff 必须一起携带
-    // sandboxCluster / reasoningEffort。
+    // sandboxCluster / agent / reasoningEffort。
     act(() => { root.findByProps({ dataInput: 'riff-sandbox-cluster' }).props.onChange('cn'); });
     act(() => { root.findByProps({ dataInput: 'riff-reasoning-effort' }).props.onChange('xhigh'); });
     const baseUrlInput = root.findByProps({ 'data-input': 'riff-base-url' });
@@ -2256,7 +2391,58 @@ describe('riff CLI switch persistence (PR #467 P1)', () => {
     const puts = requests.filter(r => r.method === 'PUT');
     expect(puts.map(r => r.url.split('/').pop())).toEqual(['riff', 'agent']);
     expect(puts[1]!.body).toEqual({ cliId: 'riff', model: '' });
-    expect(JSON.parse(puts[0]!.body.riff)).toMatchObject({ sandboxCluster: 'cn', reasoningEffort: 'xhigh' });
+    expect(JSON.parse(puts[0]!.body.riff)).toMatchObject({ sandboxCluster: 'cn', agent: 'claude', reasoningEffort: 'xhigh' });
+  });
+
+  it('clears an explicitly configured model on either Riff agent transition before saving', async () => {
+    const requests: Array<{ method: string; url: string; body: any }> = [];
+    (globalThis as any).fetch = async (url: string, init?: any) => {
+      requests.push({ method: init?.method ?? 'GET', url: String(url), body: init?.body ? JSON.parse(init.body) : undefined });
+      const body = String(url).endsWith('/agent')
+        ? { ok: true, cliId: 'riff', wrapperCli: null, model: '', selectionKey: 'riff' }
+        : { ok: true, riff: init?.body ? JSON.parse(init.body).riff : JSON.stringify({}) };
+      return { ok: true, status: 200, json: async () => body } as any;
+    };
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(BotAgentSection, {
+        bot: {
+          larkAppId: 'cli_riff_agent_model', cliId: 'riff', model: '',
+          riff: {
+            baseUrl: 'https://riff.example', sandboxCluster: 'cn', agent: 'codex',
+            model: 'gpt-5.5', reasoningEffort: 'high',
+          },
+        },
+        sessionFallback: 'riff',
+        cliState: {
+          options: [{ id: 'codex', label: 'Codex' }, { id: 'riff', label: 'Riff' }],
+          ttadkModelDefault: 'glm-5.1',
+          ttadkModelSuggestions: [],
+        },
+        patchBot: () => undefined,
+      }));
+    });
+    const root = renderer.root;
+    expect(root.findByProps({ dataInput: 'riff-agent' }).props.value).toBe('codex');
+    expect(root.findByProps({ 'data-input': 'riff-model' }).props.value).toBe('gpt-5.5');
+
+    act(() => { root.findByProps({ dataInput: 'riff-agent' }).props.onChange('claude'); });
+    expect(root.findByProps({ 'data-input': 'riff-model' }).props.value).toBe('');
+    expect(root.findByProps({ dataInput: 'riff-reasoning-effort' }).props.value).toBe('high');
+
+    // The reset is deliberately unconditional, not based on either suggestion list.
+    act(() => { root.findByProps({ 'data-input': 'riff-model' }).props.onChange({ currentTarget: { value: 'glm-5.3' } }); });
+    act(() => { root.findByProps({ dataInput: 'riff-agent' }).props.onChange('codex'); });
+    expect(root.findByProps({ 'data-input': 'riff-model' }).props.value).toBe('');
+    act(() => { root.findByProps({ dataInput: 'riff-agent' }).props.onChange('claude'); });
+
+    await act(async () => { await root.findByProps({ 'data-action': 'save-riff' }).props.onClick(); });
+    const put = requests.find(r => r.method === 'PUT' && r.url.endsWith('/riff'))!;
+    const saved = JSON.parse(put.body.riff);
+    expect(saved).toMatchObject({
+      baseUrl: 'https://riff.example', sandboxCluster: 'cn', agent: 'claude', reasoningEffort: 'high',
+    });
+    expect(saved).not.toHaveProperty('model');
   });
 
   it('resets the native-subagent editor from the authoritative Trae-to-Riff response', async () => {

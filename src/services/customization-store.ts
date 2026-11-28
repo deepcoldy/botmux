@@ -34,6 +34,18 @@
  *
  * The master enabled flag also mirrors into GlobalConfig (`customization.enabled`)
  * so it participates in the dashboard settings surface; this store owns the rest.
+ *
+ * SCOPES (services/customization-scope.ts): the layout above exists once per
+ * scope — `customizations/` (feishu, what every scope-less caller gets, exactly
+ * as before scopes existed) and `customizations-wecom/` (the native-gateway
+ * channel). Every exported function takes the scope as an optional LAST
+ * argument. The read cache, the file lock and the history are per store root,
+ * so two scopes used alternately in one process (the Dashboard) never mix.
+ *
+ * READ-ONLY IN A NATIVE GATEWAY CORE: a native gateway's dedicated core (and
+ * its workers) only ever reads a store — the one its gateway hands it, see
+ * skills/effective-builtins.ts — so every mutation refuses there, and in the
+ * CLI sessions of that core (core/native-gateway-session.ts).
  */
 import {
   existsSync, mkdirSync, readFileSync, rmSync, cpSync,
@@ -44,6 +56,25 @@ import { config } from '../config.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLockSync } from '../utils/file-lock.js';
 import { type Locale, SUPPORTED_LOCALES } from '../i18n/types.js';
+import { isNativeGatewayCoreProcess } from '../core/runtime-mode.js';
+import { inNativeGatewaySession } from '../core/native-gateway-session.js';
+import {
+  type CustomizationScope,
+  DEFAULT_CUSTOMIZATION_SCOPE,
+  customizationStoreRoot,
+  customizationScopeHasSkills,
+  wecomCustomizationStoreDir,
+} from './customization-scope.js';
+
+export {
+  type CustomizationScope,
+  CUSTOMIZATION_SCOPES,
+  DEFAULT_CUSTOMIZATION_SCOPE,
+  isCustomizationScope,
+  customizationStoreRoot,
+  customizationScopeHasSkills,
+  wecomCustomizationStoreDir,
+} from './customization-scope.js';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -108,26 +139,29 @@ export const MAX_SKILL_BODY_BYTES = 64 * 1024;
  *  generous ceiling that still stops a paste-bomb from bloating every prompt. */
 export const MAX_PROMPT_OVERRIDE_BYTES = 16 * 1024;
 
-export function customizationsRoot(): string {
-  return join(config.session.dataDir, 'customizations');
+/** Root of `scope`'s store: the Feishu one under this process's data dir
+ *  (exactly as before scopes existed), the WeCom one by its single resolution
+ *  rule (customization-scope.ts wecomCustomizationStoreDir). */
+export function customizationsRoot(scope: CustomizationScope = DEFAULT_CUSTOMIZATION_SCOPE): string {
+  return scope === 'wecom' ? wecomCustomizationStoreDir() : customizationStoreRoot(config.session.dataDir, scope);
 }
-function statePath(): string {
-  return join(customizationsRoot(), 'state.json');
+function statePath(root: string): string {
+  return join(root, 'state.json');
 }
-function skillsDir(): string {
-  return join(customizationsRoot(), 'skills');
+function skillsDir(root: string): string {
+  return join(root, 'skills');
 }
-function skillOverridePath(name: string): string {
-  return join(skillsDir(), `${safeSkillName(name)}.md`);
+function skillOverridePath(root: string, name: string): string {
+  return join(skillsDir(root), `${safeSkillName(name)}.md`);
 }
-function historyDir(): string {
-  return join(customizationsRoot(), 'history');
+function historyDir(root: string): string {
+  return join(root, 'history');
 }
-function historyIndexPath(): string {
-  return join(historyDir(), 'index.json');
+function historyIndexPath(root: string): string {
+  return join(historyDir(root), 'index.json');
 }
-function snapshotDir(id: string): string {
-  return join(historyDir(), safeSnapshotId(id));
+function snapshotDir(root: string, id: string): string {
+  return join(historyDir(root), safeSnapshotId(id));
 }
 
 // ─── Validation helpers ──────────────────────────────────────────────────────
@@ -152,10 +186,11 @@ const LOCK_TIMEOUT_MS = 5_000;
 // Short TTL so dashboard/CLI writes are picked up by the next session without a
 // restart, but hot prompt-build paths don't re-parse the file on every t() call.
 const READ_CACHE_TTL_MS = 2_000;
-let readCache: { at: number; state: CustomizationState } | undefined;
+/** Per store root, so scopes (and explicit roots) never share an entry. */
+const readCache = new Map<string, { at: number; state: CustomizationState }>();
 
-function ensureRoot(): void {
-  mkdirSync(customizationsRoot(), { recursive: true });
+function ensureRoot(root: string): void {
+  mkdirSync(root, { recursive: true });
 }
 
 function emptyState(): CustomizationState {
@@ -211,39 +246,67 @@ function coerceState(raw: unknown): CustomizationState {
   return out;
 }
 
-/** Read the current state (short-TTL cached). Never throws — a missing or
- *  corrupt file yields the empty baseline. */
-export function readCustomizationState(): CustomizationState {
+/** Read the current state of `scope` (short-TTL cached). Never throws — a
+ *  missing or corrupt file yields the empty baseline. */
+export function readCustomizationState(scope: CustomizationScope = DEFAULT_CUSTOMIZATION_SCOPE): CustomizationState {
+  return readCustomizationStateAt(customizationsRoot(scope));
+}
+
+/**
+ * Read the state of the store rooted at `root` (an absolute store directory,
+ * e.g. the one a native gateway hands its core). Same cache, same never-throw
+ * contract as {@link readCustomizationState}. There is no write counterpart:
+ * a store addressed by an explicit root is only ever read.
+ */
+export function readCustomizationStateAt(root: string): CustomizationState {
   const now = Date.now();
-  if (readCache && now - readCache.at < READ_CACHE_TTL_MS) return readCache.state;
+  const cached = readCache.get(root);
+  if (cached && now - cached.at < READ_CACHE_TTL_MS) return cached.state;
   let state = emptyState();
-  const fp = statePath();
+  const fp = statePath(root);
   if (existsSync(fp)) {
     try { state = coerceState(JSON.parse(readFileSync(fp, 'utf-8'))); }
     catch { state = emptyState(); }
   }
-  readCache = { at: now, state };
+  readCache.set(root, { at: now, state });
   return state;
 }
 
+/** Drop every cached read (all scopes / roots). */
 export function invalidateCustomizationCache(): void {
-  readCache = undefined;
+  readCache.clear();
 }
 
-function writeStateUnlocked(state: CustomizationState): void {
-  ensureRoot();
+function writeStateUnlocked(root: string, state: CustomizationState): void {
+  ensureRoot(root);
   const next: CustomizationState = { ...state, schemaVersion: SCHEMA_VERSION, updatedAt: nowIso() };
-  atomicWriteFileSync(statePath(), JSON.stringify(next, null, 2) + '\n');
-  invalidateCustomizationCache();
+  atomicWriteFileSync(statePath(root), JSON.stringify(next, null, 2) + '\n');
+  readCache.delete(root);
 }
 
 function nowIso(): string {
   return new Date().toISOString();
 }
 
-function withStateLock<T>(fn: () => T): T {
-  ensureRoot();
-  return withFileLockSync(statePath(), fn, { maxWaitMs: LOCK_TIMEOUT_MS });
+/** Thrown by every mutation inside a native gateway's dedicated core. */
+export const CUSTOMIZATION_STORE_READ_ONLY = 'customization_store_read_only';
+/** Thrown by skill mutations on a scope without built-in skills. */
+export const CUSTOMIZATION_SCOPE_HAS_NO_SKILLS = 'skills_not_supported_in_scope';
+
+function assertWritable(): void {
+  // The core and its workers carry the native mark; its CLI sessions do not,
+  // but they see the core's marked store (core/native-gateway-session.ts).
+  if (isNativeGatewayCoreProcess() || inNativeGatewaySession()) throw new Error(CUSTOMIZATION_STORE_READ_ONLY);
+}
+
+function assertSkillsScope(scope: CustomizationScope): void {
+  if (!customizationScopeHasSkills(scope)) throw new Error(CUSTOMIZATION_SCOPE_HAS_NO_SKILLS);
+}
+
+function withStateLock<T>(root: string, fn: () => T): T {
+  assertWritable();
+  ensureRoot(root);
+  return withFileLockSync(statePath(root), fn, { maxWaitMs: LOCK_TIMEOUT_MS });
 }
 
 // ─── Master enabled flag ─────────────────────────────────────────────────────
@@ -251,14 +314,14 @@ function withStateLock<T>(fn: () => T): T {
 /** Whether customizations are active. Missing flag = enabled (opt-out master
  *  switch); an explicit `false` disables everything. The resolution layer also
  *  consults this so a single check short-circuits all override lookups. */
-export function customizationEnabled(): boolean {
-  return readCustomizationState().enabled !== false;
+export function customizationEnabled(scope: CustomizationScope = DEFAULT_CUSTOMIZATION_SCOPE): boolean {
+  return readCustomizationState(scope).enabled !== false;
 }
 
 // ─── Snapshot / history ──────────────────────────────────────────────────────
 
-function readHistoryIndex(): HistoryIndex {
-  const fp = historyIndexPath();
+function readHistoryIndex(root: string): HistoryIndex {
+  const fp = historyIndexPath(root);
   if (!existsSync(fp)) return { schemaVersion: SCHEMA_VERSION, snapshots: [] };
   try {
     const parsed = JSON.parse(readFileSync(fp, 'utf-8')) as Partial<HistoryIndex>;
@@ -271,9 +334,9 @@ function readHistoryIndex(): HistoryIndex {
   }
 }
 
-function writeHistoryIndex(index: HistoryIndex): void {
-  mkdirSync(historyDir(), { recursive: true });
-  atomicWriteFileSync(historyIndexPath(), JSON.stringify(index, null, 2) + '\n');
+function writeHistoryIndex(root: string, index: HistoryIndex): void {
+  mkdirSync(historyDir(root), { recursive: true });
+  atomicWriteFileSync(historyIndexPath(root), JSON.stringify(index, null, 2) + '\n');
 }
 
 function summarize(state: CustomizationState): CustomizationSnapshot['summary'] {
@@ -288,53 +351,53 @@ function summarize(state: CustomizationState): CustomizationSnapshot['summary'] 
  *  Must be called *before* a mutation writes the new state, so the snapshot
  *  preserves the prior point-in-time. Prunes to MAX_SNAPSHOTS. Best-effort:
  *  a snapshot failure never blocks the mutation itself (caller ignores throw). */
-function snapshotCurrentUnlocked(label: string): CustomizationSnapshot {
-  const current = existsSync(statePath()) ? readStateFromDisk() : emptyState();
+function snapshotCurrentUnlocked(root: string, label: string): CustomizationSnapshot {
+  const current = existsSync(statePath(root)) ? readStateFromDisk(root) : emptyState();
   const id = `snap_${randomUUID().replace(/-/g, '').slice(0, 20)}`;
-  const dir = snapshotDir(id);
+  const dir = snapshotDir(root, id);
   mkdirSync(dir, { recursive: true });
   atomicWriteFileSync(join(dir, 'state.json'), JSON.stringify(current, null, 2) + '\n');
   // Copy the skill override bodies so a rollback restores exact SKILL.md text,
   // not just the state.json pointers.
-  if (existsSync(skillsDir())) {
-    try { cpSync(skillsDir(), join(dir, 'skills'), { recursive: true }); } catch { /* best-effort */ }
+  if (existsSync(skillsDir(root))) {
+    try { cpSync(skillsDir(root), join(dir, 'skills'), { recursive: true }); } catch { /* best-effort */ }
   }
   const snap: CustomizationSnapshot = { id, at: nowIso(), label: label.slice(0, 200), summary: summarize(current) };
-  const index = readHistoryIndex();
+  const index = readHistoryIndex(root);
   index.snapshots.unshift(snap);
   // Prune oldest beyond the cap and delete their dirs.
   while (index.snapshots.length > MAX_SNAPSHOTS) {
     const dropped = index.snapshots.pop();
-    if (dropped) { try { rmSync(snapshotDir(dropped.id), { recursive: true, force: true }); } catch { /* ignore */ } }
+    if (dropped) { try { rmSync(snapshotDir(root, dropped.id), { recursive: true, force: true }); } catch { /* ignore */ } }
   }
-  writeHistoryIndex(index);
+  writeHistoryIndex(root, index);
   return snap;
 }
 
 /** Uncached direct disk read — used inside locked sections where the TTL cache
  *  could be stale relative to a sibling process's just-committed write. */
-function readStateFromDisk(): CustomizationState {
-  const fp = statePath();
+function readStateFromDisk(root: string): CustomizationState {
+  const fp = statePath(root);
   if (!existsSync(fp)) return emptyState();
   try { return coerceState(JSON.parse(readFileSync(fp, 'utf-8'))); }
   catch { return emptyState(); }
 }
 
-export function listSnapshots(): CustomizationSnapshot[] {
-  return readHistoryIndex().snapshots;
+export function listSnapshots(scope: CustomizationScope = DEFAULT_CUSTOMIZATION_SCOPE): CustomizationSnapshot[] {
+  return readHistoryIndex(customizationsRoot(scope)).snapshots;
 }
 
 /** Read the full state stored in a snapshot (for diff preview before rollback). */
-export function readSnapshotState(id: string): CustomizationState | undefined {
-  const fp = join(snapshotDir(id), 'state.json');
+export function readSnapshotState(id: string, scope: CustomizationScope = DEFAULT_CUSTOMIZATION_SCOPE): CustomizationState | undefined {
+  const fp = join(snapshotDir(customizationsRoot(scope), id), 'state.json');
   if (!existsSync(fp)) return undefined;
   try { return coerceState(JSON.parse(readFileSync(fp, 'utf-8'))); }
   catch { return undefined; }
 }
 
 /** Read a skill body as it existed in a snapshot (mirrors {@link readSkillOverrideBody}). */
-export function readSnapshotSkillBody(id: string, name: string): string | undefined {
-  const fp = join(snapshotDir(id), 'skills', `${safeSkillName(name)}.md`);
+export function readSnapshotSkillBody(id: string, name: string, scope: CustomizationScope = DEFAULT_CUSTOMIZATION_SCOPE): string | undefined {
+  const fp = join(snapshotDir(customizationsRoot(scope), id), 'skills', `${safeSkillName(name)}.md`);
   if (!existsSync(fp)) return undefined;
   try { return readFileSync(fp, 'utf-8'); } catch { return undefined; }
 }
@@ -344,8 +407,13 @@ export function readSnapshotSkillBody(id: string, name: string): string | undefi
 /** Read the override SKILL.md body for a built-in skill, or undefined if none.
  *  Reads the .md file when the state entry has a body; the state's `body` field
  *  is a presence marker, the file is the source of truth for large text. */
-export function readSkillOverrideBody(name: string): string | undefined {
-  const fp = skillOverridePath(name);
+export function readSkillOverrideBody(name: string, scope: CustomizationScope = DEFAULT_CUSTOMIZATION_SCOPE): string | undefined {
+  return readSkillOverrideBodyAt(customizationsRoot(scope), name);
+}
+
+/** {@link readSkillOverrideBody} for the store rooted at `root` (read-only, like {@link readCustomizationStateAt}). */
+export function readSkillOverrideBodyAt(root: string, name: string): string | undefined {
+  const fp = skillOverridePath(root, name);
   if (!existsSync(fp)) return undefined;
   try { return readFileSync(fp, 'utf-8'); } catch { return undefined; }
 }
@@ -353,24 +421,31 @@ export function readSkillOverrideBody(name: string): string | undefined {
 // ─── Mutations (each snapshots the prior state first) ─────────────────────────
 
 /** Set (or clear) the master enabled flag. */
-export function setCustomizationEnabled(enabled: boolean): CustomizationState {
-  return withStateLock(() => {
-    try { snapshotCurrentUnlocked(enabled ? 'enable customization' : 'disable customization'); } catch { /* best-effort */ }
-    const state = readStateFromDisk();
+export function setCustomizationEnabled(enabled: boolean, scope: CustomizationScope = DEFAULT_CUSTOMIZATION_SCOPE): CustomizationState {
+  const root = customizationsRoot(scope);
+  return withStateLock(root, () => {
+    try { snapshotCurrentUnlocked(root, enabled ? 'enable customization' : 'disable customization'); } catch { /* best-effort */ }
+    const state = readStateFromDisk(root);
     state.enabled = enabled;
-    writeStateUnlocked(state);
+    writeStateUnlocked(root, state);
     return state;
   });
 }
 
 /** Override (value set) or clear (value === null) a single prompt key for a locale. */
-export function setPromptOverride(locale: Locale, key: string, value: string | null): CustomizationState {
+export function setPromptOverride(
+  locale: Locale,
+  key: string,
+  value: string | null,
+  scope: CustomizationScope = DEFAULT_CUSTOMIZATION_SCOPE,
+): CustomizationState {
   if (value !== null && Buffer.byteLength(value, 'utf-8') > MAX_PROMPT_OVERRIDE_BYTES) {
     throw new Error('prompt_override_too_large');
   }
-  return withStateLock(() => {
-    try { snapshotCurrentUnlocked(`${value === null ? 'reset' : 'set'} ${key} (${locale})`); } catch { /* best-effort */ }
-    const state = readStateFromDisk();
+  const root = customizationsRoot(scope);
+  return withStateLock(root, () => {
+    try { snapshotCurrentUnlocked(root, `${value === null ? 'reset' : 'set'} ${key} (${locale})`); } catch { /* best-effort */ }
+    const state = readStateFromDisk(root);
     const po = state.promptOverrides ?? {};
     const map = { ...(po[locale] ?? {}) };
     if (value === null) delete map[key];
@@ -379,62 +454,79 @@ export function setPromptOverride(locale: Locale, key: string, value: string | n
     else delete po[locale];
     if (Object.keys(po).length) state.promptOverrides = po;
     else delete state.promptOverrides;
-    writeStateUnlocked(state);
+    writeStateUnlocked(root, state);
     return state;
   });
 }
 
 /** Force a conditional prompt line on/off, or clear the override (follow shipped gating). */
-export function setConditionalLine(key: string, value: boolean | null): CustomizationState {
-  return withStateLock(() => {
-    try { snapshotCurrentUnlocked(`${value === null ? 'reset' : 'set'} condition ${key}`); } catch { /* best-effort */ }
-    const state = readStateFromDisk();
+export function setConditionalLine(
+  key: string,
+  value: boolean | null,
+  scope: CustomizationScope = DEFAULT_CUSTOMIZATION_SCOPE,
+): CustomizationState {
+  const root = customizationsRoot(scope);
+  return withStateLock(root, () => {
+    try { snapshotCurrentUnlocked(root, `${value === null ? 'reset' : 'set'} condition ${key}`); } catch { /* best-effort */ }
+    const state = readStateFromDisk(root);
     const cl = { ...(state.conditionalLines ?? {}) };
     if (value === null) delete cl[key];
     else cl[key] = value;
     if (Object.keys(cl).length) state.conditionalLines = cl;
     else delete state.conditionalLines;
-    writeStateUnlocked(state);
+    writeStateUnlocked(root, state);
     return state;
   });
 }
 
 /** Set (body != null) or clear (body === null) the override body for a built-in skill.
  *  Clearing removes the body but leaves any `disabled` flag intact. */
-export function setSkillOverrideBody(name: string, body: string | null): CustomizationState {
+export function setSkillOverrideBody(
+  name: string,
+  body: string | null,
+  scope: CustomizationScope = DEFAULT_CUSTOMIZATION_SCOPE,
+): CustomizationState {
   const clean = safeSkillName(name);
   if (body !== null && Buffer.byteLength(body, 'utf-8') > MAX_SKILL_BODY_BYTES) {
     throw new Error('skill_body_too_large');
   }
-  return withStateLock(() => {
-    try { snapshotCurrentUnlocked(`${body === null ? 'reset body' : 'override body'} ${clean}`); } catch { /* best-effort */ }
-    const state = readStateFromDisk();
+  assertSkillsScope(scope);
+  const root = customizationsRoot(scope);
+  return withStateLock(root, () => {
+    try { snapshotCurrentUnlocked(root, `${body === null ? 'reset body' : 'override body'} ${clean}`); } catch { /* best-effort */ }
+    const state = readStateFromDisk(root);
     const bs = { ...(state.builtinSkills ?? {}) };
     const entry: BuiltinSkillOverride = { ...(bs[clean] ?? {}) };
     if (body === null) {
       delete entry.body;
-      try { rmSync(skillOverridePath(clean), { force: true }); } catch { /* ignore */ }
+      try { rmSync(skillOverridePath(root, clean), { force: true }); } catch { /* ignore */ }
     } else {
       entry.body = body;
       entry.updatedAt = nowIso();
-      mkdirSync(skillsDir(), { recursive: true });
-      atomicWriteFileSync(skillOverridePath(clean), body);
+      mkdirSync(skillsDir(root), { recursive: true });
+      atomicWriteFileSync(skillOverridePath(root, clean), body);
     }
     if (entry.body !== undefined || entry.disabled) bs[clean] = entry;
     else delete bs[clean];
     if (Object.keys(bs).length) state.builtinSkills = bs;
     else delete state.builtinSkills;
-    writeStateUnlocked(state);
+    writeStateUnlocked(root, state);
     return state;
   });
 }
 
 /** Enable/disable injection of a built-in skill (independent of any body override). */
-export function setSkillDisabled(name: string, disabled: boolean): CustomizationState {
+export function setSkillDisabled(
+  name: string,
+  disabled: boolean,
+  scope: CustomizationScope = DEFAULT_CUSTOMIZATION_SCOPE,
+): CustomizationState {
   const clean = safeSkillName(name);
-  return withStateLock(() => {
-    try { snapshotCurrentUnlocked(`${disabled ? 'disable' : 'enable'} skill ${clean}`); } catch { /* best-effort */ }
-    const state = readStateFromDisk();
+  assertSkillsScope(scope);
+  const root = customizationsRoot(scope);
+  return withStateLock(root, () => {
+    try { snapshotCurrentUnlocked(root, `${disabled ? 'disable' : 'enable'} skill ${clean}`); } catch { /* best-effort */ }
+    const state = readStateFromDisk(root);
     const bs = { ...(state.builtinSkills ?? {}) };
     const entry: BuiltinSkillOverride = { ...(bs[clean] ?? {}) };
     if (disabled) entry.disabled = true;
@@ -444,7 +536,7 @@ export function setSkillDisabled(name: string, disabled: boolean): Customization
     else delete bs[clean];
     if (Object.keys(bs).length) state.builtinSkills = bs;
     else delete state.builtinSkills;
-    writeStateUnlocked(state);
+    writeStateUnlocked(root, state);
     return state;
   });
 }
@@ -452,16 +544,17 @@ export function setSkillDisabled(name: string, disabled: boolean): Customization
 /** Reset EVERYTHING to factory: clears all overrides + skill bodies. Snapshots
  *  first, so this is fully reversible via rollback. Keeps the master enabled
  *  flag (resetting content is orthogonal to the on/off switch). */
-export function resetAllToFactory(): CustomizationState {
-  return withStateLock(() => {
-    try { snapshotCurrentUnlocked('reset all to factory'); } catch { /* best-effort */ }
-    const prior = readStateFromDisk();
+export function resetAllToFactory(scope: CustomizationScope = DEFAULT_CUSTOMIZATION_SCOPE): CustomizationState {
+  const root = customizationsRoot(scope);
+  return withStateLock(root, () => {
+    try { snapshotCurrentUnlocked(root, 'reset all to factory'); } catch { /* best-effort */ }
+    const prior = readStateFromDisk(root);
     // Wipe the skill body files.
-    try { rmSync(skillsDir(), { recursive: true, force: true }); } catch { /* ignore */ }
+    try { rmSync(skillsDir(root), { recursive: true, force: true }); } catch { /* ignore */ }
     const next: CustomizationState = { schemaVersion: SCHEMA_VERSION };
     // Preserve the master switch across a content reset.
     if (prior.enabled !== undefined) next.enabled = prior.enabled;
-    writeStateUnlocked(next);
+    writeStateUnlocked(root, next);
     return next;
   });
 }
@@ -469,18 +562,19 @@ export function resetAllToFactory(): CustomizationState {
 /** Roll the current state back to a snapshot's contents. Non-destructive: the
  *  pre-rollback state is snapshotted first, so a rollback can itself be undone
  *  by rolling forward to that new snapshot. */
-export function rollbackToSnapshot(id: string): CustomizationState {
-  const target = readSnapshotState(id);
+export function rollbackToSnapshot(id: string, scope: CustomizationScope = DEFAULT_CUSTOMIZATION_SCOPE): CustomizationState {
+  const target = readSnapshotState(id, scope);
   if (!target) throw new Error('snapshot_not_found');
-  return withStateLock(() => {
-    try { snapshotCurrentUnlocked(`rollback to ${id}`); } catch { /* best-effort */ }
+  const root = customizationsRoot(scope);
+  return withStateLock(root, () => {
+    try { snapshotCurrentUnlocked(root, `rollback to ${id}`); } catch { /* best-effort */ }
     // Restore skill bodies from the snapshot dir.
-    try { rmSync(skillsDir(), { recursive: true, force: true }); } catch { /* ignore */ }
-    const snapSkills = join(snapshotDir(id), 'skills');
+    try { rmSync(skillsDir(root), { recursive: true, force: true }); } catch { /* ignore */ }
+    const snapSkills = join(snapshotDir(root, id), 'skills');
     if (existsSync(snapSkills)) {
-      try { cpSync(snapSkills, skillsDir(), { recursive: true }); } catch { /* best-effort */ }
+      try { cpSync(snapSkills, skillsDir(root), { recursive: true }); } catch { /* best-effort */ }
     }
-    writeStateUnlocked(target);
+    writeStateUnlocked(root, target);
     return target;
   });
 }
@@ -492,19 +586,22 @@ export function replaceState(
   next: CustomizationState,
   skillBodies: Record<string, string>,
   label: string,
+  scope: CustomizationScope = DEFAULT_CUSTOMIZATION_SCOPE,
 ): CustomizationState {
-  return withStateLock(() => {
-    try { snapshotCurrentUnlocked(label); } catch { /* best-effort */ }
+  if (next.builtinSkills && Object.keys(next.builtinSkills).length) assertSkillsScope(scope);
+  const root = customizationsRoot(scope);
+  return withStateLock(root, () => {
+    try { snapshotCurrentUnlocked(root, label); } catch { /* best-effort */ }
     const clean = coerceState(next);
     // Rewrite skill body files to exactly match the incoming set.
-    try { rmSync(skillsDir(), { recursive: true, force: true }); } catch { /* ignore */ }
+    try { rmSync(skillsDir(root), { recursive: true, force: true }); } catch { /* ignore */ }
     if (clean.builtinSkills) {
-      mkdirSync(skillsDir(), { recursive: true });
+      mkdirSync(skillsDir(root), { recursive: true });
       for (const [name, entry] of Object.entries(clean.builtinSkills)) {
         if (entry.body === undefined) continue;
         const body = skillBodies[name];
         if (typeof body === 'string') {
-          atomicWriteFileSync(skillOverridePath(name), body);
+          atomicWriteFileSync(skillOverridePath(root, name), body);
         } else {
           // Body marked present but no text supplied — drop the marker so state
           // never references a missing file.
@@ -514,7 +611,7 @@ export function replaceState(
       }
       if (clean.builtinSkills && !Object.keys(clean.builtinSkills).length) delete clean.builtinSkills;
     }
-    writeStateUnlocked(clean);
+    writeStateUnlocked(root, clean);
     return clean;
   });
 }

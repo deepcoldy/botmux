@@ -20,6 +20,9 @@ if (args[0] !== 'app-server') {
 const logPath = process.env.FAKE_CODEX_LOG;
 const pidPath = process.env.FAKE_CODEX_PID_PATH;
 const behavior = process.env.FAKE_CODEX_BEHAVIOR ?? 'success';
+const persistedNamePath = process.env.FAKE_CODEX_PERSISTED_NAME_PATH;
+const firstNameWriteFault = process.env.FAKE_CODEX_FIRST_NAME_WRITE_FAULT;
+const startReleasePath = process.env.FAKE_CODEX_START_RELEASE;
 const previewDelayReads = Number(process.env.FAKE_CODEX_PREVIEW_DELAY_READS ?? '0');
 const threadNotLoadedReads = Number(process.env.FAKE_CODEX_THREAD_NOT_LOADED_READS ?? '0');
 const updatedDelayReads = Number(process.env.FAKE_CODEX_UPDATED_DELAY_READS ?? '0');
@@ -71,7 +74,8 @@ let inputBuffer = '';
 let turnAttempt = 0;
 let threadReadAttempt = 0;
 let nameSetSeen = false;
-let currentThreadName;
+let nameWriteAttempt = 0;
+let currentThreadName = process.env.FAKE_CODEX_INITIAL_TITLE;
 let goalTurn = null;
 let reconciledTurn = null;
 let activeTurn;
@@ -206,7 +210,14 @@ function completeTurn(request) {
         { title: 'Which environment?', options: ['PPE (Recommended)', 'Production'] },
         { title: 'Which voice?', options: null },
       ] };
+    if (behavior === 'async-user-input-plain' || behavior === 'async-user-input-plain-null') {
+      item.id = 'call_async_notice';
+      item.text = 'Complete sign-in in your private terminal.';
+      if (behavior === 'async-user-input-plain-null') item.questions = null;
+      else delete item.questions;
+    }
     if (behavior === 'async-user-input-malformed') item.questions[0].options = [];
+    if (behavior === 'async-user-input-duplicate') item.phase = 'commentary';
     if (behavior === 'async-user-input-selected') item.questions[1].options = ['Elia', 'Other'];
     const notificationThread = behavior === 'async-user-input-foreign' ? 'foreign-thread' : threadId;
     if (behavior === 'async-user-input-corrected') notify('item/completed', { threadId, turnId,
@@ -219,7 +230,9 @@ function completeTurn(request) {
     if (behavior !== 'async-user-input-no-start') notify('item/started', { threadId: notificationThread, turnId, item });
     notify('item/agentMessage/delta', { threadId: notificationThread, turnId, itemId: item.id, delta: item.text });
     notify('item/completed', { threadId: notificationThread, turnId, item });
-    if (behavior === 'async-user-input-duplicate') notify('item/completed', { threadId, turnId, item });
+    if (behavior === 'async-user-input-duplicate' || behavior === 'async-user-input-plain') {
+      notify('item/completed', { threadId, turnId, item });
+    }
     if (behavior === 'async-user-input-limit') {
       for (let n = 1; n <= 32; n++) notify('item/completed', { threadId, turnId, item: { ...item, id: `call_limit_${n}` } });
     }
@@ -610,8 +623,19 @@ function handle(request) {
   }
   if (request.method === 'thread/name/set') {
     if (behavior === 'hang-name') return;
+    const fault = ++nameWriteAttempt === 1 ? firstNameWriteFault : undefined;
+    if (fault === 'reject') {
+      reject(request.id, -32000, 'temporary write failure');
+      return;
+    }
+    if (fault === 'false-ack') {
+      respond(request.id, {});
+      return;
+    }
     currentThreadName = request.params.name;
     nameSetSeen = true;
+    if (persistedNamePath) writeFileSync(persistedNamePath, currentThreadName);
+    if (fault === 'lose-ack') return;
     if (nameSetDelayMs > 0) setTimeout(() => respond(request.id, {}), nameSetDelayMs);
     else respond(request.id, {});
     return;
@@ -1039,7 +1063,16 @@ function handle(request) {
     });
     // Small delay before the response so the runner observes turn/started (and
     // can steer) strictly before the start response returns.
-    setTimeout(() => respond(request.id, { turn: { id: turnId } }), 120);
+    if (startReleasePath) {
+      const release = setInterval(() => {
+        if (!existsSync(startReleasePath)) return;
+        clearInterval(release);
+        respond(request.id, { turn: { id: turnId } });
+      }, 10);
+      release.unref();
+    } else {
+      setTimeout(() => respond(request.id, { turn: { id: turnId } }), 120);
+    }
     return;
   }
   if (behavior === 'completion-before-response-mismatch') {

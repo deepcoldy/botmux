@@ -28,7 +28,8 @@ import type {
   CreateAskInput,
   PendingAsk,
 } from './ask-types.js';
-import { AskDispatchError } from './ask-types.js';
+import { AskDispatchError, nativeGatewayExecutionEndedResult } from './ask-types.js';
+import type { NativeGatewayAnswerAction } from './native-gateway-contract.js';
 import { supportsAskCustomInput, parseAskCustomFields } from './ask-custom-input.js';
 import { askChoiceProblem, splitAskTexts } from './ask-choice.js';
 import { isHookPermissionAsk } from './ask-hook/types.js';
@@ -195,14 +196,79 @@ export function setCanTalkChecker(
   canTalkChecker = fn;
 }
 
+/** Who vouches for the person answering an ask, passed explicitly down every
+ *  answer path (never held in module state):
+ *   - `talk`: an IM card click or text reply. The bot's canTalk gate decides;
+ *     `actor` is only supplied by the text-reply path.
+ *   - `native_gateway`: a native gateway callback. The gateway has already applied
+ *     its own ACL, and nativeGatewayAskDecision has proved the answer targets an
+ *     ask of the exact live execution it is shown for, so only the ask's own
+ *     responder lock still applies. Only `answerNativeGatewayAsk` passes it. */
+type AnswerAuthority =
+  | { kind: 'talk'; actor?: AskAnswerActor }
+  | { kind: 'native_gateway' };
+
+const TALK_AUTHORITY: AnswerAuthority = { kind: 'talk' };
+
 /** A click is authorized iff the clicker may `canTalk` to the bot in this chat.
  *  `botmux ask` is a talk-level interaction (answering the agent's question),
  *  so it follows the canTalk gate — not the stricter canOperate / allowedUsers.
- *  `actor` is only supplied by the text-reply path; card clicks omit it. */
-function isAuthorizedToAnswer(ask: InternalPending, by: string, actor?: AskAnswerActor): boolean {
+ *  A native gateway answer skips canTalk (see AnswerAuthority) but never the
+ *  responder lock. */
+function isAuthorizedToAnswer(ask: InternalPending, by: string, authority: AnswerAuthority): boolean {
   if (ask.answererOpenId && ask.answererOpenId !== by) return false;
+  if (authority.kind === 'native_gateway') return true;
+  const actor = authority.actor;
   if (ask.deliveryTarget && (ask.deliveryTarget.openId !== by || actor?.botSender)) return false;
   return canTalkChecker?.(ask.larkAppId, ask.chatId, by, ask.deliveryTarget ? 'p2p' : ask.chatType, actor) ?? false;
+}
+
+/** A native gateway responder id is a concrete, opaque platform user id. */
+function isNativeGatewayResponder(by: string): boolean {
+  return by.length > 0 && by.length <= 256 && !/[\s\0]/.test(by);
+}
+
+/**
+ * Native gateway answer path. Callers (nativeGatewayAskDecision) must first prove
+ * the gateway's ACL and that the ask belongs to the exact live execution the
+ * gateway acts for. The broker still enforces the nonce, settlement and the
+ * ask's responder lock. Never used by Desktop or Lark.
+ */
+export function answerNativeGatewayAsk(input: {
+  askId: string;
+  nonce: string;
+  by: string;
+  action: NativeGatewayAnswerAction;
+  questionIndex?: number;
+  key?: string;
+  text?: string;
+  confirmEmpty?: boolean;
+}): AskClickOutcome {
+  if (!isNativeGatewayResponder(input.by)) return 'unauthorized';
+  const authority: AnswerAuthority = { kind: 'native_gateway' };
+  const { askId, nonce, by } = input;
+  if (input.action === 'toggle') {
+    return toggleAskWith({ askId, nonce, by, questionIndex: input.questionIndex ?? -1, key: input.key ?? '' }, authority);
+  }
+  if (input.action === 'submit') {
+    return submitAskWith({ askId, nonce, by, confirmEmpty: input.confirmEmpty }, authority);
+  }
+  const ask = pending.get(askId);
+  // A text answer carries no nonce of its own downstream; bind it to this ask
+  // instance here.
+  if (!ask || ask.nonce !== nonce) return 'stale';
+  const text = input.text ?? '';
+  if (hasAskForm(ask.questions)) {
+    let values: unknown;
+    try {
+      values = JSON.parse(text);
+    } catch {
+      return 'invalid_form';
+    }
+    return submitAskFormWith({ askId, nonce, by, values }, authority);
+  }
+  if (ask.questions.some(question => question.allowCustom === false)) return 'unauthorized';
+  return submitCustomReplyWith({ askId, by, text }, authority);
 }
 
 function invalidateClosedExplicitAsk(ask: InternalPending | undefined): void {
@@ -223,7 +289,8 @@ function expireAskAtDeadline(ask: InternalPending | undefined): void {
 
 function gateAskDecision(
   ask: InternalPending | undefined,
-  input: { nonce?: string; by: string; actor?: AskAnswerActor },
+  input: { nonce?: string; by: string },
+  authority: AnswerAuthority,
 ): Exclude<AskClickOutcome, 'accepted' | 'toggled' | 'needs_empty_confirm'> | 'ready' {
   invalidateClosedExplicitAsk(ask);
   expireAskAtDeadline(ask);
@@ -231,7 +298,7 @@ function gateAskDecision(
     exists: !!ask,
     nonceMatches: !!ask && (input.nonce === undefined || ask.nonce === input.nonce),
     settled: ask?.settled ?? false,
-    authorized: !!ask && isAuthorizedToAnswer(ask, input.by, input.actor),
+    authorized: !!ask && isAuthorizedToAnswer(ask, input.by, authority),
   });
   return gate === 'expired' ? 'stale' : gate;
 }
@@ -336,6 +403,12 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean, signal
       if (existing.dormant) {
         return reattachByRequest(existing, signal, input.cardRootMessageId);
       }
+    } else if (sameInvocationFromAnotherExecution(existing, input)) {
+      // The same native gateway invocation re-asked under a different execution
+      // (e.g. its worker generation changed while it was disconnected): the
+      // execution it asked from is over. Say so, rather than report tampering.
+      logger.info?.(`ask-broker: native gateway ask ${existing.askId} re-asked from another execution — ended (key=${askKey})`);
+      return Promise.resolve(nativeGatewayExecutionEndedResult());
     } else {
       // Same key, DIFFERENT immutable identity (crafted / stale-but-mutated
       // re-POST). FAIL CLOSED (codex P1-2): never fall through to a second ask —
@@ -379,6 +452,7 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean, signal
       deliveryTarget: input.deliveryTarget ? { ...input.deliveryTarget } : undefined,
       questions: input.questions,
       replyCardTarget: input.replyCardTarget,
+      ...(input.nativeGatewayOrigin ? { nativeGatewayOrigin: input.nativeGatewayOrigin } : {}),
       createdAt,
       deadlineAt,
       settled: false,
@@ -391,12 +465,14 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean, signal
     if (!hostManaged) armAskTimeout(ask, input.timeoutMs, createdAt);
     pending.set(askId, ask);
     attachWaiter(ask, resolve, signal);
-    // Persist ONLY resumable origins (codex P1-4). A restart before the card
-    // lands still leaves a resumable record; restore/re-attach re-sends.
-    if (resumable) {
+    // Persist ONLY durable asks: resumable origins (codex P1-4), never native
+    // gateway asks. A restart before the card lands still leaves a resumable record;
+    // restore/re-attach re-sends.
+    if (isDurable(ask)) {
       persistFromInternal(ask);
       logger.info?.(`ask-broker: registered + persisted ask ${askId} (key=${askKey}, session=${input.sessionId})`);
     }
+    if (ask.nativeGatewayOrigin) armNativeGatewayAskSweep();
     void sendCardForAsk(ask);
   });
 }
@@ -453,8 +529,16 @@ function sameIdentity(ask: InternalPending, input: CreateAskInput): boolean {
     (ask.timeoutMs === 0) === (input.timeoutMs === 0) &&
     ask.answererOpenId === input.answererOpenId &&
     JSON.stringify(ask.deliveryTarget) === JSON.stringify(input.deliveryTarget) &&
+    JSON.stringify(ask.nativeGatewayOrigin) === JSON.stringify(input.nativeGatewayOrigin) &&
     questionsShape(ask.questions) === questionsShape(input.questions)
   );
+}
+
+/** A native gateway ask and a re-registration that differ only in which execution
+ *  they were asked from. */
+function sameInvocationFromAnotherExecution(ask: InternalPending, input: CreateAskInput): boolean {
+  return !!ask.nativeGatewayOrigin && !!input.nativeGatewayOrigin
+    && sameIdentity(ask, { ...input, nativeGatewayOrigin: ask.nativeGatewayOrigin });
 }
 
 /** Stable shape string for question-set equality (prompt + multiSelect + each
@@ -529,8 +613,14 @@ function sendCardForAsk(ask: InternalPending): void {
         }
         return; // sent (or server-deduped to the original) — done
       } catch (err) {
-        const retryable = err instanceof AskDispatchError && err.retryable;
         const msg = err instanceof Error ? err.message : String(err);
+        if (err instanceof AskDispatchError && err.releasedBySettle) {
+          // The dispatcher released this send because the ask settled; nothing
+          // is waiting on this card, so it is not a delivery failure.
+          logger.debug(`ask-broker: ${ask.askId} card dispatch released after the ask settled: ${msg}`);
+          return;
+        }
+        const retryable = err instanceof AskDispatchError && err.retryable;
         if (retryable && attempt < CARD_DISPATCH_MAX_ATTEMPTS) {
           const backoff = Math.min(CARD_DISPATCH_BACKOFF_MS * attempt, CARD_DISPATCH_BACKOFF_CAP_MS);
           logger.warn?.(
@@ -642,10 +732,19 @@ function reattachByRequest(ask: InternalPending, signal?: AbortSignal, cardRootM
   });
 }
 
-/** Build the persisted projection from a live internal ask and write it. Only
- *  called for resumable asks. */
+/** Whether this ask may be written to the durable store. A native gateway ask never
+ *  is: it is bound to one live HTTP turn execution (turn + worker generation),
+ *  and neither survives a daemon restart, so a restored copy could never be
+ *  shown or answered again. It still reconnects in-process through the
+ *  in-memory dormant / re-attach path that `resumable` enables. */
+function isDurable(ask: InternalPending): boolean {
+  return ask.resumable && !ask.nativeGatewayOrigin;
+}
+
+/** Build the persisted projection from a live internal ask and write it. A
+ *  no-op unless the ask is durable. */
 function persistFromInternal(ask: InternalPending, strict = false): void {
-  if (!persistStore || !ask.resumable) return;
+  if (!persistStore || !isDurable(ask)) return;
   // A settled ask with a stashed answer is a durable handoff that must be KEPT
   // until claimed; a settled ask without one has nothing left to resume.
   if (ask.settled && !ask.answeredResult) return;
@@ -701,9 +800,16 @@ export function toggleAsk(args: {
   key: string;
   by: string;
 }): AskClickOutcome {
+  return toggleAskWith(args, TALK_AUTHORITY);
+}
+
+function toggleAskWith(
+  args: { askId: string; nonce: string; questionIndex: number; key: string; by: string },
+  authority: AnswerAuthority,
+): AskClickOutcome {
   gcSettled();
   const ask = pending.get(args.askId);
-  const gate = gateAskDecision(ask, { nonce: args.nonce, by: args.by });
+  const gate = gateAskDecision(ask, { nonce: args.nonce, by: args.by }, authority);
   if (gate !== 'ready') return gate;
   if (!ask || hasAskForm(ask.questions) || ask.customRevision !== undefined) return 'stale';
 
@@ -751,9 +857,22 @@ export function submitAsk(args: {
    *  这一种可确认的空提交；其它情形不看它。缺省 false。 */
   confirmEmpty?: boolean;
 }): AskClickOutcome {
+  return submitAskWith(args, TALK_AUTHORITY);
+}
+
+function submitAskWith(
+  args: {
+    askId: string;
+    nonce: string;
+    by: string;
+    selections?: ReadonlyArray<ReadonlyArray<string>>;
+    confirmEmpty?: boolean;
+  },
+  authority: AnswerAuthority,
+): AskClickOutcome {
   gcSettled();
   const ask = pending.get(args.askId);
-  const gate = gateAskDecision(ask, { nonce: args.nonce, by: args.by });
+  const gate = gateAskDecision(ask, { nonce: args.nonce, by: args.by }, authority);
   if (gate !== 'ready') return gate;
   if (!ask || hasAskForm(ask.questions) || ask.customRevision !== undefined) return 'stale';
 
@@ -813,9 +932,16 @@ export function submitAsk(args: {
 
 /** Atomic form submission shares identity, nonce, deadline and durable settlement. */
 export function submitAskForm(args: { askId: string; nonce: string; by: string; values: unknown }): AskClickOutcome {
+  return submitAskFormWith(args, TALK_AUTHORITY);
+}
+
+function submitAskFormWith(
+  args: { askId: string; nonce: string; by: string; values: unknown },
+  authority: AnswerAuthority,
+): AskClickOutcome {
   gcSettled();
   const ask = pending.get(args.askId);
-  const gate = gateAskDecision(ask, { nonce: args.nonce, by: args.by });
+  const gate = gateAskDecision(ask, { nonce: args.nonce, by: args.by }, authority);
   if (gate !== 'ready') return gate;
   if (!ask || !hasAskForm(ask.questions)) return 'stale';
   const values = parseAskFormValues(ask.questions, args.values);
@@ -834,7 +960,7 @@ export function applyAskForm(args: {
 }): AskClickOutcome {
   gcSettled();
   const ask = pending.get(args.askId);
-  const gate = gateAskDecision(ask, { nonce: args.nonce, by: args.by });
+  const gate = gateAskDecision(ask, { nonce: args.nonce, by: args.by }, TALK_AUTHORITY);
   if (gate !== 'ready') return gate;
   if (!ask || !supportsAskCustomInput(ask)) return 'stale';
   if (!Number.isSafeInteger(args.revision) || args.revision !== (ask.customRevision ?? 0)) return 'draft_conflict';
@@ -913,7 +1039,7 @@ export function submitAskChoices(args: {
 }): AskClickOutcome {
   gcSettled();
   const ask = pending.get(args.askId);
-  const gate = gateAskDecision(ask, { nonce: args.nonce, by: args.by });
+  const gate = gateAskDecision(ask, { nonce: args.nonce, by: args.by }, TALK_AUTHORITY);
   if (gate !== 'ready') return gate;
   if (!ask || hasAskForm(ask.questions) || args.selections.length !== ask.questions.length) return 'stale';
   for (const [i, q] of ask.questions.entries()) {
@@ -978,9 +1104,16 @@ export function submitCustomReply(args: {
   text: string;
   actor?: AskAnswerActor;
 }): AskClickOutcome {
+  return submitCustomReplyWith(args, { kind: 'talk', actor: args.actor });
+}
+
+function submitCustomReplyWith(
+  args: { askId: string; by: string; text: string; actor?: AskAnswerActor },
+  authority: AnswerAuthority,
+): AskClickOutcome {
   gcSettled();
   const ask = pending.get(args.askId);
-  const gate = gateAskDecision(ask, { by: args.by, actor: args.actor });
+  const gate = gateAskDecision(ask, { by: args.by }, authority);
   if (gate !== 'ready') return gate;
   if (!ask || isUnclaimedHookAsk(ask)) return 'stale';
   const text = args.text.trim();
@@ -1061,7 +1194,7 @@ export function listPendingHostChoicesByAnchor(args: AskMessageAnchor & {
     expireAskAtDeadline(ask);
     if (!hostChoiceFallbackMatches(ask, args) || isUnclaimedHookAsk(ask)) continue;
     if (args.sessionId !== undefined && ask.sessionId !== args.sessionId) continue;
-    if (!isAuthorizedToAnswer(ask, args.by, args.actor)) continue;
+    if (!isAuthorizedToAnswer(ask, args.by, { kind: 'talk', actor: args.actor })) continue;
     matches.push(snapshot(ask));
   }
   return matches;
@@ -1212,6 +1345,101 @@ export function invalidateReplyCardAsks(target: { larkAppId: string; sessionId: 
       settle(ask.askId, { kind: 'invalidated', reason, selected: null, by: null, comment: null, timedOut: false });
     }
   }
+}
+
+/** How often pending native gateway asks are re-checked against their execution. */
+const NATIVE_GATEWAY_ASK_SWEEP_MS = 2_000;
+
+let nativeGatewayAskIsLive: ((ask: PendingAsk) => boolean) | null = null;
+let nativeGatewayAskSweepHandle: NodeJS.Timeout | undefined;
+
+/**
+ * Wire the native gateway core's liveness test for its asks (daemon
+ * bootstrap). While native gateway asks are pending the broker re-checks each one;
+ * an ask whose exact execution is no longer live on two consecutive checks —
+ * its turn finished, its worker generation was replaced, its dispatch attempt
+ * was superseded, or its session closed — is invalidated, so the CLI blocked
+ * on it gets a terminal result instead of waiting for a card the gateway can
+ * no longer show. Without a checker, native gateway asks are not swept.
+ */
+export function setNativeGatewayAskLivenessChecker(checker: ((ask: PendingAsk) => boolean) | null): void {
+  nativeGatewayAskIsLive = checker;
+  if (checker) armNativeGatewayAskSweep();
+  else stopNativeGatewayAskSweep();
+}
+
+function hasPendingNativeGatewayAsk(): boolean {
+  for (const ask of pending.values()) {
+    if (ask.nativeGatewayOrigin && !ask.settled) return true;
+  }
+  return false;
+}
+
+function armNativeGatewayAskSweep(): void {
+  if (nativeGatewayAskSweepHandle || !nativeGatewayAskIsLive || !hasPendingNativeGatewayAsk()) return;
+  nativeGatewayAskSweepHandle = setInterval(sweepNativeGatewayAsks, NATIVE_GATEWAY_ASK_SWEEP_MS);
+  nativeGatewayAskSweepHandle.unref?.();
+}
+
+function stopNativeGatewayAskSweep(): void {
+  clearInterval(nativeGatewayAskSweepHandle);
+  nativeGatewayAskSweepHandle = undefined;
+}
+
+/** Native gateway asks whose liveness check has thrown; each is logged once. */
+const nativeGatewayLivenessFailures = new Set<string>();
+/** Native gateway asks found not live by the previous sweep. */
+const nativeGatewayAskNotLiveOnce = new Set<string>();
+
+/**
+ * An ask ends only when two consecutive sweeps find its execution not live: a
+ * same-turn managed-origin revoke followed by its republication (the worker's
+ * provisional release) can hide a live execution for an instant. A check that
+ * cannot decide keeps the ask: only a proven-ended execution ends it.
+ */
+function nativeGatewayAskExecutionEnded(ask: InternalPending, isLive: (ask: PendingAsk) => boolean): boolean {
+  try {
+    const live = isLive(snapshot(ask));
+    nativeGatewayLivenessFailures.delete(ask.askId);
+    if (live) {
+      nativeGatewayAskNotLiveOnce.delete(ask.askId);
+      return false;
+    }
+    if (nativeGatewayAskNotLiveOnce.has(ask.askId)) return true;
+    nativeGatewayAskNotLiveOnce.add(ask.askId);
+    return false;
+  } catch (err) {
+    if (!nativeGatewayLivenessFailures.has(ask.askId)) {
+      nativeGatewayLivenessFailures.add(ask.askId);
+      logger.warn?.(
+        `ask-broker: liveness check for native gateway ask ${ask.askId} failed; keeping it: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    return false;
+  }
+}
+
+function sweepNativeGatewayAsks(): void {
+  const isLive = nativeGatewayAskIsLive;
+  if (!isLive) {
+    stopNativeGatewayAskSweep();
+    return;
+  }
+  const ended = [...pending.values()]
+    .filter(ask => ask.nativeGatewayOrigin && !ask.settled && nativeGatewayAskExecutionEnded(ask, isLive));
+  for (const tracked of [nativeGatewayLivenessFailures, nativeGatewayAskNotLiveOnce]) {
+    for (const askId of tracked) {
+      const ask = pending.get(askId);
+      if (!ask || ask.settled || ended.includes(ask)) tracked.delete(askId);
+    }
+  }
+  for (const ask of ended) {
+    logger.info?.(
+      `ask-broker: native gateway ask ${ask.askId} invalidated — its turn execution is no longer live (session=${ask.sessionId})`,
+    );
+    settle(ask.askId, nativeGatewayExecutionEndedResult());
+  }
+  if (!hasPendingNativeGatewayAsk()) stopNativeGatewayAskSweep();
 }
 
 /** Invalidate every pending ask. Intended for daemon shutdown / restart paths
@@ -1559,6 +1787,20 @@ export function invalidateExplicitAsk(input: CreateAskInput, reason: string): vo
   }
 }
 
+/** Invalidate an active host-managed ask by its exact scoped identity (e.g., when
+ *  the turn it belongs to finishes on its own or is superseded by new input). */
+export function invalidateHostAsk(
+  target: { larkAppId: string; sessionId: string; originKind: string; requestId: string },
+  reason: string,
+): boolean {
+  if (!target.originKind.startsWith('host_')) return false;
+  const key = askKeyFor(target.larkAppId, target.sessionId, target.originKind, target.requestId);
+  const ask = findByKey(key);
+  if (!ask || ask.settled || ask.originKind !== target.originKind) return false;
+  settle(ask.askId, { kind: 'invalidated', reason, selected: null, by: null, comment: null, timedOut: false });
+  return true;
+}
+
 export function explicitAskSnapshot(input: CreateAskInput): PendingAsk | undefined {
   const key = askKeyFor(input.larkAppId, input.sessionId, 'host_explicit', input.requestId!);
   const ask = findByKey(key);
@@ -1777,6 +2019,10 @@ export function _resetForTest(): void {
   dispatcher = null;
   canTalkChecker = null;
   explicitAskSessionChecker = null;
+  nativeGatewayAskIsLive = null;
+  nativeGatewayLivenessFailures.clear();
+  nativeGatewayAskNotLiveOnce.clear();
+  stopNativeGatewayAskSweep();
   handoffRetentionMs = HANDOFF_RETENTION_MS; // restore default retention
   hookReclaimGraceMs = HOOK_RECLAIM_GRACE_MS;
   reclaimClockStarted = false;

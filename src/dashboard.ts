@@ -1,3 +1,4 @@
+import { WecomDashboard } from './dashboard/wecom/index.js';
 import { selectSessionPage } from './dashboard/session-pagination.js';
 import { createSessionContentSearch } from './dashboard/session-content-search.js';
 import { TopicIndexError } from './services/topic-search/query.js';
@@ -38,7 +39,9 @@ import {
   writeTeamRoleFile,
   writeTeamRoleInjectMode,
 } from './core/role-resolver.js';
-import { readBotsJsonOrEmpty } from './setup/bots-store.js';
+import { readBotsJsonOrEmpty, readConfiguredBotCount } from './setup/bots-store.js';
+import { resolveBotsConfigFile } from './core/config-dir.js';
+import { findInvalidAllowedUserEntries, hasOwnerEntry, isMobileEntry } from './setup/bot-config-editor.js';
 import { listenWithProbe, LISTEN_RELEASE_WEDGED_CODE, type VerifyBoundResult } from './utils/listen-with-probe.js';
 import {
   parseCookie, buildSetCookie, verifyHmac, cliAuthBind,
@@ -157,7 +160,12 @@ import { normalizeBotsInfoRouteEntries } from './services/bots-info-shape.js';
 import { createBotDisplayNameLookup, readPersistedBotNameMap } from './services/bot-display-name.js';
 import { handleFederationSpokeApi, syncAllMemberships, autoBindOwnerIfUnambiguous, type TeamSessionRowLike } from './dashboard/federation-spoke-api.js';
 import type { TeamGroupCreateResult, TeamGroupOwnerTransferResult } from './dashboard/federated-group-core.js';
-import { BotOnboardingManager } from './dashboard/bot-onboarding.js';
+import {
+  assertBotsJsonValidOrAbsent,
+  BotOnboardingManager,
+  isValidManualAppSecret,
+  MANUAL_FEISHU_APP_ID_RE,
+} from './dashboard/bot-onboarding.js';
 import { FeishuLoginManager } from './dashboard/feishu-login.js';
 import {
   createDashboardH5AuthController,
@@ -331,7 +339,8 @@ import { listProjectGroups, type ProjectGroupState } from './services/project-gr
 import { resolveProjectProgressCardConfig } from './services/project-progress-card-config.js';
 import { listTeamReports, readTeamBoard, setTeamBoardEntry } from './services/team-board-store.js';
 import type { CliId } from './adapters/cli/types.js';
-import { ALL_CLI_IDS, CLI_ALIASES, createCliAdapterSync, rawCliExecutable, resolveCommandReal } from './adapters/cli/registry.js';
+import { ALL_CLI_IDS, CLI_ALIASES, cliAdapterHasReliableTurnTerminal, createCliAdapterSync, rawCliExecutable, resolveCommandReal } from './adapters/cli/registry.js';
+import { resolveSessionEnv } from './core/session-env-resolve.js';
 import { createDashboardExecutableResolver, resolveDashboardRuntimeUpdateTargets } from './dashboard/cli-executable-resolver.js';
 import type { ConnectorDefinition } from './services/connector-store.js';
 import {
@@ -479,7 +488,7 @@ const dashboardAutostart = createDashboardAutostartController({
 /** Per-daemon budget for the cross-daemon insight overview fan-out — bounds
  *  aggregate latency when one daemon's insight parse is slow or hung. */
 const INSIGHT_FANOUT_TIMEOUT_MS = 10_000;
-const BOTS_JSON_PATH = join(homedir(), '.botmux', 'bots.json');
+const BOTS_JSON_PATH = resolveBotsConfigFile();
 const queryDashboardUsage = createUsageAnalytics();
 const REGISTRY_DIR = join(resolveBotmuxDataDir(), 'dashboard-daemons');
 // The dashboard probes upward if its configured port is busy (e.g. a second
@@ -567,6 +576,13 @@ try {
 } catch (error) {
   logger.warn(`[dashboard] Failed to sweep expired plugin results: ${(error as Error).message}`);
 }
+const wecom = new WecomDashboard({
+  secret: SECRET,
+  audit: dashboardControlAudit,
+  resolveActor: dashboardRequestIdentity,
+  isAuthSessionLive: terminalAuthSessionLive,
+  dashboardPort: () => boundDashboardPort,
+});
 const terminalControl = new TerminalControlManager({
   secret: SECRET,
   audit: dashboardControlAudit,
@@ -650,6 +666,7 @@ const controlCsrfTokens = new ControlCsrfTokens();
  */
 function endDashboardAuthSession(authSessionId: string): void {
   terminalControl.releaseByAuthSession(authSessionId);
+  wecom.releaseAuthSession(authSessionId);
   previewInteraction.relockAuthSession(authSessionId);
   authSessionConnections.closeAuthSession(authSessionId);
   controlCsrfTokens.revokeAuthSession(authSessionId);
@@ -1600,6 +1617,19 @@ function dashboardBotNameLookup(configs?: readonly BotConfig[]): (larkAppId: str
   });
 }
 
+/**
+ * Whether this host has a Feishu fleet: bots.json lists at least one bot. A
+ * missing registry (a WeCom-only host) counts as no fleet; an unreadable or
+ * malformed one counts as a fleet, so provider fallbacks stay off when unsure.
+ */
+function fleetBotsConfigured(): boolean {
+  try {
+    return loadBotConfigsCached().length > 0;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException | undefined)?.code !== 'ENOENT';
+  }
+}
+
 /** Workflow run view names (online and offline bots alike). */
 function v3RunBotNameResolver(): (larkAppId: string) => string | undefined {
   return dashboardBotNameLookup();
@@ -1622,10 +1652,17 @@ function vcMeetingConsumerProfilesApiDeps(): VcMeetingConsumerProfilesApiDeps {
     effectiveDefaultWorkingDir,
     onlineBotName: appId => nameOf(appId),
     isOnline: appId => !!registry.getByAppId(appId),
-    adapterReliableTurnTerminal: (cliId, cliPathOverride) => {
-      if (!cliId) return false;
+    adapterReliableTurnTerminal: bot => {
+      if (!bot.cliId) return false;
       try {
-        return createCliAdapterSync(cliId as CliId, cliPathOverride).reliableTurnTerminal === true;
+        const backendType = resolvePairedSpawnBackendType(
+          bot.cliId,
+          undefined,
+          bot.backendType,
+          config.daemon.backendType,
+        );
+        const sessionEnv = resolveSessionEnv({ bot, backendType }).env;
+        return cliAdapterHasReliableTurnTerminal(bot.cliId, bot.cliPathOverride, sessionEnv);
       } catch {
         return false;
       }
@@ -3267,7 +3304,7 @@ async function handlePluginManagementApi(
 
 const pluginMarket = createHostPluginMarket(id => {
   if (readGlobalConfig().plugins?.includes(id)) return true;
-  return loadBotConfigs().some(bot => bot.plugins?.includes(id));
+  return loadBotConfigsAllowMissingDefault().some(bot => bot.plugins?.includes(id));
 });
 
 function pluginProxyForbiddenPorts(): Set<number> {
@@ -3547,6 +3584,8 @@ async function configuredBotDefaultsRecoveryRows(
         }, {
           displayName: bot.displayName ?? null,
           larkBotName: persistedNames.get(bot.larkAppId) ?? null,
+          commandTriggersConfigured: Boolean(bot.commandTriggers?.commands.length),
+          blockedUsersConfigured: Boolean(bot.blockedUsers?.length),
           // 离线行也要带上磁盘里的保存值（如竖放排版、默认关的 larkToolBinding），
           // 否则 daemon 不在线时 Dashboard 会把已保存的非默认态显示回默认态。
           ...sparseOverridesFromRawBotConfig(rawEntry),
@@ -4066,6 +4105,29 @@ function dashboardSkillsPayload(): Record<string, unknown> {
 
 // --- Skill pack dashboard helpers ------------------------------------------
 
+function parseOwnerEntries(raw: string): string[] {
+  const entries: string[] = [];
+  for (const segment of raw.split(/[,，;；\r\n]+/)) {
+    const trimmed = segment.trim();
+    if (!trimmed) continue;
+    // Preserve space-formatted international mobile numbers like "+86 130-1111-2222"
+    // while still splitting whitespace-separated non-mobile lists like "ou_a ou_b".
+    if (isMobileEntry(trimmed)) {
+      entries.push(trimmed);
+    } else {
+      for (const token of trimmed.split(/\s+/)) {
+        if (token) entries.push(token);
+      }
+    }
+  }
+  return entries;
+}
+
+function loadBotConfigsAllowMissingDefault(): BotConfig[] {
+  if (!process.env.BOTS_CONFIG && !existsSync(BOTS_JSON_PATH)) return [];
+  return loadBotConfigs();
+}
+
 function loadBotConfigsSafe(): BotConfig[] {
   try { return loadBotConfigs(); } catch { return []; }
 }
@@ -4254,7 +4316,7 @@ function terminalControlAvailability(sessionId: string):
  */
 async function liveDashboardSummary(): Promise<ReturnType<typeof buildDashboardSummary>> {
   const daemons = registry.list();
-  const configuredBots = loadBotConfigs();
+  const configuredBots = loadBotConfigsAllowMissingDefault();
   const snapshots = await Promise.all(daemons.map(async daemon => {
     const [sessionsResponse, schedulesResponse] = await Promise.all([
       fetchDaemonIpc(daemon.ipcPort, '/api/sessions', {
@@ -4486,6 +4548,7 @@ const server = createServer(async (req, res) => {
     // sessions and countersigned for the worker, which refuses one that arrived
     // any other way. That is why the view-link API hands out a same-origin path
     // instead of the daemon/worker origin — this is the only door.
+    if (await wecom.terminalHttp(req, res, url)) return;
     if (terminalFrontProxy.handleHttp(req, res, url)) return;
 
     if (await pluginWebhookRoutes.handle(req, res, url)) {
@@ -4818,6 +4881,11 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    if (await wecom.handleSessionApi(req, res, url, {
+      hostAdmin: legacyAuthed && requestIdentity?.kind === 'legacy-dashboard',
+      csrfValid: () => Boolean(requestIdentity && enforceControlCsrf(req, res, requestIdentity)),
+      readBody: async () => await readJsonBody(req) as Record<string, unknown>,
+    })) return;
     // Server-authoritative terminal control lease. The API returns only mode
     // and timestamps; its signed read/write grant stays inside the central
     // proxy and is never placed in a URL or response body.
@@ -4894,6 +4962,30 @@ const server = createServer(async (req, res) => {
 
     if (url.pathname.startsWith('/api/feedback/analytics/')) {
       await handleFeedbackAnalyticsApi(req, res, url, { service: (await getFeedbackStorage(config.session.dataDir)).analytics });
+      return;
+    }
+    // WeCom onboarding jobs share the `/api/bot-onboarding/` prefix but live in
+    // their own `wecom-` namespace (`wecom-jobs`, `wecom-<uuid>[/action]`;
+    // Feishu job ids are `bot_*` / `botperm_*`). Only that namespace requires
+    // an identified manager plus the control CSRF token. Feishu onboarding
+    // routes keep the original gate (global auth + sessionWriteOriginAllowed):
+    // SPA tabs opened before an upgrade and the permission-recovery helpers do
+    // not send `x-botmux-csrf`. WeCom `start` is a body-selected platform on
+    // the shared route; its own branch below enforces the same CSRF check.
+    if (wecom.isOnboardingPath(url.pathname)) {
+      if (!authed || !requestIdentity) return jsonRes(res, 403, { error: 'onboarding_management_required' });
+      if (!enforceControlCsrf(req, res, requestIdentity)) return;
+      const handled = await wecom.handleOnboardingApi(req, res, url, {
+        actor: requestIdentity,
+        hostAdmin: legacyAuthed && requestIdentity.kind === 'legacy-dashboard',
+        csrfValid: () => true,
+      });
+      if (handled) return;
+    }
+    if (url.pathname.startsWith('/api/wecom/')) {
+      const hostAdmin = legacyAuthed && requestIdentity?.kind === 'legacy-dashboard';
+      if (hostAdmin && req.method !== 'GET' && !enforceControlCsrf(req, res, requestIdentity!)) return;
+      await wecom.handleConnectionsApi(req, res, url, { hostAdmin, csrfValid: hostAdmin, readBody: async () => await readJsonBody(req) as Record<string, unknown> });
       return;
     }
     if (url.pathname.startsWith('/api/feedback/storage')) {
@@ -5105,34 +5197,39 @@ const server = createServer(async (req, res) => {
       const nameOf = dashboardBotNameLookup();
       groupsMatrixSnapshot.warm();
       const groupPresentation = groupsMatrixSnapshot.peekPresentation();
-      let page: ReturnType<typeof selectSessionPage<ReturnType<typeof aggregator.getSessions>[number]>>;
+      // Private providers enter the list only after host-admin authentication,
+      // before sorting, search and pagination (including totals/cursors).
+      const hostAdmin = legacyAuthed && requestIdentity?.kind === 'legacy-dashboard';
+      // The board tells the host admin whether WeCom connections exist, so the browser only
+      // asks /api/wecom/* when there is something to show. Without connections there are no
+      // WeCom sessions to read and both provider fields are omitted: a Feishu-only deployment
+      // gets exactly the pre-WeCom body.
+      const wecomConnections = hostAdmin ? wecom.connectionCount() : 0;
+      const privateSnapshot = wecomConnections > 0 ? await wecom.sessionSnapshot() : { sessions: [], complete: false };
+      const merged = wecom.mergeSessionSnapshot<Record<string, unknown> & { sessionId: string }>(aggregator.getSessions(), hostAdmin, privateSnapshot);
+      const providerFields = {
+        ...(merged.wecomSessionIds ? { wecomSessionIds: merged.wecomSessionIds } : {}),
+        ...(wecomConnections > 0 ? { wecomConnectionCount: wecomConnections } : {}),
+      };
+      const rows=merged.sessions;
+      let page: ReturnType<typeof selectSessionPage<(typeof rows)[number]>>;
       try {
-        const rows = aggregator.getSessions();
-        page = selectSessionPage(rows, url.searchParams, {
-          // ⌘K / Workbench search also matches the names the browser displays
-          // beside a row: the current bot name and the group name.
-          searchText: row => [
-            row.larkAppId ? nameOf(row.larkAppId) : undefined,
-            typeof row.chatId === 'string' ? groupPresentation.get(row.chatId)?.name : undefined,
-          ],
-        });
+        page = selectSessionPage(rows, url.searchParams, {searchText: row => [
+          typeof row.larkAppId === 'string' ? nameOf(row.larkAppId) : undefined,
+          typeof row.chatId === 'string' ? groupPresentation.get(row.chatId)?.name : undefined,
+        ]});
         if (url.searchParams.get('view') === 'content') {
           page = await sessionContentSearch(url.searchParams.get('q') ?? '', sessionBoardAudience, rows);
         }
-      }
-      catch (error) {
-        return jsonRes(res, 400, { ok: false, error: error instanceof Error ? error.message : 'invalid_session_page' });
-      }
-      const sessions = enrichSessionsWithGroupNames(page.sessions.map(s => {
-        const n = s.larkAppId ? nameOf(s.larkAppId) : undefined;
-        return n && n !== s.botName ? { ...s, botName: n } : s;
-      }), groupPresentation);
-      const browserSessions = projectSessionPreviewsForBrowser(sessions);
-      lazyTopicLinkBackfill.trigger(browserSessions);
-      return jsonRes(res, 200, {
-        ...page,
-        sessions: projectSessionsForAudience(browserSessions, sessionBoardAudience),
-      });
+      } catch (error) { return jsonRes(res, 400, {ok:false,error:error instanceof Error ? error.message : 'invalid_session_page'}); }
+      const larkRows = page.sessions.filter(row=>row.provider!=='wecom') as ReturnType<typeof aggregator.getSessions>;
+      const enriched = enrichSessionsWithGroupNames(larkRows.map(row=>{
+        const name=row.larkAppId?nameOf(row.larkAppId):undefined;return name&&name!==row.botName?{...row,botName:name}:row;
+      }),groupPresentation);
+      const browserLark = projectSessionPreviewsForBrowser(enriched);
+      lazyTopicLinkBackfill.trigger(browserLark);
+      const projected = new Map((projectSessionsForAudience(browserLark,sessionBoardAudience) as Array<Record<string,unknown>&{sessionId:string}>).map(row=>[row.sessionId,row]));
+      return jsonRes(res,200,{...page,...providerFields,sessions:page.sessions.flatMap(row=>row.provider==='wecom'?[row]:projected.has(row.sessionId)?[projected.get(row.sessionId)!]:[])});
     }
 
     // Desktop / operator UI: aggregate pending ask-hooks across daemons.
@@ -5284,6 +5381,7 @@ const server = createServer(async (req, res) => {
         // 那里进来的机器主人和协管者都解析成 legacy 身份，能看到。
         hostTerminal: legacyAuthed,
         bound: readPlatformBinding() !== null,
+        ...(authed ? { configuredBotCount: readConfiguredBotCount(BOTS_JSON_PATH) } : {}),
       });
     }
     if (req.method === 'PUT' && url.pathname === '/api/settings') {
@@ -5383,7 +5481,7 @@ const server = createServer(async (req, res) => {
       const latest = latestResult.value;
       let configuredUpdateTargets: ReturnType<typeof selectCodexRuntimeUpdateTargets> = [];
       try {
-        configuredUpdateTargets = await resolveDashboardRuntimeUpdateTargets(loadBotConfigs());
+        configuredUpdateTargets = await resolveDashboardRuntimeUpdateTargets(loadBotConfigsAllowMissingDefault());
       } catch {
         // Config unreadable or an adapter unavailable: fail closed and hide
         // persisted badges whose continued relevance cannot be established.
@@ -6382,7 +6480,13 @@ const server = createServer(async (req, res) => {
     // ─── Customization center (built-in prompt/skill overrides) ──────────────
     // GET is a public read (overview only, no secrets); all mutations are
     // owner-gated (not on PUBLIC_READ_PATHS → decideDashboardAuth 401s guests).
-    if (await handleCustomizationApi(req, res, url)) {
+    // `?scope=wecom` is a WeCom surface: host admin only, writes CSRF-checked —
+    // the same test the `/api/wecom/*` routes apply above. The Feishu scope
+    // never consults it.
+    if (await handleCustomizationApi(req, res, url, {
+      wecomHostAdmin: legacyAuthed && requestIdentity?.kind === 'legacy-dashboard',
+      wecomCsrfValid: () => Boolean(requestIdentity && enforceControlCsrf(req, res, requestIdentity)),
+    })) {
       return;
     }
 
@@ -6505,6 +6609,7 @@ const server = createServer(async (req, res) => {
         // ttadk 模型默认值 + 候选 (单一事实源在 cli-selection), 供前端模型框使用.
         ttadkModelDefault: TTADK_DEFAULT_MODEL,
         ttadkModelSuggestions: TTADK_MODEL_SUGGESTIONS,
+        canCreateWecomBot: legacyAuthed && requestIdentity?.kind === 'legacy-dashboard',
         suggestedAppName: botOnboarding.suggestedAppName(),
         // 未探测时整个字段缺席 (而不是 webSession: undefined)——JSON 里两者都不
         // 出现, 但显式写清意图: 调用方拿不到就该自己带 ?probe=session 再要一次,
@@ -6525,7 +6630,8 @@ const server = createServer(async (req, res) => {
       } catch {
         botConfig = undefined;
       }
-      const response = await cliAvailabilityResponse(key, botConfig, process.env);
+      const refresh = url.searchParams.get('refresh') === '1';
+      const response = await cliAvailabilityResponse(key, botConfig, process.env, undefined, undefined, { refresh });
       return jsonRes(res, response.statusCode, response.body);
     }
 
@@ -6552,9 +6658,13 @@ const server = createServer(async (req, res) => {
       const body = await buildModelChoicesResponse(key, {
         runtimeContext: probeContext.runtimeContext,
         probeEnv: probeContext.probeEnv,
+        probeSettingsEnv: probeContext.probeSettingsEnv,
         runtimeExecutable: probeContext.runtimeExecutable,
         resolveExecutable,
         supportsModelDiscovery: requestedCliId => {
+          // A Bot whose persisted launch shape doesn't match the request (for
+          // example an unknown wrapper) must not borrow the host's catalogue.
+          if (!probeContext.canProbe) return false;
           // Capability fields are static for a CLI. An absolute placeholder
           // keeps even eager constructors (for example pi) from resolving the
           // real command before this preflight has proved discovery is needed.
@@ -6563,14 +6673,20 @@ const server = createServer(async (req, res) => {
         },
         adapterFactory: async (requestedCliId, pathOverride) => {
           const command = pathOverride ?? rawCliExecutable(requestedCliId);
-          return createCliAdapterSync(requestedCliId, command ? await resolveExecutable(command) : undefined);
+          return createCliAdapterSync(
+            requestedCliId,
+            command ? await resolveExecutable(command) : undefined,
+            { configDir: probeContext.configDir },
+          );
         },
       });
       return jsonRes(res, 200, body);
     }
 
     if (req.method === 'POST' && url.pathname === '/api/bot-onboarding/start') {
+      const MAX_ONBOARDING_BODY_BYTES = 64 * 1024;
       let parsed: {
+        platform?: unknown;
         appName?: unknown;
         cloneSourceAppId?: unknown;
         registrationMode?: unknown;
@@ -6582,14 +6698,52 @@ const server = createServer(async (req, res) => {
         model?: unknown;
         autoAvoidApproval?: unknown;
         requireCriticalScopesBeforeActivation?: unknown;
+        brand?: unknown;
+        appId?: unknown;
+        appSecret?: unknown;
+        owner?: unknown;
+        allowedUsers?: unknown;
       };
       try {
         const chunks: Buffer[] = [];
-        for await (const c of req) chunks.push(c as Buffer);
+        let totalBytes = 0;
+        for await (const c of req) {
+          const buf = Buffer.isBuffer(c) ? c : Buffer.from(c);
+          totalBytes += buf.length;
+          if (totalBytes > MAX_ONBOARDING_BODY_BYTES) {
+            return jsonRes(res, 413, { ok: false, error: 'payload_too_large', message: '请求体过大。' });
+          }
+          chunks.push(buf);
+        }
         const raw = Buffer.concat(chunks).toString('utf8');
         parsed = raw ? JSON.parse(raw) : {};
       } catch {
         return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      if (parsed.platform === 'wecom') {
+        if (!legacyAuthed || requestIdentity?.kind !== 'legacy-dashboard') return jsonRes(res, 403, { ok: false, error: 'wecom_host_admin_required' });
+        // Same CSRF requirement as the `wecom-` job routes above; the Feishu
+        // branch of this shared route keeps its original gate.
+        if (!enforceControlCsrf(req, res, requestIdentity)) return;
+        try {
+          const job = await wecom.startOnboarding(parsed as Record<string, unknown>, requestIdentity);
+          return jsonRes(res, 202, { job });
+        } catch (error) {
+          const code = error instanceof Error && /^wecom_[a-z_]+$/.test(error.message) ? error.message : 'wecom_invalid_onboarding';
+          return jsonRes(res, 400, { ok: false, error: code });
+        }
+      }
+      if (parsed.platform !== undefined && parsed.platform !== 'lark' && parsed.platform !== 'feishu') {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_platform' });
+      }
+      try {
+        assertBotsJsonValidOrAbsent(BOTS_JSON_PATH);
+      } catch (err: any) {
+        return jsonRes(res, 400, {
+          ok: false,
+          error: 'invalid_bots_json',
+          message: `现有 bots.json 格式损坏或不可读，已拒绝写入以保护原有配置：${err?.message ?? String(err)}`,
+        });
       }
       // CLI: 把下拉传来的选择键 (普通 cliId 或 aiden-x-claude/codex) 解析成
       // { cliId, wrapperCli }——空 → 默认 claude-code; 非法键 → 400.
@@ -6636,17 +6790,77 @@ const server = createServer(async (req, res) => {
         return jsonRes(res, 400, { ok: false, error: 'invalid_app_name', message: '应用名称不能超过 64 个字符' });
       }
       const registrationModeRaw = typeof parsed.registrationMode === 'string' ? parsed.registrationMode.trim() : '';
-      if (registrationModeRaw && registrationModeRaw !== 'sdk' && registrationModeRaw !== 'web' && registrationModeRaw !== 'compat' && registrationModeRaw !== 'local') {
-        return jsonRes(res, 400, { ok: false, error: 'invalid_registration_mode', message: 'registrationMode 必须是 sdk、web、compat 或 local' });
+      if (
+        registrationModeRaw
+        && registrationModeRaw !== 'sdk'
+        && registrationModeRaw !== 'web'
+        && registrationModeRaw !== 'compat'
+        && registrationModeRaw !== 'local'
+        && registrationModeRaw !== 'manual'
+      ) {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_registration_mode', message: 'registrationMode 必须是 sdk、web、compat、local 或 manual' });
       }
       // 缺省走网页会话流程（内置表单同样走网页流程）；sdk 只在调用方显式传入时使用。
-      const registrationMode = registrationModeRaw === 'sdk' || registrationModeRaw === 'compat' || registrationModeRaw === 'local'
+      const registrationMode = registrationModeRaw === 'sdk'
+        || registrationModeRaw === 'compat'
+        || registrationModeRaw === 'local'
+        || registrationModeRaw === 'manual'
         ? registrationModeRaw : 'web';
       if (registrationMode === 'local' && typeof parsed.cloneSourceAppId === 'string' && parsed.cloneSourceAppId.trim()) {
         return jsonRes(res, 400, { ok: false, error: 'local_clone_unsupported', message: '本地模式不克隆飞书机器人。' });
       }
       if (registrationMode === 'local' && parsed.requireCriticalScopesBeforeActivation === true) {
         return jsonRes(res, 400, { ok: false, error: 'local_scope_gate_unsupported', message: '本地机器人没有飞书权限可校验。' });
+      }
+      if (registrationMode === 'manual' && typeof parsed.cloneSourceAppId === 'string' && parsed.cloneSourceAppId.trim()) {
+        return jsonRes(res, 400, { ok: false, error: 'manual_clone_unsupported', message: '手动填入已有应用凭证不支持克隆其他机器人配置。' });
+      }
+      if (registrationMode === 'manual' && parsed.requireCriticalScopesBeforeActivation === true) {
+        return jsonRes(res, 400, { ok: false, error: 'manual_scope_gate_unsupported', message: '手动模式不走开放平台自动权限激活。' });
+      }
+      let manualParams: { brand: 'feishu' | 'lark'; appId: string; appSecret: string; allowedUsers: string[] } | undefined;
+      if (registrationMode === 'manual') {
+        const brandRaw = typeof parsed.brand === 'string' ? parsed.brand.trim().toLowerCase() : '';
+        if (brandRaw && brandRaw !== 'feishu' && brandRaw !== 'lark') {
+          return jsonRes(res, 400, { ok: false, error: 'invalid_brand', message: 'brand 必须是 feishu 或 lark' });
+        }
+        const brand = brandRaw === 'lark' ? 'lark' as const : 'feishu' as const;
+        const appId = typeof parsed.appId === 'string' ? parsed.appId.trim() : '';
+        if (!MANUAL_FEISHU_APP_ID_RE.test(appId)) {
+          return jsonRes(res, 400, { ok: false, error: 'invalid_app_id', message: 'App ID 格式无效，请填写飞书/Lark 开放平台提供的 cli_ 开头 App ID。' });
+        }
+        if (!isValidManualAppSecret(parsed.appSecret)) {
+          return jsonRes(res, 400, { ok: false, error: 'invalid_app_secret', message: 'App Secret 不能为空且不能包含控制字符。' });
+        }
+        const appSecret = parsed.appSecret.trim();
+        const manualOwners = Array.isArray(parsed.allowedUsers)
+          ? parsed.allowedUsers.filter((v): v is string => typeof v === 'string').map(v => v.trim()).filter(Boolean)
+          : typeof parsed.owner === 'string'
+            ? parseOwnerEntries(parsed.owner)
+            : [];
+        const invalidOwners = findInvalidAllowedUserEntries(manualOwners);
+        if (invalidOwners.length > 0) {
+          return jsonRes(res, 400, {
+            ok: false,
+            error: 'invalid_entries',
+            message: `不是完整邮箱、手机号（大陆 11 位 / 海外带 + 国家码）、union_id(on_) 或 open_id(ou_)：${invalidOwners.join(', ')}`,
+          });
+        }
+        if (!hasOwnerEntry(manualOwners)) {
+          return jsonRes(res, 400, {
+            ok: false,
+            error: 'no_owner',
+            message: '至少需要填写一个完整邮箱、手机号（大陆 11 位 / 海外带 + 国家码）、union_id(on_) 或 open_id(ou_) 作为管理员。',
+          });
+        }
+        if (readBotsJsonOrEmpty(BOTS_JSON_PATH).some((entry: any) => entry?.larkAppId === appId)) {
+          return jsonRes(res, 409, {
+            ok: false,
+            error: 'duplicate_app',
+            message: `应用 ${appId} 已存在，请勿重复添加。`,
+          });
+        }
+        manualParams = { brand, appId, appSecret, allowedUsers: manualOwners };
       }
       const sessionModeRaw = typeof parsed.sessionMode === 'string' ? parsed.sessionMode.trim() : '';
       if (registrationMode !== 'web' && sessionModeRaw) {
@@ -6683,16 +6897,21 @@ const server = createServer(async (req, res) => {
           : {}),
         registrationMode,
         ...(registrationMode === 'web' ? { sessionMode, expectedIdentity } : {}),
+        ...(manualParams ? manualParams : {}),
         cliId,
         wrapperCli,
         cliLaunchMode,
         workingDir,
         dirMode,
         model,
-        ...(typeof parsed.autoAvoidApproval === 'boolean' ? { autoAvoidApproval: parsed.autoAvoidApproval } : {}),
-        ...(parsed.requireCriticalScopesBeforeActivation === true
-          ? { requireCriticalScopesBeforeActivation: true }
-          : {}),
+        ...(registrationMode === 'local' || registrationMode === 'manual'
+          ? {}
+          : {
+              ...(typeof parsed.autoAvoidApproval === 'boolean' ? { autoAvoidApproval: parsed.autoAvoidApproval } : {}),
+              ...(parsed.requireCriticalScopesBeforeActivation === true
+                ? { requireCriticalScopesBeforeActivation: true }
+                : {}),
+            }),
       });
       return jsonRes(res, 202, { job: botOnboarding.get(job.id) });
     }
@@ -6801,18 +7020,37 @@ const server = createServer(async (req, res) => {
       } catch {
         return jsonRes(res, 400, { ok: false, error: 'bad_json' });
       }
-      // 接受 owner 字符串 (逗号/空白分隔) 或 allowedUsers 数组。
+      // 接受 owner 字符串 (逗号/空白分隔，保留带空格的国际手机号) 或 allowedUsers 数组。
       const entries = Array.isArray(parsedOwner.allowedUsers)
         ? parsedOwner.allowedUsers.filter((v): v is string => typeof v === 'string')
         : typeof parsedOwner.owner === 'string'
-          ? parsedOwner.owner.split(/[,\s]+/).map(s => s.trim()).filter(Boolean)
+          ? parseOwnerEntries(parsedOwner.owner)
           : [];
       const r = await botOnboarding.submitOwner(onboardingId, entries);
       if (!r.ok) {
-        const status = r.error === 'unknown_onboarding_job' ? 404 : 400;
+        const status = r.error === 'unknown_onboarding_job'
+          ? 404
+          : r.error === 'onboarding_cancelled'
+            ? 409
+            : 400;
         return jsonRes(res, status, r);
       }
       return jsonRes(res, 200, { job: botOnboarding.get(onboardingId) });
+    }
+    let mCancel: RegExpMatchArray | null;
+    if (req.method === 'POST' && (mCancel = url.pathname.match(/^\/api\/bot-onboarding\/([^/]+)\/cancel$/))) {
+      let onboardingId: string;
+      try {
+        onboardingId = decodeURIComponent(mCancel[1]);
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_request' });
+      }
+      const r = botOnboarding.cancel(onboardingId);
+      if (!r.ok) {
+        const status = r.error === 'unknown_onboarding_job' ? 404 : 409;
+        return jsonRes(res, status, r);
+      }
+      return jsonRes(res, 200, { ok: true, job: r.job });
     }
     let mOnboard: RegExpMatchArray | null;
     if (req.method === 'GET' && (mOnboard = url.pathname.match(/^\/api\/bot-onboarding\/([^/]+)$/))) {
@@ -8212,6 +8450,10 @@ const server = createServer(async (req, res) => {
     // 原文查看与 tmux server 改动只给本机 owner（legacyAuthed），见 dashboard/session-env-api.ts。
     if (await handleSessionEnvRoute(req, res, url, {
       canReveal: legacyAuthed,
+      providerMachineHost: {
+        fleetConfigured: fleetBotsConfigured,
+        request: (path, init) => wecom.machineEnvironment(path, init),
+      },
       daemons: () => registry.list(),
       proxyToDaemon,
       readJsonBody: body => readJsonBody(body),
@@ -8670,7 +8912,15 @@ const server = createServer(async (req, res) => {
         const frame = roster.next(online);
         if (frame) stream.write(frame.event, { body: frame.body });
       });
-      res.on('close', () => { off(); offRoster(); clearInterval(hb); stream.dispose(); });
+      // WeCom sessions never travel on this stream. A host admin's stream (the
+      // test /api/sessions merges WeCom rows under) hears only that they changed,
+      // in a frame without data, and reads them from /api/wecom/sessions; every
+      // other stream subscribes to nothing.
+      const offWecomSessions = wecom.watchSessions(
+        legacyAuthed && requestIdentity?.kind === 'legacy-dashboard',
+        event => { stream.write(event, {}); },
+      );
+      res.on('close', () => { off(); offRoster(); offWecomSessions(); clearInterval(hb); stream.dispose(); });
       return;
     }
 
@@ -8724,7 +8974,7 @@ oauthCallbackServer.listen(9768, '127.0.0.1', () => {
 // request line + headers verbatim, then pipe both directions. Mirrors how
 // terminal-proxy.ts bridges to the worker. Non-`/s/*` upgrades are dropped (the
 // dashboard SPA uses SSE, not WebSocket).
-server.on('upgrade', (req: IncomingMessage, clientSocket: Duplex, head: Buffer) => {
+server.on('upgrade', async (req: IncomingMessage, clientSocket: Duplex, head: Buffer) => {
   try {
     const rawUrl = req.url ?? '/';
     // Preview 的 WS 必须第一个判：沙箱化之后它来自不透明来源（`Origin: null`），
@@ -8756,6 +9006,7 @@ server.on('upgrade', (req: IncomingMessage, clientSocket: Duplex, head: Buffer) 
     if (upgradeRoute.route === 'host-terminal') {
       if (hostTerminalManager.handleUpgrade(req, clientSocket, head)) return;
     }
+    if (await wecom.terminalUpgrade(req, clientSocket, head)) return;
     if (terminalFrontProxy.handleUpgrade(req, clientSocket, head)) return;
     clientSocket.destroy();
   } catch {

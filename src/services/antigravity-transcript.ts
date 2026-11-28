@@ -36,7 +36,7 @@
  * new tool calls; the user-facing answer only comes later. Emitting the first
  * content-only step immediately would dequeue the turn and lose the real
  * final. The candidate therefore stays in the drainer STATE until either:
- *   - the next USER_INPUT arrives (proves the previous loop ended), or
+ *   - the next USER_INPUT arrives and no previous task or subagent is pending, or
  *   - the worker's guarded quiet-tick confirms (1s of unchanged offset AND a
  *     viewport that is both not-busy and shows the ready marker) and calls
  *     drain with flushTrailingFinal:true.
@@ -481,10 +481,8 @@ export interface AntigravityDrainOptions {
   /** Worker-only: release the held trailing candidate after the viewport
    *  quiet-tick probe confirmed the TUI is idle and on the ready marker. */
   flushTrailingFinal?: boolean;
-  /** Worker-only: the whole conversation is being retired. A later explicit
-   *  input abandons earlier pending work in managed mode too, rather than
-   *  promoting its waiting narration to a normal final. */
-  retirePendingTurns?: boolean;
+  /** A quiet viewport attests only the candidate and offset it observed. */
+  expectedTrailingFinal?: { uuid: string; offset: number };
   /** Bind replies to native inputs when a person can also type in the pane. */
   adoptMode?: boolean;
 }
@@ -784,7 +782,6 @@ function foldRecord(
   events: CodexBridgeEvent[],
   state: AntigravityTranscriptState,
   adoptMode: boolean,
-  retirePendingTurns: boolean,
 ): AntigravityTranscriptState {
   const type = obj?.type;
   const turn = state.sourceTurnId ? { sourceTurnId: state.sourceTurnId } : {};
@@ -792,15 +789,13 @@ function foldRecord(
     // Only agy's own explicit submits start bridge turns. Any other source is
     // ignored entirely (and neither confirms nor cancels a candidate).
     if (obj.source !== undefined && obj.source !== 'USER_EXPLICIT') return state;
-    // A new explicit user turn normally confirms the previous loop. During
-    // conversation retirement, pending work is abandoned in managed mode too:
-    // its waiting narration must not become the old turn's normal answer.
+    // A new explicit input ends the previous loop. Pending work disproves
+    // completion, so discard its waiting narration and close the old owner.
     const uuid = `${path}:${lineStart}`;
     const pending = hasAntigravityPendingTasks(state);
-    const abandonPending = retirePendingTurns && pending;
-    if (state.provisionalFinal && !((adoptMode || retirePendingTurns) && pending)) {
+    if (state.provisionalFinal && !pending) {
       events.push(state.provisionalFinal);
-    } else if (state.sourceTurnId || abandonPending) {
+    } else if (state.sourceTurnId || pending) {
       // Managed states have no native id; the queue's current collecting owner
       // receives this abort. Adopt states route by their exact sourceTurnId.
       events.push({ uuid: `${uuid}:abort`, timestampMs, kind: 'turn_aborted', text: '', ...turn });
@@ -1067,6 +1062,11 @@ export function drainAntigravityTranscript(
   incomingState: AntigravityTranscriptState = {},
   options: AntigravityDrainOptions = {},
 ): AntigravityDrainResult {
+  const canFlush = (state: AntigravityTranscriptState, offset: number) =>
+    options.flushTrailingFinal && state.provisionalFinal && !hasAntigravityPendingTasks(state)
+    && (options.expectedTrailingFinal === undefined
+      || (offset === options.expectedTrailingFinal.offset
+        && state.provisionalFinal.uuid === options.expectedTrailingFinal.uuid));
   const step = beginJsonlDrain(path, fromOffset, { onShrink: 'hold', missingOffset: 'keep' });
   if (step.kind === 'skip') {
     return { events: [], newOffset: step.newOffset, pendingTail: '', state: cloneState(incomingState) };
@@ -1076,7 +1076,7 @@ export function drainAntigravityTranscript(
     // Refuse while a background task is still outstanding: its completion
     // result notification has not arrived, so a quiet
     // screen cannot prove the turn is done.
-    if (options.flushTrailingFinal && incomingState.provisionalFinal && !hasAntigravityPendingTasks(incomingState)) {
+    if (incomingState.provisionalFinal && canFlush(incomingState, fromOffset)) {
       const events = [incomingState.provisionalFinal];
       const nextState = pendingState(incomingState);
       return { events, newOffset: fromOffset, pendingTail: '', state: nextState };
@@ -1093,7 +1093,7 @@ export function drainAntigravityTranscript(
   for (const { line, lineStart } of iterateJsonlLines(completeText, fromOffset)) {
     let obj: any;
     try { obj = JSON.parse(line); } catch { continue; }
-    state = foldRecord(path, lineStart, obj, recordTimestampMs(obj), events, state, options.adoptMode === true, options.retirePendingTurns === true);
+    state = foldRecord(path, lineStart, obj, recordTimestampMs(obj), events, state, options.adoptMode === true);
   }
 
   // The final object may sit at EOF without a trailing \n until the next turn.
@@ -1101,7 +1101,7 @@ export function drainAntigravityTranscript(
   if (pendingTail.length > 0) {
     try {
       const obj = JSON.parse(pendingTail);
-      state = foldRecord(path, newOffset, obj, recordTimestampMs(obj), events, state, options.adoptMode === true, options.retirePendingTurns === true);
+      state = foldRecord(path, newOffset, obj, recordTimestampMs(obj), events, state, options.adoptMode === true);
       newOffset = size;
       pendingTail = '';
     } catch {
@@ -1112,7 +1112,7 @@ export function drainAntigravityTranscript(
   // Release the candidate only when the flush is requested AND no background
   // command or subagent is outstanding. The candidate rides another tick
   // until the corresponding result / next user turn clears the wait.
-  if (options.flushTrailingFinal && state.provisionalFinal && !hasAntigravityPendingTasks(state)) {
+  if (state.provisionalFinal && !pendingTail && canFlush(state, newOffset)) {
     events.push(state.provisionalFinal);
     state.provisionalFinal = undefined;
     delete state.sourceTurnId;
@@ -1194,7 +1194,7 @@ function scanTranscriptTailForPendingTasks(
           // latest input would lose older daemon identity needed to reject its
           // late notification in a newer anonymous-task turn.
           for (let i = 0; i < parsed.length; i++) {
-            state = foldRecord(transcriptPath, i, parsed[i], 0, events, state, false, false);
+            state = foldRecord(transcriptPath, i, parsed[i], 0, events, state, false);
           }
           return { bounded: true, pending: hasAntigravityPendingTasks(state) };
         }
@@ -1206,7 +1206,7 @@ function scanTranscriptTailForPendingTasks(
       let state: AntigravityTranscriptState = {};
       const events: CodexBridgeEvent[] = [];
       for (let i = 0; i < lastParsed.length; i++) {
-        state = foldRecord(transcriptPath, i, lastParsed[i], 0, events, state, false, false);
+        state = foldRecord(transcriptPath, i, lastParsed[i], 0, events, state, false);
       }
       return { bounded: false, pending: hasAntigravityPendingTasks(state) };
     } finally {
@@ -1287,19 +1287,58 @@ export function resolveAntigravityCandidateMinByteOffset(
   return null;
 }
 
-/** 统计 transcriptPath 的 [minByteOffset, maxByteOffset) 区间内，正文 SHA-256 命中 textSha256 的 USER_INPUT 次数。 */
-export function countAntigravityUserInputMatches(
+export interface AntigravityUserInputMatch {
+  /** Line start offset in the scanned file. */
+  offset: number;
+  /** agy's step_index, shared by the compact and full transcripts of a conversation. */
+  stepIndex?: number;
+}
+
+/** Incremental scan for USER_INPUT records whose unwrapped payload hashes to
+ *  `textSha256`, from `fromOffset` to the last complete line. Returns the
+ *  matches and the next resume offset (never past a partial trailing line),
+ *  or null when the file cannot be read. */
+export function scanAntigravityUserInputMatches(
+  transcriptPath: string,
+  textSha256: string,
+  fromOffset: number,
+): { matches: AntigravityUserInputMatch[]; nextOffset: number } | null {
+  if (!transcriptPath || !existsSync(transcriptPath)) return null;
+  const matches: AntigravityUserInputMatch[] = [];
+  let failed = false;
+  const cursor = scanJsonlFromOffset(transcriptPath, fromOffset, {
+    onError: () => { failed = true; },
+    onLine: (line, lineStart) => {
+      if (!line.includes('USER_INPUT')) return;
+      let rec: any;
+      try {
+        rec = JSON.parse(line);
+      } catch {
+        return;
+      }
+      if (!isExplicitUserInput(rec)) return;
+      const unwrapped = unwrapAntigravityUserInput(typeof rec.content === 'string' ? rec.content : '');
+      if (hashAntigravitySubmittedText(unwrapped) !== textSha256) return;
+      matches.push({ offset: lineStart, ...(Number.isInteger(rec.step_index) ? { stepIndex: rec.step_index } : {}) });
+    },
+  });
+  if (!cursor || failed) return null;
+  return { matches, nextOffset: cursor.newOffset };
+}
+
+/** transcriptPath 的 [minByteOffset, maxByteOffset) 区间内，正文 SHA-256 命中 textSha256 的 USER_INPUT 行起始偏移（升序）。 */
+export function listAntigravityUserInputMatchOffsets(
   transcriptPath: string,
   textSha256: string,
   minByteOffset = 0,
   maxByteOffset?: number,
-): number {
-  if (!transcriptPath || !existsSync(transcriptPath)) return 0;
-  if (maxByteOffset !== undefined && maxByteOffset <= minByteOffset) return 0;
-  let count = 0;
+): number[] {
+  if (!transcriptPath || !existsSync(transcriptPath)) return [];
+  if (maxByteOffset !== undefined && maxByteOffset <= minByteOffset) return [];
+  const offsets: number[] = [];
   scanJsonlFromOffset(transcriptPath, minByteOffset, {
     ...(maxByteOffset !== undefined ? { endOffset: maxByteOffset } : {}),
-    onLine: line => {
+    onLine: (line, lineStart) => {
       if (!line.trim()) return;
       let rec: any;
       try {
@@ -1309,10 +1348,20 @@ export function countAntigravityUserInputMatches(
       }
       if (!isExplicitUserInput(rec)) return;
       const unwrapped = unwrapAntigravityUserInput(typeof rec.content === 'string' ? rec.content : '');
-      if (hashAntigravitySubmittedText(unwrapped) === textSha256) count += 1;
+      if (hashAntigravitySubmittedText(unwrapped) === textSha256) offsets.push(lineStart);
     },
   });
-  return count;
+  return offsets;
+}
+
+/** 统计 transcriptPath 的 [minByteOffset, maxByteOffset) 区间内，正文 SHA-256 命中 textSha256 的 USER_INPUT 次数。 */
+export function countAntigravityUserInputMatches(
+  transcriptPath: string,
+  textSha256: string,
+  minByteOffset = 0,
+  maxByteOffset?: number,
+): number {
+  return listAntigravityUserInputMatchOffsets(transcriptPath, textSha256, minByteOffset, maxByteOffset).length;
 }
 
 const COMPLETED_TURN_INITIAL_TAIL_BYTES = 256 * 1024;
@@ -1832,7 +1881,7 @@ function hasPendingTasksInSnapshot(snap: ParsedTranscriptSnapshot): boolean {
   let state: AntigravityTranscriptState = {};
   const events: CodexBridgeEvent[] = [];
   for (let i = 0; i < snap.records.length; i++) {
-    state = foldRecord(snap.path, i, snap.records[i]!.rec, 0, events, state, false, false);
+    state = foldRecord(snap.path, i, snap.records[i]!.rec, 0, events, state, false);
   }
   return hasAntigravityPendingTasks(state);
 }

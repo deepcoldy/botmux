@@ -1,7 +1,7 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { resolveCommand } from './registry.js';
-import type { CliAdapter } from './types.js';
+import type { CliAdapter, CliModelDetectionOptions } from './types.js';
 import { delay } from '../../utils/timing.js';
 import { readZcodeModelChoices } from '../../services/zcode-models.js';
 import { readZcodeSubmissionReceipt, readZcodeSubmissionReceiptsAfter, zcodeInputSha256, zcodeNativeSessionExists, zcodeSessionDbPath } from '../../services/zcode-session.js';
@@ -166,7 +166,17 @@ export function createZcodeAdapter(pathOverride?: string): CliAdapter {
     // `undefined` means "no curated list" (the static CLI_MODEL_CHOICES
     // contract); content comes from the live personal provider config.
     get modelChoices() { try { const choices = readZcodeModelChoices(); return choices.length ? choices : undefined; } catch { return undefined; } },
-    async detectModels() { try { return readZcodeModelChoices(); } catch { return null; } },
+    // Reads this process's provider config, like `modelChoices`. Only a caller
+    // probing for a separately launched core (isolatedEnv, e.g. the WeCom
+    // managed core) resolves the config path from the given env instead.
+    async detectModels(options?: CliModelDetectionOptions) {
+      const env = options?.isolatedEnv ? options.env : undefined;
+      try {
+        return readZcodeModelChoices(env);
+      } catch {
+        return null;
+      }
+    },
     defaultPassthroughCommands: ['/model', '/effort', '/compact', '/clear'],
   };
 }

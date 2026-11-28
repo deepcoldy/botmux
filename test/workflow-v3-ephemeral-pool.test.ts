@@ -1,18 +1,21 @@
 import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
+import { BoundedLogFile } from '../src/utils/bounded-log-file.js';
+import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { WorkerSessionEventScope } from '../src/services/session-event-scope.js';
-import { existsSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, realpathSync, symlinkSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, truncateSync, statSync, rmSync, writeFileSync, mkdirSync, readFileSync, realpathSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { createEphemeralPool, buildGoalCommand, GOAL_COMMAND, spawnWorkerFactory, v3WorkerBackendType } from '../src/workflows/v3/ephemeral-pool.js';
+import { assertNotAssistantModeBot, createEphemeralPool, buildGoalCommand, GOAL_COMMAND, spawnWorkerFactory, v3WorkerBackendType } from '../src/workflows/v3/ephemeral-pool.js';
 import { config } from '../src/config.js';
 import { GOAL_COMMAND_OBJECTIVE, GOAL_ENV, isBotmuxGoalObjective, V3_NATIVE_GOAL_COMMAND_CLIS, type RunNodeRequest } from '../src/workflows/v3/contract.js';
 import { syntheticSessionUuid, type WorkerHandle, type WorkerProcessFactory, type WorkerSpawnOptions } from '../src/workflows/shared/worker-process.js';
 import { readV3AttemptWorkerFence } from '../src/workflows/v3/worker-fence.js';
 import { botToSnapshot, parseFrozenBotSnapshots } from '../src/workflows/v3/bot-resolve.js';
-import { getBot, registerBot, __testOnly_resetBotRegistry, type BotConfig } from '../src/bot-registry.js';
+import { getBot, loadBotConfigsCached, registerBot, __testOnly_resetBotRegistry, type BotConfig } from '../src/bot-registry.js';
 import { invalidateGlobalConfigCache } from '../src/global-config.js';
 
 // The default factory delegates to self-spawn's spawnWorker, which is the only
@@ -51,29 +54,20 @@ beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'wf-v3-pool-'));
   config.session.dataDir = join(dir, 'data');
   vi.stubEnv('SESSION_DATA_DIR', config.session.dataDir);
+  // Default-path nodes come from the run's bots.json, so the node bot that
+  // request() names must be configured there (tests may overwrite this file).
+  // Its profile differs from request()'s snapshot, so folder-trust seeding
+  // stays out of tests that do not exercise it.
+  const botsPath = join(dir, 'bots.json');
+  writeFileSync(botsPath, JSON.stringify([{ larkAppId: 'cli_app', larkAppSecret: 'test-only', cliId: 'claude-code',
+    cliConfigDir: join(dir, 'fixture-profile') }]));
+  vi.stubEnv('BOTS_CONFIG', botsPath);
 });
 
-afterEach(async () => {
+afterEach(() => {
   config.session.dataDir = originalDataDir;
   vi.unstubAllEnvs();
-  // The pool deliberately fire-and-forgets its diagnostic log writes
-  // (`void appendLine(...)` in ephemeral-pool.ts — each one mkdir+append into
-  // the attempt dir). A straggler landing after runNode resolves can RECREATE
-  // a directory the recursive delete just emptied, which rmSync's internal
-  // maxRetries never wins: they retry the same rmdir, they do not re-walk.
-  // An outer retry restarts the whole recursive walk from a fresh readdir, and
-  // the writers all finish within milliseconds, so a couple of spaced re-walks
-  // are deterministic where a single walk (however many inner retries) is not.
-  for (let attempt = 0; ; attempt++) {
-    try {
-      rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
-      break;
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (attempt >= 4 || (code !== 'ENOTEMPTY' && code !== 'EBUSY')) throw err;
-      await new Promise(r => setTimeout(r, 100));
-    }
-  }
+  rmSync(dir, { recursive: true, force: true });
 });
 
 // A v3 attempt runs on a SYNTHETIC session id with no persistent row, so
@@ -190,6 +184,92 @@ describe('v3WorkerBackendType', () => {
 });
 
 describe('v3 ephemeral pool', () => {
+  it.each(['stdout', 'stderr'] as const)('fails on a full %s log even after a claimed success', async (stream) => {
+    const worker = Object.assign(new ScriptedWorker(), { stdout: new PassThrough(), stderr: new PassThrough() });
+    const req = request();
+    const path = join(req.attemptDir, stream + '.log');
+    mkdirSync(req.attemptDir, { recursive: true });
+    writeFileSync(path, '');
+    truncateSync(path, 64_000_000);
+    const running = createEphemeralPool({ factory: factoryFor(worker), resolveLarkAppSecret: () => 'secret' }).runNode(req);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'claude_exit', code: 0, signal: null });
+    worker[stream].write('more');
+    worker.emitExit(0);
+    await expect(running).resolves.toMatchObject({ status: 'fail', error: { code: 'WORKFLOW_LOG_LIMIT' } });
+    expect(statSync(path).size).toBe(64_000_000);
+  });
+
+  it('counts pending stdout and stderr writes together when they share a log file', async () => {
+    const worker = Object.assign(new ScriptedWorker(), { stdout: new PassThrough(), stderr: new PassThrough() });
+    const req = request();
+    const path = join(req.attemptDir, 'combined.log');
+    mkdirSync(req.attemptDir, { recursive: true });
+    writeFileSync(path, '');
+    truncateSync(path, 64_000_000 - 2);
+    const pool = createEphemeralPool({ factory: factoryFor(worker), resolveLarkAppSecret: () => 'secret' });
+    const running = pool.runNode({ ...req, stdoutPath: path, stderrPath: path });
+    await worker.waitForInit();
+    worker.stdout.write('ab');
+    const closeAfterStdout = worker.closeRequests;
+    worker.stderr.write('cd');
+    const closeAfterStderr = worker.closeRequests;
+    worker.emitExit(0);
+    await expect(running).resolves.toMatchObject({ status: 'fail', error: { code: 'WORKFLOW_LOG_LIMIT' } });
+    expect(closeAfterStdout).toBe(0);
+    expect(closeAfterStderr).toBe(1);
+    expect(statSync(path).size).toBe(64_000_000);
+  });
+
+  it('rejects a custom diagnostic path that aliases the worker-owned replay before spawning', async () => {
+    const req = request();
+    mkdirSync(req.attemptDir, { recursive: true });
+    const stdoutPath = join(req.attemptDir, 'custom.log');
+    symlinkSync('pty.log', stdoutPath);
+    const factory = factoryFor(new ScriptedWorker());
+    const pool = createEphemeralPool({ factory, resolveLarkAppSecret: () => 'secret' });
+    await expect(pool.runNode({ ...req, stdoutPath })).rejects.toThrow(/pty.log/);
+    expect(factory.lastOpts).toBeUndefined();
+    expect(readV3AttemptWorkerFence(req.attemptDir, req)?.phase).toBe('closed_no_spawn');
+  });
+
+  it('requests worker close on oversized final output and preserves a user cancellation during shutdown', async () => {
+    const worker = new ScriptedWorker();
+    const ac = new AbortController();
+    const running = createEphemeralPool({ factory: factoryFor(worker), resolveLarkAppSecret: () => 'secret' })
+      .runNode({ ...request(), cancelSignal: ac.signal });
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'final_output', content: 'x'.repeat(16_000_000), lastUuid: 'u', turnId: 't' });
+    const closeRequests = worker.closeRequests;
+    ac.abort('operator');
+    worker.emitExit(0);
+    await expect(running).resolves.toMatchObject({ status: 'cancelled', cancelReason: 'operator' });
+    expect(closeRequests).toBe(1);
+  });
+
+  it('propagates a terminal replay limit received during worker shutdown', async () => {
+    const worker = new ScriptedWorker();
+    const req = request();
+    const running = createEphemeralPool({ factory: factoryFor(worker), resolveLarkAppSecret: () => 'secret' }).runNode(req);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'claude_exit', code: 0, signal: null });
+    const path = join(req.attemptDir, 'pty.log');
+    writeFileSync(path, '');
+    truncateSync(path, 64_000_000);
+    const stamp = loadWorkerFunction('sessionEventMetadata', { workerSessionEventScope: worker.contractScope });
+    const append = loadWorkerFunction('appendWorkflowPtyLog', {
+      isWorkflowWorker: () => true, process: { env: { BOTMUX_WORKFLOW_PTY_LOG_PATH: path } },
+      workflowPtyLogStream: undefined, workflowPtyLogOpenFailed: false, BoundedLogFile, mkdirSync, dirname,
+      send: (event: unknown) => worker.emit('message', stamp(event)),
+    });
+    // PTY callbacks carry their runtime binding even while the worker is closing.
+    const scope = worker.contractScope!;
+    scope.run(scope.currentBinding()!, () => append('more'));
+    worker.emitExit(0);
+    await expect(running).resolves.toMatchObject({ status: 'fail', error: { code: 'WORKFLOW_LOG_LIMIT', message: 'pty.log exceeded the disk limit' } });
+    expect(statSync(path).size).toBe(64_000_000);
+  });
+
   it('does not inherit machine protected env names even when the workflow bot enables no matching plugin', async () => {
     vi.stubEnv('FIXTURE_SECRET', 'machine-secret');
     vi.stubEnv('FIXTURE_TOKEN', 'machine-token');
@@ -336,6 +416,194 @@ describe('v3 ephemeral pool', () => {
       expect(spawn).not.toHaveBeenCalled();
     });
 
+    it('fails an unregistered node bot with the read error when bots.json turns invalid instead of starting without its env', async () => {
+      configureBots([{ larkAppId: 'cli_app', larkAppSecret: 'test-only', cliId: 'claude-code',
+        env: { MODEL_AUTH: 'node-sentinel' } }]);
+      const botsPath = join(dir, 'bots.json');
+      // Rewritten mid-run (hand edit, torn write): no longer valid JSON.
+      writeFileSync(botsPath, '[{"larkAppId": "cli_app", "env": {');
+      const spawn = vi.fn((): WorkerHandle => { throw new Error('unexpected spawn'); });
+      const req = request();
+      const failure = await createEphemeralPool({ factory: { spawn }, workerPath: '/tmp/worker.js',
+        resolveLarkAppSecret: () => 'secret' }).runNode(req).then(() => undefined, (err: unknown) => err);
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).toContain('cli_app');
+      expect((failure as Error).message).toContain(botsPath);
+      expect(spawn).not.toHaveBeenCalled();
+      expect(readV3AttemptWorkerFence(req.attemptDir, req)).toBeNull();
+    });
+
+    // Real permission bits: POSIX only, and root bypasses them, so the probe
+    // would prove nothing there. bot-registry.test.ts covers the errno mapping
+    // with mocked fs on every platform.
+    const permissionsEnforced = process.platform !== 'win32'
+      && typeof process.getuid === 'function' && process.getuid() !== 0;
+    const rejectsBeforeSpawn = async (
+      resolveLarkAppSecret: (larkAppId: string) => string | undefined = () => 'secret',
+    ) => {
+      const spawn = vi.fn((): WorkerHandle => { throw new Error('unexpected spawn'); });
+      const failure = await createEphemeralPool({ factory: { spawn }, workerPath: '/tmp/worker.js',
+        resolveLarkAppSecret }).runNode(request()).then(() => undefined, (err: unknown) => err);
+      expect(spawn).not.toHaveBeenCalled();
+      expect(failure).toBeInstanceOf(Error);
+      return failure as Error;
+    };
+
+    it.skipIf(!permissionsEnforced)('fails an unregistered node bot when the default bots.json directory cannot be searched', async () => {
+      const home = join(dir, 'home');
+      const configDir = join(home, '.botmux');
+      mkdirSync(configDir, { recursive: true });
+      writeFileSync(join(configDir, 'bots.json'), JSON.stringify([{ larkAppId: 'cli_app', larkAppSecret: 'test-only',
+        cliId: 'claude-code', env: { MODEL_AUTH: 'node-sentinel' } }]));
+      vi.stubEnv('HOME', home);
+      vi.stubEnv('USERPROFILE', home);
+      vi.stubEnv('BOTS_CONFIG', '');
+      chmodSync(configDir, 0o000);
+      try {
+        const failure = await rejectsBeforeSpawn();
+        expect(failure.message).toContain('cli_app');
+        expect(failure.message).toMatch(/EACCES|EPERM/);
+      } finally { chmodSync(configDir, 0o700); }
+    });
+
+    it.skipIf(!permissionsEnforced)('fails an unregistered node bot when the pinned BOTS_CONFIG parent cannot be searched', async () => {
+      const pinnedDir = join(dir, 'pinned');
+      mkdirSync(pinnedDir);
+      const pinnedPath = join(pinnedDir, 'bots.json');
+      writeFileSync(pinnedPath, JSON.stringify([{ larkAppId: 'cli_app', larkAppSecret: 'test-only',
+        cliId: 'claude-code', env: { MODEL_AUTH: 'node-sentinel' } }]));
+      vi.stubEnv('BOTS_CONFIG', pinnedPath);
+      chmodSync(pinnedDir, 0o000);
+      try {
+        const failure = await rejectsBeforeSpawn();
+        expect(failure.message).toContain('cli_app');
+        expect(failure.message).toContain(pinnedPath);
+        expect(failure.cause).toMatchObject({ reason: 'permission_denied' });
+      } finally { chmodSync(pinnedDir, 0o700); }
+    });
+
+    it('fails an unregistered node bot when the default bots.json is a dangling symlink', async (ctx) => {
+      const home = join(dir, 'home');
+      const configDir = join(home, '.botmux');
+      mkdirSync(configDir, { recursive: true });
+      const linkPath = join(configDir, 'bots.json');
+      try { symlinkSync(join(dir, 'moved-away.json'), linkPath); } catch { ctx.skip(); }
+      // os.homedir() reads USERPROFILE on Windows, HOME elsewhere.
+      vi.stubEnv('HOME', home);
+      vi.stubEnv('USERPROFILE', home);
+      vi.stubEnv('BOTS_CONFIG', '');
+      const failure = await rejectsBeforeSpawn();
+      expect(failure.message).toContain('cli_app');
+      expect(failure.message).toContain(linkPath);
+      expect(failure.cause).toMatchObject({ reason: 'unreadable' });
+    });
+
+    it.skipIf(!permissionsEnforced)('fails an unregistered node bot on an unreadable bots.json even under read isolation', async () => {
+      configureBots([{ larkAppId: 'cli_app', larkAppSecret: 'test-only', cliId: 'claude-code',
+        env: { MODEL_AUTH: 'node-sentinel' } }]);
+      const botsPath = join(dir, 'bots.json');
+      vi.stubEnv('BOTMUX_READ_ISOLATION', '1');
+      chmodSync(botsPath, 0o000);
+      try {
+        // An isolated CLI's ordinary read keeps degrading to "no bots"…
+        expect(loadBotConfigsCached()).toEqual([]);
+        // …but a workflow node must not read that as "this bot has no env".
+        const failure = await rejectsBeforeSpawn();
+        expect(failure.message).toContain('cli_app');
+        expect(failure.message).toContain(botsPath);
+      } finally { chmodSync(botsPath, 0o600); }
+    });
+
+    it('never copies another bot entry\'s raw values into the persisted node failure', async () => {
+      const secret = 'sk-live-SENTINEL-4f9c';
+      const botsPath = join(dir, 'bots.json');
+      vi.stubEnv('BOTS_CONFIG', botsPath);
+      // The node's own entry is fine; a sibling has a secret pasted into a boolean field.
+      writeFileSync(botsPath, JSON.stringify([
+        { larkAppId: 'cli_app', larkAppSecret: 'test-only', cliId: 'claude-code' },
+        { larkAppId: 'cli_other', larkAppSecret: 'test-only', cliId: 'claude-code', sandboxWithholdBotSecret: secret },
+      ]));
+      const failure = await rejectsBeforeSpawn();
+      expect(failure.message).not.toContain(secret);
+      expect(failure.message).toContain('cli_app');
+      expect(failure.message).toContain(botsPath);
+    });
+
+    it('returns cancelled (not a config failure) for an attempt already aborted while bots.json is invalid', async () => {
+      configureBots([{ larkAppId: 'cli_app', larkAppSecret: 'test-only', cliId: 'claude-code' }]);
+      writeFileSync(join(dir, 'bots.json'), '{ not json');
+      const factory = factoryFor(new ScriptedWorker());
+      const ac = new AbortController();
+      ac.abort({ kind: 'run', cancelRequestId: 'cancel-before-config' });
+      await expect(createEphemeralPool({ factory, workerPath: '/tmp/worker.js', resolveLarkAppSecret: () => 'secret' })
+        .runNode({ ...request(), cancelSignal: ac.signal })).resolves.toMatchObject({
+        status: 'cancelled',
+        cancelReason: { kind: 'run', cancelRequestId: 'cancel-before-config' },
+      });
+      expect(readV3AttemptWorkerFence(request().attemptDir, request())).toMatchObject({
+        phase: 'closed_no_spawn',
+        reason: 'pre_aborted',
+      });
+      expect(factory.lastOpts).toBeUndefined();
+    });
+
+    it('fails an unregistered node bot when HOME itself is a dangling symlink', async (ctx) => {
+      const home = join(dir, 'home-link');
+      try { symlinkSync(join(dir, 'moved-home'), home); } catch { ctx.skip(); }
+      // os.homedir() reads USERPROFILE on Windows, HOME elsewhere.
+      vi.stubEnv('HOME', home);
+      vi.stubEnv('USERPROFILE', home);
+      vi.stubEnv('BOTS_CONFIG', '');
+      const failure = await rejectsBeforeSpawn();
+      expect(failure.message).toContain('cli_app');
+      expect(failure.cause).toMatchObject({ reason: 'unreadable' });
+    });
+
+    it('fails an unregistered node bot when the default config directory is a regular file', async () => {
+      const home = join(dir, 'home');
+      mkdirSync(home, { recursive: true });
+      writeFileSync(join(home, '.botmux'), 'not a directory');
+      // os.homedir() reads USERPROFILE on Windows, HOME elsewhere.
+      vi.stubEnv('HOME', home);
+      vi.stubEnv('USERPROFILE', home);
+      vi.stubEnv('BOTS_CONFIG', '');
+      const failure = await rejectsBeforeSpawn();
+      expect(failure.message).toContain('cli_app');
+      expect(failure.cause).toMatchObject({ reason: 'unreadable' });
+    });
+
+    it('fails an unregistered node bot when the default config directory is a dangling symlink', async (ctx) => {
+      const home = join(dir, 'home');
+      mkdirSync(home, { recursive: true });
+      const configDir = join(home, '.botmux');
+      try { symlinkSync(join(dir, 'moved-config-dir'), configDir); } catch { ctx.skip(); }
+      // os.homedir() reads USERPROFILE on Windows, HOME elsewhere.
+      vi.stubEnv('HOME', home);
+      vi.stubEnv('USERPROFILE', home);
+      vi.stubEnv('BOTS_CONFIG', '');
+      const failure = await rejectsBeforeSpawn();
+      expect(failure.message).toContain('cli_app');
+      expect(failure.cause).toMatchObject({ reason: 'unreadable' });
+    });
+
+    it('keeps starting a hosted node bot from the registry while bots.json is invalid', async () => {
+      const bot: BotConfig = { larkAppId: 'cli_app', larkAppSecret: 'test-only', cliId: 'claude-code',
+        apiOnly: true, env: { MODEL_AUTH: 'registered-sentinel' } };
+      registerBot(bot);
+      configureBots([bot]);
+      writeFileSync(join(dir, 'bots.json'), '{ not json');
+      const worker = new ScriptedWorker();
+      const running = createEphemeralPool({ factory: factoryFor(worker), workerPath: '/tmp/worker.js',
+        resolveLarkAppSecret: () => 'secret' }).runNode(request());
+      try {
+        await worker.waitForInit();
+        expect(worker.init.env?.MODEL_AUTH).toBe('registered-sentinel');
+      } finally {
+        worker.emitExit(0);
+        await running;
+      }
+    });
+
     it.each(['missing', 'throwing'] as const)('does not override an explicit %s resolver with bots.json', async (behavior) => {
       configureBots([{ larkAppId: 'cli_app', larkAppSecret: 'test-only', cliId: 'claude-code',
         env: { MODEL_AUTH: 'file-sentinel' } }]);
@@ -356,15 +624,131 @@ describe('v3 ephemeral pool', () => {
       }
     });
 
-    it('does not substitute another configured bot when the node bot is absent', async () => {
-      configureBots([{ larkAppId: 'cli_other', larkAppSecret: 'test-only', cliId: 'claude-code',
-        env: { MODEL_AUTH: 'other-sentinel' } }]);
+    // The run pins secrets in memory at start, so a node bot that disappears
+    // from bots.json mid-run still resolves a secret. The default path must not
+    // read that as "not configured": no env-less worker, no assistant pass.
+    const nodeBot: BotConfig = { larkAppId: 'cli_app', larkAppSecret: 'test-only', cliId: 'claude-code',
+      env: { MODEL_AUTH: 'node-sentinel' } };
+    const otherBot: BotConfig = { larkAppId: 'cli_other', larkAppSecret: 'test-only', cliId: 'claude-code',
+      env: { MODEL_AUTH: 'other-sentinel' } };
+
+    it('fails before spawn when the node bot is removed from bots.json mid-run', async () => {
+      configureBots([nodeBot, otherBot]);
+      const secrets = new Map([[nodeBot.larkAppId, nodeBot.larkAppSecret]]);
+      configureBots([otherBot]);
+      const failure = await rejectsBeforeSpawn(id => secrets.get(id));
+      expect(failure.message).toContain('cli_app');
+      expect(failure.message).toContain('bots.json');
+      expect(failure.message).not.toContain('other-sentinel');
+    });
+
+    it('fails before spawn when the default bots.json is deleted mid-run', async () => {
+      const home = join(dir, 'home');
+      const homeBots = join(home, '.botmux', 'bots.json');
+      mkdirSync(dirname(homeBots), { recursive: true });
+      writeFileSync(homeBots, JSON.stringify([nodeBot]));
+      const secrets = new Map([[nodeBot.larkAppId, nodeBot.larkAppSecret]]);
+      vi.stubEnv('HOME', home);
+      vi.stubEnv('USERPROFILE', home);
+      vi.stubEnv('BOTS_CONFIG', '');
+      rmSync(homeBots);
+      const failure = await rejectsBeforeSpawn(id => secrets.get(id));
+      expect(failure.message).toContain('cli_app');
+      expect(failure.message).toContain('bots.json');
+    });
+
+    it('fails before spawn when the node bot is removed while its secret is being resolved', async () => {
+      configureBots([nodeBot, otherBot]);
+      const spawn = vi.fn((): WorkerHandle => { throw new Error('unexpected spawn'); });
+      const req = request();
+      const failure = await createEphemeralPool({ factory: { spawn }, workerPath: '/tmp/worker.js',
+        resolveLarkAppSecret: async () => {
+          // The entry check already passed; the bot leaves bots.json during the wait.
+          configureBots([otherBot]);
+          return 'secret';
+        } }).runNode(req).then(() => undefined, (err: unknown) => err);
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).toContain('cli_app');
+      expect((failure as Error).message).not.toContain('other-sentinel');
+      expect(spawn).not.toHaveBeenCalled();
+      expect(readV3AttemptWorkerFence(req.attemptDir, req)).toMatchObject({ phase: 'closed_no_spawn', reason: 'setup_failed' });
+    });
+
+    it('launches with the env from the final pre-spawn read when bots.json changes during the wait', async () => {
+      configureBots([nodeBot]);
       const worker = new ScriptedWorker();
       const running = createEphemeralPool({ factory: factoryFor(worker), workerPath: '/tmp/worker.js',
-        resolveLarkAppSecret: () => 'secret' }).runNode(request());
+        resolveLarkAppSecret: async () => {
+          configureBots([{ ...nodeBot, env: { MODEL_AUTH: 'rotated-sentinel' } }]);
+          return 'secret';
+        } }).runNode(request());
       try {
         await worker.waitForInit();
-        expect(worker.init.env?.MODEL_AUTH).toBeUndefined();
+        expect(worker.init.env?.MODEL_AUTH).toBe('rotated-sentinel');
+      } finally {
+        worker.emitExit(0);
+        await running;
+      }
+    });
+
+    it('fails before spawn when assistantMode turns on while its secret is being resolved', async () => {
+      configureBots([nodeBot]);
+      const spawn = vi.fn((): WorkerHandle => { throw new Error('unexpected spawn'); });
+      const req = request();
+      const failure = await createEphemeralPool({ factory: { spawn }, workerPath: '/tmp/worker.js',
+        resolveLarkAppSecret: async () => {
+          // The entry assistant check passed; the flag flips on during the wait,
+          // so only the authoritative pre-spawn re-read can refuse it.
+          configureBots([{ ...nodeBot, assistantMode: true }]);
+          return 'secret';
+        } }).runNode(req).then(() => undefined, (err: unknown) => err);
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).toContain('assistant');
+      expect(spawn).not.toHaveBeenCalled();
+      expect(readV3AttemptWorkerFence(req.attemptDir, req)).toMatchObject({ phase: 'closed_no_spawn', reason: 'setup_failed' });
+    });
+
+    it('still returns cancelled when the attempt is cancelled during the wait in which its bot left bots.json', async () => {
+      configureBots([nodeBot]);
+      const factory = factoryFor(new ScriptedWorker());
+      const ac = new AbortController();
+      const req = request();
+      await expect(createEphemeralPool({ factory, workerPath: '/tmp/worker.js',
+        resolveLarkAppSecret: async () => {
+          configureBots([otherBot]);
+          ac.abort('user-requested');
+          return 'secret';
+        } }).runNode({ ...req, cancelSignal: ac.signal })).resolves.toMatchObject({ status: 'cancelled' });
+      expect(factory.lastOpts).toBeUndefined();
+      expect(readV3AttemptWorkerFence(req.attemptDir, req)).toMatchObject({ phase: 'closed_no_spawn', reason: 'pre_aborted' });
+    });
+
+    it('fails the assistant-mode check closed for a default-path bot missing from bots.json', () => {
+      configureBots([otherBot]);
+      expect(() => assertNotAssistantModeBot('cli_app', true)).toThrow(/cli_app/);
+      // Explicit-resolver callers keep leaving an absent bot to the credential resolver.
+      expect(() => assertNotAssistantModeBot('cli_app')).not.toThrow();
+    });
+
+    it('still returns cancelled for an attempt aborted on arrival after its bot left bots.json', async () => {
+      configureBots([otherBot]);
+      const factory = factoryFor(new ScriptedWorker());
+      const ac = new AbortController();
+      ac.abort('user-requested');
+      await expect(createEphemeralPool({ factory, workerPath: '/tmp/worker.js', resolveLarkAppSecret: () => 'secret' })
+        .runNode({ ...request(), cancelSignal: ac.signal })).resolves.toMatchObject({ status: 'cancelled' });
+      expect(factory.lastOpts).toBeUndefined();
+    });
+
+    it('keeps an explicit resolver authoritative when the node bot is absent from bots.json', async () => {
+      configureBots([otherBot]);
+      const worker = new ScriptedWorker();
+      const running = createEphemeralPool({ factory: factoryFor(worker), workerPath: '/tmp/worker.js',
+        resolveLarkAppSecret: () => 'secret', resolveBot: appId => appId === nodeBot.larkAppId ? nodeBot : undefined })
+        .runNode(request());
+      try {
+        await worker.waitForInit();
+        expect(worker.init.env?.MODEL_AUTH).toBe('node-sentinel');
       } finally {
         worker.emitExit(0);
         await running;
@@ -1744,7 +2128,7 @@ class ScriptedWorker extends EventEmitter implements WorkerHandle {
   readonly autoReadyAfterInit: boolean;
   closeRequests = 0;
   init: any;
-  private contractScope?: WorkerSessionEventScope;
+  contractScope?: WorkerSessionEventScope;
   readyEmitted = false;
   private initResolve?: () => void;
   private initPromise = new Promise<void>((resolve) => { this.initResolve = resolve; });
@@ -1790,7 +2174,10 @@ class ScriptedWorker extends EventEmitter implements WorkerHandle {
 
   emitMessage(msg: unknown): void {
     const binding = this.contractScope?.currentBinding();
-    this.emit('message', binding && this.contractScope ? { ...(msg as any), sessionContract: this.contractScope.envelope({ bindingId: binding.bindingId, runtime: binding.runtime }) } : msg);
+    // Startup timers capture the execution supplied with init, just as spawnCli does.
+    const execution = (msg as any).type === 'prompt_ready' ? this.init?.sessionCommand?.execution : undefined;
+    const origin = binding && { bindingId: binding.bindingId, runtime: binding.runtime, execution };
+    this.emit('message', this.contractScope && origin ? { ...(msg as any), sessionContract: this.contractScope.envelope(origin) } : msg);
   }
 
   emitExit(code: number | null): void {

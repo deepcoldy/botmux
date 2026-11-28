@@ -49,12 +49,28 @@ const GUIDANCE: Record<IdentityRefusalReason, { cause: string; next: string }> =
     next: '重发一条消息开启新轮次后重试；连续出现再发 /login status 查看授权状态。',
   },
   bytecloud_grant_unavailable: {
-    cause: '本轮的默认 ByteCloud 凭据已过期，平台暂未返回有效的新凭据。',
+    cause: '本命令所需的平台凭据已过期，平台暂未返回有效的新凭据。',
     next: '稍后在同一轮重试。已有授权继续保留，无需反复登录。',
   },
   bytecloud_grant_denied: {
-    cause: '平台拒绝为这台机器续发本轮发起人的 ByteCloud 凭据。',
+    cause: '平台拒绝为这台机器续发本命令所需的凭据。',
     next: '请管理员检查平台授权和机器绑定。',
+  },
+  lark_grant_unavailable: {
+    cause: '本轮的飞书用户凭据已过期，平台暂未返回有效的新凭据。',
+    next: '稍后在同一轮重试。',
+  },
+  lark_grant_denied: {
+    cause: '平台拒绝为这台机器续发本轮发起人的飞书用户凭据。',
+    next: '请管理员检查平台授权和机器绑定。',
+  },
+  bytecloud_region_authorization_required: {
+    cause: '当前 ByteCloud 分区的凭据已过期，平台要求重新授权该分区。',
+    next: '在平台凭据页检查该站点的授权，完成后稍等片刻再重试。',
+  },
+  codebase_grant_authorization_required: {
+    cause: 'Codebase 凭据已过期，平台要求重新授权。',
+    next: '在平台凭据页检查 ByteCloud 和 Codebase 授权，完成后稍等片刻再重试。',
   },
   invalid_invocation: {
     cause: '包装脚本的参数不完整（会话、应用、端口或工具名缺失）。',

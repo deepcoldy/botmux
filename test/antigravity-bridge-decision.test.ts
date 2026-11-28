@@ -7,16 +7,60 @@
  * is now a pure function.
  */
 import { describe, it, expect } from 'vitest';
+import { hasStructuredBridgeTurnTerminal } from '../src/services/turn-terminal-capability.js';
 import {
   antigravityRecoveryBindPath,
   decideAntigravityFullUpgrade,
   decideAntigravityNotifyAction,
   decideAntigravityTickerAction,
+  shouldAcceptAntigravityDiscoveredSessionId,
   type AntigravityFullUpgradeInput,
 } from '../src/services/antigravity-bridge-decision.js';
 
 const A = '/home/u/.gemini/antigravity-cli/brain/A/.system_generated/logs/transcript.jsonl';
 const B = '/home/u/.gemini/antigravity-cli/brain/B/.system_generated/logs/transcript.jsonl';
+
+describe('Antigravity terminal reply fallback', () => {
+  it('collects ordinary turns from a supported local terminal', () => {
+    expect(hasStructuredBridgeTurnTerminal({ cliId: 'antigravity', backendType: 'tmux' })).toBe(true);
+    expect(hasStructuredBridgeTurnTerminal({ cliId: 'antigravity', backendType: 'pty' })).toBe(true);
+  });
+
+  it('defers to existing reply paths where the terminal transcript cannot be confirmed', () => {
+    expect(hasStructuredBridgeTurnTerminal({ cliId: 'antigravity', backendType: 'zmx' })).toBe(false);
+    expect(hasStructuredBridgeTurnTerminal({ cliId: 'antigravity', backendType: 'orca' })).toBe(false);
+    expect(hasStructuredBridgeTurnTerminal({ cliId: 'antigravity', backendType: 'remote-runner' })).toBe(false);
+    expect(hasStructuredBridgeTurnTerminal({ cliId: 'antigravity', backendType: 'tmux', scratch: true })).toBe(false);
+    expect(hasStructuredBridgeTurnTerminal({
+      cliId: 'antigravity', backendType: 'tmux', adapter: { runnerFramedInput: true },
+    })).toBe(false);
+    expect(hasStructuredBridgeTurnTerminal({ cliId: 'antigravity', adoptMode: true })).toBe(true);
+  });
+});
+
+describe('shouldAcceptAntigravityDiscoveredSessionId', () => {
+  const coldResume = {
+    discoveredSessionId: 'bbbbbbbb-0000-4000-8000-000000000000',
+    effectiveResume: true,
+    resumeSessionId: 'aaaaaaaa-0000-4000-8000-000000000000',
+    persistentReattach: false,
+    adoptMode: false,
+    discoverySource: 'process-discovery' as 'native-log' | 'process-discovery',
+  };
+
+  const cases: Array<[string, Partial<typeof coldResume>, boolean]> = [
+    ['rejects a transient sibling only during an explicit cold resume', {}, false],
+    ['accepts a later authoritative native-log rotation during cold resume', { discoverySource: 'native-log' }, true],
+    ['accepts the exact target without UUID casing changing identity', { discoveredSessionId: 'AAAAAAAA-0000-4000-8000-000000000000' }, true],
+    ['does not invent a target for a fresh launch', { effectiveResume: false }, true],
+    ['does not invent a target when resume was demoted to a fresh launch', { resumeSessionId: undefined }, true],
+    ['follows the current conversation of a persistent reattached pane', { persistentReattach: true }, true],
+    ['follows the current conversation of an adopted pane', { adoptMode: true }, true],
+  ];
+  it.each(cases)('%s', (_name, patch, expected) => {
+    expect(shouldAcceptAntigravityDiscoveredSessionId({ ...coldResume, ...patch })).toBe(expected);
+  });
+});
 
 describe('decideAntigravityTickerAction', () => {
   it('unbound + pending sid resolves → initial bind', () => {

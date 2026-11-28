@@ -204,8 +204,9 @@ describe('acceptCardClickTurn', () => {
           workingDir: '/tmp',
           live: { ownerOpenId: 'ou_owner', creatorOpenId: 'ou_creator' },
         };
-        return { ok: true, session };
+        return { ok: true, session, created: true };
       },
+      discardCreatedSession: async () => {},
       workingDirReady: dir => dir === '/tmp',
       setWorkingDir: (session, dir) => { session.workingDir = dir; },
       startTurn: async (session, args) => {
@@ -249,6 +250,24 @@ describe('acceptCardClickTurn', () => {
     expect(accepted).toEqual({ ok: false, reason: 'bot_or_app' });
     expect(started).toEqual([]);
     expect(created).toEqual([]);
+  });
+
+  it('rejects a card that expires while assistant-group admission is awaiting Lark', async () => {
+    let now = NOW;
+    const issued = issue({ ttlMs: 60_000 });
+    let finishAdmission!: () => void;
+    const assistantGroupAdmitted = vi.fn(() => new Promise<boolean>(resolve => {
+      finishAdmission = () => { now = issued.claims.exp; resolve(true); };
+    }));
+    const { deps, created, started } = harness({ now: () => now, assistantGroupAdmitted });
+
+    const pending = acceptCardClickTurn({
+      larkAppId: APP, operatorOpenId: 'ou_clicker', payload: issued.payload, sig: issued.sig,
+    }, deps);
+    finishAdmission();
+    expect(await pending).toEqual({ ok: false, reason: 'expired' });
+    expect(created).toEqual([]);
+    expect(started).toEqual([]);
   });
 
   it('refuses a missing session id instead of spawning another session', async () => {

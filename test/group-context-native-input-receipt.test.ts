@@ -54,6 +54,20 @@ function covered(nativeId: string | undefined, turnId: string): number[] {
 }
 
 describe('native input consumption receipt (store)', () => {
+  it('persists confirmed steering coverage before completion and preserves generation fencing', () => {
+    const binding = prepareBound('om_correction', { nativeId: 'native_known' });
+    const steerProof = { kind: 'codex_rpc_turn_steer' as const, nativeTurnId: 'active-native' };
+    expect(confirmGroupContextNativeInput({ ...binding, workerGeneration: 2 }, steerProof, dir)).toBe(false);
+    expect(covered('native_known', 'om_correction')).toEqual([]);
+    expect(confirmGroupContextNativeInput(binding, steerProof, dir)).toBe(true);
+    const receipt = readGroupContextDeliveryReceipt(base.appId, base.chatId, 'om_correction', dir, binding.epoch);
+    expect(receipt?.proof).toEqual(steerProof);
+    expect(receipt?.confirmedAt).toBeUndefined();
+    expect(covered('native_known', 'om_followup')).toEqual([1, 2, 3]);
+    expect(confirmGroupContextNativeInput(binding, steerProof, dir)).toBe(true);
+    expect(readGroupContextDeliveryReceipt(base.appId, base.chatId, 'om_correction', dir, binding.epoch)?.nativeConsumedAt).toBe(receipt?.nativeConsumedAt);
+  });
+
   it('covers frozen sources at consumption, before any terminal, and stays idempotent', () => {
     const binding = prepareBound('om_turn', { nativeId: 'native_known' });
     expect(covered('native_known', 'om_turn')).toEqual([]);
@@ -215,5 +229,46 @@ describe('next-turn preparation after a consumed input', () => {
     expect(withNew?.includedSeqs).toEqual([3]);
     const otherNative = await prepare({ appId: base.appId, chatId: base.chatId, turnId: 'om_other_native', query: 'q', createTime: 9_000, sessionId: base.sessionId, epoch: groupContextEpoch(base.sessionId, 'native_other', base.cliId, 'om_other_native'), scope: 'main' });
     expect(otherNative?.includedSeqs).toEqual([1, 2]);
+  });
+});
+
+describe('Antigravity transcript receipt', () => {
+  const agy = { ...base, cliId: 'antigravity' };
+  const agyProof = { kind: 'antigravity_transcript_user_input' as const };
+  function message(seq: number, messageId: string, text: string): GroupContextRenderMessage {
+    return { seq, messageId, chatId: agy.chatId, senderId: 'ou_user', senderType: 'user', senderName: 'u', msgType: 'text', text, createTime: String(1_000 + seq), resourceRefs: [], conversationScope: 'main' } as GroupContextRenderMessage;
+  }
+  const history = [message(1, 'om_a', 'first topic'), message(2, 'om_b', 'second topic')];
+  const prepare = createGroupContextPreparer({
+    settings: () => ({ enabled: true, maxContextChars: 24_000 }),
+    readPrepared: () => undefined,
+    writePrepared: value => writePreparedGroupContext(value, dir),
+    backfill: async () => ({ messages: [], incomplete: false }),
+    ingest: () => true,
+    readLocal: () => ({ messages: history, incomplete: false }),
+    deliveredSeqs: (appId, chatId, sessionId, epoch) => getDeliveredGroupContextSeqs(appId, chatId, sessionId, epoch, dir),
+    timeoutMs: 1_000,
+  });
+  const turn = (turnId: string, nativeId: string | undefined, createTime: number) => prepare({
+    appId: agy.appId, chatId: agy.chatId, turnId, query: 'q', createTime, sessionId: agy.sessionId,
+    epoch: groupContextEpoch(agy.sessionId, nativeId, agy.cliId, turnId), scope: 'main',
+  });
+
+  it('a consumed fresh first turn is promoted to its conversation and the next activation repeats no history', async () => {
+    // Fresh agy launch: the native conversation id is unknown at dispatch.
+    const first = await turn('om_first', undefined, 5_000);
+    expect(first?.includedSeqs).toEqual([1, 2]);
+    const binding: GroupContextDeliveryBinding = { appId: agy.appId, chatId: agy.chatId, turnId: 'om_first', sessionId: agy.sessionId, epoch: groupContextEpoch(agy.sessionId, undefined, agy.cliId, 'om_first') };
+    bindGroupContextDelivery(binding, dir);
+    bindGroupContextWorkerGeneration(binding, 4, dir);
+    expect(commitGroupContextDispatchIntoPayload({ content: `${first!.body}\n\nq` }, { ...binding, workerGeneration: 4 }, dir)?.dispatched.includedSeqs).toEqual([1, 2]);
+    const nativeId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    expect(confirmNativeGroupContextInput({ appId: agy.appId, chatId: agy.chatId, turnId: 'om_first', sessionId: agy.sessionId, cliId: agy.cliId, nativeSessionId: nativeId, workerGeneration: 4 }, agyProof, dir)).toBe(true);
+    const epoch = groupContextEpoch(agy.sessionId, nativeId, agy.cliId, 'om_first');
+    expect(readGroupContextDeliveryReceipt(agy.appId, agy.chatId, 'om_first', dir, epoch)?.proof).toEqual(agyProof);
+    // No terminal yet: the next activation in the same conversation still skips the frozen history.
+    expect((await turn('om_second', nativeId, 6_000))?.includedSeqs).toEqual([]);
+    // Another conversation (e.g. after /new) is not covered by this receipt.
+    expect((await turn('om_other', 'ffffffff-bbbb-cccc-dddd-eeeeeeeeeeee', 7_000))?.includedSeqs).toEqual([1, 2]);
   });
 });

@@ -20,7 +20,7 @@ import { readRawGlobalSessionEnv } from '../global-config.js';
 import { readSessionEnvStamp } from '../services/session-env-stamp.js';
 import { tmuxEnv } from '../setup/ensure-tmux.js';
 import { readProcessStartIdentity } from '../utils/process-identity.js';
-import { buildSessionChildEnv, inheritBotEnv, type EnvPolicy } from './env-policy.js';
+import { buildSessionChildEnv, buildBotWorkerEnv, inheritBotEnv, type EnvPolicy } from './env-policy.js';
 import { identityWrapperEnvKeys, reservedSessionEnvKeys, sessionEnvLock, type SessionEnvLockContext } from './per-bot-env.js';
 import { resolvePairedSpawnBackendType } from './persistent-backend.js';
 import { isRemoteBackendId } from './remote-cli-ids.js';
@@ -44,6 +44,9 @@ import { listActiveSessions, resolveSessionEnvForSession, sessionEnvWorkerBase }
 export interface SessionEnvViewOptions {
   /** Viewer without reveal rights: mask every value, not just credentials. */
   maskAll?: boolean;
+  /** Dedicated host input for a provider-owned core, without mutating process.env. */
+  baseEnv?: NodeJS.ProcessEnv;
+  sessions?: SessionEnvSessionInfo[];
 }
 
 function masker(opts: SessionEnvViewOptions): (key: string, value: string) => MaskedEnvValue {
@@ -67,17 +70,17 @@ export interface SessionEnvBaseline {
  * the terminal server's global env and the login shell's rcfile on top; the
  * live-session view shows those.
  */
-export function sessionEnvBaseline(policy?: EnvPolicy): SessionEnvBaseline {
+export function sessionEnvBaseline(policy?: EnvPolicy, baseEnv?: NodeJS.ProcessEnv): SessionEnvBaseline {
   const reserved = (key: string) => sessionEnvLock(key) === 'reserved';
-  const child = buildSessionChildEnv(sessionEnvWorkerBase(policy), policy);
+  const child = buildSessionChildEnv(baseEnv ? buildBotWorkerEnv(baseEnv,policy) : sessionEnvWorkerBase(policy), policy);
   const baseline: Record<string, string> = {};
   for (const [key, value] of Object.entries(child)) {
     if (value !== undefined && !reserved(key)) baseline[key] = value;
   }
-  const inherited = inheritBotEnv(process.env, policy);
+  const inherited = inheritBotEnv(baseEnv ?? process.env, policy);
   const redactedHostKeys = Object.keys(inherited).filter(k => !(k in child) && !reserved(k)).sort();
   const notInheritedKeys = policy?.mode === 'strict'
-    ? Object.keys(process.env).filter(k => !(k in inherited) && !reserved(k)).sort()
+    ? Object.keys(baseEnv ?? process.env).filter(k => !(k in inherited) && !reserved(k)).sort()
     : [];
   return { baseline, redactedHostKeys, notInheritedKeys };
 }
@@ -131,7 +134,7 @@ export function globalSessionEnvView(opts: SessionEnvViewOptions = {}): SessionE
 
 export function botSessionEnvView(bot: BotConfig, opts: SessionEnvViewOptions = {}): BotSessionEnvView {
   const ctx = sessionEnvLockContextForBot(bot);
-  const { baseline, redactedHostKeys, notInheritedKeys } = sessionEnvBaseline(bot.envPolicy);
+  const { baseline, redactedHostKeys, notInheritedKeys } = sessionEnvBaseline(bot.envPolicy,opts.baseEnv);
   const { layer: global } = globalLayerWithConflicts();
   const identityLockedKeys = identityWrapperEnvKeys(ctx);
   const backendType = effectiveBackendType(bot);
@@ -154,7 +157,7 @@ export function botSessionEnvView(bot: BotConfig, opts: SessionEnvViewOptions = 
     overlayApplies: sessionEnvOverlayApplies(backendType),
     identityLockedKeys,
     identityIgnoredKeys: identityLockedKeys.filter(k => bot.env?.[k] !== undefined),
-    sessions: sessionEnvSessions().filter(s => s.larkAppId === bot.larkAppId),
+    sessions: (opts.sessions ?? sessionEnvSessions()).filter(s => s.larkAppId === bot.larkAppId),
   };
 }
 

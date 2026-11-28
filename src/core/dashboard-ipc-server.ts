@@ -1,5 +1,23 @@
 import { freezeBytedcliHostLayout } from './bytedcli-host-layout.js';
 import { bytecloudExportBlocked } from './bytedcli-strict-session.js';
+import { nativeGatewayAskSnapshots, nativeGatewayAskDecision, type NativeGatewayAskOrigin } from './native-gateway-ask-control.js';
+import {
+  EXPECTED_CORE_BOOT_HEADER,
+  NATIVE_GATEWAY_EXCLUSIVE_ROUTE_PATTERNS,
+  NATIVE_GATEWAY_ROUTE_PATTERNS,
+  type NativeGatewayAskCallbackResponse,
+  type NativeGatewayAsksResponse,
+  type NativeGatewayCoreProfileResponse,
+  type NativeGatewayProgressResponse,
+  type NativeGatewayReminderStateResponse,
+  type NativeGatewaySourceIdentity,
+} from './native-gateway-contract.js';
+import { applyNativeGatewayCoreProfile } from './native-gateway-core-profile.js';
+import { nativeGatewayCoreCredential } from './native-gateway-credential.js';
+import { isCoreOnlyProcess, isNativeGatewayCoreProcess } from './runtime-mode.js';
+import {projectCoreOnlyReminderState} from './core-only-reminder-state.js';
+import { getTerminalAdvertisedPort } from './terminal-url.js';
+import { readDurableProcessIdentity } from '../utils/process-identity.js';
 import { isFeedGroupSelection, setChatFeedGroup } from '../services/chat-feed-groups.js';
 import { readOncallDeploymentEnv } from '../services/oncall-deployment-config.js';
 import { loadOncallPresetOptions } from '../services/oncall-preset-options.js';
@@ -128,6 +146,7 @@ import {
   tmuxServersEnvView,
 } from './session-env-host.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
+import { projectCoreOnlyProgress } from './core-only-progress.js';
 import { resolveAsyncTriggerState, decideAsyncOwnership } from '../services/async-trigger-state.js';
 import { isLoopbackPeer } from '../utils/loopback-peers.js';
 import * as scheduleStore from '../services/schedule-store.js';
@@ -178,7 +197,7 @@ import { parseGroupSerialInput } from './group-serial-input.js';
 import { setGroupDefaultModels } from '../services/group-default-models-store.js';
 import { parseGroupDefaultModels } from './group-default-models.js';
 import { setChatStreamingCardPin } from '../services/pin-streaming-card-mode-store.js';
-import { isValidRiffBaseUrl, isValidRiffSandboxCluster } from '../adapters/backend/riff-backend.js';
+import { isValidRiffAgent, isValidRiffBaseUrl, isValidRiffSandboxCluster } from '../adapters/backend/riff-backend.js';
 import { probeScratchCapability } from '../adapters/backend/scratch-capability.js';
 import { ensureBackendAvailable } from '../services/backend-availability.js';
 import type { BackendType } from '../adapters/backend/types.js';
@@ -205,7 +224,7 @@ import {
   CURRENT_EXECUTION_IDENTITY_ROUTE,
   CURRENT_EXECUTION_IDENTITY_SCHEMA,
 } from '../cli/current-execution.js';
-import { isBytedcliIdentityRegion } from '../platform/bytedcli-grant-regions.js';
+import { isBytedcliIdentityRegion, isBytedcliOverseasRegion } from '../platform/bytedcli-grant-regions.js';
 import { GRANT_WAIT_CAP_MS, PROVIDER_AUTH_REQUEST_ROUTE_BUDGET_MS } from '../platform/credential-grant-budget.js';
 import { resolveDaemonCurrentExecution } from './current-execution.js';
 import { configuredCliExecutionMode, sessionCliExecutionInfo } from './cli-execution-mode.js';
@@ -328,7 +347,7 @@ import {
   updateTaskWithOptionalPrecondition,
   type SchedulePreconditionMutation,
 } from './schedule-precondition-config.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, closeSessionForBackgroundCleanup, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, suspendWorkerAsync, killWorker, requestSessionRestart, isSessionRestartInFlight, getDaemonReplyCardUsageSnapshot, getDaemonReplyCardRenderSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, interruptExactWorkerTurn, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId, CARD_POSTING_SENTINEL, ensureReadonlyTaskContinuationAttached, isSessionEffortChangeInFlight, scheduleActiveRuntimePatch, updateHandoffLiveCard, isSessionLifecycleInFlight, hasPendingOrdinaryImDelivery, manualSuspendWaits, queueManualSuspend, identityStorageModelForDaemonSession, identityDecisionConflict, identityModelRefusalReason, dshRuntimeForSession } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, closeSessionForBackgroundCleanup, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, suspendWorkerAsync, killWorker, requestSessionRestart, isSessionRestartInFlight, getDaemonSessionUsageSnapshot, getDaemonReplyCardUsageSnapshot, getDaemonReplyCardRenderSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, interruptExactWorkerTurn, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId, CARD_POSTING_SENTINEL, ensureReadonlyTaskContinuationAttached, isSessionEffortChangeInFlight, scheduleActiveRuntimePatch, updateHandoffLiveCard, isSessionLifecycleInFlight, hasPendingOrdinaryImDelivery, manualSuspendWaits, queueManualSuspend, identityStorageModelForDaemonSession, identityDecisionConflict, identityModelRefusalReason, dshRuntimeForSession } from './worker-pool.js';
 import {
   awaitReadonlyTaskContinuationUser,
   cancelReadonlyTaskContinuationExplicit,
@@ -714,10 +733,11 @@ import { createProductionBytedcliBroker, type BytedcliBroker, type BytedcliHostL
 import { bytedcliSessionWasStrict, markBytedcliStrictSession } from './bytedcli-broker-containment.js';
 import { resolveVerifiedUserIdentityByUnionId } from '../im/lark/identity-cache.js';
 import { activePlatformCredentialBindingKey, reasonTag, platformAuthorizeUrl } from './platform-credential-source.js';
+import { platformLarkAuthorization, refreshPlatformLarkGrant } from './platform-lark-identity-renewal.js';
 import { askPlatformToAuthorize, type PlatformAuthorizationRequestResult } from './platform-authorization-request.js';
 import { hasReason, PLATFORM_WILL_NOT_ISSUE_REASONS } from './refusal-reasons.js';
 import { requestUnattendedAuthorization, noticeUnattendedLapse, clearUnattendedLapse, definitelyNotAuthorized, missingAuthorizationEntries, privateNoticeSender, unattendedTask, unattendedRefusalText, type UnattendedNoticeOutcome, type UnattendedProvider } from './capability-authorization.js';
-import { publishDelegationRefusal, adoptLocalBytedcliAuthorization, refreshExpiredPlatformBytedcliDefault, retryMissingRegionalGrant, retryTransientTurnIdentity, awaitTurnIdentityPublication } from './turn-cli-identity.js';
+import { publishDelegationRefusal, adoptLocalBytedcliAuthorization, refreshExpiredPlatformBytedcli, hasExpiredPlatformBitscliCredential, retryMissingRegionalGrant, retryTransientTurnIdentity, awaitTurnIdentityPublication } from './turn-cli-identity.js';
 import { boundLarkPlatformPolicy, platformAuthRequestRedirect, resolveBoundLarkUserCredential } from './lark-tool-platform-credential.js';
 import type { ReplyStyleConfig } from '../im/lark/reply-card-style.js';
 import {
@@ -834,6 +854,24 @@ export function ipcRoute(method: string, path: string, handler: Handler): void {
     '^' + path.replace(/:([a-zA-Z]+)/g, (_, k) => { keys.push(k); return '([^/]+)'; }) + '$',
   );
   routes.push({ method: method.toUpperCase(), pattern, keys, handler });
+}
+
+/**
+ * EXPECTED_CORE_BOOT_HEADER pins a request to one boot of a core-only
+ * service (a native gateway / its Dashboard sends it so a restarted core, or a
+ * different daemon now owning the port, can never act on a stale session id).
+ * Requests without the header — every fleet caller — pass unchanged. A request
+ * carrying it passes only on a core-only service whose current boot id matches;
+ * any other daemon, including a fleet daemon, answers 409 rather than serve a
+ * caller that expected a specific core.
+ */
+function coreBootMismatch(
+  header: string | string[] | undefined,
+  coreOnly: boolean,
+  bootId: string,
+): boolean {
+  if (header === undefined) return false;
+  return !coreOnly || header !== bootId;
 }
 
 const groupSendStorePath = (larkAppId: string): string => join(config.session.dataDir, `group-sends-${larkAppId}.json`);
@@ -1341,8 +1379,11 @@ function routeHasPublicAccess(method: string, pathname: string): boolean {
  * Core-only ONLY: the exact riff-facing routes that bypass the trusted-host HMAC
  * when the daemon runs headless in riff's sandbox. Everything else STILL requires
  * the HMAC (codex P1: authRequired:false opened all 96 IPC routes — a co-resident
- * model turn could read/perturb sessions, scheduler, mutations). This is a tight
- * allowlist of drive-my-own-turn + poll-my-own-output surfaces:
+ * model turn could read/perturb sessions, scheduler, mutations). A native gateway
+ * core holding its gateway's credential requires the HMAC on these as well (the
+ * credential, or the Dashboard secret where NATIVE_GATEWAY_EXCLUSIVE_ROUTE_PATTERNS
+ * allows it). This is a tight allowlist of drive-my-own-turn + poll-my-own-output
+ * surfaces:
  *   POST /api/trigger                              (start a turn)
  *       · options.steer=true authorizes a best-effort native turn/steer into
  *         a live codex-app turn; same drive-my-own-turn trust surface, no extra
@@ -1365,6 +1406,15 @@ function routeIsCoreOnlyPublic(method: string, pathname: string): boolean {
       || /^\/api\/sessions\/[^/]+\/host-facts$/.test(pathname);
   }
   return false;
+}
+
+const NATIVE_GATEWAY_EXCLUSIVE_ROUTES = NATIVE_GATEWAY_EXCLUSIVE_ROUTE_PATTERNS.map(pattern => new RegExp(
+  '^' + pattern.replace(/:([a-zA-Z]+)/g, '([^/]+)') + '$',
+));
+
+/** Whether `pathname` is a route only the native gateway calls (any method). */
+function routeIsNativeGatewayExclusive(pathname: string): boolean {
+  return NATIVE_GATEWAY_EXCLUSIVE_ROUTES.some(route => route.test(pathname));
 }
 
 export function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean {
@@ -1501,6 +1551,41 @@ function trustedHostAuthorized(
     ? { ok: true }
     : { ok: false, reason: verified.reason ?? 'unauthorized' };
 }
+
+// Trusted-host only: no entry in the core-only public route allowlist.
+ipcRoute('GET', NATIVE_GATEWAY_ROUTE_PATTERNS.sourceIdentity, (req, res) => {
+  let apiOnly = false;
+  try { apiOnly = getBot(cachedLarkAppId).config.apiOnly === true; } catch { /* fail closed */ }
+  if (!isCoreOnlyProcess() || !apiOnly) return jsonRes(res, 404, { ok: false });
+  const sid = new URL(req.url ?? '/', 'http://localhost').searchParams.get('sessionId');
+  const ds = sid ? findActiveBySessionId(sid) : undefined;
+  const worker = ds?.worker;
+  // Only a live worker of this bot's session has a terminal to prove.
+  const workerLive = !!ds
+    && ds.larkAppId === cachedLarkAppId
+    && worker?.connected === true
+    && !worker.killed
+    && worker.exitCode === null
+    && worker.signalCode === null;
+  const terminal = workerLive && sid && worker?.pid
+    ? {
+      sessionId: sid,
+      workerPid: worker.pid,
+      workerProcessStart: readDurableProcessIdentity(worker.pid),
+      proxyPort: getTerminalAdvertisedPort(),
+    }
+    : undefined;
+  const identity: NativeGatewaySourceIdentity = {
+    ok: true,
+    coreOnly: true,
+    coreBotId: cachedLarkAppId,
+    bootInstanceId: getDaemonBootId(),
+    pid: process.pid,
+    processStart: readDurableProcessIdentity(process.pid),
+    ...(terminal ? { terminal } : {}),
+  };
+  return jsonRes(res, 200, identity);
+});
 
 ipcRoute('GET', '/__health', (_req, res) => {
   jsonRes(res, 200, { ok: true });
@@ -1890,8 +1975,10 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
   const tool: IdentityRouteTool | '' = (identityRouteTools as readonly string[]).includes(toolValue)
     ? toolValue as IdentityRouteTool : '';
   const region = record?.region;
+  const codebase = record?.codebase;
   if (!sessionId || !tool || (record?.as !== undefined && typeof record.as !== 'string')
-    || (region !== undefined && (tool !== 'bytedcli' || !isBytedcliIdentityRegion(region)))) {
+    || (region !== undefined && (tool !== 'bytedcli' || !isBytedcliIdentityRegion(region)))
+    || (codebase !== undefined && (tool !== 'bytedcli' || codebase !== true || region !== undefined))) {
     return jsonRes(res, 400, blocked('invalid_request'));
   }
   const requestedAs = record?.as as string | undefined;
@@ -1997,26 +2084,52 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
       await awaitTurnIdentityPublication(config.session.dataDir, sessionId);
       env = recallProvenIdentityContent(config.session.dataDir, sessionId, speakerTurnId, tool);
     }
-    if (env && region && !delegation) {
+    const credential = tool === 'codebase' || codebase ? 'codebase' : tool === 'bitscli' ? 'default' : region;
+    if (env && credential && !delegation) {
       const refresh = {
         sessionDataDir: dataDir, sessionId, turnId: speakerTurnId, speakerOpenId: choice.speaker?.openId,
         currentPolicy, executionStillCurrent, waitMs: grantDeadline - Date.now(),
       };
-      const renewed = region === 'default' || region === 'cn'
-        ? await refreshExpiredPlatformBytedcliDefault({ ...refresh, region })
-        : await retryMissingRegionalGrant({ ...refresh, region });
-      if (!executionStillCurrent() || renewed === 'superseded') return jsonRes(res, 403, blocked('lineage_unproven'));
-      if (renewed === 'unavailable') return jsonRes(res, 503, blocked('bytecloud_grant_unavailable'));
-      if (renewed === 'denied') return jsonRes(res, 403, blocked('bytecloud_grant_denied'));
+      const credentials = tool === 'bitscli' ? ['default', 'codebase'] as const : [credential] as const;
+      const renewals = await Promise.all(credentials.map(credential => refreshExpiredPlatformBytedcli({ ...refresh, credential })));
+      if (renewals[0] === 'untracked' && isBytedcliOverseasRegion(region)) {
+        await retryMissingRegionalGrant({ ...refresh, region });
+      }
+      if (!executionStillCurrent() || renewals.includes('superseded')) return jsonRes(res, 403, blocked('lineage_unproven'));
+      if (renewals.includes('denied')) return jsonRes(res, 403, blocked('bytecloud_grant_denied'));
+      if (renewals.includes('regional_authorization_required')) return jsonRes(res, 403, blocked('bytecloud_region_authorization_required'));
+      if (renewals.includes('codebase_authorization_required')) return jsonRes(res, 403, blocked('codebase_grant_authorization_required'));
       env = recallProvenIdentityContent(dataDir, sessionId, speakerTurnId, tool);
-      if (renewed === 'not_authorized' || renewed === 'consent_missing') {
+      const consent = renewals.includes('consent_missing');
+      if (consent || renewals.includes('not_authorized')) {
         // Refuse this command without overwriting the turn's other credentials.
         // The existing wrapper flow can ask the platform for authorization.
-        const consent = renewed === 'consent_missing';
         const hint = t(consent ? 'trigger_user_auth.denied_platform_consent' : 'trigger_user_auth.denied_platform_login',
           { tool, provider: 'ByteCloud' }, localeForBot(liveAppId));
-        env = renderIdentityEnv({ tool: 'bytedcli', mode: 'denied', turnId: speakerTurnId,
+        env = renderIdentityEnv({ tool, mode: 'denied', turnId: speakerTurnId,
           openId: choice.speaker?.openId, message: `${hint}\n${reasonTag(consent ? 'platform_consent_missing' : 'platform_not_authorized')}` });
+      } else if (renewals.includes('unavailable') || (tool === 'bitscli' && hasExpiredPlatformBitscliCredential(refresh))) {
+        return jsonRes(res, 503, blocked('bytecloud_grant_unavailable'));
+      }
+    }
+    if (env && tool === 'lark-cli') {
+      const renewed = await refreshPlatformLarkGrant({
+        sessionDataDir: dataDir, sessionId, turnId: speakerTurnId, speakerOpenId: choice.speaker?.openId,
+        currentPolicy, executionStillCurrent, waitMs: grantDeadline - Date.now(),
+      });
+      if (renewed === 'superseded' || (renewed !== 'untracked' && !executionStillCurrent())) {
+        return jsonRes(res, 403, blocked('lineage_unproven'));
+      }
+      if (renewed === 'unavailable') return jsonRes(res, 503, blocked('lark_grant_unavailable'));
+      if (renewed === 'denied') return jsonRes(res, 403, blocked('lark_grant_denied'));
+      if (renewed === 'ready') env = recallProvenIdentityContent(dataDir, sessionId, speakerTurnId, tool);
+      if (renewed === 'not_authorized' || renewed === 'consent_missing') {
+        const consent = renewed === 'consent_missing';
+        const locale = localeForBot(liveAppId);
+        const hint = t(consent ? 'trigger_user_auth.denied_platform_consent' : 'trigger_user_auth.denied_platform_login',
+          { tool, provider: t('trigger_user_auth.provider_lark', undefined, locale) }, locale);
+        env = renderIdentityEnv({ tool, mode: 'denied', turnId: speakerTurnId, openId: choice.speaker?.openId,
+          message: `${hint}\n${reasonTag(consent ? 'platform_consent_missing' : 'platform_not_authorized')}` });
       }
     }
     if (strictExport() || !executionStillCurrent()) return jsonRes(res, 403, blocked('broker_export_disabled'));
@@ -4341,6 +4454,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/project-workstream', async (req, res,
     }
     const actor = { sessionId: ds.session.sessionId, larkAppId: ds.larkAppId, chatId: ds.chatId,
       scope: 'chat' as const, ownerKey, authorizedSourceOwnerKey, sourceAuthorizationStillValid, turnId: turn,
+      repostOnExpired: directHuman,
       authorizationStillValid: () => findActiveBySessionId(params.sessionId) === ds
         && ds.managedTurnOrigin === admittedOrigin && ds.managedTurnOrigin?.capability === admittedCapability
         && ds.managedTurnOrigin?.turnId === turn
@@ -5490,19 +5604,24 @@ async function handleProviderAuthRequest(
         || identityStorageModelForDaemonSession(ds) !== 'proven') return false;
       if (as === undefined) return true;
       try {
-        return governedSpeakers({ policy: currentPolicy(), tool: 'bytedcli',
+        return governedSpeakers({ policy: currentPolicy(), tool: provider === 'lark-cli' ? 'lark-cli' : 'bytedcli',
           sessionDataDir: dataDir, sessionId, origin: live })
           ?.some(speaker => speaker.openId === openId && speaker.turnId === publishedTurnId) ?? false;
       } catch { return false; }
     };
     const routeDeadline = Date.now() + PROVIDER_AUTH_REQUEST_ROUTE_BUDGET_MS;
     const grantDeadline = Math.min(routeDeadline, Date.now() + GRANT_WAIT_CAP_MS);
+    const larkRefresh = { sessionDataDir: dataDir, sessionId, turnId: publishedTurnId, speakerOpenId: openId,
+      currentPolicy, executionStillCurrent };
+    const larkAuthorization = provider === 'lark-cli' ? platformLarkAuthorization(larkRefresh) : undefined;
+    const larkAuthorizationFence = larkAuthorization?.stillAllowed;
+    const refuseStaleLarkAuthorization = () => jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
     const refreshBytedcli = ({ afterPlatformReady = false } = {}) => {
       // A ready answer authorizes one immediate re-ask, past the previous
       // refusal's cooldown. It gets its own grant window, bounded by this
       // request's overall route budget so the CLI can still receive an answer.
       const deadline = afterPlatformReady ? Math.min(routeDeadline, Date.now() + GRANT_WAIT_CAP_MS) : grantDeadline;
-      return refreshExpiredPlatformBytedcliDefault({
+      return refreshExpiredPlatformBytedcli({
         sessionDataDir: dataDir, sessionId, turnId: publishedTurnId, speakerOpenId: openId,
         currentPolicy, executionStillCurrent, waitMs: deadline - Date.now(), force: afterPlatformReady,
       });
@@ -5536,11 +5655,13 @@ async function handleProviderAuthRequest(
       needsRenewalAuthorization = true;
     }
     const asked = await askPlatformToAuthorize({ botConfig: cfg, openId,
-      ...(needsRenewalAuthorization ? { stillAllowed: canRequestRenewalAuthorization } : {}),
+      ...(needsRenewalAuthorization ? { stillAllowed: canRequestRenewalAuthorization } : larkAuthorization),
     });
     if (needsRenewalAuthorization && !canRequestRenewalAuthorization()) return renewalUnavailable(true);
+    if (larkAuthorizationFence?.() === false) return refuseStaleLarkAuthorization();
     if (asked.kind === 'legacy') {
-      const delivered = await deliverPlatformAuthorization(ds, cfg, openId, platformUrl, provider as AuthProvider | 'lark-cli', published);
+      const delivered = await deliverPlatformAuthorization(ds, cfg, openId, platformUrl,
+        provider as AuthProvider | 'lark-cli', published, larkAuthorizationFence);
       return jsonRes(res, 200, { ok: true, provider, ...delivered });
     }
     if (asked.kind === 'ready') {
@@ -5557,12 +5678,21 @@ async function handleProviderAuthRequest(
         if (renewed === 'denied') return renewalDenied();
         if (renewed !== 'ready' && renewed !== 'untracked') return renewalUnavailable(renewed === 'superseded');
       }
+      if (provider === 'lark-cli' && published?.('lark-cli')?.includes("BOTMUX_IDENTITY_MODE='user'")) {
+        const renewed = await refreshPlatformLarkGrant({ ...larkRefresh,
+          waitMs: Math.min(routeDeadline - Date.now(), GRANT_WAIT_CAP_MS), force: true });
+        if (renewed === 'superseded' || larkAuthorizationFence?.() === false) return refuseStaleLarkAuthorization();
+        if (renewed === 'denied') return renewalDenied();
+        if (renewed !== 'ready' && renewed !== 'untracked') return jsonRes(res, 200, { ok: true, provider, status: 'unavailable',
+          message: t('trigger_user_auth.denied_platform_unavailable_retryable',
+            { tool: provider, provider: t('trigger_user_auth.provider_lark', undefined, loc) }, loc) });
+      }
       const effective = recallProvenIdentityContent(config.session.dataDir, sessionId, publishedTurnId, provider as TriggerUserAuthTool)
         ?.includes("BOTMUX_IDENTITY_MODE='user'");
       return jsonRes(res, 200, { ok: true, provider, status: 'ready',
         message: t(effective ? 'provider_auth.platform_ready_now' : 'provider_auth.platform_ready', undefined, loc) });
     }
-    return jsonRes(res, 200, { ok: true, provider, ...await platformCardOutcome(ds, asked) });
+    return jsonRes(res, 200, { ok: true, provider, ...await platformCardOutcome(ds, asked, larkAuthorizationFence) });
   }
   const localBytecloudPolicyCurrent = provider === 'bytedcli' ? () => {
     try {
@@ -6312,12 +6442,17 @@ ipcRoute('POST', '/api/sessions/:sessionId/project', async (req, res, params) =>
   if (action.action === 'report' && action.expectedAttachment && !isTrustedHostIpcRequest(req)) {
     return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
   }
+  // Report relay traffic always leaves publication to sync. Only a caller
+  // that opts into immediate recovery on the control path can repost inline.
+  const cardPublication = action.action === 'report'
+    ? 'deferred' : body?.cardPublication === 'repost' ? 'repost' : 'patch';
   try {
     const project = await projectCoordinator.run({
       dataDir: config.session.dataDir,
       chatId: ds.chatId,
       larkAppId: ds.larkAppId,
       coordinatorSessionId: ds.session.sessionId,
+      cardPublication,
     }, action, action.action === 'report' && action.expectedAttachment ? () => {
       const record = readProjectAttachmentRecord(config.session.dataDir, ds.chatId, action.dispatchRoot);
       const source = record && sessionStore.getSession(record.source.sessionId);
@@ -6333,6 +6468,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/project', async (req, res, params) =>
         || mode?.mode !== 'project' || mode.coordinatorAppId !== ds.larkAppId
         || !mode.workerAppIds?.includes(record.source.larkAppId)) throw new Error('project_attachment_revision_conflict');
     } : undefined);
+    if (cardPublication === 'deferred') projectCardRuntimeObserver?.(ds.chatId);
     if (action.action === 'init') {
       await refreshProjectImportCardsForChat({
         coordinatorAppId: ds.larkAppId,
@@ -7185,6 +7321,7 @@ ipcRoute('POST', '/api/project-groups/:chatId/refresh-card', async (_req, res, p
       chatId,
       larkAppId: cachedLarkAppId,
       coordinatorSessionId: project.coordinatorSessionId,
+      cardPublication: 'repost',
     }, { action: 'refresh' });
     return jsonRes(res, 200, { ok: true, project: refreshed });
   } catch (error) {
@@ -7690,7 +7827,7 @@ function buildAsyncTriggerLookupResponse(
   // on explicit /write-link request). buildTerminalUrl carries ?viewToken=
   // inline; the write token is never included. Closed/restored sessions have no
   // live worker terminal, so no stale URL is ever advertised.
-  if (process.env.BOTMUX_CORE_ONLY === '1' && ds && ds.workerPort && ds.workerViewToken) {
+  if (isCoreOnlyProcess() && ds && ds.workerPort && ds.workerViewToken) {
     resolved.readOnlyUrl = buildTerminalUrl(ds, { viewScope: 'worker' });
     resolved.viewToken = ds.workerViewToken;
   }
@@ -8317,11 +8454,193 @@ ipcRoute('GET', '/api/sessions/:sessionId/trigger-result', (req, res, params) =>
 });
 
 /**
+ * The exact live execution a native gateway may act for: `triggerId` must be
+ * the pending turn of an apiOnly HTTP virtual session of this core-only
+ * service's own bot, running on the current worker generation under the live
+ * managed origin.
+ *
+ * The ask projection and decisions built on this require trusted-host HMAC even
+ * in core-only mode — never add these routes to the unauthenticated core-only
+ * allowlist. Identity is asserted only by the authenticated gateway after its
+ * own callback ACL, never by Desktop or a worker session capability.
+ */
+function currentNativeGatewayAskOrigin(
+  sessionId: string,
+  triggerId: string,
+): { origin: NativeGatewayAskOrigin; appId: string; chatId: string } | undefined {
+  const ds = findActiveBySessionId(sessionId);
+  let apiOnly = false;
+  try {
+    apiOnly = !!cachedLarkAppId && getBot(cachedLarkAppId).config.apiOnly === true;
+  } catch { /* fail closed */ }
+  if (!isCoreOnlyProcess() || !apiOnly || !ds || ds.larkAppId !== cachedLarkAppId
+    || ds.session.larkAppId !== cachedLarkAppId || !isHttpVirtualSession(ds.chatId)) {
+    return;
+  }
+  const progress = projectCoreOnlyProgress(ds, triggerId);
+  if (!progress) return;
+  // A dispatch attempt is numbered per turn: it identifies this trigger's
+  // execution only while the live managed origin is this very turn.
+  const managedOrigin = ds.managedTurnOrigin;
+  if (managedOrigin?.turnId !== triggerId) return;
+  return {
+    origin: {
+      sessionId,
+      turnId: triggerId,
+      workerGeneration: progress.workerGeneration,
+      dispatchAttempt: managedOrigin.dispatchAttempt,
+    },
+    appId: ds.larkAppId,
+    chatId: ds.chatId,
+  };
+}
+
+ipcRoute('GET', NATIVE_GATEWAY_ROUTE_PATTERNS.asks, (req, res, params) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  const url = new URL(req.url ?? '/', 'http://localhost');
+  const values = url.searchParams.getAll('triggerId');
+  if (values.length !== 1 || url.searchParams.size !== 1 || !values[0] || values[0].length > 256) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_trigger_id' });
+  }
+  const current = currentNativeGatewayAskOrigin(params.sessionId, values[0]);
+  res.setHeader('cache-control', 'no-store');
+  const body: NativeGatewayAsksResponse = {
+    ok: true,
+    asks: current ? nativeGatewayAskSnapshots(current.origin, current.appId, current.chatId) : [],
+  };
+  return jsonRes(res, 200, body);
+});
+
+ipcRoute('POST', NATIVE_GATEWAY_ROUTE_PATTERNS.asks, async (req, res, params) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  const body = await readJsonBodyOrBadJson<Record<string, unknown>>(req, res);
+  if (body === BAD_JSON) return;
+  const origin = body.origin as NativeGatewayAskOrigin | undefined;
+  const current = currentNativeGatewayAskOrigin(params.sessionId, origin?.turnId ?? '');
+  if (!current) return jsonRes(res, 409, { ok: false, error: 'stale_execution' });
+  const outcome = nativeGatewayAskDecision(body, current.origin, current.appId, current.chatId);
+  const response: NativeGatewayAskCallbackResponse = { ok: true, outcome };
+  return jsonRes(res, 200, response);
+});
+
+ipcRoute('GET', NATIVE_GATEWAY_ROUTE_PATTERNS.progress, (req, res, params) => {
+  res.setHeader('cache-control', 'no-store');
+  const ds = findActiveBySessionId(params.sessionId);
+  const url = new URL(req.url ?? '/', 'http://localhost');
+  const values = url.searchParams.getAll('triggerId');
+  const triggerId = values.length === 1 ? values[0] : '';
+  let apiOnly = false;
+  try { apiOnly = !!cachedLarkAppId && getBot(cachedLarkAppId).config.apiOnly === true; } catch { /* fail closed */ }
+  if (!apiOnly || !cachedLarkAppId || !ds || ds.larkAppId !== cachedLarkAppId
+    || ds.session.larkAppId !== cachedLarkAppId || !isHttpVirtualSession(ds.chatId)) {
+    return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  }
+  if (!triggerId || triggerId.length > 256 || url.searchParams.size !== 1) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_trigger_id' });
+  }
+  const progress = projectCoreOnlyProgress(ds, triggerId);
+  let usage: ReturnType<typeof getDaemonSessionUsageSnapshot> | undefined;
+  if (progress) {
+    try { usage = getDaemonSessionUsageSnapshot(ds); } catch { /* no observed usage */ }
+  }
+  // `usage` copies the card usage snapshot's context, cumulative tokens and
+  // turn delta, in the shape CoreOnlyProgressUsage declares.
+  const body: NativeGatewayProgressResponse = {
+    ok: true,
+    progress: progress
+      ? {
+        ...progress,
+        ...(ds.activeModel ? { model: ds.activeModel } : {}),
+        ...(usage
+          ? { usage: { context: usage.context, tokens: usage.tokens, turnTokens: usage.turnTokens ?? null } }
+          : {}),
+      }
+      : null,
+  };
+  return jsonRes(res, 200, body);
+});
+
+/** Native recipient reminders remain trusted-host only, like native gateway progress. */
+ipcRoute('GET', NATIVE_GATEWAY_ROUTE_PATTERNS.reminderState, (req, res, params) => {
+  res.setHeader('cache-control', 'no-store');
+  const ds = findActiveBySessionId(params.sessionId);
+  const url = new URL(req.url ?? '/', 'http://localhost');
+  const values = url.searchParams.getAll('triggerId');
+  const triggerId = values.length === 1 ? values[0] : '';
+  let apiOnly = false;
+  try { apiOnly = !!cachedLarkAppId && getBot(cachedLarkAppId).config.apiOnly === true; } catch { /* fail closed */ }
+  if (!apiOnly || !cachedLarkAppId || !ds || ds.larkAppId !== cachedLarkAppId
+    || ds.session.larkAppId !== cachedLarkAppId || !isHttpVirtualSession(ds.chatId)) {
+    return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  }
+  if (!triggerId || triggerId.length > 256 || url.searchParams.size !== 1) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_trigger_id' });
+  }
+  let observed = ds;
+  if (!ds.latestAsyncTriggerId) {
+    // Restored dormant workers can lack the in-memory latest pointer. Only a
+    // strict, bot-owned durable latest receipt may replace that missing fact.
+    const receipt = asyncTriggerStore.lookupStrict(params.sessionId);
+    if (receipt?.ownerLarkAppId !== cachedLarkAppId || receipt.triggerId !== triggerId) {
+      const none: NativeGatewayReminderStateResponse = { ok: true, reminder: null };
+      return jsonRes(res, 200, none);
+    }
+    observed = { ...ds, latestAsyncTriggerId: receipt.triggerId };
+  }
+  const body: NativeGatewayReminderStateResponse = {
+    ok: true,
+    reminder: projectCoreOnlyReminderState(observed, triggerId) ?? null,
+  };
+  return jsonRes(res, 200, body);
+});
+
+/**
+ * After a native gateway core took a new core profile: close the sessions frozen
+ * on a CLI the bot no longer runs, with the sweep a Feishu bot's Agent save runs
+ * (POST /api/bots/:larkAppId/cli). Sessions it skips (protected ownership, a
+ * routing transfer) or fails to close stay as they are; only the counts are
+ * logged, the per-session refusal or residual is logged by the sweep itself.
+ */
+async function closeSessionsOfReplacedAgent(larkAppId: string): Promise<void> {
+  const swept = await closeCliMismatchedSessionsForBot(larkAppId);
+  logger.info(
+    `[native-gateway] core profile replaced; new sessions use the new settings; `
+    + `sessions on a previous agent: closed=${swept.closed} residual=${swept.residual} failed=${swept.failed}`,
+  );
+}
+
+/**
+ * The gateway's configuration changed: the core settings new sessions use
+ * (core/native-gateway-core-profile.ts). Exists only in a native gateway core;
+ * there the server-wide gate admits it with the gateway's own credential alone
+ * (NATIVE_GATEWAY_EXCLUSIVE_ROUTE_PATTERNS).
+ *
+ * Like a Feishu bot's Agent save, the profile is replaced and the sessions of a
+ * replaced CLI are closed inside one exclusive bot turn mutation, and the answer
+ * follows both: no turn is admitted in between, and a turn the gateway sends
+ * after this answer never reaches a session of the previous CLI.
+ */
+ipcRoute('POST', NATIVE_GATEWAY_ROUTE_PATTERNS.coreProfile, async (req, res) => {
+  if (!isNativeGatewayCoreProcess() || !cachedLarkAppId) return jsonRes(res, 404, { ok: false, error: 'not_found' });
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  const body = await readJsonBodyOrBadJson(req, res, 1024 * 1024);
+  if (body === BAD_JSON) return;
+  const larkAppId = cachedLarkAppId;
+  return withBotTurnMutation(larkAppId, async () => {
+    const result = applyNativeGatewayCoreProfile(larkAppId, body);
+    if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.error });
+    if (result.changed) await closeSessionsOfReplacedAgent(larkAppId);
+    const response: NativeGatewayCoreProfileResponse = { ok: true, changed: result.changed };
+    return jsonRes(res, 200, response);
+  });
+});
+
+/**
  * core-only 会话宿主事实：供嵌入方读取会话、CLI、后端、worker 与 native session 状态。
  *
- * 路由只在 startIpcServer({ coreOnlyPublicRoutes:true }) 时免 HMAC；普通 fleet 仍需可信
- * host 鉴权。即使在 core-only 下也只允许本 daemon 的 apiOnly HTTP virtual session，且
- * 永不返回 tmux socket、worker token、PID、环境变量或任意终端写 capability。
+ * 路由只在 startIpcServer({ coreOnlyPublicRoutes:true }) 时免 HMAC（持有网关凭据的原生网关
+ * core 除外）；普通 fleet 仍需可信 host 鉴权。即使在 core-only 下也只允许本 daemon 的
+ * apiOnly HTTP virtual session，且永不返回 tmux socket、worker token、PID、环境变量或任意终端写 capability。
  */
 ipcRoute('GET', '/api/sessions/:sessionId/host-facts', (_req, res, params) => {
   const ds = findActiveBySessionId(params.sessionId);
@@ -8552,7 +8871,8 @@ ipcRoute('POST', '/api/sessions/:sessionId/rename', async (req, res, params) => 
   const source = normalizeSessionTitleSource(body.source, 'dashboard');
   const updated = updateSessionTitle(session, title, source);
   if (!updated.ok) return jsonRes(res, 400, { ok: false, error: updated.error });
-  const agentSync = active
+  const localSourceMetadata = isCoreOnlyProcess() && typeof req.headers[EXPECTED_CORE_BOOT_HEADER] === 'string';
+  const agentSync = active && !localSourceMetadata
     ? requestAgentSessionRename(active, updated.title)
     : { status: 'not_running' as const };
   jsonRes(res, 200, {
@@ -8784,7 +9104,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => 
     void reconcileResumedStreamingCard(
       ds,
       staleCardId,
-      cardJson => replyMessage(ds.larkAppId, rootMessageId, cardJson, 'interactive', true),
+      (cardJson, uuid) => replyMessage(ds.larkAppId, rootMessageId, cardJson, 'interactive', true, uuid),
     ).then(async (result) => {
       if (result.status === 'committed') await postResumeNotice();
     }).catch(async (err) => {
@@ -9138,7 +9458,7 @@ export interface ScheduleRow {
   createdAt: string;
   lastRunAt?: string;
   nextRunAt?: string;
-  lastStatus?: 'running' | 'ok' | 'error' | 'skipped';
+  lastStatus?: 'running' | 'ok' | 'error' | 'skipped' | 'deferred';
   lastError?: string;
   repeat?: { times: number | null; completed: number };
   /** until-done state, run ledger and owner notification settings. They feed
@@ -10097,9 +10417,11 @@ ipcRoute('DELETE', '/api/schedules/:id', requireBoundBot((_req, res, p) => {
   }
 }, NOT_BOUND_BODY.okFalse));
 
-async function handleTriggerIpc(req: IncomingMessage, res: ServerResponse, endpoint: 'ordinary' | 'owner' | 'host'): Promise<void> {
+async function handleTriggerIpc(req: IncomingMessage, res: ServerResponse, endpoint: 'ordinary' | 'owner' | 'host' | 'owner-union'): Promise<void> {
   const ownerActorEndpoint = endpoint === 'owner';
-  const hostFieldsEndpoint = endpoint === 'host';
+  // owner-union carries `actorUnionId`, plus any host field the request also needs.
+  const ownerUnionEndpoint = endpoint === 'owner-union';
+  const hostFieldsEndpoint = endpoint === 'host' || ownerUnionEndpoint;
   if ((ownerActorEndpoint || hostFieldsEndpoint) && !isTrustedHostIpcRequest(req)) {
     return jsonRes(res, 403, { ok: false, errorCode: 'actor_not_allowed' });
   }
@@ -10114,6 +10436,11 @@ async function handleTriggerIpc(req: IncomingMessage, res: ServerResponse, endpo
   const valid = validateTriggerRequest(body);
   if (!valid.ok) return jsonRes(res, valid.status, valid.body);
   if (!hostFieldsEndpoint && ownerActorEndpoint !== (valid.request.actor === 'owner')) {
+    return jsonRes(res, 403, { ok: false, errorCode: 'actor_not_allowed' });
+  }
+  // The Dashboard sends `actorUnionId` here so an older daemon, which would
+  // ignore the field and act as the owner anyway, answers 404 instead.
+  if (ownerUnionEndpoint && valid.request.actorUnionId === undefined) {
     return jsonRes(res, 403, { ok: false, errorCode: 'actor_not_allowed' });
   }
   // Host-only fields live on a distinct route so mixed-version fleets fail
@@ -10168,7 +10495,7 @@ async function handleTriggerIpc(req: IncomingMessage, res: ServerResponse, endpo
         ? 409
       : (ownerActorEndpoint || (hostFieldsEndpoint && valid.request.actor === 'owner')) && result.errorCode === 'session_not_runnable'
         ? 409
-      : result.errorCode === 'bot_not_in_chat' || result.errorCode === 'owner_unresolved'
+      : result.errorCode === 'bot_not_in_chat' || result.errorCode === 'owner_unresolved' || result.errorCode === 'owner_mismatch'
         || result.errorCode === 'run_as_not_allowed' || result.errorCode === 'run_as_unresolved'
         ? 403
         : result.errorCode === 'session_not_found'
@@ -10188,6 +10515,7 @@ const unboundTriggerResponse = { ok: false, errorCode: 'bot_not_found', error: '
 ipcRoute('POST', '/api/trigger', requireBoundBot((req, res) => handleTriggerIpc(req, res, 'ordinary'), unboundTriggerResponse));
 ipcRoute('POST', '/api/trigger/owner', requireBoundBot((req, res) => handleTriggerIpc(req, res, 'owner'), unboundTriggerResponse));
 ipcRoute('POST', '/api/trigger/host', requireBoundBot((req, res) => handleTriggerIpc(req, res, 'host'), unboundTriggerResponse));
+ipcRoute('POST', '/api/trigger/owner-union', requireBoundBot((req, res) => handleTriggerIpc(req, res, 'owner-union'), unboundTriggerResponse));
 
 // ─── Exact chat grants (talk-only) ─────────────────────────────────────────
 
@@ -11879,8 +12207,6 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     const configured = getBot(cachedLarkAppId).config.p2pMode;
     if (configured === 'thread' || configured === 'group') p2pMode = configured;
   } catch { /* default chat */ }
-  let envelopeInjection: 'auto' | 'off' = 'off';
-  try { if (getBot(cachedLarkAppId).config.envelopeInjection === 'auto') envelopeInjection = 'auto'; } catch { /* default off */ }
   // 最终回复投递方式：给 dashboard 的是**生效值**（显式配置 → 否则按 CLI 缺省，
   // doubao 缺省 transcript、其余 send）
   // + 该 CLI 的缺省值 + 当前 CLI 是否支持 transcript（dashboard 据此禁用开关并说明）。
@@ -12066,9 +12392,12 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     larkBotName = bot.botName ?? null;
   } catch { /* none */ }
   const sandboxPathsForDashboard = sandboxStore.getBotSandboxPaths(cachedLarkAppId);
+  const currentBotConfig = getBot(cachedLarkAppId).config;
   jsonRes(res, 200, {
     larkAppId: cachedLarkAppId,
-    apiOnly: getBot(cachedLarkAppId).config.apiOnly === true,
+    apiOnly: currentBotConfig.apiOnly === true,
+    commandTriggersConfigured: Boolean(currentBotConfig.commandTriggers?.commands.length),
+    blockedUsersConfigured: Boolean(currentBotConfig.blockedUsers?.length),
     botName: getBotName(),
     displayName,
     larkBotName,
@@ -12156,9 +12485,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     sandboxMode: sandboxStore.getBotSandboxMode(cachedLarkAppId),
     // Machine-wide BOTMUX_SANDBOX force the worker applies over this bot's own
     // selection (null = none). Lets the page say why "关闭" is not what runs.
-    sandboxEnvForce: (() => {
-      try { const m = envSandboxMode(process.env.BOTMUX_SANDBOX); return m === 'off' ? null : m; } catch { return null; }
-    })(),
+    sandboxEnvForce: dashboardSandboxEnvForce(),
     scratchStorage: (() => { try { return getBot(cachedLarkAppId).config.scratchStorage ?? null; } catch { return null; } })(),
     scratchTmpfsSizeMb: (() => { try { return getBot(cachedLarkAppId).config.scratchTmpfsSizeMb ?? null; } catch { return null; } })(),
     scratchDenyPaths: (() => { try { return getBot(cachedLarkAppId).config.scratchDenyPaths ?? null; } catch { return null; } })(),
@@ -12280,7 +12607,8 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     messageQuotaDefaultLimit: grantPrefs.messageQuotaDefaultLimit,
     grantDefaultDurationMs: grantPrefs.grantDefaultDurationMs,
     p2pMode,
-    envelopeInjection,
+    // Read-only compatibility field for stale Dashboard chunks: hook injection is now default-on.
+    envelopeInjection: 'auto',
     triggerUserAuth,
     larkToolBinding: getBot(cachedLarkAppId).config.larkToolBinding !== false,
     larkUserOwnerFallback: getBot(cachedLarkAppId).config.larkUserOwnerFallback !== false,
@@ -13617,6 +13945,15 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
     } else if (bot.config.backendType && isRemoteBackendType(bot.config.backendType)) {
       bot.config.backendType = undefined;
     }
+    if (selected.cliId === 'claude-code') {
+      try {
+        (await import('./worker-pool.js')).ensureCliEnv?.(
+          'claude-code',
+          bot.config.cliPathOverride,
+          { configDir: bot.config.cliConfigDir },
+        );
+      } catch { /* best-effort */ }
+    }
 
     // 热切后立刻清掉本 bot 名下失配的存量会话——否则它们冻结的旧 CLI 会被下一条
     // 消息 lazy resume 复活，要等下次 daemon 重启才被 restore 守卫清理。
@@ -13656,6 +13993,13 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
       // rejected above; retain the legacy cleared flag for older clients.
       readIsolation: bot.config.readIsolation === true,
       readIsolationSupported: readIsolationEnforceableFor(bot.config),
+      // The summary must follow the just-saved CLI/backend pairing without a full page reload.
+      localSandboxApplies: localSandboxApplies(
+        resolvePairedBackendId(bot.config.cliId, bot.config.backendType, config.daemon.backendType) ?? 'pty',
+        bot.config.mojo,
+      ),
+      effectiveSandboxMode: effectiveBotSandboxMode(bot.config),
+      sandboxEnvForce: dashboardSandboxEnvForce(),
       readIsolationCleared: false,
       codexBrowserCleared,
       agentAvailable: availability.available,
@@ -13846,15 +14190,13 @@ botConfigPutRoute<{ p2pMode?: unknown }>('/api/bot-p2p-mode', 'p2pMode', {
   respond: value => ({ ok: true, p2pMode: value ?? 'chat' }),
 });
 
-// Per-bot 每轮上下文注入方式 envelopeInjection（#794）。Body `{ envelopeInjection: 'auto'|'off'|'' }`:
-//   • 'auto' → 支持的 CLI（claude-code）把 reminder/whiteboard 经 UserPromptSubmit
-//     hook 注入为 system-reminder，user turn 只留消息本身；不支持的自动回退内联
-//   • 'off'/其它 → 内联 envelope（历史行为，默认）
-// 走 applyConfigField（与 /botconfig 同一写盘 + 热更新路径），下一个 follow-up turn 生效。
-botConfigPutRoute<{ envelopeInjection?: unknown }>('/api/bot-envelope-injection', 'envelopeInjection', {
-  normalize: body => fieldOk(body.envelopeInjection === 'auto' ? 'auto' : null),
-  respond: value => ({ ok: true, envelopeInjection: value ?? 'off' }),
-});
+// 只读兼容路由：Claude Code hook 注入已默认开启并移除实验开关，保留此路由避免
+// 升级前已打开的 Dashboard 缓存分包或旧 API 客户端收到 404/500；不改写 bots.json。
+ipcRoute('PUT', '/api/bot-envelope-injection', requireBoundBot(async (req, res) => {
+  const body = await readJsonBodyOrBadJson(req, res);
+  if (body === BAD_JSON) return;
+  jsonRes(res, 200, { ok: true, envelopeInjection: 'auto' });
+}));
 
 botConfigPutRoute('/api/bot-topic-unavailable-policy', 'topicUnavailablePolicy', {
   normalize: body => {
@@ -14438,6 +14780,16 @@ botConfigPutRoute<{ enabled?: unknown; autoAvoidApproval?: unknown }>('/api/bot-
   },
   respond: value => ({ ok: true, autoAvoidApproval: value !== false }),
 });
+/** Machine-wide sandbox override reported consistently by dashboard GET and agent PUT. */
+function dashboardSandboxEnvForce(): 'oncall' | 'scratch' | null {
+  try {
+    const mode = envSandboxMode(process.env.BOTMUX_SANDBOX);
+    return mode === 'off' ? null : mode;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * The sandbox mode the worker will spawn this bot's CLI under
  * (resolveLocalSandboxMode: global BOTMUX_SANDBOX and the legacy readIsolation
@@ -14557,7 +14909,7 @@ ipcRoute('DELETE', '/api/bot-trigger-user-auth/users/:openId', requireBoundBot(a
 /** riff 配置里 dashboard 可编辑的字段——PUT /bot-riff 只覆盖这些，其余保留。 */
 // injectStatusLines 已从 dashboard UI 移除（恒默认开启）——不在此集合中意味着
 // 存量 bots.json 值按「隐藏字段」原样保留。
-const RIFF_UI_EDITABLE_KEYS = new Set(['baseUrl', 'sandboxCluster', 'model', 'reasoningEffort', 'jwtEnv', 'systemPrompt', 'setupCommands']);
+const RIFF_UI_EDITABLE_KEYS = new Set(['baseUrl', 'sandboxCluster', 'agent', 'model', 'reasoningEffort', 'jwtEnv', 'systemPrompt', 'setupCommands']);
 
 /** 发给浏览器前脱敏：明文 jwt / env（可能含各类密钥）绝不进 dashboard 响应。 */
 function redactRiffForClient(riff: unknown): Record<string, unknown> | null {
@@ -14578,12 +14930,20 @@ botConfigPutRoute<{ riff?: unknown }>('/api/bot-riff', 'riff', {
     // 一个 model 就会静默删掉认证等隐藏配置。
     const prev = (getBot(cachedLarkAppId).config.riff ?? {}) as Record<string, unknown>;
     const preserved = Object.fromEntries(Object.entries(prev).filter(([k]) => !RIFF_UI_EDITABLE_KEYS.has(k)));
-    // Older dashboard clients do not send sandboxCluster. Preserve a valid
-    // existing selection for them; a brand-new config follows Riff's BOE
-    // default. New clients always submit the explicit dropdown value.
+    // Older dashboard clients do not send sandboxCluster or agent. Preserve a valid
+    // existing selection for them (and keep legacy hidden agent values untouched);
+    // a brand-new config follows Riff's BOE / codex defaults. New clients always
+    // submit the explicit dropdown values.
     const sandboxCluster = value.sandboxCluster ?? prev.sandboxCluster ?? 'boe';
     if (!isValidRiffSandboxCluster(sandboxCluster)) return fieldInvalid('invalid_sandbox_cluster');
-    value = { ...preserved, ...value, sandboxCluster };
+    if (value.agent !== undefined && !isValidRiffAgent(value.agent)) return fieldInvalid('invalid_agent');
+    const agent = value.agent !== undefined ? value.agent : prev.agent;
+    value = {
+      ...preserved,
+      ...value,
+      sandboxCluster,
+      ...(agent !== undefined ? { agent } : {}),
+    };
     if (!isValidRiffBaseUrl(value.baseUrl)) return fieldInvalid('invalid_base_url');
     return fieldOk(value);
   },
@@ -15392,9 +15752,13 @@ export function startIpcServer(opts: {
    * port — riff's task-runner is told a fixed port and must not have the service
    * silently drift to another one. */
   maxProbe?: number;
-  /** Core-only: additionally treat the tight riff-facing route allowlist
-   * (routeIsCoreOnlyPublic) as public (no HMAC). Every OTHER route still requires
-   * the trusted-host HMAC — this does NOT disable auth wholesale (codex P1). */
+  /** Core-only: this is a core-only service. The tight riff-facing route
+   * allowlist (routeIsCoreOnlyPublic) answers 503 while restoring and is public
+   * (no HMAC) — unless this process holds its native gateway's credential
+   * (core/native-gateway-credential.ts), which requires a signature there too.
+   * Every OTHER route still requires the trusted-host HMAC — this does NOT
+   * disable auth wholesale (codex P1). Also what EXPECTED_CORE_BOOT_HEADER is
+   * matched against. */
   coreOnlyPublicRoutes?: boolean;
 }): Promise<IpcServerHandle> {
   setProjectWorkstreamPool({ findActiveBySessionId });
@@ -15420,30 +15784,49 @@ export function startIpcServer(opts: {
     try {
       const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
       const method = req.method ?? 'GET';
-      const coreOnlyPublic = opts.coreOnlyPublicRoutes === true && routeIsCoreOnlyPublic(method, url.pathname);
+      const coreOnlyRoute = opts.coreOnlyPublicRoutes === true && routeIsCoreOnlyPublic(method, url.pathname);
+      // Unsigned on a core-only service, except on a native gateway core that
+      // holds its gateway's credential: there they authenticate like any route.
+      const coreOnlyPublic = coreOnlyRoute && !nativeGatewayCoreCredential();
       const publicRoute = routeHasPublicAccess(method, url.pathname) || coreOnlyPublic;
-      // Readiness barrier (codex P1): the core-only public control routes
-      // (trigger / trigger-result / insight) must NOT enter their handlers until
-      // restore completes — a trigger during 'starting' races durable restore.
-      // Gate them at the server level so it doesn't depend on the caller probing
-      // /healthz first. /healthz itself reports 503 via its own handler.
-      if (coreOnlyPublic && coreOnlyNotReady()) {
+      // Readiness barrier (codex P1): the core-only control routes
+      // (routeIsCoreOnlyPublic) must NOT enter their handlers until restore
+      // completes — a trigger during 'starting' races durable restore. Gate
+      // them at the server level, before authentication, so it doesn't depend
+      // on the caller probing /healthz first; they answer 503 rather than wait
+      // on `ready`. /healthz itself reports 503 via its own handler.
+      if (coreOnlyRoute && coreOnlyNotReady()) {
         return jsonRes(res, 503, { ok: false, status: 'starting', error: 'core-only service is still restoring; retry after /healthz returns 200' });
       }
       const capabilityRoute = routeHasNarrowUntrustedAuth(method, url.pathname);
       if (opts.authRequired && !publicRoute) {
-        const secret = ipcAuthSecret();
-        const auth = secret
-          ? trustedHostAuthorized(req, url.pathname, boundPort, secret)
-          : { ok: false as const, reason: 'secret_unavailable' };
+        // A native gateway core that received its gateway's credential also
+        // trusts a request signed with it (core/native-gateway-credential.ts).
+        // Tried first: a failed verification records no nonce, so a request
+        // signed with the Dashboard secret still verifies below. Everywhere
+        // else there is no such credential and this is the Dashboard secret
+        // check alone.
+        const gatewaySecret = nativeGatewayCoreCredential();
+        const gatewayAuth = gatewaySecret
+          ? trustedHostAuthorized(req, url.pathname, boundPort, gatewaySecret)
+          : undefined;
+        const secret = gatewayAuth?.ok ? gatewaySecret : ipcAuthSecret();
+        const auth = gatewayAuth?.ok
+          ? gatewayAuth
+          : secret
+            ? trustedHostAuthorized(req, url.pathname, boundPort, secret)
+            : { ok: false as const, reason: 'secret_unavailable' };
         if (auth.ok) {
           trustedHostRequests.add(req);
           trustedHostRequestSecrets.set(req, secret!);
         } else if (!capabilityRoute) {
           return jsonRes(res, 401, { ok: false, error: 'unauthorized', reason: auth.reason });
         }
+        if (gatewaySecret && !gatewayAuth?.ok && routeIsNativeGatewayExclusive(url.pathname)) {
+          return jsonRes(res, 403, { ok: false, error: 'native_gateway_credential_required' });
+        }
       }
-      if (!publicRoute && opts.ready) {
+      if (!publicRoute && !coreOnlyRoute && opts.ready) {
         await opts.ready;
         if (req.aborted || req.destroyed || res.destroyed) return;
       }
@@ -15461,6 +15844,10 @@ export function startIpcServer(opts: {
             return jsonRes(res, 400, { ok: false, error: 'invalid_url_encoding' });
           }
           throw err;
+        }
+        const expectedCoreBoot = req.headers[EXPECTED_CORE_BOOT_HEADER];
+        if (coreBootMismatch(expectedCoreBoot, opts.coreOnlyPublicRoutes === true, getDaemonBootId())) {
+          return jsonRes(res, 409, { ok: false, error: 'core_boot_changed' });
         }
         await r.handler(req, res, params);
         return;

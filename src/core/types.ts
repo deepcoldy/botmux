@@ -154,11 +154,22 @@ export interface DaemonSession {
     /** Actual running executable image (Linux `/proc/<pid>/exe`). Absent when
      * unknown; an unknown identity never authorizes an automatic reclaim. */
     cliExe?: import('../services/cli-install-identity.js').ExecutableIdentity;
-    /** Install entry the worker's adapter resolved at spawn. */
+    /** Configured install entry the operator/bot selected (the mutable path a
+     *  version upgrade rewrites). It is NOT the snapshot the process may exec. */
     cliInstallEntry?: string;
-    /** What `cliInstallEntry` resolved to right before this CLI spawn. Only a
-     *  process whose `cliExe` is this very object was launched from the entry. */
+    /** What `cliInstallEntry` resolved to right before this CLI spawn. Compared
+     *  against a later resolution of the same configured entry to detect an
+     *  upgrade; it need not equal `cliExe` when the launch used a frozen copy. */
     cliInstallAtSpawn?: import('../services/cli-install-identity.js').ExecutableIdentity;
+    /** The exact object this generation exec'd (snapshot copy or pinned path). */
+    cliLaunchTarget?: string;
+    /** Identity of `cliLaunchTarget` right after materialisation, before exec.
+     *  A proven launch means `cliExe` is this very object. */
+    cliLaunchTargetIdentity?: import('../services/cli-install-identity.js').ExecutableIdentity;
+    /** Content combination key of the exec'd object. */
+    cliLaunchComboKey?: string;
+    /** Private snapshot directory backing `cliLaunchTarget`, when one was used. */
+    cliSnapshotDir?: string;
     /** Worker-local CLI spawn counter that produced `cliExe`. */
     cliSpawnGeneration?: number;
     enginePid?: number;
@@ -221,6 +232,18 @@ export interface DaemonSession {
   resumeFreshFallbackNotified?: boolean;
   workingDir?: string;
   initConfig?: Extract<DaemonToWorker, { type: 'init' }>;   // stored for restart
+  /** Actual turn-terminal capability reported by a correlated, successful
+   *  in-place restart. Scoped to that worker generation: a refork invalidates
+   *  the report automatically, while an in-place respawn keeps the generation.
+   *  Before the first such report the fork-time initConfig is sufficient; while
+   *  workerReady is false the current capability is unknown and consumers must
+   *  fail closed rather than reuse this attestation. */
+  inPlaceRestartTurnTerminal?: { workerGeneration: number; reliableTurnTerminal: boolean };
+  /** A live restart has invalidated the previous attestation and no correlated
+   *  success has confirmed the replacement yet. Kept after failure/timeout and
+   *  across parked prompt_ready recovery; only an untouched receipt may restore
+   *  the previous state. A worker exit/refork makes this generation stale. */
+  inPlaceRestartTurnTerminalPending?: { workerGeneration: number | undefined; attemptId: string };
   /**
    * Unprovable launcher-env keys this worker generation was ever HANDED, kept as
    * a monotonically growing set for the life of the generation.
@@ -314,6 +337,10 @@ export interface DaemonSession {
    * still fails — never leave a live worker beside an unpromoted tail. Cleared
    * once promotion succeeds. In-memory only. */
   quarantinedActivationTailPromotion?: boolean;
+  /** Cancellation tombstone could not be persisted. Promotion must stay blocked
+   * until a retry records it; unlike generic promotion quarantine, this is NOT
+   * cleared by an offline recovery attempt. In-memory only. */
+  activationCancellationPending?: boolean;
   /** Generation token for the handler that atomically reserved a worker:null
    * refork. Later same-anchor handlers may prepare concurrently, but only this
    * owner may cross the fork boundary; followers buffer behind its gate. */
@@ -347,6 +374,11 @@ export interface DaemonSession {
   };
   worktreeCreating?: boolean;    // a worktree-open is in flight — dedups repeated card clicks / `/repo wt`
   pendingPrompt?: string;        // original user message to send after repo is selected
+  /** Exact structured scheduled input (content + trustedCaller/linkRefs) built
+   *  for a fresh scheduled fire. A refused durable admission keeps it here so
+   *  the same run/turn retry re-sends the ORIGINAL payload instead of only its
+   *  text. In-memory only; a restart rebuilds it from the frozen task identity. */
+  scheduledStagedInput?: import('../types.js').CliTurnPayload;
   /** Exact Lark message id whose user input is waiting for the first worker
    *  spawn. This is intentionally in-memory and must come from the accepted
    *  inbound event: restoring a session must never recover per-turn authority
@@ -507,7 +539,9 @@ export interface DaemonSession {
    *  bare force flag could otherwise miss a turn whose thinking already
    *  ended). Cleared on turn_terminal: a bubble created after its turn
    *  settled would never receive RUN_FINISHED and spin forever. */
-  lastThinkingUpdate?: { entries: CotEntry[]; turnId: string; dispatchAttempt?: number };
+  lastThinkingUpdate?: { entries: CotEntry[]; turnId: string; dispatchAttempt?: number; workerGeneration?: number };
+  /** Ephemeral native gateway projection; never promotes an old worker/turn snapshot. */
+  lastNativeGatewayGoal?: { goal: import('../services/native-goal-state.js').NativeGoalState | null; turnId: string; dispatchAttempt?: number; workerGeneration: number };
   /** Bounded per-turn admission times for optional reply timing; not restored or guessed. */
   turnReceivedAtMs?: Map<string, number>;
   /** Native write observations, scoped to the worker generation and exact attempt. */
@@ -896,6 +930,11 @@ export interface DaemonSession {
     entry: string;
     running: import('../services/cli-install-identity.js').ExecutableIdentity;
     installAtSpawn: import('../services/cli-install-identity.js').ExecutableIdentity;
+    /** Frozen object actually exec'd when it differs from the source install. */
+    launchTargetIdentity?: import('../services/cli-install-identity.js').ExecutableIdentity;
+    /** Legacy snapshot attestation: source release identity frozen at claim time. */
+    sourceReleaseDir?: string;
+    sourceSignature?: string;
     workerGeneration: number;
     cliSpawnGeneration?: number;
     cliPid?: number;
@@ -969,6 +1008,15 @@ export interface DaemonSession {
   directInputEpoch?: number;
   /** Latest timestamp of a direct Web Terminal submission (cancels pending recovery/replay). */
   lastDirectTerminalInputAt?: number;
+  /** Structured usage / rate limit a native gateway may show for one exact turn (rememberCoreOnlyLimit). */
+  nativeGatewayLimit?: {
+    turnId: string;
+    workerGeneration: number;
+    dispatchAttempt?: number;
+    key: string;
+    kind: 'usage' | 'rate';
+    retryAtMs: number;
+  };
   /** A failed persistence must be retried even if the next frame is identical. */
   usageLimitPersistPending?: boolean;
   usageLimitRetryTimer?: NodeJS.Timeout;
@@ -1008,6 +1056,8 @@ export interface DaemonSession {
   antigravityAccountId?: string;
   /** In-flight and per-turn state for Antigravity quota-limit auto-rotation. */
   antigravityRotation?: import('./antigravity-rotation.js').AntigravitySessionRotationState;
+  /** In-flight and per-turn confirmation state for Codex model-capacity downgrade. */
+  codexCapacityFallback?: import('./codex-capacity-fallback.js').CodexCapacityFallbackState;
   /** Interval that re-PATCHes the live streaming card with fresh Context/Token
    *  usage while a turn is executing (streaming display mode). Armed on the
    *  working edge, cleared on idle/turn-end/card removal. */
@@ -1021,13 +1071,17 @@ export interface DaemonSession {
    *  input's turn id; bounded, in-memory (a dead worker never reports). */
   pendingFailedTurnRewinds?: Map<string, {
     failedTurnId: string;
-    mode: 'merge' | 'resend';
+    mode: 'merge' | 'resend' | 'edit';
     content: string;
+    /** Envelope that will remain sidecar-injected in the final rewritten input;
+     * absent when the directive restored it inline. */
+    hookEnvelope?: string;
     failedUserPrompt: string;
     /** The worker process that was asked; another one never answers. */
     worker: DaemonSession['worker'];
   }>;
   lastCodexAppInput?: CodexAppTurnInput;
+  lastHookEnvelope?: string;
   replyThreadAliases?: { [rootMessageId: string]: { createdAt: string; lastUsedAt: string } };
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean };
   /** Lark turns that a still-running Claude background task was launched

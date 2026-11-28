@@ -347,32 +347,63 @@ function recordFailure(
  * 失败且可重试 → 指数退避（尊重 Retry-After 头）后重试；不可重试或重试耗尽 →
  * 累计失败计数（可能触发熔断）并抛原始错误。
  *
- * 不传 signal 的调用方行为与直接调用 fn 完全一致（除限流/重试引入的延迟外）。
+ * 不传 signal / retryMaxAttempts 的调用方行为与直接调用 fn 完全一致（除限流/重试引入的延迟外）。
+ * retryMaxAttempts 用于有外部使用次数预算的操作按调用覆盖全局重试上限。
  */
+const gatePriorAttemptErrors = new WeakMap<object, readonly unknown[]>();
+
+/**
+ * Return earlier retryable attempt errors observed inside the same
+ * `executeWithLarkGate` call before `err` terminated the loop (e.g. Attempt #0
+ * hit HTTP 500 `code=2200` after server-side commit, then Attempt #1 hit
+ * `LarkCircuitOpenError`, `TOPIC_SEND_CHECK_FAILED`, or `beforeWrite`).
+ */
+export function getLarkGatePriorAttemptErrors(err: unknown): readonly unknown[] {
+  if (!err || typeof err !== 'object') return [];
+  return gatePriorAttemptErrors.get(err) ?? [];
+}
+
+function attachPriorAttemptErrors(err: unknown, priorAttemptErrors: readonly unknown[]): void {
+  if (priorAttemptErrors.length === 0 || !err || typeof err !== 'object') return;
+  if (!gatePriorAttemptErrors.has(err)) {
+    gatePriorAttemptErrors.set(err, Object.freeze([...priorAttemptErrors]));
+  }
+}
+
 export async function executeWithLarkGate<T>(
   larkAppId: string,
   op: string,
   fn: () => Promise<T>,
-  options?: { signal?: AbortSignal },
+  options?: { signal?: AbortSignal; retryMaxAttempts?: number },
 ): Promise<T> {
   const cfg = resolveLarkGateConfig();
   const signal = options?.signal;
+  const retryMaxAttempts = options?.retryMaxAttempts ?? cfg.retryMaxAttempts;
+  const priorAttemptErrors: unknown[] = [];
   let attempt = 0;
+  const throwWithHistory = (err: unknown): never => {
+    attachPriorAttemptErrors(err, priorAttemptErrors);
+    throw err;
+  };
   for (;;) {
-    if (signal?.aborted) throw gateAbortError(signal);
+    if (signal?.aborted) throwWithHistory(gateAbortError(signal));
     const now = Date.now();
     const circuit = getCircuit(larkAppId);
     if (circuit.status === 'open') {
       if (now - circuit.openedAtMs < cfg.circuitProbeIntervalMs) {
-        throw new LarkCircuitOpenError(larkAppId, circuit.openedAtMs);
+        throwWithHistory(new LarkCircuitOpenError(larkAppId, circuit.openedAtMs));
       }
       circuit.status = 'half-open';
     }
-    await acquireToken(larkAppId, op, cfg, signal);
+    try {
+      await acquireToken(larkAppId, op, cfg, signal);
+    } catch (tokenErr) {
+      throwWithHistory(tokenErr);
+    }
     // acquireToken 的 await 会让出事件循环——调用方的 abort() 可能在这期间
     // 到达。此处必须复查：已 aborted 的 signal 上后注册的监听不会触发，
     // 不提前抛出会让 fn 内的请求永远挂起。
-    if (signal?.aborted) throw gateAbortError(signal);
+    if (signal?.aborted) throwWithHistory(gateAbortError(signal));
     try {
       const result = await fn();
       circuit.consecutiveFailures = 0;
@@ -383,18 +414,23 @@ export async function executeWithLarkGate<T>(
       return result;
     } catch (err) {
       const retryable = isRetryableLarkError(err);
-      if (retryable && attempt < cfg.retryMaxAttempts) {
+      if (retryable && attempt < retryMaxAttempts) {
+        priorAttemptErrors.push(err);
         const backoffMs = computeBackoffMs(cfg, attempt, err);
         attempt += 1;
-        logger.warn(`[lark-gate] ${larkAppId} retry ${attempt}/${cfg.retryMaxAttempts} op=${op} backoff=${backoffMs}ms`);
-        if (signal?.aborted) throw gateAbortError(signal);
-        await sleep(backoffMs, signal);
+        logger.warn(`[lark-gate] ${larkAppId} retry ${attempt}/${retryMaxAttempts} op=${op} backoff=${backoffMs}ms`);
+        if (signal?.aborted) throwWithHistory(gateAbortError(signal));
+        try {
+          await sleep(backoffMs, signal);
+        } catch (sleepErr) {
+          throwWithHistory(sleepErr);
+        }
         continue;
       }
       // 熔断器只对瞬态错误（429/5xx/网络）计数：确定性错误（密钥错误、参数
       // 错误）重试无意义，也不该影响电路——否则调用方注入的失败会误跳闸。
       if (retryable) recordFailure(circuit, larkAppId, op, cfg, Date.now());
-      throw err;
+      throwWithHistory(err);
     }
   }
 }

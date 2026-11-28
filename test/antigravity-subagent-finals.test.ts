@@ -155,12 +155,12 @@ describe('Antigravity subagent final delivery', () => {
     expect(state.pendingSubagentIds).toEqual(['agent-2']);
   });
 
-  it('resets waits only for an explicit new user input', () => {
+  it('resets waits only for an explicit new user input and aborts its waiting narration', () => {
     launch('agent-1');
     expect(drain([{ type: 'USER_INPUT', source: 'SYSTEM', content: 'not a user turn' }])).toEqual([]);
     expect(hasAntigravityPendingTasks(state)).toBe(true);
     expect(drain([{ type: 'USER_INPUT', source: 'USER_EXPLICIT', content: 'Next question' }]).map(e => `${e.kind}:${e.text}`))
-      .toEqual(['assistant_final:Waiting for reviews', 'user:Next question']);
+      .toEqual(['turn_aborted:', 'user:Next question']);
     expect(state).toEqual({});
   });
 

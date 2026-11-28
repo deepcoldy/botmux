@@ -23,6 +23,8 @@ import {
   type PalettePageEntry,
 } from '../src/dashboard/web/command-palette-sources.js';
 import { SETTINGS_SECTIONS } from '../src/dashboard/web/settings-sections.js';
+import { providerDescriptor } from '../src/dashboard/web/providers/registry.js';
+import type { ProviderCopy } from '../src/dashboard/web/providers/types.js';
 import {
   BOT_DEFAULTS_SECTIONS,
   BOT_DEFAULTS_TABS,
@@ -72,11 +74,31 @@ const BOT_CONFIG_SOURCE_FILES = [
   'bot-defaults-page.tsx', 'blocked-users-editor.tsx', 'session-env-editor.tsx', 'prompt-cache-editor.tsx',
   'provider-recovery-editor.tsx',
   'traex-auto-model-editor.tsx', 'quiet-preset-section.tsx',
+  'wecom-bot-defaults-card.tsx', 'bot-profile-ui.tsx',
 ];
 
+/**
+ * 共享区块里按平台切换的文案写成 `tr(copy.<槽位>)`，键在 providers/ 的文案表里（数据，不是源码）。
+ * 扫描前按真实文案表展开成下面扫描规则认得的平台分支：飞书那一支是 ⌘K 登记的键，企业微信的键
+ * 与之不同时作为变体出现，照旧要在 PROVIDER_LABEL_VARIANTS / PROVIDER_HEADING_VARIANTS 里逐条登记。
+ */
+function resolveProviderCopy(source: string): string {
+  const lark = providerDescriptor('lark').copy;
+  const wecom = providerDescriptor('wecom').copy;
+  return source.replace(/\btr\(copy\.(\w+)\)/g, (whole, slot: string) => {
+    const larkKey = lark[slot as keyof ProviderCopy];
+    const wecomKey = wecom[slot as keyof ProviderCopy];
+    if (!larkKey || !wecomKey) return `(unknown copy slot) ${whole}`;
+    return larkKey === wecomKey ? `tr('${larkKey}')` : `provider === 'wecom' ? tr('${wecomKey}') : tr('${larkKey}')`;
+  });
+}
+
+function readBotConfigSource(file: string): string {
+  return resolveProviderCopy(readFileSync(new URL(`../src/dashboard/web/${file}`, import.meta.url), 'utf8'));
+}
+
 function readBotConfigSources(): string {
-  return BOT_CONFIG_SOURCE_FILES
-    .map(file => readFileSync(new URL(`../src/dashboard/web/${file}`, import.meta.url), 'utf8')).join('\n');
+  return BOT_CONFIG_SOURCE_FILES.map(readBotConfigSource).join('\n');
 }
 
 type OpeningTag = { start: number; end: number; body: string; selfClosing: boolean };
@@ -211,7 +233,7 @@ function trTextKeys(text: string): string[] {
 
 /**
  * 区块组件里以「可见标签」写出的全部 tr() 键，按写法而非按键名找：
- * 1. `<FieldTitle>` 的直接文本子节点（含跨行写法）；
+ * 1. `<FieldTitle>` / 共享 `<BotFieldTitle>` 的直接文本子节点（含跨行写法）；
  * 2. 选项组的 `groupName={tr(...)}`；
  * 3. `<ToggleRow>` 的 `title`（字面量与三元两支）；
  * 4. `<label>` 自己的直接文本，以及其内 `<span>` / `<strong>` / `<small>` 的直接文本子节点
@@ -230,13 +252,18 @@ function trTextKeys(text: string): string[] {
 function renderedBotConfigLabelKeys(sources: string): Set<string> {
   const keys = new Set<string>();
   const add = (found: Iterable<string>) => { for (const key of found) keys.add(key); };
-  for (const children of elementChildren(sources, 'FieldTitle')) add(trTextKeys(directText(children)));
+  for (const name of ['FieldTitle', 'BotFieldTitle']) {
+    for (const children of elementChildren(sources, name)) add(trTextKeys(directText(children)));
+  }
   add([...sources.matchAll(/\bgroupName=\{tr\('([^']+)'\)\}/g)].map(m => m[1]!));
   for (const tag of openingTags(sources, 'ToggleRow')) {
     const literal = /\btitle=\{tr\('([^']+)'\)\}/.exec(tag.body);
     if (literal) add([literal[1]!]);
     const ternary = /\btitle=\{tr\([^?(){}]+\?\s*'([^']+)'\s*:\s*'([^']+)'\)\}/.exec(tag.body);
     if (ternary) add([ternary[1]!, ternary[2]!]);
+    // Provider-specific literal labels can share a visible title with a translated branch.
+    const conditionalTitle = /\btitle=\{([^{}]*\?[^{}]*)\}/.exec(tag.body);
+    if (conditionalTitle) add([...conditionalTitle[1]!.matchAll(/\btr\('([^']+)'\)/g)].map(match => match[1]!));
   }
   for (const label of elementChildren(sources, 'label')) {
     // label 自己的直接文本（嵌套元素的文本会被 directText 剥掉，不和下面的子元素重复计数）。
@@ -246,7 +273,7 @@ function renderedBotConfigLabelKeys(sources: string): Set<string> {
     }
   }
   add([...sources.matchAll(/<span>\{tr\('([^']+)'\)\}<\/span>\s*<DropdownField\b/g)].map(m => m[1]!));
-  if (sources.includes('title={tr(`botDefaults.${key}`)}')) add(REPLY_FOOTER_KEYS.map(key => `botDefaults.${key}`));
+  if (openingTags(sources, 'ToggleRow').some(tag => /\btitle=\{/.test(tag.body) && tag.body.includes('tr(`botDefaults.${key}`)'))) add(REPLY_FOOTER_KEYS.map(key => `botDefaults.${key}`));
   if (sources.includes('tr(`botDefaults.streamingButton.${id}`)')) {
     add(STREAMING_CARD_BUTTON_IDS.map(id => `botDefaults.streamingButton.${id}`));
   }
@@ -288,6 +315,59 @@ const NOT_CONFIG_LABELS: ReadonlyMap<string, string> = new Map([
 ]);
 
 const BOT_CONFIG_KEY_NAMESPACES = ['botDefaults.', 'sessionEnv.', 'quietPreset.', 'promptCache.', 'providerRecovery.', 'roles.', 'blocked.'];
+
+/**
+ * 企业微信分支换掉的可见标签 → ⌘K 落到同一行 / 同一格子所用的已登记键。
+ * 区块组件由飞书与企业微信共用，少数标签按平台换文案；⌘K 索引目前只登记飞书文案，企业微信
+ * 的索引留给后续的 provider 能力表。这里逐条登记：扫描到没登记的企业微信标签、登记了却不再
+ * 渲染、或者指向未登记键的条目，都会让用例变红。
+ */
+const PROVIDER_LABEL_VARIANTS: ReadonlyMap<string, string> = new Map([
+  ['botDefaults.wecom.autoStreaming', 'botDefaults.autoStreaming'],
+  ['botDefaults.wecom.commandTriggerEnabled', 'botDefaults.commandTriggerEnabled'],
+  ['botDefaults.wecom.allowedUsersLabel', 'blocked.sectionTitle'],
+  ['botDefaults.wecom.blockedUsersLabel', 'blocked.sectionTitle'],
+  ['botDefaults.wecom.groupModeLabel', 'botDefaults.groupRegular'],
+]);
+
+/**
+ * 同上，区块标题的企业微信变体 → 它替换的已登记标题。两种写法都算：共用区块里的
+ * `provider === 'wecom' ? tr(变体) : tr(飞书键)`，以及只在企业微信卡里出现、挂在已登记格子下的专属区块标题。
+ */
+const PROVIDER_HEADING_VARIANTS: ReadonlyMap<string, string> = new Map([
+  ['botDefaults.wecom.commandTriggerTitle', 'botDefaults.sectionCommandTrigger'],
+  ['botDefaults.wecom.accessTitle', 'blocked.sectionTitle'],
+]);
+
+/** 写成 `provider === 'wecom' ? tr('变体') : tr('飞书键')` 的平台分支。 */
+const PROVIDER_BRANCH = /provider\s*===\s*'wecom'\s*\?\s*tr\('([^']+)'\)\s*:\s*tr\('([^']+)'\)/;
+const CJK_LITERAL = /(['"`])[^'"`]*[\u4e00-\u9fff][^'"`]*\1/;
+
+/** 取顶层组件函数的源码（到下一个顶层声明为止），与它在文件里的先后位置无关。 */
+function componentSource(page: string, name: string): string {
+  const start = page.indexOf(`\nexport function ${name}(`);
+  if (start < 0) return '';
+  const rest = page.slice(start + 1);
+  const next = /\n(?:export\s+)?(?:async\s+)?(?:function|const|let|type|interface|class)\s/.exec(rest.slice(1));
+  return next ? rest.slice(0, next.index + 1) : rest;
+}
+
+/** 某个位置所在的、尚未闭合的 `<section>` 开标签；不在任何 section 里时返回 undefined。 */
+function enclosingSection(source: string, at: number): { body: string } | undefined {
+  const before = source.slice(0, at);
+  const opens = openingTags(before, 'section').filter(tag => !tag.selfClosing);
+  const closes = [...before.matchAll(/<\/section>/g)].map(match => match.index!);
+  const events = [
+    ...opens.map(tag => ({ at: tag.start, open: tag as { body: string } | null })),
+    ...closes.map(index => ({ at: index, open: null })),
+  ].sort((a, b) => a.at - b.at);
+  const stack: Array<{ body: string }> = [];
+  for (const event of events) {
+    if (event.open) stack.push(event.open);
+    else stack.pop();
+  }
+  return stack.at(-1);
+}
 
 describe('⌘K index coverage', () => {
   it('every dashboard route is in the sidebar or NAV_SUBPAGES, or excluded on purpose with a reason', () => {
@@ -344,24 +424,63 @@ describe('⌘K index coverage', () => {
   });
 
   const botDefaultsPageSource = () => readFileSync(new URL('../src/dashboard/web/bot-defaults-page.tsx', import.meta.url), 'utf8');
+  // 企业微信资料卡在自己的文件里，复用飞书卡的区块组件（由 bot-defaults-page 经 props 交给它）。
+  const wecomCardSource = () => readFileSync(new URL('../src/dashboard/web/wecom-bot-defaults-card.tsx', import.meta.url), 'utf8');
 
   // 源码结构护栏(K4)：分类网格是 BotDefaultsEditor 内部的 JSX（依赖整套 bot 数据与接口），渲染不出来，
   // 只能读文本反查；守的是「某个分类里新加了格子却没登记进 BOT_DEFAULTS_SECTIONS / 没挂深链落点 id」。
   it('every tile in the Bot config category panels carries a registered section id of that category', () => {
-    const source = botDefaultsPageSource();
+    const page = botDefaultsPageSource();
+    const registeredByTab = new Map(BOT_DEFAULTS_TABS.map(tab => [tab, new Set(
+      BOT_DEFAULTS_SECTIONS.filter(section => section.tab === tab && !section.tile).map(section => section.id),
+    )]));
+    /** 一张资料卡五个分类面板里的格子；只读的运行状态格不进设置索引，但里面不能有可编辑控件。 */
+    const panelTiles = (source: string, card: string, panelStart: (tab: BotDefaultsTab) => string) => {
+      const starts = BOT_DEFAULTS_TABS.map(tab => ({ tab, at: source.indexOf(panelStart(tab)) }));
+      expect(starts.every(entry => entry.at > 0), card).toBe(true);
+      return starts.map(({ tab, at }, index) => {
+        const end = starts[index + 1]?.at ?? source.indexOf('</BotProfileLayout>', at);
+        const panel = source.slice(at, end);
+        for (const tag of openingTags(panel, 'section').filter(tag => /\bdata-runtime-status\b/.test(tag.body))) {
+          const children = elementChildren(panel.slice(tag.start), 'section')[0] ?? '';
+          expect(openingTags(children, 'BotRuntimeStatus'), `${card}/${tab}`).toHaveLength(1);
+          for (const control of ['input', 'select', 'textarea', 'FieldTitle', 'BotFieldTitle', 'ToggleRow', 'DropdownField', 'ModelPickerField']) {
+            expect(openingTags(children, control), `${card}/${tab}: read-only status contains ${control}`).toHaveLength(0);
+          }
+        }
+        const tiles = openingTags(panel, 'section')
+          .filter(tag => /className="bd-tile(?:[ "])/.test(tag.body) && !/\bdata-runtime-status\b/.test(tag.body))
+          .map(tag => ({
+            id: /botDefaultsSectionDomId\('([^']+)'\)/.exec(tag.body)?.[1] ?? '(no id)',
+            providerOnly: /\bdata-provider-only="wecom"/.test(tag.body),
+          }));
+        return { tab, tiles };
+      });
+    };
+
+    // 飞书资料卡：格子与各平台共用的登记一一对应（缺登记、缺落点 id、登记了却没有格子都红），且不允许
+    // 平台专属格子（data-provider-only，或登记表里标了 provider 的区块）。
     // 面板已改为 LazyTabPanel 懒挂载（id 传给组件，运行时仍渲染为 bd-panel-<tab>），按组件开头定位。
-    const starts = BOT_DEFAULTS_TABS.map(tab => ({ tab, at: source.indexOf(`<LazyTabPanel id="${tab}"`) }));
-    expect(starts.every(entry => entry.at > 0)).toBe(true);
+    const larkPanels = panelTiles(componentSource(page, 'BotDefaultsCard'), 'BotDefaultsCard', tab => `<LazyTabPanel id="${tab}"`);
     const tiles: string[] = [];
-    starts.forEach(({ tab, at }, index) => {
-      const end = starts[index + 1]?.at ?? source.indexOf('</article>', at);
-      const panel = source.slice(at, end);
-      const found = [...panel.matchAll(/<section className="bd-tile[^"]*"([^>]*)>/g)].map(match => /botDefaultsSectionDomId\('([^']+)'\)/.exec(match[1]!)?.[1] ?? '(no id)');
+    for (const { tab, tiles: found } of larkPanels) {
       expect(found.length, tab).toBeGreaterThan(0);
-      tiles.push(...found.map(id => `${tab}:${id}`));
-    });
-    const registered = BOT_DEFAULTS_SECTIONS.filter(section => !section.tile).map(section => `${section.tab}:${section.id}`);
+      expect(found.filter(tile => tile.providerOnly).map(tile => tile.id), `BotDefaultsCard/${tab}: provider-only tile`).toEqual([]);
+      tiles.push(...found.map(tile => `${tab}:${tile.id}`));
+    }
+    const registered = BOT_DEFAULTS_SECTIONS.filter(section => !section.tile && !section.provider)
+      .map(section => `${section.tab}:${section.id}`);
     expect([...tiles].sort()).toEqual([...registered].sort());
+
+    // 企业微信资料卡复用同一套区块：它自己挂的格子都得带同分类里已登记的区块 id。企业微信专属格子
+    // （WecomNativeTiles 按分类挂出、登记表里标了 provider: 'wecom'）的 id 是按分类拼出来的，读文本看不到；
+    // 它们的落点与 ⌘K 条目由 dashboard-bot-config-palette-landing 渲染真实卡片逐项校验。
+    for (const { tab, tiles: found } of panelTiles(componentSource(wecomCardSource(), 'WecomBotDefaultsCard'), 'WecomBotDefaultsCard', tab => `id="bd-panel-${tab}"`)) {
+      const registeredHere = registeredByTab.get(tab)!;
+      const misplaced = found.filter(tile => !registeredHere.has(tile.id));
+      expect(misplaced.map(tile => tile.id), `WecomBotDefaultsCard/${tab}`).toEqual([]);
+    }
+
     // 合放在别的格子里的区块：那个格子得存在、同分类，而且自己不是合放的。
     for (const section of BOT_DEFAULTS_SECTIONS.filter(entry => entry.tile)) {
       const host = findBotDefaultsSection(section.tile);
@@ -376,14 +495,47 @@ describe('⌘K index coverage', () => {
   it('every Bot config section heading uses a translation key that is in the section index', () => {
     const titleKeys = new Set(BOT_DEFAULTS_SECTIONS.map(section => section.titleKey));
     const headings: string[] = [];
-    for (const file of ['bot-defaults-page.tsx', 'blocked-users-editor.tsx']) {
-      const source = readFileSync(new URL(`../src/dashboard/web/${file}`, import.meta.url), 'utf8');
+    for (const file of ['bot-defaults-page.tsx', 'wecom-bot-defaults-card.tsx', 'blocked-users-editor.tsx', 'bot-profile-ui.tsx']) {
+      const source = readBotConfigSource(file);
       // 区块标题是 `<h3 className="bd-section-title">` 或不带属性的 `<h3>`；弹窗里的 h3 带自己的 id / class，不算。
-      headings.push(...[...source.matchAll(/<h3(?: className="bd-section-title")?>([\s\S]*?)<\/h3>/g)].map(match => match[1]!));
+      headings.push(...[...source.matchAll(/<h3(?: className="bd-section-title")?>([\s\S]*?)<\/h3>/g)]
+        .filter(match => !(file === 'bot-profile-ui.tsx' && match[1] === '{props.title}'))
+        .map(match => match[1]!));
+      for (const tag of openingTags(source, 'BotSettingSection')) {
+        // 只读运行状态格（不进设置索引）里的标题豁免；判断的是真正包住它的那个 section。
+        if (/\bdata-runtime-status\b/.test(enclosingSection(source, tag.start)?.body ?? '')) continue;
+        const title = /\btitle=(\{tr\('[^']+'\)\}|"[^"]*")/.exec(tag.body)?.[1];
+        headings.push(title ?? `(unrecognized title) ${tag.body}`);
+      }
     }
-    expect(headings.length).toBeGreaterThanOrEqual(BOT_DEFAULTS_SECTIONS.length);
-    const keys = headings.map(body => /\btr\('([^']+)'\)/.exec(body.replace(/help=\{[^}]*\}/g, ''))?.[1] ?? `(literal) ${body.trim()}`);
+    // 平台专属区块的标题写在它们自己的组件里（企业微信的 wecom-native-*），不在扫描范围内，由渲染落点测试校验。
+    expect(headings.length).toBeGreaterThanOrEqual(BOT_DEFAULTS_SECTIONS.filter(section => !section.provider).length);
+    const variants: Array<[string, string]> = [];
+    const keys = headings.map(body => {
+      const visible = body.replace(/help=\{[^}]*\}/g, '').replace(/help="[^"]*"/g, '');
+      // 标题里不许有写死的中文（包括平台分支里的那一支）。
+      if (CJK_LITERAL.test(visible) || /[\u4e00-\u9fff]/.test(visible.replace(/\{[^}]*\}/g, ''))) return `(literal) ${body.trim()}`;
+      const branch = PROVIDER_BRANCH.exec(visible);
+      if (branch) {
+        variants.push([branch[1]!, branch[2]!]);
+        return branch[2]!;
+      }
+      const key = /\btr\('([^']+)'\)/.exec(visible)?.[1];
+      // 企业微信专属区块的标题：必须逐条登记，按它替换的已登记标题校验。
+      const replaced = key ? PROVIDER_HEADING_VARIANTS.get(key) : undefined;
+      if (key && replaced) {
+        variants.push([key, replaced]);
+        return replaced;
+      }
+      return key ?? `(literal) ${body.trim()}`;
+    });
     expect(keys.filter(key => !titleKeys.has(key)), 'section headings missing from BOT_DEFAULTS_SECTIONS').toEqual([]);
+    // 平台分支的标题：飞书那一支已在上面按登记表校验；企业微信那一支必须逐条登记、两种语言都有译文。
+    expect(variants.sort(), 'provider heading variants').toEqual([...PROVIDER_HEADING_VARIANTS].sort());
+    for (const [variant] of variants) {
+      expect(zh(variant), variant).not.toBe(variant);
+      expect(en(variant), variant).not.toBe(variant);
+    }
   });
 
   // 源码结构护栏(K4)：配置项行在各区块组件内部渲染，组件依赖整套 bot 数据渲染不出来，只能读文本反查；
@@ -396,7 +548,9 @@ describe('⌘K index coverage', () => {
         expect(zh(key), key).not.toBe(key);
         expect(en(key), key).not.toBe(key);
       }
-      // 落地时按文字找这一行，所以它得是看得见的标签（写法见 renderedBotConfigLabelKeys）。
+      // 落地时按文字找这一行，所以它得是看得见的标签（写法见 renderedBotConfigLabelKeys）。平台专属区块的
+      // 配置项不在扫描的源码里，由 dashboard-bot-config-palette-landing 渲染真实卡片逐项校验落点。
+      if (section.provider) continue;
       for (const key of section.fieldKeys ?? []) {
         const renderedInFollowEditor = key.startsWith('botDefaults.ownerGroupFollow') && followLabels.has(t(key));
         expect(rendered.has(key) || renderedInFollowEditor, key).toBe(true);
@@ -415,9 +569,11 @@ describe('⌘K index coverage', () => {
   // 守的是「跨行的 FieldTitle、label 里的 span、下拉框前的 span 都算标签，嵌套元素里的文字和属性里的 tr() 不算」。
   it('reads label text by JSX position, not by key name', () => {
     const fixture = [
+      "<ToggleRow title={provider === 'wecom' ? tr('botDefaults.fixtureVariant') : tr('botDefaults.fixtureConditional')} help={tr('botDefaults.fixtureHiddenHelp')} />",
       '<FieldTitle help={tr(\'botDefaults.fixtureHelp\')}>',
       '  {tr(\'botDefaults.fixtureTitle\')}',
       '</FieldTitle>',
+      '<BotFieldTitle help={tr(\'botDefaults.fixtureSharedHelp\')}>{tr(\'botDefaults.fixtureSharedTitle\')}</BotFieldTitle>',
       '<label><input type="checkbox" /><span>{tr(\'botDefaults.fixtureCheckbox\')}</span></label>',
       '<label><span><strong>{tr(\'botDefaults.fixtureLang\')}</strong><em>{tr(\'botDefaults.fixtureBadge\')}</em></span></label>',
       '<div className="bd-field"><span>{tr(\'botDefaults.fixtureDropdown\')}</span>',
@@ -430,8 +586,8 @@ describe('⌘K index coverage', () => {
       '<h4>{tr(\'botDefaults.fixtureOtherHeading\')}</h4>',
     ].join('\n');
     expect([...renderedBotConfigLabelKeys(fixture)].sort()).toEqual([
-      'botDefaults.fixtureCheckbox', 'botDefaults.fixtureDropdown', 'botDefaults.fixtureLang',
-      'botDefaults.fixtureSubsection', 'botDefaults.fixtureTitle',
+      'botDefaults.fixtureCheckbox', 'botDefaults.fixtureConditional', 'botDefaults.fixtureDropdown', 'botDefaults.fixtureLang',
+      'botDefaults.fixtureSharedTitle', 'botDefaults.fixtureSubsection', 'botDefaults.fixtureTitle', 'botDefaults.fixtureVariant',
     ]);
   });
 
@@ -444,11 +600,26 @@ describe('⌘K index coverage', () => {
     const indexedKeys = new Set(BOT_DEFAULTS_SECTIONS.flatMap(section => [section.titleKey, ...(section.fieldKeys ?? [])]));
     const rendered = [...renderedBotConfigLabelKeys(readBotConfigSources())]
       .filter(key => BOT_CONFIG_KEY_NAMESPACES.some(prefix => key.startsWith(prefix)));
-    const unindexed = rendered.filter(key => !indexedKeys.has(key) && !NOT_CONFIG_LABELS.has(key));
+    const unindexed = rendered.filter(key => !indexedKeys.has(key) && !NOT_CONFIG_LABELS.has(key) && !PROVIDER_LABEL_VARIANTS.has(key));
     expect(unindexed, 'rendered Bot config labels missing from BOT_DEFAULTS_SECTIONS').toEqual([]);
     // 名单只放扫描真读到、又确实没登记的键：过时或已登记的条目要删掉，不留静默豁免。
     const stale = [...NOT_CONFIG_LABELS.keys()].filter(key => !rendered.includes(key) || indexedKeys.has(key));
     expect(stale, 'NOT_CONFIG_LABELS entries that are no longer rendered, or are indexed after all').toEqual([]);
+    // 企业微信变体同样不留静默豁免：必须真被渲染、自己没登记、指向的落点键已登记。
+    const staleVariants = [...PROVIDER_LABEL_VARIANTS]
+      .filter(([variant, target]) => !rendered.includes(variant) || indexedKeys.has(variant) || !indexedKeys.has(target))
+      .map(([variant]) => variant);
+    expect(staleVariants, 'PROVIDER_LABEL_VARIANTS entries that are stale or point at an unindexed key').toEqual([]);
+  });
+
+  // 源码结构护栏(K4)：平台分支写在区块组件的 JSX 属性与文本里，组件依赖整套 bot 数据渲染不出来，只能读文本反查；
+  // 守的是「企业微信分支写死中文、英文界面显示中文、扫描器也读不到这个标签」——上面几条护栏都只认 tr() 键。
+  it('no provider branch in the Bot config sections hardcodes visible text', () => {
+    const offending = readBotConfigSources().split('\n')
+      .filter(line => /provider\s*===\s*'wecom'/.test(line))
+      .filter(line => /[?:]\s*\(?\s*(['"`])[^'"`]*[\u4e00-\u9fff]/.test(line))
+      .map(line => line.trim().slice(0, 160));
+    expect(offending).toEqual([]);
   });
 });
 
@@ -624,8 +795,8 @@ describe('⌘K reaches the Bot config page, its categories and each bot', () => 
         // 区块标题直达区块；合放在别的格子里的区块也有自己的条目。
         expect(topSetting(tr('botDefaults.sectionSessionMode'))?.primary.href).toBe(botDefaultsHref({ section: 'session-mode' }));
         expect(topSetting(tr('botDefaults.networkPolicy'))?.primary.href).toBe(botDefaultsHref({ section: 'network-policy' }));
-        // 每个区块都有条目，标题带「Bot 配置 ›」。
-        for (const section of BOT_DEFAULTS_SECTIONS) {
+        // 各平台共用的每个区块都有条目，标题带「Bot 配置 ›」（平台专属区块只在那个平台的部署里列出）。
+        for (const section of BOT_DEFAULTS_SECTIONS.filter(entry => !entry.provider)) {
           const item = items.find(entry => entry.key === `setting:bot-defaults-section:${section.id}`);
           expect(item?.title, section.id).toBe(`${tr('nav.botDefaults')} › ${tr(section.titleKey)}`);
         }

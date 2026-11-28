@@ -27,6 +27,7 @@ function harness(scope: WorkerSessionEventScope) {
     activeRestartAttemptId: ATTEMPT,
     backend: {},
     codexAutoUpgrade: undefined,
+    cliAdapter: { reliableTurnTerminal: true },
     pendingTopicEffortRestart: undefined,
     lastInitConfig: { cliId: 'claude-code' },
     pendingRawInputs: [],
@@ -85,6 +86,19 @@ describe('a restart receipt from a callback the relay superseded', () => {
     const run = harness(scope);
     scope.run(live, () => run.settle('restart continuation finished at the prompt', { republishPromptReady: true }));
     expect(run.sent.map(entry => entry.msg.type)).toEqual(['prompt_ready', 'restart_result']);
+  });
+
+  it.each([true, false])('reports the actual adapter turn-terminal capability (%s) with the successful receipt', reliableTurnTerminal => {
+    const { scope, live } = relayRebound();
+    const run = harness(scope);
+    run.state.cliAdapter = { reliableTurnTerminal };
+    scope.run(live, () => run.settle('prompt-ready'));
+    expect(run.sent.map(entry => entry.msg.type)).toEqual(['restart_result']);
+    expect(run.sent[0]!.msg).toMatchObject({
+      attemptId: ATTEMPT,
+      status: 'succeeded',
+      reliableTurnTerminal,
+    });
   });
 
   it.each([

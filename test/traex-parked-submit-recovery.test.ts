@@ -77,6 +77,7 @@ function fixture(options: { acceptsRescue?: boolean; screen?: string; dispatchAt
     queuePostSubmitNativeSessionTitle: vi.fn(), persistCliSessionId: vi.fn(),
     codexBridgeFallbackActive: () => false, syncFreshCodexNativeSessionTitle: vi.fn(),
     codexHistoryMatchProvesConsumption: () => false,
+    ownedSubmitConsumptionProofKind: () => undefined,
     buildSubmitMessagePreview, cliName: () => 'TRAE', currentBotmuxTurnId: 'delivery',
     emitTurnTerminal: vi.fn(), send: vi.fn(), log: vi.fn(), t: (key: string) => key,
     shareableStuckScreenTail: () => '', classifyStuckPage,

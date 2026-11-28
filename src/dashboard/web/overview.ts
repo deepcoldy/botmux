@@ -1,14 +1,24 @@
+import { publishProviderRoster } from './provider-roster.js';
+import { isWecomSource, providerBotKey } from './providers/registry.js';
+import type { WecomConnectionDto } from '../../im/wecom/contract/dashboard-dto.js';
 import { botNameForAppId } from './ui.js';
 import { deriveSessionTaskStatus } from '../../core/session-task-status.js';
 import { fetchGroupsNamesSnapshot } from './groups-api.js';
 
+let wecomSnapshot: WecomConnectionDto[] = [];
 let groupsSnapshot: { chats: any[]; bots: any[] } = { chats: [], bots: [] };
+let groupsSnapshotLoaded = false;
 
 export function __setGroupsSnapshotForTest(snapshot: { chats: any[]; bots: any[] }): void {
   groupsSnapshot = snapshot;
+  groupsSnapshotLoaded = true;
 }
 
-export async function loadGroupsSnapshot(): Promise<void> {
+export function hasLoadedGroupsSnapshot(): boolean {
+  return groupsSnapshotLoaded;
+}
+
+export async function loadGroupsSnapshot(options: { force?: boolean } = {}): Promise<void> {
   try {
     // 轻量视图：buildBotCards() 只遍历 snapshot.bots，且只读 larkAppId /
     // botName / botAvatarUrl / cliId / brand 这 5 个字段；`snapshot.chats` 在
@@ -19,14 +29,39 @@ export async function loadGroupsSnapshot(): Promise<void> {
     // 两者必须落在 groups-api 的**同一个 in-flight** 上，否则会变成
     // 「names 387KB + full 12.73MB」两发（MEASURED 13.11MB，比改动前的
     // 12.73MB 更差）。loadNameMaps 走 names，本函数也必须走 names。
-    groupsSnapshot = await fetchGroupsNamesSnapshot();
+    groupsSnapshot = await fetchGroupsNamesSnapshot(options.force ? { force: true } : {});
+    groupsSnapshotLoaded = true;
+    publishProviderRoster('lark', groupsSnapshot.bots.length);
   } catch {
     // Overview stays useful even when Lark group APIs are unavailable.
   }
 }
 
+/**
+ * 企业微信连接名单（总览卡片与 provider 名册的来源）。和 {@link loadGroupsSnapshot}
+ * 分开：飞书名称快照只在启动和进总览时拉一次，企业微信名单则只在确实有企业微信连接时
+ * 才需要定期刷新，两者不能绑在一起重拉。返回名单是否有变化，调用方据此决定要不要重渲染。
+ */
+export async function loadWecomConnectionsSnapshot(): Promise<boolean> {
+  try {
+    const response = await fetch('/api/wecom/connections');
+    const body = response.ok ? await response.json() : null;
+    if (!Array.isArray(body?.connections)) return false;
+    const changed = JSON.stringify(body.connections) !== JSON.stringify(wecomSnapshot);
+    wecomSnapshot = body.connections;
+    publishProviderRoster('wecom', wecomSnapshot.length);
+    return changed;
+  } catch {
+    // Keep the last confirmed provider roster during transient failures.
+    return false;
+  }
+}
+
 export type BotCard = {
   botName: string;
+  provider?: 'wecom';
+  providerBotId?: string;
+  providerConnection?: WecomConnectionDto['connection'];
   larkAppId?: string;
   /** 租户品牌，决定飞书后台深链的 host（feishu.cn vs larksuite.com）。
    *  缺省（旧 payload / 未注册）→ larkConsoleUrl 内 normalizeBrand 兜底 feishu。 */
@@ -47,11 +82,15 @@ export type BotCard = {
  *  又不在注册表里的 bot 不出卡（避免一排灰色离线噪音）。 */
 export function buildBotCards(sessions: any[]): BotCard[] {
   const byKey = new Map<string, BotCard>();
-  const ensure = (key: string): BotCard => {
+  // 企业微信卡片带上连接 id（不编造飞书 appId）；其余卡片的身份键就是 appId（或兜底的名字）。
+  const ensure = (key: string, wecomBotId?: string): BotCard => {
     let card = byKey.get(key);
     if (!card) {
+      const identity = wecomBotId !== undefined
+        ? { provider: 'wecom' as const, providerBotId: wecomBotId }
+        : { larkAppId: key };
       card = {
-        botName: key, larkAppId: key, cliId: 'unknown', online: false,
+        botName: key, ...identity, cliId: 'unknown', online: false,
         sessions: [], active: [], busy: [], attention: [], lastActiveAt: 0,
       };
       byKey.set(key, card);
@@ -66,13 +105,21 @@ export function buildBotCards(sessions: any[]): BotCard[] {
     if (b.cliId) card.cliId = b.cliId;
     if (b.brand) card.brand = b.brand;
   }
+  for (const connection of wecomSnapshot) {
+    const card = ensure(providerBotKey({ provider: 'wecom', providerBotId: connection.id }), connection.id);
+    card.botName = connection.label;
+    // 状态文件写入失败的网关仍连着企业微信，但已不再处理消息：不算在线。
+    card.online = connection.connection === 'connected' && !connection.stateWriteFailure;
+    card.providerConnection = connection.connection;
+  }
   // 两遍：先 active 建卡，再让 closed 会话只补充已有卡（不为其单独出卡）
   const ordered = [...sessions].sort((a, b) => Number(a.status === 'closed') - Number(b.status === 'closed'));
   for (const s of ordered) {
-    const key = s.larkAppId ?? s.botName ?? '-';
+    const wecom = isWecomSource(s);
+    const key = wecom ? providerBotKey(s) : s.larkAppId ?? s.botName ?? '-';
     if (s.status === 'closed' && !byKey.has(key)) continue;
-    const card = ensure(key);
-    if (s.botName && (card.botName === card.larkAppId || !card.botName)) card.botName = s.botName;
+    const card = ensure(key, wecom ? String(s.providerBotId ?? '') : undefined);
+    if (s.botName && (card.botName === key || card.botName === card.larkAppId || !card.botName)) card.botName = s.botName;
     card.sessions.push(s);
     if (s.cliId && card.cliId === 'unknown') card.cliId = s.cliId;
     card.lastActiveAt = Math.max(card.lastActiveAt, Number(s.lastMessageAt ?? 0));

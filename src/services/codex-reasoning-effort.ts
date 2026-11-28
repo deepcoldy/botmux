@@ -4,6 +4,11 @@ export const ANTIGRAVITY_REASONING_EFFORTS: readonly CodexReasoningEffort[] = ['
 /** Doubao's model-independent CLI flag accepts these BotMux levels; the
  * selected provider decides how to honour them. `ultra` is rejected by the CLI. */
 export const DOUBAO_REASONING_EFFORTS: readonly CodexReasoningEffort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
+/** Pi's `--thinking` parses off|minimal|low|medium|high|xhigh|max regardless of
+ *  model; BotMux's public vocabulary intersects it at these five (`ultra` is
+ *  not a Pi level, and off/minimal stay out of the shared enum). Per-model
+ *  narrowing stays Pi's own native behavior — no BotMux capability table. */
+export const PI_REASONING_EFFORTS: readonly CodexReasoningEffort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
 export const CODEX_COMMON_REASONING_EFFORTS = CODEX_REASONING_EFFORTS.slice(0, 4);
 export const GROK_REASONING_EFFORTS = CODEX_REASONING_EFFORTS.slice(0, 4);
 export const GROK_COMMON_REASONING_EFFORTS = GROK_REASONING_EFFORTS.slice(0, 3);
@@ -122,7 +127,7 @@ export function isConfigurableReasoningCliId(cliId: string | undefined): boolean
     // differ per model (grok-4.6 tops out at xhigh, GLM/Opus go to max, MiMo is
     // a switch). The launch path resolves the closest supported level, so the
     // whole vocabulary is offered here instead of a per-model subset.
-    || cliId === 'zcode' || cliId === 'antigravity';
+    || cliId === 'zcode' || cliId === 'antigravity' || cliId === 'pi';
 }
 
 export function isCodexReasoningEffort(value: unknown): value is CodexReasoningEffort {
@@ -321,6 +326,7 @@ export function reasoningEffortsForCliModel(
 ): readonly CodexReasoningEffort[] {
   if (cliId === 'antigravity') return ANTIGRAVITY_REASONING_EFFORTS;
   if (cliId === 'doubao') return DOUBAO_REASONING_EFFORTS;
+  if (cliId === 'pi') return PI_REASONING_EFFORTS;
   if (cliId === 'grok') return grokReasoningEffortsForModel(model);
   if (cliId === 'remote-runner') return REMOTE_RUNNER_REASONING_EFFORTS;
   if (cliId === 'traex') return traexReasoningEffortsForModel(model);

@@ -93,6 +93,10 @@ const RESERVED_ENV_KEYS = new Set<string>([
   'DSH_HOME',
   'CLAUDE_CODE_RESUME_TOKEN_THRESHOLD',
   'CJADK_INTERACTIVE',
+  'BOTMUX_TRAEX_OCCUPANT_ID',
+  'BOTMUX_TRAEX_DOMAIN_KEY',
+  'BOTMUX_TRAEX_SNAPSHOT_DIR',
+  'TRAEX_CODE_MODE_HOST_PATH',
 ]);
 
 /** Whether `key` is botmux-controlled and therefore rejected from per-bot env. */

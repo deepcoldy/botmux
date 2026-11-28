@@ -51,6 +51,7 @@ import { nativeGoalFromEvent, type NativeGoalState } from './native-goal-state.j
 import { basename, isAbsolute, join, relative, sep } from 'node:path';
 import { isTraexQuotaError, TRAEX_QUOTA_ERROR_CODE } from './traex-quota.js';
 import { isTraexModelAccessError, TRAEX_MODEL_ACCESS_ERROR_CODE } from './traex-model-access.js';
+import { isTraexToolImageUploadError, TRAEX_TOOL_IMAGE_UPLOAD_ERROR_CODE } from './traex-tool-image-recovery.js';
 import {
   splitCodexEventsByCutoff,
   extractLastCodexTurn,
@@ -1345,7 +1346,9 @@ export function drainTraexRollout(
         // the real reason instead of an empty-final alert.
         ...(failed ? {
           terminalStatus: 'failed' as const,
-          terminalErrorCode: isTraexModelAccessError(payload.error)
+          terminalErrorCode: isTraexToolImageUploadError(payload.error)
+            ? TRAEX_TOOL_IMAGE_UPLOAD_ERROR_CODE
+            : isTraexModelAccessError(payload.error)
             ? TRAEX_MODEL_ACCESS_ERROR_CODE
             : isTraexQuotaError(payload.error)
             ? TRAEX_QUOTA_ERROR_CODE

@@ -150,7 +150,7 @@ export function supportsTranscriptReplyDeliveryForBot(
  * written only into the sandbox's private tmpfs. An allowlist makes a newly added
  * transcript CLI without host-state mounts fall back to `send` by default. */
 export const ONCALL_HOST_VIEW_TRANSCRIPT_CLI_IDS: ReadonlySet<string> = new Set([
-  'claude-code', 'codex', 'traex', 'coco', 'mtr', 'pi', 'oh-my-pi', 'ebsd', 'grok', 'cursor', 'doubao',
+  'claude-code', 'codex', 'traex', 'coco', 'mtr', 'pi', 'oh-my-pi', 'ebsd', 'grok', 'cursor', 'doubao', 'nca',
 ]);
 
 /** Zero-injection has one extra transcript-capable CLI: antigravity only

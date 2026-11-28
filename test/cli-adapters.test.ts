@@ -39,7 +39,7 @@ import { createAidenAdapter } from '../src/adapters/cli/aiden.js';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
-import { createCursorAdapter, CURSOR_PLUGIN_DIR } from '../src/adapters/cli/cursor.js';
+import { createCursorAdapter, CURSOR_PLUGIN_DIR, cursorStopLeftParkedFollowUp } from '../src/adapters/cli/cursor.js';
 import { createGeniusAdapter } from '../src/adapters/cli/genius.js';
 import { createOpenCodeAdapter, isOpenCodeSessionId } from '../src/adapters/cli/opencode.js';
 import { createMiMoCodeAdapter } from '../src/adapters/cli/mimocode.js';
@@ -260,13 +260,18 @@ describe('zero injection with structured final reply adapters', () => {
   }
 });
 
+// The .mjs is embedded verbatim for the real Pi process; importing the typed
+// twin alone cannot catch a behavior change in just one of the two copies.
+const piTurnBoundaryImplementations = [
+  ['typed twin (.ts)', async () => registerBotmuxTurnBoundaryExtension],
+  ['runtime source (.mjs)', async (): Promise<typeof registerBotmuxTurnBoundaryExtension> =>
+    (await import('../src/adapters/cli/pi-turn-boundary-extension.mjs' as string)).default],
+] as const;
+
 // Input submitted while Pi is busy is written to the session only when Pi
 // dequeues it; the extension records the acceptance at submit time instead.
 describe('pi turn-boundary extension: queued input marker', () => {
-  for (const [name, load] of [
-    ['typed twin', async () => (await import('../src/adapters/cli/pi-turn-boundary-extension.js')).default],
-    ['runtime source', async () => (await import('../src/adapters/cli/pi-turn-boundary-extension.mjs' as string)).default],
-  ] as const) {
+  for (const [name, load] of piTurnBoundaryImplementations) {
     it(`${name}: marks input Pi will queue, and nothing for idle input`, async () => {
       const register = await load();
       const handlers: Record<string, (event?: any) => any> = {};
@@ -1329,6 +1334,20 @@ describe('codex-app buildArgs', () => {
     expect(args).not.toContain('--strict-resume');
   });
 
+  it('passes the frozen join bootstrap and replay fingerprint to the runner', () => {
+    const previous = { digest: 'a'.repeat(64), length: 42 };
+    const args = adapter.buildArgs({
+      sessionId: 'sess-app', resume: false,
+      groupJoinPrompt: '入群后等待真实任务', groupJoinTitleBootstrap: previous,
+    });
+    const promptIndex = args.indexOf('--group-join-prompt');
+    const digestIndex = args.indexOf('--group-join-title-digest');
+    const lengthIndex = args.indexOf('--group-join-title-length');
+    expect(args[promptIndex + 1]).toBe('入群后等待真实任务');
+    expect(args[digestIndex + 1]).toBe(previous.digest);
+    expect(args[lengthIndex + 1]).toBe('42');
+  });
+
   it('disables the runner fallback catalogue when the bare Codex runtime cannot attest the provider', () => {
     const direct = adapter.buildArgs({ sessionId: 'sess-app', resume: false });
     expect(direct).not.toContain('--codex-reasoning-catalog');
@@ -2166,6 +2185,73 @@ describe('cursor buildArgs', () => {
     expect(adapter.readyPattern?.test('Plan, search, build anything')).toBe(false);
   });
 
+  it('recognizes the Agent Local composer before, during, and after a turn', () => {
+    const empty = '  > Plan, search, build anything';
+    const busy = '  > Add a follow-up    ctrl+c to stop';
+    const busyAnsi = ' \u001b[48;5;233m \u001b[2m> \u001b[22m\u001b[7mA\u001b[27m\u001b[2mdd a follow-up\u001b[22m    \u001b[2mctrl+c to stop\u001b[22m \u001b[49m\r\n';
+    const idle = '  > Add a follow-up  \r\n';
+
+    expect(adapter.readyPattern?.test(`Cursor Agent (local-agent)\n${empty}`)).toBe(true);
+    expect(adapter.readyPattern?.test(idle)).toBe(true);
+    expect(adapter.readyPattern?.test(busy)).toBe(true);
+    expect(adapter.readyPattern?.test('Example: > Add a follow-up')).toBe(false);
+    expect(adapter.readyPattern?.test('> Add a follow-up before noon')).toBe(false);
+    expect(adapter.readyPattern?.test('>\nAdd a follow-up')).toBe(false);
+    expect(adapter.busyPattern?.test(busy)).toBe(true);
+    expect(adapter.busyPattern?.test('> press ctrl+c to stop')).toBe(false);
+    expect(adapter.screenShowsNoPendingInput?.('> press Escape    ctrl+c to stop\n  → Add a follow-up')).toBe(true);
+    expect(adapter.busyPattern?.test('> \npress ctrl+c to stop')).toBe(false);
+    expect(adapter.screenHoldsSubmittedInput?.(busyAnsi)).toBe(true);
+    expect(adapter.screenShowsNoPendingInput?.(busyAnsi)).toBe(false);
+    expect(adapter.screenShowsNoPendingInput?.(idle)).toBe(true);
+    expect(adapter.screenShowsNoPendingInput?.(`${idle}\n  > half-typed draft`)).toBe(false);
+    expect(adapter.screenHoldsSubmittedInput?.(`${busy}\r\n${idle}`)).toBe(false);
+    expect(adapter.screenShowsNoPendingInput?.(`${busy}\r\n${idle}`)).toBe(true);
+    expect(adapter.screenHoldsSubmittedInput?.(`${idle}\r\n${busy}`)).toBe(true);
+  });
+
+  it.each(['→', '>'])('recognizes the Cursor composer while a plan is available for review (%s)', glyph => {
+    const placeholder = `  ${glyph} Add a follow-up — /plan to review and build`;
+    expect(adapter.readyPattern?.test(placeholder)).toBe(true);
+    expect(adapter.readyPattern?.test(`${placeholder}    ctrl+c to stop`)).toBe(true);
+    expect(adapter.screenShowsNoPendingInput?.(placeholder)).toBe(true);
+  });
+
+  it('finds the Agent Local composer and queue above tmux viewport padding', () => {
+    const paddedViewport = (rows: string[]) => [
+      ...Array.from({ length: 19 }, (_, index) => `Earlier output ${index}`),
+      ...rows,
+      '  gateway-model',
+      ...Array<string>(16).fill('\u001b[49m    '),
+    ].join('\r\n');
+    const idle = '  > Add a follow-up';
+    const busy = `${idle}    ctrl+c to stop`;
+    const queued = ['  ┌─ follow-ups ────┐', '  │ Next request    │', '  └────────────────┘', idle];
+
+    expect(adapter.screenHoldsSubmittedInput?.(paddedViewport([busy]))).toBe(true);
+    expect(adapter.screenHoldsSubmittedInput?.(paddedViewport(queued))).toBe(true);
+    expect(adapter.screenShowsNoPendingInput?.(paddedViewport(queued))).toBe(false);
+    expect(adapter.screenShowsNoPendingInput?.(paddedViewport([idle]))).toBe(true);
+    expect(adapter.busyPattern?.test(busyProbeRegion(paddedViewport([busy]), 'cursor'))).toBe(true);
+    expect(adapter.busyPattern?.test(busyProbeRegion(paddedViewport([busy]), 'codex'))).toBe(false);
+  });
+
+  it('keeps an Agent Local draft starting with the placeholder pending', () => {
+    const placeholder = '  > Add a follow-up';
+    const draft = `${placeholder} before noon`;
+    const parked = '  ┌─ follow-ups ────┐\n  │ enter steer    │\n  └────────────────┘\n';
+
+    expect(adapter.screenShowsNoPendingInput?.(placeholder)).toBe(true);
+    expect(adapter.screenShowsNoPendingInput?.(`${placeholder}\n${draft}`)).toBe(false);
+    expect(adapter.screenShowsNoPendingInput?.('  > quote → Add a follow-up')).toBe(false);
+    expect(adapter.screenShowsNoPendingInput?.(`  → existing draft\n${placeholder}`)).toBe(false);
+    expect(adapter.screenShowsNoPendingInput?.('  → Add a follow-up\n  > interrupted draft')).toBe(false);
+    expect(cursorStopLeftParkedFollowUp(`${parked}${placeholder}`)).toBe(true);
+    expect(cursorStopLeftParkedFollowUp(`Example: enter steer\n${placeholder}`)).toBe(false);
+    expect(cursorStopLeftParkedFollowUp(`${parked}${placeholder}\n${draft}`)).toBe(false);
+    expect(cursorStopLeftParkedFollowUp(`  → Add a follow-up\n${parked}${draft}`)).toBe(false);
+  });
+
   it('detects active composer busy state and follow-ups queue without matching scrollback prose', () => {
     const busyAnsi = [
       '  I inspected /ctrl+c to stop/i in cursor.ts',
@@ -2475,6 +2561,84 @@ describe('pi buildArgs', () => {
     expect(modelIdx).toBeGreaterThanOrEqual(0);
     expect(args[modelIdx + 1]).toBe('custom/long-context-model');
     expect(args[0]).toBe('--extension');
+  });
+
+  it('passes a saved reasoning effort to Pi as --thinking, without a model required', () => {
+    // Dashboard 保存的档位必须抵达 Pi 进程：`--thinking` 与 `--model` 相互独立，
+    // 未显式配置模型的 Bot 也要能带上已保存档位启动。
+    const args = adapter.buildArgs({
+      sessionId: 'sess-pi',
+      resume: false,
+      reasoningEffort: 'xhigh',
+    });
+    const idx = args.indexOf('--thinking');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx + 1]).toBe('xhigh');
+    expect(args).not.toContain('--model');
+  });
+
+  it('lets Pi restore the session thinking level when resuming', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-pi', resume: true, reasoningEffort: 'high' });
+    expect(args).not.toContain('--thinking');
+    expect(args[args.indexOf('--session-id') + 1]).toBe('sess-pi');
+  });
+
+  describe.each(piTurnBoundaryImplementations)('resume fallback: %s', (_name, load) => {
+    it.each([
+      ['missing', 'startup', true],
+      ['present', 'startup', false],
+      ['removed after load', 'startup', false],
+      ['missing', 'not provided', true], // Older Pi without a reason field.
+      // Deliver the marker to each non-startup event directly: firing it only
+      // after startup would test env consumption, not the reason guard.
+      ['missing', 'new', false],
+      ['missing', 'resume', false],
+      ['missing', 'fork', false],
+      ['missing', 'reload', false],
+    ] as const)('handles a %s transcript (reason=%s)', async (transcriptState, reason, appliesFallback) => {
+      const register = await load();
+      const dir = mkdtempSync(join(tmpdir(), 'pi-resume-thinking-'));
+      const env: NodeJS.ProcessEnv = {};
+      const key = 'BOTMUX_PI_RESUME_FALLBACK_THINKING';
+      try {
+        const sessionId = randomUUID();
+        const transcript = join(dir, `session_${sessionId}.jsonl`);
+        if (transcriptState === 'present') writeFileSync(transcript, JSON.stringify({ type: 'session', id: sessionId, cwd: dir }) + '\n');
+        // A predicted reattach can become a cold spawn if its pane disappears.
+        expect(adapter.buildArgs({ sessionId, resume: true, reattach: true, reasoningEffort: 'high', env })).not.toContain('--thinking');
+        expect(env[key]).toBe('high');
+
+        const setThinkingLevel = vi.fn();
+        const ctx = { sessionManager: {
+          getSessionFile: () => transcript,
+          getEntries: () => transcriptState === 'removed after load' ? [{ type: 'message' }] : [],
+        } };
+        let start: ((event: { reason?: string }, context: typeof ctx) => void) | undefined;
+        register({
+          on: (name, handler) => { if (name === 'session_start') start = handler as typeof start; },
+          appendEntry: vi.fn(), setThinkingLevel,
+        });
+        vi.stubEnv(key, env[key]);
+        start!(reason === 'not provided' ? {} : { reason }, ctx);
+        expect(setThinkingLevel.mock.calls).toEqual(appliesFallback ? [['high']] : []);
+        expect(process.env[key]).toBeUndefined();
+      } finally {
+        vi.unstubAllEnvs();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it('never puts a level Pi rejects (ultra) on Pi argv and adds no override when unset', () => {
+    // Hand-edited bots.json is filtered in the adapter too: `ultra` 不是 Pi
+    // `--thinking` 的合法值，绝不能进入启动 argv。
+    for (const effort of ['ultra', 'off', 'minimal'] as const) {
+      const args = adapter.buildArgs({ sessionId: 'sess-pi', resume: false, reasoningEffort: effort });
+      expect(args).not.toContain('--thinking');
+    }
+    // Pi 原生默认（未保存档位）不加额外覆盖。
+    const args = adapter.buildArgs({ sessionId: 'sess-pi', resume: false });
+    expect(args).not.toContain('--thinking');
   });
 
   it('injects session context and builtin skills via extension env and --skill', () => {

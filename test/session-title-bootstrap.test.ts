@@ -43,4 +43,12 @@ describe('bootstrap-aware session titles', () => {
     const state = { title: 'Pinned title', titleSource: 'initial', nativeSessionTitleUserDefined: true };
     expect(applyAutomaticSessionTitle(state, 'new', 'cli', '2026-11-14T00:00:00Z')).toBe(false);
   });
+  it('strips hook-mode opening blocks before extracting title or matching group-join bootstrap', () => {
+    const hookJoinOnly = `<role context="group">helper</role>\n\n<botmux_group_join>joined</botmux_group_join>\n\n${bootstrap}\n\n<botmux_link_refs>L1=https://example.test</botmux_link_refs>`;
+    expect(sessionTitleInput(hookJoinOnly, undefined, [bootstrap])).toEqual({ text: '', bootstrapOnly: true });
+    expect(extractBotmuxLarkNativeSessionTitlePrompt(hookJoinOnly, undefined, [bootstrap])).toBeUndefined();
+
+    const hookQuestion = '<role context="group">helper</role>\n\n<shared_group_context>noise</shared_group_context>\n\n排查接口 502 错误\n\n<botmux_skills mode="priority">- ops</botmux_skills>';
+    expect(sessionTitleInput(hookQuestion)).toEqual({ text: '排查接口 502 错误', bootstrapOnly: false });
+  });
 });

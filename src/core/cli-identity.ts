@@ -773,9 +773,9 @@ const BYTEDCLI_REGIONAL_MISSING_HINTS: Record<BytedcliRegionalJwtSource, string>
 const BYTEDCLI_REGIONAL_MISSING_DEFAULT_HINT = '请确认发起人有该分区的权限后，发一条新消息再试。';
 
 /** bytedcli's root options that take a value (`ROOT_OPTIONS_WITH_VALUE` in its
- *  root-argv, 0.191), so the command after them can be found. */
+ *  root-argv, 0.203), so the command after them can be found. */
 const BYTEDCLI_ROOT_OPTIONS_WITH_VALUE = [
-  '--jq', '--site', '--cloud-site', '--auth-site', '--as', '--ai-auth-subject', '--ai-auth-app-key',
+  '--jq', '--site', '--network-profile', '--cloud-site', '--auth-site', '--as', '--ai-auth-subject', '--ai-auth-app-key',
   '--bytecloud-user-jwt-file', '--profile', '--vregion', '--vdc', '--socks5-proxy', '--http-proxy',
   '--http-print', '--http-header', '--http-trace-file', '--http-body-limit', '--http-timeout-ms',
   '--http-retry-count', '--http-retry-base-delay-ms', '--http-retry-max-delay-ms',
@@ -790,12 +790,13 @@ const BYTEDCLI_REGION_FREE_COMMANDS = ['help', 'codebase', 'meego'] as const;
  * `__botmux_bd_region_free "$@"`: 0 when this invocation does not use the
  * ByteCloud JWT of its site's partition — help or version output, no command
  * at all, or a {@link BYTEDCLI_REGION_FREE_COMMANDS} command. Finds the command
- * the way bytedcli's getFirstCommandArgIndex does. Anything it cannot place
- * answers 1, so a missing ticket is refused rather than let through.
+ * the way bytedcli's getFirstCommandArgIndex does. It also marks a Codebase
+ * command that was not short-circuited by a help/version flag.
+ * Anything it cannot place answers 1, so a missing ticket is refused.
  */
 const BYTEDCLI_REGION_FREE_FN: readonly string[] = [
   '__botmux_bd_region_free() {',
-  '  __botmux_rf_skip=; __botmux_rf_cmd=',
+  '  __botmux_rf_skip=; __botmux_rf_cmd=; __botmux_rf_codebase=',
   '  for __botmux_rf_a in "$@"; do',
   '    if [ -n "$__botmux_rf_skip" ]; then __botmux_rf_skip=; continue; fi',
   '    case "$__botmux_rf_a" in',
@@ -807,10 +808,12 @@ const BYTEDCLI_REGION_FREE_FN: readonly string[] = [
   '    case "$__botmux_rf_a" in',
   '      -h|--version|-V) return 0 ;;',
   `      ${BYTEDCLI_ROOT_OPTIONS_WITH_VALUE.join('|')}) __botmux_rf_skip=1 ;;`,
+  '      --*=*) ;;',
   '      -*) ;;',
   '      *) __botmux_rf_cmd=$__botmux_rf_a ;;',
   '    esac',
   '  done',
+  '  [ "$__botmux_rf_cmd" != codebase ] || __botmux_rf_codebase=1',
   '  case "$__botmux_rf_cmd" in',
   `    ''|${BYTEDCLI_REGION_FREE_COMMANDS.join('|')}) return 0 ;;`,
   '  esac',
@@ -939,8 +942,10 @@ function bytedcliRegionalSelection(): string[] {
     '  fi',
     '  __botmux_regional=',
     ...bytedcliSiteRegionCase('__botmux_site', '__botmux_regional'),
-    '  if [ -n "$__botmux_regional" ]; then BYTEDCLI_USER_CLOUD_JWT=$__botmux_regional; fi',
-    `  unset __botmux_site __botmux_gsite __botmux_next __botmux_skip __botmux_arg __botmux_region __botmux_regional __botmux_state __botmux_requested_region __botmux_global_region __botmux_selected_region __botmux_global_regional __botmux_followup_region ${BYTEDCLI_REGIONAL_SOURCE_VAR} ${BYTEDCLI_REGIONAL_RETRY_VAR} ${Object.values(BYTEDCLI_REGIONAL_JWT_VARS).join(' ')} ${Object.values(BYTEDCLI_REGIONAL_STATE_VARS).join(' ')}`,
+    // Once the fallback was selected, a concurrent publication that gains a
+    // regional JWT must not replace the default ticket we actually resolved.
+    '  if [ -n "$__botmux_regional" ] && [ "$__botmux_followup_region" != default ]; then BYTEDCLI_USER_CLOUD_JWT=$__botmux_regional; fi',
+    `  unset __botmux_site __botmux_gsite __botmux_next __botmux_skip __botmux_arg __botmux_region __botmux_regional __botmux_state __botmux_requested_region __botmux_codebase __botmux_global_region __botmux_selected_region __botmux_global_regional __botmux_followup_region ${BYTEDCLI_REGIONAL_SOURCE_VAR} ${BYTEDCLI_REGIONAL_RETRY_VAR} ${Object.values(BYTEDCLI_REGIONAL_JWT_VARS).join(' ')} ${Object.values(BYTEDCLI_REGIONAL_STATE_VARS).join(' ')}`,
   ];
 }
 
@@ -1462,8 +1467,8 @@ const BYTEDCLI_SCAN_FN: readonly string[] = [
   '        --) __botmux_sc_end=1; continue ;;',
   `        ${[...BYTEDCLI_ROOT_OPTIONS_WITH_VALUE, '--tenant', '--session-id'].join('|')}) __botmux_sc_skip=1; continue ;;`,
   '        -h|--help|-V|--version) [ -n "$__botmux_sc_optprev" ] || __botmux_sc_help=1; continue ;;',
-  '        -d|--debug|-j|--json|--nomask|--yes|--color|--no-color|--tls1.2|--http-debug|--no-auto-upgrade|--all-help) continue ;;',
-  '        -[dhjV][dhjV]*) case "$__botmux_sc_a" in *[hV]*) [ -n "$__botmux_sc_optprev" ] || __botmux_sc_help=1 ;; esac; continue ;;',
+  '        -d|--debug|-j|--json|-json|-v|--verbose|--nomask|--yes|--color|--no-color|--tls1.2|--http-debug|--no-auto-upgrade|--all-help) continue ;;',
+  '        -[dhjvV][dhjvV]*) case "$__botmux_sc_a" in *[hV]*) [ -n "$__botmux_sc_optprev" ] || __botmux_sc_help=1 ;; esac; continue ;;',
   // `--session[=…]` / `--session-method[=…]` make `auth login` the browser-session login, not the ByteCloud one (`--session-id` is another option).
   '        --session-method) __botmux_sc_websess=1; __botmux_sc_skip=1; continue ;;',
   '        --session|--session=*|--session-method=*) __botmux_sc_websess=1; continue ;;',
@@ -1700,14 +1705,15 @@ export function renderIdentityWrapper(
   const governsMeego = tool === 'bytedcli' && !nativeCapabilities.meego;
   const isBytecloudFamily = tool === 'bytedcli' || tool === CODEBASE_COMPANION_TOOL || tool === BITSCLI_COMPANION_TOOL;
   const authProvider = tool === 'lark-cli' ? 'lark-cli' : 'bytedcli';
-  const requestsRegionalGrant = tool === 'bytedcli' && model === 'proven' && governsByteCloud;
-  const regionArg = requestsRegionalGrant ? ' ${__botmux_requested_region:+--region} ${__botmux_requested_region:+"$__botmux_requested_region"}' : '';
+  const requestsBytedcliGrant = tool === 'bytedcli' && model === 'proven' && governsByteCloud;
+  const demandArgs = requestsBytedcliGrant ? ' ${1:+--region} ${1:+"$1"} ${2:+--codebase}' : '';
+  const resolveInitial = requestsBytedcliGrant ? '__botmux_resolve "$__botmux_requested_region" "$__botmux_codebase"' : '__botmux_resolve';
   const resolveBlock = model === 'proven' ? [
     // The runner proves this process tree over the daemon loopback channel and
     // prints the identity env ASSIGNMENTS, never a path. eval consumes that
     // body straight from the pipe: nothing in the session directory can select
     // or alter the identity, and no token rests on disk to be read.
-    `__botmux_cred_body=$(${[...identityResolver!, tool].map(shellSingleQuote).join(' ')}${regionArg}) || return ${IDENTITY_DENIED_EXIT_CODE}`,
+    `__botmux_cred_body=$(${[...identityResolver!, tool].map(shellSingleQuote).join(' ')}${demandArgs}) || return ${IDENTITY_DENIED_EXIT_CODE}`,
     // An empty body is a missing/empty response (no mode assignment below),
     // never silent permission to run: deny it like a failed proof.
     `[ -n "$__botmux_cred_body" ] || return ${IDENTITY_DENIED_EXIT_CODE}`,
@@ -1774,7 +1780,7 @@ export function renderIdentityWrapper(
     // the exec site below, after identity resolution where it applies.
     ...BYTEDCLI_AUTH_REQUEST_FN,
     ...(isBytecloudFamily ? [...BYTEDCLI_SCAN_FN, ...BYTECLOUD_CLEAN_RUN_FN] : []),
-    ...(tool === 'bytedcli' ? ['__botmux_requested_region=', '__botmux_global_region=', '__botmux_followup_region=', ...BYTEDCLI_REGION_FREE_FN] : []),
+    ...(tool === 'bytedcli' ? ['__botmux_requested_region=', '__botmux_codebase=', '__botmux_followup_region=', ...BYTEDCLI_REGION_FREE_FN] : []),
     ...(governsMeego ? BYTEDCLI_MEEGO_FN : []),
     '__botmux_resolve() {',
     `  ${MODE_VAR}=`,
@@ -1847,7 +1853,7 @@ export function renderIdentityWrapper(
       ] : []),
     ] : []),
     ...(tool === 'bytedcli' ? [...bytedcliGlobalSite(), ...bytedcliSelectedSite()] : []),
-    ...(requestsRegionalGrant ? [
+    ...(requestsBytedcliGrant ? [
       'if ! __botmux_bd_region_free "$@"; then',
       ...bytedcliSiteRegionCase('__botmux_gsite', undefined, '__botmux_requested_region'),
       '  __botmux_global_region=$__botmux_requested_region',
@@ -1864,43 +1870,53 @@ export function renderIdentityWrapper(
       '        *:) __botmux_requested_region=default ;;',
       '        *) __botmux_requested_region= ;;',
       '      esac ;;',
-      '    *)',
-      // The global overseas ticket is a prerequisite even when the subcommand
-      // selects another token. Satisfy it first, then renew an effective
-      // default/CN ticket in a second resolution below.
-      '      case "$__botmux_selected_region" in',
-      '        "") __botmux_followup_region=default ;;',
-      '        cn) __botmux_followup_region=cn ;;',
-      '      esac ;;',
       '  esac',
+      'elif [ -n "$__botmux_rf_codebase" ] && [ -z "$__botmux_sc_unknown$__botmux_sc_help" ]; then',
+      '  case "$__botmux_sc_w2" in ""|help) ;; *) __botmux_codebase=1 ;; esac',
       'fi',
     ] : []),
-    ...(requestsRegionalGrant ? [
-      '__botmux_resolve_selected() {',
-      `  [ "$${MODE_VAR}" = user ] || return 0`,
-      '  if [ -n "$__botmux_followup_region" ]; then',
-      '    __botmux_requested_region=$__botmux_followup_region',
-      '    __botmux_followup_region=',
-      '    __botmux_resolve || return',
-      '  fi',
-      // A missing subcommand partition falls back to the default JWT, but only
-      // after the global prerequisite is present. Renew that fallback ticket;
-      // do not trade a missing global partition for an unrelated default grant.
-      '  [ -n "$__botmux_selected_region" ] || return 0',
+    ...(requestsBytedcliGrant ? [
+      '__botmux_has_selected_regional() {',
       '  __botmux_regional=',
       ...bytedcliSiteRegionCase('__botmux_site', '__botmux_regional'),
-      '  [ -z "$__botmux_regional" ] || return 0',
+      '  [ -n "$__botmux_regional" ]',
+      '}',
+      '__botmux_resolve_selected() {',
+      '  __botmux_followup_region=',
+      `  [ "$${MODE_VAR}" = user ] && ! __botmux_bd_region_free "$@" || return 0`,
+      // The global partition remains a prerequisite even when the subcommand
+      // selects another token. Keep the original missing-region guidance.
       '  if [ -n "$__botmux_global_region" ]; then',
       '    __botmux_global_regional=',
       ...bytedcliSiteRegionCase('__botmux_gsite', '__botmux_global_regional'),
       '    [ -n "$__botmux_global_regional" ] || return 0',
       '  fi',
-      '  __botmux_requested_region=default',
-      '  __botmux_resolve',
+      // A subcommand site only selects a regional ticket when the published
+      // identity has one. Preserve the default fallback for an absent ticket.
+      '  __botmux_followup_region=default',
+      '  if __botmux_has_selected_regional; then',
+      '    __botmux_followup_region=$__botmux_selected_region',
+      '  fi',
+      '  [ "$__botmux_followup_region" != "$__botmux_requested_region" ] || return 0',
+      `  __botmux_first_turn=$${TURN_VAR}; __botmux_first_open_id=$${OPEN_ID_VAR}`,
+      '  __botmux_resolve "$__botmux_followup_region" || return',
+      // The second RPC can independently prove a newer turn. Use its result
+      // only if it serves the same identity as the first resolution.
+      `  if [ -z "$__botmux_first_turn" ] || [ -z "$__botmux_first_open_id" ] || [ "$${TURN_VAR}" != "$__botmux_first_turn" ] || [ "$${OPEN_ID_VAR}" != "$__botmux_first_open_id" ]; then`,
+      `    printf '%s\\n' 'botmux: 获取凭据时轮次或发起人已变更，命令未执行。请重试。' '[reason=lineage_unproven]' >&2`,
+      `    return ${IDENTITY_DENIED_EXIT_CODE}`,
+      '  fi',
+      '  unset __botmux_first_turn __botmux_first_open_id',
+      // A republish of the same turn could have withdrawn the selected token
+      // between lookups. The next command can resolve the default explicitly.
+      `  if [ "$${MODE_VAR}" = user ] && [ "$__botmux_followup_region" != default ] && ! __botmux_has_selected_regional; then`,
+      `    printf '%s\\n' 'botmux: 当前轮次的所选分区凭据已变更，命令未执行。请重试。' '[reason=regional_jwt_missing]' >&2`,
+      `    return ${IDENTITY_DENIED_EXIT_CODE}`,
+      '  fi',
       '}',
     ] : []),
-    `__botmux_resolve || exit ${IDENTITY_DENIED_EXIT_CODE}`,
-    ...(requestsRegionalGrant ? [`__botmux_resolve_selected || exit ${IDENTITY_DENIED_EXIT_CODE}`] : []),
+    `${resolveInitial} || exit ${IDENTITY_DENIED_EXIT_CODE}`,
+    ...(requestsBytedcliGrant ? [`__botmux_resolve_selected "$@" || exit ${IDENTITY_DENIED_EXIT_CODE}`] : []),
     // A refusal of an unattended run (published for exactly the lapse of a
     // credential): the single place that asks botmux for the private notice.
     `if [ "$${MODE_VAR}" = denied ]; then`,
@@ -1917,8 +1933,8 @@ export function renderIdentityWrapper(
     `    __botmux_auth_request --provider ${authProvider}`,
     '    __botmux_rc=$?',
     '    if [ "$__botmux_rc" -eq 0 ]; then',
-    `      __botmux_resolve || { printf '%s\\n' "$__botmux_ar_out" >&2; exit ${IDENTITY_DENIED_EXIT_CODE}; }`,
-    ...(requestsRegionalGrant ? [`      __botmux_resolve_selected || { printf '%s\\n' "$__botmux_ar_out" >&2; exit ${IDENTITY_DENIED_EXIT_CODE}; }`] : []),
+    `      ${resolveInitial} || { printf '%s\\n' "$__botmux_ar_out" >&2; exit ${IDENTITY_DENIED_EXIT_CODE}; }`,
+    ...(requestsBytedcliGrant ? [`      __botmux_resolve_selected "$@" || { printf '%s\\n' "$__botmux_ar_out" >&2; exit ${IDENTITY_DENIED_EXIT_CODE}; }`] : []),
     // Only the same turn and the same person may pick up the new identity;
     // an identity that names neither is never taken for the same one.
     `      if [ "$${MODE_VAR}" != user ] || [ -z "$__botmux_t0" ] || [ -z "$__botmux_o0" ] || [ "$${TURN_VAR}" != "$__botmux_t0" ] || [ "$${OPEN_ID_VAR}" != "$__botmux_o0" ]; then`,

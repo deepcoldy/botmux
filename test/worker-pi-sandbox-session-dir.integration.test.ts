@@ -16,31 +16,40 @@
  * where the host cannot run it.
  */
 import { afterEach, describe, expect, it } from 'vitest';
-import { type ChildProcess } from 'node:child_process';
+import { spawnSync, type ChildProcess } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { spawnNodeTsScript, spawnSyncTsEvalWithRepoImports } from './helpers/ts-runner.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
+import { scratchMountRuntimeAvailable } from './helpers/scratch-mount-probe.js';
+import { waitForWorkerMessage } from './helpers/worker-ipc-waiter.js';
+import { killProcessTree } from './helpers/process-tree.js';
 import { probeHostCredentialIsolationMechanism } from '../src/adapters/backend/sandbox.js';
-import { piSessionDirName } from '../src/services/pi-transcript.js';
+import { teardownScratchSession } from '../src/adapters/backend/scratch-sandbox.js';
+import { piPersistentTranscriptDir, piPreviousTranscriptDir, piSessionDirName } from '../src/services/pi-transcript.js';
 import type { DaemonToWorker } from '../src/types.js';
 
 const bwrapRuntime = process.platform === 'linux' && (() => {
   const probe = probeHostCredentialIsolationMechanism();
   return probe.supported && probe.mechanism === 'bwrap';
 })();
+const scratchStorage: 'tmpfs' | 'disk' = process.getuid?.() === 0 ? 'tmpfs' : 'disk';
+const scratchRuntime = bwrapRuntime && scratchMountRuntimeAvailable(scratchStorage);
+const hasTmux = process.platform === 'linux' && spawnSync('tmux', ['-V']).status === 0;
 
 const SID = '7d1f3c2a-5b6e-4f80-9a1b-2c3d4e5f6a7b';
 
 let child: ChildProcess | undefined;
 let root: string | undefined;
+let scratchUsed = false;
+let stopTmux: (() => void) | undefined;
 afterEach(async () => {
-  if (child && child.exitCode === null && child.signalCode === null) {
-    const stopped = new Promise<void>(done => child!.once('exit', () => done()));
-    child.kill('SIGKILL');
-    await Promise.race([stopped, new Promise<void>(done => setTimeout(done, 5_000))]);
-  }
+  if (child) await killProcessTree(child);
   child = undefined;
+  stopTmux?.();
+  stopTmux = undefined;
+  if (root && scratchUsed) teardownScratchSession(SID, join(root, '.botmux', 'data'));
+  scratchUsed = false;
   if (root) rmSandboxScratch(root);
   root = undefined;
 });
@@ -76,6 +85,8 @@ for a in "$@"; do
 done
 {
   echo "argv:$*"
+  echo "resumeFallbackThinking:\${BOTMUX_PI_RESUME_FALLBACK_THINKING-unset}"
+  echo "paneRc:\${PI_TEST_PANE_RC-unset}"
   echo "tar:$TAR_OPTIONS"
   if cat '${sibling}' >/dev/null 2>&1; then echo "sibling:READ"; else echo "sibling:HIDDEN"; fi
   if cat '${siblingOwn}' >/dev/null 2>&1; then echo "siblingOwn:READ"; else echo "siblingOwn:HIDDEN"; fi
@@ -87,25 +98,49 @@ exec sleep 600
   const env: NodeJS.ProcessEnv = {
     ...process.env, HOME: home, SHELL: '/bin/sh', SESSION_DATA_DIR: dataDir, BOTS_CONFIG: bots, BOTMUX_NO_CLAIM: '1',
   };
-  for (const key of Object.keys(env)) if (key.startsWith('BOTMUX_') && key !== 'BOTMUX_NO_CLAIM') delete env[key];
+  for (const key of Object.keys(env)) {
+    if (key.startsWith('BOTMUX_') && key !== 'BOTMUX_NO_CLAIM' && key !== 'BOTMUX_FENCED_RUN') delete env[key];
+  }
+  // A nested Pi runner can pin its own profile independently of HOME.
+  delete env.PI_CODING_AGENT_DIR;
+  delete env.PI_CODING_AGENT_SESSION_DIR;
   delete env.TMUX;
   delete env.TMUX_PANE;
   return {
-    home, sessions, workDir, report, fakePi,
+    home, dataDir, sessions, workDir, report, fakePi,
     ownDir: join(sessions, 'botmux', SID),
-    start(opts: { sandbox: boolean; resume?: boolean; botEnv?: Record<string, string> }) {
+    start(opts: { sandbox: boolean | 'scratch'; resume?: boolean; reasoningEffort?: 'high' | 'xhigh'; botEnv?: Record<string, string>; backend?: 'pty' | 'tmux' }) {
+      scratchUsed ||= opts.sandbox === 'scratch';
+      if (opts.backend === 'tmux') {
+        env.TMUX_TMPDIR = home;
+        // Keep both probe targets reachable, using only this test's sockets.
+        const sockets = ['default', 'botmux'].map(name => join(home, `tmux-${process.getuid!()}`, name));
+        stopTmux = () => {
+          for (const socket of sockets) spawnSync('tmux', ['-S', socket, 'kill-server'], { env, stdio: 'ignore', timeout: 5_000 });
+        };
+        for (const socket of sockets) {
+          const result = spawnSync('tmux', ['-S', socket, '-f', '/dev/null', 'new-session', '-d', '-s', 'holder', 'sleep', '120'],
+            { env, encoding: 'utf8', timeout: 5_000 });
+          expect(result.status, result.stderr).toBe(0);
+        }
+      }
       const logs: string[] = [];
       child = spawnNodeTsScript(resolve('src/worker.ts'), [], { env, stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
       child.stdout?.on('data', chunk => logs.push(String(chunk)));
       child.stderr?.on('data', chunk => logs.push(String(chunk)));
       child.send({
         type: 'init', sessionId: SID, chatId: 'oc_pi', rootMessageId: 'om_pi', workingDir: workDir,
-        cliId: 'pi', cliPathOverride: fakePi, backendType: 'pty', prompt: '',
+        cliId: 'pi', cliPathOverride: fakePi, backendType: opts.backend ?? 'pty', prompt: '',
+        ...(opts.backend === 'tmux' ? { launchShell: '/bin/bash' } : {}),
         apiOnly: true, larkAppId: 'app_pi', larkAppSecret: '', ownerOpenId: 'ou_owner',
         loadedBotsConfigPath: bots, loadedBotsConfigProvenance: 'loaded', promptInjection: 'none',
         ...(opts.resume ? { resume: true, cliSessionId: SID } : {}),
+        ...(opts.reasoningEffort ? { reasoningEffort: opts.reasoningEffort } : {}),
         ...(opts.botEnv ? { env: opts.botEnv } : {}),
-        ...(opts.sandbox ? { sandbox: 'oncall' } : {}),
+        ...(opts.sandbox ? {
+          sandbox: opts.sandbox === 'scratch' ? 'scratch' as const : 'oncall' as const,
+          ...(opts.sandbox === 'scratch' ? { scratchStorage } : {}),
+        } : {}),
       } satisfies DaemonToWorker);
       return logs;
     },
@@ -137,6 +172,29 @@ describe('Pi transcript dir under the allowlist file sandbox (real worker)', () 
     expect(report.siblingOwn).toBe('HIDDEN');
   }, 60_000);
 
+  it.skipIf(!bwrapRuntime)('uses the sandbox directory for both Pi and bridge reattachment with a custom profile', async () => {
+    const l = lab();
+    const logs = l.start({ sandbox: true, botEnv: { PI_CODING_AGENT_DIR: join(l.home, 'bot-profile') } });
+    await waitForWorkerMessage(child!, [], 'ready', logs, 30_000);
+    const report = await readReport(l.report, logs);
+    expect(report.argv).toContain(`--session-dir ${l.ownDir}`);
+    expect(piPreviousTranscriptDir(l.dataDir, SID)).toBe(l.ownDir);
+  }, 60_000);
+
+  it.skipIf(!scratchRuntime)('cold scratch preserves the previous host transcript directory record', async () => {
+    const l = lab();
+    const previousDir = join(l.workDir, 'project-records');
+    mkdirSync(join(l.workDir, '.pi'), { recursive: true });
+    writeFileSync(join(l.workDir, '.pi', 'settings.json'), JSON.stringify({ sessionDir: previousDir }));
+    piPersistentTranscriptDir(l.dataDir, SID, previousDir, false);
+
+    const logs = l.start({ sandbox: 'scratch' });
+    await waitForWorkerMessage(child!, [], 'ready', logs, 30_000);
+    // The scratch launch has no host profile directory. Its undefined bridge
+    // directory must not erase what a later oncall resume needs for adoption.
+    expect(piPreviousTranscriptDir(l.dataDir, SID)).toBe(previousDir);
+  }, 60_000);
+
   it.skipIf(!bwrapRuntime || process.getuid?.() !== 0)('sandboxed, root worker: the bot\'s own TAR_OPTIONS reaches the CLI extended with --no-same-owner', async () => {
     const l = lab();
     const logs = l.start({ sandbox: true, botEnv: { TAR_OPTIONS: '--warning=no-timestamp' } });
@@ -155,6 +213,35 @@ describe('Pi transcript dir under the allowlist file sandbox (real worker)', () 
     expect(report.argv).toContain(`--session-dir ${l.ownDir}`);
     expect(readdirSync(l.ownDir)).toContain(name);
     expect(readFileSync(join(l.ownDir, name), 'utf8')).toContain(`"id":"${SID}"`);
+  }, 60_000);
+
+  const verifyResumeFallback = async (sandbox: boolean) => {
+    const l = lab();
+    const logs = l.start({ sandbox, resume: true, reasoningEffort: 'xhigh' });
+    const report = await readReport(l.report, logs);
+    // No --thinking on resume: the extension applies this value only if Pi
+    // actually opened a replacement transcript. This assertion covers the real
+    // worker's env promotion rather than merely calling the adapter directly.
+    expect(report.argv).not.toContain('--thinking');
+    expect(report.resumeFallbackThinking).toBe('xhigh');
+  };
+  it('unsandboxed cold resume carries saved thinking to the session-start fallback', () => verifyResumeFallback(false), 60_000);
+  it.skipIf(!bwrapRuntime)('sandboxed cold resume carries saved thinking to the session-start fallback', () => verifyResumeFallback(true), 60_000);
+
+  it.skipIf(!hasTmux).each([
+    ['configured', 'xhigh'],
+    ['unconfigured', undefined],
+  ] as const)('tmux cold resume forwards only the saved fallback (%s)', async (_case, reasoningEffort) => {
+    const l = lab();
+    // A stale value from a shell rcfile arrives after any server-side scrub.
+    writeFileSync(join(l.home, '.bashrc'), 'export BOTMUX_PI_RESUME_FALLBACK_THINKING=low\nexport PI_TEST_PANE_RC=loaded\n');
+    const logs = l.start({ sandbox: false, resume: true, backend: 'tmux', reasoningEffort,
+      botEnv: { BOTMUX_PI_RESUME_FALLBACK_THINKING: 'medium' } });
+    const report = await readReport(l.report, logs);
+    expect(report.paneRc).toBe('loaded');
+    expect(report.argv).toContain(`--session-id ${SID}`);
+    expect(report.argv).not.toContain('--thinking');
+    expect(report.resumeFallbackThinking).toBe(reasoningEffort ?? 'unset');
   }, 60_000);
 
   it('unsandboxed: a session that never ran sandboxed keeps Pi\'s native layout', async () => {

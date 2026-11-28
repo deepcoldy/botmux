@@ -384,7 +384,7 @@ describe('CLI transport gate for a managed no-transport turn', () => {
 });
 
 describe('core-only entrypoint', () => {
-  it('freezes a dedicated state root, strips BOTS_CONFIG and pins worker HTTP to loopback before the daemon starts', async () => {
+  it('freezes and marks a dedicated state root, strips BOTS_CONFIG and pins worker HTTP to loopback before the daemon starts', async () => {
     const home = mkdtempSync(join(tmpdir(), 'core-only-entry-'));
     const before = { ...process.env };
     let envAtStart: NodeJS.ProcessEnv | undefined;
@@ -397,6 +397,8 @@ describe('core-only entrypoint', () => {
         BOTMUX_API_PORT: '45931',
         BOTS_CONFIG: '/fleet/bots.json',
         SESSION_DATA_DIR: '/fleet/data',
+        // A stale marker inherited from an outer core's session must not survive.
+        BOTMUX_CORE_ONLY_DATA_DIR: '/outer/core/data',
         BOTMUX_WORKER_HTTP_HOST: '0.0.0.0',
         BOTMUX_WORKER_HOST: '0.0.0.0',
       });
@@ -407,6 +409,8 @@ describe('core-only entrypoint', () => {
       expect(envAtStart!.BOTMUX_CORE_ONLY).toBe('1');
       expect(envAtStart!.BOTS_CONFIG).toBeUndefined();
       expect(envAtStart!.SESSION_DATA_DIR).toBe(join(home, '.botmux', 'core-only', 'local_riff', 'data'));
+      // Sessions on every backend inherit this marker of whose store they carry.
+      expect(envAtStart!.BOTMUX_CORE_ONLY_DATA_DIR).toBe(envAtStart!.SESSION_DATA_DIR);
       expect(envAtStart!.BOTMUX_WORKER_HTTP_HOST).toBe('127.0.0.1');
       expect(envAtStart!.BOTMUX_WORKER_HOST).toBeUndefined();
       expect(exit).not.toHaveBeenCalled();
@@ -436,12 +440,12 @@ describe('source-structure guards (no injectable seam)', () => {
   // 的沙箱迁移、不改写共享 HOME 的 ~/.botmux/.data-dir；就绪闸门在 bind 前布防、session 恢复后才放行，
   // ready 行（riff 解析的契约）只在放行后打印——否则 trigger 会撞上未完成的持久恢复而重发。来历：#668 codex P1 第 2/3 轮、P1-3。
   it('core-only daemon never touches fleet-wide host state and holds triggers until restore completes', () => {
-    expect(daemonSource).toMatch(/if \(process\.env\.BOTMUX_CORE_ONLY !== '1'\) \{\s*await migrateSandboxConfigAtStartup\(\);/);
+    expect(daemonSource).toMatch(/if \(!isCoreOnlyProcess\(\)\) \{\s*await migrateSandboxConfigAtStartup\(\);/);
     const maintenance = braceBlock(daemonSource, 'if (idx === 0 && !coreOnly) {');
     for (const call of ['startMaintenance(', 'startCliRuntimeUpdateMonitor(', 'sendRestartReportIfPending(']) {
       expect(maintenance, call).toContain(call);
     }
-    const breadcrumbGuard = braceBlock(braceBlock(daemonSource, 'function writePidFile('), "BOTMUX_CORE_ONLY !== '1'");
+    const breadcrumbGuard = braceBlock(braceBlock(daemonSource, 'function writePidFile('), 'if (!isCoreOnlyProcess())');
     expect(breadcrumbGuard).toContain("'.data-dir'");
 
     const armAt = daemonSource.indexOf('armCoreOnlyReadinessGate()');
@@ -497,7 +501,7 @@ describe('source-structure guards (no injectable seam)', () => {
       ['larkAppId', 'sourceOpenId', 'undefined', 'false', 'sourceTurnId'],
     ]);
     const inbound = allCalls.filter(args => args[4] !== 'sourceTurnId');
-    expect(inbound).toHaveLength(6);
+    expect(inbound).toHaveLength(7);
     // The card-click entry has no platform sender_type. It must pass the
     // card-click predicate (peer cross-ref, identity-cache bot/app, and the
     // three union-id bot tables) rather than a literal false, which would
@@ -515,7 +519,7 @@ describe('source-structure guards (no injectable seam)', () => {
     expect(predicate).toContain('isPlatformTeamBot(');
     expect(predicate).toContain('isTrustedSameOwnerSiblingBot(');
     const humanEntries = inbound.filter(args => !/cardClickOperatorIsBotOrApp\(/.test(args[3] ?? ''));
-    expect(humanEntries).toHaveLength(5);
+    expect(humanEntries).toHaveLength(6);
     // Three inline IM entries (new topic, principal-lane proposer, thread
     // reply) name parsed.senderType and the cross-ref foreign-bot leg at the
     // call site. The (?!false) lookahead rejects downgrading any single site
@@ -528,7 +532,7 @@ describe('source-structure guards (no injectable seam)', () => {
     // The queue and ask sites forward a tri-state value computed earlier in
     // the same frame; pin the local names so a boolean literal goes red.
     const precomputedEntries = humanEntries.filter(args => !args.some(a => /\bparsed\.senderType\b/.test(a)));
-    expect(precomputedEntries).toHaveLength(2);
+    expect(precomputedEntries).toHaveLength(3);
     for (const args of precomputedEntries) {
       expect(args[3], args.join(', ')).toMatch(/^(?:senderIsBot|byType)$/);
     }

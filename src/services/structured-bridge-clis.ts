@@ -9,9 +9,9 @@
  *     its agent-transcript JSONL, and the send-marker gate in
  *     bridge-fallback-gate.ts suppresses the transcript emit when the model
  *     did send — exactly like the other structured CLIs.
- *   - ZERO_PROMPT: CLIs whose spawned sessions only harvest in zero-prompt
- *     mode. Antigravity also harvests replies to messages sent to an adopted
- *     process, which did not receive Botmux's send instructions when it started.
+ *   - ZERO_PROMPT: additional drivers enabled by zero-prompt. Antigravity's
+ *     ordinary terminal fallback also needs a runtime backend check in
+ *     turn-terminal-capability.ts.
  *
  * File-path resolution for JSONL-style bridges lives in
  * `resolveFileBridgePath` (same module family, worker-facing). Hermes/MTR
@@ -42,6 +42,7 @@ export const STRUCTURED_BRIDGE_ALWAYS_CLI_IDS = [
   // Like coco/cursor it lacks a complete interrupted/error terminal contract
   // and stays OUT of the lifecycle-blocking list.
   'doubao',
+  'nca',
 ] as const satisfies readonly CliId[];
 
 /** Adopt must forward pid/cwd/cliSessionId for these (CLIs whose worker
@@ -68,11 +69,9 @@ export const STRUCTURED_BRIDGE_ADOPT_CLI_IDS = [
 const ALWAYS_SET: ReadonlySet<string> = new Set(STRUCTURED_BRIDGE_ALWAYS_CLI_IDS);
 const ADOPT_SET: ReadonlySet<string> = new Set(STRUCTURED_BRIDGE_ADOPT_CLI_IDS);
 
-/** Botmux-spawned CLIs that gain the structured bridge SOLELY under zero-prompt
- *  injection (`promptInjection: 'none'`): in ordinary mode the model delivers
- *  through `botmux send` and harvesting transcript finals would double-post.
- *  A local-PTY-only CLI (no remote backend) with an append-only transcript
- *  that can be distilled to the user → assistant_final shape:
+/** Additional CLIs supported by zero-prompt injection (`promptInjection: 'none'`).
+ *  Antigravity has an append-only local transcript that can be distilled to
+ *  the user → assistant_final shape:
  *
  *   - antigravity: `brain/<id>/.system_generated/logs/transcript.jsonl`
  *     (`drainAntigravityTranscript`). Adopted processes use the same reader.
@@ -129,8 +128,8 @@ export function isStructuredBridgeLifecycleBlockingCli(cliId: string | undefined
   return !!cliId && LIFECYCLE_BLOCKING_SET.has(cliId);
 }
 
-/** Worker `codexBridgeFallbackActive` — the ALWAYS CLIs (including cursor, in
- *  every mode), plus Antigravity in adopt mode or under zero-prompt. */
+/** Static bridge eligibility. The worker also checks Antigravity's local
+ *  terminal capability before enabling fallback for an ordinary spawn. */
 export function isStructuredBridgeFallbackActive(
   cliId: string | undefined,
   adoptMode?: boolean,
@@ -156,11 +155,9 @@ export function supportsZeroPromptStructuredBridge(cliId: string | undefined): b
 
 /** Automatic final replies for ordinary bot-spawned CLI sessions. Claude uses
  * its own transcript bridge; the remaining drivers share the structured one.
- * Deliberately EXCLUDES antigravity (the sole remaining zero-prompt-only
- *  CLI): in default mode it replies via `botmux send`, so callers must not
- *  expect transcript delivery from it. Note this only governs the opt-in
- *  `replyDelivery: transcript` mode — the ALWAYS CLIs' send-marker-gated
- *  fallback harvest (including cursor) runs regardless of this setting. */
+ * This predicate governs opting into `replyDelivery: transcript`. Antigravity
+ * keeps its ordinary send mode and can harvest a missing reply via the
+ * runtime fallback in turn-terminal-capability.ts. */
 export function supportsTranscriptReplyDelivery(cliId: string | undefined): boolean {
   return cliId === 'claude-code' || (!!cliId && ALWAYS_SET.has(cliId));
 }

@@ -17,13 +17,25 @@ import { homedir } from 'node:os';
 import { existsSync, mkdirSync } from 'node:fs';
 import { installDaemonFatalErrorGuard } from './utils/daemon-fatal-error.js';
 import { installStdioEpipeGuard } from './utils/stdio-epipe-guard.js';
-import { scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv } from './utils/child-env.js';
+import {
+  CORE_ONLY_FROZEN_LOOPBACK_ENV,
+  pinCoreOnlyServiceDataDir,
+  scrubClaudeSessionMarkerEnv,
+  scrubSessionCliHomeEnv,
+} from './utils/child-env.js';
+import { isNativeGatewayCoreEnv } from './core/runtime-mode.js';
+import { takeNativeGatewayCoreCredential } from './core/native-gateway-credential.js';
+import { syncNativeGatewayDataDirMark } from './core/native-gateway-session.js';
 
 installDaemonFatalErrorGuard();
 installStdioEpipeGuard();
 
 const globalEnv = join(homedir(), '.botmux', '.env');
-dotenvConfig({ path: existsSync(globalEnv) ? globalEnv : '.env' });
+// Managed gateways already construct a scrubbed child environment. Reloading
+// the user's .env here would reintroduce IM secrets into the core and workers.
+if (process.env.BOTMUX_CORE_SKIP_DOTENV !== '1') {
+  dotenvConfig({ path: existsSync(globalEnv) ? globalEnv : '.env' });
+}
 
 // Same boot-env hygiene as index-daemon: a daemon is never a session, so scrub
 // any session-scoped vars that a parent (e.g. a botmux session that spawned us)
@@ -38,6 +50,11 @@ scrubClaudeSessionMarkerEnv(process.env);
 // synthesizes the apiOnly bot on this flag, and daemon.ts reads it for the
 // fixed-port / no-probe / core-only-public-route / loopback IPC decisions.
 process.env.BOTMUX_CORE_ONLY = '1';
+// The credential a native gateway shares with this core (core/native-gateway-
+// credential.ts): into module memory, out of the environment, before any
+// config module or child process can see it. Removed whatever this service is;
+// kept only by a native gateway's core.
+takeNativeGatewayCoreCredential(process.env);
 // Strip BOTS_CONFIG entirely (codex P1): the config PARSER already ignores it for
 // identity, but the raw env is inherited by every forked worker — an agent could
 // `cat $BOTS_CONFIG` to read a real fleet.json (sibling secrets) if it points
@@ -51,7 +68,7 @@ delete process.env.BOTS_CONFIG;
 // env it inherits. Freeze it to loopback UNCONDITIONALLY — a parent/dotenv value
 // of 0.0.0.0 must NOT survive and re-expose the worker on all interfaces. (A
 // future intentional exposure would be a separate explicit danger switch.)
-process.env.BOTMUX_WORKER_HTTP_HOST = '127.0.0.1';
+process.env.BOTMUX_WORKER_HTTP_HOST = CORE_ONLY_FROZEN_LOOPBACK_ENV.BOTMUX_WORKER_HTTP_HOST;
 delete process.env.BOTMUX_WORKER_HOST; // legacy alias — must not shadow the freeze
 // Freeze the ADVERTISED web-terminal host to loopback too (form C). The line
 // above confines where the worker web server BINDS; this confines the host
@@ -63,8 +80,21 @@ delete process.env.BOTMUX_WORKER_HOST; // legacy alias — must not shadow the f
 // core-only is single-tenant loopback, so the terminal is only ever reached via
 // 127.0.0.1; freeze the advertised host to match the bind. WEB_EXTERNAL_HOST is
 // the env getWebExternalHost() reads first (config.ts:30), so this wins.
-process.env.WEB_EXTERNAL_HOST = '127.0.0.1';
+process.env.WEB_EXTERNAL_HOST = CORE_ONLY_FROZEN_LOOPBACK_ENV.WEB_EXTERNAL_HOST;
 
+// A managed WeCom gateway gives its core a terminal-proxy base clear of the
+// Feishu bot daemons' ports (im/wecom/config/managed-core-env.ts): on macOS a
+// 127.0.0.1 proxy on a Feishu daemon's 0.0.0.0 port takes that port over for
+// every loopback client. config.ts reads the base from
+// BOTMUX_WEB_PROXY_BASE_PORT when it loads; main() removes it again right
+// after, so it never reaches a worker or CLI session, where a `botmux
+// start/restart` would pin it onto the Feishu fleet (a fleet lifecycle key).
+// Without the managed knob (riff, `botmux serve --api-only`) nothing changes.
+const managedTerminalProxyBase = process.env.BOTMUX_CORE_WEB_PROXY_BASE_PORT?.trim();
+delete process.env.BOTMUX_CORE_WEB_PROXY_BASE_PORT;
+if (managedTerminalProxyBase) {
+  process.env.BOTMUX_WEB_PROXY_BASE_PORT = managedTerminalProxyBase;
+}
 
 // Freeze a DEDICATED state root (codex P1): core-only must never inherit an
 // ambient SESSION_DATA_DIR — a managed turn that spawns `serve --api-only`
@@ -76,14 +106,24 @@ process.env.WEB_EXTERNAL_HOST = '127.0.0.1';
 //   • explicit BOTMUX_CORE_STATE_DIR (a deliberate core-only knob) wins, else
 //   • a per-bot dedicated default ~/.botmux/core-only/<botId>/data — isolated
 //     from the fleet's ~/.botmux/data and from any sibling core-only bot.
-// The ambient SESSION_DATA_DIR value is discarded either way.
+// The ambient SESSION_DATA_DIR value is discarded either way. The same value is
+// also exported as the BOTMUX_CORE_ONLY_DATA_DIR marker (inherited ones are
+// overwritten too), so this service's sessions — tmux/zellij panes included —
+// keep saying the store is a core-only one: a `botmux start/restart` typed in
+// one must not hand it to the host fleet.
 {
   const coreBotId = process.env.BOTMUX_API_ONLY_BOT || 'local_riff';
   const explicitStateDir = process.env.BOTMUX_CORE_STATE_DIR?.trim();
   const frozenStateDir = explicitStateDir
     ? explicitStateDir
     : join(homedir(), '.botmux', 'core-only', coreBotId, 'data');
-  process.env.SESSION_DATA_DIR = frozenStateDir;
+  // Tell this service's own CLI sessions whether they run under a native
+  // gateway (core/native-gateway-session.ts): marked for a native gateway's
+  // core, cleared for every other core-only service — unless this one was
+  // started from inside a native gateway session. Before the pin below, so it
+  // still sees the environment this service inherited.
+  syncNativeGatewayDataDirMark(frozenStateDir, isNativeGatewayCoreEnv(process.env), process.env);
+  pinCoreOnlyServiceDataDir(process.env, frozenStateDir);
   // The fleet's ~/.botmux/data always pre-exists; a dedicated core-only root may
   // not. Create it (recursive, idempotent) so the daemon can write pid/descriptor/
   // sessions there from the first boot.
@@ -113,6 +153,10 @@ async function main() {
 
   const { startDaemon } = await import('./daemon.js');
   const { logger } = await import('./utils/logger.js');
+  if (managedTerminalProxyBase) {
+    // config.ts (imported by daemon.js) has read the base by now.
+    delete process.env.BOTMUX_WEB_PROXY_BASE_PORT;
+  }
 
   logger.info(`Starting botmux core-only service on 127.0.0.1:${port}...`);
   // startDaemon() with no bot index → uses loadBotConfigs()[0], which

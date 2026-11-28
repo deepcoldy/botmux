@@ -172,7 +172,10 @@ const mockGetChatModeStrict = vi.fn(async () => 'group' as 'group' | 'topic' | '
 const mockGetCachedChatModeStrict = vi.fn(() => 'group' as 'group' | 'topic' | 'p2p' | undefined);
 const mockGetChatInfo = vi.fn(async () => ({ userCount: 1, botCount: 1 }));
 const mockReplyMessage = vi.fn(async () => 'msg-id');
-const mockUpdateMessage = vi.fn(async () => true);
+const mockUpdateMessage = vi.fn(async (_larkAppId: string, _messageId: string, _cardJson: string) => true);
+const mockUpdateInteractiveCardByToken = vi.fn(async (
+  _larkAppId: string, _token: string, _card: Record<string, unknown>,
+) => {});
 const mockListChatMessages = vi.fn(async () => [] as any[]);
 const mockListChatMessagesUntil = vi.fn(async () => [] as any[]);
 const mockListThreadMessages = vi.fn(async () => [] as any[]);
@@ -206,6 +209,7 @@ vi.mock('../src/im/lark/client.js', () => ({
   resolveSiblingBotBySenderOpenId: (...args: any[]) => mockResolveSiblingBot(...args),
   replyMessage: (...args: any[]) => mockReplyMessage(...args),
   updateMessage: (...args: any[]) => mockUpdateMessage(...args),
+  updateInteractiveCardByToken: (...args: any[]) => mockUpdateInteractiveCardByToken(...args),
   getMessageDetail: (...args: any[]) => mockGetMessageDetail(...args),
   resolveUnionIdFromOpenId: (...args: any[]) => mockResolveUnionIdFromOpenId(...args),
   resolveUnionIdFromOpenIdStrict: (...args: any[]) => mockResolveUnionIdFromOpenIdStrict(...args),
@@ -302,6 +306,8 @@ vi.mock('../src/im/lark/transport/resilient-ws-client.js', () => ({
 
 import { __resetAnchorQueues } from '../src/utils/anchor-serializer.js';
 import { __pollMessageListenersOnceForTest, __recoverDurablePrimaryIngressOnceForTest, __resetListenerCircuitsForTest, __setListenerClockForTest, __resetMessageListenerPollCursorForTest, __resetEventClaimsForTest, __resetChatStatsForTest, canOperate, canTalk, createLarkEventDispatcherRuntime, decideRouting, ensureBotOpenId, getGroupStats, isBotMentioned, learnSameOwnerSiblingCrossRef, maybeApplyForceTopicOverride, mentionsAnotherInChatMember, mentionsAnotherMember, markForwardFollowupsSessionsReady, rawMessageIngressAnchor, startLarkEventDispatcher, updateBotOpenIdCrossRef, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
+import { resetAssistantMultiUserNoticesForTest } from '../src/im/lark/assistant-command.js';
+import { setAssistantOwner } from '../src/services/assistant-owner-store.js';
 import { writeGroupCollaborationMode } from '../src/services/group-collaboration-mode-store.js';
 import { __resetSubtopicHandoffCacheForTest, findLiveMentionlessSubtopicOwner, ORCHESTRATE_DISPATCH_STORE_FILE, resolveManagedSubtopicMentionlessHandoff, type SubtopicMentionlessHandoff, type SubtopicSessionSnapshot } from '../src/services/subtopic-mentionless-handoff.js';
 import { PROJECT_GROUP_STORE_FILE } from '../src/services/project-group-store.js';
@@ -327,6 +333,8 @@ import { __resetPeerCrossRefCacheForTest } from '../src/services/peer-cross-ref-
 import { CLONE_EXCLUDED_KEYS, cloneBotConfig, cloneOwnerEntries } from '../src/setup/bot-config-editor.js';
 import { normalizeManagedOwnerEntries } from '../src/setup/owner-identity.js';
 import { createPluginCardActionGateway } from '../src/core/plugins/card-actions/gateway.js';
+import { buildSessionClosedCard } from '../src/im/lark/card-builder.js';
+import { handleSessionWorktreeCleanupAction } from '../src/im/lark/session-worktree-cleanup-card.js';
 import { InputCaptureTerminalRejection } from '../src/core/plugins/input-capture/runtime.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
 import { _resetMentionDropCountsForTest } from '../src/im/lark/mention-drop-telemetry.js';
@@ -4434,6 +4442,106 @@ describe('message listener polling backfill', () => {
       },
     });
     handlers = makeHandlers();
+  });
+
+  it('assistant mode: a card polled while the group had two people stays consumed after it drops to one', async () => {
+    (mockGetBot() as any).config.assistantMode = true;
+    try {
+      __resetChatStatsForTest();
+      const card = makeHistoryMessage({
+        senderAppId: OTHER_BOT_APP_ID,
+        senderType: 'app',
+        messageType: 'interactive',
+        messageId: 'msg-polled-assistant-multi',
+        chatId: 'chat_listener',
+        content: JSON.stringify({ title: 'Argos平台报警', elements: [[{ tag: 'text', text: 'Lego插件调用 SLA 低于 95%' }]] }),
+        createTime: String(Date.now()),
+      });
+      mockGetChatInfo.mockResolvedValue({ userCount: 2, botCount: 1 });
+      mockListChatMessagesUntil.mockResolvedValueOnce([card]);
+      await __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
+      await flushEventWork();
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+
+      __resetChatStatsForTest();
+      __resetMessageListenerPollCursorForTest();
+      mockGetChatInfo.mockResolvedValue({ userCount: 1, botCount: 1 });
+      mockListChatMessagesUntil.mockResolvedValueOnce([card]);
+      await __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
+      await flushEventWork();
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    } finally {
+      delete (mockGetBot() as any).config.assistantMode;
+    }
+  });
+
+  it('settles a polled owner-absent message without dispatching or repeating owner-left', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), SUBST_TEST_TMP_PREFIX + 'assistant-polled-owner-'));
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    try {
+      const owner = 'ou_' + 'e'.repeat(32);
+      const other = 'ou_' + 'f'.repeat(32);
+      const chatId = 'oc_' + '1'.repeat(32);
+      const botState = mockGetBot() as any;
+      botState.config.messageListeners = { [chatId]: botState.config.messageListeners.chat_listener };
+      botState.config.assistantMode = true;
+      setAssistantOwner(dataDir, MY_APP_ID, chatId, owner, 'claimed');
+      const handleChatMemberUserDeleted = vi.fn(async () => {});
+      Object.assign(handlers, { handleChatMemberUserDeleted });
+      mockListChatMemberOpenIds.mockResolvedValue([other]);
+      const card = makeHistoryMessage({
+        senderAppId: OTHER_BOT_APP_ID, senderType: 'app', messageType: 'interactive',
+        messageId: 'msg-polled-owner-absent', chatId, content: '{}', createTime: String(Date.now()),
+      });
+      mockListChatMessagesUntil.mockResolvedValue([card]);
+
+      await __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
+      await flushEventWork();
+      expect(handleChatMemberUserDeleted).toHaveBeenCalledWith(chatId, [owner], MY_APP_ID);
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+      const membershipCallsAfterFirst = mockListChatMemberOpenIds.mock.calls.length;
+
+      await __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
+      await flushEventWork();
+      expect(handleChatMemberUserDeleted).toHaveBeenCalledOnce();
+      expect(mockListChatMemberOpenIds).toHaveBeenCalledTimes(membershipCallsAfterFirst);
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    } finally {
+      config.session.dataDir = previousDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('retries a polled message after a transient owner-membership lookup failure', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), SUBST_TEST_TMP_PREFIX + 'assistant-polled-retry-'));
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    try {
+      const owner = 'ou_' + 'e'.repeat(32);
+      const chatId = 'oc_' + '2'.repeat(32);
+      const botState = mockGetBot() as any;
+      botState.config.messageListeners = { [chatId]: botState.config.messageListeners.chat_listener };
+      botState.config.assistantMode = true;
+      setAssistantOwner(dataDir, MY_APP_ID, chatId, owner, 'claimed');
+      mockListChatMemberOpenIds.mockRejectedValueOnce(new Error('temporary Lark failure'));
+      mockListChatMemberOpenIds.mockResolvedValue([owner]);
+      const card = makeHistoryMessage({
+        senderAppId: OTHER_BOT_APP_ID, senderType: 'app', messageType: 'interactive',
+        messageId: 'msg-polled-owner-retry', chatId, content: '{}', createTime: String(Date.now()),
+      });
+      mockListChatMessagesUntil.mockResolvedValue([card]);
+
+      await __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
+      await flushEventWork();
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+      await __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
+      await flushEventWork();
+      expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+    } finally {
+      config.session.dataDir = previousDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
   });
 
   it('routes a recent top-level Argos interactive card found in chat history', async () => {
@@ -12184,6 +12292,7 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     __resetAnchorQueues();
     __resetEventClaimsForTest();
     mockUpdateMessage.mockClear();
+    mockUpdateInteractiveCardByToken.mockReset().mockResolvedValue(undefined);
     vi.mocked(logger.error).mockClear();
     setupBotState();
     handlers = makeHandlers();
@@ -12263,6 +12372,184 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
       'om_feedback_stale',
       JSON.stringify({ type: 'latest-feedback-card' }),
     );
+  });
+
+  it.each([false, true])('keeps shared Card 1.0 token updates visible to every recipient (preexisting open_ids=%s)', async withExistingOpenIds => {
+    const rawCard: Record<string, any> = {
+      config: { wide_screen_mode: true, update_multi: true }, elements: [],
+    };
+    if (withExistingOpenIds) rawCard.open_ids = ['ou_stale_recipient'];
+    handlers.handleCardAction.mockResolvedValue({ card: { type: 'raw', data: rawCard } });
+
+    const result = await capturedHandlers['card.action.trigger']({
+      event_id: `evt-shared-card-${withExistingOpenIds}`,
+      token: 'c_shared_card', message_id: 'om_shared_card',
+      operator: { open_id: USER_OPEN_ID },
+      action: { value: { action: 'cleanup_session_worktree' } },
+    });
+
+    expect(result).toEqual({});
+    expect(mockUpdateInteractiveCardByToken).not.toHaveBeenCalled();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
+    expect(mockUpdateInteractiveCardByToken).toHaveBeenCalledOnce();
+    expect(mockUpdateInteractiveCardByToken.mock.calls[0][0]).toBe(MY_APP_ID);
+    expect(mockUpdateInteractiveCardByToken.mock.calls[0][1]).toBe('c_shared_card');
+    const update = mockUpdateInteractiveCardByToken.mock.calls[0][2];
+    expect(update.config.update_multi).toBe(true);
+    expect(update).not.toHaveProperty('open_ids');
+  });
+
+  it.each([
+    { label: 'default exclusive', card: { config: { wide_screen_mode: true }, elements: [] } },
+    { label: 'empty recipients', card: { config: { update_multi: false }, open_ids: [], elements: [] } },
+  ])('addresses $label Card 1.0 updates to the operator', async ({ card }) => {
+    handlers.handleCardAction.mockResolvedValue({ card: { type: 'raw', data: card } });
+    const result = await capturedHandlers['card.action.trigger']({
+      event_id: `evt-exclusive-card-${card.config.update_multi}`,
+      token: 'c_exclusive_card', message_id: 'om_exclusive_card',
+      operator: { open_id: USER_OPEN_ID },
+      action: { value: { action: 'faas.confirm' } },
+    });
+    expect(result).toEqual({});
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(mockUpdateInteractiveCardByToken).toHaveBeenCalledWith(
+      MY_APP_ID, 'c_exclusive_card', { ...card, open_ids: [USER_OPEN_ID] },
+    );
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { label: 'Card 2.0', card: { schema: '2.0', config: { update_multi: true }, body: { elements: [] } } },
+    { label: 'template', card: { type: 'template', data: { template_id: 'tpl_confirm' } } },
+  ])('does not add legacy open_ids to $label delayed updates', async ({ label, card }) => {
+    handlers.handleCardAction.mockResolvedValue({ card: { type: 'raw', data: card } });
+    const result = await capturedHandlers['card.action.trigger']({
+      event_id: `evt-nonlegacy-${label}`, token: 'c_nonlegacy', message_id: 'om_nonlegacy',
+      operator: { open_id: USER_OPEN_ID }, action: { value: { action: 'faas.confirm' } },
+    });
+    expect(result).toEqual({});
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(mockUpdateInteractiveCardByToken).toHaveBeenCalledWith(MY_APP_ID, 'c_nonlegacy', card);
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { label: 'missing', card: { config: { wide_screen_mode: true }, elements: [] } },
+    { label: 'explicit', card: { config: { update_multi: false }, open_ids: ['ou_existing'], elements: [] } },
+  ])('handles exclusive Card 1.0 with $label recipients but no operator', async ({ label, card }) => {
+    const afterAck = vi.fn(async () => {});
+    handlers.handleCardAction.mockResolvedValue({ card: { type: 'raw', data: card }, afterAck });
+    const result = await capturedHandlers['card.action.trigger']({
+      event_id: `evt-exclusive-without-operator-${label}`,
+      token: 'c_without_operator', message_id: 'om_without_operator',
+      action: { value: { action: 'faas.confirm' } },
+    });
+    expect(result).toEqual({});
+    await vi.waitFor(() => expect(afterAck).toHaveBeenCalledOnce());
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
+    if (label === 'explicit') {
+      expect(mockUpdateInteractiveCardByToken).toHaveBeenCalledWith(MY_APP_ID, 'c_without_operator', card);
+    } else {
+      // No operator means no valid recipient list. Do not spend the token or
+      // attempt an exclusive update through message.patch; continuation survives.
+      expect(mockUpdateInteractiveCardByToken).not.toHaveBeenCalled();
+    }
+  });
+
+  it('settles an intermediate token update before the cleanup result continuation', async () => {
+    const events: string[] = [];
+    let releaseToken!: () => void;
+    const tokenPending = new Promise<void>(resolve => { releaseToken = resolve; });
+    mockUpdateInteractiveCardByToken.mockImplementation(async () => {
+      events.push('token:running:start');
+      await tokenPending;
+      events.push('token:running:end');
+    });
+    mockUpdateMessage.mockImplementation(async () => {
+      events.push('patch:result');
+      return true;
+    });
+    const session = { sessionId: 'sess_ordered_cleanup', status: 'closed', larkAppId: MY_APP_ID } as any;
+    handlers.handleCardAction.mockImplementation(() => handleSessionWorktreeCleanupAction({
+      larkAppId: MY_APP_ID, operatorOpenId: USER_OPEN_ID,
+      sessionId: session.sessionId, cardMessageId: 'om_ordered_cleanup',
+    }, {
+      canOperate: () => true,
+      getSession: () => session,
+      buildCard: (_session, state) => buildSessionClosedCard(
+        session.sessionId, 'om_ordered_root', 'ordered cleanup', 'claude-code',
+        undefined, undefined, 'zh-CN', undefined, undefined,
+        { note: state.phase === 'running' ? 'running' : 'result', button: state.phase === 'running' },
+      ),
+      cleanup: async () => ({ status: 'removed', dir: '/tmp/fenced-cleanup' }),
+      updateCard: async (messageId, card) => { await mockUpdateMessage(MY_APP_ID, messageId, card); },
+      sendToOperator: async () => { throw new Error('unexpected private fallback'); },
+      locale: 'zh-CN',
+    }));
+
+    vi.useFakeTimers();
+    try {
+      const call = capturedHandlers['card.action.trigger']({
+        event_id: 'evt_ordered_cleanup', token: 'c_ordered_cleanup', message_id: 'om_ordered_cleanup',
+        operator: { open_id: USER_OPEN_ID },
+        action: { value: { action: 'cleanup_session_worktree', session_id: session.sessionId } },
+      });
+      await expect(call).resolves.toEqual({});
+      await vi.advanceTimersByTimeAsync(0);
+      expect(events).toEqual(['token:running:start']);
+
+      releaseToken();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(events).toEqual(['token:running:start', 'token:running:end', 'patch:result']);
+    } finally {
+      releaseToken();
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it('still runs afterAck when the intermediate card update fails', async () => {
+    mockUpdateInteractiveCardByToken.mockRejectedValueOnce(new Error('300030 token expired'));
+    const afterAck = vi.fn(async () => {});
+    handlers.handleCardAction.mockResolvedValue({
+      card: { type: 'raw', data: { schema: '2.0', body: { elements: [] } } },
+      afterAck,
+    });
+    const result = await capturedHandlers['card.action.trigger']({
+      event_id: 'evt_failed_intermediate', token: 'c_failed_intermediate', message_id: 'om_failed_intermediate',
+      operator: { open_id: USER_OPEN_ID }, action: { value: { action: 'faas.confirm' } },
+    });
+    expect(result).toEqual({});
+    await vi.waitFor(() => expect(afterAck).toHaveBeenCalledOnce());
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('300030 token expired'));
+  });
+
+  it('does not misreport a slow toast-plus-card result as toast-only', async () => {
+    let release!: () => void;
+    handlers.handleCardAction.mockReturnValueOnce(new Promise(resolve => {
+      release = () => resolve({
+        toast: { type: 'success', content: 'done' },
+        card: { type: 'raw', data: { schema: '2.0', body: { elements: [] } } },
+      });
+    }) as any);
+    vi.mocked(logger.warn).mockClear();
+    vi.useFakeTimers();
+    try {
+      const call = capturedHandlers['card.action.trigger']({
+        event_id: 'evt_slow_mixed_result', token: 'c_slow_mixed', message_id: 'om_slow_mixed',
+        operator: { open_id: USER_OPEN_ID }, action: { value: { action: 'faas.confirm' } },
+      });
+      await vi.advanceTimersByTimeAsync(2500);
+      await expect(call).resolves.toEqual({ toast: expect.objectContaining({ type: 'info' }) });
+      release();
+      await vi.runAllTimersAsync();
+      expect(mockUpdateInteractiveCardByToken).toHaveBeenCalledOnce();
+      expect(logger.warn).not.toHaveBeenCalledWith(expect.stringContaining('toast-only result'));
+    } finally {
+      release();
+      vi.useRealTimers();
+    }
   });
 
   it('runs a fresh publisher after ACK without returning or patching a captured card', async () => {
@@ -18212,5 +18499,108 @@ describe('in-chat @ membership check is only paid when its answer matters (comma
     await flushEventWork();
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+});
+
+describe('assistant mode without multi-user groups (assistantGroupChat off)', () => {
+  let handlers: ReturnType<typeof makeHandlers>;
+  const groupMessage = (id: string, chatId = 'chat-assistant-multi', senderOpenId = USER_OPEN_ID) => makeUserMessageEvent({
+    senderOpenId,
+    content: JSON.stringify({ text: '@Bot hello' }),
+    messageId: id,
+    chatId,
+    chatType: 'group',
+    mentions: [{ key: '@_bot', name: 'Bot', id: { open_id: MY_OPEN_ID } }],
+  });
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    __resetAnchorQueues();
+    __resetEventClaimsForTest();
+    __resetChatStatsForTest();
+    resetAssistantMultiUserNoticesForTest();
+    emitHookEventMock.mockClear();
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    (mockGetBot() as any).config.assistantMode = true;
+    handlers = makeHandlers();
+    mockGetChatMode.mockResolvedValue('group');
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    markForwardFollowupsSessionsReady(MY_APP_ID);
+  });
+
+  it('drops a message in a group with two people and answers an @ with the notice', async () => {
+    mockGetChatInfo.mockResolvedValue({ userCount: 2, botCount: 1 });
+    await capturedHandlers['im.message.receive_v1'](groupMessage('msg-assistant-multi-1'));
+    await flushEventWork();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(mockReplyMessage).toHaveBeenCalledWith(MY_APP_ID, 'msg-assistant-multi-1', expect.stringContaining('多人群'), 'text', false);
+  });
+
+  it('serves a group where the owner is the only person', async () => {
+    mockGetChatInfo.mockResolvedValue({ userCount: 1, botCount: 2 });
+    await capturedHandlers['im.message.receive_v1'](groupMessage('msg-assistant-solo-1'));
+    await flushEventWork();
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+  });
+
+  it('serves multi-user groups when assistantGroupChat is on', async () => {
+    (mockGetBot() as any).config.assistantGroupChat = true;
+    mockGetChatInfo.mockResolvedValue({ userCount: 2, botCount: 1 });
+    await capturedHandlers['im.message.receive_v1'](groupMessage('msg-assistant-on-1'));
+    await flushEventWork();
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+  });
+
+  it('treats the owner as gone when someone else is the only person in the group', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), SUBST_TEST_TMP_PREFIX + 'assistant-'));
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    try {
+      const owner = 'ou_' + 'a'.repeat(32);
+      const other = 'ou_' + 'b'.repeat(32);
+      setAssistantOwner(dataDir, MY_APP_ID, 'oc_assistant_absent', owner, 'claimed');
+      const handleChatMemberUserDeleted = vi.fn(async () => {});
+      Object.assign(handlers, { handleChatMemberUserDeleted });
+      mockGetChatInfo.mockResolvedValue({ userCount: 1, botCount: 1 });
+      await capturedHandlers['im.message.receive_v1'](groupMessage('msg-assistant-absent-1', 'oc_assistant_absent', other));
+      await flushEventWork();
+      expect(handleChatMemberUserDeleted).toHaveBeenCalledWith('oc_assistant_absent', [owner], MY_APP_ID);
+
+      // bot 发言没法拿发言人比：现查成员，主人不在就同样按退群处理。
+      handleChatMemberUserDeleted.mockClear();
+      mockListChatMemberOpenIds.mockResolvedValue([other]);
+      await capturedHandlers['im.message.receive_v1'](makeBotMessageEvent({
+        senderOpenId: OTHER_BOT_OPEN_ID, senderAppId: OTHER_BOT_APP_ID, content: JSON.stringify({ text: '@Bot hello' }),
+        messageId: 'msg-assistant-absent-bot', chatId: 'oc_assistant_absent',
+        mentions: [{ key: '@_bot', name: 'Bot', id: { open_id: MY_OPEN_ID } }],
+      }));
+      await flushEventWork();
+      expect(mockListChatMemberOpenIds).toHaveBeenCalledWith(MY_APP_ID, 'oc_assistant_absent');
+      expect(handleChatMemberUserDeleted).toHaveBeenCalledWith('oc_assistant_absent', [owner], MY_APP_ID);
+
+      handleChatMemberUserDeleted.mockClear();
+      setAssistantOwner(dataDir, MY_APP_ID, 'oc_assistant_absent', other, 'claimed');
+      await capturedHandlers['im.message.receive_v1'](groupMessage('msg-assistant-absent-2', 'oc_assistant_absent', other));
+      await flushEventWork();
+      expect(handleChatMemberUserDeleted).not.toHaveBeenCalled();
+    } finally {
+      config.session.dataDir = previousDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('does nothing when added to a group with two people, and joins a one-person group normally', async () => {
+    const handleBotAdded = vi.fn(async () => {});
+    Object.assign(handlers, { handleBotAdded });
+    mockGetChatInfo.mockResolvedValue({ userCount: 2, botCount: 1 });
+    capturedHandlers['im.chat.member.bot.added_v1']({ chat_id: 'chat-assistant-add-1', operator_id: { open_id: USER_OPEN_ID } });
+    await flushEventWork();
+    expect(handleBotAdded).not.toHaveBeenCalled();
+    expect(emitHookEventMock.mock.calls.filter(c => c[0] === 'chat.bot_added')).toHaveLength(0);
+
+    mockGetChatInfo.mockResolvedValue({ userCount: 1, botCount: 1 });
+    capturedHandlers['im.chat.member.bot.added_v1']({ chat_id: 'chat-assistant-add-2', operator_id: { open_id: 'ou_someone_else' } });
+    await flushEventWork();
+    expect(handleBotAdded).toHaveBeenCalledWith('chat-assistant-add-2', 'ou_someone_else', MY_APP_ID);
   });
 });

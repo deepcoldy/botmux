@@ -17,13 +17,18 @@ export async function resolveDispatchLaunchSpec(input: {
   if (input.requested.reasoningEffort !== undefined && !isCodexReasoningEffort(effort)) {
     return { ok: false, error: '--reasoning-effort 只接受 low|medium|high|xhigh|max|ultra。' };
   }
+  if (effort && input.target.cliId === 'pi') {
+    return { ok: false, error: 'Pi 会话恢复时沿用会话自己的推理强度，dispatch 不支持固定 --reasoning-effort。' };
+  }
   if (!botAcceptsLaunchModel(input.target)) return { ok: false, error: `目标 Bot 的 ${input.target.cliId ?? 'unknown'} 启动路径不支持显式 model。` };
   const effectiveModel = model ?? input.target.model?.trim();
   if (!effectiveModel) return { ok: false, error: '指定 --reasoning-effort 时目标 Bot 必须有可解析的 model。' };
   const catalog = await input.detectModels().catch(() => null);
   if (!catalog?.includes(effectiveModel)) return { ok: false, error: `目标 Bot 的实时 model catalog 不包含 ${effectiveModel}。` };
   const requestedEffort = effort as CodexReasoningEffort | undefined;
-  const effectiveEffort = requestedEffort ?? input.target.reasoningEffort;
+  // Pi applies the bot default when a conversation starts, without freezing
+  // that default as part of the dispatch receipt.
+  const effectiveEffort = requestedEffort ?? (input.target.cliId === 'pi' ? undefined : input.target.reasoningEffort);
   // The target's own saved pair passed config load; judge it by the same keep-rule.
   const inheritedPair = !requestedEffort && effectiveModel === input.target.model?.trim();
   if (effectiveEffort && input.target.cliId !== 'traex'

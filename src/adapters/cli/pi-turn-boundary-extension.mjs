@@ -5,7 +5,7 @@
  * 2. 监听 before_agent_start 事件，在 Pi 原生完成资源加载与项目信任决策后，追加 Botmux 系统提示词；
  * 3. 监听 input 事件：Pi 忙时收到的输入要等当前工作结束才写进会话，先写一条已接收 marker。
  */
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 
 export const PI_TURN_BOUNDARY_CUSTOM_TYPE = 'botmux-turn-settled';
 export const PI_TURN_BOUNDARY_STOP_REASON_ERROR = 'error';
@@ -23,7 +23,23 @@ export function lastAssistantStopReason(event) {
 }
 
 export default function registerBotmuxTurnBoundaryExtension(pi) {
-  pi.on('session_start', () => {
+  pi.on('session_start', (event, ctx) => {
+    const fallbackThinking = process.env.BOTMUX_PI_RESUME_FALLBACK_THINKING;
+    delete process.env.BOTMUX_PI_RESUME_FALLBACK_THINKING;
+    if (fallbackThinking && (event?.reason === undefined || event.reason === 'startup')) {
+      try {
+        const manager = ctx?.sessionManager;
+        const sessionFile = manager?.getSessionFile?.();
+        // Pi defers the first write until there is a conversation. An already
+        // loaded conversation still owns its thinking if its file moved during startup.
+        if (sessionFile && statSync(sessionFile, { throwIfNoEntry: false }) === undefined) {
+          const loadedEntries = manager?.getEntries?.();
+          if (loadedEntries && !loadedEntries.some(entry => entry.type === 'message')) {
+            pi.setThinkingLevel?.(fallbackThinking);
+          }
+        }
+      } catch { /* Preserve native startup if the transcript or extension API is unavailable. */ }
+    }
     try {
       pi.appendEntry(PI_TURN_BOUNDARY_CUSTOM_TYPE, { lastStopReason: null });
     } catch { /* ignore */ }

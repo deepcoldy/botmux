@@ -22,8 +22,15 @@ export type LegacyWorkflowRetirementReason =
  *  for the trigger API and `botmux schedule add --run-as`. */
 export const RUN_AS_PATTERN = /^(ou_[A-Za-z0-9_-]{1,160}|[^\s@]{1,128}@[^\s@]{1,128})$/;
 
+/** A tenant-stable Lark `union_id`: `actorUnionId` and the bot's `ownerUnionId`. */
+export const LARK_UNION_ID_PATTERN = /^on_[A-Za-z0-9_-]{1,128}$/;
+
 export interface TriggerRequest {
   actor?: 'owner';
+  /** With `actor: "owner"` only: the caller's tenant-stable `union_id`. The
+   *  turn is accepted only when it names this bot's owner, so a client acting
+   *  for one person cannot post as the owner of a bot that belongs to another. */
+  actorUnionId?: string;
   /** Run this one turn under a named person (open_id or email): the bot's tools
    *  (bytedcli / lark-cli / Meego / Bits) act as that person. Same trust
    *  boundary as `botmux schedule add --run-as`: only the local Dashboard
@@ -97,6 +104,14 @@ export interface TriggerRequest {
     status?: 'firing' | 'resolved' | string;
     waitForFinalOutput?: boolean;
     asyncReturnSessionId?: boolean;
+    /** Working directory a native gateway selected for a NEW core-only session
+     * (absolute; rejected together with `target.sessionId`). Not authenticated:
+     * core-only `/api/trigger` is a public route, so the daemon independently
+     * requires the realpath to stay inside the bot's configured root
+     * (resolveNativeGatewayWorkingDirectory) and an apiOnly HTTP virtual session.
+     * The wire name predates the native gateway naming and is kept: the gateway
+     * persists each frozen request in its state file and replays it on retry. */
+    connectorWorkingDirectory?: string;
     /** Permit explicit botmux send for messages authorized by this request in the
      * existing real group. The caller determines message content and timing.
      * Final output still returns to the caller. Defaults to false; turn-local.
@@ -157,6 +172,7 @@ export type TriggerErrorCode =
   | 'run_as_not_allowed'
   | 'run_as_unresolved'
   | 'owner_unresolved'
+  | 'owner_mismatch'
   | 'bot_not_found'
   | 'bot_not_in_chat'
   | 'daemon_offline'
@@ -279,10 +295,11 @@ export function hasTriggerActor(raw: unknown): boolean {
   return isRecord(raw) && Object.hasOwn(raw, 'actor');
 }
 
-/** A request that claims a caller identity (`actor` or `runAs`); only the local
- *  Dashboard administrator token may send one. */
+/** A request that claims a caller identity (`actor`, `actorUnionId` or
+ *  `runAs`); only the local Dashboard administrator token may send one. */
 export function hasTriggerIdentityClaim(raw: unknown): boolean {
-  return hasTriggerActor(raw) || (isRecord(raw) && Object.hasOwn(raw, 'runAs'));
+  return hasTriggerActor(raw)
+    || (isRecord(raw) && (Object.hasOwn(raw, 'actorUnionId') || Object.hasOwn(raw, 'runAs')));
 }
 
 export function validateTriggerRequest(raw: unknown): { ok: true; request: TriggerRequest } | { ok: false; status: number; body: TriggerResponse } {
@@ -304,6 +321,10 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
       || typeof raw.instruction !== 'string' || !raw.instruction.trim()) {
       return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'owner actor requires a turn target with botId, sessionId, and a non-empty instruction' } };
     }
+  }
+  if (Object.hasOwn(raw, 'actorUnionId')
+    && (raw.actor !== 'owner' || typeof raw.actorUnionId !== 'string' || !LARK_UNION_ID_PATTERN.test(raw.actorUnionId))) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'actorUnionId requires actor owner and must be a union_id (on_…)' } };
   }
   if (Object.hasOwn(raw, 'runAs')) {
     if (typeof raw.runAs !== 'string' || !RUN_AS_PATTERN.test(raw.runAs)) {
@@ -354,6 +375,9 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
   // responses advertise an authorization the daemon did not act on).
   if (options.steer === true && options.dryRun === true) {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.steer is not supported with options.dryRun' } };
+  }
+  if (options.connectorWorkingDirectory !== undefined && !validNativeGatewayWorkingDirectory(options.connectorWorkingDirectory, raw)) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'invalid connector working directory' } };
   }
   const waitForFinalOutput = options.waitForFinalOutput === true;
   const asyncReturnSessionId = options.asyncReturnSessionId === true;
@@ -494,4 +518,12 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
     }
   }
   return { ok: true, request: raw as unknown as TriggerRequest };
+}
+
+/** Shape check only (absolute, no NUL, new sessions only); containment in the
+ * configured root is enforced by the daemon at session creation. */
+function validNativeGatewayWorkingDirectory(value: unknown, raw: Record<string, unknown>): boolean {
+  if (typeof value !== 'string' || !value.startsWith('/') || value.includes('\0')) return false;
+  const target = raw.target as Record<string, unknown> | undefined;
+  return !target?.sessionId;
 }

@@ -24,8 +24,14 @@ import {
   antigravityFullTranscriptPath,
   antigravityTranscriptPath,
   resolveAntigravityTranscriptPath,
+  hashAntigravitySubmittedText,
   type AntigravityTranscriptState,
 } from '../../services/antigravity-transcript.js';
+import {
+  AntigravitySubmitLedger,
+  snapshotAntigravityConversations,
+  type AntigravitySubmitBaseline,
+} from '../../services/antigravity-submit-ledger.js';
 
 /**
  * Adapter for Google Antigravity CLI (`agy`).
@@ -91,12 +97,43 @@ import {
  *      next message reaches the model.
  */
 
+/** First agy release whose OSC 7501 reports are enabled by botmux:
+ *  1.4.0 introduced OSC 7501 (`AGY_CLI_OSC7501=on` / `AGY_CLI_OSC7501_MESSAGES=brief`),
+ *  and 1.5.10 fixed premature `done` while waiting for background subagents/tasks
+ *  (daemon tasks such as dev servers do not count). Older/unknown versions keep
+ *  the screen + transcript path unchanged. */
+export const ANTIGRAVITY_PROGRAM_STATUS_MIN_VERSION = '1.5.10';
+
 const HISTORY_PATH = join(homedir(), '.gemini', 'antigravity-cli', 'history.jsonl');
 
 
 function currentFileSize(path: string): number {
   if (!existsSync(path)) return 0;
   try { return statSync(path).size; } catch { return 0; }
+}
+
+/** Size of a file known to exist, or undefined when it cannot be measured
+ *  (a proof baseline must not mistake that for an empty file). */
+function measuredFileSize(path: string): number | undefined {
+  try { return statSync(path).size; } catch { return undefined; }
+}
+
+/** `existsSync` collapses EACCES/EIO/replace races into false. When the path
+ * resolver found no transcript, only two confirmed ENOENT results prove that
+ * a known conversation has no log yet; anything else is an unknown baseline. */
+function antigravityTranscriptExistenceUnknown(conversationId: string): boolean {
+  for (const path of [antigravityFullTranscriptPath(conversationId), antigravityTranscriptPath(conversationId)]) {
+    if (!path) continue;
+    try {
+      statSync(path);
+      // The resolver said missing but stat now sees an entry: a race, not proof
+      // that the transcript was created after this submit.
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') return true;
+    }
+  }
+  return false;
 }
 
 /** Build a JSON-escaped prefix marker for substring-matching against
@@ -614,7 +651,7 @@ export const antigravityBridgeSpec: StructuredBridgeSpec = {
     (ctx.state as AntigravityTranscriptState | undefined) ?? {},
     {
       flushTrailingFinal: ctx.flushTrailingFinal,
-      retirePendingTurns: ctx.retirePendingTurns,
+      expectedTrailingFinal: ctx.expectedTrailingFinal,
       adoptMode: ctx.adoptMode,
     },
   ),
@@ -713,22 +750,31 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
   // Only a newly launched --conversation process can inherit unfinished work
   // from a dead predecessor. A reattached process can still be doing that work.
   let coldResumeTail: { conversationId: string; step: string } | undefined;
-  const activeSessionId = (pty: Pick<PtyHandle, 'cliPid' | 'cliCwd'>): string | undefined => {
+  // Claims each USER_INPUT for at most one submit (see antigravity-submit-ledger).
+  const submitLedger = new AntigravitySubmitLedger();
+  const activeSessionIdObservation = (pty: Pick<PtyHandle, 'cliPid' | 'cliCwd'>): {
+    sessionId: string;
+    source: 'native-log' | 'process-discovery';
+  } | undefined => {
     const fromLog = sessionLog?.read().currentId;
-    if (fromLog) return fromLog;
-    // On a fresh launch (`!resume && !reattach`), agy creates no conversation
-    // until the first prompt is submitted, while startup `ListConversations`
-    // opens historical/sibling conversation `.db` files in parallel. Once agy
-    // is actively writing `--log-file`, wait for its authoritative
-    // `Streaming conversation <uuid>` line instead of probing transient startup fds.
-    if (awaitNativeStreamLog && sessionLog?.hasLogFile()) return undefined;
+    if (fromLog) return { sessionId: fromLog.toLowerCase(), source: 'native-log' };
+    // On a fresh launch (`!reattach && !(resume && resumeSessionId)`), buildArgs
+    // always wires a process-scoped `--log-file` and agy creates no conversation
+    // until the first prompt is submitted, while startup `ListConversations` can
+    // open historical/sibling conversation `.db` files before `--log-file` is
+    // created or flushed. Never probe transient startup fds — wait for this
+    // process's own `--log-file` to emit `Streaming conversation <uuid>`.
+    if (awaitNativeStreamLog && sessionLog) return undefined;
     // Managed sessions (`buildArgs` wired `--log-file`) must never fall back to
     // workspace summaries when `cliPid` is unset — that hijacks a concurrent or
     // historical conversation sharing the same working directory.
     const cwd = sessionLog ? undefined : pty.cliCwd;
     if (!pty.cliPid && !cwd) return undefined;
-    return findAntigravityConversationId({ pid: pty.cliPid, cwd }) ?? undefined;
+    const discovered = findAntigravityConversationId({ pid: pty.cliPid, cwd }) ?? undefined;
+    return discovered ? { sessionId: discovered.toLowerCase(), source: 'process-discovery' } : undefined;
   };
+  const activeSessionId = (pty: Pick<PtyHandle, 'cliPid' | 'cliCwd'>): string | undefined =>
+    activeSessionIdObservation(pty)?.sessionId;
   const recordConfirmedSubmit = (
     pty: Pick<PtyHandle, 'cliPid' | 'cliCwd'>,
     preSize: number | null,
@@ -764,9 +810,9 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
 
     buildArgs({ sessionId, resume, resumeSessionId, disableCliBypass, model, reasoningEffort, cliVersion, reattach }) {
       bracketedPasteSupported = reattach === false && supportsAntigravityBracketedPaste(cliVersion);
-      awaitNativeStreamLog = !resume && !reattach;
+      awaitNativeStreamLog = !reattach && !(resume && resumeSessionId);
       const args = disableCliBypass ? [] : ['--dangerously-skip-permissions'];
-      sessionLog = new AntigravitySessionLog(sessionId);
+      sessionLog = new AntigravitySessionLog(sessionId, undefined, { startAtEnd: !reattach });
       args.push('--log-file', sessionLog.path);
       // Resume: only when we have agy's own conversation UUID. We never
       // map botmux's sessionId here because agy generates its own id at
@@ -819,6 +865,7 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
     },
 
     resolveActiveSessionId: activeSessionId,
+    resolveActiveSessionIdObservation: activeSessionIdObservation,
 
     forkSessionAfterReady(opts) {
       if (!sessionLog) throw new Error('Antigravity fork has no process-scoped native log');
@@ -875,14 +922,51 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       const marker = historyMarker(content);
       const initialCid = activeSessionId(pty) ?? knownCliSessionId;
       const initialTranscriptPath = initialCid ? resolveAntigravityTranscriptPath(initialCid) : null;
-      const preSize = initialTranscriptPath ? currentFileSize(initialTranscriptPath) : null;
+      const baselineSize = initialTranscriptPath ? measuredFileSize(initialTranscriptPath) : undefined;
+      const preSize = initialTranscriptPath ? baselineSize ?? 0 : null;
       // No transcript exists yet for the conversation this input lands in: a
       // known id whose brain file agy creates lazily (e.g. right after /new),
-      // or a fresh launch whose native log has not streamed any conversation
-      // (activeSessionId withholds an id only in that state). Any USER_INPUT
-      // that later appears there is this submit's.
+      // or a fresh launch whose native log is already being written with no
+      // streamed conversation yet. Any USER_INPUT that later appears there is
+      // this submit's.
       const transcriptCreatedAfterSubmit = !initialTranscriptPath
+        && !(initialCid && antigravityTranscriptExistenceUnknown(initialCid))
         && (!!initialCid || (awaitNativeStreamLog && !!sessionLog?.hasLogFile()));
+      const preexistingConversations = transcriptCreatedAfterSubmit && !initialCid
+        ? snapshotAntigravityConversations(join(homedir(), '.gemini', 'antigravity-cli', 'brain'))
+        : undefined;
+      const submitBaseline: AntigravitySubmitBaseline = {
+        ...(initialCid ? { conversationId: initialCid } : {}),
+        transcriptPath: initialTranscriptPath,
+        transcriptSize: initialTranscriptPath ? baselineSize : 0,
+        transcriptCreatedAfter: transcriptCreatedAfterSubmit,
+        ...(preexistingConversations ? { preexistingConversations } : {}),
+      };
+      const submittedSha = hashAntigravitySubmittedText(content);
+      let ledgerEntry: ReturnType<AntigravitySubmitLedger['register']> | undefined;
+      // Adopted panes have no process-scoped log; their conversation id comes
+      // from a cwd guess that may name a sibling window, so they never prove.
+      const proveOwned = (cliSessionId: string | undefined): boolean => !!sessionLog && !!ledgerEntry
+        && submitLedger.tryClaim(ledgerEntry, cliSessionId);
+      const settleConsumed = (): void => { if (ledgerEntry) submitLedger.settle(ledgerEntry); };
+      // Read-only, never blocks the write path: agy writes USER_INPUT only once
+      // it feeds the input to the model (a busy agy parks or defers it).
+      const proveConsumed = (): { cliSessionId?: string } | undefined => {
+        const proofCid = activeSessionId(pty) ?? knownCliSessionId;
+        if (!proveOwned(proofCid)) return undefined;
+        knownCliSessionId = proofCid;
+        return { cliSessionId: proofCid };
+      };
+      // The probe does not depend on the id being known yet: a fresh launch can
+      // log the Enter before it streams its conversation id, and the entry must
+      // still be watched and, at the turn's end, settled.
+      // Panes without a ledger entry (adopted, no process-scoped log) keep the
+      // legacy shape: no id → no result object.
+      const confirmedResult = (cliSessionId: string | undefined, owned: boolean) => {
+        if (owned && cliSessionId) return { submitted: true as const, cliSessionId, ownershipProven: true as const };
+        if (ledgerEntry) return { submitted: true as const, ...(cliSessionId ? { cliSessionId } : {}), proveConsumed, settleConsumed };
+        return cliSessionId ? { submitted: true as const, cliSessionId } : undefined;
+      };
 
       const trySendEnter = (): boolean => {
         try {
@@ -942,6 +1026,10 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
         if (!trySendEnter()) return { submitted: false };
       }
 
+      // The input may now reach agy: from here on it can own a USER_INPUT, so a
+      // later identical submit must not take that record.
+      if (sessionLog) ledgerEntry = submitLedger.register(submittedSha, submitBaseline);
+
       // Single Enter only — do NOT retry it. agy's history.jsonl append can
       // lag well past a short per-attempt window (cold start, large initial
       // prompt, network-bound auth), and a retry Enter lands on the
@@ -951,7 +1039,11 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       // recheck, not by a second Enter (same pattern as the grok adapter).
       if (await waitForHistoryAppend(HISTORY_PATH, baseByte, marker, 3_200)) {
         const cliSessionId = recordConfirmedSubmit(pty, preSize, transcriptCreatedAfterSubmit);
-        return cliSessionId ? { submitted: true, cliSessionId } : undefined;
+        // The Enter landed; ownership is a separate, stricter question, checked
+        // once here and otherwise left to the worker's background probe.
+        const proof = proveConsumed();
+        if (proof?.cliSessionId) return confirmedResult(proof.cliSessionId, true);
+        return confirmedResult(cliSessionId, false);
       }
 
       // In-band budget exhausted. Hand the worker a recheck closure so a
@@ -960,9 +1052,11 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       const recheck = (): SubmitRecheckResult => {
         if (!historyDeltaContains(HISTORY_PATH, baseByte, marker)) return false;
         const cliSessionId = recordConfirmedSubmit(pty, preSize, transcriptCreatedAfterSubmit);
-        return cliSessionId ? { submitted: true, cliSessionId } : true;
+        const proofCid = cliSessionId ?? knownCliSessionId;
+        if (proveOwned(proofCid)) return confirmedResult(proofCid, true)!;
+        return confirmedResult(cliSessionId, false) ?? true;
       };
-      return { submitted: false, recheck };
+      return { submitted: false, recheck, proveConsumed, settleConsumed };
     },
 
     completionPattern: undefined,
@@ -1035,6 +1129,31 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
           && isAntigravityIdleComposerScreen(screen)) return false;
       } catch { /* Missing viewport is not evidence of cancellation. */ }
       return true;
+    },
+    // OSC 7501 (`ESC]7501;state=…:app=antigravity BEL`), verified live on agy
+    // 1.5.18 (raw PTY and private tmux pipe-pane):
+    //   startup  idle on ready composer (blocked kind=question on setup wizard,
+    //            blocked kind=permission on folder trust);
+    //   turn     [idle on first keystroke after done] → working →
+    //            [blocked kind=permission|question → working] → done | error | idle (Esc);
+    //   /model, /help: no report at all.
+    // Under tmux pipe-pane the startup `7501;?` probe goes unanswered, so
+    // `AGY_CLI_OSC7501=on` skips the handshake and `AGY_CLI_OSC7501_MESSAGES=brief`
+    // keeps `msg` compact (without raw reply/command/question bodies). Startup
+    // stays on the composer gates; each write cycle hands idle to the screen
+    // until agy reports busy; from there working → blocked → done/idle/error is
+    // authoritative, blocked holds queued input off approval dialogs, and a
+    // confirmed transcript terminal still releases a lingering `working` (never
+    // `blocked`). Older/unknown versions, adopted panes, and explicit
+    // `AGY_CLI_OSC7501=off` keep the screen + transcript path unchanged.
+    supportsProgramStatus: true,
+    programStatusMinVersion: ANTIGRAVITY_PROGRAM_STATUS_MIN_VERSION,
+    programStatusFollowsInputCycle: true,
+    programStatusYieldsToTranscriptTerminal: true,
+    programStatusBlockedHoldsInput: true,
+    spawnEnv: {
+      AGY_CLI_OSC7501: 'on',
+      AGY_CLI_OSC7501_MESSAGES: 'brief',
     },
     systemHints: BOTMUX_SHELL_HINTS,
     skillsDir: '~/.gemini/config/skills',

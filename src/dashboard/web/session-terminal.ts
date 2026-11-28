@@ -1,3 +1,4 @@
+import { isWecomSource, sessionSupports } from './providers/registry.js';
 export interface SessionTerminalLocation {
   protocol: string;
   origin: string;
@@ -9,6 +10,10 @@ function currentLocation(): SessionTerminalLocation | null {
 }
 
 export function sessionTerminalHref(s: any, loc: SessionTerminalLocation | null = currentLocation()): string | null {
+  if (isWecomSource(s)) {
+    if (!sessionSupports(s, 'terminal') || typeof s.terminalUrl !== 'string' || !/^\/wecom-terminal\//.test(s.terminalUrl)) return null;
+    return loc ? `${loc.origin}${s.terminalUrl}` : s.terminalUrl;
+  }
   // riff：只读入口对齐飞书卡片语义 —— 「Web终端=日志页」走本地 worker 端口的
   // 只读日志视图，而不是 riffAccessUrl。riffAccessUrl 是 AIO Sandbox 的**可写**
   // capability（bearer URL，见 riff-backend.ts:hashUrlForLog「the unique subdomain

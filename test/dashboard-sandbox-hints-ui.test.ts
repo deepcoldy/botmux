@@ -79,7 +79,9 @@ describe('SandboxSection — says when the selection is not what new sessions ru
     expect(calls.filter(c => c.method === 'PUT').map(c => [c.url, c.body])).toEqual([
       ['/api/bots/app_a/read-isolation', JSON.stringify({ enabled: false })],
     ]);
-    expect(patchBot).toHaveBeenCalledWith('app_a', { readIsolation: false });
+    // 清除 legacy readIsolation 后同时丢弃 daemon 旧计算值，让摘要回落到 env/配置解析，
+    // 避免行内残留 effectiveSandboxMode='oncall' 继续显示已不生效的隔离态。
+    expect(patchBot).toHaveBeenCalledWith('app_a', { readIsolation: false, effectiveSandboxMode: null });
   });
 
   it('a daemon-wide BOTMUX_SANDBOX force is named; no note when it matches the selection', () => {

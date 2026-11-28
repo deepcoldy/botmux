@@ -246,6 +246,10 @@ function runWorkerWiring(late: boolean, options: {
     // wiring runs in this VM without worker.ts's declaration, so supply its
     // initial value. It is only read inside the slice, never assigned.
     cliSpawnGeneration: 0,
+    // The slice calls this closure (declared earlier in spawnCliBody, outside
+    // the slice) after it resolves the real CLI leaf. PID resolution is what
+    // this suite covers; the lease bookkeeping is exercised elsewhere.
+    attachTraexLeaseCli: vi.fn(),
     scopePayloadLauncherActive: options.scopeLaunched ?? options.scopePayloadPid !== undefined,
     lastSpawnOuterBwrapActive: false, lastSpawnTraexLauncherActive: false, lastSpawnCodexLauncherActive: false,
     lastSpawnCodexExecutable: undefined,
@@ -2022,6 +2026,34 @@ describe('findLaunchedCliPid()', () => {
     const t: Record<number, number[]> = { 500: [501], 501: [] };
     const c: Record<number, string> = { 500: 'bwrap', 501: 'bwrap' };
     expect(findLaunchedCliPid(500, 'traex', 6, { childrenOf: (pid) => t[pid] ?? [], commOf: (pid) => c[pid] })).toBeNull();
+  });
+
+  it.each(['cursor-agent-local', 'cursor-agent-lo'])('finds Agent Local below a persistent wrapper by comm (%s)', localComm => {
+    const tree: Record<number, number[]> = { 100: [101], 101: [] };
+    expect(findLaunchedCliPid(100, 'cursor', 6, {
+      childrenOf: pid => tree[pid] ?? [],
+      commOf: pid => ({ 100: 'sh', 101: localComm })[pid],
+      cmdlineOf: () => ['/opt/cursor-agent-local', '--authless'],
+    })).toBe(101);
+  });
+
+  it('finds a MainThread Agent Local leaf below bwrap by executable argv', () => {
+    const tree: Record<number, number[]> = { 500: [501], 501: [502], 502: [] };
+    const comm: Record<number, string> = { 500: 'bwrap', 501: 'bwrap', 502: 'MainThread' };
+    expect(findLaunchedCliPid(500, 'cursor', 6, {
+      childrenOf: pid => tree[pid] ?? [],
+      commOf: pid => comm[pid],
+      cmdlineOf: pid => pid === 502 ? ['/opt/cursor-agent-local', '--authless', '--disable-auto-update'] : [],
+    })).toBe(502);
+  });
+
+  it('does not identify Agent Local from an arbitrary MainThread program argument', () => {
+    const tree: Record<number, number[]> = { 100: [101], 101: [] };
+    expect(findLaunchedCliPid(100, 'cursor', 6, {
+      childrenOf: pid => tree[pid] ?? [],
+      commOf: pid => ({ 100: 'sh', 101: 'MainThread' })[pid],
+      cmdlineOf: () => ['node', '/srv/unrelated.js', '/opt/cursor-agent-local'],
+    })).toBeNull();
   });
 
   it('terminates on cycles in the reported tree (seen guard)', () => {

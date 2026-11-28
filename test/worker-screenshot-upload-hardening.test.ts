@@ -560,12 +560,18 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
       // This scenario has no writable Web terminal: the dirty-wire write gate
       // must stay open for the queue-only capture identity harness.
       const webTerminalInputWireDirty = () => false;
+      // This dsh-tui scenario has no persistent TraeX steering lease. The
+      // extracted callback still reads its enclosing flush-local binding.
+      const reattachSteerFence = undefined;
       const retiredTurnIds = new Set();
       const started = [];
       const syncQueuedTurnsFromMarkerDisk = () => false;
       // No terminal has gone out for any queued record in this scenario.
       const turnTerminalEmitted = () => false, dropQueuedTurnRecord = () => false;
-      const readSendMarkers = () => [];
+      // This capture-only scenario has no final delivery evidence; the shared
+      // queue/preparation callbacks must retain their original promotion path.
+      const currentTurnHasFinalEvidence = () => false;
+      const resetFinalTransitionRetryBackoff = () => {};
       const markActiveTurnStarted = record => started.push(record);
       const writeCliPidMarker = () => {}, publishSandboxRelayCapability = () => {}, cancelAntigravityFoldedReconcilePending = () => {}, log = () => {};
       // Restart bookkeeping (restored-input settle) is short-circuited here; it is

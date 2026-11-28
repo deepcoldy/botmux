@@ -18,10 +18,12 @@
 |---|---|---|---|
 | 每天自动装新版 | 系统与维护 → 自动维护 → 自动更新 | `maintenance.autoUpdate` | 关 |
 | 装完新版自动重启 | 系统与维护 → 自动维护 → 自动重启 | `maintenance.autoRestart` | 关 |
+| 发现新版时私聊主机器人管理员 | 系统与维护 → 自动维护 → 新版私聊提醒 | `maintenance.notifyOnNewVersion` | 关 |
 | 定时关掉长期不用的会话 | 通用设置 → 定时任务 → 定时自动清理空闲会话 | `sessionCleanup` | 关 |
 | 机器过载时收到私信 | 通用设置 → 机器过载告警 | `hostOverloadAlert` | 关 |
 | 定时任务按某个时区算 | 通用设置 → 定时任务 → 时区 | `scheduleTimeZone` | 跟随主机 |
 | `/g` 建的群自动加前缀 | 通用设置 → 群聊创建 | `groupNamePrefix` | 不加 |
+| Codex 桌面的自动会话标题加前缀 | [仅配置文件](#codex-app-title-prefix) | `codexAppTitlePrefix` | 不加 |
 | 选仓卡里不显示 worktree | 通用设置 → 仓库选择 | `repoPickerMode` | 仓库 + worktree |
 | 新建的 worktree 放到大数据盘 | 通用设置 → Worktree | `worktreeRoot` | 建在主仓库旁边 |
 | 模型服务临时出错时让 Claude 自动接着做 | 通用设置 → 暂态故障自动续跑 | `providerRecovery` | 关 |
@@ -48,11 +50,29 @@
 }
 ```
 
+### 新版私聊提醒 {#version-notifications}
+
+「新版私聊提醒」默认关闭，可在 Dashboard 的自动维护设置或飞书 `/dashboard settings` 设置卡中开启。对应配置为 `"maintenance": { "notifyOnNewVersion": true }`。
+
+开启后每小时检查一次新版本，只由主机器人私聊它解析出的主管理员；不会逐个通知其它机器人。它与自动更新、自动重启和重启报告相互独立，只查询版本并提醒，不会安装更新。关闭时不会查询版本或发送提醒。投递、去重和失败重试细节见[版本通知](https://github.com/deepcoldy/botmux/blob/master/docs/version-notifications.md)。
+
 ### 自动升级会话里的 Codex
 
 位置：通用设置 → 实验性配置 → 自动升级会话 Codex 版本。实验功能，默认关。
 
 打开后，本机装了新版 Codex，正在用的 Codex 会话会在**安全空闲时**换成新版进程，并接回原来的会话，不会额外发起一次对话。有后台任务、或者判断不了是否安全的会话会先等等再升。开关立即生效。
+
+## Codex App 会话标题前缀 {#codex-app-title-prefix}
+
+Botmux 用首条有效任务的正文给新建的 `codex-app` 会话命名。要在 Codex 桌面里一眼认出这些会话，在 `~/.botmux/config.json` 顶层加入（保留已有设置）：
+
+```json
+{
+  "codexAppTitlePrefix": "botmux："
+}
+```
+
+例如，首条任务是「排查图片上传报错」，标题就会是 `botmux：排查图片上传报错`。空格和分隔符按配置保留；前缀最多 24 个 Unicode 码点，整个标题最多 48 个。省略或留空就不加前缀。只影响本机所有 `codex-app` Bot 后续新建会话的自动标题，不改旧会话、已有标题、其他 CLI 或飞书群名。
 
 ## 定时清理空闲会话
 

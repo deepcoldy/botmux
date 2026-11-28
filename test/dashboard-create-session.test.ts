@@ -16,7 +16,14 @@ import type { DaemonSession } from '../src/core/types.js';
 const store = new Map<string, Session>();
 let sessionSeq = 0;
 const assistant = vi.hoisted(() => ({ spawn: { kind: 'off' } as any }));
-vi.mock('../src/core/assistant-spawn.js', () => ({ resolveAssistantSpawn: () => assistant.spawn }));
+vi.mock('../src/core/assistant-spawn.js', () => ({ resolveAssistantSpawn: () => assistant.spawn, assistantMultiUserGroupsOff: () => false }));
+// Group-level directory bindings recorded by /g --dir (created-groups.json).
+const groupDirState = vi.hoisted(() => ({ value: undefined as string | undefined }));
+vi.mock('../src/services/created-groups-store.js', () => ({
+  createdGroupWorkingDir: vi.fn((_chatId: string) => groupDirState.value),
+  getCreatedGroup: vi.fn(() => undefined),
+  recordCreatedGroup: vi.fn(),
+}));
 vi.mock('../src/services/session-store.js', () => ({
   registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
   cleanupSessionBridgeSendMarkers: vi.fn(),
@@ -199,6 +206,7 @@ beforeEach(() => {
     botName: 'TestBot',
     botOpenId: 'ou_bot',
   } as any);
+  groupDirState.value = undefined;
 });
 
 describe('spawnDashboardSession — backlog (待办池) parks without starting the CLI', () => {
@@ -875,6 +883,35 @@ describe('spawnDashboardSession — backlog (待办池) parks without starting t
     expect(active.get(sessionKey('oc_healthy_2', APP))?.session.sessionId).toBe(healthy.sessionId);
   });
 
+  it('restores an all-cancelled pruned tail as drained instead of quarantining the owner', async () => {
+    const drained: Session = {
+      sessionId: 'drained-cancelled-tail', chatId: CHAT, rootMessageId: CHAT, scope: 'chat', larkAppId: APP,
+      title: 'cancelled tail', status: 'active', createdAt: new Date('2026-01-01T00:00:00Z').toISOString(),
+      cliId: 'claude-code',
+      queuedActivationTail: [{
+        id: 'tail-cancelled-restore', order: 1, userPrompt: 'CANCELLED_RESTORE',
+        cliInput: { content: 'CANCELLED_RESTORE' }, turnId: 'cancelled-restore-turn',
+      }],
+      cancelledActivationTurnIds: ['cancelled-restore-turn'],
+    };
+    store.set(drained.sessionId, drained);
+    const { promoteQueuedActivationTail } = await import('../src/core/worker-pool.js');
+    vi.mocked(promoteQueuedActivationTail).mockImplementationOnce((ds: any) => {
+      // The real prune has already persisted the empty result. Exercise the
+      // restore decision, not the prune implementation mocked in this file.
+      ds.session.queuedActivationTail = undefined;
+      ds.initialStartPending = false;
+      return false;
+    });
+    const active = new Map<string, DaemonSession>();
+    await restoreActiveSessions(active);
+    const registered = active.get(sessionKey(CHAT, APP));
+    expect(registered?.session.sessionId).toBe(drained.sessionId);
+    expect(registered?.quarantinedActivationTailPromotion).toBeUndefined();
+    expect(registered?.initialStartPending).toBe(false);
+    expect(registered?.initialStartClaimToken).toBeUndefined();
+  });
+
   it('rolls back a failed terminal-empty cleanup and continues restoring later rows', async () => {
     const failed: Session = {
       sessionId: 'failed-terminal-cleanup', chatId: CHAT, rootMessageId: CHAT, scope: 'chat', larkAppId: APP,
@@ -1527,5 +1564,58 @@ describe('executeScheduledTask — workerless owner semantics', () => {
     expect(ds?.initialStartPending).toBe(true);
     expect(ds?.pendingPrompt).toBe('scheduled prompt');
     expect(ds?.worker).toBeNull();
+  });
+});
+
+describe('P2-2: /g --dir binding must not be mistaken for the bot default by auto-worktree', () => {
+  function enableAutoWorktreeBot(): void {
+    vi.mocked(getBot).mockReturnValue({
+      config: { cliId: 'claude-code', cliPathOverride: undefined, defaultWorkingDir: '/tmp', defaultWorkingDirAutoWorktree: true },
+      botName: 'TestBot',
+      botOpenId: 'ou_bot',
+    } as any);
+  }
+
+  it('A: group binding equal to the bot default starts in place — no auto-worktree, no pendingRepo', async () => {
+    enableAutoWorktreeBot();
+    groupDirState.value = '/tmp';
+    const active = new Map<string, DaemonSession>();
+    activeRegistryMock = active;
+    runAutoWorktreeCommitMock.mockClear();
+    const r = await spawnDashboardSession(active, undefined, {
+      larkAppId: APP, chatId: CHAT, content: '开干', column: 'in_progress', role: 'solo', postBanner: false,
+    });
+    expect(r.ok).toBe(true);
+    expect(runAutoWorktreeCommitMock).not.toHaveBeenCalled();
+    const ds = active.get(sessionKey(CHAT, APP))!;
+    expect(ds.pendingRepo).toBeFalsy();
+    expect(ds.workingDir).toBe('/tmp');
+  });
+
+  it('B: group binding to a different dir is kept verbatim and does not auto-worktree', async () => {
+    enableAutoWorktreeBot();
+    groupDirState.value = '/tmp/some-other-repo';
+    const active = new Map<string, DaemonSession>();
+    activeRegistryMock = active;
+    runAutoWorktreeCommitMock.mockClear();
+    const r = await spawnDashboardSession(active, undefined, {
+      larkAppId: APP, chatId: CHAT, content: '开干', column: 'in_progress', role: 'solo', postBanner: false,
+    });
+    expect(r.ok).toBe(true);
+    expect(runAutoWorktreeCommitMock).not.toHaveBeenCalled();
+    expect(active.get(sessionKey(CHAT, APP))!.workingDir).toBe('/tmp/some-other-repo');
+  });
+
+  it('C: without a group binding, the bot default still drives auto-worktree (existing behavior)', async () => {
+    enableAutoWorktreeBot();
+    groupDirState.value = undefined;
+    const active = new Map<string, DaemonSession>();
+    activeRegistryMock = active;
+    runAutoWorktreeCommitMock.mockClear();
+    const r = await spawnDashboardSession(active, undefined, {
+      larkAppId: APP, chatId: CHAT, content: '开干', column: 'in_progress', role: 'solo', postBanner: false,
+    });
+    expect(r.ok).toBe(true);
+    expect(runAutoWorktreeCommitMock).toHaveBeenCalledTimes(1);
   });
 });

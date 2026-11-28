@@ -23,7 +23,7 @@ import {
 import { createCliAdapterSync, rawCliExecutable, resolveCommand } from '../adapters/cli/registry.js';
 import { CLI_MODEL_CHOICES } from '../adapters/cli/model-choices.js';
 import type { DebugModelCapabilities } from '../adapters/cli/model-catalog-json.js';
-import type { CliAdapter, CliId } from '../adapters/cli/types.js';
+import type { CliAdapter, CliId, CliModelDetectionOptions } from '../adapters/cli/types.js';
 import { detectAidenCodexModels } from './aiden-model-catalog.js';
 import { codexConfigIdentity } from './codex-service-tier-catalog.js';
 import { createHash } from 'node:crypto';
@@ -50,11 +50,21 @@ export interface DetectModelsOptions {
    * adapter construction and executable resolution (Dashboard HTTP probes). */
   readonly supportsModelDiscovery?: (cliId: CliId) => boolean;
   /** Aiden AIPROXY 探测器注入，默认调用 `aiden x models --codex --json`。 */
-  readonly aidenCodexDetector?: () => Promise<readonly string[] | null>;
+  readonly aidenCodexDetector?: (env?: NodeJS.ProcessEnv) => Promise<readonly string[] | null>;
   /** Bot-specific runtime identity; never returned to clients. */
   readonly runtimeContext?: string;
   /** Bot-specific environment for a capability probe. */
   readonly probeEnv?: NodeJS.ProcessEnv;
+  /** Botmux-owned global/Bot overlay, kept separate from inherited probeEnv. */
+  readonly probeSettingsEnv?: NodeJS.ProcessEnv;
+  /**
+   * `probeEnv` belongs to a separately launched core (the WeCom managed core),
+   * not to this process: every probe must run in it and inherit nothing from
+   * here. Without it, adapters keep their established behaviour — coco /
+   * opencode / zcode / Aiden probe in this process's environment, as they
+   * always have for Feishu bots.
+   */
+  readonly isolatedProbeEnv?: boolean;
   /** Trusted executable selected from the target Bot's persisted native runtime. */
   readonly runtimeExecutable?: string;
   /** Command resolver injection for deterministic cache-identity tests. */
@@ -152,10 +162,15 @@ async function detectModelCatalogWith(
     ?? ((cliId: CliId, pathOverride?: string) => createCliAdapterSync(cliId, pathOverride));
   try {
     const opt = lookupCliSelection(key);
-    // Only ttadk owns its model list. Other registered wrappers (including
-    // cjadk) retain the underlying adapter's live slug discovery; Aiden Codex
-    // is handled by its dedicated detector below.
+    // Only ttadk owns its model list. Other registered wrappers keep the
+    // underlying adapter's live slug discovery — except the Claude gateways
+    // below; Aiden Codex is handled by its dedicated detector.
     if (!opt || isTtadkWrapper(opt.wrapperCli)) return null;
+    // Claude 网关 wrapper（aiden-x-claude、cjadk-x-claude）的模型集合由网关定义。
+    // 原生 claude-code 探测器没有 Bot 时会退到宿主机的官方账户目录，给出的列表
+    // 与网关无关，因此这类 wrapper 一律回退静态候选（与 ClaudeFamilyVariant 的
+    // 注释一致；cli dispatch 侧有同一条守卫）。
+    if (opt.cliId === 'claude-code' && opt.wrapperCli) return null;
 
     // Pi reads local configuration in the effective environment, including
     // ambient HOME/agent-dir when no Bot-specific probe env was supplied.
@@ -166,7 +181,8 @@ async function detectModelCatalogWith(
       )).digest('hex')
       : '';
     const executable = opts?.runtimeExecutable ?? rawCliExecutable(opt.cliId);
-    const operationKey = `operation:${opt.key}\0${opts?.runtimeContext ?? ''}\0${envKey}\0${opt.key === 'aiden-x-codex' ? 'aiden' : executable ?? ''}`;
+    const isolated = opts?.isolatedProbeEnv === true;
+    const operationKey = `operation:${opt.key}\0${opts?.runtimeContext ?? ''}\0${envKey}\0${opt.key === 'aiden-x-codex' ? 'aiden' : executable ?? ''}${isolated ? '\0isolated' : ''}`;
     const pendingOperation = inFlight.get(operationKey);
     if (pendingOperation) return pendingOperation;
 
@@ -191,7 +207,7 @@ async function detectModelCatalogWith(
             );
         // Codex reads its catalogue under CODEX_HOME/config.toml; key on it too.
         const configIdentity = isCodexReasoningCliId(opt.cliId) ? codexConfigIdentity(probeEnv ?? process.env) : '';
-        const cacheKey = `${opt.key}\0${opts?.runtimeContext ?? ''}\0${envKey}\0${runtimeIdentity}\0${configIdentity}`;
+        const cacheKey = `${opt.key}\0${opts?.runtimeContext ?? ''}\0${envKey}\0${runtimeIdentity}\0${configIdentity}${isolated ? '\0isolated' : ''}`;
         const cached = cache.get(cacheKey);
         if (cached && now() - cached.at < MODEL_DETECT_TTL_MS) {
           return { models: cached.models, ...(cached.modelCapabilities ? { modelCapabilities: cached.modelCapabilities } : {}) };
@@ -208,11 +224,19 @@ async function detectModelCatalogWith(
             const capabilities = adapter?.detectModelCapabilities
               ? await adapter.detectModelCapabilities({ env: opts?.probeEnv })
               : undefined;
+            const aidenDetector = opts?.aidenCodexDetector ?? detectAidenCodexModels;
+            const adapterProbeOptions: CliModelDetectionOptions = {
+              env: probeEnv,
+              ...(opts?.probeSettingsEnv && Object.keys(opts.probeSettingsEnv).length > 0
+                ? { settingsEnv: opts.probeSettingsEnv }
+                : {}),
+              ...(isolated ? { isolatedEnv: true } : {}),
+            };
             const models = opt.key === 'aiden-x-codex'
-              ? await (opts?.aidenCodexDetector ?? detectAidenCodexModels)()
+              ? await (isolated && opts?.probeEnv ? aidenDetector(opts.probeEnv) : aidenDetector())
               : adapter?.detectModelCapabilities
                 ? capabilities?.map(model => model.slug) ?? null
-                : await adapter?.detectModels?.({ env: probeEnv }) ?? null;
+                : await adapter?.detectModels?.(adapterProbeOptions) ?? null;
             // 只缓存非空成功结果；失败（null/空数组/异常）不缓存，下次调用重试。
             if (models === null) return null;
             if (models.length === 0) return { models: [] };

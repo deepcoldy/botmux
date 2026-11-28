@@ -392,6 +392,48 @@ describe('Lark send gate retry keeps one dedupe uuid', () => {
     expect(mocks.create.mock.calls.map(c => c[0].data.uuid)).toEqual(['caller-uuid', 'caller-uuid']);
   });
 
+  it('replyMessage sends a caller-supplied uuid unchanged across HTTP 500 code=2200 gate retries', async () => {
+    const http500Code2200 = () => Object.assign(new Error('Request failed with status code 500'), {
+      isAxiosError: true,
+      response: { status: 500, data: { code: 2200, msg: 'internal error' } },
+    });
+    mocks.reply
+      .mockRejectedValueOnce(http500Code2200())
+      .mockRejectedValueOnce(http500Code2200())
+      .mockResolvedValueOnce({ code: 0, data: { message_id: 'om_reply_ok' } });
+    const action = replyMessage('app-retry-uuid', 'om_root', '{"card":1}', 'interactive', true, 'sc_t_0123456789abcdef0123456789abcdef');
+    await vi.advanceTimersByTimeAsync(20_000);
+    await expect(action).resolves.toBe('om_reply_ok');
+    expect(mocks.reply.mock.calls.map(c => c[0].data.uuid)).toEqual([
+      'sc_t_0123456789abcdef0123456789abcdef',
+      'sc_t_0123456789abcdef0123456789abcdef',
+      'sc_t_0123456789abcdef0123456789abcdef',
+    ]);
+    expect(mocks.reply.mock.calls.every(c => c[0].data.reply_in_thread === true)).toBe(true);
+  });
+
+  it('normalizes whitespace-only and >50-char/non-URL-safe caller uuids to wire-safe <=50-char tokens', async () => {
+    mocks.create.mockResolvedValue({ code: 0, data: { message_id: 'om_ok' } });
+    mocks.reply.mockResolvedValue({ code: 0, data: { message_id: 'om_reply_ok' } });
+
+    await sendMessage('app-retry-uuid', 'oc_chat', 'body', 'text', '   ');
+    await sendMessage('app-retry-uuid', 'oc_chat', 'body', 'text', '   ');
+    const blank1 = mocks.create.mock.calls[0][0].data.uuid;
+    const blank2 = mocks.create.mock.calls[1][0].data.uuid;
+    expect(blank1).toMatch(/^[A-Za-z0-9_-]{1,50}$/);
+    expect(blank2).toMatch(/^[A-Za-z0-9_-]{1,50}$/);
+    expect(blank1).not.toBe(blank2);
+
+    const oversized = `vc_678901234567_overflow_${'a.b'.repeat(20)}`;
+    await replyMessage('app-retry-uuid', 'om_root', 'body', 'text', true, oversized);
+    await replyMessage('app-retry-uuid', 'om_root', 'body', 'text', true, oversized);
+    const norm1 = mocks.reply.mock.calls[0][0].data.uuid;
+    const norm2 = mocks.reply.mock.calls[1][0].data.uuid;
+    expect(norm1).toMatch(/^u_[0-9a-f]{32}$/);
+    expect(norm1.length).toBeLessThanOrEqual(50);
+    expect(norm2).toBe(norm1);
+  });
+
   it('thread reply keeps reply_in_thread and the uuid across a retry', async () => {
     mocks.reply
       .mockRejectedValueOnce(transient502())

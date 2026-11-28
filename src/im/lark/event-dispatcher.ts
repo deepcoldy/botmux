@@ -14,7 +14,7 @@ import { startLarkConnection, type LarkConnection } from './transport/connection
 import { getBot, getAllBots, getBotOpenId, findOncallChat, getOwnerOpenId, loadBotConfigs, loadBotConfigsCached, vcMeetingAgentConfigActive, type BotConfig, type BotState, type SubstituteModeConfig } from '../../bot-registry.js';
 import { botHasConfiguredAllowlist } from '../../core/bot-allowlist.js';
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
-import { getChatInfo, getChatMode, getChatModeStrict, getCachedChatMode, getChatName, getUserProfile, getMessageDetail, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, resolveUnionIdFromOpenId, resolveUnionIdFromOpenIdStrict, replyMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
+import { getChatInfo, getChatMode, getChatModeStrict, getCachedChatMode, getChatName, getUserProfile, getMessageDetail, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, resolveUnionIdFromOpenId, resolveUnionIdFromOpenIdStrict, replyMessage, sendUserMessage, isHumanOpenId, updateInteractiveCardByToken, updateMessage } from './client.js';
 import * as larkClient from './client.js';
 import type { SubtopicMentionlessHandoff } from '../../services/subtopic-mentionless-handoff.js';
 import { listChats, type ChatBrief } from '../../services/groups-store.js';
@@ -72,7 +72,8 @@ import { tryHandleChatTabsCommand } from './chat-tabs-command.js';
 import { tryHandleMentionModeCommand } from './mention-mode-command.js';
 import { tryHandleSecretaryCommand } from './secretary-command.js';
 import { observeGroupSecretaryMessage } from '../../services/group-secretary-runtime.js';
-import { tryHandleAssistantCommand } from './assistant-command.js';
+import { assistantGroupIsMultiUser, assistantSoloGroupOwnerCheck, tryHandleAssistantCommand, tryHandleAssistantMultiUserGroup } from './assistant-command.js';
+import { assistantMultiUserGroupsOff, assistantSoloGroupAdmission } from '../../core/assistant-spawn.js';
 import { isChatManager } from '../../services/chat-manager.js';
 import { resolveSubstituteAppMentions, substituteMentionIdentities } from './substitute-app-mentions.js';
 import { tryHandleSubstituteCommand } from './substitute-command.js';
@@ -88,7 +89,7 @@ import {
 } from '../../services/grant-store.js';
 import { ForwardFollowupBuffer } from './forward-followup-buffer.js';
 import { listForwardFollowups, putForwardFollowup, removeForwardFollowup } from './forward-followup-store.js';
-import { claimMessageOnce, _resetCacheForTest as _resetSeenMessagesForTest } from '../../services/seen-message-store.js';
+import { claimMessageOnce, hasClaimedMessage, _resetCacheForTest as _resetSeenMessagesForTest } from '../../services/seen-message-store.js';
 import {
   acquireReverifySlot,
   contentHasMentionPlaceholder,
@@ -1564,7 +1565,7 @@ const CARD_ACTION_TIMEOUT = Symbol('card-action-timeout');
 const cardActionInFlight = new Set<string>();
 
 function cardActionMessageId(data: any): string | undefined {
-  return data?.context?.open_message_id ?? data?.open_message_id;
+  return data?.context?.open_message_id ?? data?.open_message_id ?? data?.message_id;
 }
 
 const PRIMARY_UNSAFE_SESSION_LIFECYCLE_ACTIONS = new Set([
@@ -1639,7 +1640,13 @@ function shapeCardActionResult(result: any): any {
   // The handler may return:
   //   - an already-shaped Lark response ({toast} and/or {card}) -> pass through;
   //   - a raw card body (e.g. toggle_stream) -> wrap as an in-place card patch.
-  if (result && (result.toast || result.card || result.deferredCard || result.afterAck)) return result;
+  if (result && (result.toast || result.card || result.deferredCard || result.afterAck)) {
+    if (result.card && !result.deferredCard) {
+      const { card, ...rest } = result;
+      return { ...rest, deferredCard: card };
+    }
+    return result;
+  }
   if (result) return { card: { type: 'raw', data: result } };
   // The Lark WS SDK only serializes callback `data` for truthy results. An
   // empty object therefore means "ACK with no UI update", while undefined
@@ -1652,11 +1659,72 @@ function serializeRawCardForPatch(cardData: any): string | undefined {
   return typeof cardData === 'string' ? cardData : JSON.stringify(cardData);
 }
 
+function cardActionPatchErrorDetail(err: unknown): string {
+  const shape = extractLarkErrorShape(err);
+  const responseData = (err as any)?.response?.data;
+  return `${shape.message}`
+    + `${shape.httpStatus !== undefined ? ` httpStatus=${shape.httpStatus}` : ''}`
+    + `${shape.larkCode !== undefined ? ` larkCode=${shape.larkCode}` : ''}`
+    + `${responseData ? ` response=${JSON.stringify(responseData).slice(0, 1000)}` : ''}`;
+}
+
+function cardActionToken(data: any): string | undefined {
+  const token = data?.token ?? data?.event?.token;
+  return typeof token === 'string' && token.trim() ? token.trim() : undefined;
+}
+
+function cardActionOperatorOpenId(data: any): string | undefined {
+  const openId = data?.operator?.open_id ?? data?.operator_id ?? data?.event?.operator?.open_id;
+  return typeof openId === 'string' && openId.trim() ? openId.trim() : undefined;
+}
+
+function delayedUpdateCardFromRaw(raw: any, operatorOpenId?: string): Record<string, unknown> | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const card = (raw as any).card && typeof (raw as any).card === 'object' && !Array.isArray((raw as any).card)
+    ? (raw as any).card
+    : raw;
+  if (!card || typeof card !== 'object' || Array.isArray(card)) return undefined;
+
+  // interactive/v1/card/update targets the callback token, not the message id.
+  // Card 1.0 uses update_multi to select the audience: shared cards update every
+  // recipient and must NOT carry open_ids; exclusive cards (including the
+  // default update_multi=false) require a non-empty recipient list (300090).
+  // Card 2.0 and template updates do not use this legacy field.
+  const legacyCard = !(card as any).schema && (card as any).type !== 'template';
+  const sharedLegacyCard = legacyCard && (card as any).config?.update_multi === true;
+  if (sharedLegacyCard) {
+    if (!Object.hasOwn(card, 'open_ids')) return card as Record<string, unknown>;
+    const { open_ids: _openIds, ...sharedCard } = card as Record<string, unknown>;
+    return sharedCard;
+  }
+  const hasLegacyRecipients = Array.isArray((card as any).open_ids) && (card as any).open_ids.length > 0;
+  if (legacyCard && !hasLegacyRecipients) {
+    // Do not spend one of the two token uses on a request that must fail with
+    // 300090, and do not fall through to message.patch (which cannot perform an
+    // exclusive/partial update). The deferred lane catches this and still runs
+    // the business continuation.
+    if (!operatorOpenId) {
+      throw new Error('Delayed update of an exclusive Card 1.0 requires an operator open_id or non-empty open_ids');
+    }
+    return { ...(card as Record<string, unknown>), open_ids: [operatorOpenId] };
+  }
+  return card as Record<string, unknown>;
+}
+
 async function patchTimedOutCardActionResult(larkAppId: string, data: any, shapedResult: any): Promise<void> {
   const messageId = cardActionMessageId(data);
   const card = shapedResult?.card ?? shapedResult?.deferredCard;
-  if (!messageId || !card) return;
+  if (!card) return;
   const raw = card.type === 'raw' ? card.data : card;
+  const token = cardActionToken(data);
+  if (token) {
+    const delayedCard = delayedUpdateCardFromRaw(raw, cardActionOperatorOpenId(data));
+    if (delayedCard) {
+      await updateInteractiveCardByToken(larkAppId, token, delayedCard);
+      return;
+    }
+  }
+  if (!messageId) return;
   const body = serializeRawCardForPatch(raw);
   if (!body) return;
   await updateMessage(larkAppId, messageId, body);
@@ -1684,6 +1752,7 @@ async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: E
   const ackTimeoutMs = resolveCardActionAckTimeoutMs(getBot(larkAppId).config.cardActionAckTimeoutMs);
   cardActionInFlight.add(key);
   let timedOut = false;
+  let deferredCardUpdateScheduled = false;
   const work = handlers.handleCardAction(data, larkAppId)
     .then(shapeCardActionResult)
     .then(result => {
@@ -1691,22 +1760,33 @@ async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: E
       // ACK the callback before patching. If we await message.patch here, Lark
       // applies the callback completion after the API patch and can restore the
       // pre-click card, making the expanded follow-up flash and disappear.
-      if (result.deferredCard) {
-        setTimeout(() => {
-          void patchTimedOutCardActionResult(larkAppId, data, result)
-            .catch(err => logger.warn(`Failed to patch deferred card action result: ${err}`));
-        }, 0);
-      }
-      if (typeof result.afterAck === 'function') {
-        setTimeout(() => {
-          // Pass the REAL ACK-timeout state observed by this wrapper. Existing
-          // afterAck callbacks ignore the extra argument; callbacks that must
-          // decide between a synchronous toast and a visible fallback (e.g. the
-          // substitute toggle) use it instead of estimating elapsed time.
-          void Promise.resolve(result.afterAck(timedOut))
-            .catch(err => logger.warn(`Failed to run deferred card continuation: ${err}`));
-        }, 0);
-      }
+      // A result such as {card: running, afterAck: publishResult} has two writes
+      // to the same message. Settle the intermediate update before starting the
+      // continuation; otherwise a slow token request can overwrite the result.
+      if (result.deferredCard) deferredCardUpdateScheduled = true;
+      setTimeout(() => {
+        void (async () => {
+          if (result.deferredCard) {
+            try {
+              await patchTimedOutCardActionResult(larkAppId, data, result);
+            } catch (err) {
+              logger.warn(`Failed to patch deferred card action result: ${cardActionPatchErrorDetail(err)}`);
+            }
+          }
+          if (typeof result.afterAck === 'function') {
+            try {
+              // Pass the REAL ACK-timeout state observed by this wrapper. Existing
+              // afterAck callbacks ignore the extra argument; callbacks that must
+              // decide between a synchronous toast and a visible fallback (e.g. the
+              // substitute toggle) use it instead of estimating elapsed time.
+              // A card-update failure must not suppress the business continuation.
+              await result.afterAck(timedOut);
+            } catch (err) {
+              logger.warn(`Failed to run deferred card continuation: ${err}`);
+            }
+          }
+        })();
+      }, 0);
       if (result.deferredCard) return result.toast ? { toast: result.toast } : {};
       const { afterAck: _afterAck, ...response } = result;
       return response;
@@ -1718,6 +1798,10 @@ async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: E
 
   void work.then(result => {
     if (!timedOut || !result) return;
+    // The deferred lane already owns this card update. Its stripped ACK-shaped
+    // result may still contain a toast; do not misreport that as toast-only or
+    // issue a second, empty patch from this timeout fallback.
+    if (deferredCardUpdateScheduled) return;
     if (!result.card && result.toast) {
       // A toast-only result can't be re-surfaced after we already ACKed with the
       // generic "后台处理中" toast: toasts ride the synchronous callback response,
@@ -4380,6 +4464,28 @@ async function dispatchPolledMessageListenerMatch(input: {
   chatId: string;
   messageId: string;
 }): Promise<void> {
+  // 只读预检避免合法重复消息每拍重新查成员。真正的 claim 在准入后：明确非法的丢弃是终态，
+  // 但 lookup_failed 只是本轮 fail closed，绝不能消费消息、挡住 Lark 恢复后的重试。
+  if (hasClaimedMessage(input.larkAppId, input.messageId)) {
+    logger.debug(`[message-listener:${input.larkAppId}] polled duplicate ignored msg=${input.messageId.substring(0, 12)}`);
+    return;
+  }
+  if (assistantMultiUserGroupsOff(input.larkAppId)) {
+    const admission = await assistantSoloGroupAdmission(input.larkAppId, input.chatId);
+    if (!admission.ok && admission.reason === 'lookup_failed') {
+      logger.debug(`[message-listener:${input.larkAppId}] owner lookup failed for ${input.chatId.substring(0, 12)}; retry next poll`);
+      return;
+    }
+    if (!admission.ok && admission.reason !== 'unclaimed') {
+      if (admission.reason === 'owner_absent' && admission.ownerOpenId) {
+        logger.info(`[assistant-mode:${input.larkAppId}] owner ${admission.ownerOpenId.slice(0, 12)}… absent before polled routing in ${input.chatId.substring(0, 12)}; treating as left`);
+        await input.handlers.handleChatMemberUserDeleted?.(input.chatId, [admission.ownerOpenId], input.larkAppId);
+      }
+      claimMessageOnce(input.larkAppId, input.messageId);
+      logger.debug(`[message-listener:${input.larkAppId}] polled message ignored permanently: ${admission.reason}`);
+      return;
+    }
+  }
   if (!claimMessageOnce(input.larkAppId, input.messageId)) {
     logger.debug(`[message-listener:${input.larkAppId}] polled duplicate ignored msg=${input.messageId.substring(0, 12)}`);
     return;
@@ -6076,6 +6182,21 @@ export function createLarkEventDispatcherRuntime(
       const chatType = (message.chat_type === 'p2p' ? 'p2p' : 'group') as 'group' | 'p2p';
       const messageId = message.message_id;
 
+      // 个人助理模式且不允许多人群：真人 ≥2 的群里什么都不做（不旁听、不路由、不认领），被真人 @ 时回一句。
+      if (chatType === 'group') {
+        const st = sender?.sender_type;
+        const senderIsBot = st === 'app' || st === 'bot';
+        if (await tryHandleAssistantMultiUserGroup(larkAppId, message, sender?.sender_id?.open_id, senderIsBot)) return;
+        // 单人群里主人已不在（真人发言者不是主人，或 bot 发言时现查成员没有主人）：按主人退群处理，
+        // 之后这条消息按未认领的群走。bot 发言且核对不了 ⇒ 丢弃。
+        const { drop, absentOwner } = await assistantSoloGroupOwnerCheck(larkAppId, message, sender?.sender_id?.open_id, senderIsBot);
+        if (drop) return;
+        if (absentOwner) {
+          logger.info(`[assistant-mode:${larkAppId}] owner ${absentOwner.slice(0, 12)}… is not in solo group ${chatId.substring(0, 12)}; treating as left`);
+          await handlers.handleChatMemberUserDeleted?.(chatId, [absentOwner], larkAppId);
+        }
+      }
+
       // 群聊上下文共享：静默旁听写入（group-context-ingest），放在任何 sender 分支 /
       // self return / mention gate 之前，让没被 @ 的消息也进共享记录。它自带开关
       // （默认关）与错误隔离，永不抛出、不推进 seen-message 去重、不启动 worker；
@@ -7686,7 +7807,9 @@ export function createLarkEventDispatcherRuntime(
       data.__groupContextHandled = true;
       try {
         const editedChatId: string | undefined = data.message?.chat_id;
-        if (editedChatId && data.message.chat_type !== 'p2p' && isGroupContextEnabled(larkAppId, editedChatId)) {
+        // 个人助理模式不允许多人群：多人群的编辑不旁听（私聊本就不采集）。
+        if (editedChatId && data.message.chat_type !== 'p2p' && isGroupContextEnabled(larkAppId, editedChatId)
+          && !(assistantMultiUserGroupsOff(larkAppId) && await assistantGroupIsMultiUser(larkAppId, editedChatId))) {
           const mode = getCachedChatMode(larkAppId, editedChatId) ?? await getChatModeStrict(larkAppId, editedChatId);
           if (mode === 'p2p') data.message.chat_type = 'p2p';
           else if (mode === 'group' || mode === 'topic') {
@@ -8014,6 +8137,12 @@ export function createLarkEventDispatcherRuntime(
         // 这次入群不跑入群钩子 / 入群命令 / 拉 owner / 自动开工，不发言也不开会话。
         if (isStewardSilentJoin(config.session.dataDir, larkAppId, chatId)) {
           logger.info(`[steward-join] joined chat=${chatId.substring(0, 12)} silently as a steward; skipping group-join actions`);
+          return;
+        }
+        // 个人助理模式不允许多人群：被拉进真人 ≥2 的群时入群钩子 / 入群命令 / 拉 owner / 归属 / 自动开工一概不做。
+        if (assistantMultiUserGroupsOff(larkAppId)
+          && (await getGroupStats(larkAppId, chatId, { requireFresh: true })).userCount !== 1) {
+          logger.info(`[assistant-mode:${larkAppId}] bot added to multi-user group ${chatId.substring(0, 12)}; ignoring`);
           return;
         }
         logger.info(`[auto-start:入群] bot added to chat=${chatId.substring(0, 12)} by ${String(operatorOpenId ?? '?').substring(0, 12)}`);

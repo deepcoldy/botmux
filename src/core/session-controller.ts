@@ -316,7 +316,9 @@ export class SessionController {
       // in-worker restart/rebind the worker has no assigned runtime yet, and
       // admitSessionCommand allows runtime-less `message` delivery so turns are
       // never silently dropped as stale_runtime_target.
-      const attachRuntime = message.type !== 'message' && !base.runtime && !!target;
+      const attachRuntime = message.type !== 'message'
+        && message.type !== 'cancel_queued_turn'
+        && !base.runtime && !!target;
       return {
         ...base,
         ...(attachRuntime ? { runtime: target } : {}),

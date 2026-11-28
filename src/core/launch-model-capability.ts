@@ -37,7 +37,7 @@ export function allowsTaskModelOverride(cliId: CliId | undefined): boolean {
 export const LAUNCH_MODEL_CLI_IDS: ReadonlySet<CliId> = new Set<CliId>([
   'claude-code', 'seed', 'relay', 'coco', 'codex', 'codex-app', 'cursor',
   'genius', 'opencode', 'mimocode', 'traex', 'pi', 'copilot', 'oh-my-pi', 'kimi', 'codem', 'grok',
-  'reasonix', 'dsh', 'minimax', 'antigravity', 'remote-runner', 'doubao',
+  'reasonix', 'dsh', 'minimax', 'antigravity', 'remote-runner', 'doubao', 'nca',
   // PTY 之外：MojoBackend 把 botmux 解析出的 model 拼进 `mojo -p --model`。
   'mojo',
   // ZCode receives a validated session-specific provider config in worker.

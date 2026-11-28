@@ -18,6 +18,8 @@ import type { TraexAutoModelConfig } from '../services/traex-auto-model.js';
 import { readGlobalConfig } from '../global-config.js';
 import { resolveBotCodexRpcInput } from '../services/codex-rpc-input-policy.js';
 import { normalizeBotTaskRoutingConfig } from '../core/task-routing/model.js';
+import { normalizeSessionOwnerReminderConfig } from '../core/session-owner-reminder.js';
+import type { SessionOwnerReminderConfig } from '../core/session-owner-reminder-config.js';
 
 /** Shared parser so a malformed payload can't reach the selector half-shaped;
  *  anything invalid degrades to the registry default (`inherit`). */
@@ -172,6 +174,9 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     // 克隆弹窗要用它判断源 Bot 是哪种目录形态，才能预填出与克隆结果一致的表单。
     workingDir: typeof j?.workingDir === 'string' ? j.workingDir : null,
     defaultWorkingDirAutoWorktree: j?.defaultWorkingDirAutoWorktree === true,
+    // Older daemons omit these fields: preserve unknown so modified-only can fail open.
+    commandTriggersConfigured: typeof j?.commandTriggersConfigured === 'boolean' ? j.commandTriggersConfigured : undefined,
+    blockedUsersConfigured: typeof j?.blockedUsersConfigured === 'boolean' ? j.blockedUsersConfigured : undefined,
     autoboundChatCount: j?.autoboundChatCount ?? 0,
     // 当前 oncall 绑定数。旧 daemon 不回这个字段 → null，页面只显示自动绑定过的数量。
     oncallChatCount: typeof j?.oncallChatCount === 'number' ? j.oncallChatCount : null,
@@ -313,7 +318,8 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
       : null,
     messageQuotaDefaultLimit: typeof j?.messageQuotaDefaultLimit === 'number' ? j.messageQuotaDefaultLimit : null,
     p2pMode: j?.p2pMode === 'thread' ? 'thread' : j?.p2pMode === 'group' ? 'group' : 'chat',
-    envelopeInjection: j?.envelopeInjection === 'auto' ? 'auto' : 'off',
+    // Read-only compatibility field for stale Dashboard chunks: hook injection is now default-on.
+    envelopeInjection: 'auto',
     topicUnavailablePolicy: j?.topicUnavailablePolicy === 'stop' ? 'stop' : 'legacy',
     replyDelivery: j?.replyDelivery === 'transcript' ? 'transcript' : 'send',
     promptInjection: j?.promptInjection === 'none' ? 'none' : 'default',
@@ -390,6 +396,7 @@ export function sparseOverridesFromRawBotConfig(rawEntry: any): {
   grantDelegateBots: string[] | undefined;
   archiveCodex: boolean | undefined;
   taskRouting: unknown;
+  sessionOwnerReminder: SessionOwnerReminderConfig | null;
 } {
   return {
     quotaFallbackBot: rawEntry?.quotaFallbackBot,
@@ -414,6 +421,8 @@ export function sparseOverridesFromRawBotConfig(rawEntry: any): {
     archiveCodex: typeof rawEntry?.archiveCodex === 'boolean' ? rawEntry.archiveCodex : undefined,
     // 离线 bot 也带回已保存的任务分配画像，避免 daemon 离线时 Bot 配置页把画像显示为空。
     taskRouting: rawEntry?.taskRouting,
+    // 离线 Bot 也带回已保存的主人提醒；缺省/非法值保持 null，由编辑器使用共享默认值。
+    sessionOwnerReminder: normalizeSessionOwnerReminderConfig(rawEntry?.sessionOwnerReminder) ?? null,
   };
 }
 

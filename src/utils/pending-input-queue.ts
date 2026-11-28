@@ -4,11 +4,14 @@ import type {
   TrustedCaller,
   VcMeetingImTurnOrigin,
 } from '../types.js';
+import { parseScheduledTurnId } from '../core/scheduled-turn-provenance.js';
+import type { Session } from '../types.js';
 import { sameTrustedPrincipal } from '../core/active-turn-authority.js';
 import { isPersonActorTurnId } from '../core/workflow-event-turn.js';
 import type { LinkRefMode } from '../services/link-ref-types.js';
 
 export interface PendingCliInput {
+  scheduledRun?: Session['scheduledRun'];
   queueAfterActiveTurn?: true;
   content: string;
   /** Refreshed catalog parked for the TraeX RPC write edge; folded into
@@ -126,6 +129,24 @@ export function handoffQueuedDurableInputsOnBackendExit(
   return handedOff;
 }
 
+/** Remove only at-most-once inputs whose backend generation ended. Ordinary
+ * inputs and an intentional TraeX recovery restart keep their existing queue
+ * ownership. Returning the exact removed items lets probes prove that a
+ * deferred precheck cannot recreate them after the daemon terminalizes them. */
+export function dropNoReplayPendingInputsOnBackendExit(
+  pending: PendingCliInput[],
+  opts: { intentionalRestart: boolean },
+): PendingCliInput[] {
+  const dropped: PendingCliInput[] = [];
+  for (let index = pending.length - 1; index >= 0; index -= 1) {
+    const item = pending[index]!;
+    if (item.noReplay !== true || (opts.intentionalRestart && item.traexAutoModelRecovery)) continue;
+    dropped.unshift(item);
+    pending.splice(index, 1);
+  }
+  return dropped;
+}
+
 /** Whether an input must wait for the active turn's real prompt boundary.
  *  The explicit flag marks collaborative/durable serial inputs; a cross-chat
  *  task continuation is serial on its own even when the flag was not carried
@@ -148,6 +169,44 @@ export function inputForcesSerialTurn(
     || !!activeCaller?.taskContinuation;
 }
 
+export function shouldDeferScheduledInitialPrompt(opts: { turnId?: string; adoptMode?: boolean }): boolean {
+  return !opts.adoptMode && !!(opts.turnId && parseScheduledTurnId(opts.turnId));
+}
+
+/** Parsing legacy ids permits queue cleanup only; host admission still authenticates every write. */
+export function automaticScheduledInputTask(item: PendingCliInput): string | undefined {
+  const taskId = item.turnId ? parseScheduledTurnId(item.turnId) : null;
+  if (!taskId || item.dispatchAttempt !== undefined || item.durablePrimaryInbox
+    || item.noReplay || item.taskContinuation || item.traexAutoModelRecovery
+    || item.traexAutoModelContinuation || item.queuedActivationToken
+    || item.vcMeetingImTurnOrigin || item.trustedCaller?.source === 'failed_turn_recovery') return undefined;
+  if (item.scheduledRun?.recoveryOfTurnId) return undefined;
+  if (item.scheduledRun) return item.scheduledRun.trigger === 'scheduler'
+    && item.scheduledRun.taskId === taskId && item.scheduledRun.turnId === item.turnId ? taskId : undefined;
+  return item.queueAfterActiveTurn ? taskId : undefined;
+}
+
+export function scheduledRecoveryInputTask(item: PendingCliInput): string | undefined {
+  const taskId = item.turnId ? parseScheduledTurnId(item.turnId) : null;
+  const run = item.scheduledRun;
+  if (!taskId || !run?.recoveryOfTurnId || run.taskId !== taskId || run.turnId !== item.turnId
+    || parseScheduledTurnId(run.recoveryOfTurnId) !== taskId) return undefined;
+  return taskId;
+}
+
+export function coalesceAutomaticScheduledInputs(pending: PendingCliInput[]): PendingCliInput[] {
+  const seen = new Set<string>();
+  const dropped: PendingCliInput[] = [];
+  for (let index = pending.length - 1; index >= 0; index--) {
+    const item = pending[index]!;
+    const taskId = automaticScheduledInputTask(item);
+    if (!taskId) continue;
+    if (seen.has(taskId)) dropped.unshift(...pending.splice(index, 1));
+    else seen.add(taskId);
+  }
+  return dropped;
+}
+
 export function mergeQueuedCliInput(
   pending: PendingCliInput[],
   next: PendingCliInput,
@@ -159,7 +218,8 @@ export function mergeQueuedCliInput(
   // must likewise start its own turn). Structured Codex App turns also carry
   // per-message attribution/context, so concatenating only their visible text
   // would drop or mis-attach the sidecar.
-  if (tail.queueAfterActiveTurn || next.queueAfterActiveTurn
+  if (automaticScheduledInputTask(tail) || automaticScheduledInputTask(next)
+    || tail.queueAfterActiveTurn || next.queueAfterActiveTurn
     || tail.dispatchAttempt !== undefined || next.dispatchAttempt !== undefined
     || tail.codexAppDispatchId || next.codexAppDispatchId
     || tail.traexAutoModelRecovery || next.traexAutoModelRecovery
@@ -362,18 +422,17 @@ export function terminalReleasesDurableTurn(
     && current.dispatchAttempt === terminal.dispatchAttempt;
 }
 
-/** A serial schedule prefix may wait indefinitely behind an active task.
- * Let its authenticated human controller steer without changing the order of
- * other user messages or crossing a durable/group/continuation boundary. */
-export function promoteInteractiveInputPastSchedules(
+function promoteInteractiveInputPastPrefix(
   pending: PendingCliInput[],
   mayControlActiveTurn: (input: PendingCliInput) => boolean,
+  isBlockedSchedule: (item: PendingCliInput) => boolean,
+  requireSerialSchedule = true,
 ): boolean {
   let index = 0;
   while (index < pending.length) {
     const item = pending[index]!;
-    if (item.trustedCaller?.source !== 'schedule_creator'
-      || !item.queueAfterActiveTurn || item.dispatchAttempt !== undefined
+    if (!isBlockedSchedule(item)
+      || (requireSerialSchedule && !item.queueAfterActiveTurn) || item.dispatchAttempt !== undefined
       || item.durablePrimaryInbox || item.queuedActivationToken
       || item.vcMeetingImTurnOrigin || item.taskContinuation || item.noReplay) break;
     index++;
@@ -388,4 +447,25 @@ export function promoteInteractiveInputPastSchedules(
   pending.splice(index, 1);
   pending.unshift(input);
   return true;
+}
+
+/** A serial schedule prefix may wait indefinitely behind an active task.
+ * Let its authenticated human controller steer without changing the order of
+ * other user messages or crossing a durable/group/continuation boundary. */
+export function promoteInteractiveInputPastSchedules(
+  pending: PendingCliInput[],
+  mayControlActiveTurn: (input: PendingCliInput) => boolean,
+): boolean {
+  return promoteInteractiveInputPastPrefix(pending, mayControlActiveTurn,
+    item => item.trustedCaller?.source === 'schedule_creator');
+}
+
+/** A quota hold applies only to automatic ticks, not to an owner's urgent input.
+ * Promote across precisely the inputs that the quota gate would hold. */
+export function promoteInteractiveInputPastQuotaSchedules(
+  pending: PendingCliInput[],
+  mayControlActiveTurn: (input: PendingCliInput) => boolean,
+): boolean {
+  return promoteInteractiveInputPastPrefix(pending, mayControlActiveTurn,
+    item => automaticScheduledInputTask(item) !== undefined, false);
 }

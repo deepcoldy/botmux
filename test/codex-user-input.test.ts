@@ -25,11 +25,11 @@ beforeEach(() => {
 });
 describe('Codex native user input bridge', () => {
   it('marks standalone native questions without changing their authenticated origin or recipient', async () => {
-    await postCodexAsk({ ...context, standalone: true }, [{ prompt: 'Native question', multiSelect: false,
+    await postCodexAsk({ ...context, standalone: true, requestId: 'native-question-request' }, [{ prompt: 'Native question', multiSelect: false,
       options: [{ key: '1', label: 'A' }, { key: '2', label: 'B' }] }]);
     expect(JSON.parse(mocks.post.mock.calls[0][2].body)).toMatchObject({ sessionId: context.sessionId,
       larkAppId: context.larkAppId, chatId: context.chatId, rootMessageId: context.rootMessageId,
-      originTurnId: context.originTurnId, originKind: NATIVE_STANDALONE_ASK_ORIGIN });
+      originTurnId: context.originTurnId, originKind: NATIVE_STANDALONE_ASK_ORIGIN, requestId: 'native-question-request' });
   });
   it('uses a fresh broker origin for a restored async question', async () => {
     mocks.post.mockImplementation(async () => Response.json(result));

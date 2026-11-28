@@ -15,7 +15,7 @@
  * Run:  npx vitest run --project unit test/turn-cli-identity.test.ts
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -83,6 +83,12 @@ const { assertScheduledAuthorityCurrent, isManualScheduleRun, isManualScheduledT
 const { getLarkToolDelegation, rememberLarkToolDelegation } = await import('../src/core/lark-tool-delegation.js');
 const { activeIdentityTurns } = await import('../src/core/active-identity-turns.js');
 const { beginReplyTargetTurn } = await import('../src/core/reply-target.js');
+import * as scheduler from '../src/core/scheduler.js';
+import { ScheduleAuthorityStore } from '../src/services/schedule-authority-store.js';
+import { executeScheduledTaskForTargets, ScheduleTargetExecutionError } from '../src/services/schedule-target-executor.js';
+import * as scheduleStore from '../src/services/schedule-store.js';
+import { dashboardEventBus } from '../src/core/dashboard-events.js';
+import { config } from '../src/config.js';
 
 const APP = 'cli_bot';
 const ALICE = 'ou_alice';
@@ -100,7 +106,12 @@ beforeEach(() => {
   forgetBytedcliIdentityRenewals();
   vi.mocked(renewBytedcliJwts).mockReset().mockResolvedValue(null);
 });
-afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+afterEach(() => {
+  scheduler.stopScheduler();
+  scheduler.setScheduleAuthorityStore(null);
+  scheduler.setParkedRunCancellationHandler(null);
+  rmSync(dir, { recursive: true, force: true });
+});
 
 function botConfig(triggerUserAuth: unknown = { enabled: true, tools: ['lark-cli'] }) {
   return {
@@ -710,6 +721,7 @@ describe('target daemon consumes signed message authority', () => {
       noteScheduledIdentityRestored: vi.fn(),
       isAutoCompletedSchedule, buildUntilDoneRunPrompt, scheduleTimeZone,
       scheduleStore: { effectiveScheduleChatIds: (task: any) => task.chatIds ?? [task.chatId] },
+      randomUUID,
       getDashboardAdminOpenIds: () => [ALICE],
       canOperate: vi.fn((_appId: string, _chatId: string, openId?: string) => openId === ALICE),
       scheduleAuthorityStore: undefined as any,
@@ -749,6 +761,7 @@ describe('target daemon consumes signed message authority', () => {
           compilerOptions: { target: ts.ScriptTarget.ES2022 },
         }).outputText;
         new Function('scope', 'with (scope) { ' + code + ' }')({
+          getAllBots: () => [],
           ...scopeValues, prepareTurnCliIdentity: handlers.prepareTurnCliIdentity, ...scope,
         });
       },
@@ -875,7 +888,15 @@ describe('target daemon consumes signed message authority', () => {
     let execute: (task: any, context: any) => Promise<void>;
     let dispatches = 0;
     h.installSchedulerCallback({
-      cfg: { larkAppId: APP }, scheduler: { setExecuteCallback: (fn: typeof execute) => { execute = fn; } },
+      cfg: { larkAppId: APP }, scheduler: {
+        setExecuteCallback: (fn: typeof execute) => { execute = fn; },
+        // The production callback reads the parked-run state and persists the
+        // per-target dispatch states. These tests run fresh (no parked run).
+        getRuntimeTask: () => undefined,
+        markDeferredTargetDispatching: () => false,
+        markDeferredTargetAccepted: () => false,
+        parkDeferredRun: () => false,
+      },
       executeScheduledTaskWithPrecondition: async (_task: any, _app: any, run: () => Promise<void>) => {
         await run(); return 'executed';
       },
@@ -1685,7 +1706,13 @@ describe('target daemon consumes signed message authority', () => {
     let execute: (task: any, context: any) => Promise<void>;
     let dispatches = 0;
     h.installSchedulerCallback({
-      cfg: { larkAppId: APP }, scheduler: { setExecuteCallback: (fn: typeof execute) => { execute = fn; } },
+      cfg: { larkAppId: APP }, scheduler: {
+        setExecuteCallback: (fn: typeof execute) => { execute = fn; },
+        getRuntimeTask: () => undefined,
+        markDeferredTargetDispatching: () => false,
+        markDeferredTargetAccepted: () => false,
+        parkDeferredRun: () => false,
+      },
       executeScheduledTaskWithPrecondition: async (_task: any, _app: any, run: () => Promise<void>) => {
         await run(); return 'executed';
       },
@@ -1724,7 +1751,13 @@ describe('target daemon consumes signed message authority', () => {
     let dispatches = 0;
     let revokeOnWait = true;
     h.installSchedulerCallback({
-      cfg: { larkAppId: APP }, scheduler: { setExecuteCallback: (fn: typeof execute) => { execute = fn; } },
+      cfg: { larkAppId: APP }, scheduler: {
+        setExecuteCallback: (fn: typeof execute) => { execute = fn; },
+        getRuntimeTask: () => undefined,
+        markDeferredTargetDispatching: () => false,
+        markDeferredTargetAccepted: () => false,
+        parkDeferredRun: () => false,
+      },
       executeScheduledTaskWithPrecondition: async (_task: any, _app: any, run: () => Promise<void>) => {
         if (revokeOnWait) {
           revokeOnWait = false;
@@ -1755,6 +1788,91 @@ describe('target daemon consumes signed message authority', () => {
     task.lastRunId = 'test-run-2';
     await execute!(task, { runId: 'test-run-2', trigger: 'scheduler', startedAt: new Date().toISOString() });
     expect(dispatches).toBe(1);
+  });
+
+  it('settles an ordinary non-TRAE dispatch error once without entering TRAE deferred retries', async () => {
+    const h = await targetHarness();
+    const previousDataDir = config.session.dataDir;
+    const authority = ScheduleAuthorityStore.open(dir);
+    const appendScheduleRunLog = vi.fn();
+    const publish = vi.spyOn(dashboardEventBus, 'publish');
+    let dispatches = 0;
+    try {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-11-09T15:00:00Z'));
+      config.session.dataDir = dir;
+      scheduleStore.setScheduleScope(APP);
+      authority.initializeApp(APP, []);
+      scheduler.setScheduleAuthorityStore(authority);
+      scheduler.setOwnerFilter(APP, true);
+      const task = scheduler.addTask({
+        id: 'nontrae1', name: 'ordinary CLI dispatch failure', schedule: 'every 30m',
+        prompt: 'check', workingDir: dir, chatId: 'oc_chat', larkAppId: APP,
+        creatorLarkAppId: APP,
+        owner: { kind: 'human', openId: ALICE, unionId: 'on_alice' },
+        repeat: { times: 2, completed: 0 },
+      });
+      h.scopeValues.scheduleAuthorityStore = authority;
+      h.scopeValues.getBot = () => ({
+        config: { ...botConfig({ enabled: false }), cliId: 'claude-code' },
+      });
+      (h.scopeValues as any).getAllBots = () => [h.scopeValues.getBot()];
+      h.installSchedulerCallback({
+        cfg: { larkAppId: APP, cliId: 'traex' },
+        scheduler,
+        executeScheduledTaskWithPrecondition: async (_task: any, _app: any, run: () => Promise<void>) => {
+          await run(); return 'executed';
+        },
+        executeScheduledTaskForTargets,
+        withBotTurnAdmission: (_app: any, run: () => Promise<void>) => run(),
+        activeSessions: new Map(), refreshCliVersion: vi.fn(),
+        ScheduleTargetExecutionError,
+        resolveScheduleRunLogErrorDetails: (_precondition: any, error: Error) => ({ error: error.message }),
+        executeScheduledTask: async (_task: any, _active: any, _refresh: any, _prompt: any, runtime: any) => {
+          dispatches += 1;
+          const selectedSession = {
+            ...h.ds,
+            session: {
+              ...h.ds.session,
+              cliId: 'claude-code',
+              cliLaunchSnapshot: { cliId: 'claude-code' },
+            },
+          };
+          expect(runtime.onBeforeDispatch(runtime.turnId, selectedSession)).toBe(true);
+          throw new Error('working directory disappeared');
+        },
+        appendScheduleRunLog,
+      });
+
+      expect(scheduler.runNow(task.id)).toEqual({ ok: true });
+      for (let i = 0; i < 20 && scheduler.getRuntimeTask(task.id, APP)?.lastStatus !== 'error'; i++) {
+        await vi.advanceTimersByTimeAsync(0);
+      }
+      const settled = scheduler.getRuntimeTask(task.id, APP)!;
+      expect(settled.lastStatus).toBe('error');
+      expect(settled.lastError).toBe('working directory disappeared');
+      expect(settled.deferredRun).toBeUndefined();
+      expect(settled.repeat?.completed).toBe(1);
+      expect(appendScheduleRunLog.mock.calls.filter(([entry]) => entry.outcome === 'error')).toHaveLength(1);
+      expect(publish.mock.calls.filter(([event]) => event.type === 'schedule.fired')).toHaveLength(1);
+
+      // The ordinary cadence is still 30 minutes away. Ten scheduler ticks must
+      // not turn this one CLI failure into a TRAE handoff retry storm.
+      scheduler.startScheduler();
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+      expect(dispatches).toBe(1);
+      expect(scheduler.getRuntimeTask(task.id, APP)?.deferredRun).toBeUndefined();
+      expect(appendScheduleRunLog.mock.calls.filter(([entry]) => entry.outcome === 'error')).toHaveLength(1);
+      expect(publish.mock.calls.filter(([event]) => event.type === 'schedule.fired')).toHaveLength(1);
+    } finally {
+      scheduler.stopScheduler();
+      scheduler.setScheduleAuthorityStore(null);
+      scheduler.setParkedRunCancellationHandler(null);
+      authority.close();
+      config.session.dataDir = previousDataDir;
+      publish.mockRestore();
+      vi.useRealTimers();
+    }
   });
 });
 

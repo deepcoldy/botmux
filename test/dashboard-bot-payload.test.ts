@@ -4,8 +4,32 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { invalidateGlobalConfigCache } from '../src/global-config.js';
 import { botDefaultsPayload, botSummaryPayload, brandMapByAppId, mergeBotOncallFields, sparseOverridesFromRawBotConfig, withConfiguredCliId } from '../src/dashboard/bot-payload.js';
+import { DEFAULT_SESSION_OWNER_REMINDER } from '../src/core/session-owner-reminder-config.js';
 
 describe('dashboard bot payload helpers', () => {
+  it('exposes whether command triggers and blocked users are customized without their contents', () => {
+    const bot = { larkAppId: 'demo-bot' };
+    const row = botDefaultsPayload(bot, { commandTriggersConfigured: true, blockedUsersConfigured: true,
+      commandTriggers: { commands: ['demo'] }, blockedUsers: ['demo-user'] });
+    expect(row).toMatchObject({ commandTriggersConfigured: true, blockedUsersConfigured: true });
+    expect(row).not.toHaveProperty('commandTriggers');
+    expect(row).not.toHaveProperty('blockedUsers');
+    const oldDaemon = botDefaultsPayload(bot, {});
+    expect({
+      commandTriggersConfigured: oldDaemon.commandTriggersConfigured,
+      blockedUsersConfigured: oldDaemon.blockedUsersConfigured,
+    }).toEqual({ commandTriggersConfigured: undefined, blockedUsersConfigured: undefined });
+    expect(botDefaultsPayload(bot, { commandTriggersConfigured: false, blockedUsersConfigured: false }))
+      .toMatchObject({ commandTriggersConfigured: false, blockedUsersConfigured: false });
+  });
+
+  it('preserves valid owner reminders for offline bots and degrades missing or malformed values to null', () => {
+    const saved = { ...DEFAULT_SESSION_OWNER_REMINDER, enabled: true };
+    expect(sparseOverridesFromRawBotConfig({ sessionOwnerReminder: saved }).sessionOwnerReminder).toEqual(saved);
+    expect(sparseOverridesFromRawBotConfig({}).sessionOwnerReminder).toBeNull();
+    expect(sparseOverridesFromRawBotConfig({ sessionOwnerReminder: { enabled: true } }).sessionOwnerReminder).toBeNull();
+  });
+
   it.each([
     [false, false],
     [true, true],
@@ -445,13 +469,15 @@ describe('dashboard bot payload helpers', () => {
       .toMatchObject({ pinStreamingCard: false });
   });
 
-  it('projects hook envelope injection so the dashboard preserves it after refresh', () => {
+  it('projects read-only hook envelope compatibility field as auto across all daemon payloads', () => {
     const daemon = { larkAppId: 'app_claude', botName: 'Claude', cliId: 'claude-code' };
-    expect(botDefaultsPayload(daemon, {})).toMatchObject({ envelopeInjection: 'off' });
+    expect(botDefaultsPayload(daemon, {})).toMatchObject({ envelopeInjection: 'auto' });
     expect(botDefaultsPayload(daemon, { envelopeInjection: 'auto' }))
       .toMatchObject({ envelopeInjection: 'auto' });
+    expect(botDefaultsPayload(daemon, { envelopeInjection: 'off' }))
+      .toMatchObject({ envelopeInjection: 'auto' });
     expect(botDefaultsPayload(daemon, { envelopeInjection: 'invalid' }))
-      .toMatchObject({ envelopeInjection: 'off' });
+      .toMatchObject({ envelopeInjection: 'auto' });
   });
 
   it('projects reply delivery effective value + CLI default + CLI support so the dashboard toggle survives refresh', () => {

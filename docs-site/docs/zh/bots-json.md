@@ -424,6 +424,7 @@ botmux 用 app-server 协议运行 Codex 时，拿不到 Codex App 内置的 Chr
 |------|------|
 | `allowedUsers` | 管理员名单，能执行管理命令、点卡片按钮。推荐写完整邮箱、手机号或 `on_xxx`；`ou_xxx` 只对签发它的那个应用有效，不能从别的 bot 复制过来。配了 `allowedChatGroups` 时至少要有一个管理员 |
 | `ownerOpenId` | 显式指定主管理员 `ou_xxx`。只有它仍在 `allowedUsers` 里时才算数；不填时取 `allowedUsers` 里第一个人 |
+| `ownerUnionId` | 用 `on_xxx` 显式指定主管理员，可在同一人的多个 bot 间复制。这个 `on_xxx` 必须同时写在 `allowedUsers` 里并解析成功才算数；与 `ownerOpenId` 同时填写时两者必须是同一个人，否则视为未指定主管理员 |
 | `allowedChatGroups` | 可对话的群（`oc_xxx`）。群里任何人都能和 bot 对话，管理操作仍只认 `allowedUsers` |
 | `p2pOpen` | `true` 时飞书应用可用范围内的任何人都能私聊 bot（只能对话）。群聊不受影响 |
 | `oncallChats` | oncall 绑定：`[{ "chatId": "oc_xxx", "workingDir": "~/projects/foo" }]`。见 [oncall](/oncall) |
@@ -630,9 +631,10 @@ Dashboard 的「Bot 配置 → 消息卡片 → 实时卡片按钮」可以直�
 | `senderTagHideEmail` | 默认关闭。开启后 `<sender>` 标签里不带邮箱，姓名和 ID 保留 |
 | `hideLocalAddresses` | 默认关闭：模型回复原样发到飞书。开启后把开发机路径和本机服务地址挡在回复外。见下方[隐藏开发机地址](#hide-local-addresses) |
 | `promptInjection` | `"default"`（默认）或 `"none"`。`none` 是零注入模式：botmux 不加任何系统提示和提醒，只传任务原文和附件，并自动回传最终答复。见下方说明 |
-| `envelopeInjection` | 仅 Claude Code：`auto` 时把每轮的提醒内容改由 hook 注入，终端输入框里只剩消息本身；默认 `off` 保持原样 |
 | `topicUnavailablePolicy` | 原话题被删除或不可用时怎么办。见[原话题不可用策略](/topic-unavailable-policy) |
 | `turnResults` | 提供每一轮的结构化结果，供外部系统读取。见[单轮结果](/turn-results) |
+
+> Claude Code 在本地后端且已安装 `UserPromptSubmit` hook 时，默认通过 hook 注入每轮上下文（输入框只保留消息本身；零注入、远端后端、非回环沙盒或未安装 hook 时自动回退内联）。旧配置中已有的 `envelopeInjection` 字段会被兼容忽略，不会引起解析报错。
 
 ### 自动转发最终回复（`replyDelivery: "transcript"`）
 
@@ -703,7 +705,7 @@ Dashboard 的「Bot 配置 → 消息卡片 → 实时卡片按钮」可以直�
 - 回复处理和每轮提醒立即生效；系统提示里的完整规则从下一个新会话起生效。
 - Dashboard「Bot 配置 → 消息卡片 → 开发机地址」里的开关改的就是这个字段。
 
-### 零注入模式（`promptInjection: "none"`）
+### 零注入模式（`promptInjection: "none"`） {#zero-prompt-injection}
 
 适合「主 bot 派活、子 bot 专心执行」的多 Agent 流水线，或者你就是不想让 botmux 往 prompt 里加任何东西。
 

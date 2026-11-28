@@ -29,9 +29,20 @@ export class AntigravitySessionLog {
     sideQuestion?: { conversationId: string; outcome: string };
   } = {};
 
-  constructor(sessionId: string, root = join(homedir(), '.gemini', 'antigravity-cli')) {
+  constructor(
+    sessionId: string,
+    root = join(homedir(), '.gemini', 'antigravity-cli'),
+    options: { startAtEnd?: boolean } = {},
+  ) {
     this.path = antigravitySessionLogPath(sessionId, root);
     mkdirSync(dirname(this.path), { recursive: true });
+    if (options.startAtEnd) {
+      try {
+        const stat = statSync(this.path);
+        this.offset = stat.size;
+        this.inode = `${stat.dev}:${stat.ino}`;
+      } catch { /* A cold spawn may not have created its log yet. */ }
+    }
   }
 
   /** True once `agy --log-file` has created and written to this native log. */

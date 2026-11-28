@@ -125,6 +125,17 @@ describe('bot-config store', () => {
     return { registry, store, pinStreamingCardChange, sessionGroups, awaySummaryFocusRevocation };
   }
 
+  it('assistantGroupChat: an immediate boolean that persists and reaches the live config', async () => {
+    const { registry, store } = await loaded({ assistantMode: true });
+    const spec = store.findConfigField('assistantGroupChat')!;
+    expect(spec).toMatchObject({ kind: 'boolean', effect: 'immediate' });
+    expect((await store.applyConfigField('app_default', spec, true)).ok).toBe(true);
+    expect(registry.getBot('app_default').config.assistantGroupChat).toBe(true);
+    expect(readConfig().assistantGroupChat).toBe(true);
+    expect((await store.applyConfigField('app_default', spec, false)).ok).toBe(true);
+    expect(registry.getBot('app_default').config.assistantGroupChat).not.toBe(true);
+  });
+
   it('publishes recap revocation to live config before a queued card settlement', async () => {
     const { registry, store, awaySummaryFocusRevocation } = await loaded({ replyCardRecap: true });
     const { noteRecapCard, noteRecapTurnStarted } = await import('../src/core/turn-recap-state.js');
@@ -1016,6 +1027,18 @@ describe('bot-config store', () => {
     expect(spec).toBeDefined();
     expect(store.coerceConfigValue(spec!, JSON.stringify(value))).toEqual({ ok: true, value });
     expect(registry.getBot('app_default').config.inviteConfig).toEqual(value);
+  });
+
+  it('retires envelopeInjection from CONFIG_FIELDS while tolerating legacy bots.json entries on unrelated edits', async () => {
+    const { registry, store } = await loaded({ envelopeInjection: 'off' });
+    expect(store.findConfigField('envelopeInjection')).toBeUndefined();
+    expect(registry.getBot('app_default').config).not.toHaveProperty('envelopeInjection');
+
+    const p2pSpec = store.findConfigField('p2pMode')!;
+    expect(await store.applyConfigField('app_default', p2pSpec, 'thread')).toMatchObject({ ok: true });
+    expect(readConfig()).toMatchObject({ p2pMode: 'thread', envelopeInjection: 'off' });
+    expect(registry.loadBotConfigs()[0].p2pMode).toBe('thread');
+    expect(registry.loadBotConfigs()[0]).not.toHaveProperty('envelopeInjection');
   });
 
   it('persists Oncall button settings without changing feedback or chat overrides', async () => {

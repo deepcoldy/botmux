@@ -297,6 +297,23 @@ describe('native_input_consumed fencing', () => {
     expect(ds.session.workerGeneration).toBeGreaterThanOrEqual(1);
   });
 
+  it('forwards a confirmed steer receipt only from its live worker generation', async () => {
+    const onNativeInputConsumed = vi.fn();
+    initWorkerPool({ sessionReply: vi.fn(), getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn(), onNativeInputConsumed } as any);
+    const worker = makeFakeWorker();
+    const ds = makeDs(worker);
+    ds.session.cliId = 'traex';
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const receipt = { type: 'native_input_consumed', turnId: 'om_correction', proofKind: 'codex_rpc_turn_steer', nativeSessionId: 'native-known', nativeTurnId: 'active-native' };
+    worker.emit('message', receipt);
+    await flush();
+    expect(onNativeInputConsumed).toHaveBeenCalledWith(ds, receipt, { workerGeneration: ds.session.workerGeneration });
+    ds.worker = makeFakeWorker();
+    worker.emit('message', receipt);
+    await flush();
+    expect(onNativeInputConsumed).toHaveBeenCalledTimes(1);
+  });
+
   it('ignores receipts from a replaced worker or a changed generation', async () => {
     const onNativeInputConsumed = vi.fn();
     initWorkerPool({ sessionReply: vi.fn(), getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn(), onNativeInputConsumed } as any);

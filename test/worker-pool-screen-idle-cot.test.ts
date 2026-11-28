@@ -185,11 +185,11 @@ describe('screen_update working -> idle CoT finalization (real adapter registry)
   });
 
   it.each<[string, SetupOptions]>([
-    ['ordinary antigravity', { cliId: 'antigravity' }],
     ['opencode2 without runner framing', { cliId: 'opencode2' }],
     ['kimi', { cliId: 'kimi' }],
     ['dsh-tui without a runner terminal', { cliId: 'dsh', dshRuntime: 'tui' }],
     ['cursor with scratch disabling the host bridge', { cliId: 'cursor', scratch: true }],
+    ['antigravity with scratch hiding the transcript', { cliId: 'antigravity', scratch: true }],
     ['adopted seed without a spawned Claude-family bridge', { cliId: 'seed', adopted: true }],
   ])('finalizes CoT on working -> idle for %s', (_label, opts) => {
     const { ds, worker } = setup(opts);
@@ -199,7 +199,7 @@ describe('screen_update working -> idle CoT finalization (real adapter registry)
   });
 
   it('clears the one-shot CoT force and cached thinking on idle finalization', () => {
-    const { ds, worker } = setup({ cliId: 'antigravity' });
+    const { ds, worker } = setup({ cliId: 'kimi' });
     ds.cotForced = true;
     ds.lastThinkingUpdate = {
       turnId: 'om_turn', dispatchAttempt: 1, entries: [{ kind: 'thinking', text: 'stale' }],
@@ -211,6 +211,7 @@ describe('screen_update working -> idle CoT finalization (real adapter registry)
   });
 
   it.each<[string, SetupOptions]>([
+    ['ordinary antigravity local terminal', { cliId: 'antigravity' }],
     ['antigravity zero-prompt', { cliId: 'antigravity', promptInjection: 'none' }],
     ['antigravity adopt', { cliId: 'antigravity', adopted: true }],
     ['antigravity ACP', { cliId: 'antigravity', agyTransport: 'acp' }],

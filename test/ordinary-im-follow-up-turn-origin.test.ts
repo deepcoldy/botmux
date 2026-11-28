@@ -245,10 +245,13 @@ describe('ordinary IM follow-up turn origin', () => {
     await s.boot();
     const openingCapability = await s.writeTurn(OPENING, caller('ou_opening_sender'));
     await s.relayRebind();
-    s.ds.pendingSuspendReason = 'cli_install_changed'; s.ds.pendingSuspendGeneration = 1;
 
     // The CLI is still on the opening turn: the worker queues the follow-up.
+    // It is handed over BEFORE the install-change reclaim is requested, so it
+    // belongs to this worker; input arriving after the request is instead held
+    // for the replacement runtime (covered by the PR2 reclaim tests).
     await s.queueFollowUp(s.deliverFollowUp());
+    s.ds.pendingSuspendReason = 'cli_install_changed'; s.ds.pendingSuspendGeneration = 1;
     expect(workerPool.hasPendingOrdinaryImDelivery(s.ds)).toBe(false);
     expect(workerPool.hasUnacceptedCliInput(s.ds)).toBe(true);
 

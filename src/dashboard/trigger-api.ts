@@ -105,8 +105,9 @@ export async function dispatchTriggerRequest(
   logContext?: TriggerDispatchLogContext,
 ): Promise<{ status: number; body: TriggerResponse }> {
   // Both turn and workflow are proxied by botId to the owning daemon. Requests
-  // carrying host-only fields use /api/trigger/host so older daemons 404 rather
-  // than silently dropping them; the daemon IPC handler dispatches turn vs workflow.
+  // carrying host-only fields use /api/trigger/host, and requests carrying
+  // actorUnionId use /api/trigger/owner-union, so older daemons 404 rather than
+  // silently dropping them; the daemon IPC handler dispatches turn vs workflow.
   const botId = body.target.botId;
   if (!botId) {
     return {
@@ -116,9 +117,12 @@ export async function dispatchTriggerRequest(
   }
 
   const hostFields = body.runAs !== undefined || body.options?.workingDir !== undefined;
-  const daemonPath = hostFields
-    ? '/api/trigger/host'
-    : body.actor === 'owner' ? '/api/trigger/owner' : '/api/trigger';
+  const ownerUnion = body.actorUnionId !== undefined;
+  const daemonPath = ownerUnion
+    ? '/api/trigger/owner-union'
+    : hostFields
+      ? '/api/trigger/host'
+      : body.actor === 'owner' ? '/api/trigger/owner' : '/api/trigger';
   let upstream: Response;
   try {
     upstream = await deps.proxyToDaemon(botId, daemonPath, {
@@ -147,14 +151,14 @@ export async function dispatchTriggerRequest(
     };
   }
 
-  if (hostFields && upstream.status === 404 && parsed.errorCode === undefined) {
-    // An older daemon has no /api/trigger/host route. Its router 404 carries no
+  if ((hostFields || ownerUnion) && upstream.status === 404 && parsed.errorCode === undefined) {
+    // An older daemon has no such route. Its router 404 carries no
     // errorCode; a current daemon's session_not_found DOES, so do not mask that
     // legitimate target failure as an upgrade problem.
     upstream = new Response(JSON.stringify({
       ok: false,
       errorCode: 'daemon_upgrade_required',
-      error: 'target daemon does not support runAs/options.workingDir; upgrade it before using these fields',
+      error: 'target daemon does not support runAs/options.workingDir/actorUnionId; upgrade it before using these fields',
     }), { status: 503, headers: { 'content-type': 'application/json' } });
     parsed = await upstream.json() as TriggerResponse;
   }

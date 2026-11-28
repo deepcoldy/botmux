@@ -27,7 +27,10 @@ export const MAX_SCHEDULE_RUN_LOG_ERROR_BYTES = 2 * 1024;
 export type ScheduleRunTrigger = 'scheduler' | 'dashboard';
 export type ScheduleRunOutcome = 'model_dispatched' | 'precondition_skipped' | 'calendar_skipped' | 'error';
 export type ScheduleRunPrecondition = 'not_checked' | 'none' | 'disabled' | 'passed' | 'skipped' | 'error';
-export type ScheduleRunTargetOutcome = 'model_dispatched' | 'error';
+/** Per-target dispatch fact. `deferred` means this target's input was held
+ *  behind a managed-runtime handoff; it is not a run-log terminal state and
+ *  the run's own outcome stays unset until every target settles. */
+export type ScheduleRunTargetOutcome = 'model_dispatched' | 'deferred' | 'error';
 
 export interface ScheduleRunTargetResult {
   chatId: string;
@@ -88,7 +91,7 @@ const PRECONDITIONS = new Set<ScheduleRunPrecondition>([
   'skipped',
   'error',
 ]);
-const TARGET_OUTCOMES = new Set<ScheduleRunTargetOutcome>(['model_dispatched', 'error']);
+const TARGET_OUTCOMES = new Set<ScheduleRunTargetOutcome>(['model_dispatched', 'deferred', 'error']);
 
 function assertNonEmpty(value: unknown, label: string): asserts value is string {
   if (typeof value !== 'string' || value.length === 0) {
@@ -402,6 +405,19 @@ export function queryScheduleRunLogs(
     offset,
     hasMore: offset + limit < logs.length,
   };
+}
+
+/** Host-side provenance for pre-trigger scheduledRun rows. Missing history is
+ * different from a read failure: callers may retain on the latter, but must not
+ * guess scheduler/dashboard semantics on the former. */
+export function findScheduleRunTrigger(
+  taskId: string,
+  runId: string,
+  appId: string,
+  dataDir: string = config.session.dataDir,
+): ScheduleRunTrigger | undefined {
+  return queryScheduleRunLogs(taskId, { limit: MAX_SCHEDULE_RUN_LOG_ENTRIES }, appId, dataDir)
+    .logs.find(entry => entry.id === runId)?.trigger;
 }
 
 /** Delete only the selected task's history. Returns whether a file existed. */

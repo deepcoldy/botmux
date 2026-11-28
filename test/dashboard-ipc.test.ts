@@ -7111,6 +7111,7 @@ describe('POST /api/sessions/:sessionId/resume', () => {
         expect.stringContaining('resume topic card'),
         'interactive',
         true,
+        expect.stringMatching(/^sc_r_[0-9a-f]{32}$/),
       );
       expect(deleteSpy).toHaveBeenCalledWith(appId, 'om_closed_topic_card');
       const interactiveCall = replySpy.mock.calls.findIndex(call => call[3] === 'interactive');
@@ -9583,6 +9584,8 @@ esac
           }
           createRoot(document.getElementById('root')).render(<App/>);
         `, resolveDir: process.cwd(), loader: 'tsx' },
+        // This fixture serves style.css separately and never renders the plugin market.
+        loader: { '.css': 'empty' },
         bundle: true, write: false, platform: 'browser', format: 'esm', minify: true,
       });
       const server = createServer((req, res) => {
@@ -9927,6 +9930,8 @@ esac
           }
           createRoot(document.getElementById('root')).render(<App/>);
         `, resolveDir: process.cwd(), loader: 'tsx' },
+        // This isolated control fixture never renders the plugin market.
+        loader: { '.css': 'empty' },
         bundle: true, write: false, platform: 'browser', format: 'esm', minify: true,
       });
       const server = createServer((req, res) => {
@@ -11410,7 +11415,7 @@ describe('PUT /api/bot-riff config safety (finding H)', () => {
       expect(stored).toMatchObject({
         baseUrl: 'https://riff-new.example',
         reasoningEffort: 'high',
-        // agent 已下线 UI（服务端写死 codex）——存量值按隐藏字段保留
+        // 旧 dashboard 未回写 agent 时兼容保留原值。
         agent: 'aiden',
         templateId: 'tpl-1',
         jwt: 'SECRET-JWT',
@@ -11421,6 +11426,36 @@ describe('PUT /api/bot-riff config safety (finding H)', () => {
         // UI 已不回写 injectStatusLines——存量值按隐藏字段保留。
         injectStatusLines: false,
       });
+    });
+  });
+
+  it('updates agent (codex/claude) and rejects unsupported values', async () => {
+    await withRiffBot(async (base, configPath) => {
+      const toClaude = await fetch(`${base}/api/bot-riff`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ riff: JSON.stringify({ baseUrl: 'https://riff-new.example', agent: 'claude' }) }),
+      });
+      expect(toClaude.status).toBe(200);
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].riff.agent).toBe('claude');
+
+      const toCodex = await fetch(`${base}/api/bot-riff`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ riff: JSON.stringify({ baseUrl: 'https://riff-new.example', agent: 'codex' }) }),
+      });
+      expect(toCodex.status).toBe(200);
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].riff.agent).toBe('codex');
+
+      for (const bad of ['aiden', 'bogus', '']) {
+        const invalid = await fetch(`${base}/api/bot-riff`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ riff: JSON.stringify({ baseUrl: 'https://riff-new.example', agent: bad }) }),
+        });
+        expect(invalid.status).toBe(400);
+        expect(await invalid.json()).toMatchObject({ ok: false, error: 'invalid_agent' });
+      }
     });
   });
 
@@ -11638,6 +11673,50 @@ describe('PUT /api/bot-agent riff backend pairing', () => {
     } finally {
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('returns freshly resolved sandbox fields after switching from a remote to a local CLI', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-sandbox-refresh-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-agent-sandbox-refresh';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const prevSandbox = process.env.BOTMUX_SANDBOX;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      process.env.BOTMUX_SANDBOX = 'scratch';
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'riff',
+        backendType: 'riff',
+        riff: { baseUrl: 'https://riff.example' },
+        sandbox: true,
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      const before = await (await fetch(`http://127.0.0.1:${handle.port}/api/bot-default-oncall`)).json();
+      expect(before).toMatchObject({
+        localSandboxApplies: false, effectiveSandboxMode: 'off', sandboxEnvForce: 'scratch',
+      });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'codex', model: '' }),
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({
+        cliId: 'codex',
+        localSandboxApplies: true, effectiveSandboxMode: 'scratch', sandboxEnvForce: 'scratch',
+      });
+    } finally {
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      if (prevSandbox === undefined) delete process.env.BOTMUX_SANDBOX;
+      else process.env.BOTMUX_SANDBOX = prevSandbox;
       rmSync(dir, { recursive: true, force: true });
     }
   });
@@ -13930,6 +14009,23 @@ describe('core-only public routes + readiness barrier (behavioral)', () => {
       });
       expect(signed.status).toBe(403);
       expect(await signed.json()).toMatchObject({ errorCode: 'owner_unresolved' });
+      const unionBody = JSON.stringify({ ...JSON.parse(actorBody), actorUnionId: 'on_fixture_owner' });
+      const unsignedUnion = await fetch(`${base}/api/trigger/owner-union`, { method: 'POST', headers: actorHeaders, body: unionBody });
+      expect(unsignedUnion.status).toBe(401);
+      const signedUnion = (body: string) => fetch(`${base}/api/trigger/owner-union`, {
+        method: 'POST',
+        headers: { ...actorHeaders, ...trustedHostHeaders('POST', '/api/trigger/owner-union', handle!.port) },
+        body,
+      });
+      const withoutUnion = await signedUnion(actorBody);
+      expect(withoutUnion.status).toBe(403);
+      expect(await withoutUnion.json()).toMatchObject({ errorCode: 'actor_not_allowed' });
+      const withUnion = await signedUnion(unionBody);
+      expect(withUnion.status).toBe(403);
+      expect(await withUnion.json()).toMatchObject({ errorCode: 'owner_unresolved' });
+      const publicUnion = await fetch(`${base}/api/trigger`, { method: 'POST', headers: actorHeaders, body: unionBody });
+      expect(publicUnion.status).toBe(403);
+      expect(await publicUnion.json()).toMatchObject({ errorCode: 'actor_not_allowed' });
     } finally {
       workerPool.setActiveSessionsRegistry(previousSessions ?? new Map());
     }

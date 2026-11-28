@@ -7,6 +7,7 @@ import { TurnExecutionClock } from '../src/services/turn-execution-clock.js';
 import { pendingInputMayFlush } from '../src/utils/pending-input-queue.js';
 import { workerSubmitHarness } from './helpers/worker-submit-harness.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { parseScheduledTurnId } from '../src/core/scheduled-turn-provenance.js';
 
 const prompt = (role: string, text: string) =>
   `<role>${role}</role>\n\n<user_message>${text}</user_message>`;
@@ -32,8 +33,11 @@ function rpcHarness() {
     lastInitConfig: { cliId: 'traex', codexRpcInput: true, cliSessionId: 'thread' },
     codexRpcEngine: {
       activeThreadId: 'thread', activeNativeTurnId: undefined,
+      canSteerTurn: () => false,
       sendTurn: acceptingSendTurn(),
     },
+    rpcTurnsAwaitingActivation: new Map(), rpcActiveOwners: new Map(),
+    settlingRpcTerminalOwners: new Map(), rpcTerminalHydrationOwners: new Map(),
     installAwaitingRpcActivation: vi.fn(),
     clearAwaitingRpcActivation: vi.fn(),
     runAfterAmbiguousSubmissionWrites: async (_backend: unknown, action: () => unknown) => action(),
@@ -47,6 +51,9 @@ function rpcHarness() {
     maybeQueuePostSubmitNativeSessionTitle: () => false,
     stampMojoTurnMark: vi.fn(),
   });
+  h.scope.hybridRpcInputMaySteer = loadWorkerFunction('hybridRpcInputMaySteer', h.scope);
+  h.scope.rpcTurnOwnerKey = loadWorkerFunction('rpcTurnOwnerKey', h.scope);
+  h.scope.hybridRpcTurnBlocksAdministrativeInput = loadWorkerFunction('hybridRpcTurnBlocksAdministrativeInput', h.scope);
   h.scope.publishTraexNativeContextReceipt = loadWorkerFunction('publishTraexNativeContextReceipt', h.scope);
   h.scope.invalidateTraexNativeContextReceipt = loadWorkerFunction('invalidateTraexNativeContextReceipt', h.scope);
   return h;
@@ -60,6 +67,17 @@ function deadSocketEngine() {
   return engine;
 }
 
+function scheduledRpcTurn(h: ReturnType<typeof rpcHarness>, decisions: Array<'allow' | 'reject'>, onDecision?: () => void) {
+  const turnId = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+  Object.assign(h.scope.pendingMessages[0], {
+    turnId, dispatchAttempt: undefined,
+    scheduledRun: { taskId: 'a1b2c3d4', runId: 'run-1', turnId, trigger: 'scheduler' },
+  });
+  h.scope.requestScheduledInputAdmission = vi.fn()
+    .mockImplementation(async () => { onDecision?.(); return decisions.shift() ?? 'allow'; });
+  return h.scope.pendingMessages[0];
+}
+
 /** Real per-turn submission bookkeeping, so a half-committed write is observable. */
 function withRealSubmissionScope(h: ReturnType<typeof rpcHarness>) {
   const scope = new WorkerSessionEventScope({ appId: 'cli_app', sessionId: 'sid' } as any, { workerId: 'w1', generation: 1 } as any);
@@ -71,6 +89,37 @@ function withRealSubmissionScope(h: ReturnType<typeof rpcHarness>) {
 }
 
 describe('actual worker TraeX RPC write edge', () => {
+  it('applies the late scheduled rejection before an unsettled native lifecycle can retain the input', async () => {
+    const h = rpcHarness();
+    const scheduled = scheduledRpcTurn(h, ['allow', 'reject'],
+      () => h.scope.settlingRpcTerminalOwners.set('another-owner', {}));
+    await h.flush();
+    expect(h.scope.requestScheduledInputAdmission).toHaveBeenCalledTimes(2);
+    expect(h.scope.codexRpcEngine.sendTurn).not.toHaveBeenCalled();
+    expect(h.scope.pendingMessages).toEqual([]);
+    expect(h.scope.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'turn_input_rejected', turnId: scheduled.turnId,
+    }));
+    expect(h.scope.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      message: expect.stringContaining('RPC 消息尚未发送'),
+    }));
+  });
+
+  it('retains the exact scheduled FIFO head when native lifecycle settling rejects a fully admitted write', async () => {
+    const h = rpcHarness();
+    const scheduled = scheduledRpcTurn(h, ['allow', 'allow'],
+      () => h.scope.settlingRpcTerminalOwners.set('another-owner', {}));
+    await h.flush();
+    expect(h.scope.requestScheduledInputAdmission).toHaveBeenCalledTimes(2);
+    expect(h.scope.codexRpcEngine.sendTurn).not.toHaveBeenCalled();
+    expect(h.scope.pendingMessages).toEqual([scheduled]);
+    expect(h.scope.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'turn_input_rejected' }));
+    expect(h.scope.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'user_notify', turnId: scheduled.turnId,
+      message: expect.stringContaining('RPC 消息尚未发送'),
+    }));
+  });
+
   it('publishes accepted context only after the native ACK', async () => {
     const h = rpcHarness();
     h.scope.pendingMessages[0].content = prompt('A', 'hello');
@@ -261,32 +310,81 @@ function engageHarness(opts: {
   resume?: boolean;
   firstOutcome?: 'accepted' | 'not-sent' | 'ambiguous';
   receipt?: context.TraexNativeContextReceipt;
+  startGates?: Array<Promise<void>>;
+  stopAndWaitOutcome?: 'false' | 'throw';
 }) {
   const engines: any[] = [];
   class FakeEngine {
-    appServerPid = 4242;
+    appServerPid: number;
     wsUrl = 'ws://127.0.0.1:1';
     activeThreadId: string | undefined;
     stop = vi.fn();
+    stopAndWait = vi.fn(async () => {
+      if (opts.stopAndWaitOutcome === 'throw') throw new Error('live descendant');
+      return opts.stopAndWaitOutcome === 'false' ? false : true;
+    });
     sendFirstTurn = vi.fn(async () => ({
       outcome: opts.firstOutcome ?? 'accepted',
       ...(opts.firstOutcome === 'accepted' || !opts.firstOutcome ? { nativeTurnId: 'native-1' } : {}),
     }));
-    constructor(readonly opts: any) { engines.push(this); }
-    async start() {}
+    private readonly index: number;
+    constructor(readonly opts: any) {
+      this.index = engines.length;
+      this.appServerPid = 4242 + this.index;
+      engines.push(this);
+    }
+    async start() {
+      await opts.startGates?.[this.index];
+      this.opts.onAppServerSpawn?.(this.appServerPid);
+    }
     async startThread() { this.activeThreadId = 'thread-fresh'; return 'thread-fresh'; }
     async resumeThread(id: string) { this.activeThreadId = id; return id; }
   }
   const noop = () => undefined;
+  const lease = {
+    occupantId: 'occupant-a',
+    domain: { domainKey: 'domain-a', registryPath: '/registry', skillsDir: '/skills', lockPath: '/lock' },
+    snapshot: {
+      traexPath: '/snapshots/combo-a/traex', helperPath: '/snapshots/combo-a/helper',
+      dir: '/snapshots/combo-a', comboKey: 'combo-a', snapshot: true,
+    },
+    markRunning: vi.fn(async () => {}),
+    markUnknown: vi.fn(async () => {}),
+    markDeathUnproven: vi.fn(async () => {}),
+    release: vi.fn(async () => {}),
+    abandon: vi.fn(async () => {}),
+  };
   const base: Record<string, any> = {
     ...context,
+    parseScheduledTurnId,
     CodexRpcEngine: FakeEngine,
     CliSpawnSupersededError: class extends Error {},
     CodexRpcEngineDiedDuringEngagementError: class extends Error {},
     randomBytes, currentBotmuxTurnId: undefined, followBotTraeHome: noop, larkUserNative: noop, homedir: () => '/home/fake', join: (...parts: string[]) => parts.join('/'),
     codexRpcEligible: () => true, sandboxEnabled: () => false,
     stopCodexRpcEngine: vi.fn(),
+    traexLaunchUsesSharedRuntimeGate: () => true,
+    resolveCommandEntry: (path: string) => path,
+    resolveCommandReal: (path: string) => path,
+    releaseDirForExecutable: (path: string) => `${path}/..`,
+    resolveTraexChildHome: () => '/home/trae',
+    daemonBirthIdentity: () => ({ daemonPid: 1, daemonStart: 'boot' }),
+    readProcessStartIdentity: (pid: number) => `start-${pid}`,
+    resolveInstallIdentity: () => ({}),
+    applyTraexRuntimeOwnershipEnv: (env: NodeJS.ProcessEnv, lease: any) => {
+      env.BOTMUX_TRAEX_OCCUPANT_ID = lease.occupantId;
+      env.BOTMUX_TRAEX_DOMAIN_KEY = lease.domain.domainKey;
+    },
+    acquireTraexRuntimeLease: vi.fn(async () => ({ kind: 'granted', lease })),
     rpcEngagementFence: { begin: () => 1, isCurrent: () => true, isLive: () => true, markDead: noop },
+    closeRequested: false,
+    cancelledQueuedTurnIds: new Set(),
+    pendingRpcEngagement: undefined,
+    traexRpcLeaseContext: undefined,
+    traexRuntimeLeaseContext: undefined,
+    traexSpawnLeaseContext: undefined,
+    traexLeaseSettlements: new Set(),
+    pendingTraexSpawnAbandon: undefined,
     cliSpawnGeneration: 1,
     createCliAdapterSync: () => ({ resolvedBin: '/bin/traex' }),
     // RPC hook-trust gating (PR #3515): the engine reads the global toggle and
@@ -331,6 +429,11 @@ function engageHarness(opts: {
       throw new ReferenceError(`engage harness: unstubbed worker global ${String(key)}`);
     },
   });
+  base.createTraexSpawnLeaseContext = loadWorkerFunction('createTraexSpawnLeaseContext', scope);
+  base.settleTraexSpawnLease = loadWorkerFunction('settleTraexSpawnLease', scope);
+  base.startTraexSpawnLeaseHeartbeat = loadWorkerFunction('startTraexSpawnLeaseHeartbeat', scope);
+  base.stopTraexLeaseHeartbeat = loadWorkerFunction('stopTraexLeaseHeartbeat', scope);
+  base.settleTraexRpcLease = loadWorkerFunction('settleTraexRpcLease', scope);
   base.prepareFreshTraexFirstTurn = loadWorkerFunction('prepareFreshTraexFirstTurn', scope);
   base.publishTraexNativeContextReceipt = loadWorkerFunction('publishTraexNativeContextReceipt', scope);
   base.invalidateTraexNativeContextReceipt = loadWorkerFunction('invalidateTraexNativeContextReceipt', scope);
@@ -342,7 +445,8 @@ function engageHarness(opts: {
     ...(opts.receipt ? { traexNativeContextReceipt: opts.receipt } : {}),
   };
   return {
-    base, cfg, engines,
+    base, cfg, engines, lease,
+    engageRaw: () => engage(cfg),
     engage: async () => {
       const outcome = await engage(cfg);
       // The generic catch would turn a harness gap into a silent paste fallback.
@@ -371,6 +475,15 @@ describe('actual worker TraeX RPC engagement', () => {
     expect(h.engines[0].sendFirstTurn.mock.calls[0][0]).toContain('catalog');
     expect(h.cfg.prompt).toBe(prompt('A', 'hello'));
     expect(h.base.deferredPluginSkillCatalog).toBe('<botmux_skills_refresh>catalog</botmux_skills_refresh>');
+    expect(h.lease.release).toHaveBeenCalledTimes(1);
+    expect(h.engines[0].stopAndWait.mock.invocationCallOrder[0]).toBeLessThan(h.lease.release.mock.invocationCallOrder[0]);
+  });
+
+  it.each(['false', 'throw'] as const)('keeps a not-sent RPC lease when final teardown cannot prove death (%s)', async mode => {
+    const h = engageHarness({ firstOutcome: 'not-sent', receipt: acceptedOld, stopAndWaitOutcome: mode });
+    await expect(h.engage()).resolves.toBe('not-engaged');
+    expect(h.lease.markDeathUnproven).toHaveBeenCalledWith(4242);
+    expect(h.lease.release).not.toHaveBeenCalled();
   });
 
   it('consumes the catalog with an accepted fresh first turn and fingerprints the sent text', async () => {
@@ -390,5 +503,155 @@ describe('actual worker TraeX RPC engagement', () => {
     expect(h.base.lastInitConfig.traexNativeContextReceipt).toMatchObject({
       nativeThreadId: 'thread-fresh', status: 'unknown',
     });
+  });
+
+  it('admits the RPC app-server with the frozen snapshot and records its pid', async () => {
+    const h = engageHarness({ firstOutcome: 'accepted' });
+    await expect(h.engage()).resolves.toBe('accepted');
+    expect(h.base.acquireTraexRuntimeLease).toHaveBeenCalledTimes(1);
+    expect(h.engines[0].opts.cliBin).toBe('/snapshots/combo-a/traex');
+    expect(h.engines[0].opts.env).toMatchObject({
+      TRAEX_CODE_MODE_HOST_PATH: '/snapshots/combo-a/helper',
+      BOTMUX_TRAEX_OCCUPANT_ID: 'occupant-a',
+      BOTMUX_TRAEX_DOMAIN_KEY: 'domain-a',
+    });
+    expect(h.lease.markRunning).toHaveBeenCalledWith(4242, 'start-4242');
+  });
+
+  it('does not construct an engine for an opening cancelled while the gate was waiting', async () => {
+    const h = engageHarness({ resume: false });
+    h.base.cancelledQueuedTurnIds.add('om_first');
+    await expect(h.engageRaw()).rejects.toBeInstanceOf(h.base.CliSpawnSupersededError);
+    expect(h.engines).toHaveLength(0);
+    expect(h.lease.abandon).toHaveBeenCalledTimes(1);
+    expect(h.lease.markRunning).not.toHaveBeenCalled();
+  });
+
+  it.each(['false', 'throw'] as const)('retains a spawned RPC lease when stopAndWait cannot prove group death (%s)', async mode => {
+    let openA!: () => void;
+    const gateA = new Promise<void>(resolve => { openA = resolve; });
+    const h = engageHarness({ resume: true, startGates: [gateA] });
+    let generation = 0;
+    h.base.rpcEngagementFence = {
+      begin: () => ++generation, isCurrent: (token: number) => token === generation,
+      isLive: () => true, markDead: () => undefined,
+    };
+    const resultA = h.engageRaw().then(outcome => ({ outcome }), error => ({ error }));
+    for (let i = 0; i < 30 && h.engines.length === 0; i++) await Promise.resolve();
+    if (mode === 'throw') h.engines[0].stopAndWait.mockRejectedValue(new Error('unverified descendant'));
+    else h.engines[0].stopAndWait.mockResolvedValue(false);
+    const resultB = h.engageRaw();
+    openA();
+    const a = await resultA;
+    expect((a as any).error).toBeInstanceOf(h.base.CliSpawnSupersededError);
+    await expect(resultB).resolves.toBe('resumed');
+    expect(h.engines[0].stopAndWait).toHaveBeenCalled();
+    expect(h.lease.release).not.toHaveBeenCalled();
+    expect(h.lease.abandon).not.toHaveBeenCalled();
+    expect(h.lease.markDeathUnproven).toHaveBeenCalledWith(4242);
+  });
+
+  it('abandons a stale pre-spawn lease without publishing over the replacement', async () => {
+    const h = engageHarness({ resume: true });
+    let grantA!: (value: { kind: 'granted'; lease: any }) => void;
+    const gateA = new Promise<{ kind: 'granted'; lease: any }>(resolve => { grantA = resolve; });
+    const leaseB = {
+      ...h.lease, occupantId: 'occupant-b',
+      markRunning: vi.fn(async () => {}), release: vi.fn(async () => {}), abandon: vi.fn(async () => {}),
+    };
+    h.base.acquireTraexRuntimeLease = vi.fn()
+      .mockImplementationOnce(() => gateA)
+      .mockResolvedValueOnce({ kind: 'granted', lease: leaseB });
+    let generation = 0;
+    h.base.rpcEngagementFence = {
+      begin: () => ++generation,
+      isCurrent: (token: number) => token === generation,
+      isLive: () => true,
+      markDead: () => undefined,
+    };
+    const resultA = h.engageRaw().then(
+      outcome => ({ outcome }), error => ({ error }),
+    );
+    for (let i = 0; i < 30 && h.base.acquireTraexRuntimeLease.mock.calls.length === 0; i++) await Promise.resolve();
+    const resultB = h.engageRaw();
+    grantA({ kind: 'granted', lease: h.lease });
+    const a = await resultA;
+    expect((a as any).error).toBeInstanceOf(h.base.CliSpawnSupersededError);
+    await expect(resultB).resolves.toBe('resumed');
+    expect(h.lease.abandon).toHaveBeenCalledTimes(1);
+    expect(h.lease.release).not.toHaveBeenCalled();
+    expect(h.lease.markRunning).not.toHaveBeenCalled();
+    expect(h.engines).toHaveLength(1);
+    expect(h.base.traexRpcLeaseContext?.lease).toBe(leaseB);
+  });
+
+  it('keeps overlapping engagements on their own lease contexts', async () => {
+    let openA!: () => void;
+    let openB!: () => void;
+    const startGates = [
+      new Promise<void>(resolve => { openA = resolve; }),
+      new Promise<void>(resolve => { openB = resolve; }),
+    ];
+    const h = engageHarness({ resume: true, startGates });
+    const leaseB = {
+      ...h.lease,
+      occupantId: 'occupant-b',
+      domain: { ...h.lease.domain, domainKey: 'domain-b' },
+      snapshot: { ...h.lease.snapshot, traexPath: '/snapshots/combo-b/traex', dir: '/snapshots/combo-b' },
+      markRunning: vi.fn(async () => {}), release: vi.fn(async () => {}), abandon: vi.fn(async () => {}),
+    };
+    h.base.acquireTraexRuntimeLease = vi.fn()
+      .mockResolvedValueOnce({ kind: 'granted', lease: h.lease })
+      .mockResolvedValueOnce({ kind: 'granted', lease: leaseB });
+    let generation = 0;
+    h.base.rpcEngagementFence = {
+      begin: () => ++generation,
+      isCurrent: (token: number) => token === generation,
+      isLive: () => true,
+      markDead: () => undefined,
+    };
+    h.base.settleTraexRpcLease = loadWorkerFunction('settleTraexRpcLease', h.base);
+    const waitForEngines = async (count: number) => {
+      for (let i = 0; i < 30 && h.engines.length !== count; i++) await Promise.resolve();
+      expect(h.engines).toHaveLength(count);
+    };
+
+    const resultA = h.engageRaw().then(
+      outcome => ({ outcome }),
+      error => ({ error }),
+    );
+    await waitForEngines(1);
+    const resultB = h.engageRaw();
+    await waitForEngines(2);
+
+    openA();
+    const a = await resultA;
+    expect((a as any).error).toBeInstanceOf(h.base.CliSpawnSupersededError);
+    expect(h.lease.markRunning).toHaveBeenCalledWith(4242, 'start-4242');
+    expect(h.engines[0].stopAndWait).toHaveBeenCalled();
+    expect(h.engines[0].stopAndWait.mock.invocationCallOrder[0]).toBeLessThan(h.lease.release.mock.invocationCallOrder[0]);
+    expect(h.lease.release).toHaveBeenCalledTimes(1);
+    expect(leaseB.markRunning).not.toHaveBeenCalled();
+    expect(leaseB.release).not.toHaveBeenCalled();
+    expect(leaseB.abandon).not.toHaveBeenCalled();
+    // B is still inside start(): its granted lease stays local and cannot be
+    // overwritten by A's late cleanup or published as the active generation.
+    expect(h.base.traexRpcLeaseContext).toBeUndefined();
+    expect(h.base.pendingRpcEngagement?.lease?.lease).toBe(leaseB);
+
+    openB();
+    await expect(resultB).resolves.toBe('resumed');
+    expect(leaseB.markRunning).toHaveBeenCalledWith(4243, 'start-4243');
+    expect(leaseB.release).not.toHaveBeenCalled();
+    expect(leaseB.abandon).not.toHaveBeenCalled();
+    expect(h.base.codexRpcEngine).toBe(h.engines[1]);
+    expect(h.base.traexRpcLeaseContext?.lease).toBe(leaseB);
+  });
+
+  it('refuses an unadmitted RPC start before constructing the app-server', async () => {
+    const h = engageHarness({ firstOutcome: 'accepted' });
+    h.base.acquireTraexRuntimeLease = vi.fn(async () => ({ kind: 'error', reason: 'snapshot-failed', detail: 'bad' }));
+    await expect(h.engage()).rejects.toThrow('TRAE runtime gate refused the RPC start');
+    expect(h.engines).toHaveLength(0);
   });
 });

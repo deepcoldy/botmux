@@ -3,6 +3,7 @@ import type { TriggerUserAuthConfig } from '../../services/trigger-user-auth.js'
 import type { CodexServiceTier } from '../../services/codex-service-tier.js';
 import type { DebugModelCapabilities } from './model-catalog-json.js';
 import type { BackgroundTaskSignals, CodexBridgeEvent } from '../../services/codex-transcript.js';
+import type { BackendType } from '../backend/types.js';
 
 export interface PtyHandle {
   /** `false` means the backend rejected the write before it could confirm
@@ -74,10 +75,13 @@ export type SubmitRecheckResult = boolean | {
    *  (see the Codex adapter). A candidate, never a binding: callers may use it
    *  only after independently proving the observed CLI process owns it. */
   unprovenCliSessionId?: string;
+  /** See the writeInput result's `proveConsumed` / `settleConsumed`. */
+  proveConsumed?: () => { cliSessionId?: string } | undefined;
+  settleConsumed?: () => void;
 };
 
 /** See {@link CliAdapter.sessionRenameSurface}. */
-export type SessionRenameSurface = 'settled' | 'unsubmitted' | 'occupied' | 'unknown';
+export type SessionRenameSurface = 'settled' | 'unsubmitted' | 'occupied' | 'blocked' | 'unknown';
 
 /** What the adapter can prove about a failed runner-protocol write.
  *
@@ -97,6 +101,11 @@ export type RunnerSubmissionDisposition =
  * keep protocol ids separate from reply-routing ids. */
 export interface WriteInputContext {
   turnId?: string;
+  /** Commit worker-side turn/write state after the adapter's pre-write input
+   * checks, immediately before the actual paste. A pre-write refusal therefore
+   * leaves no durable turn, bridge mark, type-ahead or activation side effects.
+   * Returning false vetoes the paste when the worker's generation became stale. */
+  beforeSubmit?: () => boolean | void;
   onInputPrepared?: (content: string) => void;
   /** Durable replay identity. Runner adapters may forward this with turnId so
    * late output from an older attempt cannot settle its successor. */
@@ -200,6 +209,24 @@ export interface CliLaunchNotice {
   minVersion: string;
 }
 
+/** Options for {@link CliAdapter.detectModels}. */
+export interface CliModelDetectionOptions {
+  /** Effective process environment after inheritance and configured overlays. */
+  env?: NodeJS.ProcessEnv;
+  /** Botmux-owned global/Bot overlay promoted through Claude's --settings. */
+  settingsEnv?: NodeJS.ProcessEnv;
+  /** Claude only: false forbids falling back to the caller's implicit ~/.claude.
+   *  An explicit configDir remains allowed. Defaults to true for daemon probes. */
+  allowImplicitConfigRoot?: boolean;
+  /** `env` belongs to a separately launched core rather than this process:
+   *  the probe must run in it and inherit nothing from here. Set by the model
+   *  catalog when its caller probes for such a core (the WeCom Dashboard
+   *  configuration for its managed core). Adapters whose established probe
+   *  runs in this process's own environment switch to `env` only when this
+   *  is set; adapters that already use `env` may ignore it. */
+  isolatedEnv?: boolean;
+}
+
 export interface CliAdapter {
   /** Unique identifier */
   readonly id: string;
@@ -251,6 +278,12 @@ export interface CliAdapter {
      *  launch-time title flag may consume it; others should ignore it. */
     nativeSessionTitle?: string;
     botName?: string;
+    /** Resolved per-bot join bootstrap, frozen for this launch so native-title
+     * adapters can distinguish setup instructions from the first real task. */
+    groupJoinPrompt?: string;
+    /** Persisted normalized bootstrap used to recognize replay after its
+     * configured text changes between runner generations. */
+    groupJoinTitleBootstrap?: { digest: string; length: number };
     botOpenId?: string;
     /** This bot's larkAppId. Lets injectsSessionContext adapters (genius) resolve
      *  their per-bot built-in skill injection mode for the system-prompt catalog;
@@ -540,6 +573,14 @@ export interface CliAdapter {
    * handles (Antigravity after /fork). Prefer over the generic first-FD probe. */
   resolveActiveSessionId?(pty: Pick<PtyHandle, 'cliPid' | 'cliCwd'>): string | undefined;
 
+  /** Atomic identity + provenance when the adapter has both an authoritative
+   * native stream log and weaker process/fd discovery. Cold-resume policy must
+   * fence only the latter without rejecting a later native-log `/new`. */
+  resolveActiveSessionIdObservation?(pty: Pick<PtyHandle, 'cliPid' | 'cliCwd'>): {
+    sessionId: string;
+    source: 'native-log' | 'process-discovery';
+  } | undefined;
+
   /** True when this adapter finds the native session to resume by itself
    *  from the botmux session id (Kimi: its index + wire logs; the
    *  session it was started under), so no `cliSessionId` is needed. Whether a
@@ -547,6 +588,12 @@ export interface CliAdapter {
    *  answers; upper layers (resume receipt, closed card) ask it instead of
    *  assuming either way. */
   readonly resumeFindsOwnSession?: boolean;
+
+  /** This adapter performs asynchronous input-surface prechecks and invokes
+   * `context.beforeSubmit` only after they pass. The worker must therefore not
+   * also commit normal-write state through the transaction's early beforeWrite
+   * hook. Adapters without this capability retain the legacy beforeWrite path. */
+  readonly writeInputDefersPreparation?: true;
 
   /** Write user input to PTY. May fire writes asynchronously (e.g. Aiden delayed Enter).
    *  Resolves when all writes are complete.
@@ -579,6 +626,14 @@ export interface CliAdapter {
      *  terminal keybinding). Worker surfaces this immediately. */
     failureReason?: string;
     recheck?: () => SubmitRecheckResult | Promise<SubmitRecheckResult>;
+    /** The input may have landed but consumption is not proven yet: a read-only probe the worker
+     *  may poll later (without blocking the write path) for the same proof
+     *  `ownershipProven` would have carried. Returns the owned native session
+     *  once proven. Never re-sends input. */
+    proveConsumed?: () => { cliSessionId?: string } | undefined;
+    /** The probed input's turn reached its terminal unproven: release it so
+     *  it can no longer claim a record. */
+    settleConsumed?: () => void;
   }>;
 
   /** Press the composer's SUBMIT key once for a draft already parked in the
@@ -903,11 +958,12 @@ export interface CliAdapter {
 
   /** True when this CLI supports a UserPromptSubmit hook whose additionalContext
    *  is injected as an INVISIBLE system-reminder (not rendered into the visible
-   *  transcript). When true and the per-bot `envelopeInjection` setting is
-   *  `auto`, the daemon moves the per-turn reminder/whiteboard blocks out of the
-   *  user turn text and into a sidecar that `botmux user-prompt-hook` reads back.
-   *  Only set for CLIs verified end-to-end; codex renders hook context as a
-   *  visible developer message and must NOT set this. */
+   *  transcript). Enabled by default on local loopback-capable backends when
+   *  non-zero prompt injection is active and the hook is installed: the daemon
+   *  moves per-turn metadata blocks out of user turn text into a sidecar that
+   *  `botmux user-prompt-hook` claims via IPC. Only set for CLIs verified
+   *  end-to-end; codex renders hook context as a visible developer message and
+   *  must NOT set this. */
   readonly supportsInvisiblePromptHook?: boolean;
 
   /** The adapter exposes a transcript-backed end-of-turn boundary that the
@@ -1100,12 +1156,13 @@ export interface CliAdapter {
    *  `modelChoices`. Contract:
    *  - MUST be fail-soft: return null on any error, timeout, or unparseable
    *    output, never throw (the caller falls back to `modelChoices`);
-   *  - MUST be self-contained: one short-lived subprocess (or pure file read)
-   *    with a tight timeout (≤10s) and a capped output buffer — catalogue
-   *    JSON can be hundreds of KB;
+   *  - MUST be self-contained: one short-lived subprocess, a pure file read, or
+   *    a short-timeout (≤10s) request to an endpoint the CLI itself is already
+   *    configured for, with a tight timeout and a capped output buffer —
+   *    catalogue JSON can be hundreds of KB;
    *  - absent = the CLI cannot enumerate its models; the picker shows
    *    `modelChoices` only. */
-  readonly detectModels?: (options?: { env?: NodeJS.ProcessEnv }) => Promise<readonly string[] | null>;
+  readonly detectModels?: (options?: CliModelDetectionOptions) => Promise<readonly string[] | null>;
 
   /** Optional richer form of {@link detectModels}. Adapters that already parse
    *  a model catalogue should implement this and derive detectModels from it,
@@ -1279,9 +1336,11 @@ export interface CliAdapter {
    *  it) after its Enter: `settled` — the composer is an empty native input
    *  again; `unsubmitted` — the composer still holds exactly `command` (the
    *  Enter became a newline or never arrived), so one more Enter submits it;
-   *  `occupied` — a recognised dialog, busy turn or user draft owns the input;
-   *  `unknown` — the viewport cannot be classified. Undefined keeps the
-   *  historical bounded fail-open for CLIs/backends without this capability. */
+   *  `occupied` — an ordinary busy turn owns input; `blocked` — a dialog,
+   *  confirmation, non-empty draft or paste chip owns the input focus and must
+   *  never be released by the timeout; `unknown` — the viewport cannot be
+   *  classified. Undefined keeps the historical bounded fail-open for
+   *  CLIs/backends without this capability. */
   sessionRenameSurface?(
     evidence: { viewport: string; cursor?: { x: number; y: number } },
     command: string,
@@ -1299,8 +1358,11 @@ export interface CliAdapter {
       /** Resolve at every poll: persistent reattach may prove native identity
        * only after the rename was typed. The original byte baseline is kept. */
       getCliSessionId: () => string | undefined;
-      /** Recovery after worker replacement may accept an existing receipt for
-       * this exact thread/title; normal writes arm at the current file size. */
+      /** Optional byte offset for a receipt watcher. Omitted means the current
+       * index size when armed. Recovery arms BEFORE reading the input surface
+       * and reuses that one probe across unknown retries, so a receipt in any
+       * intervening window counts; historical same-title receipts never prove
+       * that a surviving draft executed. */
       fromByte?: number;
     },
   ): () => boolean;
@@ -1348,13 +1410,14 @@ export interface StructuredBridgeDrainContext {
   /** Terminal `/adopt`: the drainer must post transcript text verbatim (no
    *  synthesised bare-sentinel). */
   adoptMode: boolean;
+  /** Effective backend used to submit the session's input. */
+  backendType?: BackendType;
   /** `state` returned by the previous drain; undefined right after attach/detach. */
   state: unknown;
   /** Release a provisionally held trailing final (drivers that hold one). */
   flushTrailingFinal?: boolean;
-  /** Retire a whole conversation: later explicit inputs abandon earlier pending
-   *  turns instead of confirming their waiting narration (Antigravity only). */
-  retirePendingTurns?: boolean;
+  /** Candidate observed by a quiet viewport probe (Antigravity only). */
+  expectedTrailingFinal?: { uuid: string; offset: number };
   /** Number of turns the ATTRIBUTION QUEUE currently holds as started with no
    *  terminal yet, measured by the worker immediately before the drain.
    *  Drivers whose user and final records live in SEPARATE files (doubao:
@@ -1411,7 +1474,7 @@ export interface StructuredBridgeSpec {
   readonly stateCommit?: 'drain' | 'ingest';
   /** Transcript discovery. Lookups by session id are tried before pid. */
   readonly locate: {
-    bySessionId(sessionId: string, cwd?: string): string | undefined;
+    bySessionId(sessionId: string, cwd?: string, nativeSessionDir?: string): string | undefined;
     /** Absent for drivers addressed only by id (oh-my-pi, ebsd). */
     byPid?(pid: number): string | undefined;
   };
@@ -1448,7 +1511,7 @@ export interface StructuredBridgeSpec {
   };
 }
 
-export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'genius' | 'opencode' | 'opencode2' | 'mimocode' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'ebsd' | 'kimi' | 'grok' | 'kiro-cli' | 'riff' | 'reasonix' | 'dsh' | 'dsh-tui' | 'mojo' | 'minimax' | 'remote-runner' | 'codem' | 'zcode' | 'doubao';
+export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'genius' | 'opencode' | 'opencode2' | 'mimocode' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'ebsd' | 'kimi' | 'grok' | 'kiro-cli' | 'riff' | 'reasonix' | 'dsh' | 'dsh-tui' | 'mojo' | 'minimax' | 'remote-runner' | 'codem' | 'zcode' | 'doubao' | 'nca';
 
 /**
  * "这个 CLI 是不是 Codex App" 的唯一字面量出口（CliId 级判定）。

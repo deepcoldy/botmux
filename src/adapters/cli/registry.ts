@@ -20,6 +20,7 @@ import { createOpenCode2Adapter } from './opencode2.js';
 import { createMiMoCodeAdapter } from './mimocode.js';
 import { createAntigravityAdapter, antigravityBridgeSpec } from './antigravity.js';
 import { createAntigravityAcpAdapter } from './antigravity-acp.js';
+import { antigravityTransport } from '../../services/antigravity-transport.js';
 import { createMtrAdapter } from './mtr.js';
 import { createHermesAdapter } from './hermes.js';
 import { createMiraAdapter } from './mira.js';
@@ -42,6 +43,7 @@ import { createMinimaxAdapter } from './minimax.js';
 import { createRemoteRunnerAdapter } from './remote-runner.js';
 import { createZcodeAdapter } from './zcode.js';
 import { createDoubaoAdapter, doubaoBridgeSpec } from './doubao.js';
+import { createNcaAdapter, ncaBridgeSpec } from './nca.js';
 import { retiredCli, retiredCliNotice } from './retired-cli.js';
 
 /**
@@ -102,6 +104,7 @@ const RAW_CLI_EXECUTABLES: Readonly<Record<CliId, string | undefined>> = {
   zcode: 'zcode',
   // npm launcher (`scripts/run.cjs`) that execs the native runtime.
   doubao: 'doubao',
+  nca: 'nca',
 };
 
 /**
@@ -171,6 +174,7 @@ const CLI_SHORT_ALIASES: Readonly<Record<CliId, readonly string[]>> = {
   codem: [],
   zcode: [],
   doubao: [],
+  nca: [],
 };
 
 /** Every non-id name of each CLI: its program name, then its short aliases. */
@@ -378,6 +382,20 @@ export function resolveCommandReal(cmd: string): string {
 }
 
 /**
+ * The UPDATABLE install entry: what `resolveCommand` found, without collapsing
+ * the last alias.
+ *
+ * Use this for anything that must keep observing the operator-selected entry
+ * across time (the TRAE install watcher / runtime gate). `resolveCommandReal`
+ * freezes the path to the release leaf that happened to be current at call
+ * time, so a later `current -> releases/B` switch becomes invisible. Paths that
+ * are actually handed to a spawner still need `resolveCommandReal`.
+ */
+export function resolveCommandEntry(cmd: string): string {
+  return resolveCommand(cmd);
+}
+
+/**
  * Locate an executable the way `execvp` will at spawn time: an absolute path is
  * checked directly, a bare name is searched across the current process's PATH.
  * Returns the resolved absolute path, or null when nothing runnable is found.
@@ -417,7 +435,7 @@ export async function createCliAdapter(id: CliId, pathOverride?: string, opts?: 
   return adapter;
 }
 
-export { createClaudeCodeAdapter, createSeedAdapter, createRelayAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCodexAppAdapter, createCursorAdapter, createGeniusAdapter, createOpenCodeAdapter, createOpenCode2Adapter, createMiMoCodeAdapter, createAntigravityAdapter, createMtrAdapter, createHermesAdapter, createMiraAdapter, createMirAdapter, createTraexAdapter, createPiAdapter, createCopilotAdapter, createOhMyPiAdapter, createEbsdAdapter, createKimiAdapter, createCodemAdapter, createGrokAdapter, createKiroCliAdapter, createRiffAdapter, createReasonixAdapter, createDshAdapter, createDshTuiAdapter, createMojoAdapter, createMinimaxAdapter, createRemoteRunnerAdapter, createZcodeAdapter, createDoubaoAdapter };
+export { createClaudeCodeAdapter, createSeedAdapter, createRelayAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCodexAppAdapter, createCursorAdapter, createGeniusAdapter, createOpenCodeAdapter, createOpenCode2Adapter, createMiMoCodeAdapter, createAntigravityAdapter, createMtrAdapter, createHermesAdapter, createMiraAdapter, createMirAdapter, createTraexAdapter, createPiAdapter, createCopilotAdapter, createOhMyPiAdapter, createEbsdAdapter, createKimiAdapter, createCodemAdapter, createGrokAdapter, createKiroCliAdapter, createRiffAdapter, createReasonixAdapter, createDshAdapter, createDshTuiAdapter, createMojoAdapter, createMinimaxAdapter, createRemoteRunnerAdapter, createZcodeAdapter, createDoubaoAdapter, createNcaAdapter };
 
 /** The CLI id a session actually runs with.
  *
@@ -473,11 +491,35 @@ export function createCliAdapterSync(id: CliId, pathOverride?: string, opts?: Cl
     case 'remote-runner': return createRemoteRunnerAdapter(pathOverride);
     case 'zcode': return createZcodeAdapter(pathOverride);
     case 'doubao': return createDoubaoAdapter(pathOverride);
+    case 'nca': return createNcaAdapter(pathOverride);
     default:
       // A session persisted on a removed CLI (e.g. switched with `/cli gemini`)
       // fails with the migration notice, not a bare "unknown adapter".
       if (retiredCli(id)) throw new Error(retiredCliNotice(id));
       throw new Error(`Unknown CLI adapter: ${id}`);
+  }
+}
+
+/** Whether a CLI adapter exposes a reliable turn-terminal contract under the
+ *  effective launch environment (for example, Antigravity only provides one
+ *  when `AGY_BOTMUX_TRANSPORT=acp`). Fails closed on unknown CLIs or invalid
+ *  transport values. */
+export function cliAdapterHasReliableTurnTerminal(
+  cliId: string | undefined,
+  cliPathOverride?: string,
+  env?: Readonly<Record<string, string>>,
+): boolean {
+  if (!cliId) return false;
+  try {
+    const normalized = cliId.toLowerCase() as CliId;
+    const agyTransport = normalized === 'antigravity' ? antigravityTransport(env) : undefined;
+    return createCliAdapterSync(
+      normalized,
+      cliPathOverride,
+      agyTransport ? { antigravityTransport: agyTransport } : undefined,
+    ).reliableTurnTerminal === true;
+  } catch {
+    return false;
   }
 }
 
@@ -504,6 +546,7 @@ export function bridgeSpecFor(cliId: string | undefined): StructuredBridgeSpec |
     case 'ebsd': return ebsdBridgeSpec;
     case 'grok': return grokBridgeSpec;
     case 'doubao': return doubaoBridgeSpec;
+    case 'nca': return ncaBridgeSpec;
     default: return undefined;
   }
 }

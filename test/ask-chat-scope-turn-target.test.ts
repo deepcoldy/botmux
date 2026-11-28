@@ -41,12 +41,14 @@ import { createExplicitAskContinuation, explicitAskOriginIsLive, explicitAskSess
 import { frozenReplyContextForTurn } from '../src/core/reply-target.js';
 import { createLarkAskCardDispatcher } from '../src/im/lark/ask-card.js';
 import { isSilentMessageListenerSession } from '../src/core/message-listener-silence.js';
+import { resolveAskDeliveryRoute } from '../src/core/native-gateway-ask-dispatch.js';
 import { productionConst } from './helpers/codex-async-answer-function-harness.js';
 import { captureCodexAsyncAskOrigin } from '../src/core/codex-async-ask-origin.js';
 import { codexAsyncAnswerNeedsRawInput, codexAsyncAskOriginEligible } from '../src/services/codex-async-user-input.js';
 import * as sessionControllers from '../src/core/session-controller.js';
 import { SessionContractStore } from '../src/services/session-contract-store.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { NATIVE_STANDALONE_ASK_ORIGIN } from '../src/core/ask-types.js';
 
 // 执行 daemon.ts 里真实的 handleAskRequest，配真实 broker / 显式 ask 回执 / 飞书发卡器，
 // 只把飞书发送接口换成记录器：断言卡片实际发到哪、文字答复能否结算。
@@ -112,12 +114,15 @@ describe('chat-scope 会话里 ask 卡片跟随发起 turn 的冻结回复目标
       readJsonBody: async () => body,
       jsonRes: (_res: unknown, status: number, payload: unknown) => { responses.push({ status, payload }); },
       parseAskBody,
+      NATIVE_STANDALONE_ASK_ORIGIN,
       findActiveBySessionId: (id: string) => id === ds.session.sessionId ? ds : undefined,
       shouldReturnAskStartupNotReady: () => false,
       isTrustedHostIpcRequest: () => true,
       authorizeSessionScopedIpc,
       bindSessionScopedIpcIdentity,
       larkTransportEnabled: () => true,
+      resolveAskDeliveryRoute,
+      isNativeGatewayCoreProcess: () => false,
       isSilentMessageListenerSession,
       getBot: () => ({ config: { apiOnly: false, cliId: 'codex-app' } }),
       resolveDocumentAskDelivery: async () => undefined,
@@ -200,6 +205,20 @@ describe('chat-scope 会话里 ask 卡片跟随发起 turn 的冻结回复目标
     } finally {
       lookup.mockRestore(); store.close();
     }
+  });
+
+  it('rejects a standalone native question without a request identity before registering a card', async () => {
+    const ds = chatScopeSession({ status: 'active', workerGeneration: 1, cliId: 'traex' });
+    const { done, responses } = post(ds, askBody(TURN, {
+      originKind: NATIVE_STANDALONE_ASK_ORIGIN,
+      requestId: undefined,
+    }));
+    await vi.waitFor(() => expect(responses.length + sent.length).toBeGreaterThan(0));
+    expect(responses).toHaveLength(1);
+    expect(responses[0]).toMatchObject({ status: 409, payload: { ok: false } });
+    expect(sent).toEqual([]);
+    expect(listPendingAsksByAnchor({ larkAppId: APP, chatId: CHAT, anchor: CHAT })).toEqual([]);
+    await done;
   });
 
   it('rejects a native question whose threadId does not match the live runtime', async () => {

@@ -54,6 +54,7 @@ macOS 上用 Codex / Codex App 时，如果 PATH 里找不到 `codex`，botmux �
 | `reasonix` | Reasonix | `reasonix` | 本地进程 | ✅ |
 | `zcode` | ZCode | `zcode` | 本地进程 | ✅ |
 | `doubao` | Doubao CLI（见 [Doubao 使用指南](https://github.com/deepcoldy/botmux/blob/master/docs/doubao.md)） | `doubao` | 本地进程 | ✅ |
+| `nca` | NCA | `nca` | 本地进程 | ✅ |
 | `pi` | Pi | `pi` | 本地进程 | ✅ |
 | `oh-my-pi` | Oh My Pi（Pi 的分支） | `omp` | 本地进程 | ✅ |
 | `aiden` | Aiden（原生 agent） | `aiden` | 本地进程 | |
@@ -140,6 +141,36 @@ macOS 上用 Codex / Codex App 时，如果 PATH 里找不到 `codex`，botmux �
 
 > 排查 wrapper 问题：`botmux logs` 里找 `Spawning fresh CLI:` 那一行，把完整命令复制出来在终端手动跑一遍，基本能定位是权限、参数还是登录态的问题。
 
+### Cursor Agent Local 接入自定义模型 API
+
+如果你能获取 Cursor Agent Local，保留 `cliId: "cursor"`，把 `cliPathOverride` 指向可执行启动脚本。下面以本地 OpenAI 兼容网关为例，已用 `cursor-agent-local` 版本 `2026.11.22-e9042b2` 验证。此配置需要单独的 Agent Local 可执行文件。
+
+```sh
+#!/bin/sh
+set -eu
+export CURSOR_LOCAL_AGENT_BASE_URL="http://127.0.0.1:8080/v1"
+: "${CURSOR_LOCAL_AGENT_API_KEY:?请通过启动环境注入限权的本地网关令牌}"
+export CURSOR_LOCAL_AGENT_API_KEY
+export CURSOR_CONFIG_DIR="$HOME/.cursor"
+export CURSOR_DATA_DIR="$HOME/.cursor"
+exec /path/to/cursor-agent-local --authless --disable-auto-update "$@"
+```
+
+将上游模型密钥保存在网关内。通过服务的密钥配置给启动脚本传入限权的本地网关令牌。如果机器人使用[严格环境变量模式](/zh/bots-json#strict-env)过滤该环境，在允许列表加入 `CURSOR_LOCAL_AGENT_API_KEY`。网关需提供 `GET /models` 和流式 `POST /chat/completions`。使用工作区工具时，网关还需支持流式工具调用。
+
+```json
+{
+  "cliId": "cursor",
+  "cliPathOverride": "/path/to/cursor-local-launcher",
+  "model": "gateway-model",
+  "customModels": ["gateway-model"]
+}
+```
+
+`model` 填写网关公布的模型 ID。`customModels` 可以把网关模型加入飞书选择器。网关负责校验允许使用的模型。
+
+Botmux 从守护进程用户的 `~/.cursor` 读取会话记录。启动脚本使用同一服务账号，并将数据目录设到这里。如果 Linux 进程保护导致 Botmux 无法发现会话记录，已验证的版本支持在启动脚本中设置 `CURSOR_AGENT_ALLOW_PROCESS_INSPECTION=1`。这会允许同一用户下的进程检查，仅在需要时启用，并使用专用服务账号。
+
 ## Codex 兼容发行版
 
 如果你用的是**严格兼容 Codex** 的独立发行版，用 `cliId: "codex"` + `cliRuntime`：`cliId` 选 Codex 协议适配器，`cliRuntime` 指定真正运行、独立发版的二进制。这样它能复用模型参数、恢复会话、空闲检测和 Codex RPC，又不会被当成官方 Codex 去检查版本。
@@ -151,6 +182,10 @@ Dashboard 的「Codex 运行时」可以直接切到「自定义兼容版」，�
 ![Dashboard 配置 Codex 兼容发行版](/img/codex-compatible-runtime-dashboard.png)
 
 完整字段与更新来源见 [bots.json 的 Codex 兼容发行版章节](/bots-json#codex-runtime)。旧的 `cliPathOverride` 写法继续可用，但不会自动开启需要明确兼容声明的 Codex RPC 能力。
+
+### Codex 多账号与实例池 {#codex-instances}
+
+同一个 Bot 可以通过 `codexInstancePool` 配置多个 Codex 登录目录，并按静态权重分配给普通新会话；后续消息、失败重试和冷恢复沿用已保存的实例，不重新抽签。配置约束、初始化与登录命令、恢复语义见[会话级 Codex 实例](https://github.com/deepcoldy/botmux/blob/master/docs/codex-instances.md)。
 
 ## API / 远端适配器 {#remote-agents}
 
@@ -248,7 +283,7 @@ Remote Runner 通过 JSONL 协议接任意远端 Agent 平台。botmux 起一个
 
 ### 新接入的 CLI 怎么用 {#new-clis}
 
-Grok Build、Reasonix、OpenCode 2、DeepSeek Harness（dsh / dsh-tui）、MiniMax Code（mcode）、MiMoCode、CodeM、ZCode、Doubao 都是内置适配器，不用额外开关。启用步骤和换别的 CLI 一样（见上文[怎么给机器人换 CLI](#怎么给机器人换-cli)）：先在 daemon 的系统用户下装好对应命令并登录，然后把 Bot 的 `cliId` 设成下表的值。
+Grok Build、Reasonix、OpenCode 2、DeepSeek Harness（dsh / dsh-tui）、MiniMax Code（mcode）、MiMoCode、CodeM、ZCode、Doubao、NCA 都是内置适配器，不用额外开关。启用步骤和换别的 CLI 一样（见上文[怎么给机器人换 CLI](#怎么给机器人换-cli)）：先在 daemon 的系统用户下装好对应命令并登录，然后把 Bot 的 `cliId` 设成下表的值。
 
 | CLI | `cliId` | 默认命令 |
 |---|---|---|
@@ -261,6 +296,7 @@ Grok Build、Reasonix、OpenCode 2、DeepSeek Harness（dsh / dsh-tui）、MiniM
 | CodeM | `codem` | `codem` |
 | ZCode | `zcode` | `zcode` |
 | Doubao | `doubao` | `doubao` |
+| NCA | `nca` | `nca` |
 
 **Forge × TraeX**：想经 Forge 启动 TraeX，在 `botmux setup` 或 Dashboard 的 CLI 菜单里选「Forge x TraeX」，或在 `bots.json` 写 `"cliId": "traex", "cliLaunchMode": "forge-traex"`。botmux 会改用 `forge run --agent traex --agent-args ...` 启动，所以 `forge` 要在 PATH 上。这种启动方式只能配 `cliId: "traex"`，而且不能和 `wrapperCli`、`cliRuntime`、`cliPathOverride`、文件沙盒或 `readIsolation` 一起用，否则配置会被拒绝。
 
@@ -375,6 +411,12 @@ mircli mcp status
 ```bash
 MIRCLI_AUTO_START_MIRAMCP=0 botmux start
 ```
+
+### NCA
+
+先用运行 BotMux daemon 的同一账号安装和配置本地 `nca`，并确认它能正常回复，再在 Setup 选择 NCA 或设置 `cliId: "nca"`。已验证 NCA 3.0.20 的 PTY 和 tmux 会话。
+
+`model` 可填 NCA 原生 `/model` 可用的模型 ID。自定义会话目录时，将 `NCA_DATA_HOME` 配到 BotMux daemon 的环境，或在 `CLI_EXTRA_ARGS` 中传绝对路径 `--home /path/to/harness`。目录语义与原生 NCA 一致：`NCA_DATA_HOME=X` 使用 `X/harness`，而 `--home X` 直接使用 `X`。文件沙盒会把原生用户数据根（默认 `~/.nca`，或 `NCA_DATA_HOME` 指定目录）以及额外的 `--home` harness 目录绑定到宿主，保证登录态和历史持久化，且桥接能读取会话记录。BotMux 会匹配它发送的消息和 NCA 会话记录。在可操作终端执行 `/new` 后，从飞书发一条消息来绑定新线程，再关闭或恢复该会话。
 
 ### Doubao CLI
 

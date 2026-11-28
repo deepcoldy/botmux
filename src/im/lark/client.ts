@@ -2,7 +2,7 @@ import { assertMessageTopicAvailable, createTopicMessageLookupCache, TopicSendEr
 import { closeSync, constants as fsConstants, openSync, readFileSync, writeFileSync, createWriteStream, createReadStream, mkdirSync, mkdtempSync, rmSync, statSync, existsSync, lstatSync, renameSync, unlinkSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, extname, basename, join, sep } from 'node:path';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import { Client } from '@larksuiteoapi/node-sdk';
@@ -358,8 +358,12 @@ async function recordPublishedGroupContext(larkAppId: string, data: any, body: s
  * the closure keeps it stable across gate retries so Feishu returns the original
  * message_id. Caller-supplied uuids win; the generated one is never exposed to hooks.
  */
+const FEISHU_WIRE_UUID_PATTERN = /^[A-Za-z0-9_-]{1,50}$/;
+
 function dedupeUuid(uuid?: string): string {
-  return uuid || randomUUID();
+  if (!uuid || !uuid.trim()) return randomUUID();
+  if (FEISHU_WIRE_UUID_PATTERN.test(uuid)) return uuid;
+  return `u_${createHash('sha256').update(`botmux.lark.wire-uuid.v1\0${uuid}`, 'utf8').digest('hex').slice(0, 32)}`;
 }
 
 /** Durable automatic finals carry this host-owned marker across outbox waits.
@@ -1574,6 +1578,28 @@ export async function updateMessage(
     }
     if (returnAcknowledgement) return res.data;
   });
+}
+
+export async function updateInteractiveCardByToken(
+  larkAppId: string,
+  token: string,
+  card: Record<string, unknown>,
+): Promise<void> {
+  assertLarkTransport(larkAppId, 'updateInteractiveCardByToken');
+  let cardJson = JSON.stringify(card);
+  cardJson = prepareLocalAddressContent(cardJson, 'interactive', linkFieldContext(larkAppId));
+  const stampedCard = JSON.parse(stampBotmuxCallbackMarkers(cardJson)) as Record<string, unknown>;
+  // A callback token permits at most two delayed updates: one initial request
+  // plus one retry. The generic gate default (three retries) can exhaust it.
+  return executeWithLarkGate(larkAppId, 'updateInteractiveCardByToken', async () => {
+    const c = getBotClient(larkAppId);
+    const res: any = await c.request({
+      method: 'POST',
+      url: '/open-apis/interactive/v1/card/update',
+      data: { token, card: stampedCard },
+    });
+    if (res.code !== 0) throw larkApiError('update interactive card by token', res);
+  }, { retryMaxAttempts: 1 });
 }
 
 export interface CardStreamingSettings {

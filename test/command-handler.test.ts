@@ -279,6 +279,7 @@ vi.mock('../src/services/project-scanner.js', () => ({
 
 vi.mock('../src/services/git-worktree.js', () => ({
   createRepoWorktree: vi.fn(),
+  isValidBranchName: vi.fn(async (name: string) => !name.includes('..') && !name.includes(' ')),
   pushWorktreeBranch: vi.fn(async () => {}),
   isLinkedWorktree: vi.fn(async () => false),
   mainWorktreeFor: vi.fn(async () => '/home/testuser/project'),
@@ -407,6 +408,12 @@ vi.mock('../src/im/lark/client.js', () => ({
 vi.mock('../src/services/group-auto-title.js', () => ({
   registerGroupAutoTitle: vi.fn(),
   scheduleGroupAutoTitle: vi.fn(),
+}));
+
+vi.mock('../src/services/created-groups-store.js', () => ({
+  recordCreatedGroup: vi.fn(),
+  getCreatedGroup: vi.fn(),
+  createdGroupWorkingDir: vi.fn(),
 }));
 
 vi.mock('../src/services/group-creator.js', () => ({
@@ -797,6 +804,7 @@ import { recordP2pForceTopicRoot, removeP2pForceTopicRoot } from '../src/service
 import { buildAdoptSelectCard, buildRepoSelectCard, buildSlashListCard, buildSessionClosedCard } from '../src/im/lark/card-builder.js';
 import { createGroupWithBots } from '../src/services/group-creator.js';
 import { registerGroupAutoTitle, scheduleGroupAutoTitle } from '../src/services/group-auto-title.js';
+import { recordCreatedGroup } from '../src/services/created-groups-store.js';
 import { getAllBots, getBot, loadBotConfigs, findOncallChat, effectiveDefaultWorkingDir, type ChatReplyMode } from '../src/bot-registry.js';
 import { getChatReplyModeState, resolveRegularGroupMode } from '../src/services/chat-reply-mode-store.js';
 import { t } from '../src/i18n/index.js';
@@ -10541,12 +10549,13 @@ describe('handleCommand', () => {
 
       it('does not repeat forwarding or activation when the source receipt fails after startup', async () => {
         const deps = makeDeps();
-        vi.mocked(deps.sessionReply).mockRejectedValueOnce(new Error('source_reply_failed'));
+        vi.mocked(deps.sessionReply).mockRejectedValue(new Error('source_reply_failed'));
         await handleCommand('/g', ROOT_ID, makeLarkMessage('/g --start 原任务', { msgType: 'image' }), deps, LARK_APP_ID);
 
         expect(vi.mocked(forwardMessage)).toHaveBeenCalledTimes(1);
         expect(activate()).toHaveBeenCalledTimes(1);
-        expect(vi.mocked(deps.sessionReply)).toHaveBeenCalledTimes(1);
+        // Interactive card attempt + plain-text fallback attempt; neither re-runs startup.
+        expect(vi.mocked(deps.sessionReply)).toHaveBeenCalledTimes(2);
       });
 
       it('activates the same reserved session and reports setup failure after the chat exists', async () => {
@@ -10642,6 +10651,165 @@ describe('handleCommand', () => {
     it('/g --avatar off keeps Feishu\'s default avatar', async () => {
       await handleCommand('/g', ROOT_ID, makeLarkMessage('/g Project --avatar off'), makeDeps(), LARK_APP_ID);
       expect(mockedCreate.mock.calls[0][0].customization).toBeUndefined();
+    });
+
+    it('sends unified interactive result and error cards on /g, falling back to text if card send fails', async () => {
+      const okDeps = makeDeps();
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g 统一卡片'), okDeps, LARK_APP_ID);
+      expect(vi.mocked(okDeps.sessionReply).mock.calls[0][2]).toBe('interactive');
+      const okCard = JSON.parse(vi.mocked(okDeps.sessionReply).mock.calls[0][1] as string);
+      expect(okCard.header.template).toBe('green');
+      expect(okCard.header.title.content).toContain('统一卡片');
+
+      const errDeps = makeDeps();
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g --avatar bad 项目'), errDeps, LARK_APP_ID);
+      expect(vi.mocked(errDeps.sessionReply).mock.calls[0][2]).toBe('interactive');
+      const errCard = JSON.parse(vi.mocked(errDeps.sessionReply).mock.calls[0][1] as string);
+      expect(errCard.header.template).toBe('red');
+
+      const fbDeps = makeDeps();
+      vi.mocked(fbDeps.sessionReply).mockRejectedValueOnce(new Error('card_send_failed'));
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g 降级回执'), fbDeps, LARK_APP_ID);
+      expect(vi.mocked(fbDeps.sessionReply)).toHaveBeenCalledTimes(2);
+      expect(vi.mocked(fbDeps.sessionReply).mock.calls[1][2]).toBeUndefined();
+      expect(vi.mocked(fbDeps.sessionReply).mock.calls[1][1]).toContain('降级回执');
+    });
+
+    it('opens the interactive form card on --card or opt-in groupCreation.card: true, without breaking default bare /g', async () => {
+      // Explicit --card opens the form card and prefills name.
+      const explicitDeps = makeDeps();
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g --card 预填群名'), explicitDeps, LARK_APP_ID);
+      expect(mockedCreate).not.toHaveBeenCalled();
+      expect(vi.mocked(explicitDeps.sessionReply).mock.calls[0][2]).toBe('interactive');
+      const formCard = JSON.parse(vi.mocked(explicitDeps.sessionReply).mock.calls[0][1] as string);
+      expect(formCard.header.template).toBe('blue');
+      expect(JSON.stringify(formCard)).toContain('预填群名');
+
+      // Opt-in groupCreation.card: true makes bare /g open the form card; --no-card or explicit name stays direct.
+      vi.mocked(getBot).mockImplementation(((id: string) => {
+        const bot = defaultGetBot(id);
+        return { ...bot, config: { ...bot.config, groupCreation: { card: true } } };
+      }) as any);
+      const bareOptInDeps = makeDeps();
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g'), bareOptInDeps, LARK_APP_ID);
+      expect(mockedCreate).not.toHaveBeenCalled();
+      expect(JSON.parse(vi.mocked(bareOptInDeps.sessionReply).mock.calls[0][1] as string).header.template).toBe('blue');
+
+      const skipCardDeps = makeDeps();
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g --no-card'), skipCardDeps, LARK_APP_ID);
+      expect(mockedCreate).toHaveBeenCalledTimes(1);
+
+      const namedDeps = makeDeps();
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g 直接建群'), namedDeps, LARK_APP_ID);
+      expect(mockedCreate).toHaveBeenCalledTimes(2);
+
+      // Explicit --card combined with an auto-starting task is rejected cleanly.
+      const conflictDeps = makeDeps();
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g --card --start 冲突任务'), conflictDeps, LARK_APP_ID);
+      expect(mockedCreate).toHaveBeenCalledTimes(2);
+      const conflictCard = JSON.parse(vi.mocked(conflictDeps.sessionReply).mock.calls[0][1] as string);
+      expect(conflictCard.header.template).toBe('red');
+      expect(conflictCard.elements[0].text.content).toContain('--card');
+    });
+
+    it('P2-1: in primary coordination mode --card is refused with a downgrade card and creates no group', async () => {
+      // Form state lives in one process's Map while primary delivers a card
+      // callback to a random replica; fail closed instead of random "expired".
+      vi.stubEnv('BOTMUX_COORDINATION_MODE', 'primary');
+      try {
+        const deps = makeDeps();
+        await handleCommand('/g', ROOT_ID, makeLarkMessage('/g --card 预填群名'), deps, LARK_APP_ID);
+        expect(mockedCreate).not.toHaveBeenCalled();
+        const reply = vi.mocked(deps.sessionReply).mock.calls[0]!;
+        expect(reply[2]).toBe('interactive');
+        const card = JSON.parse(reply[1] as string);
+        expect(card.header.template).toBe('red');
+        expect(card.elements[0].text.content).toContain('primary');
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    });
+
+    it('binds --dir and creates a worktree for --branch, recording the created group directory', async () => {
+      vi.mocked(existsSync).mockImplementation((p: any) => String(p) === '/home/testuser/my-repo' || String(p).includes('bots-info.json'));
+      vi.mocked(statSync).mockImplementation((() => ({ isDirectory: () => true })) as any);
+      vi.mocked(createRepoWorktree).mockResolvedValueOnce({
+        path: '/home/testuser/my-repo-feat-x',
+        branch: 'feat/x',
+        baseRef: 'origin/master',
+      });
+      mockedCreate.mockImplementationOnce(async (opts: any) => {
+        await opts.onChatCreated?.('oc_dir_group');
+        return {
+          ok: true,
+          chatId: 'oc_dir_group',
+          creator: opts.creatorLarkAppId,
+          invalidBotIds: [],
+          invalidUserIds: [],
+          ownerTransferredTo: opts.transferOwnerTo ?? null,
+          shareLink: 'https://applink.feishu.cn/oc_dir_group',
+        } as any;
+      });
+      const deps = makeDeps();
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g 项目群 --dir /home/testuser/my-repo --branch feat/x'), deps, LARK_APP_ID);
+
+      expect(createRepoWorktree).toHaveBeenCalledWith('/home/testuser/my-repo', { branch: 'feat/x' });
+      expect(recordCreatedGroup).toHaveBeenCalledWith(expect.objectContaining({
+        chatId: 'oc_dir_group',
+        creatorAppId: LARK_APP_ID,
+        ownerOpenId: 'ou_sender',
+        workingDir: '/home/testuser/my-repo-feat-x',
+        repository: '/home/testuser/my-repo',
+        branch: 'feat/x',
+      }));
+      const card = JSON.parse(vi.mocked(deps.sessionReply).mock.calls[0][1] as string);
+      expect(card.header.template).toBe('green');
+      expect(card.elements[0].text.content).toContain('/home/testuser/my-repo-feat-x');
+      expect(card.elements[0].text.content).toContain('feat/x');
+
+      // --branch without --dir fails before group creation.
+      const missingDirDeps = makeDeps();
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g 项目群 --branch feat/y'), missingDirDeps, LARK_APP_ID);
+      expect(mockedCreate).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(vi.mocked(missingDirDeps.sessionReply).mock.calls[0][1] as string).header.template).toBe('red');
+    });
+
+    it('P2-5 plain /g --dir: a created-groups.json write failure keeps the green success card, chat link and binding hint', async () => {
+      vi.mocked(existsSync).mockImplementation((p: any) => String(p) === '/home/testuser/bind-repo' || String(p).includes('bots-info.json'));
+      vi.mocked(statSync).mockImplementation((() => ({ isDirectory: () => true })) as any);
+      mockedCreate.mockImplementationOnce(async (opts: any) => {
+        await opts.onChatCreated?.('oc_bind_fail');
+        return {
+          ok: true, chatId: 'oc_bind_fail', creator: opts.creatorLarkAppId,
+          invalidBotIds: [], invalidUserIds: [], ownerTransferredTo: opts.transferOwnerTo ?? null,
+          shareLink: 'https://applink.feishu.cn/oc_bind_fail',
+        } as any;
+      });
+      vi.mocked(recordCreatedGroup).mockImplementationOnce(() => { throw new Error('review_disk_full'); });
+      const deps = makeDeps();
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g 绑定群 --dir /home/testuser/bind-repo'), deps, LARK_APP_ID);
+
+      expect(mockedCreate).toHaveBeenCalledTimes(1);
+      const card = JSON.parse(vi.mocked(deps.sessionReply).mock.calls[0][1] as string);
+      const text = JSON.stringify(card);
+      expect(card.header.template).toBe('green');
+      expect(text).toContain('oc_bind_fail');
+      expect(text).toContain('review_disk_full');
+    });
+
+    it('P2-5 /g --start --dir: a binding write failure does not abort the task reservation and still returns a green card', async () => {
+      vi.mocked(existsSync).mockImplementation((p: any) => String(p) === '/home/testuser/bind-repo' || String(p).includes('bots-info.json'));
+      vi.mocked(statSync).mockImplementation((() => ({ isDirectory: () => true })) as any);
+      vi.mocked(recordCreatedGroup).mockImplementationOnce(() => { throw new Error('review_disk_full_task'); });
+      const deps = makeDeps();
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g --start 任务 --dir /home/testuser/bind-repo'), deps, LARK_APP_ID);
+
+      // The task reservation still ran despite the binding failure.
+      expect(spawnDashboardSession).toHaveBeenCalledTimes(1);
+      const card = JSON.parse(vi.mocked(deps.sessionReply).mock.calls[0][1] as string);
+      const text = JSON.stringify(card);
+      expect(card.header.template).toBe('green');
+      expect(text).toContain('review_disk_full_task');
     });
 
     it('passes /group --role-profile through and strips it from the group name', async () => {

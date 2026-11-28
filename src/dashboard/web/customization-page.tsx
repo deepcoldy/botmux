@@ -4,12 +4,17 @@ import { requestJson } from './dashboard-api.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { confirm } from './confirm-modal.js';
 import { copyText } from './clipboard.js';
+import { useProviderRoster } from './provider-roster.js';
+import { controlCsrfHeaders } from './control-csrf.js';
 
 // ─── Types (mirror src/dashboard/customization-api.ts payloads) ──────────────
 
 type FragmentKind = 'editable' | 'placeholder' | 'conditional';
 type StageId = 'new' | 'followup' | 'send';
 type TabId = StageId | 'skills';
+/** Which store the page edits (services/customization-scope.ts). The WeCom one
+ *  only exists on the page while the deployment has a WeCom connection. */
+type Scope = 'feishu' | 'wecom';
 
 interface StageMeta { id: StageId; label: string; blurb: string }
 interface BlockMeta { id: string; label: string; hint?: string }
@@ -26,6 +31,8 @@ interface Fragment {
   gateLabel?: string;
   locales: Record<string, FragmentLocaleState>;
   conditionForced?: boolean | null;
+  /** Rendered only in this locale (WeCom gateway lines): edited there whatever tab is open. */
+  fixedLocale?: string;
 }
 interface SkillRow {
   name: string;
@@ -59,6 +66,34 @@ function belongsToStage(frag: Fragment, stage: StageId): boolean {
   return frag.stage === stage || (frag.stages ?? []).includes(stage);
 }
 
+/** API path for `scope`: the Feishu store keeps the scope-less legacy URLs. */
+function czPath(path: string, scope: Scope): string {
+  return scope === 'feishu' ? path : `${path}${path.includes('?') ? '&' : '?'}scope=${scope}`;
+}
+
+/** JSON write headers for `scope`: the WeCom store is a WeCom surface and its
+ *  writes carry the control CSRF token; Feishu writes stay exactly as before. */
+function czJsonHeaders(scope: Scope): Record<string, string> {
+  return scope === 'feishu'
+    ? { 'Content-Type': 'application/json' }
+    : { 'Content-Type': 'application/json', ...controlCsrfHeaders() };
+}
+
+/**
+ * The tab a scope may show: the built-in Skill section exists only for Feishu,
+ * and a stage tab only when the scope lists that stage. Anything else falls back
+ * to the first stage.
+ */
+export function resolveCustomizationTab(tab: TabId, scope: Scope, stageIds: readonly StageId[]): TabId {
+  if (tab === 'skills') return scope === 'feishu' ? 'skills' : (stageIds[0] ?? 'new');
+  return stageIds.includes(tab) ? tab : (stageIds[0] ?? 'new');
+}
+
+/** The locale a fragment row shows and saves. */
+function rowLocale(frag: Fragment, locale: string): string {
+  return frag.fixedLocale ?? locale;
+}
+
 function rel(ts: string): string {
   const t = Date.parse(ts);
   if (!t) return ts || '-';
@@ -76,12 +111,14 @@ function rel(ts: string): string {
 function FragmentRow(props: {
   frag: Fragment;
   locale: string;
+  scope: Scope;
   onSaved: (snap: CustomizationSnapshotPayload) => void;
   onError: (msg: string) => void;
   /** In search-results mode show which stage/block the row lives in. */
   stageTag?: string;
 }) {
-  const { frag, locale } = props;
+  const { frag, scope } = props;
+  const locale = rowLocale(frag, props.locale);
   const ls = frag.locales[locale] ?? { factory: '', override: null };
   const modified = ls.override !== null;
   const [editing, setEditing] = useState(false);
@@ -94,9 +131,9 @@ function FragmentRow(props: {
   const save = async (value: string | null) => {
     setBusy(true);
     try {
-      const res = await requestJson('/api/customization/prompt', {
+      const res = await requestJson(czPath('/api/customization/prompt', scope), {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
+        headers: czJsonHeaders(scope),
         body: JSON.stringify({ locale, key: frag.key, value }),
       });
       props.onSaved(res.snapshot);
@@ -111,9 +148,9 @@ function FragmentRow(props: {
   const toggleCond = async (value: boolean | null) => {
     setBusy(true);
     try {
-      const res = await requestJson('/api/customization/condition', {
+      const res = await requestJson(czPath('/api/customization/condition', scope), {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
+        headers: czJsonHeaders(scope),
         body: JSON.stringify({ key: frag.key, value }),
       });
       props.onSaved(res.snapshot);
@@ -147,6 +184,7 @@ function FragmentRow(props: {
           <code className="cz-frag-key">{frag.key}</code>
           <span className="cz-frag-badges">
             {modified ? <span className="cz-chip cz-chip-mod">已修改</span> : null}
+            {frag.fixedLocale ? <span className="cz-chip cz-chip-ph" title="这条只按这个语言渲染，切换语言不影响">仅 {frag.fixedLocale.toUpperCase()}</span> : null}
             {frag.kind === 'placeholder' ? <span className="cz-chip cz-chip-ph">占位符 {(frag.placeholders ?? []).map(p => `{${p}}`).join(' ')}</span> : null}
             {frag.kind === 'conditional' ? (
               <span className="cz-chip cz-chip-cond">
@@ -214,6 +252,7 @@ function BlockGroup(props: {
   meta?: BlockMeta;
   fragments: Fragment[];
   locale: string;
+  scope: Scope;
   onSaved: (snap: CustomizationSnapshotPayload) => void;
   onError: (msg: string) => void;
   stageTagFor?: (f: Fragment) => string | undefined;
@@ -230,6 +269,7 @@ function BlockGroup(props: {
           key={f.key}
           frag={f}
           locale={props.locale}
+          scope={props.scope}
           onSaved={props.onSaved}
           onError={props.onError}
           stageTag={props.stageTagFor?.(f)}
@@ -295,7 +335,7 @@ function SkillRowView(props: {
 
 // ─── Import modal ────────────────────────────────────────────────────────────
 
-function ImportModal(props: { onClose: () => void; onApplied: (snap: CustomizationSnapshotPayload) => void; onError: (m: string) => void }) {
+function ImportModal(props: { scope: Scope; onClose: () => void; onApplied: (snap: CustomizationSnapshotPayload) => void; onError: (m: string) => void }) {
   const [json, setJson] = useState('');
   const [preview, setPreview] = useState<any>(null);
   const [busy, setBusy] = useState(false);
@@ -303,8 +343,8 @@ function ImportModal(props: { onClose: () => void; onApplied: (snap: Customizati
   const doPreview = async (apply: boolean) => {
     setBusy(true);
     try {
-      const res = await requestJson('/api/customization/import', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
+      const res = await requestJson(czPath('/api/customization/import', props.scope), {
+        method: 'POST', headers: czJsonHeaders(props.scope),
         body: JSON.stringify({ json, apply }),
       });
       if (apply && res.applied) { props.onApplied(res.snapshot); props.onClose(); return; }
@@ -360,28 +400,93 @@ function ImportModal(props: { onClose: () => void; onApplied: (snap: Customizati
 // ─── Page ──────────────────────────────────────────────────────────────────
 
 export function CustomizationPage() {
-  const [data, setData] = useState<CustomizationSnapshotPayload | null>(null);
-  const [loadErr, setLoadErr] = useState<string | null>(null);
+  // The platform switch exists only while the deployment has a WeCom connection;
+  // without one the page is the Feishu page, request for request.
+  const { hasWecomBots } = useProviderRoster();
+  const [scopeChoice, setScopeChoice] = useState<Scope>('feishu');
+  const scope: Scope = hasWecomBots ? scopeChoice : 'feishu';
+  // Per scope: the last snapshot (shown at once when switching back), the last
+  // load error, and a count of applied mutations — a load that started before
+  // the latest mutation landed answers with older state and is dropped.
+  const [dataByScope, setDataByScope] = useState<Partial<Record<Scope, CustomizationSnapshotPayload>>>({});
+  const [errorByScope, setErrorByScope] = useState<Partial<Record<Scope, string>>>({});
+  const mutations = useRef<Record<Scope, number>>({ feishu: 0, wecom: 0 });
+
+  const load = useCallback(async (target: Scope) => {
+    const seen = mutations.current[target];
+    try {
+      const snap = await requestJson(czPath('/api/customization', target));
+      if (mutations.current[target] !== seen) return;
+      setDataByScope(prev => ({ ...prev, [target]: snap }));
+      setErrorByScope(prev => { const next = { ...prev }; delete next[target]; return next; });
+    } catch (e: any) {
+      if (mutations.current[target] !== seen) return;
+      setErrorByScope(prev => ({ ...prev, [target]: e?.message ?? '加载失败' }));
+    }
+  }, []);
+  useEffect(() => { void load(scope); }, [load, scope]);
+
+  const commit = useCallback((target: Scope, snap: CustomizationSnapshotPayload) => {
+    mutations.current[target] += 1;
+    setDataByScope(prev => ({ ...prev, [target]: snap }));
+  }, []);
+
+  // Keyed by scope: everything typed, opened or selected under one scope
+  // (editors and drafts, dialogs, tab, search) is discarded whenever the
+  // effective scope changes — by the switch or by the WeCom roster — so nothing
+  // can be saved into the other store.
+  return (
+    <ScopedCustomization
+      key={scope}
+      scope={scope}
+      hasWecomBots={hasWecomBots}
+      data={dataByScope[scope] ?? null}
+      loadErr={errorByScope[scope] ?? null}
+      commit={commit}
+      onScope={setScopeChoice}
+    />
+  );
+}
+
+function ScopedCustomization(props: {
+  scope: Scope;
+  hasWecomBots: boolean;
+  data: CustomizationSnapshotPayload | null;
+  loadErr: string | null;
+  commit: (scope: Scope, snap: CustomizationSnapshotPayload) => void;
+  onScope: (scope: Scope) => void;
+}) {
+  const { scope, hasWecomBots, data, loadErr } = props;
   const [toast, setToast] = useState<string | null>(null);
   const [locale, setLocale] = useState<string>('zh');
   const [tab, setTab] = useState<TabId>('new');
   const [query, setQuery] = useState('');
   const [showImport, setShowImport] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
+  // Confirm dialogs opened under this scope are withdrawn when it goes away.
+  const dialogs = useRef<AbortController | null>(null);
+  useEffect(() => {
+    const controller = new AbortController();
+    dialogs.current = controller;
+    return () => controller.abort();
+  }, []);
+  const ask = async (options: Parameters<typeof confirm>[0]): Promise<boolean> => {
+    const signal = dialogs.current?.signal;
+    return await confirm({ ...options, signal }) && !signal?.aborted;
+  };
 
+  const { commit } = props;
+  const setData = useCallback((snap: CustomizationSnapshotPayload) => commit(scope, snap), [commit, scope]);
   const flash = useCallback((m: string) => { setToast(m); window.setTimeout(() => setToast(null), 2400); }, []);
   const onError = useCallback((m: string) => flash(`⚠ ${m}`), [flash]);
-  const onSaved = useCallback((snap: CustomizationSnapshotPayload) => { setData(snap); flash('已保存 · 下个会话即生效'); }, [flash]);
-
-  const load = useCallback(async () => {
-    try { setData(await requestJson('/api/customization')); }
-    catch (e: any) { setLoadErr(e?.message ?? '加载失败'); }
-  }, []);
-  useEffect(() => { void load(); }, [load]);
+  const onSaved = useCallback((snap: CustomizationSnapshotPayload) => {
+    setData(snap);
+    flash(scope === 'wecom' ? '已保存 · 企业微信下一轮即生效' : '已保存 · 下个会话即生效');
+  }, [flash, setData, scope]);
 
   const post = async (path: string, body?: unknown) => {
     try {
-      const res = await requestJson(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+      const res = await requestJson(czPath(path, scope), { method: 'POST', headers: czJsonHeaders(scope), body: body ? JSON.stringify(body) : undefined });
       if (res.snapshot) setData(res.snapshot);
       return res;
     } catch (e: any) { onError(e?.message ?? '操作失败'); }
@@ -389,7 +494,7 @@ export function CustomizationPage() {
 
   const setEnabled = async (enabled: boolean) => {
     try {
-      const res = await requestJson('/api/customization/enabled', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled }) });
+      const res = await requestJson(czPath('/api/customization/enabled', scope), { method: 'PUT', headers: czJsonHeaders(scope), body: JSON.stringify({ enabled }) });
       setData(res.snapshot);
       flash(enabled ? '自定义已启用' : '自定义已停用（覆盖保留）');
     } catch (e: any) { onError(e?.message ?? '操作失败'); }
@@ -404,7 +509,7 @@ export function CustomizationPage() {
   const modifiedCountByStage = useMemo(() => {
     const m: Record<StageId, number> = { new: 0, followup: 0, send: 0 };
     for (const f of data?.fragments ?? []) {
-      if (f.locales[locale]?.override == null) continue;
+      if (f.locales[rowLocale(f, locale)]?.override == null) continue;
       if (belongsToStage(f, 'new')) m.new += 1;
       if (belongsToStage(f, 'followup')) m.followup += 1;
       if (belongsToStage(f, 'send')) m.send += 1;
@@ -418,15 +523,43 @@ export function CustomizationPage() {
     const q = query.trim().toLowerCase();
     if (!q) return null;
     return (data?.fragments ?? []).filter(f => {
-      const ls = f.locales[locale] ?? { factory: '', override: null };
+      const ls = f.locales[rowLocale(f, locale)] ?? { factory: '', override: null };
       return f.label.toLowerCase().includes(q)
         || f.key.toLowerCase().includes(q)
         || (ls.override ?? ls.factory).toLowerCase().includes(q);
     });
   }, [query, data, locale]);
 
-  if (loadErr) return <div className="cz-page"><div className="cz-error">加载失败：{loadErr}</div></div>;
-  if (!data) return <LoadingState label="加载自定义配置…" />;
+  const wecom = scope === 'wecom';
+  const activeTab = resolveCustomizationTab(tab, scope, stages.map(st => st.id));
+  // Only with a WeCom connection: the switch (and its own style block, so the
+  // Feishu-only page keeps exactly its markup).
+  const scopeTabs = hasWecomBots ? (
+    <>
+      <style>{SCOPE_CSS}</style>
+      <div className="cz-scope-tabs" role="tablist" aria-label="平台">
+        {([['feishu', '飞书'], ['wecom', '企业微信']] as const).map(([id, label]) => (
+          <button
+            key={id}
+            type="button"
+            role="tab"
+            aria-selected={scope === id}
+            className={`cz-scope-tab${scope === id ? ' cz-scope-tab-on' : ''}`}
+            onClick={() => { if (id !== scope) props.onScope(id); }}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+    </>
+  ) : null;
+
+  if (loadErr) return <div className="cz-page">{scopeTabs}<div className="cz-error">加载失败：{loadErr}</div></div>;
+  if (!data) {
+    return hasWecomBots
+      ? <section className="cz-page">{scopeTabs}<LoadingState label="加载自定义配置…" /></section>
+      : <LoadingState label="加载自定义配置…" />;
+  }
 
   // Ordered blocks for a stage: native fragments first, then cross-listed.
   const blocksForStage = (stage: StageId) => {
@@ -441,7 +574,7 @@ export function CustomizationPage() {
     }));
   };
 
-  const activeStage = stages.find(s => s.id === tab);
+  const activeStage = stages.find(s => s.id === activeTab);
   const searching = searchResults !== null;
 
   return (
@@ -451,15 +584,22 @@ export function CustomizationPage() {
       <div className="cz-head">
         <div>
           <h1>自定义中心</h1>
-          <p>调优 botmux 内置的框架 prompt 与内置 skill。所有改动<b>下一个会话即生效，无需重启 daemon</b>；随时可逐项恢复出厂或整体回滚。</p>
+          {wecom
+            ? <p>调优企业微信会话里 botmux 内置的框架 prompt：网关每轮写进任务块的说明，以及专用 core 注入的片段。改动对所有企业微信连接生效，<b>下一轮 / 下一个会话即生效，无需重启</b>；随时可逐项恢复出厂或整体回滚。</p>
+            : <p>调优 botmux 内置的框架 prompt 与内置 skill。所有改动<b>下一个会话即生效，无需重启 daemon</b>；随时可逐项恢复出厂或整体回滚。</p>}
         </div>
       </div>
+
+      {scopeTabs}
+      {wecom ? <p className="cz-scope-note">角色与业务提示词在各企业微信连接的 Bot 配置里设置；这里只调 botmux 内置的框架文案，与飞书那套互不影响。</p> : null}
 
       {/* master switch */}
       <div className="cz-master">
         <div className="cz-master-txt">
-          <b>启用自定义</b>
-          <span>关闭后所有覆盖立即停用、但不删除——排查「是不是我改的 prompt 导致的」时一键回到出厂行为。</span>
+          <b>{wecom ? '启用企业微信自定义' : '启用自定义'}</b>
+          <span>{wecom
+            ? '只作用于企业微信连接；关闭后这套覆盖立即停用、但不删除。飞书那套不受影响。'
+            : '关闭后所有覆盖立即停用、但不删除——排查「是不是我改的 prompt 导致的」时一键回到出厂行为。'}</span>
         </div>
         <label className="toggle-row cz-master-switch">
           <input type="checkbox" checked={data.enabled} onChange={e => void setEnabled(e.currentTarget.checked)} />
@@ -475,27 +615,31 @@ export function CustomizationPage() {
             <button
               key={s.id}
               role="tab"
-              className={`cz-stage-tab${tab === s.id ? ' cz-stage-tab-on' : ''}`}
+              className={`cz-stage-tab${activeTab === s.id ? ' cz-stage-tab-on' : ''}`}
               onClick={() => setTab(s.id)}
             >
               {s.label}
               {modifiedCountByStage[s.id] > 0 ? <span className="cz-tab-badge">{modifiedCountByStage[s.id]}</span> : null}
             </button>
           ))}
-          <span className="cz-tabs-sep" />
-          <button
-            role="tab"
-            className={`cz-stage-tab${tab === 'skills' ? ' cz-stage-tab-on' : ''}`}
-            onClick={() => setTab('skills')}
-          >
-            内置 Skill
-            {skillsModified > 0 ? <span className="cz-tab-badge">{skillsModified}</span> : null}
-          </button>
+          {wecom ? null : (
+            <>
+              <span className="cz-tabs-sep" />
+              <button
+                role="tab"
+                className={`cz-stage-tab${activeTab === 'skills' ? ' cz-stage-tab-on' : ''}`}
+                onClick={() => setTab('skills')}
+              >
+                内置 Skill
+                {skillsModified > 0 ? <span className="cz-tab-badge">{skillsModified}</span> : null}
+              </button>
+            </>
+          )}
         </div>
 
         {/* secondary row: locale + search + actions */}
         <div className="cz-toolbar">
-          {tab !== 'skills' ? (
+          {activeTab !== 'skills' ? (
             <>
               <div className="cz-locale-tabs">
                 {Object.keys(data.fragments[0]?.locales ?? { zh: 0, en: 0 }).map(loc => (
@@ -513,9 +657,9 @@ export function CustomizationPage() {
           ) : <div className="cz-toolbar-spacer" />}
           <div className="cz-toolbar-spacer" />
           <button className="cz-btn cz-btn-ghost" onClick={() => setShowHistory(h => !h)}>历史 / 回滚 ({data.history.length})</button>
-          <a className="cz-btn cz-btn-ghost" href="/api/customization/export" download>导出 bundle</a>
+          <a className="cz-btn cz-btn-ghost" href={czPath('/api/customization/export', scope)} download>导出 bundle</a>
           <button className="cz-btn cz-btn-ghost" onClick={() => setShowImport(true)}>导入 bundle</button>
-          <button className="cz-btn cz-btn-danger" onClick={async () => { if (await confirm({ title: '全部恢复出厂', message: '把所有 prompt/skill 覆盖恢复出厂？会先存快照，可回滚撤回。', danger: true, confirmLabel: '恢复出厂' })) { await post('/api/customization/reset-all'); flash('已全部恢复出厂'); } }}>全部恢复出厂</button>
+          <button className="cz-btn cz-btn-danger" onClick={async () => { if (await ask({ title: '全部恢复出厂', message: wecom ? '把企业微信这套 prompt 覆盖全部恢复出厂？飞书那套不受影响；会先存快照，可回滚撤回。' : '把所有 prompt/skill 覆盖恢复出厂？会先存快照，可回滚撤回。', danger: true, confirmLabel: '恢复出厂' })) { await post('/api/customization/reset-all'); flash('已全部恢复出厂'); } }}>全部恢复出厂</button>
         </div>
 
         {showHistory ? (
@@ -527,14 +671,14 @@ export function CustomizationPage() {
                   <span className="cz-hist-when">{rel(s.at)}</span>
                   <span className="cz-hist-label">{s.label}</span>
                   <span className="cz-hist-sum">prompt {s.summary.promptKeys} · skill {s.summary.skills} · {s.summary.enabled ? 'on' : 'off'}</span>
-                  <button className="cz-link" onClick={async () => { if (await confirm({ title: '回滚快照', message: '回滚到此快照？回滚本身也会存快照，非破坏式。', confirmLabel: '回滚' })) { await post('/api/customization/rollback', { id: s.id }); flash('已回滚'); } }}>回滚到此</button>
+                  <button className="cz-link" onClick={async () => { if (await ask({ title: '回滚快照', message: '回滚到此快照？回滚本身也会存快照，非破坏式。', confirmLabel: '回滚' })) { await post('/api/customization/rollback', { id: s.id }); flash('已回滚'); } }}>回滚到此</button>
                 </div>
               ))}
             </div>
           </div>
         ) : null}
 
-        {tab !== 'skills' ? (
+        {activeTab !== 'skills' ? (
           <>
             {!searching && activeStage ? <p className="cz-stage-blurb">{activeStage.blurb}</p> : null}
 
@@ -550,6 +694,7 @@ export function CustomizationPage() {
                         meta={blockMeta.get(bid)}
                         fragments={searchResults!.filter(f => f.block === bid)}
                         locale={locale}
+                        scope={scope}
                         onSaved={onSaved}
                         onError={onError}
                         stageTagFor={f => stageLabel.get(f.stage) ?? f.stage}
@@ -559,7 +704,7 @@ export function CustomizationPage() {
                 </div>
               </div>
             ) : (
-              (tab === 'new' || tab === 'followup' || tab === 'send') && blocksForStage(tab).map(group => (
+              (activeTab === 'new' || activeTab === 'followup' || activeTab === 'send') && blocksForStage(activeTab).map(group => (
                 <div key={group.blockId} className={group.cross ? 'cz-cross' : ''}>
                   {group.cross ? <div className="cz-cross-head">同时在本阶段注入（与「{stageLabel.get(data.fragments.find(f => f.block === group.blockId)!.stage)}」阶段共用同一条文案）</div> : null}
                   <BlockGroup
@@ -567,6 +712,7 @@ export function CustomizationPage() {
                     meta={blockMeta.get(group.blockId)}
                     fragments={group.fragments}
                     locale={locale}
+                    scope={scope}
                     onSaved={onSaved}
                     onError={onError}
                   />
@@ -580,7 +726,9 @@ export function CustomizationPage() {
               <span className="cz-chip cz-chip-ph" style={{ fontSize: 10 }}>{'{占位符}'}</span> 删不得，保存时校验
               <span className="cz-hint">「注入条件」说明该文案何时出现；改文案不影响注入开关</span>
             </div>
-            <div className="cz-callout">⚠ 逃生阀：可以删掉命脉指令（如 <code>botmux send</code>），但机器人可能因此无法把回复发回飞书。拿不准就点「恢复出厂」。</div>
+            {wecom
+              ? <div className="cz-callout">⚠ 逃生阀：可以删掉命脉指令（如回复发送方式那一行），但机器人可能因此无法把回复发回企业微信。拿不准就点「恢复出厂」。</div>
+              : <div className="cz-callout">⚠ 逃生阀：可以删掉命脉指令（如 <code>botmux send</code>），但机器人可能因此无法把回复发回飞书。拿不准就点「恢复出厂」。</div>}
           </>
         ) : (
           /* skills tab */
@@ -598,7 +746,7 @@ export function CustomizationPage() {
       </div>
 
       {toast ? <div className="cz-toast">{toast}</div> : null}
-      {showImport ? <ImportModal onClose={() => setShowImport(false)} onApplied={onSaved} onError={onError} /> : null}
+      {showImport ? <ImportModal scope={scope} onClose={() => setShowImport(false)} onApplied={onSaved} onError={onError} /> : null}
     </section>
   );
 }
@@ -608,6 +756,19 @@ export function renderCustomizationPage(root: HTMLElement): PageDisposer {
 }
 
 // ─── Scoped CSS (uses shared design tokens; cz- prefix avoids collisions) ────
+
+/** Platform switch styles; rendered only with the switch itself. */
+const SCOPE_CSS = `
+.cz-scope-tabs{display:inline-flex;gap:2px;margin:16px 0 0;background:var(--surface-muted);border:1px solid var(--border-soft);border-radius:12px;padding:3px;}
+.cz-scope-tab{border:none;background:none;color:var(--muted);padding:7px 18px;border-radius:9px;cursor:pointer;font-size:13.5px;font-weight:600;font-family:inherit;min-height:0;}
+.cz-scope-tab:hover{color:var(--accent-strong);}
+.cz-scope-tab-on{background:var(--surface);color:var(--fg);box-shadow:var(--shadow);}
+.cz-scope-note{margin:10px 2px 0;color:var(--muted);font-size:12.5px;}
+@media (max-width:640px){
+  .cz-scope-tabs{display:flex;}
+  .cz-scope-tab{flex:1;}
+}
+`;
 
 const PAGE_CSS = `
 .cz-page{max-width:1080px;padding:20px 22px 80px;}
@@ -626,7 +787,7 @@ const PAGE_CSS = `
 .cz-tabs{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:12px;}
 .cz-stage-tab{border:1px solid var(--border-soft);background:var(--surface);color:var(--muted);border-radius:12px;padding:9px 18px;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;display:inline-flex;align-items:center;gap:8px;min-height:0;transition:all .15s;}
 .cz-stage-tab:hover{border-color:var(--accent);color:var(--accent-strong);}
-.cz-stage-tab-on{background:var(--accent);border-color:var(--accent);color:var(--on-accent);box-shadow:var(--shadow);}
+.cz-stage-tab-on{background:var(--accent-fill);border-color:var(--accent);color:var(--on-accent);box-shadow:var(--shadow);}
 .cz-stage-tab-on:hover{color:var(--on-accent);}
 .cz-tab-badge{background:var(--warning-soft);color:var(--warning);border-radius:999px;font-size:11px;font-weight:700;min-width:18px;height:18px;line-height:18px;text-align:center;padding:0 5px;}
 .cz-stage-tab-on .cz-tab-badge{background:rgba(0,0,0,.18);color:inherit;}
@@ -641,7 +802,7 @@ const PAGE_CSS = `
 .cz-search:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft);}
 .cz-toolbar-spacer{flex:1;}
 .cz-btn{border:none;border-radius:10px;height:32px;padding:0 13px;font-size:12.5px;font-weight:600;cursor:pointer;font-family:inherit;display:inline-flex;align-items:center;gap:6px;text-decoration:none;}
-.cz-btn-primary{background:var(--accent);color:var(--on-accent);}
+.cz-btn-primary{background:var(--accent-fill);color:var(--on-accent);}
 .cz-btn-ghost{background:var(--surface);border:1px solid var(--border);color:var(--fg);}
 .cz-btn-ghost:hover{border-color:var(--accent);color:var(--accent-strong);}
 .cz-btn-danger{background:var(--danger-soft);color:var(--danger);}

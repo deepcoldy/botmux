@@ -68,7 +68,7 @@ export interface PiInputQueuedEntryData {
   behavior: 'steer' | 'followUp';
 }
 
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 
 export interface PiTurnBoundaryEntryData {
   /** Stop reason of the final assistant message in the settled turn, or null
@@ -77,7 +77,14 @@ export interface PiTurnBoundaryEntryData {
 }
 
 interface PiTurnBoundaryExtensionApi {
-  on(event: 'session_start', handler: (event: unknown) => void): void;
+  on(event: 'session_start', handler: (
+    event: { reason?: string } | undefined,
+    ctx?: { sessionManager?: {
+      getSessionFile?: () => string | undefined;
+      getEntries?: () => readonly { type: string }[];
+    } },
+  ) => void): void;
+  setThinkingLevel?(level: string): void;
   on(event: 'agent_end', handler: (event: unknown) => void): void;
   on(event: 'agent_settled', handler: (event: unknown) => void): void;
   on(event: 'before_agent_start', handler: (event: unknown) => { systemPrompt?: string | string[] } | void | Promise<{ systemPrompt?: string | string[] } | void>): void;
@@ -108,7 +115,23 @@ export default function registerBotmuxTurnBoundaryExtension(pi: PiTurnBoundaryEx
   // proof, so a steer landing in that turn's retry backoff would be misread as
   // a new turn. `lastStopReason: null` carries no verdict — it only says
   // "the extension is live here".
-  pi.on('session_start', () => {
+  pi.on('session_start', (event, ctx) => {
+    const fallbackThinking = process.env.BOTMUX_PI_RESUME_FALLBACK_THINKING;
+    delete process.env.BOTMUX_PI_RESUME_FALLBACK_THINKING;
+    if (fallbackThinking && (event?.reason === undefined || event.reason === 'startup')) {
+      try {
+        const manager = ctx?.sessionManager;
+        const sessionFile = manager?.getSessionFile?.();
+        // Pi defers the first write until there is a conversation. An already
+        // loaded conversation still owns its thinking if its file moved during startup.
+        if (sessionFile && statSync(sessionFile, { throwIfNoEntry: false }) === undefined) {
+          const loadedEntries = manager?.getEntries?.();
+          if (loadedEntries && !loadedEntries.some(entry => entry.type === 'message')) {
+            pi.setThinkingLevel?.(fallbackThinking);
+          }
+        }
+      } catch { /* Preserve native startup if the transcript or extension API is unavailable. */ }
+    }
     try {
       const data: PiTurnBoundaryEntryData = { lastStopReason: null };
       pi.appendEntry(PI_TURN_BOUNDARY_CUSTOM_TYPE, data);

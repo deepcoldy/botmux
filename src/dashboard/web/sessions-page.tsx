@@ -1,3 +1,5 @@
+import { useProviderRoster } from './provider-roster.js';
+import { isWecomSource, providerBotKey, providerOfBotKey, sessionSupports, sessionMutationPayload, sessionWriteHeaders, sessionWritesControlled } from './providers/registry.js';
 import { sessionDisplayTitle, sessionLastActivityAt, sessionSupportReason } from './sessions.js';
 import { ModelPinChip } from './model-pin.js';
 import type React from 'react';
@@ -53,6 +55,7 @@ import {
   ICON,
   SESSION_STATUS_OPTIONS,
   canRestartSession,
+  drawerFootActions,
   clearSessionFilters,
   cssToken,
   filterSessionRows,
@@ -499,12 +502,32 @@ function FilterChip(props: {
 
 // 工具栏：搜索 + 一排筛选下拉 + 清理空闲。看板的列本身就是状态分组、表格表头自带排序，
 // 以前的「待处理/进行中/全部」快捷分段、排序下拉和「筛选」弹窗都和它们重复，已去掉。
+
+/**
+ * 「来源」筛选项。按平台筛（企业微信 / 飞书）只在确实有企业微信机器人或会话时出现；
+ * 纯飞书部署只有「原生 / 外部接入」两项，与企微接入前一致。
+ */
+export function sessionSourceFilterOptions(showProviderSources: boolean): ChatFilterOption[] {
+  return [
+    ...(showProviderSources
+      ? [
+          { value: 'wecom', label: t('sessions.filters.sourceWecom') },
+          { value: 'lark', label: t('sessions.filters.sourceLark') },
+        ]
+      : []),
+    { value: 'no', label: t('sessions.filters.sourceNative') },
+    { value: 'yes', label: t('sessions.filters.sourceAdopt') },
+  ];
+}
+
 function SessionsFilters(props: {
   botOptions: ChatFilterOption[];
   chatOptions: ChatFilterOption[];
   filters: FiltersState;
   viewMode: SessionsViewMode;
   idleCleanup: IdleCleanupBarProps;
+  showIdleCleanup?: boolean;
+  showProviderSources?: boolean;
   setFilters: (updater: (prev: FiltersState) => FiltersState) => void;
 }): React.JSX.Element {
   const { filters, setFilters } = props;
@@ -516,10 +539,7 @@ function SessionsFilters(props: {
     ...(kanbanKeepsClosed ? [] : [{ value: SESSION_STATUS_ANY, label: t('sessions.filters.statusAnyInclClosed') }]),
   ];
   const cliOptions: ChatFilterOption[] = CLI_FILTER_OPTIONS.map(cli => ({ value: cli, label: cli }));
-  const adoptOptions: ChatFilterOption[] = [
-    { value: 'no', label: t('sessions.filters.sourceNative') },
-    { value: 'yes', label: t('sessions.filters.sourceAdopt') },
-  ];
+  const adoptOptions = sessionSourceFilterOptions(props.showProviderSources === true);
   const set = (key: 'status' | 'bot' | 'chat' | 'cli' | 'adopt') => (value: string) =>
     setFilters(prev => ({ ...prev, [key]: value }));
   const hasActive = hasActiveSessionFilters(filters);
@@ -565,13 +585,14 @@ function SessionsFilters(props: {
           </button>
         ) : null}
       </div>
-      <IdleCleanupBar {...props.idleCleanup} />
+      {props.showIdleCleanup !== false ? <IdleCleanupBar {...props.idleCleanup} /> : null}
     </form>
   );
 }
 
 function BulkBar(props: {
   selectedCount: number;
+  canClose?: boolean; canLock?: boolean; canMonitor?: boolean;
   lockDisabled: boolean;
   unlockDisabled: boolean;
   closeProgress: { done: number; total: number } | null;
@@ -589,16 +610,16 @@ function BulkBar(props: {
   return (
     <div id="bulk-bar" className="bulk-bar" hidden={props.selectedCount === 0}>
       <span id="bulk-count">{t('sessions.selectedCount', { count: props.selectedCount })}</span>
-      {webTerminalAvailable ? (
+      {webTerminalAvailable && props.canMonitor !== false ? (
         <button type="button" id="bulk-monitor-room" disabled={busy || props.selectedCount === 0} onClick={props.onAddToMonitorRoom}>
           {props.monitorRoomText ?? t('sessions.addToMonitorRoom')}
         </button>
       ) : null}
-      <button type="button" id="bulk-lock" disabled={busy || props.lockDisabled} onClick={() => props.onLock(true)}>{lockText}</button>
-      <button type="button" id="bulk-unlock" disabled={busy || props.unlockDisabled} onClick={() => props.onLock(false)}>{unlockText}</button>
-      <button type="button" id="bulk-close" className="contrast" disabled={busy} onClick={props.onClose}>
+      {props.canLock !== false ? <><button type="button" id="bulk-lock" disabled={busy || props.lockDisabled} onClick={() => props.onLock(true)}>{lockText}</button>
+      <button type="button" id="bulk-unlock" disabled={busy || props.unlockDisabled} onClick={() => props.onLock(false)}>{unlockText}</button></> : null}
+      {props.canClose !== false ? <button type="button" id="bulk-close" className="contrast" disabled={busy} onClick={props.onClose}>
         {props.closeProgress ? `${props.closeProgress.done}/${props.closeProgress.total}` : t('sessions.closeSelected')}
-      </button>
+      </button> : null}
       <button type="button" id="bulk-clear" disabled={busy} onClick={props.onClear}>{t('sessions.clearSelection')}</button>
     </div>
   );
@@ -837,7 +858,7 @@ export function SessionsTableBase(props: {
       case 'cliId':
         return <td data-label={labels.cliId}><span className={`badge cli-${cssToken(row.cliId)}`} title={row.runtimeId && row.runtimeId !== row.cliId ? `${row.cliId} / ${row.runtimeId}` : undefined}>{sessionCliDisplayName(row)}</span></td>;
       case 'status':
-        return <td data-label={labels.status}><StatusBadge row={row} /><TodoBadge row={row} /><LockChip row={row} /><SandboxDriftChip row={row} /><ModelPinChip row={row} /></td>;
+        return <td data-label={labels.status}><StatusBadge row={row} /><TodoBadge row={row} /><LockChip row={row} /><SandboxDriftChip row={row} />{sessionSupports(row, 'modelPin') ? <ModelPinChip row={row} /> : null}</td>;
       case 'chat':
         return <td className="session-location-cell" data-label={labels.chat} title={sessionLocationTitle(row)}>{sessionLocationText(row)}</td>;
       case 'tokenIn':
@@ -1135,7 +1156,7 @@ function TerminalModal(props: { state: TerminalState | null; onClose: () => void
               <span dangerouslySetInnerHTML={rawHtml(botAvatarHtml({ name: botDisplayName(row), larkAppId: row.larkAppId, size: 'sm' }))} />
               <span className="term-modal-title-copy">
                 <span className="term-modal-title-main">
-                  <TerminalNameEditor row={row} onRename={props.onRename} />
+                  {sessionSupports(row, 'rename') ? <TerminalNameEditor row={row} onRename={props.onRename} /> : <strong>{row.title || row.sessionId}</strong>}
                   <StatusBadge row={row} />
                 </span>
                 <span className="term-modal-subtitle">
@@ -1285,7 +1306,16 @@ function InsightPanel(props: { row: any }): React.JSX.Element | null {
   );
 }
 
-function Drawer(props: {
+/** 受控平台（企业微信）的会话写请求要带控制 CSRF 头和 `expectedGeneration`；其它平台不加任何东西。 */
+function providerMutationOptions(row: any): RequestInit {
+  if (!sessionWritesControlled(row)) return {};
+  return {
+    headers: { 'content-type': 'application/json', ...sessionWriteHeaders(row) },
+    body: JSON.stringify(sessionMutationPayload(row)),
+  };
+}
+
+export function SessionDetailsDrawer(props: {
   row: any | null;
   onClose: () => void;
   locateSession: (row: any) => Promise<boolean>;
@@ -1296,11 +1326,15 @@ function Drawer(props: {
   setSessionLocked: (row: any, locked: boolean, button?: HTMLButtonElement) => Promise<boolean>;
   startSession: (row: any, button?: HTMLButtonElement) => Promise<boolean>;
   onTakeover: (row: any, button?: HTMLButtonElement) => void;
+  onOpenTerminal?: (row:any) => void;
+  interruptSession?: (row: any, button?: HTMLButtonElement) => Promise<boolean>;
+  suspendSession?: (row:any,button?:HTMLButtonElement)=>Promise<boolean>;
 }): React.JSX.Element {
   const row = props.row;
   const terminal = row ? terminalHref(row) : null;
   const closed = !!row && row.status === 'closed';
-  const canTakeover = !!row && !closed && !!terminal;
+  const footActions = row ? drawerFootActions(row) : 'none';
+  const canTakeover = !!row && sessionSupports(row, 'takeover') && !closed && !!terminal;
   const [envOpen, setEnvOpen] = useState(false);
   useEffect(() => { setEnvOpen(false); }, [row?.sessionId]);
   return (
@@ -1322,20 +1356,20 @@ function Drawer(props: {
               <TodoBadge row={row} />
               <LockChip row={row} />
             </span>
-            <p><code>{row.sessionId}</code> <CopyButton value={row.sessionId} /></p>
+            <p className="drawer-session-id"><code title={row.sessionId}>{row.sessionId}</code><CopyButton value={row.sessionId} /></p>
           </header>
           <div className="drawer-body">
             <p><b>{t('sessions.bot')}:</b> {botDisplayName(row)} · <b>{t('sessions.cli')}:</b> {sessionCliDisplayName(row)}</p>
             <p><b>{t('sessions.location')}:</b> {sessionLocationText(row)}</p>
-            <p><b>chatId:</b> <code>{row.chatId ?? ''}</code> <CopyButton value={row.chatId ?? ''} /></p>
-            <p><b>rootMessageId:</b> <code>{row.rootMessageId ?? ''}</code> <CopyButton value={row.rootMessageId ?? ''} /></p>
-            {row.threadId ? <p><b>threadId:</b> <code>{row.threadId}</code></p> : null}
+            {!isWecomSource(row) ? <><p><b>chatId:</b> <code>{row.chatId ?? ''}</code> <CopyButton value={row.chatId ?? ''} /></p>
+            <p><b>rootMessageId:</b> <code>{row.rootMessageId ?? ''}</code> <CopyButton value={row.rootMessageId ?? ''} /></p></> : null}
+            {!isWecomSource(row) && row.threadId ? <p><b>threadId:</b> <code>{row.threadId}</code></p> : null}
             <p><b>{t('sessions.workingDir')}:</b> {row.workingDir ?? '-'}</p>
-            <InsightPanel row={row} />
+            {sessionSupports(row, 'insight') ? <InsightPanel row={row} /> : null}
           </div>
           <footer className="drawer-foot">
             <div className="drawer-foot-actions">
-              {closed ? (
+              {footActions === 'resume' ? (
                 <button
                   id="resume-btn"
                   type="button"
@@ -1344,9 +1378,9 @@ function Drawer(props: {
                 >
                   {t('sessions.resume')}
                 </button>
-              ) : (
+              ) : footActions === 'live' ? (
                 <>
-                  <button
+                  {sessionSupports(row, 'takeover') ? <button
                     id="takeover-btn"
                     type="button"
                     className="primary drawer-btn-primary"
@@ -1355,7 +1389,17 @@ function Drawer(props: {
                     onClick={event => props.onTakeover(row, event.currentTarget)}
                   >
                     {t('sessions.takeoverTerminal')}
-                  </button>
+                  </button> : null}
+                  {sessionSupports(row, 'terminal') && !sessionSupports(row, 'takeover') ? (
+                    <button
+                      type="button"
+                      className="primary drawer-btn-primary"
+                      disabled={!terminal}
+                      onClick={() => props.onOpenTerminal?.(row)}
+                    >
+                      {t('sessions.viewTerminal')}
+                    </button>
+                  ) : null}
                   {canRestartSession(row) ? (
                     <button
                       id="restart-btn"
@@ -1366,29 +1410,39 @@ function Drawer(props: {
                       {t('sessions.restart')}
                     </button>
                   ) : null}
-                  <button
+                  {sessionSupports(row, 'close') ? <button
                     id="close-btn"
                     type="button"
                     className="drawer-btn-danger"
                     onClick={async event => { if (await props.closeSession(row, event.currentTarget)) props.onClose(); }}
                   >
                     {t('sessions.close')}
-                  </button>
+                  </button> : null}
+                  {sessionSupports(row, 'suspend') && props.suspendSession ? (
+                    <button type="button" className="drawer-btn-secondary" onClick={event => void props.suspendSession?.(row, event.currentTarget)}>
+                      {t('sessions.suspend')}
+                    </button>
+                  ) : null}
+                  {sessionSupports(row, 'interrupt') && props.interruptSession ? (
+                    <button type="button" className="drawer-btn-secondary" onClick={event => void props.interruptSession?.(row, event.currentTarget)}>
+                      {t('sessions.interruptTask')}
+                    </button>
+                  ) : null}
                 </>
-              )}
+              ) : null}
             </div>
             <details className="drawer-more">
               <summary aria-label={t('sessions.more')}>{t('sessions.more')}</summary>
               <div className="drawer-more-pop" role="menu">
-                <button
+                {sessionSupports(row, 'history') ? <button
                   id="history-drawer-btn"
                   type="button"
                   role="menuitem"
                   onClick={() => props.openHistory(row)}
                 >
                   {t('sessions.history.title')}
-                </button>
-                {shouldOpenWritableTerminal() && !closed ? (
+                </button> : null}
+                {sessionSupports(row, 'spawnCommand') && shouldOpenWritableTerminal() && !closed ? (
                   <IconTip label={t('sessions.copyCommandHint')}>
                     <button
                       id="copy-cmd-btn"
@@ -1400,15 +1454,15 @@ function Drawer(props: {
                     </button>
                   </IconTip>
                 ) : null}
-                <button
+                {sessionSupports(row, 'lock') ? <button
                   id="lock-btn"
                   type="button"
                   role="menuitem"
                   onClick={event => void props.setSessionLocked(row, !row.locked, event.currentTarget)}
                 >
                   {lockActionLabel(row)}
-                </button>
-                {!row.feishuChatLink || row.scope !== 'chat' ? (
+                </button> : null}
+                {!sessionSupports(row, 'locate') ? null : !row.feishuChatLink || row.scope !== 'chat' ? (
                   <span className="drawer-more-item"><LocateButton row={row} locateSession={props.locateSession} /></span>
                 ) : (
                   <a
@@ -1421,7 +1475,7 @@ function Drawer(props: {
                     {t('sessions.openChat')}
                   </a>
                 )}
-                {row.queued && !closed ? (
+                {sessionSupports(row, 'start') && row.queued && !closed ? (
                   <button
                     id="start-btn"
                     type="button"
@@ -1431,7 +1485,7 @@ function Drawer(props: {
                     {t('sessions.create.start')}
                   </button>
                 ) : null}
-                {!closed && row.larkAppId ? (
+                {sessionSupports(row, 'environment') && !closed && row.larkAppId ? (
                   <button
                     id="session-env-btn"
                     type="button"
@@ -1945,9 +1999,27 @@ function SessionsSkeleton(): React.JSX.Element {
   );
 }
 
-function SessionsPage(): React.JSX.Element {
+/** Cross-page creation follows the current session provider context. */
+export function useSessionCreateEntry(openCreateSession: () => Promise<void>, blocked: boolean): void {
+  useEffect(() => {
+    const maybeOpenFromEntry = () => {
+      const requested = consumePendingCreateSession();
+      if (requested && ui.authed && !blocked) void openCreateSession();
+    };
+    maybeOpenFromEntry();
+    window.addEventListener(OPEN_CREATE_SESSION_EVENT, maybeOpenFromEntry);
+    return () => window.removeEventListener(OPEN_CREATE_SESSION_EVENT, maybeOpenFromEntry);
+  }, [openCreateSession, blocked]);
+}
+
+export function SessionsPage(): React.JSX.Element {
   useT();
+  const { onlyWecom, hasWecomBots } = useProviderRoster();
   const storeRows = useStoreSelector(snapshot => [...snapshot.sessions.values()] as SessionRow[]);
+  const showProviderSources = useMemo(
+    () => hasWecomBots || storeRows.some(row => isWecomSource(row)),
+    [hasWecomBots, storeRows],
+  );
   const bootstrapped = useStoreSelector(snapshot => snapshot.bootstrapped);
   const sessionSnapshotVersion = useStoreSelector(snapshot => snapshot.sessionSnapshotVersion);
   const closedCursor = useStoreSelector(snapshot => snapshot.closedCursor);
@@ -2041,7 +2113,7 @@ function SessionsPage(): React.JSX.Element {
   const botOptions = useMemo<ChatFilterOption[]>(() => {
     const options = new Map<string, string>();
     for (const row of storeRows) {
-      const id = String(row.larkAppId ?? '').trim();
+      const id = providerBotKey(row).trim();
       if (id && !options.has(id)) options.set(id, botDisplayName(row));
     }
     return [...options.entries()]
@@ -2085,7 +2157,7 @@ function SessionsPage(): React.JSX.Element {
   // 在数千行上重跑一遍 filter/every/some。全部收进 useMemo：只有真正的输入变了才重算。
   // 全选只作用于表格当前已渲染的行：没展开的行用户看不到，不能被一键批量关掉。
   const selectableRows = useMemo(
-    () => rows.slice(0, tableLimit).filter(row => row.status !== 'closed'),
+    () => rows.slice(0, tableLimit).filter(row => row.status !== 'closed' && (sessionSupports(row, 'close') || sessionSupports(row, 'lock') || sessionSupports(row, 'monitorRoom'))),
     [rows, tableLimit],
   );
   const selectedRows = useMemo(
@@ -2119,7 +2191,7 @@ function SessionsPage(): React.JSX.Element {
   }, [rowsById]);
 
   const idleCleanupCandidatesFor = useCallback(
-    (hours: IdleCleanupHours) => selectCleanupCandidates(rows, hours),
+    (hours: IdleCleanupHours) => selectCleanupCandidates(rows.filter(row=>!isWecomSource(row)), hours),
     [rows],
   );
 
@@ -2132,8 +2204,8 @@ function SessionsPage(): React.JSX.Element {
     try {
       const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/board`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ column, position }),
+        headers: { 'content-type': 'application/json', ...sessionWriteHeaders(row) },
+        body: JSON.stringify(sessionMutationPayload(row,{ column, position })),
       });
       const body = await r.json().catch(() => ({}));
       if (!r.ok || body?.ok === false) {
@@ -2159,7 +2231,7 @@ function SessionsPage(): React.JSX.Element {
       if (!sessionId) continue;
       if (move.row.status === 'closed' && move.column !== 'done') continue;
       const row = store.sessions.get(sessionId);
-      if (!row) continue;
+      if (!row || !sessionSupports(row, 'board')) continue;
       const prev = { column: row.kanbanColumn, columnAt: row.kanbanColumnAt, position: row.kanbanPosition };
       row.kanbanColumn = move.column;
       row.kanbanColumnAt = Date.now();
@@ -2171,14 +2243,15 @@ function SessionsPage(): React.JSX.Element {
   }, [persistBoardMove, refresh]);
 
   const persistRename = useCallback(async (row: any, title: string): Promise<void> => {
+    if (!sessionSupports(row, 'rename')) return;
     const prevTitle = row.title;
     row.title = title;
     refresh();
     try {
       const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/rename`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ title }),
+        headers: { 'content-type': 'application/json', ...sessionWriteHeaders(row) },
+        body: JSON.stringify(sessionMutationPayload(row,{ title })),
       });
       const body = await r.json().catch(() => ({}));
       if (!r.ok || body?.ok === false) {
@@ -2194,6 +2267,7 @@ function SessionsPage(): React.JSX.Element {
   }, [refresh]);
 
   const locateSession = useCallback(async (row: any): Promise<boolean> => {
+    if (!sessionSupports(row, 'locate')) return false;
     // Busy/cooldown UI is owned by the React-state LocateButton / LocateIconButton;
     // do NOT imperatively mutate the button here — the board's locate button renders
     // its icon via dangerouslySetInnerHTML and a textContent write permanently wipes it.
@@ -2210,10 +2284,11 @@ function SessionsPage(): React.JSX.Element {
   }, []);
 
   const closeSession = useCallback(async (row: any, closeBtn?: HTMLButtonElement): Promise<boolean> => {
+    if (!sessionSupports(row, 'close')) return false;
     if (!await confirm({ title: '关闭会话', message: t('sessions.closeConfirm'), danger: true })) return false;
     if (closeBtn) closeBtn.disabled = true;
     try {
-      const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/close`, { method: 'POST' });
+      const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/close`, { method: 'POST', ...providerMutationOptions(row) });
       const body = await r.json().catch(() => ({}));
       if (!r.ok || body?.ok === false) {
         if (r.status !== 401) toast(`Close failed: ${body?.error ?? r.status}`, { kind: 'error' });
@@ -2252,6 +2327,7 @@ function SessionsPage(): React.JSX.Element {
   }, [refresh]);
 
   const setSessionLocked = useCallback(async (row: any, locked: boolean, btn?: HTMLButtonElement): Promise<boolean> => {
+    if (!sessionSupports(row, 'lock')) return false;
     const prev = !!row.locked;
     if (prev === locked) return true;
     row.locked = locked;
@@ -2260,8 +2336,8 @@ function SessionsPage(): React.JSX.Element {
     try {
       const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/lock`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ locked }),
+        headers: { 'content-type': 'application/json', ...sessionWriteHeaders(row) },
+        body: JSON.stringify(sessionMutationPayload(row,{ locked })),
       });
       const body = await r.json().catch(() => ({}));
       if (!r.ok || body?.ok === false) {
@@ -2284,11 +2360,12 @@ function SessionsPage(): React.JSX.Element {
   }, [refresh]);
 
   const restartSession = useCallback(async (row: any, restartBtn?: HTMLButtonElement): Promise<boolean> => {
+    if (!sessionSupports(row, 'restart')) return false;
     if (restartCooldownIds.current.has(row.sessionId)) return false;
     if (!await confirm({ title: '重启会话', message: restartConfirmMessage(row), danger: true })) return false;
     if (restartBtn) restartBtn.disabled = true;
     try {
-      const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/restart`, { method: 'POST' });
+      const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/restart`, { method: 'POST', ...providerMutationOptions(row) });
       const body = await r.json().catch(() => ({}));
       if (!r.ok || body?.ok === false) {
         if (r.status !== 401) toast(restartErrorMessage(body, r.status), { kind: 'error' });
@@ -2306,9 +2383,10 @@ function SessionsPage(): React.JSX.Element {
   }, []);
 
   const resumeSession = useCallback(async (row: any, button?: HTMLButtonElement): Promise<boolean> => {
+    if (!sessionSupports(row, 'resume')) return false;
     if (button) button.disabled = true;
     try {
-      const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/resume`, { method: 'POST' });
+      const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/resume`, { method: 'POST', ...providerMutationOptions(row) });
       const body = await r.json().catch(() => ({}));
       if (!r.ok || body.ok === false) {
         toast(resumeErrorMessage(body?.error ?? r.status, t), { kind: 'error' });
@@ -2324,9 +2402,10 @@ function SessionsPage(): React.JSX.Element {
   }, []);
 
   const startSession = useCallback(async (row: any, button?: HTMLButtonElement): Promise<boolean> => {
+    if (!sessionSupports(row, 'start')) return false;
     if (button) button.disabled = true;
     try {
-      const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/start`, { method: 'POST' });
+      const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/start`, { method: 'POST', ...providerMutationOptions(row) });
       const body = await r.json().catch(() => ({}));
       if (!r.ok || body.ok === false) {
         if (r.status !== 401) toast(`${t('sessions.create.startFailed')}: ${body?.error ?? r.status}`, { kind: 'error' });
@@ -2341,7 +2420,38 @@ function SessionsPage(): React.JSX.Element {
     }
   }, []);
 
+  const suspendSession = useCallback(async (row: any, button?: HTMLButtonElement): Promise<boolean> => {
+    if (!isWecomSource(row) || !sessionSupports(row, 'suspend')) return false;
+    if (button) button.disabled = true;
+    try {
+      const response = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/suspend`, { method: 'POST', ...providerMutationOptions(row) });
+      if (!response.ok) throw new Error('suspend');
+      toast(t('sessions.suspendRequested'));
+      return true;
+    } catch {
+      toast(t('sessions.suspendFailed'), { kind: 'error' });
+      return false;
+    } finally {
+      if (button) button.disabled = false;
+    }
+  }, []);
+  const interruptSession = useCallback(async (row: any, button?: HTMLButtonElement): Promise<boolean> => {
+    if (!sessionSupports(row, 'interrupt')) return false;
+    if (button) button.disabled = true;
+    try {
+      const response = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/interrupt`, { method: 'POST', ...providerMutationOptions(row) });
+      if (!response.ok) throw new Error('interrupt');
+      toast(t('sessions.interruptRequested'));
+      return true;
+    } catch {
+      toast(t('sessions.interruptFailed'), { kind: 'error' });
+      return false;
+    } finally {
+      if (button) button.disabled = false;
+    }
+  }, []);
   const openHistoryModal = useCallback((row: any): void => {
+    if (!sessionSupports(row, 'history')) return;
     setHistoryState({ sessionId: row.sessionId, loading: true, messages: [] });
     void (async () => {
       try {
@@ -2390,6 +2500,7 @@ function SessionsPage(): React.JSX.Element {
 
   // 抽屉主操作「接管终端」：有权限直接开可写终端，否则退到只读终端弹窗。
   const takeoverSession = useCallback((row: any, button?: HTMLButtonElement): void => {
+    if (isWecomSource(row) && !sessionSupports(row, 'takeover')) { if (sessionSupports(row, 'terminal')) openTerminalModal(row); return; }
     if (shouldOpenWritableTerminal() && row.status !== 'closed') {
       void openWriteLink(row, button);
       return;
@@ -2398,7 +2509,7 @@ function SessionsPage(): React.JSX.Element {
   }, [openTerminalModal]);
 
   const runBulkClose = useCallback(async (): Promise<void> => {
-    const ids = [...selected];
+    const ids = [...selected].filter(id => sessionSupports(rowsById.get(id), 'close'));
     if (ids.length === 0) return;
     if (!await confirm({ title: '关闭会话', message: t('sessions.closeBulkConfirm', { count: ids.length }), danger: true })) return;
     setBulkCloseProgress({ done: 0, total: ids.length });
@@ -2412,8 +2523,10 @@ function SessionsPage(): React.JSX.Element {
     async function worker() {
       while (queue.length) {
         const sid = queue.shift()!;
+        const row = rowsById.get(sid);
+        if (!row || !sessionSupports(row, 'close')) continue;
         try {
-          const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/close`, { method: 'POST' });
+          const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/close`, { method: 'POST', ...providerMutationOptions(row) });
           const body = await r.json().catch(() => ({}));
           if (!r.ok || body?.ok === false) {
             failed += 1;
@@ -2444,12 +2557,12 @@ function SessionsPage(): React.JSX.Element {
       toast(`⚠️ ${residualIds.length}/${ids.length} closed locally but left a residual `
         + `requiring manual cleanup: ${residualIds.join(', ')}`, { kind: 'warning' });
     }
-  }, [refresh, selected]);
+  }, [refresh, selected, rowsById]);
 
   const runBulkLock = useCallback(async (locked: boolean): Promise<void> => {
     const targetRows = [...selected]
       .map(id => rowsById.get(id))
-      .filter((row): row is SessionRow => !!row && row.status !== 'closed' && !!row.locked !== locked);
+      .filter((row): row is SessionRow => !!row && row.status !== 'closed' && sessionSupports(row, 'lock') && !!row.locked !== locked);
     if (targetRows.length === 0) return;
     setBulkLockProgress({ locked, done: 0, total: targetRows.length });
     let done = 0;
@@ -2462,8 +2575,8 @@ function SessionsPage(): React.JSX.Element {
         try {
           const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/lock`, {
             method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ locked }),
+            headers: { 'content-type': 'application/json', ...sessionWriteHeaders(row) },
+            body: JSON.stringify(sessionMutationPayload(row,{ locked })),
           });
           const body = await r.json().catch(() => ({}));
           if (!r.ok || body?.ok === false) {
@@ -2488,7 +2601,7 @@ function SessionsPage(): React.JSX.Element {
   }, [refresh, rowsById, selected]);
 
   const addSelectedToMonitorRoom = useCallback((): void => {
-    const ids = [...selected].filter(id => !!rowsById.get(id));
+    const ids = [...selected].filter(id => !!rowsById.get(id) && sessionSupports(rowsById.get(id), 'monitorRoom'));
     if (ids.length === 0) return;
     const result = addMonitorRoomSessionIds(ids);
     setMonitorRoomFeedback(t('sessions.monitorRoomAdded', { added: result.added, total: result.total }));
@@ -2599,6 +2712,10 @@ function SessionsPage(): React.JSX.Element {
     const s = store.sessions.get(String(row.sessionId));
     if (s) void setSessionLocked(s, !s.locked, button);
   }, [setSessionLocked]);
+  const kanbanOnInterrupt = useCallback((row: any, button?: HTMLButtonElement) => {
+    const s = store.sessions.get(String(row.sessionId));
+    if (s) void interruptSession(s, button);
+  }, [interruptSession]);
   const kanbanOnToggleSelect = useCallback((row: any) => setSelected(prev => {
     const id = String(row.sessionId);
     const next = new Set(prev);
@@ -2646,6 +2763,8 @@ function SessionsPage(): React.JSX.Element {
   // 开关来自 dashboard 配置，值在一次会话内不变，但函数引用必须固定。
   const kanbanOnOpenTerminal = dashboardShellAllowsWebTerminal() ? takeoverSession : undefined;
 
+  const wecomSelected = onlyWecom || filters.adopt === 'wecom' || providerOfBotKey(filters.bot) === 'wecom';
+  const monitorAvailable = !wecomSelected || rows.some(row => sessionSupports(row, 'monitorRoom'));
   const drawerRow = drawerSessionId ? rowsById.get(drawerSessionId) ?? null : null;
   const closeCreateSession = useCallback(() => {
     createRequestRef.current += 1;
@@ -2654,6 +2773,7 @@ function SessionsPage(): React.JSX.Element {
   }, []);
 
   const openCreateSession = useCallback(async (): Promise<void> => {
+    if (wecomSelected) return;
     const requestId = createRequestRef.current + 1;
     createRequestRef.current = requestId;
     setCreateState({ bots: [], loading: true });
@@ -2665,18 +2785,9 @@ function SessionsPage(): React.JSX.Element {
     } finally {
       if (createRequestRef.current === requestId) setCreateLoading(false);
     }
-  }, []);
+  }, [wecomSelected]);
 
-  useEffect(() => {
-    const maybeOpenFromEntry = () => {
-      if (consumePendingCreateSession() && ui.authed) void openCreateSession();
-    };
-    maybeOpenFromEntry();
-    window.addEventListener(OPEN_CREATE_SESSION_EVENT, maybeOpenFromEntry);
-    return () => window.removeEventListener(OPEN_CREATE_SESSION_EVENT, maybeOpenFromEntry);
-    // openCreateSession 只碰稳定的 ref/setState，取首次渲染的闭包即可
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  useSessionCreateEntry(openCreateSession, wecomSelected);
 
   return (
     <section className="page sessions-page">
@@ -2705,12 +2816,12 @@ function SessionsPage(): React.JSX.Element {
           </div>
         </div>
         <div className="page-heading-actions sessions-page-actions">
-          {dashboardShellAllowsWebTerminal() ? (
+          {dashboardShellAllowsWebTerminal() && monitorAvailable ? (
             <button type="button" id="monitor-room-open" className="monitor-room-open" onClick={() => { window.location.href = monitorRoomUrl(); }}>
               {t('sessions.monitorRoom')}
             </button>
           ) : null}
-          {ui.authed ? (
+          {ui.authed && !wecomSelected ? (
             <CreateActionButton
               className="page-primary-action create-session-btn"
               disabled={createLoading}
@@ -2731,6 +2842,8 @@ function SessionsPage(): React.JSX.Element {
       </div>
 
       <SessionsFilters
+        showIdleCleanup={!wecomSelected}
+        showProviderSources={showProviderSources}
         botOptions={botOptions}
         chatOptions={chatOptions}
         filters={filters}
@@ -2756,6 +2869,9 @@ function SessionsPage(): React.JSX.Element {
         </div>
       ) : null}
       <BulkBar
+        canClose={selectedRows.every(row=>sessionSupports(row,'close'))}
+        canLock={selectedRows.every(row=>sessionSupports(row,'lock'))}
+        canMonitor={selectedRows.every(row=>sessionSupports(row,'monitorRoom'))}
         selectedCount={selected.size}
         lockDisabled={!selectedRows.some(row => !row.locked)}
         unlockDisabled={!selectedRows.some(row => !!row.locked)}
@@ -2816,6 +2932,7 @@ function SessionsPage(): React.JSX.Element {
             onOpenTerminal={kanbanOnOpenTerminal}
             onRename={kanbanOnRename}
             onRestart={kanbanOnRestart}
+            onInterrupt={kanbanOnInterrupt}
             onToggleLock={kanbanOnToggleLock}
             onToggleSelect={kanbanOnToggleSelect}
             selectedSessionIds={selected}
@@ -2833,7 +2950,7 @@ function SessionsPage(): React.JSX.Element {
         </p>
       ) : null}
 
-      <Drawer
+      <SessionDetailsDrawer
         row={drawerRow}
         onClose={() => {
           setDrawerSessionId(null);
@@ -2847,6 +2964,9 @@ function SessionsPage(): React.JSX.Element {
         setSessionLocked={setSessionLocked}
         startSession={startSession}
         onTakeover={takeoverSession}
+        onOpenTerminal={openTerminalModal}
+        interruptSession={interruptSession}
+        suspendSession={suspendSession}
       />
       <TerminalModal state={termState} onClose={() => setTermState(null)} onRename={persistRename} />
       <HistoryModal state={historyState} onClose={() => setHistoryState(null)} />

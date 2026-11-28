@@ -3,6 +3,7 @@ import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:chil
 import { Buffer } from 'node:buffer';
 import { createConnection, type Socket } from 'node:net';
 import type { KeyObject } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import type { CodexAppTurnInput } from './types.js';
 import {
   buildCodexAppTurnStartParams,
@@ -55,6 +56,9 @@ import { CodexAppCotCollector, prepareCodexAppCotMarker } from './services/codex
 import { bridgeCodexUserInput, postCodexAsk } from './services/codex-user-input.js';
 import { parseCodexAsyncQuestions, parseCodexAsyncUserInput, codexAsyncSteerTargetMatches } from './services/codex-async-user-input.js';
 import { larkToolPromptFromEnv } from './core/lark-tool-binding.js';
+import { isBootstrapDisplayTitle, sessionTitleInput } from './core/session-title-content.js';
+import { titleBootstrapDigest } from './core/session-title-digest.js';
+import { normalizeCodexAppTitlePrefix } from './utils/codex-app-title-prefix.js';
 import { readProcessStartIdentity } from './utils/process-identity.js';
 
 type JsonObject = Record<string, any>;
@@ -70,8 +74,15 @@ interface Args {
   threadId?: string;
   strictResume?: boolean;
   botName?: string;
+  groupJoinPrompt?: string;
+  groupJoinTitleDigest?: string;
+  groupJoinTitleLength?: number;
+  titlePrefix?: string;
   botOpenId?: string;
   locale?: string;
+  /** Set by the adapter only in a native IM gateway's core (the runner, a CLI
+   *  child, never sees that marker): instructions describe the channel gateway. */
+  nativeGateway?: boolean;
   model?: string;
   reasoningEffort?: string;
   allowReasoningCatalog: boolean;
@@ -285,8 +296,17 @@ function parseArgs(argv: string[]): Args {
     else if (key === '--thread-id' && val !== undefined) { out.threadId = val; i++; }
     else if (key === '--strict-resume') out.strictResume = true;
     else if (key === '--bot-name' && val !== undefined) { out.botName = val; i++; }
+    else if (key === '--group-join-prompt' && val !== undefined) { out.groupJoinPrompt = val; i++; }
+    else if (key === '--group-join-title-digest' && val !== undefined) { out.groupJoinTitleDigest = val; i++; }
+    else if (key === '--group-join-title-length' && val !== undefined) {
+      const length = Number(val);
+      if (Number.isInteger(length) && length > 0) out.groupJoinTitleLength = length;
+      i++;
+    }
+    else if (key === '--title-prefix' && val !== undefined) { out.titlePrefix = normalizeCodexAppTitlePrefix(val); i++; }
     else if (key === '--bot-open-id' && val !== undefined) { out.botOpenId = val; i++; }
     else if (key === '--locale' && val !== undefined) { out.locale = val; i++; }
+    else if (key === '--native-gateway') out.nativeGateway = true;
     else if (key === '--model' && val !== undefined) { out.model = val; i++; }
     else if (key === '--reasoning-effort' && val !== undefined) { out.reasoningEffort = val; i++; }
     else if (key === '--codex-reasoning-catalog' && val !== undefined) {
@@ -324,6 +344,8 @@ function appDeveloperInstructions(args: Args): string {
     `botmux session_id: ${args.sessionId}`,
   ].filter(Boolean).join('\n');
 
+  if (args.nativeGateway) return nativeGatewayDeveloperInstructions(args, identity);
+
   if (zh) {
     return [
       '你正在通过 botmux 接入飞书/Lark，但运行载体是 Codex App 的 app-server 协议，不是 Codex CLI TUI。',
@@ -349,6 +371,41 @@ function appDeveloperInstructions(args: Args): string {
       ? 'When the `botmux_browser` tool is present, use it for Chrome/Edge operations. Do not look for or fall back to node_repl, standalone Playwright, or another browser-control surface.'
       : '',
     larkToolPromptFromEnv('en'),
+    identity ? `<identity>\n${identity}\n</identity>` : '',
+  ].filter(Boolean).join('\n\n');
+}
+
+/**
+ * Developer instructions in a native IM gateway's core. The final message is
+ * posted by the channel gateway into the chat the turn came from; `botmux send`
+ * follows the turn's <botmux_task> (as <botmux_http_response_mode> says); a
+ * synchronous request_user_input becomes a card in that chat, answerable only
+ * within the turn, while an asynchronous one is refused at the core's ask
+ * entry (core/native-gateway-ask-dispatch.ts). No Feishu/Lark context helpers
+ * and no managed lark-cli exist there (an apiOnly bot gets no binding).
+ */
+function nativeGatewayDeveloperInstructions(args: Args, identity: string): string {
+  const browser = !!args.browserFamily;
+  if (args.locale === 'zh') {
+    return [
+      '你通过 botmux 运行，运行载体是 Codex App 的 app-server 协议，不是 Codex CLI TUI。',
+      '你的最终 assistant message 会由通道网关发到当前聊天，聊天里的人会看到它；只输出最终回答。',
+      '不要自己发送消息：只有本轮 `<botmux_task>` 明确给出了发送方式时，才严格按它发送，不使用其它形式的 `botmux send`。',
+      '需要用户选择时，原生 `request_user_input` 会以卡片发到当前聊天并等待作答（也可使用 `botmux ask`）；提问只在本轮内有效，本轮结束即作废。不等答复就继续运行的异步提问在这里不受支持，会被直接拒绝。不要通过卡片索取密码等秘密。',
+      browser
+        ? '当 `botmux_browser` 工具存在时，Chrome/Edge 操作必须使用该工具；不要寻找或回退到 `node_repl`、Playwright 服务或其它浏览器控制面。'
+        : '',
+      identity ? `<identity>\n${identity}\n</identity>` : '',
+    ].filter(Boolean).join('\n\n');
+  }
+  return [
+    'You run through botmux on the Codex App app-server protocol rather than the Codex CLI TUI.',
+    'Your final assistant message is posted by the channel gateway into the current chat, where people will read it; output only the final answer.',
+    'Do not send messages yourself: only when this turn\'s `<botmux_task>` gives you a delivery instruction, use exactly that, and no other form of `botmux send`.',
+    'When you need the user to choose, native request_user_input questions are posted as a card in the current chat and wait for an answer (botmux ask works too); a question is valid only within this turn and is void once the turn ends. Asynchronous questions that continue without waiting for the answer are not supported here and are refused. Do not request secrets through chat cards.',
+    browser
+      ? 'When the `botmux_browser` tool is present, use it for Chrome/Edge operations. Do not look for or fall back to node_repl, standalone Playwright, or another browser-control surface.'
+      : '',
     identity ? `<identity>\n${identity}\n</identity>` : '',
   ].filter(Boolean).join('\n\n');
 }
@@ -750,6 +807,8 @@ connectControlSocket();
 
 let client!: AppServerClient;
 let threadId = args.threadId;
+let pendingThreadTitle: { threadId: string; name?: string; attempts: number; writing?: boolean } | undefined;
+let titleWritesStopped = false;
 const browserBroker = args.browserFamily
   ? new CodexBrowserBroker({
       sessionId: args.sessionId,
@@ -973,6 +1032,14 @@ function emitTurnActivity(turn: ActiveTurn, phase: 'submitted' | 'progress' | 'c
     atMs,
     ...(turn.nativeTurnId ? { turnId: turn.nativeTurnId } : {}),
   });
+}
+
+function publishTurnThinking(turn: ActiveTurn, method: string, params: JsonObject): void {
+  const entries = cotCollector.observe(method, params);
+  const replyTurnId = turn.accepted?.at(-1)?.replyTurnId;
+  if (!replyTurnId || entries.length === 0) return;
+  const marker = prepareCodexAppCotMarker(replyTurnId, entries);
+  if (marker) emitMarker('thinking', marker);
 }
 
 const userInputRequests = new Map<number | string, { turnId?: string; controller: AbortController }>();
@@ -1618,15 +1685,32 @@ function handleNotification(msg: JsonObject, replayedAfterResponse = false): voi
     turn.keepPendingDeadlineAtMs = Date.now() + keepPendingTimeoutMs();
   }
 
-  const cotEntries = cotCollector.observe(msg.method, params);
-  const cotTurnId = turn.accepted?.at(-1)?.replyTurnId;
-  if (cotTurnId && cotEntries.length > 0) {
-    const marker = prepareCodexAppCotMarker(cotTurnId, cotEntries);
-    if (marker) emitMarker('thinking', marker);
+  const item = params.item;
+  if (msg.method === 'item/completed' && item?.type === 'agentMessage' && item.delivery === 'async') {
+    const id = String(item.id);
+    turn.asyncItemIds.add(id);
+    turn.itemText.delete(id);
+    turn.allAgentText = [...turn.itemText.values()].join('');
+    // Plain async notices and async questions share the same delivery tag.
+    // Only an item with a question payload belongs to the ask broker.
+    if (item.questions != null) {
+      if (typeof notificationTurnId === 'string') handleAsyncUserInput(item, notificationTurnId, turn);
+    } else if (!turn.knownAgentItemIds.has(id)) {
+      turn.knownAgentItemIds.add(id);
+      // A plain notice carries no promise of a trailing newline; without one
+      // it fuses with the next terminal line. Keep the thinking marker on the
+      // raw text — only the PTY display gets the boundary.
+      if (typeof item.text === 'string' && item.text.trim()) {
+        output.display(item.text.endsWith('\n') ? item.text : `${item.text}\n`);
+      }
+      publishTurnThinking(turn, msg.method, params);
+    }
+    return;
   }
 
+  publishTurnThinking(turn, msg.method, params);
+
   if (msg.method === 'item/started') {
-    const item = params.item;
     if (item?.type === 'agentMessage') {
       if (item.delivery === 'async') turn.asyncItemIds.add(String(item.id));
       else {
@@ -1661,15 +1745,7 @@ function handleNotification(msg: JsonObject, replayedAfterResponse = false): voi
   }
 
   if (msg.method === 'item/completed') {
-    const item = params.item;
     if (item?.type === 'agentMessage') {
-      if (item.delivery === 'async') {
-        turn.asyncItemIds.add(String(item.id));
-        turn.itemText.delete(String(item.id));
-        turn.allAgentText = [...turn.itemText.values()].join('');
-        if (typeof notificationTurnId === 'string') handleAsyncUserInput(item, notificationTurnId, turn);
-        return;
-      }
       const id = String(item.id);
       if (!turn.knownAgentItemIds.has(id)) output.display(String(turn.itemText.get(id) ?? item.text ?? ''));
       turn.knownAgentItemIds.add(id);
@@ -1810,6 +1886,10 @@ async function ensureThread(startupDeadlineAtMs?: number): Promise<string> {
       threadId = resumedThreadId;
       currentModel = resumed.model;
       threadReady = true;
+      // A bootstrap-only opening deliberately persists no title. Its daemon-side
+      // awaiting-content marker re-arms naming on the next runner generation;
+      // ordinary/legacy resume has no groupJoinPrompt and remains untouched.
+      if (args.groupJoinPrompt) pendingThreadTitle = { threadId: resumedThreadId, attempts: 0 };
       emitMarker('thread', { threadId: resumedThreadId });
       return resumedThreadId;
     } catch (err: any) {
@@ -1858,12 +1938,69 @@ async function ensureThread(startupDeadlineAtMs?: number): Promise<string> {
   threadId = startedThreadId;
   currentModel = started.model;
   threadReady = true;
+  pendingThreadTitle = { threadId: startedThreadId, attempts: 0 };
   emitMarker('thread', { threadId: startedThreadId });
-  void client.request('thread/name/set', {
-      threadId: startedThreadId,
-      name: `botmux ${args.sessionId.slice(0, 8)}`,
-    }, { timeoutMs: 2_000 }).catch(() => { /* naming is cosmetic */ });
   return startedThreadId;
+}
+
+function queueThreadTitle(targetThreadId: string, accepted: readonly Dispatch[]): void {
+  const pending = pendingThreadTitle;
+  if (titleWritesStopped || pending?.threadId !== targetThreadId || pending.writing || pending.attempts >= 2) return;
+  const mentions = args.botName ? [{ name: args.botName }] : undefined;
+  if (!pending.name) {
+    const previous = args.groupJoinTitleDigest && args.groupJoinTitleLength !== undefined
+      ? { digest: args.groupJoinTitleDigest, length: args.groupJoinTitleLength } : undefined;
+    for (const { input } of accepted) {
+      const raw = input.codexAppInput?.text ?? input.content;
+      const body = raw.match(/<user_message>\s*([\s\S]*?)\s*<\/user_message>/)?.[1] ?? raw;
+      const task = body.trimStart().startsWith('<botmux_headless_session trusted="true">')
+        ? body.match(/<botmux_task trusted="true">([\s\S]*?)<\/botmux_task>/)?.[1] ?? ''
+        : body;
+      const { text } = sessionTitleInput(task, mentions, args.groupJoinPrompt ? [args.groupJoinPrompt] : [], previous, titleBootstrapDigest);
+      if (!text || isBootstrapDisplayTitle(text)) continue;
+      const prefix = args.titlePrefix ?? '';
+      const normalizedPrefix = prefix.trimStart().replace(/\s+/g, ' ');
+      const title = `${prefix}${text.startsWith(normalizedPrefix) ? text.slice(normalizedPrefix.length) : text}`;
+      const chars = Array.from(title);
+      pending.name = chars.length > 48 ? `${chars.slice(0, 47).join('').trimEnd()}…` : title;
+      break;
+    }
+  }
+  if (!pending.name) return;
+  pending.writing = true;
+  pending.attempts += 1;
+  void writeNewThreadTitle(client, targetThreadId, pending.name).then(settled => {
+    if (settled && pendingThreadTitle === pending) pendingThreadTitle = undefined;
+  }).catch(() => {}).finally(() => { pending.writing = false; });
+}
+
+async function writeNewThreadTitle(server: AppServerClient, targetThreadId: string, name: string): Promise<boolean> {
+  const signal = server.lifetime.signal;
+  const isCurrent = () => client === server && threadId === targetThreadId && !generationFenced && !signal.aborted && !titleWritesStopped;
+  const deadline = Date.now() + 5_000;
+  const rpcOptions = () => ({ timeoutMs: Math.min(deadline - Date.now(), 2_000) });
+  let writes = 0;
+  while (isCurrent() && Date.now() < deadline) {
+    try {
+      const { thread: metadata } = await server.request('thread/read', {
+        threadId: targetThreadId, includeTurns: false,
+      }, rpcOptions());
+      if (!isCurrent()) return false;
+      if (metadata?.id === targetThreadId) {
+        if (metadata.name) return true;
+        if (metadata.preview && Date.now() < deadline) {
+          if (writes >= 2) return false;
+          writes += 1;
+          await server.request('thread/name/set', { threadId: targetThreadId, name }, rpcOptions());
+        }
+      }
+    } catch (error) {
+      if (error instanceof AppServerRpcError && error.code === -32601) return true;
+      if (!(error instanceof AppServerRpcError || error instanceof AppServerRequestTimeoutError)) return false;
+    }
+    if (isCurrent() && Date.now() < deadline) await delay(100, undefined, { signal });
+  }
+  return false;
 }
 
 /** Emit a signed lifecycle marker (steer_attempt / steer_accepted / completion_race
@@ -2270,6 +2407,7 @@ async function tryAdmitSteer(): Promise<void> {
   }
   queue.shift();
   turn.accepted!.push(dispatch);
+  queueThreadTitle(built.params.threadId, turn.accepted!);
   publishInterruptTarget();
   turn.steerInFlight = undefined;
   steerAdmitting = false;
@@ -2521,6 +2659,7 @@ async function runTurn(message: QueuedInput): Promise<void> {
   turn.nativeTurnId = responseNativeId;
   turn.requestAccepted = true;
   turn.startResponsePending = false;
+  if (responseNativeId) queueThreadTitle(tid, turn.accepted);
   // The root request is accepted → its native id is now canonical for the group,
   // so pre-final follow-up steers may bind against it (canSteer). A plain start
   // is proven by its start-response; a Goal-continuation root is proven by the
@@ -2885,7 +3024,8 @@ async function main(): Promise<void> {
   prompt();
 }
 
-process.on('SIGTERM', async () => {
+async function shutdown(code: number): Promise<void> {
+  titleWritesStopped = true;
   cancelUserInputRequests();
   cancelAsyncUserInputRequests();
   cancelRunnerIdleSettle();
@@ -2893,19 +3033,11 @@ process.on('SIGTERM', async () => {
   controlSocket?.destroy();
   await browserBroker?.close().catch(() => {});
   client?.close();
-  process.exit(0);
-});
+  process.exit(code);
+}
 
-process.on('SIGINT', async () => {
-  cancelUserInputRequests();
-  cancelAsyncUserInputRequests();
-  cancelRunnerIdleSettle();
-  if (controlReconnectTimer) clearTimeout(controlReconnectTimer);
-  controlSocket?.destroy();
-  await browserBroker?.close().catch(() => {});
-  client?.close();
-  process.exit(130);
-});
+process.on('SIGTERM', () => { void shutdown(0); });
+process.on('SIGINT', () => { void shutdown(130); });
 
 main().catch(err => {
   if (err instanceof CodexAppActiveWriterError) {

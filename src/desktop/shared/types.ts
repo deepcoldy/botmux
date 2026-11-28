@@ -7,6 +7,12 @@ export type RuntimeStatus =
 
 export type RuntimeSource = 'bundled' | 'global-cli' | 'none';
 
+export type RuntimeDegradedReason =
+  | 'invalid_bots_json'
+  | 'missing_runtime'
+  | 'external_unmanaged'
+  | 'fleet_discovery';
+
 export interface DesktopPaths {
   // User-owned CLI/dashboard state remains in ~/.botmux across app upgrades.
   botmuxHome: string;
@@ -26,6 +32,7 @@ export interface DesktopRuntimeState {
   onlineDaemonCount: number;
   attentionCount: number;
   dashboardUrl: string | null;
+  degradedReason?: RuntimeDegradedReason;
   message?: string;
 }
 

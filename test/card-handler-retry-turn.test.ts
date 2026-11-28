@@ -346,6 +346,35 @@ describe('retry_turn — happy path', () => {
     expect(res?.toast?.type).toBe('success');
   });
 
+  it('keeps the original delivery envelope for a non-direct failure continue on a live worker', async () => {
+    const envelope = '<botmux_reminder>deliver with botmux send</botmux_reminder>\n\n<sender name="Alice" />';
+    const ds = makeDs({
+      sessionOverrides: {
+        lastFailedTurn: makeFailedTurn({ hookEnvelope: envelope, directFailure: undefined }),
+      },
+    });
+    await handleCardAction(actionData(TURN, 'continue'), depsWith(ds), LARK_APP_ID);
+    const sent = sendWorkerInputMock.mock.calls[0][1];
+    expect(sent.content).toContain('[BOTMUX_CONTINUE]');
+    expect(sent.content).toContain(envelope);
+    expect(sent.hookEnvelope).toBeUndefined();
+  });
+
+  it('keeps the original delivery envelope for a direct-failure continue that reforks', async () => {
+    const envelope = '<botmux_reminder>deliver with botmux send</botmux_reminder>';
+    const ds = makeDs({
+      worker: null,
+      sessionOverrides: {
+        lastFailedTurn: makeFailedTurn({ hookEnvelope: envelope, directFailure: true }),
+      },
+    });
+    await handleCardAction(actionData(TURN, 'continue'), depsWith(ds), LARK_APP_ID);
+    const sent = forkWorkerMock.mock.calls[0][1];
+    expect(sent.content).toContain('[BOTMUX_CONTINUE]');
+    expect(sent.content).toContain(envelope);
+    expect(sent.hookEnvelope).toBeUndefined();
+  });
+
   it('treats a card with no mode as continue (fail-safe for older cards)', async () => {
     // Defaulting to resend would blindly replay a possibly-executed turn.
     const ds = makeDs();
@@ -789,5 +818,127 @@ describe('/quote cold admission', () => {
     expect(readBack).toEqual([]);
     expect(published.at(-1)).toContain('引用这一轮的回顾');
     expect(published.join('\n')).not.toContain('上一轮的回顾');
+  });
+});
+
+
+describe('TRAE tool image repair — behavioral dispatch', () => {
+  function data() {
+    const input = actionData(TURN, null, 'purge_images_continue');
+    input.action.value.image_kind = 'traex_tool_images';
+    return input;
+  }
+  function ds(overrides: Partial<DaemonSession> = {}) {
+    return makeDs({ ...overrides, sessionOverrides: { cliId: 'traex', lastFailedTurn: makeFailedTurn({ errorCode: 'traex_tool_image_upload_failed', status: 'failed' }) } });
+  }
+  it('continues from verified work under a new turn and keeps the conversation active', async () => {
+    const session = ds();
+    const result = await handleCardAction(data(), depsWith(session), LARK_APP_ID);
+    expect(result?.toast?.type).toBe('success');
+    expect(sendWorkerInputMock).toHaveBeenCalledWith(session, expect.objectContaining({ content: expect.stringContaining('[BOTMUX_CONTINUE]') }), expect.stringMatching(/^retry-/), { purgeToolImages: true });
+    expect(session.session.status).toBe('active');
+    expect(session.session.lastFailedTurn?.retryCount).toBe(1);
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+  });
+  it.each(['new input', 'stale card', 'unrelated failure', 'dead worker', 'wrong CLI', 'unauthorized'])('refuses %s without consuming the retry lease', async scenario => {
+    const session = ds(); const input = data();
+    if (scenario === 'new input') session.lastCliInputTurnId = 'om_new';
+    if (scenario === 'stale card') input.action.value.turn_id = 'om_old';
+    if (scenario === 'unrelated failure') session.session.lastFailedTurn!.errorCode = 'codex_connection_failed';
+    if (scenario === 'dead worker') session.worker = undefined;
+    if (scenario === 'wrong CLI') session.session.cliId = 'codex';
+    if (scenario === 'unauthorized') vi.mocked(canOperate).mockReturnValue(false);
+    await handleCardAction(input, depsWith(session), LARK_APP_ID);
+    expect(sendWorkerInputMock).not.toHaveBeenCalled();
+    expect(session.session.lastFailedTurn?.retryCount).toBe(0);
+    expect(session.session.status).toBe('active');
+  });
+});
+
+describe('TRAE saved prompt recovery', () => {
+  const checkpoint = { sessionId: '00000000-0000-7000-8000-000000000001', offset: 123, prefixHash: 'a'.repeat(64) };
+  function trae(over: Partial<FailedTurnRecord> = {}) {
+    return makeDs({ lastScreenStatus: 'idle', lastCliInputTurnId: TURN, sessionOverrides: { cliId: 'traex', lastFailedTurn: makeFailedTurn({
+      userPrompt: 'Describe this image', cliInput: '<sender>original</sender><user_message>Describe this image</user_message>\n<attachments><image n="1" path="/fixture/photo.png" /></attachments>',
+      status: 'failed', errorCode: 'traex_tool_image_upload_failed', retryable: false, directFailure: true,
+      traexPromptCheckpoint: checkpoint, attachments: [{ type: 'image', path: '/fixture/photo.png', name: 'photo.png', resourceKey: 'img_original' }], ...over,
+    }) } });
+  }
+  it.each(['retry_turn', 'retry_edited_prompt'])('forwards the frozen trusted caller for %s', async action => {
+    const trustedCaller = { requestUserOpenId: 'ou_original', requestLarkAppId: LARK_APP_ID, senderType: 'user' as const };
+    const ds = trae({ trustedCaller });
+    const data = actionData(TURN, 'resend', action);
+    if (action === 'retry_edited_prompt') data.action.form_value = { failed_prompt: 'edited prompt', failed_image: 'keep' };
+    await handleCardAction(data, depsWith(ds), LARK_APP_ID);
+    expect(sendWorkerInputMock).toHaveBeenCalledOnce();
+    const [, payload, , opts] = sendWorkerInputMock.mock.calls[0];
+    expect(payload.trustedCaller).toEqual(trustedCaller);
+    expect(opts).toMatchObject({ trustedCaller });
+  });
+  it('uses the edited input directly without replaying a hook sidecar', async () => {
+    const trustedCaller = { requestUserOpenId: 'ou_original', requestLarkAppId: LARK_APP_ID, senderType: 'user' as const };
+    const hookEnvelope = '<botmux_reminder>original delivery</botmux_reminder>';
+    const ds = trae({ trustedCaller, hookEnvelope });
+    const data = actionData(TURN, null, 'retry_edited_prompt');
+    data.action.form_value = { failed_prompt: 'edited prompt', failed_image: 'keep' };
+    await handleCardAction(data, depsWith(ds), LARK_APP_ID);
+    const [, payload, , opts] = sendWorkerInputMock.mock.calls[0];
+    expect(payload.content).toContain('edited prompt');
+    expect(payload.content).not.toContain(hookEnvelope);
+    expect(payload.hookEnvelope).toBeUndefined();
+    expect(payload.trustedCaller).toEqual(trustedCaller);
+    expect(opts).toMatchObject({ trustedCaller, failedTurnEditedInput: true });
+  });
+  it('opens the editor on the same card without sending input or spending the retry cooldown', async () => {
+    const { sendEphemeralCard } = await import('../src/im/lark/client.js'); vi.mocked(sendEphemeralCard).mockClear();
+    const ds = trae();
+    const result = await handleCardAction(actionData(TURN, null, 'edit_failed_prompt'), depsWith(ds), LARK_APP_ID);
+    expect(result?.toast.type).toBe('success');
+    expect(sendEphemeralCard).not.toHaveBeenCalled();
+    const card = result.card.data;
+    expect(JSON.stringify(card)).toContain('Describe this image');
+    expect(sendWorkerInputMock).not.toHaveBeenCalled();
+    expect(ds.session.lastFailedTurn?.retryCount).toBe(0);
+  });
+  it.each(['keep', 'remove'])('submits edited text once with image choice %s', async image => {
+    const ds = trae(); const data = actionData(TURN, null, 'retry_edited_prompt');
+    data.action.form_value = { failed_prompt: 'Describe the colors', failed_image: image };
+    const result = await handleCardAction(data, depsWith(ds), LARK_APP_ID);
+    expect(result?.toast.type).toBe('success');
+    expect(sendWorkerInputMock).toHaveBeenCalledOnce();
+    const [,, retryTurnId, opts] = sendWorkerInputMock.mock.calls[0];
+    const input = sendWorkerInputMock.mock.calls[0][1];
+    expect(input.content).toContain('Describe the colors');
+    expect(input.content).toContain('<sender>original</sender>');
+    expect(input.content.includes('/fixture/photo.png')).toBe(image === 'keep');
+    expect(opts).toMatchObject({ failedTurnResendOf: TURN, failedTurnEditedInput: true });
+    expect(rememberLastCliInputMock).toHaveBeenCalledWith(ds, 'Describe the colors', input, retryTurnId);
+    expect(takePurgeClickRollback(ds, retryTurnId)?.receipt?.previousRetryCount).toBe(0);
+    await handleCardAction(data, depsWith(ds), LARK_APP_ID);
+    expect(sendWorkerInputMock).toHaveBeenCalledOnce();
+  });
+  it('edits an input proven never to have reached the CLI without requiring transcript rollback', async () => {
+    const ds = trae({ status: 'ambiguous', errorCode: 'write_input_threw', directFailure: undefined, retryable: undefined, traexPromptCheckpoint: undefined });
+    const data = actionData(TURN, null, 'retry_edited_prompt'); data.action.form_value = { failed_prompt: 'new text', failed_image: 'remove' };
+    await handleCardAction(data, depsWith(ds), LARK_APP_ID);
+    expect(sendWorkerInputMock).toHaveBeenCalledOnce(); expect(sendWorkerInputMock.mock.calls[0][1].content).toContain('new text');
+  });
+  it('rechecks missing proof rather than trusting a resend button', async () => {
+    const ds = trae({ directFailure: undefined, traexPromptCheckpoint: undefined });
+    await handleCardAction(actionData(TURN, 'resend'), depsWith(ds), LARK_APP_ID);
+    expect(sendWorkerInputMock).toHaveBeenCalledOnce();
+    expect(sendWorkerInputMock.mock.calls[0][1].content).toContain('[BOTMUX_CONTINUE]');
+    expect(sendWorkerInputMock.mock.calls[0][3]).not.toHaveProperty('failedTurnResendOf');
+  });
+  it.each(['new input', 'busy', 'no proof', 'bad image choice', 'blank', 'permission'])('refuses edit after %s', async why => {
+    const ds = trae(why === 'no proof' ? { traexPromptCheckpoint: undefined } : {});
+    if (why === 'new input') ds.lastCliInputTurnId = 'newer';
+    if (why === 'busy') ds.lastScreenStatus = 'working';
+    if (why === 'permission') vi.mocked(canOperate).mockReturnValue(false);
+    const data = actionData(TURN, null, 'retry_edited_prompt');
+    data.action.form_value = { failed_prompt: why === 'blank' ? ' ' : 'new prompt', failed_image: why === 'bad image choice' ? 'arbitrary' : 'keep' };
+    await handleCardAction(data, depsWith(ds), LARK_APP_ID);
+    expect(sendWorkerInputMock).not.toHaveBeenCalled();
+    expect(ds.session.lastFailedTurn?.retryCount).toBe(0);
   });
 });

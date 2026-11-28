@@ -1,3 +1,5 @@
+import { CORE_ONLY_BACKENDS, validateCoreOnlyBotProfile } from './core/core-only-bot-profile.js';
+import { coreOnlyBotProfileJson, isCoreOnlyEnv } from './core/runtime-mode.js';
 import { normalizeCustomModels } from './core/model-value-pattern.js';
 import { normalizeOwnerGroupFollowConfig, type OwnerGroupFollowConfig } from './services/owner-group-follow-policy.js';
 import { validateSessionGroupCollaborationConfig, type SessionGroupCollaborationConfig } from './services/collab-group-config.js';
@@ -13,8 +15,8 @@ import { getTurnResultRuntime } from './core/turn-result-runtime.js';
 import { parseSandboxNetworkPolicy } from './core/sandbox-network-policy.js';
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { normalizeCodexInstancePool, registerCodexInstanceBot, clearCodexInstanceBots, validateCodexInstanceRoster } from './services/codex-instance-pool.js';
-import { readFileSync, existsSync, statSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { readFileSync, existsSync, lstatSync, statSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
 import { underReadIsolation } from './adapters/cli/read-isolation.js';
 import { retiredCli, retiredCliNotice } from './adapters/cli/retired-cli.js';
 import {
@@ -42,6 +44,7 @@ import {
   type CliLaunchMode,
 } from './core/cli-launch-mode.js';
 import { logger } from './utils/logger.js';
+import { LARK_UNION_ID_PATTERN } from './services/trigger-types.js';
 import { isLocalBotId } from './setup/local-bot.js';
 import {
   normalizeApprovalDeferredScopes,
@@ -1728,13 +1731,6 @@ export interface BotConfig {
    */
   codexBrowser?: CodexBrowserConfig;
   /**
-   * Per-turn 上下文注入方式（#794）。`auto`：对支持的 CLI（目前仅 claude-code），
-   * 把 reminder/whiteboard 从 user turn 文本挪到 UserPromptSubmit hook 注入的
-   * system-reminder，终端输入框只保留消息本身；不支持的 CLI 自动回退内联。
-   * 缺省/`off`：保持内联 envelope（历史行为）。从下一个 follow-up turn 生效。
-   */
-  envelopeInjection?: 'auto' | 'off';
-  /**
    * 最终回复投递方式。`send`（除 doubao 外所有 CLI 的默认）：模型必须自己执行
    * `botmux send` 把回复发到飞书，系统提示与每轮 reminder 都这么要求。`transcript`
    * （自动转发最终回复，按需显式开启）：daemon 从 CLI 会话记录自动取本轮最后的
@@ -2060,6 +2056,14 @@ export interface BotConfig {
    * identity, simply have none and fall back to the resolved allowlist.
    */
   ownerOpenId?: string;
+  /**
+   * Owner's tenant-stable `union_id` (`on_…`), an explicit owner declaration
+   * that can be copied between this owner's bots. It is never resolved by
+   * itself: it names an owner only while the same `on_` entry is in
+   * `allowedUsers` and resolves into the current allowlist. Together with
+   * `ownerOpenId`, both must name the same person.
+   */
+  ownerUnionId?: string;
   /** 首次成功上线后私聊 owner 一次的欢迎语；已发送记录在 dataDir，见 services/welcome-message.ts。 */
   welcomeMessage?: string;
   allowedChatGroups?: string[];
@@ -2167,6 +2171,12 @@ export interface BotConfig {
   /** 助理模式的人设模板目录：每次 spawn 覆盖同步进 owner 的 work/（模板有的覆盖、
    *  用户自己的文件保留）。缺省 = effectiveDefaultWorkingDir。 */
   assistantTemplateDir?: string;
+  /**
+   * 助理模式下是否允许多人群（默认关）。关着时只在真人只有 1 个的群里工作（bot 不计）；
+   * 真人 ≥2 的群消息一律不处理，被真人 @ 时回一句「助理模式不支持多人群」（同群 10 分钟最多一次）。
+   * 只在 assistantMode 开着时有意义。
+   */
+  assistantGroupChat?: boolean;
   /**
    * 是否接受**其他 bot** 通过 `botmux send --slash` 发来的原生斜杠命令
    * （/clear、/model、/close…）。默认开（undefined = 开）；只有显式 false 才关。
@@ -2987,22 +2997,7 @@ export function registerBot(cfg: BotConfig): BotState {
     getTurnResultRuntime()?.clearBot(cfg.larkAppId);
   }
   registerCodexInstanceBot(cfg);
-  const parsedStatus = parsedNativeSubagentRuntimeStatus.get(cfg);
-  const normalizedRuntime = cfg.cliId === 'traex'
-    ? normalizeNativeSubagentRuntimePolicy(cfg.nativeSubagentRuntime)
-    : { ok: true as const, value: undefined };
-  const nativeSubagentRuntimeState: NativeSubagentRuntimeConfigState =
-    parsedStatus === 'invalid' && cfg.nativeSubagentRuntime === undefined
-      ? { status: 'invalid' }
-      : !normalizedRuntime.ok
-        ? { status: 'invalid' }
-        : normalizedRuntime.value
-          ? { status: 'valid', policy: normalizedRuntime.value }
-          : { status: 'absent' };
-  parsedNativeSubagentRuntimeStatus.set(cfg, nativeSubagentRuntimeState.status);
-  cfg.nativeSubagentRuntime = nativeSubagentRuntimeState.status === 'valid'
-    ? nativeSubagentRuntimeState.policy
-    : undefined;
+  const nativeSubagentRuntimeState = settleNativeSubagentRuntimeState(cfg);
   // apiOnly (core-only) bots have NO Feishu credential (empty appSecret). The Lark
   // SDK Client ctor throws "appSecret or clientAssertionProvider is required" on an
   // empty secret, so constructing it would fatal the whole daemon at boot — the
@@ -3048,6 +3043,65 @@ export function registerBot(cfg: BotConfig): BotState {
   }
   bots.set(cfg.larkAppId, state);
   return state;
+}
+
+/** The registry's view of `cfg.nativeSubagentRuntime`: normalizes the field in
+ * place and records the parser outcome (registerBot and
+ * replaceCoreOnlyBotConfig share it). */
+function settleNativeSubagentRuntimeState(cfg: BotConfig): NativeSubagentRuntimeConfigState {
+  const parsedStatus = parsedNativeSubagentRuntimeStatus.get(cfg);
+  const normalizedRuntime = cfg.cliId === 'traex'
+    ? normalizeNativeSubagentRuntimePolicy(cfg.nativeSubagentRuntime)
+    : { ok: true as const, value: undefined };
+  const nativeSubagentRuntimeState: NativeSubagentRuntimeConfigState =
+    parsedStatus === 'invalid' && cfg.nativeSubagentRuntime === undefined
+      ? { status: 'invalid' }
+      : !normalizedRuntime.ok
+        ? { status: 'invalid' }
+        : normalizedRuntime.value
+          ? { status: 'valid', policy: normalizedRuntime.value }
+          : { status: 'absent' };
+  parsedNativeSubagentRuntimeStatus.set(cfg, nativeSubagentRuntimeState.status);
+  cfg.nativeSubagentRuntime = nativeSubagentRuntimeState.status === 'valid'
+    ? nativeSubagentRuntimeState.policy
+    : undefined;
+  return nativeSubagentRuntimeState;
+}
+
+/**
+ * Replace the settings of a registered synthetic core-only bot with `next` (a
+ * config {@link synthesizeCoreOnlyBotConfig} produced), the way a core started
+ * on `next` would register it. The config object keeps its identity — every
+ * holder of `getBot(id).config` (daemon closures, the codex instance roster)
+ * sees the new values — like the in-memory side of applyConfigField: values
+ * are assigned, keys `next` lacks are deleted. Sessions already running keep
+ * what they froze at launch; new ones read the new values.
+ *
+ * Identity never changes here: `next` must be the same apiOnly bot. Everything
+ * that can throw runs before the first write, so a rejected `next` leaves the
+ * registry exactly as it was.
+ */
+export function replaceCoreOnlyBotConfig(larkAppId: string, next: BotConfig): void {
+  const bot = getBot(larkAppId);
+  if (next.larkAppId !== larkAppId || next.apiOnly !== true || bot.config.apiOnly !== true) {
+    throw new Error('core-only bot config replacement must keep the same apiOnly bot');
+  }
+  normalizeCodexInstancePool(next.codexInstancePool, next);
+  const target = bot.config as unknown as Record<string, unknown>;
+  const source = next as unknown as Record<string, unknown>;
+  const parsedStatus = parsedNativeSubagentRuntimeStatus.get(next);
+  for (const key of Object.keys(target)) {
+    if (!Object.hasOwn(source, key)) delete target[key];
+  }
+  Object.assign(target, source);
+  if (parsedStatus) parsedNativeSubagentRuntimeStatus.set(bot.config, parsedStatus);
+  else parsedNativeSubagentRuntimeStatus.delete(bot.config);
+  // The rest of what registerBot derives from a config: apiOnly keeps the Lark
+  // clients null and turn results cleared; allowedUsers is not a core profile
+  // setting, so the resolved lists stay as they are.
+  getTurnResultRuntime()?.clearBot(larkAppId);
+  registerCodexInstanceBot(bot.config);
+  bot.nativeSubagentRuntimeState = settleNativeSubagentRuntimeState(bot.config);
 }
 
 /** Publish the persisted native-subagent policy and its diagnostic metadata as
@@ -3164,21 +3218,68 @@ export function getConfiguredOwnerOpenId(larkAppId: string): string | undefined 
 }
 
 /**
- * Current permission owner: explicit ownerOpenId keeps priority only while it
+ * The explicitly declared owner (`ownerOpenId` / `ownerUnionId`) as this app's
+ * open_id. `declared` without `openId` means a declaration exists but names
+ * nobody in the resolved allowlist, or the two fields name different people.
+ */
+function explicitOwner(bot: BotState): { declared: boolean; openId?: string } {
+  const byOpenId = getConfiguredOwnerOpenId(bot.config.larkAppId);
+  const unionId = bot.config.ownerUnionId;
+  if (!byOpenId && !unionId) return { declared: false };
+  const byUnionId = unionId ? bot.rawAllowedUserResolution.get(unionId) : undefined;
+  if (unionId && !byUnionId) return { declared: true };
+  if (byOpenId && byUnionId && byOpenId !== byUnionId) return { declared: true };
+  const openId = byOpenId ?? byUnionId!;
+  return bot.resolvedAllowedUsers.includes(openId) ? { declared: true, openId } : { declared: true };
+}
+
+/**
+ * Current permission owner: an explicit owner keeps priority only while it
  * is still in the resolved allowlist. Once removed or unresolved, ownership
  * follows the first resolved ou_ entry, matching legacy allowlist semantics.
  */
 export function getOwnerOpenId(larkAppId: string): string | undefined {
   const bot = bots.get(larkAppId);
   if (!bot) return undefined;
-  return getStrictOwnerOpenId(larkAppId) ?? bot.resolvedAllowedUsers.find(u => u.startsWith('ou_'));
+  return explicitOwner(bot).openId ?? bot.resolvedAllowedUsers.find(u => u.startsWith('ou_'));
 }
 
+/**
+ * The owner a host administrator may act as. Unlike {@link getOwnerOpenId} it
+ * never guesses among several people: an explicit owner must be in the
+ * resolved allowlist; without one, the owner is the allowlist's only person,
+ * and only when every configured entry resolved to that same person (an
+ * entry that failed to resolve may be someone else).
+ */
 export function getStrictOwnerOpenId(larkAppId: string): string | undefined {
-  const configuredOwner = getConfiguredOwnerOpenId(larkAppId);
-  if (configuredOwner && bots.get(larkAppId)?.resolvedAllowedUsers.includes(configuredOwner)) {
-    return configuredOwner;
-  }
+  const bot = bots.get(larkAppId);
+  if (!bot) return undefined;
+  const explicit = explicitOwner(bot);
+  if (explicit.declared) return explicit.openId;
+  const people = new Set(bot.resolvedAllowedUsers.filter(u => u.startsWith('ou_')));
+  if (people.size !== 1) return undefined;
+  const [only] = people;
+  const entries = bot.config.allowedUsers ?? [];
+  const allResolved = entries.length > 0
+    && entries.every(e => (bot.rawAllowedUserResolution.get(e) ?? (e.startsWith('ou_') ? e : undefined)) === only);
+  return allResolved ? only : undefined;
+}
+
+/**
+ * Whether `unionId` names `ownerOpenId` ({@link getStrictOwnerOpenId}) as far
+ * as this bot's configuration can tell: an `on_` allowlist entry or an
+ * explicit `ownerUnionId` answers directly. `lookup` means only the owner's
+ * own union_id, fetched with this app's credentials, can decide.
+ */
+export function ownerUnionIdVerdict(
+  larkAppId: string, ownerOpenId: string, unionId: string,
+): 'match' | 'mismatch' | 'lookup' {
+  const bot = bots.get(larkAppId);
+  if (!bot) return 'mismatch';
+  const listed = bot.rawAllowedUserResolution.get(unionId);
+  if (listed !== undefined) return listed === ownerOpenId ? 'match' : 'mismatch';
+  // A declared ownerUnionId that named the owner is itself in the map above.
+  return bot.config.ownerUnionId ? 'mismatch' : 'lookup';
 }
 
 /** Per-bot 最终回复投递方式的**显式**配置值；未配置 / 未注册的 bot 返回 undefined，
@@ -3671,29 +3772,47 @@ export function loadBotConfigs(): BotConfig[] {
  * path (even though the file is absent/ignored) so the no-transport fs-policy sees
  * the config as living INSIDE the default botmux authority root — never an external
  * path or a carve-out, which would trip buildFsPolicy's fail-closed checks.
+ *
+ * `env` is the environment synthesized from: the process's own, except when a
+ * native gateway core validates a candidate profile before committing it
+ * (core/native-gateway-core-profile.ts), which hands a copy carrying the
+ * candidate values.
  */
-function maybeSynthesizeCoreOnlyConfig(): BotConfig[] | null {
-  if (process.env.BOTMUX_CORE_ONLY !== '1') return null;
+function maybeSynthesizeCoreOnlyConfig(env: NodeJS.ProcessEnv = process.env): BotConfig[] | null {
+  if (!isCoreOnlyEnv(env)) return null;
 
-  const larkAppId = process.env.BOTMUX_API_ONLY_BOT || 'local_riff';
+  const larkAppId = env.BOTMUX_API_ONLY_BOT || 'local_riff';
   if (!/^local_[A-Za-z0-9._-]+$/.test(larkAppId)) {
     throw new Error(
       `Core-only BOTMUX_API_ONLY_BOT must match local_<slug> (letters/digits/._-), got: ${larkAppId}`,
     );
   }
-  const cliId = process.env.BOTMUX_CORE_CLI || 'codex-app';
-  const entry: Record<string, unknown> = { larkAppId, apiOnly: true, cliId };
-  if (process.env.BOTMUX_CORE_WORKING_DIR) entry.workingDir = process.env.BOTMUX_CORE_WORKING_DIR;
-  // Core-only keeps tmux as the default. PTY is an explicit opt-in for embedded
-  // hosts that cannot establish a reliable tmux server; it is intentionally
-  // limited to this synthetic apiOnly Bot and never changes fleet defaults.
-  const coreBackend = process.env.BOTMUX_CORE_BACKEND;
-  if (coreBackend !== undefined && coreBackend !== 'tmux' && coreBackend !== 'pty') {
-    throw new Error(`Core-only BOTMUX_CORE_BACKEND must be tmux or pty, got: ${coreBackend}`);
+  const cliId = env.BOTMUX_CORE_CLI || 'codex-app';
+  // Host-supplied transport-neutral profile (the native gateway's managed core
+  // passes it; any core-only host may). Identity fields below are applied after
+  // it, so the profile can never override larkAppId / apiOnly / cliId.
+  const profileJson = coreOnlyBotProfileJson(env);
+  const profile = profileJson ? validateCoreOnlyBotProfile(JSON.parse(profileJson)) : {};
+  const entry: Record<string, unknown> = {
+    ...profile,
+    larkAppId,
+    apiOnly: true,
+    cliId,
+    ...(profile.customPassthroughCommands ? { tuiSlashAllow: profile.customPassthroughCommands } : {}),
+  };
+  if (env.BOTMUX_CORE_WORKING_DIR) entry.workingDir = env.BOTMUX_CORE_WORKING_DIR;
+  // Core-only keeps tmux as the default. A host may select any backend in
+  // CORE_ONLY_BACKENDS (the WeCom managed core offers that same list in its
+  // configuration and passes the choice here); anything else fails instead of
+  // falling back. The choice is limited to this synthetic apiOnly Bot and never
+  // changes fleet defaults.
+  const coreBackend = env.BOTMUX_CORE_BACKEND;
+  if (coreBackend !== undefined && !(CORE_ONLY_BACKENDS as readonly string[]).includes(coreBackend)) {
+    throw new Error(`Core-only BOTMUX_CORE_BACKEND must be a supported session backend, got: ${coreBackend}`);
   }
   if (coreBackend) entry.backendType = coreBackend;
-  if (process.env.BOTMUX_CORE_MODEL) entry.model = process.env.BOTMUX_CORE_MODEL;
-  if (process.env.BOTMUX_CORE_CODEX_AUTH_SYNC === 'isolated') entry.codexAuthSync = 'isolated';
+  if (env.BOTMUX_CORE_MODEL) entry.model = env.BOTMUX_CORE_MODEL;
+  if (env.BOTMUX_CORE_CODEX_AUTH_SYNC === 'isolated') entry.codexAuthSync = 'isolated';
   // Route through the normal parser so the synthesized entry gets identical
   // validation + normalization as a file-loaded one (apiOnly secret exemption,
   // cliId check, defaults). Pin loadedConfigPath to the default in-root path.
@@ -3707,6 +3826,17 @@ function maybeSynthesizeCoreOnlyConfig(): BotConfig[] | null {
   return configs;
 }
 
+/**
+ * The single synthetic bot a core-only service started on `env` would run —
+ * the same synthesis as {@link loadBotConfigs}, for a candidate environment.
+ * Throws when `env` is not a core-only one or its settings are invalid.
+ */
+export function synthesizeCoreOnlyBotConfig(env: NodeJS.ProcessEnv): BotConfig {
+  const configs = maybeSynthesizeCoreOnlyConfig(env);
+  if (!configs || configs.length !== 1) throw new Error('not a core-only environment');
+  return configs[0]!;
+}
+
 function resolveBotConfigPath(): string {
   // 1. BOTS_CONFIG env var — an EXACT file, and the top of the chain. For a
   //    daemon-spawned CLI child this is the path the daemon pinned (its own
@@ -3715,7 +3845,16 @@ function resolveBotConfigPath(): string {
   const botsConfigPath = process.env.BOTS_CONFIG;
   if (botsConfigPath) {
     const resolved = resolve(botsConfigPath);
-    if (!existsSync(resolved)) {
+    let pinnedMissing: string | undefined;
+    try {
+      statSync(resolved);
+    } catch (err: any) {
+      // A parent that cannot be searched is a permission fault, not "gone";
+      // either way the pinned registry stays authoritative (no fallback).
+      if (err?.code !== 'ENOENT' && err?.code !== 'ENOTDIR') throw botConfigAccessError(resolved, err);
+      pinnedMissing = err.code;
+    }
+    if (pinnedMissing) {
       // FAIL CLOSED, and deliberately so. For a daemon-spawned CLI child this
       // path is the registry the daemon actually parsed (pinned by spawnCli), so
       // "it is gone now" must NOT degrade into "resolve my own HOME's default
@@ -3723,12 +3862,13 @@ function resolveBotConfigPath(): string {
       // DIFFERENT fleet's registry, and quietly switching authority would run
       // this bot against another fleet's secret and routing. Losing the file is
       // an operator-visible fault; changing registries behind their back is worse.
-      throw new Error(
+      // Keep the errno (ENOENT vs ENOTDIR) so a strict reader can say which.
+      throw Object.assign(new Error(
         `BOTS_CONFIG file not found: ${resolved}`
         + ` — refusing to fall back to a different registry.`
         + ` (For a botmux-spawned CLI this is the exact bots.json the daemon loaded;`
         + ` if it was moved or unmounted, restore it or restart the daemon.)`,
-      );
+      ), { code: pinnedMissing });
     }
     loadedConfigPath = resolved;
     loadedConfigProvenance = 'loaded';
@@ -3736,16 +3876,102 @@ function resolveBotConfigPath(): string {
   }
 
   // 2. <config dir>/bots.json (i.e. os.homedir()/.botmux/bots.json)
+  // One stat decides it: existsSync() also answers false when the path cannot
+  // be inspected (e.g. lost search permission on ~/.botmux), and only a
+  // proven-absent file is "no configuration".
   const defaultPath = resolveBotsConfigFile();
-  if (existsSync(defaultPath)) {
-    loadedConfigPath = defaultPath;
-    loadedConfigProvenance = 'loaded';
-    return defaultPath;
+  try {
+    statSync(defaultPath);
+  } catch (err: any) {
+    if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') {
+      // Only a truly absent file under an absent-or-real config directory is
+      // "no configuration". ENOTDIR (the config dir is a file, or a link to
+      // one), a bots.json link whose target moved, and a config dir that is a
+      // dangling link are all broken configurations.
+      if (!defaultConfigProvenAbsent(defaultPath, err.code)) {
+        throw new BotConfigLoadError('unreadable', defaultPath, err.code, err);
+      }
+      throw new BotConfigNotFoundError(
+        'No bot configuration found. Set BOTS_CONFIG or create ~/.botmux/bots.json.\nSee README for config format.'
+      );
+    }
+    throw botConfigAccessError(defaultPath, err);
   }
+  loadedConfigPath = defaultPath;
+  loadedConfigProvenance = 'loaded';
+  return defaultPath;
+}
 
-  throw new Error(
-    'No bot configuration found. Set BOTS_CONFIG or create ~/.botmux/bots.json.\nSee README for config format.'
-  );
+/** No bots.json exists at all (BOTS_CONFIG unset, default file absent). Lets a
+ *  caller tell "nothing is configured" apart from a file it failed to read or
+ *  parse; a pinned-but-missing BOTS_CONFIG is a fault and stays a plain Error. */
+export class BotConfigNotFoundError extends Error {
+  override name = 'BotConfigNotFoundError';
+}
+
+export type BotConfigLoadFailure = 'permission_denied' | 'unreadable' | 'invalid_json' | 'invalid_config';
+
+/**
+ * bots.json could not be loaded. The message carries only the failure category,
+ * an fs error code and the file path — never validator text, which can quote
+ * raw values (including secrets) from ANY bot's entry. The original error stays
+ * on `cause` for local debugging; do not persist or send it.
+ */
+export class BotConfigLoadError extends Error {
+  override name = 'BotConfigLoadError';
+  constructor(
+    readonly reason: BotConfigLoadFailure,
+    readonly path: string | undefined,
+    readonly code: string | undefined,
+    cause: unknown,
+  ) {
+    const category = {
+      permission_denied: 'permission denied',
+      unreadable: 'unreadable',
+      invalid_json: 'invalid JSON',
+      invalid_config: 'invalid bot configuration',
+    }[reason];
+    super(`bots.json ${category}${code ? ` (${code})` : ''}${path ? ` (file: ${path})` : ''}`, { cause });
+  }
+}
+
+/** The directory entry itself exists (lstat: a dangling symlink counts). Only
+ *  ENOENT/ENOTDIR mean absent; any other lstat failure is a read fault. */
+function pathEntryExists(path: string): boolean {
+  try { lstatSync(path); return true; } catch (err: any) {
+    if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') return false;
+    throw botConfigAccessError(path, err);
+  }
+}
+
+/** stat(file) said ENOENT/ENOTDIR: true only when the file entry is absent
+ *  and its nearest existing ancestor is a real directory. Read faults on the way
+ *  (EACCES, EIO, …) throw. */
+function defaultConfigProvenAbsent(file: string, statCode: string): boolean {
+  if (statCode !== 'ENOENT' || pathEntryExists(file)) return false;
+  // Walk up to the nearest entry that exists: the file is absent only if that
+  // entry resolves to a real directory (a dangling link anywhere on the way —
+  // ~/.botmux, $HOME, … — makes the registry unreachable, not absent).
+  let dir = dirname(file);
+  while (!pathEntryExists(dir)) {
+    const parent = dirname(dir);
+    if (parent === dir) return true;
+    dir = parent;
+  }
+  try { return statSync(dir).isDirectory(); } catch (err: any) {
+    if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') return false;
+    throw botConfigAccessError(dir, err);
+  }
+}
+
+function fsErrorCode(err: unknown): string | undefined {
+  const code = (err as { code?: unknown } | null)?.code;
+  return typeof code === 'string' && /^E[A-Z0-9]+$/.test(code) ? code : undefined;
+}
+
+function botConfigAccessError(path: string, err: unknown): BotConfigLoadError {
+  const code = fsErrorCode(err);
+  return new BotConfigLoadError(code === 'EACCES' || code === 'EPERM' ? 'permission_denied' : 'unreadable', path, code, err);
 }
 
 const warnedRetiredCliApps = new Set<string>();
@@ -3932,16 +4158,37 @@ function parseBotConfigFile(filePath: string): BotConfig[] {
  * {@link loadBotConfigs} 的按原文缓存版：bots.json 内容没变就复用上次的解析结果（几十个 bot
  * 的解析要几十毫秒）。给热路径上只读的调用方用（如同机兄弟 bot 的身份判定），返回值不要改。
  * 读文件失败的语义与 loadBotConfigs 一致。
+ *
+ * `strictRead`：读不出文件时一律抛错，不走读隔离下 EPERM/EACCES → [] 的降级；除"根本没有配置"
+ * （BotConfigNotFoundError）外，所有失败都收敛为只含类别/错误码/路径的 {@link BotConfigLoadError}，
+ * 不带校验器原文。给必须区分"确实没有该 bot"与"读不到配置"、且会把错误落盘的调用方用
+ * （v3 workflow 节点配置解析）。
  */
 let parsedBotConfigsCache: { path: string; text: string; configs: BotConfig[] } | undefined;
-export function loadBotConfigsCached(): readonly BotConfig[] {
-  const synthetic = maybeSynthesizeCoreOnlyConfig();
+export function loadBotConfigsCached(options: { strictRead?: boolean } = {}): readonly BotConfig[] {
+  const strict = options.strictRead === true;
+  let synthetic: BotConfig[] | null;
+  try {
+    synthetic = maybeSynthesizeCoreOnlyConfig();
+  } catch (err) {
+    if (strict) throw new BotConfigLoadError('invalid_config', undefined, undefined, err);
+    throw err;
+  }
   if (synthetic) return synthetic;
-  const filePath = resolveBotConfigPath();
+  let filePath: string;
+  try {
+    filePath = resolveBotConfigPath();
+  } catch (err) {
+    if (!strict || err instanceof BotConfigNotFoundError || err instanceof BotConfigLoadError) throw err;
+    // A pinned BOTS_CONFIG that is gone (its message is constant text + path).
+    throw new BotConfigLoadError('unreadable',
+      process.env.BOTS_CONFIG ? resolve(process.env.BOTS_CONFIG) : undefined, fsErrorCode(err), err);
+  }
   let text: string;
   try {
     text = readFileSync(filePath, 'utf-8');
-  } catch {
+  } catch (err) {
+    if (strict) throw botConfigAccessError(filePath, err);
     return parseBotConfigFile(filePath);
   }
   if (parsedBotConfigsCache?.path === filePath && parsedBotConfigsCache.text === text) {
@@ -3951,6 +4198,11 @@ export function loadBotConfigsCached(): readonly BotConfig[] {
   try {
     configs = parseBotConfigsFromText(text);
   } catch (err: any) {
+    if (strict) {
+      let syntax = false;
+      try { JSON.parse(text); } catch { syntax = true; }
+      throw new BotConfigLoadError(syntax ? 'invalid_json' : 'invalid_config', filePath, undefined, err);
+    }
     throw new Error(`${err?.message ?? err} (file: ${filePath})`);
   }
   parsedBotConfigsCache = { path: filePath, text, configs };
@@ -4667,9 +4919,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       replyDelivery: entry.replyDelivery === 'transcript' || entry.replyDelivery === 'send' ? entry.replyDelivery : undefined,
       durableImReplies: entry.durableImReplies === true || undefined,
       promptInjection: entry.promptInjection === 'none' ? 'none' : undefined,
-      // Only the non-default hook mode is persisted; absent, 'off', and invalid
-      // values all retain the historical inline behavior.
-      envelopeInjection: entry.envelopeInjection === 'auto' ? 'auto' : undefined,
+      // Legacy `envelopeInjection` ('auto' | 'off') keys in existing bots.json
+      // are compatibly ignored: Claude Code hook injection is now default-on.
       codexBrowser,
       codexRpcInput: typeof entry.codexRpcInput === 'boolean' ? entry.codexRpcInput : undefined,
       existingAppServer,
@@ -4751,6 +5002,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       ownerOpenId: typeof entry.ownerOpenId === 'string' && entry.ownerOpenId.startsWith('ou_')
         ? entry.ownerOpenId
         : undefined,
+      ownerUnionId: typeof entry.ownerUnionId === 'string' && LARK_UNION_ID_PATTERN.test(entry.ownerUnionId)
+        ? entry.ownerUnionId
+        : undefined,
       welcomeMessage: typeof entry.welcomeMessage === 'string' && entry.welcomeMessage.trim()
         ? entry.welcomeMessage.trim()
         : undefined,
@@ -4783,6 +5037,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       assistantTemplateDir: typeof entry.assistantTemplateDir === 'string' && entry.assistantTemplateDir.trim()
         ? entry.assistantTemplateDir.trim()
         : undefined,
+      assistantGroupChat: entry.assistantGroupChat === true || undefined,
       messageQuota,
       grantDefaultDurationMs,
       quotaState,

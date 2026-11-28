@@ -35,7 +35,7 @@ let dispatcher: (data: any, appId: string, handlers: any) => Promise<any>;
 // 非文本断言：执行真实 dispatcher ACK 函数，隔离整个事件模块启动；不检查源码措辞或位置。
 function loadAckDispatcher(): typeof dispatcher {
   const parsed = ts.createSourceFile('event-dispatcher.ts', readFileSync(join(process.cwd(), 'src/im/lark/event-dispatcher.ts'), 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
-  const names = ['handleCardActionAckSafe', 'shapeCardActionResult', 'patchTimedOutCardActionResult', 'serializeRawCardForPatch', 'cardActionMessageId'];
+  const names = ['handleCardActionAckSafe', 'shapeCardActionResult', 'patchTimedOutCardActionResult', 'serializeRawCardForPatch', 'cardActionMessageId', 'cardActionToken', 'cardActionOperatorOpenId', 'delayedUpdateCardFromRaw', 'cardActionPatchErrorDetail'];
   const printer = ts.createPrinter();
   const declarations = names.map(name => {
     const declaration = parsed.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === name);
@@ -55,6 +55,8 @@ function loadAckDispatcher(): typeof dispatcher {
     localeForBot: () => 'zh-CN',
     t: (key: string) => key,
     updateMessage: mocks.patch,
+    updateInteractiveCardByToken: mocks.patch,
+    extractLarkErrorShape: (err: unknown) => ({ message: err instanceof Error ? err.message : String(err) }),
   };
   const proxy = new Proxy(scope, {
     has: (_target, key) => key !== Symbol.unscopables,
@@ -110,10 +112,9 @@ describe('Oncall join callback ACK ordering', () => {
     expect(result.toast.type).toBe('success');
     expect(order).toEqual(['ACK']);
     await vi.advanceTimersByTimeAsync(0);
-    await until(() => order.includes('PATCH'));
+    await until(() => groups.getRequest(source)?.cardRefreshPending === false);
     expect(order).toEqual(['ACK', 'PATCH']);
     expect(visibleCard).toContain(inviteLink);
-    expect(groups.getRequest(source)?.cardRefreshPending).toBe(false);
     expect(mocks.invite).not.toHaveBeenCalled();
   });
   it('sends the legacy invitation reply after ACK when no card snapshot exists', async () => {

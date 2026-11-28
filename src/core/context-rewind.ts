@@ -23,7 +23,7 @@ import {
   isTranscriptRateLimitEvent,
   type TranscriptEvent,
 } from '../services/claude-transcript.js';
-import { stripBotmuxDisplayBlocks } from '../utils/prompt-display-strip.js';
+import { stripBotmuxDisplayBlocks, stripBotmuxEnvelopeBlocks } from '../utils/prompt-display-strip.js';
 import { rewindBackupSuffix } from './rewind-backup-retention.js';
 
 export interface RewindCheckpoint {
@@ -68,13 +68,13 @@ export const REWIND_CHECKPOINT_LIMIT = 10;
 
 /** 从一条 `<user_message>` / `<botmux_*>` 注入口袋里剥出人真正说的话。 */
 export function summarizeUserText(text: string): string {
-  let body = text;
-  const m = /<user_message>([\s\S]*?)<\/user_message>/i.exec(body);
-  if (m) body = m[1] ?? '';
-  body = stripBotmuxDisplayBlocks(body)
-    // bare（transcript + solo）续轮没有 <user_message> 壳；上面整块剥掉追加
-    // 在用户正文后的 <botmux_formatting>（含块体），再清掉其余残留标签，
-    // 否则内部提示会混进预览文案。
+  const m = /<user_message>([\s\S]*?)<\/user_message>/i.exec(text);
+  const raw = m
+    ? stripBotmuxDisplayBlocks(m[1] ?? '')
+    // hook 注入或 bare（transcript + solo）轮没有 <user_message> 壳：整块剥掉
+    // 已知 BotMux 上下文/提示块（含块体），再清掉其余残留标签，避免内部提示混进预览。
+    : stripBotmuxEnvelopeBlocks(text, { replacement: ' ' });
+  const body = raw
     .replace(/<[^>]+>/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
@@ -165,6 +165,8 @@ export function scanClaudeTranscriptCheckpoints(path: string, limit = 20, scope:
 
 /** 一个打开着的 transcript：扫描和截断都经同一个描述符，截断的一定是扫描读的那个文件。 */
 export interface OpenTranscript {
+  /** Bounded read from the same descriptor used by cut, for other native formats. */
+  read(maxBytes: number): Buffer;
   scan(limit?: number): RewindCheckpoint[];
   /** The last turn, read from the held descriptor (see {@link inspectLastClaudeTurn}). */
   lastTurn(limit?: number): LastTurnInspection;
@@ -176,15 +178,50 @@ export interface OpenTranscript {
  *  之间被换成别的文件也碰不到它，inode 号也不会在持有期间被别的文件复用。 */
 export function withOpenTranscript<T>(path: string, scope: TranscriptTreeScope, use: (transcript: OpenTranscript) => T): T {
   const fd = openTranscript(path, scope, fsConstants.O_RDWR);
+  let lastRead: ReturnType<typeof fstatSync> | undefined;
+  let lastReadBytes: Buffer | undefined;
+  const readExact = (size: number): Buffer => {
+    const bytes = Buffer.alloc(size);
+    let offset = 0;
+    while (offset < size) {
+      const count = readSync(fd, bytes, offset, size - offset, offset);
+      if (!count) throw new Error('transcript changed during read');
+      offset += count;
+    }
+    return bytes;
+  };
+  const verifyRead = (): void => {
+    if (!lastRead) return;
+    const current = fstatSync(fd);
+    if (current.size !== lastRead.size || current.mtimeMs !== lastRead.mtimeMs || current.ctimeMs !== lastRead.ctimeMs) {
+      throw new Error('transcript changed after inspection');
+    }
+    assertSameInode(lstatSync(path), current, path);
+    // Filesystems with coarse timestamp resolution can keep every checked stat
+    // unchanged for a same-size write. Compare the inspected bytes as well.
+    if (lastReadBytes && !readExact(current.size).equals(lastReadBytes)) {
+      throw new Error('transcript changed after inspection');
+    }
+  };
   try {
     return use({
+      read: maxBytes => {
+        lastRead = fstatSync(fd);
+        const size = lastRead.size;
+        if (size > maxBytes) throw new Error('transcript exceeds read budget');
+        const bytes = readExact(size);
+        verifyRead();
+        lastReadBytes = bytes;
+        return bytes;
+      },
       scan: (limit = 20) => scanDescriptor(fd, limit),
       lastTurn: (limit = LAST_TURN_SCAN_LIMIT_BYTES) => lastTurnOfDescriptor(fd, limit),
       cut: (offset, now = Date.now(), opts = {}) => {
         // The backup is created next to the path: it must still name the
         // file held here (held open, its inode cannot have been reused).
         assertSameInode(lstatSync(path), fstatSync(fd), path);
-        return rewindOpenTranscript(fd, path, offset, now, { ...scope, ...opts });
+        verifyRead();
+        return rewindOpenTranscript(fd, path, offset, now, { ...scope, ...opts, ...(lastRead ? { beforeCut: verifyRead } : {}) });
       },
     });
   } finally {
@@ -770,7 +807,7 @@ function mayFollowRestoredTurn(line: string): boolean {
 export function restoreRewoundTranscript(
   path: string,
   cut: { offset: number; transcript: FileIdentity; removed: Buffer },
-  scope: TranscriptTreeScope = {},
+  scope: TranscriptTreeScope & { requireUnchangedTail?: boolean } = {},
 ): boolean {
   // The transcript sits in a directory the sandboxed CLI can write: opened the
   // way every transcript read here is (no link, no FIFO, inside that tree),
@@ -784,6 +821,9 @@ export function restoreRewoundTranscript(
     const st = fstatSync(fd);
     if (!sameFile(pre, st) || !sameFile(cut.transcript, st)) return false;
     const size = st.size;
+    // Native formats whose response/tool records do not look like Claude
+    // messages must never reuse Claude's permissive metadata-tail predicate.
+    if (scope.requireUnchangedTail && size !== cut.offset) return false;
     if (size < cut.offset || size - cut.offset > RESTORE_TAIL_LIMIT_BYTES) return false;
     const tail = Buffer.alloc(size - cut.offset);
     if (tail.length > 0 && readSync(fd, tail, 0, tail.length, cut.offset) !== tail.length) return false;

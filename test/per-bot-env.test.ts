@@ -129,6 +129,8 @@ describe('isReservedPerBotEnvKey()', () => {
       'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_EXECPATH', 'CLAUDE_PID',
       'CODEX_HOME', 'GROK_HOME', 'DSH_HOME', 'LARKSUITE_CLI_DATA_DIR',
       'CJADK_INTERACTIVE', 'IS_SANDBOX', 'SESSION_DATA_DIR',
+      'BOTMUX_TRAEX_OCCUPANT_ID', 'BOTMUX_TRAEX_DOMAIN_KEY',
+      'BOTMUX_TRAEX_SNAPSHOT_DIR', 'TRAEX_CODE_MODE_HOST_PATH',
       'TMPDIR', 'TMP', 'TEMP', '__OWNER_OPEN_ID',
     ]) {
       expect(isReservedPerBotEnvKey(k), k).toBe(true);
