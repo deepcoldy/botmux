@@ -646,6 +646,60 @@ describe('Worker resetTraexAutoModelBeforePendingTurn & flushPending during TRAE
     expect(scope.pendingMessages).toEqual([]);
   });
 
+  it('does not publish idle when a nested task_complete lands while a sibling continuation stays open without an OSC working hold', () => {
+    const h = buildWorkerHarness({ reselectPerTurn: false });
+    const { scope, rolloutPath, detector } = h;
+
+    // Two nested subagent continuations start in one drain; the becameActive
+    // branch revokes readiness and resets the detector before any OSC working.
+    appendFileSync(
+      rolloutPath,
+      traexTaskStarted('native-t2', 'native-t1', '2026-11-28T00:01:00.000Z')
+        + traexTaskStarted('native-t3', 'native-t1', '2026-11-28T00:01:01.000Z'),
+    );
+    scope.codexBridgeIngest();
+    expect(scope.traexNativeContinuation.hasTranscriptContinuation()).toBe(true);
+    // OSC 7501 has no heartbeat: the working hold can be absent while rollout
+    // still proves both continuations running.
+    expect(detector.programStatusHeldWorking()).toBe(false);
+    expect(detector.isIdleNow()).toBe(false);
+
+    // Sibling t3 closes with its own assistant_final; t2 remains open.
+    appendFileSync(
+      rolloutPath,
+      traexTaskComplete('native-t3', 'sibling synthesis', '2026-11-28T00:02:00.000Z'),
+    );
+    scope.codexBridgeIngest();
+    expect(scope.traexNativeContinuation.hasTranscriptContinuation()).toBe(true);
+    // The assistant_final must not fireIdle() into a wrong ready edge while t2
+    // is demonstrably still running on transcript evidence alone.
+    expect(detector.isIdleNow()).toBe(false);
+  });
+
+  it('retires an armed post-terminal fence from the external-idle path while a transcript continuation stays open', () => {
+    const h = buildWorkerHarness({
+      reselectPerTurn: false,
+      viewport: '◆ Working… (1s • esc to interrupt)',
+    });
+    const { scope, rolloutPath } = h;
+
+    scope.armPostTerminalInputFence();
+    expect(scope.postTerminalInputFence).not.toBeNull();
+
+    // Nested continuation opens with no started/queued Botmux turn in the queue.
+    appendFileSync(
+      rolloutPath,
+      traexTaskStarted('native-t2', 'native-t1', '2026-11-28T00:01:00.000Z'),
+    );
+    scope.codexBridgeIngest();
+    expect(scope.traexNativeContinuation.hasTranscriptContinuation()).toBe(true);
+
+    // An external idle edge reaches the fence while the continuation is open:
+    // it must retire the stale predecessor fence instead of keeping input held.
+    expect(scope.postTerminalPromptFenceHolds('external', scope.backend)).toBe(true);
+    expect(scope.postTerminalInputFence).toBeNull();
+  });
+
   it('still holds post-terminal successors waiting for composer recovery when NOT in native continuation (reselectPerTurn on & off)', () => {
     for (const reselectPerTurn of [false, true]) {
       const h = buildWorkerHarness({ reselectPerTurn, switchToBackupFirst: true });
