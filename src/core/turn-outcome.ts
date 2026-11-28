@@ -21,6 +21,7 @@ import {
   type TurnOutcome,
 } from './session-task-status.js';
 import { emitSessionTaskEvent } from './session-task-events.js';
+import { sameMergedTurnGroup } from './turn-absorption.js';
 import type { DaemonSession } from './types.js';
 
 /** 等本轮 daemon 兜底最终回复投递完成的上限，覆盖现有 0/5/15 秒重试序列。 */
@@ -244,6 +245,10 @@ export async function recordTurnOutcome(
     /** Per-turn facts, independent of whether this turn still owns the latest projection. */
     onClassified?: (outcome: TurnOutcome) => void;
     isFinalDelivered: () => boolean;
+    /** Host turn that answered a mid-turn absorbed follow-up; drained alongside
+     *  `terminal.turnId` and consulted as summary fallback when this turn has no
+     *  standalone reply of its own. */
+    fallbackTurnId?: string;
     drainTimeoutMs?: number;
     now?: () => number;
     dataDir?: string;
@@ -254,17 +259,24 @@ export async function recordTurnOutcome(
   const seq = (outcomeSeq.get(ds) ?? 0) + 1;
   outcomeSeq.set(ds, seq);
   remember(terminalStatuses, ds, terminal.turnId, terminal);
+  const fallbackTurnId = opts.fallbackTurnId && opts.fallbackTurnId !== terminal.turnId
+    ? opts.fallbackTurnId
+    : undefined;
   if (terminal.status === 'completed') {
+    const drains = [waitForTurnFinalOutputDeliveryDrain(ds, terminal.turnId)];
+    if (fallbackTurnId) drains.push(waitForTurnFinalOutputDeliveryDrain(ds, fallbackTurnId));
     await waitAllWithin(
-      [waitForTurnFinalOutputDeliveryDrain(ds, terminal.turnId)],
+      drains,
       now() + (opts.drainTimeoutMs ?? TURN_OUTCOME_DRAIN_TIMEOUT_MS),
       now,
     );
   }
+  const ownKind = finalKinds.get(ds)?.get(terminal.turnId);
+  const effectiveKind = ownKind ?? (fallbackTurnId ? finalKinds.get(ds)?.get(fallbackTurnId) : undefined);
   const outcome = classifyTurnOutcome(terminal, {
     recoveryHandled: opts.recoveryHandled,
     finalDelivered: terminal.status === 'completed' && opts.isFinalDelivered()
-      && finalKinds.get(ds)?.get(terminal.turnId) !== 'diagnostic',
+      && effectiveKind !== 'diagnostic',
   });
   opts.onClassified?.(outcome);
   if (outcomeSeq.get(ds) !== seq) return undefined;
@@ -280,8 +292,10 @@ export async function recordTurnOutcome(
     return undefined;
   }
   heldBackNoOutput.delete(ds);
+  const dataDir = opts.dataDir ?? config.session.dataDir;
   const summary = outcome === 'delivered'
-    ? turnFinalSummary(ds, terminal.turnId, opts.dataDir ?? config.session.dataDir)
+    ? (turnFinalSummary(ds, terminal.turnId, dataDir)
+      ?? (fallbackTurnId ? turnFinalSummary(ds, fallbackTurnId, dataDir) : undefined))
     : undefined;
   const lastTurn: SessionLastTurn = {
     turnId: terminal.turnId,
@@ -311,14 +325,17 @@ export function noteLateFinalReply(
   const current = ds.session.lastTurn;
   const heldBack = heldBackNoOutput.get(ds);
   // 之后又来了新消息：这一轮已经不是「本轮」，补登会把它重新顶成当前结果。
-  const sameTurnNoOutput = current?.turnId === turnId && current.outcome === 'no_output' && resultStillCurrent(ds, current);
-  const heldBackTurn = heldBack?.turnId === turnId && !(ds.lastMessageAt > heldBack.at);
+  const sameTurnNoOutput = !!current && sameMergedTurnGroup(ds, current.turnId, turnId) && current.outcome === 'no_output' && resultStillCurrent(ds, current);
+  const heldBackTurn = !!heldBack && sameMergedTurnGroup(ds, heldBack.turnId, turnId) && !(ds.lastMessageAt > heldBack.at);
   if (!sameTurnNoOutput && !heldBackTurn) return undefined;
   heldBackNoOutput.delete(ds);
-  const summary = turnFinalSummary(ds, turnId, opts.dataDir ?? config.session.dataDir);
-  const startedAt = turnStarts.get(ds)?.get(turnId);
+  const resolvedTurnId = sameTurnNoOutput ? current!.turnId : heldBack!.turnId;
+  const dataDir = opts.dataDir ?? config.session.dataDir;
+  const summary = turnFinalSummary(ds, resolvedTurnId, dataDir)
+    ?? (resolvedTurnId !== turnId ? turnFinalSummary(ds, turnId, dataDir) : undefined);
+  const startedAt = turnStarts.get(ds)?.get(resolvedTurnId) ?? turnStarts.get(ds)?.get(turnId);
   const lastTurn: SessionLastTurn = {
-    turnId,
+    turnId: resolvedTurnId,
     outcome: 'delivered',
     at: (opts.now ?? Date.now)(),
     ...(startedAt !== undefined ? { startedAt } : {}),

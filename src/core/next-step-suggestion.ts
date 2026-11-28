@@ -19,6 +19,7 @@
 import { createHash } from 'node:crypto';
 import type { DaemonSession } from './types.js';
 import { serializeCardWrite } from './card-element-writes.js';
+import { sameMergedTurnGroup } from './turn-absorption.js';
 import {
   buildNextStepElement,
   nextStepPlacement,
@@ -76,6 +77,8 @@ interface State {
   turnId?: string;
   /** That turn's last card, once settled. */
   card?: NextStepCard;
+  /** Exact turnId that published `card` (may be a merged host turn of `turnId`). */
+  cardTurnId?: string;
   suggestion?: { turnId: string; text: string; editable: boolean };
   requestedTurnId?: string;
   /** The row this module may have put on a card and not removed yet. */
@@ -127,6 +130,7 @@ export function noteNextStepTurnStarted(ds: DaemonSession, turnId: string, io: N
   if (state.turnId === turnId) return;
   state.turnId = turnId;
   state.card = undefined;
+  state.cardTurnId = undefined;
   if (state.suggestion?.turnId !== turnId) state.suggestion = undefined;
   if (state.shown || state.leftovers.length) reconcile(ds, io);
 }
@@ -134,15 +138,21 @@ export function noteNextStepTurnStarted(ds: DaemonSession, turnId: string, io: N
 export function noteNextStepCard(ds: DaemonSession, turnId: string, card: NextStepCard, io: NextStepIo, dispatchAttempt?: number): void {
   const state = stateFor(ds);
   const latest = latestTurn(ds, state);
-  if (latest !== undefined && latest !== turnId) {
+  if (latest !== undefined && !sameMergedTurnGroup(ds, latest, turnId)) {
     io.info?.(`${tag(ds)}: card of ${short(turnId)} ignored: the session's latest turn is ${short(latest)}`);
     return;
   }
-  state.turnId = turnId;
+  if (latest !== undefined && state.cardTurnId === latest && turnId !== latest) {
+    io.info?.(`${tag(ds)}: card of ${short(turnId)} ignored: ${short(latest)} already owns the latest card`);
+    return;
+  }
+  const effectiveTurnId = latest ?? turnId;
+  state.turnId = effectiveTurnId;
+  state.cardTurnId = turnId;
   state.card = card;
-  if (io.enabled(ds) && state.requestedTurnId !== turnId
-    && io.requestSuggestion?.(ds, turnId, dispatchAttempt)) {
-    state.requestedTurnId = turnId;
+  if (io.enabled(ds) && state.requestedTurnId !== effectiveTurnId
+    && io.requestSuggestion?.(ds, effectiveTurnId, dispatchAttempt)) {
+    state.requestedTurnId = effectiveTurnId;
   }
   reconcile(ds, io);
 }
@@ -172,13 +182,15 @@ export function noteNextStepSuggestion(ds: DaemonSession, turnId: string | undef
   if (!turnId || !trimmed) return;
   const state = stateFor(ds);
   const latest = latestTurn(ds, state);
-  if (latest !== undefined && latest !== turnId) {
+  if (latest !== undefined && !sameMergedTurnGroup(ds, latest, turnId)) {
     io.info?.(`${tag(ds)}: suggestion of ${short(turnId)} ignored: the session's latest turn is ${short(latest)}`);
     return;
   }
-  if (state.suggestion?.turnId === turnId && state.suggestion.text === trimmed && state.suggestion.editable === editable) return;
-  state.turnId = turnId;
-  state.suggestion = { turnId, text: trimmed, editable };
+  const effectiveTurnId = latest ?? turnId;
+  if (state.suggestion && sameMergedTurnGroup(ds, state.suggestion.turnId, effectiveTurnId)
+    && state.suggestion.text === trimmed && state.suggestion.editable === editable) return;
+  state.turnId = effectiveTurnId;
+  state.suggestion = { turnId: effectiveTurnId, text: trimmed, editable };
   reconcile(ds, io);
 }
 
@@ -239,8 +251,11 @@ async function retryLeftovers(ds: DaemonSession, state: State, io: NextStepIo): 
 async function apply(ds: DaemonSession, state: State, io: NextStepIo): Promise<void> {
   await retryLeftovers(ds, state, io);
   const turnId = state.turnId;
-  const card = state.card;
-  const desired = io.enabled(ds) && card && turnId !== undefined && state.suggestion?.turnId === turnId
+  const card = state.card && (!state.cardTurnId || sameMergedTurnGroup(ds, state.cardTurnId, turnId))
+    ? state.card
+    : undefined;
+  const desired = io.enabled(ds) && card && turnId !== undefined
+    && state.suggestion && sameMergedTurnGroup(ds, state.suggestion.turnId, turnId)
     ? state.suggestion.text : undefined;
   if (state.shown && (!desired || state.shown.turnId !== turnId || !sameCard(state.shown.card, card))) {
     await removeShown(ds, state, io);

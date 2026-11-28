@@ -67,6 +67,9 @@ export interface TurnSendLedgerRecord extends TurnSendLedgerKey {
      *  settled, persisted atomically so crash recovery in the catch-up loop
      *  settles them instead of promoting them as fresh execution turns. */
     settledAbsorbedTurnIds?: string[];
+    /** Set when send-level flags (`--reply-to`, `--quote`, routing override, or
+     *  excluded send kind) forbade settling absorbed follow-ups on this final. */
+    absorbedSettlementIneligible?: true;
   };
 }
 
@@ -509,7 +512,7 @@ export class TurnSendLedger {
     kind: TurnSendKind,
     renderedContent: string,
     dispatch: (providerUuid?: string) => Promise<string>,
-    options: { fenced?: boolean; providerUuid?: string; reuseExistingFinal?: boolean; sentAtMs?: number; marker?: TurnSendLedgerMarkerSource; beforeDispatch?: () => void; noSideEffect?: (error: unknown) => boolean; resolveSettledAbsorbedTurnIds?: () => string[] | undefined } = {},
+    options: { fenced?: boolean; providerUuid?: string; reuseExistingFinal?: boolean; sentAtMs?: number; marker?: TurnSendLedgerMarkerSource; beforeDispatch?: () => void; noSideEffect?: (error: unknown) => boolean; resolveSettledAbsorbedTurnIds?: () => string[] | undefined; absorbedSettlementIneligible?: boolean } = {},
   ): Promise<TurnSendLedgerResult> {
     this.ensureSessionDirectory(key);
     return withFileLock(this.recordPath(key), async () => {
@@ -589,6 +592,9 @@ export class TurnSendLedger {
           ...(marker ? { marker: snapshotTurnSendLedgerMarker(marker) } : {}),
           ...(settledAbsorbedTurnIds && settledAbsorbedTurnIds.length > 0
             ? { settledAbsorbedTurnIds }
+            : {}),
+          ...(options.absorbedSettlementIneligible === true
+            ? { absorbedSettlementIneligible: true as const }
             : {}),
         };
         delete record.publication;

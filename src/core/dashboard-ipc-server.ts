@@ -345,7 +345,8 @@ import {
   updateTaskWithOptionalPrecondition,
   type SchedulePreconditionMutation,
 } from './schedule-precondition-config.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, closeSessionForBackgroundCleanup, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, suspendWorkerAsync, killWorker, requestSessionRestart, isSessionRestartInFlight, getDaemonSessionUsageSnapshot, getDaemonReplyCardUsageSnapshot, getDaemonReplyCardRenderSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, interruptExactWorkerTurn, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId, CARD_POSTING_SENTINEL, ensureReadonlyTaskContinuationAttached, isSessionEffortChangeInFlight, scheduleActiveRuntimePatch, updateHandoffLiveCard, isSessionLifecycleInFlight, hasPendingOrdinaryImDelivery, manualSuspendWaits, queueManualSuspend, identityStorageModelForDaemonSession, identityDecisionConflict, identityModelRefusalReason, dshRuntimeForSession } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, currentCaptureIdentity, closeSession, closeSessionForBackgroundCleanup, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, suspendWorkerAsync, killWorker, requestSessionRestart, isSessionRestartInFlight, getDaemonSessionUsageSnapshot, getDaemonReplyCardUsageSnapshot, getDaemonReplyCardRenderSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, interruptExactWorkerTurn, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId, CARD_POSTING_SENTINEL, ensureReadonlyTaskContinuationAttached, isSessionEffortChangeInFlight, scheduleActiveRuntimePatch, updateHandoffLiveCard, isSessionLifecycleInFlight, hasPendingOrdinaryImDelivery, manualSuspendWaits, queueManualSuspend, identityStorageModelForDaemonSession, identityDecisionConflict, identityModelRefusalReason, dshRuntimeForSession } from './worker-pool.js';
+import { sameMergedTurnGroup } from './turn-absorption.js';
 import {
   awaitReadonlyTaskContinuationUser,
   cancelReadonlyTaskContinuationExplicit,
@@ -2575,7 +2576,22 @@ ipcRoute('POST', '/api/sessions/:sessionId/reply-card-ready', async (req, res, p
   const attempt = body?.dispatchAttempt;
   const boundAttempt = typeof turnId === 'string' ? replyCardDispatchAttempt(ds, turnId) : undefined;
   if (attempt !== boundAttempt) return jsonRes(res, 409, { ok: false, error: 'reply_attempt_changed' });
-  if (typeof turnId !== 'string' || turnId !== ds.currentTurnId
+  const turnMatchesSession = (target: typeof ds | undefined): boolean => {
+    if (!target || typeof turnId !== 'string') return false;
+    if (turnId === target.currentTurnId) return true;
+    if (sameMergedTurnGroup(target, turnId, target.currentTurnId)) return true;
+    // Allow the still-running capturing turn while a queued follow-up awaits it,
+    // but never an already-terminated turn whose stale captureIdentity has not
+    // yet been replaced by a newer write.
+    if (target.replyCardRunningTurnId !== turnId
+      || target.terminalIdentityTurnIds?.has(turnId)
+      || (target.lastTurnTerminalTurnId === turnId && target.lastTurnTerminalDispatchAttempt === attempt)) {
+      return false;
+    }
+    const capture = currentCaptureIdentity(target);
+    return capture?.turnId === turnId && capture.dispatchAttempt === attempt;
+  };
+  if (typeof turnId !== 'string' || !turnMatchesSession(ds)
     || (attempt !== undefined && (!Number.isSafeInteger(attempt) || Number(attempt) < 1))) {
     return jsonRes(res, 409, { ok: false, error: 'reply_turn_changed' });
   }
@@ -2584,7 +2600,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/reply-card-ready', async (req, res, p
   if (!sessionCliIpcAuth(req, current, params.sessionId, body).ok || (current && replyCardDispatchAttempt(current, turnId) !== attempt)) {
     return jsonRes(res, 409, { ok: false, error: 'reply_attempt_changed' });
   }
-  if (current !== ds || current?.currentTurnId !== turnId || current?.session.status === 'closed') {
+  if (current !== ds || !turnMatchesSession(current) || current?.session.status === 'closed') {
     return jsonRes(res, 409, { ok: false, error: 'reply_turn_changed' });
   }
   // The CLI persists this with the barrier; absent (older daemon) means the

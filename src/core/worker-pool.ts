@@ -301,7 +301,8 @@ import { getSessionUsageSnapshot } from './cost-calculator.js';
 import { repairReplyMarkdown } from '../services/reply-markdown.js';
 import { renderBrandTemplate } from '../im/lark/brand-template.js';
 import { handleCotThinkingUpdate, handleCotThinkingSuperseded, finalizeCotMessage, hasCotMessageForTurn, cotMessageFinishStatus, abortCotMessage, resumeCotMessage, cotEnabled } from '../im/lark/cot-message.js';
-import { cardTerminalForHistoricalReply, cardTerminalForRequiredReply, readHistoricalSink, retireReplyCardDisplay, settleTurnReplyCardTerminal, replyCardDispatchAttempt, updateReplyCardNativeThinking, replyCardModeFor, replyCardSandboxBlocked, updateTurnReplyCard, queueTurnReplyTools, flushTurnReplyTools, settleTurnReplyCards, supersedeTurnReplyCard } from './turn-reply-card.js';
+import { cardTerminalForHistoricalReply, cardTerminalForRequiredReply, readHistoricalSink, replyCardKey, retireReplyCardDisplay, settleTurnReplyCardTerminal, replyCardDispatchAttempt, updateReplyCardNativeThinking, replyCardModeFor, replyCardSandboxBlocked, updateTurnReplyCard, queueTurnReplyTools, flushTurnReplyTools, settleTurnReplyCards, supersedeTurnReplyCard } from './turn-reply-card.js';
+import { absorbedMembersOfHost, clearTurnAbsorption, recordTurnAbsorption, sameChatReplyDestination, sameMergedTurnGroup, samePrivateReplySender, shouldFoldAbsorbedTurnReplyCard } from './turn-absorption.js';
 import { captureTerminalReplyContext } from './terminal-reply-context.js';
 import { ReplyCardWithdrawnError, TurnReplyCardStore } from '../services/turn-reply-card.js';
 import { readGroupContextAuthorOrigin } from '../services/group-context-publication.js';
@@ -8398,6 +8399,7 @@ export function releaseDeferredUnifiedReplyCard(
 ): Promise<boolean> {
   const turnId = takeReadyUnifiedReply(ds);
   if (!turnId || replyCardModeFor(ds, turnId) === 'legacy') return Promise.resolve(false);
+  ds.replyCardRunningTurnId = turnId;
   return trackStartingCardPublication(ds, postUnifiedReplyPlaceholder(ds, sessionReply, turnId, 'start'));
 }
 
@@ -26194,6 +26196,17 @@ function setupWorkerHandlers(
         }
         // Native proof upgrades the phase, but a submitted turn is still owned
         // work until its terminal: reclaim must wait for that boundary too.
+        if (msg.absorbedIntoTurnId && msg.absorbedIntoTurnId !== msg.turnId) {
+          const hasCrossChat = !!(ds.session.turnReplyContexts?.[msg.turnId]?.crossChatOrigin
+            || ds.session.replyTargets?.[msg.turnId]?.crossChatOrigin);
+          const sameDest = ds.scope === 'thread'
+            || sameChatReplyDestination(ds, msg.absorbedIntoTurnId, msg.turnId);
+          const samePriv = !privateReplyEnabled(ds.session)
+            || samePrivateReplySender(ds, msg.absorbedIntoTurnId, msg.turnId);
+          if (!hasCrossChat && sameDest && samePriv) {
+            recordTurnAbsorption(ds, msg.turnId, msg.absorbedIntoTurnId, msg.absorbedIntoDispatchAttempt);
+          }
+        }
         noteNativeAcceptedInputTurn(ds, msg.turnId, msg.dispatchAttempt, workerGeneration);
         reconcileFoldedOrSteeredStartingCard(msg.turnId, msg.dispatchAttempt, { requireNotCapturing: true });
         try {
@@ -26409,12 +26422,13 @@ function setupWorkerHandlers(
           logger[unboundInputCommitLogLevel(msg.turnId, frozenReplyContextForTurn(ds, msg.turnId))](`[${t}] Ignored unbound input commit turn=${msg.turnId.slice(0, 16)}`);
         }
         if (!managedAuxUiSuppressed(msg.turnId)) {
-          ds.replyCardRunningTurnId = msg.turnId;
           if (replyCardModeFor(ds, msg.turnId) !== 'legacy' && unifiedReplyTurnNotCapturing(ds, msg.turnId)) {
             // Queue ownership is not terminal ownership. In particular, do not
-            // let the start event bypass the deferred admission placeholder.
+            // let the start event bypass the deferred admission placeholder or
+            // steal replyCardRunningTurnId from the currently running card.
             rememberDeferredUnifiedReply(ds, msg.turnId);
           } else {
+            ds.replyCardRunningTurnId = msg.turnId;
             void updateTurnReplyCard(ds, msg.turnId, { kind: 'start' },
               (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.turnId, { uuid, beforeWrite }),
               { dispatchAttempt: msg.dispatchAttempt, owns: ownsLifecycleMutation }).catch(error => logger.warn(`[${t}] reply-card start: ${error.message}`));
@@ -30457,16 +30471,107 @@ function setupWorkerHandlers(
           break;
         }
         if (effectiveCliId === 'codex') terminateProgressDelivery(ds, msg.turnId, msg.dispatchAttempt);
+        const isPrivateReplySession = privateReplyEnabled(ds.session);
+        const turnHasCrossChatOrigin = (turnId: string): boolean =>
+          !!(ds.session.turnReplyContexts?.[turnId]?.crossChatOrigin
+            || ds.session.replyTargets?.[turnId]?.crossChatOrigin);
+        const hostSettledMemberInLedger = (
+          hostTurnId: string,
+          hostDispatchAttempt: number | undefined,
+          memberTurnId: string,
+        ): boolean => {
+          try {
+            const record = new TurnSendLedger(config.session.dataDir).read({
+              larkAppId: ds.larkAppId,
+              sessionId: msg.sessionId,
+              turnId: hostTurnId,
+              ...(hostDispatchAttempt !== undefined ? { dispatchAttempt: hostDispatchAttempt } : {}),
+            });
+            return !!record?.final
+              && record.dispatchAttempt === hostDispatchAttempt
+              && record.final.settledAbsorbedTurnIds?.includes(memberTurnId) === true;
+          } catch {
+            return false;
+          }
+        };
+        const confirmedHostMembers = new Set<string>();
+        if (msg.absorbedTurnIds?.length) {
+          for (const memberId of msg.absorbedTurnIds) {
+            if (!memberId || memberId === msg.turnId || turnHasCrossChatOrigin(memberId)) continue;
+            const settledByLedger = hostSettledMemberInLedger(msg.turnId, msg.dispatchAttempt, memberId);
+            const sameDest = ds.scope === 'thread' || settledByLedger
+              || sameChatReplyDestination(ds, msg.turnId, memberId);
+            const samePriv = !isPrivateReplySession || settledByLedger
+              || samePrivateReplySender(ds, msg.turnId, memberId);
+            if (sameDest && samePriv) {
+              confirmedHostMembers.add(memberId);
+              recordTurnAbsorption(ds, memberId, msg.turnId, msg.dispatchAttempt);
+            }
+          }
+        }
+        // Detach any mid-turn absorbed member that was omitted or rejected at
+        // host settlement (TOCTOU, #3880 gate refusal, or own reply) BEFORE
+        // host's next-step/recap handlers consult sameMergedTurnGroup.
+        for (const priorMemberId of absorbedMembersOfHost(ds, msg.turnId)) {
+          if (!confirmedHostMembers.has(priorMemberId)) {
+            clearTurnAbsorption(ds, priorMemberId);
+          }
+        }
+        const absorbedHost = msg.absorbedIntoTurnId && msg.absorbedIntoTurnId !== msg.turnId && msg.absorbedCoverage
+          ? { hostTurnId: msg.absorbedIntoTurnId, hostDispatchAttempt: msg.absorbedIntoDispatchAttempt }
+          : undefined;
+        let cachedAbsorbedSettledInHostLedger = false;
+        const absorbedSettledInHostLedger = (): boolean => {
+          if (!absorbedHost) return false;
+          if (cachedAbsorbedSettledInHostLedger) return true;
+          if (hostSettledMemberInLedger(
+            absorbedHost.hostTurnId,
+            absorbedHost.hostDispatchAttempt,
+            msg.turnId,
+          )) {
+            cachedAbsorbedSettledInHostLedger = true;
+            return true;
+          }
+          return false;
+        };
+        const absorbedCrossChatOrigin = absorbedHost ? turnHasCrossChatOrigin(msg.turnId) : false;
+        const absorbedSameDestination = (): boolean => !!absorbedHost
+          && (ds.scope === 'thread'
+            || absorbedSettledInHostLedger()
+            || sameChatReplyDestination(ds, absorbedHost.hostTurnId, msg.turnId));
+        const absorbedSamePrivateRecipient = (): boolean => !!absorbedHost
+          && (!isPrivateReplySession
+            || absorbedSettledInHostLedger()
+            || samePrivateReplySender(ds, absorbedHost.hostTurnId, msg.turnId));
+        const absorbedLinkEligible = (): boolean => !!absorbedHost
+          && absorbedSameDestination()
+          && absorbedSamePrivateRecipient()
+          && !absorbedCrossChatOrigin
+          && (msg.absorbedCoverage !== 'pre_send_unmarked' || ds.scope === 'thread');
+        if (msg.absorbedIntoTurnId && msg.absorbedIntoTurnId !== msg.turnId) {
+          if (absorbedLinkEligible()) {
+            recordTurnAbsorption(ds, msg.turnId, msg.absorbedIntoTurnId, msg.absorbedIntoDispatchAttempt);
+          } else {
+            clearTurnAbsorption(ds, msg.turnId);
+          }
+        }
         // The「本轮回顾」panel goes on the turn's last card once it settles —
         // and only if the CLI recaps the turn (core/turn-recap-state.ts).
         const recapWanted = msg.status === 'completed' && turnRecapIo.enabled(ds);
         const frozenSink = journal?.sink(msg.sessionId, msg.turnId);
         const requiresReply = frozenSink?.kind === 'im' && frozenSink.answerRequired === true;
-        const answered = () => requiresReply
+        const ownAnswered = () => requiresReply
           ? !!new TurnSendLedger(config.session.dataDir).readFinalForAttempt({
             larkAppId: ds.larkAppId, sessionId: msg.sessionId, turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt,
           })?.messageId
           : isFinalTurnTerminalCarrier(ds.turnTerminalCarriers?.get(msg.turnId));
+        const answered = () => {
+          if (ownAnswered()) return true;
+          if (!absorbedLinkEligible() || !absorbedHost) return false;
+          if (requiresReply) return absorbedSettledInHostLedger();
+          return isFinalTurnTerminalCarrier(ds.turnTerminalCarriers?.get(absorbedHost.hostTurnId))
+            || absorbedSettledInHostLedger();
+        };
         const emptyRequiredReply = requiresReply && msg.status === 'completed'
           && (msg.outputDisposition === 'nothing_to_send' || msg.outputDisposition === 'empty_answer');
         // The exact turn is over. This is the only boundary that releases the
@@ -30675,16 +30780,60 @@ function setupWorkerHandlers(
           if (ds.replyCardRunningTurnId === msg.turnId) ds.replyCardRunningTurnId = undefined;
           terminalReplyCardSend = (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.turnId, { uuid, beforeWrite });
           const replyCardSend = terminalReplyCardSend;
-          const waitingForReply = requiresReply && msg.status === 'completed' && !answered() && !emptyRequiredReply;
+          const replyCardStore = new TurnReplyCardStore(config.session.dataDir);
+          let ownReplyRecord: import('../services/turn-reply-card.js').TurnReplyCardRecord | undefined;
+          try {
+            ownReplyRecord = replyCardStore.read(replyCardKey(ds, msg.turnId, msg.dispatchAttempt));
+          } catch { /* unreadable record falls through to normal publisher */ }
+          const hasOwnUnifiedFinal = !!ownReplyRecord?.finalCard
+            || ownReplyRecord?.externalFinal === true
+            || ownAnswered();
+          const requiresReplyUnansweredNow = requiresReply && msg.status === 'completed' && !answered();
+          const foldAbsorbedReplyCard = shouldFoldAbsorbedTurnReplyCard({
+            turnId: msg.turnId,
+            absorbedIntoTurnId: absorbedHost?.hostTurnId,
+            absorbedCoverage: msg.absorbedCoverage,
+            scope: ds.scope,
+            privateReply: isPrivateReplySession,
+            samePrivateReplyRecipient: absorbedSamePrivateRecipient(),
+            memberHasCrossChatOrigin: absorbedCrossChatOrigin,
+            hasOwnFinal: hasOwnUnifiedFinal,
+            requiresReplyUnanswered: requiresReplyUnansweredNow,
+            sameDestination: absorbedSameDestination(),
+          });
+          const supersededFinalAllowed = msg.supersededFinalDelivered === true
+            && msg.status === 'completed'
+            && !requiresReplyUnansweredNow
+            && !ownReplyRecord?.finalCard;
+          const retireUnshownSupersededFinal = !foldAbsorbedReplyCard
+            && supersededFinalAllowed
+            && !ownReplyRecord?.messageId
+            && !ownReplyRecord?.pendingCreate;
+          const markVisibleSupersededExternalFinal = !foldAbsorbedReplyCard
+            && !retireUnshownSupersededFinal
+            && supersededFinalAllowed;
+          const waitingForReply = !foldAbsorbedReplyCard && !retireUnshownSupersededFinal
+            && requiresReply && msg.status === 'completed' && !answered() && !emptyRequiredReply;
           const cardTerminal = cardTerminalForRequiredReply(msg, requiresReply, answered);
-          const settleCard = waitingForReply
-            ? retireReplyCardDisplay(ds, { ...msg, message: tr('worker.required_reply_pending', undefined, localeForBot(ds.larkAppId)) },
+          if (foldAbsorbedReplyCard || retireUnshownSupersededFinal) {
+            forgetDeferredUnifiedReply(ds, msg.turnId);
+          }
+          const settleCard = (foldAbsorbedReplyCard || retireUnshownSupersededFinal)
+            ? retireReplyCardDisplay(ds, { turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt, silent: true },
               replyCardSend, ownsLifecycleMutation)
-            : settleTurnReplyCardTerminal(ds, cardTerminal, replyCardSend, ownsLifecycleMutation);
+            : waitingForReply
+              ? retireReplyCardDisplay(ds, { ...msg, message: tr('worker.required_reply_pending', undefined, localeForBot(ds.larkAppId)) },
+                replyCardSend, ownsLifecycleMutation)
+              : markVisibleSupersededExternalFinal
+                ? replyCardStore.noteExternalFinal(replyCardKey(ds, msg.turnId, msg.dispatchAttempt), ds.chatId)
+                  .catch(() => false)
+                  .then(() => settleTurnReplyCardTerminal(ds, cardTerminal, replyCardSend, ownsLifecycleMutation))
+                : settleTurnReplyCardTerminal(ds, cardTerminal, replyCardSend, ownsLifecycleMutation);
           terminalCardSettlement = settleCard;
           void settleCard
             .then(async () => {
-              if (cardTerminal.status !== 'completed' || waitingForReply) return;
+              if (foldAbsorbedReplyCard || retireUnshownSupersededFinal
+                || cardTerminal.status !== 'completed' || waitingForReply) return;
               if (nextStepIo.enabled(ds) && isCodexFamilyCliId(terminalCliId)) {
                 await waitForTurnFinalOutputDeliveryDrain(ds, msg.turnId);
                 if (!ownsLifecycleMutation()) return;
@@ -31281,6 +31430,7 @@ function setupWorkerHandlers(
             recoveryHandled,
             onClassified: outcome => { delivered = outcome === 'delivered'; },
             isFinalDelivered: answered,
+            ...(absorbedLinkEligible() && absorbedHost ? { fallbackTurnId: absorbedHost.hostTurnId } : {}),
           }).then(async () => {
             if (!usesOutcomeBasedTurnReactions(ds)) return;
             // The persistent delivery owner may still be reconciling a provider
@@ -31397,8 +31547,21 @@ function setupWorkerHandlers(
         if (replyCardRowsWanted && replyCardRoute !== 'receipt' && replyCardRoute !== 'transcript_rows' && replyCardRoute !== 'unified') {
           logger.info(`[${t}] Reply card rows skipped for ${msg.turnId.substring(0, 16)}: ${replyCardRoute}`);
         }
+        const foldAbsorbedLegacyReceipt = shouldFoldAbsorbedTurnReplyCard({
+          turnId: msg.turnId,
+          absorbedIntoTurnId: absorbedHost?.hostTurnId,
+          absorbedCoverage: msg.absorbedCoverage,
+          scope: ds.scope,
+          privateReply: isPrivateReplySession,
+          samePrivateReplyRecipient: absorbedSamePrivateRecipient(),
+          memberHasCrossChatOrigin: absorbedCrossChatOrigin,
+          hasOwnFinal: !!visibleCarrier || ownAnswered(),
+          requiresReplyUnanswered: requiresReply && msg.status === 'completed' && !answered(),
+          sameDestination: absorbedSameDestination(),
+        });
         const shouldPostTerminalReceipt = terminalReceiptKind !== undefined
-          && terminalReceiptRouteEligible;
+          && terminalReceiptRouteEligible
+          && !foldAbsorbedLegacyReceipt;
         // Interim-only turns get no synchronous footer decision. Wait for the
         // turn's final-output drain and re-read the carrier: a fallback final
         // landing in that window is the authoritative completion card and must
@@ -31481,7 +31644,7 @@ function setupWorkerHandlers(
           // would advertise 「已处理 · 判定无需回复」 over a turn that is still
           // working — and beginNewTurn has already passed, so nothing clears it.
           // Unknown lineage (HTTP/async-only sessions) stays trusted.
-          if (!ds.currentTurnId || ds.currentTurnId === msg.turnId) {
+          if (!ds.currentTurnId || sameMergedTurnGroup(ds, ds.currentTurnId, msg.turnId)) {
             ds.silentIdleTurnId = msg.turnId;
             if (ds.lastScreenStatus === 'idle') scheduleActiveRuntimePatch(ds);
           }
@@ -31521,7 +31684,7 @@ function setupWorkerHandlers(
                 // during the backoff or the reads. A write that already landed is
                 // caught by the readback (any receipt counts as applied) and the
                 // stable uuid.
-                const superseded = () => !!ds.currentTurnId && ds.currentTurnId !== msg.turnId;
+                const superseded = () => !!ds.currentTurnId && !sameMergedTurnGroup(ds, ds.currentTurnId, msg.turnId);
                 try {
                   const patched = await patchTurnTerminalCarrier(ds, carrier.messageId, kind, superseded,
                     () => { footerWriteAttempted = true; });
@@ -31568,7 +31731,7 @@ function setupWorkerHandlers(
             // also accepted: scheduleActiveRuntimePatch records a pending
             // refresh that the POST completion immediately reconciles.
             if (!carrier
-              && (!ds.currentTurnId || ds.currentTurnId === msg.turnId)
+              && (!ds.currentTurnId || sameMergedTurnGroup(ds, ds.currentTurnId, msg.turnId))
               && !!ds.streamCardId) {
               if (kind === 'silent') {
                 ds.silentIdleTurnId = msg.turnId;
@@ -31585,7 +31748,7 @@ function setupWorkerHandlers(
             // after type-ahead because it is bound to the old turn itself;
             // a new bottom-of-thread strip would incorrectly claim that the
             // newer turn is awaiting input.
-            if (ds.currentTurnId && ds.currentTurnId !== msg.turnId) {
+            if (ds.currentTurnId && !sameMergedTurnGroup(ds, ds.currentTurnId, msg.turnId)) {
               logger.debug(
                 `[${t}] Skipped stale terminal receipt for ${msg.turnId.substring(0, 8)}`,
               );
@@ -31599,7 +31762,7 @@ function setupWorkerHandlers(
               const delayMs = TERMINAL_RECEIPT_RETRY_BACKOFF_MS[attempt];
               if (delayMs > 0) await new Promise<void>(resolve => setTimeout(resolve, delayMs));
               if (!ownsLifecycleMutation()
-                || (ds.currentTurnId && ds.currentTurnId !== msg.turnId)) {
+                || (ds.currentTurnId && !sameMergedTurnGroup(ds, ds.currentTurnId, msg.turnId))) {
                 logger.debug(
                   `[${t}] Skipped stale terminal receipt for ${msg.turnId.substring(0, 8)}`,
                 );
@@ -32729,6 +32892,49 @@ function setupWorkerHandlers(
         // turn_terminal type narrowing on the mutable `msg` binding.
         const historicalSessionId = msg.sessionId;
         const historicalDispatchAttempt = msg.dispatchAttempt;
+        const historicalPrivateReply = privateReplyEnabled(ds.session);
+        const historicalTurnHasCrossChatOrigin = (id: string): boolean =>
+          !!(ds.session.turnReplyContexts?.[id]?.crossChatOrigin
+            || ds.session.replyTargets?.[id]?.crossChatOrigin);
+        const historicalHostSettledMember = (
+          hostTurnId: string,
+          hostDispatchAttempt: number | undefined,
+          memberTurnId: string,
+        ): boolean => {
+          try {
+            const record = new TurnSendLedger(config.session.dataDir).read({
+              larkAppId: ds.larkAppId,
+              sessionId: historicalSessionId,
+              turnId: hostTurnId,
+              ...(hostDispatchAttempt !== undefined ? { dispatchAttempt: hostDispatchAttempt } : {}),
+            });
+            return !!record?.final
+              && record.dispatchAttempt === hostDispatchAttempt
+              && record.final.settledAbsorbedTurnIds?.includes(memberTurnId) === true;
+          } catch {
+            return false;
+          }
+        };
+        const historicalConfirmedMembers = new Set<string>();
+        if (msg.absorbedTurnIds?.length) {
+          for (const memberId of msg.absorbedTurnIds) {
+            if (!memberId || memberId === turnId || historicalTurnHasCrossChatOrigin(memberId)) continue;
+            const settledByLedger = historicalHostSettledMember(turnId, historicalDispatchAttempt, memberId);
+            const sameDest = ds.scope === 'thread' || settledByLedger
+              || sameChatReplyDestination(ds, turnId, memberId);
+            const samePriv = !historicalPrivateReply || settledByLedger
+              || samePrivateReplySender(ds, turnId, memberId);
+            if (sameDest && samePriv) {
+              historicalConfirmedMembers.add(memberId);
+              recordTurnAbsorption(ds, memberId, turnId, historicalDispatchAttempt);
+            }
+          }
+        }
+        for (const priorMemberId of absorbedMembersOfHost(ds, turnId)) {
+          if (!historicalConfirmedMembers.has(priorMemberId)) {
+            clearTurnAbsorption(ds, priorMemberId);
+          }
+        }
         // Legacy cards early-return inside settleTurnReplyCardTerminal. Resolve
         // the mode first so a legacy replay does no pointless sink/ledger reads
         // (and cannot emit ledger warnings). A mode probe failure must not block
@@ -32740,15 +32946,85 @@ function setupWorkerHandlers(
         } catch (error) {
           logger.warn(`[${t}] historical reply-card terminal: mode probe failed: ${error instanceof Error ? error.message : String(error)}`);
         }
-        const historicalCardTerminal = historicalLegacy
-          ? msg
-          : cardTerminalForHistoricalReply(msg, readHistoricalSink(journal, historicalSessionId, turnId), () =>
-            new TurnSendLedger(config.session.dataDir).readFinalForAttempt({
-              larkAppId: ds.larkAppId, sessionId: historicalSessionId, turnId, dispatchAttempt: historicalDispatchAttempt,
-            })?.messageId);
-        await settleTurnReplyCardTerminal(ds, historicalCardTerminal,
-          (body, type, uuid, beforeWrite) => scopedReply(body, type, turnId, { uuid, beforeWrite }), ownsDisplay)
-          .catch(error => logger.warn(`[${t}] historical reply-card terminal: ${error.message}`));
+        const historicalReplyStore = new TurnReplyCardStore(config.session.dataDir);
+        let historicalOwnRecord: import('../services/turn-reply-card.js').TurnReplyCardRecord | undefined;
+        if (!historicalLegacy) {
+          try {
+            historicalOwnRecord = historicalReplyStore.read(replyCardKey(ds, turnId, historicalDispatchAttempt));
+          } catch { /* unreadable record falls through to normal publisher */ }
+        }
+        const historicalSink = historicalLegacy ? undefined : readHistoricalSink(journal, historicalSessionId, turnId);
+        const historicalRequiresReply = historicalSink?.kind === 'im' && historicalSink.answerRequired === true;
+        const readHistoricalOwnFinalId = () => new TurnSendLedger(config.session.dataDir).readFinalForAttempt({
+          larkAppId: ds.larkAppId, sessionId: historicalSessionId, turnId, dispatchAttempt: historicalDispatchAttempt,
+        })?.messageId;
+        const historicalAbsorbedHost = msg.absorbedIntoTurnId && msg.absorbedIntoTurnId !== turnId && msg.absorbedCoverage
+          ? { hostTurnId: msg.absorbedIntoTurnId, hostDispatchAttempt: msg.absorbedIntoDispatchAttempt }
+          : undefined;
+        const historicalSettledByHost = historicalAbsorbedHost
+          ? historicalHostSettledMember(historicalAbsorbedHost.hostTurnId, historicalAbsorbedHost.hostDispatchAttempt, turnId)
+          : false;
+        const historicalSameDest = historicalAbsorbedHost
+          ? (ds.scope === 'thread'
+            || historicalSettledByHost
+            || sameChatReplyDestination(ds, historicalAbsorbedHost.hostTurnId, turnId))
+          : false;
+        const historicalSamePriv = historicalAbsorbedHost
+          ? (!historicalPrivateReply
+            || historicalSettledByHost
+            || samePrivateReplySender(ds, historicalAbsorbedHost.hostTurnId, turnId))
+          : false;
+        let historicalOwnLedgerFinal = false;
+        if (!historicalLegacy && (historicalAbsorbedHost || msg.supersededFinalDelivered === true)) {
+          try { historicalOwnLedgerFinal = !!readHistoricalOwnFinalId(); } catch { /* fail closed below */ }
+        }
+        const historicalRequiresReplyUnanswered = historicalRequiresReply
+          && msg.status === 'completed'
+          && !historicalOwnLedgerFinal
+          && !historicalSettledByHost;
+        const historicalFoldAbsorbed = !historicalLegacy && shouldFoldAbsorbedTurnReplyCard({
+          turnId,
+          absorbedIntoTurnId: historicalAbsorbedHost?.hostTurnId,
+          absorbedCoverage: msg.absorbedCoverage,
+          scope: ds.scope,
+          privateReply: historicalPrivateReply,
+          samePrivateReplyRecipient: historicalSamePriv,
+          memberHasCrossChatOrigin: historicalAbsorbedHost ? historicalTurnHasCrossChatOrigin(turnId) : false,
+          hasOwnFinal: !!historicalOwnRecord?.finalCard || historicalOwnRecord?.externalFinal === true || historicalOwnLedgerFinal,
+          requiresReplyUnanswered: historicalRequiresReplyUnanswered,
+          sameDestination: historicalSameDest,
+        });
+        const historicalSupersededAllowed = !historicalLegacy
+          && !historicalFoldAbsorbed
+          && msg.supersededFinalDelivered === true
+          && msg.status === 'completed'
+          && !(historicalRequiresReply && !historicalOwnLedgerFinal)
+          && !historicalOwnRecord?.finalCard;
+        const historicalRetireUnshownSuperseded = historicalSupersededAllowed
+          && !historicalOwnRecord?.messageId
+          && !historicalOwnRecord?.pendingCreate;
+        const historicalMarkVisibleSuperseded = historicalSupersededAllowed
+          && !historicalRetireUnshownSuperseded;
+        const historicalReplySend: Parameters<typeof settleTurnReplyCardTerminal>[2] =
+          (body, type, uuid, beforeWrite) => scopedReply(body, type, turnId, { uuid, beforeWrite });
+        if (historicalFoldAbsorbed || historicalRetireUnshownSuperseded) {
+          await retireReplyCardDisplay(ds, { turnId, dispatchAttempt: historicalDispatchAttempt, silent: true },
+            historicalReplySend, ownsDisplay)
+            .catch(error => logger.warn(`[${t}] historical reply-card terminal: ${error.message}`));
+        } else {
+          if (historicalMarkVisibleSuperseded) {
+            await historicalReplyStore.noteExternalFinal(
+              replyCardKey(ds, turnId, historicalDispatchAttempt),
+              ds.chatId,
+            ).catch(() => false);
+          }
+          const historicalCardTerminal = historicalLegacy
+            ? msg
+            : cardTerminalForHistoricalReply(msg, historicalSink, () =>
+              readHistoricalOwnFinalId() ?? (historicalSettledByHost ? 'host-settled' : undefined));
+          await settleTurnReplyCardTerminal(ds, historicalCardTerminal, historicalReplySend, ownsDisplay)
+            .catch(error => logger.warn(`[${t}] historical reply-card terminal: ${error.message}`));
+        }
       }
     }
     let physicalExitClaimOwner: string | undefined;

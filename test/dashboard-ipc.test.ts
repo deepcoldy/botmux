@@ -14703,6 +14703,48 @@ describe('POST /api/sessions/:sessionId/reply-card-ready', () => {
       expect(prepareSpy).toHaveBeenLastCalledWith(ds, 'om_order', 1);
     } finally { findSpy.mockRestore(); prepareSpy.mockRestore(); }
   });
+
+  it('allows the merged host turn when currentTurnId advanced to an absorbed follow-up, and rejects already-terminated turns even with stale captureIdentity', async () => {
+    const cards = await import('../src/core/turn-reply-card.js');
+    const { recordTurnAbsorption } = await import('../src/core/turn-absorption.js');
+    const appId = 'cli_native_merged';
+    const ds = {
+      larkAppId: appId,
+      currentTurnId: 'om_m3',
+      workerGeneration: 1,
+      replyCardRunningTurnId: 'om_m1',
+      captureIdentity: { turnId: 'om_m1', workerGeneration: 1, revision: 1 },
+      session: { sessionId: 'native-merged', status: 'active' },
+    } as any;
+    recordTurnAbsorption(ds, 'om_m2', 'om_m1');
+    recordTurnAbsorption(ds, 'om_m3', 'om_m1');
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    const prepareSpy = vi.spyOn(cards, 'prepareReplyCardNativeThinking').mockResolvedValue(true);
+    try {
+      setLarkAppId(appId); setIpcAuthSecret(TEST_IPC_SECRET);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const path = '/api/sessions/native-merged/reply-card-ready';
+      const body = JSON.stringify({ expectedTurnId: 'om_m1' });
+      const query = () => requestJson(handle!.port, path, {
+        method: 'POST',
+        body,
+        headers: { ...trustedHostHeaders('POST', path, handle!.port), 'content-type': 'application/json' },
+      });
+
+      const mergedOk = await query();
+      expect(mergedOk.status).toBe(200);
+      expect(mergedOk.json).toEqual({ ok: true, nativeThinkingVisible: true });
+
+      // Once M1 terminates and independent turn M4 starts, stale captureIdentity still
+      // pointing to M1 must NOT authorize a late reply-card-ready for M1.
+      ds.replyCardRunningTurnId = undefined;
+      ds.terminalIdentityTurnIds = new Set(['om_m1']);
+      ds.currentTurnId = 'om_m4';
+      const independentRejected = await query();
+      expect(independentRejected.status).toBe(409);
+      expect(independentRejected.json).toMatchObject({ ok: false, error: 'reply_turn_changed' });
+    } finally { findSpy.mockRestore(); prepareSpy.mockRestore(); }
+  });
 });
 
 describe('Dashboard default CLI passthrough configuration', () => {
