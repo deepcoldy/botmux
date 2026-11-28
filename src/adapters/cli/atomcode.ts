@@ -1,4 +1,4 @@
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommandReal } from './registry.js';
@@ -50,6 +50,9 @@ export function createAtomcodeAdapter(pathOverride?: string): CliAdapter {
       const nativeEnv = { ...process.env, ...env };
       dataDir = atomcodeDataDir(nativeEnv);
       mkdirSync(dataDir, { recursive: true });
+      // Inside bwrap, authPaths are bound at their canonical realpath. Passing the
+      // canonical path to --data-dir ensures ATOMCODE_HOME resolves on symlinked homes.
+      try { dataDir = realpathSync(dataDir); } catch { /* keep resolved path */ }
       const args = [
         runnerArgv0('atomcode-runner', resolveRunnerPath('atomcode-runner.js', {
           testOverrideEnv: 'BOTMUX_TEST_ATOMCODE_RUNNER_PATH',

@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -50,18 +50,35 @@ describe('AtomCode CLI adapter', () => {
       env: { ATOMCODE_HOME: dataDir },
     });
 
-    expect(args).toContain('--atomcode-bin');
-    expect(args).toContain('--data-dir');
-    expect(args[args.indexOf('--data-dir') + 1]).toBe(dataDir);
+    expect(args[args.indexOf('--atomcode-bin') + 1]).toBe(realpathSync('/bin/true'));
+    expect(args[args.indexOf('--data-dir') + 1]).toBe(realpathSync(dataDir));
     expect(args[args.indexOf('--cwd') + 1]).toBe(dir);
     expect(args[args.indexOf('--native-session-id') + 1]).toBe('acp-uuid-1');
     expect(args[args.indexOf('--model') + 1]).toBe('codingplan/glm-5');
     expect(args[args.indexOf('--effort') + 1]).toBe('high');
     expect(args[args.indexOf('--permission') + 1]).toBe('smart');
     expect(args[args.indexOf('--turn-timeout-ms') + 1]).toBe('120000');
-    expect(adapter.authPaths).toEqual([dataDir]);
-    expect(adapter.skillsDir).toBe(join(dataDir, 'skills'));
+    expect(adapter.authPaths).toEqual([realpathSync(dataDir)]);
+    expect(adapter.skillsDir).toBe(join(realpathSync(dataDir), 'skills'));
     expect(adapter.sandboxExtraExecPaths?.()).toHaveLength(1);
+  });
+
+  it('canonicalizes symlinked ATOMCODE_HOME for bwrap sandbox compatibility', () => {
+    const dir = makeTempDir();
+    const realHome = join(dir, 'real-home');
+    const linkHome = join(dir, 'link-home');
+    mkdirSync(realHome, { recursive: true });
+    symlinkSync(realHome, linkHome);
+    const adapter = createAtomcodeAdapter('/bin/true');
+    const args = adapter.buildArgs({
+      sessionId: 'sess-symlink',
+      resume: false,
+      workingDir: dir,
+      env: { ATOMCODE_HOME: join(linkHome, '.atomcode') },
+    });
+    const canonical = realpathSync(join(realHome, '.atomcode'));
+    expect(args[args.indexOf('--data-dir') + 1]).toBe(canonical);
+    expect(adapter.authPaths).toEqual([canonical]);
   });
 
   it('rejects session fork on resume', () => {
