@@ -221,6 +221,190 @@ describe('extractInteractiveCardReplyText', () => {
     expect(hugeText.length).toBeGreaterThan(0);
     expect(hugeText.length).toBeLessThan(2_000_000 / 10);
   });
+
+  it('preserves literal Lark tags and <br> in plain_text nodes, subtitles, and collapsible panel titles', () => {
+    const literal = "Use <font color='red'> literally<br>now";
+    const text = extractInteractiveCardReplyText({
+      schema: '2.0',
+      header: {
+        title: { tag: 'plain_text', content: 'Title <font color="red">raw</font><br>keep' },
+        subtitle: { tag: 'plain_text', content: literal },
+      },
+      body: {
+        elements: [
+          { tag: 'div', text: { tag: 'plain_text', content: literal } },
+          { tag: 'div', text: { tag: 'lark_md', content: "MD <font color='green'>ok</font><br>next" } },
+          {
+            tag: 'div',
+            fields: [
+              { text: { tag: 'plain_text', content: "Field <text_tag>raw</text_tag><br>1" } },
+              { text: { tag: 'lark_md', content: "Field <text_tag>tag</text_tag><br>2" } },
+            ],
+          },
+          {
+            tag: 'collapsible_panel',
+            header: { title: { tag: 'plain_text', content: literal } },
+            elements: [
+              {
+                tag: 'collapsible_panel',
+                header: { title: { tag: 'markdown', content: "Panel <font color='blue'>md</font><br>sub" } },
+                elements: [{ tag: 'plain_text', content: literal }],
+              },
+            ],
+          },
+          {
+            tag: 'note',
+            elements: [
+              { tag: 'plain_text', content: literal },
+              { tag: 'lark_md', content: "<font color='green'>note</font>" },
+            ],
+          },
+        ],
+      },
+    });
+    expect(text).toBe([
+      '[卡片: Title <font color="red">raw</font><br>keep]',
+      literal,
+      literal,
+      'MD ok\nnext',
+      'Field <text_tag>raw</text_tag><br>1',
+      'Field `tag`\n2',
+      literal,
+      'Panel md\nsub',
+      literal,
+      `${literal} note`,
+    ].join('\n'));
+  });
+
+  it('handles GFM tables without outer pipes (converting <br> and padding blank lines) without misclassifying ordinary pipe lines', () => {
+    const text = extractInteractiveCardReplyText({
+      schema: '2.0',
+      body: {
+        elements: [
+          {
+            tag: 'markdown',
+            content: [
+              '## 汇总',
+              'a | b',
+              '--- | ---',
+              '1<br>2 | 3',
+              '结论段落',
+            ].join('\n'),
+          },
+          {
+            tag: 'markdown',
+            content: '选项 A | 选项 B<br>下一行说明',
+          },
+        ],
+      },
+    });
+    expect(text).toBe([
+      '## 汇总',
+      '',
+      'a | b',
+      '--- | ---',
+      '1 / 2 | 3',
+      '',
+      '结论段落',
+      '选项 A | 选项 B',
+      '下一行说明',
+    ].join('\n'));
+  });
+
+  it('isolates unclosed fences and inline backticks so they cannot bleed into subsequent card elements', () => {
+    const withUnclosedFence = extractInteractiveCardReplyText({
+      schema: '2.0',
+      body: {
+        elements: [
+          { tag: 'markdown', content: 'before\n```html\nunclosed' },
+          { tag: 'markdown', content: "after <font color='red'>ok</font><br>next" },
+        ],
+      },
+    });
+    expect(withUnclosedFence).toBe([
+      'before',
+      '```html',
+      'unclosed',
+      '```',
+      'after ok',
+      'next',
+    ].join('\n'));
+
+    const withUnclosedBacktick = extractInteractiveCardReplyText({
+      schema: '2.0',
+      body: {
+        elements: [
+          { tag: 'markdown', content: 'unclosed `code' },
+          { tag: 'markdown', content: "after <font color='red'>ok</font><br>keep `span`" },
+        ],
+      },
+    });
+    expect(withUnclosedBacktick).toBe([
+      'unclosed `code',
+      '',
+      'after ok',
+      'keep `span`',
+    ].join('\n'));
+  });
+
+  it('stops visiting large primitive arrays, large objects, and trailing fields once node or char budget is exhausted', () => {
+    let arrayReads = 0;
+    const trackedPrimitives = new Proxy(
+      Array.from({ length: 20_000 }, (_, i) => i),
+      {
+        get(target, prop, receiver) {
+          if (typeof prop === 'string' && /^\d+$/.test(prop)) arrayReads += 1;
+          return Reflect.get(target, prop, receiver);
+        },
+      },
+    );
+    const arrayCardText = extractInteractiveCardReplyText({
+      schema: '2.0',
+      body: { elements: [{ tag: 'markdown', content: 'ok' }] },
+      meta: trackedPrimitives,
+    });
+    expect(arrayCardText).toBe('ok');
+    expect(arrayReads).toBeGreaterThan(0);
+    expect(arrayReads).toBeLessThanOrEqual(5_000);
+
+    let propReads = 0;
+    const bigObject: Record<string, number> = {};
+    for (let i = 0; i < 20_000; i += 1) {
+      Object.defineProperty(bigObject, `k${i}`, {
+        enumerable: true,
+        get() {
+          propReads += 1;
+          return i;
+        },
+      });
+    }
+    const objCardText = extractInteractiveCardReplyText({
+      schema: '2.0',
+      body: { elements: [{ tag: 'markdown', content: 'ok' }] },
+      meta: bigObject,
+    });
+    expect(objCardText).toBe('ok');
+    expect(propReads).toBeGreaterThan(0);
+    expect(propReads).toBeLessThanOrEqual(5_000);
+
+    let afterCharsReads = 0;
+    const afterBigString = new Proxy(
+      Array.from({ length: 20_000 }, (_, i) => i),
+      {
+        get(target, prop, receiver) {
+          if (typeof prop === 'string' && /^\d+$/.test(prop)) afterCharsReads += 1;
+          return Reflect.get(target, prop, receiver);
+        },
+      },
+    );
+    const charBudgetText = extractInteractiveCardReplyText({
+      schema: '2.0',
+      body: { elements: [{ tag: 'markdown', content: 'a'.repeat(200_000) }] },
+      trailing: afterBigString,
+    });
+    expect(charBudgetText).toBeDefined();
+    expect(afterCharsReads).toBe(0);
+  });
 });
 
 describe('card reply text through recordSessionTurnReplies', () => {
