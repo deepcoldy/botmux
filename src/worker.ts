@@ -13521,14 +13521,33 @@ function scheduledCliInputWriteHold(
 /** The scheduled write this CLI's flushPending had begun when it was held
  *  (retained) back into the queue. Until it is retired or any other input takes
  *  the CLI, STOP owns it as it owned that in-flight writer. */
-let heldScheduledWrite: {
+type HeldScheduledWrite = {
   item: PendingCliInput;
   backend: SessionBackend;
   generation: number;
   turnId: string | undefined;
   webSubmitGeneration: number;
   rawInputGeneration: number;
-} | undefined;
+};
+let heldScheduledWrite: HeldScheduledWrite | undefined;
+
+/** A held write temporarily displaced while a literal command-line write (a
+ *  non-keepalive injection) is in flight. It is restored when that write is
+ *  proven not to have reached the CLI; `stopRequested` latches a STOP that
+ *  arrived during the window so the restored write is retired on settlement. */
+let suspendedHeldWrite: { held: HeldScheduledWrite; stopRequested: boolean } | undefined;
+
+/** A literal write proven not to have reached the CLI (framed runner's
+ *  `untouched`, or any submissionStarted=false refusal) gives the held write
+ *  back its STOP ownership. If STOP arrived while the write was in flight, run
+ *  the normal STOP retirement, with all its validity checks, immediately. */
+function restoreSuspendedHeldWrite(): void {
+  const suspended = suspendedHeldWrite;
+  suspendedHeldWrite = undefined;
+  if (!suspended) return;
+  heldScheduledWrite = suspended.held;
+  if (suspended.stopRequested) discardScheduledBacklogForStop();
+}
 
 function settleScheduledCliInputHold(
   item: PendingCliInput,
@@ -15016,6 +15035,10 @@ function coalescePendingScheduledInputs(pending: PendingCliInput[] = pendingMess
 }
 
 function discardScheduledBacklogForStop(): void {
+  // A literal injection may have suspended the held write at its write edge and
+  // still be in flight. Latch the stop intent; when that write settles as
+  // proven-unwritten the held slot is restored and retired below.
+  if (suspendedHeldWrite) suspendedHeldWrite.stopRequested = true;
   const activeTask = currentBotmuxTurnId ? parseScheduledTurnId(currentBotmuxTurnId) : null;
   const writing = cliSubmissionInFlight;
   const writingTask = writing?.scheduledWritePending
@@ -26596,13 +26619,16 @@ async function flushPendingInjections(): Promise<void> {
           );
 
           // A non-keepalive injection is a fresh operator input taking the CLI
-          // at this literal write edge: a scheduled write held back into the
-          // queue is no longer the writer STOP may retire. Invalidate it here,
-          // before the physical write, rather than after awaitPtyQuiescence so a
-          // STOP arriving while the injection is in flight cannot retire it
-          // either. Keep-alive is bot-generated and must not invalidate the
-          // held writer.
-          if (item.kind !== 'keepalive') heldScheduledWrite = undefined;
+          // at this literal write edge: suspend the held writer rather than drop
+          // it outright, so a write later proven not to have reached the CLI can
+          // give back its STOP ownership. Suspending here, before the physical
+          // write, also means a STOP arriving while the injection is in flight
+          // cannot retire the held write (it latches stopRequested instead).
+          // Keep-alive is bot-generated and never touches the held writer.
+          if (item.kind !== 'keepalive' && heldScheduledWrite) {
+            suspendedHeldWrite = { held: heldScheduledWrite, stopRequested: false };
+            heldScheduledWrite = undefined;
+          }
 
           // Record the keep-alive by its actual command fingerprint so the later
           // UserPromptSubmit hook can be matched by content regardless of HTTP
@@ -26620,12 +26646,24 @@ async function flushPendingInjections(): Promise<void> {
           }
         });
         await awaitPtyQuiescence(STARTUP_CMD_QUIET_MS, STARTUP_CMD_CAP_MS);
+        // The injection really landed: the held write stays without STOP ownership.
+        suspendedHeldWrite = undefined;
         log(`Injected command: ${cmd}`);
       } catch (e: any) {
-        if (e instanceof SubmissionWriteError && !e.submissionStarted
-          && webTerminalInputWireDirty()) {
+        const provenUnwritten = e instanceof SubmissionWriteError && !e.submissionStarted;
+        if (provenUnwritten && webTerminalInputWireDirty()) {
           pendingInjections.unshift(item);
+          restoreSuspendedHeldWrite();
           return;
+        }
+        if (provenUnwritten) {
+          // A framed runner's untouched / pre-write refusal proves no byte reached
+          // the CLI: restore the held writer (and retire it now if STOP latched).
+          restoreSuspendedHeldWrite();
+        } else {
+          // Ambiguous (a frame may have buffered) or an ordinary failure leaves
+          // the CLI state uncertain: the held write stays without STOP ownership.
+          suspendedHeldWrite = undefined;
         }
         log(`Inject command failed (${cmd}): ${e?.message ?? e}`);
       }

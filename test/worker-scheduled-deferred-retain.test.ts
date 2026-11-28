@@ -955,4 +955,95 @@ describe('STOP after another input channel took the CLI while the scheduled writ
     expect(h.scope.pendingMessages).toEqual([runA]);
     expect(rejections(runA.turnId)).toBe(0);
   });
+
+  /** A framed runner (minimax/atomcode/antigravity-acp) settles a raw line via
+   *  writeInput. Route the REAL sendRawCommandLine through the recovery fence so
+   *  its submitted:false branch throws and the injection catch runs. */
+  function armFramedInjection(scope: Record<string, any>, disposition: string) {
+    armInjectionFlush(scope);
+    scope.sendRawCommandLine = loadWorkerFunction('sendRawCommandLine', scope);
+    scope.cliAdapter.runnerFramedInput = true;
+    scope.cliAdapter.writeInput = vi.fn(async () => ({
+      submitted: false, submissionDisposition: disposition, failureReason: 'probe-frame-refusal',
+    }));
+    scope.sendRawCommandLineWithRecoveryFence = vi.fn(async (
+      backend: unknown, cmd: string, beforeWrite?: () => void,
+    ) => { beforeWrite?.(); await scope.sendRawCommandLine(backend, cmd); });
+  }
+
+  it('a framed untouched injection proves no byte was written: STOP still retires the held write', async () => {
+    const { h, item: runA, rejections } = scheduledHarness(['allow', 'retain'], true);
+    h.scope.cliInterruptGeneration = 0;
+    await h.flush();
+    expect(h.scope.pendingMessages).toEqual([runA]);
+    const scheduledWrite = h.scope.cliAdapter.writeInput;
+
+    armFramedInjection(h.scope, 'untouched');
+    h.scope.pendingInjections.push({ command: '/compact', barrier: false });
+    await loadWorkerFunction<() => Promise<void>>('flushPendingInjections', h.scope)();
+    h.scope.cliAdapter.writeInput = scheduledWrite;
+
+    // The injection provably never reached the CLI, so the held scheduled write
+    // must keep its STOP ownership.
+    await stopCli(h.scope);
+    expect(h.scope.pendingMessages).toEqual([]);
+    expect(rejections(runA.turnId)).toBe(1);
+    expect(h.scope.scheduledAdmissionRetry).toBeUndefined();
+    await h.flush();
+    expect(scheduledWrite).not.toHaveBeenCalled();
+  });
+
+  it('a framed dirty_unknown injection may have buffered bytes: held stays invalidated, STOP leaves the write queued', async () => {
+    const { h, item: runA, rejections } = scheduledHarness(['allow', 'retain'], true);
+    h.scope.cliInterruptGeneration = 0;
+    await h.flush();
+    expect(h.scope.pendingMessages).toEqual([runA]);
+
+    armFramedInjection(h.scope, 'dirty_unknown');
+    h.scope.pendingInjections.push({ command: '/compact', barrier: false });
+    await loadWorkerFunction<() => Promise<void>>('flushPendingInjections', h.scope)();
+
+    await stopCli(h.scope);
+    expect(h.scope.pendingMessages).toEqual([runA]);
+    expect(rejections(runA.turnId)).toBe(0);
+  });
+
+  it('STOP arriving while a framed injection is in flight retires the held write once it settles untouched', async () => {
+    const { h, item: runA, rejections } = scheduledHarness(['allow', 'retain'], true);
+    h.scope.cliInterruptGeneration = 0;
+    armInjectionFlush(h.scope);
+    await h.flush();
+    expect(h.scope.pendingMessages).toEqual([runA]);
+
+    h.scope.sendRawCommandLine = loadWorkerFunction('sendRawCommandLine', h.scope);
+    h.scope.cliAdapter.runnerFramedInput = true;
+    let releaseWrite!: () => void;
+    const writeInFlight = new Promise<void>(resolve => { releaseWrite = resolve; });
+    h.scope.cliAdapter.writeInput = vi.fn(async () => {
+      await writeInFlight;
+      return { submitted: false, submissionDisposition: 'untouched', failureReason: 'probe-frame-refusal' };
+    });
+    h.scope.sendRawCommandLineWithRecoveryFence = vi.fn(async (
+      backend: unknown, cmd: string, beforeWrite?: () => void,
+    ) => { beforeWrite?.(); await h.scope.sendRawCommandLine(backend, cmd); });
+
+    h.scope.pendingInjections.push({ command: '/compact', barrier: false });
+    const flushInjections = loadWorkerFunction<() => Promise<void>>('flushPendingInjections', h.scope)();
+    // The write edge has suspended the held write and the framed write is pending.
+    await vi.waitFor(() => expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledTimes(1));
+
+    // STOP lands while the injection write is still in flight: it latches the
+    // intent but cannot retire the (suspended) held write yet.
+    await stopCli(h.scope);
+    expect(h.scope.pendingMessages).toEqual([runA]);
+    expect(rejections(runA.turnId)).toBe(0);
+
+    // The untouched settlement proves nothing was written: the latched STOP now
+    // retires the held write exactly once.
+    releaseWrite();
+    await flushInjections;
+    expect(h.scope.pendingMessages).toEqual([]);
+    expect(rejections(runA.turnId)).toBe(1);
+    expect(h.scope.scheduledAdmissionRetry).toBeUndefined();
+  });
 });
