@@ -6,6 +6,7 @@ import {
   type DurableInsertResult,
   type DurableJson,
 } from './durable-coordination.js';
+import { redactTraeLoginCallbackEvent } from './trae-login-message.js';
 
 export type DurableLarkMessageEventType =
   | 'lark.im.message.receive_v1'
@@ -129,7 +130,7 @@ export function durableLarkMessageEvent(input: {
     version: 1,
     type: input.eventType ?? 'lark.im.message.receive_v1',
     larkAppId: input.larkAppId,
-    event: jsonValue(input.data),
+    event: jsonValue(redactTraeLoginCallbackEvent(input.data)),
   };
   return {
     eventId: input.eventId,

@@ -27,6 +27,7 @@ import { handleDashboardSessions, type DashboardSessionsCommandDeps } from './se
 import { handleDashboardSchedules, type DashboardSchedulesCommandDeps } from './schedules.js';
 import { handleDashboardOverview, type DashboardOverviewCommandDeps } from './overview.js';
 import { handleDashboardGroups, type DashboardGroupsCommandDeps } from './groups.js';
+import { handleTraeLoginCommand, type TraeLoginCommandDeps } from './trae-login.js';
 
 /** Optional test seam. Production omits these overrides. */
 export interface DashboardCommandDeps extends EnsureDashboardOwnerDeps {
@@ -39,6 +40,7 @@ export interface DashboardCommandDeps extends EnsureDashboardOwnerDeps {
   groups?: DashboardGroupsCommandDeps;
   /** Test seams for `/dashboard link` (and the `/dash` alias). */
   link?: DashboardLinkSeams;
+  traeLogin?: TraeLoginCommandDeps;
 }
 
 export async function handleDashboardCommand(
@@ -96,6 +98,14 @@ export async function handleDashboardCommand(
   };
 
   // ─── Dispatch (admin-only zone) ───
+  if (sub === 'trae-login') {
+    await handleTraeLoginCommand(message, subArgs, rootId, deps, larkAppId!, gate.adminOpenId, {
+      ...testDeps.traeLogin,
+      sendUserMessage: testDeps.traeLogin?.sendUserMessage ?? testDeps.sendUserMessage,
+      authorized: async () => (await ensureDashboardOwner(message, larkAppId, testDeps)).ok,
+    });
+    return;
+  }
   // `/dashboard link` hands out a token-bearing admin URL, so it bypasses the
   // card DM idiom below and uses its own private-delivery flow (ephemeral card
   // in plain groups, DM otherwise, never a public group message). It inherits

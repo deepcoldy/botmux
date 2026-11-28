@@ -13,6 +13,7 @@ import { secretaryPatrolTurnId } from './send-policy.js';
 import type { SecretaryEvent } from './group-secretary-engine.js';
 import { getGroupSecretaryChat, getGroupSecretaryOwner, isGroupSecretaryChat, listGroupSecretaryChats, setGroupSecretaryChat, type GroupSecretaryChatEntry } from './group-secretary-store.js';
 import { extractListenerMessageText, listenerSenderType } from './message-listener.js';
+import { isTraeLoginCallbackEvent } from './trae-login-message.js';
 import type { ObserveSnapshot } from './session-observe.js';
 
 export interface GroupSecretaryRuntimeDeps {
@@ -128,6 +129,10 @@ export function restMessageToEventData(item: any, chatId: string): any {
 }
 
 export function larkEventToSecretaryMessage(data: any, selfOpenId: string | undefined, selfAppId?: string) {
+  // Both live observation and restart backfill pass through this conversion.
+  // Never retain or deliver a credential-bearing callback as secretary context;
+  // the daemon's live command route still returns its own private_only reply.
+  if (isTraeLoginCallbackEvent(data)) return undefined;
   const message = data?.message;
   if (!message || typeof message !== 'object') return undefined;
   if (message.chat_type === 'p2p') return undefined;

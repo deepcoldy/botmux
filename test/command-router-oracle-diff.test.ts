@@ -103,6 +103,11 @@ const INTENTIONAL: Array<(input: SlashRouteInput, legacy: any, next: any) => boo
     && legacy.reason === 'unknown_slash'
     && next.kind === 'daemon' && next.cmd === '/models'
     && next.sessionPolicy === 'sessionless',
+  // Sensitive native login callbacks stay on the admin control path even
+  // when malformed URL syntax would normally be classified as discussion.
+  (input, legacy, next) => /^\s*\/dashboard\s+trae-login\s+complete\b/i.test(input.text)
+    && legacy.kind === 'forward' && legacy.reason === 'discussion'
+    && next.kind === 'daemon' && next.cmd === '/dashboard' && next.sessionPolicy === 'sessionless',
   // Valid Codex effort headers may include a literal task body on later lines.
   (input, legacy, next) => ['codex', 'codex-app'].includes(input.cliId ?? '')
     && /^\s*\/effort\s+(?:low|medium|high|xhigh|max|ultra)(?:\s|$)/i.test(input.text)
