@@ -438,10 +438,12 @@ describe('v3 ephemeral pool', () => {
     // with mocked fs on every platform.
     const permissionsEnforced = process.platform !== 'win32'
       && typeof process.getuid === 'function' && process.getuid() !== 0;
-    const rejectsBeforeSpawn = async () => {
+    const rejectsBeforeSpawn = async (
+      resolveLarkAppSecret: (larkAppId: string) => string | undefined = () => 'secret',
+    ) => {
       const spawn = vi.fn((): WorkerHandle => { throw new Error('unexpected spawn'); });
       const failure = await createEphemeralPool({ factory: { spawn }, workerPath: '/tmp/worker.js',
-        resolveLarkAppSecret: () => 'secret' }).runNode(request()).then(() => undefined, (err: unknown) => err);
+        resolveLarkAppSecret }).runNode(request()).then(() => undefined, (err: unknown) => err);
       expect(spawn).not.toHaveBeenCalled();
       expect(failure).toBeInstanceOf(Error);
       return failure as Error;
@@ -625,18 +627,6 @@ describe('v3 ephemeral pool', () => {
     // The run pins secrets in memory at start, so a node bot that disappears
     // from bots.json mid-run still resolves a secret. The default path must not
     // read that as "not configured": no env-less worker, no assistant pass.
-    const startsWithEnv = async () => {
-      const worker = new ScriptedWorker();
-      const running = createEphemeralPool({ factory: factoryFor(worker), workerPath: '/tmp/worker.js',
-        resolveLarkAppSecret: () => 'secret' }).runNode(request());
-      try {
-        await worker.waitForInit();
-        expect(worker.init.env?.MODEL_AUTH).toBe('node-sentinel');
-      } finally {
-        worker.emitExit(0);
-        await running;
-      }
-    };
     const nodeBot: BotConfig = { larkAppId: 'cli_app', larkAppSecret: 'test-only', cliId: 'claude-code',
       env: { MODEL_AUTH: 'node-sentinel' } };
     const otherBot: BotConfig = { larkAppId: 'cli_other', larkAppSecret: 'test-only', cliId: 'claude-code',
@@ -644,9 +634,9 @@ describe('v3 ephemeral pool', () => {
 
     it('fails before spawn when the node bot is removed from bots.json mid-run', async () => {
       configureBots([nodeBot, otherBot]);
-      await startsWithEnv();
+      const secrets = new Map([[nodeBot.larkAppId, nodeBot.larkAppSecret]]);
       configureBots([otherBot]);
-      const failure = await rejectsBeforeSpawn();
+      const failure = await rejectsBeforeSpawn(id => secrets.get(id));
       expect(failure.message).toContain('cli_app');
       expect(failure.message).toContain('bots.json');
       expect(failure.message).not.toContain('other-sentinel');
@@ -657,12 +647,12 @@ describe('v3 ephemeral pool', () => {
       const homeBots = join(home, '.botmux', 'bots.json');
       mkdirSync(dirname(homeBots), { recursive: true });
       writeFileSync(homeBots, JSON.stringify([nodeBot]));
+      const secrets = new Map([[nodeBot.larkAppId, nodeBot.larkAppSecret]]);
       vi.stubEnv('HOME', home);
       vi.stubEnv('USERPROFILE', home);
       vi.stubEnv('BOTS_CONFIG', '');
-      await startsWithEnv();
       rmSync(homeBots);
-      const failure = await rejectsBeforeSpawn();
+      const failure = await rejectsBeforeSpawn(id => secrets.get(id));
       expect(failure.message).toContain('cli_app');
       expect(failure.message).toContain('bots.json');
     });
