@@ -477,7 +477,7 @@ async function runNodeWithLogs(
     // long node is never cut off by the runner first. Only the minimax (and
     // dsh, not v3-admitted) adapters read this field, so the override stays
     // scoped instead of changing every adapter's spawn.
-    ...(req.botSnapshot.cliId === 'minimax'
+    ...(req.botSnapshot.cliId === 'minimax' || req.botSnapshot.cliId === 'atomcode'
       ? { turnTimeoutMs: req.timeoutMs + WORKFLOW_INNER_TURN_GRACE_MS }
       : {}),
     ...workflowSandboxInitFields(req.botSnapshot),
