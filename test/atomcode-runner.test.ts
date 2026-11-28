@@ -38,6 +38,14 @@ function markers(stdout: string) {
     .map(m => ({ kind: m[1], payload: JSON.parse(Buffer.from(m[2], 'base64').toString('utf8')) }));
 }
 
+function readCalls(logPath: string) {
+  try {
+    return readFileSync(logPath, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+  } catch {
+    return [];
+  }
+}
+
 async function waitFor(check: () => boolean) {
   const deadline = Date.now() + 10_000;
   while (!check()) {
@@ -74,7 +82,7 @@ function startRunner(extra: string[] = [], hiddenEntry = false) {
 }
 
 describe('atomcode-runner', () => {
-  it('handles framed turns, persists threadId across resumes, and supports hidden compiled entry', async () => {
+  it('reuses one ACP process across consecutive turns, supports hidden compiled entry, and closes lease on SIGTERM', async () => {
     const r = startRunner(['--model', 'codingplan/glm-5', '--effort', 'high'], true);
     await waitFor(() => /^›$/m.test(r.h.stdout));
 
@@ -91,22 +99,81 @@ describe('atomcode-runner', () => {
 
     r.send('second turn', 'turn-2', 2);
     await waitFor(() => markers(r.h.stdout).some(m => m.kind === 'final' && m.payload.turnId === 'turn-2'));
+    expect(markers(r.h.stdout).find(m => m.kind === 'final' && m.payload.turnId === 'turn-2')?.payload).toMatchObject({
+      content: 'echo:second turn|mode=bypass|model=codingplan/glm-5|effort=high',
+      turnId: 'turn-2',
+      dispatchAttempt: 2,
+    });
 
-    const calls = readFileSync(r.h.log, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    // SIGTERM while idle must send session/close to release the native lease before exiting.
+    r.h.child.kill('SIGTERM');
+    const exit = await r.h.closed;
+    expect(exit.code).toBe(0);
+
+    const calls = readCalls(r.h.log);
+    expect(calls.filter(entry => Array.isArray(entry.args))).toHaveLength(1);
+    expect(calls.filter(entry => entry.message?.method === 'initialize')).toHaveLength(1);
+    expect(calls.filter(entry => entry.message?.method === 'session/prompt')).toHaveLength(2);
+    expect(calls.filter(entry => entry.message?.method === 'session/resume')).toHaveLength(0);
+    expect(calls.filter(entry => entry.message?.method === 'session/close')).toHaveLength(1);
+  });
+
+  it('releases the idle ACP session after --idle-timeout-ms and transparently resumes on the next turn', async () => {
+    const r = startRunner(['--idle-timeout-ms', '120']);
+    await waitFor(() => /^›$/m.test(r.h.stdout));
+
+    r.send('turn-before-idle', 'turn-1');
+    await waitFor(() => markers(r.h.stdout).some(m => m.kind === 'final' && m.payload.turnId === 'turn-1'));
+
+    await waitFor(() => readCalls(r.h.log).some(entry => entry.event === 'close_done'));
+
+    r.send('turn-after-idle', 'turn-2');
+    await waitFor(() => markers(r.h.stdout).some(m => m.kind === 'final' && m.payload.turnId === 'turn-2'));
+
+    const calls = readCalls(r.h.log);
+    expect(calls.filter(entry => Array.isArray(entry.args))).toHaveLength(2);
     expect(calls.some(entry => entry.message?.method === 'session/resume' && entry.message.params.sessionId === 'acp-fixture-session-1')).toBe(true);
   });
 
-  it('cancels an active turn on Ctrl+C and reports cancelled errorCode', async () => {
+  it('recovers cleanly via session/resume after crash, invalid JSON, and Ctrl+C cancellation', async () => {
     const r = startRunner();
     await waitFor(() => /^›$/m.test(r.h.stdout));
 
+    r.send('seed', 'turn-seed');
+    await waitFor(() => markers(r.h.stdout).some(m => m.kind === 'final' && m.payload.turnId === 'turn-seed'));
+
+    r.send('crash', 'turn-crash');
+    await waitFor(() => markers(r.h.stdout).some(m => m.kind === 'final' && m.payload.turnId === 'turn-crash'));
+    expect(markers(r.h.stdout).find(m => m.kind === 'final' && m.payload.turnId === 'turn-crash')?.payload).toMatchObject({
+      errorCode: 'execution_failed',
+      turnId: 'turn-crash',
+    });
+
+    r.send('invalid-json', 'turn-bad-json');
+    await waitFor(() => markers(r.h.stdout).some(m => m.kind === 'final' && m.payload.turnId === 'turn-bad-json'));
+    expect(markers(r.h.stdout).find(m => m.kind === 'final' && m.payload.turnId === 'turn-bad-json')?.payload).toMatchObject({
+      errorCode: 'execution_failed',
+      turnId: 'turn-bad-json',
+    });
+
     r.send('hang', 'turn-cancel');
-    await waitFor(() => r.h.stdout.includes('[AtomCode] running…'));
+    await waitFor(() => r.h.stdout.includes('[AtomCode] running…') && readCalls(r.h.log).some(e => e.message?.method === 'session/prompt' && e.message.params.prompt[0].text === 'hang'));
     r.h.child.stdin.write('\x03');
     await waitFor(() => markers(r.h.stdout).some(m => m.kind === 'final' && m.payload.turnId === 'turn-cancel'));
+    expect(markers(r.h.stdout).find(m => m.kind === 'final' && m.payload.turnId === 'turn-cancel')?.payload).toMatchObject({
+      errorCode: 'cancelled',
+      turnId: 'turn-cancel',
+    });
 
-    const final = markers(r.h.stdout).find(m => m.kind === 'final' && m.payload.turnId === 'turn-cancel')?.payload;
-    expect(final).toMatchObject({ errorCode: 'cancelled', turnId: 'turn-cancel' });
+    r.send('recovered', 'turn-recovered');
+    await waitFor(() => markers(r.h.stdout).some(m => m.kind === 'final' && m.payload.turnId === 'turn-recovered'));
+    expect(markers(r.h.stdout).find(m => m.kind === 'final' && m.payload.turnId === 'turn-recovered')?.payload).toMatchObject({
+      content: 'echo:recovered|mode=bypass|model=demo-default|effort=off',
+      turnId: 'turn-recovered',
+    });
+
+    const calls = readCalls(r.h.log);
+    expect(calls.filter(entry => entry.message?.method === 'session/resume')).toHaveLength(3);
   });
 
   it('aborts with turn_budget_exhausted when --turn-timeout-ms expires', async () => {

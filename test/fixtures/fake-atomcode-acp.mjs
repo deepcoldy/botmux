@@ -63,6 +63,10 @@ for await (const line of createInterface({ input: process.stdin })) {
   log({ message });
   const { method, id, params } = message;
   if (method === 'initialize') {
+    const initDelay = Number(process.env.ATOMCODE_ACP_INIT_DELAY_MS ?? '0');
+    if (initDelay > 0) {
+      await new Promise(resolve => setTimeout(resolve, initDelay));
+    }
     send({
       id,
       result: {
@@ -91,8 +95,14 @@ for await (const line of createInterface({ input: process.stdin })) {
       send({ id, result: control });
     }
   } else if (method === 'session/close') {
+    const closeDelay = Number(process.env.ATOMCODE_ACP_CLOSE_DELAY_MS ?? '0');
+    if (closeDelay > 0) {
+      await new Promise(resolve => setTimeout(resolve, closeDelay));
+    }
+    log({ event: 'close_done', pid: process.pid });
     send({ id, result: {} });
   } else if (method === 'session/cancel') {
+    log({ event: 'cancel_received', pid: process.pid });
     if (promptId !== undefined) send({ id: promptId, result: { stopReason: 'cancelled' } });
   } else if (method === 'session/prompt') {
     promptId = id;
@@ -100,6 +110,21 @@ for await (const line of createInterface({ input: process.stdin })) {
     if (promptText === 'hang') continue;
     if (promptText === 'crash') process.exit(4);
     if (promptText === 'invalid-json') { process.stdout.write('not-json\n'); continue; }
+    if (promptText === 'idle-exit-after-turn') {
+      complete('ok-before-idle-exit');
+      setTimeout(() => process.exit(7), 30);
+      continue;
+    }
+    if (promptText === 'idle-garbage-after-turn') {
+      complete('ok-before-idle-garbage');
+      setTimeout(() => process.stdout.write('corrupt-idle-frame\n'), 30);
+      continue;
+    }
+    if (promptText === 'idle-request-after-turn') {
+      complete('ok-before-idle-request');
+      setTimeout(() => send({ id: 'idle-req-1', method: 'session/request_permission', params: { sessionId } }), 30);
+      continue;
+    }
     if (promptText === 'refusal') { complete('refused', 'refusal'); continue; }
     if (promptText === '/compact') {
       complete('compact requested; the next request continues on the compacted context');

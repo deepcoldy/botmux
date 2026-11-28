@@ -4,7 +4,7 @@ import { resolve } from 'node:path';
 import { RunnerControlWriter } from './adapters/cli/runner-control-channel.js';
 import { MinimaxTurnBudget, parseMinimaxTurnTimeout } from './services/minimax-turn-budget.js';
 import { writeMinimaxFinal } from './services/minimax-final-control.js';
-import { runAtomcodeAcp } from './services/atomcode-acp.js';
+import { AtomcodeAcpSession, parseAtomcodeIdleTimeout } from './services/atomcode-acp.js';
 import { bridgeAtomcodeForm, bridgeAtomcodePermission } from './services/atomcode-user-input.js';
 
 const FRAME_PREFIX = '::botmux-atomcode:';
@@ -24,6 +24,7 @@ for (let i = argOffset; i < process.argv.length; i += 2) {
     '--effort',
     '--permission',
     '--turn-timeout-ms',
+    '--idle-timeout-ms',
   ].includes(key) || value === undefined) {
     output.error('Invalid atomcode runner arguments\n');
     process.exit(2);
@@ -34,10 +35,17 @@ for (let i = argOffset; i < process.argv.length; i += 2) {
 const executable = values.get('--atomcode-bin');
 const permission = values.get('--permission') ?? 'full';
 let timeoutMs: number | undefined;
+let idleTimeoutMs: number;
 try {
   timeoutMs = parseMinimaxTurnTimeout(values.get('--turn-timeout-ms'));
 } catch {
   output.error('atomcode runner: invalid --turn-timeout-ms (expected an integer from 1 to 2147483647)\n');
+  process.exit(2);
+}
+try {
+  idleTimeoutMs = parseAtomcodeIdleTimeout(values.get('--idle-timeout-ms'));
+} catch {
+  output.error('atomcode runner: invalid --idle-timeout-ms (expected an integer from 0 to 2147483647)\n');
   process.exit(2);
 }
 if (!executable || !['full', 'smart'].includes(permission)) {
@@ -52,8 +60,26 @@ const nativeEnv: NodeJS.ProcessEnv = {
 };
 
 let nativeSessionId = values.get('--native-session-id');
+const session = new AtomcodeAcpSession({
+  executable,
+  cwd,
+  env: nativeEnv,
+  nativeSessionId,
+  model: values.get('--model'),
+  effort: values.get('--effort'),
+  permission: permission as 'full' | 'smart',
+  idleTimeoutMs,
+  onSession(sessionId) {
+    // Publish immediately so a mid-turn runner crash still preserves this session for resume.
+    if (nativeSessionId === sessionId) return;
+    nativeSessionId = sessionId;
+    output.marker('thread', { threadId: sessionId });
+  },
+});
+
 let active: AbortController | undefined;
 let closing = false;
+let shutdownExiting = false;
 let processing = false;
 let buffer = '';
 const queue: Array<{ content: string; turnId?: string; dispatchAttempt?: number }> = [];
@@ -75,6 +101,13 @@ function finishDisplay(): void {
   displayLineStart = true;
 }
 
+function finalizeShutdown(): void {
+  // Idempotent across overlapping SIGTERM/SIGHUP/stdin-EOF events; release any idle .lease before exit.
+  if (shutdownExiting) return;
+  shutdownExiting = true;
+  void session.close(true).finally(() => process.exit(0));
+}
+
 async function drain(): Promise<void> {
   if (processing || closing) return;
   processing = true;
@@ -87,21 +120,8 @@ async function drain(): Promise<void> {
       const budget = new MinimaxTurnBudget(timeoutMs, () => controller.abort('turn_budget_exhausted'));
       output.line('[AtomCode] running…');
       try {
-        const result = await runAtomcodeAcp({
-          executable: executable!,
-          cwd,
-          env: nativeEnv,
+        const result = await session.runTurn({
           content: turn.content,
-          nativeSessionId,
-          model: values.get('--model'),
-          effort: values.get('--effort'),
-          permission: permission as 'full' | 'smart',
-          onSession(sessionId) {
-            // Publish immediately so a mid-turn runner crash still preserves this session for resume.
-            if (nativeSessionId === sessionId) return;
-            nativeSessionId = sessionId;
-            output.marker('thread', { threadId: sessionId });
-          },
           onInteractionPending: waiting => {
             if (controller.signal.aborted || closing) budget.dispose();
             else budget.waitingForHuman(waiting);
@@ -171,7 +191,7 @@ async function drain(): Promise<void> {
     }
   } finally {
     processing = false;
-    if (closing) process.exit(0);
+    if (closing) finalizeShutdown();
   }
 }
 
@@ -199,7 +219,7 @@ function close(): void {
   closing = true;
   queue.length = 0;
   active?.abort();
-  if (!processing) process.exit(0);
+  if (!processing) finalizeShutdown();
 }
 
 process.on('SIGTERM', close);
