@@ -270,6 +270,7 @@ function defaultScopedWorkerState(scope: Record<string, unknown>, key: string | 
   if (key === 'parseScheduledTurnId') return parseScheduledTurnId;
   if (key === 'isCriticalInterruptKey') return isCriticalInterruptKey;
   if (key === 'removeTakenUnsentInputs') return removeTakenUnsentInputs;
+  if (key === 'pendingMessages') return (scope.pendingMessages ??= []);
   if (key === 'pendingAdoptMessages') return (scope.pendingAdoptMessages ??= []);
   if (key === 'restoredUnsentInputs') return (scope.restoredUnsentInputs ??= new Set());
   if (key === 'scheduledInputReceipts') return (scope.scheduledInputReceipts ??= new Map());

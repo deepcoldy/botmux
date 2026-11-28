@@ -571,3 +571,265 @@ describe('deferred scheduled input interrupted during the adapter precheck', () 
     expect(h.scope.pendingMessages).toEqual([]);
   });
 });
+
+describe('STOP after a held scheduled write armed its retry, before the retry fires', () => {
+  it.each([
+    ['deferred', true],
+    ['non-deferred', false],
+  ] as const)('%s write-edge retain: STOP retires it once and the retry writes nothing', async (_mode, deferred) => {
+    const { h, item: runA, rejections, fireRetry } = scheduledHarness(['allow', 'retain', 'allow', 'allow'], deferred);
+    // STOP's ctrlc bumps the interrupt generation; give it a number to bump.
+    h.scope.cliInterruptGeneration = 0;
+    await h.flush();
+    expect(h.scope.pendingMessages).toEqual([runA]);
+    expect(h.scope.scheduledAdmissionRetry?.item).toBe(runA);
+
+    await stopCli(h.scope);
+    expect(h.scope.pendingMessages).toEqual([]);
+    expect(rejections(runA.turnId)).toBe(1);
+    expect(h.scope.scheduledAdmissionRetry).toBeUndefined();
+
+    await fireRetry();
+    await h.flush();
+    expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+    expect(h.scope.requestScheduledInputAdmission).toHaveBeenCalledTimes(2);
+    expect(rejections(runA.turnId)).toBe(1);
+    expect(h.scope.pendingMessages).toEqual([]);
+  });
+
+  it('precheck interrupt retain: STOP retires it once, unprepared, and the retry writes nothing', async () => {
+    const harness = scheduledHarness(['allow', 'allow', 'allow', 'allow'], true);
+    const { h, item: runA, rejections, fireRetry } = harness;
+    h.scope.cliInterruptGeneration = 0;
+    h.scope.holdNativeInputForHardBlock = vi.fn();
+    const authority = useRealTurnAuthority(h.scope);
+    const { parked, release } = parkPrecheck(h.scope);
+    const flushA = h.flush();
+    await parked;
+    await interruptCli(h.scope);
+    release();
+    await flushA;
+    expect(h.scope.pendingMessages).toEqual([runA]);
+    expect(h.scope.scheduledAdmissionRetry?.item).toBe(runA);
+    expect(rejections(runA.turnId)).toBe(0);
+
+    await stopCli(h.scope);
+    expect(h.scope.pendingMessages).toEqual([]);
+    expect(rejections(runA.turnId)).toBe(1);
+    expect(h.scope.scheduledAdmissionRetry).toBeUndefined();
+
+    await fireRetry();
+    await h.flush();
+    // Only the vetoed precheck ever reached the adapter.
+    expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledTimes(1);
+    expect(preparedFor(h.scope, runA.turnId)).toEqual(NOT_PREPARED);
+    expect(authority.snapshot()).toBeUndefined();
+    expect(h.scope.cliGenerationTurnWrites).toBe(0);
+    expect(rejections(runA.turnId)).toBe(1);
+    expect(h.scope.pendingMessages).toEqual([]);
+  });
+
+  it('a retry that passes the head gate but is blocked before writing stays STOP-owned', async () => {
+    const { h, item: runA, rejections, fireRetry } = scheduledHarness(['allow', 'retain', 'allow', 'allow'], true);
+    h.scope.cliInterruptGeneration = 0;
+    await h.flush();
+    expect(h.scope.pendingMessages).toEqual([runA]);
+
+    // Another turn takes the CLI while the retry's head gate awaits admission:
+    // the gate admits it, consumes the retry slot, then is blocked.
+    let blocked = false;
+    h.scope.activeTurnBlocks = () => blocked;
+    const admit = h.scope.requestScheduledInputAdmission.getMockImplementation()!;
+    h.scope.requestScheduledInputAdmission.mockImplementationOnce(async (...args: any[]) => {
+      blocked = true;
+      return admit(...args);
+    });
+    await fireRetry();
+    expect(h.scope.requestScheduledInputAdmission).toHaveBeenCalledTimes(3);
+    expect(h.scope.scheduledAdmissionRetry).toBeUndefined();
+    expect(h.scope.pendingMessages).toEqual([runA]);
+
+    await stopCli(h.scope);
+    expect(h.scope.pendingMessages).toEqual([]);
+    expect(rejections(runA.turnId)).toBe(1);
+
+    blocked = false;
+    await h.flush();
+    expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+    expect(rejections(runA.turnId)).toBe(1);
+  });
+
+  it('a write whose edge settles only after its CLI was replaced is not STOP-owned by the replacement CLI', async () => {
+    const edgeA = deferredAdmission();
+    const { h, item: runA, rejections } = scheduledHarness(['allow', edgeA.answer, 'allow', 'allow'], true);
+    h.scope.cliInterruptGeneration = 0;
+    h.scope.holdNativeInputForHardBlock = vi.fn();
+    useRealTurnAuthority(h.scope);
+    h.scope.cliLifetimeNonce = 'old-runtime';
+    h.scope.backend.kill = vi.fn();
+    const flushA = h.flush();
+    await edgeA.asked;
+    // The old CLI is rebuilt, queue preserved, while its write edge awaits.
+    killCliPreservingQueue(h.scope);
+    Object.assign(h.scope, {
+      backend: {}, cliLifetimeNonce: 'replacement-runtime', isPromptReady: true, idleDetector: liveIdleDetector,
+    });
+    edgeA.settle('allow');
+    await flushA;
+    expect(h.scope.pendingMessages).toEqual([runA]);
+    expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+
+    // STOP on the replacement CLI, before it ever began writing A: A stays.
+    await stopCli(h.scope);
+    expect(h.scope.pendingMessages).toEqual([runA]);
+    expect(rejections(runA.turnId)).toBe(0);
+
+    await h.flush();
+    expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledTimes(1);
+    expect(h.scope.pendingMessages).toEqual([]);
+    expect(rejections(runA.turnId)).toBe(0);
+  });
+
+  it('a write held on a CLI that was since replaced is not STOP-owned by the replacement CLI', async () => {
+    const { h, item: runA, rejections } = scheduledHarness(['allow', 'retain', 'allow', 'allow'], true);
+    h.scope.cliInterruptGeneration = 0;
+    useRealTurnAuthority(h.scope);
+    h.scope.cliLifetimeNonce = 'old-runtime';
+    h.scope.backend.kill = vi.fn();
+    await h.flush();
+    expect(h.scope.pendingMessages).toEqual([runA]);
+
+    killCliPreservingQueue(h.scope);
+    Object.assign(h.scope, {
+      backend: {}, cliLifetimeNonce: 'replacement-runtime', isPromptReady: true, idleDetector: liveIdleDetector,
+    });
+    await stopCli(h.scope);
+    expect(h.scope.pendingMessages).toEqual([runA]);
+    expect(rejections(runA.turnId)).toBe(0);
+
+    await h.flush();
+    expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledTimes(1);
+    expect(h.scope.pendingMessages).toEqual([]);
+    expect(rejections(runA.turnId)).toBe(0);
+  });
+
+  it.each([
+    ['a human turn', 'human-turn'],
+    ['an input without a turn id', undefined],
+  ] as const)('STOP after %s jumped ahead of the held write and took the CLI leaves the held write queued', async (_label, humanTurnId) => {
+    const { h, item: runA, rejections } = scheduledHarness(['allow', 'retain'], true);
+    h.scope.cliInterruptGeneration = 0;
+    useRealTurnAuthority(h.scope);
+    // The real shared write record every writer (queue, TraeX native answer) calls.
+    h.scope.writtenInputs = { noteWritten: vi.fn() };
+    h.scope.noteCliInputWritten = vi.fn(loadWorkerFunction('noteCliInputWritten', h.scope));
+    await h.flush();
+    expect(h.scope.pendingMessages).toEqual([runA]);
+
+    // The human input overtakes A (as promotePendingHumanInterruption would)
+    // and is written; A waits behind it without ever reaching the writer.
+    h.scope.pendingMessages.unshift({ content: 'human', ...(humanTurnId ? { turnId: humanTurnId } : {}) });
+    h.scope.pendingInputAllowsTypeAhead = () => false;
+    await h.flush();
+    const written = h.scope.cliAdapter.writeInput.mock.calls.map(([, message]: [unknown, string]) => message);
+    expect(written).toEqual(['human']);
+    expect(h.scope.pendingMessages).toEqual([runA]);
+    expect(h.scope.currentBotmuxTurnId).toBe(humanTurnId);
+
+    // This STOP is the human's: A was not its writer.
+    await stopCli(h.scope);
+    expect(h.scope.pendingMessages).toEqual([runA]);
+    expect(rejections(runA.turnId)).toBe(0);
+  });
+
+  it('STOP after another turn became current leaves the held write queued', async () => {
+    const { h, item: runA, rejections } = scheduledHarness(['allow', 'retain'], true);
+    h.scope.cliInterruptGeneration = 0;
+    useRealTurnAuthority(h.scope);
+    await h.flush();
+    expect(h.scope.pendingMessages).toEqual([runA]);
+
+    // A turn handed to the CLI outside this queue's writer slot.
+    h.scope.setCaptureIdentity('human-turn', undefined);
+    await stopCli(h.scope);
+    expect(h.scope.pendingMessages).toEqual([runA]);
+    expect(rejections(runA.turnId)).toBe(0);
+  });
+
+  it.each([
+    ['a Web terminal submit', 'webTerminalSubmitGeneration'],
+    ['a raw passthrough write', 'rawInputWriteGeneration'],
+  ] as const)('STOP after %s took the CLI leaves the held write queued', async (_label, generation) => {
+    const { h, item: runA, rejections } = scheduledHarness(['allow', 'retain'], true);
+    Object.assign(h.scope, { cliInterruptGeneration: 0, webTerminalSubmitGeneration: 0, rawInputWriteGeneration: 0 });
+    await h.flush();
+    expect(h.scope.pendingMessages).toEqual([runA]);
+
+    // noteWebTerminalInput / the raw command-line writer advance these when
+    // operator bytes reach the CLI outside the queue.
+    h.scope[generation] += 1;
+    await stopCli(h.scope);
+    expect(h.scope.pendingMessages).toEqual([runA]);
+    expect(rejections(runA.turnId)).toBe(0);
+  });
+
+  it('STOP while another input is mid-write leaves the held write queued', async () => {
+    const { h, item: runA, rejections } = scheduledHarness(['allow', 'retain', 'retain'], true);
+    h.scope.cliInterruptGeneration = 0;
+    await h.flush();
+    expect(h.scope.pendingMessages).toEqual([runA]);
+
+    h.scope.pendingMessages.unshift({ content: 'human' });
+    const { parked, release } = parkPrecheck(h.scope);
+    const flushHuman = h.flush();
+    await parked;
+    expect(h.scope.cliSubmissionInFlight?.item?.content).toBe('human');
+    await stopCli(h.scope);
+    expect(h.scope.pendingMessages).toContain(runA);
+    expect(rejections(runA.turnId)).toBe(0);
+    release();
+    await flushHuman;
+  });
+
+  it('a retried write refused before it reached the CLI stays STOP-owned', async () => {
+    const { h, item: runA, rejections, fireRetry } = scheduledHarness(['allow', 'retain', 'allow', 'allow'], false);
+    h.scope.cliInterruptGeneration = 0;
+    await h.flush();
+    expect(h.scope.pendingMessages).toEqual([runA]);
+
+    // The retry is admitted, but the prior turn's absorbed final is still
+    // unresolved: preparation refuses the write and keeps A at the head.
+    Object.assign(h.scope, {
+      currentTurnHasFinalEvidence: () => true,
+      advanceQueuedTypeAheadTurnAfterFinal: vi.fn(),
+      queuedTypeAheadTurns: [{ turnId: 'absorbed', inputConsumed: true }],
+    });
+    await fireRetry();
+    expect(h.scope.requestScheduledInputAdmission).toHaveBeenCalledTimes(4);
+    expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+    expect(h.scope.pendingMessages).toEqual([runA]);
+
+    await stopCli(h.scope);
+    expect(h.scope.pendingMessages).toEqual([]);
+    expect(rejections(runA.turnId)).toBe(1);
+  });
+
+  it('a head-gate retain never became the writer: STOP leaves it queued and the retry writes it once', async () => {
+    // The pre-dequeue gate retains; STOP with no scheduled turn or writer has
+    // no target, exactly as it would have had it arrived during that gate.
+    const { h, item: runA, rejections, fireRetry } = scheduledHarness(['retain', 'allow', 'allow'], true);
+    h.scope.cliInterruptGeneration = 0;
+    await h.flush();
+    expect(h.scope.pendingMessages).toEqual([runA]);
+    expect(h.scope.scheduledAdmissionRetry?.item).toBe(runA);
+
+    await stopCli(h.scope);
+    expect(h.scope.pendingMessages).toEqual([runA]);
+    expect(rejections(runA.turnId)).toBe(0);
+
+    await fireRetry();
+    expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledTimes(1);
+    expect(h.scope.pendingMessages).toEqual([]);
+    expect(rejections(runA.turnId)).toBe(0);
+  });
+});

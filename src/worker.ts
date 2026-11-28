@@ -13476,11 +13476,31 @@ function scheduledCliInputWriteHold(
   return !isCurrent() || (requireQueueOwner && owner?.item !== item) ? 'retain' : undefined;
 }
 
+/** The scheduled write this CLI's flushPending had begun when it was held
+ *  (retained) back into the queue. Until it is retired or any other input takes
+ *  the CLI, STOP owns it as it owned that in-flight writer. */
+let heldScheduledWrite: {
+  item: PendingCliInput;
+  backend: SessionBackend;
+  generation: number;
+  turnId: string | undefined;
+  webSubmitGeneration: number;
+  rawInputGeneration: number;
+} | undefined;
+
 function settleScheduledCliInputHold(
   item: PendingCliInput,
   held: 'reject' | 'retain',
   onHold: (decision: 'reject' | 'retain') => void,
 ): void {
+  const owner = cliSubmissionInFlight;
+  if (held === 'retain' && backend && owner?.item === item && owner.scheduledWritePending
+    && owner.generation === cliSpawnGeneration) {
+    heldScheduledWrite = {
+      item, backend, generation: cliSpawnGeneration, turnId: currentBotmuxTurnId,
+      webSubmitGeneration: webTerminalSubmitGeneration, rawInputGeneration: rawInputWriteGeneration,
+    };
+  }
   if (held === 'retain') scheduleScheduledAdmissionRetry(item);
   else cancelScheduledAdmissionRetry(item);
   onHold(held);
@@ -14935,6 +14955,7 @@ function saveUnsentInputsForSuccessor(reason: string): void {
 }
 
 function discardUnwrittenScheduledInput(item: PendingCliInput): void {
+  if (heldScheduledWrite?.item === item) heldScheduledWrite = undefined;
   if (item.turnId) send({ type: 'turn_input_rejected', turnId: item.turnId,
     ...(item.dispatchAttempt !== undefined ? { dispatchAttempt: item.dispatchAttempt } : {}),
     reason: 'execution_reconciliation_required', rejectedBeforeAdmission: true });
@@ -14957,7 +14978,16 @@ function discardScheduledBacklogForStop(): void {
   const writing = cliSubmissionInFlight;
   const writingTask = writing?.scheduledWritePending
     ? automaticScheduledInputTask(writing.item) ?? scheduledRecoveryInputTask(writing.item) : undefined;
-  const targetTask = activeTask ?? writingTask;
+  // A write this CLI held back into the queue is still that writer between
+  // edges, unless another input has since taken (or is taking) the CLI.
+  const held = activeTask || writingTask ? undefined : heldScheduledWrite;
+  const heldTask = held && held.backend === backend && held.generation === cliSpawnGeneration
+    && pendingMessages.includes(held.item) && (!writing || writing.item === held.item)
+    && (currentBotmuxTurnId === undefined || currentBotmuxTurnId === held.turnId)
+    && webTerminalSubmitGeneration === held.webSubmitGeneration
+    && rawInputWriteGeneration === held.rawInputGeneration
+    ? automaticScheduledInputTask(held.item) ?? scheduledRecoveryInputTask(held.item) : undefined;
+  const targetTask = activeTask ?? writingTask ?? heldTask;
   // STOP belongs to a human/non-scheduled turn unless a scheduled writer proves
   // otherwise. Never turn that absence into a wildcard over every queued task.
   if (!targetTask) return;
@@ -14968,6 +14998,7 @@ function discardScheduledBacklogForStop(): void {
       const taskId = automaticScheduledInputTask(item) ?? scheduledRecoveryInputTask(item);
       if (taskId === targetTask) {
         queue.splice(index, 1);
+        cancelScheduledAdmissionRetry(item);
         discardUnwrittenScheduledInput(item);
       }
     }
@@ -14978,6 +15009,8 @@ function noteCliInputWritten(
   item: PendingCliInput,
   antigravityAnchor?: AntigravityTranscriptWriteBoundary,
 ): void {
+  // This input now owns the CLI: a held scheduled write is no longer its writer.
+  heldScheduledWrite = undefined;
   lastWrittenCliInput = item;
   lastWrittenCliInputWebSubmitGen = webTerminalSubmitGeneration;
   lastWrittenCliInputRawGen = rawInputWriteGeneration;
