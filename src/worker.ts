@@ -3402,6 +3402,7 @@ function refreshCliPluginGeneration(
       && codexRpcEligible(cfg, { sandboxForced: sandboxEnabled() }),
     previousSkillCatalogFingerprint: preserveUnchangedCatalog || sameAutoSession
       ? deliveredPluginSkillCatalogFingerprint : undefined,
+    locale: cfg.locale,
   });
   for (const diagnostic of generation.diagnostics) log(`Plugin generation: ${diagnostic}`);
   if (generation.fatal) {
@@ -3410,6 +3411,11 @@ function refreshCliPluginGeneration(
     // Throw the actionable text itself so this fatal path does not emit both a
     // user_notify and an error card for the same failure.
     throw new Error(t('worker.skill_delivery_failed', { reason }));
+  }
+  if (generation.userWarnings?.length) {
+    for (const warning of generation.userWarnings) {
+      send({ type: 'user_notify', message: warning, ...(cfg.turnId ? { turnId: cfg.turnId } : {}) });
+    }
   }
   cfg.prompt = generation.prompt;
   if (cfg.promptCodexAppInput && generation.skillCatalog) {

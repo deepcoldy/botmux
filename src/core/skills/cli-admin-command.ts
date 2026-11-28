@@ -1,4 +1,5 @@
 import { existsSync } from 'node:fs';
+import { isVersionedPluginCachePath } from './cache-path.js';
 import { githubToGitUrl, parseSkillInstallSource } from './sources.js';
 import { validateSkillPackageDir } from './package.js';
 import {
@@ -430,8 +431,13 @@ export function runSkillsAdminCommand(args: string[]): AdminCommandResult {
         fullDepth: hasFlag(args, '--full-depth'),
       };
       if (parsed.kind === 'local') {
-        const pkgs = installLocalSkillsFromSource(parsed.value, { link: hasFlag(args, '--link'), ...selection });
-        return { code: 0, stdout: formatInstalled(pkgs), stderr: '' };
+        const link = hasFlag(args, '--link');
+        const pkgs = installLocalSkillsFromSource(parsed.value, { link, ...selection });
+        const cacheLinked = link ? pkgs.filter((pkg) => isVersionedPluginCachePath(pkg.rootDir)) : [];
+        const stderr = cacheLinked.length > 0
+          ? `warning: linked ${cacheLinked.length} skill(s) inside a versioned plugin cache (${cacheLinked.map((pkg) => pkg.name).join(', ')}). Plugin upgrades or cache cleanup will break these links; prefer copy mode (\`botmux skills install <path>\` without \`--link\`).\n`
+          : '';
+        return { code: 0, stdout: formatInstalled(pkgs), stderr };
       }
       if (parsed.kind === 'git') {
         const path = argValue(args, '--path');

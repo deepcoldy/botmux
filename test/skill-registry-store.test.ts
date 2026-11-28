@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { skillRegistryPath } from '../src/core/skills/registry-paths.js';
-import { __testOnly_setStoreTreeRemovalOps, buildSkillInstallAuditSummary, discoverLocalSkillCandidates, installLocalSkill, installLocalSkillLinks, readSkillRegistry, removeInstalledSkill, removeInstalledSkills, sweepStoreTrash } from '../src/services/skill-registry-store.js';
+import { withFileLock } from '../src/utils/file-lock.js';
+import { __testOnly_setLocalSkillCopyOps, __testOnly_setStoreTreeRemovalOps, buildSkillInstallAuditSummary, discoverLocalSkillCandidates, installLocalSkill, installLocalSkillCopies, installLocalSkillCopiesAsync, installLocalSkillLinks, readSkillRegistry, removeInstalledSkill, removeInstalledSkills, sweepStoreTrash } from '../src/services/skill-registry-store.js';
 
 function write(file: string, content: string): void {
   mkdirSync(dirname(file), { recursive: true });
@@ -23,6 +24,7 @@ describe('skill registry store', () => {
 
   afterEach(() => {
     __testOnly_setStoreTreeRemovalOps(undefined);
+    __testOnly_setLocalSkillCopyOps(undefined);
     vi.unstubAllEnvs();
     rmSync(home, { recursive: true, force: true });
     rmSync(src, { recursive: true, force: true });
@@ -68,11 +70,13 @@ describe('skill registry store', () => {
     chmodSync(join(skillDir, 'bin', 'delivery'), 0o755);
     chmodSync(join(skillDir, 'scripts', 'helper.py'), 0o755);
     symlinkSync('../SKILL.md', join(skillDir, 'references-link'));
-    const pkg = installLocalSkill(skillDir, { link: false });
+    // Audit a linked fixture: copy installation deliberately materializes safe
+    // links and rejects broken/out-of-root links before publication.
+    const pkg = installLocalSkill(skillDir, { link: true });
 
     expect(buildSkillInstallAuditSummary(pkg)).toMatchObject({
       name: 'complex',
-      sourceType: 'local-copy',
+      sourceType: 'local-link',
       version: '1.2.3',
       files: 3,
       directories: 2,
@@ -246,6 +250,133 @@ describe('skill registry store', () => {
       missing: ['missing'],
     });
     expect(readSkillRegistry().skills.keep).toBeDefined();
+  });
+
+  it('keeps prior registry and installed trees when a later staged copy fails', () => {
+    const alphaSource = join(src, 'alpha');
+    const betaSource = join(src, 'beta');
+    write(join(alphaSource, 'SKILL.md'), '---\nname: alpha\n---\n# OLD ALPHA');
+    write(join(betaSource, 'SKILL.md'), '---\nname: beta\n---\n# OLD BETA');
+    const alpha = installLocalSkill(alphaSource, { link: false });
+    const beta = installLocalSkill(betaSource, { link: false });
+    const registryBefore = readFileSync(skillRegistryPath(), 'utf-8');
+    write(join(alphaSource, 'SKILL.md'), '---\nname: alpha\n---\n# NEW ALPHA');
+
+    __testOnly_setLocalSkillCopyOps({
+      copySync: (sourceDir, targetDir) => {
+        cpSync(sourceDir, targetDir, { recursive: true, dereference: true });
+        if (sourceDir === realpathSync(betaSource)) {
+          throw Object.assign(new Error('injected source EACCES'), { code: 'EACCES' });
+        }
+      },
+    });
+
+    expect(() => installLocalSkillCopies([alphaSource, betaSource])).toThrow(/EACCES/);
+    expect(readFileSync(skillRegistryPath(), 'utf-8')).toBe(registryBefore);
+    expect(readFileSync(join(alpha.rootDir, 'SKILL.md'), 'utf-8')).toContain('OLD ALPHA');
+    expect(readFileSync(join(beta.rootDir, 'SKILL.md'), 'utf-8')).toContain('OLD BETA');
+    expect(readdirSync(dirname(alpha.rootDir)).filter(name => name.startsWith('.copy-staging-') || name.startsWith('.trash-'))).toEqual([]);
+  });
+
+  it('restores every old tree and the registry when a commit rename fails', () => {
+    const alphaSource = join(src, 'alpha');
+    const betaSource = join(src, 'beta');
+    write(join(alphaSource, 'SKILL.md'), '---\nname: alpha\n---\n# OLD ALPHA');
+    write(join(betaSource, 'SKILL.md'), '---\nname: beta\n---\n# OLD BETA');
+    const alpha = installLocalSkill(alphaSource, { link: false });
+    const beta = installLocalSkill(betaSource, { link: false });
+    const registryBefore = readFileSync(skillRegistryPath(), 'utf-8');
+    write(join(alphaSource, 'SKILL.md'), '---\nname: alpha\n---\n# NEW ALPHA');
+    write(join(betaSource, 'SKILL.md'), '---\nname: beta\n---\n# NEW BETA');
+
+    let finalRenames = 0;
+    __testOnly_setLocalSkillCopyOps({
+      renameSync: (from, to) => {
+        if (from.includes('.copy-staging-') && !to.includes('.copy-staging-')) {
+          finalRenames++;
+          if (finalRenames === 2) throw new Error('injected commit rename failure');
+        }
+        renameSync(from, to);
+      },
+    });
+
+    expect(() => installLocalSkillCopies([alphaSource, betaSource])).toThrow(/commit rename failure/);
+    expect(finalRenames).toBe(2);
+    expect(readFileSync(skillRegistryPath(), 'utf-8')).toBe(registryBefore);
+    expect(readFileSync(join(alpha.rootDir, 'SKILL.md'), 'utf-8')).toContain('OLD ALPHA');
+    expect(readFileSync(join(beta.rootDir, 'SKILL.md'), 'utf-8')).toContain('OLD BETA');
+    expect(readdirSync(dirname(alpha.rootDir)).filter(name => name.startsWith('.copy-staging-') || name.startsWith('.trash-'))).toEqual([]);
+  });
+
+  it('materializes a root link and in-root resource links into an independent single copy', () => {
+    const actualRoot = join(src, 'actual-root');
+    const rootLink = join(src, 'root-link');
+    write(join(actualRoot, 'SKILL.md'), '---\nname: rooted\n---\n# Rooted');
+    write(join(actualRoot, 'references', 'local.txt'), 'local resource');
+    symlinkSync('local.txt', join(actualRoot, 'references', 'relative.txt'));
+    symlinkSync(join(actualRoot, 'references', 'local.txt'), join(actualRoot, 'references', 'absolute.txt'));
+    symlinkSync(actualRoot, rootLink);
+
+    const pkg = installLocalSkill(rootLink, { link: false });
+
+    expect(pkg.rootDir).toContain(join('.botmux', 'skills', 'store', 'rooted'));
+    expect(pkg.rootDir).not.toBe(realpathSync(actualRoot));
+    expect(lstatSync(pkg.rootDir).isSymbolicLink()).toBe(false);
+    for (const name of ['relative.txt', 'absolute.txt']) {
+      expect(lstatSync(join(pkg.rootDir, 'references', name)).isSymbolicLink()).toBe(false);
+    }
+    expect(pkg.source).toMatchObject({ type: 'local-copy', originalPath: rootLink });
+    rmSync(actualRoot, { recursive: true, force: true });
+    expect(readFileSync(join(pkg.rootDir, 'references', 'relative.txt'), 'utf-8')).toBe('local resource');
+    expect(readFileSync(join(pkg.rootDir, 'references', 'absolute.txt'), 'utf-8')).toBe('local resource');
+    expect(readSkillRegistry().skills.rooted.rootDir).toBe(pkg.rootDir);
+  });
+
+  it('uses the same materialization and publication contract through the async copy entry', async () => {
+    const sourceDir = join(src, 'async-skill');
+    write(join(sourceDir, 'SKILL.md'), '---\nname: async-skill\n---\n# Async');
+    write(join(sourceDir, 'references', 'local.txt'), 'async resource');
+    symlinkSync('local.txt', join(sourceDir, 'references', 'alias.txt'));
+
+    mkdirSync(dirname(skillRegistryPath()), { recursive: true });
+    let lockHeld = false;
+    const blocker = withFileLock(join(dirname(skillRegistryPath()), 'registry-operation'), async () => {
+      lockHeld = true;
+      await new Promise(resolve => setTimeout(resolve, 100));
+    });
+    await vi.waitFor(() => expect(lockHeld).toBe(true));
+    const pkg = (await installLocalSkillCopiesAsync([sourceDir]))[0]!;
+    await blocker;
+
+    expect(lstatSync(join(pkg.rootDir, 'references', 'alias.txt')).isSymbolicLink()).toBe(false);
+    rmSync(sourceDir, { recursive: true, force: true });
+    expect(readFileSync(join(pkg.rootDir, 'references', 'alias.txt'), 'utf-8')).toBe('async resource');
+    expect(readSkillRegistry().skills['async-skill'].rootDir).toBe(pkg.rootDir);
+  });
+
+  it('rejects escaping, broken, and cyclic links before touching the store or registry', () => {
+    const outside = join(src, 'outside');
+    write(join(outside, 'SKILL.md'), '---\nname: outside\n---\n# Outside');
+    write(join(src, 'shared.txt'), 'shared');
+    symlinkSync(join(src, 'shared.txt'), join(outside, 'shared-link.txt'));
+
+    const broken = join(src, 'broken');
+    write(join(broken, 'SKILL.md'), '---\nname: broken\n---\n# Broken');
+    symlinkSync(join(broken, 'missing.txt'), join(broken, 'broken-link.txt'));
+
+    const cyclic = join(src, 'cyclic');
+    write(join(cyclic, 'SKILL.md'), '---\nname: cyclic\n---\n# Cyclic');
+    write(join(cyclic, 'sub', 'file.txt'), 'file');
+    symlinkSync('..', join(cyclic, 'sub', 'loop'));
+
+    expect(() => installLocalSkillCopies([outside])).toThrow(/local_skill_symlink_outside_source/);
+    expect(() => installLocalSkillCopies([broken])).toThrow(/local_skill_symlink_unresolvable/);
+    expect(() => installLocalSkillCopies([cyclic])).toThrow(/local_skill_symlink_cycle/);
+    const registry = readSkillRegistry();
+    for (const name of ['outside', 'broken', 'cyclic']) {
+      expect(registry.skills[name]).toBeUndefined();
+      expect(existsSync(join(home, '.botmux', 'skills', 'store', name))).toBe(false);
+    }
   });
 
   it('rejects reinstalling a local copy from its own store target without deleting it', () => {

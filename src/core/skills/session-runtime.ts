@@ -13,12 +13,17 @@ import {
 } from './snapshot.js';
 import { renderSkillCatalogBlock } from './prompt.js';
 import { resolveSessionSkillManifest } from './session-resolver.js';
+import { filterAvailableSessionSkills, type UnavailableSkillEntry } from './source-health.js';
 
 export interface PreparedSessionSkillPrompt {
   prompt: string;
   manifest: SessionSkillManifest | null;
   /** Snapshot refusals / limit hits / skipped entries, for the worker log. */
   snapshotDiagnostics?: string[];
+  /** Skills skipped during preflight because their source directory/entrypoint was unavailable. */
+  unavailableSkills?: UnavailableSkillEntry[];
+  /** Human-readable lines for unavailable skills skipped during preflight. */
+  sourceDiagnostics?: string[];
 }
 
 export function prepareSessionSkillPrompt(opts: {
@@ -53,23 +58,38 @@ export function prepareSessionSkillPrompt(opts: {
     removeSessionSkillRuntime(opts.sessionId);
     return { prompt: opts.prompt, manifest };
   }
+  const preflight = filterAvailableSessionSkills(manifest);
+  if (preflight.availableSkills.length === 0) {
+    removeSessionSkillRuntime(opts.sessionId);
+    return {
+      prompt: opts.prompt,
+      manifest: preflight.manifest,
+      unavailableSkills: preflight.unavailableSkills,
+      sourceDiagnostics: preflight.diagnostics,
+    };
+  }
   // Freeze the enabled botmux-MANAGED skills (store / plugin bundles) into
   // this session's own runtime dir and point the manifest there (snapshot.ts):
   // that is what the file sandbox exposes. Linked / external skills keep their
   // own path — readable wherever the CLI can already read it, unavailable in
   // the file sandbox (`botmux skill show` explains). The catalog is unchanged.
-  const snapshot = snapshotSessionSkills(manifest, {
+  const snapshot = snapshotSessionSkills(preflight.manifest, {
     trust: opts.snapshotTrust,
     limits: opts.snapshotLimits,
   });
   const manifestOut = snapshot.manifest;
   writeSessionSkillManifest(manifestOut);
+  const extra = {
+    snapshotDiagnostics: snapshot.diagnostics,
+    ...(preflight.unavailableSkills.length > 0 ? { unavailableSkills: preflight.unavailableSkills } : {}),
+    ...(preflight.diagnostics.length > 0 ? { sourceDiagnostics: preflight.diagnostics } : {}),
+  };
   if (opts.prompt.trim().length === 0 || opts.prompt.includes('<botmux_skills')) {
-    return { prompt: opts.prompt, manifest: manifestOut, snapshotDiagnostics: snapshot.diagnostics };
+    return { prompt: opts.prompt, manifest: manifestOut, ...extra };
   }
   return {
     prompt: `${opts.prompt}\n\n${renderSkillCatalogBlock(manifestOut)}`,
     manifest: manifestOut,
-    snapshotDiagnostics: snapshot.diagnostics,
+    ...extra,
   };
 }

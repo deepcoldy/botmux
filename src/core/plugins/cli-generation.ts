@@ -3,8 +3,16 @@ import { createHash } from 'node:crypto';
 import type { BotConfig } from '../../bot-registry.js';
 import type { GlobalConfig } from '../../global-config.js';
 import { prepareSkillDelivery } from '../skills/delivery.js';
+import { writeSessionSkillManifest } from '../skills/manifest-store.js';
 import { renderSkillCatalogBlock } from '../skills/prompt.js';
 import { prepareSessionSkillPrompt } from '../skills/session-runtime.js';
+import { removeSessionSkillRuntime } from '../skills/snapshot.js';
+import {
+  formatUnavailableSkillDiagnostic,
+  formatUnavailableSkillsUserWarning,
+  mergeUnavailableSkills,
+  type UnavailableSkillEntry,
+} from '../skills/source-health.js';
 import { refreshSessionPluginManifest, type SessionPluginManifest } from './session-manifest.js';
 import { refreshSessionMcpRuntimeManifest } from './mcp/session-runtime.js';
 import { resolvePluginSkillPackages } from './skills.js';
@@ -24,6 +32,8 @@ export interface CliPluginGenerationResult {
   skillReadonlyRoots?: string[];
   deferredSkillCatalog?: string;
   diagnostics: string[];
+  unavailableSkills?: UnavailableSkillEntry[];
+  userWarnings?: string[];
   fatal?: boolean;
 }
 
@@ -54,6 +64,7 @@ export function prepareCliPluginGeneration(opts: {
   deferCatalogToContextManager?: boolean;
   /** Only the host's admitted Auto resume passes its last delivered catalog. */
   previousSkillCatalogFingerprint?: string;
+  locale?: 'zh' | 'en';
   now?: () => string;
 }): CliPluginGenerationResult {
   const pluginManifest = refreshSessionPluginManifest({
@@ -93,8 +104,38 @@ export function prepareCliPluginGeneration(opts: {
     preparedSkills.manifest,
     preparedSkills.manifest?.delivery ?? 'auto',
   );
+  // If a skill disappeared between preflight and native delivery (TOCTOU),
+  // strip it from the persisted manifest and catalog so the model isn't
+  // advertised a skill that failed to materialize.
+  let effectiveManifest = preparedSkills.manifest;
+  let deliverySkippedChangedManifest = false;
+  let effectiveReadonlyRoots = delivery.readonlyRoots;
+  if (effectiveManifest && delivery.skippedSkills?.length) {
+    const skippedNames = new Set(delivery.skippedSkills.map(entry => entry.name));
+    const remainingSkills = effectiveManifest.prioritySkills.filter(skill => !skippedNames.has(skill.name));
+    if (remainingSkills.length !== effectiveManifest.prioritySkills.length) {
+      deliverySkippedChangedManifest = true;
+      const extraDiagnostics = delivery.skippedSkills.map(entry => ({
+        level: 'warn' as const,
+        code: 'skill_source_missing',
+        skillName: entry.name,
+        message: formatUnavailableSkillDiagnostic(entry),
+      }));
+      effectiveManifest = {
+        ...effectiveManifest,
+        prioritySkills: remainingSkills,
+        diagnostics: [...effectiveManifest.diagnostics, ...extraDiagnostics],
+      };
+      if (remainingSkills.length > 0) {
+        writeSessionSkillManifest(effectiveManifest);
+      } else {
+        removeSessionSkillRuntime(opts.sessionId, opts.dataDir);
+        effectiveReadonlyRoots = [];
+      }
+    }
+  }
   const baseCatalog = renderSkillCatalogBlock(
-    preparedSkills.manifest,
+    effectiveManifest,
     { compact: opts.compactCatalog === true },
   );
   const fingerprint = createHash('sha256').update(baseCatalog).digest('hex');
@@ -103,7 +144,14 @@ export function prepareCliPluginGeneration(opts: {
   const catalog = unchanged ? '' : opts.replacesPriorGeneration
     ? renderReplacementCatalog(baseCatalog)
     : baseCatalog;
-  let prompt = preparedSkills.prompt;
+  const promptCatalog = deliverySkippedChangedManifest
+    ? renderSkillCatalogBlock(effectiveManifest)
+    : '';
+  let prompt = deliverySkippedChangedManifest
+    ? (opts.replacesPriorGeneration || opts.prompt.trim().length === 0 || opts.prompt.includes('<botmux_skills')
+      ? opts.prompt
+      : (promptCatalog ? `${opts.prompt}\n\n${promptCatalog}` : opts.prompt))
+    : preparedSkills.prompt;
   if (unchanged || opts.deferCatalogToContextManager) prompt = opts.prompt;
   else if (opts.replacesPriorGeneration && opts.prompt.trim().length > 0) {
     prompt = `${opts.prompt}\n\n${catalog}`;
@@ -122,6 +170,14 @@ export function prepareCliPluginGeneration(opts: {
     }).content;
   }
 
+  const unavailableSkills = mergeUnavailableSkills(
+    preparedSkills.unavailableSkills,
+    delivery.skippedSkills,
+  );
+  const unavailableWarning = !delivery.fatal
+    ? formatUnavailableSkillsUserWarning(unavailableSkills, opts.locale)
+    : null;
+
   return {
     pluginManifest,
     prompt,
@@ -131,13 +187,16 @@ export function prepareCliPluginGeneration(opts: {
       : undefined,
     skillCatalogFingerprint: fingerprint,
     skillPluginDir: delivery.pluginDir,
-    skillReadonlyRoots: delivery.readonlyRoots.length > 0 ? delivery.readonlyRoots : undefined,
+    skillReadonlyRoots: effectiveReadonlyRoots.length > 0 ? effectiveReadonlyRoots : undefined,
     deferredSkillCatalog,
     diagnostics: [
       ...pluginSkills.diagnostics.map(value => `plugin_skill:${value}`),
+      ...(preparedSkills.sourceDiagnostics ?? []).map(value => `skill_source:${value}`),
       ...(preparedSkills.snapshotDiagnostics ?? []).map(value => `skill_snapshot:${value}`),
       ...delivery.diagnostics.map(value => `skill_delivery:${value}`),
     ],
+    ...(unavailableSkills.length > 0 ? { unavailableSkills } : {}),
+    ...(unavailableWarning ? { userWarnings: [unavailableWarning] } : {}),
     fatal: delivery.fatal,
   };
 }

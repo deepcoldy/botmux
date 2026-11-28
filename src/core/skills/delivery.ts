@@ -1,10 +1,11 @@
-import { realpathSync } from 'node:fs';
+import { realpathSync, rmSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { CliAdapter } from '../../adapters/cli/types.js';
 import type { SessionSkillManifest } from './types.js';
 import { prepareClaudeSkillPlugin } from './claude-plugin-delivery.js';
 import { prepareSkillRootDelivery } from './skill-root-delivery.js';
 import { sessionSkillSnapshotRoot } from './snapshot.js';
+import type { UnavailableSkillEntry } from './source-health.js';
 
 export interface PreparedSkillDelivery {
   prompt: boolean;
@@ -15,6 +16,7 @@ export interface PreparedSkillDelivery {
    *  under `<dataDir>/runtime-skills/<sid>/` — never a host source dir. */
   readonlyRoots: string[];
   diagnostics: string[];
+  skippedSkills?: UnavailableSkillEntry[];
   fatal?: boolean;
 }
 
@@ -45,11 +47,31 @@ export function prepareSkillDelivery(
   if (requested === 'prompt') return { prompt: true, readonlyRoots: snapshotRoots, diagnostics: [] };
   if (adapter.skillDelivery?.nativeKind === 'claude-plugin') {
     const prepared = prepareClaudeSkillPlugin(manifest);
-    return { prompt: true, pluginDir: prepared.pluginDir, readonlyRoots: [prepared.pluginDir, ...snapshotRoots], diagnostics: [] };
+    const hasDelivered = prepared.deliveredSkills.length > 0;
+    if (!hasDelivered) {
+      try { rmSync(prepared.pluginDir, { recursive: true, force: true }); } catch { /* best effort */ }
+    }
+    return {
+      prompt: hasDelivered,
+      ...(hasDelivered ? { pluginDir: prepared.pluginDir } : {}),
+      readonlyRoots: hasDelivered ? [prepared.pluginDir, ...snapshotRoots] : snapshotRoots,
+      diagnostics: prepared.diagnostics,
+      ...(prepared.skippedSkills.length > 0 ? { skippedSkills: prepared.skippedSkills } : {}),
+    };
   }
   if (adapter.skillDelivery?.nativeKind === 'skill-root') {
     const prepared = prepareSkillRootDelivery(manifest);
-    return { prompt: true, pluginDir: prepared.skillDir, readonlyRoots: [prepared.skillDir, ...snapshotRoots], diagnostics: [] };
+    const hasDelivered = prepared.deliveredSkills.length > 0;
+    if (!hasDelivered) {
+      try { rmSync(prepared.skillDir, { recursive: true, force: true }); } catch { /* best effort */ }
+    }
+    return {
+      prompt: hasDelivered,
+      ...(hasDelivered ? { pluginDir: prepared.skillDir } : {}),
+      readonlyRoots: hasDelivered ? [prepared.skillDir, ...snapshotRoots] : snapshotRoots,
+      diagnostics: prepared.diagnostics,
+      ...(prepared.skippedSkills.length > 0 ? { skippedSkills: prepared.skippedSkills } : {}),
+    };
   }
   if (requested === 'native') {
     return {

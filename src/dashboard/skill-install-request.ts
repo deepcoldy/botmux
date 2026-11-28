@@ -6,6 +6,7 @@ import {
   installLocalSkillsFromSource,
   installGitSkillsFromSourceAsync,
 } from '../services/skill-registry-store.js';
+import { isVersionedPluginCachePath } from '../core/skills/cache-path.js';
 import {
   assertSafeGitSkillPath,
   githubToGitUrl,
@@ -34,6 +35,7 @@ export type DashboardSkillInstallRequest =
   | { kind: 'agentbuddy'; agentbuddy: AgentbuddySource };
 
 export function shouldAutoLinkLocalSkillPath(rawPath: string): boolean {
+  if (isVersionedPluginCachePath(rawPath)) return false;
   const normalized = rawPath.replace(/\\/g, '/');
   const parts = normalized.split('/').filter(Boolean);
   return parts.some((part, index) => (
@@ -61,6 +63,16 @@ export function parseInstallLocalLinksSources(body: unknown): string[] {
   return [...new Set(trimmed)];
 }
 
+/** Optional installation mode for POST /api/skills/install-local-links.
+ *  Defaults to `'link'` so existing callers stay unchanged; passing
+ *  `mode: 'copy'` (or `copy: true`) copies selected skills into the Botmux
+ *  managed skill store instead of linking fragile paths (e.g. plugin caches). */
+export function parseInstallLocalLinksMode(body: unknown): 'link' | 'copy' {
+  const obj = body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : {};
+  if (obj.mode === 'copy' || obj.copy === true) return 'copy';
+  return 'link';
+}
+
 function parseSkillNames(body: Record<string, unknown>): string[] {
   const raw = Array.isArray(body.skillNames)
     ? body.skillNames
@@ -86,7 +98,7 @@ export function parseDashboardSkillInstallRequest(body: Record<string, unknown>)
     return {
       kind: 'local',
       value: parsedSource.value,
-      link: body.link === true || shouldAutoLinkLocalSkillPath(parsedSource.value),
+      link: typeof body.link === 'boolean' ? body.link : shouldAutoLinkLocalSkillPath(parsedSource.value),
       skillNames,
       all,
       fullDepth,

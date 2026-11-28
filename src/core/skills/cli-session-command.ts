@@ -206,14 +206,24 @@ function unavailableSkillReason(
   err: any,
   env: Record<string, string | undefined>,
 ): string | null {
-  const skill = name ? manifest.prioritySkills.find((candidate) => candidate.name === name) : undefined;
-  if (!skill || skill.snapshotOf || skill.source?.type === 'project') return null;
+  if (!name) return null;
+  const skill = manifest.prioritySkills.find((candidate) => candidate.name === name);
+  if (!skill) {
+    const skipped = manifest.diagnostics.find((d) => d.skillName === name && d.code === 'skill_source_missing');
+    if (skipped) return `skill ${name} was skipped at session start because its source is unavailable: ${skipped.message}`;
+    return null;
+  }
+  if (skill.snapshotOf || skill.source?.type === 'project') return null;
   if (!['ENOENT', 'EACCES', 'EPERM', 'ENOTDIR', 'ELOOP'].includes(err?.code)) return null;
   const sandboxed = env.BOTMUX_READ_ISOLATION === '1';
   const where = sandboxed ? 'inside this sandboxed session' : 'from this session';
   const failed = manifest.diagnostics.find((d) => d.skillName === skill.name && d.level === 'error'
     && d.code.startsWith('skill_snapshot_'));
   if (failed) return `skill ${skill.name} is not available ${where}: ${failed.message}`;
+  if (!sandboxed && err?.code === 'ENOENT') {
+    return `skill ${skill.name} (${skill.source?.type ?? 'unknown'}) source path no longer exists (${skill.rootDir}) — `
+      + 'reinstall it in copy mode (`botmux skills install <path>` without --link) or run `botmux skills doctor`.';
+  }
   return `skill ${skill.name} is a linked/external skill (source ${skill.source?.type ?? 'unknown'}: ${skill.rootDir}) and is not available ${where} — `
     + 'only skills installed into the botmux skill store are snapshotted into sandboxed sessions. '
     + 'Install it in copy mode (`botmux skills install <path>` without --link) to use it here.';

@@ -5,6 +5,7 @@ import { useT } from './react-hooks.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { clearHashQueryParam, hashQueryParam } from './dashboard-routes.js';
 import { ModalDialog } from './modal-dialog.js';
+import { isVersionedPluginCachePath } from '../../core/skills/cache-path.js';
 import { SkillPacksTab } from './skills/skill-packs-tab.js';
 import { detectSourceType, SkillLibraryTab } from './skills/skill-library-tab.js';
 import { BotAssignmentsTab } from './skills/bot-assignments-tab.js';
@@ -942,6 +943,8 @@ export function SkillsPage() {
   const [discoveryBusy, setDiscoveryBusy] = useState(false);
   const [activeDiscoveryKey, setActiveDiscoveryKey] = useState<string | null>(null);
   const [selectedDiscovered, setSelectedDiscovered] = useState<Set<string>>(() => new Set());
+  const [discoveryCopyMode, setDiscoveryCopyMode] = useState<'auto' | 'copy' | 'link'>('auto');
+  const discoveryGenerationRef = useRef(0);
 
   const [globalBusy, setGlobalBusy] = useState<'project' | 'delivery' | null>(null);
   const [skillBusy, setSkillBusy] = useState<string | null>(null);
@@ -975,6 +978,13 @@ export function SkillsPage() {
       .filter(Boolean);
   }, [activeDiscoveryGroup, installedNames]);
   const activeAllSelected = activeGroupSelectable.length > 0 && activeGroupSelectable.every(path => selectedDiscovered.has(path));
+  const activeGroupIsPluginCache = !!activeDiscoveryGroup && isVersionedPluginCachePath(activeDiscoveryGroup.rootDir);
+  const selectedHasPluginCache = useMemo(
+    () => [...selectedDiscovered].some(isVersionedPluginCachePath),
+    [selectedDiscovered],
+  );
+  const effectiveDiscoveryCopy = discoveryCopyMode === 'copy'
+    || (discoveryCopyMode === 'auto' && (selectedHasPluginCache || (selectedDiscovered.size === 0 && activeGroupIsPluginCache)));
 
   const clearTimers = useCallback(() => {
     for (const id of timersRef.current) window.clearTimeout(id);
@@ -1034,11 +1044,10 @@ export function SkillsPage() {
       if (current.status === 'failed') {
         throw new Error(current.error ?? 'job_failed');
       }
-      await delay(800);
-      if (!mountedRef.current) return null;
       const body = await requestJson(`/api/skills/jobs/${encodeURIComponent(current.id)}`, { method: 'GET' });
       if (!mountedRef.current) return null;
       current = body.job as SkillJob;
+      if (current.status === 'running') await delay(800);
     }
   }
 
@@ -1235,21 +1244,43 @@ export function SkillsPage() {
     if (mountedRef.current) setActiveTab('packs');
   }
 
+  function openNativeDiscovery(): void {
+    discoveryGenerationRef.current += 1;
+    setDiscoveryOpen(true);
+  }
+
+  function closeNativeDiscovery(): void {
+    discoveryGenerationRef.current += 1;
+    setDiscoveryOpen(false);
+    setDiscoveryCopyMode('auto');
+  }
+
   async function registerDiscoveredSkills(): Promise<void> {
     const selected = [...selectedDiscovered].filter(Boolean);
     if (selected.length === 0) {
       setInstallStatus({ text: tr('skills.discoverNothingSelected'), ok: false });
       return;
     }
+    const submissionGeneration = discoveryGenerationRef.current;
     setDiscoveryBusy(true);
     try {
       setInstallStatus({ text: tr('skills.discoverRegisteringBatch', { total: selected.length }), ok: true });
-      await requestJson('/api/skills/install-local-links', {
+      const payload = effectiveDiscoveryCopy
+        ? { sources: selected, mode: 'copy' as const }
+        : { sources: selected };
+      const body = await requestJson('/api/skills/install-local-links', {
         method: 'POST',
-        body: JSON.stringify({ sources: selected }),
+        body: JSON.stringify(payload),
       });
       if (!mountedRef.current) return;
-      setDiscoveryOpen(false);
+      if (effectiveDiscoveryCopy) {
+        const completed = await waitForSkillJob(body.job as SkillJob, setInstallStatus, false);
+        if (!completed || !mountedRef.current) return;
+      }
+      if (discoveryGenerationRef.current === submissionGeneration) {
+        closeNativeDiscovery();
+        setSelectedDiscovered(new Set());
+      }
       await refresh();
       if (mountedRef.current) setInstallStatus({ text: tr('skills.saved'), ok: true });
     } catch (err: any) {
@@ -1615,7 +1646,7 @@ export function SkillsPage() {
               onConfirmInstallSelection={confirmInstallSelection}
               onCloseInstallSelection={() => setInstallSelectionOpen(false)}
               onInstall={installSkill}
-              onOpenNativeDiscovery={() => setDiscoveryOpen(true)}
+              onOpenNativeDiscovery={openNativeDiscovery}
               onCreatePack={createPackFromInstalledSkills}
               InstallPanel={SkillsInstallPanel}
               InstalledLibrary={InstalledSkillsLibrary}
@@ -1691,7 +1722,7 @@ export function SkillsPage() {
             className="skills-discovery-dialog"
             id="skills-discovery-dialog"
             open={discoveryOpen}
-            onClose={() => setDiscoveryOpen(false)}
+            onClose={closeNativeDiscovery}
           >
             <article>
               <header>
@@ -1703,7 +1734,7 @@ export function SkillsPage() {
                   data-action="close-discovery"
                   aria-label={tr('skills.discoverClose')}
                   title={tr('skills.discoverClose')}
-                  onClick={() => setDiscoveryOpen(false)}
+                  onClick={closeNativeDiscovery}
                 />
               </header>
               <div className="skills-discovery-body">
@@ -1732,6 +1763,21 @@ export function SkillsPage() {
                       </div>
                       <div className="skills-discovery-main">
                         <div className="skills-discovery-path"><code>{activeDiscoveryGroup.rootDir}</code></div>
+                        {(activeGroupIsPluginCache || selectedHasPluginCache) ? (
+                          <div className="skills-discovery-cache-notice" data-discovery-cache-warning role="alert">
+                            <p className="hint-warn">{tr('skills.discoverCacheWarning')}</p>
+                            <label className="skills-scan-toggle">
+                              <input
+                                type="checkbox"
+                                data-discovery-copy-mode
+                                checked={effectiveDiscoveryCopy}
+                                disabled={discoveryBusy}
+                                onChange={e => setDiscoveryCopyMode(e.currentTarget.checked ? 'copy' : 'link')}
+                              />
+                              <span>{tr('skills.discoverCopyToStore')}</span>
+                            </label>
+                          </div>
+                        ) : null}
                         {nativeSkillGroups.map(group => {
                         const key = discoveryGroupKey(group);
                         const selected = key === activeKey;
@@ -1795,7 +1841,7 @@ export function SkillsPage() {
                   {activeAllSelected ? tr('skills.discoverClearSelection') : tr('skills.discoverSelectAll')}
                 </button>
                 <button type="button" className="primary" data-action="register-discovered-skills" disabled={discoveryBusy} onClick={() => void registerDiscoveredSkills()}>
-                  {tr('skills.discoverRegister')}
+                  {effectiveDiscoveryCopy ? tr('skills.discoverCopyRegister') : tr('skills.discoverRegister')}
                 </button>
               </footer>
             </article>
